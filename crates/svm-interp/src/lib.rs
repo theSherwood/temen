@@ -15678,15 +15678,46 @@ pub type HostProc = Box<
         + Send,
 >;
 
-/// FORK.md PR 5 — a host proc's **fork factory**: mints a fresh [`HostProc`] closure for a `fork()`
-/// twin's powerbox. The runtime can never fork a `HostProc` itself (the closure's captured state is
-/// opaque — the same wall in Rust as a C embedder's `void* ctx`), so forkability is a capability the
-/// **provider** supplies: the factory duplicates-or-shares its own state (svm-posix shares the
-/// fd-table/memfs `Arc`s — fork-shares-fds semantics; a C embedder would `dup` its structs) and
-/// returns the child's closure. A `host_proc` granted *without* a factory keeps today's behavior:
-/// [`Host::fork_powerbox`] fails closed on it. `Arc` so the factory itself rides into the twin —
-/// a forked domain remains forkable (fork-of-fork, nested guests).
-pub type HostProcFork = Arc<dyn Fn() -> HostProc + Send + Sync>;
+/// FORK.md PR 5 / #863 — a host proc's **fork factory**: mints what a `fork()` twin's powerbox
+/// carries for this capability. The runtime can never fork a `HostProc` itself (the closure's
+/// captured state is opaque — the same wall in Rust as a C embedder's `void* ctx`), so forkability
+/// is a capability the **provider** supplies: the factory duplicates-or-shares its own state (its
+/// choice — svm-posix clones the per-process side and shares the world side, POSIX fork semantics;
+/// a C embedder would `dup` its structs) and returns the child's [`ForkedProc`]. A `host_proc`
+/// granted *without* a factory keeps today's behavior: [`Host::fork_powerbox`] fails closed on it.
+/// `Arc` so the factory itself rides into the twin — a forked domain remains forkable
+/// (fork-of-fork, nested guests).
+pub type HostProcFork = Arc<dyn Fn() -> ForkedProc + Send + Sync>;
+
+/// #863 — what a [`HostProcFork`] factory mints for a **new process domain**. Beyond the fresh
+/// handler closure, a personality may hand the new domain two extras — both *mechanism-neutral*:
+/// the core installs whatever the provider supplies, and all signal/fork **policy** stays with the
+/// provider (invariant 4).
+pub struct ForkedProc {
+    /// The new domain's handler closure over the provider's (duplicated or shared) state.
+    pub handler: HostProc,
+    /// A signal door over the **new process's own** signal state, installed on the new domain's
+    /// `Host` ([`Host::set_signal_source`]). `None` = the twin shares its parent's source (the
+    /// pre-split behavior, right for providers whose state is fully shared).
+    pub signal: Option<(Arc<dyn SignalSource + Send + Sync>, Arc<AtomicBool>)>,
+    /// The **replacement fork factory** for the new domain: a self-replicating personality forks
+    /// the *new* process's state next time, not the original's (fork-of-fork clones the twin's fd
+    /// table/cwd, not the grandparent's). `None` = reuse the same factory (fully-shared providers).
+    pub refork: Option<HostProcFork>,
+}
+
+impl ForkedProc {
+    /// A shared-state mint: fresh closure over the same provider state, no per-process signal door,
+    /// fork-of-fork through the same factory. The pre-#863 contract, right for providers whose
+    /// state is deliberately global (a scripted table, a shared service shim).
+    pub fn shared(handler: HostProc) -> Self {
+        Self {
+            handler,
+            signal: None,
+            refork: None,
+        }
+    }
+}
 
 /// §12 parking-on-blocking — a punted blocking op: a **self-contained** scalar job the offload
 /// pool runs off the vCPU thread. Deliberately narrow (the SQE discipline, kept): it captures
@@ -16921,15 +16952,22 @@ impl Host {
         twin.live_impls = self.live_impls.clone();
         // Forkable host procs: each provider factory mints the twin's fresh closure over its own
         // (shared or duplicated) state, at the same index so the copied table's `HostProc(i)` slots
-        // resolve; the factories themselves ride along, so the twin remains forkable (fork-of-fork).
+        // resolve. #863: the minted [`ForkedProc`] may carry a per-process signal door (installed on
+        // the twin below, overriding the shared-source fallback) and a replacement factory (so
+        // fork-of-fork forks the *twin's* state); either absent keeps the pre-split shared behavior.
+        let mut twin_sig: Option<(Arc<dyn SignalSource + Send + Sync>, Arc<AtomicBool>)> = None;
         twin.host_procs = self
             .host_procs
             .iter()
             .map(|e| {
                 let factory = e.fork.as_ref().unwrap();
+                let forked = factory();
+                if forked.signal.is_some() {
+                    twin_sig = forked.signal;
+                }
                 HostProcEntry {
-                    handler: ProcHandler::Sync(factory()),
-                    fork: Some(Arc::clone(factory)),
+                    handler: ProcHandler::Sync(forked.handler),
+                    fork: Some(forked.refork.unwrap_or_else(|| Arc::clone(factory))),
                     mints: e.mints,
                 }
             })
@@ -16943,10 +16981,20 @@ impl Host {
         twin.out_sink = self.out_sink.clone();
         twin.err_sink = self.err_sink.clone();
         twin.sinks = self.sinks.clone();
-        // #796 L2 — a fork shares the async-signal source + armed flag (the personality's signal state is
-        // shared like the rest of the powerbox); each twin polls the same doorbell.
-        twin.sig_source = self.sig_source.clone();
-        twin.sig_armed = Arc::clone(&self.sig_armed);
+        // #796 L2 / #863 — the twin's async-signal source: a personality that minted a per-process
+        // door above gets it installed (the twin polls its OWN pending/mask/dispositions — POSIX
+        // fork copies signal state); otherwise fall back to sharing the parent's source + armed
+        // flag (the pre-split behavior, right when the provider's state is fully shared).
+        match twin_sig {
+            Some((source, armed)) => {
+                twin.sig_source = Some(source);
+                twin.sig_armed = armed;
+            }
+            None => {
+                twin.sig_source = self.sig_source.clone();
+                twin.sig_armed = Arc::clone(&self.sig_armed);
+            }
+        }
         // The twin gets its own copy of the value-typed quota vectors.
         twin.budgets = self.budgets.clone();
         twin.quota = self.quota;
@@ -19931,19 +19979,31 @@ impl Host {
             let entry = entry.clone();
             return Some(child.adopt_offer(entry));
         }
-        // FORK.md §8.5 slice 3 — a **forkable host proc** (e.g. posix libc): re-mint the handler in
-        // the CHILD over the *same* shared provider state via its fork factory
-        // ([`Host::grant_host_proc_forkable`]), so the child inherits the capability with its fd
-        // table / memfs shared (the manager handing its libc to a spawned guest), and the child's
-        // copy stays forkable itself (nesting / fork-of-child). A **factory-less** host proc is an
-        // opaque closure the runtime cannot carry — the re-grant refuses (`None`, fail-closed); such
-        // a cap the parent keeps. This is the deep-copy path `resolve_copyable` defers for `HostProc`.
+        // FORK.md §8.5 slice 3 / #863 — a **forkable host proc** (e.g. posix libc): re-mint the
+        // handler in the CHILD via its fork factory ([`Host::grant_host_proc_forkable`]), so the
+        // child inherits the capability (the manager handing its libc to a spawned guest) and the
+        // child's copy stays forkable itself (nesting / fork-of-child). The provider decides what a
+        // new process inherits: svm-posix mints a per-process clone (own fd table/cwd/env/signals,
+        // shared memfs — POSIX fork semantics), and its [`ForkedProc`] extras install the child's
+        // own signal door + replacement factory; a shared-state provider mints over the same state.
+        // A **factory-less** host proc is an opaque closure the runtime cannot carry — the re-grant
+        // refuses (`None`, fail-closed); such a cap the parent keeps. This is the deep-copy path
+        // `resolve_copyable` defers for `HostProc`.
         if let Ok(Binding::HostProc(idx)) = self.resolve(handle, cap_id::HOST_PROC) {
             return self
                 .host_procs
                 .get(idx as usize)
                 .and_then(|e| e.fork.clone())
-                .map(|factory| child.grant_host_proc_forkable(factory(), factory));
+                .map(|factory| {
+                    let forked = factory();
+                    if let Some((source, armed)) = forked.signal {
+                        child.set_signal_source(source, armed);
+                    }
+                    child.grant_host_proc_forkable(
+                        forked.handler,
+                        forked.refork.unwrap_or_else(|| Arc::clone(&factory)),
+                    )
+                });
         }
         // FORK.md §8.6 — a **module** grant: an immutable instantiable artifact. Re-granting shares it
         // into the child (cloning the grant entry — its `funcs`/`data`/`module` are `Arc`s, so the copy
@@ -23462,7 +23522,7 @@ mod fork_powerbox_tests {
         // And a mixed table is all-or-nothing: one factory-less entry poisons the fork.
         host.grant_host_proc_forkable(
             Box::new(|_, _, _, _| Ok(vec![1])),
-            Arc::new(|| Box::new(|_, _, _, _| Ok(vec![1]))),
+            Arc::new(|| ForkedProc::shared(Box::new(|_, _, _, _| Ok(vec![1])))),
         );
         assert!(
             host.fork_powerbox().is_none(),
@@ -23489,7 +23549,7 @@ mod fork_powerbox_tests {
             }
         };
         let mut host = Host::new();
-        let h = host.grant_host_proc_forkable(make(), Arc::new(make));
+        let h = host.grant_host_proc_forkable(make(), Arc::new(move || ForkedProc::shared(make())));
         let twin = host.fork_powerbox().expect("a forkable host_proc forks");
         // Same handle value resolves in the twin, through the factory-minted fresh closure.
         let mut twin = twin;
@@ -23530,7 +23590,8 @@ mod fork_powerbox_tests {
             }
         };
         let mut parent = Host::new();
-        let h = parent.grant_host_proc_forkable(make(), Arc::new(make));
+        let h =
+            parent.grant_host_proc_forkable(make(), Arc::new(move || ForkedProc::shared(make())));
         let mut child = Host::new();
         let ch = parent
             .regrant_into_child(h, &mut child)

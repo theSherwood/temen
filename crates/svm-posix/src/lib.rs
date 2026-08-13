@@ -10,7 +10,7 @@
 //! **State model (POSIX.md §3):** the bytes a libc call touches — a `malloc`'d buffer, a `write`
 //! source — live in the **guest window** (native-speed access; `malloc` returns a window offset). The
 //! *bookkeeping* — the allocator's cursor, captured stdout/stderr, the stdin cursor — lives host-side
-//! in [`Inner`], never in the guest's address space, so the guest cannot corrupt it.
+//! in [`World`]/[`Proc`], never in the guest's address space, so the guest cannot corrupt it.
 //!
 //! Scope: `write` / `read` / `malloc` / `free` / `exit`, plus `open` / `close` / `lseek` / `unlink`
 //! over an in-memory filesystem (a `path → bytes` memfs) with a host-side fd table, and
@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use svm_interp::{cap_id, GuestMem, Host, HostProc, SignalSource, Trap};
+use svm_interp::{cap_id, ForkedProc, GuestMem, Host, HostProc, HostProcFork, SignalSource, Trap};
 use svm_ir::ResolvedCap;
 
 /// Op numbers on the shared `HOST_PROC` handle; [`resolve`] maps libc names to these.
@@ -52,7 +52,7 @@ pub const OP_ARGC: u32 = 17;
 pub const OP_ARGV: u32 = 18;
 /// **Personality `exec` surface** (STAGE1.md §5) — how a shell running on this personality launches an
 /// external command. `exec_lookup(name_ptr, name_len) -> module_handle | -1` resolves a command name
-/// against the [`Inner::commands`] PATH registry (a `name → Module` handle map the embedder seeds); the
+/// against the [`World::commands`] PATH registry (a `name → Module` handle map the embedder seeds); the
 /// shell then drives `Instantiator.instantiate_module_named` (op 13) + `join` on the returned handle.
 /// `exec_stdout() -> stream_handle` returns the `Stream` the shell should re-grant to the child under
 /// the name `"stdout"` so the command's `write(1, …)` reaches the shell's sink. `exec_stdin(ptr, len)
@@ -466,14 +466,15 @@ fn mem_pair(client_addr: NetAddr, server_addr: NetAddr) -> (MemSock, MemSock) {
 
 /// One entry in the host-side fd table. The three stdio streams start as sentinels (`Stdin`/`Stdout`/
 /// `Stderr`) so `dup2`/`dup`/`close` treat fds `0`/`1`/`2` uniformly with the rest; `open` adds `File`;
-/// `pipe` adds a `PipeRead`/`PipeWrite` pair sharing one [`PipeBuf`]. `dup`/`dup2` clone an entry —
-/// pipe ends clone the `Arc` (shared buffer); a `File` clones its description (independent offset — the
-/// POSIX shared-offset nuance is a follow-up, irrelevant to the shell redirect pattern).
+/// `pipe` adds a `PipeRead`/`PipeWrite` pair sharing one [`PipeBuf`]. Every entry is a reference to a
+/// **shared open-file description** (#863): `dup`/`dup2` clone the reference, so dups share the offset
+/// (POSIX), and [`Proc::fork`]'s entry-wise table copy shares descriptions across processes the same
+/// way. Descriptions lock innermost (World → Proc → description; see [`World`]).
 enum FdEntry {
     Stdin,
     Stdout,
     Stderr,
-    File(OpenFile),
+    File(Arc<Mutex<OpenFile>>),
     PipeRead(PipeBuf),
     PipeWrite(PipeBuf),
     /// A connected memnet socket end (loopback; POSIX.md §5a).
@@ -485,18 +486,15 @@ enum FdEntry {
 }
 
 impl FdEntry {
-    /// Clone this entry for `dup`/`dup2`: pipe ends share the buffer (`Arc` clone), a file copies its
-    /// (independent) description, stdio sentinels are trivial.
+    /// Clone this entry for `dup`/`dup2` (and [`Proc::fork`]'s table copy): every non-sentinel arm
+    /// shares its description via `Arc` clone — a dup'd or fork-inherited file fd shares the offset,
+    /// pipe ends share the buffer, per POSIX.
     fn dup_clone(&self) -> FdEntry {
         match self {
             FdEntry::Stdin => FdEntry::Stdin,
             FdEntry::Stdout => FdEntry::Stdout,
             FdEntry::Stderr => FdEntry::Stderr,
-            FdEntry::File(of) => FdEntry::File(OpenFile {
-                path: of.path.clone(),
-                pos: of.pos,
-                writable: of.writable,
-            }),
+            FdEntry::File(of) => FdEntry::File(Arc::clone(of)),
             FdEntry::PipeRead(p) => FdEntry::PipeRead(Arc::clone(p)),
             FdEntry::PipeWrite(p) => FdEntry::PipeWrite(Arc::clone(p)),
             // Socket ends and listeners share their connection state (`Arc` clones throughout) —
@@ -521,12 +519,18 @@ struct DirStream {
 /// is suitably aligned for anything the guest stores into it.
 const ALIGN: u64 = 16;
 
-/// Host-side bookkeeping for one POSIX personality: captured output, the stdin cursor, and the
-/// window-heap allocator cursor. Lives outside the guest window (POSIX.md §3), shared (`Arc<Mutex>`)
-/// so an embedder/test can read the captured output back after a run.
-struct Inner {
+/// #863 — state **all processes of one personality share**: the "kernel side" of the split. One
+/// per world, behind one `Arc<Mutex<World>>` every process's handler holds. POSIX draws the line:
+/// the filesystem, the network, the registered commands, the embedder delegates, and the captured
+/// stdio *descriptions* are world-shared; everything a `fork()` copies lives in [`Proc`].
+///
+/// **Lock order: `World` before `Proc`, always.** Every op that needs both takes the world lock
+/// first ([`handler`] takes both at dispatch top); a proc-only path ([`SignalDoor`],
+/// [`Posix::raise_signal`]) may lock its `Proc` alone but must never then take the world lock.
+/// Open-file descriptions ([`OpenFile`]) nest innermost: World → Proc → description.
+struct World {
     stdout: Vec<u8>,
-    /// When set, fd-1 writes go **here** instead of [`Inner::stdout`], and [`Posix::stdout`] reads it
+    /// When set, fd-1 writes go **here** instead of [`World::stdout`], and [`Posix::stdout`] reads it
     /// back. This unifies the shell's own output with a spawned child's: the embedder points it at the
     /// `Host`'s shared stdout sink (`Host::shared_stdout`), the same buffer a re-granted `Stream` writes
     /// to, so the shell's `write(1, …)` and the command's `write(1, …)` interleave in one stream
@@ -534,33 +538,19 @@ struct Inner {
     /// existing embedder).
     stdout_sink: Option<Arc<Mutex<Vec<u8>>>>,
     stderr: Vec<u8>,
-    /// Preloaded standard input; `read(0, …)` drains it from `stdin_pos`.
+    /// Preloaded standard input; `read(0, …)` drains it from `stdin_pos`. World-shared: the stdin
+    /// **description** (bytes + offset) is one open file description all processes' fd-0 sentinels
+    /// point at — POSIX fork shares the offset.
     stdin: Vec<u8>,
     stdin_pos: usize,
-    /// High-water mark: the window offset fresh (never-freed) allocations bump upward from.
-    heap_next: u64,
-    /// One past the last window byte the allocator may hand out.
-    heap_end: u64,
-    /// Live allocations, `ptr → size` — so `free` knows a block's length (the size header lives
-    /// host-side, out of the guest's reach, rather than in a window prefix the guest could clobber).
-    allocated: HashMap<u64, u64>,
-    /// Freed blocks available for reuse (`offset, size`), first-fit. No coalescing yet — adjacent
-    /// frees stay separate (a fragmentation follow-up, POSIX.md §6); reuse of a same-or-larger block
-    /// works regardless.
-    free_list: Vec<(u64, u64)>,
     /// The **in-memory filesystem**: path → contents. A memfs keeps the personality self-contained and
     /// deterministic (the playground has no disk); a native embedder routing to a real `fs` cap is a
-    /// follow-up. Shared file bytes; per-fd offsets live in [`Inner::fds`].
+    /// follow-up. Shared file bytes; per-fd offsets live in each fd's [`OpenFile`] description.
     files: HashMap<String, Vec<u8>>,
     /// Explicitly-created **empty** directories (`mkdir`). The memfs otherwise infers directories as
     /// prefixes of file keys, which can't represent a dir with no files under it; this set carries those.
     /// A path is a directory if it is the root, appears here, or is a proper prefix of some file key.
     explicit_dirs: HashSet<String>,
-    /// The host-side fd table (indexed by fd). Seeded with the three stdio sentinels at `0`/`1`/`2`
-    /// (`FdEntry::Stdin`/`Stdout`/`Stderr`), so `dup2`/`dup`/`close`/`fcntl` treat every fd uniformly.
-    /// `open`/`pipe`/`dup` allocate the lowest free slot; a closed fd (including a closed stdio fd) is
-    /// reused, matching POSIX "lowest available".
-    fds: Vec<Option<FdEntry>>,
     /// Loopback memnet listeners: bound port → the pending-connection queue its `accept` pops and a
     /// loopback `connect` pushes into. (The queue is shared with the listener's `FdEntry`; this index
     /// exists so `connect` can find it by port and `bind` can detect `-EADDRINUSE`.)
@@ -570,32 +560,11 @@ struct Inner {
     /// The embedder's network delegate ([`Posix::set_net`]) — authority beyond loopback. `None` ⇒
     /// non-loopback fails closed.
     net_delegate: Option<Box<dyn NetDelegate>>,
-    /// Open directory streams (`opendir`/`readdir`/`closedir`), indexed by the `DIR*`-analog handle
-    /// `opendir` returns. Each holds the immediate child names snapshotted at `opendir` time and a
-    /// read cursor. Separate from [`Inner::fds`] (a directory stream is not a file fd here).
-    dirs: Vec<Option<DirStream>>,
-    /// The program's argument vector (`args[0]` is the program name), delivered **host-side** — the
-    /// symmetric analogue of the environment: `argc`/`argv` read it, the embedder sets it. This is how
-    /// a personality program gets `sh -c "…"` without the window args buffer (POSIX.md §5); a guest
-    /// crt that wants a standard `main(int, char**)` builds `argv[]` from these ops.
-    args: Vec<String>,
-    /// The current working directory `getcwd` reports and `chdir` updates. A plain string — the memfs
-    /// is flat (paths are used as-given), so `cwd` is not validated against it; path normalization/
-    /// resolution is a follow-up (POSIX.md §6).
-    cwd: String,
-    /// The environment: `name → value`. `getenv`/`setenv` read and update it; host-side, out of the
-    /// guest's reach, like the rest of the bookkeeping (POSIX.md §3).
-    env: HashMap<String, String>,
     /// The monotonic-clock base — `clock(1)` reports nanos elapsed since this. Captured at creation.
     clock_base: std::time::Instant,
     /// A pinned clock value (`Some(nanos)`) for determinism: when set, `clock(_)` returns it verbatim
     /// so a differential run is reproducible. `None` reads the real host clock.
     clock_fixed: Option<i64>,
-    /// Cache of `getenv` results already materialized into the window: `name → ptr`. C's `getenv`
-    /// returns a stable `char*` into libc-owned storage, so a repeated `getenv("X")` must return the
-    /// **same** pointer; we allocate a NUL-terminated copy in the arena once and reuse it. `setenv`
-    /// invalidates the entry so the next `getenv` re-materializes the new value.
-    env_ptrs: HashMap<String, u64>,
     /// The **PATH registry** (STAGE1.md §5): command name → `(granted Module handle, declared window
     /// size_log2)`. `exec_lookup` returns the handle; `exec_win` the size_log2 (so the shell carves each
     /// spawn to the command's own window). The embedder seeds it with [`Posix::register_command`] after
@@ -615,22 +584,72 @@ struct Inner {
     /// The embedder-wired **spawn delegate** ([`Posix::set_spawn`]) — the authority `spawn` needs to run
     /// a child. `None` until wired, in which case `spawn` is `-ENOSYS` (fail closed).
     spawn_fn: Option<SpawnFn>,
-    /// Reaped-pending children: synthetic `pid → wait-encoded status`. `spawn` runs the child to
-    /// completion and records its status here; `waitpid`/`wait` remove and return it.
+    /// Reaped-pending children of the synchronous `spawn` path: synthetic `pid → wait-encoded status`.
+    /// `spawn` runs the child to completion and records its status here; `waitpid`/`wait` remove and
+    /// return it. (#863 slice 2 unifies this synthetic pid space with the scheduler's twin pids.)
     children: HashMap<i32, i32>,
     /// The next synthetic pid `spawn` hands out. Starts at `1000` (well clear of small fd/int values, so
     /// a pid is never confused with an fd in a test).
     next_pid: i32,
+}
+
+/// #863 — **per-process** state: what POSIX `fork()` copies (and what `exec` will one day reset).
+/// One per process domain; a `fork()` twin gets [`Proc::fork`]'s clone — fd *table* copied
+/// entry-wise over shared descriptions, cwd/env/args copied, allocator copied (paired with the
+/// twin's private window copy), signal dispositions/mask copied with **pending cleared**. See
+/// [`World`] for the shared side and the lock order.
+struct Proc {
+    /// High-water mark: the window offset fresh (never-freed) allocations bump upward from.
+    heap_next: u64,
+    /// One past the last window byte the allocator may hand out.
+    heap_end: u64,
+    /// Live allocations, `ptr → size` — so `free` knows a block's length (the size header lives
+    /// host-side, out of the guest's reach, rather than in a window prefix the guest could clobber).
+    allocated: HashMap<u64, u64>,
+    /// Freed blocks available for reuse (`offset, size`), first-fit. No coalescing yet — adjacent
+    /// frees stay separate (a fragmentation follow-up, POSIX.md §6); reuse of a same-or-larger block
+    /// works regardless.
+    free_list: Vec<(u64, u64)>,
+    /// The host-side fd **table** (indexed by fd) — per-process, POSIX: a fork copies the table, a
+    /// child's `close`/`dup2` never disturbs its parent's numbering. Entries point at **shared**
+    /// descriptions (an [`OpenFile`] `Arc`, a pipe buffer, a socket), so offsets and liveness are
+    /// shared where POSIX shares them. Seeded with the three stdio sentinels at `0`/`1`/`2`
+    /// (`FdEntry::Stdin`/`Stdout`/`Stderr`); `open`/`pipe`/`dup` allocate the lowest free slot.
+    fds: Vec<Option<FdEntry>>,
+    /// Open directory streams (`opendir`/`readdir`/`closedir`), indexed by the `DIR*`-analog handle
+    /// `opendir` returns. Each holds the immediate child names snapshotted at `opendir` time and a
+    /// read cursor. Separate from [`Proc::fds`] (a directory stream is not a file fd here).
+    dirs: Vec<Option<DirStream>>,
+    /// The program's argument vector (`args[0]` is the program name), delivered **host-side** — the
+    /// symmetric analogue of the environment: `argc`/`argv` read it, the embedder sets it. This is how
+    /// a personality program gets `sh -c "…"` without the window args buffer (POSIX.md §5); a guest
+    /// crt that wants a standard `main(int, char**)` builds `argv[]` from these ops.
+    args: Vec<String>,
+    /// The current working directory `getcwd` reports and `chdir` updates — per-process (a subshell's
+    /// `cd` must not move its parent). A plain string — the memfs is flat (paths are used as-given),
+    /// so `cwd` is not validated against it; path normalization/resolution is a follow-up (POSIX.md §6).
+    cwd: String,
+    /// The environment: `name → value` — per-process (POSIX fork copies it; a child's `setenv` is
+    /// invisible to the parent). `getenv`/`setenv` read and update it; host-side, out of the guest's
+    /// reach, like the rest of the bookkeeping (POSIX.md §3).
+    env: HashMap<String, String>,
+    /// Cache of `getenv` results already materialized into the window: `name → ptr`. C's `getenv`
+    /// returns a stable `char*` into libc-owned storage, so a repeated `getenv("X")` must return the
+    /// **same** pointer; we allocate a NUL-terminated copy in the arena once and reuse it. `setenv`
+    /// invalidates the entry so the next `getenv` re-materializes the new value. Per-process (the
+    /// pointers land in this process's own window arena).
+    env_ptrs: HashMap<String, u64>,
     /// **Pending signals** — the L0 doorbell. Bit `s` set ⇒ signal `s` has been raised (`kill`/
-    /// [`Posix::raise_signal`]) and not yet polled. Signals are `1..=63` (one `u64`).
+    /// [`Posix::raise_signal`]) and not yet polled. Signals are `1..=63` (one `u64`). Per-process, and
+    /// **cleared** in a fork twin (POSIX: the child starts with no pending signals).
     sig_pending: u64,
     /// **Signal dispositions**: `signum → handler` (`SIG_DFL`/`SIG_IGN`/a guest handler pointer), set by
     /// `signal`/`sigaction`. Absent ⇒ `SIG_DFL`. `sigcheck` consults this to deliver caught signals and
-    /// drop the rest.
+    /// drop the rest. Copied into a fork twin (POSIX: dispositions are inherited).
     sig_handler: HashMap<i32, i64>,
     /// **Signal mask** — the blocked set (`sigprocmask`, #796). Bit `s` set ⇒ signal `s` is blocked: a
     /// pending blocked signal is held (not delivered by `sigcheck`) until unblocked. `SIGKILL`/`SIGSTOP`
-    /// are never blockable, so those bits stay clear.
+    /// are never blockable, so those bits stay clear. Copied into a fork twin.
     sig_mask: u64,
     /// **Per-signal `sigaction` extras** (`sa_mask` / `sa_flags`), kept for round-trip fidelity (`oldact`).
     /// The poll model does not yet auto-block `sa_mask` while a handler runs, nor act on `SA_RESTART` —
@@ -639,32 +658,49 @@ struct Inner {
     sig_action_flags: HashMap<i32, i64>,
     /// #796 L2 — the guest's registered **signal-handler stack** base (`sigaltstack`), the data-SP an async
     /// handler runs on. `0` ⇒ no stack ⇒ async delivery is off (poll-only). Distinct from the guest's normal
-    /// stack because the interp can't compute where the interrupted frame's stack ends.
+    /// stack because the interp can't compute where the interrupted frame's stack ends. Copied into a
+    /// fork twin (POSIX: the signal stack settings are inherited; the twin's window is a private copy,
+    /// so the base points at the twin's own copy of the stack).
     sig_stack_base: u64,
     /// #796 L2 — the **armed** flag shared with the interp ([`Host::sig_armed`]): set when a caught,
     /// unmasked signal may be deliverable, so the interp's per-op poll knows to ask [`SignalSource`]. The
-    /// same `Arc` is handed to the `Host` at grant time.
+    /// same `Arc` is handed to the `Host` at grant time. A fork twin gets a **fresh** flag (its door is
+    /// its own).
     sig_armed: Arc<AtomicBool>,
     /// #799 L1 (embedder `^C`) — the interp's **scheduler-wake** closure, installed at run start via
     /// [`SignalSource::set_wake`] and cleared to a no-op at teardown. [`Posix::raise_signal`] invokes it
     /// after raising a **deliverable** signal, so an embedder `^C` interrupts a parked blocking syscall
     /// even when every fiber is parked (no per-op safepoint to notice the arm). `None` until a run installs
-    /// it (and between runs).
+    /// it (and between runs); `None` again in a fork twin (each run re-installs).
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
-/// A handle to a granted POSIX personality's shared state — read the captured output after a run.
-/// Cheap to clone (shares one `Arc`).
+/// One dispatch's view over the two personality lock domains — the shared [`World`] and the calling
+/// process's [`Proc`], both locked at dispatch top ([`handler`]) in the canonical order (world,
+/// then proc; see [`World`]). The op bodies are methods here; pure-`Proc` signal helpers
+/// ([`Proc::arm_signals`], [`Proc::deliverable_now`]) live on [`Proc`] so proc-only doors reach
+/// them without the world lock.
+struct Ctx<'a> {
+    w: &'a mut World,
+    p: &'a mut Proc,
+}
+
+/// A handle to a granted POSIX personality's state — read the captured output after a run, stage
+/// the memfs/env, raise embedder signals. Cheap to clone (shares the `Arc`s). #863: holds the
+/// shared [`World`] plus the **root process's** [`Proc`] — the proc-side setters (`set_env`,
+/// `set_args`, `cwd`, `raise_signal`) address the root process, matching the pre-split embedder
+/// semantics (per-child addressing is #863 slice 2's process table).
 #[derive(Clone)]
 pub struct Posix {
-    inner: Arc<Mutex<Inner>>,
+    world: Arc<Mutex<World>>,
+    root: Arc<Mutex<Proc>>,
 }
 
 impl Posix {
     /// Bytes the guest `write`-to-fd-1'd — from the shared sink when one is set ([`Posix::set_stdout_sink`]),
     /// else the personality's own captured buffer.
     pub fn stdout(&self) -> Vec<u8> {
-        let st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let st = self.world.lock().unwrap_or_else(|e| e.into_inner());
         match &st.stdout_sink {
             Some(sink) => sink.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             None => st.stdout.clone(),
@@ -672,7 +708,7 @@ impl Posix {
     }
     /// Bytes the guest `write`-to-fd-2'd.
     pub fn stderr(&self) -> Vec<u8> {
-        self.inner
+        self.world
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .stderr
@@ -681,7 +717,7 @@ impl Posix {
 
     /// Seed (or overwrite) a memfs file — how an embedder/test stages the filesystem a guest `open`s.
     pub fn write_file(&self, path: &str, bytes: &[u8]) {
-        self.inner
+        self.world
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .files
@@ -690,7 +726,7 @@ impl Posix {
 
     /// Read a memfs file back — how an embedder/test inspects what the guest wrote.
     pub fn read_file(&self, path: &str) -> Option<Vec<u8>> {
-        self.inner
+        self.world
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .files
@@ -701,7 +737,7 @@ impl Posix {
     /// Seed (or overwrite) an environment variable — how an embedder/test stages the environment a
     /// guest `getenv`s. Invalidates any cached `getenv` pointer for the name.
     pub fn set_env(&self, name: &str, value: &str) {
-        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.root.lock().unwrap_or_else(|e| e.into_inner());
         st.env_ptrs.remove(name);
         st.env.insert(name.to_string(), value.to_string());
     }
@@ -709,7 +745,7 @@ impl Posix {
     /// Pin the clock to a fixed `nanos` value (all `clock(_)` calls return it) — how a test makes
     /// `std::time` deterministic. Passing a value makes a differential run reproducible.
     pub fn set_clock(&self, nanos: i64) {
-        self.inner
+        self.world
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clock_fixed = Some(nanos);
@@ -717,7 +753,7 @@ impl Posix {
 
     /// The current working directory — how an embedder/test observes a guest `chdir`.
     pub fn cwd(&self) -> String {
-        self.inner
+        self.root
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .cwd
@@ -728,7 +764,7 @@ impl Posix {
     /// embedder hands a personality program its `argv` (e.g. `["sh", "-c", "echo hi"]`), read back by
     /// the guest through the `argc`/`argv` ops.
     pub fn set_args(&self, args: &[&str]) {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).args =
+        self.root.lock().unwrap_or_else(|e| e.into_inner()).args =
             args.iter().map(|s| s.to_string()).collect();
     }
 
@@ -737,7 +773,7 @@ impl Posix {
     /// (STAGE1.md §5). Pass the `Host`'s shared stdout (`Host::shared_stdout()`). [`Posix::stdout`] then
     /// reads this sink back.
     pub fn set_stdout_sink(&self, sink: Arc<Mutex<Vec<u8>>>) {
-        self.inner
+        self.world
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .stdout_sink = Some(sink);
@@ -748,7 +784,7 @@ impl Posix {
     /// shell's `exec_lookup(name)` returns it (or `-1` when absent). A later registration of the same
     /// name shadows the earlier (last wins), matching a `PATH` re-export.
     pub fn register_command(&self, name: &str, module_handle: i32, win_log2: u8) {
-        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.world.lock().unwrap_or_else(|e| e.into_inner());
         st.commands.retain(|(n, _, _)| n != name);
         st.commands
             .push((name.to_string(), module_handle, win_log2));
@@ -758,7 +794,7 @@ impl Posix {
     /// `exec_stdout()` returns. Grant the `Stream` on the same `Host`, routed to the shared sink
     /// (`set_stdout_sink`), so the child's output joins the shell's (STAGE1.md §5).
     pub fn set_exec_stdout(&self, handle: i32) {
-        self.inner
+        self.world
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .exec_stdout_handle = handle;
@@ -769,7 +805,7 @@ impl Posix {
     /// [`Host::grant_input_pipe`] call on the same `Host`; `exec_stdin(ptr, len)` pushes the guest bytes
     /// into `fifo` and returns `handle`, so the child's `read(0, …)` drains them (then EOF).
     pub fn set_exec_stdin(&self, handle: i32, fifo: Arc<Mutex<VecDeque<u8>>>) {
-        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.world.lock().unwrap_or_else(|e| e.into_inner());
         st.exec_stdin_handle = handle;
         st.exec_stdin_fifo = Some(fifo);
     }
@@ -784,7 +820,7 @@ impl Posix {
     where
         F: FnMut(&str, &[String], &[u8]) -> SpawnResult + Send + 'static,
     {
-        self.inner
+        self.world
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .spawn_fn = Some(Box::new(f));
@@ -795,7 +831,7 @@ impl Posix {
     /// is `-ECONNREFUSED` and a non-`localhost` `resolve` is `-ENOENT` — fail closed. The delegate
     /// is where policy lives: a real socket, a scripted table, an allowlisting proxy.
     pub fn set_net(&self, delegate: impl NetDelegate + 'static) {
-        self.inner
+        self.world
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .net_delegate = Some(Box::new(delegate));
@@ -816,7 +852,7 @@ impl Posix {
         // notice the arm gets interrupted → `-EINTR` (#799 L1, the terminal `^C`). An ignored/masked
         // signal is not deliverable, so `wake` stays untouched and nothing is interrupted.
         let wake = {
-            let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut st = self.root.lock().unwrap_or_else(|e| e.into_inner());
             st.sig_pending |= 1 << signum;
             st.arm_signals(); // #796 L2 — deliverable async, not just at the next poll
             if st.deliverable_now() {
@@ -941,11 +977,13 @@ pub fn bind_with_fork(
 /// data/stack). `stdin` preloads standard input for `read(0, …)`. Every libc import in a linked module
 /// shares this **one** handle (svm-wasm/chibicc thread a single capability handle); the op number
 /// distinguishes the call, so pass the handle as the entry's leading argument.
-/// #796 L2 — the interp-facing async-signal door: the [`SignalSource`] the `Host` holds. It locks the
-/// shared `Inner` on demand (the interp holds no personality lock at a safepoint) and returns the next
-/// deliverable handler, keeping POSIX signal *policy* (dispositions, mask, pending) inside this
-/// personality while the interp only performs the *mechanism* (the safepoint redirect, invariant 4).
-struct SignalDoor(Arc<Mutex<Inner>>);
+/// #796 L2 — the interp-facing async-signal door: the [`SignalSource`] the `Host` holds. It locks
+/// **its own process's** [`Proc`] on demand (the interp holds no personality lock at a safepoint; a
+/// proc-only lock, never the world — see [`World`]'s lock order) and returns the next deliverable
+/// handler, keeping POSIX signal *policy* (dispositions, mask, pending) inside this personality
+/// while the interp only performs the *mechanism* (the safepoint redirect, invariant 4). #863: one
+/// door per process — a fork twin's door locks the twin's `Proc`, so its signals are its own.
+struct SignalDoor(Arc<Mutex<Proc>>);
 
 impl SignalSource for SignalDoor {
     fn take_deliverable(&self) -> Option<(i32, i32, u64)> {
@@ -985,25 +1023,51 @@ impl SignalSource for SignalDoor {
 }
 
 pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> (i32, Posix) {
-    let inner = Arc::new(Mutex::new(new_inner(heap_base, heap_end, stdin)));
+    let world = Arc::new(Mutex::new(new_world(stdin)));
+    let root = Arc::new(Mutex::new(new_proc(heap_base, heap_end)));
     let posix = Posix {
-        inner: Arc::clone(&inner),
+        world: Arc::clone(&world),
+        root: Arc::clone(&root),
     };
     // #796 L2 — install the async-signal source + the shared `armed` flag (the *same* `Arc` the
     // personality mutates), so the interp can redirect into a handler at a safepoint (PROCESS.md §9 L2).
-    let armed = inner
+    let armed = root
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .sig_armed
         .clone();
-    host.set_signal_source(Arc::new(SignalDoor(Arc::clone(&inner))), armed);
-    // FORK.md PR 5 — grant **forkable**: the factory re-mints the handler over the *same* shared
-    // `Inner` (fd table + memfs + cwd/env + captured output), so a `fork()` twin inherits the whole
-    // libc state, shared — POSIX fork-shares-open-file-descriptions. `Host::fork_powerbox` calls this
-    // factory to carry libc into the twin, instead of failing closed on an opaque closure.
-    let make = move || handler(Arc::clone(&inner));
-    let handle = host.grant_host_proc_forkable(make(), Arc::new(make));
+    host.set_signal_source(Arc::new(SignalDoor(Arc::clone(&root))), armed);
+    // FORK.md PR 5 / #863 — grant **forkable**: the factory clones the per-process side by POSIX's
+    // rules ([`Proc::fork`]) and shares the [`World`], so a `fork()` twin gets its own fd table /
+    // cwd / env / signal state over the shared memfs and open-file descriptions — real POSIX fork
+    // semantics. `Host::fork_powerbox` calls this factory to carry libc into the twin, instead of
+    // failing closed on an opaque closure.
+    let handle = host.grant_host_proc_forkable(
+        handler(Arc::clone(&world), Arc::clone(&root)),
+        fork_factory(world, root),
+    );
     (handle, posix)
+}
+
+/// #863 — the self-replicating fork factory over one process: mints a `fork()` twin's handler +
+/// signal door over a fresh [`Proc::fork`] clone (world shared), and a **replacement factory** over
+/// the twin's own `Proc` — so fork-of-fork clones the twin's state, not the grandparent's.
+fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFork {
+    Arc::new(move || {
+        let child = Arc::new(Mutex::new(
+            proc_.lock().unwrap_or_else(|e| e.into_inner()).fork(),
+        ));
+        let armed = child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sig_armed
+            .clone();
+        ForkedProc {
+            handler: handler(Arc::clone(&world), Arc::clone(&child)),
+            signal: Some((Arc::new(SignalDoor(Arc::clone(&child))), armed)),
+            refork: Some(fork_factory(Arc::clone(&world), child)),
+        }
+    })
 }
 
 /// Build the personality as a re-grantable **capability factory** for the powerbox model (svm-run's
@@ -1018,12 +1082,23 @@ pub fn cap(
     heap_end: u64,
     stdin: Vec<u8>,
 ) -> (Posix, impl Fn() -> HostProc + Send + Sync + 'static) {
-    let inner = Arc::new(Mutex::new(new_inner(heap_base, heap_end, stdin)));
+    let world = Arc::new(Mutex::new(new_world(stdin)));
+    let root = Arc::new(Mutex::new(new_proc(heap_base, heap_end)));
     let posix = Posix {
-        inner: Arc::clone(&inner),
+        world: Arc::clone(&world),
+        root: Arc::clone(&root),
     };
-    let make = move || handler(Arc::clone(&inner));
+    // Per-backend mint over the SAME world+proc: the interp and JIT hosts are two engines of one
+    // process, so they share both sides (unlike a fork, which clones the proc side).
+    let make = move || handler(Arc::clone(&world), Arc::clone(&root));
     (posix, make)
+}
+
+/// #863 — the [`fork_factory`] over an existing [`cap`]/[`grant`] personality's **root process**,
+/// for embedders that grant the personality through the powerbox path (`HostCap`) and want real
+/// POSIX fork semantics there too (svm-run's `posix_cap`).
+pub fn cap_fork_factory(posix: &Posix) -> HostProcFork {
+    fork_factory(Arc::clone(&posix.world), Arc::clone(&posix.root))
 }
 
 /// The **`net` capability** as a factory over an existing personality (POSIX.md §5a) — the same
@@ -1031,16 +1106,22 @@ pub fn cap(
 /// over the *same* shared state, so the socket fds it mints live in the same fd table the libc
 /// `read`/`write`/`close`/`dup2` ops serve — the data plane needs no new surface.
 pub fn net_cap_factory(posix: &Posix) -> impl Fn() -> HostProc + Send + Sync + 'static {
-    let inner = Arc::clone(&posix.inner);
-    move || net_handler(Arc::clone(&inner))
+    let world = Arc::clone(&posix.world);
+    let root = Arc::clone(&posix.root);
+    move || net_handler(Arc::clone(&world), Arc::clone(&root))
 }
 
 /// Build the `net` capability's [`HostProc`] handler over shared `inner`: the tiny authority surface
 /// (connect / bind / accept / shutdown / resolve). An unknown op is a clean `CapFault`.
-fn net_handler(inner: Arc<Mutex<Inner>>) -> HostProc {
+fn net_handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
     Box::new(
         move |op, args, mem, _minter: Option<&mut dyn svm_interp::RegionMinter>| {
-            let mut st = inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
+            let mut p = proc_.lock().unwrap_or_else(|e| e.into_inner());
+            let mut st = Ctx {
+                w: &mut w,
+                p: &mut p,
+            };
             match op {
                 NET_CONNECT => st.net_connect(args, mem),
                 NET_BIND => st.net_bind(args, mem),
@@ -1053,36 +1134,22 @@ fn net_handler(inner: Arc<Mutex<Inner>>) -> HostProc {
     )
 }
 
-/// A fresh personality state: preloaded `stdin`, the window-heap arena bounded by `[heap_base, heap_end)`,
-/// and the three stdio sentinels seeded in the fd table. Shared by [`grant`] and [`cap`].
-fn new_inner(heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> Inner {
-    Inner {
+/// A fresh shared [`World`]: preloaded `stdin`, empty memfs, no delegates. Shared by [`grant`] and
+/// [`cap`]; every process of the personality shares this one.
+fn new_world(stdin: Vec<u8>) -> World {
+    World {
         stdout: Vec::new(),
         stdout_sink: None,
         stderr: Vec::new(),
         stdin,
         stdin_pos: 0,
-        heap_next: heap_base,
-        heap_end,
-        allocated: HashMap::new(),
-        free_list: Vec::new(),
         files: HashMap::new(),
         explicit_dirs: HashSet::new(),
-        fds: vec![
-            Some(FdEntry::Stdin),
-            Some(FdEntry::Stdout),
-            Some(FdEntry::Stderr),
-        ],
         net_listeners: HashMap::new(),
         net_next_port: 49152, // the IANA ephemeral range start
         net_delegate: None,
-        dirs: Vec::new(),
-        args: Vec::new(),
-        cwd: "/".to_string(),
-        env: HashMap::new(),
         clock_base: std::time::Instant::now(),
         clock_fixed: None,
-        env_ptrs: HashMap::new(),
         commands: Vec::new(),
         exec_stdout_handle: 0,
         exec_stdin_handle: 0,
@@ -1090,6 +1157,27 @@ fn new_inner(heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> Inner {
         spawn_fn: None,
         children: HashMap::new(),
         next_pid: 1000,
+    }
+}
+
+/// A fresh [`Proc`]: the window-heap arena bounded by `[heap_base, heap_end)`, the three stdio
+/// sentinels seeded in the fd table, default signal state.
+fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
+    Proc {
+        heap_next: heap_base,
+        heap_end,
+        allocated: HashMap::new(),
+        free_list: Vec::new(),
+        fds: vec![
+            Some(FdEntry::Stdin),
+            Some(FdEntry::Stdout),
+            Some(FdEntry::Stderr),
+        ],
+        dirs: Vec::new(),
+        args: Vec::new(),
+        cwd: "/".to_string(),
+        env: HashMap::new(),
+        env_ptrs: HashMap::new(),
         sig_pending: 0,
         sig_handler: HashMap::new(),
         sig_mask: 0,
@@ -1101,12 +1189,19 @@ fn new_inner(heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> Inner {
     }
 }
 
-/// Build the POSIX [`HostProc`] handler over shared `inner`. Dispatches on the op number; an unknown op
-/// on this handle is a `CapFault` (as for any capability).
-fn handler(inner: Arc<Mutex<Inner>>) -> HostProc {
+/// Build the POSIX [`HostProc`] handler for one process: the shared [`World`] + this process's
+/// [`Proc`]. Dispatches on the op number; an unknown op on this handle is a `CapFault` (as for any
+/// capability). Both locks are taken at dispatch top in the canonical order (world, then proc — see
+/// [`World`]), exactly the blanket-lock scope the pre-split single mutex had.
+fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
     Box::new(
         move |op, args, mem, _minter: Option<&mut dyn svm_interp::RegionMinter>| {
-            let mut st = inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
+            let mut p = proc_.lock().unwrap_or_else(|e| e.into_inner());
+            let mut st = Ctx {
+                w: &mut w,
+                p: &mut p,
+            };
             match op {
                 OP_WRITE => st.write(args, mem),
                 OP_READ => st.read(args, mem),
@@ -1127,10 +1222,10 @@ fn handler(inner: Arc<Mutex<Inner>>) -> HostProc {
                 OP_OPENDIR => st.opendir(args, mem),
                 OP_READDIR => st.readdir(args, mem),
                 OP_CLOSEDIR => Ok(vec![st.closedir(args)]),
-                OP_ARGC => Ok(vec![st.args.len() as i64]),
+                OP_ARGC => Ok(vec![st.p.args.len() as i64]),
                 OP_ARGV => st.argv(args, mem),
                 OP_EXEC_LOOKUP => st.exec_lookup(args, mem),
-                OP_EXEC_STDOUT => Ok(vec![st.exec_stdout_handle as i64]),
+                OP_EXEC_STDOUT => Ok(vec![st.w.exec_stdout_handle as i64]),
                 OP_EXEC_STDIN => st.exec_stdin(args, mem),
                 OP_EXEC_WIN => st.exec_win(args),
                 OP_PIPE => st.pipe(args, mem),
@@ -1161,7 +1256,83 @@ fn handler(inner: Arc<Mutex<Inner>>) -> HostProc {
     )
 }
 
-impl Inner {
+impl Proc {
+    /// #796 L2 — nudge the interp's per-op poll to check for delivery: set the shared `armed` flag when
+    /// async delivery is *possible* (a signal stack is registered). `SignalSource::take_deliverable` is
+    /// authoritative and disarms if nothing is actually deliverable, so an over-eager arm costs only one
+    /// no-op poll. Called wherever a signal may become deliverable (raise / unblock / install a handler /
+    /// register a stack).
+    fn arm_signals(&self) {
+        if self.sig_stack_base != 0 {
+            self.sig_armed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// #799 L1 — is a signal **deliverable right now**? Non-destructive twin of [`SignalDoor::
+    /// take_deliverable`]'s gate: a caught (`> SIG_IGN`), unmasked, pending signal with async delivery on
+    /// (a signal stack registered). This is the personality's *policy* the embedder-`^C` path consults
+    /// before poking the interp: an ignored or masked signal is **not** deliverable, so it never interrupts
+    /// a blocked syscall.
+    fn deliverable_now(&self) -> bool {
+        if self.sig_stack_base == 0 {
+            return false; // async delivery off (poll-only)
+        }
+        let mut d = self.sig_pending & !self.sig_mask;
+        while d != 0 {
+            let s = d.trailing_zeros() as i32;
+            d &= !(1u64 << s);
+            if self.sig_handler.get(&s).copied().unwrap_or(SIG_DFL) > SIG_IGN {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// #863 — POSIX `fork()` of the per-process state, in one place so the rules are auditable:
+    /// the fd **table** is copied entry-wise over **shared** descriptions ([`FdEntry::dup_clone`] —
+    /// offsets and pipe liveness stay shared, POSIX fork-shares-open-file-descriptions), cwd / env /
+    /// args are copied, the allocator bookkeeping is copied (it describes the twin's private window
+    /// copy equally), signal dispositions / mask / `sigaction` extras / the signal stack are copied,
+    /// and **pending signals are cleared** (POSIX: a child starts with none). The twin gets a fresh
+    /// `armed` flag (its door is its own) and no wake (each run installs its own).
+    fn fork(&self) -> Proc {
+        Proc {
+            heap_next: self.heap_next,
+            heap_end: self.heap_end,
+            allocated: self.allocated.clone(),
+            free_list: self.free_list.clone(),
+            fds: self
+                .fds
+                .iter()
+                .map(|s| s.as_ref().map(FdEntry::dup_clone))
+                .collect(),
+            dirs: self
+                .dirs
+                .iter()
+                .map(|s| {
+                    s.as_ref().map(|d| DirStream {
+                        entries: d.entries.clone(),
+                        pos: d.pos,
+                    })
+                })
+                .collect(),
+            args: self.args.clone(),
+            cwd: self.cwd.clone(),
+            env: self.env.clone(),
+            env_ptrs: self.env_ptrs.clone(),
+            sig_pending: 0,
+            sig_handler: self.sig_handler.clone(),
+            sig_mask: self.sig_mask,
+            sig_action_mask: self.sig_action_mask.clone(),
+            sig_action_flags: self.sig_action_flags.clone(),
+            sig_stack_base: self.sig_stack_base,
+            sig_armed: Arc::new(AtomicBool::new(false)),
+            wake: None,
+        }
+    }
+}
+
+impl Ctx<'_> {
     /// `write(fd, buf, len) -> n | -errno`: the `Stdout`/`Stderr` sentinels append to the captured
     /// stdout/stderr; a `File` fd writes into its memfs file at the offset (extending it), advancing it;
     /// a `PipeWrite` fd appends to its shared buffer. `Stdin`, a `PipeRead`, a read-only file, and an
@@ -1180,14 +1351,14 @@ impl Inner {
 
     /// Write `data` to fd `fd`'s current binding, returning the count or `-EBADF`: the `Stdout`/`Stderr`
     /// sentinels append to captured stdout/stderr, a `File` writes at its offset, a `PipeWrite` appends to
-    /// its shared buffer. Factored out of [`Inner::write`] so `spawn` can route a child's captured stdout
+    /// its shared buffer. Factored out of [`Ctx::write`] so `spawn` can route a child's captured stdout
     /// to *whatever the caller's fd 1 currently is* (the fd-inheritance path). Empty `data` is a `0` no-op.
     fn sink_write(&mut self, fd: i64, data: &[u8]) -> i64 {
         if data.is_empty() {
             return 0;
         }
-        // Decide the sink first (cloning the pipe `Arc`) so we don't hold a borrow of `self.fds` while
-        // mutating `self.stdout`/`self.stderr`/the memfs.
+        // Decide the sink first (cloning the pipe `Arc`) so we don't hold a borrow of `self.p.fds` while
+        // mutating `self.w.stdout`/`self.w.stderr`/the memfs.
         enum Sink {
             Stdout,
             Stderr,
@@ -1207,14 +1378,14 @@ impl Inner {
             _ => Sink::Bad,
         };
         match sink {
-            Sink::Stdout => match &self.stdout_sink {
+            Sink::Stdout => match &self.w.stdout_sink {
                 Some(s) => s
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .extend_from_slice(data),
-                None => self.stdout.extend_from_slice(data),
+                None => self.w.stdout.extend_from_slice(data),
             },
-            Sink::Stderr => self.stderr.extend_from_slice(data),
+            Sink::Stderr => self.w.stderr.extend_from_slice(data),
             Sink::File => return self.file_write(fd as usize, data),
             Sink::Pipe(p) => p
                 .lock()
@@ -1264,9 +1435,9 @@ impl Inner {
         };
         let chunk: Vec<u8> = match src {
             Src::Stdin => {
-                let avail = &self.stdin[self.stdin_pos.min(self.stdin.len())..];
+                let avail = &self.w.stdin[self.w.stdin_pos.min(self.w.stdin.len())..];
                 let n = len.min(avail.len());
-                self.stdin_pos += n;
+                self.w.stdin_pos += n;
                 avail[..n].to_vec()
             }
             Src::File => match self.file_read(fd as usize, len) {
@@ -1314,7 +1485,7 @@ impl Inner {
         if fd < 0 {
             return None;
         }
-        self.fds.get(fd as usize).and_then(|s| s.as_ref())
+        self.p.fds.get(fd as usize).and_then(|s| s.as_ref())
     }
 
     /// `open(path_ptr, path_len, flags) -> fd | -errno`: open (or `O_CREAT`) a memfs file, returning a
@@ -1329,22 +1500,24 @@ impl Inner {
         let Ok(path) = String::from_utf8(bytes) else {
             return Ok(vec![EINVAL]);
         };
-        let exists = self.files.contains_key(&path);
+        let exists = self.w.files.contains_key(&path);
         if !exists && flags & O_CREAT == 0 {
             return Ok(vec![ENOENT]);
         }
-        let file = self.files.entry(path.clone()).or_default();
+        let file = self.w.files.entry(path.clone()).or_default();
         if flags & O_TRUNC != 0 {
             file.clear();
         }
         let pos = if flags & O_APPEND != 0 { file.len() } else { 0 };
         let acc = flags & O_ACCMODE;
         let writable = acc == O_WRONLY || acc == O_RDWR;
-        Ok(vec![self.alloc_fd(FdEntry::File(OpenFile {
-            path,
-            pos,
-            writable,
-        }))])
+        Ok(vec![self.alloc_fd(FdEntry::File(Arc::new(Mutex::new(
+            OpenFile {
+                path,
+                pos,
+                writable,
+            },
+        ))))])
     }
 
     /// `close(fd) -> 0 | -errno`: release any open fd (a file, a pipe end, or a stdio sentinel — a shell
@@ -1352,17 +1525,18 @@ impl Inner {
     fn close(&mut self, args: &[i64]) -> i64 {
         let fd = *args.first().unwrap_or(&-1);
         if fd >= 0 {
-            if let Some(slot) = self.fds.get_mut(fd as usize) {
+            if let Some(slot) = self.p.fds.get_mut(fd as usize) {
                 if let Some(entry) = slot.take() {
                     // Closing a memnet listener releases its port — but only if the registry still
                     // points at *this* listener's queue (a stale dup must not evict a later binder).
                     if let FdEntry::NetListener(l) = &entry {
                         if self
+                            .w
                             .net_listeners
                             .get(&l.addr.port)
                             .is_some_and(|q| Arc::ptr_eq(q, &l.pending))
                         {
-                            self.net_listeners.remove(&l.addr.port);
+                            self.w.net_listeners.remove(&l.addr.port);
                         }
                     }
                     return 0;
@@ -1378,24 +1552,23 @@ impl Inner {
         let fd = *args.first().unwrap_or(&-1);
         let offset = *args.get(1).unwrap_or(&0);
         let whence = *args.get(2).unwrap_or(&-1);
-        let (path, pos) = match self.fd(fd) {
-            Some(FdEntry::File(of)) => (of.path.clone(), of.pos as i64),
+        let desc = match self.fd(fd) {
+            Some(FdEntry::File(of)) => Arc::clone(of),
             Some(_) => return ESPIPE,
             None => return EBADF,
         };
-        let size = self.files.get(&path).map_or(0, |f| f.len()) as i64;
+        let mut of = desc.lock().unwrap_or_else(|e| e.into_inner());
+        let size = self.w.files.get(&of.path).map_or(0, |f| f.len()) as i64;
         let newpos = match whence {
             SEEK_SET => offset,
-            SEEK_CUR => pos + offset,
+            SEEK_CUR => of.pos as i64 + offset,
             SEEK_END => size + offset,
             _ => return EINVAL,
         };
         if newpos < 0 {
             return EINVAL;
         }
-        if let Some(FdEntry::File(of)) = self.fds[fd as usize].as_mut() {
-            of.pos = newpos as usize;
-        }
+        of.pos = newpos as usize;
         newpos
     }
 
@@ -1432,10 +1605,10 @@ impl Inner {
         }
         let dup = entry.dup_clone();
         let n = newfd as usize;
-        if self.fds.len() <= n {
-            self.fds.resize_with(n + 1, || None);
+        if self.p.fds.len() <= n {
+            self.p.fds.resize_with(n + 1, || None);
         }
-        self.fds[n] = Some(dup);
+        self.p.fds[n] = Some(dup);
         newfd
     }
 
@@ -1489,18 +1662,21 @@ impl Inner {
         };
         match src {
             Src::Stdin => {
-                let out = self.stdin[self.stdin_pos.min(self.stdin.len())..].to_vec();
-                self.stdin_pos = self.stdin.len();
+                let out = self.w.stdin[self.w.stdin_pos.min(self.w.stdin.len())..].to_vec();
+                self.w.stdin_pos = self.w.stdin.len();
                 out
             }
             // A file has a bounded length; read from the offset to EOF in one shot.
             Src::File => {
-                let n = match self.fds.get(fd as usize).and_then(|s| s.as_ref()) {
-                    Some(FdEntry::File(of)) => self
-                        .files
-                        .get(&of.path)
-                        .map_or(0, |f| f.len())
-                        .saturating_sub(of.pos),
+                let n = match self.p.fds.get(fd as usize).and_then(|s| s.as_ref()) {
+                    Some(FdEntry::File(of)) => {
+                        let of = of.lock().unwrap_or_else(|e| e.into_inner());
+                        self.w
+                            .files
+                            .get(&of.path)
+                            .map_or(0, |f| f.len())
+                            .saturating_sub(of.pos)
+                    }
                     _ => 0,
                 };
                 self.file_read(fd as usize, n).unwrap_or_default()
@@ -1607,24 +1783,24 @@ impl Inner {
         stderr_fd: i64,
     ) -> i64 {
         // Fail closed *before* any side effect (draining stdin) if no delegate is wired.
-        if self.spawn_fn.is_none() {
+        if self.w.spawn_fn.is_none() {
             return ENOSYS;
         }
         // The child inherits its stdin from `stdin_fd` (fd 0 by default) — drain it before the delegate.
         let stdin = self.drain_fd(if stdin_fd < 0 { 0 } else { stdin_fd });
         // Take the delegate out to call it (a `&mut self` method cannot also borrow the boxed closure),
         // then restore it.
-        let mut f = self.spawn_fn.take().unwrap();
+        let mut f = self.w.spawn_fn.take().unwrap();
         let res = f(name, argv, &stdin);
-        self.spawn_fn = Some(f);
+        self.w.spawn_fn = Some(f);
         // Route the child's stdout/stderr to the requested fds (default: the caller's current fd 1 / fd
         // 2 — inheritance, as a prior `dup2(_, 1)` / `dup2(_, 2)` redirect lands each in a file or pipe).
         self.sink_write(if stdout_fd < 0 { 1 } else { stdout_fd }, &res.stdout);
         self.sink_write(if stderr_fd < 0 { 2 } else { stderr_fd }, &res.stderr);
-        let pid = self.next_pid;
-        self.next_pid += 1;
+        let pid = self.w.next_pid;
+        self.w.next_pid += 1;
         // Wait-encode the exit status: WEXITSTATUS occupies bits 8–15, low bits 0 (a normal exit).
-        self.children.insert(pid, (res.status & 0xff) << 8);
+        self.w.children.insert(pid, (res.status & 0xff) << 8);
         pid as i64
     }
 
@@ -1637,8 +1813,8 @@ impl Inner {
         let pid = *args.first().ok_or(Trap::Malformed)?;
         let status_ptr = *args.get(1).unwrap_or(&0) as u64;
         let reaped = if pid == -1 {
-            self.children.keys().min().copied()
-        } else if self.children.contains_key(&(pid as i32)) {
+            self.w.children.keys().min().copied()
+        } else if self.w.children.contains_key(&(pid as i32)) {
             Some(pid as i32)
         } else {
             None
@@ -1646,7 +1822,7 @@ impl Inner {
         let Some(p) = reaped else {
             return Ok(vec![ECHILD]);
         };
-        let status: i32 = self.children.remove(&p).unwrap_or(0);
+        let status: i32 = self.w.children.remove(&p).unwrap_or(0);
         if status_ptr != 0 {
             mem.write_bytes(status_ptr, &status.to_le_bytes())
                 .ok_or(Trap::Malformed)?;
@@ -1664,10 +1840,11 @@ impl Inner {
             return EINVAL;
         }
         let prev = self
+            .p
             .sig_handler
             .insert(signum as i32, handler)
             .unwrap_or(SIG_DFL);
-        self.arm_signals(); // #796 L2 — a handler installed for an already-pending signal may deliver now
+        self.p.arm_signals(); // #796 L2 — a handler installed for an already-pending signal may deliver now
         prev
     }
 
@@ -1682,40 +1859,9 @@ impl Inner {
         if !(1..=63).contains(&sig) {
             return EINVAL;
         }
-        self.sig_pending |= 1 << sig;
-        self.arm_signals();
+        self.p.sig_pending |= 1 << sig;
+        self.p.arm_signals();
         0
-    }
-
-    /// #796 L2 — nudge the interp's per-op poll to check for delivery: set the shared `armed` flag when
-    /// async delivery is *possible* (a signal stack is registered). `SignalSource::take_deliverable` is
-    /// authoritative and disarms if nothing is actually deliverable, so an over-eager arm costs only one
-    /// no-op poll. Called wherever a signal may become deliverable (raise / unblock / install a handler /
-    /// register a stack).
-    fn arm_signals(&self) {
-        if self.sig_stack_base != 0 {
-            self.sig_armed.store(true, Ordering::Relaxed);
-        }
-    }
-
-    /// #799 L1 — is a signal **deliverable right now**? Non-destructive twin of [`SignalDoor::
-    /// take_deliverable`]'s gate: a caught (`> SIG_IGN`), unmasked, pending signal with async delivery on
-    /// (a signal stack registered). This is the personality's *policy* the embedder-`^C` path consults
-    /// before poking the interp: an ignored or masked signal is **not** deliverable, so it never interrupts
-    /// a blocked syscall.
-    fn deliverable_now(&self) -> bool {
-        if self.sig_stack_base == 0 {
-            return false; // async delivery off (poll-only)
-        }
-        let mut d = self.sig_pending & !self.sig_mask;
-        while d != 0 {
-            let s = d.trailing_zeros() as i32;
-            d &= !(1u64 << s);
-            if self.sig_handler.get(&s).copied().unwrap_or(SIG_DFL) > SIG_IGN {
-                return true;
-            }
-        }
-        false
     }
 
     /// `sigaltstack(sp, size) -> 0` (#796 L2): register the guest's dedicated signal-handler stack (the
@@ -1723,8 +1869,8 @@ impl Inner {
     /// advisory. Registering a stack may make already-pending caught signals deliverable, so re-arm.
     fn sigaltstack(&mut self, args: &[i64]) -> i64 {
         let sp = *args.first().unwrap_or(&0);
-        self.sig_stack_base = sp.max(0) as u64;
-        self.arm_signals();
+        self.p.sig_stack_base = sp.max(0) as u64;
+        self.p.arm_signals();
         0
     }
 
@@ -1736,13 +1882,13 @@ impl Inner {
     /// `((void(*)(void))handler)()` at its safe point.
     fn sigcheck(&mut self) -> i64 {
         loop {
-            let deliverable = self.sig_pending & !self.sig_mask;
+            let deliverable = self.p.sig_pending & !self.p.sig_mask;
             if deliverable == 0 {
                 return 0; // nothing pending, or all pending signals are blocked (held)
             }
             let s = deliverable.trailing_zeros() as i32;
-            self.sig_pending &= !(1u64 << s);
-            let handler = self.sig_handler.get(&s).copied().unwrap_or(SIG_DFL);
+            self.p.sig_pending &= !(1u64 << s);
+            let handler = self.p.sig_handler.get(&s).copied().unwrap_or(SIG_DFL);
             if handler > SIG_IGN {
                 return handler;
             }
@@ -1764,20 +1910,20 @@ impl Inner {
         let oldset_ptr = *args.get(2).unwrap_or(&0) as u64;
         let mem = mem.ok_or(Trap::Malformed)?;
         if oldset_ptr != 0 {
-            mem.write_bytes(oldset_ptr, &self.sig_mask.to_le_bytes())
+            mem.write_bytes(oldset_ptr, &self.p.sig_mask.to_le_bytes())
                 .ok_or(Trap::Malformed)?;
         }
         if set_ptr != 0 {
             let bytes = mem.read_bytes(set_ptr, 8).ok_or(Trap::Malformed)?;
             let set = u64::from_le_bytes(bytes.try_into().map_err(|_| Trap::Malformed)?);
             let new = match how {
-                SIG_BLOCK => self.sig_mask | set,
-                SIG_UNBLOCK => self.sig_mask & !set,
+                SIG_BLOCK => self.p.sig_mask | set,
+                SIG_UNBLOCK => self.p.sig_mask & !set,
                 SIG_SETMASK => set,
                 _ => return Ok(vec![EINVAL]),
             };
-            self.sig_mask = new & !UNMASKABLE; // SIGKILL/SIGSTOP can never be blocked
-            self.arm_signals(); // #796 L2 — unblocking may free a held signal for async delivery
+            self.p.sig_mask = new & !UNMASKABLE; // SIGKILL/SIGSTOP can never be blocked
+            self.p.arm_signals(); // #796 L2 — unblocking may free a held signal for async delivery
         }
         Ok(vec![0])
     }
@@ -1802,9 +1948,9 @@ impl Inner {
         let mem = mem.ok_or(Trap::Malformed)?;
         if oldact_ptr != 0 {
             let mut buf = [0u8; 24];
-            let h = self.sig_handler.get(&s).copied().unwrap_or(SIG_DFL);
-            let m = self.sig_action_mask.get(&s).copied().unwrap_or(0);
-            let f = self.sig_action_flags.get(&s).copied().unwrap_or(0);
+            let h = self.p.sig_handler.get(&s).copied().unwrap_or(SIG_DFL);
+            let m = self.p.sig_action_mask.get(&s).copied().unwrap_or(0);
+            let f = self.p.sig_action_flags.get(&s).copied().unwrap_or(0);
             buf[0..8].copy_from_slice(&h.to_le_bytes());
             buf[8..16].copy_from_slice(&m.to_le_bytes());
             buf[16..24].copy_from_slice(&f.to_le_bytes());
@@ -1815,10 +1961,10 @@ impl Inner {
             let handler = i64::from_le_bytes(b[0..8].try_into().map_err(|_| Trap::Malformed)?);
             let mask = u64::from_le_bytes(b[8..16].try_into().map_err(|_| Trap::Malformed)?);
             let flags = i64::from_le_bytes(b[16..24].try_into().map_err(|_| Trap::Malformed)?);
-            self.sig_handler.insert(s, handler);
-            self.sig_action_mask.insert(s, mask);
-            self.sig_action_flags.insert(s, flags);
-            self.arm_signals(); // #796 L2 — a handler for an already-pending signal may deliver now
+            self.p.sig_handler.insert(s, handler);
+            self.p.sig_action_mask.insert(s, mask);
+            self.p.sig_action_flags.insert(s, flags);
+            self.p.arm_signals(); // #796 L2 — a handler for an already-pending signal may deliver now
         }
         Ok(vec![0])
     }
@@ -1834,7 +1980,7 @@ impl Inner {
         let Ok(path) = String::from_utf8(bytes) else {
             return Ok(vec![EINVAL]);
         };
-        Ok(vec![if self.files.remove(&path).is_some() {
+        Ok(vec![if self.w.files.remove(&path).is_some() {
             0
         } else {
             ENOENT
@@ -1857,7 +2003,7 @@ impl Inner {
         if norm.is_empty() {
             return Ok(vec![EEXIST]); // the root always exists
         }
-        if self.files.contains_key(&norm) || self.is_dir(&norm) {
+        if self.w.files.contains_key(&norm) || self.is_dir(&norm) {
             return Ok(vec![EEXIST]);
         }
         let parent = match norm.rfind('/') {
@@ -1867,7 +2013,7 @@ impl Inner {
         if !self.is_dir(parent) {
             return Ok(vec![ENOENT]);
         }
-        self.explicit_dirs.insert(norm);
+        self.w.explicit_dirs.insert(norm);
         Ok(vec![0])
     }
 
@@ -1886,7 +2032,7 @@ impl Inner {
         if norm.is_empty() {
             return Ok(vec![EINVAL]); // cannot remove the root
         }
-        if self.files.contains_key(&norm) {
+        if self.w.files.contains_key(&norm) {
             return Ok(vec![ENOTDIR]);
         }
         if !self.is_dir(&norm) {
@@ -1895,7 +2041,7 @@ impl Inner {
         if !self.dir_children(&norm).is_empty() {
             return Ok(vec![ENOTEMPTY]);
         }
-        self.explicit_dirs.remove(&norm);
+        self.w.explicit_dirs.remove(&norm);
         Ok(vec![0])
     }
 
@@ -1917,9 +2063,9 @@ impl Inner {
         let old_n = old.trim_end_matches('/').to_string();
         let new_n = new.trim_end_matches('/').to_string();
         // File fast path: move the bytes, shadowing any explicit dir marker at the destination.
-        if let Some(v) = self.files.remove(&old_n) {
-            self.files.insert(new_n.clone(), v);
-            self.explicit_dirs.remove(&new_n);
+        if let Some(v) = self.w.files.remove(&old_n) {
+            self.w.files.insert(new_n.clone(), v);
+            self.w.explicit_dirs.remove(&new_n);
             return Ok(vec![0]);
         }
         // Directory: re-key every file and explicit subdir under `old_n`, plus the marker itself.
@@ -1927,29 +2073,31 @@ impl Inner {
             let op = format!("{old_n}/");
             let np = format!("{new_n}/");
             let moved: Vec<String> = self
+                .w
                 .files
                 .keys()
                 .filter(|k| k.starts_with(&op))
                 .cloned()
                 .collect();
             for k in moved {
-                let v = self.files.remove(&k).unwrap();
-                self.files.insert(format!("{np}{}", &k[op.len()..]), v);
+                let v = self.w.files.remove(&k).unwrap();
+                self.w.files.insert(format!("{np}{}", &k[op.len()..]), v);
             }
             let dirs: Vec<String> = self
+                .w
                 .explicit_dirs
                 .iter()
                 .filter(|d| d.as_str() == old_n || d.starts_with(&op))
                 .cloned()
                 .collect();
             for d in dirs {
-                self.explicit_dirs.remove(&d);
+                self.w.explicit_dirs.remove(&d);
                 let nd = if d == old_n {
                     new_n.clone()
                 } else {
                     format!("{np}{}", &d[op.len()..])
                 };
-                self.explicit_dirs.insert(nd);
+                self.w.explicit_dirs.insert(nd);
             }
             return Ok(vec![0]);
         }
@@ -1961,9 +2109,9 @@ impl Inner {
     /// The next free ephemeral port (49152..), skipping bound listeners; wraps within the range.
     fn net_alloc_ephemeral(&mut self) -> u16 {
         loop {
-            let p = self.net_next_port;
-            self.net_next_port = if p == u16::MAX { 49152 } else { p + 1 };
-            if !self.net_listeners.contains_key(&p) {
+            let p = self.w.net_next_port;
+            self.w.net_next_port = if p == u16::MAX { 49152 } else { p + 1 };
+            if !self.w.net_listeners.contains_key(&p) {
                 return p;
             }
         }
@@ -2007,7 +2155,7 @@ impl Inner {
             return Ok(vec![EINVAL]);
         };
         if dst.is_loopback() {
-            let Some(q) = self.net_listeners.get(&dst.port).map(Arc::clone) else {
+            let Some(q) = self.w.net_listeners.get(&dst.port).map(Arc::clone) else {
                 return Ok(vec![ECONNREFUSED]);
             };
             let src = NetAddr::loopback(self.net_alloc_ephemeral());
@@ -2020,7 +2168,7 @@ impl Inner {
             }
             return Ok(vec![self.alloc_fd(FdEntry::NetSock(client))]);
         }
-        let Some(d) = self.net_delegate.as_mut() else {
+        let Some(d) = self.w.net_delegate.as_mut() else {
             return Ok(vec![ECONNREFUSED]);
         };
         match d.connect(&dst) {
@@ -2061,7 +2209,7 @@ impl Inner {
         }
         let port = if req.port == 0 {
             self.net_alloc_ephemeral()
-        } else if self.net_listeners.contains_key(&req.port) {
+        } else if self.w.net_listeners.contains_key(&req.port) {
             return Ok(vec![EADDRINUSE]);
         } else {
             req.port
@@ -2071,7 +2219,7 @@ impl Inner {
             return Ok(vec![e]);
         }
         let pending = Arc::new(Mutex::new(VecDeque::new()));
-        self.net_listeners.insert(port, Arc::clone(&pending));
+        self.w.net_listeners.insert(port, Arc::clone(&pending));
         Ok(vec![self.alloc_fd(FdEntry::NetListener(MemListener {
             addr: bound,
             pending,
@@ -2151,7 +2299,7 @@ impl Inner {
         let addrs: Vec<NetAddr> = if name == "localhost" {
             vec![NetAddr::loopback(0)]
         } else {
-            match self.net_delegate.as_mut() {
+            match self.w.net_delegate.as_mut() {
                 Some(d) => match d.resolve(&name) {
                     Ok(v) => v,
                     Err(e) => return Ok(vec![if e < 0 { e } else { ENOENT }]),
@@ -2181,9 +2329,10 @@ impl Inner {
         // empty directories under `prefix` (`mkdir`). Both contribute the first path component after
         // `prefix`.
         let mut names: Vec<String> = self
+            .w
             .files
             .keys()
-            .chain(self.explicit_dirs.iter())
+            .chain(self.w.explicit_dirs.iter())
             .filter_map(|k| k.strip_prefix(&prefix))
             .filter(|rest| !rest.is_empty())
             .map(|rest| rest.split('/').next().unwrap_or(rest).to_string())
@@ -2198,7 +2347,9 @@ impl Inner {
     /// Not a file key itself.
     fn is_dir(&self, path: &str) -> bool {
         let norm = path.trim_end_matches('/');
-        norm.is_empty() || self.explicit_dirs.contains(norm) || !self.dir_children(path).is_empty()
+        norm.is_empty()
+            || self.w.explicit_dirs.contains(norm)
+            || !self.dir_children(path).is_empty()
     }
 
     /// `stat(path_ptr, path_len, statbuf_ptr) -> 0 | -errno`: fill the caller's `struct stat`
@@ -2214,7 +2365,7 @@ impl Inner {
         let Ok(path) = String::from_utf8(bytes) else {
             return Ok(vec![EINVAL]);
         };
-        let (mode, size) = if let Some(f) = self.files.get(&path) {
+        let (mode, size) = if let Some(f) = self.w.files.get(&path) {
             (S_IFREG | 0o644, f.len() as i64)
         } else if self.is_dir(&path) {
             (S_IFDIR | 0o755, 0)
@@ -2239,7 +2390,7 @@ impl Inner {
         let Ok(path) = String::from_utf8(bytes) else {
             return Ok(vec![EINVAL]);
         };
-        if self.files.contains_key(&path) {
+        if self.w.files.contains_key(&path) {
             return Ok(vec![ENOTDIR]);
         }
         if !self.is_dir(&path) {
@@ -2247,14 +2398,14 @@ impl Inner {
         }
         let entries = self.dir_children(&path);
         let stream = DirStream { entries, pos: 0 };
-        let idx = match self.dirs.iter().position(Option::is_none) {
+        let idx = match self.p.dirs.iter().position(Option::is_none) {
             Some(i) => {
-                self.dirs[i] = Some(stream);
+                self.p.dirs[i] = Some(stream);
                 i
             }
             None => {
-                self.dirs.push(Some(stream));
-                self.dirs.len() - 1
+                self.p.dirs.push(Some(stream));
+                self.p.dirs.len() - 1
             }
         };
         Ok(vec![idx as i64])
@@ -2271,7 +2422,7 @@ impl Inner {
         let cap = (*args.get(2).ok_or(Trap::Malformed)?).max(0) as u64;
         let Some(stream) = usize::try_from(dir)
             .ok()
-            .and_then(|i| self.dirs.get_mut(i)?.as_mut())
+            .and_then(|i| self.p.dirs.get_mut(i)?.as_mut())
         else {
             return Ok(vec![EBADF]);
         };
@@ -2292,7 +2443,10 @@ impl Inner {
     /// `closedir(dir) -> 0 | -errno`: release a directory stream. A stale handle is `-EBADF`.
     fn closedir(&mut self, args: &[i64]) -> i64 {
         let dir = *args.first().unwrap_or(&-1);
-        if let Some(slot @ Some(_)) = usize::try_from(dir).ok().and_then(|i| self.dirs.get_mut(i)) {
+        if let Some(slot @ Some(_)) = usize::try_from(dir)
+            .ok()
+            .and_then(|i| self.p.dirs.get_mut(i))
+        {
             *slot = None;
             0
         } else {
@@ -2302,13 +2456,13 @@ impl Inner {
 
     /// `argv(i, buf, cap) -> len | -errno`: write argument `i` (NUL-terminated) into the caller's
     /// buffer and return its length (excluding the NUL). An out-of-range index is `-EINVAL`; a name
-    /// that won't fit `cap` is `-ERANGE`. (`argc` is a fieldless op: `self.args.len()`.)
+    /// that won't fit `cap` is `-ERANGE`. (`argc` is a fieldless op: `self.p.args.len()`.)
     fn argv(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let i = *args.first().ok_or(Trap::Malformed)?;
         let buf = *args.get(1).ok_or(Trap::Malformed)? as u64;
         let cap = (*args.get(2).ok_or(Trap::Malformed)?).max(0) as u64;
-        let Some(arg) = usize::try_from(i).ok().and_then(|i| self.args.get(i)) else {
+        let Some(arg) = usize::try_from(i).ok().and_then(|i| self.p.args.get(i)) else {
             return Ok(vec![EINVAL]);
         };
         let mut bytes = arg.clone().into_bytes();
@@ -2338,6 +2492,7 @@ impl Inner {
             return Ok(vec![-1]);
         };
         let h = self
+            .w
             .commands
             .iter()
             .find(|(n, _, _)| n == name)
@@ -2352,6 +2507,7 @@ impl Inner {
     fn exec_win(&mut self, args: &[i64]) -> Result<Vec<i64>, Trap> {
         let handle = *args.first().ok_or(Trap::Malformed)? as i32;
         let wl = self
+            .w
             .commands
             .iter()
             .find(|(_, h, _)| *h == handle)
@@ -2371,7 +2527,7 @@ impl Inner {
         args: &[i64],
         mem: Option<&mut dyn GuestMem>,
     ) -> Result<Vec<i64>, Trap> {
-        let Some(fifo) = self.exec_stdin_fifo.clone() else {
+        let Some(fifo) = self.w.exec_stdin_fifo.clone() else {
             return Ok(vec![-1]);
         };
         let mem = mem.ok_or(Trap::Malformed)?;
@@ -2381,7 +2537,7 @@ impl Inner {
         let mut q = fifo.lock().unwrap_or_else(|e| e.into_inner());
         q.clear(); // defensively drop any residue from an aborted prior filter
         q.extend(bytes);
-        Ok(vec![self.exec_stdin_handle as i64])
+        Ok(vec![self.w.exec_stdin_handle as i64])
     }
 
     /// Allocate the lowest free fd for `entry`, extending the table if needed.
@@ -2392,17 +2548,17 @@ impl Inner {
     /// Allocate the lowest free fd `>= min` for `entry` (the `F_DUPFD`/`dup2` "at or above" contract),
     /// extending the table if needed.
     fn alloc_fd_from(&mut self, entry: FdEntry, min: usize) -> i64 {
-        while self.fds.len() < min {
-            self.fds.push(None);
+        while self.p.fds.len() < min {
+            self.p.fds.push(None);
         }
-        match (min..self.fds.len()).find(|&i| self.fds[i].is_none()) {
+        match (min..self.p.fds.len()).find(|&i| self.p.fds[i].is_none()) {
             Some(i) => {
-                self.fds[i] = Some(entry);
+                self.p.fds[i] = Some(entry);
                 i as i64
             }
             None => {
-                self.fds.push(Some(entry));
-                (self.fds.len() - 1) as i64
+                self.p.fds.push(Some(entry));
+                (self.p.fds.len() - 1) as i64
             }
         }
     }
@@ -2410,35 +2566,43 @@ impl Inner {
     /// Write `data` into fd `fd`'s memfs file at its offset (extending with zeros if the offset is
     /// past the end), advancing the offset. Returns the count, or `-EBADF` for a non-file / read-only fd.
     fn file_write(&mut self, fd: usize, data: &[u8]) -> i64 {
-        let (path, pos) = match self.fds.get(fd).and_then(|s| s.as_ref()) {
-            Some(FdEntry::File(of)) if of.writable => (of.path.clone(), of.pos),
+        let desc = match self.p.fds.get(fd).and_then(|s| s.as_ref()) {
+            Some(FdEntry::File(of)) => Arc::clone(of),
             _ => return EBADF,
         };
-        let file = self.files.entry(path).or_default();
+        let mut of = desc.lock().unwrap_or_else(|e| e.into_inner());
+        if !of.writable {
+            return EBADF;
+        }
+        let pos = of.pos;
+        let file = self.w.files.entry(of.path.clone()).or_default();
         let end = pos + data.len();
         if file.len() < end {
             file.resize(end, 0);
         }
         file[pos..end].copy_from_slice(data);
-        if let Some(FdEntry::File(of)) = self.fds[fd].as_mut() {
-            of.pos = end;
-        }
+        of.pos = end;
         data.len() as i64
     }
 
     /// Read up to `len` bytes from fd `fd`'s memfs file at its offset, advancing it. `Err(-EBADF)` for
     /// a non-file fd.
     fn file_read(&mut self, fd: usize, len: usize) -> Result<Vec<u8>, i64> {
-        let (path, pos) = match self.fds.get(fd).and_then(|s| s.as_ref()) {
-            Some(FdEntry::File(of)) => (of.path.clone(), of.pos),
+        let desc = match self.p.fds.get(fd).and_then(|s| s.as_ref()) {
+            Some(FdEntry::File(of)) => Arc::clone(of),
             _ => return Err(EBADF),
         };
-        let file = self.files.get(&path).map(|v| v.as_slice()).unwrap_or(&[]);
+        let mut of = desc.lock().unwrap_or_else(|e| e.into_inner());
+        let pos = of.pos;
+        let file = self
+            .w
+            .files
+            .get(&of.path)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
         let n = len.min(file.len().saturating_sub(pos));
         let chunk = file[pos..pos + n].to_vec();
-        if let Some(FdEntry::File(of)) = self.fds[fd].as_mut() {
-            of.pos = pos + n;
-        }
+        of.pos = pos + n;
         Ok(chunk)
     }
 
@@ -2452,18 +2616,18 @@ impl Inner {
             .div_ceil(ALIGN)
             * ALIGN;
         // First-fit over the free list: reuse the first block that fits, splitting off any remainder.
-        if let Some(i) = self.free_list.iter().position(|&(_, sz)| sz >= want) {
-            let (off, sz) = self.free_list.swap_remove(i);
+        if let Some(i) = self.p.free_list.iter().position(|&(_, sz)| sz >= want) {
+            let (off, sz) = self.p.free_list.swap_remove(i);
             if sz > want {
-                self.free_list.push((off + want, sz - want));
+                self.p.free_list.push((off + want, sz - want));
             }
-            self.allocated.insert(off, want);
+            self.p.allocated.insert(off, want);
             return off as i64;
         }
         // Bump a fresh block from the high-water mark and record it as a live allocation.
         match self.arena_bump(want) {
             Some(ptr) => {
-                self.allocated.insert(ptr, want);
+                self.p.allocated.insert(ptr, want);
                 ptr as i64
             }
             None => 0, // out of heap → NULL
@@ -2475,10 +2639,10 @@ impl Inner {
     /// the `getenv` string cache both grow from — it advances `heap_next` but does **not** record an
     /// `allocated` entry (the caller decides whether the block is `free`-able).
     fn arena_bump(&mut self, n: u64) -> Option<u64> {
-        let ptr = (self.heap_next + (ALIGN - 1)) & !(ALIGN - 1);
+        let ptr = (self.p.heap_next + (ALIGN - 1)) & !(ALIGN - 1);
         match ptr.checked_add(n) {
-            Some(end) if end <= self.heap_end => {
-                self.heap_next = end;
+            Some(end) if end <= self.p.heap_end => {
+                self.p.heap_next = end;
                 Some(ptr)
             }
             _ => None,
@@ -2495,7 +2659,7 @@ impl Inner {
         if size == 0 {
             return Ok(vec![EINVAL]);
         }
-        let mut bytes = self.cwd.clone().into_bytes();
+        let mut bytes = self.p.cwd.clone().into_bytes();
         bytes.push(0); // NUL terminator
         if bytes.len() as u64 > size {
             return Ok(vec![ERANGE]);
@@ -2515,7 +2679,7 @@ impl Inner {
         let Ok(path) = String::from_utf8(bytes) else {
             return Ok(vec![EINVAL]);
         };
-        self.cwd = path;
+        self.p.cwd = path;
         Ok(vec![0])
     }
 
@@ -2532,10 +2696,10 @@ impl Inner {
         let Ok(name) = String::from_utf8(bytes) else {
             return Ok(vec![0]); // a name we can't represent can't be set
         };
-        if let Some(&cached) = self.env_ptrs.get(&name) {
+        if let Some(&cached) = self.p.env_ptrs.get(&name) {
             return Ok(vec![cached as i64]);
         }
-        let Some(value) = self.env.get(&name).cloned() else {
+        let Some(value) = self.p.env.get(&name).cloned() else {
             return Ok(vec![0]); // unset → NULL
         };
         let mut vb = value.into_bytes();
@@ -2544,7 +2708,7 @@ impl Inner {
             return Ok(vec![0]); // no room → behave as if unset (best effort)
         };
         mem.write_bytes(dst, &vb).ok_or(Trap::Malformed)?;
-        self.env_ptrs.insert(name, dst);
+        self.p.env_ptrs.insert(name, dst);
         Ok(vec![dst as i64])
     }
 
@@ -2565,11 +2729,11 @@ impl Inner {
         let (Ok(name), Ok(value)) = (String::from_utf8(nb), String::from_utf8(vb)) else {
             return Ok(vec![EINVAL]);
         };
-        if overwrite == 0 && self.env.contains_key(&name) {
+        if overwrite == 0 && self.p.env.contains_key(&name) {
             return Ok(vec![0]); // keep the existing value
         }
-        self.env_ptrs.remove(&name); // stale cached pointer no longer reflects the value
-        self.env.insert(name, value);
+        self.p.env_ptrs.remove(&name); // stale cached pointer no longer reflects the value
+        self.p.env.insert(name, value);
         Ok(vec![0])
     }
 
@@ -2587,7 +2751,7 @@ impl Inner {
         let Ok(name) = String::from_utf8(nb) else {
             return Ok(vec![-1]);
         };
-        let Some(value) = self.env.get(&name) else {
+        let Some(value) = self.p.env.get(&name) else {
             return Ok(vec![-1]); // unset
         };
         let vb = value.as_bytes();
@@ -2606,8 +2770,8 @@ impl Inner {
         let Ok(name) = String::from_utf8(nb) else {
             return Ok(vec![EINVAL]);
         };
-        self.env_ptrs.remove(&name);
-        self.env.remove(&name);
+        self.p.env_ptrs.remove(&name);
+        self.p.env.remove(&name);
         Ok(vec![0])
     }
 
@@ -2622,12 +2786,12 @@ impl Inner {
         if index < 0 {
             return Ok(vec![-1]);
         }
-        let mut keys: Vec<&String> = self.env.keys().collect();
+        let mut keys: Vec<&String> = self.p.env.keys().collect();
         keys.sort();
         let Some(key) = keys.get(index as usize) else {
             return Ok(vec![-1]); // past the end
         };
-        let entry = format!("{key}={}", self.env[*key]).into_bytes();
+        let entry = format!("{key}={}", self.p.env[*key]).into_bytes();
         if buf != 0 && (entry.len() as u64) <= cap {
             mem.write_bytes(buf, &entry).ok_or(Trap::Malformed)?;
         }
@@ -2638,11 +2802,11 @@ impl Inner {
     /// else realtime (nanos since the Unix epoch). Returns a pinned value when [`Posix::set_clock`] set
     /// one, so a differential run is reproducible; otherwise reads the real host clock.
     fn clock(&self, args: &[i64]) -> i64 {
-        if let Some(fixed) = self.clock_fixed {
+        if let Some(fixed) = self.w.clock_fixed {
             return fixed;
         }
         if *args.first().unwrap_or(&0) == 1 {
-            self.clock_base.elapsed().as_nanos() as i64
+            self.w.clock_base.elapsed().as_nanos() as i64
         } else {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2659,8 +2823,8 @@ impl Inner {
         if ptr == 0 {
             return;
         }
-        if let Some(size) = self.allocated.remove(&ptr) {
-            self.free_list.push((ptr, size));
+        if let Some(size) = self.p.allocated.remove(&ptr) {
+            self.p.free_list.push((ptr, size));
         }
     }
 }
@@ -2671,11 +2835,151 @@ mod tests {
     use svm_interp::{run_capture_reserved_with_host, Host, Value};
     use svm_jit::{compile_and_run_capture_reserved_with_host, JitOutcome};
     use svm_text::parse_module;
+
+    /// Lock the personality's world + root proc (canonical order — see [`World`]) and build the
+    /// [`Ctx`] dispatch view a test drives op methods through, as [`handler`] does.
+    macro_rules! ctx {
+        ($posix:expr, $w:ident, $p:ident, $st:ident) => {
+            let mut $w = $posix.world.lock().unwrap();
+            let mut $p = $posix.root.lock().unwrap();
+            #[allow(unused_mut)]
+            let mut $st = Ctx {
+                w: &mut $w,
+                p: &mut $p,
+            };
+        };
+    }
     use svm_verify::verify_module;
 
     const HEAP_BASE: u64 = 4096;
     const HEAP_END: u64 = 64 << 10;
     const WIN: usize = 128 << 10;
+
+    /// #863 slice 1 — the World/Proc fork contract, unit-level. [`Proc::fork`] copies the
+    /// per-process side (cwd/env/dispositions copied, **pending cleared**) while fd-table entries
+    /// share their open-file **descriptions** — a fork-inherited fd shares its offset with the
+    /// parent (POSIX fork-shares-open-file-descriptions), and a child's cwd/env mutations are
+    /// invisible to the parent (the pre-split shared blob got both wrong).
+    #[test]
+    fn fork_clones_the_process_side_and_shares_descriptions() {
+        let world = Arc::new(Mutex::new(new_world(Vec::new())));
+        let root = Arc::new(Mutex::new(new_proc(HEAP_BASE, HEAP_END)));
+        let posix = Posix { world, root };
+        posix.write_file("/f", b"hello world");
+        let mut win = vec![0u8; 256];
+        win[0..2].copy_from_slice(b"/f");
+        let mut mem = svm_interp::WindowMem::new(&mut win, 256);
+
+        let mut w = posix.world.lock().unwrap();
+        let mut p = posix.root.lock().unwrap();
+        let fd = {
+            let mut st = Ctx {
+                w: &mut w,
+                p: &mut p,
+            };
+            let fd = st.open(&[0, 2, 0], Some(&mut mem)).unwrap()[0];
+            assert!(fd >= 3, "a fresh fd past the stdio sentinels");
+            // Advance the description to offset 5 through the parent.
+            assert_eq!(st.read(&[fd, 100, 5], Some(&mut mem)).unwrap()[0], 5);
+            fd
+        };
+        p.cwd = "/parent".to_string();
+        p.env.insert("K".to_string(), "v".to_string());
+        p.sig_handler.insert(2, 0x1234);
+        p.sig_pending = 1 << 2;
+        p.sig_mask = 1 << 10;
+
+        let mut twin = p.fork();
+        assert_eq!(
+            twin.sig_pending, 0,
+            "POSIX: a fork twin starts with no pending signals"
+        );
+        assert_eq!(
+            twin.sig_handler.get(&2),
+            Some(&0x1234),
+            "dispositions are inherited (copied)"
+        );
+        assert_eq!(
+            twin.sig_mask,
+            1 << 10,
+            "the signal mask is inherited (copied)"
+        );
+
+        // cwd/env are copies: the twin's mutations never reach the parent.
+        twin.cwd = "/child".to_string();
+        twin.env.insert("K".to_string(), "child".to_string());
+        assert_eq!(
+            p.cwd, "/parent",
+            "a subshell's chdir must not move its parent"
+        );
+        assert_eq!(
+            p.env["K"], "v",
+            "a child's setenv is invisible to the parent"
+        );
+
+        // The twin's inherited fd continues at the PARENT's offset (shared description)…
+        {
+            let mut tc = Ctx {
+                w: &mut w,
+                p: &mut twin,
+            };
+            assert_eq!(tc.read(&[fd, 120, 6], Some(&mut mem)).unwrap()[0], 6);
+        }
+        assert_eq!(
+            mem.read_bytes(120, 6).unwrap(),
+            b" world",
+            "twin resumes at offset 5"
+        );
+        // …and its read advanced the shared offset for the parent too (now EOF).
+        {
+            let mut pc = Ctx {
+                w: &mut w,
+                p: &mut p,
+            };
+            assert_eq!(
+                pc.read(&[fd, 130, 8], Some(&mut mem)).unwrap()[0],
+                0,
+                "the twin's read moved the shared offset to EOF for the parent"
+            );
+            // The twin's fd TABLE is a copy: closing the parent's fd leaves the twin's open.
+            assert_eq!(pc.close(&[fd]), 0);
+        }
+        {
+            let mut tc = Ctx {
+                w: &mut w,
+                p: &mut twin,
+            };
+            assert_eq!(
+                tc.lseek(&[fd, 0, SEEK_SET]),
+                0,
+                "the twin's fd survives the parent's close (per-process table)"
+            );
+        }
+    }
+
+    /// #863 slice 1 — `dup` shares the open-file description: the dup'd fd continues at the
+    /// original's offset (POSIX; the pre-split inline description gave dups independent offsets).
+    #[test]
+    fn dup_shares_the_open_file_description_offset() {
+        let world = Arc::new(Mutex::new(new_world(Vec::new())));
+        let root = Arc::new(Mutex::new(new_proc(HEAP_BASE, HEAP_END)));
+        let posix = Posix { world, root };
+        posix.write_file("/f", b"hello world");
+        let mut win = vec![0u8; 256];
+        win[0..2].copy_from_slice(b"/f");
+        let mut mem = svm_interp::WindowMem::new(&mut win, 256);
+        ctx!(posix, w_g, p_g, st);
+        let fd = st.open(&[0, 2, 0], Some(&mut mem)).unwrap()[0];
+        let dup = st.dup(&[fd]);
+        assert!(dup >= 0 && dup != fd);
+        assert_eq!(st.read(&[fd, 100, 5], Some(&mut mem)).unwrap()[0], 5);
+        assert_eq!(st.read(&[dup, 120, 6], Some(&mut mem)).unwrap()[0], 6);
+        assert_eq!(
+            mem.read_bytes(120, 6).unwrap(),
+            b" world",
+            "the dup continues at the original's offset — one shared description"
+        );
+    }
 
     /// func 0 `(host_proc_handle) -> i64`: `malloc(2)`, store `"hi"` into the returned buffer,
     /// `write(1, ptr, 2)`, then encode `write_result * 1_000_000 + ptr`. `malloc` hands out the aligned
@@ -3096,7 +3400,7 @@ block 0 (vph: i32) {\n\
         // pipe lseek, EBADF fail-closed, and stdio fds as ordinary (closable, reusable) table entries.
         let mut host = Host::new();
         let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
-        let mut st = posix.inner.lock().unwrap();
+        ctx!(posix, w_g, p_g, st);
         let mut win = vec![0u8; WIN];
         win[16..21].copy_from_slice(b"hello");
         let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
@@ -3217,7 +3521,7 @@ block 0 (vph: i32) {\n\
 
         // No delegate ⇒ spawn is ENOSYS and there are no children to reap.
         {
-            let mut st = posix.inner.lock().unwrap();
+            ctx!(posix, w_g, p_g, st);
             let mut win = vec![0u8; WIN];
             win[0..2].copy_from_slice(b"up");
             let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
@@ -3248,7 +3552,7 @@ block 0 (vph: i32) {\n\
         });
 
         let (pid, status_word, stdin_after) = {
-            let mut st = posix.inner.lock().unwrap();
+            ctx!(posix, w_g, p_g, st);
             let mut win = vec![0u8; WIN];
             win[0..2].copy_from_slice(b"up"); // name
             win[8..13].copy_from_slice(b"up\0-n"); // argv blob: ["up", "-n"]
@@ -3410,7 +3714,7 @@ block 0 (vph: i32) {\n\
         // default ones are dropped, lowest number first.
         let mut host = Host::new();
         let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
-        let mut st = posix.inner.lock().unwrap();
+        ctx!(posix, w_g, p_g, st);
 
         assert_eq!(st.sigcheck(), 0, "nothing pending");
         // Install then re-install a caught handler for SIGINT(2); `signal` returns the previous.
@@ -3461,10 +3765,13 @@ block 0 (vph: i32) {\n\
         );
         assert_eq!(st.sigcheck(), 0, "the probe/edge calls raised nothing");
 
-        // The embedder's door (a terminal ^C) reaches the still-installed SIGINT handler.
-        drop(st);
+        // The embedder's door (a terminal ^C) reaches the still-installed SIGINT handler. Release
+        // the guards (the `Ctx` view only borrows them) before `raise_signal` re-locks the root proc.
+        let _ = st;
+        drop(p_g);
+        drop(w_g);
         posix.raise_signal(2);
-        let mut st = posix.inner.lock().unwrap();
+        ctx!(posix, w_g, p_g, st);
         assert_eq!(
             st.sigcheck(),
             0x1234,
@@ -3476,7 +3783,7 @@ block 0 (vph: i32) {\n\
         // the compiled-C `c_posix` tests cover that path on both backends. Here we drive the mask field
         // directly to unit-test the `sigcheck` hold-vs-deliver decision.)
         st.signal(&[4, 0xCAFE]); // catch signal 4
-        st.sig_mask = 1 << 4; // block it
+        st.p.sig_mask = 1 << 4; // block it
         st.kill(&[0, 4]); // raise -> pending but blocked
         assert_eq!(
             st.sigcheck(),
@@ -3484,11 +3791,11 @@ block 0 (vph: i32) {\n\
             "a blocked pending signal is held, not delivered"
         );
         assert_eq!(
-            st.sig_pending & (1 << 4),
+            st.p.sig_pending & (1 << 4),
             1 << 4,
             "the held signal stays pending across the poll"
         );
-        st.sig_mask = 0; // unblock
+        st.p.sig_mask = 0; // unblock
         assert_eq!(st.sigcheck(), 0xCAFE, "delivered once unblocked");
         assert_eq!(st.sigcheck(), 0, "delivered exactly once");
     }
@@ -3734,7 +4041,7 @@ block 0 (vph: i32) {\n\
         // getenv caches a pointer; setenv must invalidate it so the next getenv reflects the new value.
         let mut host = Host::new();
         let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
-        let mut st = posix.inner.lock().unwrap();
+        ctx!(posix, w_g, p_g, st);
         // Stage the name "K" at offset 0 and value "v2" at offset 8 in a scratch window.
         let mut win = vec![0u8; WIN];
         win[0] = b'K';
@@ -3742,7 +4049,7 @@ block 0 (vph: i32) {\n\
         win[9] = b'2';
         let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
         // setenv("K", "v1", overwrite=1): name@0 len 1, value staged separately — reuse offset 8 with "v1".
-        st.env.insert("K".to_string(), "v1".to_string());
+        st.p.env.insert("K".to_string(), "v1".to_string());
         // getenv("K") materializes "v1\0" and caches the pointer.
         let p1 = st.getenv(&[0, 1], Some(&mut mem)).unwrap()[0];
         assert!(p1 > 0, "getenv returns a non-null arena pointer");
@@ -3758,7 +4065,7 @@ block 0 (vph: i32) {\n\
         let r0 = st.setenv(&[0, 1, 8, 2, 0], Some(&mut mem)).unwrap()[0];
         assert_eq!(r0, 0, "setenv(overwrite=0) on existing name returns 0");
         assert_eq!(
-            st.env.get("K").map(String::as_str),
+            st.p.env.get("K").map(String::as_str),
             Some("v2"),
             "overwrite=0 kept the existing value"
         );
@@ -3779,7 +4086,7 @@ block 0 (vph: i32) {\n\
         win[..6].copy_from_slice(b"/tmp/a"); // path at offset 0
         win[100..104].copy_from_slice(b"/tmp"); // dir path at offset 100
         let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
-        let mut st = posix.inner.lock().unwrap();
+        ctx!(posix, w_g, p_g, st);
         let rd = |mem: &svm_interp::WindowMem, off: u64| {
             i64::from_le_bytes(mem.read_bytes(off, 8).unwrap().try_into().unwrap())
         };
@@ -3837,7 +4144,7 @@ block 0 (vph: i32) {\n\
         win_write(&mut mem, 96, b"/data/e");
         win_write(&mut mem, 112, b"/data/e/inner");
         win_write(&mut mem, 128, b"/data/d/inner");
-        let mut st = posix.inner.lock().unwrap();
+        ctx!(posix, w_g, p_g, st);
         let rd = |mem: &svm_interp::WindowMem, off: u64| {
             i64::from_le_bytes(mem.read_bytes(off, 8).unwrap().try_into().unwrap())
         };
@@ -3921,7 +4228,7 @@ block 0 (vph: i32) {\n\
         let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
         // bind blob: v4 loopback :0 at offset 0 → [4, 0,0, 127,0,0,1]
         win_write(&mut mem, 0, &[4u8, 0, 0, 127, 0, 0, 1]);
-        let mut st = posix.inner.lock().unwrap();
+        ctx!(posix, w_g, p_g, st);
 
         // bind :0 → listener fd + the actual bound addr (ephemeral port) written at 100.
         let lfd = st.net_bind(&[0, 7, 100, 32], Some(&mut mem)).unwrap()[0];
@@ -4043,7 +4350,7 @@ block 0 (vph: i32) {\n\
         posix.set_net(Scripted);
         let mut win = vec![0u8; WIN];
         let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
-        let mut st = posix.inner.lock().unwrap();
+        ctx!(posix, w_g, p_g, st);
 
         // resolve("localhost") → the loopback blob, no delegate involved.
         win_write(&mut mem, 0, b"localhost");
@@ -4085,12 +4392,12 @@ block 0 (vph: i32) {\n\
         let mut win = vec![0u8; WIN];
         let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
         win_write(&mut mem, 0, b"prog");
-        let mut st = posix.inner.lock().unwrap();
+        ctx!(posix, w_g, p_g, st);
 
         let pid = st.spawn(&[0, 4, 0, 0], Some(&mut mem)).unwrap()[0];
         assert!(pid >= 0, "spawn returns a pid");
-        assert_eq!(st.stdout, b"to-out", "stdout routed to fd 1's sink");
-        assert_eq!(st.stderr, b"to-err", "stderr routed to fd 2's sink");
+        assert_eq!(st.w.stdout, b"to-out", "stdout routed to fd 1's sink");
+        assert_eq!(st.w.stderr, b"to-err", "stderr routed to fd 2's sink");
 
         assert_eq!(st.waitpid(&[pid, 200, 0], Some(&mut mem)).unwrap()[0], pid);
         let status = i32::from_le_bytes(mem.read_bytes(200, 4).unwrap().try_into().unwrap());
@@ -4117,7 +4424,7 @@ block 0 (vph: i32) {\n\
         });
         let mut win = vec![0u8; WIN];
         let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
-        let mut st = posix.inner.lock().unwrap();
+        ctx!(posix, w_g, p_g, st);
 
         win_write(&mut mem, 0, b"prog"); // command name
                                          // Two capture pipes: their write ends receive the child's stdout / stderr, their read ends drain.
@@ -4144,7 +4451,7 @@ block 0 (vph: i32) {\n\
 
         // The child's stdout/stderr landed in the capture pipes, NOT the shared fd-1/fd-2 sinks.
         assert!(
-            st.stdout.is_empty() && st.stderr.is_empty(),
+            st.w.stdout.is_empty() && st.w.stderr.is_empty(),
             "per-child routing never wrote the shared stdout/stderr sinks"
         );
         let n_out = st.read(&[rfd_out, 200, 64], Some(&mut mem)).unwrap()[0];
@@ -4168,7 +4475,7 @@ block 0 (vph: i32) {\n\
         let pid2 = st.spawn2(&[100], Some(&mut mem)).unwrap()[0];
         assert_eq!(pid2, pid + 1, "a second spawn mints the next pid");
         assert_eq!(
-            st.stderr, b"E",
+            st.w.stderr, b"E",
             "an all-(-1) request inherits fd 2 → the shared stderr sink"
         );
     }
@@ -4187,9 +4494,9 @@ block 0 (vph: i32) {\n\
         posix.set_args(&["sh", "-c", "echo hi"]);
         let mut win = vec![0u8; WIN];
         let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
-        let mut st = posix.inner.lock().unwrap();
+        ctx!(posix, w_g, p_g, st);
 
-        assert_eq!(st.args.len() as i64, 3, "argc");
+        assert_eq!(st.p.args.len() as i64, 3, "argc");
         assert_eq!(st.argv(&[1, 0, 64], Some(&mut mem)).unwrap()[0], 2); // "-c" len 2
         assert_eq!(mem.read_bytes(0, 3).unwrap(), b"-c\0");
         assert_eq!(st.argv(&[2, 100, 64], Some(&mut mem)).unwrap()[0], 7); // "echo hi"

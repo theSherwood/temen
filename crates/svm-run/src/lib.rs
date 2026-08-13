@@ -4707,23 +4707,31 @@ impl HostCap {
     /// `(op, args, guest_mem) -> result slots | Trap`.
     pub fn host_proc(op: u32, make: impl Fn() -> HostProc + Send + Sync + 'static) -> HostCap {
         let make = Arc::new(make);
+        // FORK.md PR 5 / #863: with no provider-supplied fork factory, `make` doubles as a
+        // shared-state one — a `fork()` twin re-mints a fresh closure over the SAME provider state
+        // (`ForkedProc::shared`), the right default for an arbitrary host cap whose state the
+        // runtime cannot split. A personality with real per-process state supplies its own factory
+        // via [`HostCap::host_proc_forkable`] (e.g. `posix_cap`).
+        let fork: svm_interp::HostProcFork = Arc::new({
+            let make = Arc::clone(&make);
+            move || svm_interp::ForkedProc::shared(make())
+        });
+        Self::host_proc_forkable(op, move || make(), fork)
+    }
+
+    /// [`HostCap::host_proc`] with a **provider-supplied fork factory** (#863): the factory decides
+    /// what a `fork()` twin inherits — svm-posix's clones the per-process side (own fd table / cwd /
+    /// env / signal state) and shares the world, real POSIX fork semantics. A twin's powerbox
+    /// re-mints through this factory (`Host::fork_powerbox`).
+    pub fn host_proc_forkable(
+        op: u32,
+        make: impl Fn() -> HostProc + Send + Sync + 'static,
+        fork: svm_interp::HostProcFork,
+    ) -> HostCap {
         HostCap {
             type_id: cap_id::HOST_PROC,
             op,
-            // FORK.md PR 5: `make` is already the fork factory — the multi-backend grant contract
-            // ("a fresh closure per grant over one shared provider state") is exactly the
-            // fork-shares-state contract, so every `HostCap::host_proc`-wired capability (e.g.
-            // `posix_cap`'s libc: shared fd table/memfs) is forkable by construction. A twin's
-            // powerbox re-mints its closure through this same factory (`Host::fork_powerbox`).
-            grant: Arc::new({
-                let make = Arc::clone(&make);
-                move |h, _| {
-                    h.grant_host_proc_forkable(
-                        make(),
-                        Arc::clone(&make) as svm_interp::HostProcFork,
-                    )
-                }
-            }),
+            grant: Arc::new(move |h, _| h.grant_host_proc_forkable(make(), Arc::clone(&fork))),
             unbound: false,
             offer: None,
             iface: None,
