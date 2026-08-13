@@ -71,8 +71,8 @@ fn build_std_bin_ll_target(name: &str, src: &str, target_file: &str) -> Option<P
     std::fs::write(src_dir.join("main.rs"), src).ok()?;
 
     let target_json = lane_dir().join(target_file);
-    let mut child = Command::new("cargo")
-        .current_dir(&work)
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(&work)
         .env("RUSTC_BOOTSTRAP", "1")
         .env("CARGO_TARGET_DIR", work.join("target"))
         .args([
@@ -90,9 +90,15 @@ fn build_std_bin_ll_target(name: &str, src: &str, target_file: &str) -> Option<P
             "--",
             "--emit=llvm-ir",
             "-Clto=fat",
-        ])
-        .spawn()
-        .ok()?;
+        ]);
+    // #788: put `cargo` in its own process group so a wedged build can be killed **as a group** — the
+    // original stall left an orphan `rustc` alive after `cargo` was reaped (killing the child alone
+    // doesn't reap its `rustc`/`rustc`-worker grandchildren), and under `--test-threads=1` that orphan
+    // then steals CPU/disk from the next build, risking a cascade. A new group makes the timeout kill
+    // reap the whole build tree at once. (Unix-only; the lane is Linux-only, and non-unix auto-skips.)
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd.spawn().ok()?;
     // #788 wedge guard: a `rustc`/`cargo` that hangs mid-`build-std` must not stall the whole (serial)
     // job to the 6-hour ceiling. Bound each build and kill a wedged child, returning `None` (skip)
     // instead of blocking forever. Override the budget with `SVM_STD_BUILD_TIMEOUT_SECS`.
@@ -108,8 +114,7 @@ fn build_std_bin_ll_target(name: &str, src: &str, target_file: &str) -> Option<P
             Ok(Some(_)) => break,
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_build(&mut child);
                     eprintln!(
                         "note: skipping std_guest ({target_file}): build-std exceeded {budget}s \
                          (possible #788 rustc wedge)"
@@ -132,6 +137,22 @@ fn build_std_bin_ll_target(name: &str, src: &str, target_file: &str) -> Option<P
     std::fs::copy(&ll, &out_ll).ok()?;
     let _ = std::fs::remove_dir_all(&work);
     Some(out_ll)
+}
+
+/// Kill a wedged `build-std` and reap it (#788). On Unix `cargo` leads its own process group (set at
+/// spawn), so signal the **whole group** — negative pid to `kill(2)` — to take down `cargo` and every
+/// `rustc`/codegen grandchild together, then `wait` the leader so it is not left a zombie. Elsewhere,
+/// fall back to killing just the child. Uses the `kill` binary (universally present on the Linux lane)
+/// so the harness needs no `libc`/`nix` dependency.
+fn kill_build(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-KILL", &format!("-{}", child.id())])
+            .status();
+    }
+    let _ = child.kill(); // belt-and-suspenders (and the non-unix path)
+    let _ = child.wait();
 }
 
 fn find_ll(target: &Path, name: &str) -> Option<PathBuf> {
