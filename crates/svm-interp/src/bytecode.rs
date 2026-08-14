@@ -9186,8 +9186,29 @@ fn drive(
     host: &mut Host,
     budget: u64,
 ) -> Result<Vec<Value>, Trap> {
-    let mut sched = CoopSched::new(&dom, entry, args, fuel, mem, host)?;
-    sched.pump(&dom, mem, host, fuel, budget)
+    // The native driver never enables tier-up (no eligibility bitmap), so `pump` runs the whole
+    // schedule and returns `Done`; a `TierUp` yield is impossible here.
+    let mut sched = CoopSched::new(&dom, entry, args, fuel, mem, host, None)?;
+    match sched.pump(&dom, mem, host, fuel, budget)? {
+        CoopStep::Done(vals) => Ok(vals),
+        CoopStep::TierUp { .. } => unreachable!("tier-up not enabled on the native driver"),
+    }
+}
+
+/// A pause point of [`CoopSched::pump`]: either the run finished (`Done`) or a module-0 task hit an
+/// eligible direct `Call` and the emitted region must run on the host (`TierUp`) before the paused
+/// task is resumed via [`CoopSched::deliver_tierup`]. `pump` returns `Err(trap)` for a run-fatal trap
+/// (the root task trapped, or a driver operation failed) — mirroring the `Result` `drive` returns.
+enum CoopStep {
+    /// The root task returned; these are the run's results.
+    Done(Vec<Value>),
+    /// A task paused on an eligible module-0 `Call` to `func` with raw i64 arg slots `argv`; `mapped`
+    /// is the window's committed scalar extent for the emitted `"mapped"` global (#717 host sync).
+    TierUp {
+        func: u32,
+        argv: Box<[i64]>,
+        mapped: u64,
+    },
 }
 
 /// The cooperative multiplex scheduler's run-shared state, extracted from `drive` so that a future
@@ -9218,12 +9239,29 @@ struct CoopSched {
     /// The scheduler's logical clock (advanced only when no task is runnable, to the earliest due
     /// `wait` deadline).
     clock: u64,
+    /// #926 slice 2: wasm-JIT tier-up eligibility for this run's **module-0** tasks (the root and its
+    /// same-module `thread.spawn` descendants). `None` ⇒ everything interprets, exactly the native
+    /// `drive` (which never sets it). When set, each qualifying task's `Vm` carries it, so a direct
+    /// module-0 `Call` to an eligible function surfaces as [`CoopStep::TierUp`] instead of interpreting
+    /// the callee — the host runs the emitted `f{func}` and delivers the results back.
+    eligible: Option<std::sync::Arc<[bool]>>,
+    /// #750 paged tier-up: the eligible set is page-checked (the emitted region carries a per-access
+    /// page check), so an unrepresentable window surfaces with the reserved size instead of declining.
+    page_checked: bool,
+    /// The task currently paused on a surfaced tier-up, awaiting [`deliver_tierup`](Self::deliver_tierup):
+    /// `(task index, caller-frame-relative dst slot, result types)`. At most one is ever outstanding —
+    /// the driver services one tier-up round-trip before pumping again — so a single slot suffices.
+    /// `None` between round-trips (and always, on the native driver).
+    pending_tierup: Option<(usize, usize, Box<[ValType]>)>,
 }
 
 impl CoopSched {
     /// Build the initial scheduler state: the root task at `entry`, plus any fibers a durable freeze
     /// left to re-seed (taken from `host.frozen_fibers`). This is `drive`'s former preamble verbatim
-    /// — including the once-per-run entry-fuel charge — so its behaviour is unchanged.
+    /// — including the once-per-run entry-fuel charge — so its behaviour is unchanged. `eligible` /
+    /// `page_checked` are the run's #926-slice-2 tier-up config: `None`/`false` (the native `drive`)
+    /// leaves everything interpreting; a `Some` bitmap makes the root's — and its same-module
+    /// `thread.spawn` descendants' — module-0 direct calls to eligible functions surface as tier-ups.
     fn new(
         dom: &Domain,
         entry: FuncIdx,
@@ -9231,7 +9269,11 @@ impl CoopSched {
         fuel: &mut u64,
         mem: &mut Option<Mem>,
         host: &mut Host,
+        tierup: Option<TierUpConfig>,
     ) -> Result<CoopSched, Trap> {
+        // `page_checked` is meaningful only with a bitmap, so it rides in the same `Option`.
+        let (eligible, page_checked) =
+            tierup.map_or((None, false), |t| (Some(t.eligible), t.page_checked));
         // Fuel unification (safepoint-anchored): charge one fuel for *entering the top-level entry
         // function*, mirroring the per-callee-entry charge at `Op::Call`/`CallIndirect`/`TailCall*` and
         // the JIT's entry-prologue charge, so the tree-walker, bytecode, and JIT engines burn identically.
@@ -9244,12 +9286,19 @@ impl CoopSched {
         if !is_thaw {
             *fuel = fuel.checked_sub(1).ok_or(Trap::OutOfFuel)?;
         }
-        let tasks: Vec<TaskSlot> = vec![TaskSlot {
+        let mut tasks: Vec<TaskSlot> = vec![TaskSlot {
             vt: VTask::new(&dom.source.primary(), entry as usize, args)?,
             threads: Vec::new(),
             env: None,
             state: TaskState::Runnable,
         }];
+        // #926 slice 2: arm the root task's `Vm` for tier-up. The entry runs in module 0, so a direct
+        // call to an eligible function surfaces (`Vm::resume`'s `module == 0 && jit_eligible[callee]`
+        // gate). `thread.spawn` children inherit the bitmap in `pump`'s `Spawn` arm (same-module only).
+        if let Some(e) = &eligible {
+            tasks[0].vt.active.jit_eligible = Some(std::sync::Arc::clone(e));
+            tasks[0].vt.active.jit_page_checked = page_checked;
+        }
         // §14 `instantiate` children's confined environments (handle = `env` index). The root and its
         // `thread.spawn` siblings use the shared `mem`/`host`/`dom.table` instead (`env == None`).
         let extra_envs: Vec<ChildEnv> = Vec::new();
@@ -9308,13 +9357,18 @@ impl CoopSched {
             dead_envs,
             forked_twins,
             clock,
+            eligible,
+            page_checked,
+            pending_tierup: None,
         })
     }
 
-    /// Run the scheduler to completion — the loop `drive` used to run inline. Each iteration services
-    /// one runnable vCPU via `step_vcpu` and settles wakes/teardown; the run's result is the root
-    /// task's. Behaviourally identical to the former inline loop — tier-up and blocking-stdin stops
-    /// stay `unreachable!` on this native driver (no eligibility bitmap is ever set here).
+    /// Run the scheduler until it must pause — either the run finished ([`CoopStep::Done`]) or a task
+    /// hit an eligible module-0 call and its emitted region must run on the host ([`CoopStep::TierUp`],
+    /// resumed via [`deliver_tierup`](Self::deliver_tierup)). On the native `drive` (no eligibility),
+    /// tier-up never fires, so this runs the whole schedule and returns `Done` — behaviourally the
+    /// inline loop `drive` used to run. Each iteration services one runnable vCPU via `step_vcpu` and
+    /// settles wakes/teardown; a run-fatal trap is `Err(trap)`.
     fn pump(
         &mut self,
         dom: &Domain,
@@ -9322,7 +9376,7 @@ impl CoopSched {
         host: &mut Host,
         fuel: &mut u64,
         budget: u64,
-    ) -> Result<Vec<Value>, Trap> {
+    ) -> Result<CoopStep, Trap> {
         let CoopSched {
             tasks,
             extra_envs,
@@ -9332,6 +9386,9 @@ impl CoopSched {
             dead_envs,
             forked_twins,
             clock,
+            eligible,
+            page_checked,
+            pending_tierup,
         } = self;
         loop {
             // Domain lifetime & teardown (DESIGN.md §12 / ISSUES.md I37, owner 2026-07-24): a
@@ -9361,7 +9418,9 @@ impl CoopSched {
                     host.frozen_fibers =
                         freeze_drive(fibers, fiber_sp, fiber_meta, dom, &mut ctx, budget)?;
                 }
-                return res;
+                // `res` is the root's `Result<Vec<Value>, Trap>`: `Ok(vals)` → `Done(vals)`; a root
+                // trap stays `Err(trap)` (the run's fatal trap), exactly as `drive` returned it.
+                return res.map(CoopStep::Done);
             }
             // §3.6 (I36 slice 2) — settle wakes: a task parked on a live-call ticket wakes when the
             // callee's serve loop completed its dispatch; claiming the completion cell delivers the
@@ -9548,10 +9607,27 @@ impl CoopSched {
             match stop {
                 Err(trap) => complete(tasks, ti, Err(trap)),
                 Ok(VcpuStop::Done(vals)) => complete(tasks, ti, Ok(vals)),
-                // wasm-JIT tier-up is only enabled on the browser `Vcpu::run` path (`with_jit_eligible`);
-                // the native drivers never set the eligibility bitmap, so it cannot occur here.
-                Ok(VcpuStop::TierUp { .. }) => {
-                    unreachable!("tier-up not enabled on the native driver")
+                // #926 slice 2 — wasm-JIT tier-up: this module-0 task hit a direct call to an eligible
+                // function (its `Vm` carries the run's bitmap). `step_vcpu` has already spilled the frame
+                // past the call, so the task is resumable with just the result slots filled. Stash the
+                // delivery target — `(task, dst, result types)` — and surface the region to the driver;
+                // `deliver_tierup` writes the emitted results back into `tasks[ti].vt.active` and the next
+                // `pump` resumes the task. At most one tier-up is outstanding (we return here), so the
+                // single `pending_tierup` slot suffices — no per-task field needed. On the native driver
+                // no task is eligible, so this arm is never reached (the bitmap is `None`).
+                Ok(VcpuStop::TierUp {
+                    func,
+                    argv,
+                    dst,
+                    results,
+                    mapped,
+                }) => {
+                    debug_assert!(
+                        pending_tierup.is_none(),
+                        "a tier-up is already outstanding — deliver_tierup was skipped"
+                    );
+                    *pending_tierup = Some((ti, dst, results));
+                    return Ok(CoopStep::TierUp { func, argv, mapped });
                 }
                 // Blocking stdin is only ever set on an owned-host `Vcpu` (the interactive session), never
                 // a scheduler task — same rationale as tier-up above.
@@ -9928,6 +10004,17 @@ impl CoopSched {
                         VTask::new(&cm, func as usize, &[Value::I64(sp), Value::I64(arg)])?;
                     child.active.module = module as usize;
                     child.active.home = module as usize;
+                    // #926 slice 2: a `thread.spawn` child running in **module 0** tiers up its own
+                    // eligible calls too (the run's bitmap is per-module-0-function, shared across the
+                    // root and its same-module threads). A child spawned in another module (a confined
+                    // §22 unit spawning its own function) runs a different module, where the module-0
+                    // bitmap does not apply — leave it interpreting.
+                    if module == 0 {
+                        if let Some(e) = eligible.as_ref() {
+                            child.active.jit_eligible = Some(std::sync::Arc::clone(e));
+                            child.active.jit_page_checked = *page_checked;
+                        }
+                    }
                     let cidx = tasks.len();
                     // §12 seed the child vCPU's TLS register to its dense id (root is task 0), so
                     // `vcpu.tls.get` returns the worker index — the tree-walker's `tls: id` seeding.
@@ -10640,6 +10727,151 @@ impl CoopSched {
                 }
             }
         }
+    }
+
+    /// #926 slice 2 — deliver an emitted tier-up region's results into the paused task and clear the
+    /// pending slot, so the next [`pump`](Self::pump) resumes it. `vals` are the raw i64 result slots
+    /// the host read out of the emitted `f{func}` run; they are re-tagged into the caller frame's `dst`
+    /// slots per the recorded result types (mirroring [`Vcpu::deliver_tierup`]). A short reply is a
+    /// malformed host reply, which traps the task (its domain tears down, surfacing as the run result).
+    fn deliver_tierup(&mut self, vals: &[i64]) {
+        let (ti, dst, results) = self
+            .pending_tierup
+            .take()
+            .expect("deliver_tierup with no pending tier-up");
+        if vals.len() < results.len() {
+            complete(&mut self.tasks, ti, Err(Trap::Malformed));
+            return;
+        }
+        for (i, ty) in results.iter().enumerate() {
+            self.tasks[ti].vt.active.set(
+                dst as u32 + i as u32,
+                Reg::from_value(slot_to_val(*ty, vals[i])),
+            );
+        }
+    }
+
+    /// #926 slice 2 — the emitted tier-up region trapped: surface it exactly where the interpreter
+    /// would by trapping the paused task (mirroring [`Vcpu::deliver_tierup_trap`]).
+    fn deliver_tierup_trap(&mut self, trap: Trap) {
+        let (ti, _dst, _results) = self
+            .pending_tierup
+            .take()
+            .expect("deliver_tierup_trap with no pending tier-up");
+        complete(&mut self.tasks, ti, Err(trap));
+    }
+}
+
+/// #926 slice 2 tier-up configuration for a cooperative run: the wasm-JIT eligibility bitmap plus
+/// whether it is page-checked (#750). Bundled rather than passed as two loose parameters because
+/// `page_checked` is meaningful only alongside a bitmap — a `None` config is "no tier-up", exactly the
+/// native `drive`. The bitmap is per **module-0** function; a direct call to an `eligible[f] == true`
+/// function surfaces as a tier-up on the root and any same-module `thread.spawn` descendant.
+pub struct TierUpConfig {
+    /// Per-module-0-function eligibility (index = function). `true` ⇒ a direct call tiers up.
+    pub eligible: std::sync::Arc<[bool]>,
+    /// #750 paged tier-up: the emitted region carries a per-access page check, so an unrepresentable
+    /// window surfaces with the reserved size instead of declining.
+    pub page_checked: bool,
+}
+
+/// A pause of the cooperative tier-up driver [`CoopRun`], mirroring the single-vCPU [`VcpuEvent`]'s
+/// tier-up-relevant subset. The cooperative driver services concurrency (`thread.spawn`, join, futex
+/// wait/notify) **internally** — multiplexing every vCPU on the one host thread — so, unlike the
+/// per-Worker parallel driver, those never surface; only the run's end and tier-up round-trips do.
+pub enum CoopEvent {
+    /// The run finished; these are the root task's results.
+    Done(Vec<Value>),
+    /// The run trapped (the root task, or a fatal driver fault).
+    Trapped(Trap),
+    /// A module-0 task paused on an eligible direct `Call` to `func` with raw i64 arg slots `argv`;
+    /// `mapped` is the committed scalar window extent for the emitted `"mapped"` global. The host runs
+    /// the emitted `f{func}` and calls [`CoopRun::deliver_tierup`] / [`CoopRun::deliver_tierup_trap`].
+    TierUp {
+        func: u32,
+        argv: Box<[i64]>,
+        mapped: u64,
+    },
+}
+
+/// A **resumable cooperative tier-up run**: the single-thread, no-Worker analogue of the parallel
+/// `svm_par_*` driver. It owns the run's `Domain`/window/powerbox/fuel and a [`CoopSched`] that
+/// multiplexes every vCPU (root + `thread.spawn` descendants) on this one thread, and pauses to the
+/// host on each wasm-JIT tier-up ([`run`](Self::run) → [`CoopEvent::TierUp`] → run the emitted region
+/// → [`deliver_tierup`](Self::deliver_tierup) → `run` again), exactly the loop the native tests and
+/// the browser cdylib drive it with. With no eligibility bitmap it behaves as `drive`: `run` returns
+/// `Done`/`Trapped` in one call. (#926 slice 2.)
+pub struct CoopRun {
+    dom: Domain,
+    mem: Option<Mem>,
+    host: Host,
+    fuel: u64,
+    sched: CoopSched,
+}
+
+impl CoopRun {
+    /// Build a run over module `m`, entering `entry(args)` with `fuel` and the granted `host` powerbox.
+    /// `tierup` is the tier-up config ([`TierUpConfig`]); pass `None` for a pure-interpreter multiplex.
+    /// `None` if `m` uses an op outside the bytecode engine's subset (the caller falls back to the
+    /// tree-walker), `Some(Err)` if `entry` is out of range.
+    pub fn new(
+        m: &Module,
+        entry: FuncIdx,
+        args: &[Value],
+        mut fuel: u64,
+        mut host: Host,
+        tierup: Option<TierUpConfig>,
+    ) -> Option<Result<CoopRun, Trap>> {
+        let c = compile_module_for(m)?;
+        if entry as usize >= c.progs.len() {
+            return Some(Err(Trap::Malformed));
+        }
+        let dom = Domain::new(c, host.jit_table_log2());
+        let mut mem = build_mem(m);
+        let sched = match CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)
+        {
+            Ok(s) => s,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(Ok(CoopRun {
+            dom,
+            mem,
+            host,
+            fuel,
+            sched,
+        }))
+    }
+
+    /// Pump the schedule to its next pause: [`CoopEvent::Done`]/[`CoopEvent::Trapped`] end the run,
+    /// [`CoopEvent::TierUp`] hands an emitted region to the host (resume with `deliver_tierup*`).
+    pub fn run(&mut self) -> CoopEvent {
+        // `budget` is the per-step op budget `step_vcpu` hands `Vm::resume` (a `0` would run zero ops
+        // and spin on `Outcome::Suspended`); the native `drive` runs unsliced, so match it with
+        // `u64::MAX` — run each vCPU to its next stop. It doubles as the §3d spawn record budget
+        // (`u64::MAX` ⇒ the no-record default `take_spawn_budget` already uses for a normal run).
+        match self.sched.pump(
+            &self.dom,
+            &mut self.mem,
+            &mut self.host,
+            &mut self.fuel,
+            u64::MAX,
+        ) {
+            Ok(CoopStep::Done(vals)) => CoopEvent::Done(vals),
+            Ok(CoopStep::TierUp { func, argv, mapped }) => CoopEvent::TierUp { func, argv, mapped },
+            Err(t) => CoopEvent::Trapped(t),
+        }
+    }
+
+    /// Deliver the emitted tier-up region's raw i64 result slots and resume (see
+    /// [`CoopSched::deliver_tierup`]). Call exactly once after a [`CoopEvent::TierUp`], before `run`.
+    pub fn deliver_tierup(&mut self, vals: &[i64]) {
+        self.sched.deliver_tierup(vals);
+    }
+
+    /// Surface an emitted tier-up region's trap and resume (the paused task traps). Call once after a
+    /// [`CoopEvent::TierUp`] in lieu of [`deliver_tierup`](Self::deliver_tierup).
+    pub fn deliver_tierup_trap(&mut self, trap: Trap) {
+        self.sched.deliver_tierup_trap(trap);
     }
 }
 
