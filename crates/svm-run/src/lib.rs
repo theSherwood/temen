@@ -6364,12 +6364,14 @@ block 0 (vaddr: i64) {{
         m
     }
 
-    /// A host with the self module registered and an `Instantiator` granted under the name the
-    /// guest's `cap.self.resolve` looks up — the grants a `Session` host would carry.
+    /// A host with the self module registered, the region factory installed (`grant_caps` does
+    /// this too — the demand-paging fault path needs it), and an `Instantiator` granted under
+    /// the name the guest's `cap.self.resolve` looks up — the grants a `Session` host carries.
     fn pager_host(m: &Module) -> Host {
         let win = 1u64 << 17;
         let mut host = Host::new();
         host.set_self_module(&Arc::new(m.clone()));
+        host.set_region_factory(new_shared_region);
         let ih = host.grant_instantiator(0, win);
         host.register_cap_name("vm", ih);
         host
