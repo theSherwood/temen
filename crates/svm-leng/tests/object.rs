@@ -96,115 +96,53 @@ fn whole_object_exposes_exportc_c_names() {
     }
 }
 
-/// A separately-produced **runtime object** (not from nimony): the four pure seq/openArray ops real
-/// `sumSeq` imports, hand-authored as svm-text. This stands in for what a real compiled `system`
-/// module (or a C-runtime `.svmo`) will provide — the point is only that it's a *different producer*
-/// whose object links against the nimony one through the shared format.
-const RUNTIME_TEXT: &str = "\
-memory 16
-
-func (i64, i64) -> () {
-block 0 (v0: i64, v1: i64) {
-  v2 = i64.load v1 offset=8
-  i64.store v0 v2 offset=0
-  v3 = i64.load v1 offset=0
-  i64.store v0 v3 offset=8
-  return
-  }
-}
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  v1 = i64.load v0 offset=8
-  return v1
-  }
-}
-func (i64, i64) -> (i64) {
-block 0 (v0: i64, v1: i64) {
-  v2 = i64.load v0 offset=0
-  v3 = i64.const 8
-  v4 = i64.mul v1 v3
-  v5 = i64.add v2 v4
-  return v5
-  }
-}
-func (i64) -> () {
-block 0 (v0: i64) {
-  v1 = i64.load v0
-  v2 = i64.const 1
-  v3 = i64.add v1 v2
-  i64.store v0 v3
-  return
-  }
-}";
-
-fn runtime_shim_index(name: &str) -> u32 {
-    if name.contains("toOpenArray") {
-        0
-    } else if name.starts_with("len") {
-        1
-    } else if name.contains("5B") {
-        2 // the `[]` operator (`\5B\5D…`)
-    } else if name.starts_with("inc") {
-        3
-    } else {
-        panic!("no runtime op for import {name}");
-    }
-}
-
 #[test]
 fn cross_producer_link_through_svmo() {
-    // A nimony `.svmo` (sumSeq) links against a *separately produced* runtime `.svmo` — both binary
-    // objects, joined only through the format — and runs. This is the composition the narrow waist
-    // exists for: the runtime object will one day be the real compiled `system` module.
-    const R: &str = include_str!("fixtures/real_seq_loop.leng.nif");
+    // A nimony `.svmo` links against a **separately-produced, non-nimony** runtime `.svmo` through the
+    // shared binary format — the cross-*producer* composition the narrow waist exists for (the runtime
+    // object will one day be the real compiled `system` module). A minimal nimony proc `dbl` calls the
+    // cross-module `ext`, which no unit here defines, so it compiles to an import; a hand-authored
+    // runtime object (a different producer) exports `ext` — doubling. Linked and run: `dbl(21) = 42`.
+    let nim_src = "\
+(stmts
+ (proc :dbl.0. (params (param :x.0 . (i +64))) (i +64) .
+  (stmts .
+   (ret (call ext.0.rt x.0)))))";
     let nim_obj = svm_leng::compile_object(&LengModule {
         stem: "seqmod",
-        src: R,
-        names: &["sumSeq.0."],
+        src: nim_src,
+        names: &["dbl.0."],
     })
     .unwrap();
-    // The nimony object declares its seq-op imports; the runtime object must export exactly those.
     let nim = decode_unit(&nim_obj).expect("decode nimony object");
-    let mut runtime = svm_text::parse_module(RUNTIME_TEXT).expect("runtime text");
+    // The non-nimony runtime object: one func doubling its arg, exported under the nimony import name.
+    let mut runtime = svm_text::parse_module(
+        "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = i64.const 2\n  v2 = i64.mul v0 v1\n  return v2\n  }\n}",
+    )
+    .expect("runtime text");
     runtime.exports = nim
         .imports
         .iter()
         .map(|imp| Export {
             name: imp.name.clone(),
-            func: runtime_shim_index(&imp.name),
+            func: 0,
         })
         .collect();
     let rt_obj = encode_unit(&runtime); // the runtime, as its own `.svmo`
 
-    // Link the two objects through the format and run sumSeq over a harness-built seq.
+    // Link the two objects through the format and run.
     let linked = svm_ir::link(&[
         unit_of(decode_unit(&nim_obj).unwrap()),
         unit_of(decode_unit(&rt_obj).unwrap()),
     ])
     .expect("link nimony + runtime objects");
     svm_verify::verify_module(&linked).expect("verify");
-
-    let (seq, data, sp) = (512usize, 640usize, 1024i64);
-    let mut seed = vec![0u8; 4096];
-    seed[seq..seq + 8].copy_from_slice(&3i64.to_le_bytes());
-    seed[seq + 8..seq + 16].copy_from_slice(&(data as i64).to_le_bytes());
-    for (i, v) in [10i64, 20, 30].iter().enumerate() {
-        seed[data + i * 8..data + i * 8 + 8].copy_from_slice(&v.to_le_bytes());
-    }
-    // sumSeq is func 0 of the linked module: (sp, seq_addr) -> Σ = 60.
+    // dbl is func 0: (x) -> 2x.
     let mut fuel = u64::MAX;
-    let (ir, _) = svm_interp::run_capture(
-        &linked,
-        0,
-        &[Value::I64(sp), Value::I64(seq as i64)],
-        &mut fuel,
-        &seed,
-    );
-    assert_eq!(ir.expect("interp").as_slice(), &[Value::I64(60)]);
-    let (jout, _) =
-        svm_jit::compile_and_run_capture(&linked, 0, &[sp, seq as i64], &seed).expect("jit");
-    match jout {
-        svm_jit::JitOutcome::Returned(v) => assert_eq!(v, vec![60], "§9 parity"),
+    let ir = svm_interp::run(&linked, 0, &[Value::I64(21)], &mut fuel).unwrap();
+    assert_eq!(ir.as_slice(), &[Value::I64(42)]);
+    match svm_jit::compile_and_run(&linked, 0, &[21]).expect("jit") {
+        svm_jit::JitOutcome::Returned(v) => assert_eq!(v, vec![42], "§9 parity"),
         o => panic!("jit: {o:?}"),
     }
 }

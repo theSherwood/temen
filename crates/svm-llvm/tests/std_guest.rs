@@ -1,4 +1,4 @@
-//! **Real Rust `std` as an svm guest** — the RUST_STD.md S1b differential (the analog of
+//! **Real Rust `std` as an svm guest** — the std-on-svm differential (LLVM.md §10; the analog of
 //! `w5_rust_guest.rs`, one rung up: `no_std + alloc` → full `std`). A `std` binary is built for the
 //! custom `x86_64-unknown-svm` target via `-Zbuild-std` (the `crates/svm-llvm/rust-svm/` lane),
 //! emitted as one fat-LTO'd `.ll`, translated by the on-ramp, verified, and run through the powerbox —
@@ -71,8 +71,8 @@ fn build_std_bin_ll_target(name: &str, src: &str, target_file: &str) -> Option<P
     std::fs::write(src_dir.join("main.rs"), src).ok()?;
 
     let target_json = lane_dir().join(target_file);
-    let mut child = Command::new("cargo")
-        .current_dir(&work)
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(&work)
         .env("RUSTC_BOOTSTRAP", "1")
         .env("CARGO_TARGET_DIR", work.join("target"))
         .args([
@@ -90,37 +90,18 @@ fn build_std_bin_ll_target(name: &str, src: &str, target_file: &str) -> Option<P
             "--",
             "--emit=llvm-ir",
             "-Clto=fat",
-        ])
-        .spawn()
-        .ok()?;
-    // #788 wedge guard: a `rustc`/`cargo` that hangs mid-`build-std` must not stall the whole (serial)
-    // job to the 6-hour ceiling. Bound each build and kill a wedged child, returning `None` (skip)
-    // instead of blocking forever. Override the budget with `SVM_STD_BUILD_TIMEOUT_SECS`.
-    let budget = std::env::var("SVM_STD_BUILD_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(600);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(budget);
-    loop {
-        match child.try_wait() {
-            // A missing `_start` linker note is expected (we consume the IR, not the executable); a
-            // non-zero status is tolerated as long as the `.ll` landed (checked below).
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    eprintln!(
-                        "note: skipping std_guest ({target_file}): build-std exceeded {budget}s \
-                         (possible #788 rustc wedge)"
-                    );
-                    return None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-            Err(_) => return None,
-        }
-    }
+        ]);
+    // #788: put `cargo` in its own process group so a wedged build can be killed **as a group** — the
+    // original stall left an orphan `rustc` alive after `cargo` was reaped (killing the child alone
+    // doesn't reap its `rustc`/`rustc`-worker grandchildren), and under `--test-threads=1` that orphan
+    // then steals CPU/disk from the next build, risking a cascade. A new group makes the timeout kill
+    // reap the whole build tree at once. (Unix-only; the lane is Linux-only, and non-unix auto-skips.)
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd.spawn().ok()?;
+    // A missing `_start` linker note is expected (we consume the IR, not the executable); a
+    // non-zero status is tolerated as long as the `.ll` landed (checked below).
+    wait_bounded(&mut child, target_file)?;
     let ll = find_ll(&work.join("target"), name)?;
     // Free the per-test build tree now. Each test does a full `build-std` (~hundreds of MB of target
     // artifacts); run serially across the whole suite that exhausts the runner's disk allowance —
@@ -132,6 +113,53 @@ fn build_std_bin_ll_target(name: &str, src: &str, target_file: &str) -> Option<P
     std::fs::copy(&ll, &out_ll).ok()?;
     let _ = std::fs::remove_dir_all(&work);
     Some(out_ll)
+}
+
+/// #788 wedge guard, shared by the `build-std` and native-oracle compiles: a `rustc`/`cargo` that
+/// hangs must not stall the whole (serial) job to the 6-hour ceiling — CI observed the wedge in
+/// **both** spots (build-std originally; the bare native-oracle `rustc` in issue #906). Bound the
+/// wait and kill a wedged child's whole process group, returning `None` (skip) instead of blocking
+/// forever. The child must have been spawned as its own group leader (`process_group(0)`).
+/// Override the budget with `SVM_STD_BUILD_TIMEOUT_SECS`.
+fn wait_bounded(child: &mut std::process::Child, what: &str) -> Option<std::process::ExitStatus> {
+    let budget = std::env::var("SVM_STD_BUILD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(600);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(budget);
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return Some(st),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    kill_build(child);
+                    eprintln!(
+                        "note: skipping std_guest ({what}): compile exceeded {budget}s \
+                         (possible #788 rustc wedge)"
+                    );
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Kill a wedged `build-std` and reap it (#788). On Unix `cargo` leads its own process group (set at
+/// spawn), so signal the **whole group** — negative pid to `kill(2)` — to take down `cargo` and every
+/// `rustc`/codegen grandchild together, then `wait` the leader so it is not left a zombie. Elsewhere,
+/// fall back to killing just the child. Uses the `kill` binary (universally present on the Linux lane)
+/// so the harness needs no `libc`/`nix` dependency.
+fn kill_build(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-KILL", &format!("-{}", child.id())])
+            .status();
+    }
+    let _ = child.kill(); // belt-and-suspenders (and the non-unix path)
+    let _ = child.wait();
 }
 
 fn find_ll(target: &Path, name: &str) -> Option<PathBuf> {
@@ -349,15 +377,15 @@ fn native_oracle_args(name: &str, src: &str, extra_args: &[&str]) -> Option<(Vec
     let rs = dir.join("main.rs");
     let bin = dir.join("oracle");
     std::fs::write(&rs, host_src).ok()?;
-    let built = Command::new("rustc")
-        .args(["--edition", "2021", "-O"])
+    let mut cmd = Command::new("rustc");
+    cmd.args(["--edition", "2021", "-O"])
         .arg(&rs)
         .arg("-o")
-        .arg(&bin)
-        .status()
-        .ok()?
-        .success();
-    if !built {
+        .arg(&bin);
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd.spawn().ok()?;
+    if !wait_bounded(&mut child, "native-oracle rustc")?.success() {
         return None;
     }
     let out = Command::new(&bin).args(extra_args).output().ok()?;
@@ -394,15 +422,15 @@ fn native_oracle_streams(name: &str, src: &str) -> Option<(Vec<u8>, Vec<u8>, u8)
     let rs = dir.join("main.rs");
     let bin = dir.join("oracle");
     std::fs::write(&rs, host_src).ok()?;
-    let built = Command::new("rustc")
-        .args(["--edition", "2021", "-O"])
+    let mut cmd = Command::new("rustc");
+    cmd.args(["--edition", "2021", "-O"])
         .arg(&rs)
         .arg("-o")
-        .arg(&bin)
-        .status()
-        .ok()?
-        .success();
-    if !built {
+        .arg(&bin);
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd.spawn().ok()?;
+    if !wait_bounded(&mut child, "native-oracle rustc")?.success() {
         return None;
     }
     let out = Command::new(&bin).output().ok()?;
@@ -831,6 +859,50 @@ fn std_fs_dir_ops() {
          clone_read=\"hi there\"\n",
         "create_dir/create_dir_all/rename/remove_dir/try_clone over the memfs dir ops"
     );
+}
+
+/// HashMap — `std::collections::HashMap` end-to-end (LLVM.md §10). `RandomState` reaches
+/// the svm PAL's `sys/random` leaf, which supplies a per-guest-deterministic seed (no host RNG op), so
+/// `HashMap` constructs and hashes without failing closed. The program's output is deliberately
+/// **iteration-order-independent** (`len`/`values().sum()`/keyed `get`/`contains_key`/`entry`) so it is
+/// byte-identical to native even though svm's seed differs from native's real random seed — the
+/// differential holds on *semantics*, which is what a fixed/deterministic seed buys (LLVM.md §10).
+#[test]
+fn std_hashmap_round_trips() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest hashmap (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         use std::collections::HashMap;\n\
+         fn main() {\n\
+         \x20   let mut m: HashMap<String, u32> = HashMap::new();\n\
+         \x20   for i in 0..50u32 { m.insert(format!(\"k{i}\"), i * i); }\n\
+         \x20   for i in (0..50u32).step_by(7) { m.remove(&format!(\"k{i}\")); }\n\
+         \x20   let sum: u32 = m.values().sum();\n\
+         \x20   println!(\"len={} sum={} has_k10={} k13={}\", m.len(), sum, m.contains_key(\"k10\"), m[\"k13\"]);\n\
+         \x20   *m.entry(\"k13\".to_string()).or_insert(0) += 1000;\n\
+         \x20   *m.entry(\"knew\".to_string()).or_insert(7) += 1;\n\
+         \x20   println!(\"k13_after={} knew={} final_len={}\", m[\"k13\"], m[\"knew\"], m.len());\n\
+         }\n";
+
+    let Some((stdout, _)) = svm_run_std("svm_std_hashmap", src) else {
+        eprintln!("note: skipping std_guest hashmap (build-std produced no .ll)");
+        return;
+    };
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "len=42 sum=33565 has_k10=true k13=169\n\
+         k13_after=1169 knew=8 final_len=43\n",
+        "HashMap insert/remove/get/values-sum/entry all correct, order-independent"
+    );
+    if let Some((native, _)) = native_oracle("svm_std_hashmap_oracle", src) {
+        assert_eq!(
+            stdout, native,
+            "HashMap output byte-identical to native (order-independent aggregates)"
+        );
+    }
 }
 
 /// S2 (net) — `std::net` via the **`net` capability** (POSIX.md §5a): a lockstep self-connect over

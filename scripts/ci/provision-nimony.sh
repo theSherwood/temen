@@ -8,38 +8,29 @@
 #     NIMONY_BIN=<abs>/nimony/bin
 #     NIM_BIN=<dir of the nim on PATH>
 #
-# NIMONY_REF pins the nimony commit so the emitted Leng (symbol mangling, ABI) is reproducible — bump
-# it deliberately, in lockstep with any svm-leng change the newer frontend would require.
+# The nimony frontend (and its sibling `nativenif`) are vendored as **git submodules** — the exact
+# commit is pinned by the gitlink in `.gitmodules`, reproducible in-tree, and bumped deliberately in
+# lockstep with any svm-leng change the newer frontend requires (`git -C nimony checkout <ref>` +
+# commit the submodule). This replaces the old in-script clone-and-checkout of a hard-coded SHA.
 set -euo pipefail
 
 # The caller appends our stdout to $GITHUB_ENV, so ONLY the final `KEY=value` lines may go there —
-# send every command's chatter (clone progress, the `hastur` build) to stderr, and emit the two
+# send every command's chatter (submodule fetch, the `hastur` build) to stderr, and emit the two
 # result lines on the saved stdout (fd 3) at the end.
 exec 3>&1 1>&2
 
-# Full 40-char commit SHA (GitHub's fetch/checkout-by-SHA needs the full hash, not an abbreviation).
-NIMONY_REF="${NIMONY_REF:-096de9a3dd479c5865f04cd3d595dfdf42e83ef9}"
 WORK="${1:-${GITHUB_WORKSPACE:-$PWD}}"
 cd "$WORK"
 
 command -v nim >/dev/null || { echo "error: nim (devel) not on PATH" >&2; exit 1; }
 NIM_BIN="$(dirname "$(command -v nim)")"
 
-# nimony + its sibling nativenif (the native backend's nim.cfg reach it via `../nativenif`). We need
-# master (blob-filtered — all commits, lazy blobs) so the pinned commit is present, then check it out.
-# The toolchain cache restores `nimony/bin` (built output) WITHOUT `nimony/.git`, so on a warm cache
-# `nimony/` exists but is not a checkout — and `git clone nimony` aborts on the non-empty dir. Init a
-# repo in place and fetch instead, which works whether `nimony/` is absent (cold) or holds a restored
-# `bin/` (warm); fetching all branches mirrors the old clone's reachability so the pinned SHA is found.
-if [ ! -d nimony/.git ]; then
-  mkdir -p nimony
-  git -C nimony init -q
-  git -C nimony remote add origin https://github.com/nim-lang/nimony 2>/dev/null \
-    || git -C nimony remote set-url origin https://github.com/nim-lang/nimony
-  git -C nimony fetch --filter=blob:none origin
-fi
-git -C nimony checkout --detach "$NIMONY_REF"
-[ -d nativenif/.git ] || git clone --depth 1 https://github.com/nim-lang/nativenif nativenif
+# Ensure the vendored submodules are checked out at their pinned commits. A CI checkout with
+# `submodules: recursive` already does this, so this is a no-op there; it makes a plain checkout or a
+# local run work too. Not shallow — the pinned commit need not be a branch tip, so the full fetch is
+# required to resolve it. `nativenif` must sit beside `nimony` (the native backend's nim.cfg reaches
+# it via `../nativenif`); both are repo-root submodules, so that sibling layout holds.
+git submodule update --init nimony nativenif
 
 # setup-nim installs a *prebuilt* nightly that can lag `devel`; overlay fresh compiler sources so
 # nifler (which compiles Nim's own parser) can parse current syntax — exactly what nimony CI does.
@@ -51,7 +42,7 @@ NIM_ROOT="$(dirname "$NIM_BIN")"
 if [ -d "$NIM_ROOT/compiler" ]; then
   cp -a nim-src/compiler/. "$NIM_ROOT/compiler/"
 fi
-# hastur resolves the frontend's NIF libs via `nim/dist/nimony` — point it at our checkout.
+# hastur resolves the frontend's NIF libs via `nim/dist/nimony` — point it at our submodule checkout.
 mkdir -p "$NIM_ROOT/dist"
 rm -rf "$NIM_ROOT/dist/nimony"
 ln -sf "$WORK/nimony" "$NIM_ROOT/dist/nimony"

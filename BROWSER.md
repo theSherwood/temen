@@ -995,9 +995,11 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    `driveTierupRun` in `web/wasmjit-module.js` services each event on the emitted module over the
    shared memory (re-arm `"fuel"`, write the event's committed-extent snapshot to `"mapped"` — the
    #717 sync — then `f{func}(win, env, ...args)` and deliver), and `runJitModule` tries this opener
-   automatically when the whole-program open declines. Fail-closed at open for threads/futex guests
-   (`Spawn`/`Join`/`Wait`/`Notify` events the single-vCPU pump can't service) and when nothing could
-   ever run emitted; a trap mid-run throws so the page re-runs on the interpreter oracle
+   automatically when the whole-program open declines. Fail-closed when nothing could ever run
+   emitted, and (originally) at open for any threads/futex-linked guest — a static scan later
+   narrowed to a runtime decline on the surfaced `Spawn`/`Join`/`Wait`/`Notify` event so
+   dead-linked concurrency ops no longer refuse (#926 slice 1, below); a trap mid-run throws so the
+   page re-runs on the interpreter oracle
    (INVARIANT 9). Proven observably identical to `onramp_exec` (status/value/stdout, with a tier-up
    non-vacuity counter) by the native `tests/tierup_driver.rs` with wasmi playing the JS host.
 
@@ -1014,12 +1016,94 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    emitted + all-scalar operands + representable window state) surfaces as a `TIERUP_RUN_JIT_INVOKE`
    event, serviced by `driveTierupRun` as `f0(win, env, ...args)` on the unit's own wasm
    (instantiated once per code handle, args/results marshalled by the event's scalar type codes,
-   same per-call `"mapped"` sync). A symtab-linked macro unit (Slot callbacks into the program) is
-   outside the closed-unit emitter subset and stays interpreted — fail-closed, and the reason the
-   JACL capstone test asserts parity but not emitted-unit non-vacuity. Differentials in
-   `tests/tierup_driver.rs`: a `vm_jit_compile`+`invoke2` guest whose unit stores/loads through the
-   `vm_map`-grown page (emitted-invoke non-vacuity + the grown-extent `"mapped"` operand pinned), a
-   fiber-guest admit/parity pin, and the asset-gated real `jacl_compiler.svmb` pump run.
+   same per-call `"mapped"` sync). Differentials in `tests/tierup_driver.rs`: a
+   `vm_jit_compile`+`invoke2` guest whose unit stores/loads through the `vm_map`-grown page
+   (emitted-invoke non-vacuity + the grown-extent `"mapped"` operand pinned), a fiber-guest
+   admit/parity pin, and the asset-gated real `jacl_compiler.svmb` pump run.
+
+   **#846 — linked units: the driver table + the live-state bounce.** Units now emit whole-module
+   in **Model B2** shape (`compile_module_b2`): their `call_indirect` dispatches through **one
+   shared `WebAssembly.Table`** the driver populates from the engine's slot mirror at each event
+   boundary — an installed unit's emitted `f0` (unit→unit, native), an eligible program function's
+   `f{i}` from the main emitted module (unit→program, native; `call_indirect`-bearing leaves are
+   excluded from TIERUP eligibility for the same table-consistency reason), and, for every
+   interpreter-resident target, an engine-generated **bounce shim** (`emit_slot_trampoline` — the
+   emitter's cross-tier trampoline packaged as a standalone module with the slot baked in). The
+   bounce (`svm_onramp_tierup_call_interp` → `Vcpu::bounce_call`) runs the target on a nested
+   interpretation over the run's **live** window/powerbox/fuel — resolution through the shared
+   dispatch table exactly as `Op::CallIndirect`, fibers serviced against a per-invoke registry that
+   persists across the invoke's bounces, real fuel debited, a callback's `exit`/trap staged so the
+   unwind delivers the true trap kind — and the driver then fans the fresh `"mapped"` extent out to
+   every live instance, so mid-invoke `vm_map` growth becomes visible exactly when the interpreted
+   path would see it. The engine's dispatch table is sized to the emitted mask
+   (`compile_with_jit_table`), and a guest with any non-shimmable signature (v128 / over-arity)
+   keeps its units interpreted (a null table slot would diverge, not refuse). Differentials
+   (`TierupDriver` in `tests/tierup_driver.rs`, wasmi playing `driveTierupRun`): a linked unit
+   spanning all three edge kinds — a cap-calling bounce that **grows the window mid-invoke** (the
+   store into the just-grown page pins the fan-out), a native eligible-`f{i}` edge (pinned
+   never-bounced), and unit→unit through an install slot (pinned zero-bounce) — all observably
+   identical to `onramp_exec`.
+
+   **#880 — `call_indirect` tiers up (the B2 main module).** The mixed-tier emit had *never*
+   admitted a `call_indirect`-bearing function (the local identity table is only safe when the
+   whole module is in-subset — and a real `_start` never is), pinning every dispatch-loop function
+   to the interpreter and running installed units' *bytecode* on the program→unit edge. The main
+   module now emits over the **shared reserved table** too (`compile_module_tierup_b2` — the
+   candidate restriction lifts, since the driver populates every slot correctly: native funcref /
+   bounce shim / trapping null ≡ `TABLE_EMPTY`), the engine's dispatch table is mask-sized for
+   every pump guest, and a non-shimmable-signature guest falls back to the local-mode emit whole.
+   TIERUP regions can now bounce: the staged-trap delivery extends to
+   `svm_onramp_tierup_deliver_trap`, and `Vcpu::bounce_call` picks its fiber registry by context —
+   invoke-confined during a JIT_INVOKE (`run_invoke` parity), the **run-level** registry (parallel
+   arrays mirrored) during a TIERUP region, so a fiber created inside a bounced callback persists
+   for the run to resume later, exactly as the same call inline would. Differentials: a
+   `call_indirect`-bearing leaf tiering up with the indirect edge native; a leaf reaching an
+   **install slot** natively (old→new emitted at last); a TIERUP-region bounce growing the window
+   mid-region with stdout-ordering parity; and a fiber created inside a TIERUP bounce resumed
+   later by `_start` (the run-registry persistence pin).
+
+   **#888 — widened cross-tier calls collapse the fixpoint cascade (the coverage lever).** The
+   mixed-tier fixpoint dropped any candidate whose direct callee wasn't emitted or a strict
+   `interp_leaf` (pure/memory-free/call-free) — so one `printf` deep in a call chain de-emitted
+   everything above it. Measured over the shipping cards (the #887 inventory), this cascade — not
+   any op — pinned **61–69%** of chibicc/Lua/QuickJS to the interpreter, with only a handful of
+   functions per card carrying a genuinely non-emittable op. In the shared-reserved (B2) mode the
+   host services `env.call_interp` over the run's **live** window/powerbox/fuel (the pump's
+   `svm_onramp_tierup_call_interp` → the #846/#880 live-state bounce), exactly
+   `compile_module_reactor`'s Doom-perf contract — so `compile_module_tierup_b2` widens the
+   cross-tier set from strict `interp_leaf` to the reactor's `cross` (any `marshallable_sig`
+   non-in-subset function). An in-subset function that calls a memory/cap helper now stays emitted;
+   the helper bounces. Serving needed **no** change — direct (`Call`) and indirect (`call_indirect`)
+   cross-tier both emit `env.call_interp` and route to the same live bounce, already built by
+   #846/#880. Measured jump (`compile_module_tierup_b2`, per-card emitted fraction): chibicc
+   30%→**91%**, Lua 26%→**97%**, QuickJS 22%→**99%**, svm-leng 55%→**100%**. Local-mode and paged
+   callers keep the strict `interp_leaf` (throwaway-window bounce). Pinned: an emitter unit test
+   flipping one cascade function from interpreted→emitted purely from the widened set
+   (`tierup.rs`), and a browser differential where a tiered-up leaf makes a **direct** cross-tier
+   call to a cap-calling helper that grows the window mid-call — parity with `onramp_exec`, the
+   store into the just-grown page pinning the fan-out (`tierup_driver.rs`).
+
+   **#926 slice 1 — the concurrency open-gate was whole-module; make it runtime (dead-linked ops
+   no longer refuse).** `svm_onramp_tierup_open` used to scan every function for
+   `uses_threads() || uses_futex()` and refuse the whole guest if any matched — a **static** check,
+   so it also rejected guests whose concurrency ops are *linked but never reached*. The JACL
+   compiler-guest is exactly that shape (#839): jaclrt's scheduler/GC links thread/futex ops, but
+   with `POOL_WORKERS=1` it runs single-threaded on fibers and never executes them — yet the static
+   scan refused it, pinning the whole card to the interpreter. The gate is unnecessary: a
+   concurrency op that *actually executes* surfaces a `Spawn`/`Join`/`Wait`/`Notify` event, and the
+   run loop's catch-all already declines it to `TIERUP_RUN_TRAP` → the page re-runs on the
+   interpreter (which multiplexes concurrency cooperatively — INVARIANT 9). So the **runtime** event,
+   not a static pre-scan, is the real gate. Removing the pre-scan lets a guest that never reaches its
+   concurrency ops (JACL) tier up, while a guest that *does* reach one declines cleanly at that op —
+   exactly what the static refusal delivered, minus the false rejection of dead code. Fibers stay
+   admitted (`step_vcpu` services `cont.*`/`suspend` in-engine, §22 renegotiated 2026-07-30) and the
+   §22 unit-compile validator still refuses a futex-using *unit* at `vm_jit_compile` (`-EINVAL`) —
+   both unchanged. Differentials in `tierup_driver.rs`: a guest whose func 2 holds an unreached
+   `i32.atomic.wait` is admitted (`opened == 0`) and its eligible leaf tiers up with `onramp_exec`
+   parity; a guest whose `_start` tiers up a leaf and *then* runs `atomic.notify` is admitted but
+   declines to `TIERUP_RUN_TRAP` (`svm_status() == STATUS_TRAP`) after the tier-up, proving the
+   runtime gate. (Servicing those concurrency events on a cooperative multi-vCPU scheduler instead
+   of declining is #926 slice 2 — deferred until a guest that genuinely spawns at runtime needs it.)
 
 ### Fuel: safepoint parity + a global (LANDED — two interacting wins)
 

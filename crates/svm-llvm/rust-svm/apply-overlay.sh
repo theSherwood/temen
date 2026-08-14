@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Apply the svm `std` overlay to the active nightly toolchain's `rust-src`, so
-# `-Zbuild-std` can build `std` for the `x86_64-unknown-svm` target (RUST_STD.md, S0).
+# `-Zbuild-std` can build `std` for the `x86_64-unknown-svm` target (the `rust-svm` overlay; design in LLVM.md §10).
 #
 # The overlay is a set of `cfg_select!` arm additions that route `target_os = "svm"` to the svm
 # leaf-module implementations, plus the copied `imp` files. Most arms are shared by both svm targets;

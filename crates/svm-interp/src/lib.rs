@@ -2138,19 +2138,48 @@ fn drive_over_cell(
             sched_for_comp.completion_drain(&comps);
         }));
     }
-    // #799 L1 (embedder `^C`) — hand the signal source a scheduler-wake closure so an embedder raise
-    // (`Posix::raise_signal`) can interrupt a parked blocking syscall even when every fiber is parked and no
-    // safepoint fires. The personality invokes it only for a *deliverable* signal (its policy). Cleared at
-    // teardown (it captures the run's scheduler — cycle discipline, like `completion_notify`).
-    if let Some((_, source)) = host_shared
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .signal_poll()
+    // #799 L1 (embedder `^C`) / #863 slice 3 — hand the signal source a scheduler-wake closure so an
+    // embedder raise (`Posix::raise_signal`) can interrupt a parked blocking syscall even when every
+    // fiber is parked and no safepoint fires. The personality invokes it only for a *deliverable*
+    // signal (its policy). The closure holds the scheduler **weakly** and is **scoped to the root
+    // domain** (invariant 12): no teardown discipline is needed — the run's `Arc` dies with the run,
+    // so a post-run raise upgrades to nothing and is a harmless no-op.
     {
-        let sched_for_sig = Arc::clone(&sched);
-        source.set_wake(Arc::new(move || {
-            sched_for_sig.interrupt_interruptible_parks();
-        }));
+        let hg = host_shared.lock().unwrap_or_else(|e| e.into_inner());
+        let root_dom = hg.domain_id() as usize;
+        let stop_flag = hg.stop_flag.clone();
+        let term_flag = hg.term_flag.clone();
+        let source = hg.signal_poll().map(|(_, s)| s);
+        drop(hg); // release before `set_wake` (the door takes the personality's own lock)
+        if let Some(source) = source {
+            let sched_weak = Arc::downgrade(&sched);
+            source.set_wake(Arc::new(move || {
+                if let Some(s) = sched_weak.upgrade() {
+                    s.interrupt_interruptible_parks(root_dom, true);
+                }
+            }));
+            // #798 slice 2 — the stop/continue closure, same weak discipline as the wake.
+            let sched_weak = Arc::downgrade(&sched);
+            source.set_stop(Arc::new(move |stopped| {
+                stop_flag.store(stopped, Ordering::SeqCst);
+                if !stopped {
+                    if let Some(s) = sched_weak.upgrade() {
+                        s.wake_stopped(root_dom);
+                    }
+                }
+            }));
+            // #796 default actions — the terminate closure: flag up, then wake everything the
+            // domain has parked (interruptible parks AND stopped vCPUs) so each runs to its next
+            // per-op poll and dies. Death beats stop, so a woken stopped vCPU cannot re-park.
+            let sched_weak = Arc::downgrade(&sched);
+            source.set_kill(Arc::new(move || {
+                term_flag.store(true, Ordering::SeqCst);
+                if let Some(s) = sched_weak.upgrade() {
+                    s.interrupt_interruptible_parks(root_dom, false);
+                    s.wake_stopped(root_dom);
+                }
+            }));
+        }
     }
     let root_id = {
         let mut s = sched.lock();
@@ -2600,11 +2629,8 @@ fn drive_over_cell(
         let mut h = host_shared.lock().unwrap_or_else(|e| e.into_inner());
         h.quiesce_pool();
         h.clear_completion_notify();
-        // #799 L1 — drop the signal-wake closure's `Arc<Scheduler>` too (a no-op replaces it), so an
-        // embedder that keeps the source alive past the run doesn't pin the scheduler.
-        if let Some((_, source)) = h.signal_poll() {
-            source.set_wake(Arc::new(|| {}));
-        }
+        // #863 slice 3 — no signal-wake clear: the wake closure holds the scheduler *weakly*, so a
+        // source kept alive past the run pins nothing and a post-run raise is a no-op.
     }
     let (out, trap_origin) = {
         let mut s = sched.lock();
@@ -4109,6 +4135,13 @@ enum Blocked {
     /// the last write end closing (writer count → 0, which re-issues the read to EOF). On wake the read
     /// re-executes from the top (no partial state), like [`Blocked::CapRead`] / the stdin park.
     PipeRead { pipe: u32 },
+    /// #798 slice 2 — **job-control stop**: the vCPU observed its domain's stop flag at the per-op
+    /// poll and parks BETWEEN ops (nothing rewound — the current inst simply hasn't run; a resume
+    /// executes it). Parked in [`Sched::stopped`] keyed by domain; drained only by the continue
+    /// side of the personality's stop closure ([`SignalSource::set_stop`]) — never by a signal
+    /// interrupt (a stop is not a syscall). The core never sees a signal number: "stop this
+    /// domain / continue this domain" is the whole surface (invariants 4 and 12).
+    Stopped,
     /// FORK.md §8.6 (backpressure) — a **blocking pipe write** parked on a full FIFO whose reader count
     /// is still `> 0`. Keyed by pipe id in `pipe_write_waiters`; woken by a `read` that drains the pipe
     /// (room opened) or by the last read end closing (reader count → 0, which re-issues the write to
@@ -4394,6 +4427,10 @@ struct Sched {
     /// (`Box<VCpu>` deliberately, like every other parked-vCPU store — a `VCpu` is large and moves
     /// between this map and `runnable` as a pointer, never by value.)
     cap_waiters: BTreeMap<i32, Vec<Waiter>>,
+    /// #798 slice 2 — vCPUs parked **stopped** ([`Blocked::Stopped`]), keyed by domain. Pushed when
+    /// a vCPU observes its domain's stop flag; drained wholesale by [`Scheduler::wake_stopped`]
+    /// (the personality's SIGCONT). Swept like every waiter map at teardown.
+    stopped: BTreeMap<usize, VecDeque<Box<VCpu>>>,
     /// FORK.md §8.6 — vCPUs/fibers parked in a **blocking pipe read** ([`Blocked::PipeRead`]), keyed
     /// by pipe id. Woken by a `write` to that pipe (data available) or by its last write end closing
     /// (writer count → 0, EOF); both drain the entry into `runnable` and the read re-issues. Same shape
@@ -4642,54 +4679,189 @@ impl Scheduler {
         n
     }
 
-    /// #796 L1 — interrupt every vCPU/fiber parked in an **interruptible** blocking pipe op
-    /// ([`Blocked::PipeRead`]/[`Blocked::PipeWrite`]) so its syscall returns `-EINTR` (POSIX). Called from
-    /// the L2 safepoint when the personality hands the interp a **deliverable** signal ([`SignalSource::
-    /// take_deliverable`] returned `Some` — i.e. caught + unmasked; an ignored/masked signal never gets
-    /// here, so the disposition gating is free and no signal policy lives in svm). Not keyed by a pipe id —
-    /// a signal interrupts *whatever* blocking read/write is outstanding: drain every waiter from both park
-    /// maps, set each waiting vCPU's host EINTR flag ([`Host::set_sig_interrupt`]), and re-admit it. Its
-    /// rewound op re-runs, finds the flag, and completes `-EINTR` rather than re-parking. Returns the count
-    /// interrupted (0 if nothing was blocked — the handler still delivers to the running fiber).
-    fn interrupt_interruptible_parks(&self) -> u32 {
+    /// #798 slice 2 — **continue** a stopped domain: drain its [`Sched::stopped`] parks back to
+    /// runnable. The personality's stop closure calls this (after clearing the stop flag) on
+    /// SIGCONT; a domain with nothing parked is a no-op (its running vCPUs simply see the cleared
+    /// flag at their next poll — or were never stopped at all).
+    fn wake_stopped(&self, domain: usize) -> u32 {
+        let mut s = self.lock();
+        let woken = s.stopped.remove(&domain).unwrap_or_default();
+        let n = woken.len() as u32;
+        for v in woken {
+            s.runnable.push_back(v);
+        }
+        if n > 0 {
+            self.work.notify_all();
+        }
+        n
+    }
+
+    /// #796 L1 / #863 slice 3 — interrupt every vCPU/fiber of **one domain** parked in an
+    /// **interruptible** blocking op so its syscall returns `-EINTR` (POSIX): blocking pipe reads/
+    /// writes ([`Blocked::PipeRead`]/[`Blocked::PipeWrite`]) and POSIX `wait` reaps (a
+    /// [`Pending::ReapPid`] join park or a `wait(-1)` [`Sched::reap_any_waiters`] park — never a
+    /// `thread.join`, which is not a syscall). Called from the L2 safepoint when the personality
+    /// hands the interp a **deliverable** signal ([`SignalSource::take_deliverable`] returned `Some`
+    /// — caught + unmasked; an ignored/masked signal never gets here, so the disposition gating is
+    /// free and no signal policy lives in svm), and from the wake closures the run installs on each
+    /// domain's signal door.
+    ///
+    /// **Scoped to `domain` (INVARIANTS.md #12):** a signal delivered to process A must interrupt
+    /// A's outstanding blocked syscall — never process B's unrelated park. Pipe waiters carry their
+    /// domain (`Waiter::Fiber.svc`; a vCPU's host knows its own); reap parks are vCPUs. A pipe park
+    /// resumes via the host EINTR flag ([`Host::set_sig_interrupt`], the rewound op re-runs and
+    /// completes `-EINTR`); a reap park resumes via [`Pending::CapResult`]`(-EINTR)` — the twin is
+    /// NOT reaped, its status stays in `results` for the re-issued `wait` (invariant 7). Returns the
+    /// count interrupted (0 if nothing of this domain was blocked — the handler still delivers to
+    /// the running fiber).
+    fn interrupt_interruptible_parks(&self, domain: usize, honor_restart: bool) -> u32 {
         let mut s = self.lock();
         let mut n = 0u32;
-        for (_pipe, waiters) in std::mem::take(&mut s.pipe_waiters) {
-            for w in waiters {
-                n += 1;
-                match w {
-                    Waiter::VCpu(v) => {
-                        v.host
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .set_sig_interrupt();
-                        s.runnable.push_back(v);
-                    }
-                    Waiter::Fiber { reg, slot, svc } => {
-                        reg.wake_blocked(slot, Reg::from_i64(EINTR));
-                        svc_wake_locked(&mut s, svc);
-                    }
+        let mut hit: Vec<Waiter> = Vec::new();
+        for waiters in s.pipe_waiters.values_mut() {
+            let mut keep = Vec::new();
+            for w in waiters.drain(..) {
+                let d = match &w {
+                    Waiter::VCpu(v) => domain_key_of(v),
+                    Waiter::Fiber { svc, .. } => *svc,
+                };
+                if d == domain {
+                    hit.push(w);
+                } else {
+                    keep.push(w);
+                }
+            }
+            *waiters = keep;
+        }
+        for waiters in s.pipe_write_waiters.values_mut() {
+            let mut keep = Vec::new();
+            for w in waiters.drain(..) {
+                let d = match &w {
+                    Waiter::VCpu(v) => domain_key_of(v),
+                    Waiter::Fiber { svc, .. } => *svc,
+                };
+                if d == domain {
+                    hit.push(w);
+                } else {
+                    keep.push(w);
+                }
+            }
+            *waiters = keep;
+        }
+        s.pipe_waiters.retain(|_, ws| !ws.is_empty());
+        s.pipe_write_waiters.retain(|_, ws| !ws.is_empty());
+        for w in hit {
+            n += 1;
+            match w {
+                Waiter::VCpu(v) => {
+                    v.host
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .set_sig_interrupt();
+                    s.runnable.push_back(v);
+                }
+                Waiter::Fiber { reg, slot, svc } => {
+                    reg.wake_blocked(slot, Reg::from_i64(EINTR));
+                    svc_wake_locked(&mut s, svc);
                 }
             }
         }
-        for (_pipe, waiters) in std::mem::take(&mut s.pipe_write_waiters) {
-            for w in waiters {
-                n += 1;
-                match w {
-                    Waiter::VCpu(v) => {
-                        v.host
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .set_sig_interrupt();
-                        s.runnable.push_back(v);
-                    }
-                    Waiter::Fiber { reg, slot, svc } => {
-                        reg.wake_blocked(slot, Reg::from_i64(EINTR));
-                        svc_wake_locked(&mut s, svc);
-                    }
+        // #796 slice D — blocking **stream** reads (`Blocked::CapRead` — the stdin park): complete
+        // the parked call with `-EINTR`, the exact injection shape `cap_revoke` uses (a value on
+        // the caller's own error path, invariant 5). This is the interactive case: a `^C` at a
+        // shell blocked reading its terminal. Deliberately NOT swept: `CapPending`/`CapReply`
+        // (mid-flight cap calls — interrupting would strand the callee's reply; not a syscall
+        // boundary), the serve-loop parks (`SvcWait`/`OfferPark`/`OfferAdmit` — scheduler
+        // machinery), futex `Wait` (not a personality syscall; guest `std` retries), and plain
+        // `thread.join`.
+        // `SA_RESTART` (#796 slice C): like the reap parks below, the `-EINTR` is injected here,
+        // so the restart decision is made here — a restart-flagged delivery leaves the park
+        // untouched. Queried once per sweep, lazily, from the first gated waiter's host; a
+        // fiber waiter (no host of its own) uses the domain's already-computed answer, else
+        // defaults to interrupting. The kill door's sweep passes `honor_restart = false` —
+        // death must always collapse the parks.
+        let mut restart_cache: Option<bool> = None;
+        fn restart_of(cache: &mut Option<bool>, honor: bool, host: &Arc<Mutex<Host>>) -> bool {
+            if !honor {
+                return false;
+            }
+            *cache.get_or_insert_with(|| {
+                host.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .signal_restart()
+            })
+        }
+        let mut hit_caps: Vec<Waiter> = Vec::new();
+        for waiters in s.cap_waiters.values_mut() {
+            let mut keep = Vec::new();
+            for w in waiters.drain(..) {
+                let d = match &w {
+                    Waiter::VCpu(v) => domain_key_of(v),
+                    Waiter::Fiber { svc, .. } => *svc,
+                };
+                // The restart query is scoped to THIS domain's waiters — a foreign waiter must
+                // neither be asked nor prime the cache with another domain's answer.
+                let skip = d == domain
+                    && match &w {
+                        Waiter::VCpu(v) => restart_of(&mut restart_cache, honor_restart, &v.host),
+                        Waiter::Fiber { .. } => honor_restart && restart_cache.unwrap_or(false),
+                    };
+                if d == domain && !skip {
+                    hit_caps.push(w);
+                } else {
+                    keep.push(w);
+                }
+            }
+            *waiters = keep;
+        }
+        s.cap_waiters.retain(|_, ws| !ws.is_empty());
+        for w in hit_caps {
+            n += 1;
+            match w {
+                Waiter::VCpu(mut v) => {
+                    v.pending = Some(Pending::CapResult(EINTR));
+                    s.runnable.push_back(v);
+                }
+                Waiter::Fiber { reg, slot, svc } => {
+                    reg.wake_blocked(slot, Reg::from_i64(EINTR));
+                    svc_wake_locked(&mut s, svc);
                 }
             }
         }
+        // POSIX `wait` parks: a named `wait(pid)` sits in `join_waiters` under `Pending::ReapPid`
+        // (a `thread.join` park has a different pending and is NOT a syscall — left alone).
+        let mut restart =
+            |v: &VCpu| -> bool { restart_of(&mut restart_cache, honor_restart, &v.host) };
+        let reap_keys: Vec<TaskId> = s
+            .join_waiters
+            .iter()
+            .filter(|(_, v)| {
+                matches!(v.pending, Some(Pending::ReapPid { .. })) && domain_key_of(v) == domain
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for k in reap_keys {
+            if restart(s.join_waiters.get(&k).expect("key just enumerated")) {
+                continue;
+            }
+            let mut v = s.join_waiters.remove(&k).expect("key just enumerated");
+            v.pending = Some(Pending::CapResult(EINTR));
+            s.runnable.push_back(v);
+            n += 1;
+        }
+        // `wait(-1)` / `waitpid(-pgid)` parks.
+        let anyw = std::mem::take(&mut s.reap_any_waiters);
+        let mut keep_any = std::collections::VecDeque::new();
+        for (target, mut v) in anyw {
+            if domain_key_of(&v) == domain && !restart(&v) {
+                v.pending = Some(Pending::CapResult(EINTR));
+                s.runnable.push_back(v);
+                n += 1;
+            } else {
+                keep_any.push_back((target, v));
+            }
+        }
+        s.reap_any_waiters = keep_any;
         if n > 0 {
             self.work.notify_all();
         }
@@ -4914,11 +5086,16 @@ impl Scheduler {
             },
             None => None,
         };
+        // The twin's TaskId — read (not yet committed) so the fork factories learn the pid the
+        // parent's `fork()` will return (#863 slice 2: a personality registers the new process in
+        // its table at birth). Stable under `s` (the scheduler lock is held throughout); committed
+        // below only once the fork succeeds, so a failed fork burns no id.
+        let twin_id = s.next_task;
         // Duplicated powerbox (own handle namespace, shared `Arc` backings, new `domain_id`) — fails
         // closed on any domain the core can't duplicate on its own (closure caps, live offers, …).
         let twin_host = {
             let hg = v.host.lock().unwrap_or_else(|e| e.into_inner());
-            match hg.fork_powerbox() {
+            match hg.fork_powerbox(twin_id) {
                 Some(h) => Arc::new(Mutex::new(h)),
                 None => {
                     drop(hg);
@@ -4926,9 +5103,47 @@ impl Scheduler {
                 }
             }
         };
-        let twin_id = s.next_task;
         s.next_task += 1;
         s.live += 1;
+        // #863 slice 3 — the twin's signal door (minted by the personality's fork factory, installed
+        // by `fork_powerbox`) gets its own **domain-scoped, weak** run-wake at birth, so a
+        // deliverable signal raised against the twin (`kill(pid)`) interrupts ITS blocked syscalls —
+        // and only its (invariant 12). Weak: the run's `Arc` dies with the run, no teardown needed.
+        {
+            let hg = twin_host.lock().unwrap_or_else(|e| e.into_inner());
+            let dom = hg.domain_id() as usize;
+            let stop_flag = hg.stop_flag.clone();
+            let term_flag = hg.term_flag.clone();
+            let source = hg.signal_poll().map(|(_, s)| s);
+            drop(hg); // release before `set_wake` (the door takes the personality's own lock)
+            if let Some(source) = source {
+                let sched_weak = Arc::downgrade(self);
+                source.set_wake(Arc::new(move || {
+                    if let Some(sc) = sched_weak.upgrade() {
+                        sc.interrupt_interruptible_parks(dom, true);
+                    }
+                }));
+                // #798 slice 2 — the twin's stop/continue closure, minted with its wake.
+                let sched_weak = Arc::downgrade(self);
+                source.set_stop(Arc::new(move |stopped| {
+                    stop_flag.store(stopped, Ordering::SeqCst);
+                    if !stopped {
+                        if let Some(sc) = sched_weak.upgrade() {
+                            sc.wake_stopped(dom);
+                        }
+                    }
+                }));
+                // #796 default actions — the twin's terminate closure, minted with its wake/stop.
+                let sched_weak = Arc::downgrade(self);
+                source.set_kill(Arc::new(move || {
+                    term_flag.store(true, Ordering::SeqCst);
+                    if let Some(sc) = sched_weak.upgrade() {
+                        sc.interrupt_interruptible_parks(dom, false);
+                        sc.wake_stopped(dom);
+                    }
+                }));
+            }
+        }
         let parent_key = domain_key_of(&v); // the forking domain — this twin's parent (per-parent reap)
         let mut twin = v.fork_twin(twin_id, twin_mem, twin_host);
         twin.pending = Some(Pending::CapResult(reply_twin));
@@ -5344,6 +5559,8 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
             s.join_waiters.insert(k, v);
         }
     }
+    // #798 — the dying domain's stopped parks die with it (a stopped job killed at run end).
+    victims.extend(s.stopped.remove(&key).unwrap_or_default());
     // Parked `wait(-1)`/`waitpid(-pgid)` callers of the dying domain are reaped; others stay parked.
     let raw = std::mem::take(&mut s.reap_any_waiters);
     for (target, v) in raw {
@@ -5482,6 +5699,8 @@ fn teardown_run(s: &mut Sched) {
     s.shutdown = true;
     let mut victims: Vec<Box<VCpu>> = s.runnable.drain(..).collect();
     victims.extend(std::mem::take(&mut s.join_waiters).into_values());
+    // #798 — stopped jobs die with the run like any parked daemon.
+    victims.extend(std::mem::take(&mut s.stopped).into_values().flatten());
     // parked `wait(-1)`/`waitpid(-pgid)` callers (drop the target tag, keep the vCPU)
     victims.extend(
         std::mem::take(&mut s.reap_any_waiters)
@@ -5968,6 +6187,27 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     s.trap_origin
                         .get_or_insert_with(|| (outcome.trap_bt.clone(), outcome.trap_fiber));
                 }
+                // #863 hygiene — a **fork twin** finishing notifies its personalities: the exit
+                // hooks its fork factories rode in on ([`Host::exit_hooks`]) fire with the raw
+                // exit status ([`reap_status`] — the same value a servicer-side reap hands a
+                // `wait`), so each retires the process in its own table (Live → Zombie). Gated on
+                // the twin registry: a thread sibling completing on a *shared* host must not fire
+                // the domain's hooks. Safe under the scheduler lock: hooks take personality locks,
+                // and the established order is scheduler → personality (the fork factory); the
+                // host lock is free (this very thread just dropped the vCPU).
+                if s.forked_twins.contains_key(&id) {
+                    let hooks = dying_host
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .exit_hooks
+                        .clone();
+                    if !hooks.is_empty() {
+                        let status = reap_status(&outcome.result);
+                        for h in hooks {
+                            h(status);
+                        }
+                    }
+                }
                 // §12 domain lifetime: a member of an already-dead domain finishing *after* the
                 // teardown sweep (it was running — teardown is non-preemptive) observes the domain's
                 // end, not its own late Ok: post-teardown sibling effects are unspecified, but the
@@ -6068,18 +6308,50 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     sched.work.notify_all();
                     return;
                 };
-                let live = v
-                    .host
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .handle_live(handle);
-                if live {
+                let (live, interrupted) = {
+                    let hg = v.host.lock().unwrap_or_else(|e| e.into_inner());
+                    // #796 slice D — the pre-park pending check, same shape as the revoke
+                    // re-check beside it: a deliverable raise that landed after this vCPU's last
+                    // per-op poll ran its sweep against a map we were not yet in; complete the
+                    // read `-EINTR` instead of blocking through the signal.
+                    (hg.handle_live(handle), hg.park_interrupted())
+                };
+                if live && !interrupted {
                     s.cap_waiters
                         .entry(handle)
                         .or_default()
                         .push(Waiter::VCpu(v));
                 } else {
-                    v.pending = Some(Pending::CapResult(CAP_REVOKED));
+                    v.pending = Some(Pending::CapResult(if live { EINTR } else { CAP_REVOKED }));
+                    s.runnable.push_back(v);
+                    sched.work.notify_one();
+                }
+            }
+            Step::Park(Blocked::Stopped) => {
+                // #798 slice 2 — the job-control stop park. Park-vs-continue race (mirrors the
+                // pipe parks): a SIGCONT that cleared the flag between the poll and this insert
+                // found nothing in the stopped map to drain — so re-check the flag under the lock
+                // and re-admit instead of parking forever. Keyed by domain; drained wholesale by
+                // [`Scheduler::wake_stopped`].
+                let dom = domain_key_of(&v);
+                let (still_stopped, term) = {
+                    let hg = v.host.lock().unwrap_or_else(|e| e.into_inner());
+                    (
+                        hg.stop_flag.load(Ordering::SeqCst),
+                        // #796 — the same race against a terminate: a kill whose `wake_stopped`
+                        // ran between the poll and this insert found nothing to drain; re-admit
+                        // so the vCPU dies at its next poll instead of parking stopped forever.
+                        hg.term_flag.load(Ordering::SeqCst),
+                    )
+                };
+                let mut s = sched.lock();
+                let Some(v) = park_gate(&mut s, v) else {
+                    sched.work.notify_all();
+                    return;
+                };
+                if still_stopped && !term {
+                    s.stopped.entry(dom).or_default().push_back(v);
+                } else {
                     s.runnable.push_back(v);
                     sched.work.notify_one();
                 }
@@ -6472,12 +6744,12 @@ impl SchedRef {
             SchedRef::Det(_) => 0,
         }
     }
-    /// #796 L1 — interrupt interruptible blocking pipe parks with `-EINTR`
+    /// #796 L1 / #863 slice 3 — interrupt `domain`'s interruptible blocking parks with `-EINTR`
     /// ([`Scheduler::interrupt_interruptible_parks`]). Real scheduler only; the explorer never parks a
     /// blocking pipe op (its read/write arms fail closed), so there is nothing to interrupt.
-    fn interrupt_interruptible_parks(&self) -> u32 {
+    fn interrupt_interruptible_parks(&self, domain: usize, honor_restart: bool) -> u32 {
         match self {
-            SchedRef::Real(s) => s.interrupt_interruptible_parks(),
+            SchedRef::Real(s) => s.interrupt_interruptible_parks(domain, honor_restart),
             SchedRef::Det(_) => 0,
         }
     }
@@ -7084,7 +7356,10 @@ impl SchedDriver {
                     // I48: the explorer takes the advisory downgrade at the resume site (the
                     // blocking idle is gated on `SchedRef::Real`), so `cont.resume.block` there
                     // returns FIBER_PARKED and never produces this park — the arm is defensive.
-                    | Blocked::ContResumeBlock { .. },
+                    | Blocked::ContResumeBlock { .. }
+                    // #798: the explorer never installs a stop closure, so the stop flag is never
+                    // set and this park never fires — defensive, fail-closed like the rest.
+                    | Blocked::Stopped,
                 ) => {
                     let id = v.id;
                     let key = domain_key_of(&v); // §12 teardown: read before the vCPU is dropped
@@ -8253,11 +8528,14 @@ struct VCpu {
     /// set the vCPU traps (`ThreadFault`, which `poll` reports as `2`), so the child's whole subtree
     /// self-terminates. `None` on the root and top-level threads (nothing above them to kill them).
     kill: Option<Arc<AtomicBool>>,
-    /// #796 L2 async signals — `Some(depth)` while an injected signal **handler** frame is live, where
-    /// `depth` is `frames.len()` just after the handler was pushed. Gates re-entry (no signal delivers
-    /// while a handler runs) and is cleared when that frame returns (`frames.len()` falls below `depth`).
-    /// `None` = not currently in a handler.
-    sig_handler_depth: Option<usize>,
+    /// #796 L2 async signals — one entry (`frames.len()` just after the push) per **live injected
+    /// signal-handler frame**, innermost last. Empty = not in a handler. Delivery may **nest**
+    /// (a different unmasked signal can interrupt a running handler — the source blocks the
+    /// delivered signal + its `sa_mask` for the handler's duration, so same-signal reentry never
+    /// reaches here) up to [`MAX_SIG_HANDLER_NEST`]; each entry is popped when its frame returns,
+    /// which also tells the source to restore its pre-delivery mask
+    /// ([`SignalSource::handler_returned`]).
+    sig_handler_stack: Vec<usize>,
     /// PROCESS.md S3 `kill` — a parent's map from a §14 child's join-table **slot** to that child's
     /// kill flag ([`VCpu::kill`]), so `Instantiator.kill(child)` sets it. Sparse (only §14 children,
     /// not `thread.spawn` threads, which share their §14 ancestor's flag); empty on a leaf vCPU.
@@ -8390,7 +8668,7 @@ impl VCpu {
             invoked_ref_slots: None,
             debug: None,
             kill: None,
-            sig_handler_depth: None,
+            sig_handler_stack: Vec::new(),
             child_kill: BTreeMap::new(),
             serve_run: None,
             handler_parks: BTreeMap::new(),
@@ -8458,7 +8736,7 @@ impl VCpu {
             invoked_ref_slots: None,
             debug: None,
             kill: None,
-            sig_handler_depth: None,
+            sig_handler_stack: self.sig_handler_stack.clone(), // forked mid-handler: the twin returns from the inherited frame too
             child_kill: BTreeMap::new(),
             serve_run: None,
             handler_parks: BTreeMap::new(),
@@ -8548,7 +8826,7 @@ impl VCpu {
             invoked_ref_slots,
             debug: None,
             kill: None,
-            sig_handler_depth: None,
+            sig_handler_stack: Vec::new(),
             child_kill: BTreeMap::new(),
             serve_run: None,
             handler_parks: BTreeMap::new(),
@@ -8993,7 +9271,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         invoked_ref_slots,
         debug,
         kill,
-        sig_handler_depth,
+        sig_handler_stack,
         child_kill,
         serve_run,
         handler_parks,
@@ -9011,6 +9289,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // op). `None` when no personality installed a `SignalSource`, so the per-op check below compiles to a
     // predicted `is_some()` branch and the hot path is untouched for every non-signal guest.
     let signal_poll = host.lock().unwrap_or_else(|e| e.into_inner()).signal_poll();
+    // #863 slice 3 — this vCPU's own domain, for the scoped park interrupt a deliverable signal
+    // fires (INVARIANTS.md #12: a signal to this process never sweeps another domain's parks).
+    let sig_domain = host.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
+    // #798 slice 2 — the domain's job-control stop flag (shared by every vCPU of the domain): one
+    // relaxed load per op, park [`Blocked::Stopped`] while set. Cloned once — the personality's
+    // stop closure holds the same `Arc`.
+    let stop_flag = host
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .stop_flag
+        .clone();
+    // #796 default actions — the domain's terminate flag, same one-relaxed-load-per-op shape.
+    let term_flag = host
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .term_flag
+        .clone();
 
     // Reusable scratch for branch edge-args (block parameters). Each taken edge gathers its
     // args here and swaps the buffer into the frame's value slot, so steady-state branching —
@@ -9610,13 +9905,27 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             // fuel, and a §14 child must self-terminate even in a loop that exits on its first
             // iteration (no back-edge), so it can't wait for a safepoint.
             poll_kill(kill.as_deref())?;
+            // #796 default actions — a `SIG_DFL` terminate delivered to this domain: die at the
+            // next op, exactly like the parent-set kill flag (the exit hook reports term-by-signal
+            // from the personality's bookkeeping). Checked before stop — death beats stop, so a
+            // killed-while-stopped domain woken by the kill closure dies instead of re-parking.
+            if term_flag.load(Ordering::Relaxed) {
+                return Err(Trap::ThreadFault);
+            }
+            // #798 slice 2 — the job-control stop: park between ops while the domain's flag is set
+            // (nothing rewound; a resume executes the current inst). Checked after `kill`/terminate
+            // (death beats stop) and before signal delivery (a stopped process handles its signals
+            // at continue, not while stopped — POSIX).
+            if stop_flag.load(Ordering::Relaxed) {
+                return Ok(Inner::Park(Blocked::Stopped));
+            }
             // #796 L2 async signal delivery (PROCESS.md §9). At this per-op safepoint, if a personality
             // has a caught, unmasked signal pending (its cheap `armed` flag is set) and we are not already
             // inside a handler, redirect this fiber into the handler `void handler(int)` — on its own
             // dedicated signal stack — exactly like a `call_indirect`. The interrupted instruction is
             // **not** advanced, so it re-executes when the handler returns (the empty `Return` restores the
             // interrupted frame untouched). Same interrupt-at-safepoint shape as `kill`, but non-lethal.
-            if sig_handler_depth.is_none() {
+            if sig_handler_stack.len() < MAX_SIG_HANDLER_NEST {
                 if let Some((armed, source)) = &signal_poll {
                     if armed.load(Ordering::Relaxed) {
                         // The source owns its own locking; the interp holds no personality lock here.
@@ -9627,8 +9936,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // syscall** in this run, so a blocked read/write/wait returns `-EINTR` (POSIX).
                             // The disposition gating is free: the core never inspects signal policy, it
                             // just acts when the source hands it a delivery. (Signal semantics stay in the
-                            // personality; svm only provides the wake mechanism — invariant 4.)
-                            sched.interrupt_interruptible_parks();
+                            // personality; svm only provides the wake mechanism — invariant 4. Scoped to
+                            // THIS domain — invariant 12.)
+                            sched.interrupt_interruptible_parks(sig_domain, true);
                             // The handler's IR shape is `void handler(int)` = `(i64 sp, i32 signum) -> ()`
                             // — chibicc threads the data-SP as v0. `dispatch_indirect` masks the funcref
                             // into the table and type-checks; a mis-typed handler is dropped (the signal
@@ -9652,7 +9962,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     inst: 0,
                                     vals: vec![Reg::from_i64(sp as i64), Reg::from_i32(signum)],
                                 });
-                                *sig_handler_depth = Some(frames.len());
+                                sig_handler_stack.push(frames.len());
                                 continue 'frames;
                             }
                         }
@@ -10361,6 +10671,44 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         named_child.push(cg);
                                     }
                                 }
+                                // #863 slice 3 — a child that inherited a personality signal door
+                                // via the re-grant above gets its own **domain-scoped, weak**
+                                // run-wake at build time (no locks: `ch` is not yet shared), so a
+                                // deliverable signal raised against it interrupts ITS blocked
+                                // syscalls — and only its (invariant 12) — exactly like a fork twin
+                                // at mint. Weak: a post-run fire upgrades to nothing.
+                                if let SchedRef::Real(rs) = &sched {
+                                    if let Some((_, source)) = ch.signal_poll() {
+                                        let dom = ch.domain_id() as usize;
+                                        let sched_weak = Arc::downgrade(rs);
+                                        source.set_wake(Arc::new(move || {
+                                            if let Some(sc) = sched_weak.upgrade() {
+                                                sc.interrupt_interruptible_parks(dom, true);
+                                            }
+                                        }));
+                                        // #798 slice 2 — and its stop/continue closure.
+                                        let stop_flag = ch.stop_flag.clone();
+                                        let sched_weak = Arc::downgrade(rs);
+                                        source.set_stop(Arc::new(move |stopped| {
+                                            stop_flag.store(stopped, Ordering::SeqCst);
+                                            if !stopped {
+                                                if let Some(sc) = sched_weak.upgrade() {
+                                                    sc.wake_stopped(dom);
+                                                }
+                                            }
+                                        }));
+                                        // #796 default actions — and its terminate closure.
+                                        let term_flag = ch.term_flag.clone();
+                                        let sched_weak = Arc::downgrade(rs);
+                                        source.set_kill(Arc::new(move || {
+                                            term_flag.store(true, Ordering::SeqCst);
+                                            if let Some(sc) = sched_weak.upgrade() {
+                                                sc.interrupt_interruptible_parks(dom, false);
+                                                sc.wake_stopped(dom);
+                                            }
+                                        }));
+                                    }
+                                }
                                 // IMPORTS.md phase 3 / S2.1 + §3.3: bind the child module's
                                 // import manifest against its granted powerbox (named offers
                                 // first, then the shared reference policy — same binder the
@@ -10754,6 +11102,44 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     };
                                     if let Some(cg) = cg {
                                         ch.register_cap_name(name, cg);
+                                    }
+                                }
+                                // #863 slice 3 — a child that inherited a personality signal door
+                                // via the re-grant above gets its own **domain-scoped, weak**
+                                // run-wake at build time (no locks: `ch` is not yet shared), so a
+                                // deliverable signal raised against it interrupts ITS blocked
+                                // syscalls — and only its (invariant 12) — exactly like a fork twin
+                                // at mint. Weak: a post-run fire upgrades to nothing.
+                                if let SchedRef::Real(rs) = &sched {
+                                    if let Some((_, source)) = ch.signal_poll() {
+                                        let dom = ch.domain_id() as usize;
+                                        let sched_weak = Arc::downgrade(rs);
+                                        source.set_wake(Arc::new(move || {
+                                            if let Some(sc) = sched_weak.upgrade() {
+                                                sc.interrupt_interruptible_parks(dom, true);
+                                            }
+                                        }));
+                                        // #798 slice 2 — and its stop/continue closure.
+                                        let stop_flag = ch.stop_flag.clone();
+                                        let sched_weak = Arc::downgrade(rs);
+                                        source.set_stop(Arc::new(move |stopped| {
+                                            stop_flag.store(stopped, Ordering::SeqCst);
+                                            if !stopped {
+                                                if let Some(sc) = sched_weak.upgrade() {
+                                                    sc.wake_stopped(dom);
+                                                }
+                                            }
+                                        }));
+                                        // #796 default actions — and its terminate closure.
+                                        let term_flag = ch.term_flag.clone();
+                                        let sched_weak = Arc::downgrade(rs);
+                                        source.set_kill(Arc::new(move || {
+                                            term_flag.store(true, Ordering::SeqCst);
+                                            if let Some(sc) = sched_weak.upgrade() {
+                                                sc.interrupt_interruptible_parks(dom, false);
+                                                sc.wake_stopped(dom);
+                                            }
+                                        }));
                                     }
                                 }
                                 if ch.bind_child_manifest(&cm.imports, &cm.types).is_err() {
@@ -11782,7 +12168,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // only when *this* op is actually about to park (a completed read/write must not eat
                     // it). Short-circuits so `take_sig_interrupt` fires only on a genuine park.
                     let sig_intr = (pipe_park.is_some() || pipe_write_park.is_some())
-                        && hg.take_sig_interrupt();
+                        && hg.take_sig_interrupt()
+                        // #796 SA_RESTART: a restart-flagged delivery re-parks silently instead
+                        && !hg.signal_restart();
                     drop(hg);
                     if closed {
                         sched.cap_revoke(h, CAP_REVOKED);
@@ -12138,7 +12526,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // #796 L1 — take the EINTR flag only when this named-import op is about to park (as in
                     // the `cap.call` arm above), so a raised signal completes it `-EINTR` not re-parks.
                     let sig_intr = (pipe_park.is_some() || pipe_write_park.is_some())
-                        && hg.take_sig_interrupt();
+                        && hg.take_sig_interrupt()
+                        // #796 SA_RESTART: a restart-flagged delivery re-parks silently instead
+                        && !hg.signal_restart();
                     let _ = hg.take_stdin_parked(); // no slot-parking this slice (see call.import)
                     drop(hg);
                     let mut eintr_done = false;
@@ -13035,8 +13425,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         // Fuel unification: the terminator no longer charges fuel unconditionally. A *back-edge* branch
         // (target block <= current) charges in its arm below; tail calls charge as function entries;
         // forward branches and `return` are free (bounded straight-line control flow). `kill` stays
-        // per-op — polled here for the terminator too (it is orthogonal to fuel).
+        // per-op — polled here for the terminator too (it is orthogonal to fuel). The #796 terminate
+        // flag polls beside it for the same reason (an empty-block branch loop has no inst-site poll).
         poll_kill(kill.as_deref())?;
+        if term_flag.load(Ordering::Relaxed) {
+            return Err(Trap::ThreadFault);
+        }
         // Back-edge freeze trigger (DURABILITY.md Phase-4 Slice A): on a durable run armed for
         // back-edges (`ARM_BACKEDGE_OFF`), count down at each branch terminator and promote to
         // `UNWINDING` at 0 so the next loop-header poll begins the freeze — reaching a poll-free
@@ -13101,11 +13495,17 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 collect_into(&mut ret_buf, &frames[top].vals, out)?;
                 let popped = frames.pop();
                 // #796 L2 — if the frame that just returned is the injected signal handler (it sat at
-                // `sig_handler_depth`, now one above the post-pop length), clear the in-handler guard so
-                // the next pending signal can be delivered. A `void` handler's empty `ret_buf` leaves the
-                // interrupted caller's `vals` untouched below, so it resumes at the re-run safepoint op.
-                if *sig_handler_depth == Some(frames.len() + 1) {
-                    *sig_handler_depth = None;
+                // its stack entry, now one above the post-pop length), pop the guard entry and tell
+                // the source ([`SignalSource::handler_returned`]) so it restores its pre-delivery
+                // mask (block-during-handler / `sa_mask`) — possibly re-arming a now-unblocked
+                // pending signal or running its default action. A `void` handler's empty `ret_buf`
+                // leaves the interrupted caller's `vals` untouched below, so it resumes at the
+                // re-run safepoint op.
+                if sig_handler_stack.last() == Some(&(frames.len() + 1)) {
+                    sig_handler_stack.pop();
+                    if let Some((_, source)) = &signal_poll {
+                        source.handler_returned();
+                    }
                 }
                 if let Some(caller) = frames.last_mut() {
                     // Caller in the same fiber resumes past its `call` (`inst` already advanced).
@@ -15678,15 +16078,60 @@ pub type HostProc = Box<
         + Send,
 >;
 
-/// FORK.md PR 5 — a host proc's **fork factory**: mints a fresh [`HostProc`] closure for a `fork()`
-/// twin's powerbox. The runtime can never fork a `HostProc` itself (the closure's captured state is
-/// opaque — the same wall in Rust as a C embedder's `void* ctx`), so forkability is a capability the
-/// **provider** supplies: the factory duplicates-or-shares its own state (svm-posix shares the
-/// fd-table/memfs `Arc`s — fork-shares-fds semantics; a C embedder would `dup` its structs) and
-/// returns the child's closure. A `host_proc` granted *without* a factory keeps today's behavior:
-/// [`Host::fork_powerbox`] fails closed on it. `Arc` so the factory itself rides into the twin —
-/// a forked domain remains forkable (fork-of-fork, nested guests).
-pub type HostProcFork = Arc<dyn Fn() -> HostProc + Send + Sync>;
+/// FORK.md PR 5 / #863 — a host proc's **fork factory**: mints what a `fork()` twin's powerbox
+/// carries for this capability. The runtime can never fork a `HostProc` itself (the closure's
+/// captured state is opaque — the same wall in Rust as a C embedder's `void* ctx`), so forkability
+/// is a capability the **provider** supplies: the factory duplicates-or-shares its own state (its
+/// choice — svm-posix clones the per-process side and shares the world side, POSIX fork semantics;
+/// a C embedder would `dup` its structs) and returns the child's [`ForkedProc`]. A `host_proc`
+/// granted *without* a factory keeps today's behavior: [`Host::fork_powerbox`] fails closed on it.
+/// `Arc` so the factory itself rides into the twin — a forked domain remains forkable
+/// (fork-of-fork, nested guests).
+///
+/// #863 slice 2 — the argument is the twin's **pid** (its scheduler `TaskId`, the value the
+/// parent's `fork()` returns), so a personality can register the new process in its own process
+/// table at birth (`kill(pid)`/`waitpid(pid)` then mean the same pid everywhere). A provider with
+/// no process table ignores it ([`ForkedProc::shared`] mints).
+pub type HostProcFork = Arc<dyn Fn(u64) -> ForkedProc + Send + Sync>;
+
+/// #863 — what a [`HostProcFork`] factory mints for a **new process domain**. Beyond the fresh
+/// handler closure, a personality may hand the new domain two extras — both *mechanism-neutral*:
+/// the core installs whatever the provider supplies, and all signal/fork **policy** stays with the
+/// provider (invariant 4).
+pub struct ForkedProc {
+    /// The new domain's handler closure over the provider's (duplicated or shared) state.
+    pub handler: HostProc,
+    /// A signal door over the **new process's own** signal state, installed on the new domain's
+    /// `Host` ([`Host::set_signal_source`]). `None` = the twin shares its parent's source (the
+    /// pre-split behavior, right for providers whose state is fully shared).
+    pub signal: Option<(Arc<dyn SignalSource + Send + Sync>, Arc<AtomicBool>)>,
+    /// The **replacement fork factory** for the new domain: a self-replicating personality forks
+    /// the *new* process's state next time, not the original's (fork-of-fork clones the twin's fd
+    /// table/cwd, not the grandparent's). `None` = reuse the same factory (fully-shared providers).
+    pub refork: Option<HostProcFork>,
+    /// #863 hygiene — the new process's **exit hook**: the core calls it with the process's raw
+    /// exit status ([`reap_status`] — the same value the servicer-side reap hands a `wait`) when
+    /// its fork-twin task completes, so a personality can retire the process from its own table
+    /// (svm-posix: `Live` → reapable `Zombie`). Encoding the status (wait-encode, crash mapping)
+    /// is the personality's policy. `None` = no notification (shared-state providers). Fired only
+    /// for **fork twins** (the tasks in the scheduler's twin registry) — a domain torn down
+    /// wholesale at run end is not individually notified.
+    pub exit: Option<Arc<dyn Fn(i64) + Send + Sync>>,
+}
+
+impl ForkedProc {
+    /// A shared-state mint: fresh closure over the same provider state, no per-process signal door,
+    /// fork-of-fork through the same factory. The pre-#863 contract, right for providers whose
+    /// state is deliberately global (a scripted table, a shared service shim).
+    pub fn shared(handler: HostProc) -> Self {
+        Self {
+            handler,
+            signal: None,
+            refork: None,
+            exit: None,
+        }
+    }
+}
 
 /// §12 parking-on-blocking — a punted blocking op: a **self-contained** scalar job the offload
 /// pool runs off the vCPU thread. Deliberately narrow (the SQE discipline, kept): it captures
@@ -16160,6 +16605,11 @@ impl RegionMinter for Host {
 /// safepoint redirect, invariant 4) lives in the interp; svm-interp never names a personality, it only
 /// calls this. The interp polls a cheap [`Host::sig_armed`] flag per op and, when set and not already in a
 /// handler, asks the source for the next delivery.
+/// #796 — the ceiling on **nested** injected signal-handler frames per fiber. The source's
+/// block-during-handler masking already prevents same-signal reentry; this bounds pathological
+/// distinct-signal towers (each nested delivery costs a call frame on the interrupted stack).
+pub const MAX_SIG_HANDLER_NEST: usize = 16;
+
 pub trait SignalSource: Send + Sync {
     /// The next deliverable async signal, or `None` if nothing is currently deliverable. Returns
     /// `(handler_funcref, signum, handler_sp)` — the guest handler's function-table index (§3c), the
@@ -16180,6 +16630,53 @@ pub trait SignalSource: Send + Sync {
     /// syscall returns `-EINTR`. Default no-op — a source with no embedder-raise path need not store it;
     /// the interp installs `|| {}` at teardown to drop its `Scheduler` reference (cycle discipline).
     fn set_wake(&self, _wake: Arc<dyn Fn() + Send + Sync>) {}
+
+    /// #798 slice 2 — store the run's **stop/continue closure**: `stop(true)` sets the domain's
+    /// stop flag (the domain parks at its next per-op poll, [`Blocked::Stopped`]); `stop(false)`
+    /// clears it and drains the domain's stopped parks. Installed at the same sites as the wake
+    /// (run start / twin mint / child build), holding the scheduler weakly — same no-teardown
+    /// discipline. The personality invokes it per its own signal policy (SIGSTOP/SIGTSTP default
+    /// actions, SIGCONT); the core never sees a signal number. Default no-op — a source with no
+    /// job-control story need not store it.
+    fn set_stop(&self, _stop: Arc<dyn Fn(bool) + Send + Sync>) {}
+
+    /// #796 — called when an injected handler frame **returns**, so the source can restore the
+    /// mask it pushed at delivery (block-during-handler: the delivered signal + its `sa_mask`
+    /// are blocked for the handler's duration, POSIX) and act on anything that unblocking
+    /// exposes — re-arm a now-deliverable pending signal, or run a held fatal signal's default
+    /// action. Called with no interp locks held. Default no-op — a poll-only source has no
+    /// injected frames to be told about.
+    fn handler_returned(&self) {}
+
+    /// #796 `SA_RESTART` — asked when a signal interrupt reaches a parked blocking op: `true` ⇒
+    /// the delivery that fired the interrupt carried `SA_RESTART`, so the op silently re-issues
+    /// (re-parks) instead of returning `-EINTR`. Non-consuming — the source updates it at each
+    /// delivery (last delivery wins; with several near-simultaneous mixed-flag deliveries this is
+    /// a documented approximation of POSIX's per-handler rule). Default `false` — always EINTR.
+    fn syscall_restart(&self) -> bool {
+        false
+    }
+
+    /// #796 slice D — the **pre-park pending check**: is a deliverable signal pending *right
+    /// now*? Non-consuming. Asked at the interruptible park inserts (under the scheduler lock)
+    /// to close the instants-wide race where a raise lands after the vCPU's last per-op poll but
+    /// before its park insert — the sweep ran against an empty map and the park would otherwise
+    /// block through the signal it should have returned `-EINTR` for. True only for a delivery
+    /// the next per-op poll WOULD redirect (an earlier one would already have been consumed
+    /// there), so a stale `true` is impossible in steady state. Default `false` — poll-only
+    /// sources keep plain parks.
+    fn interrupt_pending(&self) -> bool {
+        false
+    }
+
+    /// #796 default actions — store the run's **terminate closure**: firing it sets the domain's
+    /// term flag; every vCPU of the domain self-terminates at its next per-op poll (checked after
+    /// `kill`, before stop — death beats stop), and parked/stopped vCPUs are woken so they observe
+    /// it. Installed at the same sites as the wake/stop pair, same weak no-teardown discipline.
+    /// The personality fires it per its own policy (a `SIG_DFL` terminate-action signal — SIGKILL,
+    /// SIGTERM, …); the core never sees a signal number, it only kills a domain on request.
+    /// Default no-op — a source with no default-action story need not store it.
+    fn set_kill(&self, _kill: Arc<dyn Fn() + Send + Sync>) {}
 }
 
 /// The host: the **host-owned handle table** (the powerbox) plus deterministic mock
@@ -16434,6 +16931,21 @@ pub struct Host {
     /// handler when `sig_armed` fires. `None` ⇒ no async signals (poll-only, the default). Installed via
     /// [`Host::set_signal_source`]; the source holds the *same* `sig_armed` `Arc`, so its arming is visible.
     sig_source: Option<Arc<dyn SignalSource + Send + Sync>>,
+    /// #863 hygiene — exit hooks the fork factories supplied ([`ForkedProc::exit`]): fired with the
+    /// task's raw exit status when this host's **fork-twin** task completes, so each personality
+    /// retires the process from its own table. Empty for every non-forked host.
+    exit_hooks: Vec<Arc<dyn Fn(i64) + Send + Sync>>,
+    /// #798 slice 2 — the domain's **job-control stop flag**: set/cleared by the personality's
+    /// stop closure ([`SignalSource::set_stop`]); every vCPU of the domain polls it per op (beside
+    /// `poll_kill`, free-when-clear) and parks [`Blocked::Stopped`] while set. On the `Host` so
+    /// thread siblings share it — a stop stops the whole domain.
+    stop_flag: Arc<AtomicBool>,
+    /// #796 default actions — the domain's **terminate flag**: set by the personality's kill
+    /// closure ([`SignalSource::set_kill`]) when a `SIG_DFL` terminate-action signal is delivered;
+    /// every vCPU of the domain polls it per op beside `poll_kill`/`stop_flag` (free-when-clear,
+    /// checked after kill, before stop — death beats stop) and self-terminates ([`Trap::ThreadFault`])
+    /// when set. On the `Host` so thread siblings share it — a terminate kills the whole domain.
+    term_flag: Arc<AtomicBool>,
     /// §4/§7 the **JIT cap-path window page map**, keyed by window base. The JIT's `cap_thunk` rebuilds
     /// its window view per `cap.call`, so without a persistent home a guest-*grown* heap page (committed
     /// via the Memory cap in an earlier call) would read back as unmapped and a cap-buffer borrow of it
@@ -16823,6 +17335,9 @@ impl Host {
             completion_notify: None,
             sig_armed: Arc::new(AtomicBool::new(false)),
             sig_source: None,
+            exit_hooks: Vec::new(),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            term_flag: Arc::new(AtomicBool::new(false)),
             cap_pages: None,
             quota: Quota::default(),
             jit_domains: Vec::new(),
@@ -16866,7 +17381,7 @@ impl Host {
     /// Stream / Exit / Clock / Memory / SharedRegion / Budget) plus live offers, a self-module, an
     /// attestation, and the shared sinks. Copy-vs-share is decided per backing, not silently: adding a
     /// `Host` field leaves it at the `Host::new` default in the twin until this is revisited.
-    fn fork_powerbox(&self) -> Option<Host> {
+    fn fork_powerbox(&self, twin_pid: u64) -> Option<Host> {
         // FORK.md PR 5 — host procs are forkable iff **every** entry carries a provider-supplied
         // fork factory ([`Host::grant_host_proc_forkable`]): the runtime cannot fork an opaque
         // closure itself, and a partial carry would silently drop capabilities, so one factory-less
@@ -16921,15 +17436,26 @@ impl Host {
         twin.live_impls = self.live_impls.clone();
         // Forkable host procs: each provider factory mints the twin's fresh closure over its own
         // (shared or duplicated) state, at the same index so the copied table's `HostProc(i)` slots
-        // resolve; the factories themselves ride along, so the twin remains forkable (fork-of-fork).
+        // resolve. #863: the minted [`ForkedProc`] may carry a per-process signal door (installed on
+        // the twin below, overriding the shared-source fallback) and a replacement factory (so
+        // fork-of-fork forks the *twin's* state); either absent keeps the pre-split shared behavior.
+        let mut twin_sig: Option<(Arc<dyn SignalSource + Send + Sync>, Arc<AtomicBool>)> = None;
+        let mut twin_exit: Vec<Arc<dyn Fn(i64) + Send + Sync>> = Vec::new();
         twin.host_procs = self
             .host_procs
             .iter()
             .map(|e| {
                 let factory = e.fork.as_ref().unwrap();
+                let forked = factory(twin_pid);
+                if forked.signal.is_some() {
+                    twin_sig = forked.signal;
+                }
+                if let Some(x) = forked.exit {
+                    twin_exit.push(x);
+                }
                 HostProcEntry {
-                    handler: ProcHandler::Sync(factory()),
-                    fork: Some(Arc::clone(factory)),
+                    handler: ProcHandler::Sync(forked.handler),
+                    fork: Some(forked.refork.unwrap_or_else(|| Arc::clone(factory))),
                     mints: e.mints,
                 }
             })
@@ -16943,10 +17469,23 @@ impl Host {
         twin.out_sink = self.out_sink.clone();
         twin.err_sink = self.err_sink.clone();
         twin.sinks = self.sinks.clone();
-        // #796 L2 — a fork shares the async-signal source + armed flag (the personality's signal state is
-        // shared like the rest of the powerbox); each twin polls the same doorbell.
-        twin.sig_source = self.sig_source.clone();
-        twin.sig_armed = Arc::clone(&self.sig_armed);
+        // #796 L2 / #863 — the twin's async-signal source: a personality that minted a per-process
+        // door above gets it installed (the twin polls its OWN pending/mask/dispositions — POSIX
+        // fork copies signal state); otherwise fall back to sharing the parent's source + armed
+        // flag (the pre-split behavior, right when the provider's state is fully shared).
+        match twin_sig {
+            Some((source, armed)) => {
+                twin.sig_source = Some(source);
+                twin.sig_armed = armed;
+            }
+            None => {
+                twin.sig_source = self.sig_source.clone();
+                twin.sig_armed = Arc::clone(&self.sig_armed);
+            }
+        }
+        // #863 hygiene — the personalities' exit hooks ride the twin's host; the scheduler fires
+        // them with the twin's exit status at completion (Live → Zombie in each process table).
+        twin.exit_hooks = twin_exit;
         // The twin gets its own copy of the value-typed quota vectors.
         twin.budgets = self.budgets.clone();
         twin.quota = self.quota;
@@ -17282,6 +17821,26 @@ impl Host {
     /// about to park a pipe read/write; when set, the op returns `-EINTR` instead of rewinding+parking.
     fn take_sig_interrupt(&mut self) -> bool {
         std::mem::take(&mut self.sig_interrupt)
+    }
+
+    /// #796 `SA_RESTART` — ask the installed signal source whether the delivery behind a
+    /// just-consumed interrupt wants the blocking op restarted instead of `-EINTR`. `false`
+    /// with no source (the interrupt then always surfaces).
+    fn signal_restart(&self) -> bool {
+        self.sig_source
+            .as_ref()
+            .map(|s| s.syscall_restart())
+            .unwrap_or(false)
+    }
+
+    /// #796 slice D — the pre-park pending check at an interruptible park insert: `true` when a
+    /// deliverable signal is pending ([`SignalSource::interrupt_pending`]) and its delivery does
+    /// NOT carry `SA_RESTART` — the park should complete `-EINTR` instead of inserting.
+    fn park_interrupted(&self) -> bool {
+        self.sig_source
+            .as_ref()
+            .map(|s| s.interrupt_pending() && !s.syscall_restart())
+            .unwrap_or(false)
     }
 
     /// FORK.md §8.6 — decrement a pipe's shared **writer** count by one (a write end closed or its
@@ -19931,19 +20490,37 @@ impl Host {
             let entry = entry.clone();
             return Some(child.adopt_offer(entry));
         }
-        // FORK.md §8.5 slice 3 — a **forkable host proc** (e.g. posix libc): re-mint the handler in
-        // the CHILD over the *same* shared provider state via its fork factory
-        // ([`Host::grant_host_proc_forkable`]), so the child inherits the capability with its fd
-        // table / memfs shared (the manager handing its libc to a spawned guest), and the child's
-        // copy stays forkable itself (nesting / fork-of-child). A **factory-less** host proc is an
-        // opaque closure the runtime cannot carry — the re-grant refuses (`None`, fail-closed); such
-        // a cap the parent keeps. This is the deep-copy path `resolve_copyable` defers for `HostProc`.
+        // FORK.md §8.5 slice 3 / #863 — a **forkable host proc** (e.g. posix libc): re-mint the
+        // handler in the CHILD via its fork factory ([`Host::grant_host_proc_forkable`]), so the
+        // child inherits the capability (the manager handing its libc to a spawned guest) and the
+        // child's copy stays forkable itself (nesting / fork-of-child). The provider decides what a
+        // new process inherits: svm-posix mints a per-process clone (own fd table/cwd/env/signals,
+        // shared memfs — POSIX fork semantics), and its [`ForkedProc`] extras install the child's
+        // own signal door + replacement factory; a shared-state provider mints over the same state.
+        // A **factory-less** host proc is an opaque closure the runtime cannot carry — the re-grant
+        // refuses (`None`, fail-closed); such a cap the parent keeps. This is the deep-copy path
+        // `resolve_copyable` defers for `HostProc`.
         if let Ok(Binding::HostProc(idx)) = self.resolve(handle, cap_id::HOST_PROC) {
             return self
                 .host_procs
                 .get(idx as usize)
                 .and_then(|e| e.fork.clone())
-                .map(|factory| child.grant_host_proc_forkable(factory(), factory));
+                .map(|factory| {
+                    // Pid `0` = anonymous: this re-grant wires a *spawned* child (no fork pid — its
+                    // TaskId is minted later, by the spawn), so the personality mints the clone
+                    // without registering it in its process table (#863 slice 2).
+                    let forked = factory(0);
+                    if let Some((source, armed)) = forked.signal {
+                        child.set_signal_source(source, armed);
+                    }
+                    if let Some(x) = forked.exit {
+                        child.exit_hooks.push(x);
+                    }
+                    child.grant_host_proc_forkable(
+                        forked.handler,
+                        forked.refork.unwrap_or_else(|| Arc::clone(&factory)),
+                    )
+                });
         }
         // FORK.md §8.6 — a **module** grant: an immutable instantiable artifact. Re-granting shares it
         // into the child (cloning the grant entry — its `funcs`/`data`/`module` are `Arc`s, so the copy
@@ -23394,7 +23971,7 @@ mod fork_powerbox_tests {
         let mut host = Host::new();
         let h_inst = host.grant_instantiator(0, 1u64 << 16);
         let h_out = host.grant_stream(StreamRole::Out);
-        let twin = host.fork_powerbox().expect("a simple domain forks");
+        let twin = host.fork_powerbox(7).expect("a simple domain forks");
         // A distinct domain identity — the twin is its own domain.
         assert_ne!(
             twin.domain_id(),
@@ -23429,7 +24006,7 @@ mod fork_powerbox_tests {
         let hr = host
             .try_grant_shared_region_backed(backing)
             .expect("region grant");
-        let twin = host.fork_powerbox().expect("forks");
+        let twin = host.fork_powerbox(7).expect("forks");
         let (hid, tid) = match (
             host.resolve(hr, cap_id::SHARED_REGION),
             twin.resolve(hr, cap_id::SHARED_REGION),
@@ -23456,16 +24033,16 @@ mod fork_powerbox_tests {
         let mut host = Host::new();
         host.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![0])));
         assert!(
-            host.fork_powerbox().is_none(),
+            host.fork_powerbox(7).is_none(),
             "a host_proc granted WITHOUT a fork factory fails the fork closed (never a silent drop)"
         );
         // And a mixed table is all-or-nothing: one factory-less entry poisons the fork.
         host.grant_host_proc_forkable(
             Box::new(|_, _, _, _| Ok(vec![1])),
-            Arc::new(|| Box::new(|_, _, _, _| Ok(vec![1]))),
+            Arc::new(|_pid| ForkedProc::shared(Box::new(|_, _, _, _| Ok(vec![1])))),
         );
         assert!(
-            host.fork_powerbox().is_none(),
+            host.fork_powerbox(7).is_none(),
             "one factory-less host_proc fails the whole fork closed even beside a forkable one"
         );
     }
@@ -23489,8 +24066,9 @@ mod fork_powerbox_tests {
             }
         };
         let mut host = Host::new();
-        let h = host.grant_host_proc_forkable(make(), Arc::new(make));
-        let twin = host.fork_powerbox().expect("a forkable host_proc forks");
+        let h =
+            host.grant_host_proc_forkable(make(), Arc::new(move |_pid| ForkedProc::shared(make())));
+        let twin = host.fork_powerbox(7).expect("a forkable host_proc forks");
         // Same handle value resolves in the twin, through the factory-minted fresh closure.
         let mut twin = twin;
         assert_eq!(
@@ -23505,7 +24083,7 @@ mod fork_powerbox_tests {
         );
         // The factory rode along: the twin itself remains forkable (fork-of-fork / nesting).
         assert!(
-            twin.fork_powerbox().is_some(),
+            twin.fork_powerbox(7).is_some(),
             "a forked domain is still forkable — nested guests can fork"
         );
     }
@@ -23530,7 +24108,8 @@ mod fork_powerbox_tests {
             }
         };
         let mut parent = Host::new();
-        let h = parent.grant_host_proc_forkable(make(), Arc::new(make));
+        let h = parent
+            .grant_host_proc_forkable(make(), Arc::new(move |_pid| ForkedProc::shared(make())));
         let mut child = Host::new();
         let ch = parent
             .regrant_into_child(h, &mut child)
@@ -23546,7 +24125,7 @@ mod fork_powerbox_tests {
             "the child's re-granted proc shares the parent's state (inherited libc / fd table)"
         );
         assert!(
-            child.fork_powerbox().is_some(),
+            child.fork_powerbox(7).is_some(),
             "the child's inherited libc is itself forkable — the guest can then fork"
         );
         // A factory-less host proc is an opaque closure that cannot be carried into a child.

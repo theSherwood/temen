@@ -268,6 +268,93 @@ fn cross_module_value_type_resolves() {
 }
 
 #[test]
+fn cross_module_pointer_field_pointee_resolves() {
+    // A field typed `ptr Inner`, where `Inner` is defined in the *same* unit as the record. The pooled
+    // export must stem-suffix the **pointee** name too (`Ptr(Agg("Inner.0.<stem>"))`), not just
+    // top-level aggregate fields — else the importing unit can't resolve `Inner` and a `dot` through
+    // the loaded pointer fail-closes with `dot on a non-object`. This is exactly what an RTTI vtable
+    // walk needs — `obj.vt : ptr Rtti`, then `.mt` on the `Rtti` behind it — the shape `std/json`'s
+    // method dispatch hits (#760). `readThrough` chases `Rec.p → Inner.val`.
+    let mod_defs = "\
+(stmts
+ (type :Inner.0. . (object . (fld :val.0 . (i +64))))
+ (type :Rec.0. . (object . (fld :p.0 . (ptr Inner.0.)))))";
+    let mod_use = "\
+(stmts
+ (proc :readThrough.0. (params (param :r.0 . (ptr Rec.0.moddefs))) (i +64) .
+  (stmts .
+   (ret (dot (deref (dot (deref r.0) p.0 0)) val.0 0)))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "moduse",
+            src: mod_use,
+            names: &["readThrough.0."],
+        },
+        LengModule {
+            stem: "moddefs",
+            src: mod_defs,
+            names: &[], // type-only unit: defines `Inner` and `Rec`
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    svm_verify::verify_module(&linked).unwrap();
+    // Rec at 512 with p → Inner at 256; Inner.val = 42. readThrough(&Rec) chases both pointers.
+    let mut seed = vec![0u8; 4096];
+    seed[512..520].copy_from_slice(&256i64.to_le_bytes()); // Rec.p = &Inner
+    seed[256..264].copy_from_slice(&42i64.to_le_bytes()); // Inner.val
+    let mut fuel = u64::MAX;
+    let (ir, _) = svm_interp::run_capture(&linked, 0, &[Value::I64(512)], &mut fuel, &seed);
+    assert_eq!(ir.expect("interp").as_slice(), &[Value::I64(42)]);
+    let (jout, _) = svm_jit::compile_and_run_capture(&linked, 0, &[512], &seed).expect("jit");
+    match jout {
+        svm_jit::JitOutcome::Returned(v) => assert_eq!(v, vec![42], "§9 parity"),
+        o => panic!("jit: {o:?}"),
+    }
+}
+
+#[test]
+fn cross_module_inheritance_inlines_base() {
+    // `Circle = object of Shape`, and `Shape` (itself `object of RootObj`) is defined in *another*
+    // unit. A derived object inlines its base's fields at the front (after the RTTI vtable header),
+    // so `Circle` must carry `Shape`'s `area` — even though `Shape` is cross-module. Type layouts are
+    // baked at translate time, and a single per-module export can't see a sibling's base, so the
+    // derived unit used to export a lossy layout with only the synthetic vtable slot; the linker now
+    // pools types to a fixpoint (each round re-exports with the prior pool visible), fully inlining a
+    // cross-module inheritance chain of any depth. This is the shape `std/json` hits — `JsonParser =
+    // object of BaseLexer`, base in a sibling module (#859). mk(v) builds a Circle {vt@0, area@8,
+    // r@16} and sums the inherited base field and its own: area + r = (v) + 7.
+    let mod_base = "\
+(stmts
+ (type :Shape.0. . (object RootObj.0.sysv (fld :area.0 . (i +64)))))";
+    let mod_derived = "\
+(stmts
+ (type :Circle.0. . (object Shape.0.modbase (fld :r.0 . (i +64))))
+ (proc :mk.0. (params (param :v.0 . (i +64))) (i +64) .
+  (stmts .
+   (var :c.0 . Circle.0. (oconstr Circle.0. (kv area.0 v.0) (kv r.0 7)))
+   (ret (add (i +64) (dot c.0 area.0 1) (dot c.0 r.0 0))))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "modderived",
+            src: mod_derived,
+            names: &["mk.0."],
+        },
+        LengModule {
+            stem: "modbase",
+            src: mod_base,
+            names: &[], // type-only unit: it just defines the base `Shape`
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    // mk is frame-needing (aggregate local): ($sp, v) -> i64.
+    assert_eq!(
+        run(&linked, 0, &[4096, 35]),
+        42,
+        "inherited area(35) + own r(7)"
+    );
+}
+
+#[test]
 fn nested_cross_module_types_resolve() {
     // `Outer.0.modp` embeds `Inner.0.` *by value*. The pooled export rewrites the field's type
     // name to its suffixed form (`Inner.0.modp`), so the importing unit resolves the nested layout

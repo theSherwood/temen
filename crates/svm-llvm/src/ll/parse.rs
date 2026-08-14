@@ -807,6 +807,8 @@ impl Parser {
                         | "or"
                         | "xor"
                         | "shl"
+                        | "lshr"
+                        | "ashr"
                 ) || (w == "c" && matches!(self.peek2(), Some(Token::Str(_))))
             }
             _ => false,
@@ -1634,7 +1636,7 @@ impl Parser {
             Some(Token::Word(w))
                 if matches!(
                     w.as_str(),
-                    "add" | "sub" | "mul" | "and" | "or" | "xor" | "shl"
+                    "add" | "sub" | "mul" | "and" | "or" | "xor" | "shl" | "lshr" | "ashr"
                 ) =>
             {
                 let op = w.clone();
@@ -1646,7 +1648,9 @@ impl Parser {
                     "and" => Constant::And(b),
                     "or" => Constant::Or(b),
                     "xor" => Constant::Xor(b),
-                    _ => Constant::Shl(b),
+                    "shl" => Constant::Shl(b),
+                    "lshr" => Constant::LShr(b),
+                    _ => Constant::AShr(b),
                 }
             }
             // A constant-expression integer compare `icmp <pred> ( <ty> <c0>, <ty> <c1> )` → i1. The
@@ -3215,7 +3219,7 @@ mod tests {
         // `rustc`'s real `std` output attaches operand bundles to `llvm.assume`
         // (`[ "align"(...) ]`, `[ "nonnull"(...) ]`) after the argument list. The parser must
         // consume them, in either order relative to `#N` fn-attrs, so the *next* instruction
-        // parses — otherwise the leading `[` reads as a missing `%dest =`. (RUST_STD.md S1.)
+        // parses — otherwise the leading `[` reads as a missing `%dest =`. (Rust `std` on-ramp; LLVM.md §10.)
         let m = parse_module(
             "declare void @llvm.assume(i1)\n\
              define i32 @f(ptr %p) {\n\

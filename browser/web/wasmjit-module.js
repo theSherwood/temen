@@ -54,11 +54,19 @@ export function jitCacheClear() {
 // invoked **only on a compile miss** (so a hit skips the ~12.7 MB byte copy), and `callInterp` becomes
 // the instance's `env.call_interp`. Returns the emitted `f0`. A `hits`/`compiles` bump mirrors the
 // Module-cache accounting (an instance hit is a compile skip). `cacheKey === undefined` disables caching.
-async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp) {
+async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp, entryName = 'f0') {
+  // The emit exports one `f{svm_idx}` per SVM function; `entryName` picks the one this run drives. The
+  // single-shot `_start` path is `f0`; the warm+JIT path drives `eval_run`'s export (`f{eval_fn}`), NOT
+  // `f0` (= the cold `_start`) — see `runWarmJit` (#865).
+  const pick = (instance) => {
+    const f = instance.exports[entryName];
+    if (typeof f !== 'function') throw new Error(`emitted module has no ${entryName} export`);
+    return f;
+  };
   const cached = cacheKey === undefined ? undefined : jitInstanceCache.get(cacheKey);
   if (cached) {
     jitCacheStats.hits++;
-    return cached.f0;
+    return pick(cached.instance);
   }
   let module = cacheGet(cacheKey);
   if (module === undefined) {
@@ -69,15 +77,13 @@ async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp) {
   const instance = await WebAssembly.instantiate(module, {
     env: { memory, trap: () => {}, call_interp: callInterp },
   });
-  const f0 = instance.exports.f0;
-  if (typeof f0 !== 'function') throw new Error('emitted module has no f0 export');
   if (cacheKey !== undefined) {
     if (jitInstanceCache.size >= JIT_MODULE_CACHE_MAX && !jitInstanceCache.has(cacheKey)) {
       jitInstanceCache.delete(jitInstanceCache.keys().next().value);
     }
-    jitInstanceCache.set(cacheKey, { instance, f0 });
+    jitInstanceCache.set(cacheKey, { instance });
   }
-  return f0;
+  return pick(instance);
 }
 
 // Drive an already-opened single-shot JIT run to completion: get the emitted `_start`'s instance (compiled
@@ -181,11 +187,42 @@ async function driveTierupRun(ex, memory, cacheKey) {
   const i64 = () => new BigInt64Array(memory.buffer);
   const win = Number(ex.svm_onramp_tierup_win_ptr());
 
-  // Compile + instantiate the emitted leaves once per Run, reused across every TIERUP. The compiled
-  // Module is cached across Runs under a key distinct from the whole-program `_start` emit (a different
-  // artifact: same guest, leaf-only exports). No instance cache: the eligible-leaf set is per-open, and
-  // a Run holds its instance for all its events anyway. An emitted leaf never crosses tiers (eligibility
-  // excludes cap-calls and calls into unemitted code), so `call_interp` throwing is fail-closed.
+  // ---- #846/#880: the linked-unit driver — one shared funcref table + the live-state bounce ---
+  // The main module and every §22 unit emit against this table (Model B2): `call_indirect`
+  // dispatches through it, and the driver populates its slots from the engine's mirror at each
+  // event boundary — an installed unit's emitted `f0`, an emitted program function's `f{i}` from
+  // the main module, or a **bounce shim** (engine-generated trampoline) for interpreter-resident
+  // targets. The bounce (`env.call_interp`) runs the target on a nested interpretation over the
+  // run's LIVE window/powerbox/fuel, then fans the fresh `"mapped"` extent out to every live
+  // instance (a callback may have vm_map-grown the window mid-region). With the shared table,
+  // `call_indirect`-bearing program functions tier up too (#880 — the dispatch-loop shape).
+  // Proven observably identical to `onramp_exec` by tests/tierup_driver.rs's `TierupDriver`
+  // (wasmi playing this file's role).
+  const tsize = 1 << ex.svm_onramp_tierup_table_log2();
+  const table = new WebAssembly.Table({ initial: tsize, maximum: tsize, element: 'anyfunc' });
+  const mappedGlobals = []; // every live instance's "mapped" — the post-bounce fan-out set
+  const fuelGlobals = [];
+  const registerGlobals = (exports) => {
+    if (exports.mapped) mappedGlobals.push(exports.mapped);
+    if (exports.fuel) fuelGlobals.push(exports.fuel);
+  };
+  const unitImports = () => ({ env: {
+    memory,
+    __indirect_function_table: table,
+    trap: () => {},
+    call_interp: (target, argsPtr) => {
+      const rc = ex.svm_onramp_tierup_call_interp(target, argsPtr);
+      // #717 fan-out: growth a bounced callback made is visible from the next instruction on.
+      const now = ex.svm_onramp_tierup_mapped_now();
+      for (const g of mappedGlobals) g.value = now;
+      if (rc !== 0) throw new Error('bounce trap'); // unwind to the deliver below
+    },
+  } });
+
+  // Compile + instantiate the main emitted module once per Run, reused across every event. The
+  // compiled Module is cached across Runs under a key distinct from the whole-program `_start`
+  // emit (a different artifact: same guest, tier-up exports). No instance cache: the eligible set
+  // is per-open, and a Run holds its instance for all its events anyway.
   const tierupKey = cacheKey === undefined ? undefined : `${cacheKey}#tierup`;
   let module = cacheGet(tierupKey);
   if (module === undefined) {
@@ -197,47 +234,81 @@ async function driveTierupRun(ex, memory, cacheKey) {
   } else {
     jitCacheStats.hits++;
   }
-  const instance = await WebAssembly.instantiate(module, {
-    env: {
-      memory,
-      trap: () => {},
-      call_interp: () => { throw new Error('unexpected cross-tier call from an emitted leaf'); },
-    },
-  });
+  const instance = await WebAssembly.instantiate(module, unitImports());
   const emitted = instance.exports;
   const envCell = Number(ex.svm_alloc(ex.svm_wasmjit_env_bytes()));
-  // §22 unit instances, one per code handle (#835). Per-Run only: code handles are per-session.
+  registerGlobals(emitted);
+  // Per-code-handle unit instances and per-(slot, occupant) bounce shims; per-Run only. Async
+  // instantiation (the drive loop awaits it) — a macro unit can exceed the main thread's sync
+  // compile allowance.
   const jitUnits = new Map();
+  const shims = new Map();
+  const instantiateUnit = async (bytes) => {
+    const inst = await WebAssembly.instantiate(await WebAssembly.compile(bytes), unitImports());
+    registerGlobals(inst.exports);
+    return inst.exports;
+  };
+  const shimFor = async (slot, code) => {
+    const key = `${slot}#${code}`;
+    let f = shims.get(key);
+    if (f === undefined) {
+      const len = ex.svm_onramp_tierup_shim_wasm(slot);
+      if (len === 0) return null;
+      const bytes = u8().slice(Number(ex.svm_onramp_tierup_shim_ptr()), Number(ex.svm_onramp_tierup_shim_ptr()) + len);
+      f = (await instantiateUnit(bytes))['t'];
+      shims.set(key, f);
+    }
+    return f;
+  };
+  const unitFor = async (code, bytes) => {
+    let unit = jitUnits.get(code);
+    if (unit === undefined) {
+      unit = await instantiateUnit(bytes);
+      jitUnits.set(code, unit);
+    }
+    return unit;
+  };
+  // Rebuild the table from the engine's slot mirror. Installs only happen between events (a unit
+  // with a cap.call never emits), so an event-boundary sync is exact for the whole event.
+  const nfuncs = ex.svm_onramp_tierup_nfuncs();
+  const syncTable = async () => {
+    for (let slot = 0; slot < tsize; slot++) {
+      let entry = null;
+      if (slot < nfuncs) {
+        entry = emitted['f' + slot] ?? await shimFor(slot, -2);
+      } else {
+        const code = ex.svm_onramp_tierup_slot_code(slot);
+        if (code >= 0) {
+          const len = ex.svm_onramp_tierup_jit_wasm_by_handle_len(code);
+          entry = len > 0
+            ? (await unitFor(code, u8().slice(Number(ex.svm_onramp_tierup_jit_wasm_by_handle_ptr()),
+                                              Number(ex.svm_onramp_tierup_jit_wasm_by_handle_ptr()) + len)))['f0']
+            : await shimFor(slot, code);
+        }
+      }
+      table.set(slot, entry);
+    }
+  };
 
   try {
     for (;;) {
       const ev = ex.svm_onramp_tierup_run();
       if (ev === 3 /* TIERUP_RUN_JIT_INVOKE */) {
-        // A guest-compiled §22 unit with emitted wasm: instantiate once per code handle, then
-        // `f0(win, env, ...args)` with the per-call `"mapped"` sync — worker.js's JIT_INVOKE
-        // handler, single-shot edition.
+        // A guest-compiled §22 unit with emitted wasm: sync the table, instantiate once per code
+        // handle, then `f0(win, env, ...args)` with the per-event `"mapped"`/fuel sync fanned out
+        // to every live instance (a unit's table dispatch may run any of them).
+        await syncTable();
         const code = ex.svm_onramp_tierup_jit_code();
-        let unit = jitUnits.get(code);
-        if (unit === undefined) {
-          const wptr = Number(ex.svm_onramp_tierup_jit_wasm_ptr());
-          const wlen = ex.svm_onramp_tierup_jit_wasm_len();
-          const uinst = await WebAssembly.instantiate(
-            await WebAssembly.compile(u8().slice(wptr, wptr + wlen)),
-            { env: {
-                memory,
-                trap: () => {},
-                call_interp: () => { throw new Error('unexpected cross-tier call from an emitted unit'); },
-            } },
-          );
-          unit = uinst.exports;
-          jitUnits.set(code, unit);
-        }
+        const unit = await unitFor(code, u8().slice(Number(ex.svm_onramp_tierup_jit_wasm_ptr()),
+                                                    Number(ex.svm_onramp_tierup_jit_wasm_ptr()) + ex.svm_onramp_tierup_jit_wasm_len()));
         const argvPtr = Number(ex.svm_onramp_tierup_argv_ptr());
         const n = ex.svm_onramp_tierup_argv_len();
         const ptypes = new Uint8Array(memory.buffer, Number(ex.svm_onramp_tierup_jit_param_types_ptr()), n);
         const args = [];
         for (let i = 0; i < n; i++) args.push(tierupJitArg(i64()[(argvPtr >> 3) + i], ptypes[i]));
-        unit.mapped.value = ex.svm_onramp_tierup_mapped(); // #717 host sync, as TIERUP below
+        const mapped = ex.svm_onramp_tierup_mapped(); // #717 host sync, as TIERUP below
+        for (const g of mappedGlobals) g.value = mapped;
+        for (const g of fuelGlobals) g.value = 1n << 61n;
         new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
         try {
           const ret = unit['f0'](win, envCell, ...args);
@@ -250,20 +321,26 @@ async function driveTierupRun(ex, memory, cacheKey) {
           ex.svm_onramp_tierup_deliver_jit(rptr, rets.length);
           ex.svm_dealloc(rptr, rlen);
         } catch {
+          // A wasm trap — or a bounce callback's trap/exit, which the engine staged and
+          // `deliver_jit_trap` resolves as the real trap kind (an exit ends the run as EXIT).
           ex.svm_onramp_tierup_deliver_jit_trap();
         }
         continue;
       }
       if (ev !== 1 /* TIERUP_RUN_TIERUP */) break; // 0 = done (slots staged), 2 = trapped (status 3)
+      // #880: a tiered-up leaf's `call_indirect` dispatches through the shared table — sync it
+      // (and the per-event `"mapped"`/fuel fan-out covers every instance the dispatch may reach).
+      await syncTable();
       const func = ex.svm_onramp_tierup_func();
       const argvPtr = Number(ex.svm_onramp_tierup_argv_ptr());
       const n = ex.svm_onramp_tierup_argv_len();
       const args = [];
       for (let i = 0; i < n; i++) args.push(i64()[(argvPtr >> 3) + i]);
-      // #717 host sync: the event's committed extent → the emitted `"mapped"` global, so the bounds
-      // check admits exactly what the interpreter's page map does for this call.
-      emitted.mapped.value = ex.svm_onramp_tierup_mapped();
-      emitted.fuel.value = 1n << 61n; // re-arm the fuel global across events on the reused instance
+      // #717 host sync: the event's committed extent → every live `"mapped"` global, so the bounds
+      // checks admit exactly what the interpreter's page map does for this call.
+      const tmapped = ex.svm_onramp_tierup_mapped();
+      for (const g of mappedGlobals) g.value = tmapped;
+      for (const g of fuelGlobals) g.value = 1n << 61n; // re-arm across events on reused instances
       new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
       try {
         const ret = emitted['f' + func](win, envCell, ...args);
@@ -347,13 +424,18 @@ export async function runWarmJit(ex, memory, stdinBytes, cacheKey, shared = 1) {
   if (prepared !== 0) throw new Error(`warm-JIT prepare failed: status ${ex.svm_status()}`);
 
   const win = Number(ex.svm_warm_jit_win_ptr());
-  const sp = ex.svm_warm_jit_entry_sp(); // i64 export ⇒ BigInt; passed straight as f0's i64 slot
+  const sp = ex.svm_warm_jit_entry_sp(); // i64 export ⇒ BigInt; passed straight as the entry's i64 slot
   const envBytes = ex.svm_onramp_jit_run_env_bytes();
+  // Drive the emitted `eval_run` export — `f{eval_fn}`, NOT `f0` (#865). `f0` is the cold `_start`
+  // (init + eval); driving it re-runs the guest's init over the restored warm image, which for Tcl
+  // re-enters `Tcl_FindExecutable` → an encoding-proc `call_indirect` trap (and for any driver defeats
+  // the "init paid once" warm contract). The entry export index comes from the engine.
+  const entryName = `f${ex.svm_warm_jit_entry_func()}`;
 
   // Reuse the instance across Runs (issue #803): a hit skips both the byte copy and instantiate, so a
   // warm Run collapses to `prepare` + the eval. The emit is stable and window-independent (`win`/`sp` are
   // passed per Run), so one instance serves every Run of this warm session.
-  const f0 = await cachedInstanceF0(
+  const entry = await cachedInstanceF0(
     memory,
     cacheKey,
     () => {
@@ -364,25 +446,55 @@ export async function runWarmJit(ex, memory, stdinBytes, cacheKey, shared = 1) {
     (func, argsPtr) => {
       if (ex.svm_warm_jit_call_interp(func, argsPtr) !== 0) throw new Error('cross-tier stop');
     },
+    entryName,
   );
 
   const env = Number(ex.svm_alloc(envBytes));
   new DataView(memory.buffer).setBigInt64(env, 1n << 60n, true); // huge dispatcher-fuel budget
   let threw = 0;
   let value = 0n;
+  let trapError = null;
   try {
-    // f0(win, env, sp) — runs `eval_run(sp)` over the restored warm image on emitted wasm. Its return is
-    // the guest's top-level result (an i32/i64); normalize to i64.
-    const r = f0(win, env, sp);
+    // entry(win, env, sp) — runs `eval_run(sp)` over the restored warm image on emitted wasm. Its return
+    // is the guest's top-level result (an i32/i64); normalize to i64.
+    const r = entry(win, env, sp);
     value = r === undefined || r === null ? 0n : BigInt(r);
-  } catch {
+  } catch (e) {
     threw = 1;
+    trapError = e; // keep it — the trap kind + wasm location live here (issue #865)
   }
   ex.svm_dealloc(env, envBytes);
   ex.svm_warm_jit_report(threw, value);
   const status = ex.svm_warm_jit_finish();
-  if (status === 3 /* STATUS_TRAP */) throw new Error('emitted warm run trapped (declined to the interpreter)');
+  if (status === 3 /* STATUS_TRAP */) throw warmJitTrapError(trapError);
   return status;
+}
+
+// The last warm+JIT trap, captured for diagnosis (issue #865) — `{ kind, frames }` where `frames` are the
+// emitted wasm frames `fN@0xoff` (innermost first), or `null` if the last run didn't trap. Test/telemetry
+// hook: a decline used to be a bare "trapped" with no location; this exposes the trap KIND (the V8
+// RuntimeError message, e.g. "null function or function signature mismatch" = a `call_indirect` to a
+// null/mismatched table slot) and WHERE (which emitted functions), the way the bytecode tier reports.
+export let lastWarmJitTrap = null;
+
+// Build a diagnosable decline error from the caught `f0` trap. A wasm-level trap is a `WebAssembly.
+// RuntimeError` whose message is the trap kind and whose stack carries `wasm-function[N]:0xoff` frames
+// (the emitted function index + byte offset). Our own cross-tier unwind (`env.call_interp` returned
+// nonzero → we threw 'cross-tier stop') has no wasm location — the real trap is on the interpreter side,
+// recorded by `svm_warm_jit_call_interp`'s `last_trap`.
+function warmJitTrapError(e) {
+  if (e instanceof WebAssembly.RuntimeError) {
+    const frames = String(e.stack || '')
+      .split('\n')
+      .map((l) => l.match(/wasm-function\[(\d+)\]:0x([0-9a-fA-F]+)/))
+      .filter(Boolean)
+      .map((m) => `f${m[1]}@0x${m[2]}`);
+    lastWarmJitTrap = { kind: e.message, frames };
+    const where = frames.length ? ` at ${frames[0]}${frames.length > 1 ? ` (from ${frames.slice(1, 6).join(' ← ')})` : ''}` : '';
+    return new Error(`emitted warm run trapped: ${e.message}${where}`);
+  }
+  lastWarmJitTrap = { kind: (e && e.message) || 'cross-tier stop', frames: [] };
+  return new Error(`emitted warm run trapped (declined to the interpreter): ${(e && e.message) || e}`);
 }
 
 // **Pre-warm** the warm+JIT `eval_run` for `cacheKey` — emit + `WebAssembly.compile` + instantiate **and

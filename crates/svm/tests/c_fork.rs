@@ -1626,14 +1626,14 @@ fn a_shell_redirects_a_command_output_to_a_file() {
     let factory = std::sync::Arc::new(factory);
     let make: svm_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move || -> svm_interp::HostProc {
+        std::sync::Arc::new(move |_pid| -> svm_interp::ForkedProc {
             let mut inner = factory();
-            Box::new(move |_slot_op, args, mem, minter| {
+            svm_interp::ForkedProc::shared(Box::new(move |_slot_op, args, mem, minter| {
                 inner(args[0] as u32, &args[1..], mem, minter)
-            })
+            }))
         })
     };
-    let fs_cap = host.grant_host_proc_forkable(make(), make.clone());
+    let fs_cap = host.grant_host_proc_forkable(make(0).handler, make.clone());
 
     let mut fuel = 120_000_000u64;
     let r = run_with_host(
@@ -1731,14 +1731,14 @@ fn a_shell_appends_a_command_output_to_a_file() {
     let factory = std::sync::Arc::new(factory);
     let make: svm_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move || -> svm_interp::HostProc {
+        std::sync::Arc::new(move |_pid| -> svm_interp::ForkedProc {
             let mut inner = factory();
-            Box::new(move |_slot_op, args, mem, minter| {
+            svm_interp::ForkedProc::shared(Box::new(move |_slot_op, args, mem, minter| {
                 inner(args[0] as u32, &args[1..], mem, minter)
-            })
+            }))
         })
     };
-    let fs_cap = host.grant_host_proc_forkable(make(), make.clone());
+    let fs_cap = host.grant_host_proc_forkable(make(0).handler, make.clone());
 
     let mut fuel = 120_000_000u64;
     let r = run_with_host(
@@ -1840,14 +1840,14 @@ fn a_shell_redirects_a_file_into_a_command_stdin() {
     let factory = std::sync::Arc::new(factory);
     let make: svm_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move || -> svm_interp::HostProc {
+        std::sync::Arc::new(move |_pid| -> svm_interp::ForkedProc {
             let mut inner = factory();
-            Box::new(move |_slot_op, args, mem, minter| {
+            svm_interp::ForkedProc::shared(Box::new(move |_slot_op, args, mem, minter| {
                 inner(args[0] as u32, &args[1..], mem, minter)
-            })
+            }))
         })
     };
-    let fs_cap = host.grant_host_proc_forkable(make(), make.clone());
+    let fs_cap = host.grant_host_proc_forkable(make(0).handler, make.clone());
 
     let mut fuel = 120_000_000u64;
     let r = run_with_host(
@@ -1943,14 +1943,14 @@ fn a_shell_redirects_a_command_stderr_to_a_file() {
     let factory = std::sync::Arc::new(factory);
     let make: svm_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move || -> svm_interp::HostProc {
+        std::sync::Arc::new(move |_pid| -> svm_interp::ForkedProc {
             let mut inner = factory();
-            Box::new(move |_slot_op, args, mem, minter| {
+            svm_interp::ForkedProc::shared(Box::new(move |_slot_op, args, mem, minter| {
                 inner(args[0] as u32, &args[1..], mem, minter)
-            })
+            }))
         })
     };
-    let fs_cap = host.grant_host_proc_forkable(make(), make.clone());
+    let fs_cap = host.grant_host_proc_forkable(make(0).handler, make.clone());
 
     let mut fuel = 120_000_000u64;
     let r = run_with_host(
@@ -2310,14 +2310,14 @@ fn a_nested_compiled_c_command_reads_a_file_through_a_granted_fs_cap() {
     let factory = std::sync::Arc::new(factory);
     let make: svm_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move || -> svm_interp::HostProc {
+        std::sync::Arc::new(move |_pid| -> svm_interp::ForkedProc {
             let mut inner = factory();
-            Box::new(move |_slot_op, args, mem, minter| {
+            svm_interp::ForkedProc::shared(Box::new(move |_slot_op, args, mem, minter| {
                 inner(args[0] as u32, &args[1..], mem, minter)
-            })
+            }))
         })
     };
-    let fs_cap = host.grant_host_proc_forkable(make(), make.clone());
+    let fs_cap = host.grant_host_proc_forkable(make(0).handler, make.clone());
 
     let mut fuel = 120_000_000u64;
     let r = run_with_host(
@@ -2743,14 +2743,14 @@ fn a_compiled_c_program_forks_execs_a_real_command_that_reads_a_file_and_waits()
     let factory = std::sync::Arc::new(factory);
     let make: svm_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move || -> svm_interp::HostProc {
+        std::sync::Arc::new(move |_pid| -> svm_interp::ForkedProc {
             let mut inner = factory();
-            Box::new(move |_slot_op, args, mem, minter| {
+            svm_interp::ForkedProc::shared(Box::new(move |_slot_op, args, mem, minter| {
                 inner(args[0] as u32, &args[1..], mem, minter)
-            })
+            }))
         })
     };
-    let fs_cap = host.grant_host_proc_forkable(make(), make.clone());
+    let fs_cap = host.grant_host_proc_forkable(make(0).handler, make.clone());
 
     let mut fuel = 120_000_000u64;
     let r = run_with_host(
@@ -2834,5 +2834,895 @@ fn a_compiled_c_program_forks_for_real_and_both_copies_write_through_the_shared_
         vals,
         vec![0, 3],
         "child wrote 0, parent wrote its pid (3) — a real compiled-C fork() through the shared stream"
+    );
+}
+
+/// #863 slice 2 — **`kill(pid, SIGUSR1)` from a compiled-C parent to its forked child, by the pid
+/// `fork()` returned.** The one-pid-space integration pin: the pid the core hands the parent (the
+/// twin's `TaskId`) must be the SAME pid the personality registered in its process table at mint —
+/// if they disagreed, the parent's `kill` would be `-ESRCH`. The child installs a SIGUSR1 handler
+/// (the L0 doorbell) and spins on `sigcheck`; the parent kills an unknown pid first (`-ESRCH`),
+/// then the child's; the child's own `sigcheck` — and only the child's — delivers the handler
+/// token, and the child's exit (42) flows back through `wait`. Impossible before the World/Proc
+/// split: parent and child shared one pending set, so per-child targeting had no address.
+///
+/// Reuses `FS_FORK_MANAGER` (fork + wait offers, one re-granted forkable cap): the `"__vm_fs"`
+/// import slot here carries the op-shifted **posix** cap — same wire shape (`args[0]` = op), only
+/// the personality behind it differs.
+const KILL_BY_PID_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static long pid;
+static long st;
+static long h;
+int main(int argc, char **argv) {
+  /* Pre-install a caught disposition for 10 — inherited by the fork twin (POSIX), so the kill
+   * below can never land on SIG_DFL (#796: that would terminate the child, not pend). */
+  __vm_fs(30, 10, 6, 0, 0);
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    __vm_fs(30, 10, 7, 0, 0);                    /* signal(10, its own handler-token 7) */
+    while ((h = __vm_fs(32, 0, 0, 0, 0)) == 0);  /* sigcheck: spin until the kill lands */
+    if (h == 7) return 42;
+    return 9;
+  }
+  if (__vm_fs(31, 99, 10, 0, 0) != -3) return 1; /* kill(unknown pid) is -ESRCH */
+  if (__vm_fs(31, pid, 10, 0, 0) != 0) return 2; /* kill(child, 10) — by the fork() pid */
+  if (__vm_fs(32, 0, 0, 0, 0) != 0) return 3;    /* the PARENT's own sigcheck stays empty */
+  while ((st = wait_pid(pid)) < 0);
+  return st;                                     /* 42: the child saw the pid-targeted signal */
+}
+"#;
+
+/// Op-shift a posix fork factory into the manager re-grant wire shape (`args[0]` = op, like the
+/// fs-cap tests), preserving the #863 extras — the per-process signal door rides along untouched,
+/// and the replacement factory is re-wrapped so fork-of-fork keeps the shape.
+fn opshift_fork(base: svm_interp::HostProcFork) -> svm_interp::HostProcFork {
+    Arc::new(move |pid| {
+        let forked = base(pid);
+        let mut inner = forked.handler;
+        svm_interp::ForkedProc {
+            handler: Box::new(move |_slot_op, args, mem, minter| {
+                inner(args[0] as u32, &args[1..], mem, minter)
+            }),
+            signal: forked.signal,
+            refork: forked.refork.map(opshift_fork),
+            exit: forked.exit,
+        }
+    })
+}
+
+#[test]
+fn a_compiled_c_parent_kills_its_forked_child_by_pid() {
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let guest_src = format!("{FORK_SHIM}\n{KILL_BY_PID_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse kill-by-pid guest");
+    verify_module(&guest).expect("verify kill-by-pid guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let (posix, make) = svm_posix::cap(4096, 1 << 16, Vec::new());
+    let make = Arc::new(make);
+    let px_handler: svm_interp::HostProc = {
+        let mut inner = make();
+        Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter))
+    };
+    let px_cap = host.grant_host_proc_forkable(
+        px_handler,
+        opshift_fork(svm_posix::cap_fork_factory(&posix)),
+    );
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(gmod as i64), // the cmd-module slot — unused by this guest
+            Value::I32(px_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "the child saw the parent's pid-targeted SIGUSR1 (its sigcheck delivered the handler \
+         token) and its exit rode back through wait — fork pid, table pid, and kill pid are ONE"
+    );
+}
+
+/// #796 default actions — **an unhandled fatal signal really terminates, compiled C, end to end**:
+/// the child spins forever (no handler for anything — a runaway job); the parent's plain
+/// `kill(child, SIGTERM)` must actually kill it (`SIG_DFL` action = terminate through the
+/// `SignalSource::set_kill` door → the domain's term flag → `ThreadFault` at the next per-op
+/// poll), and the personality's `waitpid` must report the death in the `WIFSIGNALED` shape —
+/// the signal in the low 7 bits, NOT an exit-code encode. Without the kill the child's infinite
+/// spin would burn the run's whole fuel budget: the test passing quickly IS the death witness.
+/// Also probes the discard side: `SIGCHLD` (default-ignore) at the child beforehand is a no-op.
+const DEFAULT_TERMINATE_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static long pid;
+static long r;
+static int status;
+static volatile long sink;
+int main(int argc, char **argv) {
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    while (1) sink = sink + 1;                      /* runaway: no handler, no exit */
+  }
+  if (__vm_fs(31, pid, 17, 0, 0) != 0) return 1;    /* SIGCHLD: default-ignore, a no-op */
+  if (__vm_fs(31, pid, 15, 0, 0) != 0) return 2;    /* SIGTERM: SIG_DFL = terminate */
+  while ((r = __vm_fs(28, pid, (long)&status, 0, 0)) == -10);  /* reap the killed child */
+  if (r != pid) return 3;
+  if ((status & 0x7f) != 15) return 4;              /* WIFSIGNALED: the terminating signal */
+  if (((status >> 8) & 0xff) != 0) return 5;        /* not an exit-code encode */
+  return 42;
+}
+"#;
+
+#[test]
+fn an_unhandled_sigterm_kills_a_runaway_forked_child_for_real() {
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let guest_src = format!("{FORK_SHIM}\n{DEFAULT_TERMINATE_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse default-terminate guest");
+    verify_module(&guest).expect("verify default-terminate guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let (posix, make) = svm_posix::cap(4096, 1 << 16, Vec::new());
+    let make = Arc::new(make);
+    let px_handler: svm_interp::HostProc = {
+        let mut inner = make();
+        Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter))
+    };
+    let px_cap = host.grant_host_proc_forkable(
+        px_handler,
+        opshift_fork(svm_posix::cap_fork_factory(&posix)),
+    );
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(gmod as i64), // the cmd-module slot — unused by this guest
+            Value::I32(px_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "kill(child, SIGTERM) with no handler installed actually terminated the runaway child \
+         (the default action, through the set_kill door), and waitpid reported the death as \
+         WIFSIGNALED(15) — not an exit code"
+    );
+}
+
+/// #800 — **`isatty` + `getppid`, the shell's interactive-mode and `$PPID` probes**: `isatty`
+/// answers the same proto-terminal test the `tc*` ops gate on (stdio fds 1, a pipe fd 0 — the
+/// discrimination bash's "am I interactive?" check needs), and a fork twin's `getppid()` is the
+/// parent's own `getpid()` (recorded at twin mint), with the parent's `getppid()` reporting its
+/// granting root. The child returns its checks as an exit code the parent folds into its own.
+const ISATTY_PPID_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static long pid;
+static long me;
+static long st;
+static int fds[2];
+int main(int argc, char **argv) {
+  me = __vm_fs(44, 0, 0, 0, 0);                       /* getpid */
+  if (__vm_fs(49, 1, 0, 0, 0) != 1) return 1;         /* stdout IS the proto-terminal */
+  if (__vm_fs(49, 0, 0, 0, 0) != 1) return 2;         /* stdin too */
+  if (__vm_fs(23, (long)fds, 0, 0, 0) != 0) return 3; /* pipe(fds) */
+  if (__vm_fs(49, fds[0], 0, 0, 0) != 0) return 4;    /* a pipe fd is NOT a tty */
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    if (__vm_fs(50, 0, 0, 0, 0) != me) return 9;      /* child's getppid == parent's getpid */
+    return 5;
+  }
+  while ((st = wait_pid(pid)) < 0);
+  if (st != 5) return 6;
+  if (__vm_fs(50, 0, 0, 0, 0) == me) return 7;        /* parent's ppid is its granter, not itself */
+  return 42;
+}
+"#;
+
+#[test]
+fn isatty_discriminates_the_proto_terminal_and_getppid_names_the_forking_parent() {
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let guest_src = format!("{FORK_SHIM}\n{ISATTY_PPID_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse isatty-ppid guest");
+    verify_module(&guest).expect("verify isatty-ppid guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let (posix, make) = svm_posix::cap(4096, 1 << 16, Vec::new());
+    let make = Arc::new(make);
+    let px_handler: svm_interp::HostProc = {
+        let mut inner = make();
+        Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter))
+    };
+    let px_cap = host.grant_host_proc_forkable(
+        px_handler,
+        opshift_fork(svm_posix::cap_fork_factory(&posix)),
+    );
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(gmod as i64), // the cmd-module slot — unused by this guest
+            Value::I32(px_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "isatty told the proto-terminal from a pipe fd, and getppid reported the forking \
+         parent from inside the twin"
+    );
+}
+
+/// #796 `SA_RESTART` — **a restart-flagged delivery leaves a parked `wait` parked**: the parent
+/// installs SIGUSR1 via `sigaction` with `SA_RESTART` (real handler, async stack) and parks in
+/// `wait_pid(child)`; the child raises USR1 at the parent (pid 1) and only THEN exits 5. Without
+/// the flag that raise EINTRs the wait (the #863 capstone proves it); with it the wait must ride
+/// through — never `-4` — and return the child's real 5, with the handler having run by then
+/// (delivered at the parent's first post-wait safepoint; for the shell's `SIGCHLD`-with-restart
+/// case the wait completes at the same moment the signal lands, so the delay is invisible).
+const RESTART_WAIT_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static char sigstk[4096];
+static long act[3];
+static volatile long got;
+static void on_usr(int sig) { got = sig; }
+static long pid;
+static long ppid;
+static long st;
+static volatile long acc;
+int main(int argc, char **argv) {
+  act[0] = (long)on_usr;
+  act[1] = 0;
+  act[2] = 0x10000000;                     /* SA_RESTART */
+  __vm_fs(41, 10, (long)act, 0, 0);        /* sigaction(SIGUSR1, restart) — BEFORE fork */
+  __vm_fs(42, (long)sigstk, 4096, 0, 0);   /* sigaltstack: async delivery on */
+  ppid = __vm_fs(44, 0, 0, 0, 0);          /* getpid, saved pre-fork: the twin's copy = its parent */
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    __vm_fs(31, ppid, 10, 0, 0);           /* kill(parent, USR1) while it is (or will be) parked */
+    for (long i = 0; i < 200000; i = i + 1) acc = acc + i;  /* a window for a wrong EINTR */
+    return 5;
+  }
+  st = wait_pid(pid);                      /* PARKS; the USR1 must NOT interrupt it (restart) */
+  if (st == -4) return 1;                  /* -EINTR = SA_RESTART was ignored */
+  if (st != 5) return 2;                   /* the child's real exit rode through */
+  for (long i = 0; got != 10 && i < 100000000; i = i + 1) acc = acc + 1;  /* async landing window */
+  if (got != 10) return 3;                 /* the held handler delivered after the wait */
+  return 42;
+}
+"#;
+
+#[test]
+fn sa_restart_rides_a_parked_wait_through_a_delivered_signal() {
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let guest_src = format!("{FORK_SHIM}\n{RESTART_WAIT_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse restart-wait guest");
+    verify_module(&guest).expect("verify restart-wait guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let (posix, make) = svm_posix::cap(4096, 1 << 16, Vec::new());
+    let make = Arc::new(make);
+    let px_handler: svm_interp::HostProc = {
+        let mut inner = make();
+        Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter))
+    };
+    let px_cap = host.grant_host_proc_forkable(
+        px_handler,
+        opshift_fork(svm_posix::cap_fork_factory(&posix)),
+    );
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(gmod as i64), // the cmd-module slot — unused by this guest
+            Value::I32(px_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "the SA_RESTART'd USR1 left the parent's wait parked (no -EINTR): it returned the \
+         child's real 5, and the handler had run by then"
+    );
+}
+
+/// #863 slice 3 — **the waitpid-EINTR capstone: an embedder `^C` interrupts a forked shell blocked
+/// in `wait`, on the RIGHT process.** The compiled-C parent catches SIGINT (real handler + signal
+/// stack — async delivery on), forks a child (which spins on its `sigcheck` doorbell), and parks in
+/// `wait(child)` — the core reap park (`join_waiters`). A background "terminal" thread calls
+/// [`svm_posix::Posix::kill_pid`]`(1000, SIGINT)` — the parent's personality pid (the first
+/// anonymous re-grant clone draws 1000 from the spawn allocator) — so the personality sets the
+/// PARENT's pending bit and fires the parent's **domain-scoped weak run-wake**: the reap park
+/// completes `-EINTR` while the child's spin is untouched (invariant 12 — a signal to A never
+/// sweeps B). The parent then observes the handler ran, ignores further SIGINTs (`SIG_IGN` — the
+/// terminal thread keeps firing; an undeliverable raise must never wake), releases the child with
+/// `kill(child_pid, 10)`, and reaps it for real: the classic interactive-shell loop —
+/// `wait → ^C → EINTR → handle → wait again` — end to end in ordinary C.
+const WAIT_EINTR_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static char sigstk[4096];  /* small enough to keep the module inside the 2^17 spawn carve */
+static volatile long got;
+static void on_int(int sig) { got = sig; }
+static volatile long usr;
+static void on_usr(int sig) { usr = sig; }
+static long pid;
+static long st;
+int main(int argc, char **argv) {
+  __vm_fs(30, 2, (long)on_int, 0, 0);      /* signal(SIGINT, handler): catch */
+  __vm_fs(30, 10, (long)on_usr, 0, 0);     /* pre-install 10 too — inherited by the twin, so the
+                                              parent's kill(child, 10) can never land on SIG_DFL
+                                              (#796: that would terminate it, not pend) */
+  __vm_fs(42, (long)sigstk, 4096, 0, 0);   /* sigaltstack: async delivery on */
+  __vm_fs(0, 1, (long)&st, 1, 0);          /* readiness byte: the terminal may open fire (#796 —
+                                              a pre-handler ^C is now FATAL, the default action) */
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    /* The fork twin INHERITS the signal stack (POSIX) — async delivery is ON here too, so its
+     * handler must be real (an L0 token would be table-masked and dispatched). Its own async
+     * SIGUSR1 breaks the spin: the child-side half of the capstone. */
+    __vm_fs(30, 10, (long)on_usr, 0, 0);   /* child: signal(10, handler) */
+    while (!usr);                          /* spin until the parent's kill delivers async */
+    return 5;
+  }
+  st = wait_pid(pid);                      /* PARKS in the core reap; the terminal ^C -> -EINTR */
+  if (st != -4) return 1;                  /* the interrupted wait returned EINTR */
+  if (got != 2) return 2;                  /* the SIGINT handler ran on the PARENT */
+  __vm_fs(30, 2, 1, 0, 0);                 /* SIG_IGN: the terminal keeps firing; no more wakes */
+  __vm_fs(31, pid, 10, 0, 0);              /* kill(child, 10): release the spinner */
+  while ((st = wait_pid(pid)) < 0);        /* wait again — reap for real (retries a raced EINTR) */
+  return st;                               /* 5: the child's exit, after the ^C round-trip */
+}
+"#;
+
+#[test]
+fn a_terminal_ctrl_c_interrupts_a_forked_parent_blocked_in_wait() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let guest_src = format!("{FORK_SHIM}\n{WAIT_EINTR_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse wait-eintr guest");
+    verify_module(&guest).expect("verify wait-eintr guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let (posix, make) = svm_posix::cap(4096, 1 << 16, Vec::new());
+    let make = Arc::new(make);
+    let px_handler: svm_interp::HostProc = {
+        let mut inner = make();
+        Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter))
+    };
+    let px_cap = host.grant_host_proc_forkable(
+        px_handler,
+        opshift_fork(svm_posix::cap_fork_factory(&posix)),
+    );
+
+    // The "terminal": raise SIGINT at the parent (personality pid 1000) until the run returns.
+    // It holds fire until the guest's readiness byte lands on the captured stdout — #796 default
+    // actions made a pre-handler `^C` FATAL (terminate is the `SIG_DFL` action), so the storm may
+    // only start once the handler is installed. After that it stays robust to ordering: raises
+    // are caught (pending bit + handler), and after the guest's SIG_IGN they are discarded.
+    // Domain scoping keeps every one of these away from the child's spin.
+    let done = Arc::new(AtomicBool::new(false));
+    let done2 = Arc::clone(&done);
+    let posix2 = posix.clone();
+    let terminal = std::thread::spawn(move || {
+        while !done2.load(Ordering::Relaxed) && posix2.stdout().is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        while !done2.load(Ordering::Relaxed) {
+            posix2.kill_pid(1000, 2);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    });
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(gmod as i64), // the cmd-module slot — unused by this guest
+            Value::I32(px_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    );
+    done.store(true, Ordering::Relaxed);
+    terminal.join().unwrap();
+    let r = r.expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(5)],
+        "the ^C EINTR'd the parent's wait (handler ran, child's park untouched), and the \
+         re-issued wait reaped the child's real exit — the interactive shell loop, end to end"
+    );
+}
+
+/// #863 slice 3 — **the invariant-12 scoping witness: a `^C` at the parent never sweeps the
+/// child's park.** Three generations: the parent waits on the child, the child waits on a
+/// grandchild (which spins on its doorbell), so TWO processes of one world are parked in `wait`
+/// simultaneously when the terminal `^C` hits the PARENT. Only the parent's wait may return
+/// `-EINTR`: the child's park must survive untouched (`gst != 5 → 1` would surface a stray EINTR —
+/// exactly what the pre-slice-3 run-global `interrupt_interruptible_parks` sweep did). The parent
+/// then releases the leaf **across two generations** — `kill(4, 12)` straight to the grandchild's
+/// own async handler — and the exits cascade back: grandchild 5 → child 6 → parent. Also
+/// exercises fork-of-fork (the twin's replacement factory) and the grandchild's wake install at
+/// its own mint.
+const WAIT_SCOPED_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static char sigstk[4096];
+static volatile long got;
+static void on_int(int sig) { got = sig; }
+static volatile long usr;
+static void on_usr(int sig) { usr = sig; }
+static long pid;
+static long st;
+int main(int argc, char **argv) {
+  __vm_fs(30, 2, (long)on_int, 0, 0);      /* signal(SIGINT, handler): catch */
+  __vm_fs(30, 12, (long)on_usr, 0, 0);     /* pre-install 12 — inherited down BOTH generations, so
+                                              the cross-generation kill(4, 12) can never land on
+                                              SIG_DFL in a grandchild that has not re-installed */
+  __vm_fs(42, (long)sigstk, 4096, 0, 0);   /* sigaltstack: async delivery on (inherited by all) */
+  __vm_fs(0, 1, (long)&st, 1, 0);          /* readiness byte: the terminal may open fire (#796 —
+                                              a pre-handler ^C is now FATAL, the default action) */
+  while ((pid = fork()) < 0);              /* child: pid 3 (task ids are deterministic here) */
+  if (pid == 0) {
+    long gpid;
+    long gst;
+    while ((gpid = fork()) < 0);           /* fork-of-fork: grandchild, pid 4 */
+    if (gpid == 0) {
+      __vm_fs(30, 12, (long)on_usr, 0, 0); /* grandchild: catch signal 12 */
+      while (!usr);                        /* spin until the PARENT's cross-generation kill */
+      return 5;
+    }
+    gst = wait_pid(gpid);                  /* PARKS — the parent's ^C must NOT touch this */
+    if (gst != 5) return 1;                /* a stray -EINTR here = the unscoped-sweep bug */
+    return 6;
+  }
+  st = wait_pid(pid);                      /* PARKS; the terminal ^C -> -EINTR, parent only */
+  if (st != -4) return 2;
+  if (got != 2) return 3;                  /* the SIGINT handler ran on the parent */
+  __vm_fs(30, 2, 1, 0, 0);                 /* SIG_IGN: the terminal keeps firing harmlessly */
+  __vm_fs(31, 4, 12, 0, 0);                /* kill(grandchild, 12): two generations down */
+  while ((st = wait_pid(pid)) < 0);        /* reap the CHILD (retries a raced EINTR) */
+  return st;                               /* 6: the child reaped 5 cleanly, unswept */
+}
+"#;
+
+#[test]
+fn a_ctrl_c_at_the_parent_never_sweeps_the_childs_wait_park() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let guest_src = format!("{FORK_SHIM}\n{WAIT_SCOPED_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse scoped-wait guest");
+    verify_module(&guest).expect("verify scoped-wait guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let (posix, make) = svm_posix::cap(4096, 1 << 16, Vec::new());
+    let make = Arc::new(make);
+    let px_handler: svm_interp::HostProc = {
+        let mut inner = make();
+        Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter))
+    };
+    let px_cap = host.grant_host_proc_forkable(
+        px_handler,
+        opshift_fork(svm_posix::cap_fork_factory(&posix)),
+    );
+
+    let done = Arc::new(AtomicBool::new(false));
+    let done2 = Arc::clone(&done);
+    let posix2 = posix.clone();
+    let terminal = std::thread::spawn(move || {
+        // Hold fire until the parent's readiness byte (#796 — a pre-handler ^C is fatal).
+        while !done2.load(Ordering::Relaxed) && posix2.stdout().is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        while !done2.load(Ordering::Relaxed) {
+            posix2.kill_pid(1000, 2);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    });
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(gmod as i64), // the cmd-module slot — unused by this guest
+            Value::I32(px_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    );
+    done.store(true, Ordering::Relaxed);
+    terminal.join().unwrap();
+    let r = r.expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(6)],
+        "the parent's ^C EINTR'd only ITS wait; the child's park survived (6 = the child \
+         reaped the grandchild's clean 5) — the domain-scoped sweep, witnessed across three \
+         generations"
+    );
+}
+
+/// #863 hygiene — **`waitpid` over a fork twin, through the personality**: the parent reaps its
+/// forked child with the POSIX `waitpid` op (a non-blocking `-ECHILD` poll), never touching the
+/// core's wait offer. The chain under test: the twin's task completes → the core fires the fork
+/// factory's exit hook → the personality flips the twin `Live` → `Zombie` (wait-encoded) → the
+/// parent's poll stops seeing `-ECHILD` and reaps the status. One pid, two reap channels — this
+/// pins the personality one; the wait-offer one is every other test in this file.
+const WAITPID_TWIN_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static long pid;
+static long r;
+static int status;
+int main(int argc, char **argv) {
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    return 7;
+  }
+  while ((r = __vm_fs(28, pid, (long)&status, 0, 0)) == -10);  /* waitpid poll: ECHILD until exit */
+  if (r != pid) return 1;
+  if (((status >> 8) & 0xff) != 7) return 2;                   /* WEXITSTATUS */
+  if (__vm_fs(31, pid, 15, 0, 0) != -3) return 3;              /* reaped: kill(pid) is -ESRCH */
+  return 42;
+}
+"#;
+
+#[test]
+fn a_compiled_c_parent_reaps_its_fork_twin_through_posix_waitpid() {
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let guest_src = format!("{FORK_SHIM}\n{WAITPID_TWIN_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse waitpid-twin guest");
+    verify_module(&guest).expect("verify waitpid-twin guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let (posix, make) = svm_posix::cap(4096, 1 << 16, Vec::new());
+    let make = Arc::new(make);
+    let px_handler: svm_interp::HostProc = {
+        let mut inner = make();
+        Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter))
+    };
+    let px_cap = host.grant_host_proc_forkable(
+        px_handler,
+        opshift_fork(svm_posix::cap_fork_factory(&posix)),
+    );
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(gmod as i64), // the cmd-module slot — unused by this guest
+            Value::I32(px_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "the exit hook flipped the twin to a zombie: posix waitpid reaped it (WEXITSTATUS 7) \
+         and the pid is gone afterwards"
+    );
+}
+
+/// #798 slice 1 — **the shell's job-control loop, compiled C, fully in-guest and deterministic**:
+/// fork a two-process "pipeline job", `setpgid` both members into one group led by the first,
+/// `tcsetpgrp` the job to the foreground (readback via `tcgetpgrp`), observe the now-background
+/// shell's own stdout write ring its `SIGTTOU` doorbell (the write proceeds — the L0
+/// approximation until slice 2's stop), **Ctrl-C the job with one `kill(-pgid)`** (both members'
+/// doorbells ring, each exits with its own status), take the terminal back, and reap both members
+/// through `waitpid`. Everything is L0 polling — no signal stack anywhere, so nothing dispatches
+/// async and no embedder thread is needed; the run is single-threaded deterministic.
+const JOB_CONTROL_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static long p1;
+static long p2;
+static long h;
+static long msg;
+static int status;
+int main(int argc, char **argv) {
+  /* Catch 10 BEFORE forking — the disposition is inherited (POSIX), so the group ^C below can
+   * never find SIG_DFL in a member that has not yet re-installed its own token. #796 made that
+   * matter: an uncaught signal 10 now runs its default action (terminate) instead of pending. */
+  __vm_fs(30, 10, 6, 0, 0);
+  while ((p1 = fork()) < 0);
+  if (p1 == 0) {
+    __vm_fs(30, 10, 7, 0, 0);                 /* member 1: re-catch with its own L0 token */
+    while (__vm_fs(32, 0, 0, 0, 0) != 7);     /* spin on the doorbell */
+    return 5;
+  }
+  while ((p2 = fork()) < 0);
+  if (p2 == 0) {
+    __vm_fs(30, 10, 8, 0, 0);                 /* member 2: its own token */
+    while (__vm_fs(32, 0, 0, 0, 0) != 8);
+    return 6;
+  }
+  /* Build the job: both children into a group led by the first; foreground it. */
+  if (__vm_fs(45, p1, p1, 0, 0) != 0) return 1;   /* setpgid(c1, c1): group leader */
+  if (__vm_fs(45, p2, p1, 0, 0) != 0) return 2;   /* setpgid(c2, c1): join the job */
+  if (__vm_fs(46, p2, 0, 0, 0) != p1) return 3;   /* getpgid(c2) == the job group */
+  if (__vm_fs(48, 1, p1, 0, 0) != 0) return 4;    /* tcsetpgrp(stdout, job) */
+  if (__vm_fs(47, 1, 0, 0, 0) != p1) return 7;    /* tcgetpgrp readback */
+  /* The shell is background now: its own stdout write rings SIGTTOU (and proceeds). */
+  __vm_fs(30, 22, 9, 0, 0);                       /* catch SIGTTOU (token 9) */
+  msg = 0x0a24;                                   /* "$\n" */
+  if (__vm_fs(0, 1, (long)&msg, 2, 0) != 2) return 8;
+  if (__vm_fs(32, 0, 0, 0, 0) != 9) return 9;     /* the TTOU doorbell rang */
+  /* ^C the job: ONE group kill reaches both members. */
+  if (__vm_fs(31, -p1, 10, 0, 0) != 0) return 10;
+  /* Take the terminal back (own group, occupied by us) and reap the job. */
+  if (__vm_fs(48, 1, 1, 0, 0) != 0) return 11;
+  while ((h = __vm_fs(28, p1, (long)&status, 0, 0)) == -10);
+  if (h != p1 || ((status >> 8) & 0xff) != 5) return 12;
+  while ((h = __vm_fs(28, p2, (long)&status, 0, 0)) == -10);
+  if (h != p2 || ((status >> 8) & 0xff) != 6) return 13;
+  return 42;
+}
+"#;
+
+#[test]
+fn a_compiled_c_shell_runs_the_job_control_loop() {
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let guest_src = format!("{FORK_SHIM}\n{JOB_CONTROL_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse job-control guest");
+    verify_module(&guest).expect("verify job-control guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let (posix, make) = svm_posix::cap(4096, 1 << 16, Vec::new());
+    let make = Arc::new(make);
+    let px_handler: svm_interp::HostProc = {
+        let mut inner = make();
+        Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter))
+    };
+    let px_cap = host.grant_host_proc_forkable(
+        px_handler,
+        opshift_fork(svm_posix::cap_fork_factory(&posix)),
+    );
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(gmod as i64), // the cmd-module slot — unused by this guest
+            Value::I32(px_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "the job-control loop end to end: setpgid the job, tcsetpgrp foreground, the background \
+         shell's TTOU doorbell, kill(-pgid) reaching BOTH members, terminal back, both reaped"
+    );
+    // The backgrounded shell's write proceeded (the L0 doorbell, not a stop): it reached stdout.
+    assert_eq!(
+        posix.stdout(),
+        b"$\n",
+        "the background write went through to the captured terminal"
+    );
+}
+
+/// #798 slice 2 — **Ctrl-Z / `fg` in compiled C: the stop actually stops the domain.** The parent
+/// forks a child that spins on its `sigcheck` doorbell, then:
+///
+/// 1. `kill(child, SIGTSTP)` — default disposition ⇒ the child's domain STOPS (the core parks it
+///    at its next per-op poll).
+/// 2. `waitpid(-1, WUNTRACED)` reports the stop (`SIGTSTP<<8 | 0x7f`) — and only once.
+/// 3. `kill(child, 10)` — delivered **while stopped**, so it must be HELD: the child, were it
+///    secretly still running, would consume it and exit. A long busy-wait gives the cooperative
+///    scheduler every chance to run it; `waitpid(child, 0)` still `-ECHILD` is the proof of
+///    stopped-ness (the interp would happily have scheduled a runnable child during the wait).
+/// 4. `kill(child, SIGCONT)` — the domain resumes, the HELD signal delivers, the child exits 5;
+///    `waitpid(WCONTINUED)` reports the continue (`0xffff`), then the reap collects the 5.
+///
+/// Fully in-guest and deterministic (L0 polling, no signal stacks, no embedder thread).
+const CTRL_Z_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static long pid;
+static long r;
+static int status;
+static long i;
+static volatile long sink;
+int main(int argc, char **argv) {
+  /* Pre-install a caught disposition for 10 — inherited by the twin, so the held-while-stopped
+   * 10 below can never sit as SIG_DFL (#796: the SIGCONT would then run the default action —
+   * terminate — instead of delivering it). The child re-installs its own token before reading. */
+  __vm_fs(30, 10, 6, 0, 0);
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    __vm_fs(30, 10, 7, 0, 0);                  /* catch 10 (its own L0 token) */
+    while (__vm_fs(32, 0, 0, 0, 0) != 7);      /* spin until it delivers */
+    return 5;
+  }
+  if (__vm_fs(31, pid, 20, 0, 0) != 0) return 1;        /* kill(child, SIGTSTP): stop */
+  r = __vm_fs(28, -1, (long)&status, 2, 0);             /* waitpid(-1, WUNTRACED) */
+  if (r != pid) return 2;
+  if ((status & 0xff) != 0x7f) return 3;                /* stopped marker */
+  if (((status >> 8) & 0xff) != 20) return 4;           /* by SIGTSTP */
+  if (__vm_fs(28, -1, (long)&status, 2, 0) != -10) return 6;  /* report-once */
+  if (__vm_fs(31, pid, 10, 0, 0) != 0) return 7;        /* the 10 lands while stopped: HELD */
+  for (i = 0; i < 200000; i = i + 1) sink = i;          /* every chance to run, were it runnable */
+  if (__vm_fs(28, pid, (long)&status, 0, 0) != -10) return 8;  /* still alive: truly stopped */
+  if (__vm_fs(31, pid, 18, 0, 0) != 0) return 9;        /* kill(child, SIGCONT): resume */
+  while ((r = __vm_fs(28, pid, (long)&status, 8, 0)) == -10);  /* waitpid(pid, WCONTINUED) */
+  if (r == pid && status == 0xffff) {
+    while ((r = __vm_fs(28, pid, (long)&status, 0, 0)) == -10);  /* now the real reap */
+  }
+  if (r != pid) return 10;
+  if (((status >> 8) & 0xff) != 5) return 11;           /* the held 10 delivered post-continue */
+  return 42;
+}
+"#;
+
+#[test]
+fn ctrl_z_stops_a_forked_child_and_fg_resumes_it() {
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let guest_src = format!("{FORK_SHIM}\n{CTRL_Z_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse ctrl-z guest");
+    verify_module(&guest).expect("verify ctrl-z guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let (posix, make) = svm_posix::cap(4096, 1 << 16, Vec::new());
+    let make = Arc::new(make);
+    let px_handler: svm_interp::HostProc = {
+        let mut inner = make();
+        Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter))
+    };
+    let px_cap = host.grant_host_proc_forkable(
+        px_handler,
+        opshift_fork(svm_posix::cap_fork_factory(&posix)),
+    );
+
+    let mut fuel = 220_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(gmod as i64), // the cmd-module slot — unused by this guest
+            Value::I32(px_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "Ctrl-Z: the child STOPPED (a signal sent while stopped was held through a long busy-wait \
+         — a runnable child would have consumed it and exited), WUNTRACED reported it once, \
+         SIGCONT resumed it, WCONTINUED reported, and the held signal delivered post-continue"
     );
 }

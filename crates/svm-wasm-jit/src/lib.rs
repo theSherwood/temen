@@ -1907,7 +1907,35 @@ pub fn compile_module_tierup_caps(
     shared_memory: bool,
     nested_caps: bool,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
-    compile_module_tierup_inner(m, shared_memory, nested_caps, None)
+    compile_module_tierup_inner(m, shared_memory, nested_caps, None, None)
+}
+
+/// #880 — [`compile_module_tierup`] over the **shared reserved table** (§22 Model B2): the emitted
+/// module *imports* `env.__indirect_function_table` (sized `1 << table_log2`, the domain's
+/// reservation) instead of declaring a local identity table, and — the point — the
+/// `all_in_subset || !uses_indirect` candidate restriction is **dropped**: a `call_indirect`-bearing
+/// function tiers up, because under a host-populated table every slot resolves *correctly*
+/// regardless of the emit split — an emitted target is a native funcref (an installed unit's `f0`,
+/// another `f{i}`), an interpreter-resident target is a live-state bounce shim
+/// ([`emit_slot_trampoline`]), and an empty slot is a null-funcref trap, exactly the interpreter's
+/// `TABLE_EMPTY`. This is what lets a program's hot **dispatch loop** (the language-runtime shape)
+/// run on the emitted tier, including the old→new edge into installed units. The host owns slot
+/// population and must keep the table exact at every entry to emitted code (the single-shot pump
+/// syncs at event boundaries — installs only happen between events).
+///
+/// #888 — this mode also **widens the cross-tier set** to the reactor's `cross` (every
+/// [`marshallable_sig`] non-in-subset function, not just the strict memory-free [`interp_leaf`]),
+/// collapsing the fixpoint cascade so an in-subset function that calls a memory/cap helper stays
+/// emitted. **Contract:** the host must therefore service `env.call_interp` over the run's **LIVE**
+/// window/powerbox/fuel (the pump's `svm_onramp_tierup_call_interp` → the live-state bounce) — the
+/// same contract the bounce shims already impose — not the throwaway-window bounce the leaf-only
+/// drivers use.
+pub fn compile_module_tierup_b2(
+    m: &Module,
+    shared_memory: bool,
+    table_log2: u32,
+) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    compile_module_tierup_inner(m, shared_memory, false, None, Some(table_log2))
 }
 
 /// The **opt-in gated software page-check** entry (#750): like [`compile_module_tierup`], but the
@@ -1930,7 +1958,7 @@ pub fn compile_module_tierup_paged(
     shared_memory: bool,
     page_log2: u8,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
-    compile_module_tierup_inner(m, shared_memory, false, Some(page_log2))
+    compile_module_tierup_inner(m, shared_memory, false, Some(page_log2), None)
 }
 
 fn compile_module_tierup_inner(
@@ -1938,6 +1966,7 @@ fn compile_module_tierup_inner(
     shared_memory: bool,
     nested_caps: bool,
     paged: Option<u8>,
+    reserved_table_log2: Option<u32>,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
     let n = m.funcs.len();
     // Track 3 (c)+(a): a page-op module (`map`/`unmap`/`protect`) can't be accelerated on the
@@ -1986,8 +2015,28 @@ fn compile_module_tierup_inner(
             }
         }
     }
+    // The cross-tier set — functions an emitted `Call`/`call_indirect` routes to `env.call_interp`.
+    // Two widths, by who services the bounce:
+    //   * **local table** (`reserved_table_log2 == None`): the strict [`interp_leaf`] set —
+    //     memory-free, call-free, cap-free — because the leaf-only drivers run a bounce over a
+    //     *throwaway* window (a memory-touching leaf would diverge from the shared one).
+    //   * **shared reserved table** (#888, B2 mode — `compile_module_tierup_b2`): the reactor's
+    //     `cross` set — **any** [`marshallable_sig`] non-in-subset function. This mode's host
+    //     services `env.call_interp` over the run's **LIVE** window/powerbox/fuel (the pump's
+    //     `svm_onramp_tierup_call_interp` → the #846/#880 live-state bounce), exactly
+    //     [`compile_module_reactor`]'s contract, so a cross-tier callee may touch memory, make
+    //     calls, and cap-call. Widening here collapses the fixpoint cascade below: an in-subset
+    //     function that calls a memory/cap helper stays emitted instead of being dropped
+    //     (#887 measured this as ~30% → ~90% static coverage on the C-family cards).
     let leaf: Vec<bool> = (0..n)
-        .map(|i| !in_subset[i] && interp_leaf(&m.funcs[i]))
+        .map(|i| {
+            !in_subset[i]
+                && if reserved_table_log2.is_some() {
+                    marshallable_sig(&m.funcs[i])
+                } else {
+                    interp_leaf(&m.funcs[i])
+                }
+        })
         .collect();
     let all_in_subset = in_subset.iter().all(|&s| s);
     // Emitted functions follow the import block; the nested layout adds the §14/§11 bounce imports.
@@ -1997,11 +2046,19 @@ fn compile_module_tierup_inner(
         IMPORTED_FUNCS
     };
 
-    // Optimistic start: every in-subset function is a candidate. A `call_indirect` can dispatch to any
-    // identity-table slot, so a function that uses one is only safe to emit when every function is
-    // in-subset (all slots resolve); otherwise drop it (and the emitted module needs no table).
+    // Optimistic start: every in-subset function is a candidate. A `call_indirect` can dispatch to
+    // any identity-table slot, so under the **local** table a function that uses one is only safe to
+    // emit when every function is in-subset (all slots resolve); under the **shared reserved** table
+    // (#880 — `compile_module_tierup_b2`) the restriction lifts: the host populates every slot
+    // correctly (native funcref / bounce shim / trapping null), so indirect dispatch is always
+    // routable and dispatch-loop functions tier up.
     let mut emit: Vec<bool> = (0..n)
-        .map(|i| in_subset[i] && (all_in_subset || !func_uses_indirect(&m.funcs[i])))
+        .map(|i| {
+            in_subset[i]
+                && (reserved_table_log2.is_some()
+                    || all_in_subset
+                    || !func_uses_indirect(&m.funcs[i]))
+        })
         .collect();
     // Fixpoint: drop any candidate that directly calls a function which is neither still a candidate
     // nor a cross-tier leaf — its emitted body would have an unroutable `Call`. Monotone (only
@@ -2040,7 +2097,7 @@ fn compile_module_tierup_inner(
         &emitted,
         &wasm_of,
         &leaf,
-        None,
+        reserved_table_log2,
         nested_caps,
         FuelMode::Global,
         paged,
@@ -2629,6 +2686,78 @@ fn emit_module(
     }
     section(&mut out, 10, &sec);
 
+    // Name section (custom id 0, "name", function-names subsection) — names each emitted wasm function by
+    // its **export symbol name** (`lua_checkstack`, `JS_CallInternal` …), plus the cross-tier trampolines
+    // (`xtramp_gfN`) and the `()->()` trap stub (`TRAP_STUB`). Diagnostic-only and cheap: a V8 wasm stack
+    // trace — e.g. a `svm_warm_jit` decline (issue #865) — then names the culprit function instead of a
+    // bare `wasm-function[N]`. `wasm_of[fi]` is the final wasm index (it already accounts for the function
+    // imports), so it is the name-section funcidx directly; `env.trap`/`env.call_interp` are always
+    // imports 0/1.
+    //
+    // Name precedence (#907): a DWARF source name (a `-g` build's `debug_info.func_names`, the reserved
+    // level-2 rung) → the function's export symbol name → the guest index `gf{fi}`. Every defined function
+    // is exported by its symbol name (translate's `exports` = one entry per defined function), so the real
+    // names already ship in every `.svmb` via the semantic exports table — no `-g` flag, no format change,
+    // no extra bytes. `gf{fi}` remains only for an *unexported* emitted function (a synthesized helper /
+    // trampoline). Built once into maps: a real module's `exports` runs to thousands of entries.
+    {
+        use std::collections::HashMap;
+        let dwarf: HashMap<u32, &str> = m
+            .debug_info
+            .as_ref()
+            .map(|d| {
+                d.func_names
+                    .iter()
+                    .map(|f| (f.func, f.name.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let export_name: HashMap<u32, &str> = m
+            .exports
+            .iter()
+            .map(|e| (e.func, e.name.as_str()))
+            .collect();
+        let src_name = |fi: usize| -> String {
+            let fi = fi as u32;
+            dwarf
+                .get(&fi)
+                .or_else(|| export_name.get(&fi))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("gf{fi}"))
+        };
+        let mut ents: Vec<(u32, String)> = vec![
+            (0, "env.trap".to_string()),
+            (1, "env.call_interp".to_string()),
+        ];
+        for fi in 0..m.funcs.len() {
+            if let Some(w) = wasm_of[fi] {
+                ents.push((w, src_name(fi)));
+            }
+            if let Some(w) = tramp_of[fi] {
+                ents.push((w, format!("xtramp_gf{fi}")));
+            }
+        }
+        if let Some(w) = trap_stub_widx {
+            ents.push((w, "TRAP_STUB".to_string()));
+        }
+        ents.sort_by_key(|(w, _)| *w);
+        ents.dedup_by_key(|(w, _)| *w);
+        let mut names_sub = Vec::new();
+        uleb(&mut names_sub, ents.len() as u64);
+        for (w, nm) in &ents {
+            uleb(&mut names_sub, *w as u64);
+            uleb(&mut names_sub, nm.len() as u64);
+            names_sub.extend_from_slice(nm.as_bytes());
+        }
+        let mut payload = Vec::new();
+        uleb(&mut payload, 4);
+        payload.extend_from_slice(b"name");
+        payload.push(0x01); // subsection 1: function names
+        uleb(&mut payload, names_sub.len() as u64);
+        payload.extend_from_slice(&names_sub);
+        section(&mut out, 0, &payload);
+    }
+
     Ok(out)
 }
 
@@ -2717,6 +2846,102 @@ fn emit_trap_stub() -> Vec<u8> {
     code.push(0x00); // unreachable
     code.push(OP_END);
     code
+}
+
+/// #846 — a standalone **cross-tier trampoline module**: one exported function `"t"` with the
+/// env-prepended `call_indirect` signature of `(params) -> (results)`, whose body marshals its
+/// params into the env scratch, calls `env.call_interp(target, args_ptr)`, and returns the
+/// reloaded result slots — the [`emit_trampoline`] body packaged as its own instantiable module,
+/// so a **host-populated** shared table (§22 Model B2) can route a slot whose occupant has no
+/// emitted wasm (a cross-tier program function, an interpreter-only installed unit) back to a
+/// **live-state** interpreter bounce. `target` is the value handed to `env.call_interp` — the
+/// dispatch-table slot, which for the natural prefix is the program function's own index. The
+/// import layout matches the emitted modules' (`env.memory`, `env.trap`, `env.call_interp`), so
+/// the one import object a host builds serves emitted units and trampolines alike; the host's
+/// `call_interp` signals a trap by throwing (unwinding the emitted frames), exactly the
+/// cross-tier convention everywhere. Rejects non-scalar and over-arity signatures — the i64-slot
+/// transport's limits (the host must gate such slots out before ever placing a trampoline).
+pub fn emit_slot_trampoline(
+    params: &[ValType],
+    results: &[ValType],
+    target: u32,
+    shared_memory: bool,
+) -> Result<Vec<u8>, Error> {
+    let scalar =
+        |t: &ValType| matches!(t, ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64);
+    if !params.iter().all(scalar) || !results.iter().all(scalar) {
+        return Err(Error::Unsupported("non-scalar trampoline signature"));
+    }
+    let sig = FuncType {
+        params: params.to_vec(),
+        results: results.to_vec(),
+    };
+    let f = Func {
+        params: params.to_vec(),
+        results: results.to_vec(),
+        blocks: Vec::new(),
+    };
+    let body = emit_trampoline(&f, target)?; // arity-guarded there (XCALL_MAX_SLOTS)
+
+    let mut out = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]; // \0asm v1
+
+    // Type section (1): t0 = env.trap (i32)->(), t1 = env.call_interp (i32,i32)->(), t2 = the
+    // trampoline's env-prepended signature.
+    let (tp, tr) = indirect_type_bytes(&sig)?;
+    let mut sec = Vec::new();
+    uleb(&mut sec, 3);
+    sec.extend_from_slice(&[0x60, 0x01, 0x7f, 0x00]); // (i32) -> ()
+    sec.extend_from_slice(&[0x60, 0x02, 0x7f, 0x7f, 0x00]); // (i32, i32) -> ()
+    sec.push(0x60);
+    uleb(&mut sec, tp.len() as u64);
+    sec.extend_from_slice(&tp);
+    uleb(&mut sec, tr.len() as u64);
+    sec.extend_from_slice(&tr);
+    section(&mut out, 1, &sec);
+
+    // Import section (2): env.memory (share-matched), env.trap (func 0), env.call_interp (func 1)
+    // — [`emit_trampoline`]'s body calls func index 1, so the order must match [`emit_module`]'s.
+    let mut sec = Vec::new();
+    uleb(&mut sec, 3);
+    import_name(&mut sec, "env", "memory");
+    sec.push(0x02); // memory
+    if shared_memory {
+        sec.push(0x03); // shared + has-max
+        uleb(&mut sec, 0);
+        uleb(&mut sec, 65536);
+    } else {
+        sec.push(0x00); // min-only
+        uleb(&mut sec, 0);
+    }
+    import_name(&mut sec, "env", "trap");
+    sec.push(0x00); // func
+    uleb(&mut sec, 0);
+    import_name(&mut sec, "env", "call_interp");
+    sec.push(0x00); // func
+    uleb(&mut sec, 1);
+    section(&mut out, 2, &sec);
+
+    // Function (3), export (7: "t" → func index 2), code (10).
+    let mut sec = Vec::new();
+    uleb(&mut sec, 1);
+    uleb(&mut sec, 2); // type t2
+    section(&mut out, 3, &sec);
+
+    let mut sec = Vec::new();
+    uleb(&mut sec, 1);
+    uleb(&mut sec, 1);
+    sec.extend_from_slice(b"t");
+    sec.push(0x00); // func export
+    uleb(&mut sec, 2); // imports 0..=1 are funcs, ours is 2
+    section(&mut out, 7, &sec);
+
+    let mut sec = Vec::new();
+    uleb(&mut sec, 1);
+    uleb(&mut sec, body.len() as u64);
+    sec.extend_from_slice(&body);
+    section(&mut out, 10, &sec);
+
+    Ok(out)
 }
 
 /// The wasm function-type of a `call_indirect` signature: the two prepended env params (`win`,

@@ -321,7 +321,7 @@ pub fn compile_whole_object(unit: &WholeModule) -> Result<Vec<u8>, LengError> {
 /// **Cross-module type resolution**: proc and data symbols resolve at *link* time, but an aggregate
 /// **type**'s layout is needed at *translate* time (field offsets are baked into loads/stores). So
 /// before translating any unit, every unit's `(type …)` defs are pooled under their stem-suffixed
-/// global names ([`translate::Translator::export_types`]) and made available to all — a module
+/// global names ([`translate::Translator::export_types_pooled`]) and made available to all — a module
 /// constructing a `string.0.sysvq0asl` gets the system module's layout automatically, with no
 /// hand-supplied prelude.
 fn link_selected(units: &[(&str, &str, Select)]) -> Result<Module, LengError> {
@@ -374,7 +374,33 @@ fn link_selected_with_extra(
     manifest: bool,
     synth_start: bool,
 ) -> Result<Module, LengError> {
-    let mut pooled = Vec::new();
+    // Cross-module aggregate type layouts. Unlike the other pools, an object type can *inherit* a
+    // base defined in another unit (`JsonParser = object of BaseLexer`, `BaseLexer` in a sibling
+    // module), and the base is inlined into the derived layout at translate time — so a single
+    // per-module pass exports a lossy layout (missing every inherited field) whenever the base is
+    // cross-module. Pool to a **fixpoint** instead: each round re-exports with the prior round's
+    // pool visible, so a chain of any depth is fully inlined. Inlining only *adds* fields, so the
+    // summed field count is monotonic and converges; the unit count bounds the max chain depth.
+    let roots: Vec<_> = units
+        .iter()
+        .map(|(_, src, _)| nif::parse(src).map_err(LengError::Parse))
+        .collect::<Result<_, _>>()?;
+    let mut pooled: Vec<(String, translate::Layout)> = Vec::new();
+    let mut prev_fields = usize::MAX;
+    for _ in 0..=units.len() {
+        let mut next: Vec<(String, translate::Layout)> = Vec::new();
+        for ((stem, _, _), root) in units.iter().zip(&roots) {
+            next.extend(translate::Translator::export_types_pooled(
+                root, stem, &pooled,
+            )?);
+        }
+        let fields: usize = next.iter().map(|(_, l)| l.field_count()).sum();
+        pooled = next;
+        if fields == prev_fields {
+            break;
+        }
+        prev_fields = fields;
+    }
     let mut pooled_funcrefs = Vec::new();
     // Frame-graph nodes across all units: (global_name, own_needs_frame, global_callees).
     let mut frame_nodes: Vec<(String, bool, Vec<String>)> = Vec::new();
@@ -393,7 +419,6 @@ fn link_selected_with_extra(
     let mut pooled_consts: Vec<(String, i64)> = Vec::new();
     for (stem, src, _) in units {
         let root = nif::parse(src).map_err(LengError::Parse)?;
-        pooled.extend(translate::Translator::export_types(&root, stem)?);
         pooled_funcrefs.extend(translate::Translator::export_funcrefs(&root, stem)?);
         pooled_sret.extend(translate::Translator::export_sret_procs(&root, stem)?);
         pooled_consts.extend(translate::Translator::export_consts(&root, stem)?);
@@ -577,6 +602,141 @@ pub fn link_whole_powerbox_manifest(
         .map(|u| (u.stem, u.src, Select::Whole))
         .collect();
     link_selected_with_extra(&sel, runtime, false, true, true)
+}
+
+/// The **pure-compute C bottom edge** as SVM-text funcs — nimony's `memcpy`/`memcmp`/`memset`,
+/// the `atomic*` family, `bswap64`/`ctz64`/`clz64`, and a **bump `mmap`** (serves from the powerbox
+/// heap-brk word) — plus stubbed `exit`/`getpid`/`kill`/`cWriteErr`/`dl*`. Linked into a nim program
+/// so those leaves resolve to compiled code; only the true syscalls are left for the host.
+const POWERBOX_COMPUTE_SHIM: &str = include_str!("powerbox_compute_shim.svm.txt");
+
+/// The compute-shim func index serving each pure-compute leaf (longest-prefix match — so
+/// `atomicCompareExchangeN` isn't shadowed by a shorter atomic). The func order is
+/// [`POWERBOX_COMPUTE_SHIM`]'s.
+const COMPUTE_LEAVES: &[(&str, u32)] = &[
+    ("cExitSys", 0),
+    ("cGetpid", 1),
+    ("cKill", 2),
+    ("c_memcpy", 3),
+    ("c_memcmp", 4),
+    ("c_memset", 5),
+    ("mmap", 6),
+    ("atomicLoadN", 7),
+    ("atomicStoreN", 8),
+    ("atomicCompareExchangeN", 9),
+    ("atomicExchangeN", 10),
+    ("atomicAddFetch", 11),
+    ("atomicSubFetch", 12),
+    ("bswap64", 13),
+    ("ctz64", 14),
+    ("clz64", 15),
+    ("cWriteErr", 16),
+    ("dlopen", 17),
+    ("dlclose", 18),
+    ("dlsym", 19),
+];
+
+/// The **syscall adapter** unit. nimony spells its bottom-edge syscalls `sysWrite(fd, buf, len)` (etc.,
+/// the C `write` ABI), but the §3e powerbox's STREAM `write` cap is `(buf, len) -> n` — no `fd`. This
+/// unit reconciles the two: `nimWrite` (func 0) drops `fd` and tail-calls the powerbox `write` (its
+/// one import), so the cap sees the shape it expects; the file-op syscalls `read`/`close`/`open`/
+/// `lseek` (funcs 1–4) — imported by `syncio` but never reached by a stdout-only program — resolve to
+/// harmless stubs (EOF / success / -1). The powerbox binds the retained `write` STREAM cap at run, so
+/// the program writes to the real host stdout. Func order is fixed; [`link_nim_powerbox`] maps the
+/// retained `sysWrite`/`sysRead`/`sysClose`/`sysOpen`/`sysLseek` names onto it.
+const SYSCALL_ADAPTER: &str = "\
+import 0 \"write\" (i64, i64) -> (i64)
+
+func (i32, i64, i64) -> (i64) { block 0 (v0: i32, v1: i64, v2: i64) { v3 = call.import 0 (v1, v2) return v3 } }
+func (i32, i64, i64) -> (i64) { block 0 (v0: i32, v1: i64, v2: i64) { v3 = i64.const 0 return v3 } }
+func (i32) -> (i32) { block 0 (v0: i32) { v1 = i32.const 0 return v1 } }
+func (i64, i32, i64) -> (i32) { block 0 (v0: i64, v1: i32, v2: i64) { v3 = i32.const -1 return v3 } }
+func (i32, i64, i32) -> (i64) { block 0 (v0: i32, v1: i64, v2: i32) { v3 = i64.const -1 return v3 } }";
+
+/// The compute-shim func index for a bottom-edge leaf import `name`, or `None` for a name the shim
+/// doesn't serve (the true syscalls — those go to the adapter / powerbox).
+fn compute_leaf_index(name: &str) -> Option<u32> {
+    COMPUTE_LEAVES
+        .iter()
+        .filter(|(p, _)| name.starts_with(p))
+        .max_by_key(|(p, _)| p.len())
+        .map(|(_, i)| *i)
+}
+
+/// Link whole nimony modules into a **powerbox-runnable module** — the shape `svm_run::run_powerbox`
+/// (and the browser's `svm_run_onramp`) executes with the host granting stdout, so a real Nim I/O
+/// program *prints for real* with no custom personality.
+///
+/// [`link_whole_with_runtime`] binds *every* bottom-edge leaf to a pure-IR shim (a self-contained
+/// module for the offline runner). This instead splits the bottom edge the way the powerbox wants it:
+/// the **pure-compute leaves** (memcpy/atomics/bswap/bump-`mmap`/…) resolve to [`POWERBOX_COMPUTE_SHIM`],
+/// while the **syscalls** route through [`SYSCALL_ADAPTER`], which reconciles nimony's
+/// `sysWrite(fd,buf,len)` with the §3e powerbox STREAM `write(buf,len)` cap and leaves that cap a
+/// bound-at-run manifest import (`write`). The merged module is a powerbox entry (`_start` at func 0).
+///
+/// Two link passes: the first (compute shim only) surfaces the retained syscall imports — their nim
+/// names (`sysWrite.0.` …) aren't known until link — then the adapter is bound onto them and the whole
+/// thing re-linked. Re-verify the result like any linked output (the caller runs `run_powerbox`, which
+/// verifies).
+pub fn link_nim_powerbox(units: &[WholeModule]) -> Result<Module, LengError> {
+    // The compute shim must know which leaf names to export; discover them from the `system` unit's
+    // own compiled imports (every pure-compute leaf originates there — a self-contained module that
+    // compiles standalone, unlike a program unit that references a sibling's aggregate type).
+    let sys = units
+        .iter()
+        .find(|u| u.stem.starts_with("sysv"))
+        .ok_or_else(|| LengError::Malformed("no `system` unit (stem `sysv…`) to link".into()))?;
+    let sys_obj = svm_encode::decode_unit(&compile_whole_object(sys)?)
+        .map_err(|e| LengError::Malformed(format!("decode system object: {e:?}")))?;
+    let mut compute_exports: Vec<(String, u32)> = Vec::new();
+    for imp in &sys_obj.imports {
+        if let Some(i) = compute_leaf_index(&imp.name) {
+            if compute_exports.iter().all(|(n, _)| n != &imp.name) {
+                compute_exports.push((imp.name.clone(), i));
+            }
+        }
+    }
+    let compute_unit = |exports: Vec<(String, u32)>| -> Result<svm_ir::LinkUnit, LengError> {
+        let module = svm_text::parse_module(POWERBOX_COMPUTE_SHIM)
+            .map_err(|e| LengError::Malformed(format!("compute shim parse: {e:?}")))?;
+        Ok(svm_ir::LinkUnit {
+            module,
+            exports,
+            ..Default::default()
+        })
+    };
+
+    // Pass 1: link with only the compute shim, so the true syscalls survive as retained imports.
+    let m1 = link_whole_powerbox_manifest(units, vec![compute_unit(compute_exports.clone())?])?;
+
+    // Map each retained syscall onto the adapter's fixed func order.
+    let mut adapter_exports: Vec<(String, u32)> = Vec::new();
+    for imp in &m1.imports {
+        let n = &imp.name;
+        let f = if n.starts_with("sysWrite") {
+            0
+        } else if n.starts_with("sysRead") {
+            1
+        } else if n.starts_with("sysClose") {
+            2
+        } else if n.starts_with("sysOpen") {
+            3
+        } else if n.starts_with("sysLseek") {
+            4
+        } else {
+            continue; // anything else stays a manifest import the powerbox binds (write) or rejects
+        };
+        adapter_exports.push((n.clone(), f));
+    }
+    let adapter = svm_ir::LinkUnit {
+        module: svm_text::parse_module(SYSCALL_ADAPTER)
+            .map_err(|e| LengError::Malformed(format!("syscall adapter parse: {e:?}")))?,
+        exports: adapter_exports,
+        ..Default::default()
+    };
+
+    // Pass 2: link with the compute shim + the adapter. Only the powerbox `write` cap is left.
+    link_whole_powerbox_manifest(units, vec![compute_unit(compute_exports)?, adapter])
 }
 
 /// **Link several nimony modules in Tier-2 TLS mode** (NIM.md §3d) together with a runtime that

@@ -2766,6 +2766,12 @@ pub struct Vcpu<'p> {
     /// A §22 JIT op awaiting its `deliver_jit_*` (carries the op's dst + parameters across the
     /// host round-trip). Distinct from `pending` because the reply payload is richer than one register.
     pending_jit: Option<PendingJit>,
+    /// #846 — the **emitted-invoke** fiber registry: while a codegen host services a
+    /// [`VcpuEvent::JitInvoke`] on emitted wasm, each cross-tier callback it bounces back here
+    /// ([`bounce_call`](Vcpu::bounce_call)) shares this registry, so a fiber parked by one callback
+    /// is resumable by a later one — the same one-registry-per-invoke scope the interpreted
+    /// `run_invoke` has by construction. Cleared when the invoke resolves (`deliver_jit_invoke_*`).
+    invoke_fibers: Vec<FiberState>,
     /// A trap to surface on the next `run` (a joined child trap propagates to the joiner).
     trap: Option<Trap>,
     /// **wasm-JIT tier-up eligibility** (browser wasm-JIT threads slice). When set, `jit_eligible[f]`
@@ -2971,6 +2977,7 @@ impl<'p> Vcpu<'p> {
             prog,
             pending: None,
             pending_jit: None,
+            invoke_fibers: Vec::new(),
             trap: None,
             jit_eligible: None,
             jit_page_checked: false,
@@ -3046,6 +3053,7 @@ impl<'p> Vcpu<'p> {
             prog,
             pending: None,
             pending_jit: None,
+            invoke_fibers: Vec::new(),
             trap: None,
             jit_eligible: None,
             jit_page_checked: false,
@@ -3704,6 +3712,7 @@ impl<'p> Vcpu<'p> {
     /// args)`) calls this with the emitted region's results; a host that interprets calls the other.
     /// Too few results is a `Malformed` trap (a mis-marshalled host reply).
     pub fn deliver_jit_invoke_vals(&mut self, vals: &[i64]) {
+        self.invoke_fibers.clear(); // the emitted invoke resolved — its bounce registry dies with it
         let Some(PendingJit::Invoke { results, dst, .. }) = self.pending_jit.take() else {
             panic!("deliver_jit_invoke_vals with no pending invoke");
         };
@@ -3718,11 +3727,108 @@ impl<'p> Vcpu<'p> {
         }
     }
 
+    /// #846 slice 1 — service **one cross-tier bounce** out of an emitted §22 unit: the codegen host
+    /// is mid-way through running a [`VcpuEvent::JitInvoke`] on emitted wasm (this vCPU is parked on
+    /// the pending invoke), and the unit reached a call the emit routed to `env.call_interp` — a
+    /// trampoline'd `call_indirect` target or a cross-tier direct call. `target` resolves through
+    /// the **shared dispatch table** exactly as [`Op::CallIndirect`] does (the natural prefix maps a
+    /// program function's index to itself; an installed unit sits at its install slot; empty padding
+    /// is an `IndirectCallType` trap), and the resolved function runs on a nested interpretation
+    /// over this vCPU's **live** window/powerbox/fuel — observably identical to the same call inside
+    /// an interpreted invoke. Fibers are serviced against the persistent emitted-invoke registry
+    /// ([`invoke_fibers`](Vcpu::invoke_fibers)), so a fiber parked by one callback is resumable by a
+    /// later one within the same invoke.
+    ///
+    /// `io` carries the i64 arg slots in and the result slots out (the `env.call_interp` scratch
+    /// ABI — floats by bits, i32s in the low half). Returns the result count. `Err` is the
+    /// callback's trap — the host must unwind the emitted unit and deliver it via
+    /// [`deliver_jit_invoke_trap`](Vcpu::deliver_jit_invoke_trap) (an `Exit` included: it must
+    /// resolve the invoke as the interpreted path would, not be swallowed).
+    pub fn bounce_call(&mut self, target: u32, io: &mut [i64]) -> Result<usize, Trap> {
+        step(&mut self.fuel, None)?; // fuel unification: the dispatch-site safepoint
+        let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
+        let slot = (target as usize) & (dom.table.len() - 1);
+        let ts = dom.table.slot(slot);
+        if ts.module == super::TABLE_EMPTY {
+            return Err(Trap::IndirectCallType);
+        }
+        let tm = dom.source.get(ts.module as usize).ok_or(Trap::Malformed)?;
+        let (cp, cr) = tm.sigs[ts.func as usize].clone();
+        if cp.len() > io.len() || cr.len() > io.len() {
+            return Err(Trap::Malformed); // scratch too small — a mis-marshalled host call
+        }
+        // The i64-slot transport carries scalars only; a v128-sig target can never have been given
+        // a trampoline (the host gates that at open) — a bounce naming one is a mis-wired host.
+        let scalar =
+            |t: &ValType| matches!(t, ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64);
+        if !cp.iter().all(scalar) || !cr.iter().all(scalar) {
+            return Err(Trap::Malformed);
+        }
+        let args: Vec<Value> = cp
+            .iter()
+            .zip(io.iter())
+            .map(|(ty, s)| slot_to_val(*ty, *s))
+            .collect();
+        let mut vm = Vm::new(&tm, ts.func as usize, &args)?;
+        vm.module = ts.module as usize;
+        let mut cell = match self.shared_host {
+            Some(m) => HostCell::Shared(m),
+            None => HostCell::Excl(&mut self.host),
+        };
+        // Registry context (#880): during an emitted **invoke**, callbacks share the
+        // invoke-confined registry (`run_invoke` parity — fibers die with the invoke). During an
+        // emitted **TIERUP region**, the callback is interpreted-inline-call territory: its fibers
+        // register in the vCPU's *run-level* registry (parallel arrays mirrored), so one created
+        // here persists for the run to resume later — exactly as the same call inline would.
+        let vals = if self.pending_jit.is_some() {
+            drive_nested(
+                &dom.source,
+                &dom.table,
+                vm,
+                &mut self.fuel,
+                &mut self.mem,
+                &mut cell,
+                &mut self.invoke_fibers,
+                None,
+            )?
+        } else {
+            drive_nested(
+                &dom.source,
+                &dom.table,
+                vm,
+                &mut self.fuel,
+                &mut self.mem,
+                &mut cell,
+                &mut self.fibers,
+                Some((&mut self.fiber_sp, &mut self.fiber_meta)),
+            )?
+        };
+        for (i, v) in vals.iter().enumerate() {
+            io[i] = val_to_slot(*v);
+        }
+        Ok(cr.len())
+    }
+
+    /// The window's committed **scalar extent** right now ([`Mem::scalar_extent`]) — the #717 value
+    /// the codegen host re-syncs to every live instance's `"mapped"` global after a
+    /// [`bounce_call`](Vcpu::bounce_call) (a bounced callback may have `vm_map`-grown the window
+    /// mid-invoke; the fan-out makes the growth visible to the emitted tier exactly when the
+    /// interpreted path would see it — after the call returns). `0` when the window state is no
+    /// longer scalar-representable — deny-everything, the diverge-toward-refusal posture
+    /// (INVARIANTS.md #9), or when there is no window.
+    pub fn window_scalar_extent(&self) -> u64 {
+        self.mem
+            .as_ref()
+            .and_then(|m| m.scalar_extent())
+            .unwrap_or(0)
+    }
+
     /// Deliver a **trap** from a host-run [`VcpuEvent::JitInvoke`] unit (the emitted region hit a
     /// guest `unreachable` / memory fault / div-by-zero / out-of-fuel, surfaced to the host as a
     /// catchable `RuntimeError`). The vCPU traps on its next `run`, exactly as an interpreted invoke
     /// trap would (`deliver_jit_invoke` sets `self.trap` on the unit's `Err`).
     pub fn deliver_jit_invoke_trap(&mut self, trap: Trap) {
+        self.invoke_fibers.clear(); // the emitted invoke resolved — its bounce registry dies with it
         self.pending_jit = None;
         self.trap = Some(trap);
     }
@@ -8187,11 +8293,51 @@ fn run_invoke(
     let unit = source.get(module).ok_or(Trap::Malformed)?;
     let mut active = Vm::new(&unit, 0, args)?;
     active.module = module;
-    // The invoke-confined fiber registry + resumer chain (`(resumer's fiber id, resumer, dst)`).
-    // Invariant: `chain` is non-empty iff `active` is a fiber (`active_id` then indexes `fibers`).
-    let mut fibers: Vec<FiberState> = Vec::new();
+    // The interpreted invoke completes synchronously, so its fiber registry is loop-local; the
+    // emitted-invoke bounce path threads the vCPU's persistent registry instead (`bounce_call`).
+    drive_nested(
+        source,
+        table,
+        active,
+        fuel,
+        mem,
+        host,
+        &mut Vec::new(),
+        None,
+    )
+}
+
+/// The shared nested-drive loop under [`run_invoke`] (an interpreted `Jit.invoke`) and
+/// [`Vcpu::bounce_call`] (#846 — one cross-tier callback out of an *emitted* unit): drive `active`
+/// to completion over the shared window/powerbox/dispatch-table, servicing fibers against `fibers`.
+/// The registry is caller-owned so the bounce path can persist it across the several bounces of one
+/// emitted invoke (a fiber parked by one callback is resumable by a later one — exactly the
+/// one-registry-per-invoke scope the interpreted loop has by construction).
+/// The run-level parallel-array halves `drive_nested` mirrors in run-registry mode (#880): the
+/// fibers' durable shadow-SPs and their `(entry func, sp)` freeze metadata.
+type RunFiberMeta<'a> = (&'a mut Vec<u64>, &'a mut Vec<(i32, i64)>);
+
+#[allow(clippy::too_many_arguments)] // the nested-drive seam: window + registry halves, all borrowed
+fn drive_nested(
+    source: &ModuleSource,
+    table: &SharedSlots,
+    mut active: Vm,
+    fuel: &mut u64,
+    mem: &mut Option<Mem>,
+    host: &mut HostCell,
+    fibers: &mut Vec<FiberState>,
+    // #880 — `Some((fiber_sp, fiber_meta))` when `fibers` is the vCPU's **run-level** registry (a
+    // bounce out of a TIERUP region: the callback's fibers must persist for the run to resume
+    // later, exactly as the same call inline would register them). `ContNew` then mirrors
+    // `step_vcpu`'s parallel-array pushes so the run's bookkeeping stays index-aligned; the
+    // durability `shadow_switch` is deliberately absent — a bounce host is never a durable run
+    // (the pump), and the interpreted invoke path passes `None` (invoke-confined registry).
+    mut run_meta: Option<RunFiberMeta<'_>>,
+) -> Result<Vec<Value>, Trap> {
+    // The resumer chain (`(resumer's fiber id, resumer, dst)`). Invariant: `chain` is non-empty
+    // iff `active` is a fiber (`active_id` then indexes `fibers`).
     let mut chain: Vec<(usize, Vm, u32)> = Vec::new();
-    let mut active_id = usize::MAX; // sentinel while the unit entry itself is active
+    let mut active_id = usize::MAX; // sentinel while the root frame is active
     loop {
         match active.resume(source, table, fuel, mem, host, u64::MAX)? {
             Outcome::Done(vals) => match chain.pop() {
@@ -8222,6 +8368,15 @@ fn run_invoke(
                 }
                 let h = fibers.len() as i32;
                 fibers.push(FiberState::Pending { funcref, sp });
+                // Run-registry mode (#880): keep the parallel arrays index-aligned with the run's
+                // (`step_vcpu`'s ContNew arm, minus the durable shadow bookkeeping — see the
+                // `run_meta` doc above).
+                if let Some((fiber_sp, fiber_meta)) = run_meta.as_mut() {
+                    fiber_sp
+                        .push(super::shadow_region_base(h as usize + 1) + super::REGION_HEADER_LEN);
+                    let func_idx = (funcref as u32 as usize & source.primary().table_mask) as i32;
+                    fiber_meta.push((func_idx, sp));
+                }
                 active.set(dst, Reg::from_i32(h));
             }
             // Fibers here never event-park (every park surface faults or waits inline above), so
@@ -9528,6 +9683,9 @@ fn drive(
                     // Duplicate the caller's window (private copy — fork does not share memory) and
                     // powerbox (own handle namespace, shared `Arc` backings). A root caller (no env)
                     // or a non-forkable window/powerbox fails closed to a single reply.
+                    // The twin's pid is its task index (`twin_ti` below); nothing is pushed between
+                    // here and that push, so the fork factories learn it up front (#863 slice 2).
+                    let twin_pid = tasks.len() as u64;
                     let forked = if bare {
                         caller_env.and_then(|ck| {
                             let twin_mem = match &extra_envs[ck].mem {
@@ -9538,7 +9696,7 @@ fn drive(
                                 .host
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
-                                .fork_powerbox()?;
+                                .fork_powerbox(twin_pid)?;
                             Some((ck, twin_mem, twin_host))
                         })
                     } else {

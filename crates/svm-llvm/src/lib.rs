@@ -1425,14 +1425,29 @@ fn const_eval(
         K::Mul(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_mul(b)),
         // Bitwise + left-shift constexprs (e.g. alignment masks `and(ptrtoint(@g), -16)`). All fold
         // correctly in i64 and mask to the result width at the consumer, since `and`/`or`/`xor`/`shl`
-        // commute with keeping the low N bits (unlike a right shift, which is width-sensitive — those
-        // are deferred). The shift amount is masked to the operand width by `wrapping_shl`.
+        // commute with keeping the low N bits (unlike a right shift, below). The shift amount is masked
+        // to the operand width by `wrapping_shl`.
         K::And(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a & b),
         K::Or(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a | b),
         K::Xor(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a ^ b),
         K::Shl(x) => {
             bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_shl(b as u32))
         }
+        // Right-shift constexprs are **width-sensitive** (the fill bit and the shift range depend on
+        // `operand0`'s bit width), unlike the width-agnostic bitwise ops above. `lshr` zero-fills:
+        // read `operand0` as unsigned at its width (`mask_low` clears the bits above it) then shift
+        // logically. `ashr` sign-fills: sign-extend `operand0` from its width to i64 (`sign_extend`)
+        // then shift arithmetically, so the fill comes from bit `bits-1`. A shift ≥ width is poison in
+        // LLVM (a well-formed module never emits one); `wrapping_shr`'s `& 63` is a no-op for the
+        // in-range amounts these actually carry.
+        K::LShr(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| {
+            let bits = int_bits(x.operand0.get_type(types).as_ref());
+            (mask_low(a, bits) as u64).wrapping_shr(b as u32) as i64
+        }),
+        K::AShr(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| {
+            let bits = int_bits(x.operand0.get_type(types).as_ref());
+            sign_extend(a, bits).wrapping_shr(b as u32)
+        }),
         // An interior pointer into a constant aggregate (`&arr[k]`, `&s.f`, a string-literal tail
         // `&".."[k]`) — base address plus the type-walked constant byte offset (§3b, like `getelementptr`).
         K::GetElementPtr(g) => {
@@ -2588,7 +2603,11 @@ fn translate_func(
     //     a block parameter wherever it is live; its block-local value index is its position in that
     //     block's param list, so one `SsaLoc` per such block (effective from block entry) gives an
     //     `SsaList` covering the argument's whole live range.
-    // §6 function name: the `DISubprogram` source name → this IR function index.
+    // §6 function name: the `DISubprogram` source name → this IR function index. (Only under `-g`: a
+    // stripped build deliberately carries no debug info to keep `.svmb` lean — `translate.rs`'s
+    // `llvm_without_g_has_no_debug_info` guards that. The emitted wasm name section (#865) therefore
+    // falls back to `gfN` guest indices for a stripped guest; real symbol names need a `-g` build or a
+    // future opt-in symbol-recording flag.)
     if let Some(src) = di.and_then(|d| d.func_names.get(&f.name)) {
         dbg.func_names.push(FuncName {
             func: func_idx,
@@ -14275,10 +14294,17 @@ fn emit_bswap(ctx: &mut BlockCtx, v: ValIdx, ty: IntTy, nbytes: u64) -> ValIdx {
 /// network: `((v & m_s) << s) | ((v >> s) & m_s)` for s = 1,2,…,bits/2, where `m_s` selects the
 /// even-indexed `s`-bit groups (`s` ones, `s` zeros, repeating). The on-ramp keeps narrow integers
 /// zero-extended in their container (§3b), so a 16-bit value reverses cleanly into the low 16 bits.
-/// Lowers `llvm.bitreverse.{i8,i16,i32,i64}`; a non-power-of-2 width is `Unsupported` (fail-closed).
+/// Lowers `llvm.bitreverse.iN`. Power-of-2 widths (`{i8,i16,i32,i64}`) reverse exactly their `N` bits
+/// in place via the swap network. A **non-power-of-2** width (e.g. `i3`, which `core`'s recent `fmt`
+/// placeholder packing emits) reverses the full power-of-2 container (32 or 64) and shifts the reversed
+/// low-`N` bits — which land in the container's high end — back down to `[0, N)`; the shift discards the
+/// container's other bits, so this is correct with no zero-extension precondition on `v`.
 fn emit_bitreverse(ctx: &mut BlockCtx, v: ValIdx, ty: IntTy, bits: u32) -> Result<ValIdx, Error> {
-    if !matches!(bits, 8 | 16 | 32 | 64) {
-        return unsup(format!("llvm.bitreverse.i{bits} (non-power-of-2 width)"));
+    let container = if ty == IntTy::I64 { 64u32 } else { 32u32 };
+    if bits == 0 || bits > container {
+        return unsup(format!(
+            "llvm.bitreverse.i{bits} (width out of range for its {container}-bit container)"
+        ));
     }
     let kof = |ctx: &mut BlockCtx, k: u64| {
         ctx.push(if ty == IntTy::I64 {
@@ -14287,6 +14313,20 @@ fn emit_bitreverse(ctx: &mut BlockCtx, v: ValIdx, ty: IntTy, bits: u32) -> Resul
             Inst::ConstI32(k as i32)
         })
     };
+    // Non-power-of-2: reverse the whole container (a power-of-2 → the fast path below), then right-shift
+    // the reversed `N` bits down out of the container's high end. `reverse_w(v)` maps `v`'s bit `i` to
+    // bit `w-1-i`, so `v`'s low `N` bits land at `[w-N, w)`; `>> (w-N)` brings them to `[0, N)` and drops
+    // everything the reversal moved into `[0, w-N)`.
+    if !matches!(bits, 8 | 16 | 32 | 64) {
+        let full = emit_bitreverse(ctx, v, ty, container)?;
+        let sh = kof(ctx, (container - bits) as u64);
+        return Ok(ctx.push(Inst::IntBin {
+            ty,
+            op: BinOp::ShrU,
+            a: full,
+            b: sh,
+        }));
+    }
     let mut cur = v;
     let mut s = 1u32;
     while s < bits {
@@ -16193,6 +16233,8 @@ impl<'a> BlockCtx<'a> {
                 | Constant::Or(_)
                 | Constant::Xor(_)
                 | Constant::Shl(_)
+                | Constant::LShr(_)
+                | Constant::AShr(_)
                 | Constant::Trunc(_)
                 | Constant::ZExt(_)
                 | Constant::SExt(_) => {

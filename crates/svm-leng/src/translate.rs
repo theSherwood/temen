@@ -55,6 +55,12 @@ fn escape_bytes(bytes: &[u8]) -> String {
     s
 }
 
+/// The RTTI type-header field every `RootObj`-derived object carries at offset 0: an 8-byte pointer
+/// to the object's `Rtti` (vtable / type descriptor). nimony spells the field `vt.00` and accesses
+/// it as `(dot (deref x) vt.00 <inheritance-level>)`; `svm-leng` synthesizes it under this exact name
+/// when the real `RootObj` layout isn't in scope, so those accesses resolve (#859).
+const RTTI_VT_FIELD: &str = "vt.00";
+
 /// True if a `(proc :name params ret pragmas body)` carries an `importc` pragma — a C extern with no
 /// translatable body (calls to it become SVM imports the host binds at link).
 fn is_importc_proc(proc_node: &Node) -> bool {
@@ -255,6 +261,18 @@ pub(crate) enum Layout {
         elem_size: u64,
         size: u64,
     },
+}
+
+impl Layout {
+    /// Number of laid-out fields (0 for an array) — the convergence signal for the linker's
+    /// type-pooling fixpoint: inlining a cross-module base only *adds* fields, so the summed field
+    /// count grows monotonically until every inheritance chain is fully resolved.
+    pub(crate) fn field_count(&self) -> usize {
+        match self {
+            Layout::Object { fields, .. } => fields.len(),
+            Layout::Array { .. } => 0,
+        }
+    }
 }
 
 pub(crate) struct Translator {
@@ -1341,11 +1359,18 @@ impl Translator {
                                 fields.extend(bf);
                                 off = bsize;
                             }
-                            // External inheritable root (`RootObj`/`Exception`): a single 8-byte
-                            // vtable/type-header pointer at offset 0.
+                            // External inheritable root (`RootObj`/`Exception`) whose own layout
+                            // isn't in scope here — `export_types_pooled` with an empty pool runs per-module with no
+                            // imports, so an intermediate module (`BaseLexer = object of RootObj`)
+                            // can't see `RootObj` and lands here. Synthesize the *real* RTTI header
+                            // `RootObj` carries: a single field `vt.00` (an 8-byte `ptr Rtti` at
+                            // offset 0), under the exact name nimony's `(dot (deref x) vt.00 <lvl>)`
+                            // accesses — so inherited-object vtable reads/writes resolve (#859), and
+                            // the offset matches the real `RootObj` (also 8 bytes) so a module that
+                            // *does* pool it lays the base's other fields at the same offsets.
                             _ => {
                                 fields.push((
-                                    "$vtable".to_string(),
+                                    RTTI_VT_FIELD.to_string(),
                                     0,
                                     TyDesc::Scalar(ValType::I64),
                                 ));
@@ -1424,7 +1449,7 @@ impl Translator {
     }
 
     /// Pre-register **external** aggregate type layouts (another module's types, under the
-    /// stem-suffixed global names this module references them by — [`export_types`]). Must run
+    /// stem-suffixed global names this module references them by — [`export_types_pooled`]). Must run
     /// before `collect_types`, whose `resolve_type` skips already-registered names.
     pub fn import_types(&mut self, ext: &[(String, Layout)]) {
         for (name, layout) in ext {
@@ -1499,7 +1524,7 @@ impl Translator {
     /// stdlib's `oomHandler`) is a function-*pointer* data symbol; a sibling unit that calls through
     /// it needs the `call_indirect` signature at translate time (the funcref value itself, an `i32`
     /// index, resolves at link time via `data.sym`). This is the funcref counterpart of
-    /// [`export_types`]; [`link_selected`] pools these across its units before translating any.
+    /// [`export_types_pooled`]; [`link_selected`] pools these across its units before translating any.
     pub fn export_funcrefs(root: &Node, stem: &str) -> Result<Vec<(String, FnPtrSig)>, LengError> {
         let mut t = Translator::new();
         t.scan_lenient = true; // enumerating funcref globals; tolerate unresolvable cross-module aggregates
@@ -1554,7 +1579,7 @@ impl Translator {
     /// to the returned aggregate's [`TyDesc`] — the input the linker pools so a *cross-module* caller
     /// knows a callee returns by `$sret` (and must pass a destination), the sret twin of
     /// [`proc_frame_nodes`]. A proc is sret iff its return type is a known aggregate ([`ret_sret`]);
-    /// the returned type name is stem-suffixed exactly as [`export_types`] suffixes a local type, so
+    /// the returned type name is stem-suffixed exactly as [`export_types_pooled`] suffixes a local type, so
     /// the importing unit resolves the same pooled layout when it sizes the result temp.
     pub fn export_sret_procs(root: &Node, stem: &str) -> Result<Vec<(String, TyDesc)>, LengError> {
         let mut t = Translator::new();
@@ -1662,30 +1687,45 @@ impl Translator {
     }
 
     /// Collect a module's aggregate type layouts under their **stem-suffixed global names** — the
-    /// form *other* modules reference them by (a type `T.0.` defined in module `stem` is
-    /// `T.0.<stem>` elsewhere, the same mangling as procs/gvars). Field/element types that name a
-    /// sibling type from the same module are rewritten to their suffixed form too, so nested
-    /// aggregates resolve in the importing translator. This is the cross-module *type* half of
-    /// linking (NIM.md W2): layouts are baked at translate time, unlike proc/data symbols, which
-    /// resolve at link time — so `link_units` pools these across its units before translating any.
-    pub fn export_types(root: &Node, stem: &str) -> Result<Vec<(String, Layout)>, LengError> {
+    /// form *other* modules reference them by (a type `T.0.` defined in module `stem` is `T.0.<stem>`
+    /// elsewhere, the same mangling as procs/gvars). Field/element types that name a sibling type
+    /// from the same module are rewritten to their suffixed form too, so nested aggregates resolve in
+    /// the importing translator. This is the cross-module *type* half of linking (NIM.md W2): layouts
+    /// are baked at translate time, unlike proc/data symbols, which resolve at link time — so
+    /// [`link_selected`] pools these across its units before translating any.
+    ///
+    /// `pool` holds **already-resolved sibling layouts** to pre-register, so a type whose base (or
+    /// field) is defined in *another* module resolves against the pool rather than falling to the
+    /// lossy synthesized-vtable-root placeholder. A base class is inlined at the front of a derived
+    /// object, but a single per-module pass has no cross-module input — so an object inheriting a base
+    /// from another unit (`JsonParser = object of BaseLexer`, `BaseLexer` in a different unit) would
+    /// lose every inherited field, exporting a layout with only the synthetic vtable slot.
+    /// [`link_selected`] calls this to a **fixpoint** — each round feeds the prior round's pool back
+    /// in — so a cross-module inheritance chain of any depth is fully inlined before any unit is
+    /// translated (#859). Only the unit's *own* types are returned; the pre-registered pool is
+    /// filtered back out. Pass `&[]` for the standalone (no-pool) export.
+    pub fn export_types_pooled(
+        root: &Node,
+        stem: &str,
+        pool: &[(String, Layout)],
+    ) -> Result<Vec<(String, Layout)>, LengError> {
         let mut t = Translator::new();
+        t.import_types(pool);
+        let imported: HashSet<String> = pool.iter().map(|(n, _)| n.clone()).collect();
         t.collect_types(root)?;
-        let local: HashSet<&String> = t.types.keys().collect();
-        let suffix = |n: &String| {
-            if local.contains(n) {
-                format!("{n}{stem}")
-            } else {
-                n.clone()
-            }
-        };
-        let rewrite = |d: &TyDesc| match d {
-            TyDesc::Agg(n) => TyDesc::Agg(suffix(n)),
-            s => s.clone(),
-        };
+        // This unit's own types = everything resolved that wasn't pre-registered from the pool.
+        let local: HashSet<&String> = t.types.keys().filter(|n| !imported.contains(*n)).collect();
+        // Rewrite every aggregate **type name** in a field/element descriptor to its stem-suffixed
+        // global form — recursing through `Ptr`/`FlexArray` pointees, not just the top level. Missing
+        // the nested case left a field like `vt: ptr Rtti` exporting `Ptr(Agg("Rtti.0."))` unsuffixed,
+        // so the importing unit couldn't resolve the pointee (`Rtti` — the RTTI struct behind a vtable
+        // walk) and a `dot` through it fail-closed. Only local names are suffixed; already-global
+        // (cross-module) names pass through.
+        let rewrite = |d: &TyDesc| rewrite_agg_names(d, &local, stem);
         let mut out: Vec<(String, Layout)> = t
             .types
             .iter()
+            .filter(|(name, _)| !imported.contains(*name))
             .map(|(name, layout)| {
                 let l = match layout {
                     Layout::Object { fields, size } => Layout::Object {
@@ -3077,8 +3117,8 @@ impl<'a> FuncGen<'a> {
         match rhs.tag() {
             Some("oconstr") => {
                 // `(oconstr T [Vtable] (kv Field Expr)*)`. For an inheritable object the first
-                // positional element is the vtable/type-header pointer → the synthetic `$vtable`
-                // field at offset 0; the rest are keyed fields.
+                // positional element is the vtable/type-header pointer → the RTTI header field
+                // `vt.00` at offset 0 (see the object-layout comment); the rest are keyed fields.
                 for elem in &rhs.args()[1..] {
                     if elem.tag() == Some("kv") {
                         let ka = elem.args();
@@ -3091,7 +3131,7 @@ impl<'a> FuncGen<'a> {
                         self.store_member(faddr, &fdesc, &ka[1])?;
                     } else if !elem.is_empty_marker() {
                         // A positional element: the vtable pointer of an inheritable object.
-                        let (voff, vdesc) = self.field_of(ddesc, "$vtable")?;
+                        let (voff, vdesc) = self.field_of(ddesc, RTTI_VT_FIELD)?;
                         let vaddr = self.add_const_off(daddr, voff);
                         self.store_member(vaddr, &vdesc, elem)?;
                     }
@@ -3825,7 +3865,7 @@ impl<'a> FuncGen<'a> {
                             "bitnot needs Type and one operand".into(),
                         ));
                     }
-                    let (ty, _) = int_ty_signed(&a[0])?;
+                    let (ty, _) = self.arith_ty(&a[0])?;
                     let x = self.expr_typed(&a[1], ty)?;
                     let ones = self.emit_const(ty, -1);
                     Ok(self.emit_bin("xor", ty, x, ones))
@@ -3974,6 +4014,34 @@ impl<'a> FuncGen<'a> {
         })
     }
 
+    /// The `(ValType, signed)` of an integer op's leading **type operand**. Primitive `(i N)`/`(u N)`/
+    /// `(c N)`/`bool` nodes go straight through [`int_ty_signed`]; a **bare named type** — an enum or
+    /// distinct int like `JsonKind.0.` — is resolved the way [`tydesc`](Translator::tydesc) classifies
+    /// every named scalar (its underlying int), so enum-ordinal arithmetic (`inc`/`dec` over an enum,
+    /// which nimony emits as `(add EnumT x (conv EnumT 1))`) lowers instead of fail-closing on the
+    /// named type. A named type svm-leng holds as a non-integer (aggregate/pointer/funcref) still fails
+    /// closed — arithmetic on it is a real type error.
+    fn arith_ty(&self, node: &Node) -> Result<(ValType, bool), LengError> {
+        if node.tag().is_none() && node.as_atom().is_some() {
+            return match self.t.tydesc(node)? {
+                TyDesc::Scalar(vt @ (ValType::I32 | ValType::I64)) => Ok((vt, false)),
+                TyDesc::Narrow { bytes, signed } => Ok((
+                    if bytes > 4 {
+                        ValType::I64
+                    } else {
+                        ValType::I32
+                    },
+                    signed,
+                )),
+                other => Err(LengError::Unsupported(format!(
+                    "arithmetic on non-integer named type `{}` ({other:?})",
+                    node.as_atom().unwrap_or("?")
+                ))),
+            };
+        }
+        int_ty_signed(node)
+    }
+
     /// `(add|sub|mul|div|mod Type Expr Expr)` — integer or floating-point per the carried `Type`.
     fn arith(&mut self, op: &str, e: &Node) -> Result<Val, LengError> {
         let a = e.args();
@@ -4000,7 +4068,7 @@ impl<'a> FuncGen<'a> {
             };
             return Ok(self.emit_bin(name, ty, l, r));
         }
-        let (ty, signed) = int_ty_signed(&a[0])?;
+        let (ty, signed) = self.arith_ty(&a[0])?;
         let l = self.expr_typed(&a[1], ty)?;
         let r = self.expr_typed(&a[2], ty)?;
         let name = match op {
@@ -4036,7 +4104,7 @@ impl<'a> FuncGen<'a> {
                 "`{op}` needs Type and two operands"
             )));
         }
-        let (ty, signed) = int_ty_signed(&a[0])?;
+        let (ty, signed) = self.arith_ty(&a[0])?;
         let l = self.expr_typed(&a[1], ty)?;
         let r = self.expr_typed(&a[2], ty)?;
         let name = match op {
@@ -4860,6 +4928,26 @@ fn collect_funcref_targets(node: &Node, procs: &HashSet<String>, out: &mut HashS
 
 /// True if any `(var …)` in the tree has a bare-symbol (named aggregate) type.
 /// Collect `(lab :L)` label names in document order (recursing through scopes, loops, and `if`s).
+/// Recursively rewrite the aggregate **type names** in a field/element [`TyDesc`] to their
+/// stem-suffixed global form — a local name (in `local`) gets `+stem`, an already-global cross-module
+/// name passes through. Recurses through `Ptr`/`FlexArray` pointees so a field like `vt: ptr Rtti`
+/// exports `Ptr(Agg("Rtti.0.<stem>"))`, not the unsuffixed `Ptr(Agg("Rtti.0."))` that left the pointee
+/// unresolvable in the importing unit. (`FnPtr` carries only `ValType`s — no nested aggregate name.)
+fn rewrite_agg_names(d: &TyDesc, local: &HashSet<&String>, stem: &str) -> TyDesc {
+    match d {
+        TyDesc::Agg(n) => TyDesc::Agg(if local.contains(n) {
+            format!("{n}{stem}")
+        } else {
+            n.clone()
+        }),
+        TyDesc::Ptr(inner) => TyDesc::Ptr(Box::new(rewrite_agg_names(inner, local, stem))),
+        TyDesc::FlexArray(inner) => {
+            TyDesc::FlexArray(Box::new(rewrite_agg_names(inner, local, stem)))
+        }
+        other => other.clone(),
+    }
+}
+
 fn collect_labels(node: &Node, out: &mut Vec<String>) {
     if let Node::List(_) = node {
         if node.tag() == Some("lab") {

@@ -10,7 +10,7 @@
 //! **State model (POSIX.md §3):** the bytes a libc call touches — a `malloc`'d buffer, a `write`
 //! source — live in the **guest window** (native-speed access; `malloc` returns a window offset). The
 //! *bookkeeping* — the allocator's cursor, captured stdout/stderr, the stdin cursor — lives host-side
-//! in [`Inner`], never in the guest's address space, so the guest cannot corrupt it.
+//! in [`World`]/[`Proc`], never in the guest's address space, so the guest cannot corrupt it.
 //!
 //! Scope: `write` / `read` / `malloc` / `free` / `exit`, plus `open` / `close` / `lseek` / `unlink`
 //! over an in-memory filesystem (a `path → bytes` memfs) with a host-side fd table, and
@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use svm_interp::{cap_id, GuestMem, Host, HostProc, SignalSource, Trap};
+use svm_interp::{cap_id, ForkedProc, GuestMem, Host, HostProc, HostProcFork, SignalSource, Trap};
 use svm_ir::ResolvedCap;
 
 /// Op numbers on the shared `HOST_PROC` handle; [`resolve`] maps libc names to these.
@@ -52,7 +52,7 @@ pub const OP_ARGC: u32 = 17;
 pub const OP_ARGV: u32 = 18;
 /// **Personality `exec` surface** (STAGE1.md §5) — how a shell running on this personality launches an
 /// external command. `exec_lookup(name_ptr, name_len) -> module_handle | -1` resolves a command name
-/// against the [`Inner::commands`] PATH registry (a `name → Module` handle map the embedder seeds); the
+/// against the [`World::commands`] PATH registry (a `name → Module` handle map the embedder seeds); the
 /// shell then drives `Instantiator.instantiate_module_named` (op 13) + `join` on the returned handle.
 /// `exec_stdout() -> stream_handle` returns the `Stream` the shell should re-grant to the child under
 /// the name `"stdout"` so the command's `write(1, …)` reaches the shell's sink. `exec_stdin(ptr, len)
@@ -130,6 +130,41 @@ pub const OP_WAIT: u32 = 29;
 /// and its stderr to `stderr_fd`. A `-1` fd inherits the caller's current fd 0 / 1 / 2 binding (the
 /// [`OP_SPAWN`] default), so a request with all three fds `-1` is exactly `spawn`.
 pub const OP_SPAWN2: u32 = 43;
+
+/// `getpid() -> pid` (#863 slice 2): this process's own pid — `1` for the root, the scheduler
+/// `TaskId` (= the parent's `fork()` return) for a fork twin, a personality-allocated pid for a
+/// re-grant clone (slice 3). One pid space with `kill(pid)`/`waitpid(pid)`: the value is
+/// meaningful to both.
+pub const OP_GETPID: u32 = 44;
+
+/// **Job control — the process-group surface** (#798 slice 1). `setpgid(pid, pgid) -> 0 | -errno`:
+/// move process `pid` (`0` = self) into group `pgid` (`0` = `pid`'s own id — become a leader), by
+/// the process table; the target must be the caller or a live table entry. POSIX's exec/session
+/// restrictions are not modeled (one world ≈ one session, #798).
+pub const OP_SETPGID: u32 = 45;
+/// `getpgid(pid) -> pgid | -errno`: process `pid`'s (`0` = self) group id, from the table.
+pub const OP_GETPGID: u32 = 46;
+/// `tcgetpgrp(fd) -> pgid | -errno`: the **foreground process group** of the terminal `fd` refers
+/// to. Until the TTY layer (#797) the personality's captured stdio is the one proto-terminal: any
+/// stdio-sentinel fd names it, anything else is `-ENOTTY`. Foreground starts as the root's group
+/// (`1`), so nothing changes for a guest that never calls `tcsetpgrp`.
+pub const OP_TCGETPGRP: u32 = 47;
+/// `tcsetpgrp(fd, pgid) -> 0 | -errno`: make `pgid` the terminal's foreground process group
+/// (`-EINVAL` non-positive, `-EPERM` if no live process is in it, `-ENOTTY` off-terminal). A
+/// background process's terminal I/O then rings its `SIGTTOU`/`SIGTTIN` doorbell (see
+/// [`OP_WRITE`]/[`OP_READ`]) — the L0 approximation of stop-on-background-I/O until #798 slice 2
+/// brings real stop/continue.
+pub const OP_TCSETPGRP: u32 = 48;
+
+/// `isatty(fd) -> 1 | 0` (#800): is `fd` the terminal? Until the TTY layer (#797) the captured
+/// stdio is the one proto-terminal (the same convention as `tcgetpgrp`/`tcsetpgrp`): the stdio
+/// fds 0/1/2 answer `1`, everything else `0`. Bash probes `isatty(0)`/`isatty(2)` to decide
+/// interactive mode — this is the op that decision rides on.
+pub const OP_ISATTY: u32 = 49;
+/// `getppid() -> pid` (#800): the parent's pid — the pid of the process whose `fork` (or whose
+/// re-grant, for a spawned clone) minted this one; `0` only for the root (init-like, no parent).
+/// Bash exports it as `$PPID`.
+pub const OP_GETPPID: u32 = 50;
 
 /// **POSIX signal surface — L0 doorbell** (STAGE1.md slice 3 / PROCESS.md §9). A signal a shell traps
 /// (SIGINT/SIGTERM/…) becomes a **pending bit** the guest polls at a safe point (a command boundary) and
@@ -222,6 +257,7 @@ const UNMASKABLE: u64 = (1 << 9) | (1 << 19);
 
 /// Negative errnos this personality returns (Linux values, so a guest's `<errno.h>` agrees).
 const ENOENT: i64 = -2; // no such file (open without O_CREAT; stat/opendir of an absent path)
+const ESRCH: i64 = -3; // kill on a pid the process table does not know
 const ECHILD: i64 = -10; // waitpid on a pid that is not a live child
 const EBADF: i64 = -9; // an op on an fd this personality does not serve
 const EINVAL: i64 = -22; // bad argument (whence, non-UTF-8 path, negative seek)
@@ -229,6 +265,33 @@ const ENOTDIR: i64 = -20; // opendir on a path that is a regular file, not a dir
 const ESPIPE: i64 = -29; // lseek on a pipe/stdio fd (not seekable)
 const ERANGE: i64 = -34; // result won't fit the caller's buffer (getcwd)
 const ENOSYS: i64 = -38; // spawn with no embedder-wired delegate (fail closed)
+const EPERM: i64 = -1; // tcsetpgrp to a process group nobody occupies (#798)
+const ENOTTY: i64 = -25; // a tc* op on an fd that is not the proto-terminal (#798)
+
+/// #798 — the job-control signal numbers (Linux values, like every signum here).
+const SIGCONT: i32 = 18; // continue a stopped process (also deliverable if caught)
+const SIGSTOP: i32 = 19; // unconditional stop (uncatchable)
+const SIGTSTP: i32 = 20; // the terminal ^Z — stop unless caught/ignored
+const SIGTTIN: i32 = 21; // background read from the terminal
+const SIGTTOU: i32 = 22; // background write to the terminal
+
+/// #796 default actions — `SIGKILL` (uncatchable, unmaskable terminate).
+const SIGKILL: i32 = 9;
+/// #796 — `sigaction` `sa_flags` bit: restart an interrupted blocking call instead of `-EINTR`
+/// (Linux value, so a guest's `<signal.h>` agrees).
+const SA_RESTART: i64 = 0x10000000;
+/// #796 default actions — the signals whose `SIG_DFL` action is **ignore** (Linux: CHLD/URG/WINCH).
+/// Everything else outside the job-control set above defaults to **terminate**.
+fn default_ignored(sig: i32) -> bool {
+    matches!(
+        sig,
+        17 /* SIGCHLD */ | 23 /* SIGURG */ | 28 /* SIGWINCH */
+    )
+}
+
+/// #798 slice 2 — `waitpid` option bits (Linux values).
+const WUNTRACED: i64 = 2; // also report a freshly-stopped child
+const WCONTINUED: i64 = 8; // also report a freshly-continued child
 const EEXIST: i64 = -17; // mkdir/rename onto a path that already exists
 const ENOTEMPTY: i64 = -39; // rmdir on a directory that still has children
 const EAGAIN: i64 = -11; // read/accept on an empty memnet socket (would block a cooperative guest)
@@ -466,14 +529,15 @@ fn mem_pair(client_addr: NetAddr, server_addr: NetAddr) -> (MemSock, MemSock) {
 
 /// One entry in the host-side fd table. The three stdio streams start as sentinels (`Stdin`/`Stdout`/
 /// `Stderr`) so `dup2`/`dup`/`close` treat fds `0`/`1`/`2` uniformly with the rest; `open` adds `File`;
-/// `pipe` adds a `PipeRead`/`PipeWrite` pair sharing one [`PipeBuf`]. `dup`/`dup2` clone an entry —
-/// pipe ends clone the `Arc` (shared buffer); a `File` clones its description (independent offset — the
-/// POSIX shared-offset nuance is a follow-up, irrelevant to the shell redirect pattern).
+/// `pipe` adds a `PipeRead`/`PipeWrite` pair sharing one [`PipeBuf`]. Every entry is a reference to a
+/// **shared open-file description** (#863): `dup`/`dup2` clone the reference, so dups share the offset
+/// (POSIX), and [`Proc::fork`]'s entry-wise table copy shares descriptions across processes the same
+/// way. Descriptions lock innermost (World → Proc → description; see [`World`]).
 enum FdEntry {
     Stdin,
     Stdout,
     Stderr,
-    File(OpenFile),
+    File(Arc<Mutex<OpenFile>>),
     PipeRead(PipeBuf),
     PipeWrite(PipeBuf),
     /// A connected memnet socket end (loopback; POSIX.md §5a).
@@ -485,18 +549,15 @@ enum FdEntry {
 }
 
 impl FdEntry {
-    /// Clone this entry for `dup`/`dup2`: pipe ends share the buffer (`Arc` clone), a file copies its
-    /// (independent) description, stdio sentinels are trivial.
+    /// Clone this entry for `dup`/`dup2` (and [`Proc::fork`]'s table copy): every non-sentinel arm
+    /// shares its description via `Arc` clone — a dup'd or fork-inherited file fd shares the offset,
+    /// pipe ends share the buffer, per POSIX.
     fn dup_clone(&self) -> FdEntry {
         match self {
             FdEntry::Stdin => FdEntry::Stdin,
             FdEntry::Stdout => FdEntry::Stdout,
             FdEntry::Stderr => FdEntry::Stderr,
-            FdEntry::File(of) => FdEntry::File(OpenFile {
-                path: of.path.clone(),
-                pos: of.pos,
-                writable: of.writable,
-            }),
+            FdEntry::File(of) => FdEntry::File(Arc::clone(of)),
             FdEntry::PipeRead(p) => FdEntry::PipeRead(Arc::clone(p)),
             FdEntry::PipeWrite(p) => FdEntry::PipeWrite(Arc::clone(p)),
             // Socket ends and listeners share their connection state (`Arc` clones throughout) —
@@ -521,12 +582,18 @@ struct DirStream {
 /// is suitably aligned for anything the guest stores into it.
 const ALIGN: u64 = 16;
 
-/// Host-side bookkeeping for one POSIX personality: captured output, the stdin cursor, and the
-/// window-heap allocator cursor. Lives outside the guest window (POSIX.md §3), shared (`Arc<Mutex>`)
-/// so an embedder/test can read the captured output back after a run.
-struct Inner {
+/// #863 — state **all processes of one personality share**: the "kernel side" of the split. One
+/// per world, behind one `Arc<Mutex<World>>` every process's handler holds. POSIX draws the line:
+/// the filesystem, the network, the registered commands, the embedder delegates, and the captured
+/// stdio *descriptions* are world-shared; everything a `fork()` copies lives in [`Proc`].
+///
+/// **Lock order: `World` before `Proc`, always.** Every op that needs both takes the world lock
+/// first ([`handler`] takes both at dispatch top); a proc-only path ([`SignalDoor`],
+/// [`Posix::raise_signal`]) may lock its `Proc` alone but must never then take the world lock.
+/// Open-file descriptions ([`OpenFile`]) nest innermost: World → Proc → description.
+struct World {
     stdout: Vec<u8>,
-    /// When set, fd-1 writes go **here** instead of [`Inner::stdout`], and [`Posix::stdout`] reads it
+    /// When set, fd-1 writes go **here** instead of [`World::stdout`], and [`Posix::stdout`] reads it
     /// back. This unifies the shell's own output with a spawned child's: the embedder points it at the
     /// `Host`'s shared stdout sink (`Host::shared_stdout`), the same buffer a re-granted `Stream` writes
     /// to, so the shell's `write(1, …)` and the command's `write(1, …)` interleave in one stream
@@ -534,33 +601,19 @@ struct Inner {
     /// existing embedder).
     stdout_sink: Option<Arc<Mutex<Vec<u8>>>>,
     stderr: Vec<u8>,
-    /// Preloaded standard input; `read(0, …)` drains it from `stdin_pos`.
+    /// Preloaded standard input; `read(0, …)` drains it from `stdin_pos`. World-shared: the stdin
+    /// **description** (bytes + offset) is one open file description all processes' fd-0 sentinels
+    /// point at — POSIX fork shares the offset.
     stdin: Vec<u8>,
     stdin_pos: usize,
-    /// High-water mark: the window offset fresh (never-freed) allocations bump upward from.
-    heap_next: u64,
-    /// One past the last window byte the allocator may hand out.
-    heap_end: u64,
-    /// Live allocations, `ptr → size` — so `free` knows a block's length (the size header lives
-    /// host-side, out of the guest's reach, rather than in a window prefix the guest could clobber).
-    allocated: HashMap<u64, u64>,
-    /// Freed blocks available for reuse (`offset, size`), first-fit. No coalescing yet — adjacent
-    /// frees stay separate (a fragmentation follow-up, POSIX.md §6); reuse of a same-or-larger block
-    /// works regardless.
-    free_list: Vec<(u64, u64)>,
     /// The **in-memory filesystem**: path → contents. A memfs keeps the personality self-contained and
     /// deterministic (the playground has no disk); a native embedder routing to a real `fs` cap is a
-    /// follow-up. Shared file bytes; per-fd offsets live in [`Inner::fds`].
+    /// follow-up. Shared file bytes; per-fd offsets live in each fd's [`OpenFile`] description.
     files: HashMap<String, Vec<u8>>,
     /// Explicitly-created **empty** directories (`mkdir`). The memfs otherwise infers directories as
     /// prefixes of file keys, which can't represent a dir with no files under it; this set carries those.
     /// A path is a directory if it is the root, appears here, or is a proper prefix of some file key.
     explicit_dirs: HashSet<String>,
-    /// The host-side fd table (indexed by fd). Seeded with the three stdio sentinels at `0`/`1`/`2`
-    /// (`FdEntry::Stdin`/`Stdout`/`Stderr`), so `dup2`/`dup`/`close`/`fcntl` treat every fd uniformly.
-    /// `open`/`pipe`/`dup` allocate the lowest free slot; a closed fd (including a closed stdio fd) is
-    /// reused, matching POSIX "lowest available".
-    fds: Vec<Option<FdEntry>>,
     /// Loopback memnet listeners: bound port → the pending-connection queue its `accept` pops and a
     /// loopback `connect` pushes into. (The queue is shared with the listener's `FdEntry`; this index
     /// exists so `connect` can find it by port and `bind` can detect `-EADDRINUSE`.)
@@ -570,32 +623,11 @@ struct Inner {
     /// The embedder's network delegate ([`Posix::set_net`]) — authority beyond loopback. `None` ⇒
     /// non-loopback fails closed.
     net_delegate: Option<Box<dyn NetDelegate>>,
-    /// Open directory streams (`opendir`/`readdir`/`closedir`), indexed by the `DIR*`-analog handle
-    /// `opendir` returns. Each holds the immediate child names snapshotted at `opendir` time and a
-    /// read cursor. Separate from [`Inner::fds`] (a directory stream is not a file fd here).
-    dirs: Vec<Option<DirStream>>,
-    /// The program's argument vector (`args[0]` is the program name), delivered **host-side** — the
-    /// symmetric analogue of the environment: `argc`/`argv` read it, the embedder sets it. This is how
-    /// a personality program gets `sh -c "…"` without the window args buffer (POSIX.md §5); a guest
-    /// crt that wants a standard `main(int, char**)` builds `argv[]` from these ops.
-    args: Vec<String>,
-    /// The current working directory `getcwd` reports and `chdir` updates. A plain string — the memfs
-    /// is flat (paths are used as-given), so `cwd` is not validated against it; path normalization/
-    /// resolution is a follow-up (POSIX.md §6).
-    cwd: String,
-    /// The environment: `name → value`. `getenv`/`setenv` read and update it; host-side, out of the
-    /// guest's reach, like the rest of the bookkeeping (POSIX.md §3).
-    env: HashMap<String, String>,
     /// The monotonic-clock base — `clock(1)` reports nanos elapsed since this. Captured at creation.
     clock_base: std::time::Instant,
     /// A pinned clock value (`Some(nanos)`) for determinism: when set, `clock(_)` returns it verbatim
     /// so a differential run is reproducible. `None` reads the real host clock.
     clock_fixed: Option<i64>,
-    /// Cache of `getenv` results already materialized into the window: `name → ptr`. C's `getenv`
-    /// returns a stable `char*` into libc-owned storage, so a repeated `getenv("X")` must return the
-    /// **same** pointer; we allocate a NUL-terminated copy in the arena once and reuse it. `setenv`
-    /// invalidates the entry so the next `getenv` re-materializes the new value.
-    env_ptrs: HashMap<String, u64>,
     /// The **PATH registry** (STAGE1.md §5): command name → `(granted Module handle, declared window
     /// size_log2)`. `exec_lookup` returns the handle; `exec_win` the size_log2 (so the shell carves each
     /// spawn to the command's own window). The embedder seeds it with [`Posix::register_command`] after
@@ -615,22 +647,105 @@ struct Inner {
     /// The embedder-wired **spawn delegate** ([`Posix::set_spawn`]) — the authority `spawn` needs to run
     /// a child. `None` until wired, in which case `spawn` is `-ENOSYS` (fail closed).
     spawn_fn: Option<SpawnFn>,
-    /// Reaped-pending children: synthetic `pid → wait-encoded status`. `spawn` runs the child to
-    /// completion and records its status here; `waitpid`/`wait` remove and return it.
-    children: HashMap<i32, i32>,
-    /// The next synthetic pid `spawn` hands out. Starts at `1000` (well clear of small fd/int values, so
-    /// a pid is never confused with an fd in a test).
+    /// #863 slice 2 — the **process table**: `pid → entry`, ONE pid space for every process this
+    /// world knows. A **fork twin**'s pid is its scheduler `TaskId` (the value the parent's `fork()`
+    /// returned), registered at mint by [`fork_factory`]; a **spawn-delegate child** (already run to
+    /// completion) sits as a [`ProcEntry::Zombie`] holding its wait-encoded status until `waitpid`
+    /// reaps it. `kill(pid, sig)` and `waitpid(pid)` are lookups here; the root is pid `1`.
+    procs: HashMap<i32, ProcEntry>,
+    /// The next pid `spawn` hands out for a delegate child. Starts at `1000` and skips occupied
+    /// pids (fork twins occupy their `TaskId`s in the same table — one space, no collisions).
     next_pid: i32,
+    /// #798 — the proto-terminal's **foreground process group** (`tcsetpgrp`/`tcgetpgrp`; the
+    /// captured stdio stands in for the pty until #797). Init `1` — the root's group — so every
+    /// pre-job-control guest is foreground and nothing rings. A background process's terminal
+    /// I/O rings its `SIGTTOU`/`SIGTTIN` doorbell.
+    fg_pgid: i32,
+}
+
+/// #863 slice 2 — a [`World::procs`] process-table entry.
+enum ProcEntry {
+    /// A live process: its [`Proc`], so `kill(pid, sig)` can set **its** pending bit (and wake
+    /// **its** run). The root (pid `1`) and every fork twin (pid = scheduler `TaskId`) live here.
+    Live(Arc<Mutex<Proc>>),
+    /// A spawn-delegate child that already ran to completion: its wait-encoded exit status, held
+    /// until `waitpid`/`wait` reaps it — a zombie.
+    Zombie(i32),
+}
+
+/// #863 — **per-process** state: what POSIX `fork()` copies (and what `exec` will one day reset).
+/// One per process domain; a `fork()` twin gets [`Proc::fork`]'s clone — fd *table* copied
+/// entry-wise over shared descriptions, cwd/env/args copied, allocator copied (paired with the
+/// twin's private window copy), signal dispositions/mask copied with **pending cleared**. See
+/// [`World`] for the shared side and the lock order.
+struct Proc {
+    /// This process's own pid (#863 slice 2): `1` for the root (init-like), the scheduler `TaskId`
+    /// for a fork twin (stamped by [`fork_factory`] at mint — the same value the parent's `fork()`
+    /// returned), or a personality-allocated pid for a re-grant clone (slice 3 — a spawned child is
+    /// wired before any `TaskId` exists, so it draws from the spawn allocator instead; every
+    /// process is table-addressable). `getpid` reports it, and `kill(own pid)` short-circuits to
+    /// the self path on it.
+    pid: i32,
+    /// #800 `getppid` — the minting process's pid, recorded in [`Proc::fork`] (twins and
+    /// re-grant clones alike); `0` only for the root.
+    ppid: i32,
+    /// #798 — this process's **process group** (`setpgid`/`getpgid`): the unit `kill(-pgid)`
+    /// sweeps and `tcsetpgrp` foregrounds. The root leads group `1`; a `fork` twin **inherits**
+    /// its parent's (POSIX — unlike the core's `Twin.pgid`, which defaults to own-id and feeds
+    /// only the core reap's `-pgid` filter; the personality's is authoritative for personality
+    /// ops, and the two unify when blocking `waitpid` lands, #799).
+    pgid: i32,
+    /// High-water mark: the window offset fresh (never-freed) allocations bump upward from.
+    heap_next: u64,
+    /// One past the last window byte the allocator may hand out.
+    heap_end: u64,
+    /// Live allocations, `ptr → size` — so `free` knows a block's length (the size header lives
+    /// host-side, out of the guest's reach, rather than in a window prefix the guest could clobber).
+    allocated: HashMap<u64, u64>,
+    /// Freed blocks available for reuse (`offset, size`), first-fit. No coalescing yet — adjacent
+    /// frees stay separate (a fragmentation follow-up, POSIX.md §6); reuse of a same-or-larger block
+    /// works regardless.
+    free_list: Vec<(u64, u64)>,
+    /// The host-side fd **table** (indexed by fd) — per-process, POSIX: a fork copies the table, a
+    /// child's `close`/`dup2` never disturbs its parent's numbering. Entries point at **shared**
+    /// descriptions (an [`OpenFile`] `Arc`, a pipe buffer, a socket), so offsets and liveness are
+    /// shared where POSIX shares them. Seeded with the three stdio sentinels at `0`/`1`/`2`
+    /// (`FdEntry::Stdin`/`Stdout`/`Stderr`); `open`/`pipe`/`dup` allocate the lowest free slot.
+    fds: Vec<Option<FdEntry>>,
+    /// Open directory streams (`opendir`/`readdir`/`closedir`), indexed by the `DIR*`-analog handle
+    /// `opendir` returns. Each holds the immediate child names snapshotted at `opendir` time and a
+    /// read cursor. Separate from [`Proc::fds`] (a directory stream is not a file fd here).
+    dirs: Vec<Option<DirStream>>,
+    /// The program's argument vector (`args[0]` is the program name), delivered **host-side** — the
+    /// symmetric analogue of the environment: `argc`/`argv` read it, the embedder sets it. This is how
+    /// a personality program gets `sh -c "…"` without the window args buffer (POSIX.md §5); a guest
+    /// crt that wants a standard `main(int, char**)` builds `argv[]` from these ops.
+    args: Vec<String>,
+    /// The current working directory `getcwd` reports and `chdir` updates — per-process (a subshell's
+    /// `cd` must not move its parent). A plain string — the memfs is flat (paths are used as-given),
+    /// so `cwd` is not validated against it; path normalization/resolution is a follow-up (POSIX.md §6).
+    cwd: String,
+    /// The environment: `name → value` — per-process (POSIX fork copies it; a child's `setenv` is
+    /// invisible to the parent). `getenv`/`setenv` read and update it; host-side, out of the guest's
+    /// reach, like the rest of the bookkeeping (POSIX.md §3).
+    env: HashMap<String, String>,
+    /// Cache of `getenv` results already materialized into the window: `name → ptr`. C's `getenv`
+    /// returns a stable `char*` into libc-owned storage, so a repeated `getenv("X")` must return the
+    /// **same** pointer; we allocate a NUL-terminated copy in the arena once and reuse it. `setenv`
+    /// invalidates the entry so the next `getenv` re-materializes the new value. Per-process (the
+    /// pointers land in this process's own window arena).
+    env_ptrs: HashMap<String, u64>,
     /// **Pending signals** — the L0 doorbell. Bit `s` set ⇒ signal `s` has been raised (`kill`/
-    /// [`Posix::raise_signal`]) and not yet polled. Signals are `1..=63` (one `u64`).
+    /// [`Posix::raise_signal`]) and not yet polled. Signals are `1..=63` (one `u64`). Per-process, and
+    /// **cleared** in a fork twin (POSIX: the child starts with no pending signals).
     sig_pending: u64,
     /// **Signal dispositions**: `signum → handler` (`SIG_DFL`/`SIG_IGN`/a guest handler pointer), set by
     /// `signal`/`sigaction`. Absent ⇒ `SIG_DFL`. `sigcheck` consults this to deliver caught signals and
-    /// drop the rest.
+    /// drop the rest. Copied into a fork twin (POSIX: dispositions are inherited).
     sig_handler: HashMap<i32, i64>,
     /// **Signal mask** — the blocked set (`sigprocmask`, #796). Bit `s` set ⇒ signal `s` is blocked: a
     /// pending blocked signal is held (not delivered by `sigcheck`) until unblocked. `SIGKILL`/`SIGSTOP`
-    /// are never blockable, so those bits stay clear.
+    /// are never blockable, so those bits stay clear. Copied into a fork twin.
     sig_mask: u64,
     /// **Per-signal `sigaction` extras** (`sa_mask` / `sa_flags`), kept for round-trip fidelity (`oldact`).
     /// The poll model does not yet auto-block `sa_mask` while a handler runs, nor act on `SA_RESTART` —
@@ -639,32 +754,94 @@ struct Inner {
     sig_action_flags: HashMap<i32, i64>,
     /// #796 L2 — the guest's registered **signal-handler stack** base (`sigaltstack`), the data-SP an async
     /// handler runs on. `0` ⇒ no stack ⇒ async delivery is off (poll-only). Distinct from the guest's normal
-    /// stack because the interp can't compute where the interrupted frame's stack ends.
+    /// stack because the interp can't compute where the interrupted frame's stack ends. Copied into a
+    /// fork twin (POSIX: the signal stack settings are inherited; the twin's window is a private copy,
+    /// so the base points at the twin's own copy of the stack).
     sig_stack_base: u64,
     /// #796 L2 — the **armed** flag shared with the interp ([`Host::sig_armed`]): set when a caught,
     /// unmasked signal may be deliverable, so the interp's per-op poll knows to ask [`SignalSource`]. The
-    /// same `Arc` is handed to the `Host` at grant time.
+    /// same `Arc` is handed to the `Host` at grant time. A fork twin gets a **fresh** flag (its door is
+    /// its own).
     sig_armed: Arc<AtomicBool>,
     /// #799 L1 (embedder `^C`) — the interp's **scheduler-wake** closure, installed at run start via
     /// [`SignalSource::set_wake`] and cleared to a no-op at teardown. [`Posix::raise_signal`] invokes it
     /// after raising a **deliverable** signal, so an embedder `^C` interrupts a parked blocking syscall
     /// even when every fiber is parked (no per-op safepoint to notice the arm). `None` until a run installs
-    /// it (and between runs).
+    /// it (and between runs); a fork twin / spawned child gets its own installed at mint/admission
+    /// (#863 slice 3 — the core hands every door a domain-scoped weak wake, so reachability is
+    /// independent of nesting depth and fork history; weak ⇒ a post-run fire is a no-op).
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// #798 slice 2 — the core's **stop/continue closure** for this process's domain
+    /// ([`SignalSource::set_stop`], installed beside the wake): `f(true)` parks the domain at its
+    /// next per-op poll, `f(false)` resumes it. `None` (a driver without the mechanism — the
+    /// bytecode driver, a bare unit test) degrades to bookkeeping-only stops: the table records
+    /// the stop, `WUNTRACED` reports it, but the process keeps running (the L0 posture).
+    stop: Option<Arc<dyn Fn(bool) + Send + Sync>>,
+    /// #798 slice 2 — the signal this process is currently **stopped** by (`None` = running).
+    /// Set by the delivery gate on a default-action stop signal; cleared by `SIGCONT`.
+    stopped_sig: Option<i32>,
+    /// #798 slice 2 — a stop not yet reported through `waitpid(WUNTRACED)` (report-once).
+    stop_fresh: bool,
+    /// #798 slice 2 — a continue not yet reported through `waitpid(WCONTINUED)` (report-once).
+    cont_fresh: bool,
+    /// #796 default actions — the core's **terminate closure** for this process's domain
+    /// ([`SignalSource::set_kill`], installed beside the wake/stop pair): firing it kills the
+    /// domain at its next per-op poll. `None` (a driver without the mechanism) degrades to
+    /// bookkeeping-only termination: `term_sig` is recorded (so `waitpid` reports it if the
+    /// process exits by other means) but the process keeps running — the L0 posture, same
+    /// degradation as `stop`.
+    kill: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// #796 default actions — the signal that terminated this process (`SIG_DFL` terminate
+    /// action). Read by the exit hook at retire time: set ⇒ the zombie's wait status is the
+    /// `WIFSIGNALED` shape (`sig` in the low 7 bits) instead of the exit-code encode.
+    term_sig: Option<i32>,
+    /// #796 block-during-handler — the pre-delivery masks of the **live async handler frames**,
+    /// innermost last: [`SignalDoor::take_deliverable`] pushes the current mask and blocks the
+    /// delivered signal + its `sa_mask` for the handler's duration (POSIX);
+    /// [`SignalDoor::handler_returned`] pops and restores. LIFO per process — with `thread.spawn`
+    /// siblings sharing one process, interleaved cross-fiber returns restore in push order (a
+    /// documented approximation: POSIX masks are per-thread, ours is per-process).
+    handler_mask_stack: Vec<u64>,
+    /// #796 `SA_RESTART` — whether the most recent caught delivery's action carried `SA_RESTART`,
+    /// answered to the core through [`SignalDoor::syscall_restart`] when an interrupt reaches a
+    /// parked blocking call. Last delivery wins (the documented approximation of POSIX's
+    /// per-interrupting-handler rule for near-simultaneous mixed-flag deliveries).
+    restart_ok: bool,
 }
 
-/// A handle to a granted POSIX personality's shared state — read the captured output after a run.
-/// Cheap to clone (shares one `Arc`).
+/// One dispatch's view over the two personality lock domains — the shared [`World`] and the calling
+/// process's [`Proc`], both locked at dispatch top ([`handler`]) in the canonical order (world,
+/// then proc; see [`World`]). The op bodies are methods here; pure-`Proc` signal helpers
+/// ([`Proc::arm_signals`], [`Proc::deliverable_now`]) live on [`Proc`] so proc-only doors reach
+/// them without the world lock.
+struct Ctx<'a> {
+    w: &'a mut World,
+    p: &'a mut Proc,
+    /// #863 slice 2 — scheduler wakes to fire **after** this dispatch's locks are released.
+    /// `kill` pushes one per target the signal is deliverable to (a `-pgid` group kill may have
+    /// several, #798): the wake closures take the scheduler lock, and the fork factory takes the
+    /// world lock *under* the scheduler lock, so firing while still holding the world lock would
+    /// deadlock (scheduler → world vs world → scheduler). [`handler`] fires them once the guards
+    /// are dropped.
+    wake_after: Vec<Arc<dyn Fn() + Send + Sync>>,
+}
+
+/// A handle to a granted POSIX personality's state — read the captured output after a run, stage
+/// the memfs/env, raise embedder signals. Cheap to clone (shares the `Arc`s). #863: holds the
+/// shared [`World`] plus the **root process's** [`Proc`] — the proc-side setters (`set_env`,
+/// `set_args`, `cwd`, `raise_signal`) address the root process, matching the pre-split embedder
+/// semantics (per-child addressing is #863 slice 2's process table).
 #[derive(Clone)]
 pub struct Posix {
-    inner: Arc<Mutex<Inner>>,
+    world: Arc<Mutex<World>>,
+    root: Arc<Mutex<Proc>>,
 }
 
 impl Posix {
     /// Bytes the guest `write`-to-fd-1'd — from the shared sink when one is set ([`Posix::set_stdout_sink`]),
     /// else the personality's own captured buffer.
     pub fn stdout(&self) -> Vec<u8> {
-        let st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let st = self.world.lock().unwrap_or_else(|e| e.into_inner());
         match &st.stdout_sink {
             Some(sink) => sink.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             None => st.stdout.clone(),
@@ -672,7 +849,7 @@ impl Posix {
     }
     /// Bytes the guest `write`-to-fd-2'd.
     pub fn stderr(&self) -> Vec<u8> {
-        self.inner
+        self.world
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .stderr
@@ -681,7 +858,7 @@ impl Posix {
 
     /// Seed (or overwrite) a memfs file — how an embedder/test stages the filesystem a guest `open`s.
     pub fn write_file(&self, path: &str, bytes: &[u8]) {
-        self.inner
+        self.world
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .files
@@ -690,7 +867,7 @@ impl Posix {
 
     /// Read a memfs file back — how an embedder/test inspects what the guest wrote.
     pub fn read_file(&self, path: &str) -> Option<Vec<u8>> {
-        self.inner
+        self.world
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .files
@@ -701,7 +878,7 @@ impl Posix {
     /// Seed (or overwrite) an environment variable — how an embedder/test stages the environment a
     /// guest `getenv`s. Invalidates any cached `getenv` pointer for the name.
     pub fn set_env(&self, name: &str, value: &str) {
-        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.root.lock().unwrap_or_else(|e| e.into_inner());
         st.env_ptrs.remove(name);
         st.env.insert(name.to_string(), value.to_string());
     }
@@ -709,7 +886,7 @@ impl Posix {
     /// Pin the clock to a fixed `nanos` value (all `clock(_)` calls return it) — how a test makes
     /// `std::time` deterministic. Passing a value makes a differential run reproducible.
     pub fn set_clock(&self, nanos: i64) {
-        self.inner
+        self.world
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clock_fixed = Some(nanos);
@@ -717,7 +894,7 @@ impl Posix {
 
     /// The current working directory — how an embedder/test observes a guest `chdir`.
     pub fn cwd(&self) -> String {
-        self.inner
+        self.root
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .cwd
@@ -728,7 +905,7 @@ impl Posix {
     /// embedder hands a personality program its `argv` (e.g. `["sh", "-c", "echo hi"]`), read back by
     /// the guest through the `argc`/`argv` ops.
     pub fn set_args(&self, args: &[&str]) {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).args =
+        self.root.lock().unwrap_or_else(|e| e.into_inner()).args =
             args.iter().map(|s| s.to_string()).collect();
     }
 
@@ -737,7 +914,7 @@ impl Posix {
     /// (STAGE1.md §5). Pass the `Host`'s shared stdout (`Host::shared_stdout()`). [`Posix::stdout`] then
     /// reads this sink back.
     pub fn set_stdout_sink(&self, sink: Arc<Mutex<Vec<u8>>>) {
-        self.inner
+        self.world
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .stdout_sink = Some(sink);
@@ -748,7 +925,7 @@ impl Posix {
     /// shell's `exec_lookup(name)` returns it (or `-1` when absent). A later registration of the same
     /// name shadows the earlier (last wins), matching a `PATH` re-export.
     pub fn register_command(&self, name: &str, module_handle: i32, win_log2: u8) {
-        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.world.lock().unwrap_or_else(|e| e.into_inner());
         st.commands.retain(|(n, _, _)| n != name);
         st.commands
             .push((name.to_string(), module_handle, win_log2));
@@ -758,7 +935,7 @@ impl Posix {
     /// `exec_stdout()` returns. Grant the `Stream` on the same `Host`, routed to the shared sink
     /// (`set_stdout_sink`), so the child's output joins the shell's (STAGE1.md §5).
     pub fn set_exec_stdout(&self, handle: i32) {
-        self.inner
+        self.world
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .exec_stdout_handle = handle;
@@ -769,7 +946,7 @@ impl Posix {
     /// [`Host::grant_input_pipe`] call on the same `Host`; `exec_stdin(ptr, len)` pushes the guest bytes
     /// into `fifo` and returns `handle`, so the child's `read(0, …)` drains them (then EOF).
     pub fn set_exec_stdin(&self, handle: i32, fifo: Arc<Mutex<VecDeque<u8>>>) {
-        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.world.lock().unwrap_or_else(|e| e.into_inner());
         st.exec_stdin_handle = handle;
         st.exec_stdin_fifo = Some(fifo);
     }
@@ -784,7 +961,7 @@ impl Posix {
     where
         F: FnMut(&str, &[String], &[u8]) -> SpawnResult + Send + 'static,
     {
-        self.inner
+        self.world
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .spawn_fn = Some(Box::new(f));
@@ -795,7 +972,7 @@ impl Posix {
     /// is `-ECONNREFUSED` and a non-`localhost` `resolve` is `-ENOENT` — fail closed. The delegate
     /// is where policy lives: a real socket, a scripted table, an allowlisting proxy.
     pub fn set_net(&self, delegate: impl NetDelegate + 'static) {
-        self.inner
+        self.world
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .net_delegate = Some(Box::new(delegate));
@@ -816,18 +993,45 @@ impl Posix {
         // notice the arm gets interrupted → `-EINTR` (#799 L1, the terminal `^C`). An ignored/masked
         // signal is not deliverable, so `wake` stays untouched and nothing is interrupted.
         let wake = {
-            let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            st.sig_pending |= 1 << signum;
-            st.arm_signals(); // #796 L2 — deliverable async, not just at the next poll
-            if st.deliverable_now() {
-                st.wake.clone()
-            } else {
-                None
-            }
+            let mut st = self.root.lock().unwrap_or_else(|e| e.into_inner());
+            // The delivery gate (#798 slice 2): an embedder ^Z (SIGTSTP) stops the root, an
+            // embedder SIGCONT resumes it — same policy as every in-world raise.
+            st.deliver_signal(signum)
         };
         if let Some(w) = wake {
             w();
         }
+    }
+
+    /// #863 slice 3 — the embedder's **pid-targeted** signal: [`Posix::raise_signal`]'s semantics
+    /// (pending + arm + wake-if-deliverable, disposition-gated by the TARGET's own state) routed
+    /// through the process table instead of pinned to the root. This is how a terminal `^C` reaches
+    /// the *right* process when the world has several — e.g. a spawned shell (a slice-3 re-grant
+    /// clone, pid from the personality allocator) or a fork twin (pid = its `TaskId`). The wake it
+    /// fires is the target's own domain-scoped run-wake, so only that process's blocked syscalls
+    /// return `-EINTR` (INVARIANTS.md #12). Returns `0`, `-ESRCH` for an unknown pid, `-EINVAL`
+    /// for a bad signal. Locks world → target proc (the canonical order), releases both, then wakes.
+    pub fn kill_pid(&self, pid: i32, signum: i32) -> i64 {
+        if !(1..=63).contains(&signum) {
+            return EINVAL;
+        }
+        let wake = {
+            let w = self.world.lock().unwrap_or_else(|e| e.into_inner());
+            match w.procs.get(&pid) {
+                Some(ProcEntry::Live(t)) => {
+                    let mut tp = t.lock().unwrap_or_else(|e| e.into_inner());
+                    // The delivery gate (#798 slice 2): pending, stop, or continue by the
+                    // target's dispositions; fired below, after the locks drop.
+                    tp.deliver_signal(signum)
+                }
+                Some(ProcEntry::Zombie(_)) => None, // exists until reaped; takes no signal
+                None => return ESRCH,
+            }
+        };
+        if let Some(f) = wake {
+            f();
+        }
+        0
     }
 }
 
@@ -878,6 +1082,13 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "fcntl" => OP_FCNTL,
         "spawn" | "posix_spawn" | "posix_spawnp" => OP_SPAWN,
         "spawn2" => OP_SPAWN2,
+        "getpid" => OP_GETPID,
+        "setpgid" => OP_SETPGID,
+        "getpgid" => OP_GETPGID,
+        "tcgetpgrp" => OP_TCGETPGRP,
+        "tcsetpgrp" => OP_TCSETPGRP,
+        "isatty" => OP_ISATTY,
+        "getppid" => OP_GETPPID,
         "waitpid" => OP_WAITPID,
         "wait" => OP_WAIT,
         "signal" => OP_SIGNAL,
@@ -941,15 +1152,25 @@ pub fn bind_with_fork(
 /// data/stack). `stdin` preloads standard input for `read(0, …)`. Every libc import in a linked module
 /// shares this **one** handle (svm-wasm/chibicc thread a single capability handle); the op number
 /// distinguishes the call, so pass the handle as the entry's leading argument.
-/// #796 L2 — the interp-facing async-signal door: the [`SignalSource`] the `Host` holds. It locks the
-/// shared `Inner` on demand (the interp holds no personality lock at a safepoint) and returns the next
-/// deliverable handler, keeping POSIX signal *policy* (dispositions, mask, pending) inside this
-/// personality while the interp only performs the *mechanism* (the safepoint redirect, invariant 4).
-struct SignalDoor(Arc<Mutex<Inner>>);
+/// #796 L2 — the interp-facing async-signal door: the [`SignalSource`] the `Host` holds. It locks
+/// **its own process's** [`Proc`] on demand (the interp holds no personality lock at a safepoint; a
+/// proc-only lock, never the world — see [`World`]'s lock order) and returns the next deliverable
+/// handler, keeping POSIX signal *policy* (dispositions, mask, pending) inside this personality
+/// while the interp only performs the *mechanism* (the safepoint redirect, invariant 4). #863: one
+/// door per process — a fork twin's door locks the twin's `Proc`, so its signals are its own.
+struct SignalDoor(Arc<Mutex<Proc>>);
 
 impl SignalSource for SignalDoor {
     fn take_deliverable(&self) -> Option<(i32, i32, u64)> {
         let mut st = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        // #798 slice 2 — a STOPPED process handles its signals at continue, not while stopped
+        // (POSIX): hold everything pending. Also closes the stop-fire race — the bookkeeping stop
+        // is synchronous under this lock, the domain flag lands a beat later, and in between the
+        // process must not consume a signal it should sleep on.
+        if st.stopped_sig.is_some() {
+            st.sig_armed.store(false, Ordering::Relaxed);
+            return None;
+        }
         // No signal stack registered ⇒ async delivery is off (poll-only): leave pending signals for the
         // guest's own `sigcheck` loop, and disarm so the interp stops asking.
         if st.sig_stack_base == 0 {
@@ -967,13 +1188,24 @@ impl SignalSource for SignalDoor {
             st.sig_pending &= !(1u64 << s);
             let handler = st.sig_handler.get(&s).copied().unwrap_or(SIG_DFL);
             if handler > SIG_IGN {
-                // A caught handler: deliver it. Re-arm iff another signal is already deliverable, so the
-                // interp returns for it once this handler completes (its in-handler guard then clears).
+                // A caught handler: deliver it. #796 block-during-handler — push the current mask
+                // and block the delivered signal + its `sa_mask` for the handler's duration
+                // (POSIX; `handler_returned` restores). This is also what makes NESTED delivery
+                // safe: a further signal may interrupt the handler, but never this same one.
+                st.note_delivery_flags(s); // #796 SA_RESTART (the safepoint dispatch also sweeps parks)
+                let saved = st.sig_mask;
+                st.handler_mask_stack.push(saved);
+                let sa = st.sig_action_mask.get(&s).copied().unwrap_or(0);
+                st.sig_mask = (saved | (1u64 << s) | sa) & !UNMASKABLE;
+                // Re-arm iff another signal is deliverable UNDER THE HANDLER MASK, so the interp
+                // returns for it (a nested delivery) or picks it up at the handler's return.
                 let more = (st.sig_pending & !st.sig_mask) != 0;
                 st.sig_armed.store(more, Ordering::Relaxed);
                 return Some((handler as i32, s, sp));
             }
-            // SIG_DFL / SIG_IGN: dropped in L0 (no default actions yet), keep scanning for a caught one.
+            // SIG_DFL / SIG_IGN: nothing to run async — ignored signals are discarded at generation
+            // and default-terminate fires through the kill door (#796), so anything still here is a
+            // stale pending bit; drop it and keep scanning for a caught one.
         }
     }
 
@@ -982,28 +1214,150 @@ impl SignalSource for SignalDoor {
     fn set_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).wake = Some(wake);
     }
+
+    /// #798 slice 2 — store the core's stop/continue closure for this process's domain.
+    fn set_stop(&self, stop: Arc<dyn Fn(bool) + Send + Sync>) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).stop = Some(stop);
+    }
+
+    /// #796 default actions — store the core's terminate closure for this process's domain.
+    fn set_kill(&self, kill: Arc<dyn Fn() + Send + Sync>) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).kill = Some(kill);
+    }
+
+    /// #796 `SA_RESTART` — answer the park sites: does the delivery behind the just-consumed
+    /// interrupt want the blocking call restarted?
+    fn syscall_restart(&self) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).restart_ok
+    }
+
+    /// #796 slice D — the pre-park pending check: a deliverable (caught, unmasked, async-on,
+    /// not-stopped) signal is pending right now, so an about-to-insert interruptible park should
+    /// complete `-EINTR` instead of blocking through it.
+    fn interrupt_pending(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .deliverable_now()
+    }
+
+    /// #796 block-during-handler — an injected handler frame returned: restore the pre-delivery
+    /// mask pushed by [`SignalDoor::take_deliverable`], then act on what the unblocking exposes —
+    /// a now-deliverable caught signal re-arms (the running vCPU picks it up at its next per-op
+    /// poll, no wake needed), and a held **fatal** signal runs its default action (the kill fire,
+    /// invoked here directly: the interp holds no locks at this call, and the fire's scheduler
+    /// work is safe from a running vCPU).
+    fn handler_returned(&self) {
+        let kill_fire = {
+            let mut st = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(saved) = st.handler_mask_stack.pop() {
+                st.sig_mask = saved & !UNMASKABLE;
+            }
+            st.arm_signals();
+            st.dispatch_default_actions()
+        };
+        if let Some(f) = kill_fire {
+            f();
+        }
+    }
 }
 
 pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> (i32, Posix) {
-    let inner = Arc::new(Mutex::new(new_inner(heap_base, heap_end, stdin)));
+    let world = Arc::new(Mutex::new(new_world(stdin)));
+    let root = Arc::new(Mutex::new(new_proc(heap_base, heap_end)));
     let posix = Posix {
-        inner: Arc::clone(&inner),
+        world: Arc::clone(&world),
+        root: Arc::clone(&root),
     };
+    // #863 slice 2 — the root is pid 1 in the process table (so a child can `kill(1, sig)` its
+    // init-like parent; `kill` short-circuits to the self path when the root signals itself).
+    world
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .procs
+        .insert(1, ProcEntry::Live(Arc::clone(&root)));
     // #796 L2 — install the async-signal source + the shared `armed` flag (the *same* `Arc` the
     // personality mutates), so the interp can redirect into a handler at a safepoint (PROCESS.md §9 L2).
-    let armed = inner
+    let armed = root
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .sig_armed
         .clone();
-    host.set_signal_source(Arc::new(SignalDoor(Arc::clone(&inner))), armed);
-    // FORK.md PR 5 — grant **forkable**: the factory re-mints the handler over the *same* shared
-    // `Inner` (fd table + memfs + cwd/env + captured output), so a `fork()` twin inherits the whole
-    // libc state, shared — POSIX fork-shares-open-file-descriptions. `Host::fork_powerbox` calls this
-    // factory to carry libc into the twin, instead of failing closed on an opaque closure.
-    let make = move || handler(Arc::clone(&inner));
-    let handle = host.grant_host_proc_forkable(make(), Arc::new(make));
+    host.set_signal_source(Arc::new(SignalDoor(Arc::clone(&root))), armed);
+    // FORK.md PR 5 / #863 — grant **forkable**: the factory clones the per-process side by POSIX's
+    // rules ([`Proc::fork`]) and shares the [`World`], so a `fork()` twin gets its own fd table /
+    // cwd / env / signal state over the shared memfs and open-file descriptions — real POSIX fork
+    // semantics. `Host::fork_powerbox` calls this factory to carry libc into the twin, instead of
+    // failing closed on an opaque closure.
+    let handle = host.grant_host_proc_forkable(
+        handler(Arc::clone(&world), Arc::clone(&root)),
+        fork_factory(world, root),
+    );
     (handle, posix)
+}
+
+/// #863 — the self-replicating fork factory over one process: mints a `fork()` twin's handler +
+/// signal door over a fresh [`Proc::fork`] clone (world shared), and a **replacement factory** over
+/// the twin's own `Proc` — so fork-of-fork clones the twin's state, not the grandparent's.
+///
+/// Slice 2: the twin is born with its **pid** (the scheduler `TaskId` the parent's `fork()`
+/// returns — the factory's argument) and registered in the world's process table, so `kill(pid)`
+/// can target it from anywhere in the world. Pid `0` is an **anonymous** mint (the spawned-child
+/// re-grant path, where no `TaskId` exists yet); slice 3 gives such a clone a pid from the
+/// personality's own allocator instead — every process is table-addressable, so an embedder
+/// ([`Posix::kill_pid`]) or a sibling can signal a spawned shell just like a fork twin.
+fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFork {
+    Arc::new(move |pid: u64| {
+        // World before Proc — the canonical order. (This runs under the core's scheduler lock;
+        // no dispatch fires a scheduler wake while holding the world lock — see [`Ctx::wake_after`]
+        // — so scheduler → world here cannot cross a world → scheduler hold.)
+        let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
+        let mut child = proc_.lock().unwrap_or_else(|e| e.into_inner()).fork();
+        let pid = if pid != 0 {
+            pid as i32
+        } else {
+            // Anonymous mint: allocate from the same space spawn zombies use (skip occupied).
+            while w.procs.contains_key(&w.next_pid) {
+                w.next_pid += 1;
+            }
+            let p = w.next_pid;
+            w.next_pid += 1;
+            p
+        };
+        child.pid = pid;
+        let armed = child.sig_armed.clone();
+        let child = Arc::new(Mutex::new(child));
+        w.procs.insert(pid, ProcEntry::Live(Arc::clone(&child)));
+        drop(w);
+        // #863 hygiene — the twin's exit retires its table entry: the core fires this with the
+        // raw exit status when the twin's task completes, and the process becomes a reapable
+        // zombie (`waitpid` then serves fork twins exactly like spawn children). Wait-encoding is
+        // OUR policy — WEXITSTATUS in bits 8–15, the same encode `spawn_core` uses; a crashed
+        // twin arrives as the core's crash status (128, already shell-`$?`-shaped) and encodes
+        // like any exit code. #796 default actions: a twin the delivery gate terminated
+        // (`term_sig` set — the core's kill is signal-blind, only this bookkeeping knows why)
+        // retires in the `WIFSIGNALED` shape instead: the signal in the low 7 bits.
+        let exit_world = Arc::clone(&world);
+        let exit_child = Arc::clone(&child);
+        let exit = Arc::new(move |status: i64| {
+            let term = exit_child
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .term_sig;
+            let encoded = match term {
+                Some(sig) => sig & 0x7f,
+                None => ((status & 0xff) << 8) as i32,
+            };
+            let mut w = exit_world.lock().unwrap_or_else(|e| e.into_inner());
+            w.procs.insert(pid, ProcEntry::Zombie(encoded));
+        });
+        ForkedProc {
+            handler: handler(Arc::clone(&world), Arc::clone(&child)),
+            signal: Some((Arc::new(SignalDoor(Arc::clone(&child))), armed)),
+            refork: Some(fork_factory(Arc::clone(&world), child)),
+            exit: Some(exit),
+        }
+    })
 }
 
 /// Build the personality as a re-grantable **capability factory** for the powerbox model (svm-run's
@@ -1018,12 +1372,30 @@ pub fn cap(
     heap_end: u64,
     stdin: Vec<u8>,
 ) -> (Posix, impl Fn() -> HostProc + Send + Sync + 'static) {
-    let inner = Arc::new(Mutex::new(new_inner(heap_base, heap_end, stdin)));
+    let world = Arc::new(Mutex::new(new_world(stdin)));
+    let root = Arc::new(Mutex::new(new_proc(heap_base, heap_end)));
     let posix = Posix {
-        inner: Arc::clone(&inner),
+        world: Arc::clone(&world),
+        root: Arc::clone(&root),
     };
-    let make = move || handler(Arc::clone(&inner));
+    // #863 slice 2 — the root is pid 1 in the process table (so a child can `kill(1, sig)` its
+    // init-like parent; `kill` short-circuits to the self path when the root signals itself).
+    world
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .procs
+        .insert(1, ProcEntry::Live(Arc::clone(&root)));
+    // Per-backend mint over the SAME world+proc: the interp and JIT hosts are two engines of one
+    // process, so they share both sides (unlike a fork, which clones the proc side).
+    let make = move || handler(Arc::clone(&world), Arc::clone(&root));
     (posix, make)
+}
+
+/// #863 — the [`fork_factory`] over an existing [`cap`]/[`grant`] personality's **root process**,
+/// for embedders that grant the personality through the powerbox path (`HostCap`) and want real
+/// POSIX fork semantics there too (svm-run's `posix_cap`).
+pub fn cap_fork_factory(posix: &Posix) -> HostProcFork {
+    fork_factory(Arc::clone(&posix.world), Arc::clone(&posix.root))
 }
 
 /// The **`net` capability** as a factory over an existing personality (POSIX.md §5a) — the same
@@ -1031,16 +1403,23 @@ pub fn cap(
 /// over the *same* shared state, so the socket fds it mints live in the same fd table the libc
 /// `read`/`write`/`close`/`dup2` ops serve — the data plane needs no new surface.
 pub fn net_cap_factory(posix: &Posix) -> impl Fn() -> HostProc + Send + Sync + 'static {
-    let inner = Arc::clone(&posix.inner);
-    move || net_handler(Arc::clone(&inner))
+    let world = Arc::clone(&posix.world);
+    let root = Arc::clone(&posix.root);
+    move || net_handler(Arc::clone(&world), Arc::clone(&root))
 }
 
 /// Build the `net` capability's [`HostProc`] handler over shared `inner`: the tiny authority surface
 /// (connect / bind / accept / shutdown / resolve). An unknown op is a clean `CapFault`.
-fn net_handler(inner: Arc<Mutex<Inner>>) -> HostProc {
+fn net_handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
     Box::new(
         move |op, args, mem, _minter: Option<&mut dyn svm_interp::RegionMinter>| {
-            let mut st = inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
+            let mut p = proc_.lock().unwrap_or_else(|e| e.into_inner());
+            let mut st = Ctx {
+                w: &mut w,
+                p: &mut p,
+                wake_after: Vec::new(),
+            };
             match op {
                 NET_CONNECT => st.net_connect(args, mem),
                 NET_BIND => st.net_bind(args, mem),
@@ -1053,43 +1432,54 @@ fn net_handler(inner: Arc<Mutex<Inner>>) -> HostProc {
     )
 }
 
-/// A fresh personality state: preloaded `stdin`, the window-heap arena bounded by `[heap_base, heap_end)`,
-/// and the three stdio sentinels seeded in the fd table. Shared by [`grant`] and [`cap`].
-fn new_inner(heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> Inner {
-    Inner {
+/// A fresh shared [`World`]: preloaded `stdin`, empty memfs, no delegates. Shared by [`grant`] and
+/// [`cap`]; every process of the personality shares this one.
+fn new_world(stdin: Vec<u8>) -> World {
+    World {
         stdout: Vec::new(),
         stdout_sink: None,
         stderr: Vec::new(),
         stdin,
         stdin_pos: 0,
-        heap_next: heap_base,
-        heap_end,
-        allocated: HashMap::new(),
-        free_list: Vec::new(),
         files: HashMap::new(),
         explicit_dirs: HashSet::new(),
-        fds: vec![
-            Some(FdEntry::Stdin),
-            Some(FdEntry::Stdout),
-            Some(FdEntry::Stderr),
-        ],
         net_listeners: HashMap::new(),
         net_next_port: 49152, // the IANA ephemeral range start
         net_delegate: None,
-        dirs: Vec::new(),
-        args: Vec::new(),
-        cwd: "/".to_string(),
-        env: HashMap::new(),
         clock_base: std::time::Instant::now(),
         clock_fixed: None,
-        env_ptrs: HashMap::new(),
         commands: Vec::new(),
         exec_stdout_handle: 0,
         exec_stdin_handle: 0,
         exec_stdin_fifo: None,
         spawn_fn: None,
-        children: HashMap::new(),
+        procs: HashMap::new(),
         next_pid: 1000,
+        fg_pgid: 1,
+    }
+}
+
+/// A fresh [`Proc`]: the window-heap arena bounded by `[heap_base, heap_end)`, the three stdio
+/// sentinels seeded in the fd table, default signal state.
+fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
+    Proc {
+        pid: 1,  // the root process — init-like; fork twins get their TaskId stamped by the factory
+        ppid: 0, // no recorded parent (#800 getppid)
+        pgid: 1, // the root leads process group 1
+        heap_next: heap_base,
+        heap_end,
+        allocated: HashMap::new(),
+        free_list: Vec::new(),
+        fds: vec![
+            Some(FdEntry::Stdin),
+            Some(FdEntry::Stdout),
+            Some(FdEntry::Stderr),
+        ],
+        dirs: Vec::new(),
+        args: Vec::new(),
+        cwd: "/".to_string(),
+        env: HashMap::new(),
+        env_ptrs: HashMap::new(),
         sig_pending: 0,
         sig_handler: HashMap::new(),
         sig_mask: 0,
@@ -1098,16 +1488,32 @@ fn new_inner(heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> Inner {
         sig_stack_base: 0,
         sig_armed: Arc::new(AtomicBool::new(false)),
         wake: None,
+        stop: None,
+        stopped_sig: None,
+        stop_fresh: false,
+        cont_fresh: false,
+        kill: None,
+        term_sig: None,
+        handler_mask_stack: Vec::new(),
+        restart_ok: false,
     }
 }
 
-/// Build the POSIX [`HostProc`] handler over shared `inner`. Dispatches on the op number; an unknown op
-/// on this handle is a `CapFault` (as for any capability).
-fn handler(inner: Arc<Mutex<Inner>>) -> HostProc {
+/// Build the POSIX [`HostProc`] handler for one process: the shared [`World`] + this process's
+/// [`Proc`]. Dispatches on the op number; an unknown op on this handle is a `CapFault` (as for any
+/// capability). Both locks are taken at dispatch top in the canonical order (world, then proc — see
+/// [`World`]), exactly the blanket-lock scope the pre-split single mutex had.
+fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
     Box::new(
         move |op, args, mem, _minter: Option<&mut dyn svm_interp::RegionMinter>| {
-            let mut st = inner.lock().unwrap_or_else(|e| e.into_inner());
-            match op {
+            let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
+            let mut p = proc_.lock().unwrap_or_else(|e| e.into_inner());
+            let mut st = Ctx {
+                w: &mut w,
+                p: &mut p,
+                wake_after: Vec::new(),
+            };
+            let res = match op {
                 OP_WRITE => st.write(args, mem),
                 OP_READ => st.read(args, mem),
                 OP_MALLOC => Ok(vec![st.malloc(args)]),
@@ -1127,10 +1533,10 @@ fn handler(inner: Arc<Mutex<Inner>>) -> HostProc {
                 OP_OPENDIR => st.opendir(args, mem),
                 OP_READDIR => st.readdir(args, mem),
                 OP_CLOSEDIR => Ok(vec![st.closedir(args)]),
-                OP_ARGC => Ok(vec![st.args.len() as i64]),
+                OP_ARGC => Ok(vec![st.p.args.len() as i64]),
                 OP_ARGV => st.argv(args, mem),
                 OP_EXEC_LOOKUP => st.exec_lookup(args, mem),
-                OP_EXEC_STDOUT => Ok(vec![st.exec_stdout_handle as i64]),
+                OP_EXEC_STDOUT => Ok(vec![st.w.exec_stdout_handle as i64]),
                 OP_EXEC_STDIN => st.exec_stdin(args, mem),
                 OP_EXEC_WIN => st.exec_win(args),
                 OP_PIPE => st.pipe(args, mem),
@@ -1155,13 +1561,273 @@ fn handler(inner: Arc<Mutex<Inner>>) -> HostProc {
                 OP_UNSETENV => st.unsetenv(args, mem),
                 OP_ENVIRON => st.environ(args, mem),
                 OP_CLOCK => Ok(vec![st.clock(args)]),
+                OP_GETPID => Ok(vec![st.p.pid as i64]),
+                OP_SETPGID => Ok(vec![st.setpgid(args)]),
+                OP_GETPGID => Ok(vec![st.getpgid(args)]),
+                OP_TCGETPGRP => Ok(vec![st.tcgetpgrp(args)]),
+                OP_TCSETPGRP => Ok(vec![st.tcsetpgrp(args)]),
+                OP_ISATTY => Ok(vec![st.isatty(args)]),
+                OP_GETPPID => Ok(vec![st.p.ppid as i64]),
                 _ => Err(Trap::CapFault),
+            };
+            // Fire a deferred cross-process wake (see [`Ctx::wake_after`]) only after both guards
+            // drop — and from a **detached thread**: the interp invoked this handler while holding
+            // our domain's `Host` lock, the wake takes the scheduler lock, and scheduler-lock
+            // holders lock `Host`s (fork mints, park interrupts) — a same-stack fire could close a
+            // host ↔ scheduler cycle. Cross-process signals are human-frequency, so a short-lived
+            // thread is the boring, provably-unentangled choice. (The embedder paths —
+            // [`Posix::raise_signal`], [`Posix::kill_pid`] — hold no `Host` lock and fire inline.)
+            let wakes = std::mem::take(&mut st.wake_after);
+            drop(p);
+            drop(w);
+            if !wakes.is_empty() {
+                std::thread::spawn(move || {
+                    for wk in wakes {
+                        wk();
+                    }
+                });
             }
+            res
         },
     )
 }
 
-impl Inner {
+impl Proc {
+    /// #796 L2 — nudge the interp's per-op poll to check for delivery: set the shared `armed` flag when
+    /// async delivery is *possible* (a signal stack is registered). `SignalSource::take_deliverable` is
+    /// #798 slice 2 — **the one signal-delivery gate**: every raise aimed at this process (`kill`
+    /// self/table/table-sweep, [`Posix::kill_pid`], [`Posix::raise_signal`], the TTOU/TTIN
+    /// terminal check) routes here, so the job-control actions live in one place:
+    ///
+    /// - `SIGCONT`: clear a stop (mark it for `WCONTINUED`) and return the **continue** fire; a
+    ///   caught `SIGCONT` also pends (POSIX: the handler runs after the continue).
+    /// - `SIGSTOP`: stop, unconditionally (uncatchable, unignorable).
+    /// - `SIGTSTP`/`SIGTTIN`/`SIGTTOU`: default disposition ⇒ **stop** (mark for `WUNTRACED`);
+    ///   ignored ⇒ dropped; caught ⇒ the ordinary pending path.
+    /// - anything else: pending + arm, the wake when deliverable (the pre-slice behavior).
+    ///
+    /// Returns the deferred fire — the target's run-wake, or its stop/continue closure wrapped to
+    /// the right direction — for the caller to run **after its locks drop** ([`Ctx::wake_after`] /
+    /// the embedder paths). A missing stop closure degrades to bookkeeping-only (see
+    /// [`Proc::stop`]).
+    fn deliver_signal(&mut self, sig: i32) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        let disposition = |p: &Proc, s: i32| p.sig_handler.get(&s).copied().unwrap_or(SIG_DFL);
+        match sig {
+            SIGCONT => {
+                let was_stopped = self.stopped_sig.take().is_some();
+                if was_stopped {
+                    self.cont_fresh = true;
+                    self.stop_fresh = false; // an unreported stop superseded by the continue
+                }
+                if disposition(self, SIGCONT) > SIG_IGN {
+                    self.sig_pending |= 1 << SIGCONT;
+                    self.note_delivery_flags(SIGCONT); // #796 SA_RESTART
+                    self.arm_signals();
+                }
+                if was_stopped {
+                    // #796 default actions — a fatal signal held while stopped runs its action at
+                    // the continue (POSIX): the kill fire subsumes the continue fire (it wakes the
+                    // stopped domain itself, and death beats stop at the poll).
+                    if let Some(kf) = self.dispatch_default_actions() {
+                        return Some(kf);
+                    }
+                    self.stop
+                        .clone()
+                        .map(|f| -> Arc<dyn Fn() + Send + Sync> { Arc::new(move || f(false)) })
+                } else if self.deliverable_now() {
+                    self.wake.clone()
+                } else {
+                    None
+                }
+            }
+            SIGSTOP => self.enter_stop(SIGSTOP),
+            SIGTSTP | SIGTTIN | SIGTTOU => match disposition(self, sig) {
+                SIG_DFL => self.enter_stop(sig),
+                SIG_IGN => None,
+                _ => {
+                    self.sig_pending |= 1 << sig;
+                    self.note_delivery_flags(sig); // #796 SA_RESTART
+                    self.arm_signals();
+                    if self.deliverable_now() {
+                        self.wake.clone()
+                    } else {
+                        None
+                    }
+                }
+            },
+            _ => {
+                let disp = disposition(self, sig);
+                // #796 default actions. Ignored — explicitly (`SIG_IGN`) or by default
+                // (CHLD/URG/WINCH) — is discarded at generation (POSIX). This replaces the L0
+                // posture of pending such signals forever.
+                if disp == SIG_IGN || (disp == SIG_DFL && default_ignored(sig)) {
+                    return None;
+                }
+                if disp == SIG_DFL {
+                    // Default action: TERMINATE. Masked or stopped ⇒ held pending — the action
+                    // runs at unblock (`sigprocmask`) / continue (`SIGCONT`), not at raise.
+                    // `SIGKILL` alone can never be held (unmaskable, kills a stopped process).
+                    if sig != SIGKILL
+                        && (self.stopped_sig.is_some() || (1u64 << sig) & self.sig_mask != 0)
+                    {
+                        self.sig_pending |= 1 << sig;
+                        return None;
+                    }
+                    self.term_sig = Some(sig);
+                    return self.kill.clone();
+                }
+                // Caught: pend + arm. A stopped process holds delivery until continued
+                // ([`SignalDoor::take_deliverable`]'s gate).
+                self.sig_pending |= 1 << sig;
+                self.note_delivery_flags(sig); // #796 SA_RESTART
+                self.arm_signals();
+                if self.deliverable_now() {
+                    self.wake.clone()
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// #796 `SA_RESTART` — record whether `sig`'s action wants interrupted blocking calls
+    /// restarted, at every point a caught delivery can fire a park interrupt. Plain `signal()`
+    /// installs leave `sa_flags` at 0 (the SysV flavor: no restart) — only a `sigaction` with
+    /// `SA_RESTART` opts in.
+    fn note_delivery_flags(&mut self, sig: i32) {
+        self.restart_ok = (self.sig_action_flags.get(&sig).copied().unwrap_or(0) & SA_RESTART) != 0;
+    }
+
+    /// #796 default actions — run the default action for a pending, unmasked, `SIG_DFL`
+    /// **terminate**-action signal (lowest number first; POSIX leaves the order unspecified):
+    /// consume it, record it as this process's terminating signal, and hand back the core's
+    /// terminate fire for the caller's deferred-wake path. Job-control signals are excluded
+    /// (their default actions have their own arms in [`Proc::deliver_signal`]); a stopped
+    /// process holds everything until continued. Called wherever a held fatal signal can
+    /// become actionable: unblock (`sigprocmask`), continue (`SIGCONT`), and a disposition
+    /// reset to `SIG_DFL` (`signal`/`sigaction`).
+    fn dispatch_default_actions(&mut self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        if self.stopped_sig.is_some() {
+            return None;
+        }
+        let mut cand = self.sig_pending & !self.sig_mask;
+        while cand != 0 {
+            let s = cand.trailing_zeros() as i32;
+            cand &= !(1u64 << s);
+            if matches!(s, SIGCONT | SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU) || default_ignored(s) {
+                continue;
+            }
+            if self.sig_handler.get(&s).copied().unwrap_or(SIG_DFL) == SIG_DFL {
+                self.sig_pending &= !(1u64 << s);
+                self.term_sig = Some(s);
+                return self.kill.clone();
+            }
+        }
+        None
+    }
+
+    /// The stop half of the gate: record the stopping signal (report-once for `WUNTRACED`) and
+    /// return the domain-stop fire. Already-stopped ⇒ nothing new to do or report.
+    fn enter_stop(&mut self, sig: i32) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        if self.stopped_sig.is_some() {
+            return None;
+        }
+        self.stopped_sig = Some(sig);
+        self.stop_fresh = true;
+        self.cont_fresh = false;
+        self.stop
+            .clone()
+            .map(|f| -> Arc<dyn Fn() + Send + Sync> { Arc::new(move || f(true)) })
+    }
+
+    /// authoritative and disarms if nothing is actually deliverable, so an over-eager arm costs only one
+    /// no-op poll. Called wherever a signal may become deliverable (raise / unblock / install a handler /
+    /// register a stack).
+    fn arm_signals(&self) {
+        if self.sig_stack_base != 0 {
+            self.sig_armed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// #799 L1 — is a signal **deliverable right now**? Non-destructive twin of [`SignalDoor::
+    /// take_deliverable`]'s gate: a caught (`> SIG_IGN`), unmasked, pending signal with async delivery on
+    /// (a signal stack registered). This is the personality's *policy* the embedder-`^C` path consults
+    /// before poking the interp: an ignored or masked signal is **not** deliverable, so it never interrupts
+    /// a blocked syscall.
+    fn deliverable_now(&self) -> bool {
+        if self.stopped_sig.is_some() {
+            return false; // #798 slice 2 — a stopped process delivers at continue, never before
+        }
+        if self.sig_stack_base == 0 {
+            return false; // async delivery off (poll-only)
+        }
+        let mut d = self.sig_pending & !self.sig_mask;
+        while d != 0 {
+            let s = d.trailing_zeros() as i32;
+            d &= !(1u64 << s);
+            if self.sig_handler.get(&s).copied().unwrap_or(SIG_DFL) > SIG_IGN {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// #863 — POSIX `fork()` of the per-process state, in one place so the rules are auditable:
+    /// the fd **table** is copied entry-wise over **shared** descriptions ([`FdEntry::dup_clone`] —
+    /// offsets and pipe liveness stay shared, POSIX fork-shares-open-file-descriptions), cwd / env /
+    /// args are copied, the allocator bookkeeping is copied (it describes the twin's private window
+    /// copy equally), signal dispositions / mask / `sigaction` extras / the signal stack are copied,
+    /// and **pending signals are cleared** (POSIX: a child starts with none). The twin gets a fresh
+    /// `armed` flag (its door is its own) and no wake (each run installs its own).
+    fn fork(&self) -> Proc {
+        Proc {
+            pid: 0, // stamped by [`fork_factory`]: the twin's TaskId, or an allocated pid (re-grant)
+            ppid: self.pid, // #800 getppid — the forking process is the parent
+            pgid: self.pgid, // POSIX: a fork twin inherits its parent's process group
+            heap_next: self.heap_next,
+            heap_end: self.heap_end,
+            allocated: self.allocated.clone(),
+            free_list: self.free_list.clone(),
+            fds: self
+                .fds
+                .iter()
+                .map(|s| s.as_ref().map(FdEntry::dup_clone))
+                .collect(),
+            dirs: self
+                .dirs
+                .iter()
+                .map(|s| {
+                    s.as_ref().map(|d| DirStream {
+                        entries: d.entries.clone(),
+                        pos: d.pos,
+                    })
+                })
+                .collect(),
+            args: self.args.clone(),
+            cwd: self.cwd.clone(),
+            env: self.env.clone(),
+            env_ptrs: self.env_ptrs.clone(),
+            sig_pending: 0,
+            sig_handler: self.sig_handler.clone(),
+            sig_mask: self.sig_mask,
+            sig_action_mask: self.sig_action_mask.clone(),
+            sig_action_flags: self.sig_action_flags.clone(),
+            sig_stack_base: self.sig_stack_base,
+            sig_armed: Arc::new(AtomicBool::new(false)),
+            wake: None,
+            stop: None, // the twin's own domain gets its closure at mint (like the wake)
+            stopped_sig: None,
+            stop_fresh: false,
+            cont_fresh: false,
+            kill: None, // ditto — the twin's own terminate closure lands at mint
+            term_sig: None,
+            handler_mask_stack: self.handler_mask_stack.clone(), // forked mid-handler: the twin restores on its inherited return (POSIX fork copies signal state)
+            restart_ok: self.restart_ok,
+        }
+    }
+}
+
+impl Ctx<'_> {
     /// `write(fd, buf, len) -> n | -errno`: the `Stdout`/`Stderr` sentinels append to the captured
     /// stdout/stderr; a `File` fd writes into its memfs file at the offset (extending it), advancing it;
     /// a `PipeWrite` fd appends to its shared buffer. `Stdin`, a `PipeRead`, a read-only file, and an
@@ -1180,14 +1846,14 @@ impl Inner {
 
     /// Write `data` to fd `fd`'s current binding, returning the count or `-EBADF`: the `Stdout`/`Stderr`
     /// sentinels append to captured stdout/stderr, a `File` writes at its offset, a `PipeWrite` appends to
-    /// its shared buffer. Factored out of [`Inner::write`] so `spawn` can route a child's captured stdout
+    /// its shared buffer. Factored out of [`Ctx::write`] so `spawn` can route a child's captured stdout
     /// to *whatever the caller's fd 1 currently is* (the fd-inheritance path). Empty `data` is a `0` no-op.
     fn sink_write(&mut self, fd: i64, data: &[u8]) -> i64 {
         if data.is_empty() {
             return 0;
         }
-        // Decide the sink first (cloning the pipe `Arc`) so we don't hold a borrow of `self.fds` while
-        // mutating `self.stdout`/`self.stderr`/the memfs.
+        // Decide the sink first (cloning the pipe `Arc`) so we don't hold a borrow of `self.p.fds` while
+        // mutating `self.w.stdout`/`self.w.stderr`/the memfs.
         enum Sink {
             Stdout,
             Stderr,
@@ -1206,15 +1872,20 @@ impl Inner {
             Some(FdEntry::NetStream(d)) => Sink::NetDelegate(Arc::clone(d)),
             _ => Sink::Bad,
         };
+        // #798 — a background write to the proto-terminal rings SIGTTOU (doorbell; the write still
+        // proceeds until slice 2's stop). Unconditional pending TOSTOP: termios lands with #797.
+        if matches!(sink, Sink::Stdout | Sink::Stderr) {
+            self.tty_background_check(SIGTTOU);
+        }
         match sink {
-            Sink::Stdout => match &self.stdout_sink {
+            Sink::Stdout => match &self.w.stdout_sink {
                 Some(s) => s
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .extend_from_slice(data),
-                None => self.stdout.extend_from_slice(data),
+                None => self.w.stdout.extend_from_slice(data),
             },
-            Sink::Stderr => self.stderr.extend_from_slice(data),
+            Sink::Stderr => self.w.stderr.extend_from_slice(data),
             Sink::File => return self.file_write(fd as usize, data),
             Sink::Pipe(p) => p
                 .lock()
@@ -1264,9 +1935,12 @@ impl Inner {
         };
         let chunk: Vec<u8> = match src {
             Src::Stdin => {
-                let avail = &self.stdin[self.stdin_pos.min(self.stdin.len())..];
+                // #798 — a background read from the proto-terminal rings SIGTTIN (doorbell; the
+                // read still proceeds until slice 2's stop).
+                self.tty_background_check(SIGTTIN);
+                let avail = &self.w.stdin[self.w.stdin_pos.min(self.w.stdin.len())..];
                 let n = len.min(avail.len());
-                self.stdin_pos += n;
+                self.w.stdin_pos += n;
                 avail[..n].to_vec()
             }
             Src::File => match self.file_read(fd as usize, len) {
@@ -1314,7 +1988,7 @@ impl Inner {
         if fd < 0 {
             return None;
         }
-        self.fds.get(fd as usize).and_then(|s| s.as_ref())
+        self.p.fds.get(fd as usize).and_then(|s| s.as_ref())
     }
 
     /// `open(path_ptr, path_len, flags) -> fd | -errno`: open (or `O_CREAT`) a memfs file, returning a
@@ -1329,22 +2003,24 @@ impl Inner {
         let Ok(path) = String::from_utf8(bytes) else {
             return Ok(vec![EINVAL]);
         };
-        let exists = self.files.contains_key(&path);
+        let exists = self.w.files.contains_key(&path);
         if !exists && flags & O_CREAT == 0 {
             return Ok(vec![ENOENT]);
         }
-        let file = self.files.entry(path.clone()).or_default();
+        let file = self.w.files.entry(path.clone()).or_default();
         if flags & O_TRUNC != 0 {
             file.clear();
         }
         let pos = if flags & O_APPEND != 0 { file.len() } else { 0 };
         let acc = flags & O_ACCMODE;
         let writable = acc == O_WRONLY || acc == O_RDWR;
-        Ok(vec![self.alloc_fd(FdEntry::File(OpenFile {
-            path,
-            pos,
-            writable,
-        }))])
+        Ok(vec![self.alloc_fd(FdEntry::File(Arc::new(Mutex::new(
+            OpenFile {
+                path,
+                pos,
+                writable,
+            },
+        ))))])
     }
 
     /// `close(fd) -> 0 | -errno`: release any open fd (a file, a pipe end, or a stdio sentinel — a shell
@@ -1352,17 +2028,18 @@ impl Inner {
     fn close(&mut self, args: &[i64]) -> i64 {
         let fd = *args.first().unwrap_or(&-1);
         if fd >= 0 {
-            if let Some(slot) = self.fds.get_mut(fd as usize) {
+            if let Some(slot) = self.p.fds.get_mut(fd as usize) {
                 if let Some(entry) = slot.take() {
                     // Closing a memnet listener releases its port — but only if the registry still
                     // points at *this* listener's queue (a stale dup must not evict a later binder).
                     if let FdEntry::NetListener(l) = &entry {
                         if self
+                            .w
                             .net_listeners
                             .get(&l.addr.port)
                             .is_some_and(|q| Arc::ptr_eq(q, &l.pending))
                         {
-                            self.net_listeners.remove(&l.addr.port);
+                            self.w.net_listeners.remove(&l.addr.port);
                         }
                     }
                     return 0;
@@ -1378,24 +2055,23 @@ impl Inner {
         let fd = *args.first().unwrap_or(&-1);
         let offset = *args.get(1).unwrap_or(&0);
         let whence = *args.get(2).unwrap_or(&-1);
-        let (path, pos) = match self.fd(fd) {
-            Some(FdEntry::File(of)) => (of.path.clone(), of.pos as i64),
+        let desc = match self.fd(fd) {
+            Some(FdEntry::File(of)) => Arc::clone(of),
             Some(_) => return ESPIPE,
             None => return EBADF,
         };
-        let size = self.files.get(&path).map_or(0, |f| f.len()) as i64;
+        let mut of = desc.lock().unwrap_or_else(|e| e.into_inner());
+        let size = self.w.files.get(&of.path).map_or(0, |f| f.len()) as i64;
         let newpos = match whence {
             SEEK_SET => offset,
-            SEEK_CUR => pos + offset,
+            SEEK_CUR => of.pos as i64 + offset,
             SEEK_END => size + offset,
             _ => return EINVAL,
         };
         if newpos < 0 {
             return EINVAL;
         }
-        if let Some(FdEntry::File(of)) = self.fds[fd as usize].as_mut() {
-            of.pos = newpos as usize;
-        }
+        of.pos = newpos as usize;
         newpos
     }
 
@@ -1432,10 +2108,10 @@ impl Inner {
         }
         let dup = entry.dup_clone();
         let n = newfd as usize;
-        if self.fds.len() <= n {
-            self.fds.resize_with(n + 1, || None);
+        if self.p.fds.len() <= n {
+            self.p.fds.resize_with(n + 1, || None);
         }
-        self.fds[n] = Some(dup);
+        self.p.fds[n] = Some(dup);
         newfd
     }
 
@@ -1489,18 +2165,21 @@ impl Inner {
         };
         match src {
             Src::Stdin => {
-                let out = self.stdin[self.stdin_pos.min(self.stdin.len())..].to_vec();
-                self.stdin_pos = self.stdin.len();
+                let out = self.w.stdin[self.w.stdin_pos.min(self.w.stdin.len())..].to_vec();
+                self.w.stdin_pos = self.w.stdin.len();
                 out
             }
             // A file has a bounded length; read from the offset to EOF in one shot.
             Src::File => {
-                let n = match self.fds.get(fd as usize).and_then(|s| s.as_ref()) {
-                    Some(FdEntry::File(of)) => self
-                        .files
-                        .get(&of.path)
-                        .map_or(0, |f| f.len())
-                        .saturating_sub(of.pos),
+                let n = match self.p.fds.get(fd as usize).and_then(|s| s.as_ref()) {
+                    Some(FdEntry::File(of)) => {
+                        let of = of.lock().unwrap_or_else(|e| e.into_inner());
+                        self.w
+                            .files
+                            .get(&of.path)
+                            .map_or(0, |f| f.len())
+                            .saturating_sub(of.pos)
+                    }
                     _ => 0,
                 };
                 self.file_read(fd as usize, n).unwrap_or_default()
@@ -1607,24 +2286,31 @@ impl Inner {
         stderr_fd: i64,
     ) -> i64 {
         // Fail closed *before* any side effect (draining stdin) if no delegate is wired.
-        if self.spawn_fn.is_none() {
+        if self.w.spawn_fn.is_none() {
             return ENOSYS;
         }
         // The child inherits its stdin from `stdin_fd` (fd 0 by default) — drain it before the delegate.
         let stdin = self.drain_fd(if stdin_fd < 0 { 0 } else { stdin_fd });
         // Take the delegate out to call it (a `&mut self` method cannot also borrow the boxed closure),
         // then restore it.
-        let mut f = self.spawn_fn.take().unwrap();
+        let mut f = self.w.spawn_fn.take().unwrap();
         let res = f(name, argv, &stdin);
-        self.spawn_fn = Some(f);
+        self.w.spawn_fn = Some(f);
         // Route the child's stdout/stderr to the requested fds (default: the caller's current fd 1 / fd
         // 2 — inheritance, as a prior `dup2(_, 1)` / `dup2(_, 2)` redirect lands each in a file or pipe).
         self.sink_write(if stdout_fd < 0 { 1 } else { stdout_fd }, &res.stdout);
         self.sink_write(if stderr_fd < 0 { 2 } else { stderr_fd }, &res.stderr);
-        let pid = self.next_pid;
-        self.next_pid += 1;
+        // One pid space (#863 slice 2): allocate past any pid the table already knows (fork twins
+        // occupy their `TaskId`s, the root holds 1), then park the child as a reapable zombie.
+        while self.w.procs.contains_key(&self.w.next_pid) {
+            self.w.next_pid += 1;
+        }
+        let pid = self.w.next_pid;
+        self.w.next_pid += 1;
         // Wait-encode the exit status: WEXITSTATUS occupies bits 8–15, low bits 0 (a normal exit).
-        self.children.insert(pid, (res.status & 0xff) << 8);
+        self.w
+            .procs
+            .insert(pid, ProcEntry::Zombie((res.status & 0xff) << 8));
         pid as i64
     }
 
@@ -1636,17 +2322,64 @@ impl Inner {
         let mem = mem.ok_or(Trap::Malformed)?;
         let pid = *args.first().ok_or(Trap::Malformed)?;
         let status_ptr = *args.get(1).unwrap_or(&0) as u64;
+        // #863 — reap from the process table: [`ProcEntry::Zombie`] entries are reapable here —
+        // completed spawn-delegate children, and (hygiene slice) **exited fork twins**, whose exit
+        // hook flipped them Live → Zombie. A still-running twin is `-ECHILD` (this op never blocks
+        // — a guest polls, or parks in the core's servicer reap, the wait offer, which serves the
+        // same twin independently; use one channel per child).
+        let is_zombie = |e: Option<&ProcEntry>| matches!(e, Some(ProcEntry::Zombie(_)));
         let reaped = if pid == -1 {
-            self.children.keys().min().copied()
-        } else if self.children.contains_key(&(pid as i32)) {
+            self.w
+                .procs
+                .iter()
+                .filter_map(|(p, e)| matches!(e, ProcEntry::Zombie(_)).then_some(*p))
+                .min()
+        } else if is_zombie(self.w.procs.get(&(pid as i32))) {
             Some(pid as i32)
         } else {
             None
         };
+        // #798 slice 2 — `WUNTRACED`/`WCONTINUED`: with no zombie to reap, a freshly-stopped
+        // (or freshly-continued) live process matching the pid filter is reportable — once. The
+        // entry stays in the table (the process is alive); only the fresh mark clears. Status
+        // encodes the Linux wait word: stopped = `sig<<8 | 0x7f`, continued = `0xffff`.
+        let opts = *args.get(2).unwrap_or(&0);
+        if reaped.is_none() && (opts & (WUNTRACED | WCONTINUED)) != 0 {
+            let self_pid = self.p.pid;
+            let mut hit: Option<(i32, i32)> = None;
+            for (&tpid, e) in self.w.procs.iter() {
+                if tpid == self_pid || (pid != -1 && pid != tpid as i64) {
+                    continue; // never report ourselves; respect a named-pid wait
+                }
+                let ProcEntry::Live(t) = e else { continue };
+                let mut tp = t.lock().unwrap_or_else(|e| e.into_inner());
+                if (opts & WUNTRACED) != 0 && tp.stop_fresh {
+                    tp.stop_fresh = false;
+                    let sig = tp.stopped_sig.unwrap_or(SIGSTOP);
+                    hit = Some((tpid, (sig << 8) | 0x7f));
+                    break;
+                }
+                if (opts & WCONTINUED) != 0 && tp.cont_fresh {
+                    tp.cont_fresh = false;
+                    hit = Some((tpid, 0xffff));
+                    break;
+                }
+            }
+            if let Some((tpid, status)) = hit {
+                if status_ptr != 0 {
+                    mem.write_bytes(status_ptr, &status.to_le_bytes())
+                        .ok_or(Trap::Malformed)?;
+                }
+                return Ok(vec![tpid as i64]);
+            }
+        }
         let Some(p) = reaped else {
             return Ok(vec![ECHILD]);
         };
-        let status: i32 = self.children.remove(&p).unwrap_or(0);
+        let status: i32 = match self.w.procs.remove(&p) {
+            Some(ProcEntry::Zombie(st)) => st,
+            _ => unreachable!("reaped pid selected as a zombie above"),
+        };
         if status_ptr != 0 {
             mem.write_bytes(status_ptr, &status.to_le_bytes())
                 .ok_or(Trap::Malformed)?;
@@ -1663,59 +2396,222 @@ impl Inner {
         if !(1..=63).contains(&signum) {
             return EINVAL;
         }
+        // #796 default actions — POSIX forbids changing SIGKILL/SIGSTOP's action.
+        if signum as i32 == SIGKILL || signum as i32 == SIGSTOP {
+            return EINVAL;
+        }
         let prev = self
+            .p
             .sig_handler
             .insert(signum as i32, handler)
             .unwrap_or(SIG_DFL);
-        self.arm_signals(); // #796 L2 — a handler installed for an already-pending signal may deliver now
+        self.p.arm_signals(); // #796 L2 — a handler installed for an already-pending signal may deliver now
+        if handler == SIG_DFL {
+            // #796 default actions — a reset to `SIG_DFL` runs a pending signal's action now.
+            if let Some(f) = self.p.dispatch_default_actions() {
+                self.wake_after.push(f);
+            }
+        }
         prev
     }
 
-    /// `kill(pid, sig) -> 0 | -errno`: raise `sig` (set its pending bit). `pid` is advisory in this
-    /// single-process doorbell (`raise(s)` is the guest `kill(0, s)`). Out-of-range `sig` is `-EINVAL`;
-    /// `sig == 0` (the POSIX existence probe) is a `0` no-op.
+    /// `kill(pid, sig) -> 0 | -errno` — #863 slice 2: **pid-targeted** through the process table.
+    /// `pid == 0` or the caller's own pid is the self path (`raise(s)`); any other pid is a table
+    /// lookup — a live process gets **its** pending bit set (and its run woken when the signal is
+    /// deliverable by **its** dispositions, the depth-agnostic `kill(child_pid, SIGINT)`); a spawn
+    /// zombie exists-until-reaped (`0`, signal dropped); an unknown pid is `-ESRCH`. `sig == 0` is
+    /// the POSIX existence probe. Negative pids (process groups) are `-EINVAL` (follow-up);
+    /// out-of-range `sig` is `-EINVAL`.
     fn kill(&mut self, args: &[i64]) -> i64 {
+        let pid = *args.first().unwrap_or(&0);
         let sig = *args.get(1).unwrap_or(&0);
-        if sig == 0 {
-            return 0; // kill(pid, 0): liveness probe — the (single) process exists
-        }
-        if !(1..=63).contains(&sig) {
+        if !(0..=63).contains(&sig) {
             return EINVAL;
         }
-        self.sig_pending |= 1 << sig;
-        self.arm_signals();
+        if pid < 0 {
+            return self.kill_pgroup((-pid) as i32, sig); // kill(-pgid): the group sweep (#798)
+        }
+        // Self — pid 0 (the pre-table calling convention) or the caller's own pid. Never a table
+        // lock: the caller's own `Proc` is already held by this dispatch.
+        if pid == 0 || pid == self.p.pid as i64 {
+            if sig == 0 {
+                return 0; // kill(pid, 0): liveness probe — we exist
+            }
+            // Through the delivery gate (#798 slice 2): a self-raised SIGTSTP stops US at the
+            // next per-op poll — the fire is deferred past this dispatch's locks like any other.
+            if let Some(f) = self.p.deliver_signal(sig as i32) {
+                self.wake_after.push(f);
+            }
+            return 0;
+        }
+        // #863 slice 2 — any other pid is a process-table lookup.
+        match self.w.procs.get(&(pid as i32)) {
+            Some(ProcEntry::Live(t)) => {
+                // Not self (guarded above), so this is a different mutex — World → Proc, the
+                // canonical order, serialized against other multi-`Proc` paths by the world lock.
+                let mut tp = t.lock().unwrap_or_else(|e| e.into_inner());
+                if sig == 0 {
+                    return 0; // liveness probe — the target exists
+                }
+                // The delivery gate (#798 slice 2) decides pending/stop/continue by the TARGET's
+                // dispositions; whatever it returns fires only after this dispatch's locks drop
+                // ([`Ctx::wake_after`]), never under ours.
+                if let Some(f) = tp.deliver_signal(sig as i32) {
+                    self.wake_after.push(f);
+                }
+                0
+            }
+            // A zombie exists until reaped (POSIX: kill succeeds) but takes no signal.
+            Some(ProcEntry::Zombie(_)) => 0,
+            None => ESRCH,
+        }
+    }
+
+    /// `kill(-pgid, sig)` (#798) — the **process-group sweep**: raise `sig` on every live table
+    /// process in group `pgid`, the caller included (POSIX: the whole group, sender too when it is
+    /// a member). One deferred wake per deliverable member ([`Ctx::wake_after`]). `-ESRCH` when the
+    /// group has no live member; a zombie member is skipped (it takes no signal); `sig == 0` probes
+    /// group existence.
+    fn kill_pgroup(&mut self, pgid: i32, sig: i64) -> i64 {
+        let mut any = false;
+        // Self first (no table lock — this dispatch already holds our `Proc`).
+        if self.p.pgid == pgid {
+            any = true;
+            if sig != 0 {
+                if let Some(f) = self.p.deliver_signal(sig as i32) {
+                    self.wake_after.push(f);
+                }
+            }
+        }
+        let self_pid = self.p.pid;
+        for (&pid, entry) in self.w.procs.iter() {
+            if pid == self_pid {
+                continue; // handled above (and never a second lock on our own Proc)
+            }
+            let ProcEntry::Live(t) = entry else {
+                continue; // a zombie exists but takes no signal
+            };
+            let mut tp = t.lock().unwrap_or_else(|e| e.into_inner());
+            if tp.pgid != pgid {
+                continue;
+            }
+            any = true;
+            if sig != 0 {
+                if let Some(f) = tp.deliver_signal(sig as i32) {
+                    self.wake_after.push(f);
+                }
+            }
+        }
+        if any {
+            0
+        } else {
+            ESRCH
+        }
+    }
+
+    /// [`OP_SETPGID`] — `setpgid(pid, pgid)`: move `pid` (`0` = self) into group `pgid` (`0` =
+    /// `pid`'s own id). The caller's own move happens on its held `Proc`; any other target must be
+    /// a live table process. `-EINVAL` on a negative `pgid`, `-ESRCH` on an unknown/zombie pid.
+    fn setpgid(&mut self, args: &[i64]) -> i64 {
+        let pid = *args.first().unwrap_or(&0);
+        let pgid = *args.get(1).unwrap_or(&0);
+        if pgid < 0 || pid < 0 {
+            return EINVAL;
+        }
+        if pid == 0 || pid == self.p.pid as i64 {
+            self.p.pgid = if pgid == 0 { self.p.pid } else { pgid as i32 };
+            return 0;
+        }
+        match self.w.procs.get(&(pid as i32)) {
+            Some(ProcEntry::Live(t)) => {
+                let mut tp = t.lock().unwrap_or_else(|e| e.into_inner());
+                tp.pgid = if pgid == 0 { tp.pid } else { pgid as i32 };
+                0
+            }
+            _ => ESRCH,
+        }
+    }
+
+    /// [`OP_GETPGID`] — `getpgid(pid)`: `pid`'s (`0` = self) process group, from the table.
+    fn getpgid(&mut self, args: &[i64]) -> i64 {
+        let pid = *args.first().unwrap_or(&0);
+        if pid == 0 || pid == self.p.pid as i64 {
+            return self.p.pgid as i64;
+        }
+        match self.w.procs.get(&(pid as i32)) {
+            Some(ProcEntry::Live(t)) => t.lock().unwrap_or_else(|e| e.into_inner()).pgid as i64,
+            _ => ESRCH,
+        }
+    }
+
+    /// Is fd a handle on the proto-terminal (the captured stdio — the pty stand-in until #797)?
+    fn fd_is_terminal(&mut self, fd: i64) -> bool {
+        matches!(
+            self.fd(fd),
+            Some(FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr)
+        )
+    }
+
+    /// [`OP_TCGETPGRP`] — `tcgetpgrp(fd)`: the terminal's foreground process group. `-ENOTTY` off
+    /// the proto-terminal.
+    fn tcgetpgrp(&mut self, args: &[i64]) -> i64 {
+        let fd = *args.first().unwrap_or(&0);
+        if !self.fd_is_terminal(fd) {
+            return ENOTTY;
+        }
+        self.w.fg_pgid as i64
+    }
+
+    /// [`OP_ISATTY`] — `isatty(fd) -> 1 | 0`: the same proto-terminal test the `tc*` ops gate on
+    /// (`fd_is_terminal`), answered as C's boolean instead of `-ENOTTY`. Bash's interactive-mode
+    /// probe (#800).
+    fn isatty(&mut self, args: &[i64]) -> i64 {
+        let fd = *args.first().unwrap_or(&0);
+        i64::from(self.fd_is_terminal(fd))
+    }
+
+    /// [`OP_TCSETPGRP`] — `tcsetpgrp(fd, pgid)`: make `pgid` the foreground group. `-ENOTTY` off
+    /// the proto-terminal, `-EINVAL` non-positive, `-EPERM` when no live process (the caller
+    /// included) is in the group — a foreground nobody occupies is a stuck terminal.
+    fn tcsetpgrp(&mut self, args: &[i64]) -> i64 {
+        let fd = *args.first().unwrap_or(&0);
+        let pgid = *args.get(1).unwrap_or(&0);
+        if !self.fd_is_terminal(fd) {
+            return ENOTTY;
+        }
+        if pgid <= 0 {
+            return EINVAL;
+        }
+        let self_pid = self.p.pid;
+        let occupied = self.p.pgid as i64 == pgid
+            || self.w.procs.iter().any(|(&pid, e)| {
+                pid != self_pid
+                    && matches!(e, ProcEntry::Live(t)
+                        if t.lock().unwrap_or_else(|x| x.into_inner()).pgid as i64 == pgid)
+            });
+        if !occupied {
+            return EPERM;
+        }
+        self.w.fg_pgid = pgid as i32;
         0
     }
 
-    /// #796 L2 — nudge the interp's per-op poll to check for delivery: set the shared `armed` flag when
-    /// async delivery is *possible* (a signal stack is registered). `SignalSource::take_deliverable` is
-    /// authoritative and disarms if nothing is actually deliverable, so an over-eager arm costs only one
-    /// no-op poll. Called wherever a signal may become deliverable (raise / unblock / install a handler /
-    /// register a stack).
-    fn arm_signals(&self) {
-        if self.sig_stack_base != 0 {
-            self.sig_armed.store(true, Ordering::Relaxed);
-        }
-    }
-
-    /// #799 L1 — is a signal **deliverable right now**? Non-destructive twin of [`SignalDoor::
-    /// take_deliverable`]'s gate: a caught (`> SIG_IGN`), unmasked, pending signal with async delivery on
-    /// (a signal stack registered). This is the personality's *policy* the embedder-`^C` path consults
-    /// before poking the interp: an ignored or masked signal is **not** deliverable, so it never interrupts
-    /// a blocked syscall.
-    fn deliverable_now(&self) -> bool {
-        if self.sig_stack_base == 0 {
-            return false; // async delivery off (poll-only)
-        }
-        let mut d = self.sig_pending & !self.sig_mask;
-        while d != 0 {
-            let s = d.trailing_zeros() as i32;
-            d &= !(1u64 << s);
-            if self.sig_handler.get(&s).copied().unwrap_or(SIG_DFL) > SIG_IGN {
-                return true;
+    /// #798 — the **background-terminal doorbell**: a process outside the foreground group
+    /// touching the proto-terminal raises `sig` (`SIGTTOU` on write, `SIGTTIN` on read) pending on
+    /// ITSELF and arms — the L0 approximation of POSIX's stop-the-background-job (real
+    /// stop/continue is #798 slice 2; until then the I/O proceeds and the doorbell tells a
+    /// job-control-aware guest what happened).
+    fn tty_background_check(&mut self, sig: i32) {
+        if self.p.pgid != self.w.fg_pgid {
+            // #798 slice 2 — through the delivery gate: default disposition now really STOPS the
+            // background job (the doorbell became the POSIX action); ignored proceeds silently
+            // (POSIX: an ignored TTOU write goes through); caught pends. The stop fires after
+            // this dispatch's locks drop, so the current I/O completes first — close enough to
+            // the letter (POSIX stops before the I/O) and honest about it.
+            if let Some(f) = self.p.deliver_signal(sig) {
+                self.wake_after.push(f);
             }
         }
-        false
     }
 
     /// `sigaltstack(sp, size) -> 0` (#796 L2): register the guest's dedicated signal-handler stack (the
@@ -1723,8 +2619,8 @@ impl Inner {
     /// advisory. Registering a stack may make already-pending caught signals deliverable, so re-arm.
     fn sigaltstack(&mut self, args: &[i64]) -> i64 {
         let sp = *args.first().unwrap_or(&0);
-        self.sig_stack_base = sp.max(0) as u64;
-        self.arm_signals();
+        self.p.sig_stack_base = sp.max(0) as u64;
+        self.p.arm_signals();
         0
     }
 
@@ -1735,14 +2631,19 @@ impl Inner {
     /// — until `sigprocmask` unblocks it. `0` when nothing is deliverable — so the guest runs
     /// `((void(*)(void))handler)()` at its safe point.
     fn sigcheck(&mut self) -> i64 {
+        // #798 slice 2 — a stopped process delivers nothing until continued (POSIX; also makes
+        // the stop deterministic — see [`SignalDoor::take_deliverable`]).
+        if self.p.stopped_sig.is_some() {
+            return 0;
+        }
         loop {
-            let deliverable = self.sig_pending & !self.sig_mask;
+            let deliverable = self.p.sig_pending & !self.p.sig_mask;
             if deliverable == 0 {
                 return 0; // nothing pending, or all pending signals are blocked (held)
             }
             let s = deliverable.trailing_zeros() as i32;
-            self.sig_pending &= !(1u64 << s);
-            let handler = self.sig_handler.get(&s).copied().unwrap_or(SIG_DFL);
+            self.p.sig_pending &= !(1u64 << s);
+            let handler = self.p.sig_handler.get(&s).copied().unwrap_or(SIG_DFL);
             if handler > SIG_IGN {
                 return handler;
             }
@@ -1764,20 +2665,25 @@ impl Inner {
         let oldset_ptr = *args.get(2).unwrap_or(&0) as u64;
         let mem = mem.ok_or(Trap::Malformed)?;
         if oldset_ptr != 0 {
-            mem.write_bytes(oldset_ptr, &self.sig_mask.to_le_bytes())
+            mem.write_bytes(oldset_ptr, &self.p.sig_mask.to_le_bytes())
                 .ok_or(Trap::Malformed)?;
         }
         if set_ptr != 0 {
             let bytes = mem.read_bytes(set_ptr, 8).ok_or(Trap::Malformed)?;
             let set = u64::from_le_bytes(bytes.try_into().map_err(|_| Trap::Malformed)?);
             let new = match how {
-                SIG_BLOCK => self.sig_mask | set,
-                SIG_UNBLOCK => self.sig_mask & !set,
+                SIG_BLOCK => self.p.sig_mask | set,
+                SIG_UNBLOCK => self.p.sig_mask & !set,
                 SIG_SETMASK => set,
                 _ => return Ok(vec![EINVAL]),
             };
-            self.sig_mask = new & !UNMASKABLE; // SIGKILL/SIGSTOP can never be blocked
-            self.arm_signals(); // #796 L2 — unblocking may free a held signal for async delivery
+            self.p.sig_mask = new & !UNMASKABLE; // SIGKILL/SIGSTOP can never be blocked
+            self.p.arm_signals(); // #796 L2 — unblocking may free a held signal for async delivery
+                                  // #796 default actions — unblocking a held fatal signal runs its
+                                  // action now (deferred-fire discipline, like every kill).
+            if let Some(f) = self.p.dispatch_default_actions() {
+                self.wake_after.push(f);
+            }
         }
         Ok(vec![0])
     }
@@ -1799,12 +2705,17 @@ impl Inner {
             return Ok(vec![EINVAL]);
         }
         let s = signum as i32;
+        // #796 default actions — POSIX forbids changing SIGKILL/SIGSTOP's action (probing with a
+        // null `act` is allowed).
+        if act_ptr != 0 && (s == SIGKILL || s == SIGSTOP) {
+            return Ok(vec![EINVAL]);
+        }
         let mem = mem.ok_or(Trap::Malformed)?;
         if oldact_ptr != 0 {
             let mut buf = [0u8; 24];
-            let h = self.sig_handler.get(&s).copied().unwrap_or(SIG_DFL);
-            let m = self.sig_action_mask.get(&s).copied().unwrap_or(0);
-            let f = self.sig_action_flags.get(&s).copied().unwrap_or(0);
+            let h = self.p.sig_handler.get(&s).copied().unwrap_or(SIG_DFL);
+            let m = self.p.sig_action_mask.get(&s).copied().unwrap_or(0);
+            let f = self.p.sig_action_flags.get(&s).copied().unwrap_or(0);
             buf[0..8].copy_from_slice(&h.to_le_bytes());
             buf[8..16].copy_from_slice(&m.to_le_bytes());
             buf[16..24].copy_from_slice(&f.to_le_bytes());
@@ -1815,10 +2726,17 @@ impl Inner {
             let handler = i64::from_le_bytes(b[0..8].try_into().map_err(|_| Trap::Malformed)?);
             let mask = u64::from_le_bytes(b[8..16].try_into().map_err(|_| Trap::Malformed)?);
             let flags = i64::from_le_bytes(b[16..24].try_into().map_err(|_| Trap::Malformed)?);
-            self.sig_handler.insert(s, handler);
-            self.sig_action_mask.insert(s, mask);
-            self.sig_action_flags.insert(s, flags);
-            self.arm_signals(); // #796 L2 — a handler for an already-pending signal may deliver now
+            self.p.sig_handler.insert(s, handler);
+            self.p.sig_action_mask.insert(s, mask);
+            self.p.sig_action_flags.insert(s, flags);
+            self.p.arm_signals(); // #796 L2 — a handler for an already-pending signal may deliver now
+            if handler == SIG_DFL {
+                // #796 default actions — resetting a pending signal's disposition to `SIG_DFL`
+                // runs its default action now (deferred-fire discipline).
+                if let Some(f) = self.p.dispatch_default_actions() {
+                    self.wake_after.push(f);
+                }
+            }
         }
         Ok(vec![0])
     }
@@ -1834,7 +2752,7 @@ impl Inner {
         let Ok(path) = String::from_utf8(bytes) else {
             return Ok(vec![EINVAL]);
         };
-        Ok(vec![if self.files.remove(&path).is_some() {
+        Ok(vec![if self.w.files.remove(&path).is_some() {
             0
         } else {
             ENOENT
@@ -1857,7 +2775,7 @@ impl Inner {
         if norm.is_empty() {
             return Ok(vec![EEXIST]); // the root always exists
         }
-        if self.files.contains_key(&norm) || self.is_dir(&norm) {
+        if self.w.files.contains_key(&norm) || self.is_dir(&norm) {
             return Ok(vec![EEXIST]);
         }
         let parent = match norm.rfind('/') {
@@ -1867,7 +2785,7 @@ impl Inner {
         if !self.is_dir(parent) {
             return Ok(vec![ENOENT]);
         }
-        self.explicit_dirs.insert(norm);
+        self.w.explicit_dirs.insert(norm);
         Ok(vec![0])
     }
 
@@ -1886,7 +2804,7 @@ impl Inner {
         if norm.is_empty() {
             return Ok(vec![EINVAL]); // cannot remove the root
         }
-        if self.files.contains_key(&norm) {
+        if self.w.files.contains_key(&norm) {
             return Ok(vec![ENOTDIR]);
         }
         if !self.is_dir(&norm) {
@@ -1895,7 +2813,7 @@ impl Inner {
         if !self.dir_children(&norm).is_empty() {
             return Ok(vec![ENOTEMPTY]);
         }
-        self.explicit_dirs.remove(&norm);
+        self.w.explicit_dirs.remove(&norm);
         Ok(vec![0])
     }
 
@@ -1917,9 +2835,9 @@ impl Inner {
         let old_n = old.trim_end_matches('/').to_string();
         let new_n = new.trim_end_matches('/').to_string();
         // File fast path: move the bytes, shadowing any explicit dir marker at the destination.
-        if let Some(v) = self.files.remove(&old_n) {
-            self.files.insert(new_n.clone(), v);
-            self.explicit_dirs.remove(&new_n);
+        if let Some(v) = self.w.files.remove(&old_n) {
+            self.w.files.insert(new_n.clone(), v);
+            self.w.explicit_dirs.remove(&new_n);
             return Ok(vec![0]);
         }
         // Directory: re-key every file and explicit subdir under `old_n`, plus the marker itself.
@@ -1927,29 +2845,31 @@ impl Inner {
             let op = format!("{old_n}/");
             let np = format!("{new_n}/");
             let moved: Vec<String> = self
+                .w
                 .files
                 .keys()
                 .filter(|k| k.starts_with(&op))
                 .cloned()
                 .collect();
             for k in moved {
-                let v = self.files.remove(&k).unwrap();
-                self.files.insert(format!("{np}{}", &k[op.len()..]), v);
+                let v = self.w.files.remove(&k).unwrap();
+                self.w.files.insert(format!("{np}{}", &k[op.len()..]), v);
             }
             let dirs: Vec<String> = self
+                .w
                 .explicit_dirs
                 .iter()
                 .filter(|d| d.as_str() == old_n || d.starts_with(&op))
                 .cloned()
                 .collect();
             for d in dirs {
-                self.explicit_dirs.remove(&d);
+                self.w.explicit_dirs.remove(&d);
                 let nd = if d == old_n {
                     new_n.clone()
                 } else {
                     format!("{np}{}", &d[op.len()..])
                 };
-                self.explicit_dirs.insert(nd);
+                self.w.explicit_dirs.insert(nd);
             }
             return Ok(vec![0]);
         }
@@ -1961,9 +2881,9 @@ impl Inner {
     /// The next free ephemeral port (49152..), skipping bound listeners; wraps within the range.
     fn net_alloc_ephemeral(&mut self) -> u16 {
         loop {
-            let p = self.net_next_port;
-            self.net_next_port = if p == u16::MAX { 49152 } else { p + 1 };
-            if !self.net_listeners.contains_key(&p) {
+            let p = self.w.net_next_port;
+            self.w.net_next_port = if p == u16::MAX { 49152 } else { p + 1 };
+            if !self.w.net_listeners.contains_key(&p) {
                 return p;
             }
         }
@@ -2007,7 +2927,7 @@ impl Inner {
             return Ok(vec![EINVAL]);
         };
         if dst.is_loopback() {
-            let Some(q) = self.net_listeners.get(&dst.port).map(Arc::clone) else {
+            let Some(q) = self.w.net_listeners.get(&dst.port).map(Arc::clone) else {
                 return Ok(vec![ECONNREFUSED]);
             };
             let src = NetAddr::loopback(self.net_alloc_ephemeral());
@@ -2020,7 +2940,7 @@ impl Inner {
             }
             return Ok(vec![self.alloc_fd(FdEntry::NetSock(client))]);
         }
-        let Some(d) = self.net_delegate.as_mut() else {
+        let Some(d) = self.w.net_delegate.as_mut() else {
             return Ok(vec![ECONNREFUSED]);
         };
         match d.connect(&dst) {
@@ -2061,7 +2981,7 @@ impl Inner {
         }
         let port = if req.port == 0 {
             self.net_alloc_ephemeral()
-        } else if self.net_listeners.contains_key(&req.port) {
+        } else if self.w.net_listeners.contains_key(&req.port) {
             return Ok(vec![EADDRINUSE]);
         } else {
             req.port
@@ -2071,7 +2991,7 @@ impl Inner {
             return Ok(vec![e]);
         }
         let pending = Arc::new(Mutex::new(VecDeque::new()));
-        self.net_listeners.insert(port, Arc::clone(&pending));
+        self.w.net_listeners.insert(port, Arc::clone(&pending));
         Ok(vec![self.alloc_fd(FdEntry::NetListener(MemListener {
             addr: bound,
             pending,
@@ -2151,7 +3071,7 @@ impl Inner {
         let addrs: Vec<NetAddr> = if name == "localhost" {
             vec![NetAddr::loopback(0)]
         } else {
-            match self.net_delegate.as_mut() {
+            match self.w.net_delegate.as_mut() {
                 Some(d) => match d.resolve(&name) {
                     Ok(v) => v,
                     Err(e) => return Ok(vec![if e < 0 { e } else { ENOENT }]),
@@ -2181,9 +3101,10 @@ impl Inner {
         // empty directories under `prefix` (`mkdir`). Both contribute the first path component after
         // `prefix`.
         let mut names: Vec<String> = self
+            .w
             .files
             .keys()
-            .chain(self.explicit_dirs.iter())
+            .chain(self.w.explicit_dirs.iter())
             .filter_map(|k| k.strip_prefix(&prefix))
             .filter(|rest| !rest.is_empty())
             .map(|rest| rest.split('/').next().unwrap_or(rest).to_string())
@@ -2198,7 +3119,9 @@ impl Inner {
     /// Not a file key itself.
     fn is_dir(&self, path: &str) -> bool {
         let norm = path.trim_end_matches('/');
-        norm.is_empty() || self.explicit_dirs.contains(norm) || !self.dir_children(path).is_empty()
+        norm.is_empty()
+            || self.w.explicit_dirs.contains(norm)
+            || !self.dir_children(path).is_empty()
     }
 
     /// `stat(path_ptr, path_len, statbuf_ptr) -> 0 | -errno`: fill the caller's `struct stat`
@@ -2214,7 +3137,7 @@ impl Inner {
         let Ok(path) = String::from_utf8(bytes) else {
             return Ok(vec![EINVAL]);
         };
-        let (mode, size) = if let Some(f) = self.files.get(&path) {
+        let (mode, size) = if let Some(f) = self.w.files.get(&path) {
             (S_IFREG | 0o644, f.len() as i64)
         } else if self.is_dir(&path) {
             (S_IFDIR | 0o755, 0)
@@ -2239,7 +3162,7 @@ impl Inner {
         let Ok(path) = String::from_utf8(bytes) else {
             return Ok(vec![EINVAL]);
         };
-        if self.files.contains_key(&path) {
+        if self.w.files.contains_key(&path) {
             return Ok(vec![ENOTDIR]);
         }
         if !self.is_dir(&path) {
@@ -2247,14 +3170,14 @@ impl Inner {
         }
         let entries = self.dir_children(&path);
         let stream = DirStream { entries, pos: 0 };
-        let idx = match self.dirs.iter().position(Option::is_none) {
+        let idx = match self.p.dirs.iter().position(Option::is_none) {
             Some(i) => {
-                self.dirs[i] = Some(stream);
+                self.p.dirs[i] = Some(stream);
                 i
             }
             None => {
-                self.dirs.push(Some(stream));
-                self.dirs.len() - 1
+                self.p.dirs.push(Some(stream));
+                self.p.dirs.len() - 1
             }
         };
         Ok(vec![idx as i64])
@@ -2271,7 +3194,7 @@ impl Inner {
         let cap = (*args.get(2).ok_or(Trap::Malformed)?).max(0) as u64;
         let Some(stream) = usize::try_from(dir)
             .ok()
-            .and_then(|i| self.dirs.get_mut(i)?.as_mut())
+            .and_then(|i| self.p.dirs.get_mut(i)?.as_mut())
         else {
             return Ok(vec![EBADF]);
         };
@@ -2292,7 +3215,10 @@ impl Inner {
     /// `closedir(dir) -> 0 | -errno`: release a directory stream. A stale handle is `-EBADF`.
     fn closedir(&mut self, args: &[i64]) -> i64 {
         let dir = *args.first().unwrap_or(&-1);
-        if let Some(slot @ Some(_)) = usize::try_from(dir).ok().and_then(|i| self.dirs.get_mut(i)) {
+        if let Some(slot @ Some(_)) = usize::try_from(dir)
+            .ok()
+            .and_then(|i| self.p.dirs.get_mut(i))
+        {
             *slot = None;
             0
         } else {
@@ -2302,13 +3228,13 @@ impl Inner {
 
     /// `argv(i, buf, cap) -> len | -errno`: write argument `i` (NUL-terminated) into the caller's
     /// buffer and return its length (excluding the NUL). An out-of-range index is `-EINVAL`; a name
-    /// that won't fit `cap` is `-ERANGE`. (`argc` is a fieldless op: `self.args.len()`.)
+    /// that won't fit `cap` is `-ERANGE`. (`argc` is a fieldless op: `self.p.args.len()`.)
     fn argv(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let i = *args.first().ok_or(Trap::Malformed)?;
         let buf = *args.get(1).ok_or(Trap::Malformed)? as u64;
         let cap = (*args.get(2).ok_or(Trap::Malformed)?).max(0) as u64;
-        let Some(arg) = usize::try_from(i).ok().and_then(|i| self.args.get(i)) else {
+        let Some(arg) = usize::try_from(i).ok().and_then(|i| self.p.args.get(i)) else {
             return Ok(vec![EINVAL]);
         };
         let mut bytes = arg.clone().into_bytes();
@@ -2338,6 +3264,7 @@ impl Inner {
             return Ok(vec![-1]);
         };
         let h = self
+            .w
             .commands
             .iter()
             .find(|(n, _, _)| n == name)
@@ -2352,6 +3279,7 @@ impl Inner {
     fn exec_win(&mut self, args: &[i64]) -> Result<Vec<i64>, Trap> {
         let handle = *args.first().ok_or(Trap::Malformed)? as i32;
         let wl = self
+            .w
             .commands
             .iter()
             .find(|(_, h, _)| *h == handle)
@@ -2371,7 +3299,7 @@ impl Inner {
         args: &[i64],
         mem: Option<&mut dyn GuestMem>,
     ) -> Result<Vec<i64>, Trap> {
-        let Some(fifo) = self.exec_stdin_fifo.clone() else {
+        let Some(fifo) = self.w.exec_stdin_fifo.clone() else {
             return Ok(vec![-1]);
         };
         let mem = mem.ok_or(Trap::Malformed)?;
@@ -2381,7 +3309,7 @@ impl Inner {
         let mut q = fifo.lock().unwrap_or_else(|e| e.into_inner());
         q.clear(); // defensively drop any residue from an aborted prior filter
         q.extend(bytes);
-        Ok(vec![self.exec_stdin_handle as i64])
+        Ok(vec![self.w.exec_stdin_handle as i64])
     }
 
     /// Allocate the lowest free fd for `entry`, extending the table if needed.
@@ -2392,17 +3320,17 @@ impl Inner {
     /// Allocate the lowest free fd `>= min` for `entry` (the `F_DUPFD`/`dup2` "at or above" contract),
     /// extending the table if needed.
     fn alloc_fd_from(&mut self, entry: FdEntry, min: usize) -> i64 {
-        while self.fds.len() < min {
-            self.fds.push(None);
+        while self.p.fds.len() < min {
+            self.p.fds.push(None);
         }
-        match (min..self.fds.len()).find(|&i| self.fds[i].is_none()) {
+        match (min..self.p.fds.len()).find(|&i| self.p.fds[i].is_none()) {
             Some(i) => {
-                self.fds[i] = Some(entry);
+                self.p.fds[i] = Some(entry);
                 i as i64
             }
             None => {
-                self.fds.push(Some(entry));
-                (self.fds.len() - 1) as i64
+                self.p.fds.push(Some(entry));
+                (self.p.fds.len() - 1) as i64
             }
         }
     }
@@ -2410,35 +3338,43 @@ impl Inner {
     /// Write `data` into fd `fd`'s memfs file at its offset (extending with zeros if the offset is
     /// past the end), advancing the offset. Returns the count, or `-EBADF` for a non-file / read-only fd.
     fn file_write(&mut self, fd: usize, data: &[u8]) -> i64 {
-        let (path, pos) = match self.fds.get(fd).and_then(|s| s.as_ref()) {
-            Some(FdEntry::File(of)) if of.writable => (of.path.clone(), of.pos),
+        let desc = match self.p.fds.get(fd).and_then(|s| s.as_ref()) {
+            Some(FdEntry::File(of)) => Arc::clone(of),
             _ => return EBADF,
         };
-        let file = self.files.entry(path).or_default();
+        let mut of = desc.lock().unwrap_or_else(|e| e.into_inner());
+        if !of.writable {
+            return EBADF;
+        }
+        let pos = of.pos;
+        let file = self.w.files.entry(of.path.clone()).or_default();
         let end = pos + data.len();
         if file.len() < end {
             file.resize(end, 0);
         }
         file[pos..end].copy_from_slice(data);
-        if let Some(FdEntry::File(of)) = self.fds[fd].as_mut() {
-            of.pos = end;
-        }
+        of.pos = end;
         data.len() as i64
     }
 
     /// Read up to `len` bytes from fd `fd`'s memfs file at its offset, advancing it. `Err(-EBADF)` for
     /// a non-file fd.
     fn file_read(&mut self, fd: usize, len: usize) -> Result<Vec<u8>, i64> {
-        let (path, pos) = match self.fds.get(fd).and_then(|s| s.as_ref()) {
-            Some(FdEntry::File(of)) => (of.path.clone(), of.pos),
+        let desc = match self.p.fds.get(fd).and_then(|s| s.as_ref()) {
+            Some(FdEntry::File(of)) => Arc::clone(of),
             _ => return Err(EBADF),
         };
-        let file = self.files.get(&path).map(|v| v.as_slice()).unwrap_or(&[]);
+        let mut of = desc.lock().unwrap_or_else(|e| e.into_inner());
+        let pos = of.pos;
+        let file = self
+            .w
+            .files
+            .get(&of.path)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
         let n = len.min(file.len().saturating_sub(pos));
         let chunk = file[pos..pos + n].to_vec();
-        if let Some(FdEntry::File(of)) = self.fds[fd].as_mut() {
-            of.pos = pos + n;
-        }
+        of.pos = pos + n;
         Ok(chunk)
     }
 
@@ -2452,18 +3388,18 @@ impl Inner {
             .div_ceil(ALIGN)
             * ALIGN;
         // First-fit over the free list: reuse the first block that fits, splitting off any remainder.
-        if let Some(i) = self.free_list.iter().position(|&(_, sz)| sz >= want) {
-            let (off, sz) = self.free_list.swap_remove(i);
+        if let Some(i) = self.p.free_list.iter().position(|&(_, sz)| sz >= want) {
+            let (off, sz) = self.p.free_list.swap_remove(i);
             if sz > want {
-                self.free_list.push((off + want, sz - want));
+                self.p.free_list.push((off + want, sz - want));
             }
-            self.allocated.insert(off, want);
+            self.p.allocated.insert(off, want);
             return off as i64;
         }
         // Bump a fresh block from the high-water mark and record it as a live allocation.
         match self.arena_bump(want) {
             Some(ptr) => {
-                self.allocated.insert(ptr, want);
+                self.p.allocated.insert(ptr, want);
                 ptr as i64
             }
             None => 0, // out of heap → NULL
@@ -2475,10 +3411,10 @@ impl Inner {
     /// the `getenv` string cache both grow from — it advances `heap_next` but does **not** record an
     /// `allocated` entry (the caller decides whether the block is `free`-able).
     fn arena_bump(&mut self, n: u64) -> Option<u64> {
-        let ptr = (self.heap_next + (ALIGN - 1)) & !(ALIGN - 1);
+        let ptr = (self.p.heap_next + (ALIGN - 1)) & !(ALIGN - 1);
         match ptr.checked_add(n) {
-            Some(end) if end <= self.heap_end => {
-                self.heap_next = end;
+            Some(end) if end <= self.p.heap_end => {
+                self.p.heap_next = end;
                 Some(ptr)
             }
             _ => None,
@@ -2495,7 +3431,7 @@ impl Inner {
         if size == 0 {
             return Ok(vec![EINVAL]);
         }
-        let mut bytes = self.cwd.clone().into_bytes();
+        let mut bytes = self.p.cwd.clone().into_bytes();
         bytes.push(0); // NUL terminator
         if bytes.len() as u64 > size {
             return Ok(vec![ERANGE]);
@@ -2515,7 +3451,7 @@ impl Inner {
         let Ok(path) = String::from_utf8(bytes) else {
             return Ok(vec![EINVAL]);
         };
-        self.cwd = path;
+        self.p.cwd = path;
         Ok(vec![0])
     }
 
@@ -2532,10 +3468,10 @@ impl Inner {
         let Ok(name) = String::from_utf8(bytes) else {
             return Ok(vec![0]); // a name we can't represent can't be set
         };
-        if let Some(&cached) = self.env_ptrs.get(&name) {
+        if let Some(&cached) = self.p.env_ptrs.get(&name) {
             return Ok(vec![cached as i64]);
         }
-        let Some(value) = self.env.get(&name).cloned() else {
+        let Some(value) = self.p.env.get(&name).cloned() else {
             return Ok(vec![0]); // unset → NULL
         };
         let mut vb = value.into_bytes();
@@ -2544,7 +3480,7 @@ impl Inner {
             return Ok(vec![0]); // no room → behave as if unset (best effort)
         };
         mem.write_bytes(dst, &vb).ok_or(Trap::Malformed)?;
-        self.env_ptrs.insert(name, dst);
+        self.p.env_ptrs.insert(name, dst);
         Ok(vec![dst as i64])
     }
 
@@ -2565,11 +3501,11 @@ impl Inner {
         let (Ok(name), Ok(value)) = (String::from_utf8(nb), String::from_utf8(vb)) else {
             return Ok(vec![EINVAL]);
         };
-        if overwrite == 0 && self.env.contains_key(&name) {
+        if overwrite == 0 && self.p.env.contains_key(&name) {
             return Ok(vec![0]); // keep the existing value
         }
-        self.env_ptrs.remove(&name); // stale cached pointer no longer reflects the value
-        self.env.insert(name, value);
+        self.p.env_ptrs.remove(&name); // stale cached pointer no longer reflects the value
+        self.p.env.insert(name, value);
         Ok(vec![0])
     }
 
@@ -2587,7 +3523,7 @@ impl Inner {
         let Ok(name) = String::from_utf8(nb) else {
             return Ok(vec![-1]);
         };
-        let Some(value) = self.env.get(&name) else {
+        let Some(value) = self.p.env.get(&name) else {
             return Ok(vec![-1]); // unset
         };
         let vb = value.as_bytes();
@@ -2606,8 +3542,8 @@ impl Inner {
         let Ok(name) = String::from_utf8(nb) else {
             return Ok(vec![EINVAL]);
         };
-        self.env_ptrs.remove(&name);
-        self.env.remove(&name);
+        self.p.env_ptrs.remove(&name);
+        self.p.env.remove(&name);
         Ok(vec![0])
     }
 
@@ -2622,12 +3558,12 @@ impl Inner {
         if index < 0 {
             return Ok(vec![-1]);
         }
-        let mut keys: Vec<&String> = self.env.keys().collect();
+        let mut keys: Vec<&String> = self.p.env.keys().collect();
         keys.sort();
         let Some(key) = keys.get(index as usize) else {
             return Ok(vec![-1]); // past the end
         };
-        let entry = format!("{key}={}", self.env[*key]).into_bytes();
+        let entry = format!("{key}={}", self.p.env[*key]).into_bytes();
         if buf != 0 && (entry.len() as u64) <= cap {
             mem.write_bytes(buf, &entry).ok_or(Trap::Malformed)?;
         }
@@ -2638,11 +3574,11 @@ impl Inner {
     /// else realtime (nanos since the Unix epoch). Returns a pinned value when [`Posix::set_clock`] set
     /// one, so a differential run is reproducible; otherwise reads the real host clock.
     fn clock(&self, args: &[i64]) -> i64 {
-        if let Some(fixed) = self.clock_fixed {
+        if let Some(fixed) = self.w.clock_fixed {
             return fixed;
         }
         if *args.first().unwrap_or(&0) == 1 {
-            self.clock_base.elapsed().as_nanos() as i64
+            self.w.clock_base.elapsed().as_nanos() as i64
         } else {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2659,8 +3595,8 @@ impl Inner {
         if ptr == 0 {
             return;
         }
-        if let Some(size) = self.allocated.remove(&ptr) {
-            self.free_list.push((ptr, size));
+        if let Some(size) = self.p.allocated.remove(&ptr) {
+            self.p.free_list.push((ptr, size));
         }
     }
 }
@@ -2671,11 +3607,829 @@ mod tests {
     use svm_interp::{run_capture_reserved_with_host, Host, Value};
     use svm_jit::{compile_and_run_capture_reserved_with_host, JitOutcome};
     use svm_text::parse_module;
+
+    /// Lock the personality's world + root proc (canonical order — see [`World`]) and build the
+    /// [`Ctx`] dispatch view a test drives op methods through, as [`handler`] does.
+    macro_rules! ctx {
+        ($posix:expr, $w:ident, $p:ident, $st:ident) => {
+            let mut $w = $posix.world.lock().unwrap();
+            let mut $p = $posix.root.lock().unwrap();
+            #[allow(unused_mut)]
+            let mut $st = Ctx {
+                w: &mut $w,
+                p: &mut $p,
+                wake_after: Vec::new(),
+            };
+        };
+    }
     use svm_verify::verify_module;
 
     const HEAP_BASE: u64 = 4096;
     const HEAP_END: u64 = 64 << 10;
     const WIN: usize = 128 << 10;
+
+    /// #863 slice 1 — the World/Proc fork contract, unit-level. [`Proc::fork`] copies the
+    /// per-process side (cwd/env/dispositions copied, **pending cleared**) while fd-table entries
+    /// share their open-file **descriptions** — a fork-inherited fd shares its offset with the
+    /// parent (POSIX fork-shares-open-file-descriptions), and a child's cwd/env mutations are
+    /// invisible to the parent (the pre-split shared blob got both wrong).
+    #[test]
+    fn fork_clones_the_process_side_and_shares_descriptions() {
+        let world = Arc::new(Mutex::new(new_world(Vec::new())));
+        let root = Arc::new(Mutex::new(new_proc(HEAP_BASE, HEAP_END)));
+        let posix = Posix { world, root };
+        posix.write_file("/f", b"hello world");
+        let mut win = vec![0u8; 256];
+        win[0..2].copy_from_slice(b"/f");
+        let mut mem = svm_interp::WindowMem::new(&mut win, 256);
+
+        let mut w = posix.world.lock().unwrap();
+        let mut p = posix.root.lock().unwrap();
+        let fd = {
+            let mut st = Ctx {
+                w: &mut w,
+                p: &mut p,
+                wake_after: Vec::new(),
+            };
+            let fd = st.open(&[0, 2, 0], Some(&mut mem)).unwrap()[0];
+            assert!(fd >= 3, "a fresh fd past the stdio sentinels");
+            // Advance the description to offset 5 through the parent.
+            assert_eq!(st.read(&[fd, 100, 5], Some(&mut mem)).unwrap()[0], 5);
+            fd
+        };
+        p.cwd = "/parent".to_string();
+        p.env.insert("K".to_string(), "v".to_string());
+        p.sig_handler.insert(2, 0x1234);
+        p.sig_pending = 1 << 2;
+        p.sig_mask = 1 << 10;
+
+        let mut twin = p.fork();
+        assert_eq!(
+            twin.sig_pending, 0,
+            "POSIX: a fork twin starts with no pending signals"
+        );
+        assert_eq!(
+            twin.sig_handler.get(&2),
+            Some(&0x1234),
+            "dispositions are inherited (copied)"
+        );
+        assert_eq!(
+            twin.sig_mask,
+            1 << 10,
+            "the signal mask is inherited (copied)"
+        );
+
+        // cwd/env are copies: the twin's mutations never reach the parent.
+        twin.cwd = "/child".to_string();
+        twin.env.insert("K".to_string(), "child".to_string());
+        assert_eq!(
+            p.cwd, "/parent",
+            "a subshell's chdir must not move its parent"
+        );
+        assert_eq!(
+            p.env["K"], "v",
+            "a child's setenv is invisible to the parent"
+        );
+
+        // The twin's inherited fd continues at the PARENT's offset (shared description)…
+        {
+            let mut tc = Ctx {
+                w: &mut w,
+                p: &mut twin,
+                wake_after: Vec::new(),
+            };
+            assert_eq!(tc.read(&[fd, 120, 6], Some(&mut mem)).unwrap()[0], 6);
+        }
+        assert_eq!(
+            mem.read_bytes(120, 6).unwrap(),
+            b" world",
+            "twin resumes at offset 5"
+        );
+        // …and its read advanced the shared offset for the parent too (now EOF).
+        {
+            let mut pc = Ctx {
+                w: &mut w,
+                p: &mut p,
+                wake_after: Vec::new(),
+            };
+            assert_eq!(
+                pc.read(&[fd, 130, 8], Some(&mut mem)).unwrap()[0],
+                0,
+                "the twin's read moved the shared offset to EOF for the parent"
+            );
+            // The twin's fd TABLE is a copy: closing the parent's fd leaves the twin's open.
+            assert_eq!(pc.close(&[fd]), 0);
+        }
+        {
+            let mut tc = Ctx {
+                w: &mut w,
+                p: &mut twin,
+                wake_after: Vec::new(),
+            };
+            assert_eq!(
+                tc.lseek(&[fd, 0, SEEK_SET]),
+                0,
+                "the twin's fd survives the parent's close (per-process table)"
+            );
+        }
+    }
+
+    /// #863 slice 1 — `dup` shares the open-file description: the dup'd fd continues at the
+    /// original's offset (POSIX; the pre-split inline description gave dups independent offsets).
+    #[test]
+    fn dup_shares_the_open_file_description_offset() {
+        let world = Arc::new(Mutex::new(new_world(Vec::new())));
+        let root = Arc::new(Mutex::new(new_proc(HEAP_BASE, HEAP_END)));
+        let posix = Posix { world, root };
+        posix.write_file("/f", b"hello world");
+        let mut win = vec![0u8; 256];
+        win[0..2].copy_from_slice(b"/f");
+        let mut mem = svm_interp::WindowMem::new(&mut win, 256);
+        ctx!(posix, w_g, p_g, st);
+        let fd = st.open(&[0, 2, 0], Some(&mut mem)).unwrap()[0];
+        let dup = st.dup(&[fd]);
+        assert!(dup >= 0 && dup != fd);
+        assert_eq!(st.read(&[fd, 100, 5], Some(&mut mem)).unwrap()[0], 5);
+        assert_eq!(st.read(&[dup, 120, 6], Some(&mut mem)).unwrap()[0], 6);
+        assert_eq!(
+            mem.read_bytes(120, 6).unwrap(),
+            b" world",
+            "the dup continues at the original's offset — one shared description"
+        );
+    }
+
+    /// #863 slice 2 — `kill(pid, sig)` reaches a fork twin's OWN pending set through the process
+    /// table, end to end across two processes' handlers: the twin (minted by the fork factory
+    /// under pid 7, as the core does at `fork()`) installs a SIGUSR1 handler; the ROOT's `kill(7,
+    /// 10)` sets the TWIN's bit (the twin's `sigcheck` delivers it, the root's own stays empty).
+    /// Plus the table edges: `kill(unknown)` = `-ESRCH`, `kill(7, 0)` probes, negative = `-EINVAL`.
+    #[test]
+    fn kill_targets_a_fork_twin_through_the_process_table() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        let mut forked = cap_fork_factory(&posix)(7);
+        // The twin installs a handler for signal 10 through its own dispatch.
+        assert_eq!(
+            (forked.handler)(OP_SIGNAL, &[10, 0x77], None, None).unwrap(),
+            vec![0]
+        );
+        {
+            ctx!(posix, w_g, p_g, st);
+            assert_eq!(st.kill(&[7, 0]), 0, "kill(pid, 0): the twin exists");
+            assert_eq!(st.kill(&[99, 10]), ESRCH, "unknown pid");
+            assert_eq!(
+                st.kill(&[-5, 10]),
+                ESRCH,
+                "kill(-pgid) of an empty group (#798)"
+            );
+            assert_eq!(st.kill(&[7, 10]), 0, "signal the twin by pid");
+            assert_eq!(
+                st.p.sig_pending, 0,
+                "the ROOT's pending set stays empty — the signal went to the twin"
+            );
+        }
+        assert_eq!(
+            (forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            vec![0x77],
+            "the twin's own sigcheck delivers the pid-targeted signal"
+        );
+    }
+
+    /// #863 slice 2 — `getpid`: the root is pid 1, a fork twin reports the pid it was minted under
+    /// (its scheduler `TaskId` — the same value the parent's `fork()` returned), and a twin can
+    /// signal ITSELF by that pid (the self short-circuit, no table double-lock).
+    #[test]
+    fn getpid_reports_the_table_pid_on_both_sides_of_a_fork() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        let mut root_handler = handler(Arc::clone(&posix.world), Arc::clone(&posix.root));
+        assert_eq!(
+            root_handler(OP_GETPID, &[], None, None).unwrap(),
+            vec![1],
+            "the root is pid 1"
+        );
+        let mut forked = cap_fork_factory(&posix)(9);
+        assert_eq!(
+            (forked.handler)(OP_GETPID, &[], None, None).unwrap(),
+            vec![9],
+            "a twin's getpid is the pid fork() returned to its parent"
+        );
+        // Self-kill by own pid: handler + raise + sigcheck, all through the twin's dispatch.
+        assert_eq!(
+            (forked.handler)(OP_SIGNAL, &[12, 0x99], None, None).unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            (forked.handler)(OP_KILL, &[9, 12], None, None).unwrap(),
+            vec![0],
+            "kill(own pid) short-circuits to self — no deadlock on the table entry"
+        );
+        assert_eq!(
+            (forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            vec![0x99]
+        );
+    }
+
+    /// #863 slice 2 — ONE pid space: spawn-delegate zombies live in the same process table as fork
+    /// twins. A spawn's pid allocation skips a pid a twin already occupies; `kill` on the zombie
+    /// succeeds (exists-until-reaped, signal dropped); `waitpid` reaps it out of the table, after
+    /// which the pid is `-ESRCH`.
+    #[test]
+    fn spawn_zombies_share_the_process_table_with_fork_twins() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        posix.set_spawn(|_n, _a, _stdin| SpawnResult {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            status: 7,
+        });
+        // A twin squatting on pid 1000 — exactly where the spawn allocator starts.
+        let _forked = cap_fork_factory(&posix)(1000);
+        let mut win = vec![0u8; 256];
+        win[0..4].copy_from_slice(b"prog");
+        let mut mem = svm_interp::WindowMem::new(&mut win, 256);
+        ctx!(posix, w_g, p_g, st);
+        let pid = st.spawn(&[0, 4, 0, 0], Some(&mut mem)).unwrap()[0];
+        assert_eq!(pid, 1001, "the allocator skips the twin's occupied pid");
+        assert_eq!(st.kill(&[pid, 15]), 0, "a zombie exists until reaped");
+        assert_eq!(
+            st.waitpid(&[pid, 0, 0], Some(&mut mem)).unwrap()[0],
+            pid,
+            "waitpid reaps the zombie from the table"
+        );
+        assert_eq!(st.kill(&[pid, 15]), ESRCH, "reaped ⇒ the pid is gone");
+        // The live twin at 1000 is NOT reapable through this op (core reap owns fork twins).
+        assert_eq!(
+            st.waitpid(&[1000, 0, 0], Some(&mut mem)).unwrap()[0],
+            ECHILD
+        );
+    }
+
+    /// #863 slice 2 — a deliverable pid-targeted `kill` pokes the TARGET's run wake, and only
+    /// **after** the dispatch's locks are released (the deferred [`Ctx::wake_after`] — firing under
+    /// the world lock would invert the fork factory's scheduler → world order). The twin has a
+    /// caught handler + a signal stack (async delivery on) and a wake installed through its door;
+    /// the root's `kill(7, 10)` through the ROOT handler must fire it. A masked signal must not.
+    #[test]
+    fn kill_wakes_the_targets_run_after_unlock() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        let mut root_handler = handler(Arc::clone(&posix.world), Arc::clone(&posix.root));
+        let mut forked = cap_fork_factory(&posix)(7);
+        // Deliverability on the twin: caught handler + registered signal stack.
+        assert_eq!(
+            (forked.handler)(OP_SIGNAL, &[10, 0x77], None, None).unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            (forked.handler)(OP_SIGALTSTACK, &[0x500, 0x100], None, None).unwrap(),
+            vec![0]
+        );
+        let (door, _armed) = forked.signal.as_ref().expect("the twin has its own door");
+        let fired = Arc::new(AtomicBool::new(false));
+        let f2 = Arc::clone(&fired);
+        door.set_wake(Arc::new(move || {
+            f2.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        // Signal 11 has no handler on the twin: pending is set but nothing is deliverable — no wake
+        // (the fire is async — a detached thread — so give a false positive a moment to appear).
+        assert_eq!(
+            root_handler(OP_KILL, &[7, 11], None, None).unwrap(),
+            vec![0]
+        );
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(
+            !fired.load(std::sync::atomic::Ordering::SeqCst),
+            "an undeliverable signal never wakes the target's run"
+        );
+        // Signal 10 is caught + unmasked + stack registered: the wake fires — from a detached
+        // thread, after the dispatch's locks dropped (slice 3), so poll for it.
+        assert_eq!(
+            root_handler(OP_KILL, &[7, 10], None, None).unwrap(),
+            vec![0]
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !fired.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a deliverable pid-targeted kill pokes the target's scheduler wake"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// #863 hygiene — a fork twin's **exit hook** retires it in the process table: firing it (as
+    /// the core does at twin completion) flips `Live` → `Zombie` with the wait-encoded status, so
+    /// `waitpid` reaps a fork twin exactly like a spawn child — and the pid is gone afterwards
+    /// (`kill` = `-ESRCH`). Before the exit, the live twin is `-ECHILD` here (non-blocking poll).
+    #[test]
+    fn a_twins_exit_hook_makes_it_reapable_by_waitpid() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        let forked = cap_fork_factory(&posix)(7);
+        let mut win = vec![0u8; 256];
+        let mut mem = svm_interp::WindowMem::new(&mut win, 256);
+        {
+            ctx!(posix, w_g, p_g, st);
+            assert_eq!(
+                st.waitpid(&[7, 0, 0], Some(&mut mem)).unwrap()[0],
+                ECHILD,
+                "a still-running twin is not reapable through this op"
+            );
+        }
+        // The core fires the hook with the twin's raw exit status at completion.
+        (forked
+            .exit
+            .as_ref()
+            .expect("the personality installs an exit hook"))(7);
+        ctx!(posix, w_g, p_g, st);
+        assert_eq!(
+            st.kill(&[7, 15]),
+            0,
+            "an exited-unreaped twin is a zombie — kill succeeds"
+        );
+        assert_eq!(
+            st.waitpid(&[7, 100, 0], Some(&mut mem)).unwrap()[0],
+            7,
+            "waitpid reaps the exited fork twin"
+        );
+        let status = i32::from_le_bytes(mem.read_bytes(100, 4).unwrap().try_into().unwrap());
+        assert_eq!(
+            (status >> 8) & 0xff,
+            7,
+            "WEXITSTATUS is the twin's exit code"
+        );
+        assert_eq!(st.kill(&[7, 15]), ESRCH, "reaped ⇒ the pid is gone");
+    }
+
+    /// #798 slice 1 — the process-group surface over the table: `setpgid`/`getpgid` roundtrip
+    /// (self and a table-routed twin), a fork twin **inherits** its parent's group, and
+    /// `kill(-pgid)` sweeps exactly the group — every member's own pending set rings (the caller
+    /// included), the non-member's stays silent, and an empty group is `-ESRCH`.
+    #[test]
+    fn process_groups_route_through_the_table_and_group_kill_sweeps_them() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        // Twins 7 and 8; 8 forks 9 AFTER being moved into group 5 — 9 must inherit 5.
+        let mut t7 = cap_fork_factory(&posix)(7);
+        let f8 = cap_fork_factory(&posix)(8);
+        {
+            ctx!(posix, w_g, p_g, st);
+            assert_eq!(st.getpgid(&[0]), 1, "the root leads group 1");
+            assert_eq!(st.getpgid(&[7]), 1, "a twin inherits the root's group");
+            assert_eq!(st.setpgid(&[7, 5]), 0, "move twin 7 into group 5 by pid");
+            assert_eq!(st.setpgid(&[8, 5]), 0, "move twin 8 into group 5 by pid");
+            assert_eq!(st.getpgid(&[7]), 5);
+            assert_eq!(st.setpgid(&[99, 5]), ESRCH, "unknown pid");
+        }
+        // Twin 8 forks twin 9: the child inherits group 5 (POSIX), not the root's 1.
+        let _t9 = (f8.refork.expect("self-replicating factory"))(9);
+        {
+            ctx!(posix, w_g, p_g, st);
+            assert_eq!(
+                st.getpgid(&[9]),
+                5,
+                "a fork twin inherits its parent's group"
+            );
+            // Group kill: twins 7 and 9 catch signal 10; the root (group 1) must stay silent.
+            // (Install handlers through the table procs directly — unit-level.)
+        }
+        assert_eq!(
+            (t7.handler)(OP_SIGNAL, &[10, 0x71], None, None).unwrap(),
+            vec![0]
+        );
+        {
+            ctx!(posix, w_g, p_g, st);
+            assert_eq!(st.kill(&[-5, 10]), 0, "sweep group 5");
+            assert_eq!(
+                st.p.sig_pending, 0,
+                "the root is outside group 5 — its pending set stays empty"
+            );
+            assert_eq!(st.kill(&[-77, 10]), ESRCH, "an empty group");
+        }
+        assert_eq!(
+            (t7.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            vec![0x71],
+            "group member 7's own doorbell rang"
+        );
+    }
+
+    /// #798 slice 1 — the proto-terminal: `tcgetpgrp`/`tcsetpgrp` on stdio fds (`-ENOTTY` on a
+    /// file), foreground validation (`-EINVAL` non-positive, `-EPERM` for an unoccupied group),
+    /// and the background doorbells — a background write rings `SIGTTOU`, a background read rings
+    /// `SIGTTIN` (both proceed — the L0 approximation), and a foreground process rings nothing.
+    #[test]
+    fn the_proto_terminal_foreground_group_gates_with_ttou_ttin_doorbells() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, b"input".to_vec());
+        let _twin = cap_fork_factory(&posix)(7); // occupies group 1 alongside the root
+        let mut win = vec![0u8; 256];
+        win[0..2].copy_from_slice(b"/f");
+        let mut mem = svm_interp::WindowMem::new(&mut win, 256);
+        ctx!(posix, w_g, p_g, st);
+        assert_eq!(
+            st.tcgetpgrp(&[1]),
+            1,
+            "foreground starts as the root's group"
+        );
+        assert_eq!(
+            st.tcgetpgrp(&[0]),
+            1,
+            "any stdio fd names the one proto-terminal"
+        );
+        let file_fd = st.open(&[0, 2, 65], Some(&mut mem)).unwrap()[0]; // O_CREATE|O_WRITE
+        assert_eq!(
+            st.tcgetpgrp(&[file_fd]),
+            ENOTTY,
+            "a file is not the terminal"
+        );
+        assert_eq!(st.tcsetpgrp(&[1, 0]), EINVAL, "a non-positive pgid");
+        assert_eq!(st.tcsetpgrp(&[1, 42]), EPERM, "an unoccupied group");
+        // Foreground I/O rings nothing.
+        assert_eq!(st.write(&[1, 0, 2], Some(&mut mem)).unwrap()[0], 2);
+        assert_eq!(st.read(&[0, 100, 2], Some(&mut mem)).unwrap()[0], 2);
+        assert_eq!(st.p.sig_pending, 0, "foreground terminal I/O is silent");
+        // Move the root into its own group 9 and foreground the twin's group 1: root backgrounded.
+        // CATCH the job-control signals first — a caught TTOU/TTIN takes the pending path (the
+        // doorbell); the DEFAULT disposition now stops (#798 slice 2, asserted further down).
+        assert_eq!(st.signal(&[SIGTTOU as i64, 0x70]), 0);
+        assert_eq!(st.signal(&[SIGTTIN as i64, 0x71]), 0);
+        assert_eq!(st.setpgid(&[0, 9]), 0);
+        assert_eq!(
+            st.tcgetpgrp(&[1]),
+            1,
+            "foreground group unchanged by setpgid"
+        );
+        assert_eq!(
+            st.write(&[1, 0, 2], Some(&mut mem)).unwrap()[0],
+            2,
+            "the write proceeds"
+        );
+        assert_ne!(
+            st.p.sig_pending & (1 << SIGTTOU),
+            0,
+            "a background terminal write rings caught SIGTTOU"
+        );
+        assert_eq!(
+            st.read(&[0, 100, 2], Some(&mut mem)).unwrap()[0],
+            2,
+            "the read proceeds"
+        );
+        assert_ne!(
+            st.p.sig_pending & (1 << SIGTTIN),
+            0,
+            "a background terminal read rings caught SIGTTIN"
+        );
+        // #798 slice 2 — back to the DEFAULT disposition: a background write now records a real
+        // stop (bookkeeping-only here — a unit Ctx has no core stop closure installed).
+        assert_eq!(st.signal(&[SIGTTOU as i64, SIG_DFL]), 0x70);
+        st.p.sig_pending = 0;
+        assert_eq!(st.write(&[1, 0, 2], Some(&mut mem)).unwrap()[0], 2);
+        assert_eq!(
+            st.p.stopped_sig,
+            Some(SIGTTOU),
+            "default-disposition TTOU stops the background writer"
+        );
+        assert!(st.p.stop_fresh, "the stop is fresh for WUNTRACED");
+        assert_eq!(
+            st.p.sig_pending, 0,
+            "a default-action stop is not a pending bit"
+        );
+        // SIGCONT through the gate clears the stop and marks the continue.
+        assert!(
+            st.p.deliver_signal(SIGCONT).is_none(),
+            "no closure to fire in a unit Ctx"
+        );
+        assert_eq!(st.p.stopped_sig, None, "continued");
+        assert!(st.p.cont_fresh, "the continue is fresh for WCONTINUED");
+        // The root takes the terminal back for its own group — foreground again, silence again.
+        assert_eq!(
+            st.tcsetpgrp(&[1, 9]),
+            0,
+            "the caller's own group is occupied"
+        );
+        st.p.sig_pending = 0;
+        assert_eq!(st.write(&[1, 0, 2], Some(&mut mem)).unwrap()[0], 2);
+        assert_eq!(st.p.sig_pending, 0, "foreground once more — no doorbell");
+        // A write to the FILE from the background never rings (not the terminal).
+        assert_eq!(st.setpgid(&[0, 1]), 0); // background again (fg is 9... self now group 1)
+        assert_eq!(
+            st.tcsetpgrp(&[1, 9]),
+            EPERM,
+            "group 9 is now unoccupied — EPERM"
+        );
+        assert_eq!(st.write(&[file_fd, 0, 2], Some(&mut mem)).unwrap()[0], 2);
+        assert_eq!(
+            st.p.sig_pending & (1 << SIGTTOU),
+            0,
+            "file I/O is not terminal I/O — no TTOU"
+        );
+    }
+
+    /// #798 slice 2 — stop/continue through the delivery gate, end to end at the unit level: a
+    /// #796 default actions — the delivery gate's terminate side, driven through a mock kill door:
+    /// an unhandled `SIGTERM` fires the twin's **kill closure** (deferred like every wake) and the
+    /// exit hook retires the zombie in the `WIFSIGNALED` shape (`waitpid` status = the signal);
+    /// `SIGCHLD` (default-ignore) and a `SIG_IGN`'d signal are discarded at generation — a later
+    /// reset to `SIG_DFL` finds nothing pending; a **masked** `SIGTERM` is held and runs its action
+    /// at `sigprocmask`-unblock; a **stopped** process holds a fatal signal until `SIGCONT` (whose
+    /// fire is then the death, not the continue) while `SIGKILL` cuts straight through a stop; and
+    /// `signal`/`sigaction` refuse to change `SIGKILL`/`SIGSTOP`'s action (`-EINVAL`).
+    #[test]
+    fn default_terminate_fires_the_kill_door_and_waitpid_reports_the_signal() {
+        use std::sync::atomic::{AtomicI32, Ordering};
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        let mut root_handler = handler(Arc::clone(&posix.world), Arc::clone(&posix.root));
+        let mut forked = cap_fork_factory(&posix)(7);
+        let kills = Arc::new(AtomicI32::new(0));
+        let k2 = Arc::clone(&kills);
+        let (door, _armed) = forked.signal.as_ref().expect("the twin has a door");
+        door.set_kill(Arc::new(move || {
+            k2.fetch_add(1, Ordering::SeqCst);
+        }));
+        let mut win = vec![0u8; 256];
+        let mut mem = svm_interp::WindowMem::new(&mut win, 256);
+
+        // SIGCHLD (17): default-ignore — discarded, no fire, nothing pends.
+        assert_eq!(
+            root_handler(OP_KILL, &[7, 17], None, None).unwrap(),
+            vec![0]
+        );
+        // SIG_IGN'd SIGUSR2 (12): discarded at generation — a reset to SIG_DFL finds nothing.
+        assert_eq!(
+            (forked.handler)(OP_SIGNAL, &[12, SIG_IGN], None, None).unwrap(),
+            vec![SIG_DFL]
+        );
+        assert_eq!(
+            root_handler(OP_KILL, &[7, 12], None, None).unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            (forked.handler)(OP_SIGNAL, &[12, SIG_DFL], None, None).unwrap(),
+            vec![SIG_IGN]
+        );
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(
+            kills.load(Ordering::SeqCst),
+            0,
+            "ignored signals never kill"
+        );
+
+        // Masked SIGTERM (15): held pending; the unblock runs the default action.
+        mem.write_bytes(64, &(1u64 << 15).to_le_bytes()).unwrap();
+        assert_eq!(
+            (forked.handler)(OP_SIGPROCMASK, &[SIG_BLOCK, 64, 0], Some(&mut mem), None).unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            root_handler(OP_KILL, &[7, 15], None, None).unwrap(),
+            vec![0]
+        );
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(
+            kills.load(Ordering::SeqCst),
+            0,
+            "a masked fatal signal is held"
+        );
+        assert_eq!(
+            (forked.handler)(OP_SIGPROCMASK, &[SIG_UNBLOCK, 64, 0], Some(&mut mem), None).unwrap(),
+            vec![0]
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while kills.load(Ordering::SeqCst) != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the unblock runs the default action (kill fire)"
+            );
+            std::thread::yield_now();
+        }
+        // The core's task completion now fires the exit hook (crash status 128 — what a
+        // `ThreadFault` self-termination produces); the personality's bookkeeping wins.
+        (forked.exit.take().expect("the twin has an exit hook"))(128);
+        let r = root_handler(OP_WAITPID, &[7, 100, 0], Some(&mut mem), None).unwrap();
+        assert_eq!(r, vec![7], "the killed twin is reapable");
+        let status = i32::from_le_bytes(mem.read_bytes(100, 4).unwrap().try_into().unwrap());
+        assert_eq!(status & 0x7f, 15, "WIFSIGNALED: the terminating signal");
+        assert_eq!((status >> 8) & 0xff, 0, "not an exit-code encode");
+
+        // A second twin: a stop holds SIGTERM; SIGCONT's fire is the death, not the continue.
+        let forked2 = cap_fork_factory(&posix)(8);
+        let kills2 = Arc::new(AtomicI32::new(0));
+        let stops2 = Arc::new(AtomicI32::new(0));
+        let (door2, _armed2) = forked2.signal.as_ref().expect("door");
+        let k = Arc::clone(&kills2);
+        door2.set_kill(Arc::new(move || {
+            k.fetch_add(1, Ordering::SeqCst);
+        }));
+        let s = Arc::clone(&stops2);
+        door2.set_stop(Arc::new(move |stopped| {
+            s.store(if stopped { 1 } else { -1 }, Ordering::SeqCst);
+        }));
+        assert_eq!(
+            root_handler(OP_KILL, &[8, SIGSTOP as i64], None, None).unwrap(),
+            vec![0]
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while stops2.load(Ordering::SeqCst) != 1 {
+            assert!(std::time::Instant::now() < deadline, "the stop fires");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            root_handler(OP_KILL, &[8, 15], None, None).unwrap(),
+            vec![0]
+        );
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(
+            kills2.load(Ordering::SeqCst),
+            0,
+            "a stopped process holds a fatal signal"
+        );
+        assert_eq!(
+            root_handler(OP_KILL, &[8, SIGCONT as i64], None, None).unwrap(),
+            vec![0]
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while kills2.load(Ordering::SeqCst) != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the continue runs the held default action"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            stops2.load(Ordering::SeqCst),
+            1,
+            "the kill fire subsumed the continue fire"
+        );
+
+        // A third twin: SIGKILL cuts straight through a stop.
+        let mut forked3 = cap_fork_factory(&posix)(9);
+        let kills3 = Arc::new(AtomicI32::new(0));
+        let (door3, _armed3) = forked3.signal.as_ref().expect("door");
+        let k = Arc::clone(&kills3);
+        door3.set_kill(Arc::new(move || {
+            k.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(
+            root_handler(OP_KILL, &[9, SIGSTOP as i64], None, None).unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            root_handler(OP_KILL, &[9, SIGKILL as i64], None, None).unwrap(),
+            vec![0]
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while kills3.load(Ordering::SeqCst) != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "SIGKILL kills a stopped process"
+            );
+            std::thread::yield_now();
+        }
+
+        // SIGKILL/SIGSTOP dispositions are immutable.
+        assert_eq!(
+            (forked3.handler)(OP_SIGNAL, &[SIGKILL as i64, 0x77], None, None).unwrap(),
+            vec![EINVAL]
+        );
+        mem.write_bytes(128, &[0u8; 24]).unwrap();
+        assert_eq!(
+            (forked3.handler)(
+                OP_SIGACTION,
+                &[SIGSTOP as i64, 128, 0],
+                Some(&mut mem),
+                None
+            )
+            .unwrap(),
+            vec![EINVAL]
+        );
+        assert_eq!(
+            (forked3.handler)(
+                OP_SIGACTION,
+                &[SIGKILL as i64, 0, 128],
+                Some(&mut mem),
+                None
+            )
+            .unwrap(),
+            vec![0],
+            "probing with a null act stays allowed"
+        );
+    }
+
+    /// default-disposition `SIGTSTP` at a twin fires its **stop closure** (`f(true)`, deferred
+    /// past the dispatch's locks like a wake) and `waitpid(-1, WUNTRACED)` reports the stop once
+    /// (`sig<<8 | 0x7f`); while stopped, further signals are held (`sigcheck` empty, no wake);
+    /// `SIGCONT` fires `f(false)`, `waitpid(-1, WCONTINUED)` reports once (`0xffff`), and the held
+    /// signal delivers after the continue. A CAUGHT `SIGTSTP` never stops (ordinary pending).
+    #[test]
+    fn sigtstp_stops_fire_the_domain_closure_and_waitpid_reports_them() {
+        use std::sync::atomic::{AtomicI32, Ordering};
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        let mut root_handler = handler(Arc::clone(&posix.world), Arc::clone(&posix.root));
+        let mut forked = cap_fork_factory(&posix)(7);
+        // A mock core stop closure on the twin's door: records the last direction.
+        let dir = Arc::new(AtomicI32::new(0));
+        let d2 = Arc::clone(&dir);
+        let (door, _armed) = forked.signal.as_ref().expect("the twin has a door");
+        door.set_stop(Arc::new(move |stopped| {
+            d2.store(if stopped { 1 } else { -1 }, Ordering::SeqCst);
+        }));
+        let mut win = vec![0u8; 256];
+        let mut mem = svm_interp::WindowMem::new(&mut win, 256);
+
+        // Default-disposition SIGTSTP: the twin stops; the closure fires (detached thread — poll).
+        assert_eq!(
+            root_handler(OP_KILL, &[7, SIGTSTP as i64], None, None).unwrap(),
+            vec![0]
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while dir.load(Ordering::SeqCst) != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stop closure fires f(true)"
+            );
+            std::thread::yield_now();
+        }
+        // WUNTRACED reports the stop, once.
+        let r = root_handler(OP_WAITPID, &[-1, 100, WUNTRACED], Some(&mut mem), None).unwrap();
+        assert_eq!(
+            r,
+            vec![7],
+            "waitpid(-1, WUNTRACED) reports the stopped twin"
+        );
+        let status = i32::from_le_bytes(mem.read_bytes(100, 4).unwrap().try_into().unwrap());
+        assert_eq!(status & 0xff, 0x7f, "the stopped marker");
+        assert_eq!((status >> 8) & 0xff, SIGTSTP, "the stopping signal");
+        assert_eq!(
+            root_handler(OP_WAITPID, &[-1, 100, WUNTRACED], Some(&mut mem), None).unwrap(),
+            vec![ECHILD],
+            "report-once"
+        );
+        // While stopped: an ordinary signal is HELD — the twin's sigcheck stays empty.
+        assert_eq!(
+            (forked.handler)(OP_SIGNAL, &[10, 0x77], None, None).unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            root_handler(OP_KILL, &[7, 10], None, None).unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            (forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            vec![0],
+            "a stopped process delivers nothing"
+        );
+        // SIGCONT: the closure fires f(false); WCONTINUED reports once; the held 10 now delivers.
+        assert_eq!(
+            root_handler(OP_KILL, &[7, SIGCONT as i64], None, None).unwrap(),
+            vec![0]
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while dir.load(Ordering::SeqCst) != -1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the continue fires f(false)"
+            );
+            std::thread::yield_now();
+        }
+        let r = root_handler(OP_WAITPID, &[-1, 100, WCONTINUED], Some(&mut mem), None).unwrap();
+        assert_eq!(r, vec![7], "waitpid(-1, WCONTINUED) reports the continue");
+        let status = i32::from_le_bytes(mem.read_bytes(100, 4).unwrap().try_into().unwrap());
+        assert_eq!(status, 0xffff, "the continued status word");
+        assert_eq!(
+            root_handler(OP_WAITPID, &[-1, 100, WCONTINUED], Some(&mut mem), None).unwrap(),
+            vec![ECHILD],
+            "report-once"
+        );
+        assert_eq!(
+            (forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            vec![0x77],
+            "the held signal delivers after the continue"
+        );
+        // A CAUGHT SIGTSTP never stops: ordinary pending.
+        assert_eq!(
+            (forked.handler)(OP_SIGNAL, &[SIGTSTP as i64, 0x99], None, None).unwrap(),
+            vec![0]
+        );
+        dir.store(0, Ordering::SeqCst);
+        assert_eq!(
+            root_handler(OP_KILL, &[7, SIGTSTP as i64], None, None).unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            (forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            vec![0x99],
+            "caught TSTP takes the pending path"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(
+            dir.load(Ordering::SeqCst),
+            0,
+            "no stop fired for a caught TSTP"
+        );
+    }
 
     /// func 0 `(host_proc_handle) -> i64`: `malloc(2)`, store `"hi"` into the returned buffer,
     /// `write(1, ptr, 2)`, then encode `write_result * 1_000_000 + ptr`. `malloc` hands out the aligned
@@ -3096,7 +4850,7 @@ block 0 (vph: i32) {\n\
         // pipe lseek, EBADF fail-closed, and stdio fds as ordinary (closable, reusable) table entries.
         let mut host = Host::new();
         let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
-        let mut st = posix.inner.lock().unwrap();
+        ctx!(posix, w_g, p_g, st);
         let mut win = vec![0u8; WIN];
         win[16..21].copy_from_slice(b"hello");
         let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
@@ -3217,7 +4971,7 @@ block 0 (vph: i32) {\n\
 
         // No delegate ⇒ spawn is ENOSYS and there are no children to reap.
         {
-            let mut st = posix.inner.lock().unwrap();
+            ctx!(posix, w_g, p_g, st);
             let mut win = vec![0u8; WIN];
             win[0..2].copy_from_slice(b"up");
             let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
@@ -3248,7 +5002,7 @@ block 0 (vph: i32) {\n\
         });
 
         let (pid, status_word, stdin_after) = {
-            let mut st = posix.inner.lock().unwrap();
+            ctx!(posix, w_g, p_g, st);
             let mut win = vec![0u8; WIN];
             win[0..2].copy_from_slice(b"up"); // name
             win[8..13].copy_from_slice(b"up\0-n"); // argv blob: ["up", "-n"]
@@ -3410,7 +5164,7 @@ block 0 (vph: i32) {\n\
         // default ones are dropped, lowest number first.
         let mut host = Host::new();
         let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
-        let mut st = posix.inner.lock().unwrap();
+        ctx!(posix, w_g, p_g, st);
 
         assert_eq!(st.sigcheck(), 0, "nothing pending");
         // Install then re-install a caught handler for SIGINT(2); `signal` returns the previous.
@@ -3461,10 +5215,13 @@ block 0 (vph: i32) {\n\
         );
         assert_eq!(st.sigcheck(), 0, "the probe/edge calls raised nothing");
 
-        // The embedder's door (a terminal ^C) reaches the still-installed SIGINT handler.
-        drop(st);
+        // The embedder's door (a terminal ^C) reaches the still-installed SIGINT handler. Release
+        // the guards (the `Ctx` view only borrows them) before `raise_signal` re-locks the root proc.
+        let _ = st;
+        drop(p_g);
+        drop(w_g);
         posix.raise_signal(2);
-        let mut st = posix.inner.lock().unwrap();
+        ctx!(posix, w_g, p_g, st);
         assert_eq!(
             st.sigcheck(),
             0x1234,
@@ -3476,7 +5233,7 @@ block 0 (vph: i32) {\n\
         // the compiled-C `c_posix` tests cover that path on both backends. Here we drive the mask field
         // directly to unit-test the `sigcheck` hold-vs-deliver decision.)
         st.signal(&[4, 0xCAFE]); // catch signal 4
-        st.sig_mask = 1 << 4; // block it
+        st.p.sig_mask = 1 << 4; // block it
         st.kill(&[0, 4]); // raise -> pending but blocked
         assert_eq!(
             st.sigcheck(),
@@ -3484,11 +5241,11 @@ block 0 (vph: i32) {\n\
             "a blocked pending signal is held, not delivered"
         );
         assert_eq!(
-            st.sig_pending & (1 << 4),
+            st.p.sig_pending & (1 << 4),
             1 << 4,
             "the held signal stays pending across the poll"
         );
-        st.sig_mask = 0; // unblock
+        st.p.sig_mask = 0; // unblock
         assert_eq!(st.sigcheck(), 0xCAFE, "delivered once unblocked");
         assert_eq!(st.sigcheck(), 0, "delivered exactly once");
     }
@@ -3734,7 +5491,7 @@ block 0 (vph: i32) {\n\
         // getenv caches a pointer; setenv must invalidate it so the next getenv reflects the new value.
         let mut host = Host::new();
         let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
-        let mut st = posix.inner.lock().unwrap();
+        ctx!(posix, w_g, p_g, st);
         // Stage the name "K" at offset 0 and value "v2" at offset 8 in a scratch window.
         let mut win = vec![0u8; WIN];
         win[0] = b'K';
@@ -3742,7 +5499,7 @@ block 0 (vph: i32) {\n\
         win[9] = b'2';
         let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
         // setenv("K", "v1", overwrite=1): name@0 len 1, value staged separately — reuse offset 8 with "v1".
-        st.env.insert("K".to_string(), "v1".to_string());
+        st.p.env.insert("K".to_string(), "v1".to_string());
         // getenv("K") materializes "v1\0" and caches the pointer.
         let p1 = st.getenv(&[0, 1], Some(&mut mem)).unwrap()[0];
         assert!(p1 > 0, "getenv returns a non-null arena pointer");
@@ -3758,7 +5515,7 @@ block 0 (vph: i32) {\n\
         let r0 = st.setenv(&[0, 1, 8, 2, 0], Some(&mut mem)).unwrap()[0];
         assert_eq!(r0, 0, "setenv(overwrite=0) on existing name returns 0");
         assert_eq!(
-            st.env.get("K").map(String::as_str),
+            st.p.env.get("K").map(String::as_str),
             Some("v2"),
             "overwrite=0 kept the existing value"
         );
@@ -3779,7 +5536,7 @@ block 0 (vph: i32) {\n\
         win[..6].copy_from_slice(b"/tmp/a"); // path at offset 0
         win[100..104].copy_from_slice(b"/tmp"); // dir path at offset 100
         let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
-        let mut st = posix.inner.lock().unwrap();
+        ctx!(posix, w_g, p_g, st);
         let rd = |mem: &svm_interp::WindowMem, off: u64| {
             i64::from_le_bytes(mem.read_bytes(off, 8).unwrap().try_into().unwrap())
         };
@@ -3837,7 +5594,7 @@ block 0 (vph: i32) {\n\
         win_write(&mut mem, 96, b"/data/e");
         win_write(&mut mem, 112, b"/data/e/inner");
         win_write(&mut mem, 128, b"/data/d/inner");
-        let mut st = posix.inner.lock().unwrap();
+        ctx!(posix, w_g, p_g, st);
         let rd = |mem: &svm_interp::WindowMem, off: u64| {
             i64::from_le_bytes(mem.read_bytes(off, 8).unwrap().try_into().unwrap())
         };
@@ -3921,7 +5678,7 @@ block 0 (vph: i32) {\n\
         let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
         // bind blob: v4 loopback :0 at offset 0 → [4, 0,0, 127,0,0,1]
         win_write(&mut mem, 0, &[4u8, 0, 0, 127, 0, 0, 1]);
-        let mut st = posix.inner.lock().unwrap();
+        ctx!(posix, w_g, p_g, st);
 
         // bind :0 → listener fd + the actual bound addr (ephemeral port) written at 100.
         let lfd = st.net_bind(&[0, 7, 100, 32], Some(&mut mem)).unwrap()[0];
@@ -4043,7 +5800,7 @@ block 0 (vph: i32) {\n\
         posix.set_net(Scripted);
         let mut win = vec![0u8; WIN];
         let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
-        let mut st = posix.inner.lock().unwrap();
+        ctx!(posix, w_g, p_g, st);
 
         // resolve("localhost") → the loopback blob, no delegate involved.
         win_write(&mut mem, 0, b"localhost");
@@ -4085,12 +5842,12 @@ block 0 (vph: i32) {\n\
         let mut win = vec![0u8; WIN];
         let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
         win_write(&mut mem, 0, b"prog");
-        let mut st = posix.inner.lock().unwrap();
+        ctx!(posix, w_g, p_g, st);
 
         let pid = st.spawn(&[0, 4, 0, 0], Some(&mut mem)).unwrap()[0];
         assert!(pid >= 0, "spawn returns a pid");
-        assert_eq!(st.stdout, b"to-out", "stdout routed to fd 1's sink");
-        assert_eq!(st.stderr, b"to-err", "stderr routed to fd 2's sink");
+        assert_eq!(st.w.stdout, b"to-out", "stdout routed to fd 1's sink");
+        assert_eq!(st.w.stderr, b"to-err", "stderr routed to fd 2's sink");
 
         assert_eq!(st.waitpid(&[pid, 200, 0], Some(&mut mem)).unwrap()[0], pid);
         let status = i32::from_le_bytes(mem.read_bytes(200, 4).unwrap().try_into().unwrap());
@@ -4117,7 +5874,7 @@ block 0 (vph: i32) {\n\
         });
         let mut win = vec![0u8; WIN];
         let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
-        let mut st = posix.inner.lock().unwrap();
+        ctx!(posix, w_g, p_g, st);
 
         win_write(&mut mem, 0, b"prog"); // command name
                                          // Two capture pipes: their write ends receive the child's stdout / stderr, their read ends drain.
@@ -4144,7 +5901,7 @@ block 0 (vph: i32) {\n\
 
         // The child's stdout/stderr landed in the capture pipes, NOT the shared fd-1/fd-2 sinks.
         assert!(
-            st.stdout.is_empty() && st.stderr.is_empty(),
+            st.w.stdout.is_empty() && st.w.stderr.is_empty(),
             "per-child routing never wrote the shared stdout/stderr sinks"
         );
         let n_out = st.read(&[rfd_out, 200, 64], Some(&mut mem)).unwrap()[0];
@@ -4168,7 +5925,7 @@ block 0 (vph: i32) {\n\
         let pid2 = st.spawn2(&[100], Some(&mut mem)).unwrap()[0];
         assert_eq!(pid2, pid + 1, "a second spawn mints the next pid");
         assert_eq!(
-            st.stderr, b"E",
+            st.w.stderr, b"E",
             "an all-(-1) request inherits fd 2 → the shared stderr sink"
         );
     }
@@ -4187,9 +5944,9 @@ block 0 (vph: i32) {\n\
         posix.set_args(&["sh", "-c", "echo hi"]);
         let mut win = vec![0u8; WIN];
         let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
-        let mut st = posix.inner.lock().unwrap();
+        ctx!(posix, w_g, p_g, st);
 
-        assert_eq!(st.args.len() as i64, 3, "argc");
+        assert_eq!(st.p.args.len() as i64, 3, "argc");
         assert_eq!(st.argv(&[1, 0, 64], Some(&mut mem)).unwrap()[0], 2); // "-c" len 2
         assert_eq!(mem.read_bytes(0, 3).unwrap(), b"-c\0");
         assert_eq!(st.argv(&[2, 100, 64], Some(&mut mem)).unwrap()[0], 7); // "echo hi"

@@ -20,6 +20,11 @@ patched*.wasm
 /web/assets/*.wad
 /web/assets/*.img
 !/web/assets/hello_c.svmb
+# nim_hello.svmb — a real Nim program (`write(stdout, "hello, svm")`) compiled through nimony →
+# svm-leng → the nim→powerbox bridge to a runnable module, committed like `hello_c` so the "run real
+# Nim" playground card works out of the box. Regenerate with `cargo run -p svm-run --example
+# build_nim_hello_svmb` (needs the nimony toolchain); gated by `crates/svm-run/tests/nim_hello_asset.rs`.
+!/web/assets/nim_hello.svmb
 !/web/assets/gradient.svmb
 !/web/assets/bounce.svmb
 !/web/assets/life.svmb

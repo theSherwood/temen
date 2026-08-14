@@ -16,6 +16,13 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **`timeout-minutes: 45` on the `svm-llvm` job** (issue #906) — it was the only lane with no
+  timeout, so a wedged compile ran to GitHub's 6-hour default before reporting. Observed once: the
+  `std_guest` native-oracle `rustc` hung 66+ min on PR #898's run (the suite unexpectedly *ran*
+  there rather than auto-skipping — the runner had a usable nightly). The harness-side fix (the
+  #788 bounded-wait now also covers the native-oracle compiles, `std_guest.rs`) is the primary
+  guard; this timeout is the backstop. Normal lane time ~20 min.
+
 - **`lua-warm-snapshot-test.mjs` + Lua coverage in `snapshot-worker-test.mjs` (`browser-real` job, issue
   #805)** — one line added after `node warm-jit-test.mjs`: `node lua-warm-snapshot-test.mjs` (Node/V8
   cold ≡ warm ≡ warm+JIT byte-for-byte + isolation over the committed `lua_snapshot.svmb`). The existing
@@ -151,11 +158,15 @@ identical until the next agent edit.
 - **`nim-e2e` job** — builds the real nimony toolchain (`scripts/ci/provision-nimony.sh`, cached) and
   runs `crates/svm-leng/tests/nim_e2e.rs`, which compiles small **Nim source** programs through
   `nimony c` and runs them on both SVM engines. The tests self-skip (pass) in the always-on `check`
-  job because the toolchain isn't there; this job provides it so they actually execute. **Two things
+  job because the toolchain isn't there; this job provides it so they actually execute. **Things
   to do on copy-over:** (1) pin `alaviss/setup-nim@0.1.1` by SHA (left as a tag — no vetted SHA to
   hand); (2) confirm the heavy cold build (~10-15 min) fits the runner budget — it's a mirror of
   nim-lang/nimony's own CI and hasn't been run in *this* repo's CI yet, so the first green run is the
-  real validation.
+  real validation. **(3) NEW — the `nim-e2e` checkout now needs `submodules: recursive`** (added in
+  `workflows_src/ci.yml`): `nimony` + `nativenif` are vendored as **git submodules** (pinned in
+  `.gitmodules`), and `provision-nimony.sh` now `git submodule update --init`s them instead of cloning
+  a hard-coded SHA. Without the recursive checkout the submodule dirs are empty and the toolchain
+  build fails. Only this job's checkout changed; the others stay bare.
 
 - **`std-guest` job** (#821) — a new **nightly** (`schedule` + `workflow_dispatch`) Linux job that runs
   the `crates/svm-llvm/tests/std_guest.rs` suite, which no CI job previously executed (it auto-skips in
