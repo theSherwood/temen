@@ -6330,13 +6330,22 @@ block 0 () {{
 {stores}
   vrp = i64.const 1024
   vch = cap.call 6 17 (i64) -> (i32) vh (vrp)
+  vzero = i32.const 0
+  visneg = i32.lt_s vch vzero
+  br_if visneg 2(vch) 1(vh, vch)
+}}
+block 1 (vh1: i32, vch1: i32) {{
   vz = i32.const 0
   vs = svc.wait vz
-  vj = cap.call 6 1 (i32) -> (i64) vh (vch)
+  vj = cap.call 6 1 (i32) -> (i64) vh1 (vch1)
   vk = i64.const 1000
   vm2 = i64.mul vs vk
   vt = i64.add vj vm2
   return vt
+}}
+block 2 (verr: i32) {{
+  verr64 = i64.extend_i32_s verr
+  return verr64
   }}
 }}
 
@@ -6372,6 +6381,7 @@ block 0 (vaddr: i64) {{
         let mut host = Host::new();
         host.set_self_module(&Arc::new(m.clone()));
         host.set_region_factory(new_shared_region);
+        host.set_quota(Limits::default().quota());
         let ih = host.grant_instantiator(0, win);
         host.register_cap_name("vm", ih);
         host
