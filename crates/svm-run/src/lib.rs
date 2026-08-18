@@ -3390,6 +3390,47 @@ pub fn is_named_powerbox_entry(module: &Module) -> bool {
             .any(|e| e.name == "_start" && e.func == 0)
 }
 
+/// **Demote** non-entry-point exports to diagnostic names (#907, the `.dynsym`/`.symtab` split — the
+/// `svmb-strip` packaging step). Translate exports *every* defined function by its symbol name, so a
+/// shipped `.svmb` carries thousands of export entries nothing ever resolves; only the ones in `keep`
+/// (plus `_start`, always — it is the powerbox-entry *marker*, [`is_named_powerbox_entry`]) are
+/// semantic. Each export not kept is removed from [`Module::exports`] and its name recorded in
+/// [`svm_ir::DebugInfo::func_names`] instead — the strippable, verifier-ignored §6 name waist that
+/// backtraces and the wasm-JIT emitter's name section already read — so demotion changes **no**
+/// diagnostic output, only what [`Module::resolve_export`] can reach. An existing `func_names` entry
+/// (a `-g` source name) is never overwritten. Returns the number of exports demoted.
+///
+/// Only sound as an explicit **per-artifact** choice for a known-single-module artifact: a parent
+/// guest can resolve any child export by name through the Module capability, so a linking or
+/// child-module artifact must keep everything it publishes.
+pub fn demote_exports(module: &mut Module, keep: &[&str]) -> usize {
+    let kept: Vec<svm_ir::Export> = module
+        .exports
+        .iter()
+        .filter(|e| e.name == "_start" || keep.contains(&e.name.as_str()))
+        .cloned()
+        .collect();
+    let demoted: Vec<svm_ir::FuncName> = module
+        .exports
+        .iter()
+        .filter(|e| e.name != "_start" && !keep.contains(&e.name.as_str()))
+        .map(|e| svm_ir::FuncName {
+            func: e.func,
+            name: e.name.clone(),
+        })
+        .collect();
+    let n = demoted.len();
+    if n == 0 {
+        return 0;
+    }
+    module.exports = kept;
+    let di = module.debug_info.get_or_insert_with(Default::default);
+    let named: std::collections::HashSet<u32> = di.func_names.iter().map(|f| f.func).collect();
+    di.func_names
+        .extend(demoted.into_iter().filter(|f| !named.contains(&f.func)));
+    n
+}
+
 /// The reference host's capability-import name policy (§7 "Host-defined capabilities &
 /// discoverability"): the standard `name → (type_id, op)` binding a manifest module's import
 /// names resolve to when the powerbox binds its slots ([`Instance::grant_caps`],
