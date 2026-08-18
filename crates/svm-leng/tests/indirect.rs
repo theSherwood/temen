@@ -169,6 +169,79 @@ fn virtual_dispatch_through_a_vtable() {
 }
 
 #[test]
+fn dispatch_through_a_materialized_const_vtable() {
+    // The `method` shape (#979): the vtable is a **`const`** whose `mt` flexarray holds method
+    // funcrefs — `(oconstr Vtbl (kv mt (aconstr (flexarray (ptr void)) (cast (ptr void) getX))))`.
+    // Unlike `virtual_dispatch_through_a_vtable` (which *seeds* the vtable bytes by hand), here
+    // svm-leng must **materialize** the const's `mt` table (a `data.funcref` the linker resolves), so
+    // `o.vt.mt[0]` reaches the real method. Before the fix the const stayed a zeroed placeholder and
+    // dispatch silently called func 0. `decoy` is func 0 and `getX` is func 1, so a broken
+    // materialization returns 999 (the decoy), while a correct one returns o.x = 42. Driven through
+    // the **link** path (`link_whole_with_runtime`) — the one nimony uses — so the funcref resolves
+    // (runnable `translate` leaves data funcrefs to a linker, as it does for funcref gvars).
+    let leng = "\
+(stmts
+ (type :Getter.0. . (proctype . (params (param :self.0 . (ptr Obj.0.))) (i +64) (pragmas (nimcall))))
+ (type :GetterP.0. . (ptr Getter.0.))
+ (type :Vtbl.0. . (object . (fld :mt.0 . (flexarray (ptr (void))))))
+ (type :Obj.0. . (object . (fld :vt.0 . (ptr Vtbl.0.)) (fld :x.0 . (i +64))))
+ (proc :decoy.0 (params (param :self.0 . (ptr Obj.0.))) (i +64) .
+  (stmts . (ret 999)))
+ (proc :getX.0 (params (param :self.0 . (ptr Obj.0.))) (i +64) .
+  (stmts . (ret (dot (deref self.0) x.0 0))))
+ (const :theVt.0. . Vtbl.0.
+  (oconstr Vtbl.0. (kv mt.0 (aconstr (flexarray (ptr (void))) (cast (ptr (void)) getX.0)))))
+ (proc :dispatch.0 (params (param :o.0 . (ptr Obj.0.))) (i +64) .
+  (stmts .
+   (asgn (dot (deref o.0) vt.0 0) (cast (ptr Vtbl.0.) (addr theVt.0.)))
+   (ret (call
+     (cast GetterP.0. (pat (dot (deref (dot (deref o.0) vt.0 0)) mt.0 0) 0))
+     o.0)))))";
+    let unit = svm_leng::WholeModule {
+        stem: "vt7test",
+        src: leng,
+    };
+    let m =
+        svm_leng::link_whole_with_runtime(&[unit], vec![]).unwrap_or_else(|e| panic!("link: {e}"));
+    svm_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    let dispatch = m
+        .exports
+        .iter()
+        .find(|e| e.name.contains("dispatch"))
+        .expect("dispatch export")
+        .func;
+
+    // Object at 320: vt@320 (set by dispatch), x@328 = 42.
+    let obj = 320usize;
+    let mut seed = vec![0u8; 4096];
+    seed[obj + 8..obj + 16].copy_from_slice(&42u64.to_le_bytes());
+    // `dispatch` makes an indirect call → frame-needing under the funcref ABI: leading `$sp` (2048).
+    let mut fuel = u64::MAX;
+    let (ir, _) = svm_interp::run_capture(
+        &m,
+        dispatch,
+        &[Value::I64(2048), Value::I64(obj as i64)],
+        &mut fuel,
+        &seed,
+    );
+    let iword = match ir.expect("interp").as_slice() {
+        [Value::I64(n)] => *n,
+        o => panic!("unexpected {o:?}"),
+    };
+    let (jout, _) =
+        svm_jit::compile_and_run_capture(&m, dispatch, &[2048, obj as i64], &seed).expect("jit");
+    let jword = match jout {
+        svm_jit::JitOutcome::Returned(v) => v,
+        o => panic!("jit: {o:?}"),
+    };
+    assert_eq!(vec![iword], jword, "§9 interp/JIT parity");
+    assert_eq!(
+        iword, 42,
+        "dispatch through the materialized const vtable calls getX (func 1), not the decoy (func 0)"
+    );
+}
+
+#[test]
 fn baseobj_upcasts_to_the_base_subobject() {
     // `(baseobj Base N obj)` upcasts to the inlined base sub-object (offset 0, single inheritance).
     // `Derived` inlines `Base{tag}` at offset 0, then its own `extra`. Reading the base's `tag`

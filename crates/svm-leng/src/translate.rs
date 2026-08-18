@@ -277,6 +277,12 @@ impl Layout {
 
 pub(crate) struct Translator {
     procs: HashMap<String, Sig>,
+    /// Names of every proc **defined** in this module — populated at the top of [`collect_globals`],
+    /// *before* the `procs` signature table exists, so [`const_aggregate_bytes`](Self::const_aggregate_bytes)
+    /// can tell a **vtable method-table entry** (a proc symbol → a funcref reloc) from a **data pointer**
+    /// (another global) while materializing an `Rtti` const's `mt` array. Without this, a `method`
+    /// dispatch's vtable stayed a zeroed placeholder and dynamic dispatch silently called func 0 (#979).
+    proc_names: HashSet<String>,
     types: HashMap<String, Layout>,
     /// Names of locally-declared `object`/`array` aggregate types. A bare-symbol type is treated as
     /// an aggregate (held by address, indexed by `dot`/`at`) iff it is in this set; every other named
@@ -407,6 +413,7 @@ impl Translator {
     pub fn new() -> Self {
         Translator {
             procs: HashMap::default(),
+            proc_names: HashSet::default(),
             types: HashMap::default(),
             agg_names: HashSet::default(),
             ty_aliases: HashMap::default(),
@@ -558,6 +565,16 @@ impl Translator {
     /// Collect `gvar`/`const` top-levels: globals get fixed window offsets (below the stack the
     /// caller passes in); scalar int consts are recorded for inlining.
     fn collect_globals(&mut self, root: &Node) -> Result<(), LengError> {
+        // Record every proc **defined** here up front (the signature table doesn't exist yet), so
+        // `const_aggregate_bytes` can classify a vtable `mt` entry (a proc symbol → funcref) apart
+        // from a data pointer while materializing an `Rtti` const (#979).
+        for item in root.args() {
+            if item.tag() == Some("proc") {
+                if let Ok(n) = sym_def(&item.args()[0]) {
+                    self.proc_names.insert(n);
+                }
+            }
+        }
         // Globals start at the link-unit base (`POWERBOX_STACK_PAGE` for a powerbox program, so page
         // 0 stays reserved for the heap-brk words + args buffer; 16 for a runnable single module).
         let mut off = self.globals_base();
@@ -655,7 +672,7 @@ impl Translator {
                                 // reserve the slot zero-initialized. (Relocating a data-pointer global
                                 // initializer to its target is a later refinement, the `data.ptr`
                                 // twin of the funcref case above.)
-                            } else if let Some((bytes, adesc, relocs)) =
+                            } else if let Some((bytes, adesc, relocs, frelocs)) =
                                 self.const_aggregate_bytes(init)?
                             {
                                 // An **aggregate `gvar` initializer** — an object/array/string constant
@@ -664,11 +681,15 @@ impl Translator {
                                 // global's offset, exactly as an aggregate `const` does; the global just
                                 // stays writable. A blob may exceed the fixed type size (a `string`/
                                 // `LongString` tail), so reserve the larger of the two. Any const-to-const
-                                // pointer inside (a string's `more = (addr strlit)`) becomes a `data.ptr`.
+                                // pointer inside (a string's `more = (addr strlit)`) becomes a `data.ptr`;
+                                // a funcref slot (a vtable's `mt`) becomes a `data.funcref`.
                                 let n = bytes.len() as u64;
                                 self.data_inits.push((off, bytes));
                                 for (rel_at, target) in relocs {
                                     self.data_ptrs.push((off + rel_at, target));
+                                }
+                                for (rel_at, sym) in frelocs {
+                                    self.funcref_inits.push((off + rel_at, sym));
                                 }
                                 self.globals.insert(name, (off, adesc));
                                 off += n.max(self.sizeof(&desc)).max(8);
@@ -705,28 +726,30 @@ impl Translator {
                         let name = sym_def(&a[0])?;
                         if let Some(v) = int_literal(&a[3]) {
                             self.consts.insert(name, v);
-                        } else if let Some((bytes, desc, relocs)) =
+                        } else if let Some((bytes, desc, relocs, frelocs)) =
                             self.const_aggregate_bytes(&a[3])?
                         {
-                            // A constant aggregate with data (a `LongString` string-literal blob):
-                            // materialize its exact bytes into a data segment and register it as an
-                            // addressable global, so `(addr strlit…)` — the `string` value's `more`
-                            // pointer — resolves to it. Any const-to-const pointer inside it becomes
-                            // a `data.ptr` relocation at its absolute offset.
+                            // A constant aggregate with data (a `LongString` string-literal blob, or an
+                            // `Rtti` **vtable** — its `mt` method table now materialized as funcref
+                            // relocs, #979): materialize its exact bytes into a data segment and register
+                            // it as an addressable global, so `(addr strlit…)`/`(addr Type.vt)` resolve.
+                            // A const-to-const pointer inside becomes a `data.ptr`; a funcref slot (a
+                            // vtable's `mt` entry) becomes a `data.funcref` the linker fills.
                             let sz = bytes.len() as u64;
                             self.data_inits.push((off, bytes));
                             for (rel_at, target) in relocs {
                                 self.data_ptrs.push((off + rel_at, target));
                             }
+                            for (rel_at, sym) in frelocs {
+                                self.funcref_inits.push((off + rel_at, sym));
+                            }
                             self.globals.insert(name, (off, desc));
                             off += sz.max(8);
                         } else {
-                            // A non-scalar const we can't materialize — e.g. an `Rtti` vtable
-                            // (`Type.vt`) or its RTTI internals. Reserve an addressable, opaque
-                            // placeholder global so `(addr Type.vt)` yields a valid window address.
-                            // Its bytes are never read by translatable code (an object stores the
-                            // vtable pointer, but only *dynamic dispatch* reads through it, and that
-                            // fail-closes), so a zeroed fixed-size placeholder is sound.
+                            // A non-scalar const we still can't materialize — reserve an addressable,
+                            // opaque placeholder global so `(addr name)` yields a valid window address.
+                            // (An `Rtti` vtable now materializes above; this remains for genuinely
+                            // opaque RTTI internals whose bytes no translatable code reads.)
                             const VT_PLACEHOLDER: u64 = 64;
                             self.globals
                                 .insert(name, (off, TyDesc::Scalar(ValType::I64)));
@@ -764,11 +787,16 @@ impl Translator {
             if a.len() >= 4 {
                 let name = sym_def(&a[0])?;
                 if !self.globals.contains_key(&name) && int_literal(&a[3]).is_none() {
-                    if let Some((bytes, desc, relocs)) = self.const_aggregate_bytes(&a[3])? {
+                    if let Some((bytes, desc, relocs, frelocs)) =
+                        self.const_aggregate_bytes(&a[3])?
+                    {
                         let sz = bytes.len() as u64;
                         self.data_inits.push((*off, bytes));
                         for (rel_at, target) in relocs {
                             self.data_ptrs.push((*off + rel_at, target));
+                        }
+                        for (rel_at, sym) in frelocs {
+                            self.funcref_inits.push((*off + rel_at, sym));
                         }
                         self.globals.insert(name, (*off, desc));
                         *off += sz.max(8);
@@ -873,22 +901,47 @@ impl Translator {
     fn const_aggregate_bytes(
         &self,
         val: &Node,
-    ) -> Result<Option<(Vec<u8>, TyDesc, Vec<(u64, u64)>)>, LengError> {
+    ) -> Result<Option<(Vec<u8>, TyDesc, Vec<(u64, u64)>, Vec<(u64, String)>)>, LengError> {
         // Relocations `(rel_at, target_off)`: a pointer at `rel_at` (relative to these bytes) to the
         // window offset `target_off` — a const-to-const pointer (a `string`'s `more = (addr strlit)`).
         let mut relocs: Vec<(u64, u64)> = Vec::new();
+        // **Funcref relocations** `(rel_at, proc_sym)`: an 8-byte slot at `rel_at` that must hold a
+        // function index — an `Rtti` vtable's `mt` method-table entry (a `method` override). Zeroed
+        // here; the linker writes `ref.func proc_sym`'s value (the funcref-gvar mechanism, #979).
+        let mut funcrelocs: Vec<(u64, String)> = Vec::new();
         // An **array constructor** `(aconstr ArrayType elem0 elem1 …)` — a `const` table (e.g.
-        // `fsLookupTable`, 256 `i8`s). Each scalar-int element writes at `i * elem_size`.
+        // `fsLookupTable`, 256 `i8`s; or a vtable's `mt` funcptr table). The type may be a **named**
+        // array or an **inline** `(flexarray|uarray ElemT)` (the shape an `Rtti`'s `mt` uses). Each
+        // element writes at `i * elem_size`.
         if val.tag() == Some("aconstr") {
             let a = val.args();
-            let tyname = match a.first().and_then(|n| n.as_atom()) {
-                Some(n) => n,
-                None => return Ok(None),
-            };
-            let (elem_size, total) = match self.types.get(tyname) {
-                Some(Layout::Array {
-                    elem_size, size, ..
-                }) => (*elem_size as usize, *size as usize),
+            // `desc` is the const's registered type: the **named** array type for `(aconstr Named …)`
+            // (unchanged), or a `FlexArray` for an **inline** `(flexarray|uarray ElemT)` (a vtable `mt`).
+            let (elem_size, total, desc): (usize, usize, TyDesc) = match a.first() {
+                Some(t) if t.as_atom().is_some() => match self.types.get(t.as_atom().unwrap()) {
+                    Some(Layout::Array {
+                        elem_size, size, ..
+                    }) => (
+                        *elem_size as usize,
+                        *size as usize,
+                        TyDesc::Agg(t.as_atom().unwrap().to_string()),
+                    ),
+                    _ => return Ok(None),
+                },
+                // Inline `(flexarray|uarray ElemT)`: element size from `ElemT`, count from the elems.
+                Some(t) if matches!(t.tag(), Some("flexarray") | Some("uarray")) => {
+                    let ed = t.args().first().and_then(|e| self.tydesc(e).ok());
+                    let es = ed
+                        .as_ref()
+                        .map(|d| self.sizeof(d) as usize)
+                        .unwrap_or(8)
+                        .max(1);
+                    (
+                        es,
+                        a.len().saturating_sub(1) * es,
+                        TyDesc::FlexArray(Box::new(ed.unwrap_or(TyDesc::Scalar(ValType::I64)))),
+                    )
+                }
                 _ => return Ok(None),
             };
             let w = elem_size.min(8);
@@ -904,7 +957,16 @@ impl Translator {
                     if off + w <= bytes.len() {
                         bytes[off..off + w].copy_from_slice(&(n as u64).to_le_bytes()[..w]);
                     }
-                } else if let Some((ebytes, _, erelocs)) = self.const_aggregate_bytes(v)? {
+                } else if let Some(sym) = peel_cast(v)
+                    .as_atom()
+                    .filter(|s| self.proc_names.contains(*s))
+                {
+                    // A **funcref element** — a `(cast (ptr void) proc)` (or bare proc) in a vtable's
+                    // `mt` table. Emit a funcref reloc at this slot; the linker writes its func index.
+                    funcrelocs.push((off as u64, sym.to_string()));
+                } else if let Some((ebytes, _, erelocs, efrelocs)) =
+                    self.const_aggregate_bytes(v)?
+                {
                     // An **aggregate** element (an array of `string`s — each an SSO `oconstr`):
                     // materialize it recursively and place its bytes; shift its relocs by `off`.
                     let end = (off + ebytes.len()).min(bytes.len());
@@ -912,6 +974,7 @@ impl Translator {
                         bytes[off..end].copy_from_slice(&ebytes[..end - off]);
                     }
                     relocs.extend(erelocs.into_iter().map(|(at, t)| (at + off as u64, t)));
+                    funcrelocs.extend(efrelocs.into_iter().map(|(at, s)| (at + off as u64, s)));
                 } else if let Ok(fb) = const_float_bytes(v, &felem) {
                     // A **float element** (`powtens = [1e0, 1e1, …]` in `parseutils.parseFloat`, an
                     // `array[..22, float64]`). Fold to the element-width float bits, exactly as the
@@ -925,7 +988,7 @@ impl Translator {
                     return Ok(None);
                 }
             }
-            return Ok(Some((bytes, TyDesc::Agg(tyname.to_string()), relocs)));
+            return Ok(Some((bytes, desc, relocs, funcrelocs)));
         }
         if val.tag() != Some("oconstr") {
             return Ok(None);
@@ -970,17 +1033,49 @@ impl Translator {
                     bytes.resize(off + data.len(), 0);
                 }
                 bytes[off..off + data.len()].copy_from_slice(&data);
-            } else if ka[1].tag() == Some("addr") {
-                // A pointer to another const/global (`more = (addr strlit…)`). Runnable mode bakes
-                // the target's fixed window offset in; **link** mode emits a `data.ptr` relocation
-                // (placeholder bytes here, the linker overwrites with the resolved address).
-                let target = ka[1].args().first().and_then(|n| n.as_atom());
+            } else if ka[1].tag() == Some("aconstr") {
+                // An **inline array field** — a vtable's `mt` funcptr table (`(kv mt.0 (aconstr …))`).
+                // Materialize it recursively (funcref elements included) at the field's offset, growing
+                // the fixed-size blob to hold the tail, and shift its relocs by `off`.
+                let Some((ebytes, _, erelocs, efrelocs)) = self.const_aggregate_bytes(&ka[1])?
+                else {
+                    return Ok(None);
+                };
+                if bytes.len() < off + ebytes.len() {
+                    bytes.resize(off + ebytes.len(), 0);
+                }
+                bytes[off..off + ebytes.len()].copy_from_slice(&ebytes);
+                relocs.extend(erelocs.into_iter().map(|(at, t)| (at + off as u64, t)));
+                funcrelocs.extend(efrelocs.into_iter().map(|(at, s)| (at + off as u64, s)));
+            } else if matches!(peel_cast(&ka[1]).as_atom(), Some(s) if self.proc_names.contains(s))
+            {
+                // A **funcref pointer field** — a bare/`cast`-wrapped proc symbol in a pointer slot.
+                let sym = peel_cast(&ka[1]).as_atom().unwrap();
+                funcrelocs.push((off as u64, sym.to_string()));
+            } else if ka[1].tag() == Some("addr")
+                || peel_cast(&ka[1])
+                    .as_atom()
+                    .is_some_and(|s| self.globals.contains_key(s))
+            {
+                // A pointer to another const/global — `more = (addr strlit…)`, or a vtable's `dy`
+                // display-info pointer (`(cast (ptr u32) Type.dy)`). Runnable mode bakes the target's
+                // fixed window offset in; **link** mode emits a `data.ptr` relocation. A `(cast …)`
+                // wrapping the symbol is transparent here (peeled).
+                let inner = peel_cast(&ka[1]);
+                let target = if ka[1].tag() == Some("addr") {
+                    ka[1].args().first().and_then(|n| n.as_atom())
+                } else {
+                    inner.as_atom()
+                };
                 match target.and_then(|t| self.globals.get(t)) {
                     Some((goff, _)) if self.link_mode => relocs.push((off as u64, *goff)),
                     Some((goff, _)) => {
                         bytes[off..off + 8].copy_from_slice(&goff.to_le_bytes());
                     }
-                    None => return Ok(None),
+                    // An unresolved target (e.g. a not-yet-materialized RTTI display blob) — reserve a
+                    // zeroed slot rather than abort. Sound: only `mt` (the funcrefs above) is read by
+                    // dynamic dispatch; `dy` feeds `of`/type-name display, tolerant of a null here.
+                    None => {}
                 }
             } else if matches!(fdesc, TyDesc::Scalar(ValType::F32 | ValType::F64)) {
                 // A **float field** value (`(kv x 1.0)`, `(kv y 2.0)` — nimony emits object consts
@@ -998,7 +1093,12 @@ impl Translator {
                 return Ok(None); // an unsupported const field value — fall back to a placeholder
             }
         }
-        Ok(Some((bytes, TyDesc::Agg(tyname.to_string()), relocs)))
+        Ok(Some((
+            bytes,
+            TyDesc::Agg(tyname.to_string()),
+            relocs,
+            funcrelocs,
+        )))
     }
 
     /// Byte size of a type descriptor.
@@ -4897,6 +4997,21 @@ fn collect_calls(node: &Node, out: &mut HashSet<String>) {
 /// initializer, an `(addr …)` operand, etc. — all funcref uses that lower to `ref.func`. The head of
 /// a *direct* call is skipped (not a funcref of the proc); a computed/indirect head (a non-atom) is
 /// recursed into. See [`Translator::funcref_targets`].
+/// Peel `(cast T x)` wrappers, returning the innermost non-`cast` node. A const materializer treats a
+/// cast to a pointer type as transparent — a vtable stores its method entries and display-info pointer
+/// as `(cast (ptr void) proc)` / `(cast (ptr u32) Type.dy)` (#979).
+fn peel_cast(n: &Node) -> &Node {
+    let mut cur = n;
+    while cur.tag() == Some("cast") {
+        // `(cast T x)` — the value is the second arg.
+        match cur.args().get(1) {
+            Some(inner) => cur = inner,
+            None => break,
+        }
+    }
+    cur
+}
+
 fn collect_funcref_targets(node: &Node, procs: &HashSet<String>, out: &mut HashSet<String>) {
     if node.tag() == Some("call") {
         let args = node.args();
