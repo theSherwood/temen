@@ -3828,13 +3828,9 @@ impl PowerboxProgram {
                     .into(),
             );
         }
-        if module_demand_spawns(&module)
-            || (module_serves(&module)
-                && !svm_interp::bytecode::serve_qualifies(&module.funcs)
-                && !module_nests(&module))
-        {
+        if folds_to_oracle(&module) {
             return Err(
-                "PowerboxProgram: module folds to the tree-walker (serves / spawns demand \
+                "PowerboxProgram: module folds off the JIT (serves / spawns demand \
                         children); use run_powerbox"
                     .into(),
             );
@@ -4227,6 +4223,25 @@ fn module_serves(m: &Module) -> bool {
             })
         })
     })
+}
+
+/// The **one** definition of the JIT routing fold (INVARIANTS #9: a veto composition must not
+/// have per-site copies — #897 found the reactor path had silently dropped the
+/// `module_demand_spawns` clause). True when a `Backend::Jit` run must leave the Cranelift JIT:
+/// the module is pager-capable (`module_demand_spawns` — the JIT's op-17 thunk `CapFault`s any
+/// nonzero pager on the assumption this fold routed it away), or it statically serves without
+/// being serve-qualified or nesting (the oracle's serve arm has the fiber-park machinery).
+///
+/// Fold **down the ladder, not straight to the tree-walker** (owner decision 2026-08-13, #891):
+/// callers fold to [`Backend::Bytecode`], whose own compile gate decides the final landing —
+/// the bytecode engine runs what it admits (bit-exact to the oracle) and transparently falls
+/// back to the tree-walker for the rest, so a legitimate short-circuit (a shape bytecode also
+/// declines) collapses the ladder by construction rather than by caller assumption.
+fn folds_to_oracle(m: &svm_ir::Module) -> bool {
+    module_demand_spawns(m)
+        || (module_serves(m)
+            && !svm_interp::bytecode::serve_qualifies(&m.funcs)
+            && !module_nests(m))
 }
 
 /// Fold an interpreter result (`TreeWalk`/`Bytecode`) into an [`Outcome`]: a clean return, an
@@ -5406,15 +5421,11 @@ impl Instance {
         // §3.6 behavioral parity (narrowed by I36 slice 3): a **serve-qualified** module (service
         // points, no park-capable seams — `bytecode::serve_qualifies`, the same predicate the
         // bytecode engine's compile veto applies) now runs its serve loop natively on the JIT
-        // (the cap thunk's `serve_native` arm). Everything else `module_serves` catches — op-14
-        // offer mints, serving modules whose handlers could park — still folds to the oracle.
-        let backend = if matches!(backend, Backend::Jit)
-            && (module_demand_spawns(m)
-                || (module_serves(m)
-                    && !svm_interp::bytecode::serve_qualifies(&m.funcs)
-                    && !module_nests(m)))
-        {
-            Backend::TreeWalk
+        // (the cap thunk's `serve_native` arm). Everything else `folds_to_oracle` catches — op-14
+        // offer mints, park-capable servers, pager-capable spawners — leaves the JIT down the
+        // ladder: bytecode first, whose compile gate falls the rest through to the tree-walker.
+        let backend = if matches!(backend, Backend::Jit) && folds_to_oracle(m) {
+            Backend::Bytecode
         } else {
             backend
         };
@@ -5813,15 +5824,13 @@ fn run_capture_on(
     host: &mut Host,
     limits: &Limits,
 ) -> Result<(Outcome, Vec<u8>), String> {
-    // §3.6 behavioral parity (reactor path; narrowed by I36 slice 3): serve-qualified modules
-    // run natively, everything else `module_serves` catches folds — the same routing as
-    // `Instance::run_with_caps`.
-    let backend = if matches!(backend, Backend::Jit)
-        && module_serves(m)
-        && !svm_interp::bytecode::serve_qualifies(&m.funcs)
-        && !module_nests(m)
-    {
-        Backend::TreeWalk
+    // §3.6 behavioral parity (reactor path): the same routing as `Instance::run_with_caps` —
+    // now by construction (`folds_to_oracle`, one definition). This path once hand-copied the
+    // composition and silently dropped the `module_demand_spawns` clause (#897): a pager-capable
+    // module on a Jit `Session` hit the op-17 thunk's `CapFault` arm — whose soundness comment
+    // assumes this very fold routed it away — instead of the oracle's demand paging.
+    let backend = if matches!(backend, Backend::Jit) && folds_to_oracle(m) {
+        Backend::Bytecode
     } else {
         backend
     };
@@ -6277,5 +6286,73 @@ mod symtab_tests {
             }
             let _ = decode_symbol_table(&buf); // must not panic
         }
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    //! #897 — the JIT routing fold is **one definition** (`folds_to_oracle`) consumed by the
+    //! batch (`Instance::run_with_caps`), reactor (`run_capture_on`), and cache
+    //! (`PowerboxProgram::new`) paths alike. The reactor path once hand-copied the composition
+    //! minus the `module_demand_spawns` clause, so a pager-capable module on a Jit `Session` hit
+    //! the op-17 thunk's `CapFault` (`svm-jit/src/instantiator_rt.rs` documents that arm as sound
+    //! *because* this fold routes pager records off the JIT) instead of the oracle's demand paging.
+    //!
+    //! The regression is guarded here at the predicate: `folds_to_oracle` must fold a demand-spawn
+    //! module, and all three sites now call that one function, so a dropped clause fails this test.
+    //! End-to-end demand-pager execution across the three backends (the record actually serving a
+    //! fault and returning 1123) is covered separately by
+    //! `crates/svm/tests/instantiate_record.rs::record_spawn_carries_the_pager_binding`, through
+    //! the public `Instance::run_with_caps` grant path — reproducing a working pager host by hand
+    //! here would duplicate that coverage without adding routing-parity guard value.
+    use super::*;
+
+    /// A minimal module that `module_demand_spawns` classifies as pager-capable: an op-17
+    /// `Instantiator` record-spawn plus an impl export (the record's `pager` field is runtime
+    /// data, so any module that *could* name one of its exports as a pager folds off the JIT).
+    /// The body is never executed by this test — only the static routing predicate is checked.
+    fn demand_spawn_module() -> Module {
+        let src = r#"memory 17
+type 0 func (i64) -> (i64)
+type 1 interface { page: 0 }
+export 0 interface "pager" 1 { page: 1 }
+
+func 0 (i32) -> (i32) {
+block 0 (vh: i32) {
+  vrp = i64.const 1024
+  vch = cap.call 6 17 (i64) -> (i32) vh (vrp)
+  return vch
+  }
+}
+
+func 1 (i64) -> (i64) {
+block 0 (vaddr: i64) {
+  vzero = i64.const 0
+  return vzero
+  }
+}
+"#;
+        let m = svm_text::parse_module(src).expect("parse");
+        svm_verify::verify_module(&m).expect("verify");
+        assert!(
+            !m.impl_exports.is_empty(),
+            "fixture must carry an impl export"
+        );
+        m
+    }
+
+    #[test]
+    fn demand_spawn_module_folds_off_the_jit() {
+        let m = demand_spawn_module();
+        // The exact clause #897 restored: a pager-capable module is demand-spawn-classified,
+        // and the one shared routing predicate folds it off the JIT.
+        assert!(
+            module_demand_spawns(&m),
+            "op-17 + impl exports is pager-capable"
+        );
+        assert!(
+            folds_to_oracle(&m),
+            "the one routing predicate (all three call sites) folds it off the JIT"
+        );
     }
 }
