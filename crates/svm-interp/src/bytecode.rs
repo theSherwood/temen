@@ -10894,6 +10894,13 @@ impl CoopRun {
             .unwrap_or(0)
     }
 
+    /// The run's **root** powerbox — where the root task and its `thread.spawn` threads' host I/O
+    /// lands (stdout/stderr, the framebuffer). The cdylib drains it into its capture slots at the end
+    /// of a run. (§14 confined children keep their own `host` in `extra_envs`, not exposed here.)
+    pub fn host_mut(&mut self) -> &mut Host {
+        &mut self.host
+    }
+
     /// Pump the schedule to its next pause: [`CoopEvent::Done`]/[`CoopEvent::Trapped`] end the run,
     /// [`CoopEvent::TierUp`] hands an emitted region to the host (resume with `deliver_tierup*`).
     pub fn run(&mut self) -> CoopEvent {
