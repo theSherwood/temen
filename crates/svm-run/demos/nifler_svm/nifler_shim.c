@@ -93,6 +93,60 @@ int atexit(void (*fn)(void)) {
 }
 int getpid(void) { return 1; }
 
+/* `system` — nimsem shells out to `nifler` to parse stdlib modules on demand (deps.nim). Route the
+ * shell command to the `exec` capability: split it into argv, EXEC_RUN it (nifler.svmb runs as an
+ * isolated child domain sharing our memfs, writing its `.p.nif` where we can read it), then return
+ * its exit status POSIX-wait-encoded so Nim's WEXITSTATUS recovers the code. `__vm_cap_resolve` /
+ * `__vm_host_call` are the same §7 host-cap surface os_shim uses for `fs`. */
+enum { EXEC_RUN = 0, EXEC_STATUS = 3, EXEC_CLOSE = 4 };
+int system(const char *cmd) {
+  if (!cmd) return 1; /* "is a shell available?" probe → yes */
+  static int g_exec = -2;
+  if (g_exec == -2) g_exec = __vm_cap_resolve("exec", 4);
+  if (g_exec < 0) return -1;
+  /* split cmd into a NUL-separated argv buffer (simple whitespace split, strips ' and " quotes) */
+  static char av[8192];
+  size_t n = 0;
+  int in_tok = 0;
+  for (const char *p = cmd; *p && n < sizeof(av) - 1; p++) {
+    char ch = *p;
+    if (ch == ' ' || ch == '\t' || ch == '\n') {
+      if (in_tok) { av[n++] = 0; in_tok = 0; }
+    } else if (ch == '"' || ch == '\'') {
+      /* drop quote chars; a token may still be open */
+    } else {
+      av[n++] = ch;
+      in_tok = 1;
+    }
+  }
+  if (in_tok && n < sizeof(av)) av[n++] = 0;
+  long job = __vm_host_call(g_exec, EXEC_RUN, (long)av, (long)n, (long)av, 0);
+  if (job < 0) return -1;
+  long st = __vm_host_call(g_exec, EXEC_STATUS, job, 0, 0, 0);
+  __vm_host_call(g_exec, EXEC_CLOSE, job, 0, 0, 0);
+  return (int)((st & 0xff) << 8); /* WEXITSTATUS(ret) == child exit code */
+}
+
+/* `readlink` — nimsem calls getAppFilename() → readlink("/proc/self/exe") to derive its stdlib path. */
+ssize_t readlink(const char *path, char *buf, size_t bufsiz) {
+  (void)path;
+  static const char exe[] = "/bin/nimsem";
+  size_t n = sizeof(exe) - 1;
+  if (n > bufsiz) n = bufsiz;
+  memcpy(buf, exe, n);
+  return (ssize_t)n;
+}
+/* `strerror` — nimony phases format errnos with it; not an on-ramp builtin. */
+char *strerror(int e) {
+  switch (e) {
+    case 2: return (char *)"No such file or directory";
+    case 13: return (char *)"Permission denied";
+    case 21: return (char *)"Is a directory";
+    case 22: return (char *)"Invalid argument";
+    default: return (char *)"error";
+  }
+}
+
 /* `mmap`/`munmap` — hexer/nimony read NIF files through `std/memfiles` (`nifreader.nim`'s
  * `vfsOpenMmap`), i.e. `mmap(nil, size, PROT_READ, MAP_SHARED, fd, offset)`. There is no host address
  * space to map into, but a read-only file map is observationally just "the file's bytes at a stable
