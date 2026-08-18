@@ -7582,19 +7582,19 @@ impl SchedDriver {
 // whose lone shadow stack started at `SHADOW_BASE`); a `cont.new`-created fiber in registry
 // slot `s` is context `s + 1`.
 
-/// Window byte offset of the `i32` durable **state word** (`NORMAL | UNWINDING | REWINDING`).
-/// The freeze driver reads it to tell a freeze (UNWINDING) run from an ordinary one. Must equal
-/// `svm_durable::STATE_OFF`.
-pub const STATE_OFF: u64 = 0;
-/// State-word values (must equal `svm_durable::STATE_*`). Only `UNWINDING` is read by the runtime
-/// today (the freeze-driver trigger); the others are maintained entirely by the instrumented IR.
-pub const STATE_NORMAL: i32 = 0;
-pub const STATE_UNWINDING: i32 = 1;
-pub const STATE_REWINDING: i32 = 2;
 /// Freeze **armed**: the deterministic mid-run freeze trigger. The runtime counts down
 /// [`ARM_COUNTDOWN_OFF`] at each safepoint and promotes the word to `UNWINDING` at 0; transparent to
 /// the instrumented IR (which tests only `UNWINDING`/`REWINDING`). Must equal `svm_durable::STATE_ARMED`.
-pub const STATE_ARMED: i32 = 3;
+pub use svm_ir::durable_abi::STATE_ARMED;
+/// State-word values (must equal `svm_durable::STATE_*`). Only `UNWINDING` is read by the runtime
+/// today (the freeze-driver trigger); the others are maintained entirely by the instrumented IR.
+pub use svm_ir::durable_abi::STATE_NORMAL;
+/// Window byte offset of the `i32` durable **state word** (`NORMAL | UNWINDING | REWINDING`).
+/// The freeze driver reads it to tell a freeze (UNWINDING) run from an ordinary one. Must equal
+/// `svm_durable::STATE_OFF`.
+pub use svm_ir::durable_abi::STATE_OFF;
+pub use svm_ir::durable_abi::STATE_REWINDING;
+pub use svm_ir::durable_abi::STATE_UNWINDING;
 
 /// §12.8 4A.7 (parked-vCPU / `Blocking.work` latency). Reads the global durable **freeze** word at
 /// [`STATE_OFF`] from the live window image: `true` iff an async stop-the-world freeze has already
@@ -7608,27 +7608,30 @@ fn freeze_has_landed(mem: Option<&dyn GuestMem>) -> bool {
         .map(|b| i32::from_le_bytes(b) == STATE_UNWINDING)
         .unwrap_or(false)
 }
-/// Window byte offset of the `i64` **arm countdown** (safepoints left before an `ARMED` run promotes
-/// to `UNWINDING`). Decremented by the runtime at each safepoint; inert unless `ARMED`. Must equal
-/// `svm_durable::ARM_COUNTDOWN_OFF`.
-pub const ARM_COUNTDOWN_OFF: u64 = 16;
 /// Window byte offset of the `i64` **back-edge arm countdown** (loop back-edges left before an
 /// `ARMED` run promotes to `UNWINDING`, so a loop-header poll begins the freeze). Decremented at each
 /// branch terminator; inert unless `ARMED` and the slot is positive. Must equal
 /// `svm_durable::ARM_BACKEDGE_OFF`.
-pub const ARM_BACKEDGE_OFF: u64 = 24;
+pub use svm_ir::durable_abi::ARM_BACKEDGE_OFF;
+/// Window byte offset of the `i64` **arm countdown** (safepoints left before an `ARMED` run promotes
+/// to `UNWINDING`). Decremented by the runtime at each safepoint; inert unless `ARMED`. Must equal
+/// `svm_durable::ARM_COUNTDOWN_OFF`.
+pub use svm_ir::durable_abi::ARM_COUNTDOWN_OFF;
 /// Window byte offset of the `i8` **freeze-on-quiesce** flag (DURABILITY.md §13.4 slice 4c-bis):
 /// non-zero arms the runtime to freeze the instant the run would otherwise block on
 /// `svc.wait`-parked consumers only. Read once at run setup into [`Sched::freeze_on_quiesce`].
 /// Must equal `svm_durable::ARM_QUIESCE_OFF`.
-pub const ARM_QUIESCE_OFF: u64 = 32;
+pub use svm_ir::durable_abi::ARM_QUIESCE_OFF;
+/// Ceiling of the reserved durable region `[0, DURABLE_RESERVE)`. Must equal
+/// `svm_durable::DURABLE_RESERVE`.
+pub use svm_ir::durable_abi::DURABLE_RESERVE;
+/// Window byte offset where **context 0's** (the root's) shadow stack begins. Must equal
+/// `svm_durable::SHADOW_BASE`.
+pub use svm_ir::durable_abi::SHADOW_BASE;
 /// Window byte offset of the `i64` *active* shadow-stack pointer (the running context's, a
 /// window byte offset itself). The instrumented IR reads/writes this; the runtime re-points it
 /// on each fiber switch. Must equal `svm_durable::SHADOW_SP_OFF`.
-pub const SHADOW_SP_OFF: u64 = 8;
-/// Window byte offset where **context 0's** (the root's) shadow stack begins. Must equal
-/// `svm_durable::SHADOW_BASE`.
-pub const SHADOW_BASE: u64 = 64;
+pub use svm_ir::durable_abi::SHADOW_SP_OFF;
 /// Per-context shadow-stack stride: context `i` occupies `[SHADOW_BASE + i*SHADOW_STRIDE, +
 /// SHADOW_STRIDE)`. 4 KiB per context fits ~15 contexts in the 64 KiB reserve — a provisional
 /// slice-1 value; precise per-fiber sizing + quota accounting is the open §12.8 sub-question.
@@ -7638,10 +7641,7 @@ pub const SHADOW_BASE: u64 = 64;
 /// `SHADOW_STRIDE` would grow into the next context's region before tripping. Shallow fibers
 /// (every test today) stay confined; making the overflow bound per-region travels with the
 /// sizing decision.
-pub const SHADOW_STRIDE: u64 = 1 << 12;
-/// Ceiling of the reserved durable region `[0, DURABLE_RESERVE)`. Must equal
-/// `svm_durable::DURABLE_RESERVE`.
-pub const DURABLE_RESERVE: u64 = 1 << 16;
+pub use svm_ir::durable_abi::SHADOW_STRIDE;
 
 /// The shadow-region base (window offset) of context `ctx_idx` (root = 0, fiber slot `s` =
 /// `s + 1`). The per-context partition that keeps two fibers' frozen frames from colliding.
@@ -7649,19 +7649,19 @@ fn shadow_region_base(ctx_idx: usize) -> u64 {
     SHADOW_BASE + ctx_idx as u64 * SHADOW_STRIDE
 }
 
+/// §12.8 concurrent-thaw stage 1: bytes reserved at a region's base before its frames — the SP word
+/// plus the 4-byte thaw word, padded to 8 to keep frames 8-aligned. Must equal
+/// `svm_durable::REGION_HEADER_LEN`.
+pub use svm_ir::durable_abi::REGION_HEADER_LEN;
 /// Bytes reserved at each region's base for its **per-context shadow-SP word** (§12.8 4A.5): the SP
 /// word lives at `shadow_region_base(ctx)`; frames grow upward from [`shadow_frame_base`]. So a vCPU
 /// addresses *its own* SP word (via `durable.shadow_base`) with no shared location.
-const SHADOW_SP_WORD_LEN: u64 = 8;
+pub use svm_ir::durable_abi::SHADOW_SP_WORD_LEN;
 /// §12.8 concurrent-thaw stage 1: byte offset of a context's **thaw** state word (`REWINDING`/`NORMAL`)
 /// within its region — just past the [`SHADOW_SP_WORD_LEN`]-byte SP word, addressed via
 /// `durable.shadow_base` (like the SP word). The **freeze** word (`UNWINDING`) stays at the global
 /// [`STATE_OFF`]. Must equal `svm_durable::STATE_IN_REGION_OFF`.
-const STATE_IN_REGION_OFF: u64 = SHADOW_SP_WORD_LEN;
-/// §12.8 concurrent-thaw stage 1: bytes reserved at a region's base before its frames — the SP word
-/// plus the 4-byte thaw word, padded to 8 to keep frames 8-aligned. Must equal
-/// `svm_durable::REGION_HEADER_LEN`.
-const REGION_HEADER_LEN: u64 = 16;
+pub use svm_ir::durable_abi::STATE_IN_REGION_OFF;
 
 /// The empty shadow-SP / frame base of context `ctx_idx`: just past its in-region SP + thaw words. The
 /// empty (no-frames) extent of a context's shadow stack.

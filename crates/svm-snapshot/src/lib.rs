@@ -451,29 +451,8 @@ pub fn freeze_with_prots(
                         None => write_uleb(b, 0),
                         Some(c) => {
                             write_uleb(b, 1);
-                            write_uleb(b, c.svc_queue.len() as u64);
-                            for d in &c.svc_queue {
-                                write_uleb(b, d.export as u64);
-                                write_uleb(b, d.op as u64);
-                                write_uleb(b, d.args.len() as u64);
-                                for &a in &d.args {
-                                    write_uleb(b, a as u64);
-                                }
-                                write_uleb(b, d.ticket);
-                            }
-                            write_uleb(b, c.svc_results.len() as u64);
-                            for &(t, v_) in &c.svc_results {
-                                write_uleb(b, t);
-                                write_uleb(b, v_ as u64);
-                            }
-                            write_uleb(b, c.svc_next_ticket);
-                            write_uleb(b, c.handles.len() as u64);
-                            for h in &c.handles {
-                                write_uleb(b, h.slot as u64);
-                                write_uleb(b, h.generation as u64);
-                                write_uleb(b, h.type_id as u64);
-                                write_binding(b, &h.binding);
-                            }
+                            write_serve_trio(b, &c.svc_queue, &c.svc_results, c.svc_next_ticket);
+                            write_handle_recs(b, &c.handles);
                         }
                     }
                 }
@@ -482,15 +461,7 @@ pub fn freeze_with_prots(
     }
 
     // Section 3 — Handle table (§12.5): ascending slot (capture already orders it).
-    section(&mut out, TAG_HANDLES, |b| {
-        write_uleb(b, handles.len() as u64);
-        for h in &handles {
-            write_uleb(b, h.slot as u64);
-            write_uleb(b, h.generation as u64);
-            write_uleb(b, h.type_id as u64);
-            write_binding(b, &h.binding);
-        }
-    });
+    section(&mut out, TAG_HANDLES, |b| write_handle_recs(b, &handles));
 
     // Section 4 — Serve state (DURABILITY.md §13.4 step 3, v13): the domain's inbound queue
     // (FIFO order), completion cells (ascending ticket — `svc_state` yields the `BTreeMap`
@@ -500,22 +471,7 @@ pub fn freeze_with_prots(
     let (svc_queue, svc_results, svc_next_ticket) = host.svc_state();
     if !svc_queue.is_empty() || !svc_results.is_empty() || svc_next_ticket != 0 {
         section(&mut out, TAG_SERVE, |b| {
-            write_uleb(b, svc_queue.len() as u64);
-            for d in &svc_queue {
-                write_uleb(b, d.export as u64);
-                write_uleb(b, d.op as u64);
-                write_uleb(b, d.args.len() as u64);
-                for &a in &d.args {
-                    write_uleb(b, a as u64);
-                }
-                write_uleb(b, d.ticket);
-            }
-            write_uleb(b, svc_results.len() as u64);
-            for &(t, v) in &svc_results {
-                write_uleb(b, t);
-                write_uleb(b, v as u64);
-            }
-            write_uleb(b, svc_next_ticket);
+            write_serve_trio(b, &svc_queue, &svc_results, svc_next_ticket)
         });
     }
 
@@ -604,7 +560,11 @@ pub fn restore_with_prots(
             TAG_HANDLES => handles_body = Some(body),
             TAG_SERVE => serve_body = Some(body),
             TAG_JIT => jit_body = Some(body),
-            _ => {} // forward-compatible: skip unknown sections
+            // Fail closed on an unknown tag (#915/§8). The version gate above already pins
+            // `version == FORMAT_VERSION`, so no artifact this build emits can carry one — silently
+            // skipping it was dead "forward-compat" that only opened a canonicality hole (a
+            // junk-section artifact restoring identically to a clean one). Reject it.
+            _ => return Err(RestoreError::Malformed),
         }
     }
     let header = header.ok_or(RestoreError::MissingSection(TAG_HEADER))?;
@@ -1049,6 +1009,51 @@ fn decode_jit(body: Option<&[u8]>) -> Result<(u8, Vec<DurableJitDomain>), Restor
         return Err(RestoreError::Malformed);
     }
     Ok((table_log2, domains))
+}
+
+// ---- Shared section encoders (#915): the serve-trio and handle-record wire shapes are written
+// byte-for-byte the same for the domain-level sections and each frozen child's inline state, so they
+// have one encoder each here rather than a hand-copied pair. (The *decoders* legitimately diverge —
+// the root handle table also bounds-checks the slot against `Host::handle_capacity()` — so they stay
+// inline.) ----
+
+/// Encode a serve trio (§13.4): the dispatch `queue` (FIFO), completion `results` (ascending ticket),
+/// and the `next_ticket` counter. Length-prefixed ULEB throughout; the exact bytes both serve sites
+/// emit, pinned by the §12.6 byte-identity tests.
+fn write_serve_trio(
+    b: &mut Vec<u8>,
+    queue: &[SvcDispatch],
+    results: &[(u64, i64)],
+    next_ticket: u64,
+) {
+    write_uleb(b, queue.len() as u64);
+    for d in queue {
+        write_uleb(b, d.export as u64);
+        write_uleb(b, d.op as u64);
+        write_uleb(b, d.args.len() as u64);
+        for &a in &d.args {
+            write_uleb(b, a as u64);
+        }
+        write_uleb(b, d.ticket);
+    }
+    write_uleb(b, results.len() as u64);
+    for &(t, v) in results {
+        write_uleb(b, t);
+        write_uleb(b, v as u64);
+    }
+    write_uleb(b, next_ticket);
+}
+
+/// Encode a handle table (§12.5): a length prefix then each record's `slot`/`generation`/`type_id`
+/// and its binding. The exact bytes both handle-table sites emit.
+fn write_handle_recs(b: &mut Vec<u8>, handles: &[DurableHandle]) {
+    write_uleb(b, handles.len() as u64);
+    for h in handles {
+        write_uleb(b, h.slot as u64);
+        write_uleb(b, h.generation as u64);
+        write_uleb(b, h.type_id as u64);
+        write_binding(b, &h.binding);
+    }
 }
 
 // ---- Binding (de)serialization (§12.5) ----
