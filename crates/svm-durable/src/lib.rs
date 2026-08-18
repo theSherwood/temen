@@ -64,18 +64,12 @@ use svm_ir::{
 /// The reserved self-namespace op for `svc.poll` (IMPORTS.md §3.6). A local copy — this crate
 /// depends only on `svm-ir` — pinned equal to `svm_interp::CAP_SELF_SVC_POLL` by a dev-test
 /// (`tests/serve.rs`).
-pub const SVC_POLL_OP: u32 = 9;
+pub use svm_ir::durable_abi::SVC_POLL_OP;
 /// The reserved self-namespace op for `svc.wait`; pinned equal to `svm_interp::CAP_SELF_SVC_WAIT`.
-pub const SVC_WAIT_OP: u32 = 10;
+pub use svm_ir::durable_abi::SVC_WAIT_OP;
 
 // ---- State word values (the §2 state machine) ----
 
-/// Normal forward execution; polls and prologues fall straight through.
-pub const STATE_NORMAL: i32 = 0;
-/// Freeze in progress: every poll after a may-suspend call unwinds out to the host.
-pub const STATE_UNWINDING: i32 = 1;
-/// Thaw in progress: every prologue rebuilds its frame from the shadow stack.
-pub const STATE_REWINDING: i32 = 2;
 /// Freeze **armed** (the deterministic mid-run trigger): the run executes normally, but the runtime
 /// counts down [`ARM_COUNTDOWN_OFF`] at each **fiber safepoint** (`cont.resume`/`suspend`) and, on
 /// reaching 0, promotes the word to [`STATE_UNWINDING`] so that op's trailing poll begins the freeze.
@@ -87,7 +81,13 @@ pub const STATE_REWINDING: i32 = 2;
 /// the same set (the fiber ops, routed through runtime thunks), so an armed freeze lands at the same
 /// safepoint on each — `cap.call` is not counted (no cross-backend choke; its freeze is already
 /// reachable at the first safepoint).
-pub const STATE_ARMED: i32 = 3;
+pub use svm_ir::durable_abi::STATE_ARMED;
+/// Normal forward execution; polls and prologues fall straight through.
+pub use svm_ir::durable_abi::STATE_NORMAL;
+/// Thaw in progress: every prologue rebuilds its frame from the shadow stack.
+pub use svm_ir::durable_abi::STATE_REWINDING;
+/// Freeze in progress: every poll after a may-suspend call unwinds out to the host.
+pub use svm_ir::durable_abi::STATE_UNWINDING;
 
 // ---- Durable runtime region layout ----
 //
@@ -106,30 +106,33 @@ pub const STATE_ARMED: i32 = 3;
 // guest (a guard-paged, per-fiber placement, DURABILITY.md §12.7) is optional
 // defense-in-depth, not required for a cooperating toolchain.
 
-/// Window byte offset of the `i32` state word.
-pub const STATE_OFF: u64 = 0;
-/// Window byte offset of the `i64` shadow-stack pointer (a window byte offset itself).
-pub const SHADOW_SP_OFF: u64 = 8;
-/// Window byte offset of the `i64` **arm countdown** — the number of fiber safepoints still to pass
-/// before an [`STATE_ARMED`] run promotes itself to [`STATE_UNWINDING`]. Decremented by the runtime at
-/// each fiber safepoint (`cont.resume`/`suspend`); inert unless the state word is `ARMED`. Lives in the
-/// reserve's previously-unused `[16, 64)` gap, so it is byte-identical to before for any run that never
-/// arms (countdown stays 0).
-pub const ARM_COUNTDOWN_OFF: u64 = 16;
 /// Window byte offset of the `i64` **back-edge arm countdown** — the number of loop back-edges
 /// (branch terminators) still to pass before an [`STATE_ARMED`] run promotes itself to
 /// [`STATE_UNWINDING`], so a loop-header poll begins the freeze. The deterministic trigger for the
 /// Phase-4 Slice A back-edge polls, separate from [`ARM_COUNTDOWN_OFF`] (which counts only fiber
 /// safepoints) so an ordinary or fiber-armed run is byte-identical (this slot stays 0). Lives in the
 /// reserve's `[24, 64)` gap.
-pub const ARM_BACKEDGE_OFF: u64 = 24;
+pub use svm_ir::durable_abi::ARM_BACKEDGE_OFF;
+/// Window byte offset of the `i64` **arm countdown** — the number of fiber safepoints still to pass
+/// before an [`STATE_ARMED`] run promotes itself to [`STATE_UNWINDING`]. Decremented by the runtime at
+/// each fiber safepoint (`cont.resume`/`suspend`); inert unless the state word is `ARMED`. Lives in the
+/// reserve's previously-unused `[16, 64)` gap, so it is byte-identical to before for any run that never
+/// arms (countdown stays 0).
+pub use svm_ir::durable_abi::ARM_COUNTDOWN_OFF;
 /// Window byte offset of the `i8` **freeze-on-quiesce** flag (DURABILITY.md §13.4 slice 4c-bis):
 /// non-zero arms the runtime to freeze the instant the run would otherwise block on
 /// `svc.wait`-parked consumers only — a server idle in its accept loop, which no safepoint or
 /// back-edge countdown can reach (a parked vCPU runs no ops). Distinct from the two countdown
 /// slots (which trigger mid-execution); this triggers at quiescence. Lives in the reserve's
 /// `[32, 64)` gap, so an unarmed run stays byte-identical. Must equal `svm-interp`'s copy.
-pub const ARM_QUIESCE_OFF: u64 = 32;
+pub use svm_ir::durable_abi::ARM_QUIESCE_OFF;
+/// §12.8 concurrent-thaw stage 1: bytes reserved at a context region's base before its shadow frames —
+/// the 8-byte shadow-SP word plus the 4-byte thaw state word at [`STATE_IN_REGION_OFF`], padded to 8 to
+/// keep frames 8-aligned. [`shadow_frame_base`]-equivalents in every backend start here. Must equal
+/// `svm-interp`/`svm-jit`'s copy.
+pub use svm_ir::durable_abi::REGION_HEADER_LEN;
+/// Window byte offset of the `i64` shadow-stack pointer (a window byte offset itself).
+pub use svm_ir::durable_abi::SHADOW_SP_OFF;
 /// §12.8 concurrent-thaw stage 1: byte offset of the per-context **thaw** state word
 /// (`REWINDING`/`NORMAL`) **within a context's region** — just past the 8-byte in-region shadow-SP word
 /// at the region base, addressed via the `durable.shadow_base` register (like the SP word). Each frozen
@@ -138,25 +141,22 @@ pub const ARM_QUIESCE_OFF: u64 = 32;
 /// still `REWINDING`, and a forward vCPU's callee prologue can't read another's `REWINDING`. The
 /// **freeze** state (`UNWINDING`) stays at the global [`STATE_OFF`] — a freeze is stop-the-world, so the
 /// single word is the natural broadcast every poll reads. Must equal `svm-interp`/`svm-jit`'s copy.
-pub const STATE_IN_REGION_OFF: u64 = 8;
-/// §12.8 concurrent-thaw stage 1: bytes reserved at a context region's base before its shadow frames —
-/// the 8-byte shadow-SP word plus the 4-byte thaw state word at [`STATE_IN_REGION_OFF`], padded to 8 to
-/// keep frames 8-aligned. [`shadow_frame_base`]-equivalents in every backend start here. Must equal
-/// `svm-interp`/`svm-jit`'s copy.
-pub const REGION_HEADER_LEN: u64 = 16;
+pub use svm_ir::durable_abi::STATE_IN_REGION_OFF;
+/// Window byte offset of the `i32` state word.
+pub use svm_ir::durable_abi::STATE_OFF;
 
-/// Window byte offset where the shadow stack begins (grows upward, bounded by `DURABLE_RESERVE`).
-pub const SHADOW_BASE: u64 = 64;
-/// Per-context shadow-region stride: context `i` owns `[SHADOW_BASE + i*SHADOW_STRIDE, +SHADOW_STRIDE)`
-/// (§12.8 4A.5). The transform itself never addresses a region (it emits `durable.shadow_base`-relative
-/// loads the runtime resolves), but the [`write_thaw_state`] host helper indexes a context's region.
-/// Must equal `svm-interp`/`svm-jit`'s `SHADOW_STRIDE`.
-pub const SHADOW_STRIDE: u64 = 1 << 12;
 /// Size of the reserved low region (one 64 KiB wasm page): `[0, DURABLE_RESERVE)` holds the
 /// state word, shadow-SP, and shadow stack; the guest's memory is `[DURABLE_RESERVE, window)`.
 /// A durable module's declared window must be at least this large (it is counted against the
 /// guest's memory budget). A policy default — embedders may standardize a different value.
-pub const DURABLE_RESERVE: u64 = 1 << 16;
+pub use svm_ir::durable_abi::DURABLE_RESERVE;
+/// Window byte offset where the shadow stack begins (grows upward, bounded by `DURABLE_RESERVE`).
+pub use svm_ir::durable_abi::SHADOW_BASE;
+/// Per-context shadow-region stride: context `i` owns `[SHADOW_BASE + i*SHADOW_STRIDE, +SHADOW_STRIDE)`
+/// (§12.8 4A.5). The transform itself never addresses a region (it emits `durable.shadow_base`-relative
+/// loads the runtime resolves), but the [`write_thaw_state`] host helper indexes a context's region.
+/// Must equal `svm-interp`/`svm-jit`'s `SHADOW_STRIDE`.
+pub use svm_ir::durable_abi::SHADOW_STRIDE;
 
 // Block layout of an instrumented function with `S` forward segments (each original
 // block is split at its suspend ops into `points+1` segments; non-suspend blocks are one

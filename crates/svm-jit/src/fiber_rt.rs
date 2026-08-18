@@ -100,38 +100,38 @@ const FIBER_STACK: usize = 1 << 18;
 // a fiber in registry slot `s` is context `s+1`. §12.8 4A.5: each context's shadow-SP word is the
 // **first 8 bytes of its own region**, with frames following, so `durable.shadow_base` (the per-OS-thread
 // register the instrumented IR reads) points at the running context's region — no shared SP word.
-const SHADOW_BASE: u64 = 64;
-const SHADOW_STRIDE: u64 = 1 << 12;
 /// Size of the reserved durable low slice (one 64 KiB wasm page); must match `svm-interp`'s
 /// `DURABLE_RESERVE`. The per-context shadow regions live within `[0, DURABLE_RESERVE)`.
-const DURABLE_RESERVE: u64 = 1 << 16;
+pub use svm_ir::durable_abi::DURABLE_RESERVE;
+pub use svm_ir::durable_abi::SHADOW_BASE;
+pub use svm_ir::durable_abi::SHADOW_STRIDE;
 /// Highest shadow-context index (must match `svm-interp`'s `MAX_SHADOW_CTX`): `DURABLE_RESERVE /
 /// SHADOW_STRIDE - 1` = 15. Fibers grow **up** from context 1 (`slot+1`); spawned vCPUs grow **down**
 /// from here (slice 3.3, mirroring the interp), so a `u16` mask holds every vCPU-context bit.
 const MAX_SHADOW_CTX: usize = (DURABLE_RESERVE / SHADOW_STRIDE) as usize - 1;
-/// Window byte offset of the durable state word (`NORMAL | UNWINDING | REWINDING`); the freeze
-/// driver reads it to confirm a freeze is in progress. Must match `svm-interp`'s `STATE_OFF`.
-const STATE_OFF: u64 = 0;
-/// State-word value meaning "freeze in progress" (must match `svm-interp`'s `STATE_UNWINDING`).
-const STATE_UNWINDING: i32 = 1;
-/// State-word value meaning "thaw in progress" — a restored vCPU rewinds from its shadow extent
-/// then flips to `NORMAL` and runs forward (must match `svm-interp`'s `STATE_REWINDING`).
-const STATE_REWINDING: i32 = 2;
+/// Window byte offset of the `i64` arm countdown (must match `svm-interp`'s `ARM_COUNTDOWN_OFF`).
+pub use svm_ir::durable_abi::ARM_COUNTDOWN_OFF;
+/// §12.8 concurrent-thaw stage 1: bytes reserved at a region's base before its frames — the 8-byte
+/// shadow-SP word plus the thaw state word at [`STATE_IN_REGION_OFF`] (padded to 8 for frame alignment).
+/// Frames grow up from here. Must match `svm-interp`/`svm_durable::REGION_HEADER_LEN`.
+pub use svm_ir::durable_abi::REGION_HEADER_LEN;
 /// State-word value meaning "freeze armed" — the mid-run freeze trigger (must match
 /// `svm-interp`'s `STATE_ARMED`). On an armed durable run the runtime counts down
 /// [`ARM_COUNTDOWN_OFF`] at each fiber safepoint and promotes the word to `UNWINDING` at 0.
-const STATE_ARMED: i32 = 3;
-/// Window byte offset of the `i64` arm countdown (must match `svm-interp`'s `ARM_COUNTDOWN_OFF`).
-const ARM_COUNTDOWN_OFF: u64 = 16;
+pub use svm_ir::durable_abi::STATE_ARMED;
 /// §12.8 concurrent-thaw stage 1: byte offset of a context's **thaw** state word (`REWINDING`/`NORMAL`)
 /// within its region — just past the 8-byte in-region shadow-SP word. The **freeze** word (`UNWINDING`)
 /// stays at the global [`STATE_OFF`] (stop-the-world); only the thaw word is per-context, so concurrent
 /// rewinds don't race. Must match `svm-interp`/`svm_durable::STATE_IN_REGION_OFF`.
-const STATE_IN_REGION_OFF: u64 = 8;
-/// §12.8 concurrent-thaw stage 1: bytes reserved at a region's base before its frames — the 8-byte
-/// shadow-SP word plus the thaw state word at [`STATE_IN_REGION_OFF`] (padded to 8 for frame alignment).
-/// Frames grow up from here. Must match `svm-interp`/`svm_durable::REGION_HEADER_LEN`.
-const REGION_HEADER_LEN: u64 = 16;
+pub use svm_ir::durable_abi::STATE_IN_REGION_OFF;
+/// Window byte offset of the durable state word (`NORMAL | UNWINDING | REWINDING`); the freeze
+/// driver reads it to confirm a freeze is in progress. Must match `svm-interp`'s `STATE_OFF`.
+pub use svm_ir::durable_abi::STATE_OFF;
+/// State-word value meaning "thaw in progress" — a restored vCPU rewinds from its shadow extent
+/// then flips to `NORMAL` and runs forward (must match `svm-interp`'s `STATE_REWINDING`).
+pub use svm_ir::durable_abi::STATE_REWINDING;
+/// State-word value meaning "freeze in progress" (must match `svm-interp`'s `STATE_UNWINDING`).
+pub use svm_ir::durable_abi::STATE_UNWINDING;
 
 /// Tick the **mid-run freeze trigger** at a fiber safepoint (`cont.resume`/`suspend`), the JIT mirror
 /// of `svm_interp::Mem::durable_tick_arm`: if the run is `STATE_ARMED`, decrement the arm countdown
