@@ -3508,8 +3508,10 @@ fn a_terminal_ctrl_c_interrupts_a_forked_parent_blocked_in_wait() {
 /// simultaneously when the terminal `^C` hits the PARENT. Only the parent's wait may return
 /// `-EINTR`: the child's park must survive untouched (`gst != 5 → 1` would surface a stray EINTR —
 /// exactly what the pre-slice-3 run-global `interrupt_interruptible_parks` sweep did). The parent
-/// then releases the leaf **across two generations** — `kill(4, 12)` straight to the grandchild's
-/// own async handler — and the exits cascade back: grandchild 5 → child 6 → parent. Also
+/// then releases the leaf **across two generations** — `kill(gpid, 12)` straight to the grandchild's
+/// own async handler — and the exits cascade back: grandchild 5 → child 6 → parent. The parent
+/// learns the grandchild's *real* pid over a `pipe` the child writes it to (task ids are not
+/// deterministic under load — #929 — so hard-coding it raced the kill onto the wrong task). Also
 /// exercises fork-of-fork (the twin's replacement factory) and the grandchild's wake install at
 /// its own mint.
 const WAIT_SCOPED_SRC: &str = r#"
@@ -3521,24 +3523,30 @@ static volatile long usr;
 static void on_usr(int sig) { usr = sig; }
 static long pid;
 static long st;
+static int gp_fds[2];                        /* pipe: the child hands the parent the grandchild's real pid */
 int main(int argc, char **argv) {
   __vm_fs(30, 2, (long)on_int, 0, 0);      /* signal(SIGINT, handler): catch */
   __vm_fs(30, 12, (long)on_usr, 0, 0);     /* pre-install 12 — inherited down BOTH generations, so
-                                              the cross-generation kill(4, 12) can never land on
+                                              the cross-generation kill(gpid, 12) can never land on
                                               SIG_DFL in a grandchild that has not re-installed */
   __vm_fs(42, (long)sigstk, 4096, 0, 0);   /* sigaltstack: async delivery on (inherited by all) */
+  __vm_fs(23, (long)gp_fds, 0, 0, 0);      /* pipe(): shared across fork (the fd table is dup'd), so the
+                                              child can publish the grandchild's REAL pid up — task ids
+                                              are not deterministic under load (#929), so the parent must
+                                              not hard-code it */
   __vm_fs(0, 1, (long)&st, 1, 0);          /* readiness byte: the terminal may open fire (#796 —
                                               a pre-handler ^C is now FATAL, the default action) */
-  while ((pid = fork()) < 0);              /* child: pid 3 (task ids are deterministic here) */
+  while ((pid = fork()) < 0);              /* child */
   if (pid == 0) {
     long gpid;
     long gst;
-    while ((gpid = fork()) < 0);           /* fork-of-fork: grandchild, pid 4 */
+    while ((gpid = fork()) < 0);           /* fork-of-fork: the grandchild */
     if (gpid == 0) {
       __vm_fs(30, 12, (long)on_usr, 0, 0); /* grandchild: catch signal 12 */
       while (!usr);                        /* spin until the PARENT's cross-generation kill */
       return 5;
     }
+    __vm_fs(0, gp_fds[1], (long)&gpid, 8, 0); /* publish the grandchild's real pid to the parent */
     gst = wait_pid(gpid);                  /* PARKS — the parent's ^C must NOT touch this */
     if (gst != 5) return 1;                /* a stray -EINTR here = the unscoped-sweep bug */
     return 6;
@@ -3547,7 +3555,14 @@ int main(int argc, char **argv) {
   if (st != -4) return 2;
   if (got != 2) return 3;                  /* the SIGINT handler ran on the parent */
   __vm_fs(30, 2, 1, 0, 0);                 /* SIG_IGN: the terminal keeps firing harmlessly */
-  __vm_fs(31, 4, 12, 0, 0);                /* kill(grandchild, 12): two generations down */
+  long gpid = 0;
+  long gn = 0;
+  long gr;
+  while (gn < 8) {                         /* read the grandchild's real pid the child published */
+    gr = __vm_fs(1, gp_fds[0], (long)&gpid + gn, 8 - gn, 0);
+    if (gr > 0) gn = gn + gr;
+  }
+  __vm_fs(31, gpid, 12, 0, 0);             /* kill(grandchild, 12): two generations down, real pid */
   while ((st = wait_pid(pid)) < 0);        /* reap the CHILD (retries a raced EINTR) */
   return st;                               /* 6: the child reaped 5 cleanly, unswept */
 }
