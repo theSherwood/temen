@@ -8783,6 +8783,11 @@ fn probe_span(b: &mut FunctionBuilder, phys: Value, len: Value) {
 /// the `reserved − len` subtraction can wrap. `len == 0` is a no-op span that never faults (matching
 /// the interpreter and C `memcpy(_,_,0)`), so a 0-length op on a wild pointer is inert.
 ///
+/// This predicate is the overflow-avoiding lowering of the **one span-OOB reference**,
+/// `svm_mask::Window::span_checked` (the arithmetic the interpreter calls and the `mask` fuzz target
+/// asserts against a `u128` oracle). Any change to that reference must be mirrored in the CLIF here —
+/// the fuzz oracle pins the reference, and the `diff.rs` escape oracle pins this emission to it.
+///
 /// The returned base is then Spectre-clamped (`& mask`) exactly as in [`mask_addr`]: architecturally a
 /// no-op (the check proved `ptr < reserved`), but on a *mispredicted* path it pins the copy's base
 /// inside `[0, reserved)`. As with `mask_addr`, this matches Wasmtime's bounds-checked `memory.copy`

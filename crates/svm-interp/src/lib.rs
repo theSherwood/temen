@@ -22414,15 +22414,12 @@ impl Mem {
         // window-relative, so the bound is on `addr+offset` directly. The returned absolute address
         // indexes the (possibly parent-sized) backing.
         self.last_fault.store(NO_FAULT, Ordering::Relaxed); // fresh: clear any prior page fault
-        match addr
-            .checked_add(offset)
-            .and_then(|e| e.checked_add(width as u64))
-        {
-            // An out-of-window fault is a real trap (not a recoverable page fault) — leave `last_fault`
-            // cleared so `take_fault` returns `None` and the coroutine path propagates the trap.
-            Some(end) if end <= self.window.reserved() => Ok(self.window.confine(addr, offset)),
-            _ => Err(Trap::MemoryFault),
-        }
+                                                            // The reserved-bound overflow-free arithmetic is svm-mask's (the one fuzzed reference). An
+                                                            // out-of-window fault is a real trap (not a recoverable page fault), so `last_fault` stays
+                                                            // cleared and `take_fault` returns `None` for the coroutine path to propagate the trap.
+        self.window
+            .checked_reserved(addr, offset, width)
+            .ok_or(Trap::MemoryFault)
     }
 
     /// Read `len` raw bytes from confined window address `addr` (DEBUGGING.md W2 inspection). Bounds
@@ -22462,10 +22459,9 @@ impl Mem {
     /// calling, so this always sees `len >= 1` (matching the JIT's `len != 0`-guarded check).
     fn confine_span(&self, addr: u64, len: u64) -> Result<u64, Trap> {
         self.last_fault.store(NO_FAULT, Ordering::Relaxed);
-        match addr.checked_add(len) {
-            Some(end) if end <= self.window.reserved() => Ok(self.window.confine(addr, 0)),
-            _ => Err(Trap::MemoryFault),
-        }
+        // The span-OOB arithmetic is svm-mask's `span_checked` — the one fuzzed reference the JIT's
+        // `confine_span` must emit (INVARIANTS #2's "one masking regime").
+        self.window.span_checked(addr, len).ok_or(Trap::MemoryFault)
     }
 
     /// Per-page committed-ness / RO enforcement over a whole span — the `len: u64` analogue of

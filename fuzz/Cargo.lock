@@ -632,6 +632,7 @@ name = "svm-exec"
 version = "0.0.0"
 dependencies = [
  "svm-interp",
+ "svm-ir",
 ]
 
 [[package]]
@@ -647,6 +648,7 @@ name = "svm-fs"
 version = "0.0.0"
 dependencies = [
  "svm-interp",
+ "svm-ir",
 ]
 
 [[package]]
