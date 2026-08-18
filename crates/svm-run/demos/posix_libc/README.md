@@ -15,7 +15,7 @@ they need themselves (identical duplicate declarations are legal C).
 | `fnmatch.c` | `fnmatch(3)` — `*` `?` brackets/ranges/negation/`[[:class:]]`, `FNM_PATHNAME`/`FNM_PERIOD`/`FNM_NOESCAPE`/`FNM_CASEFOLD` | pure compute; differential-tested against the host's `fnmatch(3)` |
 | `posix_misc.c` | `putenv`, `wait3`, `wait4` | setenv/unsetenv/waitpid ops (12/35/28) |
 | `regex.c` | `regcomp`/`regexec`/`regfree` — POSIX **ERE** with captures (`BASH_REMATCH`): `.` `^` `$`, brackets + `[[:class:]]`, groups, `\|`, `*` `+` `?` `{n,m}`; `REG_ICASE`/`REG_NOSUB`/`REG_NOTBOL`/`REG_NOTEOL`. Leftmost-**longest** (POSIX), via exhaustive exploration with a step budget — bash-sized patterns never hit it; `REG_NEWLINE` and BRE unimplemented | malloc/free ops (2/3); differential-tested — spans **and** captures — against the host's `regexec(3)` |
+| `glob.c` | `glob`/`globfree` — segment walk with `fnmatch` filtering (`FNM_PERIOD`: `*` skips dotfiles), magic middle segments fan out, sorted results; `GLOB_MARK`/`NOSORT`/`NOCHECK`/`DOOFFS`/`APPEND`/`NOESCAPE`/`ERR`; relative patterns walk under getcwd, returned pattern-form. `errfunc` accepted, ignored | opendir/readdir/closedir/stat/getcwd ops (14–16/13/9) + this `fnmatch`; needs `fnmatch.c` earlier in the TU |
 
-Still to come under #800: `glob`/`globfree` (over opendir/readdir ops 14–16
-plus this `fnmatch`), and `getline`/`getdelim` (blocked on a minimal `FILE` layer
+Still to come under #800: `getline`/`getdelim` (blocked on a minimal `FILE` layer
 decision — see the issue).

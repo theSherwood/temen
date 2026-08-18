@@ -1712,3 +1712,78 @@ int main(void) {{\n\
     );
     assert_eq!(jit.result, vec![Value::I64(42)], "jit parity");
 }
+
+const GLOB_C: &str = include_str!("../../svm-run/demos/posix_libc/glob.c");
+
+/// #800 — `glob(3)` over the memfs: absolute patterns walk segments via opendir/readdir with
+/// slice 1's `fnmatch` (`FNM_PERIOD` — `*` skips dotfiles, the shell rule), results sorted; a magic
+/// middle segment (`/*/x.c`) fans out across directories; `GLOB_MARK` marks directories with `/`;
+/// no match is `GLOB_NOMATCH` unless `GLOB_NOCHECK` returns the pattern itself; `globfree` releases.
+/// Each sub-check writes its joined `gl_pathv` to stdout, and the whole battery must agree across
+/// backends. Hand-asserted (the host's glob walks a real fs, not this memfs — no oracle to share).
+#[test]
+fn c_glob_expands_over_the_memfs() {
+    let src = format!(
+        "{SHIM}\n{FNMATCH_C}\n{GLOB_C}\n\
+static glob_t g;\n\
+static void dump(void) {{\n\
+  long i;\n\
+  for (i = 0; i < g.gl_pathc; i = i + 1) {{\n\
+    char *s = g.gl_pathv[g.gl_offs + i];\n\
+    write(1, s, slen(s));\n\
+    write(1, \" \", 1);\n\
+  }}\n\
+  write(1, \";\", 1);\n\
+}}\n\
+int main(void) {{\n\
+  if (glob(\"/*.c\", 0, 0, &g) != 0) return 1;      /* sorted, dotfiles skipped */\n\
+  dump();\n\
+  globfree(&g);\n\
+  if (glob(\"/dir/*.c\", 0, 0, &g) != 0) return 2;  /* .hidden.c excluded */\n\
+  dump();\n\
+  globfree(&g);\n\
+  if (glob(\"/dir/.*.c\", 0, 0, &g) != 0) return 3; /* explicit dot matches it */\n\
+  dump();\n\
+  globfree(&g);\n\
+  if (glob(\"/*/x.c\", 0, 0, &g) != 0) return 4;    /* magic middle segment */\n\
+  dump();\n\
+  globfree(&g);\n\
+  if (glob(\"/d*\", 2, 0, &g) != 0) return 5;       /* GLOB_MARK: trailing / on dirs */\n\
+  dump();\n\
+  globfree(&g);\n\
+  if (glob(\"/nope*\", 0, 0, &g) != 3) return 6;    /* GLOB_NOMATCH */\n\
+  if (glob(\"/nope*\", 16, 0, &g) != 0) return 7;   /* GLOB_NOCHECK: the pattern back */\n\
+  dump();\n\
+  globfree(&g);\n\
+  return 42;\n\
+}}\n"
+    );
+    let (interp, jit) = run_both(&src, |px| {
+        px.write_file("/b.c", b"b");
+        px.write_file("/a.c", b"a");
+        px.write_file("/ab.txt", b"t");
+        px.write_file("/.dot.c", b"d");
+        px.write_file("/dir/x.c", b"x");
+        px.write_file("/dir/y.h", b"y");
+        px.write_file("/dir/.hidden.c", b"h");
+        px.write_file("/dpl/x.c", b"x2");
+    });
+    assert_eq!(
+        interp.result,
+        vec![Value::I32(42)],
+        "every glob sub-check passed"
+    );
+    let want: &[u8] = b"/a.c /b.c ;\
+/dir/x.c ;\
+/dir/.hidden.c ;\
+/dir/x.c /dpl/x.c ;\
+/dir/ /dpl/ ;\
+/nope* ;";
+    assert_eq!(
+        String::from_utf8_lossy(&interp.stdout),
+        String::from_utf8_lossy(want),
+        "the expansions, sorted, dot-rules and MARK applied"
+    );
+    assert_eq!(jit.result, vec![Value::I64(42)], "jit parity");
+    assert_eq!(jit.stdout, interp.stdout, "jit stdout parity");
+}
