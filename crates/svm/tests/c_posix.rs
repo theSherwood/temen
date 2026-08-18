@@ -921,6 +921,89 @@ int main(void) {{
     }
 }
 
+/// #799 — **the two-world merge, witnessed in one program**: a PERSONALITY-ONLY guest (no
+/// manager, no offers, no powerbox topology — the exact link shape bash gets) runs return-twice
+/// `fork()` and a blocking `waitpid()` through nothing but named personality imports. The fork
+/// rides the caller-request door (`ParkEvent::ForkSelf` → the core's fork engine); the twin is
+/// table-registered by the fork factory at mint (so `getppid` and `waitpid` know it instantly);
+/// the parent's single un-looped `waitpid` blocks through the twin's slow spin. Interp-only (the
+/// fork/park doors are interp-tier; on other tiers the op answers `-ENOSYS`, "fork unavailable").
+#[test]
+fn c_a_personality_only_guest_forks_and_blocks_in_waitpid() {
+    let src = r#"
+long __px_fork(int cap, long a);
+long __px_waitpid(int cap, long pid, long status, long opts);
+long __px_getpid(int cap, long a);
+long __px_getppid(int cap, long a);
+static int status;
+static volatile long acc;
+static long me;
+static long pid;
+static long h;
+int main(void) {
+  me = __px_getpid(0, 0);
+  pid = __px_fork(0, 0);                       /* return-twice, no offer anywhere in sight */
+  if (pid < 0) return 1;                       /* -ENOSYS/-EAGAIN: the door failed */
+  if (pid == 0) {
+    if (__px_getppid(0, 0) != me) return 9;    /* the twin knows its forking parent */
+    for (long i = 0; i < 30000; i = i + 1) acc = acc + 1;  /* slow: the parent must BLOCK */
+    return 7;
+  }
+  if (pid == me) return 2;                     /* the twin got a fresh pid */
+  h = __px_waitpid(0, pid, (long)&status, 0);  /* ONE call — blocks until the twin exits */
+  if (h != pid) return 3;
+  if ((status & 0x7f) != 0) return 4;          /* clean exit, not a signal death */
+  if (((status >> 8) & 0xff) != 7) return 5;   /* WEXITSTATUS = the twin's 7 */
+  return 42;
+}
+"#;
+    let e = run_interp_only(src, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "a personality-only guest forked (return-twice) and blocked in waitpid until the twin's \
+         real exit — the capability fork engine reached through named imports alone"
+    );
+}
+
+/// #799 — **fork × default-actions × blocking-waitpid, personality-only**: the parent forks a
+/// runaway twin (spins forever, no handlers), kills it with an unhandled `SIGTERM` (#796's
+/// default-terminate through the kill door — the twin's doors minted at fork), and the blocking
+/// `waitpid` wakes at the death reporting `WIFSIGNALED(15)`. Three subsystems from three
+/// different slices composing in one guest with no test-specific wiring.
+#[test]
+fn c_a_forked_twin_dies_by_unhandled_sigterm_and_the_blocked_wait_reports_it() {
+    let src = r#"
+long __px_fork(int cap, long a);
+long __px_waitpid(int cap, long pid, long status, long opts);
+long __px_kill(int cap, long pid, long sig);
+static int status;
+static volatile long acc;
+static long pid;
+static long h;
+int main(void) {
+  pid = __px_fork(0, 0);
+  if (pid < 0) return 1;
+  if (pid == 0) {
+    while (1) acc = acc + 1;                   /* runaway: no handler, no exit */
+  }
+  if (__px_kill(0, pid, 15) != 0) return 2;    /* SIGTERM: SIG_DFL = terminate the twin */
+  h = __px_waitpid(0, pid, (long)&status, 0);  /* blocks until the kill lands */
+  if (h != pid) return 3;
+  if ((status & 0x7f) != 15) return 4;         /* WIFSIGNALED: the terminating signal */
+  if (((status >> 8) & 0xff) != 0) return 5;   /* not an exit-code encode */
+  return 42;
+}
+"#;
+    let e = run_interp_only(src, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "kill(twin, SIGTERM) terminated the runaway fork twin and the blocked personality \
+         waitpid reported WIFSIGNALED(15)"
+    );
+}
+
 /// #796 — guest wrappers for the signal ops, matching the `__px_` (dummy-handle-first) shim convention.
 /// `sigprocmask`/`sigaction` take pointers to this personality's simple ABI: a `sigset_t` is a `u64`
 /// bitset; a `struct sigaction` is `{ long sa_handler; unsigned long sa_mask; long sa_flags; }` (24 bytes).

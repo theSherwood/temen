@@ -165,6 +165,15 @@ pub const OP_ISATTY: u32 = 49;
 /// re-grant, for a spawned clone) minted this one; `0` only for the root (init-like, no parent).
 /// Bash exports it as `$PPID`.
 pub const OP_GETPPID: u32 = 50;
+/// `fork() -> pid | 0 | -errno` (#799): **return-twice fork through the personality** — no offer
+/// topology, no manager. The op fires the core's caller-request door ([`ParkEvent::ForkSelf`])
+/// and returns a `-ENOSYS` placeholder: a parkable route discards it, runs the core's fork engine
+/// (private window copy, duplicated powerbox — which runs this personality's own fork factory, so
+/// the twin is table-registered with its pid and full doors at birth), and re-admits the parent
+/// with the twin's pid and the twin with `0`. A refused fork re-admits `-EAGAIN` (retryable — the
+/// `while ((pid = fork()) < 0)` idiom); a route or tier without the door keeps `-ENOSYS` (fork
+/// unavailable — an error a shell surfaces, never an infinite retry).
+pub const OP_FORK: u32 = 51;
 
 /// **POSIX signal surface — L0 doorbell** (STAGE1.md slice 3 / PROCESS.md §9). A signal a shell traps
 /// (SIGINT/SIGTERM/…) becomes a **pending bit** the guest polls at a safe point (a command boundary) and
@@ -1085,6 +1094,7 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "tcsetpgrp" => OP_TCSETPGRP,
         "isatty" => OP_ISATTY,
         "getppid" => OP_GETPPID,
+        "fork" => OP_FORK,
         "waitpid" => OP_WAITPID,
         "wait" => OP_WAIT,
         "signal" => OP_SIGNAL,
@@ -1574,6 +1584,7 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
                 OP_TCSETPGRP => Ok(vec![st.tcsetpgrp(args)]),
                 OP_ISATTY => Ok(vec![st.isatty(args)]),
                 OP_GETPPID => Ok(vec![st.p.ppid as i64]),
+                OP_FORK => Ok(vec![st.fork_request()]),
                 _ => Err(Trap::CapFault),
             };
             // Fire a deferred cross-process wake (see [`Ctx::wake_after`]) only after both guards
@@ -2597,6 +2608,16 @@ impl Ctx<'_> {
     fn isatty(&mut self, args: &[i64]) -> i64 {
         let fd = *args.first().unwrap_or(&0);
         i64::from(self.fd_is_terminal(fd))
+    }
+
+    /// [`OP_FORK`] (#799) — request the return-twice clone through the caller-request door and
+    /// return the no-door placeholder; see [`OP_FORK`] for the full contract. Policy lives in the
+    /// fork factory (table registration, inherited signal state/pgid/`ppid`) — this op only asks.
+    fn fork_request(&mut self) -> i64 {
+        if let Some(req) = self.p.park_req.clone() {
+            req(svm_interp::ParkEvent::ForkSelf);
+        }
+        ENOSYS
     }
 
     /// [`OP_TCSETPGRP`] — `tcsetpgrp(fd, pgid)`: make `pgid` the foreground group. `-ENOTTY` off
