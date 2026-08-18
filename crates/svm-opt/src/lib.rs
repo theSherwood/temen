@@ -2210,60 +2210,12 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
     inst.for_each_operand_mut(&mut |v| *v = f(*v));
 }
 
-/// Apply `f` to every **value** operand of a terminator (the branch condition / table index,
-/// all edge arguments, return / tail-call arguments). Block-index *targets* are untouched —
-/// those are remapped separately by [`remap_targets`].
+/// Remap every **value** operand of a terminator through `f` (the branch condition / table index,
+/// all edge arguments, return / tail-call arguments). Block-index *targets* are untouched — those
+/// are remapped separately by [`remap_targets`]. Thin adapter over
+/// [`svm_ir::Terminator::for_each_operand_mut`], the sibling of `map_operands` (#913).
 pub fn map_term_operands(t: &mut Terminator, f: &mut impl FnMut(ValIdx) -> ValIdx) {
-    match t {
-        Terminator::Br { args, .. } => {
-            for v in args.iter_mut() {
-                *v = f(*v);
-            }
-        }
-        Terminator::BrIf {
-            cond,
-            then_args,
-            else_args,
-            ..
-        } => {
-            *cond = f(*cond);
-            for v in then_args.iter_mut().chain(else_args.iter_mut()) {
-                *v = f(*v);
-            }
-        }
-        Terminator::BrTable {
-            idx,
-            targets,
-            default,
-        } => {
-            *idx = f(*idx);
-            for (_, args) in targets.iter_mut() {
-                for v in args.iter_mut() {
-                    *v = f(*v);
-                }
-            }
-            for v in default.1.iter_mut() {
-                *v = f(*v);
-            }
-        }
-        Terminator::Return(vals) => {
-            for v in vals.iter_mut() {
-                *v = f(*v);
-            }
-        }
-        Terminator::ReturnCall { args, .. } => {
-            for v in args.iter_mut() {
-                *v = f(*v);
-            }
-        }
-        Terminator::ReturnCallIndirect { idx, args, .. } => {
-            *idx = f(*idx);
-            for v in args.iter_mut() {
-                *v = f(*v);
-            }
-        }
-        Terminator::Unreachable => {}
-    }
+    t.for_each_operand_mut(&mut |v| *v = f(*v));
 }
 
 /// Visit (read-only) every value operand of an instruction. Implemented on a throwaway clone

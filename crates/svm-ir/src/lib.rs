@@ -3150,6 +3150,66 @@ pub enum Terminator {
     Unreachable,
 }
 
+impl Terminator {
+    /// Apply `f` to every **value operand** of this terminator, in place — the branch condition /
+    /// table index, all edge block-arguments, and return / tail-call arguments. Block-index
+    /// *targets* are **not** value operands and are left untouched (the optimizer remaps those
+    /// separately). Exhaustive on purpose (no wildcard arm), the sibling of
+    /// [`Inst::for_each_operand_mut`], so svm-ir owns terminator operand traversal too (#913).
+    pub fn for_each_operand_mut(&mut self, f: &mut impl FnMut(&mut ValIdx)) {
+        match self {
+            Terminator::Br { args, .. } => {
+                for v in args.iter_mut() {
+                    f(v);
+                }
+            }
+            Terminator::BrIf {
+                cond,
+                then_args,
+                else_args,
+                ..
+            } => {
+                f(cond);
+                for v in then_args.iter_mut().chain(else_args.iter_mut()) {
+                    f(v);
+                }
+            }
+            Terminator::BrTable {
+                idx,
+                targets,
+                default,
+            } => {
+                f(idx);
+                for (_, args) in targets.iter_mut() {
+                    for v in args.iter_mut() {
+                        f(v);
+                    }
+                }
+                for v in default.1.iter_mut() {
+                    f(v);
+                }
+            }
+            Terminator::Return(vals) => {
+                for v in vals.iter_mut() {
+                    f(v);
+                }
+            }
+            Terminator::ReturnCall { args, .. } => {
+                for v in args.iter_mut() {
+                    f(v);
+                }
+            }
+            Terminator::ReturnCallIndirect { idx, args, .. } => {
+                f(idx);
+                for v in args.iter_mut() {
+                    f(v);
+                }
+            }
+            Terminator::Unreachable => {}
+        }
+    }
+}
+
 /// A basic block: a typed parameter list, a straight-line body, one terminator.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Block {
