@@ -6095,6 +6095,138 @@ fn dbg_advance_task(
     }
 }
 
+/// Outcome of [`service_advance`]: `Ran` = a step this engine services (op / thread spawn·join /
+/// futex wait·notify / §14 instantiate) was dispatched and `turn` ticked; `Declined` = a coroutine
+/// or tier-up op this scheduled engine does not drive (`turn` left untouched, caller bails its own
+/// way).
+enum Serviced {
+    Ran,
+    Declined,
+}
+
+/// Advance task `ti` one step and service the scheduler seam it produced. This is the shared core of
+/// [`ScheduledDebugRun::drive`] and [`ScheduledDebugRun::tick`]: both dispatch the *same* set of
+/// [`Outcome`]s with the *same* rejections, so a new seam is added here **once** rather than in two
+/// places — a `tick` (the reverse-`seek` replay path) that silently declined what `drive` services
+/// would desync replay from live runs (DEBUGGING.md; INVARIANTS #9 observability corollary). `turn`
+/// is ticked for every serviced step, matching each engine's per-op clock; on `Declined` it is left
+/// untouched so each caller keeps its own bail (`drive` → `SchedStop::Declined` with no tick; `tick`
+/// → tick its clock and stop the replay).
+#[allow(clippy::too_many_arguments)]
+fn service_advance(
+    tasks: &mut Vec<DbgTask>,
+    ti: usize,
+    extra_envs: &mut Vec<DbgEnv>,
+    fibers: &mut Vec<FiberState>,
+    source: &ModuleSource,
+    table: &SharedSlots,
+    fuel: &mut u64,
+    mem: &mut Option<Mem>,
+    host: &mut Host,
+    clock: u64,
+    turn: &mut u64,
+) -> Serviced {
+    let step_res = dbg_advance_task(
+        tasks, ti, extra_envs, fibers, source, table, fuel, mem, host,
+    );
+    tasks[ti].at_bp = false;
+    match step_res {
+        // A fiber switch (or a plain op) — the vCPU advanced one op, stays runnable.
+        FiberStep::Stepped => *turn += 1,
+        FiberStep::Finished(vals) => {
+            *turn += 1;
+            dbg_complete(tasks, ti, Ok(vals));
+        }
+        FiberStep::Trapped(t) => {
+            *turn += 1;
+            dbg_complete(tasks, ti, Err(t));
+        }
+        // A scheduler seam: the ones this engine dispatches, else `Declined`.
+        FiberStep::Other(outcome) => match outcome {
+            Outcome::ThreadSpawn {
+                func,
+                sp,
+                arg,
+                dst,
+                module,
+            } => {
+                *turn += 1;
+                if let Err(t) = dbg_spawn(tasks, ti, func, sp, arg, dst, module, source) {
+                    dbg_complete(tasks, ti, Err(t));
+                }
+            }
+            Outcome::ThreadJoin { handle, dst } => {
+                *turn += 1;
+                dbg_join(tasks, ti, handle, dst);
+            }
+            Outcome::MemoryWait {
+                base,
+                expected,
+                width,
+                timeout,
+                dst,
+            } => {
+                *turn += 1;
+                dbg_wait(tasks, ti, mem, clock, base, expected, width, timeout, dst);
+            }
+            Outcome::MemoryNotify { base, count, dst } => {
+                *turn += 1;
+                dbg_notify(tasks, ti, base, count, dst);
+            }
+            // §14 `instantiate` (op 0): spawn a confined executor child as its own scheduled vCPU.
+            Outcome::Instantiate {
+                ibase,
+                isize: isz,
+                entry,
+                off,
+                size_log2,
+                quota,
+                dst,
+                grants,
+                budget,
+            } => {
+                *turn += 1;
+                // op 11 (named-grant spawn) / a §3d budget record is not driven by the debugger path.
+                if grants.is_some() || budget != 0 {
+                    dbg_complete(tasks, ti, Err(Trap::Malformed));
+                } else if let Err(t) = dbg_instantiate(
+                    tasks, ti, extra_envs, source, mem, *fuel, ibase, isz, entry, off, size_log2,
+                    quota, dst,
+                ) {
+                    dbg_complete(tasks, ti, Err(t));
+                }
+            }
+            // §14 `instantiate_module` (op 5): a confined child running a granted separate module.
+            Outcome::InstantiateModule {
+                ibase,
+                isize: isz,
+                mh,
+                entry,
+                off,
+                size_log2,
+                quota,
+                dst,
+                grants,
+                budget,
+            } => {
+                *turn += 1;
+                // op 13 (named-grant spawn) / a §3d budget record is not driven by the debugger path.
+                if grants.is_some() || budget != 0 {
+                    dbg_complete(tasks, ti, Err(Trap::Malformed));
+                } else if let Err(t) = dbg_instantiate_module(
+                    tasks, ti, extra_envs, source, mem, *fuel, host, mh, ibase, isz, entry, off,
+                    size_log2, quota, dst,
+                ) {
+                    dbg_complete(tasks, ti, Err(t));
+                }
+            }
+            // coroutine / tier-up — outside this engine's slice.
+            _ => return Serviced::Declined,
+        },
+    }
+    Serviced::Ran
+}
+
 /// §14 `instantiate` (op 0) under the debug scheduler: build a **confined executor child** as a new
 /// scheduled vCPU with its own [`DbgEnv`] (window / attenuated powerbox / quota), registered as a
 /// child handle of `ti` (so `Instantiator.join` → `ThreadJoin` joins it). The debug-engine counterpart
@@ -7007,105 +7139,11 @@ impl ScheduledDebugRun {
                     task: ti,
                 });
             }
-            let step_res = dbg_advance_task(
-                tasks, ti, extra_envs, fibers, source, table, fuel, mem, host,
-            );
-            tasks[ti].at_bp = false;
-            match step_res {
-                // A fiber switch (or a plain op) — the vCPU advanced one op, stays runnable.
-                FiberStep::Stepped => *turn += 1,
-                FiberStep::Finished(vals) => {
-                    *turn += 1;
-                    dbg_complete(tasks, ti, Ok(vals));
-                }
-                FiberStep::Trapped(t) => {
-                    *turn += 1;
-                    dbg_complete(tasks, ti, Err(t));
-                }
-                // A scheduler seam: the ones this engine dispatches, else `Declined`.
-                FiberStep::Other(outcome) => match outcome {
-                    Outcome::ThreadSpawn {
-                        func,
-                        sp,
-                        arg,
-                        dst,
-                        module,
-                    } => {
-                        *turn += 1;
-                        if let Err(t) = dbg_spawn(tasks, ti, func, sp, arg, dst, module, source) {
-                            dbg_complete(tasks, ti, Err(t));
-                        }
-                    }
-                    Outcome::ThreadJoin { handle, dst } => {
-                        *turn += 1;
-                        dbg_join(tasks, ti, handle, dst);
-                    }
-                    Outcome::MemoryWait {
-                        base,
-                        expected,
-                        width,
-                        timeout,
-                        dst,
-                    } => {
-                        *turn += 1;
-                        dbg_wait(tasks, ti, mem, *clock, base, expected, width, timeout, dst);
-                    }
-                    Outcome::MemoryNotify { base, count, dst } => {
-                        *turn += 1;
-                        dbg_notify(tasks, ti, base, count, dst);
-                    }
-                    // §14 `instantiate` (op 0): spawn a confined executor child as its own scheduled vCPU.
-                    Outcome::Instantiate {
-                        ibase,
-                        isize: isz,
-                        entry,
-                        off,
-                        size_log2,
-                        quota,
-                        dst,
-                        grants,
-                        budget,
-                    } => {
-                        *turn += 1;
-                        // op 11 (named-grant spawn) / a §3d budget record is not driven by the
-                        // debugger path.
-                        if grants.is_some() || budget != 0 {
-                            dbg_complete(tasks, ti, Err(Trap::Malformed));
-                        } else if let Err(t) = dbg_instantiate(
-                            tasks, ti, extra_envs, source, mem, *fuel, ibase, isz, entry, off,
-                            size_log2, quota, dst,
-                        ) {
-                            dbg_complete(tasks, ti, Err(t));
-                        }
-                    }
-                    // §14 `instantiate_module` (op 5): a confined child running a granted separate module.
-                    Outcome::InstantiateModule {
-                        ibase,
-                        isize: isz,
-                        mh,
-                        entry,
-                        off,
-                        size_log2,
-                        quota,
-                        dst,
-                        grants,
-                        budget,
-                    } => {
-                        *turn += 1;
-                        // op 13 (named-grant spawn) / a §3d budget record is not driven by the
-                        // debugger path.
-                        if grants.is_some() || budget != 0 {
-                            dbg_complete(tasks, ti, Err(Trap::Malformed));
-                        } else if let Err(t) = dbg_instantiate_module(
-                            tasks, ti, extra_envs, source, mem, *fuel, host, mh, ibase, isz, entry,
-                            off, size_log2, quota, dst,
-                        ) {
-                            dbg_complete(tasks, ti, Err(t));
-                        }
-                    }
-                    // coroutine / tier-up — outside this slice.
-                    _ => return SchedStop::Declined,
-                },
+            if let Serviced::Declined = service_advance(
+                tasks, ti, extra_envs, fibers, source, table, fuel, mem, host, *clock, turn,
+            ) {
+                // A coroutine / tier-up op this engine does not drive — bail, `turn` untouched.
+                return SchedStop::Declined;
             }
             // Slice 6: derive the park/wake/spawn edges this advance caused (see `trace_diff`).
             if let (Some(trace), Some(before)) = (sched_trace.as_mut(), pre_adv.as_ref()) {
@@ -7239,89 +7277,13 @@ impl ScheduledDebugRun {
                 task: ti,
             });
         }
-        let step_res = dbg_advance_task(
-            tasks, ti, extra_envs, fibers, source, table, fuel, mem, host,
-        );
-        tasks[ti].at_bp = false;
-        *turn += 1;
-        match step_res {
-            FiberStep::Stepped => {}
-            FiberStep::Finished(vals) => dbg_complete(tasks, ti, Ok(vals)),
-            FiberStep::Trapped(t) => dbg_complete(tasks, ti, Err(t)),
-            FiberStep::Other(outcome) => match outcome {
-                Outcome::ThreadSpawn {
-                    func,
-                    sp,
-                    arg,
-                    dst,
-                    module,
-                } => {
-                    if let Err(t) = dbg_spawn(tasks, ti, func, sp, arg, dst, module, source) {
-                        dbg_complete(tasks, ti, Err(t));
-                    }
-                }
-                Outcome::ThreadJoin { handle, dst } => dbg_join(tasks, ti, handle, dst),
-                Outcome::MemoryWait {
-                    base,
-                    expected,
-                    width,
-                    timeout,
-                    dst,
-                } => dbg_wait(tasks, ti, mem, *clock, base, expected, width, timeout, dst),
-                Outcome::MemoryNotify { base, count, dst } => {
-                    dbg_notify(tasks, ti, base, count, dst)
-                }
-                // §14 `instantiate` (op 0): build the confined child — mirrors the `drive` arm so a
-                // reverse-`seek` replay reconstructs the env/task set identically.
-                Outcome::Instantiate {
-                    ibase,
-                    isize: isz,
-                    entry,
-                    off,
-                    size_log2,
-                    quota,
-                    dst,
-                    grants,
-                    budget,
-                } => {
-                    // op 11 (named-grant spawn) / a §3d budget record is not driven by the debugger
-                    // replay path.
-                    if grants.is_some() || budget != 0 {
-                        dbg_complete(tasks, ti, Err(Trap::Malformed));
-                    } else if let Err(t) = dbg_instantiate(
-                        tasks, ti, extra_envs, source, mem, *fuel, ibase, isz, entry, off,
-                        size_log2, quota, dst,
-                    ) {
-                        dbg_complete(tasks, ti, Err(t));
-                    }
-                }
-                // §14 `instantiate_module` (op 5): mirrors the `drive` arm so replay rebuilds the pushed
-                // module + env/task set identically.
-                Outcome::InstantiateModule {
-                    ibase,
-                    isize: isz,
-                    mh,
-                    entry,
-                    off,
-                    size_log2,
-                    quota,
-                    dst,
-                    grants,
-                    budget,
-                } => {
-                    // op 13 (named-grant spawn) / a §3d budget record is not driven by the debugger
-                    // replay path.
-                    if grants.is_some() || budget != 0 {
-                        dbg_complete(tasks, ti, Err(Trap::Malformed));
-                    } else if let Err(t) = dbg_instantiate_module(
-                        tasks, ti, extra_envs, source, mem, *fuel, host, mh, ibase, isz, entry,
-                        off, size_log2, quota, dst,
-                    ) {
-                        dbg_complete(tasks, ti, Err(t));
-                    }
-                }
-                _ => return false, // an unsupported op — stop the replay here
-            },
+        if let Serviced::Declined = service_advance(
+            tasks, ti, extra_envs, fibers, source, table, fuel, mem, host, *clock, turn,
+        ) {
+            // An unsupported op — tick this engine's clock (as it did unconditionally before) and
+            // stop the replay here.
+            *turn += 1;
+            return false;
         }
         // Slice 6: the park/wake/spawn edges this replayed op caused (identical to `drive`'s,
         // so a `tick`-replay refills the tape deterministically).
