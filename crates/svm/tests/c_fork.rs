@@ -3023,6 +3023,193 @@ fn an_unhandled_sigterm_kills_a_runaway_forked_child_for_real() {
     );
 }
 
+/// #799 — **blocking `waitpid`, the API-level witness**: ONE un-looped personality `waitpid`
+/// call returns the child's real status. Impossible before this slice — the op was a poll, and a
+/// parent reaching it while the child still ran got `-ECHILD` (every guest carried a retry loop).
+/// Now the op requests a bench on the child's exit (`ParkEvent::TaskExit` through the park door),
+/// the core rewinds+parks this vCPU, the twin-completion wake re-runs the op against the retired
+/// table entry, and the single call answers. The child's long spin makes the parent reach the
+/// wait first with certainty in practice — on the old semantics this guest returns 1.
+const BLOCKING_WAITPID_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static long pid;
+static long h;
+static int status;
+static volatile long acc;
+int main(int argc, char **argv) {
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    for (long i = 0; i < 50000; i = i + 1) acc = acc + i;  /* be slow: the parent must WAIT */
+    return 7;
+  }
+  h = __vm_fs(28, pid, (long)&status, 0, 0);   /* ONE call — no retry loop anywhere */
+  if (h != pid) return 1;                      /* -10 here = the op is still a poll */
+  if ((status & 0x7f) != 0) return 2;          /* a clean exit, not a signal death */
+  if (((status >> 8) & 0xff) != 7) return 3;   /* WEXITSTATUS = the child's 7 */
+  return 42;
+}
+"#;
+
+#[test]
+fn a_single_waitpid_call_blocks_until_the_child_exits() {
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let guest_src = format!("{FORK_SHIM}\n{BLOCKING_WAITPID_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse blocking-waitpid guest");
+    verify_module(&guest).expect("verify blocking-waitpid guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let (posix, make) = svm_posix::cap(4096, 1 << 16, Vec::new());
+    let make = Arc::new(make);
+    let px_handler: svm_interp::HostProc = {
+        let mut inner = make();
+        Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter))
+    };
+    let px_cap = host.grant_host_proc_forkable(
+        px_handler,
+        opshift_fork(svm_posix::cap_fork_factory(&posix)),
+    );
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(gmod as i64), // the cmd-module slot — unused by this guest
+            Value::I32(px_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "one un-looped personality waitpid blocked through the child's slow spin and returned \
+         its real WEXITSTATUS — the park door end to end"
+    );
+}
+
+/// #799 — **a `^C` interrupts a BLOCKED personality `waitpid` with `-EINTR`**: the parent parks
+/// in the op-28 bench (not the core wait offer — the other channel the #863 capstone covers);
+/// the terminal's SIGINT EINTRs it through the reap-bench sweep arm; after `SIG_IGN` the retried
+/// wait blocks cleanly again, the released child exits, and the reap collects it. The signals ×
+/// blocking-waitpid composition, on the personality channel.
+const BLOCKING_WAITPID_EINTR_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static char sigstk[4096];
+static volatile long got;
+static void on_int(int sig) { got = sig; }
+static volatile long usr;
+static void on_usr(int sig) { usr = sig; }
+static long pid;
+static long h;
+static int status;
+int main(int argc, char **argv) {
+  __vm_fs(30, 2, (long)on_int, 0, 0);      /* catch SIGINT */
+  __vm_fs(30, 10, (long)on_usr, 0, 0);     /* pre-install a REAL handler for 10 (inherited): the
+                                              twin runs with async delivery ON (inherited stack),
+                                              so an L0 token would be table-masked and dropped at
+                                              a safepoint — the #798-capstone hazard */
+  __vm_fs(42, (long)sigstk, 4096, 0, 0);   /* sigaltstack: async delivery on */
+  __vm_fs(0, 1, (long)&h, 1, 0);           /* readiness byte: the terminal may open fire */
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    while (!usr);                          /* spin until the parent's kill delivers async */
+    return 5;
+  }
+  h = __vm_fs(28, pid, (long)&status, 0, 0);   /* BLOCKS in the op-28 bench; ^C -> -EINTR */
+  if (h != -4) return 1;                       /* the interrupted wait returned EINTR */
+  if (got != 2) return 2;                      /* the SIGINT handler ran */
+  __vm_fs(30, 2, 1, 0, 0);                     /* SIG_IGN: the terminal keeps firing harmlessly */
+  __vm_fs(31, pid, 10, 0, 0);                  /* release the child */
+  while ((h = __vm_fs(28, pid, (long)&status, 0, 0)) == -10);  /* blocks again; reaps for real */
+  if (h != pid) return 3;
+  if (((status >> 8) & 0xff) != 5) return 4;
+  return 42;
+}
+"#;
+
+#[test]
+fn a_ctrl_c_interrupts_a_blocked_personality_waitpid() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let guest_src = format!("{FORK_SHIM}\n{BLOCKING_WAITPID_EINTR_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse waitpid-eintr guest");
+    verify_module(&guest).expect("verify waitpid-eintr guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let (posix, make) = svm_posix::cap(4096, 1 << 16, Vec::new());
+    let make = Arc::new(make);
+    let px_handler: svm_interp::HostProc = {
+        let mut inner = make();
+        Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter))
+    };
+    let px_cap = host.grant_host_proc_forkable(
+        px_handler,
+        opshift_fork(svm_posix::cap_fork_factory(&posix)),
+    );
+
+    let done = Arc::new(AtomicBool::new(false));
+    let done2 = Arc::clone(&done);
+    let posix2 = posix.clone();
+    let terminal = std::thread::spawn(move || {
+        // Hold fire until the parent's readiness byte (#796 — a pre-handler ^C is fatal).
+        while !done2.load(Ordering::Relaxed) && posix2.stdout().is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        while !done2.load(Ordering::Relaxed) {
+            posix2.kill_pid(1000, 2);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    });
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(gmod as i64), // the cmd-module slot — unused by this guest
+            Value::I32(px_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    );
+    done.store(true, Ordering::Relaxed);
+    terminal.join().unwrap();
+    let r = r.expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "the ^C EINTR'd the op-28 bench (handler ran), and after SIG_IGN the retried blocking \
+         wait reaped the released child's real 5"
+    );
+}
+
 /// #800 — **`isatty` + `getppid`, the shell's interactive-mode and `$PPID` probes**: `isatty`
 /// answers the same proto-terminal test the `tc*` ops gate on (stdio fds 1, a pipe fd 0 — the
 /// discrimination bash's "am I interactive?" check needs), and a fork twin's `getppid()` is the
@@ -3663,7 +3850,10 @@ int main(int argc, char **argv) {
   if (__vm_fs(28, -1, (long)&status, 2, 0) != -10) return 6;  /* report-once */
   if (__vm_fs(31, pid, 10, 0, 0) != 0) return 7;        /* the 10 lands while stopped: HELD */
   for (i = 0; i < 200000; i = i + 1) sink = i;          /* every chance to run, were it runnable */
-  if (__vm_fs(28, pid, (long)&status, 0, 0) != -10) return 8;  /* still alive: truly stopped */
+  if (__vm_fs(28, pid, (long)&status, 1, 0) != -10) return 8;  /* WNOHANG probe (#799 — a plain
+                                              waitpid now BLOCKS, and a stopped child without
+                                              WUNTRACED would park this probe forever): still
+                                              alive, truly stopped */
   if (__vm_fs(31, pid, 18, 0, 0) != 0) return 9;        /* kill(child, SIGCONT): resume */
   while ((r = __vm_fs(28, pid, (long)&status, 8, 0)) == -10);  /* waitpid(pid, WCONTINUED) */
   if (r == pid && status == 0xffff) {

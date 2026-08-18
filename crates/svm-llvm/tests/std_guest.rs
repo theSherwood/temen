@@ -21,16 +21,30 @@ fn lane_dir() -> PathBuf {
 
 /// The nightly sysroot's `rust-src` std tree, or `None` if nightly/rust-src is absent.
 fn nightly_std_src() -> Option<PathBuf> {
-    let out = Command::new("rustc")
-        .args(["+nightly", "--print", "sysroot"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+    // #906 (second occurrence) — this probe runs through the rustup shim (`rustc +nightly`),
+    // which can wedge on a toolchain lock/auto-install stall on a shared runner: CI caught it
+    // hanging 29+ min with a live orphan `rustc` while every *compile* was already bounded.
+    // So the probe gets the same #788 bounded-wait as the compiles — and is memoized, because
+    // `lane_ready()` runs per test and the toolchain cannot change mid-binary (one bounded probe,
+    // not 22).
+    static PROBE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    fn probe() -> Option<PathBuf> {
+        let mut cmd = Command::new("rustc");
+        cmd.args(["+nightly", "--print", "sysroot"])
+            .stdout(std::process::Stdio::piped());
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        let mut child = cmd.spawn().ok()?;
+        // The tiny `--print` output cannot fill the pipe, so bounded-wait-then-collect is safe.
+        if !wait_bounded(&mut child, "rustc +nightly --print sysroot")?.success() {
+            return None;
+        }
+        let out = child.wait_with_output().ok()?;
+        let sysroot = String::from_utf8(out.stdout).ok()?;
+        let std_src = Path::new(sysroot.trim()).join("lib/rustlib/src/rust/library/std/src");
+        std_src.is_dir().then_some(std_src)
     }
-    let sysroot = String::from_utf8(out.stdout).ok()?;
-    let std_src = Path::new(sysroot.trim()).join("lib/rustlib/src/rust/library/std/src");
-    std_src.is_dir().then_some(std_src)
+    PROBE.get_or_init(probe).clone()
 }
 
 /// The lane is ready iff nightly + rust-src exist **and** the svm overlay is applied (the allocator
