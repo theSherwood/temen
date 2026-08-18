@@ -367,12 +367,11 @@ async function driveTierupRun(ex, memory, cacheKey) {
 // genuinely threaded guest (`thread.spawn`) that `driveTierupRun` above declines (its single-vCPU
 // pump traps at the spawn event). It wraps the `svm_coop_*` cdylib (`CoopRun`), which multiplexes
 // every vCPU of the run — the root and its `thread.spawn` descendants — on this one wasm thread and
-// services concurrency, fibers, and §22 install/invoke **internally**, so only tier-up (and the run's
-// end) reach here. Mirrors `driveTierupRun`'s TIERUP + `env.call_interp` mechanics, minus the B2
-// driver table and the JIT_INVOKE arm — the cooperative driver's simple (non-B2) emission has no
-// `call_indirect` tier-up, and runtime §22 units run interpreted for now (surfacing them is a
-// follow-up). Proven observably identical to `onramp_exec` by tests/coop_tierup_driver.rs (wasmi
-// playing this file's role over a threaded guest).
+// services concurrency, fibers, and §22 install/invoke **internally**, so only tier-up, a §22
+// `Jit.invoke` of an emitted unit, and the run's end reach here. Mirrors `driveTierupRun` in full —
+// the B2 shared driver table (`call_indirect` tiers up, #880), the `env.call_interp` live-state bounce,
+// and the JIT_INVOKE arm — for a genuinely threaded guest. Proven observably identical to `onramp_exec`
+// by tests/coop_tierup_driver.rs (wasmi playing this file's role over a threaded guest).
 async function driveCoopTierupRun(ex, memory, cacheKey) {
   const u8 = () => new Uint8Array(memory.buffer);
   const i64 = () => new BigInt64Array(memory.buffer);
@@ -384,11 +383,15 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
     if (exports.mapped) mappedGlobals.push(exports.mapped);
     if (exports.fuel) fuelGlobals.push(exports.fuel);
   };
-  // A leaf never dispatches through a shared table in this (non-B2) emission; an all-null table
-  // satisfies the emitted module's `__indirect_function_table` import. `env.call_interp` bounces a
-  // cross-tier helper back through the cooperative live-state bounce (routed to the tiering-up task's
-  // env), then fans the fresh "mapped" extent out to every live instance.
-  const table = new WebAssembly.Table({ initial: 1 << 10, maximum: 1 << 10, element: 'anyfunc' });
+  // #846/#880 on the cooperative path — the shared driver table (Model B2): the main module and every
+  // §22 unit `call_indirect` through it, and the driver populates its slots from the engine's mirror at
+  // each event boundary (an installed unit's emitted `f0`, an emitted program function's `f{i}`, or a
+  // bounce shim for an interpreter-resident target). `env.call_interp` bounces a cross-tier helper back
+  // through the cooperative live-state bounce (routed to the tiering-up task's env), then fans the fresh
+  // "mapped" extent out to every live instance. A non-shimmable guest reports `table_log2 == 0` (a
+  // 1-slot table) and emits in local-table mode, so the shared table is inert for it.
+  const tsize = 1 << ex.svm_coop_table_log2();
+  const table = new WebAssembly.Table({ initial: tsize, maximum: tsize, element: 'anyfunc' });
   const unitImports = () => ({ env: {
     memory,
     __indirect_function_table: table,
@@ -419,10 +422,23 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
   // Per-code-handle unit instances (a runtime-compiled §22 unit runs emitted on JIT_INVOKE — the
   // JACL macro-staging shape). Async instantiation: a macro unit can exceed the sync compile budget.
   const jitUnits = new Map();
+  const shims = new Map();
   const instantiateUnit = async (bytes) => {
     const inst = await WebAssembly.instantiate(await WebAssembly.compile(bytes), unitImports());
     registerGlobals(inst.exports);
     return inst.exports;
+  };
+  const shimFor = async (slot, code) => {
+    const key = `${slot}#${code}`;
+    let f = shims.get(key);
+    if (f === undefined) {
+      const len = ex.svm_coop_shim_wasm(slot);
+      if (len === 0) return null;
+      const bytes = u8().slice(Number(ex.svm_coop_shim_ptr()), Number(ex.svm_coop_shim_ptr()) + len);
+      f = (await instantiateUnit(bytes))['t'];
+      shims.set(key, f);
+    }
+    return f;
   };
   const unitFor = async (code, bytes) => {
     let unit = jitUnits.get(code);
@@ -432,15 +448,39 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
     }
     return unit;
   };
+  // Rebuild the shared table from the engine's slot mirror at each event boundary (installs only
+  // happen between events — a unit with a `cap.call` never emits). A slot in the natural prefix holds
+  // the emitted program `f{slot}` (or a bounce shim if that function stayed interpreted); a slot past
+  // it holds an installed unit's `f0` (via its by-handle wasm) or a shim for an interpreter-resident
+  // target. Exactly `driveTierupRun`'s `syncTable`, over the `svm_coop_*` accessors.
+  const nfuncs = ex.svm_coop_nfuncs();
+  const syncTable = async () => {
+    for (let slot = 0; slot < tsize; slot++) {
+      let entry = null;
+      if (slot < nfuncs) {
+        entry = emitted['f' + slot] ?? await shimFor(slot, -2);
+      } else {
+        const code = ex.svm_coop_slot_code(slot);
+        if (code >= 0) {
+          const len = ex.svm_coop_jit_wasm_by_handle_len(code);
+          entry = len > 0
+            ? (await unitFor(code, u8().slice(Number(ex.svm_coop_jit_wasm_by_handle_ptr()),
+                                              Number(ex.svm_coop_jit_wasm_by_handle_ptr()) + len)))['f0']
+            : await shimFor(slot, code);
+        }
+      }
+      table.set(slot, entry);
+    }
+  };
 
   try {
     for (;;) {
       const ev = ex.svm_coop_run();
       if (ev === 3 /* COOP_RUN_JIT_INVOKE */) {
-        // A guest-compiled §22 unit with emitted wasm: instantiate once per code handle, then
+        // A guest-compiled §22 unit with emitted wasm: sync the table (its `call_indirect` may reach
+        // installed units / program `f{i}`s / bounce shims), instantiate once per code handle, then
         // `f0(win, env, ...args)` with the per-event "mapped"/fuel sync fanned to every live instance.
-        // No table sync — the coop driver's non-B2 units don't dispatch through the shared funcref
-        // table; the all-null table + the `call_interp` bounce satisfy their imports.
+        await syncTable();
         const code = ex.svm_coop_jit_code();
         const wptr = Number(ex.svm_coop_jit_wasm_ptr());
         const unit = await unitFor(code, u8().slice(wptr, wptr + ex.svm_coop_jit_wasm_len()));
@@ -469,6 +509,9 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
         continue;
       }
       if (ev !== 1 /* COOP_RUN_TIERUP */) break; // 0 = done (slots staged), 2 = trapped (status 3)
+      // #880: a tiered-up leaf's `call_indirect` dispatches through the shared table — sync it before
+      // running the region (the per-event "mapped"/fuel fan-out covers every instance it may reach).
+      await syncTable();
       const func = ex.svm_coop_func();
       const argvPtr = Number(ex.svm_coop_argv_ptr());
       const n = ex.svm_coop_argv_len();
