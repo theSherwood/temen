@@ -10,9 +10,10 @@
 //! (the committed W5 self-host asset) translates that Leng to SVM IR text; the text is parsed,
 //! instantiated, and run. Every hop is checked against its native oracle (native hexer's `.x.nif`,
 //! `svm_leng::translate_to_text`), so a divergence anywhere is caught. The `.s.nif` input is what
-//! `nimsem` produces — currently oracle-baked while nimsem-on-SVM is blocked upstream (a native
-//! nimony stock-nim build issue, not the on-ramp); once unblocked it slots in as a third guest ahead
-//! of hexer, closing the full Nim→run chain.
+//! `nimsem` produces — here oracle-baked to isolate the back-end hops. **`nimsem`-on-SVM is proven
+//! (slice 2b): the earlier "blocked upstream" note was a misdiagnosis — an incorrect invocation, not a
+//! build issue.** The full chain with `nimsem` slotted in ahead of `hexer` — Nim source → all phases on
+//! the SVM → a linked module that *runs* — is `examples/nim_e2e_chain.rs`.
 //!
 //! ```text
 //! cargo run -q --release -p svm-run --example nim_backend_chain -- \
