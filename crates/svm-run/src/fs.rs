@@ -202,14 +202,14 @@ impl HostFsState {
             }
             FS_READ => {
                 let Some(Some(o)) = self.open.get_mut(a(0) as usize) else {
-                    return -EBADF;
+                    return EBADF;
                 };
                 if !o.readable {
-                    return -EBADF;
+                    return EBADF;
                 }
                 let (buf, len) = (a(1), a(2));
                 if buf < 0 || !(0..=(1 << 30)).contains(&len) {
-                    return -EINVAL;
+                    return EINVAL;
                 }
                 let mut tmp = vec![0u8; len as usize];
                 let n = match o.file.read(&mut tmp) {
@@ -218,10 +218,10 @@ impl HostFsState {
                 };
                 if n > 0 {
                     let Some(m) = mem.as_deref_mut() else {
-                        return -EFAULT;
+                        return EFAULT;
                     };
                     if m.write_bytes(buf as u64, &tmp[..n]).is_none() {
-                        return -EFAULT;
+                        return EFAULT;
                     }
                 }
                 n as i64
@@ -231,17 +231,17 @@ impl HostFsState {
                     return a(2).max(0); // power-loss: the un-synced write is silently dropped
                 }
                 let Some(Some(o)) = self.open.get_mut(a(0) as usize) else {
-                    return -EBADF;
+                    return EBADF;
                 };
                 if !o.writable {
-                    return -EBADF;
+                    return EBADF;
                 }
                 let bytes = match mem.as_deref() {
                     Some(m) => match m.read_bytes(a(1) as u64, a(2) as u64) {
                         Some(b) => b,
-                        None => return -EFAULT,
+                        None => return EFAULT,
                     },
-                    None => return -EFAULT,
+                    None => return EFAULT,
                 };
                 match o.file.write_all(&bytes) {
                     Ok(()) => bytes.len() as i64,
@@ -250,13 +250,13 @@ impl HostFsState {
             }
             FS_SEEK => {
                 let Some(Some(o)) = self.open.get_mut(a(0) as usize) else {
-                    return -EBADF;
+                    return EBADF;
                 };
                 let from = match a(1) {
                     0 => SeekFrom::Start(a(2).max(0) as u64),
                     1 => SeekFrom::Current(a(2)),
                     2 => SeekFrom::End(a(2)),
-                    _ => return -EINVAL,
+                    _ => return EINVAL,
                 };
                 match o.file.seek(from) {
                     Ok(p) => p as i64,
@@ -265,10 +265,10 @@ impl HostFsState {
             }
             FS_CLOSE => {
                 let Some(slot) = self.open.get_mut(a(0) as usize) else {
-                    return -EBADF;
+                    return EBADF;
                 };
                 if slot.take().is_none() {
-                    return -EBADF;
+                    return EBADF;
                 }
                 0
             }
@@ -301,14 +301,14 @@ impl HostFsState {
                     return 0; // power-loss: the resize never reaches the backing file
                 }
                 let Some(Some(o)) = self.open.get_mut(a(0) as usize) else {
-                    return -EBADF;
+                    return EBADF;
                 };
                 if !o.writable {
-                    return -EBADF;
+                    return EBADF;
                 }
                 let len = a(1);
                 if len < 0 {
-                    return -EINVAL;
+                    return EINVAL;
                 }
                 match o.file.set_len(len as u64) {
                     Ok(()) => 0,
@@ -321,7 +321,7 @@ impl HostFsState {
                     return 0;
                 }
                 let Some(Some(o)) = self.open.get_mut(a(0) as usize) else {
-                    return -EBADF;
+                    return EBADF;
                 };
                 match o.file.sync_all() {
                     Ok(()) => 0,
@@ -331,10 +331,10 @@ impl HostFsState {
             FS_MMAP => {
                 let (fd, foff, len, buf) = (a(0), a(1), a(2), a(3));
                 if foff < 0 || len < 0 || buf < 0 {
-                    return -EINVAL;
+                    return EINVAL;
                 }
                 let Some(Some(o)) = self.open.get_mut(fd as usize) else {
-                    return -EBADF;
+                    return EBADF;
                 };
                 // Copy the file region into the guest buffer (zero-fill past EOF).
                 let mut region = vec![0u8; len as usize];
@@ -350,10 +350,10 @@ impl HostFsState {
                     }
                 }
                 let Some(m) = mem.as_deref_mut() else {
-                    return -EFAULT;
+                    return EFAULT;
                 };
                 if m.write_bytes(buf as u64, &region).is_none() {
-                    return -EFAULT;
+                    return EFAULT;
                 }
                 self.maps.push(HostMapping {
                     base: buf as u64,
@@ -366,29 +366,29 @@ impl HostFsState {
             FS_MSYNC => {
                 let (buf, len) = (a(0), a(1));
                 if buf < 0 || len < 0 {
-                    return -EINVAL;
+                    return EINVAL;
                 }
                 let Some(map) = self
                     .maps
                     .iter()
                     .find(|m| buf as u64 >= m.base && (buf as u64) < m.base + m.len)
                 else {
-                    return -EINVAL;
+                    return EINVAL;
                 };
                 let n = (len as u64).min(map.base + map.len - buf as u64) as usize;
                 let file_pos = map.file_off + (buf as u64 - map.base);
                 let open_idx = map.open_idx;
                 let Some(m) = mem.as_deref() else {
-                    return -EFAULT;
+                    return EFAULT;
                 };
                 let Some(bytes) = m.read_bytes(buf as u64, n as u64) else {
-                    return -EFAULT;
+                    return EFAULT;
                 };
                 if self.crash_barrier() {
                     return 0; // power-loss: this msync's bytes never reach the file
                 }
                 let Some(Some(o)) = self.open.get_mut(open_idx) else {
-                    return -EBADF; // the mapped fd was closed
+                    return EBADF; // the mapped fd was closed
                 };
                 if o.file.seek(SeekFrom::Start(file_pos)).is_err() {
                     return io_errno(&std::io::Error::last_os_error());
@@ -401,7 +401,7 @@ impl HostFsState {
             FS_MUNMAP => {
                 let buf = a(0);
                 let Some(idx) = self.maps.iter().position(|m| m.base == buf as u64) else {
-                    return -EINVAL;
+                    return EINVAL;
                 };
                 let map = self.maps.remove(idx);
                 // Final flush of the whole mapping (self-contained munmap) — unless a crash froze the
@@ -420,14 +420,14 @@ impl HostFsState {
             // handle for the guest to `SharedRegion.map` into its window (real MAP_SHARED aliasing).
             FS_MAP_REGION => {
                 let Some(minter) = minter else {
-                    return -EINVAL; // not an mmap-capable grant (plain host_fs / mem_fs)
+                    return EINVAL; // not an mmap-capable grant (plain host_fs / mem_fs)
                 };
                 let (fd, foff, len) = (a(0), a(1), a(2));
                 if foff != 0 || len <= 0 {
-                    return -EINVAL; // v1 maps the whole file from offset 0
+                    return EINVAL; // v1 maps the whole file from offset 0
                 }
                 let Some(Some(o)) = self.open.get(fd as usize) else {
-                    return -EBADF;
+                    return EBADF;
                 };
                 // Give the backing its **own** fd (dup) over the same OS file, so it outlives the
                 // guest's fd and both share one page cache — the map and the fs cap's pread/pwrite/
@@ -447,7 +447,7 @@ impl HostFsState {
                 #[cfg(not(unix))]
                 {
                     let _ = (minter, o, len); // region-mapping is unix-only for now
-                    -EINVAL
+                    EINVAL
                 }
             }
             FS_STAT => {
@@ -463,15 +463,15 @@ impl HostFsState {
                 };
                 let buf = host_stat_bytes(&md);
                 if a(2) < 0 || a(3) < STATBUF_LEN as i64 {
-                    return -EINVAL;
+                    return EINVAL;
                 }
                 let Some(m) = mem.as_deref_mut() else {
-                    return -EFAULT;
+                    return EFAULT;
                 };
                 if m.write_bytes(a(2) as u64, &buf).is_some() {
                     0
                 } else {
-                    -EFAULT
+                    EFAULT
                 }
             }
             FS_MKDIR => {
@@ -527,7 +527,7 @@ impl HostFsState {
             }
             FS_READDIR => {
                 let Some(Some(entries)) = self.opendirs.get_mut(a(0) as usize) else {
-                    return -EBADF;
+                    return EBADF;
                 };
                 let Some(name) = entries.pop() else {
                     return 0; // exhausted
@@ -535,27 +535,27 @@ impl HostFsState {
                 let (ptr, cap) = (a(1), a(2));
                 if ptr < 0 || cap < name.len() as i64 {
                     entries.push(name);
-                    return -EINVAL;
+                    return EINVAL;
                 }
                 let Some(m) = mem else {
-                    return -EFAULT;
+                    return EFAULT;
                 };
                 if m.write_bytes(ptr as u64, name.as_bytes()).is_some() {
                     name.len() as i64
                 } else {
-                    -EFAULT
+                    EFAULT
                 }
             }
             FS_CLOSEDIR => {
                 let Some(slot) = self.opendirs.get_mut(a(0) as usize) else {
-                    return -EBADF;
+                    return EBADF;
                 };
                 if slot.take().is_none() {
-                    return -EBADF;
+                    return EBADF;
                 }
                 0
             }
-            _ => -EINVAL,
+            _ => EINVAL,
         }
     }
 }
@@ -761,7 +761,7 @@ mod tests {
                     Some(&mut wm),
                 )
                 .unwrap()[0];
-            assert_eq!(region, -EINVAL, "plain host_fs must refuse FS_MAP_REGION");
+            assert_eq!(region, EINVAL, "plain host_fs must refuse FS_MAP_REGION");
         }
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -885,7 +885,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
 
         let expected: Vec<i64> = vec![
-            0, -EEXIST, 0, 1, 5, 0, 0, -ENOENT, 1, 1, 0, 0, -ENOTEMPTY, 0, 0, -ENOENT,
+            0, EEXIST, 0, 1, 5, 0, 0, ENOENT, 1, 1, 0, 0, ENOTEMPTY, 0, 0, ENOENT,
         ];
         assert_eq!(mem_rc, expected, "mem_fs rc sequence");
         assert_eq!(host_rc, expected, "host_fs rc sequence (must match mem_fs)");
@@ -1035,7 +1035,7 @@ mod tests {
         let (np, nl) = put(&mut win, PA, "sub/nope");
         assert_eq!(
             call(&mut host, h, &mut win, FS_OPEN, &[np, nl, O_READ, 0]),
-            -ENOENT,
+            ENOENT,
             "read-only open of a non-file, non-tracked-dir path is ENOENT (dir-open stays narrow)"
         );
         // And a create still makes a *file* even where a dir subtree exists alongside (write intent
@@ -1114,7 +1114,7 @@ mod tests {
         let dh = call(&mut host, h, &mut win, FS_OPENDIR, &[0, 1, 0, 0]);
         assert_eq!(
             call(&mut host, h, &mut win, FS_READDIR, &[dh, 512, 2, 0]),
-            -EINVAL,
+            EINVAL,
             "a too-small readdir buffer fails closed"
         );
         // The entry survived: a full-size read still returns it.
