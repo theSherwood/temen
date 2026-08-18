@@ -136,6 +136,22 @@ fn conv_wrapped_and_narrow_int_global_initializers() {
 }
 
 #[test]
+fn const_arith_global_initializer_folds() {
+    // A top-level `let r = 2 * 3 + 36` — nimony emits the initializer as an **un-folded constant
+    // arithmetic tree** in the gvar's data slot `(add (i +64) (mul (i +64) 2 3) 36)`, not a folded
+    // literal. `const_scalar_int` recurses through `add`/`mul` (and `sub`/`div`/`mod`/`neg`) over
+    // constant operands to materialize the initial value. `readr` reads it back: 2*3 + 36 = 42 (#760).
+    let leng = "\
+(stmts
+ (gvar :r.0. . (i +64) (add (i +64) (mul (i +64) 2 3) 36))
+ (proc :readr.0. . (i +64) .
+  (stmts .
+   (ret r.0.))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    assert_eq!(run(&m, 0, &[]), 42, "2 * 3 + 36 = 42");
+}
+
+#[test]
 fn aggregate_const_with_float_fields() {
     // An aggregate global/const with **float members** — `var c = Shape(x: 1.5, y: 2.0)` →
     // `(oconstr Shape (kv x 1.5) (kv y 2.0))`. `const_aggregate_bytes` folded int, string, and

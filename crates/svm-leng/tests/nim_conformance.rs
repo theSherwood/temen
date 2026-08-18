@@ -12,8 +12,8 @@
 //! fixture carries an [`Expect`], and the test asserts the **measured** status matches it. A feature that
 //! starts working (Fails→Runs) or regresses (Runs→Fails) both fail the test — the first prompts flipping
 //! the expectation (and closing the feature's sub-issue), the second is a real regression. This is the
-//! "green/red matrix, each red a filed ticket" the issue asks for — the driver + oracle surfacing #760's
-//! remaining arms from the *language* side.
+//! "green/red matrix, each red a filed ticket" the issue asks for — the driver + oracle for the
+//! *language*-side breadth (all 15 features run end-to-end today).
 //!
 //! **Toolchain gating.** Needs the nimony toolchain (`nimony` + `nim` on `PATH`, or `NIMONY_BIN`/
 //! `NIM_BIN`); when absent the test **skips** (like `nim_e2e.rs`). CI's `nim-e2e` job provisions it.
@@ -550,15 +550,15 @@ const FIXTURES: &[Fixture] = &[
     },
     // A top-level `let` whose initializer is an un-folded constant *arithmetic tree* — nimony emits it
     // as an inline `gvar` initializer `(add (mul 2 3) 36)` rather than folding to `42` or routing it
-    // through the init chain (as a call-initializer like the anchors above is). svm-leng fail-closes on
-    // that gvar-initializer shape. (Arithmetic in a *proc* body runs — see the anchor.) A #760 arm.
+    // through the init chain (as a call-initializer like the anchors above is). svm-leng folds the
+    // constant arithmetic tree in the gvar initializer (`const_scalar_int`, #760).
     Fixture {
         feature: "const-arith gvar initializer",
         source: "let r = 2 * 3 + 36\n",
         expected: 42,
         io: None,
-        expect: Expect::FailsClosed(Stage::Translate),
-        ticket: Some("#760 (svm-leng totality)"),
+        expect: Expect::Runs,
+        ticket: None,
     },
 ];
 
