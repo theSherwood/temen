@@ -36,7 +36,7 @@ clang $FL -emit-llvm -c -fno-vectorize -fno-slp-vectorize          "$HERE/doom_l
 clang $FL -emit-llvm -c -fno-vectorize -fno-slp-vectorize "$LUA/lua_fmt_snprintf.c" -o "$G/_fmt.bc"
 clang $FL -emit-llvm -c -fno-vectorize -fno-slp-vectorize "$LUA/lua_files_stdio.c"  -o "$G/_files.bc"
 llvm-link "$G"/*.bc -o "$G/doom_diff.linked.bc"
-"$TR" "$G/doom_diff.linked.bc" -o "$G/doom_diff.svmb" --host-page 65536
+"$TR" "$G/doom_diff.linked.bc" -o "$G/doom_diff.svmb" --host-page 65536 --null-guard
 echo "guest: $G/doom_diff.svmb ($(wc -c < "$G/doom_diff.svmb") bytes)"
 
 # --- native oracle: doom_diff.c with `cc` (+ the netgame stubs the guest gets from doom_libc.c) -----

@@ -6,6 +6,14 @@
 // read-only global must not share a host page with the writable data stack (it would fault under
 // D40). The native default (16 KiB) is wrong for the browser — see the `svm-llvm` stack-page commit.
 //
+// Every clang-translated asset also gets **`--null-guard`** (#964): the guarded powerbox layout
+// (`__null_guard`-marked, scratch/args one guard up) so a NULL dereference traps on every tier.
+// The marker rides the synthesized `_start`, so an entry-less reactor kernel (gradient, bounce,
+// mandelzoom, gpu_shader — `tick` only, no `main`) stays unmarked and keeps the legacy behavior.
+// chibicc stays on the legacy layout (its own codegen bakes the legacy ABI for the programs it
+// compiles), as do the committed chibicc-compiled shell fixtures and the unrebuildable nim assets —
+// the marker gates everything, so mixed old/new assets coexist.
+//
 // Usage:  node build-onramp-assets.mjs           (builds whatever the toolchain + caches allow)
 // Needs `clang`/`llvm-dis` on PATH. SQLite/Lua sources are fetched-and-cached (skipped offline).
 // Outputs to `web/assets/*.svmb` (gitignored except the tiny committed `hello_c.svmb`).
@@ -37,7 +45,7 @@ function buildC(name, src, includes = [], defines = []) {
   const svmb = join(ASSETS, `${name}.svmb`);
   const flags = ['-O2', '-emit-llvm', '-c', '-fno-vectorize', '-fno-slp-vectorize'];
   execFileSync('clang', [...flags, ...defines, ...includes.map((i) => `-I${i}`), src, '-o', bc], { stdio: 'inherit' });
-  execFileSync(TR, [bc, '-o', svmb, '--host-page', HOST_PAGE], { stdio: 'inherit' });
+  execFileSync(TR, [bc, '-o', svmb, '--host-page', HOST_PAGE, '--null-guard'], { stdio: 'inherit' });
   const size = execFileSync('wc', ['-c', svmb]).toString().trim().split(/\s+/)[0];
   console.log(`  ✓ ${name}.svmb (${size} B)`);
 }
@@ -46,7 +54,7 @@ function buildC(name, src, includes = [], defines = []) {
 // bitcode is a golden input in the tree, e.g. the Lua test fixtures).
 function buildBc(name, bcPath) {
   const svmb = join(ASSETS, `${name}.svmb`);
-  execFileSync(TR, [bcPath, '-o', svmb, '--host-page', HOST_PAGE], { stdio: 'inherit' });
+  execFileSync(TR, [bcPath, '-o', svmb, '--host-page', HOST_PAGE, '--null-guard'], { stdio: 'inherit' });
   const size = execFileSync('wc', ['-c', svmb]).toString().trim().split(/\s+/)[0];
   console.log(`  ✓ ${name}.svmb (${size} B)`);
 }
@@ -221,7 +229,7 @@ function buildQuickJS() {
     const linked = join(ASSETS, `${out.replace('.svmb', '')}_linked.ll`);
     execFileSync('llvm-link', ['-S', driverLl, ...shared, '-o', linked], { stdio: 'inherit' });
     const svmb = join(ASSETS, out);
-    execFileSync(TR, [linked, '-o', svmb, '--host-page', HOST_PAGE], { stdio: 'inherit' });
+    execFileSync(TR, [linked, '-o', svmb, '--host-page', HOST_PAGE, '--null-guard'], { stdio: 'inherit' });
     const size = execFileSync('wc', ['-c', svmb]).toString().trim().split(/\s+/)[0];
     console.log(`  ✓ ${out} (${size} B)`);
   }
@@ -256,6 +264,9 @@ try {
     const linked = join(cache, linkedName);
     if (!existsSync(linked)) throw new Error(`build script produced no ${linkedName}`);
     const svmb = join(ASSETS, svmbName);
+    // No `--null-guard` for Tcl: its init genuinely dereferences NULL (tolerated as reading zeros
+    // on the legacy layout — the exact class #964 exposes), so it stays unmarked until that's
+    // shimmed/fixed upstream. The marker gates everything, so a legacy Tcl coexists fine.
     execFileSync(TR, [linked, '-o', svmb, '--host-page', HOST_PAGE, '--stub-externs'], { stdio: 'inherit' });
     const size = execFileSync('wc', ['-c', svmb]).toString().trim().split(/\s+/)[0];
     console.log(`  ✓ ${svmbName} (${size} B)`);

@@ -76,6 +76,10 @@ if (!existsSync(TR)) {
 }
 const rawSvmb = join(CACHE, 'postgres.svmb');
 console.log('translating bitcode → browser-target .svmb (--host-page 65536 --stub-externs)…');
+// No `--null-guard` for Postgres (#964): its boot genuinely reads through NULL somewhere
+// (tolerated as zeros on the legacy layout — the exact class the guard exposes; the guarded build
+// fails the browser boot check). It stays unmarked until that's tracked down and shimmed. The
+// marker gates everything, so a legacy Postgres coexists with guarded assets.
 sh(TR, [shimmedBc, '-o', rawSvmb, '--binary', '--host-page', '65536', '--stub-externs']);
 
 // resolve caps + verify + re-serialize → the shipped module; then encode the cluster → the shipped image.
