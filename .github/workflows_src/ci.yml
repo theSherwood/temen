@@ -162,6 +162,8 @@ jobs:
         run: scripts/ci/provision-nimony.sh "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
       - name: Nim end-to-end tests (both engines)
         run: cargo test -p svm-leng --test nim_e2e -- --nocapture
+      - name: Nim language conformance matrix (#956)
+        run: cargo test -p svm-leng --test nim_conformance -- --nocapture
 
   # The CI token can't push `.github/workflows/` (needs the `workflow` OAuth scope), so agent-authored
   # workflow changes are staged in `.github/workflows_src/` and the owner copies them over

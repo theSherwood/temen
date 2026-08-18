@@ -16,6 +16,17 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **Nim conformance matrix step in the `nim-e2e` job (#956)** — one step added right after the
+  `Nim end-to-end tests` step: `cargo test -p svm-leng --test nim_conformance -- --nocapture`. Runs the
+  new `crates/svm-leng/tests/nim_conformance.rs` — a feature→status matrix (generics, exceptions,
+  closures, methods, `seq`/`string`/`Table`, floats, iterators, variant objects, `ref`+ARC) driven
+  through the whole real toolchain and asserted against a committed baseline (a feature that starts
+  working *or* regresses fails the test). Self-skips (passes) without the toolchain, exactly like
+  `nim_e2e`, so it only truly runs in this job. No new toolchain — reuses the one this job already
+  builds. Verified locally against the vendored nimony (`11/15` features run today). (Until copied over,
+  the `workflows-in-sync` guard stays red — the expected mirror-edit friction; `cp
+  .github/workflows_src/*.yml .github/workflows/` drains it.)
+
 - **`nim-e2e`: wait for the `latest-devel` nightly before `setup-nim`** (issue #856) — a new
   `run:` step ("Wait for the Nim devel nightly to be published") added to the `nim-e2e` job
   immediately before the `Setup Nim (devel)` step in `ci.yml`. `alaviss/setup-nim` with
