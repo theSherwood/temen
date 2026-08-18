@@ -9192,6 +9192,9 @@ fn drive(
     match sched.pump(&dom, mem, host, fuel, budget)? {
         CoopStep::Done(vals) => Ok(vals),
         CoopStep::TierUp { .. } => unreachable!("tier-up not enabled on the native driver"),
+        CoopStep::JitInvoke { .. } => {
+            unreachable!("Jit.invoke surfacing not enabled on the native driver")
+        }
     }
 }
 
@@ -9207,6 +9210,20 @@ enum CoopStep {
     TierUp {
         func: u32,
         argv: Box<[i64]>,
+        mapped: u64,
+    },
+    /// A task paused on a §22 `Jit.invoke` of a runtime-compiled unit that has **emitted wasm**, an
+    /// all-scalar signature, and a representable window — the host runs the unit's `f0` and delivers
+    /// the results back ([`CoopSched::deliver_jit_invoke_vals`]). `code` is the unit's code handle,
+    /// `wasm` its emitted module, `argv` the raw i64 arg slots, `params`/`results` the unit entry's
+    /// scalar signature, `mapped` the committed extent. A unit without emitted wasm (or a non-scalar
+    /// signature / unrepresentable window) is serviced interpreted inside the pump and never surfaces.
+    JitInvoke {
+        code: i32,
+        wasm: std::sync::Arc<[u8]>,
+        argv: Box<[i64]>,
+        params: Box<[ValType]>,
+        results: Box<[ValType]>,
         mapped: u64,
     },
 }
@@ -9253,6 +9270,11 @@ struct CoopSched {
     /// the driver services one tier-up round-trip before pumping again — so a single slot suffices.
     /// `None` between round-trips (and always, on the native driver).
     pending_tierup: Option<(usize, usize, Box<[ValType]>)>,
+    /// The task currently paused on a surfaced §22 `Jit.invoke`, awaiting
+    /// [`deliver_jit_invoke_vals`](Self::deliver_jit_invoke_vals): `(task index, dst slot, result
+    /// types)` — the same one-outstanding-round-trip discipline as `pending_tierup` (a tier-up and an
+    /// invoke are never outstanding at once: each is one `pump` yield). `None` off the browser driver.
+    pending_jit: Option<(usize, usize, Box<[ValType]>)>,
 }
 
 impl CoopSched {
@@ -9360,6 +9382,7 @@ impl CoopSched {
             eligible,
             page_checked,
             pending_tierup: None,
+            pending_jit: None,
         })
     }
 
@@ -9389,6 +9412,7 @@ impl CoopSched {
             eligible,
             page_checked,
             pending_tierup,
+            pending_jit,
         } = self;
         loop {
             // Domain lifetime & teardown (DESIGN.md §12 / ISSUES.md I37, owner 2026-07-24): a
@@ -10668,6 +10692,47 @@ impl CoopSched {
                     params,
                     results,
                 }) => {
+                    // #926 slice 2e — surface to the browser host when this run drives tier-up
+                    // (`eligible` set) and the unit has **emitted wasm** with an all-scalar signature
+                    // over a representable window: the host runs the emitted `f0` and delivers the
+                    // results back ([`deliver_jit_invoke_vals`]). Otherwise — the native `drive` (no
+                    // `eligible`), an interpreter-only unit (no emitted wasm), a non-scalar signature,
+                    // or an unrepresentable window — fall through to the interpreted service below,
+                    // which is always correct (the fail-closed default the single-vCPU pump also uses).
+                    let scalar = |t: &ValType| {
+                        matches!(t, ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64)
+                    };
+                    let emittable = eligible.is_some()
+                        && params.iter().all(scalar)
+                        && results.iter().all(scalar);
+                    let surfaced = if emittable {
+                        // Resolve the unit's emitted wasm exactly as the browser FFI's resolver does
+                        // (`jit_unit_wasm`), and the #717 committed-extent bound over the run's window
+                        // (a `Jit.invoke` runs against the shared root powerbox/window).
+                        let wasm = host.resolve_jit_domain(h).ok().and_then(|domain| {
+                            let (cd, cu) = host.resolve_jit_code(code).ok()?;
+                            (cd == domain).then(|| host.jit_unit_wasm(cd, cu))?
+                        });
+                        let mapped = match mem.as_ref() {
+                            None => Some(0),
+                            Some(m) if *page_checked => Some(m.reserved_size()),
+                            Some(m) => m.scalar_extent(),
+                        };
+                        wasm.zip(mapped)
+                    } else {
+                        None
+                    };
+                    if let Some((wasm, mapped)) = surfaced {
+                        *pending_jit = Some((ti, dst as usize, results.clone()));
+                        return Ok(CoopStep::JitInvoke {
+                            code,
+                            wasm,
+                            argv,
+                            params,
+                            results,
+                            mapped,
+                        });
+                    }
                     // Resolve unit funcs (authority + cross-domain) and compile, as for install.
                     let funcs = match host.resolve_jit_domain(h).and_then(|domain| {
                         let (cd, cu) = host.resolve_jit_code(code)?;
@@ -10760,6 +10825,36 @@ impl CoopSched {
             .expect("deliver_tierup_trap with no pending tier-up");
         complete(&mut self.tasks, ti, Err(trap));
     }
+
+    /// #926 slice 2e — deliver a surfaced `Jit.invoke`'s emitted `f0` result slots into the paused
+    /// task and clear the pending slot (mirroring [`deliver_tierup`](Self::deliver_tierup), routed to
+    /// the invoking task's frame via `pending_jit`). A short reply traps the task.
+    fn deliver_jit_invoke_vals(&mut self, vals: &[i64]) {
+        let (ti, dst, results) = self
+            .pending_jit
+            .take()
+            .expect("deliver_jit_invoke_vals with no pending invoke");
+        if vals.len() < results.len() {
+            complete(&mut self.tasks, ti, Err(Trap::Malformed));
+            return;
+        }
+        for (i, ty) in results.iter().enumerate() {
+            self.tasks[ti].vt.active.set(
+                dst as u32 + i as u32,
+                Reg::from_value(slot_to_val(*ty, vals[i])),
+            );
+        }
+    }
+
+    /// #926 slice 2e — the emitted `Jit.invoke` unit trapped: trap the invoking task (mirroring
+    /// [`deliver_tierup_trap`](Self::deliver_tierup_trap)).
+    fn deliver_jit_invoke_trap(&mut self, trap: Trap) {
+        let (ti, _dst, _results) = self
+            .pending_jit
+            .take()
+            .expect("deliver_jit_invoke_trap with no pending invoke");
+        complete(&mut self.tasks, ti, Err(trap));
+    }
 }
 
 /// #926 slice 2 tier-up configuration for a cooperative run: the wasm-JIT eligibility bitmap plus
@@ -10790,6 +10885,18 @@ pub enum CoopEvent {
     TierUp {
         func: u32,
         argv: Box<[i64]>,
+        mapped: u64,
+    },
+    /// A task paused on a §22 `Jit.invoke` of a runtime-compiled unit with emitted `wasm`: the host
+    /// runs the unit's `f0(win, env, ...argv)` (marshalling by `params`/`results`, `mapped` into its
+    /// `"mapped"` global) and calls [`CoopRun::deliver_jit_invoke_vals`] /
+    /// [`CoopRun::deliver_jit_invoke_trap`]. A non-emittable unit runs interpreted and never surfaces.
+    JitInvoke {
+        code: i32,
+        wasm: std::sync::Arc<[u8]>,
+        argv: Box<[i64]>,
+        params: Box<[ValType]>,
+        results: Box<[ValType]>,
         mapped: u64,
     },
 }
@@ -10917,6 +11024,21 @@ impl CoopRun {
         ) {
             Ok(CoopStep::Done(vals)) => CoopEvent::Done(vals),
             Ok(CoopStep::TierUp { func, argv, mapped }) => CoopEvent::TierUp { func, argv, mapped },
+            Ok(CoopStep::JitInvoke {
+                code,
+                wasm,
+                argv,
+                params,
+                results,
+                mapped,
+            }) => CoopEvent::JitInvoke {
+                code,
+                wasm,
+                argv,
+                params,
+                results,
+                mapped,
+            },
             Err(t) => CoopEvent::Trapped(t),
         }
     }
@@ -10933,6 +11055,18 @@ impl CoopRun {
         self.sched.deliver_tierup_trap(trap);
     }
 
+    /// Deliver a surfaced `Jit.invoke` unit's emitted `f0` result slots and resume (see
+    /// [`CoopSched::deliver_jit_invoke_vals`]). Call once after a [`CoopEvent::JitInvoke`], before `run`.
+    pub fn deliver_jit_invoke_vals(&mut self, vals: &[i64]) {
+        self.sched.deliver_jit_invoke_vals(vals);
+    }
+
+    /// Surface a `Jit.invoke` unit's trap and resume (the invoking task traps). Call once after a
+    /// [`CoopEvent::JitInvoke`] in lieu of [`deliver_jit_invoke_vals`](Self::deliver_jit_invoke_vals).
+    pub fn deliver_jit_invoke_trap(&mut self, trap: Trap) {
+        self.sched.deliver_jit_invoke_trap(trap);
+    }
+
     /// #926 slice 2 — service an emitted tier-up region's cross-tier `call_interp(target, io)` while it
     /// is mid-run for the **currently paused task**. Routes the bounce to *that task's* env — a §14
     /// confined child steps its own window/powerbox/dispatch table (`env == Some`), the root and its
@@ -10942,10 +11076,13 @@ impl CoopRun {
     /// Marshals results back into `io` and returns the result count. Call only between a
     /// [`CoopEvent::TierUp`] and its delivery; `Err(Malformed)` if no tier-up is outstanding.
     pub fn bounce(&mut self, target: u32, io: &mut [i64]) -> Result<usize, Trap> {
+        // The paused task is whichever host round-trip is outstanding — a tier-up region or a
+        // surfaced `Jit.invoke` unit; both bounce cross-tier the same way. (#926 slice 2e)
         let ti = self
             .sched
             .pending_tierup
             .as_ref()
+            .or(self.sched.pending_jit.as_ref())
             .map(|(ti, ..)| *ti)
             .ok_or(Trap::Malformed)?;
         let CoopRun {

@@ -363,6 +363,146 @@ async function driveTierupRun(ex, memory, cacheKey) {
   return status;
 }
 
+// #926 slice 2 — the **cooperative** tier-up driver: the single-thread, no-Worker host loop for a
+// genuinely threaded guest (`thread.spawn`) that `driveTierupRun` above declines (its single-vCPU
+// pump traps at the spawn event). It wraps the `svm_coop_*` cdylib (`CoopRun`), which multiplexes
+// every vCPU of the run — the root and its `thread.spawn` descendants — on this one wasm thread and
+// services concurrency, fibers, and §22 install/invoke **internally**, so only tier-up (and the run's
+// end) reach here. Mirrors `driveTierupRun`'s TIERUP + `env.call_interp` mechanics, minus the B2
+// driver table and the JIT_INVOKE arm — the cooperative driver's simple (non-B2) emission has no
+// `call_indirect` tier-up, and runtime §22 units run interpreted for now (surfacing them is a
+// follow-up). Proven observably identical to `onramp_exec` by tests/coop_tierup_driver.rs (wasmi
+// playing this file's role over a threaded guest).
+async function driveCoopTierupRun(ex, memory, cacheKey) {
+  const u8 = () => new Uint8Array(memory.buffer);
+  const i64 = () => new BigInt64Array(memory.buffer);
+  const win = Number(ex.svm_coop_win_ptr());
+
+  const mappedGlobals = []; // every live instance's "mapped" — the post-bounce fan-out set (#717)
+  const fuelGlobals = [];
+  const registerGlobals = (exports) => {
+    if (exports.mapped) mappedGlobals.push(exports.mapped);
+    if (exports.fuel) fuelGlobals.push(exports.fuel);
+  };
+  // A leaf never dispatches through a shared table in this (non-B2) emission; an all-null table
+  // satisfies the emitted module's `__indirect_function_table` import. `env.call_interp` bounces a
+  // cross-tier helper back through the cooperative live-state bounce (routed to the tiering-up task's
+  // env), then fans the fresh "mapped" extent out to every live instance.
+  const table = new WebAssembly.Table({ initial: 1 << 10, maximum: 1 << 10, element: 'anyfunc' });
+  const unitImports = () => ({ env: {
+    memory,
+    __indirect_function_table: table,
+    trap: () => {},
+    call_interp: (target, argsPtr) => {
+      const rc = ex.svm_coop_call_interp(target, argsPtr);
+      const now = ex.svm_coop_mapped_now();
+      for (const g of mappedGlobals) g.value = now;
+      if (rc !== 0) throw new Error('bounce trap'); // unwind to the deliver below
+    },
+  } });
+
+  const coopKey = cacheKey === undefined ? undefined : `${cacheKey}#coop`;
+  let module = cacheGet(coopKey);
+  if (module === undefined) {
+    const wptr = Number(ex.svm_coop_wasm_ptr());
+    const wlen = ex.svm_coop_wasm_len();
+    module = await WebAssembly.compile(u8().slice(wptr, wptr + wlen));
+    cachePut(coopKey, module);
+    jitCacheStats.compiles++;
+  } else {
+    jitCacheStats.hits++;
+  }
+  const instance = await WebAssembly.instantiate(module, unitImports());
+  const emitted = instance.exports;
+  const envCell = Number(ex.svm_alloc(ex.svm_wasmjit_env_bytes()));
+  registerGlobals(emitted);
+  // Per-code-handle unit instances (a runtime-compiled §22 unit runs emitted on JIT_INVOKE — the
+  // JACL macro-staging shape). Async instantiation: a macro unit can exceed the sync compile budget.
+  const jitUnits = new Map();
+  const instantiateUnit = async (bytes) => {
+    const inst = await WebAssembly.instantiate(await WebAssembly.compile(bytes), unitImports());
+    registerGlobals(inst.exports);
+    return inst.exports;
+  };
+  const unitFor = async (code, bytes) => {
+    let unit = jitUnits.get(code);
+    if (unit === undefined) {
+      unit = await instantiateUnit(bytes);
+      jitUnits.set(code, unit);
+    }
+    return unit;
+  };
+
+  try {
+    for (;;) {
+      const ev = ex.svm_coop_run();
+      if (ev === 3 /* COOP_RUN_JIT_INVOKE */) {
+        // A guest-compiled §22 unit with emitted wasm: instantiate once per code handle, then
+        // `f0(win, env, ...args)` with the per-event "mapped"/fuel sync fanned to every live instance.
+        // No table sync — the coop driver's non-B2 units don't dispatch through the shared funcref
+        // table; the all-null table + the `call_interp` bounce satisfy their imports.
+        const code = ex.svm_coop_jit_code();
+        const wptr = Number(ex.svm_coop_jit_wasm_ptr());
+        const unit = await unitFor(code, u8().slice(wptr, wptr + ex.svm_coop_jit_wasm_len()));
+        const argvPtr = Number(ex.svm_coop_argv_ptr());
+        const n = ex.svm_coop_argv_len();
+        const ptypes = new Uint8Array(memory.buffer, Number(ex.svm_coop_jit_param_types_ptr()), n);
+        const args = [];
+        for (let i = 0; i < n; i++) args.push(tierupJitArg(i64()[(argvPtr >> 3) + i], ptypes[i]));
+        const mapped = ex.svm_coop_mapped();
+        for (const g of mappedGlobals) g.value = mapped;
+        for (const g of fuelGlobals) g.value = 1n << 61n;
+        new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
+        try {
+          const ret = unit['f0'](win, envCell, ...args);
+          const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
+          const rn = ex.svm_coop_jit_result_types_len();
+          const rtypes = new Uint8Array(memory.buffer, Number(ex.svm_coop_jit_result_types_ptr()), rn);
+          const rlen = Math.max(1, rets.length) * 8;
+          const rptr = Number(ex.svm_alloc(rlen));
+          for (let i = 0; i < rets.length; i++) i64()[(rptr >> 3) + i] = tierupJitRes(rets[i], rtypes[i]);
+          ex.svm_coop_deliver_jit(rptr, rets.length);
+          ex.svm_dealloc(rptr, rlen);
+        } catch {
+          ex.svm_coop_deliver_jit_trap();
+        }
+        continue;
+      }
+      if (ev !== 1 /* COOP_RUN_TIERUP */) break; // 0 = done (slots staged), 2 = trapped (status 3)
+      const func = ex.svm_coop_func();
+      const argvPtr = Number(ex.svm_coop_argv_ptr());
+      const n = ex.svm_coop_argv_len();
+      const args = [];
+      for (let i = 0; i < n; i++) args.push(i64()[(argvPtr >> 3) + i]);
+      // #717 host sync: the event's committed extent → every live "mapped" global, so the emitted
+      // bounds checks admit exactly what the interpreter's page map does for this call.
+      const tmapped = ex.svm_coop_mapped();
+      for (const g of mappedGlobals) g.value = tmapped;
+      for (const g of fuelGlobals) g.value = 1n << 61n; // re-arm across events on the reused instance
+      new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
+      try {
+        const ret = emitted['f' + func](win, envCell, ...args);
+        const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
+        const rlen = Math.max(1, rets.length) * 8;
+        const rptr = Number(ex.svm_alloc(rlen));
+        for (let i = 0; i < rets.length; i++) i64()[(rptr >> 3) + i] = BigInt(rets[i]);
+        ex.svm_coop_deliver(rptr, rets.length);
+        ex.svm_dealloc(rptr, rlen);
+      } catch {
+        ex.svm_coop_deliver_trap();
+      }
+    }
+  } finally {
+    ex.svm_dealloc(envCell, ex.svm_wasmjit_env_bytes());
+    ex.svm_coop_close();
+  }
+  const status = ex.svm_status();
+  if (status === 3 /* STATUS_TRAP */) {
+    throw new Error('cooperative tier-up run trapped (declined to the interpreter)');
+  }
+  return status;
+}
+
 // Run an on-ramp module whose input is **stdin** (Lua/SQLite/hello) on the wasm-JIT.
 export async function runJitModule(ex, memory, moduleBytes, stdinBytes, cacheKey) {
   const u8 = () => new Uint8Array(memory.buffer);
@@ -388,9 +528,19 @@ export async function runJitModule(ex, memory, moduleBytes, stdinBytes, cacheKey
       ex.svm_onramp_tierup_open(modP, moduleBytes.length, stdinP, stdinLen, 1) === 0) {
     tierup = true;
   }
+  // #926 slice 2: the single-vCPU tier-up declined (a guest that reaches a `thread.spawn`/futex event
+  // — the JACL-with-runtime-threads shape). Try the **cooperative** driver, which multiplexes those
+  // vCPUs on this one wasm thread and still tiers up their hot leaves. Refused → fall through to the
+  // caller's plain-interpreter fallback, exactly as before.
+  let coop = false;
+  if (opened !== 0 && !tierup && ex.svm_coop_open &&
+      ex.svm_coop_open(modP, moduleBytes.length, stdinP, stdinLen, 1) === 0) {
+    coop = true;
+  }
   ex.svm_dealloc(modP, moduleBytes.length);
   if (stdinP) ex.svm_dealloc(stdinP, stdinLen);
   if (tierup) return driveTierupRun(ex, memory, cacheKey);
+  if (coop) return driveCoopTierupRun(ex, memory, cacheKey);
   if (opened !== 0) {
     throw new Error(`JIT module open failed: status ${ex.svm_status()} (2 = _start not emittable)`);
   }

@@ -9107,6 +9107,7 @@ pub extern "C" fn svm_onramp_tierup_close() {
 pub const COOP_RUN_DONE: i32 = 0;
 pub const COOP_RUN_TIERUP: i32 = 1;
 pub const COOP_RUN_TRAP: i32 = 2;
+pub const COOP_RUN_JIT_INVOKE: i32 = 3;
 
 /// The live cooperative tier-up session — the `CoopRun` plus the host-facing operand/capture state
 /// (mirrors the relevant fields of `TierupRun`). The `backing` box owns the window `CoopRun`'s `Mem`
@@ -9117,10 +9118,17 @@ struct CoopTierupRun {
     /// the one shared `env.memory`. Pointer-stable across the struct's moves (boxed slice).
     backing: Box<[u8]>,
     emitted_wasm: Vec<u8>,
-    /// Pending TIERUP operands.
+    /// Pending TIERUP / JIT_INVOKE operands (one event is pending at a time, so `mapped`/`argv` are
+    /// shared between them).
     func: u32,
     mapped: u64,
     argv: Vec<i64>,
+    /// Pending JIT_INVOKE operands (#926 slice 2e): the invoked unit's code handle (the JS host's
+    /// instance-cache key), its emitted wasm, and the per-arg/-result scalar type codes.
+    jit_code: i32,
+    jit_wasm: Option<std::sync::Arc<[u8]>>,
+    jit_param_types: Vec<u8>,
+    jit_result_types: Vec<u8>,
     /// A bounce callback's staged trap (see [`svm_coop_call_interp`] / [`svm_coop_deliver_trap`]).
     pending_bounce_trap: Option<Trap>,
     /// The guest's top-level result, staged at DONE.
@@ -9181,8 +9189,11 @@ pub extern "C" fn svm_coop_open(
         .enumerate()
         .map(|(i, f)| emit[i] && all_i64(&f.params) && all_i64(&f.results))
         .collect();
-    if !eligible.iter().any(|&e| e) {
-        // Nothing for the emitted tier to ever run → the page's plain bytecode path is simpler.
+    // #835/#926: a `vm_jit_*` importer stays eligible even with no emittable leaf — its win is the
+    // runtime-compiled §22 units running emitted (the JACL macro-staging shape). A guest with neither
+    // an eligible leaf nor a jit importer has nothing for the emitted tier to ever run → decline.
+    let jit_importer = m.imports.iter().any(|im| im.name.starts_with("vm_jit_"));
+    if !eligible.iter().any(|&e| e) && !jit_importer {
         set(STATUS_UNSUPPORTED);
         return -STATUS_UNSUPPORTED;
     }
@@ -9199,6 +9210,15 @@ pub extern "C" fn svm_coop_open(
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
     };
     let (frame, _keys) = grant_onramp_caps(&mut host, &m, None);
+    // #926 slice 2e: arm the §22 unit wasm-emitter for a `vm_jit_*` importer so its runtime-compiled
+    // units run emitted (the pump then surfaces a `CoopEvent::JitInvoke` when a unit has emitted wasm;
+    // an interpreter-only unit falls back to the inline service). Reuses the single-vCPU emitter and
+    // its shared parameters — only one driver runs at a time (single-threaded wasm).
+    TIERUP_UNIT_SHARED.store(shared != 0, std::sync::atomic::Ordering::Relaxed);
+    TIERUP_UNIT_WIN_LOG2.store(win_log2, std::sync::atomic::Ordering::Relaxed);
+    if jit_importer {
+        host.set_jit_wasm_emitter(onramp_tierup_unit_emitter);
+    }
     let tierup = bytecode::TierUpConfig {
         eligible: std::sync::Arc::from(eligible.into_boxed_slice()),
         page_checked: false,
@@ -9235,6 +9255,10 @@ pub extern "C" fn svm_coop_open(
             func: 0,
             mapped: 0,
             argv: Vec::new(),
+            jit_code: 0,
+            jit_wasm: None,
+            jit_param_types: Vec::new(),
+            jit_result_types: Vec::new(),
             pending_bounce_trap: None,
             value: 0,
             frame,
@@ -9261,6 +9285,29 @@ pub extern "C" fn svm_coop_run() -> i32 {
             s.mapped = mapped;
             s.argv = argv.into_vec();
             return COOP_RUN_TIERUP;
+        }
+        bytecode::CoopEvent::JitInvoke {
+            code,
+            wasm,
+            argv,
+            params,
+            results,
+            mapped,
+        } => {
+            // The unit is emittable + all-scalar (the pump gated surfacing on it), so every type
+            // maps to a scalar code; the host marshals the i64 slots by these.
+            let codes = |ts: &[svm_ir::ValType]| {
+                ts.iter()
+                    .map(|t| scalar_type_code(*t).unwrap_or(0))
+                    .collect::<Vec<u8>>()
+            };
+            s.jit_code = code;
+            s.mapped = mapped;
+            s.argv = argv.into_vec();
+            s.jit_param_types = codes(&params);
+            s.jit_result_types = codes(&results);
+            s.jit_wasm = Some(wasm);
+            return COOP_RUN_JIT_INVOKE;
         }
         bytecode::CoopEvent::Done(vals) => match vals.first() {
             Some(Value::I64(x)) => (STATUS_OK, *x, 0, COOP_RUN_DONE),
@@ -9373,6 +9420,73 @@ pub extern "C" fn svm_coop_deliver_trap() {
     if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() } {
         let t = s.pending_bounce_trap.take().unwrap_or(Trap::Unreachable);
         s.run.deliver_tierup_trap(t);
+    }
+}
+
+// ---- #926 slice 2e: pending JIT_INVOKE operands (the §22 runtime-unit half of the coop pump) ----
+
+/// The pending JIT_INVOKE unit's code handle (the JS host's instance-cache key).
+#[no_mangle]
+pub extern "C" fn svm_coop_jit_code() -> i32 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.jit_code)
+}
+
+/// The pending JIT_INVOKE unit's emitted wasm bytes (compile + instantiate its `f0`).
+#[no_mangle]
+pub extern "C" fn svm_coop_jit_wasm_ptr() -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .and_then(|s| s.jit_wasm.as_ref())
+        .map_or(core::ptr::null(), |w| w.as_ptr())
+}
+
+#[no_mangle]
+pub extern "C" fn svm_coop_jit_wasm_len() -> usize {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .and_then(|s| s.jit_wasm.as_ref())
+        .map_or(0, |w| w.len())
+}
+
+/// The pending JIT_INVOKE's per-arg scalar type codes (length is [`svm_coop_argv_len`], as the args).
+#[no_mangle]
+pub extern "C" fn svm_coop_jit_param_types_ptr() -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .map_or(core::ptr::null(), |s| s.jit_param_types.as_ptr())
+}
+
+/// The pending JIT_INVOKE's per-result scalar type codes (marshal the emitted `f0`'s returns by these).
+#[no_mangle]
+pub extern "C" fn svm_coop_jit_result_types_ptr() -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .map_or(core::ptr::null(), |s| s.jit_result_types.as_ptr())
+}
+
+#[no_mangle]
+pub extern "C" fn svm_coop_jit_result_types_len() -> usize {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.jit_result_types.len())
+}
+
+/// Deliver the emitted unit `f0`'s i64 result slots for the pending JIT_INVOKE, resuming the task.
+#[no_mangle]
+pub extern "C" fn svm_coop_deliver_jit(rptr: *const i64, n: usize) {
+    // SAFETY: single-threaded wasm; `[rptr, n)` is a live `svm_alloc`ation the host just filled.
+    if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() } {
+        let vals = if rptr.is_null() || n == 0 {
+            &[][..]
+        } else {
+            unsafe { core::slice::from_raw_parts(rptr, n) }
+        };
+        s.run.deliver_jit_invoke_vals(vals);
+    }
+}
+
+/// Deliver a trap from the emitted unit for the pending JIT_INVOKE (a bounce callback's staged trap in
+/// preference, so a callback's `exit` ends the run as `STATUS_EXIT` exactly as interpreted).
+#[no_mangle]
+pub extern "C" fn svm_coop_deliver_jit_trap() {
+    // SAFETY: single-threaded wasm; exclusive access to the session.
+    if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() } {
+        let t = s.pending_bounce_trap.take().unwrap_or(Trap::Unreachable);
+        s.run.deliver_jit_invoke_trap(t);
     }
 }
 
