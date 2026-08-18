@@ -2035,3 +2035,169 @@ int main(void) {{ return pipe(fds) == 0 ? 42 : 9; }}\n"
         "the pipe end's own refusal kind"
     );
 }
+
+const EXEC_C: &str = include_str!("../../svm-run/demos/posix_libc/exec.c");
+
+/// #801 — like [`run_interp_only`] but with an `extra` hook that can grant command modules on the
+/// `Host` and register them with the personality (grant order: personality first, then commands, so
+/// handle values are deterministic). The execve tests use it to stage `/bin` executables.
+fn run_interp_setup(src: &str, extra: impl Fn(&mut Host, &Posix)) -> Effects {
+    let ir = c_to_ir(src);
+    let raw = parse_module_raw(&ir)
+        .unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
+    let win = 1u64
+        << raw
+            .memory
+            .expect("the frontend declares a window")
+            .size_log2;
+    let mut ih = Host::new();
+    let (iposix, ipx) = setup(&mut ih, win);
+    extra(&mut ih, &iposix);
+    verify_module(&raw).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
+    bind_shim(&raw, &mut ih, ipx);
+    let mut fuel = 200_000_000u64;
+    let (result, exited) = match run_with_host(&raw, 0, &[], &mut fuel, &mut ih) {
+        Ok(v) => (v, None),
+        Err(Trap::Exit(c)) => (Vec::new(), Some(c)),
+        Err(e) => panic!("interp trapped: {e:?}\n--- IR ---\n{ir}"),
+    };
+    Effects {
+        result,
+        exited,
+        stdout: iposix.stdout(),
+        file_f: iposix.read_file("f"),
+    }
+}
+
+/// Compile a C source with the §14 **`--child-entry`** ABI — the `(i64 starter) -> (i64)` entry
+/// shape `exec_module`'s admissibility requires of a command (`child_entry_ok`); the plain powerbox
+/// `() -> (i32)` entry is refused. Commands are child-entry; shells stay plain.
+fn c_to_ir_child(src: &str) -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let id = N.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!("svm_cposixcmd_{}_{id}", std::process::id()));
+    let cfile = base.with_extension("c");
+    let irfile = base.with_extension("svm");
+    std::fs::write(&cfile, src).unwrap();
+    let status = Command::new(chibicc())
+        .args([
+            "-cc1",
+            "--emit-ir",
+            "--child-entry",
+            "-cc1-input",
+            cfile.to_str().unwrap(),
+            "-cc1-output",
+            irfile.to_str().unwrap(),
+            cfile.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run chibicc");
+    assert!(status.success(), "chibicc failed on:\n{src}");
+    std::fs::read_to_string(&irfile).unwrap()
+}
+
+/// Compile a C command source, grant it as a `Module`, and register it as a filesystem executable
+/// at `path` — the embedder half of #801's userland ("each coreutil compiled to a module,
+/// presented in the fs as a file").
+fn stage_executable(host: &mut Host, posix: &Posix, path: &str, src: &str) {
+    let ir = c_to_ir_child(src);
+    let m = parse_module_raw(&ir).expect("parse command");
+    verify_module(&m).expect("verify command");
+    let wl = m.memory.expect("command window").size_log2;
+    let h = host.grant_module(&m);
+    posix.register_executable(path, h, wl);
+}
+
+/// #801 slice A — **the POSIX trinity over the personality**: `fork` → `execve("/bin/rc")` →
+/// `waitpid`. The twin image-replaces itself with a registered command module (resolved by
+/// filesystem path through op 53, exec'd by the guest's own `CAP_SELF_EXEC` call — zero new core
+/// surface); its `return 99` after `execve` **never runs** (the image was truly replaced); the
+/// command's argv arrives through the preserved args region; and the parent's blocking `waitpid`
+/// reaps the **command's** status under the twin's pid — POSIX's exec-keeps-the-pid, end to end.
+#[test]
+fn c_fork_execve_wait_runs_a_filesystem_command() {
+    const CMD: &str = r#"
+int main(int argc, char **argv) {
+  if (argc != 2) return 90;
+  return argv[1][0];        /* '4' = 52: argv crossed the exec */
+}
+"#;
+    let src = format!(
+        "{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+static char *av[] = {{ \"rc\", \"4\", 0 }};\n\
+static int status;\n\
+static long pid; static long h;\n\
+int main(void) {{\n\
+  pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 1;\n\
+  if (pid == 0) {{\n\
+    execve(\"/bin/rc\", av, 0);\n\
+    return 99;                       /* must never run: the image is replaced */\n\
+  }}\n\
+  h = __px_waitpid(0, pid, (long)&status, 0);\n\
+  if (h != pid) return 2;\n\
+  if (((status >> 8) & 0xff) != 52) return 3;\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_executable(host, posix, "/bin/rc", CMD);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "fork -> execve(path) -> waitpid: the command's argv-derived status reaped under the twin's pid"
+    );
+}
+
+/// #801 slice A — **`execvp` walks PATH** (`getenv("PATH")`, `:`-separated, ENOENT continues the
+/// walk) and the **errno split + exec bit** hold: an absent path is `-ENOENT`, a plain memfs file
+/// without the executable registration is `-EACCES`, and `stat` reports the exec bits only on
+/// registered executables.
+#[test]
+fn c_execvp_walks_path_and_the_errno_split_holds() {
+    const CMD: &str = r#"
+int main(void) { return 7; }
+"#;
+    let src = format!(
+        "{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_stat(int cap, long path, long len, long buf);\n\
+static char *av[] = {{ \"tool\", 0 }};\n\
+static long st[2];\n\
+static int status;\n\
+static long pid; static long h;\n\
+int main(void) {{\n\
+  if (execve(\"/no/such\", av, 0) != -2) return 1;      /* ENOENT */\n\
+  if (execve(\"/plain.txt\", av, 0) != -13) return 2;   /* a file, no exec bit: EACCES */\n\
+  if (__px_stat(0, (long)\"/bin/tool\", 9, (long)st) != 0) return 3;\n\
+  if ((st[0] & 0111) == 0) return 4;                    /* exec bits on the registered file */\n\
+  if (__px_stat(0, (long)\"/plain.txt\", 10, (long)st) != 0) return 5;\n\
+  if ((st[0] & 0111) != 0) return 6;                    /* none on the plain file */\n\
+  pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 7;\n\
+  if (pid == 0) {{\n\
+    execvp(\"tool\", av);                 /* PATH=/nowhere:/bin -> ENOENT then the hit */\n\
+    return 99;\n\
+  }}\n\
+  h = __px_waitpid(0, pid, (long)&status, 0);\n\
+  if (h != pid) return 8;\n\
+  if (((status >> 8) & 0xff) != 7) return 9;\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_executable(host, posix, "/bin/tool", CMD);
+        posix.write_file("/plain.txt", b"not a program");
+        posix.set_env("PATH", "/nowhere:/bin");
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "ENOENT/EACCES split, stat exec bits, and the PATH walk landing on /bin/tool"
+    );
+}
