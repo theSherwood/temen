@@ -8,7 +8,7 @@
 //! this test. The flag-off path is pinned byte-identical by the entire existing suite (every other
 //! test runs the legacy layout).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use svm_run::run_powerbox_with_args;
@@ -53,7 +53,7 @@ fn compile_to_ll(name: &str) -> Option<PathBuf> {
     }
 }
 
-fn translate(ll: &PathBuf, null_guard: bool) -> svm_ir::Module {
+fn translate(ll: &Path, null_guard: bool) -> svm_ir::Module {
     let opts = svm_llvm::TranslateOptions {
         null_guard,
         ..Default::default()

@@ -20,7 +20,7 @@ const GUARD: i64 = svm_ir::POWERBOX_NULL_GUARD as i64;
 
 /// The guard engages only when host-page-exact (both backends skip identically otherwise).
 fn guard_active() -> bool {
-    svm_ir::POWERBOX_NULL_GUARD % svm_interp::host_page_size() == 0
+    svm_ir::POWERBOX_NULL_GUARD.is_multiple_of(svm_interp::host_page_size())
 }
 
 /// f0: probe load at arg. f1: probe store at arg. f2 `(as, off, len)`: `unmap` via the
