@@ -156,6 +156,46 @@ try {
     ? ok('nifler front-end card: real Nim → parsed NIF in-browser (Nim compiled on the SVM)')
     : fail(`nifler run: state=${nifler.state} result=${nifler.result} stdout=${nifler.stdout.slice(0, 100)}`);
 
+  // The whole-program nim compiler card (NIM.md §3c/§3e; #958) — the toolchain capstone: it inflates
+  // the three committed phase guests (`nifler`/`nimsem`/`hexer` `.svmb.gz`) + the stdlib image
+  // (`nim_stdlib.img.gz`, all committed → always present) and compiles the editor's whole Nim program
+  // **client-side** — the page plays nifmake (stems, `import` crawl), runs nimsem (spawning nifler via
+  // an `exec` cap) + hexer over the closure, links through the nim→powerbox bridge, and runs `_start`.
+  // Assert the editor holds an I/O Nim program and the run prints the program's real stdout. This is the
+  // heaviest card (four assets, multi-phase compile on the tree-walker), so a generous timeout.
+  const nimcCard = 'nim: compile & run a whole Nim program → SVM (the full toolchain, in your browser)';
+  const nimcSrc = await page.evaluate(
+    (sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.getValue(),
+    card(nimcCard),
+  );
+  nimcSrc.includes('import std/syncio') && nimcSrc.includes('write(stdout')
+    ? ok('nim compiler card → editor holds a whole Nim program')
+    : fail(`nim compiler editor: ${nimcSrc.slice(0, 80)}`);
+  await runCard(page, nimcCard, 180_000);
+  const nimc = await page.evaluate((sel) => ({
+    state: document.querySelector(`${sel} .state`).dataset.state,
+    result: document.querySelector(`${sel} .result`).textContent.trim(),
+    stdout: document.querySelector(`${sel} .stdout`).textContent,
+  }), card(nimcCard));
+  nimc.state === 'done' && nimc.result.endsWith('B stdout') &&
+    nimc.stdout.includes('hello from Nim, compiled on the SVM') &&
+    nimc.stdout.includes('all client-side')
+    ? ok('whole-program nim compiler card: the full toolchain compiled + ran a Nim program in-browser')
+    : fail(`nimc run: state=${nimc.state} result=${nimc.result} stdout=${nimc.stdout.slice(0, 120)}`);
+
+  // Editing the program and re-running recompiles it: a different write() prints the new text — proving
+  // the whole toolchain re-runs over the user's edits, not a canned result.
+  await page.evaluate((sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.setValue(
+    'import std/syncio\nwrite(stdout, "edited: recompiled in the browser\\n")\n'), card(nimcCard));
+  await runCard(page, nimcCard, 180_000);
+  const nimc2 = await page.evaluate((sel) => ({
+    state: document.querySelector(`${sel} .state`).dataset.state,
+    stdout: document.querySelector(`${sel} .stdout`).textContent,
+  }), card(nimcCard));
+  nimc2.state === 'done' && nimc2.stdout.includes('edited: recompiled in the browser')
+    ? ok('nim compiler card: editing the Nim recompiles + reruns it (the edit prints)')
+    : fail(`nimc edit re-run: state=${nimc2.state} stdout=${nimc2.stdout.slice(0, 120)}`);
+
   // The QuickJS card is wired to the warm-runtime snapshot (WASM_AOT.md): it defaults to the warm path
   // (svm_warm_open runs the QuickJS runtime init once, svm_warm_eval restores that image + evals per Run).
   // Its qjs_snapshot.svmb is committed (always present), so no build guard is needed.

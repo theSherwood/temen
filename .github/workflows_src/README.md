@@ -16,6 +16,29 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **Nim conformance matrix step in the `nim-e2e` job (#956)** — one step added right after the
+  `Nim end-to-end tests` step: `cargo test -p svm-leng --test nim_conformance -- --nocapture`. Runs the
+  new `crates/svm-leng/tests/nim_conformance.rs` — a feature→status matrix (generics, exceptions,
+  closures, methods, `seq`/`string`/`Table`, floats, iterators, variant objects, `ref`+ARC) driven
+  through the whole real toolchain and asserted against a committed baseline (a feature that starts
+  working *or* regresses fails the test). Self-skips (passes) without the toolchain, exactly like
+  `nim_e2e`, so it only truly runs in this job. No new toolchain — reuses the one this job already
+  builds. Verified locally against the vendored nimony (`11/15` features run today). (Until copied over,
+  the `workflows-in-sync` guard stays red — the expected mirror-edit friction; `cp
+  .github/workflows_src/*.yml .github/workflows/` drains it.)
+
+- **`nim-e2e`: wait for the `latest-devel` nightly before `setup-nim`** (issue #856) — a new
+  `run:` step ("Wait for the Nim devel nightly to be published") added to the `nim-e2e` job
+  immediately before the `Setup Nim (devel)` step in `ci.yml`. `alaviss/setup-nim` with
+  `version: devel` resolves to the nim-lang/nightlies `latest-devel` release, which is transiently
+  absent while the nightly is re-cut — the observed flake failed in ~188 ms with "Could not find any
+  release named 'latest-devel'", before any repo code ran. The new step polls the nightlies release
+  API (`releases/tags/latest-devel`) with bounded backoff (6 attempts, ~5 min max) so the re-cut
+  window self-heals; a genuine upstream outage still fails the job inside the 45-min budget. No new
+  action dependency (pure `curl` + `github.token`), and it does not change which Nim is used. (Until
+  copied over, the `workflows-in-sync` guard stays red — the expected mirror-edit friction;
+  `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
+
 - **`wasm_diff` added to the nightly `fuzz` matrix** (issue #910) — one entry added to the
   `fuzz` job's `target: [...]` list (after `diff`), plus the descriptive comment above it. It is the
   new libFuzzer target `fuzz/fuzz_targets/wasm_diff.rs`: the generative interp⇄**wasm-JIT**
@@ -185,7 +208,10 @@ identical until the next agent edit.
   `workflows_src/ci.yml`): `nimony` + `nativenif` are vendored as **git submodules** (pinned in
   `.gitmodules`), and `provision-nimony.sh` now `git submodule update --init`s them instead of cloning
   a hard-coded SHA. Without the recursive checkout the submodule dirs are empty and the toolchain
-  build fails. Only this job's checkout changed; the others stay bare.
+  build fails. Only this job's checkout changed; the others stay bare. **(4) NEW (#856) — a
+  "Wait for the Nim devel nightly to be published" step now precedes `setup-nim`**, gating on the
+  nim-lang/nightlies `latest-devel` release so the transient re-cut window self-heals instead of
+  reddening the run (see the pending-changes entry above).
 
 - **`std-guest` job** (#821) — a new **nightly** (`schedule` + `workflow_dispatch`) Linux job that runs
   the `crates/svm-llvm/tests/std_guest.rs` suite, which no CI job previously executed (it auto-skips in

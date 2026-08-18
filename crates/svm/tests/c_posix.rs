@@ -115,7 +115,13 @@ fn bind_shim(m: &svm_ir::Module, host: &mut Host, handle: i32) {
 /// personality, bound by name via [`resolver`]. The personality handle is **not** an entry argument;
 /// it binds at resolve. Returns a [`Posix`] handle to the captured state + the granted handle.
 fn setup(host: &mut Host, win: u64) -> (Posix, i32) {
-    let (px, posix) = svm_posix::grant(host, win / 2, win, Vec::new());
+    // Heap at the top quarter: the frontend guarantees data ends by `win/2` (it sizes the window to
+    // 2x data + reserve), but the C data stack grows UP from data_end with no marked ceiling — a
+    // heap granted at `win/2` sits right where a big program's stack frames land (the regex
+    // differential found this: its ~32.7 KiB of data in a 64 KiB window put main's frame 104 bytes
+    // past the old heap base, and deep matcher recursion smashed live heap blocks). `3*win/4`
+    // leaves the stack >= win/4 of headroom above data while the heap keeps win/4.
+    let (px, posix) = svm_posix::grant(host, 3 * win / 4, win, Vec::new());
     (posix, px)
 }
 
@@ -1236,4 +1242,548 @@ int main() {{\n\
     );
     assert_eq!(jit.exited, Some(7), "jit: exit code must match interp");
     assert_eq!(jit.stdout, interp.stdout, "jit: stdout must match interp");
+}
+
+/// #800 — the guest-libc modules (`crates/svm-run/demos/posix_libc/`): real-libc functions that are
+/// pure guest code (POSIX.md §1's split — semantics guest-side, never in the core), concatenated into
+/// the test program as one translation unit.
+const FNMATCH_C: &str = include_str!("../../svm-run/demos/posix_libc/fnmatch.c");
+const POSIX_MISC_C: &str = include_str!("../../svm-run/demos/posix_libc/posix_misc.c");
+const REGEX_C: &str = include_str!("../../svm-run/demos/posix_libc/regex.c");
+
+/// Render `s` as a C string literal (escaping `\` and `"`).
+fn c_str_lit(s: &str) -> String {
+    let mut o = String::from("\"");
+    for ch in s.chars() {
+        match ch {
+            '\\' => o.push_str("\\\\"),
+            '"' => o.push_str("\\\""),
+            _ => o.push(ch),
+        }
+    }
+    o.push('"');
+    o
+}
+
+/// #800 — the guest `fnmatch(3)` differential-tested against the **host libc's** `fnmatch(3)` over a
+/// portable case table (the flags rendered per-platform through the `libc` crate). Guest flag values are
+/// glibc's (fnmatch.c); the host side maps them to its own constants, so the same table drives both. The
+/// guest prints one `'1'`/`'0'` per case; the expected string is computed by calling the real host
+/// `fnmatch`. Cases stick to POSIX-specified behavior where glibc and the BSDs agree (the glibc-specific
+/// fallbacks are hand-asserted in the next test). Both backends must match the host byte-for-byte.
+#[test]
+fn c_fnmatch_matches_the_host_libc() {
+    // (pattern, string, guest flags: PATHNAME=1 NOESCAPE=2 PERIOD=4)
+    const CASES: &[(&str, &str, i32)] = &[
+        ("*", "abc", 0),
+        ("*", "", 0),
+        ("", "", 0),
+        ("", "a", 0),
+        ("*.c", "foo.c", 0),
+        ("*.c", "foo.h", 0),
+        ("*c", "c", 0),
+        ("a**b", "ab", 0),
+        ("a*b*c", "aXbYc", 0),
+        ("a*b*c", "acb", 0),
+        ("?at", "cat", 0),
+        ("?at", "at", 0),
+        ("[abc]at", "bat", 0),
+        ("[abc]at", "dat", 0),
+        ("[!abc]at", "dat", 0),
+        ("[!abc]at", "bat", 0),
+        ("[^abc]at", "dat", 0),
+        ("[a-m]x", "gx", 0),
+        ("[a-m]x", "px", 0),
+        ("[]ab]", "]", 0),
+        ("[]ab]", "c", 0),
+        ("[[:digit:]][[:alpha:]]", "7x", 0),
+        ("[[:digit:]][[:alpha:]]", "xx", 0),
+        ("[![:space:]]", "q", 0),
+        ("[[:xdigit:]]", "f", 0),
+        ("foo/*", "foo/bar", 0),
+        ("*", "foo/bar", 1),
+        ("*/*", "foo/bar", 1),
+        ("*/*", "foo/bar/baz", 1),
+        ("foo?bar", "foo/bar", 1),
+        ("foo*baz", "foo/baz", 1),
+        ("foo/*", "foo/bar", 1),
+        ("*", ".hidden", 4),
+        (".*", ".hidden", 4),
+        ("?idden", ".hidden", 4),
+        ("*/*", "foo/.bar", 5),
+        ("*/.*", "foo/.bar", 5),
+        ("\\*", "*", 0),
+        ("\\*", "x", 0),
+        ("\\*", "\\anything", 2),
+        ("a\\?c", "a?c", 0),
+        ("a\\?c", "abc", 0),
+    ];
+    let n = CASES.len();
+
+    // Host oracle: the same table through the platform's real fnmatch(3).
+    fn host_flags(g: i32) -> i32 {
+        let mut f = 0;
+        if g & 1 != 0 {
+            f |= libc::FNM_PATHNAME;
+        }
+        if g & 2 != 0 {
+            f |= libc::FNM_NOESCAPE;
+        }
+        if g & 4 != 0 {
+            f |= libc::FNM_PERIOD;
+        }
+        f
+    }
+    let expected: Vec<u8> = CASES
+        .iter()
+        .map(|&(pat, s, g)| {
+            let p = std::ffi::CString::new(pat).unwrap();
+            let c = std::ffi::CString::new(s).unwrap();
+            let r = unsafe { libc::fnmatch(p.as_ptr(), c.as_ptr(), host_flags(g)) };
+            if r == 0 {
+                b'1'
+            } else {
+                b'0'
+            }
+        })
+        .collect();
+
+    let pats: Vec<String> = CASES.iter().map(|c| c_str_lit(c.0)).collect();
+    let strs: Vec<String> = CASES.iter().map(|c| c_str_lit(c.1)).collect();
+    let flgs: Vec<String> = CASES.iter().map(|c| c.2.to_string()).collect();
+    let src = format!(
+        "{SHIM}\n{FNMATCH_C}\n\
+static char *pats[] = {{ {} }};\n\
+static char *strs[] = {{ {} }};\n\
+static int flgs[] = {{ {} }};\n\
+static char out[{n}];\n\
+int main(void) {{\n\
+  int i;\n\
+  for (i = 0; i < {n}; i = i + 1)\n\
+    out[i] = fnmatch(pats[i], strs[i], flgs[i]) == 0 ? '1' : '0';\n\
+  write(1, out, {n});\n\
+  return 0;\n\
+}}\n",
+        pats.join(", "),
+        strs.join(", "),
+        flgs.join(", "),
+    );
+    let (interp, jit) = run_both(&src, |_| {});
+
+    if interp.stdout != expected {
+        let i = interp
+            .stdout
+            .iter()
+            .zip(&expected)
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
+        panic!(
+            "guest fnmatch diverged from the host libc at case {i}: {:?} (guest {:?}, host {:?})",
+            CASES[i], interp.stdout[i] as char, expected[i] as char
+        );
+    }
+    assert_eq!(jit.stdout, expected, "jit parity with the host fnmatch");
+}
+
+/// #800 — the `fnmatch` behaviors the differential can't carry portably: `FNM_CASEFOLD` (the GNU/BSD
+/// extension bash's nocaseglob/nocasematch use; the `libc` crate doesn't expose it everywhere) and the
+/// glibc malformed-bracket fallback (an unterminated `[` matches literally — BSDs differ). Hand-asserted
+/// expectations, both backends.
+#[test]
+fn c_fnmatch_casefold_and_bracket_fallback() {
+    // (pattern, string, guest flags, expected-match) — CASEFOLD=16
+    const CASES: &[(&str, &str, i32, bool)] = &[
+        ("*.C", "foo.c", 16, true),
+        ("abc", "ABC", 16, true),
+        ("abc", "ABD", 16, false),
+        ("[a-f]x", "Dx", 16, true),
+        ("[A-F]x", "dx", 16, true),
+        ("[a-f]x", "gx", 16, false),
+        ("a[b", "a[b", 0, true),
+        ("[", "[", 0, true),
+        ("a[b", "ab", 0, false),
+    ];
+    let n = CASES.len();
+    let expected: Vec<u8> = CASES
+        .iter()
+        .map(|c| if c.3 { b'1' } else { b'0' })
+        .collect();
+    let pats: Vec<String> = CASES.iter().map(|c| c_str_lit(c.0)).collect();
+    let strs: Vec<String> = CASES.iter().map(|c| c_str_lit(c.1)).collect();
+    let flgs: Vec<String> = CASES.iter().map(|c| c.2.to_string()).collect();
+    let src = format!(
+        "{SHIM}\n{FNMATCH_C}\n\
+static char *pats[] = {{ {} }};\n\
+static char *strs[] = {{ {} }};\n\
+static int flgs[] = {{ {} }};\n\
+static char out[{n}];\n\
+int main(void) {{\n\
+  int i;\n\
+  for (i = 0; i < {n}; i = i + 1)\n\
+    out[i] = fnmatch(pats[i], strs[i], flgs[i]) == 0 ? '1' : '0';\n\
+  write(1, out, {n});\n\
+  return 0;\n\
+}}\n",
+        pats.join(", "),
+        strs.join(", "),
+        flgs.join(", "),
+    );
+    let (interp, jit) = run_both(&src, |_| {});
+    if interp.stdout != expected {
+        let i = interp
+            .stdout
+            .iter()
+            .zip(&expected)
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
+        panic!(
+            "fnmatch casefold/fallback diverged at case {i}: {:?} (guest {:?}, want {:?})",
+            CASES[i], interp.stdout[i] as char, expected[i] as char
+        );
+    }
+    assert_eq!(jit.stdout, expected, "jit parity");
+}
+
+/// #800 — `putenv` as real libc over the env ops: `KEY=VALUE` sets (overwriting a staged variable),
+/// a bare `KEY` removes (the glibc behavior bash relies on). Round-tripped through `getenv` and echoed,
+/// both backends.
+#[test]
+fn c_putenv_sets_overwrites_and_removes() {
+    let src = format!(
+        "{SHIM}\n{POSIX_MISC_C}\n\
+int main(void) {{\n\
+  if (putenv(\"NEWVAR=hello\") != 0) return 1;\n\
+  char *v = getenv(\"NEWVAR\");\n\
+  if (!v) return 2;\n\
+  write(1, v, slen(v));                    /* -> \"hello\" */\n\
+  if (putenv(\"PATH=/override\") != 0) return 3;\n\
+  char *p = getenv(\"PATH\");\n\
+  write(1, p, slen(p));                    /* -> \"/override\", the staged \"/bin\" replaced */\n\
+  if (putenv(\"NEWVAR\") != 0) return 4;     /* bare name removes (glibc) */\n\
+  if (getenv(\"NEWVAR\")) return 5;\n\
+  return 42;\n\
+}}\n"
+    );
+    let (interp, jit) = run_both(&src, |px| px.set_env("PATH", "/bin"));
+    assert_eq!(
+        interp.result,
+        vec![Value::I32(42)],
+        "interp: putenv set, overwrote, and removed"
+    );
+    assert_eq!(
+        interp.stdout, b"hello/override",
+        "interp: getenv round-trip"
+    );
+    assert_eq!(jit.result, vec![Value::I64(42)], "jit parity");
+    assert_eq!(jit.stdout, interp.stdout, "jit stdout parity");
+}
+
+/// #800 — `wait4`/`wait3` as real libc over op 28: `wait4(pid)` rides the #799 **blocking** reap and
+/// zeroes the caller's `rusage` (the personality meters fuel, not rusage — all-zero is the POSIX "no
+/// information" answer; the buffer is pre-poisoned to prove the zeroing); `wait3` is the any-child form
+/// (non-blocking on the table, so it polls like every `-1` wait). Two fork twins, reaped one by each.
+#[test]
+fn c_wait4_and_wait3_reap_fork_twins() {
+    let src = format!(
+        "{POSIX_MISC_C}\n\
+long __px_fork(int cap, long a);\n\
+static int status;\n\
+static char ru[144];\n\
+static long pid; static long pid2; static long h;\n\
+int main(void) {{\n\
+  int i;\n\
+  for (i = 0; i < 144; i = i + 1) ru[i] = 0x55;   /* poison: wait4 must zero it */\n\
+  pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 1;\n\
+  if (pid == 0) return 7;\n\
+  h = wait4(pid, &status, 0, ru);                 /* specific pid: the blocking reap */\n\
+  if (h != pid) return 2;\n\
+  if (((status >> 8) & 0xff) != 7) return 3;\n\
+  for (i = 0; i < 144; i = i + 1) if (ru[i]) return 4;\n\
+  pid2 = __px_fork(0, 0);\n\
+  if (pid2 < 0) return 5;\n\
+  if (pid2 == 0) return 9;\n\
+  while ((h = wait3(&status, 0, ru)) == -10) {{}}  /* any-child: poll until the twin retires */\n\
+  if (h != pid2) return 6;\n\
+  if (((status >> 8) & 0xff) != 9) return 8;\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_only(&src, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "wait4 blocked on the twin, zeroed rusage; wait3 reaped the second twin any-child"
+    );
+}
+
+/// #800 — the guest `regcomp`/`regexec` (posix_libc/regex.c) differential-tested against the **host
+/// libc's** POSIX regex over a case table: for every case both sides print the same encoding — `E;`
+/// (compile error), `N;` (no match), or `so,eo` for the whole match and every capture group
+/// (`nmatch = re_nsub+1`, so the group *count* is differential too) — and must agree byte-for-byte.
+/// This pins the POSIX **leftmost-longest** discipline (`(a|ab)` against `"ab"` must span 0..2 where a
+/// first-match backtracker stops at 0..1), capture spans including the last-repetition rule and unset
+/// `(-1,-1)` groups, ICASE folding, and NOTBOL. Both guest backends must match the host.
+#[test]
+fn c_regex_matches_the_host_libc() {
+    // (pattern, string, icase, notbol)
+    const CASES: &[(&str, &str, bool, bool)] = &[
+        ("abc", "xabcy", false, false),
+        ("abc", "xy", false, false),
+        ("a.c", "abc", false, false),
+        ("^abc$", "abc", false, false),
+        ("^abc$", "xabc", false, false),
+        ("a*", "aaa", false, false),
+        ("a*", "b", false, false),
+        ("(a|ab)", "ab", false, false),
+        ("(a|ab)(c|bcd)", "abcd", false, false),
+        ("(a|b)+", "abab", false, false),
+        ("a+b+", "aabbb", false, false),
+        ("colou?r", "color", false, false),
+        ("colou?r", "colour", false, false),
+        ("[0-9]+", "abc123def", false, false),
+        ("[^0-9]+", "abc123", false, false),
+        ("[[:alpha:]]+", "ab12", false, false),
+        ("[[:xdigit:]]+", "xfa9z", false, false),
+        ("(ab)*", "ababx", false, false),
+        ("a{2,3}", "aaaa", false, false),
+        ("a{2}", "aaaa", false, false),
+        ("a{2,}", "aaaaa", false, false),
+        ("(a+)(b*)(c?)", "aabcc", false, false),
+        ("x|yz|w", "byzq", false, false),
+        ("\\.", "a.b", false, false),
+        ("a$", "ba", false, false),
+        ("(a)(b)?", "a", false, false),
+        ("[]a]x", "]x", false, false),
+        ("[a-]x", "-x", false, false),
+        ("abc", "xABCy", true, false),
+        ("[a-f]+", "DEaf", true, false),
+        ("[[:upper:]]+", "aBCd", true, false),
+        ("^a", "abc", false, true),
+        ("a(", "aa", false, false),
+        ("[z-a]", "x", false, false),
+    ];
+    let n = CASES.len();
+
+    // In ERE every unescaped `(` outside a bracket expression opens a group; the libc crate keeps
+    // `regex_t.__re_nsub` private, so count groups from the pattern — the encoding's pair count then
+    // cross-checks the guest's own `re_nsub` against this.
+    fn nsub_of(pat: &str) -> usize {
+        let b = pat.as_bytes();
+        let (mut n, mut i, mut in_br) = (0, 0, false);
+        while i < b.len() {
+            match b[i] {
+                b'\\' if !in_br => i += 1,
+                b'[' if !in_br => in_br = true,
+                b']' if in_br => in_br = false,
+                b'(' if !in_br => n += 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        n
+    }
+
+    // Host oracle: the identical encoding through the platform's real regcomp/regexec.
+    let mut expected = String::new();
+    for &(pat, s, icase, notbol) in CASES {
+        unsafe {
+            let mut re: libc::regex_t = std::mem::zeroed();
+            let p = std::ffi::CString::new(pat).unwrap();
+            let c = std::ffi::CString::new(s).unwrap();
+            let cf = libc::REG_EXTENDED | if icase { libc::REG_ICASE } else { 0 };
+            if libc::regcomp(&mut re, p.as_ptr(), cf) != 0 {
+                expected.push_str("E;");
+                continue;
+            }
+            let nsub = nsub_of(pat);
+            let mut m: [libc::regmatch_t; 33] = std::mem::zeroed();
+            let ef = if notbol { libc::REG_NOTBOL } else { 0 };
+            if libc::regexec(&re, c.as_ptr(), nsub + 1, m.as_mut_ptr(), ef) != 0 {
+                expected.push_str("N;");
+            } else {
+                for g in m.iter().take(nsub + 1) {
+                    expected.push_str(&format!("{},{} ", g.rm_so, g.rm_eo));
+                }
+                expected.push(';');
+            }
+            libc::regfree(&mut re);
+        }
+    }
+
+    let pats: Vec<String> = CASES.iter().map(|c| c_str_lit(c.0)).collect();
+    let strs: Vec<String> = CASES.iter().map(|c| c_str_lit(c.1)).collect();
+    let cfs: Vec<String> = CASES
+        .iter()
+        .map(|c| if c.2 { "2" } else { "0" }.to_string())
+        .collect();
+    let efs: Vec<String> = CASES
+        .iter()
+        .map(|c| if c.3 { "1" } else { "0" }.to_string())
+        .collect();
+    let src = format!(
+        "{SHIM}\n{REGEX_C}\n\
+static char *pats[] = {{ {} }};\n\
+static char *strs[] = {{ {} }};\n\
+static int cfs[] = {{ {} }};\n\
+static int efs[] = {{ {} }};\n\
+static void put_num(long v) {{\n\
+  char b[24];\n\
+  int i = 24;\n\
+  int neg = v < 0;\n\
+  if (neg) v = -v;\n\
+  if (v == 0) {{ i = i - 1; b[i] = '0'; }}\n\
+  while (v) {{ i = i - 1; b[i] = '0' + (v - v / 10 * 10); v = v / 10; }}\n\
+  if (neg) {{ i = i - 1; b[i] = '-'; }}\n\
+  write(1, b + i, 24 - i);\n\
+}}\n\
+int main(void) {{\n\
+  int i;\n\
+  for (i = 0; i < {n}; i = i + 1) {{\n\
+    regex_t re;\n\
+    if (regcomp(&re, pats[i], cfs[i] | 1) != 0) {{ write(1, \"E;\", 2); continue; }}\n\
+    regmatch_t m[4];\n\
+    if (regexec(&re, strs[i], re.re_nsub + 1, m, efs[i]) != 0) {{\n\
+      write(1, \"N;\", 2);\n\
+    }} else {{\n\
+      long k;\n\
+      for (k = 0; k <= re.re_nsub; k = k + 1) {{\n\
+        put_num(m[k].rm_so); write(1, \",\", 1); put_num(m[k].rm_eo); write(1, \" \", 1);\n\
+      }}\n\
+      write(1, \";\", 1);\n\
+    }}\n\
+    regfree(&re);\n\
+  }}\n\
+  return 0;\n\
+}}\n",
+        pats.join(", "),
+        strs.join(", "),
+        cfs.join(", "),
+        efs.join(", "),
+    );
+    let (interp, jit) = run_both(&src, |_| {});
+
+    let got = String::from_utf8_lossy(&interp.stdout);
+    if got != expected {
+        let gi: Vec<&str> = got.split(';').collect();
+        let ei: Vec<&str> = expected.split(';').collect();
+        let i = gi.iter().zip(&ei).position(|(a, b)| a != b).unwrap_or(0);
+        panic!(
+            "guest regex diverged from the host libc at case {i}: {:?}\n  guest: {:?}\n  host:  {:?}",
+            CASES[i],
+            gi.get(i),
+            ei.get(i)
+        );
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&jit.stdout),
+        expected,
+        "jit parity with the host regex"
+    );
+}
+
+/// #800 — the `[[ =~ ]]` shape end to end: compile once, match, and read the whole match + groups the
+/// way bash fills `BASH_REMATCH` — hand-asserted (documents the intended use), both backends.
+#[test]
+fn c_regex_bash_rematch_shape() {
+    let src = format!(
+        "{SHIM}\n{REGEX_C}\n\
+int main(void) {{\n\
+  regex_t re;\n\
+  /* the bash idiom: [[ \"2026-08-18\" =~ ([0-9]+)-([0-9]+)-([0-9]+) ]] */\n\
+  if (regcomp(&re, \"([0-9]+)-([0-9]+)-([0-9]+)\", 1) != 0) return 1;\n\
+  if (re.re_nsub != 3) return 2;\n\
+  regmatch_t m[4];\n\
+  if (regexec(&re, \"date: 2026-08-18!\", 4, m, 0) != 0) return 3;\n\
+  if (m[0].rm_so != 6 || m[0].rm_eo != 16) return 4;   /* BASH_REMATCH[0] */\n\
+  if (m[1].rm_so != 6 || m[1].rm_eo != 10) return 5;   /* 2026 */\n\
+  if (m[2].rm_so != 11 || m[2].rm_eo != 13) return 6;  /* 08 */\n\
+  if (m[3].rm_so != 14 || m[3].rm_eo != 16) return 7;  /* 18 */\n\
+  if (regexec(&re, \"no digits here\", 4, m, 0) == 0) return 8;\n\
+  /* no regfree */\n\
+  return 42;\n\
+}}\n"
+    );
+    let (interp, jit) = run_both(&src, |_| {});
+    assert_eq!(
+        interp.result,
+        vec![Value::I32(42)],
+        "the =~ shape: compile, match, BASH_REMATCH-style group spans"
+    );
+    assert_eq!(jit.result, vec![Value::I64(42)], "jit parity");
+}
+
+const GLOB_C: &str = include_str!("../../svm-run/demos/posix_libc/glob.c");
+
+/// #800 — `glob(3)` over the memfs: absolute patterns walk segments via opendir/readdir with
+/// slice 1's `fnmatch` (`FNM_PERIOD` — `*` skips dotfiles, the shell rule), results sorted; a magic
+/// middle segment (`/*/x.c`) fans out across directories; `GLOB_MARK` marks directories with `/`;
+/// no match is `GLOB_NOMATCH` unless `GLOB_NOCHECK` returns the pattern itself; `globfree` releases.
+/// Each sub-check writes its joined `gl_pathv` to stdout, and the whole battery must agree across
+/// backends. Hand-asserted (the host's glob walks a real fs, not this memfs — no oracle to share).
+#[test]
+fn c_glob_expands_over_the_memfs() {
+    let src = format!(
+        "{SHIM}\n{FNMATCH_C}\n{GLOB_C}\n\
+static glob_t g;\n\
+static void dump(void) {{\n\
+  long i;\n\
+  for (i = 0; i < g.gl_pathc; i = i + 1) {{\n\
+    char *s = g.gl_pathv[g.gl_offs + i];\n\
+    write(1, s, slen(s));\n\
+    write(1, \" \", 1);\n\
+  }}\n\
+  write(1, \";\", 1);\n\
+}}\n\
+int main(void) {{\n\
+  if (glob(\"/*.c\", 0, 0, &g) != 0) return 1;      /* sorted, dotfiles skipped */\n\
+  dump();\n\
+  globfree(&g);\n\
+  if (glob(\"/dir/*.c\", 0, 0, &g) != 0) return 2;  /* .hidden.c excluded */\n\
+  dump();\n\
+  globfree(&g);\n\
+  if (glob(\"/dir/.*.c\", 0, 0, &g) != 0) return 3; /* explicit dot matches it */\n\
+  dump();\n\
+  globfree(&g);\n\
+  if (glob(\"/*/x.c\", 0, 0, &g) != 0) return 4;    /* magic middle segment */\n\
+  dump();\n\
+  globfree(&g);\n\
+  if (glob(\"/d*\", 2, 0, &g) != 0) return 5;       /* GLOB_MARK: trailing / on dirs */\n\
+  dump();\n\
+  globfree(&g);\n\
+  if (glob(\"/nope*\", 0, 0, &g) != 3) return 6;    /* GLOB_NOMATCH */\n\
+  if (glob(\"/nope*\", 16, 0, &g) != 0) return 7;   /* GLOB_NOCHECK: the pattern back */\n\
+  dump();\n\
+  globfree(&g);\n\
+  return 42;\n\
+}}\n"
+    );
+    let (interp, jit) = run_both(&src, |px| {
+        px.write_file("/b.c", b"b");
+        px.write_file("/a.c", b"a");
+        px.write_file("/ab.txt", b"t");
+        px.write_file("/.dot.c", b"d");
+        px.write_file("/dir/x.c", b"x");
+        px.write_file("/dir/y.h", b"y");
+        px.write_file("/dir/.hidden.c", b"h");
+        px.write_file("/dpl/x.c", b"x2");
+    });
+    assert_eq!(
+        interp.result,
+        vec![Value::I32(42)],
+        "every glob sub-check passed"
+    );
+    let want: &[u8] = b"/a.c /b.c ;\
+/dir/x.c ;\
+/dir/.hidden.c ;\
+/dir/x.c /dpl/x.c ;\
+/dir/ /dpl/ ;\
+/nope* ;";
+    assert_eq!(
+        String::from_utf8_lossy(&interp.stdout),
+        String::from_utf8_lossy(want),
+        "the expansions, sorted, dot-rules and MARK applied"
+    );
+    assert_eq!(jit.result, vec![Value::I64(42)], "jit parity");
+    assert_eq!(jit.stdout, interp.stdout, "jit stdout parity");
 }

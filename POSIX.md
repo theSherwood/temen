@@ -62,8 +62,8 @@ The elegant split for the stateful ops (`malloc`, `stdio`, the fd table):
 
 The allocator manages a **heap region of the guest window** the embedder configures at grant
 (`[heap_base, heap_end)`): a first-fit **free list** — `malloc` reuses a freed block (splitting
-off any remainder) before bumping the high-water mark, and `free` returns a block for reuse
-(coalescing adjacent frees is a follow-up). The **fs** is an in-memory `path → bytes` map (a
+off any remainder) before bumping the high-water mark, and `free` returns a block for reuse,
+coalescing it with adjacent free neighbors (#800). The **fs** is an in-memory `path → bytes` map (a
 memfs) with a host-side fd table (`open`/`close`/`read`/`write`/`lseek`); it keeps the
 personality self-contained for the playground, and a native embedder routing to a real `fs`
 cap is a follow-up.
@@ -103,7 +103,7 @@ only to mark the boundary.
 | 0 | `write(fd, buf, len)` | `-> n \| -errno` | host sinks / fd table → `Stream`/`Pipe` | **done (spike)** — fd 1/2 → captured stdout/stderr |
 | 1 | `read(fd, buf, len)` | `-> n \| -errno` | host sinks / fd table → `Stream`/`Pipe` | **done (spike)** — fd 0 → preloaded stdin |
 | 2 | `malloc(size)` | `-> ptr \| 0` | window-heap arena (host bookkeeping) | **done** — first-fit free list |
-| 3 | `free(ptr)` | `-> 0` | window-heap arena | **done** — reclaims for reuse (no coalescing yet) |
+| 3 | `free(ptr)` | `-> 0` | window-heap arena | **done** — reclaims for reuse, **coalescing** adjacent free blocks (#800: the regex differential's varied-size compile/free cycles demanded it) |
 | 4 | `exit(code)` | `noreturn` | `Trap::Exit` (→ `Exit` cap) | **done** |
 | 5 | `open(path, len, flags)` | `-> fd \| -errno` | memfs + host fd table | **done** — `O_CREAT`/`O_TRUNC`/`O_APPEND`, `-ENOENT` |
 | 6 | `close(fd)` | `-> 0 \| -errno` | host fd table | **done** |
@@ -156,6 +156,7 @@ only to mark the boundary.
 | — | default actions + `EINTR` | doorbell (§9 L1/L2) | host signal state | **partial** — **L2 async delivery to a running loop is DONE** (#796): with a handler + `sigaltstack`, the interp redirects a caught, unmasked signal into `void handler(int)` at a per-op safepoint and resumes. **`EINTR` on blocked calls is DONE** (#863: a deliverable signal — embedder `^C`, `kill(pid)` — interrupts the target domain's blocked pipe I/O and `wait` reaps with `-EINTR`, domain-scoped per INVARIANTS.md #12). **Stop/continue is DONE** (#798: `SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU` default actions park the domain at a safepoint; `SIGCONT` resumes; a stopped process holds all delivery until continued). **Default-action terminate is DONE** (#796: an unhandled fatal signal fires the core's `SignalSource::set_kill` door — the domain's term flag, death at the next per-op poll, `waitpid` reports `WIFSIGNALED` — while ignored/default-ignore signals are discarded at generation; a masked or stopped process holds a fatal signal until unblock/continue, `SIGKILL` excepted). **Block-during-handler + nested delivery are DONE** (#796: delivery pushes the mask and blocks the signal + its `sa_mask` for the handler's duration, restored via `SignalSource::handler_returned`; a different unmasked signal nests, same-signal reentry cannot). **`SA_RESTART` is DONE** (#796: a restart-flagged delivery re-issues an interrupted blocking pipe op — handler runs promptly, the op re-parks — and leaves a parked `wait` parked, the handler landing at the wait's completion; plain `signal()` stays SysV no-restart). **L1 park coverage is COMPLETE for the POSIX-syscall parks** (#796 slice D: blocking **stream** reads — the stdin/prompt park — join pipe I/O and `wait` in the EINTR sweep, same `SA_RESTART` gating, plus a pre-park pending check at the stream-park insert; mid-flight cap calls, serve-loop parks, futex waits and `thread.join` are deliberately NOT interruptible — not syscall boundaries). **Remaining:** JIT/bytecode parity for the async safepoint (#932) |
 | — | `fork/vfork/execve` | Stage 3 | durable clone (§7) | **parked** — return-twice / image-replace need the durable-clone capstone (R8 ✓); `spawn`+`waitpid` (ops 27–29) cover the fork-free process model a shell drives today |
 | — | `strlen/memcpy/snprintf/qsort/ctype/math` | pure | **guest code** (no cap) | n/a |
+| — | `fnmatch` / `putenv` / `wait3` / `wait4` | pure / thin wrappers | **guest code** (`crates/svm-run/demos/posix_libc/`) | **done (#800)** — `fnmatch(3)` with `FNM_PATHNAME`/`PERIOD`/`NOESCAPE`/`CASEFOLD` + `[[:class:]]`, differential-tested against the host libc's; `putenv` over setenv/unsetenv (bare name removes, glibc-style; copies, never aliases); `wait3`/`wait4` over op 28 (incl. the blocking reap) with rusage zeroed; **`regcomp`/`regexec`/`regfree`** — POSIX ERE with captures (bash's `[[ =~ ]]`/`BASH_REMATCH`), leftmost-longest, differential-tested (spans + captures) against the host's `regexec(3)`; **`glob`/`globfree`** — memfs segment walk over opendir/readdir + `fnmatch` (`FNM_PERIOD` dot rule), sorted, `GLOB_MARK`/`NOCHECK`/`APPEND`/`DOOFFS`. Still to come: `getline` (needs a minimal `FILE` layer) |
 
 ## 5a. The `net` capability — sockets without growing the libc table
 

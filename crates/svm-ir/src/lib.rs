@@ -2941,6 +2941,15 @@ impl Func {
                 .any(|i| matches!(i, Inst::SetJmp { .. } | Inst::LongJmp { .. }))
         })
     }
+
+    /// Whether this function contains a [`Inst::GcRoots`] op. It walks the fiber runtime's live
+    /// stacks, so a module holding one needs that runtime stood up even if it never explicitly
+    /// creates a fiber — the JIT's fiber-runtime gate unions this with [`uses_fibers`](Func::uses_fibers).
+    pub fn uses_gc_roots(&self) -> bool {
+        self.blocks
+            .iter()
+            .any(|b| b.insts.iter().any(|i| matches!(i, Inst::GcRoots { .. })))
+    }
 }
 
 /// A linear-memory window declaration (§4). The window is `1 << size_log2` bytes —

@@ -30,6 +30,7 @@ use svm_interp::{bytecode, Host, StreamRole, Trap, Value};
 
 // The `webgpu` capability's host import (browser: `navigator.gpu` via `webgpu_op`). Wasm-only — native
 // builds (the Rust reactor tests) have no such import, so the cap is simply not granted there.
+mod nimc;
 #[cfg(target_arch = "wasm32")]
 mod webgpu;
 
@@ -2473,7 +2474,7 @@ const ONRAMP_CAP_NAMES: [&str; 5] = ["stdout", "stdin", "exit", "memory", "addrs
 /// (`write`/`read`/`exit`/`vm_map`/…); this lowers each name to the `(type_id, op)` its `cap.call`
 /// runs, so the resolved module verifies and runs. The **handle** (which stream/region) is supplied
 /// by the powerbox stash, not this map — `write`/`read` share `Stream`, differing only by handle.
-fn onramp_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
+pub(crate) fn onramp_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
     use svm_interp::cap_id;
     let (type_id, op): (u32, u32) = match name {
         "write" => (cap_id::STREAM, 1),
@@ -2508,7 +2509,7 @@ fn onramp_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
 /// rewrite died with phase 4). An import-free module passes as-is: its entry runs with no args
 /// (missing params zero-seed, the `Session` convention) and reaches capabilities only by name via
 /// `cap.self.resolve`.
-fn onramp_check(m: &svm_ir::Module) -> Result<(), ()> {
+pub(crate) fn onramp_check(m: &svm_ir::Module) -> Result<(), ()> {
     let named_entry = m.funcs.first().is_some_and(|f| f.params.is_empty())
         && m.exports.iter().any(|e| e.name == "_start" && e.func == 0);
     if m.imports.is_empty() || named_entry {
@@ -2958,7 +2959,7 @@ pub fn posix_shell_exec_with(
 /// Build the §3e powerbox args blob — `{ argc:u32-LE, envc:u32-LE }` then packed NUL-terminated
 /// strings — for seeding at `POWERBOX_ARGS_BASE` (the browser twin of `svm-run`'s `build_args_blob`,
 /// no env). The on-ramp `_start` parses it into `argc`/`argv`.
-fn pg_args_blob(argv: &[&[u8]]) -> Vec<u8> {
+pub(crate) fn pg_args_blob(argv: &[&[u8]]) -> Vec<u8> {
     let mut blob = Vec::new();
     blob.extend_from_slice(&(argv.len() as u32).to_le_bytes());
     blob.extend_from_slice(&0u32.to_le_bytes()); // envc = 0
@@ -3574,6 +3575,75 @@ pub extern "C" fn svm_run_nifler_fs(
         EXIT_CODE = out.exit_code;
     }
     out.value
+}
+
+/// **Compile any Nim in the browser — the nimony compiler card** (NIM.md §3c/§3e, #958). Decode the
+/// three phase modules (`nifler`/`nimsem`/`hexer`), mount the stdlib image on the shared memfs and add
+/// the editor's Nim as `[main].nim`, then run the whole nimony toolchain **client-side** via
+/// [`nimc::compile_nim`]: it plays nifmake (computes stems, crawls the `import` graph with nifler),
+/// runs nimsem + hexer over the closure (nimsem spawning nifler through a wasm-native `exec` cap over
+/// the shared store), links through the nim→powerbox bridge, and runs `_start` under the powerbox.
+/// The program's **stdout** comes back on `svm_stdout_ptr`/`_len`; a compile/link/run failure puts the
+/// diagnostic on `svm_stderr_ptr`/`_len` and sets a non-OK [`svm_status`]. `img` is an `svm_fs`
+/// image of the stdlib (keys under `lib/`, with a flattened `lib/std/…`→`lib/…` view); `main` is the
+/// editor source's file name (e.g. `prog.nim`).
+///
+/// # Safety
+/// Each pointer/len names a live `svm_alloc`ation the host just filled.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn svm_compile_nim_fs(
+    nifler_ptr: *const u8,
+    nifler_len: usize,
+    nimsem_ptr: *const u8,
+    nimsem_len: usize,
+    hexer_ptr: *const u8,
+    hexer_len: usize,
+    img_ptr: *const u8,
+    img_len: usize,
+    src_ptr: *const u8,
+    src_len: usize,
+    main_ptr: *const u8,
+    main_len: usize,
+) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    let sl = |p: *const u8, n: usize| unsafe { core::slice::from_raw_parts(p, n) };
+    let nifler = sl(nifler_ptr, nifler_len);
+    let nimsem = sl(nimsem_ptr, nimsem_len);
+    let hexer = sl(hexer_ptr, hexer_len);
+    let image = sl(img_ptr, img_len);
+    let src = sl(src_ptr, src_len).to_vec();
+    let main = String::from_utf8_lossy(sl(main_ptr, main_len)).into_owned();
+
+    let (mut files, _dirs) = match svm_fs::decode_image(image) {
+        Ok(x) => x,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    files.push((main.clone(), src));
+
+    match nimc::compile_nim(nifler, nimsem, hexer, files, &main) {
+        Ok(stdout) => {
+            set(STATUS_OK);
+            unsafe {
+                stash(&mut *core::ptr::addr_of_mut!(OUT), stdout.into_bytes());
+                stash(&mut *core::ptr::addr_of_mut!(ERR), Vec::new());
+                EXIT_CODE = 0;
+            }
+            0
+        }
+        Err(diag) => {
+            set(STATUS_TRAP);
+            unsafe {
+                stash(&mut *core::ptr::addr_of_mut!(OUT), Vec::new());
+                stash(&mut *core::ptr::addr_of_mut!(ERR), diag.into_bytes());
+                EXIT_CODE = 1;
+            }
+            0
+        }
+    }
 }
 
 /// **Self-host card — bytecode tier** (SELFHOST_C.md §7 step 5, the capstone). Run `chibicc.svmb` in

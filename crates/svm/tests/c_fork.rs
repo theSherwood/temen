@@ -3548,7 +3548,15 @@ int main(int argc, char **argv) {
     }
     __vm_fs(0, gp_fds[1], (long)&gpid, 8, 0); /* publish the grandchild's real pid to the parent */
     gst = wait_pid(gpid);                  /* PARKS — the parent's ^C must NOT touch this */
-    if (gst != 5) return 1;                /* a stray -EINTR here = the unscoped-sweep bug */
+    if (gst != 5) return 20000 + gst;      /* #936 diagnostic: encode the ACTUAL park result so a CI
+                                              hit is self-classifying instead of a bare `1`. gst is
+                                              the raw wait_pid value, so the parent reaps `20000+gst`:
+                                              gst == -4 (=> 19996) is the stray -EINTR the parent's
+                                              ^C must never cause — the genuine invariant-12
+                                              unscoped-sweep bug this test exists to catch; anything
+                                              else (grandchild died out-of-fuel/killed => a status
+                                              >= 20000, or another -errno => < 20000) is a DIFFERENT
+                                              mechanism, not a scoping leak. Decode: gst = ret-20000. */
     return 6;
   }
   st = wait_pid(pid);                      /* PARKS; the terminal ^C -> -EINTR, parent only */
@@ -3629,12 +3637,27 @@ fn a_ctrl_c_at_the_parent_never_sweeps_the_childs_wait_park() {
     terminal.join().unwrap();
     let r = r.expect("run");
 
+    // #936 — self-classifying failure. Expected 6 (parent's ^C EINTR'd only ITS wait; the child's
+    // park survived and reaped the grandchild's clean 5). The guest encodes any non-clean child
+    // park as `20000 + gst` (see WAIT_SCOPED_SRC), so a CI hit names its own mechanism instead of
+    // the historical bare `1`: got 19996 (= 20000 + -4) is a stray -EINTR swept into the CHILD's
+    // park — the genuine invariant-12 unscoped-sweep race this test guards (FORK.md); a value
+    // >= 20000 means the grandchild itself died (out-of-fuel/killed, a wait-encoded status), a
+    // DIFFERENT mechanism; codes 2/3 are the parent-side early-outs. Assertion stays `== 6`, so
+    // any deviation still reddens CI — the message just makes the next occurrence triageable.
+    let got = match r.as_slice() {
+        [Value::I64(v)] => *v,
+        other => panic!("#936 witness: expected a single I64 result, got {other:?}"),
+    };
     assert_eq!(
-        r,
-        vec![Value::I64(6)],
-        "the parent's ^C EINTR'd only ITS wait; the child's park survived (6 = the child \
-         reaped the grandchild's clean 5) — the domain-scoped sweep, witnessed across three \
-         generations"
+        got,
+        6,
+        "the parent's ^C EINTR'd only ITS wait; the child's park survived (6 = the child reaped \
+         the grandchild's clean 5) — the domain-scoped sweep, witnessed across three generations. \
+         Got {got}. If ~20000, the child's wait_pid(grandchild) returned gst = {} (ret-20000): \
+         gst == -4 is the stray -EINTR = the unscoped-sweep bug (#936); gst >= 0 means the \
+         grandchild died, a different mechanism. Codes 2/3 are parent-side early-outs.",
+        got - 20000
     );
 }
 

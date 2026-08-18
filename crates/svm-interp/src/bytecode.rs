@@ -1103,6 +1103,44 @@ fn take_spawn_budget(
     }))
 }
 
+/// The §14 carve **geometry** check (D19), the single definition every spawn/instantiate driver and
+/// tree-walk arm shares: a child window of `1 << size_log2` bytes at offset `off` fits inside the
+/// parent's `[0, isize)` iff the size is a valid power of two (`size_log2` in `0..64`), `off` is
+/// size-aligned, and the whole span lies within `isize`. Overflow-free (an out-of-range `size_log2`
+/// or a `off + size` past `u64` yields `false`, not a shift/overflow). A future bound tweak lives
+/// here, not in ten pasted copies (#911).
+///
+/// #964: the carve may also not dip into the holder window's reserved NULL region — `ibase + off`
+/// (the carve's window-relative base; `ibase` is the holder's own base) must clear `null_guard`
+/// (`0` = unguarded, trivially true). The host seeds/copies a carve outside the guarded call, and
+/// the reserved region is permanent by design, so a below-guard carve is refused, not admitted.
+pub(crate) fn carve_fits(
+    off: u64,
+    size_log2: i64,
+    isize: u64,
+    ibase: u64,
+    null_guard: u64,
+) -> bool {
+    let child_size = if (0..64).contains(&size_log2) {
+        1u64 << size_log2
+    } else {
+        0
+    };
+    child_size != 0
+        && child_size <= isize
+        && off & (child_size - 1) == 0
+        && off.checked_add(child_size).is_some_and(|e| e <= isize)
+        && ibase.checked_add(off).is_some_and(|b| b >= null_guard)
+}
+
+/// A §14 child module's **entry signature** must be `(i64) -> (i64)` (an instantiator handle) or
+/// `(i64, i64) -> (i64)` (also an address-space handle, so the child manages its own pages). The
+/// single definition the drivers and tree-walk arms share (#911).
+pub(crate) fn child_entry_ok(params: &[ValType], results: &[ValType]) -> bool {
+    results == [ValType::I64]
+        && (params == [ValType::I64] || params == [ValType::I64, ValType::I64])
+}
+
 pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
     compile_module_with(funcs, true)
 }
@@ -3405,22 +3443,23 @@ impl<'p> Vcpu<'p> {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
             return Ok(None);
         };
-        let ok_entry = cm.sigs.get(entry as usize).is_some_and(|(p, r)| {
-            r[..] == [ValType::I64]
-                && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
-        });
+        let ok_entry = cm
+            .sigs
+            .get(entry as usize)
+            .is_some_and(|(p, r)| child_entry_ok(p, r));
         let child_size = if (0..64).contains(&size_log2) {
             1u64 << size_log2
         } else {
             0
         };
         let off_u = off as u64;
-        let fits = child_size != 0
-            && child_size <= isize
-            && off_u & (child_size - 1) == 0
-            && off_u.checked_add(child_size).is_some_and(|e| e <= isize)
-            // #964: a carve may not dip into the reserved NULL region `[0, guard)`.
-            && self.mem.as_ref().is_none_or(|m| ibase + off_u >= m.null_guard);
+        let fits = carve_fits(
+            off_u,
+            size_log2,
+            isize,
+            ibase,
+            self.mem.as_ref().map_or(0, |m| m.null_guard),
+        );
         if !ok_entry || !fits {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
             return Ok(None);
@@ -3495,22 +3534,20 @@ impl<'p> Vcpu<'p> {
         let ok_entry = child_compiled
             .sigs
             .get(entry as usize)
-            .is_some_and(|(p, r)| {
-                r[..] == [ValType::I64]
-                    && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
-            });
+            .is_some_and(|(p, r)| child_entry_ok(p, r));
         let child_size = if (0..64).contains(&size_log2) {
             1u64 << size_log2
         } else {
             0
         };
         let off_u = off as u64;
-        let fits = child_size != 0
-            && child_size <= isize
-            && off_u & (child_size - 1) == 0
-            && off_u.checked_add(child_size).is_some_and(|e| e <= isize)
-            // #964: a carve may not dip into the reserved NULL region `[0, guard)`.
-            && self.mem.as_ref().is_none_or(|m| ibase + off_u >= m.null_guard);
+        let fits = carve_fits(
+            off_u,
+            size_log2,
+            isize,
+            ibase,
+            self.mem.as_ref().map_or(0, |m| m.null_guard),
+        );
         let mod_ok = cmem_log2 == Some(size_log2 as u8);
         if !ok_entry || !fits || !mod_ok {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
@@ -6117,6 +6154,138 @@ fn dbg_advance_task(
     }
 }
 
+/// Outcome of [`service_advance`]: `Ran` = a step this engine services (op / thread spawn·join /
+/// futex wait·notify / §14 instantiate) was dispatched and `turn` ticked; `Declined` = a coroutine
+/// or tier-up op this scheduled engine does not drive (`turn` left untouched, caller bails its own
+/// way).
+enum Serviced {
+    Ran,
+    Declined,
+}
+
+/// Advance task `ti` one step and service the scheduler seam it produced. This is the shared core of
+/// [`ScheduledDebugRun::drive`] and [`ScheduledDebugRun::tick`]: both dispatch the *same* set of
+/// [`Outcome`]s with the *same* rejections, so a new seam is added here **once** rather than in two
+/// places — a `tick` (the reverse-`seek` replay path) that silently declined what `drive` services
+/// would desync replay from live runs (DEBUGGING.md; INVARIANTS #9 observability corollary). `turn`
+/// is ticked for every serviced step, matching each engine's per-op clock; on `Declined` it is left
+/// untouched so each caller keeps its own bail (`drive` → `SchedStop::Declined` with no tick; `tick`
+/// → tick its clock and stop the replay).
+#[allow(clippy::too_many_arguments)]
+fn service_advance(
+    tasks: &mut Vec<DbgTask>,
+    ti: usize,
+    extra_envs: &mut Vec<DbgEnv>,
+    fibers: &mut Vec<FiberState>,
+    source: &ModuleSource,
+    table: &SharedSlots,
+    fuel: &mut u64,
+    mem: &mut Option<Mem>,
+    host: &mut Host,
+    clock: u64,
+    turn: &mut u64,
+) -> Serviced {
+    let step_res = dbg_advance_task(
+        tasks, ti, extra_envs, fibers, source, table, fuel, mem, host,
+    );
+    tasks[ti].at_bp = false;
+    match step_res {
+        // A fiber switch (or a plain op) — the vCPU advanced one op, stays runnable.
+        FiberStep::Stepped => *turn += 1,
+        FiberStep::Finished(vals) => {
+            *turn += 1;
+            dbg_complete(tasks, ti, Ok(vals));
+        }
+        FiberStep::Trapped(t) => {
+            *turn += 1;
+            dbg_complete(tasks, ti, Err(t));
+        }
+        // A scheduler seam: the ones this engine dispatches, else `Declined`.
+        FiberStep::Other(outcome) => match outcome {
+            Outcome::ThreadSpawn {
+                func,
+                sp,
+                arg,
+                dst,
+                module,
+            } => {
+                *turn += 1;
+                if let Err(t) = dbg_spawn(tasks, ti, func, sp, arg, dst, module, source) {
+                    dbg_complete(tasks, ti, Err(t));
+                }
+            }
+            Outcome::ThreadJoin { handle, dst } => {
+                *turn += 1;
+                dbg_join(tasks, ti, handle, dst);
+            }
+            Outcome::MemoryWait {
+                base,
+                expected,
+                width,
+                timeout,
+                dst,
+            } => {
+                *turn += 1;
+                dbg_wait(tasks, ti, mem, clock, base, expected, width, timeout, dst);
+            }
+            Outcome::MemoryNotify { base, count, dst } => {
+                *turn += 1;
+                dbg_notify(tasks, ti, base, count, dst);
+            }
+            // §14 `instantiate` (op 0): spawn a confined executor child as its own scheduled vCPU.
+            Outcome::Instantiate {
+                ibase,
+                isize: isz,
+                entry,
+                off,
+                size_log2,
+                quota,
+                dst,
+                grants,
+                budget,
+            } => {
+                *turn += 1;
+                // op 11 (named-grant spawn) / a §3d budget record is not driven by the debugger path.
+                if grants.is_some() || budget != 0 {
+                    dbg_complete(tasks, ti, Err(Trap::Malformed));
+                } else if let Err(t) = dbg_instantiate(
+                    tasks, ti, extra_envs, source, mem, *fuel, ibase, isz, entry, off, size_log2,
+                    quota, dst,
+                ) {
+                    dbg_complete(tasks, ti, Err(t));
+                }
+            }
+            // §14 `instantiate_module` (op 5): a confined child running a granted separate module.
+            Outcome::InstantiateModule {
+                ibase,
+                isize: isz,
+                mh,
+                entry,
+                off,
+                size_log2,
+                quota,
+                dst,
+                grants,
+                budget,
+            } => {
+                *turn += 1;
+                // op 13 (named-grant spawn) / a §3d budget record is not driven by the debugger path.
+                if grants.is_some() || budget != 0 {
+                    dbg_complete(tasks, ti, Err(Trap::Malformed));
+                } else if let Err(t) = dbg_instantiate_module(
+                    tasks, ti, extra_envs, source, mem, *fuel, host, mh, ibase, isz, entry, off,
+                    size_log2, quota, dst,
+                ) {
+                    dbg_complete(tasks, ti, Err(t));
+                }
+            }
+            // coroutine / tier-up — outside this engine's slice.
+            _ => return Serviced::Declined,
+        },
+    }
+    Serviced::Ran
+}
+
 /// §14 `instantiate` (op 0) under the debug scheduler: build a **confined executor child** as a new
 /// scheduled vCPU with its own [`DbgEnv`] (window / attenuated powerbox / quota), registered as a
 /// child handle of `ti` (so `Instantiator.join` → `ThreadJoin` joins it). The debug-engine counterpart
@@ -6143,22 +6312,20 @@ fn dbg_instantiate(
     // -> (i64)`; the latter also gets an `AddressSpace` grant so it manages its own pages.
     let sig = c0.sigs.get(entry as u64 as usize);
     let want_as = sig.is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
-    let ok_entry = sig.is_some_and(|(p, r)| {
-        r[..] == [ValType::I64]
-            && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
-    });
+    let ok_entry = sig.is_some_and(|(p, r)| child_entry_ok(p, r));
     let child_size = if (0..64).contains(&size_log2) {
         1u64 << size_log2
     } else {
         0
     };
     let off_u = off as u64;
-    let fits = child_size != 0
-        && child_size <= isz
-        && off_u & (child_size - 1) == 0
-        && off_u.checked_add(child_size).is_some_and(|e| e <= isz)
-        // #964: a carve may not dip into the reserved NULL region `[0, guard)`.
-        && shared_mem.as_ref().is_none_or(|m| ibase + off_u >= m.null_guard);
+    let fits = carve_fits(
+        off_u,
+        size_log2,
+        isz,
+        ibase,
+        shared_mem.as_ref().map_or(0, |m| m.null_guard),
+    );
     if !ok_entry || !fits {
         tasks[ti]
             .vt
@@ -6272,22 +6439,20 @@ fn dbg_instantiate_module(
     // declared memory (§14 transparency — it runs exactly as it would standalone).
     let sig = child_compiled.sigs.get(entry as u64 as usize);
     let want_as = sig.is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
-    let ok_entry = sig.is_some_and(|(p, r)| {
-        r[..] == [ValType::I64]
-            && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
-    });
+    let ok_entry = sig.is_some_and(|(p, r)| child_entry_ok(p, r));
     let child_size = if (0..64).contains(&size_log2) {
         1u64 << size_log2
     } else {
         0
     };
     let off_u = off as u64;
-    let fits = child_size != 0
-        && child_size <= isz
-        && off_u & (child_size - 1) == 0
-        && off_u.checked_add(child_size).is_some_and(|e| e <= isz)
-        // #964: a carve may not dip into the reserved NULL region `[0, guard)`.
-        && shared_mem.as_ref().is_none_or(|m| ibase + off_u >= m.null_guard);
+    let fits = carve_fits(
+        off_u,
+        size_log2,
+        isz,
+        ibase,
+        shared_mem.as_ref().map_or(0, |m| m.null_guard),
+    );
     let mod_ok = cmem_log2 == Some(size_log2 as u8);
     if !ok_entry || !fits || !mod_ok {
         tasks[ti]
@@ -7033,105 +7198,11 @@ impl ScheduledDebugRun {
                     task: ti,
                 });
             }
-            let step_res = dbg_advance_task(
-                tasks, ti, extra_envs, fibers, source, table, fuel, mem, host,
-            );
-            tasks[ti].at_bp = false;
-            match step_res {
-                // A fiber switch (or a plain op) — the vCPU advanced one op, stays runnable.
-                FiberStep::Stepped => *turn += 1,
-                FiberStep::Finished(vals) => {
-                    *turn += 1;
-                    dbg_complete(tasks, ti, Ok(vals));
-                }
-                FiberStep::Trapped(t) => {
-                    *turn += 1;
-                    dbg_complete(tasks, ti, Err(t));
-                }
-                // A scheduler seam: the ones this engine dispatches, else `Declined`.
-                FiberStep::Other(outcome) => match outcome {
-                    Outcome::ThreadSpawn {
-                        func,
-                        sp,
-                        arg,
-                        dst,
-                        module,
-                    } => {
-                        *turn += 1;
-                        if let Err(t) = dbg_spawn(tasks, ti, func, sp, arg, dst, module, source) {
-                            dbg_complete(tasks, ti, Err(t));
-                        }
-                    }
-                    Outcome::ThreadJoin { handle, dst } => {
-                        *turn += 1;
-                        dbg_join(tasks, ti, handle, dst);
-                    }
-                    Outcome::MemoryWait {
-                        base,
-                        expected,
-                        width,
-                        timeout,
-                        dst,
-                    } => {
-                        *turn += 1;
-                        dbg_wait(tasks, ti, mem, *clock, base, expected, width, timeout, dst);
-                    }
-                    Outcome::MemoryNotify { base, count, dst } => {
-                        *turn += 1;
-                        dbg_notify(tasks, ti, base, count, dst);
-                    }
-                    // §14 `instantiate` (op 0): spawn a confined executor child as its own scheduled vCPU.
-                    Outcome::Instantiate {
-                        ibase,
-                        isize: isz,
-                        entry,
-                        off,
-                        size_log2,
-                        quota,
-                        dst,
-                        grants,
-                        budget,
-                    } => {
-                        *turn += 1;
-                        // op 11 (named-grant spawn) / a §3d budget record is not driven by the
-                        // debugger path.
-                        if grants.is_some() || budget != 0 {
-                            dbg_complete(tasks, ti, Err(Trap::Malformed));
-                        } else if let Err(t) = dbg_instantiate(
-                            tasks, ti, extra_envs, source, mem, *fuel, ibase, isz, entry, off,
-                            size_log2, quota, dst,
-                        ) {
-                            dbg_complete(tasks, ti, Err(t));
-                        }
-                    }
-                    // §14 `instantiate_module` (op 5): a confined child running a granted separate module.
-                    Outcome::InstantiateModule {
-                        ibase,
-                        isize: isz,
-                        mh,
-                        entry,
-                        off,
-                        size_log2,
-                        quota,
-                        dst,
-                        grants,
-                        budget,
-                    } => {
-                        *turn += 1;
-                        // op 13 (named-grant spawn) / a §3d budget record is not driven by the
-                        // debugger path.
-                        if grants.is_some() || budget != 0 {
-                            dbg_complete(tasks, ti, Err(Trap::Malformed));
-                        } else if let Err(t) = dbg_instantiate_module(
-                            tasks, ti, extra_envs, source, mem, *fuel, host, mh, ibase, isz, entry,
-                            off, size_log2, quota, dst,
-                        ) {
-                            dbg_complete(tasks, ti, Err(t));
-                        }
-                    }
-                    // coroutine / tier-up — outside this slice.
-                    _ => return SchedStop::Declined,
-                },
+            if let Serviced::Declined = service_advance(
+                tasks, ti, extra_envs, fibers, source, table, fuel, mem, host, *clock, turn,
+            ) {
+                // A coroutine / tier-up op this engine does not drive — bail, `turn` untouched.
+                return SchedStop::Declined;
             }
             // Slice 6: derive the park/wake/spawn edges this advance caused (see `trace_diff`).
             if let (Some(trace), Some(before)) = (sched_trace.as_mut(), pre_adv.as_ref()) {
@@ -7265,89 +7336,13 @@ impl ScheduledDebugRun {
                 task: ti,
             });
         }
-        let step_res = dbg_advance_task(
-            tasks, ti, extra_envs, fibers, source, table, fuel, mem, host,
-        );
-        tasks[ti].at_bp = false;
-        *turn += 1;
-        match step_res {
-            FiberStep::Stepped => {}
-            FiberStep::Finished(vals) => dbg_complete(tasks, ti, Ok(vals)),
-            FiberStep::Trapped(t) => dbg_complete(tasks, ti, Err(t)),
-            FiberStep::Other(outcome) => match outcome {
-                Outcome::ThreadSpawn {
-                    func,
-                    sp,
-                    arg,
-                    dst,
-                    module,
-                } => {
-                    if let Err(t) = dbg_spawn(tasks, ti, func, sp, arg, dst, module, source) {
-                        dbg_complete(tasks, ti, Err(t));
-                    }
-                }
-                Outcome::ThreadJoin { handle, dst } => dbg_join(tasks, ti, handle, dst),
-                Outcome::MemoryWait {
-                    base,
-                    expected,
-                    width,
-                    timeout,
-                    dst,
-                } => dbg_wait(tasks, ti, mem, *clock, base, expected, width, timeout, dst),
-                Outcome::MemoryNotify { base, count, dst } => {
-                    dbg_notify(tasks, ti, base, count, dst)
-                }
-                // §14 `instantiate` (op 0): build the confined child — mirrors the `drive` arm so a
-                // reverse-`seek` replay reconstructs the env/task set identically.
-                Outcome::Instantiate {
-                    ibase,
-                    isize: isz,
-                    entry,
-                    off,
-                    size_log2,
-                    quota,
-                    dst,
-                    grants,
-                    budget,
-                } => {
-                    // op 11 (named-grant spawn) / a §3d budget record is not driven by the debugger
-                    // replay path.
-                    if grants.is_some() || budget != 0 {
-                        dbg_complete(tasks, ti, Err(Trap::Malformed));
-                    } else if let Err(t) = dbg_instantiate(
-                        tasks, ti, extra_envs, source, mem, *fuel, ibase, isz, entry, off,
-                        size_log2, quota, dst,
-                    ) {
-                        dbg_complete(tasks, ti, Err(t));
-                    }
-                }
-                // §14 `instantiate_module` (op 5): mirrors the `drive` arm so replay rebuilds the pushed
-                // module + env/task set identically.
-                Outcome::InstantiateModule {
-                    ibase,
-                    isize: isz,
-                    mh,
-                    entry,
-                    off,
-                    size_log2,
-                    quota,
-                    dst,
-                    grants,
-                    budget,
-                } => {
-                    // op 13 (named-grant spawn) / a §3d budget record is not driven by the debugger
-                    // replay path.
-                    if grants.is_some() || budget != 0 {
-                        dbg_complete(tasks, ti, Err(Trap::Malformed));
-                    } else if let Err(t) = dbg_instantiate_module(
-                        tasks, ti, extra_envs, source, mem, *fuel, host, mh, ibase, isz, entry,
-                        off, size_log2, quota, dst,
-                    ) {
-                        dbg_complete(tasks, ti, Err(t));
-                    }
-                }
-                _ => return false, // an unsupported op — stop the replay here
-            },
+        if let Serviced::Declined = service_advance(
+            tasks, ti, extra_envs, fibers, source, table, fuel, mem, host, *clock, turn,
+        ) {
+            // An unsupported op — tick this engine's clock (as it did unconditionally before) and
+            // stop the replay here.
+            *turn += 1;
+            return false;
         }
         // Slice 6: the park/wake/spawn edges this replayed op caused (identical to `drive`'s,
         // so a `tick`-replay refills the tape deterministically).
@@ -10126,10 +10121,10 @@ impl CoopSched {
                         .sigs
                         .get(entry as usize)
                         .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
-                    let ok_entry = c0.sigs.get(entry as usize).is_some_and(|(p, r)| {
-                        r[..] == [ValType::I64]
-                            && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
-                    });
+                    let ok_entry = c0
+                        .sigs
+                        .get(entry as usize)
+                        .is_some_and(|(p, r)| child_entry_ok(p, r));
                     // The carve must be a power-of-two-aligned sub-window within `[0, isize)` — a child
                     // gets only what the holder sub-allocates (§14/D19).
                     let child_size = if (0..64).contains(&size_log2) {
@@ -10138,12 +10133,13 @@ impl CoopSched {
                         0
                     };
                     let off_u = off as u64;
-                    let fits = child_size != 0
-                        && child_size <= isz
-                        && off_u & (child_size - 1) == 0
-                        && off_u.checked_add(child_size).is_some_and(|e| e <= isz)
-                        // #964: a carve may not dip into the reserved NULL region `[0, guard)`.
-                        && mem.as_ref().is_none_or(|m| ibase + off_u >= m.null_guard);
+                    let fits = carve_fits(
+                        off_u,
+                        size_log2,
+                        isz,
+                        ibase,
+                        mem.as_ref().map_or(0, |m| m.null_guard),
+                    );
                     if !ok_entry || !fits {
                         tasks[ti]
                             .vt
@@ -10339,23 +10335,20 @@ impl CoopSched {
                     let ok_entry = child_compiled
                         .sigs
                         .get(entry as usize)
-                        .is_some_and(|(p, r)| {
-                            r[..] == [ValType::I64]
-                                && (p[..] == [ValType::I64]
-                                    || p[..] == [ValType::I64, ValType::I64])
-                        });
+                        .is_some_and(|(p, r)| child_entry_ok(p, r));
                     let child_size = if (0..64).contains(&size_log2) {
                         1u64 << size_log2
                     } else {
                         0
                     };
                     let off_u = off as u64;
-                    let fits = child_size != 0
-                        && child_size <= isz
-                        && off_u & (child_size - 1) == 0
-                        && off_u.checked_add(child_size).is_some_and(|e| e <= isz)
-                        // #964: a carve may not dip into the reserved NULL region `[0, guard)`.
-                        && mem.as_ref().is_none_or(|m| ibase + off_u >= m.null_guard);
+                    let fits = carve_fits(
+                        off_u,
+                        size_log2,
+                        isz,
+                        ibase,
+                        mem.as_ref().map_or(0, |m| m.null_guard),
+                    );
                     let mod_ok = cmem_log2 == Some(size_log2 as u8);
                     if !ok_entry || !fits || !mod_ok {
                         tasks[ti]
@@ -11740,22 +11733,23 @@ fn run_vcpu_parallel<'scope, 'env>(
                     .sigs
                     .get(entry as usize)
                     .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
-                let ok_entry = c0.sigs.get(entry as usize).is_some_and(|(p, r)| {
-                    r[..] == [ValType::I64]
-                        && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
-                });
+                let ok_entry = c0
+                    .sigs
+                    .get(entry as usize)
+                    .is_some_and(|(p, r)| child_entry_ok(p, r));
                 let child_size = if (0..64).contains(&size_log2) {
                     1u64 << size_log2
                 } else {
                     0
                 };
                 let off_u = off as u64;
-                let fits = child_size != 0
-                    && child_size <= isz
-                    && off_u & (child_size - 1) == 0
-                    && off_u.checked_add(child_size).is_some_and(|e| e <= isz)
-                    // #964: a carve may not dip into the reserved NULL region `[0, guard)`.
-                    && mem.as_ref().is_none_or(|m| ibase + off_u >= m.null_guard);
+                let fits = carve_fits(
+                    off_u,
+                    size_log2,
+                    isz,
+                    ibase,
+                    mem.as_ref().map_or(0, |m| m.null_guard),
+                );
                 if !ok_entry || !fits {
                     vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
                     continue;
@@ -11871,22 +11865,20 @@ fn run_vcpu_parallel<'scope, 'env>(
                 let ok_entry = child_compiled
                     .sigs
                     .get(entry as usize)
-                    .is_some_and(|(p, r)| {
-                        r[..] == [ValType::I64]
-                            && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
-                    });
+                    .is_some_and(|(p, r)| child_entry_ok(p, r));
                 let child_size = if (0..64).contains(&size_log2) {
                     1u64 << size_log2
                 } else {
                     0
                 };
                 let off_u = off as u64;
-                let fits = child_size != 0
-                    && child_size <= isz
-                    && off_u & (child_size - 1) == 0
-                    && off_u.checked_add(child_size).is_some_and(|e| e <= isz)
-                    // #964: a carve may not dip into the reserved NULL region `[0, guard)`.
-                    && mem.as_ref().is_none_or(|m| ibase + off_u >= m.null_guard);
+                let fits = carve_fits(
+                    off_u,
+                    size_log2,
+                    isz,
+                    ibase,
+                    mem.as_ref().map_or(0, |m| m.null_guard),
+                );
                 let mod_ok = cmem_log2 == Some(size_log2 as u8);
                 if !ok_entry || !fits || !mod_ok {
                     vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));

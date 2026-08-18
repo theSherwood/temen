@@ -51,6 +51,23 @@ Programs that pull in *stdlib* modules additionally depend on that module transl
 `nimsem` is built with **`-d:skipPostSemValidator`** (as nimony's own Windows CI does); the in-process
 post-sem IR validator has a separate on-ramp issue, tracked apart from the sema this proves correct.
 
+## No native bootstrap (`nim_selfdrive`) — the in-browser card's core (#958)
+
+`nim_e2e_chain` leans on a native `nimony c` to lay out the `nimcache` (the `.p.nif` parse outputs, the
+module stems, and the `.build.nif` plan). **The browser has no native nimony**, so
+`examples/nim_selfdrive.rs` plays **nifmake itself** — given only the Nim source + the stdlib it:
+
+1. computes each module's cache **stem** exactly as nimony does — `gear2/modnames.moduleSuffix`:
+   `name[0..3]` + base36 of `lib/tinyhashes.uhash(shortest-relative-path)` (reproduced in Rust,
+   byte-for-byte: `prog.nim`→`proucs6t71`, `std/syncio.nim`→`syn1lfpjv`, system→`sysvq0asl`);
+2. crawls the `import` graph by parsing each module with `nifler.svmb` and reading its `.p.deps.nif`
+   (skipping platform-`when`-guarded imports, as native does for a non-Windows target);
+3. dependency-orders the closure, runs `nimsem.svmb` + `hexer.svmb` over it, and links + runs.
+
+Nothing native is in the loop but the guest `.svmb` build. This is the **exact logic the browser cdylib
+will run** for #958 — proven here headless (`build_e2e_chain.sh` step 3 runs the same fixtures with no
+bootstrap: `addTwo`→5, `useit`→13, `iohello`→`hello, svm\n`).
+
 ## Run it
 
 ```sh

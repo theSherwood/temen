@@ -119,6 +119,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with: { toolchain: "${{ env.RUST_STABLE }}" }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # #856 — `setup-nim` resolves `version: devel` to the nim-lang/nightlies `latest-devel` release,
+      # which is transiently ABSENT for a short window while the nightly is being re-cut. The observed
+      # flake was exactly that: "Could not find any release named 'latest-devel'", failing in ~188 ms
+      # before any repo code ran. That window is upstream timing, not a repo failure — so wait for the
+      # release to reappear before invoking setup-nim instead of reddening the run on it. Bounded
+      # (~5 min of backoff): a genuine upstream outage still fails the job well inside the 45-min budget.
+      - name: Wait for the Nim devel nightly to be published (#856)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          api='https://api.github.com/repos/nim-lang/nightlies/releases/tags/latest-devel'
+          for attempt in 1 2 3 4 5 6; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -H 'Accept: application/vnd.github+json' \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "$api" || echo 000)
+            if [ "$code" = 200 ]; then
+              echo "nim-lang/nightlies latest-devel is published (HTTP 200, attempt ${attempt})."
+              exit 0
+            fi
+            echo "Attempt ${attempt}: latest-devel not resolvable yet (HTTP ${code}); backing off..."
+            [ "$attempt" = 6 ] || sleep "$((attempt * 20))"
+          done
+          echo "::error::nim-lang/nightlies latest-devel still missing after 6 attempts — likely a genuine upstream outage, not the usual re-cut window (#856)."
+          exit 1
       - name: Setup Nim (devel)
         uses: alaviss/setup-nim@0.1.1 # owner: pin by SHA on copy-over
         with:
@@ -136,6 +162,8 @@ jobs:
         run: scripts/ci/provision-nimony.sh "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
       - name: Nim end-to-end tests (both engines)
         run: cargo test -p svm-leng --test nim_e2e -- --nocapture
+      - name: Nim language conformance matrix (#956)
+        run: cargo test -p svm-leng --test nim_conformance -- --nocapture
 
   # The CI token can't push `.github/workflows/` (needs the `workflow` OAuth scope), so agent-authored
   # workflow changes are staged in `.github/workflows_src/` and the owner copies them over
