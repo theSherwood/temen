@@ -2,8 +2,11 @@
 //! matrix that measures the *envelope* of Nim language features which compile-and-run on the SVM —
 //! generics, exceptions, closures, methods (dynamic dispatch), `seq`/`string`/`Table`, floats,
 //! iterators, `case`/variant objects, `ref` + ARC destructors — each driven through the **whole real
-//! toolchain** (`nimony c` → nifler → nimony → hexer emit Leng, `svm-leng` lowers + links with the W3
-//! compute shim) and **run on both engines** (§9 interp/JIT parity), reducing to an `int` we check.
+//! toolchain** (`nimony c` → nifler → nimony → hexer emit Leng, `svm-leng` lowers + links) and **run
+//! on both engines** (§9 interp/JIT parity). A **compute** fixture links with the W3 compute shim and
+//! reads back an `int` global; an **I/O** fixture (a feature whose real stdlib pulls in the syscall
+//! bottom edge — `Table` → `panic` → `syncio`) links through the nim→powerbox manifest bridge and
+//! checks captured stdout under the POSIX personality.
 //!
 //! Unlike the exact-value tests in `nim_e2e.rs`, this suite tolerates *known* fail-closed features: each
 //! fixture carries an [`Expect`], and the test asserts the **measured** status matches it. A feature that
@@ -277,10 +280,17 @@ enum Expect {
 struct Fixture {
     /// The language feature this exercises (the matrix row label).
     feature: &'static str,
-    /// Nim source; must end with a top-level `let r = <int expr>` — we read `r.0.` back.
+    /// Nim source. A **compute** fixture (`io: None`) ends with a top-level `let r = <int expr>` — we
+    /// read `r.0.` back. An **I/O** fixture (`io: Some(_)`) `write`s to stdout — it links through the
+    /// nim→powerbox manifest bridge and runs `_start` under the POSIX personality on both engines, and
+    /// we check the captured stdout (for features whose real stdlib pulls in the I/O bottom edge, e.g.
+    /// `panic` → `syncio`, which the pure-compute shim can't bind — #993).
     source: &'static str,
-    /// The `int` value a *working* run must produce (checked only when it Runs).
+    /// The `int` value a working **compute** run must produce (checked only when it Runs; ignored for
+    /// an `io` fixture).
     expected: i64,
+    /// `Some(substr)` marks an **I/O** fixture whose captured stdout must contain `substr`.
+    io: Option<&'static str>,
     /// The committed baseline: does it run today, or fail closed (and at which stage)?
     expect: Expect,
     /// The sub-issue tracking a fail-closed feature (for the printed matrix); `None` when it Runs.
@@ -293,6 +303,10 @@ fn measure(path: &str, f: &Fixture) -> (Status, Option<i64>) {
         Ok(m) => m,
         Err(s) => return (Status::Fails(s), None),
     };
+    // An **I/O** fixture links through the nim→powerbox manifest bridge and checks captured stdout.
+    if let Some(want) = f.io {
+        return (measure_io(&mods, want), None);
+    }
     let m = match link_with_runtime(&mods) {
         Ok(m) => m,
         Err(s) => return (Status::Fails(s), None),
@@ -302,6 +316,104 @@ fn measure(path: &str, f: &Fixture) -> (Status, Option<i64>) {
         Ok(v) => (Status::Fails(Stage::Run), Some(v)), // ran, wrong value
         Err(s) => (Status::Fails(s), None),
     }
+}
+
+/// Measure an **I/O** fixture: manifest-link the modules (retaining the raw-syscall leaves as
+/// host-bound imports rather than fail-closing the compute link on them — `panic` → `syncio`'s
+/// `sysWrite`), run the powerbox `_start` on **both engines** under the POSIX personality, and require
+/// the two captured streams to agree (§9 parity) and to contain `want`. This is how a stdlib feature
+/// whose real code pulls in the I/O bottom edge (e.g. `Table`, via `panic`) is exercised — the compute
+/// shim can't bind those leaves (#993). Reuses `nim_e2e.rs`'s proven manifest+POSIX harness.
+fn measure_io(mods: &[(String, String)], want: &str) -> Status {
+    let linked = std::panic::catch_unwind(AssertUnwindSafe(|| io_link(mods)));
+    let m = match linked {
+        Ok(Ok(m)) => m,
+        Ok(Err(s)) => return Status::Fails(s),
+        Err(_) => return Status::Fails(Stage::Translate),
+    };
+    if svm_verify::verify_module(&m).is_err() || !svm_run::is_named_powerbox_entry(&m) {
+        return Status::Fails(Stage::Verify);
+    }
+    let interp =
+        std::panic::catch_unwind(AssertUnwindSafe(|| io_run(&m, svm_run::Backend::TreeWalk)));
+    let jit = std::panic::catch_unwind(AssertUnwindSafe(|| io_run(&m, svm_run::Backend::Jit)));
+    match (interp, jit) {
+        (Ok(Some(i)), Ok(Some(j))) if i == j && String::from_utf8_lossy(&i).contains(want) => {
+            Status::Runs
+        }
+        (Ok(Some(_)), Ok(Some(_))) => Status::Fails(Stage::Run), // ran, wrong/mismatched stdout
+        _ => Status::Fails(Stage::Run),
+    }
+}
+
+/// Manifest-link the modules with the compute shim bound to the pure-compute bottom edge, but via the
+/// **powerbox manifest** link so the raw-syscall leaves survive as host-bindable imports. `Err(stage)`
+/// on a translate/link failure. (Mirrors `nim_e2e.rs::run_io_program`'s link half.)
+fn io_link(mods: &[(String, String)]) -> Result<Module, Stage> {
+    let mut import_names: Vec<String> = Vec::new();
+    for (stem, src) in mods.iter().filter(|(stem, _)| stem.starts_with("sysv")) {
+        let obj = svm_leng::compile_whole_object(&svm_leng::WholeModule { stem, src })
+            .map_err(|_| Stage::Translate)?;
+        let obj = svm_encode::decode_unit(&obj).map_err(|_| Stage::Translate)?;
+        for imp in &obj.imports {
+            if import_names.iter().all(|n| n != &imp.name) {
+                import_names.push(imp.name.clone());
+            }
+        }
+    }
+    const SHIM: &str = include_str!("../src/powerbox_compute_shim.svm.txt");
+    let shim = svm_text::parse_module(SHIM).expect("runtime shim parses");
+    let exports: Vec<(String, u32)> = import_names
+        .iter()
+        .filter_map(|n| shim_index(n).map(|i| (n.clone(), i)))
+        .collect();
+    let runtime = LinkUnit {
+        module: shim,
+        exports,
+        ..Default::default()
+    };
+    let mut ordered: Vec<&(String, String)> = mods.iter().collect();
+    ordered.sort_by_key(|(stem, _)| stem.starts_with("sysv"));
+    let units: Vec<svm_leng::WholeModule> = ordered
+        .iter()
+        .map(|(stem, src)| svm_leng::WholeModule { stem, src })
+        .collect();
+    svm_leng::link_whole_powerbox_manifest(&units, vec![runtime]).map_err(|_| Stage::Translate)
+}
+
+/// Map a retained nimony syscall import to its POSIX-personality op (mirrors `nim_e2e.rs`).
+fn nim_posix_op(name: &str) -> u32 {
+    if name.starts_with("sysWrite") {
+        svm_posix::OP_WRITE
+    } else if name.starts_with("sysRead") {
+        svm_posix::OP_READ
+    } else if name.starts_with("sysOpen") {
+        svm_posix::OP_OPEN
+    } else if name.starts_with("sysClose") {
+        svm_posix::OP_CLOSE
+    } else if name.starts_with("sysLseek") {
+        svm_posix::OP_LSEEK
+    } else {
+        svm_posix::OP_WRITE // any other retained leaf (e.g. sysAssert) — a no-op-ish write sink
+    }
+}
+
+/// Run the manifest module's powerbox `_start` on `backend` with every retained syscall import bound to
+/// a shared POSIX personality; return the guest's stdout (`None` on a trap/instantiate failure).
+fn io_run(m: &Module, backend: svm_run::Backend) -> Option<Vec<u8>> {
+    let (posix, make) = svm_posix::cap(0, 0, Vec::new());
+    let make = std::sync::Arc::new(make);
+    let mut imports = svm_run::Imports::new();
+    for imp in &m.imports {
+        let make = std::sync::Arc::clone(&make);
+        imports = imports.provide(
+            imp.name.clone(),
+            svm_run::HostCap::host_proc(nim_posix_op(&imp.name), move || (*make)()),
+        );
+    }
+    let inst = svm_run::instantiate_with_imports(m.clone(), imports).ok()?;
+    inst.run(backend, &svm_run::RunConfig::default()).ok()?;
+    Some(posix.stdout())
 }
 
 /// The feature envelope (#956). Each fixture reduces its feature to an `int` global `r` so the same
@@ -314,6 +426,7 @@ const FIXTURES: &[Fixture] = &[
         feature: "arithmetic (in a proc)",
         source: "proc calc(a, b: int): int = a * b + 6\nlet r = calc(6, 6)\n",
         expected: 42,
+        io: None,
         expect: Expect::Runs,
         ticket: None,
     },
@@ -321,6 +434,7 @@ const FIXTURES: &[Fixture] = &[
         feature: "control-flow (while/if)",
         source: "proc sumTo(n: int): int =\n  result = 0\n  var i = 1\n  while i <= n:\n    result = result + i\n    i = i + 1\nlet r = sumTo(8) + 6\n",
         expected: 42,
+        io: None,
         expect: Expect::Runs,
         ticket: None,
     },
@@ -328,6 +442,7 @@ const FIXTURES: &[Fixture] = &[
         feature: "seq[int] (alloc/add/index)",
         source: "proc build(n: int): int =\n  var s: seq[int] = @[]\n  var i = 0\n  while i < n:\n    s.add(i * i)\n    i = i + 1\n  result = 0\n  for x in s:\n    result = result + x\nlet r = build(5) + 12\n",
         expected: 42,
+        io: None,
         expect: Expect::Runs,
         ticket: None,
     },
@@ -336,6 +451,7 @@ const FIXTURES: &[Fixture] = &[
         feature: "generics",
         source: "proc pick[T](a, b: T): T = a\nlet r = pick(42, 7)\n",
         expected: 42,
+        io: None,
         expect: Expect::Runs,
         ticket: None,
     },
@@ -350,6 +466,7 @@ const FIXTURES: &[Fixture] = &[
         // raise returns a `(ErrorCode, value)` tuple; the caller branches on the code and `jmp`s to the
         // handler — all plain constructs svm-leng handles. The earlier "front-end gap" was the fixture
         // using standard-Nim `newException`/object exceptions, which isn't nimony's model.
+        io: None,
         expect: Expect::Runs,
         ticket: None,
     },
@@ -357,6 +474,7 @@ const FIXTURES: &[Fixture] = &[
         feature: "closures (capture upvalue)",
         source: "proc outer(): int =\n  var n = 40\n  proc inner(): int {.closure.} = n + 2\n  inner()\nlet r = outer()\n",
         expected: 42,
+        io: None,
         expect: Expect::Runs,
         ticket: None,
     },
@@ -366,6 +484,7 @@ const FIXTURES: &[Fixture] = &[
         expected: 42,
         // Fixed in #979: the `Rtti` vtable's `mt` method table is now materialized (funcref relocs),
         // so dynamic dispatch reaches the derived override (`Dog.speak` → 42), both engines agreeing.
+        io: None,
         expect: Expect::Runs,
         ticket: None,
     },
@@ -373,26 +492,27 @@ const FIXTURES: &[Fixture] = &[
         feature: "string (.len)",
         source: "let s = \"hello, world!\"\nlet r = s.len * 3 + 3\n",
         expected: 42,
+        io: None,
         expect: Expect::Runs,
         ticket: None,
     },
     Fixture {
-        // `std/tables` `initTable`/`[]`/`[]=` are `.raises`, so they must be called inside a
-        // `try`/`except ErrorCode` (nimony's error-flag model). Compiles (#980) and now **translates**
-        // (oconstr in expression position landed, #990), but fails to **link** in this compute-shim
-        // harness: `tables` calls `panic` → `syncio`'s `sysWrite`, a syscall leaf the compute shim
-        // doesn't bind (the powerbox/browser link does). Tracked in #993. (Harness buckets the link
-        // error as `Translate`.)
+        // `std/tables` `initTable`/`[]`/`[]=` are `.raises`, so they run inside a `try`/`except
+        // ErrorCode` (nimony's error-flag model). `tables` also pulls in `panic` → `syncio`'s
+        // `sysWrite`, a syscall leaf the *compute* shim can't bind — so this is an **I/O fixture**: it
+        // links through the powerbox manifest bridge and `write`s a marker, checked on stdout (#993).
         feature: "Table[string,int]",
-        source: "import std/tables\nproc run(): int =\n  try:\n    var t = initTable[string, int]()\n    t[\"a\"] = 42\n    result = t[\"a\"]\n  except ErrorCode:\n    result = -1\nlet r = run()\n",
+        source: "import std/tables\nimport std/syncio\nproc run(): int =\n  try:\n    var t = initTable[string, int]()\n    t[\"a\"] = 42\n    result = t[\"a\"]\n  except ErrorCode:\n    result = -1\nif run() == 42:\n  write(stdout, \"table-ok\\n\")\n",
         expected: 42,
-        expect: Expect::FailsClosed(Stage::Translate),
-        ticket: Some("#993 (sysWrite unbound in the compute-shim link)"),
+        io: Some("table-ok"),
+        expect: Expect::Runs,
+        ticket: None,
     },
     Fixture {
         feature: "floats (arith + int conv)",
         source: "let x = 3.5\nlet r = int(x * 12.0)\n",
         expected: 42,
+        io: None,
         expect: Expect::Runs,
         ticket: None,
     },
@@ -400,6 +520,7 @@ const FIXTURES: &[Fixture] = &[
         feature: "custom iterators (yield)",
         source: "iterator countUp(n: int): int =\n  var i = 0\n  while i < n:\n    yield i\n    inc i\nproc run(): int =\n  result = 6\n  for x in countUp(9):\n    result = result + x\nlet r = run()\n",
         expected: 42,
+        io: None,
         expect: Expect::Runs,
         ticket: None,
     },
@@ -407,6 +528,7 @@ const FIXTURES: &[Fixture] = &[
         feature: "variant objects (case)",
         source: "type\n  Kind = enum kA, kB\n  Node = object\n    case kind: Kind\n    of kA: a: int\n    of kB: b: int\nproc val(n: Node): int =\n  case n.kind\n  of kA: n.a\n  of kB: n.b\nlet r = val(Node(kind: kA, a: 42))\n",
         expected: 42,
+        io: None,
         expect: Expect::Runs,
         ticket: None,
     },
@@ -414,6 +536,7 @@ const FIXTURES: &[Fixture] = &[
         feature: "ref object",
         source: "type Box = ref object\n  v: int\nproc run(): int =\n  var b = Box(v: 42)\n  b.v\nlet r = run()\n",
         expected: 42,
+        io: None,
         expect: Expect::Runs,
         ticket: None,
     },
@@ -421,6 +544,7 @@ const FIXTURES: &[Fixture] = &[
         feature: "object + ARC destructor",
         source: "var freed {.global.}: int = 0\ntype Res = object\n  id: int\nproc `=destroy`(x: Res) =\n  freed = freed + x.id\nproc run() =\n  var x = Res(id: 42)\n  discard x\nrun()\nlet r = freed\n",
         expected: 42,
+        io: None,
         expect: Expect::Runs,
         ticket: None,
     },
@@ -432,6 +556,7 @@ const FIXTURES: &[Fixture] = &[
         feature: "const-arith gvar initializer",
         source: "let r = 2 * 3 + 36\n",
         expected: 42,
+        io: None,
         expect: Expect::FailsClosed(Stage::Translate),
         ticket: Some("#760 (svm-leng totality)"),
     },
