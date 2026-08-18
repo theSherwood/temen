@@ -51,8 +51,8 @@ use svm_ir::{
 
 use super::{
     bin32, bin64, cast, cmp32, cmp64, fbin32, fbin64, fcmp32, fcmp64, fto_i, fun32, fun64, i_to_f,
-    intun32, intun64, slot_to_val, step, trunc_trap, val_to_slot, GuestMem, Host, Mem, Reg, Trap,
-    Value, VarValue, DEFAULT_RESERVED_LOG2,
+    intun32, intun64, slot_to_val, step, trunc_trap, val_to_slot, GuestMem, Host, LockUnpoisoned,
+    Mem, Reg, Trap, Value, VarValue, DEFAULT_RESERVED_LOG2,
 };
 
 // ---- Per-function call profiler (opt-in `callprof` feature; tier-up break-even measurement) -------
@@ -743,27 +743,23 @@ impl ModuleSource {
     /// A fresh clone of the module `Arc`s — a vCPU's lock-free local cache (cheap refcount bumps),
     /// refreshed on a miss. The lock acquire pairs with `install`'s push, so the snapshot sees it.
     fn snapshot(&self) -> Vec<std::sync::Arc<Compiled>> {
-        self.mods.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.mods.lock_unpoisoned().clone()
     }
 
     /// The primary program (module 0).
     fn primary(&self) -> std::sync::Arc<Compiled> {
-        std::sync::Arc::clone(&self.mods.lock().unwrap_or_else(|e| e.into_inner())[0])
+        std::sync::Arc::clone(&self.mods.lock_unpoisoned()[0])
     }
 
     /// Module `i` (`0` = primary, `k≥1` = an installed unit), or `None` if out of range.
     fn get(&self, i: usize) -> Option<std::sync::Arc<Compiled>> {
-        self.mods
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(i)
-            .cloned()
+        self.mods.lock_unpoisoned().get(i).cloned()
     }
 
     /// Append a module (a §14 `instantiate_module` child's program) and return its index. (§22
     /// `Jit.install` instead goes through [`Domain::install`], which also fills a dispatch slot.)
     fn push(&self, unit: Compiled) -> usize {
-        let mut mods = self.mods.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mods = self.mods.lock_unpoisoned();
         mods.push(std::sync::Arc::new(unit));
         mods.len() - 1
     }
@@ -772,13 +768,13 @@ impl ModuleSource {
     /// refcount bumps) so a reverse-`seek` restore can re-push them and a separate-module coroutine/child
     /// frame's `module` index resolves as it did at capture. Paired with [`reset_extra`].
     fn extra_units(&self) -> Vec<std::sync::Arc<Compiled>> {
-        self.mods.lock().unwrap_or_else(|e| e.into_inner())[1..].to_vec()
+        self.mods.lock_unpoisoned()[1..].to_vec()
     }
 
     /// Reset the pushed units to exactly `units` (keeping the primary at index 0) — the restore inverse
     /// of [`extra_units`]. Idempotent, so restoring twice into the same run is safe.
     fn reset_extra(&self, units: &[std::sync::Arc<Compiled>]) {
-        let mut mods = self.mods.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mods = self.mods.lock_unpoisoned();
         mods.truncate(1);
         mods.extend(units.iter().cloned());
     }
@@ -845,7 +841,7 @@ impl Domain {
 /// so a reader that observes the slot also observes the pushed unit.
 fn jit_install_into(source: &ModuleSource, table: &SharedSlots, unit: Compiled) -> Option<usize> {
     use std::sync::atomic::Ordering;
-    let mut mods = source.mods.lock().unwrap_or_else(|e| e.into_inner());
+    let mut mods = source.mods.lock_unpoisoned();
     let slot = table
         .slots
         .iter()
@@ -868,7 +864,7 @@ fn jit_uninstall_from(
     n_real: usize,
 ) -> bool {
     use std::sync::atomic::Ordering;
-    let _g = source.mods.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = source.mods.lock_unpoisoned();
     if slot >= n_real
         && slot < table.slots.len()
         && (table.slots[slot].load(Ordering::Relaxed) >> 32) as u32 != super::TABLE_EMPTY
@@ -3253,7 +3249,7 @@ impl<'p> Vcpu<'p> {
                     // F2: the session driver keeps the inline completion wait — identical to
                     // the pre-F2 in-op wait (the I45 whole-vCPU posture for this driver).
                     let comps = match self.shared_host {
-                        Some(m) => m.lock().unwrap_or_else(|e| e.into_inner()).completions(),
+                        Some(m) => m.lock_unpoisoned().completions(),
                         None => self.host.completions(),
                     };
                     let r = comps.wait(id);
@@ -3437,7 +3433,7 @@ impl<'p> Vcpu<'p> {
             let pf = self.fuel;
             let take = match self.shared_host {
                 Some(m) => {
-                    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut g = m.lock_unpoisoned();
                     take_spawn_budget(&mut g, budget, child_size, pf)?
                 }
                 None => take_spawn_budget(&mut self.host, budget, child_size, pf)?,
@@ -3486,7 +3482,7 @@ impl<'p> Vcpu<'p> {
         // Resolve the granted module from the run's powerbox (the shared one when attached).
         let (cfuncs, cmem_log2, cdata) = match self.shared_host {
             Some(m) => {
-                let g = m.lock().unwrap_or_else(|e| e.into_inner());
+                let g = m.lock_unpoisoned();
                 let g = g.resolve_module(mh)?;
                 (g.funcs.clone(), g.memory_log2, g.data.clone())
             }
@@ -3529,7 +3525,7 @@ impl<'p> Vcpu<'p> {
             let pf = self.fuel;
             let take = match self.shared_host {
                 Some(m) => {
-                    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut g = m.lock_unpoisoned();
                     take_spawn_budget(&mut g, budget, child_size, pf)?
                 }
                 None => take_spawn_budget(&mut self.host, budget, child_size, pf)?,
@@ -8579,7 +8575,7 @@ impl HostCell<'_> {
     fn with<R>(&mut self, f: impl FnOnce(&mut Host) -> R) -> R {
         match self {
             HostCell::Excl(h) => f(h),
-            HostCell::Shared(m) => f(&mut m.lock().unwrap_or_else(|e| e.into_inner())),
+            HostCell::Shared(m) => f(&mut m.lock_unpoisoned()),
         }
     }
 }
@@ -9447,8 +9443,7 @@ impl CoopSched {
                         callee,
                         dst,
                     } => callee
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
+                        .lock_unpoisoned()
                         .svc_results
                         .remove(ticket)
                         .map(|v| (v, *dst)),
@@ -9747,11 +9742,7 @@ impl CoopSched {
                     } else {
                         let comps = match tasks[ti].env {
                             None => host.completions(),
-                            Some(k) => extra_envs[k]
-                                .host
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .completions(),
+                            Some(k) => extra_envs[k].host.lock_unpoisoned().completions(),
                         };
                         let r = comps.wait(id);
                         tasks[ti].vt.active.set(dst, Reg::from_i64(r));
@@ -9768,16 +9759,12 @@ impl CoopSched {
                         .and_then(|cidx| tasks[cidx].env)
                         .map(|k| std::sync::Arc::clone(&extra_envs[k].host));
                     let cap = callee.and_then(|callee: std::sync::Arc<std::sync::Mutex<Host>>| {
-                        let sigs = callee
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .offer_shape(export)?;
+                        let sigs = callee.lock_unpoisoned().offer_shape(export)?;
                         match tasks[ti].env {
                             None => host.wire_live_impl(&callee, export, &sigs).ok(),
                             Some(pk) => extra_envs[pk]
                                 .host
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
+                                .lock_unpoisoned()
                                 .wire_live_impl(&callee, export, &sigs)
                                 .ok(),
                         }
@@ -9864,8 +9851,7 @@ impl CoopSched {
                                 };
                                 let twin_host = extra_envs[ck]
                                     .host
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
+                                    .lock_unpoisoned()
                                     .fork_powerbox(twin_pid)?;
                                 Some((ck, twin_mem, twin_host))
                             })
@@ -10173,12 +10159,7 @@ impl CoopSched {
                     // domain's registered module, exactly the tree-walker's `self_module` handoff.
                     child_host.self_module = match tasks[ti].env {
                         None => host.self_module.clone(),
-                        Some(k) => extra_envs[k]
-                            .host
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .self_module
-                            .clone(),
+                        Some(k) => extra_envs[k].host.lock_unpoisoned().self_module.clone(),
                     };
                     let child_args = if want_as {
                         vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
@@ -11504,7 +11485,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                 // this OS thread while the pool works (the §5b overlap across sibling vCPUs
                 // is the lock-release, already landed); fiber-waiter delivery through the
                 // real cross-thread futex is the I45/I73 residue, its own slice.
-                let comps = host.lock().unwrap_or_else(|e| e.into_inner()).completions();
+                let comps = host.lock_unpoisoned().completions();
                 let r = comps.wait(id);
                 vt.active.set(dst, Reg::from_i64(r));
             }
@@ -11538,7 +11519,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                 // if the unit uses an op the engine doesn't lower yet (the one place a guest unit can
                 // outrun coverage — no tree-walker fallback mid-run).
                 let funcs = {
-                    let g = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let g = host.lock_unpoisoned();
                     match g.resolve_jit_domain(h).and_then(|domain| {
                         let (cd, cu) = g.resolve_jit_code(code)?;
                         if cd != domain {
@@ -11561,7 +11542,7 @@ fn run_vcpu_parallel<'scope, 'env>(
             }
             Ok(VcpuStop::JitUninstall { h, slot, dst }) => {
                 {
-                    let g = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let g = host.lock_unpoisoned();
                     if let Err(t) = g.resolve_jit_domain(h) {
                         return (Err(t), mem); // authority check
                     }
@@ -11584,7 +11565,7 @@ fn run_vcpu_parallel<'scope, 'env>(
             }) => {
                 // Resolve unit funcs (authority + cross-domain) and compile, as for install.
                 let funcs = {
-                    let g = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let g = host.lock_unpoisoned();
                     match g.resolve_jit_domain(h).and_then(|domain| {
                         let (cd, cu) = g.resolve_jit_code(code)?;
                         if cd != domain {
@@ -11771,7 +11752,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                 // Resolve + clone the granted module under the host lock (a forged/closed/wrong-type
                 // handle is an inert CapFault → trap).
                 let (cfuncs, cmem_log2, cdata) = {
-                    let g = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let g = host.lock_unpoisoned();
                     match g.resolve_module(mh) {
                         Ok(grant) => (grant.funcs.clone(), grant.memory_log2, grant.data.clone()),
                         Err(t) => return (Err(t), mem),
@@ -11973,11 +11954,7 @@ fn teardown_domains(
                     }
                 }
             }
-            dying
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .svc_queue
-                .clear();
+            dying.lock_unpoisoned().svc_queue.clear();
         }
     }
 }
@@ -12790,10 +12767,7 @@ impl Vm {
                     // tree-walker's caller-parking arm, task-level). A full callee queue is
                     // probeable backpressure (`EAGAIN` as the call's result), never a trap.
                     if let Some((callee, export)) = host.with(|p| p.live_impl_of(h, *type_id)) {
-                        let t = callee
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .svc_enqueue(export, *op, argv);
+                        let t = callee.lock_unpoisoned().svc_enqueue(export, *op, argv);
                         if let Some(ticket) = t {
                             self.module = module;
                             self.cur = cur;

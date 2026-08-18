@@ -11,15 +11,24 @@ pub use svm_ir as ir;
 pub use svm_text as text;
 pub use svm_verify as verify;
 
+/// The embedding runtime — instantiate a verified module with the powerbox and run it. Behind the
+/// off-by-default `run` feature (#918) so the umbrella crate's default build stays the dependency-free
+/// pipeline core; `svm_run` itself re-exports `parse_module`/`decode_module`/`verify_module`, so an
+/// embedder that enables `run` needs only this one crate.
+#[cfg(feature = "run")]
+pub use svm_run as run;
+
 use svm_interp::Value;
 use svm_ir::{FuncIdx, Module, ValType};
 
-/// Any failure along the pipeline.
+/// Any failure along the pipeline — a compile-time reject (parse/decode/verify) **or** a runtime
+/// [`Trap`](svm_interp::Trap) from running the verified module.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Error {
     Parse(svm_text::ParseError),
     Decode(svm_encode::DecodeError),
     Verify(svm_verify::VerifyError),
+    Trap(svm_interp::Trap),
 }
 
 impl From<svm_text::ParseError> for Error {
@@ -35,6 +44,11 @@ impl From<svm_encode::DecodeError> for Error {
 impl From<svm_verify::VerifyError> for Error {
     fn from(e: svm_verify::VerifyError) -> Self {
         Error::Verify(e)
+    }
+}
+impl From<svm_interp::Trap> for Error {
+    fn from(t: svm_interp::Trap) -> Self {
+        Error::Trap(t)
     }
 }
 
@@ -56,10 +70,9 @@ pub fn run_text(src: &str, func: FuncIdx, args: &[Value], fuel: u64) -> Result<V
     let bytes = assemble(src)?;
     let m = load(&bytes)?;
     let mut fuel = fuel;
-    // A verified module that traps is a runtime outcome, not a pipeline error; we
-    // surface traps to callers that care via the lower-level API. Here we treat a
-    // trap as an empty result for ergonomics in examples/tests.
-    Ok(svm_interp::run_fast(&m, func, args, &mut fuel).unwrap_or_default())
+    // A verified module that traps is a real outcome — surface it as `Error::Trap` rather than
+    // swallowing it into an empty result (a trap-swallowing example API teaches the wrong contract).
+    Ok(svm_interp::run_fast(&m, func, args, &mut fuel)?)
 }
 
 /// A zeroed value of each parameter type — handy for fuzzing/driving arbitrary funcs.
