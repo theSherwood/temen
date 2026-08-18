@@ -81,6 +81,7 @@ use svm_interp::{GuestMem, HostProc, RegionMinter};
 // that `svm-run` pulls in. Re-export them so `svm_run::fs::*` is unchanged; the real-filesystem
 // `host_fs` backend and the `HostCap` wrappers (svm-run's capability type) stay here.
 pub use svm_fs::*;
+use svm_ir::errno::*; // the one shared negative-errno table (#905)
 
 /// A deterministic **in-memory** filesystem capability (fresh, empty state per host). The hermetic
 /// default for tests and differential runs.
@@ -188,7 +189,7 @@ impl HostFsState {
                     .create(flags & O_CREATE != 0);
                 let file = match oo.open(&path) {
                     Ok(f) => f,
-                    Err(e) => return -io_errno(&e),
+                    Err(e) => return io_errno(&e),
                 };
                 let o = HostOpen {
                     file,
@@ -213,7 +214,7 @@ impl HostFsState {
                 let mut tmp = vec![0u8; len as usize];
                 let n = match o.file.read(&mut tmp) {
                     Ok(n) => n,
-                    Err(e) => return -io_errno(&e),
+                    Err(e) => return io_errno(&e),
                 };
                 if n > 0 {
                     let Some(m) = mem.as_deref_mut() else {
@@ -244,7 +245,7 @@ impl HostFsState {
                 };
                 match o.file.write_all(&bytes) {
                     Ok(()) => bytes.len() as i64,
-                    Err(e) => -io_errno(&e),
+                    Err(e) => io_errno(&e),
                 }
             }
             FS_SEEK => {
@@ -259,7 +260,7 @@ impl HostFsState {
                 };
                 match o.file.seek(from) {
                     Ok(p) => p as i64,
-                    Err(e) => -io_errno(&e),
+                    Err(e) => io_errno(&e),
                 }
             }
             FS_CLOSE => {
@@ -278,7 +279,7 @@ impl HostFsState {
                 };
                 match std::fs::remove_file(path) {
                     Ok(()) => 0,
-                    Err(e) => -io_errno(&e),
+                    Err(e) => io_errno(&e),
                 }
             }
             FS_RENAME => {
@@ -292,7 +293,7 @@ impl HostFsState {
                 };
                 match std::fs::rename(from, to) {
                     Ok(()) => 0,
-                    Err(e) => -io_errno(&e),
+                    Err(e) => io_errno(&e),
                 }
             }
             FS_TRUNCATE => {
@@ -311,7 +312,7 @@ impl HostFsState {
                 }
                 match o.file.set_len(len as u64) {
                     Ok(()) => 0,
-                    Err(e) => -io_errno(&e),
+                    Err(e) => io_errno(&e),
                 }
             }
             FS_SYNC => {
@@ -324,7 +325,7 @@ impl HostFsState {
                 };
                 match o.file.sync_all() {
                     Ok(()) => 0,
-                    Err(e) => -io_errno(&e),
+                    Err(e) => io_errno(&e),
                 }
             }
             FS_MMAP => {
@@ -338,14 +339,14 @@ impl HostFsState {
                 // Copy the file region into the guest buffer (zero-fill past EOF).
                 let mut region = vec![0u8; len as usize];
                 if o.file.seek(SeekFrom::Start(foff as u64)).is_err() {
-                    return -io_errno(&std::io::Error::last_os_error());
+                    return io_errno(&std::io::Error::last_os_error());
                 }
                 let mut got = 0usize;
                 while got < region.len() {
                     match o.file.read(&mut region[got..]) {
                         Ok(0) => break, // EOF — rest stays zero
                         Ok(n) => got += n,
-                        Err(e) => return -io_errno(&e),
+                        Err(e) => return io_errno(&e),
                     }
                 }
                 let Some(m) = mem.as_deref_mut() else {
@@ -390,11 +391,11 @@ impl HostFsState {
                     return -EBADF; // the mapped fd was closed
                 };
                 if o.file.seek(SeekFrom::Start(file_pos)).is_err() {
-                    return -io_errno(&std::io::Error::last_os_error());
+                    return io_errno(&std::io::Error::last_os_error());
                 }
                 match o.file.write_all(&bytes) {
                     Ok(()) => 0,
-                    Err(e) => -io_errno(&e),
+                    Err(e) => io_errno(&e),
                 }
             }
             FS_MUNMAP => {
@@ -436,11 +437,11 @@ impl HostFsState {
                 {
                     let dup = match o.file.try_clone() {
                         Ok(f) => f,
-                        Err(e) => return -io_errno(&e),
+                        Err(e) => return io_errno(&e),
                     };
                     match crate::new_file_region(dup, len as usize) {
                         Ok(backing) => minter.grant_region(backing) as i64,
-                        Err(e) => -io_errno(&e),
+                        Err(e) => io_errno(&e),
                     }
                 }
                 #[cfg(not(unix))]
@@ -458,7 +459,7 @@ impl HostFsState {
                 // followed, so its type can't be confused with a target outside the granted root.
                 let md = match std::fs::symlink_metadata(&path) {
                     Ok(m) => m,
-                    Err(e) => return -io_errno(&e),
+                    Err(e) => return io_errno(&e),
                 };
                 let buf = host_stat_bytes(&md);
                 if a(2) < 0 || a(3) < STATBUF_LEN as i64 {
@@ -480,7 +481,7 @@ impl HostFsState {
                 };
                 match std::fs::create_dir(path) {
                     Ok(()) => 0,
-                    Err(e) => -io_errno(&e),
+                    Err(e) => io_errno(&e),
                 }
             }
             FS_RMDIR => {
@@ -490,7 +491,7 @@ impl HostFsState {
                 };
                 match std::fs::remove_dir(path) {
                     Ok(()) => 0,
-                    Err(e) => -io_errno(&e),
+                    Err(e) => io_errno(&e),
                 }
             }
             FS_OPENDIR => {
@@ -500,7 +501,7 @@ impl HostFsState {
                 };
                 let rd = match std::fs::read_dir(&path) {
                     Ok(r) => r,
-                    Err(e) => return -io_errno(&e),
+                    Err(e) => return io_errno(&e),
                 };
                 let mut names = Vec::new();
                 for ent in rd {
@@ -512,7 +513,7 @@ impl HostFsState {
                                 names.push(s.to_string());
                             }
                         }
-                        Err(e) => return -io_errno(&e),
+                        Err(e) => return io_errno(&e),
                     }
                 }
                 names.sort();
@@ -593,11 +594,12 @@ fn host_stat_bytes(md: &std::fs::Metadata) -> [u8; STATBUF_LEN] {
     }
 }
 
-/// Map a host `io::Error` to the protocol's canonical (Linux) errno. The wire protocol must be
-/// **host-OS-independent** — both backends have to return the same value for the same failure, and
-/// on a differential a `host_fs` run has to match a `mem_fs` run — but the raw OS error code is not
-/// portable: `ENOTEMPTY` is 39 on Linux and 66 on macOS, and Windows codes are not errno at all. So
-/// canonicalize through the portable `io::ErrorKind`, falling back to the raw errno (already the
+/// Map a host `io::Error` to the protocol's canonical (Linux) **negative** errno — ready to return
+/// directly (the caller no longer negates). The wire protocol must be **host-OS-independent** — both
+/// backends have to return the same value for the same failure, and on a differential a `host_fs` run
+/// has to match a `mem_fs` run — but the raw OS error code is not portable: `ENOTEMPTY` is 39 on Linux
+/// and 66 on macOS, and Windows codes are not errno at all. So canonicalize through the portable
+/// `io::ErrorKind` (the shared `svm_ir::errno` table), falling back to the negated raw errno (the
 /// canonical value on Linux, the differential's reference host) for kinds without a fixed mapping.
 fn io_errno(e: &std::io::Error) -> i64 {
     use std::io::ErrorKind;
@@ -608,7 +610,7 @@ fn io_errno(e: &std::io::Error) -> i64 {
         ErrorKind::DirectoryNotEmpty => ENOTEMPTY,
         ErrorKind::NotADirectory => ENOTDIR,
         ErrorKind::InvalidInput => EINVAL,
-        _ => e.raw_os_error().map(|c| c as i64).unwrap_or(EINVAL),
+        _ => e.raw_os_error().map(|c| -(c as i64)).unwrap_or(EINVAL),
     }
 }
 

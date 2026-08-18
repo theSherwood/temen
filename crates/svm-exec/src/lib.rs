@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 use svm_interp::{GuestMem, HostProc};
+use svm_ir::errno::*;
 
 /// `run(argv_ptr, argv_len, stdin_ptr, stdin_len) -> job | -errno` — spawn with `argv`
 /// (NUL-separated bytes, `argv[0]` the program) and `stdin` fed to it; v1 runs the job to
@@ -37,28 +38,22 @@ pub const EXEC_STATUS: u32 = 3;
 /// `close(job) -> 0 | -errno` — release the job handle.
 pub const EXEC_CLOSE: u32 = 4;
 
-pub const EPERM: i64 = 1;
-pub const ENOENT: i64 = 2;
-pub const EBADF: i64 = 9;
-pub const EFAULT: i64 = 14;
-pub const EINVAL: i64 = 22;
-
 /// Parse the wire `argv`: NUL-separated byte strings, no trailing NUL required, each a
 /// non-empty UTF-8 token. `argv[0]` is the program. Empty argv or a non-UTF-8 token is
 /// `-EINVAL`; an unreadable buffer is `-EFAULT`.
 pub fn read_argv(mem: Option<&dyn GuestMem>, ptr: i64, len: i64) -> Result<Vec<String>, i64> {
-    let mem = mem.ok_or(-EFAULT)?;
+    let mem = mem.ok_or(EFAULT)?;
     if !(1..=65536).contains(&len) || ptr < 0 {
-        return Err(-EINVAL);
+        return Err(EINVAL);
     }
-    let bytes = mem.read_bytes(ptr as u64, len as u64).ok_or(-EFAULT)?;
+    let bytes = mem.read_bytes(ptr as u64, len as u64).ok_or(EFAULT)?;
     let argv: Vec<String> = bytes
         .split(|&b| b == 0)
         .filter(|t| !t.is_empty())
-        .map(|t| String::from_utf8(t.to_vec()).map_err(|_| -EINVAL))
+        .map(|t| String::from_utf8(t.to_vec()).map_err(|_| EINVAL))
         .collect::<Result<_, i64>>()?;
     if argv.is_empty() {
-        return Err(-EINVAL);
+        return Err(EINVAL);
     }
     Ok(argv)
 }
@@ -68,11 +63,11 @@ pub fn read_bytes(mem: Option<&dyn GuestMem>, ptr: i64, len: i64) -> Result<Vec<
     if len == 0 {
         return Ok(Vec::new());
     }
-    let mem = mem.ok_or(-EFAULT)?;
+    let mem = mem.ok_or(EFAULT)?;
     if len < 0 || ptr < 0 {
-        return Err(-EINVAL);
+        return Err(EINVAL);
     }
-    mem.read_bytes(ptr as u64, len as u64).ok_or(-EFAULT)
+    mem.read_bytes(ptr as u64, len as u64).ok_or(EFAULT)
 }
 
 /// One completed job: captured output with read cursors + the exit code. v1 jobs are complete
@@ -112,16 +107,16 @@ impl JobTable {
     pub fn handle(&mut self, op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>) -> i64 {
         let job_idx = match args.first() {
             Some(&j) if j >= 0 && (j as usize) < self.jobs.len() => j as usize,
-            _ => return -EBADF,
+            _ => return EBADF,
         };
         let Some(job) = self.jobs[job_idx].as_mut() else {
-            return -EBADF;
+            return EBADF;
         };
         match op {
             EXEC_READ_OUT | EXEC_READ_ERR => {
                 let (&ptr, &cap) = match (args.get(1), args.get(2)) {
                     (Some(p), Some(c)) if *p >= 0 && *c >= 0 => (p, c),
-                    _ => return -EINVAL,
+                    _ => return EINVAL,
                 };
                 let (buf, pos) = if op == EXEC_READ_OUT {
                     (&job.stdout, &mut job.out_pos)
@@ -132,9 +127,9 @@ impl JobTable {
                 if n == 0 {
                     return 0; // EOF
                 }
-                let Some(mem) = mem else { return -EFAULT };
+                let Some(mem) = mem else { return EFAULT };
                 if mem.write_bytes(ptr as u64, &buf[*pos..*pos + n]).is_none() {
-                    return -EFAULT;
+                    return EFAULT;
                 }
                 *pos += n;
                 n as i64
@@ -144,7 +139,7 @@ impl JobTable {
                 self.jobs[job_idx] = None;
                 0
             }
-            _ => -EINVAL,
+            _ => EINVAL,
         }
     }
 }
@@ -206,7 +201,7 @@ fn scripted_dispatch(
                     err_pos: 0,
                     exit: e.exit,
                 }),
-                None => -EPERM,
+                None => EPERM,
             }
         }
         Err(e) => e,
@@ -218,7 +213,7 @@ fn scripted_dispatch(
 pub fn run_args(args: &[i64], mem: Option<&dyn GuestMem>) -> Result<(Vec<String>, Vec<u8>), i64> {
     let (&ap, &al, &sp, &sl) = match (args.first(), args.get(1), args.get(2), args.get(3)) {
         (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
-        _ => return Err(-EINVAL),
+        _ => return Err(EINVAL),
     };
     let argv = read_argv(mem, ap, al)?;
     let stdin = read_bytes(mem, sp, sl)?;

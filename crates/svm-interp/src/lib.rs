@@ -15226,23 +15226,13 @@ pub fn builtin_iface_shape(id: u32) -> Option<Vec<(&'static str, FuncType)>> {
 }
 
 /// Negative-errno values returned by capability ops (§3e D42): `< 0` is `-errno`,
-/// `>= 0` is success. Errors do **not** trap — traps stay reserved for escape/fatal.
-const ENOMEM: i64 = -12; // resource quota exhausted (e.g. the Jit compile budget)
+/// `>= 0` is success. Errors do **not** trap — traps stay reserved for escape/fatal. The standard
+/// errnos come from the one shared table ([`svm_ir::errno`]); the aliases below are svm-interp's own.
+use svm_ir::errno::{EAGAIN, ECHILD, EFAULT, EINTR, EINVAL, EMFILE, ENOMEM, ENOSPC, EPIPE, ESRCH};
 /// §3.6 revocation-unparks completion status (`-EBADF`): the errno a fiber's parked capability
 /// call returns when the handle it was parked through is revoked out from under it. Probeable
 /// on the fiber's own error path — never a trap (D42: errors return, traps stay for escape).
 const CAP_REVOKED: i64 = -9;
-/// A live-callee's dispatch queue was full at the enqueue (`-EAGAIN`): backpressure surfaces
-/// as a probeable errno at the caller, per the §3.6 bounded fail-closed queue design.
-const EAGAIN: i64 = -11;
-const EFAULT: i64 = -14; // buffer not fully within the window
-const EINVAL: i64 = -22; // bad op / argument
-const EMFILE: i64 = -24; // handle table full — a guest-minted handle has nowhere to go (§3c)
-const ECHILD: i64 = -10; // `reap`/`wait` for a pid that is not a live twin this servicer minted
-const ESRCH: i64 = -3; // `setpgid` for a pid that is not a live child of the calling domain
-const ENOSPC: i64 = -28; // no free table slot — the Jit install table is full
-const EPIPE: i64 = -32; // FORK.md §8.6 — write to a pipe whose read end is fully closed (SIGPIPE errno)
-const EINTR: i64 = -4; // #796 L1 — a blocking pipe read/write interrupted by a delivered signal (POSIX EINTR)
 
 /// Per-region cap on a **guest-minted** region (`AddressSpace.create_region`, §13/§14): an anti-bomb
 /// ceiling so a single mint can't exhaust the host. Aggregate quota metering is §15 (D48: DoS is

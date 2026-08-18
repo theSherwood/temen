@@ -255,18 +255,9 @@ const SIG_SETMASK: i64 = 2;
 /// mask so a guest can never wedge them.
 const UNMASKABLE: u64 = (1 << 9) | (1 << 19);
 
-/// Negative errnos this personality returns (Linux values, so a guest's `<errno.h>` agrees).
-const ENOENT: i64 = -2; // no such file (open without O_CREAT; stat/opendir of an absent path)
-const ESRCH: i64 = -3; // kill on a pid the process table does not know
-const ECHILD: i64 = -10; // waitpid on a pid that is not a live child
-const EBADF: i64 = -9; // an op on an fd this personality does not serve
-const EINVAL: i64 = -22; // bad argument (whence, non-UTF-8 path, negative seek)
-const ENOTDIR: i64 = -20; // opendir on a path that is a regular file, not a directory
-const ESPIPE: i64 = -29; // lseek on a pipe/stdio fd (not seekable)
-const ERANGE: i64 = -34; // result won't fit the caller's buffer (getcwd)
-const ENOSYS: i64 = -38; // spawn with no embedder-wired delegate (fail closed)
-const EPERM: i64 = -1; // tcsetpgrp to a process group nobody occupies (#798)
-const ENOTTY: i64 = -25; // a tc* op on an fd that is not the proto-terminal (#798)
+/// Negative errnos this personality returns — the one shared table ([`svm_ir::errno`], Linux
+/// values, so a guest's `<errno.h>` agrees).
+use svm_ir::errno::*;
 
 /// #798 — the job-control signal numbers (Linux values, like every signum here).
 const SIGCONT: i32 = 18; // continue a stopped process (also deliverable if caught)
@@ -293,14 +284,6 @@ fn default_ignored(sig: i32) -> bool {
 const WNOHANG: i64 = 1; // never block (#799 — the poll everyone implicitly had before)
 const WUNTRACED: i64 = 2; // also report a freshly-stopped child
 const WCONTINUED: i64 = 8; // also report a freshly-continued child
-const EEXIST: i64 = -17; // mkdir/rename onto a path that already exists
-const ENOTEMPTY: i64 = -39; // rmdir on a directory that still has children
-const EAGAIN: i64 = -11; // read/accept on an empty memnet socket (would block a cooperative guest)
-const EACCES: i64 = -13; // bind beyond loopback (no delegate-granted listener path yet, POSIX.md §5a)
-const EPIPE: i64 = -32; // write on a socket whose write side is shut down
-const ENOTSOCK: i64 = -88; // a net op on an fd that is not a socket/listener
-const EADDRINUSE: i64 = -98; // bind on a loopback port another listener holds
-const ECONNREFUSED: i64 = -111; // connect with no listener (loopback) or no delegate (beyond)
 
 /// `fcntl` commands this personality serves (Linux `<fcntl.h>` values). `F_DUPFD`/`F_DUPFD_CLOEXEC`
 /// duplicate to the lowest free fd `>= arg`; `F_GETFD`/`F_SETFD`/`F_GETFL`/`F_SETFL` are accepted no-ops

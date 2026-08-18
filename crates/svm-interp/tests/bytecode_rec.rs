@@ -19,7 +19,7 @@
 use svm_interp::{bytecode, run_with_host, Host, Trap, Value};
 use svm_text::parse_module;
 
-const EINVAL: i64 = -22;
+use svm_ir::errno::EINVAL;
 
 /// Parent (entry 0, `(i32 inst) -> (i64)`): build the record at 1152 — entry 1, off 64 KiB,
 /// size_log2 12, no pager/module/budget/quota/grants — spawn via op 17, join, return the child's

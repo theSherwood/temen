@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::path::{Component, Path};
 use std::sync::{Arc, Mutex};
 use svm_interp::{GuestMem, HostProc};
+use svm_ir::errno::*;
 
 pub const FS_OPEN: u32 = 0;
 pub const FS_READ: u32 = 1;
@@ -82,15 +83,6 @@ pub const O_APPEND: i64 = 4;
 pub const O_TRUNC: i64 = 8;
 pub const O_CREATE: i64 = 16;
 
-pub const ENOENT: i64 = 2;
-pub const EBADF: i64 = 9;
-pub const EACCES: i64 = 13;
-pub const EFAULT: i64 = 14;
-pub const EEXIST: i64 = 17;
-pub const ENOTDIR: i64 = 20;
-pub const EINVAL: i64 = 22;
-pub const ENOTEMPTY: i64 = 39;
-
 /// Build the fixed 72-byte little-endian [`StatBuf`] payload from the fields the guest libc reads.
 /// Layout (offset: field): `0:mode(u32) 4:nlink(u32) 8:size(i64) 16:mtime_sec(i64) 24:mtime_nsec(i64)
 /// 32:ino(u64) 40:dev(u64) 48:uid(u32) 52:gid(u32) 56:blksize(i64) 64:blocks(i64)`.
@@ -128,19 +120,19 @@ pub fn stat_bytes(
 /// granted root (absolute, `..`, or empty) — enforced by **both** backends so the protocol semantics
 /// are backend-independent (a differential runs identically on `mem_fs` and `host_fs`).
 pub fn read_path(mem: Option<&dyn GuestMem>, ptr: i64, len: i64) -> Result<String, i64> {
-    let mem = mem.ok_or(-EFAULT)?;
+    let mem = mem.ok_or(EFAULT)?;
     if !(0..=4096).contains(&len) || ptr < 0 {
-        return Err(-EINVAL);
+        return Err(EINVAL);
     }
-    let bytes = mem.read_bytes(ptr as u64, len as u64).ok_or(-EFAULT)?;
-    let path = String::from_utf8(bytes).map_err(|_| -EINVAL)?;
+    let bytes = mem.read_bytes(ptr as u64, len as u64).ok_or(EFAULT)?;
+    let path = String::from_utf8(bytes).map_err(|_| EINVAL)?;
     let p = Path::new(&path);
     if path.is_empty()
         || p.is_absolute()
         || p.components()
             .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
     {
-        return Err(-EACCES);
+        return Err(EACCES);
     }
     Ok(path)
 }
@@ -353,7 +345,7 @@ impl MemFsState {
                             return fd as i64;
                         }
                         if flags & O_CREATE == 0 {
-                            return -ENOENT;
+                            return ENOENT;
                         }
                         let d = Arc::new(Mutex::new(Vec::new()));
                         self.files.insert(path, d.clone());
@@ -373,24 +365,24 @@ impl MemFsState {
             }
             FS_READ => {
                 let Some(Some(o)) = self.open.get_mut(a(0) as usize) else {
-                    return -EBADF;
+                    return EBADF;
                 };
                 if !o.readable {
-                    return -EBADF;
+                    return EBADF;
                 }
                 let (buf, len) = (a(1), a(2));
                 if buf < 0 || len < 0 {
-                    return -EINVAL;
+                    return EINVAL;
                 }
                 let data = o.data.lock().unwrap_or_else(|e| e.into_inner());
                 let avail = data.len().saturating_sub(o.pos);
                 let n = avail.min(len as usize);
                 if n > 0 {
                     let Some(m) = mem.as_deref_mut() else {
-                        return -EFAULT;
+                        return EFAULT;
                     };
                     if m.write_bytes(buf as u64, &data[o.pos..o.pos + n]).is_none() {
-                        return -EFAULT;
+                        return EFAULT;
                     }
                 }
                 drop(data);
@@ -402,21 +394,21 @@ impl MemFsState {
                     return a(2).max(0); // power-loss: the un-synced write is silently dropped
                 }
                 let Some(Some(o)) = self.open.get_mut(a(0) as usize) else {
-                    return -EBADF;
+                    return EBADF;
                 };
                 if !o.writable {
-                    return -EBADF;
+                    return EBADF;
                 }
                 let (buf, len) = (a(1), a(2));
                 if buf < 0 || len < 0 {
-                    return -EINVAL;
+                    return EINVAL;
                 }
                 let bytes = match mem.as_deref() {
                     Some(m) => match m.read_bytes(buf as u64, len as u64) {
                         Some(b) => b,
-                        None => return -EFAULT,
+                        None => return EFAULT,
                     },
-                    None => return -EFAULT,
+                    None => return EFAULT,
                 };
                 let mut data = o.data.lock().unwrap_or_else(|e| e.into_inner());
                 if o.append {
@@ -436,30 +428,30 @@ impl MemFsState {
             }
             FS_SEEK => {
                 let Some(Some(o)) = self.open.get_mut(a(0) as usize) else {
-                    return -EBADF;
+                    return EBADF;
                 };
                 let size = o.data.lock().unwrap_or_else(|e| e.into_inner()).len() as i64;
                 let base = match a(1) {
                     0 => 0,
                     1 => o.pos as i64,
                     2 => size,
-                    _ => return -EINVAL,
+                    _ => return EINVAL,
                 };
                 let Some(new) = base.checked_add(a(2)) else {
-                    return -EINVAL;
+                    return EINVAL;
                 };
                 if new < 0 {
-                    return -EINVAL;
+                    return EINVAL;
                 }
                 o.pos = new as usize;
                 new
             }
             FS_CLOSE => {
                 let Some(slot) = self.open.get_mut(a(0) as usize) else {
-                    return -EBADF;
+                    return EBADF;
                 };
                 if slot.take().is_none() {
-                    return -EBADF;
+                    return EBADF;
                 }
                 0
             }
@@ -469,7 +461,7 @@ impl MemFsState {
                     Err(e) => return e,
                 };
                 if self.files.remove(&path).is_none() {
-                    return -ENOENT;
+                    return ENOENT;
                 }
                 0
             }
@@ -483,7 +475,7 @@ impl MemFsState {
                     Err(e) => return e,
                 };
                 let Some(d) = self.files.remove(&from) else {
-                    return -ENOENT;
+                    return ENOENT;
                 };
                 self.files.insert(to, d);
                 0
@@ -493,14 +485,14 @@ impl MemFsState {
                     return 0; // power-loss: the resize never reaches the backing file
                 }
                 let Some(Some(o)) = self.open.get_mut(a(0) as usize) else {
-                    return -EBADF;
+                    return EBADF;
                 };
                 if !o.writable {
-                    return -EBADF; // POSIX ftruncate needs a writable descriptor
+                    return EBADF; // POSIX ftruncate needs a writable descriptor
                 }
                 let len = a(1);
                 if len < 0 {
-                    return -EINVAL;
+                    return EINVAL;
                 }
                 // POSIX: shrink discards, grow zero-fills; the cursor is untouched.
                 o.data
@@ -516,17 +508,17 @@ impl MemFsState {
                     return 0;
                 }
                 let Some(Some(_)) = self.open.get(a(0) as usize) else {
-                    return -EBADF;
+                    return EBADF;
                 };
                 0
             }
             FS_MMAP => {
                 let (fd, foff, len, buf) = (a(0), a(1), a(2), a(3));
                 if foff < 0 || len < 0 || buf < 0 {
-                    return -EINVAL;
+                    return EINVAL;
                 }
                 let Some(Some(o)) = self.open.get(fd as usize) else {
-                    return -EBADF;
+                    return EBADF;
                 };
                 let data = o.data.clone();
                 // Copy the file region into the guest buffer (zero-fill past EOF, like a file-backed
@@ -541,10 +533,10 @@ impl MemFsState {
                     }
                 }
                 let Some(m) = mem.as_deref_mut() else {
-                    return -EFAULT;
+                    return EFAULT;
                 };
                 if m.write_bytes(buf as u64, &region).is_none() {
-                    return -EFAULT;
+                    return EFAULT;
                 }
                 self.maps.push(MemMapping {
                     base: buf as u64,
@@ -557,23 +549,23 @@ impl MemFsState {
             FS_MSYNC => {
                 let (buf, len) = (a(0), a(1));
                 if buf < 0 || len < 0 {
-                    return -EINVAL;
+                    return EINVAL;
                 }
                 let Some(map) = self
                     .maps
                     .iter()
                     .find(|m| buf as u64 >= m.base && (buf as u64) < m.base + m.len)
                 else {
-                    return -EINVAL; // no mapping contains this address
+                    return EINVAL; // no mapping contains this address
                 };
                 let n = (len as u64).min(map.base + map.len - buf as u64) as usize;
                 let file_pos = map.file_off + (buf as u64 - map.base);
                 let data = map.data.clone(); // end the borrow of `self.maps` before `crash_barrier`
                 let Some(m) = mem.as_deref() else {
-                    return -EFAULT;
+                    return EFAULT;
                 };
                 let Some(bytes) = m.read_bytes(buf as u64, n as u64) else {
-                    return -EFAULT;
+                    return EFAULT;
                 };
                 if self.crash_barrier() {
                     return 0; // power-loss: this msync's bytes never reach the file
@@ -592,7 +584,7 @@ impl MemFsState {
                 // final flush keeps `munmap` self-contained) — unless a crash has frozen the store,
                 // in which case a real `munmap` on a dead process would flush nothing.
                 let Some(idx) = self.maps.iter().position(|m| m.base == buf as u64) else {
-                    return -EINVAL;
+                    return EINVAL;
                 };
                 let map = self.maps.remove(idx);
                 if !self.crash_frozen() {
@@ -626,21 +618,21 @@ impl MemFsState {
                     // only `S_IFMT`, so the perm bits are free to model an owner-private fs.
                     (S_IFDIR | 0o700, 0)
                 } else {
-                    return -ENOENT;
+                    return ENOENT;
                 };
                 // A stable synthetic identity: mtime 0, one link, a hash-free ino of 0 (Postgres uses
                 // st_ino/st_dev only for cross-file identity, which a fresh per-run store never needs).
                 let buf = stat_bytes(mode, 1, size, 0, 0, 0, 0, 0, 0, 4096, (size + 511) / 512);
                 if a(2) < 0 || a(3) < STATBUF_LEN as i64 {
-                    return -EINVAL;
+                    return EINVAL;
                 }
                 let Some(m) = mem.as_deref_mut() else {
-                    return -EFAULT;
+                    return EFAULT;
                 };
                 if m.write_bytes(a(2) as u64, &buf).is_some() {
                     0
                 } else {
-                    -EFAULT
+                    EFAULT
                 }
             }
             FS_MKDIR => {
@@ -649,7 +641,7 @@ impl MemFsState {
                     Err(e) => return e,
                 };
                 if key.is_empty() || self.is_dir(&key) || self.files.contains_key(&key) {
-                    return -EEXIST;
+                    return EEXIST;
                 }
                 self.dirs.insert(key);
                 0
@@ -660,16 +652,16 @@ impl MemFsState {
                     Err(e) => return e,
                 };
                 if self.files.contains_key(&key) {
-                    return -ENOTDIR;
+                    return ENOTDIR;
                 }
                 if !self.is_dir(&key) {
-                    return -ENOENT;
+                    return ENOENT;
                 }
                 if !self.children_of(&key).is_empty() {
-                    return -ENOTEMPTY;
+                    return ENOTEMPTY;
                 }
                 if !self.dirs.remove(&key) {
-                    return -ENOENT; // an implicit (non-empty) dir has no explicit entry to remove
+                    return ENOENT; // an implicit (non-empty) dir has no explicit entry to remove
                 }
                 0
             }
@@ -679,10 +671,10 @@ impl MemFsState {
                     Err(e) => return e,
                 };
                 if self.files.contains_key(&key) {
-                    return -ENOTDIR;
+                    return ENOTDIR;
                 }
                 if !self.is_dir(&key) {
-                    return -ENOENT;
+                    return ENOENT;
                 }
                 let mut kids = self.children_of(&key);
                 kids.reverse(); // pop() yields them in sorted order
@@ -695,7 +687,7 @@ impl MemFsState {
             }
             FS_READDIR => {
                 let Some(Some(entries)) = self.opendirs.get_mut(a(0) as usize) else {
-                    return -EBADF;
+                    return EBADF;
                 };
                 let Some(name) = entries.pop() else {
                     return 0; // exhausted
@@ -703,27 +695,27 @@ impl MemFsState {
                 let (ptr, cap) = (a(1), a(2));
                 if ptr < 0 || cap < name.len() as i64 {
                     entries.push(name); // leave the walk where it was
-                    return -EINVAL;
+                    return EINVAL;
                 }
                 let Some(m) = mem else {
-                    return -EFAULT;
+                    return EFAULT;
                 };
                 if m.write_bytes(ptr as u64, name.as_bytes()).is_some() {
                     name.len() as i64
                 } else {
-                    -EFAULT
+                    EFAULT
                 }
             }
             FS_CLOSEDIR => {
                 let Some(slot) = self.opendirs.get_mut(a(0) as usize) else {
-                    return -EBADF;
+                    return EBADF;
                 };
                 if slot.take().is_none() {
-                    return -EBADF;
+                    return EBADF;
                 }
                 0
             }
-            _ => -EINVAL,
+            _ => EINVAL,
         }
     }
 }
@@ -733,7 +725,7 @@ impl MemFsState {
 /// non-`crashy` grants) — so the op simply does not exist on a shipping capability.
 pub fn arm_crash(ctl: Option<&mut CrashCtl>, n: i64) -> i64 {
     let Some(c) = ctl else {
-        return -EINVAL;
+        return EINVAL;
     };
     c.countdown = if n < 0 { None } else { Some(n as u64) };
     c.crashed = false;

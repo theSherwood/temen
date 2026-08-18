@@ -54,6 +54,8 @@ const SEEK_SET: i64 = 0;
 const SEEK_CUR: i64 = 1;
 const SEEK_END: i64 = 2;
 // The errno values (`-code`) the memfs ops return, mapped to the `ErrorKind`s programs actually match.
+// Guest-side mirror: this is compiled *inside* the sandbox and cannot link the host, so it keeps its
+// own copy of the values whose authority is the host table `svm_ir::errno` (negative, Linux values).
 const ENOENT: i64 = -2;
 const EEXIST: i64 = -17;
 const ENOTDIR: i64 = -20;

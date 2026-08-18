@@ -12,6 +12,7 @@
 //! backends apart by how they refuse (interposition invisibility, per EXEC.md).
 
 pub use svm_exec::*;
+use svm_ir::errno::*; // the one shared negative-errno table (#905)
 
 use crate::{Backend, HostCap, Instance, Limits, Outcome, RunConfig};
 use std::io::Write;
