@@ -98,13 +98,25 @@ impl Region {
         Region::Shared(Shared::new(base, size))
     }
 
-    /// The addressable length `[0, size)`.
-    pub fn len(&self) -> u64 {
+    /// The raw-backed variants (`Mapped`, `Shared`) both dispatch to the one accessor body in
+    /// [`Shared`] — `Mapped` *is* a `Shared` plus an owned `mmap` — so a single `Ok(&Shared)` arm
+    /// serves both; `Paged` (the safe reference) is the `Err` arm. This collapses every accessor's
+    /// former three-arm match to two, with no `Mapped`/`Shared` duplication to keep in step.
+    #[inline]
+    fn backing(&self) -> Result<&Shared, &Paged> {
         match self {
             #[cfg(unix)]
-            Region::Mapped(m) => m.size,
-            Region::Shared(s) => s.size,
-            Region::Paged(p) => p.size,
+            Region::Mapped(m) => Ok(&m.raw),
+            Region::Shared(s) => Ok(s),
+            Region::Paged(p) => Err(p),
+        }
+    }
+
+    /// The addressable length `[0, size)`.
+    pub fn len(&self) -> u64 {
+        match self.backing() {
+            Ok(s) => s.size,
+            Err(p) => p.size,
         }
     }
 
@@ -118,11 +130,9 @@ impl Region {
         if off >= self.len() {
             return 0;
         }
-        match self {
-            #[cfg(unix)]
-            Region::Mapped(m) => m.byte(off),
-            Region::Shared(s) => s.byte(off),
-            Region::Paged(p) => p.byte(off),
+        match self.backing() {
+            Ok(s) => s.byte(off),
+            Err(p) => p.byte(off),
         }
     }
 
@@ -131,11 +141,9 @@ impl Region {
         if off >= self.len() {
             return;
         }
-        match self {
-            #[cfg(unix)]
-            Region::Mapped(m) => m.set_byte(off, b),
-            Region::Shared(s) => s.set_byte(off, b),
-            Region::Paged(p) => p.set_byte(off, b),
+        match self.backing() {
+            Ok(s) => s.set_byte(off, b),
+            Err(p) => p.set_byte(off, b),
         }
     }
 
@@ -146,11 +154,9 @@ impl Region {
         if len == 0 {
             return;
         }
-        match self {
-            #[cfg(unix)]
-            Region::Mapped(m) => m.zero(off, len),
-            Region::Shared(s) => s.zero(off, len),
-            Region::Paged(p) => p.zero(off, len),
+        match self.backing() {
+            Ok(s) => s.zero(off, len),
+            Err(p) => p.zero(off, len),
         }
     }
 
@@ -163,11 +169,9 @@ impl Region {
         if len == 0 {
             return;
         }
-        match self {
-            #[cfg(unix)]
-            Region::Mapped(m) => m.fill(off, len, b),
-            Region::Shared(s) => s.fill(off, len, b),
-            Region::Paged(p) => p.fill(off, len, b),
+        match self.backing() {
+            Ok(s) => s.fill(off, len, b),
+            Err(p) => p.fill(off, len, b),
         }
     }
 
@@ -181,11 +185,9 @@ impl Region {
         if len == 0 {
             return;
         }
-        match self {
-            #[cfg(unix)]
-            Region::Mapped(m) => m.copy_within(dst, src, len),
-            Region::Shared(s) => s.copy_within(dst, src, len),
-            Region::Paged(p) => p.copy_within(dst, src, len),
+        match self.backing() {
+            Ok(s) => s.copy_within(dst, src, len),
+            Err(p) => p.copy_within(dst, src, len),
         }
     }
 
@@ -193,11 +195,9 @@ impl Region {
     /// the escape-oracle window snapshot, which can span the whole mapped extent — so the mmap
     /// backing bulk-copies rather than dispatching per byte.
     pub fn read_into(&self, off: u64, out: &mut [u8]) {
-        match self {
-            #[cfg(unix)]
-            Region::Mapped(m) => m.read_into(off, out),
-            Region::Shared(s) => s.read_into(off, out),
-            Region::Paged(p) => p.read_into(off, out),
+        match self.backing() {
+            Ok(s) => s.read_into(off, out),
+            Err(p) => p.read_into(off, out),
         }
     }
 
@@ -209,11 +209,9 @@ impl Region {
     /// confined `[off, off+width) ⊆ [0, size)` (e.g. via `svm_mask::Window::checked`).
     #[inline]
     pub fn read_word(&self, off: u64, width: u32) -> u64 {
-        match self {
-            #[cfg(unix)]
-            Region::Mapped(m) => m.read_word(off, width),
-            Region::Shared(s) => s.read_word(off, width),
-            Region::Paged(p) => p.read_word(off, width),
+        match self.backing() {
+            Ok(s) => s.read_word(off, width),
+            Err(p) => p.read_word(off, width),
         }
     }
 
@@ -221,53 +219,43 @@ impl Region {
     /// [`Region::read_word`] (same single-threaded contract). Keeps only the low `width` bytes.
     #[inline]
     pub fn write_word(&self, off: u64, width: u32, val: u64) {
-        match self {
-            #[cfg(unix)]
-            Region::Mapped(m) => m.write_word(off, width, val),
-            Region::Shared(s) => s.write_word(off, width, val),
-            Region::Paged(p) => p.write_word(off, width, val),
+        match self.backing() {
+            Ok(s) => s.write_word(off, width, val),
+            Err(p) => p.write_word(off, width, val),
         }
     }
 
     /// `width`-byte (4 or 8) sequentially-consistent atomic load (§12). The caller guarantees
     /// natural alignment and in-window bounds.
     pub fn atomic_load(&self, off: u64, width: u32) -> u64 {
-        match self {
-            #[cfg(unix)]
-            Region::Mapped(m) => m.atomic_load(off, width),
-            Region::Shared(s) => s.atomic_load(off, width),
-            Region::Paged(p) => p.atomic_load(off, width),
+        match self.backing() {
+            Ok(s) => s.atomic_load(off, width),
+            Err(p) => p.atomic_load(off, width),
         }
     }
 
     /// `width`-byte seq-cst atomic store.
     pub fn atomic_store(&self, off: u64, width: u32, val: u64) {
-        match self {
-            #[cfg(unix)]
-            Region::Mapped(m) => m.atomic_store(off, width, val),
-            Region::Shared(s) => s.atomic_store(off, width, val),
-            Region::Paged(p) => p.atomic_store(off, width, val),
+        match self.backing() {
+            Ok(s) => s.atomic_store(off, width, val),
+            Err(p) => p.atomic_store(off, width, val),
         }
     }
 
     /// `width`-byte seq-cst read-modify-write; returns the **old** value.
     pub fn atomic_rmw(&self, off: u64, width: u32, op: RmwOp, val: u64) -> u64 {
-        match self {
-            #[cfg(unix)]
-            Region::Mapped(m) => m.atomic_rmw(off, width, op, val),
-            Region::Shared(s) => s.atomic_rmw(off, width, op, val),
-            Region::Paged(p) => p.atomic_rmw(off, width, op, val),
+        match self.backing() {
+            Ok(s) => s.atomic_rmw(off, width, op, val),
+            Err(p) => p.atomic_rmw(off, width, op, val),
         }
     }
 
     /// `width`-byte seq-cst compare-exchange: store `replacement` iff the current value equals
     /// `expected`; always return the **old** value.
     pub fn atomic_cmpxchg(&self, off: u64, width: u32, expected: u64, replacement: u64) -> u64 {
-        match self {
-            #[cfg(unix)]
-            Region::Mapped(m) => m.atomic_cmpxchg(off, width, expected, replacement),
-            Region::Shared(s) => s.atomic_cmpxchg(off, width, expected, replacement),
-            Region::Paged(p) => p.atomic_cmpxchg(off, width, expected, replacement),
+        match self.backing() {
+            Ok(s) => s.atomic_cmpxchg(off, width, expected, replacement),
+            Err(p) => p.atomic_cmpxchg(off, width, expected, replacement),
         }
     }
 }
@@ -309,9 +297,11 @@ fn clamp_len(off: u64, len: u64, size: u64) -> u64 {
 pub use shared::Shared;
 
 /// A region over **caller-owned** memory — the parallel-wasm backing. Available on every target
-/// (unlike `Mapped`, which is unix-only): on wasm it spans the shared linear memory. Its bodies
-/// mirror `Mapped`'s raw-pointer hardware atomics exactly (minus mmap ownership / `Drop`); the
-/// `differential_*_fuzz` tests gate that the two stay byte-for-byte equivalent, so they can't drift.
+/// (unlike `Mapped`, which is unix-only): on wasm it spans the shared linear memory. This holds the
+/// tree's raw-pointer hardware-atomic accessor bodies **once**: `Mapped` is a thin `mmap`-owning
+/// wrapper around a `Shared` and delegates here (so the two cannot drift — it is not a gated
+/// invariant, it is unrepresentable). `differential_shared_vs_paged_fuzz` gates these bodies against
+/// the safe `Paged` reference.
 mod shared {
     use super::RmwOp;
     use core::sync::atomic::{
@@ -334,8 +324,23 @@ mod shared {
     unsafe impl Sync for Shared {}
 
     impl Shared {
+        /// Wrap `[base, base+size)` as the raw backing. The caller guarantees `base` points to ≥ `size`
+        /// valid, 8-aligned bytes that **outlive** this `Shared` and are touched *only* through it (and
+        /// its clones across threads) — so a naturally-aligned 4/8-byte atomic at any in-bounds offset
+        /// is a valid `AtomicU32`/`U64`. Both callers meet it: `Region::shared` (its `unsafe` contract)
+        /// over embedder memory, and `Mapped` over an `mmap` reservation it owns for the map's lifetime
+        /// (no aliasing beyond `map_len`).
         pub(super) fn new(base: *mut u8, size: u64) -> Shared {
             Shared { base, size }
+        }
+
+        /// The raw base pointer — for the owner (`Mapped`) to `munmap` exactly the reservation it
+        /// wrapped. Not for access (that goes through the bounds-checked accessors below). Only the
+        /// unix `Mapped` owner needs it; elsewhere `Shared` is non-owning, so gate it to avoid a
+        /// dead-code error under `-D warnings`.
+        #[cfg(unix)]
+        pub(super) fn base_ptr(&self) -> *mut u8 {
+            self.base
         }
 
         #[inline]
@@ -498,32 +503,18 @@ pub use mapped::Mapped;
 
 #[cfg(unix)]
 mod mapped {
-    use super::RmwOp;
-    use core::sync::atomic::{
-        AtomicU32, AtomicU64, AtomicU8,
-        Ordering::{Relaxed, SeqCst},
-    };
+    use super::Shared;
 
-    /// One anonymous `mmap` of `[0, size)` (rounded up to `map_len`). The base is page-aligned, so
-    /// any naturally-aligned 4/8-byte access is hardware-atomic-able.
+    /// One anonymous `mmap` of `[0, size)` (rounded up to `map_len`), owned here — the unix parallel
+    /// backing. A **thin owner**: every raw-pointer accessor body lives once in [`Shared`], which this
+    /// wraps; `Mapped` adds only the reservation's lifecycle (`mmap` in `new`, `munmap` in `Drop`).
+    /// The base is page-aligned, so any naturally-aligned 4/8-byte access is hardware-atomic-able.
+    /// `Send`/`Sync` are **automatic** — a `Shared` (itself declared shareable under the crate's raced-
+    /// atomics contract) plus a `usize` — so `Mapped` needs no `unsafe impl` of its own.
     pub struct Mapped {
-        base: *mut u8,
-        pub(super) size: u64,
+        pub(super) raw: Shared,
         map_len: usize,
     }
-
-    // SAFETY: `Mapped` is the only non-`Send`/`Sync`-by-default piece of `Region` (it holds a raw
-    // `*mut u8`). Sharing it across vCPU threads is sound under the contract documented on the crate:
-    //   * the mmap is a process-wide reservation owned by this value (freed once on `Drop`), so
-    //     moving it between threads (`Send`) transfers nothing thread-local;
-    //   * concurrent access through `&Mapped` (`Sync`) is either a real hardware atomic (`atomic_*`,
-    //     seq-cst) or a relaxed-atomic single byte (`byte`/`set_byte`) — both *defined* under races,
-    //     never UB. Bulk `zero`/`read_into` are control-plane and not raced against live access.
-    // Every offset is bounds-checked by `Region` before reaching here, and masking (§4) confines the
-    // address upstream, so no access can leave `[0, size)` — a guest race can corrupt only the
-    // guest's own memory, never escape the window (§12).
-    unsafe impl Send for Mapped {}
-    unsafe impl Sync for Mapped {}
 
     impl Mapped {
         pub(super) fn new(size: u64, page: u64) -> Option<Mapped> {
@@ -567,189 +558,31 @@ mod mapped {
                 base as *mut u8
             };
 
+            // Wrap the owned reservation as the raw backing — the accessor bodies live in `Shared`.
             Some(Mapped {
-                base,
-                size,
+                raw: Shared::new(base, size),
                 map_len,
             })
         }
-
-        #[inline]
-        fn ptr(&self, off: u64) -> *mut u8 {
-            // SAFETY: callers go through `Region`, which bounds `off < size <= map_len`.
-            unsafe { self.base.add(off as usize) }
-        }
-
-        pub(super) fn byte(&self, off: u64) -> u8 {
-            // Relaxed atomic so a concurrent same-byte write is defined, not UB. On x86 this is a
-            // plain `mov`. SAFETY: `off < size`; a `*mut u8` is trivially 1-aligned for `AtomicU8`.
-            unsafe { AtomicU8::from_ptr(self.ptr(off)).load(Relaxed) }
-        }
-
-        pub(super) fn set_byte(&self, off: u64, b: u8) {
-            // SAFETY: as `byte`.
-            unsafe { AtomicU8::from_ptr(self.ptr(off)).store(b, Relaxed) }
-        }
-
-        #[inline]
-        pub(super) fn read_word(&self, off: u64, width: u32) -> u64 {
-            let p = self.ptr(off);
-            // SAFETY: the caller confined `[off, off+width) ⊆ [0, size)` (see `Region::read_word`), so
-            // `p..p+width` is in the mapping; `read_unaligned` needs no alignment. **Non-atomic** —
-            // sound only for the single-threaded bytecode caller (no concurrent access to this range).
-            unsafe {
-                match width {
-                    1 => p.read() as u64,
-                    2 => p.cast::<u16>().read_unaligned() as u64,
-                    4 => p.cast::<u32>().read_unaligned() as u64,
-                    _ => p.cast::<u64>().read_unaligned(),
-                }
-            }
-        }
-
-        #[inline]
-        pub(super) fn write_word(&self, off: u64, width: u32, val: u64) {
-            let p = self.ptr(off);
-            // SAFETY: as `read_word`.
-            unsafe {
-                match width {
-                    1 => p.write(val as u8),
-                    2 => p.cast::<u16>().write_unaligned(val as u16),
-                    4 => p.cast::<u32>().write_unaligned(val as u32),
-                    _ => p.cast::<u64>().write_unaligned(val),
-                }
-            }
-        }
-
-        pub(super) fn zero(&self, off: u64, len: u64) {
-            // SAFETY: `[off, off+len)` is within `[0, size)` (clamped by the caller). Control-plane:
-            // not concurrent with live access to the range.
-            unsafe { core::ptr::write_bytes(self.ptr(off), 0, len as usize) }
-        }
-
-        pub(super) fn fill(&self, off: u64, len: u64, b: u8) {
-            // SAFETY: as `zero`, with an arbitrary fill byte. Non-atomic bulk — single-threaded caller.
-            unsafe { core::ptr::write_bytes(self.ptr(off), b, len as usize) }
-        }
-
-        pub(super) fn copy_within(&self, dst: u64, src: u64, len: u64) {
-            // SAFETY: both spans `⊆ [0, size)` (clamped by caller); `ptr::copy` is overlap-safe
-            // (`memmove`). Non-atomic bulk — sound only for the single-threaded cooperative caller.
-            unsafe { core::ptr::copy(self.ptr(src), self.ptr(dst), len as usize) }
-        }
-
-        pub(super) fn read_into(&self, off: u64, out: &mut [u8]) {
-            // Copy the in-range prefix in one shot; anything past `size` stays whatever `out` held
-            // (the caller zeroes `out` first).
-            let avail = self.size.saturating_sub(off) as usize;
-            let n = avail.min(out.len());
-            if n == 0 {
-                return;
-            }
-            // SAFETY: `[off, off+n)` is within `[0, size)`; `out[..n]` is a distinct caller buffer.
-            unsafe { core::ptr::copy_nonoverlapping(self.ptr(off), out.as_mut_ptr(), n) }
-        }
-
-        pub(super) fn atomic_load(&self, off: u64, width: u32) -> u64 {
-            // SAFETY: caller guarantees `off` is `width`-aligned and in-bounds; base is page-aligned,
-            // so `base+off` is `width`-aligned → a valid `AtomicU32`/`U64` location.
-            unsafe {
-                match width {
-                    4 => AtomicU32::from_ptr(self.ptr(off) as *mut u32).load(SeqCst) as u64,
-                    _ => AtomicU64::from_ptr(self.ptr(off) as *mut u64).load(SeqCst),
-                }
-            }
-        }
-
-        pub(super) fn atomic_store(&self, off: u64, width: u32, val: u64) {
-            // SAFETY: aligned + in-bounds as in `atomic_load`.
-            unsafe {
-                match width {
-                    4 => AtomicU32::from_ptr(self.ptr(off) as *mut u32).store(val as u32, SeqCst),
-                    _ => AtomicU64::from_ptr(self.ptr(off) as *mut u64).store(val, SeqCst),
-                }
-            }
-        }
-
-        pub(super) fn atomic_rmw(&self, off: u64, width: u32, op: RmwOp, val: u64) -> u64 {
-            // SAFETY: aligned + in-bounds as in `atomic_load`.
-            unsafe {
-                match width {
-                    4 => {
-                        let a = AtomicU32::from_ptr(self.ptr(off) as *mut u32);
-                        let v = val as u32;
-                        let old = match op {
-                            RmwOp::Add => a.fetch_add(v, SeqCst),
-                            RmwOp::Sub => a.fetch_sub(v, SeqCst),
-                            RmwOp::And => a.fetch_and(v, SeqCst),
-                            RmwOp::Or => a.fetch_or(v, SeqCst),
-                            RmwOp::Xor => a.fetch_xor(v, SeqCst),
-                            RmwOp::Xchg => a.swap(v, SeqCst),
-                        };
-                        old as u64
-                    }
-                    _ => {
-                        let a = AtomicU64::from_ptr(self.ptr(off) as *mut u64);
-                        match op {
-                            RmwOp::Add => a.fetch_add(val, SeqCst),
-                            RmwOp::Sub => a.fetch_sub(val, SeqCst),
-                            RmwOp::And => a.fetch_and(val, SeqCst),
-                            RmwOp::Or => a.fetch_or(val, SeqCst),
-                            RmwOp::Xor => a.fetch_xor(val, SeqCst),
-                            RmwOp::Xchg => a.swap(val, SeqCst),
-                        }
-                    }
-                }
-            }
-        }
-
-        pub(super) fn atomic_cmpxchg(
-            &self,
-            off: u64,
-            width: u32,
-            expected: u64,
-            replacement: u64,
-        ) -> u64 {
-            // SAFETY: aligned + in-bounds as in `atomic_load`. `compare_exchange` returns the prior
-            // value in both the `Ok` (swapped) and `Err` (unchanged) arms.
-            unsafe {
-                match width {
-                    4 => {
-                        let a = AtomicU32::from_ptr(self.ptr(off) as *mut u32);
-                        match a.compare_exchange(
-                            expected as u32,
-                            replacement as u32,
-                            SeqCst,
-                            SeqCst,
-                        ) {
-                            Ok(old) | Err(old) => old as u64,
-                        }
-                    }
-                    _ => {
-                        let a = AtomicU64::from_ptr(self.ptr(off) as *mut u64);
-                        match a.compare_exchange(expected, replacement, SeqCst, SeqCst) {
-                            Ok(old) | Err(old) => old,
-                        }
-                    }
-                }
-            }
-        }
     }
 
+    // The mapping outlives every use of the inner `Shared`: nothing hands out the base pointer except
+    // this `Drop`, which runs once, after all `&self` accesses have ended (structural via ownership).
     impl Drop for Mapped {
         fn drop(&mut self) {
+            let base = self.raw.base_ptr();
             #[cfg(miri)]
             // SAFETY: the exact layout `new` allocated under miri (8-aligned, `map_len` bytes).
             unsafe {
                 std::alloc::dealloc(
-                    self.base,
+                    base,
                     std::alloc::Layout::from_size_align_unchecked(self.map_len, 8),
                 );
             }
             #[cfg(not(miri))]
             // SAFETY: releasing exactly the reservation created in `new`.
             unsafe {
-                libc::munmap(self.base as *mut libc::c_void, self.map_len);
+                libc::munmap(base as *mut libc::c_void, self.map_len);
             }
         }
     }
@@ -1251,22 +1084,12 @@ mod tests {
         assert_eq!(ai, bi, "final region images diverge");
     }
 
-    /// `Mapped` (the unix mmap backing, the crate's `unsafe`) vs the `Paged` safe reference. On
-    /// non-unix `Region::new` is itself `Paged`, so it degenerates to a self-consistency check.
-    #[test]
-    fn differential_mapped_vs_paged_fuzz() {
-        let (size, page) = (3 * 4096, 4096);
-        fuzz_against(
-            &Region::new(size, page),
-            &Region::Paged(Paged::new(size, page)),
-            size,
-            page,
-        );
-    }
-
-    /// `Shared` (the borrowed parallel-wasm backing) vs the `Paged` reference — gates that its
-    /// raw-pointer atomics agree with the safe model byte-for-byte across 20k ops, so the duplicated
-    /// bodies can't drift from `Mapped`.
+    /// The **one** raw-pointer accessor body (`Shared`, which `Mapped` now merely `mmap`-owns and
+    /// delegates to) vs the `Paged` safe reference — gates that the `unsafe` atomics/bulk ops agree
+    /// with the safe model byte-for-byte across 20k ops. The former `Mapped`-vs-`Paged` twin was a
+    /// drift gate between two copies of this body; with the copies merged, drift is unrepresentable,
+    /// so that test could no longer fail and was deleted (invariant 1). The unix `mmap` lifecycle
+    /// stays covered by `Region::new` in the unit tests + `shared_atomic_counter_across_threads`.
     #[test]
     fn differential_shared_vs_paged_fuzz() {
         let (size, page) = (3 * 4096, 4096);
