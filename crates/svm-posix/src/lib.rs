@@ -290,6 +290,7 @@ fn default_ignored(sig: i32) -> bool {
 }
 
 /// #798 slice 2 — `waitpid` option bits (Linux values).
+const WNOHANG: i64 = 1; // never block (#799 — the poll everyone implicitly had before)
 const WUNTRACED: i64 = 2; // also report a freshly-stopped child
 const WCONTINUED: i64 = 8; // also report a freshly-continued child
 const EEXIST: i64 = -17; // mkdir/rename onto a path that already exists
@@ -807,6 +808,18 @@ struct Proc {
     /// parked blocking call. Last delivery wins (the documented approximation of POSIX's
     /// per-interrupting-handler rule for near-simultaneous mixed-flag deliveries).
     restart_ok: bool,
+    /// #799 — the core's **park-request closure** ([`SignalSource::set_park_request`], installed
+    /// beside the wake/stop/kill doors): `waitpid` fires it with `ParkEvent::TaskExit(child)` to
+    /// ask that the calling vCPU be benched until the child exits, then returns the `-ECHILD`
+    /// placeholder (which doubles as the degraded poll answer on any route that cannot park).
+    /// `None` (a driver without the door — the bytecode engine, the JIT, a bare unit `Ctx`)
+    /// keeps today's poll everywhere — same degradation family as `stop`/`kill`.
+    park_req: Option<Arc<dyn Fn(svm_interp::ParkEvent) + Send + Sync>>,
+    /// #799 — this process's pid **is a core scheduler `TaskId`** (a fork twin registered by the
+    /// factory with the core-minted pid) — exactly the processes whose exit the core's
+    /// twin-completion wake covers, so exactly the ones a blocking `waitpid` may bench on.
+    /// `false` for the root and for spawn/re-grant clones (personality-allocated pids).
+    core_task: bool,
 }
 
 /// One dispatch's view over the two personality lock domains — the shared [`World`] and the calling
@@ -1225,6 +1238,11 @@ impl SignalSource for SignalDoor {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).kill = Some(kill);
     }
 
+    /// #799 — store the core's park-request closure for this process's domain.
+    fn set_park_request(&self, req: Arc<dyn Fn(svm_interp::ParkEvent) + Send + Sync>) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).park_req = Some(req);
+    }
+
     /// #796 `SA_RESTART` — answer the park sites: does the delivery behind the just-consumed
     /// interrupt want the blocking call restarted?
     fn syscall_restart(&self) -> bool {
@@ -1313,6 +1331,9 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
         // — so scheduler → world here cannot cross a world → scheduler hold.)
         let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
         let mut child = proc_.lock().unwrap_or_else(|e| e.into_inner()).fork();
+        // #799 — a non-zero pid IS the twin's scheduler TaskId: exactly the processes the core's
+        // twin-completion wake covers, so exactly the ones blocking `waitpid` may bench on.
+        child.core_task = pid != 0;
         let pid = if pid != 0 {
             pid as i32
         } else {
@@ -1496,6 +1517,8 @@ fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
         term_sig: None,
         handler_mask_stack: Vec::new(),
         restart_ok: false,
+        park_req: None,
+        core_task: false,
     }
 }
 
@@ -1823,6 +1846,8 @@ impl Proc {
             term_sig: None,
             handler_mask_stack: self.handler_mask_stack.clone(), // forked mid-handler: the twin restores on its inherited return (POSIX fork copies signal state)
             restart_ok: self.restart_ok,
+            park_req: None, // the twin's own door lands at mint, like the wake/stop/kill
+            core_task: false, // stamped by [`fork_factory`] beside the pid
         }
     }
 }
@@ -2374,6 +2399,27 @@ impl Ctx<'_> {
             }
         }
         let Some(p) = reaped else {
+            // #799 — blocking `waitpid`: nothing to reap and the caller did not opt out
+            // (`WNOHANG`) or ask for stop/continue reports (those keep polling this rung).
+            // If the target is a specific, Live, core-task twin — exactly the processes the
+            // core's twin-completion wake covers — request the bench: the core rewinds this
+            // very op and re-runs it against the retired entry when the child exits. The
+            // `-ECHILD` below then doubles as the placeholder (parking routes discard it)
+            // AND the degraded poll answer (non-parking routes/tiers keep the historical
+            // spin — same results, decline-never-diverge).
+            if (opts & (WNOHANG | WUNTRACED | WCONTINUED)) == 0 && pid > 0 {
+                if let Some(req) = self.p.park_req.clone() {
+                    let target_is_core_twin = match self.w.procs.get(&(pid as i32)) {
+                        Some(ProcEntry::Live(t)) => {
+                            t.lock().unwrap_or_else(|e| e.into_inner()).core_task
+                        }
+                        _ => false,
+                    };
+                    if target_is_core_twin {
+                        req(svm_interp::ParkEvent::TaskExit(pid as u64));
+                    }
+                }
+            }
             return Ok(vec![ECHILD]);
         };
         let status: i32 = match self.w.procs.remove(&p) {

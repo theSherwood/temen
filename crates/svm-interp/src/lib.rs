@@ -2149,6 +2149,7 @@ fn drive_over_cell(
         let root_dom = hg.domain_id() as usize;
         let stop_flag = hg.stop_flag.clone();
         let term_flag = hg.term_flag.clone();
+        let park_request = hg.park_request.clone();
         let source = hg.signal_poll().map(|(_, s)| s);
         drop(hg); // release before `set_wake` (the door takes the personality's own lock)
         if let Some(source) = source {
@@ -2178,6 +2179,13 @@ fn drive_over_cell(
                     s.interrupt_interruptible_parks(root_dom, false);
                     s.wake_stopped(root_dom);
                 }
+            }));
+            // #799 — the park-request closure: a pre-cloned lock-free cell (the dispatch runs
+            // under this Host's lock, so the closure must not re-lock it).
+            let park_cell = park_request.clone();
+            source.set_park_request(Arc::new(move |ev| {
+                let ParkEvent::TaskExit(id) = ev;
+                park_cell.store(id, Ordering::SeqCst);
             }));
         }
     }
@@ -4108,6 +4116,11 @@ enum Blocked {
     /// Blocked in `thread.join` on child task `child` (the join handle's table slot is recorded in the
     /// vCPU's `pending`, set before it parks).
     Join { child: TaskId },
+    /// #799 — benched by a personality **park request** ([`ParkEvent::TaskExit`]): a blocking
+    /// `waitpid` whose op was rewound; re-admitted (no pending value — it re-executes against the
+    /// personality's now-retired table entry) by the twin-completion wake, the EINTR sweep, or the
+    /// park-vs-completion re-check at insert.
+    ReapWait { child: TaskId },
     /// Blocked in `atomic.wait`. `key` is the canonical rendezvous coordinate the wait-queue and
     /// `notify` match on (region-canonical for aliased pages — S1b); `addr` is the confined absolute
     /// address the driver re-reads to compare against `expected` under its lock (the futex
@@ -4431,6 +4444,13 @@ struct Sched {
     /// a vCPU observes its domain's stop flag; drained wholesale by [`Scheduler::wake_stopped`]
     /// (the personality's SIGCONT). Swept like every waiter map at teardown.
     stopped: BTreeMap<usize, VecDeque<Box<VCpu>>>,
+    /// #799 — vCPUs benched by a personality park request on a child's exit
+    /// ([`Blocked::ReapWait`]), keyed by the awaited child task. A `Vec` (not one-per-key like
+    /// `join_waiters` — deliberately a separate map so the offer path's single-waiter slot is
+    /// never contended): several processes may block on one child. Drained at the
+    /// twin-completion point (after the exit hooks retire the personality entry, so the
+    /// re-executed op reaps), by the EINTR sweep, and at teardown.
+    posix_reap_waiters: BTreeMap<TaskId, Vec<Box<VCpu>>>,
     /// FORK.md §8.6 — vCPUs/fibers parked in a **blocking pipe read** ([`Blocked::PipeRead`]), keyed
     /// by pipe id. Woken by a `write` to that pipe (data available) or by its last write end closing
     /// (writer count → 0, EOF); both drain the entry into `runnable` and the read re-issues. Same shape
@@ -4765,6 +4785,30 @@ impl Scheduler {
                     svc_wake_locked(&mut s, svc);
                 }
             }
+        }
+        // #799 — blocking-`waitpid` benches (`Blocked::ReapWait`) are interruptible syscalls:
+        // wake with the host EINTR flag (the pipe discipline — the rewound op re-executes,
+        // re-requests its park, and the dispatch arm converts flag+request into `-EINTR`, with
+        // `SA_RESTART` re-parking silently through the same re-execution).
+        let mut hit_reaps: Vec<Box<VCpu>> = Vec::new();
+        for ws in s.posix_reap_waiters.values_mut() {
+            let mut i = 0;
+            while i < ws.len() {
+                if domain_key_of(&ws[i]) == domain {
+                    hit_reaps.push(ws.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        s.posix_reap_waiters.retain(|_, ws| !ws.is_empty());
+        for v in hit_reaps {
+            v.host
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_sig_interrupt();
+            s.runnable.push_back(v);
+            n += 1;
         }
         // #796 slice D — blocking **stream** reads (`Blocked::CapRead` — the stdin park): complete
         // the parked call with `-EINTR`, the exact injection shape `cap_revoke` uses (a value on
@@ -5114,6 +5158,7 @@ impl Scheduler {
             let dom = hg.domain_id() as usize;
             let stop_flag = hg.stop_flag.clone();
             let term_flag = hg.term_flag.clone();
+            let park_request = hg.park_request.clone();
             let source = hg.signal_poll().map(|(_, s)| s);
             drop(hg); // release before `set_wake` (the door takes the personality's own lock)
             if let Some(source) = source {
@@ -5141,6 +5186,12 @@ impl Scheduler {
                         sc.interrupt_interruptible_parks(dom, false);
                         sc.wake_stopped(dom);
                     }
+                }));
+                // #799 — the twin's park-request closure, minted with its wake/stop/kill.
+                let park_cell = park_request.clone();
+                source.set_park_request(Arc::new(move |ev| {
+                    let ParkEvent::TaskExit(id) = ev;
+                    park_cell.store(id, Ordering::SeqCst);
                 }));
             }
         }
@@ -5561,6 +5612,18 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
     }
     // #798 — the dying domain's stopped parks die with it (a stopped job killed at run end).
     victims.extend(s.stopped.remove(&key).unwrap_or_default());
+    // #799 — the dying domain's blocking-`waitpid` benches die with it; other domains' stay.
+    for ws in s.posix_reap_waiters.values_mut() {
+        let mut i = 0;
+        while i < ws.len() {
+            if domain_key_of(&ws[i]) == key {
+                victims.push(ws.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+    }
+    s.posix_reap_waiters.retain(|_, ws| !ws.is_empty());
     // Parked `wait(-1)`/`waitpid(-pgid)` callers of the dying domain are reaped; others stay parked.
     let raw = std::mem::take(&mut s.reap_any_waiters);
     for (target, v) in raw {
@@ -6208,6 +6271,16 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         }
                     }
                 }
+                // #799 — wake blocking-`waitpid` benchers of this child ([`Blocked::ReapWait`]).
+                // Deliberately AFTER the exit hooks: the woken op re-executes and must find the
+                // personality's table entry already retired (Live → Zombie). No pending value —
+                // the op was rewound, the personality's own answer machinery serves the reply.
+                if let Some(ws) = s.posix_reap_waiters.remove(&id) {
+                    for w in ws {
+                        s.runnable.push_back(w);
+                    }
+                    sched.work.notify_all();
+                }
                 // §12 domain lifetime: a member of an already-dead domain finishing *after* the
                 // teardown sweep (it was running — teardown is non-preemptive) observes the domain's
                 // end, not its own late Ok: post-teardown sibling effects are unspecified, but the
@@ -6325,6 +6398,24 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     v.pending = Some(Pending::CapResult(if live { EINTR } else { CAP_REVOKED }));
                     s.runnable.push_back(v);
                     sched.work.notify_one();
+                }
+            }
+            Step::Park(Blocked::ReapWait { child }) => {
+                // #799 — bench a blocking `waitpid` until `child` exits. Park-vs-completion race
+                // (the CapRead/Stopped discipline): enqueue under the scheduler lock, but if the
+                // child's task has ALREADY completed (its outcome is in `results` — the completion
+                // path fired the exit hooks and drained this map before we were in it), re-admit
+                // instead of parking forever; the rewound op re-executes and reaps the zombie.
+                let mut s = sched.lock();
+                let Some(v) = park_gate(&mut s, v) else {
+                    sched.work.notify_all();
+                    return;
+                };
+                if s.results.contains_key(&child) {
+                    s.runnable.push_back(v);
+                    sched.work.notify_one();
+                } else {
+                    s.posix_reap_waiters.entry(child).or_default().push(v);
                 }
             }
             Step::Park(Blocked::Stopped) => {
@@ -7359,7 +7450,10 @@ impl SchedDriver {
                     | Blocked::ContResumeBlock { .. }
                     // #798: the explorer never installs a stop closure, so the stop flag is never
                     // set and this park never fires — defensive, fail-closed like the rest.
-                    | Blocked::Stopped,
+                    | Blocked::Stopped
+                    // #799: likewise no park-request door on the explorer — a personality op's
+                    // request is take-and-dropped at the dispatch arms, so this park never fires.
+                    | Blocked::ReapWait { .. },
                 ) => {
                     let id = v.id;
                     let key = domain_key_of(&v); // §12 teardown: read before the vCPU is dropped
@@ -10707,6 +10801,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                 sc.wake_stopped(dom);
                                             }
                                         }));
+                                        // #799 — and its park-request closure.
+                                        let park_cell = ch.park_request.clone();
+                                        source.set_park_request(Arc::new(move |ev| {
+                                            let ParkEvent::TaskExit(id) = ev;
+                                            park_cell.store(id, Ordering::SeqCst);
+                                        }));
                                     }
                                 }
                                 // IMPORTS.md phase 3 / S2.1 + §3.3: bind the child module's
@@ -11139,6 +11239,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                 sc.interrupt_interruptible_parks(dom, false);
                                                 sc.wake_stopped(dom);
                                             }
+                                        }));
+                                        // #799 — and its park-request closure.
+                                        let park_cell = ch.park_request.clone();
+                                        source.set_park_request(Arc::new(move |ev| {
+                                            let ParkEvent::TaskExit(id) = ev;
+                                            park_cell.store(id, Ordering::SeqCst);
                                         }));
                                     }
                                 }
@@ -12164,10 +12270,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let pipe_park = hg.take_pipe_read_parked();
                     let pipe_write_park = hg.take_pipe_write_parked();
                     let pipe_wake_w = hg.take_pipe_wake_writers();
+                    // #799 — a personality park request (blocking `waitpid` asked to bench its
+                    // caller on a child's exit). Taken here like every transient (consume-everywhere).
+                    let reap_park = hg.take_park_request();
                     // #796 L1 — a `raise()` interrupted a parked blocking op: consume the EINTR flag, but
                     // only when *this* op is actually about to park (a completed read/write must not eat
                     // it). Short-circuits so `take_sig_interrupt` fires only on a genuine park.
-                    let sig_intr = (pipe_park.is_some() || pipe_write_park.is_some())
+                    let sig_intr = (pipe_park.is_some()
+                        || pipe_write_park.is_some()
+                        || reap_park.is_some())
                         && hg.take_sig_interrupt()
                         // #796 SA_RESTART: a restart-flagged delivery re-parks silently instead
                         && !hg.signal_restart();
@@ -12208,6 +12319,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             }
                         }
                         // A non-parkable context (a fiber, the explorer) keeps the placeholder result.
+                    }
+                    // #799 — bench a blocking `waitpid` on its child's exit: the pipe discipline
+                    // exactly (rewind so the op re-executes on wake and reaps from the
+                    // personality's now-retired table entry; a consumed interrupt completes
+                    // `-EINTR`; SA_RESTART re-parks via the re-executed op's re-request).
+                    if let Some(child) = reap_park {
+                        if *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
+                            if sig_intr {
+                                frames[top].vals.push(Reg::from_i64(EINTR));
+                                eintr_done = true;
+                            } else {
+                                frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
+                                return Ok(Inner::Park(Blocked::ReapWait { child }));
+                            }
+                        }
+                        // A non-parkable context keeps the placeholder answer (the -ECHILD poll).
                     }
                     if !eintr_done {
                         for (s, ty) in results.iter().zip(&sig.results) {
@@ -12383,6 +12510,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // the §3.6 caller-parking slice); discard the flag so it can't leak into a
                     // later direct call's park decision — the read keeps its historical 0-EOF.
                     let _ = hg.take_stdin_parked();
+                    let _ = hg.take_park_request(); // #799: likewise — degrade to the poll answer
                     for (s, ty) in results.iter().zip(&sig.results) {
                         frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
                     }
@@ -12523,9 +12651,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // writer; a drained-full read / reader-to-zero close wakes parked writers.
                     let pipe_write_park = hg.take_pipe_write_parked();
                     let pipe_wake_w = hg.take_pipe_wake_writers();
+                    // #799 — a personality park request (blocking `waitpid`); this named-import
+                    // route is where a shim-linked guest's `waitpid` lands.
+                    let reap_park = hg.take_park_request();
                     // #796 L1 — take the EINTR flag only when this named-import op is about to park (as in
                     // the `cap.call` arm above), so a raised signal completes it `-EINTR` not re-parks.
-                    let sig_intr = (pipe_park.is_some() || pipe_write_park.is_some())
+                    let sig_intr = (pipe_park.is_some()
+                        || pipe_write_park.is_some()
+                        || reap_park.is_some())
                         && hg.take_sig_interrupt()
                         // #796 SA_RESTART: a restart-flagged delivery re-parks silently instead
                         && !hg.signal_restart();
@@ -12555,6 +12688,19 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             }
                         }
                         // A non-parkable context (a fiber, the explorer) keeps the placeholder result.
+                    }
+                    // #799 — bench a blocking `waitpid` (see the `cap.call` arm for the shape).
+                    if let Some(child) = reap_park {
+                        if *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
+                            if sig_intr {
+                                frames[top].vals.push(Reg::from_i64(EINTR));
+                                eintr_done = true;
+                            } else {
+                                frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
+                                return Ok(Inner::Park(Blocked::ReapWait { child }));
+                            }
+                        }
+                        // A non-parkable context keeps the placeholder answer (the -ECHILD poll).
                     }
                     if let Some(pipe) = pipe_wake {
                         sched.wake_pipe_readers(pipe);
@@ -12606,6 +12752,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let results =
                         hg.cap_dispatch_slots(svm_ir::CAP_DYN_TYPE_ID, packed, h, &argv, gm)?;
                     let _ = hg.take_stdin_parked(); // no dyn-parking this slice (see call.import)
+                    let _ = hg.take_park_request(); // #799: likewise — degrade to the poll answer
                     for (s, tyv) in results.iter().zip(&sig.results) {
                         frames[top]
                             .vals
@@ -16605,6 +16752,21 @@ impl RegionMinter for Host {
 /// safepoint redirect, invariant 4) lives in the interp; svm-interp never names a personality, it only
 /// calls this. The interp polls a cheap [`Host::sig_armed`] flag per op and, when set and not already in a
 /// handler, asks the source for the next delivery.
+/// #799 — a **core-legible park event**: what a personality asks the core to bench its caller
+/// on, through [`SignalSource::set_park_request`]. This is the generic face of the eval loop's
+/// park-transient family (`stdin_parked`, the pipe parks — consolidation tracked in #941): the
+/// personality names an *event the scheduler already owns*, never a POSIX concept — the two-verbs/
+/// one-vocabulary split (park requests = self, synchronous; the wake/stop/kill doors = another
+/// domain, asynchronous; both over the same event nouns). Variants grow here (`Deadline`,
+/// `AnyOf` for select/poll) — new nouns, not new mechanisms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParkEvent {
+    /// Bench the caller until task `0` exits — the blocking-`waitpid` event (#799): the wake is
+    /// the twin-completion point that already fires the exit hooks, so the re-executed op finds
+    /// the personality's table entry already retired.
+    TaskExit(TaskId),
+}
+
 /// #796 — the ceiling on **nested** injected signal-handler frames per fiber. The source's
 /// block-during-handler masking already prevents same-signal reentry; this bounds pathological
 /// distinct-signal towers (each nested delivery costs a call frame on the interrupted stack).
@@ -16677,6 +16839,17 @@ pub trait SignalSource: Send + Sync {
     /// SIGTERM, …); the core never sees a signal number, it only kills a domain on request.
     /// Default no-op — a source with no default-action story need not store it.
     fn set_kill(&self, _kill: Arc<dyn Fn() + Send + Sync>) {}
+
+    /// #799 — store the run's **park-request closure**: the personality fires it *during* one of
+    /// its own dispatches to ask that the calling vCPU be benched on a [`ParkEvent`] instead of
+    /// taking the op's placeholder answer. Lock-free by construction (the dispatch runs under the
+    /// caller's `Host` lock, so the closure writes a pre-cloned atomic cell — the `stop_flag`
+    /// discipline); the eval loop's dispatch-completion arms consume the cell: parkable routes
+    /// rewind the op and park (it re-executes on wake), every other route drops the request and
+    /// the placeholder stands — graceful degradation, identical results (a non-parking tier just
+    /// polls, as every caller did before this door existed). Default no-op — a source with no
+    /// blocking ops need not store it.
+    fn set_park_request(&self, _req: Arc<dyn Fn(ParkEvent) + Send + Sync>) {}
 }
 
 /// The host: the **host-owned handle table** (the powerbox) plus deterministic mock
@@ -16946,6 +17119,12 @@ pub struct Host {
     /// checked after kill, before stop — death beats stop) and self-terminates ([`Trap::ThreadFault`])
     /// when set. On the `Host` so thread siblings share it — a terminate kills the whole domain.
     term_flag: Arc<AtomicBool>,
+    /// #799 — the **park-request cell** ([`SignalSource::set_park_request`]): a personality
+    /// dispatch stores the [`ParkEvent::TaskExit`] task id here (`0` = none) to ask that its
+    /// caller be benched; the dispatch-completion arms take it (parkable routes park, the rest
+    /// drop). An `Arc`'d atomic — not a locked field — because the requesting closure runs while
+    /// the interp holds this `Host`'s lock (the `stop_flag`/`term_flag` discipline).
+    park_request: Arc<AtomicU64>,
     /// §4/§7 the **JIT cap-path window page map**, keyed by window base. The JIT's `cap_thunk` rebuilds
     /// its window view per `cap.call`, so without a persistent home a guest-*grown* heap page (committed
     /// via the Memory cap in an earlier call) would read back as unmapped and a cap-buffer borrow of it
@@ -17338,6 +17517,7 @@ impl Host {
             exit_hooks: Vec::new(),
             stop_flag: Arc::new(AtomicBool::new(false)),
             term_flag: Arc::new(AtomicBool::new(false)),
+            park_request: Arc::new(AtomicU64::new(0)),
             cap_pages: None,
             quota: Quota::default(),
             jit_domains: Vec::new(),
@@ -17783,6 +17963,16 @@ impl Host {
     /// [`Outcome::StdinPark`]). Crate-internal: the bytecode engine lives in a sibling module.
     pub(crate) fn take_stdin_parked(&mut self) -> bool {
         core::mem::take(&mut self.stdin_parked)
+    }
+
+    /// #799 — take the pending park request (`None` = none). Consume-everywhere discipline: every
+    /// dispatch-completion arm calls this, so a request made on a non-parkable route can never
+    /// leak into a later call's park decision (the `take_stdin_parked` precedent).
+    fn take_park_request(&self) -> Option<TaskId> {
+        match self.park_request.swap(0, Ordering::SeqCst) {
+            0 => None,
+            id => Some(id),
+        }
     }
 
     /// FORK.md §8.6 — take the transient "the last pipe read must park" flag (`Some(pipe)`), so the
