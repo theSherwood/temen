@@ -663,7 +663,13 @@ enum ProcEntry {
     Live(Arc<Mutex<Proc>>),
     /// A spawn-delegate child that already ran to completion: its wait-encoded exit status, held
     /// until `waitpid`/`wait` reaps it — a zombie.
-    Zombie(i32),
+    Zombie {
+        /// The wait-encoded status `waitpid` serves.
+        status: i32,
+        /// #799 — the pgid at exit, retained so `waitpid(-pgid)` can group-reap a zombie whose
+        /// `Proc` (the live pgid's home) is already gone.
+        pgid: i32,
+    },
 }
 
 /// #863 — **per-process** state: what POSIX `fork()` copies (and what `exec` will one day reset).
@@ -1029,7 +1035,7 @@ impl Posix {
                     // target's dispositions; fired below, after the locks drop.
                     tp.deliver_signal(signum)
                 }
-                Some(ProcEntry::Zombie(_)) => None, // exists until reaped; takes no signal
+                Some(ProcEntry::Zombie { .. }) => None, // exists until reaped; takes no signal
                 None => return ESRCH,
             }
         };
@@ -1354,16 +1360,22 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
         let exit_world = Arc::clone(&world);
         let exit_child = Arc::clone(&child);
         let exit = Arc::new(move |status: i64| {
-            let term = exit_child
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .term_sig;
+            let (term, pgid) = {
+                let c = exit_child.lock().unwrap_or_else(|e| e.into_inner());
+                (c.term_sig, c.pgid)
+            };
             let encoded = match term {
                 Some(sig) => sig & 0x7f,
                 None => ((status & 0xff) << 8) as i32,
             };
             let mut w = exit_world.lock().unwrap_or_else(|e| e.into_inner());
-            w.procs.insert(pid, ProcEntry::Zombie(encoded));
+            w.procs.insert(
+                pid,
+                ProcEntry::Zombie {
+                    status: encoded,
+                    pgid,
+                },
+            );
         });
         ForkedProc {
             handler: handler(Arc::clone(&world), Arc::clone(&child)),
@@ -2327,9 +2339,13 @@ impl Ctx<'_> {
         let pid = self.w.next_pid;
         self.w.next_pid += 1;
         // Wait-encode the exit status: WEXITSTATUS occupies bits 8–15, low bits 0 (a normal exit).
-        self.w
-            .procs
-            .insert(pid, ProcEntry::Zombie((res.status & 0xff) << 8));
+        self.w.procs.insert(
+            pid,
+            ProcEntry::Zombie {
+                status: (res.status & 0xff) << 8,
+                pgid: pid, // a spawn clone is its own group leader (never setpgid'd)
+            },
+        );
         pid as i64
     }
 
@@ -2346,12 +2362,24 @@ impl Ctx<'_> {
         // hook flipped them Live → Zombie. A still-running twin is `-ECHILD` (this op never blocks
         // — a guest polls, or parks in the core's servicer reap, the wait offer, which serves the
         // same twin independently; use one channel per child).
-        let is_zombie = |e: Option<&ProcEntry>| matches!(e, Some(ProcEntry::Zombie(_)));
+        let is_zombie = |e: Option<&ProcEntry>| matches!(e, Some(ProcEntry::Zombie { .. }));
         let reaped = if pid == -1 {
             self.w
                 .procs
                 .iter()
-                .filter_map(|(p, e)| matches!(e, ProcEntry::Zombie(_)).then_some(*p))
+                .filter_map(|(p, e)| matches!(e, ProcEntry::Zombie { .. }).then_some(*p))
+                .min()
+        } else if pid < -1 {
+            // #799 — `waitpid(-pgid)`: group-reap the lowest zombie whose pgid (retained on the
+            // zombie entry) matches. Non-blocking like `-1` — the park door benches only
+            // specific-pid waits this rung.
+            let g = (-pid) as i32;
+            self.w
+                .procs
+                .iter()
+                .filter_map(|(p, e)| {
+                    matches!(e, ProcEntry::Zombie { pgid, .. } if *pgid == g).then_some(*p)
+                })
                 .min()
         } else if is_zombie(self.w.procs.get(&(pid as i32))) {
             Some(pid as i32)
@@ -2367,10 +2395,21 @@ impl Ctx<'_> {
             let self_pid = self.p.pid;
             let mut hit: Option<(i32, i32)> = None;
             for (&tpid, e) in self.w.procs.iter() {
-                if tpid == self_pid || (pid != -1 && pid != tpid as i64) {
-                    continue; // never report ourselves; respect a named-pid wait
+                if tpid == self_pid {
+                    continue; // never report ourselves
                 }
                 let ProcEntry::Live(t) = e else { continue };
+                // Respect the pid filter: a named pid, `-pgid` (#799 — the live proc's own
+                // pgid), or `-1` (any).
+                if pid > 0 && pid != tpid as i64 {
+                    continue;
+                }
+                if pid < -1 {
+                    let g = (-pid) as i32;
+                    if t.lock().unwrap_or_else(|e| e.into_inner()).pgid != g {
+                        continue;
+                    }
+                }
                 let mut tp = t.lock().unwrap_or_else(|e| e.into_inner());
                 if (opts & WUNTRACED) != 0 && tp.stop_fresh {
                     tp.stop_fresh = false;
@@ -2417,7 +2456,7 @@ impl Ctx<'_> {
             return Ok(vec![ECHILD]);
         };
         let status: i32 = match self.w.procs.remove(&p) {
-            Some(ProcEntry::Zombie(st)) => st,
+            Some(ProcEntry::Zombie { status: st, .. }) => st,
             _ => unreachable!("reaped pid selected as a zombie above"),
         };
         if status_ptr != 0 {
@@ -2502,7 +2541,7 @@ impl Ctx<'_> {
                 0
             }
             // A zombie exists until reaped (POSIX: kill succeeds) but takes no signal.
-            Some(ProcEntry::Zombie(_)) => 0,
+            Some(ProcEntry::Zombie { .. }) => 0,
             None => ESRCH,
         }
     }

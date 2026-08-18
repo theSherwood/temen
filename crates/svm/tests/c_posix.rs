@@ -1004,6 +1004,101 @@ int main(void) {
     );
 }
 
+/// #799 — **personality pipes are inherited across `fork`** (the audit's works-today witness):
+/// the fd table clones share the pipe buffer (`Arc`-backed open file descriptions, POSIX), so
+/// bytes the parent wrote before forking are drained by the twin through ITS copy of the read
+/// end, and `dup2` re-plumbing survives the fork. This is the *sequential* pattern; the
+/// concurrent write-while-blocked-reader pattern needs the personality-pipe blocking rework
+/// (false-EOF-on-empty today — tracked on #799, the pipe-unification slice).
+#[test]
+fn c_personality_pipes_are_inherited_across_fork() {
+    let src = r#"
+long __px_fork(int cap, long a);
+long __px_waitpid(int cap, long pid, long status, long opts);
+long __px_pipe(int cap, long fdp);
+long __px_write(int cap, long fd, long buf, long len);
+long __px_read(int cap, long fd, long buf, long len);
+static int fds[2];
+static int status;
+static char b[8];
+static long pid;
+static long h;
+int main(void) {
+  if (__px_pipe(0, (long)fds) != 0) return 1;
+  if (__px_write(0, fds[1], (long)"hi!", 3) != 3) return 2;  /* parent fills BEFORE forking */
+  pid = __px_fork(0, 0);
+  if (pid < 0) return 3;
+  if (pid == 0) {
+    long n = __px_read(0, fds[0], (long)b, 8);   /* the twin drains ITS inherited copy */
+    if (n != 3) return 8;
+    if (b[0] != 'h' || b[1] != 'i' || b[2] != '!') return 9;
+    return 7;
+  }
+  h = __px_waitpid(0, pid, (long)&status, 0);    /* blocking waitpid (#953) */
+  if (h != pid) return 4;
+  if (((status >> 8) & 0xff) != 7) return 5;     /* the twin saw the parent's bytes */
+  return 42;
+}
+"#;
+    let e = run_interp_only(src, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "the fork twin drained the parent's pre-fork pipe bytes through its inherited fd copy"
+    );
+}
+
+/// #799 — **`waitpid(-pgid)` on the personality table**: two twins `setpgid` into one group led
+/// by the first; both are killed with one `kill(-pgid)`; two `waitpid(-pgid)` calls group-reap
+/// exactly them (the zombie entries retain their pgid), and a third finds the group empty.
+/// Everything through personality ops — the group-wait shape the core `__wait(-pgid)` offer
+/// serves on the capability path, now available to a personality-linked shell.
+#[test]
+fn c_waitpid_by_group_reaps_a_personality_job() {
+    let src = r#"
+long __px_fork(int cap, long a);
+long __px_waitpid(int cap, long pid, long status, long opts);
+long __px_setpgid(int cap, long pid, long pgid);
+long __px_kill(int cap, long pid, long sig);
+long __px_signal(int cap, long signum, long handler);
+static int status;
+static long p1;
+static long p2;
+static long h;
+static volatile long acc;
+int main(void) {
+  __px_signal(0, 10, 6);                          /* pre-install: the group kill must not
+                                                     default-terminate a slow-to-install twin
+                                                     (#796 discipline) — inherited by both */
+  p1 = __px_fork(0, 0);
+  if (p1 < 0) return 1;
+  if (p1 == 0) { while (1) acc = acc + 1; }       /* member 1: runs until killed */
+  p2 = __px_fork(0, 0);
+  if (p2 < 0) return 2;
+  if (p2 == 0) { while (1) acc = acc + 1; }       /* member 2 */
+  if (__px_setpgid(0, p1, p1) != 0) return 3;     /* the job: group led by p1 */
+  if (__px_setpgid(0, p2, p1) != 0) return 4;
+  if (__px_kill(0, -p1, 9) != 0) return 5;        /* one SIGKILL fells the group (#796) */
+  h = __px_waitpid(0, -p1, (long)&status, 0);     /* group-reap #1 */
+  while (h == -10) h = __px_waitpid(0, -p1, (long)&status, 0);
+  if (h != p1 && h != p2) return 6;
+  long first = h;
+  h = __px_waitpid(0, -p1, (long)&status, 0);     /* group-reap #2 */
+  while (h == -10) h = __px_waitpid(0, -p1, (long)&status, 0);
+  if (h == first || (h != p1 && h != p2)) return 7;
+  if (__px_waitpid(0, -p1, (long)&status, 0) != -10) return 8;  /* the group is empty */
+  return 42;
+}
+"#;
+    let e = run_interp_only(src, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "one kill(-pgid) felled the personality job and waitpid(-pgid) group-reaped exactly its \
+         two members from the pgid-retaining zombie entries"
+    );
+}
+
 /// #796 — guest wrappers for the signal ops, matching the `__px_` (dummy-handle-first) shim convention.
 /// `sigprocmask`/`sigaction` take pointers to this personality's simple ABI: a `sigset_t` is a `u64`
 /// bitset; a `struct sigaction` is `{ long sa_handler; unsigned long sa_mask; long sa_flags; }` (24 bytes).
