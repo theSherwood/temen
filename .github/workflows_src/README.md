@@ -16,6 +16,17 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **Nim conformance matrix step in the `nim-e2e` job (#956)** — one step added right after the
+  `Nim end-to-end tests` step: `cargo test -p svm-leng --test nim_conformance -- --nocapture`. Runs the
+  new `crates/svm-leng/tests/nim_conformance.rs` — a feature→status matrix (generics, exceptions,
+  closures, methods, `seq`/`string`/`Table`, floats, iterators, variant objects, `ref`+ARC) driven
+  through the whole real toolchain and asserted against a committed baseline (a feature that starts
+  working *or* regresses fails the test). Self-skips (passes) without the toolchain, exactly like
+  `nim_e2e`, so it only truly runs in this job. No new toolchain — reuses the one this job already
+  builds. Verified locally against the vendored nimony (`11/15` features run today). (Until copied over,
+  the `workflows-in-sync` guard stays red — the expected mirror-edit friction; `cp
+  .github/workflows_src/*.yml .github/workflows/` drains it.)
+
 - **`wasm_diff` added to the nightly `fuzz` matrix** (issue #910) — one entry added to the
   `fuzz` job's `target: [...]` list (after `diff`), plus the descriptive comment above it. It is the
   new libFuzzer target `fuzz/fuzz_targets/wasm_diff.rs`: the generative interp⇄**wasm-JIT**

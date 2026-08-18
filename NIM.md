@@ -438,6 +438,14 @@ plumbing. Five workstreams, roughly independent:
   general **`goto`** (the low-level `jmp`/`lab`/`jtrue`/`mflag`/`vflag` jump family), then
   **exceptions** (`try`/`onerr`/`raise` as an error-flag model), then **seq/string** (nimony's
   built-in containers). Non-zero global/data initializers land here too.
+  - **Measured from the language side (#956).** `crates/svm-leng/tests/nim_conformance.rs` is a
+    toolchain-gated feature→status matrix (generics, exceptions, closures, methods, `seq`/`string`/
+    `Table`, floats, iterators, variant objects, `ref`+ARC destructors), each driven Nim-source →
+    whole toolchain → run on both engines and asserted against a committed baseline. As of the first
+    pass **11/15 run end-to-end**; the fail-closed rows each point at a ticket (#760 for an
+    `svm-leng` translate arm, #979 for method dispatch, #980 for the nimony exceptions surface). A
+    row that starts working *or* regresses fails the test — the "green/red matrix, each red a ticket"
+    the totality work grinds down.
 - **W2 — Linker (the long pole).** A real program is many modules; nimony emits one Leng file per
   module. W2 resolves cross-module symbols, merges globals/data, and lays out one svm module from N
   Leng inputs — the analog of what the C on-ramp gets from `clang`+`lld` for free. **✅ Core done
