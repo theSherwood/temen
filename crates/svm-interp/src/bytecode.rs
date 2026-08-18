@@ -9275,6 +9275,12 @@ struct CoopSched {
     /// types)` — the same one-outstanding-round-trip discipline as `pending_tierup` (a tier-up and an
     /// invoke are never outstanding at once: each is one `pump` yield). `None` off the browser driver.
     pending_jit: Option<(usize, usize, Box<[ValType]>)>,
+    /// #926 slice 2f — the driver-table **slot → code-handle mirror** for the browser B2 coop driver:
+    /// `slot_codes[s]` is the §22 code handle a guest `Jit.install`ed at dispatch slot `s` (`-1`
+    /// empty/natural), recorded at the pump's install/uninstall arms so the JS host can rebuild its
+    /// `WebAssembly.Table` at each event boundary (the twin of the single-shot pump's `slot_codes`).
+    /// Sized `1 << host.jit_table_log2()` — length 1 and unused on the native `drive` (no shared table).
+    slot_codes: Vec<i32>,
 }
 
 impl CoopSched {
@@ -9383,6 +9389,9 @@ impl CoopSched {
             page_checked,
             pending_tierup: None,
             pending_jit: None,
+            // Sized to the domain table (`Domain::new(_, host.jit_table_log2())`), so a `Jit.install`'s
+            // returned slot always indexes it. `1 << 0 == 1` and unused on the native `drive`.
+            slot_codes: vec![-1i32; 1usize << host.jit_table_log2()],
         })
     }
 
@@ -9413,6 +9422,7 @@ impl CoopSched {
             page_checked,
             pending_tierup,
             pending_jit,
+            slot_codes,
         } = self;
         loop {
             // Domain lifetime & teardown (DESIGN.md §12 / ISSUES.md I37, owner 2026-07-24): a
@@ -10661,7 +10671,17 @@ impl CoopSched {
                     };
                     let res = match compile_module(&funcs) {
                         Some(unit) => match dom.install(unit) {
-                            Some(slot) => slot as i64,
+                            Some(slot) => {
+                                // #926 slice 2f: mirror `slot → code` so the browser B2 driver can
+                                // rebuild its `WebAssembly.Table` at the next event boundary (installs
+                                // only ever happen between host events — a unit with a `cap.call` never
+                                // emits, so the install itself always runs interpreted). Twin of the
+                                // single-shot pump's `slot_codes` recording; inert on the native drive.
+                                if let Some(e) = slot_codes.get_mut(slot) {
+                                    *e = code;
+                                }
+                                slot as i64
+                            }
                             None => super::ENOSPC,
                         },
                         None => {
@@ -10678,6 +10698,10 @@ impl CoopSched {
                     }
                     let n_real = dom.source.primary().progs.len();
                     let res = if dom.uninstall(slot as usize, n_real) {
+                        // Keep the B2 mirror exact — a freed slot must trap in the JS table too.
+                        if let Some(e) = slot_codes.get_mut(slot as usize) {
+                            *e = -1;
+                        }
                         0
                     } else {
                         super::EINVAL
@@ -11006,6 +11030,17 @@ impl CoopRun {
     /// of a run. (§14 confined children keep their own `host` in `extra_envs`, not exposed here.)
     pub fn host_mut(&mut self) -> &mut Host {
         &mut self.host
+    }
+
+    /// #926 slice 2f — the §22 code handle installed at dispatch-table `slot` (`-1` empty/natural):
+    /// the browser B2 driver's slot mirror, from which it rebuilds its `WebAssembly.Table` at each
+    /// event boundary (a slot at or past the program's `f{i}` prefix holds an installed unit's `f0`).
+    pub fn slot_code(&self, slot: u32) -> i32 {
+        self.sched
+            .slot_codes
+            .get(slot as usize)
+            .copied()
+            .unwrap_or(-1)
     }
 
     /// Pump the schedule to its next pause: [`CoopEvent::Done`]/[`CoopEvent::Trapped`] end the run,
