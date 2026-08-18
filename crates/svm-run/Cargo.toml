@@ -19,6 +19,13 @@ path = "src/lib.rs"
 name = "svm-run"
 path = "src/main.rs"
 
+# The `.svmb` packaging step (#907): demote non-entry-point exports to strippable diagnostic names
+# (the `strip`-with-a-keep-list analogue) so a shipped single-module artifact carries a lean semantic
+# exports table without losing named stack traces.
+[[bin]]
+name = "svmb-strip"
+path = "src/bin/svmb_strip.rs"
+
 [dependencies]
 svm-ir.workspace = true
 svm-text.workspace = true

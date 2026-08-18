@@ -117,3 +117,41 @@ block 0 (v0: i64) {
     );
     assert!(has(b"gf1"), "unexported func 1 stays gf1");
 }
+
+/// A **demoted** module (#907, the `svmb-strip` packaging step) still names its functions: the name
+/// rides `debug_info.func_names` — the strippable diagnostic table demotion moves it to — instead of
+/// the exports table, and the emitter's precedence (`func_names` → export → `gfN`) picks it up with
+/// no export entry at all. This is the guardrail that slimming the semantic surface does not degrade
+/// a stack trace back to `gfN`.
+#[test]
+fn emitted_wasm_names_demoted_functions_from_func_names() {
+    let mut module = m(r#"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = call 1 (v0)
+  return v1
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 7
+  v2 = i64.add v0 v1
+  return v2
+  }
+}"#);
+    module.debug_info = Some(svm_ir::DebugInfo {
+        func_names: vec![svm_ir::FuncName {
+            func: 1,
+            name: "emit_demoted".into(),
+        }],
+        ..Default::default()
+    });
+    let wasm = compile_module(&module).expect("module emits");
+
+    let has = |needle: &[u8]| wasm.windows(needle.len()).any(|w| w == needle);
+    assert!(
+        has(b"emit_demoted"),
+        "unexported func 1 named from func_names (the demoted-name path)"
+    );
+    assert!(has(b"gf0"), "unnamed, unexported func 0 stays gf0");
+}
