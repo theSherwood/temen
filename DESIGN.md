@@ -2216,11 +2216,13 @@ IR, so a verified unit always yields a runnable artifact:
   unit" allowance.
 
 **Cross-tier ABI.** A non-emittable function runs as a cross-tier interpreter leaf over the shared
-window via `env.call_interp`, which marshals each arg/result through one 8-byte scratch slot in the
-`env` cell (`i32` widened, `f32`/`f64` written narrow, `i64` as-is). A `v128` needs two slots, so it is
-**not** marshallable and stays off the cross-tier path — deferred (a two-slot encoding + a wider
-`ENV_CELL_BYTES` + every servicer's slot arithmetic; low demand, since non-emittable functions rarely
-carry a `v128` signature).
+window via `env.call_interp`, which marshals each arg/result through the `env` cell's scratch slots at
+a **running offset** computed from the callee's signature: scalars take one 8-byte slot (`i32` widened,
+`f32`/`f64` written narrow, `i64` as-is), a `v128` takes **two** (16 raw little-endian bytes — the
+two-slot encoding, #749). Every servicer computes the same layout from the signature; only `ref`/`cap`
+values stay unmarshallable. The §22 slot-trampoline transport (`emit_slot_trampoline` → the vCPU's
+`bounce_call`) still carries scalars only — its `&[i64]` decode and JS-crossing entry argv were not
+widened — so a `v128`-signature function in a *nested* unit still fails closed to whole-interpreter.
 
 **Window-remapping ops fall to the interpreter (decision: fail-closed + scope-out).** The wasm tier's
 confinement is a mask plus **one live bound** — an emitted access is admitted in `[0, live_mapped)`

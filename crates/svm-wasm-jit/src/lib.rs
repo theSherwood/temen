@@ -1001,8 +1001,8 @@ pub struct Analysis {
     /// lowers directly (it becomes an emitted `f{i}`).
     pub in_subset: Vec<bool>,
     /// `interp_leaf[i]` — function `i` is **not** in-subset but is safe to run on the bytecode
-    /// engine as a cross-tier leaf: a [`marshallable_sig`] signature (each arg/result fits one
-    /// scratch slot — `i32`/`i64`/`f32`/`f64`, not `v128`), **memory-free**, makes no calls (a true
+    /// engine as a cross-tier leaf: a [`marshallable_sig`] signature (each arg/result fits the
+    /// scratch — `i32`/`i64`/`f32`/`f64` one slot, `v128` two, #749), **memory-free**, makes no calls (a true
     /// leaf, so no transitive window/state to share), and no concurrency / capability ops. A JITted
     /// caller reaches it via `env.call_interp`.
     pub interp_leaf: Vec<bool>,
@@ -1234,15 +1234,38 @@ fn interp_leaf(f: &Func) -> bool {
 }
 
 /// Classify every function of a **verified** `m` for tiering rooted at func 0 (see [`Analysis`]).
-/// Whether every param/result of `f` fits **one** 8-byte cross-tier scratch slot — the ABI
+/// Whether every param/result of `f` fits the cross-tier scratch — the ABI
 /// [`emit_slot_store`]/[`emit_slot_load`] encode and every `env.call_interp` servicer decodes:
-/// `i32` (widened), `i64`, `f32` (low 4 bytes), `f64`. A `v128` needs **two** slots, so it is not
-/// marshallable; such a function cannot be reached cross-tier and stays off the interpreter-leaf path.
+/// `i32` (widened), `i64`, `f32` (low 4 bytes), `f64` in one 8-byte slot each, and `v128` across
+/// **two** consecutive slots (#749 — slot offsets are the running [`slot_off`] of the signature,
+/// not `i*8`). Only `ref`/`cap` values stay unmarshallable (interpreter-tier only).
 fn marshallable_sig(f: &Func) -> bool {
-    f.params
-        .iter()
-        .chain(&f.results)
-        .all(|t| matches!(t, ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64))
+    f.params.iter().chain(&f.results).all(|t| {
+        matches!(
+            t,
+            ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64 | ValType::V128
+        )
+    })
+}
+
+/// Scratch slots one cross-tier value occupies: `v128` spans two 8-byte slots (#749), all else one.
+fn slots_of(ty: ValType) -> u64 {
+    match ty {
+        ValType::V128 => 2,
+        _ => 1,
+    }
+}
+
+/// Total scratch slots a signature side occupies — the arity the [`XCALL_MAX_SLOTS`] guards bound.
+fn slot_count(types: &[ValType]) -> u64 {
+    types.iter().map(|t| slots_of(*t)).sum()
+}
+
+/// Byte offset of value `i` in the cross-tier scratch: the slots of everything before it. Params
+/// and results each start at offset 0 (results overlay the arg slots, as ever); both the emitter
+/// and every `env.call_interp` servicer compute this same running layout from the signature.
+fn slot_off(types: &[ValType], i: usize) -> u64 {
+    types[..i].iter().map(|t| slots_of(*t) * 8).sum()
 }
 
 pub fn analyze(m: &Module) -> Analysis {
@@ -1369,12 +1392,13 @@ const NESTED_IMPORTED_FUNCS: u32 = 8;
 /// §3c.3 — `env.instantiate_rec` (the config-record spawn bounce), emitted **conditionally** as
 /// func import 8 only when [`module_uses_rec`]; the emitted-function base is then 9.
 const INSTANTIATE_REC_IMPORT_IDX: u32 = 8;
-/// `env.call_interp` scratch: the cross-tier call marshals its i64 arg/result slots starting at
+/// `env.call_interp` scratch: the cross-tier call marshals its arg/result slots starting at
 /// this byte offset in the `env` cell (past the `i64` fuel counter at 0). The host must allocate the
 /// `env` cell at least [`ENV_CELL_BYTES`] large.
 const ENV_SCRATCH_OFF: u64 = 16;
-/// Max i64 slots the cross-tier scratch holds (a call with more args-or-results than this is refused
-/// — 64 is absurdly generous for a function signature).
+/// Max 8-byte slots the cross-tier scratch holds (a `v128` occupies two, #749; a call whose
+/// params-or-results need more slots than this is refused — 64 is absurdly generous for a
+/// function signature).
 const XCALL_MAX_SLOTS: usize = 64;
 /// Bytes the host must allocate for the `env` cell: the `i64` fuel counter + the cross-tier scratch.
 pub const ENV_CELL_BYTES: usize = ENV_SCRATCH_OFF as usize + XCALL_MAX_SLOTS * 8;
@@ -1458,11 +1482,19 @@ pub fn compile_module_nested_with_eligibility(
             return Err(Error::Unsupported(
                 "fiber op in a nested unit (needs the interp-driven tier)",
             ));
-        } else if marshallable_sig(f) {
+        } else if marshallable_sig(f)
+            && f.params
+                .iter()
+                .chain(&f.results)
+                .all(|t| !matches!(t, ValType::V128))
+        {
             interp_leaf[i] = true;
         } else {
-            // Not nested-emittable and carries a `v128` (the one type the i64-slot cross-tier ABI
-            // can't marshal), so it can be neither emitted nor run cross-tier — fail closed.
+            // Not nested-emittable and carries a `v128`/`ref`/`cap` in its signature. A nested
+            // unit's `env.call_interp` lands in the vCPU's `bounce_call`, whose `&[i64]` slot
+            // decode is scalar-only — `v128` marshals two-slot on the module-internal cross-tier
+            // ABI (#749) but NOT on this §22 transport — so it can be neither emitted nor run
+            // cross-tier here. Fail closed (the unit runs whole-interpreter instead).
             return Err(Error::Unsupported(
                 "v128-signature function outside the nested subset",
             ));
@@ -1766,8 +1798,9 @@ pub fn outline_cap_calls(m: &mut Module) {
 ///
 /// Returns the wasm plus a per-function **emitted** bitmap (`emitted[i]` ⇒ `f{i}` runs on wasm; the
 /// rest are cross-tier). [`Error::Unsupported`] if the entry isn't in-subset, a reachable function has
-/// a non-[`marshallable_sig`] signature (a `v128` param/result can't be marshalled cross-tier), or an
-/// address-taken indirect target is itself non-marshallable (can't be trampolined).
+/// a non-[`marshallable_sig`] signature (a `ref`/`cap` param/result can't be marshalled cross-tier —
+/// `v128` marshals two-slot since #749), or an address-taken indirect target is itself
+/// non-marshallable (can't be trampolined).
 pub fn compile_module_reactor(
     m: &Module,
     entry: u32,
@@ -2764,22 +2797,24 @@ fn emit_module(
 
 /// The cross-tier `env.call_interp` slot ABI, **store half**: with a value already on the stack
 /// (its scratch-slot address pushed beneath it), emit the widen/reinterpret + `store` that packs it
-/// into one 8-byte slot. Paired with [`emit_slot_load`] — the two are the ABI's single encoding, so
-/// the emitter and every host servicer agree byte-for-byte. `i32` widens to the full slot; `f32`
-/// writes its low 4 bytes (the high 4 stay stale, unread); `i64`/`f64` fill the slot. `v128` is not
-/// marshallable (it needs two slots) and never reaches here — see [`marshallable_sig`].
+/// into its scratch slot(s). Paired with [`emit_slot_load`] — the two are the ABI's single encoding,
+/// so the emitter and every host servicer agree byte-for-byte. `i32` widens to the full slot; `f32`
+/// writes its low 4 bytes (the high 4 stay stale, unread); `i64`/`f64` fill the slot; `v128` fills
+/// **two** consecutive slots (16 raw little-endian bytes, #749 — the slot address is only 8-aligned,
+/// hence the a=8 alignment hint). Slot addresses come from [`slot_off`], never `i*8`.
 fn emit_slot_store(code: &mut Vec<u8>, ty: ValType) {
     match ty {
         ValType::I32 => code.extend_from_slice(&[0xad, 0x37, 0x03, 0x00]), // i64.extend_i32_u; i64.store a=8
         ValType::I64 => code.extend_from_slice(&[0x37, 0x03, 0x00]),       // i64.store a=8
         ValType::F32 => code.extend_from_slice(&[0x38, 0x02, 0x00]),       // f32.store a=4
         ValType::F64 => code.extend_from_slice(&[0x39, 0x03, 0x00]),       // f64.store a=8
-        _ => unreachable!("marshallable_sig admits only i32/i64/f32/f64"),
+        ValType::V128 => code.extend_from_slice(&[0xfd, 0x0b, 0x03, 0x00]), // v128.store a=8
+        _ => unreachable!("marshallable_sig admits only i32/i64/f32/f64/v128"),
     }
 }
 
 /// The cross-tier `env.call_interp` slot ABI, **load half**: with a scratch-slot address on the
-/// stack, emit the `load` (+ narrow) that reads the slot back to `ty`. The inverse of
+/// stack, emit the `load` (+ narrow) that reads the slot(s) back to `ty`. The inverse of
 /// [`emit_slot_store`]; see that function for the encoding.
 fn emit_slot_load(code: &mut Vec<u8>, ty: ValType) {
     match ty {
@@ -2787,7 +2822,8 @@ fn emit_slot_load(code: &mut Vec<u8>, ty: ValType) {
         ValType::I64 => code.extend_from_slice(&[0x29, 0x03, 0x00]),       // i64.load a=8
         ValType::F32 => code.extend_from_slice(&[0x2a, 0x02, 0x00]),       // f32.load a=4
         ValType::F64 => code.extend_from_slice(&[0x2b, 0x03, 0x00]),       // f64.load a=8
-        _ => unreachable!("marshallable_sig admits only i32/i64/f32/f64"),
+        ValType::V128 => code.extend_from_slice(&[0xfd, 0x00, 0x03, 0x00]), // v128.load a=8
+        _ => unreachable!("marshallable_sig admits only i32/i64/f32/f64/v128"),
     }
 }
 
@@ -2799,7 +2835,7 @@ fn emit_slot_load(code: &mut Vec<u8>, ty: ValType) {
 /// slot (an indirect call to it then reaches the interpreter). No locals: params are locals
 /// `2..2+nparams`; results are loaded straight onto the operand stack for the return.
 fn emit_trampoline(f: &Func, fi: u32) -> Result<Vec<u8>, Error> {
-    if f.params.len().max(f.results.len()) > XCALL_MAX_SLOTS {
+    if slot_count(&f.params).max(slot_count(&f.results)) > XCALL_MAX_SLOTS as u64 {
         return Err(Error::Unsupported("indirect trampoline arity too large"));
     }
     let mut code = Vec::new();
@@ -2808,7 +2844,7 @@ fn emit_trampoline(f: &Func, fi: u32) -> Result<Vec<u8>, Error> {
         code.push(OP_LOCAL_GET);
         uleb(&mut code, 1); // env
         code.push(OP_I32_CONST);
-        sleb32(&mut code, (ENV_SCRATCH_OFF + i as u64 * 8) as i32);
+        sleb32(&mut code, (ENV_SCRATCH_OFF + slot_off(&f.params, i)) as i32);
         code.push(0x6a); // i32.add → slot addr
         code.push(OP_LOCAL_GET);
         uleb(&mut code, (2 + i) as u64); // the i-th SVM param local
@@ -2827,7 +2863,10 @@ fn emit_trampoline(f: &Func, fi: u32) -> Result<Vec<u8>, Error> {
         code.push(OP_LOCAL_GET);
         uleb(&mut code, 1); // env
         code.push(OP_I32_CONST);
-        sleb32(&mut code, (ENV_SCRATCH_OFF + i as u64 * 8) as i32);
+        sleb32(
+            &mut code,
+            (ENV_SCRATCH_OFF + slot_off(&f.results, i)) as i32,
+        );
         code.push(0x6a); // i32.add
         emit_slot_load(&mut code, *r);
     }
@@ -2860,8 +2899,10 @@ fn emit_trap_stub() -> Vec<u8> {
 /// import layout matches the emitted modules' (`env.memory`, `env.trap`, `env.call_interp`), so
 /// the one import object a host builds serves emitted units and trampolines alike; the host's
 /// `call_interp` signals a trap by throwing (unwinding the emitted frames), exactly the
-/// cross-tier convention everywhere. Rejects non-scalar and over-arity signatures — the i64-slot
-/// transport's limits (the host must gate such slots out before ever placing a trampoline).
+/// cross-tier convention everywhere. Rejects non-scalar and over-arity signatures — this §22
+/// transport's `call_interp` lands in the vCPU's `bounce_call`, whose `&[i64]` slot decode is
+/// scalar-only (unlike the module-internal cross-tier ABI, which marshals `v128` two-slot since
+/// #749) — so `v128` stays fail-closed here until that transport is widened too.
 pub fn emit_slot_trampoline(
     params: &[ValType],
     results: &[ValType],
@@ -4027,22 +4068,24 @@ fn emit_block_body(
                             uleb(code, cx.local_of[k][next_val + i] as u64);
                         }
                     }
-                    // Cross-tier: `func` is an interp leaf. Marshal args as i64 slots into the env
-                    // scratch, call `env.call_interp(func, args_ptr)` (the engine runs it on the
+                    // Cross-tier: `func` is an interp leaf. Marshal args into the env scratch
+                    // slots, call `env.call_interp(func, args_ptr)` (the engine runs it on the
                     // bytecode interpreter and writes results back to the same slots), then reload.
                     None => {
                         if !interp_leaf[*func as usize] {
                             return Err(Error::Unsupported("call to a non-emitted, non-leaf func"));
                         }
-                        if args.len().max(n_results) > XCALL_MAX_SLOTS {
+                        if slot_count(&callee.params).max(slot_count(&callee.results))
+                            > XCALL_MAX_SLOTS as u64
+                        {
                             return Err(Error::Unsupported("cross-tier call arity too large"));
                         }
-                        // Store each arg to env + ENV_SCRATCH_OFF + i*8 (widen/reinterpret to the slot).
+                        // Store each arg to env + ENV_SCRATCH_OFF + slot_off (widen/reinterpret).
                         for (i, a) in args.iter().enumerate() {
                             code.push(OP_LOCAL_GET);
                             uleb(code, 1); // env
                             code.push(OP_I32_CONST);
-                            sleb32(code, (ENV_SCRATCH_OFF + i as u64 * 8) as i32);
+                            sleb32(code, (ENV_SCRATCH_OFF + slot_off(&callee.params, i)) as i32);
                             code.push(0x6a); // i32.add → slot addr
                             get(code, cx, *a);
                             emit_slot_store(code, callee.params[i]);
@@ -4062,7 +4105,10 @@ fn emit_block_body(
                             code.push(OP_LOCAL_GET);
                             uleb(code, 1); // env
                             code.push(OP_I32_CONST);
-                            sleb32(code, (ENV_SCRATCH_OFF + i as u64 * 8) as i32);
+                            sleb32(
+                                code,
+                                (ENV_SCRATCH_OFF + slot_off(&callee.results, i)) as i32,
+                            );
                             code.push(0x6a); // i32.add
                             emit_slot_load(code, callee.results[i]);
                             code.push(OP_LOCAL_SET);
@@ -4484,14 +4530,16 @@ fn emit_block_body(
                             "tail call to a non-emitted, non-leaf func",
                         ));
                     }
-                    if args.len().max(n_results) > XCALL_MAX_SLOTS {
+                    if slot_count(&callee.params).max(slot_count(&callee.results))
+                        > XCALL_MAX_SLOTS as u64
+                    {
                         return Err(Error::Unsupported("cross-tier tail-call arity too large"));
                     }
                     for (i, a) in args.iter().enumerate() {
                         code.push(OP_LOCAL_GET);
                         uleb(code, 1); // env
                         code.push(OP_I32_CONST);
-                        sleb32(code, (ENV_SCRATCH_OFF + i as u64 * 8) as i32);
+                        sleb32(code, (ENV_SCRATCH_OFF + slot_off(&callee.params, i)) as i32);
                         code.push(0x6a); // i32.add → slot addr
                         get(code, cx, *a);
                         emit_slot_store(code, callee.params[i]);
@@ -4509,7 +4557,10 @@ fn emit_block_body(
                         code.push(OP_LOCAL_GET);
                         uleb(code, 1); // env
                         code.push(OP_I32_CONST);
-                        sleb32(code, (ENV_SCRATCH_OFF + i as u64 * 8) as i32);
+                        sleb32(
+                            code,
+                            (ENV_SCRATCH_OFF + slot_off(&callee.results, i)) as i32,
+                        );
                         code.push(0x6a); // i32.add
                         emit_slot_load(code, callee.results[i]);
                     }

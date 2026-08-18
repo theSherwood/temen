@@ -108,20 +108,32 @@ fn reactor_run(m: &svm_ir::Module, arg: i64) -> i64 {
                 let callee = &mod_cb.funcs[func as usize];
                 let args: Vec<Value> = {
                     let data = mem.data(&caller);
+                    // Mirrors the browser servicer's `read_slot_value` + running `slot_offs` (the
+                    // cross-tier ABI): scalars take one 8-byte slot, a `v128` two (#749).
+                    let mut off = args_ptr as usize;
                     callee
                         .params
                         .iter()
-                        .enumerate()
-                        .map(|(i, t)| {
-                            let o = args_ptr as usize + i * 8;
-                            let raw = u64::from_le_bytes(data[o..o + 8].try_into().unwrap());
-                            // Mirrors the browser servicer's `slot_to_value` (the cross-tier ABI).
+                        .map(|t| {
+                            let o = off;
+                            off += if *t == svm_ir::ValType::V128 { 16 } else { 8 };
                             match t {
-                                svm_ir::ValType::I32 => Value::I32(raw as i32),
-                                svm_ir::ValType::I64 => Value::I64(raw as i64),
-                                svm_ir::ValType::F32 => Value::F32(f32::from_bits(raw as u32)),
-                                svm_ir::ValType::F64 => Value::F64(f64::from_bits(raw)),
-                                _ => panic!("v128 not marshallable cross-tier"),
+                                svm_ir::ValType::V128 => {
+                                    Value::V128(data[o..o + 16].try_into().unwrap())
+                                }
+                                _ => {
+                                    let raw =
+                                        u64::from_le_bytes(data[o..o + 8].try_into().unwrap());
+                                    match t {
+                                        svm_ir::ValType::I32 => Value::I32(raw as i32),
+                                        svm_ir::ValType::I64 => Value::I64(raw as i64),
+                                        svm_ir::ValType::F32 => {
+                                            Value::F32(f32::from_bits(raw as u32))
+                                        }
+                                        svm_ir::ValType::F64 => Value::F64(f64::from_bits(raw)),
+                                        _ => panic!("ref/cap not marshallable cross-tier"),
+                                    }
+                                }
                             }
                         })
                         .collect()
@@ -144,17 +156,27 @@ fn reactor_run(m: &svm_ir::Module, arg: i64) -> i64 {
                 ) {
                     Some((Ok(vals), _)) => {
                         let data = mem.data_mut(&mut caller);
-                        for (i, v) in vals.iter().enumerate() {
-                            // Mirrors the browser servicer's `value_to_slot` (the cross-tier ABI).
-                            let raw = match v {
-                                Value::I32(x) => *x as u32 as u64,
-                                Value::I64(x) => *x as u64,
-                                Value::F32(x) => x.to_bits() as u64,
-                                Value::F64(x) => x.to_bits(),
-                                _ => panic!("v128 not marshallable cross-tier"),
-                            };
-                            let o = args_ptr as usize + i * 8;
-                            data[o..o + 8].copy_from_slice(&raw.to_le_bytes());
+                        // Mirrors the browser servicer's `write_slot_value` + running `slot_offs`
+                        // (result slots overlay arg slots; a `v128` result takes two, #749).
+                        let mut off = args_ptr as usize;
+                        for v in vals.iter() {
+                            match v {
+                                Value::V128(b) => {
+                                    data[off..off + 16].copy_from_slice(b);
+                                    off += 16;
+                                }
+                                _ => {
+                                    let raw = match v {
+                                        Value::I32(x) => *x as u32 as u64,
+                                        Value::I64(x) => *x as u64,
+                                        Value::F32(x) => x.to_bits() as u64,
+                                        Value::F64(x) => x.to_bits(),
+                                        _ => panic!("ref/cap not marshallable cross-tier"),
+                                    };
+                                    data[off..off + 8].copy_from_slice(&raw.to_le_bytes());
+                                    off += 8;
+                                }
+                            }
                         }
                         Ok(())
                     }
@@ -442,5 +464,56 @@ fn cross_tier_f32_signature() {
             "f32-leaf mixed != oracle for arg {arg}"
         );
         assert_eq!(got, arg * arg + arg, "fma round-trip (arg {arg})");
+    }
+}
+
+// **Cross-tier call with a `v128` signature** (#749 — the two-slot scratch encoding). f0 (emitted)
+// splats its arg to a v128 and calls the cross-tier `f1: (v128, i64) -> (v128)` — kept out of subset
+// by `i16x8.dot_i8x16_s` — then extracts lane 0 and adds the shared-window read-back. The `(v128,
+// i64)` param order puts the scalar at running offset **16** (after the v128's two slots), so a
+// regression to the old `i*8` positional layout mis-reads the i64 (and truncates the v128) — exactly
+// what this differential catches. The v128 **result** rides the two result slots back the same way,
+// and the mem[8]→mem[100] round trip proves the shared window still holds alongside the wide marshal.
+const SRC_V128_LEAF: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v7 = i64.const 7
+  vpre = i64.add v0 v7
+  va8 = i64.const 8
+  i64.store va8 vpre
+  vs = i64x2.splat v0
+  vr = call 1 (vs, v0)
+  ve = i64x2.extract_lane 0 vr
+  vaddr = i64.const 100
+  vw = i64.load vaddr
+  vout = i64.add ve vw
+  return vout
+  }
+}
+func (v128, i64) -> (v128) {
+block 0 (v0: v128, v1: i64) {
+  va8 = i64.const 8
+  vread = i64.load va8
+  vaddr = i64.const 100
+  i64.store vaddr vread
+  vd = i16x8.dot_i8x16_s v0 v0
+  vz = i64x2.splat v1
+  vsum = i64x2.add vd vz
+  return vsum
+  }
+}
+"#;
+
+#[test]
+fn cross_tier_v128_signature() {
+    let m = parse(SRC_V128_LEAF);
+    for &arg in &[0i64, 1, 42, 1000, -5, i64::MIN + 1] {
+        let got = reactor_run(&m, arg);
+        assert_eq!(
+            got,
+            oracle(&m, arg),
+            "v128-leaf mixed != oracle for arg {arg}"
+        );
     }
 }
