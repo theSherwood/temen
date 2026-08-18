@@ -265,12 +265,17 @@ int chdir(const char *path) {
   (void)path;
   return 0;
 }
+/* #986: return the ABSOLUTE root ("/"), not "." — `make_absolute_path` trusts getcwd to absolutize,
+ * and a relative cwd left `ConfigFileName` relative, sending `AbsoluteConfigLocation` down its
+ * `DataDir` branch while DataDir was still NULL (a NULL `strlcpy` read — tolerated as zeros on the
+ * legacy layout, a trap under the #964 NULL guard). The open/stat boundary maps guest-absolute
+ * paths back to cap-relative (strip leading slashes), so "/" round-trips. */
 char *getcwd(char *buf, size_t size) {
   if (!buf || size < 2) {
     shim_errno = 34; /* ERANGE */
     return (char *)0;
   }
-  buf[0] = '.';
+  buf[0] = '/';
   buf[1] = 0;
   return buf;
 }

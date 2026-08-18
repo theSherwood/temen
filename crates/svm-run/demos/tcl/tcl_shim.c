@@ -30,6 +30,15 @@ extern void exit(int);
 static int __tcl_errno;
 int *__errno_location(void) { return &__tcl_errno; }
 
+/* --- environ (#986) ---------------------------------------------------------------------------
+ * Tcl walks `environ` directly at interp creation (tclEnv.c `TclSetupEnv`: `tenviron[0]`) and
+ * replaces it wholesale on writes (`TclSetEnv`). Without a definition the on-ramp lays the extern
+ * out as zeroed BSS, so the walk reads through a NULL pointer — tolerated as reading zeros on the
+ * legacy layout, a trap under the #964 NULL guard. Start it at a real empty vector (the same move
+ * as Postgres's `libc_shim.c`); the sandbox passes no ambient environment. */
+static char *shim_environ[1] = {0};
+char **environ = shim_environ;
+
 /* --- time: deterministic stubs (fixed epoch) --------------------------------------------------
  * Tcl's `clock` command and channel timestamps read the wall clock; a differential-vs-native demo
  * must be deterministic (the same choice `../quickjs/libc_shim.c` and SQLite's fixed-clock VFS make),

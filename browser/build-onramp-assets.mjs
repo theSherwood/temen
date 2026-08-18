@@ -264,10 +264,9 @@ try {
     const linked = join(cache, linkedName);
     if (!existsSync(linked)) throw new Error(`build script produced no ${linkedName}`);
     const svmb = join(ASSETS, svmbName);
-    // No `--null-guard` for Tcl: its init genuinely dereferences NULL (tolerated as reading zeros
-    // on the legacy layout — the exact class #964 exposes), so it stays unmarked until that's
-    // shimmed/fixed upstream. The marker gates everything, so a legacy Tcl coexists fine.
-    execFileSync(TR, [linked, '-o', svmb, '--host-page', HOST_PAGE, '--stub-externs'], { stdio: 'inherit' });
+    // Tcl is guarded again (#986): its one NULL read was `TclSetupEnv` walking a NULL `environ`
+    // (the extern was laid out as zeroed BSS) — `tcl_shim.c` now defines a real empty `environ`.
+    execFileSync(TR, [linked, '-o', svmb, '--host-page', HOST_PAGE, '--stub-externs', '--null-guard'], { stdio: 'inherit' });
     const size = execFileSync('wc', ['-c', svmb]).toString().trim().split(/\s+/)[0];
     console.log(`  ✓ ${svmbName} (${size} B)`);
   }
