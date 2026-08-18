@@ -66,6 +66,7 @@
 #![forbid(unsafe_code)]
 
 use svm_ir::bounds::{in_window, ub_at, ub_of, UB_TOP};
+use svm_ir::cap_id;
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CmpOp, ConvOp, Func, FuncType, Inst, IntTy, IntUnOp, LoadOp, Module,
     StoreOp, Terminator, ValIdx, ValType, DEFAULT_RESERVED_LOG2,
@@ -763,12 +764,12 @@ fn vextadd_sub(shape: VShape, signed: bool) -> Option<u32> {
 /// verified, so no `unwrap` here can be reached by a malformed operand index).
 /// The §14 capability ops the wasm tier lowers to a **host-driver bounce** (instead of failing
 /// out-of-subset): INSTANTIATOR (iface 6) `instantiate` (op 0) and `join` (op 1) — the VM-in-VM
-/// primitive (`DESIGN.md` §14; `crates/svm-interp/src/lib.rs` `cap_id::INSTANTIATOR = 6`). The child
+/// primitive (`DESIGN.md` §14; `svm_ir::cap_id::INSTANTIATOR`). The child
 /// vCPU spawn/join happens host-side (as the interpreter surfaces `VcpuStop::Instantiate`), so the
 /// emitted code just marshals the args to an `env.instantiate`/`env.join` import. Other §14 ops
 /// (address-space, coroutines) are not lowered yet — they stay out-of-subset (fail-closed).
 fn is_nested_cap(type_id: u32, op: u32) -> bool {
-    type_id == 6 && (op == 0 || op == 1 || op == 17)
+    type_id == cap_id::INSTANTIATOR && (op == 0 || op == 1 || op == 17)
 }
 
 /// CONSOLIDATION.md §3c.3 — does the module use the config-record spawn (`Instantiator` op 17)?
@@ -783,7 +784,7 @@ fn module_uses_rec(m: &Module) -> bool {
                 matches!(
                     i,
                     Inst::CapCall {
-                        type_id: 6,
+                        type_id: cap_id::INSTANTIATOR,
                         op: 17,
                         ..
                     }
@@ -802,7 +803,7 @@ fn module_uses_rec(m: &Module) -> bool {
 /// interpreter traps. They stay out-of-subset (fail-closed to the interpreter), deferred with the
 /// D40/§13 page-enforcement question.
 fn is_nested_leaf_cap(type_id: u32, op: u32) -> bool {
-    type_id == 5 && (op == 3 || op == 4)
+    type_id == cap_id::ADDRESS_SPACE && (op == 3 || op == 4)
 }
 
 /// Outline each [`is_nested_leaf_cap`] `cap.call` into an appended int-signature wrapper (exactly
@@ -1103,11 +1104,11 @@ fn func_uses_page_ops(f: &Func) -> bool {
             matches!(
                 i,
                 Inst::CapCall {
-                    type_id: 5,
+                    type_id: cap_id::ADDRESS_SPACE,
                     op: 1..=2,
                     ..
                 } | Inst::CapCall {
-                    type_id: 4,
+                    type_id: cap_id::SHARED_REGION,
                     op: 0..=1,
                     ..
                 }
@@ -1146,7 +1147,7 @@ fn func_uses_region_ops(f: &Func) -> bool {
             matches!(
                 i,
                 Inst::CapCall {
-                    type_id: 4,
+                    type_id: cap_id::SHARED_REGION,
                     op: 0..=1,
                     ..
                 }

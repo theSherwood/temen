@@ -77,6 +77,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 use std::sync::Arc;
 use svm_ir::bounds::{in_window, ub_at, ub_of, UB_TOP};
+use svm_ir::cap_id;
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, ConvOp, Data, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx,
     FuncType, Inst, IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, VBitBinOp,
@@ -4529,9 +4530,15 @@ pub(crate) unsafe fn compile_child_and_run(
     let child_win_size: Box<u64> = Box::new(child_size);
     let child_uses_instantiator = funcs.iter().any(|f| {
         f.blocks.iter().any(|b| {
-            b.insts
-                .iter()
-                .any(|i| matches!(i, Inst::CapCall { type_id: 6, .. }))
+            b.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    Inst::CapCall {
+                        type_id: cap_id::INSTANTIATOR,
+                        ..
+                    }
+                )
+            })
         })
     });
     let child_nursery: Option<Box<instantiator_rt::Nursery>> = if durable && child_uses_instantiator
@@ -6037,15 +6044,21 @@ fn module_uses_setjmp(m: &IrModule) -> bool {
     })
 }
 
-/// Whether `m` holds a §14 `Instantiator` — a `cap.call` to iface 6 (`svm_interp::cap_id::INSTANTIATOR`)
+/// Whether `m` holds a §14 `Instantiator` — a `cap.call` to `cap_id::INSTANTIATOR`
 /// — so `run_inner` knows to stand up the nesting [`instantiator_rt::Nursery`].
 #[cfg(fiber_rt)]
 fn module_uses_instantiator(m: &IrModule) -> bool {
     m.funcs.iter().any(|f| {
         f.blocks.iter().any(|blk| {
-            blk.insts
-                .iter()
-                .any(|i| matches!(i, Inst::CapCall { type_id: 6, .. }))
+            blk.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    Inst::CapCall {
+                        type_id: cap_id::INSTANTIATOR,
+                        ..
+                    }
+                )
+            })
         })
     })
 }
@@ -6199,7 +6212,7 @@ fn lower_block(
             // `instantiate`/`join` to its thunks instead of the generic `cap.call` — spawning a child
             // needs the host compiler, which the flat `cap.call` thunk can't reach. Otherwise (a child
             // compile, or no nesting runtime) it falls through to the ordinary path (an inert CapFault).
-            if *type_id == 6 && lower.inst.is_active() {
+            if *type_id == cap_id::INSTANTIATOR && lower.inst.is_active() {
                 lower_instantiator(module, b, lower, *op, sig, *handle, args, &mut vals)?;
             } else if let Some(target) = fast_cap_target(lower, *type_id, *op, sig) {
                 // D45 devirtualized fast path: a register-to-register direct call to the specialized
