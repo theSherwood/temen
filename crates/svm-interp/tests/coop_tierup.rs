@@ -12,6 +12,11 @@
 //! The distinguishing coverage over the single-vCPU `vcpu_tierup` test: tier-up fires on **two tasks**
 //! — the root and the spawned worker — proving the paused-task delivery routes to the right vCPU across
 //! the scheduler's multiplexing, and that a spawned same-module child inherits the eligibility bitmap.
+//! Plus the #926 "Differentials" concurrency shapes: tier-up co-runs with a **self-hosted fiber
+//! scheduler** (`cont.new`/`cont.resume` worker fibers) and with a **single-threaded live futex** wake
+//! cell (`atomic.wait`/`atomic.notify` park-and-wake) — the scheduler services the concurrency while the
+//! root's leaf still tiers up, matching the pure-interp oracle. (A dead-linked-concurrency guest tiering
+//! up its leaves is slice 1, #930; the browser-host wasm servicing is `browser/tests/coop_tierup_driver.rs`.)
 //!
 //! Fuel is **bounded** (not `u64::MAX`) so any regression surfaces as an `OutOfFuel` trap rather than a
 //! hang; the guests finish in well under the budget, so a bound never perturbs the differential.
@@ -286,4 +291,151 @@ fn coop_tierup_bounce_matches_pure_interp() {
         "cooperative tier-up + bounce diverged from the pure-interp oracle"
     );
     assert_eq!(bounces, 1, "expected exactly one cross-tier bounce");
+}
+
+// #926 differential (the issue's "Differentials" list): a **self-hosted fiber scheduler** whose worker
+// fibers each call the eligible leaf, plus the root — proving tier-up fires and marshals correctly amid
+// the scheduler's fiber servicing (`cont.new`/`cont.resume`), not only across `thread.spawn` vCPUs. The
+// root spins two worker fibers (func 1 `call 3 (3)`, func 2 `call 3 (5)`), runs each to completion, then
+// calls the leaf itself (`call 3 (9)`); every `call 3` to the eligible leaf `f(x) = 3x + 7` must run
+// observably identical to the pure-interp cooperative oracle. Single-vCPU — the fibers ARE the workers.
+const SRC_FIBER_SCHED: &str = r#"
+memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vf1 = ref.func 1
+  vk1 = cont.new vf1 vz
+  vsa, vva = cont.resume vk1 vz
+  vf2 = ref.func 2
+  vk2 = cont.new vf2 vz
+  vsb, vvb = cont.resume vk2 vz
+  v9 = i64.const 9
+  vroot = call 3 (v9)
+  vsum1 = i64.add vva vvb
+  vr = i64.add vsum1 vroot
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  v3 = i64.const 3
+  vr = call 3 (v3)
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  v5 = i64.const 5
+  vr = call 3 (v5)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  v3 = i64.const 3
+  vm = i64.mul vx v3
+  v7 = i64.const 7
+  va = i64.add vm v7
+  return va
+  }
+}
+"#;
+
+#[test]
+fn coop_tierup_fiber_scheduler_matches_pure_interp() {
+    let m = parse_module(SRC_FIBER_SCHED).unwrap();
+    svm_verify::verify_module(&m).expect("verify");
+    // Only func 3 (the leaf) is eligible; the root and both worker fibers call it.
+    let eligible: std::sync::Arc<[bool]> = std::sync::Arc::from(vec![false, false, false, true]);
+
+    let want = oracle(&m);
+    let (got, tierups) = coop_tierup_run(&m, eligible);
+
+    // fiber A f(3)=16, fiber B f(5)=22, root f(9)=34 → 72.
+    assert_eq!(want, Ok(vec![Value::I64(72)]), "oracle value");
+    assert_eq!(
+        got, want,
+        "cooperative tier-up under a fiber scheduler diverged from the pure-interp oracle"
+    );
+    // Non-vacuity: exactly **one** tier-up — the root's direct `call 3`. A leaf called from *inside* a
+    // fiber runs interpreted (a resumed continuation executes on the fiber machinery, not the
+    // eligibility-armed root frame), so fibers A and B compute their `f(3)`/`f(5)` on the interpreter —
+    // and the parity check above proves that's identical to the oracle. The point this pins: tier-up
+    // still fires and marshals correctly on the root while the cooperative scheduler juggles live fibers
+    // (a regression that dropped tier-up under fiber activity would read 0).
+    assert_eq!(
+        tierups, 1,
+        "expected 1 tier-up (the root's leaf; fibers run their leaf interpreted), got {tierups}"
+    );
+}
+
+// #926 differential (the issue's "Differentials" list): a **single-threaded, cooperative live futex**
+// wake cell whose compute leaf tiers up. The root creates a fiber that untimed-`atomic.wait`s on cell 0
+// (parking the FIBER, not the vCPU — the root keeps running), `atomic.notify`s the cell to wake it, runs
+// it to completion, then calls the eligible compute leaf (`f(x) = 3x + 7`). The whole run — the live
+// futex park/wake handshake AND the tier-up — must match the pure-interp cooperative oracle. No
+// `thread.spawn`: the wake is delivered within the one vCPU, the `uses_futex` shape #845 gates on.
+const SRC_LIVE_FUTEX: &str = r#"
+memory 16
+func () -> (i64) {
+block 0 () {
+  v0 = ref.func 1
+  v1 = i64.const 0
+  vk = cont.new v0 v1
+  vz = i64.const 0
+  vs1, vv1 = cont.resume vk vz
+  vs2, vv2 = cont.resume vk vz
+  vaddr = i64.const 0
+  vcnt = i32.const 1
+  vw = atomic.notify vaddr vcnt
+  vs3, vv3 = cont.resume vk vz
+  v4 = i64.const 4
+  vleaf = call 2 (v4)
+  vr = i64.add vv3 vleaf
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vaddr = i64.const 0
+  vexp = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait vaddr vexp vto
+  vst64 = i64.extend_i32_s vst
+  return vst64
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  v3 = i64.const 3
+  vm = i64.mul vx v3
+  v7 = i64.const 7
+  va = i64.add vm v7
+  return va
+  }
+}
+"#;
+
+#[test]
+fn coop_tierup_live_futex_matches_pure_interp() {
+    let m = parse_module(SRC_LIVE_FUTEX).unwrap();
+    svm_verify::verify_module(&m).expect("verify");
+    // Only func 2 (the compute leaf) is eligible; the root calls it after the futex wake handshake.
+    let eligible: std::sync::Arc<[bool]> = std::sync::Arc::from(vec![false, false, true]);
+
+    let want = oracle(&m);
+    let (got, tierups) = coop_tierup_run(&m, eligible);
+
+    // The fiber wakes WAIT_WOKEN(0), then the leaf f(4) = 19 → 0 + 19 = 19.
+    assert_eq!(want, Ok(vec![Value::I64(19)]), "oracle value");
+    assert_eq!(
+        got, want,
+        "cooperative tier-up over a live futex wake cell diverged from the pure-interp oracle"
+    );
+    // Non-vacuity: the compute leaf tiers up after the live futex park/wake completes single-threaded.
+    assert_eq!(
+        tierups, 1,
+        "expected exactly one tier-up (the root's compute leaf), got {tierups}"
+    );
 }
