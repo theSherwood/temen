@@ -28,6 +28,10 @@ svm-text = { path = "../crates/svm-text" }
 svm-wasm = { path = "../crates/svm-wasm" } # untrusted core-wasm frontend, fuzzed for fail-closed decode
 svm-opt = { path = "../crates/svm-opt" } # generic IR→IR optimizer, fuzzed for the SSA round-trip identity
 svm-llvm = { path = "../crates/svm-llvm" } # LLVM on-ramp, fuzzed for translation miscompiles (onramp_diff)
+svm-wasm-jit = { path = "../crates/svm-wasm-jit" } # backend 4, fuzzed for confinement miscompiles (wasm_diff)
+# `simd` enables wasmi's §17 v128 proposal (`Config::wasm_simd`), needed by `wasm_diff` (the core v128
+# lane ops are in the wasm-JIT's integer subset). The emitted wasm runs under wasmi as the escape oracle.
+wasmi = { version = "0.47", features = ["simd"] }
 
 [[bin]]
 name = "opt_ssa_roundtrip"
@@ -67,6 +71,13 @@ bench = false
 [[bin]]
 name = "diff"
 path = "fuzz_targets/diff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wasm_diff"
+path = "fuzz_targets/wasm_diff.rs"
 test = false
 doc = false
 bench = false
