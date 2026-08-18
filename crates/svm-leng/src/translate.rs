@@ -1151,6 +1151,20 @@ impl Translator {
     }
 
     fn agg_temp_bytes(&self, node: &Node) -> u64 {
+        // `materializes` = whether a constructor *at this node* would materialize a scratch temp (the
+        // top level of a body is a `stmts`, never a constructor, so start `true`).
+        self.agg_temp_bytes_at(node, true)
+    }
+
+    /// Frame scratch for aggregate-rvalue temps, **position-aware**. A constructor materializes a temp
+    /// exactly when [`FuncGen::agg_rvalue_temp`] runs on it — a **call argument** or a general
+    /// **expression** position (`discard Obj(…)`, #990) — and *not* when it builds in place (the direct
+    /// value of `ret`/`asgn`/`store`/`keepovf`/`var`, a `kv` field value, an `aconstr` element). So
+    /// count a constructor iff `materializes`, and recurse marking each build-in-place child slot
+    /// `false` (recomputed per level, so a call *nested inside* a build-in-place value still has its own
+    /// args materialize). This matches emission exactly — an under-count corrupts, an over-count would
+    /// spuriously frame a proc and change its ABI.
+    fn agg_temp_bytes_at(&self, node: &Node, materializes: bool) -> u64 {
         let mut total = 0;
         match node.tag() {
             Some("call") => {
@@ -1165,15 +1179,11 @@ impl Translator {
                     }
                 }
                 for arg in node.args().iter().skip(1) {
-                    if matches!(arg.tag(), Some("oconstr") | Some("aconstr")) {
-                        if let Some(Ok(d @ TyDesc::Agg(_))) =
-                            arg.args().first().map(|t| self.tydesc(t))
-                        {
-                            total += self.sizeof(&d);
-                        }
-                    } else if arg.tag() == Some("call") {
+                    if arg.tag() == Some("call") {
                         // An **aggregate-returning call in argument position** (`f($ x)`) materializes
-                        // a result temp (`agg_rvalue_temp`); reserve its return aggregate's bytes.
+                        // a result temp (`agg_rvalue_temp`); reserve its return aggregate's bytes. (An
+                        // `oconstr`/`aconstr` *argument*'s temp is reserved by the constructor clause
+                        // below — a call arg is a materializing position — so it is not double-counted.)
                         if let Some(d) = arg.args().first().and_then(|c| self.sret_return(c)) {
                             total += self.sizeof(&d);
                         }
@@ -1196,9 +1206,31 @@ impl Translator {
             }
             _ => {}
         }
+        // Reserve for an aggregate constructor **only** in a materializing position (#990).
+        if materializes && matches!(node.tag(), Some("oconstr") | Some("aconstr")) {
+            if let Some(Ok(d @ TyDesc::Agg(_))) = node.args().first().map(|t| self.tydesc(t)) {
+                total += self.sizeof(&d);
+            }
+        }
         if let Node::List(items) = node {
-            for c in items {
-                total += self.agg_temp_bytes(c);
+            // `items[0]` is the head atom; `items[i]` for `i>=1` is `args[i-1]`. A constructor sitting
+            // in one of these build-in-place value slots is constructed in place (no temp), so mark it
+            // non-materializing. Everything else (call args, `discard`, operands) materializes.
+            let tag = node.tag();
+            let last = items.len().saturating_sub(1);
+            for (i, c) in items.iter().enumerate() {
+                let build_in_place = match tag {
+                    Some("ret") => i == 1,               // (ret Value) — into $sret
+                    Some("asgn") => i == 2,              // (asgn Lvalue Rhs)
+                    Some("store" | "keepovf") => i == 1, // (store Expr Lvalue) / (keepovf Expr Dest)
+                    // (var/const :n . type Init) — a `var` builds into its slot, a `const` into a data
+                    // segment; either way the initializer constructor is *not* a frame temp.
+                    Some("var" | "const") => i == last && i >= 4,
+                    Some("kv") => i == 2, // (kv Field Value) — into the parent field
+                    Some("aconstr") => i >= 2, // (aconstr Type Elem*) — into the array slot
+                    _ => false,
+                };
+                total += self.agg_temp_bytes_at(c, !build_in_place);
             }
         }
         total
@@ -4084,6 +4116,21 @@ impl<'a> FuncGen<'a> {
                 // Reading through an lvalue: load the scalar it addresses.
                 Some("deref" | "dot" | "at" | "pat") => self.load_lvalue(e),
                 Some("call") => self.call(e, Some(ValType::I64)), // value wanted (default i64 hint)
+                // An **aggregate literal in value position** — `(oconstr T …)` / `(aconstr T …)` with
+                // an aggregate `T`. An aggregate value *is* its address in this by-address model, so
+                // materialize the constructor into a scratch temp (the same lowering a call-argument
+                // constructor uses) and yield the temp's address. This is the `oconstr` in expression
+                // position a stdlib `result = (k, v)` / `return Obj(a: …)` hits (#990). A non-aggregate
+                // constructor (shouldn't occur) fails closed.
+                Some("oconstr" | "aconstr") => match self.agg_rvalue_temp(e)? {
+                    Some((addr, _)) => Ok(Val {
+                        id: addr,
+                        ty: ValType::I64,
+                    }),
+                    None => Err(LengError::Unsupported(
+                        "non-aggregate constructor in expression position".into(),
+                    )),
+                },
                 other => Err(LengError::Unsupported(format!(
                     "expression `{}`",
                     other.unwrap_or("<headless>")
