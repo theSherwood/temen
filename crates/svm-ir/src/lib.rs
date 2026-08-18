@@ -299,6 +299,60 @@ pub mod durable_abi {
     pub const SVC_WAIT_OP: u32 = 10;
 }
 
+/// The **op-17 spawn config record** (CONSOLIDATION.md §3/§3c/§3d): the fixed 56-byte little-endian
+/// layout that every `instantiate_rec` driver decodes — the tree-walker's op-17 arm, the bytecode
+/// tier's `Op::InstantiateRec`, and the Cranelift `instantiate_rec` thunk. One record subsumes every
+/// §14 spawn shape as data (module / entry / carve / pager / budget / quota / named-grant list).
+/// Hoisted here (svm-ir is the common dependency of all three) so the byte layout has **one**
+/// definition instead of three hand-decoded copies (#911). Only the *field extraction* is shared:
+/// each tier keeps its own pager / budget / grant handling and error order — they diverge by design
+/// (see the call sites), so this decodes the fields and validates nothing beyond the version word.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SpawnRec {
+    /// Child entry function index (record offset 4).
+    pub entry: u32,
+    /// Carve window offset within the parent's address space (offset 8).
+    pub off: u64,
+    /// Carve size as a power-of-two shift count; the driver validates it against `0..64` (offset 16).
+    pub size_log2: i64,
+    /// Pager impl-export index, or `u32::MAX` for none (offset 20).
+    pub pager: u32,
+    /// `Module` handle, or `-1` for self (offset 24).
+    pub modh: i32,
+    /// `Budget` handle, or `0` for none — mutually exclusive with a nonzero `quota` (offset 28).
+    pub budget: i32,
+    /// Raw fuel quota (offset 32).
+    pub quota: i64,
+    /// Named-grant list pointer (offset 40).
+    pub grants_ptr: u64,
+    /// Named-grant list count (offset 48).
+    pub grants_n: u64,
+}
+
+impl SpawnRec {
+    /// Decode the 56-byte record. `None` when the `version` word (offset 0) is nonzero — every
+    /// driver fails that closed. Pure layout decode: no handle/window/geometry validation, all of
+    /// which stays tier-local.
+    pub fn parse(rec: &[u8; 56]) -> Option<SpawnRec> {
+        let u32_at = |o: usize| u32::from_le_bytes([rec[o], rec[o + 1], rec[o + 2], rec[o + 3]]);
+        let u64_at = |o: usize| u64::from_le_bytes(rec[o..o + 8].try_into().unwrap());
+        if u32_at(0) != 0 {
+            return None; // version — fail closed
+        }
+        Some(SpawnRec {
+            entry: u32_at(4),
+            off: u64_at(8),
+            size_log2: u32_at(16) as i64,
+            pager: u32_at(20),
+            modh: u32_at(24) as i32,
+            budget: u32_at(28) as i32,
+            quota: u64_at(32) as i64,
+            grants_ptr: u64_at(40),
+            grants_n: u64_at(48),
+        })
+    }
+}
+
 /// SSA value types. `i8`/`i16` are memory access *widths*, not value types (§3a).
 /// `v128` is the fixed-128 SIMD vector (§17/D58): a first-class value carrying 16
 /// raw bytes whose lane interpretation is per-op, never per-value.

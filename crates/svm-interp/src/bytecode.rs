@@ -46,7 +46,7 @@
 
 use svm_ir::{
     BinOp, CastOp, CmpOp, ConvOp, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, FuncIdx,
-    IToF, Inst, IntTy, IntUnOp, LoadOp, Module, StoreOp, Terminator, ValType, VarLoc,
+    IToF, Inst, IntTy, IntUnOp, LoadOp, Module, SpawnRec, StoreOp, Terminator, ValType, VarLoc,
 };
 
 use super::{
@@ -13314,22 +13314,17 @@ impl Vm {
                     let ih = r!(*handle).i32();
                     let (ibase, isz) = host.with(|p| p.resolve_instantiator(ih))?;
                     let rp = r!(*rec).i64() as u64;
-                    let bytes = mem.as_ref().ok_or(Trap::Malformed)?.read_window(rp, 56)?;
-                    let u32_at = |o: usize| {
-                        u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]])
-                    };
-                    let u64_at = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
-                    if u32_at(0) != 0 {
-                        return Err(Trap::CapFault); // version — fail closed
-                    }
-                    let entry = u32_at(4) as i64;
-                    let off = u64_at(8) as i64;
-                    let size_log2 = u32_at(16) as i64;
-                    let pager = u32_at(20);
-                    let modh = u32_at(24) as i32;
-                    let budget = u32_at(28) as i32;
-                    let quota = u64_at(32) as i64;
-                    if pager != u32::MAX {
+                    let raw = mem.as_ref().ok_or(Trap::Malformed)?.read_window(rp, 56)?;
+                    let raw: &[u8; 56] = raw.as_slice().try_into().map_err(|_| Trap::Malformed)?;
+                    // Shared 56-byte layout decode (#911); pager/budget handling stays tier-local.
+                    let sr = SpawnRec::parse(raw).ok_or(Trap::CapFault)?; // version — fail closed
+                    let entry = sr.entry as i64;
+                    let off = sr.off as i64;
+                    let size_log2 = sr.size_log2;
+                    let modh = sr.modh;
+                    let budget = sr.budget;
+                    let quota = sr.quota;
+                    if sr.pager != u32::MAX {
                         return Err(Trap::CapFault); // no impl exports here (see above) — fail closed
                     }
                     if budget != 0 {
@@ -13340,9 +13335,7 @@ impl Vm {
                         // the drain waits for the drivers' commit.
                         host.with(|p| p.peek_budget(budget).map(|_| ()).ok_or(Trap::CapFault))?;
                     }
-                    let gp = u64_at(40);
-                    let gn = u64_at(48);
-                    let grants = (gn > 0).then_some((gp, gn));
+                    let grants = (sr.grants_n > 0).then_some((sr.grants_ptr, sr.grants_n));
                     let dst = *dst;
                     self.module = module;
                     self.cur = cur;
