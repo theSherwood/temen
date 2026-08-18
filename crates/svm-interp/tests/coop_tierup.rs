@@ -204,3 +204,80 @@ fn coop_tierup_trap_parity() {
         "cooperative tier-up value/trap diverged from the oracle"
     );
 }
+
+// A tier-up leaf whose emitted region **bounces** back to an interp-resident callee: func 1 (`L`, the
+// eligible leaf) is `L(x) = C(x)`, and func 2 (`C`) is `C(x) = 3x + 7`. The host services the `TierUp`
+// by calling `CoopRun::bounce` — emulating the emitted `f1` reaching `call_interp` for func 2 — then
+// delivers `C`'s result as `L`'s. Proves the cross-tier bounce dispatches through the tiering-up task's
+// env (masked table → `(module 0, func 2)`), marshals args/results, and threads the run-shared fiber
+// registry — the `CoopSched` analogue of `Vcpu::bounce_call`. The dispatch-table slot for a module-0
+// function `c` is just `c` (`SharedSlots::new` packs slot i ↦ `(0, i)`), so the bounce target is `2`.
+const SRC_BOUNCE: &str = r#"
+func () -> (i64) {
+block 0 () {
+  v = i64.const 4
+  vr = call 1 (v)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vr = call 2 (vx)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  v3 = i64.const 3
+  vm = i64.mul vx v3
+  v7 = i64.const 7
+  va = i64.add vm v7
+  return va
+  }
+}
+"#;
+
+#[test]
+fn coop_tierup_bounce_matches_pure_interp() {
+    let m = parse_module(SRC_BOUNCE).unwrap();
+    svm_verify::verify_module(&m).expect("verify");
+    // func 1 (L) is the eligible tier-up leaf; func 2 (C) is the interp callee it bounces to.
+    let eligible: std::sync::Arc<[bool]> = std::sync::Arc::from(vec![false, true, false]);
+
+    let want = {
+        let mut fuel = FUEL;
+        bytecode::compile_and_run(&m, 0, &[], &mut fuel).expect("supported")
+    };
+
+    let tierup = TierUpConfig {
+        eligible,
+        page_checked: false,
+    };
+    let mut run = bytecode::CoopRun::new(&m, 0, &[], FUEL, Host::new(), Some(tierup))
+        .expect("supported")
+        .expect("entry in range");
+    let mut bounces = 0u32;
+    let got = loop {
+        match run.run() {
+            bytecode::CoopEvent::Done(vals) => break Ok(vals),
+            bytecode::CoopEvent::Trapped(t) => break Err(t),
+            bytecode::CoopEvent::TierUp { func, argv, .. } => {
+                assert_eq!(func, 1, "only func 1 (L) is eligible / tiers up");
+                // Emulate f1's emitted body: `call_interp(func 2, argv)` — the cross-tier bounce.
+                let mut io: Vec<i64> = argv.to_vec();
+                let n = run.bounce(2, &mut io).expect("bounce resolves + runs");
+                bounces += 1;
+                assert_eq!(n, 1, "C returns exactly one result");
+                run.deliver_tierup(&io[..n]);
+            }
+        }
+    };
+
+    // L(x) = C(x) = 3x + 7; x = 4 → 19.
+    assert_eq!(want, Ok(vec![Value::I64(19)]), "oracle value");
+    assert_eq!(
+        got, want,
+        "cooperative tier-up + bounce diverged from the pure-interp oracle"
+    );
+    assert_eq!(bounces, 1, "expected exactly one cross-tier bounce");
+}

@@ -10873,6 +10873,136 @@ impl CoopRun {
     pub fn deliver_tierup_trap(&mut self, trap: Trap) {
         self.sched.deliver_tierup_trap(trap);
     }
+
+    /// #926 slice 2 — service an emitted tier-up region's cross-tier `call_interp(target, io)` while it
+    /// is mid-run for the **currently paused task**. Routes the bounce to *that task's* env — a §14
+    /// confined child steps its own window/powerbox/dispatch table (`env == Some`), the root and its
+    /// `thread.spawn` threads the shared ones (`env == None`) — so a confined leaf's callback can never
+    /// reach outside its window (the confinement hinge). The run-shared fiber registry is used (a fiber
+    /// a callback parks persists for the run to resume), exactly as the same call inline would register.
+    /// Marshals results back into `io` and returns the result count. Call only between a
+    /// [`CoopEvent::TierUp`] and its delivery; `Err(Malformed)` if no tier-up is outstanding.
+    pub fn bounce(&mut self, target: u32, io: &mut [i64]) -> Result<usize, Trap> {
+        let ti = self
+            .sched
+            .pending_tierup
+            .as_ref()
+            .map(|(ti, ..)| *ti)
+            .ok_or(Trap::Malformed)?;
+        let CoopRun {
+            dom,
+            mem,
+            host,
+            fuel,
+            sched,
+        } = self;
+        let CoopSched {
+            tasks,
+            extra_envs,
+            fibers,
+            fiber_sp,
+            fiber_meta,
+            ..
+        } = sched;
+        match tasks[ti].env {
+            // Root / `thread.spawn` thread: the run's shared window, powerbox, and domain table.
+            None => {
+                let mut cell = HostCell::Excl(host);
+                coop_bounce(
+                    &dom.source,
+                    &dom.table,
+                    fuel,
+                    mem,
+                    &mut cell,
+                    fibers,
+                    fiber_sp,
+                    fiber_meta,
+                    target,
+                    io,
+                )
+            }
+            // §14 confined child: its OWN window, powerbox, table, and fuel — never the root's.
+            Some(k) => {
+                let e = &mut extra_envs[k];
+                let mut cell = HostCell::Shared(&e.host);
+                coop_bounce(
+                    &dom.source,
+                    &e.table,
+                    &mut e.fuel,
+                    &mut e.mem,
+                    &mut cell,
+                    fibers,
+                    fiber_sp,
+                    fiber_meta,
+                    target,
+                    io,
+                )
+            }
+        }
+    }
+}
+
+/// #926 slice 2 — the cooperative driver's cross-tier **bounce** body: an emitted tier-up region, mid
+/// run, calls back to an interp-resident leaf `target`. Resolves `target` through the caller's dispatch
+/// `table` (masked, exactly as `Op::CallIndirect`), marshals the i64 scratch `io` per the callee's
+/// signature, and drives it to completion on a nested interpretation over the caller's `mem`/`host`/
+/// `fuel` and the **run-level** fiber registry (so a fiber a callback parks persists for the run — the
+/// same registry `step_vcpu` mirrors its parallel arrays into). The multi-task analogue of
+/// [`Vcpu::bounce_call`], differing only in that the window/powerbox/table come from the *tiering-up
+/// task's* env (resolved by [`CoopRun::bounce`]); always a run-level bounce — the cooperative driver
+/// never surfaces an emitted `Jit.invoke`, so there is no invoke-confined variant.
+#[allow(clippy::too_many_arguments)] // an inherently many-input dispatch shim; a config struct would obscure it
+fn coop_bounce(
+    source: &ModuleSource,
+    table: &SharedSlots,
+    fuel: &mut u64,
+    mem: &mut Option<Mem>,
+    host: &mut HostCell,
+    fibers: &mut Vec<FiberState>,
+    fiber_sp: &mut Vec<u64>,
+    fiber_meta: &mut Vec<(i32, i64)>,
+    target: u32,
+    io: &mut [i64],
+) -> Result<usize, Trap> {
+    step(fuel, None)?; // fuel unification: the dispatch-site safepoint
+    let slot = (target as usize) & (table.len() - 1);
+    let ts = table.slot(slot);
+    if ts.module == super::TABLE_EMPTY {
+        return Err(Trap::IndirectCallType);
+    }
+    let tm = source.get(ts.module as usize).ok_or(Trap::Malformed)?;
+    let (cp, cr) = tm.sigs[ts.func as usize].clone();
+    if cp.len() > io.len() || cr.len() > io.len() {
+        return Err(Trap::Malformed); // scratch too small — a mis-marshalled host call
+    }
+    // The i64-slot transport carries scalars only; a v128-sig target can never have been given a
+    // trampoline (the host gates that at open) — a bounce naming one is a mis-wired host.
+    let scalar =
+        |t: &ValType| matches!(t, ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64);
+    if !cp.iter().all(scalar) || !cr.iter().all(scalar) {
+        return Err(Trap::Malformed);
+    }
+    let args: Vec<Value> = cp
+        .iter()
+        .zip(io.iter())
+        .map(|(ty, s)| slot_to_val(*ty, *s))
+        .collect();
+    let mut vm = Vm::new(&tm, ts.func as usize, &args)?;
+    vm.module = ts.module as usize;
+    let vals = drive_nested(
+        source,
+        table,
+        vm,
+        fuel,
+        mem,
+        host,
+        fibers,
+        Some((fiber_sp, fiber_meta)),
+    )?;
+    for (i, v) in vals.iter().enumerate() {
+        io[i] = val_to_slot(*v);
+    }
+    Ok(cr.len())
 }
 
 /// THREADS.md step 4c — a **native futex**, the parallel driver's stand-in for wasm
