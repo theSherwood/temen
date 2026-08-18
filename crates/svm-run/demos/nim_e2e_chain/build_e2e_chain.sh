@@ -107,4 +107,13 @@ let r = useit(4)
 printf 'proc triple*(x: int): int = x * 3\n' > "$CACHE/proj_usermod/helper.nim"
 run_fixture usermod useit 13 4
 
+# Real I/O: a program that `import std/syncio` and `write`s (four units: system + syncio + its dep +
+# main). `<io>` mode links through the nim→powerbox bridge and runs `_start` under the powerbox, so the
+# guest's `write(fd,buf,len)` reaches the STREAM `write` cap — real **stdout**, checked against the
+# expected string (`\n` decoded). (`echo` is not yet an identifier nimony resolves — a frontend gap.)
+write_main iohello 'import std/syncio
+write(stdout, "hello, svm\n")
+'
+run_fixture iohello '<io>' 'hello, svm\n'
+
 echo "ALL FIXTURES RAN — the full nimony compiler runs on the SVM (single- and multi-module), and its compiled output runs too"

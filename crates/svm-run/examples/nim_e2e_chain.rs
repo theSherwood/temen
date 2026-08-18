@@ -18,8 +18,13 @@
 //! plan). The driver reads that plan, so it handles **any number of modules**: a program that
 //! `import`s pulls in more compilation units, each its own nifler→nimsem→hexer unit, dependency-
 //! ordered. It re-runs **sema and lowering on the SVM** for every module (the parse is checked too —
-//! nifler.svmb re-parses the main and its bytes must match), links them all with the runtime shim, and
-//! calls `<export>` with `[arg...]`, asserting the result is `<expected>` on the tree-walker and JIT.
+//! nifler.svmb re-parses the main and its bytes must match), then links and runs in one of two modes:
+//!
+//! - **compute** — `<export> <expected-i64> [i64 args…]`: link with the W3 compute shim and call the
+//!   named exported proc, asserting the returned `i64` on the tree-walker and the JIT (§9 parity).
+//! - **I/O** — `<io> <expected-stdout>`: a program that `write`s. Link through the nim→powerbox bridge
+//!   (`svm_leng::link_nim_powerbox`), run `_start` under the powerbox (host grants stdout), and assert
+//!   the captured **stdout** (`\n`/`\t` decoded) — a Nim program compiled by the SVM printing for real.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -274,8 +279,13 @@ fn main() {
     let libdir = next("libdir");
     let nimcache = next("nimcache-dir");
     let main_stem = next("main-stem");
+    // Two run modes. Compute: `<export> <expected-i64> [i64 args…]` — link with the compute shim and
+    // call an exported proc, asserting the returned i64. I/O: `<io> <expected-stdout>` — link through
+    // the nim→powerbox bridge and run `_start` under the powerbox, asserting the captured **stdout**
+    // (a program that `echo`s / `write`s). `\n`/`\t` in the expected stdout are decoded.
     let export = next("export");
-    let expected: i64 = next("expected").parse().expect("expected is i64");
+    let expected_raw = next("expected");
+    let io_mode = export == "<io>";
     let call_args: Vec<i64> = a.map(|s| s.parse().expect("arg is i64")).collect();
 
     let read = |p: &str| std::fs::read(p).unwrap_or_else(|e| panic!("read {p}: {e}"));
@@ -429,12 +439,34 @@ fn main() {
     }
 
     // ---- phase 3: hexer.svmb (lower) — each semchecked module → Leng `.x.nif` ----------------------
+    // The **main** module is lowered as native `nimony c` does — `hexer c --isMain --app:console
+    // --outdir:nimcache/<main>` — so its `.x.nif` (written into the outdir) carries the C `main`/
+    // `_start` app-entry glue the powerbox `_start` run needs. Other modules use a plain `hexer c`.
+    let outdir = format!("nimcache/{main_stem}");
     let run_hexer = |stem: &str| -> Vec<u8> {
+        let is_main = stem == main_stem;
+        let s_nif = format!("nimcache/{stem}.s.nif");
+        let outdir_arg = format!("--outdir:{outdir}");
+        let argv: Vec<&str> = if is_main {
+            vec![
+                "hexer",
+                "c",
+                "--bits:64",
+                "--cpu:le",
+                "--flags:br",
+                "--isMain",
+                "--app:console",
+                &outdir_arg,
+                &s_nif,
+            ]
+        } else {
+            vec!["hexer", "c", &s_nif]
+        };
         let run = instantiate(svm_encode::decode_module(&hexer).expect("decode hexer"))
             .expect("instantiate hexer")
             .run_with_caps(
                 Backend::TreeWalk,
-                &cfg(&["hexer", "c", &format!("nimcache/{stem}.s.nif")], vec![]),
+                &cfg(&argv, vec![]),
                 &[("fs", fs.grant())],
             )
             .expect("run hexer");
@@ -443,9 +475,15 @@ fn main() {
             "hexer {stem}: {:?}",
             run.outcome
         );
+        // The main's `.x.nif` lands in the outdir; the others' next to their `.s.nif`.
+        let key = if is_main {
+            format!("{outdir}/{stem}.x.nif")
+        } else {
+            format!("nimcache/{stem}.x.nif")
+        };
         let xnif = fs
-            .read(&format!("nimcache/{stem}.x.nif"))
-            .unwrap_or_else(|| panic!("hexer wrote no {stem}.x.nif"));
+            .read(&key)
+            .unwrap_or_else(|| panic!("hexer wrote no {key}"));
         eprintln!("phase 3  hexer.svmb: {stem} → {} B Leng .x.nif", xnif.len());
         xnif
     };
@@ -459,10 +497,53 @@ fn main() {
         })
         .collect();
 
-    // ---- phase 4 (host link + run): link the SVM-produced Leng with the W3 runtime shim, execute ---
-    // The system module (stem `sysv…`) is self-contained, so it discovers the bottom-edge C imports;
-    // bind those to the shim. Order units **main first** (func 0 = the natural entry) and **system
-    // last**, with the imported modules in between — the convention `link_whole_with_runtime` builds on.
+    // ---- phase 4 (host link + run): link the SVM-produced Leng, execute --------------------------
+    // Order units **main first** (func 0 = the natural entry) and **system last**, with imported
+    // modules between — the convention both linkers build on.
+    let mut ordered: Vec<&(String, String)> = leng.iter().collect();
+    ordered.sort_by_key(|(stem, _)| (*stem != main_stem, stem.starts_with("sysv")));
+    let units: Vec<svm_leng::WholeModule> = ordered
+        .iter()
+        .map(|(stem, src)| svm_leng::WholeModule { stem, src })
+        .collect();
+
+    if io_mode {
+        // I/O program: bridge nimony's bottom edge to the §3e powerbox (`sysWrite(fd,buf,len)` → the
+        // STREAM `write` cap) via `link_nim_powerbox`, then run `_start` under the powerbox (host grants
+        // stdout) and assert the captured **stdout** — the same bridge the `nim_hello` card ships.
+        let m: Module = svm_leng::link_nim_powerbox(&units)
+            .unwrap_or_else(|e| panic!("nim→powerbox link: {e}"));
+        svm_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+        assert!(
+            svm_run::is_named_powerbox_entry(&m),
+            "linked module is not a powerbox entry (paramless func-0 `_start`)"
+        );
+        eprintln!(
+            "phase 4  linked (powerbox) → {} funcs, verified",
+            m.funcs.len()
+        );
+        let want = expected_raw.replace("\\n", "\n").replace("\\t", "\t");
+        let run = svm_run::run_powerbox(&m, &[]).unwrap_or_else(|e| panic!("run_powerbox: {e}"));
+        let got = String::from_utf8_lossy(&run.stdout);
+        assert_eq!(
+            got.as_ref(),
+            want,
+            "SVM stdout must match the expected output (got {:?})",
+            got
+        );
+        println!(
+            "✅ FULL CHAIN ON SVM (I/O): nifler → nimsem → hexer (all sandboxed) → nim→powerbox link → \
+             ran under the powerbox → stdout = {:?}. A Nim program compiled by the SVM prints for real.",
+            got
+        );
+        return;
+    }
+
+    // Compute program: link with the W3 runtime shim (discover the system module's bottom-edge C
+    // imports and bind them), then call an exported proc on both engines (§9 parity).
+    let expected: i64 = expected_raw
+        .parse()
+        .expect("expected is i64 in compute mode");
     let sys_src = leng
         .iter()
         .find(|(s, _)| s.starts_with("sysv"))
@@ -484,12 +565,6 @@ fn main() {
         exports,
         ..Default::default()
     };
-    let mut ordered: Vec<&(String, String)> = leng.iter().collect();
-    ordered.sort_by_key(|(stem, _)| (*stem != main_stem, stem.starts_with("sysv")));
-    let units: Vec<svm_leng::WholeModule> = ordered
-        .iter()
-        .map(|(stem, src)| svm_leng::WholeModule { stem, src })
-        .collect();
     let m: Module = svm_leng::link_whole_with_runtime(&units, vec![runtime])
         .unwrap_or_else(|e| panic!("link with runtime: {e}"));
     svm_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
@@ -499,7 +574,6 @@ fn main() {
         m.funcs.len()
     );
 
-    // Call `export` with `call_args` on both engines (§9 parity) and assert the result.
     let idx = m
         .exports
         .iter()

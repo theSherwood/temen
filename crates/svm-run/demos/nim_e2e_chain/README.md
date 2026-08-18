@@ -33,10 +33,20 @@ exact args nimony assigned (`--isSystem` / `--isMain` / bare), lowers each with 
 whole `.x.nif` set. The `usermod` fixture (`import ./helper`) is a three-unit build (system + helper +
 main) that compiles and runs on the SVM.
 
-The fixtures are **compute programs** (`proc … ; let r = …`), and the result is read back by calling an
-exported proc (no stdout needed — real `echo`/`write` output through the powerbox is #957). Programs
-that pull in *stdlib* modules additionally depend on that module translating through `svm-leng` (the
-breadth long-pole, #760 / conformance suite #956).
+## Two run modes
+
+- **Compute** (`<export> <expected-i64> [args…]`): link with the W3 compute shim and call an exported
+  proc, asserting the returned `i64` on both engines (§9 parity).
+- **I/O** (`<io> <expected-stdout>`): a program that `write`s — link through the **nim→powerbox
+  bridge** (`svm_leng::link_nim_powerbox`, the same bridge the `nim_hello` card ships) and run `_start`
+  under the powerbox, so the guest's `write(fd,buf,len)` reaches the STREAM `write` cap. The captured
+  **stdout** is checked against the expected string. The `iohello` fixture (`import std/syncio;
+  write(stdout, "hello, svm\n")`) is a four-unit compile that **prints for real** — a Nim program
+  compiled entirely by the SVM, producing output. (`echo` isn't an identifier nimony resolves yet — a
+  frontend gap, not ours.)
+
+Programs that pull in *stdlib* modules additionally depend on that module translating through
+`svm-leng` (the breadth long-pole, #760 / conformance suite #956).
 
 `nimsem` is built with **`-d:skipPostSemValidator`** (as nimony's own Windows CI does); the in-process
 post-sem IR validator has a separate on-ramp issue, tracked apart from the sema this proves correct.
