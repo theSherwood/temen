@@ -11978,6 +11978,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         hg.spawn_named_child(grants, child_size)
                             .and_then(|(mut ch, ci, ca)| {
                                 ch.self_module = Some(Arc::clone(&cm.module));
+                                // #801 — the image-replace keeps the TaskId, so it must keep the
+                                // domain's task-lifecycle wiring too: the **exit hooks** (a
+                                // personality fork twin's retire-to-Zombie — without the carry an
+                                // exec'd twin's exit never retires and the parent's blocking
+                                // `waitpid` hangs, breaking §8.6's "wait reaps the command's
+                                // exit") and the **signal source + armed flag** (the twin stays
+                                // kill/stop-addressable after exec — the #796 doors reach the
+                                // domain, not an image). Dispositions resetting to default on
+                                // exec is personality policy, not this carry's concern.
+                                ch.exit_hooks = hg.exit_hooks.clone();
+                                if let Some(src) = hg.sig_source.as_ref() {
+                                    ch.set_signal_source(
+                                        Arc::clone(src),
+                                        Arc::clone(&hg.sig_armed),
+                                    );
+                                }
                                 ch.bind_child_manifest(&cm.imports, &cm.types)
                                     .ok()
                                     .map(|()| (ch, ci, ca, child_size))

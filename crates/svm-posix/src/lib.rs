@@ -184,6 +184,16 @@ pub const OP_FORK: u32 = 51;
 /// leave the guest's powerbox), and a garbage handle simply fails the guest's own later cap-call.
 pub const OP_PIPE_ADOPT: u32 = 52;
 
+/// #801 slice A — **`exec_resolve(path_ptr, path_len) -> module_handle | -errno`**: the
+/// execve-of-a-file resolver. A path registered through [`Posix::register_executable`] returns its
+/// pre-granted `Module` handle (the exec_lookup discipline: minting happened at registration on
+/// the embedder's side, so this dispatch is pure bookkeeping); a memfs file that is NOT a
+/// registered executable is `-EACCES` (a real file without the exec bit); anything else is
+/// `-ENOENT`. The guest libc's `execve` follows a hit with the `CAP_SELF_EXEC` self-op
+/// (`__vm_exec_module`) — the core image-replace — so the personality adds no exec mechanism,
+/// only the path→module policy (INVARIANTS #4).
+pub const OP_EXEC_RESOLVE: u32 = 53;
+
 /// #972 slice 1 — the **handle-carrying tag** returned by `read`/`write`/`close` on a
 /// [`FdEntry::CorePipe`] fd: `PX_TAG_BASE - handle`. A **personality ↔ shim private convention**,
 /// never interpreted by the core (INVARIANTS.md #5/#11 discipline): every tag is `<= PX_TAG_BASE`,
@@ -341,6 +351,7 @@ const S_IFDIR: i64 = 0o040000; // directory (| 0o755 perms)
 const O_ACCMODE: i64 = 3;
 const O_WRONLY: i64 = 1;
 const O_RDWR: i64 = 2;
+const EACCES: i64 = -13; // #801: a memfs file without the executable registration
 const O_CREAT: i64 = 0o100;
 const O_TRUNC: i64 = 0o1000;
 const O_APPEND: i64 = 0o2000;
@@ -664,6 +675,10 @@ struct World {
     /// spawn to the command's own window). The embedder seeds it with [`Posix::register_command`] after
     /// granting each command `Module`. A plain `Vec` (a shell's PATH is short); first match wins.
     commands: Vec<(String, i32, u8)>,
+    /// #801 — paths registered as **executables** ([`Posix::register_executable`]): the exec-bit
+    /// set `stat` consults (mode `0o755` vs a plain file's `0o644`) and the `exec_resolve` gate
+    /// (a memfs file outside this set is `-EACCES`).
+    executables: HashSet<String>,
     /// The `Stream` handle `exec_stdout` returns — the stdout the shell re-grants to a spawned child
     /// under the name `"stdout"`. Set by [`Posix::set_exec_stdout`]; `0` until then (a shell that never
     /// spawns never reads it).
@@ -980,6 +995,21 @@ impl Posix {
             .push((name.to_string(), module_handle, win_log2));
     }
 
+    /// #801 — register a **filesystem executable**: `path → module_handle` in the same registry
+    /// [`Self::register_command`] feeds (a path is just a name with `/`), plus the userland
+    /// presentation — a memfs marker file at `path` (so `stat`/`glob`/`open` see a real file) and
+    /// the exec bit (`stat` reports mode `0o755`; `exec_resolve` refuses unregistered files with
+    /// `-EACCES`). The `Module` was granted on the shell's `Host` by the embedder — authority
+    /// arrived down the grant graph (invariant 3); this records the path view over it.
+    pub fn register_executable(&self, path: &str, module_handle: i32, win_log2: u8) {
+        self.register_command(path, module_handle, win_log2);
+        let mut st = self.world.lock().unwrap_or_else(|e| e.into_inner());
+        st.executables.insert(path.to_string());
+        st.files
+            .entry(path.to_string())
+            .or_insert_with(|| b"\x7fSVM".to_vec());
+    }
+
     /// Set the `Stream` handle the shell re-grants to a spawned child as its `"stdout"` — what
     /// `exec_stdout()` returns. Grant the `Stream` on the same `Host`, routed to the shared sink
     /// (`set_stdout_sink`), so the child's output joins the shell's (STAGE1.md §5).
@@ -1127,6 +1157,7 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "exec_win" => OP_EXEC_WIN,
         "pipe" => OP_PIPE,
         "pipe_adopt" => OP_PIPE_ADOPT,
+        "exec_resolve" => OP_EXEC_RESOLVE,
         "dup2" => OP_DUP2,
         "dup" => OP_DUP,
         "fcntl" => OP_FCNTL,
@@ -1514,6 +1545,7 @@ fn new_world(stdin: Vec<u8>) -> World {
         clock_base: std::time::Instant::now(),
         clock_fixed: None,
         commands: Vec::new(),
+        executables: HashSet::new(),
         exec_stdout_handle: 0,
         exec_stdin_handle: 0,
         exec_stdin_fifo: None,
@@ -1608,6 +1640,7 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
                 OP_EXEC_WIN => st.exec_win(args),
                 OP_PIPE => st.pipe(args, mem),
                 OP_PIPE_ADOPT => st.pipe_adopt(args, mem),
+                OP_EXEC_RESOLVE => st.exec_resolve(args, mem),
                 OP_DUP2 => Ok(vec![st.dup2(args)]),
                 OP_DUP => Ok(vec![st.dup(args)]),
                 OP_FCNTL => Ok(vec![st.fcntl(args)]),
@@ -2422,6 +2455,19 @@ impl Ctx<'_> {
         // Fail closed *before* any side effect (draining stdin) if no delegate is wired.
         if self.w.spawn_fn.is_none() {
             return ENOSYS;
+        }
+        // #972 slice 2 — a CorePipe stdio target fails closed with a probeable errno. The capture
+        // spawn is synchronous (the child runs to completion inside this dispatch), so it cannot
+        // consume or feed a *live* core pipe: a CorePipe stdin would need a blocking drain this
+        // dispatch cannot perform, and a CorePipe stdout/stderr would need a cap-call write it
+        // cannot issue — silently dropping the bytes (the pre-fix behavior) is the one wrong
+        // answer. Live-pipe wiring belongs to fork + execve (#801), where the exec-replace's
+        // named re-grant carries the ends.
+        for (fd, dflt) in [(stdin_fd, 0), (stdout_fd, 1), (stderr_fd, 2)] {
+            let eff = if fd < 0 { dflt } else { fd };
+            if matches!(self.fd(eff), Some(FdEntry::CorePipe(_))) {
+                return EINVAL;
+            }
         }
         // The child inherits its stdin from `stdin_fd` (fd 0 by default) — drain it before the delegate.
         let stdin = self.drain_fd(if stdin_fd < 0 { 0 } else { stdin_fd });
@@ -3330,7 +3376,13 @@ impl Ctx<'_> {
             return Ok(vec![EINVAL]);
         };
         let (mode, size) = if let Some(f) = self.w.files.get(&path) {
-            (S_IFREG | 0o644, f.len() as i64)
+            // #801 — a registered executable carries the exec bits; a plain file does not.
+            let perms = if self.w.executables.contains(&path) {
+                0o755
+            } else {
+                0o644
+            };
+            (S_IFREG | perms, f.len() as i64)
         } else if self.is_dir(&path) {
             (S_IFDIR | 0o755, 0)
         } else {
@@ -3463,6 +3515,34 @@ impl Ctx<'_> {
             .map(|(_, h, _)| *h as i64)
             .unwrap_or(-1);
         Ok(vec![h])
+    }
+
+    /// #801 — `exec_resolve(path_ptr, path_len) -> module_handle | -errno`: resolve a filesystem
+    /// path to its registered executable's pre-granted `Module` handle. A memfs file that is not
+    /// a registered executable is `-EACCES` (no exec bit); an absent path is `-ENOENT`; a
+    /// non-UTF-8 path is `-EINVAL`. The errno split is what the guest `execvp` PATH walk keys on
+    /// (POSIX: remember an EACCES, keep searching on ENOENT).
+    fn exec_resolve(
+        &mut self,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+    ) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+        let len = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
+        let bytes = mem.read_bytes(ptr, len).ok_or(Trap::Malformed)?;
+        let Ok(path) = String::from_utf8(bytes) else {
+            return Ok(vec![EINVAL]);
+        };
+        if self.w.executables.contains(&path) {
+            if let Some((_, h, _)) = self.w.commands.iter().find(|(n, _, _)| *n == path) {
+                return Ok(vec![*h as i64]);
+            }
+        }
+        if self.w.files.contains_key(&path) {
+            return Ok(vec![EACCES]);
+        }
+        Ok(vec![ENOENT])
     }
 
     /// `exec_win(module_handle) -> size_log2 | -1`: the declared window of the registered command with
@@ -6091,6 +6171,44 @@ block 0 (vph: i32) {\n\
             (status >> 8) & 0xff,
             3,
             "WEXITSTATUS is the delegate's exit code"
+        );
+    }
+
+    /// #972 slice 2 — a **CorePipe stdio target fails closed** on the capture spawn: the child runs
+    /// to completion inside one dispatch, which can neither drain a live core pipe (blocking) nor
+    /// cap-call bytes into one — so a CorePipe stdin/stdout/stderr is `-EINVAL` up front (the
+    /// pre-fix behavior silently dropped the child's bytes). Adoption never exercises handles, so
+    /// fake handle numbers suffice here. Live-pipe wiring is fork+execve territory (#801).
+    #[test]
+    fn spawn2_fails_closed_on_a_core_pipe_stdio_target() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        posix.set_spawn(|_n, _a, _s| SpawnResult {
+            stdout: b"out".to_vec(),
+            stderr: Vec::new(),
+            status: 0,
+        });
+        let mut win = vec![0u8; WIN];
+        let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
+        ctx!(posix, w_g, p_g, st);
+        win_write(&mut mem, 0, b"prog");
+        st.pipe_adopt(&[7, 8, 8], Some(&mut mem)).unwrap(); // fake handles; [rfd@8, wfd@12]
+        let wfd = i32::from_le_bytes(mem.read_bytes(12, 4).unwrap().try_into().unwrap()) as i64;
+        win_write(&mut mem, 100, &0u64.to_le_bytes());
+        win_write(&mut mem, 108, &4u64.to_le_bytes());
+        win_write(&mut mem, 116, &0u64.to_le_bytes());
+        win_write(&mut mem, 124, &0u64.to_le_bytes());
+        win_write(&mut mem, 132, &(-1i32).to_le_bytes());
+        win_write(&mut mem, 136, &(wfd as i32).to_le_bytes()); // stdout -> a CorePipe fd
+        win_write(&mut mem, 140, &(-1i32).to_le_bytes());
+        let r = st.spawn2(&[100], Some(&mut mem)).unwrap()[0];
+        assert_eq!(
+            r, EINVAL,
+            "a CorePipe spawn target refuses probeably, never a silent drop"
+        );
+        assert!(
+            st.w.stdout.is_empty(),
+            "nothing ran: fail closed happened before the delegate"
         );
     }
 
