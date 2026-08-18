@@ -11508,6 +11508,22 @@ fn ll_parity_debug_source_lines() {
 }
 
 #[test]
+fn ll_parity_debug_o2_phi_and_declare() {
+    // Full `-O2 -g` (#986, the Tcl/Postgres `-g` diagnosis builds): optimized debug output attaches
+    // `!dbg` where the plain-text parser once choked — trailing on a `phi`'s incoming list
+    // (`phi i32 [...], [...], !dbg !N` — the comma belongs to the metadata, not a next incoming)
+    // and function-level on an extern `declare` BEFORE the return type, mixed with return attrs
+    // (`declare !dbg !N noundef i32 @ext(...)`). The loop yields the phi; the extern the declare.
+    assert_ll_parity_debug_at(
+        "ll_parity_dbg_o2",
+        "extern int putchar(int);\n\
+         int f(int n){ int s = 0; for (int i = 0; i < n; i++) s += i; return putchar(s); }\n",
+        "-O2",
+        "-g",
+    );
+}
+
+#[test]
 fn ll_parity_trivial_add() {
     // The simplest real `clang -O2` function: `define dso_local i32 @add(i32 %0, i32 %1) … { %3 =
     // add nsw i32 %1, %0; ret i32 %3 }` — exercising the function header (linkage/param attrs/

@@ -822,6 +822,16 @@ impl Parser {
     fn declare_def(&mut self) -> PResult<()> {
         self.expect_word("declare")?;
         self.skip_pre_signature_attrs();
+        // A `-g` build attaches function-level metadata BEFORE the return type on declarations
+        // (`declare !dbg !N noundef i64 @fwrite(...)`); skip `!kind !N` pairs — a declaration has
+        // no body to attribute, so the id is droppable — then re-skip return attrs (`noundef` …)
+        // that follow the metadata.
+        while matches!(self.peek(), Some(Token::Meta(_)))
+            && matches!(self.peek2(), Some(Token::Meta(_)))
+        {
+            self.pos += 2;
+        }
+        self.skip_pre_signature_attrs();
         let return_type = self.type_()?;
         let name = match self.bump() {
             Some(Token::Global(s)) => s,
@@ -1914,7 +1924,11 @@ impl Parser {
             self.expect(&Token::RBracket)?;
             incoming_values.push((val, block));
             inc_idx += 1;
-            if !self.eat(&Token::Comma) {
+            // Continue only into another `[val, block]` incoming — a `-g` build attaches `, !dbg !N`
+            // after the list, which must stay for `skip_trailing_metadata` (the comma included).
+            if self.peek() == Some(&Token::Comma) && self.peek2() == Some(&Token::LBracket) {
+                self.pos += 1; // `,`
+            } else {
                 break;
             }
         }
