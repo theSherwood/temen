@@ -42,6 +42,14 @@ svm-dap    = { path = "../crates/svm-dap" }
 # `Module` is named by the fixture/corpus bins and by `powerbox_exec` (shared with the cdylib).
 svm-ir     = { path = "../crates/svm-ir" }
 svm-fs     = { path = "../crates/svm-fs" }
+# The `exec` capability ABI + `JobTable`/`run_args` (EXEC.md) — the multibinary driver's child-spawn
+# surface. Pure (deps `svm-ir` + `svm-interp`), so it builds for wasm. Used by the in-browser nimony
+# compiler card (#958): `nimsem` spawns `nifler` as an `exec` child over the shared memfs.
+svm-exec = { path = "../crates/svm-exec" }
+# The Leng→SVM-IR translator + the nim→powerbox / runtime-shim linkers (NIM.md §3d/§3e). Pure
+# (deps `svm-ir` + `svm-text` + `svm-encode`), so it builds for wasm — it links the compiled Nim
+# in-browser (the same `link_nim_powerbox`/`link_whole_with_runtime` the headless driver uses).
+svm-leng = { path = "../crates/svm-leng" }
 # The escape-freedom verifier — the security hinge of the guest-driven `Jit` cap's validator
 # (decode → verify → preconditions). Pure (only deps `svm-ir`), so it builds for wasm.
 svm-verify = { path = "../crates/svm-verify" }
