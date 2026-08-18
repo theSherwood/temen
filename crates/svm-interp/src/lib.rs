@@ -23210,7 +23210,7 @@ impl Mem {
 
 impl GuestMem for Mem {
     fn window_size(&self) -> u64 {
-        self.window.size()
+        self.window.reserved()
     }
     fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
         self.read_bytes_impl(ptr, len)

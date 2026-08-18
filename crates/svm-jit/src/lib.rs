@@ -2636,52 +2636,10 @@ impl CompiledModule {
             None => (0, 0, 0, 0, 0, 0),
         };
 
-        let mut flags = settings::builder();
-        // A JIT'd function is called directly, not relocated into a shared object.
-        let _ = flags.set("is_pic", "false");
-        // Cranelift's x64 `return_call` (tail calls, §3b) lowering requires frame pointers.
-        let _ = flags.set("preserve_frame_pointers", "true");
-        // Run Cranelift's mid-end optimizer (GVN/CSE, constant materialization, store-to-load
-        // forwarding). Wasmtime defaults to this; without it (the prior default `none`) redundant
-        // address computations weren't CSE'd and constants were pool loads. "SSA on the wire" (no SSA
-        // reconstruction) keeps cold start ahead even with the optimizer on.
-        let _ = flags.set("opt_level", "speed");
-        // Pin `enable_probestack` OFF (its 0.132 default). The software stack-overflow guard
-        // (`stack-check`) is sound *because* a large frame's `sub rsp` is a pure pointer move that
-        // touches no pages before the entry-block check runs — a probestack that page-walked the frame
-        // downward would touch below the fiber's low bound *before* the check (silent neighbour-slot
-        // corruption under the arena, which has no guard page). Pinning it locks that escape-TCB
-        // assumption against a future Cranelift default flip. See `emit_stack_check` / STACK_GUARD.md.
-        let _ = flags.set("enable_probestack", "false");
-        let isa = cranelift_native::builder()
-            .map_err(|e| JitError::Backend(e.to_string()))?
-            .finish(settings::Flags::new(flags))
-            .map_err(|e| JitError::Backend(e.to_string()))?;
-        let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-        // Allocate code + read-only data (float constants, jump tables) from a single contiguous
-        // arena rather than the default separate `mmap`s. cranelift's x64 `call`/rip-relative
-        // loads use 32-bit PC-relative relocations (`X86CallPCRel4`/`X86PCRel4`); with independent
-        // mmaps, ASLR can place code and rodata > 2 GiB apart, overflowing the i32 offset (a
-        // `compiled_blob.rs` panic) — intermittent, and only on large modules with rodata (e.g.
-        // a whole UI library). A 256 MiB reserved arena (VA only, committed on demand) keeps every
-        // segment in range. Reserve falls back to the default provider if it cannot map.
-        if let Ok(arena) = cranelift_jit::ArenaMemoryProvider::new_with_size(256 << 20) {
-            builder.memory_provider(Box::new(arena));
-        }
-        let mut module = JITModule::new(builder);
+        let mut module = new_jit_module()?;
 
         // Declare every function (natural ABI) up front so calls can reference any of them.
-        let ids: Vec<_> = m
-            .funcs
-            .iter()
-            .enumerate()
-            .map(|(i, f)| {
-                let sig = natural_sig(&mut module, f);
-                module
-                    .declare_function(&format!("f{i}"), Linkage::Local, &sig)
-                    .map_err(|e| JitError::Backend(e.to_string()))
-            })
-            .collect::<Result<_, _>>()?;
+        let ids: Vec<FuncId> = declare_all_funcs(&mut module, &m.funcs)?;
 
         // Distinct signatures give each function (and call site) a structural type id, the
         // basis for the `call_indirect` type check (matching the interpreter). Function
@@ -4861,6 +4819,56 @@ const _: fn() = || {
     assert_send_sync::<ChildCode>();
 };
 
+/// Build a fresh `JITModule` with the escape-TCB ISA configuration **every** compile path shares
+/// (top-level [`CompiledModule::compile`] and nested [`compile_child`]) — one audited copy, so the
+/// soundness-critical flags cannot drift between them. Most load-bearing is
+/// `enable_probestack=false`: the software stack-overflow guard (`emit_stack_check` / STACK_GUARD.md)
+/// is sound *only because* a large frame's `sub rsp` is a pure pointer move touching no pages before
+/// the entry-block check — a probestack that page-walked the frame downward would touch below the
+/// fiber's low bound *before* the check (silent neighbour-slot corruption under the arena, which has
+/// no guard page). Pinning it here locks that assumption against a future Cranelift default flip.
+fn new_jit_module() -> Result<JITModule, JitError> {
+    let mut flags = settings::builder();
+    // A JIT'd function is called directly, not relocated into a shared object.
+    let _ = flags.set("is_pic", "false");
+    // Cranelift's x64 `return_call` (tail calls, §3b) lowering requires frame pointers.
+    let _ = flags.set("preserve_frame_pointers", "true");
+    // Run Cranelift's mid-end optimizer (GVN/CSE, constant materialization, store-to-load
+    // forwarding), as Wasmtime does; "SSA on the wire" keeps cold start ahead even with it on.
+    let _ = flags.set("opt_level", "speed");
+    // The escape-TCB pin — see this fn's doc.
+    let _ = flags.set("enable_probestack", "false");
+    let isa = cranelift_native::builder()
+        .map_err(|e| JitError::Backend(e.to_string()))?
+        .finish(settings::Flags::new(flags))
+        .map_err(|e| JitError::Backend(e.to_string()))?;
+    let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+    // Code + read-only data (float constants, jump tables) from a single contiguous 256 MiB arena
+    // (VA only, committed on demand) rather than separate `mmap`s: x64's 32-bit PC-relative
+    // relocations (`X86CallPCRel4`/`X86PCRel4`) overflow if ASLR places independent mmaps > 2 GiB
+    // apart (a `compiled_blob.rs` panic on large modules with rodata). Falls back to the default
+    // provider if it cannot map.
+    if let Ok(arena) = cranelift_jit::ArenaMemoryProvider::new_with_size(256 << 20) {
+        builder.memory_provider(Box::new(arena));
+    }
+    Ok(JITModule::new(builder))
+}
+
+/// Declare every function (natural ABI, `f{i}` local linkage) up front so any call site can
+/// reference any of them — shared by both compile paths.
+fn declare_all_funcs(module: &mut JITModule, funcs: &[Func]) -> Result<Vec<FuncId>, JitError> {
+    funcs
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let sig = natural_sig(module, f);
+            module
+                .declare_function(&format!("f{i}"), Linkage::Local, &sig)
+                .map_err(|e| JitError::Backend(e.to_string()))
+        })
+        .collect()
+}
+
 /// Compile a §14 child module: every function confined (top-level masking) to a fresh
 /// `2^child_size_log2`-byte window, `cap.call`s baked to `cap_thunk`/`cap_ctx`, and the entry
 /// wrapped in a buffer-ABI trampoline. "Nesting cost is paid at setup" (§14): this is the setup.
@@ -4933,33 +4941,8 @@ fn compile_child(
     let child_size = 1u64 << child_size_log2; // bounded ≤ MAX by compile_child's reject (audit #3)
     let mask = child_size - 1;
 
-    let mut flags = settings::builder();
-    let _ = flags.set("is_pic", "false");
-    let _ = flags.set("preserve_frame_pointers", "true");
-    let _ = flags.set("opt_level", "speed"); // match the top-level compile (GVN/CSE/const-mat)
-                                             // Pin `enable_probestack` OFF, as in the top-level compile — the software stack guard's soundness
-                                             // depends on `sub rsp` touching no pages before the entry-block check (see the other flag builder).
-    let _ = flags.set("enable_probestack", "false");
-    let isa = cranelift_native::builder()
-        .map_err(|e| JitError::Backend(e.to_string()))?
-        .finish(settings::Flags::new(flags))
-        .map_err(|e| JitError::Backend(e.to_string()))?;
-    let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-    if let Ok(arena) = cranelift_jit::ArenaMemoryProvider::new_with_size(256 << 20) {
-        builder.memory_provider(Box::new(arena));
-    }
-    let mut module = JITModule::new(builder);
-
-    let ids: Vec<_> = funcs
-        .iter()
-        .enumerate()
-        .map(|(i, f)| {
-            let sig = natural_sig(&mut module, f);
-            module
-                .declare_function(&format!("f{i}"), Linkage::Local, &sig)
-                .map_err(|e| JitError::Backend(e.to_string()))
-        })
-        .collect::<Result<_, _>>()?;
+    let mut module = new_jit_module()?;
+    let ids: Vec<FuncId> = declare_all_funcs(&mut module, funcs)?;
     let distinct = distinct_types(funcs);
 
     let cap = CapEnv {
