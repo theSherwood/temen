@@ -25,8 +25,7 @@ use svm_browser::{
     svm_onramp_tierup_table_log2, svm_onramp_tierup_value, svm_onramp_tierup_wasm_len,
     svm_onramp_tierup_wasm_ptr, svm_onramp_tierup_win_len, svm_onramp_tierup_win_ptr,
     svm_run_value, svm_status, svm_stdout_len, svm_stdout_ptr, STATUS_OK, STATUS_TRAP,
-    STATUS_UNSUPPORTED,
-    TIERUP_RUN_DONE, TIERUP_RUN_JIT_INVOKE, TIERUP_RUN_TIERUP, TIERUP_RUN_TRAP,
+    STATUS_UNSUPPORTED, TIERUP_RUN_DONE, TIERUP_RUN_JIT_INVOKE, TIERUP_RUN_TIERUP, TIERUP_RUN_TRAP,
 };
 use svm_interp::{Host, StreamRole};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
@@ -1831,7 +1830,8 @@ export 0 func "_start" 0
     // The open itself is the #888 pin: pre-#888 f1 cascades (no eligible leaf) → UNSUPPORTED.
     let opened = svm_onramp_tierup_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
     assert_eq!(
-        opened, 0,
+        opened,
+        0,
         "#888: the leaf with a direct cross-tier call must now be eligible (status {})",
         svm_status()
     );
@@ -1851,7 +1851,10 @@ export 0 func "_start" 0
     // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
     let got_out =
         unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
-    assert_eq!(got_out, want.stdout, "stdout parity (bounce ordering included)");
+    assert_eq!(
+        got_out, want.stdout,
+        "stdout parity (bounce ordering included)"
+    );
     svm_onramp_tierup_close();
 }
 
@@ -1920,12 +1923,16 @@ export 0 func "_start" 0
 
     let opened = svm_onramp_tierup_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
     assert_eq!(
-        opened, 0,
+        opened,
+        0,
         "#926: a dead (unreachable) concurrency op must no longer refuse the pump (status {})",
         svm_status()
     );
     let (_d, tierups, _invokes) = drive_full_session(&m);
-    assert!(tierups >= 1, "the pure leaf must tier up beside the dead op");
+    assert!(
+        tierups >= 1,
+        "the pure leaf must tier up beside the dead op"
+    );
     assert_eq!(svm_status(), want.status, "status parity with the oracle");
     assert_eq!(svm_onramp_tierup_value(), want.value, "value parity");
     // SAFETY: capture slots staged at DONE; this thread is the only accessor (FFI_LOCK).
@@ -1976,7 +1983,12 @@ export 0 func "_start" 0
     let bytes = svm_encode::encode_module(&m);
 
     let opened = svm_onramp_tierup_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
-    assert_eq!(opened, 0, "admitted (no static concurrency gate) — status {}", svm_status());
+    assert_eq!(
+        opened,
+        0,
+        "admitted (no static concurrency gate) — status {}",
+        svm_status()
+    );
     let mut d = TierupDriver::new();
     let mut tierups = 0u32;
     let ev = loop {
@@ -1993,7 +2005,14 @@ export 0 func "_start" 0
         ev, TIERUP_RUN_TRAP,
         "the reachable atomic.notify must decline cleanly to TRAP (→ interpreter), not DONE/crash"
     );
-    assert!(tierups >= 1, "the leaf tiered up before the concurrency op was reached");
-    assert_eq!(svm_status(), STATUS_TRAP, "status is TRAP (the page re-runs on the interpreter)");
+    assert!(
+        tierups >= 1,
+        "the leaf tiered up before the concurrency op was reached"
+    );
+    assert_eq!(
+        svm_status(),
+        STATUS_TRAP,
+        "status is TRAP (the page re-runs on the interpreter)"
+    );
     svm_onramp_tierup_close();
 }

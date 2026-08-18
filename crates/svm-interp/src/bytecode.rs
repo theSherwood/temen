@@ -10818,16 +10818,57 @@ impl CoopRun {
         m: &Module,
         entry: FuncIdx,
         args: &[Value],
+        fuel: u64,
+        host: Host,
+        tierup: Option<TierUpConfig>,
+    ) -> Option<Result<CoopRun, Trap>> {
+        // A fresh engine-sized window built from `m`'s declaration + data (the native/test path).
+        Self::assemble(m, entry, args, fuel, host, tierup, build_mem(m))
+    }
+
+    /// Like [`new`](Self::new), but the linear-memory window is built **over a caller-provided
+    /// backing** `back` (with `init_mem` seeded first), the resumable twin of
+    /// [`Vcpu::new_root_reserved_over_with_powerbox`]. This is the browser cdylib seam: the window
+    /// lives in the host's own linear memory, so every emitted `f{func}(win, env, …)` addresses it
+    /// directly through the one shared `env.memory`. `back` is dropped if `m` is unsupported.
+    #[allow(clippy::too_many_arguments)] // the window-backing seam inherently threads more inputs
+    pub fn new_over(
+        m: &Module,
+        entry: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        host: Host,
+        tierup: Option<TierUpConfig>,
+        init_mem: &[u8],
+        reserved_log2: u8,
+        back: std::sync::Arc<super::Region>,
+    ) -> Option<Result<CoopRun, Trap>> {
+        let mem = m.memory.map(|mc| {
+            let mut mm = Mem::with_reservation_over(reserved_log2, mc.size_log2, back);
+            mm.seed(init_mem);
+            mm.init_data(&m.data);
+            mm
+        });
+        Self::assemble(m, entry, args, fuel, host, tierup, mem)
+    }
+
+    /// Shared constructor tail: compile `m`, range-check `entry`, and build the `CoopSched` over the
+    /// caller-chosen `mem`. `None` if `m` is outside the bytecode engine's subset (fall back to the
+    /// tree-walker); `Some(Err)` if `entry` is out of range or seeding traps.
+    fn assemble(
+        m: &Module,
+        entry: FuncIdx,
+        args: &[Value],
         mut fuel: u64,
         mut host: Host,
         tierup: Option<TierUpConfig>,
+        mut mem: Option<Mem>,
     ) -> Option<Result<CoopRun, Trap>> {
         let c = compile_module_for(m)?;
         if entry as usize >= c.progs.len() {
             return Some(Err(Trap::Malformed));
         }
         let dom = Domain::new(c, host.jit_table_log2());
-        let mut mem = build_mem(m);
         let sched = match CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)
         {
             Ok(s) => s,
@@ -10840,6 +10881,24 @@ impl CoopRun {
             fuel,
             sched,
         }))
+    }
+
+    /// The run's window committed **scalar extent** right now — the #717 value the cdylib re-syncs to
+    /// every emitted instance's `"mapped"` global after a [`bounce`](Self::bounce) (a bounced callback
+    /// may have grown the window). `0` when there is no window or its state is not representable by one
+    /// bound. Reads the shared root window (a confined child's own-window growth is a later refinement).
+    pub fn window_scalar_extent(&self) -> u64 {
+        self.mem
+            .as_ref()
+            .and_then(|m| m.scalar_extent())
+            .unwrap_or(0)
+    }
+
+    /// The run's **root** powerbox — where the root task and its `thread.spawn` threads' host I/O
+    /// lands (stdout/stderr, the framebuffer). The cdylib drains it into its capture slots at the end
+    /// of a run. (§14 confined children keep their own `host` in `extra_envs`, not exposed here.)
+    pub fn host_mut(&mut self) -> &mut Host {
+        &mut self.host
     }
 
     /// Pump the schedule to its next pause: [`CoopEvent::Done`]/[`CoopEvent::Trapped`] end the run,
@@ -10873,6 +10932,136 @@ impl CoopRun {
     pub fn deliver_tierup_trap(&mut self, trap: Trap) {
         self.sched.deliver_tierup_trap(trap);
     }
+
+    /// #926 slice 2 — service an emitted tier-up region's cross-tier `call_interp(target, io)` while it
+    /// is mid-run for the **currently paused task**. Routes the bounce to *that task's* env — a §14
+    /// confined child steps its own window/powerbox/dispatch table (`env == Some`), the root and its
+    /// `thread.spawn` threads the shared ones (`env == None`) — so a confined leaf's callback can never
+    /// reach outside its window (the confinement hinge). The run-shared fiber registry is used (a fiber
+    /// a callback parks persists for the run to resume), exactly as the same call inline would register.
+    /// Marshals results back into `io` and returns the result count. Call only between a
+    /// [`CoopEvent::TierUp`] and its delivery; `Err(Malformed)` if no tier-up is outstanding.
+    pub fn bounce(&mut self, target: u32, io: &mut [i64]) -> Result<usize, Trap> {
+        let ti = self
+            .sched
+            .pending_tierup
+            .as_ref()
+            .map(|(ti, ..)| *ti)
+            .ok_or(Trap::Malformed)?;
+        let CoopRun {
+            dom,
+            mem,
+            host,
+            fuel,
+            sched,
+        } = self;
+        let CoopSched {
+            tasks,
+            extra_envs,
+            fibers,
+            fiber_sp,
+            fiber_meta,
+            ..
+        } = sched;
+        match tasks[ti].env {
+            // Root / `thread.spawn` thread: the run's shared window, powerbox, and domain table.
+            None => {
+                let mut cell = HostCell::Excl(host);
+                coop_bounce(
+                    &dom.source,
+                    &dom.table,
+                    fuel,
+                    mem,
+                    &mut cell,
+                    fibers,
+                    fiber_sp,
+                    fiber_meta,
+                    target,
+                    io,
+                )
+            }
+            // §14 confined child: its OWN window, powerbox, table, and fuel — never the root's.
+            Some(k) => {
+                let e = &mut extra_envs[k];
+                let mut cell = HostCell::Shared(&e.host);
+                coop_bounce(
+                    &dom.source,
+                    &e.table,
+                    &mut e.fuel,
+                    &mut e.mem,
+                    &mut cell,
+                    fibers,
+                    fiber_sp,
+                    fiber_meta,
+                    target,
+                    io,
+                )
+            }
+        }
+    }
+}
+
+/// #926 slice 2 — the cooperative driver's cross-tier **bounce** body: an emitted tier-up region, mid
+/// run, calls back to an interp-resident leaf `target`. Resolves `target` through the caller's dispatch
+/// `table` (masked, exactly as `Op::CallIndirect`), marshals the i64 scratch `io` per the callee's
+/// signature, and drives it to completion on a nested interpretation over the caller's `mem`/`host`/
+/// `fuel` and the **run-level** fiber registry (so a fiber a callback parks persists for the run — the
+/// same registry `step_vcpu` mirrors its parallel arrays into). The multi-task analogue of
+/// [`Vcpu::bounce_call`], differing only in that the window/powerbox/table come from the *tiering-up
+/// task's* env (resolved by [`CoopRun::bounce`]); always a run-level bounce — the cooperative driver
+/// never surfaces an emitted `Jit.invoke`, so there is no invoke-confined variant.
+#[allow(clippy::too_many_arguments)] // an inherently many-input dispatch shim; a config struct would obscure it
+fn coop_bounce(
+    source: &ModuleSource,
+    table: &SharedSlots,
+    fuel: &mut u64,
+    mem: &mut Option<Mem>,
+    host: &mut HostCell,
+    fibers: &mut Vec<FiberState>,
+    fiber_sp: &mut Vec<u64>,
+    fiber_meta: &mut Vec<(i32, i64)>,
+    target: u32,
+    io: &mut [i64],
+) -> Result<usize, Trap> {
+    step(fuel, None)?; // fuel unification: the dispatch-site safepoint
+    let slot = (target as usize) & (table.len() - 1);
+    let ts = table.slot(slot);
+    if ts.module == super::TABLE_EMPTY {
+        return Err(Trap::IndirectCallType);
+    }
+    let tm = source.get(ts.module as usize).ok_or(Trap::Malformed)?;
+    let (cp, cr) = tm.sigs[ts.func as usize].clone();
+    if cp.len() > io.len() || cr.len() > io.len() {
+        return Err(Trap::Malformed); // scratch too small — a mis-marshalled host call
+    }
+    // The i64-slot transport carries scalars only; a v128-sig target can never have been given a
+    // trampoline (the host gates that at open) — a bounce naming one is a mis-wired host.
+    let scalar =
+        |t: &ValType| matches!(t, ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64);
+    if !cp.iter().all(scalar) || !cr.iter().all(scalar) {
+        return Err(Trap::Malformed);
+    }
+    let args: Vec<Value> = cp
+        .iter()
+        .zip(io.iter())
+        .map(|(ty, s)| slot_to_val(*ty, *s))
+        .collect();
+    let mut vm = Vm::new(&tm, ts.func as usize, &args)?;
+    vm.module = ts.module as usize;
+    let vals = drive_nested(
+        source,
+        table,
+        vm,
+        fuel,
+        mem,
+        host,
+        fibers,
+        Some((fiber_sp, fiber_meta)),
+    )?;
+    for (i, v) in vals.iter().enumerate() {
+        io[i] = val_to_slot(*v);
+    }
+    Ok(cr.len())
 }
 
 /// THREADS.md step 4c — a **native futex**, the parallel driver's stand-in for wasm

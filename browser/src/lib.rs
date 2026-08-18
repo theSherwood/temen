@@ -8910,3 +8910,337 @@ pub extern "C" fn svm_onramp_tierup_close() {
         }
     }
 }
+
+// ============================================================================================
+// #926 slice 2 — the **cooperative** tier-up driver (`svm_coop_*`).
+//
+// The single-vCPU `svm_onramp_tierup_*` driver above declines a guest that actually reaches a
+// `Spawn`/`Join`/`Wait`/`Notify` event (its `run()` catch-all → `TIERUP_RUN_TRAP`), because one
+// `Vcpu` can't multiplex threads. This driver wraps [`bytecode::CoopRun`] instead — the cooperative
+// multi-vCPU scheduler — so a real `thread.spawn` guest tiers up its hot leaves on **one** wasm
+// thread, no Workers (the JACL-with-runtime-threads shape). It is a strict simplification of the
+// single-vCPU FFI: `CoopRun` owns its `Domain`/window/powerbox (no leaked program), and services
+// `Spawn`/`Join`/`Wait`/`Notify`/fibers/`Jit.install`/`Jit.invoke` **internally**, so the only
+// events that reach the host are tier-up and the run's end — the pump loop has no concurrency or
+// §22 arms. Emitted `Jit.invoke` acceleration (a host event) is a later refinement; here units run
+// interpreted inside the pump. The cross-tier `call_interp` bounce is routed to the tiering-up
+// task's env by [`CoopRun::bounce`] (the confinement hinge).
+//
+// The capture/status statics (`OUT`/`ERR`/`FB`/`EXIT_CODE`/`RUN_VALUE`/`LAST_STATUS`) and the
+// `svm_alloc`/`svm_stdout_*` accessors are shared with the single-vCPU driver — only one runs at a
+// time (single-threaded wasm; tests serialize on the FFI lock).
+// ============================================================================================
+
+/// Cooperative-driver event codes (returned by [`svm_coop_run`]) — the `CoopEvent` subset that
+/// reaches the host. Distinct constants from the `TIERUP_RUN_*` set for clarity, though the values
+/// coincide.
+pub const COOP_RUN_DONE: i32 = 0;
+pub const COOP_RUN_TIERUP: i32 = 1;
+pub const COOP_RUN_TRAP: i32 = 2;
+
+/// The live cooperative tier-up session — the `CoopRun` plus the host-facing operand/capture state
+/// (mirrors the relevant fields of `TierupRun`). The `backing` box owns the window `CoopRun`'s `Mem`
+/// addresses through a raw-pointer `Region`; both drop together at [`svm_coop_close`].
+struct CoopTierupRun {
+    run: bytecode::CoopRun,
+    /// The owned window buffer — in this module's linear memory, so emitted leaves address it through
+    /// the one shared `env.memory`. Pointer-stable across the struct's moves (boxed slice).
+    backing: Box<[u8]>,
+    emitted_wasm: Vec<u8>,
+    /// Pending TIERUP operands.
+    func: u32,
+    mapped: u64,
+    argv: Vec<i64>,
+    /// A bounce callback's staged trap (see [`svm_coop_call_interp`] / [`svm_coop_deliver_trap`]).
+    pending_bounce_trap: Option<Trap>,
+    /// The guest's top-level result, staged at DONE.
+    value: i64,
+    frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
+}
+
+static mut COOP_RUN: Option<CoopTierupRun> = None;
+
+/// Open a cooperative tier-up run over the guest module `[mod_ptr, mod_len)` (stdin optional,
+/// `shared` = SharedArrayBuffer memory). Returns `0`/`STATUS_OK` on success, a negative `STATUS_*`
+/// on refusal (decode error, an op outside the engine subset, or nothing for the emitted tier to
+/// run). Idempotent open: closes any prior run first.
+#[no_mangle]
+pub extern "C" fn svm_coop_open(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+    shared: i32,
+) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    svm_coop_close();
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let Ok(m) = svm_encode::decode_module(bytes) else {
+        set(STATUS_DECODE_ERR);
+        return -STATUS_DECODE_ERR;
+    };
+    if onramp_check(&m).is_err() || m.memory.is_none() {
+        set(STATUS_UNSUPPORTED);
+        return -STATUS_UNSUPPORTED;
+    }
+    let declared = m.memory.map_or(0, |mc| mc.size_log2);
+    let win_log2 = JIT_RUN_WIN_LOG2.max(declared);
+    // Emit with the mask bumped to the run window (the driver convention), so the emitted `"mapped"`
+    // default is the full window; the per-tier-up `mapped` event narrows it to the committed extent.
+    let mut emit_m = m.clone();
+    if let Some(mc) = emit_m.memory.as_mut() {
+        mc.size_log2 = win_log2;
+    }
+    // First cut: the simple (non-B2) tier-up emission — direct-call leaves tier up, driven by the
+    // host's per-`f{func}` service. (`call_indirect` tier-up via the B2 driver table is a follow-up,
+    // as is emitted `Jit.invoke`.) An unsupported shape declines to the interpreter.
+    let (wasm, emit) = match svm_wasm_jit::compile_module_tierup(&emit_m, shared != 0) {
+        Ok(x) => x,
+        Err(_) => {
+            set(STATUS_UNSUPPORTED);
+            return -STATUS_UNSUPPORTED;
+        }
+    };
+    // A function tiers up iff the emitter emitted it and its signature is all-i64 (the i64-slot
+    // transport the host marshals by) — exactly the single-vCPU gate.
+    let all_i64 = |ts: &[svm_ir::ValType]| ts.iter().all(|t| *t == svm_ir::ValType::I64);
+    let eligible: Vec<bool> = m
+        .funcs
+        .iter()
+        .enumerate()
+        .map(|(i, f)| emit[i] && all_i64(&f.params) && all_i64(&f.results))
+        .collect();
+    if !eligible.iter().any(|&e| e) {
+        // Nothing for the emitted tier to ever run → the page's plain bytecode path is simpler.
+        set(STATUS_UNSUPPORTED);
+        return -STATUS_UNSUPPORTED;
+    }
+    let mut backing = vec![0u8; 1usize << win_log2].into_boxed_slice();
+    let win_ptr = backing.as_mut_ptr();
+    // SAFETY: `backing` is owned by the session and pointer-stable across its moves (boxed slice).
+    let back =
+        std::sync::Arc::new(unsafe { svm_interp::Region::shared(win_ptr, 1u64 << win_log2) });
+    let mut host = Host::new();
+    host.stdin = if stdin_ptr.is_null() || stdin_len == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: the host guarantees the stdin range is a live `svm_alloc`ation it just filled.
+        unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
+    };
+    let (frame, _keys) = grant_onramp_caps(&mut host, &m, None);
+    let tierup = bytecode::TierUpConfig {
+        eligible: std::sync::Arc::from(eligible.into_boxed_slice()),
+        page_checked: false,
+    };
+    // `CoopRun` owns its `Domain`; the window is built over `back` with the reservation clamped to
+    // the run window (`vm_map`-grow into `[declared, 1 << win_log2)`, an over-grow `-EINVAL`s).
+    let run = match bytecode::CoopRun::new_over(
+        &m,
+        0,
+        &[],
+        u64::MAX,
+        host,
+        Some(tierup),
+        &[],
+        win_log2,
+        back,
+    ) {
+        Some(Ok(r)) => r,
+        Some(Err(_)) => {
+            set(STATUS_TRAP);
+            return -STATUS_TRAP;
+        }
+        None => {
+            set(STATUS_UNSUPPORTED);
+            return -STATUS_UNSUPPORTED;
+        }
+    };
+    // SAFETY: single-threaded wasm; the session is read back only via the coop exports.
+    unsafe {
+        *core::ptr::addr_of_mut!(COOP_RUN) = Some(CoopTierupRun {
+            run,
+            backing,
+            emitted_wasm: wasm,
+            func: 0,
+            mapped: 0,
+            argv: Vec::new(),
+            pending_bounce_trap: None,
+            value: 0,
+            frame,
+        });
+    }
+    set(STATUS_OK);
+    0
+}
+
+/// Pump the cooperative run to its next host event: `COOP_RUN_TIERUP` (read the operands via the
+/// getters, run the emitted `f{func}`, then [`svm_coop_deliver`]/[`svm_coop_deliver_trap`]) or
+/// `COOP_RUN_DONE`/`COOP_RUN_TRAP` (the run ended — result + stdout/stderr/framebuffer are captured
+/// into the shared accessor slots). All concurrency is multiplexed inside the pump.
+#[no_mangle]
+pub extern "C" fn svm_coop_run() -> i32 {
+    // SAFETY: single-threaded wasm; exclusive access to the session for this call.
+    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() }) else {
+        unsafe { LAST_STATUS = STATUS_UNSUPPORTED };
+        return COOP_RUN_TRAP;
+    };
+    let (status, value, exit_code, ev) = match s.run.run() {
+        bytecode::CoopEvent::TierUp { func, argv, mapped } => {
+            s.func = func;
+            s.mapped = mapped;
+            s.argv = argv.into_vec();
+            return COOP_RUN_TIERUP;
+        }
+        bytecode::CoopEvent::Done(vals) => match vals.first() {
+            Some(Value::I64(x)) => (STATUS_OK, *x, 0, COOP_RUN_DONE),
+            Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0, COOP_RUN_DONE),
+            None => (STATUS_OK, 0, 0, COOP_RUN_DONE),
+            _ => (STATUS_BAD_RESULT, 0, 0, COOP_RUN_DONE),
+        },
+        bytecode::CoopEvent::Trapped(Trap::Exit(code)) => (STATUS_EXIT, 0, code, COOP_RUN_DONE),
+        bytecode::CoopEvent::Trapped(_) => (STATUS_TRAP, 0, 0, COOP_RUN_TRAP),
+    };
+    s.value = value;
+    let host = s.run.host_mut();
+    let stdout = std::mem::take(&mut host.stdout);
+    let stderr = std::mem::take(&mut host.stderr);
+    let fb = s.frame.lock().unwrap().take();
+    let (fb_rgba, fb_w, fb_h) = match fb {
+        Some(f) => (f.rgba, f.width, f.height),
+        None => (Vec::new(), 0, 0),
+    };
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(OUT), stdout);
+        stash(&mut *core::ptr::addr_of_mut!(ERR), stderr);
+        stash(&mut *core::ptr::addr_of_mut!(FB), fb_rgba);
+        FB_W = fb_w;
+        FB_H = fb_h;
+        EXIT_CODE = exit_code;
+        RUN_VALUE = value;
+        LAST_STATUS = status;
+    }
+    ev
+}
+
+/// The pending TIERUP's function index.
+#[no_mangle]
+pub extern "C" fn svm_coop_func() -> i32 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.func as i32)
+}
+
+/// The pending TIERUP's committed extent — the value for the emitted `"mapped"` global (#717).
+#[no_mangle]
+pub extern "C" fn svm_coop_mapped() -> i64 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.mapped as i64)
+}
+
+/// The pending TIERUP's marshalled i64 args (base pointer; valid until the next event).
+#[no_mangle]
+pub extern "C" fn svm_coop_argv_ptr() -> *const i64 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .map_or(core::ptr::null(), |s| s.argv.as_ptr())
+}
+
+/// Number of pending TIERUP args (see [`svm_coop_argv_ptr`]).
+#[no_mangle]
+pub extern "C" fn svm_coop_argv_len() -> usize {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.argv.len())
+}
+
+/// The emitted tier-up module's bytes (compile + instantiate against this module's memory).
+#[no_mangle]
+pub extern "C" fn svm_coop_wasm_ptr() -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .map_or(core::ptr::null(), |s| s.emitted_wasm.as_ptr())
+}
+
+#[no_mangle]
+pub extern "C" fn svm_coop_wasm_len() -> usize {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.emitted_wasm.len())
+}
+
+/// The run window's base address in this module's linear memory (the emitted `f{i}`s' `win` arg).
+#[no_mangle]
+pub extern "C" fn svm_coop_win_ptr() -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .map_or(core::ptr::null(), |s| s.backing.as_ptr())
+}
+
+/// The run window's byte length (`1 << win_log2`).
+#[no_mangle]
+pub extern "C" fn svm_coop_win_len() -> usize {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.backing.len())
+}
+
+/// The guest's top-level result once [`COOP_RUN_DONE`] is reached.
+#[no_mangle]
+pub extern "C" fn svm_coop_value() -> i64 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.value)
+}
+
+/// Deliver the emitted `f{func}`'s i64 result slots for the pending TIERUP, resuming the paused task.
+#[no_mangle]
+pub extern "C" fn svm_coop_deliver(rptr: *const i64, n: usize) {
+    // SAFETY: single-threaded wasm; `[rptr, n)` is a live `svm_alloc`ation the host just filled.
+    if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() } {
+        let vals = if rptr.is_null() || n == 0 {
+            &[][..]
+        } else {
+            unsafe { core::slice::from_raw_parts(rptr, n) }
+        };
+        s.run.deliver_tierup(vals);
+    }
+}
+
+/// Deliver a trap from the emitted `f{func}` for the pending TIERUP. A bounce callback's staged trap
+/// (see [`svm_coop_call_interp`]) is delivered in preference, so a callback's `exit` ends the run as
+/// `STATUS_EXIT` exactly as the interpreted call would.
+#[no_mangle]
+pub extern "C" fn svm_coop_deliver_trap() {
+    // SAFETY: single-threaded wasm; exclusive access to the session.
+    if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() } {
+        let t = s.pending_bounce_trap.take().unwrap_or(Trap::Unreachable);
+        s.run.deliver_tierup_trap(t);
+    }
+}
+
+/// The emitted tier-up region's cross-tier `env.call_interp(target, args_ptr)`: bounce into the
+/// interp-resident leaf `target` over the **tiering-up task's** window/powerbox (routed by
+/// [`CoopRun::bounce`]). `args_ptr` is the env scratch (i64 slots, args→results in place). Returns
+/// `0` on success, `1` on a callback trap (staged for [`svm_coop_deliver_trap`]).
+#[no_mangle]
+pub extern "C" fn svm_coop_call_interp(target: u32, args_ptr: *mut u8) -> i32 {
+    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() }) else {
+        return 1;
+    };
+    let max_slots = (svm_wasm_jit::ENV_CELL_BYTES - 16) / 8;
+    // SAFETY: the host passes the env scratch, at least `max_slots` i64s wide.
+    let io = unsafe { core::slice::from_raw_parts_mut(args_ptr as *mut i64, max_slots) };
+    match s.run.bounce(target, io) {
+        Ok(_) => 0,
+        Err(t) => {
+            s.pending_bounce_trap = Some(t);
+            1
+        }
+    }
+}
+
+/// The run window's committed scalar extent right now — the #717 value the host re-syncs to every
+/// emitted instance's `"mapped"` global after a [`svm_coop_call_interp`] bounce.
+#[no_mangle]
+pub extern "C" fn svm_coop_mapped_now() -> i64 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .map_or(0, |s| s.run.window_scalar_extent() as i64)
+}
+
+/// Close the open cooperative run, freeing its window. Idempotent. `CoopRun` owns everything it
+/// borrows (no leaked program), so dropping the session frees it all.
+#[no_mangle]
+pub extern "C" fn svm_coop_close() {
+    // SAFETY: single-threaded wasm; take + drop the session.
+    unsafe {
+        *core::ptr::addr_of_mut!(COOP_RUN) = None;
+    }
+}
