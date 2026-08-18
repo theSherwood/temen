@@ -199,6 +199,52 @@ impl Window {
             _ => None,
         }
     }
+
+    /// Like [`Window::checked`] but bounds the access against the **reservation** `[0, reserved)`
+    /// rather than the backed `[0, mapped)`. This is the escape bound: the interpreter checks a
+    /// scalar access here for out-of-window safety and enforces per-page committed-ness (the
+    /// `[0, mapped)` half) separately, so the overflow-free bound arithmetic lives in **one**
+    /// audited place instead of being re-derived. Returns `base + addr + offset` iff
+    /// `[addr+offset, addr+offset+width) ⊆ [0, reserved)`, else `None` (⇒ `MemoryFault`). Fuzzed
+    /// by the `mask` target (reserved-bound assertion) alongside [`Window::checked`].
+    #[inline]
+    pub fn checked_reserved(self, addr: u64, offset: u64, width: u32) -> Option<u64> {
+        match addr
+            .checked_add(offset)
+            .and_then(|e| e.checked_add(width as u64))
+        {
+            Some(end) if end <= self.reserved() => {
+                Some(self.base.wrapping_add(addr.wrapping_add(offset)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Trap-confinement for a **bulk span** `[ptr, ptr+len)` against the reservation `[0, reserved)`
+    /// (§4/§18, D62): the *single* range check a bulk-memory op (`memory.copy`/`fill`) makes before
+    /// its libcall, in place of the per-byte scalar [`Window::checked`]. Returns the confined base
+    /// `base + ptr` iff the whole span lies in `[0, reserved)`, else `None` (⇒ `MemoryFault`).
+    /// Bounds against **reserved** (the bulk op enforces per-page committed-ness separately); the
+    /// `checked_add` makes the `ptr + len` bound overflow-free, so a wild `ptr`/`len` faults rather
+    /// than wrapping. `len == 0` is an in-bounds no-op (returns the base).
+    ///
+    /// **This is the one definition of the span-OOB arithmetic** the Cranelift JIT's `confine_span`
+    /// emits (as the overflow-avoiding `len != 0 && (len > reserved || ptr > reserved − len)`) and
+    /// the interpreter calls. The `mask` fuzz target asserts it against a `u128` oracle, so the
+    /// security-critical overflow-avoidance is **fuzzed, not transcribed** into the harness.
+    #[inline]
+    pub fn span_checked(self, ptr: u64, len: u64) -> Option<u64> {
+        if len == 0 {
+            // A zero-length bulk op touches no bytes — an in-bounds no-op regardless of `ptr`,
+            // exactly as the JIT's `len != 0` gate. (Real callers early-out on `len == 0`; this
+            // keeps the reference total and matched to the emitted predicate.)
+            return Some(self.base.wrapping_add(ptr));
+        }
+        match ptr.checked_add(len) {
+            Some(end) if end <= self.reserved() => Some(self.base.wrapping_add(ptr)),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -448,5 +494,84 @@ mod tests {
         assert_eq!(child.checked(4088, 0, 8), Some((1 << 16) + 4088)); // last backed slot
         assert_eq!(child.checked(4092, 0, 8), None); // overruns the child's top → fault
         assert_eq!(child.checked(1 << 12, 0, 1), None); // one past the backed top → fault (no alias)
+    }
+
+    /// `checked_reserved` is `checked`'s sibling bounded at `[0, reserved)` instead of `[0, mapped)`
+    /// — the escape bound the interpreter's scalar `confine_checked` uses (per-page committed-ness is
+    /// enforced separately). Property: admits an access iff `addr+offset+width <= reserved`, returning
+    /// `base + addr + offset`; total + panic-free on any input.
+    #[test]
+    fn checked_reserved_confines_or_faults() {
+        let mut rng = Rng(0xBADD_CAFE_0FF1_CE00);
+        for _ in 0..2_000_000 {
+            let base_in = rng.next();
+            let addr = rng.next();
+            let offset = rng.next();
+            let width = match rng.next() % 9 {
+                8 => 16, // §17 `v128` width (D58)
+                k => (k + 1) as u32,
+            };
+            let reserved_log2 = (rng.next() % 66) as u8; // include out-of-range (clamped)
+            let mapped_in = rng.next(); // any backed extent (clamped to reserved by `sub`)
+
+            let w = Window::sub(base_in, reserved_log2, mapped_in);
+            let base = w.base();
+            let in_reserved = addr
+                .checked_add(offset)
+                .and_then(|e| e.checked_add(width as u64))
+                .is_some_and(|end| end <= w.reserved());
+
+            match w.checked_reserved(addr, offset, width) {
+                Some(c) => {
+                    assert!(in_reserved, "admitted an out-of-reservation access");
+                    assert_eq!(
+                        c,
+                        base.wrapping_add(addr.wrapping_add(offset)),
+                        "checked_reserved = base + addr + offset"
+                    );
+                    assert!(
+                        (c - base) + width as u64 <= w.reserved(),
+                        "escaped the reservation"
+                    );
+                }
+                None => assert!(!in_reserved, "faulted on an in-reservation access"),
+            }
+        }
+    }
+
+    /// `span_checked` is the D62 bulk-span confinement: admit `[ptr, ptr+len)` iff it lies in
+    /// `[0, reserved)` (with `len == 0` an in-bounds no-op), returning `base + ptr`; total +
+    /// panic-free. This is the one reference the JIT's `confine_span` mirrors.
+    #[test]
+    fn span_checked_confines_or_faults() {
+        let mut rng = Rng(0x5EED_1DEA_D00D_F00D);
+        for _ in 0..2_000_000 {
+            let base_in = rng.next();
+            let ptr = rng.next();
+            let len = rng.next();
+            let reserved_log2 = (rng.next() % 66) as u8; // include out-of-range (clamped)
+            let mapped_in = rng.next(); // clamped to reserved by `sub`; irrelevant to the reserved bound
+
+            let w = Window::sub(base_in, reserved_log2, mapped_in);
+            let base = w.base();
+            // u128 oracle (cannot overflow): a non-empty span fits iff its end is within reserved.
+            let in_bounds = len == 0 || (ptr as u128 + len as u128) <= w.reserved() as u128;
+
+            match w.span_checked(ptr, len) {
+                Some(a) => {
+                    assert!(in_bounds, "span_checked admitted an out-of-window span");
+                    assert_eq!(a, base.wrapping_add(ptr), "span_checked = base + ptr");
+                }
+                None => assert!(!in_bounds, "span_checked faulted on an in-window span"),
+            }
+        }
+
+        // Concrete corners: a 64 KiB reservation at base 0.
+        let w = Window::new(16);
+        assert_eq!(w.span_checked(0, 0), Some(0)); // empty span → no-op
+        assert_eq!(w.span_checked(1 << 16, 0), Some(1 << 16)); // empty span, wild ptr → still a no-op
+        assert_eq!(w.span_checked(0, 1 << 16), Some(0)); // whole reservation fits
+        assert_eq!(w.span_checked(1, 1 << 16), None); // one past the top faults
+        assert_eq!(w.span_checked(u64::MAX, 2), None); // ptr+len overflow faults (no wrap)
     }
 }
