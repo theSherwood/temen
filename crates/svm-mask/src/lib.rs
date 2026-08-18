@@ -28,14 +28,18 @@
 //! can name a byte outside its backed region. `base + (addr+offset)` cannot overflow on a
 //! passing access because it implies `addr+offset < mapped ≤ reserved` and `base+reserved ≤ 2^64`.
 //!
-//! ## The JIT's speculative clamp (§4, D38) — invisible to this spec
-//! The production JIT lowering additionally ANDs the checked address with `reserved − 1` on its
-//! way to the access. For every access this spec admits, that clamp is a **no-op**
-//! (`addr+offset < mapped ≤ reserved`), so the architectural semantics — what this crate
-//! specifies and what the escape oracle differentials — are exactly `checked`-then-access. The
-//! clamp exists for the *speculative* path only (a data dependency confining misspeculated OOB
-//! accesses to `[0, reserved)`, the Spectre-v1 hardening); an interpreter doesn't speculate, so
-//! it has no analogue there.
+//! ## The JIT's speculative confinement (§4, D63) — invisible to this spec
+//! The production Cranelift lowering does not just test-and-fault: on the failing branch it
+//! redirects the out-of-bounds access to the enclosing window's trailing guard page via a
+//! **branchless** `select_spectre_guard(oob, guard_offset, addr+offset)` (D63, superseding the
+//! D38 `trapnz` + `& (reserved−1)` clamp — the AND survives only in the bulk-span path and the
+//! wasm-JIT tier). For every access this spec admits, `oob` is false, so the redirect is a
+//! **no-op** and the physical address is exactly `mem_base + (addr+offset)`; the architectural
+//! semantics — what this crate specifies and what the escape oracle differentials — are exactly
+//! `checked`-then-access. The redirect is *also* a speculation barrier: a misspeculated OOB
+//! access receives `guard_offset` and faults on the guard (`PROT_NONE`), the Spectre-v1
+//! hardening — the identical Cranelift primitive Wasmtime uses. An interpreter doesn't
+//! speculate, so it has no analogue there.
 //!
 //! ## Nesting (§14)
 //! A window can be a power-of-two-aligned **sub-region** of an enclosing window — a parent grants a
@@ -162,21 +166,6 @@ impl Window {
         self.mapped
     }
 
-    /// Window size in bytes — an alias for [`Window::reserved`] (the reservation), retained
-    /// for callers that predate the `reserved`/`mapped` split. For a fully-mapped window
-    /// this is also the backed extent.
-    #[inline]
-    pub fn size(self) -> u64 {
-        self.reserved()
-    }
-
-    /// The reservation mask (`reserved - 1`). Retained for callers that align to the
-    /// power-of-two reservation; trap-confinement no longer uses it to mask accesses.
-    #[inline]
-    pub fn mask(self) -> u64 {
-        self.reserved() - 1
-    }
-
     /// The raw absolute effective address `base + addr + offset` — **no confinement** (this is
     /// **trap-confinement**, not the old wrap model: there is no `& mask`). Callers that access
     /// memory must go through [`Window::checked`], which bounds-checks and rejects an out-of-window
@@ -246,8 +235,8 @@ mod tests {
             let size_log2 = (rng.next() % 66) as u8; // include out-of-range (clamped)
 
             let w = Window::new(size_log2);
-            let size = w.size(); // fully-mapped: mapped == reserved == size
-                                 // In bounds iff `addr+offset+width <= size`, computed overflow-free.
+            let size = w.reserved(); // fully-mapped: mapped == reserved == size
+                                     // In bounds iff `addr+offset+width <= size`, computed overflow-free.
             let in_bounds = addr
                 .checked_add(offset)
                 .and_then(|e| e.checked_add(width as u64))
@@ -349,7 +338,7 @@ mod tests {
     #[test]
     fn boundary_cases() {
         let w = Window::new(16); // 64 KiB, fully mapped
-        let size = w.size();
+        let size = w.reserved();
         // An aligned 8-byte load at the last full slot is fine.
         assert_eq!(w.checked(size - 8, 0, 8), Some(size - 8));
         // One byte further crosses the top -> fault.
@@ -365,7 +354,7 @@ mod tests {
     #[test]
     fn degenerate_one_byte_window() {
         let w = Window::new(0); // size 1
-        assert_eq!(w.size(), 1);
+        assert_eq!(w.reserved(), 1);
         assert_eq!(w.checked(0, 0, 1), Some(0)); // the one valid byte
         assert_eq!(w.checked(1, 0, 1), None); // one past the top faults (no aliasing)
         assert_eq!(w.checked(12345, 0, 1), None); // far OOB faults
@@ -375,14 +364,14 @@ mod tests {
     #[test]
     fn largest_window_does_not_overflow() {
         let w = Window::new(63);
-        assert_eq!(w.size(), 1u64 << 63);
+        assert_eq!(w.reserved(), 1u64 << 63);
         // Near the top of a 2^63 window: an access that fits, and one that doesn't.
         assert_eq!(w.checked((1u64 << 63) - 8, 0, 8), Some((1u64 << 63) - 8));
         assert_eq!(w.checked((1u64 << 63) - 1, 0, 2), None);
         // A wild address whose `addr+offset` overflows u64 faults (checked_add rejects it).
         assert_eq!(w.checked(u64::MAX, 8, 1), None);
         // size_log2 over the max is clamped, not a shift-overflow panic.
-        assert_eq!(Window::new(200).size(), 1u64 << 63);
+        assert_eq!(Window::new(200).reserved(), 1u64 << 63);
     }
 
     /// The §14 **nesting** property under trap-confinement: `checked` admits an access iff it lies
