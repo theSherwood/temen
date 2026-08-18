@@ -3418,7 +3418,9 @@ impl<'p> Vcpu<'p> {
         let fits = child_size != 0
             && child_size <= isize
             && off_u & (child_size - 1) == 0
-            && off_u.checked_add(child_size).is_some_and(|e| e <= isize);
+            && off_u.checked_add(child_size).is_some_and(|e| e <= isize)
+            // #964: a carve may not dip into the reserved NULL region `[0, guard)`.
+            && self.mem.as_ref().is_none_or(|m| ibase + off_u >= m.null_guard);
         if !ok_entry || !fits {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
             return Ok(None);
@@ -3506,7 +3508,9 @@ impl<'p> Vcpu<'p> {
         let fits = child_size != 0
             && child_size <= isize
             && off_u & (child_size - 1) == 0
-            && off_u.checked_add(child_size).is_some_and(|e| e <= isize);
+            && off_u.checked_add(child_size).is_some_and(|e| e <= isize)
+            // #964: a carve may not dip into the reserved NULL region `[0, guard)`.
+            && self.mem.as_ref().is_none_or(|m| ibase + off_u >= m.null_guard);
         let mod_ok = cmem_log2 == Some(size_log2 as u8);
         if !ok_entry || !fits || !mod_ok {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
@@ -6152,7 +6156,9 @@ fn dbg_instantiate(
     let fits = child_size != 0
         && child_size <= isz
         && off_u & (child_size - 1) == 0
-        && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
+        && off_u.checked_add(child_size).is_some_and(|e| e <= isz)
+        // #964: a carve may not dip into the reserved NULL region `[0, guard)`.
+        && shared_mem.as_ref().is_none_or(|m| ibase + off_u >= m.null_guard);
     if !ok_entry || !fits {
         tasks[ti]
             .vt
@@ -6279,7 +6285,9 @@ fn dbg_instantiate_module(
     let fits = child_size != 0
         && child_size <= isz
         && off_u & (child_size - 1) == 0
-        && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
+        && off_u.checked_add(child_size).is_some_and(|e| e <= isz)
+        // #964: a carve may not dip into the reserved NULL region `[0, guard)`.
+        && shared_mem.as_ref().is_none_or(|m| ibase + off_u >= m.null_guard);
     let mod_ok = cmem_log2 == Some(size_log2 as u8);
     if !ok_entry || !fits || !mod_ok {
         tasks[ti]
@@ -10133,7 +10141,9 @@ impl CoopSched {
                     let fits = child_size != 0
                         && child_size <= isz
                         && off_u & (child_size - 1) == 0
-                        && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
+                        && off_u.checked_add(child_size).is_some_and(|e| e <= isz)
+                        // #964: a carve may not dip into the reserved NULL region `[0, guard)`.
+                        && mem.as_ref().is_none_or(|m| ibase + off_u >= m.null_guard);
                     if !ok_entry || !fits {
                         tasks[ti]
                             .vt
@@ -10343,7 +10353,9 @@ impl CoopSched {
                     let fits = child_size != 0
                         && child_size <= isz
                         && off_u & (child_size - 1) == 0
-                        && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
+                        && off_u.checked_add(child_size).is_some_and(|e| e <= isz)
+                        // #964: a carve may not dip into the reserved NULL region `[0, guard)`.
+                        && mem.as_ref().is_none_or(|m| ibase + off_u >= m.null_guard);
                     let mod_ok = cmem_log2 == Some(size_log2 as u8);
                     if !ok_entry || !fits || !mod_ok {
                         tasks[ti]
@@ -11741,7 +11753,9 @@ fn run_vcpu_parallel<'scope, 'env>(
                 let fits = child_size != 0
                     && child_size <= isz
                     && off_u & (child_size - 1) == 0
-                    && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
+                    && off_u.checked_add(child_size).is_some_and(|e| e <= isz)
+                    // #964: a carve may not dip into the reserved NULL region `[0, guard)`.
+                    && mem.as_ref().is_none_or(|m| ibase + off_u >= m.null_guard);
                 if !ok_entry || !fits {
                     vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
                     continue;
@@ -11870,7 +11884,9 @@ fn run_vcpu_parallel<'scope, 'env>(
                 let fits = child_size != 0
                     && child_size <= isz
                     && off_u & (child_size - 1) == 0
-                    && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
+                    && off_u.checked_add(child_size).is_some_and(|e| e <= isz)
+                    // #964: a carve may not dip into the reserved NULL region `[0, guard)`.
+                    && mem.as_ref().is_none_or(|m| ibase + off_u >= m.null_guard);
                 let mod_ok = cmem_log2 == Some(size_log2 as u8);
                 if !ok_entry || !fits || !mod_ok {
                     vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));

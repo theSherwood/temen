@@ -324,6 +324,11 @@ unsafe fn cap_thunk_impl(
     let pages = host.cap_window_pages(mem_base as usize);
     #[cfg(any(unix, windows))]
     let mut wm = MprotectWindow::new_shared(mem_base, mem_size, mem_reserved, pages);
+    // #964: carry the running module's NULL guard into the window backend (recorded on the host
+    // at `set_self_module` time — the thunk has no module in reach), so `[0, guard)` is refused
+    // to page ops and reads as unmapped to borrow checks, matching the interpreter oracle.
+    #[cfg(any(unix, windows))]
+    wm.set_null_guard(host.null_guard());
     #[cfg(any(unix, windows))]
     let gm: Option<&mut dyn GuestMem> = if mem_base.is_null() {
         None
@@ -2486,6 +2491,12 @@ pub struct MprotectWindow {
     /// persistent home is the `Host` ([`Host::cap_window_pages`]); a one-off [`MprotectWindow::new`]
     /// gets a private fresh map.
     prot: CapPageMap,
+    /// #964: the marked module's reserved NULL region (`0` = unguarded, the default). `[0, guard)`
+    /// reports unmapped to borrow checks and is **refused** to `map`/`unmap`/`protect` (the
+    /// `mmap_min_addr` analogue), mirroring the interpreter's `prot_pages`/`check_prot` so the
+    /// hardware-protected window and the oracle agree. Set from [`svm_interp::Host::null_guard`]
+    /// by the cap thunk ([`MprotectWindow::set_null_guard`]).
+    null_guard: u64,
 }
 
 #[cfg(any(unix, windows))]
@@ -2544,7 +2555,13 @@ impl MprotectWindow {
             reserved: reserved.max(mapped),
             page: host_page_size(),
             prot,
+            null_guard: 0,
         }
+    }
+
+    /// #964: install the running module's NULL guard (see the `null_guard` field). No-op at `0`.
+    pub fn set_null_guard(&mut self, guard: u64) {
+        self.null_guard = guard;
     }
 
     /// Read one page's explicit state from the shared map (locks; `None` ⇒ absent / region default).
@@ -2568,6 +2585,11 @@ impl MprotectWindow {
     /// One page's access state: `None` ⇒ faults (unmapped), `Some(writable)` ⇒ committed — the
     /// same default rule as the interpreter (`svm_interp::Mem::page_access`).
     fn page_access(&self, page: u64) -> Option<bool> {
+        // #964: the reserved NULL region reads as unmapped — a cap-buffer borrow at/near NULL is
+        // refused exactly as the interpreter's `Unmapped`-seeded page map refuses it.
+        if page * self.page < self.null_guard {
+            return None;
+        }
         match self.prot_get(page) {
             Some(PageState::Rw) => Some(true),
             Some(PageState::Ro) => Some(false),
@@ -2597,6 +2619,11 @@ impl MprotectWindow {
     /// interpreter's `prot_pages` (growth into the reserved tail is allowed).
     fn prot_pages(&self, offset: u64, len: u64) -> Result<std::ops::RangeInclusive<u64>, i64> {
         if len == 0 || !offset.is_multiple_of(self.page) {
+            return Err(EINVAL);
+        }
+        // #964: the reserved NULL region is permanent — re-mapping it would make the tiers' baked
+        // guard diverge from the live map (the `mmap_min_addr` analogue; interp `prot_pages` twin).
+        if offset < self.null_guard {
             return Err(EINVAL);
         }
         let end = offset.checked_add(len).ok_or(EINVAL)?;

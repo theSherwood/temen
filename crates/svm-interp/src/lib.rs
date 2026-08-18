@@ -10778,6 +10778,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 && child_size <= isize
                                 && off & (child_size - 1) == 0
                                 && off.checked_add(child_size).is_some_and(|e| e <= isize)
+                                // #964: a carve may not dip into the reserved NULL region
+                                // `[0, guard)` — the host seeds/copies the carve outside the
+                                // guarded call, and the region is permanent by design.
+                                && mem.as_ref().is_none_or(|m| ibase + off >= m.null_guard)
                                 // §3b: a budget-funded spawn's carve must fit the budget's mem
                                 // quota (`-1` = unbounded). Peek, not take — a refused spawn
                                 // leaves the budget intact.
@@ -17154,6 +17158,10 @@ pub struct Host {
     /// mirrors how the interpreter's `Mem` keeps its page map across calls. Page index → state code
     /// (`svm_run` owns the encoding); absent ⇒ region default. Reset when a new window base appears.
     cap_pages: Option<(usize, CapPageMap)>,
+    /// #964: the running module's NULL guard (`0` = unguarded), recorded by
+    /// [`Host::set_self_module`] so the JIT cap path's window backend can enforce the reserved
+    /// region without the module in reach.
+    null_guard: u64,
     /// §15 spawn quota (fiber/vCPU ceilings) the embedder sets for this domain ([`Host::set_quota`]);
     /// default = the hard anti-bomb ceilings, so an unconfigured run is unchanged. `drive` reads it to
     /// size the executor's live-vCPU cap and each vCPU's fiber cap.
@@ -17541,6 +17549,7 @@ impl Host {
             term_flag: Arc::new(AtomicBool::new(false)),
             park_request: Arc::new(AtomicU64::new(0)),
             cap_pages: None,
+            null_guard: 0,
             quota: Quota::default(),
             jit_domains: Vec::new(),
             jit_validator: None,
@@ -19226,7 +19235,17 @@ impl Host {
     /// `cap.self.type_id`, `cap.self.covers`, and `export.handle` resolve through one host-side
     /// entry on all three backends. Unregistered, those ops fail closed (probeable `CapFault`).
     pub fn set_self_module(&mut self, m: &Arc<Module>) {
+        // #964: a `__null_guard`-marked module's window reserves `[0, guard)`. Recording it here —
+        // the one place every run path registers the running module — lets the native JIT's
+        // Memory-cap backend (`svm-run`'s `MprotectWindow`, rebuilt per `cap.call` with no module
+        // in reach) mirror the interpreter's refusal/unmapped semantics for the reserved region.
+        self.null_guard = svm_ir::module_null_guard(m).unwrap_or(0);
         self.self_module = Some(Arc::clone(m));
+    }
+
+    /// #964: the running module's NULL guard (`0` = unguarded) — see [`Host::set_self_module`].
+    pub fn null_guard(&self) -> u64 {
+        self.null_guard
     }
 
     /// §3.6 slice 2 — enqueue a dispatch onto this domain's bounded inbound queue, to be served
@@ -22557,10 +22576,15 @@ impl Mem {
     /// the legacy fast paths stay lock-free. The guard is a multiple of every supported page size
     /// (16 KiB = the max host page; the browser's software page is 4 KiB), asserted here.
     pub(crate) fn seed_null_guard(&mut self, guard: u64) {
-        if guard == 0 {
+        // Page-exact or skip: on a host whose page exceeds the guard (e.g. 64 KiB aarch64), a
+        // page-map seed would swallow live scratch above the guard — so the guard disengages, and
+        // the native tier's `mprotect` seeding skips identically (per-platform trap parity). A
+        // window smaller than the guard (a tiny §14 sub-window of a marked module) also skips —
+        // seeding would unmap the whole window, and the native tier could not mirror it without
+        // protecting past the carve.
+        if guard == 0 || !guard.is_multiple_of(self.page) || guard > self.window.mapped() {
             return;
         }
-        debug_assert!(guard.is_multiple_of(self.page), "guard must be page-exact");
         self.null_guard = guard;
         let mut space = self.space_write();
         for p in 0..guard.div_ceil(self.page) {

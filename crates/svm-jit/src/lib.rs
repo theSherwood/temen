@@ -2223,6 +2223,12 @@ pub struct CompiledModule {
     win_reserved: usize,
     win_size: usize,
     mem_size_log2: Option<u8>,
+    /// #964: the module's NULL guard (`0` = unguarded). Captured at compile from the
+    /// `__null_guard` marker export; each run `mprotect`s `[0, guard)` inaccessible after the
+    /// window is seeded, so a NULL dereference faults into the §5 guard exactly where the
+    /// interpreter's `Unmapped`-seeded page map traps. Always `0` for a §14 sub-window compile
+    /// (a carve child mirrors the interpreter's unguarded sub-window).
+    null_guard: u64,
     /// Initialized data segments, owned so a run can seed a fresh window (the module may
     /// outlive the borrowed `IrModule`).
     data: Vec<Data>,
@@ -2799,6 +2805,12 @@ impl CompiledModule {
         } else {
             None
         };
+        // #964: a marked module's carves may not dip into the reserved NULL region (the host
+        // seeds/copies carves outside the guarded call).
+        #[cfg(fiber_rt)]
+        if let Some(n) = &nursery {
+            n.set_null_guard(svm_ir::module_null_guard(m).unwrap_or(0));
+        }
         #[cfg(fiber_rt)]
         let inst = if let Some(n) = &nursery {
             InstEnv {
@@ -3225,6 +3237,10 @@ impl CompiledModule {
             win_mapped,
             win_reserved,
             win_size,
+            // #964: the marker opts this module's window into the NULL guard — window-relative,
+            // so a §14 sub-window compile guards `[sub_base, sub_base + guard)`, exactly where the
+            // interpreter's `run_capture_sub` seeds its child-relative guard.
+            null_guard: svm_ir::module_null_guard(m).unwrap_or(0),
             mem_size_log2: m.memory.map(|mc| mc.size_log2),
             data: m.data.clone(),
             restore_prots: Vec::new(),
@@ -3546,6 +3562,16 @@ impl CompiledModule {
                     }
                     WindowProt::Rw => {}
                 }
+            }
+            // #964: reserve the marked module's NULL region last, after every host write above
+            // (init seed, data segments, durable prots) has landed — the marked layout keeps all
+            // live data at or above the guard, so nothing legitimate is covered. Window-relative
+            // (`sub_base` shifts a §14 sub-window's guard into the parent backing); a (sub-)window
+            // smaller than the guard skips — protecting past the carve would false-trap the
+            // parent — matching the interpreter's fit check. The snapshot paths below re-assert RW
+            // (`restore_rw`/`read_low`) before any host read.
+            if t.null_guard <= t.cap_mapped {
+                window.seed_null_guard(t.sub_base, t.null_guard);
             }
             let fn_table_ptr = t.fn_table.as_ptr() as *const core::ffi::c_void;
             (window, win_size, t.mask, fn_table_ptr)

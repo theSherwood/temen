@@ -1278,11 +1278,22 @@ pub fn analyze(m: &Module) -> Analysis {
 pub fn analyze_from(m: &Module, entry: u32) -> Analysis {
     let n = m.funcs.len();
     let atomics_ok = module_atomics_ok(m);
-    let in_subset: Vec<bool> = m
+    let mut in_subset: Vec<bool> = m
         .funcs
         .iter()
         .map(|f| func_in_subset(m, f, atomics_ok))
         .collect();
+    // #964: a `__null_guard`-marked module's emitted accesses carry the NULL guard, but the
+    // bulk-memory span check has no low bound — so bulk-mem functions leave the subset and run on
+    // the interpreter, which enforces the guard through its page map. Fail-closed; unmarked
+    // modules are untouched (byte-identical emit).
+    if svm_ir::module_null_guard(m).is_some() {
+        for (i, f) in m.funcs.iter().enumerate() {
+            if func_uses_bulk_mem(f) {
+                in_subset[i] = false;
+            }
+        }
+    }
     let interp_leaf: Vec<bool> = m
         .funcs
         .iter()
@@ -1367,7 +1378,7 @@ pub fn compile_module_fuel(m: &Module, fuel_mode: FuelMode) -> Result<Vec<u8>, E
         false,
         fuel_mode,
         None,
-        None,
+        svm_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
     )
 }
 
@@ -1428,7 +1439,7 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
         false,
         FuelMode::Global,
         None,
-        None,
+        svm_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
     )
 }
 
@@ -1468,11 +1479,15 @@ pub fn compile_module_nested_with_eligibility(
                 .is_ok_and(|tys| tys.iter().all(|t| valtype_byte(*t).is_ok()))
         })
     };
+    // #964: a marked granted unit emits with the NULL guard; its bulk-mem functions (span check
+    // has no low bound) must fall to the cross-tier leaf path or fail closed, exactly as on the
+    // tier-up entries.
+    let null_guard = svm_ir::module_null_guard(m);
     let mut wasm_of: Vec<Option<u32>> = vec![None; n];
     let mut interp_leaf = vec![false; n];
     let mut emitted: Vec<usize> = Vec::new();
     for (i, f) in m.funcs.iter().enumerate() {
-        if nested_ok(f) {
+        if nested_ok(f) && !(null_guard.is_some() && func_uses_bulk_mem(f)) {
             wasm_of[i] =
                 Some(NESTED_IMPORTED_FUNCS + module_uses_rec(m) as u32 + emitted.len() as u32);
             emitted.push(i);
@@ -1516,7 +1531,7 @@ pub fn compile_module_nested_with_eligibility(
         true,
         FuelMode::Global,
         None,
-        None,
+        null_guard,
     )?;
     Ok((wasm, eligible))
 }
@@ -1603,7 +1618,7 @@ pub fn compile_module_b2(
         false,
         FuelMode::Global,
         None,
-        None,
+        svm_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
     )
 }
 
@@ -1848,7 +1863,7 @@ pub fn compile_module_reactor(
         false,
         FuelMode::Global,
         None,
-        None,
+        svm_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
     )?;
     Ok((wasm, emitted_bitmap))
 }
@@ -1909,7 +1924,7 @@ pub fn compile_module_reactor_keep(
         false,
         FuelMode::Global,
         None,
-        None,
+        svm_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
     )?;
     Ok((wasm, emitted_bitmap))
 }
@@ -2011,10 +2026,11 @@ pub fn compile_module_tierup_paged(
 /// elided (an in-window proof bounds the access from above, not below). Bulk-memory functions stay
 /// interpreted (the span check has no low bound), same limit as paged mode.
 ///
-/// **Not a shipped confinement mode**: nothing drives it in production, the powerbox ABI still
-/// places live data below any useful guard (`POWERBOX_ARGS_BASE = 128`), and the interpreter does
-/// not yet seed a NULL page. It exists so the design decision is made against measured numbers
-/// (`paged_bench_emit` / `bench_paged.mjs` emit + time it as a third variant).
+/// Since the #964 ABI landed this is the **measurement/override** entry: production compiles derive
+/// the guard from the module's `__null_guard` marker on every standard entry (see
+/// [`compile_module_tierup_inner`]), so a marked module needs no special entry. This one forces an
+/// arbitrary `guard` on an *unmarked* module — what `paged_bench_emit` / `bench_paged.mjs` emit +
+/// time as a third variant.
 pub fn compile_module_tierup_nullguard(
     m: &Module,
     shared_memory: bool,
@@ -2031,6 +2047,11 @@ fn compile_module_tierup_inner(
     reserved_table_log2: Option<u32>,
     null_guard: Option<u64>,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    // #964: a `__null_guard`-marked module opts every tier into the NULL guard — derive it from the
+    // marker whenever the caller didn't force one (the measurement entry still can), so the plain
+    // tier-up entries stay trap-parity with the interpreter oracle, which seeds `[0, guard)`
+    // `Unmapped` for marked modules. Unmarked modules keep `None` (byte-identical emit).
+    let null_guard = null_guard.or_else(|| svm_ir::module_null_guard(m));
     let n = m.funcs.len();
     // Track 3 (c)+(a): a page-op module (`map`/`unmap`/`protect`) can't be accelerated on the
     // mask-only tier — an emitted access ignores per-page state the interpreter would trap on
@@ -2255,7 +2276,7 @@ fn compile_interp_only(
         nested_caps,
         FuelMode::Global,
         None,
-        None,
+        svm_ir::module_null_guard(m), // #964 (vacuous here — no bodies — but kept uniform)
     )?;
     Ok(Artifact {
         wasm,
