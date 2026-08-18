@@ -2184,8 +2184,13 @@ fn drive_over_cell(
             // under this Host's lock, so the closure must not re-lock it).
             let park_cell = park_request.clone();
             source.set_park_request(Arc::new(move |ev| {
-                let ParkEvent::TaskExit(id) = ev;
-                park_cell.store(id, Ordering::SeqCst);
+                park_cell.store(
+                    match ev {
+                        ParkEvent::TaskExit(id) => id,
+                        ParkEvent::ForkSelf => u64::MAX,
+                    },
+                    Ordering::SeqCst,
+                );
             }));
         }
     }
@@ -4121,6 +4126,11 @@ enum Blocked {
     /// personality's now-retired table entry) by the twin-completion wake, the EINTR sweep, or the
     /// park-vs-completion re-check at insert.
     ReapWait { child: TaskId },
+    /// #799 — a personality **fork request** ([`ParkEvent::ForkSelf`]): not a park — the drive
+    /// loop immediately hands this vCPU to [`Scheduler::fork_vcpu`] (the offer path's engine)
+    /// and both copies re-admit with their return-twice replies. On a failed fork the caller
+    /// re-admits with `-EAGAIN` as the call's result (a value, never a hang — invariant 5).
+    ForkSelf,
     /// Blocked in `atomic.wait`. `key` is the canonical rendezvous coordinate the wait-queue and
     /// `notify` match on (region-canonical for aliased pages — S1b); `addr` is the confined absolute
     /// address the driver re-reads to compare against `expected` under its lock (the futex
@@ -5095,19 +5105,55 @@ impl Scheduler {
         reply_orig: Option<i64>,
         reply_twin: i64,
     ) -> Option<i64> {
+        // Only a whole parked vCPU is forkable this slice; anything else stays put. The extracted
+        // caller is owned — dropping the lock before the engine call is race-free (nothing else
+        // can reach it), and the engine re-acquires with the same lock discipline.
+        let v = {
+            let mut s = self.lock();
+            match s.ticket_waiters.remove(&(callee_id, ticket)) {
+                Some(Waiter::VCpu(v)) => v,
+                Some(other) => {
+                    s.ticket_waiters.insert((callee_id, ticket), other);
+                    return None;
+                }
+                None => return None,
+            }
+        };
+        match self.fork_vcpu(v, reply_orig, reply_twin) {
+            Ok(twin_id) => Some(twin_id),
+            Err(v) => {
+                // Fork refused: re-park the caller exactly where it was (it falls back to the
+                // single-reply path, so it never hangs).
+                let mut s = self.lock();
+                s.ticket_waiters
+                    .insert((callee_id, ticket), Waiter::VCpu(v));
+                None
+            }
+        }
+    }
+
+    /// #799 — the **fork engine**, factored out of [`Scheduler::fork_parked_caller`] so the
+    /// personality-fork route ([`Blocked::ForkSelf`] — the drive loop holding the running
+    /// caller's own vCPU) shares it verbatim: the bare-root-shape gate, the private window copy,
+    /// the powerbox duplicate (running the personality's fork factory), the four door mints, the
+    /// vCPU twin, and the return-twice re-admissions (`reply_orig`/pid-mode for the original,
+    /// `reply_twin` for the twin). `Err(v)` hands the intact caller back — each route decides its
+    /// own failure delivery (re-park the ticket waiter; `-EAGAIN` as the call's result).
+    fn fork_vcpu(
+        self: &Arc<Self>,
+        mut v: Box<VCpu>,
+        reply_orig: Option<i64>,
+        reply_twin: i64,
+    ) -> Result<i64, Box<VCpu>> {
         let mut s = self.lock();
         if s.live >= self.cap || s.shutdown {
-            return None;
+            return Err(v);
         }
-        // Only a whole parked vCPU is forkable this slice; anything else stays put.
-        let mut v = match s.ticket_waiters.remove(&(callee_id, ticket)) {
-            Some(Waiter::VCpu(v)) => v,
-            Some(other) => {
-                s.ticket_waiters.insert((callee_id, ticket), other);
-                return None;
-            }
-            None => return None,
-        };
+        // #799 — never fork a member of an already-dead domain (the drive-loop route can race a
+        // teardown; the caller's own next safepoint observes the domain trap).
+        if s.dead.contains_key(&domain_key_of(&v)) {
+            return Err(v);
+        }
         // A bare root park with no children/fibers is the only shape `fork_twin` duplicates faithfully.
         let bare = v.cur == ROOT_FIBER
             && v.chain.as_slice() == [ROOT_FIBER]
@@ -5118,9 +5164,8 @@ impl Scheduler {
             && !v.registry.has_blocked_parks();
         macro_rules! put_back_none {
             () => {{
-                s.ticket_waiters
-                    .insert((callee_id, ticket), Waiter::VCpu(v));
-                return None;
+                drop(s);
+                return Err(v);
             }};
         }
         if !bare {
@@ -5138,6 +5183,15 @@ impl Scheduler {
         // parent's `fork()` will return (#863 slice 2: a personality registers the new process in
         // its table at birth). Stable under `s` (the scheduler lock is held throughout); committed
         // below only once the fork succeeds, so a failed fork burns no id.
+        // #799 — a twin's TaskId IS its personality pid (#863's one pid space), so the mint skips
+        // the personality's reserved band: `0` (the `kill(0)` self-raise convention) and `1` (the
+        // root process — a ROOT-domain fork's first twin would otherwise overwrite the root's own
+        // table entry). Only twins skip: ordinary task ids are core-internal and stay dense.
+        // (The 1000+ spawn-clone band remains a documented latent overlap for runs minting a
+        // thousand tasks — the eventual pid-namespace unification's problem.)
+        if s.next_task <= 1 {
+            s.next_task = 2;
+        }
         let twin_id = s.next_task;
         // Duplicated powerbox (own handle namespace, shared `Arc` backings, new `domain_id`) — fails
         // closed on any domain the core can't duplicate on its own (closure caps, live offers, …).
@@ -5151,6 +5205,7 @@ impl Scheduler {
                 }
             }
         };
+        // From here the fork commits: both copies are enqueued before the lock drops.
         s.next_task += 1;
         s.live += 1;
         // #863 slice 3 — the twin's signal door (minted by the personality's fork factory, installed
@@ -5194,8 +5249,13 @@ impl Scheduler {
                 // #799 — the twin's park-request closure, minted with its wake/stop/kill.
                 let park_cell = park_request.clone();
                 source.set_park_request(Arc::new(move |ev| {
-                    let ParkEvent::TaskExit(id) = ev;
-                    park_cell.store(id, Ordering::SeqCst);
+                    park_cell.store(
+                        match ev {
+                            ParkEvent::TaskExit(id) => id,
+                            ParkEvent::ForkSelf => u64::MAX,
+                        },
+                        Ordering::SeqCst,
+                    );
                 }));
             }
         }
@@ -5220,7 +5280,7 @@ impl Scheduler {
         s.runnable.push_back(v);
         self.maybe_spawn_worker(&mut s);
         self.work.notify_all();
-        Some(twin_id as i64)
+        Ok(twin_id as i64)
     }
 
     /// FORK.md §8.6 — the servicer side of `wait(pid)`. From within a serve handler, reap the twin
@@ -6408,6 +6468,23 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     sched.work.notify_one();
                 }
             }
+            Step::Park(Blocked::ForkSelf) => {
+                // #799 — `fork` through the personality: hand this running caller's vCPU to the
+                // offer path's fork engine. Success re-admits both copies with their return-twice
+                // replies inside `fork_vcpu`; a refusal (capacity, non-bare shape, unforkable
+                // window/powerbox, dead domain) re-admits the caller with `-EAGAIN` as the
+                // call's result — a value, never a hang (the `while ((pid = fork()) < 0)` idiom).
+                if let Err(v) = sched.fork_vcpu(v, None, 0) {
+                    let mut s = sched.lock();
+                    let Some(mut v) = park_gate(&mut s, v) else {
+                        sched.work.notify_all();
+                        return;
+                    };
+                    v.pending = Some(Pending::CapResult(EAGAIN));
+                    s.runnable.push_back(v);
+                    sched.work.notify_one();
+                }
+            }
             Step::Park(Blocked::ReapWait { child }) => {
                 // #799 — bench a blocking `waitpid` until `child` exits. Park-vs-completion race
                 // (the CapRead/Stopped discipline): enqueue under the scheduler lock, but if the
@@ -7460,8 +7537,9 @@ impl SchedDriver {
                     // set and this park never fires — defensive, fail-closed like the rest.
                     | Blocked::Stopped
                     // #799: likewise no park-request door on the explorer — a personality op's
-                    // request is take-and-dropped at the dispatch arms, so this park never fires.
-                    | Blocked::ReapWait { .. },
+                    // request is take-and-dropped at the dispatch arms, so these never fire.
+                    | Blocked::ReapWait { .. }
+                    | Blocked::ForkSelf,
                 ) => {
                     let id = v.id;
                     let key = domain_key_of(&v); // §12 teardown: read before the vCPU is dropped
@@ -10812,8 +10890,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         // #799 — and its park-request closure.
                                         let park_cell = ch.park_request.clone();
                                         source.set_park_request(Arc::new(move |ev| {
-                                            let ParkEvent::TaskExit(id) = ev;
-                                            park_cell.store(id, Ordering::SeqCst);
+                                            park_cell.store(
+                                                match ev {
+                                                    ParkEvent::TaskExit(id) => id,
+                                                    ParkEvent::ForkSelf => u64::MAX,
+                                                },
+                                                Ordering::SeqCst,
+                                            );
                                         }));
                                     }
                                 }
@@ -11251,8 +11334,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         // #799 — and its park-request closure.
                                         let park_cell = ch.park_request.clone();
                                         source.set_park_request(Arc::new(move |ev| {
-                                            let ParkEvent::TaskExit(id) = ev;
-                                            park_cell.store(id, Ordering::SeqCst);
+                                            park_cell.store(
+                                                match ev {
+                                                    ParkEvent::TaskExit(id) => id,
+                                                    ParkEvent::ForkSelf => u64::MAX,
+                                                },
+                                                Ordering::SeqCst,
+                                            );
                                         }));
                                     }
                                 }
@@ -12278,12 +12366,19 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let pipe_park = hg.take_pipe_read_parked();
                     let pipe_write_park = hg.take_pipe_write_parked();
                     let pipe_wake_w = hg.take_pipe_wake_writers();
-                    // #799 — a personality park request (blocking `waitpid` asked to bench its
-                    // caller on a child's exit). Taken here like every transient (consume-everywhere).
-                    let reap_park = hg.take_park_request();
+                    // #799 — a personality caller request: bench on a child's exit (blocking
+                    // `waitpid`) or clone the caller (`fork`). Taken here like every transient
+                    // (consume-everywhere).
+                    let request = hg.take_park_request();
+                    let reap_park = match request {
+                        Some(ParkEvent::TaskExit(id)) => Some(id),
+                        _ => None,
+                    };
+                    let fork_self = matches!(request, Some(ParkEvent::ForkSelf));
                     // #796 L1 — a `raise()` interrupted a parked blocking op: consume the EINTR flag, but
                     // only when *this* op is actually about to park (a completed read/write must not eat
-                    // it). Short-circuits so `take_sig_interrupt` fires only on a genuine park.
+                    // it). Short-circuits so `take_sig_interrupt` fires only on a genuine park. (`fork`
+                    // does not participate: POSIX fork is not interruptible — it succeeds or EAGAINs.)
                     let sig_intr = (pipe_park.is_some()
                         || pipe_write_park.is_some()
                         || reap_park.is_some())
@@ -12343,6 +12438,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             }
                         }
                         // A non-parkable context keeps the placeholder answer (the -ECHILD poll).
+                    }
+                    // #799 — `fork` through the personality: hand this vCPU to the fork engine
+                    // (no rewind, no result push — both copies resume past the call via their
+                    // return-twice `Pending::CapResult`). A non-parkable context keeps the
+                    // placeholder (`-ENOSYS`: fork unavailable on this route/tier — an error a
+                    // shell surfaces, never an infinite `-EAGAIN` retry).
+                    if fork_self && *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
+                        return Ok(Inner::Park(Blocked::ForkSelf));
                     }
                     if !eintr_done {
                         for (s, ty) in results.iter().zip(&sig.results) {
@@ -12659,9 +12762,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // writer; a drained-full read / reader-to-zero close wakes parked writers.
                     let pipe_write_park = hg.take_pipe_write_parked();
                     let pipe_wake_w = hg.take_pipe_wake_writers();
-                    // #799 — a personality park request (blocking `waitpid`); this named-import
-                    // route is where a shim-linked guest's `waitpid` lands.
-                    let reap_park = hg.take_park_request();
+                    // #799 — a personality caller request (blocking `waitpid` / `fork`); this
+                    // named-import route is where a shim-linked guest's calls land.
+                    let request = hg.take_park_request();
+                    let reap_park = match request {
+                        Some(ParkEvent::TaskExit(id)) => Some(id),
+                        _ => None,
+                    };
+                    let fork_self = matches!(request, Some(ParkEvent::ForkSelf));
                     // #796 L1 — take the EINTR flag only when this named-import op is about to park (as in
                     // the `cap.call` arm above), so a raised signal completes it `-EINTR` not re-parks.
                     let sig_intr = (pipe_park.is_some()
@@ -12709,6 +12817,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             }
                         }
                         // A non-parkable context keeps the placeholder answer (the -ECHILD poll).
+                    }
+                    // #799 — `fork` through the personality (see the `cap.call` arm).
+                    if fork_self && *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
+                        return Ok(Inner::Park(Blocked::ForkSelf));
                     }
                     if let Some(pipe) = pipe_wake {
                         sched.wake_pipe_readers(pipe);
@@ -16663,6 +16775,13 @@ pub enum ParkEvent {
     /// the twin-completion point that already fires the exit hooks, so the re-executed op finds
     /// the personality's table entry already retired.
     TaskExit(TaskId),
+    /// #799 — `fork()` through the personality: clone the calling vCPU (return-twice). Not a
+    /// park but the same request plumbing (cell → dispatch arm → a `Step` the drive loop acts
+    /// on — the `Step::Exec` image-replace precedent): the drive loop hands the caller's own
+    /// vCPU to the offer path's fork engine ([`Scheduler::fork_vcpu`]); the parent re-admits
+    /// with the twin's TaskId as the call's result, the twin with `0`. The one request where
+    /// complete-with-value is mandatory on both sides — a rewound fork would fork twice.
+    ForkSelf,
 }
 
 /// #796 — the ceiling on **nested** injected signal-handler frames per fiber. The source's
@@ -17476,7 +17595,11 @@ impl Host {
             && self.svc_results.is_empty()
             && self.self_instance.is_none()
             && self.pool.is_none()
-            && self.completion_notify.is_none()
+            // `completion_notify` is deliberately NOT gated (#799): it is per-run executor
+            // wiring (the §12 completion-wake hook, installed on every root host at run start),
+            // not a capability — a root-domain personality `fork` must not fail on it. The twin
+            // starts unwired (`Host::new`), so its offloadable ops degrade to inline — the
+            // decline-never-diverge default every twin already had.
             && self.cap_record.is_none()
             && self.cap_replay.is_none()
             && self.cap_pages.is_none()
@@ -17863,13 +17986,16 @@ impl Host {
         core::mem::take(&mut self.stdin_parked)
     }
 
-    /// #799 — take the pending park request (`None` = none). Consume-everywhere discipline: every
-    /// dispatch-completion arm calls this, so a request made on a non-parkable route can never
-    /// leak into a later call's park decision (the `take_stdin_parked` precedent).
-    fn take_park_request(&self) -> Option<TaskId> {
+    /// #799 — take the pending caller request (`None` = none). Consume-everywhere discipline:
+    /// every dispatch-completion arm calls this, so a request made on a non-parkable route can
+    /// never leak into a later call's park decision (the `take_stdin_parked` precedent).
+    /// Cell encoding: `0` = none, [`u64::MAX`] = [`ParkEvent::ForkSelf`], else the
+    /// [`ParkEvent::TaskExit`] task id.
+    fn take_park_request(&self) -> Option<ParkEvent> {
         match self.park_request.swap(0, Ordering::SeqCst) {
             0 => None,
-            id => Some(id),
+            u64::MAX => Some(ParkEvent::ForkSelf),
+            id => Some(ParkEvent::TaskExit(id)),
         }
     }
 
@@ -22221,9 +22347,30 @@ impl Mem {
     /// region aliasing, no non-prefix page protections — the shape [`Host::fork_powerbox`] already
     /// restricts a forkable domain to); returns `None` otherwise, fail-closed.
     fn fork_private(&self) -> Option<Mem> {
-        if !self.snapshot_safe() {
+        // §13 region aliasing and externally-`Backed` pages cannot be duplicated blindly — fail
+        // closed, as ever. Plain page protections (an `Ro` stack-guard page, an `Unmapped` hole,
+        // an explicitly re-`Rw`'d page) *within the snapshotted prefix* are per-domain view
+        // state a POSIX fork preserves: cloned into the twin's own space below (#799 — the
+        // personality-only chibicc `_start` guards its data stack with one `Ro` page, so the
+        // original all-`Rw` restriction refused every personality-linked fork). An entry beyond
+        // the mapped prefix stays fail-closed: its bytes are outside `window_snapshot`.
+        let mapped_pages = self.window.mapped() / self.page;
+        let prot_copy: BTreeMap<u64, PageProt> = if self.has_regions.load(Ordering::Relaxed) {
             return None;
-        }
+        } else if !self.prot_dirty.load(Ordering::Acquire) {
+            BTreeMap::new() // never mutated ⇒ plain Rw throughout, nothing to clone
+        } else {
+            let space = self.space_read();
+            let ok = space.regions.is_empty()
+                && space
+                    .prot
+                    .iter()
+                    .all(|(&pg, p)| !matches!(p, PageProt::Backed { .. }) && pg < mapped_pages);
+            if !ok {
+                return None;
+            }
+            space.prot.clone()
+        };
         let reserved = self.window.reserved();
         let mapped = self.window.mapped();
         if reserved == 0 || !reserved.is_power_of_two() || !mapped.is_power_of_two() {
@@ -22234,6 +22381,9 @@ impl Mem {
             mapped.trailing_zeros() as u8,
         );
         twin.seed(&self.window_snapshot());
+        if !prot_copy.is_empty() {
+            twin.space_write().prot = prot_copy;
+        }
         Some(twin)
     }
 
