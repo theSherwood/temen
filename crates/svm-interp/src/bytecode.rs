@@ -10818,16 +10818,57 @@ impl CoopRun {
         m: &Module,
         entry: FuncIdx,
         args: &[Value],
+        fuel: u64,
+        host: Host,
+        tierup: Option<TierUpConfig>,
+    ) -> Option<Result<CoopRun, Trap>> {
+        // A fresh engine-sized window built from `m`'s declaration + data (the native/test path).
+        Self::assemble(m, entry, args, fuel, host, tierup, build_mem(m))
+    }
+
+    /// Like [`new`](Self::new), but the linear-memory window is built **over a caller-provided
+    /// backing** `back` (with `init_mem` seeded first), the resumable twin of
+    /// [`Vcpu::new_root_reserved_over_with_powerbox`]. This is the browser cdylib seam: the window
+    /// lives in the host's own linear memory, so every emitted `f{func}(win, env, …)` addresses it
+    /// directly through the one shared `env.memory`. `back` is dropped if `m` is unsupported.
+    #[allow(clippy::too_many_arguments)] // the window-backing seam inherently threads more inputs
+    pub fn new_over(
+        m: &Module,
+        entry: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        host: Host,
+        tierup: Option<TierUpConfig>,
+        init_mem: &[u8],
+        reserved_log2: u8,
+        back: std::sync::Arc<super::Region>,
+    ) -> Option<Result<CoopRun, Trap>> {
+        let mem = m.memory.map(|mc| {
+            let mut mm = Mem::with_reservation_over(reserved_log2, mc.size_log2, back);
+            mm.seed(init_mem);
+            mm.init_data(&m.data);
+            mm
+        });
+        Self::assemble(m, entry, args, fuel, host, tierup, mem)
+    }
+
+    /// Shared constructor tail: compile `m`, range-check `entry`, and build the `CoopSched` over the
+    /// caller-chosen `mem`. `None` if `m` is outside the bytecode engine's subset (fall back to the
+    /// tree-walker); `Some(Err)` if `entry` is out of range or seeding traps.
+    fn assemble(
+        m: &Module,
+        entry: FuncIdx,
+        args: &[Value],
         mut fuel: u64,
         mut host: Host,
         tierup: Option<TierUpConfig>,
+        mut mem: Option<Mem>,
     ) -> Option<Result<CoopRun, Trap>> {
         let c = compile_module_for(m)?;
         if entry as usize >= c.progs.len() {
             return Some(Err(Trap::Malformed));
         }
         let dom = Domain::new(c, host.jit_table_log2());
-        let mut mem = build_mem(m);
         let sched = match CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)
         {
             Ok(s) => s,
@@ -10840,6 +10881,17 @@ impl CoopRun {
             fuel,
             sched,
         }))
+    }
+
+    /// The run's window committed **scalar extent** right now — the #717 value the cdylib re-syncs to
+    /// every emitted instance's `"mapped"` global after a [`bounce`](Self::bounce) (a bounced callback
+    /// may have grown the window). `0` when there is no window or its state is not representable by one
+    /// bound. Reads the shared root window (a confined child's own-window growth is a later refinement).
+    pub fn window_scalar_extent(&self) -> u64 {
+        self.mem
+            .as_ref()
+            .and_then(|m| m.scalar_extent())
+            .unwrap_or(0)
     }
 
     /// Pump the schedule to its next pause: [`CoopEvent::Done`]/[`CoopEvent::Trapped`] end the run,
