@@ -3018,6 +3018,46 @@ pub const POWERBOX_HEAP_TOP: u64 = 40;
 /// live at/above this page — a read-only global never shares page 0 with the writable stash, and
 /// `_start`'s handle stores never fault on a read-only page (D40 page isolation).
 pub const POWERBOX_STACK_PAGE: u64 = POWERBOX_ARGS_END; // 16384
+
+/// **Trap-on-NULL** (#964): the byte extent of the reserved NULL region for a guard-marked powerbox
+/// module — `[0, POWERBOX_NULL_GUARD)` holds *nothing*, so a NULL dereference (any offset below the
+/// guard) traps like native platforms instead of silently touching low scratch. 16 KiB = the **max
+/// host page** (macOS), which keeps three enforcement mechanisms exactly aligned: the interpreter's
+/// host-granular page map, native `mprotect`, and the wasm tier's baked compare (a smaller guard
+/// diverges on 16 KiB-page hosts — proven by the #965 macOS CI catch). A marked module's writable
+/// low scratch (handle stash, heap words, format buffer, args blob) relocates to
+/// `[POWERBOX_NULL_GUARD, POWERBOX_NULL_GUARD + POWERBOX_ARGS_END)` — the legacy layout shifted up
+/// by exactly one guard — and its globals/stack base sits at or above `2 * POWERBOX_NULL_GUARD`.
+pub const POWERBOX_NULL_GUARD: u64 = 16384;
+
+/// The **guard marker**: a function export with this name (aliasing `_start`'s funcidx) declares
+/// that the module was built with the guarded layout — its low scratch lives above
+/// [`POWERBOX_NULL_GUARD`], so a host may seed `[0, POWERBOX_NULL_GUARD)` unmapped and must place
+/// the args blob at the shifted base. A module **without** the marker uses the legacy layout
+/// (scratch from 0, args at [`POWERBOX_ARGS_BASE`]) and is never guarded — old artifacts keep
+/// running unchanged. The marker is **semantics, not observability**: hosts resolve it, so it is
+/// never stripped/demoted (`svmb-strip` keeps it like `_start`).
+pub const NULL_GUARD_EXPORT: &str = "__null_guard";
+
+/// The NULL-guard extent of `m`, from its [`NULL_GUARD_EXPORT`] marker: `Some(POWERBOX_NULL_GUARD)`
+/// for a guard-marked module (seed `[0, guard)` unmapped; args at `guard + POWERBOX_ARGS_BASE`),
+/// `None` for a legacy module (no guard; args at [`POWERBOX_ARGS_BASE`]).
+pub fn module_null_guard(m: &Module) -> Option<u64> {
+    m.resolve_export(NULL_GUARD_EXPORT)
+        .map(|_| POWERBOX_NULL_GUARD)
+}
+
+/// Where a host seeds the args blob for `m` (and where its `_start` reads it): the guarded base for
+/// a [`NULL_GUARD_EXPORT`]-marked module, the legacy [`POWERBOX_ARGS_BASE`] otherwise.
+pub fn module_args_base(m: &Module) -> u64 {
+    module_null_guard(m).map_or(POWERBOX_ARGS_BASE, |g| g + POWERBOX_ARGS_BASE)
+}
+
+/// The exclusive end of `m`'s args region — the bound a host must reject a blob at (the guarded
+/// layout's region is the legacy one shifted up by the guard, same span).
+pub fn module_args_end(m: &Module) -> u64 {
+    module_null_guard(m).map_or(POWERBOX_ARGS_END, |g| g + POWERBOX_ARGS_END)
+}
 /// The alignment of the powerbox **data-stack base** ([`powerbox_entry_sp`]). It must be **≥ the
 /// largest host page any artifact may run on** — 64 KiB (the wasm linear-memory page) — because the
 /// D40 read-only const-segment protection is applied at *host-page* granularity: the runtime rounds a

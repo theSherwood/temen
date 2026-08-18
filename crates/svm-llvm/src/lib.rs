@@ -258,6 +258,15 @@ pub struct TranslateOptions {
     /// data stack (which would fault under D40). Must be a power of two `≥` [`svm_ir::POWERBOX_ARGS_END`].
     /// Defaults to [`DEFAULT_STACK_PAGE`] (native). See [`DEFAULT_STACK_PAGE`] for why.
     pub stack_page: u64,
+    /// **Trap-on-NULL layout** (#964): lay the powerbox low scratch (handle stash, heap words,
+    /// format buffer, args blob) out **one guard above zero** — shifted up by
+    /// [`svm_ir::POWERBOX_NULL_GUARD`] — and mark the module with the
+    /// [`svm_ir::NULL_GUARD_EXPORT`] function export, so a host may seed `[0, guard)` unmapped and
+    /// every NULL dereference traps like native platforms. `stack_page` is raised to at least
+    /// `guard + POWERBOX_ARGS_END` (32 KiB) so the globals base clears the shifted args region.
+    /// **Off by default** — the legacy layout is byte-identical to before this knob existed, and an
+    /// unmarked module is never guarded (old artifacts keep running unchanged).
+    pub null_guard: bool,
 }
 
 impl Default for TranslateOptions {
@@ -267,6 +276,7 @@ impl Default for TranslateOptions {
         Self {
             stub_unresolved_externs: false,
             stack_page: DEFAULT_STACK_PAGE,
+            null_guard: false,
         }
     }
 }
@@ -484,7 +494,17 @@ fn translate_impl(
     // The RO/writable page-isolation granularity is a per-target knob (native 16 KiB, wasm 64 KiB).
     // Fail closed on a nonsensical value: it must be a power of two and leave room for the §3e args
     // buffer below the globals base (`globals_base == stack_page` for a powerbox program).
-    let stack_page = opts.stack_page;
+    // #964 guarded layout: the low scratch shifts up by one NULL guard; `scratch` offsets every
+    // low-window address the synthesized code touches (0 = the legacy layout, byte-identical).
+    let scratch = if opts.null_guard {
+        svm_ir::POWERBOX_NULL_GUARD
+    } else {
+        0
+    };
+    // Under the guard the globals base must clear the *shifted* args region — raise a too-small
+    // (e.g. defaulted) stack_page to the guarded minimum rather than failing (the knob's documented
+    // behavior); an explicit larger value (the browser's 65536) is untouched.
+    let stack_page = opts.stack_page.max(scratch + svm_ir::POWERBOX_ARGS_END);
     if !stack_page.is_power_of_two() || stack_page < svm_ir::POWERBOX_ARGS_END {
         return Err(Error::Unsupported(format!(
             "stack_page {stack_page} must be a power of two >= {} (POWERBOX_ARGS_END)",
@@ -844,6 +864,7 @@ fn translate_impl(
             &tls_layout.off,
             tls_layout.block_size,
             tls_layout.template_base.unwrap_or(0),
+            scratch,
             &caps,
             &cstrs,
             &gbytes,
@@ -961,6 +982,7 @@ fn translate_impl(
             wants_envp,
             stack_page,
             tls_layout.root_base,
+            scratch,
         );
         funcs.insert(0, start);
     }
@@ -970,7 +992,7 @@ fn translate_impl(
         funcs.push(synth_memcpy());
     }
     if need_malloc {
-        funcs.push(synth_malloc(caps["vm_map"], stack_page));
+        funcs.push(synth_malloc(caps["vm_map"], stack_page, scratch));
     }
     if need_printf || need_snprintf {
         funcs.push(synth_utoa());
@@ -985,7 +1007,7 @@ fn translate_impl(
         ));
     }
     if need_getenv {
-        funcs.push(synth_getenv());
+        funcs.push(synth_getenv(scratch));
     }
     if need_dtoa {
         // The bignum float family, appended in `Helpers` order; the formatters are built against the
@@ -1190,6 +1212,19 @@ fn translate_impl(
                             func: 0,
                         },
                     );
+                    // #964 guarded layout: the `__null_guard` marker export (aliasing `_start`'s
+                    // funcidx) declares the shifted low scratch, so a host seeds `[0, guard)`
+                    // unmapped and places the args blob at the shifted base. Semantics, not
+                    // observability — hosts resolve it; `svmb-strip` never demotes it.
+                    if scratch > 0 {
+                        ex.insert(
+                            1,
+                            svm_ir::Export {
+                                name: svm_ir::NULL_GUARD_EXPORT.to_string(),
+                                func: 0,
+                            },
+                        );
+                    }
                 }
                 ex
             },
@@ -2565,6 +2600,7 @@ fn translate_func(
     tls_off: &HashMap<String, u64>,
     tls_block_size: u64,
     tls_template_base: u64,
+    scratch: u64,
     caps: &HashMap<String, u32>,
     cstrs: &HashMap<String, u64>,
     gbytes: &HashMap<String, Vec<u8>>,
@@ -2671,6 +2707,7 @@ fn translate_func(
             tls_off,
             tls_block_size,
             tls_template_base,
+            scratch,
             caps,
             cstrs,
             gbytes,
@@ -3670,7 +3707,8 @@ fn collect_global_ctors(m: &LModule, name2idx: &HashMap<String, u32>) -> Result<
 /// `main(void)`) and [`synth_start_argv`] (`main(int, char**)`): `(main_idx, main_results, entry_sp,
 /// n_handles, heap_base, ctors) -> Func`. A `type` alias so the dispatch can pick one by function
 /// pointer without tripping `clippy::type_complexity`.
-type StartBuilder = fn(u32, &[ValType], u64, Option<u64>, &[u32], bool, u64, Option<u64>) -> Func;
+type StartBuilder =
+    fn(u32, &[ValType], u64, Option<u64>, &[u32], bool, u64, Option<u64>, u64) -> Func;
 
 /// Synthesize the **powerbox entry** (`_start`, function 0) for a program that uses host
 /// capabilities — a **paramless** entry (IMPORTS.md phase 3): capabilities are manifest slots the
@@ -3692,6 +3730,8 @@ fn synth_start(
     // thread-locals. When present, `_start` sets `vcpu.tls` to it before ctors/`main` so every
     // thread-local access (`vcpu.tls.get() + off`) lands in the root's block.
     root_tls_base: Option<u64>,
+    // #964 guarded layout: every low-scratch address shifts up by this (0 = legacy).
+    scratch: u64,
 ) -> Func {
     use svm_ir::StoreOp;
     let mut insts: Vec<Inst> = Vec::new();
@@ -3702,7 +3742,7 @@ fn synth_start(
     // Initialize the heap: the bump pointer and the committed boundary both start at `heap_base` (the
     // window's mapped boundary — the first reserved page); the allocator `vm_map`-commits upward.
     if let Some(hb) = heap_base {
-        for off in [HEAP_BRK, HEAP_TOP] {
+        for off in [scratch + HEAP_BRK, scratch + HEAP_TOP] {
             insts.push(Inst::ConstI64(off as i64));
             let addr = next;
             next += 1;
@@ -3783,9 +3823,12 @@ fn synth_start_argv(
     // The root vCPU's TLS block base (NIM.md §3d Tier-2), set into `vcpu.tls` in block 0 before
     // ctors/`main`; `None` when the module has no thread-locals. See [`synth_start`].
     root_tls_base: Option<u64>,
+    // #964 guarded layout: every low-scratch address (heap words, the args blob) shifts up by this
+    // (0 = legacy).
+    scratch: u64,
 ) -> Func {
     use svm_ir::{LoadOp, StoreOp};
-    let args_base = svm_ir::POWERBOX_ARGS_BASE as i64;
+    let args_base = (scratch + svm_ir::POWERBOX_ARGS_BASE) as i64;
     let page = stack_page as i64;
     let add = |a: ValIdx, b: ValIdx| Inst::IntBin {
         ty: IntTy::I64,
@@ -3821,7 +3864,7 @@ fn synth_start_argv(
     let mut insts: Vec<Inst> = Vec::new();
     let mut next: ValIdx = 0;
     if let Some(hb) = heap_base {
-        for off in [HEAP_BRK, HEAP_TOP] {
+        for off in [scratch + HEAP_BRK, scratch + HEAP_TOP] {
             insts.push(Inst::ConstI64(off as i64));
             let addr = next;
             next += 1;
@@ -4189,7 +4232,7 @@ fn synth_start_argv(
 /// ```
 /// The header is written in `commit` (not `block0`) because on the first `malloc` `brk` is an
 /// *uncommitted* reserved page — only `grow` (or the prior commit) maps it.
-fn synth_malloc(vm_map_import: u32, stack_page: u64) -> Func {
+fn synth_malloc(vm_map_import: u32, stack_page: u64, scratch: u64) -> Func {
     use svm_ir::{LoadOp, StoreOp};
     let i64add = |a: ValIdx, b: ValIdx| Inst::IntBin {
         ty: IntTy::I64,
@@ -4222,17 +4265,17 @@ fn synth_malloc(vm_map_import: u32, stack_page: u64) -> Func {
     let b0 = Block {
         params: vec![ValType::I64], // size = v0
         insts: vec![
-            Inst::ConstI64(HEAP_BRK as i64), // v1
-            load_i64(1),                     // v2 = brk
-            Inst::ConstI64(16),              // v3
-            i64add(2, 3),                    // v4 = brk + 16
-            i64add(4, 0),                    // v5 = brk+16+size
-            Inst::ConstI64(15),              // v6
-            i64add(5, 6),                    // v7
-            Inst::ConstI64(!15i64),          // v8 = ~15
-            i64and(7, 8),                    // v9 = new (aligned)
-            Inst::ConstI64(HEAP_TOP as i64), // v10
-            load_i64(10),                    // v11 = top
+            Inst::ConstI64((scratch + HEAP_BRK) as i64), // v1
+            load_i64(1),                                 // v2 = brk
+            Inst::ConstI64(16),                          // v3
+            i64add(2, 3),                                // v4 = brk + 16
+            i64add(4, 0),                                // v5 = brk+16+size
+            Inst::ConstI64(15),                          // v6
+            i64add(5, 6),                                // v7
+            Inst::ConstI64(!15i64),                      // v8 = ~15
+            i64and(7, 8),                                // v9 = new (aligned)
+            Inst::ConstI64((scratch + HEAP_TOP) as i64), // v10
+            load_i64(10),                                // v11 = top
             Inst::IntCmp {
                 ty: IntTy::I64,
                 op: CmpOp::GtU,
@@ -4273,7 +4316,7 @@ fn synth_malloc(vm_map_import: u32, stack_page: u64) -> Func {
                 sig: import_sig("vm_map"),
                 args: vec![3, 10, 11],
             }, // v12 = map result (ignored)
-            Inst::ConstI64(HEAP_TOP as i64), // v13
+            Inst::ConstI64((scratch + HEAP_TOP) as i64), // v13
             store_i64(13, 7),            // *HEAP_TOP = limit
         ],
         term: Terminator::Br {
@@ -4287,11 +4330,11 @@ fn synth_malloc(vm_map_import: u32, stack_page: u64) -> Func {
     let c = Block {
         params: vec![ValType::I64, ValType::I64, ValType::I64], // brk, size, new
         insts: vec![
-            store_i64(0, 1),                 // *brk = size (header) — no value
-            Inst::ConstI64(HEAP_BRK as i64), // v3
-            store_i64(3, 2),                 // *HEAP_BRK = new — no value
-            Inst::ConstI64(16),              // v4
-            i64add(0, 4),                    // v5 = brk + 16 (data)
+            store_i64(0, 1),                             // *brk = size (header) — no value
+            Inst::ConstI64((scratch + HEAP_BRK) as i64), // v3
+            store_i64(3, 2),                             // *HEAP_BRK = new — no value
+            Inst::ConstI64(16),                          // v4
+            i64add(0, 4),                                // v5 = brk + 16 (data)
         ],
         term: Terminator::Return(vec![5]), // data
     };
@@ -7262,9 +7305,9 @@ fn synth_fmod() -> Func {
 /// seeded no env, since the window then reads `argc==envc==0`). Three phases: skip the `argc` argv
 /// strings to reach the env section, then for each of the `envc` env strings compare it against `name`
 /// char by char; a full `name` match landing on `=` yields the value pointer.
-fn synth_getenv() -> Func {
+fn synth_getenv(scratch: u64) -> Func {
     use svm_ir::LoadOp;
-    let args_base = svm_ir::POWERBOX_ARGS_BASE as i64;
+    let args_base = (scratch + svm_ir::POWERBOX_ARGS_BASE) as i64;
     let add = |a: ValIdx, b: ValIdx| Inst::IntBin {
         ty: IntTy::I64,
         op: BinOp::Add,
@@ -11665,7 +11708,7 @@ fn lower_vm_builtin(
             use svm_ir::StoreOp;
             let name = "blocking";
             for (k, &b) in name.as_bytes().iter().enumerate() {
-                let addr = ctx.const_i64(k as i64);
+                let addr = ctx.const_i64((ctx.scratch_base + k as u64) as i64);
                 let val = ctx.push(Inst::ConstI32(b as i32));
                 ctx.push_effect(Inst::Store {
                     op: StoreOp::I32_8,
@@ -11675,7 +11718,7 @@ fn lower_vm_builtin(
                     align: 0,
                 });
             }
-            let name_ptr = ctx.const_i64(0);
+            let name_ptr = ctx.const_i64(ctx.scratch_base as i64);
             let name_len = ctx.const_i64(name.len() as i64);
             let r = ctx.push(Inst::CapSelfResolve { name_ptr, name_len });
             ctx.bind_dest(&c.dest, r);
@@ -12611,7 +12654,7 @@ fn lower_format(
                 if width > 0 {
                     let space = ctx.push(Inst::ConstI32(b' ' as i32));
                     for k in 0..width as u64 {
-                        let a = ctx.const_i64((FMT_BUF + k) as i64);
+                        let a = ctx.const_i64((ctx.scratch_base + FMT_BUF + k) as i64);
                         ctx.push_effect(Inst::Store {
                             op: svm_ir::StoreOp::I32_8,
                             addr: a,
@@ -12639,7 +12682,7 @@ fn lower_format(
                         a: diff,
                         b: zero,
                     });
-                    let padbuf = ctx.const_i64(FMT_BUF as i64);
+                    let padbuf = ctx.const_i64((ctx.scratch_base + FMT_BUF) as i64);
                     ctx.emit_write(padbuf, padlen)?;
                 }
                 ctx.emit_write(ptr, len)?;
@@ -12887,7 +12930,7 @@ fn pf_prefill_pad(ctx: &mut BlockCtx, width: u32, flags: FmtFlags) {
     let pad_char = if flags.zero { b'0' } else { b' ' };
     let padch = ctx.push(Inst::ConstI32(pad_char as i32));
     for k in 0..width as u64 {
-        let a = ctx.const_i64((FMT_BUF + k) as i64);
+        let a = ctx.const_i64((ctx.scratch_base + FMT_BUF + k) as i64);
         pf_store8(ctx, a, padch);
     }
 }
@@ -12933,7 +12976,7 @@ fn pf_field_layout(
     width: u32,
     flags: FmtFlags,
 ) -> Result<(), Error> {
-    let bufend = ctx.const_i64(FMT_BUF_END as i64);
+    let bufend = ctx.const_i64((ctx.scratch_base + FMT_BUF_END) as i64);
     let contentlen = pf_sub(ctx, bufend, content_start);
     if width == 0 {
         ctx.emit_write(content_start, contentlen)?;
@@ -12953,7 +12996,7 @@ fn pf_field_layout(
         a: diff,
         b: zero,
     });
-    let padbuf = ctx.const_i64(FMT_BUF as i64);
+    let padbuf = ctx.const_i64((ctx.scratch_base + FMT_BUF) as i64);
     if flags.left {
         // Left-justify: content, then trailing spaces.
         ctx.emit_write(content_start, contentlen)?;
@@ -13004,7 +13047,7 @@ fn emit_printf_int_field(
     };
     pf_prefill_pad(ctx, width, layout_flags);
 
-    let bufend_off = FMT_BUF_END;
+    let bufend_off = ctx.scratch_base + FMT_BUF_END;
     // Zero-extension to `prec` digits: pre-fill `[bufend-prec, bufend)` with `'0'` *before* `utoa`,
     // which overwrites the rightmost `ndigits` with the real digits — leaving `max(prec, ndigits)`.
     if let Some(p) = prec {
@@ -15462,6 +15505,9 @@ struct BlockCtx<'a> {
     /// thread trampoline can allocate a spawned thread's block. 0 when there are no thread-locals.
     tls_block_size: u64,
     tls_template_base: u64,
+    /// #964 guarded layout: every low-scratch address the lowering emits (format buffer, stash
+    /// byte, blocking-resolve name staging) shifts up by this (0 = the legacy layout).
+    scratch_base: u64,
     /// Import name (`write`/`read`/`exit`) → its §7 import index (for lowering a libc call to
     /// `CallImport`); several libc names can share one import (e.g. `puts`/`fwrite` → `write`).
     caps: &'a HashMap<String, u32>,
@@ -15775,7 +15821,7 @@ impl<'a> BlockCtx<'a> {
     /// Store a single byte `value` (`i32`-typed) into the 1-byte stash scratch and return its window
     /// address — the staging point a `Stream.write(scratch, 1)` then sends (for `putc`/the newline).
     fn scratch_byte(&mut self, value: ValIdx) -> ValIdx {
-        let addr = self.const_i64(STASH_SCRATCH as i64);
+        let addr = self.const_i64((self.scratch_base + STASH_SCRATCH) as i64);
         self.push_effect(Inst::Store {
             op: svm_ir::StoreOp::I32_8,
             addr,
@@ -16336,6 +16382,7 @@ fn translate_block(
     tls_off: &HashMap<String, u64>,
     tls_block_size: u64,
     tls_template_base: u64,
+    scratch: u64,
     caps: &HashMap<String, u32>,
     cstrs: &HashMap<String, u64>,
     gbytes: &HashMap<String, Vec<u8>>,
@@ -16384,6 +16431,7 @@ fn translate_block(
         tls_off,
         tls_block_size,
         tls_template_base,
+        scratch_base: scratch,
         caps,
         cstrs,
         gbytes,

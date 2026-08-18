@@ -3029,9 +3029,10 @@ fn pg_setup(
     let fsh = host.grant_host_proc(fs_hostfn);
     host.register_cap_name("fs", fsh);
     // Seed the caller's `argv` at the powerbox args base (Postgres: a slashed `argv[0]` so
-    // `find_my_exec` resolves; chibicc: `["chibicc", "/in.c"]`).
+    // `find_my_exec` resolves; chibicc: `["chibicc", "/in.c"]`). #964: a `__null_guard`-marked
+    // module reads its args one guard higher — place the blob where its `_start` looks.
     let blob = pg_args_blob(argv);
-    let base = svm_ir::POWERBOX_ARGS_BASE as usize;
+    let base = svm_ir::module_args_base(m) as usize;
     let mut init_mem = vec![0u8; base + blob.len()];
     init_mem[base..].copy_from_slice(&blob);
     Ok((host, init_mem, fs_handle))
