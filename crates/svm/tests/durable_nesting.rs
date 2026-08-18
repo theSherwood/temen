@@ -33,7 +33,7 @@ use svm_verify::verify_module;
 
 const SIZE_LOG2: u8 = 18;
 const WINDOW: usize = 1 << SIZE_LOG2;
-const EINVAL: i64 = -22;
+use svm_ir::errno::EINVAL;
 
 fn instrument(src: &str) -> Module {
     let m = parse_module(src).expect("parse");

@@ -22,6 +22,7 @@ use svm_interp::{
 // `WinShmBacking`) the JIT aliases into the window for §13.
 #[cfg(any(unix, windows))]
 use svm_interp::SharedBacking;
+use svm_ir::errno::{EAGAIN, EFAULT, EINVAL, ENOSPC};
 use svm_ir::{FuncIdx, FuncType, Module, Resolved, ValType};
 
 // Re-export the value type + the §15 spawn quota so embedders (and the CLI) need not also depend on
@@ -501,7 +502,6 @@ pub unsafe extern "C" fn cap_thunk_locked(
     // blocked on A's lock). Refuse probeably (`-EINVAL`, the pre-5c.1 answer) — the child-caller
     // tier is a recorded 5c residue; the root caller (unlocked thunk) covers the transport.
     if guard.live_impl_of(handle, type_id).is_some() {
-        const EINVAL: i64 = -22;
         if n_results != 0 {
             *results = EINVAL;
         }
@@ -660,7 +660,6 @@ unsafe fn serve_native(
     n_results: u64,
     trap_out: *mut i64,
 ) {
-    const EINVAL: i64 = -22;
     let put = |v: i64, trap_out: *mut i64| {
         if n_results != 0 {
             *results = v;
@@ -745,8 +744,6 @@ unsafe fn jit_native_op(
     mem_base: *mut u8,
 ) {
     // Negative-errno results (§3e D42), matching `svm-interp`'s private consts.
-    const EINVAL: i64 = -22;
-    const EFAULT: i64 = -14;
     // One errno/handle result slot + a clean trap cell — the compile/release result shape.
     let put = |results: *mut i64, n_results: u64, v: i64, trap_out: *mut i64| {
         if n_results != 0 {
@@ -882,7 +879,6 @@ unsafe fn jit_native_op(
             // install(code_handle) -> slot_index | -errno (DESIGN.md §22): write the unit's
             // natural entry + interned type_id into the live fn_table's next padding slot. The
             // slot index agrees with the interpreter's (both fill from the parent's funcs count).
-            const ENOSPC: i64 = -28;
             let Ok(domain) = host.resolve_jit_domain(handle) else {
                 return cap_fault(trap_out);
             };
@@ -1008,7 +1004,6 @@ pub fn jit_blob_validator(
     mem_log2: Option<u8>,
     symtab: &[u8],
 ) -> Result<Arc<[svm_ir::Func]>, i64> {
-    const EINVAL: i64 = -22;
     // Decode the guest's symbol table (empty for the closed `compile` op — every prior caller —
     // which then resolves nothing, so a unit with imports fails closed). A malformed table is
     // fail-closed, before any IR is touched.
@@ -1027,7 +1022,6 @@ pub fn jit_blob_validator_durable(
     mem_log2: Option<u8>,
     symtab: &[u8],
 ) -> Result<Arc<[svm_ir::Func]>, i64> {
-    const EINVAL: i64 = -22;
     let Some(table) = decode_symbol_table(symtab) else {
         return Err(EINVAL);
     };
@@ -1167,7 +1161,6 @@ fn jit_resolve_and_validate_impl(
     resolve: impl FnMut(&str) -> Option<Resolved>,
     durable: bool,
 ) -> Result<Arc<[svm_ir::Func]>, i64> {
-    const EINVAL: i64 = -22;
     let Ok(m) = svm_encode::decode_module(bytes) else {
         return Err(EINVAL);
     };
@@ -2051,7 +2044,6 @@ unsafe fn serve_locked_child(
     n_results: u64,
     trap_out: *mut i64,
 ) {
-    const EINVAL: i64 = -22;
     let put = |v: i64, trap_out: *mut i64| {
         if n_results != 0 {
             *results = v;
@@ -2193,8 +2185,6 @@ unsafe fn live_impl_call(
     args: &[i64],
     trap_out: *mut i64,
 ) -> Option<i64> {
-    const EAGAIN: i64 = -11;
-    const EINVAL: i64 = -22;
     const CAP_REVOKED: i64 = -9;
     let (callee, export) = (*host_ptr).live_impl_of(handle, type_id)?;
     let fast = (*host_ptr).handoff();
@@ -2606,7 +2596,6 @@ impl MprotectWindow {
     /// `-EINVAL` (page-aligned offset, non-zero len, within `[0, reserved)`) — matching the
     /// interpreter's `prot_pages` (growth into the reserved tail is allowed).
     fn prot_pages(&self, offset: u64, len: u64) -> Result<std::ops::RangeInclusive<u64>, i64> {
-        const EINVAL: i64 = -22;
         if len == 0 || !offset.is_multiple_of(self.page) {
             return Err(EINVAL);
         }
@@ -2839,7 +2828,6 @@ impl GuestMem for MprotectWindow {
         _region: u32,
         backing: RegionBacking,
     ) -> i64 {
-        const EINVAL: i64 = -22;
         #[cfg(unix)]
         {
             const PROT_READ: i32 = 1;

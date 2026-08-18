@@ -28,8 +28,8 @@ use svm_ir::{Data, Func, FuncIdx, ValType};
 /// absent — it is a runtime arg, so one entry serves every offset.
 type ChildCodeKey = (usize, usize, u32, u8);
 
-/// Negative-errno an out-of-range carve returns (matches the interpreter's `EINVAL`, §3e D42).
-const EINVAL: i64 = -22;
+/// Negative-errno an out-of-range carve returns (§3e D42) — the one shared table.
+use svm_ir::errno::EINVAL;
 
 /// One spawned child's **completion cell** (S1c): `(result, trap)` once the child has finished (`trap`
 /// `0` = clean), or `None` while it is still running. An async child's OS thread fills it from the

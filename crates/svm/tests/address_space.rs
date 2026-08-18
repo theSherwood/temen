@@ -12,7 +12,7 @@ use svm_jit::{compile_and_run_capture_reserved_with_host, JitOutcome};
 use svm_text::parse_module;
 use svm_verify::verify_module;
 
-const EINVAL: i64 = -22;
+use svm_ir::errno::EINVAL;
 
 /// Parse+verify `src`, grant **both** an interp `Host` and a JIT `Host` an identical root
 /// `AddressSpace` over the whole window `[0, 1<<size_log2)`, run the entry (the granted handle is
@@ -199,7 +199,7 @@ fn sub_rejects_ranges_outside_the_holder() {
 /// errno, not a crash.
 #[test]
 fn minting_past_table_capacity_returns_emfile_not_panic() {
-    const EMFILE: i64 = -24;
+    use svm_ir::errno::EMFILE;
     let src = "\
 memory 17
 func (i32) -> (i64) {

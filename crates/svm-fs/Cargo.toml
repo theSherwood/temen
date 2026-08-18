@@ -12,4 +12,5 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+svm-ir.workspace = true
 svm-interp.workspace = true

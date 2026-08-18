@@ -182,6 +182,67 @@ pub mod cap_id {
     pub const GUEST_IMPL_BASE: u32 = 0x1000_0000;
 }
 
+/// Guest-facing **errno values** — the negative `-errno` a fallible capability op returns on its
+/// own error path (INVARIANTS #5: "errors are values"). **One definition** here, in the wire-IR
+/// crate every host crate already depends on, so the values and their **sign** cannot drift between
+/// the servicers (svm-fs, svm-exec, svm-posix), the runtime (svm-interp), the embedder (svm-run),
+/// and the JIT thunks (svm-jit). The convention is **negative**: this is what crosses the ABI, since
+/// the runtime sign-tests a result as `handle | -errno` (a negative i64 is an error, a non-negative
+/// one a value — the invariant-11 packing). Standard Linux numeric values, negated. Moved here from
+/// the six crates that each defined their own copy, 2026-08-18 (#905). The guest-side mirrors in
+/// `svm-llvm/rust-svm/*-imp.rs` are a separate compilation universe (guest code cannot link this
+/// crate) and keep their own copies, citing this module as the authority.
+pub mod errno {
+    /// Operation not permitted.
+    pub const EPERM: i64 = -1;
+    /// No such file or directory.
+    pub const ENOENT: i64 = -2;
+    /// No such process (a pid the table does not know).
+    pub const ESRCH: i64 = -3;
+    /// Interrupted by a delivered signal (#796 — a blocking op woken by a signal).
+    pub const EINTR: i64 = -4;
+    /// Bad file descriptor / handle.
+    pub const EBADF: i64 = -9;
+    /// No child processes (`wait`/`reap` for a pid that is not a live child).
+    pub const ECHILD: i64 = -10;
+    /// Try again — would block a cooperative guest (empty socket/pipe read, etc.).
+    pub const EAGAIN: i64 = -11;
+    /// Out of memory — a resource quota was exhausted (e.g. the JIT compile budget).
+    pub const ENOMEM: i64 = -12;
+    /// Permission denied.
+    pub const EACCES: i64 = -13;
+    /// Bad address — a buffer not fully within the guest window.
+    pub const EFAULT: i64 = -14;
+    /// File exists (`mkdir`/`rename` onto an existing path).
+    pub const EEXIST: i64 = -17;
+    /// Not a directory (`opendir`/dir op on a regular file).
+    pub const ENOTDIR: i64 = -20;
+    /// Invalid argument.
+    pub const EINVAL: i64 = -22;
+    /// Too many open files — the handle table is full (§3c).
+    pub const EMFILE: i64 = -24;
+    /// Inappropriate ioctl for device — a `tc*` op on a non-terminal fd (#798).
+    pub const ENOTTY: i64 = -25;
+    /// No space left — no free table slot (e.g. the JIT install table is full).
+    pub const ENOSPC: i64 = -28;
+    /// Illegal seek (`lseek` on a pipe/stdio fd).
+    pub const ESPIPE: i64 = -29;
+    /// Broken pipe — write to a pipe whose read end is fully closed (FORK.md §8.6).
+    pub const EPIPE: i64 = -32;
+    /// Result too large for the caller's buffer (`getcwd`).
+    pub const ERANGE: i64 = -34;
+    /// Function not implemented — no embedder-wired delegate (fail closed).
+    pub const ENOSYS: i64 = -38;
+    /// Directory not empty (`rmdir` on a non-empty directory).
+    pub const ENOTEMPTY: i64 = -39;
+    /// Socket operation on a non-socket fd.
+    pub const ENOTSOCK: i64 = -88;
+    /// Address already in use (loopback port another listener holds).
+    pub const EADDRINUSE: i64 = -98;
+    /// Connection refused (no listener, or no delegate beyond loopback).
+    pub const ECONNREFUSED: i64 = -111;
+}
+
 /// SSA value types. `i8`/`i16` are memory access *widths*, not value types (§3a).
 /// `v128` is the fixed-128 SIMD vector (§17/D58): a first-class value carrying 16
 /// raw bytes whose lane interpretation is per-op, never per-value.

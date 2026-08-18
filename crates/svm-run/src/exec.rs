@@ -12,6 +12,7 @@
 //! backends apart by how they refuse (interposition invisibility, per EXEC.md).
 
 pub use svm_exec::*;
+use svm_ir::errno::*; // the one shared negative-errno table (#905)
 
 use crate::{Backend, HostCap, Instance, Limits, Outcome, RunConfig};
 use std::io::Write;
@@ -117,7 +118,7 @@ fn domain_dispatch(
         Err(e) => return e,
     };
     let Some(p) = programs.iter().find(|p| p.name == argv[0]) else {
-        return -EPERM; // outside the registry: refused, not a trap
+        return EPERM; // outside the registry: refused, not a trap
     };
     let config = RunConfig {
         limits: p.limits.clone(),
@@ -154,7 +155,7 @@ fn domain_dispatch(
                 exit,
             })
         }
-        Err(_) => -EINVAL, // the child trapped / ran out of fuel: a failed run, probeable
+        Err(_) => EINVAL, // the child trapped / ran out of fuel: a failed run, probeable
     }
 }
 
@@ -188,7 +189,7 @@ fn host_dispatch(
         Err(e) => return e,
     };
     if !allow.is_empty() && !allow.iter().any(|a| a == &argv[0]) {
-        return -EPERM; // outside the allowlist: refused, not a trap
+        return EPERM; // outside the allowlist: refused, not a trap
     }
     match spawn_blocking(&argv, &stdin) {
         Ok(job) => jobs.push(job),
@@ -205,7 +206,7 @@ fn spawn_blocking(argv: &[String], stdin: &[u8]) -> Result<Job, i64> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|_| -ENOENT)?;
+        .map_err(|_| ENOENT)?;
     // Feed stdin and close it so the child sees EOF. v1 payloads are one-shot and bounded by
     // the guest window, so a straight write before reaping is fine (a child that blocks writing
     // output before draining stdin could wedge only if the payload exceeds the OS pipe buffer —
@@ -213,7 +214,7 @@ fn spawn_blocking(argv: &[String], stdin: &[u8]) -> Result<Job, i64> {
     if let Some(mut si) = child.stdin.take() {
         let _ = si.write_all(stdin);
     }
-    let out = child.wait_with_output().map_err(|_| -EINVAL)?;
+    let out = child.wait_with_output().map_err(|_| EINVAL)?;
     let exit = {
         #[cfg(unix)]
         {
@@ -221,12 +222,12 @@ fn spawn_blocking(argv: &[String], stdin: &[u8]) -> Result<Job, i64> {
             match (out.status.code(), out.status.signal()) {
                 (Some(c), _) => (c & 0xff) as i64,
                 (None, Some(sig)) => 128 + sig as i64,
-                (None, None) => -EINVAL,
+                (None, None) => EINVAL,
             }
         }
         #[cfg(not(unix))]
         {
-            out.status.code().map_or(-EINVAL, |c| c as i64)
+            out.status.code().map_or(EINVAL, |c| c as i64)
         }
     };
     Ok(Job {
