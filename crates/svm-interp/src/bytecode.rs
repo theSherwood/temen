@@ -1920,6 +1920,7 @@ fn build_mem(m: &Module) -> Option<Mem> {
     m.memory.map(|mc| {
         let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
         mm.init_data(&m.data);
+        mm.seed_null_guard(svm_ir::module_null_guard(m).unwrap_or(0)); // #964
         mm
     })
 }
@@ -2101,6 +2102,7 @@ pub fn compile_and_run_capture(
         let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
         mm.seed(init_mem);
         mm.init_data(&m.data);
+        mm.seed_null_guard(svm_ir::module_null_guard(m).unwrap_or(0)); // #964
         mm
     });
     let r = run(dom, func, args, fuel, &mut mem, &mut host);
@@ -2142,6 +2144,7 @@ pub fn compile_and_run_capture_over(
         );
         mm.seed(init_mem);
         mm.init_data(&m.data);
+        mm.seed_null_guard(svm_ir::module_null_guard(m).unwrap_or(0)); // #964
         mm
     });
     let r = run(dom, func, args, fuel, &mut mem, &mut host);
@@ -2181,6 +2184,7 @@ pub fn compile_and_run_over_shared_with_host(
         let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, mc.size_log2, back);
         if seed_data {
             mm.init_data(&m.data);
+            mm.seed_null_guard(svm_ir::module_null_guard(m).unwrap_or(0)); // #964
         }
         mm
     });
@@ -2198,6 +2202,8 @@ pub struct SharedProgram {
     n_funcs: usize,
     mem_size_log2: Option<u8>,
     data: Vec<super::Data>,
+    /// #964: the module's NULL-guard extent (`0` = unmarked/legacy).
+    null_guard: u64,
 }
 
 impl SharedProgram {
@@ -2210,6 +2216,7 @@ impl SharedProgram {
             n_funcs,
             mem_size_log2: m.memory.map(|mc| mc.size_log2),
             data: m.data.clone(),
+            null_guard: svm_ir::module_null_guard(m).unwrap_or(0),
         })
     }
 
@@ -2273,6 +2280,7 @@ impl SharedProgram {
             if seed_data {
                 mm.init_data(&self.data);
             }
+            mm.seed_null_guard(self.null_guard); // #964
             if let Some(entries) = prots {
                 mm.seed_pages(entries);
             }
@@ -2353,6 +2361,7 @@ pub fn compile_and_run_capture_over_parallel_with_host(
         );
         mm.seed(init_mem);
         mm.init_data(&m.data);
+        mm.seed_null_guard(svm_ir::module_null_guard(m).unwrap_or(0)); // #964
         mm
     });
     let (r, mem) = drive_parallel(dom, func, args, *fuel, mem, host);
@@ -2380,6 +2389,9 @@ pub struct VcpuProgram {
     dom: Domain,
     mem_size_log2: Option<u8>,
     data: Vec<svm_ir::Data>,
+    /// #964: the module's NULL-guard extent (`0` = unmarked/legacy), captured at compile so every
+    /// window this program is run over seeds the same guard the module's layout was built for.
+    null_guard: u64,
 }
 
 impl VcpuProgram {
@@ -2403,6 +2415,7 @@ impl VcpuProgram {
             dom,
             mem_size_log2: m.memory.as_ref().map(|mc| mc.size_log2),
             data: m.data.clone(),
+            null_guard: svm_ir::module_null_guard(m).unwrap_or(0),
         })
     }
 
@@ -2805,6 +2818,7 @@ impl<'p> Vcpu<'p> {
             let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back);
             mm.seed(init_mem);
             mm.init_data(&prog.data);
+            mm.seed_null_guard(prog.null_guard); // #964
             mm
         });
         Vcpu::with_mem(prog, func, args, mem, Host::new())
@@ -2829,6 +2843,7 @@ impl<'p> Vcpu<'p> {
             let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back);
             mm.seed(init_mem);
             mm.init_data(&prog.data);
+            mm.seed_null_guard(prog.null_guard); // #964
             mm
         });
         Vcpu::with_mem(prog, func, args, mem, host)
@@ -2853,6 +2868,7 @@ impl<'p> Vcpu<'p> {
             let mut mm = Mem::with_reservation(reserved_log2, sl);
             mm.seed(init_mem);
             mm.init_data(&prog.data);
+            mm.seed_null_guard(prog.null_guard); // #964
             mm
         });
         Vcpu::with_mem(prog, func, args, mem, host)
@@ -2877,6 +2893,7 @@ impl<'p> Vcpu<'p> {
             let mut mm = Mem::with_reservation_over(reserved_log2, sl, back);
             mm.seed(init_mem);
             mm.init_data(&prog.data);
+            mm.seed_null_guard(prog.null_guard); // #964
             mm
         });
         Vcpu::with_mem(prog, func, args, mem, host)
@@ -3919,6 +3936,7 @@ pub fn compile_and_run_capture_reserved_with_host(
         let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
         mm.seed(init_mem);
         mm.init_data(&m.data);
+        mm.seed_null_guard(svm_ir::module_null_guard(m).unwrap_or(0)); // #964
         mm
     });
     let r = run(dom, func, args, fuel, &mut mem, host);
@@ -10996,6 +11014,7 @@ impl CoopRun {
             let mut mm = Mem::with_reservation_over(reserved_log2, mc.size_log2, back);
             mm.seed(init_mem);
             mm.init_data(&m.data);
+            mm.seed_null_guard(svm_ir::module_null_guard(m).unwrap_or(0)); // #964
             mm
         });
         Self::assemble(m, entry, args, fuel, host, tierup, mem)

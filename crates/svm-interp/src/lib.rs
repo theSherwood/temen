@@ -916,6 +916,8 @@ impl Inspector {
         let mem = memory.map(|mc| {
             let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
             mm.init_data(data);
+            // No NULL-guard seeding (#964): this harness gets bare funcs/data, never the module,
+            // so the `__null_guard` marker is out of reach — debugger attaches run unguarded.
             mm
         });
         let quota = Quota::default();
@@ -1054,6 +1056,8 @@ impl Inspector {
         let mem = memory.map(|mc| {
             let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
             mm.init_data(data);
+            // No NULL-guard seeding (#964): bare funcs/data, no module marker in reach (see
+            // `fresh_single_root`).
             mm
         });
         let det = Arc::new(DetSched::new(0, MAX_VCPUS));
@@ -1803,6 +1807,7 @@ pub fn run_with_host_traced(
     let mut mem = m.memory.map(|mc| {
         let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
         mm.init_data(&m.data); // §3a/D40 data segments (copy + RO-protect)
+        mm.seed_null_guard(svm_ir::module_null_guard(m).unwrap_or(0)); // #964
         mm
     });
     drive(&m.funcs, func, args, fuel, &mut mem, host)
@@ -2703,6 +2708,7 @@ pub fn run_capture_reserved(
         let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
         mm.seed(init_mem);
         mm.init_data(&m.data); // §3a/D40 data segments (after the escape-oracle seed)
+        mm.seed_null_guard(svm_ir::module_null_guard(m).unwrap_or(0)); // #964
         mm
     });
     let (r, ..) = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
@@ -2740,6 +2746,7 @@ pub fn run_capture_reserved_with_host(
         let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
         mm.seed(init_mem);
         mm.init_data(&m.data);
+        mm.seed_null_guard(svm_ir::module_null_guard(m).unwrap_or(0)); // #964
         mm
     });
     let (r, ..) = drive(&m.funcs, func, args, fuel, &mut mem, host);
@@ -2799,6 +2806,7 @@ pub fn run_capture_reserved_with_host_prots(
         let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
         mm.seed(init_mem);
         mm.init_data(&m.data);
+        mm.seed_null_guard(svm_ir::module_null_guard(m).unwrap_or(0)); // #964
         if let Some(prots) = init_prots {
             mm.apply_prots(prots);
         }
@@ -2837,6 +2845,7 @@ pub fn run_capture_sub(
         let mut mm = Mem::sub_window(base, mc.size_log2, parent_bytes);
         mm.seed_parent(init_mem); // seed the whole parent, not just the child slice
         mm.init_data_at(&m.data, base); // child-relative segments shifted into the slice
+        mm.seed_null_guard(svm_ir::module_null_guard(m).unwrap_or(0)); // #964
         mm
     });
     let (r, ..) = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
@@ -2867,6 +2876,7 @@ pub fn run_scheduled(
     let mem = m.memory.map(|mc| {
         let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
         mm.init_data(&m.data);
+        mm.seed_null_guard(svm_ir::module_null_guard(m).unwrap_or(0)); // #964
         mm
     });
     let det = Arc::new(DetSched::new(seed, MAX_VCPUS));
@@ -3639,6 +3649,8 @@ fn run_one_schedule(
     let mem = memory.map(|mc| {
         let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
         mm.init_data(data);
+        // No NULL-guard seeding (#964): bare funcs/data, no module marker in reach (see
+        // `fresh_single_root`).
         mm
     });
     let det = Arc::new(DetSched::new(0, MAX_VCPUS)); // seed unused under the exhaustive policy
@@ -11279,6 +11291,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let mut fm =
                                     Mem::with_reservation(DEFAULT_RESERVED_LOG2, size_log2 as u8);
                                 fm.init_data(&cm.data);
+                                fm.seed_null_guard(
+                                    svm_ir::module_null_guard(&cm.module).unwrap_or(0),
+                                ); // #964
                                 let mut ch = Host::new();
                                 ch.set_attestation({
                                     let hg = host.lock().unwrap_or_else(|e| e.into_inner());
@@ -19182,6 +19197,7 @@ impl Host {
         let mem = m.memory.map(|mc| {
             let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
             mm.init_data(&m.data);
+            mm.seed_null_guard(svm_ir::module_null_guard(m).unwrap_or(0)); // #964
             mm
         });
         let type_id = self.intern_interface(&sigs);
@@ -19656,6 +19672,7 @@ impl Host {
                 let mem = m.memory.map(|mc| {
                     let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
                     mm.init_data(&m.data);
+                    mm.seed_null_guard(svm_ir::module_null_guard(&m).unwrap_or(0)); // #964
                     mm
                 });
                 Arc::new(Mutex::new(ProviderState {
@@ -22169,6 +22186,12 @@ struct Mem {
     /// Host page size (`host_page_size()`): protection + storage-chunk granularity. Cached per
     /// `Mem` so every method shares the one host-queried value (matches the JIT's `mprotect`).
     page: u64,
+    /// #964 trap-on-NULL: the reserved NULL extent — `[0, null_guard)` is seeded `Unmapped` for a
+    /// `__null_guard`-marked module ([`Mem::seed_null_guard`]) and **permanently refused** to the
+    /// page ops (`prot_pages` returns `EINVAL` below it, the `mmap_min_addr` analogue — what keeps
+    /// the tiers' baked guard constant sound). `0` = unguarded (every legacy module). A guard fault
+    /// is **fatal**, never a §14 recoverable page fault (a demand parent could not legally map it).
+    null_guard: u64,
     /// The anonymous-page backing: a [`svm_mem::Region`] (`#![forbid(unsafe_code)]`-friendly) sized
     /// to the window's reserved extent. On unix this is one demand-zeroed `mmap` — the shareable
     /// substrate parallel vCPUs run over with real hardware atomics (§12); elsewhere a paged
@@ -22247,6 +22270,7 @@ impl Mem {
             prot_dirty: Arc::new(AtomicBool::new(false)),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
+            null_guard: 0,
         }
     }
 
@@ -22270,6 +22294,7 @@ impl Mem {
             prot_dirty: Arc::new(AtomicBool::new(false)),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
+            null_guard: 0,
         }
     }
 
@@ -22294,6 +22319,7 @@ impl Mem {
             prot_dirty: Arc::new(AtomicBool::new(false)),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
+            null_guard: 0,
         }
     }
 
@@ -22325,6 +22351,7 @@ impl Mem {
             prot_dirty: Arc::clone(&self.prot_dirty),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
+            null_guard: self.null_guard,
         }
     }
 
@@ -22374,6 +22401,9 @@ impl Mem {
         if !prot_copy.is_empty() {
             twin.space_write().prot = prot_copy;
         }
+        // #964: the twin runs the same module — its NULL guard (already in `prot_copy` as pages,
+        // and enforced by `prot_pages`' refusal via this field) carries over.
+        twin.null_guard = self.null_guard;
         Some(twin)
     }
 
@@ -22399,6 +22429,7 @@ impl Mem {
             prot_dirty: Arc::new(AtomicBool::new(false)),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
+            null_guard: 0,
         }
     }
 
@@ -22439,6 +22470,11 @@ impl Mem {
             match self.page_access(&space.prot, page) {
                 // A **recoverable** in-window page fault: record the confined address so a §14
                 // coroutine child can suspend to its parent (fault-driven yield) instead of trapping.
+                None if page * self.page < self.null_guard => {
+                    // #964: a NULL dereference — fatal, never a recoverable §14 page fault (a
+                    // demand parent could not legally map the reserved region anyway).
+                    return Err(Trap::MemoryFault);
+                }
                 None => return Err(self.page_fault(base)), // unmapped
                 Some(false) if write => return Err(self.page_fault(base)), // read-only store
                 _ => {}
@@ -22471,6 +22507,9 @@ impl Mem {
             match prot {
                 PageProt::Rw if start < high => {} // set-neutral re-commit inside [0, high)
                 PageProt::Rw if start == high => high = high.saturating_add(self.page),
+                // #964: the canonical NULL-guard prefix — set-neutral, because a marked module's
+                // emitted tier carries its own baked guard check for exactly this range.
+                PageProt::Unmapped if start < self.null_guard => {}
                 _ => return None, // Ro/Unmapped/Backed anywhere, or Rw beyond a hole
             }
         }
@@ -22506,6 +22545,26 @@ impl Mem {
                 _ => PageProt::Unmapped,
             };
             space.prot.insert(off / self.page, prot);
+        }
+        drop(space);
+        self.prot_dirty.store(true, Ordering::Release);
+    }
+
+    /// #964 trap-on-NULL: seed the reserved NULL region for a `__null_guard`-marked module —
+    /// `[0, guard)` becomes `Unmapped` (a guest access traps exactly like native) and `prot_pages`
+    /// permanently refuses the page ops below `guard` (the `mmap_min_addr` analogue, which keeps
+    /// the JIT tiers' baked guard constant sound). `guard = 0` (an unmarked module) is a no-op —
+    /// the legacy fast paths stay lock-free. The guard is a multiple of every supported page size
+    /// (16 KiB = the max host page; the browser's software page is 4 KiB), asserted here.
+    pub(crate) fn seed_null_guard(&mut self, guard: u64) {
+        if guard == 0 {
+            return;
+        }
+        debug_assert!(guard.is_multiple_of(self.page), "guard must be page-exact");
+        self.null_guard = guard;
+        let mut space = self.space_write();
+        for p in 0..guard.div_ceil(self.page) {
+            space.prot.insert(p, PageProt::Unmapped);
         }
         drop(space);
         self.prot_dirty.store(true, Ordering::Release);
@@ -22978,6 +23037,11 @@ impl Mem {
         // in the parent). The prot map is keyed by the same relative pages
         // (`check_prot`/`page_access`); only backing-store accesses add `window.base()`.
         if len == 0 || !offset.is_multiple_of(self.page) {
+            return Err(EINVAL);
+        }
+        // #964: the NULL region is permanently reserved — no `map`/`unmap`/`protect`/§13 alias may
+        // touch it (re-mapping page 0 would invalidate the tiers' baked guard constant).
+        if offset < self.null_guard {
             return Err(EINVAL);
         }
         let end = offset.checked_add(len).ok_or(EINVAL)?;
