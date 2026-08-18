@@ -204,6 +204,17 @@ jobs:
           if [ "$fail" -eq 0 ]; then echo "workflows_src/ and workflows/ are in sync."; fi
           exit "$fail"
 
+  fuzz-matrix-in-sync:
+    name: fuzz targets wired
+    runs-on: ubuntu-latest
+    # A fuzz target file with no [[bin]] never builds; one with no matrix row builds but never runs —
+    # zero coverage, silently (the exact hole the fuzz job's "keep this list in lockstep" comment
+    # warns about). Gate it mechanically, the same way `workflows-in-sync` gates the mirror.
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: fuzz_targets/*.rs == fuzz/Cargo.toml [[bin]] == ci.yml fuzz matrix
+        run: ./scripts/ci/check-fuzz-matrix.sh
+
   cross-os:
     name: build · test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
