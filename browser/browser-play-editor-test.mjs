@@ -168,7 +168,8 @@ try {
     (sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.getValue(),
     card(nimcCard),
   );
-  nimcSrc.includes('import std/syncio') && nimcSrc.includes('write(stdout')
+  nimcSrc.includes('import std/syncio') && nimcSrc.includes('proc greet') &&
+    nimcSrc.includes('write(stdout')
     ? ok('nim compiler card → editor holds a whole Nim program')
     : fail(`nim compiler editor: ${nimcSrc.slice(0, 80)}`);
   await runCard(page, nimcCard, 180_000);
@@ -178,8 +179,8 @@ try {
     stdout: document.querySelector(`${sel} .stdout`).textContent,
   }), card(nimcCard));
   nimc.state === 'done' && nimc.result.endsWith('B stdout') &&
-    nimc.stdout.includes('hello from Nim, compiled on the SVM') &&
-    nimc.stdout.includes('all client-side')
+    nimc.stdout.includes('hello, Nim') &&
+    nimc.stdout.includes('hello, the SVM')
     ? ok('whole-program nim compiler card: the full toolchain compiled + ran a Nim program in-browser')
     : fail(`nimc run: state=${nimc.state} result=${nimc.result} stdout=${nimc.stdout.slice(0, 120)}`);
 

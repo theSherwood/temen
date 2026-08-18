@@ -898,17 +898,23 @@ for x in xs:
       "`svm-leng`, and **runs `_start` under the powerbox**. Every phase is a verified SVM guest; the " +
       "stdlib is mounted from a committed `svm_fs` image. Edit the Nim on the left and click Run — the " +
       "output below is your program's **real stdout**, produced by a Nim program the SVM compiled and " +
-      "ran end-to-end, no server. (Breadth is bounded by what translates through `svm-leng` today — " +
-      "#760/#956; `import std/syncio` + `write(stdout, …)` works. `echo` isn't an identifier nimony " +
-      "resolves yet — a front-end gap. The four assets total ~6.5 MB gzipped and inflate in-browser.)",
+      "ran end-to-end, no server. The default below shows a `proc`, a `string` parameter, and string " +
+      "concatenation (`&`) all compiling through; the language conformance suite (#956) runs **15/15** " +
+      "features end-to-end on the SVM — generics, exceptions, methods, closures, `seq`/`string`/`Table`, " +
+      "floats, iterators, variant/`ref` objects, ARC destructors. (`echo` isn't an identifier nimony " +
+      "resolves yet — a front-end gap; use `write(stdout, …)` for output. The four assets total ~6.5 MB " +
+      "gzipped and inflate in-browser.)",
     src: `# Edit this Nim, then Run. The whole nimony toolchain compiles it in your
 # browser — nifler (parse) -> nimsem (sema) -> hexer (lower) -> svm-leng
 # (translate + link) — and the result runs on the SVM. The text below is
 # your program's real stdout.
 import std/syncio
 
-write(stdout, "hello from Nim, compiled on the SVM\\n")
-write(stdout, "nifler -> nimsem -> hexer -> svm-leng, all client-side\\n")
+proc greet(name: string): string =
+  "hello, " & name & "\\n"
+
+write(stdout, greet("Nim"))
+write(stdout, greet("the SVM"))
 `,
   },
   'svm-leng: translate real nimony Leng → SVM IR (self-host)': {

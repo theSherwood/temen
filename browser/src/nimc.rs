@@ -459,15 +459,19 @@ mod tests {
         let Some((nifler, nimsem, hexer, mut files)) = seed() else {
             return;
         };
+        // Mirrors the playground `nimc` card's default source (browser/web/play.js): a `proc` with a
+        // `string` parameter, string concatenation (`&`), and two `write`s. The native oracle for the
+        // in-browser compile — same bytecode engine the wasm cdylib runs — so card breadth can't drift
+        // past what compiles here.
         files.push((
             "prog.nim".into(),
-            b"import std/syncio\nwrite(stdout, \"hello, svm\\n\")\n".to_vec(),
+            b"import std/syncio\n\nproc greet(name: string): string =\n  \"hello, \" & name & \"\\n\"\n\nwrite(stdout, greet(\"Nim\"))\nwrite(stdout, greet(\"the SVM\"))\n".to_vec(),
         ));
         let r = compile_nim(&nifler, &nimsem, &hexer, files, "prog.nim");
         assert_eq!(
             r.as_deref(),
-            Ok("hello, svm\n"),
-            "in-browser compile+run of a write program"
+            Ok("hello, Nim\nhello, the SVM\n"),
+            "in-browser compile+run of a proc + string-concat program"
         );
     }
 }
