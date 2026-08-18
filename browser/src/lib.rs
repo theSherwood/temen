@@ -5352,29 +5352,23 @@ pub extern "C" fn svm_warm_jit_call_interp(func: u32, args_ptr: *mut u8) -> i32 
         let (p, r) = run.func_sig(func);
         (p.to_vec(), r.to_vec())
     };
-    let read_slot = |i: usize| -> u64 {
-        let mut b = [0u8; 8];
-        // SAFETY: the host guarantees `args_ptr` addresses ≥ max(params, results) i64 slots.
-        unsafe { core::ptr::copy_nonoverlapping(args_ptr.add(i * 8), b.as_mut_ptr(), 8) };
-        u64::from_le_bytes(b)
-    };
+    // SAFETY: the host guarantees `args_ptr` addresses the signature's full slot span (the env scratch).
     let args: Vec<Value> = params
         .iter()
-        .enumerate()
-        .map(|(i, t)| slot_to_value(*t, read_slot(i)))
+        .zip(slot_offs(&params))
+        .map(|(t, o)| unsafe { read_slot_value(*t, args_ptr, o) })
         .collect();
     match run.run_cross_tier(func, &args) {
         Ok(vals) => {
+            let offs = slot_offs(&results);
             for (i, v) in vals.iter().enumerate() {
                 if i >= results.len() {
                     break;
                 }
-                let Some(raw) = value_to_slot(v) else {
+                // SAFETY: `args_ptr + offs[i]` is within the env scratch (result slots overlay arg slots).
+                if !unsafe { write_slot_value(v, args_ptr, offs[i]) } {
                     return STATUS_TRAP;
-                };
-                let b = raw.to_le_bytes();
-                // SAFETY: `args_ptr + i*8` is within the env scratch (result slots overlay arg slots).
-                unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), args_ptr.add(i * 8), 8) };
+                }
             }
             0
         }
@@ -5869,31 +5863,109 @@ pub extern "C" fn svm_onramp_trap_len() -> usize {
 // ---- cross-tier `env.call_interp` slot ABI (shared by the three servicers below) ------------------
 //
 // The emitter (svm-wasm-jit `emit_slot_store` / `emit_slot_load`) packs each cross-tier arg/result
-// into one 8-byte scratch slot; these two helpers are the host end of that single encoding, so all
-// three `*_call_interp` servicers decode/encode identically. `i32` fills the slot (widened); `f32`
-// uses its low 4 bytes; `i64`/`f64` the full slot. `v128` needs two slots and is excluded by
-// `marshallable_sig`, so it never appears in a cross-tier signature.
+// into the env scratch at a **running slot offset** computed from the callee's signature: scalars
+// (`i32` widened, `f32` low 4 bytes, `i64`/`f64` whole) take one 8-byte slot, a `v128` takes two
+// (16 raw little-endian bytes, #749). These helpers are the host end of that single encoding, so
+// all three `*_call_interp` servicers decode/encode identically. Only `ref`/`cap` values are
+// unmarshallable (excluded by `marshallable_sig`; a servicer fails closed if one appears).
 
-/// Decode one scratch slot (read as a little-endian `u64`) to a [`Value`] of the callee's param type.
-fn slot_to_value(ty: svm_ir::ValType, raw: u64) -> Value {
+/// Running byte offsets of each value of a signature side in the scratch (params and results each
+/// start at 0 — result slots overlay arg slots). Mirrors the emitter's `slot_off`.
+fn slot_offs(types: &[svm_ir::ValType]) -> Vec<usize> {
+    let mut offs = Vec::with_capacity(types.len());
+    let mut off = 0usize;
+    for t in types {
+        offs.push(off);
+        off += if *t == svm_ir::ValType::V128 { 16 } else { 8 };
+    }
+    offs
+}
+
+/// Decode the scratch value at `args_ptr + off` to a [`Value`] of the callee's param type.
+///
+/// SAFETY: the caller guarantees `args_ptr + off` addresses the full slot(s) of `ty` (8 bytes, 16
+/// for `v128`) inside the env scratch.
+unsafe fn read_slot_value(ty: svm_ir::ValType, args_ptr: *const u8, off: usize) -> Value {
+    let raw8 = || -> u64 {
+        let mut b = [0u8; 8];
+        unsafe { core::ptr::copy_nonoverlapping(args_ptr.add(off), b.as_mut_ptr(), 8) };
+        u64::from_le_bytes(b)
+    };
     match ty {
-        svm_ir::ValType::I32 => Value::I32(raw as i32),
-        svm_ir::ValType::I64 => Value::I64(raw as i64),
-        svm_ir::ValType::F32 => Value::F32(f32::from_bits(raw as u32)),
-        svm_ir::ValType::F64 => Value::F64(f64::from_bits(raw)),
-        _ => Value::I64(raw as i64), // v128 never reaches a cross-tier leaf; decode defensively
+        svm_ir::ValType::I32 => Value::I32(raw8() as i32),
+        svm_ir::ValType::I64 => Value::I64(raw8() as i64),
+        svm_ir::ValType::F32 => Value::F32(f32::from_bits(raw8() as u32)),
+        svm_ir::ValType::F64 => Value::F64(f64::from_bits(raw8())),
+        svm_ir::ValType::V128 => {
+            let mut b = [0u8; 16];
+            unsafe { core::ptr::copy_nonoverlapping(args_ptr.add(off), b.as_mut_ptr(), 16) };
+            Value::V128(b)
+        }
+        _ => Value::I64(raw8() as i64), // ref/cap never reach a cross-tier leaf; decode defensively
     }
 }
 
-/// Encode a cross-tier result [`Value`] into its 8-byte slot bits. `None` for a `v128` result (not
-/// marshallable — the caller fails the cross-tier call closed).
-fn value_to_slot(v: &Value) -> Option<u64> {
+/// Encode a cross-tier result [`Value`] into its slot(s) at `args_ptr + off`. `false` for a
+/// `ref`/`cap` result (not marshallable — the caller fails the cross-tier call closed).
+///
+/// SAFETY: the caller guarantees `args_ptr + off` addresses the full slot(s) of `v`'s type (8
+/// bytes, 16 for `v128`) inside the env scratch.
+unsafe fn write_slot_value(v: &Value, args_ptr: *mut u8, off: usize) -> bool {
+    let put8 = |raw: u64| {
+        let b = raw.to_le_bytes();
+        unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), args_ptr.add(off), 8) };
+    };
     match v {
-        Value::I32(x) => Some(*x as u32 as u64),
-        Value::I64(x) => Some(*x as u64),
-        Value::F32(x) => Some(x.to_bits() as u64),
-        Value::F64(x) => Some(x.to_bits()),
-        _ => None,
+        Value::I32(x) => put8(*x as u32 as u64),
+        Value::I64(x) => put8(*x as u64),
+        Value::F32(x) => put8(x.to_bits() as u64),
+        Value::F64(x) => put8(x.to_bits()),
+        Value::V128(b) => unsafe {
+            core::ptr::copy_nonoverlapping(b.as_ptr(), args_ptr.add(off), 16)
+        },
+        _ => return false,
+    }
+    true
+}
+
+#[cfg(test)]
+mod xcall_slot_tests {
+    use super::*;
+
+    /// The two-slot `v128` scratch layout (#749): running offsets skip 16 bytes past a `v128`, and
+    /// every marshallable value round-trips write→read bit-exactly at its offset — the host half of
+    /// the encoding the emitter's `slot_off`/`emit_slot_store`/`emit_slot_load` produce (the wasmi
+    /// differential in svm-wasm-jit `cross_tier.rs` pins the emitter half against this same layout).
+    #[test]
+    fn v128_two_slot_layout_round_trips() {
+        use svm_ir::ValType;
+        let sig = [
+            ValType::V128,
+            ValType::I64,
+            ValType::F32,
+            ValType::V128,
+            ValType::I32,
+        ];
+        assert_eq!(slot_offs(&sig), vec![0, 16, 24, 32, 48]);
+
+        let vals = [
+            Value::V128(*b"0123456789abcdef"),
+            Value::I64(-7),
+            Value::F32(1.5),
+            Value::V128([0xAA; 16]),
+            Value::I32(-1),
+        ];
+        let mut scratch = [0u8; 56];
+        let p = scratch.as_mut_ptr();
+        for (v, off) in vals.iter().zip(slot_offs(&sig)) {
+            // SAFETY: `scratch` covers the signature's full 56-byte slot span.
+            assert!(unsafe { write_slot_value(v, p, off) });
+        }
+        for ((ty, v), off) in sig.iter().zip(&vals).zip(slot_offs(&sig)) {
+            // SAFETY: same span as above.
+            let got = unsafe { read_slot_value(*ty, p, off) };
+            assert_eq!(format!("{got:?}"), format!("{v:?}"), "round-trip at {off}");
+        }
     }
 }
 
@@ -6043,29 +6115,23 @@ pub extern "C" fn svm_onramp_jit_call_interp(func: u32, args_ptr: *mut u8) -> i3
         let (p, r) = reactor.func_sig(func);
         (p.to_vec(), r.to_vec())
     };
-    // SAFETY: the host guarantees `args_ptr` addresses ≥ max(params, results) i64 slots (the env scratch).
-    let read_slot = |i: usize| -> u64 {
-        let mut b = [0u8; 8];
-        unsafe { core::ptr::copy_nonoverlapping(args_ptr.add(i * 8), b.as_mut_ptr(), 8) };
-        u64::from_le_bytes(b)
-    };
+    // SAFETY: the host guarantees `args_ptr` addresses the signature's full slot span (the env scratch).
     let args: Vec<Value> = params
         .iter()
-        .enumerate()
-        .map(|(i, t)| slot_to_value(*t, read_slot(i)))
+        .zip(slot_offs(&params))
+        .map(|(t, o)| unsafe { read_slot_value(*t, args_ptr, o) })
         .collect();
     match reactor.run_cross_tier(func, &args) {
         Ok(vals) => {
+            let offs = slot_offs(&results);
             for (i, v) in vals.iter().enumerate() {
                 if i >= results.len() {
                     break;
                 }
-                let Some(raw) = value_to_slot(v) else {
+                // SAFETY: `args_ptr + offs[i]` is within the env scratch (result slots overlay arg slots).
+                if !unsafe { write_slot_value(v, args_ptr, offs[i]) } {
                     return STATUS_TRAP;
-                };
-                let b = raw.to_le_bytes();
-                // SAFETY: `args_ptr + i*8` is within the env scratch (result slots overlay arg slots).
-                unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), args_ptr.add(i * 8), 8) };
+                }
             }
             0
         }
@@ -6347,29 +6413,23 @@ pub extern "C" fn svm_onramp_jit_run_call_interp(func: u32, args_ptr: *mut u8) -
         let (p, r) = run.func_sig(func);
         (p.to_vec(), r.to_vec())
     };
-    let read_slot = |i: usize| -> u64 {
-        let mut b = [0u8; 8];
-        // SAFETY: the host guarantees `args_ptr` addresses ≥ max(params, results) i64 slots.
-        unsafe { core::ptr::copy_nonoverlapping(args_ptr.add(i * 8), b.as_mut_ptr(), 8) };
-        u64::from_le_bytes(b)
-    };
+    // SAFETY: the host guarantees `args_ptr` addresses the signature's full slot span (the env scratch).
     let args: Vec<Value> = params
         .iter()
-        .enumerate()
-        .map(|(i, t)| slot_to_value(*t, read_slot(i)))
+        .zip(slot_offs(&params))
+        .map(|(t, o)| unsafe { read_slot_value(*t, args_ptr, o) })
         .collect();
     match run.run_cross_tier(func, &args) {
         Ok(vals) => {
+            let offs = slot_offs(&results);
             for (i, v) in vals.iter().enumerate() {
                 if i >= results.len() {
                     break;
                 }
-                let Some(raw) = value_to_slot(v) else {
+                // SAFETY: `args_ptr + offs[i]` is within the env scratch (result slots overlay arg slots).
+                if !unsafe { write_slot_value(v, args_ptr, offs[i]) } {
                     return STATUS_TRAP;
-                };
-                let b = raw.to_le_bytes();
-                // SAFETY: `args_ptr + i*8` is within the env scratch (result slots overlay arg slots).
-                unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), args_ptr.add(i * 8), 8) };
+                }
             }
             0
         }
@@ -7038,31 +7098,24 @@ pub extern "C" fn svm_wasmjit_call_interp(func: u32, args_ptr: *mut u8) -> i32 {
     let Some(callee) = m.funcs.get(func as usize) else {
         return 1;
     };
-    let nparams = callee.params.len();
     let nresults = callee.results.len();
-    // SAFETY: the host guarantees `args_ptr` addresses ≥ max(nparams, nresults) i64 slots (the env
+    // SAFETY: the host guarantees `args_ptr` addresses the signature's full slot span (the env
     // scratch, sized by `svm_wasmjit_env_bytes`).
-    let read_slot = |i: usize| -> u64 {
-        let mut b = [0u8; 8];
-        unsafe { core::ptr::copy_nonoverlapping(args_ptr.add(i * 8), b.as_mut_ptr(), 8) };
-        u64::from_le_bytes(b)
-    };
     let args: Vec<Value> = callee
         .params
         .iter()
-        .enumerate()
-        .map(|(i, t)| slot_to_value(*t, read_slot(i)))
+        .zip(slot_offs(&callee.params))
+        .map(|(t, o)| unsafe { read_slot_value(*t, args_ptr, o) })
         .collect();
-    let _ = nparams;
     let mut fuel = u64::MAX;
     match bytecode::compile_and_run(m, func, &args, &mut fuel) {
         Some(Ok(vals)) if vals.len() == nresults => {
+            let offs = slot_offs(&callee.results);
             for (i, v) in vals.iter().enumerate() {
-                let Some(raw) = value_to_slot(v) else {
-                    return 1; // v128 result: not marshallable through the scratch slot
-                };
-                let b = raw.to_le_bytes();
-                unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), args_ptr.add(i * 8), 8) };
+                // SAFETY: `args_ptr + offs[i]` is within the env scratch (result slots overlay args).
+                if !unsafe { write_slot_value(v, args_ptr, offs[i]) } {
+                    return 1; // ref/cap result: not marshallable through the scratch
+                }
             }
             0
         }
