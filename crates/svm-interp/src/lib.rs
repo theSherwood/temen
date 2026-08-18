@@ -4450,7 +4450,7 @@ struct Sched {
     /// never contended): several processes may block on one child. Drained at the
     /// twin-completion point (after the exit hooks retire the personality entry, so the
     /// re-executed op reaps), by the EINTR sweep, and at teardown.
-    posix_reap_waiters: BTreeMap<TaskId, Vec<Box<VCpu>>>,
+    posix_reap_waiters: BTreeMap<TaskId, VecDeque<Box<VCpu>>>,
     /// FORK.md §8.6 — vCPUs/fibers parked in a **blocking pipe read** ([`Blocked::PipeRead`]), keyed
     /// by pipe id. Woken by a `write` to that pipe (data available) or by its last write end closing
     /// (writer count → 0, EOF); both drain the entry into `runnable` and the read re-issues. Same shape
@@ -4792,14 +4792,18 @@ impl Scheduler {
         // `SA_RESTART` re-parking silently through the same re-execution).
         let mut hit_reaps: Vec<Box<VCpu>> = Vec::new();
         for ws in s.posix_reap_waiters.values_mut() {
-            let mut i = 0;
-            while i < ws.len() {
-                if domain_key_of(&ws[i]) == domain {
-                    hit_reaps.push(ws.remove(i));
-                } else {
-                    i += 1;
-                }
-            }
+            let keep: VecDeque<Box<VCpu>> = std::mem::take(ws)
+                .into_iter()
+                .filter_map(|v| {
+                    if domain_key_of(&v) == domain {
+                        hit_reaps.push(v);
+                        None
+                    } else {
+                        Some(v)
+                    }
+                })
+                .collect();
+            *ws = keep;
         }
         s.posix_reap_waiters.retain(|_, ws| !ws.is_empty());
         for v in hit_reaps {
@@ -5614,14 +5618,18 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
     victims.extend(s.stopped.remove(&key).unwrap_or_default());
     // #799 — the dying domain's blocking-`waitpid` benches die with it; other domains' stay.
     for ws in s.posix_reap_waiters.values_mut() {
-        let mut i = 0;
-        while i < ws.len() {
-            if domain_key_of(&ws[i]) == key {
-                victims.push(ws.remove(i));
-            } else {
-                i += 1;
-            }
-        }
+        let keep: VecDeque<Box<VCpu>> = std::mem::take(ws)
+            .into_iter()
+            .filter_map(|v| {
+                if domain_key_of(&v) == key {
+                    victims.push(v);
+                    None
+                } else {
+                    Some(v)
+                }
+            })
+            .collect();
+        *ws = keep;
     }
     s.posix_reap_waiters.retain(|_, ws| !ws.is_empty());
     // Parked `wait(-1)`/`waitpid(-pgid)` callers of the dying domain are reaped; others stay parked.
@@ -6415,7 +6423,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     s.runnable.push_back(v);
                     sched.work.notify_one();
                 } else {
-                    s.posix_reap_waiters.entry(child).or_default().push(v);
+                    s.posix_reap_waiters.entry(child).or_default().push_back(v);
                 }
             }
             Step::Park(Blocked::Stopped) => {
