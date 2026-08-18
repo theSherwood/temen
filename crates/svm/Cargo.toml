@@ -54,4 +54,6 @@ libc = "0.2"
 # (`jit_wasm_codegen.rs`) emits a runtime-compiled unit and runs it under `wasmi`, the same
 # escape-TCB-adjacent correctness contract the `svm-wasm-jit` crate's own differentials hold.
 svm-wasm-jit = { path = "../svm-wasm-jit" }
-wasmi = "0.47"
+# `simd` enables wasmi's §17 v128 proposal (`Config::wasm_simd`), needed by the generative wasm-JIT
+# differential (`wasm_diff.rs`) since the core v128 lane ops are in the emitter's integer subset.
+wasmi = { version = "0.47", features = ["simd"] }

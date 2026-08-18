@@ -16,6 +16,17 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **`wasm_diff` added to the nightly `fuzz` matrix** (issue #910) — one entry added to the
+  `fuzz` job's `target: [...]` list (after `diff`), plus the descriptive comment above it. It is the
+  new libFuzzer target `fuzz/fuzz_targets/wasm_diff.rs`: the generative interp⇄**wasm-JIT**
+  differential (the tree's third confinement lowering, `emit_confine`/`emit_span_check`), the wasm-tier
+  peer of `diff`. Runs like every other target (`cargo fuzz run wasm_diff -- -max_total_time=300`). The
+  matrix comment already says "keep this list in lockstep with `fuzz/fuzz_targets/*.rs`", so an unwired
+  target would be zero coverage. Builds under the pinned nightly + `cargo-fuzz`; the stable
+  `crates/svm/tests/wasm_diff.rs` gates it per-PR from seeds. (Until copied over, the `workflows-in-sync`
+  guard stays red — the expected mirror-edit friction; `cp .github/workflows_src/*.yml
+  .github/workflows/` drains it.)
+
 - **I67 apt hardening, second azure path (all 10 `apt-get update` sites, `ci.yml`)** — the
   sources.list.d removal turned out to cover only half of the runner's azure dependency: apt ALSO
   routes through the `/etc/apt/apt-mirrors.txt` mirrorlist (and `.sources` stanzas), which still

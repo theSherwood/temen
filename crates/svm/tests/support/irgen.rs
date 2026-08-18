@@ -28,6 +28,12 @@ pub struct Gen {
     data: Vec<u8>,
     pos: usize,
     rng: u64,
+    /// Whether to synthesize `cap.call`s (arms 18/19). The Cranelift differential grants a Memory
+    /// capability and exercises the success/CapFault paths, so it leaves this `true`; the **wasm-JIT**
+    /// differential disables it ([`Gen::without_caps`]) because that tier refuses `cap.call`/page-op
+    /// modules (`Unsupported`), and a shared generator that peppered them everywhere would make almost
+    /// every memory module unemittable — starving the escape-oracle. Off ⇒ arms 18/19 re-roll.
+    emit_caps: bool,
 }
 
 impl Gen {
@@ -40,6 +46,7 @@ impl Gen {
             data: data.to_vec(),
             pos: 0,
             rng: seed | 1,
+            emit_caps: true,
         }
     }
     pub fn from_seed(seed: u64) -> Gen {
@@ -47,7 +54,13 @@ impl Gen {
             data: Vec::new(),
             pos: 0,
             rng: seed | 1,
+            emit_caps: true,
         }
+    }
+    /// Suppress `cap.call` generation (for the wasm-JIT differential — see the field's note).
+    pub fn without_caps(mut self) -> Gen {
+        self.emit_caps = false;
+        self
     }
     fn raw(&mut self) -> u64 {
         let mut x = self.rng;
@@ -414,7 +427,7 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                     bb.push0(Inst::CallIndirect { ty, idx, args });
                 }
             }
-            18 => {
+            18 if bb.g.emit_caps => {
                 // cap.call with an *ungranted* handle. The fuzzer grants no capabilities, so
                 // the handle resolves to nothing in the host-owned table and the call is
                 // **inert** — it traps `CapFault` on both backends (interp: empty `Host`; JIT:
@@ -447,7 +460,7 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                     &results,
                 );
             }
-            19 if has_mem => {
+            19 if has_mem && bb.g.emit_caps => {
                 // A *valid* Memory `cap.call` (§3e) on the granted handle: `map`/`unmap`/`protect`
                 // one whole page, page-aligned, so it takes the **success** path on both backends
                 // (interp page-map + JIT real `mprotect`/`VirtualProtect`) — exercising cap.call
@@ -1293,7 +1306,7 @@ fn is_float(t: ValType) -> bool {
 /// differ *legitimately* — a false escape. Confinement is about *addresses*, which integer
 /// modules exercise fully, so the memory oracle runs on float-free modules only; float
 /// coverage stays at the (NaN-insensitive) value level.
-fn has_float(m: &Module) -> bool {
+pub fn has_float(m: &Module) -> bool {
     let any = |ts: &[ValType]| ts.iter().copied().any(is_float);
     m.funcs.iter().any(|f| {
         any(&f.params)
