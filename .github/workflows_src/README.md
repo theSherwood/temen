@@ -27,6 +27,14 @@ identical until the next agent edit.
   guard stays red — the expected mirror-edit friction; `cp .github/workflows_src/*.yml
   .github/workflows/` drains it.)
 
+- **I67 apt hardening, second azure path (all 10 `apt-get update` sites, `ci.yml`)** — the
+  sources.list.d removal turned out to cover only half of the runner's azure dependency: apt ALSO
+  routes through the `/etc/apt/apt-mirrors.txt` mirrorlist (and `.sources` stanzas), which still
+  name `azure.archive.ubuntu.com`. PR #953's gate lost a 15-minute step timeout to an azure-mirror
+  outage *after* the existing hardening ran (an `Ign:` retry storm, then a stalled fallback fetch).
+  Each site now also seds the mirrorlist/stanzas onto `https://archive.ubuntu.com` (fail-soft
+  `|| true` — a healthy runner is untouched). Same class, same shape, one more door closed.
+
 - **`timeout-minutes: 45` on the `svm-llvm` job** (issue #906) — it was the only lane with no
   timeout, so a wedged compile ran to GitHub's 6-hour default before reporting. Observed once: the
   `std_guest` native-oracle `rustc` hung 66+ min on PR #898's run (the suite unexpectedly *ran*

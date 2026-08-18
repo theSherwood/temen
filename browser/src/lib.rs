@@ -9129,6 +9129,14 @@ struct CoopTierupRun {
     jit_wasm: Option<std::sync::Arc<[u8]>>,
     jit_param_types: Vec<u8>,
     jit_result_types: Vec<u8>,
+    /// #926 slice 2f — the B2 driver-table state (the twin of `TierupRun`'s). `sigs[i]` is program
+    /// function `i`'s signature (the shim generator's source for a slot in the natural prefix); the
+    /// slot→code mirror itself lives on the engine's `CoopSched` (read via [`bytecode::CoopRun::slot_code`],
+    /// since coop `Jit.install` happens inside the pump). `shim_wasm`/`jit_wasm_by_handle` each hold the
+    /// last generated bounce-shim / by-handle unit-wasm, valid until the next call of its accessor.
+    sigs: Vec<(Vec<svm_ir::ValType>, Vec<svm_ir::ValType>)>,
+    shim_wasm: Vec<u8>,
+    jit_wasm_by_handle: Option<std::sync::Arc<[u8]>>,
     /// A bounce callback's staged trap (see [`svm_coop_call_interp`] / [`svm_coop_deliver_trap`]).
     pending_bounce_trap: Option<Trap>,
     /// The guest's top-level result, staged at DONE.
@@ -9170,10 +9178,34 @@ pub extern "C" fn svm_coop_open(
     if let Some(mc) = emit_m.memory.as_mut() {
         mc.size_log2 = win_log2;
     }
-    // First cut: the simple (non-B2) tier-up emission — direct-call leaves tier up, driven by the
-    // host's per-`f{func}` service. (`call_indirect` tier-up via the B2 driver table is a follow-up,
-    // as is emitted `Jit.invoke`.) An unsupported shape declines to the interpreter.
-    let (wasm, emit) = match svm_wasm_jit::compile_module_tierup(&emit_m, shared != 0) {
+    // #926 slice 2f — B2 vs non-B2 emit, exactly the single-shot pump's gate ([`svm_onramp_tierup_open`]).
+    // A guest whose every function has a shimmable signature (scalar operands, arity ≤ the env
+    // scratch's slot count) emits over the **shared reserved table** (Model B2): `call_indirect`-bearing
+    // functions tier up (the language-runtime dispatch-loop shape), their indirect calls reaching
+    // installed §22 units natively (old→new) and interpreter-resident targets through the live bounce.
+    // A non-shimmable guest (v128 / over-arity) emits in the old local-table mode, where a null
+    // shared-table slot can never diverge from the interpreter's dispatch. An unsupported shape declines.
+    let scalar = |t: &svm_ir::ValType| {
+        matches!(
+            t,
+            svm_ir::ValType::I32
+                | svm_ir::ValType::I64
+                | svm_ir::ValType::F32
+                | svm_ir::ValType::F64
+        )
+    };
+    let max_slots = (svm_wasm_jit::ENV_CELL_BYTES - 16) / 8;
+    let all_shimmable = m.funcs.iter().all(|f| {
+        f.params.iter().all(scalar)
+            && f.results.iter().all(scalar)
+            && f.params.len().max(f.results.len()) <= max_slots
+    });
+    let emitted_res = if all_shimmable {
+        svm_wasm_jit::compile_module_tierup_b2(&emit_m, shared != 0, ONRAMP_JIT_TABLE_LOG2 as u32)
+    } else {
+        svm_wasm_jit::compile_module_tierup(&emit_m, shared != 0)
+    };
+    let (wasm, emit) = match emitted_res {
         Ok(x) => x,
         Err(_) => {
             set(STATUS_UNSUPPORTED);
@@ -9210,13 +9242,24 @@ pub extern "C" fn svm_coop_open(
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
     };
     let (frame, _keys) = grant_onramp_caps(&mut host, &m, None);
-    // #926 slice 2e: arm the §22 unit wasm-emitter for a `vm_jit_*` importer so its runtime-compiled
+    // #926 slice 2f: a B2 main module masks `call_indirect` against `1 << ONRAMP_JIT_TABLE_LOG2`, so the
+    // engine's dispatch table must be the same size — a natural-size table would number install slots
+    // and wrap wild indices differently (#846/#880). `CoopRun` builds the domain with
+    // `host.jit_table_log2()`, so force it here (a `vm_jit_*` importer's `grant_onramp_caps` already set
+    // it to this floor; `set_jit_table_log2` takes the max, so this is idempotent for that case).
+    if all_shimmable {
+        host.set_jit_table_log2(ONRAMP_JIT_TABLE_LOG2);
+    }
+    // #926 slice 2e/2f: arm the §22 unit wasm-emitter for a `vm_jit_*` importer so its runtime-compiled
     // units run emitted (the pump then surfaces a `CoopEvent::JitInvoke` when a unit has emitted wasm;
-    // an interpreter-only unit falls back to the inline service). Reuses the single-vCPU emitter and
-    // its shared parameters — only one driver runs at a time (single-threaded wasm).
+    // an interpreter-only unit falls back to the inline service). Gated on `all_shimmable` like the
+    // shared-table emit — a unit emits B2 (`onramp_tierup_unit_emitter`), so its `call_indirect`
+    // dispatch depends on the driver table covering every interpreter-resident slot with a shim; a
+    // non-shimmable guest's units run interpreted instead (fail-closed, matching the single-shot pump).
+    // Reuses the single-vCPU emitter and its shared parameters — only one driver runs at a time.
     TIERUP_UNIT_SHARED.store(shared != 0, std::sync::atomic::Ordering::Relaxed);
     TIERUP_UNIT_WIN_LOG2.store(win_log2, std::sync::atomic::Ordering::Relaxed);
-    if jit_importer {
+    if jit_importer && all_shimmable {
         host.set_jit_wasm_emitter(onramp_tierup_unit_emitter);
     }
     let tierup = bytecode::TierUpConfig {
@@ -9259,6 +9302,13 @@ pub extern "C" fn svm_coop_open(
             jit_wasm: None,
             jit_param_types: Vec::new(),
             jit_result_types: Vec::new(),
+            sigs: m
+                .funcs
+                .iter()
+                .map(|f| (f.params.clone(), f.results.clone()))
+                .collect(),
+            shim_wasm: Vec::new(),
+            jit_wasm_by_handle: None,
             pending_bounce_trap: None,
             value: 0,
             frame,
@@ -9517,6 +9567,113 @@ pub extern "C" fn svm_coop_call_interp(target: u32, args_ptr: *mut u8) -> i32 {
 pub extern "C" fn svm_coop_mapped_now() -> i64 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
         .map_or(0, |s| s.run.window_scalar_extent() as i64)
+}
+
+// ---- #926 slice 2f: the B2 driver-table accessors (the twins of the single-shot `svm_onramp_tierup_*`
+// set) the JS host rebuilds its shared `WebAssembly.Table` from at each event boundary. ----
+
+/// The dispatch-table size (log2) the coop run's shared table is built with — the JS host sizes its
+/// `WebAssembly.Table` to `1 << this` (the emitted `call_indirect` mask). `0` (a 1-slot table) for a
+/// non-shimmable guest, which emits in local-table mode and never dispatches through the shared table.
+#[no_mangle]
+pub extern "C" fn svm_coop_table_log2() -> u32 {
+    // SAFETY: single-threaded wasm; read of the session's host.
+    unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() }
+        .map_or(0, |s| s.run.host_mut().jit_table_log2() as u32)
+}
+
+/// The guest program's function count — the dispatch table's **natural prefix** (`slot i < nfuncs`
+/// dispatches program function `i`; slots at or past it hold installed §22 units or trap empty).
+#[no_mangle]
+pub extern "C" fn svm_coop_nfuncs() -> usize {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.sigs.len())
+}
+
+/// The §22 code handle installed at dispatch-table `slot` (`-1` empty/natural) — the mirror the JS
+/// host rebuilds its table from (from [`bytecode::CoopRun::slot_code`], since coop install happens
+/// inside the pump).
+#[no_mangle]
+pub extern "C" fn svm_coop_slot_code(slot: u32) -> i32 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(-1, |s| s.run.slot_code(slot))
+}
+
+/// Emitted-wasm length for **any** compiled unit by code handle (`0` if none — the unit is
+/// interpreter-only), so the JS host can instantiate an *installed* slot's unit it hasn't itself
+/// invoked. The bytes (via [`svm_coop_jit_wasm_by_handle_ptr`]) stay valid until the next call.
+#[no_mangle]
+pub extern "C" fn svm_coop_jit_wasm_by_handle_len(code: i32) -> usize {
+    // SAFETY: single-threaded wasm; exclusive access to the session.
+    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() }) else {
+        return 0;
+    };
+    let h = s.run.host_mut();
+    s.jit_wasm_by_handle = h
+        .resolve_jit_code(code)
+        .ok()
+        .and_then(|(cd, cu)| h.jit_unit_wasm(cd, cu));
+    s.jit_wasm_by_handle.as_ref().map_or(0, |w| w.len())
+}
+
+/// Pointer to the emitted wasm the last [`svm_coop_jit_wasm_by_handle_len`] resolved.
+#[no_mangle]
+pub extern "C" fn svm_coop_jit_wasm_by_handle_ptr() -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(core::ptr::null(), |s| {
+        s.jit_wasm_by_handle
+            .as_ref()
+            .map_or(core::ptr::null(), |w| w.as_ptr())
+    })
+}
+
+/// Generate the **bounce-shim module** for dispatch-table `slot` — a standalone one-function wasm
+/// module (`export "t"`, [`svm_wasm_jit::emit_slot_trampoline`]) with the slot occupant's env-prepended
+/// signature, whose body bounces to [`svm_coop_call_interp`] with `slot` baked in. The JS host
+/// `table.set`s its instance's `"t"` into the slot, so an emitted `call_indirect` to an
+/// interpreter-resident target lands on the live-state bounce. Returns the module's byte length
+/// (`0` = no shim: empty slot, or a signature the transport can't carry — the open-time `all_shimmable`
+/// gate makes the latter unreachable for a run whose units emit). Bytes via [`svm_coop_shim_ptr`],
+/// valid until the next call.
+#[no_mangle]
+pub extern "C" fn svm_coop_shim_wasm(slot: u32) -> usize {
+    // SAFETY: single-threaded wasm; exclusive access to the session.
+    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() }) else {
+        return 0;
+    };
+    let sig = if (slot as usize) < s.sigs.len() {
+        Some(s.sigs[slot as usize].clone())
+    } else {
+        let code = s.run.slot_code(slot);
+        if code < 0 {
+            None
+        } else {
+            let h = s.run.host_mut();
+            h.resolve_jit_code(code)
+                .ok()
+                .and_then(|(cd, cu)| h.jit_unit_funcs(cd, cu))
+                .and_then(|fs| fs.first().map(|f| (f.params.clone(), f.results.clone())))
+        }
+    };
+    let Some((params, results)) = sig else {
+        s.shim_wasm.clear();
+        return 0;
+    };
+    let shared = TIERUP_UNIT_SHARED.load(std::sync::atomic::Ordering::Relaxed);
+    match svm_wasm_jit::emit_slot_trampoline(&params, &results, slot, shared) {
+        Ok(w) => {
+            s.shim_wasm = w;
+            s.shim_wasm.len()
+        }
+        Err(_) => {
+            s.shim_wasm.clear();
+            0
+        }
+    }
+}
+
+/// Pointer to the shim module the last [`svm_coop_shim_wasm`] generated.
+#[no_mangle]
+pub extern "C" fn svm_coop_shim_ptr() -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .map_or(core::ptr::null(), |s| s.shim_wasm.as_ptr())
 }
 
 /// Close the open cooperative run, freeing its window. Idempotent. `CoopRun` owns everything it
