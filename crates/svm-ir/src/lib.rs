@@ -62,6 +62,126 @@ pub const CAP_IMPORT_ATTACH_TYPE_ID: u32 = u32::MAX - 3;
 /// shared entry keeps the three backends in lockstep, like [`CAP_IMPORT_TYPE_ID`].
 pub const CAP_DYN_TYPE_ID: u32 = u32::MAX - 4;
 
+/// Built-in capability **interface ids** — the `type_id` a `cap.call` names (§3c/§3e). One
+/// definition, in the wire-IR crate, so every backend (the interpreter's dispatch, both JITs'
+/// gate predicates) agrees without copying raw integers; `svm_interp::cap_id` re-exports this
+/// (moved here from svm-interp, 2026-08-18, #902). Doc links to host-crate types are rendered as
+/// plain code spans since this crate has no `Host`.
+pub mod cap_id {
+    /// `Stream` — byte stream: op 0 `read`, op 1 `write`, op 2 `close` (§3e D43).
+    pub const STREAM: u32 = 0;
+    /// `Exit` — lifecycle: op 0 `exit(code)` (noreturn).
+    pub const EXIT: u32 = 1;
+    /// `Clock` — op 0 `now(clock_id) -> i64` nanoseconds.
+    pub const CLOCK: u32 = 2;
+    // 3: retired `Memory` (CONSOLIDATION §4, 2026-08-06). It was `AddressSpace` over the whole
+    // window minus `sub` — the degenerate form. Whole-window memory authority is now an
+    // `ADDRESS_SPACE` grant with the whole-window range (`Host::grant_memory`); the id stays
+    // reserved so an old artifact or guest naming it fails closed rather than aliasing a new kind.
+    /// `SharedRegion` — a host-backed memory object aliased into the window (§13). op 0
+    /// `map(window_offset, region_offset, len, prot)` aliases the region's pages into the window
+    /// (the same backing may be mapped at *multiple* window offsets → zero-overhead aliasing, the
+    /// magic-ring-buffer primitive); op 1 `unmap(window_offset, len)` drops the alias; op 2
+    /// `len() -> i64` reports the region size; op 3 `page_size() -> i64`. Granting the handle is how
+    /// two domains come to share memory; `create`/`grant` (guest-minted regions, cross-domain) are a
+    /// §14 follow-up — today regions are host-granted. A backing may be a fresh OS
+    /// shared object (`memfd`) **or a real host file** (`svm-run`'s `FileBacking`, minted by an
+    /// mmap-capable fs cap): mapping the latter aliases the file into the window zero-copy — the
+    /// file-backed-mmap bridge (MMAP_CAPABILITY.md §4b).
+    pub const SHARED_REGION: u32 = 4;
+    /// `AddressSpace` — the §14 memory-management capability, **attenuable to a power-of-two
+    /// window sub-range** `[base, base+size)`. Every op is confined to the
+    /// holder's sub-range (offsets are sub-range-relative, shifted by `base`): op 0 `map(off,len,prot)`,
+    /// 1 `unmap(off,len)`, 2 `protect(off,len,prot)`, 3 `page_size() -> i64`, and 4
+    /// **`sub(off, size_log2) -> handle`** — the **attenuation** primitive: mint a child `AddressSpace`
+    /// over the power-of-two-aligned sub-range `[base+off, base+off + 2^size_log2)`, which must lie
+    /// within the holder's range (a parent can only sub-allocate what it holds, §14). This is the
+    /// memory half of the `Instantiator`: a guest carves a child's window from its own.
+    pub const ADDRESS_SPACE: u32 = 5;
+    /// `Instantiator` — the §14 nesting primitive: spawn a **child domain** confined to a
+    /// power-of-two sub-window `[base, base+size)` of the holder's window (VM-in-VM). op 0
+    /// `instantiate(entry, off, size_log2, fuel) -> child_handle` enqueues a child vCPU running the
+    /// same module's `entry` (which returns one `i64` and takes one or two — its starter caps)
+    /// confined to `[base+off, base+off+2^size_log2)` with an **attenuated** powerbox over the child's
+    /// own window: an `Instantiator` (so it can recurse — confinement composes to any depth) and an
+    /// `AddressSpace` (so it can manage its own pages), passed as the entry's arguments. A fuel quota
+    /// caps it; returns immediately (non-blocking). op 1 `join(child_handle) -> result` parks **only
+    /// the calling fiber** until that child finishes, then yields its result (siblings keep running —
+    /// the child rides the same §12 executor). Holding the handle is the authority to nest (D19: a
+    /// child can only get what the parent sub-allocates).
+    pub const INSTANTIATOR: u32 = 6;
+    /// `Module` — a host-granted, host-**verified** module a guest may instantiate (§14). The handle
+    /// confers only the authority to pass it to the `Instantiator`'s module ops (5/6/7 —
+    /// `instantiate_module` / `spawn_coroutine_module` / `spawn_demand_coroutine_module`), which
+    /// spawn a child domain running *that* module's code confined to a carve of the holder's window
+    /// — the "plugin-in-plugin" story: a guest can only instantiate modules it was given (no ambient
+    /// authority). It has no directly callable ops (`cap.call` on it is an inert `CapFault`).
+    pub const MODULE: u32 = 8;
+    // id 9 was `IoRing` (the submit/complete ring), retired 2026-08-07 by the §12
+    // parking-on-blocking re-measure: batching measured 13× negative, overlap subsumed by
+    // parked blocking dispatches (DESIGN.md §12). The id stays reserved — never reuse it.
+    /// §12 `Blocking` — a *mock* synchronous-only / blocking host capability (DNS-/FS-blocking-shaped)
+    /// whose op 0 `work(arg) -> mix(arg)` is **window-independent and `&mut Host`-free**, so a
+    /// punting dispatch hands it to the offload pool instead of the guest's vCPU thread. Op 0 is
+    /// also a perfectly ordinary synchronous `cap.call` (it then blocks the caller — the degenerate path).
+    ///
+    /// **Test-only since CONSOLIDATION §5a:** no product powerbox grants it — it is the
+    /// offload-pool / §12 parking exerciser (an offloadable dispatch that always punts when it
+    /// would genuinely block). A harness that needs it calls `Host::grant_blocking`
+    /// (and registers the `"blocking"` name if its guest resolves by name).
+    pub const BLOCKING: u32 = 10;
+    /// `Jit` — the guest-driven JIT capability (DESIGN.md §22): submit serialized IR at runtime to
+    /// be validated (decode + verify + the memory-match precondition, via the host-injected
+    /// `JitValidator`) and compiled into the **same domain** (same window, same powerbox —
+    /// a module is not an isolation unit, DESIGN §8). op 0 `compile(ptr, len) -> code_handle | -errno`
+    /// (fail-closed: nothing is installed on any validation failure); op 1
+    /// `invoke(code_handle, args…) -> results` runs the compiled unit's entry (`funcs[0]`) over the
+    /// caller's **live window** — serviced by the eval loop on the interpreter (it must run guest
+    /// code, which the generic dispatch can't) and by the embedder's cap thunk on the JIT (it calls
+    /// the unit's native trampoline); traps in invoked code are **terminal for the domain**; op 2
+    /// `release(code_handle) -> 0 | -errno` revokes the handle (no code reclaim yet — DESIGN.md §22
+    /// "Code reclaim"); op 3 `install(code_handle) -> slot_index | -errno` (Model B2) installs the
+    /// unit into the `call_indirect` table's next reserved slot so old code (or another unit) can
+    /// dispatch it at native speed (old→new), `-ENOSPC` if the table is full; op 4
+    /// `uninstall(slot) -> 0 | -errno` clears an installed slot so the index is reusable and a
+    /// stale `call_indirect` of it traps (slot reclaim — the code memory itself is not freed).
+    pub const JIT: u32 = 11;
+    /// `CompiledCode` — a unit minted by `Jit.compile`. Like `Module`, it has no directly callable
+    /// ops (`cap.call` on it is an inert `CapFault`); it confers only the authority to be named in
+    /// `Jit.invoke`/`release` on the domain handle that compiled it.
+    pub const JIT_CODE: u32 = 12;
+    /// `HostProc` — an **embedder-registered** capability (§7 "host-defined capabilities"): the host
+    /// installs a handler closure with `grant_host_proc` and the guest reaches it like
+    /// any capability (`cap.call HOST_PROC op …`). The interface's *semantics* live entirely in the
+    /// embedder's closure (e.g. an `svm-wasi` shim), **outside** this crate's TCB match — so a host
+    /// can add capabilities without touching the VM. The handler reads/writes the guest window
+    /// through the same masked `GuestMem` the built-in ops use (authority-TCB, not escape-TCB).
+    pub const HOST_PROC: u32 = 13;
+    /// §15 / PROCESS.md §5 `Budget` — a passable, **splittable** resource-quota vector (fuel / mem /
+    /// spawn), §15's "every meterable resource is a capability with a quota" promoted to an object.
+    /// op 0 `split(fuel, mem, spawn) -> sub_handle | -errno`: mint a child `Budget` holding those
+    /// amounts, **deducted** from the holder's remaining — attenuation (a child can never exceed the
+    /// parent, D19); a field of `-1` means "all remaining"; asking for more than remains is `-EINVAL`.
+    /// op 1 `read(field) -> remaining | -EINVAL`: report one field's remaining quota (`0` fuel, `1`
+    /// mem, `2` spawn) — the §15 monitoring readout. Charging a domain's consumption against its budget
+    /// (the `create(module, window, budget)` accounting) is the follow-up; this is the passable object
+    /// + attenuation the rest builds on.
+    pub const BUDGET: u32 = 14;
+    /// PROCESS.md §5 **window minter** — the authority to mint **detached** windows: a child
+    /// spawned through it (`Instantiator.instantiate_detached`, op 15) gets a fresh platform
+    /// window *outside* the parent's — no ancestor below the minter holds read authority, and
+    /// the child attests `window_exposed = false` (the jacl distrust-spawner trust anchor).
+    /// The capability carries a **byte quota**, deducted at each mint (host-enforced); an
+    /// ordinary granted authority (D46 `Resolver`-shaped: you can mint detached windows only
+    /// if someone granted you that), embedder-granted at the root.
+    pub const WINDOW_MINTER: u32 = 15;
+    /// Base of the **guest-interface id space** (IMPORTS.md §3.2): ids for wired interface offers
+    /// are interned per-`Host` from this base upward (`intern_interface` — the id ≡
+    /// the structural op-signature list, the D59 rule applied to capability interfaces). Far above
+    /// the fixed built-ins and far below the reserved `u32::MAX`-family dispatch sentinels.
+    pub const GUEST_IMPL_BASE: u32 = 0x1000_0000;
+}
+
 /// SSA value types. `i8`/`i16` are memory access *widths*, not value types (§3a).
 /// `v128` is the fixed-128 SIMD vector (§17/D58): a first-class value carrying 16
 /// raw bytes whose lane interpretation is per-op, never per-value.
