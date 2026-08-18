@@ -357,10 +357,10 @@ const FIXTURES: &[Fixture] = &[
         feature: "methods (dynamic dispatch)",
         source: "type\n  Animal = ref object of RootObj\n  Dog = ref object of Animal\nmethod speak(a: Animal): int {.base.} = 0\nmethod speak(d: Dog): int = 42\nproc run(): int =\n  let a: Animal = Dog()\n  a.speak()\nlet r = run()\n",
         expected: 42,
-        // Compiles + runs, but dispatch resolves to the *base* method (returns 0, not 42) — a silent
-        // wrong-answer, both engines agreeing. See #979.
-        expect: Expect::FailsClosed(Stage::Run),
-        ticket: Some("#979 (method dispatch selects base)"),
+        // Fixed in #979: the `Rtti` vtable's `mt` method table is now materialized (funcref relocs),
+        // so dynamic dispatch reaches the derived override (`Dog.speak` → 42), both engines agreeing.
+        expect: Expect::Runs,
+        ticket: None,
     },
     Fixture {
         feature: "string (.len)",
