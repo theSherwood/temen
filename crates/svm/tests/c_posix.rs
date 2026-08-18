@@ -1237,3 +1237,275 @@ int main() {{\n\
     assert_eq!(jit.exited, Some(7), "jit: exit code must match interp");
     assert_eq!(jit.stdout, interp.stdout, "jit: stdout must match interp");
 }
+
+/// #800 — the guest-libc modules (`crates/svm-run/demos/posix_libc/`): real-libc functions that are
+/// pure guest code (POSIX.md §1's split — semantics guest-side, never in the core), concatenated into
+/// the test program as one translation unit.
+const FNMATCH_C: &str = include_str!("../../svm-run/demos/posix_libc/fnmatch.c");
+const POSIX_MISC_C: &str = include_str!("../../svm-run/demos/posix_libc/posix_misc.c");
+
+/// Render `s` as a C string literal (escaping `\` and `"`).
+fn c_str_lit(s: &str) -> String {
+    let mut o = String::from("\"");
+    for ch in s.chars() {
+        match ch {
+            '\\' => o.push_str("\\\\"),
+            '"' => o.push_str("\\\""),
+            _ => o.push(ch),
+        }
+    }
+    o.push('"');
+    o
+}
+
+/// #800 — the guest `fnmatch(3)` differential-tested against the **host libc's** `fnmatch(3)` over a
+/// portable case table (the flags rendered per-platform through the `libc` crate). Guest flag values are
+/// glibc's (fnmatch.c); the host side maps them to its own constants, so the same table drives both. The
+/// guest prints one `'1'`/`'0'` per case; the expected string is computed by calling the real host
+/// `fnmatch`. Cases stick to POSIX-specified behavior where glibc and the BSDs agree (the glibc-specific
+/// fallbacks are hand-asserted in the next test). Both backends must match the host byte-for-byte.
+#[test]
+fn c_fnmatch_matches_the_host_libc() {
+    // (pattern, string, guest flags: PATHNAME=1 NOESCAPE=2 PERIOD=4)
+    const CASES: &[(&str, &str, i32)] = &[
+        ("*", "abc", 0),
+        ("*", "", 0),
+        ("", "", 0),
+        ("", "a", 0),
+        ("*.c", "foo.c", 0),
+        ("*.c", "foo.h", 0),
+        ("*c", "c", 0),
+        ("a**b", "ab", 0),
+        ("a*b*c", "aXbYc", 0),
+        ("a*b*c", "acb", 0),
+        ("?at", "cat", 0),
+        ("?at", "at", 0),
+        ("[abc]at", "bat", 0),
+        ("[abc]at", "dat", 0),
+        ("[!abc]at", "dat", 0),
+        ("[!abc]at", "bat", 0),
+        ("[^abc]at", "dat", 0),
+        ("[a-m]x", "gx", 0),
+        ("[a-m]x", "px", 0),
+        ("[]ab]", "]", 0),
+        ("[]ab]", "c", 0),
+        ("[[:digit:]][[:alpha:]]", "7x", 0),
+        ("[[:digit:]][[:alpha:]]", "xx", 0),
+        ("[![:space:]]", "q", 0),
+        ("[[:xdigit:]]", "f", 0),
+        ("foo/*", "foo/bar", 0),
+        ("*", "foo/bar", 1),
+        ("*/*", "foo/bar", 1),
+        ("*/*", "foo/bar/baz", 1),
+        ("foo?bar", "foo/bar", 1),
+        ("foo*baz", "foo/baz", 1),
+        ("foo/*", "foo/bar", 1),
+        ("*", ".hidden", 4),
+        (".*", ".hidden", 4),
+        ("?idden", ".hidden", 4),
+        ("*/*", "foo/.bar", 5),
+        ("*/.*", "foo/.bar", 5),
+        ("\\*", "*", 0),
+        ("\\*", "x", 0),
+        ("\\*", "\\anything", 2),
+        ("a\\?c", "a?c", 0),
+        ("a\\?c", "abc", 0),
+    ];
+    let n = CASES.len();
+
+    // Host oracle: the same table through the platform's real fnmatch(3).
+    fn host_flags(g: i32) -> i32 {
+        let mut f = 0;
+        if g & 1 != 0 {
+            f |= libc::FNM_PATHNAME;
+        }
+        if g & 2 != 0 {
+            f |= libc::FNM_NOESCAPE;
+        }
+        if g & 4 != 0 {
+            f |= libc::FNM_PERIOD;
+        }
+        f
+    }
+    let expected: Vec<u8> = CASES
+        .iter()
+        .map(|&(pat, s, g)| {
+            let p = std::ffi::CString::new(pat).unwrap();
+            let c = std::ffi::CString::new(s).unwrap();
+            let r = unsafe { libc::fnmatch(p.as_ptr(), c.as_ptr(), host_flags(g)) };
+            if r == 0 {
+                b'1'
+            } else {
+                b'0'
+            }
+        })
+        .collect();
+
+    let pats: Vec<String> = CASES.iter().map(|c| c_str_lit(c.0)).collect();
+    let strs: Vec<String> = CASES.iter().map(|c| c_str_lit(c.1)).collect();
+    let flgs: Vec<String> = CASES.iter().map(|c| c.2.to_string()).collect();
+    let src = format!(
+        "{SHIM}\n{FNMATCH_C}\n\
+static char *pats[] = {{ {} }};\n\
+static char *strs[] = {{ {} }};\n\
+static int flgs[] = {{ {} }};\n\
+static char out[{n}];\n\
+int main(void) {{\n\
+  int i;\n\
+  for (i = 0; i < {n}; i = i + 1)\n\
+    out[i] = fnmatch(pats[i], strs[i], flgs[i]) == 0 ? '1' : '0';\n\
+  write(1, out, {n});\n\
+  return 0;\n\
+}}\n",
+        pats.join(", "),
+        strs.join(", "),
+        flgs.join(", "),
+    );
+    let (interp, jit) = run_both(&src, |_| {});
+
+    if interp.stdout != expected {
+        let i = interp
+            .stdout
+            .iter()
+            .zip(&expected)
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
+        panic!(
+            "guest fnmatch diverged from the host libc at case {i}: {:?} (guest {:?}, host {:?})",
+            CASES[i], interp.stdout[i] as char, expected[i] as char
+        );
+    }
+    assert_eq!(jit.stdout, expected, "jit parity with the host fnmatch");
+}
+
+/// #800 — the `fnmatch` behaviors the differential can't carry portably: `FNM_CASEFOLD` (the GNU/BSD
+/// extension bash's nocaseglob/nocasematch use; the `libc` crate doesn't expose it everywhere) and the
+/// glibc malformed-bracket fallback (an unterminated `[` matches literally — BSDs differ). Hand-asserted
+/// expectations, both backends.
+#[test]
+fn c_fnmatch_casefold_and_bracket_fallback() {
+    // (pattern, string, guest flags, expected-match) — CASEFOLD=16
+    const CASES: &[(&str, &str, i32, bool)] = &[
+        ("*.C", "foo.c", 16, true),
+        ("abc", "ABC", 16, true),
+        ("abc", "ABD", 16, false),
+        ("[a-f]x", "Dx", 16, true),
+        ("[A-F]x", "dx", 16, true),
+        ("[a-f]x", "gx", 16, false),
+        ("a[b", "a[b", 0, true),
+        ("[", "[", 0, true),
+        ("a[b", "ab", 0, false),
+    ];
+    let n = CASES.len();
+    let expected: Vec<u8> = CASES
+        .iter()
+        .map(|c| if c.3 { b'1' } else { b'0' })
+        .collect();
+    let pats: Vec<String> = CASES.iter().map(|c| c_str_lit(c.0)).collect();
+    let strs: Vec<String> = CASES.iter().map(|c| c_str_lit(c.1)).collect();
+    let flgs: Vec<String> = CASES.iter().map(|c| c.2.to_string()).collect();
+    let src = format!(
+        "{SHIM}\n{FNMATCH_C}\n\
+static char *pats[] = {{ {} }};\n\
+static char *strs[] = {{ {} }};\n\
+static int flgs[] = {{ {} }};\n\
+static char out[{n}];\n\
+int main(void) {{\n\
+  int i;\n\
+  for (i = 0; i < {n}; i = i + 1)\n\
+    out[i] = fnmatch(pats[i], strs[i], flgs[i]) == 0 ? '1' : '0';\n\
+  write(1, out, {n});\n\
+  return 0;\n\
+}}\n",
+        pats.join(", "),
+        strs.join(", "),
+        flgs.join(", "),
+    );
+    let (interp, jit) = run_both(&src, |_| {});
+    if interp.stdout != expected {
+        let i = interp
+            .stdout
+            .iter()
+            .zip(&expected)
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
+        panic!(
+            "fnmatch casefold/fallback diverged at case {i}: {:?} (guest {:?}, want {:?})",
+            CASES[i], interp.stdout[i] as char, expected[i] as char
+        );
+    }
+    assert_eq!(jit.stdout, expected, "jit parity");
+}
+
+/// #800 — `putenv` as real libc over the env ops: `KEY=VALUE` sets (overwriting a staged variable),
+/// a bare `KEY` removes (the glibc behavior bash relies on). Round-tripped through `getenv` and echoed,
+/// both backends.
+#[test]
+fn c_putenv_sets_overwrites_and_removes() {
+    let src = format!(
+        "{SHIM}\n{POSIX_MISC_C}\n\
+int main(void) {{\n\
+  if (putenv(\"NEWVAR=hello\") != 0) return 1;\n\
+  char *v = getenv(\"NEWVAR\");\n\
+  if (!v) return 2;\n\
+  write(1, v, slen(v));                    /* -> \"hello\" */\n\
+  if (putenv(\"PATH=/override\") != 0) return 3;\n\
+  char *p = getenv(\"PATH\");\n\
+  write(1, p, slen(p));                    /* -> \"/override\", the staged \"/bin\" replaced */\n\
+  if (putenv(\"NEWVAR\") != 0) return 4;     /* bare name removes (glibc) */\n\
+  if (getenv(\"NEWVAR\")) return 5;\n\
+  return 42;\n\
+}}\n"
+    );
+    let (interp, jit) = run_both(&src, |px| px.set_env("PATH", "/bin"));
+    assert_eq!(
+        interp.result,
+        vec![Value::I32(42)],
+        "interp: putenv set, overwrote, and removed"
+    );
+    assert_eq!(
+        interp.stdout, b"hello/override",
+        "interp: getenv round-trip"
+    );
+    assert_eq!(jit.result, vec![Value::I64(42)], "jit parity");
+    assert_eq!(jit.stdout, interp.stdout, "jit stdout parity");
+}
+
+/// #800 — `wait4`/`wait3` as real libc over op 28: `wait4(pid)` rides the #799 **blocking** reap and
+/// zeroes the caller's `rusage` (the personality meters fuel, not rusage — all-zero is the POSIX "no
+/// information" answer; the buffer is pre-poisoned to prove the zeroing); `wait3` is the any-child form
+/// (non-blocking on the table, so it polls like every `-1` wait). Two fork twins, reaped one by each.
+#[test]
+fn c_wait4_and_wait3_reap_fork_twins() {
+    let src = format!(
+        "{POSIX_MISC_C}\n\
+long __px_fork(int cap, long a);\n\
+static int status;\n\
+static char ru[144];\n\
+static long pid; static long pid2; static long h;\n\
+int main(void) {{\n\
+  int i;\n\
+  for (i = 0; i < 144; i = i + 1) ru[i] = 0x55;   /* poison: wait4 must zero it */\n\
+  pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 1;\n\
+  if (pid == 0) return 7;\n\
+  h = wait4(pid, &status, 0, ru);                 /* specific pid: the blocking reap */\n\
+  if (h != pid) return 2;\n\
+  if (((status >> 8) & 0xff) != 7) return 3;\n\
+  for (i = 0; i < 144; i = i + 1) if (ru[i]) return 4;\n\
+  pid2 = __px_fork(0, 0);\n\
+  if (pid2 < 0) return 5;\n\
+  if (pid2 == 0) return 9;\n\
+  while ((h = wait3(&status, 0, ru)) == -10) {{}}  /* any-child: poll until the twin retires */\n\
+  if (h != pid2) return 6;\n\
+  if (((status >> 8) & 0xff) != 9) return 8;\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_only(&src, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "wait4 blocked on the twin, zeroed rusage; wait3 reaped the second twin any-child"
+    );
+}
