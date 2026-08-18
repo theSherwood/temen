@@ -1,0 +1,46 @@
+(.nif27)
+(.vendor "Nifler")
+(.dialect "nim-parsed")
+(stmts@,1,in.nim
+ (type@B Color~6 . . .
+  (enum@2 .
+   (efld@5 cRed . . . .)
+   (efld@B cGreen . . . .)
+   (efld@J cBlue . . . .)))
+ (proc@,2 classify@5 . . .
+  (params@D
+   (param@1 n . . int@3 .))string@A . .
+  (stmts@2,1
+   (if
+    (elif@3
+     (infix@2 < n~2 0@2)
+     (stmts~1,1
+      (asgn@7 result~7 "neg"@2)))
+    (elif@5,2
+     (infix@2 == n~2 0@3)
+     (stmts~3,1
+      (asgn@7 result~7 "zero"@2)))
+    (else@,4
+     (stmts@2,1
+      (asgn@7 result~7 "pos"@2))))))
+ (proc@,A sumTo@5 . . .
+  (params@A
+   (param@1 n . . int@3 .))int@A . .
+  (stmts@2,1
+   (var@4 total . . . 0@8)
+   (for@4,1
+    (infix@7 \2E\2E< 0~2 n@4)
+    (unpackflat
+     (let i . . ..))
+    (stmts~2,1
+     (infix@6 \2B= total~6 i@3)))
+   (while@,3
+    (infix@C > total~6 100@2)
+    (stmts@2,1
+     (asgn@6 total~6
+      (infix@8 div total~6 2@4))))total@,5))
+ (let@4,I c . . . cGreen@4)
+ (let@4,J s . . .
+  (call@C classify~8 -5@1))
+ (let@4,K t . . .
+  (call@9 sumTo~5 20@1)))

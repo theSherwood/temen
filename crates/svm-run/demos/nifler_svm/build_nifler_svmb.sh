@@ -87,3 +87,24 @@ for src in "$HERE"/inputs/*.nim; do
   done
 done
 [ "$fail" = 0 ] && echo "ALL MATCH NATIVE — a real nimony phase (nifler) parses Nim on the SVM, byte-exact" || { echo "FAILED"; exit 1; }
+
+# --- [6/6] regenerate the committed slice-4 browser asset + gate fixtures (opt-in) -------------------
+# The playground card (`browser/web/play.js`, kind 'nifler') loads `nifler.svmb` **gzipped** (~3.8 MB
+# vs ~17.7 MB raw; inflated client-side), and the toolchain-free gate `crates/svm-run/tests/nifler_asset.rs`
+# compares the in-sandbox parse against `expected/*.p.nif` (verbatim native-nifler output). Both are
+# committed. Regenerate them here with `SVM_NIFLER_EMIT_ASSET=1` when the module or a fixture drifts.
+if [ "${SVM_NIFLER_EMIT_ASSET:-0}" = 1 ]; then
+  echo "=== [6/6] emit committed asset + fixtures (SVM_NIFLER_EMIT_ASSET=1) ==="
+  gzip -9 -c "$CACHE/nifler.svmb" > "$REPO/browser/web/assets/nifler.svmb.gz"
+  echo "  browser/web/assets/nifler.svmb.gz $(stat -c%s "$REPO/browser/web/assets/nifler.svmb.gz") B (from $(stat -c%s "$CACHE/nifler.svmb") B raw)"
+  mkdir -p "$HERE/expected"
+  for src in "$HERE"/inputs/*.nim; do
+    name="$(basename "$src" .nim)"
+    # Native nifler over the source seeded as `in.nim` (the portable path the guest embeds too).
+    rm -rf "$CACHE/nat"; mkdir -p "$CACHE/nat"; cp "$src" "$CACHE/nat/in.nim"
+    ( cd "$CACHE/nat" && "$NIFLER_BIN" p in.nim out.nif >/dev/null 2>&1 )
+    cp "$CACHE/nat/out.nif" "$HERE/expected/$name.p.nif"
+    echo "  expected/$name.p.nif $(stat -c%s "$HERE/expected/$name.p.nif") B"
+  done
+  echo "  committed asset + fixtures regenerated — git add browser/web/assets/nifler.svmb.gz $HERE/expected"
+fi

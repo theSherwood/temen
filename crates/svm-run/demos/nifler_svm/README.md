@@ -46,12 +46,29 @@ NIFLER_BIN=<repo>/.nimtool/nimony/bin/nifler  bash build_nifler_svmb.sh
 ```
 
 Fail-soft **SKIP** when the toolchain is absent (nimony bootstrap needs Nim 2.3.x devel, so this is
-**not** in the per-PR CI — NIM.md §2). The ~17 MB `.svmb` is a build artifact, **not committed** (too
-big for an asset lane); this script is the gate, run when the toolchain is present.
+**not** in the per-PR CI — NIM.md §2). This script is the toolchain-gated build+diff gate.
+
+## The committed browser asset (slice 4)
+
+The raw `.svmb` is ~17.7 MB — too big to commit raw — so the **slice-4 playground card** ships it
+**gzipped**: `browser/web/assets/nifler.svmb.gz` (~3.8 MB, comparable to one QuickJS asset), which the
+card inflates client-side via the browser's `DecompressionStream`. A toolchain-free PR gate,
+`crates/svm-run/tests/nifler_asset.rs`, inflates that committed `.gz`, re-verifies it, runs it
+in-sandbox over `inputs/*.nim`, and asserts the emitted NIF is byte-identical to the committed
+`expected/*.p.nif` (verbatim native-nifler output) — so any IR/ABI/encoder drift fails the PR.
+
+Regenerate the committed asset + fixtures (when the module or a fixture drifts) with:
+
+```sh
+SVM_NIFLER_EMIT_ASSET=1  NIFLER_BIN=<repo>/.nimtool/nimony/bin/nifler  bash build_nifler_svmb.sh
+git add browser/web/assets/nifler.svmb.gz crates/svm-run/demos/nifler_svm/expected
+```
 
 ## Status
 
-✅ **Slice 1 done.** `nifler` parses `inputs/*.nim` on the SVM, byte-identical to native, on
-treewalk · bytecode · jit. Next: the larger phases (`hexer`, `nimony`) the same way, then drive the
-real chain (NIM.md §3c W4 `domain_exec`) and feed its Leng into the already-in-browser `svm-leng.svmb`
-→ the "compile Nim in the browser" card.
+✅ **Slice 1 + slice 4 done.** `nifler` parses `inputs/*.nim` on the SVM, byte-identical to native, on
+treewalk · bytecode · jit (slice 1), and the **"compile Nim in the browser" front-end card** runs it
+client-side over the reader's own Nim (slice 4): `browser/web/play.js` kind `'nifler'` → the
+`svm_run_nifler_fs` cdylib entry → the emitted `.p.nif` shown in the pane. The complement to the
+already-in-browser `svm-leng.svmb` back-end card (Leng → SVM IR): with both, the front edge (Nim →
+NIF) and the back edge (Leng → IR) of the toolchain each run in the browser, on the SVM.

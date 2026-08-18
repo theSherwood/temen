@@ -33,9 +33,9 @@ CM.defineSimpleMode('svm', {
 
 // CodeMirror mode string for a demo's declared `lang`. SVM text is the default.
 const MODE = { svm: 'svm', lua: 'lua', sql: 'text/x-sql', c: 'text/x-csrc', js: 'text/javascript',
-  // The CodeMirror bundle carries no shell grammar; plain text (no mis-highlighting) suits the
-  // shell-script card fine.
-  shell: 'text/plain' };
+  // The CodeMirror bundle carries no shell or Nim grammar; plain text (no mis-highlighting) suits the
+  // shell-script and Nim front-end cards fine.
+  shell: 'text/plain', nim: 'text/plain' };
 
 const instances = [];
 

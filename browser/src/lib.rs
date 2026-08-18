@@ -3101,6 +3101,72 @@ pub fn onramp_fs_exec(m: &svm_ir::Module, image: &[u8], argv: &[&[u8]], stdin: &
     }
 }
 
+/// Like [`onramp_fs_exec`], but after the run **reads one named file back out of the seeded memfs** —
+/// for a guest phase whose real output is a *file* it wrote through the `fs` cap, not stdout. `nifler
+/// p /in.nim /out.p.nif` (NIM.md §3c/§3e, "nimony in the browser" slice 4) parses to a `.p.nif` file;
+/// [`onramp_fs_exec`] drops the fs handle, so this keeps it and, after the run, seeds it back out and
+/// returns the bytes at `out_key` (the memfs strips a leading `/`, so pass the slashless key). The
+/// file is `Vec::new()` if the phase never wrote it (a parse error — the caller shows the guest's
+/// stderr instead). The run's own `stdout`/`stderr` still ride the returned [`PbOutcome`].
+fn onramp_fs_exec_readback(
+    m: &svm_ir::Module,
+    image: &[u8],
+    argv: &[&[u8]],
+    stdin: &[u8],
+    out_key: &str,
+) -> (PbOutcome, Vec<u8>) {
+    let unsupported = |status: i32| PbOutcome {
+        status,
+        value: 0,
+        exit_code: 0,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        framebuffer: None,
+    };
+    let (mut host, init_mem, fs) = match pg_setup(m, image, argv) {
+        Ok(setup) => setup,
+        Err(status) => return (unsupported(status), Vec::new()),
+    };
+    host.stdin = stdin.to_vec();
+    let mut fuel = u64::MAX;
+    let (status, value, exit_code) = match bytecode::compile_and_run_capture_reserved_with_host(
+        m,
+        0,
+        &[],
+        &mut fuel,
+        &init_mem,
+        svm_ir::DEFAULT_RESERVED_LOG2,
+        &mut host,
+    ) {
+        None => (STATUS_UNSUPPORTED, 0, 0),
+        Some((Err(Trap::Exit(code)), _)) => (STATUS_EXIT, 0, code),
+        Some((Err(_), _)) => (STATUS_TRAP, 0, 0),
+        Some((Ok(vals), _)) => match vals.first() {
+            Some(Value::I64(x)) => (STATUS_OK, *x, 0),
+            Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
+            _ => (STATUS_BAD_RESULT, 0, 0),
+        },
+    };
+    // Read the emitted file back out of the live store (the `MemFsHandle` observes what the guest wrote).
+    let (files, _dirs) = fs.seed();
+    let produced = files
+        .into_iter()
+        .find(|(k, _)| k == out_key)
+        .map(|(_, v)| v)
+        .unwrap_or_default();
+    (
+        PbOutcome {
+            status,
+            value,
+            exit_code,
+            stdout: host.stdout,
+            stderr: host.stderr,
+            framebuffer: None,
+        },
+        produced,
+    )
+}
+
 /// **Boot Postgres in wasm.** Decode + verify the module at `[mod_ptr, mod_len)`, mount the data image
 /// at `[img_ptr, img_len)` on the `fs` cap, feed the SQL at `[stdin_ptr, stdin_len)`, and run. Sets
 /// [`svm_status`]/[`svm_exit_code`]; the backend's output is read back via `svm_stdout_ptr`/`_len`.
@@ -3452,6 +3518,57 @@ pub extern "C" fn svm_run_onramp_fs(
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
         stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
+        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
+        EXIT_CODE = out.exit_code;
+    }
+    out.value
+}
+
+/// **Compile Nim in the browser — the nimony front-end card** (NIM.md §3c/§3e, "nimony in the browser"
+/// slice 4). Run `nifler.svmb` — the *first real nimony compiler phase* (Nim source → parsed NIF),
+/// itself a Nim program on-ramped to SVM through the C on-ramp (slice 1) — over the editor's Nim.
+/// Decode + verify the phase module at `[mod_ptr, mod_len)`, seed an in-memory `fs` cap with the user's
+/// source at `in.nim`, run `nifler p /in.nim /out.p.nif` (the parse command), and hand the emitted
+/// `.p.nif` **text** back on `svm_stdout_ptr`/`_len` — the same real nifler that parses Nim natively,
+/// now running client-side in the sandbox on the reader's own code. Unlike the pre-built
+/// `nim (Nim → SVM, runs)` card (whose front-end ran at *build* time), this runs a front-end phase
+/// **in the browser**; unlike the `svm-leng` back-end card (Leng → IR), this is the front edge (Nim →
+/// NIF). The guest reaches only the seeded `fs` — no ambient authority. Sets [`svm_status`]/
+/// [`svm_exit_code`]; returns the guest's `i64` result (`0` on any non-`OK`/`EXIT`). On a parse error
+/// (`nifler` wrote no `.p.nif`) the guest's own stderr rides `svm_stderr_ptr`/`_len` and the stdout
+/// capture is empty, so the card can surface the diagnostic.
+#[no_mangle]
+pub extern "C" fn svm_run_nifler_fs(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    src_ptr: *const u8,
+    src_len: usize,
+) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees each range is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let src = unsafe { core::slice::from_raw_parts(src_ptr, src_len) };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    if svm_verify::verify_module(&m).is_err() {
+        set(STATUS_VERIFY_ERR);
+        return 0;
+    }
+    // Seed the source as `in.nim`; nifler parses `/in.nim` and writes `/out.p.nif` (both memfs keys,
+    // slashless in the store). The emitted `.p.nif` is the file we read back and show.
+    let image = svm_fs::encode_image(&[("in.nim".to_string(), src.to_vec())], &[]);
+    let argv: [&[u8]; 4] = [b"nifler", b"p", b"/in.nim", b"/out.p.nif"];
+    let (out, produced) = onramp_fs_exec_readback(&m, &image, &argv, &[], "out.p.nif");
+    set(out.status);
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
+    // The produced `.p.nif` is the visible output (stdout slot); the guest's diagnostics ride stderr.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(OUT), produced);
         stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
         EXIT_CODE = out.exit_code;
     }
