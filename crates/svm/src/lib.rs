@@ -11,6 +11,13 @@ pub use svm_ir as ir;
 pub use svm_text as text;
 pub use svm_verify as verify;
 
+/// The embedding runtime — instantiate a verified module with the powerbox and run it. Behind the
+/// off-by-default `run` feature (#918) so the umbrella crate's default build stays the dependency-free
+/// pipeline core; `svm_run` itself re-exports `parse_module`/`decode_module`/`verify_module`, so an
+/// embedder that enables `run` needs only this one crate.
+#[cfg(feature = "run")]
+pub use svm_run as run;
+
 use svm_interp::Value;
 use svm_ir::{FuncIdx, Module, ValType};
 

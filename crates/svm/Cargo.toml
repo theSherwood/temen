@@ -11,6 +11,10 @@ publish = false
 [features]
 # Passthrough to svm-fiber's ASan fiber-switch annotations (the sanitizer job).
 asan = ["svm-jit/asan"]
+# The embedding front door (#918): `pub use svm_run` so a consumer reaches the runtime (instantiate
+# + powerbox + JIT) through this one umbrella crate. **Off by default** — the default build stays the
+# dependency-free, auditable pipeline core (see the comment above). Opt in with `--features run`.
+run = ["dep:svm-run"]
 
 [dependencies]
 svm-ir.workspace = true
@@ -18,6 +22,9 @@ svm-text.workspace = true
 svm-encode.workspace = true
 svm-verify.workspace = true
 svm-interp.workspace = true
+# Optional embedding runtime, gated by the `run` feature (see [features]); keeps the default core
+# dependency-free. Also a dev-dependency below (the differential tests use it unconditionally).
+svm-run = { path = "../svm-run", optional = true }
 
 [[bin]]
 name = "svm-bench"
