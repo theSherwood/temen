@@ -9248,7 +9248,7 @@ pub extern "C" fn svm_coop_open(
     // `host.jit_table_log2()`, so force it here (a `vm_jit_*` importer's `grant_onramp_caps` already set
     // it to this floor; `set_jit_table_log2` takes the max, so this is idempotent for that case).
     if all_shimmable {
-        host.set_jit_table_log2(ONRAMP_JIT_TABLE_LOG2 as u8);
+        host.set_jit_table_log2(ONRAMP_JIT_TABLE_LOG2);
     }
     // #926 slice 2e/2f: arm the §22 unit wasm-emitter for a `vm_jit_*` importer so its runtime-compiled
     // units run emitted (the pump then surfaces a `CoopEvent::JitInvoke` when a unit has emitted wasm;
