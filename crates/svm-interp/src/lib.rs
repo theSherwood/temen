@@ -10740,11 +10740,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // re-granted caps by name, via the record's grant list.)
                             let want_as =
                                 cfs.get(entry as usize).is_some_and(|f| f.params.len() >= 2);
-                            let ok_entry = cfs.get(entry as usize).is_some_and(|f| {
-                                f.results == [ValType::I64]
-                                    && f.params.iter().all(|p| *p == ValType::I64)
-                                    && (f.params.len() == 1 || f.params.len() == 2)
-                            });
+                            let ok_entry = cfs
+                                .get(entry as usize)
+                                .is_some_and(|f| bytecode::child_entry_ok(&f.params, &f.results));
                             // The carve must be a power-of-two-aligned sub-window within `[0, isize)`
                             // — a child can only get what the holder sub-allocates (§14/D19). A
                             // separate-module child's carve must be **at least its declared memory**
@@ -10762,10 +10760,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let mod_ok = child_mod.as_ref().is_none_or(|cm| {
                                 cm.memory_log2.is_some_and(|ml| ml <= size_log2 as u8)
                             });
-                            let fits = child_size != 0
-                                && child_size <= isize
-                                && off & (child_size - 1) == 0
-                                && off.checked_add(child_size).is_some_and(|e| e <= isize)
+                            let fits = bytecode::carve_fits(off, size_log2, isize)
                                 // §3b: a budget-funded spawn's carve must fit the budget's mem
                                 // quota (`-1` = unbounded). Peek, not take — a refused spawn
                                 // leaves the budget intact.
@@ -11250,11 +11245,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let cfs: &[Func] = &cm.funcs;
                             let want_as =
                                 cfs.get(entry as usize).is_some_and(|f| f.params.len() >= 2);
-                            let ok_entry = cfs.get(entry as usize).is_some_and(|f| {
-                                f.results == [ValType::I64]
-                                    && f.params.iter().all(|p| *p == ValType::I64)
-                                    && (f.params.len() == 1 || f.params.len() == 2)
-                            });
+                            let ok_entry = cfs
+                                .get(entry as usize)
+                                .is_some_and(|f| bytecode::child_entry_ok(&f.params, &f.results));
                             let child_size = if (0..64).contains(&size_log2) {
                                 1u64 << size_log2
                             } else {
@@ -12020,11 +12013,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let entry_params = cmod
                         .as_ref()
                         .and_then(|cm| cm.funcs.get(entry as usize))
-                        .filter(|f| {
-                            f.results == [ValType::I64]
-                                && f.params.iter().all(|p| *p == ValType::I64)
-                                && (f.params.len() == 1 || f.params.len() == 2)
-                        })
+                        .filter(|f| bytecode::child_entry_ok(&f.params, &f.results))
                         .map(|f| f.params.len());
                     let admissible = !durable
                         && clean_root

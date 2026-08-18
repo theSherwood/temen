@@ -1103,6 +1103,32 @@ fn take_spawn_budget(
     }))
 }
 
+/// The §14 carve **geometry** check (D19), the single definition every spawn/instantiate driver and
+/// tree-walk arm shares: a child window of `1 << size_log2` bytes at offset `off` fits inside the
+/// parent's `[0, isize)` iff the size is a valid power of two (`size_log2` in `0..64`), `off` is
+/// size-aligned, and the whole span lies within `isize`. Overflow-free (an out-of-range `size_log2`
+/// or a `off + size` past `u64` yields `false`, not a shift/overflow). A future bound tweak lives
+/// here, not in ten pasted copies (#911).
+pub(crate) fn carve_fits(off: u64, size_log2: i64, isize: u64) -> bool {
+    let child_size = if (0..64).contains(&size_log2) {
+        1u64 << size_log2
+    } else {
+        0
+    };
+    child_size != 0
+        && child_size <= isize
+        && off & (child_size - 1) == 0
+        && off.checked_add(child_size).is_some_and(|e| e <= isize)
+}
+
+/// A §14 child module's **entry signature** must be `(i64) -> (i64)` (an instantiator handle) or
+/// `(i64, i64) -> (i64)` (also an address-space handle, so the child manages its own pages). The
+/// single definition the drivers and tree-walk arms share (#911).
+pub(crate) fn child_entry_ok(params: &[ValType], results: &[ValType]) -> bool {
+    results == [ValType::I64]
+        && (params == [ValType::I64] || params == [ValType::I64, ValType::I64])
+}
+
 pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
     compile_module_with(funcs, true)
 }
@@ -3388,20 +3414,17 @@ impl<'p> Vcpu<'p> {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
             return Ok(None);
         };
-        let ok_entry = cm.sigs.get(entry as usize).is_some_and(|(p, r)| {
-            r[..] == [ValType::I64]
-                && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
-        });
+        let ok_entry = cm
+            .sigs
+            .get(entry as usize)
+            .is_some_and(|(p, r)| child_entry_ok(p, r));
         let child_size = if (0..64).contains(&size_log2) {
             1u64 << size_log2
         } else {
             0
         };
         let off_u = off as u64;
-        let fits = child_size != 0
-            && child_size <= isize
-            && off_u & (child_size - 1) == 0
-            && off_u.checked_add(child_size).is_some_and(|e| e <= isize);
+        let fits = carve_fits(off_u, size_log2, isize);
         if !ok_entry || !fits {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
             return Ok(None);
@@ -3476,20 +3499,14 @@ impl<'p> Vcpu<'p> {
         let ok_entry = child_compiled
             .sigs
             .get(entry as usize)
-            .is_some_and(|(p, r)| {
-                r[..] == [ValType::I64]
-                    && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
-            });
+            .is_some_and(|(p, r)| child_entry_ok(p, r));
         let child_size = if (0..64).contains(&size_log2) {
             1u64 << size_log2
         } else {
             0
         };
         let off_u = off as u64;
-        let fits = child_size != 0
-            && child_size <= isize
-            && off_u & (child_size - 1) == 0
-            && off_u.checked_add(child_size).is_some_and(|e| e <= isize);
+        let fits = carve_fits(off_u, size_log2, isize);
         let mod_ok = cmem_log2 == Some(size_log2 as u8);
         if !ok_entry || !fits || !mod_ok {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
@@ -6253,20 +6270,14 @@ fn dbg_instantiate(
     // -> (i64)`; the latter also gets an `AddressSpace` grant so it manages its own pages.
     let sig = c0.sigs.get(entry as u64 as usize);
     let want_as = sig.is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
-    let ok_entry = sig.is_some_and(|(p, r)| {
-        r[..] == [ValType::I64]
-            && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
-    });
+    let ok_entry = sig.is_some_and(|(p, r)| child_entry_ok(p, r));
     let child_size = if (0..64).contains(&size_log2) {
         1u64 << size_log2
     } else {
         0
     };
     let off_u = off as u64;
-    let fits = child_size != 0
-        && child_size <= isz
-        && off_u & (child_size - 1) == 0
-        && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
+    let fits = carve_fits(off_u, size_log2, isz);
     if !ok_entry || !fits {
         tasks[ti]
             .vt
@@ -6380,20 +6391,14 @@ fn dbg_instantiate_module(
     // declared memory (§14 transparency — it runs exactly as it would standalone).
     let sig = child_compiled.sigs.get(entry as u64 as usize);
     let want_as = sig.is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
-    let ok_entry = sig.is_some_and(|(p, r)| {
-        r[..] == [ValType::I64]
-            && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
-    });
+    let ok_entry = sig.is_some_and(|(p, r)| child_entry_ok(p, r));
     let child_size = if (0..64).contains(&size_log2) {
         1u64 << size_log2
     } else {
         0
     };
     let off_u = off as u64;
-    let fits = child_size != 0
-        && child_size <= isz
-        && off_u & (child_size - 1) == 0
-        && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
+    let fits = carve_fits(off_u, size_log2, isz);
     let mod_ok = cmem_log2 == Some(size_log2 as u8);
     if !ok_entry || !fits || !mod_ok {
         tasks[ti]
@@ -10062,10 +10067,10 @@ impl CoopSched {
                         .sigs
                         .get(entry as usize)
                         .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
-                    let ok_entry = c0.sigs.get(entry as usize).is_some_and(|(p, r)| {
-                        r[..] == [ValType::I64]
-                            && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
-                    });
+                    let ok_entry = c0
+                        .sigs
+                        .get(entry as usize)
+                        .is_some_and(|(p, r)| child_entry_ok(p, r));
                     // The carve must be a power-of-two-aligned sub-window within `[0, isize)` — a child
                     // gets only what the holder sub-allocates (§14/D19).
                     let child_size = if (0..64).contains(&size_log2) {
@@ -10074,10 +10079,7 @@ impl CoopSched {
                         0
                     };
                     let off_u = off as u64;
-                    let fits = child_size != 0
-                        && child_size <= isz
-                        && off_u & (child_size - 1) == 0
-                        && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
+                    let fits = carve_fits(off_u, size_log2, isz);
                     if !ok_entry || !fits {
                         tasks[ti]
                             .vt
@@ -10273,21 +10275,14 @@ impl CoopSched {
                     let ok_entry = child_compiled
                         .sigs
                         .get(entry as usize)
-                        .is_some_and(|(p, r)| {
-                            r[..] == [ValType::I64]
-                                && (p[..] == [ValType::I64]
-                                    || p[..] == [ValType::I64, ValType::I64])
-                        });
+                        .is_some_and(|(p, r)| child_entry_ok(p, r));
                     let child_size = if (0..64).contains(&size_log2) {
                         1u64 << size_log2
                     } else {
                         0
                     };
                     let off_u = off as u64;
-                    let fits = child_size != 0
-                        && child_size <= isz
-                        && off_u & (child_size - 1) == 0
-                        && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
+                    let fits = carve_fits(off_u, size_log2, isz);
                     let mod_ok = cmem_log2 == Some(size_log2 as u8);
                     if !ok_entry || !fits || !mod_ok {
                         tasks[ti]
@@ -11671,20 +11666,17 @@ fn run_vcpu_parallel<'scope, 'env>(
                     .sigs
                     .get(entry as usize)
                     .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
-                let ok_entry = c0.sigs.get(entry as usize).is_some_and(|(p, r)| {
-                    r[..] == [ValType::I64]
-                        && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
-                });
+                let ok_entry = c0
+                    .sigs
+                    .get(entry as usize)
+                    .is_some_and(|(p, r)| child_entry_ok(p, r));
                 let child_size = if (0..64).contains(&size_log2) {
                     1u64 << size_log2
                 } else {
                     0
                 };
                 let off_u = off as u64;
-                let fits = child_size != 0
-                    && child_size <= isz
-                    && off_u & (child_size - 1) == 0
-                    && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
+                let fits = carve_fits(off_u, size_log2, isz);
                 if !ok_entry || !fits {
                     vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
                     continue;
@@ -11800,20 +11792,14 @@ fn run_vcpu_parallel<'scope, 'env>(
                 let ok_entry = child_compiled
                     .sigs
                     .get(entry as usize)
-                    .is_some_and(|(p, r)| {
-                        r[..] == [ValType::I64]
-                            && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
-                    });
+                    .is_some_and(|(p, r)| child_entry_ok(p, r));
                 let child_size = if (0..64).contains(&size_log2) {
                     1u64 << size_log2
                 } else {
                     0
                 };
                 let off_u = off as u64;
-                let fits = child_size != 0
-                    && child_size <= isz
-                    && off_u & (child_size - 1) == 0
-                    && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
+                let fits = carve_fits(off_u, size_log2, isz);
                 let mod_ok = cmem_log2 == Some(size_log2 as u8);
                 if !ok_entry || !fits || !mod_ok {
                     vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));

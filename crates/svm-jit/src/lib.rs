@@ -5974,57 +5974,27 @@ fn fiber_func_type() -> FuncType {
     }
 }
 
-/// Whether `m` contains any fiber op, so `run_inner` knows to stand up the fiber runtime.
+/// Whether `m` contains any fiber op (or a `gc.roots`, which needs the fiber runtime to walk live
+/// stacks), so `run_inner` knows to stand it up. Delegates to svm-ir's per-function predicates — the
+/// single source of truth for the op sets backends must agree on (#913) — instead of re-enumerating.
 #[cfg(fiber_rt)]
 fn module_uses_fibers(m: &IrModule) -> bool {
-    m.funcs.iter().any(|f| {
-        f.blocks.iter().any(|blk| {
-            blk.insts.iter().any(|i| {
-                matches!(
-                    i,
-                    Inst::ContNew { .. }
-                        | Inst::ContResume { .. }
-                        | Inst::ContResumeBlock { .. } // I48 (advisory alias to the resume thunk)
-                        | Inst::Suspend { .. }
-                        // `gc.roots` walks the fiber runtime's live stacks, so it needs the runtime
-                        // stood up even if the module never explicitly creates a fiber.
-                        | Inst::GcRoots { .. }
-                )
-            })
-        })
-    })
+    m.funcs.iter().any(|f| f.uses_fibers() || f.uses_gc_roots())
 }
 
 /// Whether `m` contains any thread op (spawn/join/wait/notify), so `run_inner` knows to run under the
-/// thread scheduler.
+/// thread scheduler. `uses_threads` is spawn/join and `uses_futex` is wait/notify (svm-ir), so their
+/// union is the "thread scheduler needed" set this gate wants.
 #[cfg(fiber_rt)]
 fn module_uses_threads(m: &IrModule) -> bool {
-    m.funcs.iter().any(|f| {
-        f.blocks.iter().any(|blk| {
-            blk.insts.iter().any(|i| {
-                matches!(
-                    i,
-                    Inst::ThreadSpawn { .. }
-                        | Inst::ThreadJoin { .. }
-                        | Inst::MemoryWait { .. }
-                        | Inst::MemoryNotify { .. }
-                )
-            })
-        })
-    })
+    m.funcs.iter().any(|f| f.uses_threads() || f.uses_futex())
 }
 
 /// Whether `m` contains any `setjmp`/`longjmp` op, so `run_inner` knows to stand up the per-run
 /// [`setjmp_rt::SetjmpRuntime`] whose address is baked into those sites.
 #[cfg(setjmp_rt)]
 fn module_uses_setjmp(m: &IrModule) -> bool {
-    m.funcs.iter().any(|f| {
-        f.blocks.iter().any(|blk| {
-            blk.insts
-                .iter()
-                .any(|i| matches!(i, Inst::SetJmp { .. } | Inst::LongJmp { .. }))
-        })
-    })
+    m.funcs.iter().any(|f| f.uses_setjmp())
 }
 
 /// Whether `m` holds a §14 `Instantiator` — a `cap.call` to `cap_id::INSTANTIATOR`
