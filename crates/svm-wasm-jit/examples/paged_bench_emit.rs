@@ -1,19 +1,21 @@
 //! **#750 paged-tier tail-cost bench, emit half.** The paged software page-check's default flip is
 //! gated on measured numbers ("~1.5–3×+ on the random-access tail" was an estimate, not data). This
 //! example emits one kernel module — four memory-hot leaves, sequential/random × load/store, at a
-//! cache-resident (8 MiB) and a RAM-bound (64 MiB) working set — through both tier-up entries,
-//! [`compile_module_tierup`] (plain, mask-only) and
-//! [`compile_module_tierup_paged`] (per-access page check), and times the **native bytecode
-//! interpreter** on the same kernels as the baseline row. The V8 half (`browser/bench_paged.mjs`)
-//! instantiates the two wasm files and times the emitted `f{k}` calls — plain vs paged on the same
-//! engine isolates the check's tax; the interp row contextualizes what paged mode buys a guest that
-//! today runs whole-interpreter.
+//! cache-resident (8 MiB) and a RAM-bound (64 MiB) working set — through three tier-up entries:
+//! [`compile_module_tierup`] (plain, mask-only), [`compile_module_tierup_paged`] (per-access page
+//! check), and [`compile_module_tierup_nullguard`] (the dedicated NULL-page compare the trap-on-NULL
+//! design weighs against full paged mode) — and times the **native bytecode interpreter** on the
+//! same kernels as the baseline row. The V8 half (`browser/bench_paged.mjs`) instantiates the wasm
+//! files and times the emitted `f{k}` calls — each variant vs plain on the same engine isolates
+//! that check's tax; the interp row contextualizes what either buys a guest that today runs
+//! whole-interpreter. The kernels offset every access one guard page up so all variants run
+//! trap-free.
 //!
 //!   cargo run --release -p svm-wasm-jit --example paged_bench_emit
 //!   node browser/bench_paged.mjs target/paged_bench
 //!
-//! Writes `target/paged_bench/{plain,paged}.wasm` + `manifest.json` (kernel table, layout params,
-//! interp ns/op + checksums — the parity anchors the JS side asserts against).
+//! Writes `target/paged_bench/{plain,paged,nullguard}.wasm` + `manifest.json` (kernel table, layout
+//! params, interp ns/op + checksums — the parity anchors the JS side asserts against).
 
 use std::time::Instant;
 
@@ -21,6 +23,9 @@ use svm_interp::{bytecode, Value};
 
 /// The run's software page size (4 KiB — the common host page; baked into the emitted shift).
 const PAGE_LOG2: u8 = 12;
+/// The NULL-page guard for the third variant (`compile_module_tierup_nullguard`): one 4 KiB page.
+/// The kernels offset every access by 512 entries (4096 B) so all three variants run trap-free.
+const NULL_GUARD: u64 = 4096;
 /// Window: 128 MiB (`memory 27`) — big enough for a RAM-bound (64 MiB) working set.
 const WIN_LOG2: u8 = 27;
 
@@ -41,8 +46,10 @@ block 1 (vi: i64, vacc: i64, vn1: i64, vm1: i64) {
 }
 block 2 (vi2: i64, vacc2: i64, vn2: i64, vm2: i64) {
   vidx = i64.and vi2 vm2
+  v512 = i64.const 512
+  vidx2 = i64.add vidx v512
   v8 = i64.const 8
-  vaddr = i64.mul vidx v8
+  vaddr = i64.mul vidx2 v8
   vv = i64.load vaddr
   vacc3 = i64.add vacc2 vv
   vone = i64.const 1
@@ -72,8 +79,10 @@ block 2 (vi2: i64, vacc2: i64, vx2: i64, vn2: i64, vm2: i64) {
   vsh = i64.const 33
   vhi = i64.shr_u vx3 vsh
   vidx = i64.and vhi vm2
+  v512 = i64.const 512
+  vidx2 = i64.add vidx v512
   v8 = i64.const 8
-  vaddr = i64.mul vidx v8
+  vaddr = i64.mul vidx2 v8
   vv = i64.load vaddr
   vacc3 = i64.add vacc2 vv
   vone = i64.const 1
@@ -95,8 +104,10 @@ block 1 (vi: i64, vacc: i64, vn1: i64, vm1: i64) {
 }
 block 2 (vi2: i64, vacc2: i64, vn2: i64, vm2: i64) {
   vidx = i64.and vi2 vm2
+  v512 = i64.const 512
+  vidx2 = i64.add vidx v512
   v8 = i64.const 8
-  vaddr = i64.mul vidx v8
+  vaddr = i64.mul vidx2 v8
   i64.store vaddr vi2
   vacc3 = i64.add vacc2 vidx
   vone = i64.const 1
@@ -126,8 +137,10 @@ block 2 (vi2: i64, vacc2: i64, vx2: i64, vn2: i64, vm2: i64) {
   vsh = i64.const 33
   vhi = i64.shr_u vx3 vsh
   vidx = i64.and vhi vm2
+  v512 = i64.const 512
+  vidx2 = i64.add vidx v512
   v8 = i64.const 8
-  vaddr = i64.mul vidx v8
+  vaddr = i64.mul vidx2 v8
   i64.store vaddr vx3
   vacc3 = i64.add vacc2 vidx
   vone = i64.const 1
@@ -163,15 +176,21 @@ fn main() {
         svm_wasm_jit::compile_module_tierup(&m, false).expect("plain tier-up emits");
     let (paged, paged_emitted) =
         svm_wasm_jit::compile_module_tierup_paged(&m, false, PAGE_LOG2).expect("paged emits");
+    let (nullg, nullg_emitted) =
+        svm_wasm_jit::compile_module_tierup_nullguard(&m, false, NULL_GUARD)
+            .expect("nullguard emits");
     assert!(
-        plain_emitted.iter().all(|&b| b) && paged_emitted.iter().all(|&b| b),
-        "all four kernels must be tier-up eligible on both entries"
+        plain_emitted.iter().all(|&b| b)
+            && paged_emitted.iter().all(|&b| b)
+            && nullg_emitted.iter().all(|&b| b),
+        "all four kernels must be tier-up eligible on every entry"
     );
 
     let dir = std::path::Path::new("target/paged_bench");
     std::fs::create_dir_all(dir).expect("mkdir");
     std::fs::write(dir.join("plain.wasm"), &plain).expect("write plain.wasm");
     std::fs::write(dir.join("paged.wasm"), &paged).expect("write paged.wasm");
+    std::fs::write(dir.join("nullguard.wasm"), &nullg).expect("write nullguard.wasm");
 
     // Native bytecode-interpreter baseline + the checksum parity anchors. Each kernel runs in a
     // fresh zeroed window (the module's own `memory 27`), matching the JS side's zeroed memory, so
@@ -205,13 +224,14 @@ fn main() {
         }
     }
     let manifest = format!(
-        "{{\n  \"win_log2\": {WIN_LOG2},\n  \"page_log2\": {PAGE_LOG2},\n  \"kernels\": [\n{rows}  ]\n}}\n"
+        "{{\n  \"win_log2\": {WIN_LOG2},\n  \"page_log2\": {PAGE_LOG2},\n  \"null_guard\": {NULL_GUARD},\n  \"kernels\": [\n{rows}  ]\n}}\n"
     );
     std::fs::write(dir.join("manifest.json"), manifest).expect("write manifest");
     println!(
-        "wrote {} (plain {} B, paged {} B)",
+        "wrote {} (plain {} B, paged {} B, nullguard {} B)",
         dir.display(),
         plain.len(),
-        paged.len()
+        paged.len(),
+        nullg.len()
     );
 }

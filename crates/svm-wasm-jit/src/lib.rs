@@ -1367,6 +1367,7 @@ pub fn compile_module_fuel(m: &Module, fuel_mode: FuelMode) -> Result<Vec<u8>, E
         false,
         fuel_mode,
         None,
+        None,
     )
 }
 
@@ -1426,6 +1427,7 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
         None,
         false,
         FuelMode::Global,
+        None,
         None,
     )
 }
@@ -1514,6 +1516,7 @@ pub fn compile_module_nested_with_eligibility(
         true,
         FuelMode::Global,
         None,
+        None,
     )?;
     Ok((wasm, eligible))
 }
@@ -1599,6 +1602,7 @@ pub fn compile_module_b2(
         Some(table_log2),
         false,
         FuelMode::Global,
+        None,
         None,
     )
 }
@@ -1844,6 +1848,7 @@ pub fn compile_module_reactor(
         false,
         FuelMode::Global,
         None,
+        None,
     )?;
     Ok((wasm, emitted_bitmap))
 }
@@ -1904,6 +1909,7 @@ pub fn compile_module_reactor_keep(
         false,
         FuelMode::Global,
         None,
+        None,
     )?;
     Ok((wasm, emitted_bitmap))
 }
@@ -1941,7 +1947,7 @@ pub fn compile_module_tierup_caps(
     shared_memory: bool,
     nested_caps: bool,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
-    compile_module_tierup_inner(m, shared_memory, nested_caps, None, None)
+    compile_module_tierup_inner(m, shared_memory, nested_caps, None, None, None)
 }
 
 /// #880 — [`compile_module_tierup`] over the **shared reserved table** (§22 Model B2): the emitted
@@ -1969,7 +1975,7 @@ pub fn compile_module_tierup_b2(
     shared_memory: bool,
     table_log2: u32,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
-    compile_module_tierup_inner(m, shared_memory, false, None, Some(table_log2))
+    compile_module_tierup_inner(m, shared_memory, false, None, Some(table_log2), None)
 }
 
 /// The **opt-in gated software page-check** entry (#750): like [`compile_module_tierup`], but the
@@ -1992,7 +1998,29 @@ pub fn compile_module_tierup_paged(
     shared_memory: bool,
     page_log2: u8,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
-    compile_module_tierup_inner(m, shared_memory, false, Some(page_log2), None)
+    compile_module_tierup_inner(m, shared_memory, false, Some(page_log2), None, None)
+}
+
+/// **Experimental NULL-page guard** entry (measurement mode for the trap-on-NULL design; see the
+/// tracking issue): like [`compile_module_tierup`], but every confined access additionally traps
+/// when its first byte lands below `guard` — the cheap dedicated lowering (one compare +
+/// never-taken branch, no table load) the design weighs against full paged mode for trapping NULL
+/// dereferences. Trap-parity holds against an interpreter whose page map seeds `[0, guard)`
+/// `Unmapped` (the `nullguard.rs` differential). A *bottom* guard needs no last-byte check (an
+/// access starting at or above `guard` cannot reach down), and — like the page check — it is never
+/// elided (an in-window proof bounds the access from above, not below). Bulk-memory functions stay
+/// interpreted (the span check has no low bound), same limit as paged mode.
+///
+/// **Not a shipped confinement mode**: nothing drives it in production, the powerbox ABI still
+/// places live data below any useful guard (`POWERBOX_ARGS_BASE = 128`), and the interpreter does
+/// not yet seed a NULL page. It exists so the design decision is made against measured numbers
+/// (`paged_bench_emit` / `bench_paged.mjs` emit + time it as a third variant).
+pub fn compile_module_tierup_nullguard(
+    m: &Module,
+    shared_memory: bool,
+    guard: u64,
+) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    compile_module_tierup_inner(m, shared_memory, false, None, None, Some(guard))
 }
 
 fn compile_module_tierup_inner(
@@ -2001,6 +2029,7 @@ fn compile_module_tierup_inner(
     nested_caps: bool,
     paged: Option<u8>,
     reserved_table_log2: Option<u32>,
+    null_guard: Option<u64>,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
     let n = m.funcs.len();
     // Track 3 (c)+(a): a page-op module (`map`/`unmap`/`protect`) can't be accelerated on the
@@ -2030,6 +2059,7 @@ fn compile_module_tierup_inner(
             nested_caps,
             FuelMode::Global,
             paged,
+            null_guard,
         )?;
         return Ok((wasm, vec![false; n]));
     }
@@ -2039,9 +2069,10 @@ fn compile_module_tierup_inner(
         .iter()
         .map(|f| func_in_subset_caps(m, f, atomics_ok, nested_caps))
         .collect();
-    if paged.is_some() {
+    if paged.is_some() || null_guard.is_some() {
         // Paged-mode limit (#750): bulk-memory ops have no per-page walk in the emitted span check,
-        // so their functions stay on the interpreter (which honors the full page map). Fail-closed:
+        // so their functions stay on the interpreter (which honors the full page map). The NULL
+        // guard shares the limit (its span check has no low-bound either). Fail-closed:
         // dropping them from the subset can only route more code to the oracle.
         for (i, f) in m.funcs.iter().enumerate() {
             if func_uses_bulk_mem(f) {
@@ -2135,6 +2166,7 @@ fn compile_module_tierup_inner(
         nested_caps,
         FuelMode::Global,
         paged,
+        null_guard,
     )?;
     Ok((wasm, emit))
 }
@@ -2223,6 +2255,7 @@ fn compile_interp_only(
         nested_caps,
         FuelMode::Global,
         None,
+        None,
     )?;
     Ok(Artifact {
         wasm,
@@ -2293,6 +2326,7 @@ fn emit_module(
     nested_caps: bool,
     fuel_mode: FuelMode,
     paged: Option<u8>,
+    null_guard: Option<u64>,
 ) -> Result<Vec<u8>, Error> {
     // An import *manifest* is fine (IMPORTS.md phase 3): executable `call.import`s dispatch on the
     // import-capable interpreter tier, reached through outlined wrappers / cross-tier calls. What
@@ -2501,6 +2535,7 @@ fn emit_module(
             nested_caps,
             fuel_mode,
             paged,
+            null_guard,
         )?);
     }
     bodies.extend(extra_bodies);
@@ -3051,6 +3086,12 @@ struct FnCtx {
     /// the interpreter's `check_prot` would. `None` (every other entry) emits byte-identical code
     /// to before #750 — the fail-closed default pays nothing.
     page_check: Option<(u8, u32)>,
+    /// The **experimental NULL-page guard** ([`compile_module_tierup_nullguard`], a measurement
+    /// mode): `Some(guard)` ⇒ every confined access additionally traps when its first byte lands
+    /// below `guard` — matching an interpreter whose page map seeds `[0, guard)` `Unmapped`. Never
+    /// elided (an in-window proof is an upper bound; it says nothing about the low pages). `None`
+    /// everywhere else — byte-identical output.
+    null_guard: Option<u64>,
 }
 
 impl FnCtx {
@@ -3072,6 +3113,7 @@ fn emit_func(
     nested_caps: bool,
     fuel_mode: FuelMode,
     paged: Option<u8>,
+    null_guard: Option<u64>,
 ) -> Result<Vec<u8>, Error> {
     let n_params = 2 + f.params.len() as u32; // win, env, then the SVM params
 
@@ -3177,6 +3219,7 @@ fn emit_func(
         mapped_global_idx: mapped_global_idx(fuel_mode),
         // The pagestate global (paged mode only) sits immediately after `mapped`.
         page_check: paged.map(|pl| (pl, mapped_global_idx(fuel_mode) + 1)),
+        null_guard,
     };
 
     let mut code = Vec::new();
@@ -3412,6 +3455,32 @@ fn emit_page_check_one(cx: &mut FnCtx, code: &mut Vec<u8>, delta: u64, write: bo
     cx.depth -= 1;
 }
 
+/// The experimental **NULL-page guard** check ([`compile_module_tierup_nullguard`], a measurement
+/// mode): trap when the access's first byte lands below `guard`. A *bottom* guard needs no
+/// last-byte consultation — an access starting at or above `guard` cannot reach down into
+/// `[0, guard)` — so this is one compare + never-taken branch, the cheap lowering the NULL-trap
+/// design weighs against full paged mode. Masked into the same clamp domain as the access itself
+/// (matching [`emit_page_check_one`]'s defensive style). No-op when unguarded.
+fn emit_null_guard(cx: &mut FnCtx, code: &mut Vec<u8>) {
+    let Some(guard) = cx.null_guard else {
+        return;
+    };
+    code.push(OP_LOCAL_GET);
+    uleb(code, cx.ea_l as u64);
+    code.push(OP_I64_CONST);
+    sleb64(code, MASK as i64);
+    code.push(0x83); // i64.and — same clamp domain as the access itself
+    code.push(OP_I64_CONST);
+    sleb64(code, guard as i64);
+    code.push(0x54); // i64.lt_u → first byte below the guard?
+    code.push(OP_IF);
+    code.push(BLOCKTYPE_VOID);
+    cx.depth += 1;
+    emit_trap(code, TRAP_MEMORY_FAULT);
+    code.push(OP_END);
+    cx.depth -= 1;
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_confine_maybe_aligned(
     cx: &mut FnCtx,
@@ -3480,6 +3549,8 @@ fn emit_confine_maybe_aligned(
     if width > 1 && !align {
         emit_page_check_one(cx, code, width - 1, write);
     }
+    // NULL-page guard (experimental measurement mode) — like the page check, never elided.
+    emit_null_guard(cx, code);
     code.push(OP_LOCAL_GET);
     uleb(code, cx.ea_l as u64);
     code.push(OP_I64_CONST);
