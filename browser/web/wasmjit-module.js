@@ -416,10 +416,58 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
   const emitted = instance.exports;
   const envCell = Number(ex.svm_alloc(ex.svm_wasmjit_env_bytes()));
   registerGlobals(emitted);
+  // Per-code-handle unit instances (a runtime-compiled §22 unit runs emitted on JIT_INVOKE — the
+  // JACL macro-staging shape). Async instantiation: a macro unit can exceed the sync compile budget.
+  const jitUnits = new Map();
+  const instantiateUnit = async (bytes) => {
+    const inst = await WebAssembly.instantiate(await WebAssembly.compile(bytes), unitImports());
+    registerGlobals(inst.exports);
+    return inst.exports;
+  };
+  const unitFor = async (code, bytes) => {
+    let unit = jitUnits.get(code);
+    if (unit === undefined) {
+      unit = await instantiateUnit(bytes);
+      jitUnits.set(code, unit);
+    }
+    return unit;
+  };
 
   try {
     for (;;) {
       const ev = ex.svm_coop_run();
+      if (ev === 3 /* COOP_RUN_JIT_INVOKE */) {
+        // A guest-compiled §22 unit with emitted wasm: instantiate once per code handle, then
+        // `f0(win, env, ...args)` with the per-event "mapped"/fuel sync fanned to every live instance.
+        // No table sync — the coop driver's non-B2 units don't dispatch through the shared funcref
+        // table; the all-null table + the `call_interp` bounce satisfy their imports.
+        const code = ex.svm_coop_jit_code();
+        const wptr = Number(ex.svm_coop_jit_wasm_ptr());
+        const unit = await unitFor(code, u8().slice(wptr, wptr + ex.svm_coop_jit_wasm_len()));
+        const argvPtr = Number(ex.svm_coop_argv_ptr());
+        const n = ex.svm_coop_argv_len();
+        const ptypes = new Uint8Array(memory.buffer, Number(ex.svm_coop_jit_param_types_ptr()), n);
+        const args = [];
+        for (let i = 0; i < n; i++) args.push(tierupJitArg(i64()[(argvPtr >> 3) + i], ptypes[i]));
+        const mapped = ex.svm_coop_mapped();
+        for (const g of mappedGlobals) g.value = mapped;
+        for (const g of fuelGlobals) g.value = 1n << 61n;
+        new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
+        try {
+          const ret = unit['f0'](win, envCell, ...args);
+          const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
+          const rn = ex.svm_coop_jit_result_types_len();
+          const rtypes = new Uint8Array(memory.buffer, Number(ex.svm_coop_jit_result_types_ptr()), rn);
+          const rlen = Math.max(1, rets.length) * 8;
+          const rptr = Number(ex.svm_alloc(rlen));
+          for (let i = 0; i < rets.length; i++) i64()[(rptr >> 3) + i] = tierupJitRes(rets[i], rtypes[i]);
+          ex.svm_coop_deliver_jit(rptr, rets.length);
+          ex.svm_dealloc(rptr, rlen);
+        } catch {
+          ex.svm_coop_deliver_jit_trap();
+        }
+        continue;
+      }
       if (ev !== 1 /* COOP_RUN_TIERUP */) break; // 0 = done (slots staged), 2 = trapped (status 3)
       const func = ex.svm_coop_func();
       const argvPtr = Number(ex.svm_coop_argv_ptr());

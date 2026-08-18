@@ -82,6 +82,9 @@ fn coop_tierup_run(
         match run.run() {
             bytecode::CoopEvent::Done(vals) => return (Ok(vals), tierups),
             bytecode::CoopEvent::Trapped(t) => return (Err(t), tierups),
+            bytecode::CoopEvent::JitInvoke { .. } => {
+                panic!("unexpected JitInvoke (no vm_jit guest here)")
+            }
             bytecode::CoopEvent::TierUp { func, argv, .. } => {
                 tierups += 1;
                 // A regression that fails to advance the paused task would tier up unboundedly; cap it
@@ -261,6 +264,9 @@ fn coop_tierup_bounce_matches_pure_interp() {
         match run.run() {
             bytecode::CoopEvent::Done(vals) => break Ok(vals),
             bytecode::CoopEvent::Trapped(t) => break Err(t),
+            bytecode::CoopEvent::JitInvoke { .. } => {
+                panic!("unexpected JitInvoke (no vm_jit guest here)")
+            }
             bytecode::CoopEvent::TierUp { func, argv, .. } => {
                 assert_eq!(func, 1, "only func 1 (L) is eligible / tiers up");
                 // Emulate f1's emitted body: `call_interp(func 2, argv)` — the cross-tier bounce.
