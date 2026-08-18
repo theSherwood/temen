@@ -877,6 +877,40 @@ for x in xs:
   echo fib(x)
 `,
   },
+  'nim: compile & run a whole Nim program → SVM (the full toolchain, in your browser)': {
+    kind: 'nimc',
+    editable: true,
+    lang: 'nim',
+    mode: 'io',
+    // Four assets: the three phase guests (gzipped `.svmb`) + the nimony stdlib image (gzipped).
+    urls: {
+      nifler: './assets/nifler.svmb.gz',
+      nimsem: './assets/nimsem.svmb.gz',
+      hexer: './assets/hexer.svmb.gz',
+      stdlib: './assets/nim_stdlib.img.gz',
+    },
+    desc: "**Compile a whole Nim program in your browser** (NIM.md §3c/§3e; #958) — the capstone of the " +
+      "nimony-on-SVM slices. The `nifler` card above runs *one* phase (parse); this runs the **entire " +
+      "nimony toolchain client-side**: the page plays nifmake itself — computes each module's cache stem " +
+      "exactly as nimony does, crawls your program's `import` graph with `nifler`, then runs `nimsem` " +
+      "(sema — itself spawning `nifler` as a sandboxed `exec` child over a shared in-memory `fs`) and " +
+      "`hexer` (lower) over the whole closure, links the result through the nim→powerbox bridge with " +
+      "`svm-leng`, and **runs `_start` under the powerbox**. Every phase is a verified SVM guest; the " +
+      "stdlib is mounted from a committed `svm_fs` image. Edit the Nim on the left and click Run — the " +
+      "output below is your program's **real stdout**, produced by a Nim program the SVM compiled and " +
+      "ran end-to-end, no server. (Breadth is bounded by what translates through `svm-leng` today — " +
+      "#760/#956; `import std/syncio` + `write(stdout, …)` works. `echo` isn't an identifier nimony " +
+      "resolves yet — a front-end gap. The four assets total ~6.5 MB gzipped and inflate in-browser.)",
+    src: `# Edit this Nim, then Run. The whole nimony toolchain compiles it in your
+# browser — nifler (parse) -> nimsem (sema) -> hexer (lower) -> svm-leng
+# (translate + link) — and the result runs on the SVM. The text below is
+# your program's real stdout.
+import std/syncio
+
+write(stdout, "hello from Nim, compiled on the SVM\\n")
+write(stdout, "nifler -> nimsem -> hexer -> svm-leng, all client-side\\n")
+`,
+  },
   'svm-leng: translate real nimony Leng → SVM IR (self-host)': {
     kind: 'module',
     jit: false, // the ~280-func translator module folds to the tree-walker (the native JIT declines it too); the interp run is ~200ms
@@ -2044,6 +2078,94 @@ async function runNifler(c) {
   runEnd(rec, { ok: true, status, result: `${nif.length} B .p.nif` });
 }
 
+// Compile a **whole Nim program** in the browser — the nimony toolchain capstone (NIM.md §3c/§3e;
+// #958). Fetch the three phase guests (`nifler`/`nimsem`/`hexer`, gzipped) + the stdlib image
+// (gzipped), inflate them, then hand the editor's Nim as `<main>.nim` to `svm_compile_nim_fs`: the
+// cdylib plays nifmake (computes stems, crawls the `import` graph with nifler), runs nimsem + hexer
+// over the closure (nimsem spawning nifler through a wasm-native `exec` cap over the shared memfs),
+// links through the nim→powerbox bridge, and runs `_start` under the powerbox. The program's real
+// **stdout** comes back on the module stdout slot; a compile/link/run failure lands on stderr. All
+// phases run on the bytecode engine (the ~hundreds-of-func Nim guests fold to the tree-walker); no JIT.
+async function runNimc(c) {
+  const ex = c.ex;
+  setState(c, 'running', 'fetching toolchain…');
+  c.el.result.textContent = '';
+  c.el.stdout.textContent = '';
+  c.el.canvas.hidden = true;
+  const rec = runStart(c, { tier: 'interpreter' });
+  let nifler, nimsem, hexer, stdlib;
+  try {
+    // Each asset ships **gzipped** (phase `.svmb` are ~3–17 MB raw; the stdlib image ~2.4 MB): fetch
+    // the compressed bytes and inflate them in-browser (DecompressionStream — no library).
+    const [gn, gs, gh, gl] = await Promise.all([
+      fetchTimed(rec, c, ex.urls.nifler),
+      fetchTimed(rec, c, ex.urls.nimsem),
+      fetchTimed(rec, c, ex.urls.hexer),
+      fetchTimed(rec, c, ex.urls.stdlib),
+    ]);
+    [nifler, nimsem, hexer, stdlib] = await Promise.all([gunzip(gn), gunzip(gs), gunzip(gh), gunzip(gl)]);
+    logTo(c, `inflated: nifler ${nifler.length}B · nimsem ${nimsem.length}B · hexer ${hexer.length}B · stdlib ${stdlib.length}B`);
+  } catch (e) {
+    setState(c, 'error', `${e.message} — run \`bash ../crates/svm-run/demos/nim_e2e_chain/build_e2e_chain.sh\` to build the phase guests + stdlib image`);
+    logTo(c, `fetch/inflate failed: ${e.message}`);
+    runNote(rec, { fetchError: e.message });
+    runEnd(rec, { ok: false });
+    return;
+  }
+  const main = 'prog.nim';
+  const srcBytes = new TextEncoder().encode(c.editor.getValue());
+  const mainBytes = new TextEncoder().encode(main);
+  runNote(rec, {
+    niflerBytes: nifler.length, nimsemBytes: nimsem.length, hexerBytes: hexer.length,
+    stdlibBytes: stdlib.length, srcBytes: srcBytes.length,
+  });
+  setState(c, 'running', 'compiling Nim (nifler → nimsem → hexer → link → run)…');
+  const t0 = performance.now();
+  // Alloc every buffer before writing any (svm_alloc may grow/detach linear memory), then take one
+  // fresh view and fill them.
+  const np = eng.ex.svm_alloc(nifler.length);
+  const smp = eng.ex.svm_alloc(nimsem.length);
+  const hp = eng.ex.svm_alloc(hexer.length);
+  const ip = eng.ex.svm_alloc(stdlib.length);
+  const sp = eng.ex.svm_alloc(srcBytes.length);
+  const mp = eng.ex.svm_alloc(mainBytes.length);
+  const view = new Uint8Array(eng.memory.buffer);
+  view.set(nifler, np);
+  view.set(nimsem, smp);
+  view.set(hexer, hp);
+  view.set(stdlib, ip);
+  view.set(srcBytes, sp);
+  view.set(mainBytes, mp);
+  eng.ex.svm_compile_nim_fs(
+    np, nifler.length, smp, nimsem.length, hp, hexer.length,
+    ip, stdlib.length, sp, srcBytes.length, mp, mainBytes.length);
+  const status = eng.ex.svm_status();
+  eng.ex.svm_dealloc(np, nifler.length);
+  eng.ex.svm_dealloc(smp, nimsem.length);
+  eng.ex.svm_dealloc(hp, hexer.length);
+  eng.ex.svm_dealloc(ip, stdlib.length);
+  eng.ex.svm_dealloc(sp, srcBytes.length);
+  eng.ex.svm_dealloc(mp, mainBytes.length);
+  const ms = runStage(rec, 'compile+run:interpreter', performance.now() - t0).toFixed(0);
+  runTier(rec, 'interpreter');
+  const out = readModuleStdout();
+  const err = readModuleStderr();
+  logTo(c, `compile+run → status ${status}, ${out.length}B stdout in ${ms}ms`);
+  // 0 = OK, 5 = clean Exit. Any other status: a phase/link/run failure — show the diagnostic (stderr).
+  if (status !== 0 && status !== 5) {
+    c.el.stdout.textContent = err || out;
+    setState(c, 'error', `compile failed: status ${status}${err ? ` — ${err.trim().split('\n')[0]}` : ''}`);
+    runEnd(rec, { ok: false, status });
+    return;
+  }
+  const bar = '─'.repeat(10);
+  c.el.stdout.textContent =
+    `${bar} your Nim, compiled by the SVM (nifler → nimsem → hexer → svm-leng) and run — stdout ${bar}\n${out}`;
+  c.el.result.textContent = `${out.length} B stdout`;
+  setState(c, 'done', `compiled + ran your Nim · ${out.length} B stdout · ${ms}ms`);
+  runEnd(rec, { ok: true, status, result: `${out.length} B stdout` });
+}
+
 // Boot PostgreSQL `--single` single-shot on the main engine (the `svm_run_pg` entry): fetch the
 // pre-translated+resolved module + the data image, feed the editor's SQL as stdin, mount the image on
 // an in-memory `fs` cap, run to a queried backend, read the captured stdout. A fresh boot per Run.
@@ -3142,6 +3264,7 @@ async function runDemo(c) {
   if (ex.kind === 'chibicc') return runChibicc(c);
   if (ex.kind === 'selfhost') return runSelfhost(c);
   if (ex.kind === 'nifler') return runNifler(c);
+  if (ex.kind === 'nimc') return runNimc(c);
   if (ex.kind === 'shell') return runShell(c);
   if (ex.kind === 'module') return runModule(c);
   return runText(c);

@@ -173,9 +173,11 @@ dependencies = [
  "svm-dap",
  "svm-durable",
  "svm-encode",
+ "svm-exec",
  "svm-fs",
  "svm-interp",
  "svm-ir",
+ "svm-leng",
  "svm-opt",
  "svm-posix",
  "svm-text",
@@ -208,6 +210,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "svm-exec"
+version = "0.0.0"
+dependencies = [
+ "svm-interp",
+ "svm-ir",
+]
+
+[[package]]
 name = "svm-fs"
 version = "0.0.0"
 dependencies = [
@@ -230,6 +240,15 @@ dependencies = [
 [[package]]
 name = "svm-ir"
 version = "0.0.0"
+
+[[package]]
+name = "svm-leng"
+version = "0.0.0"
+dependencies = [
+ "svm-encode",
+ "svm-ir",
+ "svm-text",
+]
 
 [[package]]
 name = "svm-mask"
