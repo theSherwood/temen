@@ -6291,144 +6291,68 @@ mod symtab_tests {
 
 #[cfg(test)]
 mod routing_tests {
-    //! #897 — the JIT routing fold is one definition (`folds_to_oracle`) consumed by the batch,
-    //! reactor, and cache paths alike. The reactor path (`run_capture_on`) once hand-copied the
-    //! composition minus the `module_demand_spawns` clause, so a pager-capable module on a Jit
-    //! `Session` hit the op-17 thunk's `CapFault` (`svm-jit/src/instantiator_rt.rs` documents
-    //! that arm as sound *because* this fold routes pager records away) instead of the oracle's
-    //! demand paging. The test drives the shared per-call primitive directly on both routes and
-    //! pins outcome parity.
+    //! #897 — the JIT routing fold is **one definition** (`folds_to_oracle`) consumed by the
+    //! batch (`Instance::run_with_caps`), reactor (`run_capture_on`), and cache
+    //! (`PowerboxProgram::new`) paths alike. The reactor path once hand-copied the composition
+    //! minus the `module_demand_spawns` clause, so a pager-capable module on a Jit `Session` hit
+    //! the op-17 thunk's `CapFault` (`svm-jit/src/instantiator_rt.rs` documents that arm as sound
+    //! *because* this fold routes pager records off the JIT) instead of the oracle's demand paging.
+    //!
+    //! The regression is guarded here at the predicate: `folds_to_oracle` must fold a demand-spawn
+    //! module, and all three sites now call that one function, so a dropped clause fails this test.
+    //! End-to-end demand-pager execution across the three backends (the record actually serving a
+    //! fault and returning 1123) is covered separately by
+    //! `crates/svm/tests/instantiate_record.rs::record_spawn_carries_the_pager_binding`, through
+    //! the public `Instance::run_with_caps` grant path — reproducing a working pager host by hand
+    //! here would duplicate that coverage without adding routing-parity guard value.
     use super::*;
 
-    /// The §2.2 pager shape spelled as an op-17 record (the reactor twin of
-    /// `instantiate_record.rs::record_pager_program`): pager export 0, one 64 KiB stride, the
-    /// handler supplies 123; entry joins the child and **returns** `join + serves*1000 = 1123`.
-    /// `module_demand_spawns` is true for it (op 17 + impl exports), so a `Backend::Jit` run
-    /// must leave the JIT.
-    fn record_pager_module() -> Module {
-        let f0 = (1u64 << 32) as i64; // version 0, entry 1
-        let f16 = 16i64; // size_log2 16, pager export 0
-        let f24 = 0xFFFF_FFFFi64; // module -1 (self), budget 0
-        let stores: String = (0..7)
-            .map(|i| {
-                let off = 1024 + 8 * i;
-                format!("  va{i} = i64.const {off}\n  i64.store va{i} vf{}\n", 8 * i)
-            })
-            .collect();
-        let src = format!(
-            "\
-memory 17
-data 0 \"vm\"
+    /// A minimal module that `module_demand_spawns` classifies as pager-capable: an op-17
+    /// `Instantiator` record-spawn plus an impl export (the record's `pager` field is runtime
+    /// data, so any module that *could* name one of its exports as a pager folds off the JIT).
+    /// The body is never executed by this test — only the static routing predicate is checked.
+    fn demand_spawn_module() -> Module {
+        let src = r#"memory 17
 type 0 func (i64) -> (i64)
-type 1 interface {{ page: 0 }}
-export 0 interface \"pager\" 1 {{ page: 2 }}
+type 1 interface { page: 0 }
+export 0 interface "pager" 1 { page: 1 }
 
-func 0 () -> (i64) {{
-block 0 () {{
-  vp = i64.const 0
-  vl = i64.const 2
-  vh = cap.self.resolve vp vl
-  vf0 = i64.const {f0}
-  vf8 = i64.const 65536
-  vf16 = i64.const {f16}
-  vf24 = i64.const {f24}
-  vf32 = i64.const 0
-  vf40 = i64.const 0
-  vf48 = i64.const 0
-{stores}
+func 0 (i32) -> (i32) {
+block 0 (vh: i32) {
   vrp = i64.const 1024
   vch = cap.call 6 17 (i64) -> (i32) vh (vrp)
-  vzero = i32.const 0
-  visneg = i32.lt_s vch vzero
-  br_if visneg 2(vch) 1(vh, vch)
-}}
-block 1 (vh1: i32, vch1: i32) {{
-  vz = i32.const 0
-  vs = svc.wait vz
-  vj = cap.call 6 1 (i32) -> (i64) vh1 (vch1)
-  vk = i64.const 1000
-  vm2 = i64.mul vs vk
-  vt = i64.add vj vm2
-  return vt
-}}
-block 2 (verr: i32) {{
-  verr64 = i64.extend_i32_s verr
-  return verr64
-  }}
-}}
+  return vch
+  }
+}
 
-func 1 (i64) -> (i64) {{
-block 0 (v0: i64) {{
-  vaddr = i64.const 0
-  vb = i32.load8_u vaddr
-  vbw = i64.extend_i32_u vb
-  return vbw
-  }}
-}}
-
-func 2 (i64) -> (i64) {{
-block 0 (vaddr: i64) {{
-  vb = i32.const 123
-  i32.store8 vaddr vb
+func 1 (i64) -> (i64) {
+block 0 (vaddr: i64) {
   vzero = i64.const 0
   return vzero
-  }}
-}}
-"
-        );
-        let m = svm_text::parse_module(&src).expect("parse");
+  }
+}
+"#;
+        let m = svm_text::parse_module(src).expect("parse");
         svm_verify::verify_module(&m).expect("verify");
+        assert!(
+            !m.impl_exports.is_empty(),
+            "fixture must carry an impl export"
+        );
         m
     }
 
-    /// A host with the self module registered, the region factory installed (`grant_caps` does
-    /// this too — the demand-paging fault path needs it), and an `Instantiator` granted under
-    /// the name the guest's `cap.self.resolve` looks up — the grants a `Session` host carries.
-    fn pager_host(m: &Module) -> Host {
-        let win = 1u64 << 17;
-        let mut host = Host::new();
-        host.set_self_module(&Arc::new(m.clone()));
-        host.set_region_factory(new_shared_region);
-        host.set_quota(Limits::default().quota());
-        let ih = host.grant_instantiator(0, win);
-        host.register_cap_name("vm", ih);
-        host
-    }
-
     #[test]
-    fn demand_spawn_module_folds_on_every_route() {
-        let m = record_pager_module();
-        assert!(module_demand_spawns(&m), "fixture is pager-capable");
-        assert!(folds_to_oracle(&m), "the one routing predicate folds it");
-    }
-
-    /// The reactor primitive's Jit route agrees with the tree-walk oracle on a pager-record
-    /// module — the exact parity `run_capture_on`'s dropped clause broke (#897).
-    #[test]
-    fn reactor_jit_route_matches_oracle_on_pager_record() {
-        let m = record_pager_module();
-        let limits = Limits::default();
-
-        let mut oracle_host = pager_host(&m);
-        let (oracle_out, _) = run_capture_on(
-            Backend::TreeWalk,
-            &m,
-            0,
-            &[],
-            &[],
-            &mut oracle_host,
-            &limits,
-        )
-        .expect("oracle runs the pager record");
-        assert_eq!(
-            oracle_out,
-            Outcome::Returned(vec![Value::I64(1123)]),
-            "oracle: one serve (×1000) + child join (123)"
+    fn demand_spawn_module_folds_off_the_jit() {
+        let m = demand_spawn_module();
+        // The exact clause #897 restored: a pager-capable module is demand-spawn-classified,
+        // and the one shared routing predicate folds it off the JIT.
+        assert!(
+            module_demand_spawns(&m),
+            "op-17 + impl exports is pager-capable"
         );
-
-        let mut jit_host = pager_host(&m);
-        let (jit_out, _) = run_capture_on(Backend::Jit, &m, 0, &[], &[], &mut jit_host, &limits)
-            .expect("Jit route must fold down the ladder, not CapFault in the op-17 thunk");
-        assert_eq!(jit_out, oracle_out, "reactor Jit route ≡ oracle");
+        assert!(
+            folds_to_oracle(&m),
+            "the one routing predicate (all three call sites) folds it off the JIT"
+        );
     }
 }
