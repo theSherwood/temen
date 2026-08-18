@@ -2423,6 +2423,19 @@ impl Ctx<'_> {
         if self.w.spawn_fn.is_none() {
             return ENOSYS;
         }
+        // #972 slice 2 — a CorePipe stdio target fails closed with a probeable errno. The capture
+        // spawn is synchronous (the child runs to completion inside this dispatch), so it cannot
+        // consume or feed a *live* core pipe: a CorePipe stdin would need a blocking drain this
+        // dispatch cannot perform, and a CorePipe stdout/stderr would need a cap-call write it
+        // cannot issue — silently dropping the bytes (the pre-fix behavior) is the one wrong
+        // answer. Live-pipe wiring belongs to fork + execve (#801), where the exec-replace's
+        // named re-grant carries the ends.
+        for (fd, dflt) in [(stdin_fd, 0), (stdout_fd, 1), (stderr_fd, 2)] {
+            let eff = if fd < 0 { dflt } else { fd };
+            if matches!(self.fd(eff), Some(FdEntry::CorePipe(_))) {
+                return EINVAL;
+            }
+        }
         // The child inherits its stdin from `stdin_fd` (fd 0 by default) — drain it before the delegate.
         let stdin = self.drain_fd(if stdin_fd < 0 { 0 } else { stdin_fd });
         // Take the delegate out to call it (a `&mut self` method cannot also borrow the boxed closure),
@@ -6091,6 +6104,44 @@ block 0 (vph: i32) {\n\
             (status >> 8) & 0xff,
             3,
             "WEXITSTATUS is the delegate's exit code"
+        );
+    }
+
+    /// #972 slice 2 — a **CorePipe stdio target fails closed** on the capture spawn: the child runs
+    /// to completion inside one dispatch, which can neither drain a live core pipe (blocking) nor
+    /// cap-call bytes into one — so a CorePipe stdin/stdout/stderr is `-EINVAL` up front (the
+    /// pre-fix behavior silently dropped the child's bytes). Adoption never exercises handles, so
+    /// fake handle numbers suffice here. Live-pipe wiring is fork+execve territory (#801).
+    #[test]
+    fn spawn2_fails_closed_on_a_core_pipe_stdio_target() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        posix.set_spawn(|_n, _a, _s| SpawnResult {
+            stdout: b"out".to_vec(),
+            stderr: Vec::new(),
+            status: 0,
+        });
+        let mut win = vec![0u8; WIN];
+        let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
+        ctx!(posix, w_g, p_g, st);
+        win_write(&mut mem, 0, b"prog");
+        st.pipe_adopt(&[7, 8, 8], Some(&mut mem)).unwrap(); // fake handles; [rfd@8, wfd@12]
+        let wfd = i32::from_le_bytes(mem.read_bytes(12, 4).unwrap().try_into().unwrap()) as i64;
+        win_write(&mut mem, 100, &0u64.to_le_bytes());
+        win_write(&mut mem, 108, &4u64.to_le_bytes());
+        win_write(&mut mem, 116, &0u64.to_le_bytes());
+        win_write(&mut mem, 124, &0u64.to_le_bytes());
+        win_write(&mut mem, 132, &(-1i32).to_le_bytes());
+        win_write(&mut mem, 136, &(wfd as i32).to_le_bytes()); // stdout -> a CorePipe fd
+        win_write(&mut mem, 140, &(-1i32).to_le_bytes());
+        let r = st.spawn2(&[100], Some(&mut mem)).unwrap()[0];
+        assert_eq!(
+            r, EINVAL,
+            "a CorePipe spawn target refuses probeably, never a silent drop"
+        );
+        assert!(
+            st.w.stdout.is_empty(),
+            "nothing ran: fail closed happened before the delegate"
         );
     }
 
