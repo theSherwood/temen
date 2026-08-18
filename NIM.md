@@ -441,13 +441,16 @@ plumbing. Five workstreams, roughly independent:
   - **Measured from the language side (#956).** `crates/svm-leng/tests/nim_conformance.rs` is a
     toolchain-gated feature→status matrix (generics, exceptions, closures, methods, `seq`/`string`/
     `Table`, floats, iterators, variant objects, `ref`+ARC destructors), each driven Nim-source →
-    whole toolchain → run on both engines and asserted against a committed baseline. **12/15 run
-    end-to-end** (method **dynamic dispatch** landed with #979 — the `Rtti` vtable's `mt` method table
-    is now materialized as funcref relocs, so dispatch reaches the derived override). The remaining
-    fail-closed rows each point at a ticket (#760 for a `const`-arith gvar-initializer translate arm,
-    #980 for the nimony front-end exceptions surface, which also gates `Table`). A row that starts
-    working *or* regresses fails the test — the "green/red matrix, each red a ticket" the totality
-    work grinds down.
+    whole toolchain → run on both engines and asserted against a committed baseline. **13/15 run
+    end-to-end**: method **dynamic dispatch** landed with #979 (the `Rtti` vtable's `mt` method table
+    is materialized as funcref relocs), and **exceptions** run (#980) — hexer lowers `raise`/`try`/
+    `except` to nimony's **error-flag model** (a can-raise proc returns an `(ErrorCode, value)` tuple;
+    the caller branches on the code and `jmp`s to the handler), all constructs svm-leng already
+    handles; the earlier "gap" was a fixture using standard-Nim `newException`, not nimony's model.
+    The two remaining fail-closed rows each point at a ticket: **#760** (a `const`-arith gvar
+    initializer) and **#990** (`oconstr` in expression position — a tuple/object literal as an rvalue,
+    which blocks `Table`). A row that starts working *or* regresses fails the test — the "green/red
+    matrix, each red a ticket" the totality work grinds down.
 - **W2 — Linker (the long pole).** A real program is many modules; nimony emits one Leng file per
   module. W2 resolves cross-module symbols, merges globals/data, and lays out one svm module from N
   Leng inputs — the analog of what the C on-ramp gets from `clang`+`lld` for free. **✅ Core done

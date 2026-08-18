@@ -340,11 +340,18 @@ const FIXTURES: &[Fixture] = &[
         ticket: None,
     },
     Fixture {
+        // nimony's exceptions are an **`ErrorCode` enum** (an error-flag model), not object
+        // exceptions: `raise <ErrorCode>` in a `{.raises.}` routine, caught by `except ErrorCode`.
+        // `ErrorCode`/`ValueError` are `include`d into `system`, so no import. (#980)
         feature: "exceptions (raise/try/except)",
-        source: "proc mayFail(x: int): int =\n  if x < 0: raise newException(ValueError, \"neg\")\n  else: x * 2\nproc safe(x: int): int =\n  try: mayFail(x)\n  except ValueError: -1\nlet r = safe(21)\n",
+        source: "proc mayFail(x: int): int {.raises.} =\n  if x < 0: raise ValueError\n  else: x * 2\nproc safe(x: int): int =\n  try: mayFail(x)\n  except ErrorCode: -1\nlet r = safe(21)\n",
         expected: 42,
-        expect: Expect::FailsClosed(Stage::Frontend),
-        ticket: Some("#980 (nimony front-end exceptions surface)"),
+        // Runs (#980): hexer lowers `raise`/`try`/`except` to the error-flag model — a proc that can
+        // raise returns a `(ErrorCode, value)` tuple; the caller branches on the code and `jmp`s to the
+        // handler — all plain constructs svm-leng handles. The earlier "front-end gap" was the fixture
+        // using standard-Nim `newException`/object exceptions, which isn't nimony's model.
+        expect: Expect::Runs,
+        ticket: None,
     },
     Fixture {
         feature: "closures (capture upvalue)",
@@ -370,13 +377,15 @@ const FIXTURES: &[Fixture] = &[
         ticket: None,
     },
     Fixture {
+        // `std/tables` `initTable`/`[]`/`[]=` are `.raises`, so they must be called inside a
+        // `try`/`except ErrorCode` (nimony's error-flag model). Compiles now that exceptions work
+        // (#980), but `std/tables`/`syncio` fail-close in svm-leng on `oconstr` in expression position
+        // (a tuple/object literal as an rvalue) — a #760-class translate arm tracked in #990.
         feature: "Table[string,int]",
-        source: "import std/tables\nproc run(): int =\n  var t = initTable[string, int]()\n  t[\"a\"] = 42\n  t[\"a\"]\nlet r = run()\n",
+        source: "import std/tables\nproc run(): int =\n  try:\n    var t = initTable[string, int]()\n    t[\"a\"] = 42\n    result = t[\"a\"]\n  except ErrorCode:\n    result = -1\nlet r = run()\n",
         expected: 42,
-        // `std/tables` routines are `.raises`, so this fails the same front-end check as exceptions —
-        // blocked transitively until the exceptions surface exists. Same root cause, tracked in #980.
-        expect: Expect::FailsClosed(Stage::Frontend),
-        ticket: Some("#980 (blocked by exceptions surface)"),
+        expect: Expect::FailsClosed(Stage::Translate),
+        ticket: Some("#990 (oconstr in expression position)"),
     },
     Fixture {
         feature: "floats (arith + int conv)",
