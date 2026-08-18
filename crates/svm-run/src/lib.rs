@@ -9,6 +9,12 @@
 //! this crate only wires the host capabilities a guest is granted. A guest that traps
 //! (out-of-window fault, `unreachable`, …) is **detect-and-killed** (§5) — surfaced here as an
 //! `Err`, never undefined behaviour in the host.
+//!
+//! **Cost note for embedders:** the convenience entry [`Instance::call`] runs the guest on the
+//! **three-backend differential** (tree-walk + bytecode + JIT in lockstep) so a divergence is caught
+//! — it costs ~3× a single run. A production embedder that doesn't need the cross-check should call
+//! [`Instance::run`]`(Backend::Jit, …)` (or [`Session`] for a cap-using export) to pay for one
+//! backend only.
 
 use core::ffi::c_void;
 
