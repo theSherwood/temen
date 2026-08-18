@@ -6099,12 +6099,22 @@ fn lower_block(
     // The CLIF block params are the IR block params; seed the value map with them.
     let mut vals: Vec<Value> = b.block_params(cb).to_vec();
     // Parallel upper-bound map (for mask elision); block params are unknown. Kept in lockstep
-    // with `vals` so `ubs[i]` always describes IR value `i` (a misalignment could mis-elide,
-    // so it is grown at the same points `vals` is). `size` confines via `mask` (= size−1).
+    // with `vals` so `ubs[i]` describes IR value `i` — a misalignment could mis-elide a mask (the
+    // INVARIANTS #2 escape class). Rather than re-growing it by hand in every multi-result arm (a
+    // 25th-arm slip away from a mis-elide), it is repaired to `vals.len()` at the **top of each
+    // iteration** (below), before any bound is consulted. So a slip now pads with `UB_TOP`
+    // ("unknown ⇒ emit the check") — degrading to a redundant mask (perf pennies), never a missing
+    // one — and the single-value tail's `ubs.push` is the only hand-placed growth. `size` confines
+    // via `mask` (= size−1).
     let mut ubs: Vec<u64> = vec![UB_TOP; vals.len()];
     let size = lower.mask.wrapping_add(1);
 
     for (inst_idx, inst) in blk.insts.iter().enumerate() {
+        // Single-site `ubs` maintenance (#893): repair any lag a previous multi-result arm left —
+        // those arms grow `vals` but no longer touch `ubs` — before any elision bound is read this
+        // iteration. A same-length resize is a no-op, so there is no cost on the common path, and
+        // the lockstep is pinned by a `debug_assert_eq!` at each consult site.
+        ubs.resize(vals.len(), UB_TOP);
         // W5 JIT/DWARF Stage 0: stamp the ops this IR instruction lowers to with a `SourceLoc`
         // (= its `debug_info.locs` index), so the finalized code's address map carries source
         // positions. Only when the module has `-g` debug info; otherwise codegen is unchanged.
@@ -6135,7 +6145,6 @@ fn lower_block(
             // path this also returns *before* reading the unwritten return-area slots.
             emit_trap_propagate(b, lower);
             read_call_results(b, call, sret, results, &mut vals);
-            ubs.resize(vals.len(), UB_TOP); // call results are unknown
             continue;
         }
         if let Inst::CallIndirect { ty, idx, args } = inst {
@@ -6150,7 +6159,6 @@ fn lower_block(
             // Propagate a callee trap immediately (see the direct-call case above).
             emit_trap_propagate(b, lower);
             read_call_results(b, call, sret, &ty.results, &mut vals);
-            ubs.resize(vals.len(), UB_TOP); // call results are unknown
             continue;
         }
         if let Inst::CapCall {
@@ -6179,7 +6187,6 @@ fn lower_block(
                     };
                     vals.push(v);
                 }
-                ubs.resize(vals.len(), UB_TOP);
                 continue;
             }
             // FORK.md §8.6 — `exec_module` (`execve` image-replace, op 14) is eval-loop-only: the
@@ -6205,7 +6212,6 @@ fn lower_block(
                 let h = get(&vals, *handle)?;
                 lower_cap_call(module, b, lower, *type_id, *op, sig, h, args, &mut vals)?;
             }
-            ubs.resize(vals.len(), UB_TOP); // cap-call results are unknown
             continue;
         }
         // §7 executable named import (IMPORTS.md phase 1): lower like the `cap.self.*` family — a
@@ -6236,7 +6242,6 @@ fn lower_block(
                 args,
                 &mut vals,
             )?;
-            ubs.resize(vals.len(), UB_TOP);
             continue;
         }
         // §7/§22 symbolic call: a bound `call.sym` is a flat import dispatch (op 0); the
@@ -6257,7 +6262,6 @@ fn lower_block(
                 args,
                 &mut vals,
             )?;
-            ubs.resize(vals.len(), UB_TOP);
             continue;
         }
         // §3.5 dynamic-mode dispatch by type-section reference: the reserved dyn entry packs
@@ -6282,7 +6286,6 @@ fn lower_block(
                 args,
                 &mut vals,
             )?;
-            ubs.resize(vals.len(), UB_TOP);
             continue;
         }
         // §3.5 self-namespace extensions — the shared dispatch entry with `CAP_SELF_TYPE_ID` and
@@ -6321,7 +6324,6 @@ fn lower_block(
                 call_args,
                 &mut vals,
             )?;
-            ubs.resize(vals.len(), UB_TOP);
             continue;
         }
         // Phase-2 `import.attach` (IMPORTS.md): the attach sentinel with the handle value as the
@@ -6345,7 +6347,6 @@ fn lower_block(
                 &call_args,
                 &mut vals,
             )?;
-            ubs.resize(vals.len(), UB_TOP);
             continue;
         }
         // §7/§6 capability reflection: lower to a `cap.call` thunk with the reserved `CAP_SELF_TYPE_ID`
@@ -6396,7 +6397,6 @@ fn lower_block(
                 call_args,
                 &mut vals,
             )?;
-            ubs.resize(vals.len(), UB_TOP);
             continue;
         }
         // §7 `cap.self.resolve` — op 2 over the reserved `CAP_SELF_TYPE_ID`, with a `(name_ptr,
@@ -6420,7 +6420,6 @@ fn lower_block(
                 &call_args,
                 &mut vals,
             )?;
-            ubs.resize(vals.len(), UB_TOP);
             continue;
         }
         // §7 `cap.self.label` — op 3 over `CAP_SELF_TYPE_ID`: `(handle, buf_ptr, buf_cap)` → label len
@@ -6448,7 +6447,6 @@ fn lower_block(
                 &call_args,
                 &mut vals,
             )?;
-            ubs.resize(vals.len(), UB_TOP);
             continue;
         }
         // §12 fibers: lower `cont.*` to indirect calls to the host fiber thunks (addresses baked into
@@ -6474,7 +6472,6 @@ fn lower_block(
                 .call_indirect(tref, thunk, &[mem_base, fnt, trap_out, funcref, spv]);
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
-            ubs.resize(vals.len(), UB_TOP);
             continue;
         }
         // I48: `cont.resume` returns `FIBER_PARKED` on a still-parked fiber (the guest polls);
@@ -6520,7 +6517,6 @@ fn lower_block(
             let status = b.ins().ireduce(I32, status64);
             vals.push(status); // result 0: status (i32)
             vals.push(value); // result 1: value (i64)
-            ubs.resize(vals.len(), UB_TOP);
             continue;
         }
         if let Inst::Suspend { value } = inst {
@@ -6537,7 +6533,6 @@ fn lower_block(
             let call = b.ins().call_indirect(tref, thunk, &[v, trap_out]);
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
-            ubs.resize(vals.len(), UB_TOP);
             continue;
         }
         // `setjmp` (LLVM.md §"JIT `longjmp`", Option B): two calls. First a host thunk returns the
@@ -6567,7 +6562,6 @@ fn lower_block(
             let setjmp_fn = b.ins().iconst(I64, lower.setjmp.setjmp_addr);
             let c2 = b.ins().call_indirect(r2, setjmp_fn, &[slot]);
             vals.push(b.inst_results(c2)[0]);
-            ubs.resize(vals.len(), UB_TOP);
             continue;
         }
         // `longjmp` (LLVM.md §"JIT `longjmp`"): look up the host `jmp_buf` slot for this `buf` (set by a
@@ -6600,7 +6594,6 @@ fn lower_block(
             let r2 = b.import_signature(s2);
             let longjmp_fn = b.ins().iconst(I64, lower.setjmp.longjmp_addr);
             b.ins().call_indirect(r2, longjmp_fn, &[slot, valv]);
-            ubs.resize(vals.len(), UB_TOP);
             continue;
         }
         // §12 per-vCPU TLS register: baked thunks over a per-OS-thread word (no window/trap context —
@@ -6613,7 +6606,6 @@ fn lower_block(
             let thunk = b.ins().iconst(I64, vcpu_tls::get as *const () as i64);
             let call = b.ins().call_indirect(tref, thunk, &[]);
             vals.push(b.inst_results(call)[0]);
-            ubs.resize(vals.len(), UB_TOP);
             continue;
         }
         // §12.8 4A.5 durable-runtime-internal: read the current context's shadow-region base from the
@@ -6626,7 +6618,6 @@ fn lower_block(
             let thunk = b.ins().iconst(I64, durable_shadow::get as *const () as i64);
             let call = b.ins().call_indirect(tref, thunk, &[]);
             vals.push(b.inst_results(call)[0]);
-            ubs.resize(vals.len(), UB_TOP);
             continue;
         }
         if let Inst::VcpuTlsSet { val } = inst {
@@ -6697,7 +6688,6 @@ fn lower_block(
             let call = b.ins().call_indirect(tref, thunk, &[args_ptr]);
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
-            ubs.resize(vals.len(), UB_TOP);
             continue;
         }
         // §12 threads: lower `thread.spawn`/`thread.join` to indirect calls to the host scheduler
@@ -6736,7 +6726,6 @@ fn lower_block(
             );
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
-            ubs.resize(vals.len(), UB_TOP);
             continue;
         }
         if let Inst::ThreadJoin { handle } = inst {
@@ -6754,7 +6743,6 @@ fn lower_block(
             let call = b.ins().call_indirect(tref, thunk, &[sched, h, trap_out]);
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
-            ubs.resize(vals.len(), UB_TOP);
             continue;
         }
         if let Inst::MemoryWait {
@@ -6792,7 +6780,6 @@ fn lower_block(
                 .call_indirect(tref, thunk, &[sched, phys, exp, width, to, trap_out]);
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
-            ubs.resize(vals.len(), UB_TOP);
             continue;
         }
         if let Inst::MemoryNotify { addr, count } = inst {
@@ -6810,7 +6797,6 @@ fn lower_block(
             let thunk = b.ins().iconst(I64, lower.thread.notify_thunk);
             let call = b.ins().call_indirect(tref, thunk, &[sched, phys, cnt]);
             vals.push(b.inst_results(call)[0]);
-            ubs.resize(vals.len(), UB_TOP);
             continue;
         }
         let v = match inst {
@@ -6952,6 +6938,11 @@ fn lower_block(
             }
             Inst::V128Load { addr, offset, .. } => {
                 // The 16-byte masked access — the lone escape-TCB delta SIMD adds (§17/D58).
+                debug_assert_eq!(
+                    ubs.len(),
+                    vals.len(),
+                    "ubs/vals lockstep (mask-elision, #893)"
+                );
                 let elide = in_window(ub_at(&ubs, *addr), *offset, 16, size);
                 let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, 16);
                 b.ins().load(I8X16, mem_flags(), phys, 0)
@@ -6962,6 +6953,11 @@ fn lower_block(
                 offset,
                 ..
             } => {
+                debug_assert_eq!(
+                    ubs.len(),
+                    vals.len(),
+                    "ubs/vals lockstep (mask-elision, #893)"
+                );
                 let elide = in_window(ub_at(&ubs, *addr), *offset, 16, size);
                 let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, 16);
                 b.ins().store(mem_flags(), get(&vals, *value)?, phys, 0);
@@ -7460,6 +7456,11 @@ fn lower_block(
             Inst::Load {
                 op, addr, offset, ..
             } => {
+                debug_assert_eq!(
+                    ubs.len(),
+                    vals.len(),
+                    "ubs/vals lockstep (mask-elision, #893)"
+                );
                 let elide = in_window(ub_at(&ubs, *addr), *offset, op.info().2, size);
                 let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, op.info().2);
                 lower_load(b, *op, phys)
@@ -7471,6 +7472,11 @@ fn lower_block(
                 offset,
                 ..
             } => {
+                debug_assert_eq!(
+                    ubs.len(),
+                    vals.len(),
+                    "ubs/vals lockstep (mask-elision, #893)"
+                );
                 let elide = in_window(ub_at(&ubs, *addr), *offset, op.info().2, size);
                 let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, op.info().2);
                 lower_store(b, *op, phys, get(&vals, *value)?);
@@ -7516,6 +7522,11 @@ fn lower_block(
                 ty, addr, offset, ..
             } => {
                 let w = atomic_width(*ty);
+                debug_assert_eq!(
+                    ubs.len(),
+                    vals.len(),
+                    "ubs/vals lockstep (mask-elision, #893)"
+                );
                 let elide = in_window(ub_at(&ubs, *addr), *offset, w, size);
                 let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, w);
                 guard_atomic_align(b, lower, phys, w);
@@ -7529,6 +7540,11 @@ fn lower_block(
                 ..
             } => {
                 let w = atomic_width(*ty);
+                debug_assert_eq!(
+                    ubs.len(),
+                    vals.len(),
+                    "ubs/vals lockstep (mask-elision, #893)"
+                );
                 let elide = in_window(ub_at(&ubs, *addr), *offset, w, size);
                 let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, w);
                 guard_atomic_align(b, lower, phys, w);
@@ -7545,6 +7561,11 @@ fn lower_block(
                 ..
             } => {
                 let w = atomic_width(*ty);
+                debug_assert_eq!(
+                    ubs.len(),
+                    vals.len(),
+                    "ubs/vals lockstep (mask-elision, #893)"
+                );
                 let elide = in_window(ub_at(&ubs, *addr), *offset, w, size);
                 let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, w);
                 guard_atomic_align(b, lower, phys, w);
@@ -7565,6 +7586,11 @@ fn lower_block(
                 ..
             } => {
                 let w = atomic_width(*ty);
+                debug_assert_eq!(
+                    ubs.len(),
+                    vals.len(),
+                    "ubs/vals lockstep (mask-elision, #893)"
+                );
                 let elide = in_window(ub_at(&ubs, *addr), *offset, w, size);
                 let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, w);
                 guard_atomic_align(b, lower, phys, w); // type is inferred from the operands
