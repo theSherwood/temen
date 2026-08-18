@@ -9281,6 +9281,15 @@ struct CoopSched {
     /// `WebAssembly.Table` at each event boundary (the twin of the single-shot pump's `slot_codes`).
     /// Sized `1 << host.jit_table_log2()` — length 1 and unused on the native `drive` (no shared table).
     slot_codes: Vec<i32>,
+    /// #926 slice 2g — the **invoke-confined** fiber registry for a surfaced emitted `Jit.invoke`'s
+    /// cross-tier bounces (the twin of [`Vcpu::invoke_fibers`]). While a `Jit.invoke` unit runs on the
+    /// host, its `env.call_interp` callbacks share this registry across the invoke's several bounces (a
+    /// fiber one callback parks is resumable by a later bounce of the *same* invoke), then it is cleared
+    /// when the invoke resolves ([`deliver_jit_invoke_vals`](Self::deliver_jit_invoke_vals) / `_trap`) —
+    /// so an invoke's fibers die with it, exactly as the interpreted `run_invoke`'s loop-local registry
+    /// does. A tier-up region's bounces use the run-level `fibers` instead (a parked fiber persists for
+    /// the run to resume). Empty except during an outstanding invoke; always empty on the native `drive`.
+    invoke_fibers: Vec<FiberState>,
 }
 
 impl CoopSched {
@@ -9392,6 +9401,8 @@ impl CoopSched {
             // Sized to the domain table (`Domain::new(_, host.jit_table_log2())`), so a `Jit.install`'s
             // returned slot always indexes it. `1 << 0 == 1` and unused on the native `drive`.
             slot_codes: vec![-1i32; 1usize << host.jit_table_log2()],
+            // Empty until a surfaced `Jit.invoke` bounces; populated only across that invoke's bounces.
+            invoke_fibers: Vec::new(),
         })
     }
 
@@ -9423,6 +9434,9 @@ impl CoopSched {
             pending_tierup,
             pending_jit,
             slot_codes,
+            // The invoke-confined registry is threaded only by `CoopRun::bounce` (an emitted invoke's
+            // callbacks), never touched by the scheduler loop itself.
+            invoke_fibers: _,
         } = self;
         loop {
             // Domain lifetime & teardown (DESIGN.md §12 / ISSUES.md I37, owner 2026-07-24): a
@@ -10854,6 +10868,8 @@ impl CoopSched {
     /// task and clear the pending slot (mirroring [`deliver_tierup`](Self::deliver_tierup), routed to
     /// the invoking task's frame via `pending_jit`). A short reply traps the task.
     fn deliver_jit_invoke_vals(&mut self, vals: &[i64]) {
+        // #926 slice 2g: the emitted invoke resolved — its bounce registry dies with it (Vcpu parity).
+        self.invoke_fibers.clear();
         let (ti, dst, results) = self
             .pending_jit
             .take()
@@ -10873,6 +10889,8 @@ impl CoopSched {
     /// #926 slice 2e — the emitted `Jit.invoke` unit trapped: trap the invoking task (mirroring
     /// [`deliver_tierup_trap`](Self::deliver_tierup_trap)).
     fn deliver_jit_invoke_trap(&mut self, trap: Trap) {
+        // #926 slice 2g: the emitted invoke resolved (trapped) — its bounce registry dies with it.
+        self.invoke_fibers.clear();
         let (ti, _dst, _results) = self
             .pending_jit
             .take()
@@ -11102,14 +11120,17 @@ impl CoopRun {
         self.sched.deliver_jit_invoke_trap(trap);
     }
 
-    /// #926 slice 2 — service an emitted tier-up region's cross-tier `call_interp(target, io)` while it
-    /// is mid-run for the **currently paused task**. Routes the bounce to *that task's* env — a §14
-    /// confined child steps its own window/powerbox/dispatch table (`env == Some`), the root and its
-    /// `thread.spawn` threads the shared ones (`env == None`) — so a confined leaf's callback can never
-    /// reach outside its window (the confinement hinge). The run-shared fiber registry is used (a fiber
-    /// a callback parks persists for the run to resume), exactly as the same call inline would register.
-    /// Marshals results back into `io` and returns the result count. Call only between a
-    /// [`CoopEvent::TierUp`] and its delivery; `Err(Malformed)` if no tier-up is outstanding.
+    /// #926 slice 2 — service an emitted tier-up region's **or** a surfaced `Jit.invoke` unit's cross-tier
+    /// `call_interp(target, io)` while it is mid-run for the **currently paused task**. Routes the bounce
+    /// to *that task's* env — a §14 confined child steps its own window/powerbox/dispatch table
+    /// (`env == Some`), the root and its `thread.spawn` threads the shared ones (`env == None`) — so a
+    /// confined leaf's callback can never reach outside its window (the confinement hinge). The fiber
+    /// registry is picked by which round-trip is outstanding (#926 slice 2g, `Vcpu::bounce_call` parity):
+    /// a tier-up region uses the **run-level** registry (a parked fiber persists for the run to resume),
+    /// while a surfaced `Jit.invoke` uses the **invoke-confined** registry (`invoke_fibers` — its fibers
+    /// die when the invoke resolves). Marshals results back into `io` and returns the result count. Call
+    /// only between a [`CoopEvent::TierUp`]/[`CoopEvent::JitInvoke`] and its delivery; `Err(Malformed)` if
+    /// nothing is outstanding.
     pub fn bounce(&mut self, target: u32, io: &mut [i64]) -> Result<usize, Trap> {
         // The paused task is whichever host round-trip is outstanding — a tier-up region or a
         // surfaced `Jit.invoke` unit; both bounce cross-tier the same way. (#926 slice 2e)
@@ -11120,6 +11141,9 @@ impl CoopRun {
             .or(self.sched.pending_jit.as_ref())
             .map(|(ti, ..)| *ti)
             .ok_or(Trap::Malformed)?;
+        // Mid-invoke iff a `Jit.invoke` (not a tier-up) is the outstanding round-trip — never both at
+        // once (the one-round-trip discipline). Selects the invoke-confined registry below.
+        let in_invoke = self.sched.pending_jit.is_some();
         let CoopRun {
             dom,
             mem,
@@ -11133,8 +11157,18 @@ impl CoopRun {
             fibers,
             fiber_sp,
             fiber_meta,
+            invoke_fibers,
             ..
         } = sched;
+        // The registry `coop_bounce` threads into `drive_nested`: invoke-confined (`invoke_fibers`, no
+        // shadow-SP/freeze halves — invoke fibers are transient) during an emitted `Jit.invoke`, else the
+        // run-level registry with its parallel arrays. One of the two `match` arms below moves it.
+        let (bounce_fibers, bounce_meta): (&mut Vec<FiberState>, Option<RunFiberMeta<'_>>) =
+            if in_invoke {
+                (invoke_fibers, None)
+            } else {
+                (fibers, Some((fiber_sp, fiber_meta)))
+            };
         match tasks[ti].env {
             // Root / `thread.spawn` thread: the run's shared window, powerbox, and domain table.
             None => {
@@ -11145,9 +11179,8 @@ impl CoopRun {
                     fuel,
                     mem,
                     &mut cell,
-                    fibers,
-                    fiber_sp,
-                    fiber_meta,
+                    bounce_fibers,
+                    bounce_meta,
                     target,
                     io,
                 )
@@ -11162,9 +11195,8 @@ impl CoopRun {
                     &mut e.fuel,
                     &mut e.mem,
                     &mut cell,
-                    fibers,
-                    fiber_sp,
-                    fiber_meta,
+                    bounce_fibers,
+                    bounce_meta,
                     target,
                     io,
                 )
@@ -11177,11 +11209,14 @@ impl CoopRun {
 /// run, calls back to an interp-resident leaf `target`. Resolves `target` through the caller's dispatch
 /// `table` (masked, exactly as `Op::CallIndirect`), marshals the i64 scratch `io` per the callee's
 /// signature, and drives it to completion on a nested interpretation over the caller's `mem`/`host`/
-/// `fuel` and the **run-level** fiber registry (so a fiber a callback parks persists for the run — the
-/// same registry `step_vcpu` mirrors its parallel arrays into). The multi-task analogue of
-/// [`Vcpu::bounce_call`], differing only in that the window/powerbox/table come from the *tiering-up
-/// task's* env (resolved by [`CoopRun::bounce`]); always a run-level bounce — the cooperative driver
-/// never surfaces an emitted `Jit.invoke`, so there is no invoke-confined variant.
+/// `fuel`. The `fibers`/`fiber_meta` the caller passes select the registry (#926 slice 2g): a **tier-up
+/// region**'s callbacks run against the **run-level** registry (`fiber_meta = Some(shadow-SP/freeze
+/// halves)` — a parked fiber persists for the run, the same registry `step_vcpu` mirrors its parallel
+/// arrays into), while a surfaced **`Jit.invoke`** unit's callbacks run against an **invoke-confined**
+/// registry (`fiber_meta = None`, the transient loop-local scope `run_invoke` and `Vcpu::bounce_call`'s
+/// invoke branch use — its fibers die when the invoke resolves). The multi-task analogue of
+/// [`Vcpu::bounce_call`], differing only in that the window/powerbox/table come from the *paused task's*
+/// env (resolved by [`CoopRun::bounce`]).
 #[allow(clippy::too_many_arguments)] // an inherently many-input dispatch shim; a config struct would obscure it
 fn coop_bounce(
     source: &ModuleSource,
@@ -11190,8 +11225,7 @@ fn coop_bounce(
     mem: &mut Option<Mem>,
     host: &mut HostCell,
     fibers: &mut Vec<FiberState>,
-    fiber_sp: &mut Vec<u64>,
-    fiber_meta: &mut Vec<(i32, i64)>,
+    fiber_meta: Option<RunFiberMeta<'_>>,
     target: u32,
     io: &mut [i64],
 ) -> Result<usize, Trap> {
@@ -11220,16 +11254,7 @@ fn coop_bounce(
         .collect();
     let mut vm = Vm::new(&tm, ts.func as usize, &args)?;
     vm.module = ts.module as usize;
-    let vals = drive_nested(
-        source,
-        table,
-        vm,
-        fuel,
-        mem,
-        host,
-        fibers,
-        Some((fiber_sp, fiber_meta)),
-    )?;
+    let vals = drive_nested(source, table, vm, fuel, mem, host, fibers, fiber_meta)?;
     for (i, v) in vals.iter().enumerate() {
         io[i] = val_to_slot(*v);
     }

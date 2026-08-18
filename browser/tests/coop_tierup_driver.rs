@@ -1108,3 +1108,171 @@ fn coop_leaf_reaches_installed_unit_natively() {
     assert_eq!(got_out, want.stdout, "stdout parity with the oracle");
     svm_coop_close();
 }
+
+// ---- #926 slice 2g: the invoke-confined bounce — an emitted `Jit.invoke` unit bounces cross-tier ----
+
+/// What the bounce helper adds, and where the unit probes the page a bounced callback grew mid-invoke.
+const BOUNCE_K: i64 = 1000;
+const MID_GROW_PROBE: i64 = 81920 + 8;
+
+/// A **threaded** `vm_jit_*` guest whose surfaced `Jit.invoke` unit **bounces** cross-tier (#926 slice
+/// 2g — the invoke-confined registry path; the #846 `linked_unit_bounces` shape, on the cooperative
+/// driver). `_start` (root vCPU) spawns a worker (`f3`, returns 0), `vm_map`-grows `[64 KiB, 80 KiB)`,
+/// compiles + `invoke2`s a unit whose emitted `f0`: (1) `call_indirect`s slot 1 → the program's
+/// cap-calling helper `f1` — interpreter-resident, so the edge **bounces** via `env.call_interp` (the
+/// callback grows `[80 KiB, 96 KiB)` and streams); (2) stores into that just-grown page (correct only
+/// if the post-bounce `"mapped"` fan-out admits the growth); (3) `call_indirect`s slot 2 → the pure leaf
+/// `f2` — emitted, **native**. The bounce runs through the invoke-confined fiber registry (`Vcpu`
+/// parity), and must match the interpreted oracle bit-for-bit.
+fn coop_invoke_bounce_guest_text() -> String {
+    let (out_h, mem_h) = onramp_out_mem_handles();
+    let unit_src = format!(
+        r#"memory 16
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vs1 = i32.const 1
+  va = call_indirect (i64) -> (i64) vs1 (v0)
+  vsum = i64.add v0 va
+  vaddr = i64.const {MID_GROW_PROBE}
+  i64.store vaddr vsum
+  vld = i64.load vaddr
+  vs2 = i32.const 2
+  vc = call_indirect (i64) -> (i64) vs2 (vld)
+  return vc
+  }}
+}}
+"#
+    );
+    let unit = svm_text::parse_module(&unit_src).expect("unit parse");
+    svm_verify::verify_module(&unit).expect("unit verify");
+    let blob = svm_encode::encode_module(&unit);
+    let blob_len = blob.len();
+    let mut stores = String::new();
+    for (i, chunk) in blob.chunks(8).enumerate() {
+        let mut word = [0u8; 8];
+        word[..chunk.len()].copy_from_slice(chunk);
+        let val = i64::from_le_bytes(word);
+        let addr = BLOB_BASE + (i as i64) * 8;
+        stores.push_str(&format!(
+            "  va{i} = i64.const {addr}\n  vv{i} = i64.const {val}\n  i64.store va{i} vv{i}\n"
+        ));
+    }
+    format!(
+        r#"memory 16
+import 0 "vm_jit_compile" (i64, i64) -> (i64)
+import 1 "vm_jit_invoke2" (i64, i64) -> (i64)
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vt = thread.spawn 3 vz vz
+  vas = i32.const {mem_h}
+  voff = i64.const 65536
+  vlen = i64.const 16384
+  vprot = i32.const 3
+  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+{stores}  vbp = i64.const {BLOB_BASE}
+  vbl = i64.const {blob_len}
+  vcode = call.import 0 (vbp, vbl)
+  vprobe = i64.const {PROBE}
+  vres = call.import 1 (vcode, vprobe)
+  vj = thread.join vt
+  vsum = i64.add vres vj
+  vsl = i64.const {SLOT}
+  i64.store vsl vsum
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vsum
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vas = i32.const {mem_h}
+  voff = i64.const 81920
+  vlen = i64.const 16384
+  vprot = i32.const 3
+  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vout = i32.const {out_h}
+  vzero = i64.const 0
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vzero, vlen8)
+  vk = i64.const {BOUNCE_K}
+  vsum = i64.add v0 vk
+  return vsum
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vk = i64.const 3
+  vmul = i64.mul v0 vk
+  return vmul
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vz = i64.const 0
+  return vz
+  }}
+}}
+export 0 func "_start" 0
+"#
+    )
+}
+
+#[test]
+fn coop_invoked_unit_bounces_and_native_edges_match_the_oracle() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let m = svm_text::parse_module(&coop_invoke_bounce_guest_text()).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+
+    // Oracle: bounce (+K, grow), grown-page store/load, native ×3; worker 0.
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(
+        want.value,
+        (2 * PROBE + BOUNCE_K) * 3,
+        "oracle: bounce (+K, grow), grown-page store/load, native ×3"
+    );
+
+    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(
+        opened,
+        0,
+        "open must admit the threaded bouncing-invoke guest (status {})",
+        svm_status()
+    );
+
+    let (d, _tierups, invokes) = drive_coop_b2_session(&m);
+    // Non-vacuity: the unit ran emitted (invoke), its cap-calling edge **bounced** through the
+    // invoke-confined registry (slot 1 in the bounce log), and the pure leaf dispatched **natively**
+    // (slot 2 absent) — the exact edge split #846 pins, now on the cooperative driver.
+    assert!(
+        invokes >= 1,
+        "the linked unit must run emitted (invoke non-vacuity)"
+    );
+    assert!(
+        d.bounces().contains(&1),
+        "the cap-calling helper must have bounced during the invoke: {:?}",
+        d.bounces()
+    );
+    assert!(
+        !d.bounces().contains(&2),
+        "the eligible leaf must dispatch natively, never bounce: {:?}",
+        d.bounces()
+    );
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        svm_coop_value(),
+        want.value,
+        "value parity (growth-mid-invoke visible post-bounce)"
+    );
+    // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
+    let got_out =
+        unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
+    assert_eq!(
+        got_out, want.stdout,
+        "stdout parity (bounce ordering included)"
+    );
+    svm_coop_close();
+}
