@@ -274,6 +274,11 @@ fn run_inner(m: &Module, global_substr: &str) -> Result<i64, Stage> {
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Expect {
     Runs,
+    /// A feature known to fail closed, pinned to the stage it stops at. Retained scaffolding: the matrix
+    /// is 15/15 today so no fixture constructs this, but the suite's whole point is to tolerate the
+    /// *next* red — a new feature lands as `FailsClosed(stage)` with its ticket, then flips to `Runs`
+    /// when fixed. `allow(dead_code)` keeps the machinery (and the assertion arm below) alive meanwhile.
+    #[allow(dead_code)]
     FailsClosed(Stage),
 }
 
