@@ -33,6 +33,37 @@ use svm_mem::RmwOp;
 // `#![forbid(unsafe_code)]`.
 pub use svm_mem::Region;
 
+/// The crate's **continue-through-poison** lock policy, in one documented home (#918). A poisoned
+/// lock means a thread panicked while holding it, but the data these locks guard is a plain guest
+/// image (scheduler queues, memory, host table) that is never left in a torn state a reader must
+/// reject — so we recover the inner guard and proceed rather than cascading the panic. Replaces the
+/// ~140 open-coded `.lock_unpoisoned()` call sites with `.lock_unpoisoned()`.
+pub(crate) trait LockUnpoisoned<T> {
+    fn lock_unpoisoned(&self) -> std::sync::MutexGuard<'_, T>;
+}
+impl<T> LockUnpoisoned<T> for Mutex<T> {
+    #[inline]
+    fn lock_unpoisoned(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// The [`RwLock`] analogue of [`LockUnpoisoned`] — same continue-through-poison policy.
+pub(crate) trait RwLockUnpoisoned<T> {
+    fn read_unpoisoned(&self) -> std::sync::RwLockReadGuard<'_, T>;
+    fn write_unpoisoned(&self) -> std::sync::RwLockWriteGuard<'_, T>;
+}
+impl<T> RwLockUnpoisoned<T> for RwLock<T> {
+    #[inline]
+    fn read_unpoisoned(&self) -> std::sync::RwLockReadGuard<'_, T> {
+        self.read().unwrap_or_else(|e| e.into_inner())
+    }
+    #[inline]
+    fn write_unpoisoned(&self) -> std::sync::RwLockWriteGuard<'_, T> {
+        self.write().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// A runtime value. Mirrors `ValType`.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Value {
@@ -490,7 +521,7 @@ impl DebugCtx {
     }
 
     fn shared(&self) -> std::sync::MutexGuard<'_, DebugShared> {
-        self.shared.lock().unwrap_or_else(|e| e.into_inner())
+        self.shared.lock_unpoisoned()
     }
 
     fn watches_armed(&self) -> bool {
@@ -1205,9 +1236,7 @@ impl Inspector {
         );
         if let Some(cp) = start {
             root.restore_continuation(cp.frames.clone(), cp.fuel, cp.mem.as_deref(), cp.clock);
-            host.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .restore_replay_substate(&cp.host);
+            host.lock_unpoisoned().restore_replay_substate(&cp.host);
         }
         self.host = host;
         self.finished = None;
@@ -1273,7 +1302,7 @@ impl Inspector {
         }
         let clock = root.debug_clock();
         let host_sub = {
-            let h = self.host.lock().unwrap_or_else(|e| e.into_inner());
+            let h = self.host.lock_unpoisoned();
             // Leave the subset (and drop the ladder) if the continuation or the host has grown state a
             // checkpoint can't faithfully restore.
             if !root.checkpointable() || !h.checkpoint_safe() {
@@ -1421,7 +1450,7 @@ impl Inspector {
     /// Lock the powerbox to inspect host-side effects (e.g. `host().stdout`). Safe while the guest
     /// is paused or finished — it is not executing, so the lock is uncontended.
     pub fn host(&self) -> std::sync::MutexGuard<'_, Host> {
-        self.host.lock().unwrap_or_else(|e| e.into_inner())
+        self.host.lock_unpoisoned()
     }
 
     /// The recorded capability-input trace so far (DEBUGGING.md W1) — the `Clock` (and, later, other
@@ -1440,7 +1469,7 @@ impl Inspector {
 
     /// The run-wide (cross-vCPU) breakpoint/watchpoint state. Uncontended while the guest is paused.
     fn shared(&self) -> std::sync::MutexGuard<'_, DebugShared> {
-        self.shared.lock().unwrap_or_else(|e| e.into_inner())
+        self.shared.lock_unpoisoned()
     }
 
     /// Add a breakpoint at `pc` (idempotent). Applies to every thread (DEBUGGING.md Milestone B).
@@ -2045,7 +2074,7 @@ fn drive_arc_shared(
         .unwrap_or(1)
         .clamp(1, MAX_WORKERS);
     let (quota, jit_table_log2, offer_table_demand, durable, handoff, jit_reapply) = {
-        let h = cell.lock().unwrap_or_else(|e| e.into_inner());
+        let h = cell.lock_unpoisoned();
         // Install-durability (§12.5): a provider cell with B2-installed units gets them re-applied
         // onto the sub-run's fresh dispatch table, exactly as the by-value wrapper does.
         let reapply: Vec<(u32, Arc<[Func]>)> = h
@@ -2132,7 +2161,7 @@ fn drive_over_cell(
     // Cleared at teardown (it captures the run's scheduler — cycle discipline).
     {
         let sched_for_comp = Arc::clone(&sched);
-        let mut hg = host_shared.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hg = host_shared.lock_unpoisoned();
         let comps = hg.completions();
         hg.set_completion_notify(Arc::new(move || {
             sched_for_comp.completion_drain(&comps);
@@ -2145,7 +2174,7 @@ fn drive_over_cell(
     // domain** (invariant 12): no teardown discipline is needed — the run's `Arc` dies with the run,
     // so a post-run raise upgrades to nothing and is a harmless no-op.
     {
-        let hg = host_shared.lock().unwrap_or_else(|e| e.into_inner());
+        let hg = host_shared.lock_unpoisoned();
         let root_dom = hg.domain_id() as usize;
         let stop_flag = hg.stop_flag.clone();
         let term_flag = hg.term_flag.clone();
@@ -2203,10 +2232,7 @@ fn drive_over_cell(
                        // §12 domain lifetime (owner 2026-07-24): record the root domain's key — a
                        // trap/exit anywhere in the shared-powerbox domain ends the whole run, not
                        // just the trapping vCPU (the batch activation's owner is gone).
-        s.root_domain = host_shared
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .domain_id() as usize;
+        s.root_domain = host_shared.lock_unpoisoned().domain_id() as usize;
         // §13.4 slice 4c-bis: read the freeze-on-quiesce arm from the seeded window once.
         s.freeze_on_quiesce = mem
             .as_ref()
@@ -2449,10 +2475,7 @@ fn drive_over_cell(
                 // parent's re-executed `thread.join` fails closed — the per-child R5 identity gate.
                 let cfuncs = match fnr.module_digest {
                     None => Some(Arc::clone(&funcs)),
-                    Some(d) => host_shared
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .module_by_digest(&d),
+                    Some(d) => host_shared.lock_unpoisoned().module_by_digest(&d),
                 };
                 let Some(cfuncs) = cfuncs else {
                     if parent == id {
@@ -2515,7 +2538,7 @@ fn drive_over_cell(
                         cs.svc_next_ticket,
                     );
                     ch.self_module = {
-                        let hg = host_shared.lock().unwrap_or_else(|e| e.into_inner());
+                        let hg = host_shared.lock_unpoisoned();
                         match fnr.module_digest {
                             Some(d) => hg.module_arc_by_digest(&d),
                             None => hg.self_module.clone(),
@@ -2608,15 +2631,11 @@ fn drive_over_cell(
             // children, not just the root against its direct children.
             let holders = std::iter::once((id, Arc::clone(&host_shared))).chain(holder_hosts);
             for (htask, hhost) in holders {
-                let pending = hhost
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .take_pending_live_impls();
+                let pending = hhost.lock_unpoisoned().take_pending_live_impls();
                 for (idx, cslot, export) in pending {
                     if let Some(chost) = child_hosts_by_edge.get(&(htask, cslot)) {
                         hhost
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
+                            .lock_unpoisoned()
                             .relink_live_impl(idx, Arc::clone(chost), export);
                     }
                 }
@@ -2639,7 +2658,7 @@ fn drive_over_cell(
     // be writing the futex counter) and drop the `notify` hook's `Arc<Scheduler>` before reading the
     // final window back. Safe to lock: all vCPUs are gone, so the shared host is otherwise idle.
     {
-        let mut h = host_shared.lock().unwrap_or_else(|e| e.into_inner());
+        let mut h = host_shared.lock_unpoisoned();
         h.quiesce_pool();
         h.clear_completion_notify();
         // #863 slice 3 — no signal-wake clear: the wake closure holds the scheduler *weakly*, so a
@@ -3807,7 +3826,7 @@ impl DomainTable {
     /// under the `units` lock (rare — only inside a synchronous `cap.call`, the guest suspended); the
     /// slot store is `Release` so the pushed unit is visible to any reader that observes the slot.
     fn install(&self, unit: Arc<[Func]>) -> Option<u32> {
-        let mut units = self.units.lock().unwrap_or_else(|e| e.into_inner());
+        let mut units = self.units.lock_unpoisoned();
         let slot = self
             .slots
             .iter()
@@ -3830,7 +3849,7 @@ impl DomainTable {
         if s >= self.slots.len() {
             return;
         }
-        let mut units = self.units.lock().unwrap_or_else(|e| e.into_inner());
+        let mut units = self.units.lock_unpoisoned();
         units.push(unit);
         let module = units.len() as u32; // module k ≡ units[k-1]
         self.slots[s].store(pack_slot(module, 0), Ordering::Release);
@@ -3845,7 +3864,7 @@ impl DomainTable {
     /// from an identical table state. Serialized under the `units` lock like [`Self::install`].
     fn install_unit_funcs(&self, unit: Arc<[Func]>) -> Option<Vec<u32>> {
         let n = unit.len();
-        let mut units = self.units.lock().unwrap_or_else(|e| e.into_inner());
+        let mut units = self.units.lock_unpoisoned();
         // CALLS.md 6a — dedup: a unit already installed (same `Arc`) reuses its slots. Repeat
         // installs — multiple vCPUs animating one `ref.func` offer, repeat invokes of one unit —
         // must not leak table slots. (A B2 `uninstall` of any slot voids the reuse: the recount
@@ -3889,7 +3908,7 @@ impl DomainTable {
     /// back to trapping padding so the index is reusable and a stale `call_indirect` of it traps.
     /// `units` stays (append-only; the unit is just no longer reachable). Serialized like `install`.
     fn uninstall(&self, slot: usize, n_real: usize) -> bool {
-        let _g = self.units.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = self.units.lock_unpoisoned();
         if slot >= n_real
             && slot < self.slots.len()
             && (self.slots[slot].load(Ordering::Relaxed) >> 32) as u32 != TABLE_EMPTY
@@ -3905,7 +3924,7 @@ impl DomainTable {
     /// local-cache miss (a unit installed since its last sync); the `Mutex` acquire pairs with the
     /// `install` slot `Release` to make the pushed unit visible.
     fn units_snapshot(&self) -> Vec<Arc<[Func]>> {
-        self.units.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.units.lock_unpoisoned().clone()
     }
 }
 
@@ -4580,7 +4599,7 @@ impl Scheduler {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Sched> {
-        self.mx.lock().unwrap_or_else(|e| e.into_inner())
+        self.mx.lock_unpoisoned()
     }
 
     /// Allocate a task id + live slot and enqueue the vCPU built by `make`; spawn another worker if
@@ -4784,10 +4803,7 @@ impl Scheduler {
             n += 1;
             match w {
                 Waiter::VCpu(v) => {
-                    v.host
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .set_sig_interrupt();
+                    v.host.lock_unpoisoned().set_sig_interrupt();
                     s.runnable.push_back(v);
                 }
                 Waiter::Fiber { reg, slot, svc } => {
@@ -4817,10 +4833,7 @@ impl Scheduler {
         }
         s.posix_reap_waiters.retain(|_, ws| !ws.is_empty());
         for v in hit_reaps {
-            v.host
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .set_sig_interrupt();
+            v.host.lock_unpoisoned().set_sig_interrupt();
             s.runnable.push_back(v);
             n += 1;
         }
@@ -4843,11 +4856,7 @@ impl Scheduler {
             if !honor {
                 return false;
             }
-            *cache.get_or_insert_with(|| {
-                host.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .signal_restart()
-            })
+            *cache.get_or_insert_with(|| host.lock_unpoisoned().signal_restart())
         }
         let mut hit_caps: Vec<Waiter> = Vec::new();
         for waiters in s.cap_waiters.values_mut() {
@@ -4937,7 +4946,7 @@ impl Scheduler {
     /// fiber early-probe, so the pair can't deadlock.
     fn cap_reply_or_stash(&self, ticket: u64, result: i64, callee: &Arc<Mutex<Host>>) {
         let mut s = self.lock();
-        let callee_id = callee.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
+        let callee_id = callee.lock_unpoisoned().domain_id() as usize;
         match s.ticket_waiters.remove(&(callee_id, ticket)) {
             Some(Waiter::VCpu(mut v)) => {
                 v.pending = Some(Pending::CapResult(result));
@@ -4956,11 +4965,7 @@ impl Scheduler {
                 if s.orphan_tickets.remove(&(callee_id, ticket)) {
                     return;
                 }
-                callee
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .svc_results
-                    .insert(ticket, result);
+                callee.lock_unpoisoned().svc_results.insert(ticket, result);
             }
         }
     }
@@ -5196,7 +5201,7 @@ impl Scheduler {
         // Duplicated powerbox (own handle namespace, shared `Arc` backings, new `domain_id`) — fails
         // closed on any domain the core can't duplicate on its own (closure caps, live offers, …).
         let twin_host = {
-            let hg = v.host.lock().unwrap_or_else(|e| e.into_inner());
+            let hg = v.host.lock_unpoisoned();
             match hg.fork_powerbox(twin_id) {
                 Some(h) => Arc::new(Mutex::new(h)),
                 None => {
@@ -5213,7 +5218,7 @@ impl Scheduler {
         // deliverable signal raised against the twin (`kill(pid)`) interrupts ITS blocked syscalls —
         // and only its (invariant 12). Weak: the run's `Arc` dies with the run, no teardown needed.
         {
-            let hg = twin_host.lock().unwrap_or_else(|e| e.into_inner());
+            let hg = twin_host.lock_unpoisoned();
             let dom = hg.domain_id() as usize;
             let stop_flag = hg.stop_flag.clone();
             let term_flag = hg.term_flag.clone();
@@ -5559,7 +5564,7 @@ fn process_timers(s: &mut Sched) {
 /// `thread.spawn` threads vs. each §14 live child + *its* threads). Lock order sched → host is
 /// the established one (the park arms take it the same way).
 fn domain_key_of(v: &VCpu) -> usize {
-    v.host.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize
+    v.host.lock_unpoisoned().domain_id() as usize
 }
 
 /// Kill one vCPU at a teardown (DESIGN.md §12 "Domain lifetime & teardown", owner 2026-07-24):
@@ -5587,12 +5592,12 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
     // never a wrong answer). A promoted-but-parked handler already handed its world back at the
     // park (`offer_parked` ⇒ `busy` already clear), so only the active stack needs clearing.
     for anim in &v.offer_anim {
-        anim.state.lock().unwrap_or_else(|e| e.into_inner()).busy = false;
+        anim.state.lock_unpoisoned().busy = false;
     }
     // CALLS.md 4c.1 — a reaped admission-waiter drops out of its instance's `admit_parked` count
     // (it will never re-attempt), so a reused `Host`'s bound stays accurate.
     if let Some(state) = &v.admit_retry {
-        state.lock().unwrap_or_else(|e| e.into_inner()).admit_parked -= 1;
+        state.lock_unpoisoned().admit_parked -= 1;
     }
     if v.vcpu_ctx > 0 {
         v.registry.free_vcpu_context(v.vcpu_ctx);
@@ -5808,8 +5813,7 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
     // The dying domain's *queued* (never-admitted) dispatches: their callers wake too.
     tickets.extend(
         dying
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_unpoisoned()
             .svc_queue
             .drain(..)
             .map(|d| d.ticket),
@@ -5984,7 +5988,7 @@ fn park_cap_reply(sched: &Arc<Scheduler>, v: Box<VCpu>, ticket: u64, callee: Arc
         // registered a waiter — but its dispatch is queued on the (live) callee and will be
         // served. Record the ticket as an orphan so the reply is dropped, not leaked. (A
         // dead callee never replies; its queue was already drained, so skip it.)
-        let callee_id = callee.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
+        let callee_id = callee.lock_unpoisoned().domain_id() as usize;
         if !s.dead.contains_key(&callee_id) {
             s.orphan_tickets.insert((callee_id, ticket));
         }
@@ -5994,13 +5998,9 @@ fn park_cap_reply(sched: &Arc<Scheduler>, v: Box<VCpu>, ticket: u64, callee: Arc
     // D37 death-is-revocation: a callee torn down between the enqueue and this park will
     // never reply (its queue was drained by the teardown before we got here) — complete
     // with the probeable errno instead of stranding the caller.
-    let callee_id = callee.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
+    let callee_id = callee.lock_unpoisoned().domain_id() as usize;
     let callee_dead = s.dead.contains_key(&callee_id);
-    let early = callee
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .svc_results
-        .remove(&ticket);
+    let early = callee.lock_unpoisoned().svc_results.remove(&ticket);
     match early {
         Some(r) => {
             v.pending = Some(Pending::CapResult(r));
@@ -6149,18 +6149,15 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                             // where a thaw reads it — the root records its child with `parent_task = 0`,
                             // a child records its grandchild with `parent_task = <child's task>`.
                             let sink = v.freeze_sink.clone().unwrap_or_else(|| Arc::clone(&v.host));
-                            sink.lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .frozen_nested
-                                .push(FrozenNested {
-                                    parent_task: v.id as usize,
-                                    slot: c.slot,
-                                    carve_off: c.carve_off,
-                                    size_log2: c.size_log2,
-                                    entry: c.entry,
-                                    module_digest: c.module_digest,
-                                    completed_result,
-                                });
+                            sink.lock_unpoisoned().frozen_nested.push(FrozenNested {
+                                parent_task: v.id as usize,
+                                slot: c.slot,
+                                carve_off: c.carve_off,
+                                size_log2: c.size_log2,
+                                entry: c.entry,
+                                module_digest: c.module_digest,
+                                completed_result,
+                            });
                         }
                         refuse
                     }
@@ -6175,7 +6172,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // fresh-grant instantiator/AS handles) record nothing, keeping plain-subtree
                 // artifacts unchanged.
                 let child_state_refused = froze && v.nested_child && {
-                    let hg = v.host.lock().unwrap_or_else(|e| e.into_inner());
+                    let hg = v.host.lock_unpoisoned();
                     let (q, r, t) = hg.svc_state();
                     match hg.capture_durable_handles() {
                         Err(_) => true, // a non-durable child handle: fail the freeze closed
@@ -6188,8 +6185,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                                 drop(hg);
                                 let sink =
                                     v.freeze_sink.clone().unwrap_or_else(|| Arc::clone(&v.host));
-                                sink.lock()
-                                    .unwrap_or_else(|e| e.into_inner())
+                                sink.lock_unpoisoned()
                                     .frozen_child_state
                                     .push(FrozenChildState {
                                         parent_task: v.parent_task as usize,
@@ -6217,25 +6213,18 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     if let Some((func, args)) = v.spawn_residue.clone() {
                         // A **spawned** vCPU (slice 3.2.1) records *itself* as residue: its continuation now
                         // lives in its own region (extent = `self_sp`); a thaw re-spawns it there.
-                        v.host
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .frozen_vcpus
-                            .push(FrozenVCpu {
-                                task: v.id as usize,
-                                parent_task: v.parent_task as usize,
-                                func: func as i32,
-                                args,
-                                shadow_sp: self_sp,
-                                completed_result: None, // interp runs durable single-worker
-                            });
+                        v.host.lock_unpoisoned().frozen_vcpus.push(FrozenVCpu {
+                            task: v.id as usize,
+                            parent_task: v.parent_task as usize,
+                            func: func as i32,
+                            args,
+                            shadow_sp: self_sp,
+                            completed_result: None, // interp runs durable single-worker
+                        });
                     } else if !v.nested_child {
                         // The root: record its extent (the shared active-SP word will be overwritten by a
                         // later child, so the root's residue can't ride the window).
-                        v.host
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .frozen_root_sp = Some(self_sp);
+                        v.host.lock_unpoisoned().frozen_root_sp = Some(self_sp);
                     }
                     // (A §14 nested child records nothing: its extent is its carve's own shadow-SP
                     // word, inside the parent's window image — carve-self-describing.)
@@ -6252,11 +6241,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                             drop(frozen);
                             r = Err(Trap::ThreadFault);
                         } else {
-                            v.host
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .frozen_fibers
-                                .extend(frozen);
+                            v.host.lock_unpoisoned().frozen_fibers.extend(frozen);
                         }
                     }
                     r
@@ -6293,7 +6278,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // *also* releases its read ends — a consumer that exits (e.g. `head`) drops the reader
                 // count, so a parked upstream producer wakes to `-EPIPE` rather than hang forever.
                 let (pipe_eofs, pipe_epipes) = {
-                    let hg = v.host.lock().unwrap_or_else(|e| e.into_inner());
+                    let hg = v.host.lock_unpoisoned();
                     (hg.drop_all_pipe_writers(), hg.drop_all_pipe_readers())
                 };
                 let mut outcome = Outcome {
@@ -6327,11 +6312,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // and the established order is scheduler → personality (the fork factory); the
                 // host lock is free (this very thread just dropped the vCPU).
                 if s.forked_twins.contains_key(&id) {
-                    let hooks = dying_host
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .exit_hooks
-                        .clone();
+                    let hooks = dying_host.lock_unpoisoned().exit_hooks.clone();
                     if !hooks.is_empty() {
                         let status = reap_status(&outcome.result);
                         for h in hooks {
@@ -6450,7 +6431,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     return;
                 };
                 let (live, interrupted) = {
-                    let hg = v.host.lock().unwrap_or_else(|e| e.into_inner());
+                    let hg = v.host.lock_unpoisoned();
                     // #796 slice D — the pre-park pending check, same shape as the revoke
                     // re-check beside it: a deliverable raise that landed after this vCPU's last
                     // per-op poll ran its sweep against a map we were not yet in; complete the
@@ -6511,7 +6492,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // [`Scheduler::wake_stopped`].
                 let dom = domain_key_of(&v);
                 let (still_stopped, term) = {
-                    let hg = v.host.lock().unwrap_or_else(|e| e.into_inner());
+                    let hg = v.host.lock_unpoisoned();
                     (
                         hg.stop_flag.load(Ordering::SeqCst),
                         // #796 — the same race against a terminate: a kill whose `wake_stopped`
@@ -6544,10 +6525,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     return;
                 };
                 let ready = {
-                    let hg = v.host.lock().unwrap_or_else(|e| e.into_inner());
+                    let hg = v.host.lock_unpoisoned();
                     match hg.pipes.get(pipe as usize) {
                         Some((fifo, writers, _)) => {
-                            !fifo.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+                            !fifo.lock_unpoisoned().is_empty()
                                 || writers.load(std::sync::atomic::Ordering::SeqCst) == 0
                         }
                         None => true, // vanished — re-run to fail closed
@@ -6576,10 +6557,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     return;
                 };
                 let ready = {
-                    let hg = v.host.lock().unwrap_or_else(|e| e.into_inner());
+                    let hg = v.host.lock_unpoisoned();
                     match hg.pipes.get(pipe as usize) {
                         Some((fifo, _, readers)) => {
-                            fifo.lock().unwrap_or_else(|e| e.into_inner()).len() < PIPE_CAP
+                            fifo.lock_unpoisoned().len() < PIPE_CAP
                                 || readers.load(std::sync::atomic::Ordering::SeqCst) == 0
                         }
                         None => true, // vanished — re-run to fail closed
@@ -6602,11 +6583,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // that landed before the insert is delivered right here instead of stranding the
                 // caller. (The host guard below is released before the scheduler lock is taken —
                 // lock order sched → host is never crossed.)
-                let comps = v
-                    .host
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .completions();
+                let comps = v.host.lock_unpoisoned().completions();
                 {
                     let mut s = sched.lock();
                     // §12 domain-lifetime park gate (owner 2026-07-24): never park into a
@@ -6640,7 +6617,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     return;
                 };
                 let (ticket, pager_id) = {
-                    let mut cg = pb.cell.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut cg = pb.cell.lock_unpoisoned();
                     (
                         cg.svc_enqueue(pb.export, 0, vec![addr as i64]),
                         cg.domain_id(),
@@ -6657,12 +6634,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 if sched.handoff {
                     if let Some(provider) = sched.take_parked_serve_loop(pager_id as usize) {
                         dispatch(sched, provider);
-                        let served = pb
-                            .cell
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .svc_results
-                            .remove(&t);
+                        let served = pb.cell.lock_unpoisoned().svc_results.remove(&t);
                         if let Some(r) = served {
                             if r < 0 {
                                 // Pager refused: an unserviceable fault — detect-and-kill semantics
@@ -6696,12 +6668,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     sched.work.notify_all();
                     return;
                 };
-                let empty = v
-                    .host
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .svc_queue
-                    .is_empty();
+                let empty = v.host.lock_unpoisoned().svc_queue.is_empty();
                 // Lost-wakeup guard (the macOS/Windows serve-chain flake, ISSUES.md I52): a reply may
                 // have woken one of THIS vCPU's parked handler fibers between the serve loop deciding
                 // to park (its `handler_parks` claim saw the handler still blocked) and this point.
@@ -6793,7 +6760,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 let freed = v
                     .admit_retry
                     .as_ref()
-                    .is_some_and(|st| !st.lock().unwrap_or_else(|e| e.into_inner()).busy);
+                    .is_some_and(|st| !st.lock_unpoisoned().busy);
                 if freed {
                     s.runnable.push_back(v);
                     sched.work.notify_one();
@@ -6949,11 +6916,7 @@ impl SchedRef {
         match self {
             SchedRef::Real(s) => s.cap_reply_or_stash(ticket, result, callee),
             SchedRef::Det(_) => {
-                callee
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .svc_results
-                    .insert(ticket, result);
+                callee.lock_unpoisoned().svc_results.insert(ticket, result);
             }
         }
     }
@@ -7234,7 +7197,7 @@ impl DetSched {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, DetState> {
-        self.st.lock().unwrap_or_else(|e| e.into_inner())
+        self.st.lock_unpoisoned()
     }
 
     fn spawn(&self, make: impl FnOnce(TaskId) -> Box<VCpu>) -> Option<TaskId> {
@@ -8154,7 +8117,7 @@ impl FiberRegistry {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, RegState> {
-        self.mx.lock().unwrap_or_else(|e| e.into_inner())
+        self.mx.lock_unpoisoned()
     }
 
     /// The saved shadow-SP of the fiber in `slot` (its region base if it has never been frozen).
@@ -9468,24 +9431,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // #796 L2 — pull the async-signal poll pair once per quantum (a single `Host` lock here, never per
     // op). `None` when no personality installed a `SignalSource`, so the per-op check below compiles to a
     // predicted `is_some()` branch and the hot path is untouched for every non-signal guest.
-    let signal_poll = host.lock().unwrap_or_else(|e| e.into_inner()).signal_poll();
+    let signal_poll = host.lock_unpoisoned().signal_poll();
     // #863 slice 3 — this vCPU's own domain, for the scoped park interrupt a deliverable signal
     // fires (INVARIANTS.md #12: a signal to this process never sweeps another domain's parks).
-    let sig_domain = host.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
+    let sig_domain = host.lock_unpoisoned().domain_id() as usize;
     // #798 slice 2 — the domain's job-control stop flag (shared by every vCPU of the domain): one
     // relaxed load per op, park [`Blocked::Stopped`] while set. Cloned once — the personality's
     // stop closure holds the same `Arc`.
-    let stop_flag = host
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .stop_flag
-        .clone();
+    let stop_flag = host.lock_unpoisoned().stop_flag.clone();
     // #796 default actions — the domain's terminate flag, same one-relaxed-load-per-op shape.
-    let term_flag = host
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .term_flag
-        .clone();
+    let term_flag = host.lock_unpoisoned().term_flag.clone();
 
     // Reusable scratch for branch edge-args (block parameters). Each taken edge gathers its
     // args here and swaps the buffer into the frame's value slot, so steady-state branching —
@@ -9504,7 +9459,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // its rewound offer op re-attempts admission below. (The offer op was left rewound at park, so
     // it re-executes naturally in the loop — winning the now-free instance or re-parking.)
     if let Some(state) = admit_retry.take() {
-        state.lock().unwrap_or_else(|e| e.into_inner()).admit_parked -= 1;
+        state.lock_unpoisoned().admit_parked -= 1;
     }
 
     // CALLS.md 4b — resume a **promoted** offer animation. This vCPU parked as the resumer of a
@@ -9521,7 +9476,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // instance over new callers, so it is free here — the generation re-check the 3a
                 // phase-3 relock deferred). `busy` set again for the resumed segment.
                 let (pm, ph) = {
-                    let mut st = parked.state.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut st = parked.state.lock_unpoisoned();
                     if parked.threaded {
                         // CALLS.md increment 7 — a threaded animation never checked the world
                         // out: re-fork the window view and re-clone the cell; `busy` untouched.
@@ -9716,7 +9671,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         // silently dropping its dispatch. Every other tier keeps the
                                         // 3a semantics — a held lock reads as busy: `-EAGAIN`.
                                         if entry_.policy == OfferPolicy::Threaded {
-                                            state_.lock().unwrap_or_else(|e| e.into_inner())
+                                            state_.lock_unpoisoned()
                                         } else {
                                             frames[top].vals.push(Reg::from_i64(EAGAIN));
                                             continue;
@@ -9889,8 +9844,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                     if !threaded_ {
                                                         {
                                                             let mut st_ = state_
-                                                                .lock()
-                                                                .unwrap_or_else(|e| e.into_inner());
+                                                                .lock_unpoisoned();
                                                             st_.mem = pm_;
                                                             // 6d.4.1 — no host restore: the checkout
                                                             // cloned the cell (kept its ref); the
@@ -9920,8 +9874,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                 if !threaded_ {
                                                     {
                                                         let mut st_ = state_
-                                                            .lock()
-                                                            .unwrap_or_else(|e| e.into_inner());
+                                                            .lock_unpoisoned();
                                                         st_.mem = pm_;
                                                         // 6d.4.1 — no host restore (see above); the
                                                         // cloned cell ref drops with `ph_`.
@@ -10196,7 +10149,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // so no `shadow_switch` — the 4a switch shape, reversed.
                     if let Some(anim) = offer_anim.pop_if(|a| a.handler_slot == leaving) {
                         let resume_key =
-                            host.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
+                            host.lock_unpoisoned().domain_id() as usize;
                         // CALLS.md 5b caller-pays: `*fuel` is the caller's own counter, drained by
                         // the handler up to this park. Leave it (do NOT restore `anim.saved_fuel`) so
                         // the caller carries the paid-down fuel across the park; `remaining_budget`
@@ -10230,7 +10183,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             }
                             drop(prov_host_arc); // the checkout clone; the instance keeps its ref
                             {
-                                let mut st = anim.state.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut st = anim.state.lock_unpoisoned();
                                 st.mem = prov_mem;
                                 // 6d.4.1 — no host restore: mutations landed through the shared
                                 // cell.
@@ -10294,8 +10247,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if cont_block.contains(&leaving) && !durable {
                         if let SchedRef::Real(_) = sched {
                             let key = host
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
+                                .lock_unpoisoned()
                                 .domain_id() as usize;
                             frames[rtop].inst -= 1; // rewind: the wake re-executes the resume
                             return Ok(Inner::Park(Blocked::ContResumeBlock {
@@ -10314,7 +10266,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let ch =
                         get(&frames[top].vals, *$args.first().ok_or(Trap::Malformed)?)?.i64() as i32;
                     let (domain, cu, unit_funcs) = {
-                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        let hg = host.lock_unpoisoned();
                         let domain = hg.resolve_jit_domain($h)?;
                         let (cd, cu) = hg.resolve_jit_code(ch)?;
                         if cd != domain {
@@ -10330,8 +10282,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Some(slot) => {
                             // Record the occupancy on the domain so it survives the run (the table is
                             // a per-run transient) and rides a snapshot (DURABILITY.md §12.5).
-                            host.lock()
-                                .unwrap_or_else(|e| e.into_inner())
+                            host.lock_unpoisoned()
                                 .jit_record_install(domain, slot, cu);
                             slot as i64
                         }
@@ -10343,7 +10294,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             macro_rules! jit_uninstall_body {
                 ($h:expr, $args:expr) => {{
                     let domain = {
-                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        let hg = host.lock_unpoisoned();
                         hg.resolve_jit_domain($h)? // authority: a forged handle is inert
                     };
                     let slot = get(&frames[top].vals, *$args.first().ok_or(Trap::Malformed)?)?.i64()
@@ -10352,8 +10303,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // function count) — `dt.uninstall` enforces the range + filled checks.
                     let res = if dt.uninstall(slot, funcs.len()) {
                         // Drop the occupancy record so a snapshot doesn't re-apply a cleared slot.
-                        host.lock()
-                            .unwrap_or_else(|e| e.into_inner())
+                        host.lock_unpoisoned()
                             .jit_forget_install(domain, slot as u32);
                         0
                     } else {
@@ -10370,7 +10320,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let ch =
                         get(&frames[top].vals, *$args.first().ok_or(Trap::Malformed)?)?.i64() as i32;
                     let unit_funcs = {
-                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        let hg = host.lock_unpoisoned();
                         let domain = hg.resolve_jit_domain($h)?;
                         let (cd, cu) = hg.resolve_jit_code(ch)?;
                         // A code handle is only valid on the domain that compiled it.
@@ -10494,7 +10444,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 } => {
                     let h = get_i32(&frames[top].vals, *handle)?;
                     let (ibase, isize) = {
-                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        let hg = host.lock_unpoisoned();
                         hg.resolve_instantiator(h)?
                     };
                     // §14 **separate-module children** (ops 5/6/7 = `instantiate_module` /
@@ -10530,7 +10480,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 get_i64(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?
                                     as i32;
                             let g = {
-                                let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                let hg = host.lock_unpoisoned();
                                 let g = hg.resolve_module(mh)?;
                                 ChildMod {
                                     funcs: g.funcs.clone(),
@@ -10603,7 +10553,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 if quota != 0 {
                                     return Err(Trap::CapFault);
                                 }
-                                let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                let hg = host.lock_unpoisoned();
                                 if hg.peek_budget(budget_h).is_none() {
                                     return Err(Trap::CapFault);
                                 }
@@ -10623,13 +10573,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let name =
                                     String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
                                 {
-                                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                    let hg = host.lock_unpoisoned();
                                     hg.can_regrant(handle).then_some(()).ok_or(Trap::CapFault)?;
                                 }
                                 list.push((name, handle));
                             }
                             if pager != u32::MAX {
-                                let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                let hg = host.lock_unpoisoned();
                                 // A missing/empty pager export fails the spawn closed (§3.3).
                                 let ok = hg
                                     .self_module
@@ -10642,7 +10592,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 pager_ref = Some((Arc::clone(host), pager));
                             }
                             let g = if modh >= 0 {
-                                let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                let hg = host.lock_unpoisoned();
                                 let g = hg.resolve_module(modh)?;
                                 Some(ChildMod {
                                     funcs: g.funcs.clone(),
@@ -10674,7 +10624,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 get_i64(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?
                                     as i32;
                             let g = {
-                                let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                let hg = host.lock_unpoisoned();
                                 let g = hg.resolve_module(mh)?;
                                 ChildMod {
                                     funcs: g.funcs.clone(),
@@ -10706,7 +10656,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let name =
                                     String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
                                 {
-                                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                    let hg = host.lock_unpoisoned();
                                     hg.can_regrant(handle).then_some(()).ok_or(Trap::CapFault)?;
                                 }
                                 list.push((name, handle));
@@ -10765,7 +10715,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // quota (`-1` = unbounded). Peek, not take — a refused spawn
                                 // leaves the budget intact.
                                 && rec_budget_h.is_none_or(|bh| {
-                                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                    let hg = host.lock_unpoisoned();
                                     hg.peek_budget(bh)
                                         .is_some_and(|b| b.mem < 0 || child_size <= b.mem as u64)
                                 });
@@ -10826,7 +10776,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // §6: stamp the child's attestation — nested (its carve is a superset
                                 // the parent reads), freezable iff durable, tier inherited from us.
                                 let catt = {
-                                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                    let hg = host.lock_unpoisoned();
                                     hg.child_attestation(durable)
                                 };
                                 ch.set_attestation(catt);
@@ -10838,7 +10788,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let mut named_child: Vec<i32> = Vec::new();
                                 for (name, gh) in &named {
                                     let cg = {
-                                        let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                        let mut hg = host.lock_unpoisoned();
                                         hg.regrant_into_child(*gh, &mut ch)
                                     };
                                     if let Some(cg) = cg {
@@ -10917,11 +10867,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // parent's registered module).
                                     ch.self_module = match &child_mod {
                                         Some(cm) => Some(Arc::clone(&cm.module)),
-                                        None => host
-                                            .lock()
-                                            .unwrap_or_else(|e| e.into_inner())
-                                            .self_module
-                                            .clone(),
+                                        None => host.lock_unpoisoned().self_module.clone(),
                                     };
                                     let child_host = Arc::new(Mutex::new(ch));
                                     // §3.6 slice 3: keep a live reference past the move into
@@ -10939,7 +10885,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // after), and its spawn field tightens the child's vCPU
                                     // ceiling below.
                                     let rec_b = rec_budget_h.take().and_then(|bh| {
-                                        let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                        let mut hg = host.lock_unpoisoned();
                                         hg.take_budget(bh)
                                     });
                                     let child_fuel = match rec_b.as_ref() {
@@ -11164,11 +11110,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     as u32;
                             let cap = resolve_thread(threads, ch).ok().and_then(|slot| {
                                 let callee = child_hosts.get(&slot).cloned()?;
-                                let sigs = callee
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .offer_shape(export)?;
-                                let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                let sigs = callee.lock_unpoisoned().offer_shape(export)?;
+                                let mut hg = host.lock_unpoisoned();
                                 // §13.4 4d: record the child's join `slot` — the live impl's
                                 // durable structural name, re-linked to the re-created child on thaw.
                                 Some(hg.wire_live_impl_child(&callee, export, &sigs, slot))
@@ -11210,7 +11153,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // The module grant (a forged module handle is a CapFault, as ops
                             // 5/13); the child runs it as its own program + self module.
                             let cm = {
-                                let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                let hg = host.lock_unpoisoned();
                                 let g = hg.resolve_module(mh)?;
                                 ChildMod {
                                     funcs: g.funcs.clone(),
@@ -11237,7 +11180,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let name =
                                     String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
                                 {
-                                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                    let hg = host.lock_unpoisoned();
                                     hg.can_regrant(gh).then_some(()).ok_or(Trap::CapFault)?;
                                 }
                                 glist.push((name, gh));
@@ -11261,8 +11204,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 && child_size != 0
                                 && mod_ok
                                 && host
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
+                                    .lock_unpoisoned()
                                     .window_minter_take(minter, child_size);
                             if !admitted {
                                 frames[top].vals.push(Reg::from_i32(EINVAL as i32));
@@ -11274,14 +11216,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 fm.init_data(&cm.data);
                                 let mut ch = Host::new();
                                 ch.set_attestation({
-                                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                    let hg = host.lock_unpoisoned();
                                     hg.detached_child_attestation()
                                 });
                                 let cinst = ch.grant_instantiator(0, child_size);
                                 let cas = ch.grant_address_space(0, child_size);
                                 for (name, gh) in &glist {
                                     let cg = {
-                                        let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                        let mut hg = host.lock_unpoisoned();
                                         hg.regrant_into_child(*gh, &mut ch)
                                     };
                                     if let Some(cg) = cg {
@@ -11350,7 +11292,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // §3b: budget-funded spawn — same consumption as the
                                     // same-module branch above.
                                     let rec_b = rec_budget_h.take().and_then(|bh| {
-                                        let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                        let mut hg = host.lock_unpoisoned();
                                         hg.take_budget(bh)
                                     });
                                     let child_fuel = match rec_b.as_ref() {
@@ -11621,14 +11563,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // the first servable one switches.
                     loop {
                         let d = {
-                            let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut hg = host.lock_unpoisoned();
                             hg.svc_queue.pop_front()
                         };
                         let Some(d) = d else { break };
                         // The queue only holds servable dispatches (checked at enqueue), so a
                         // missing handler here is host-state corruption: fail closed.
                         let fidx = {
-                            let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                            let hg = host.lock_unpoisoned();
                             hg.svc_handler_func(d.export, d.op).ok_or(Trap::CapFault)?
                         };
                         let params = &funcs.get(fidx as usize).ok_or(Trap::CapFault)?.params;
@@ -11678,8 +11620,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         && !std::mem::take(&mut svc_timed_out)
                     {
                         frames[top].inst -= 1;
-                        let key =
-                            host.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
+                        let key = host.lock_unpoisoned().domain_id() as usize;
                         // I38 timed form: the op's single optional arg is a timeout in ns
                         // (`< 0` / absent = wait forever). Re-read on every (re-)park, so a
                         // spurious wake restarts the clock — "at least this long" semantics.
@@ -11735,8 +11676,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Some(sr) if *cur != sr.serve_cur => {
                             let ticket = sr.ticket;
                             sr.replied = true;
-                            let callee_id =
-                                host.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
+                            let callee_id = host.lock_unpoisoned().domain_id() as usize;
                             // Fork the parked caller into a twin (Real scheduler only); on any failure
                             // fall back to a single reply so the original never hangs — no twin.
                             let twin = if let SchedRef::Real(sr_sched) = sched {
@@ -11789,9 +11729,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Some(sr) if *cur != sr.serve_cur => {
                             if let SchedRef::Real(sr_sched) = sched {
                                 let ticket = sr.ticket;
-                                let callee_id =
-                                    host.lock().unwrap_or_else(|e| e.into_inner()).domain_id()
-                                        as usize;
+                                let callee_id = host.lock_unpoisoned().domain_id() as usize;
                                 // POSIX `waitpid` pid selector: `-1` = any child (`target None`);
                                 // `< -1` = any child in process group `|pid|` (`target Some(pgid)`);
                                 // `> 0` = a specific twin. `pid == 0` (the caller's own group) is
@@ -11862,8 +11800,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         None => 0,
                     };
                     let r = if let SchedRef::Real(sr_sched) = sched {
-                        let parent =
-                            host.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
+                        let parent = host.lock_unpoisoned().domain_id() as usize;
                         sr_sched.set_child_pgid(parent, pid as TaskId, pgid as TaskId)
                     } else {
                         EINVAL
@@ -11890,9 +11827,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         None => 0,
                     };
                     let minted = if matches!(sched, SchedRef::Real(_)) {
-                        host.lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .try_grant_pipe()
+                        host.lock_unpoisoned().try_grant_pipe()
                     } else {
                         None
                     };
@@ -11958,7 +11893,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let size_log2 = argn(4)?;
                     // Resolve the command module (forged handle → fail closed) into an owned `ChildMod`.
                     let cmod = {
-                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        let hg = host.lock_unpoisoned();
                         hg.resolve_module(mh).ok().map(|g| ChildMod {
                             funcs: g.funcs.clone(),
                             memory_log2: g.memory_log2,
@@ -11985,10 +11920,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
                             let name_bytes = m.read_window(name_off, name_len).ok()?;
                             let name = String::from_utf8(name_bytes).ok()?;
-                            host.lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .can_regrant(handle)
-                                .then_some(())?;
+                            host.lock_unpoisoned().can_regrant(handle).then_some(())?;
                             list.push((name, handle));
                         }
                         Some(list)
@@ -12034,7 +11966,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         let child_size = 1u64 << win_log2.expect("admissible");
                         let cm = cmod.as_ref().expect("admissible");
                         let grants = grants.as_ref().expect("admissible");
-                        let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut hg = host.lock_unpoisoned();
                         hg.spawn_named_child(grants, child_size)
                             .and_then(|(mut ch, ci, ca)| {
                                 ch.self_module = Some(Arc::clone(&cm.module));
@@ -12060,7 +11992,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // writers). The new image's grants already bumped their own ends
                             // (`install_pipe_end`), so the shared counts never dip through this.
                             let (zeroed_w, zeroed_r) = {
-                                let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                let hg = host.lock_unpoisoned();
                                 (hg.drop_all_pipe_writers(), hg.drop_all_pipe_readers())
                             };
                             for pipe in zeroed_w {
@@ -12106,12 +12038,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // handler's reply (`Blocked::CapReply`). A full callee queue is probeable
                     // backpressure (`-EAGAIN` as the call's result), never a trap.
                     let live = {
-                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        let hg = host.lock_unpoisoned();
                         hg.live_impl_of(h, *type_id)
                     };
                     if let Some((callee, export)) = live {
                         let (ticket, callee_id) = {
-                            let mut cg = callee.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut cg = callee.lock_unpoisoned();
                             (cg.svc_enqueue(export, *op, argv), cg.domain_id())
                         };
                         match ticket {
@@ -12132,11 +12064,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             sr.take_parked_serve_loop(callee_id as usize)
                                         {
                                             dispatch(sr, provider);
-                                            let served = callee
-                                                .lock()
-                                                .unwrap_or_else(|e| e.into_inner())
-                                                .svc_results
-                                                .remove(&t);
+                                            let served =
+                                                callee.lock_unpoisoned().svc_results.remove(&t);
                                             if let Some(rv) = served {
                                                 if !sig.results.is_empty() {
                                                     frames[top].vals.push(Reg::from_i64(rv));
@@ -12151,11 +12080,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     if let SchedRef::Real(sr) = sched {
                                         let regc = Arc::clone(registry);
                                         let calleec = Arc::clone(&callee);
-                                        let svck = host
-                                            .lock()
-                                            .unwrap_or_else(|e| e.into_inner())
-                                            .domain_id()
-                                            as usize;
+                                        let svck = host.lock_unpoisoned().domain_id() as usize;
                                         fiber_park!(|slot: usize| {
                                             let mut sg = sr.lock();
                                             // D37 death-is-revocation (§12 teardown, owner
@@ -12176,8 +12101,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                 );
                                                 drop(sg);
                                                 let early = calleec
-                                                    .lock()
-                                                    .unwrap_or_else(|e| e.into_inner())
+                                                    .lock_unpoisoned()
                                                     .svc_results
                                                     .remove(&t);
                                                 if let Some(r) = early {
@@ -12206,7 +12130,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let inst_offer = if durable {
                         None // 6a: a durable caller takes the host-side dispatch below
                     } else {
-                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        let hg = host.lock_unpoisoned();
                         hg.instanced_offer_of(h, *type_id)
                     };
                     if let Some(entry) = inst_offer {
@@ -12223,7 +12147,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     // Lock the shared powerbox for the duration of this one cap.call (brief; no nested
                     // host locking). Threads of a domain serialize their capability calls here.
-                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut hg = host.lock_unpoisoned();
                     let mut pending_id = None;
                     let results = hg.cap_dispatch_slots_pending(
                         *type_id,
@@ -12318,9 +12242,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             if let SchedRef::Real(sr) = sched {
                                 let regc = Arc::clone(registry);
                                 let hostc = Arc::clone(host);
-                                let svck =
-                                    hostc.lock().unwrap_or_else(|e| e.into_inner()).domain_id()
-                                        as usize;
+                                let svck = hostc.lock_unpoisoned().domain_id() as usize;
                                 fiber_park!(|slot: usize| {
                                     let mut sg = sr.lock();
                                     sg.cap_waiters.entry(h).or_default().push(Waiter::Fiber {
@@ -12329,10 +12251,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         svc: svck,
                                     });
                                     drop(sg);
-                                    let live = hostc
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .handle_live(h);
+                                    let live = hostc.lock_unpoisoned().handle_live(h);
                                     if !live {
                                         regc.wake_blocked(slot, Reg::from_i64(CAP_REVOKED));
                                     }
@@ -12460,13 +12379,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 | Inst::CallSym {
                     import, sig, args, ..
                 } if matches!(
-                    host.lock().unwrap_or_else(|e| e.into_inner()).import_binding(*import),
+                    host.lock_unpoisoned().import_binding(*import),
                     Some(b) if b.type_id == cap_id::JIT && matches!(b.op, 1 | 3 | 4)
                 ) =>
                 {
                     let b = host
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
+                        .lock_unpoisoned()
                         .import_binding(*import)
                         .ok_or(Trap::CapFault)?;
                     let h = b.handle;
@@ -12491,12 +12409,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // offer routes like the direct form: enqueue on the callee, park this
                     // fiber until the reply. Same backpressure and race story as slice 3.
                     let live = {
-                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        let hg = host.lock_unpoisoned();
                         hg.import_live_target(*import)
                     };
                     if let Some((callee, export, base_op)) = live {
                         let (ticket, callee_id) = {
-                            let mut cg = callee.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut cg = callee.lock_unpoisoned();
                             (cg.svc_enqueue(export, base_op + *op, argv), cg.domain_id())
                         };
                         match ticket {
@@ -12517,11 +12435,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             sr.take_parked_serve_loop(callee_id as usize)
                                         {
                                             dispatch(sr, provider);
-                                            let served = callee
-                                                .lock()
-                                                .unwrap_or_else(|e| e.into_inner())
-                                                .svc_results
-                                                .remove(&t);
+                                            let served =
+                                                callee.lock_unpoisoned().svc_results.remove(&t);
                                             if let Some(rv) = served {
                                                 if !sig.results.is_empty() {
                                                     frames[top].vals.push(Reg::from_i64(rv));
@@ -12536,11 +12451,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     if let SchedRef::Real(sr) = sched {
                                         let regc = Arc::clone(registry);
                                         let calleec = Arc::clone(&callee);
-                                        let svck = host
-                                            .lock()
-                                            .unwrap_or_else(|e| e.into_inner())
-                                            .domain_id()
-                                            as usize;
+                                        let svck = host.lock_unpoisoned().domain_id() as usize;
                                         fiber_park!(|slot: usize| {
                                             let mut sg = sr.lock();
                                             // D37 death-is-revocation (§12 teardown, owner
@@ -12561,8 +12472,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                 );
                                                 drop(sg);
                                                 let early = calleec
-                                                    .lock()
-                                                    .unwrap_or_else(|e| e.into_inner())
+                                                    .lock_unpoisoned()
                                                     .svc_results
                                                     .remove(&t);
                                                 if let Some(r) = early {
@@ -12588,7 +12498,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let inst_offer = if durable {
                         None // 6a: a durable caller takes the host-side dispatch below
                     } else {
-                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        let hg = host.lock_unpoisoned();
                         hg.instanced_offer_for_import(*import | (*op << 16))
                     };
                     if let Some((entry, eff_op)) = inst_offer {
@@ -12601,7 +12511,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         return Err(Trap::CapFault);
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
-                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut hg = host.lock_unpoisoned();
                     // §3.5: the reserved import dispatch packs `(slot | consumer_op << 16)`.
                     let packed = *import | (*op << 16);
                     let results =
@@ -12630,12 +12540,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // "a flat call.import (op 0)", so the op is the bound base op alone. This is the
                     // path a compiled-C `fork()` (chibicc emits `call.sym "__fork"`) rides.
                     let live = {
-                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        let hg = host.lock_unpoisoned();
                         hg.import_live_target(*import)
                     };
                     if let Some((callee, export, base_op)) = live {
                         let (ticket, callee_id) = {
-                            let mut cg = callee.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut cg = callee.lock_unpoisoned();
                             (cg.svc_enqueue(export, base_op, argv), cg.domain_id())
                         };
                         match ticket {
@@ -12656,11 +12566,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             sr.take_parked_serve_loop(callee_id as usize)
                                         {
                                             dispatch(sr, provider);
-                                            let served = callee
-                                                .lock()
-                                                .unwrap_or_else(|e| e.into_inner())
-                                                .svc_results
-                                                .remove(&t);
+                                            let served =
+                                                callee.lock_unpoisoned().svc_results.remove(&t);
                                             if let Some(rv) = served {
                                                 if !sig.results.is_empty() {
                                                     frames[top].vals.push(Reg::from_i64(rv));
@@ -12675,11 +12582,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     if let SchedRef::Real(sr) = sched {
                                         let regc = Arc::clone(registry);
                                         let calleec = Arc::clone(&callee);
-                                        let svck = host
-                                            .lock()
-                                            .unwrap_or_else(|e| e.into_inner())
-                                            .domain_id()
-                                            as usize;
+                                        let svck = host.lock_unpoisoned().domain_id() as usize;
                                         fiber_park!(|slot: usize| {
                                             let mut sg = sr.lock();
                                             if sg.dead.contains_key(&(callee_id as usize)) {
@@ -12696,8 +12599,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                 );
                                                 drop(sg);
                                                 let early = calleec
-                                                    .lock()
-                                                    .unwrap_or_else(|e| e.into_inner())
+                                                    .lock_unpoisoned()
                                                     .svc_results
                                                     .remove(&t);
                                                 if let Some(r) = early {
@@ -12723,7 +12625,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let inst_offer = if durable {
                         None // 6a: a durable caller takes the host-side dispatch below
                     } else {
-                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        let hg = host.lock_unpoisoned();
                         hg.instanced_offer_for_import(*import)
                     };
                     if let Some((entry, eff_op)) = inst_offer {
@@ -12736,7 +12638,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         return Err(Trap::CapFault);
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
-                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut hg = host.lock_unpoisoned();
                     let results =
                         hg.cap_dispatch_slots(svm_ir::CAP_IMPORT_TYPE_ID, *import, 0, &argv, gm)?;
                     // FORK.md §8.6 — pipe blocking rides this dispatch (a command's `write`/`read` are
@@ -12843,7 +12745,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let inst_offer = if durable {
                         None // 6a: a durable caller takes the host-side dispatch below
                     } else {
-                        let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut hg = host.lock_unpoisoned();
                         hg.instanced_offer_for_dyn(*ty, *op, h)
                     };
                     if let Some((entry, eff_op)) = inst_offer {
@@ -12856,7 +12758,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         return Err(Trap::CapFault);
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
-                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut hg = host.lock_unpoisoned();
                     let packed = *ty | (*op << 16);
                     let results =
                         hg.cap_dispatch_slots(svm_ir::CAP_DYN_TYPE_ID, packed, h, &argv, gm)?;
@@ -12871,7 +12773,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // §3.5 self-namespace extensions: reify own offer / intern own shape / probe
                 // coverage — all through the shared dispatch entry (op packs `selfop | idx << 8`).
                 Inst::ExportHandle { export } => {
-                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut hg = host.lock_unpoisoned();
                     let results = hg.cap_dispatch_slots(
                         svm_ir::CAP_SELF_TYPE_ID,
                         8 | (*export << 8),
@@ -12883,7 +12785,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     frames[top].vals.push(Reg::from_i32(r as i32));
                 }
                 Inst::CapSelfTypeId { ty } => {
-                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut hg = host.lock_unpoisoned();
                     let results = hg.cap_dispatch_slots(
                         svm_ir::CAP_SELF_TYPE_ID,
                         6 | (*ty << 8),
@@ -12896,7 +12798,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 }
                 Inst::CapSelfCovers { handle, ty } => {
                     let h = get_i32(&frames[top].vals, *handle)?;
-                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut hg = host.lock_unpoisoned();
                     let results = hg.cap_dispatch_slots(
                         svm_ir::CAP_SELF_TYPE_ID,
                         7 | (*ty << 8),
@@ -12912,7 +12814,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // backends agree over one implementation. Result is the `i32` status.
                 Inst::ImportAttach { import, handle } => {
                     let h = get_i32(&frames[top].vals, *handle)?;
-                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut hg = host.lock_unpoisoned();
                     // §3.6 slice 4 — rebind revokes the outgoing *connection*: fibers parked in
                     // a call through the slot's old binding handle wake with the revocation
                     // errno (the pinned racing-fibers trigger: "closing/REBINDING the client
@@ -12944,14 +12846,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // §7 reflection (`cap.self.count`): how many capabilities this domain holds. Routed
                 // through `self_dispatch` (op 0) — the same path the JIT's thunk takes, so they agree.
                 Inst::CapSelfCount => {
-                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let hg = host.lock_unpoisoned();
                     let r = hg.self_dispatch(0, &[])?;
                     frames[top].vals.push(Reg::from_i32(r[0] as i32));
                 }
                 // §6 attestation (`cap.self.attest`): the domain's platform-vouched provenance, packed
                 // into an `i32` (op 4). Same `self_dispatch` path the JIT thunk takes, so they agree.
                 Inst::CapSelfAttest => {
-                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let hg = host.lock_unpoisoned();
                     let r = hg.self_dispatch(4, &[])?;
                     frames[top].vals.push(Reg::from_i32(r[0] as i32));
                 }
@@ -12959,7 +12861,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // (op 1). An out-of-range index is fail-closed (the guest bounds it by the count).
                 Inst::CapSelfGet { idx } => {
                     let i = get_i32(&frames[top].vals, *idx)? as i64;
-                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let hg = host.lock_unpoisoned();
                     let r = hg.self_dispatch(1, &[i])?;
                     drop(hg);
                     frames[top].vals.push(Reg::from_i32(r[0] as i32));
@@ -12972,7 +12874,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let ptr = get_i64(&frames[top].vals, *name_ptr)?;
                     let len = get_i64(&frames[top].vals, *name_len)?;
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
-                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut hg = host.lock_unpoisoned();
                     let r =
                         hg.cap_dispatch_slots(svm_ir::CAP_SELF_TYPE_ID, 2, 0, &[ptr, len], gm)?;
                     drop(hg);
@@ -12989,7 +12891,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let ptr = get_i64(&frames[top].vals, *buf_ptr)?;
                     let cap = get_i64(&frames[top].vals, *buf_cap)?;
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
-                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut hg = host.lock_unpoisoned();
                     let r =
                         hg.cap_dispatch_slots(svm_ir::CAP_SELF_TYPE_ID, 3, 0, &[h, ptr, cap], gm)?;
                     drop(hg);
@@ -13137,9 +13039,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // no new machinery (ISSUES.md I48).
                             if blocking && !durable {
                                 if let SchedRef::Real(_) = sched {
-                                    let key =
-                                        host.lock().unwrap_or_else(|e| e.into_inner()).domain_id()
-                                            as usize;
+                                    let key = host.lock_unpoisoned().domain_id() as usize;
                                     frames[top].inst -= 1; // rewind: the wake re-executes this op
                                     return Ok(Inner::Park(Blocked::ContResumeBlock {
                                         key,
@@ -13448,8 +13348,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if *cur != ROOT_FIBER {
                         if let SchedRef::Real(sr) = sched {
                             let regc = Arc::clone(registry);
-                            let svck =
-                                host.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
+                            let svck = host.lock_unpoisoned().domain_id() as usize;
                             fiber_park!(|slot: usize| {
                                 let mut sg = sr.lock();
                                 let wid = sg.next_wid;
@@ -13874,7 +13773,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // are the declared regime, and there is no world to hand back (the fork
                         // drops) and no `busy` to reopen.
                         if !anim.threaded && Arc::strong_count(&prov_host_arc) != 2 {
-                            let mut st = anim.state.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut st = anim.state.lock_unpoisoned();
                             st.busy = false;
                             return Err(Trap::FiberFault);
                         }
@@ -13890,7 +13789,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // provider→caller — under the `state → hg` order (3a §phase 3). CALLS.md 5b:
                         // no reserve drain (caller-pays — the caller's `*fuel` already paid).
                         {
-                            let mut st = anim.state.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut st = anim.state.lock_unpoisoned();
                             if anim.threaded {
                                 // Increment 7 — the fork just drops; the instance kept its window.
                                 drop(prov_mem);
@@ -15424,7 +15323,7 @@ struct VecBacking(Mutex<Vec<u8>>);
 impl VecBacking {
     /// Lock, recovering from poisoning rather than panicking (the interpreter never panics, §robust).
     fn buf(&self) -> std::sync::MutexGuard<'_, Vec<u8>> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+        self.0.lock_unpoisoned()
     }
 }
 
@@ -16084,7 +15983,7 @@ pub struct CapFiberCell {
 impl CapFiberCell {
     /// Claim the delivered scalar, if the drain has filled the cell.
     pub fn take(&self) -> Option<i64> {
-        self.result.lock().unwrap_or_else(|e| e.into_inner()).take()
+        self.result.lock_unpoisoned().take()
     }
 }
 
@@ -16105,7 +16004,7 @@ impl Completions {
     /// the ordered drain under the same lock (register-then-recheck: a completion that raced
     /// the park is claimed here, in submission order, never stranded).
     pub fn fiber_register(&self, id: u64) -> Arc<CapFiberCell> {
-        let mut g = self.mx.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.mx.lock_unpoisoned();
         let cell = Arc::new(CapFiberCell {
             result: Mutex::new(None),
         });
@@ -16118,7 +16017,7 @@ impl Completions {
     /// result stays unclaimed in `ready` for the teardown sweep, exactly like an abandoned
     /// vCPU waiter's.
     pub fn fiber_deregister(&self, id: u64) {
-        let mut g = self.mx.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.mx.lock_unpoisoned();
         g.fiber_cells.remove(&id);
     }
 
@@ -16131,13 +16030,13 @@ impl Completions {
                 break;
             };
             let (_, cell) = g.fiber_cells.pop_first().expect("first_key_value above");
-            *cell.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+            *cell.result.lock_unpoisoned() = Some(r);
         }
     }
 
     /// Mint the next completion id (also counts it in-flight). Called only on the punt path.
     fn mint(&self) -> u64 {
-        let mut g = self.mx.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.mx.lock_unpoisoned();
         let id = g.next_id;
         g.next_id += 1;
         g.in_flight += 1;
@@ -16148,7 +16047,7 @@ impl Completions {
     /// F3 fiber cells, via the ordered drain (their resumers observe the wake at the next
     /// `cont.resume` poll; no separate notify hook is needed on the JIT tier).
     fn complete(&self, id: u64, result: i64) {
-        let mut g = self.mx.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.mx.lock_unpoisoned();
         g.ready.insert(id, result);
         g.in_flight -= 1;
         Self::fiber_drain_locked(&mut g);
@@ -16161,7 +16060,7 @@ impl Completions {
     /// caller must have dropped the host lock; this blocks only the calling vCPU thread while the
     /// pool does the work.
     pub fn wait(&self, id: u64) -> i64 {
-        let mut g = self.mx.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.mx.lock_unpoisoned();
         loop {
             if let Some(r) = g.ready.remove(&id) {
                 return r;
@@ -16174,23 +16073,19 @@ impl Completions {
     /// drain's probe and the park path's register-then-recheck. Exactly one taker wins; the
     /// loser's wake attempt is an idempotent no-op.
     pub fn try_take(&self, id: u64) -> Option<i64> {
-        self.mx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .ready
-            .remove(&id)
+        self.mx.lock_unpoisoned().ready.remove(&id)
     }
 
     /// Ids minted but not yet completed. A test pins the "sync ops never pay" invariant with
     /// [`Completions::minted`]; this is the in-flight drain signal.
     pub fn outstanding(&self) -> usize {
-        self.mx.lock().unwrap_or_else(|e| e.into_inner()).in_flight
+        self.mx.lock_unpoisoned().in_flight
     }
 
     /// Total completion ids ever minted on this host — `0` proves no dispatch ever touched the
     /// parking machinery (the §12 "sync ops never pay" pin, asserted by tests).
     pub fn minted(&self) -> u64 {
-        self.mx.lock().unwrap_or_else(|e| e.into_inner()).next_id
+        self.mx.lock_unpoisoned().next_id
     }
 }
 
@@ -18807,10 +18702,7 @@ impl Host {
     /// structural `type_id` was already reinstated at restore, so the handle keeps resolving).
     /// A missing offer leaves the placeholder (the holder's re-issued call then faults probeably).
     pub fn relink_live_impl(&mut self, idx: u32, callee: Arc<Mutex<Host>>, export: u32) {
-        let sigs = callee
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .offer_shape(export);
+        let sigs = callee.lock_unpoisoned().offer_shape(export);
         if let (Some(e), Some(sigs)) = (self.live_impls.get_mut(idx as usize), sigs) {
             e.callee = callee;
             e.sigs = sigs.into();
@@ -18956,7 +18848,7 @@ impl Host {
     /// have inherited this host's stdout.
     pub fn stdout_bytes(&self) -> Vec<u8> {
         match &self.out_sink {
-            Some(s) => s.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            Some(s) => s.lock_unpoisoned().clone(),
             None => self.stdout.clone(),
         }
     }
@@ -18964,7 +18856,7 @@ impl Host {
     /// S2 — the stderr analogue of [`Host::stdout_bytes`].
     pub fn stderr_bytes(&self) -> Vec<u8> {
         match &self.err_sink {
-            Some(s) => s.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            Some(s) => s.lock_unpoisoned().clone(),
             None => self.stderr.clone(),
         }
     }
@@ -19418,10 +19310,7 @@ impl Host {
     /// `callee_slot: None`: not an interp §14 join slot, so non-durable (freeze refuses, the
     /// [`Host::wire_live_impl`] rule).
     pub fn mint_child_offer(&mut self, callee: &Arc<Mutex<Host>>, export: u32) -> Option<i32> {
-        let sigs = callee
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .offer_shape(export)?;
+        let sigs = callee.lock_unpoisoned().offer_shape(export)?;
         Some(self.install_live_impl(Arc::clone(callee), export, sigs.into(), None))
     }
 
@@ -19712,9 +19601,9 @@ impl Host {
     /// dissolves entirely when `ProviderState` retires (the 6d binding-merge residue).
     pub fn grant_impl_cap(&mut self, offer: i32, cap: i32, name: &str) -> Option<i32> {
         let state = self.resolve_offer(offer).ok()?.state.clone()?;
-        let st = state.lock().unwrap_or_else(|e| e.into_inner());
+        let st = state.lock_unpoisoned();
         // CALLS.md 6d.4.1 — the powerbox is the shared cell; lock it for the re-grant.
-        let mut ph = st.host.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ph = st.host.lock_unpoisoned();
         let h = self.regrant_into_child(cap, &mut ph)?;
         ph.register_cap_name(name, h);
         Some(h)
@@ -21329,7 +21218,7 @@ impl Host {
                                 // path holds a provider cell while entering this arm (durable
                                 // sub-runs are refused), so the only contention is brief edge
                                 // scopes.
-                                let mut ph = cell.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut ph = cell.lock_unpoisoned();
                                 translate_cap_slots(
                                     &mut ph,
                                     self,
@@ -21341,7 +21230,7 @@ impl Host {
                             // Check-in: reopen the host-side gate whatever the outcome; the fork
                             // drops (the instance kept its window; mutations shared the backing).
                             {
-                                let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut st = state.lock_unpoisoned();
                                 st.busy = false;
                                 st.busy_owner = 0;
                             }
@@ -21370,9 +21259,7 @@ impl Host {
                             // cell for the lock-free `drive_arc` sub-run (leaving a default in the
                             // cell, exactly as the old by-value field did); no inner lock is held
                             // across the run — `busy` guards it (6c). Restored at the check-in.
-                            let host_taken = std::mem::take(
-                                &mut *st.host.lock().unwrap_or_else(|e| e.into_inner()),
-                            );
+                            let host_taken = std::mem::take(&mut *st.host.lock_unpoisoned());
                             (st.mem.take(), host_taken)
                         };
                         // The crossing runs with the state lock released. `?` inside stays local so
@@ -21415,10 +21302,10 @@ impl Host {
                         // Check-in: restore the provider world and reopen the instance, whatever
                         // the outcome (the single settle point, mirroring the animation's).
                         {
-                            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut st = state.lock_unpoisoned();
                             st.mem = mem_local;
                             // 6d.4.1 — restore the taken inner Host back into the shared cell.
-                            *st.host.lock().unwrap_or_else(|e| e.into_inner()) = host_local;
+                            *st.host.lock_unpoisoned() = host_local;
                             st.busy = false;
                             st.busy_owner = 0;
                         }
@@ -21919,9 +21806,7 @@ impl Host {
                     let Some(s) = self.sinks.get(i as usize) else {
                         return ret(EINVAL);
                     };
-                    s.lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .extend_from_slice(&bytes);
+                    s.lock_unpoisoned().extend_from_slice(&bytes);
                     return ret(len as i64);
                 }
                 let own = if role == StreamRole::Out {
@@ -21930,10 +21815,7 @@ impl Host {
                     &self.err_sink
                 };
                 match own {
-                    Some(s) => s
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .extend_from_slice(&bytes),
+                    Some(s) => s.lock_unpoisoned().extend_from_slice(&bytes),
                     None if role == StreamRole::Out => self.stdout.extend_from_slice(&bytes),
                     None => self.stderr.extend_from_slice(&bytes),
                 }
@@ -21966,7 +21848,7 @@ impl Host {
         else {
             return ret(EINVAL);
         };
-        let mut fifo = fifo_arc.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fifo = fifo_arc.lock_unpoisoned();
         match op {
             0 => {
                 // read(buf, len) -> n; only the read end is readable.
@@ -22289,7 +22171,7 @@ impl Mem {
     /// Read/write the shared address space, recovering from a poisoned lock (the interpreter never
     /// panics while holding it) rather than propagating the panic.
     fn space_read(&self) -> std::sync::RwLockReadGuard<'_, AddrSpace> {
-        self.space.read().unwrap_or_else(|e| e.into_inner())
+        self.space.read_unpoisoned()
     }
     fn space_write(&self) -> std::sync::RwLockWriteGuard<'_, AddrSpace> {
         // Any address-space mutation (the only reason to take the write lock) disables the lock-free
@@ -22297,7 +22179,7 @@ impl Mem {
         // reader never observes a clear flag after a mutation has begun (a false positive just makes
         // it take the read lock — always safe; a false negative would not be).
         self.prot_dirty.store(true, Ordering::Release);
-        self.space.write().unwrap_or_else(|e| e.into_inner())
+        self.space.write_unpoisoned()
     }
 
     /// Build the memory view a spawned vCPU (`thread.spawn`) starts with (§12): it shares the **same**
@@ -23309,7 +23191,7 @@ impl Mem {
             return true; // never mutated ⇒ the prefix is plain Rw throughout
         }
         let mapped_pages = self.window.mapped() / self.page;
-        let space = self.space.read().unwrap_or_else(|e| e.into_inner());
+        let space = self.space.read_unpoisoned();
         space.regions.is_empty()
             && space
                 .prot
@@ -23339,7 +23221,7 @@ impl Mem {
     /// region-backed (§13 alias). Pages absent from the list take the region default: read-write
     /// below `mapped`, unmapped above. Pure observation over existing state.
     pub fn map_info(&self) -> (u64, u64, u64, Vec<(u64, u8)>) {
-        let sp = self.space.read().unwrap_or_else(|e| e.into_inner());
+        let sp = self.space.read_unpoisoned();
         let pages = sp
             .prot
             .iter()
@@ -23374,7 +23256,7 @@ impl Mem {
     /// zero on commit), matching a fresh window. Only for the **root** window (`base == 0`); nested
     /// children ride in the root capture.
     fn layout_snapshot(&self) -> MemLayout {
-        let space = self.space.read().unwrap_or_else(|e| e.into_inner());
+        let space = self.space.read_unpoisoned();
         let mut high = self.window.mapped();
         if let Some((&max_pg, _)) = space.prot.iter().next_back() {
             high = high.max(max_pg.saturating_add(1).saturating_mul(self.page));
@@ -23407,7 +23289,7 @@ impl Mem {
     /// [`layout_snapshot_safe`](Mem::layout_snapshot_safe) (no §13 regions). Reinstated with
     /// [`install_prot`](Mem::install_prot).
     fn prot_snapshot(&self) -> Vec<(u64, PageProt)> {
-        let space = self.space.read().unwrap_or_else(|e| e.into_inner());
+        let space = self.space.read_unpoisoned();
         space.prot.iter().map(|(&pg, &p)| (pg, p)).collect()
     }
 
@@ -24272,7 +24154,7 @@ mod fork_powerbox_tests {
             move || -> HostProc {
                 let counter = Arc::clone(&counter);
                 Box::new(move |_op, _args, _mem, _| {
-                    let mut c = counter.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut c = counter.lock_unpoisoned();
                     *c += 1;
                     Ok(vec![*c])
                 })
@@ -24314,7 +24196,7 @@ mod fork_powerbox_tests {
             move || -> HostProc {
                 let counter = Arc::clone(&counter);
                 Box::new(move |_op, _args, _mem, _| {
-                    let mut c = counter.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut c = counter.lock_unpoisoned();
                     *c += 1;
                     Ok(vec![*c])
                 })
