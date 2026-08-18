@@ -175,6 +175,25 @@ pub const OP_GETPPID: u32 = 50;
 /// unavailable — an error a shell surfaces, never an infinite retry).
 pub const OP_FORK: u32 = 51;
 
+/// #972 slice 1 — **adopt two core pipe-end handles into the fd table** (`pipe_adopt(read_h,
+/// write_h, fds_ptr) -> 0 | -errno`). The unification's mint path: the guest mints its own
+/// counted pipe with the `CAP_SELF_PIPE` self-op (`__vm_pipe` — synchronous, its own powerbox,
+/// no host authority), then this op records the two handles as [`FdEntry::CorePipe`] entries and
+/// writes `[read_fd, write_fd]` at `fds_ptr`. The personality gains **no authority**: it stores
+/// handle *numbers* as bookkeeping — it cannot exercise them (INVARIANTS.md #3; the handles never
+/// leave the guest's powerbox), and a garbage handle simply fails the guest's own later cap-call.
+pub const OP_PIPE_ADOPT: u32 = 52;
+
+/// #972 slice 1 — the **handle-carrying tag** returned by `read`/`write`/`close` on a
+/// [`FdEntry::CorePipe`] fd: `PX_TAG_BASE - handle`. A **personality ↔ shim private convention**,
+/// never interpreted by the core (INVARIANTS.md #5/#11 discipline): every tag is `<= PX_TAG_BASE`,
+/// every real errno is `> -4096`, so the ranges can never alias; no top-byte semantics — plain
+/// negative i64 values on the existing sign-tested `count | -errno` returns. The shim decodes
+/// `handle = PX_TAG_BASE - tag` and follows with the core cap-call (`__vm_read`/`__vm_write`/
+/// `__vm_close`) — the blocking/EINTR/EOF/`-EPIPE` path. A caller that is not our shim sees a
+/// large negative "error" and fails closed: no bytes moved, no fd state changed.
+pub const PX_TAG_BASE: i64 = -(1 << 20);
+
 /// **POSIX signal surface — L0 doorbell** (STAGE1.md slice 3 / PROCESS.md §9). A signal a shell traps
 /// (SIGINT/SIGTERM/…) becomes a **pending bit** the guest polls at a safe point (a command boundary) and
 /// dispatches itself — no asynchronous interruption of running guest code (that is L1/L2, parked). This
@@ -539,6 +558,22 @@ enum FdEntry {
     NetStream(Arc<Mutex<Box<dyn NetStream>>>),
     /// A memnet listener (`bind`+listen folded); `accept` pops its pending queue.
     NetListener(MemListener),
+    /// #972 slice 1 — a **core pipe-end handle** adopted into the table ([`OP_PIPE_ADOPT`]): the fd
+    /// is a view over a counted core pipe end living in the guest's own powerbox. `read`/`write`/
+    /// `close` on it return a [`PX_TAG_BASE`] tag redirecting the shim to the core cap-call path
+    /// (blocking, EINTR, true EOF, `-EPIPE`). The `Arc` token counts **intra-process dups only**:
+    /// `dup`/`dup2`/`F_DUPFD` share it, and the last `close` (strong count 1) tags "release the
+    /// handle" so the shim's `__vm_close` fires the powerbox count decrement (EOF/EPIPE wakes).
+    /// [`Proc::fork`] re-splits tokens per process — the twin's powerbox is a *duplicate* with its
+    /// own end-counts, so its release decisions must be its own (sharing the token across the fork
+    /// would let the parent's last close swallow the twin's release, or vice versa).
+    CorePipe(Arc<CorePipeToken>),
+}
+
+/// The shared token behind every intra-process dup of one adopted core pipe-end fd
+/// ([`FdEntry::CorePipe`]): the handle number, plus the `Arc` itself as the dup count.
+struct CorePipeToken {
+    handle: i32,
 }
 
 impl FdEntry {
@@ -559,6 +594,9 @@ impl FdEntry {
             FdEntry::NetSock(s) => FdEntry::NetSock(s.clone()),
             FdEntry::NetStream(d) => FdEntry::NetStream(Arc::clone(d)),
             FdEntry::NetListener(l) => FdEntry::NetListener(l.clone()),
+            // Intra-process dup: share the token, so only the last close releases the handle.
+            // Fork does NOT use this arm for CorePipe — see [`Proc::fork`]'s re-split.
+            FdEntry::CorePipe(t) => FdEntry::CorePipe(Arc::clone(t)),
         }
     }
 }
@@ -1088,6 +1126,7 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "exec_stdin" => OP_EXEC_STDIN,
         "exec_win" => OP_EXEC_WIN,
         "pipe" => OP_PIPE,
+        "pipe_adopt" => OP_PIPE_ADOPT,
         "dup2" => OP_DUP2,
         "dup" => OP_DUP,
         "fcntl" => OP_FCNTL,
@@ -1568,6 +1607,7 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
                 OP_EXEC_STDIN => st.exec_stdin(args, mem),
                 OP_EXEC_WIN => st.exec_win(args),
                 OP_PIPE => st.pipe(args, mem),
+                OP_PIPE_ADOPT => st.pipe_adopt(args, mem),
                 OP_DUP2 => Ok(vec![st.dup2(args)]),
                 OP_DUP => Ok(vec![st.dup(args)]),
                 OP_FCNTL => Ok(vec![st.fcntl(args)]),
@@ -1817,11 +1857,26 @@ impl Proc {
             heap_end: self.heap_end,
             allocated: self.allocated.clone(),
             free_list: self.free_list.clone(),
-            fds: self
-                .fds
-                .iter()
-                .map(|s| s.as_ref().map(FdEntry::dup_clone))
-                .collect(),
+            fds: {
+                // #972 — entry-wise copy over shared descriptions, EXCEPT CorePipe tokens, which
+                // re-split per process: the twin's duplicated powerbox has its own end-counts, so
+                // its last-close release decision must be its own. Intra-process dup groups are
+                // preserved (one fresh token per distinct parent token).
+                let mut split: HashMap<*const CorePipeToken, Arc<CorePipeToken>> = HashMap::new();
+                self.fds
+                    .iter()
+                    .map(|s| {
+                        s.as_ref().map(|e| match e {
+                            FdEntry::CorePipe(t) => FdEntry::CorePipe(Arc::clone(
+                                split.entry(Arc::as_ptr(t)).or_insert_with(|| {
+                                    Arc::new(CorePipeToken { handle: t.handle })
+                                }),
+                            )),
+                            other => other.dup_clone(),
+                        })
+                    })
+                    .collect()
+            },
             dirs: self
                 .dirs
                 .iter()
@@ -1901,6 +1956,11 @@ impl Ctx<'_> {
             Some(FdEntry::PipeWrite(p)) => Sink::Pipe(Arc::clone(p)),
             Some(FdEntry::NetSock(s)) => Sink::Net(s.clone()),
             Some(FdEntry::NetStream(d)) => Sink::NetDelegate(Arc::clone(d)),
+            // #972 — an adopted core pipe end: redirect the shim to the core cap-call write
+            // (backpressure park, `-EPIPE`; the shim raises SIGPIPE per disposition). Note this
+            // also surfaces to `spawn`'s fd-1 routing — a CorePipe stdout for a spawn child is
+            // out of slice-1 scope (exec carry, #972 slice 2) and fails closed here.
+            Some(FdEntry::CorePipe(t)) => return PX_TAG_BASE - t.handle as i64,
             _ => Sink::Bad,
         };
         // #798 — a background write to the proto-terminal rings SIGTTOU (doorbell; the write still
@@ -1962,6 +2022,10 @@ impl Ctx<'_> {
             Some(FdEntry::PipeRead(p)) => Src::Pipe(Arc::clone(p)),
             Some(FdEntry::NetSock(s)) => Src::Net(s.clone()),
             Some(FdEntry::NetStream(d)) => Src::NetDelegate(Arc::clone(d)),
+            // #972 — an adopted core pipe end: redirect the shim to the core cap-call read
+            // (blocking/EINTR/EOF). No bytes move here; a non-shim caller sees a large negative
+            // "error" and fails closed.
+            Some(FdEntry::CorePipe(t)) => return Ok(vec![PX_TAG_BASE - t.handle as i64]),
             _ => Src::Bad,
         };
         let chunk: Vec<u8> = match src {
@@ -2073,6 +2137,15 @@ impl Ctx<'_> {
                             self.w.net_listeners.remove(&l.addr.port);
                         }
                     }
+                    // #972 — the LAST close of an adopted core pipe end (no other dup holds the
+                    // token) tags "release the handle": the shim's `__vm_close` then decrements
+                    // the powerbox end-count, firing the EOF/EPIPE wakes. A non-last close is a
+                    // plain 0 — the description stays open through its dups (POSIX).
+                    if let FdEntry::CorePipe(t) = &entry {
+                        if Arc::strong_count(t) == 1 {
+                            return PX_TAG_BASE - t.handle as i64;
+                        }
+                    }
                     return 0;
                 }
             }
@@ -2115,6 +2188,36 @@ impl Ctx<'_> {
         let buf: PipeBuf = Arc::new(Mutex::new(VecDeque::new()));
         let rfd = self.alloc_fd(FdEntry::PipeRead(Arc::clone(&buf)));
         let wfd = self.alloc_fd(FdEntry::PipeWrite(buf));
+        let mut out = Vec::with_capacity(8);
+        out.extend_from_slice(&(rfd as i32).to_le_bytes());
+        out.extend_from_slice(&(wfd as i32).to_le_bytes());
+        mem.write_bytes(ptr, &out).ok_or(Trap::Malformed)?;
+        Ok(vec![0])
+    }
+
+    /// #972 — `pipe_adopt(read_h, write_h, fds_ptr) -> 0 | -errno`: record two guest-minted core
+    /// pipe-end handles (`__vm_pipe`'s output) as [`FdEntry::CorePipe`] fds and store
+    /// `[read_fd, write_fd]` (`i32`×2, read end first — POSIX order) at `fds_ptr`. Pure
+    /// bookkeeping: the handles are numbers to this table (never exercised here — a garbage
+    /// handle fails the guest's own later cap-call, not this op). Negative handles are `-EINVAL`.
+    fn pipe_adopt(
+        &mut self,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+    ) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let rh = *args.first().ok_or(Trap::Malformed)?;
+        let wh = *args.get(1).ok_or(Trap::Malformed)?;
+        let ptr = *args.get(2).ok_or(Trap::Malformed)? as u64;
+        if rh < 0 || wh < 0 || rh > i32::MAX as i64 || wh > i32::MAX as i64 {
+            return Ok(vec![EINVAL]);
+        }
+        let rfd = self.alloc_fd(FdEntry::CorePipe(Arc::new(CorePipeToken {
+            handle: rh as i32,
+        })));
+        let wfd = self.alloc_fd(FdEntry::CorePipe(Arc::new(CorePipeToken {
+            handle: wh as i32,
+        })));
         let mut out = Vec::with_capacity(8);
         out.extend_from_slice(&(rfd as i32).to_le_bytes());
         out.extend_from_slice(&(wfd as i32).to_le_bytes());

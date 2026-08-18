@@ -1787,3 +1787,251 @@ int main(void) {{\n\
     assert_eq!(jit.result, vec![Value::I64(42)], "jit parity");
     assert_eq!(jit.stdout, interp.stdout, "jit stdout parity");
 }
+
+/// #972 slice 1 — the **pipe-unification shim**: `pipe()` composes the guest's own core mint
+/// (`__vm_pipe`, CAP_SELF_PIPE) with the personality's adopt op; `read`/`write`/`close` follow the
+/// personality's handle-carrying tag (`PX_TAG_BASE - handle`, disjoint from every errno) to the core
+/// cap-call path — blocking parks, EINTR, true EOF, `-EPIPE` — and `write` raises SIGPIPE through
+/// the personality on `-EPIPE` (disposition-gated; the write still returns `-EPIPE`). The guest
+/// definitions shadow chibicc's powerbox builtins of the same names (PROCESS.md S15 (b)).
+const PIPE_SHIM: &str = r#"
+long __vm_pipe(int *fds);
+long __vm_read(int fd, void *buf, long len);
+long __vm_write(int fd, void *buf, long len);
+long __vm_close(int h);
+long __px_pipe_adopt(int cap, long rh, long wh, long fdp);
+long __px_read(int cap, long fd, long buf, long len);
+long __px_write(int cap, long fd, long buf, long len);
+long __px_close(int cap, long fd);
+long __px_kill(int cap, long pid, long sig);
+
+static long px_h_(long r) { return r <= -1048576 ? -(r + 1048576) : -1; }
+long pipe(int *fds) {
+  int h[2];
+  long r = __vm_pipe(h);
+  if (r != 0) return r;              /* off the park tier: the probeable decline surfaces here */
+  return __px_pipe_adopt(0, h[0], h[1], (long)fds);
+}
+long read(long fd, void *buf, long n) {
+  long r = __px_read(0, fd, (long)buf, n);
+  long h = px_h_(r);
+  if (h < 0) return r;
+  return __vm_read((int)h, buf, n);  /* core path: parks on empty-with-writers, EOFs at count 0 */
+}
+long write(long fd, void *buf, long n) {
+  long r = __px_write(0, fd, (long)buf, n);
+  long h = px_h_(r);
+  if (h < 0) return r;
+  r = __vm_write((int)h, buf, n);
+  if (r == -32) __px_kill(0, 0, 13); /* -EPIPE: raise SIGPIPE per disposition */
+  return r;
+}
+long close(long fd) {
+  long r = __px_close(0, fd);
+  long h = px_h_(r);
+  if (h < 0) return r;
+  __vm_close((int)h);                /* last dup: release the end -> EOF/EPIPE wakes */
+  return 0;
+}
+"#;
+
+/// #972 slice 1 — **THE witness the #967 audit couldn't write**: a concurrent pipeline across fork
+/// twins. The parent pipes, forks, closes its own copy of the write end, and **blocks** in `read`
+/// on the empty pipe — the twin's inherited write end keeps the writer count > 0, so this parks
+/// (`Blocked::PipeRead`) instead of the old `PipeBuf` false-EOF. The twin (spinning first so the
+/// parent is genuinely parked) writes through its fd, then exits — its domain teardown releases its
+/// ends, so after the parent drains the bytes the next `read` returns **true EOF** (0). All through
+/// libc names over the unified fd table. Interp-only (fork + the park machinery).
+#[test]
+fn c_core_pipe_concurrent_pipeline_across_fork() {
+    let src = format!(
+        "{PIPE_SHIM}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+static int fds[2];\n\
+static int status;\n\
+static char b[8];\n\
+static volatile long acc;\n\
+static long pid; static long h;\n\
+int main(void) {{\n\
+  if (pipe(fds) != 0) return 1;\n\
+  pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 2;\n\
+  if (pid == 0) {{\n\
+    long i;\n\
+    for (i = 0; i < 2000000; i = i + 1) acc = acc + i;  /* let the parent park first */\n\
+    if (write(fds[1], \"GO!\", 3) != 3) return 8;\n\
+    return 7;                                 /* exit releases the twin's ends */\n\
+  }}\n\
+  close(fds[1]);                              /* parent's write end gone: twin's keeps it open */\n\
+  long n = read(fds[0], b, 8);                /* PARKS (writer alive), woken by the twin's write */\n\
+  if (n != 3) return 3;\n\
+  if (b[0] != 'G' || b[1] != 'O' || b[2] != '!') return 4;\n\
+  n = read(fds[0], b, 8);                     /* twin exited: writer count 0 -> true EOF */\n\
+  if (n != 0) return 5;\n\
+  h = __px_waitpid(0, pid, (long)&status, 0);\n\
+  if (h != pid) return 6;\n\
+  if (((status >> 8) & 0xff) != 7) return 9;\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_only(&src, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "blocked reader fed by a live writer across fork twins, true EOF on last-writer-close"
+    );
+}
+
+/// #972 slice 1 — **dup refcounting + release-fires-EPIPE + SIGPIPE**: `dup2` shares the token, so
+/// closing the original read fd releases nothing (the write side stays writable); closing the LAST
+/// read dup releases the read end — proven by the writer immediately getting `-EPIPE` (the reader
+/// count hit 0 in the core, so the release really fired), with SIGPIPE raised through the
+/// personality (caught handler pending on the doorbell). Interp-only (`CAP_SELF_PIPE`).
+#[test]
+fn c_core_pipe_dup_close_refcount_and_epipe() {
+    let src = format!(
+        "{PIPE_SHIM}\n\
+long __px_signal(int cap, long signum, long handler);\n\
+long __px_sigcheck(int cap, long z);\n\
+static int fds[2];\n\
+static char b[8];\n\
+int main(void) {{\n\
+  __px_signal(0, 13, 777);                    /* catch SIGPIPE so the raise is observable */\n\
+  if (pipe(fds) != 0) return 1;\n\
+  if (write(fds[1], \"hi\", 2) != 2) return 2;\n\
+  if (__px_close(0, 99) != -9) return 3;      /* plain errno stays plain: -EBADF, never a tag */\n\
+  long d = 9;\n\
+  long __px_dup2(int cap, long o, long n);\n\
+  if (__px_dup2(0, fds[0], d) != d) return 4;\n\
+  if (close(fds[0]) != 0) return 5;           /* NOT the last dup: no release */\n\
+  if (read(d, b, 8) != 2) return 6;           /* the dup still drains the pipe */\n\
+  if (close(d) != 0) return 7;                /* LAST dup: releases the read end */\n\
+  if (write(fds[1], \"x\", 1) != -32) return 8; /* reader count 0 in the core: -EPIPE */\n\
+  if (__px_sigcheck(0, 0) != 777) return 9;   /* the shim raised SIGPIPE; caught -> pending */\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_only(&src, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "dup shares, last close releases (write sees -EPIPE), SIGPIPE raised per disposition"
+    );
+}
+
+/// #972 slice 1 — **invariant-9 decline pin**: the pipe path refuses probeably where the park
+/// machinery is absent. On the interpreter (Real scheduler) `pipe()` works; on the JIT the mint
+/// self-op declines (`-EINVAL`) and the shim surfaces it as a clean errno from `pipe()` — no trap,
+/// no hang, no false success. The same program, both backends, each asserting its own honest
+/// answer — the divergence is *toward refusal*, the fail-closed direction invariant 9 sanctions.
+#[test]
+fn c_core_pipe_declines_probeably_off_the_park_tier() {
+    let src = format!(
+        "{PIPE_SHIM}\n\
+static int fds[2];\n\
+static char b[4];\n\
+int main(void) {{\n\
+  long r = pipe(fds);\n\
+  if (r == -22) return 22;                    /* the decline: clean -EINVAL through the shim */\n\
+  if (r != 0) return 9;\n\
+  if (write(fds[1], \"ok\", 2) != 2) return 8; /* park tier: drain sequentially, no park needed */\n\
+  if (read(fds[0], b, 4) != 2) return 7;\n\
+  return 100;\n\
+}}\n"
+    );
+    let (interp, jit) = run_both(&src, |_| {});
+    assert_eq!(
+        interp.result,
+        vec![Value::I32(100)],
+        "interp (park tier): the unified pipe works end to end"
+    );
+    assert_eq!(
+        jit.result,
+        vec![Value::I64(22)],
+        "jit (no park machinery): pipe() declines with a clean -EINVAL, never a hang or false success"
+    );
+}
+
+/// #972 slice 1 — **tag ABI discipline pins** (invariants 5/11): the raw op return on a CorePipe fd
+/// is a value in the reserved range (`<= PX_TAG_BASE`, disjoint from every errno since errnos are
+/// `> -4096`); a naive caller treating it as an error fails closed (no bytes moved — the buffer is
+/// untouched); and the shim's decode round-trips (the decoded handle really reads the pipe's bytes).
+/// The Rust side pins the constant the C shim hardcodes, so drift breaks here first.
+#[test]
+fn c_core_pipe_tag_range_and_fail_closed() {
+    assert_eq!(
+        svm_posix::PX_TAG_BASE,
+        -(1 << 20),
+        "the C shim hardcodes -1048576; keep them in lockstep"
+    );
+    let src = format!(
+        "{PIPE_SHIM}\n\
+static int fds[2];\n\
+static char b[4];\n\
+int main(void) {{\n\
+  if (pipe(fds) != 0) return 1;\n\
+  if (write(fds[1], \"ab\", 2) != 2) return 2;\n\
+  b[0] = 'Z';\n\
+  long t = __px_read(0, fds[0], (long)b, 4);  /* RAW op, no shim: the tag, not bytes */\n\
+  if (t > -1048576) return 3;                 /* in the reserved range, below every errno */\n\
+  if (b[0] != 'Z') return 4;                  /* fail-closed: nothing moved */\n\
+  long h = -(t + 1048576);\n\
+  if (__vm_read((int)h, b, 4) != 2) return 5; /* the decoded handle drains the real bytes */\n\
+  if (b[0] != 'a' || b[1] != 'b') return 6;\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_only(&src, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "tag in range, fail-closed on raw use, decode round-trips"
+    );
+}
+
+/// #972 slice 1 — **freeze witness** (invariant 7-adjacent): after the personality makes pipe ends
+/// reachable from libc (`pipe()` = mint + adopt), a freeze of the domain still hits the existing
+/// clean refusal — `capture_durable_handles` reports `NonDurableKind::Pipe`, never a partial
+/// snapshot or a new failure mode.
+#[test]
+fn c_core_pipe_freeze_refuses_nondurable() {
+    let src = format!(
+        "{PIPE_SHIM}\n\
+static int fds[2];\n\
+int main(void) {{ return pipe(fds) == 0 ? 42 : 9; }}\n"
+    );
+    let ir = c_to_ir(&src);
+    let raw = parse_module_raw(&ir).expect("parse");
+    let win = 1u64 << raw.memory.expect("window").size_log2;
+    let mut ih = Host::new();
+    let (_posix, ipx) = setup(&mut ih, win);
+    verify_module(&raw).expect("verify");
+    bind_shim(&raw, &mut ih, ipx);
+    let mut fuel = 50_000_000u64;
+    let r = run_with_host(&raw, 0, &[], &mut fuel, &mut ih).expect("run");
+    assert_eq!(r, vec![Value::I32(42)], "the guest minted + adopted a pipe");
+    // The refusal reports the FIRST non-durable slot: the personality's own HostProc handle sits
+    // below the pipe ends, so a personality domain was non-durable before pipes and stays so —
+    // the same clean refusal, no new failure mode.
+    let err = ih
+        .capture_durable_handles()
+        .expect_err("a personality domain holding pipe ends must refuse durable capture");
+    assert_eq!(
+        err.kind,
+        svm_interp::NonDurableKind::HostProc,
+        "the personality slot refuses first (it precedes the pipe ends in the table)"
+    );
+    // And the pipe ends refuse in their own right: a bare host whose only non-durable slots are a
+    // minted pipe's two ends reports NonDurableKind::Pipe.
+    let mut bare = Host::new();
+    let (_w, _r) = bare.grant_pipe();
+    let err = bare
+        .capture_durable_handles()
+        .expect_err("a live pipe end alone must refuse durable capture");
+    assert_eq!(
+        err.kind,
+        svm_interp::NonDurableKind::Pipe,
+        "the pipe end's own refusal kind"
+    );
+}
