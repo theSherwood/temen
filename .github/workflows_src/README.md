@@ -16,6 +16,17 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **`fuzz-matrix-in-sync` job (#923)** — a new lightweight ubuntu job ("fuzz targets wired") that
+  runs `scripts/ci/check-fuzz-matrix.sh`, which asserts the three places a fuzz target is named stay
+  identical: the source files (`fuzz/fuzz_targets/*.rs`), the build entries (`fuzz/Cargo.toml`
+  `[[bin]]`), and the nightly `fuzz` job's `target: [...]` matrix. A target file with no `[[bin]]`
+  never builds; one with no matrix row builds but never runs — silent zero coverage, the exact hole
+  the fuzz job's "keep this list in lockstep with `fuzz/fuzz_targets/*.rs`" comment only warns about
+  in prose. The script is committed and runs locally (`./scripts/ci/check-fuzz-matrix.sh`); it passes
+  today (20 targets in sync) and catches both a stray file and a missing matrix row (verified). (Until
+  copied over, the `workflows-in-sync` guard stays red — the expected mirror-edit friction; `cp
+  .github/workflows_src/*.yml .github/workflows/` drains it.)
+
 - **Nim conformance matrix step in the `nim-e2e` job (#956)** — one step added right after the
   `Nim end-to-end tests` step: `cargo test -p svm-leng --test nim_conformance -- --nocapture`. Runs the
   new `crates/svm-leng/tests/nim_conformance.rs` — a feature→status matrix (generics, exceptions,

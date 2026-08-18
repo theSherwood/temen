@@ -892,7 +892,9 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
   - [ ] **5c** — split register banks (profile-gated).
   - **Revised thesis:** safe levers are low-single-digit% each; the frontier is closed by removing
         real work (5b, memory, edge-copies), not by shaving predicted branches.
-- [ ] **Fuel unification** — safepoint-anchored fuel (IR back-edges + function entries) charged
+- [x] **Fuel unification** — safepoint-anchored fuel (IR back-edges + function entries) charged
       identically across tree-walker / bytecode / Cranelift JIT; `OutOfFuel` flips from
       excluded-from-contract to differentially-asserted; single-step (`budget`) untouched.
-      Owner-approved 2026-07-25 (see "Fuel unification" + INVARIANTS invariant 9). Not started.
+      Owner-approved 2026-07-25 (see "Fuel unification" + INVARIANTS invariant 9). **Complete** —
+      the `instantiate`-child fuel threading (step 5) closed the last nested-run gap (see the
+      "Fuel unification (safepoint-anchored)" section above).

@@ -40,7 +40,8 @@ guest-driven fibers (D22), parent-as-scheduler coroutines, worker-domain shardin
 grant graph. The host holds the waiter table only because it alone can deliver lifecycle
 cleanup (death-is-revocation must find parked callers). *Violated by:* any host feature
 keyed on caller identity, priority, or ordering beyond FIFO — e.g. per-caller fairness
-belongs in guest patterns, not the substrate. (Owner decision 2026-07-24; ISSUES.md I38/I39.)
+belongs in guest patterns, not the substrate. (Owner decision 2026-07-24; originally ISSUES.md
+I38/I39, now retired — see git history / the issue tracker.)
 
 ## 5. Errors are values; traps are for forgery
 

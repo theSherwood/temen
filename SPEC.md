@@ -21,8 +21,8 @@
 > **Slices 3 + 4 landed** — `spec_encode.rs` pins every row's opcode byte against the
 > spec's independently-restated byte map (explicit per-op bytes, not `base+index()`)
 > plus per-op `decode∘encode` identity; `svm_spec::verify` is the **reference
-> verifier** (an independent full second implementation of the §3b/§3c rules, all 86
-> `Inst` variants), and `spec_verify.rs` holds it in agreement with `svm-verify` over
+> verifier** (an independent full second implementation of the §3b/§3c rules, every
+> `Inst` variant), and `spec_verify.rs` holds it in agreement with `svm-verify` over
 > every row module, ~300 generic per-row mutations (wrong operand type / undefined
 > operand, each pinned to its `VerifyError` variant), ~20 directed per-rule rejects,
 > and an `irgen` sweep (300 modules × 6 structural mutations, accept/reject
@@ -58,10 +58,11 @@
 > `v128.const` and results observed as two `i64x2.extract_lane`s, batched
 > many-per-module to amortize compiles. `v128.load`/`store` get the 16-byte
 > window-boundary lattice (the one escape-TCB delta SIMD adds, D58). Lane-NaN policy
-> per D58: computed float lanes compare NaN-class, masks and moves bit-exact. One
-> carve-out honored (not a finding): `i64x2.{min,max}_{s,u}` are a **documented** JIT
-> `Unsupported` bail (no legalizable Cranelift lowering; wasm never emits them) — the
-> interpreters stay fully pinned there. All SIMD rows also ride the encoding suite
+> per D58: computed float lanes compare NaN-class, masks and moves bit-exact.
+> `i64x2.{min,max}_{s,u}` have no direct Cranelift lowering (`smin`/`umin`/`smax`/`umax`
+> don't legalize for `I64X2`), so the JIT **synthesizes** them from a per-lane `icmp` +
+> `bitselect` (`svm-jit/src/lib.rs`) — differentially pinned against the interpreters like
+> every other SIMD row, not bailed. All SIMD rows also ride the encoding suite
 > (the `0xFE` prefix + sub-opcode pins) and both verifiers.
 >
 > **Slice 7 landed — the plan is complete.** The completeness closure
@@ -73,7 +74,7 @@
 > byte pin (`spec_structural.rs`). These carry no `eval` (host/interleaving-dependent —
 > the SPEC.md scope fence). A new exhaustive `row_home()` match (the third forcing
 > function, with `coverage()` and the reference verifier's `check_inst`) maps **every**
-> one of the 86 `Inst` variants to its owning slice, so adding any op is a compile
+> one of the `Inst` variants to its owning slice, so adding any op is a compile
 > error until the spec homes it. The executable spec now covers the entire ISA.
 >
 > **Nightly coverage-guided fuzzing wired (post-plan).** The deterministic boundary
