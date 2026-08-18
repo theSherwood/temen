@@ -29,7 +29,7 @@ One GitHub Project, two axes:
 
 ## Workstreams (epics)
 
-Eleven. File every issue as a sub-issue of exactly one:
+Twelve. File every issue as a sub-issue of exactly one:
 
 | Epic | Workstream | Owning docs |
 |---|---|---|
@@ -44,9 +44,17 @@ Eleven. File every issue as a sub-issue of exactly one:
 | #713 | **Web/Playground** — browser deploy, Pages, boot speed | FRONTEND.md, BROWSER.md, BOOTSPEED.md; `browser/` |
 | #714 | **Perf** — benchmark harness, regressions vs wasmtime | INTERP_PERF.md, OPT.md; DESIGN §1a; `bench/` |
 | #702 | **CI** — CI matrix, fuzzing, flakiness, dev tooling | AGENTS.md, `.github/` |
+| #948 | **Refactoring** — simplification, consolidation/dedup, deletion, hygiene | CLAUDE.md/AGENTS.md (prime directive); INVARIANTS #1 |
 
-`Perf` and `CI` are cross-cutting — an issue homed elsewhere carries a
-`touches:perf` / `touches:ci` label instead of moving there.
+`Perf`, `CI`, and `Refactoring` are cross-cutting — an issue homed elsewhere
+carries a `touches:perf` / `touches:ci` / `touches:refactor` label instead of
+moving there. A cleanup that is *itself* the work (a no-behavior-change refactor,
+dedup, or deletion) homes to `Refactoring`; a feature change that also tidies
+stays in its feature workstream with a `touches:refactor`.
+
+The finite **2026-08 simplification audit** is a separate one-off program tracker
+(#891, `SIMPLIFICATION_AUDIT.md`) that keeps its own children; it is *not* one of
+the twelve workstreams. New, non-audit cleanups home to #948.
 
 ## Labels
 

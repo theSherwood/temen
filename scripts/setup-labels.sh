@@ -19,6 +19,7 @@ label "area:consumers"      "1D76DB" "fork/exec/POSIX shell + language on-ramps 
 label "area:web-playground" "1D76DB" "Browser deploy, Pages, playground, boot speed"
 label "area:perf"           "1D76DB" "Benchmark harness, regressions vs wasmtime (cross-cutting)"
 label "area:ci"             "1D76DB" "CI matrix, fuzzing, flakiness, dev tooling (cross-cutting)"
+label "area:refactor"       "1D76DB" "Refactoring, consolidation, deletion, hygiene (cross-cutting)"
 
 # --- touches:*  (secondary/cross-cutting — zero or more) ---
 label "touches:verify"         "C5DEF5" "Secondary: also touches verify/masking"
@@ -32,6 +33,7 @@ label "touches:consumers"      "C5DEF5" "Secondary: also touches consumers/on-ra
 label "touches:web-playground" "C5DEF5" "Secondary: also touches browser/playground"
 label "touches:perf"           "C5DEF5" "Secondary: also touches performance"
 label "touches:ci"             "C5DEF5" "Secondary: also touches CI/tooling"
+label "touches:refactor"       "C5DEF5" "Secondary: also touches refactoring/cleanup"
 
 # --- sev:*  (mirrors ISSUES.md severity) ---
 label "sev:S1" "B60205" "Corruption / escape"
