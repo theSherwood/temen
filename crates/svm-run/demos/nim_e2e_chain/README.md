@@ -1,0 +1,55 @@
+# The full nimony compiler on the SVM — Nim source → a module that runs
+
+This is the capstone the earlier "nimony in the browser" slices left in pieces: **every nimony phase
+runs as a sandboxed SVM guest, and the compiled program then executes to the correct value.**
+
+```
+prog.nim ─nifler──▶ .p.nif ─┐
+stdlib   ─nifler (exec child, on demand)─▶ .p.nif
+                            └─nimsem──▶ .s.nif ─hexer──▶ .x.nif (Leng) ─┐
+                                                                        svm_leng::link → run
+```
+
+- **nifler** (parse), **nimsem** (sema — itself a driver, shelling out to nifler, routed to the SVM
+  `exec` capability so `nifler.svmb` runs as an isolated child sharing the memfs), and **hexer**
+  (lower) each run as real `.svmb` guests over one shared in-window `fs`.
+- The final multi-module IR link is the embedder's Rust (`svm_leng::link_whole_with_runtime` + the W3
+  runtime shim) — the same *host-drives-the-phases* shape as the browser cards and `nim_backend_chain`,
+  now carried all the way through to a **run**.
+- The linked module executes on **both engines** (§9 interp/JIT parity) and its exported proc returns
+  the expected value.
+
+This retires the last gap in the workstream: the individual phases were each proven on the SVM (slices
+1–2b), and `nim_backend_chain` drove hexer→svm-leng but stopped at "the IR parses." Here the chain runs
+front-to-back and the output *runs*.
+
+## Scope
+
+The fixtures are **import-free compute programs** (`proc … ; let r = …`), so the compilation is exactly
+two modules — the program + `system` — and the result is read back by calling an exported proc (no
+stdout needed). A program with `import`s pulls in more modules, each its own nifler→nimsem→hexer unit;
+driving that many-module graph is nifmake's dependency orchestration, a separate follow-up. The
+`system`-only two-module chain is the honest "the compiler runs on the SVM" milestone.
+
+`nimsem` is built with **`-d:skipPostSemValidator`** (as nimony's own Windows CI does); the in-process
+post-sem IR validator has a separate on-ramp issue, tracked apart from the sema this proves correct.
+
+## Run it
+
+```sh
+NIMONY_BIN=<repo>/.nimtool/nimony/bin/nimony  bash build_e2e_chain.sh
+```
+
+Builds the three phase guests (`nifler.svmb` ~17 MB, `nimsem.svmb` ~5.5 MB, `hexer.svmb` ~3 MB — build
+artifacts, **not committed**), bootstraps a native `nimcache` per fixture (for the parse layout + the
+stems nifmake computes), re-runs **sema + lowering on the SVM** from there, links, and runs. Fail-soft
+**SKIP** without the nimony toolchain (NIM.md §2). The driver itself is
+`crates/svm-run/examples/nim_e2e_chain.rs`.
+
+## Status
+
+✅ **The nimony compiler runs on the SVM, and its output runs too.** With `nifler` (slice 1), the big
+phases `nimsem`/`hexer` (slice 2/2b), `svm-leng` (W5), and now this end-to-end chain, a real Nim program
+is compiled entirely by sandboxed guests and the result executes to the correct value on both engines.
+Remaining: multi-module (`import`-bearing) programs need nifmake's dependency orchestration; the
+post-sem validator has its own on-ramp follow-up.
