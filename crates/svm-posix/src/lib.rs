@@ -3676,16 +3676,32 @@ impl Ctx<'_> {
         }
     }
 
-    /// `free(ptr)`: return `ptr`'s block to the free list for reuse. `free(NULL)` and a double / bogus
-    /// free are no-ops (a bogus free never corrupts the arena — the size table is host-side). No
-    /// coalescing yet (POSIX.md §6).
+    /// `free(ptr)`: return `ptr`'s block to the free list for reuse, **coalescing** it with any
+    /// adjacent free blocks (the #800 regex differential is the workload that finally demanded it:
+    /// 30+ compile/free cycles of varied-size arenas fragmented a quarter-window heap to
+    /// exhaustion). `free(NULL)` and a double / bogus free are no-ops (a bogus free never corrupts
+    /// the arena — the size table is host-side).
     fn free(&mut self, args: &[i64]) {
         let ptr = *args.first().unwrap_or(&0) as u64;
         if ptr == 0 {
             return;
         }
         if let Some(size) = self.p.allocated.remove(&ptr) {
-            self.p.free_list.push((ptr, size));
+            let (mut off, mut sz) = (ptr, size);
+            // Merge any free neighbor — one ending at `off`, one starting at `off + sz` — repeating
+            // until neither side touches (at most two merges; the list never holds two adjacent
+            // blocks after this, so adjacency can't chain further).
+            while let Some(i) = self
+                .p
+                .free_list
+                .iter()
+                .position(|&(o, s)| o + s == off || o == off + sz)
+            {
+                let (o, s) = self.p.free_list.swap_remove(i);
+                off = off.min(o);
+                sz += s;
+            }
+            self.p.free_list.push((off, sz));
         }
     }
 }
@@ -4665,6 +4681,34 @@ block 0 (vph: i32) {\n\
         assert!(
             matches!(jo, JitOutcome::Exited(42)),
             "jit: exit(42) must terminate the domain, got {jo:?}"
+        );
+    }
+
+    /// #800 — `free` coalesces adjacent blocks: three 1 KiB neighbors freed out of order merge back
+    /// into one span that serves a 3 KiB request no single freed block could. (The regex
+    /// differential's 30+ varied-size compile/free cycles exhausted a quarter-window heap without
+    /// this.)
+    #[test]
+    fn free_coalesces_adjacent_blocks() {
+        let mut w = new_world(Vec::new());
+        let mut p = new_proc(4096, 8192);
+        let mut cx = Ctx {
+            w: &mut w,
+            p: &mut p,
+            wake_after: Vec::new(),
+        };
+        let a = cx.malloc(&[1024]);
+        let b = cx.malloc(&[1024]);
+        let c = cx.malloc(&[1024]);
+        assert!(a > 0 && b > 0 && c > 0, "three live blocks");
+        assert_eq!(cx.malloc(&[3072]), 0, "no room while all three are live");
+        cx.free(&[a]);
+        cx.free(&[c]);
+        cx.free(&[b]);
+        let big = cx.malloc(&[3072]);
+        assert_eq!(
+            big, a,
+            "freed neighbors merged into one span serving a request bigger than any single block"
         );
     }
 
