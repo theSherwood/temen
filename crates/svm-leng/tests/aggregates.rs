@@ -126,3 +126,30 @@ fn oconstr_aggregate_argument() {
     assert_eq!(run(&m, 1, &[4096, 5]), 12, "addp of a+b with a=5, b=7");
     assert_eq!(run(&m, 1, &[4096, 100]), 107);
 }
+
+#[test]
+fn oconstr_in_expression_position() {
+    // An `(oconstr …)` in general **expression** position (a `discard`ed object literal), not a call
+    // argument — the case a stdlib `result = mk(); discard mkPair()` hits, which svm-leng fail-closed
+    // on before #990. `expr()` now materializes it into a scratch temp (the same lowering the
+    // call-argument case uses), and the position-aware `agg_temp_bytes` reserves that temp's bytes so
+    // it can't stomp the frame. `acc` is address-taken (`(addr acc)`), so it is frame-resident; the
+    // discarded 16-byte `Pair` temp must not corrupt it — reading `acc` back must still see `n`.
+    let leng = "\
+(stmts
+ (type :Pair.0. . (object . (fld :a.0 . (i +64)) (fld :b.0 . (i +64))))
+ (proc :f.0 (params (param :n.0 . (i +64))) (i +64) .
+  (stmts .
+   (var :acc.0 . (i +64) n.0)
+   (var :p.0 . (ptr (i +64)) (addr acc.0))
+   (discard (oconstr Pair.0. (kv a.0 111) (kv b.0 222)))
+   (ret (deref p.0)))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    // f is frame-needing (acc is address-taken + the oconstr temp): ($sp, n) -> i64.
+    assert_eq!(
+        run(&m, 0, &[8192, 42]),
+        42,
+        "a discarded oconstr temp in expression position leaves the frame local intact"
+    );
+    assert_eq!(run(&m, 0, &[8192, 7]), 7);
+}

@@ -447,9 +447,12 @@ plumbing. Five workstreams, roughly independent:
     `except` to nimony's **error-flag model** (a can-raise proc returns an `(ErrorCode, value)` tuple;
     the caller branches on the code and `jmp`s to the handler), all constructs svm-leng already
     handles; the earlier "gap" was a fixture using standard-Nim `newException`, not nimony's model.
-    The two remaining fail-closed rows each point at a ticket: **#760** (a `const`-arith gvar
-    initializer) and **#990** (`oconstr` in expression position — a tuple/object literal as an rvalue,
-    which blocks `Table`). A row that starts working *or* regresses fails the test — the "green/red
+    **`oconstr` in expression position** also landed (#990) — a tuple/object literal as an rvalue now
+    materializes into a scratch temp (the position-aware `agg_temp_bytes` reserves it). The two
+    remaining fail-closed rows each point at a ticket: **#760** (a `const`-arith gvar initializer) and
+    **#993** (`Table` now translates but the compute-shim conformance link leaves `sysWrite` unbound —
+    `tables` → `panic` → `syncio`; the powerbox/browser link binds it). A row that starts working *or*
+    regresses fails the test — the "green/red
     matrix, each red a ticket" the totality work grinds down.
 - **W2 — Linker (the long pole).** A real program is many modules; nimony emits one Leng file per
   module. W2 resolves cross-module symbols, merges globals/data, and lays out one svm module from N

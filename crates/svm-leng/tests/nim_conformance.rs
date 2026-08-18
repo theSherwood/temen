@@ -378,14 +378,16 @@ const FIXTURES: &[Fixture] = &[
     },
     Fixture {
         // `std/tables` `initTable`/`[]`/`[]=` are `.raises`, so they must be called inside a
-        // `try`/`except ErrorCode` (nimony's error-flag model). Compiles now that exceptions work
-        // (#980), but `std/tables`/`syncio` fail-close in svm-leng on `oconstr` in expression position
-        // (a tuple/object literal as an rvalue) — a #760-class translate arm tracked in #990.
+        // `try`/`except ErrorCode` (nimony's error-flag model). Compiles (#980) and now **translates**
+        // (oconstr in expression position landed, #990), but fails to **link** in this compute-shim
+        // harness: `tables` calls `panic` → `syncio`'s `sysWrite`, a syscall leaf the compute shim
+        // doesn't bind (the powerbox/browser link does). Tracked in #993. (Harness buckets the link
+        // error as `Translate`.)
         feature: "Table[string,int]",
         source: "import std/tables\nproc run(): int =\n  try:\n    var t = initTable[string, int]()\n    t[\"a\"] = 42\n    result = t[\"a\"]\n  except ErrorCode:\n    result = -1\nlet r = run()\n",
         expected: 42,
         expect: Expect::FailsClosed(Stage::Translate),
-        ticket: Some("#990 (oconstr in expression position)"),
+        ticket: Some("#993 (sysWrite unbound in the compute-shim link)"),
     },
     Fixture {
         feature: "floats (arith + int conv)",
