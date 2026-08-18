@@ -15,9 +15,14 @@ use svm_interp::{run_capture_reserved_with_host_prots, CapturedProt, Host, Value
 use svm_wasm_jit::{compile_module_tierup_nullguard, TRAP_MEMORY_FAULT};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
-const WIN_LOG2: u8 = 17; // 128 KiB window = 32 guard-sized (4 KiB) pages
+const WIN_LOG2: u8 = 17; // 128 KiB window = 8 guard-sized (16 KiB) pages
 const WIN_SIZE: u64 = 1 << WIN_LOG2;
-const GUARD: u64 = 4096; // one 4 KiB NULL page, = the interp's DURABLE_SNAPSHOT_PAGE granularity
+/// 16 KiB — the **max host page** (macOS), so the seeded interp region is host-page-exact on every
+/// CI host: the interpreter's page map coalesces to host-page granularity, and a 4 KiB guard on a
+/// 16 KiB-page host would make the interp trap `[4096, 16384)` where the emitted guard admits
+/// (exactly the macOS divergence this constant fixes). Also the #964 recommendation (the wider
+/// NULL net that catches big-struct field derefs).
+const GUARD: u64 = 16384;
 const WIN_BASE: u32 = 0x2_0000;
 const ENV_PTR: u32 = 1024;
 const FUEL: u64 = 1_000_000;
@@ -109,9 +114,11 @@ fn run_emitted(wasm: &[u8], func: u32, argv: &[i64]) -> Result<i64, i32> {
 /// (everything else `Rw`) — the interp half of the trap-on-NULL design, available today through the
 /// durable prot-seeding seam. `Ok(v)` / `Err(())` on a trap.
 fn run_oracle(m: &svm_ir::Module, func: u32, argv: &[i64]) -> Result<i64, ()> {
-    let npages = (WIN_SIZE / 4096) as usize;
+    let npages = (WIN_SIZE / 4096) as usize; // CapturedProt granularity (DURABLE_SNAPSHOT_PAGE)
     let mut prots = vec![CapturedProt::Rw; npages];
-    prots[0] = CapturedProt::Unmapped;
+    for slot in prots.iter_mut().take((GUARD / 4096) as usize) {
+        *slot = CapturedProt::Unmapped;
+    }
     let args: Vec<Value> = argv.iter().map(|&a| Value::I64(a)).collect();
     let mut fuel = FUEL;
     let mut host = Host::new();
@@ -147,8 +154,8 @@ fn guard_traps_match_the_seeded_interpreter() {
     let probes: [(i64, bool); 6] = [
         (0, true),
         (8, true),
-        (4088, true),             // 8-byte span entirely in the NULL page
-        (GUARD as i64 - 1, true), // first byte below the guard, span crosses into page 1
+        (GUARD as i64 - 8, true), // 8-byte span entirely in the NULL region
+        (GUARD as i64 - 1, true), // first byte below the guard, span crosses past it
         (GUARD as i64, false),
         (WIN_SIZE as i64 - 8, false),
     ];
