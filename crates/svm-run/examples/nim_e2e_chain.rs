@@ -9,16 +9,17 @@
 //!
 //! ```text
 //! cargo run -q --release -p svm-run --example nim_e2e_chain -- \
-//!     <nifler.svmb> <nimsem.svmb> <hexer.svmb> <libdir> <nimcache-dir> <sys-stem> <prog-stem> \
+//!     <nifler.svmb> <nimsem.svmb> <hexer.svmb> <libdir> <nimcache-dir> <main-stem> \
 //!     <export> <expected> [arg...]
 //! ```
 //!
 //! `<nimcache-dir>` is a native-bootstrapped `nimcache` (from one `nimony c`, giving the `.p.nif`
-//! parse outputs + the stem bookkeeping nifmake computes); the driver re-runs **sema and lowering on
-//! the SVM** from there, so the parse output is checked (nifler.svmb re-parses `prog.nim` and its
-//! bytes must match) and the two big phases actually execute in the sandbox. `<export>` is a proc the
-//! linked module must expose; the driver calls it with `[arg...]` and asserts the result is
-//! `<expected>` on the tree-walker and the JIT.
+//! parse outputs, the stem bookkeeping, and `<main-stem>.build.nif` — nimony's own dependency-ordered
+//! plan). The driver reads that plan, so it handles **any number of modules**: a program that
+//! `import`s pulls in more compilation units, each its own nifler→nimsem→hexer unit, dependency-
+//! ordered. It re-runs **sema and lowering on the SVM** for every module (the parse is checked too —
+//! nifler.svmb re-parses the main and its bytes must match), links them all with the runtime shim, and
+//! calls `<export>` with `[arg...]`, asserting the result is `<expected>` on the tree-walker and JIT.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -124,6 +125,146 @@ fn cfg(args: &[&str], stdin: Vec<u8>) -> RunConfig {
     }
 }
 
+/// One nimsem invocation from nimony's build plan (`<main>.build.nif`): the module it produces, the
+/// exact args (`--isSystem` / `--isMain` / bare `<stem>.p.nif`), and the modules it depends on.
+struct NimsemStep {
+    stem: String,
+    args: Vec<String>,
+    deps: Vec<String>,
+}
+
+/// Return the balanced `(head …)` s-expr slices in `s` (each includes the parens). A tiny reader —
+/// enough to walk nimony's pretty-printed NIF build plan without a full parser.
+fn sexpr_blocks(s: &str, head: &str) -> Vec<String> {
+    let needle = format!("({head}");
+    let b = s.as_bytes();
+    let mut out = vec![];
+    let mut i = 0;
+    while let Some(rel) = s[i..].find(&needle) {
+        let start = i + rel;
+        let (mut j, mut depth, mut in_str) = (start, 0i32, false);
+        while j < b.len() {
+            match b[j] {
+                b'\\' if in_str => j += 1,
+                b'"' => in_str = !in_str,
+                b'(' if !in_str => depth += 1,
+                b')' if !in_str => {
+                    depth -= 1;
+                    if depth == 0 {
+                        j += 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        out.push(s[start..j].to_string());
+        i = j;
+    }
+    out
+}
+
+/// The contents of every `"…"` string literal in `s`, with NIF `\HH` hex + `\\`/`\"` escapes decoded.
+fn quoted(s: &str) -> Vec<String> {
+    let b = s.as_bytes();
+    let (mut out, mut i) = (vec![], 0);
+    while i < b.len() {
+        if b[i] == b'"' {
+            let mut cur = String::new();
+            i += 1;
+            while i < b.len() && b[i] != b'"' {
+                if b[i] == b'\\' && i + 2 < b.len() {
+                    if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                        cur.push(byte as char);
+                        i += 3;
+                        continue;
+                    }
+                    cur.push(b[i + 1] as char);
+                    i += 2;
+                    continue;
+                }
+                cur.push(b[i] as char);
+                i += 1;
+            }
+            out.push(cur);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Parse the `(do nimsem …)` steps out of `<main>.build.nif` — nimony's own dependency-ordered plan.
+/// Each step's `(output …).s.nif` names the module; its `(input …).s.idx.nif`s are the modules that
+/// must be semchecked first (the dependency edges, already in stem space — no path→stem resolution).
+fn parse_nimsem_steps(build_nif: &str) -> Vec<NimsemStep> {
+    let stem_of = |path: &str, suffix: &str| -> Option<String> {
+        path.rsplit('/')
+            .next()
+            .and_then(|f| f.strip_suffix(suffix))
+            .map(str::to_string)
+    };
+    let mut steps = vec![];
+    for block in sexpr_blocks(build_nif, "do nimsem") {
+        let args = sexpr_blocks(&block, "args")
+            .first()
+            .map(|a| quoted(a))
+            .unwrap_or_default();
+        let mut stem = None;
+        let mut deps = vec![];
+        for out in sexpr_blocks(&block, "output") {
+            if let Some(s) = quoted(&out).first().and_then(|p| stem_of(p, ".s.nif")) {
+                stem = Some(s);
+            }
+        }
+        for inp in sexpr_blocks(&block, "input") {
+            if let Some(d) = quoted(&inp).first().and_then(|p| stem_of(p, ".s.idx.nif")) {
+                deps.push(d);
+            }
+        }
+        if let Some(stem) = stem {
+            steps.push(NimsemStep { stem, args, deps });
+        }
+    }
+    steps
+}
+
+/// Dependency-order the steps (each module after every module it depends on) via DFS postorder over
+/// the in-set edges. nimony's plan is already a DAG; this pins a valid processing order for the SVM
+/// run without relying on the plan's textual order.
+fn toposort(steps: &[NimsemStep]) -> Vec<usize> {
+    let idx: std::collections::HashMap<&str, usize> = steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.stem.as_str(), i))
+        .collect();
+    let mut order = vec![];
+    let mut seen = vec![0u8; steps.len()]; // 0 unvisited, 1 in-progress, 2 done
+    fn visit(
+        i: usize,
+        steps: &[NimsemStep],
+        idx: &std::collections::HashMap<&str, usize>,
+        seen: &mut [u8],
+        order: &mut Vec<usize>,
+    ) {
+        if seen[i] != 0 {
+            return; // done, or a cycle edge (nimony's graph is acyclic; ignore back-edges defensively)
+        }
+        seen[i] = 1;
+        for d in &steps[i].deps {
+            if let Some(&j) = idx.get(d.as_str()) {
+                visit(j, steps, idx, seen, order);
+            }
+        }
+        seen[i] = 2;
+        order.push(i);
+    }
+    for i in 0..steps.len() {
+        visit(i, steps, &idx, &mut seen, &mut order);
+    }
+    order
+}
+
 fn main() {
     let mut a = std::env::args().skip(1);
     let mut next = |what: &str| a.next().unwrap_or_else(|| panic!("missing <{what}>"));
@@ -132,8 +273,7 @@ fn main() {
     let hexer_p = next("hexer.svmb");
     let libdir = next("libdir");
     let nimcache = next("nimcache-dir");
-    let sys_stem = next("sys-stem");
-    let prog_stem = next("prog-stem");
+    let main_stem = next("main-stem");
     let export = next("export");
     let expected: i64 = next("expected").parse().expect("expected is i64");
     let call_args: Vec<i64> = a.map(|s| s.parse().expect("arg is i64")).collect();
@@ -143,11 +283,34 @@ fn main() {
     let nimsem = read(&nimsem_p);
     let hexer = read(&hexer_p);
     let nc = Path::new(&nimcache);
-    let prog_pnif = read(&nc.join(format!("{prog_stem}.p.nif")).to_string_lossy());
-    let sys_pnif = read(&nc.join(format!("{sys_stem}.p.nif")).to_string_lossy());
-    let prog_nim = read(&nc.join("..").join("prog.nim").to_string_lossy());
+    let prog_pnif = read(&nc.join(format!("{main_stem}.p.nif")).to_string_lossy());
+    let proj = nc.parent().expect("nimcache has a parent dir");
 
-    // ---- shared memfs: stdlib sources (under lib/, plus a flattened std/ view) + the two `.p.nif` ---
+    // The module compilation plan — nimony's own dependency graph (`<main>.build.nif`): every `.s.nif`
+    // module, its nimsem args (`--isSystem`/`--isMain`/bare), and its dependency edges. A program that
+    // `import`s pulls in more modules (each its own nifler→nimsem→hexer unit); the plan enumerates and
+    // orders them, so this generalizes the two-module case to any dependency graph.
+    let build_nif = String::from_utf8_lossy(&read(
+        &nc.join(format!("{main_stem}.build.nif")).to_string_lossy(),
+    ))
+    .into_owned();
+    let steps = parse_nimsem_steps(&build_nif);
+    assert!(
+        steps.iter().any(|s| s.stem == main_stem),
+        "no nimsem step for the main module {main_stem} in the build plan"
+    );
+    let order = toposort(&steps);
+    eprintln!(
+        "plan: {} modules, dependency order [{}]",
+        steps.len(),
+        order
+            .iter()
+            .map(|&i| steps[i].stem.as_str())
+            .collect::<Vec<_>>()
+            .join(" → ")
+    );
+
+    // ---- shared memfs: stdlib sources (under lib/, plus a flattened std/ view) + every `.p.nif` -----
     let mut files = vec![];
     collect(Path::new(&libdir), "lib/", &mut files);
     let flat: Vec<(String, Vec<u8>)> = files
@@ -158,9 +321,24 @@ fn main() {
         })
         .collect();
     files.extend(flat);
-    files.push((format!("nimcache/{prog_stem}.p.nif"), prog_pnif.clone()));
-    files.push((format!("nimcache/{sys_stem}.p.nif"), sys_pnif));
-    files.push(("prog.nim".into(), prog_nim));
+    // Seed the parsed nif of every module the plan mentions (bootstrapped by native nifler; nifler.svmb
+    // re-parses the main below to prove the parse runs on the SVM too).
+    for step in &steps {
+        let p = nc.join(format!("{}.p.nif", step.stem));
+        if let Ok(bytes) = std::fs::read(&p) {
+            files.push((format!("nimcache/{}.p.nif", step.stem), bytes));
+        }
+    }
+    // Seed every project `.nim` source at its portable name (`prog.nim`, `helper.nim`, …) so nimsem
+    // can resolve a user `import ./helper` — it may re-parse the dependency's source (via the exec
+    // nifler) when it doesn't already hold its `.s.idx.nif`.
+    for e in std::fs::read_dir(proj).unwrap_or_else(|e| panic!("read_dir {proj:?}: {e}")) {
+        let p = e.expect("entry").path();
+        if p.extension().and_then(|x| x.to_str()) == Some("nim") {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            files.push((name, std::fs::read(&p).expect("read .nim")));
+        }
+    }
     eprintln!("seeded {} files into the shared memfs", files.len());
     let fs = Memfs::new(files);
 
@@ -209,23 +387,24 @@ fn main() {
         );
     }
 
-    // ---- phase 2: nimsem.svmb (sema), driving nifler.svmb via exec, over system then main ----------
-    let run_nimsem = |mode: &str, stem: &str| {
+    // ---- phase 2: nimsem.svmb (sema), driving nifler.svmb via exec — each module in dependency order.
+    // Every module runs with the exact args nimony's plan assigned it (`--isSystem` for the system
+    // module, `--isMain` for the program, bare for imported modules); a module is semchecked only after
+    // its dependencies, so the `.s.nif` each one reads back is already present.
+    for &i in &order {
+        let step = &steps[i];
+        let mut argv = vec![
+            "nimsem",
+            "--define:nimNativeAlloc",
+            "--define:nimNativeIo",
+            "m",
+        ];
+        argv.extend(step.args.iter().map(|s| s.as_str()));
         let run = instantiate(svm_encode::decode_module(&nimsem).expect("decode nimsem"))
             .expect("instantiate nimsem")
             .run_with_caps(
                 Backend::TreeWalk,
-                &cfg(
-                    &[
-                        "nimsem",
-                        "--define:nimNativeAlloc",
-                        "--define:nimNativeIo",
-                        "m",
-                        mode,
-                        &format!("nimcache/{stem}.p.nif"),
-                    ],
-                    vec![],
-                ),
+                &cfg(&argv, vec![]),
                 &[
                     ("fs", fs.grant()),
                     ("exec", domain_exec_with_fs(programs.clone(), fs.grant())),
@@ -234,19 +413,20 @@ fn main() {
             .expect("run nimsem");
         assert!(
             matches!(run.outcome, Outcome::Exited(0) | Outcome::Returned(_)),
-            "nimsem {mode}: {:?}",
+            "nimsem {}: {:?}",
+            step.stem,
             run.outcome
         );
         let snif = fs
-            .read(&format!("nimcache/{stem}.s.nif"))
-            .unwrap_or_else(|| panic!("nimsem wrote no {stem}.s.nif"));
+            .read(&format!("nimcache/{}.s.nif", step.stem))
+            .unwrap_or_else(|| panic!("nimsem wrote no {}.s.nif", step.stem));
         eprintln!(
-            "phase 2  nimsem.svmb {mode}: {stem} → {} B .s.nif",
+            "phase 2  nimsem.svmb [{}]: {} → {} B .s.nif",
+            step.args.first().map(String::as_str).unwrap_or("m"),
+            step.stem,
             snif.len()
         );
-    };
-    run_nimsem("--isSystem", &sys_stem);
-    run_nimsem("--isMain", &prog_stem);
+    }
 
     // ---- phase 3: hexer.svmb (lower) — each semchecked module → Leng `.x.nif` ----------------------
     let run_hexer = |stem: &str| -> Vec<u8> {
@@ -269,21 +449,28 @@ fn main() {
         eprintln!("phase 3  hexer.svmb: {stem} → {} B Leng .x.nif", xnif.len());
         xnif
     };
-    let sys_x = run_hexer(&sys_stem);
-    let prog_x = run_hexer(&prog_stem);
+    // Lower every module (dependency order); keep the produced Leng keyed by stem for linking.
+    let leng: Vec<(String, String)> = order
+        .iter()
+        .map(|&i| {
+            let stem = steps[i].stem.clone();
+            let x = run_hexer(&stem);
+            (stem, String::from_utf8_lossy(&x).into_owned())
+        })
+        .collect();
 
     // ---- phase 4 (host link + run): link the SVM-produced Leng with the W3 runtime shim, execute ---
-    let prog_src = String::from_utf8_lossy(&prog_x).into_owned();
-    let sys_src = String::from_utf8_lossy(&sys_x).into_owned();
-    // Discover the bottom-edge C imports from the (self-contained) system module and bind them to the
-    // shim; program-first ordering so func 0 is the natural entry (matches svm-leng's nim_e2e).
-    let sys_unit = svm_leng::WholeModule {
-        stem: &sys_stem,
-        src: &sys_src,
-    };
+    // The system module (stem `sysv…`) is self-contained, so it discovers the bottom-edge C imports;
+    // bind those to the shim. Order units **main first** (func 0 = the natural entry) and **system
+    // last**, with the imported modules in between — the convention `link_whole_with_runtime` builds on.
+    let sys_src = leng
+        .iter()
+        .find(|(s, _)| s.starts_with("sysv"))
+        .map(|(s, src)| svm_leng::WholeModule { stem: s, src })
+        .expect("no system module among the lowered units");
     let obj = svm_encode::decode_unit(
-        &svm_leng::compile_whole_object(&sys_unit)
-            .unwrap_or_else(|e| panic!("compile {sys_stem}: {e}")),
+        &svm_leng::compile_whole_object(&sys_src)
+            .unwrap_or_else(|e| panic!("compile system module: {e}")),
     )
     .expect("decode object");
     let exports: Vec<(String, u32)> = obj
@@ -297,16 +484,12 @@ fn main() {
         exports,
         ..Default::default()
     };
-    let units = vec![
-        svm_leng::WholeModule {
-            stem: &prog_stem,
-            src: &prog_src,
-        },
-        svm_leng::WholeModule {
-            stem: &sys_stem,
-            src: &sys_src,
-        },
-    ];
+    let mut ordered: Vec<&(String, String)> = leng.iter().collect();
+    ordered.sort_by_key(|(stem, _)| (*stem != main_stem, stem.starts_with("sysv")));
+    let units: Vec<svm_leng::WholeModule> = ordered
+        .iter()
+        .map(|(stem, src)| svm_leng::WholeModule { stem, src })
+        .collect();
     let m: Module = svm_leng::link_whole_with_runtime(&units, vec![runtime])
         .unwrap_or_else(|e| panic!("link with runtime: {e}"));
     svm_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));

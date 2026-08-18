@@ -23,13 +23,20 @@ This retires the last gap in the workstream: the individual phases were each pro
 1–2b), and `nim_backend_chain` drove hexer→svm-leng but stopped at "the IR parses." Here the chain runs
 front-to-back and the output *runs*.
 
-## Scope
+## Multi-module (imports)
 
-The fixtures are **import-free compute programs** (`proc … ; let r = …`), so the compilation is exactly
-two modules — the program + `system` — and the result is read back by calling an exported proc (no
-stdout needed). A program with `import`s pulls in more modules, each its own nifler→nimsem→hexer unit;
-driving that many-module graph is nifmake's dependency orchestration, a separate follow-up. The
-`system`-only two-module chain is the honest "the compiler runs on the SVM" milestone.
+The driver reads nimony's own dependency-ordered build plan (`<main>.build.nif`), so it handles **any
+number of modules**. A program with an `import` pulls in more compilation units, each its own
+nifler→nimsem→hexer unit; the plan enumerates them and gives the dependency edges (in stem space — no
+path→stem resolution needed), and the driver topologically orders them, runs `nimsem` on each with the
+exact args nimony assigned (`--isSystem` / `--isMain` / bare), lowers each with `hexer`, and links the
+whole `.x.nif` set. The `usermod` fixture (`import ./helper`) is a three-unit build (system + helper +
+main) that compiles and runs on the SVM.
+
+The fixtures are **compute programs** (`proc … ; let r = …`), and the result is read back by calling an
+exported proc (no stdout needed — real `echo`/`write` output through the powerbox is #957). Programs
+that pull in *stdlib* modules additionally depend on that module translating through `svm-leng` (the
+breadth long-pole, #760 / conformance suite #956).
 
 `nimsem` is built with **`-d:skipPostSemValidator`** (as nimony's own Windows CI does); the in-process
 post-sem IR validator has a separate on-ramp issue, tracked apart from the sema this proves correct.
@@ -48,8 +55,9 @@ stems nifmake computes), re-runs **sema + lowering on the SVM** from there, link
 
 ## Status
 
-✅ **The nimony compiler runs on the SVM, and its output runs too.** With `nifler` (slice 1), the big
-phases `nimsem`/`hexer` (slice 2/2b), `svm-leng` (W5), and now this end-to-end chain, a real Nim program
-is compiled entirely by sandboxed guests and the result executes to the correct value on both engines.
-Remaining: multi-module (`import`-bearing) programs need nifmake's dependency orchestration; the
-post-sem validator has its own on-ramp follow-up.
+✅ **The nimony compiler runs on the SVM, and its output runs too — single- and multi-module.** With
+`nifler` (slice 1), the big phases `nimsem`/`hexer` (slice 2/2b), `svm-leng` (W5), and this end-to-end
+chain — now dependency-ordered over any number of modules (#955) — a real Nim program is compiled
+entirely by sandboxed guests and the result executes to the correct value on both engines. Remaining
+toward "any Nim in the playground" (#954): real I/O output (#957), stdlib breadth (#760/#956), and the
+in-browser card (#958); the post-sem validator has its own on-ramp follow-up (#959).

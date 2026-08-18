@@ -62,26 +62,32 @@ build_svmb "$REPO/nimony/src/nimony/nimsem.nim"  "$OUT/nimsem.svmb" -d:skipPostS
 build_svmb "$REPO/nimony/src/hexer/hexer.nim"    "$OUT/hexer.svmb"
 
 echo "=== [2/2] compile each Nim fixture through the guests → link → run, check the result ==="
-# Each fixture: a Nim program, the exported proc to call, the expected result, and its call args.
-run_fixture() { # <name> <nim-source> <export> <expected> [args...]
-  local name="$1" src="$2" export="$3" expected="$4"; shift 4
-  local w="$CACHE/proj_$name"; rm -rf "$w"; mkdir -p "$w"
-  printf '%s' "$src" > "$w/prog.nim"
-  ( cd "$w" && "$NIMONY" c --isMain prog.nim >/dev/null 2>&1 )   # native bootstrap: parse layout + stems
-  local sys prog
-  sys="$(ls "$w"/nimcache/sysv*.s.nif | head -1 | xargs -n1 basename | sed 's/\.s\.nif//')"
-  prog="$(ls "$w"/nimcache/*.s.nif | xargs -n1 basename | sed 's/\.s\.nif//' | grep -v '^sys' | head -1)"
-  rm -f "$w"/nimcache/*.s.nif "$w"/nimcache/*.x.nif; rm -rf "$w/nimcache/$prog"  # re-produce on the SVM
-  echo "--- $name: $export(...) == $expected (sys=$sys prog=$prog) ---"
+# Each fixture is a directory of `.nim` sources (`$w/prog.nim` is the main); the driver reads nimony's
+# own `<main>.build.nif` plan, so it handles any number of modules. `run_fixture <name> <export>
+# <expected> [args...]` runs after the fixture's sources are written to `$w`.
+run_fixture() { # <name> <export> <expected> [args...]  (sources already written to $CACHE/proj_<name>)
+  local name="$1" export="$2" expected="$3"; shift 3
+  local w="$CACHE/proj_$name"
+  ( cd "$w" && "$NIMONY" c --isMain prog.nim >/dev/null 2>&1 )   # native bootstrap: parse layout + plan
+  local main
+  main="$(ls "$w"/nimcache/*.build.nif | grep -v '\.final\.' | head -1 | xargs -n1 basename | sed 's/\.build\.nif//')"
+  # Strip the sema/lowering products so the driver re-produces them on the SVM (keep .p.nif + .build.nif).
+  rm -f "$w"/nimcache/*.s.nif "$w"/nimcache/*.x.nif "$w"/nimcache/*.s.idx.nif
+  find "$w/nimcache" -mindepth 1 -type d -exec rm -rf {} + 2>/dev/null || true
+  echo "--- $name: $export(...) == $expected (main=$main) ---"
   cargo run -q --release -p svm-run --example nim_e2e_chain -- \
     "$OUT/nifler.svmb" "$OUT/nimsem.svmb" "$OUT/hexer.svmb" \
-    "$BIN/../lib" "$w/nimcache" "$sys" "$prog" "$export" "$expected" "$@"
+    "$BIN/../lib" "$w/nimcache" "$main" "$export" "$expected" "$@"
 }
+write_main() { rm -rf "$CACHE/proj_$1"; mkdir -p "$CACHE/proj_$1"; printf '%s' "$2" > "$CACHE/proj_$1/prog.nim"; }
 
-run_fixture addtwo 'proc addTwo(a, b: int): int = a + b
+# Single-module compute programs (program + `system`).
+write_main addtwo 'proc addTwo(a, b: int): int = a + b
 let r = addTwo(2, 3)
-' addTwo 5 2 3
-run_fixture sumto 'proc sumTo(n: int): int =
+'
+run_fixture addtwo addTwo 5 2 3
+
+write_main sumto 'proc sumTo(n: int): int =
   result = 0
   var i = 1
   while i <= n:
@@ -89,6 +95,16 @@ run_fixture sumto 'proc sumTo(n: int): int =
     i = i + 1
 
 let r = sumTo(5)
-' sumTo 15 5
+'
+run_fixture sumto sumTo 15 5
 
-echo "ALL FIXTURES RAN — the full nimony compiler runs on the SVM, and its compiled output runs too"
+# Multi-module: a user `import ./helper` — three units (system + helper + main), dependency-ordered by
+# nimony's build plan, each compiled through the guests on the SVM and linked together.
+write_main usermod 'import ./helper
+proc useit(n: int): int = triple(n) + 1
+let r = useit(4)
+'
+printf 'proc triple*(x: int): int = x * 3\n' > "$CACHE/proj_usermod/helper.nim"
+run_fixture usermod useit 13 4
+
+echo "ALL FIXTURES RAN — the full nimony compiler runs on the SVM (single- and multi-module), and its compiled output runs too"
