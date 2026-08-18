@@ -9186,1375 +9186,1692 @@ fn drive(
     host: &mut Host,
     budget: u64,
 ) -> Result<Vec<Value>, Trap> {
-    // Fuel unification (safepoint-anchored): charge one fuel for *entering the top-level entry
-    // function*, mirroring the per-callee-entry charge at `Op::Call`/`CallIndirect`/`TailCall*` and
-    // the JIT's entry-prologue charge, so the tree-walker, bytecode, and JIT engines burn identically.
-    // Gated exactly as the tree-walker's `drive` (`super::drive_arc`): a durable **thaw** re-enters to
-    // continue an already-charged run (the root re-enters under `REWINDING`), so it must not re-charge.
-    let is_thaw = host.is_durable()
-        && mem
-            .as_ref()
-            .is_some_and(|m| m.durable_thaw_state(0) == super::STATE_REWINDING);
-    if !is_thaw {
-        *fuel = fuel.checked_sub(1).ok_or(Trap::OutOfFuel)?;
+    // The native driver never enables tier-up (no eligibility bitmap), so `pump` runs the whole
+    // schedule and returns `Done`; a `TierUp` yield is impossible here.
+    let mut sched = CoopSched::new(&dom, entry, args, fuel, mem, host, None)?;
+    match sched.pump(&dom, mem, host, fuel, budget)? {
+        CoopStep::Done(vals) => Ok(vals),
+        CoopStep::TierUp { .. } => unreachable!("tier-up not enabled on the native driver"),
     }
-    let mut tasks: Vec<TaskSlot> = vec![TaskSlot {
-        vt: VTask::new(&dom.source.primary(), entry as usize, args)?,
-        threads: Vec::new(),
-        env: None,
-        state: TaskState::Runnable,
-    }];
-    // §14 `instantiate` children's confined environments (handle = `env` index). The root and its
-    // `thread.spawn` siblings use the shared `mem`/`host`/`dom.table` instead (`env == None`).
-    let mut extra_envs: Vec<ChildEnv> = Vec::new();
-    // The §12 fiber registry is **run-shared** (one handle namespace per domain) so a fiber created
-    // or suspended on one vCPU can be resumed on another (D57 migration).
-    let mut fibers: Vec<FiberState> = Vec::new();
-    // DURABILITY.md §12.8: each fiber's saved durable shadow-SP (run-shared, parallel to `fibers`;
-    // slot `s` is shadow context `s + 1`). Inert on a non-durable run.
-    let mut fiber_sp: Vec<u64> = Vec::new();
-    // Freeze residue (DURABILITY.md §12.8): each fiber's `(resolved entry func index, data-stack base)`
-    // — what a [`super::FrozenFiber`] needs after the fiber parks (when its `Pending` `funcref`/`sp` are
-    // gone). Parallel to `fibers`. Inert on a non-durable run.
-    let mut fiber_meta: Vec<(i32, i64)> = Vec::new();
-    // Thaw seeding (DURABILITY.md §12.8 slice 3.1.5): a `REWINDING` run re-creates the fibers a freeze
-    // flattened *before* the root re-enters, so the root's re-issued `cont.resume` names the same dense
-    // handles (0, 1, …) and each fiber's saved shadow-SP is back in `fiber_sp` for the swap to re-point
-    // to. Taken (cleared) from the host; empty for a freeze or ordinary run.
-    {
-        let mut seed = std::mem::take(&mut host.frozen_fibers);
-        seed.sort_by_key(|f| f.slot);
-        for (expected, ff) in seed.into_iter().enumerate() {
-            debug_assert_eq!(
-                expected,
-                fibers.len(),
-                "frozen fibers re-seed densely from slot 0"
-            );
-            debug_assert_eq!(
-                ff.slot,
-                fibers.len(),
-                "re-seeded slot matches the recorded handle"
-            );
-            fibers.push(FiberState::Pending {
-                funcref: ff.func,
-                sp: ff.sp,
-            });
-            fiber_sp.push(ff.shadow_sp);
-            fiber_meta.push((ff.func, ff.sp));
-        }
-    }
-    let mut clock: u64 = 0;
-    // §12 "Domain lifetime & teardown" (owner 2026-07-24): child envs already torn down by a
-    // member's trap/exit — a later live call through one completes with an errno instead of
-    // parking forever (D37 death-is-revocation; the tree-walker's dead-callee park probe).
-    let mut dead_envs: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-    // FORK.md §9.2 — fork twins minted this run (task index = the pid a `clone_caller` returned). The
-    // servicer-side `reap` (`wait`) acts only on ids in this allow-set (a foreign/bogus pid is
-    // `-ECHILD`, never a park that hangs); an id is retired when reaped.
-    let mut forked_twins: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+}
 
-    loop {
-        // Domain lifetime & teardown (DESIGN.md §12 / ISSUES.md I37, owner 2026-07-24): a
-        // member's trap/exit is terminal for its whole DOMAIN — run the teardown fixpoint
-        // before reading the root's state, so a sibling's trap that killed the root domain
-        // surfaces as the run's result (previously the root's timed wait simply outlived it).
-        teardown_domains(&mut tasks, &extra_envs, &mut dead_envs);
-        // The root's result is the run's result (other vCPUs' effects are already reflected in it).
-        if let TaskState::Done(res) = &tasks[0].state {
-            let res = res.clone();
-            // Freeze driver (DURABILITY.md §12.8 slice 3.1.4): a durable run left in `UNWINDING` has
-            // drained the root's native stack into context 0's region; now flatten the still-parked
-            // fibers into theirs, while the registry is alive, before the window is snapshotted. A drive
-            // trap (out-of-scope fiber) surfaces as the run's result. `cont.*` durability is single-vCPU
-            // (the entry guard refuses `thread.*`), so only the root task owns fibers.
-            if res.is_ok()
-                && host.is_durable()
-                && mem.as_ref().map(|m| m.durable_state()) == Some(super::STATE_UNWINDING)
-            {
-                let mut ctx = RunCtx {
-                    table: &dom.table,
-                    fuel: &mut *fuel,
-                    mem: &mut *mem,
-                    durable: true,
-                    host: HostCell::Excl(&mut *host),
-                };
-                host.frozen_fibers = freeze_drive(
-                    &mut fibers,
-                    &mut fiber_sp,
-                    &mut fiber_meta,
-                    &dom,
-                    &mut ctx,
-                    budget,
-                )?;
-            }
-            return res;
+/// A pause point of [`CoopSched::pump`]: either the run finished (`Done`) or a module-0 task hit an
+/// eligible direct `Call` and the emitted region must run on the host (`TierUp`) before the paused
+/// task is resumed via [`CoopSched::deliver_tierup`]. `pump` returns `Err(trap)` for a run-fatal trap
+/// (the root task trapped, or a driver operation failed) — mirroring the `Result` `drive` returns.
+enum CoopStep {
+    /// The root task returned; these are the run's results.
+    Done(Vec<Value>),
+    /// A task paused on an eligible module-0 `Call` to `func` with raw i64 arg slots `argv`; `mapped`
+    /// is the window's committed scalar extent for the emitted `"mapped"` global (#717 host sync).
+    TierUp {
+        func: u32,
+        argv: Box<[i64]>,
+        mapped: u64,
+    },
+}
+
+/// The cooperative multiplex scheduler's run-shared state, extracted from `drive` so that a future
+/// resumable-across-FFI tier-up driver (#926 slice 2) can own it between host round-trips. `drive`
+/// builds one with [`new`](CoopSched::new) and runs it to completion with [`pump`](CoopSched::pump);
+/// the fields are exactly the run-shared locals `drive` used to hold — the task set, the run-shared
+/// §12 fiber registry (+ its durable parallel arrays), the §14 confined child environments, the
+/// fork/teardown bookkeeping, and the logical clock.
+struct CoopSched {
+    /// The live vCPUs: the root task (index 0) and its `thread.spawn`/`instantiate` descendants.
+    tasks: Vec<TaskSlot>,
+    /// §14 `instantiate` children's confined environments (handle = `env` index). The root and its
+    /// `thread.spawn` siblings share `mem`/`host`/`dom.table` instead (`env == None`).
+    extra_envs: Vec<ChildEnv>,
+    /// The §12 fiber registry is **run-shared** (one handle namespace per domain) so a fiber created
+    /// or suspended on one vCPU can be resumed on another (D57 migration).
+    fibers: Vec<FiberState>,
+    /// DURABILITY.md §12.8: each fiber's saved durable shadow-SP (run-shared, parallel to `fibers`;
+    /// slot `s` is shadow context `s + 1`). Inert on a non-durable run.
+    fiber_sp: Vec<u64>,
+    /// Freeze residue (DURABILITY.md §12.8): each fiber's `(resolved entry func index, data-stack
+    /// base)` — what a [`super::FrozenFiber`] needs after the fiber parks. Parallel to `fibers`.
+    fiber_meta: Vec<(i32, i64)>,
+    /// §12 teardown: child envs already torn down by a member's trap/exit (D37 death-is-revocation).
+    dead_envs: std::collections::BTreeSet<usize>,
+    /// FORK.md §9.2 — fork twins minted this run (task index = the pid a `clone_caller` returned).
+    forked_twins: std::collections::BTreeSet<usize>,
+    /// The scheduler's logical clock (advanced only when no task is runnable, to the earliest due
+    /// `wait` deadline).
+    clock: u64,
+    /// #926 slice 2: wasm-JIT tier-up eligibility for this run's **module-0** tasks (the root and its
+    /// same-module `thread.spawn` descendants). `None` ⇒ everything interprets, exactly the native
+    /// `drive` (which never sets it). When set, each qualifying task's `Vm` carries it, so a direct
+    /// module-0 `Call` to an eligible function surfaces as [`CoopStep::TierUp`] instead of interpreting
+    /// the callee — the host runs the emitted `f{func}` and delivers the results back.
+    eligible: Option<std::sync::Arc<[bool]>>,
+    /// #750 paged tier-up: the eligible set is page-checked (the emitted region carries a per-access
+    /// page check), so an unrepresentable window surfaces with the reserved size instead of declining.
+    page_checked: bool,
+    /// The task currently paused on a surfaced tier-up, awaiting [`deliver_tierup`](Self::deliver_tierup):
+    /// `(task index, caller-frame-relative dst slot, result types)`. At most one is ever outstanding —
+    /// the driver services one tier-up round-trip before pumping again — so a single slot suffices.
+    /// `None` between round-trips (and always, on the native driver).
+    pending_tierup: Option<(usize, usize, Box<[ValType]>)>,
+}
+
+impl CoopSched {
+    /// Build the initial scheduler state: the root task at `entry`, plus any fibers a durable freeze
+    /// left to re-seed (taken from `host.frozen_fibers`). This is `drive`'s former preamble verbatim
+    /// — including the once-per-run entry-fuel charge — so its behaviour is unchanged. `eligible` /
+    /// `page_checked` are the run's #926-slice-2 tier-up config: `None`/`false` (the native `drive`)
+    /// leaves everything interpreting; a `Some` bitmap makes the root's — and its same-module
+    /// `thread.spawn` descendants' — module-0 direct calls to eligible functions surface as tier-ups.
+    fn new(
+        dom: &Domain,
+        entry: FuncIdx,
+        args: &[Value],
+        fuel: &mut u64,
+        mem: &mut Option<Mem>,
+        host: &mut Host,
+        tierup: Option<TierUpConfig>,
+    ) -> Result<CoopSched, Trap> {
+        // `page_checked` is meaningful only with a bitmap, so it rides in the same `Option`.
+        let (eligible, page_checked) =
+            tierup.map_or((None, false), |t| (Some(t.eligible), t.page_checked));
+        // Fuel unification (safepoint-anchored): charge one fuel for *entering the top-level entry
+        // function*, mirroring the per-callee-entry charge at `Op::Call`/`CallIndirect`/`TailCall*` and
+        // the JIT's entry-prologue charge, so the tree-walker, bytecode, and JIT engines burn identically.
+        // Gated exactly as the tree-walker's `drive` (`super::drive_arc`): a durable **thaw** re-enters to
+        // continue an already-charged run (the root re-enters under `REWINDING`), so it must not re-charge.
+        let is_thaw = host.is_durable()
+            && mem
+                .as_ref()
+                .is_some_and(|m| m.durable_thaw_state(0) == super::STATE_REWINDING);
+        if !is_thaw {
+            *fuel = fuel.checked_sub(1).ok_or(Trap::OutOfFuel)?;
         }
-        // §3.6 (I36 slice 2) — settle wakes: a task parked on a live-call ticket wakes when the
-        // callee's serve loop completed its dispatch; claiming the completion cell delivers the
-        // reply (the tree-walker's cap_reply preference — a parked caller beats the cell).
-        for t in &mut tasks {
-            let hit = match &t.state {
-                TaskState::BlockedTicket {
-                    ticket,
-                    callee,
-                    dst,
-                } => callee
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .svc_results
-                    .remove(ticket)
-                    .map(|v| (v, *dst)),
-                _ => None,
-            };
-            if let Some((v, dst)) = hit {
-                t.vt.active.set(dst, Reg::from_i64(v));
-                t.state = TaskState::Runnable;
+        let mut tasks: Vec<TaskSlot> = vec![TaskSlot {
+            vt: VTask::new(&dom.source.primary(), entry as usize, args)?,
+            threads: Vec::new(),
+            env: None,
+            state: TaskState::Runnable,
+        }];
+        // #926 slice 2: arm the root task's `Vm` for tier-up. The entry runs in module 0, so a direct
+        // call to an eligible function surfaces (`Vm::resume`'s `module == 0 && jit_eligible[callee]`
+        // gate). `thread.spawn` children inherit the bitmap in `pump`'s `Spawn` arm (same-module only).
+        if let Some(e) = &eligible {
+            tasks[0].vt.active.jit_eligible = Some(std::sync::Arc::clone(e));
+            tasks[0].vt.active.jit_page_checked = page_checked;
+        }
+        // §14 `instantiate` children's confined environments (handle = `env` index). The root and its
+        // `thread.spawn` siblings use the shared `mem`/`host`/`dom.table` instead (`env == None`).
+        let extra_envs: Vec<ChildEnv> = Vec::new();
+        // The §12 fiber registry is **run-shared** (one handle namespace per domain) so a fiber created
+        // or suspended on one vCPU can be resumed on another (D57 migration).
+        let mut fibers: Vec<FiberState> = Vec::new();
+        // DURABILITY.md §12.8: each fiber's saved durable shadow-SP (run-shared, parallel to `fibers`;
+        // slot `s` is shadow context `s + 1`). Inert on a non-durable run.
+        let mut fiber_sp: Vec<u64> = Vec::new();
+        // Freeze residue (DURABILITY.md §12.8): each fiber's `(resolved entry func index, data-stack base)`
+        // — what a [`super::FrozenFiber`] needs after the fiber parks (when its `Pending` `funcref`/`sp` are
+        // gone). Parallel to `fibers`. Inert on a non-durable run.
+        let mut fiber_meta: Vec<(i32, i64)> = Vec::new();
+        // Thaw seeding (DURABILITY.md §12.8 slice 3.1.5): a `REWINDING` run re-creates the fibers a freeze
+        // flattened *before* the root re-enters, so the root's re-issued `cont.resume` names the same dense
+        // handles (0, 1, …) and each fiber's saved shadow-SP is back in `fiber_sp` for the swap to re-point
+        // to. Taken (cleared) from the host; empty for a freeze or ordinary run.
+        {
+            let mut seed = std::mem::take(&mut host.frozen_fibers);
+            seed.sort_by_key(|f| f.slot);
+            for (expected, ff) in seed.into_iter().enumerate() {
+                debug_assert_eq!(
+                    expected,
+                    fibers.len(),
+                    "frozen fibers re-seed densely from slot 0"
+                );
+                debug_assert_eq!(
+                    ff.slot,
+                    fibers.len(),
+                    "re-seeded slot matches the recorded handle"
+                );
+                fibers.push(FiberState::Pending {
+                    funcref: ff.func,
+                    sp: ff.sp,
+                });
+                fiber_sp.push(ff.shadow_sp);
+                fiber_meta.push((ff.func, ff.sp));
             }
         }
-        // FORK.md §9.2 — reap wakes: a caller parked in `wait(pid)` wakes when fork twin `pid`
-        // finishes, with the twin's exit status ([`super::reap_status`]; a trapped twin reaps as a
-        // crash status, never a propagated trap — reap ≠ join). Two-phase (read the twin's outcome,
-        // then deliver) so the caller and the twin task are not borrowed at once.
-        let reap_wakes: Vec<(usize, u32, i64, usize)> = tasks
-            .iter()
-            .enumerate()
-            .filter_map(|(ci, t)| match &t.state {
-                TaskState::BlockedReap { pid, dst } => match &tasks[*pid].state {
-                    TaskState::Done(res) => Some((ci, *dst, super::reap_status(res), *pid)),
+        let clock: u64 = 0;
+        // §12 "Domain lifetime & teardown" (owner 2026-07-24): child envs already torn down by a
+        // member's trap/exit — a later live call through one completes with an errno instead of
+        // parking forever (D37 death-is-revocation; the tree-walker's dead-callee park probe).
+        let dead_envs: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        // FORK.md §9.2 — fork twins minted this run (task index = the pid a `clone_caller` returned). The
+        // servicer-side `reap` (`wait`) acts only on ids in this allow-set (a foreign/bogus pid is
+        // `-ECHILD`, never a park that hangs); an id is retired when reaped.
+        let forked_twins: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+
+        Ok(CoopSched {
+            tasks,
+            extra_envs,
+            fibers,
+            fiber_sp,
+            fiber_meta,
+            dead_envs,
+            forked_twins,
+            clock,
+            eligible,
+            page_checked,
+            pending_tierup: None,
+        })
+    }
+
+    /// Run the scheduler until it must pause — either the run finished ([`CoopStep::Done`]) or a task
+    /// hit an eligible module-0 call and its emitted region must run on the host ([`CoopStep::TierUp`],
+    /// resumed via [`deliver_tierup`](Self::deliver_tierup)). On the native `drive` (no eligibility),
+    /// tier-up never fires, so this runs the whole schedule and returns `Done` — behaviourally the
+    /// inline loop `drive` used to run. Each iteration services one runnable vCPU via `step_vcpu` and
+    /// settles wakes/teardown; a run-fatal trap is `Err(trap)`.
+    fn pump(
+        &mut self,
+        dom: &Domain,
+        mem: &mut Option<Mem>,
+        host: &mut Host,
+        fuel: &mut u64,
+        budget: u64,
+    ) -> Result<CoopStep, Trap> {
+        let CoopSched {
+            tasks,
+            extra_envs,
+            fibers,
+            fiber_sp,
+            fiber_meta,
+            dead_envs,
+            forked_twins,
+            clock,
+            eligible,
+            page_checked,
+            pending_tierup,
+        } = self;
+        loop {
+            // Domain lifetime & teardown (DESIGN.md §12 / ISSUES.md I37, owner 2026-07-24): a
+            // member's trap/exit is terminal for its whole DOMAIN — run the teardown fixpoint
+            // before reading the root's state, so a sibling's trap that killed the root domain
+            // surfaces as the run's result (previously the root's timed wait simply outlived it).
+            teardown_domains(tasks, extra_envs, dead_envs);
+            // The root's result is the run's result (other vCPUs' effects are already reflected in it).
+            if let TaskState::Done(res) = &tasks[0].state {
+                let res = res.clone();
+                // Freeze driver (DURABILITY.md §12.8 slice 3.1.4): a durable run left in `UNWINDING` has
+                // drained the root's native stack into context 0's region; now flatten the still-parked
+                // fibers into theirs, while the registry is alive, before the window is snapshotted. A drive
+                // trap (out-of-scope fiber) surfaces as the run's result. `cont.*` durability is single-vCPU
+                // (the entry guard refuses `thread.*`), so only the root task owns fibers.
+                if res.is_ok()
+                    && host.is_durable()
+                    && mem.as_ref().map(|m| m.durable_state()) == Some(super::STATE_UNWINDING)
+                {
+                    let mut ctx = RunCtx {
+                        table: &dom.table,
+                        fuel: &mut *fuel,
+                        mem: &mut *mem,
+                        durable: true,
+                        host: HostCell::Excl(&mut *host),
+                    };
+                    host.frozen_fibers =
+                        freeze_drive(fibers, fiber_sp, fiber_meta, dom, &mut ctx, budget)?;
+                }
+                // `res` is the root's `Result<Vec<Value>, Trap>`: `Ok(vals)` → `Done(vals)`; a root
+                // trap stays `Err(trap)` (the run's fatal trap), exactly as `drive` returned it.
+                return res.map(CoopStep::Done);
+            }
+            // §3.6 (I36 slice 2) — settle wakes: a task parked on a live-call ticket wakes when the
+            // callee's serve loop completed its dispatch; claiming the completion cell delivers the
+            // reply (the tree-walker's cap_reply preference — a parked caller beats the cell).
+            for t in tasks.iter_mut() {
+                let hit = match &t.state {
+                    TaskState::BlockedTicket {
+                        ticket,
+                        callee,
+                        dst,
+                    } => callee
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .svc_results
+                        .remove(ticket)
+                        .map(|v| (v, *dst)),
                     _ => None,
-                },
-                _ => None,
-            })
-            .collect();
-        for (ci, dst, status, pid) in reap_wakes {
-            tasks[ci].vt.active.set(dst, Reg::from_i64(status));
-            tasks[ci].state = TaskState::Runnable;
-            forked_twins.remove(&pid);
-        }
-        // I48 — wake blocking-resume idlers: a `TaskState::BlockedOnFiber { fiber }` becomes
-        // runnable once its fiber is woken (the idle-timer's `WAIT_TIMED_OUT`, a `notify`'s
-        // `WAIT_WOKEN`, or the cap-completion drain). Its cursor was rewound to the resume op, so
-        // the next step re-executes it and claims the now-woken fiber. Centralized here so every
-        // wake source feeds it uniformly (no per-site wiring). Runs before the pick so a fiber
-        // woken during the previous step is seen this iteration.
-        for t in &mut tasks {
-            if let TaskState::BlockedOnFiber { fiber } = t.state {
-                if matches!(
-                    fibers.get(fiber),
-                    Some(FiberState::WaitParked { woken: Some(_), .. })
-                        | Some(FiberState::CapParked { woken: Some(_), .. })
-                ) {
+                };
+                if let Some((v, dst)) = hit {
+                    t.vt.active.set(dst, Reg::from_i64(v));
                     t.state = TaskState::Runnable;
                 }
             }
-        }
-        let Some(ti) = tasks
-            .iter()
-            .position(|t| matches!(t.state, TaskState::Runnable))
-        else {
-            // F2 (FIBER_PARK.md) — no runnable task with punt completions outstanding: that is
-            // pending work on the offload pool, never a deadlock and never a reason to jump the
-            // logical clock. Block on the store for the smallest outstanding id (submission
-            // order), deliver through the ordered drain, and loop — the woken fibers'
-            // resumers observe the wake at their next poll (or their own timers fire below on
-            // a later pass).
-            let min_cap = fibers
+            // FORK.md §9.2 — reap wakes: a caller parked in `wait(pid)` wakes when fork twin `pid`
+            // finishes, with the twin's exit status ([`super::reap_status`]; a trapped twin reaps as a
+            // crash status, never a propagated trap — reap ≠ join). Two-phase (read the twin's outcome,
+            // then deliver) so the caller and the twin task are not borrowed at once.
+            let reap_wakes: Vec<(usize, u32, i64, usize)> = tasks
                 .iter()
-                .filter_map(|f| match f {
-                    FiberState::CapParked {
-                        id, woken: None, ..
-                    } => Some(*id),
+                .enumerate()
+                .filter_map(|(ci, t)| match &t.state {
+                    TaskState::BlockedReap { pid, dst } => match &tasks[*pid].state {
+                        TaskState::Done(res) => Some((ci, *dst, super::reap_status(res), *pid)),
+                        _ => None,
+                    },
                     _ => None,
                 })
-                .min();
-            if let Some(id) = min_cap {
-                let comps = host.completions();
-                let r = comps.wait(id);
-                for f in fibers.iter_mut() {
-                    if let FiberState::CapParked {
-                        id: fid,
-                        woken: w @ None,
-                        ..
-                    } = f
-                    {
-                        if *fid == id {
-                            *w = Some(r);
-                        }
+                .collect();
+            for (ci, dst, status, pid) in reap_wakes {
+                tasks[ci].vt.active.set(dst, Reg::from_i64(status));
+                tasks[ci].state = TaskState::Runnable;
+                forked_twins.remove(&pid);
+            }
+            // I48 — wake blocking-resume idlers: a `TaskState::BlockedOnFiber { fiber }` becomes
+            // runnable once its fiber is woken (the idle-timer's `WAIT_TIMED_OUT`, a `notify`'s
+            // `WAIT_WOKEN`, or the cap-completion drain). Its cursor was rewound to the resume op, so
+            // the next step re-executes it and claims the now-woken fiber. Centralized here so every
+            // wake source feeds it uniformly (no per-site wiring). Runs before the pick so a fiber
+            // woken during the previous step is seen this iteration.
+            for t in tasks.iter_mut() {
+                if let TaskState::BlockedOnFiber { fiber } = t.state {
+                    if matches!(
+                        fibers.get(fiber),
+                        Some(FiberState::WaitParked { woken: Some(_), .. })
+                            | Some(FiberState::CapParked { woken: Some(_), .. })
+                    ) {
+                        t.state = TaskState::Runnable;
                     }
                 }
-                drain_cap_parked(&mut fibers, &comps);
-                continue;
             }
-            // No runnable task: fire the earliest `wait` timeout — whole-vCPU waiters and
-            // event-parked fiber waiters alike (§3.6 slice 5a) — else it is a deadlock.
-            let next = tasks
+            let Some(ti) = tasks
                 .iter()
-                .filter_map(|t| match t.state {
-                    TaskState::BlockedWait { deadline, .. } => Some(deadline),
-                    _ => None,
-                })
-                .chain(fibers.iter().filter_map(|f| match f {
-                    FiberState::WaitParked {
-                        deadline,
-                        woken: None,
-                        ..
-                    } => Some(*deadline),
-                    _ => None,
-                }))
-                .min();
-            match next {
-                Some(d) => {
-                    clock = clock.max(d);
-                    for t in &mut tasks {
-                        if let TaskState::BlockedWait { deadline, dst, .. } = t.state {
-                            if deadline <= clock {
-                                t.vt.active.set(dst, Reg::from_i32(super::WAIT_TIMED_OUT));
-                                t.state = TaskState::Runnable;
-                            }
-                        }
-                    }
-                    // §3.6 slice 5a: a due fiber wait completes with `WAIT_TIMED_OUT` — the
-                    // fiber becomes claimable (leaving the pending set, so this loop makes
-                    // progress); its resumer's next `cont.resume` delivers the status.
+                .position(|t| matches!(t.state, TaskState::Runnable))
+            else {
+                // F2 (FIBER_PARK.md) — no runnable task with punt completions outstanding: that is
+                // pending work on the offload pool, never a deadlock and never a reason to jump the
+                // logical clock. Block on the store for the smallest outstanding id (submission
+                // order), deliver through the ordered drain, and loop — the woken fibers'
+                // resumers observe the wake at their next poll (or their own timers fire below on
+                // a later pass).
+                let min_cap = fibers
+                    .iter()
+                    .filter_map(|f| match f {
+                        FiberState::CapParked {
+                            id, woken: None, ..
+                        } => Some(*id),
+                        _ => None,
+                    })
+                    .min();
+                if let Some(id) = min_cap {
+                    let comps = host.completions();
+                    let r = comps.wait(id);
                     for f in fibers.iter_mut() {
-                        if let FiberState::WaitParked {
-                            deadline,
+                        if let FiberState::CapParked {
+                            id: fid,
                             woken: w @ None,
                             ..
                         } = f
                         {
-                            if *deadline <= clock {
-                                *w = Some(super::WAIT_TIMED_OUT);
+                            if *fid == id {
+                                *w = Some(r);
                             }
                         }
                     }
-                }
-                None => return Err(Trap::ThreadFault), // deadlock (no runnable, no waiters)
-            }
-            continue;
-        };
-
-        // Select this vCPU's environment: the shared one (root + thread siblings), or its own
-        // confined `instantiate` env. `tasks[ti].vt` and the chosen env borrow disjoint storage
-        // (`tasks` vs `extra_envs` / the `mem`/`host`/`fuel` params), so the split borrow is sound.
-        let mut ctx = match tasks[ti].env {
-            None => RunCtx {
-                table: &dom.table,
-                fuel: &mut *fuel,
-                mem: &mut *mem,
-                durable: host.is_durable(),
-                host: HostCell::Excl(&mut *host),
-            },
-            Some(k) => {
-                let e = &mut extra_envs[k];
-                let durable = e
-                    .host
-                    .lock()
-                    .unwrap_or_else(|er| er.into_inner())
-                    .is_durable();
-                RunCtx {
-                    table: &e.table,
-                    fuel: &mut e.fuel,
-                    mem: &mut e.mem,
-                    durable,
-                    host: HostCell::Shared(&e.host),
-                }
-            }
-        };
-        let stop = step_vcpu(
-            &mut tasks[ti].vt,
-            &mut fibers,
-            &mut fiber_sp,
-            &mut fiber_meta,
-            &dom,
-            &mut ctx,
-            budget,
-            true, // the cooperative scheduler: idle blocking `cont.resume.block` (I48)
-        );
-        match stop {
-            Err(trap) => complete(&mut tasks, ti, Err(trap)),
-            Ok(VcpuStop::Done(vals)) => complete(&mut tasks, ti, Ok(vals)),
-            // wasm-JIT tier-up is only enabled on the browser `Vcpu::run` path (`with_jit_eligible`);
-            // the native drivers never set the eligibility bitmap, so it cannot occur here.
-            Ok(VcpuStop::TierUp { .. }) => unreachable!("tier-up not enabled on the native driver"),
-            // Blocking stdin is only ever set on an owned-host `Vcpu` (the interactive session), never
-            // a scheduler task — same rationale as tier-up above.
-            Ok(VcpuStop::StdinPark) => {
-                unreachable!("blocking stdin not enabled on the scheduler driver")
-            }
-            // I48 — a blocking `cont.resume.block` of a still-parked fiber: idle this task on the
-            // fiber (`step_vcpu` already rewound the resumer's cursor to the resume op). The
-            // top-of-loop scan re-marks it `Runnable` once the fiber wakes.
-            Ok(VcpuStop::BlockOnFiber { fiber }) => {
-                tasks[ti].state = TaskState::BlockedOnFiber { fiber };
-            }
-            // §3.6 (I36 slice 2) — the serve/call/offer trio, cooperative form.
-            Ok(VcpuStop::SvcWait) => {
-                tasks[ti].state = TaskState::BlockedSvc;
-            }
-            Ok(VcpuStop::LiveCall {
-                ticket,
-                callee,
-                dst,
-            }) => {
-                // The enqueue already happened in the op exec (holding only the callee's lock).
-                // Wake any svc.wait-parked task of the callee's domain — the tree-walker's
-                // `svc_wake` — then park the caller on its ticket.
-                let k = extra_envs
-                    .iter()
-                    .position(|e| std::sync::Arc::ptr_eq(&e.host, &callee));
-                // §12 teardown / D37 death-is-revocation (owner 2026-07-24): a call through an
-                // already-torn-down callee can never be replied — complete with the probeable
-                // errno instead of parking forever (the tree-walker's dead-callee park probe).
-                if k.is_some_and(|k| dead_envs.contains(&k)) {
-                    tasks[ti]
-                        .vt
-                        .active
-                        .set(dst, Reg::from_i64(super::CAP_REVOKED));
+                    drain_cap_parked(fibers, &comps);
                     continue;
                 }
-                if let Some(k) = k {
-                    for t in &mut tasks {
-                        if t.env == Some(k) && matches!(t.state, TaskState::BlockedSvc) {
-                            t.state = TaskState::Runnable;
-                        }
-                    }
-                }
-                tasks[ti].state = TaskState::BlockedTicket {
-                    ticket,
-                    callee,
-                    dst,
-                };
-            }
-            Ok(VcpuStop::CapPending { id, dst }) => {
-                // F2 (FIBER_PARK.md) — a punted dispatch, cooperative form. A FIBER parks
-                // (`CapParked` — the slice-5a contract; the ordered drain right after the
-                // park is the register-then-recheck closing the completion-raced-the-park
-                // window). The root keeps the inline wait (guest-invisible — the oracle
-                // parks the vCPU here instead; the cooperative driver has nothing else to
-                // run on this task anyway). Two more inline cases, both mirroring the
-                // oracle's predicate: a durable run (`freeze_drive` has no cap-park
-                // re-derivation — the freeze must never meet one) and a confined
-                // `instantiate` child (its completions live on ITS host; keeping the child
-                // inline keeps the drain single-store — recorded FIBER_PARK.md residue).
-                let durable = host.is_durable();
-                if tasks[ti].vt.active_id != ROOT_FIBER && !durable && tasks[ti].env.is_none() {
-                    let comps = host.completions();
-                    let k = tasks[ti].vt.active_id;
-                    // I48: read the blocking-resume marker off the parking fiber's `Running` state
-                    // before it is overwritten with `CapParked`.
-                    let blocking_ip = match fibers.get(k) {
-                        Some(FiberState::Running { blocking_ip }) => *blocking_ip,
+                // No runnable task: fire the earliest `wait` timeout — whole-vCPU waiters and
+                // event-parked fiber waiters alike (§3.6 slice 5a) — else it is a deadlock.
+                let next = tasks
+                    .iter()
+                    .filter_map(|t| match t.state {
+                        TaskState::BlockedWait { deadline, .. } => Some(deadline),
                         _ => None,
-                    };
-                    let vt = &mut tasks[ti].vt;
-                    let (rid, resumer, rdst) =
-                        vt.chain.pop().expect("a running fiber has a resumer");
-                    shadow_switch(mem, &mut fiber_sp, &mut vt.root_shadow_sp, durable, k, rid);
-                    let fvm = std::mem::replace(&mut vt.active, resumer);
-                    fibers[k] = FiberState::CapParked {
-                        vm: fvm,
-                        dst,
-                        id,
-                        woken: None,
-                    };
-                    drain_cap_parked(&mut fibers, &comps);
-                    vt.active_id = rid;
-                    // I48: a blocking resume idles the resumer on this cap-parked fiber. Rewind so
-                    // the wake re-executes the resume; if the drain already claimed the completion,
-                    // keep the task Runnable to re-resume at once, else park it until the drain
-                    // (at idle or a later poll) wakes the fiber.
-                    if let Some(ip) = blocking_ip {
-                        vt.active.pc = ip;
-                        let woken_now = matches!(
-                            fibers.get(k),
-                            Some(FiberState::CapParked { woken: Some(_), .. })
-                        );
-                        if !woken_now {
-                            tasks[ti].state = TaskState::BlockedOnFiber { fiber: k };
-                        }
-                        continue;
-                    }
-                    vt.active.set(rdst, Reg::from_i32(super::FIBER_PARKED));
-                    vt.active.set(rdst + 1, Reg::from_i64(0));
-                } else {
-                    let comps = match tasks[ti].env {
-                        None => host.completions(),
-                        Some(k) => extra_envs[k]
-                            .host
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .completions(),
-                    };
-                    let r = comps.wait(id);
-                    tasks[ti].vt.active.set(dst, Reg::from_i64(r));
-                }
-            }
-            Ok(VcpuStop::ChildOffer { child, export, dst }) => {
-                // Mint a live-callee offer over a running child's export: shape from the
-                // CALLEE's module (fetched before the wirer's lock — the tree-walker's lock
-                // order), interned structurally into the wirer's table. A bad child handle /
-                // no such export is a probeable -EINVAL, matching the oracle.
-                let callee = usize::try_from(child)
-                    .ok()
-                    .and_then(|h| tasks[ti].threads.get(h).copied().flatten())
-                    .and_then(|cidx| tasks[cidx].env)
-                    .map(|k| std::sync::Arc::clone(&extra_envs[k].host));
-                let cap = callee.and_then(|callee: std::sync::Arc<std::sync::Mutex<Host>>| {
-                    let sigs = callee
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .offer_shape(export)?;
-                    match tasks[ti].env {
-                        None => host.wire_live_impl(&callee, export, &sigs).ok(),
-                        Some(pk) => extra_envs[pk]
-                            .host
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .wire_live_impl(&callee, export, &sigs)
-                            .ok(),
-                    }
-                });
-                tasks[ti]
-                    .vt
-                    .active
-                    .set(dst, Reg::from_i32(cap.unwrap_or(super::EINVAL as i32)));
-            }
-            Ok(VcpuStop::CloneCaller {
-                reply_orig,
-                reply_twin,
-                dst,
-                has_result,
-            }) => {
-                // FORK.md §9.2 — fork-returns-twice on the cooperative driver. Duplicate the caller
-                // parked on this handler's dispatch into a live **twin** (private window +
-                // duplicated powerbox, its own env), deliver `reply_twin` to the twin and
-                // `reply_orig` (pid mode: the twin's task id) to the original; both resume past the
-                // same fork `cap.call`. Fail-closed to a single reply on any shape the driver can't
-                // duplicate — never a hang, mirroring the oracle's degrade (svm-interp
-                // `fork_parked_caller`). `reap` (fork+wait) is a later slice — such modules fold.
-                let result: i64 = 'fork: {
-                    // The running handler's dispatch ticket names the parked caller; outside a
-                    // handler there is none → `-EINVAL`, exactly as the oracle.
-                    let Some(ticket) = tasks[ti].vt.active.serve_ticket else {
-                        break 'fork super::EINVAL;
-                    };
-                    // The server (this task) is the callee the caller parked on. In the fork
-                    // topology the server is a spawned child with an `Arc` host (never the root).
-                    let Some(server_env) = tasks[ti].env else {
-                        break 'fork super::EINVAL;
-                    };
-                    let server_host = std::sync::Arc::clone(&extra_envs[server_env].host);
-                    // Locate the parked caller on `(ticket, this server)`. In the cooperative driver
-                    // the caller has already parked (it enqueued + woke us before we ran), so a miss
-                    // is defensive → degrade.
-                    let caller_ti = tasks.iter().position(|t| {
-                        matches!(&t.state,
-                            TaskState::BlockedTicket { ticket: tk, callee, .. }
-                                if *tk == ticket && std::sync::Arc::ptr_eq(callee, &server_host))
-                    });
-                    let degrade = |tasks: &mut Vec<TaskSlot>, caller_ti: Option<usize>| -> i64 {
-                        // One reply to the caller, no twin. Explicit mode delivers `reply_orig`; pid
-                        // mode delivers `-EAGAIN` (POSIX fork failure). Returns the handler's result.
-                        let fallback = reply_orig.unwrap_or(super::EAGAIN);
-                        if let Some(cti) = caller_ti {
-                            if let TaskState::BlockedTicket { dst: cdst, .. } = tasks[cti].state {
-                                tasks[cti].vt.active.set(cdst, Reg::from_i64(fallback));
-                                tasks[cti].state = TaskState::Runnable;
+                    })
+                    .chain(fibers.iter().filter_map(|f| match f {
+                        FiberState::WaitParked {
+                            deadline,
+                            woken: None,
+                            ..
+                        } => Some(*deadline),
+                        _ => None,
+                    }))
+                    .min();
+                match next {
+                    Some(d) => {
+                        *clock = (*clock).max(d);
+                        for t in tasks.iter_mut() {
+                            if let TaskState::BlockedWait { deadline, dst, .. } = t.state {
+                                if deadline <= *clock {
+                                    t.vt.active.set(dst, Reg::from_i32(super::WAIT_TIMED_OUT));
+                                    t.state = TaskState::Runnable;
+                                }
                             }
                         }
-                        reply_orig.map_or(super::EAGAIN, |_| 0)
-                    };
-                    let Some(caller_ti) = caller_ti else {
-                        break 'fork degrade(&mut tasks, None);
-                    };
-                    let TaskState::BlockedTicket {
-                        dst: caller_dst, ..
-                    } = tasks[caller_ti].state
-                    else {
-                        break 'fork super::EINVAL;
-                    };
-                    let caller_env = tasks[caller_ti].env;
-                    // Only a bare root caller (no spawned children/threads, no live fiber chain)
-                    // forks faithfully — the oracle's `bare` gate. Anything else degrades.
-                    let bare = tasks[caller_ti].threads.iter().all(|t| t.is_none())
-                        && tasks[caller_ti].vt.active_id == ROOT_FIBER
-                        && tasks[caller_ti].vt.chain.is_empty();
-                    // Duplicate the caller's window (private copy — fork does not share memory) and
-                    // powerbox (own handle namespace, shared `Arc` backings). A root caller (no env)
-                    // or a non-forkable window/powerbox fails closed to a single reply.
-                    // The twin's pid is its task index (`twin_ti` below); nothing is pushed between
-                    // here and that push, so the fork factories learn it up front (#863 slice 2).
-                    let twin_pid = tasks.len() as u64;
-                    let forked = if bare {
-                        caller_env.and_then(|ck| {
-                            let twin_mem = match &extra_envs[ck].mem {
-                                Some(m) => Some(m.fork_private()?),
-                                None => None,
-                            };
-                            let twin_host = extra_envs[ck]
-                                .host
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .fork_powerbox(twin_pid)?;
-                            Some((ck, twin_mem, twin_host))
-                        })
-                    } else {
-                        None
-                    };
-                    let Some((ck, twin_mem, twin_host)) = forked else {
-                        break 'fork degrade(&mut tasks, Some(caller_ti));
-                    };
-                    // The twin's continuation is the caller's — a bare root `Vm` cloned at its
-                    // post-call resume point (`Vm` derives `Clone`; a bare caller carries no resume
-                    // chain / invoke) — with `reply_twin` injected at the caller's reply slot.
-                    let mut twin_active = tasks[caller_ti].vt.active.clone();
-                    twin_active.set(caller_dst, Reg::from_i64(reply_twin));
-                    let twin_vt = VTask {
-                        active: twin_active,
-                        active_id: ROOT_FIBER,
-                        chain: Vec::new(),
-                        root_shadow_sp: super::SHADOW_BASE,
-                        active_invoke: None,
-                        invoke_step_into: false,
-                    };
-                    // The twin is its own domain: a fresh env over the private window + duplicated
-                    // powerbox, a natural table over the caller's (same-)module, the caller's env fuel.
-                    let twin_table = build_table(dom.source.primary().progs.len(), 0);
-                    let twin_eidx = extra_envs.len();
-                    extra_envs.push(ChildEnv {
-                        mem: twin_mem,
-                        host: std::sync::Arc::new(std::sync::Mutex::new(twin_host)),
-                        table: twin_table,
-                        fuel: extra_envs[ck].fuel,
-                    });
-                    let twin_ti = tasks.len();
-                    tasks.push(TaskSlot {
-                        vt: twin_vt,
-                        threads: Vec::new(),
-                        env: Some(twin_eidx),
-                        state: TaskState::Runnable,
-                    });
-                    // Mark the twin reapable so a later servicer-side `wait()` (`reap`) can deliver
-                    // its exit status to the parent (FORK.md §8.6); retired when reaped.
-                    forked_twins.insert(twin_ti);
-                    // Deliver the original's reply and re-run it: explicit `reply_orig`, or pid mode
-                    // = the twin's task id (parent-sees-pid). The handler's own return still writes
-                    // the ticket's completion cell, but the caller is now `Runnable` (not
-                    // `BlockedTicket`), so the settle scan never claims it — harmless, no flag needed.
-                    let orig_reply = reply_orig.unwrap_or(twin_ti as i64);
-                    tasks[caller_ti]
-                        .vt
-                        .active
-                        .set(caller_dst, Reg::from_i64(orig_reply));
-                    tasks[caller_ti].state = TaskState::Runnable;
-                    twin_ti as i64
-                };
-                if has_result {
-                    tasks[ti].vt.active.set(dst, Reg::from_i64(result));
-                }
-            }
-            Ok(VcpuStop::Reap {
-                pid,
-                dst,
-                has_result,
-            }) => {
-                // FORK.md §9.2 — the servicer side of `wait(pid)`. Reap fork twin `pid` on behalf of
-                // the caller parked on this handler's dispatch: deliver the twin's exit status now (if
-                // it finished) or park the caller until it does. `-ECHILD` for a pid this run did not
-                // mint (the handler's own reply carries it); `-EINVAL` outside a handler. Never a hang.
-                let result: i64 = 'reap: {
-                    let Some(ticket) = tasks[ti].vt.active.serve_ticket else {
-                        break 'reap super::EINVAL;
-                    };
-                    let Some(server_env) = tasks[ti].env else {
-                        break 'reap super::EINVAL;
-                    };
-                    let server_host = std::sync::Arc::clone(&extra_envs[server_env].host);
-                    let caller_ti = tasks.iter().position(|t| {
-                        matches!(&t.state,
-                            TaskState::BlockedTicket { ticket: tk, callee, .. }
-                                if *tk == ticket && std::sync::Arc::ptr_eq(callee, &server_host))
-                    });
-                    // The pid must be a twin this run minted; otherwise a genuine `-ECHILD`, which the
-                    // handler's own return delivers to the still-parked caller (the normal serve path).
-                    let Some(pid_us) = usize::try_from(pid)
-                        .ok()
-                        .filter(|p| forked_twins.contains(p))
-                    else {
-                        break 'reap super::ECHILD;
-                    };
-                    // The cooperative driver parks the caller before the handler runs, so a miss is
-                    // defensive → `-EAGAIN` (retryable, never a false `-ECHILD` — the twin is real).
-                    let Some(caller_ti) = caller_ti else {
-                        break 'reap super::EAGAIN;
-                    };
-                    let TaskState::BlockedTicket {
-                        dst: caller_dst, ..
-                    } = tasks[caller_ti].state
-                    else {
-                        break 'reap super::EINVAL;
-                    };
-                    // Twin finished → deliver its status now and retire it; else park the caller on it
-                    // (the settle scan wakes it on twin-exit). Either way the caller's reply is handled
-                    // here — the handler's own return lands on a caller no longer `BlockedTicket`, so
-                    // the settle scan never claims it (harmless, mirroring `clone_caller`).
-                    if let TaskState::Done(res) = &tasks[pid_us].state {
-                        let status = super::reap_status(res);
-                        forked_twins.remove(&pid_us);
-                        tasks[caller_ti]
-                            .vt
-                            .active
-                            .set(caller_dst, Reg::from_i64(status));
-                        tasks[caller_ti].state = TaskState::Runnable;
-                        status
-                    } else {
-                        tasks[caller_ti].state = TaskState::BlockedReap {
-                            pid: pid_us,
-                            dst: caller_dst,
-                        };
-                        0
-                    }
-                };
-                if has_result {
-                    tasks[ti].vt.active.set(dst, Reg::from_i64(result));
-                }
-            }
-            Ok(VcpuStop::Spawn {
-                func,
-                sp,
-                arg,
-                dst,
-                module,
-            }) => {
-                // `func` resolves in the SPAWNING FRAME's module (an installed §22 unit spawns its
-                // own functions — CONSOLIDATION.md §11); the child's root frame starts there too.
-                let Some(cm) = dom.source.get(module as usize) else {
-                    complete(&mut tasks, ti, Err(Trap::Malformed));
-                    continue;
-                };
-                if func as usize >= cm.progs.len() {
-                    complete(&mut tasks, ti, Err(Trap::Malformed));
-                    continue;
-                }
-                let live = tasks
-                    .iter()
-                    .filter(|t| !matches!(t.state, TaskState::Done(_)))
-                    .count();
-                if live >= super::MAX_VCPUS {
-                    complete(&mut tasks, ti, Err(Trap::ThreadFault)); // thread bomb
-                    continue;
-                }
-                let mut child = VTask::new(&cm, func as usize, &[Value::I64(sp), Value::I64(arg)])?;
-                child.active.module = module as usize;
-                child.active.home = module as usize;
-                let cidx = tasks.len();
-                // §12 seed the child vCPU's TLS register to its dense id (root is task 0), so
-                // `vcpu.tls.get` returns the worker index — the tree-walker's `tls: id` seeding.
-                child.active.tls = cidx as i64;
-                // A thread shares its spawner's window/powerbox — so it inherits the spawner's env
-                // (the shared domain for a root-spawned thread, or the same confined `instantiate`
-                // env for one spawned by a confined child).
-                let env = tasks[ti].env;
-                tasks.push(TaskSlot {
-                    vt: child,
-                    threads: Vec::new(),
-                    env,
-                    state: TaskState::Runnable,
-                });
-                let handle = tasks[ti].threads.len() as i32;
-                tasks[ti].threads.push(Some(cidx));
-                tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
-            }
-            Ok(VcpuStop::Instantiate {
-                ibase,
-                isize: isz,
-                entry,
-                off,
-                size_log2,
-                quota,
-                dst,
-                grants,
-                budget,
-            }) => {
-                // Validate the child entry signature against module 0 (a same-module child): it
-                // returns one `i64` and takes either its `Instantiator` (one `i64`) or its
-                // `Instantiator`+`AddressSpace` (two) — its starter caps over its own window.
-                let c0 = dom.source.primary();
-                let want_as = c0
-                    .sigs
-                    .get(entry as usize)
-                    .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
-                let ok_entry = c0.sigs.get(entry as usize).is_some_and(|(p, r)| {
-                    r[..] == [ValType::I64]
-                        && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
-                });
-                // The carve must be a power-of-two-aligned sub-window within `[0, isize)` — a child
-                // gets only what the holder sub-allocates (§14/D19).
-                let child_size = if (0..64).contains(&size_log2) {
-                    1u64 << size_log2
-                } else {
-                    0
-                };
-                let off_u = off as u64;
-                let fits = child_size != 0
-                    && child_size <= isz
-                    && off_u & (child_size - 1) == 0
-                    && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
-                if !ok_entry || !fits {
-                    tasks[ti]
-                        .vt
-                        .active
-                        .set(dst, Reg::from_i32(super::EINVAL as i32));
-                    continue;
-                }
-                let live = tasks
-                    .iter()
-                    .filter(|t| !matches!(t.state, TaskState::Done(_)))
-                    .count();
-                if live >= super::MAX_VCPUS {
-                    complete(&mut tasks, ti, Err(Trap::ThreadFault)); // instantiate bomb
-                    continue;
-                }
-                // The parent's window base (holder-relative `ibase`/`off` → backing-absolute, so
-                // nesting composes) and fuel (the child's quota is sub-allocated from, and capped by,
-                // the parent's) come from the parent's environment.
-                let (pbase, pfuel) = match tasks[ti].env {
-                    None => (mem.as_ref().map_or(0, |m| m.window.base()), *fuel),
-                    Some(k) => (
-                        extra_envs[k].mem.as_ref().map_or(0, |m| m.window.base()),
-                        extra_envs[k].fuel,
-                    ),
-                };
-                let abs_base = pbase + ibase + off_u;
-                let child_mem = match tasks[ti].env {
-                    None => mem
-                        .as_ref()
-                        .map(|m| m.nested_view(abs_base, size_log2 as u8)),
-                    Some(k) => extra_envs[k]
-                        .mem
-                        .as_ref()
-                        .map(|m| m.nested_view(abs_base, size_log2 as u8)),
-                };
-                // Attenuated powerbox: an `Instantiator` (so the child can itself nest — confinement
-                // composes to any depth) and an `AddressSpace` (so it manages its own pages), each
-                // over its *own* `[0, child_size)` window — its entry arguments. op 0 grants only
-                // those two; op 11 (`grants` is `Some((ptr, n))`) additionally re-grants a by-name cap
-                // list read from the parent window, so a spawned stage resolves an inherited region
-                // (a ring end) by name — the concurrent-pipeline spawn. The named build fails closed
-                // via the shared, fuzzed `spawn_named_child` (mirrors the op-13 arm; grants resolve
-                // against the root `host`, so a confined child's forged handle fails `can_regrant`).
-                let (mut child_host, cinst, cas) = if let Some((grants_ptr, grants_n)) = grants {
-                    // Parse `grants_n × 16-byte {name_off:u32, name_len:u32, handle:i32, flags:u32}`
-                    // records from the parent window (identical to the op-13 `InstantiateModule` arm).
-                    let pm: Option<&Mem> = match tasks[ti].env {
-                        None => mem.as_ref(),
-                        Some(k) => extra_envs[k].mem.as_ref(),
-                    };
-                    let list: Result<Vec<(String, i32)>, Trap> = (|| {
-                        let m = pm.ok_or(Trap::Malformed)?;
-                        let mut list: Vec<(String, i32)> = Vec::new();
-                        for i in 0..grants_n {
-                            let rec = m.read_window(grants_ptr + i * 16, 16)?;
-                            let name_off =
-                                u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
-                            let name_len =
-                                u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
-                            let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-                            let name_bytes = m.read_window(name_off, name_len)?;
-                            let name = String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
-                            list.push((name, handle));
-                        }
-                        Ok(list)
-                    })();
-                    let list = match list {
-                        Ok(l) => l,
-                        Err(t) => {
-                            complete(&mut tasks, ti, Err(t));
-                            continue;
-                        }
-                    };
-                    match host.spawn_named_child(&list, child_size) {
-                        Some(triple) => triple,
-                        None => {
-                            complete(&mut tasks, ti, Err(Trap::CapFault));
-                            continue;
-                        }
-                    }
-                } else {
-                    let mut ch = Host::new();
-                    let cinst = ch.grant_instantiator(0, child_size);
-                    let cas = ch.grant_address_space(0, child_size);
-                    (ch, cinst, cas)
-                };
-                // §3.6: a same-module child serves over the shared program — its serve machinery
-                // (enqueue admission, handler resolution) and any `child_offer` shape read the
-                // domain's registered module, exactly the tree-walker's `self_module` handoff.
-                child_host.self_module = match tasks[ti].env {
-                    None => host.self_module.clone(),
-                    Some(k) => extra_envs[k]
-                        .host
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .self_module
-                        .clone(),
-                };
-                let child_args = if want_as {
-                    vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
-                } else {
-                    vec![Value::I64(cinst as i64)]
-                };
-                // §3d: a record's budget funds the child here — the commit site, after every
-                // other refusal (geometry, grants), so a refused spawn leaves it intact.
-                let child_fuel = if budget != 0 {
-                    match take_spawn_budget(host, budget, child_size, pfuel) {
-                        Err(t) => {
-                            complete(&mut tasks, ti, Err(t));
-                            continue;
-                        }
-                        Ok(None) => {
-                            tasks[ti]
-                                .vt
-                                .active
-                                .set(dst, Reg::from_i32(super::EINVAL as i32));
-                            continue;
-                        }
-                        Ok(Some(f)) => f,
-                    }
-                } else if quota <= 0 {
-                    pfuel
-                } else {
-                    (quota as u64).min(pfuel)
-                };
-                // A nested child is its **own** domain: a fresh natural table over module 0 (no access
-                // to installed §22 units — matching the tree-walker's `DomainTable::new(&cfuncs, 0)`).
-                let c0 = dom.source.primary();
-                let child_table = build_table(c0.progs.len(), 0);
-                let child_vt = VTask::new(&c0, entry as usize, &child_args)?;
-                let eidx = extra_envs.len();
-                extra_envs.push(ChildEnv {
-                    mem: child_mem,
-                    host: std::sync::Arc::new(std::sync::Mutex::new(child_host)),
-                    table: child_table,
-                    fuel: child_fuel,
-                });
-                let cidx = tasks.len();
-                tasks.push(TaskSlot {
-                    vt: child_vt,
-                    threads: Vec::new(),
-                    env: Some(eidx),
-                    state: TaskState::Runnable,
-                });
-                let handle = tasks[ti].threads.len() as i32;
-                tasks[ti].threads.push(Some(cidx));
-                tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
-            }
-            Ok(VcpuStop::InstantiateModule {
-                ibase,
-                isize: isz,
-                mh,
-                entry,
-                off,
-                size_log2,
-                quota,
-                dst,
-                grants,
-                budget,
-            }) => {
-                // Resolve the granted Module (a forged/closed/wrong-type handle is an inert CapFault).
-                let (cfuncs, cmem_log2, cdata, cmodule) = match host.resolve_module(mh) {
-                    Ok(g) => (
-                        g.funcs.clone(),
-                        g.memory_log2,
-                        g.data.clone(),
-                        std::sync::Arc::clone(&g.module),
-                    ),
-                    Err(t) => {
-                        complete(&mut tasks, ti, Err(t));
-                        continue;
-                    }
-                };
-                // Compile the granted module to bytecode. A module using an op the engine can't lower
-                // is the one place a guest-provided program outruns coverage (no tree-walker fallback
-                // mid-run) — a `Malformed` trap, exactly as for `Jit.install`.
-                let child_compiled = match compile_module(&cfuncs) {
-                    Some(c) => c,
-                    None => {
-                        complete(&mut tasks, ti, Err(Trap::Malformed));
-                        continue;
-                    }
-                };
-                // The child entry sig is validated against the *child module*. A separate-module
-                // child's carve must equal its declared memory (§14 transparency: it runs exactly as
-                // it would standalone — same window size, same wrap behaviour).
-                let want_as = child_compiled
-                    .sigs
-                    .get(entry as usize)
-                    .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
-                let ok_entry = child_compiled
-                    .sigs
-                    .get(entry as usize)
-                    .is_some_and(|(p, r)| {
-                        r[..] == [ValType::I64]
-                            && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
-                    });
-                let child_size = if (0..64).contains(&size_log2) {
-                    1u64 << size_log2
-                } else {
-                    0
-                };
-                let off_u = off as u64;
-                let fits = child_size != 0
-                    && child_size <= isz
-                    && off_u & (child_size - 1) == 0
-                    && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
-                let mod_ok = cmem_log2 == Some(size_log2 as u8);
-                if !ok_entry || !fits || !mod_ok {
-                    tasks[ti]
-                        .vt
-                        .active
-                        .set(dst, Reg::from_i32(super::EINVAL as i32));
-                    continue;
-                }
-                let live = tasks
-                    .iter()
-                    .filter(|t| !matches!(t.state, TaskState::Done(_)))
-                    .count();
-                if live >= super::MAX_VCPUS {
-                    complete(&mut tasks, ti, Err(Trap::ThreadFault));
-                    continue;
-                }
-                let (pbase, pfuel) = match tasks[ti].env {
-                    None => (mem.as_ref().map_or(0, |m| m.window.base()), *fuel),
-                    Some(k) => (
-                        extra_envs[k].mem.as_ref().map_or(0, |m| m.window.base()),
-                        extra_envs[k].fuel,
-                    ),
-                };
-                let abs_base = pbase + ibase + off_u;
-                // Build the child window and materialize the module's data segments into the carve
-                // (exactly as if the child wrote them; the verifier bounded them to its declared window
-                // == the carve). RO protection of `readonly` segments is skipped for nested children
-                // (intra-domain self-corruption is a §1 non-goal), matching the tree-walker.
-                let child_mem = {
-                    let pm: Option<&Mem> = match tasks[ti].env {
-                        None => mem.as_ref(),
-                        Some(k) => extra_envs[k].mem.as_ref(),
-                    };
-                    if let Some(m) = pm {
-                        for d in cdata.iter() {
-                            if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
-                                for (k, &b) in d.bytes.iter().enumerate() {
-                                    m.set_byte(abs_base + d.offset + k as u64, b);
+                        // §3.6 slice 5a: a due fiber wait completes with `WAIT_TIMED_OUT` — the
+                        // fiber becomes claimable (leaving the pending set, so this loop makes
+                        // progress); its resumer's next `cont.resume` delivers the status.
+                        for f in fibers.iter_mut() {
+                            if let FiberState::WaitParked {
+                                deadline,
+                                woken: w @ None,
+                                ..
+                            } = f
+                            {
+                                if *deadline <= *clock {
+                                    *w = Some(super::WAIT_TIMED_OUT);
                                 }
                             }
                         }
                     }
-                    pm.map(|m| m.nested_view(abs_base, size_log2 as u8))
-                };
-                // op 5 grants only Instantiator+AddressSpace; op 13 (`grants` is `Some((ptr, n))`)
-                // additionally re-grants a by-name cap list read from the parent window, so a spawned
-                // command resolves an inherited `stdout` by name (STAGE1.md — the shell "exec"
-                // primitive). The named build fails closed via the shared, fuzzed `spawn_named_child`.
-                let (mut child_host, cinst, cas) = if let Some((grants_ptr, grants_n)) = grants {
-                    // Parse `grants_n × 16-byte {name_off:u32, name_len:u32, handle:i32, flags:u32}`
-                    // records from the parent window (mirrors the tree-walk op-13 arm in lib.rs).
-                    let pm: Option<&Mem> = match tasks[ti].env {
-                        None => mem.as_ref(),
-                        Some(k) => extra_envs[k].mem.as_ref(),
-                    };
-                    let list: Result<Vec<(String, i32)>, Trap> = (|| {
-                        let m = pm.ok_or(Trap::Malformed)?;
-                        let mut list: Vec<(String, i32)> = Vec::new();
-                        for i in 0..grants_n {
-                            let rec = m.read_window(grants_ptr + i * 16, 16)?;
-                            let name_off =
-                                u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
-                            let name_len =
-                                u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
-                            let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-                            let name_bytes = m.read_window(name_off, name_len)?;
-                            let name = String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
-                            list.push((name, handle));
-                        }
-                        Ok(list)
-                    })();
-                    let list = match list {
-                        Ok(l) => l,
-                        Err(t) => {
-                            complete(&mut tasks, ti, Err(t));
-                            continue;
-                        }
-                    };
-                    match host.spawn_named_child(&list, child_size) {
-                        Some(triple) => triple,
-                        None => {
-                            complete(&mut tasks, ti, Err(Trap::CapFault));
-                            continue;
-                        }
-                    }
-                } else {
-                    let mut ch = Host::new();
-                    let cinst = ch.grant_instantiator(0, child_size);
-                    let cas = ch.grant_address_space(0, child_size);
-                    (ch, cinst, cas)
-                };
-                // §3.6: a separate-module child serves its OWN offers — enqueue admission,
-                // handler resolution, and `child_offer` shape all read its module (tree-walk
-                // lockstep: the spawn sets `self_module` from the grant).
-                child_host.set_self_module(&cmodule);
-                // IMPORTS.md phase 3 / §3.3: bind the child module's import manifest against its
-                // granted powerbox — a chibicc child's generic imports (`write`/`read`/`exit`, and any
-                // named grant) resolve here, so a compiled command actually does I/O rather than
-                // `CapFault`ing on its first `write`. `spawn_named_child` registers the *names* but does
-                // not bind the manifest, so the driver does it (the same `bind_child_manifest` the tree-
-                // walker's op-13 arm and the JIT's `child_bind_imports` hook call). A `required` slot
-                // with nothing to bind fails the spawn closed with a probeable `-EINVAL` (as the tree-
-                // walker does), never a trap. Empty for a manifest-free child (imports is empty → Ok).
-                if child_host
-                    .bind_child_manifest(&cmodule.imports, &cmodule.types)
-                    .is_err()
-                {
-                    tasks[ti]
-                        .vt
-                        .active
-                        .set(dst, Reg::from_i32(super::EINVAL as i32));
-                    continue;
+                    None => return Err(Trap::ThreadFault), // deadlock (no runnable, no waiters)
                 }
-                let child_args = if want_as {
-                    vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
-                } else {
-                    vec![Value::I64(cinst as i64)]
-                };
-                // §3d: a record's budget funds the child here — the commit site, after every
-                // other refusal (module resolve, geometry, grants, manifest binding).
-                let child_fuel = if budget != 0 {
-                    match take_spawn_budget(host, budget, child_size, pfuel) {
-                        Err(t) => {
-                            complete(&mut tasks, ti, Err(t));
-                            continue;
-                        }
-                        Ok(None) => {
-                            tasks[ti]
-                                .vt
-                                .active
-                                .set(dst, Reg::from_i32(super::EINVAL as i32));
-                            continue;
-                        }
-                        Ok(Some(f)) => f,
+                continue;
+            };
+
+            // Select this vCPU's environment: the shared one (root + thread siblings), or its own
+            // confined `instantiate` env. `tasks[ti].vt` and the chosen env borrow disjoint storage
+            // (`tasks` vs `extra_envs` / the `mem`/`host`/`fuel` params), so the split borrow is sound.
+            let mut ctx = match tasks[ti].env {
+                None => RunCtx {
+                    table: &dom.table,
+                    fuel: &mut *fuel,
+                    mem: &mut *mem,
+                    durable: host.is_durable(),
+                    host: HostCell::Excl(&mut *host),
+                },
+                Some(k) => {
+                    let e = &mut extra_envs[k];
+                    let durable = e
+                        .host
+                        .lock()
+                        .unwrap_or_else(|er| er.into_inner())
+                        .is_durable();
+                    RunCtx {
+                        table: &e.table,
+                        fuel: &mut e.fuel,
+                        mem: &mut e.mem,
+                        durable,
+                        host: HostCell::Shared(&e.host),
                     }
-                } else if quota <= 0 {
-                    pfuel
-                } else {
-                    (quota as u64).min(pfuel)
-                };
-                // Push the child's compiled module and run the child over it — its own domain: a
-                // natural table mapping into *its* module index (no installed §22 units).
-                let progs_len = child_compiled.progs.len();
-                let cm = dom.source.push(child_compiled);
-                let child_table = build_table_for(progs_len, 0, cm as u32);
-                let cunit = dom.source.get(cm).ok_or(Trap::Malformed)?;
-                let mut child_vt = VTask::new(&cunit, entry as usize, &child_args)?;
-                child_vt.active.module = cm;
-                child_vt.active.home = cm;
-                let eidx = extra_envs.len();
-                extra_envs.push(ChildEnv {
-                    mem: child_mem,
-                    host: std::sync::Arc::new(std::sync::Mutex::new(child_host)),
-                    table: child_table,
-                    fuel: child_fuel,
-                });
-                let cidx = tasks.len();
-                tasks.push(TaskSlot {
-                    vt: child_vt,
-                    threads: Vec::new(),
-                    env: Some(eidx),
-                    state: TaskState::Runnable,
-                });
-                let handle = tasks[ti].threads.len() as i32;
-                tasks[ti].threads.push(Some(cidx));
-                tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
-            }
-            Ok(VcpuStop::Join { handle, dst }) => {
-                let slot = match super::resolve_thread(&tasks[ti].threads, handle) {
-                    Ok(s) => s,
-                    Err(t) => {
-                        complete(&mut tasks, ti, Err(t));
+                }
+            };
+            let stop = step_vcpu(
+                &mut tasks[ti].vt,
+                fibers,
+                fiber_sp,
+                fiber_meta,
+                dom,
+                &mut ctx,
+                budget,
+                true, // the cooperative scheduler: idle blocking `cont.resume.block` (I48)
+            );
+            match stop {
+                Err(trap) => complete(tasks, ti, Err(trap)),
+                Ok(VcpuStop::Done(vals)) => complete(tasks, ti, Ok(vals)),
+                // #926 slice 2 — wasm-JIT tier-up: this module-0 task hit a direct call to an eligible
+                // function (its `Vm` carries the run's bitmap). `step_vcpu` has already spilled the frame
+                // past the call, so the task is resumable with just the result slots filled. Stash the
+                // delivery target — `(task, dst, result types)` — and surface the region to the driver;
+                // `deliver_tierup` writes the emitted results back into `tasks[ti].vt.active` and the next
+                // `pump` resumes the task. At most one tier-up is outstanding (we return here), so the
+                // single `pending_tierup` slot suffices — no per-task field needed. On the native driver
+                // no task is eligible, so this arm is never reached (the bitmap is `None`).
+                Ok(VcpuStop::TierUp {
+                    func,
+                    argv,
+                    dst,
+                    results,
+                    mapped,
+                }) => {
+                    debug_assert!(
+                        pending_tierup.is_none(),
+                        "a tier-up is already outstanding — deliver_tierup was skipped"
+                    );
+                    *pending_tierup = Some((ti, dst, results));
+                    return Ok(CoopStep::TierUp { func, argv, mapped });
+                }
+                // Blocking stdin is only ever set on an owned-host `Vcpu` (the interactive session), never
+                // a scheduler task — same rationale as tier-up above.
+                Ok(VcpuStop::StdinPark) => {
+                    unreachable!("blocking stdin not enabled on the scheduler driver")
+                }
+                // I48 — a blocking `cont.resume.block` of a still-parked fiber: idle this task on the
+                // fiber (`step_vcpu` already rewound the resumer's cursor to the resume op). The
+                // top-of-loop scan re-marks it `Runnable` once the fiber wakes.
+                Ok(VcpuStop::BlockOnFiber { fiber }) => {
+                    tasks[ti].state = TaskState::BlockedOnFiber { fiber };
+                }
+                // §3.6 (I36 slice 2) — the serve/call/offer trio, cooperative form.
+                Ok(VcpuStop::SvcWait) => {
+                    tasks[ti].state = TaskState::BlockedSvc;
+                }
+                Ok(VcpuStop::LiveCall {
+                    ticket,
+                    callee,
+                    dst,
+                }) => {
+                    // The enqueue already happened in the op exec (holding only the callee's lock).
+                    // Wake any svc.wait-parked task of the callee's domain — the tree-walker's
+                    // `svc_wake` — then park the caller on its ticket.
+                    let k = extra_envs
+                        .iter()
+                        .position(|e| std::sync::Arc::ptr_eq(&e.host, &callee));
+                    // §12 teardown / D37 death-is-revocation (owner 2026-07-24): a call through an
+                    // already-torn-down callee can never be replied — complete with the probeable
+                    // errno instead of parking forever (the tree-walker's dead-callee park probe).
+                    if k.is_some_and(|k| dead_envs.contains(&k)) {
+                        tasks[ti]
+                            .vt
+                            .active
+                            .set(dst, Reg::from_i64(super::CAP_REVOKED));
                         continue;
                     }
-                };
-                let child = tasks[ti].threads[slot].expect("resolve_thread checked liveness");
-                match &tasks[child].state {
-                    TaskState::Done(res) => {
-                        // The child already finished: deliver now (a child trap propagates here).
-                        let res = res.clone();
-                        tasks[ti].threads[slot] = None;
-                        match res {
-                            Ok(vals) => {
-                                let v = vals.first().copied().unwrap_or(Value::I64(0));
-                                tasks[ti].vt.active.set(dst, Reg::from_value(v));
+                    if let Some(k) = k {
+                        for t in tasks.iter_mut() {
+                            if t.env == Some(k) && matches!(t.state, TaskState::BlockedSvc) {
+                                t.state = TaskState::Runnable;
                             }
-                            Err(t) => complete(&mut tasks, ti, Err(t)),
                         }
                     }
-                    _ => {
-                        tasks[ti].state = TaskState::BlockedJoin { child, slot, dst };
-                    }
-                }
-            }
-            Ok(VcpuStop::Wait {
-                base,
-                expected,
-                width,
-                timeout,
-                dst,
-            }) => {
-                // §3.6 slice 5a: a wait issued INSIDE a fiber parks the FIBER, not this vCPU
-                // (the tree-walk oracle's fiber-park routing — DESIGN.md "blocks the fiber,
-                // never the domain"; `fiber_parks.rs`). Unwind one chain link to the resumer
-                // with `(FIBER_PARKED, 0)` and set the fiber aside; the park-time value recheck
-                // closes the park-vs-store race (a store that already landed wakes it with
-                // `WAIT_NOT_EQUAL` — after the one transient `FIBER_PARKED`, like the oracle).
-                if tasks[ti].vt.active_id != ROOT_FIBER {
-                    let durable = host.is_durable();
-                    let k = tasks[ti].vt.active_id;
-                    // I48: read the blocking-resume marker off the parking fiber's `Running` state
-                    // (set at the claim) before it is overwritten with `WaitParked` below.
-                    let blocking_ip = match fibers.get(k) {
-                        Some(FiberState::Running { blocking_ip }) => *blocking_ip,
-                        _ => None,
-                    };
-                    let vt = &mut tasks[ti].vt;
-                    let (rid, resumer, rdst) =
-                        vt.chain.pop().expect("a running fiber has a resumer");
-                    shadow_switch(mem, &mut fiber_sp, &mut vt.root_shadow_sp, durable, k, rid);
-                    let fvm = std::mem::replace(&mut vt.active, resumer);
-                    let cur = mem
-                        .as_ref()
-                        .map(|m| m.atomic_value(base, width))
-                        .unwrap_or(0);
-                    let woken = (cur != expected).then_some(super::WAIT_NOT_EQUAL);
-                    fibers[k] = FiberState::WaitParked {
-                        vm: fvm,
-                        wait_dst: dst,
-                        key: base,
-                        deadline: clock.saturating_add(timeout),
-                        real_deadline: sched_wall_deadline(timeout),
-                        woken,
-                    };
-                    vt.active_id = rid;
-                    // I48: a blocking resume idles the resumer on this fiber instead of the
-                    // FIBER_PARKED poll. Rewind so the wake re-executes the resume; if the
-                    // value-recheck already woke the fiber, keep the task Runnable to re-resume at
-                    // once (the oracle's recheck-re-admit — no transient poll), else park it until
-                    // the fiber's event/idle-timer wakes it.
-                    if let Some(ip) = blocking_ip {
-                        vt.active.pc = ip;
-                        if woken.is_none() {
-                            tasks[ti].state = TaskState::BlockedOnFiber { fiber: k };
-                        }
-                        continue;
-                    }
-                    vt.active.set(rdst, Reg::from_i32(super::FIBER_PARKED));
-                    vt.active.set(rdst + 1, Reg::from_i64(0));
-                    continue;
-                }
-                // Re-read the value (the cooperative analogue of the futex compare-under-lock): if it
-                // already changed, return not-equal; else park until notified or timed out. Both the
-                // value re-read and the rendezvous key are taken against THIS task's own memory: a
-                // confined `instantiate` child steps against its `extra_envs` window, not the root
-                // `mem`, and the key is backing-identity canonical (`futex_key`) so two children that
-                // mapped the same `SharedRegion` into separate windows rendezvous (S1c). Reading the
-                // root `mem` here instead would make a child's `wait` on its mapped ring flag re-read
-                // an unrelated root byte and spin forever.
-                let (cur, key) = {
-                    let tmem: Option<&Mem> = match tasks[ti].env {
-                        None => mem.as_ref(),
-                        Some(k) => extra_envs[k].mem.as_ref(),
-                    };
-                    (
-                        tmem.map(|m| m.atomic_value(base, width)).unwrap_or(0),
-                        tmem.map(|m| m.futex_key(base))
-                            .unwrap_or(super::FutexKey::Anon(base)),
-                    )
-                };
-                if cur != expected {
-                    tasks[ti]
-                        .vt
-                        .active
-                        .set(dst, Reg::from_i32(super::WAIT_NOT_EQUAL));
-                } else {
-                    tasks[ti].state = TaskState::BlockedWait {
-                        key,
-                        deadline: clock.saturating_add(timeout),
+                    tasks[ti].state = TaskState::BlockedTicket {
+                        ticket,
+                        callee,
                         dst,
                     };
                 }
-            }
-            Ok(VcpuStop::Notify { base, count, dst }) => {
-                // Wake up to `count` waiters, lowest task index first (deterministic). Key on the
-                // notifying task's own memory + backing identity (mirrors the wait arm), so a notify
-                // from one child's window matches a waiter parked from another child's window on the
-                // same `SharedRegion` byte.
-                let key = {
-                    let tmem: Option<&Mem> = match tasks[ti].env {
-                        None => mem.as_ref(),
-                        Some(k) => extra_envs[k].mem.as_ref(),
+                Ok(VcpuStop::CapPending { id, dst }) => {
+                    // F2 (FIBER_PARK.md) — a punted dispatch, cooperative form. A FIBER parks
+                    // (`CapParked` — the slice-5a contract; the ordered drain right after the
+                    // park is the register-then-recheck closing the completion-raced-the-park
+                    // window). The root keeps the inline wait (guest-invisible — the oracle
+                    // parks the vCPU here instead; the cooperative driver has nothing else to
+                    // run on this task anyway). Two more inline cases, both mirroring the
+                    // oracle's predicate: a durable run (`freeze_drive` has no cap-park
+                    // re-derivation — the freeze must never meet one) and a confined
+                    // `instantiate` child (its completions live on ITS host; keeping the child
+                    // inline keeps the drain single-store — recorded FIBER_PARK.md residue).
+                    let durable = host.is_durable();
+                    if tasks[ti].vt.active_id != ROOT_FIBER && !durable && tasks[ti].env.is_none() {
+                        let comps = host.completions();
+                        let k = tasks[ti].vt.active_id;
+                        // I48: read the blocking-resume marker off the parking fiber's `Running` state
+                        // before it is overwritten with `CapParked`.
+                        let blocking_ip = match fibers.get(k) {
+                            Some(FiberState::Running { blocking_ip }) => *blocking_ip,
+                            _ => None,
+                        };
+                        let vt = &mut tasks[ti].vt;
+                        let (rid, resumer, rdst) =
+                            vt.chain.pop().expect("a running fiber has a resumer");
+                        shadow_switch(mem, fiber_sp, &mut vt.root_shadow_sp, durable, k, rid);
+                        let fvm = std::mem::replace(&mut vt.active, resumer);
+                        fibers[k] = FiberState::CapParked {
+                            vm: fvm,
+                            dst,
+                            id,
+                            woken: None,
+                        };
+                        drain_cap_parked(fibers, &comps);
+                        vt.active_id = rid;
+                        // I48: a blocking resume idles the resumer on this cap-parked fiber. Rewind so
+                        // the wake re-executes the resume; if the drain already claimed the completion,
+                        // keep the task Runnable to re-resume at once, else park it until the drain
+                        // (at idle or a later poll) wakes the fiber.
+                        if let Some(ip) = blocking_ip {
+                            vt.active.pc = ip;
+                            let woken_now = matches!(
+                                fibers.get(k),
+                                Some(FiberState::CapParked { woken: Some(_), .. })
+                            );
+                            if !woken_now {
+                                tasks[ti].state = TaskState::BlockedOnFiber { fiber: k };
+                            }
+                            continue;
+                        }
+                        vt.active.set(rdst, Reg::from_i32(super::FIBER_PARKED));
+                        vt.active.set(rdst + 1, Reg::from_i64(0));
+                    } else {
+                        let comps = match tasks[ti].env {
+                            None => host.completions(),
+                            Some(k) => extra_envs[k]
+                                .host
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .completions(),
+                        };
+                        let r = comps.wait(id);
+                        tasks[ti].vt.active.set(dst, Reg::from_i64(r));
+                    }
+                }
+                Ok(VcpuStop::ChildOffer { child, export, dst }) => {
+                    // Mint a live-callee offer over a running child's export: shape from the
+                    // CALLEE's module (fetched before the wirer's lock — the tree-walker's lock
+                    // order), interned structurally into the wirer's table. A bad child handle /
+                    // no such export is a probeable -EINVAL, matching the oracle.
+                    let callee = usize::try_from(child)
+                        .ok()
+                        .and_then(|h| tasks[ti].threads.get(h).copied().flatten())
+                        .and_then(|cidx| tasks[cidx].env)
+                        .map(|k| std::sync::Arc::clone(&extra_envs[k].host));
+                    let cap = callee.and_then(|callee: std::sync::Arc<std::sync::Mutex<Host>>| {
+                        let sigs = callee
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .offer_shape(export)?;
+                        match tasks[ti].env {
+                            None => host.wire_live_impl(&callee, export, &sigs).ok(),
+                            Some(pk) => extra_envs[pk]
+                                .host
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .wire_live_impl(&callee, export, &sigs)
+                                .ok(),
+                        }
+                    });
+                    tasks[ti]
+                        .vt
+                        .active
+                        .set(dst, Reg::from_i32(cap.unwrap_or(super::EINVAL as i32)));
+                }
+                Ok(VcpuStop::CloneCaller {
+                    reply_orig,
+                    reply_twin,
+                    dst,
+                    has_result,
+                }) => {
+                    // FORK.md §9.2 — fork-returns-twice on the cooperative driver. Duplicate the caller
+                    // parked on this handler's dispatch into a live **twin** (private window +
+                    // duplicated powerbox, its own env), deliver `reply_twin` to the twin and
+                    // `reply_orig` (pid mode: the twin's task id) to the original; both resume past the
+                    // same fork `cap.call`. Fail-closed to a single reply on any shape the driver can't
+                    // duplicate — never a hang, mirroring the oracle's degrade (svm-interp
+                    // `fork_parked_caller`). `reap` (fork+wait) is a later slice — such modules fold.
+                    let result: i64 = 'fork: {
+                        // The running handler's dispatch ticket names the parked caller; outside a
+                        // handler there is none → `-EINVAL`, exactly as the oracle.
+                        let Some(ticket) = tasks[ti].vt.active.serve_ticket else {
+                            break 'fork super::EINVAL;
+                        };
+                        // The server (this task) is the callee the caller parked on. In the fork
+                        // topology the server is a spawned child with an `Arc` host (never the root).
+                        let Some(server_env) = tasks[ti].env else {
+                            break 'fork super::EINVAL;
+                        };
+                        let server_host = std::sync::Arc::clone(&extra_envs[server_env].host);
+                        // Locate the parked caller on `(ticket, this server)`. In the cooperative driver
+                        // the caller has already parked (it enqueued + woke us before we ran), so a miss
+                        // is defensive → degrade.
+                        let caller_ti = tasks.iter().position(|t| {
+                            matches!(&t.state,
+                            TaskState::BlockedTicket { ticket: tk, callee, .. }
+                                if *tk == ticket && std::sync::Arc::ptr_eq(callee, &server_host))
+                        });
+                        let degrade = |tasks: &mut Vec<TaskSlot>,
+                                       caller_ti: Option<usize>|
+                         -> i64 {
+                            // One reply to the caller, no twin. Explicit mode delivers `reply_orig`; pid
+                            // mode delivers `-EAGAIN` (POSIX fork failure). Returns the handler's result.
+                            let fallback = reply_orig.unwrap_or(super::EAGAIN);
+                            if let Some(cti) = caller_ti {
+                                if let TaskState::BlockedTicket { dst: cdst, .. } = tasks[cti].state
+                                {
+                                    tasks[cti].vt.active.set(cdst, Reg::from_i64(fallback));
+                                    tasks[cti].state = TaskState::Runnable;
+                                }
+                            }
+                            reply_orig.map_or(super::EAGAIN, |_| 0)
+                        };
+                        let Some(caller_ti) = caller_ti else {
+                            break 'fork degrade(tasks, None);
+                        };
+                        let TaskState::BlockedTicket {
+                            dst: caller_dst, ..
+                        } = tasks[caller_ti].state
+                        else {
+                            break 'fork super::EINVAL;
+                        };
+                        let caller_env = tasks[caller_ti].env;
+                        // Only a bare root caller (no spawned children/threads, no live fiber chain)
+                        // forks faithfully — the oracle's `bare` gate. Anything else degrades.
+                        let bare = tasks[caller_ti].threads.iter().all(|t| t.is_none())
+                            && tasks[caller_ti].vt.active_id == ROOT_FIBER
+                            && tasks[caller_ti].vt.chain.is_empty();
+                        // Duplicate the caller's window (private copy — fork does not share memory) and
+                        // powerbox (own handle namespace, shared `Arc` backings). A root caller (no env)
+                        // or a non-forkable window/powerbox fails closed to a single reply.
+                        // The twin's pid is its task index (`twin_ti` below); nothing is pushed between
+                        // here and that push, so the fork factories learn it up front (#863 slice 2).
+                        let twin_pid = tasks.len() as u64;
+                        let forked = if bare {
+                            caller_env.and_then(|ck| {
+                                let twin_mem = match &extra_envs[ck].mem {
+                                    Some(m) => Some(m.fork_private()?),
+                                    None => None,
+                                };
+                                let twin_host = extra_envs[ck]
+                                    .host
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .fork_powerbox(twin_pid)?;
+                                Some((ck, twin_mem, twin_host))
+                            })
+                        } else {
+                            None
+                        };
+                        let Some((ck, twin_mem, twin_host)) = forked else {
+                            break 'fork degrade(tasks, Some(caller_ti));
+                        };
+                        // The twin's continuation is the caller's — a bare root `Vm` cloned at its
+                        // post-call resume point (`Vm` derives `Clone`; a bare caller carries no resume
+                        // chain / invoke) — with `reply_twin` injected at the caller's reply slot.
+                        let mut twin_active = tasks[caller_ti].vt.active.clone();
+                        twin_active.set(caller_dst, Reg::from_i64(reply_twin));
+                        let twin_vt = VTask {
+                            active: twin_active,
+                            active_id: ROOT_FIBER,
+                            chain: Vec::new(),
+                            root_shadow_sp: super::SHADOW_BASE,
+                            active_invoke: None,
+                            invoke_step_into: false,
+                        };
+                        // The twin is its own domain: a fresh env over the private window + duplicated
+                        // powerbox, a natural table over the caller's (same-)module, the caller's env fuel.
+                        let twin_table = build_table(dom.source.primary().progs.len(), 0);
+                        let twin_eidx = extra_envs.len();
+                        extra_envs.push(ChildEnv {
+                            mem: twin_mem,
+                            host: std::sync::Arc::new(std::sync::Mutex::new(twin_host)),
+                            table: twin_table,
+                            fuel: extra_envs[ck].fuel,
+                        });
+                        let twin_ti = tasks.len();
+                        tasks.push(TaskSlot {
+                            vt: twin_vt,
+                            threads: Vec::new(),
+                            env: Some(twin_eidx),
+                            state: TaskState::Runnable,
+                        });
+                        // Mark the twin reapable so a later servicer-side `wait()` (`reap`) can deliver
+                        // its exit status to the parent (FORK.md §8.6); retired when reaped.
+                        forked_twins.insert(twin_ti);
+                        // Deliver the original's reply and re-run it: explicit `reply_orig`, or pid mode
+                        // = the twin's task id (parent-sees-pid). The handler's own return still writes
+                        // the ticket's completion cell, but the caller is now `Runnable` (not
+                        // `BlockedTicket`), so the settle scan never claims it — harmless, no flag needed.
+                        let orig_reply = reply_orig.unwrap_or(twin_ti as i64);
+                        tasks[caller_ti]
+                            .vt
+                            .active
+                            .set(caller_dst, Reg::from_i64(orig_reply));
+                        tasks[caller_ti].state = TaskState::Runnable;
+                        twin_ti as i64
                     };
-                    tmem.map(|m| m.futex_key(base))
-                        .unwrap_or(super::FutexKey::Anon(base))
-                };
-                let want = count as u32;
-                let mut woken = 0u32;
-                for t in &mut tasks {
-                    if woken >= want {
-                        break;
+                    if has_result {
+                        tasks[ti].vt.active.set(dst, Reg::from_i64(result));
                     }
-                    if let TaskState::BlockedWait {
-                        key: wkey,
-                        dst: wdst,
-                        ..
-                    } = t.state
+                }
+                Ok(VcpuStop::Reap {
+                    pid,
+                    dst,
+                    has_result,
+                }) => {
+                    // FORK.md §9.2 — the servicer side of `wait(pid)`. Reap fork twin `pid` on behalf of
+                    // the caller parked on this handler's dispatch: deliver the twin's exit status now (if
+                    // it finished) or park the caller until it does. `-ECHILD` for a pid this run did not
+                    // mint (the handler's own reply carries it); `-EINVAL` outside a handler. Never a hang.
+                    let result: i64 = 'reap: {
+                        let Some(ticket) = tasks[ti].vt.active.serve_ticket else {
+                            break 'reap super::EINVAL;
+                        };
+                        let Some(server_env) = tasks[ti].env else {
+                            break 'reap super::EINVAL;
+                        };
+                        let server_host = std::sync::Arc::clone(&extra_envs[server_env].host);
+                        let caller_ti = tasks.iter().position(|t| {
+                            matches!(&t.state,
+                            TaskState::BlockedTicket { ticket: tk, callee, .. }
+                                if *tk == ticket && std::sync::Arc::ptr_eq(callee, &server_host))
+                        });
+                        // The pid must be a twin this run minted; otherwise a genuine `-ECHILD`, which the
+                        // handler's own return delivers to the still-parked caller (the normal serve path).
+                        let Some(pid_us) = usize::try_from(pid)
+                            .ok()
+                            .filter(|p| forked_twins.contains(p))
+                        else {
+                            break 'reap super::ECHILD;
+                        };
+                        // The cooperative driver parks the caller before the handler runs, so a miss is
+                        // defensive → `-EAGAIN` (retryable, never a false `-ECHILD` — the twin is real).
+                        let Some(caller_ti) = caller_ti else {
+                            break 'reap super::EAGAIN;
+                        };
+                        let TaskState::BlockedTicket {
+                            dst: caller_dst, ..
+                        } = tasks[caller_ti].state
+                        else {
+                            break 'reap super::EINVAL;
+                        };
+                        // Twin finished → deliver its status now and retire it; else park the caller on it
+                        // (the settle scan wakes it on twin-exit). Either way the caller's reply is handled
+                        // here — the handler's own return lands on a caller no longer `BlockedTicket`, so
+                        // the settle scan never claims it (harmless, mirroring `clone_caller`).
+                        if let TaskState::Done(res) = &tasks[pid_us].state {
+                            let status = super::reap_status(res);
+                            forked_twins.remove(&pid_us);
+                            tasks[caller_ti]
+                                .vt
+                                .active
+                                .set(caller_dst, Reg::from_i64(status));
+                            tasks[caller_ti].state = TaskState::Runnable;
+                            status
+                        } else {
+                            tasks[caller_ti].state = TaskState::BlockedReap {
+                                pid: pid_us,
+                                dst: caller_dst,
+                            };
+                            0
+                        }
+                    };
+                    if has_result {
+                        tasks[ti].vt.active.set(dst, Reg::from_i64(result));
+                    }
+                }
+                Ok(VcpuStop::Spawn {
+                    func,
+                    sp,
+                    arg,
+                    dst,
+                    module,
+                }) => {
+                    // `func` resolves in the SPAWNING FRAME's module (an installed §22 unit spawns its
+                    // own functions — CONSOLIDATION.md §11); the child's root frame starts there too.
+                    let Some(cm) = dom.source.get(module as usize) else {
+                        complete(tasks, ti, Err(Trap::Malformed));
+                        continue;
+                    };
+                    if func as usize >= cm.progs.len() {
+                        complete(tasks, ti, Err(Trap::Malformed));
+                        continue;
+                    }
+                    let live = tasks
+                        .iter()
+                        .filter(|t| !matches!(t.state, TaskState::Done(_)))
+                        .count();
+                    if live >= super::MAX_VCPUS {
+                        complete(tasks, ti, Err(Trap::ThreadFault)); // thread bomb
+                        continue;
+                    }
+                    let mut child =
+                        VTask::new(&cm, func as usize, &[Value::I64(sp), Value::I64(arg)])?;
+                    child.active.module = module as usize;
+                    child.active.home = module as usize;
+                    // #926 slice 2: a `thread.spawn` child running in **module 0** tiers up its own
+                    // eligible calls too (the run's bitmap is per-module-0-function, shared across the
+                    // root and its same-module threads). A child spawned in another module (a confined
+                    // §22 unit spawning its own function) runs a different module, where the module-0
+                    // bitmap does not apply — leave it interpreting.
+                    if module == 0 {
+                        if let Some(e) = eligible.as_ref() {
+                            child.active.jit_eligible = Some(std::sync::Arc::clone(e));
+                            child.active.jit_page_checked = *page_checked;
+                        }
+                    }
+                    let cidx = tasks.len();
+                    // §12 seed the child vCPU's TLS register to its dense id (root is task 0), so
+                    // `vcpu.tls.get` returns the worker index — the tree-walker's `tls: id` seeding.
+                    child.active.tls = cidx as i64;
+                    // A thread shares its spawner's window/powerbox — so it inherits the spawner's env
+                    // (the shared domain for a root-spawned thread, or the same confined `instantiate`
+                    // env for one spawned by a confined child).
+                    let env = tasks[ti].env;
+                    tasks.push(TaskSlot {
+                        vt: child,
+                        threads: Vec::new(),
+                        env,
+                        state: TaskState::Runnable,
+                    });
+                    let handle = tasks[ti].threads.len() as i32;
+                    tasks[ti].threads.push(Some(cidx));
+                    tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
+                }
+                Ok(VcpuStop::Instantiate {
+                    ibase,
+                    isize: isz,
+                    entry,
+                    off,
+                    size_log2,
+                    quota,
+                    dst,
+                    grants,
+                    budget,
+                }) => {
+                    // Validate the child entry signature against module 0 (a same-module child): it
+                    // returns one `i64` and takes either its `Instantiator` (one `i64`) or its
+                    // `Instantiator`+`AddressSpace` (two) — its starter caps over its own window.
+                    let c0 = dom.source.primary();
+                    let want_as = c0
+                        .sigs
+                        .get(entry as usize)
+                        .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
+                    let ok_entry = c0.sigs.get(entry as usize).is_some_and(|(p, r)| {
+                        r[..] == [ValType::I64]
+                            && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
+                    });
+                    // The carve must be a power-of-two-aligned sub-window within `[0, isize)` — a child
+                    // gets only what the holder sub-allocates (§14/D19).
+                    let child_size = if (0..64).contains(&size_log2) {
+                        1u64 << size_log2
+                    } else {
+                        0
+                    };
+                    let off_u = off as u64;
+                    let fits = child_size != 0
+                        && child_size <= isz
+                        && off_u & (child_size - 1) == 0
+                        && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
+                    if !ok_entry || !fits {
+                        tasks[ti]
+                            .vt
+                            .active
+                            .set(dst, Reg::from_i32(super::EINVAL as i32));
+                        continue;
+                    }
+                    let live = tasks
+                        .iter()
+                        .filter(|t| !matches!(t.state, TaskState::Done(_)))
+                        .count();
+                    if live >= super::MAX_VCPUS {
+                        complete(tasks, ti, Err(Trap::ThreadFault)); // instantiate bomb
+                        continue;
+                    }
+                    // The parent's window base (holder-relative `ibase`/`off` → backing-absolute, so
+                    // nesting composes) and fuel (the child's quota is sub-allocated from, and capped by,
+                    // the parent's) come from the parent's environment.
+                    let (pbase, pfuel) = match tasks[ti].env {
+                        None => (mem.as_ref().map_or(0, |m| m.window.base()), *fuel),
+                        Some(k) => (
+                            extra_envs[k].mem.as_ref().map_or(0, |m| m.window.base()),
+                            extra_envs[k].fuel,
+                        ),
+                    };
+                    let abs_base = pbase + ibase + off_u;
+                    let child_mem = match tasks[ti].env {
+                        None => mem
+                            .as_ref()
+                            .map(|m| m.nested_view(abs_base, size_log2 as u8)),
+                        Some(k) => extra_envs[k]
+                            .mem
+                            .as_ref()
+                            .map(|m| m.nested_view(abs_base, size_log2 as u8)),
+                    };
+                    // Attenuated powerbox: an `Instantiator` (so the child can itself nest — confinement
+                    // composes to any depth) and an `AddressSpace` (so it manages its own pages), each
+                    // over its *own* `[0, child_size)` window — its entry arguments. op 0 grants only
+                    // those two; op 11 (`grants` is `Some((ptr, n))`) additionally re-grants a by-name cap
+                    // list read from the parent window, so a spawned stage resolves an inherited region
+                    // (a ring end) by name — the concurrent-pipeline spawn. The named build fails closed
+                    // via the shared, fuzzed `spawn_named_child` (mirrors the op-13 arm; grants resolve
+                    // against the root `host`, so a confined child's forged handle fails `can_regrant`).
+                    let (mut child_host, cinst, cas) = if let Some((grants_ptr, grants_n)) = grants
                     {
-                        if wkey == key {
-                            t.vt.active.set(wdst, Reg::from_i32(super::WAIT_WOKEN));
-                            t.state = TaskState::Runnable;
-                            woken += 1;
+                        // Parse `grants_n × 16-byte {name_off:u32, name_len:u32, handle:i32, flags:u32}`
+                        // records from the parent window (identical to the op-13 `InstantiateModule` arm).
+                        let pm: Option<&Mem> = match tasks[ti].env {
+                            None => mem.as_ref(),
+                            Some(k) => extra_envs[k].mem.as_ref(),
+                        };
+                        let list: Result<Vec<(String, i32)>, Trap> = (|| {
+                            let m = pm.ok_or(Trap::Malformed)?;
+                            let mut list: Vec<(String, i32)> = Vec::new();
+                            for i in 0..grants_n {
+                                let rec = m.read_window(grants_ptr + i * 16, 16)?;
+                                let name_off =
+                                    u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
+                                let name_len =
+                                    u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
+                                let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+                                let name_bytes = m.read_window(name_off, name_len)?;
+                                let name =
+                                    String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
+                                list.push((name, handle));
+                            }
+                            Ok(list)
+                        })();
+                        let list = match list {
+                            Ok(l) => l,
+                            Err(t) => {
+                                complete(tasks, ti, Err(t));
+                                continue;
+                            }
+                        };
+                        match host.spawn_named_child(&list, child_size) {
+                            Some(triple) => triple,
+                            None => {
+                                complete(tasks, ti, Err(Trap::CapFault));
+                                continue;
+                            }
                         }
-                    }
+                    } else {
+                        let mut ch = Host::new();
+                        let cinst = ch.grant_instantiator(0, child_size);
+                        let cas = ch.grant_address_space(0, child_size);
+                        (ch, cinst, cas)
+                    };
+                    // §3.6: a same-module child serves over the shared program — its serve machinery
+                    // (enqueue admission, handler resolution) and any `child_offer` shape read the
+                    // domain's registered module, exactly the tree-walker's `self_module` handoff.
+                    child_host.self_module = match tasks[ti].env {
+                        None => host.self_module.clone(),
+                        Some(k) => extra_envs[k]
+                            .host
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .self_module
+                            .clone(),
+                    };
+                    let child_args = if want_as {
+                        vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
+                    } else {
+                        vec![Value::I64(cinst as i64)]
+                    };
+                    // §3d: a record's budget funds the child here — the commit site, after every
+                    // other refusal (geometry, grants), so a refused spawn leaves it intact.
+                    let child_fuel = if budget != 0 {
+                        match take_spawn_budget(host, budget, child_size, pfuel) {
+                            Err(t) => {
+                                complete(tasks, ti, Err(t));
+                                continue;
+                            }
+                            Ok(None) => {
+                                tasks[ti]
+                                    .vt
+                                    .active
+                                    .set(dst, Reg::from_i32(super::EINVAL as i32));
+                                continue;
+                            }
+                            Ok(Some(f)) => f,
+                        }
+                    } else if quota <= 0 {
+                        pfuel
+                    } else {
+                        (quota as u64).min(pfuel)
+                    };
+                    // A nested child is its **own** domain: a fresh natural table over module 0 (no access
+                    // to installed §22 units — matching the tree-walker's `DomainTable::new(&cfuncs, 0)`).
+                    let c0 = dom.source.primary();
+                    let child_table = build_table(c0.progs.len(), 0);
+                    let child_vt = VTask::new(&c0, entry as usize, &child_args)?;
+                    let eidx = extra_envs.len();
+                    extra_envs.push(ChildEnv {
+                        mem: child_mem,
+                        host: std::sync::Arc::new(std::sync::Mutex::new(child_host)),
+                        table: child_table,
+                        fuel: child_fuel,
+                    });
+                    let cidx = tasks.len();
+                    tasks.push(TaskSlot {
+                        vt: child_vt,
+                        threads: Vec::new(),
+                        env: Some(eidx),
+                        state: TaskState::Runnable,
+                    });
+                    let handle = tasks[ti].threads.len() as i32;
+                    tasks[ti].threads.push(Some(cidx));
+                    tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
                 }
-                // §3.6 slice 5a: also wake event-parked FIBER waiters (lowest slot next, deterministic
-                // like the task scan). Fibers can't coexist with `instantiate` (the module-level veto),
-                // so a fibered wait is always single-window — it keys on the raw confined address,
-                // unchanged. The status is delivered when a `cont.resume` claims the fiber.
-                for f in fibers.iter_mut() {
-                    if woken >= want {
-                        break;
+                Ok(VcpuStop::InstantiateModule {
+                    ibase,
+                    isize: isz,
+                    mh,
+                    entry,
+                    off,
+                    size_log2,
+                    quota,
+                    dst,
+                    grants,
+                    budget,
+                }) => {
+                    // Resolve the granted Module (a forged/closed/wrong-type handle is an inert CapFault).
+                    let (cfuncs, cmem_log2, cdata, cmodule) = match host.resolve_module(mh) {
+                        Ok(g) => (
+                            g.funcs.clone(),
+                            g.memory_log2,
+                            g.data.clone(),
+                            std::sync::Arc::clone(&g.module),
+                        ),
+                        Err(t) => {
+                            complete(tasks, ti, Err(t));
+                            continue;
+                        }
+                    };
+                    // Compile the granted module to bytecode. A module using an op the engine can't lower
+                    // is the one place a guest-provided program outruns coverage (no tree-walker fallback
+                    // mid-run) — a `Malformed` trap, exactly as for `Jit.install`.
+                    let child_compiled = match compile_module(&cfuncs) {
+                        Some(c) => c,
+                        None => {
+                            complete(tasks, ti, Err(Trap::Malformed));
+                            continue;
+                        }
+                    };
+                    // The child entry sig is validated against the *child module*. A separate-module
+                    // child's carve must equal its declared memory (§14 transparency: it runs exactly as
+                    // it would standalone — same window size, same wrap behaviour).
+                    let want_as = child_compiled
+                        .sigs
+                        .get(entry as usize)
+                        .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
+                    let ok_entry = child_compiled
+                        .sigs
+                        .get(entry as usize)
+                        .is_some_and(|(p, r)| {
+                            r[..] == [ValType::I64]
+                                && (p[..] == [ValType::I64]
+                                    || p[..] == [ValType::I64, ValType::I64])
+                        });
+                    let child_size = if (0..64).contains(&size_log2) {
+                        1u64 << size_log2
+                    } else {
+                        0
+                    };
+                    let off_u = off as u64;
+                    let fits = child_size != 0
+                        && child_size <= isz
+                        && off_u & (child_size - 1) == 0
+                        && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
+                    let mod_ok = cmem_log2 == Some(size_log2 as u8);
+                    if !ok_entry || !fits || !mod_ok {
+                        tasks[ti]
+                            .vt
+                            .active
+                            .set(dst, Reg::from_i32(super::EINVAL as i32));
+                        continue;
                     }
-                    if let FiberState::WaitParked {
-                        key: fkey,
-                        woken: w @ None,
-                        ..
-                    } = f
+                    let live = tasks
+                        .iter()
+                        .filter(|t| !matches!(t.state, TaskState::Done(_)))
+                        .count();
+                    if live >= super::MAX_VCPUS {
+                        complete(tasks, ti, Err(Trap::ThreadFault));
+                        continue;
+                    }
+                    let (pbase, pfuel) = match tasks[ti].env {
+                        None => (mem.as_ref().map_or(0, |m| m.window.base()), *fuel),
+                        Some(k) => (
+                            extra_envs[k].mem.as_ref().map_or(0, |m| m.window.base()),
+                            extra_envs[k].fuel,
+                        ),
+                    };
+                    let abs_base = pbase + ibase + off_u;
+                    // Build the child window and materialize the module's data segments into the carve
+                    // (exactly as if the child wrote them; the verifier bounded them to its declared window
+                    // == the carve). RO protection of `readonly` segments is skipped for nested children
+                    // (intra-domain self-corruption is a §1 non-goal), matching the tree-walker.
+                    let child_mem = {
+                        let pm: Option<&Mem> = match tasks[ti].env {
+                            None => mem.as_ref(),
+                            Some(k) => extra_envs[k].mem.as_ref(),
+                        };
+                        if let Some(m) = pm {
+                            for d in cdata.iter() {
+                                if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
+                                    for (k, &b) in d.bytes.iter().enumerate() {
+                                        m.set_byte(abs_base + d.offset + k as u64, b);
+                                    }
+                                }
+                            }
+                        }
+                        pm.map(|m| m.nested_view(abs_base, size_log2 as u8))
+                    };
+                    // op 5 grants only Instantiator+AddressSpace; op 13 (`grants` is `Some((ptr, n))`)
+                    // additionally re-grants a by-name cap list read from the parent window, so a spawned
+                    // command resolves an inherited `stdout` by name (STAGE1.md — the shell "exec"
+                    // primitive). The named build fails closed via the shared, fuzzed `spawn_named_child`.
+                    let (mut child_host, cinst, cas) = if let Some((grants_ptr, grants_n)) = grants
                     {
-                        if *fkey == base {
-                            *w = Some(super::WAIT_WOKEN);
-                            woken += 1;
+                        // Parse `grants_n × 16-byte {name_off:u32, name_len:u32, handle:i32, flags:u32}`
+                        // records from the parent window (mirrors the tree-walk op-13 arm in lib.rs).
+                        let pm: Option<&Mem> = match tasks[ti].env {
+                            None => mem.as_ref(),
+                            Some(k) => extra_envs[k].mem.as_ref(),
+                        };
+                        let list: Result<Vec<(String, i32)>, Trap> = (|| {
+                            let m = pm.ok_or(Trap::Malformed)?;
+                            let mut list: Vec<(String, i32)> = Vec::new();
+                            for i in 0..grants_n {
+                                let rec = m.read_window(grants_ptr + i * 16, 16)?;
+                                let name_off =
+                                    u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
+                                let name_len =
+                                    u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
+                                let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+                                let name_bytes = m.read_window(name_off, name_len)?;
+                                let name =
+                                    String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
+                                list.push((name, handle));
+                            }
+                            Ok(list)
+                        })();
+                        let list = match list {
+                            Ok(l) => l,
+                            Err(t) => {
+                                complete(tasks, ti, Err(t));
+                                continue;
+                            }
+                        };
+                        match host.spawn_named_child(&list, child_size) {
+                            Some(triple) => triple,
+                            None => {
+                                complete(tasks, ti, Err(Trap::CapFault));
+                                continue;
+                            }
+                        }
+                    } else {
+                        let mut ch = Host::new();
+                        let cinst = ch.grant_instantiator(0, child_size);
+                        let cas = ch.grant_address_space(0, child_size);
+                        (ch, cinst, cas)
+                    };
+                    // §3.6: a separate-module child serves its OWN offers — enqueue admission,
+                    // handler resolution, and `child_offer` shape all read its module (tree-walk
+                    // lockstep: the spawn sets `self_module` from the grant).
+                    child_host.set_self_module(&cmodule);
+                    // IMPORTS.md phase 3 / §3.3: bind the child module's import manifest against its
+                    // granted powerbox — a chibicc child's generic imports (`write`/`read`/`exit`, and any
+                    // named grant) resolve here, so a compiled command actually does I/O rather than
+                    // `CapFault`ing on its first `write`. `spawn_named_child` registers the *names* but does
+                    // not bind the manifest, so the driver does it (the same `bind_child_manifest` the tree-
+                    // walker's op-13 arm and the JIT's `child_bind_imports` hook call). A `required` slot
+                    // with nothing to bind fails the spawn closed with a probeable `-EINVAL` (as the tree-
+                    // walker does), never a trap. Empty for a manifest-free child (imports is empty → Ok).
+                    if child_host
+                        .bind_child_manifest(&cmodule.imports, &cmodule.types)
+                        .is_err()
+                    {
+                        tasks[ti]
+                            .vt
+                            .active
+                            .set(dst, Reg::from_i32(super::EINVAL as i32));
+                        continue;
+                    }
+                    let child_args = if want_as {
+                        vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
+                    } else {
+                        vec![Value::I64(cinst as i64)]
+                    };
+                    // §3d: a record's budget funds the child here — the commit site, after every
+                    // other refusal (module resolve, geometry, grants, manifest binding).
+                    let child_fuel = if budget != 0 {
+                        match take_spawn_budget(host, budget, child_size, pfuel) {
+                            Err(t) => {
+                                complete(tasks, ti, Err(t));
+                                continue;
+                            }
+                            Ok(None) => {
+                                tasks[ti]
+                                    .vt
+                                    .active
+                                    .set(dst, Reg::from_i32(super::EINVAL as i32));
+                                continue;
+                            }
+                            Ok(Some(f)) => f,
+                        }
+                    } else if quota <= 0 {
+                        pfuel
+                    } else {
+                        (quota as u64).min(pfuel)
+                    };
+                    // Push the child's compiled module and run the child over it — its own domain: a
+                    // natural table mapping into *its* module index (no installed §22 units).
+                    let progs_len = child_compiled.progs.len();
+                    let cm = dom.source.push(child_compiled);
+                    let child_table = build_table_for(progs_len, 0, cm as u32);
+                    let cunit = dom.source.get(cm).ok_or(Trap::Malformed)?;
+                    let mut child_vt = VTask::new(&cunit, entry as usize, &child_args)?;
+                    child_vt.active.module = cm;
+                    child_vt.active.home = cm;
+                    let eidx = extra_envs.len();
+                    extra_envs.push(ChildEnv {
+                        mem: child_mem,
+                        host: std::sync::Arc::new(std::sync::Mutex::new(child_host)),
+                        table: child_table,
+                        fuel: child_fuel,
+                    });
+                    let cidx = tasks.len();
+                    tasks.push(TaskSlot {
+                        vt: child_vt,
+                        threads: Vec::new(),
+                        env: Some(eidx),
+                        state: TaskState::Runnable,
+                    });
+                    let handle = tasks[ti].threads.len() as i32;
+                    tasks[ti].threads.push(Some(cidx));
+                    tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
+                }
+                Ok(VcpuStop::Join { handle, dst }) => {
+                    let slot = match super::resolve_thread(&tasks[ti].threads, handle) {
+                        Ok(s) => s,
+                        Err(t) => {
+                            complete(tasks, ti, Err(t));
+                            continue;
+                        }
+                    };
+                    let child = tasks[ti].threads[slot].expect("resolve_thread checked liveness");
+                    match &tasks[child].state {
+                        TaskState::Done(res) => {
+                            // The child already finished: deliver now (a child trap propagates here).
+                            let res = res.clone();
+                            tasks[ti].threads[slot] = None;
+                            match res {
+                                Ok(vals) => {
+                                    let v = vals.first().copied().unwrap_or(Value::I64(0));
+                                    tasks[ti].vt.active.set(dst, Reg::from_value(v));
+                                }
+                                Err(t) => complete(tasks, ti, Err(t)),
+                            }
+                        }
+                        _ => {
+                            tasks[ti].state = TaskState::BlockedJoin { child, slot, dst };
                         }
                     }
                 }
-                tasks[ti].vt.active.set(dst, Reg::from_i32(woken as i32));
-            }
-            Ok(VcpuStop::JitInstall { h, code, dst }) => {
-                // Resolve authority + the unit's funcs from the host (a forged/cross-domain handle is
-                // an inert CapFault → trap), compile the unit to bytecode, and install it. Compiling
-                // the unit can fail only if it uses an op the bytecode engine doesn't lower yet — the
-                // one place a guest-provided unit can outrun coverage (no tree-walker fallback mid-run).
-                let funcs = match host.resolve_jit_domain(h).and_then(|domain| {
-                    let (cd, cu) = host.resolve_jit_code(code)?;
-                    if cd != domain {
-                        return Err(Trap::CapFault);
-                    }
-                    host.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
-                }) {
-                    Ok(f) => f,
-                    Err(t) => {
-                        complete(&mut tasks, ti, Err(t));
+                Ok(VcpuStop::Wait {
+                    base,
+                    expected,
+                    width,
+                    timeout,
+                    dst,
+                }) => {
+                    // §3.6 slice 5a: a wait issued INSIDE a fiber parks the FIBER, not this vCPU
+                    // (the tree-walk oracle's fiber-park routing — DESIGN.md "blocks the fiber,
+                    // never the domain"; `fiber_parks.rs`). Unwind one chain link to the resumer
+                    // with `(FIBER_PARKED, 0)` and set the fiber aside; the park-time value recheck
+                    // closes the park-vs-store race (a store that already landed wakes it with
+                    // `WAIT_NOT_EQUAL` — after the one transient `FIBER_PARKED`, like the oracle).
+                    if tasks[ti].vt.active_id != ROOT_FIBER {
+                        let durable = host.is_durable();
+                        let k = tasks[ti].vt.active_id;
+                        // I48: read the blocking-resume marker off the parking fiber's `Running` state
+                        // (set at the claim) before it is overwritten with `WaitParked` below.
+                        let blocking_ip = match fibers.get(k) {
+                            Some(FiberState::Running { blocking_ip }) => *blocking_ip,
+                            _ => None,
+                        };
+                        let vt = &mut tasks[ti].vt;
+                        let (rid, resumer, rdst) =
+                            vt.chain.pop().expect("a running fiber has a resumer");
+                        shadow_switch(mem, fiber_sp, &mut vt.root_shadow_sp, durable, k, rid);
+                        let fvm = std::mem::replace(&mut vt.active, resumer);
+                        let cur = mem
+                            .as_ref()
+                            .map(|m| m.atomic_value(base, width))
+                            .unwrap_or(0);
+                        let woken = (cur != expected).then_some(super::WAIT_NOT_EQUAL);
+                        fibers[k] = FiberState::WaitParked {
+                            vm: fvm,
+                            wait_dst: dst,
+                            key: base,
+                            deadline: clock.saturating_add(timeout),
+                            real_deadline: sched_wall_deadline(timeout),
+                            woken,
+                        };
+                        vt.active_id = rid;
+                        // I48: a blocking resume idles the resumer on this fiber instead of the
+                        // FIBER_PARKED poll. Rewind so the wake re-executes the resume; if the
+                        // value-recheck already woke the fiber, keep the task Runnable to re-resume at
+                        // once (the oracle's recheck-re-admit — no transient poll), else park it until
+                        // the fiber's event/idle-timer wakes it.
+                        if let Some(ip) = blocking_ip {
+                            vt.active.pc = ip;
+                            if woken.is_none() {
+                                tasks[ti].state = TaskState::BlockedOnFiber { fiber: k };
+                            }
+                            continue;
+                        }
+                        vt.active.set(rdst, Reg::from_i32(super::FIBER_PARKED));
+                        vt.active.set(rdst + 1, Reg::from_i64(0));
                         continue;
                     }
-                };
-                let res = match compile_module(&funcs) {
-                    Some(unit) => match dom.install(unit) {
-                        Some(slot) => slot as i64,
-                        None => super::ENOSPC,
-                    },
-                    None => {
-                        complete(&mut tasks, ti, Err(Trap::Malformed)); // unit op outside coverage
-                        continue;
+                    // Re-read the value (the cooperative analogue of the futex compare-under-lock): if it
+                    // already changed, return not-equal; else park until notified or timed out. Both the
+                    // value re-read and the rendezvous key are taken against THIS task's own memory: a
+                    // confined `instantiate` child steps against its `extra_envs` window, not the root
+                    // `mem`, and the key is backing-identity canonical (`futex_key`) so two children that
+                    // mapped the same `SharedRegion` into separate windows rendezvous (S1c). Reading the
+                    // root `mem` here instead would make a child's `wait` on its mapped ring flag re-read
+                    // an unrelated root byte and spin forever.
+                    let (cur, key) = {
+                        let tmem: Option<&Mem> = match tasks[ti].env {
+                            None => mem.as_ref(),
+                            Some(k) => extra_envs[k].mem.as_ref(),
+                        };
+                        (
+                            tmem.map(|m| m.atomic_value(base, width)).unwrap_or(0),
+                            tmem.map(|m| m.futex_key(base))
+                                .unwrap_or(super::FutexKey::Anon(base)),
+                        )
+                    };
+                    if cur != expected {
+                        tasks[ti]
+                            .vt
+                            .active
+                            .set(dst, Reg::from_i32(super::WAIT_NOT_EQUAL));
+                    } else {
+                        tasks[ti].state = TaskState::BlockedWait {
+                            key,
+                            deadline: clock.saturating_add(timeout),
+                            dst,
+                        };
                     }
-                };
-                tasks[ti].vt.active.set(dst, Reg::from_i64(res));
-            }
-            Ok(VcpuStop::JitUninstall { h, slot, dst }) => {
-                if let Err(t) = host.resolve_jit_domain(h) {
-                    complete(&mut tasks, ti, Err(t)); // authority check
-                    continue;
                 }
-                let n_real = dom.source.primary().progs.len();
-                let res = if dom.uninstall(slot as usize, n_real) {
-                    0
-                } else {
-                    super::EINVAL
-                };
-                tasks[ti].vt.active.set(dst, Reg::from_i64(res));
-            }
-            Ok(VcpuStop::JitInvoke {
-                h,
-                code,
-                argv,
-                dst,
-                params,
-                results,
-            }) => {
-                // Resolve unit funcs (authority + cross-domain) and compile, as for install.
-                let funcs = match host.resolve_jit_domain(h).and_then(|domain| {
-                    let (cd, cu) = host.resolve_jit_code(code)?;
-                    if cd != domain {
-                        return Err(Trap::CapFault);
-                    }
-                    host.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
-                }) {
-                    Ok(f) => f,
-                    Err(t) => {
-                        complete(&mut tasks, ti, Err(t));
-                        continue;
-                    }
-                };
-                let unit = match compile_module(&funcs) {
-                    Some(u) => u,
-                    None => {
-                        complete(&mut tasks, ti, Err(Trap::Malformed));
-                        continue;
-                    }
-                };
-                // Arity-check the unit entry (func 0) against the call's (code-stripped) signature.
-                let arity_ok = unit
-                    .sigs
-                    .first()
-                    .is_some_and(|(ep, er)| ep.len() == params.len() && er.len() == results.len());
-                if !arity_ok {
-                    complete(&mut tasks, ti, Err(Trap::CapFault));
-                    continue;
-                }
-                // Marshal args via the slot ABI, push the unit as a transient module, run it.
-                let child_args: Vec<Value> = params
-                    .iter()
-                    .zip(argv.iter())
-                    .map(|(ty, s)| slot_to_val(*ty, *s))
-                    .collect();
-                let umod = dom.source.push(unit);
-                match run_invoke(
-                    &dom.source,
-                    &dom.table,
-                    umod,
-                    &child_args,
-                    fuel,
-                    mem,
-                    &mut HostCell::Excl(host),
-                ) {
-                    Ok(vals) => {
-                        for (i, (v, ty)) in vals.iter().zip(results.iter()).enumerate() {
-                            let re = slot_to_val(*ty, val_to_slot(*v));
-                            tasks[ti].vt.active.set(dst + i as u32, Reg::from_value(re));
+                Ok(VcpuStop::Notify { base, count, dst }) => {
+                    // Wake up to `count` waiters, lowest task index first (deterministic). Key on the
+                    // notifying task's own memory + backing identity (mirrors the wait arm), so a notify
+                    // from one child's window matches a waiter parked from another child's window on the
+                    // same `SharedRegion` byte.
+                    let key = {
+                        let tmem: Option<&Mem> = match tasks[ti].env {
+                            None => mem.as_ref(),
+                            Some(k) => extra_envs[k].mem.as_ref(),
+                        };
+                        tmem.map(|m| m.futex_key(base))
+                            .unwrap_or(super::FutexKey::Anon(base))
+                    };
+                    let want = count as u32;
+                    let mut woken = 0u32;
+                    for t in tasks.iter_mut() {
+                        if woken >= want {
+                            break;
+                        }
+                        if let TaskState::BlockedWait {
+                            key: wkey,
+                            dst: wdst,
+                            ..
+                        } = t.state
+                        {
+                            if wkey == key {
+                                t.vt.active.set(wdst, Reg::from_i32(super::WAIT_WOKEN));
+                                t.state = TaskState::Runnable;
+                                woken += 1;
+                            }
                         }
                     }
-                    Err(t) => {
-                        complete(&mut tasks, ti, Err(t));
+                    // §3.6 slice 5a: also wake event-parked FIBER waiters (lowest slot next, deterministic
+                    // like the task scan). Fibers can't coexist with `instantiate` (the module-level veto),
+                    // so a fibered wait is always single-window — it keys on the raw confined address,
+                    // unchanged. The status is delivered when a `cont.resume` claims the fiber.
+                    for f in fibers.iter_mut() {
+                        if woken >= want {
+                            break;
+                        }
+                        if let FiberState::WaitParked {
+                            key: fkey,
+                            woken: w @ None,
+                            ..
+                        } = f
+                        {
+                            if *fkey == base {
+                                *w = Some(super::WAIT_WOKEN);
+                                woken += 1;
+                            }
+                        }
+                    }
+                    tasks[ti].vt.active.set(dst, Reg::from_i32(woken as i32));
+                }
+                Ok(VcpuStop::JitInstall { h, code, dst }) => {
+                    // Resolve authority + the unit's funcs from the host (a forged/cross-domain handle is
+                    // an inert CapFault → trap), compile the unit to bytecode, and install it. Compiling
+                    // the unit can fail only if it uses an op the bytecode engine doesn't lower yet — the
+                    // one place a guest-provided unit can outrun coverage (no tree-walker fallback mid-run).
+                    let funcs = match host.resolve_jit_domain(h).and_then(|domain| {
+                        let (cd, cu) = host.resolve_jit_code(code)?;
+                        if cd != domain {
+                            return Err(Trap::CapFault);
+                        }
+                        host.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
+                    }) {
+                        Ok(f) => f,
+                        Err(t) => {
+                            complete(tasks, ti, Err(t));
+                            continue;
+                        }
+                    };
+                    let res = match compile_module(&funcs) {
+                        Some(unit) => match dom.install(unit) {
+                            Some(slot) => slot as i64,
+                            None => super::ENOSPC,
+                        },
+                        None => {
+                            complete(tasks, ti, Err(Trap::Malformed)); // unit op outside coverage
+                            continue;
+                        }
+                    };
+                    tasks[ti].vt.active.set(dst, Reg::from_i64(res));
+                }
+                Ok(VcpuStop::JitUninstall { h, slot, dst }) => {
+                    if let Err(t) = host.resolve_jit_domain(h) {
+                        complete(tasks, ti, Err(t)); // authority check
                         continue;
+                    }
+                    let n_real = dom.source.primary().progs.len();
+                    let res = if dom.uninstall(slot as usize, n_real) {
+                        0
+                    } else {
+                        super::EINVAL
+                    };
+                    tasks[ti].vt.active.set(dst, Reg::from_i64(res));
+                }
+                Ok(VcpuStop::JitInvoke {
+                    h,
+                    code,
+                    argv,
+                    dst,
+                    params,
+                    results,
+                }) => {
+                    // Resolve unit funcs (authority + cross-domain) and compile, as for install.
+                    let funcs = match host.resolve_jit_domain(h).and_then(|domain| {
+                        let (cd, cu) = host.resolve_jit_code(code)?;
+                        if cd != domain {
+                            return Err(Trap::CapFault);
+                        }
+                        host.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
+                    }) {
+                        Ok(f) => f,
+                        Err(t) => {
+                            complete(tasks, ti, Err(t));
+                            continue;
+                        }
+                    };
+                    let unit = match compile_module(&funcs) {
+                        Some(u) => u,
+                        None => {
+                            complete(tasks, ti, Err(Trap::Malformed));
+                            continue;
+                        }
+                    };
+                    // Arity-check the unit entry (func 0) against the call's (code-stripped) signature.
+                    let arity_ok = unit.sigs.first().is_some_and(|(ep, er)| {
+                        ep.len() == params.len() && er.len() == results.len()
+                    });
+                    if !arity_ok {
+                        complete(tasks, ti, Err(Trap::CapFault));
+                        continue;
+                    }
+                    // Marshal args via the slot ABI, push the unit as a transient module, run it.
+                    let child_args: Vec<Value> = params
+                        .iter()
+                        .zip(argv.iter())
+                        .map(|(ty, s)| slot_to_val(*ty, *s))
+                        .collect();
+                    let umod = dom.source.push(unit);
+                    match run_invoke(
+                        &dom.source,
+                        &dom.table,
+                        umod,
+                        &child_args,
+                        fuel,
+                        mem,
+                        &mut HostCell::Excl(host),
+                    ) {
+                        Ok(vals) => {
+                            for (i, (v, ty)) in vals.iter().zip(results.iter()).enumerate() {
+                                let re = slot_to_val(*ty, val_to_slot(*v));
+                                tasks[ti].vt.active.set(dst + i as u32, Reg::from_value(re));
+                            }
+                        }
+                        Err(t) => {
+                            complete(tasks, ti, Err(t));
+                            continue;
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// #926 slice 2 — deliver an emitted tier-up region's results into the paused task and clear the
+    /// pending slot, so the next [`pump`](Self::pump) resumes it. `vals` are the raw i64 result slots
+    /// the host read out of the emitted `f{func}` run; they are re-tagged into the caller frame's `dst`
+    /// slots per the recorded result types (mirroring [`Vcpu::deliver_tierup`]). A short reply is a
+    /// malformed host reply, which traps the task (its domain tears down, surfacing as the run result).
+    fn deliver_tierup(&mut self, vals: &[i64]) {
+        let (ti, dst, results) = self
+            .pending_tierup
+            .take()
+            .expect("deliver_tierup with no pending tier-up");
+        if vals.len() < results.len() {
+            complete(&mut self.tasks, ti, Err(Trap::Malformed));
+            return;
+        }
+        for (i, ty) in results.iter().enumerate() {
+            self.tasks[ti].vt.active.set(
+                dst as u32 + i as u32,
+                Reg::from_value(slot_to_val(*ty, vals[i])),
+            );
+        }
+    }
+
+    /// #926 slice 2 — the emitted tier-up region trapped: surface it exactly where the interpreter
+    /// would by trapping the paused task (mirroring [`Vcpu::deliver_tierup_trap`]).
+    fn deliver_tierup_trap(&mut self, trap: Trap) {
+        let (ti, _dst, _results) = self
+            .pending_tierup
+            .take()
+            .expect("deliver_tierup_trap with no pending tier-up");
+        complete(&mut self.tasks, ti, Err(trap));
+    }
+}
+
+/// #926 slice 2 tier-up configuration for a cooperative run: the wasm-JIT eligibility bitmap plus
+/// whether it is page-checked (#750). Bundled rather than passed as two loose parameters because
+/// `page_checked` is meaningful only alongside a bitmap — a `None` config is "no tier-up", exactly the
+/// native `drive`. The bitmap is per **module-0** function; a direct call to an `eligible[f] == true`
+/// function surfaces as a tier-up on the root and any same-module `thread.spawn` descendant.
+pub struct TierUpConfig {
+    /// Per-module-0-function eligibility (index = function). `true` ⇒ a direct call tiers up.
+    pub eligible: std::sync::Arc<[bool]>,
+    /// #750 paged tier-up: the emitted region carries a per-access page check, so an unrepresentable
+    /// window surfaces with the reserved size instead of declining.
+    pub page_checked: bool,
+}
+
+/// A pause of the cooperative tier-up driver [`CoopRun`], mirroring the single-vCPU [`VcpuEvent`]'s
+/// tier-up-relevant subset. The cooperative driver services concurrency (`thread.spawn`, join, futex
+/// wait/notify) **internally** — multiplexing every vCPU on the one host thread — so, unlike the
+/// per-Worker parallel driver, those never surface; only the run's end and tier-up round-trips do.
+pub enum CoopEvent {
+    /// The run finished; these are the root task's results.
+    Done(Vec<Value>),
+    /// The run trapped (the root task, or a fatal driver fault).
+    Trapped(Trap),
+    /// A module-0 task paused on an eligible direct `Call` to `func` with raw i64 arg slots `argv`;
+    /// `mapped` is the committed scalar window extent for the emitted `"mapped"` global. The host runs
+    /// the emitted `f{func}` and calls [`CoopRun::deliver_tierup`] / [`CoopRun::deliver_tierup_trap`].
+    TierUp {
+        func: u32,
+        argv: Box<[i64]>,
+        mapped: u64,
+    },
+}
+
+/// A **resumable cooperative tier-up run**: the single-thread, no-Worker analogue of the parallel
+/// `svm_par_*` driver. It owns the run's `Domain`/window/powerbox/fuel and a [`CoopSched`] that
+/// multiplexes every vCPU (root + `thread.spawn` descendants) on this one thread, and pauses to the
+/// host on each wasm-JIT tier-up ([`run`](Self::run) → [`CoopEvent::TierUp`] → run the emitted region
+/// → [`deliver_tierup`](Self::deliver_tierup) → `run` again), exactly the loop the native tests and
+/// the browser cdylib drive it with. With no eligibility bitmap it behaves as `drive`: `run` returns
+/// `Done`/`Trapped` in one call. (#926 slice 2.)
+pub struct CoopRun {
+    dom: Domain,
+    mem: Option<Mem>,
+    host: Host,
+    fuel: u64,
+    sched: CoopSched,
+}
+
+impl CoopRun {
+    /// Build a run over module `m`, entering `entry(args)` with `fuel` and the granted `host` powerbox.
+    /// `tierup` is the tier-up config ([`TierUpConfig`]); pass `None` for a pure-interpreter multiplex.
+    /// `None` if `m` uses an op outside the bytecode engine's subset (the caller falls back to the
+    /// tree-walker), `Some(Err)` if `entry` is out of range.
+    pub fn new(
+        m: &Module,
+        entry: FuncIdx,
+        args: &[Value],
+        mut fuel: u64,
+        mut host: Host,
+        tierup: Option<TierUpConfig>,
+    ) -> Option<Result<CoopRun, Trap>> {
+        let c = compile_module_for(m)?;
+        if entry as usize >= c.progs.len() {
+            return Some(Err(Trap::Malformed));
+        }
+        let dom = Domain::new(c, host.jit_table_log2());
+        let mut mem = build_mem(m);
+        let sched = match CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)
+        {
+            Ok(s) => s,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(Ok(CoopRun {
+            dom,
+            mem,
+            host,
+            fuel,
+            sched,
+        }))
+    }
+
+    /// Pump the schedule to its next pause: [`CoopEvent::Done`]/[`CoopEvent::Trapped`] end the run,
+    /// [`CoopEvent::TierUp`] hands an emitted region to the host (resume with `deliver_tierup*`).
+    pub fn run(&mut self) -> CoopEvent {
+        // `budget` is the per-step op budget `step_vcpu` hands `Vm::resume` (a `0` would run zero ops
+        // and spin on `Outcome::Suspended`); the native `drive` runs unsliced, so match it with
+        // `u64::MAX` — run each vCPU to its next stop. It doubles as the §3d spawn record budget
+        // (`u64::MAX` ⇒ the no-record default `take_spawn_budget` already uses for a normal run).
+        match self.sched.pump(
+            &self.dom,
+            &mut self.mem,
+            &mut self.host,
+            &mut self.fuel,
+            u64::MAX,
+        ) {
+            Ok(CoopStep::Done(vals)) => CoopEvent::Done(vals),
+            Ok(CoopStep::TierUp { func, argv, mapped }) => CoopEvent::TierUp { func, argv, mapped },
+            Err(t) => CoopEvent::Trapped(t),
+        }
+    }
+
+    /// Deliver the emitted tier-up region's raw i64 result slots and resume (see
+    /// [`CoopSched::deliver_tierup`]). Call exactly once after a [`CoopEvent::TierUp`], before `run`.
+    pub fn deliver_tierup(&mut self, vals: &[i64]) {
+        self.sched.deliver_tierup(vals);
+    }
+
+    /// Surface an emitted tier-up region's trap and resume (the paused task traps). Call once after a
+    /// [`CoopEvent::TierUp`] in lieu of [`deliver_tierup`](Self::deliver_tierup).
+    pub fn deliver_tierup_trap(&mut self, trap: Trap) {
+        self.sched.deliver_tierup_trap(trap);
     }
 }
 
