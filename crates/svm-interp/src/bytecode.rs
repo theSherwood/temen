@@ -1084,16 +1084,22 @@ fn take_spawn_budget(
     child_size: u64,
     parent_fuel: u64,
 ) -> Result<Option<u64>, Trap> {
-    let b = host.peek_budget(budget).ok_or(Trap::CapFault)?;
-    if b.mem >= 0 && child_size > b.mem as u64 {
-        return Ok(None); // mem quota short — refuse, budget intact
-    }
-    if b.spawn >= 0 || b.fuel == 0 {
+    // Peek + mem-quota gate is the shared `Host::budget_for_spawn` (#911): `None` = dangling handle
+    // (CapFault), `Some(Err(()))` = bounded mem quota short (refuse `-EINVAL`, budget intact).
+    let (fuel, spawn) = match host.budget_for_spawn(budget, child_size, false) {
+        None => return Err(Trap::CapFault),
+        Some(Err(())) => return Ok(None), // mem quota short — refuse, budget intact
+        Some(Ok(v)) => v,
+    };
+    if spawn >= 0 || fuel == 0 {
         return Ok(None); // narrowed gap (see doc) — refuse, budget intact
     }
-    let b = host.take_budget(budget).ok_or(Trap::CapFault)?;
-    Ok(Some(if b.fuel >= 0 {
-        (b.fuel as u64).min(parent_fuel)
+    // Commit: drain to zero. `take_budget` returns the pre-drain state, so the fuel it reports
+    // equals the `fuel` peeked above — fund from that. Bounded fuel is `min(budget, parent)`,
+    // unbounded inherits the parent's remaining.
+    host.take_budget(budget).ok_or(Trap::CapFault)?;
+    Ok(Some(if fuel >= 0 {
+        (fuel as u64).min(parent_fuel)
     } else {
         parent_fuel
     }))
