@@ -17,7 +17,7 @@ use crate::{mem, CapThunk, TrapKind};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
-use svm_ir::{Data, Func, FuncIdx, ValType};
+use svm_ir::{Data, Func, FuncIdx, SpawnRec, ValType};
 
 /// PROCESS.md S1: per-carve compile-cache key for a **non-durable** child — the identity the compiled
 /// [`crate::ChildCode`] depends on. `funcs_ptr`/`n_funcs` name the module's function slice (stable
@@ -1051,27 +1051,27 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
         return 0;
     }
     let base = (mem_base + rp) as *const u8;
-    let u32_at = |o: usize| -> u32 {
-        let mut b = [0u8; 4];
-        core::ptr::copy_nonoverlapping(base.add(o), b.as_mut_ptr(), 4);
-        u32::from_le_bytes(b)
+    // Copy the 56 bytes out of the guest window once, then share the layout decode with the two
+    // interpreter tiers (#911). `parse` returns `None` on a nonzero version word — fail closed.
+    let mut buf = [0u8; 56];
+    core::ptr::copy_nonoverlapping(base, buf.as_mut_ptr(), 56);
+    let sr = match SpawnRec::parse(&buf) {
+        Some(s) => s,
+        None => {
+            *trap_out = TrapKind::CapFault as i64;
+            return 0;
+        }
     };
-    let u64_at = |o: usize| -> u64 {
-        let mut b = [0u8; 8];
-        core::ptr::copy_nonoverlapping(base.add(o), b.as_mut_ptr(), 8);
-        u64::from_le_bytes(b)
-    };
-    let version = u32_at(0);
-    let entry = u32_at(4) as i64;
-    let off = u64_at(8) as i64;
-    let size_log2 = u32_at(16) as i64;
-    let pager = u32_at(20);
-    let modh = u32_at(24) as i32;
-    let budget = u32_at(28) as i32;
-    let quota = u64_at(32) as i64;
-    let grants_ptr = u64_at(40) as i64;
-    let grants_n = u64_at(48) as i64;
-    if version != 0 || pager != u32::MAX {
+    let entry = sr.entry as i64;
+    let off = sr.off as i64;
+    let size_log2 = sr.size_log2;
+    let pager = sr.pager;
+    let modh = sr.modh;
+    let budget = sr.budget;
+    let quota = sr.quota;
+    let grants_ptr = sr.grants_ptr as i64;
+    let grants_n = sr.grants_n as i64;
+    if pager != u32::MAX {
         *trap_out = TrapKind::CapFault as i64;
         return 0;
     }

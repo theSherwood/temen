@@ -20,10 +20,10 @@ use std::time::{Duration, Instant};
 
 use svm_ir::{
     AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
-    FloatTy, Func, FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, SsaLoc,
-    StoreOp, Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp,
-    VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType,
-    VarInfo, VarLoc, DEFAULT_RESERVED_LOG2,
+    FloatTy, Func, FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, SpawnRec,
+    SsaLoc, StoreOp, Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp,
+    VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx,
+    ValType, VarInfo, VarLoc, DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
 use svm_mem::RmwOp;
@@ -10527,33 +10527,20 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 get_i64(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?
                                     as u64;
                             let m = mem.as_ref().ok_or(Trap::Malformed)?;
-                            let rec = m.read_window(rp, 56)?;
-                            let u32_at = |o: usize| {
-                                u32::from_le_bytes([rec[o], rec[o + 1], rec[o + 2], rec[o + 3]])
-                            };
-                            let u64_at = |o: usize| {
-                                u64::from_le_bytes([
-                                    rec[o],
-                                    rec[o + 1],
-                                    rec[o + 2],
-                                    rec[o + 3],
-                                    rec[o + 4],
-                                    rec[o + 5],
-                                    rec[o + 6],
-                                    rec[o + 7],
-                                ])
-                            };
-                            if u32_at(0) != 0 {
-                                // version — fail closed.
-                                return Err(Trap::CapFault);
-                            }
-                            let entry = u32_at(4) as u64;
-                            let off = u64_at(8);
-                            let size_log2 = u32_at(16) as i64;
-                            let pager = u32_at(20);
-                            let modh = u32_at(24) as i32;
-                            let budget_h = u32_at(28) as i32;
-                            let quota = u64_at(32) as i64;
+                            let raw = m.read_window(rp, 56)?;
+                            let raw: &[u8; 56] =
+                                raw.as_slice().try_into().map_err(|_| Trap::Malformed)?;
+                            // Shared 56-byte layout decode (#911); budget/grant/pager handling below
+                            // stays tier-local (this arm alone validates the budget handle and the
+                            // pager export against `self_module`, and parses the grant list).
+                            let sr = SpawnRec::parse(raw).ok_or(Trap::CapFault)?; // version — fail closed
+                            let entry = sr.entry as u64;
+                            let off = sr.off;
+                            let size_log2 = sr.size_log2;
+                            let pager = sr.pager;
+                            let modh = sr.modh;
+                            let budget_h = sr.budget;
+                            let quota = sr.quota;
                             // §3b: a live Budget handle funds the child — fuel from the budget
                             // (still capped by the physical remaining), the carve gated by its
                             // mem quota, the child's vCPU ceiling tightened by its spawn quota.
@@ -10571,8 +10558,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 }
                                 rec_budget_h = Some(budget_h);
                             }
-                            let grants_ptr = u64_at(40);
-                            let grants_n = u64_at(48);
+                            let grants_ptr = sr.grants_ptr;
+                            let grants_n = sr.grants_n;
                             let mut list: Vec<(String, i32)> = Vec::new();
                             for i in 0..grants_n {
                                 let rec = m.read_window(grants_ptr + i * 16, 16)?;
