@@ -604,7 +604,11 @@ pub fn restore_with_prots(
             TAG_HANDLES => handles_body = Some(body),
             TAG_SERVE => serve_body = Some(body),
             TAG_JIT => jit_body = Some(body),
-            _ => {} // forward-compatible: skip unknown sections
+            // Fail closed on an unknown tag (#915/§8). The version gate above already pins
+            // `version == FORMAT_VERSION`, so no artifact this build emits can carry one — silently
+            // skipping it was dead "forward-compat" that only opened a canonicality hole (a
+            // junk-section artifact restoring identically to a clean one). Reject it.
+            _ => return Err(RestoreError::Malformed),
         }
     }
     let header = header.ok_or(RestoreError::MissingSection(TAG_HEADER))?;
