@@ -1553,6 +1553,13 @@ fn load_op(t: ValType) -> LoadOp {
 /// and each function's result types. Covers the scalar/memory/call subset a Phase-1
 /// prefix can use; returns `UnsupportedInst` for anything else (SIMD, conversions,
 /// concurrency ops), so the transform fails closed rather than mis-typing a frame.
+///
+/// Deliberately **not** `svm_verify::func_value_types` (#913): that one is whole-function and
+/// **total** — it types every op and degrades gracefully (an underivable value is simply absent)
+/// because it feeds the debugger's best-effort view. This one is per-instruction and **fail-closed**
+/// — an op outside the durable Phase-1 subset must *error*, not be typed, or the transform would
+/// spill/reload a frame slot it can't safely freeze. The narrower, erroring shape is the point; the
+/// two are kept separate on purpose rather than merged.
 fn result_types(
     inst: &Inst,
     types: &[ValType],
