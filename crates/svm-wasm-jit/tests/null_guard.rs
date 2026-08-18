@@ -209,3 +209,41 @@ fn unguarded_admits_and_outputs_differ() {
         "unguarded NULL store admits"
     );
 }
+
+/// #964: a `__null_guard`-marked module derives the guard on the **standard** entries — the plain
+/// tier-up emit of a marked module is byte-identical to the explicit measurement entry at
+/// `POWERBOX_NULL_GUARD`, and its NULL probe traps `MemoryFault`; the unmarked twin's plain emit
+/// keeps admitting (pinned by `unguarded_admits_and_outputs_differ` above).
+#[test]
+fn marked_module_derives_guard_on_standard_entries() {
+    let src = format!(
+        "memory 17\nexport 0 func \"_start\" 0\nexport 1 func \"__null_guard\" 0\n{}",
+        SRC.trim_start_matches("memory 17\n")
+    );
+    let m = svm_text::parse_module(&src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    assert_eq!(
+        svm_ir::module_null_guard(&m),
+        Some(GUARD),
+        "marker recognized"
+    );
+
+    let (plain, e1) = svm_wasm_jit::compile_module_tierup(&m, false).expect("plain emits");
+    let (explicit, e2) =
+        compile_module_tierup_nullguard(&m, false, svm_ir::POWERBOX_NULL_GUARD).expect("emits");
+    assert_eq!(
+        plain, explicit,
+        "marked module derives the guard on the plain entry"
+    );
+    assert_eq!(e1, e2);
+    assert_eq!(
+        run_emitted(&plain, 0, &[8]),
+        Err(TRAP_MEMORY_FAULT),
+        "marked plain emit traps a NULL load"
+    );
+    assert_eq!(
+        run_emitted(&plain, 0, &[GUARD as i64]),
+        Ok(0),
+        "marked plain emit admits at the guard boundary"
+    );
+}

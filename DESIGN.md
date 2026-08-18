@@ -1044,6 +1044,22 @@ NUL-terminated UTF-8 strings packed in order. The C entry wrapper scans it to
 build `argv[]`/`envp[]` on the data stack, calls `main(argc, argv)`, then exits
 through its `exit` import (§3d).
 
+**Trap-on-NULL (the guarded layout, #964):** a module carrying the
+`__null_guard` function export declares the **guarded** powerbox layout — its
+low scratch (heap words, format buffer, args blob) sits one
+`POWERBOX_NULL_GUARD` (16 KiB, the max host page) higher, and every tier
+reserves `[0, POWERBOX_NULL_GUARD)`: the interpreter seeds those pages
+`Unmapped` (a guard fault is fatal, never the §14 recoverable kind), the native
+JIT `mprotect`s them inaccessible, and the wasm tier emits a one-compare
+first-byte guard (measured free). The reservation is **permanent** — page ops
+and `instantiate` carves below the guard are refused (the `mmap_min_addr`
+analogue), which is what keeps the baked per-tier guard constants sound.
+Unmarked modules keep the legacy layout byte-for-byte (the marker gates
+everything), so old artifacts — chibicc's generated programs, the nim assets,
+the shell fixtures — coexist with guarded ones. `svm-llvm-translate
+--null-guard` emits the guarded layout; the host seeds args marker-aware
+(`svm_ir::module_args_base`).
+
 ### Deferred
 `File`/`Directory`/`openAt`, `Connector`/networking (§7), async submit/complete
 forms, the own/transfer buffer bit, multi-fiber/TLS clocks, revocation — none block

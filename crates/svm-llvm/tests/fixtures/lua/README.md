@@ -216,7 +216,7 @@ committed (no Rust test consumes it — only the browser `.svmb` does), and `bui
 the `.svmb`:
 
 ```sh
-svm-llvm-translate lua_snapshot.ll -o browser/web/assets/lua_snapshot.svmb --host-page 65536
+svm-llvm-translate lua_snapshot.ll -o browser/web/assets/lua_snapshot.svmb --host-page 65536 --null-guard
 ```
 
 # Lua test-suite fixture

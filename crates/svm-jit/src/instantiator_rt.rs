@@ -339,6 +339,11 @@ pub(crate) struct Nursery {
     /// granted child's `ChildCode` address on its shared powerbox so the locked thunk's serve arm
     /// can resolve + invoke handlers.
     grant_register_serve: std::sync::atomic::AtomicUsize,
+    /// #964: the run's NULL guard (`0` = unguarded), set once at run entry via
+    /// [`Nursery::set_null_guard`] (same interior-mutability contract as `set_durable`). A carve
+    /// overlapping `[0, guard)` of the window is refused `-EINVAL` — the host seeds/copies a
+    /// child's carve outside the guarded call, so an mprotect-guarded carve would fault the host.
+    null_guard: std::sync::atomic::AtomicU64,
 }
 
 // SAFETY: the raw `cap_ctx` is the run's host pointer, valid for the whole run; the `Nursery` is
@@ -388,7 +393,15 @@ impl Nursery {
             grant_register_serve: std::sync::atomic::AtomicUsize::new(0),
             grant_mint: std::sync::atomic::AtomicUsize::new(0),
             grant_thunk: std::sync::atomic::AtomicUsize::new(0),
+            null_guard: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// #964: install the run's NULL guard (see the `null_guard` field). Called once at run entry,
+    /// before any guest code can `instantiate`; child nurseries keep the `0` default (a child's
+    /// own window is unguarded).
+    pub(crate) fn set_null_guard(&self, guard: u64) {
+        self.null_guard.store(guard, Ordering::Release);
     }
 
     /// PROCESS.md S2 (JIT parity): install the granted-child host callbacks — build a granted child's
@@ -709,6 +722,8 @@ pub(crate) unsafe extern "C" fn instantiate(
         && child_size <= size
         && off & (child_size - 1) == 0
         && off.checked_add(child_size).is_some_and(|e| e <= size)
+        // #964: a carve may not dip into the reserved NULL region `[0, guard)` (interp twin).
+        && base + off >= rt.null_guard.load(Ordering::Acquire)
         && (entry as usize) < child_funcs.len();
     if !fits || !mod_ok {
         return EINVAL as i32;
@@ -931,7 +946,9 @@ pub(crate) unsafe extern "C" fn instantiate_named(
     let fits = child_size != 0
         && child_size <= size
         && off & (child_size - 1) == 0
-        && off.checked_add(child_size).is_some_and(|e| e <= size);
+        && off.checked_add(child_size).is_some_and(|e| e <= size)
+        // #964: a carve may not dip into the reserved NULL region `[0, guard)` (interp twin).
+        && base + off >= rt.null_guard.load(Ordering::Acquire);
     if !ok_entry || !fits {
         return EINVAL as i32;
     }
@@ -1226,7 +1243,9 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
     let fits = child_size != 0
         && child_size <= size
         && off & (child_size - 1) == 0
-        && off.checked_add(child_size).is_some_and(|e| e <= size);
+        && off.checked_add(child_size).is_some_and(|e| e <= size)
+        // #964: a carve may not dip into the reserved NULL region `[0, guard)` (interp twin).
+        && base + off >= rt.null_guard.load(Ordering::Acquire);
     if !ok_entry || !fits || !mod_ok {
         return EINVAL as i32;
     }

@@ -1105,7 +1105,18 @@ fn take_spawn_budget(
 /// size-aligned, and the whole span lies within `isize`. Overflow-free (an out-of-range `size_log2`
 /// or a `off + size` past `u64` yields `false`, not a shift/overflow). A future bound tweak lives
 /// here, not in ten pasted copies (#911).
-pub(crate) fn carve_fits(off: u64, size_log2: i64, isize: u64) -> bool {
+///
+/// #964: the carve may also not dip into the holder window's reserved NULL region — `ibase + off`
+/// (the carve's window-relative base; `ibase` is the holder's own base) must clear `null_guard`
+/// (`0` = unguarded, trivially true). The host seeds/copies a carve outside the guarded call, and
+/// the reserved region is permanent by design, so a below-guard carve is refused, not admitted.
+pub(crate) fn carve_fits(
+    off: u64,
+    size_log2: i64,
+    isize: u64,
+    ibase: u64,
+    null_guard: u64,
+) -> bool {
     let child_size = if (0..64).contains(&size_log2) {
         1u64 << size_log2
     } else {
@@ -1115,6 +1126,7 @@ pub(crate) fn carve_fits(off: u64, size_log2: i64, isize: u64) -> bool {
         && child_size <= isize
         && off & (child_size - 1) == 0
         && off.checked_add(child_size).is_some_and(|e| e <= isize)
+        && ibase.checked_add(off).is_some_and(|b| b >= null_guard)
 }
 
 /// A §14 child module's **entry signature** must be `(i64) -> (i64)` (an instantiator handle) or
@@ -1942,6 +1954,7 @@ fn build_mem(m: &Module) -> Option<Mem> {
     m.memory.map(|mc| {
         let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
         mm.init_data(&m.data);
+        mm.seed_null_guard(svm_ir::module_null_guard(m).unwrap_or(0)); // #964
         mm
     })
 }
@@ -2123,6 +2136,7 @@ pub fn compile_and_run_capture(
         let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
         mm.seed(init_mem);
         mm.init_data(&m.data);
+        mm.seed_null_guard(svm_ir::module_null_guard(m).unwrap_or(0)); // #964
         mm
     });
     let r = run(dom, func, args, fuel, &mut mem, &mut host);
@@ -2164,6 +2178,7 @@ pub fn compile_and_run_capture_over(
         );
         mm.seed(init_mem);
         mm.init_data(&m.data);
+        mm.seed_null_guard(svm_ir::module_null_guard(m).unwrap_or(0)); // #964
         mm
     });
     let r = run(dom, func, args, fuel, &mut mem, &mut host);
@@ -2203,6 +2218,7 @@ pub fn compile_and_run_over_shared_with_host(
         let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, mc.size_log2, back);
         if seed_data {
             mm.init_data(&m.data);
+            mm.seed_null_guard(svm_ir::module_null_guard(m).unwrap_or(0)); // #964
         }
         mm
     });
@@ -2220,6 +2236,8 @@ pub struct SharedProgram {
     n_funcs: usize,
     mem_size_log2: Option<u8>,
     data: Vec<super::Data>,
+    /// #964: the module's NULL-guard extent (`0` = unmarked/legacy).
+    null_guard: u64,
 }
 
 impl SharedProgram {
@@ -2232,6 +2250,7 @@ impl SharedProgram {
             n_funcs,
             mem_size_log2: m.memory.map(|mc| mc.size_log2),
             data: m.data.clone(),
+            null_guard: svm_ir::module_null_guard(m).unwrap_or(0),
         })
     }
 
@@ -2295,6 +2314,7 @@ impl SharedProgram {
             if seed_data {
                 mm.init_data(&self.data);
             }
+            mm.seed_null_guard(self.null_guard); // #964
             if let Some(entries) = prots {
                 mm.seed_pages(entries);
             }
@@ -2375,6 +2395,7 @@ pub fn compile_and_run_capture_over_parallel_with_host(
         );
         mm.seed(init_mem);
         mm.init_data(&m.data);
+        mm.seed_null_guard(svm_ir::module_null_guard(m).unwrap_or(0)); // #964
         mm
     });
     let (r, mem) = drive_parallel(dom, func, args, *fuel, mem, host);
@@ -2402,6 +2423,9 @@ pub struct VcpuProgram {
     dom: Domain,
     mem_size_log2: Option<u8>,
     data: Vec<svm_ir::Data>,
+    /// #964: the module's NULL-guard extent (`0` = unmarked/legacy), captured at compile so every
+    /// window this program is run over seeds the same guard the module's layout was built for.
+    null_guard: u64,
 }
 
 impl VcpuProgram {
@@ -2425,6 +2449,7 @@ impl VcpuProgram {
             dom,
             mem_size_log2: m.memory.as_ref().map(|mc| mc.size_log2),
             data: m.data.clone(),
+            null_guard: svm_ir::module_null_guard(m).unwrap_or(0),
         })
     }
 
@@ -2827,6 +2852,7 @@ impl<'p> Vcpu<'p> {
             let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back);
             mm.seed(init_mem);
             mm.init_data(&prog.data);
+            mm.seed_null_guard(prog.null_guard); // #964
             mm
         });
         Vcpu::with_mem(prog, func, args, mem, Host::new())
@@ -2851,6 +2877,7 @@ impl<'p> Vcpu<'p> {
             let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back);
             mm.seed(init_mem);
             mm.init_data(&prog.data);
+            mm.seed_null_guard(prog.null_guard); // #964
             mm
         });
         Vcpu::with_mem(prog, func, args, mem, host)
@@ -2875,6 +2902,7 @@ impl<'p> Vcpu<'p> {
             let mut mm = Mem::with_reservation(reserved_log2, sl);
             mm.seed(init_mem);
             mm.init_data(&prog.data);
+            mm.seed_null_guard(prog.null_guard); // #964
             mm
         });
         Vcpu::with_mem(prog, func, args, mem, host)
@@ -2899,6 +2927,7 @@ impl<'p> Vcpu<'p> {
             let mut mm = Mem::with_reservation_over(reserved_log2, sl, back);
             mm.seed(init_mem);
             mm.init_data(&prog.data);
+            mm.seed_null_guard(prog.null_guard); // #964
             mm
         });
         Vcpu::with_mem(prog, func, args, mem, host)
@@ -3420,7 +3449,13 @@ impl<'p> Vcpu<'p> {
             0
         };
         let off_u = off as u64;
-        let fits = carve_fits(off_u, size_log2, isize);
+        let fits = carve_fits(
+            off_u,
+            size_log2,
+            isize,
+            ibase,
+            self.mem.as_ref().map_or(0, |m| m.null_guard),
+        );
         if !ok_entry || !fits {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
             return Ok(None);
@@ -3502,7 +3537,13 @@ impl<'p> Vcpu<'p> {
             0
         };
         let off_u = off as u64;
-        let fits = carve_fits(off_u, size_log2, isize);
+        let fits = carve_fits(
+            off_u,
+            size_log2,
+            isize,
+            ibase,
+            self.mem.as_ref().map_or(0, |m| m.null_guard),
+        );
         let mod_ok = cmem_log2 == Some(size_log2 as u8);
         if !ok_entry || !fits || !mod_ok {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
@@ -3932,6 +3973,7 @@ pub fn compile_and_run_capture_reserved_with_host(
         let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
         mm.seed(init_mem);
         mm.init_data(&m.data);
+        mm.seed_null_guard(svm_ir::module_null_guard(m).unwrap_or(0)); // #964
         mm
     });
     let r = run(dom, func, args, fuel, &mut mem, host);
@@ -6273,7 +6315,13 @@ fn dbg_instantiate(
         0
     };
     let off_u = off as u64;
-    let fits = carve_fits(off_u, size_log2, isz);
+    let fits = carve_fits(
+        off_u,
+        size_log2,
+        isz,
+        ibase,
+        shared_mem.as_ref().map_or(0, |m| m.null_guard),
+    );
     if !ok_entry || !fits {
         tasks[ti]
             .vt
@@ -6394,7 +6442,13 @@ fn dbg_instantiate_module(
         0
     };
     let off_u = off as u64;
-    let fits = carve_fits(off_u, size_log2, isz);
+    let fits = carve_fits(
+        off_u,
+        size_log2,
+        isz,
+        ibase,
+        shared_mem.as_ref().map_or(0, |m| m.null_guard),
+    );
     let mod_ok = cmem_log2 == Some(size_log2 as u8);
     if !ok_entry || !fits || !mod_ok {
         tasks[ti]
@@ -10065,7 +10119,13 @@ impl CoopSched {
                         0
                     };
                     let off_u = off as u64;
-                    let fits = carve_fits(off_u, size_log2, isz);
+                    let fits = carve_fits(
+                        off_u,
+                        size_log2,
+                        isz,
+                        ibase,
+                        mem.as_ref().map_or(0, |m| m.null_guard),
+                    );
                     if !ok_entry || !fits {
                         tasks[ti]
                             .vt
@@ -10263,7 +10323,13 @@ impl CoopSched {
                         0
                     };
                     let off_u = off as u64;
-                    let fits = carve_fits(off_u, size_log2, isz);
+                    let fits = carve_fits(
+                        off_u,
+                        size_log2,
+                        isz,
+                        ibase,
+                        mem.as_ref().map_or(0, |m| m.null_guard),
+                    );
                     let mod_ok = cmem_log2 == Some(size_log2 as u8);
                     if !ok_entry || !fits || !mod_ok {
                         tasks[ti]
@@ -10934,6 +11000,7 @@ impl CoopRun {
             let mut mm = Mem::with_reservation_over(reserved_log2, mc.size_log2, back);
             mm.seed(init_mem);
             mm.init_data(&m.data);
+            mm.seed_null_guard(svm_ir::module_null_guard(m).unwrap_or(0)); // #964
             mm
         });
         Self::assemble(m, entry, args, fuel, host, tierup, mem)
@@ -11657,7 +11724,13 @@ fn run_vcpu_parallel<'scope, 'env>(
                     0
                 };
                 let off_u = off as u64;
-                let fits = carve_fits(off_u, size_log2, isz);
+                let fits = carve_fits(
+                    off_u,
+                    size_log2,
+                    isz,
+                    ibase,
+                    mem.as_ref().map_or(0, |m| m.null_guard),
+                );
                 if !ok_entry || !fits {
                     vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
                     continue;
@@ -11780,7 +11853,13 @@ fn run_vcpu_parallel<'scope, 'env>(
                     0
                 };
                 let off_u = off as u64;
-                let fits = carve_fits(off_u, size_log2, isz);
+                let fits = carve_fits(
+                    off_u,
+                    size_log2,
+                    isz,
+                    ibase,
+                    mem.as_ref().map_or(0, |m| m.null_guard),
+                );
                 let mod_ok = cmem_log2 == Some(size_log2 as u8);
                 if !ok_entry || !fits || !mod_ok {
                     vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));

@@ -1225,8 +1225,16 @@ impl Debuggee for BytecodeBackend {
             (
                 "stack",
                 Json::obj(vec![
-                    ("argsBase", Json::i(svm_ir::POWERBOX_ARGS_BASE as i64)),
-                    ("argsEnd", Json::i(svm_ir::POWERBOX_ARGS_END as i64)),
+                    // #964: a `__null_guard`-marked module's args blob (and low scratch) sits one
+                    // guard up — report where THIS module actually reads it.
+                    (
+                        "argsBase",
+                        Json::i(svm_ir::module_args_base(&self.module) as i64),
+                    ),
+                    (
+                        "argsEnd",
+                        Json::i(svm_ir::module_args_end(&self.module) as i64),
+                    ),
                     ("stackPage", Json::i(svm_ir::POWERBOX_STACK_PAGE as i64)),
                     (
                         "stackReserve",
@@ -1240,9 +1248,11 @@ impl Debuggee for BytecodeBackend {
                 let b = self.read_window(off, 8).ok()?;
                 Some(i64::from_le_bytes(b.try_into().ok()?))
             };
+            // #964: the heap words ride the (possibly guard-shifted) low scratch.
+            let scratch = svm_ir::module_null_guard(&self.module).unwrap_or(0);
             if let (Some(brk), Some(top)) = (
-                word(svm_ir::POWERBOX_HEAP_BRK),
-                word(svm_ir::POWERBOX_HEAP_TOP),
+                word(scratch + svm_ir::POWERBOX_HEAP_BRK),
+                word(scratch + svm_ir::POWERBOX_HEAP_TOP),
             ) {
                 fields.push((
                     "heap",

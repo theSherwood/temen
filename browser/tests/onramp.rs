@@ -4,7 +4,9 @@
 //! (Lua, SQLite) the same way `svm-run` does natively.
 //!
 //! The fixture `fixtures/hello_onramp.svmb` is `crates/svm-run/demos/hello.c` compiled with stock
-//! `clang -O2 -emit-llvm` and translated (`svm-llvm-translate hello.bc -o hello_onramp.svmb`). The
+//! `clang -O2 -emit-llvm` and translated (`svm-llvm-translate hello.bc -o hello_onramp.svmb
+//! --host-page 65536 --null-guard` — the #964 guarded layout, so this fixture also pins the
+//! marked powerbox path in the browser). The
 //! current on-ramp emits the **by-name** paramless `_start` (S15), whose manifest imports
 //! (`write`/`exit`) bind to slot bindings at instantiation (`grant_onramp_caps`; IMPORTS.md phase 4
 //! — the positional handle-args entry form is gone, and an import-bearing module without the

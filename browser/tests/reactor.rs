@@ -4,7 +4,9 @@
 //! `display` and draining input through `keyboard`. The browser drives it in a requestAnimationFrame
 //! loop; the wasm `svm_onramp_{open,frame,key,close}` exports wrap these same methods.
 //!
-//! Two fixtures, both `clang -O2 -emit-llvm` + `svm-llvm-translate --host-page 65536`:
+//! Two fixtures, both `clang -O2 -emit-llvm` + `svm-llvm-translate --host-page 65536 --null-guard`
+//! (#964 — `life` has a `main`, so it carries the guarded-layout marker; `bounce` is an entry-less
+//! reactor kernel and stays unmarked):
 //! - `fixtures/bounce.svmb` (`display/bounce.c`) — the box's motion is a pure function of its initial
 //!   state + injected key events, asserted to the pixel (animation, input steering, state persistence).
 //! - `fixtures/life.svmb` (`display/life.c`) — Conway's Game of Life on a **malloc heap above the

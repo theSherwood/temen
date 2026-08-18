@@ -75,10 +75,12 @@ fn window(size: usize) -> (Arc<Region>, *mut u8, Layout) {
 /// grows the heap up (via `vm_map`) into the reserved tail — here, into `back` above the window. Only for
 /// a **fresh** window (cold / warmup); a restored snapshot already carries the warm allocator state.
 fn seed_heap(base: *mut u8, ctx: &Ctx) {
+    // #964: a `__null_guard`-marked module's heap words sit one guard up.
+    let scratch = svm_ir::module_null_guard(ctx.module).unwrap_or(0);
     for off in [POWERBOX_HEAP_BRK, POWERBOX_HEAP_TOP] {
-        // SAFETY: `off + 8 <= 48 <= heap_base <= win`; `base` owns `win` bytes.
+        // SAFETY: `scratch + off + 8 <= heap_base <= win`; `base` owns `win` bytes.
         unsafe {
-            let p = base.add(off as usize) as *mut i64;
+            let p = base.add((scratch + off) as usize) as *mut i64;
             p.write_unaligned(ctx.heap_base as i64);
         }
     }
@@ -213,8 +215,9 @@ fn main() {
     let warmup_ms = t.elapsed().as_secs_f64() * 1e3;
     // SAFETY: warmup finished; read the post-warmup bump pointer, then the live prefix, before free.
     let live = unsafe {
-        let brk =
-            (warm_base.add(POWERBOX_HEAP_BRK as usize) as *const i64).read_unaligned() as usize;
+        // #964: the brk word rides the (possibly guard-shifted) low scratch.
+        let brk_off = svm_ir::module_null_guard(ctx.module).unwrap_or(0) + POWERBOX_HEAP_BRK;
+        let brk = (warm_base.add(brk_off as usize) as *const i64).read_unaligned() as usize;
         // `brk` is the heap high-water; clamp defensively to the buffer.
         brk.min(back_size)
     };

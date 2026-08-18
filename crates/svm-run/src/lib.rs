@@ -338,6 +338,11 @@ unsafe fn cap_thunk_impl(
     let pages = host.cap_window_pages(mem_base as usize);
     #[cfg(any(unix, windows))]
     let mut wm = MprotectWindow::new_shared(mem_base, mem_size, mem_reserved, pages);
+    // #964: carry the running module's NULL guard into the window backend (recorded on the host
+    // at `set_self_module` time — the thunk has no module in reach), so `[0, guard)` is refused
+    // to page ops and reads as unmapped to borrow checks, matching the interpreter oracle.
+    #[cfg(any(unix, windows))]
+    wm.set_null_guard(host.null_guard());
     #[cfg(any(unix, windows))]
     let gm: Option<&mut dyn GuestMem> = if mem_base.is_null() {
         None
@@ -2500,6 +2505,12 @@ pub struct MprotectWindow {
     /// persistent home is the `Host` ([`Host::cap_window_pages`]); a one-off [`MprotectWindow::new`]
     /// gets a private fresh map.
     prot: CapPageMap,
+    /// #964: the marked module's reserved NULL region (`0` = unguarded, the default). `[0, guard)`
+    /// reports unmapped to borrow checks and is **refused** to `map`/`unmap`/`protect` (the
+    /// `mmap_min_addr` analogue), mirroring the interpreter's `prot_pages`/`check_prot` so the
+    /// hardware-protected window and the oracle agree. Set from [`svm_interp::Host::null_guard`]
+    /// by the cap thunk ([`MprotectWindow::set_null_guard`]).
+    null_guard: u64,
 }
 
 #[cfg(any(unix, windows))]
@@ -2558,7 +2569,13 @@ impl MprotectWindow {
             reserved: reserved.max(mapped),
             page: host_page_size(),
             prot,
+            null_guard: 0,
         }
+    }
+
+    /// #964: install the running module's NULL guard (see the `null_guard` field). No-op at `0`.
+    pub fn set_null_guard(&mut self, guard: u64) {
+        self.null_guard = guard;
     }
 
     /// Read one page's explicit state from the shared map (locks; `None` ⇒ absent / region default).
@@ -2582,6 +2599,11 @@ impl MprotectWindow {
     /// One page's access state: `None` ⇒ faults (unmapped), `Some(writable)` ⇒ committed — the
     /// same default rule as the interpreter (`svm_interp::Mem::page_access`).
     fn page_access(&self, page: u64) -> Option<bool> {
+        // #964: the reserved NULL region reads as unmapped — a cap-buffer borrow at/near NULL is
+        // refused exactly as the interpreter's `Unmapped`-seeded page map refuses it.
+        if page * self.page < self.null_guard {
+            return None;
+        }
         match self.prot_get(page) {
             Some(PageState::Rw) => Some(true),
             Some(PageState::Ro) => Some(false),
@@ -2611,6 +2633,11 @@ impl MprotectWindow {
     /// interpreter's `prot_pages` (growth into the reserved tail is allowed).
     fn prot_pages(&self, offset: u64, len: u64) -> Result<std::ops::RangeInclusive<u64>, i64> {
         if len == 0 || !offset.is_multiple_of(self.page) {
+            return Err(EINVAL);
+        }
+        // #964: the reserved NULL region is permanent — re-mapping it would make the tiers' baked
+        // guard diverge from the live map (the `mmap_min_addr` analogue; interp `prot_pages` twin).
+        if offset < self.null_guard {
             return Err(EINVAL);
         }
         let end = offset.checked_add(len).ok_or(EINVAL)?;
@@ -3406,16 +3433,19 @@ pub fn is_named_powerbox_entry(module: &Module) -> bool {
 /// guest can resolve any child export by name through the Module capability, so a linking or
 /// child-module artifact must keep everything it publishes.
 pub fn demote_exports(module: &mut Module, keep: &[&str]) -> usize {
+    // `_start` (the powerbox-entry marker) and the #964 NULL-guard marker are semantics a host
+    // resolves — always kept, never demotable to a diagnostic name.
+    let semantic = |name: &str| name == "_start" || name == svm_ir::NULL_GUARD_EXPORT;
     let kept: Vec<svm_ir::Export> = module
         .exports
         .iter()
-        .filter(|e| e.name == "_start" || keep.contains(&e.name.as_str()))
+        .filter(|e| semantic(&e.name) || keep.contains(&e.name.as_str()))
         .cloned()
         .collect();
     let demoted: Vec<svm_ir::FuncName> = module
         .exports
         .iter()
-        .filter(|e| e.name != "_start" && !keep.contains(&e.name.as_str()))
+        .filter(|e| !semantic(&e.name) && !keep.contains(&e.name.as_str()))
         .map(|e| svm_ir::FuncName {
             func: e.func,
             name: e.name.clone(),
@@ -4431,15 +4461,18 @@ impl RunConfig {
     /// `None` when neither `args` nor `env` is set. Seeded *before* the module's data segments (which
     /// live at/above `POWERBOX_ARGS_END`), so the two never overlap. The single source for the
     /// powerbox args layout (shared by `Instance::run`/`run_diff` and the `run_powerbox*` wrappers).
-    fn init_mem(&self) -> Result<Option<Vec<u8>>, String> {
+    fn init_mem(&self, m: &Module) -> Result<Option<Vec<u8>>, String> {
         if self.args.is_empty() && self.env.is_empty() {
             return Ok(None);
         }
         let args: Vec<&[u8]> = self.args.iter().map(|v| v.as_slice()).collect();
         let env: Vec<&[u8]> = self.env.iter().map(|v| v.as_slice()).collect();
         let blob = build_args_blob(&args, &env)?;
-        let mut buf = vec![0u8; svm_ir::POWERBOX_ARGS_BASE as usize + blob.len()];
-        buf[svm_ir::POWERBOX_ARGS_BASE as usize..].copy_from_slice(&blob);
+        // #964: a `__null_guard`-marked module reads its args one guard higher — place the blob
+        // where the module's own `_start` looks (`module_args_base`), legacy 128 otherwise.
+        let base = svm_ir::module_args_base(m) as usize;
+        let mut buf = vec![0u8; base + blob.len()];
+        buf[base..].copy_from_slice(&blob);
         Ok(Some(buf))
     }
 }
@@ -5449,7 +5482,7 @@ impl Instance {
         let owned = self.window_override(config);
         let m = owned.as_ref().unwrap_or(&self.module);
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-        let init_mem = config.init_mem()?;
+        let init_mem = config.init_mem(m)?;
 
         let mut host = Host::new();
         host.stdin = config.stdin.clone();
@@ -5524,7 +5557,7 @@ impl Instance {
         let owned = self.window_override(config);
         let m = owned.as_ref().unwrap_or(&self.module);
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-        let init_mem = config.init_mem()?;
+        let init_mem = config.init_mem(m)?;
 
         let mut host = Host::new();
         host.stdin = config.stdin.clone();
@@ -5583,7 +5616,7 @@ impl Instance {
         let owned = self.window_override(config);
         let m = owned.as_ref().unwrap_or(&self.module);
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-        let init_mem = config.init_mem()?;
+        let init_mem = config.init_mem(m)?;
 
         // Two hosts, granted identically (grants are deterministic, so the handle vectors match).
         let mut hi = Host::new();

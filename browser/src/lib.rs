@@ -3030,9 +3030,10 @@ fn pg_setup(
     let fsh = host.grant_host_proc(fs_hostfn);
     host.register_cap_name("fs", fsh);
     // Seed the caller's `argv` at the powerbox args base (Postgres: a slashed `argv[0]` so
-    // `find_my_exec` resolves; chibicc: `["chibicc", "/in.c"]`).
+    // `find_my_exec` resolves; chibicc: `["chibicc", "/in.c"]`). #964: a `__null_guard`-marked
+    // module reads its args one guard higher — place the blob where its `_start` looks.
     let blob = pg_args_blob(argv);
-    let base = svm_ir::POWERBOX_ARGS_BASE as usize;
+    let base = svm_ir::module_args_base(m) as usize;
     let mut init_mem = vec![0u8; base + blob.len()];
     init_mem[base..].copy_from_slice(&blob);
     Ok((host, init_mem, fs_handle))
@@ -5147,6 +5148,9 @@ struct WarmSession {
     /// High-water of bytes any prior eval may have dirtied (≥ `image.len()`): the restore zeroes
     /// `[image.len(), dirty_end)` so a re-Run sees the same zero tail `warmup` left above the heap.
     dirty_end: usize,
+    /// #964: the module's NULL guard (`0` = legacy layout) — a marked module's powerbox low scratch
+    /// (heap bump words included) sits one guard up, so every brk read/seed offsets by this.
+    scratch: u64,
     /// The cached warm+JIT run (WASM_AOT.md warm+JIT): `eval_run` emitted to wasm **once**, then driven
     /// per Run over the restored warm image. `None` until [`svm_warm_jit_open`]; reusing the emit across
     /// Runs is what keeps a warm+JIT Run off the ~one-time cdylib emit. Held here (not in a global) so
@@ -5157,9 +5161,10 @@ struct WarmSession {
 /// The one live warm session (single-threaded wasm ⇒ a plain static). `None` until [`svm_warm_open`].
 static mut WARM_SESSION: Option<WarmSession> = None;
 
-/// Read the on-ramp guest heap bump pointer (`POWERBOX_HEAP_BRK`) from a window image.
-fn warm_read_brk(win: &[u8]) -> usize {
-    let o = svm_ir::POWERBOX_HEAP_BRK as usize;
+/// Read the on-ramp guest heap bump pointer (`POWERBOX_HEAP_BRK`, shifted one guard up on the #964
+/// marked layout — pass the module's `scratch` base) from a window image.
+fn warm_read_brk(win: &[u8], scratch: u64) -> usize {
+    let o = (scratch + svm_ir::POWERBOX_HEAP_BRK) as usize;
     i64::from_le_bytes(win[o..o + 8].try_into().unwrap()) as usize
 }
 
@@ -5217,13 +5222,15 @@ pub extern "C" fn svm_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
         return -1;
     }
     // Seed the on-ramp heap bump words (`_start` normally does this): brk = top = heap_base.
+    // #964: a marked module's heap words sit one guard up.
+    let scratch = svm_ir::module_null_guard(&m).unwrap_or(0);
     // SAFETY: `win_ptr` owns `win` zeroed bytes; no engine run is in flight (sole access here).
     unsafe {
         let w = core::slice::from_raw_parts_mut(win_ptr, win as usize);
         let hb = (heap_base as i64).to_le_bytes();
         let (b, t) = (
-            svm_ir::POWERBOX_HEAP_BRK as usize,
-            svm_ir::POWERBOX_HEAP_TOP as usize,
+            (scratch + svm_ir::POWERBOX_HEAP_BRK) as usize,
+            (scratch + svm_ir::POWERBOX_HEAP_TOP) as usize,
         );
         w[b..b + 8].copy_from_slice(&hb);
         w[t..t + 8].copy_from_slice(&hb);
@@ -5261,7 +5268,7 @@ pub extern "C" fn svm_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
     // SAFETY: `win_ptr` owns `win` bytes; read the post-warmup image, no run in flight.
     let (image, live) = unsafe {
         let w = core::slice::from_raw_parts(win_ptr, win as usize);
-        let live = warm_read_brk(w).min(win as usize);
+        let live = warm_read_brk(w, scratch).min(win as usize);
         (w[..live].to_vec(), live)
     };
     // SAFETY: single-threaded wasm; the session is read back only via the warm exports.
@@ -5278,6 +5285,7 @@ pub extern "C" fn svm_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
             back,
             image,
             dirty_end: live,
+            scratch,
             jit: None,
         });
     }
@@ -5357,7 +5365,7 @@ pub extern "C" fn svm_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64 {
             .min(s.win) as usize;
         s.dirty_end = s
             .dirty_end
-            .max(warm_read_brk(w).min(s.win as usize))
+            .max(warm_read_brk(w, s.scratch).min(s.win as usize))
             .max(grown);
     }
     set(status);
@@ -5610,7 +5618,9 @@ pub extern "C" fn svm_warm_jit_finish() -> i32 {
     // SAFETY: `win_ptr` owns `win` bytes; read the post-eval brk, no run in flight.
     unsafe {
         let w = core::slice::from_raw_parts(s.win_ptr, s.win as usize);
-        s.dirty_end = s.dirty_end.max(warm_read_brk(w).min(s.win as usize));
+        s.dirty_end = s
+            .dirty_end
+            .max(warm_read_brk(w, s.scratch).min(s.win as usize));
     }
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
