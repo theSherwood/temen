@@ -116,4 +116,22 @@ write(stdout, "hello, svm\n")
 '
 run_fixture iohello '<io>' 'hello, svm\n'
 
-echo "ALL FIXTURES RAN — the full nimony compiler runs on the SVM (single- and multi-module), and its compiled output runs too"
+echo "=== [3/3] the same, with NO native bootstrap (nim_selfdrive — the in-browser card's core) ==="
+# `nim_e2e_chain` above leans on native `nimony c` to lay out the nimcache (stems + .build.nif plan).
+# `nim_selfdrive` needs none of that: given only the Nim source + stdlib it plays nifmake itself —
+# computes each module's stem (gear2/modnames), crawls the `import` graph with nifler.svmb, then runs
+# nimsem/hexer and links + runs. This is the exact logic the browser cdylib will run (#958); proving it
+# here headless de-risks the browser port. Same fixtures, source-only.
+selfdrive() { # <name> <main.nim-relative-in-$w> <export> <expected> [args...]
+  local name="$1" export="$3" expected="$4"; shift 4
+  local w="$CACHE/proj_$name"   # reuse the fixture dirs written above (sources only)
+  echo "--- selfdrive $name: $export(...) == $expected (no native bootstrap) ---"
+  cargo run -q --release -p svm-run --example nim_selfdrive -- \
+    "$OUT/nifler.svmb" "$OUT/nimsem.svmb" "$OUT/hexer.svmb" "$BIN/../lib" "$w" prog.nim \
+    "$export" "$expected" "$@"
+}
+selfdrive addtwo prog.nim addTwo 5 2 3
+selfdrive usermod prog.nim useit 13 4
+selfdrive iohello prog.nim '<io>' 'hello, svm\n'
+
+echo "ALL FIXTURES RAN — the full nimony compiler runs on the SVM (single- and multi-module, with and without a native bootstrap), and its compiled output runs too"
