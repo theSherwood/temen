@@ -849,6 +849,34 @@ int main(void) {
       "front end runs at build time for now, unlike the `svm-leng` card below, which runs the translator " +
       "itself in your browser; committed `nim_hello.svmb`, gated by `nim_hello_asset.rs`.)",
   },
+  'nifler: parse real Nim → NIF (nimony front-end, in your browser)': {
+    kind: 'nifler',
+    editable: true,
+    lang: 'nim',
+    url: './assets/nifler.svmb.gz',
+    mode: 'io',
+    desc: "**Compile Nim in your browser** (NIM.md §3c/§3e slice 4): `nifler` — the *first real nimony " +
+      "compiler phase* (Nim source → parsed NIF) — is itself a Nim program, on-ramped to a verified SVM " +
+      "module through the LLVM/C on-ramp (slice 1), now **running client-side in the sandbox** over your " +
+      "own code. Edit the Nim on the left and click Run: the page seeds it as `/in.nim` on an in-memory " +
+      "`fs` cap, runs `nifler p /in.nim /out.p.nif`, and shows the `.p.nif` it emitted — the same real " +
+      "nifler that parses Nim natively, **byte-identical to a native run** (gated by `nifler_asset.rs`). " +
+      "This is the **front edge** of the toolchain (Nim → NIF), the complement to the `svm-leng` card " +
+      "below (Leng → SVM IR); unlike the `nim (Nim → SVM, runs)` card above, whose front-end ran at " +
+      "*build* time, here a front-end phase runs **in the browser**. The ~17.7 MB module ships gzipped " +
+      "(~3.8 MB) and inflates client-side; the guest reaches only the seeded `fs` — no ambient authority. " +
+      "No server, all in your browser, on the SVM.",
+    src: `# Edit this Nim, then Run: the real nifler (nimony's parser, compiled to SVM)
+# parses it into nimony's NIF — the first compiler phase, in your browser.
+proc fib(n: int): int =
+  if n < 2: n
+  else: fib(n - 1) + fib(n - 2)
+
+let xs = @[1, 2, 3]
+for x in xs:
+  echo fib(x)
+`,
+  },
   'svm-leng: translate real nimony Leng → SVM IR (self-host)': {
     kind: 'module',
     jit: false, // the ~280-func translator module folds to the tree-walker (the native JIT declines it too); the interp run is ~200ms
@@ -1418,6 +1446,14 @@ const readModuleStderr = () =>
   new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(
     eng.ex.svm_stderr_ptr(), eng.ex.svm_stderr_ptr() + eng.ex.svm_stderr_len()));
 
+// Inflate a gzip'd asset to a Uint8Array via the browser's built-in DecompressionStream (no library).
+// Used by the nifler card, whose ~17.7 MB module ships gzipped (~3.8 MB) — see `runNifler`.
+async function gunzip(bytes) {
+  const ds = new DecompressionStream('gzip');
+  const buf = await new Response(new Blob([bytes]).stream().pipeThrough(ds)).arrayBuffer();
+  return new Uint8Array(buf);
+}
+
 // Run a pre-built on-ramp module single-shot on the interpreter: alloc a buffer, copy the module in
 // (plus optional stdin), `svm_run_onramp` (the fixed §3e powerbox — stdout/stdin/exit/memory), read
 // the captured stdout, free. Returns { rv, status, stdout }. No Workers (these guests are
@@ -1944,6 +1980,68 @@ async function runSelfhost(c) {
   c.el.result.textContent = `${obj.length} B`;
   setState(c, 'done', `compiled ${short} (${tier}) · ${obj.length} B object · ${ms}ms`);
   runEnd(rec, { ok: true, status: cstatus, result: `${obj.length} B object` });
+}
+
+// Compile Nim in the browser — the nimony **front-end** card (NIM.md §3c/§3e slice 4). Fetch
+// `nifler.svmb` (the first real nimony phase, Nim → parsed NIF, on-ramped to SVM), seed the editor's
+// Nim as `/in.nim` on an in-memory `fs` cap, run `nifler p /in.nim /out.p.nif`, and show the `.p.nif`
+// it emitted. Mirrors `runSelfhost` (memfs-seeded phase), but the output is a **file** nifler wrote
+// (`svm_run_nifler_fs` reads it back onto the stdout slot), not stdout text, and there is no JIT tier
+// (the ~280-func Nim phase folds to the tree-walker, like the svm-leng card). Bytecode only.
+async function runNifler(c) {
+  const ex = c.ex;
+  setState(c, 'running', 'fetching nifler…');
+  c.el.result.textContent = '';
+  c.el.stdout.textContent = '';
+  c.el.canvas.hidden = true;
+  const rec = runStart(c, { tier: 'interpreter' });
+  let compiler;
+  try {
+    // The asset ships **gzipped** (`nifler.svmb.gz`, ~3.8 MB vs ~17.7 MB raw): fetch the compressed
+    // bytes, then inflate them in the browser (DecompressionStream — no library) to the real module.
+    const gz = await fetchTimed(rec, c, ex.url);
+    compiler = await gunzip(gz);
+    logTo(c, `nifler.svmb.gz: ${gz.length}B → ${compiler.length}B module (inflated)`);
+  } catch (e) {
+    setState(c, 'error', `${e.message} — run \`bash ../crates/svm-run/demos/nifler_svm/build_nifler_svmb.sh\` to generate it`);
+    logTo(c, `fetch/inflate failed: ${e.message}`);
+    runNote(rec, { fetchError: e.message });
+    runEnd(rec, { ok: false });
+    return;
+  }
+  const srcBytes = new TextEncoder().encode(c.editor.getValue());
+  runNote(rec, { moduleBytes: compiler.length, srcBytes: srcBytes.length });
+  setState(c, 'running', 'parsing Nim…');
+  const t0 = performance.now();
+  // Alloc both buffers before writing (svm_alloc may detach linear memory), then run on bytecode.
+  const p = eng.ex.svm_alloc(compiler.length);
+  const sp = eng.ex.svm_alloc(srcBytes.length);
+  const view = new Uint8Array(eng.memory.buffer);
+  view.set(compiler, p);
+  view.set(srcBytes, sp);
+  const rv = Number(eng.ex.svm_run_nifler_fs(p, compiler.length, sp, srcBytes.length));
+  const status = eng.ex.svm_status();
+  eng.ex.svm_dealloc(p, compiler.length);
+  eng.ex.svm_dealloc(sp, srcBytes.length);
+  const ms = runStage(rec, 'parse:interpreter', performance.now() - t0).toFixed(0);
+  runTier(rec, 'interpreter');
+  const nif = readModuleStdout();
+  const nstderr = readModuleStderr();
+  runNote(rec, { nifBytes: nif.length });
+  logTo(c, `nifler parse → ${nif.length}B .p.nif (status ${status}) in ${ms}ms`);
+  // 0 = OK, 5 = clean Exit. A parse error (or a trap) leaves no `.p.nif`; show the guest's stderr.
+  if ((status !== 0 && status !== 5) || nif.length === 0) {
+    c.el.stdout.textContent = nstderr || nif;
+    setState(c, 'error', `parse failed: status ${status}${nstderr ? ` — ${nstderr.trim().split('\n')[0]}` : ''}`);
+    runEnd(rec, { ok: false, status });
+    return;
+  }
+  const bar = '─'.repeat(12);
+  c.el.stdout.textContent =
+    `${bar} nifler parsed your Nim → ${nif.length} B .p.nif (nimony's NIF, on the SVM) ${bar}\n${nif}`;
+  c.el.result.textContent = `${nif.length} B`;
+  setState(c, 'done', `parsed Nim → ${nif.length} B .p.nif · ${ms}ms`);
+  runEnd(rec, { ok: true, status, result: `${nif.length} B .p.nif` });
 }
 
 // Boot PostgreSQL `--single` single-shot on the main engine (the `svm_run_pg` entry): fetch the
@@ -3043,6 +3141,7 @@ async function runDemo(c) {
   if (ex.kind === 'pg') return runPg(c);
   if (ex.kind === 'chibicc') return runChibicc(c);
   if (ex.kind === 'selfhost') return runSelfhost(c);
+  if (ex.kind === 'nifler') return runNifler(c);
   if (ex.kind === 'shell') return runShell(c);
   if (ex.kind === 'module') return runModule(c);
   return runText(c);

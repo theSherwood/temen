@@ -133,6 +133,29 @@ try {
     ? ok('svm-leng self-host card: real hexer Leng → SVM IR in-browser')
     : fail(`svm-leng run: state=${leng.state} result=${leng.result} stdout=${leng.stdout.slice(0, 80)}`);
 
+  // The nifler front-end card (NIM.md §3c/§3e slice 4, "compile Nim in the browser"): its editor holds
+  // a small Nim program, and running it inflates the committed `nifler.svmb.gz` (the first real nimony
+  // phase, always present) and parses that Nim to nimony's NIF — the front edge of the toolchain, run
+  // client-side on the SVM. Assert the editor holds Nim and the run emits a parsed `.p.nif`.
+  const niflerCard = 'nifler: parse real Nim → NIF (nimony front-end, in your browser)';
+  const niflerSrc = await page.evaluate(
+    (sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.getValue(),
+    card(niflerCard),
+  );
+  niflerSrc.includes('proc fib') && niflerSrc.includes('echo')
+    ? ok('nifler card → editor holds a Nim program')
+    : fail(`nifler editor: ${niflerSrc.slice(0, 80)}`);
+  await runCard(page, niflerCard, 40_000);
+  const nifler = await page.evaluate((sel) => ({
+    state: document.querySelector(`${sel} .state`).dataset.state,
+    result: document.querySelector(`${sel} .result`).textContent.trim(),
+    stdout: document.querySelector(`${sel} .stdout`).textContent,
+  }), card(niflerCard));
+  nifler.state === 'done' && nifler.result.endsWith('B') &&
+    nifler.stdout.includes('(.nif') && nifler.stdout.includes('(proc fib')
+    ? ok('nifler front-end card: real Nim → parsed NIF in-browser (Nim compiled on the SVM)')
+    : fail(`nifler run: state=${nifler.state} result=${nifler.result} stdout=${nifler.stdout.slice(0, 100)}`);
+
   // The QuickJS card is wired to the warm-runtime snapshot (WASM_AOT.md): it defaults to the warm path
   // (svm_warm_open runs the QuickJS runtime init once, svm_warm_eval restores that image + evals per Run).
   // Its qjs_snapshot.svmb is committed (always present), so no build guard is needed.
