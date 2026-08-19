@@ -167,13 +167,17 @@ try {
   await runCard(page, niflerCard, 40_000);
   const nifler = await page.evaluate((sel) => ({
     state: document.querySelector(`${sel} .state`).dataset.state,
+    msg: document.querySelector(`${sel} .state`).textContent,
     result: document.querySelector(`${sel} .result`).textContent.trim(),
     stdout: document.querySelector(`${sel} .stdout`).textContent,
   }), card(niflerCard));
+  // #1011 slice 1: nifler now runs the parse on the **wasm-JIT** first (the `.state` message reports
+  // `(wasm-JIT)`, so a silent interpreter fallback would fail here — the parse is the emitted-wasm run).
   nifler.state === 'done' && nifler.result.endsWith('B') &&
-    nifler.stdout.includes('(.nif') && nifler.stdout.includes('(proc fib')
-    ? ok('nifler front-end card: real Nim → parsed NIF in-browser (Nim compiled on the SVM)')
-    : fail(`nifler run: state=${nifler.state} result=${nifler.result} stdout=${nifler.stdout.slice(0, 100)}`);
+    nifler.stdout.includes('(.nif') && nifler.stdout.includes('(proc fib') &&
+    nifler.msg.includes('wasm-JIT')
+    ? ok('nifler front-end card: real Nim → parsed NIF in-browser (Nim parsed on the SVM, wasm-JIT)')
+    : fail(`nifler run: state=${nifler.state} msg=${nifler.msg} result=${nifler.result} stdout=${nifler.stdout.slice(0, 100)}`);
 
   // The whole-program nim compiler card (NIM.md §3c/§3e; #958) — the toolchain capstone: it inflates
   // the three committed phase guests (`nifler`/`nimsem`/`hexer` `.svmb.gz`) + the stdlib image
