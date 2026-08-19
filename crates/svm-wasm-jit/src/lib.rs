@@ -1169,6 +1169,65 @@ fn func_uses_bulk_mem(f: &Func) -> bool {
     })
 }
 
+/// Cap on the **estimated** emitted body size of a single function (bytes). wasm engines reject a
+/// function body over a hard limit (V8: 7,654,321 bytes), which fails `WebAssembly.compile` for the
+/// *whole* module. Set well under that so the conservative estimate below (which over-estimates on
+/// the shipped guests) leaves margin. The one shipped case is the SQLite VDBE dispatcher, whose
+/// bulk-memory body (~7.75 MB) rejoins the subset under #1004 — kept on the interpreter here.
+const MAX_EST_EMITTED_FN_BYTES: usize = 6_500_000;
+
+/// A conservative upper-bound estimate of `f`'s emitted wasm body size. Memory ops carry the fat
+/// confine + NULL-guard sequence; every block is a `br_table` dispatch target whose edges shuffle
+/// the target block's params ([`emit_edge`]). Calibrated to over-estimate on the shipped cards
+/// (0.52–0.84 of the true body size), so `est ≤ cap` implies the real body clears the engine limit
+/// with margin. Fail-safe both ways: an under-estimate merely lets an over-limit function through to
+/// a graceful `WebAssembly.compile` fallback (as before #1004), an over-estimate keeps an emittable
+/// function on the interpreter (a cross-tier leaf) — never an escape (§4 confinement is unaffected).
+fn est_emitted_size(f: &Func) -> usize {
+    let pcount = |t: u32| f.blocks.get(t as usize).map_or(0, |b| b.params.len());
+    f.blocks
+        .iter()
+        .map(|b| {
+            let insts: usize = b
+                .insts
+                .iter()
+                .map(|i| match i {
+                    Inst::Load { .. } | Inst::Store { .. } => 128,
+                    Inst::MemCopy { .. } | Inst::MemMove { .. } | Inst::MemFill { .. } => 256,
+                    _ => 24,
+                })
+                .sum();
+            let edges: usize = match &b.term {
+                Terminator::BrTable {
+                    targets, default, ..
+                } => targets
+                    .iter()
+                    .chain(std::iter::once(default))
+                    .map(|e| 8 + 6 * pcount(e.0))
+                    .sum(),
+                Terminator::BrIf {
+                    then_blk, else_blk, ..
+                } => 8 + 6 * (pcount(*then_blk) + pcount(*else_blk)),
+                Terminator::Br { target, .. } => 8 + 6 * pcount(*target),
+                _ => 8,
+            };
+            8 + insts + edges
+        })
+        .sum()
+}
+
+/// Drop functions whose estimated emitted body exceeds [`MAX_EST_EMITTED_FN_BYTES`] from `in_subset`
+/// — they stay on the interpreter (a cross-tier leaf under the reactor/tier-up paths, exactly as the
+/// pre-#1004 bulk-mem exclusion left the SQLite dispatcher). Shared by every subset computation so
+/// the size valve is uniform.
+fn cap_oversized(m: &Module, in_subset: &mut [bool]) {
+    for (i, f) in m.funcs.iter().enumerate() {
+        if in_subset[i] && est_emitted_size(f) > MAX_EST_EMITTED_FN_BYTES {
+            in_subset[i] = false;
+        }
+    }
+}
+
 /// The function indices `f` calls (direct `Call`s + tail-call terminators — the latter keeps the
 /// reachability sound even though a tail call itself isn't emitted).
 fn func_callees(f: &Func) -> Vec<u32> {
@@ -1283,17 +1342,12 @@ pub fn analyze_from(m: &Module, entry: u32) -> Analysis {
         .iter()
         .map(|f| func_in_subset(m, f, atomics_ok))
         .collect();
-    // #964: a `__null_guard`-marked module's emitted accesses carry the NULL guard, but the
-    // bulk-memory span check has no low bound — so bulk-mem functions leave the subset and run on
-    // the interpreter, which enforces the guard through its page map. Fail-closed; unmarked
-    // modules are untouched (byte-identical emit).
-    if svm_ir::module_null_guard(m).is_some() {
-        for (i, f) in m.funcs.iter().enumerate() {
-            if func_uses_bulk_mem(f) {
-                in_subset[i] = false;
-            }
-        }
-    }
+    // #1004: a `__null_guard`-marked module's bulk-memory span check now carries the guard low bound
+    // ([`emit_span_check`]), so bulk-mem functions stay in-subset and emit — the #964 exclusion is
+    // retired. (Unmarked modules were never affected: their span check emits byte-identically.)
+    // The size valve then keeps a rare over-limit body (the SQLite VDBE dispatcher) off the wasm
+    // tier so the whole-module emit clears the engine's per-function limit.
+    cap_oversized(m, &mut in_subset);
     let interp_leaf: Vec<bool> = m
         .funcs
         .iter()
@@ -1479,15 +1533,15 @@ pub fn compile_module_nested_with_eligibility(
                 .is_ok_and(|tys| tys.iter().all(|t| valtype_byte(*t).is_ok()))
         })
     };
-    // #964: a marked granted unit emits with the NULL guard; its bulk-mem functions (span check
-    // has no low bound) must fall to the cross-tier leaf path or fail closed, exactly as on the
-    // tier-up entries.
+    // #1004: a marked granted unit emits with the NULL guard, and its bulk-mem functions now carry
+    // the guard low bound in their span check ([`emit_span_check`]) — so they emit like any other
+    // in-subset function instead of falling to the cross-tier leaf path.
     let null_guard = svm_ir::module_null_guard(m);
     let mut wasm_of: Vec<Option<u32>> = vec![None; n];
     let mut interp_leaf = vec![false; n];
     let mut emitted: Vec<usize> = Vec::new();
     for (i, f) in m.funcs.iter().enumerate() {
-        if nested_ok(f) && !(null_guard.is_some() && func_uses_bulk_mem(f)) {
+        if nested_ok(f) {
             wasm_of[i] =
                 Some(NESTED_IMPORTED_FUNCS + module_uses_rec(m) as u32 + emitted.len() as u32);
             emitted.push(i);
@@ -2090,17 +2144,22 @@ fn compile_module_tierup_inner(
         .iter()
         .map(|f| func_in_subset_caps(m, f, atomics_ok, nested_caps))
         .collect();
-    if paged.is_some() || null_guard.is_some() {
+    if paged.is_some() {
         // Paged-mode limit (#750): bulk-memory ops have no per-page walk in the emitted span check,
-        // so their functions stay on the interpreter (which honors the full page map). The NULL
-        // guard shares the limit (its span check has no low-bound either). Fail-closed:
-        // dropping them from the subset can only route more code to the oracle.
+        // so their functions stay on the interpreter (which honors the full page map). Fail-closed:
+        // dropping them from the subset can only route more code to the oracle. (The NULL guard no
+        // longer shares this limit — #1004 gave the span check its guard low bound; a marked module
+        // that is *also* paged still excludes them here, the per-page walk being the open problem.)
         for (i, f) in m.funcs.iter().enumerate() {
             if func_uses_bulk_mem(f) {
                 in_subset[i] = false;
             }
         }
     }
+    // #1004 size valve (see `cap_oversized`): a body over the engine's per-function limit stays on
+    // the interpreter — a cross-tier leaf here, since the tier-up `leaf` set below admits any
+    // `marshallable_sig` non-subset function.
+    cap_oversized(m, &mut in_subset);
     // The cross-tier set — functions an emitted `Call`/`call_indirect` routes to `env.call_interp`.
     // Two widths, by who services the bounce:
     //   * **local table** (`reserved_table_log2 == None`): the strict [`interp_leaf`] set —
@@ -3638,6 +3697,29 @@ fn emit_span_check(cx: &mut FnCtx, code: &mut Vec<u8>, base_local: u32, len_loca
     emit_trap(code, TRAP_MEMORY_FAULT);
     code.push(OP_END);
     cx.depth -= 1;
+    // #1004: NULL-guard low bound for a marked module — trap if the span dips into the reserved
+    // `[0, guard)` region. Called inside `if len != 0`, so `len >= 1` and `base` is the span's
+    // lowest byte: `base >= guard` proves every byte is at or above the guard (a *bottom* region
+    // needs no last-byte check, #750's note). This is the span analogue of the scalar
+    // [`emit_null_guard`] — with it, bulk-memory functions of a marked module emit (they no longer
+    // leave the subset in `analyze` / the tier-up fixpoint), trapping exactly where the
+    // interpreter's `check_prot_span` faults on the `Unmapped` guard pages.
+    if let Some(guard) = cx.null_guard {
+        code.push(OP_LOCAL_GET);
+        uleb(code, base_local as u64);
+        code.push(OP_I64_CONST);
+        sleb64(code, MASK as i64);
+        code.push(0x83); // i64.and — same clamp domain as the access itself
+        code.push(OP_I64_CONST);
+        sleb64(code, guard as i64);
+        code.push(0x54); // i64.lt_u → base below the guard?
+        code.push(OP_IF);
+        code.push(BLOCKTYPE_VOID);
+        cx.depth += 1;
+        emit_trap(code, TRAP_MEMORY_FAULT);
+        code.push(OP_END);
+        cx.depth -= 1;
+    }
 }
 
 /// Push the confined linear-memory address `win + (base & MASK)` (an `i32`) for a bulk-op span whose

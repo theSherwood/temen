@@ -247,3 +247,75 @@ fn marked_module_derives_guard_on_standard_entries() {
         "marked plain emit admits at the guard boundary"
     );
 }
+
+/// #1004: the **bulk-memory** span check carries the same guard low bound — a `mem.fill`/`mem.copy`
+/// whose span dips into `[0, guard)` traps on BOTH tiers, and one at or above the guard admits on
+/// both, exactly where the interpreter's `check_prot_span` faults on the seeded `Unmapped` guard
+/// pages. The copy exercises two spans (dst and src), each guard-checked; a zero-length op is a
+/// no-op that never faults even at base 0 (the `if len != 0` short-circuit). The functions emitting
+/// at all (`emitted == [true, true]`) is half the pin — before #1004 a marked module's bulk-mem
+/// functions left the subset and never reached the wasm tier.
+#[test]
+fn bulk_guard_traps_match_the_seeded_interpreter() {
+    // f0(base, len): fill `[base, base+len)` with a constant byte, return base.
+    // f1(dst, src, len): copy `len` bytes src→dst, return dst.
+    let src = r#"memory 17
+func (i64, i64) -> (i64) {
+block 0 (vbase: i64, vlen: i64) {
+  vbyte = i32.const 171
+  mem.fill vbase vbyte vlen
+  return vbase
+  }
+}
+func (i64, i64, i64) -> (i64) {
+block 0 (vdst: i64, vsrc: i64, vlen: i64) {
+  mem.copy vdst vsrc vlen
+  return vdst
+  }
+}
+"#;
+    let m = svm_text::parse_module(src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let (wasm, emitted) = compile_module_tierup_nullguard(&m, false, GUARD).expect("emits");
+    assert_eq!(
+        emitted,
+        vec![true, true],
+        "#1004: bulk-mem functions now emit under the guard"
+    );
+
+    // (base, len, expect_trap): the span's lowest byte vs the guard.
+    let cases: [(i64, i64, bool); 6] = [
+        (0, 8, true),                      // wholly below the guard
+        (GUARD as i64 - 8, 8, true),       // span ends at the guard, base below
+        (GUARD as i64 - 1, 32, true),      // straddles: base below, span crosses past
+        (GUARD as i64, 64, false),         // exactly at the guard
+        (GUARD as i64 + 4096, 128, false), // well inside the window
+        (0, 0, false),                     // zero length: no-op, never faults even at base 0
+    ];
+    // fill (f0): args (base, len).
+    for (base, len, expect_trap) in cases {
+        let e = run_emitted(&wasm, 0, &[base, len]);
+        let o = run_oracle(&m, 0, &[base, len]);
+        assert_eq!(
+            e.is_err(),
+            o.is_err(),
+            "fill divergence at ({base}, {len}): emitted {e:?} vs interp {o:?}"
+        );
+        assert_eq!(e.is_err(), expect_trap, "fill({base}, {len})");
+        if let Err(code) = e {
+            assert_eq!(code, TRAP_MEMORY_FAULT, "fill({base}, {len}) trap kind");
+        }
+    }
+    // copy (f1): dst a safe high region, src the probed span — the src span is guard-checked too.
+    let dst = WIN_SIZE as i64 - 4096;
+    for (base, len, expect_trap) in cases {
+        let e = run_emitted(&wasm, 1, &[dst, base, len]);
+        let o = run_oracle(&m, 1, &[dst, base, len]);
+        assert_eq!(
+            e.is_err(),
+            o.is_err(),
+            "copy(src) divergence at ({base}, {len}): emitted {e:?} vs interp {o:?}"
+        );
+        assert_eq!(e.is_err(), expect_trap, "copy src span ({base}, {len})");
+    }
+}
