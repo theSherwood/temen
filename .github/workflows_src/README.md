@@ -16,6 +16,17 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **`real-browser` Playwright-install apt hardening (#1017)** — the `Install Playwright + Chromium` step
+  runs `npx playwright install --with-deps chromium`, whose `--with-deps` half shells out to `apt-get`;
+  that wedged >10 min on the runner's default `azure.archive.ubuntu.com` mirror **twice** on PR #1016,
+  timing the step out before any browser test ran. Added the same I67 source hardening the LLVM step uses
+  (drop the microsoft/azure `sources.list.d` files, sed the mirrorlist/`.sources` stanzas onto
+  `https://archive.ubuntu.com`) **plus a warm `apt-get update`** immediately before the `npm`/`npx`
+  lines, so Playwright's own apt-get hits a healthy mirror. Pure CI infra; no tree code. (Until copied
+  over, `workflows-in-sync` stays red — the expected mirror-edit friction; `cp
+  .github/workflows_src/*.yml .github/workflows/` drains it, and copying it onto a branch is also what
+  unblocks that branch's `real-browser` re-run.)
+
 - **`arena-stacks` no-op feature removed from the `stack-guard` + `stack-guard-cross-os` jobs (#919)** —
   the `svm-fiber`/`svm-jit` `arena-stacks` feature was a retained no-op (the arena is svm-fiber's
   always-on default backend now), so every `--features stack-check,arena-stacks` invocation just
