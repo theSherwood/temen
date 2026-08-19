@@ -209,12 +209,25 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
     if let Some(r) = m.data_funcrefs.first() {
         return Err(VerifyError::UnlinkedDataFuncref { at: r.at });
     }
-    // Import manifest (§7 / IMPORTS.md phase 1): names must be uniquely resolvable — the
-    // instantiation policy binds by name, so an ambiguous manifest is fail-closed here,
-    // mirroring the export-name check below.
+    // Validate the import manifest (§7 / IMPORTS.md phase 1) in one pass, before `verify_func`
+    // checks any call against it. Two properties per entry:
+    //   - names must be uniquely resolvable — the instantiation policy binds by name, so an
+    //     ambiguous manifest is fail-closed here, mirroring the export-name check below;
+    //   - §3.5 shape: every import must reference a well-formed type-section entry of its declared
+    //     kind — a `func` import a `Func` entry, an `interface` import an `Interface` entry whose
+    //     elements all resolve to `Func` entries. Fail-closed before any binding act.
     for (ii, imp) in m.imports.iter().enumerate() {
         if m.imports[..ii].iter().any(|o| o.name == imp.name) {
             return Err(VerifyError::DuplicateImport { import: ii as u32 });
+        }
+        let shape_ok = match imp.shape {
+            svm_ir::ImportShape::Func(t) => {
+                matches!(m.types.get(t as usize), Some(svm_ir::TypeEntry::Func(_)))
+            }
+            svm_ir::ImportShape::Interface(t) => m.interface_ops(t).is_some(),
+        };
+        if !shape_ok {
+            return Err(VerifyError::ImportShapeInvalid { import: ii as u32 });
         }
     }
     let has_memory = m.memory.is_some();
@@ -228,20 +241,6 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
             m.impl_exports.len(),
             has_memory,
         )?;
-    }
-    // §3.5 import shapes: every import must reference a well-formed type-section entry of its
-    // declared kind — a `func` import a `Func` entry, an `interface` import an `Interface`
-    // entry whose elements all resolve to `Func` entries. Fail-closed before any binding act.
-    for (ii, imp) in m.imports.iter().enumerate() {
-        let ok = match imp.shape {
-            svm_ir::ImportShape::Func(t) => {
-                matches!(m.types.get(t as usize), Some(svm_ir::TypeEntry::Func(_)))
-            }
-            svm_ir::ImportShape::Interface(t) => m.interface_ops(t).is_some(),
-        };
-        if !ok {
-            return Err(VerifyError::ImportShapeInvalid { import: ii as u32 });
-        }
     }
     // Named exports must point at a real function and be uniquely addressable (backends ignore the
     // table, but the host resolves `call("name")` through it, so a dangling/ambiguous name is
@@ -410,24 +409,12 @@ fn verify_func(
                         block: bi,
                         callee: *func,
                     })?;
-                if args.len() != callee.params.len() {
-                    return Err(VerifyError::CallArgCountMismatch {
-                        func: fi,
-                        block: bi,
-                        expected: callee.params.len(),
-                        found: args.len(),
-                    });
+                Cx {
+                    fi,
+                    bi,
+                    types: &types,
                 }
-                {
-                    let cx = Cx {
-                        fi,
-                        bi,
-                        types: &types,
-                    };
-                    for (a, want) in args.iter().zip(&callee.params) {
-                        cx.expect(*a, *want)?;
-                    }
-                }
+                .check_args(args, &callee.params)?;
                 types.extend_from_slice(&callee.results);
                 continue;
             }
@@ -443,25 +430,13 @@ fn verify_func(
                 continue;
             }
             if let Inst::CallIndirect { ty, idx, args } = inst {
-                {
-                    let cx = Cx {
-                        fi,
-                        bi,
-                        types: &types,
-                    };
-                    cx.expect(*idx, ValType::I32)?;
-                    if args.len() != ty.params.len() {
-                        return Err(VerifyError::CallArgCountMismatch {
-                            func: fi,
-                            block: bi,
-                            expected: ty.params.len(),
-                            found: args.len(),
-                        });
-                    }
-                    for (a, want) in args.iter().zip(&ty.params) {
-                        cx.expect(*a, *want)?;
-                    }
-                }
+                let cx = Cx {
+                    fi,
+                    bi,
+                    types: &types,
+                };
+                cx.expect(*idx, ValType::I32)?;
+                cx.check_args(args, &ty.params)?;
                 types.extend_from_slice(&ty.results);
                 continue;
             }
@@ -469,27 +444,15 @@ fn verify_func(
                 sig, handle, args, ..
             } = inst
             {
-                {
-                    let cx = Cx {
-                        fi,
-                        bi,
-                        types: &types,
-                    };
-                    // The handle is a forgeable i32 index; safety is the runtime
-                    // use-site check (host-owned table type_id/generation), not typing.
-                    cx.expect(*handle, ValType::I32)?;
-                    if args.len() != sig.params.len() {
-                        return Err(VerifyError::CallArgCountMismatch {
-                            func: fi,
-                            block: bi,
-                            expected: sig.params.len(),
-                            found: args.len(),
-                        });
-                    }
-                    for (a, want) in args.iter().zip(&sig.params) {
-                        cx.expect(*a, *want)?;
-                    }
-                }
+                let cx = Cx {
+                    fi,
+                    bi,
+                    types: &types,
+                };
+                // The handle is a forgeable i32 index; safety is the runtime
+                // use-site check (host-owned table type_id/generation), not typing.
+                cx.expect(*handle, ValType::I32)?;
+                cx.check_args(args, &sig.params)?;
                 types.extend_from_slice(&sig.results);
                 continue;
             }
@@ -527,25 +490,13 @@ fn verify_func(
                         import: *import,
                     });
                 }
-                {
-                    let cx = Cx {
-                        fi,
-                        bi,
-                        types: &types,
-                    };
-                    cx.expect(*handle, ValType::I32)?;
-                    if args.len() != sig.params.len() {
-                        return Err(VerifyError::CallArgCountMismatch {
-                            func: fi,
-                            block: bi,
-                            expected: sig.params.len(),
-                            found: args.len(),
-                        });
-                    }
-                    for (a, want) in args.iter().zip(&sig.params) {
-                        cx.expect(*a, *want)?;
-                    }
-                }
+                let cx = Cx {
+                    fi,
+                    bi,
+                    types: &types,
+                };
+                cx.expect(*handle, ValType::I32)?;
+                cx.check_args(args, &sig.params)?;
                 types.extend_from_slice(&sig.results);
                 continue;
             }
@@ -585,24 +536,12 @@ fn verify_func(
                         import: *import,
                     });
                 }
-                {
-                    let cx = Cx {
-                        fi,
-                        bi,
-                        types: &types,
-                    };
-                    if args.len() != sig.params.len() {
-                        return Err(VerifyError::CallArgCountMismatch {
-                            func: fi,
-                            block: bi,
-                            expected: sig.params.len(),
-                            found: args.len(),
-                        });
-                    }
-                    for (a, want) in args.iter().zip(&sig.params) {
-                        cx.expect(*a, *want)?;
-                    }
+                Cx {
+                    fi,
+                    bi,
+                    types: &types,
                 }
+                .check_args(args, &sig.params)?;
                 types.extend_from_slice(&sig.results);
                 continue;
             }
@@ -735,17 +674,7 @@ fn verify_func(
                     types: &types,
                 };
                 cx.expect(*handle, ValType::I32)?;
-                if args.len() != sig.params.len() {
-                    return Err(VerifyError::CallArgCountMismatch {
-                        func: fi,
-                        block: bi,
-                        expected: sig.params.len(),
-                        found: args.len(),
-                    });
-                }
-                for (a, want) in args.iter().zip(&sig.params) {
-                    cx.expect(*a, *want)?;
-                }
+                cx.check_args(args, &sig.params)?;
                 types.extend_from_slice(&sig.results);
                 continue;
             }
@@ -1665,17 +1594,7 @@ fn check_tail_call(
     callee_results: &[ValType],
     func_results: &[ValType],
 ) -> Result<(), VerifyError> {
-    if args.len() != callee_params.len() {
-        return Err(VerifyError::CallArgCountMismatch {
-            func: cx.fi,
-            block: cx.bi,
-            expected: callee_params.len(),
-            found: args.len(),
-        });
-    }
-    for (a, want) in args.iter().zip(callee_params) {
-        cx.expect(*a, *want)?;
-    }
+    cx.check_args(args, callee_params)?;
     if callee_results != func_results {
         return Err(VerifyError::ResultCountMismatch {
             func: cx.fi,
@@ -1738,6 +1657,26 @@ impl Cx<'_> {
                 value: v,
                 defined: self.types.len() as u32,
             })
+    }
+
+    /// Check a call's arguments: exactly `params.len()` of them, each defined earlier in this
+    /// block with `params[i]`'s type. The shared body behind every call-shaped op — `call`,
+    /// `call_indirect`, `cap.call`, `call.sym`, `call.import`, `call.import.dyn`, and the two
+    /// `return_call` forms (via [`check_tail_call`]) — mirroring [`check_edge`] on the terminator
+    /// side. (Handle/index operands, where present, are checked by the caller before this.)
+    fn check_args(&self, args: &[ValIdx], params: &[ValType]) -> Result<(), VerifyError> {
+        if args.len() != params.len() {
+            return Err(VerifyError::CallArgCountMismatch {
+                func: self.fi,
+                block: self.bi,
+                expected: params.len(),
+                found: args.len(),
+            });
+        }
+        for (a, want) in args.iter().zip(params) {
+            self.expect(*a, *want)?;
+        }
+        Ok(())
     }
 
     /// An operand must be defined earlier in this block and have exactly `want`'s type.
