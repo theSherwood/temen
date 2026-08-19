@@ -706,6 +706,12 @@ jobs:
         timeout-minutes: 10
         working-directory: browser
         run: |
+          # ISSUES.md I67 (#1017): `npx playwright install --with-deps` shells out to apt-get, which
+          # wedged >10 min on the runner's default azure mirror (twice on PR #1016). Drop the unused
+          # microsoft/azure apt sources and repoint the mirrorlist/.sources stanzas at archive.ubuntu.com,
+          # then warm the hardened cache with an update, so Playwright's own apt-get hits a healthy mirror.
+          sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure* && sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          sudo apt-get update
           npm install playwright@1.56.1
           npx playwright install --with-deps chromium
 
