@@ -31,7 +31,7 @@ repo convention.
     compiler's wasm output is plain linear-memory core wasm (not wasm-GC): the Go
     runtime brings its own allocator, GC, and goroutine multiplexing *inside* the
     module. svm-wasm is feature-complete for typical toolchain output; the gap is
-    widening the `svm-wasi` preview1 shim from 2 syscalls to the ~20 Go uses.
+    widening the WASI preview1 shim (`wasi_named_imports`) from 2 syscalls to the ~20 Go uses.
     **Order: 1–2 weeks.** Buys: unmodified full Go (reflection, maps, channels,
     stdlib) running single-threaded — a compatibility oracle for Route B. Uses
     neither fibers nor `gc.roots`.
@@ -88,7 +88,7 @@ linear-memory stacks, goroutine switching compiled into the functions themselves
 about wasm-GC (svm-wasm's permanent non-goal) is involved.
 
 Work:
-1. **Widen `svm-wasi`** from `fd_write`/`proc_exit` to the preview1 surface Go's
+1. **Widen the WASI shim** (`wasi_named_imports`) from `fd_write`/`proc_exit` to the preview1 surface Go's
    wasip1 runtime imports (~20: `args_*`, `environ_*`, `clock_time_get`, `random_get`,
    `fd_*` on stdio + preopens, `poll_oneoff`, `sched_yield`, `proc_exit`). Same
    embedder-`HostFn` pattern the existing shim uses; WASI semantics stay outside the

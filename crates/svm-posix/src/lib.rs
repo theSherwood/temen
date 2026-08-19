@@ -1,7 +1,8 @@
 //! A **POSIX personality** as an embedder host capability (POSIX.md, §7).
 //!
 //! The "host provides libc as a capability; the §7 named-import mechanism carries it" story — the
-//! same shape as [`svm-wasi`](../svm_wasi), generalized from a WASI subset to the POSIX/libc surface a
+//! same shape as the WASI named-import shim (the `wasi_named_imports` test), generalized from a WASI
+//! subset to the POSIX/libc surface a
 //! fork-less shell (BusyBox `ash` → Bash) links against. [`resolve`] binds libc symbol names to a
 //! single [`svm_interp::cap_id::HOST_PROC`] capability; [`handler`] implements the ops over the guest
 //! window. All libc *semantics* live **here** — outside the interp escape-TCB — reached only through a

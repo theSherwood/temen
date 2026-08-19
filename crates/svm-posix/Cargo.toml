@@ -8,7 +8,7 @@ publish = false
 # (svm-interp) implementing the POSIX/libc surface a fork-less shell needs, plus a §7 import-name
 # resolver binding libc symbol names to it. libc semantics live here, outside the interp TCB match —
 # the guest reaches the personality only through a masked, type-checked capability handle. Generalizes
-# svm-wasi from a WASI subset to the POSIX subset BusyBox/Bash link against.
+# the WASI shim from a WASI subset to the POSIX subset BusyBox/Bash link against.
 
 [dependencies]
 svm-ir = { path = "../svm-ir" }

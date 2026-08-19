@@ -140,7 +140,7 @@ IR→IR pass that fires an embedder hook (observe or veto) around every guest me
 all three backends, for memory-safety validation and cache/page-fault scoring; a **partial evaluator**
 (`svm-peval`, §20c) — a semantics-preserving IR→IR
 > optimizer plus the first **Futamura projection** (specialize an interpreter + fixed program into a
-> residual); a minimal **WASI preview1** host shim (`svm-wasi`, §7) over the `svm-wasm` import
+> residual); a minimal **WASI preview1** host shim (§7, the `wasi_named_imports` test) over the `svm-wasm` import
 > mechanism; **conservative-GC support** (`gc.roots` control-stack root enumeration for a guest's own
 > collector, `GC.md`); and the **interpreter-as-wasm browser build** (`browser/`, §21; `BROWSER.md`) —
 > the bytecode engine compiled to **wasm64** so SVM guests run client-side.
@@ -167,7 +167,6 @@ all three backends, for memory-safety validation and cache/page-fault scoring; a
 | `svm-text` | Text format ⇄ IR (dev/debug; 1:1 with binary) (§3a) | — |
 | `svm-wasm` | **Core-wasm → IR transpiler** — a second frontend (untrusted, re-verified); stack→SSA reconstruction (`WASM.md`) | — |
 | `svm-llvm` | **LLVM-bitcode → IR translator** — the AOT LLVM on-ramp (untrusted, re-verified); dominance-SSA → block-args (§20a, D54; `LLVM.md`) | — |
-| `svm-wasi` | Minimal **WASI preview1** host shim (`fd_write`/`proc_exit`) over the `svm-wasm` import mechanism (§7) | — (host shim) |
 | `svm-peval` | **Partial evaluator** — semantics-preserving IR→IR optimizer + the first Futamura projection (§20c) | — |
 | `svm-durable` | IR→IR **freeze/thaw** transform for durable domains (tooling-tier, +0 TCB; §21, D60; `DURABILITY.md`) | — |
 | `svm-snapshot` | Durable-domain **snapshot artifact codec** (window image + handle table + identity gate; §21; `DURABILITY.md`) | — |
