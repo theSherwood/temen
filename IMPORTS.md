@@ -434,7 +434,7 @@ rule (§2.1).
   spawn now needs only the tid counter — bindings are host state shared
   across vCPUs), and the start-wrapper handle threading. Embedders migrated
   to `Host::set_import_bindings` (svm-wasm's own differential tests,
-  `svm-wasi` — its `bind` helper replaces `resolve_imports` + handle-arg —
+  the `wasi_named_imports` test — its `bind` helper replaces `resolve_imports` + handle-arg —
   and the bench thunk/fast-resolver, which now map the
   `CAP_IMPORT_TYPE_ID` sentinel dispatch by arity).*
 - *`svm-llvm` — **landed.** `_start` synths dropped the by-name resolve

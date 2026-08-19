@@ -23,7 +23,6 @@ members = [
     "crates/svm-wasm",
     "crates/svm-wasm-jit",
     "crates/svm-leng",
-    "crates/svm-wasi",
     "crates/svm-posix",
     "crates/svm-capi",
     "crates/svm-parity",

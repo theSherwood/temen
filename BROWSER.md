@@ -1129,7 +1129,8 @@ storage class no memory store can touch, so V8 register-allocates it. Same debit
 global self-initializes to the standard `1<<61` region budget, so every existing host seed site (all of
 which wrote exactly `1<<61` to the `env` cell) is a byte-identical no-op — a drop-in.
 
-Measured, this machine class (per-loop-iteration ns; `crates/svm-wasm-jit/examples/fuelbench.{rs,mjs}`,
+Measured, this machine class (per-loop-iteration ns; via the cross-engine fuel A/B harness — since
+retired now the A/B is settled for the shipped global, in git history as `examples/fuelbench.{rs,mjs}`;
 min-over-reps, large/small-`n` subtraction, TurboFan-warmed). Columns walk the journey: `mem/dispatch` =
 the original (linear-memory cell, per-dispatch charging); `mem/parity` = safepoint charging alone;
 `global/parity` = **shipped** (both); `nofuel` = fuel removed (upper bound):

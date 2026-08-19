@@ -16208,7 +16208,7 @@ impl Completions {
 /// An **embedder-registered host-capability handler** (iface [`cap_id::HOST_PROC`]): given the `op`,
 /// the slot-encoded `i64` args, and the guest window (`None` if the module has no memory), it runs
 /// the operation and returns its result slots — or a [`Trap`] (e.g. `Trap::Exit`). This is how a
-/// host adds a capability (e.g. an `svm-wasi` shim) **without** touching this crate: the semantics
+/// host adds a capability (e.g. a WASI shim) **without** touching this crate: the semantics
 /// live in the closure, reached only through a granted handle (the §3c masked/type-checked table).
 ///
 /// The last parameter is the §4b [`RegionMinter`] escape hatch — `Some` **only** for a handler
@@ -19122,7 +19122,7 @@ impl Host {
 
     /// §7 Register an **embedder host-capability** handler and grant a handle to it (iface
     /// [`cap_id::HOST_PROC`]). The guest reaches it with `cap.call HOST_PROC <op> <handle> (args)`; the
-    /// closure supplies the semantics, so a host adds a capability (e.g. an `svm-wasi` shim) without
+    /// closure supplies the semantics, so a host adds a capability (e.g. a WASI shim) without
     /// changing the VM. The handler is host code in the **authority** TCB — it sees the guest window
     /// (masked `GuestMem`) but is reached only through this masked, type-checked handle.
     pub fn grant_host_proc(&mut self, f: HostProc) -> i32 {
