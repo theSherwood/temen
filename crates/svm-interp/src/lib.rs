@@ -20870,7 +20870,7 @@ impl Host {
     /// every other coordinate-free cap copies its binding as-is. Returns the child handle,
     /// or `None` for a forged / non-grantable cap. (A pipe end is checked first: it is index-carrying,
     /// so `resolve_copyable` would refuse it.)
-    fn regrant_into_child(&mut self, handle: i32, child: &mut Host) -> Option<i32> {
+    pub(crate) fn regrant_into_child(&mut self, handle: i32, child: &mut Host) -> Option<i32> {
         if let Some((write, backing)) = self.resolve_pipe_end(handle) {
             return Some(child.install_pipe_end(write, backing));
         }
