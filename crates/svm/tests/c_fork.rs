@@ -2887,6 +2887,7 @@ fn opshift_fork(base: svm_interp::HostProcFork) -> svm_interp::HostProcFork {
             signal: forked.signal,
             refork: forked.refork.map(opshift_fork),
             exit: forked.exit,
+            exec_remap: None,
         }
     })
 }

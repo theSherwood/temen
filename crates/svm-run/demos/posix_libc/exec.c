@@ -24,6 +24,9 @@
 
 long __px_exec_resolve(int cap, long path, long len);
 long __px_getenv(int cap, long name, long len);
+long __px_open(int cap, long path, long len, long flags);
+long __px_read(int cap, long fd, long buf, long len);
+long __px_close(int cap, long fd);
 long __vm_exec_module(long mod, long grants, long n, long entry, long sl);
 
 static long xs_len_(char *s) {
@@ -32,8 +35,56 @@ static long xs_len_(char *s) {
   return n;
 }
 
+int execve(char *path, char **argv, char **envp);
+
+/* `#!` scripts (#801, one level per POSIX): a memfs file whose first bytes are `#!` re-execs its
+   interpreter with the script path spliced into argv (`interp [arg] path argv[1..]`). v1
+   divergence, documented: ANY memfs file with a `#!` line runs this way (the memfs has no chmod
+   yet — the exec bit gates only module executables). The depth guard refuses a script
+   interpreter (POSIX: the interpreter must be a real executable). */
+static int xs_script_depth_;
+static int xs_try_script_(char *path, char **argv, char **envp) {
+  if (xs_script_depth_) return -13;
+  long fd = __px_open(0, (long)path, xs_len_(path), 0);
+  if (fd < 0) return -13;
+  char line[128];
+  long n = __px_read(0, fd, (long)line, 127);
+  __px_close(0, fd);
+  if (n < 3 || line[0] != '#' || line[1] != '!') return -13;
+  line[n] = 0;
+  long i = 2;
+  while (line[i] == ' ') i = i + 1;
+  char *interp = line + i;
+  while (line[i] && line[i] != '\n' && line[i] != ' ') i = i + 1;
+  char *arg = 0;
+  if (line[i] == ' ') {
+    line[i] = 0;
+    i = i + 1;
+    while (line[i] == ' ') i = i + 1;
+    if (line[i] && line[i] != '\n') {
+      arg = line + i;
+      while (line[i] && line[i] != '\n') i = i + 1;
+    }
+  }
+  line[i] = 0;
+  if (!*interp) return -13;
+  char *nav[64];
+  long k = 0;
+  nav[k] = interp; k = k + 1;
+  if (arg && *arg) { nav[k] = arg; k = k + 1; }
+  nav[k] = path; k = k + 1;
+  long j = 1;
+  while (argv && argv[j] && k < 62) { nav[k] = argv[j]; k = k + 1; j = j + 1; }
+  nav[k] = 0;
+  xs_script_depth_ = 1;
+  int r = execve(interp, nav, envp);
+  xs_script_depth_ = 0;
+  return r;
+}
+
 int execve(char *path, char **argv, char **envp) {
   long m = __px_exec_resolve(0, (long)path, xs_len_(path));
+  if (m == -13) return xs_try_script_(path, argv, envp);
   if (m < 0) return (int)m;
   /* Pack the args region: argc/envc header at 128, strings NUL-packed at 136.
      Bounds-checked against the region end (16384) — overflow is -E2BIG with

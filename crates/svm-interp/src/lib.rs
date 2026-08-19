@@ -12016,10 +12016,49 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         }
                                     }
                                 }
+                                // #972 — exec keeps the process's **pipe ends** (POSIX keeps
+                                // fds): every PipeEnd binding re-installs into the new powerbox
+                                // (count bumps BEFORE the commit's old-powerbox release, so the
+                                // shared counts never dip), and the personality's exec-remap
+                                // hooks receive the (old, new) handle pairs to re-point its fd
+                                // table — the exit-hook lifecycle family: the core reports
+                                // renumbering of ends the process already held, policy stays
+                                // with the provider.
+                                // Gated on a provider having DECLARED fd-preservation (an
+                                // exec-remap hook registered): the personality's fd table means
+                                // POSIX keeps-fds; a capability-path guest manages its ends
+                                // explicitly through the grant list, and its established exec
+                                // contract is drop-by-default — auto-carrying would inflate its
+                                // counts and break last-close EOF/EPIPE (`yes | head`).
+                                let mut remap: Vec<(i32, i32)> = Vec::new();
+                                let keep_fds = !hg.exec_remap_hooks.is_empty();
+                                for slot in 0..(if keep_fds { hg.table.len() } else { 0 }) {
+                                    let st = &hg.table[slot];
+                                    if st.entry.is_none() {
+                                        continue;
+                                    }
+                                    let old_h = ((st.generation & GEN_MASK) << CAP_LOG2
+                                        | slot as u32)
+                                        as i32;
+                                    if let Some((is_w, backing)) = hg.resolve_pipe_end(old_h) {
+                                        let nh = ch.install_pipe_end(is_w, backing);
+                                        remap.push((old_h, nh));
+                                    }
+                                }
                                 match ch.bind_child_manifest(&cm.imports, &cm.types) {
-                                    Ok(()) => Some((ch, ci, ca, child_size)),
+                                    Ok(()) => {
+                                        for hook in hg.exec_remap_hooks.iter() {
+                                            hook(&remap);
+                                        }
+                                        ch.exec_remap_hooks = hg.exec_remap_hooks.clone();
+                                        Some((ch, ci, ca, child_size))
+                                    }
                                     Err(_) => {
-                                        // Give the entries back: the exec refuses cleanly.
+                                        // Give the entries back and release the pre-bumped pipe
+                                        // ends (a dead never-run child Host has no teardown):
+                                        // the exec refuses cleanly, the caller keeps running.
+                                        ch.drop_all_pipe_writers();
+                                        ch.drop_all_pipe_readers();
                                         let n = ch.host_procs.len();
                                         hg.host_procs = ch.host_procs.drain(n - nmoved..).collect();
                                         None
@@ -16181,6 +16220,10 @@ pub type HostProcFork = Arc<dyn Fn(u64) -> ForkedProc + Send + Sync>;
 /// handler closure, a personality may hand the new domain two extras — both *mechanism-neutral*:
 /// the core installs whatever the provider supplies, and all signal/fork **policy** stays with the
 /// provider (invariant 4).
+/// #972 — the exec-remap hook's shape: called with the `(old_handle, new_handle)` pipe-end pairs
+/// the image-replace carried (see [`ForkedProc::exec_remap`]).
+pub type ExecRemapHook = Arc<dyn Fn(&[(i32, i32)]) + Send + Sync>;
+
 pub struct ForkedProc {
     /// The new domain's handler closure over the provider's (duplicated or shared) state.
     pub handler: HostProc,
@@ -16200,6 +16243,13 @@ pub struct ForkedProc {
     /// for **fork twins** (the tasks in the scheduler's twin registry) — a domain torn down
     /// wholesale at run end is not individually notified.
     pub exit: Option<Arc<dyn Fn(i64) + Send + Sync>>,
+    /// #972 — the new process's **exec remap hook**: the image-replace carries the process's pipe
+    /// ends into the new powerbox (fresh slots) and calls this with the `(old_handle, new_handle)`
+    /// pairs, so a personality whose fd table names handles can re-point its entries — the same
+    /// lifecycle-notification family as `exit`. Mechanism-neutral: the core reports renumbering of
+    /// handles the process already held; what to do with it is the provider's policy (invariant 4).
+    /// `None` = no notification.
+    pub exec_remap: Option<ExecRemapHook>,
 }
 
 impl ForkedProc {
@@ -16212,6 +16262,7 @@ impl ForkedProc {
             signal: None,
             refork: None,
             exit: None,
+            exec_remap: None,
         }
     }
 }
@@ -17061,6 +17112,9 @@ pub struct Host {
     /// task's raw exit status when this host's **fork-twin** task completes, so each personality
     /// retires the process from its own table. Empty for every non-forked host.
     exit_hooks: Vec<Arc<dyn Fn(i64) + Send + Sync>>,
+    /// #972 — hooks the exec image-replace fires with the pipe-end handle remap (see
+    /// [`ForkedProc::exec_remap`]); carried across exec like `exit_hooks` (same process).
+    exec_remap_hooks: Vec<ExecRemapHook>,
     /// #798 slice 2 — the domain's **job-control stop flag**: set/cleared by the personality's
     /// stop closure ([`SignalSource::set_stop`]); every vCPU of the domain polls it per op (beside
     /// `poll_kill`, free-when-clear) and parks [`Blocked::Stopped`] while set. On the `Host` so
@@ -17472,6 +17526,7 @@ impl Host {
             sig_armed: Arc::new(AtomicBool::new(false)),
             sig_source: None,
             exit_hooks: Vec::new(),
+            exec_remap_hooks: Vec::new(),
             stop_flag: Arc::new(AtomicBool::new(false)),
             term_flag: Arc::new(AtomicBool::new(false)),
             park_request: Arc::new(AtomicU64::new(0)),
@@ -17583,6 +17638,7 @@ impl Host {
         // fork-of-fork forks the *twin's* state); either absent keeps the pre-split shared behavior.
         let mut twin_sig: Option<(Arc<dyn SignalSource + Send + Sync>, Arc<AtomicBool>)> = None;
         let mut twin_exit: Vec<Arc<dyn Fn(i64) + Send + Sync>> = Vec::new();
+        let mut twin_exec_remap: Vec<ExecRemapHook> = Vec::new();
         twin.host_procs = self
             .host_procs
             .iter()
@@ -17594,6 +17650,9 @@ impl Host {
                 }
                 if let Some(x) = forked.exit {
                     twin_exit.push(x);
+                }
+                if let Some(x) = forked.exec_remap {
+                    twin_exec_remap.push(x);
                 }
                 HostProcEntry {
                     handler: ProcHandler::Sync(forked.handler),
@@ -17631,6 +17690,7 @@ impl Host {
         // #863 hygiene — the personalities' exit hooks ride the twin's host; the scheduler fires
         // them with the twin's exit status at completion (Live → Zombie in each process table).
         twin.exit_hooks = twin_exit;
+        twin.exec_remap_hooks = twin_exec_remap;
         // The twin gets its own copy of the value-typed quota vectors.
         twin.budgets = self.budgets.clone();
         twin.quota = self.quota;
@@ -19049,6 +19109,13 @@ impl Host {
     /// an image's named imports bind to this handler through the same §3.5 coverage walk offers
     /// use — name-keyed within this explicit grant, signature-checked at bind. No-op on a handle
     /// that is not a live `HostProc`.
+    /// #972 — register an **exec remap hook** on this domain: the image-replace calls it with the
+    /// pipe-end `(old_handle, new_handle)` pairs it carried (see [`ForkedProc::exec_remap`] for
+    /// the fork-twin form). Root-domain counterpart of the `ForkedProc` field.
+    pub fn push_exec_remap_hook(&mut self, hook: ExecRemapHook) {
+        self.exec_remap_hooks.push(hook);
+    }
+
     pub fn set_host_proc_vtable(&mut self, handle: i32, names: Vec<String>, sigs: Vec<FuncType>) {
         if let Ok(Binding::HostProc(idx)) = self.resolve(handle, cap_id::HOST_PROC) {
             if let Some(e) = self.host_procs.get_mut(idx as usize) {
@@ -20750,6 +20817,9 @@ impl Host {
                     }
                     if let Some(x) = forked.exit {
                         child.exit_hooks.push(x);
+                    }
+                    if let Some(x) = forked.exec_remap {
+                        child.exec_remap_hooks.push(x);
                     }
                     let h = child.grant_host_proc_forkable(
                         forked.handler,
