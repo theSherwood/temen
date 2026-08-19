@@ -24,6 +24,9 @@ let jitPrimed = false;
 // that codegen (measured ~0.1–0.7 s with the deployed engine). A dry eval at pre-warm compiles them off
 // the main thread; a warm-interp Run awaits it so its first Run reuses the warmed code.
 let interpWarmPromise = null;
+// The nimony phase guests + stdlib image, cached here after the first `nimAssets` message so each
+// `nimCompile` Run re-uses them instead of re-posting ~28 MB across the worker boundary every time.
+let nimAssets = null;
 
 const u8 = () => new Uint8Array(memory.buffer);
 // Read a captured stream out of the worker's memory. `.slice` copies to a non-shared buffer (TextDecoder
@@ -128,6 +131,52 @@ self.onmessage = async (e) => {
       else if (interpWarmPromise) { try { await interpWarmPromise; } catch { /* dry eval failed → just run */ } }
       const r = await evalWarm(msg.source, msg.jit);
       self.postMessage({ type: 'reply', id: msg.id, ok: true, ...r });
+      return;
+    }
+    if (msg.type === 'nimAssets') {
+      // Cache the nimony phase guests + stdlib image (posted once). Kept as the worker's own copies so
+      // later `nimCompile` Runs need only ship the (small) source, not ~28 MB of guests each time.
+      nimAssets = { nifler: msg.nifler, nimsem: msg.nimsem, hexer: msg.hexer, stdlib: msg.stdlib };
+      self.postMessage({ type: 'reply', id: msg.id, ok: true });
+      return;
+    }
+    if (msg.type === 'nimCompile') {
+      // Compile a whole Nim program through the nimony toolchain on THIS worker (nifler → nimsem → hexer
+      // → svm-leng → link → run under the powerbox), so a multi-minute compile — or a runaway guest that
+      // never returns — stalls only this worker, never the page. Mirrors play.js's main-thread `runNimc`.
+      if (!nimAssets) {
+        self.postMessage({ type: 'reply', id: msg.id, ok: false, error: 'nim assets not loaded' });
+        return;
+      }
+      const { nifler, nimsem, hexer, stdlib } = nimAssets;
+      const src = new TextEncoder().encode(msg.source);
+      const main = new TextEncoder().encode(msg.main || 'prog.nim');
+      // Alloc every buffer before writing any (svm_alloc may grow/detach linear memory), then take one
+      // fresh view and fill them — the same discipline as play.js's `runNimc`.
+      const np = Number(ex.svm_alloc(nifler.length));
+      const smp = Number(ex.svm_alloc(nimsem.length));
+      const hp = Number(ex.svm_alloc(hexer.length));
+      const ip = Number(ex.svm_alloc(stdlib.length));
+      const sp = Number(ex.svm_alloc(src.length));
+      const mp = Number(ex.svm_alloc(main.length));
+      const view = u8();
+      view.set(nifler, np);
+      view.set(nimsem, smp);
+      view.set(hexer, hp);
+      view.set(stdlib, ip);
+      view.set(src, sp);
+      view.set(main, mp);
+      ex.svm_compile_nim_fs(
+        np, nifler.length, smp, nimsem.length, hp, hexer.length,
+        ip, stdlib.length, sp, src.length, mp, main.length);
+      const status = ex.svm_status();
+      ex.svm_dealloc(np, nifler.length);
+      ex.svm_dealloc(smp, nimsem.length);
+      ex.svm_dealloc(hp, hexer.length);
+      ex.svm_dealloc(ip, stdlib.length);
+      ex.svm_dealloc(sp, src.length);
+      ex.svm_dealloc(mp, main.length);
+      self.postMessage({ type: 'reply', id: msg.id, ok: true, status, stdout: readStdout(), stderr: readStderr() });
       return;
     }
     if (msg.type === 'stats') {

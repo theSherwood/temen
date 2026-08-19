@@ -184,11 +184,34 @@ try {
     ? ok('whole-program nim compiler card: the full toolchain compiled + ran a Nim program in-browser')
     : fail(`nimc run: state=${nimc.state} result=${nimc.result} stdout=${nimc.stdout.slice(0, 120)}`);
 
-  // Editing the program and re-running recompiles it: a different write() prints the new text — proving
-  // the whole toolchain re-runs over the user's edits, not a canned result.
+  // #1005: the compile runs on the snapshot worker's own engine, not the main thread. Confirm the nim
+  // worker was spawned (the offload path was taken, not the main-thread fallback).
+  const nimOffloaded = await page.evaluate(() =>
+    !!(globalThis.__snapshotClient && globalThis.__snapshotClient._workers.has('__nimc__')));
+  nimOffloaded
+    ? ok('nim compiler card: the compile ran on a Web Worker (page not blocked)')
+    : fail('nimc offload: no nim worker spawned — compile ran on the main thread');
+
+  // The real regression guard for #1005: while a compile is in flight the **main thread stays
+  // responsive**. Start a re-run without awaiting it, then round-trip a trivial `page.evaluate` through
+  // the page's main-thread event loop — if the compile were synchronous on the main thread (the old bug)
+  // this would block for the whole multi-minute compile; via the worker it returns immediately.
   await page.evaluate((sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.setValue(
     'import std/syncio\nwrite(stdout, "edited: recompiled in the browser\\n")\n'), card(nimcCard));
-  await runCard(page, nimcCard, 180_000);
+  await page.click(`${card(nimcCard)} .run`);
+  // Wait until the compile is genuinely in flight (state 'running'), then time a main-thread round-trip.
+  await page.waitForFunction(
+    (sel) => document.querySelector(sel).dataset.state === 'running',
+    `${card(nimcCard)} .state`, { timeout: 30_000 });
+  const probeStart = Date.now();
+  await page.evaluate(() => 1 + 1); // resolves on the page's main-thread task queue
+  const probeMs = Date.now() - probeStart;
+  probeMs < 5_000
+    ? ok(`nim compiler card: main thread responsive during compile (${probeMs}ms round-trip)`)
+    : fail(`nimc responsiveness: main-thread round-trip took ${probeMs}ms (compile blocking the UI thread?)`);
+  await page.waitForFunction(
+    (sel) => ['done', 'error', 'stopped'].includes(document.querySelector(sel).dataset.state),
+    `${card(nimcCard)} .state`, { timeout: 180_000 });
   const nimc2 = await page.evaluate((sel) => ({
     state: document.querySelector(`${sel} .state`).dataset.state,
     stdout: document.querySelector(`${sel} .stdout`).textContent,
