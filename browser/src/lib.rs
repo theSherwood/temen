@@ -3593,6 +3593,127 @@ pub extern "C" fn svm_run_nifler_fs(
     out.value
 }
 
+/// A cached nifler emit (#1011 slice 1): the `Arc`-shared emit products keyed by a content hash of the
+/// phase module bytes, so a re-Run of the same `nifler.svmb` skips the ~2 s `compile_jit` **and** the
+/// ~2 s `Module` clone — a re-parse becomes build-window + drive. Single-threaded wasm ⇒ a plain static;
+/// one slot (the card runs one nifler). Populated on the first JIT parse, reused on every later one.
+struct NiflerEmitCache {
+    key: u64,
+    emit: CachedEmit,
+}
+static mut NIFLER_EMIT: Option<NiflerEmitCache> = None;
+
+/// A cheap content key for the phase module bytes: FNV-1a over the length plus the first and last 4 KiB.
+/// Distinct committed `.svmb` assets differ in length or head/tail, so this keys the cache without
+/// hashing all ~17 MB on every Run; a rebuilt asset changes the key and re-emits.
+fn nifler_module_key(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf29ce4_84222325u64;
+    let mut mix = |b: u8| h = (h ^ b as u64).wrapping_mul(0x1000_0001b3);
+    for &b in &(bytes.len() as u64).to_le_bytes() {
+        mix(b);
+    }
+    let n = bytes.len();
+    let head = &bytes[..n.min(4096)];
+    let tail = &bytes[n.saturating_sub(4096)..];
+    for &b in head.iter().chain(tail) {
+        mix(b);
+    }
+    h
+}
+
+/// **Wasm-JIT twin of [`svm_run_nifler_fs`]** (#1011 slice 1 — route the nifler phase run through the
+/// wasm-JIT). Decode + verify `nifler.svmb`, seed the editor's Nim as `/in.nim`, and open a single-shot
+/// JIT run of `nifler p /in.nim /out.p.nif` rooted at `_start` — so the ~8k-func nifler phase runs on
+/// **emitted wasm** (its `fopen`/`write`/`exit` bounce cross-tier) instead of the tree-walker. Its output
+/// is the `.p.nif` file it writes, so the run **retains the memfs handle** and
+/// [`svm_onramp_jit_run_finish`] reads `out.p.nif` back onto the stdout slot — the card reads it via the
+/// usual [`svm_stdout_ptr`] accessor, identical to the bytecode path. Drive it with the shared
+/// `svm_onramp_jit_run_*` exports. Returns `0`, else a negative `STATUS_*` (also in [`LAST_STATUS`]) —
+/// notably [`STATUS_UNSUPPORTED`] if `_start` isn't wasm-drivable (the card falls back to
+/// [`svm_run_nifler_fs`]).
+///
+/// The emit is **cached** ([`NiflerEmitCache`]): the first parse pays the emit + `Module` clone; every
+/// later parse of the same nifler reuses the `Arc`-shared emit and only rebuilds the fresh window + memfs
+/// (with the new source), so a re-parse runs near the emitted-wasm run cost rather than re-emitting.
+#[no_mangle]
+pub extern "C" fn svm_run_nifler_jit_open(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    src_ptr: *const u8,
+    src_len: usize,
+) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees each range is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let src = unsafe { core::slice::from_raw_parts(src_ptr, src_len) };
+    // Same memfs + argv the bytecode `svm_run_nifler_fs` builds: source at `/in.nim`, parse to `/out.p.nif`.
+    let image = svm_fs::encode_image(&[("in.nim".to_string(), src.to_vec())], &[]);
+    let argv: [&[u8]; 4] = [b"nifler", b"p", b"/in.nim", b"/out.p.nif"];
+    let key = nifler_module_key(bytes);
+    // Cache hit: reuse the shared emit (no decode / verify / emit / clone). The cached module is a valid
+    // `&Module` for the (unused-on-hit) `m` param, so a hit never touches the raw module bytes.
+    // SAFETY: single-threaded wasm; exclusive access to the cache.
+    let cached = unsafe { (*core::ptr::addr_of!(NIFLER_EMIT)).as_ref() }
+        .filter(|c| c.key == key)
+        .map(|c| c.emit.clone());
+    // The play threads build imports a **shared** memory, so the emitted module must too.
+    let opened = if let Some(emit) = cached {
+        let module_ref = std::sync::Arc::clone(&emit.0);
+        JitOnrampRun::open_owned_run_fs_readback(
+            &module_ref,
+            JIT_RUN_WIN_LOG2,
+            true,
+            &image,
+            &argv,
+            "out.p.nif".to_string(),
+            Some(emit),
+        )
+    } else {
+        // Miss: decode + verify + emit, then stash the emit for next time.
+        let m = match svm_encode::decode_module(bytes) {
+            Ok(m) => m,
+            Err(_) => {
+                set(STATUS_DECODE_ERR);
+                return -STATUS_DECODE_ERR;
+            }
+        };
+        if svm_verify::verify_module(&m).is_err() {
+            set(STATUS_VERIFY_ERR);
+            return -STATUS_VERIFY_ERR;
+        }
+        JitOnrampRun::open_owned_run_fs_readback(
+            &m,
+            JIT_RUN_WIN_LOG2,
+            true,
+            &image,
+            &argv,
+            "out.p.nif".to_string(),
+            None,
+        )
+        .inspect(|r| {
+            // SAFETY: single-threaded wasm; exclusive access to the cache.
+            unsafe {
+                *core::ptr::addr_of_mut!(NIFLER_EMIT) = Some(NiflerEmitCache {
+                    key,
+                    emit: r.cached_emit(),
+                });
+            }
+        })
+    };
+    match opened {
+        Ok(r) => {
+            // SAFETY: single-threaded wasm; the run is touched only by these export accessors.
+            unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = Some(r) };
+            set(STATUS_OK);
+            0
+        }
+        Err(status) => {
+            set(status);
+            -status
+        }
+    }
+}
+
 /// **Compile any Nim in the browser — the nimony compiler card** (NIM.md §3c/§3e, #958). Decode the
 /// three phase modules (`nifler`/`nimsem`/`hexer`), mount the stdlib image on the shared memfs and add
 /// the editor's Nim as `[main].nim`, then run the whole nimony toolchain **client-side** via
@@ -4451,14 +4572,31 @@ impl JitOnrampReactor {
 /// window up front (the emitted `_start` seeds only the heap), then `f0(win, env)` runs the
 /// program. `stdout`/`stderr`/`exit_code` are read back from the host afterward, exactly as
 /// [`onramp_exec`] captures them — so the two tiers are a stdout/exit differential.
+/// A cached emit shared across Runs (#1011 slice 1): the outlined module, its compiled interpreter
+/// program (for cross-tier bounces), the emitted `_start` wasm, and the per-function emit bitmap. All
+/// cheaply `Arc`-cloned — reusing them skips the ~2 s emit + ~2 s `Module` clone on a re-Run of the same
+/// guest (nifler). The interpreter's `SharedProgram` is already an `Arc`-backed cheap clone.
+type CachedEmit = (
+    std::sync::Arc<svm_ir::Module>,
+    std::sync::Arc<bytecode::SharedProgram>,
+    std::sync::Arc<[u8]>,
+    Vec<bool>,
+);
+
 pub struct JitOnrampRun {
-    module: svm_ir::Module,
-    program: bytecode::SharedProgram,
+    /// The outlined module. `Arc` so a cached emit (nifler, #1011 slice 1) is shared with the run
+    /// instead of deep-cloned — a nifler `Module` clone costs ~2 s, as much as the emit itself.
+    module: std::sync::Arc<svm_ir::Module>,
+    /// The compiled interpreter program for cross-tier bounces. `Arc` so the nifler emit cache shares it
+    /// across Runs (its data image is otherwise copied per Run).
+    program: std::sync::Arc<bytecode::SharedProgram>,
     host: Host,
     _backing: Option<Box<[u8]>>,
     back: std::sync::Arc<svm_interp::Region>,
     win_base: usize,
-    emitted_wasm: Vec<u8>,
+    /// The emitted `_start` wasm. `Arc<[u8]>` for the same reason as `module` — the nifler emit cache
+    /// shares these ~40 MB across Runs (the JS driver's V8-compiled Module is cached separately).
+    emitted_wasm: std::sync::Arc<[u8]>,
     emitted: Vec<bool>,
     frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
     /// The emitted `f0`'s trailing `...slots` args. Empty for the paramless `_start` (IMPORTS.md phase
@@ -4479,6 +4617,12 @@ pub struct JitOnrampRun {
     /// cross-tier `Exit`), a throw that did not `exit` is a trap. Keeps the runner from reporting a
     /// truncated run as `STATUS_OK` (INVARIANT 9: a fast backend never runs wrong — it traps or declines).
     trapped: bool,
+    /// A phase guest whose output is a **file it wrote to the memfs**, not stdout (nifler `p /in.nim
+    /// /out.p.nif` — #1011 slice 1): the retained `MemFsHandle` + the memfs key to read back. When set,
+    /// [`output`](Self::output) returns that file's bytes instead of `stdout`, so `svm_onramp_jit_run_finish`
+    /// hands the produced file to the card exactly as the bytecode `onramp_fs_exec_readback` does. `None`
+    /// for a stdout guest (Lua/chibicc), whose memfs handle is dropped.
+    fs_readback: Option<(svm_fs::MemFsHandle, String)>,
 }
 
 /// How a single-shot JIT run feeds its guest — the twin of [`onramp_exec`] (stdin) vs
@@ -4491,6 +4635,10 @@ enum RunInput {
         image: Vec<u8>,
         argv: Vec<Vec<u8>>,
         stdin: Vec<u8>,
+        /// `Some(key)` for a guest whose output is a file it writes to the memfs (nifler's `.p.nif`): the
+        /// mounted `MemFsHandle` is retained and this key read back after the run. `None` for a stdout
+        /// guest (chibicc), whose handle is dropped.
+        readback: Option<String>,
     },
 }
 
@@ -4521,6 +4669,7 @@ impl JitOnrampRun {
             win_log2,
             shared_memory,
             RunInput::Stdin(stdin),
+            None,
         )
     }
 
@@ -4557,7 +4706,46 @@ impl JitOnrampRun {
                 image: image.to_vec(),
                 argv: argv.iter().map(|a| a.to_vec()).collect(),
                 stdin,
+                readback: None,
             },
+        )
+    }
+
+    /// Like [`open_owned_run_fs`](Self::open_owned_run_fs), but the guest's output is a **file it writes
+    /// to the memfs** (at key `readback`), not stdout — the single-shot JIT twin of
+    /// [`onramp_fs_exec_readback`], for a phase guest like nifler (`p /in.nim /out.p.nif`, #1011 slice 1).
+    /// `svm_onramp_jit_run_finish` reads that key back and hands it to the card on the stdout slot, exactly
+    /// as the bytecode path does.
+    pub fn open_owned_run_fs_readback(
+        m: &svm_ir::Module,
+        win_log2: u8,
+        shared_memory: bool,
+        image: &[u8],
+        argv: &[&[u8]],
+        readback: String,
+        cached: Option<CachedEmit>,
+    ) -> Result<JitOnrampRun, i32> {
+        Self::open_owned_run_with_cached(
+            m,
+            win_log2,
+            shared_memory,
+            RunInput::Fs {
+                image: image.to_vec(),
+                argv: argv.iter().map(|a| a.to_vec()).collect(),
+                stdin: Vec::new(),
+                readback: Some(readback),
+            },
+            cached,
+        )
+    }
+
+    /// The run's cached-emit products, cheaply `Arc`-cloned for the nifler emit cache (#1011 slice 1).
+    fn cached_emit(&self) -> CachedEmit {
+        (
+            self.module.clone(),
+            self.program.clone(),
+            self.emitted_wasm.clone(),
+            self.emitted.clone(),
         )
     }
 
@@ -4593,7 +4781,9 @@ impl JitOnrampRun {
                 image: image.to_vec(),
                 argv: argv.iter().map(|a| a.to_vec()).collect(),
                 stdin,
+                readback: None,
             },
+            None,
         )
     }
 
@@ -4603,7 +4793,26 @@ impl JitOnrampRun {
         shared_memory: bool,
         input: RunInput,
     ) -> Result<JitOnrampRun, i32> {
-        let declared = m.memory.map_or(0, |mc| mc.size_log2);
+        Self::open_owned_run_with_cached(m, win_log2, shared_memory, input, None)
+    }
+
+    /// [`open_owned_run_with`](Self::open_owned_run_with) with an optional pre-built emit — the seam the
+    /// nifler emit cache (#1011 slice 1) uses to skip the ~2 s emit + `Module` clone on a re-Run. On a hit
+    /// only the fresh window backing + per-run powerbox are built around the shared emit; on a miss the
+    /// emit runs and `cached` is `None`.
+    fn open_owned_run_with_cached(
+        m: &svm_ir::Module,
+        win_log2: u8,
+        shared_memory: bool,
+        input: RunInput,
+        cached: Option<CachedEmit>,
+    ) -> Result<JitOnrampRun, i32> {
+        // A cached module already declares the enlarged window; a fresh one uses the module's own
+        // declared size as the floor. Either way the owned backing must equal the size the emitter masks.
+        let declared = cached
+            .as_ref()
+            .and_then(|(md, ..)| md.memory.map(|mc| mc.size_log2))
+            .unwrap_or_else(|| m.memory.map_or(0, |mc| mc.size_log2));
         let win_log2 = win_log2.max(declared);
         let win_size = 1u64 << win_log2;
         let mut backing = vec![0u8; win_size as usize].into_boxed_slice();
@@ -4622,6 +4831,7 @@ impl JitOnrampRun {
             win_log2,
             shared_memory,
             input,
+            cached,
         )
     }
 
@@ -4636,20 +4846,53 @@ impl JitOnrampRun {
         win_log2: u8,
         shared_memory: bool,
         input: RunInput,
+        cached: Option<CachedEmit>,
     ) -> Result<JitOnrampRun, i32> {
-        onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
-        let mut module = m.clone();
-        svm_wasm_jit::outline_cap_calls(&mut module);
-        // Enlarge the mapped window to cover the guest's heap (fixed — emitted code can't grow it).
-        if let Some(mc) = module.memory.as_mut() {
-            if (mc.size_log2 as u32) < win_log2 as u32 {
-                mc.size_log2 = win_log2;
+        // The emit (outline → interp program → `compile_jit`) is what a re-Run reuses via `cached`
+        // (#1011 slice 1): a nifler emit is ~2 s and its `Module` clone another ~2 s, so a cache hand
+        // here turns a re-Run into build-window + drive. On a miss we emit fresh and return the products
+        // (all `Arc`-shared) so the caller can stash them for next time.
+        let (module, program, emitted_wasm, emitted): CachedEmit = match cached {
+            Some(c) => c,
+            None => {
+                onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
+                let mut module = m.clone();
+                svm_wasm_jit::outline_cap_calls(&mut module);
+                // Enlarge the mapped window to cover the guest's heap (fixed — emitted code can't grow it).
+                if let Some(mc) = module.memory.as_mut() {
+                    if (mc.size_log2 as u32) < win_log2 as u32 {
+                        mc.size_log2 = win_log2;
+                    }
+                }
+                // Compile once — reused for every cross-tier bounce (and shared across Runs via the cache).
+                let program = std::sync::Arc::new(
+                    bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?,
+                );
+                // Emit rooted at func 0 (`_start`), wasm-driven; cross-tier helpers route to
+                // `env.call_interp`. The front door reports `InterpDriven` (→ fall back to the pure
+                // interpreter) if `_start` is out of subset or its reachable set can suspend — this
+                // driver can only run a wasm-driven artifact.
+                let artifact = svm_wasm_jit::compile_jit(
+                    &module,
+                    svm_wasm_jit::Shape::Batch { entry: 0 },
+                    shared_memory,
+                )
+                .map_err(|_| STATUS_UNSUPPORTED)?;
+                let svm_wasm_jit::DriveMode::WasmDriven { .. } = artifact.drive else {
+                    return Err(STATUS_UNSUPPORTED);
+                };
+                (
+                    std::sync::Arc::new(module),
+                    program,
+                    std::sync::Arc::from(artifact.wasm),
+                    artifact.emitted,
+                )
             }
-        }
+        };
         // Build the powerbox + the window-prefix seed (`init_mem`, the argv blob for the `Fs` path)
         // from the input shape. `frame` is only ever populated by a `display.present` — kept for
         // struct parity; a compiler/compute guest never presents.
-        let (host, init_mem, frame): (Host, Vec<u8>, _) = match input {
+        let (host, init_mem, frame, fs_readback): (Host, Vec<u8>, _, _) = match input {
             RunInput::Stdin(stdin) => {
                 let mut host = Host::new();
                 host.stdin = stdin;
@@ -4657,20 +4900,26 @@ impl JitOnrampRun {
                 // by name; `display` too (unused by a pure compute guest, present for parity with
                 // `onramp_exec`). No `fs` (input comes from stdin).
                 let (frame, _keys) = grant_onramp_caps(&mut host, &module, None);
-                (host, Vec::new(), frame)
+                (host, Vec::new(), frame, None)
             }
-            RunInput::Fs { image, argv, stdin } => {
+            RunInput::Fs {
+                image,
+                argv,
+                stdin,
+                readback,
+            } => {
                 // The headless memfs powerbox (`fs` image + argv at POWERBOX_ARGS_BASE), exactly as the
-                // bytecode `onramp_fs_exec` builds it — the `MemFsHandle` is dropped (no snapshot here).
+                // bytecode `onramp_fs_exec` builds it. The `MemFsHandle` is retained only when a `readback`
+                // key was requested (a file-output phase guest like nifler); otherwise it is dropped, as a
+                // stdout guest (chibicc) needs no snapshot.
                 let argv_refs: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
-                let (mut host, init_mem, _fsh) = pg_setup(&module, &image, &argv_refs)?;
+                let (mut host, init_mem, fsh) = pg_setup(&module, &image, &argv_refs)?;
                 host.stdin = stdin;
                 let frame = std::sync::Arc::new(std::sync::Mutex::new(None));
-                (host, init_mem, frame)
+                let fs_readback = readback.map(|key| (fsh, key));
+                (host, init_mem, frame, fs_readback)
             }
         };
-        // Compile once — reused for every cross-tier bounce.
-        let program = bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?;
         // Materialize the window before the emitted `_start` runs (the interpreter does this at
         // instantiation; the emitted `_start` seeds only the heap + stashes handles): first the argv
         // prefix (`init_mem`, empty for stdin), then `.data`/`.rodata`. Data segments start at the
@@ -4689,19 +4938,6 @@ impl JitOnrampRun {
                 }
             }
         }
-        // Emit rooted at func 0 (`_start`), wasm-driven; cross-tier helpers route to `env.call_interp`.
-        // The front door reports `InterpDriven` (→ fall back to the pure interpreter) if `_start` is out
-        // of subset or its reachable set can suspend — this driver can only run a wasm-driven artifact.
-        let artifact = svm_wasm_jit::compile_jit(
-            &module,
-            svm_wasm_jit::Shape::Batch { entry: 0 },
-            shared_memory,
-        )
-        .map_err(|_| STATUS_UNSUPPORTED)?;
-        let svm_wasm_jit::DriveMode::WasmDriven { .. } = artifact.drive else {
-            return Err(STATUS_UNSUPPORTED);
-        };
-        let (emitted_wasm, emitted) = (artifact.wasm, artifact.emitted);
         Ok(JitOnrampRun {
             module,
             program,
@@ -4718,6 +4954,7 @@ impl JitOnrampRun {
             exited: false,
             returned_value: 0,
             trapped: false,
+            fs_readback,
         })
     }
 
@@ -4757,7 +4994,9 @@ impl JitOnrampRun {
         let mut host = Host::new();
         let (frame, _keys) = grant_onramp_caps(&mut host, &module, None);
         // Compiled once — reused for every cross-tier bounce (`write`/`read`/`exit` off the emitted eval).
-        let program = bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?;
+        let program = std::sync::Arc::new(
+            bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?,
+        );
         // Emit rooted at `eval_run` (not `_start`); the reachable-set / concurrency gates are unchanged,
         // so a driver whose eval can suspect or leaves the subset declines to the interpreter.
         let artifact = svm_wasm_jit::compile_jit(
@@ -4771,13 +5010,13 @@ impl JitOnrampRun {
         };
         let (emitted_wasm, emitted) = (artifact.wasm, artifact.emitted);
         Ok(JitOnrampRun {
-            module,
+            module: std::sync::Arc::new(module),
             program,
             host,
             _backing: None,
             back,
             win_base,
-            emitted_wasm,
+            emitted_wasm: std::sync::Arc::from(emitted_wasm),
             emitted,
             frame,
             slots: vec![Value::I64(entry_sp as i64)],
@@ -4786,6 +5025,7 @@ impl JitOnrampRun {
             exited: false,
             returned_value: 0,
             trapped: false,
+            fs_readback: None,
         })
     }
 
@@ -4857,6 +5097,23 @@ impl JitOnrampRun {
     }
     pub fn stderr(&self) -> &[u8] {
         &self.host.stderr
+    }
+    /// The run's **primary output**: the retained memfs file for a file-output phase guest (nifler's
+    /// `.p.nif`, [`fs_readback`](Self::fs_readback)), else `stdout`. `svm_onramp_jit_run_finish` hands
+    /// this to the card on the stdout slot, so a JIT phase guest surfaces its produced file exactly as the
+    /// bytecode `onramp_fs_exec_readback` does.
+    fn output(&self) -> Vec<u8> {
+        match &self.fs_readback {
+            Some((fsh, key)) => {
+                let (files, _dirs) = fsh.seed();
+                files
+                    .into_iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v)
+                    .unwrap_or_default()
+            }
+            None => self.host.stdout.clone(),
+        }
     }
     pub fn exited(&self) -> bool {
         self.exited
@@ -6714,7 +6971,9 @@ pub extern "C" fn svm_onramp_jit_run_finish() -> i32 {
     let Some(run) = (unsafe { (*core::ptr::addr_of!(JIT_RUN)).as_ref() }) else {
         return STATUS_UNSUPPORTED;
     };
-    let stdout = run.stdout().to_vec();
+    // `output()` is `stdout` for a stdout guest (Lua/chibicc) and the produced memfs file for a
+    // file-output phase guest (nifler's `.p.nif`) — the card reads both off the stdout slot.
+    let stdout = run.output();
     let stderr = run.stderr().to_vec();
     // Exit is checked first (a cross-tier `Exit` sets both `exited` and, via the JS driver, `trapped`);
     // then a trap; then a clean return carrying the guest's result value. This mirrors `svm_run_onramp`'s

@@ -7,7 +7,7 @@
 
 import { loadEngine, makeRunner, readParStdout } from './par.js';
 import { openJitReactor } from './wasmjit-reactor.js';
-import { runJitModule, runWarmJit, runJitCompiler, runJitSelfhost } from './wasmjit-module.js';
+import { runJitModule, runWarmJit, runJitCompiler, runJitSelfhost, runJitNifler } from './wasmjit-module.js';
 import { SnapshotClient } from './snapshot-client.js';
 import { createDapClient } from './dap.js';
 import { initWebGPU, teardownWebGPU, webgpuAvailable } from './webgpu.js';
@@ -2028,9 +2028,10 @@ async function runSelfhost(c) {
 // Compile Nim in the browser — the nimony **front-end** card (NIM.md §3c/§3e slice 4). Fetch
 // `nifler.svmb` (the first real nimony phase, Nim → parsed NIF, on-ramped to SVM), seed the editor's
 // Nim as `/in.nim` on an in-memory `fs` cap, run `nifler p /in.nim /out.p.nif`, and show the `.p.nif`
-// it emitted. Mirrors `runSelfhost` (memfs-seeded phase), but the output is a **file** nifler wrote
-// (`svm_run_nifler_fs` reads it back onto the stdout slot), not stdout text, and there is no JIT tier
-// (the ~280-func Nim phase folds to the tree-walker, like the svm-leng card). Bytecode only.
+// it emitted. Mirrors `runSelfhost` (memfs-seeded phase), but the output is a **file** nifler wrote (read
+// back onto the stdout slot), not stdout text. Runs on the **wasm-JIT** first (#1011 slice 1 —
+// `svm_run_nifler_jit_open` emits nifler's `_start`, its `.p.nif` read back after the run), falling back to
+// the bytecode `svm_run_nifler_fs` when `_start` isn't wasm-drivable or the emitted run traps (INVARIANT 9).
 async function runNifler(c) {
   const ex = c.ex;
   setState(c, 'running', 'fetching nifler…');
@@ -2056,22 +2057,38 @@ async function runNifler(c) {
   runNote(rec, { moduleBytes: compiler.length, srcBytes: srcBytes.length });
   setState(c, 'running', 'parsing Nim…');
   const t0 = performance.now();
-  // Alloc both buffers before writing (svm_alloc may detach linear memory), then run on bytecode.
-  const p = eng.ex.svm_alloc(compiler.length);
-  const sp = eng.ex.svm_alloc(srcBytes.length);
-  const view = new Uint8Array(eng.memory.buffer);
-  view.set(compiler, p);
-  view.set(srcBytes, sp);
-  const rv = Number(eng.ex.svm_run_nifler_fs(p, compiler.length, sp, srcBytes.length));
-  const status = eng.ex.svm_status();
-  eng.ex.svm_dealloc(p, compiler.length);
-  eng.ex.svm_dealloc(sp, srcBytes.length);
-  const ms = runStage(rec, 'parse:interpreter', performance.now() - t0).toFixed(0);
-  runTier(rec, 'interpreter');
+  // Try the **wasm-JIT** first (#1011 slice 1): emit nifler's `_start` and run the parse on emitted wasm,
+  // with the produced `.p.nif` read back on the stdout slot (`svm_run_nifler_jit_open` → `driveJitRun`).
+  // A decline (STATUS_UNSUPPORTED, e.g. `_start` not wasm-drivable) or an emitted-run trap throws → we
+  // fall back to the bytecode `svm_run_nifler_fs` below, so the result matches on both tiers (INVARIANT 9).
+  let status, tier;
+  try {
+    status = await runJitNifler(eng.ex, eng.memory, compiler, srcBytes, ex.url);
+    tier = 'wasm-JIT';
+  } catch (e) {
+    logTo(c, `wasm-JIT nifler unavailable (${e.message}); falling back to the interpreter`);
+    runNote(rec, { jitFallbackReason: e.message });
+    status = undefined;
+  }
+  if (status === undefined) {
+    // Alloc both buffers before writing (svm_alloc may detach linear memory), then run on bytecode.
+    const p = eng.ex.svm_alloc(compiler.length);
+    const sp = eng.ex.svm_alloc(srcBytes.length);
+    const view = new Uint8Array(eng.memory.buffer);
+    view.set(compiler, p);
+    view.set(srcBytes, sp);
+    Number(eng.ex.svm_run_nifler_fs(p, compiler.length, sp, srcBytes.length));
+    status = eng.ex.svm_status();
+    eng.ex.svm_dealloc(p, compiler.length);
+    eng.ex.svm_dealloc(sp, srcBytes.length);
+    tier = 'interpreter';
+  }
+  const ms = runStage(rec, `parse:${tier}`, performance.now() - t0).toFixed(0);
+  runTier(rec, tier);
   const nif = readModuleStdout();
   const nstderr = readModuleStderr();
   runNote(rec, { nifBytes: nif.length });
-  logTo(c, `nifler parse → ${nif.length}B .p.nif (status ${status}) in ${ms}ms`);
+  logTo(c, `nifler parse (${tier}) → ${nif.length}B .p.nif (status ${status}) in ${ms}ms`);
   // 0 = OK, 5 = clean Exit. A parse error (or a trap) leaves no `.p.nif`; show the guest's stderr.
   if ((status !== 0 && status !== 5) || nif.length === 0) {
     c.el.stdout.textContent = nstderr || nif;
@@ -2081,9 +2098,9 @@ async function runNifler(c) {
   }
   const bar = '─'.repeat(12);
   c.el.stdout.textContent =
-    `${bar} nifler parsed your Nim → ${nif.length} B .p.nif (nimony's NIF, on the SVM) ${bar}\n${nif}`;
+    `${bar} nifler parsed your Nim → ${nif.length} B .p.nif (nimony's NIF, on the SVM, ${tier}) ${bar}\n${nif}`;
   c.el.result.textContent = `${nif.length} B`;
-  setState(c, 'done', `parsed Nim → ${nif.length} B .p.nif · ${ms}ms`);
+  setState(c, 'done', `parsed Nim → ${nif.length} B .p.nif (${tier}) · ${ms}ms`);
   runEnd(rec, { ok: true, status, result: `${nif.length} B .p.nif` });
 }
 

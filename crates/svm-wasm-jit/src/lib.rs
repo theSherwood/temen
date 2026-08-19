@@ -1804,6 +1804,58 @@ pub fn outline_cap_calls(m: &mut Module) {
     m.funcs.extend(wrappers);
 }
 
+/// V8 rejects any single wasm function body larger than `kV8MaxWasmFunctionSize` (7,654,321 bytes) at
+/// compile time, and one over-large body makes the **whole** module unloadable. A function whose
+/// emitted body exceeds this cap is therefore pulled out of the emitted set and run as a cross-tier
+/// interpreter leaf instead — it executes on the bytecode engine over the shared window (reached via
+/// `env.call_interp`) while the rest of the module still JITs. The threshold sits below the hard limit
+/// with margin: the measured length is the function payload alone, and re-routing a caller's direct
+/// call to a now-excluded callee grows the *caller* by a few bytes, so we leave headroom rather than
+/// emit right up to the wall. Discovered via nifler, whose linked-in (but never-run) Nim VM
+/// `rawExecute` lowers to an ~8.5 MB body (#1011).
+const MAX_EMITTED_FUNC_BYTES: usize = 7_000_000;
+
+/// Decode a ULEB128 at `p[i..]`, returning `(value, next_index)`. The bytes come from our own
+/// [`emit_module`] output, so the encoding is assumed well-formed (no overlong / truncation check).
+fn read_uleb(p: &[u8], mut i: usize) -> (u64, usize) {
+    let (mut val, mut shift) = (0u64, 0u32);
+    loop {
+        let b = p[i];
+        i += 1;
+        val |= u64::from(b & 0x7f) << shift;
+        if b & 0x80 == 0 {
+            return (val, i);
+        }
+        shift += 7;
+    }
+}
+
+/// Byte length of each function body in the code section (id 10) of an assembled wasm module, in emit
+/// order — the [`emit_module`] order (`emitted` first, then trampolines / trap stub). Used to find a
+/// body that exceeds [`MAX_EMITTED_FUNC_BYTES`]. Input is our own well-formed output, so the section
+/// walk is unchecked. Returns empty if there is no code section (a module with no emitted functions).
+fn code_section_body_sizes(wasm: &[u8]) -> Vec<usize> {
+    let mut i = 8; // skip the 8-byte "\0asm" + version preamble
+    while i < wasm.len() {
+        let id = wasm[i];
+        i += 1;
+        let (size, after_len) = read_uleb(wasm, i);
+        i = after_len;
+        if id == 10 {
+            let (count, mut j) = read_uleb(wasm, i);
+            let mut sizes = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                let (blen, after) = read_uleb(wasm, j);
+                sizes.push(blen as usize);
+                j = after + blen as usize;
+            }
+            return sizes;
+        }
+        i += size as usize;
+    }
+    Vec::new()
+}
+
 /// Compile a **whole-module reactor** guest with **widened cross-tier calls** (Doom-perf): emit every
 /// reachable in-subset function to wasm and route a **direct** `Call` to any reachable, non-emitted,
 /// **integer-signature** function through `env.call_interp` — not just the strict memory-free/call-free
@@ -1824,51 +1876,105 @@ pub fn outline_cap_calls(m: &mut Module) {
 /// a non-[`marshallable_sig`] signature (a `ref`/`cap` param/result can't be marshalled cross-tier —
 /// `v128` marshals two-slot since #749), or an address-taken indirect target is itself
 /// non-marshallable (can't be trampolined).
+///
+/// A function whose emitted body would exceed the V8 per-function byte cap ([`MAX_EMITTED_FUNC_BYTES`])
+/// is pulled out of the emitted set and run as a cross-tier leaf too (#1011) — so a guest that links a
+/// giant-but-cold function (nifler's ~8.5 MB Nim VM `rawExecute`) still JITs the rest of the module
+/// instead of shipping a body V8 refuses to load. We can't know a body's size without emitting it, so
+/// this emits, measures, excludes any over-large marshallable body, and re-emits until every emitted
+/// body fits; the common case finds none and emits once. An over-large body that *can't* be crossed
+/// (non-marshallable) forces [`Error::Unsupported`], dropping the guest to the fully-interpreted
+/// artifact rather than an unloadable module.
 pub fn compile_module_reactor(
     m: &Module,
     entry: u32,
     shared_memory: bool,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    compile_module_reactor_capped(m, entry, shared_memory, MAX_EMITTED_FUNC_BYTES)
+}
+
+/// [`compile_module_reactor`] with an explicit emitted-body byte cap. The public wrapper passes V8's
+/// [`MAX_EMITTED_FUNC_BYTES`]; the parameter exists so the exclusion loop can be differential-tested
+/// with a small cap (and a small module) instead of a genuine multi-megabyte function. `usize::MAX`
+/// disables the size exclusion (an engine with no per-function cap).
+#[doc(hidden)]
+pub fn compile_module_reactor_capped(
+    m: &Module,
+    entry: u32,
+    shared_memory: bool,
+    cap: usize,
+) -> Result<(Vec<u8>, Vec<bool>), Error> {
     let n = m.funcs.len();
     let a = analyze_from(m, entry);
-    // Cross-tier: reachable, not emitted (not in-subset), and marshallable (fits the scratch slots). Runs on
-    // the interpreter over the shared window — so, unlike `interp_leaf`, memory/calls/caps are fine.
-    let cross: Vec<bool> = (0..n)
-        .map(|i| a.reachable[i] && !a.in_subset[i] && marshallable_sig(&m.funcs[i]))
-        .collect();
-    let ok = (entry as usize) < n
-        && a.in_subset[entry as usize]
-        // Every reachable function must be emittable or cross-tier-callable. When the guest makes an
-        // indirect call, `analyze` marks **all** functions reachable, so this also guarantees every
-        // possible indirect target (including a data-segment function pointer, which no `RefFunc` scan
-        // sees) is either emitted or `cross` — hence gets an identity-table slot: the emitted wasm
-        // function, or a trampoline that bounces to the interpreter (see `emit_module`).
-        && (0..n).all(|i| !a.reachable[i] || a.in_subset[i] || cross[i]);
-    if !ok {
-        return Err(Error::Unsupported("guest not cross-tier reactor runnable"));
-    }
-    let mut wasm_of: Vec<Option<u32>> = vec![None; n];
-    let mut emitted: Vec<usize> = Vec::new();
-    let mut emitted_bitmap = vec![false; n];
-    for i in 0..n {
-        if a.reachable[i] && a.in_subset[i] {
-            wasm_of[i] = Some(IMPORTED_FUNCS + emitted.len() as u32);
-            emitted.push(i);
-            emitted_bitmap[i] = true;
+    // `oversized[i]` — an in-subset function pulled from the emitted set because its body exceeds the
+    // V8 cap (#1011). Monotone: it only grows across re-emits, so the loop runs at most once per
+    // over-large function and terminates. Empty on the first pass ⇒ byte-identical emit for every guest
+    // that has no over-large body.
+    let mut oversized = vec![false; n];
+    loop {
+        // Cross-tier: reachable, not emitted (not in-subset, or pulled for size), and marshallable
+        // (fits the scratch slots). Runs on the interpreter over the shared window — so, unlike
+        // `interp_leaf`, memory/calls/caps are fine.
+        let cross: Vec<bool> = (0..n)
+            .map(|i| {
+                a.reachable[i] && (!a.in_subset[i] || oversized[i]) && marshallable_sig(&m.funcs[i])
+            })
+            .collect();
+        let ok = (entry as usize) < n
+            && a.in_subset[entry as usize]
+            && !oversized[entry as usize] // a wasm-driven entry must itself be emitted
+            // Every reachable function must be emittable or cross-tier-callable. When the guest makes an
+            // indirect call, `analyze` marks **all** functions reachable, so this also guarantees every
+            // possible indirect target (including a data-segment function pointer, which no `RefFunc` scan
+            // sees) is either emitted or `cross` — hence gets an identity-table slot: the emitted wasm
+            // function, or a trampoline that bounces to the interpreter (see `emit_module`).
+            && (0..n).all(|i| !a.reachable[i] || (a.in_subset[i] && !oversized[i]) || cross[i]);
+        if !ok {
+            return Err(Error::Unsupported("guest not cross-tier reactor runnable"));
+        }
+        let mut wasm_of: Vec<Option<u32>> = vec![None; n];
+        let mut emitted: Vec<usize> = Vec::new();
+        let mut emitted_bitmap = vec![false; n];
+        for i in 0..n {
+            if a.reachable[i] && a.in_subset[i] && !oversized[i] {
+                wasm_of[i] = Some(IMPORTED_FUNCS + emitted.len() as u32);
+                emitted.push(i);
+                emitted_bitmap[i] = true;
+            }
+        }
+        let wasm = emit_module(
+            m,
+            shared_memory,
+            &emitted,
+            &wasm_of,
+            &cross,
+            None,
+            false,
+            None,
+            svm_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
+        )?;
+        // Measure the emitted bodies and pull any over-large *marshallable* one out for a re-emit as a
+        // cross-tier leaf. An over-large body that can't be crossed (non-marshallable sig) has nowhere
+        // to go — fail closed so `compile_jit` drops to the interpreter rather than ship a module V8
+        // rejects. `code_section_body_sizes` returns bodies in emit order, so `sizes[bi]` is `emitted[bi]`.
+        let sizes = code_section_body_sizes(&wasm);
+        let mut progressed = false;
+        for (bi, &fi) in emitted.iter().enumerate() {
+            if sizes[bi] > cap {
+                if marshallable_sig(&m.funcs[fi]) {
+                    oversized[fi] = true;
+                    progressed = true;
+                } else {
+                    return Err(Error::Unsupported(
+                        "emitted function exceeds the V8 body cap",
+                    ));
+                }
+            }
+        }
+        if !progressed {
+            return Ok((wasm, emitted_bitmap));
         }
     }
-    let wasm = emit_module(
-        m,
-        shared_memory,
-        &emitted,
-        &wasm_of,
-        &cross,
-        None,
-        false,
-        None,
-        svm_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
-    )?;
-    Ok((wasm, emitted_bitmap))
 }
 
 /// Like [`compile_module_reactor`], but emit only the functions in `keep` (plus any whose signature
