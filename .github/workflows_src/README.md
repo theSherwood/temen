@@ -16,16 +16,17 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
-- **`real-browser` Playwright-install apt hardening (#1017)** — the `Install Playwright + Chromium` step
-  runs `npx playwright install --with-deps chromium`, whose `--with-deps` half shells out to `apt-get`;
-  that wedged >10 min on the runner's default `azure.archive.ubuntu.com` mirror **twice** on PR #1016,
-  timing the step out before any browser test ran. Added the same I67 source hardening the LLVM step uses
-  (drop the microsoft/azure `sources.list.d` files, sed the mirrorlist/`.sources` stanzas onto
-  `https://archive.ubuntu.com`) **plus a warm `apt-get update`** immediately before the `npm`/`npx`
-  lines, so Playwright's own apt-get hits a healthy mirror. Pure CI infra; no tree code. (Until copied
-  over, `workflows-in-sync` stays red — the expected mirror-edit friction; `cp
-  .github/workflows_src/*.yml .github/workflows/` drains it, and copying it onto a branch is also what
-  unblocks that branch's `real-browser` re-run.)
+- **I67 apt hardening for the `Install Playwright + Chromium` step (`browser-real` job, #1017)** —
+  the one apt consumer the 10-site I67 hardening missed: `npx playwright install --with-deps`
+  runs its **own** internal `apt-get update && apt-get install` with the runner's default (azure)
+  sources, and it runs *before* the job's hardened LLVM step. An azure-mirror outage on 2026-08-19
+  wedged the step to its 10-minute timeout **three consecutive times** on PR #1015 (and once on
+  PR #1016 — see #1017): the `Ign:` retry storm, then a stalled mirrorlist fetch, Playwright never
+  installed. The step now leads with the exact same scrub line the other 10 sites use (drop
+  `sources.list.d/{microsoft,azure}*`, sed `apt-mirrors.txt`/`.sources` onto
+  `https://archive.ubuntu.com`, fail-soft `|| true`). No behavior change on a healthy runner.
+  (Until copied over, the `workflows-in-sync` guard stays red — the expected mirror-edit friction;
+  `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
 
 - **`arena-stacks` no-op feature removed from the `stack-guard` + `stack-guard-cross-os` jobs (#919)** —
   the `svm-fiber`/`svm-jit` `arena-stacks` feature was a retained no-op (the arena is svm-fiber's

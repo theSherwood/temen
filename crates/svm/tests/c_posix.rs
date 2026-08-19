@@ -2402,3 +2402,171 @@ int main(void) {{\n\
         "the #! line re-exec'd the interpreter with [interp, X, /s.sh, tail]"
     );
 }
+
+/// #797 — like [`run_interp_only`] but with the **controlling terminal** enabled and a feeder
+/// thread delivering keystrokes (and winsize changes) on best-effort delays while the guest runs.
+/// Ordering is best-effort only — a feed landing before the guest's read means the read drains
+/// without parking, which is equally correct; the assertions are on results, not on parking.
+fn run_interp_terminal(
+    src: &str,
+    feeds: Vec<(u64, Vec<u8>)>,
+    winsize: Option<(u64, i32, i32)>,
+) -> Effects {
+    let ir = c_to_ir(src);
+    let raw = parse_module_raw(&ir)
+        .unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
+    let win = 1u64
+        << raw
+            .memory
+            .expect("the frontend declares a window")
+            .size_log2;
+    let mut ih = Host::new();
+    let (iposix, ipx) = setup(&mut ih, win);
+    iposix.enable_terminal(&mut ih);
+    verify_module(&raw).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
+    bind_shim(&raw, &mut ih, ipx);
+    let feeder = {
+        let px = iposix.clone();
+        std::thread::spawn(move || {
+            for (delay, bytes) in feeds {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+                px.feed_terminal(&bytes);
+            }
+            if let Some((delay, r, c)) = winsize {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+                px.set_winsize(r, c);
+            }
+        })
+    };
+    let mut fuel = 200_000_000u64;
+    let (result, exited) = match run_with_host(&raw, 0, &[], &mut fuel, &mut ih) {
+        Ok(v) => (v, None),
+        Err(Trap::Exit(c)) => (Vec::new(), Some(c)),
+        Err(e) => panic!("interp trapped: {e:?}\n--- IR ---\n{ir}"),
+    };
+    feeder.join().expect("feeder thread");
+    Effects {
+        result,
+        exited,
+        stdout: iposix.stdout(),
+        file_f: iposix.read_file("f"),
+    }
+}
+
+/// #797 — **a parked terminal read wakes on a completed canonical line, edited and echoed**: the
+/// guest blocks in `read(0)` (the tag redirect parks on the empty input pipe — a real prompt);
+/// the feeder types `hI`, erases the `I` (`VERASE`), types `i\n` — the guest receives the EDITED
+/// line `hi\n`, and the echo (including backspace-space-backspace for the erase) landed on stdout.
+#[test]
+fn c_terminal_canonical_read_line_editing_and_echo() {
+    let src = format!(
+        "{PIPE_SHIM}\n\
+static char b[16];\n\
+int main(void) {{\n\
+  long n = read(0, b, 16);            /* parks until the line completes */\n\
+  if (n != 3) return (int)(100 + n);\n\
+  if (b[0] != 'h' || b[1] != 'i' || b[2] != 10) return 2;\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_terminal(&src, vec![(60, b"hI\x7fi\n".to_vec())], None);
+    assert_eq!(e.result, vec![Value::I32(42)], "the edited line arrived");
+    assert_eq!(
+        e.stdout, b"hI\x08 \x08i\n",
+        "echo mirrored the typing, erase as backspace-space-backspace"
+    );
+}
+
+/// #797 — **`^C` interrupts a parked terminal read as a signal, not data**: the guest catches
+/// SIGINT and blocks in `read(0)`; the fed `VINTR` byte never enters the stream — the discipline
+/// fires the #798 group kill at the foreground group, the #796 EINTR path wakes the park, the
+/// read returns `-EINTR` (plain `signal()`, SysV no-restart), and the doorbell holds the handler.
+#[test]
+fn c_terminal_ctrl_c_interrupts_a_parked_read() {
+    let src = format!(
+        "{PIPE_SHIM}\n\
+long __px_signal(int cap, long signum, long handler);\n\
+long __px_sigaltstack(int cap, long sp, long size);\n\
+static char sigstk[16384];\n\
+static volatile int fired;\n\
+static void handler(int sig) {{ fired = sig; }}\n\
+static char b[8];\n\
+int main(void) {{\n\
+  __px_signal(0, 2, (long)handler);   /* catch SIGINT (plain signal(): no SA_RESTART) */\n\
+  __px_sigaltstack(0, (long)sigstk, 16384); /* async delivery on (the #796 policy gate) */\n\
+  long n = read(0, b, 8);             /* parks; ^C must interrupt, not feed */\n\
+  if (n != -4) return (int)(100 - n); /* -EINTR */\n\
+  if (fired != 2) return 2;           /* the handler ran on the delivery */\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_terminal(&src, vec![(60, b"\x03".to_vec())], None);
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "^C -> SIGINT at the fg group -> EINTR from the parked read, handler pending"
+    );
+}
+
+/// #797 — **`^D` on an empty line is true one-shot EOF**: the held writer count drops to 0 and the
+/// parked reader wakes to `read() == 0` — bash's exit-on-EOF, through a real park.
+#[test]
+fn c_terminal_ctrl_d_is_true_eof() {
+    let src = format!(
+        "{PIPE_SHIM}\n\
+static char b[8];\n\
+int main(void) {{\n\
+  long n = read(0, b, 8);\n\
+  if (n != 0) return (int)(100 + n);\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_terminal(&src, vec![(60, b"\x04".to_vec())], None);
+    assert_eq!(e.result, vec![Value::I32(42)], "^D on an empty line: EOF");
+}
+
+/// #797 — **raw mode + winsize + SIGWINCH**: the guest reads the default termios, flips off
+/// ICANON/ECHO (keeping ISIG) via `tcsetattr`, reads a single byte fed with no newline (raw
+/// delivery), checks the default 80×24 winsize, then waits for the embedder's `set_winsize` —
+/// SIGWINCH (caught) rings the doorbell and `tcgetwinsize` reports the new size. Nothing echoed
+/// (ECHO off before any input).
+#[test]
+fn c_terminal_raw_mode_winsize_and_sigwinch() {
+    let src = format!(
+        "{PIPE_SHIM}\n\
+long __px_tcgetattr(int cap, long fd, long p);\n\
+long __px_tcsetattr(int cap, long fd, long p);\n\
+long __px_tcgetwinsize(int cap, long fd, long p);\n\
+long __px_signal(int cap, long signum, long handler);\n\
+long __px_sigcheck(int cap, long z);\n\
+static long t[4];\n\
+static int ws[2];\n\
+static char b[4];\n\
+int main(void) {{\n\
+  __px_signal(0, 28, 555);                    /* catch SIGWINCH */\n\
+  if (__px_tcgetattr(0, 0, (long)t) != 0) return 1;\n\
+  if ((t[0] & 02) == 0 || (t[0] & 010) == 0) return 2;  /* canonical+echo default */\n\
+  t[0] = t[0] & ~02L & ~010L;                 /* raw: ICANON|ECHO off, ISIG stays */\n\
+  if (__px_tcsetattr(0, 0, (long)t) != 0) return 3;\n\
+  if (__px_tcgetwinsize(0, 0, (long)ws) != 0) return 4;\n\
+  if (ws[0] != 24 || ws[1] != 80) return 5;\n\
+  long n = read(0, b, 1);                      /* raw: a single byte, no newline needed */\n\
+  if (n != 1 || b[0] != 'x') return 6;\n\
+  long h = 0;\n\
+  while (h != 555) h = __px_sigcheck(0, 0);    /* poll until SIGWINCH lands */\n\
+  if (__px_tcgetwinsize(0, 0, (long)ws) != 0) return 7;\n\
+  if (ws[0] != 50 || ws[1] != 120) return 8;\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_terminal(&src, vec![(60, b"x".to_vec())], Some((150, 50, 120)));
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "raw single-byte read, default and updated winsize, SIGWINCH doorbell"
+    );
+    assert_eq!(
+        e.stdout, b"",
+        "ECHO was off before any input: nothing echoed"
+    );
+}

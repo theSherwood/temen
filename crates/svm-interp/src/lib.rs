@@ -2187,6 +2187,13 @@ fn drive_over_cell(
         let source = hg.signal_poll().map(|(_, s)| s);
         drop(hg); // release before `set_wake` (the door takes the personality's own lock)
         if let Some(source) = source {
+            // #797 — the terminal feed's pipe-reader wake, same weak discipline.
+            let sched_weak = Arc::downgrade(&sched);
+            source.set_pipe_wake(Arc::new(move |pipe| {
+                if let Some(s) = sched_weak.upgrade() {
+                    s.wake_pipe_readers(pipe);
+                }
+            }));
             let sched_weak = Arc::downgrade(&sched);
             source.set_wake(Arc::new(move || {
                 if let Some(s) = sched_weak.upgrade() {
@@ -5238,6 +5245,12 @@ impl Scheduler {
             let source = hg.signal_poll().map(|(_, s)| s);
             drop(hg); // release before `set_wake` (the door takes the personality's own lock)
             if let Some(source) = source {
+                let sched_weak = Arc::downgrade(self);
+                source.set_pipe_wake(Arc::new(move |pipe| {
+                    if let Some(sc) = sched_weak.upgrade() {
+                        sc.wake_pipe_readers(pipe);
+                    }
+                }));
                 let sched_weak = Arc::downgrade(self);
                 source.set_wake(Arc::new(move || {
                     if let Some(sc) = sched_weak.upgrade() {
@@ -10811,6 +10824,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     if let Some((_, source)) = ch.signal_poll() {
                                         let dom = ch.domain_id() as usize;
                                         let sched_weak = Arc::downgrade(rs);
+                                        source.set_pipe_wake(Arc::new(move |pipe| {
+                                            if let Some(sc) = sched_weak.upgrade() {
+                                                sc.wake_pipe_readers(pipe);
+                                            }
+                                        }));
+                                        let sched_weak = Arc::downgrade(rs);
                                         source.set_wake(Arc::new(move || {
                                             if let Some(sc) = sched_weak.upgrade() {
                                                 sc.interrupt_interruptible_parks(dom, true);
@@ -11247,6 +11266,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 if let SchedRef::Real(rs) = &sched {
                                     if let Some((_, source)) = ch.signal_poll() {
                                         let dom = ch.domain_id() as usize;
+                                        let sched_weak = Arc::downgrade(rs);
+                                        source.set_pipe_wake(Arc::new(move |pipe| {
+                                            if let Some(sc) = sched_weak.upgrade() {
+                                                sc.wake_pipe_readers(pipe);
+                                            }
+                                        }));
                                         let sched_weak = Arc::downgrade(rs);
                                         source.set_wake(Arc::new(move || {
                                             if let Some(sc) = sched_weak.upgrade() {
@@ -16806,6 +16831,15 @@ pub trait SignalSource: Send + Sync {
     /// job-control story need not store it.
     fn set_stop(&self, _stop: Arc<dyn Fn(bool) + Send + Sync>) {}
 
+    /// #797 — install the run's **pipe-reader wake** closure: `wake(pipe_id)` re-admits every
+    /// reader parked on that pipe ([`Blocked::PipeRead`] — the rewound read re-executes and
+    /// drains, invariant 7). The terminal personality invokes it after `feed_terminal` deposits
+    /// bytes host-side into an input pipe's backing — a feed is not a guest `write`, so nothing
+    /// else would wake the parked prompt read. Same weak-scheduler discipline as
+    /// [`Self::set_wake`]; the core never sees WHY bytes arrived (a keystroke is policy). Default
+    /// no-op — a source with no terminal has nothing to feed.
+    fn set_pipe_wake(&self, _wake: Arc<dyn Fn(u32) + Send + Sync>) {}
+
     /// #796 — called when an injected handler frame **returns**, so the source can restore the
     /// mask it pushed at delivery (block-during-handler: the delivered signal + its `sa_mask`
     /// are blocked for the handler's duration, POSIX) and act on anything that unblocking
@@ -18936,6 +18970,33 @@ impl Host {
     /// is re-granted to the child as its `"stdin"`, and its `read`s drain the same FIFO (empty ⇒ `0`,
     /// i.e. EOF — so a filter terminates cleanly). No write end is exposed: the source is the embedder's
     /// buffer, not another guest.
+    /// #797 — [`Self::grant_input_pipe`]'s **terminal** variant: the writer count starts at **1**
+    /// (held by the feeding personality), so an empty read **parks** ([`Blocked::PipeRead`])
+    /// instead of the filter form's drain-then-EOF — a prompt blocks until a keystroke. Returns
+    /// the read handle, the backing the personality feeds, the **writer-count** `Arc` (dropping
+    /// it to 0 — the `^D` close — turns parked readers into true EOF via the wake), and the pipe
+    /// id for [`SignalSource::set_pipe_wake`].
+    #[allow(clippy::type_complexity)]
+    pub fn grant_terminal_input(
+        &mut self,
+    ) -> (
+        i32,
+        Arc<Mutex<std::collections::VecDeque<u8>>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        u32,
+    ) {
+        let pipe = self.pipes.len() as u32;
+        let backing = Arc::new(Mutex::new(VecDeque::new()));
+        let writers = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        self.pipes.push((
+            Arc::clone(&backing),
+            Arc::clone(&writers),
+            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        ));
+        let r = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false });
+        (r, backing, writers, pipe)
+    }
+
     pub fn grant_input_pipe(&mut self) -> (i32, Arc<Mutex<std::collections::VecDeque<u8>>>) {
         let pipe = self.pipes.len() as u32;
         let backing = Arc::new(Mutex::new(VecDeque::new()));
