@@ -33,7 +33,7 @@ boundary DESIGN.md §7 draws.
 
 ## 2. The mechanism already exists: §7 named imports → `HostFn`
 
-`svm-wasi` is the working template (a 2-op WASI shim); `svm-posix` generalizes it.
+The WASI shim (the `wasi_named_imports` test) is the working template (a 2-op WASI shim); `svm-posix` generalizes it.
 
 1. The shell (C) compiles to SVM IR with its libc calls left as **unresolved named imports**
    — `CallImport { "env.malloc" }`, `"posix.open"`, … (chibicc / `svm-llvm` emit these for

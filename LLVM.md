@@ -3465,7 +3465,7 @@ scheduled CI lane — each test does a full `-Zbuild-std`, too slow for the per-
 overlay. Alternatives rejected: **(B)** reuse `std::sys::unix` via a Linux-claiming triple + a guest
 libc shim — its raw `libc::syscall(SYS_*)` is exactly the numeric-syscall multiplexer the personality
 model exists to avoid (`POSIX.md` §1); **(C)** WASI — gives up toolchain independence and adds a
-wasm/WASI spec dependency (`svm-wasi` stays the deliberately-thin 2-op shim); **(D)** `restricted_std`
+wasm/WASI spec dependency (the WASI shim stays the deliberately-thin 2-op example); **(D)** `restricted_std`
 with *unpatched* std — modern std's leaf modules (`sys/{alloc,thread_local,random,io/error}`) enumerate
 `target_os` with **no catch-all**, so a novel `os=svm` fails to *build*. The minimum buildable overlay is
 a handful of `svm` leaf-arms + one allocator `imp`.

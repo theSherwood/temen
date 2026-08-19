@@ -43,6 +43,9 @@ svm-spec.workspace = true
 # The hand-rolled DWARF readers (`dwarf_line`/`dwarf_info`), reused to round-trip the JIT's DWARF
 # *emitter* (W5 JIT/DWARF tier) — emit in svm-jit, parse back here, assert they reconstruct.
 svm-wasm = { path = "../svm-wasm" }
+# The WAT assembler, for the folded WASI-bytes named-import test (`wasi_named_imports.rs`, ex-`svm-wasi`):
+# hand-written preview1 modules assembled to wasm, then transpiled by svm-wasm.
+wat = "1"
 # The embedding runtime — its `cap_thunk` (JIT CapThunk → reference-Host bridge) is shared by
 # the C-frontend differential tests instead of a copy-pasted local one.
 svm-run = { path = "../svm-run" }

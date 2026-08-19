@@ -1067,8 +1067,8 @@ So the surface a guest build must satisfy is tiny.
 - **`std` posture + `HashMap` hasher.** `svm-leng` is a `std` crate using `HashMap`/`RefCell`
   (`translate.rs`); `std`'s default `HashMap` pulls `getrandom` for `RandomState`, unavailable on a
   bare guest. Fix: a fixed-seed `BuildHasher` (or a light `no_std + alloc` rework). Small, mechanical.
-- **WASI is too thin for a `std`-`wasi` build.** `svm-wasi` provides only `fd_write` + `proc_exit` and
-  fails closed on the rest (`crates/svm-wasi/src/lib.rs:1-15,43-53`), so `wasm32-wasi` is out — which is
+- **WASI is too thin for a `std`-`wasi` build.** The WASI shim (`crates/svm/tests/wasi_named_imports.rs`)
+  provides only `fd_write` + `proc_exit` and fails closed on the rest, so `wasm32-wasi` is out — which is
   *why* Path W targets `wasm32-unknown-unknown` (and it's moot for Path L). Since `svm-leng` does no
   I/O, this is a non-issue once the allocator is supplied.
 - **CI drift.** A guest build lives in a detached workspace (like `browser/`, `bench/`), which the

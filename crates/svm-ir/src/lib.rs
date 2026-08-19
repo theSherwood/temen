@@ -153,7 +153,7 @@ pub mod cap_id {
     /// `HostProc` — an **embedder-registered** capability (§7 "host-defined capabilities"): the host
     /// installs a handler closure with `grant_host_proc` and the guest reaches it like
     /// any capability (`cap.call HOST_PROC op …`). The interface's *semantics* live entirely in the
-    /// embedder's closure (e.g. an `svm-wasi` shim), **outside** this crate's TCB match — so a host
+    /// embedder's closure (e.g. a WASI shim), **outside** this crate's TCB match — so a host
     /// can add capabilities without touching the VM. The handler reads/writes the guest window
     /// through the same masked `GuestMem` the built-in ops use (authority-TCB, not escape-TCB).
     pub const HOST_PROC: u32 = 13;

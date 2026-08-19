@@ -89,10 +89,10 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   (declared in `Module.imports`); the embedder binds the name to a concrete `(type_id, op)` at load via
   `svm_ir::resolve_imports`. The numeric `module`=type_id / `name`=op convention still lowers to an
   inline `cap.call`. svm-wasm stays pure mechanism — it never interprets host semantics. The
-  **`svm-wasi`** crate is the worked example: a minimal preview1 shim (`fd_write`/`proc_exit`) as an
-  embedder `HostFn` capability (`svm_interp::iface::HOST_FN`, registered with `Host::grant_host_fn` —
+  `wasi_named_imports` test is the worked example: a minimal preview1 shim (`fd_write`/`proc_exit`) as
+  an embedder `HostFn` capability (`svm_interp::iface::HOST_FN`, registered with `Host::grant_host_fn` —
   WASI semantics live outside both svm-wasm and the interp TCB), plus a `resolve` policy. A real WASI
-  "hello world" runs end-to-end (`crates/svm-wasi/src/lib.rs` tests). WASI's specific fd/clock/random
+  "hello world" runs end-to-end (`crates/svm/tests/wasi_named_imports.rs`). WASI's specific fd/clock/random
   *semantics* stay a ⚪ non-goal — the shim is a host-layer subset, not conformant preview1.
 - [x] **Multi-*handle* import binding — DONE.** The transpiler now threads **one handle per distinct
   import interface** (keyed by the wasm `module` string, in first-appearance order) as the leading

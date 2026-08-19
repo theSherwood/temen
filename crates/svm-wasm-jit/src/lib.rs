@@ -17,7 +17,7 @@
 //!   arg/result slots here (offset 16 on). Offset 0 is a legacy fuel slot the shipped emitter no
 //!   longer debits (see below); it stays reserved so the scratch layout is unchanged.
 //!
-//! **Fuel is debited from a mutable wasm `i64` global** (`FuelMode::Global`, exported `"fuel"`),
+//! **Fuel is debited from a mutable wasm `i64` global** (exported `"fuel"`),
 //! at the **IR-anchored safepoints** — one per function entry and one per taken back-edge — matching
 //! the tree-walk/bytecode/Cranelift oracle exactly (INVARIANTS.md #9), so the emitted wasm traps
 //! `OutOfFuel` at the *identical* safepoint for any budget (`tests/differential.rs` asserts exact
@@ -95,26 +95,8 @@ impl core::fmt::Display for Error {
 
 const MASK: u64 = (1u64 << DEFAULT_RESERVED_LOG2) - 1;
 
-/// Where the per-dispatch fuel counter lives. `Global` (the shipped default) debits a mutable wasm
-/// `i64` global — register-allocatable, because it cannot alias a guest memory store, so V8 keeps it
-/// in a register across a hot loop. `Memory` debits an `i64` cell in linear memory at `env` (the
-/// pre-change placement, which V8 must reload every iteration); `None` omits the debit entirely (an
-/// upper-bound measurement probe). `Memory`/`None` survive only as A/B knobs for the cross-engine
-/// fuel bench — see `examples/fuelbench`; the shipped emitter always emits `Global`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FuelMode {
-    /// The pre-change placement: an `i64` debit against the linear-memory `env` cell (offset 0).
-    Memory,
-    /// The shipped default: a mutable `i64` wasm global (index 0), exported as `"fuel"` so the host
-    /// may re-arm the per-region budget (it self-initializes to [`FUEL_DEFAULT`]).
-    Global,
-    /// No fuel debit — an upper-bound probe only.
-    None,
-}
-
-/// The wasm global index of the fuel counter in [`FuelMode::Global`] — global 0, emitted first so the
-/// `mapped` global (below) follows it. (`FuelMode::Memory`/`None` declare no fuel global, so `mapped`
-/// takes index 0 there — see [`mapped_global_idx`].)
+/// The wasm global index of the fuel counter — global 0, emitted first so the `mapped` global follows
+/// it at index 1 (see [`MAPPED_GLOBAL_IDX`]).
 const FUEL_GLOBAL_IDX: u32 = 0;
 /// The fuel global's instantiation-time default — the standard per-region budget every host seed
 /// site writes (`1 << 61`). Because the global self-initializes to this, an emitted module runs
@@ -131,10 +113,8 @@ const FUEL_DEFAULT: i64 = 1 << 61;
 /// global self-initializes to the emit-time `1 << size_log2`, so a host that never grows the window sees
 /// behavior **identical** to the old constant; a growing host writes the live size through the exported
 /// `"mapped"` global (kept in sync by the `vm_map` cross-tier handler). It sits *after* the fuel global
-/// when one is present, so its index is `1` under [`FuelMode::Global`] and `0` otherwise.
-fn mapped_global_idx(fuel_mode: FuelMode) -> u32 {
-    (fuel_mode == FuelMode::Global) as u32
-}
+/// (index 0), so its index is `1`.
+const MAPPED_GLOBAL_IDX: u32 = 1;
 
 // ---- wasm binary encoding primitives -------------------------------------------------------------
 
@@ -1085,7 +1065,7 @@ fn module_atomics_ok(m: &Module) -> bool {
 /// run*. Two ifaces do this:
 /// - **ADDRESS_SPACE** (iface 5): `unmap` (1), `protect` (2). `map` (0) does **not** count (#717):
 ///   it only *adds* committed pages, and the emitted tier confines against the live `"mapped"`
-///   global ([`mapped_global_idx`]) the driver re-syncs from the `VcpuEvent::TierUp` entry snapshot
+///   global ([`MAPPED_GLOBAL_IDX`]) the driver re-syncs from the `VcpuEvent::TierUp` entry snapshot
 ///   (`Mem::scalar_extent`) before every emitted call — a grow the scalar can't represent (sparse,
 ///   non-`Rw` prot) makes the driver *decline* tier-up for that call, so the emitted tier never
 ///   over- or under-admits relative to the interpreter. The `map`-containing function itself is
@@ -1409,33 +1389,6 @@ pub fn compile_module(m: &Module) -> Result<Vec<u8>, Error> {
     compile_module_with(m, false)
 }
 
-/// **Bench/experiment front door** — like [`compile_module`], but with the fuel counter placed per
-/// `fuel_mode`. Used by the cross-engine fuel A/B (`examples/fuelbench`) to measure the ROI of a
-/// register-allocatable fuel global vs the shipped linear-memory cell. Not a shipping path.
-pub fn compile_module_fuel(m: &Module, fuel_mode: FuelMode) -> Result<Vec<u8>, Error> {
-    let a = analyze(m);
-    if !a.in_subset.iter().all(|&s| s) {
-        return Err(Error::Unsupported(
-            "a function is outside the integer subset",
-        ));
-    }
-    let n = m.funcs.len();
-    let emitted: Vec<usize> = (0..n).collect();
-    let wasm_of: Vec<Option<u32>> = (0..n).map(|i| Some(IMPORTED_FUNCS + i as u32)).collect();
-    emit_module(
-        m,
-        false,
-        &emitted,
-        &wasm_of,
-        &a.interp_leaf,
-        None,
-        false,
-        fuel_mode,
-        None,
-        svm_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
-    )
-}
-
 /// Two imported functions precede every emitted function, so a defined function's wasm index is
 /// `IMPORTED_FUNCS + its position among the emitted functions`.
 const IMPORTED_FUNCS: u32 = 2;
@@ -1491,7 +1444,6 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
         &a.interp_leaf,
         None,
         false,
-        FuelMode::Global,
         None,
         svm_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
     )
@@ -1583,7 +1535,6 @@ pub fn compile_module_nested_with_eligibility(
         &interp_leaf,
         None,
         true,
-        FuelMode::Global,
         None,
         null_guard,
     )?;
@@ -1670,7 +1621,6 @@ pub fn compile_module_b2(
         &a.interp_leaf,
         Some(table_log2),
         false,
-        FuelMode::Global,
         None,
         svm_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
     )
@@ -2000,7 +1950,6 @@ pub fn compile_module_reactor_capped(
             &cross,
             None,
             false,
-            FuelMode::Global,
             None,
             svm_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
         )?;
@@ -2082,7 +2031,6 @@ pub fn compile_module_reactor_keep(
         &cross,
         None,
         false,
-        FuelMode::Global,
         None,
         svm_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
     )?;
@@ -2238,7 +2186,6 @@ fn compile_module_tierup_inner(
             &leaf,
             None,
             nested_caps,
-            FuelMode::Global,
             paged,
             null_guard,
         )?;
@@ -2350,7 +2297,6 @@ fn compile_module_tierup_inner(
         &leaf,
         reserved_table_log2,
         nested_caps,
-        FuelMode::Global,
         paged,
         null_guard,
     )?;
@@ -2439,7 +2385,6 @@ fn compile_interp_only(
         &leaf,
         None,
         nested_caps,
-        FuelMode::Global,
         None,
         svm_ir::module_null_guard(m), // #964 (vacuous here — no bodies — but kept uniform)
     )?;
@@ -2510,7 +2455,6 @@ fn emit_module(
     interp_leaf: &[bool],
     reserved_table_log2: Option<u32>,
     nested_caps: bool,
-    fuel_mode: FuelMode,
     paged: Option<u8>,
     null_guard: Option<u64>,
 ) -> Result<Vec<u8>, Error> {
@@ -2719,7 +2663,6 @@ fn emit_module(
             &types,
             table_size,
             nested_caps,
-            fuel_mode,
             paged,
             null_guard,
         )?);
@@ -2825,28 +2768,23 @@ fn emit_module(
     }
 
     {
-        // Global section (6): the emitted module's mutable `i64` globals, in index order.
-        //  * global 0 (`FuelMode::Global` only) — the fuel counter, self-initialized to the standard
+        // Global section (6): the emitted module's mutable globals, in index order.
+        //  * global 0 (`FUEL_GLOBAL_IDX`) — the fuel counter, self-initialized to the standard
         //    per-region budget (`FUEL_DEFAULT`) so an unseeded region still runs; the host may re-arm
         //    or tighten it via the exported `"fuel"` global. Debited in `emit_fuel_check`.
-        //  * global `mapped_global_idx(fuel_mode)` — the live window `mapped` size (#717), self-
+        //  * global `MAPPED_GLOBAL_IDX` (1) — the live window `mapped` size (#717), self-
         //    initialized to the emit-time `1 << size_log2`. A host that never grows behaves exactly as
         //    the old baked constant; a `vm_map`-growing host writes the live size via the `"mapped"`
         //    export, and `emit_confine`/`emit_span_check` read it live. Register-allocatable; no guest
         //    store can alias it.
         let mut sec = Vec::new();
-        let has_fuel_global = fuel_mode == FuelMode::Global;
-        uleb(
-            &mut sec,
-            1 + has_fuel_global as u64 + paged.is_some() as u64,
-        );
-        if has_fuel_global {
-            sec.push(0x7e); // i64
-            sec.push(0x01); // mutable
-            sec.push(OP_I64_CONST);
-            sleb64(&mut sec, FUEL_DEFAULT);
-            sec.push(OP_END);
-        }
+        uleb(&mut sec, 2 + paged.is_some() as u64);
+        // The fuel global (index 0).
+        sec.push(0x7e); // i64
+        sec.push(0x01); // mutable
+        sec.push(OP_I64_CONST);
+        sleb64(&mut sec, FUEL_DEFAULT);
+        sec.push(OP_END);
         // The `mapped` global: default = the emit-time window size (`1 << size_log2`).
         sec.push(0x7e); // i64
         sec.push(0x01); // mutable
@@ -2869,10 +2807,9 @@ fn emit_module(
     }
 
     let mut sec = Vec::new(); // export section (7): "f{svm_idx}" → its wasm index
-                              // One `f{i}` per emitted function, the `"mapped"` global (always — #717 host sync), and the
-                              // `"fuel"` global when one is declared (`FuelMode::Global`).
-    let n_exports =
-        emitted.len() as u64 + 1 + (fuel_mode == FuelMode::Global) as u64 + paged.is_some() as u64;
+                              // One `f{i}` per emitted function, plus the `"fuel"` and `"mapped"` globals
+                              // (both always — #717 host sync), plus `"pagestate"` on paged modules.
+    let n_exports = emitted.len() as u64 + 2 + paged.is_some() as u64;
     uleb(&mut sec, n_exports);
     for &fi in emitted {
         let name = format!("f{fi}");
@@ -2881,7 +2818,7 @@ fn emit_module(
         sec.push(0x00);
         uleb(&mut sec, wasm_of[fi].unwrap() as u64);
     }
-    if fuel_mode == FuelMode::Global {
+    {
         let name = "fuel";
         uleb(&mut sec, name.len() as u64);
         sec.extend_from_slice(name.as_bytes());
@@ -2894,7 +2831,7 @@ fn emit_module(
         uleb(&mut sec, name.len() as u64);
         sec.extend_from_slice(name.as_bytes());
         sec.push(0x03); // global export kind
-        uleb(&mut sec, mapped_global_idx(fuel_mode) as u64);
+        uleb(&mut sec, MAPPED_GLOBAL_IDX as u64);
     }
     if paged.is_some() {
         // The page-state table base (#750, paged modules only): the driver writes it before each
@@ -2903,7 +2840,7 @@ fn emit_module(
         uleb(&mut sec, name.len() as u64);
         sec.extend_from_slice(name.as_bytes());
         sec.push(0x03); // global export kind
-        uleb(&mut sec, (mapped_global_idx(fuel_mode) + 1) as u64);
+        uleb(&mut sec, (MAPPED_GLOBAL_IDX + 1) as u64);
     }
     section(&mut out, 7, &sec);
 
@@ -3259,11 +3196,9 @@ struct FnCtx {
     /// Open label count inside the body; the dispatcher `loop` is the first label opened, so a
     /// branch back to it from depth `d` is `br (d - 1)`.
     depth: u32,
-    /// Where the per-dispatch fuel debit reads/writes its counter.
-    fuel_mode: FuelMode,
     /// Wasm global index of the live-`mapped` window size (#717). `emit_confine`/`emit_span_check`
     /// read it via `global.get` instead of a baked `1 << size_log2`, so a `vm_map`-grown window no
-    /// longer spuriously faults a legitimate access on the JIT. See [`mapped_global_idx`].
+    /// longer spuriously faults a legitimate access on the JIT. See [`MAPPED_GLOBAL_IDX`].
     mapped_global_idx: u32,
     /// The **gated software page-check** (#750): `Some((page_log2, pagestate_global_idx))` iff this
     /// module was compiled by the opt-in paged entry ([`compile_module_tierup_paged`]). Every
@@ -3297,7 +3232,6 @@ fn emit_func(
     types: &[(Vec<u8>, Vec<u8>)],
     table_size: u32,
     nested_caps: bool,
-    fuel_mode: FuelMode,
     paged: Option<u8>,
     null_guard: Option<u64>,
 ) -> Result<Vec<u8>, Error> {
@@ -3401,10 +3335,9 @@ fn emit_func(
         fuel_l,
         atomic_addr_l,
         depth: 0,
-        fuel_mode,
-        mapped_global_idx: mapped_global_idx(fuel_mode),
+        mapped_global_idx: MAPPED_GLOBAL_IDX,
         // The pagestate global (paged mode only) sits immediately after `mapped`.
-        page_check: paged.map(|pl| (pl, mapped_global_idx(fuel_mode) + 1)),
+        page_check: paged.map(|pl| (pl, MAPPED_GLOBAL_IDX + 1)),
         null_guard,
     };
 
@@ -3488,45 +3421,22 @@ fn emit_func(
     Ok(body)
 }
 
-/// Debit one fuel unit from the counter (`FuelMode::Global` global, or the legacy `env` cell) and
-/// trap `TRAP_OUT_OF_FUEL` when it goes negative. Emitted at the IR-anchored safepoints — once at
-/// function entry and once per taken back-edge (`emit_edge`), matching the tree-walk/bytecode/
-/// Cranelift oracle exactly (INVARIANTS.md #9), so a run traps `OutOfFuel` at the identical
-/// safepoint for any budget. The debited value and the `< 0` trap are identical across placement
-/// modes, so the differential is placement-insensitive.
+/// Debit one fuel unit from the fuel counter global and trap `TRAP_OUT_OF_FUEL` when it goes negative.
+/// Emitted at the IR-anchored safepoints — once at function entry and once per taken back-edge
+/// (`emit_edge`), matching the tree-walk/bytecode/Cranelift oracle exactly (INVARIANTS.md #9), so a run
+/// traps `OutOfFuel` at the identical safepoint for any budget.
 fn emit_fuel_check(cx: &mut FnCtx, code: &mut Vec<u8>) {
-    match cx.fuel_mode {
-        FuelMode::None => {}
-        FuelMode::Memory => {
-            code.push(OP_LOCAL_GET); // [env]        (store address)
-            uleb(code, 1);
-            code.push(OP_LOCAL_GET); // [env, env]
-            uleb(code, 1);
-            code.extend_from_slice(&[0x29, 0x03, 0x00]); // i64.load align=8 → [env, fuel]
-            code.push(OP_I64_CONST);
-            sleb64(code, 1);
-            code.push(0x7d); // i64.sub → [env, fuel-1]
-            code.push(OP_LOCAL_TEE);
-            uleb(code, cx.fuel_l as u64);
-            code.extend_from_slice(&[0x37, 0x03, 0x00]); // i64.store align=8 → []
-        }
-        FuelMode::Global => {
-            // global.get FUEL; i64.const 1; i64.sub; tee $fuel; global.set FUEL — the counter lives
-            // in a mutable global no guest memory store can alias, so V8 register-allocates it.
-            code.push(0x23); // global.get
-            uleb(code, FUEL_GLOBAL_IDX as u64);
-            code.push(OP_I64_CONST);
-            sleb64(code, 1);
-            code.push(0x7d); // i64.sub
-            code.push(OP_LOCAL_TEE);
-            uleb(code, cx.fuel_l as u64);
-            code.push(0x24); // global.set
-            uleb(code, FUEL_GLOBAL_IDX as u64);
-        }
-    }
-    if cx.fuel_mode == FuelMode::None {
-        return;
-    }
+    // global.get FUEL; i64.const 1; i64.sub; tee $fuel; global.set FUEL — the counter lives in a
+    // mutable global no guest memory store can alias, so V8 register-allocates it.
+    code.push(0x23); // global.get
+    uleb(code, FUEL_GLOBAL_IDX as u64);
+    code.push(OP_I64_CONST);
+    sleb64(code, 1);
+    code.push(0x7d); // i64.sub
+    code.push(OP_LOCAL_TEE);
+    uleb(code, cx.fuel_l as u64);
+    code.push(0x24); // global.set
+    uleb(code, FUEL_GLOBAL_IDX as u64);
     code.push(OP_LOCAL_GET);
     uleb(code, cx.fuel_l as u64);
     code.push(OP_I64_CONST);
@@ -3591,7 +3501,7 @@ fn emit_confine(
 /// confinement escape. (The native JIT, which also drops the clamp on proof, is the escape-critical
 /// consumer of the same predicate; here we keep the clamp, a strictly safer subset.) The alignment
 /// trap is **independent of bounds** and is emitted whenever `align`, elided or not. The elision proof
-/// uses the emit-time `mapped` (`elide_access`), a *lower* bound on the live [`mapped_global_idx`] size
+/// uses the emit-time `mapped` (`elide_access`), a *lower* bound on the live [`MAPPED_GLOBAL_IDX`] size
 /// the trap branch actually reads (#717) — the window only grows, so a proven-bounded access stays
 /// bounded.
 /// One page-state consultation of the #750 software page-check: the state byte of the page holding
@@ -3766,7 +3676,7 @@ fn emit_bulk_guard_open(cx: &mut FnCtx, code: &mut Vec<u8>, len_local: u32) {
 /// the span `[base, base+len)` lies within `[0, live_mapped)` — matching the interpreter's
 /// `confine_span`/`check_prot_span` net behaviour (a span above the live `mapped` is uncommitted →
 /// faults), and keeping every accessed byte inside the physical window (never the adjacent linear
-/// memory). The bound is the **live** window size read from the [`mapped_global_idx`] global (#717),
+/// memory). The bound is the **live** window size read from the [`MAPPED_GLOBAL_IDX`] global (#717),
 /// not a baked constant, so a `vm_map`-grown span no longer faults where the interpreter admits it. The
 /// check is **overflow-safe**: `base > live_mapped`, then (only once `base <= live_mapped`)
 /// `len > live_mapped - base`, so `live_mapped - base` can't underflow and `base + len` can't overflow.
