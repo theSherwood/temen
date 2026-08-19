@@ -209,12 +209,25 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
     if let Some(r) = m.data_funcrefs.first() {
         return Err(VerifyError::UnlinkedDataFuncref { at: r.at });
     }
-    // Import manifest (§7 / IMPORTS.md phase 1): names must be uniquely resolvable — the
-    // instantiation policy binds by name, so an ambiguous manifest is fail-closed here,
-    // mirroring the export-name check below.
+    // Validate the import manifest (§7 / IMPORTS.md phase 1) in one pass, before `verify_func`
+    // checks any call against it. Two properties per entry:
+    //   - names must be uniquely resolvable — the instantiation policy binds by name, so an
+    //     ambiguous manifest is fail-closed here, mirroring the export-name check below;
+    //   - §3.5 shape: every import must reference a well-formed type-section entry of its declared
+    //     kind — a `func` import a `Func` entry, an `interface` import an `Interface` entry whose
+    //     elements all resolve to `Func` entries. Fail-closed before any binding act.
     for (ii, imp) in m.imports.iter().enumerate() {
         if m.imports[..ii].iter().any(|o| o.name == imp.name) {
             return Err(VerifyError::DuplicateImport { import: ii as u32 });
+        }
+        let shape_ok = match imp.shape {
+            svm_ir::ImportShape::Func(t) => {
+                matches!(m.types.get(t as usize), Some(svm_ir::TypeEntry::Func(_)))
+            }
+            svm_ir::ImportShape::Interface(t) => m.interface_ops(t).is_some(),
+        };
+        if !shape_ok {
+            return Err(VerifyError::ImportShapeInvalid { import: ii as u32 });
         }
     }
     let has_memory = m.memory.is_some();
@@ -228,20 +241,6 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
             m.impl_exports.len(),
             has_memory,
         )?;
-    }
-    // §3.5 import shapes: every import must reference a well-formed type-section entry of its
-    // declared kind — a `func` import a `Func` entry, an `interface` import an `Interface`
-    // entry whose elements all resolve to `Func` entries. Fail-closed before any binding act.
-    for (ii, imp) in m.imports.iter().enumerate() {
-        let ok = match imp.shape {
-            svm_ir::ImportShape::Func(t) => {
-                matches!(m.types.get(t as usize), Some(svm_ir::TypeEntry::Func(_)))
-            }
-            svm_ir::ImportShape::Interface(t) => m.interface_ops(t).is_some(),
-        };
-        if !ok {
-            return Err(VerifyError::ImportShapeInvalid { import: ii as u32 });
-        }
     }
     // Named exports must point at a real function and be uniquely addressable (backends ignore the
     // table, but the host resolves `call("name")` through it, so a dangling/ambiguous name is
@@ -400,9 +399,14 @@ fn verify_func(
         let mut types: Vec<ValType> = b.params.clone();
 
         for inst in &b.insts {
-            // `Call` needs the whole-module signatures and appends 0..N results, so
-            // it is checked here rather than in `check_inst`.
+            // Ops that need whole-module context (signatures, the import manifest, the type
+            // section) or append multiple results have their operands checked here rather than in
+            // `check_inst`. These arms **check only** — mutually exclusive by opcode, and the result
+            // types every op appends come from the single shared definition below (`inst_result_types`,
+            // else `check_inst`). Ops with no operands to check (`cap.self.count`/`cap.self.attest`)
+            // aren't listed; they fall straight through to the append.
             if let Inst::Call { func, args } = inst {
+                // `Call` needs the whole-module signatures and appends 0..N results.
                 let callee = funcs
                     .get(*func as usize)
                     .ok_or(VerifyError::CallFuncOutOfRange {
@@ -410,28 +414,13 @@ fn verify_func(
                         block: bi,
                         callee: *func,
                     })?;
-                if args.len() != callee.params.len() {
-                    return Err(VerifyError::CallArgCountMismatch {
-                        func: fi,
-                        block: bi,
-                        expected: callee.params.len(),
-                        found: args.len(),
-                    });
+                Cx {
+                    fi,
+                    bi,
+                    types: &types,
                 }
-                {
-                    let cx = Cx {
-                        fi,
-                        bi,
-                        types: &types,
-                    };
-                    for (a, want) in args.iter().zip(&callee.params) {
-                        cx.expect(*a, *want)?;
-                    }
-                }
-                types.extend_from_slice(&callee.results);
-                continue;
-            }
-            if let Inst::RefFunc { func } = inst {
+                .check_args(args, &callee.params)?;
+            } else if let Inst::RefFunc { func } = inst {
                 if *func as usize >= funcs.len() {
                     return Err(VerifyError::CallFuncOutOfRange {
                         func: fi,
@@ -439,72 +428,39 @@ fn verify_func(
                         callee: *func,
                     });
                 }
-                types.push(ValType::I32); // a funcref is a plain i32 index (§3c)
-                continue;
-            }
-            if let Inst::CallIndirect { ty, idx, args } = inst {
-                {
-                    let cx = Cx {
-                        fi,
-                        bi,
-                        types: &types,
-                    };
-                    cx.expect(*idx, ValType::I32)?;
-                    if args.len() != ty.params.len() {
-                        return Err(VerifyError::CallArgCountMismatch {
-                            func: fi,
-                            block: bi,
-                            expected: ty.params.len(),
-                            found: args.len(),
-                        });
-                    }
-                    for (a, want) in args.iter().zip(&ty.params) {
-                        cx.expect(*a, *want)?;
-                    }
-                }
-                types.extend_from_slice(&ty.results);
-                continue;
-            }
-            if let Inst::CapCall {
+            } else if let Inst::CallIndirect { ty, idx, args } = inst {
+                let cx = Cx {
+                    fi,
+                    bi,
+                    types: &types,
+                };
+                cx.expect(*idx, ValType::I32)?;
+                cx.check_args(args, &ty.params)?;
+            } else if let Inst::CapCall {
                 sig, handle, args, ..
             } = inst
             {
-                {
-                    let cx = Cx {
-                        fi,
-                        bi,
-                        types: &types,
-                    };
-                    // The handle is a forgeable i32 index; safety is the runtime
-                    // use-site check (host-owned table type_id/generation), not typing.
-                    cx.expect(*handle, ValType::I32)?;
-                    if args.len() != sig.params.len() {
-                        return Err(VerifyError::CallArgCountMismatch {
-                            func: fi,
-                            block: bi,
-                            expected: sig.params.len(),
-                            found: args.len(),
-                        });
-                    }
-                    for (a, want) in args.iter().zip(&sig.params) {
-                        cx.expect(*a, *want)?;
-                    }
-                }
-                types.extend_from_slice(&sig.results);
-                continue;
-            }
-            // §7/§22 symbolic call (v8): `call.sym` verifies exactly like a *flat* manifest
-            // import call (op 0), plus its legacy handle operand (i32, ignored by manifest
-            // dispatch — it is live only to the linker: the Cap symbol's runtime handle and
-            // the `Slot` patch target). Executable when the instance binds the name; the
-            // linker's rewrite target when resolved first. One rule, both consumers.
-            if let Inst::CallSym {
+                let cx = Cx {
+                    fi,
+                    bi,
+                    types: &types,
+                };
+                // The handle is a forgeable i32 index; safety is the runtime
+                // use-site check (host-owned table type_id/generation), not typing.
+                cx.expect(*handle, ValType::I32)?;
+                cx.check_args(args, &sig.params)?;
+            } else if let Inst::CallSym {
                 import,
                 sig,
                 handle,
                 args,
             } = inst
             {
+                // §7/§22 symbolic call (v8): `call.sym` verifies exactly like a *flat* manifest
+                // import call (op 0), plus its legacy handle operand (i32, ignored by manifest
+                // dispatch — it is live only to the linker: the Cap symbol's runtime handle and
+                // the `Slot` patch target). Executable when the instance binds the name; the
+                // linker's rewrite target when resolved first. One rule, both consumers.
                 if imports.get(*import as usize).is_none() {
                     return Err(VerifyError::UnresolvedImport {
                         func: fi,
@@ -527,40 +483,25 @@ fn verify_func(
                         import: *import,
                     });
                 }
-                {
-                    let cx = Cx {
-                        fi,
-                        bi,
-                        types: &types,
-                    };
-                    cx.expect(*handle, ValType::I32)?;
-                    if args.len() != sig.params.len() {
-                        return Err(VerifyError::CallArgCountMismatch {
-                            func: fi,
-                            block: bi,
-                            expected: sig.params.len(),
-                            found: args.len(),
-                        });
-                    }
-                    for (a, want) in args.iter().zip(&sig.params) {
-                        cx.expect(*a, *want)?;
-                    }
-                }
-                types.extend_from_slice(&sig.results);
-                continue;
-            }
-            // §7 executable named import (IMPORTS.md phase 1): the index must name a declared
-            // import and the call's self-describing `sig` must equal the manifest's — the
-            // canonical-interface check `cap.call` cannot have (its sig is self-asserted).
-            // No handle operand (v8): the slot binding identifies the capability. Arg/result
-            // typing mirrors `cap.call`.
-            if let Inst::CallImport {
+                let cx = Cx {
+                    fi,
+                    bi,
+                    types: &types,
+                };
+                cx.expect(*handle, ValType::I32)?;
+                cx.check_args(args, &sig.params)?;
+            } else if let Inst::CallImport {
                 import,
                 op,
                 sig,
                 args,
             } = inst
             {
+                // §7 executable named import (IMPORTS.md phase 1): the index must name a declared
+                // import and the call's self-describing `sig` must equal the manifest's — the
+                // canonical-interface check `cap.call` cannot have (its sig is self-asserted).
+                // No handle operand (v8): the slot binding identifies the capability. Arg/result
+                // typing mirrors `cap.call`.
                 if imports.get(*import as usize).is_none() {
                     return Err(VerifyError::UnresolvedImport {
                         func: fi,
@@ -585,32 +526,17 @@ fn verify_func(
                         import: *import,
                     });
                 }
-                {
-                    let cx = Cx {
-                        fi,
-                        bi,
-                        types: &types,
-                    };
-                    if args.len() != sig.params.len() {
-                        return Err(VerifyError::CallArgCountMismatch {
-                            func: fi,
-                            block: bi,
-                            expected: sig.params.len(),
-                            found: args.len(),
-                        });
-                    }
-                    for (a, want) in args.iter().zip(&sig.params) {
-                        cx.expect(*a, *want)?;
-                    }
+                Cx {
+                    fi,
+                    bi,
+                    types: &types,
                 }
-                types.extend_from_slice(&sig.results);
-                continue;
-            }
-            // Phase-2 `import.attach` (IMPORTS.md): the index must name a declared **rebindable**
-            // import (attaching to a `required` slot would break its immutability-per-instance);
-            // the handle operand is an ordinary forgeable `i32` (validity is the runtime's §3c
-            // check at attach). Appends the `i32` status.
-            if let Inst::ImportAttach { import, handle } = inst {
+                .check_args(args, &sig.params)?;
+            } else if let Inst::ImportAttach { import, handle } = inst {
+                // Phase-2 `import.attach` (IMPORTS.md): the index must name a declared **rebindable**
+                // import (attaching to a `required` slot would break its immutability-per-instance);
+                // the handle operand is an ordinary forgeable `i32` (validity is the runtime's §3c
+                // check at attach). Appends the `i32` status.
                 if imports.get(*import as usize).is_none() {
                     return Err(VerifyError::UnresolvedImport {
                         func: fi,
@@ -625,19 +551,15 @@ fn verify_func(
                         import: *import,
                     });
                 }
-                let cx = Cx {
+                Cx {
                     fi,
                     bi,
                     types: &types,
-                };
-                cx.expect(*handle, ValType::I32)?;
-                types.push(ValType::I32);
-                continue;
-            }
-            // §12 `cont.resume` (and its I48 blocking variant) appends two results
-            // `(status: i32, value: i64)`, so — like `call` — it is checked here rather than
-            // in `check_inst`. Both variants have identical operand + result typing.
-            if let Inst::ContResume { k, arg } | Inst::ContResumeBlock { k, arg } = inst {
+                }
+                .expect(*handle, ValType::I32)?;
+            } else if let Inst::ContResume { k, arg } | Inst::ContResumeBlock { k, arg } = inst {
+                // §12 `cont.resume` (and its I48 blocking variant) appends two results
+                // `(status: i32, value: i64)`. Both variants have identical operand + result typing.
                 let cx = Cx {
                     fi,
                     bi,
@@ -645,36 +567,19 @@ fn verify_func(
                 };
                 cx.expect(*k, ValType::I64)?; // forgeable fiber handle (i64: 16-bit slot + 48-bit generation)
                 cx.expect(*arg, ValType::I64)?;
-                types.push(ValType::I32); // status
-                types.push(ValType::I64); // value
-                continue;
-            }
-            // §7 reflection: `cap.self.count` appends an `i32`; `cap.self.get` reads an `i32`
-            // index and appends `(handle: i32, type_id: i32)`. Always valid (no module/memory
-            // dependency) — the runtime bounds the index against the live table.
-            if let Inst::CapSelfCount = inst {
-                types.push(ValType::I32);
-                continue;
-            }
-            // §6 attestation: `cap.self.attest` takes no args and appends the packed provenance `i32`.
-            if let Inst::CapSelfAttest = inst {
-                types.push(ValType::I32);
-                continue;
-            }
-            if let Inst::CapSelfGet { idx } = inst {
-                let cx = Cx {
+            } else if let Inst::CapSelfGet { idx } = inst {
+                // §7 reflection: `cap.self.get` reads an `i32` index and appends `(handle, type_id)`.
+                // Always valid (no module/memory dependency) — the runtime bounds the index against
+                // the live table.
+                Cx {
                     fi,
                     bi,
                     types: &types,
-                };
-                cx.expect(*idx, ValType::I32)?;
-                types.push(ValType::I32); // handle
-                types.push(ValType::I32); // type_id
-                continue;
-            }
-            // §7 `cap.self.resolve` reads a name buffer `(ptr: i64, len: i64)` and appends the resolved
-            // handle (or `-errno`) as `i32`. Authority-neutral like the rest of `cap.self`.
-            if let Inst::CapSelfResolve { name_ptr, name_len } = inst {
+                }
+                .expect(*idx, ValType::I32)?;
+            } else if let Inst::CapSelfResolve { name_ptr, name_len } = inst {
+                // §7 `cap.self.resolve` reads a name buffer `(ptr: i64, len: i64)` and appends the
+                // resolved handle (or `-errno`) as `i32`. Authority-neutral like the rest of `cap.self`.
                 let cx = Cx {
                     fi,
                     bi,
@@ -682,17 +587,14 @@ fn verify_func(
                 };
                 cx.expect(*name_ptr, ValType::I64)?;
                 cx.expect(*name_len, ValType::I64)?;
-                types.push(ValType::I32); // handle | -errno
-                continue;
-            }
-            // §7 `cap.self.label` reads a handle (`i32`) and a buffer `(ptr: i64, cap: i64)`, and
-            // appends the label length (`i32`). Authority-neutral like the rest of `cap.self`.
-            if let Inst::CapSelfLabel {
+            } else if let Inst::CapSelfLabel {
                 handle,
                 buf_ptr,
                 buf_cap,
             } = inst
             {
+                // §7 `cap.self.label` reads a handle (`i32`) and a buffer `(ptr: i64, cap: i64)`, and
+                // appends the label length (`i32`). Authority-neutral like the rest of `cap.self`.
                 let cx = Cx {
                     fi,
                     bi,
@@ -701,13 +603,7 @@ fn verify_func(
                 cx.expect(*handle, ValType::I32)?;
                 cx.expect(*buf_ptr, ValType::I64)?;
                 cx.expect(*buf_cap, ValType::I64)?;
-                types.push(ValType::I32); // label length (0 = none)
-                continue;
-            }
-            // §3.5 dynamic-mode dispatch by type-section reference: `ty` must name a
-            // well-formed interface, `op` in range, and the self-describing `sig` must equal
-            // the resolution — the same canonical-interface check as static mode, at load.
-            if let Inst::CallImportDyn {
+            } else if let Inst::CallImportDyn {
                 ty,
                 op,
                 sig,
@@ -715,6 +611,9 @@ fn verify_func(
                 args,
             } = inst
             {
+                // §3.5 dynamic-mode dispatch by type-section reference: `ty` must name a
+                // well-formed interface, `op` in range, and the self-describing `sig` must equal
+                // the resolution — the same canonical-interface check as static mode, at load.
                 let Some(want) = iface_op_sig(type_section, *ty, *op) else {
                     return Err(VerifyError::DynIfaceInvalid {
                         func: fi,
@@ -735,23 +634,10 @@ fn verify_func(
                     types: &types,
                 };
                 cx.expect(*handle, ValType::I32)?;
-                if args.len() != sig.params.len() {
-                    return Err(VerifyError::CallArgCountMismatch {
-                        func: fi,
-                        block: bi,
-                        expected: sig.params.len(),
-                        found: args.len(),
-                    });
-                }
-                for (a, want) in args.iter().zip(&sig.params) {
-                    cx.expect(*a, *want)?;
-                }
-                types.extend_from_slice(&sig.results);
-                continue;
-            }
-            // §3.5 `export.handle`: the index must name a declared impl export. Appends the
-            // reified handle (`i32`).
-            if let Inst::ExportHandle { export } = inst {
+                cx.check_args(args, &sig.params)?;
+            } else if let Inst::ExportHandle { export } = inst {
+                // §3.5 `export.handle`: the index must name a declared impl export. Appends the
+                // reified handle (`i32`).
                 if *export as usize >= n_impl_exports {
                     return Err(VerifyError::ExportHandleOutOfRange {
                         func: fi,
@@ -759,12 +645,9 @@ fn verify_func(
                         export: *export,
                     });
                 }
-                types.push(ValType::I32);
-                continue;
-            }
-            // §3.5 reflection: both reference a well-formed interface entry of *this* module's
-            // type section; both append an `i32`.
-            if let Inst::CapSelfTypeId { ty } = inst {
+            } else if let Inst::CapSelfTypeId { ty } = inst {
+                // §3.5 reflection: references a well-formed interface entry of *this* module's type
+                // section; appends an `i32`.
                 if !iface_well_formed(type_section, *ty) {
                     return Err(VerifyError::DynIfaceInvalid {
                         func: fi,
@@ -772,10 +655,8 @@ fn verify_func(
                         ty: *ty,
                     });
                 }
-                types.push(ValType::I32); // the runtime type_id
-                continue;
-            }
-            if let Inst::CapSelfCovers { handle, ty } = inst {
+            } else if let Inst::CapSelfCovers { handle, ty } = inst {
+                // §3.5 reflection: well-formed interface entry + a forgeable `i32` handle; appends `i32`.
                 if !iface_well_formed(type_section, *ty) {
                     return Err(VerifyError::DynIfaceInvalid {
                         func: fi,
@@ -783,19 +664,16 @@ fn verify_func(
                         ty: *ty,
                     });
                 }
-                let cx = Cx {
+                Cx {
                     fi,
                     bi,
                     types: &types,
-                };
-                cx.expect(*handle, ValType::I32)?;
-                types.push(ValType::I32); // 1 covers / 0 does not / -errno
-                continue;
-            }
-            // §12 `thread.spawn` resolves a static `funcidx` whose signature must be the fixed
-            // thread-entry type `(i64 sp, i64 arg) -> i64`, so — like `call` — it needs whole-module
-            // info.
-            if let Inst::ThreadSpawn { func, sp, arg } = inst {
+                }
+                .expect(*handle, ValType::I32)?;
+            } else if let Inst::ThreadSpawn { func, sp, arg } = inst {
+                // §12 `thread.spawn` resolves a static `funcidx` whose signature must be the fixed
+                // thread-entry type `(i64 sp, i64 arg) -> i64`, so — like `call` — it needs whole-module
+                // info.
                 let callee = funcs
                     .get(*func as usize)
                     .ok_or(VerifyError::CallFuncOutOfRange {
@@ -818,13 +696,11 @@ fn verify_func(
                 };
                 cx.expect(*sp, ValType::I64)?;
                 cx.expect(*arg, ValType::I64)?;
-                types.push(ValType::I32); // the thread handle
-                continue;
-            }
-            // Security: a `gc.roots` payload mask may only clear the top byte. When the mask is a
-            // constant we can reject a fold-down mask statically (a non-constant mask is enforced at
-            // runtime on both backends). `mask | 0xFF00_..._0000 == !0` ⇔ the low 56 bits are all 1.
-            if let Inst::GcRoots { mask, .. } = inst {
+            } else if let Inst::GcRoots { mask, .. } = inst {
+                // Security: a `gc.roots` payload mask may only clear the top byte. When the mask is a
+                // constant we can reject a fold-down mask statically (a non-constant mask is enforced at
+                // runtime on both backends). `mask | 0xFF00_..._0000 == !0` ⇔ the low 56 bits are all 1.
+                // (`gc.roots` is *not* special-cased below — its single result comes from `check_inst`.)
                 if let Some(m) = const_i64_in_block(b, &fn_results, *mask) {
                     if (m as u64) | 0xFF00_0000_0000_0000 != u64::MAX {
                         return Err(VerifyError::GcRootsMaskUnsafe {
@@ -835,7 +711,13 @@ fn verify_func(
                     }
                 }
             }
-            // A value-producing instruction appends its result type; `Store` does not.
+
+            // Append result types from the single shared definition: the special-cased ops above via
+            // `inst_result_types`, every other value-producing op's single result via `check_inst`
+            // (`Store` yields nothing).
+            if inst_result_types(inst, funcs, &fn_results, &mut types) {
+                continue;
+            }
             if let Some(result) = check_inst(fi, bi, inst, &types, has_memory)? {
                 types.push(result);
             }
@@ -855,60 +737,111 @@ fn verify_func(
 /// the two in sync); on an unverified function it degrades gracefully (a value whose type can't be
 /// derived is simply absent from the vector) rather than erroring.
 pub fn func_value_types(f: &Func, funcs: &[Func], has_memory: bool) -> Vec<Vec<ValType>> {
+    let fn_results: Vec<usize> = funcs.iter().map(|f| f.results.len()).collect();
     f.blocks
         .iter()
-        .map(|b| block_value_types(b, funcs, has_memory))
+        .map(|b| block_value_types(b, funcs, &fn_results, has_memory))
         .collect()
 }
 
-fn block_value_types(b: &Block, funcs: &[Func], has_memory: bool) -> Vec<ValType> {
+fn block_value_types(
+    b: &Block,
+    funcs: &[Func],
+    fn_results: &[usize],
+    has_memory: bool,
+) -> Vec<ValType> {
     let mut types: Vec<ValType> = b.params.clone();
     for inst in &b.insts {
-        // Multi-result / non-`check_inst` ops: mirror the inline appends in `verify_func`.
-        match inst {
-            Inst::Call { func, .. } => {
-                if let Some(callee) = funcs.get(*func as usize) {
-                    types.extend_from_slice(&callee.results);
-                }
-            }
-            Inst::CallIndirect { ty, .. } => types.extend_from_slice(&ty.results),
-            Inst::CapCall { sig, .. } => types.extend_from_slice(&sig.results),
-            Inst::ContResume { .. } | Inst::ContResumeBlock { .. } => {
-                types.push(ValType::I32); // status
-                types.push(ValType::I64); // value
-            }
-            Inst::CapSelfCount => types.push(ValType::I32),
-            Inst::CapSelfAttest => types.push(ValType::I32), // packed provenance
-            Inst::CapSelfGet { .. } => {
-                types.push(ValType::I32); // handle
-                types.push(ValType::I32); // type_id
-            }
-            Inst::CapSelfResolve { .. } => types.push(ValType::I32), // handle | -errno
-            Inst::CapSelfLabel { .. } => types.push(ValType::I32),   // label length
-            Inst::ThreadSpawn { .. } => types.push(ValType::I32),
-            Inst::RefFunc { .. } => types.push(ValType::I32),
-            // Executable named import (IMPORTS.md phase 1): the verifier checked `sig` equals the
-            // manifest's declared signature, so the self-describing copy is authoritative here.
-            Inst::CallImport { sig, .. } => types.extend_from_slice(&sig.results),
-            Inst::CallImportDyn { sig, .. } => types.extend_from_slice(&sig.results),
-            // Link-form placeholder: rejected by `verify_func`, but the collector stays total.
-            Inst::CallSym { sig, .. } => types.extend_from_slice(&sig.results),
-            // Phase-2 attach: one `i32` status.
-            Inst::ImportAttach { .. } => types.push(ValType::I32),
-            // §3.5 single-i32 appends.
-            Inst::ExportHandle { .. } | Inst::CapSelfTypeId { .. } | Inst::CapSelfCovers { .. } => {
-                types.push(ValType::I32)
-            }
-            // Everything else (single result, or `Store`/no result) goes through the shared
-            // `check_inst` rules — the single source of truth for those types.
-            _ => {
-                if let Ok(Some(t)) = check_inst(0, 0, inst, &types, has_memory) {
-                    types.push(t);
-                }
-            }
+        // Special-cased ops (multi-result / whole-module-dependent) append via the one shared
+        // definition; everything else takes its single result from the shared `check_inst` rules.
+        if inst_result_types(inst, funcs, fn_results, &mut types) {
+            continue;
+        }
+        if let Ok(Some(t)) = check_inst(0, 0, inst, &types, has_memory) {
+            types.push(t);
         }
     }
     types
+}
+
+/// Append the result types of a **special-cased** instruction to `out`, returning `true`; return
+/// `false` (appending nothing) for an op whose single result is `check_inst`'s to compute.
+///
+/// These are the multi-result and whole-module-dependent ops that [`verify_func`] checks inline
+/// rather than through [`check_inst`]. This is the **one** definition of their appended types,
+/// consumed by both the checking walk ([`verify_func`]) and the typing-only walk
+/// ([`block_value_types`]) so the two cannot drift — the value numbering the `gc.roots` constant-mask
+/// trace relies on (`const_i64_in_block` → [`Inst::result_count`]) then has a single source. The
+/// appended arity is `debug_assert`ed equal to `result_count` for the same op.
+fn inst_result_types(
+    inst: &Inst,
+    funcs: &[Func],
+    fn_results: &[usize],
+    out: &mut Vec<ValType>,
+) -> bool {
+    let before = out.len();
+    let handled = match inst {
+        // Calls append the callee/interface result row. A dangling `call` funcidx appends nothing
+        // (`verify_func` rejects it; `result_count` reports 0 there too).
+        Inst::Call { func, .. } => {
+            if let Some(callee) = funcs.get(*func as usize) {
+                out.extend_from_slice(&callee.results);
+            }
+            true
+        }
+        Inst::CallIndirect { ty, .. } => {
+            out.extend_from_slice(&ty.results);
+            true
+        }
+        // The self-describing `sig` is authoritative here — `verify_func` checked it against the
+        // manifest/type-section. (`call.sym` is a link-form placeholder `verify_func` rejects, but
+        // this collector stays total.)
+        Inst::CapCall { sig, .. }
+        | Inst::CallImport { sig, .. }
+        | Inst::CallImportDyn { sig, .. }
+        | Inst::CallSym { sig, .. } => {
+            out.extend_from_slice(&sig.results);
+            true
+        }
+        // `cont.resume` (and its blocking variant): `(status: i32, value: i64)`.
+        Inst::ContResume { .. } | Inst::ContResumeBlock { .. } => {
+            out.push(ValType::I32);
+            out.push(ValType::I64);
+            true
+        }
+        // `cap.self.get`: `(handle: i32, type_id: i32)`.
+        Inst::CapSelfGet { .. } => {
+            out.push(ValType::I32);
+            out.push(ValType::I32);
+            true
+        }
+        // Single-`i32` appends: §7 reflection / phase-2 attach / §3.5 reify, plus the `thread.spawn`
+        // handle and the `ref.func` index.
+        Inst::CapSelfCount
+        | Inst::CapSelfAttest
+        | Inst::CapSelfResolve { .. }
+        | Inst::CapSelfLabel { .. }
+        | Inst::CapSelfTypeId { .. }
+        | Inst::CapSelfCovers { .. }
+        | Inst::ExportHandle { .. }
+        | Inst::ImportAttach { .. }
+        | Inst::ThreadSpawn { .. }
+        | Inst::RefFunc { .. } => {
+            out.push(ValType::I32);
+            true
+        }
+        _ => false,
+    };
+    // The appended arity is the value-numbering contract `const_i64_in_block` reads back through
+    // `result_count`; a drift would mis-trace the `gc.roots` constant mask. Only the special ops
+    // are asserted — the rest append their single result through `check_inst`.
+    debug_assert!(
+        !handled || out.len() - before == inst.result_count(fn_results),
+        "inst_result_types arity disagrees with Inst::result_count"
+    );
+    #[cfg(not(debug_assertions))]
+    let _ = fn_results;
+    handled
 }
 
 /// Check one instruction's operands against the running type vector and return the
@@ -1665,17 +1598,7 @@ fn check_tail_call(
     callee_results: &[ValType],
     func_results: &[ValType],
 ) -> Result<(), VerifyError> {
-    if args.len() != callee_params.len() {
-        return Err(VerifyError::CallArgCountMismatch {
-            func: cx.fi,
-            block: cx.bi,
-            expected: callee_params.len(),
-            found: args.len(),
-        });
-    }
-    for (a, want) in args.iter().zip(callee_params) {
-        cx.expect(*a, *want)?;
-    }
+    cx.check_args(args, callee_params)?;
     if callee_results != func_results {
         return Err(VerifyError::ResultCountMismatch {
             func: cx.fi,
@@ -1738,6 +1661,26 @@ impl Cx<'_> {
                 value: v,
                 defined: self.types.len() as u32,
             })
+    }
+
+    /// Check a call's arguments: exactly `params.len()` of them, each defined earlier in this
+    /// block with `params[i]`'s type. The shared body behind every call-shaped op — `call`,
+    /// `call_indirect`, `cap.call`, `call.sym`, `call.import`, `call.import.dyn`, and the two
+    /// `return_call` forms (via [`check_tail_call`]) — mirroring [`check_edge`] on the terminator
+    /// side. (Handle/index operands, where present, are checked by the caller before this.)
+    fn check_args(&self, args: &[ValIdx], params: &[ValType]) -> Result<(), VerifyError> {
+        if args.len() != params.len() {
+            return Err(VerifyError::CallArgCountMismatch {
+                func: self.fi,
+                block: self.bi,
+                expected: params.len(),
+                found: args.len(),
+            });
+        }
+        for (a, want) in args.iter().zip(params) {
+            self.expect(*a, *want)?;
+        }
+        Ok(())
     }
 
     /// An operand must be defined earlier in this block and have exactly `want`'s type.
