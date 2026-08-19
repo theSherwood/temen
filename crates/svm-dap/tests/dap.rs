@@ -4,55 +4,8 @@
 
 use svm_dap::{DapServer, Json};
 
-// LOOP_SUM with a hand-written §6/W4 debug section: a source location at the loop body (sum.c:7)
-// and the two loop variables mapped to their block-relative SSA value indices.
-const LOOP_SUM_DBG: &str = r#"
-func (i32) -> (i32) {
-block 0 (v0: i32) {
-  v1 = i32.const 0
-  br 1(v0, v1)
-}
-block 1 (v2: i32, v3: i32) {
-  v4 = i32.add v3 v2
-  v5 = i32.const -1
-  v6 = i32.add v2 v5
-  br_if v6 1(v6, v4) 2(v4)
-}
-block 2 (v7: i32) {
-  return v7
-  }
-}
-
-debug.file 0 "sum.c"
-debug.fname 0 "sum"
-debug.loc 0 1 0 0 7 5
-debug.var 0 "i" ssa 0 "int"
-debug.var 0 "acc" ssa 1 "int"
-"#;
-
-fn req(seq: i64, command: &str, args: Json) -> Json {
-    Json::obj(vec![
-        ("seq", Json::i(seq)),
-        ("type", Json::s("request")),
-        ("command", Json::s(command)),
-        ("arguments", args),
-    ])
-}
-
-/// The single response message in a handle() result (type == "response").
-fn response(msgs: &[Json]) -> &Json {
-    msgs.iter()
-        .find(|m| m.get("type").and_then(|t| t.as_str()) == Some("response"))
-        .expect("a response")
-}
-
-/// The first event with the given name, if any.
-fn event<'a>(msgs: &'a [Json], name: &str) -> Option<&'a Json> {
-    msgs.iter().find(|m| {
-        m.get("type").and_then(|t| t.as_str()) == Some("event")
-            && m.get("event").and_then(|e| e.as_str()) == Some(name)
-    })
-}
+mod support;
+use support::{event, req, response, LOOP_SUM_DBG};
 
 #[test]
 fn dap_breakpoint_hit_shows_source_frame_and_locals() {
