@@ -20,9 +20,11 @@ use svm_browser::{
     svm_onramp_tierup_jit_result_types_ptr, svm_onramp_tierup_jit_wasm_by_handle_len,
     svm_onramp_tierup_jit_wasm_by_handle_ptr, svm_onramp_tierup_jit_wasm_len,
     svm_onramp_tierup_jit_wasm_ptr, svm_onramp_tierup_mapped, svm_onramp_tierup_mapped_now,
-    svm_onramp_tierup_nfuncs, svm_onramp_tierup_open, svm_onramp_tierup_run,
+    svm_onramp_tierup_nfuncs, svm_onramp_tierup_open, svm_onramp_tierup_paged,
+    svm_onramp_tierup_pagestate_len, svm_onramp_tierup_pagestate_ptr, svm_onramp_tierup_run,
     svm_onramp_tierup_shim_ptr, svm_onramp_tierup_shim_wasm, svm_onramp_tierup_slot_code,
-    svm_onramp_tierup_table_log2, svm_onramp_tierup_value, svm_onramp_tierup_wasm_len,
+    svm_onramp_tierup_table_gen, svm_onramp_tierup_table_log2, svm_onramp_tierup_value,
+    svm_onramp_tierup_wasm_len,
     svm_onramp_tierup_wasm_ptr, svm_onramp_tierup_win_len, svm_onramp_tierup_win_ptr,
     svm_run_value, svm_status, svm_stdout_len, svm_stdout_ptr, STATUS_OK, STATUS_TRAP,
     STATUS_UNSUPPORTED, TIERUP_RUN_DONE, TIERUP_RUN_JIT_INVOKE, TIERUP_RUN_TIERUP, TIERUP_RUN_TRAP,
@@ -791,6 +793,9 @@ struct DriverData {
     mem: Option<Memory>,
     mapped_globals: Vec<wasmi::Global>,
     fuel_globals: Vec<wasmi::Global>,
+    /// #1009 paged: the emitted `"pagestate"` globals (only the paged main module has one) — the
+    /// post-bounce fan-out set for the page-state base, the twin of `mapped_globals`.
+    pagestate_globals: Vec<wasmi::Global>,
     bounces: Vec<u32>,
 }
 
@@ -811,6 +816,10 @@ struct TierupDriver {
     /// uninstall/reinstall regenerates against the new occupant's signature.
     shims: HashMap<(u32, i32), wasmi::Func>,
     win_len: usize,
+    /// #1009: the dispatch-table generation the shared table was last synced at — the driver rebuilds
+    /// it only when [`svm_onramp_tierup_table_gen`] advances (a §22 install/uninstall), mirroring the
+    /// JS driver's cache so the install differentials pin that skip-when-unchanged is exact.
+    synced_gen: i64,
 }
 
 impl TierupDriver {
@@ -843,6 +852,7 @@ impl TierupDriver {
             unit_insts: HashMap::new(),
             shims: HashMap::new(),
             win_len,
+            synced_gen: -1,
         };
         d.main = d.instantiate(&main_wasm);
         d
@@ -886,10 +896,37 @@ impl TierupDriver {
                     mem.write(&mut c, WIN_BASE as usize, live).unwrap();
                     mem.write(&mut c, args_ptr as usize, &slots).unwrap();
                     // #717 fan-out: the callback may have vm_map-grown the window — every live
-                    // instance's bound must admit the growth from the next instruction on.
-                    let now = svm_onramp_tierup_mapped_now();
-                    for g in c.data().mapped_globals.clone() {
-                        g.set(&mut c, Val::I64(now)).unwrap();
+                    // instance's bound must admit the growth from the next instruction on. #1009
+                    // paged: the growth also refreshed the page-state table (`call_interp` rebuilt
+                    // it from the live map), so fan the fresh COVERAGE out to `"mapped"` and re-copy
+                    // the table + re-point `"pagestate"` — the emitted access after the bounce then
+                    // admits the grown pages exactly where the interpreter does.
+                    if svm_onramp_tierup_paged() != 0 {
+                        let cover = svm_onramp_tierup_mapped();
+                        for g in c.data().mapped_globals.clone() {
+                            g.set(&mut c, Val::I64(cover)).unwrap();
+                        }
+                        let plen = svm_onramp_tierup_pagestate_len();
+                        // SAFETY: pending-event page-state table, stable until the deliver.
+                        let table = unsafe {
+                            std::slice::from_raw_parts(svm_onramp_tierup_pagestate_ptr(), plen)
+                        }
+                        .to_vec();
+                        let table_base = WIN_BASE as usize + win_len;
+                        let need = (table_base + plen).div_ceil(1 << 16) as u32;
+                        let have = mem.size(&c) as u32;
+                        if need > have {
+                            mem.grow(&mut c, (need - have) as u64).unwrap();
+                        }
+                        mem.write(&mut c, table_base, &table).unwrap();
+                        for g in c.data().pagestate_globals.clone() {
+                            g.set(&mut c, Val::I32(table_base as i32)).unwrap();
+                        }
+                    } else {
+                        let now = svm_onramp_tierup_mapped_now();
+                        for g in c.data().mapped_globals.clone() {
+                            g.set(&mut c, Val::I64(now)).unwrap();
+                        }
                     }
                     c.data_mut().bounces.push(target as u32);
                     if rc != 0 {
@@ -912,6 +949,9 @@ impl TierupDriver {
         if let Some(g) = instance.get_global(&self.store, "fuel") {
             self.store.data_mut().fuel_globals.push(g);
         }
+        if let Some(g) = instance.get_global(&self.store, "pagestate") {
+            self.store.data_mut().pagestate_globals.push(g);
+        }
         instance
     }
 
@@ -933,8 +973,14 @@ impl TierupDriver {
     }
 
     /// Rebuild the shared table from the engine's slot mirror — the per-event sync (installs only
-    /// happen between events, so a synced table is exact for the whole event).
+    /// happen between events, so a synced table is exact for the whole event). #1009: skipped while
+    /// the table generation is unchanged (no install/uninstall since the last sync), the JS driver's
+    /// cache mirrored so the install differentials pin it.
     fn sync_table(&mut self) {
+        let gen = svm_onramp_tierup_table_gen() as i64;
+        if gen == self.synced_gen {
+            return;
+        }
         let nfuncs = svm_onramp_tierup_nfuncs();
         let tsize = 1usize << svm_onramp_tierup_table_log2();
         for slot in 0..tsize {
@@ -976,6 +1022,7 @@ impl TierupDriver {
                 .set(&mut self.store, slot as u64, Val::FuncRef(fr))
                 .unwrap();
         }
+        self.synced_gen = gen;
     }
 
     /// Service the pending JIT_INVOKE: sync window + table + globals, run the invoked unit's `f0`,
@@ -1094,6 +1141,31 @@ impl TierupDriver {
         for g in self.store.data().fuel_globals.clone() {
             g.set(&mut self.store, Val::I64(1 << 61)).unwrap();
         }
+        // #1009 paged: the emitted access consults the page-state table. Its bytes live in the
+        // pump's linear memory in the browser (zero copy); here the emitted module has its own
+        // memory, so copy the table in after the mirrored window and point the `"pagestate"` global
+        // at it — the same driver contract `page_check.rs` pins, now with the B2 main module.
+        if svm_onramp_tierup_paged() != 0 {
+            let n = svm_onramp_tierup_pagestate_len();
+            // SAFETY: pending-event page-state table, stable until the deliver.
+            let table = unsafe { std::slice::from_raw_parts(svm_onramp_tierup_pagestate_ptr(), n) };
+            let table_base = WIN_BASE as usize + self.win_len;
+            let need = (table_base + n).div_ceil(1 << 16) as u32;
+            let have = self.memory.size(&self.store) as u32;
+            if need > have {
+                self.memory
+                    .grow(&mut self.store, (need - have) as u64)
+                    .unwrap();
+            }
+            self.memory
+                .write(&mut self.store, table_base, table)
+                .unwrap();
+            self.main
+                .get_global(&self.store, "pagestate")
+                .expect("a paged main module exports the pagestate global")
+                .set(&mut self.store, Val::I32(table_base as i32))
+                .unwrap();
+        }
         let func = svm_onramp_tierup_func();
         let f = self
             .main
@@ -1151,6 +1223,28 @@ fn drive_full_session(m: &svm_ir::Module) -> (TierupDriver, u32, u32) {
         }
     }
     (d, tierups, invokes)
+}
+
+/// [`drive_full_session`] that **tolerates a trap** (the guest faults, or an emitted region traps and
+/// is delivered) instead of panicking: drive to DONE or TRAP, returning the driver and the tier-up
+/// count. The caller reads [`svm_status`] to assert trap-parity with the oracle. Used by the paged
+/// differential, where an `Ro` store is expected to fault on both tiers.
+fn drive_full_session_allow_trap(m: &svm_ir::Module) -> (TierupDriver, u32) {
+    let mut d = TierupDriver::new();
+    let mut tierups = 0u32;
+    loop {
+        match svm_onramp_tierup_run() {
+            TIERUP_RUN_JIT_INVOKE => d.service_jit_invoke(),
+            TIERUP_RUN_TIERUP => {
+                tierups += 1;
+                let f = svm_onramp_tierup_func() as usize;
+                d.service_tierup(m.funcs[f].results.len());
+            }
+            TIERUP_RUN_DONE | TIERUP_RUN_TRAP => break,
+            ev => panic!("unexpected pump event {ev} (status {})", svm_status()),
+        }
+    }
+    (d, tierups)
 }
 
 /// [`drive_full_session`] for guests with no eligible leaves (every emitted entry a unit invoke).
@@ -1622,6 +1716,191 @@ block 0 (v0: i64) {{
         want.value,
         "value parity — the emitted high-index dispatch must reach slot {TARGET}, not {}",
         TARGET & 1023
+    );
+    svm_onramp_tierup_close();
+}
+
+/// #1009 paged, the mid-invoke-grow refresh: an eligible leaf bounces to a cross-tier helper that
+/// `vm_map`-grows the window, then the leaf accesses the freshly-grown page on emitted wasm. The
+/// page-state table is built at TIERUP entry — stale after the grow — so without refreshing it the
+/// emitted access would trap (the grown page reads `Unmapped`) where the interpreter admits it. The
+/// `call_interp` bounce rebuilds the table from the live map and the driver re-points `"pagestate"` +
+/// fans the fresh coverage to `"mapped"`, exactly the #717 scalar fan-out's paged twin. Matches the
+/// `onramp_exec` oracle (before the refresh, the pump trapped — a divergence toward refusal).
+#[test]
+fn paged_midinvoke_grow_refreshes_the_pagestate_and_matches_the_oracle() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let (_out_h, mem_h) = onramp_handles();
+    const X: i64 = 1234;
+    // rodata at 32768 (clear of the args prefix and this guest's own accesses) flips the run paged.
+    // The leaf bounces to func 2 (a `cap.call` grow helper — cross-tier), which grows
+    // `[64 KiB, 80 KiB)`, then stores into that just-grown page and reads it back.
+    let src = format!(
+        r#"memory 16
+data ro 32768 "rodata-flips-paged-mode!!"
+func () -> (i64) {{
+block 0 () {{
+  vx = i64.const {X}
+  vres = call 1 (vx)
+  return vres
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vg = call 2 (v0)
+  vaddr = i64.const 65552
+  i64.store vaddr v0
+  vld = i64.load vaddr
+  return vld
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vas = i32.const {mem_h}
+  voff = i64.const 65536
+  vlen = i64.const 16384
+  vprot = i32.const 3
+  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  return v0
+  }}
+}}
+export 0 func "_start" 0
+"#
+    );
+    let m = svm_text::parse_module(&src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(
+        want.value, X,
+        "oracle: the store/load round-trips through the grown page"
+    );
+
+    let opened = svm_onramp_tierup_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "open must admit (status {})", svm_status());
+    assert_ne!(svm_onramp_tierup_paged(), 0, "the rodata guest opens paged");
+    let (d, tierups) = drive_full_session_allow_trap(&m);
+    assert!(tierups >= 1, "the leaf tiers up");
+    assert!(
+        !d.bounces().is_empty(),
+        "the grow helper's outlined `cap.call` wrapper must bounce (the mid-invoke grow): {:?}",
+        d.bounces()
+    );
+    assert_eq!(
+        svm_status(),
+        want.status,
+        "status parity: the post-grow emitted access must NOT trap (the table was refreshed)"
+    );
+    assert_eq!(
+        svm_onramp_tierup_value(),
+        want.value,
+        "value parity through the mid-invoke-grown page"
+    );
+    svm_onramp_tierup_close();
+}
+
+// ---- #1009 (the primary arc): rodata guests tier up through the PAGED pump --------------------
+
+/// #1009: a guest that declares a `readonly` data segment — the shape every real on-ramp card has
+/// (lua 703 readonly segments, qjs 1039, …) — makes the per-call `scalar_extent` sync decline *every*
+/// tier-up (one durable `Ro` page ⇒ the window is no longer one-bound-representable), so the pump
+/// fired **zero** emitted events on exactly the cards it existed to accelerate (the #839 finding). The
+/// pump now auto-flips to **paged** mode when the guest carries rodata: the eligible leaf tiers up,
+/// and its emitted access consults the per-event page-state table, honoring the `Ro` page exactly
+/// where the interpreter's `check_prot` does. A load of the Ro page succeeds (reads the rodata bytes);
+/// a store to it traps — both matching the `onramp_exec` oracle, the trap-parity that keeps a wrong
+/// table a divergence and never an escape (INVARIANTS #9).
+#[test]
+fn rodata_guest_tiers_up_paged_and_matches_the_oracle() {
+    let _g = FFI_LOCK.lock().unwrap();
+
+    // Page 1 (`[64 KiB, 128 KiB)`, host-page-rounded from the segment) is laid out read-only; the
+    // leaf loads from it. `_start` uses no linear stack, so the low args region is the only reserved
+    // span — the Ro page is the guest's own data. (offset 65536 = the wasm host page, so the whole
+    // top page goes Ro.)
+    let load_src = r#"memory 17
+data ro 65536 "svm-rodata-page-payload!!"
+func () -> (i64) {
+block 0 () {
+  vprobe = i64.const 65536
+  vres = call 1 (vprobe)
+  return vres
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vl = i64.load v0
+  return vl
+  }
+}
+export 0 func "_start" 0
+"#;
+    let m = svm_text::parse_module(load_src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    assert!(m.data.iter().any(|d| d.readonly), "guest carries rodata");
+    let bytes = svm_encode::encode_module(&m);
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity: an Ro load succeeds");
+
+    let opened = svm_onramp_tierup_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "open must admit (status {})", svm_status());
+    assert_ne!(
+        svm_onramp_tierup_paged(),
+        0,
+        "the rodata guest must open PAGED (the #1009 auto-flip)"
+    );
+    let (_d, tierups) = drive_full_session_allow_trap(&m);
+    assert!(
+        tierups >= 1,
+        "the leaf must tier up through the paged pump — this fired ZERO events before #1009"
+    );
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        svm_onramp_tierup_value(),
+        want.value,
+        "value parity: the paged Ro load reads the same rodata bytes as the interpreter"
+    );
+    svm_onramp_tierup_close();
+
+    // A store to the same Ro page traps on both tiers (the emitted page check faults exactly where
+    // `check_prot` does).
+    let store_src = r#"memory 17
+data ro 65536 "svm-rodata-page-payload!!"
+func () -> (i64) {
+block 0 () {
+  vprobe = i64.const 65536
+  vres = call 1 (vprobe)
+  return vres
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  i64.store v0 v0
+  vl = i64.load v0
+  return vl
+  }
+}
+export 0 func "_start" 0
+"#;
+    let m = svm_text::parse_module(store_src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+    let want = onramp_exec(&m, b"");
+    assert_eq!(
+        want.status, STATUS_TRAP,
+        "oracle sanity: an Ro store faults"
+    );
+
+    let opened = svm_onramp_tierup_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "open must admit (status {})", svm_status());
+    assert_ne!(svm_onramp_tierup_paged(), 0, "paged");
+    let (_d, tierups) = drive_full_session_allow_trap(&m);
+    assert!(tierups >= 1, "the leaf tiers up before the Ro store faults");
+    assert_eq!(
+        svm_status(),
+        want.status,
+        "status parity: the paged Ro store traps exactly like the interpreter"
     );
     svm_onramp_tierup_close();
 }

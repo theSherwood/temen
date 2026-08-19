@@ -8569,6 +8569,50 @@ struct TierupRun {
     /// The guest's top-level result, staged at DONE.
     value: i64,
     frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
+    /// #1009 paged tier-up: whether the emitted module carries the software page check
+    /// ([`svm_wasm_jit::compile_module_tierup_b2_paged`]) — set when the guest write-protects rodata.
+    /// A paged run rebuilds [`pagestate`](Self::pagestate) at every TIERUP and the driver points the
+    /// emitted `"pagestate"` global at it (and writes the table's coverage to `"mapped"`).
+    paged: bool,
+    /// #1009 paged tier-up: the page-state table for the pending TIERUP, rebuilt from the live page
+    /// map each event ([`bytecode::build_pagestate_table`]). Its bytes live in this module's linear
+    /// memory, so [`svm_onramp_tierup_pagestate_ptr`] IS the address the driver writes to the emitted
+    /// `"pagestate"` global (one shared memory, zero copies). Empty on unpaged runs.
+    pagestate: Vec<u8>,
+    /// #1009 paged tier-up: the [`bytecode::Vcpu::mem_map_version`] the cached `pagestate`/`mapped`
+    /// were built at. `map`/`unmap`/`protect` bump the version; while it is unchanged the page-state
+    /// table is identical, so the `O(pages)` rebuild is skipped (dispatch-heavy cards fire tens of
+    /// thousands of tier-ups between two heap grows). `u64::MAX` = never built.
+    pagestate_version: u64,
+    /// #1009 paged tier-up: the cached table's coverage — the value written to `"mapped"` (restored
+    /// even on a cache hit, since an interleaved JIT_INVOKE reuses `mapped`).
+    pagestate_cover: u64,
+    /// #1009: a generation counter bumped on each §22 install/uninstall (the only events that mutate
+    /// the dispatch-table slot mirror — a `cap.call`-bearing unit never emits, so installs happen
+    /// strictly between events). The driver caches the last generation it synced its `WebAssembly.Table`
+    /// at and rebuilds only when this advances, so a dispatch-heavy card that never installs syncs the
+    /// (up to ~4 K-slot) table ONCE instead of on every one of tens of thousands of tier-ups — the
+    /// pump's dominant per-event cost before this.
+    table_gen: u32,
+}
+
+impl TierupRun {
+    /// #1009 paged tier-up: refresh the page-state table iff the window's page map changed since the
+    /// last build ([`bytecode::Vcpu::mem_map_version`]), then stage its coverage for `"mapped"`. Cheap
+    /// on the common path (an `O(1)` version compare); an `O(pages)` rebuild only after a real
+    /// `map`/`unmap`/`protect`. Called at each TIERUP and after each `call_interp` bounce (a bounced
+    /// callback may have `vm_map`-grown the window mid-invoke).
+    fn sync_pagestate(&mut self) {
+        let ver = self.vcpu.mem_map_version();
+        if ver != self.pagestate_version {
+            let info = self.vcpu.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
+            let (table, cover) = bytecode::build_pagestate_table(&info);
+            self.pagestate = table;
+            self.pagestate_cover = cover;
+            self.pagestate_version = ver;
+        }
+        self.mapped = self.pagestate_cover;
+    }
 }
 
 /// Open a **leaf tier-up run** over the on-ramp module at `[mod_ptr, mod_len)` with stdin seeded:
@@ -8663,10 +8707,27 @@ pub extern "C" fn svm_onramp_tierup_open(
     // a high-index `call_indirect` to a different slot. One value drives the emit, the engine table,
     // the slot mirror, the unit emitter, and the driver's table build.
     let table_log2 = tierup_table_log2(m.funcs.len());
+    // #1009: a guest that write-protects its rodata (a `readonly` data segment — every real on-ramp
+    // card lays out `.rodata` this way) makes the per-call #717 `scalar_extent` sync decline **every**
+    // tier-up: one durable `Ro` page and the window is no longer one-bound-representable, so the pump
+    // fired zero emitted events on the cards it most needed to (the #839 bench finding). Emit the
+    // shared table **paged** (#750) so the decline is replaced by a per-access page check that honors
+    // `Ro`/`Unmapped` exactly where the interpreter's `check_prot` traps — the vCPU then surfaces the
+    // reserved size (never a decline), and each event refreshes a page-state table. Paged rides the
+    // B2 shared-table mode (the pump's only mode), so it is gated on `all_shimmable`.
+    let paged = all_shimmable && m.data.iter().any(|d| d.readonly);
+    let page_log2 = svm_interp::host_page_size().trailing_zeros() as u8;
     // #880: emit the main module over the **shared reserved table** — `call_indirect`-bearing
     // functions tier up (the language-runtime dispatch-loop shape), their indirect calls reaching
     // installed units natively (old→new) and interpreter-resident targets through the live bounce.
-    let emitted_res = if all_shimmable {
+    let emitted_res = if paged {
+        svm_wasm_jit::compile_module_tierup_b2_paged(
+            &emit_m,
+            shared != 0,
+            table_log2 as u32,
+            page_log2,
+        )
+    } else if all_shimmable {
         svm_wasm_jit::compile_module_tierup_b2(&emit_m, shared != 0, table_log2 as u32)
     } else {
         svm_wasm_jit::compile_module_tierup(&emit_m, shared != 0)
@@ -8733,7 +8794,16 @@ pub extern "C" fn svm_onramp_tierup_open(
         win_log2,
         back,
     ) {
-        Ok(v) => v.with_jit_eligible(std::sync::Arc::from(eligible.into_boxed_slice())),
+        Ok(v) => {
+            let v = v.with_jit_eligible(std::sync::Arc::from(eligible.into_boxed_slice()));
+            // #1009 paged: skip the scalar decline — the per-event page-state table carries the
+            // fidelity `scalar_extent` cannot (the emitted access consults it and traps in-clamp).
+            if paged {
+                v.with_jit_page_checked()
+            } else {
+                v
+            }
+        }
         Err(_) => {
             // SAFETY: the leaked program has no borrower yet; rebox and drop it.
             drop(unsafe { Box::from_raw(prog as *const _ as *mut bytecode::VcpuProgram) });
@@ -8766,6 +8836,11 @@ pub extern "C" fn svm_onramp_tierup_open(
             pending_bounce_trap: None,
             value: 0,
             frame,
+            paged,
+            pagestate: Vec::new(),
+            pagestate_version: u64::MAX,
+            pagestate_cover: 0,
+            table_gen: 0,
         });
     }
     set(STATUS_OK);
@@ -8792,8 +8867,18 @@ pub extern "C" fn svm_onramp_tierup_run() -> i32 {
         match s.vcpu.run() {
             bytecode::VcpuEvent::TierUp { func, argv, mapped } => {
                 s.func = func;
-                s.mapped = mapped;
                 s.argv = argv.into_vec();
+                if s.paged {
+                    // #1009 paged: `mapped` from the event is the reserved size (the page-checked run
+                    // never declines). Stage the page-state table's COVERAGE for `"mapped"` (the bound
+                    // above which everything traps, where `check_prot` faults) and the table itself
+                    // for `"pagestate"` — rebuilt only when the page map changed since the last event
+                    // (`sync_pagestate`). The table bytes are read via `svm_onramp_tierup_pagestate_*`
+                    // (their address in this module's linear memory IS the `"pagestate"` value).
+                    s.sync_pagestate();
+                } else {
+                    s.mapped = mapped;
+                }
                 return TIERUP_RUN_TIERUP;
             }
             // §22 install/uninstall mutate only engine/host state — resolve authority against this
@@ -8809,6 +8894,7 @@ pub extern "C" fn svm_onramp_tierup_run() -> i32 {
                     if let Some(e) = s.slot_codes.get_mut(slot) {
                         *e = code;
                     }
+                    s.table_gen = s.table_gen.wrapping_add(1); // the slot mirror changed → re-sync
                 }
             }
             bytecode::VcpuEvent::JitUninstall { handle, .. } => {
@@ -8817,6 +8903,7 @@ pub extern "C" fn svm_onramp_tierup_run() -> i32 {
                     if let Some(e) = s.slot_codes.get_mut(slot) {
                         *e = -1; // keep the JS table mirror exact (a stale slot must trap)
                     }
+                    s.table_gen = s.table_gen.wrapping_add(1); // the slot mirror changed → re-sync
                 }
             }
             // §22 `Jit.invoke` (#835): a runtime-compiled unit with emitted wasm, all-scalar
@@ -8902,11 +8989,40 @@ pub extern "C" fn svm_onramp_tierup_func() -> i32 {
 }
 
 /// The pending TIERUP's/JIT_INVOKE's committed extent — the value for the emitted `"mapped"`
-/// global (#717).
+/// global (#717). On a **paged** run (#1009) this is the pending TIERUP's page-state table
+/// *coverage*, not the scalar extent — the bound above which every access traps.
 #[no_mangle]
 pub extern "C" fn svm_onramp_tierup_mapped() -> i64 {
     // SAFETY: single-threaded wasm; read of the pending operands.
     unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.mapped as i64)
+}
+
+/// #1009: whether this run's emitted module is **paged** — the driver must, before each TIERUP call,
+/// write the emitted `"pagestate"` global to [`svm_onramp_tierup_pagestate_ptr`] (in addition to the
+/// usual `"mapped"` = [`svm_onramp_tierup_mapped`] and the fuel cell). `0` on an unpaged run (no
+/// `"pagestate"` global to write).
+#[no_mangle]
+pub extern "C" fn svm_onramp_tierup_paged() -> i32 {
+    // SAFETY: single-threaded wasm; read of the session flag.
+    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.paged as i32)
+}
+
+/// #1009 paged: the pending TIERUP's page-state table base. The bytes live in this module's linear
+/// memory, so this pointer is exactly the value the driver writes to the emitted `"pagestate"`
+/// global (one shared memory, zero copies — the browser path; the wasmi differential copies them
+/// into its own memory first). Meaningful only when [`svm_onramp_tierup_paged`] is set.
+#[no_mangle]
+pub extern "C" fn svm_onramp_tierup_pagestate_ptr() -> *const u8 {
+    // SAFETY: single-threaded wasm; read of the pending table.
+    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }
+        .map_or(core::ptr::null(), |s| s.pagestate.as_ptr())
+}
+
+/// #1009 paged: byte length of the pending TIERUP's page-state table (`0` on an unpaged run).
+#[no_mangle]
+pub extern "C" fn svm_onramp_tierup_pagestate_len() -> usize {
+    // SAFETY: single-threaded wasm; read of the pending table.
+    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.pagestate.len())
 }
 
 /// The pending TIERUP's/JIT_INVOKE's marshalled i64 args (base pointer; valid until the next event).
@@ -9094,7 +9210,18 @@ pub extern "C" fn svm_onramp_tierup_call_interp(target: u32, args_ptr: *mut u8) 
     let max_slots = (svm_wasm_jit::ENV_CELL_BYTES - 16) / 8;
     let io = unsafe { core::slice::from_raw_parts_mut(args_ptr as *mut i64, max_slots) };
     match s.vcpu.bounce_call(target, io) {
-        Ok(_) => 0,
+        Ok(_) => {
+            // #1009 paged: a bounced callback may have `vm_map`-grown the window mid-invoke — the
+            // page-state table built at TIERUP entry no longer covers the grown pages (they read as
+            // `Unmapped`, so the emitted access after the bounce would trap where the interpreter
+            // admits the growth). Refresh it (only if the page map actually changed — `sync_pagestate`
+            // version-guards the rebuild), exactly as the #717 `"mapped"` fan-out re-syncs the scalar
+            // bound; the driver reads the fresh base + coverage below.
+            if s.paged {
+                s.sync_pagestate();
+            }
+            0
+        }
         Err(t) => {
             s.pending_bounce_trap = Some(t);
             1
@@ -9127,6 +9254,16 @@ pub extern "C" fn svm_onramp_tierup_table_log2() -> u32 {
 pub extern "C" fn svm_onramp_tierup_nfuncs() -> usize {
     // SAFETY: single-threaded wasm; read of the session stash.
     unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.sigs.len())
+}
+
+/// #1009: the dispatch-table **generation** — bumped on each §22 install/uninstall (the only slot-
+/// mirror mutations). The driver caches the generation it last synced its `WebAssembly.Table` at and
+/// rebuilds only when this advances; a card that never installs syncs the table once, not per
+/// tier-up. Monotone (`wrapping_add`); the driver compares for inequality, so wrap is immaterial.
+#[no_mangle]
+pub extern "C" fn svm_onramp_tierup_table_gen() -> u32 {
+    // SAFETY: single-threaded wasm; read of the session stash.
+    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.table_gen)
 }
 
 /// The code handle installed at dispatch-table `slot` (`-1` empty/natural) — the mirror the JS

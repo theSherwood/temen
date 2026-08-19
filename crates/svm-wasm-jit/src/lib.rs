@@ -2047,6 +2047,32 @@ pub fn compile_module_tierup_b2(
     compile_module_tierup_inner(m, shared_memory, false, None, Some(table_log2), None)
 }
 
+/// #1009 — [`compile_module_tierup_b2`] **paged** (#750): the shared-reserved-table dispatch mode
+/// (B2, `table_log2`), but every emitted access also consults the host-maintained page-state table
+/// (`page_log2`), so a guest that write-protects its rodata (`readonly` data segments — every real
+/// on-ramp card does) keeps its pure leaves eligible instead of declining the whole tier-up at the
+/// per-call `scalar_extent` sync. Composes the two orthogonally: the B2 cross-tier widening and
+/// indirect-dispatch lift (see [`compile_module_tierup_b2`]) with the paged per-access page check and
+/// its bulk-memory exclusion (see [`compile_module_tierup_paged`]). The driver contract is the union
+/// of both — service `env.call_interp` over the **live** window (B2), and before each emitted call
+/// refresh the page-state table from the live map and write its base to `"pagestate"` + its coverage
+/// to `"mapped"` (#750). This is what the single-shot pump uses for a rodata-bearing card.
+pub fn compile_module_tierup_b2_paged(
+    m: &Module,
+    shared_memory: bool,
+    table_log2: u32,
+    page_log2: u8,
+) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    compile_module_tierup_inner(
+        m,
+        shared_memory,
+        false,
+        Some(page_log2),
+        Some(table_log2),
+        None,
+    )
+}
+
 /// The **opt-in gated software page-check** entry (#750): like [`compile_module_tierup`], but the
 /// module is compiled in **paged** mode — the shrinking page ops (`unmap`/`protect`, iface 5 ops
 /// 1/2) no longer force emit-nothing, because every emitted access also consults a host-maintained

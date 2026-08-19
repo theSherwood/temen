@@ -3159,6 +3159,14 @@ impl<'p> Vcpu<'p> {
         self.mem.as_ref().map(|m| m.map_info())
     }
 
+    /// #1009 paged tier-up: the window's page-map version — a cheap `O(1)` counter bumped on every
+    /// `map`/`unmap`/`protect`. A page-checked driver caches the page-state table it built from
+    /// [`mem_map_info`](Vcpu::mem_map_info) and rebuilds only when this changes (the table is
+    /// identical between two tier-ups with no intervening page-op). `0` for a memory-less module.
+    pub fn mem_map_version(&self) -> u64 {
+        self.mem.as_ref().map_or(0, |m| m.map_version())
+    }
+
     /// Reclaim this vCPU's live guest window after it finishes — the seam a **reactor** uses to keep
     /// the window (globals, BSS, and the `vm_map`-grown heap, with its address-space commit state)
     /// alive across per-frame vCPUs: build a vCPU over the persistent [`Mem`] with
