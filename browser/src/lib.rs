@@ -8546,6 +8546,18 @@ pub extern "C" fn svm_onramp_tierup_open(
         set(STATUS_UNSUPPORTED);
         return -STATUS_UNSUPPORTED;
     }
+    // #889: hoist inline `cap.call`/`call.import`/`cap.self.resolve` sites into appended cross-tier
+    // wrapper functions — the host-boundary *op* is fundamental, the compute around it isn't. The
+    // containing function becomes in-subset compute + a plain `Call`, and under the #888 widened
+    // fixpoint each wrapper is a marshallable cross-tier callee served by the live bounce. Mutates
+    // the module BOTH tiers use (the whole-program `open_over_jit` rule): the emit clone below
+    // derives from it, and `VcpuProgram`/`sigs`/`eligible` are all sized to the outlined module, so
+    // slot numbering stays consistent between the emitted mask, the engine table, and the driver's
+    // shims. Wrappers only append (existing `FuncIdx`es unchanged) and carry all-scalar signatures,
+    // so the `all_shimmable` gate below is undisturbed; wrappers themselves never become tier-up
+    // entries (they hold the cap op, so the fixpoint keeps them interpreter-resident).
+    let mut m = m;
+    svm_wasm_jit::outline_cap_calls(&mut m);
     // #926 slice 1 — **no static concurrency gate at open.** The old `any(uses_threads ||
     // uses_futex)` refusal was whole-module, so it also rejected guests whose concurrency ops are
     // *linked but dead* — the JACL compiler-guest (jaclrt's scheduler/GC links thread/futex ops
