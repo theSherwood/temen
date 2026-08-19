@@ -701,37 +701,7 @@ pub fn restore_with_prots(
     // present iff the trio is non-empty (canonical); its absence restores the empty default. ----
     if let Some(body) = serve_body {
         let mut sr = Reader::new(body);
-        let nq = sr.uleb()?;
-        let mut queue = Vec::with_capacity(nq as usize);
-        for _ in 0..nq {
-            let export = u32::try_from(sr.uleb()?).map_err(|_| RestoreError::Malformed)?;
-            let op = u32::try_from(sr.uleb()?).map_err(|_| RestoreError::Malformed)?;
-            let nargs = sr.uleb()?;
-            let mut args = Vec::with_capacity(nargs as usize);
-            for _ in 0..nargs {
-                args.push(sr.uleb()? as i64);
-            }
-            let ticket = sr.uleb()?;
-            queue.push(SvcDispatch {
-                export,
-                op,
-                args,
-                ticket,
-            });
-        }
-        let nr = sr.uleb()?;
-        let mut results = Vec::with_capacity(nr as usize);
-        let mut last: Option<u64> = None;
-        for _ in 0..nr {
-            let t = sr.uleb()?;
-            if last.is_some_and(|p| t <= p) {
-                return Err(RestoreError::Malformed); // non-canonical: tickets must ascend
-            }
-            last = Some(t);
-            let v = sr.uleb()? as i64;
-            results.push((t, v));
-        }
-        let next_ticket = sr.uleb()?;
+        let (queue, results, next_ticket) = read_serve_trio(&mut sr)?;
         if !sr.at_end() {
             return Err(RestoreError::Malformed);
         }
@@ -875,36 +845,7 @@ fn decode_control(
             };
             // v14 (§13.4 slice 4c): the child's optional host state.
             if cr.uleb()? != 0 {
-                let nq = cr.uleb()?;
-                let mut svc_queue = Vec::with_capacity(nq as usize);
-                for _ in 0..nq {
-                    let export = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
-                    let op = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
-                    let na = cr.uleb()?;
-                    let mut args = Vec::with_capacity(na as usize);
-                    for _ in 0..na {
-                        args.push(cr.uleb()? as i64);
-                    }
-                    let ticket = cr.uleb()?;
-                    svc_queue.push(SvcDispatch {
-                        export,
-                        op,
-                        args,
-                        ticket,
-                    });
-                }
-                let nr = cr.uleb()?;
-                let mut svc_results = Vec::with_capacity(nr as usize);
-                let mut lastt: Option<u64> = None;
-                for _ in 0..nr {
-                    let t = cr.uleb()?;
-                    if lastt.is_some_and(|p| t <= p) {
-                        return Err(RestoreError::Malformed); // non-canonical: tickets ascend
-                    }
-                    lastt = Some(t);
-                    svc_results.push((t, cr.uleb()? as i64));
-                }
-                let svc_next_ticket = cr.uleb()?;
+                let (svc_queue, svc_results, svc_next_ticket) = read_serve_trio(&mut cr)?;
                 let nh = cr.uleb()?;
                 let mut handles = Vec::with_capacity(nh as usize);
                 for _ in 0..nh {
@@ -1042,6 +983,48 @@ fn write_serve_trio(
         write_uleb(b, v as u64);
     }
     write_uleb(b, next_ticket);
+}
+
+/// A decoded serve trio (§13.4): the inbound dispatch queue, the completion cells `(ticket, value)`
+/// in canonical ascending-ticket order, and the next-ticket counter.
+type ServeTrio = (Vec<SvcDispatch>, Vec<(u64, i64)>, u64);
+
+/// Decode a serve trio — the exact inverse of [`write_serve_trio`], shared by the two decode sites
+/// (the root serve section and a child domain's state). Each caller does its own framing/canonicality
+/// checks (section `at_end`, empty-trio elision) around it. (#915)
+fn read_serve_trio(r: &mut Reader) -> Result<ServeTrio, RestoreError> {
+    let nq = r.uleb()?;
+    let mut queue = Vec::with_capacity(nq as usize);
+    for _ in 0..nq {
+        let export = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?;
+        let op = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?;
+        let nargs = r.uleb()?;
+        let mut args = Vec::with_capacity(nargs as usize);
+        for _ in 0..nargs {
+            args.push(r.uleb()? as i64);
+        }
+        let ticket = r.uleb()?;
+        queue.push(SvcDispatch {
+            export,
+            op,
+            args,
+            ticket,
+        });
+    }
+    let nr = r.uleb()?;
+    let mut results = Vec::with_capacity(nr as usize);
+    let mut last: Option<u64> = None;
+    for _ in 0..nr {
+        let t = r.uleb()?;
+        if last.is_some_and(|p| t <= p) {
+            return Err(RestoreError::Malformed); // non-canonical: tickets must ascend
+        }
+        last = Some(t);
+        let v = r.uleb()? as i64;
+        results.push((t, v));
+    }
+    let next_ticket = r.uleb()?;
+    Ok((queue, results, next_ticket))
 }
 
 /// Encode a handle table (§12.5): a length prefix then each record's `slot`/`generation`/`type_id`
