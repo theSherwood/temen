@@ -28,11 +28,11 @@
 //! headers (`<glob.h>`, …) are POSIX; Windows lacks the toolchain, so the whole suite is Unix-only.
 #![cfg(unix)]
 
-#[cfg(target_os = "linux")]
 #[path = "support/repo_root.rs"]
 mod repo_root_mod;
 use repo_root_mod::repo_root;
 
+#[cfg(target_os = "linux")]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
