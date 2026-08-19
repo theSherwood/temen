@@ -292,15 +292,12 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
         | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. } => row(F, cell(Status::Declines, LEAF)),
 
-        // ---- §7 capability reflection (`cap.self.*`): Cranelift services them via a host thunk;
-        // the wasm-JIT leaf folds them to the interpreter. ---------------------------------------
-        Inst::CapSelfCount
-        | Inst::CapSelfGet { .. }
-        | Inst::CapSelfResolve { .. }
-        | Inst::CapSelfLabel { .. }
-        | Inst::CapSelfTypeId { .. }
-        | Inst::CapSelfCovers { .. }
-        | Inst::CapSelfAttest => row(F, cell(Status::Declines, HOST_OP)),
+        // ---- §3.5 capability reflection (`cap.self.type_id`/`covers`): Cranelift services them via a
+        // host thunk; the wasm-JIT leaf folds them to the interpreter. (`cap.self.count`/`get`/
+        // `resolve`/`label`/`attest` are now `cap.call CAP_SELF` — covered by the `CapCall` row.) ----
+        Inst::CapSelfTypeId { .. } | Inst::CapSelfCovers { .. } => {
+            row(F, cell(Status::Declines, HOST_OP))
+        }
 
         // Per-vCPU TLS register + durable shadow base: baked thunks over a thread-local, supported on
         // every Cranelift target; the wasm-JIT leaf folds them.

@@ -110,8 +110,9 @@ mod op {
                                    // 0x76 (was PTR_FROM_INT), 0x77 (was PTR_TO_INT), 0x78 (was PTR_ADD): retired in the
                                    // wire rev (#900). Left as gaps — not renumbered, not reused.
     pub const CAP_CALL: u8 = 0x79; // type_id, op, sig, handle, arg idx-list
-    pub const CAP_SELF_COUNT: u8 = 0x7A; // §7 reflection: () -> i32 count
-    pub const CAP_SELF_GET: u8 = 0x7B; // §7 reflection: idx -> (i32 handle, i32 type_id)
+                                   // 0x7A (was CAP_SELF_COUNT), 0x7B (was CAP_SELF_GET): retired in the
+                                   // wire rev (#900) — the `cap.self.*` reflection ops are now
+                                   // `cap.call CAP_SELF op N`. Left as gaps — not renumbered, not reused.
     pub const CALL_IMPORT: u8 = 0x7C; // manifest capability call (v8): import idx, op, sig, arg idx-list
                                       // v7 §3.5 opcodes live in the low band (0x0A..=0x0D): every 0x1X..0xFX slot above is
                                       // either assigned or inside a computed range (CAST/FTOI/ITOF/LOAD families, SIMD prefix).
@@ -127,9 +128,9 @@ mod op {
     pub const DATA_SYM: u8 = 0x08; // length-prefixed name bytes, sleb addend -> i64 (cross-unit)
     pub const DATA_TOP: u8 = 0x09; // (no payload) -> i64 (post-link top-of-data)
     pub const FMA: u8 = 0x7D; // scalar fused multiply-add: ty byte (0=f32,1=f64), a, b, c
-    pub const CAP_SELF_RESOLVE: u8 = 0x7E; // §7 reflection: (name_ptr, name_len) -> i32 handle|-errno
-    pub const CAP_SELF_LABEL: u8 = 0x7F; // §7 reflection: (handle, buf_ptr, buf_cap) -> i32 label len
-    pub const CAP_SELF_ATTEST: u8 = 0xBE; // §6 attestation: () -> i32 packed provenance
+                              // 0x7E (was CAP_SELF_RESOLVE), 0x7F (was CAP_SELF_LABEL), 0xBE (was CAP_SELF_ATTEST): retired in
+                              // the wire rev (#900) — the `cap.self.*` reflection ops are now `cap.call CAP_SELF op N`. Left as
+                              // gaps — not renumbered, not reused.
 
     // Memory ops. Each carries: address operand, [value operand for stores], an
     // immediate uleb offset, and an alignment-hint byte.
@@ -784,28 +785,9 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             write_uleb(out, *import as u64);
             write_uleb(out, *handle as u64);
         }
-        // §7 capability reflection intrinsics.
-        Inst::CapSelfCount => out.push(op::CAP_SELF_COUNT),
-        Inst::CapSelfAttest => out.push(op::CAP_SELF_ATTEST),
-        Inst::CapSelfGet { idx } => {
-            out.push(op::CAP_SELF_GET);
-            write_uleb(out, *idx as u64);
-        }
-        Inst::CapSelfResolve { name_ptr, name_len } => {
-            out.push(op::CAP_SELF_RESOLVE);
-            write_uleb(out, *name_ptr as u64);
-            write_uleb(out, *name_len as u64);
-        }
-        Inst::CapSelfLabel {
-            handle,
-            buf_ptr,
-            buf_cap,
-        } => {
-            out.push(op::CAP_SELF_LABEL);
-            write_uleb(out, *handle as u64);
-            write_uleb(out, *buf_ptr as u64);
-            write_uleb(out, *buf_cap as u64);
-        }
+        // §7 capability reflection: `cap.self.count`/`get`/`resolve`/`label`/`attest` are no longer
+        // distinct wire ops — they encode as their `cap.call CAP_SELF op N` form (the generic
+        // `Inst::CapCall` arm above).
         // v7 §3.5 reflection: intern own type entry / probe coverage of a held handle.
         Inst::CapSelfTypeId { ty } => {
             out.push(op::CAP_SELF_TYPE_ID);
@@ -2336,18 +2318,8 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
             import: c.idx()?,
             handle: c.idx()?,
         },
-        op::CAP_SELF_COUNT => Inst::CapSelfCount,
-        op::CAP_SELF_ATTEST => Inst::CapSelfAttest,
-        op::CAP_SELF_GET => Inst::CapSelfGet { idx: c.idx()? },
-        op::CAP_SELF_RESOLVE => Inst::CapSelfResolve {
-            name_ptr: c.idx()?,
-            name_len: c.idx()?,
-        },
-        op::CAP_SELF_LABEL => Inst::CapSelfLabel {
-            handle: c.idx()?,
-            buf_ptr: c.idx()?,
-            buf_cap: c.idx()?,
-        },
+        // 0x7A/0x7B/0x7E/0x7F/0xBE (the retired `cap.self.*` reflection opcodes) are wire gaps now —
+        // the ops travel as `cap.call CAP_SELF op N` (decoded by the `CAP_CALL` arm).
         op::VCPU_TLS_GET => Inst::VcpuTlsGet,
         op::VCPU_TLS_SET => Inst::VcpuTlsSet { val: c.idx()? },
         op::DURABLE_SHADOW_BASE => Inst::DurableShadowBase,

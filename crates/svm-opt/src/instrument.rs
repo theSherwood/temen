@@ -430,9 +430,8 @@ mod tests {
                     | Inst::SetJmp { .. }
                     | Inst::LongJmp { .. }
                     | Inst::GcRoots { .. }
-                    | Inst::CapSelfResolve { .. }
-                    | Inst::CapSelfLabel { .. }
                     // Calls clobber conservatively; the callee's own ops carry the hooks.
+                    // (`cap.self.resolve`/`label` are now `cap.call CAP_SELF`, covered by `CapCall`.)
                     | Inst::Call { .. }
                     | Inst::CallIndirect { .. }
                     | Inst::CallImport { .. }
@@ -545,14 +544,17 @@ mod tests {
                 buf: 3,
                 cap: 4,
             },
-            Inst::CapSelfResolve {
-                name_ptr: 0,
-                name_len: 1,
-            },
-            Inst::CapSelfLabel {
+            // `cap.self.resolve`/`label` (guest-memory-touching reflection) are now `cap.call
+            // CAP_SELF` — represented by the generic `CapCall` in the excluded list.
+            Inst::CapCall {
+                type_id: svm_ir::CAP_SELF_TYPE_ID,
+                op: 2,
+                sig: svm_ir::FuncType {
+                    params: vec![ValType::I64, ValType::I64],
+                    results: vec![ValType::I32],
+                },
                 handle: 0,
-                buf_ptr: 1,
-                buf_cap: 2,
+                args: vec![1, 2],
             },
         ]
     }

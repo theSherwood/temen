@@ -551,27 +551,8 @@ fn check_inst(
             w(*handle, V::I32)?;
             vec![V::I32]
         }
-        Inst::CapSelfCount => vec![V::I32],
-        Inst::CapSelfAttest => vec![V::I32],
-        Inst::CapSelfGet { idx } => {
-            w(*idx, V::I32)?;
-            vec![V::I32, V::I32]
-        }
-        Inst::CapSelfResolve { name_ptr, name_len } => {
-            w(*name_ptr, V::I64)?;
-            w(*name_len, V::I64)?;
-            vec![V::I32]
-        }
-        Inst::CapSelfLabel {
-            handle,
-            buf_ptr,
-            buf_cap,
-        } => {
-            w(*handle, V::I32)?;
-            w(*buf_ptr, V::I64)?;
-            w(*buf_cap, V::I64)?;
-            vec![V::I32]
-        }
+        // `cap.self.count`/`get`/`resolve`/`label`/`attest` are now `cap.call CAP_SELF op N` — verified
+        // by the generic `CapCall` arm above.
 
         // ----- fibers / threads / TLS (§12) -----
         Inst::ContNew { func, sp } => {

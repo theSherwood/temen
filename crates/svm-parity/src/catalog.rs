@@ -1041,31 +1041,8 @@ fn caps_and_reflection(ops: &mut Vec<Op>) {
         ),
         skip,
     );
-    // Reflection intrinsics (self-contained, but declined on wasm as host ops — pin them where cheap).
-    let count = Inst::CapSelfCount;
-    push(
-        ops,
-        "cap.self.count".into(),
-        FAM,
-        count.clone(),
-        unit(&[], count, &[ValType::I32], false),
-    );
-    let attest = Inst::CapSelfAttest;
-    push(
-        ops,
-        "cap.self.attest".into(),
-        FAM,
-        attest.clone(),
-        unit(&[], attest, &[ValType::I32], false),
-    );
-    let get = Inst::CapSelfGet { idx: 0 };
-    push(
-        ops,
-        "cap.self.get".into(),
-        FAM,
-        get.clone(),
-        unit(&[ValType::I32], get, &[ValType::I32, ValType::I32], false),
-    );
+    // Reflection intrinsics. `cap.self.count`/`get`/`resolve`/`label`/`attest` are no longer distinct
+    // ops — they are `cap.call CAP_SELF op N`, covered by the generic `cap.call` parity row.
     let tls_get = Inst::VcpuTlsGet;
     push(
         ops,
@@ -1082,47 +1059,6 @@ fn caps_and_reflection(ops: &mut Vec<Op>) {
         tls_set.clone(),
         unit(&[ValType::I64], tls_set, &[], false),
     );
-    // The remaining §7 ops need import/impl/type sections; list them with the manifest, skip the pin.
-    for (name, inst) in [
-        (
-            "cap.self.resolve",
-            Inst::CapSelfResolve {
-                name_ptr: 0,
-                name_len: 1,
-            },
-        ),
-        (
-            "cap.self.label",
-            Inst::CapSelfLabel {
-                handle: 0,
-                buf_ptr: 1,
-                buf_cap: 2,
-            },
-        ),
-    ] {
-        // These do touch memory; give them a window so verify passes even though we skip the pin.
-        let operands = if name == "cap.self.resolve" {
-            vec![ValType::I64, ValType::I64]
-        } else {
-            vec![ValType::I32, ValType::I64, ValType::I64]
-        };
-        let res = if name == "cap.self.label" {
-            vec![ValType::I64]
-        } else {
-            vec![ValType::I32]
-        };
-        let n = operands.len() as ValIdx;
-        let m = module1(
-            func(
-                operands.clone(),
-                res.clone(),
-                vec![inst.clone()],
-                Terminator::Return(vec![n]),
-            ),
-            true,
-        );
-        push_skip(ops, name.into(), FAM, inst, m, skip);
-    }
     for (name, inst) in [
         ("export.handle", Inst::ExportHandle { export: 0 }),
         (

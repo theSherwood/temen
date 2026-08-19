@@ -11720,7 +11720,11 @@ fn lower_vm_builtin(
             }
             let name_ptr = ctx.const_i64(ctx.scratch_base as i64);
             let name_len = ctx.const_i64(name.len() as i64);
-            let r = ctx.push(Inst::CapSelfResolve { name_ptr, name_len });
+            let sig = svm_ir::FuncType {
+                params: vec![ValType::I64, ValType::I64],
+                results: vec![ValType::I32],
+            };
+            let r = ctx.cap_self_call(2, sig, vec![name_ptr, name_len], 1)[0];
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
@@ -11978,19 +11982,31 @@ fn lower_vm_builtin(
             // so index i is the same capability the stash slot held (the discovery tier is the one
             // by-index surface deliberately kept).
             let i = ctx.operand_i32(vm_arg(c, 0)?)?;
-            let rs = ctx.push_multi(Inst::CapSelfGet { idx: i }, 2); // (handle, type_id)
+            let sig = svm_ir::FuncType {
+                params: vec![ValType::I32],
+                results: vec![ValType::I32, ValType::I32],
+            };
+            let rs = ctx.cap_self_call(1, sig, vec![i], 2); // (handle, type_id)
             ctx.bind_dest(&c.dest, rs[0]);
             Ok(true)
         }
         "__vm_cap_count" => {
-            let r = ctx.push(Inst::CapSelfCount);
+            let sig = svm_ir::FuncType {
+                params: vec![],
+                results: vec![ValType::I32],
+            };
+            let r = ctx.cap_self_call(0, sig, vec![], 1)[0];
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
         "__vm_cap_at" => {
             let idx = ctx.operand_i32(vm_arg(c, 0)?)?;
             let type_id_out = ctx.operand_i64(vm_arg(c, 1)?)?; // `int *type_id_out`
-            let rs = ctx.push_multi(Inst::CapSelfGet { idx }, 2); // (handle, type_id)
+            let sig = svm_ir::FuncType {
+                params: vec![ValType::I32],
+                results: vec![ValType::I32, ValType::I32],
+            };
+            let rs = ctx.cap_self_call(1, sig, vec![idx], 2); // (handle, type_id)
             ctx.push_effect(Inst::Store {
                 op: StoreOp::I32,
                 addr: type_id_out,
@@ -12008,7 +12024,11 @@ fn lower_vm_builtin(
         "__vm_cap_resolve" => {
             let name_ptr = ctx.operand_i64(vm_arg(c, 0)?)?;
             let name_len = ctx.operand_i64(vm_arg(c, 1)?)?;
-            let r = ctx.push(Inst::CapSelfResolve { name_ptr, name_len });
+            let sig = svm_ir::FuncType {
+                params: vec![ValType::I64, ValType::I64],
+                results: vec![ValType::I32],
+            };
+            let r = ctx.cap_self_call(2, sig, vec![name_ptr, name_len], 1)[0];
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
@@ -15961,6 +15981,30 @@ impl<'a> BlockCtx<'a> {
 
     fn const_i64(&mut self, v: i64) -> ValIdx {
         self.push(Inst::ConstI64(v))
+    }
+
+    /// Build a `cap.self.*` reflection op as its canonical `cap.call CAP_SELF op N` form. The typed
+    /// `Inst::CapSelf*` fronts were retired at the wire rev — the wire/IR carry only the generic
+    /// `CapCall`, and the runtime CAP_SELF handler dispatches on `op`. `handle` is a freshly
+    /// materialized const-0 i32 the handler ignores. Returns the op's `n` result values.
+    fn cap_self_call(
+        &mut self,
+        op: u32,
+        sig: svm_ir::FuncType,
+        args: Vec<ValIdx>,
+        n: usize,
+    ) -> Vec<ValIdx> {
+        let handle = self.push(Inst::ConstI32(0));
+        self.push_multi(
+            Inst::CapCall {
+                type_id: svm_ir::CAP_SELF_TYPE_ID,
+                op,
+                sig,
+                handle,
+                args,
+            },
+            n,
+        )
     }
 
     fn add_i64(&mut self, a: ValIdx, b: ValIdx) -> ValIdx {

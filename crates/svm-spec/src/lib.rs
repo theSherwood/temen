@@ -1711,11 +1711,6 @@ pub fn coverage(inst: &Inst) -> Class {
         | Inst::DataTop
         | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. }
-        | Inst::CapSelfCount
-        | Inst::CapSelfAttest
-        | Inst::CapSelfGet { .. }
-        | Inst::CapSelfResolve { .. }
-        | Inst::CapSelfLabel { .. }
         | Inst::CapSelfTypeId { .. }
         | Inst::CapSelfCovers { .. } => Class::Host,
         Inst::ContNew { .. }

@@ -265,41 +265,9 @@ pub fn struct_rows() -> Vec<StructRow> {
         },
         false,
     ));
-    rows.push(inst_row(
-        "cap.self.count",
-        Enc::Byte(0x7A),
-        vec![],
-        Inst::CapSelfCount,
-        false,
-    ));
-    rows.push(inst_row(
-        "cap.self.get",
-        Enc::Byte(0x7B),
-        vec![i32t],
-        Inst::CapSelfGet { idx: 0 },
-        false,
-    ));
-    rows.push(inst_row(
-        "cap.self.resolve",
-        Enc::Byte(0x7E),
-        vec![i64t, i64t],
-        Inst::CapSelfResolve {
-            name_ptr: 0,
-            name_len: 1,
-        },
-        false,
-    ));
-    rows.push(inst_row(
-        "cap.self.label",
-        Enc::Byte(0x7F),
-        vec![i32t, i64t, i64t],
-        Inst::CapSelfLabel {
-            handle: 0,
-            buf_ptr: 1,
-            buf_cap: 2,
-        },
-        false,
-    ));
+    // `cap.self.count`/`get`/`resolve`/`label`/`attest` are no longer distinct wire ops (opcodes
+    // 0x7A/0x7B/0x7E/0x7F/0xBE are retired gaps) — they encode as `cap.call CAP_SELF op N`, pinned by
+    // the `cap.call` row above.
     // The pre-resolution import form: no valid module contains it (verifier rejects an
     // unresolved import), so `verifies: false` — round-trip + byte pin only.
     rows.push(StructRow {
@@ -737,11 +705,6 @@ pub fn row_home(inst: &Inst) -> RowHome {
         | Inst::DataTop
         | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. }
-        | Inst::CapSelfCount
-        | Inst::CapSelfAttest
-        | Inst::CapSelfGet { .. }
-        | Inst::CapSelfResolve { .. }
-        | Inst::CapSelfLabel { .. }
         | Inst::CapSelfTypeId { .. }
         | Inst::CapSelfCovers { .. }
         | Inst::ContNew { .. }
@@ -768,7 +731,7 @@ mod tests {
     #[test]
     fn structural_row_tally() {
         let rows = struct_rows();
-        assert_eq!(rows.len(), 41, "structural row count (update on new ops)");
+        assert_eq!(rows.len(), 37, "structural row count (update on new ops)");
         let mut ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
         ids.sort_unstable();
         ids.dedup();

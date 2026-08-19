@@ -567,42 +567,6 @@ fn verify_func(
                 };
                 cx.expect(*k, ValType::I64)?; // forgeable fiber handle (i64: 16-bit slot + 48-bit generation)
                 cx.expect(*arg, ValType::I64)?;
-            } else if let Inst::CapSelfGet { idx } = inst {
-                // §7 reflection: `cap.self.get` reads an `i32` index and appends `(handle, type_id)`.
-                // Always valid (no module/memory dependency) — the runtime bounds the index against
-                // the live table.
-                Cx {
-                    fi,
-                    bi,
-                    types: &types,
-                }
-                .expect(*idx, ValType::I32)?;
-            } else if let Inst::CapSelfResolve { name_ptr, name_len } = inst {
-                // §7 `cap.self.resolve` reads a name buffer `(ptr: i64, len: i64)` and appends the
-                // resolved handle (or `-errno`) as `i32`. Authority-neutral like the rest of `cap.self`.
-                let cx = Cx {
-                    fi,
-                    bi,
-                    types: &types,
-                };
-                cx.expect(*name_ptr, ValType::I64)?;
-                cx.expect(*name_len, ValType::I64)?;
-            } else if let Inst::CapSelfLabel {
-                handle,
-                buf_ptr,
-                buf_cap,
-            } = inst
-            {
-                // §7 `cap.self.label` reads a handle (`i32`) and a buffer `(ptr: i64, cap: i64)`, and
-                // appends the label length (`i32`). Authority-neutral like the rest of `cap.self`.
-                let cx = Cx {
-                    fi,
-                    bi,
-                    types: &types,
-                };
-                cx.expect(*handle, ValType::I32)?;
-                cx.expect(*buf_ptr, ValType::I64)?;
-                cx.expect(*buf_cap, ValType::I64)?;
             } else if let Inst::CallImportDyn {
                 ty,
                 op,
@@ -809,19 +773,10 @@ fn inst_result_types(
             out.push(ValType::I64);
             true
         }
-        // `cap.self.get`: `(handle: i32, type_id: i32)`.
-        Inst::CapSelfGet { .. } => {
-            out.push(ValType::I32);
-            out.push(ValType::I32);
-            true
-        }
-        // Single-`i32` appends: §7 reflection / phase-2 attach / §3.5 reify, plus the `thread.spawn`
-        // handle and the `ref.func` index.
-        Inst::CapSelfCount
-        | Inst::CapSelfAttest
-        | Inst::CapSelfResolve { .. }
-        | Inst::CapSelfLabel { .. }
-        | Inst::CapSelfTypeId { .. }
+        // Single-`i32` appends: §3.5 reflection / phase-2 attach / §3.5 reify, plus the `thread.spawn`
+        // handle and the `ref.func` index. (`cap.self.count`/`get`/`resolve`/`label`/`attest` are now
+        // `cap.call CAP_SELF`, handled by the `sig`-driven `CapCall` arm below.)
+        Inst::CapSelfTypeId { .. }
         | Inst::CapSelfCovers { .. }
         | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. }
@@ -997,17 +952,12 @@ fn check_inst(
                 "CallImport/CallImportDyn/CallSym/ImportAttach handled before check_inst's value match"
             )
         }
-        // §7 reflection + §3.5 ops append their results in the multi-result section above;
-        // unreachable here.
-        Inst::CapSelfCount
-        | Inst::CapSelfAttest
-        | Inst::CapSelfGet { .. }
-        | Inst::CapSelfResolve { .. }
-        | Inst::CapSelfLabel { .. }
-        | Inst::CapSelfTypeId { .. }
-        | Inst::CapSelfCovers { .. }
-        | Inst::ExportHandle { .. } => {
-            unreachable!("cap.self.*/export.handle handled before check_inst's value match")
+        // §3.5 reflection ops append their results in the multi-result section above; unreachable
+        // here. (`cap.self.count`/`get`/`resolve`/`label`/`attest` are now `cap.call CAP_SELF`.)
+        Inst::CapSelfTypeId { .. } | Inst::CapSelfCovers { .. } | Inst::ExportHandle { .. } => {
+            unreachable!(
+                "cap.self.type_id/covers/export.handle handled before check_inst's value match"
+            )
         }
         // §12 per-vCPU TLS register: ambient, no memory/module dependency. `get` yields an i64;
         // `set` consumes an i64 and yields nothing (handled like `store`).

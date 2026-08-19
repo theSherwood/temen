@@ -2138,44 +2138,12 @@ pub enum Inst {
         import: u32,
         handle: ValIdx,
     },
-    /// §7 capability **reflection** (`cap.self.count`): the number of capabilities the calling
-    /// **domain** currently holds — the count of live entries in its own handle table. An
-    /// always-available, read-only intrinsic (not a handle-gated `cap.call`): reflecting your own
-    /// granted set confers no authority (you already hold every one of those handles), so it does
-    /// not widen the §9 egress closure. A nested §14 child has its own table, so it sees only its
-    /// attenuated carve. Result is `i32`.
-    CapSelfCount,
-    /// §7 capability **reflection** (`cap.self.get`): the `idx`-th capability the calling domain
-    /// holds, as `(handle: i32, type_id: i32)` — the live handle-table entries in slot order, with
-    /// `idx` in `[0, cap.self.count)`. Read-only and authority-neutral (it returns a handle the
-    /// domain already possesses); an out-of-range `idx` traps (the guest bounds it by the count).
-    /// Lets runtime code discover *what* it was granted and obtain the handle to *use* it.
-    CapSelfGet {
-        idx: ValIdx,
-    },
-    /// §7 capability **reflection** (`cap.self.resolve`): resolve a capability **name** to the handle
-    /// it was granted under, as `i32` (`-errno` on miss) — the runtime, in-guest counterpart to
-    /// load-time name binding (dlopen-style discovery). `name_ptr`/`name_len` (both `i64`) point at a
-    /// UTF-8 name in the window. Read-only and authority-neutral like the rest of `cap.self`: it only
-    /// re-finds a handle the domain already holds (an unknown / ungranted name is `-EINVAL`; an
-    /// out-of-window buffer is `-EFAULT`). Sugar over the reserved `CAP_SELF_TYPE_ID` op 2, which it
-    /// lowers to on every backend.
-    CapSelfResolve {
-        name_ptr: ValIdx,
-        name_len: ValIdx,
-    },
-    /// §7 capability **reflection** (`cap.self.label`): write the human-readable **label** of the
-    /// capability `handle` into the window at `buf_ptr` (up to `buf_cap` bytes), returning the label's
-    /// full byte length — `0` if the handle has no label. The reverse of [`Inst::CapSelfResolve`]: a
-    /// guest enumerating its handles (`cap.self.count`/`get`) can name each one for diagnostics /
-    /// discovery. Cosmetic and authority-neutral (a label is not a nominal type_id; the verifier
-    /// ignores it). If the label doesn't fit (`buf_cap < len`) nothing is written — the guest retries
-    /// with a buffer of the returned size. An out-of-window buffer is `-EFAULT`.
-    CapSelfLabel {
-        handle: ValIdx,
-        buf_ptr: ValIdx,
-        buf_cap: ValIdx,
-    },
+    // §7 capability **reflection** — `cap.self.count` / `.get` / `.resolve` / `.label` / `.attest`
+    // are no longer first-class IR ops. Every backend lowered them to `cap.call CAP_SELF_TYPE_ID op N`
+    // (op 0/1/2/3/4), so the wire rev retired the typed fronts to that generic `CapCall` form (svm-llvm
+    // builds it, svm-text spells the `cap.self.*` sugar over it, and the runtime CAP_SELF handler
+    // dispatches on `op`). `cap.self.type_id`/`covers` stay typed ops below: they carry a type-section
+    // index, not expressible as a plain `cap.call` immediate.
     /// `cap.self.type_id <ty>` (IMPORTS.md §3.5): intern **this module's** type-section entry
     /// `ty` (a [`TypeEntry::Interface`]) in the domain's host and return the runtime `type_id`
     /// as `i32`. Authority-neutral pure reflection — the shape is already the module's own
@@ -2193,23 +2161,6 @@ pub enum Inst {
         handle: ValIdx,
         ty: u32,
     },
-    /// §6 (PROCESS.md) capability **attestation** (`cap.self.attest`) — the non-interposable **trust
-    /// anchor**. Reports the calling domain's platform-vouched provenance as a packed `i32`:
-    /// `tier (bits 0..8) | (window_exposed << 8) | (freeze_exposed << 9)`.
-    /// - `tier` — the §2 isolation tier (`0`/`1` in-process, `3` separate-process): the strongest
-    ///   isolation the domain can *require* from a distrusted host (tiers 0/1 are never a Spectre
-    ///   boundary; a domain needing that must see `3` or refuse).
-    /// - `window_exposed` — `1` iff an **ancestor** (not just the platform) holds map/read/pager
-    ///   rights over the domain's backing (a §14 nested carve is exposed; a platform-minted or root
-    ///   window is not) — the "who can read my memory" bit (O5: a single bit, not an authority set).
-    /// - `freeze_exposed` — `1` iff an ancestor may **snapshot** the domain (a snapshot *is* a read),
-    ///   so a domain is confidential (freezable by nobody below the platform) or ancestor-durable,
-    ///   never both.
-    ///
-    /// Like the rest of `cap.self`, it is a D46 runtime-resolved **intrinsic** (never a handle-table
-    /// entry), so no parent can interpose it and lie — the one report a hostile nested host cannot
-    /// forge. Read-only, authority-neutral, adds no grant-graph edge. Result is `i32`.
-    CapSelfAttest,
     /// §12 per-vCPU **thread-local register** read (`vcpu.tls.get`): the `i64` TLS word of the vCPU
     /// **currently executing** this op. svm carries one i64 of per-vCPU state; it is read *at the
     /// execution point*, so after a fiber migrates between vCPUs (D57: any vCPU may resume any
@@ -2804,18 +2755,14 @@ impl Inst {
             // out-of-window buffer.
             Inst::GcRoots { .. } => fx(true, true, true, true),
 
-            // ---- Ambient runtime-state intrinsics (`cap.self.*`, `vcpu.tls`, durable shadow base).
-            // Authority-neutral and read-only over guest memory, but they touch mutable runtime state
-            // (the handle table, the per-vCPU TLS word), so they carry `side_effect` — never CSE'd
-            // across a clobber, never removed. ----
-            Inst::CapSelfCount
-            | Inst::CapSelfAttest
-            | Inst::VcpuTlsGet
-            | Inst::VcpuTlsSet { .. }
-            | Inst::DurableShadowBase => fx(false, false, false, true),
-            Inst::CapSelfGet { .. } => fx(true, false, false, true), // out-of-range idx traps
-            Inst::CapSelfResolve { .. } => fx(false, true, false, true), // reads a name from guest mem (OOB → -errno)
-            Inst::CapSelfLabel { .. } => fx(false, false, true, true), // writes the label into guest mem (OOB → -errno)
+            // ---- Ambient runtime-state intrinsics (`vcpu.tls`, durable shadow base). Authority-neutral
+            // and read-only over guest memory, but they touch mutable runtime state (the per-vCPU TLS
+            // word), so they carry `side_effect` — never CSE'd across a clobber, never removed. The
+            // `cap.self.count`/`get`/`resolve`/`label`/`attest` reflection ops are now `cap.call
+            // CAP_SELF` and take the generic `CapCall` effects. ----
+            Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } | Inst::DurableShadowBase => {
+                fx(false, false, false, true)
+            }
             // §3.5 reflection: `type_id` interns into the host table (mutable runtime state);
             // `covers` probes a handle (dead handle → -errno, no trap).
             Inst::CapSelfTypeId { .. } | Inst::CapSelfCovers { .. } => fx(false, false, false, true),
@@ -2844,8 +2791,6 @@ impl Inst {
             | Inst::DataSelf { .. }
             | Inst::DataTop
             | Inst::RefFunc { .. }
-            | Inst::CapSelfCount
-            | Inst::CapSelfAttest
             | Inst::CapSelfTypeId { .. }
             | Inst::ExportHandle { .. }
             | Inst::VcpuTlsGet
@@ -2864,7 +2809,6 @@ impl Inst {
             | Inst::Load { addr: a, .. }
             | Inst::AtomicLoad { addr: a, .. }
             | Inst::V128Load { addr: a, .. }
-            | Inst::CapSelfGet { idx: a }
             | Inst::VcpuTlsSet { val: a }
             | Inst::Suspend { value: a }
             | Inst::SetJmp { buf: a }
@@ -2907,10 +2851,6 @@ impl Inst {
             | Inst::ContNew { func: a, sp: b }
             | Inst::ContResume { k: a, arg: b }
             | Inst::ContResumeBlock { k: a, arg: b }
-            | Inst::CapSelfResolve {
-                name_ptr: a,
-                name_len: b,
-            }
             | Inst::LongJmp { buf: a, val: b }
             | Inst::ThreadSpawn { sp: a, arg: b, .. }
             | Inst::ReplaceLane { a, b, .. }
@@ -2961,15 +2901,6 @@ impl Inst {
                 f(a);
                 f(b);
                 f(c);
-            }
-            Inst::CapSelfLabel {
-                handle,
-                buf_ptr,
-                buf_cap,
-            } => {
-                f(handle);
-                f(buf_ptr);
-                f(buf_cap);
             }
             Inst::AtomicCmpxchg {
                 addr,
@@ -3057,16 +2988,11 @@ impl Inst {
             Inst::VcpuTlsGet | Inst::DurableShadowBase => 1,
             // `cont.resume` (and its blocking variant) are the multi-result non-call ops: `(status, value)`.
             Inst::ContResume { .. } | Inst::ContResumeBlock { .. } => 2,
-            // `cap.self.get` appends `(handle, type_id)`; `cap.self.count`/`resolve`/`label` append
-            // one `i32`.
-            Inst::CapSelfGet { .. } => 2,
-            Inst::CapSelfCount
-            | Inst::CapSelfResolve { .. }
-            | Inst::CapSelfLabel { .. }
-            | Inst::CapSelfAttest
-            | Inst::CapSelfTypeId { .. }
-            | Inst::CapSelfCovers { .. }
-            | Inst::ExportHandle { .. } => 1,
+            // `cap.self.type_id`/`covers` append one `i32`. (The `cap.self.count`/`get`/`resolve`/
+            // `label`/`attest` reflection ops are now `cap.call CAP_SELF` — counted by their `sig`.)
+            Inst::CapSelfTypeId { .. } | Inst::CapSelfCovers { .. } | Inst::ExportHandle { .. } => {
+                1
+            }
             Inst::Call { func, .. } => fn_results.get(*func as usize).copied().unwrap_or(0),
             Inst::CallIndirect { ty, .. } => ty.results.len(),
             Inst::CapCall { sig, .. } => sig.results.len(),
@@ -5510,14 +5436,14 @@ mod effects_tests {
 
     #[test]
     fn ambient_intrinsics_carry_a_side_effect_but_no_guest_memory() {
-        // `cap.self`/`vcpu.tls`/durable-shadow read or write *runtime* state, not guest memory.
-        let count = Inst::CapSelfCount.effects();
-        assert!(count.side_effect && !count.reads_mem && !count.writes_mem && !count.can_trap);
-        assert!(!count.removable_if_dead());
-        let get = Inst::CapSelfGet { idx: 0 }.effects();
-        assert!(get.can_trap && get.side_effect, "out-of-range idx traps");
+        // `vcpu.tls`/durable-shadow read or write *runtime* state, not guest memory. (The `cap.self.*`
+        // reflection ops are now `cap.call CAP_SELF` and take the generic full-clobber `CapCall`
+        // effects.)
         let tls = Inst::VcpuTlsGet.effects();
-        assert!(tls.side_effect && !tls.can_trap);
+        assert!(tls.side_effect && !tls.reads_mem && !tls.writes_mem && !tls.can_trap);
+        assert!(!tls.removable_if_dead());
+        let shadow = Inst::DurableShadowBase.effects();
+        assert!(shadow.side_effect && !shadow.can_trap);
     }
 
     #[test]

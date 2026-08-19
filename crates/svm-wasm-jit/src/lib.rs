@@ -1643,14 +1643,14 @@ pub fn compile_module_b2(
 /// **both** tiers use: the emitter reads it, and the host's `call_interp` runs the wrapper on the
 /// interpreter — the wrapper only exists in the outlined module.
 ///
-/// It outlines three host-boundary ops the same way: [`Inst::CapCall`], [`Inst::CallImport`] (an
+/// It outlines the host-boundary ops the same way: [`Inst::CapCall`], [`Inst::CallImport`] (an
 /// executable manifest import, IMPORTS.md phase 3 — the wrapper carries the `call.import` to the
 /// import-capable interpreter tier, so an import-bearing guest emits without resolution or rewrite),
-/// and [`Inst::CapSelfResolve`] (the §7 runtime by-name capability lookup — `cap.self.resolve`). The
-/// latter matters for a `_start` that resolves names at startup: it is otherwise pure compute +
-/// stores, so hoisting its handful of `cap.self.resolve`s into cross-tier wrappers makes func 0
-/// itself emittable — the last thing keeping a QuickJS-scale guest (whose hot interpreter loop is
-/// all in-subset) off the wasm tier.
+/// and [`Inst::CallSym`]. The §7 runtime by-name capability lookup (`cap.self.resolve`) rides through
+/// the `CapCall` arm now (it is a `cap.call CAP_SELF op 2`): that matters for a `_start` that resolves
+/// names at startup — otherwise pure compute + stores, so hoisting its handful of `cap.self.resolve`s
+/// into cross-tier wrappers makes func 0 itself emittable — the last thing keeping a QuickJS-scale
+/// guest (whose hot interpreter loop is all in-subset) off the wasm tier.
 pub fn outline_cap_calls(m: &mut Module) {
     let base = m.funcs.len() as u32;
     let mut wrappers: Vec<Func> = Vec::new();
@@ -1771,27 +1771,6 @@ pub fn outline_cap_calls(m: &mut Module) {
                     *inst = Inst::Call {
                         func: g,
                         args: call_args,
-                    };
-                } else if let Inst::CapSelfResolve { name_ptr, name_len } = inst {
-                    let g = base + wrappers.len() as u32;
-                    // Fixed signature `(name_ptr: i64, name_len: i64) -> i32` (result appended at val 2).
-                    let (np, nl) = (*name_ptr, *name_len);
-                    let block = Block {
-                        params: vec![ValType::I64, ValType::I64],
-                        insts: vec![Inst::CapSelfResolve {
-                            name_ptr: 0,
-                            name_len: 1,
-                        }],
-                        term: Terminator::Return(vec![2]),
-                    };
-                    wrappers.push(Func {
-                        params: vec![ValType::I64, ValType::I64],
-                        results: vec![ValType::I32],
-                        blocks: vec![block],
-                    });
-                    *inst = Inst::Call {
-                        func: g,
-                        args: vec![np, nl],
                     };
                 }
             }
