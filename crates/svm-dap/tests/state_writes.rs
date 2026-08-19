@@ -5,34 +5,11 @@
 //! write's clock reads the original state; everything fails closed off the bytecode path.
 
 use svm_dap::{BytecodeBackend, DapServer, Debuggee, Json};
+
+mod support;
+use support::{req, response, LOOP_SUM_DBG};
 use svm_interp::{IrPc, Stop, Value, VarValue};
 use svm_text::parse_module;
-
-/// sum(1..=n) with named debug vars — the same fixture the DAP parity suites use. Breaking at
-/// block 1 inst 0 on first entry reads `i = n`, `acc = 0`.
-const LOOP_SUM_DBG: &str = r#"
-func (i32) -> (i32) {
-block 0 (v0: i32) {
-  v1 = i32.const 0
-  br 1(v0, v1)
-}
-block 1 (v2: i32, v3: i32) {
-  v4 = i32.add v3 v2
-  v5 = i32.const -1
-  v6 = i32.add v2 v5
-  br_if v6 1(v6, v4) 2(v4)
-}
-block 2 (v7: i32) {
-  return v7
-  }
-}
-
-debug.file 0 "sum.c"
-debug.fname 0 "sum"
-debug.loc 0 1 0 0 7 5
-debug.var 0 "i" ssa 0 "int"
-debug.var 0 "acc" ssa 1 "int"
-"#;
 
 /// Loads the i64 at window address 8 and returns it — 0 unless a debugger write lands first.
 const LOAD_CELL: &str = r#"memory 16
@@ -203,21 +180,6 @@ fn scheduled_window_write_survives_seek() {
         live,
         "seek(0) + rerun re-observes the write at its turn"
     );
-}
-
-fn req(seq: i64, command: &str, args: Json) -> Json {
-    Json::obj(vec![
-        ("seq", Json::i(seq)),
-        ("type", Json::s("request")),
-        ("command", Json::s(command)),
-        ("arguments", args),
-    ])
-}
-
-fn response(msgs: &[Json]) -> &Json {
-    msgs.iter()
-        .find(|m| m.get("type").and_then(|t| t.as_str()) == Some("response"))
-        .expect("a response")
 }
 
 /// stackTrace → scopes → the top frame's `variablesReference` + the named var's current value.

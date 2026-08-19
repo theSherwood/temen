@@ -5,6 +5,9 @@
 
 use svm_dap::{DapServer, Json};
 
+mod support;
+use support::req;
+
 /// `_start` shape: call the `exit` capability with 42 (what the frontend synthesizes for
 /// `int main(){ return 42; }` under the on-ramp powerbox).
 const EXIT_42: &str = r#"memory 16
@@ -35,15 +38,6 @@ block 0 () {
   }
 }
 "#;
-
-fn req(seq: i64, command: &str, args: Json) -> Json {
-    Json::obj(vec![
-        ("seq", Json::i(seq)),
-        ("type", Json::s("request")),
-        ("command", Json::s(command)),
-        ("arguments", args),
-    ])
-}
 
 /// Launch `src` (on the bytecode engine, under the powerbox iff `powerbox`), run to completion,
 /// and return the `exited` event's `exitCode` — asserting it precedes `terminated`.

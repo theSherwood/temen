@@ -7,6 +7,9 @@
 
 use svm_dap::{DapServer, Json};
 
+mod support;
+use support::{req, response};
+
 /// A threaded guest under the powerbox: the root spawns a worker (which just returns), joins it,
 /// then `write`s "hi\n" to stdout and `exit`s 7 — exercising the stream + exit caps across a spawn.
 const THREADED_IO: &str = r#"memory 16
@@ -36,21 +39,6 @@ block 0 (vsp: i64, varg: i64) {
   }
 }
 "#;
-
-fn req(seq: i64, command: &str, args: Json) -> Json {
-    Json::obj(vec![
-        ("seq", Json::i(seq)),
-        ("type", Json::s("request")),
-        ("command", Json::s(command)),
-        ("arguments", args),
-    ])
-}
-
-fn response(msgs: &[Json]) -> &Json {
-    msgs.iter()
-        .find(|m| m.get("type").and_then(|t| t.as_str()) == Some("response"))
-        .expect("a response")
-}
 
 /// **The powerbox reaches the threaded engine**: a `thread.spawn` guest under `powerbox: "onramp"`
 /// launches, its `write` output surfaces as an `output` event, and `main`'s `exit(7)` becomes the

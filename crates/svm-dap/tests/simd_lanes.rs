@@ -13,6 +13,9 @@ use std::sync::OnceLock;
 
 use svm_dap::{DapServer, Json};
 
+mod support;
+use support::{req, response};
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -59,21 +62,6 @@ fn c_to_ir(src: &str) -> String {
         .success();
     assert!(ok, "chibicc failed on:\n{src}");
     std::fs::read_to_string(&irfile).unwrap()
-}
-
-fn req(seq: i64, command: &str, args: Json) -> Json {
-    Json::obj(vec![
-        ("seq", Json::i(seq)),
-        ("type", Json::s("request")),
-        ("command", Json::s(command)),
-        ("arguments", args),
-    ])
-}
-
-fn response(msgs: &[Json]) -> &Json {
-    msgs.iter()
-        .find(|m| m.get("type").and_then(|t| t.as_str()) == Some("response"))
-        .expect("a response")
 }
 
 fn body_array<'a>(resp: &'a Json, key: &str) -> &'a [Json] {
