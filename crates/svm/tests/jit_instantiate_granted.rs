@@ -12,10 +12,12 @@
 //! follow-up, tied to JIT async children, S1c) — but a child that does I/O and returns is exactly the
 //! "born with stdout" case, and it matches the interpreter byte-for-byte.
 
+#[path = "support/grant_hooks.rs"]
+mod grant_hooks_mod;
+use grant_hooks_mod::grant_hooks;
+
 use svm_interp::{run_capture_reserved_with_host, Host, StreamRole, Trap, Value};
-use svm_jit::{
-    compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome, TrapKind,
-};
+use svm_jit::{compile_and_run_capture_reserved_with_host_ex, JitOutcome, TrapKind};
 use svm_text::parse_module;
 use svm_verify::verify_module;
 
@@ -91,18 +93,6 @@ block 0 (vcinst: i64, vcas: i64) {\n\
   return v7\n\
   }\n\
 }\n";
-
-fn grant_hooks() -> GrantChildHooks {
-    GrantChildHooks {
-        build: svm_run::grant_child_build,
-        build_named: svm_run::grant_named_child_build,
-        bind_imports: svm_run::child_bind_imports,
-        release: svm_run::grant_child_release,
-        mint: svm_run::child_offer_mint,
-        thunk: svm_run::cap_thunk_locked,
-        register_serve: svm_run::child_register_serve,
-    }
-}
 
 /// Run `SRC` on the interpreter. `stream_grant` picks the parent's second arg: the re-grantable
 /// `Stream` (happy path) or the non-copyable `Instantiator` (negative path). Returns the parent

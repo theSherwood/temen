@@ -10,8 +10,12 @@
 //! against the same shared sinks. The child then finds each cap by `cap.self.resolve` — which lowers to
 //! the run's `cap.call` thunk with the child host as ctx, so name resolution works unchanged.
 
+#[path = "support/grant_hooks.rs"]
+mod grant_hooks_mod;
+use grant_hooks_mod::grant_hooks;
+
 use svm_interp::{run_capture_reserved_with_host, Host, StreamRole, Value};
-use svm_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome};
+use svm_jit::{compile_and_run_capture_reserved_with_host_ex, JitOutcome};
 use svm_text::parse_module;
 use svm_verify::verify_module;
 
@@ -152,18 +156,6 @@ block 0 (vci: i64) {
   }
 }
 "#;
-
-fn grant_hooks() -> GrantChildHooks {
-    GrantChildHooks {
-        build: svm_run::grant_child_build,
-        build_named: svm_run::grant_named_child_build,
-        bind_imports: svm_run::child_bind_imports,
-        release: svm_run::grant_child_release,
-        mint: svm_run::child_offer_mint,
-        thunk: svm_run::cap_thunk_locked,
-        register_serve: svm_run::child_register_serve,
-    }
-}
 
 /// (parent result, stdout bytes, stderr bytes) on the interpreter.
 fn run_interp() -> (Result<Vec<Value>, svm_interp::Trap>, Vec<u8>, Vec<u8>) {

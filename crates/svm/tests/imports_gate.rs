@@ -7,14 +7,11 @@
 //! Scope: `.rs`/`.c`/`.h` sources under `crates/`, `browser/`, and `frontend/chibicc` (skipping
 //! `target/` build output and this file, which necessarily names the banned symbols).
 
-use std::path::{Path, PathBuf};
+#[path = "support/repo_root.rs"]
+mod repo_root_mod;
+use repo_root_mod::repo_root;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap()
-}
+use std::path::{Path, PathBuf};
 
 /// Collect every scannable source file under `dir`, recursively, skipping build output.
 fn sources(dir: &Path, out: &mut Vec<PathBuf>) {

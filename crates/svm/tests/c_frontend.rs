@@ -17,6 +17,10 @@
 //! validated cross-platform by `jit_fuzz`/`escape_oracle` + the `svm-jit` PAL conformance test.
 #![cfg(unix)]
 
+#[path = "support/repo_root.rs"]
+mod repo_root_mod;
+use repo_root_mod::repo_root;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -116,13 +120,6 @@ fn powerbox(h: &mut Host, win: u64, block_for: std::time::Duration) -> [Value; 7
         h.register_cap_name(name, handle);
     }
     handles.map(Value::I32)
-}
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap()
 }
 
 /// Build the chibicc fork once per test binary, returning the path to its binary.

@@ -14,6 +14,10 @@
 //! Gated `#![cfg(unix)]` (needs the chibicc toolchain, like `c_frontend.rs`).
 #![cfg(unix)]
 
+#[path = "support/repo_root.rs"]
+mod repo_root_mod;
+use repo_root_mod::repo_root;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -26,13 +30,6 @@ use svm_verify::verify_module;
 const WIN: usize = 256 << 10; // parent window: 256 KiB (holds the 128 KiB carve at 128 KiB)
 const CARVE: u64 = 128 << 10; // the command's carve (its declared `memory 17` = 128 KiB)
 const ARGS_BASE: u64 = 128; // svm_ir::POWERBOX_ARGS_BASE
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap()
-}
 
 fn chibicc() -> &'static Path {
     static CC: OnceLock<PathBuf> = OnceLock::new();

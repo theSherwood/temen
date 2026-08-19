@@ -29,6 +29,10 @@
 #![cfg(unix)]
 
 #[cfg(target_os = "linux")]
+#[path = "support/repo_root.rs"]
+mod repo_root_mod;
+use repo_root_mod::repo_root;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -65,13 +69,6 @@ fn unit_via_svmo(m: svm_ir::Module, tag: &str) -> LinkUnit {
         exports,
         data_exports,
     }
-}
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap()
 }
 
 /// Build the chibicc fork once per test binary, returning the path to its binary.
