@@ -2121,7 +2121,7 @@ int main(int argc, char **argv) {
 }
 "#;
     let src = format!(
-        "{EXEC_C}\n\
+        "{WIN_PAD_17}{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 static char *av[] = {{ \"rc\", \"4\", 0 }};\n\
@@ -2160,7 +2160,7 @@ fn c_execvp_walks_path_and_the_errno_split_holds() {
 int main(void) { return 7; }
 "#;
     let src = format!(
-        "{EXEC_C}\n\
+        "{WIN_PAD_17}{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_stat(int cap, long path, long len, long buf);\n\
@@ -2219,7 +2219,7 @@ int main(int argc, char **argv) {
 }
 "#;
     let src = format!(
-        "{EXEC_C}\n\
+        "{WIN_PAD_17}{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 static char *av[] = {{ \"px\", \"z\", 0 }};\n\
@@ -2267,7 +2267,7 @@ int main(void) {
 }
 "#;
     let src = format!(
-        "{EXEC_C}\n\
+        "{WIN_PAD_17}{EXEC_C}\n\
 long __px_write(int cap, long fd, long buf, long len);\n\
 long write2(long fd, void *b, long n) {{ return __px_write(0, fd, (long)b, n); }}\n\
 static char *av[] = {{ \"bad\", 0 }};\n\
@@ -2315,7 +2315,7 @@ int main(void) {
 }
 "#;
     let src = format!(
-        "{PIPE_SHIM}\n{EXEC_C}\n\
+        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_dup2(int cap, long o, long n);\n\
@@ -2373,7 +2373,7 @@ int main(int argc, char **argv) {
 }
 "#;
     let src = format!(
-        "{EXEC_C}\n\
+        "{WIN_PAD_17}{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 static char *av[] = {{ \"s\", \"tail\", 0 }};\n\
@@ -2581,6 +2581,13 @@ int main(void) {{\n\
 
 const UTIL_C: &str = include_str!("../../svm-run/demos/posix_utils/util.c");
 
+/// Pads a witness DRIVER's window to ml >= 17: `exec` runs a command **in the caller's window**,
+/// so the caller's committed extent must fit the command's declared image — and the /bin tools
+/// (util.c + their statics) declare ml=17. Without the pad a small driver's exec is a clean
+/// `-EINVAL` refusal (the admissibility gate bounds by the committed extent), which is honest but
+/// not what these witnesses are for.
+const WIN_PAD_17: &str = "static char xs_win_pad_[65536];\n";
+
 /// Compile and register `/bin/<name>` for each requested tool. Staging only
 /// what a witness needs keeps the per-test chibicc cost proportional.
 fn stage_coreutils(host: &mut Host, posix: &Posix, names: &[&str]) {
@@ -2669,7 +2676,7 @@ fn stage_coreutils(host: &mut Host, posix: &Posix, names: &[&str]) {
 #[test]
 fn c_coreutils_pipeline_seq_head_wc() {
     let src = format!(
-        "{PIPE_SHIM}\n{EXEC_C}\n\
+        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_dup2(int cap, long o, long n);\n\
@@ -2743,7 +2750,7 @@ int main(void) {{\n\
 #[test]
 fn c_coreutils_sort_uniq_counts() {
     let src = format!(
-        "{PIPE_SHIM}\n{EXEC_C}\n\
+        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_dup2(int cap, long o, long n);\n\
@@ -2811,7 +2818,7 @@ int main(void) {{\n\
 #[test]
 fn c_coreutils_grep_matches_and_exit_codes() {
     let src = format!(
-        "{PIPE_SHIM}\n{EXEC_C}\n\
+        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_dup2(int cap, long o, long n);\n\
@@ -2874,7 +2881,7 @@ int main(void) {{\n\
 #[test]
 fn c_coreutils_smoke_echo_cat_ls_pwd_true_false() {
     let src = format!(
-        "{PIPE_SHIM}\n{EXEC_C}\n\
+        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_dup2(int cap, long o, long n);\n\
@@ -2944,5 +2951,50 @@ int main(void) {{\n\
         e.result,
         vec![Value::I32(42)],
         "true/false statuses, echo join, cat of memfs, sorted ls, pwd — all as exec'd /bin tools"
+    );
+}
+
+/// #801 coreutils (regression) — **argv survives repeated fork→exec rounds**: the args-region
+/// pack in exec.c must stage in private scratch, because a non-child caller's own statics (these
+/// `av` arrays included) legitimately live inside `[128, 16384)` — the in-place pack used to
+/// trample them mid-loop on the second round (caught by the coreutils grep witness).
+#[test]
+fn c_exec_argv_survives_a_second_twin() {
+    const CMD: &str = r#"
+int main(int argc, char **argv) {
+  if (argc != 2) return 80 + argc;
+  if (argv[1][0] != 'x') return 79;
+  return 7;
+}
+"#;
+    let src = format!(
+        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_setenv(int cap, long name, long nlen, long val, long vlen, long ow);\n\
+static char *av[] = {{ \"c\", \"x\", 0 }};\n\
+static int st;\n\
+int main(void) {{\n\
+  __px_setenv(0, (long)\"PATH\", 4, (long)\"/bin\", 4, 1);\n\
+  long pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 1;\n\
+  if (pid == 0) {{ execve(\"/bin/c\", av, 0); return 99; }}\n\
+  if (__px_waitpid(0, pid, (long)&st, 0) != pid) return 2;\n\
+  if (((st >> 8) & 0xff) != 7) return 3;\n\
+  pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 4;\n\
+  if (pid == 0) {{ execve(\"/bin/c\", av, 0); return 99; }}\n\
+  if (__px_waitpid(0, pid, (long)&st, 0) != pid) return 5;\n\
+  if (((st >> 8) & 0xff) != 7) return 6;\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_executable(host, posix, "/bin/c", CMD);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "argv survives a second twin's execve"
     );
 }

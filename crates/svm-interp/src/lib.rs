@@ -4309,11 +4309,22 @@ enum Step {
 /// reloads the command's data into the caller's window and swaps the vCPU to a fresh one running the
 /// command, keeping the `TaskId`/fuel. `host` is the command's ready powerbox (inherited caps
 /// regranted by name, its own imports bound, its module registered as the self module).
+/// #801 exec ABI — the powerbox **args region** `[base, end)`: the caller packs `{argc:i32,
+/// envc:i32}` at its base and NUL-packed argv/envp strings after, immediately before
+/// `exec_module`; the image-replace freshens everything else in the declared image but keeps
+/// this range (see `commit_fresh_image`). Mirrors the guest-side constants in
+/// `crates/svm-run/demos/posix_libc/exec.c`.
+const EXEC_ARGS_BASE: u64 = 128;
+const EXEC_ARGS_END: u64 = 16384;
+
 struct ExecReq {
     funcs: Arc<[Func]>,
     data: Arc<[Data]>,
     entry: u64,
     child_size: u64,
+    /// `1 << memory_log2` of the command module: the extent `dispatch` freshens (commits + zeroes)
+    /// in the reused window before materializing `data` — the command's C `.bss` contract.
+    image_len: u64,
     host: Host,
     /// Entry args in the fresh powerbox: the granted `Instantiator`, then `AddressSpace` iff the
     /// command's entry takes two params (§14 child-entry ABI).
@@ -6549,24 +6560,24 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     sched.work.notify_all();
                     return;
                 };
-                let ready = {
+                // `pipe` is the parker's domain-local index; waiters key on the FIFO's global id
+                // so a wake from another image of the pipe (fork twin, exec carry) finds them.
+                let (ready, gid) = {
                     let hg = v.host.lock_unpoisoned();
                     match hg.pipes.get(pipe as usize) {
-                        Some((fifo, writers, _)) => {
+                        Some((fifo, writers, _, gid)) => (
                             !fifo.lock_unpoisoned().is_empty()
-                                || writers.load(std::sync::atomic::Ordering::SeqCst) == 0
-                        }
-                        None => true, // vanished — re-run to fail closed
+                                || writers.load(std::sync::atomic::Ordering::SeqCst) == 0,
+                            *gid,
+                        ),
+                        None => (true, u32::MAX), // vanished — re-run to fail closed
                     }
                 };
                 if ready {
                     s.runnable.push_back(v);
                     sched.work.notify_one();
                 } else {
-                    s.pipe_waiters
-                        .entry(pipe)
-                        .or_default()
-                        .push(Waiter::VCpu(v));
+                    s.pipe_waiters.entry(gid).or_default().push(Waiter::VCpu(v));
                 }
             }
             Step::Park(Blocked::PipeWrite { pipe }) => {
@@ -6581,14 +6592,16 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     sched.work.notify_all();
                     return;
                 };
-                let ready = {
+                // Same global-id keying as the read park above.
+                let (ready, gid) = {
                     let hg = v.host.lock_unpoisoned();
                     match hg.pipes.get(pipe as usize) {
-                        Some((fifo, _, readers)) => {
+                        Some((fifo, _, readers, gid)) => (
                             fifo.lock_unpoisoned().len() < PIPE_CAP
-                                || readers.load(std::sync::atomic::Ordering::SeqCst) == 0
-                        }
-                        None => true, // vanished — re-run to fail closed
+                                || readers.load(std::sync::atomic::Ordering::SeqCst) == 0,
+                            *gid,
+                        ),
+                        None => (true, u32::MAX), // vanished — re-run to fail closed
                     }
                 };
                 if ready {
@@ -6596,7 +6609,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     sched.work.notify_one();
                 } else {
                     s.pipe_write_waiters
-                        .entry(pipe)
+                        .entry(gid)
                         .or_default()
                         .push(Waiter::VCpu(v));
                 }
@@ -6808,6 +6821,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     data,
                     entry,
                     child_size,
+                    image_len,
                     host,
                     entry_args,
                 } = *req;
@@ -6820,10 +6834,14 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     Arc::clone(&v.dt),
                 );
                 // Materialize the command's data segments into the caller's window — the command runs
-                // where the shell did (image-replace). Increment 1 does not zero the rest of the window
-                // (no fresh-BSS): a well-formed command initializes its own state from its segments.
+                // where the shell did (image-replace). First freshen the command's declared image
+                // extent: commit its pages read-write and zero them (`commit_fresh_image`) — C's
+                // `.bss` is a no-segment zero guarantee, the caller's committed extent may be
+                // smaller than the command declares, and stale caller bytes must not leak into the
+                // fresh image. Then the segments write over the zeroed ground.
                 let mem = v.mem.take();
                 if let Some(m) = mem.as_ref() {
+                    m.commit_fresh_image(image_len.min(child_size));
                     let base = m.window.base();
                     for d in data.iter() {
                         if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
@@ -11971,7 +11989,19 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // `want_as` = the §14 child-entry takes (Instantiator, AddressSpace) rather than just
                     // (Instantiator).
                     let clean_root = serve_run.is_none() && *cur == ROOT_FIBER;
-                    let win_bytes = mem.as_ref().map(|m| m.window_size()).unwrap_or(0);
+                    // The real capacity bound is the caller's **backed prefix**
+                    // (`window.mapped()`), NOT the reserved VA (`window_size`): the image-replace
+                    // runs the command in the caller's window, and pages beyond the backed prefix
+                    // have no physical backing — committing prot entries there admits accesses
+                    // the backing cannot serve (observed: an ml-17 command in an ml-16 caller ran
+                    // with its upper half silently absent and died on garbage pointers). A grown
+                    // Rw tail is deliberately not counted (its backing depth is embedder-specific
+                    // — fail closed, invariant 9); a non-power-of-two prefix likewise refuses.
+                    let win_bytes = mem.as_ref().map(|m| m.window.mapped()).unwrap_or(0);
+                    eprintln!(
+                        "EXECDBG mapped={win_bytes} reserved={:?}",
+                        mem.as_ref().map(|m| m.window.reserved())
+                    );
                     let win_log2 = win_bytes
                         .is_power_of_two()
                         .then(|| win_bytes.trailing_zeros() as u8);
@@ -12122,6 +12152,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 data: cm.data,
                                 entry,
                                 child_size,
+                                image_len: 1u64 << cm.memory_log2.unwrap_or(0),
                                 host: ch,
                                 entry_args,
                             })));
@@ -15424,7 +15455,19 @@ type PipeBacking = (
     Arc<Mutex<VecDeque<u8>>>,
     Arc<std::sync::atomic::AtomicUsize>, // open write-end handles (EOF contract)
     Arc<std::sync::atomic::AtomicUsize>, // open read-end handles (EPIPE contract)
+    u32, // global pipe id — THE park/wake key (`Sched::pipe_waiters`)
 );
+
+/// FORK.md §8.6 — mint the **global pipe id** a new FIFO carries (`PipeBacking.3`). The park/wake
+/// key must survive a pipe end crossing domains: fork clones the local `pipes` vec so indices
+/// align by construction, but exec's `install_pipe_end` renumbers from 0 in the fresh image — a
+/// domain-local index is not an identity, and keying waiters by it loses the wake (a reader parked
+/// under the parent's index is never found by the exec'd writer's wake under its own). Monotone
+/// and never reused, so a stale waiter can never alias a later pipe.
+static NEXT_PIPE_GID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+fn next_pipe_gid() -> u32 {
+    NEXT_PIPE_GID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 /// FORK.md §8.6 — the **pipe FIFO capacity** (bytes): a `write` never grows the buffer past this; a
 /// write to a full pipe blocks (backpressure) until the reader drains. Linux's default pipe buffer is
@@ -17654,7 +17697,7 @@ impl Host {
         // forking a stage and that stage installing its own ends.
         for s in &twin.table {
             if let Some(Binding::PipeEnd { pipe, write }) = s.entry {
-                if let Some((_, writers, readers)) = twin.pipes.get(pipe as usize) {
+                if let Some((_, writers, readers, _)) = twin.pipes.get(pipe as usize) {
                     let counter = if write { writers } else { readers };
                     counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
@@ -18127,7 +18170,9 @@ impl Host {
         use std::sync::atomic::Ordering::SeqCst;
         match self.pipes.get(pipe as usize) {
             // `fetch_sub` returns the *previous* value; it hits 0 exactly when the previous was 1.
-            Some((_, writers, _)) if writers.load(SeqCst) > 0 => writers.fetch_sub(1, SeqCst) == 1,
+            Some((_, writers, _, _)) if writers.load(SeqCst) > 0 => {
+                writers.fetch_sub(1, SeqCst) == 1
+            }
             _ => false,
         }
     }
@@ -18138,9 +18183,21 @@ impl Host {
     fn drop_pipe_reader(&self, pipe: u32) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
         match self.pipes.get(pipe as usize) {
-            Some((_, _, readers)) if readers.load(SeqCst) > 0 => readers.fetch_sub(1, SeqCst) == 1,
+            Some((_, _, readers, _)) if readers.load(SeqCst) > 0 => {
+                readers.fetch_sub(1, SeqCst) == 1
+            }
             _ => false,
         }
+    }
+
+    /// FORK.md §8.6 — a local pipe index's **global id** (`PipeBacking.3`), the park/wake key. A
+    /// vanished index maps to `u32::MAX` (no pipe ever carries it — minting starts at 1), so a wake
+    /// against it is a harmless no-op scan.
+    fn pipe_gid(&self, pipe: u32) -> u32 {
+        self.pipes
+            .get(pipe as usize)
+            .map(|b| b.3)
+            .unwrap_or(u32::MAX)
     }
 
     /// FORK.md §8.6 — decrement the writer count for **every** live pipe *write* end this Host holds,
@@ -18152,7 +18209,7 @@ impl Host {
         for s in &self.table {
             if let Some(Binding::PipeEnd { pipe, write: true }) = s.entry {
                 if self.drop_pipe_writer(pipe) {
-                    zeroed.push(pipe);
+                    zeroed.push(self.pipe_gid(pipe));
                 }
             }
         }
@@ -18169,7 +18226,7 @@ impl Host {
         for s in &self.table {
             if let Some(Binding::PipeEnd { pipe, write: false }) = s.entry {
                 if self.drop_pipe_reader(pipe) {
-                    zeroed.push(pipe);
+                    zeroed.push(self.pipe_gid(pipe));
                 }
             }
         }
@@ -18937,6 +18994,7 @@ impl Host {
             Arc::new(Mutex::new(VecDeque::new())),
             Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            next_pipe_gid(),
         ));
         let w = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: true });
         let r = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false });
@@ -18958,6 +19016,7 @@ impl Host {
             Arc::new(Mutex::new(VecDeque::new())),
             Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            next_pipe_gid(),
         ));
         let w = self.try_grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: true })?;
         let r = self.try_grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false })?;
@@ -18988,13 +19047,15 @@ impl Host {
         let pipe = self.pipes.len() as u32;
         let backing = Arc::new(Mutex::new(VecDeque::new()));
         let writers = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let gid = next_pipe_gid();
         self.pipes.push((
             Arc::clone(&backing),
             Arc::clone(&writers),
             Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            gid,
         ));
         let r = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false });
-        (r, backing, writers, pipe)
+        (r, backing, writers, gid)
     }
 
     pub fn grant_input_pipe(&mut self) -> (i32, Arc<Mutex<std::collections::VecDeque<u8>>>) {
@@ -19007,6 +19068,7 @@ impl Host {
             Arc::clone(&backing),
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            next_pipe_gid(),
         ));
         let r = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false });
         (r, backing)
@@ -21385,10 +21447,10 @@ impl Host {
             Binding::PipeEnd { pipe, write } if op == 2 => {
                 if write {
                     if self.drop_pipe_writer(pipe) {
-                        self.pipe_wake = Some(pipe);
+                        self.pipe_wake = Some(self.pipe_gid(pipe));
                     }
                 } else if self.drop_pipe_reader(pipe) {
-                    self.pipe_wake_writers = Some(pipe);
+                    self.pipe_wake_writers = Some(self.pipe_gid(pipe));
                 }
                 self.close(handle);
                 Ok(vec![0])
@@ -22142,7 +22204,8 @@ impl Host {
         use std::sync::atomic::Ordering::SeqCst;
         let ret = |v: i64| Ok(vec![v]);
         // Clone the shared Arcs out so the `&mut self` flag writes below don't alias `self.pipes`.
-        let Some((fifo_arc, writers_arc, readers_arc)) = self.pipes.get(pipe as usize).cloned()
+        let Some((fifo_arc, writers_arc, readers_arc, gid)) =
+            self.pipes.get(pipe as usize).cloned()
         else {
             return ret(EINVAL);
         };
@@ -22173,7 +22236,7 @@ impl Host {
                 // parked on it (it re-issues its write). Only flag when it *was* full: an unfull pipe
                 // never had a parked writer, so the wake would be a no-op scan.
                 if was_full {
-                    self.pipe_wake_writers = Some(pipe);
+                    self.pipe_wake_writers = Some(gid);
                 }
                 let Some(m) = mem else {
                     return ret(EFAULT);
@@ -22216,7 +22279,7 @@ impl Host {
                 };
                 fifo.extend(bytes);
                 drop(fifo);
-                self.pipe_wake = Some(pipe); // eval loop wakes readers parked on this pipe
+                self.pipe_wake = Some(gid); // eval loop wakes readers parked on this pipe
                 ret(n as i64)
             }
             2 => ret(0), // close: refcount decrement is handled in the dispatch arm (it sees the handle)
@@ -22764,6 +22827,40 @@ impl Mem {
     fn supply_page(&self, abs_addr: u64) {
         let page = abs_addr.wrapping_sub(self.window.base()) / self.page;
         self.space_write().prot.insert(page, PageProt::Rw);
+    }
+
+    /// #801 `exec` image hygiene — the image-replace reuses the **caller's** window, whose
+    /// committed extent and leftover bytes are the caller's, not the command's. The command's
+    /// declared image `[0, len)` must arrive fresh: every page committed read-write (the caller
+    /// may have mapped a smaller prefix, demand-paged, or RO-protected pages the command's
+    /// statics land on) and every byte zeroed — C's `.bss` is a *no-segment zero guarantee*, and
+    /// stale caller bytes must not leak into the new image. The exec admissibility gate already
+    /// bounded the command's declared memory by this window, so `len` never exceeds `reserved()`.
+    /// Data segments materialize after this (Step::Exec), exactly like a fresh instantiation.
+    ///
+    /// One carve-out: the **args region** `[EXEC_ARGS_BASE, EXEC_ARGS_END)` is *preserved*, not
+    /// zeroed — the caller packed `{argc, envc}` + NUL-packed argv/envp strings there right
+    /// before `exec_module`, and the command's child-entry runtime reads them from the same
+    /// window (the #801 exec ABI: "argv arrives through the preserved args region").
+    fn commit_fresh_image(&self, len: u64) {
+        let pages = len.div_ceil(self.page).max(1);
+        {
+            let mut space = self.space_write();
+            for p in 0..pages {
+                if p * self.page < self.window.mapped() {
+                    space.prot.remove(&p); // read-write is the mapped prefix's default
+                } else {
+                    space.prot.insert(p, PageProt::Rw); // explicit commit in the reserved tail
+                }
+            }
+        }
+        let base = self.window.base();
+        for off in 0..len.min(EXEC_ARGS_BASE) {
+            self.set_byte(base + off, 0);
+        }
+        for off in EXEC_ARGS_END.min(len)..len {
+            self.set_byte(base + off, 0);
+        }
     }
 
     /// **Trap-confinement** (§4): bounds-check the `width`-byte access and reject any that leaves the
