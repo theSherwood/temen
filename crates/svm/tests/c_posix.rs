@@ -2201,3 +2201,93 @@ int main(void) {{\n\
         "ENOENT/EACCES split, stat exec bits, and the PATH walk landing on /bin/tool"
     );
 }
+
+/// #801 rung 1 — **a `__px_`-linked command execs, its libc bound in-loop by the vtable**: the
+/// registered command's manifest is pure `__px_*` imports; at exec the personality moves verbatim
+/// into the new powerbox (same process — same Proc, same World), its vtable registers the op names
+/// in the new image's directory, and `bind_child_manifest` binds them through the coverage walk —
+/// signature-checked, no external resolver. The command writes through its own bound `write`,
+/// reads an env var the shell's process carried across the exec (same-Proc witness), and exits
+/// with argc; the parent reaps that status under the twin's pid.
+#[test]
+fn c_execve_runs_a_px_linked_command() {
+    const CMD: &str = r#"
+long __px_write(int cap, long fd, long buf, long len);
+long __px_getenv(int cap, long name, long len);
+int main(int argc, char **argv) {
+  __px_write(0, 1, (long)"CMD!", 4);
+  char *v = (char *)__px_getenv(0, (long)"MARK", 4);
+  if (!v || v[0] != 'y') return 90;   /* the process (env) crossed the exec */
+  return argc;                        /* 2: argv crossed too */
+}
+"#;
+    let src = format!(
+        "{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+static char *av[] = {{ \"px\", \"z\", 0 }};\n\
+static int status;\n\
+static long pid; static long h;\n\
+int main(void) {{\n\
+  pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 1;\n\
+  if (pid == 0) {{\n\
+    execve(\"/bin/px\", av, 0);\n\
+    return 99;\n\
+  }}\n\
+  h = __px_waitpid(0, pid, (long)&status, 0);\n\
+  if (h != pid) return 2;\n\
+  if (((status >> 8) & 0xff) != 2) return 200 + ((status >> 8) & 0xff);\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_executable(host, posix, "/bin/px", CMD);
+        posix.set_env("MARK", "y");
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "the px-linked command's libc bound in-loop; env + argv crossed; status reaped"
+    );
+    assert_eq!(
+        e.stdout, b"CMD!",
+        "the command's write dispatched to the SAME personality (captured stdout)"
+    );
+}
+
+/// #801 rung 1 — **signature drift is a clean bind-time refusal, and the caller survives it**: a
+/// command declaring `__px_write` with the wrong arity fails the vtable's sig check, `execve`
+/// returns `-EINVAL` (POSIX: only on failure), and — the restore-path witness — the caller's own
+/// personality still works afterwards (the moved host-proc entries were given back).
+#[test]
+fn c_execve_refuses_sig_drift_and_the_caller_survives() {
+    const BAD: &str = r#"
+long __px_write(int cap, long fd, long buf);   /* wrong arity: 2 args, canonical is 3 */
+int main(void) {
+  __px_write(0, 1, (long)"X");
+  return 7;
+}
+"#;
+    let src = format!(
+        "{EXEC_C}\n\
+long __px_write(int cap, long fd, long buf, long len);\n\
+long write2(long fd, void *b, long n) {{ return __px_write(0, fd, (long)b, n); }}\n\
+static char *av[] = {{ \"bad\", 0 }};\n\
+int main(void) {{\n\
+  int r = execve(\"/bin/bad\", av, 0);\n\
+  if (r != -22) return 1;              /* the bind refusal, surfaced as -EINVAL */\n\
+  if (write2(1, \"OK\", 2) != 2) return 2; /* the caller's personality survived the refusal */\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_executable(host, posix, "/bin/bad", BAD);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "sig drift refused at bind; the caller kept running with its personality intact"
+    );
+    assert_eq!(e.stdout, b"OK", "the post-refusal write proves the restore");
+}
