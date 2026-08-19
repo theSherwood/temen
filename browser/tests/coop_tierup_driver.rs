@@ -18,10 +18,11 @@ use svm_browser::{
     svm_coop_func, svm_coop_jit_code, svm_coop_jit_param_types_ptr, svm_coop_jit_result_types_len,
     svm_coop_jit_result_types_ptr, svm_coop_jit_wasm_by_handle_len,
     svm_coop_jit_wasm_by_handle_ptr, svm_coop_jit_wasm_len, svm_coop_jit_wasm_ptr, svm_coop_mapped,
-    svm_coop_mapped_now, svm_coop_nfuncs, svm_coop_open, svm_coop_run, svm_coop_shim_ptr,
-    svm_coop_shim_wasm, svm_coop_slot_code, svm_coop_table_log2, svm_coop_value, svm_coop_wasm_len,
-    svm_coop_wasm_ptr, svm_coop_win_len, svm_coop_win_ptr, svm_run_value, svm_status,
-    svm_stdout_len, svm_stdout_ptr, COOP_RUN_DONE, COOP_RUN_JIT_INVOKE, COOP_RUN_TIERUP, STATUS_OK,
+    svm_coop_mapped_now, svm_coop_nfuncs, svm_coop_open, svm_coop_paged, svm_coop_pagestate_len,
+    svm_coop_pagestate_ptr, svm_coop_run, svm_coop_shim_ptr, svm_coop_shim_wasm, svm_coop_slot_code,
+    svm_coop_table_gen, svm_coop_table_log2, svm_coop_value, svm_coop_wasm_len, svm_coop_wasm_ptr,
+    svm_coop_win_len, svm_coop_win_ptr, svm_run_value, svm_status, svm_stdout_len, svm_stdout_ptr,
+    COOP_RUN_DONE, COOP_RUN_JIT_INVOKE, COOP_RUN_TIERUP, COOP_RUN_TRAP, STATUS_OK, STATUS_TRAP,
 };
 use svm_interp::{Host, StreamRole};
 use wasmi::{
@@ -530,6 +531,8 @@ struct DriverData {
     mem: Option<Memory>,
     mapped_globals: Vec<wasmi::Global>,
     fuel_globals: Vec<wasmi::Global>,
+    /// #1009 paged: the emitted `"pagestate"` globals (the coop twin of the pump driver's).
+    pagestate_globals: Vec<wasmi::Global>,
     bounces: Vec<u32>,
 }
 
@@ -544,6 +547,9 @@ struct CoopB2Driver {
     /// uninstall/reinstall regenerates against the new occupant's signature.
     shims: HashMap<(u32, i32), Func>,
     win_len: usize,
+    /// #1009: the dispatch-table generation the shared table was last synced at (mirrors the JS
+    /// driver's cache so an install re-syncs and a no-install run syncs once).
+    synced_gen: i64,
 }
 
 impl CoopB2Driver {
@@ -575,6 +581,7 @@ impl CoopB2Driver {
             unit_insts: HashMap::new(),
             shims: HashMap::new(),
             win_len,
+            synced_gen: -1,
         };
         d.main = d.instantiate(&main_wasm);
         d
@@ -614,10 +621,35 @@ impl CoopB2Driver {
                     let live = unsafe { std::slice::from_raw_parts(win_ptr, win_len) };
                     mem.write(&mut c, WIN_BASE as usize, live).unwrap();
                     mem.write(&mut c, args_ptr as usize, &slots).unwrap();
-                    // #717 fan-out: a bounced callback may have `vm_map`-grown the window.
-                    let now = svm_coop_mapped_now();
-                    for g in c.data().mapped_globals.clone() {
-                        g.set(&mut c, Val::I64(now)).unwrap();
+                    // #717 fan-out: a bounced callback may have `vm_map`-grown the window. #1009
+                    // paged: the grow refreshed the page-state table (`call_interp` rebuilt it) —
+                    // fan the fresh coverage to `"mapped"`, re-copy the table, re-point `"pagestate"`.
+                    if svm_coop_paged() != 0 {
+                        let cover = svm_coop_mapped();
+                        for g in c.data().mapped_globals.clone() {
+                            g.set(&mut c, Val::I64(cover)).unwrap();
+                        }
+                        let plen = svm_coop_pagestate_len();
+                        // SAFETY: pending-event page-state table, stable until the deliver.
+                        let table = unsafe {
+                            std::slice::from_raw_parts(svm_coop_pagestate_ptr(), plen)
+                        }
+                        .to_vec();
+                        let table_base = WIN_BASE as usize + win_len;
+                        let need = (table_base + plen).div_ceil(1 << 16) as u32;
+                        let have = mem.size(&c) as u32;
+                        if need > have {
+                            mem.grow(&mut c, (need - have) as u64).unwrap();
+                        }
+                        mem.write(&mut c, table_base, &table).unwrap();
+                        for g in c.data().pagestate_globals.clone() {
+                            g.set(&mut c, Val::I32(table_base as i32)).unwrap();
+                        }
+                    } else {
+                        let now = svm_coop_mapped_now();
+                        for g in c.data().mapped_globals.clone() {
+                            g.set(&mut c, Val::I64(now)).unwrap();
+                        }
                     }
                     c.data_mut().bounces.push(target as u32);
                     if rc != 0 {
@@ -639,6 +671,9 @@ impl CoopB2Driver {
         }
         if let Some(g) = instance.get_global(&self.store, "fuel") {
             self.store.data_mut().fuel_globals.push(g);
+        }
+        if let Some(g) = instance.get_global(&self.store, "pagestate") {
+            self.store.data_mut().pagestate_globals.push(g);
         }
         instance
     }
@@ -662,6 +697,10 @@ impl CoopB2Driver {
     /// Rebuild the shared table from the engine's slot mirror — the per-event sync (installs only
     /// happen between events, so a synced table is exact for the whole event).
     fn sync_table(&mut self) {
+        let gen = svm_coop_table_gen() as i64;
+        if gen == self.synced_gen {
+            return;
+        }
         let nfuncs = svm_coop_nfuncs();
         let tsize = 1usize << svm_coop_table_log2();
         for slot in 0..tsize {
@@ -703,6 +742,7 @@ impl CoopB2Driver {
                 .set(&mut self.store, slot as u64, Val::FuncRef(fr))
                 .unwrap();
         }
+        self.synced_gen = gen;
     }
 
     /// Sync window + globals into the shared instances before running an emitted entry.
@@ -721,6 +761,27 @@ impl CoopB2Driver {
         }
         for g in self.store.data().fuel_globals.clone() {
             g.set(&mut self.store, Val::I64(1 << 61)).unwrap();
+        }
+        // #1009 paged: copy the page-state table in after the window and point `"pagestate"` at it
+        // (the browser shares memory, zero-copy; here the emitted module has its own).
+        if svm_coop_paged() != 0 {
+            let plen = svm_coop_pagestate_len();
+            // SAFETY: pending-event page-state table, stable until the deliver.
+            let table = unsafe { std::slice::from_raw_parts(svm_coop_pagestate_ptr(), plen) };
+            let table_base = WIN_BASE as usize + self.win_len;
+            let need = (table_base + plen).div_ceil(1 << 16) as u32;
+            let have = self.memory.size(&self.store) as u32;
+            if need > have {
+                self.memory
+                    .grow(&mut self.store, (need - have) as u64)
+                    .unwrap();
+            }
+            self.memory
+                .write(&mut self.store, table_base, table)
+                .unwrap();
+            for g in self.store.data().pagestate_globals.clone() {
+                g.set(&mut self.store, Val::I32(table_base as i32)).unwrap();
+            }
         }
     }
 
@@ -861,6 +922,90 @@ fn drive_coop_b2_session(m: &svm_ir::Module) -> (CoopB2Driver, u32, u32) {
         }
     }
     (d, tierups, invokes)
+}
+
+/// [`drive_coop_b2_session`] that tolerates a trap (an expected fault, e.g. an `Ro` store) instead of
+/// panicking — drive to DONE or TRAP; the caller reads [`svm_status`] to assert trap-parity.
+fn drive_coop_b2_session_allow_trap(m: &svm_ir::Module) -> (CoopB2Driver, u32) {
+    let mut d = CoopB2Driver::new();
+    let mut tierups = 0u32;
+    loop {
+        match svm_coop_run() {
+            COOP_RUN_JIT_INVOKE => d.service_jit_invoke(),
+            COOP_RUN_TIERUP => {
+                tierups += 1;
+                assert!(tierups < 100, "runaway tier-ups");
+                let f = svm_coop_func() as usize;
+                d.service_tierup(m.funcs[f].results.len());
+            }
+            COOP_RUN_DONE | COOP_RUN_TRAP => break,
+            ev => panic!("unexpected pump event {ev} (status {})", svm_status()),
+        }
+    }
+    (d, tierups)
+}
+
+/// #1009 paged, on the cooperative path: a rodata guest whose eligible leaf accesses its `Ro` page
+/// (load succeeds, store traps) and, in a second guest, a page grown mid-invoke through a bounce —
+/// both matching the `onramp_exec` oracle. The coop twin of `tierup_driver`'s paged differentials:
+/// exercises `svm_coop_open`'s paged flip, `CoopRun`'s `page_checked` + `mem_map_*`, and the coop
+/// driver's `"pagestate"` wiring + mid-invoke refresh.
+#[test]
+fn coop_rodata_and_midinvoke_grow_match_the_oracle() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let (_out_h, mem_h) = onramp_out_mem_handles();
+
+    // Ro load succeeds; Ro store traps — through the paged coop tier.
+    for (store, want_trap) in [(false, false), (true, true)] {
+        let body = if store {
+            "  i64.store v0 v0\n  vl = i64.load v0\n  return vl\n"
+        } else {
+            "  vl = i64.load v0\n  return vl\n"
+        };
+        let src = format!(
+            "memory 17\ndata ro 65536 \"svm-coop-rodata-payload!!\"\nfunc () -> (i64) {{\nblock 0 () {{\n  vp = i64.const 65536\n  vr = call 1 (vp)\n  return vr\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n{body}  }}\n}}\nexport 0 func \"_start\" 0\n"
+        );
+        let m = svm_text::parse_module(&src).expect("parse");
+        svm_verify::verify_module(&m).expect("verify");
+        let bytes = svm_encode::encode_module(&m);
+        let want = onramp_exec(&m, b"");
+        assert_eq!(
+            want.status,
+            if want_trap { STATUS_TRAP } else { STATUS_OK },
+            "oracle sanity (store={store})"
+        );
+        let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+        assert_eq!(opened, 0, "coop open (status {})", svm_status());
+        assert_ne!(svm_coop_paged(), 0, "the rodata guest opens the coop run paged");
+        let (_d, tierups) = drive_coop_b2_session_allow_trap(&m);
+        assert!(tierups >= 1, "the leaf tiers up on the coop path");
+        assert_eq!(svm_status(), want.status, "coop status parity (store={store})");
+        if !want_trap {
+            assert_eq!(svm_coop_value(), want.value, "coop value parity (Ro load)");
+        }
+        svm_coop_close();
+    }
+
+    // A page grown mid-invoke through a bounce round-trips (the pagestate is refreshed in the bounce).
+    const X: i64 = 4321;
+    let src = format!(
+        "memory 16\ndata ro 32768 \"svm-coop-rodata-flip!!\"\nfunc () -> (i64) {{\nblock 0 () {{\n  vx = i64.const {X}\n  vr = call 1 (vx)\n  return vr\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  vg = call 2 (v0)\n  va = i64.const 65552\n  i64.store va v0\n  vl = i64.load va\n  return vl\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  vas = i32.const {mem_h}\n  voff = i64.const 65536\n  vlen = i64.const 16384\n  vprot = i32.const 3\n  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)\n  return v0\n  }}\n}}\nexport 0 func \"_start\" 0\n"
+    );
+    let m = svm_text::parse_module(&src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity (mid-invoke grow)");
+    assert_eq!(want.value, X, "oracle value");
+    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "coop open (status {})", svm_status());
+    assert_ne!(svm_coop_paged(), 0, "paged");
+    let (d, tierups) = drive_coop_b2_session_allow_trap(&m);
+    assert!(tierups >= 1, "the leaf tiers up");
+    assert!(!d.bounces().is_empty(), "the grow helper bounces: {:?}", d.bounces());
+    assert_eq!(svm_status(), want.status, "coop status parity (mid-invoke grow)");
+    assert_eq!(svm_coop_value(), want.value, "coop value parity through the grown page");
+    svm_coop_close();
 }
 
 /// The added constant of the `call_indirect`-reached leaf (`f2`), distinct from the unit's `UNIT_K`.

@@ -412,9 +412,11 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
 
   const mappedGlobals = []; // every live instance's "mapped" — the post-bounce fan-out set (#717)
   const fuelGlobals = [];
+  const pagestateGlobals = []; // #1009 paged: the "pagestate" base, the coop twin of driveTierupRun's
   const registerGlobals = (exports) => {
     if (exports.mapped) mappedGlobals.push(exports.mapped);
     if (exports.fuel) fuelGlobals.push(exports.fuel);
+    if (exports.pagestate) pagestateGlobals.push(exports.pagestate);
   };
   // #846/#880 on the cooperative path — the shared driver table (Model B2): the main module and every
   // §22 unit `call_indirect` through it, and the driver populates its slots from the engine's mirror at
@@ -431,8 +433,17 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
     trap: () => {},
     call_interp: (target, argsPtr) => {
       const rc = ex.svm_coop_call_interp(target, argsPtr);
-      const now = ex.svm_coop_mapped_now();
-      for (const g of mappedGlobals) g.value = now;
+      // #1009 paged: the grow rebuilt the page-state table (in `call_interp`) — fan the fresh coverage
+      // to "mapped" and re-point "pagestate"; else the #717 scalar extent (the pump's twin).
+      if (ex.svm_coop_paged()) {
+        const cover = ex.svm_coop_mapped();
+        for (const g of mappedGlobals) g.value = cover;
+        const ps = Number(ex.svm_coop_pagestate_ptr());
+        for (const g of pagestateGlobals) g.value = ps;
+      } else {
+        const now = ex.svm_coop_mapped_now();
+        for (const g of mappedGlobals) g.value = now;
+      }
       if (rc !== 0) throw new Error('bounce trap'); // unwind to the deliver below
     },
   } });
@@ -487,7 +498,12 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
   // it holds an installed unit's `f0` (via its by-handle wasm) or a shim for an interpreter-resident
   // target. Exactly `driveTierupRun`'s `syncTable`, over the `svm_coop_*` accessors.
   const nfuncs = ex.svm_coop_nfuncs();
+  // #1009: rebuild the table only when the slot mirror changed (a §22 install/uninstall bumps
+  // `svm_coop_table_gen`) — the driveTierupRun cache, over the coop accessors.
+  let syncedGen = -1;
   const syncTable = async () => {
+    const gen = ex.svm_coop_table_gen();
+    if (gen === syncedGen) return;
     for (let slot = 0; slot < tsize; slot++) {
       let entry = null;
       if (slot < nfuncs) {
@@ -504,6 +520,7 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
       }
       table.set(slot, entry);
     }
+    syncedGen = gen;
   };
 
   try {
@@ -555,6 +572,12 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
       const tmapped = ex.svm_coop_mapped();
       for (const g of mappedGlobals) g.value = tmapped;
       for (const g of fuelGlobals) g.value = 1n << 61n; // re-arm across events on the reused instance
+      // #1009 paged: point the emitted page check at the freshly rebuilt table (base can move as the
+      // pump's Vec reallocates, so read it every event). Empty set / `_paged==0` on an unpaged run.
+      if (ex.svm_coop_paged()) {
+        const ps = Number(ex.svm_coop_pagestate_ptr());
+        for (const g of pagestateGlobals) g.value = ps;
+      }
       new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
       try {
         const ret = emitted['f' + func](win, envCell, ...args);

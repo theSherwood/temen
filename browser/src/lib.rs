@@ -9433,6 +9433,30 @@ struct CoopTierupRun {
     /// The guest's top-level result, staged at DONE.
     value: i64,
     frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
+    /// #1009 paged tier-up (the `TierupRun` twin): whether the emitted module carries the software
+    /// page check (a rodata guest), the pending TIERUP's page-state table, and its version/coverage
+    /// cache (rebuilt only when the page map changed). See [`TierupRun::sync_pagestate`].
+    paged: bool,
+    pagestate: Vec<u8>,
+    pagestate_version: u64,
+    pagestate_cover: u64,
+}
+
+impl CoopTierupRun {
+    /// #1009 paged tier-up: refresh the page-state table iff the window's page map changed
+    /// ([`bytecode::CoopRun::mem_map_version`]), then stage its coverage for `"mapped"` — the
+    /// [`TierupRun::sync_pagestate`] twin over the cooperative run.
+    fn sync_pagestate(&mut self) {
+        let ver = self.run.mem_map_version();
+        if ver != self.pagestate_version {
+            let info = self.run.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
+            let (table, cover) = bytecode::build_pagestate_table(&info);
+            self.pagestate = table;
+            self.pagestate_cover = cover;
+            self.pagestate_version = ver;
+        }
+        self.mapped = self.pagestate_cover;
+    }
 }
 
 static mut COOP_RUN: Option<CoopTierupRun> = None;
@@ -9494,7 +9518,18 @@ pub extern "C" fn svm_coop_open(
     // #1009 M1: size the shared table to the guest (see `tierup_table_log2`), consistently across
     // the emit, the host's domain table, the slot mirror, the unit emitter, and the driver.
     let table_log2 = tierup_table_log2(m.funcs.len());
-    let emitted_res = if all_shimmable {
+    // #1009: a rodata guest emits the shared table PAGED (see `svm_onramp_tierup_open` for the full
+    // rationale) — the per-call `scalar_extent` decline is replaced by the per-access page check.
+    let paged = all_shimmable && m.data.iter().any(|d| d.readonly);
+    let page_log2 = svm_interp::host_page_size().trailing_zeros() as u8;
+    let emitted_res = if paged {
+        svm_wasm_jit::compile_module_tierup_b2_paged(
+            &emit_m,
+            shared != 0,
+            table_log2 as u32,
+            page_log2,
+        )
+    } else if all_shimmable {
         svm_wasm_jit::compile_module_tierup_b2(&emit_m, shared != 0, table_log2 as u32)
     } else {
         svm_wasm_jit::compile_module_tierup(&emit_m, shared != 0)
@@ -9560,7 +9595,9 @@ pub extern "C" fn svm_coop_open(
     }
     let tierup = bytecode::TierUpConfig {
         eligible: std::sync::Arc::from(eligible.into_boxed_slice()),
-        page_checked: false,
+        // #1009 paged: the vCPUs skip the scalar decline — the per-event page-state table carries the
+        // fidelity `scalar_extent` cannot (matching the pump's `with_jit_page_checked`).
+        page_checked: paged,
     };
     // `CoopRun` owns its `Domain`; the window is built over `back` with the reservation clamped to
     // the run window (`vm_map`-grow into `[declared, 1 << win_log2)`, an over-grow `-EINVAL`s).
@@ -9608,6 +9645,10 @@ pub extern "C" fn svm_coop_open(
             pending_bounce_trap: None,
             value: 0,
             frame,
+            paged,
+            pagestate: Vec::new(),
+            pagestate_version: u64::MAX,
+            pagestate_cover: 0,
         });
     }
     set(STATUS_OK);
@@ -9628,8 +9669,12 @@ pub extern "C" fn svm_coop_run() -> i32 {
     let (status, value, exit_code, ev) = match s.run.run() {
         bytecode::CoopEvent::TierUp { func, argv, mapped } => {
             s.func = func;
-            s.mapped = mapped;
             s.argv = argv.into_vec();
+            if s.paged {
+                s.sync_pagestate();
+            } else {
+                s.mapped = mapped;
+            }
             return COOP_RUN_TIERUP;
         }
         bytecode::CoopEvent::JitInvoke {
@@ -9693,10 +9738,42 @@ pub extern "C" fn svm_coop_func() -> i32 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.func as i32)
 }
 
-/// The pending TIERUP's committed extent — the value for the emitted `"mapped"` global (#717).
+/// The pending TIERUP's committed extent — the value for the emitted `"mapped"` global (#717). On a
+/// **paged** run (#1009) this is the pending TIERUP's page-state table coverage.
 #[no_mangle]
 pub extern "C" fn svm_coop_mapped() -> i64 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.mapped as i64)
+}
+
+/// #1009: whether this coop run's emitted module is **paged** — the driver must write the emitted
+/// `"pagestate"` global to [`svm_coop_pagestate_ptr`] before each TIERUP call (the pump's
+/// `svm_onramp_tierup_paged` twin). `0` on an unpaged run.
+#[no_mangle]
+pub extern "C" fn svm_coop_paged() -> i32 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.paged as i32)
+}
+
+/// #1009 paged: the pending TIERUP's page-state table base (its bytes live in this module's linear
+/// memory — the browser writes this pointer straight to the `"pagestate"` global; the wasmi
+/// differential copies them into its own memory). Meaningful only when [`svm_coop_paged`] is set.
+#[no_mangle]
+pub extern "C" fn svm_coop_pagestate_ptr() -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .map_or(core::ptr::null(), |s| s.pagestate.as_ptr())
+}
+
+/// #1009 paged: byte length of the pending TIERUP's page-state table (`0` on an unpaged run).
+#[no_mangle]
+pub extern "C" fn svm_coop_pagestate_len() -> usize {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.pagestate.len())
+}
+
+/// #1009: the dispatch-table generation — bumped on each §22 install/uninstall the coop scheduler
+/// services. The driver rebuilds its `WebAssembly.Table` only when this advances (the pump's
+/// `svm_onramp_tierup_table_gen` twin).
+#[no_mangle]
+pub extern "C" fn svm_coop_table_gen() -> u32 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.run.table_gen())
 }
 
 /// The pending TIERUP's marshalled i64 args (base pointer; valid until the next event).
@@ -9849,7 +9926,15 @@ pub extern "C" fn svm_coop_call_interp(target: u32, args_ptr: *mut u8) -> i32 {
     // SAFETY: the host passes the env scratch, at least `max_slots` i64s wide.
     let io = unsafe { core::slice::from_raw_parts_mut(args_ptr as *mut i64, max_slots) };
     match s.run.bounce(target, io) {
-        Ok(_) => 0,
+        Ok(_) => {
+            // #1009 paged: a bounced callback may have grown the window mid-invoke — refresh the
+            // page-state table (version-guarded) so the post-bounce emitted access admits the growth
+            // (the pump's `svm_onramp_tierup_call_interp` twin).
+            if s.paged {
+                s.sync_pagestate();
+            }
+            0
+        }
         Err(t) => {
             s.pending_bounce_trap = Some(t);
             1

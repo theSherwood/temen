@@ -9312,6 +9312,11 @@ struct CoopSched {
     /// `WebAssembly.Table` at each event boundary (the twin of the single-shot pump's `slot_codes`).
     /// Sized `1 << host.jit_table_log2()` — length 1 and unused on the native `drive` (no shared table).
     slot_codes: Vec<i32>,
+    /// #1009: a generation counter bumped on each `Jit.install`/`Jit.uninstall` (the only `slot_codes`
+    /// mutations) so the browser B2 driver rebuilds its `WebAssembly.Table` only when the mirror
+    /// changed — a dispatch-heavy card that never installs syncs the table once, not per tier-up. The
+    /// single-shot pump's `table_gen` twin (read via [`CoopRun::table_gen`]).
+    table_gen: u32,
     /// #926 slice 2g — the **invoke-confined** fiber registry for a surfaced emitted `Jit.invoke`'s
     /// cross-tier bounces (the twin of [`Vcpu::invoke_fibers`]). While a `Jit.invoke` unit runs on the
     /// host, its `env.call_interp` callbacks share this registry across the invoke's several bounces (a
@@ -9432,6 +9437,7 @@ impl CoopSched {
             // Sized to the domain table (`Domain::new(_, host.jit_table_log2())`), so a `Jit.install`'s
             // returned slot always indexes it. `1 << 0 == 1` and unused on the native `drive`.
             slot_codes: vec![-1i32; 1usize << host.jit_table_log2()],
+            table_gen: 0,
             // Empty until a surfaced `Jit.invoke` bounces; populated only across that invoke's bounces.
             invoke_fibers: Vec::new(),
         })
@@ -9465,6 +9471,7 @@ impl CoopSched {
             pending_tierup,
             pending_jit,
             slot_codes,
+            table_gen,
             // The invoke-confined registry is threaded only by `CoopRun::bounce` (an emitted invoke's
             // callbacks), never touched by the scheduler loop itself.
             invoke_fibers: _,
@@ -10712,6 +10719,7 @@ impl CoopSched {
                                 if let Some(e) = slot_codes.get_mut(slot) {
                                     *e = code;
                                 }
+                                *table_gen = table_gen.wrapping_add(1); // slot mirror changed → re-sync
                                 slot as i64
                             }
                             None => super::ENOSPC,
@@ -10734,6 +10742,7 @@ impl CoopSched {
                         if let Some(e) = slot_codes.get_mut(slot as usize) {
                             *e = -1;
                         }
+                        *table_gen = table_gen.wrapping_add(1); // slot mirror changed → re-sync
                         0
                     } else {
                         super::EINVAL
@@ -11078,6 +11087,27 @@ impl CoopRun {
             .get(slot as usize)
             .copied()
             .unwrap_or(-1)
+    }
+
+    /// #1009: the dispatch-table generation — bumped on each `Jit.install`/`Jit.uninstall` the
+    /// scheduler services. The browser B2 driver caches the generation it last synced its
+    /// `WebAssembly.Table` at and rebuilds only when this advances (the single-shot pump's
+    /// `svm_onramp_tierup_table_gen` twin).
+    pub fn table_gen(&self) -> u32 {
+        self.sched.table_gen
+    }
+
+    /// #1009 paged tier-up: the root window's memory-map introspection ([`MemMapInfo`]) — a paged
+    /// coop driver rebuilds its page-state table from this. `None` for a memory-less run.
+    pub fn mem_map_info(&self) -> Option<MemMapInfo> {
+        self.mem.as_ref().map(|m| m.map_info())
+    }
+
+    /// #1009 paged tier-up: the root window's page-map version (bumped on every `map`/`unmap`/
+    /// `protect`) — the cheap `O(1)` counter a paged coop driver compares to skip an unchanged
+    /// page-state rebuild. `0` for a memory-less run.
+    pub fn mem_map_version(&self) -> u64 {
+        self.mem.as_ref().map_or(0, |m| m.map_version())
     }
 
     /// Pump the schedule to its next pause: [`CoopEvent::Done`]/[`CoopEvent::Trapped`] end the run,
