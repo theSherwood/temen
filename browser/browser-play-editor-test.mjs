@@ -126,12 +126,31 @@ try {
   await runCard(page, lengCard, 30_000);
   const leng = await page.evaluate((sel) => ({
     state: document.querySelector(`${sel} .state`).dataset.state,
+    msg: document.querySelector(`${sel} .state`).textContent,
     result: document.querySelector(`${sel} .result`).textContent.trim(),
     stdout: document.querySelector(`${sel} .stdout`).textContent,
   }), card(lengCard));
+  // #1011: the card's wasm-JIT toggle now defaults on (the ~280-func translator is WasmDriven with the
+  // whole `_start` emitted), so this run executes on the emitted-wasm tier — the `.state` message reports
+  // `(wasm-JIT)`, and a silent interpreter fallback would fail this assertion.
   leng.state === 'done' && leng.result === '0' && leng.stdout.includes('func') && leng.stdout.includes('block')
-    ? ok('svm-leng self-host card: real hexer Leng → SVM IR in-browser')
-    : fail(`svm-leng run: state=${leng.state} result=${leng.result} stdout=${leng.stdout.slice(0, 80)}`);
+    && leng.msg.includes('wasm-JIT')
+    ? ok('svm-leng self-host card: real hexer Leng → SVM IR in-browser (wasm-JIT)')
+    : fail(`svm-leng run: state=${leng.state} msg=${leng.msg} result=${leng.result} stdout=${leng.stdout.slice(0, 80)}`);
+
+  // "Prove interp ≡ JIT": run the translator on both tiers and assert the emitted SVM IR is byte-identical
+  // — the #1011 correctness gate for defaulting svm-leng onto the wasm-JIT.
+  await page.click(`${card(lengCard)} button.prove`);
+  await page.waitForFunction(
+    (sel) => ['done', 'error'].includes(document.querySelector(sel).dataset.state),
+    `${card(lengCard)} .state`, { timeout: 60_000 });
+  const lengP = await page.evaluate((sel) => ({
+    state: document.querySelector(`${sel} .state`).dataset.state,
+    msg: document.querySelector(`${sel} .state`).textContent,
+  }), card(lengCard));
+  lengP.state === 'done' && lengP.msg.includes('byte-identical')
+    ? ok('svm-leng interpreter ≡ wasm-JIT — byte-identical emitted IR (in-browser)')
+    : fail(`svm-leng parity: ${JSON.stringify(lengP)}`);
 
   // The nifler front-end card (NIM.md §3c/§3e slice 4, "compile Nim in the browser"): its editor holds
   // a small Nim program, and running it inflates the committed `nifler.svmb.gz` (the first real nimony
