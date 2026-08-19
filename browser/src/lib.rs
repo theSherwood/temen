@@ -8723,53 +8723,34 @@ pub mod live {
     }
 }
 
-// ===== single-shot leaf tier-up drive (#809): InterpDriven on-ramp runs with emitted hot leaves ====
+// ===== leaf tier-up: the §22 unit-emit parameters shared with the cooperative driver below =====
 //
-// The single-shot wasm-JIT run above requires a `WasmDriven` `_start`; a module whose entry can't
-// emit (post-#784 that notably includes every `vm_map`-growing C guest — the mapping function keeps
-// the module `InterpDriven`) previously fell all the way back to the pure bytecode path, discarding
-// its tier-up-**eligible** pure leaves. This drive closes that gap: the interpreter owns `_start`
-// (caps serviced inline — no outlining, no cross-tier bounces), and each direct call to an eligible
-// leaf surfaces as a TIERUP event the JS host runs on emitted wasm, with the #717 live-`mapped`
-// sync per call (the event carries the window's committed extent; a sparse state declines to the
-// interpreter at the dispatch). The window is the owned single-shot buffer with the reservation
-// clamped to it (#816's lesson: over-growth fails probeably instead of silently dropping writes).
+// (#1026: the single-vCPU tier-up pump — `svm_onramp_tierup_*`, #809 — was collapsed into the
+// cooperative driver below, which subsumes its admission set and is faster; its differentials live
+// on in `tests/coop_tierup_driver.rs`. These statics + the unit emitter survived the pump: they are
+// the coop run's §22 unit-emit seam.)
 
-/// The live single-shot tier-up run. `None` until [`svm_onramp_tierup_open`]; single-threaded wasm.
-static mut TIERUP_RUN: Option<TierupRun> = None;
-
-/// [`svm_onramp_tierup_run`] event codes: the run finished (statuses + capture slots staged), a
-/// TIERUP awaits servicing (operands via the `svm_onramp_tierup_*` accessors), it trapped
-/// (statuses staged; the page re-runs on the interpreter oracle — INVARIANT 9 refusal), or a §22
-/// `Jit.invoke` awaits servicing on its unit's emitted wasm (#835 — operands via the
-/// `svm_onramp_tierup_jit_*` accessors + the shared `mapped`/`argv` ones).
-pub const TIERUP_RUN_DONE: i32 = 0;
-pub const TIERUP_RUN_TIERUP: i32 = 1;
-pub const TIERUP_RUN_TRAP: i32 = 2;
-pub const TIERUP_RUN_JIT_INVOKE: i32 = 3;
-
-/// The single-shot pump's §22 unit-emit parameters (#835), read by [`onramp_tierup_unit_emitter`]
+/// The tier-up run's §22 unit-emit parameters (#835), read by [`onramp_tierup_unit_emitter`]
 /// (a bare `fn` — [`Host::set_jit_wasm_emitter`] stores no closure state): the run's memory-share
-/// flag and its window log2. Stored at [`svm_onramp_tierup_open`]; single-threaded wasm.
+/// flag and its window log2. Stored at [`svm_coop_open`]; single-threaded wasm.
 static TIERUP_UNIT_SHARED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static TIERUP_UNIT_WIN_LOG2: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 /// #1009 M1: the run's effective B2 dispatch-table log2 ([`tierup_table_log2`] of the guest's
 /// function count) — a unit and the main module must mask `call_indirect` against the **same**
-/// shared table, so the unit emitter uses the guest's size, not its own. Read by the unit emitter
-/// and [`svm_onramp_tierup_table_log2`] (the driver's table size).
+/// shared table, so the unit emitter uses the guest's size, not its own.
 static TIERUP_UNIT_TABLE_LOG2: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(ONRAMP_JIT_TABLE_LOG2);
 
-/// The wasm emitter the single-shot pump installs for a `vm_jit_*`-importing guest (#835/#846):
+/// The wasm emitter the tier-up driver installs for a `vm_jit_*`-importing guest (#835/#846):
 /// emit a validated unit whole-module in **Model B2** shape (`compile_module_b2` — its
 /// `call_indirect` dispatches through the driver's shared funcref table, so a **linked** unit's
 /// Slot callbacks reach installed units / eligible program `f{i}`s natively and everything else
 /// through a live-state bounce trampoline), or `None` if any function is outside the integer
 /// subset — then the invoke runs on the interpreter, fail-closed. The unit's mask is bumped to the
-/// pump's run window first — the driver convention everywhere ([`svm_onramp_tierup_open`] bumps
-/// the main module the same way): the unit declares the guest's memory (the validator's
-/// memory-match precondition), but the run window is larger, and a declared-size mask would alias
+/// run window first — the driver convention everywhere ([`svm_coop_open`] bumps the main module
+/// the same way): the unit declares the guest's memory (the validator's memory-match
+/// precondition), but the run window is larger, and a declared-size mask would alias
 /// `vm_map`-grown addresses.
 fn onramp_tierup_unit_emitter(blob: &[u8]) -> Option<Vec<u8>> {
     let mut m = svm_encode::decode_module(blob).ok()?;
@@ -8783,865 +8764,21 @@ fn onramp_tierup_unit_emitter(blob: &[u8]) -> Option<Vec<u8>> {
     svm_wasm_jit::compile_module_b2(&m, shared, table_log2 as u32).ok()
 }
 
-struct TierupRun {
-    vcpu: bytecode::Vcpu<'static>,
-    /// The leaked program the vCPU borrows; reboxed + dropped at close.
-    prog: *mut bytecode::VcpuProgram,
-    /// The owned window buffer — lives in this module's linear memory, so the emitted leaves
-    /// address it directly through the one shared `env.memory`.
-    backing: Box<[u8]>,
-    emitted_wasm: Vec<u8>,
-    /// Pending TIERUP operands (`mapped`/`argv` double as the pending JIT_INVOKE's — one event
-    /// is pending at a time).
-    func: u32,
-    mapped: u64,
-    argv: Vec<i64>,
-    /// Pending JIT_INVOKE operands (#835): the invoked unit's code handle (the JS host's
-    /// instance-cache key), its emitted wasm, and the per-arg/-result scalar type codes the JS
-    /// host marshals the i64 slots by.
-    jit_code: i32,
-    jit_wasm: Option<std::sync::Arc<[u8]>>,
-    jit_param_types: Vec<u8>,
-    jit_result_types: Vec<u8>,
-    /// #846 — the driver-table state. `slot_codes[s]` is the code handle installed at dispatch
-    /// slot `s` (`-1` empty/natural), recorded at the inline install/uninstall arms so the JS host
-    /// can mirror the engine table into its `WebAssembly.Table` at each event boundary.
-    slot_codes: Vec<i32>,
-    /// The program functions' signatures (slot = index in the natural prefix) — the shim
-    /// generator's signature source.
-    sigs: Vec<(Vec<svm_ir::ValType>, Vec<svm_ir::ValType>)>,
-    /// The last generated bounce-shim module ([`svm_onramp_tierup_shim_wasm`]) / the last
-    /// by-handle unit-wasm fetch ([`svm_onramp_tierup_jit_wasm_by_handle`]) — each valid until the
-    /// next call of its accessor.
-    shim_wasm: Vec<u8>,
-    jit_wasm_by_handle: Option<std::sync::Arc<[u8]>>,
-    /// A bounce callback's trap ([`svm_onramp_tierup_call_interp`]), staged so the JS host's
-    /// unwind-then-`deliver_jit_trap` resolves the invoke with the *real* trap — an `Exit` must
-    /// end the run as `STATUS_EXIT`, exactly as the interpreted invoke would, not as a refusal.
-    pending_bounce_trap: Option<Trap>,
-    /// The guest's top-level result, staged at DONE.
-    value: i64,
-    frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
-    /// #1009 paged tier-up: whether the emitted module carries the software page check
-    /// ([`svm_wasm_jit::compile_module_tierup_b2_paged`]) — set when the guest write-protects rodata.
-    /// A paged run rebuilds [`pagestate`](Self::pagestate) at every TIERUP and the driver points the
-    /// emitted `"pagestate"` global at it (and writes the table's coverage to `"mapped"`).
-    paged: bool,
-    /// #1009 paged tier-up: the page-state table for the pending TIERUP, rebuilt from the live page
-    /// map each event ([`bytecode::build_pagestate_table`]). Its bytes live in this module's linear
-    /// memory, so [`svm_onramp_tierup_pagestate_ptr`] IS the address the driver writes to the emitted
-    /// `"pagestate"` global (one shared memory, zero copies). Empty on unpaged runs.
-    pagestate: Vec<u8>,
-    /// #1009 paged tier-up: the [`bytecode::Vcpu::mem_map_version`] the cached `pagestate`/`mapped`
-    /// were built at. `map`/`unmap`/`protect` bump the version; while it is unchanged the page-state
-    /// table is identical, so the `O(pages)` rebuild is skipped (dispatch-heavy cards fire tens of
-    /// thousands of tier-ups between two heap grows). `u64::MAX` = never built.
-    pagestate_version: u64,
-    /// #1009 paged tier-up: the cached table's coverage — the value written to `"mapped"` (restored
-    /// even on a cache hit, since an interleaved JIT_INVOKE reuses `mapped`).
-    pagestate_cover: u64,
-    /// #1009: a generation counter bumped on each §22 install/uninstall (the only events that mutate
-    /// the dispatch-table slot mirror — a `cap.call`-bearing unit never emits, so installs happen
-    /// strictly between events). The driver caches the last generation it synced its `WebAssembly.Table`
-    /// at and rebuilds only when this advances, so a dispatch-heavy card that never installs syncs the
-    /// (up to ~4 K-slot) table ONCE instead of on every one of tens of thousands of tier-ups — the
-    /// pump's dominant per-event cost before this.
-    table_gen: u32,
-}
-
-impl TierupRun {
-    /// #1009 paged tier-up: refresh the page-state table iff the window's page map changed since the
-    /// last build ([`bytecode::Vcpu::mem_map_version`]), then stage its coverage for `"mapped"`. Cheap
-    /// on the common path (an `O(1)` version compare); an `O(pages)` rebuild only after a real
-    /// `map`/`unmap`/`protect`. Called at each TIERUP and after each `call_interp` bounce (a bounced
-    /// callback may have `vm_map`-grown the window mid-invoke).
-    fn sync_pagestate(&mut self) {
-        let ver = self.vcpu.mem_map_version();
-        if ver != self.pagestate_version {
-            let info = self.vcpu.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
-            let (table, cover) = bytecode::build_pagestate_table(&info);
-            self.pagestate = table;
-            self.pagestate_cover = cover;
-            self.pagestate_version = ver;
-        }
-        self.mapped = self.pagestate_cover;
-    }
-}
-
-/// Open a **leaf tier-up run** over the on-ramp module at `[mod_ptr, mod_len)` with stdin seeded:
-/// the interpreter drives `_start`; every all-i64 tier-up-eligible function is emitted for the JS
-/// host to run on TIERUP events. A `vm_jit_*`-importing guest (#835, the JACL compiler shape) is
-/// admitted too: its runtime-compiled units get a wasm emitter, and a codegen-eligible `Jit.invoke`
-/// surfaces as a [`TIERUP_RUN_JIT_INVOKE`] event. Returns `0`, else a negative `STATUS_*` (also in
-/// [`svm_status`]) — [`STATUS_UNSUPPORTED`] when nothing could ever run emitted (no eligible leaf
-/// and no `Jit` import), or the guest uses threads/futex, whose events this single-vCPU pump cannot
-/// service (fibers are serviced in-engine); the page then runs the plain bytecode path. Replaces
-/// any prior run. Drive with [`svm_onramp_tierup_run`] + the deliver calls; close with
-/// [`svm_onramp_tierup_close`].
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_open(
-    mod_ptr: *const u8,
-    mod_len: usize,
-    stdin_ptr: *const u8,
-    stdin_len: usize,
-    shared: i32,
-) -> i32 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
-    svm_onramp_tierup_close();
-    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
-    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let Ok(m) = svm_encode::decode_module(bytes) else {
-        set(STATUS_DECODE_ERR);
-        return -STATUS_DECODE_ERR;
-    };
-    if onramp_check(&m).is_err() || m.memory.is_none() {
-        set(STATUS_UNSUPPORTED);
-        return -STATUS_UNSUPPORTED;
-    }
-    // #889: hoist inline `cap.call`/`call.import`/`cap.self.resolve` sites into appended cross-tier
-    // wrapper functions — the host-boundary *op* is fundamental, the compute around it isn't. The
-    // containing function becomes in-subset compute + a plain `Call`, and under the #888 widened
-    // fixpoint each wrapper is a marshallable cross-tier callee served by the live bounce. Mutates
-    // the module BOTH tiers use (the whole-program `open_over_jit` rule): the emit clone below
-    // derives from it, and `VcpuProgram`/`sigs`/`eligible` are all sized to the outlined module, so
-    // slot numbering stays consistent between the emitted mask, the engine table, and the driver's
-    // shims. Wrappers only append (existing `FuncIdx`es unchanged) and carry all-scalar signatures,
-    // so the `all_shimmable` gate below is undisturbed; wrappers themselves never become tier-up
-    // entries (they hold the cap op, so the fixpoint keeps them interpreter-resident).
-    let mut m = m;
-    svm_wasm_jit::outline_cap_calls(&mut m);
-    // #926 slice 1 — **no static concurrency gate at open.** The old `any(uses_threads ||
-    // uses_futex)` refusal was whole-module, so it also rejected guests whose concurrency ops are
-    // *linked but dead* — the JACL compiler-guest (jaclrt's scheduler/GC links thread/futex ops
-    // that never run with `POOL_WORKERS=1`) is the motivating case (#839): single-threaded at
-    // runtime, but refused for code it never reaches. The gate is unnecessary: a concurrency op
-    // that *actually executes* surfaces a `Spawn`/`Join`/`Wait`/`Notify` event, and the run loop's
-    // catch-all already declines it to `TIERUP_RUN_TRAP` → the page re-runs on the interpreter
-    // (which multiplexes them cooperatively — INVARIANT 9). So the **runtime** event, not a static
-    // scan, is the real gate: a guest that never reaches its concurrency ops (JACL) now tiers up;
-    // one that does declines cleanly at the op, exactly as the static refusal did but without
-    // rejecting dead code. Fibers were already admitted (`step_vcpu` services `cont.*`/`suspend`
-    // internally — §22 renegotiated 2026-07-30); §22 `vm_jit_*` guests too (#835). (Servicing the
-    // concurrency events on a cooperative multi-vCPU scheduler instead of declining is #926 slice 2
-    // — deferred until a guest that genuinely spawns at runtime needs it.)
-    let jit_importer = m.imports.iter().any(|im| im.name.starts_with("vm_jit_"));
-    let declared = m.memory.map_or(0, |mc| mc.size_log2);
-    let win_log2 = JIT_RUN_WIN_LOG2.max(declared);
-    // Emit with the mask bumped to the run window (the driver convention everywhere): the emitted
-    // `"mapped"` default is then the full window, which is exactly why the per-call sync below is
-    // mandatory — the event's committed extent narrows it to what the interpreter admits (#717).
-    let mut emit_m = m.clone();
-    if let Some(mc) = emit_m.memory.as_mut() {
-        mc.size_log2 = win_log2;
-    }
-    // #880 parity gate for the shared-table world: every dispatch-table target must be reachable
-    // from the emitted tier — natively or through a bounce shim — but the i64-slot transport
-    // carries scalars only and at most the env scratch's worth of them. A guest with any
-    // non-shimmable signature (v128 / over-arity) emits in the old **local**-table mode instead
-    // (the emitter's own indirect restriction then applies), so a null shared-table slot can never
-    // diverge from the interpreter's dispatch.
-    let scalar = |t: &svm_ir::ValType| {
-        matches!(
-            t,
-            svm_ir::ValType::I32
-                | svm_ir::ValType::I64
-                | svm_ir::ValType::F32
-                | svm_ir::ValType::F64
-        )
-    };
-    let max_slots = (svm_wasm_jit::ENV_CELL_BYTES - 16) / 8;
-    let all_shimmable = m.funcs.iter().all(|f| {
-        f.params.iter().all(scalar)
-            && f.results.iter().all(scalar)
-            && f.params.len().max(f.results.len()) <= max_slots
-    });
-    // #1009 M1: size the shared table to the guest, not a fixed `1 << ONRAMP_JIT_TABLE_LOG2` — the
-    // interpreter's table grows to `funcs.next_power_of_two()`, so a smaller emitted mask would send
-    // a high-index `call_indirect` to a different slot. One value drives the emit, the engine table,
-    // the slot mirror, the unit emitter, and the driver's table build.
-    let table_log2 = tierup_table_log2(m.funcs.len());
-    // #1009: a guest that write-protects its rodata (a `readonly` data segment — every real on-ramp
-    // card lays out `.rodata` this way) makes the per-call #717 `scalar_extent` sync decline **every**
-    // tier-up: one durable `Ro` page and the window is no longer one-bound-representable, so the pump
-    // fired zero emitted events on the cards it most needed to (the #839 bench finding). Emit the
-    // shared table **paged** (#750) so the decline is replaced by a per-access page check that honors
-    // `Ro`/`Unmapped` exactly where the interpreter's `check_prot` traps — the vCPU then surfaces the
-    // reserved size (never a decline), and each event refreshes a page-state table. Paged rides the
-    // B2 shared-table mode (the pump's only mode), so it is gated on `all_shimmable`.
-    let paged = all_shimmable && m.data.iter().any(|d| d.readonly);
-    let page_log2 = svm_interp::host_page_size().trailing_zeros() as u8;
-    // #880: emit the main module over the **shared reserved table** — `call_indirect`-bearing
-    // functions tier up (the language-runtime dispatch-loop shape), their indirect calls reaching
-    // installed units natively (old→new) and interpreter-resident targets through the live bounce.
-    let emitted_res = if paged {
-        svm_wasm_jit::compile_module_tierup_b2_paged(
-            &emit_m,
-            shared != 0,
-            table_log2 as u32,
-            page_log2,
-        )
-    } else if all_shimmable {
-        svm_wasm_jit::compile_module_tierup_b2(&emit_m, shared != 0, table_log2 as u32)
-    } else {
-        svm_wasm_jit::compile_module_tierup(&emit_m, shared != 0)
-    };
-    let Ok((wasm, emit)) = emitted_res else {
-        set(STATUS_UNSUPPORTED);
-        return -STATUS_UNSUPPORTED;
-    };
-    // The JS host marshals every arg/result as a plain i64 slot (same limit as the par tier-up).
-    let all_i64 = |ts: &[svm_ir::ValType]| ts.iter().all(|t| *t == svm_ir::ValType::I64);
-    let eligible: Vec<bool> = m
-        .funcs
-        .iter()
-        .enumerate()
-        .map(|(i, f)| emit[i] && all_i64(&f.params) && all_i64(&f.results))
-        .collect();
-    // Nothing for the emitted tier to ever run → refuse (the page's bytecode path is strictly
-    // simpler). A `vm_jit_*` importer stays eligible even with no emittable leaf: its win is the
-    // *runtime-compiled units* running emitted (#835 — the JACL macro-staging shape).
-    if !eligible.iter().any(|&e| e) && !jit_importer {
-        set(STATUS_UNSUPPORTED);
-        return -STATUS_UNSUPPORTED;
-    }
-    // The engine's dispatch table must match the emitted `call_indirect` mask (`1 << table_log2`) —
-    // a natural-size table would both number install slots differently and wrap wild indices
-    // differently (#846/#880). Sized to the guest (#1009 M1) so the two tiers wrap identically.
-    let Some(prog) = bytecode::VcpuProgram::compile_with_jit_table(&m, table_log2) else {
-        set(STATUS_UNSUPPORTED);
-        return -STATUS_UNSUPPORTED;
-    };
-    let prog: &'static bytecode::VcpuProgram = Box::leak(Box::new(prog));
-    let mut backing = vec![0u8; 1usize << win_log2].into_boxed_slice();
-    let win_ptr = backing.as_mut_ptr();
-    // SAFETY: `backing` is owned by the session and pointer-stable across its moves (boxed slice).
-    let back =
-        std::sync::Arc::new(unsafe { svm_interp::Region::shared(win_ptr, 1u64 << win_log2) });
-    let mut host = Host::new();
-    host.stdin = if stdin_ptr.is_null() || stdin_len == 0 {
-        Vec::new()
-    } else {
-        // SAFETY: the host guarantees the stdin range is a live `svm_alloc`ation it just filled.
-        unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
-    };
-    let (frame, _keys) = grant_onramp_caps(&mut host, &m, None);
-    // The unit-emit/shim parameters ride statics (the emitter and the shim generator are bare
-    // `fn`s) — stored for every open, since shims serve non-jit guests' emitted leaves too (#880).
-    TIERUP_UNIT_SHARED.store(shared != 0, std::sync::atomic::Ordering::Relaxed);
-    TIERUP_UNIT_WIN_LOG2.store(win_log2, std::sync::atomic::Ordering::Relaxed);
-    TIERUP_UNIT_TABLE_LOG2.store(table_log2, std::sync::atomic::Ordering::Relaxed);
-    // #835: arm the §22 unit wasm-emitter for a `vm_jit_*` importer (`grant_onramp_caps` granted
-    // the `Jit` cap + validator). Gated on the same shimmable-signature bound as the shared-table
-    // emit above — a unit's dispatch depends on shims covering every interpreter-resident slot.
-    if jit_importer && all_shimmable {
-        host.set_jit_wasm_emitter(onramp_tierup_unit_emitter);
-    }
-    // Declared prefix mapped, reservation clamped to the buffer: the guest `vm_map`-grows into
-    // `[declared, 1 << win_log2)`, and an over-grow fails with `-EINVAL` (#816).
-    let vcpu = match bytecode::Vcpu::new_root_reserved_over_with_powerbox(
-        prog,
-        0,
-        &[],
-        &[],
-        host,
-        win_log2,
-        back,
-    ) {
-        Ok(v) => {
-            let v = v.with_jit_eligible(std::sync::Arc::from(eligible.into_boxed_slice()));
-            // #1009 paged: skip the scalar decline — the per-event page-state table carries the
-            // fidelity `scalar_extent` cannot (the emitted access consults it and traps in-clamp).
-            if paged {
-                v.with_jit_page_checked()
-            } else {
-                v
-            }
-        }
-        Err(_) => {
-            // SAFETY: the leaked program has no borrower yet; rebox and drop it.
-            drop(unsafe { Box::from_raw(prog as *const _ as *mut bytecode::VcpuProgram) });
-            set(STATUS_TRAP);
-            return -STATUS_TRAP;
-        }
-    };
-    // SAFETY: single-threaded wasm; the session is read back only via the tier-up exports.
-    unsafe {
-        *core::ptr::addr_of_mut!(TIERUP_RUN) = Some(TierupRun {
-            vcpu,
-            prog: prog as *const _ as *mut bytecode::VcpuProgram,
-            backing,
-            emitted_wasm: wasm,
-            func: 0,
-            mapped: 0,
-            argv: Vec::new(),
-            jit_code: 0,
-            jit_wasm: None,
-            jit_param_types: Vec::new(),
-            jit_result_types: Vec::new(),
-            slot_codes: vec![-1; 1usize << table_log2],
-            sigs: m
-                .funcs
-                .iter()
-                .map(|f| (f.params.clone(), f.results.clone()))
-                .collect(),
-            shim_wasm: Vec::new(),
-            jit_wasm_by_handle: None,
-            pending_bounce_trap: None,
-            value: 0,
-            frame,
-            paged,
-            pagestate: Vec::new(),
-            pagestate_version: u64::MAX,
-            pagestate_cover: 0,
-            table_gen: 0,
-        });
-    }
-    set(STATUS_OK);
-    0
-}
-
-/// Pump the open tier-up run: interpret until it finishes ([`TIERUP_RUN_DONE`] — statuses, stdout/
-/// stderr, exit code, and framebuffer staged in the shared capture slots), traps
-/// ([`TIERUP_RUN_TRAP`] — statuses staged), reaches an eligible call ([`TIERUP_RUN_TIERUP`] —
-/// run the emitted `f{func}` and deliver), or reaches a codegen-eligible §22 `Jit.invoke`
-/// ([`TIERUP_RUN_JIT_INVOKE`] — instantiate the unit's wasm from the `svm_onramp_tierup_jit_*`
-/// accessors, cached per code handle, run its `f0` and deliver via
-/// [`svm_onramp_tierup_deliver_jit`]). The host contract per TIERUP/JIT_INVOKE: write
-/// [`svm_onramp_tierup_mapped`] to the emitted module's/unit's `"mapped"` global (and arm the
-/// fuel env cell) before calling `f{func}(win, env, ...argv)` / `f0(win, env, ...argv)`.
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_run() -> i32 {
-    // SAFETY: single-threaded wasm; exclusive access to the session for this call.
-    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(TIERUP_RUN)).as_mut() }) else {
-        unsafe { LAST_STATUS = STATUS_UNSUPPORTED };
-        return TIERUP_RUN_TRAP;
-    };
-    let (status, value, exit_code, ev) = loop {
-        match s.vcpu.run() {
-            bytecode::VcpuEvent::TierUp { func, argv, mapped } => {
-                s.func = func;
-                s.argv = argv.into_vec();
-                if s.paged {
-                    // #1009 paged: `mapped` from the event is the reserved size (the page-checked run
-                    // never declines). Stage the page-state table's COVERAGE for `"mapped"` (the bound
-                    // above which everything traps, where `check_prot` faults) and the table itself
-                    // for `"pagestate"` — rebuilt only when the page map changed since the last event
-                    // (`sync_pagestate`). The table bytes are read via `svm_onramp_tierup_pagestate_*`
-                    // (their address in this module's linear memory IS the `"pagestate"` value).
-                    s.sync_pagestate();
-                } else {
-                    s.mapped = mapped;
-                }
-                return TIERUP_RUN_TIERUP;
-            }
-            // §22 install/uninstall mutate only engine/host state — resolve authority against this
-            // run's own powerbox and deliver inline; the JS host is involved only when a unit *runs*.
-            // `svm_par_run`'s arms minus the B2 table mirror: an installed unit's `call_indirect`
-            // dispatch stays interpreted here (inline in the caller's frames, where fibers work).
-            bytecode::VcpuEvent::JitInstall { handle, code } => {
-                let resolved = par_resolve_unit_rt(s.vcpu.host_mut(), handle, code).map(|(f, _)| f);
-                // #846: mirror `slot → code` so the JS host can rebuild its `WebAssembly.Table`
-                // at the next event boundary (installs only ever happen between events — a unit
-                // with a `cap.call` never emits, so the install itself always runs interpreted).
-                if let Some(slot) = s.vcpu.deliver_jit_install(resolved) {
-                    if let Some(e) = s.slot_codes.get_mut(slot) {
-                        *e = code;
-                    }
-                    s.table_gen = s.table_gen.wrapping_add(1); // the slot mirror changed → re-sync
-                }
-            }
-            bytecode::VcpuEvent::JitUninstall { handle, .. } => {
-                let authorized = s.vcpu.host_mut().resolve_jit_domain(handle).map(|_| ());
-                if let Some(slot) = s.vcpu.deliver_jit_uninstall(authorized) {
-                    if let Some(e) = s.slot_codes.get_mut(slot) {
-                        *e = -1; // keep the JS table mirror exact (a stale slot must trap)
-                    }
-                    s.table_gen = s.table_gen.wrapping_add(1); // the slot mirror changed → re-sync
-                }
-            }
-            // §22 `Jit.invoke` (#835): a runtime-compiled unit with emitted wasm, all-scalar
-            // operands, and a representable window state runs on the JS host (the pending operands
-            // staged for the `svm_onramp_tierup_jit_*` accessors); anything else is serviced on the
-            // interpreter — fail-closed, it honors the full page map (the PAR_JIT_INVOKE contract).
-            bytecode::VcpuEvent::JitInvoke {
-                handle,
-                code,
-                argv,
-                params,
-                results,
-                mapped,
-            } => {
-                let codes = |ts: &[svm_ir::ValType]| {
-                    ts.iter()
-                        .map(|t| scalar_type_code(*t))
-                        .collect::<Option<Vec<u8>>>()
-                };
-                let (ptypes, rtypes) = (codes(&params), codes(&results));
-                match par_resolve_unit_rt(s.vcpu.host_mut(), handle, code) {
-                    Err(t) => s.vcpu.deliver_jit_invoke(Err(t)),
-                    Ok((funcs, wasm)) => {
-                        if let (Some(w), Some(pt), Some(rt), Some(h)) =
-                            (wasm, ptypes, rtypes, mapped)
-                        {
-                            s.jit_code = code;
-                            s.mapped = h;
-                            s.argv = argv.into_vec();
-                            s.jit_wasm = Some(w);
-                            s.jit_param_types = pt;
-                            s.jit_result_types = rt;
-                            return TIERUP_RUN_JIT_INVOKE;
-                        }
-                        s.vcpu.deliver_jit_invoke(Ok(funcs));
-                    }
-                }
-            }
-            bytecode::VcpuEvent::Done(vals) => match vals.first() {
-                Some(Value::I64(x)) => break (STATUS_OK, *x, 0, TIERUP_RUN_DONE),
-                Some(Value::I32(x)) => break (STATUS_OK, *x as i64, 0, TIERUP_RUN_DONE),
-                None => break (STATUS_OK, 0, 0, TIERUP_RUN_DONE),
-                _ => break (STATUS_BAD_RESULT, 0, 0, TIERUP_RUN_DONE),
-            },
-            bytecode::VcpuEvent::Trapped(Trap::Exit(code)) => {
-                break (STATUS_EXIT, 0, code, TIERUP_RUN_DONE)
-            }
-            bytecode::VcpuEvent::Trapped(_) => break (STATUS_TRAP, 0, 0, TIERUP_RUN_TRAP),
-            // A concurrency event (`Spawn`/`Join`/`Wait`/`Notify`) or a `StdinPark` this single-vCPU
-            // pump doesn't service: decline to the interpreter (#926 slice 1 — the real gate, now
-            // that open no longer scans for dead concurrency ops). Fail closed like the reactor.
-            _ => break (STATUS_TRAP, 0, 0, TIERUP_RUN_TRAP),
-        }
-    };
-    s.value = value;
-    let host = s.vcpu.host_mut();
-    let stdout = std::mem::take(&mut host.stdout);
-    let stderr = std::mem::take(&mut host.stderr);
-    let fb = s.frame.lock().unwrap().take();
-    let (fb_rgba, fb_w, fb_h) = match fb {
-        Some(f) => (f.rgba, f.width, f.height),
-        None => (Vec::new(), 0, 0),
-    };
-    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
-    unsafe {
-        stash(&mut *core::ptr::addr_of_mut!(OUT), stdout);
-        stash(&mut *core::ptr::addr_of_mut!(ERR), stderr);
-        stash(&mut *core::ptr::addr_of_mut!(FB), fb_rgba);
-        FB_W = fb_w;
-        FB_H = fb_h;
-        EXIT_CODE = exit_code;
-        RUN_VALUE = value;
-        LAST_STATUS = status;
-    }
-    ev
-}
-
-/// The pending TIERUP's function index.
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_func() -> i32 {
-    // SAFETY: single-threaded wasm; read of the pending operands.
-    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.func as i32)
-}
-
-/// The pending TIERUP's/JIT_INVOKE's committed extent — the value for the emitted `"mapped"`
-/// global (#717). On a **paged** run (#1009) this is the pending TIERUP's page-state table
-/// *coverage*, not the scalar extent — the bound above which every access traps.
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_mapped() -> i64 {
-    // SAFETY: single-threaded wasm; read of the pending operands.
-    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.mapped as i64)
-}
-
-/// #1009: whether this run's emitted module is **paged** — the driver must, before each TIERUP call,
-/// write the emitted `"pagestate"` global to [`svm_onramp_tierup_pagestate_ptr`] (in addition to the
-/// usual `"mapped"` = [`svm_onramp_tierup_mapped`] and the fuel cell). `0` on an unpaged run (no
-/// `"pagestate"` global to write).
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_paged() -> i32 {
-    // SAFETY: single-threaded wasm; read of the session flag.
-    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.paged as i32)
-}
-
-/// #1009 paged: the pending TIERUP's page-state table base. The bytes live in this module's linear
-/// memory, so this pointer is exactly the value the driver writes to the emitted `"pagestate"`
-/// global (one shared memory, zero copies — the browser path; the wasmi differential copies them
-/// into its own memory first). Meaningful only when [`svm_onramp_tierup_paged`] is set.
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_pagestate_ptr() -> *const u8 {
-    // SAFETY: single-threaded wasm; read of the pending table.
-    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }
-        .map_or(core::ptr::null(), |s| s.pagestate.as_ptr())
-}
-
-/// #1009 paged: byte length of the pending TIERUP's page-state table (`0` on an unpaged run).
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_pagestate_len() -> usize {
-    // SAFETY: single-threaded wasm; read of the pending table.
-    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.pagestate.len())
-}
-
-/// The pending TIERUP's/JIT_INVOKE's marshalled i64 args (base pointer; valid until the next event).
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_argv_ptr() -> *const i64 {
-    // SAFETY: single-threaded wasm; read of the pending operands.
-    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }
-        .map_or(core::ptr::null(), |s| s.argv.as_ptr())
-}
-
-/// Number of pending TIERUP args (see [`svm_onramp_tierup_argv_ptr`]).
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_argv_len() -> usize {
-    // SAFETY: single-threaded wasm; read of the pending operands.
-    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.argv.len())
-}
-
-/// The emitted tier-up module's bytes (compile + instantiate against this module's memory).
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_wasm_ptr() -> *const u8 {
-    // SAFETY: single-threaded wasm; read of the session stash.
-    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }
-        .map_or(core::ptr::null(), |s| s.emitted_wasm.as_ptr())
-}
-
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_wasm_len() -> usize {
-    // SAFETY: single-threaded wasm; read of the session stash.
-    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.emitted_wasm.len())
-}
-
-/// The run window's base address in this module's linear memory (the emitted `f{i}`s' `win` arg).
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_win_ptr() -> *const u8 {
-    // SAFETY: single-threaded wasm; read of the session stash.
-    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }
-        .map_or(core::ptr::null(), |s| s.backing.as_ptr())
-}
-
-/// The run window's byte length (`1 << win_log2` — declared bumped to [`JIT_RUN_WIN_LOG2`]).
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_win_len() -> usize {
-    // SAFETY: single-threaded wasm; read of the session stash.
-    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.backing.len())
-}
-
-/// The guest's top-level result once [`TIERUP_RUN_DONE`] is reached.
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_value() -> i64 {
-    // SAFETY: single-threaded wasm; read of the session stash.
-    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.value)
-}
-
-/// Deliver the emitted `f{func}`'s i64 result slots for the pending TIERUP.
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_deliver(rptr: *const i64, n: usize) {
-    // SAFETY: single-threaded wasm; `[rptr, n)` is a live `svm_alloc`ation the host just filled.
-    if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(TIERUP_RUN)).as_mut() } {
-        let vals = if rptr.is_null() || n == 0 {
-            &[][..]
-        } else {
-            unsafe { core::slice::from_raw_parts(rptr, n) }
-        };
-        s.vcpu.deliver_tierup(vals);
-    }
-}
-
-/// Deliver a trap from the emitted `f{func}` (a wasm trap or an SVM fault) for the pending TIERUP.
-/// When the unwind came from a **bounce** callback's trap (#880 — a `call_indirect`-bearing leaf
-/// hit a shim whose callback trapped), the staged real trap is delivered instead, so a callback's
-/// `exit` ends the run as `STATUS_EXIT` exactly as the interpreted call would.
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_deliver_trap() {
-    // SAFETY: single-threaded wasm; exclusive access to the session.
-    if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(TIERUP_RUN)).as_mut() } {
-        let t = s.pending_bounce_trap.take().unwrap_or(Trap::Unreachable);
-        s.vcpu.deliver_tierup_trap(t);
-    }
-}
-
-// ---- pending JIT_INVOKE operands (#835) — the §22 unit half of the pump ----------------------
-
-/// The pending JIT_INVOKE's code handle — the JS host keys its per-unit instance cache by this
-/// (one wasm instance per compiled unit; args differ per invoke — worker.js's `jitUnitFor` shape).
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_jit_code() -> i32 {
-    // SAFETY: single-threaded wasm; read of the pending operands.
-    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.jit_code)
-}
-
-/// The pending JIT_INVOKE's emitted unit wasm (instantiate against this module's memory; the bytes
-/// stay valid until the next event — the session holds its own `Arc`).
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_jit_wasm_ptr() -> *const u8 {
-    // SAFETY: single-threaded wasm; read of the pending operands.
-    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(core::ptr::null(), |s| {
-        s.jit_wasm
-            .as_ref()
-            .map_or(core::ptr::null(), |w| w.as_ptr())
-    })
-}
-
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_jit_wasm_len() -> usize {
-    // SAFETY: single-threaded wasm; read of the pending operands.
-    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }
-        .map_or(0, |s| s.jit_wasm.as_ref().map_or(0, |w| w.len()))
-}
-
-/// Per-arg scalar type codes of the pending JIT_INVOKE (`0` = i32, `1` = i64, `2` = f32, `3` =
-/// f64), one byte per arg — the JS host marshals each [`svm_onramp_tierup_argv_ptr`] i64 slot to
-/// the wasm type the unit's `f0` declares. Length equals [`svm_onramp_tierup_argv_len`].
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_jit_param_types_ptr() -> *const u8 {
-    // SAFETY: single-threaded wasm; read of the pending operands.
-    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }
-        .map_or(core::ptr::null(), |s| s.jit_param_types.as_ptr())
-}
-
-/// Per-result scalar type codes of the pending JIT_INVOKE (encoding as
-/// [`svm_onramp_tierup_jit_param_types_ptr`]) — the JS host marshals each `f0` result back to its
-/// i64 slot (a float's bits, an integer's value) for [`svm_onramp_tierup_deliver_jit`].
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_jit_result_types_ptr() -> *const u8 {
-    // SAFETY: single-threaded wasm; read of the pending operands.
-    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }
-        .map_or(core::ptr::null(), |s| s.jit_result_types.as_ptr())
-}
-
-/// Number of pending JIT_INVOKE results (see [`svm_onramp_tierup_jit_result_types_ptr`]).
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_jit_result_types_len() -> usize {
-    // SAFETY: single-threaded wasm; read of the pending operands.
-    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.jit_result_types.len())
-}
-
-/// Deliver the unit `f0`'s i64 result slots for the pending JIT_INVOKE — the vCPU resumes exactly
-/// as if the interpreter had run the unit ([`Vcpu::deliver_jit_invoke_vals`]'s contract).
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_deliver_jit(rptr: *const i64, n: usize) {
-    // SAFETY: single-threaded wasm; `[rptr, n)` is a live `svm_alloc`ation the host just filled.
-    if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(TIERUP_RUN)).as_mut() } {
-        let vals = if rptr.is_null() || n == 0 {
-            &[][..]
-        } else {
-            unsafe { core::slice::from_raw_parts(rptr, n) }
-        };
-        s.vcpu.deliver_jit_invoke_vals(vals);
-    }
-}
-
-/// Deliver a trap from the pending JIT_INVOKE's emitted unit (a wasm trap or an SVM fault) — the
-/// vCPU traps on its next pump, as an interpreted invoke trap would. When the unwind was caused by
-/// a **bounce** callback's trap ([`svm_onramp_tierup_call_interp`] returned nonzero), the staged
-/// real trap is delivered instead — so a callback's `exit` ends the run as `STATUS_EXIT`, exactly
-/// as the interpreted invoke would, not as a refusal (#846).
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_deliver_jit_trap() {
-    // SAFETY: single-threaded wasm; exclusive access to the session.
-    if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(TIERUP_RUN)).as_mut() } {
-        let t = s.pending_bounce_trap.take().unwrap_or(Trap::Unreachable);
-        s.vcpu.deliver_jit_invoke_trap(t);
-    }
-}
-
-// ---- #846: the driver table + live-state bounce (the §22 linked-unit half) -------------------
-
-/// Service one **cross-tier bounce** out of an emitted §22 unit: the JS host is inside the pending
-/// JIT_INVOKE's `f0` (or a table trampoline it called), and the emitted code reached a target with
-/// no wasm body. `target` is the dispatch-table slot (= the function's own index for the natural
-/// prefix — the value the trampoline was generated with); `[args_ptr, …)` are the i64 arg slots in
-/// the `env.call_interp` scratch, overwritten with the result slots. Runs the target on a nested
-/// interpretation over the run's **live** window/powerbox/fuel ([`Vcpu::bounce_call`] — fibers
-/// persist across the invoke's bounces). Returns `0`, or `1` on a trap (staged — the JS host must
-/// throw to unwind the emitted frames, then [`svm_onramp_tierup_deliver_jit_trap`] delivers it).
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_call_interp(target: u32, args_ptr: *mut u8) -> i32 {
-    // SAFETY: single-threaded wasm; the vCPU is parked on the pending invoke (not executing), so
-    // this re-entrant borrow of the session is exclusive. The host guarantees `args_ptr` addresses
-    // the env cell's scratch (≥ `ENV_CELL_BYTES - 16` bytes — the emitted call sites and the shim
-    // bodies both spill there).
-    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(TIERUP_RUN)).as_mut() }) else {
-        return 1;
-    };
-    let max_slots = (svm_wasm_jit::ENV_CELL_BYTES - 16) / 8;
-    let io = unsafe { core::slice::from_raw_parts_mut(args_ptr as *mut i64, max_slots) };
-    match s.vcpu.bounce_call(target, io) {
-        Ok(_) => {
-            // #1009 paged: a bounced callback may have `vm_map`-grown the window mid-invoke — the
-            // page-state table built at TIERUP entry no longer covers the grown pages (they read as
-            // `Unmapped`, so the emitted access after the bounce would trap where the interpreter
-            // admits the growth). Refresh it (only if the page map actually changed — `sync_pagestate`
-            // version-guards the rebuild), exactly as the #717 `"mapped"` fan-out re-syncs the scalar
-            // bound; the driver reads the fresh base + coverage below.
-            if s.paged {
-                s.sync_pagestate();
-            }
-            0
-        }
-        Err(t) => {
-            s.pending_bounce_trap = Some(t);
-            1
-        }
-    }
-}
-
-/// The window's committed scalar extent **right now** — the JS host re-syncs it to every live
-/// instance's `"mapped"` global after each bounce (a callback may have `vm_map`-grown the window
-/// mid-invoke; the fan-out makes growth visible exactly when the interpreted path would see it).
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_mapped_now() -> i64 {
-    // SAFETY: single-threaded wasm; read of the parked session.
-    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }
-        .map_or(0, |s| s.vcpu.window_scalar_extent() as i64)
-}
-
-/// The dispatch-table size (log2) this run's table is built with — the JS host sizes its
-/// `WebAssembly.Table` to `1 << this` (the emitted `call_indirect` mask). #1009 M1: this is the
-/// guest's effective size ([`tierup_table_log2`]), not the fixed minimum, so the driver's table
-/// covers every function the emitted dispatch can reach.
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_table_log2() -> u32 {
-    TIERUP_UNIT_TABLE_LOG2.load(std::sync::atomic::Ordering::Relaxed) as u32
-}
-
-/// The guest program's function count — the dispatch table's **natural prefix** (`slot i < nfuncs`
-/// dispatches program function `i`; slots at or past it hold installed units or trap empty).
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_nfuncs() -> usize {
-    // SAFETY: single-threaded wasm; read of the session stash.
-    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.sigs.len())
-}
-
-/// #1009: the dispatch-table **generation** — bumped on each §22 install/uninstall (the only slot-
-/// mirror mutations). The driver caches the generation it last synced its `WebAssembly.Table` at and
-/// rebuilds only when this advances; a card that never installs syncs the table once, not per
-/// tier-up. Monotone (`wrapping_add`); the driver compares for inequality, so wrap is immaterial.
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_table_gen() -> u32 {
-    // SAFETY: single-threaded wasm; read of the session stash.
-    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.table_gen)
-}
-
-/// The code handle installed at dispatch-table `slot` (`-1` empty/natural) — the mirror the JS
-/// host rebuilds its table from at each event boundary (worker.js's `svm_par_jit_slot_code` shape).
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_slot_code(slot: u32) -> i32 {
-    // SAFETY: single-threaded wasm; read of the session stash.
-    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(-1, |s| {
-        s.slot_codes.get(slot as usize).copied().unwrap_or(-1)
-    })
-}
-
-/// Emitted-wasm length for **any** compiled unit by code handle (`0` if none — the unit is
-/// interpreter-only) — so the JS host can instantiate an *installed* slot's unit it hasn't itself
-/// invoked (worker.js's `svm_par_jit_code_wasm_by_handle` shape). The bytes (via
-/// [`svm_onramp_tierup_jit_wasm_by_handle_ptr`]) stay valid until the next call.
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_jit_wasm_by_handle_len(code: i32) -> usize {
-    // SAFETY: single-threaded wasm; exclusive access to the session stash.
-    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(TIERUP_RUN)).as_mut() }) else {
-        return 0;
-    };
-    let h = s.vcpu.host_mut();
-    s.jit_wasm_by_handle = h
-        .resolve_jit_code(code)
-        .ok()
-        .and_then(|(cd, cu)| h.jit_unit_wasm(cd, cu));
-    s.jit_wasm_by_handle.as_ref().map_or(0, |w| w.len())
-}
-
-/// Pointer to the emitted wasm the last [`svm_onramp_tierup_jit_wasm_by_handle_len`] resolved.
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_jit_wasm_by_handle_ptr() -> *const u8 {
-    // SAFETY: single-threaded wasm; read of the session stash.
-    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(core::ptr::null(), |s| {
-        s.jit_wasm_by_handle
-            .as_ref()
-            .map_or(core::ptr::null(), |w| w.as_ptr())
-    })
-}
-
-/// Generate the **bounce-shim module** for dispatch-table `slot` — a standalone one-function wasm
-/// module (`export "t"`, [`svm_wasm_jit::emit_slot_trampoline`]) with the slot's occupant's
-/// env-prepended signature, whose body bounces to [`svm_onramp_tierup_call_interp`] with `slot`
-/// baked in. The JS host `table.set`s its instance's `"t"` into the slot, so an emitted unit's
-/// `call_indirect` to an interpreter-resident target lands on the live-state bounce. Returns the
-/// module's byte length (`0` = no shim: empty slot, or a signature the transport can't carry — the
-/// open-time `all_shimmable` gate makes the latter unreachable for a run whose units emit). Bytes
-/// via [`svm_onramp_tierup_shim_ptr`], valid until the next call.
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_shim_wasm(slot: u32) -> usize {
-    // SAFETY: single-threaded wasm; exclusive access to the session stash.
-    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(TIERUP_RUN)).as_mut() }) else {
-        return 0;
-    };
-    let sig = if (slot as usize) < s.sigs.len() {
-        Some(s.sigs[slot as usize].clone())
-    } else {
-        let code = s.slot_codes.get(slot as usize).copied().unwrap_or(-1);
-        if code < 0 {
-            None
-        } else {
-            let h = s.vcpu.host_mut();
-            h.resolve_jit_code(code)
-                .ok()
-                .and_then(|(cd, cu)| h.jit_unit_funcs(cd, cu))
-                .and_then(|fs| fs.first().map(|f| (f.params.clone(), f.results.clone())))
-        }
-    };
-    let Some((params, results)) = sig else {
-        s.shim_wasm.clear();
-        return 0;
-    };
-    let shared = TIERUP_UNIT_SHARED.load(std::sync::atomic::Ordering::Relaxed);
-    match svm_wasm_jit::emit_slot_trampoline(&params, &results, slot, shared) {
-        Ok(w) => {
-            s.shim_wasm = w;
-            s.shim_wasm.len()
-        }
-        Err(_) => {
-            s.shim_wasm.clear();
-            0
-        }
-    }
-}
-
-/// Pointer to the shim module the last [`svm_onramp_tierup_shim_wasm`] generated.
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_shim_ptr() -> *const u8 {
-    // SAFETY: single-threaded wasm; read of the session stash.
-    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }
-        .map_or(core::ptr::null(), |s| s.shim_wasm.as_ptr())
-}
-
-/// Close the open tier-up run, freeing its window and program. Idempotent.
-#[no_mangle]
-pub extern "C" fn svm_onramp_tierup_close() {
-    // SAFETY: single-threaded wasm; take the session; the vCPU (borrowing the leaked program) is
-    // dropped before the program is reboxed and freed.
-    unsafe {
-        if let Some(s) = (*core::ptr::addr_of_mut!(TIERUP_RUN)).take() {
-            let prog = s.prog;
-            drop(s);
-            drop(Box::from_raw(prog));
-        }
-    }
-}
-
 // ============================================================================================
-// #926 slice 2 — the **cooperative** tier-up driver (`svm_coop_*`).
+// The **cooperative** tier-up driver (`svm_coop_*`) — #926 slice 2; since #1026 the ONE fallback
+// tier when the whole-program emit declines (the single-vCPU pump it superseded was a strict
+// subset, and slower).
 //
-// The single-vCPU `svm_onramp_tierup_*` driver above declines a guest that actually reaches a
-// `Spawn`/`Join`/`Wait`/`Notify` event (its `run()` catch-all → `TIERUP_RUN_TRAP`), because one
-// `Vcpu` can't multiplex threads. This driver wraps [`bytecode::CoopRun`] instead — the cooperative
-// multi-vCPU scheduler — so a real `thread.spawn` guest tiers up its hot leaves on **one** wasm
-// thread, no Workers (the JACL-with-runtime-threads shape). It is a strict simplification of the
-// single-vCPU FFI: `CoopRun` owns its `Domain`/window/powerbox (no leaked program), and services
-// `Spawn`/`Join`/`Wait`/`Notify`/fibers/`Jit.install`/`Jit.invoke` **internally**, so the only
-// events that reach the host are tier-up and the run's end — the pump loop has no concurrency or
-// §22 arms. Emitted `Jit.invoke` acceleration (a host event) is a later refinement; here units run
-// interpreted inside the pump. The cross-tier `call_interp` bounce is routed to the tiering-up
-// task's env by [`CoopRun::bounce`] (the confinement hinge).
+// An `InterpDriven` guest — it `vm_map`s, streams, hosts fibers, `thread.spawn`s — runs here: this
+// driver wraps [`bytecode::CoopRun`], the cooperative multi-vCPU scheduler, so the interpreter
+// owns `_start` and multiplexes every vCPU of the run on **one** wasm thread, no Workers. `CoopRun`
+// owns its `Domain`/window/powerbox and services `Spawn`/`Join`/`Wait`/`Notify`/fibers/
+// `Jit.install`/`Jit.invoke` **internally**, so the only events that reach the host are tier-up, a
+// §22 `Jit.invoke` of an emitted unit, and the run's end. The cross-tier `call_interp` bounce is
+// routed to the tiering-up task's env by [`CoopRun::bounce`] (the confinement hinge).
 //
 // The capture/status statics (`OUT`/`ERR`/`FB`/`EXIT_CODE`/`RUN_VALUE`/`LAST_STATUS`) and the
-// `svm_alloc`/`svm_stdout_*` accessors are shared with the single-vCPU driver — only one runs at a
+// `svm_alloc`/`svm_stdout_*` accessors are shared with the other run paths — only one runs at a
 // time (single-threaded wasm; tests serialize on the FFI lock).
 // ============================================================================================
 
@@ -9739,12 +8876,14 @@ pub extern "C" fn svm_coop_open(
         return -STATUS_UNSUPPORTED;
     }
     // #889: hoist inline `cap.call`/`call.import`/`cap.self.resolve` sites into appended cross-tier
-    // wrapper functions, exactly as the single-shot pump's open does (see `svm_onramp_tierup_open`
-    // for the full rationale) — a hot loop with an inline cap write then emits and tiers up, its
-    // cap sites bouncing to the wrappers instead of pinning the whole function to the interpreter.
-    // Mutates the module BOTH tiers use, so slot numbering stays consistent between the emitted
-    // mask, the engine table, and the driver's shims. (#1026 slice 1: the ported pump differentials
-    // exposed this pass missing here — the two fallback drivers must transform identically.)
+    // wrapper functions — the host-boundary *op* is fundamental, the compute around it isn't. The
+    // containing function becomes in-subset compute + a plain `Call`, so a hot loop with an inline
+    // cap write emits and tiers up, its cap sites bouncing to the wrappers instead of pinning the
+    // whole function to the interpreter (the #888 widened fixpoint serves each wrapper as a
+    // marshallable cross-tier callee over the live bounce). Mutates the module BOTH tiers use, so
+    // slot numbering stays consistent between the emitted mask, the engine table, and the driver's
+    // shims; wrappers only append (existing `FuncIdx`es unchanged) and carry all-scalar signatures,
+    // so the `all_shimmable` gate below is undisturbed.
     let mut m = m;
     svm_wasm_jit::outline_cap_calls(&mut m);
     let declared = m.memory.map_or(0, |mc| mc.size_log2);
@@ -9755,7 +8894,7 @@ pub extern "C" fn svm_coop_open(
     if let Some(mc) = emit_m.memory.as_mut() {
         mc.size_log2 = win_log2;
     }
-    // #926 slice 2f — B2 vs non-B2 emit, exactly the single-shot pump's gate ([`svm_onramp_tierup_open`]).
+    // #926 slice 2f — B2 vs non-B2 emit (#880's parity gate for the shared-table world).
     // A guest whose every function has a shimmable signature (scalar operands, arity ≤ the env
     // scratch's slot count) emits over the **shared reserved table** (Model B2): `call_indirect`-bearing
     // functions tier up (the language-runtime dispatch-loop shape), their indirect calls reaching
@@ -9780,8 +8919,11 @@ pub extern "C" fn svm_coop_open(
     // #1009 M1: size the shared table to the guest (see `tierup_table_log2`), consistently across
     // the emit, the host's domain table, the slot mirror, the unit emitter, and the driver.
     let table_log2 = tierup_table_log2(m.funcs.len());
-    // #1009: a rodata guest emits the shared table PAGED (see `svm_onramp_tierup_open` for the full
-    // rationale) — the per-call `scalar_extent` decline is replaced by the per-access page check.
+    // #1009: a rodata guest (a `readonly` data segment — every real on-ramp card lays out its
+    // `.rodata` this way) emits the shared table PAGED: one durable `Ro` page makes the window
+    // non-one-bound-representable, so the per-call #717 `scalar_extent` sync would decline EVERY
+    // tier-up. Paged mode replaces the decline with a per-access page check that traps
+    // `Ro`/`Unmapped` exactly where the interpreter's `check_prot` does (fail-closed).
     let paged = all_shimmable && m.data.iter().any(|d| d.readonly);
     let page_log2 = svm_interp::host_page_size().trailing_zeros() as u8;
     let emitted_res = if paged {
@@ -10009,7 +9151,7 @@ pub extern "C" fn svm_coop_mapped() -> i64 {
 
 /// #1009: whether this coop run's emitted module is **paged** — the driver must write the emitted
 /// `"pagestate"` global to [`svm_coop_pagestate_ptr`] before each TIERUP call (the pump's
-/// `svm_onramp_tierup_paged` twin). `0` on an unpaged run.
+/// `"mapped"` write). `0` on an unpaged run.
 #[no_mangle]
 pub extern "C" fn svm_coop_paged() -> i32 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.paged as i32)
@@ -10032,7 +9174,7 @@ pub extern "C" fn svm_coop_pagestate_len() -> usize {
 
 /// #1009: the dispatch-table generation — bumped on each §22 install/uninstall the coop scheduler
 /// services. The driver rebuilds its `WebAssembly.Table` only when this advances (the pump's
-/// `svm_onramp_tierup_table_gen` twin).
+/// advances (a §22 install/uninstall).
 #[no_mangle]
 pub extern "C" fn svm_coop_table_gen() -> u32 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.run.table_gen())
@@ -10191,7 +9333,7 @@ pub extern "C" fn svm_coop_call_interp(target: u32, args_ptr: *mut u8) -> i32 {
         Ok(_) => {
             // #1009 paged: a bounced callback may have grown the window mid-invoke — refresh the
             // page-state table (version-guarded) so the post-bounce emitted access admits the growth
-            // (the pump's `svm_onramp_tierup_call_interp` twin).
+            // (the paged twin of the #717 scalar fan-out).
             if s.paged {
                 s.sync_pagestate();
             }
@@ -10212,8 +9354,8 @@ pub extern "C" fn svm_coop_mapped_now() -> i64 {
         .map_or(0, |s| s.run.window_scalar_extent() as i64)
 }
 
-// ---- #926 slice 2f: the B2 driver-table accessors (the twins of the single-shot `svm_onramp_tierup_*`
-// set) the JS host rebuilds its shared `WebAssembly.Table` from at each event boundary. ----
+// ---- #926 slice 2f: the B2 driver-table accessors — the set the JS host rebuilds its shared
+// `WebAssembly.Table` from at each event boundary. ----
 
 /// The dispatch-table size (log2) the coop run's shared table is built with — the JS host sizes its
 /// `WebAssembly.Table` to `1 << this` (the emitted `call_indirect` mask). `0` (a 1-slot table) for a

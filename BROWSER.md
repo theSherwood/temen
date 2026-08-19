@@ -984,7 +984,14 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    lever than locals. If module-guest throughput is ever worth pursuing, that (redundant-check elimination
    with a proof the confinement invariant holds) or **function splitting** are the real targets;
    stackification is not.
-9. **[landed — capability] Single-shot leaf tier-up (#809): the InterpDriven complement to slice 8.**
+9. **[landed — capability; superseded by the cooperative driver, #1026] Single-shot leaf tier-up
+   (#809): the InterpDriven complement to slice 8.**
+   *(#1026 collapsed this single-vCPU pump into the cooperative driver `svm_coop_*` — a strict
+   superset that services concurrency/fibers/§22 internally and measured faster on every card; the
+   `svm_onramp_tierup_*` FFI and `driveTierupRun` are gone, `runJitModule` falls back whole-program
+   → coop → interpreter, and every differential below lives on in `tests/coop_tierup_driver.rs`.
+   The mechanics this entry describes — the TIERUP event contract, the #717 sync, the B2 shared
+   table, the live bounce — are unchanged; they just have one implementation now.)*
    Slice 8 requires a `WasmDriven` `_start`; a guest that `vm_map`-grows its heap or does host I/O in
    `_start` (the chibicc/QuickJS/JACL shapes) is `InterpDriven` and used to fall all the way back to
    pure bytecode — discarding the tier-up-eligible pure leaves the #717 gate split kept emittable. Now
