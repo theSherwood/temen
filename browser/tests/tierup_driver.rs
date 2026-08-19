@@ -747,21 +747,25 @@ fn jacl_compiler_runs_through_the_pump() {
 #[test]
 fn open_fails_closed_without_an_eligible_leaf() {
     let _g = FFI_LOCK.lock().unwrap();
-    let (_, mem_h) = onramp_handles();
+    // Every function must stay non-emittable THROUGH the #889 outlining pass — a lone `cap.call`
+    // `_start` no longer qualifies (its site outlines and the function becomes eligible), so this
+    // guest is all fiber ops: `_start` hosts a fiber (out of subset), the body suspends (out of
+    // subset) — nothing for the emitted tier to ever run.
     let src = format!(
         r#"memory 16
 func () -> (i64) {{
 block 0 () {{
-  vas = i32.const {mem_h}
-  voff = i64.const 65536
-  vlen = i64.const 16384
-  vprot = i32.const 3
-  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
-  return vr
+  vf = i32.const 1
+  vsp = i64.const 0
+  vk = cont.new vf vsp
+  varg = i64.const 1
+  vs1, vv1 = cont.resume vk varg
+  return vv1
   }}
 }}
-export 0 func "_start" 0
-"#
+{}export 0 func "_start" 0
+"#,
+        fiber_body_func()
     );
     let m = svm_text::parse_module(&src).expect("parse");
     svm_verify::verify_module(&m).expect("verify");
@@ -1198,10 +1202,15 @@ fn onramp_handles_jit() -> (i32, i32, i32) {
 const BOUNCE_K: i64 = 1000;
 const MID_GROW_PROBE: i64 = 81920 + 8;
 
-/// #846 differential (unit→program bounce + growth-mid-invoke + unit→eligible-`f{i}` native):
-/// a **linked** unit whose `call_indirect` slots split across every edge kind, run through the full
-/// driver, must match `onramp_exec` — including a store into a page a *bounced callback* grew
-/// mid-invoke (only correct if the post-bounce `"mapped"` fan-out admits the growth).
+/// #846 differential (unit→program edges + growth-mid-invoke): a **linked** unit whose
+/// `call_indirect` slots split across edge kinds, run through the full driver, must match
+/// `onramp_exec` — including a store into a page grown mid-invoke (only correct if the post-bounce
+/// `"mapped"` fan-out admits the growth). Post-#889 the cap-calling helper's sites are outlined, so
+/// **both** program slots dispatch natively (the helper emits) and the live-window bounces are its
+/// wrappers 7/8 (append order: f0's vm_map/compile/invoke/write = 3–6, f1's grow/write = 7/8) —
+/// the growth now happens inside wrapper 7, mid-invoke, same contract. The interp-resident-slot
+/// shim bounce this test used to carry is pinned by `tierup_region_bounce_grows_and_streams`
+/// (whose target hosts a fiber, the shape that stays interpreter-resident post-#889).
 #[test]
 fn linked_unit_bounces_and_native_edges_match_the_oracle() {
     let _g = FFI_LOCK.lock().unwrap();
@@ -1302,8 +1311,13 @@ export 0 func "_start" 0
         "the linked unit must run emitted (non-vacuity)"
     );
     assert!(
-        d.bounces().contains(&1),
-        "the cap-calling helper must have bounced (edge non-vacuity): {:?}",
+        d.bounces().contains(&7) && d.bounces().contains(&8),
+        "the helper's outlined wrappers must bounce (edge non-vacuity): {:?}",
+        d.bounces()
+    );
+    assert!(
+        !d.bounces().contains(&1),
+        "#889: the cap-calling helper itself must emit and dispatch natively: {:?}",
         d.bounces()
     );
     assert!(
@@ -1584,9 +1598,12 @@ export 0 func "_start" 0
 }
 
 /// #880 differential (TIERUP-region bounce + growth): a tiered-up leaf's `call_indirect` lands on
-/// a **shim** (the target cap-calls), whose callback grows the window and streams — the leaf then
-/// stores into the just-grown page, correct only through the post-bounce `"mapped"` fan-out; the
-/// bounce's stdout interleaves exactly as the interpreted call would.
+/// a **shim** (the target is interpreter-resident), whose callback grows the window and streams —
+/// the leaf then stores into the just-grown page, correct only through the post-bounce `"mapped"`
+/// fan-out; the bounce's stdout interleaves exactly as the interpreted call would. Post-#889 a
+/// merely cap-calling target would emit (its sites outline), so the target here also **hosts a
+/// fiber** (`cont.new`/`resume` — out of subset by design, §22): the one shape that keeps a
+/// marshallable slot interpreter-resident, which is exactly what this shim edge exists for.
 #[test]
 fn tierup_region_bounce_grows_and_streams() {
     let _g = FFI_LOCK.lock().unwrap();
@@ -1628,9 +1645,17 @@ block 0 (v0: i64) {{
   vzero = i64.const 0
   vlen8 = i64.const 8
   vw = cap.call 0 1 (i64, i64) -> (i64) vout (vzero, vlen8)
+  vf = i32.const 3
+  vk2 = cont.new vf vzero
+  vs1, vv1 = cont.resume vk2 vzero
   vk = i64.const {BOUNCE_K}
   vsum = i64.add v0 vk
   return vsum
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  return varg
   }}
 }}
 export 0 func "_start" 0
@@ -1650,7 +1675,7 @@ export 0 func "_start" 0
     assert!(tierups >= 1, "the leaf must tier up");
     assert!(
         d.bounces().contains(&2),
-        "the cap-calling target must bounce: {:?}",
+        "the fiber-hosting target must bounce through the slot shim: {:?}",
         d.bounces()
     );
     assert_eq!(svm_status(), want.status, "status parity with the oracle");
@@ -1764,10 +1789,12 @@ const XT_K: i64 = 222;
 /// compute leaf whose *only* non-emittable feature is a **direct `Call`** to `f2`, a `cap.call`-ing
 /// helper (grows the window + streams). Before #888 `f1` cascades to the interpreter — the tier-up
 /// open would refuse the guest (no eligible leaf). After #888 `f1` emits (the reactor `cross` set),
-/// so the open succeeds, `f1` tiers up, and its direct call to `f2` bounces over the **live**
-/// window: `f2` grows `[64K, 80K)` and streams, then `f1` stores into the just-grown page — correct
-/// only through the post-bounce `"mapped"` fan-out. Distinct from the #880 `call_indirect` bounce:
-/// this is a direct `env.call_interp`, not a table shim.
+/// so the open succeeds and `f1` tiers up. Post-#889 (the pump outlines cap sites) `f2` **also**
+/// emits — its two `cap.call`s become wrappers 4/5 (appended after the 3 originals; 3 is
+/// `_start`'s) — so the direct cross-tier calls over the **live** window are now the wrapper
+/// bounces: wrapper 4 grows `[64K, 80K)` mid-`f2`, wrapper 5 streams, then `f1` stores into the
+/// just-grown page — correct only through the post-bounce `"mapped"` fan-out. Distinct from the
+/// #880 `call_indirect` bounce: these are direct `env.call_interp`s, not table shims.
 #[test]
 fn direct_cross_tier_call_bounces_over_the_live_window() {
     let _g = FFI_LOCK.lock().unwrap();
@@ -1838,8 +1865,13 @@ export 0 func "_start" 0
     let (d, tierups, _invokes) = drive_full_session(&m);
     assert!(tierups >= 1, "the widened leaf must tier up (non-vacuity)");
     assert!(
-        d.bounces().contains(&2),
-        "the direct cross-tier call to the cap-calling helper must bounce: {:?}",
+        d.bounces().contains(&4) && d.bounces().contains(&5),
+        "the cap-calling helper's outlined wrappers must bounce over the live window: {:?}",
+        d.bounces()
+    );
+    assert!(
+        !d.bounces().contains(&2),
+        "#889: the helper itself must emit (its cap sites are outlined), not bounce: {:?}",
         d.bounces()
     );
     assert_eq!(svm_status(), want.status, "status parity with the oracle");
@@ -2013,6 +2045,102 @@ export 0 func "_start" 0
         svm_status(),
         STATUS_TRAP,
         "status is TRAP (the page re-runs on the interpreter)"
+    );
+    svm_onramp_tierup_close();
+}
+
+/// What each hot-loop iteration adds (distinct from every other K so a cross-wire shows).
+const HOT_K: i64 = 77;
+/// Where the hot loop stages each iteration's running total before streaming it.
+const SLOT2: i64 = 2064;
+/// Loop iterations — also the exact expected wrapper-bounce count.
+const HOT_N: i64 = 4;
+
+/// #889 differential (the card shape): `f1` is a hot loop — compute plus **one inline stdout
+/// `cap.call` per iteration**. Pre-#889 the inline cap site pins the whole function to the
+/// interpreter (the open even refuses: nothing eligible). Post-#889 the pump outlines the site, so
+/// `f1` emits and tiers up; each iteration's cap write bounces to the outlined wrapper (index 3 —
+/// wrapper 2 is `_start`'s write, never bounced: the root runs interpreted). Pinned: parity with
+/// the bytecode oracle (status/value/stdout — the per-iteration writes interleave identically),
+/// the tier-up non-vacuity, and bounce-count == the loop's cap-site executions, all to the wrapper.
+#[test]
+fn hot_loop_with_inline_cap_write_emits_and_bounces_per_iteration() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let (out_h, _mem_h) = onramp_handles();
+    let src = format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  vn = i64.const {HOT_N}
+  vres = call 1 (vn)
+  vsl = i64.const {SLOT}
+  i64.store vsl vres
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vres
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vacc0 = i64.const 0
+  br 1(v0, vacc0)
+}}
+block 1 (vi: i64, vacc: i64) {{
+  vk = i64.const {HOT_K}
+  vmul = i64.mul vi vk
+  vacc2 = i64.add vacc vmul
+  vsl2 = i64.const {SLOT2}
+  i64.store vsl2 vacc2
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl2, vlen8)
+  vone = i64.const -1
+  vnext = i64.add vi vone
+  vz = i64.const 0
+  vgo = i64.ne vnext vz
+  br_if vgo 1(vnext, vacc2) 2(vacc2)
+}}
+block 2 (vr: i64) {{
+  return vr
+  }}
+}}
+export 0 func "_start" 0
+"#
+    );
+    let m = svm_text::parse_module(&src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    let expect = HOT_K * (1..=HOT_N).sum::<i64>();
+    assert_eq!(want.value, expect, "oracle value");
+
+    // Pre-#889 this open REFUSED (the inline cap site cascades f1, and _start holds its own) —
+    // admitting it at all is half the pin.
+    let opened = svm_onramp_tierup_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(
+        opened,
+        0,
+        "#889: the cap-bearing hot loop must be admitted (status {})",
+        svm_status()
+    );
+    let (d, tierups, _invokes) = drive_full_session(&m);
+    assert!(tierups >= 1, "the hot loop must tier up (non-vacuity)");
+    assert_eq!(
+        d.bounces(),
+        &vec![3u32; HOT_N as usize][..],
+        "each iteration's cap write bounces to f1's outlined wrapper, nothing else bounces"
+    );
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(svm_onramp_tierup_value(), want.value, "value parity");
+    // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
+    let got_out =
+        unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
+    assert_eq!(
+        got_out, want.stdout,
+        "stdout parity — the per-iteration writes interleave exactly as interpreted"
     );
     svm_onramp_tierup_close();
 }
