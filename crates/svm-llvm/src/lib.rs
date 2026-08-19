@@ -669,6 +669,24 @@ fn translate_impl(
     for (i, f) in defined.iter().enumerate() {
         name2idx.insert(f.name.clone(), i as u32 + base);
     }
+    // §varargs / old-C drift — each defined function's **own** lowered param types + variadicity,
+    // by name. Old-C empty-parens prototypes (`extern void f ();`) let every call site invent its
+    // own function type, so a site can disagree with the definition in arity, widths, AND
+    // variadicity (bash: `add_unwind_protect(fn, 0)` — the site types it `(ptr, i32, ...)`, the
+    // definition is plain `(ptr, ptr)`). The native ABI hides all of it (args share registers/
+    // slots); our lowering must follow the DEFINITION — its IR signature is what the call must
+    // match, its variadicity decides the va-area deposit, its widths drive arg coercion.
+    let mut def_sigs: HashMap<String, (Vec<ValType>, bool)> = HashMap::new();
+    for f in defined.iter() {
+        let params: Option<Vec<ValType>> = f
+            .parameters
+            .iter()
+            .map(|p| val_type(p.ty.as_ref()).ok())
+            .collect();
+        if let Some(params) = params {
+            def_sigs.insert(f.name.clone(), (params, f.is_var_arg));
+        }
+    }
     // LLVM **function aliases** (`@x = alias <ty>, ptr @y`): identical-code folding — both LLVM's
     // own pass and Rust's cross-crate dedup — collapses functions with byte-identical bodies into one
     // definition plus an alias to it (e.g. svm-ir's `VIntUnOp::index` and `VPMinMaxOp::index`, both
@@ -860,6 +878,7 @@ fn translate_impl(
             i as u32,
             &m.types,
             &name2idx,
+            &def_sigs,
             &globals,
             &tls_layout.off,
             tls_layout.block_size,
@@ -2596,6 +2615,7 @@ fn translate_func(
     bc_func_idx: u32,
     types: &Types,
     name2idx: &HashMap<String, u32>,
+    def_sigs: &HashMap<String, (Vec<ValType>, bool)>,
     globals: &HashMap<String, u64>,
     tls_off: &HashMap<String, u64>,
     tls_block_size: u64,
@@ -2703,6 +2723,7 @@ fn translate_func(
             &frame,
             frame_size,
             name2idx,
+            def_sigs,
             globals,
             tls_off,
             tls_block_size,
@@ -15495,6 +15516,10 @@ struct BlockCtx<'a> {
     frame_size: u64,
     /// Defined LLVM function name → its IR function index (for resolving a direct `call`).
     name2idx: &'a HashMap<String, u32>,
+    /// Defined function name → its DEFINITION's lowered param types + variadicity (§varargs /
+    /// old-C drift): a direct call follows the definition — arity split, va-area deposit, and
+    /// arg-width coercion — not the (possibly empty-parens-invented) call-site type.
+    def_sigs: &'a HashMap<String, (Vec<ValType>, bool)>,
     /// Global variable name → its window address (for resolving a `@global` reference).
     globals: &'a HashMap<String, u64>,
     /// Thread-local global name → its byte offset within the per-vCPU `vcpu.tls` block (NIM.md §3d
@@ -16151,6 +16176,37 @@ impl<'a> BlockCtx<'a> {
         self.operand(op)
     }
 
+    /// §varargs / old-C drift — coerce a direct-call fixed argument to the callee DEFINITION's
+    /// param width when the call-site type drifted (empty-parens prototypes let each site invent
+    /// its own). Integer widths zero-extend/wrap — deterministic where the native ABI leaves the
+    /// upper bits as junk; a float/vector drift has no ABI story and fails closed.
+    fn coerce_arg(
+        &mut self,
+        v: ValIdx,
+        a: &Operand,
+        want: Option<ValType>,
+        types: &Types,
+    ) -> Result<ValIdx, Error> {
+        let Some(want) = want else { return Ok(v) };
+        let have = val_type(a.get_type(types).as_ref())?;
+        Ok(match (have, want) {
+            (h, w) if h == w => v,
+            (ValType::I32, ValType::I64) => self.push(Inst::Convert {
+                op: ConvOp::ExtendI32U,
+                a: v,
+            }),
+            (ValType::I64, ValType::I32) => self.push(Inst::Convert {
+                op: ConvOp::WrapI64,
+                a: v,
+            }),
+            (h, w) => {
+                return unsup(format!(
+                    "call-site arg type {h:?} drifts from the definition's param {w:?}"
+                ))
+            }
+        })
+    }
+
     fn operand(&mut self, op: &Operand) -> Result<ValIdx, Error> {
         match op {
             Operand::LocalOperand { name, .. } => {
@@ -16378,6 +16434,7 @@ fn translate_block(
     frame: &HashMap<ValueId, u64>,
     frame_size: u64,
     name2idx: &HashMap<String, u32>,
+    def_sigs: &HashMap<String, (Vec<ValType>, bool)>,
     globals: &HashMap<String, u64>,
     tls_off: &HashMap<String, u64>,
     tls_block_size: u64,
@@ -16427,6 +16484,7 @@ fn translate_block(
         frame,
         frame_size,
         name2idx,
+        def_sigs,
         globals,
         tls_off,
         tls_block_size,
@@ -17809,13 +17867,34 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // slot (`callee_sp + 0`) for its `va_start`. The indirect callee (a defined `(...)` function
         // reached through a pointer) reads `va_start` from the same frame-0 slot, so the marshaling is
         // identical — only the call inst differs (`call_indirect` vs `call`), decided below.
-        let fixed = match c.function_ty.as_ref() {
-            Type::FuncType {
-                param_types,
-                is_var_arg: true,
-                ..
-            } => Some(param_types.len()),
-            _ => None,
+        // §varargs / old-C drift: a DIRECT call to a DEFINED function follows the definition's
+        // signature, not the call-site type — old-C empty-parens prototypes let each site invent
+        // its own (bash types `add_unwind_protect(fn, 0)` as `(ptr, i32, ...)` against a plain
+        // `(ptr, ptr)` definition). The definition decides the fixed/marshaled split, whether a
+        // va-area is deposited at all, and the widths the fixed args coerce to (the native ABI
+        // hides all three). An arity violation the ABI cannot paper over fails closed.
+        let def_sig = callee_name(c).and_then(|n| ctx.def_sigs.get(&n).cloned());
+        let (fixed, coerce_to): (Option<usize>, Option<Vec<ValType>>) = match def_sig {
+            Some((params, true)) => {
+                if params.len() > c.arguments.len() {
+                    return unsup("call passes fewer args than the definition's fixed params");
+                }
+                (Some(params.len()), Some(params))
+            }
+            Some((params, false)) => {
+                if params.len() != c.arguments.len() {
+                    return unsup("call arity differs from a non-variadic definition");
+                }
+                (None, Some(params))
+            }
+            None => match c.function_ty.as_ref() {
+                Type::FuncType {
+                    param_types,
+                    is_var_arg: true,
+                    ..
+                } => (Some(param_types.len()), None),
+                _ => (None, None),
+            },
         };
         if let Some(fixed) = fixed {
             let scratch_off = *ctx.frame.get(&VARARG_SCRATCH).ok_or_else(|| {
@@ -17849,12 +17928,16 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 offset: 0,
                 align: 0,
             });
-            for (a, _attrs) in c.arguments.iter().take(fixed) {
-                args.push(ctx.operand(a)?);
+            for (i, (a, _attrs)) in c.arguments.iter().take(fixed).enumerate() {
+                let v = ctx.operand(a)?;
+                let want = coerce_to.as_ref().and_then(|p| p.get(i)).copied();
+                args.push(ctx.coerce_arg(v, a, want, types)?);
             }
         } else {
-            for (a, _attrs) in &c.arguments {
-                args.push(ctx.operand(a)?);
+            for (i, (a, _attrs)) in c.arguments.iter().enumerate() {
+                let v = ctx.operand(a)?;
+                let want = coerce_to.as_ref().and_then(|p| p.get(i)).copied();
+                args.push(ctx.coerce_arg(v, a, want, types)?);
             }
         }
         // A direct call (named, defined function) lowers to `call <idx>`; an indirect call (through

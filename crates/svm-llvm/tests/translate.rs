@@ -12109,3 +12109,124 @@ entry:
         other => panic!("unexpected JIT outcome {other:?}"),
     }
 }
+
+// --- GNU bash (#802 slice 2) — the whole-shell bring-up gate + the two gaps it surfaced ---------
+
+/// **Max-alignment literal** — the first on-ramp gap bash surfaced: clang stamps
+/// `align 4294967296` (2^32, one past `u32`) on a deliberately-trapping null store (bash's
+/// `programming_error` path emits `store volatile i64 …, ptr null, align 4294967296`). The
+/// alignment of an access that can only trap carries no meaning, so the `.ll` parser saturates
+/// rather than refusing the whole module. Pinned on a benign global store.
+#[test]
+fn align_u32_max_saturates() {
+    let src = "\
+@g = global i64 0
+define i64 @run() {
+entry:
+  store i64 7, ptr @g, align 4294967296
+  %r = load i64, ptr @g, align 8
+  ret i64 %r
+}
+";
+    let t = svm_llvm::translate_ll_str(src).expect("translate max-align");
+    let module = t.module;
+    svm_verify::verify_module(&module).expect("verify max-align");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let interp = svm_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
+    assert_eq!(interp, vec![Value::I64(7)], "the store landed");
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&module, 0, &slots).expect("jit run") {
+        JitOutcome::Returned(s) => assert_eq!(s[0], 7, "JIT agrees (interp said {interp:?})"),
+        other => panic!("unexpected JIT outcome {other:?}"),
+    }
+}
+
+/// **Old-C call-site drift** — the second gap bash surfaced: an empty-parens prototype
+/// (`extern void f ();`) lets every call site invent its own function type, so a site can drift
+/// from the definition in arity, widths, AND variadicity — bash calls the plain `(ptr, ptr)`
+/// definition `add_unwind_protect` through a `(ptr, i32, ...)` site type. The native ABI hides
+/// the drift (args share registers); the lowering follows the DEFINITION: the site's variadic
+/// shape is dropped for the non-variadic callee (no va-area deposit into the callee's frame) and
+/// the `i32` argument zero-extends to the definition's pointer width.
+#[test]
+fn old_c_call_site_drift_follows_the_definition() {
+    let src = "\
+@sink = global i64 1
+define void @f(ptr %a, ptr %b) {
+entry:
+  %v = ptrtoint ptr %b to i64
+  store i64 %v, ptr %a, align 8
+  ret void
+}
+define i64 @run() {
+entry:
+  call void (ptr, i32, ...) @f(ptr @sink, i32 42)
+  %r = load i64, ptr @sink, align 8
+  ret i64 %r
+}
+";
+    let t = svm_llvm::translate_ll_str(src).expect("translate old-C drift");
+    let run_idx = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == "run")
+        .expect("run exported")
+        .1;
+    let module = t.module;
+    svm_verify::verify_module(&module).expect("verify old-C drift");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let interp = svm_interp::run(&module, run_idx, &full, &mut fuel).expect("interp run");
+    assert_eq!(
+        interp,
+        vec![Value::I64(42)],
+        "the i32 arg reached the ptr param zero-extended"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&module, run_idx, &slots).expect("jit run") {
+        JitOutcome::Returned(s) => assert_eq!(s[0], 42, "JIT agrees (interp said {interp:?})"),
+        other => panic!("unexpected JIT outcome {other:?}"),
+    }
+}
+
+/// Path to `demos/bash`.
+fn bash_demo_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../svm-run/demos/bash")
+}
+
+/// **▶ GNU bash translates + verifies** (#802 slice 2 — the whole-shell gate). Runs the faithful
+/// `demos/bash/build_bitcode.sh` (fetch bash 5.2.21 → configure the bring-up config → native
+/// oracle → 152 per-TU bitcodes with each Makefile's own flags → llvm-link + shim + waist) and
+/// translates the ~7.8 MB module through the on-ramp with trap-stubbed unreached externs:
+/// 1716 functions, verified. The RUN gate (the stdio/OS wiring) is slice 3 — a trial run today
+/// reaches deep into `shell.c` startup before the unwired `FILE*` surface stops it.
+/// `#[ignore]`d for wall-clock only (fetch + configure + a full native build — minutes); skips
+/// loudly (never fails) when clang/curl/make are unavailable — grep for `skipping bash`.
+#[test]
+#[ignore = "capstone: fetches + builds all of bash (minutes); run with --ignored"]
+fn demo_bash_translates_and_verifies() {
+    let script = bash_demo_dir().join("build_bitcode.sh");
+    let linked = std::env::temp_dir().join("svm_bash_cache/bash_linked.ll");
+    let ok = Command::new("bash")
+        .arg(&script)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok || !linked.exists() {
+        eprintln!("note: skipping bash (build_bitcode.sh failed — offline or no clang/make?)");
+        return;
+    }
+    let opts = svm_llvm::TranslateOptions {
+        stub_unresolved_externs: true,
+        ..Default::default()
+    };
+    let t = svm_llvm::translate_ll_path_with_options(linked.to_str().unwrap(), opts)
+        .expect("bash translates");
+    assert!(
+        t.module.funcs.len() > 1500,
+        "the whole shell translated ({} funcs)",
+        t.module.funcs.len()
+    );
+    svm_verify::verify_module(&t.module).expect("bash verifies");
+}
