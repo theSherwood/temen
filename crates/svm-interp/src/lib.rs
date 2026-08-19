@@ -13288,6 +13288,26 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         return Err(Trap::Malformed); // the setjmp frame has already returned
                     }
                     frames.truncate(point.depth);
+                    // #802 — a longjmp that unwinds OUT of an injected signal handler leaves the
+                    // handler exactly like a return does: pop each crossed guard entry and fire
+                    // `handler_returned()` per crossed handler, so the personality restores its
+                    // block-during-handler mask and a LATER instance of the signal can deliver.
+                    // (bash's whole interrupt model: `throw_to_top_level` longjmps out of
+                    // `sigint_sighandler` — without this, one ^C silences SIGINT for the session.)
+                    // Guard entries record the post-push frame count, so `e > frames.len()` after
+                    // the truncate is exactly the crossed handlers; a longjmp WITHIN a handler
+                    // (its setjmp deeper than the injection) crosses nothing and is untouched.
+                    while sig_handler_stack.last().is_some_and(|&e| e > frames.len()) {
+                        sig_handler_stack.pop();
+                        if let Some((_, source)) = &signal_poll {
+                            source.handler_returned();
+                        }
+                        // The longjmp also abandoned the op the delivery interrupted (rewound,
+                        // never re-run) — its pending park-interrupt flag must die with it, or
+                        // the NEXT blocking op spuriously returns `-EINTR` for a signal already
+                        // handled (POSIX: EINTR is per-interrupted-call).
+                        host.lock_unpoisoned().take_sig_interrupt();
+                    }
                     let f = &mut frames[point.depth - 1];
                     f.block = point.block;
                     f.inst = point.inst;
