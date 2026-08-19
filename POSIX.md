@@ -78,6 +78,18 @@ shell's IR is identical; only the resolver's target differs. So the durable deci
 **pin the ABI** — the function list and each function's shape — and bind it host-side now,
 guest-serve the same ABI later.
 
+**The ABI is machine-checked at bind (#801): the grant publishes a vtable.** The personality's
+`HostFn` grant carries an offer-style op vtable (`names` + `sigs` per op — the manifest names
+verbatim, the signatures chibicc's emission produces: the dummy handle is the call's handle
+operand, not a signature param). An exec'd or spawned `__px_`-linked image binds its manifest
+through the same §3.5 coverage walk offers use — name-keyed within the explicit grant,
+signature-equal or refused at bind (`execve` → `-EINVAL`, never a runtime misdispatch). The
+personality itself moves **verbatim** across `execve` (same process: same `Proc`, fds, env — the
+exec carries the host-proc entries, exit hooks, and signal doors with the TaskId), and the vtable
+rides `fork` and the spawn re-grant, so every process shape binds the same way. This also makes
+the personality **interposable**: a parent serving the same names with its own offer binds
+none-the-wiser — the "one ABI, two bindings" below, real by construction.
+
 **The handle binds by name too — no powerbox slot (PROCESS.md S15).** The personality is a
 per-domain **singleton**, so its handle is supplied by the resolver, not threaded by the
 guest: each libc import's handle operand is a `ConstI32` **placeholder** patched at resolve

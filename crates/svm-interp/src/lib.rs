@@ -11994,9 +11994,37 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         Arc::clone(&hg.sig_armed),
                                     );
                                 }
-                                ch.bind_child_manifest(&cm.imports, &cm.types)
-                                    .ok()
-                                    .map(|()| (ch, ci, ca, child_size))
+                                // #801 — exec is the SAME PROCESS, so the host-served personality
+                                // moves verbatim (same handler over the same Proc — fds, pid,
+                                // env survive exec, POSIX), never through the spawn re-grant
+                                // (which fork-clones a fresh anonymous process). Each carried
+                                // entry re-grants a handle in the new powerbox, and a published
+                                // vtable registers its op names in the new image's directory so
+                                // a `__px_`-linked manifest binds below. Restored on a bind
+                                // refusal: a failed exec leaves the caller running with its
+                                // personality intact (POSIX: execve returns only on failure).
+                                let moved = std::mem::take(&mut hg.host_procs);
+                                let nmoved = moved.len();
+                                for e in moved {
+                                    let vt = e.vtable.clone();
+                                    let idx = ch.host_procs.len() as u32;
+                                    ch.host_procs.push(e);
+                                    let nh = ch.grant(cap_id::HOST_PROC, Binding::HostProc(idx));
+                                    if let Some(vt) = vt {
+                                        for name in vt.0.iter() {
+                                            ch.register_cap_name(name, nh);
+                                        }
+                                    }
+                                }
+                                match ch.bind_child_manifest(&cm.imports, &cm.types) {
+                                    Ok(()) => Some((ch, ci, ca, child_size)),
+                                    Err(_) => {
+                                        // Give the entries back: the exec refuses cleanly.
+                                        let n = ch.host_procs.len();
+                                        hg.host_procs = ch.host_procs.drain(n - nmoved..).collect();
+                                        None
+                                    }
+                                }
                             })
                     } else {
                         None
@@ -16250,7 +16278,17 @@ struct HostProcEntry {
     /// §4b — whether the handler was registered mmap-capable
     /// ([`Host::grant_host_proc_region`]) and so receives `Some(minter)` on each call.
     mints: bool,
+    /// #801 — the provider's published **op vtable** (`(names, sigs)`, the offer-entry shape for a
+    /// host-served provider): what lets an image's named imports bind to this handler through the
+    /// SAME §3.5 coverage walk offers use — name-keyed within this explicit grant, signatures
+    /// checked at bind (the POSIX.md §4 ABI pin, machine-checked). `None` = an opaque handler
+    /// (no in-loop manifest binding; the embedder's `set_import_bindings` remains its only route).
+    vtable: Option<HostFnVtable>,
 }
+
+/// #801 — a host-served provider's published op list: parallel `names`/`sigs`, indexed by op
+/// number. The `Arc` travels with the entry across exec's verbatim carry and the spawn re-grant.
+type HostFnVtable = Arc<(Vec<String>, Vec<FuncType>)>;
 
 /// A **wired interface offer**'s host-side state (IMPORTS.md §3.2), indexed by the id a
 /// [`Binding::Offer`] carries: the offering module's functions, the offer's per-op funcidx
@@ -17561,6 +17599,9 @@ impl Host {
                     handler: ProcHandler::Sync(forked.handler),
                     fork: Some(forked.refork.unwrap_or_else(|| Arc::clone(factory))),
                     mints: e.mints,
+                    // #801 — the vtable rides the fork: a twin can exec a `__px_`-linked
+                    // command and have its manifest bind against the twin's own personality.
+                    vtable: e.vtable.clone(),
                 }
             })
             .collect();
@@ -17755,6 +17796,31 @@ impl Host {
                             }
                             None => return Err(i as u32),
                         },
+                        None if rebindable => {
+                            bindings.push(BoundImport::rebindable(0, 0, None));
+                            remaps.push(None);
+                            continue;
+                        }
+                        None => return Err(i as u32),
+                    }
+                }
+                // #801 — the named grant may be a **host-served provider with a published
+                // vtable** (the POSIX personality): coverage-match the requirement against its
+                // `(names, sigs)` exactly as against an offer's — name-keyed within this explicit
+                // grant, signatures checked — and bind `(HOST_PROC, remap[0], h)`. This is how a
+                // `__px_`-linked command's manifest binds during the in-loop exec/spawn, with no
+                // external resolver: the op knowledge travels WITH the grant.
+                if let Some(vt) = self.host_proc_vtable(h) {
+                    match coverage_remap(&req_names, &req_sigs, &vt.0, &vt.1).and_then(|remap| {
+                        let b =
+                            self.bound_import_for_impl(h, remap[0], &req_sigs[0], rebindable)?;
+                        Some((b, remap))
+                    }) {
+                        Some((b, remap)) => {
+                            bindings.push(b);
+                            remaps.push(Some(remap));
+                            continue;
+                        }
                         None if rebindable => {
                             bindings.push(BoundImport::rebindable(0, 0, None));
                             remaps.push(None);
@@ -18943,6 +19009,7 @@ impl Host {
             handler: ProcHandler::Sync(f),
             fork: None,
             mints: false,
+            vtable: None,
         })
     }
 
@@ -18960,6 +19027,7 @@ impl Host {
             handler: ProcHandler::Offloadable(f),
             fork: None,
             mints: false,
+            vtable: None,
         })
     }
 
@@ -18976,11 +19044,36 @@ impl Host {
     /// state, so [`Host::fork_powerbox`] can carry this capability into a `fork()` twin. The runtime
     /// never inspects the closure's state — forking it is the provider's job, expressed by this
     /// factory (the Rust face of the C embedder's `fork_ctx(parent_ctx) -> child_ctx`).
+    /// #801 — publish a host-served provider's **op vtable** on an already-granted `HostProc`
+    /// handle: parallel `names`/`sigs` indexed by op number (the offer-entry shape). With a vtable,
+    /// an image's named imports bind to this handler through the same §3.5 coverage walk offers
+    /// use — name-keyed within this explicit grant, signature-checked at bind. No-op on a handle
+    /// that is not a live `HostProc`.
+    pub fn set_host_proc_vtable(&mut self, handle: i32, names: Vec<String>, sigs: Vec<FuncType>) {
+        if let Ok(Binding::HostProc(idx)) = self.resolve(handle, cap_id::HOST_PROC) {
+            if let Some(e) = self.host_procs.get_mut(idx as usize) {
+                e.vtable = Some(Arc::new((names, sigs)));
+            }
+        }
+    }
+
+    /// #801 — the vtable published on `handle`'s `HostProc` entry, if any.
+    fn host_proc_vtable(&self, handle: i32) -> Option<HostFnVtable> {
+        match self.resolve(handle, cap_id::HOST_PROC) {
+            Ok(Binding::HostProc(idx)) => self
+                .host_procs
+                .get(idx as usize)
+                .and_then(|e| e.vtable.clone()),
+            _ => None,
+        }
+    }
+
     pub fn grant_host_proc_forkable(&mut self, f: HostProc, fork: HostProcFork) -> i32 {
         self.grant_host_proc_entry(HostProcEntry {
             handler: ProcHandler::Sync(f),
             fork: Some(fork),
             mints: false,
+            vtable: None,
         })
     }
 
@@ -18995,6 +19088,7 @@ impl Host {
             handler: ProcHandler::Sync(f),
             fork: None,
             mints: true,
+            vtable: None,
         })
     }
 
@@ -19692,6 +19786,20 @@ impl Host {
         declared: &FuncType,
         rebindable: bool,
     ) -> Option<BoundImport> {
+        // #801 — a host-served provider with a published vtable binds exactly like an offer:
+        // op within the list, declared signature equal to the published one, slot bound
+        // `(HOST_PROC, op, handle)`. A vtable-less HostProc stays unbindable here (opaque).
+        if let Some(vt) = self.host_proc_vtable(handle) {
+            let sig = vt.1.get(op as usize)?;
+            if sig != declared {
+                return None;
+            }
+            return Some(if rebindable {
+                BoundImport::rebindable(cap_id::HOST_PROC, op, Some(handle))
+            } else {
+                BoundImport::required(cap_id::HOST_PROC, op, handle)
+            });
+        }
         let entry = self.resolve_offer(handle).ok()?;
         let sig = entry.sigs.get(op as usize)?;
         if sig != declared {
@@ -20624,6 +20732,10 @@ impl Host {
         // refuses (`None`, fail-closed); such a cap the parent keeps. This is the deep-copy path
         // `resolve_copyable` defers for `HostProc`.
         if let Ok(Binding::HostProc(idx)) = self.resolve(handle, cap_id::HOST_PROC) {
+            let vt = self
+                .host_procs
+                .get(idx as usize)
+                .and_then(|e| e.vtable.clone());
             return self
                 .host_procs
                 .get(idx as usize)
@@ -20639,10 +20751,24 @@ impl Host {
                     if let Some(x) = forked.exit {
                         child.exit_hooks.push(x);
                     }
-                    child.grant_host_proc_forkable(
+                    let h = child.grant_host_proc_forkable(
                         forked.handler,
                         forked.refork.unwrap_or_else(|| Arc::clone(&factory)),
-                    )
+                    );
+                    // #801 — the vtable rides the re-grant, and its op names enter the child's
+                    // directory: a spawned `__px_`-linked child binds its manifest in-loop, same
+                    // as an exec'd one.
+                    if let Some(vt) = vt {
+                        for name in vt.0.iter() {
+                            child.register_cap_name(name, h);
+                        }
+                        if let Ok(Binding::HostProc(ni)) = child.resolve(h, cap_id::HOST_PROC) {
+                            if let Some(e) = child.host_procs.get_mut(ni as usize) {
+                                e.vtable = Some(vt);
+                            }
+                        }
+                    }
+                    h
                 });
         }
         // FORK.md §8.6 — a **module** grant: an immutable instantiable artifact. Re-granting shares it
