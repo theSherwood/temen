@@ -135,7 +135,7 @@ compiles under `guard-page-stacks`). Fix both with a one-word edit — add `guar
       - run: cargo test -p svm-jit --features stack-check,guard-page-stacks --test stack_guard_fuzz
 ```
 
-The arena backend stays covered by `cargo test -p svm-jit --features stack-check,arena-stacks` (same
+The arena backend stays covered by `cargo test -p svm-jit --features stack-check` (same
 job), the `stack-guard-cross-os` matrix, and — since arena is the default — the entire
 `cargo test --workspace` gating run.
 

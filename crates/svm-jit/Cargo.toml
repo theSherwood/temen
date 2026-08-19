@@ -9,9 +9,6 @@ publish = false
 [features]
 # Passthrough to svm-fiber's ASan fiber-switch annotations (the sanitizer job).
 asan = ["svm-fiber/asan"]
-# The arena stack allocator is now svm-fiber's DEFAULT backend; this passthrough is a retained no-op so
-# existing `--features arena-stacks` invocations keep working.
-arena-stacks = ["svm-fiber/arena-stacks"]
 # Opt svm-fiber back to the guard-paged control-stack backend (rollback, or the guard-page overflow
 # oracle the `stack_guard_fuzz` test needs — run it with `--features guard-page-stacks`).
 guard-page-stacks = ["svm-fiber/guard-page-stacks"]
