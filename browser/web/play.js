@@ -919,12 +919,15 @@ write(stdout, greet("the SVM"))
   },
   'svm-leng: translate real nimony Leng → SVM IR (self-host)': {
     kind: 'module',
-    jit: false, // the ~280-func translator module folds to the tree-walker (the native JIT declines it too); the interp run is ~200ms
+    jit: true, // #1011: `compile_jit(Batch)` is WasmDriven with ~281/282 funcs emitted — the whole
+    // translator runs as emitted wasm (the old "folds to the tree-walker" note conflated this with the
+    // *native* Cranelift JIT's 64 MiB window cap, which the wasm-JIT doesn't have). Defaults to the
+    // wasm-JIT tier; a decline/trap falls back to the interpreter, and "Prove interp ≡ JIT" checks parity.
     editable: true,
     lang: 'svm',
     url: './assets/svm-leng.svmb',
     mode: 'io',
-    desc: "The **leng self-host capstone** (NIM.md §3e): svm-leng — the Leng→SVM-IR translator, itself compiled to a verified SVM module through the LLVM on-ramp — **running client-side in the sandbox**. The editor holds a **real hexer Leng file** (verbatim `hexer c` output from Nim's `system/stringimpl` — string types, `=wasMoved`, ARC). Click Run: the page pipes it to `svm-leng.svmb` on stdin, the translator parses the NIF and emits **SVM IR text** on stdout (shown below), and the run's exit code is the result (0 = ok, 2 = an unsupported/malformed Leng construct). The emitted IR is **byte-identical to running svm-leng natively** (gated in CI by `leng_selfhost_asset.rs`). Edit the Leng to translate your own — the same real translator, no server, all in your browser, on the SVM.",
+    desc: "The **leng self-host capstone** (NIM.md §3e): svm-leng — the Leng→SVM-IR translator, itself compiled to a verified SVM module through the LLVM on-ramp — **running client-side in the sandbox**. The editor holds a **real hexer Leng file** (verbatim `hexer c` output from Nim's `system/stringimpl` — string types, `=wasMoved`, ARC). Click Run: the page pipes it to `svm-leng.svmb` on stdin, the translator parses the NIF and emits **SVM IR text** on stdout (shown below), and the run's exit code is the result (0 = ok, 2 = an unsupported/malformed Leng construct). The emitted IR is **byte-identical to running svm-leng natively** (gated in CI by `leng_selfhost_asset.rs`). By default the translator runs on the **wasm-JIT tier** (the whole `_start` emitted to wasm — #1011); untick *wasm-JIT* to compare the interpreter, or *Prove interp ≡ JIT* to check they agree byte-for-byte. Edit the Leng to translate your own — the same real translator, no server, all in your browser, on the SVM.",
     src: `(stmts
  (type :string.0. . (object . (fld :bytes.0 . (u 64)) (fld :more.0 . (ptr LongString.0.))))
  (type :LongString.0. . (object . (fld :fullLen.0 . (i +64)) (fld :rc.0 . (i +64)) (fld :capImpl.0 . (i +64)) (fld :data.0 . (uarray (c 8)))))
