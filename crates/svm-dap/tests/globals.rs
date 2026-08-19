@@ -6,20 +6,8 @@
 
 use svm_dap::{DapServer, Json};
 
-fn req(seq: i64, command: &str, args: Json) -> Json {
-    Json::obj(vec![
-        ("seq", Json::i(seq)),
-        ("type", Json::s("request")),
-        ("command", Json::s(command)),
-        ("arguments", args),
-    ])
-}
-
-fn response(msgs: &[Json]) -> &Json {
-    msgs.iter()
-        .find(|m| m.get("type").and_then(|t| t.as_str()) == Some("response"))
-        .expect("a response")
-}
+mod support;
+use support::{req, response};
 
 /// A global `int counter` at window address 8, initialized to 42 (little-endian `2a 00 00 00`) by a
 /// data segment, plus a reserved-name global `__hidden` at address 12 initialized to 7. The entry

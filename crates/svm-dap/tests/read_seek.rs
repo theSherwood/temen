@@ -5,6 +5,9 @@
 
 use svm_dap::{DapServer, Json};
 
+mod support;
+use support::{req, response};
+
 /// Loads the i64 at window address 8 and returns it (the slice-8 fixture).
 const LOAD_CELL: &str = r#"memory 16
 func () -> (i64) {
@@ -37,21 +40,6 @@ block 2 (vr: i64) {
   }
 }
 "#;
-
-fn req(seq: i64, command: &str, args: Json) -> Json {
-    Json::obj(vec![
-        ("seq", Json::i(seq)),
-        ("type", Json::s("request")),
-        ("command", Json::s(command)),
-        ("arguments", args),
-    ])
-}
-
-fn response(msgs: &[Json]) -> &Json {
-    msgs.iter()
-        .find(|m| m.get("type").and_then(|t| t.as_str()) == Some("response"))
-        .expect("a response")
-}
 
 fn launch(s: &mut DapServer, src: &str, engine: Option<&str>) {
     s.handle(&req(1, "initialize", Json::obj(vec![])));
