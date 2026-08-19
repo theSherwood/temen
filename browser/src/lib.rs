@@ -1074,7 +1074,23 @@ const PAR_JIT_TABLE_LOG2: u8 = 4;
 /// `2^10 = 1024` dispatch-table slots for the on-ramp `Jit` grant — matches svm-run's
 /// `CLI_JIT_TABLE_LOG2`. A self-hosted guest (the JACL compiler) binds a staged unit's `Slot` imports
 /// to its own functions by index, so the table must cover the host program's function count (~800).
+/// This is the **minimum**: a guest with more functions needs a bigger table (see
+/// [`tierup_table_log2`]).
 const ONRAMP_JIT_TABLE_LOG2: u8 = 10;
+
+/// The B2 shared dispatch-table log2 for a guest with `n_funcs` functions (#1009 Mechanism 1): at
+/// least [`ONRAMP_JIT_TABLE_LOG2`], but grown so `1 << log2` covers every function — exactly the
+/// size the interpreter's dispatch table takes (`bytecode::SharedSlots`: `max(1 << log2,
+/// n.next_power_of_two())`). A **fixed** `1 << ONRAMP_JIT_TABLE_LOG2` under-sized the emitted table
+/// for a guest with more than 1024 functions (QuickJS 1185, SQLite 1445, Tcl 2669), so a high-index
+/// `call_indirect` masked `idx & 1023` in the emitted leaf but `idx & (2*n-1)` on the interpreter —
+/// a wrong slot (→ "null function / signature mismatch", or a wrong-but-typed function). Threaded
+/// through the emit, the engine table, the slot mirror, the unit emitter, and the driver accessor so
+/// all four agree on `1 << log2`.
+fn tierup_table_log2(n_funcs: usize) -> u8 {
+    let ceil = (n_funcs.max(1) as u64).next_power_of_two().trailing_zeros() as u8;
+    ONRAMP_JIT_TABLE_LOG2.max(ceil)
+}
 
 /// Build the **shared powerbox** for a §22-JIT run: grant the `Jit` cap (16-slot table) on a fresh
 /// `Host`, host-compile [`JIT_SERVICE`] into it, then leak it and publish the pointer for every Worker.
@@ -6164,6 +6180,37 @@ mod xcall_slot_tests {
             assert_eq!(format!("{got:?}"), format!("{v:?}"), "round-trip at {off}");
         }
     }
+
+    /// #1009 Mechanism 1: the emitted B2 dispatch table's size (`1 << tierup_table_log2(n)`) must
+    /// equal the interpreter's `bytecode::SharedSlots` size (`max(1 << ONRAMP_JIT_TABLE_LOG2,
+    /// n.next_power_of_two())`) for **every** guest — the two tiers mask `call_indirect` against the
+    /// same slot count, so a high-index dispatch reaches the same function on both. A fixed
+    /// `1 << ONRAMP_JIT_TABLE_LOG2` under-sized the emitted table for the >1024-function cards
+    /// (QuickJS 1185, SQLite 1445, Tcl 2669), so the emitted leaf wrapped a wrong slot.
+    #[test]
+    fn tierup_table_matches_the_interpreter_shared_slots_size() {
+        let floor = 1usize << ONRAMP_JIT_TABLE_LOG2;
+        // The interpreter's `SharedSlots::new` sizing, reproduced (the shared-table contract).
+        let shared_slots = |n: usize| floor.max(n.next_power_of_two()).max(1);
+        // Representative counts: the card function counts plus the boundary and the degenerate case.
+        for n in [1usize, 693, 1024, 1025, 1185, 1445, 2669, 4096] {
+            assert_eq!(
+                1usize << tierup_table_log2(n),
+                shared_slots(n),
+                "emitted table vs interpreter table for n={n} functions"
+            );
+        }
+        // Below the floor the table stays at the minimum; above it, it grows to cover every func.
+        assert_eq!(
+            tierup_table_log2(1),
+            ONRAMP_JIT_TABLE_LOG2,
+            "floor holds for tiny guests"
+        );
+        assert!(
+            1usize << tierup_table_log2(1445) >= 1445,
+            "the table covers every function of a >1024-func guest"
+        );
+    }
 }
 
 // ---- the wasm-JIT reactor (Doom's whole `tick` on emitted wasm) — BROWSER.md §"wasm-JIT tier" 5d ---
@@ -8454,6 +8501,12 @@ pub const TIERUP_RUN_JIT_INVOKE: i32 = 3;
 static TIERUP_UNIT_SHARED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static TIERUP_UNIT_WIN_LOG2: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// #1009 M1: the run's effective B2 dispatch-table log2 ([`tierup_table_log2`] of the guest's
+/// function count) — a unit and the main module must mask `call_indirect` against the **same**
+/// shared table, so the unit emitter uses the guest's size, not its own. Read by the unit emitter
+/// and [`svm_onramp_tierup_table_log2`] (the driver's table size).
+static TIERUP_UNIT_TABLE_LOG2: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(ONRAMP_JIT_TABLE_LOG2);
 
 /// The wasm emitter the single-shot pump installs for a `vm_jit_*`-importing guest (#835/#846):
 /// emit a validated unit whole-module in **Model B2** shape (`compile_module_b2` — its
@@ -8472,7 +8525,9 @@ fn onramp_tierup_unit_emitter(blob: &[u8]) -> Option<Vec<u8>> {
         mc.size_log2 = mc.size_log2.max(win_log2);
     }
     let shared = TIERUP_UNIT_SHARED.load(std::sync::atomic::Ordering::Relaxed);
-    svm_wasm_jit::compile_module_b2(&m, shared, ONRAMP_JIT_TABLE_LOG2 as u32).ok()
+    // #1009 M1: mask against the run's shared-table size (the guest's), not `ONRAMP_JIT_TABLE_LOG2`.
+    let table_log2 = TIERUP_UNIT_TABLE_LOG2.load(std::sync::atomic::Ordering::Relaxed);
+    svm_wasm_jit::compile_module_b2(&m, shared, table_log2 as u32).ok()
 }
 
 struct TierupRun {
@@ -8603,11 +8658,16 @@ pub extern "C" fn svm_onramp_tierup_open(
             && f.results.iter().all(scalar)
             && f.params.len().max(f.results.len()) <= max_slots
     });
+    // #1009 M1: size the shared table to the guest, not a fixed `1 << ONRAMP_JIT_TABLE_LOG2` — the
+    // interpreter's table grows to `funcs.next_power_of_two()`, so a smaller emitted mask would send
+    // a high-index `call_indirect` to a different slot. One value drives the emit, the engine table,
+    // the slot mirror, the unit emitter, and the driver's table build.
+    let table_log2 = tierup_table_log2(m.funcs.len());
     // #880: emit the main module over the **shared reserved table** — `call_indirect`-bearing
     // functions tier up (the language-runtime dispatch-loop shape), their indirect calls reaching
     // installed units natively (old→new) and interpreter-resident targets through the live bounce.
     let emitted_res = if all_shimmable {
-        svm_wasm_jit::compile_module_tierup_b2(&emit_m, shared != 0, ONRAMP_JIT_TABLE_LOG2 as u32)
+        svm_wasm_jit::compile_module_tierup_b2(&emit_m, shared != 0, table_log2 as u32)
     } else {
         svm_wasm_jit::compile_module_tierup(&emit_m, shared != 0)
     };
@@ -8630,11 +8690,10 @@ pub extern "C" fn svm_onramp_tierup_open(
         set(STATUS_UNSUPPORTED);
         return -STATUS_UNSUPPORTED;
     }
-    // The engine's dispatch table must match the emitted `call_indirect` mask
-    // (`1 << ONRAMP_JIT_TABLE_LOG2`) — a natural-size table would both number install slots
-    // differently and wrap wild indices differently (#846/#880). Sized for every pump guest.
-    let Some(prog) = bytecode::VcpuProgram::compile_with_jit_table(&m, ONRAMP_JIT_TABLE_LOG2)
-    else {
+    // The engine's dispatch table must match the emitted `call_indirect` mask (`1 << table_log2`) —
+    // a natural-size table would both number install slots differently and wrap wild indices
+    // differently (#846/#880). Sized to the guest (#1009 M1) so the two tiers wrap identically.
+    let Some(prog) = bytecode::VcpuProgram::compile_with_jit_table(&m, table_log2) else {
         set(STATUS_UNSUPPORTED);
         return -STATUS_UNSUPPORTED;
     };
@@ -8656,6 +8715,7 @@ pub extern "C" fn svm_onramp_tierup_open(
     // `fn`s) — stored for every open, since shims serve non-jit guests' emitted leaves too (#880).
     TIERUP_UNIT_SHARED.store(shared != 0, std::sync::atomic::Ordering::Relaxed);
     TIERUP_UNIT_WIN_LOG2.store(win_log2, std::sync::atomic::Ordering::Relaxed);
+    TIERUP_UNIT_TABLE_LOG2.store(table_log2, std::sync::atomic::Ordering::Relaxed);
     // #835: arm the §22 unit wasm-emitter for a `vm_jit_*` importer (`grant_onramp_caps` granted
     // the `Jit` cap + validator). Gated on the same shimmable-signature bound as the shared-table
     // emit above — a unit's dispatch depends on shims covering every interpreter-resident slot.
@@ -8695,7 +8755,7 @@ pub extern "C" fn svm_onramp_tierup_open(
             jit_wasm: None,
             jit_param_types: Vec::new(),
             jit_result_types: Vec::new(),
-            slot_codes: vec![-1; 1usize << ONRAMP_JIT_TABLE_LOG2],
+            slot_codes: vec![-1; 1usize << table_log2],
             sigs: m
                 .funcs
                 .iter()
@@ -9052,11 +9112,13 @@ pub extern "C" fn svm_onramp_tierup_mapped_now() -> i64 {
         .map_or(0, |s| s.vcpu.window_scalar_extent() as i64)
 }
 
-/// The dispatch-table size (log2) a `vm_jit_*` run's table is built with — the JS host sizes its
-/// `WebAssembly.Table` to `1 << this` (the emitted `call_indirect` mask).
+/// The dispatch-table size (log2) this run's table is built with — the JS host sizes its
+/// `WebAssembly.Table` to `1 << this` (the emitted `call_indirect` mask). #1009 M1: this is the
+/// guest's effective size ([`tierup_table_log2`]), not the fixed minimum, so the driver's table
+/// covers every function the emitted dispatch can reach.
 #[no_mangle]
 pub extern "C" fn svm_onramp_tierup_table_log2() -> u32 {
-    ONRAMP_JIT_TABLE_LOG2 as u32
+    TIERUP_UNIT_TABLE_LOG2.load(std::sync::atomic::Ordering::Relaxed) as u32
 }
 
 /// The guest program's function count — the dispatch table's **natural prefix** (`slot i < nfuncs`
@@ -9292,8 +9354,11 @@ pub extern "C" fn svm_coop_open(
             && f.results.iter().all(scalar)
             && f.params.len().max(f.results.len()) <= max_slots
     });
+    // #1009 M1: size the shared table to the guest (see `tierup_table_log2`), consistently across
+    // the emit, the host's domain table, the slot mirror, the unit emitter, and the driver.
+    let table_log2 = tierup_table_log2(m.funcs.len());
     let emitted_res = if all_shimmable {
-        svm_wasm_jit::compile_module_tierup_b2(&emit_m, shared != 0, ONRAMP_JIT_TABLE_LOG2 as u32)
+        svm_wasm_jit::compile_module_tierup_b2(&emit_m, shared != 0, table_log2 as u32)
     } else {
         svm_wasm_jit::compile_module_tierup(&emit_m, shared != 0)
     };
@@ -9334,13 +9399,14 @@ pub extern "C" fn svm_coop_open(
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
     };
     let (frame, _keys) = grant_onramp_caps(&mut host, &m, None);
-    // #926 slice 2f: a B2 main module masks `call_indirect` against `1 << ONRAMP_JIT_TABLE_LOG2`, so the
-    // engine's dispatch table must be the same size — a natural-size table would number install slots
-    // and wrap wild indices differently (#846/#880). `CoopRun` builds the domain with
-    // `host.jit_table_log2()`, so force it here (a `vm_jit_*` importer's `grant_onramp_caps` already set
-    // it to this floor; `set_jit_table_log2` takes the max, so this is idempotent for that case).
+    // #926 slice 2f: a B2 main module masks `call_indirect` against `1 << table_log2` (#1009 M1: the
+    // guest's effective size), so the engine's dispatch table must be the same size — a natural-size
+    // table would number install slots and wrap wild indices differently (#846/#880). `CoopRun` builds
+    // the domain with `host.jit_table_log2()`, so force it here (a `vm_jit_*` importer's
+    // `grant_onramp_caps` already set it to the floor; `set_jit_table_log2` takes the max, so this
+    // raises it to the guest's size).
     if all_shimmable {
-        host.set_jit_table_log2(ONRAMP_JIT_TABLE_LOG2);
+        host.set_jit_table_log2(table_log2);
     }
     // #926 slice 2e/2f: arm the §22 unit wasm-emitter for a `vm_jit_*` importer so its runtime-compiled
     // units run emitted (the pump then surfaces a `CoopEvent::JitInvoke` when a unit has emitted wasm;
@@ -9351,6 +9417,7 @@ pub extern "C" fn svm_coop_open(
     // Reuses the single-vCPU emitter and its shared parameters — only one driver runs at a time.
     TIERUP_UNIT_SHARED.store(shared != 0, std::sync::atomic::Ordering::Relaxed);
     TIERUP_UNIT_WIN_LOG2.store(win_log2, std::sync::atomic::Ordering::Relaxed);
+    TIERUP_UNIT_TABLE_LOG2.store(table_log2, std::sync::atomic::Ordering::Relaxed);
     if jit_importer && all_shimmable {
         host.set_jit_wasm_emitter(onramp_tierup_unit_emitter);
     }

@@ -1515,6 +1515,117 @@ export 0 func "_start" 0
     svm_onramp_tierup_close();
 }
 
+/// #1009 Mechanism 1 (regression): a guest with **more than 1024 functions** whose tier-up-eligible
+/// dispatch leaf `call_indirect`s a slot **beyond the 1024-slot floor**. The emitted B2 dispatch
+/// table and the interpreter's `SharedSlots` table must both size to `next_power_of_two(n_funcs)`;
+/// before the fix the emitted leaf masked the index against a fixed `1 << 10` (`1050 & 1023 = 26`)
+/// while the interpreter reached slot 1050 — a wrong-but-identically-typed function, so the tiered-up
+/// call returned a **silently wrong value** with no trap. With the table sized to the guest both
+/// tiers mask identically and the pump matches the oracle.
+#[test]
+fn high_index_dispatch_beyond_the_table_floor_matches_the_oracle() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let (out_h, _mem_h) = onramp_handles();
+
+    // Slots: 0 = `_start`, 1 = the dispatch leaf, 2..=TARGET = identity padding, TARGET = the
+    // distinctive target (returns v0 + DISTINCT). TARGET > 1024, and next_power_of_two(1051) = 2048,
+    // so a fixed-1024 mask sends TARGET to `TARGET & 1023` = 26 — an *identity* function.
+    const TARGET: usize = 1050;
+    const INPUT: i64 = 12345;
+    const DISTINCT: i64 = 777;
+    assert_eq!(
+        TARGET & 1023,
+        26,
+        "the fixed-1024 mask lands on an identity slot"
+    );
+
+    // func 0: `_start` (interp-driven — it streams) calls the dispatch leaf, stages + writes the
+    // result to stdout, returns it.
+    let mut fns = format!(
+        r#"func () -> (i64) {{
+block 0 () {{
+  vin = i64.const {INPUT}
+  vres = call 1 (vin)
+  vsl = i64.const {SLOT}
+  i64.store vsl vres
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vres
+  }}
+}}
+"#
+    );
+    // func 1: the dispatch leaf — `call_indirect` the high slot TARGET.
+    fns.push_str(&format!(
+        r#"func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vs = i32.const {TARGET}
+  vr = call_indirect (i64) -> (i64) vs (v0)
+  return vr
+  }}
+}}
+"#
+    ));
+    // funcs 2..=TARGET: identity padding, except func TARGET returns v0 + DISTINCT.
+    for i in 2..=TARGET {
+        if i == TARGET {
+            fns.push_str(&format!(
+                "func (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  vk = i64.const {DISTINCT}\n  vr = i64.add v0 vk\n  return vr\n  }}\n}}\n"
+            ));
+        } else {
+            fns.push_str("func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  return v0\n  }\n}\n");
+        }
+    }
+    let src = format!("memory 16\n{fns}export 0 func \"_start\" 0\n");
+
+    let m = svm_text::parse_module(&src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    assert!(
+        m.funcs.len() > (1usize << 10),
+        "the guest must exceed the 1024-slot table floor to exercise M1 (got {})",
+        m.funcs.len()
+    );
+    let bytes = svm_encode::encode_module(&m);
+
+    // Oracle: dispatch reaches slot TARGET → INPUT + DISTINCT.
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(
+        want.value,
+        INPUT + DISTINCT,
+        "oracle: the dispatch reaches slot {TARGET}, not {}",
+        TARGET & 1023
+    );
+
+    let opened = svm_onramp_tierup_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "open must admit (status {})", svm_status());
+
+    // The dispatch table (emitted mask + interpreter) is sized to the guest, not the 1024 floor.
+    assert!(
+        (1u32 << svm_onramp_tierup_table_log2()) >= m.funcs.len() as u32,
+        "the table must cover every function (fixed at 1024 before #1009 M1): 1<<{} < {}",
+        svm_onramp_tierup_table_log2(),
+        m.funcs.len()
+    );
+
+    let (d, tierups, _invokes) = drive_full_session(&m);
+    assert!(tierups >= 1, "the dispatch leaf must tier up");
+    assert!(
+        d.bounces().is_empty(),
+        "the indirect edge reaches an emitted function natively, never bounced: {:?}",
+        d.bounces()
+    );
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        svm_onramp_tierup_value(),
+        want.value,
+        "value parity — the emitted high-index dispatch must reach slot {TARGET}, not {}",
+        TARGET & 1023
+    );
+    svm_onramp_tierup_close();
+}
+
 /// #880 differential (**old→new native**): an eligible leaf `call_indirect`s an **install slot** —
 /// the program reaching a guest-compiled unit's *emitted* `f0` through the shared table, the edge
 /// that previously always executed the unit's bytecode.
