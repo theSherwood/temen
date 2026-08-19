@@ -9744,6 +9744,15 @@ pub extern "C" fn svm_coop_open(
         set(STATUS_UNSUPPORTED);
         return -STATUS_UNSUPPORTED;
     }
+    // #889: hoist inline `cap.call`/`call.import`/`cap.self.resolve` sites into appended cross-tier
+    // wrapper functions, exactly as the single-shot pump's open does (see `svm_onramp_tierup_open`
+    // for the full rationale) — a hot loop with an inline cap write then emits and tiers up, its
+    // cap sites bouncing to the wrappers instead of pinning the whole function to the interpreter.
+    // Mutates the module BOTH tiers use, so slot numbering stays consistent between the emitted
+    // mask, the engine table, and the driver's shims. (#1026 slice 1: the ported pump differentials
+    // exposed this pass missing here — the two fallback drivers must transform identically.)
+    let mut m = m;
+    svm_wasm_jit::outline_cap_calls(&mut m);
     let declared = m.memory.map_or(0, |mc| mc.size_log2);
     let win_log2 = JIT_RUN_WIN_LOG2.max(declared);
     // Emit with the mask bumped to the run window (the driver convention), so the emitted `"mapped"`
