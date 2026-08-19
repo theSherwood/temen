@@ -3063,6 +3063,30 @@ impl<'p> Vcpu<'p> {
         size_log2: u8,
         fuel: u64,
     ) -> Result<Vcpu<'p>, Trap> {
+        // The plain op-0 confined child: attenuated `Instantiator`+`AddressSpace` only, no re-granted
+        // I/O caps (the browser/native drivers' path). Delegates with a no-op grant installer.
+        Self::new_confined_child_granted(prog, module, entry, back, size_log2, fuel, &mut |_| {})
+    }
+
+    /// Like [`new_confined_child`](Self::new_confined_child), but the caller may install **re-granted
+    /// caps** into the child's powerbox before it runs — the §14 op-13 grant list (a shared `fs`, an
+    /// inherited `stdout`), reached by the child through `cap.self.resolve` (#1011 slice 3a). The
+    /// `install_grants` closure receives the freshly-built child `Host` (with its `Instantiator`+
+    /// `AddressSpace` already granted) and, for each grant, calls the parent's
+    /// [`Host::regrant_into_child`] + [`Host::register_cap_name`] — so the grant *policy* (which handles
+    /// are `can_regrant`-eligible) stays with the caller (the interpreter's cap dispatch), and this
+    /// constructor stays pure mechanism (INVARIANTS §4). A confined child so built still masks every
+    /// window access to its own carve (§2 unchanged) — a re-granted cap is a cross-tier `cap.call`, not
+    /// a window access.
+    pub fn new_confined_child_granted(
+        prog: &'p VcpuProgram,
+        module: u32,
+        entry: u32,
+        back: std::sync::Arc<super::Region>,
+        size_log2: u8,
+        fuel: u64,
+        install_grants: &mut dyn FnMut(&mut Host),
+    ) -> Result<Vcpu<'p>, Trap> {
         if size_log2 >= 64 {
             return Err(Trap::Malformed);
         }
@@ -3080,6 +3104,9 @@ impl<'p> Vcpu<'p> {
         let mut host = Host::new();
         let cinst = host.grant_instantiator(0, child_size);
         let cas = host.grant_address_space(0, child_size);
+        // Install any re-granted caps (op-13 grant list) into the child powerbox under their names. The
+        // starter entry args stay `[Instantiator, AddressSpace]`; re-granted caps are name-resolved.
+        install_grants(&mut host);
         let args = if want_as {
             vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
         } else {
