@@ -8,8 +8,12 @@
 //! grant-list path and the JIT's `svm_run::grant_named_child_build` both route through it), so this
 //! is a cross-backend differential.
 
+#[path = "support/grant_hooks.rs"]
+mod grant_hooks_mod;
+use grant_hooks_mod::grant_hooks;
+
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
-use svm_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome};
+use svm_jit::{compile_and_run_capture_reserved_with_host_ex, JitOutcome};
 use svm_text::parse_module;
 use svm_verify::verify_module;
 
@@ -96,18 +100,6 @@ block 0 (vci: i64, vca: i64) {\n\
   return v7\n\
   }\n\
 }\n";
-
-fn grant_hooks() -> GrantChildHooks {
-    GrantChildHooks {
-        build: svm_run::grant_child_build,
-        build_named: svm_run::grant_named_child_build,
-        bind_imports: svm_run::child_bind_imports,
-        release: svm_run::grant_child_release,
-        mint: svm_run::child_offer_mint,
-        thunk: svm_run::cap_thunk_locked,
-        register_serve: svm_run::child_register_serve,
-    }
-}
 
 fn run_interp() -> Result<Vec<Value>, svm_interp::Trap> {
     let m = parse_module(SRC).expect("parse");

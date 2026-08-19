@@ -17,23 +17,24 @@
 //! asserting they agree on the captured stdout — a cross-backend differential.
 #![cfg(unix)]
 
+#[path = "support/grant_hooks.rs"]
+mod grant_hooks_mod;
+#[path = "support/repo_root.rs"]
+mod repo_root_mod;
+use grant_hooks_mod::grant_hooks;
+
+use repo_root_mod::repo_root;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
 use core::ffi::c_void;
 use svm_interp::{bytecode, run_capture_reserved_with_host, Host, StreamRole, Trap};
-use svm_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome};
+use svm_jit::{compile_and_run_capture_reserved_with_host_ex, JitOutcome};
 use svm_run::cap_thunk;
 use svm_text::parse_module as parse_module_raw;
 use svm_verify::verify_module;
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap()
-}
 
 /// Build the chibicc fork once per test binary.
 fn chibicc() -> &'static Path {
@@ -112,19 +113,6 @@ fn c_to_ir_child_with(src: &str, extra: &[&str]) -> String {
         .expect("run chibicc");
     assert!(status.success(), "chibicc --child-entry failed on:\n{src}");
     std::fs::read_to_string(&irfile).unwrap()
-}
-
-/// The op-13 named-grant hooks the JIT needs to spawn a separate-module child with a by-name powerbox.
-fn grant_hooks() -> GrantChildHooks {
-    GrantChildHooks {
-        build: svm_run::grant_child_build,
-        build_named: svm_run::grant_named_child_build,
-        bind_imports: svm_run::child_bind_imports,
-        release: svm_run::grant_child_release,
-        mint: svm_run::child_offer_mint,
-        thunk: svm_run::cap_thunk_locked,
-        register_serve: svm_run::child_register_serve,
-    }
 }
 
 /// Link the shim's import names to their interfaces — link-time symbol resolution (the phase-4

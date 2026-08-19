@@ -9,23 +9,15 @@
 //! parked transport: enqueue on the child's shared cell, the child's blocking `svc.wait` serves,
 //! the thread-blocked caller wakes with the reply) — the equality flip 5c.0 promised.
 
+#[path = "support/grant_hooks.rs"]
+mod grant_hooks_mod;
+use grant_hooks_mod::grant_hooks;
+
 use std::sync::Arc;
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
-use svm_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome};
+use svm_jit::{compile_and_run_capture_reserved_with_host_ex, JitOutcome};
 use svm_text::parse_module;
 use svm_verify::verify_module;
-
-fn grant_hooks() -> GrantChildHooks {
-    GrantChildHooks {
-        build: svm_run::grant_child_build,
-        build_named: svm_run::grant_named_child_build,
-        bind_imports: svm_run::child_bind_imports,
-        release: svm_run::grant_child_release,
-        mint: svm_run::child_offer_mint,
-        thunk: svm_run::cap_thunk_locked,
-        register_serve: svm_run::child_register_serve,
-    }
-}
 
 /// Parent (func 0, `(Instantiator)`): spawn a same-module named-grant child (empty grant list,
 /// entry 1, 64 KiB carve) via op 11, mint `child_offer(child, export 0)` via op 14, return the

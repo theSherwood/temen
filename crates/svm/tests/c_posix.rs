@@ -29,6 +29,10 @@
 //! fork, so the suite is gated to `#![cfg(unix)]` (like `c_frontend.rs`).
 #![cfg(unix)]
 
+#[path = "support/repo_root.rs"]
+mod repo_root_mod;
+use repo_root_mod::repo_root;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -40,13 +44,6 @@ use svm_posix::Posix;
 use svm_run::cap_thunk;
 use svm_text::parse_module as parse_module_raw;
 use svm_verify::verify_module;
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap()
-}
 
 /// Build the chibicc fork once per test binary, returning the path to its binary.
 fn chibicc() -> &'static Path {
