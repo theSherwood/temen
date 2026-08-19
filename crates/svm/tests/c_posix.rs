@@ -2585,18 +2585,66 @@ const UTIL_C: &str = include_str!("../../svm-run/demos/posix_utils/util.c");
 /// what a witness needs keeps the per-test chibicc cost proportional.
 fn stage_coreutils(host: &mut Host, posix: &Posix, names: &[&str]) {
     const TOOLS: &[(&str, &str, bool)] = &[
-        ("true", include_str!("../../svm-run/demos/posix_utils/true.c"), false),
-        ("false", include_str!("../../svm-run/demos/posix_utils/false.c"), false),
-        ("echo", include_str!("../../svm-run/demos/posix_utils/echo.c"), false),
-        ("cat", include_str!("../../svm-run/demos/posix_utils/cat.c"), false),
-        ("seq", include_str!("../../svm-run/demos/posix_utils/seq.c"), false),
-        ("head", include_str!("../../svm-run/demos/posix_utils/head.c"), false),
-        ("wc", include_str!("../../svm-run/demos/posix_utils/wc.c"), false),
-        ("sort", include_str!("../../svm-run/demos/posix_utils/sort.c"), false),
-        ("uniq", include_str!("../../svm-run/demos/posix_utils/uniq.c"), false),
-        ("grep", include_str!("../../svm-run/demos/posix_utils/grep.c"), true),
-        ("ls", include_str!("../../svm-run/demos/posix_utils/ls.c"), false),
-        ("pwd", include_str!("../../svm-run/demos/posix_utils/pwd.c"), false),
+        (
+            "true",
+            include_str!("../../svm-run/demos/posix_utils/true.c"),
+            false,
+        ),
+        (
+            "false",
+            include_str!("../../svm-run/demos/posix_utils/false.c"),
+            false,
+        ),
+        (
+            "echo",
+            include_str!("../../svm-run/demos/posix_utils/echo.c"),
+            false,
+        ),
+        (
+            "cat",
+            include_str!("../../svm-run/demos/posix_utils/cat.c"),
+            false,
+        ),
+        (
+            "seq",
+            include_str!("../../svm-run/demos/posix_utils/seq.c"),
+            false,
+        ),
+        (
+            "head",
+            include_str!("../../svm-run/demos/posix_utils/head.c"),
+            false,
+        ),
+        (
+            "wc",
+            include_str!("../../svm-run/demos/posix_utils/wc.c"),
+            false,
+        ),
+        (
+            "sort",
+            include_str!("../../svm-run/demos/posix_utils/sort.c"),
+            false,
+        ),
+        (
+            "uniq",
+            include_str!("../../svm-run/demos/posix_utils/uniq.c"),
+            false,
+        ),
+        (
+            "grep",
+            include_str!("../../svm-run/demos/posix_utils/grep.c"),
+            true,
+        ),
+        (
+            "ls",
+            include_str!("../../svm-run/demos/posix_utils/ls.c"),
+            false,
+        ),
+        (
+            "pwd",
+            include_str!("../../svm-run/demos/posix_utils/pwd.c"),
+            false,
+        ),
     ];
     for want in names {
         let (_, src, rx) = TOOLS
