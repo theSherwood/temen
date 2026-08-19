@@ -194,6 +194,19 @@ pub const OP_PIPE_ADOPT: u32 = 52;
 /// only the path→module policy (INVARIANTS #4).
 pub const OP_EXEC_RESOLVE: u32 = 53;
 
+/// #797 — the **termios control surface** as named ops (the libc `ioctl()`/`tcgetattr` shims
+/// multiplex onto these, keeping the vtable's signature checking meaningful). The personality's
+/// `struct termios` is a deliberately minimal 32 bytes: `{ i64 c_lflag; u8 c_cc[8] (packed i64);
+/// i64 c_vmin; i64 c_vtime }` — the lflag bits (Linux values: `ISIG 0o1`, `ICANON 0o2`,
+/// `ECHO 0o10`) and cc slots (`[VINTR, VQUIT, VERASE, VKILL, VEOF, VSUSP, 0, 0]`) the discipline
+/// honors; unknown bits round-trip uninterpreted (POSIX.md: extended by consumer demand).
+pub const OP_TCGETATTR: u32 = 54;
+/// #797 — `tcsetattr(fd, attr_ptr)` (the `when` is a shim concern; the personality applies
+/// immediately — TCSANOW; a shell's drain semantics are a follow-up).
+pub const OP_TCSETATTR: u32 = 55;
+/// #797 — `tcgetwinsize(fd, ws_ptr)`: `{ i32 row; i32 col }` (8 bytes), the `TIOCGWINSZ` shape.
+pub const OP_TCGETWINSIZE: u32 = 56;
+
 /// #972 slice 1 — the **handle-carrying tag** returned by `read`/`write`/`close` on a
 /// [`FdEntry::CorePipe`] fd: `PX_TAG_BASE - handle`. A **personality ↔ shim private convention**,
 /// never interpreted by the core (INVARIANTS.md #5/#11 discipline): every tag is `<= PX_TAG_BASE`,
@@ -351,7 +364,8 @@ const S_IFDIR: i64 = 0o040000; // directory (| 0o755 perms)
 const O_ACCMODE: i64 = 3;
 const O_WRONLY: i64 = 1;
 const O_RDWR: i64 = 2;
-const EACCES: i64 = -13; // #801: a memfs file without the executable registration
+const EACCES: i64 = -13;
+const ENOTTY: i64 = -25; // #797: not a terminal // #801: a memfs file without the executable registration
 const O_CREAT: i64 = 0o100;
 const O_TRUNC: i64 = 0o1000;
 const O_APPEND: i64 = 0o2000;
@@ -636,6 +650,36 @@ struct DirStream {
 /// is suitably aligned for anything the guest stores into it.
 const ALIGN: u64 = 16;
 
+/// #797 — the controlling terminal's state (see [`World::terminal`]). Termios subset: the
+/// lflag bits and cc slots the discipline honors; everything else round-trips.
+struct Terminal {
+    /// `c_lflag` (Linux bit values; default `ISIG | ICANON | ECHO`).
+    lflag: i64,
+    /// Packed cc: `[VINTR, VQUIT, VERASE, VKILL, VEOF, VSUSP, 0, 0]`.
+    cc: [u8; 8],
+    vmin: i64,
+    vtime: i64,
+    /// Winsize (`{row, col}`), reported by op 56; updated by [`Posix::set_winsize`].
+    rows: i32,
+    cols: i32,
+    /// The input pipe: the guest-facing read handle (`read(0)`'s tag target), the backing the
+    /// feed deposits into, the held writer count (`^D` on an empty line drops it to 0 — true
+    /// EOF, one-shot, the rung-1 decision), and the pipe id for the wake door.
+    input_handle: i32,
+    input_backing: Arc<Mutex<VecDeque<u8>>>,
+    input_writers: Arc<std::sync::atomic::AtomicUsize>,
+    input_pipe: u32,
+    /// The canonical-mode line under construction (flushed to the backing on `\n`/`VEOF`).
+    canon_buf: Vec<u8>,
+}
+
+impl Terminal {
+    fn default_termios() -> (i64, [u8; 8]) {
+        // ISIG | ICANON | ECHO; VINTR=^C VQUIT=^\ VERASE=DEL VKILL=^U VEOF=^D VSUSP=^Z.
+        (0o1 | 0o2 | 0o10, [3, 28, 127, 21, 4, 26, 0, 0])
+    }
+}
+
 /// #863 — state **all processes of one personality share**: the "kernel side" of the split. One
 /// per world, behind one `Arc<Mutex<World>>` every process's handler holds. POSIX draws the line:
 /// the filesystem, the network, the registered commands, the embedder delegates, and the captured
@@ -719,6 +763,12 @@ struct World {
     /// pre-job-control guest is foreground and nothing rings. A background process's terminal
     /// I/O rings its `SIGTTOU`/`SIGTTIN` doorbell.
     fg_pgid: i32,
+    /// #797 — the **controlling terminal**, wired by [`Posix::enable_terminal`] (`None` = the
+    /// preloaded-stdin world, unchanged). Input is a held-writer core pipe the embedder feeds
+    /// ([`Posix::feed_terminal`]) with the **line discipline running at feed time**; `read(0)`
+    /// tag-redirects to `input_handle` (the #972 park/EINTR/EOF path). Output echo goes to the
+    /// stdout sink. The discipline is pure personality policy (INVARIANTS 4/12).
+    terminal: Option<Terminal>,
 }
 
 /// #863 slice 2 — a [`World::procs`] process-table entry.
@@ -835,6 +885,9 @@ struct Proc {
     /// (#863 slice 3 — the core hands every door a domain-scoped weak wake, so reachability is
     /// independent of nesting depth and fork history; weak ⇒ a post-run fire is a no-op).
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// #797 — the run's **pipe-reader wake** door ([`SignalSource::set_pipe_wake`]): how a
+    /// host-side `feed_terminal` wakes a reader parked on the terminal's input pipe.
+    pipe_wake: Option<Arc<dyn Fn(u32) + Send + Sync>>,
     /// #798 slice 2 — the core's **stop/continue closure** for this process's domain
     /// ([`SignalSource::set_stop`], installed beside the wake): `f(true)` parks the domain at its
     /// next per-op poll, `f(false)` resumes it. `None` (a driver without the mechanism — the
@@ -989,6 +1042,180 @@ impl Posix {
     /// spawned child's re-granted `Stream` output and the shell's own output land in one stream
     /// (STAGE1.md §5). Pass the `Host`'s shared stdout (`Host::shared_stdout()`). [`Posix::stdout`] then
     /// reads this sink back.
+    /// #797 — wire the **controlling terminal** (opt-in; without it the preloaded-stdin world is
+    /// unchanged): mints the held-writer input pipe on `host` and installs the terminal state
+    /// with default termios (`ISIG | ICANON | ECHO`) and an 80×24 winsize. `read(0)` then
+    /// tag-redirects to the input pipe (park on empty, the #972 path); the embedder delivers
+    /// keystrokes with [`Self::feed_terminal`].
+    pub fn enable_terminal(&self, host: &mut Host) {
+        let (h, backing, writers, pipe) = host.grant_terminal_input();
+        let (lflag, cc) = Terminal::default_termios();
+        let mut w = self.world.lock().unwrap_or_else(|e| e.into_inner());
+        w.terminal = Some(Terminal {
+            lflag,
+            cc,
+            vmin: 1,
+            vtime: 0,
+            rows: 24,
+            cols: 80,
+            input_handle: h,
+            input_backing: backing,
+            input_writers: writers,
+            input_pipe: pipe,
+            canon_buf: Vec::new(),
+        });
+    }
+
+    /// #797 — deliver keystrokes to the terminal: the **line discipline runs here**, at feed
+    /// time, host-side. Raw mode (`!ICANON`) deposits bytes immediately; canonical mode buffers
+    /// with `VERASE`/`VKILL` editing and flushes completed lines (newline, or a mid-line `VEOF`);
+    /// `VEOF` on an empty line drops the held writer count — parked readers wake to true EOF
+    /// (one-shot, the rung-1 decision). `ECHO` mirrors input to the stdout sink (`VERASE` echoes
+    /// backspace-space-backspace). `ISIG` chars never enter the stream: they fire the #798 group
+    /// machinery at the foreground pgid (`VINTR`→SIGINT, `VQUIT`→SIGQUIT, `VSUSP`→SIGTSTP) via
+    /// [`Self::kill_pid`] per member, after every lock is released. A parked reader is woken
+    /// through the pipe-wake door — data arrival, never a signal interrupt.
+    pub fn feed_terminal(&self, bytes: &[u8]) {
+        let mut kills: Vec<(i32, i32)> = Vec::new();
+        type PipeWake = Arc<dyn Fn(u32) + Send + Sync>;
+        let mut wake: Option<(PipeWake, u32)> = None;
+        {
+            let mut w = self.world.lock().unwrap_or_else(|e| e.into_inner());
+            let fg = w.fg_pgid;
+            let Some(mut term) = w.terminal.take() else {
+                return;
+            };
+            let isig = term.lflag & 0o1 != 0;
+            let icanon = term.lflag & 0o2 != 0;
+            let echo = term.lflag & 0o10 != 0;
+            let mut out: Vec<u8> = Vec::new(); // echo bytes
+            let mut deposit: Vec<u8> = Vec::new(); // bytes for the backing
+            let mut eof = false;
+            for &b in bytes {
+                if isig && (b == term.cc[0] || b == term.cc[1] || b == term.cc[5]) {
+                    let sig = if b == term.cc[0] {
+                        2 // SIGINT
+                    } else if b == term.cc[1] {
+                        3 // SIGQUIT
+                    } else {
+                        20 // SIGTSTP
+                    };
+                    // Sweep the foreground group after the locks drop.
+                    for (pid, e) in w.procs.iter() {
+                        if let ProcEntry::Live(p) = e {
+                            if p.lock().unwrap_or_else(|er| er.into_inner()).pgid == fg {
+                                kills.push((*pid, sig));
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if !icanon {
+                    deposit.push(b);
+                    if echo {
+                        out.push(b);
+                    }
+                    continue;
+                }
+                if b == term.cc[2] {
+                    // VERASE
+                    if term.canon_buf.pop().is_some() && echo {
+                        out.extend_from_slice(b" ");
+                    }
+                } else if b == term.cc[3] {
+                    // VKILL
+                    for _ in 0..term.canon_buf.len() {
+                        if echo {
+                            out.extend_from_slice(b" ");
+                        }
+                    }
+                    term.canon_buf.clear();
+                } else if b == term.cc[4] {
+                    // VEOF: empty line = one-shot EOF; mid-line = flush without newline.
+                    if term.canon_buf.is_empty() {
+                        eof = true;
+                    } else {
+                        deposit.append(&mut term.canon_buf);
+                    }
+                } else if b == b'\n' {
+                    term.canon_buf.push(b);
+                    deposit.append(&mut term.canon_buf);
+                    if echo {
+                        out.push(b'\n');
+                    }
+                } else {
+                    term.canon_buf.push(b);
+                    if echo {
+                        out.push(b);
+                    }
+                }
+            }
+            let deposit_was_empty = deposit.is_empty();
+            if !deposit.is_empty() {
+                term.input_backing
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend(deposit);
+            }
+            if eof {
+                term.input_writers
+                    .store(0, std::sync::atomic::Ordering::SeqCst);
+            }
+            if !out.is_empty() {
+                match &w.stdout_sink {
+                    Some(sk) => sk
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend_from_slice(&out),
+                    None => w.stdout.extend_from_slice(&out),
+                }
+            }
+            let pipe = term.input_pipe;
+            // The data wake fires only when something changed for a reader — a deposit or the
+            // EOF close. A pure-signal feed (`^C` alone) must NOT wake the park: the reader
+            // would re-admit, find nothing, and re-park — racing the kill's EINTR sweep into a
+            // window where nothing is parked. Signal delivery does its own waking.
+            let should_wake = !deposit_was_empty || eof;
+            w.terminal = Some(term);
+            drop(w);
+            if should_wake {
+                let p = self.root.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(pw) = p.pipe_wake.as_ref() {
+                    wake = Some((Arc::clone(pw), pipe));
+                }
+            }
+        }
+        if let Some((pw, pipe)) = wake {
+            pw(pipe); // data arrival (or the EOF close): re-admit parked readers
+        }
+        for (pid, sig) in kills {
+            self.kill_pid(pid, sig);
+        }
+    }
+
+    /// #797 — update the terminal's winsize and fire **SIGWINCH** (28) at the foreground group.
+    pub fn set_winsize(&self, rows: i32, cols: i32) {
+        let mut kills: Vec<i32> = Vec::new();
+        {
+            let mut w = self.world.lock().unwrap_or_else(|e| e.into_inner());
+            let fg = w.fg_pgid;
+            if let Some(t) = w.terminal.as_mut() {
+                t.rows = rows;
+                t.cols = cols;
+                for (pid, e) in w.procs.iter() {
+                    if let ProcEntry::Live(p) = e {
+                        if p.lock().unwrap_or_else(|er| er.into_inner()).pgid == fg {
+                            kills.push(*pid);
+                        }
+                    }
+                }
+            }
+        }
+        for pid in kills {
+            self.kill_pid(pid, 28);
+        }
+    }
+
     pub fn set_stdout_sink(&self, sink: Arc<Mutex<Vec<u8>>>) {
         self.world
             .lock()
@@ -1170,6 +1397,9 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "pipe" => OP_PIPE,
         "pipe_adopt" => OP_PIPE_ADOPT,
         "exec_resolve" => OP_EXEC_RESOLVE,
+        "tcgetattr" => OP_TCGETATTR,
+        "tcsetattr" => OP_TCSETATTR,
+        "tcgetwinsize" => OP_TCGETWINSIZE,
         "dup2" => OP_DUP2,
         "dup" => OP_DUP,
         "fcntl" => OP_FCNTL,
@@ -1305,6 +1535,10 @@ impl SignalSource for SignalDoor {
 
     /// #799 L1 — store the interp's scheduler-wake closure so [`Posix::raise_signal`] can interrupt a
     /// parked blocking syscall on an embedder `^C`. Installed at run start, cleared to a no-op at teardown.
+    fn set_pipe_wake(&self, wake: Arc<dyn Fn(u32) + Send + Sync>) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).pipe_wake = Some(wake);
+    }
+
     fn set_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).wake = Some(wake);
     }
@@ -1428,6 +1662,9 @@ fn px_vtable() -> (Vec<String>, Vec<svm_ir::FuncType>) {
         ("fork", 1),         // 51
         ("pipe_adopt", 3),   // 52
         ("exec_resolve", 2), // 53
+        ("tcgetattr", 2),    // 54
+        ("tcsetattr", 2),    // 55
+        ("tcgetwinsize", 2), // 56
     ];
     let mut names = Vec::with_capacity(OPS.len());
     let mut sigs = Vec::with_capacity(OPS.len());
@@ -1672,6 +1909,7 @@ fn new_world(stdin: Vec<u8>) -> World {
         clock_fixed: None,
         commands: Vec::new(),
         executables: HashSet::new(),
+        terminal: None,
         exec_stdout_handle: 0,
         exec_stdin_handle: 0,
         exec_stdin_fifo: None,
@@ -1711,6 +1949,7 @@ fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
         sig_stack_base: 0,
         sig_armed: Arc::new(AtomicBool::new(false)),
         wake: None,
+        pipe_wake: None,
         stop: None,
         stopped_sig: None,
         stop_fresh: false,
@@ -1767,6 +2006,9 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
                 OP_PIPE => st.pipe(args, mem),
                 OP_PIPE_ADOPT => st.pipe_adopt(args, mem),
                 OP_EXEC_RESOLVE => st.exec_resolve(args, mem),
+                OP_TCGETATTR => st.tcgetattr(args, mem),
+                OP_TCSETATTR => st.tcsetattr(args, mem),
+                OP_TCGETWINSIZE => st.tcgetwinsize(args, mem),
                 OP_DUP2 => Ok(vec![st.dup2(args)]),
                 OP_DUP => Ok(vec![st.dup(args)]),
                 OP_FCNTL => Ok(vec![st.fcntl(args)]),
@@ -2058,6 +2300,7 @@ impl Proc {
             sig_stack_base: self.sig_stack_base,
             sig_armed: Arc::new(AtomicBool::new(false)),
             wake: None,
+            pipe_wake: None,
             stop: None, // the twin's own domain gets its closure at mint (like the wake)
             stopped_sig: None,
             stop_fresh: false,
@@ -2167,6 +2410,16 @@ impl Ctx<'_> {
         let fd = *args.first().ok_or(Trap::Malformed)?;
         let buf = *args.get(1).ok_or(Trap::Malformed)? as u64;
         let len = (*args.get(2).ok_or(Trap::Malformed)?).max(0) as usize;
+        // #797 — with the terminal enabled, fd 0 IS the terminal: tag-redirect to the input
+        // pipe (park on empty, EINTR, one-shot ^D EOF — the #972 path). The Stdin sentinel
+        // stays the preloaded-stdin world's binding.
+        if fd == 0 {
+            if let Some(t) = self.w.terminal.as_ref() {
+                if matches!(self.fd(fd), Some(FdEntry::Stdin)) {
+                    return Ok(vec![PX_TAG_BASE - t.input_handle as i64]);
+                }
+            }
+        }
         enum Src {
             Stdin,
             File,
@@ -2350,6 +2603,72 @@ impl Ctx<'_> {
         let mut out = Vec::with_capacity(8);
         out.extend_from_slice(&(rfd as i32).to_le_bytes());
         out.extend_from_slice(&(wfd as i32).to_le_bytes());
+        mem.write_bytes(ptr, &out).ok_or(Trap::Malformed)?;
+        Ok(vec![0])
+    }
+
+    /// #797 — `tcgetattr(fd, attr_ptr) -> 0 | -errno`: fill the 32-byte personality termios
+    /// (`{lflag, cc[8], vmin, vtime}` as 4 LE i64s) for a terminal fd (stdio, with the terminal
+    /// enabled); `-ENOTTY` otherwise.
+    fn tcgetattr(
+        &mut self,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+    ) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let fd = *args.first().ok_or(Trap::Malformed)?;
+        let ptr = *args.get(1).ok_or(Trap::Malformed)? as u64;
+        let Some(t) = self.w.terminal.as_ref().filter(|_| (0..=2).contains(&fd)) else {
+            return Ok(vec![ENOTTY]);
+        };
+        let mut out = Vec::with_capacity(32);
+        out.extend_from_slice(&t.lflag.to_le_bytes());
+        out.extend_from_slice(&t.cc);
+        out.extend_from_slice(&t.vmin.to_le_bytes());
+        out.extend_from_slice(&t.vtime.to_le_bytes());
+        mem.write_bytes(ptr, &out).ok_or(Trap::Malformed)?;
+        Ok(vec![0])
+    }
+
+    /// #797 — `tcsetattr(fd, attr_ptr) -> 0 | -errno`: apply the 32-byte termios immediately
+    /// (TCSANOW; drain/flush `when` semantics are a shim concern for now). A line buffered in
+    /// canonical mode stays buffered across a switch to raw — it flushes with the next feed.
+    fn tcsetattr(
+        &mut self,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+    ) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let fd = *args.first().ok_or(Trap::Malformed)?;
+        let ptr = *args.get(1).ok_or(Trap::Malformed)? as u64;
+        let bytes = mem.read_bytes(ptr, 32).ok_or(Trap::Malformed)?;
+        let Some(t) = self.w.terminal.as_mut().filter(|_| (0..=2).contains(&fd)) else {
+            return Ok(vec![ENOTTY]);
+        };
+        t.lflag = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        t.cc.copy_from_slice(&bytes[8..16]);
+        t.vmin = i64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        t.vtime = i64::from_le_bytes(bytes[24..32].try_into().unwrap());
+        Ok(vec![0])
+    }
+
+    /// #797 — `tcgetwinsize(fd, ws_ptr) -> 0 | -errno`: `{i32 row; i32 col}` (the `TIOCGWINSZ`
+    /// shape); `-ENOTTY` off-terminal. Updated by the embedder's [`Posix::set_winsize`], which
+    /// also fires SIGWINCH at the foreground group.
+    fn tcgetwinsize(
+        &mut self,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+    ) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let fd = *args.first().ok_or(Trap::Malformed)?;
+        let ptr = *args.get(1).ok_or(Trap::Malformed)? as u64;
+        let Some(t) = self.w.terminal.as_ref().filter(|_| (0..=2).contains(&fd)) else {
+            return Ok(vec![ENOTTY]);
+        };
+        let mut out = Vec::with_capacity(8);
+        out.extend_from_slice(&t.rows.to_le_bytes());
+        out.extend_from_slice(&t.cols.to_le_bytes());
         mem.write_bytes(ptr, &out).ok_or(Trap::Malformed)?;
         Ok(vec![0])
     }
