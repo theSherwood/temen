@@ -3411,13 +3411,10 @@ pub struct Run {
 /// manifest binds each capability slot at instantiation (the positional 3–8 `i32`-handle entry
 /// died in phase 4, IMPORTS.md §2.5). The named export is the marker, so the runtime knows to
 /// grant the powerbox rather than treat func 0 as a bare kernel.
-pub fn is_named_powerbox_entry(module: &Module) -> bool {
-    module.funcs.first().is_some_and(|f| f.params.is_empty())
-        && module
-            .exports
-            .iter()
-            .any(|e| e.name == "_start" && e.func == 0)
-}
+///
+/// Defined once in `svm-ir` ([`svm_ir::is_named_powerbox_entry`]) so every host keys off the same
+/// predicate (#912); re-exported here for the reference host's callers.
+pub use svm_ir::is_named_powerbox_entry;
 
 /// **Demote** non-entry-point exports to diagnostic names (#907, the `.dynsym`/`.symtab` split — the
 /// `svmb-strip` packaging step). Translate exports *every* defined function by its symbol name, so a
@@ -3745,16 +3742,12 @@ pub fn run_powerbox_with_deadline_and_quota(
 /// `POWERBOX_ARGS_END`, is rejected (the C `argv[]` model can't represent the former, and the latter
 /// would collide with the program's data segments).
 fn build_args_blob(args: &[&[u8]], env: &[&[u8]]) -> Result<Vec<u8>, String> {
-    let mut blob = Vec::new();
-    blob.extend_from_slice(&(args.len() as u32).to_le_bytes());
-    blob.extend_from_slice(&(env.len() as u32).to_le_bytes());
-    for s in args.iter().chain(env.iter()) {
-        if s.contains(&0) {
-            return Err("powerbox arg/env contains an embedded NUL".into());
-        }
-        blob.extend_from_slice(s);
-        blob.push(0);
+    // A NUL-terminated blob can't carry an embedded NUL in any string (§3e / D44).
+    if args.iter().chain(env.iter()).any(|s| s.contains(&0)) {
+        return Err("powerbox arg/env contains an embedded NUL".into());
     }
+    // The wire layout is shared (`svm_ir::write_args_blob`); this host owns the region-bound policy.
+    let blob = svm_ir::write_args_blob(args, env);
     if svm_ir::POWERBOX_ARGS_BASE + blob.len() as u64 > svm_ir::POWERBOX_ARGS_END {
         return Err(format!(
             "powerbox args buffer ({} bytes) does not fit in the args region [{}, {})",

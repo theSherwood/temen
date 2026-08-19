@@ -3416,6 +3416,37 @@ pub const POWERBOX_HEAP_TOP: u64 = 40;
 /// `_start`'s handle stores never fault on a read-only page (D40 page isolation).
 pub const POWERBOX_STACK_PAGE: u64 = POWERBOX_ARGS_END; // 16384
 
+/// The **powerbox entry shape** (IMPORTS.md phase 4): a paramless func 0 exported as `_start`. An
+/// import-bearing module must carry this shape for its manifest slots to bind at instantiation (the
+/// runtime never rewrites); the `_start` export is also the powerbox-entry *marker*. The one
+/// definition every host shares — `svm-run`'s front door, the browser on-ramp, and the DAP backend
+/// all key off the identical predicate so a module accepted as an entry by one host is by all
+/// (guest-ABI shape must not drift per host — #912).
+pub fn is_named_powerbox_entry(module: &Module) -> bool {
+    module.funcs.first().is_some_and(|f| f.params.is_empty())
+        && module
+            .exports
+            .iter()
+            .any(|e| e.name == "_start" && e.func == 0)
+}
+
+/// Encode the powerbox **args buffer** layout (§3e / D44): `argc` and `envc` as little-endian `u32`,
+/// then each arg string followed by each env string, every string NUL-terminated. The exact bytes a
+/// frontend's `_start` parses into `argc`/`argv`; the one definition of the wire shape every host
+/// emits (an argv-only host passes `env = &[]`). Pure layout — callers own their own validation
+/// (embedded-NUL rejection, the `[POWERBOX_ARGS_BASE, POWERBOX_ARGS_END)` bound) since host policies
+/// differ. (#912)
+pub fn write_args_blob(args: &[&[u8]], env: &[&[u8]]) -> Vec<u8> {
+    let mut blob = Vec::new();
+    blob.extend_from_slice(&(args.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&(env.len() as u32).to_le_bytes());
+    for s in args.iter().chain(env.iter()) {
+        blob.extend_from_slice(s);
+        blob.push(0);
+    }
+    blob
+}
+
 /// **Trap-on-NULL** (#964): the byte extent of the reserved NULL region for a guard-marked powerbox
 /// module — `[0, POWERBOX_NULL_GUARD)` holds *nothing*, so a NULL dereference (any offset below the
 /// guard) traps like native platforms instead of silently touching low scratch. 16 KiB = the **max
