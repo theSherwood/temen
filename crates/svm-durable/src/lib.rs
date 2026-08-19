@@ -600,6 +600,58 @@ enum SuspendKind {
     LoopHeader,
 }
 
+impl SuspendKind {
+    /// The block-local value operands this op consumes — the values that must stay **live** (spilled
+    /// and reloaded) across a freeze so the op can be re-issued on thaw. One definition for both the
+    /// liveness marking and the re-issue arg mapping (#915), so a missed operand can't silently
+    /// under-spill (a corrupted thaw). Immediates (`callee`/`ty`/`type_id`/`op`/`sig`) are not
+    /// operands; `Leaf`/`LoopHeader` have none (they only reload their own result / block params).
+    fn operands(&self) -> Vec<ValIdx> {
+        match self {
+            SuspendKind::Leaf | SuspendKind::LoopHeader => Vec::new(),
+            SuspendKind::Propagated { args, .. } => args.clone(),
+            SuspendKind::PropagatedIndirect { idx, args, .. } => {
+                let mut v = Vec::with_capacity(args.len() + 1);
+                v.push(*idx); // the table index must be reloaded to re-select the slot
+                v.extend_from_slice(args);
+                v
+            }
+            SuspendKind::Resume { k, arg } => vec![*k, *arg],
+            SuspendKind::ThreadJoin { handle } => vec![*handle],
+            SuspendKind::MemoryWait {
+                addr,
+                expected,
+                timeout,
+                ..
+            } => vec![*addr, *expected, *timeout],
+            SuspendKind::Yield { value } => vec![*value],
+            SuspendKind::SvcServe { handle, args, .. } => {
+                let mut v = Vec::with_capacity(args.len() + 1);
+                v.push(*handle);
+                v.extend_from_slice(args);
+                v
+            }
+        }
+    }
+
+    /// Whether thaw flips the shadow thaw-state word back to `NORMAL` in **this** op's arm — true for
+    /// the globally-deepest frozen frame (a leaf `cap.call`, a loop-header poll, or a re-parked
+    /// `suspend` / `thread.join` / `atomic.wait` / serve op, whose blocking peer is a separate vCPU).
+    /// A propagated `call` / `call_indirect` / `cont.resume` does **not** flip — the callee it
+    /// re-issues owns the flip at its own deepest leaf (#915).
+    fn flips_thaw_word(&self) -> bool {
+        matches!(
+            self,
+            SuspendKind::Leaf
+                | SuspendKind::LoopHeader
+                | SuspendKind::Yield { .. }
+                | SuspendKind::ThreadJoin { .. }
+                | SuspendKind::MemoryWait { .. }
+                | SuspendKind::SvcServe { .. }
+        )
+    }
+}
+
 /// One resume point's metadata across the whole function (global id by vector order).
 struct PointPlan {
     kind: SuspendKind,        // leaf cap.call or propagated call
@@ -970,43 +1022,10 @@ fn transform_func(
                         used[o as usize] = true;
                     }
                 }
-                if let SuspendKind::Propagated { args, .. } = &kind {
-                    for &a in args {
-                        used[a as usize] = true; // operands of the re-issued call
-                    }
-                }
-                if let SuspendKind::PropagatedIndirect { idx, args, .. } = &kind {
-                    used[*idx as usize] = true; // the table index must be reloaded to re-select the slot
-                    for &a in args {
-                        used[a as usize] = true; // operands of the re-issued call_indirect
-                    }
-                }
-                if let SuspendKind::Resume { k, arg } = &kind {
-                    used[*k as usize] = true; // operands of the re-issued cont.resume
-                    used[*arg as usize] = true;
-                }
-                if let SuspendKind::Yield { value } = &kind {
-                    used[*value as usize] = true; // operand of the re-executed suspend
-                }
-                if let SuspendKind::ThreadJoin { handle } = &kind {
-                    used[*handle as usize] = true; // operand of the re-issued thread.join
-                }
-                if let SuspendKind::MemoryWait {
-                    addr,
-                    expected,
-                    timeout,
-                    ..
-                } = &kind
-                {
-                    used[*addr as usize] = true; // operands of the re-issued atomic.wait
-                    used[*expected as usize] = true;
-                    used[*timeout as usize] = true;
-                }
-                if let SuspendKind::SvcServe { handle, args, .. } = &kind {
-                    used[*handle as usize] = true; // operands of the re-issued serve op
-                    for &a in args {
-                        used[a as usize] = true;
-                    }
+                // The re-issued op's operands must be reloaded across the freeze — mark them live
+                // from the single operand table (#915).
+                for o in kind.operands() {
+                    used[o as usize] = true;
                 }
                 let spilled: Vec<usize> = if conservative {
                     (0..save_end).collect()
@@ -1129,19 +1148,22 @@ fn transform_func(
             .collect();
         ab.zero(store(StoreOp::I64, sp_a, base, 0)); // pop: SP = frame base
 
-        // For a propagated call, re-issue it (its operands were all spilled). For a leaf,
-        // flip the state word back to NORMAL.
+        // Flip the shadow thaw-state word back to `NORMAL` for the globally-deepest frozen frame
+        // (leaf / loop-header / re-parked suspend·join·wait·serve); a propagated call/indirect/resume
+        // leaves it — the callee it re-issues owns the flip at its own leaf. One copy, driven by
+        // `flips_thaw_word()` (#915), emitted before the re-issue exactly as each arm did.
+        if pt.kind.flips_thaw_word() {
+            let (st_a, st_off) = ab.thaw_word_addr();
+            let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
+            ab.zero(store(StoreOp::I32, st_a, normal_v, st_off));
+        }
+        // For a propagated call, re-issue it (its operands were all spilled). For a leaf, the state
+        // word was flipped above.
         let op_results: Vec<ValIdx> = match &pt.kind {
-            // A leaf cap.call and a loop-header poll are both the globally-deepest frozen frame
-            // with no op to re-issue: flip the state word back to `NORMAL`. The leaf then reloads
-            // its cap.call result; the header reloads its block params and re-enters the body
-            // (`cont_seg`). Neither produces an `op_results` value.
-            SuspendKind::Leaf | SuspendKind::LoopHeader => {
-                let (st_a, st_off) = ab.thaw_word_addr();
-                let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
-                ab.zero(store(StoreOp::I32, st_a, normal_v, st_off));
-                vec![]
-            }
+            // A leaf cap.call and a loop-header poll are both the globally-deepest frozen frame with
+            // no op to re-issue: the leaf then reloads its cap.call result; the header reloads its
+            // block params and re-enters the body (`cont_seg`). Neither produces an `op_results` value.
+            SuspendKind::Leaf | SuspendKind::LoopHeader => vec![],
             SuspendKind::Propagated { callee, args } => {
                 let mapped: Vec<ValIdx> = args
                     .iter()
@@ -1190,9 +1212,6 @@ fn transform_func(
             // value the *next* resume delivers, threads into the continuation exactly as a leaf's
             // reloaded cap.call result does.
             SuspendKind::Yield { value } => {
-                let (st_a, st_off) = ab.thaw_word_addr();
-                let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
-                ab.zero(store(StoreOp::I32, st_a, normal_v, st_off));
                 let v = reloaded[spill_slot(*value as usize).expect("suspend value spilled")];
                 ab.many(Inst::Suspend { value: v }, pt.nres)
             }
@@ -1205,9 +1224,6 @@ fn transform_func(
             // `REWINDING` afterward), so on this thread the join is the globally-deepest frozen frame —
             // it flips the state to `NORMAL` itself, like a leaf, *before* re-issuing.
             SuspendKind::ThreadJoin { handle } => {
-                let (st_a, st_off) = ab.thaw_word_addr();
-                let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
-                ab.zero(store(StoreOp::I32, st_a, normal_v, st_off));
                 let hh =
                     reloaded[spill_slot(*handle as usize).expect("thread.join handle spilled")];
                 ab.many(Inst::ThreadJoin { handle: hh }, pt.nres)
@@ -1223,9 +1239,6 @@ fn transform_func(
                 expected,
                 timeout,
             } => {
-                let (st_a, st_off) = ab.thaw_word_addr();
-                let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
-                ab.zero(store(StoreOp::I32, st_a, normal_v, st_off));
                 let aa = reloaded[spill_slot(*addr as usize).expect("atomic.wait addr spilled")];
                 let ee =
                     reloaded[spill_slot(*expected as usize).expect("atomic.wait expected spilled")];
@@ -1254,9 +1267,6 @@ fn transform_func(
                 handle,
                 args,
             } => {
-                let (st_a, st_off) = ab.thaw_word_addr();
-                let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
-                ab.zero(store(StoreOp::I32, st_a, normal_v, st_off));
                 let hh = reloaded[spill_slot(*handle as usize).expect("serve-op handle spilled")];
                 let aa: Vec<ValIdx> = args
                     .iter()
