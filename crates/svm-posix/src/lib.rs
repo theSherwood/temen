@@ -810,6 +810,13 @@ struct Proc {
     /// only the core reap's `-pgid` filter; the personality's is authoritative for personality
     /// ops, and the two unify when blocking `waitpid` lands, #799).
     pgid: i32,
+    /// #801 — the heap **re-base** a committed exec applies (POSIX: `brk` is per-image state,
+    /// re-based at exec — the caller's heap placement was chosen for the caller's image, and the
+    /// command's data/stack may extend right across it). Stashed by a successful `exec_resolve`
+    /// as the command's own convention — heap in the top quarter of ITS registered window, the
+    /// same split embedders use for roots — and consumed by the exec-remap hook, which the core
+    /// fires only on a COMMITTED image-replace, so a refused exec leaves the live heap untouched.
+    pending_exec_heap: Option<(u64, u64)>,
     /// High-water mark: the window offset fresh (never-freed) allocations bump upward from.
     heap_next: u64,
     /// One past the last window byte the allocator may hand out.
@@ -1744,7 +1751,15 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
 /// token — the atomic store covers the group). Policy here, mechanism in the core (invariant 4).
 fn exec_remap_hook(proc_: Arc<Mutex<Proc>>) -> svm_interp::ExecRemapHook {
     Arc::new(move |pairs: &[(i32, i32)]| {
-        let p = proc_.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = proc_.lock().unwrap_or_else(|e| e.into_inner());
+        // #801 — a committed exec re-bases the heap to the new image's own convention (the old
+        // image's allocations died with it; POSIX brk is per-image).
+        if let Some((base, end)) = p.pending_exec_heap.take() {
+            p.heap_next = base;
+            p.heap_end = end;
+            p.free_list.clear();
+            p.allocated.clear();
+        }
         for entry in p.fds.iter().flatten() {
             if let FdEntry::CorePipe(t) = entry {
                 let cur = t.get();
@@ -1928,6 +1943,7 @@ fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
         pid: 1,  // the root process — init-like; fork twins get their TaskId stamped by the factory
         ppid: 0, // no recorded parent (#800 getppid)
         pgid: 1, // the root leads process group 1
+        pending_exec_heap: None,
         heap_next: heap_base,
         heap_end,
         allocated: HashMap::new(),
@@ -2255,6 +2271,7 @@ impl Proc {
             pid: 0, // stamped by [`fork_factory`]: the twin's TaskId, or an allocated pid (re-grant)
             ppid: self.pid, // #800 getppid — the forking process is the parent
             pgid: self.pgid, // POSIX: a fork twin inherits its parent's process group
+            pending_exec_heap: self.pending_exec_heap,
             heap_next: self.heap_next,
             heap_end: self.heap_end,
             allocated: self.allocated.clone(),
@@ -3977,7 +3994,12 @@ impl Ctx<'_> {
             return Ok(vec![EINVAL]);
         };
         if self.w.executables.contains(&path) {
-            if let Some((_, h, _)) = self.w.commands.iter().find(|(n, _, _)| *n == path) {
+            if let Some((_, h, wl)) = self.w.commands.iter().find(|(n, _, _)| *n == path) {
+                // Stash the command's heap re-base for the exec this resolve precedes (consumed
+                // by the exec-remap hook on commit; overwritten by any later resolve, so a PATH
+                // walk's misses and a refused exec never leave a stale re-base behind).
+                let end = 1u64 << (*wl).min(63);
+                self.p.pending_exec_heap = Some((end / 4 * 3, end));
                 return Ok(vec![*h as i64]);
             }
         }

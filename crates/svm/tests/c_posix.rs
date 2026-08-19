@@ -2121,7 +2121,7 @@ int main(int argc, char **argv) {
 }
 "#;
     let src = format!(
-        "{EXEC_C}\n\
+        "{WIN_PAD_17}{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 static char *av[] = {{ \"rc\", \"4\", 0 }};\n\
@@ -2160,7 +2160,7 @@ fn c_execvp_walks_path_and_the_errno_split_holds() {
 int main(void) { return 7; }
 "#;
     let src = format!(
-        "{EXEC_C}\n\
+        "{WIN_PAD_17}{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_stat(int cap, long path, long len, long buf);\n\
@@ -2219,7 +2219,7 @@ int main(int argc, char **argv) {
 }
 "#;
     let src = format!(
-        "{EXEC_C}\n\
+        "{WIN_PAD_17}{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 static char *av[] = {{ \"px\", \"z\", 0 }};\n\
@@ -2267,7 +2267,7 @@ int main(void) {
 }
 "#;
     let src = format!(
-        "{EXEC_C}\n\
+        "{WIN_PAD_17}{EXEC_C}\n\
 long __px_write(int cap, long fd, long buf, long len);\n\
 long write2(long fd, void *b, long n) {{ return __px_write(0, fd, (long)b, n); }}\n\
 static char *av[] = {{ \"bad\", 0 }};\n\
@@ -2315,7 +2315,7 @@ int main(void) {
 }
 "#;
     let src = format!(
-        "{PIPE_SHIM}\n{EXEC_C}\n\
+        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_dup2(int cap, long o, long n);\n\
@@ -2373,7 +2373,7 @@ int main(int argc, char **argv) {
 }
 "#;
     let src = format!(
-        "{EXEC_C}\n\
+        "{WIN_PAD_17}{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 static char *av[] = {{ \"s\", \"tail\", 0 }};\n\
@@ -2568,5 +2568,433 @@ int main(void) {{\n\
     assert_eq!(
         e.stdout, b"",
         "ECHO was off before any input: nothing echoed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #801 — coreutils staging: a real /bin of registered executables
+// (crates/svm-run/demos/posix_utils/). Each tool is its own command module —
+// util.c (the #972 tag-protocol fd runtime) + the tool source, grep also
+// carrying posix_libc/regex.c — registered under /bin so execvp finds it on
+// PATH and fork→exec pipelines run genuine multi-command workloads.
+// ---------------------------------------------------------------------------
+
+const UTIL_C: &str = include_str!("../../svm-run/demos/posix_utils/util.c");
+
+/// Pads a witness DRIVER's window to ml >= 17: `exec` runs a command **in the caller's window**,
+/// so the caller's committed extent must fit the command's declared image — and the /bin tools
+/// (util.c + their statics) declare ml=17. Without the pad a small driver's exec is a clean
+/// `-EINVAL` refusal (the admissibility gate bounds by the committed extent), which is honest but
+/// not what these witnesses are for.
+const WIN_PAD_17: &str = "static char xs_win_pad_[65536];\n";
+
+/// Compile and register `/bin/<name>` for each requested tool. Staging only
+/// what a witness needs keeps the per-test chibicc cost proportional.
+fn stage_coreutils(host: &mut Host, posix: &Posix, names: &[&str]) {
+    const TOOLS: &[(&str, &str, bool)] = &[
+        (
+            "true",
+            include_str!("../../svm-run/demos/posix_utils/true.c"),
+            false,
+        ),
+        (
+            "false",
+            include_str!("../../svm-run/demos/posix_utils/false.c"),
+            false,
+        ),
+        (
+            "echo",
+            include_str!("../../svm-run/demos/posix_utils/echo.c"),
+            false,
+        ),
+        (
+            "cat",
+            include_str!("../../svm-run/demos/posix_utils/cat.c"),
+            false,
+        ),
+        (
+            "seq",
+            include_str!("../../svm-run/demos/posix_utils/seq.c"),
+            false,
+        ),
+        (
+            "head",
+            include_str!("../../svm-run/demos/posix_utils/head.c"),
+            false,
+        ),
+        (
+            "wc",
+            include_str!("../../svm-run/demos/posix_utils/wc.c"),
+            false,
+        ),
+        (
+            "sort",
+            include_str!("../../svm-run/demos/posix_utils/sort.c"),
+            false,
+        ),
+        (
+            "uniq",
+            include_str!("../../svm-run/demos/posix_utils/uniq.c"),
+            false,
+        ),
+        (
+            "grep",
+            include_str!("../../svm-run/demos/posix_utils/grep.c"),
+            true,
+        ),
+        (
+            "ls",
+            include_str!("../../svm-run/demos/posix_utils/ls.c"),
+            false,
+        ),
+        (
+            "pwd",
+            include_str!("../../svm-run/demos/posix_utils/pwd.c"),
+            false,
+        ),
+    ];
+    for want in names {
+        let (_, src, rx) = TOOLS
+            .iter()
+            .find(|(n, _, _)| n == want)
+            .unwrap_or_else(|| panic!("no such coreutil: {want}"));
+        let tu = if *rx {
+            format!("{UTIL_C}\n{REGEX_C}\n{src}")
+        } else {
+            format!("{UTIL_C}\n{src}")
+        };
+        stage_executable(host, posix, &format!("/bin/{want}"), &tu);
+    }
+}
+
+/// #801 coreutils — **the three-stage pipeline, every stage a real exec'd
+/// program**: `seq 100 | head -n 10 | wc -l` with all plumbing done the Unix
+/// way (pipe + fork + dup2 + execvp-on-PATH). The parent reads exactly "10\n"
+/// from the tail pipe, gets true EOF once wc exits, and reaps three zero
+/// statuses — carried pipe ends, PATH resolution, and argv delivery all
+/// crossing three exec boundaries at once.
+#[test]
+fn c_coreutils_pipeline_seq_head_wc() {
+    let src = format!(
+        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_dup2(int cap, long o, long n);\n\
+long __px_setenv(int cap, long name, long nlen, long val, long vlen, long ow);\n\
+static char *av1[] = {{ \"seq\", \"100\", 0 }};\n\
+static char *av2[] = {{ \"head\", \"-n\", \"10\", 0 }};\n\
+static char *av3[] = {{ \"wc\", \"-l\", 0 }};\n\
+static int pa[2]; static int pb[2]; static int pc[2];\n\
+static int st1; static int st2; static int st3;\n\
+static char b[16];\n\
+static long p1; static long p2; static long p3;\n\
+static void shut(void) {{\n\
+  close(pa[0]); close(pa[1]); close(pb[0]); close(pb[1]); close(pc[0]); close(pc[1]);\n\
+}}\n\
+int main(void) {{\n\
+  __px_setenv(0, (long)\"PATH\", 4, (long)\"/bin\", 4, 1);\n\
+  if (pipe(pa) != 0 || pipe(pb) != 0 || pipe(pc) != 0) return 1;\n\
+  p1 = __px_fork(0, 0);\n\
+  if (p1 < 0) return 2;\n\
+  if (p1 == 0) {{\n\
+    __px_dup2(0, pa[1], 1); shut();\n\
+    execvp(\"seq\", av1); return 99;\n\
+  }}\n\
+  p2 = __px_fork(0, 0);\n\
+  if (p2 < 0) return 2;\n\
+  if (p2 == 0) {{\n\
+    __px_dup2(0, pa[0], 0); __px_dup2(0, pb[1], 1); shut();\n\
+    execvp(\"head\", av2); return 99;\n\
+  }}\n\
+  p3 = __px_fork(0, 0);\n\
+  if (p3 < 0) return 2;\n\
+  if (p3 == 0) {{\n\
+    __px_dup2(0, pb[0], 0); __px_dup2(0, pc[1], 1); shut();\n\
+    execvp(\"wc\", av3); return 99;\n\
+  }}\n\
+  close(pa[0]); close(pa[1]); close(pb[0]); close(pb[1]); close(pc[1]);\n\
+  long got = 0;\n\
+  for (;;) {{\n\
+    long n = read(pc[0], b + got, 16 - got);\n\
+    if (n < 0) return 3;\n\
+    if (n == 0) break;                       /* true EOF: wc exited, all dups gone */\n\
+    got = got + n;\n\
+  }}\n\
+  if (got != 3) return 4;\n\
+  if (b[0] != '1' || b[1] != '0' || b[2] != '\\n') return 5;\n\
+  close(pc[0]);\n\
+  if (__px_waitpid(0, p1, (long)&st1, 0) != p1) return 6;\n\
+  if (__px_waitpid(0, p2, (long)&st2, 0) != p2) return 7;\n\
+  if (__px_waitpid(0, p3, (long)&st3, 0) != p3) return 8;\n\
+  if (((st1 >> 8) & 0xff) != 0) return 9;\n\
+  if (((st2 >> 8) & 0xff) != 0) return 10;\n\
+  if (((st3 >> 8) & 0xff) != 0) return 11;\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["seq", "head", "wc"]);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "seq | head | wc across three exec boundaries: \"10\\n\", true EOF, three zero statuses"
+    );
+}
+
+/// #801 coreutils — **parent-fed `sort | uniq -c`**: the parent writes an
+/// unsorted, duplicated stream into the head pipe, closes it, and reads the
+/// collapsed counted output from the tail — sort's whole-input buffering
+/// (park until the feed closes) and uniq's adjacent-run collapse both running
+/// as exec'd programs.
+#[test]
+fn c_coreutils_sort_uniq_counts() {
+    let src = format!(
+        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_dup2(int cap, long o, long n);\n\
+long __px_setenv(int cap, long name, long nlen, long val, long vlen, long ow);\n\
+static char *av1[] = {{ \"sort\", 0 }};\n\
+static char *av2[] = {{ \"uniq\", \"-c\", 0 }};\n\
+static int pa[2]; static int pb[2]; static int pc[2];\n\
+static int st1; static int st2;\n\
+static char b[16];\n\
+static char exp[9] = \"3 a\\n2 b\\n\";\n\
+static long p1; static long p2;\n\
+static void shut(void) {{\n\
+  close(pa[0]); close(pa[1]); close(pb[0]); close(pb[1]); close(pc[0]); close(pc[1]);\n\
+}}\n\
+int main(void) {{\n\
+  __px_setenv(0, (long)\"PATH\", 4, (long)\"/bin\", 4, 1);\n\
+  if (pipe(pa) != 0 || pipe(pb) != 0 || pipe(pc) != 0) return 1;\n\
+  p1 = __px_fork(0, 0);\n\
+  if (p1 < 0) return 2;\n\
+  if (p1 == 0) {{\n\
+    __px_dup2(0, pa[0], 0); __px_dup2(0, pb[1], 1); shut();\n\
+    execvp(\"sort\", av1); return 99;\n\
+  }}\n\
+  p2 = __px_fork(0, 0);\n\
+  if (p2 < 0) return 2;\n\
+  if (p2 == 0) {{\n\
+    __px_dup2(0, pb[0], 0); __px_dup2(0, pc[1], 1); shut();\n\
+    execvp(\"uniq\", av2); return 99;\n\
+  }}\n\
+  close(pa[0]); close(pb[0]); close(pb[1]); close(pc[1]);\n\
+  if (write(pa[1], \"b\\na\\nb\\na\\na\\n\", 10) != 10) return 3;\n\
+  close(pa[1]);                              /* sort's stdin EOFs: it can sort and emit */\n\
+  long got = 0;\n\
+  for (;;) {{\n\
+    long n = read(pc[0], b + got, 16 - got);\n\
+    if (n < 0) return 4;\n\
+    if (n == 0) break;\n\
+    got = got + n;\n\
+  }}\n\
+  if (got != 8) return 5;\n\
+  long i;\n\
+  for (i = 0; i < 8; i = i + 1) if (b[i] != exp[i]) return 6;\n\
+  close(pc[0]);\n\
+  if (__px_waitpid(0, p1, (long)&st1, 0) != p1) return 7;\n\
+  if (__px_waitpid(0, p2, (long)&st2, 0) != p2) return 8;\n\
+  if (((st1 >> 8) & 0xff) != 0) return 9;\n\
+  if (((st2 >> 8) & 0xff) != 0) return 10;\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["sort", "uniq"]);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "parent-fed sort | uniq -c: \"3 a\\n2 b\\n\" and two zero statuses"
+    );
+}
+
+/// #801 coreutils — **grep is the posix_libc ERE engine running as a
+/// program**: an anchored alternation over a memfs file prints exactly the
+/// matching lines and exits 0; a miss prints nothing and exits 1 (the
+/// grep(1) exit contract shells' `if grep -q ...` lives on).
+#[test]
+fn c_coreutils_grep_matches_and_exit_codes() {
+    let src = format!(
+        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_dup2(int cap, long o, long n);\n\
+long __px_setenv(int cap, long name, long nlen, long val, long vlen, long ow);\n\
+static char *av1[] = {{ \"grep\", \"^(al|gam)\", \"/data.txt\", 0 }};\n\
+static char *av2[] = {{ \"grep\", \"zeta\", \"/data.txt\", 0 }};\n\
+static int fds[2];\n\
+static int st1; static int st2;\n\
+static char b[32];\n\
+static char exp[17] = \"alpha 1\\ngamma 3\\n\";\n\
+static long p1; static long p2;\n\
+int main(void) {{\n\
+  __px_setenv(0, (long)\"PATH\", 4, (long)\"/bin\", 4, 1);\n\
+  if (pipe(fds) != 0) return 1;\n\
+  p1 = __px_fork(0, 0);\n\
+  if (p1 < 0) return 2;\n\
+  if (p1 == 0) {{\n\
+    __px_dup2(0, fds[1], 1); close(fds[0]); close(fds[1]);\n\
+    execvp(\"grep\", av1); return 99;\n\
+  }}\n\
+  close(fds[1]);\n\
+  long got = 0;\n\
+  for (;;) {{\n\
+    long n = read(fds[0], b + got, 32 - got);\n\
+    if (n < 0) return 3;\n\
+    if (n == 0) break;\n\
+    got = got + n;\n\
+  }}\n\
+  close(fds[0]);\n\
+  if (got != 16) return 4;\n\
+  long i;\n\
+  for (i = 0; i < 16; i = i + 1) if (b[i] != exp[i]) return 5;\n\
+  if (__px_waitpid(0, p1, (long)&st1, 0) != p1) return 6;\n\
+  if (((st1 >> 8) & 0xff) != 0) return 7;      /* hit: exit 0 */\n\
+  p2 = __px_fork(0, 0);\n\
+  if (p2 < 0) return 8;\n\
+  if (p2 == 0) {{\n\
+    execvp(\"grep\", av2); return 99;\n\
+  }}\n\
+  if (__px_waitpid(0, p2, (long)&st2, 0) != p2) return 9;\n\
+  if (((st2 >> 8) & 0xff) != 1) return 10;     /* miss: exit 1 */\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["grep"]);
+        posix.write_file("/data.txt", b"alpha 1\nbeta 2\ngamma 3\n");
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "grep over memfs: anchored ERE prints the two hits and exits 0; a miss exits 1"
+    );
+}
+
+/// #801 coreutils — **the smoke sweep**: true/false exit codes, echo's argv
+/// join, cat of a memfs file, ls's sorted directory listing, and pwd — six
+/// tools exec'd through one capture helper, each output byte-checked. This is
+/// the "real /bin" witness: a populated userland any shell loop can walk.
+#[test]
+fn c_coreutils_smoke_echo_cat_ls_pwd_true_false() {
+    let src = format!(
+        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_dup2(int cap, long o, long n);\n\
+long __px_setenv(int cap, long name, long nlen, long val, long vlen, long ow);\n\
+static char ob[64];\n\
+static long olen;\n\
+static int runtool(char **av, long want) {{\n\
+  int fds[2];\n\
+  if (pipe(fds) != 0) return 1;\n\
+  long pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 2;\n\
+  if (pid == 0) {{\n\
+    __px_dup2(0, fds[1], 1); close(fds[0]); close(fds[1]);\n\
+    execvp(av[0], av);\n\
+    return 99;                                /* exec failed: exits the twin via main */\n\
+  }}\n\
+  close(fds[1]);\n\
+  olen = 0;\n\
+  for (;;) {{\n\
+    long n = read(fds[0], ob + olen, 64 - olen);\n\
+    if (n < 0) return 3;\n\
+    if (n == 0) break;\n\
+    olen = olen + n;\n\
+  }}\n\
+  close(fds[0]);\n\
+  int st;\n\
+  if (__px_waitpid(0, pid, (long)&st, 0) != pid) return 4;\n\
+  if (((st >> 8) & 0xff) != want) return 5;\n\
+  return 0;\n\
+}}\n\
+static int outis(char *s) {{\n\
+  long i = 0;\n\
+  while (s[i]) {{ if (i >= olen || ob[i] != s[i]) return 0; i = i + 1; }}\n\
+  return i == olen;\n\
+}}\n\
+static char *avt[] = {{ \"true\", 0 }};\n\
+static char *avf[] = {{ \"false\", 0 }};\n\
+static char *ave[] = {{ \"echo\", \"hi\", \"there\", 0 }};\n\
+static char *avc[] = {{ \"cat\", \"/f.txt\", 0 }};\n\
+static char *avl[] = {{ \"ls\", \"/d\", 0 }};\n\
+static char *avp[] = {{ \"pwd\", 0 }};\n\
+int main(void) {{\n\
+  __px_setenv(0, (long)\"PATH\", 4, (long)\"/bin\", 4, 1);\n\
+  int r;\n\
+  r = runtool(avt, 0); if (r) return 10 + r;\n\
+  if (!outis(\"\")) return 19;\n\
+  r = runtool(avf, 1); if (r) return 20 + r;\n\
+  if (!outis(\"\")) return 29;\n\
+  r = runtool(ave, 0); if (r) return 30 + r;\n\
+  if (!outis(\"hi there\\n\")) return 39;\n\
+  r = runtool(avc, 0); if (r) return 40 + r;\n\
+  if (!outis(\"xyz\\n\")) return 49;\n\
+  r = runtool(avl, 0); if (r) return 50 + r;\n\
+  if (!outis(\"a\\nb\\n\")) return 59;\n\
+  r = runtool(avp, 0); if (r) return 60 + r;\n\
+  if (!outis(\"/\\n\")) return 69;\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["true", "false", "echo", "cat", "ls", "pwd"]);
+        posix.write_file("/f.txt", b"xyz\n");
+        posix.write_file("/d/a", b"1");
+        posix.write_file("/d/b", b"2");
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "true/false statuses, echo join, cat of memfs, sorted ls, pwd — all as exec'd /bin tools"
+    );
+}
+
+/// #801 coreutils (regression) — **argv survives repeated fork→exec rounds**: the args-region
+/// pack in exec.c must stage in private scratch, because a non-child caller's own statics (these
+/// `av` arrays included) legitimately live inside `[128, 16384)` — the in-place pack used to
+/// trample them mid-loop on the second round (caught by the coreutils grep witness).
+#[test]
+fn c_exec_argv_survives_a_second_twin() {
+    const CMD: &str = r#"
+int main(int argc, char **argv) {
+  if (argc != 2) return 80 + argc;
+  if (argv[1][0] != 'x') return 79;
+  return 7;
+}
+"#;
+    let src = format!(
+        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_setenv(int cap, long name, long nlen, long val, long vlen, long ow);\n\
+static char *av[] = {{ \"c\", \"x\", 0 }};\n\
+static int st;\n\
+int main(void) {{\n\
+  __px_setenv(0, (long)\"PATH\", 4, (long)\"/bin\", 4, 1);\n\
+  long pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 1;\n\
+  if (pid == 0) {{ execve(\"/bin/c\", av, 0); return 99; }}\n\
+  if (__px_waitpid(0, pid, (long)&st, 0) != pid) return 2;\n\
+  if (((st >> 8) & 0xff) != 7) return 3;\n\
+  pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 4;\n\
+  if (pid == 0) {{ execve(\"/bin/c\", av, 0); return 99; }}\n\
+  if (__px_waitpid(0, pid, (long)&st, 0) != pid) return 5;\n\
+  if (((st >> 8) & 0xff) != 7) return 6;\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_executable(host, posix, "/bin/c", CMD);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "argv survives a second twin's execve"
     );
 }

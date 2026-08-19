@@ -82,38 +82,55 @@ static int xs_try_script_(char *path, char **argv, char **envp) {
   return r;
 }
 
+/* The args region `[128, 16384)` is not private to exec: a NON-child module's own
+   data legitimately starts right after 128 (only child-entry images reserve the
+   region), and the strings argv points at may themselves live INSIDE it (a command
+   re-execing with argv into its own region). Packing in place therefore tramples
+   the very bytes still being read — the original in-place pack survived every
+   short-argv witness by byte-count luck and corrupted longer ones mid-loop. So:
+   STAGE the pack in private scratch (every source string is read before any region
+   byte is written), SAVE the caller's bytes under the region, splash at the point
+   of no return, and RESTORE on a refused exec — POSIX: execve returns only on
+   failure, and a failed exec must leave the caller intact. */
+static char xs_pk_[16248]; /* staged {strings} — 16384 - 136 */
+static char xs_sv_[16256]; /* caller bytes under [128, 128+8+packed), restored on refusal */
+
 int execve(char *path, char **argv, char **envp) {
   long m = __px_exec_resolve(0, (long)path, xs_len_(path));
   if (m == -13) return xs_try_script_(path, argv, envp);
   if (m < 0) return (int)m;
-  /* Pack the args region: argc/envc header at 128, strings NUL-packed at 136.
-     Bounds-checked against the region end (16384) — overflow is -E2BIG with
-     nothing exec'd (the region is scratch until __vm_exec_module commits). */
-  int *hdr = (int *)128;
-  char *s = (char *)136;
-  char *end = (char *)16384;
   long argc = 0;
   long envc = 0;
   long i;
   for (i = 0; argv && argv[i]; i = i + 1) argc = argc + 1;
   for (i = 0; envp && envp[i]; i = i + 1) envc = envc + 1;
+  /* Stage: NUL-packed strings into scratch; -E2BIG on overflow, nothing written. */
+  long s = 0;
   for (i = 0; i < argc + envc; i = i + 1) {
     char *p = i < argc ? argv[i] : envp[i - argc];
     while (*p) {
-      if (s >= end - 1) return -7; /* E2BIG */
-      *s = *p;
+      if (s >= 16247) return -7; /* E2BIG */
+      xs_pk_[s] = *p;
       s = s + 1;
       p = p + 1;
     }
-    *s = 0;
+    xs_pk_[s] = 0;
     s = s + 1;
   }
+  /* Save the caller's region bytes, splash header + strings, exec. */
+  char *reg = (char *)128;
+  for (i = 0; i < s + 8; i = i + 1) xs_sv_[i] = reg[i];
+  int *hdr = (int *)128;
   hdr[0] = (int)argc;
   hdr[1] = (int)envc;
+  for (i = 0; i < s; i = i + 1) reg[8 + i] = xs_pk_[i];
   /* Empty grant list (v1 self-contained commands); the window hint is advisory
      since #773 — the command runs in the caller's window if it fits. */
   __vm_exec_module(m, 0, 0, 0, 17);
-  return -22; /* only on failure: the core refused (-EINVAL) and we still run */
+  /* Only reached on refusal (-EINVAL): the caller keeps running — restore the
+     bytes the splash covered so its own data (if any lived there) is intact. */
+  for (i = 0; i < s + 8; i = i + 1) reg[i] = xs_sv_[i];
+  return -22;
 }
 
 int execv(char *path, char **argv) { return execve(path, argv, 0); }
