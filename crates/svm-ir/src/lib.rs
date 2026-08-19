@@ -2843,6 +2843,224 @@ impl Inst {
         }
     }
 
+    /// Apply `f` to **every value operand** of this instruction, in place. Exhaustive on purpose
+    /// (no wildcard arm): adding an `Inst` variant that carries a [`ValIdx`] must fail to compile
+    /// here rather than silently skip an operand and miscompile after a renumbering pass. `FuncIdx`
+    /// immediates (`RefFunc`/`ThreadSpawn::func`) are *not* value operands and are left alone.
+    ///
+    /// This lives beside [`Inst::effects`] so svm-ir is the single source of truth for both "what
+    /// effect does this op have" and "what are its operands"; the optimizer's `map_operands` /
+    /// `each_operand` are thin adapters over it (#913).
+    pub fn for_each_operand_mut(&mut self, f: &mut impl FnMut(&mut ValIdx)) {
+        match self {
+            // No value operands.
+            Inst::ConstI32(_)
+            | Inst::ConstI64(_)
+            | Inst::ConstF32(_)
+            | Inst::ConstF64(_)
+            | Inst::ConstV128(_)
+            // Link-form data addresses carry only immediates (a name+addend, or an offset) — no value
+            // operands to renumber.
+            | Inst::DataSym { .. }
+            | Inst::DataSelf { .. }
+            | Inst::DataTop
+            | Inst::RefFunc { .. }
+            | Inst::CapSelfCount
+            | Inst::CapSelfAttest
+            | Inst::CapSelfTypeId { .. }
+            | Inst::ExportHandle { .. }
+            | Inst::VcpuTlsGet
+            | Inst::DurableShadowBase
+            | Inst::AtomicFence { .. }
+            | Inst::SimdWidthBytes => {}
+
+            // Exactly one operand, named `a`.
+            Inst::IntUn { a, .. }
+            | Inst::Eqz { a, .. }
+            | Inst::Convert { a, .. }
+            | Inst::FUn { a, .. }
+            | Inst::FToISat { a, .. }
+            | Inst::FToITrap { a, .. }
+            | Inst::IToFConv { a, .. }
+            | Inst::Cast { a, .. }
+            | Inst::PtrCast { a, .. }
+            | Inst::Load { addr: a, .. }
+            | Inst::AtomicLoad { addr: a, .. }
+            | Inst::V128Load { addr: a, .. }
+            | Inst::CapSelfGet { idx: a }
+            | Inst::VcpuTlsSet { val: a }
+            | Inst::Suspend { value: a }
+            | Inst::SetJmp { buf: a }
+            | Inst::ThreadJoin { handle: a }
+            | Inst::Splat { a, .. }
+            | Inst::ExtractLane { a, .. }
+            | Inst::VIntUn { a, .. }
+            | Inst::VWiden { a, .. }
+            | Inst::VConvert { a, .. }
+            | Inst::VPopcnt { a, .. }
+            | Inst::VExtAddPairwise { a, .. }
+            | Inst::VAnyTrue { a, .. }
+            | Inst::VAllTrue { a, .. }
+            | Inst::VBitmask { a, .. }
+            | Inst::VFloatUn { a, .. }
+            | Inst::VNot { a, .. } => {
+                f(a);
+            }
+
+            // Exactly two operands, named `a` and `b`.
+            Inst::IntBin { a, b, .. }
+            | Inst::IntCmp { a, b, .. }
+            | Inst::FBin { a, b, .. }
+            | Inst::FCmp { a, b, .. }
+            | Inst::PtrAdd { a, b }
+            | Inst::Store {
+                addr: a, value: b, ..
+            }
+            | Inst::AtomicStore {
+                addr: a, value: b, ..
+            }
+            | Inst::V128Store {
+                addr: a, value: b, ..
+            }
+            | Inst::AtomicRmw {
+                addr: a, value: b, ..
+            }
+            | Inst::MemoryNotify {
+                addr: a, count: b, ..
+            }
+            | Inst::ContNew { func: a, sp: b }
+            | Inst::ContResume { k: a, arg: b }
+            | Inst::ContResumeBlock { k: a, arg: b }
+            | Inst::CapSelfResolve {
+                name_ptr: a,
+                name_len: b,
+            }
+            | Inst::LongJmp { buf: a, val: b }
+            | Inst::ThreadSpawn { sp: a, arg: b, .. }
+            | Inst::ReplaceLane { a, b, .. }
+            | Inst::VIntBin { a, b, .. }
+            | Inst::VIntCmp { a, b, .. }
+            | Inst::VFloatCmp { a, b, .. }
+            | Inst::VShift { a, amt: b, .. }
+            | Inst::VSatBin { a, b, .. }
+            | Inst::VNarrow { a, b, .. }
+            | Inst::VPMinMax { a, b, .. }
+            | Inst::VAvgr { a, b, .. }
+            | Inst::VDot { a, b }
+            | Inst::VDotI8 { a, b }
+            | Inst::VExtMul { a, b, .. }
+            | Inst::VQ15MulrSat { a, b }
+            | Inst::VFloatBin { a, b, .. }
+            | Inst::VBitBin { a, b, .. }
+            | Inst::Shuffle { a, b, .. }
+            | Inst::Swizzle { a, b } => {
+                f(a);
+                f(b);
+            }
+
+            // Three operands.
+            Inst::Select { cond, a, b } => {
+                f(cond);
+                f(a);
+                f(b);
+            }
+            // Bulk-memory ops (D62): dst, src/val, len — all value operands.
+            Inst::MemCopy { dst, src, len } | Inst::MemMove { dst, src, len } => {
+                f(dst);
+                f(src);
+                f(len);
+            }
+            Inst::MemFill { dst, val, len } => {
+                f(dst);
+                f(val);
+                f(len);
+            }
+            Inst::Bitselect { a, b, mask } => {
+                f(a);
+                f(b);
+                f(mask);
+            }
+            // Scalar / vector fused multiply-add: `a·b + c`.
+            Inst::Fma { a, b, c, .. } | Inst::VFma { a, b, c, .. } => {
+                f(a);
+                f(b);
+                f(c);
+            }
+            Inst::CapSelfLabel {
+                handle,
+                buf_ptr,
+                buf_cap,
+            } => {
+                f(handle);
+                f(buf_ptr);
+                f(buf_cap);
+            }
+            Inst::AtomicCmpxchg {
+                addr,
+                expected,
+                replacement,
+                ..
+            } => {
+                f(addr);
+                f(expected);
+                f(replacement);
+            }
+            Inst::MemoryWait {
+                addr,
+                expected,
+                timeout,
+                ..
+            } => {
+                f(addr);
+                f(expected);
+                f(timeout);
+            }
+            Inst::GcRoots {
+                heap_lo,
+                heap_hi,
+                mask,
+                buf,
+                cap,
+            } => {
+                f(heap_lo);
+                f(heap_hi);
+                f(mask);
+                f(buf);
+                f(cap);
+            }
+
+            // Variable-length operand lists.
+            Inst::Call { args, .. } => {
+                for v in args.iter_mut() {
+                    f(v);
+                }
+            }
+            Inst::CallIndirect { idx, args, .. } => {
+                f(idx);
+                for v in args.iter_mut() {
+                    f(v);
+                }
+            }
+            Inst::CapSelfCovers { handle, .. } => f(handle),
+            Inst::CapCall { handle, args, .. }
+            | Inst::CallImportDyn { handle, args, .. }
+            | Inst::CallSym { handle, args, .. } => {
+                f(handle);
+                for v in args.iter_mut() {
+                    f(v);
+                }
+            }
+            Inst::CallImport { args, .. } => {
+                for v in args.iter_mut() {
+                    f(v);
+                }
+            }
+            // Phase-2 attach (IMPORTS.md): the handle is its one value operand (`import` is an
+            // immediate index into the manifest, not a value).
+            Inst::ImportAttach { handle, .. } => f(handle),
+        }
+    }
+
     /// How many values this instruction appends at the next block-local indices.
     ///
     /// Most instructions append exactly one; `Store` appends none; a `Call` appends
@@ -2930,6 +3148,66 @@ pub enum Terminator {
     /// Abort: control must not reach here. Delivers a trap to the host (§3b/§5).
     /// Covers both `unreachable` and language-level `trap`/`assert` failure.
     Unreachable,
+}
+
+impl Terminator {
+    /// Apply `f` to every **value operand** of this terminator, in place — the branch condition /
+    /// table index, all edge block-arguments, and return / tail-call arguments. Block-index
+    /// *targets* are **not** value operands and are left untouched (the optimizer remaps those
+    /// separately). Exhaustive on purpose (no wildcard arm), the sibling of
+    /// [`Inst::for_each_operand_mut`], so svm-ir owns terminator operand traversal too (#913).
+    pub fn for_each_operand_mut(&mut self, f: &mut impl FnMut(&mut ValIdx)) {
+        match self {
+            Terminator::Br { args, .. } => {
+                for v in args.iter_mut() {
+                    f(v);
+                }
+            }
+            Terminator::BrIf {
+                cond,
+                then_args,
+                else_args,
+                ..
+            } => {
+                f(cond);
+                for v in then_args.iter_mut().chain(else_args.iter_mut()) {
+                    f(v);
+                }
+            }
+            Terminator::BrTable {
+                idx,
+                targets,
+                default,
+            } => {
+                f(idx);
+                for (_, args) in targets.iter_mut() {
+                    for v in args.iter_mut() {
+                        f(v);
+                    }
+                }
+                for v in default.1.iter_mut() {
+                    f(v);
+                }
+            }
+            Terminator::Return(vals) => {
+                for v in vals.iter_mut() {
+                    f(v);
+                }
+            }
+            Terminator::ReturnCall { args, .. } => {
+                for v in args.iter_mut() {
+                    f(v);
+                }
+            }
+            Terminator::ReturnCallIndirect { idx, args, .. } => {
+                f(idx);
+                for v in args.iter_mut() {
+                    f(v);
+                }
+            }
+            Terminator::Unreachable => {}
+        }
+    }
 }
 
 /// A basic block: a typed parameter list, a straight-line body, one terminator.
