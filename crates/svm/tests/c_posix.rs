@@ -2288,3 +2288,117 @@ int main(void) {{\n\
     );
     assert_eq!(e.stdout, b"OK", "the post-refusal write proves the restore");
 }
+
+/// #972 exec carry — **the pipeline crosses the exec boundary**: the shell pipes, forks, and the
+/// twin `dup2`s the write end onto fd 1, closes its originals, and `execve`s a `__px_`-linked
+/// command. The image-replace carries the twin's pipe ends into the fresh powerbox (counts bumped
+/// before the old ends release — no EOF/EPIPE dip) and fires the personality's exec-remap hook,
+/// re-pointing the fd-1 token at the carried end's new handle — so the exec'd command's plain
+/// `write(1, …)` flows through the tag redirect into the pipe. The parent, parked in `read`, gets
+/// the command's bytes, then **true EOF** when the command exits (its teardown releases the carried
+/// write end), and reaps the command's status. `cmd | shell`-shape, personality-native.
+#[test]
+fn c_pipeline_crosses_the_exec_boundary() {
+    const WR: &str = r#"
+long __px_write(int cap, long fd, long buf, long len);
+long __vm_write(int fd, void *buf, long len);
+static long px_h_(long r) { return r <= -1048576 ? -(r + 1048576) : -1; }
+static long wr(long fd, void *b, long n) {
+  long r = __px_write(0, fd, (long)b, n);
+  long h = px_h_(r);
+  if (h < 0) return r;
+  return __vm_write((int)h, b, n);
+}
+int main(void) {
+  if (wr(1, "EXEC>", 5) != 5) return 90;  /* fd 1 is the dup2'd pipe: tag -> remapped handle */
+  return 6;
+}
+"#;
+    let src = format!(
+        "{PIPE_SHIM}\n{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_dup2(int cap, long o, long n);\n\
+static char *av[] = {{ \"wr\", 0 }};\n\
+static int fds[2];\n\
+static int status;\n\
+static char b[8];\n\
+static long pid; static long h;\n\
+int main(void) {{\n\
+  if (pipe(fds) != 0) return 1;\n\
+  pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 2;\n\
+  if (pid == 0) {{\n\
+    if (__px_dup2(0, fds[1], 1) != 1) return 91;\n\
+    close(fds[0]);                        /* the twin's read end: released */\n\
+    close(fds[1]);                        /* not the last dup: fd 1 keeps the write end */\n\
+    execve(\"/bin/wr\", av, 0);\n\
+    return 99;\n\
+  }}\n\
+  close(fds[1]);                          /* parent's write end gone: the twin's keeps it open */\n\
+  long n = read(fds[0], b, 8);            /* PARKS until the exec'd command writes */\n\
+  if (n != 5) return 3;\n\
+  if (b[0] != 'E' || b[4] != '>') return 4;\n\
+  n = read(fds[0], b, 8);                 /* command exited: carried end released -> true EOF */\n\
+  if (n != 0) return 5;\n\
+  h = __px_waitpid(0, pid, (long)&status, 0);\n\
+  if (h != pid) return 7;\n\
+  if (((status >> 8) & 0xff) != 6) return 8;\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_executable(host, posix, "/bin/wr", WR);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "the exec'd command's write flowed through the carried, remapped pipe end; EOF and status reaped"
+    );
+}
+
+/// #801 — **`#!` scripts, one level**: `execve` of a memfs file whose first line is
+/// `#!/bin/echo6 X` re-execs the interpreter with argv spliced per POSIX —
+/// `[interp, optarg, scriptpath, argv[1..]]` — so the (registered, `__px_`-linked) interpreter
+/// command sees all four and the parent reaps its status through the twin's pid.
+#[test]
+fn c_execve_runs_a_hashbang_script() {
+    const INTERP: &str = r#"
+int main(int argc, char **argv) {
+  if (argc != 4) return 80 + argc;
+  if (argv[1][0] != 'X') return 91;      /* the #! optional arg */
+  if (argv[2][0] != '/') return 92;      /* the script path */
+  if (argv[3][0] != 't') return 93;      /* the caller's argv[1] */
+  return 6;
+}
+"#;
+    let src = format!(
+        "{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+static char *av[] = {{ \"s\", \"tail\", 0 }};\n\
+static int status;\n\
+static long pid; static long h;\n\
+int main(void) {{\n\
+  pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 1;\n\
+  if (pid == 0) {{\n\
+    execve(\"/s.sh\", av, 0);\n\
+    return 99;\n\
+  }}\n\
+  h = __px_waitpid(0, pid, (long)&status, 0);\n\
+  if (h != pid) return 2;\n\
+  if (((status >> 8) & 0xff) != 6) return 200 + ((status >> 8) & 0xff);\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_executable(host, posix, "/bin/echo6", INTERP);
+        posix.write_file("/s.sh", b"#!/bin/echo6 X\necho hi\n");
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "the #! line re-exec'd the interpreter with [interp, X, /s.sh, tail]"
+    );
+}

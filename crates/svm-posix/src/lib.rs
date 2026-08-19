@@ -582,9 +582,21 @@ enum FdEntry {
 }
 
 /// The shared token behind every intra-process dup of one adopted core pipe-end fd
-/// ([`FdEntry::CorePipe`]): the handle number, plus the `Arc` itself as the dup count.
+/// ([`FdEntry::CorePipe`]): the handle number, plus the `Arc` itself as the dup count. Atomic
+/// (#972): the exec-remap hook re-points it when the image-replace renumbers the carried end.
 struct CorePipeToken {
-    handle: i32,
+    handle: std::sync::atomic::AtomicI32,
+}
+
+impl CorePipeToken {
+    fn new(h: i32) -> Self {
+        CorePipeToken {
+            handle: std::sync::atomic::AtomicI32::new(h),
+        }
+    }
+    fn get(&self) -> i32 {
+        self.handle.load(Ordering::Relaxed)
+    }
 }
 
 impl FdEntry {
@@ -1462,6 +1474,7 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
     // cwd / env / signal state over the shared memfs and open-file descriptions — real POSIX fork
     // semantics. `Host::fork_powerbox` calls this factory to carry libc into the twin, instead of
     // failing closed on an opaque closure.
+    let root_for_remap = Arc::clone(&root);
     let handle = host.grant_host_proc_forkable(
         handler(Arc::clone(&world), Arc::clone(&root)),
         fork_factory(world, root),
@@ -1471,6 +1484,9 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
     // resolver — the op knowledge travels with the grant.
     let (names, sigs) = px_vtable();
     host.set_host_proc_vtable(handle, names, sigs);
+    // #972 — the root process's exec-remap hook: an execve from the root re-points its adopted
+    // pipe fds at the carried ends' new handles (fork twins get theirs from the factory).
+    host.push_exec_remap_hook(exec_remap_hook(root_for_remap));
     (handle, posix)
 }
 
@@ -1484,6 +1500,24 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
 /// re-grant path, where no `TaskId` exists yet); slice 3 gives such a clone a pid from the
 /// personality's own allocator instead — every process is table-addressable, so an embedder
 /// ([`Posix::kill_pid`]) or a sibling can signal a spawned shell just like a fork twin.
+/// #972 — the **exec remap hook** over one process: the core's image-replace carried the
+/// process's pipe ends into fresh powerbox slots and reports the `(old, new)` handle pairs; walk
+/// the fd table and re-point every [`CorePipeToken`] naming an old handle (dup groups share one
+/// token — the atomic store covers the group). Policy here, mechanism in the core (invariant 4).
+fn exec_remap_hook(proc_: Arc<Mutex<Proc>>) -> svm_interp::ExecRemapHook {
+    Arc::new(move |pairs: &[(i32, i32)]| {
+        let p = proc_.lock().unwrap_or_else(|e| e.into_inner());
+        for entry in p.fds.iter().flatten() {
+            if let FdEntry::CorePipe(t) = entry {
+                let cur = t.get();
+                if let Some((_, nh)) = pairs.iter().find(|(o, _)| *o == cur) {
+                    t.handle.store(*nh, Ordering::Relaxed);
+                }
+            }
+        }
+    })
+}
+
 fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFork {
     Arc::new(move |pid: u64| {
         // World before Proc — the canonical order. (This runs under the core's scheduler lock;
@@ -1541,8 +1575,9 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
         ForkedProc {
             handler: handler(Arc::clone(&world), Arc::clone(&child)),
             signal: Some((Arc::new(SignalDoor(Arc::clone(&child))), armed)),
-            refork: Some(fork_factory(Arc::clone(&world), child)),
+            refork: Some(fork_factory(Arc::clone(&world), Arc::clone(&child))),
             exit: Some(exit),
+            exec_remap: Some(exec_remap_hook(child)),
         }
     })
 }
@@ -1992,9 +2027,9 @@ impl Proc {
                     .map(|s| {
                         s.as_ref().map(|e| match e {
                             FdEntry::CorePipe(t) => FdEntry::CorePipe(Arc::clone(
-                                split.entry(Arc::as_ptr(t)).or_insert_with(|| {
-                                    Arc::new(CorePipeToken { handle: t.handle })
-                                }),
+                                split
+                                    .entry(Arc::as_ptr(t))
+                                    .or_insert_with(|| Arc::new(CorePipeToken::new(t.get()))),
                             )),
                             other => other.dup_clone(),
                         })
@@ -2084,7 +2119,7 @@ impl Ctx<'_> {
             // (backpressure park, `-EPIPE`; the shim raises SIGPIPE per disposition). Note this
             // also surfaces to `spawn`'s fd-1 routing — a CorePipe stdout for a spawn child is
             // out of slice-1 scope (exec carry, #972 slice 2) and fails closed here.
-            Some(FdEntry::CorePipe(t)) => return PX_TAG_BASE - t.handle as i64,
+            Some(FdEntry::CorePipe(t)) => return PX_TAG_BASE - t.get() as i64,
             _ => Sink::Bad,
         };
         // #798 — a background write to the proto-terminal rings SIGTTOU (doorbell; the write still
@@ -2149,7 +2184,7 @@ impl Ctx<'_> {
             // #972 — an adopted core pipe end: redirect the shim to the core cap-call read
             // (blocking/EINTR/EOF). No bytes move here; a non-shim caller sees a large negative
             // "error" and fails closed.
-            Some(FdEntry::CorePipe(t)) => return Ok(vec![PX_TAG_BASE - t.handle as i64]),
+            Some(FdEntry::CorePipe(t)) => return Ok(vec![PX_TAG_BASE - t.get() as i64]),
             _ => Src::Bad,
         };
         let chunk: Vec<u8> = match src {
@@ -2267,7 +2302,7 @@ impl Ctx<'_> {
                     // plain 0 — the description stays open through its dups (POSIX).
                     if let FdEntry::CorePipe(t) = &entry {
                         if Arc::strong_count(t) == 1 {
-                            return PX_TAG_BASE - t.handle as i64;
+                            return PX_TAG_BASE - t.get() as i64;
                         }
                     }
                     return 0;
@@ -2336,12 +2371,8 @@ impl Ctx<'_> {
         if rh < 0 || wh < 0 || rh > i32::MAX as i64 || wh > i32::MAX as i64 {
             return Ok(vec![EINVAL]);
         }
-        let rfd = self.alloc_fd(FdEntry::CorePipe(Arc::new(CorePipeToken {
-            handle: rh as i32,
-        })));
-        let wfd = self.alloc_fd(FdEntry::CorePipe(Arc::new(CorePipeToken {
-            handle: wh as i32,
-        })));
+        let rfd = self.alloc_fd(FdEntry::CorePipe(Arc::new(CorePipeToken::new(rh as i32))));
+        let wfd = self.alloc_fd(FdEntry::CorePipe(Arc::new(CorePipeToken::new(wh as i32))));
         let mut out = Vec::with_capacity(8);
         out.extend_from_slice(&(rfd as i32).to_le_bytes());
         out.extend_from_slice(&(wfd as i32).to_le_bytes());
