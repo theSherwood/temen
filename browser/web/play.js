@@ -2099,63 +2099,80 @@ async function runNimc(c) {
   c.el.stdout.textContent = '';
   c.el.canvas.hidden = true;
   const rec = runStart(c, { tier: 'interpreter' });
-  let nifler, nimsem, hexer, stdlib;
-  try {
-    // Each asset ships **gzipped** (phase `.svmb` are ~3–17 MB raw; the stdlib image ~2.4 MB): fetch
-    // the compressed bytes and inflate them in-browser (DecompressionStream — no library).
+  // Lazily fetch + inflate the four assets (each ships **gzipped**: phase `.svmb` are ~3–17 MB raw, the
+  // stdlib image ~2.4 MB; DecompressionStream inflates in-browser, no library). In the worker path this
+  // runs **once** — the worker caches the guests — so re-Runs ship only the source, not ~28 MB again.
+  const getAssets = async () => {
     const [gn, gs, gh, gl] = await Promise.all([
       fetchTimed(rec, c, ex.urls.nifler),
       fetchTimed(rec, c, ex.urls.nimsem),
       fetchTimed(rec, c, ex.urls.hexer),
       fetchTimed(rec, c, ex.urls.stdlib),
     ]);
-    [nifler, nimsem, hexer, stdlib] = await Promise.all([gunzip(gn), gunzip(gs), gunzip(gh), gunzip(gl)]);
+    const [nifler, nimsem, hexer, stdlib] = await Promise.all([gunzip(gn), gunzip(gs), gunzip(gh), gunzip(gl)]);
     logTo(c, `inflated: nifler ${nifler.length}B · nimsem ${nimsem.length}B · hexer ${hexer.length}B · stdlib ${stdlib.length}B`);
+    return { nifler, nimsem, hexer, stdlib };
+  };
+  const main = 'prog.nim';
+  const source = c.editor.getValue();
+  setState(c, 'running', 'compiling Nim (nifler → nimsem → hexer → link → run)…');
+  const t0 = performance.now();
+  let status, out, err;
+  try {
+    if (snapshotClient) {
+      // Off the main thread (issue #1005): the whole toolchain runs on the snapshot worker's own engine,
+      // so the ~1–3 min compile — or a runaway compiled guest that never returns — stalls only that
+      // worker, never the page. A fresh Run first `cancelNim`s any still-running one (terminates the
+      // stuck worker), so the card is never wedged by a previous hang.
+      snapshotClient.cancelNim();
+      const r = await snapshotClient.nimCompile(getAssets, source, main);
+      if (!r.ok) throw new Error(r.error || 'nim worker unavailable');
+      ({ status } = r);
+      out = r.stdout;
+      err = r.stderr;
+    } else {
+      // Fallback: no worker (e.g. the page lacks cross-origin isolation) — run on the main thread. This
+      // freezes the tab for the duration, but keeps the card working where a worker can't be spawned.
+      const { nifler, nimsem, hexer, stdlib } = await getAssets();
+      const srcBytes = new TextEncoder().encode(source);
+      const mainBytes = new TextEncoder().encode(main);
+      // Alloc every buffer before writing any (svm_alloc may grow/detach linear memory), then take one
+      // fresh view and fill them.
+      const np = eng.ex.svm_alloc(nifler.length);
+      const smp = eng.ex.svm_alloc(nimsem.length);
+      const hp = eng.ex.svm_alloc(hexer.length);
+      const ip = eng.ex.svm_alloc(stdlib.length);
+      const sp = eng.ex.svm_alloc(srcBytes.length);
+      const mp = eng.ex.svm_alloc(mainBytes.length);
+      const view = new Uint8Array(eng.memory.buffer);
+      view.set(nifler, np);
+      view.set(nimsem, smp);
+      view.set(hexer, hp);
+      view.set(stdlib, ip);
+      view.set(srcBytes, sp);
+      view.set(mainBytes, mp);
+      eng.ex.svm_compile_nim_fs(
+        np, nifler.length, smp, nimsem.length, hp, hexer.length,
+        ip, stdlib.length, sp, srcBytes.length, mp, mainBytes.length);
+      status = eng.ex.svm_status();
+      eng.ex.svm_dealloc(np, nifler.length);
+      eng.ex.svm_dealloc(smp, nimsem.length);
+      eng.ex.svm_dealloc(hp, hexer.length);
+      eng.ex.svm_dealloc(ip, stdlib.length);
+      eng.ex.svm_dealloc(sp, srcBytes.length);
+      eng.ex.svm_dealloc(mp, mainBytes.length);
+      out = readModuleStdout();
+      err = readModuleStderr();
+    }
   } catch (e) {
     setState(c, 'error', `${e.message} — run \`bash ../crates/svm-run/demos/nim_e2e_chain/build_e2e_chain.sh\` to build the phase guests + stdlib image`);
-    logTo(c, `fetch/inflate failed: ${e.message}`);
+    logTo(c, `compile failed: ${e.message}`);
     runNote(rec, { fetchError: e.message });
     runEnd(rec, { ok: false });
     return;
   }
-  const main = 'prog.nim';
-  const srcBytes = new TextEncoder().encode(c.editor.getValue());
-  const mainBytes = new TextEncoder().encode(main);
-  runNote(rec, {
-    niflerBytes: nifler.length, nimsemBytes: nimsem.length, hexerBytes: hexer.length,
-    stdlibBytes: stdlib.length, srcBytes: srcBytes.length,
-  });
-  setState(c, 'running', 'compiling Nim (nifler → nimsem → hexer → link → run)…');
-  const t0 = performance.now();
-  // Alloc every buffer before writing any (svm_alloc may grow/detach linear memory), then take one
-  // fresh view and fill them.
-  const np = eng.ex.svm_alloc(nifler.length);
-  const smp = eng.ex.svm_alloc(nimsem.length);
-  const hp = eng.ex.svm_alloc(hexer.length);
-  const ip = eng.ex.svm_alloc(stdlib.length);
-  const sp = eng.ex.svm_alloc(srcBytes.length);
-  const mp = eng.ex.svm_alloc(mainBytes.length);
-  const view = new Uint8Array(eng.memory.buffer);
-  view.set(nifler, np);
-  view.set(nimsem, smp);
-  view.set(hexer, hp);
-  view.set(stdlib, ip);
-  view.set(srcBytes, sp);
-  view.set(mainBytes, mp);
-  eng.ex.svm_compile_nim_fs(
-    np, nifler.length, smp, nimsem.length, hp, hexer.length,
-    ip, stdlib.length, sp, srcBytes.length, mp, mainBytes.length);
-  const status = eng.ex.svm_status();
-  eng.ex.svm_dealloc(np, nifler.length);
-  eng.ex.svm_dealloc(smp, nimsem.length);
-  eng.ex.svm_dealloc(hp, hexer.length);
-  eng.ex.svm_dealloc(ip, stdlib.length);
-  eng.ex.svm_dealloc(sp, srcBytes.length);
-  eng.ex.svm_dealloc(mp, mainBytes.length);
   const ms = runStage(rec, 'compile+run:interpreter', performance.now() - t0).toFixed(0);
   runTier(rec, 'interpreter');
-  const out = readModuleStdout();
-  const err = readModuleStderr();
   logTo(c, `compile+run → status ${status}, ${out.length}B stdout in ${ms}ms`);
   // 0 = OK, 5 = clean Exit. Any other status: a phase/link/run failure — show the diagnostic (stderr).
   if (status !== 0 && status !== 5) {

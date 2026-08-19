@@ -37,7 +37,13 @@ export class SnapshotClient {
         }
       }
     };
-    worker.onerror = (e) => w._rejectReady(new Error(e.message || 'snapshot worker error'));
+    worker.onerror = (e) => {
+      const err = new Error(e.message || 'snapshot worker error');
+      w._rejectReady(err); // no-op once ready has settled
+      // Fail every in-flight request so its caller can fall back / report, instead of hanging forever.
+      for (const [id, resolve] of w.pending) resolve({ ok: false, error: err.message });
+      w.pending.clear();
+    };
     worker.postMessage({ type: 'init', module: this._engineModule });
     this._workers.set(url, w);
     return w;
@@ -78,6 +84,47 @@ export class SnapshotClient {
     const warm = await this.prewarm(url, getBytes);
     if (!warm.ok) return warm;
     return this._request(this._workers.get(url), 'eval', { url, source, jit });
+  }
+
+  // The reserved worker key for the nim full-compile card (its own engine instance, separate from any
+  // warm-card worker). A non-URL sentinel so it never collides with a warm module URL.
+  static NIMC_KEY = '__nimc__';
+
+  // Compile a whole Nim program off the main thread. `getAssets()` resolves the four phase buffers
+  // `{ nifler, nimsem, hexer, stdlib }` (fetched + inflated by the caller); they're posted to the nim
+  // worker once and cached there, so subsequent Runs ship only `source`. Resolves `{ ok, status,
+  // stdout, stderr }`, or `{ ok:false, error }` (the caller then falls back to the main-thread path).
+  async nimCompile(getAssets, source, main = 'prog.nim') {
+    const w = this._workerFor(SnapshotClient.NIMC_KEY);
+    await w.ready;
+    if (!w.nimAssets) {
+      w.nimAssets = (async () => {
+        const a = await getAssets();
+        return this._request(w, 'nimAssets', a);
+      })();
+    }
+    let loaded;
+    try {
+      loaded = await w.nimAssets;
+    } catch (e) {
+      w.nimAssets = null; // a fetch/inflate failure: clear the cached (rejected) upload so a later Run retries
+      throw e; // surfaces to runNimc's catch (fetch/build-hint error state)
+    }
+    if (!loaded.ok) {
+      w.nimAssets = null; // worker rejected the upload: let a later Run retry it
+      return { ok: false, error: loaded.error || 'nim assets failed to load' };
+    }
+    return this._request(w, 'nimCompile', { source, main });
+  }
+
+  // Abandon an in-flight nim compile: terminate the nim worker (a runaway guest can't be interrupted
+  // cooperatively) and drop its record so the next `nimCompile` respawns a fresh engine and re-sends
+  // assets. Pending requests on it never resolve — the caller drops them.
+  cancelNim() {
+    const w = this._workers.get(SnapshotClient.NIMC_KEY);
+    if (!w) return;
+    w.worker.terminate();
+    this._workers.delete(SnapshotClient.NIMC_KEY);
   }
 
   // Query `url`'s worker for its warm+JIT pre-compile state — `{ ok, jitPrimed, compiles, hits }` (for
