@@ -4388,6 +4388,100 @@ enum Waiter {
     },
 }
 
+/// A parked entry that belongs to a domain and, when that domain dies, either yields its vCPU to be
+/// reaped or is dropped. Implemented for every element type the scheduler's waiter stores hold, so
+/// [`drain_members`] can sweep any store with one retain-style pass instead of a hand-rolled
+/// `while i < q.len() { … q.remove(i) }` index loop (the #I49-class bug surface).
+trait DomainMember {
+    /// The domain this entry belongs to (INVARIANTS #4 identity).
+    fn domain_key(&self) -> usize;
+    /// Consume the entry on its domain's death: a vCPU becomes a reap victim; a parked **fiber** is
+    /// dropped (its park dies with the domain — never reaped). This is the drop-vs-reap subtlety the
+    /// teardown sweep must preserve.
+    fn into_victim(self) -> Option<Box<VCpu>>;
+}
+
+impl DomainMember for Box<VCpu> {
+    fn domain_key(&self) -> usize {
+        domain_key_of(self)
+    }
+    fn into_victim(self) -> Option<Box<VCpu>> {
+        Some(self)
+    }
+}
+
+impl DomainMember for Waiter {
+    fn domain_key(&self) -> usize {
+        match self {
+            Waiter::VCpu(v) => domain_key_of(v),
+            Waiter::Fiber { svc, .. } => *svc,
+        }
+    }
+    fn into_victim(self) -> Option<Box<VCpu>> {
+        match self {
+            Waiter::VCpu(v) => Some(v),
+            Waiter::Fiber { .. } => None,
+        }
+    }
+}
+
+// Tagged waiter entries carry a key alongside the parked thing — the futex value on `wait_waiters`,
+// the completion/ticket id on the single-`Waiter` maps, the reap-target on `reap_any_waiters`, the
+// joined task id on `join_waiters`. The tag rides along untouched for survivors; membership and the
+// reap victim are the inner value's.
+impl DomainMember for (u64, Waiter) {
+    fn domain_key(&self) -> usize {
+        self.1.domain_key()
+    }
+    fn into_victim(self) -> Option<Box<VCpu>> {
+        self.1.into_victim()
+    }
+}
+
+impl DomainMember for (u64, Box<VCpu>) {
+    fn domain_key(&self) -> usize {
+        domain_key_of(&self.1)
+    }
+    fn into_victim(self) -> Option<Box<VCpu>> {
+        Some(self.1)
+    }
+}
+
+impl DomainMember for (Option<TaskId>, Box<VCpu>) {
+    fn domain_key(&self) -> usize {
+        domain_key_of(&self.1)
+    }
+    fn into_victim(self) -> Option<Box<VCpu>> {
+        Some(self.1)
+    }
+}
+
+/// Retain-style sweep of one waiter store: move every entry belonging to domain `key` out of `q`
+/// (survivors keep their FIFO order), returning the vCPUs to reap. Replaces the duplicated teardown
+/// scan loops — a new waiter store gets its sweep by implementing [`DomainMember`], not by pasting an
+/// index loop that must agree in three places.
+// `Box<VCpu>` is the scheduler's ubiquitous parked-vCPU type (large; boxed everywhere `reap` touches).
+#[allow(clippy::vec_box)]
+fn drain_members<Q, T>(q: &mut Q, key: usize) -> Vec<Box<VCpu>>
+where
+    T: DomainMember,
+    Q: Default + IntoIterator<Item = T> + FromIterator<T>,
+{
+    let mut victims = Vec::new();
+    *q = std::mem::take(q)
+        .into_iter()
+        .filter_map(|e| {
+            if e.domain_key() == key {
+                victims.extend(e.into_victim());
+                None
+            } else {
+                Some(e)
+            }
+        })
+        .collect();
+    victims
+}
+
 /// §3.6 slice 5b — wake a domain's `svc.wait`-parked serve loop from inside a wake path that
 /// already holds the scheduler lock (the locked half of [`Scheduler::svc_wake`]). Idempotent:
 /// a domain not parked in `svc.wait` is a no-op. Returns whether a vCPU was re-admitted (the
@@ -4411,8 +4505,11 @@ fn svc_wake_locked(s: &mut Sched, key: usize) -> bool {
 /// FORK.md §8.6 — wake every reader parked on `pipe` under an **already-held** scheduler lock (the
 /// domain-exit hook holds it). Re-admits each waiting vCPU with no pending value — its rewound read
 /// re-executes. The `Scheduler::wake_pipe_readers` method wraps this with the lock + a `notify_all`.
-fn wake_pipe_readers_locked(s: &mut Sched, pipe: u32) -> u32 {
-    let woken = s.pipe_waiters.remove(&pipe).unwrap_or_default();
+/// Reap-wake a batch of pipe waiters under the held scheduler lock: each vCPU is re-admitted to
+/// `runnable`; each parked fiber is woken through its registry (return value `0`) and its serve loop
+/// re-admitted. Shared body of the read/write pipe-wake entry points — they differ only in which
+/// waiter map they drain. Returns the count woken.
+fn wake_pipe_batch_locked(s: &mut Sched, woken: Vec<Waiter>) -> u32 {
     let n = woken.len() as u32;
     for w in woken {
         match w {
@@ -4426,23 +4523,18 @@ fn wake_pipe_readers_locked(s: &mut Sched, pipe: u32) -> u32 {
     n
 }
 
+fn wake_pipe_readers_locked(s: &mut Sched, pipe: u32) -> u32 {
+    let woken = s.pipe_waiters.remove(&pipe).unwrap_or_default();
+    wake_pipe_batch_locked(s, woken)
+}
+
 /// FORK.md §8.6 (backpressure) — the write-side twin of [`wake_pipe_readers_locked`]: wake every writer
 /// parked on `pipe` under an already-held scheduler lock (the domain-exit hook holds it). Re-admits each
 /// waiting vCPU with no pending value — its rewound write re-executes (into the freed room, or `-EPIPE`
 /// if the readers are gone). `Scheduler::wake_pipe_writers` wraps this with the lock + a `notify_all`.
 fn wake_pipe_writers_locked(s: &mut Sched, pipe: u32) -> u32 {
     let woken = s.pipe_write_waiters.remove(&pipe).unwrap_or_default();
-    let n = woken.len() as u32;
-    for w in woken {
-        match w {
-            Waiter::VCpu(v) => s.runnable.push_back(v),
-            Waiter::Fiber { reg, slot, svc } => {
-                reg.wake_blocked(slot, Reg::from_i64(0));
-                svc_wake_locked(s, svc);
-            }
-        }
-    }
-    n
+    wake_pipe_batch_locked(s, woken)
 }
 
 /// FORK.md §8.6 — a live fork twin's bookkeeping: the **parent domain** that forked it (`wait`
@@ -4789,10 +4881,7 @@ impl Scheduler {
         for waiters in s.pipe_waiters.values_mut() {
             let mut keep = Vec::new();
             for w in waiters.drain(..) {
-                let d = match &w {
-                    Waiter::VCpu(v) => domain_key_of(v),
-                    Waiter::Fiber { svc, .. } => *svc,
-                };
+                let d = w.domain_key();
                 if d == domain {
                     hit.push(w);
                 } else {
@@ -4804,10 +4893,7 @@ impl Scheduler {
         for waiters in s.pipe_write_waiters.values_mut() {
             let mut keep = Vec::new();
             for w in waiters.drain(..) {
-                let d = match &w {
-                    Waiter::VCpu(v) => domain_key_of(v),
-                    Waiter::Fiber { svc, .. } => *svc,
-                };
+                let d = w.domain_key();
                 if d == domain {
                     hit.push(w);
                 } else {
@@ -4881,10 +4967,7 @@ impl Scheduler {
         for waiters in s.cap_waiters.values_mut() {
             let mut keep = Vec::new();
             for w in waiters.drain(..) {
-                let d = match &w {
-                    Waiter::VCpu(v) => domain_key_of(v),
-                    Waiter::Fiber { svc, .. } => *svc,
-                };
+                let d = w.domain_key();
                 // The restart query is scoped to THIS domain's waiters — a foreign waiter must
                 // neither be asked nor prime the cache with another domain's answer.
                 let skip = d == domain
@@ -5687,114 +5770,39 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
     // I40: any orphaned reply destined *for* this domain (as a callee) will never arrive now —
     // its handler is being torn down — so its recorded orphan entry can never be consumed. Drop it.
     s.orphan_tickets.retain(|(callee, _)| *callee != key);
-    let mut victims: Vec<Box<VCpu>> = Vec::new();
-    let runnable = std::mem::take(&mut s.runnable);
-    for v in runnable {
-        if domain_key_of(&v) == key {
-            victims.push(v);
-        } else {
-            s.runnable.push_back(v);
-        }
-    }
-    let jw = std::mem::take(&mut s.join_waiters);
-    for (k, v) in jw {
-        if domain_key_of(&v) == key {
-            victims.push(v);
-        } else {
-            s.join_waiters.insert(k, v);
-        }
-    }
+    let mut victims: Vec<Box<VCpu>> = drain_members(&mut s.runnable, key);
+    victims.extend(drain_members(&mut s.join_waiters, key));
     // #798 — the dying domain's stopped parks die with it (a stopped job killed at run end).
     victims.extend(s.stopped.remove(&key).unwrap_or_default());
     // #799 — the dying domain's blocking-`waitpid` benches die with it; other domains' stay.
     for ws in s.posix_reap_waiters.values_mut() {
-        let keep: VecDeque<Box<VCpu>> = std::mem::take(ws)
-            .into_iter()
-            .filter_map(|v| {
-                if domain_key_of(&v) == key {
-                    victims.push(v);
-                    None
-                } else {
-                    Some(v)
-                }
-            })
-            .collect();
-        *ws = keep;
+        victims.extend(drain_members(ws, key));
     }
     s.posix_reap_waiters.retain(|_, ws| !ws.is_empty());
     // Parked `wait(-1)`/`waitpid(-pgid)` callers of the dying domain are reaped; others stay parked.
-    let raw = std::mem::take(&mut s.reap_any_waiters);
-    for (target, v) in raw {
-        if domain_key_of(&v) == key {
-            victims.push(v);
-        } else {
-            s.reap_any_waiters.push_back((target, v));
-        }
-    }
+    victims.extend(drain_members(&mut s.reap_any_waiters, key));
+    // Members parked in a futex/cap wait die too; a member **fiber** is dropped, not reaped
+    // (`DomainMember::into_victim`).
     for q in s.wait_waiters.values_mut() {
-        let mut i = 0;
-        while i < q.len() {
-            let member = match &q[i].1 {
-                Waiter::VCpu(v) => domain_key_of(v) == key,
-                Waiter::Fiber { svc, .. } => *svc == key,
-            };
-            if member {
-                if let (_, Waiter::VCpu(v)) = q.remove(i) {
-                    victims.push(v);
-                }
-            } else {
-                i += 1;
-            }
-        }
+        victims.extend(drain_members(q, key));
     }
     s.wait_waiters.retain(|_, q| !q.is_empty());
     for q in s.cap_waiters.values_mut() {
-        let mut i = 0;
-        while i < q.len() {
-            let member = match &q[i] {
-                Waiter::VCpu(v) => domain_key_of(v) == key,
-                Waiter::Fiber { svc, .. } => *svc == key,
-            };
-            if member {
-                if let Waiter::VCpu(v) = q.remove(i) {
-                    victims.push(v);
-                }
-            } else {
-                i += 1;
-            }
-        }
+        victims.extend(drain_members(q, key));
     }
     s.cap_waiters.retain(|_, q| !q.is_empty());
     // §12 slice 2 — members parked on punt completions die too. The pool job still runs and its
     // eventual `complete` finds no waiter — the result lands in `Completions::ready`, unclaimed,
     // and dies with the Host (bounded by punts in flight at death, not call volume).
-    let cw = std::mem::take(&mut s.completion_waiters);
-    for (id, w) in cw {
-        let member = match &w {
-            Waiter::VCpu(v) => domain_key_of(v) == key,
-            Waiter::Fiber { svc, .. } => *svc == key,
-        };
-        if member {
-            if let Waiter::VCpu(v) = w {
-                victims.push(v);
-            }
-        } else {
-            s.completion_waiters.insert(id, w);
-        }
-    }
+    victims.extend(drain_members(&mut s.completion_waiters, key));
     // Members parked as *callers* through some other domain die too. The callee's eventual reply
     // will find no waiter here — I40: record the ticket as an orphan so the reply is dropped at its
     // stash site instead of leaking an unclaimable `svc_results` entry on the (surviving) callee.
+    // (Bespoke sweep — the member branch also records the orphan ticket.)
     let tw = std::mem::take(&mut s.ticket_waiters);
     for (k, w) in tw {
-        let member = match &w {
-            Waiter::VCpu(v) => domain_key_of(v) == key,
-            Waiter::Fiber { svc, .. } => *svc == key,
-        };
-        if member {
-            if let Waiter::VCpu(v) = w {
-                victims.push(v);
-            }
+        if w.domain_key() == key {
+            victims.extend(w.into_victim());
             s.orphan_tickets.insert(k);
         } else {
             s.ticket_waiters.insert(k, w);
@@ -5805,30 +5813,14 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
     // there). So scan every queue for member vCPUs by identity, not just `svc_waiters[key]` —
     // otherwise a dying domain's caller stranded under a live provider's key is missed.
     for q in s.svc_waiters.values_mut() {
-        let mut i = 0;
-        while i < q.len() {
-            if domain_key_of(&q[i]) == key {
-                victims.push(q.remove(i));
-            } else {
-                i += 1;
-            }
-        }
+        victims.extend(drain_members(q, key));
     }
     s.svc_waiters.retain(|_, q| !q.is_empty());
     // CALLS.md 4c.1 — admission-waiters are keyed by the provider instance, so a dying domain's
     // caller waiting on a *live* provider sits under that provider's key: scan by identity too
     // (reap drops each one's `admit_parked` count).
     for q in s.admit_waiters.values_mut() {
-        let mut i = 0;
-        while i < q.len() {
-            if domain_key_of(&q[i]) == key {
-                if let Some(vv) = q.remove(i) {
-                    victims.push(vv);
-                }
-            } else {
-                i += 1;
-            }
-        }
+        victims.extend(drain_members(q, key));
     }
     s.admit_waiters.retain(|_, q| !q.is_empty());
     let mut tickets: Vec<u64> = Vec::new();
@@ -5867,30 +5859,30 @@ fn teardown_run(s: &mut Sched) {
             .into_iter()
             .map(|(_, v)| v),
     );
-    for (_, q) in std::mem::take(&mut s.wait_waiters) {
-        for (_, w) in q {
-            if let Waiter::VCpu(v) = w {
-                victims.push(v);
-            }
-        }
-    }
-    for (_, q) in std::mem::take(&mut s.cap_waiters) {
-        for w in q {
-            if let Waiter::VCpu(v) = w {
-                victims.push(v);
-            }
-        }
-    }
-    for (_, w) in std::mem::take(&mut s.ticket_waiters) {
-        if let Waiter::VCpu(v) = w {
-            victims.push(v);
-        }
-    }
-    for (_, w) in std::mem::take(&mut s.completion_waiters) {
-        if let Waiter::VCpu(v) = w {
-            victims.push(v);
-        }
-    }
+    // Members parked as futex/cap/ticket/completion waiters: reap each vCPU, drop each fiber
+    // (`DomainMember::into_victim` — a parked fiber's stack dies with the run).
+    victims.extend(
+        std::mem::take(&mut s.wait_waiters)
+            .into_values()
+            .flatten()
+            .filter_map(|(_, w)| w.into_victim()),
+    );
+    victims.extend(
+        std::mem::take(&mut s.cap_waiters)
+            .into_values()
+            .flatten()
+            .filter_map(|w| w.into_victim()),
+    );
+    victims.extend(
+        std::mem::take(&mut s.ticket_waiters)
+            .into_values()
+            .filter_map(|w| w.into_victim()),
+    );
+    victims.extend(
+        std::mem::take(&mut s.completion_waiters)
+            .into_values()
+            .filter_map(|w| w.into_victim()),
+    );
     for (_, vs) in std::mem::take(&mut s.svc_waiters) {
         victims.extend(vs);
     }
