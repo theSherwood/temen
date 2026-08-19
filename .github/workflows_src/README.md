@@ -28,6 +28,20 @@ identical until the next agent edit.
   (Until copied over, the `workflows-in-sync` guard stays red — the expected mirror-edit friction;
   `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
 
+- **`arena-stacks` no-op feature removed from the `stack-guard` + `stack-guard-cross-os` jobs (#919)** —
+  the `svm-fiber`/`svm-jit` `arena-stacks` feature was a retained no-op (the arena is svm-fiber's
+  always-on default backend now), so every `--features stack-check,arena-stacks` invocation just
+  re-tested the default config. The two jobs now pass `--features stack-check` only (that feature still
+  gates the `svm-jit` guard test suites into the lane), and the two `cargo test -p svm-fiber --features
+  arena-stacks` rows — pure default-config re-runs, already covered by the `check` job's workspace test —
+  are deleted. Job comment + `name:` updated (no longer "off by default"). **⚠️ Copy-over is required to
+  keep these jobs green, not just to drain the `workflows-in-sync` guard:** the same PR deletes the
+  `arena-stacks` Cargo feature, so until `cp .github/workflows_src/*.yml .github/workflows/` lands, the
+  **live** `ci.yml` still runs `--features arena-stacks` against a crate that no longer defines it and
+  the `stack-guard`/`stack-guard-cross-os` jobs fail with "does not contain this feature: arena-stacks".
+  After copy-over both are green (verified locally: `cargo test -p svm-jit --features stack-check` and the
+  default `svm-fiber`/`svm-jit` builds pass; `--features arena-stacks` now errors, as intended).
+
 - **`fuzz-matrix-in-sync` job (#923)** — a new lightweight ubuntu job ("fuzz targets wired") that
   runs `scripts/ci/check-fuzz-matrix.sh`, which asserts the three places a fuzz target is named stay
   identical: the source files (`fuzz/fuzz_targets/*.rs`), the build entries (`fuzz/Cargo.toml`

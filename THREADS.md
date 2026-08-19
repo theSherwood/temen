@@ -370,11 +370,9 @@ property, so in practice:
 ```sh
 rustup toolchain install nightly -c rust-src
 
-# Step 1 — shared-memory atomics across OS threads (tiny no_std spike)
-cd browser/threads-spike
-cargo +nightly build --release   # flags baked into .cargo/config.toml (shared mem + atomics)
-node threads.mjs                 # two worker_threads → atomic EXACT 4,000,000; plain races
-cd ..
+# Step 1 — shared-memory atomics across OS threads: the `browser/threads-spike/` no_std spike
+# (two worker_threads → atomic EXACT 4,000,000; the plain path races) was retired once it had
+# served its purpose; its result is recorded above and the code remains in git history.
 
 # Step 2/3/4c — the substrate, engine bridge, and parallel drivers (native, in CI)
 cargo test -p svm-mem shared                          # Region::Shared cross-thread atomics + fuzz
@@ -393,8 +391,8 @@ cargo +nightly miri test -p svm-interp --test vcpu_instantiate_miri      # 4c-do
 cargo test -p svm --test bytecode_vcpu_orchestration_caps         # 4d: shared-powerbox cap.call via resumable Vcpu vs oracle
 cargo +nightly miri test -p svm-interp --test vcpu_shared_host_miri      # 4d: shared Mutex<Host> cap.call race-free
 
-# Step 1-futex / 4c-wasm — the cross-Worker blocking futex (tiny spike)
-cd browser/threads-spike && cargo +nightly build --release && node threads-futex.mjs && cd ..
+# Step 1-futex / 4c-wasm — the cross-Worker blocking futex (`browser/threads-spike/threads-futex.mjs`)
+# was retired with the spike above; its result is recorded above and the code remains in git history.
 
 # Step 4a/4b — the FULL engine as a wasm threads module, run over a SharedArrayBuffer window.
 # The `--export=__stack_pointer/__tls_*/__wasm_init_tls` are the per-Worker bootstrap hooks (4b).
