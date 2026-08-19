@@ -288,12 +288,10 @@ fn inst_operands(i: &Inst) -> Option<Vec<ValIdx>> {
         ConstI32(_) | ConstI64(_) | ConstF32(_) | ConstF64(_) | ConstV128(_) | RefFunc { .. } => {
             vec![]
         }
-        IntBin { a, b, .. }
-        | IntCmp { a, b, .. }
-        | FBin { a, b, .. }
-        | FCmp { a, b, .. }
-        | PtrAdd { a, b } => vec![*a, *b],
-        IntUn { a, .. } | FUn { a, .. } | Eqz { a, .. } | PtrCast { a, .. } => vec![*a],
+        IntBin { a, b, .. } | IntCmp { a, b, .. } | FBin { a, b, .. } | FCmp { a, b, .. } => {
+            vec![*a, *b]
+        }
+        IntUn { a, .. } | FUn { a, .. } | Eqz { a, .. } => vec![*a],
         Select { cond, a, b } => vec![*cond, *a, *b],
         Load { addr, .. } | AtomicLoad { addr, .. } | V128Load { addr, .. } => vec![*addr],
         Store { addr, value, .. }
@@ -1595,7 +1593,6 @@ fn result_types(
             .ok_or(TransformError::UnsupportedShape)?,
         CapCall { sig, .. } => sig.results.clone(),
         CallIndirect { ty, .. } => ty.results.clone(),
-        PtrAdd { .. } | PtrCast { .. } => vec![ValType::I64],
         RefFunc { .. } => vec![ValType::I32],
         // Fiber control ops (§12 / Phase 3): an i64 handle, a `(status, value)` pair, a resume arg.
         ContNew { .. } => vec![ValType::I64],

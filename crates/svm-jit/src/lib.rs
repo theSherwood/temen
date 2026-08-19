@@ -5365,8 +5365,6 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::FToITrap { .. }
                 | Inst::IToFConv { .. }
                 | Inst::Cast { .. }
-                | Inst::PtrAdd { .. }
-                | Inst::PtrCast { .. }
                 | Inst::Load { .. }
                 | Inst::Store { .. }
                 | Inst::MemCopy { .. }
@@ -5404,8 +5402,7 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::VNot { .. }
                 | Inst::Bitselect { .. }
                 | Inst::Shuffle { .. }
-                | Inst::Swizzle { .. }
-                | Inst::SimdWidthBytes => {}
+                | Inst::Swizzle { .. } => {}
                 // §7 reflection: lowered to a `cap.call` thunk with the reserved `CAP_SELF_TYPE_ID`,
                 // serviced host-side like any cap op — so it matches the interpreter.
                 Inst::CapSelfCount
@@ -6893,14 +6890,6 @@ fn lower_block(
                     CastOp::ReinterpF64I64 => b.ins().bitcast(I64, MemFlags::new(), x),
                 }
             }
-            // Pointer ops (§3b/§10): plain 64-bit arithmetic off-CHERI — `ptr.add` is a
-            // wrapping `iadd`, the int↔ptr casts pass the value through. Confinement is
-            // untouched: these produce values; only `load`/`store` accesses are masked.
-            Inst::PtrAdd { a, b: rb } => {
-                let (x, y) = (get(&vals, *a)?, get(&vals, *rb)?);
-                b.ins().iadd(x, y)
-            }
-            Inst::PtrCast { a, .. } => get(&vals, *a)?,
             Inst::IToFConv { op, a } => {
                 let x = get(&vals, *a)?;
                 let (_, to, signed) = op.parts();
@@ -7446,9 +7435,6 @@ fn lower_block(
                 let y = get(&vals, *rb)?;
                 b.ins().swizzle(x, y)
             }
-            // §17/D58 feature-detect hook: the fixed-128 constant (matches the interpreter).
-            Inst::SimdWidthBytes => b.ins().iconst(I32, 16),
-
             Inst::Load {
                 op, addr, offset, ..
             } => {

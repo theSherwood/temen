@@ -830,31 +830,6 @@ pub fn scalar_rows() -> Vec<OpRow> {
         });
     }
 
-    // Pointer ops (§3b/§10): plain `i64` arithmetic off-CHERI — `ptr.add` wraps,
-    // the casts pass the value through.
-    push(OpRow {
-        id: "ptr.add".into(),
-        operands: vec![ValType::I64, ValType::I64],
-        result: ValType::I64,
-        class: Class::Pure,
-        shape: Shape::Operands,
-        encoding: Enc::Byte(0x78),
-        build: Box::new(|v, _| Inst::PtrAdd { a: v[0], b: v[1] }),
-        eval: Box::new(|x| Ok(SpecVal::I64(as_i64(x[0]).wrapping_add(as_i64(x[1]))))),
-    });
-    for to_int in [false, true] {
-        push(OpRow {
-            id: format!("ptr.{}", if to_int { "to_int" } else { "from_int" }),
-            operands: vec![ValType::I64],
-            result: ValType::I64,
-            class: Class::Pure,
-            shape: Shape::Operands,
-            encoding: Enc::Byte(if to_int { 0x77 } else { 0x76 }),
-            build: Box::new(move |v, _| Inst::PtrCast { to_int, a: v[0] }),
-            eval: Box::new(|x| Ok(x[0])),
-        });
-    }
-
     rows
 }
 
@@ -1670,7 +1645,6 @@ pub fn coverage(inst: &Inst) -> Class {
         Inst::IntCmp { .. } | Inst::IntUn { .. } | Inst::Eqz { .. } => Class::Pure,
         Inst::Convert { .. } | Inst::Select { .. } => Class::Pure,
         Inst::Cast { .. } => Class::Pure,
-        Inst::PtrAdd { .. } | Inst::PtrCast { .. } => Class::Pure,
 
         // Slice 2 — scalar floats.
         Inst::ConstF32(..) | Inst::ConstF64(..) => Class::Pure,
@@ -1720,8 +1694,7 @@ pub fn coverage(inst: &Inst) -> Class {
         | Inst::VNot { .. }
         | Inst::Bitselect { .. }
         | Inst::Shuffle { .. }
-        | Inst::Swizzle { .. }
-        | Inst::SimdWidthBytes => Class::Pure,
+        | Inst::Swizzle { .. } => Class::Pure,
 
         // Slice 7 — typing/encoding rows only (semantics out of scope, SPEC.md).
         Inst::Call { .. } | Inst::CallIndirect { .. } | Inst::RefFunc { .. } => Class::Control,
@@ -1962,7 +1935,7 @@ mod tests {
     /// expected shape.
     #[test]
     fn table_invariants() {
-        assert_eq!(scalar_rows().len(), 80, "slice-1 row count");
+        assert_eq!(scalar_rows().len(), 77, "slice-1 row count");
         assert_eq!(float_rows().len(), 70, "slice-2 row count");
         let rows = all_rows();
         let mut ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();

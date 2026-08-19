@@ -381,10 +381,6 @@ fn print_inst(inst: &Inst, m: &Module) -> String {
         Inst::FToISat { op, a } => format!("{} v{a}", op.name()),
         Inst::FToITrap { op, a } => format!("{} v{a}", op.trap_name()),
         Inst::IToFConv { op, a } => format!("{} v{a}", op.name()),
-        Inst::PtrAdd { a, b } => format!("ptr.add v{a} v{b}"),
-        Inst::PtrCast { to_int, a } => {
-            format!("ptr.{} v{a}", if *to_int { "to_int" } else { "from_int" })
-        }
         Inst::Cast { op, a } => format!("{} v{a}", op.sig().0),
         Inst::Load {
             op,
@@ -684,7 +680,6 @@ fn print_inst(inst: &Inst, m: &Module) -> String {
         Inst::VAnyTrue { a } => format!("v128.any_true v{a}"),
         Inst::VAllTrue { shape, a } => format!("{}.all_true v{a}", shape.name()),
         Inst::VBitmask { shape, a } => format!("{}.bitmask v{a}", shape.name()),
-        Inst::SimdWidthBytes => "simd.width_bytes".to_string(),
     }
 }
 
@@ -2659,11 +2654,6 @@ impl<'a> Parser<'a> {
                 a: self.value(names)?,
             });
         }
-        if op == "ptr.add" {
-            let a = self.value(names)?;
-            let b = self.value(names)?;
-            return Ok(Inst::PtrAdd { a, b });
-        }
         // Bulk-memory ops (D62): `mem.copy`/`mem.move`/`mem.fill` v{dst} v{src|val} v{len}.
         if op == "mem.copy" || op == "mem.move" {
             let dst = self.value(names)?;
@@ -2753,12 +2743,6 @@ impl<'a> Parser<'a> {
                     .ok_or_else(|| ParseError(format!("unknown fence ordering: {op}")))?
             };
             return Ok(Inst::AtomicFence { order });
-        }
-        if op == "ptr.from_int" || op == "ptr.to_int" {
-            return Ok(Inst::PtrCast {
-                to_int: op == "ptr.to_int",
-                a: self.value(names)?,
-            });
         }
         if let Some(o) = IToF::from_name(&op) {
             return Ok(Inst::IToFConv {
@@ -2887,9 +2871,6 @@ impl<'a> Parser<'a> {
             let a = self.value(names)?;
             let b = self.value(names)?;
             return Ok(Inst::Swizzle { a, b });
-        }
-        if op == "simd.width_bytes" {
-            return Ok(Inst::SimdWidthBytes);
         }
         if let Some((sh, suffix)) = op
             .split_once('.')

@@ -673,9 +673,7 @@ pub fn row_home(inst: &Inst) -> RowHome {
         | Inst::FToISat { .. }
         | Inst::FToITrap { .. }
         | Inst::IToFConv { .. }
-        | Inst::Cast { .. }
-        | Inst::PtrAdd { .. }
-        | Inst::PtrCast { .. } => RowHome::Value,
+        | Inst::Cast { .. } => RowHome::Value,
 
         // Memory-window rows (slice 5).
         Inst::Load { .. }
@@ -716,8 +714,7 @@ pub fn row_home(inst: &Inst) -> RowHome {
         | Inst::VNot { .. }
         | Inst::Bitselect { .. }
         | Inst::Shuffle { .. }
-        | Inst::Swizzle { .. }
-        | Inst::SimdWidthBytes => RowHome::Simd,
+        | Inst::Swizzle { .. } => RowHome::Simd,
 
         // Structural rows (slice 7): atomics + v128 memory, calls, host, concurrency,
         // misc control.

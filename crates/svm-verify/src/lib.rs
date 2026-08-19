@@ -1081,15 +1081,6 @@ fn check_inst(
             cx.expect(*a, from.val())?;
             to.val()
         }
-        Inst::PtrAdd { a, b } => {
-            cx.expect(*a, ValType::I64)?;
-            cx.expect(*b, ValType::I64)?;
-            ValType::I64
-        }
-        Inst::PtrCast { a, .. } => {
-            cx.expect(*a, ValType::I64)?;
-            ValType::I64
-        }
         Inst::IToFConv { op, a } => {
             let (from, to, _) = op.parts();
             cx.expect(*a, from.val())?;
@@ -1496,7 +1487,6 @@ fn check_inst(
             cx.expect(*b, ValType::V128)?;
             ValType::V128
         }
-        Inst::SimdWidthBytes => ValType::I32,
 
         // Handled before/around the match; listed for exhaustiveness (no panic).
         Inst::Store { .. }

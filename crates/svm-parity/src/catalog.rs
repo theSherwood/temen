@@ -951,13 +951,6 @@ fn simd(ops: &mut Vec<Op>) {
         swz.clone(),
         unit(&[v, v], swz, &[v], false),
     );
-    push(
-        ops,
-        "simd.width_bytes".into(),
-        FAM,
-        Inst::SimdWidthBytes,
-        unit(&[], Inst::SimdWidthBytes, &[ValType::I32], false),
-    );
 }
 
 fn control_and_calls(ops: &mut Vec<Op>) {

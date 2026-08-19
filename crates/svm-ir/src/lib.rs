@@ -2005,19 +2005,6 @@ pub enum Inst {
         idx: ValIdx,
         args: Vec<ValIdx>,
     },
-    /// Pointer arithmetic: `ptr + integer_offset`. Off-CHERI a plain `i64` wrapping
-    /// add; the distinct opcode lets the JIT/CHERI backend see pointer provenance
-    /// (§3b/§10). Operands and result are `i64`.
-    PtrAdd {
-        a: ValIdx,
-        b: ValIdx,
-    },
-    /// `ptr.from_int` (`to_int = false`) / `ptr.to_int` (`to_int = true`): a free,
-    /// no-op `i64`↔`i64` provenance cast off-CHERI (§3a/§10).
-    PtrCast {
-        to_int: bool,
-        a: ValIdx,
-    },
     /// Capability call (§3c): invoke operation `op` of the interface identified by
     /// `type_id` on the capability named by `handle` — a forgeable `i32` index into
     /// the **host-owned** handle table. At this use site the index is masked into the
@@ -2643,11 +2630,6 @@ pub enum Inst {
         a: ValIdx,
         b: ValIdx,
     },
-    /// `simd.width_bytes`: the host's supported SIMD vector width in bytes, as an `i32`.
-    /// The §17/D58 **feature-detection hook**. In the fixed-128 MVP this is the constant
-    /// `16` on every backend (so it stays deterministic across the interp↔JIT oracle); it
-    /// becomes a real runtime query when feature-detected wider widths (`v256`/`v512`) land.
-    SimdWidthBytes,
 }
 
 /// What an instruction can do **besides** producing its SSA result(s) — the single source of truth
@@ -2734,9 +2716,6 @@ impl Inst {
             | Inst::DataSym { .. }
             | Inst::DataSelf { .. }
             | Inst::DataTop
-            | Inst::PtrAdd { .. }
-            | Inst::PtrCast { .. }
-            | Inst::SimdWidthBytes
             | Inst::Splat { .. }
             | Inst::ExtractLane { .. }
             | Inst::ReplaceLane { .. }
@@ -2871,8 +2850,7 @@ impl Inst {
             | Inst::ExportHandle { .. }
             | Inst::VcpuTlsGet
             | Inst::DurableShadowBase
-            | Inst::AtomicFence { .. }
-            | Inst::SimdWidthBytes => {}
+            | Inst::AtomicFence { .. } => {}
 
             // Exactly one operand, named `a`.
             Inst::IntUn { a, .. }
@@ -2883,7 +2861,6 @@ impl Inst {
             | Inst::FToITrap { a, .. }
             | Inst::IToFConv { a, .. }
             | Inst::Cast { a, .. }
-            | Inst::PtrCast { a, .. }
             | Inst::Load { addr: a, .. }
             | Inst::AtomicLoad { addr: a, .. }
             | Inst::V128Load { addr: a, .. }
@@ -2912,7 +2889,6 @@ impl Inst {
             | Inst::IntCmp { a, b, .. }
             | Inst::FBin { a, b, .. }
             | Inst::FCmp { a, b, .. }
-            | Inst::PtrAdd { a, b }
             | Inst::Store {
                 addr: a, value: b, ..
             }
@@ -5411,7 +5387,6 @@ mod effects_tests {
                 a: 0,
             },
             Inst::RefFunc { func: 0 },
-            Inst::PtrAdd { a: 0, b: 1 },
             Inst::Splat {
                 shape: VShape::I32x4,
                 a: 0,

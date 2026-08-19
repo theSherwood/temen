@@ -348,16 +348,8 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                 let a = bb.want(from);
                 bb.push(Inst::Cast { op, a }, to);
             }
-            12 => {
-                let a = bb.want(ValType::I64);
-                let b = bb.want(ValType::I64);
-                bb.push(Inst::PtrAdd { a, b }, ValType::I64);
-            }
-            13 => {
-                let to_int = bb.g.boolean();
-                let a = bb.want(ValType::I64);
-                bb.push(Inst::PtrCast { to_int, a }, ValType::I64);
-            }
+            // 12/13 were PtrAdd/PtrCast (retired in the wire rev #900); those draws now re-roll
+            // via the `_ => continue` arm below.
             14 if has_mem => {
                 let op = LoadOp::from_index(bb.g.below(14) as u8).unwrap();
                 let (_, rty, _, _) = op.info();
@@ -761,9 +753,10 @@ fn gen_simd(bb: &mut BB, has_mem: bool) {
             });
         }
         12 => gen_simd_int(bb),
-        // The feature-detect hook, and the fallback when memory isn't available for 10/11.
+        // A memory-free constant is the fallback when memory isn't available for 10/11.
         _ => {
-            bb.push(Inst::SimdWidthBytes, ValType::I32);
+            let bytes = bb.g.v128bytes();
+            bb.push(Inst::ConstV128(bytes), ValType::V128);
         }
     }
 }

@@ -250,10 +250,6 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
         // Scalar fused multiply-add: Cranelift has `fma`; core wasm has no scalar FMA opcode.
         Inst::Fma { .. } => row(F, cell(Status::Declines, NO_WASM_OP)),
 
-        // Pointer provenance ops (off-CHERI plain i64): both JITs lower them — Cranelift natively,
-        // the wasm-JIT as a wrapping `i64.add` / identity forward.
-        Inst::PtrAdd { .. } | Inst::PtrCast { .. } => row(F, F),
-
         // ---- Guest linear memory: both JITs emit confined accesses / bulk memory. ---------------
         Inst::Load { .. }
         | Inst::Store { .. }
@@ -362,8 +358,7 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
         | Inst::VNot { .. }
         | Inst::Bitselect { .. }
         | Inst::Shuffle { .. }
-        | Inst::Swizzle { .. }
-        | Inst::SimdWidthBytes => row(F, F),
+        | Inst::Swizzle { .. } => row(F, F),
 
         // `i64x2` min/max: Cranelift synthesizes it (per-lane compare + `bitselect`, since x86/aarch64
         // have no native `i64` vector min/max); wasm has no `i64x2` min/max opcode, so the wasm-JIT

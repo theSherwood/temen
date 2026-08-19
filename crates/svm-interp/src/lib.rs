@@ -13642,15 +13642,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let r = i_to_f(*op, get(&frames[top].vals, *a)?);
                     frames[top].vals.push(r);
                 }
-                Inst::PtrAdd { a, b } => {
-                    let vals = &frames[top].vals;
-                    let r = Reg::from_i64(get_i64(vals, *a)?.wrapping_add(get_i64(vals, *b)?));
-                    frames[top].vals.push(r);
-                }
-                Inst::PtrCast { a, .. } => {
-                    let r = Reg::from_i64(get_i64(&frames[top].vals, *a)?);
-                    frames[top].vals.push(r);
-                }
                 Inst::Cast { op, a } => {
                     let r = cast(*op, get(&frames[top].vals, *a)?);
                     frames[top].vals.push(r);
@@ -14177,9 +14168,6 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         Inst::FToISat { op, a } => fto_i(*op, get(vals, *a)?),
         Inst::FToITrap { op, a } => trunc_trap(*op, get(vals, *a)?)?,
         Inst::IToFConv { op, a } => i_to_f(*op, get(vals, *a)?),
-        Inst::PtrAdd { a, b } => Reg::from_i64(get_i64(vals, *a)?.wrapping_add(get_i64(vals, *b)?)),
-        // `ptr.from_int`/`ptr.to_int` are a no-op off-CHERI: pass the i64 through.
-        Inst::PtrCast { a, .. } => Reg::from_i64(get_i64(vals, *a)?),
         Inst::Cast { op, a } => cast(*op, get(vals, *a)?),
         // A funcref is just the function index as plain i32 data (§3c).
         Inst::RefFunc { func } => Reg::from_i32(*func as i32),
@@ -14393,10 +14381,6 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         Inst::Swizzle { a, b } => {
             Reg::from_v128(simd_swizzle(get(vals, *a)?.v128(), get(vals, *b)?.v128()))
         }
-        // The §17/D58 feature-detect hook: a deterministic constant in the fixed-128 MVP, so it
-        // stays identical across the interp↔JIT oracle.
-        Inst::SimdWidthBytes => Reg::from_i32(16),
-
         // Handled in `run_func` for the §12 fiber ops (which switch stacks) and in the eval
         // loop for calls/cap-calls; listed for exhaustiveness (no panic).
         Inst::Call { .. }

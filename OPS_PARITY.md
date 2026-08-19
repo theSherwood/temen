@@ -11,7 +11,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 - 🚧 **Not yet (parity not achieved)** — a real gap this backend could close but hasn't.
 - 🔶 **Conditional** — Full where a build/target cfg holds, Declines elsewhere (the note names the condition).
 
-**465 ops.** Across the two JIT columns: 862 ✅ Full · 54 ⛔ Declines · 3 🚧 Not-yet · 11 🔶 Conditional.
+**464 ops.** Across the two JIT columns: 860 ✅ Full · 54 ⛔ Declines · 3 🚧 Not-yet · 11 🔶 Conditional.
 
 ## scalar integer
 
@@ -461,7 +461,6 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 | `i16x8.q15mulr_sat_s` | ✅ | ✅ | ✅ | ✅ |  |
 | `i8x16.shuffle` | ✅ | ✅ | ✅ | ✅ |  |
 | `i8x16.swizzle` | ✅ | ✅ | ✅ | ✅ |  |
-| `simd.width_bytes` | ✅ | ✅ | ✅ | ✅ |  |
 
 ## calls & control
 

@@ -205,15 +205,6 @@ enum Op {
         a: u32,
         op: CastOp,
     },
-    PtrAdd {
-        dst: u32,
-        a: u32,
-        b: u32,
-    },
-    PtrCast {
-        dst: u32,
-        a: u32,
-    },
     RefFunc {
         dst: u32,
         func: u32,
@@ -1489,12 +1480,6 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             a: g(*a),
             op: *op,
         },
-        Inst::PtrAdd { a, b } => Op::PtrAdd {
-            dst,
-            a: g(*a),
-            b: g(*b),
-        },
-        Inst::PtrCast { a, .. } => Op::PtrCast { dst, a: g(*a) },
         Inst::RefFunc { func } => Op::RefFunc { dst, func: *func },
         Inst::Load {
             op, addr, offset, ..
@@ -12407,14 +12392,6 @@ impl Vm {
                 }
                 Op::Cast { dst, a, op } => {
                     r!(*dst) = cast(*op, r!(*a));
-                    pc += 1;
-                }
-                Op::PtrAdd { dst, a, b } => {
-                    r!(*dst) = Reg::from_i64(r!(*a).i64().wrapping_add(r!(*b).i64()));
-                    pc += 1;
-                }
-                Op::PtrCast { dst, a } => {
-                    r!(*dst) = Reg::from_i64(r!(*a).i64());
                     pc += 1;
                 }
                 Op::RefFunc { dst, func } => {

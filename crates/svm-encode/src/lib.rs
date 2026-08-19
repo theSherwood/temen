@@ -107,9 +107,8 @@ mod op {
     pub const CALL: u8 = 0x73; // direct call: uleb funcidx, then arg idx-list
     pub const CALL_INDIRECT: u8 = 0x74; // sig (params,results), idx, arg idx-list
     pub const REF_FUNC: u8 = 0x75; // uleb funcidx -> i32 funcref
-    pub const PTR_FROM_INT: u8 = 0x76; // i64 -> i64 (no-op provenance cast)
-    pub const PTR_TO_INT: u8 = 0x77;
-    pub const PTR_ADD: u8 = 0x78; // (i64, i64) -> i64
+                                   // 0x76 (was PTR_FROM_INT), 0x77 (was PTR_TO_INT), 0x78 (was PTR_ADD): retired in the
+                                   // wire rev (#900). Left as gaps — not renumbered, not reused.
     pub const CAP_CALL: u8 = 0x79; // type_id, op, sig, handle, arg idx-list
     pub const CAP_SELF_COUNT: u8 = 0x7A; // §7 reflection: () -> i32 count
     pub const CAP_SELF_GET: u8 = 0x7B; // §7 reflection: idx -> (i32 handle, i32 type_id)
@@ -207,7 +206,7 @@ mod op {
         pub const BITSELECT: u8 = 0x0B; // a, b, mask
         pub const SHUFFLE: u8 = 0x0C; // 16 lane bytes, a, b
         pub const SWIZZLE: u8 = 0x0D; // a, b
-        pub const WIDTH_BYTES: u8 = 0x0E; // (no payload) -> i32
+                                      // 0x0E (was WIDTH_BYTES): retired in the wire rev (#900). Left as a gap — not reused.
         pub const VINT_CMP: u8 = 0x0F; // shape, op, a, b
         pub const VFLOAT_CMP: u8 = 0x10; // shape, op, a, b
         pub const VSHIFT: u8 = 0x11; // shape, op, a (v128), amt (i32)
@@ -1023,19 +1022,6 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             out.push(op::FTOI_TRAP + o.index());
             write_uleb(out, *a as u64);
         }
-        Inst::PtrAdd { a, b } => {
-            out.push(op::PTR_ADD);
-            write_uleb(out, *a as u64);
-            write_uleb(out, *b as u64);
-        }
-        Inst::PtrCast { to_int, a } => {
-            out.push(if *to_int {
-                op::PTR_TO_INT
-            } else {
-                op::PTR_FROM_INT
-            });
-            write_uleb(out, *a as u64);
-        }
         Inst::CallIndirect { ty, idx, args } => {
             out.push(op::CALL_INDIRECT);
             write_types(out, &ty.params);
@@ -1394,10 +1380,6 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             write_uleb(out, *a as u64);
             write_uleb(out, *b as u64);
         }
-        Inst::SimdWidthBytes => {
-            out.push(op::SIMD);
-            out.push(op::simd::WIDTH_BYTES);
-        }
     }
 }
 
@@ -1641,7 +1623,6 @@ fn decode_simd(c: &mut Cursor) -> Result<Inst, DecodeError> {
             a: c.idx()?,
             b: c.idx()?,
         },
-        op::simd::WIDTH_BYTES => Inst::SimdWidthBytes,
         other => return Err(DecodeError::BadOpcode(other)),
     })
 }
@@ -2270,18 +2251,6 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
             args: decode_idxs(c)?,
         },
         op::REF_FUNC => Inst::RefFunc { func: c.idx()? },
-        op::PTR_FROM_INT => Inst::PtrCast {
-            to_int: false,
-            a: c.idx()?,
-        },
-        op::PTR_TO_INT => Inst::PtrCast {
-            to_int: true,
-            a: c.idx()?,
-        },
-        op::PTR_ADD => Inst::PtrAdd {
-            a: c.idx()?,
-            b: c.idx()?,
-        },
         op::FMA => {
             let ty = match c.byte()? {
                 0 => FloatTy::F32,

@@ -301,15 +301,6 @@ fn check_inst(
             w(*a, src)?;
             vec![dst]
         }
-        Inst::PtrAdd { a, b } => {
-            w(*a, V::I64)?;
-            w(*b, V::I64)?;
-            vec![V::I64]
-        }
-        Inst::PtrCast { a, .. } => {
-            w(*a, V::I64)?;
-            vec![V::I64]
-        }
 
         // ----- memory (§3b/§4): addresses are i64; every access needs a window -----
         Inst::Load { op, addr, .. } => {
@@ -816,7 +807,6 @@ fn check_inst(
             w(*b, V::V128)?;
             vec![V::V128]
         }
-        Inst::SimdWidthBytes => vec![V::I32],
     };
     types.extend_from_slice(&push);
     Ok(())

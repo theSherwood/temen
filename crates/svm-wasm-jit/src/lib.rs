@@ -886,9 +886,6 @@ fn block_value_types(m: &Module, b: &Block, nested_caps: bool) -> Result<Vec<Val
             Inst::FToISat { op, .. } | Inst::FToITrap { op, .. } => tys.push(op.parts().1.val()),
             Inst::IToFConv { op, .. } => tys.push(op.parts().1.val()),
             Inst::Cast { op, .. } => tys.push(op.sig().2),
-            // Pointer provenance ops are plain `i64` off-CHERI: `ptr.add` a wrapping add, `ptr.cast`
-            // a no-op. Both yield `i64`.
-            Inst::PtrAdd { .. } | Inst::PtrCast { .. } => tys.push(ValType::I64),
             // A standalone fence orders accesses without touching memory; no SSA result.
             Inst::AtomicFence { .. } => {}
             // `Fma` has no core-wasm scalar opcode (relaxed-SIMD only), so it stays interpreter-tier.
@@ -920,8 +917,8 @@ fn block_value_types(m: &Module, b: &Block, nested_caps: bool) -> Result<Vec<Val
             // Indirect call: results come from the call site's own signature immediate.
             Inst::CallIndirect { ty, .. } => tys.extend(ty.results.iter().copied()),
             // ---- §17 SIMD (v128): the in-subset core lane ops (see the opcode helpers above). Each
-            // yields a `v128`, except lane-extract (the shape's scalar), the reductions
-            // any/all_true/bitmask (`i32`), and `simd.width_bytes` (`i32`). The verifier already
+            // yields a `v128`, except lane-extract (the shape's scalar) and the reductions
+            // any/all_true/bitmask (`i32`). The verifier already
             // typed these, so the emit-side opcode helpers (which return `None`/`Err` for the
             // shape holes wasm omits) are what actually gate a bogus lowering — here we only need
             // the result type. The deferred widening/reduction/relaxed ops fall through to the
@@ -961,7 +958,6 @@ fn block_value_types(m: &Module, b: &Block, nested_caps: bool) -> Result<Vec<Val
             Inst::VAnyTrue { .. } | Inst::VAllTrue { .. } | Inst::VBitmask { .. } => {
                 tys.push(ValType::I32)
             }
-            Inst::SimdWidthBytes => tys.push(ValType::I32),
             _ => return Err(Error::Unsupported("instruction outside the v1 subset")),
         }
     }
@@ -3894,18 +3890,6 @@ fn emit_block_body(
                 code.push(OP_SELECT);
                 set_result(cx, code, k, &mut next_val);
             }
-            // Pointer provenance ops (off-CHERI, plain `i64`): `ptr.add` is a wrapping `i64.add`;
-            // `ptr.cast` is a free identity that forwards its operand into the result local.
-            Inst::PtrAdd { a, b: rb } => {
-                get(code, cx, *a);
-                get(code, cx, *rb);
-                code.push(0x7c); // i64.add (wrapping)
-                set_result(cx, code, k, &mut next_val);
-            }
-            Inst::PtrCast { a, .. } => {
-                get(code, cx, *a);
-                set_result(cx, code, k, &mut next_val);
-            }
             // Standalone fence: a pure ordering barrier with no data effect. The wasm-JIT only
             // compiles single-threaded guests (concurrency folds to the interp), where a fence is
             // observably a no-op — so emit nothing (matching the oracle, which honors it identically
@@ -4625,12 +4609,6 @@ fn emit_block_body(
                 get(code, cx, *a);
                 get(code, cx, *b);
                 emit_simd(code, 130); // i16x8.q15mulr_sat_s
-                set_result(cx, code, k, &mut next_val);
-            }
-            Inst::SimdWidthBytes => {
-                // Fixed-128 MVP: the constant 16 on every backend (deterministic across the oracle).
-                code.push(OP_I32_CONST);
-                sleb32(code, 16);
                 set_result(cx, code, k, &mut next_val);
             }
             _ => return Err(Error::Unsupported("instruction outside the v1 subset")),
