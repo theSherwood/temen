@@ -1074,7 +1074,23 @@ const PAR_JIT_TABLE_LOG2: u8 = 4;
 /// `2^10 = 1024` dispatch-table slots for the on-ramp `Jit` grant — matches svm-run's
 /// `CLI_JIT_TABLE_LOG2`. A self-hosted guest (the JACL compiler) binds a staged unit's `Slot` imports
 /// to its own functions by index, so the table must cover the host program's function count (~800).
+/// This is the **minimum**: a guest with more functions needs a bigger table (see
+/// [`tierup_table_log2`]).
 const ONRAMP_JIT_TABLE_LOG2: u8 = 10;
+
+/// The B2 shared dispatch-table log2 for a guest with `n_funcs` functions (#1009 Mechanism 1): at
+/// least [`ONRAMP_JIT_TABLE_LOG2`], but grown so `1 << log2` covers every function — exactly the
+/// size the interpreter's dispatch table takes (`bytecode::SharedSlots`: `max(1 << log2,
+/// n.next_power_of_two())`). A **fixed** `1 << ONRAMP_JIT_TABLE_LOG2` under-sized the emitted table
+/// for a guest with more than 1024 functions (QuickJS 1185, SQLite 1445, Tcl 2669), so a high-index
+/// `call_indirect` masked `idx & 1023` in the emitted leaf but `idx & (2*n-1)` on the interpreter —
+/// a wrong slot (→ "null function / signature mismatch", or a wrong-but-typed function). Threaded
+/// through the emit, the engine table, the slot mirror, the unit emitter, and the driver accessor so
+/// all four agree on `1 << log2`.
+fn tierup_table_log2(n_funcs: usize) -> u8 {
+    let ceil = (n_funcs.max(1) as u64).next_power_of_two().trailing_zeros() as u8;
+    ONRAMP_JIT_TABLE_LOG2.max(ceil)
+}
 
 /// Build the **shared powerbox** for a §22-JIT run: grant the `Jit` cap (16-slot table) on a fresh
 /// `Host`, host-compile [`JIT_SERVICE`] into it, then leak it and publish the pointer for every Worker.
@@ -6164,6 +6180,37 @@ mod xcall_slot_tests {
             assert_eq!(format!("{got:?}"), format!("{v:?}"), "round-trip at {off}");
         }
     }
+
+    /// #1009 Mechanism 1: the emitted B2 dispatch table's size (`1 << tierup_table_log2(n)`) must
+    /// equal the interpreter's `bytecode::SharedSlots` size (`max(1 << ONRAMP_JIT_TABLE_LOG2,
+    /// n.next_power_of_two())`) for **every** guest — the two tiers mask `call_indirect` against the
+    /// same slot count, so a high-index dispatch reaches the same function on both. A fixed
+    /// `1 << ONRAMP_JIT_TABLE_LOG2` under-sized the emitted table for the >1024-function cards
+    /// (QuickJS 1185, SQLite 1445, Tcl 2669), so the emitted leaf wrapped a wrong slot.
+    #[test]
+    fn tierup_table_matches_the_interpreter_shared_slots_size() {
+        let floor = 1usize << ONRAMP_JIT_TABLE_LOG2;
+        // The interpreter's `SharedSlots::new` sizing, reproduced (the shared-table contract).
+        let shared_slots = |n: usize| floor.max(n.next_power_of_two()).max(1);
+        // Representative counts: the card function counts plus the boundary and the degenerate case.
+        for n in [1usize, 693, 1024, 1025, 1185, 1445, 2669, 4096] {
+            assert_eq!(
+                1usize << tierup_table_log2(n),
+                shared_slots(n),
+                "emitted table vs interpreter table for n={n} functions"
+            );
+        }
+        // Below the floor the table stays at the minimum; above it, it grows to cover every func.
+        assert_eq!(
+            tierup_table_log2(1),
+            ONRAMP_JIT_TABLE_LOG2,
+            "floor holds for tiny guests"
+        );
+        assert!(
+            1usize << tierup_table_log2(1445) >= 1445,
+            "the table covers every function of a >1024-func guest"
+        );
+    }
 }
 
 // ---- the wasm-JIT reactor (Doom's whole `tick` on emitted wasm) — BROWSER.md §"wasm-JIT tier" 5d ---
@@ -8454,6 +8501,12 @@ pub const TIERUP_RUN_JIT_INVOKE: i32 = 3;
 static TIERUP_UNIT_SHARED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static TIERUP_UNIT_WIN_LOG2: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// #1009 M1: the run's effective B2 dispatch-table log2 ([`tierup_table_log2`] of the guest's
+/// function count) — a unit and the main module must mask `call_indirect` against the **same**
+/// shared table, so the unit emitter uses the guest's size, not its own. Read by the unit emitter
+/// and [`svm_onramp_tierup_table_log2`] (the driver's table size).
+static TIERUP_UNIT_TABLE_LOG2: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(ONRAMP_JIT_TABLE_LOG2);
 
 /// The wasm emitter the single-shot pump installs for a `vm_jit_*`-importing guest (#835/#846):
 /// emit a validated unit whole-module in **Model B2** shape (`compile_module_b2` — its
@@ -8472,7 +8525,9 @@ fn onramp_tierup_unit_emitter(blob: &[u8]) -> Option<Vec<u8>> {
         mc.size_log2 = mc.size_log2.max(win_log2);
     }
     let shared = TIERUP_UNIT_SHARED.load(std::sync::atomic::Ordering::Relaxed);
-    svm_wasm_jit::compile_module_b2(&m, shared, ONRAMP_JIT_TABLE_LOG2 as u32).ok()
+    // #1009 M1: mask against the run's shared-table size (the guest's), not `ONRAMP_JIT_TABLE_LOG2`.
+    let table_log2 = TIERUP_UNIT_TABLE_LOG2.load(std::sync::atomic::Ordering::Relaxed);
+    svm_wasm_jit::compile_module_b2(&m, shared, table_log2 as u32).ok()
 }
 
 struct TierupRun {
@@ -8514,6 +8569,50 @@ struct TierupRun {
     /// The guest's top-level result, staged at DONE.
     value: i64,
     frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
+    /// #1009 paged tier-up: whether the emitted module carries the software page check
+    /// ([`svm_wasm_jit::compile_module_tierup_b2_paged`]) — set when the guest write-protects rodata.
+    /// A paged run rebuilds [`pagestate`](Self::pagestate) at every TIERUP and the driver points the
+    /// emitted `"pagestate"` global at it (and writes the table's coverage to `"mapped"`).
+    paged: bool,
+    /// #1009 paged tier-up: the page-state table for the pending TIERUP, rebuilt from the live page
+    /// map each event ([`bytecode::build_pagestate_table`]). Its bytes live in this module's linear
+    /// memory, so [`svm_onramp_tierup_pagestate_ptr`] IS the address the driver writes to the emitted
+    /// `"pagestate"` global (one shared memory, zero copies). Empty on unpaged runs.
+    pagestate: Vec<u8>,
+    /// #1009 paged tier-up: the [`bytecode::Vcpu::mem_map_version`] the cached `pagestate`/`mapped`
+    /// were built at. `map`/`unmap`/`protect` bump the version; while it is unchanged the page-state
+    /// table is identical, so the `O(pages)` rebuild is skipped (dispatch-heavy cards fire tens of
+    /// thousands of tier-ups between two heap grows). `u64::MAX` = never built.
+    pagestate_version: u64,
+    /// #1009 paged tier-up: the cached table's coverage — the value written to `"mapped"` (restored
+    /// even on a cache hit, since an interleaved JIT_INVOKE reuses `mapped`).
+    pagestate_cover: u64,
+    /// #1009: a generation counter bumped on each §22 install/uninstall (the only events that mutate
+    /// the dispatch-table slot mirror — a `cap.call`-bearing unit never emits, so installs happen
+    /// strictly between events). The driver caches the last generation it synced its `WebAssembly.Table`
+    /// at and rebuilds only when this advances, so a dispatch-heavy card that never installs syncs the
+    /// (up to ~4 K-slot) table ONCE instead of on every one of tens of thousands of tier-ups — the
+    /// pump's dominant per-event cost before this.
+    table_gen: u32,
+}
+
+impl TierupRun {
+    /// #1009 paged tier-up: refresh the page-state table iff the window's page map changed since the
+    /// last build ([`bytecode::Vcpu::mem_map_version`]), then stage its coverage for `"mapped"`. Cheap
+    /// on the common path (an `O(1)` version compare); an `O(pages)` rebuild only after a real
+    /// `map`/`unmap`/`protect`. Called at each TIERUP and after each `call_interp` bounce (a bounced
+    /// callback may have `vm_map`-grown the window mid-invoke).
+    fn sync_pagestate(&mut self) {
+        let ver = self.vcpu.mem_map_version();
+        if ver != self.pagestate_version {
+            let info = self.vcpu.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
+            let (table, cover) = bytecode::build_pagestate_table(&info);
+            self.pagestate = table;
+            self.pagestate_cover = cover;
+            self.pagestate_version = ver;
+        }
+        self.mapped = self.pagestate_cover;
+    }
 }
 
 /// Open a **leaf tier-up run** over the on-ramp module at `[mod_ptr, mod_len)` with stdin seeded:
@@ -8603,11 +8702,33 @@ pub extern "C" fn svm_onramp_tierup_open(
             && f.results.iter().all(scalar)
             && f.params.len().max(f.results.len()) <= max_slots
     });
+    // #1009 M1: size the shared table to the guest, not a fixed `1 << ONRAMP_JIT_TABLE_LOG2` — the
+    // interpreter's table grows to `funcs.next_power_of_two()`, so a smaller emitted mask would send
+    // a high-index `call_indirect` to a different slot. One value drives the emit, the engine table,
+    // the slot mirror, the unit emitter, and the driver's table build.
+    let table_log2 = tierup_table_log2(m.funcs.len());
+    // #1009: a guest that write-protects its rodata (a `readonly` data segment — every real on-ramp
+    // card lays out `.rodata` this way) makes the per-call #717 `scalar_extent` sync decline **every**
+    // tier-up: one durable `Ro` page and the window is no longer one-bound-representable, so the pump
+    // fired zero emitted events on the cards it most needed to (the #839 bench finding). Emit the
+    // shared table **paged** (#750) so the decline is replaced by a per-access page check that honors
+    // `Ro`/`Unmapped` exactly where the interpreter's `check_prot` traps — the vCPU then surfaces the
+    // reserved size (never a decline), and each event refreshes a page-state table. Paged rides the
+    // B2 shared-table mode (the pump's only mode), so it is gated on `all_shimmable`.
+    let paged = all_shimmable && m.data.iter().any(|d| d.readonly);
+    let page_log2 = svm_interp::host_page_size().trailing_zeros() as u8;
     // #880: emit the main module over the **shared reserved table** — `call_indirect`-bearing
     // functions tier up (the language-runtime dispatch-loop shape), their indirect calls reaching
     // installed units natively (old→new) and interpreter-resident targets through the live bounce.
-    let emitted_res = if all_shimmable {
-        svm_wasm_jit::compile_module_tierup_b2(&emit_m, shared != 0, ONRAMP_JIT_TABLE_LOG2 as u32)
+    let emitted_res = if paged {
+        svm_wasm_jit::compile_module_tierup_b2_paged(
+            &emit_m,
+            shared != 0,
+            table_log2 as u32,
+            page_log2,
+        )
+    } else if all_shimmable {
+        svm_wasm_jit::compile_module_tierup_b2(&emit_m, shared != 0, table_log2 as u32)
     } else {
         svm_wasm_jit::compile_module_tierup(&emit_m, shared != 0)
     };
@@ -8630,11 +8751,10 @@ pub extern "C" fn svm_onramp_tierup_open(
         set(STATUS_UNSUPPORTED);
         return -STATUS_UNSUPPORTED;
     }
-    // The engine's dispatch table must match the emitted `call_indirect` mask
-    // (`1 << ONRAMP_JIT_TABLE_LOG2`) — a natural-size table would both number install slots
-    // differently and wrap wild indices differently (#846/#880). Sized for every pump guest.
-    let Some(prog) = bytecode::VcpuProgram::compile_with_jit_table(&m, ONRAMP_JIT_TABLE_LOG2)
-    else {
+    // The engine's dispatch table must match the emitted `call_indirect` mask (`1 << table_log2`) —
+    // a natural-size table would both number install slots differently and wrap wild indices
+    // differently (#846/#880). Sized to the guest (#1009 M1) so the two tiers wrap identically.
+    let Some(prog) = bytecode::VcpuProgram::compile_with_jit_table(&m, table_log2) else {
         set(STATUS_UNSUPPORTED);
         return -STATUS_UNSUPPORTED;
     };
@@ -8656,6 +8776,7 @@ pub extern "C" fn svm_onramp_tierup_open(
     // `fn`s) — stored for every open, since shims serve non-jit guests' emitted leaves too (#880).
     TIERUP_UNIT_SHARED.store(shared != 0, std::sync::atomic::Ordering::Relaxed);
     TIERUP_UNIT_WIN_LOG2.store(win_log2, std::sync::atomic::Ordering::Relaxed);
+    TIERUP_UNIT_TABLE_LOG2.store(table_log2, std::sync::atomic::Ordering::Relaxed);
     // #835: arm the §22 unit wasm-emitter for a `vm_jit_*` importer (`grant_onramp_caps` granted
     // the `Jit` cap + validator). Gated on the same shimmable-signature bound as the shared-table
     // emit above — a unit's dispatch depends on shims covering every interpreter-resident slot.
@@ -8673,7 +8794,16 @@ pub extern "C" fn svm_onramp_tierup_open(
         win_log2,
         back,
     ) {
-        Ok(v) => v.with_jit_eligible(std::sync::Arc::from(eligible.into_boxed_slice())),
+        Ok(v) => {
+            let v = v.with_jit_eligible(std::sync::Arc::from(eligible.into_boxed_slice()));
+            // #1009 paged: skip the scalar decline — the per-event page-state table carries the
+            // fidelity `scalar_extent` cannot (the emitted access consults it and traps in-clamp).
+            if paged {
+                v.with_jit_page_checked()
+            } else {
+                v
+            }
+        }
         Err(_) => {
             // SAFETY: the leaked program has no borrower yet; rebox and drop it.
             drop(unsafe { Box::from_raw(prog as *const _ as *mut bytecode::VcpuProgram) });
@@ -8695,7 +8825,7 @@ pub extern "C" fn svm_onramp_tierup_open(
             jit_wasm: None,
             jit_param_types: Vec::new(),
             jit_result_types: Vec::new(),
-            slot_codes: vec![-1; 1usize << ONRAMP_JIT_TABLE_LOG2],
+            slot_codes: vec![-1; 1usize << table_log2],
             sigs: m
                 .funcs
                 .iter()
@@ -8706,6 +8836,11 @@ pub extern "C" fn svm_onramp_tierup_open(
             pending_bounce_trap: None,
             value: 0,
             frame,
+            paged,
+            pagestate: Vec::new(),
+            pagestate_version: u64::MAX,
+            pagestate_cover: 0,
+            table_gen: 0,
         });
     }
     set(STATUS_OK);
@@ -8732,8 +8867,18 @@ pub extern "C" fn svm_onramp_tierup_run() -> i32 {
         match s.vcpu.run() {
             bytecode::VcpuEvent::TierUp { func, argv, mapped } => {
                 s.func = func;
-                s.mapped = mapped;
                 s.argv = argv.into_vec();
+                if s.paged {
+                    // #1009 paged: `mapped` from the event is the reserved size (the page-checked run
+                    // never declines). Stage the page-state table's COVERAGE for `"mapped"` (the bound
+                    // above which everything traps, where `check_prot` faults) and the table itself
+                    // for `"pagestate"` — rebuilt only when the page map changed since the last event
+                    // (`sync_pagestate`). The table bytes are read via `svm_onramp_tierup_pagestate_*`
+                    // (their address in this module's linear memory IS the `"pagestate"` value).
+                    s.sync_pagestate();
+                } else {
+                    s.mapped = mapped;
+                }
                 return TIERUP_RUN_TIERUP;
             }
             // §22 install/uninstall mutate only engine/host state — resolve authority against this
@@ -8749,6 +8894,7 @@ pub extern "C" fn svm_onramp_tierup_run() -> i32 {
                     if let Some(e) = s.slot_codes.get_mut(slot) {
                         *e = code;
                     }
+                    s.table_gen = s.table_gen.wrapping_add(1); // the slot mirror changed → re-sync
                 }
             }
             bytecode::VcpuEvent::JitUninstall { handle, .. } => {
@@ -8757,6 +8903,7 @@ pub extern "C" fn svm_onramp_tierup_run() -> i32 {
                     if let Some(e) = s.slot_codes.get_mut(slot) {
                         *e = -1; // keep the JS table mirror exact (a stale slot must trap)
                     }
+                    s.table_gen = s.table_gen.wrapping_add(1); // the slot mirror changed → re-sync
                 }
             }
             // §22 `Jit.invoke` (#835): a runtime-compiled unit with emitted wasm, all-scalar
@@ -8842,11 +8989,40 @@ pub extern "C" fn svm_onramp_tierup_func() -> i32 {
 }
 
 /// The pending TIERUP's/JIT_INVOKE's committed extent — the value for the emitted `"mapped"`
-/// global (#717).
+/// global (#717). On a **paged** run (#1009) this is the pending TIERUP's page-state table
+/// *coverage*, not the scalar extent — the bound above which every access traps.
 #[no_mangle]
 pub extern "C" fn svm_onramp_tierup_mapped() -> i64 {
     // SAFETY: single-threaded wasm; read of the pending operands.
     unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.mapped as i64)
+}
+
+/// #1009: whether this run's emitted module is **paged** — the driver must, before each TIERUP call,
+/// write the emitted `"pagestate"` global to [`svm_onramp_tierup_pagestate_ptr`] (in addition to the
+/// usual `"mapped"` = [`svm_onramp_tierup_mapped`] and the fuel cell). `0` on an unpaged run (no
+/// `"pagestate"` global to write).
+#[no_mangle]
+pub extern "C" fn svm_onramp_tierup_paged() -> i32 {
+    // SAFETY: single-threaded wasm; read of the session flag.
+    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.paged as i32)
+}
+
+/// #1009 paged: the pending TIERUP's page-state table base. The bytes live in this module's linear
+/// memory, so this pointer is exactly the value the driver writes to the emitted `"pagestate"`
+/// global (one shared memory, zero copies — the browser path; the wasmi differential copies them
+/// into its own memory first). Meaningful only when [`svm_onramp_tierup_paged`] is set.
+#[no_mangle]
+pub extern "C" fn svm_onramp_tierup_pagestate_ptr() -> *const u8 {
+    // SAFETY: single-threaded wasm; read of the pending table.
+    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }
+        .map_or(core::ptr::null(), |s| s.pagestate.as_ptr())
+}
+
+/// #1009 paged: byte length of the pending TIERUP's page-state table (`0` on an unpaged run).
+#[no_mangle]
+pub extern "C" fn svm_onramp_tierup_pagestate_len() -> usize {
+    // SAFETY: single-threaded wasm; read of the pending table.
+    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.pagestate.len())
 }
 
 /// The pending TIERUP's/JIT_INVOKE's marshalled i64 args (base pointer; valid until the next event).
@@ -9034,7 +9210,18 @@ pub extern "C" fn svm_onramp_tierup_call_interp(target: u32, args_ptr: *mut u8) 
     let max_slots = (svm_wasm_jit::ENV_CELL_BYTES - 16) / 8;
     let io = unsafe { core::slice::from_raw_parts_mut(args_ptr as *mut i64, max_slots) };
     match s.vcpu.bounce_call(target, io) {
-        Ok(_) => 0,
+        Ok(_) => {
+            // #1009 paged: a bounced callback may have `vm_map`-grown the window mid-invoke — the
+            // page-state table built at TIERUP entry no longer covers the grown pages (they read as
+            // `Unmapped`, so the emitted access after the bounce would trap where the interpreter
+            // admits the growth). Refresh it (only if the page map actually changed — `sync_pagestate`
+            // version-guards the rebuild), exactly as the #717 `"mapped"` fan-out re-syncs the scalar
+            // bound; the driver reads the fresh base + coverage below.
+            if s.paged {
+                s.sync_pagestate();
+            }
+            0
+        }
         Err(t) => {
             s.pending_bounce_trap = Some(t);
             1
@@ -9052,11 +9239,13 @@ pub extern "C" fn svm_onramp_tierup_mapped_now() -> i64 {
         .map_or(0, |s| s.vcpu.window_scalar_extent() as i64)
 }
 
-/// The dispatch-table size (log2) a `vm_jit_*` run's table is built with — the JS host sizes its
-/// `WebAssembly.Table` to `1 << this` (the emitted `call_indirect` mask).
+/// The dispatch-table size (log2) this run's table is built with — the JS host sizes its
+/// `WebAssembly.Table` to `1 << this` (the emitted `call_indirect` mask). #1009 M1: this is the
+/// guest's effective size ([`tierup_table_log2`]), not the fixed minimum, so the driver's table
+/// covers every function the emitted dispatch can reach.
 #[no_mangle]
 pub extern "C" fn svm_onramp_tierup_table_log2() -> u32 {
-    ONRAMP_JIT_TABLE_LOG2 as u32
+    TIERUP_UNIT_TABLE_LOG2.load(std::sync::atomic::Ordering::Relaxed) as u32
 }
 
 /// The guest program's function count — the dispatch table's **natural prefix** (`slot i < nfuncs`
@@ -9065,6 +9254,16 @@ pub extern "C" fn svm_onramp_tierup_table_log2() -> u32 {
 pub extern "C" fn svm_onramp_tierup_nfuncs() -> usize {
     // SAFETY: single-threaded wasm; read of the session stash.
     unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.sigs.len())
+}
+
+/// #1009: the dispatch-table **generation** — bumped on each §22 install/uninstall (the only slot-
+/// mirror mutations). The driver caches the generation it last synced its `WebAssembly.Table` at and
+/// rebuilds only when this advances; a card that never installs syncs the table once, not per
+/// tier-up. Monotone (`wrapping_add`); the driver compares for inequality, so wrap is immaterial.
+#[no_mangle]
+pub extern "C" fn svm_onramp_tierup_table_gen() -> u32 {
+    // SAFETY: single-threaded wasm; read of the session stash.
+    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.table_gen)
 }
 
 /// The code handle installed at dispatch-table `slot` (`-1` empty/natural) — the mirror the JS
@@ -9234,6 +9433,30 @@ struct CoopTierupRun {
     /// The guest's top-level result, staged at DONE.
     value: i64,
     frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
+    /// #1009 paged tier-up (the `TierupRun` twin): whether the emitted module carries the software
+    /// page check (a rodata guest), the pending TIERUP's page-state table, and its version/coverage
+    /// cache (rebuilt only when the page map changed). See [`TierupRun::sync_pagestate`].
+    paged: bool,
+    pagestate: Vec<u8>,
+    pagestate_version: u64,
+    pagestate_cover: u64,
+}
+
+impl CoopTierupRun {
+    /// #1009 paged tier-up: refresh the page-state table iff the window's page map changed
+    /// ([`bytecode::CoopRun::mem_map_version`]), then stage its coverage for `"mapped"` — the
+    /// [`TierupRun::sync_pagestate`] twin over the cooperative run.
+    fn sync_pagestate(&mut self) {
+        let ver = self.run.mem_map_version();
+        if ver != self.pagestate_version {
+            let info = self.run.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
+            let (table, cover) = bytecode::build_pagestate_table(&info);
+            self.pagestate = table;
+            self.pagestate_cover = cover;
+            self.pagestate_version = ver;
+        }
+        self.mapped = self.pagestate_cover;
+    }
 }
 
 static mut COOP_RUN: Option<CoopTierupRun> = None;
@@ -9292,8 +9515,22 @@ pub extern "C" fn svm_coop_open(
             && f.results.iter().all(scalar)
             && f.params.len().max(f.results.len()) <= max_slots
     });
-    let emitted_res = if all_shimmable {
-        svm_wasm_jit::compile_module_tierup_b2(&emit_m, shared != 0, ONRAMP_JIT_TABLE_LOG2 as u32)
+    // #1009 M1: size the shared table to the guest (see `tierup_table_log2`), consistently across
+    // the emit, the host's domain table, the slot mirror, the unit emitter, and the driver.
+    let table_log2 = tierup_table_log2(m.funcs.len());
+    // #1009: a rodata guest emits the shared table PAGED (see `svm_onramp_tierup_open` for the full
+    // rationale) — the per-call `scalar_extent` decline is replaced by the per-access page check.
+    let paged = all_shimmable && m.data.iter().any(|d| d.readonly);
+    let page_log2 = svm_interp::host_page_size().trailing_zeros() as u8;
+    let emitted_res = if paged {
+        svm_wasm_jit::compile_module_tierup_b2_paged(
+            &emit_m,
+            shared != 0,
+            table_log2 as u32,
+            page_log2,
+        )
+    } else if all_shimmable {
+        svm_wasm_jit::compile_module_tierup_b2(&emit_m, shared != 0, table_log2 as u32)
     } else {
         svm_wasm_jit::compile_module_tierup(&emit_m, shared != 0)
     };
@@ -9334,13 +9571,14 @@ pub extern "C" fn svm_coop_open(
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
     };
     let (frame, _keys) = grant_onramp_caps(&mut host, &m, None);
-    // #926 slice 2f: a B2 main module masks `call_indirect` against `1 << ONRAMP_JIT_TABLE_LOG2`, so the
-    // engine's dispatch table must be the same size — a natural-size table would number install slots
-    // and wrap wild indices differently (#846/#880). `CoopRun` builds the domain with
-    // `host.jit_table_log2()`, so force it here (a `vm_jit_*` importer's `grant_onramp_caps` already set
-    // it to this floor; `set_jit_table_log2` takes the max, so this is idempotent for that case).
+    // #926 slice 2f: a B2 main module masks `call_indirect` against `1 << table_log2` (#1009 M1: the
+    // guest's effective size), so the engine's dispatch table must be the same size — a natural-size
+    // table would number install slots and wrap wild indices differently (#846/#880). `CoopRun` builds
+    // the domain with `host.jit_table_log2()`, so force it here (a `vm_jit_*` importer's
+    // `grant_onramp_caps` already set it to the floor; `set_jit_table_log2` takes the max, so this
+    // raises it to the guest's size).
     if all_shimmable {
-        host.set_jit_table_log2(ONRAMP_JIT_TABLE_LOG2);
+        host.set_jit_table_log2(table_log2);
     }
     // #926 slice 2e/2f: arm the §22 unit wasm-emitter for a `vm_jit_*` importer so its runtime-compiled
     // units run emitted (the pump then surfaces a `CoopEvent::JitInvoke` when a unit has emitted wasm;
@@ -9351,12 +9589,15 @@ pub extern "C" fn svm_coop_open(
     // Reuses the single-vCPU emitter and its shared parameters — only one driver runs at a time.
     TIERUP_UNIT_SHARED.store(shared != 0, std::sync::atomic::Ordering::Relaxed);
     TIERUP_UNIT_WIN_LOG2.store(win_log2, std::sync::atomic::Ordering::Relaxed);
+    TIERUP_UNIT_TABLE_LOG2.store(table_log2, std::sync::atomic::Ordering::Relaxed);
     if jit_importer && all_shimmable {
         host.set_jit_wasm_emitter(onramp_tierup_unit_emitter);
     }
     let tierup = bytecode::TierUpConfig {
         eligible: std::sync::Arc::from(eligible.into_boxed_slice()),
-        page_checked: false,
+        // #1009 paged: the vCPUs skip the scalar decline — the per-event page-state table carries the
+        // fidelity `scalar_extent` cannot (matching the pump's `with_jit_page_checked`).
+        page_checked: paged,
     };
     // `CoopRun` owns its `Domain`; the window is built over `back` with the reservation clamped to
     // the run window (`vm_map`-grow into `[declared, 1 << win_log2)`, an over-grow `-EINVAL`s).
@@ -9404,6 +9645,10 @@ pub extern "C" fn svm_coop_open(
             pending_bounce_trap: None,
             value: 0,
             frame,
+            paged,
+            pagestate: Vec::new(),
+            pagestate_version: u64::MAX,
+            pagestate_cover: 0,
         });
     }
     set(STATUS_OK);
@@ -9424,8 +9669,12 @@ pub extern "C" fn svm_coop_run() -> i32 {
     let (status, value, exit_code, ev) = match s.run.run() {
         bytecode::CoopEvent::TierUp { func, argv, mapped } => {
             s.func = func;
-            s.mapped = mapped;
             s.argv = argv.into_vec();
+            if s.paged {
+                s.sync_pagestate();
+            } else {
+                s.mapped = mapped;
+            }
             return COOP_RUN_TIERUP;
         }
         bytecode::CoopEvent::JitInvoke {
@@ -9489,10 +9738,42 @@ pub extern "C" fn svm_coop_func() -> i32 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.func as i32)
 }
 
-/// The pending TIERUP's committed extent — the value for the emitted `"mapped"` global (#717).
+/// The pending TIERUP's committed extent — the value for the emitted `"mapped"` global (#717). On a
+/// **paged** run (#1009) this is the pending TIERUP's page-state table coverage.
 #[no_mangle]
 pub extern "C" fn svm_coop_mapped() -> i64 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.mapped as i64)
+}
+
+/// #1009: whether this coop run's emitted module is **paged** — the driver must write the emitted
+/// `"pagestate"` global to [`svm_coop_pagestate_ptr`] before each TIERUP call (the pump's
+/// `svm_onramp_tierup_paged` twin). `0` on an unpaged run.
+#[no_mangle]
+pub extern "C" fn svm_coop_paged() -> i32 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.paged as i32)
+}
+
+/// #1009 paged: the pending TIERUP's page-state table base (its bytes live in this module's linear
+/// memory — the browser writes this pointer straight to the `"pagestate"` global; the wasmi
+/// differential copies them into its own memory). Meaningful only when [`svm_coop_paged`] is set.
+#[no_mangle]
+pub extern "C" fn svm_coop_pagestate_ptr() -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .map_or(core::ptr::null(), |s| s.pagestate.as_ptr())
+}
+
+/// #1009 paged: byte length of the pending TIERUP's page-state table (`0` on an unpaged run).
+#[no_mangle]
+pub extern "C" fn svm_coop_pagestate_len() -> usize {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.pagestate.len())
+}
+
+/// #1009: the dispatch-table generation — bumped on each §22 install/uninstall the coop scheduler
+/// services. The driver rebuilds its `WebAssembly.Table` only when this advances (the pump's
+/// `svm_onramp_tierup_table_gen` twin).
+#[no_mangle]
+pub extern "C" fn svm_coop_table_gen() -> u32 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.run.table_gen())
 }
 
 /// The pending TIERUP's marshalled i64 args (base pointer; valid until the next event).
@@ -9645,7 +9926,15 @@ pub extern "C" fn svm_coop_call_interp(target: u32, args_ptr: *mut u8) -> i32 {
     // SAFETY: the host passes the env scratch, at least `max_slots` i64s wide.
     let io = unsafe { core::slice::from_raw_parts_mut(args_ptr as *mut i64, max_slots) };
     match s.run.bounce(target, io) {
-        Ok(_) => 0,
+        Ok(_) => {
+            // #1009 paged: a bounced callback may have grown the window mid-invoke — refresh the
+            // page-state table (version-guarded) so the post-bounce emitted access admits the growth
+            // (the pump's `svm_onramp_tierup_call_interp` twin).
+            if s.paged {
+                s.sync_pagestate();
+            }
+            0
+        }
         Err(t) => {
             s.pending_bounce_trap = Some(t);
             1

@@ -202,9 +202,16 @@ async function driveTierupRun(ex, memory, cacheKey) {
   const table = new WebAssembly.Table({ initial: tsize, maximum: tsize, element: 'anyfunc' });
   const mappedGlobals = []; // every live instance's "mapped" — the post-bounce fan-out set
   const fuelGlobals = [];
+  // #1009 paged: a rodata guest's main module is emitted PAGED — its `"pagestate"` global must point
+  // at the per-event page-state table before every emitted call (§750). The table's bytes live in
+  // this module's linear memory (the pump's `Vec` — one shared memory), so the accessor's pointer is
+  // exactly the global's value, zero copies. Only the main module is paged (units are not), so this
+  // set holds at most one global.
+  const pagestateGlobals = [];
   const registerGlobals = (exports) => {
     if (exports.mapped) mappedGlobals.push(exports.mapped);
     if (exports.fuel) fuelGlobals.push(exports.fuel);
+    if (exports.pagestate) pagestateGlobals.push(exports.pagestate);
   };
   const unitImports = () => ({ env: {
     memory,
@@ -212,9 +219,19 @@ async function driveTierupRun(ex, memory, cacheKey) {
     trap: () => {},
     call_interp: (target, argsPtr) => {
       const rc = ex.svm_onramp_tierup_call_interp(target, argsPtr);
-      // #717 fan-out: growth a bounced callback made is visible from the next instruction on.
-      const now = ex.svm_onramp_tierup_mapped_now();
-      for (const g of mappedGlobals) g.value = now;
+      // #717 fan-out: growth a bounced callback made is visible from the next instruction on. #1009
+      // paged: the grow also rebuilt the page-state table (in `call_interp`), so fan the fresh
+      // COVERAGE out to `"mapped"` and re-point `"pagestate"` at the fresh base (the `Vec` may have
+      // reallocated) — the emitted access after the bounce then admits the grown pages.
+      if (ex.svm_onramp_tierup_paged()) {
+        const cover = ex.svm_onramp_tierup_mapped();
+        for (const g of mappedGlobals) g.value = cover;
+        const ps = Number(ex.svm_onramp_tierup_pagestate_ptr());
+        for (const g of pagestateGlobals) g.value = ps;
+      } else {
+        const now = ex.svm_onramp_tierup_mapped_now();
+        for (const g of mappedGlobals) g.value = now;
+      }
       if (rc !== 0) throw new Error('bounce trap'); // unwind to the deliver below
     },
   } });
@@ -271,7 +288,15 @@ async function driveTierupRun(ex, memory, cacheKey) {
   // Rebuild the table from the engine's slot mirror. Installs only happen between events (a unit
   // with a cap.call never emits), so an event-boundary sync is exact for the whole event.
   const nfuncs = ex.svm_onramp_tierup_nfuncs();
+  // The engine's slot mirror only changes on a §22 install/uninstall (a `cap.call`-bearing unit
+  // never emits, so installs happen strictly between events). `svm_onramp_tierup_table_gen` bumps on
+  // each — cache the last-synced generation and rebuild the table only when it advances, so a
+  // dispatch-heavy card that never installs (lua/qjs/sqlite/tcl) syncs the ~4 K-slot table ONCE
+  // instead of on every one of tens of thousands of tier-ups (#1009 — the pump's dominant cost).
+  let syncedGen = -1;
   const syncTable = async () => {
+    const gen = ex.svm_onramp_tierup_table_gen();
+    if (gen === syncedGen) return;
     for (let slot = 0; slot < tsize; slot++) {
       let entry = null;
       if (slot < nfuncs) {
@@ -288,6 +313,7 @@ async function driveTierupRun(ex, memory, cacheKey) {
       }
       table.set(slot, entry);
     }
+    syncedGen = gen;
   };
 
   try {
@@ -341,6 +367,13 @@ async function driveTierupRun(ex, memory, cacheKey) {
       const tmapped = ex.svm_onramp_tierup_mapped();
       for (const g of mappedGlobals) g.value = tmapped;
       for (const g of fuelGlobals) g.value = 1n << 61n; // re-arm across events on reused instances
+      // #1009 paged: point the emitted page check at the freshly rebuilt table (its base can move as
+      // the pump's `Vec` reallocates between events, so read it every time). On an unpaged run the
+      // set is empty and `_paged` is 0 — no-op.
+      if (ex.svm_onramp_tierup_paged()) {
+        const ps = Number(ex.svm_onramp_tierup_pagestate_ptr());
+        for (const g of pagestateGlobals) g.value = ps;
+      }
       new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
       try {
         const ret = emitted['f' + func](win, envCell, ...args);
@@ -379,9 +412,11 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
 
   const mappedGlobals = []; // every live instance's "mapped" — the post-bounce fan-out set (#717)
   const fuelGlobals = [];
+  const pagestateGlobals = []; // #1009 paged: the "pagestate" base, the coop twin of driveTierupRun's
   const registerGlobals = (exports) => {
     if (exports.mapped) mappedGlobals.push(exports.mapped);
     if (exports.fuel) fuelGlobals.push(exports.fuel);
+    if (exports.pagestate) pagestateGlobals.push(exports.pagestate);
   };
   // #846/#880 on the cooperative path — the shared driver table (Model B2): the main module and every
   // §22 unit `call_indirect` through it, and the driver populates its slots from the engine's mirror at
@@ -398,8 +433,17 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
     trap: () => {},
     call_interp: (target, argsPtr) => {
       const rc = ex.svm_coop_call_interp(target, argsPtr);
-      const now = ex.svm_coop_mapped_now();
-      for (const g of mappedGlobals) g.value = now;
+      // #1009 paged: the grow rebuilt the page-state table (in `call_interp`) — fan the fresh coverage
+      // to "mapped" and re-point "pagestate"; else the #717 scalar extent (the pump's twin).
+      if (ex.svm_coop_paged()) {
+        const cover = ex.svm_coop_mapped();
+        for (const g of mappedGlobals) g.value = cover;
+        const ps = Number(ex.svm_coop_pagestate_ptr());
+        for (const g of pagestateGlobals) g.value = ps;
+      } else {
+        const now = ex.svm_coop_mapped_now();
+        for (const g of mappedGlobals) g.value = now;
+      }
       if (rc !== 0) throw new Error('bounce trap'); // unwind to the deliver below
     },
   } });
@@ -454,7 +498,12 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
   // it holds an installed unit's `f0` (via its by-handle wasm) or a shim for an interpreter-resident
   // target. Exactly `driveTierupRun`'s `syncTable`, over the `svm_coop_*` accessors.
   const nfuncs = ex.svm_coop_nfuncs();
+  // #1009: rebuild the table only when the slot mirror changed (a §22 install/uninstall bumps
+  // `svm_coop_table_gen`) — the driveTierupRun cache, over the coop accessors.
+  let syncedGen = -1;
   const syncTable = async () => {
+    const gen = ex.svm_coop_table_gen();
+    if (gen === syncedGen) return;
     for (let slot = 0; slot < tsize; slot++) {
       let entry = null;
       if (slot < nfuncs) {
@@ -471,6 +520,7 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
       }
       table.set(slot, entry);
     }
+    syncedGen = gen;
   };
 
   try {
@@ -522,6 +572,12 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
       const tmapped = ex.svm_coop_mapped();
       for (const g of mappedGlobals) g.value = tmapped;
       for (const g of fuelGlobals) g.value = 1n << 61n; // re-arm across events on the reused instance
+      // #1009 paged: point the emitted page check at the freshly rebuilt table (base can move as the
+      // pump's Vec reallocates, so read it every event). Empty set / `_paged==0` on an unpaged run.
+      if (ex.svm_coop_paged()) {
+        const ps = Number(ex.svm_coop_pagestate_ptr());
+        for (const g of pagestateGlobals) g.value = ps;
+      }
       new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
       try {
         const ret = emitted['f' + func](win, envCell, ...args);

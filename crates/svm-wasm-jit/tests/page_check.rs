@@ -22,7 +22,8 @@
 use std::sync::Arc;
 use svm_interp::{bytecode, Host, Region, Trap, Value};
 use svm_wasm_jit::{
-    compile_module_tierup, compile_module_tierup_paged, TRAP_MEMORY_FAULT, TRAP_OUT_OF_FUEL,
+    compile_module_tierup, compile_module_tierup_b2_paged, compile_module_tierup_paged,
+    TRAP_MEMORY_FAULT, TRAP_OUT_OF_FUEL,
 };
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
@@ -485,6 +486,52 @@ block 0 (v0: i64) {
         "unpaged output must carry no pagestate global — the mode lands dark"
     );
     assert!(instance.get_global(&store, "mapped").is_some());
+}
+
+#[test]
+fn b2_paged_composes_the_shared_table_import_with_the_pagestate_global() {
+    // #1009 pump shape: a rodata-bearing guest whose dispatch leaf `call_indirect`s. The composed
+    // entry must emit a module that BOTH imports the B2 shared table (so indirect dispatch routes
+    // through the host-populated table) AND exports the `"pagestate"` global (so the paged driver can
+    // point the emitted page check at the live table) — the two features are orthogonal.
+    let m = build(
+        r#"memory 17
+data ro 0 "readonlybytes"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vs = i32.wrap_i64 v0
+  vr = call_indirect (i64) -> (i64) vs (v0)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vl = i64.load v0
+  return vl
+  }
+}
+"#,
+    );
+    assert!(m.data.iter().any(|d| d.readonly), "guest carries rodata");
+    let (wasm, emit) = compile_module_tierup_b2_paged(&m, false, 10, 16).expect("emit b2+paged");
+    assert!(emit.iter().any(|&e| e), "some function tiers up");
+
+    let engine = Engine::default();
+    let module = WModule::new(&engine, &wasm[..]).expect("b2+paged wasm must validate");
+    assert!(
+        module
+            .imports()
+            .any(|i| i.module() == "env" && i.name() == "__indirect_function_table"),
+        "B2 mode imports the shared reserved table"
+    );
+    assert!(
+        module.exports().any(|e| e.name() == "pagestate"),
+        "paged mode exports the page-state base global"
+    );
+    assert!(
+        module.exports().any(|e| e.name() == "mapped"),
+        "the live-mapped bound global is present"
+    );
 }
 
 /// The reactor guest: func 0 `_start(as, off, len)` unmaps `[off, off+len)` at open; func 1

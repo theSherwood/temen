@@ -22360,6 +22360,14 @@ struct Mem {
     /// `RwLock` read entirely. Shared with the same topology as `space` (cloned for a forked thread,
     /// fresh for a §14 child, which has its own address space).
     prot_dirty: Arc<AtomicBool>,
+    /// #1009 paged tier-up: a monotonic **page-map version**, bumped at the [`Mem::space_write`] choke
+    /// point on every address-space mutation. A page-checked driver rebuilds its page-state table
+    /// ([`build_pagestate_table`], `O(pages)`) only when this changes — between two tier-ups with no
+    /// intervening `map`/`unmap`/`protect` the table is identical, so the rebuild is skipped. Shares
+    /// `space`'s topology (cloned for a forked thread so a sibling's mutation is seen; fresh for a §14
+    /// child with its own address space). Over-counts harmlessly (a write-lock taken without a real
+    /// mutation just forces one extra rebuild — never a stale table).
+    map_version: Arc<AtomicU64>,
     /// §14 fault-driven-yield side-channel: the confined address of the most recent **recoverable**
     /// page fault (an in-window access to an unmapped/read-only page — `check_prot` sets it,
     /// `confine_checked` clears it to [`NO_FAULT`]). A demand child's fault seam reads it
@@ -22412,6 +22420,7 @@ impl Mem {
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
             prot_dirty: Arc::new(AtomicBool::new(false)),
+            map_version: Arc::new(AtomicU64::new(0)),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
             null_guard: 0,
@@ -22436,6 +22445,7 @@ impl Mem {
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
             prot_dirty: Arc::new(AtomicBool::new(false)),
+            map_version: Arc::new(AtomicU64::new(0)),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
             null_guard: 0,
@@ -22461,6 +22471,7 @@ impl Mem {
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
             prot_dirty: Arc::new(AtomicBool::new(false)),
+            map_version: Arc::new(AtomicU64::new(0)),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
             null_guard: 0,
@@ -22478,7 +22489,18 @@ impl Mem {
         // reader never observes a clear flag after a mutation has begun (a false positive just makes
         // it take the read lock — always safe; a false negative would not be).
         self.prot_dirty.store(true, Ordering::Release);
+        // #1009: bump the page-map version — a paged tier-up driver reuses its page-state table
+        // across events while this is unchanged (see the field). Bumped once per write-lock take
+        // (per `map`/`unmap`/`protect` op), before the mutation, same discipline as `prot_dirty`.
+        self.map_version.fetch_add(1, Ordering::Release);
         self.space.write_unpoisoned()
+    }
+
+    /// #1009 paged tier-up: the current page-map version (see the [`map_version`](Mem::map_version)
+    /// field) — a cheap `O(1)` read a page-checked driver compares between events to decide whether
+    /// its page-state table needs rebuilding.
+    pub(crate) fn map_version(&self) -> u64 {
+        self.map_version.load(Ordering::Acquire)
     }
 
     /// Build the memory view a spawned vCPU (`thread.spawn`) starts with (§12): it shares the **same**
@@ -22493,6 +22515,7 @@ impl Mem {
             space: Arc::clone(&self.space),
             has_regions: Arc::clone(&self.has_regions),
             prot_dirty: Arc::clone(&self.prot_dirty),
+            map_version: Arc::clone(&self.map_version),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
             null_guard: self.null_guard,
@@ -22571,6 +22594,7 @@ impl Mem {
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
             prot_dirty: Arc::new(AtomicBool::new(false)),
+            map_version: Arc::new(AtomicU64::new(0)),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
             null_guard: 0,
