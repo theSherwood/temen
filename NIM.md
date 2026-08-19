@@ -443,7 +443,7 @@ plumbing. Five workstreams, roughly independent:
     `Table`, floats, iterators, variant objects, `ref`+ARC destructors), each driven Nim-source →
     whole toolchain → run on both engines and asserted against a committed baseline (a **compute**
     fixture reads back an `int` global; an **I/O** fixture links through the nim→powerbox bridge and
-    checks stdout). **14/15 run end-to-end**: method **dynamic dispatch** landed with #979 (the `Rtti`
+    checks stdout). **15/15 run end-to-end**: method **dynamic dispatch** landed with #979 (the `Rtti`
     vtable's `mt` method table is materialized as funcref relocs); **exceptions** run (#980) — hexer
     lowers `raise`/`try`/`except` to nimony's **error-flag model** (a can-raise proc returns an
     `(ErrorCode, value)` tuple; the caller branches on the code and `jmp`s to the handler), all
@@ -452,10 +452,11 @@ plumbing. Five workstreams, roughly independent:
     tuple/object literal as an rvalue materializes into a scratch temp (the position-aware
     `agg_temp_bytes` reserves it); and **`Table`** runs (#993) — as an I/O fixture through the powerbox
     manifest bridge (its `panic` → `syncio` `sysWrite` binds to the POSIX personality, which the pure
-    compute shim can't). The one remaining fail-closed row is **#760** (a `const`-arith gvar
-    initializer). A row that starts working *or*
-    regresses fails the test — the "green/red
-    matrix, each red a ticket" the totality work grinds down.
+    compute shim can't); and the **const-arith gvar initializer** row runs (#760) — nimony emits a
+    top-level `let r = 2*3+36` as an un-folded arithmetic tree in the gvar's data slot, and
+    `const_scalar_int` now folds `add`/`sub`/`mul`/`div`/`mod`/`neg` over constant operands. A row that
+    starts working *or* regresses fails the test — the "green/red matrix, each red a ticket" the
+    totality work grinds down.
 - **W2 — Linker (the long pole).** A real program is many modules; nimony emits one Leng file per
   module. W2 resolves cross-module symbols, merges globals/data, and lays out one svm module from N
   Leng inputs — the analog of what the C on-ramp gets from `clang`+`lld` for free. **✅ Core done

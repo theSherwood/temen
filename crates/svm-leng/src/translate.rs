@@ -5244,15 +5244,43 @@ fn const_float(node: &Node) -> Option<f64> {
     }
 }
 
-/// The constant integer value of a scalar/narrow-int global initializer, seeing through a
+/// Fold a **constant integer** scalar global initializer to its value. Sees through a
 /// `(conv T operand)` **or** `(cast T operand)` wrapper — nimony lowers a typed/distinct int literal
 /// as `conv` (`let x = 4` at a `distinct int` becomes `(conv (i 64) 4)`), and a C-style reinterpret
 /// as `cast` (`MAP_FAILED = cast[pointer](-1)` → `(cast pointer -1)`; a `pointer` is an `i64` scalar,
-/// so the sentinel folds to eight `0xFF` bytes). Both spell the operand as the second son. Suffixed
-/// literals (`(suf 3u "u8")`) are folded by [`int_literal`].
+/// so the sentinel folds to eight `0xFF` bytes) — both spell the operand as the second son. Also
+/// folds a compound arithmetic tree over constant operands (`(op Type L R)`, `(neg Type X)` — the
+/// shape nimony emits for a top-level `let r = 2*3+36`, an un-folded arith tree in the gvar's data
+/// initializer, #760). Suffixed literals (`(suf 3u "u8")`) are folded by [`int_literal`]. Any
+/// non-constant operand (a call, a global) → `None` (the caller then fails closed). `i64` wrapping
+/// matches the guest's wrapping integer arithmetic; a `div`/`mod` by zero doesn't fold (it would trap
+/// at runtime, not produce a constant).
 fn const_scalar_int(node: &Node) -> Option<i64> {
     match node.tag() {
         Some("conv") | Some("cast") => node.args().get(1).and_then(const_scalar_int),
+        // `(neg Type X)` — arithmetic negation of a constant.
+        Some("neg") => node
+            .args()
+            .get(1)
+            .and_then(const_scalar_int)
+            .map(i64::wrapping_neg),
+        // Binary integer arithmetic `(op Type L R)`. Both operands must fold.
+        Some(op @ ("add" | "sub" | "mul" | "div" | "mod")) => {
+            let a = node.args();
+            if a.len() != 3 {
+                return None;
+            }
+            let l = const_scalar_int(&a[1])?;
+            let r = const_scalar_int(&a[2])?;
+            match op {
+                "add" => Some(l.wrapping_add(r)),
+                "sub" => Some(l.wrapping_sub(r)),
+                "mul" => Some(l.wrapping_mul(r)),
+                "div" => (r != 0).then(|| l.wrapping_div(r)),
+                "mod" => (r != 0).then(|| l.wrapping_rem(r)),
+                _ => None,
+            }
+        }
         _ => int_literal(node),
     }
 }
