@@ -2526,9 +2526,9 @@ pub(crate) fn onramp_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
 /// (missing params zero-seed, the `Session` convention) and reaches capabilities only by name via
 /// `cap.self.resolve`.
 pub(crate) fn onramp_check(m: &svm_ir::Module) -> Result<(), ()> {
-    let named_entry = m.funcs.first().is_some_and(|f| f.params.is_empty())
-        && m.exports.iter().any(|e| e.name == "_start" && e.func == 0);
-    if m.imports.is_empty() || named_entry {
+    // An import-free module passes as-is; an import-bearing one must carry the shared powerbox
+    // entry shape (#912) so its manifest slots can bind.
+    if m.imports.is_empty() || svm_ir::is_named_powerbox_entry(m) {
         Ok(())
     } else {
         Err(())
@@ -2976,14 +2976,8 @@ pub fn posix_shell_exec_with(
 /// strings — for seeding at `POWERBOX_ARGS_BASE` (the browser twin of `svm-run`'s `build_args_blob`,
 /// no env). The on-ramp `_start` parses it into `argc`/`argv`.
 pub(crate) fn pg_args_blob(argv: &[&[u8]]) -> Vec<u8> {
-    let mut blob = Vec::new();
-    blob.extend_from_slice(&(argv.len() as u32).to_le_bytes());
-    blob.extend_from_slice(&0u32.to_le_bytes()); // envc = 0
-    for s in argv {
-        blob.extend_from_slice(s);
-        blob.push(0);
-    }
-    blob
+    // The shared powerbox args-buffer layout (#912); the Postgres on-ramp passes no environment.
+    svm_ir::write_args_blob(argv, &[])
 }
 
 /// Shared Postgres powerbox setup (used by the one-shot [`pg_exec`] and the persistent [`PgSession`]):
