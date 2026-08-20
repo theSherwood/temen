@@ -1154,10 +1154,25 @@ fn fibers_threads(ops: &mut Vec<Op>) {
     let skip = "target-conditional (needs x86-64-unix stack-switch / setjmp substrate)";
     for (name, inst) in [
         ("cont.new", Inst::ContNew { func: 0, sp: 1 }),
-        ("cont.resume", Inst::ContResume { k: 0, arg: 1 }),
-        // I48 advisory blocking resume: same parity as `cont.resume` (bytecode/Cranelift alias
-        // it; only the tree-walk oracle idles — DESIGN §12).
-        ("cont.resume.block", Inst::ContResumeBlock { k: 0, arg: 1 }),
+        (
+            "cont.resume",
+            Inst::ContResume {
+                k: 0,
+                arg: 1,
+                block: false,
+            },
+        ),
+        // I48 advisory blocking resume (`block: true`): same parity shape as `cont.resume`; the
+        // idling backends park while the OS-thread-parallel drivers take the FIBER_PARKED
+        // downgrade (DESIGN §12).
+        (
+            "cont.resume.block",
+            Inst::ContResume {
+                k: 0,
+                arg: 1,
+                block: true,
+            },
+        ),
         ("suspend", Inst::Suspend { value: 0 }),
         (
             "thread.spawn",

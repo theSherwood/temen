@@ -557,9 +557,9 @@ fn verify_func(
                     types: &types,
                 }
                 .expect(*handle, ValType::I32)?;
-            } else if let Inst::ContResume { k, arg } | Inst::ContResumeBlock { k, arg } = inst {
-                // §12 `cont.resume` (and its I48 blocking variant) appends two results
-                // `(status: i32, value: i64)`. Both variants have identical operand + result typing.
+            } else if let Inst::ContResume { k, arg, block: _ } = inst {
+                // §12 `cont.resume` (in both its I48 blocking and non-blocking forms) appends two
+                // results `(status: i32, value: i64)`. The `block` flag does not affect typing.
                 let cx = Cx {
                     fi,
                     bi,
@@ -767,8 +767,8 @@ fn inst_result_types(
             out.extend_from_slice(&sig.results);
             true
         }
-        // `cont.resume` (and its blocking variant): `(status: i32, value: i64)`.
-        Inst::ContResume { .. } | Inst::ContResumeBlock { .. } => {
+        // `cont.resume` (in both its blocking and non-blocking forms): `(status: i32, value: i64)`.
+        Inst::ContResume { .. } => {
             out.push(ValType::I32);
             out.push(ValType::I64);
             true
@@ -1450,7 +1450,6 @@ fn check_inst(
         | Inst::CallIndirect { .. }
         | Inst::CapCall { .. }
         | Inst::ContResume { .. }
-        | Inst::ContResumeBlock { .. }
         | Inst::SetJmp { .. }
         | Inst::LongJmp { .. }
         | Inst::ThreadSpawn { .. } => return Ok(None),

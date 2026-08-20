@@ -2200,31 +2200,28 @@ pub enum Inst {
         func: ValIdx,
         sp: ValIdx,
     },
-    /// §12 fiber resume (`cont.resume`): switch to fiber `k` (an `i32` handle), delivering
-    /// `arg` (`i64`) — the argument to the fiber's function on the first resume, or the
-    /// result of the fiber's `suspend` on later resumes. Runs the fiber until it suspends
-    /// or returns, then yields `(status: i32, value: i64)`: `status` 0 = **suspended** (the
-    /// fiber stays resumable), 1 = **returned** (the fiber is done; resuming it again
+    /// §12 fiber resume (`cont.resume` / `cont.resume.block`): switch to fiber `k` (an `i32`
+    /// handle), delivering `arg` (`i64`) — the argument to the fiber's function on the first
+    /// resume, or the result of the fiber's `suspend` on later resumes. Runs the fiber until it
+    /// suspends or returns, then yields `(status: i32, value: i64)`: `status` 0 = **suspended**
+    /// (the fiber stays resumable), 1 = **returned** (the fiber is done; resuming it again
     /// traps). A **call-clobbering** control op — like a call it switches stacks, but it
     /// does not end the block.
+    ///
+    /// The `block: true` form (`cont.resume.block`, ISSUES.md I48) is an advisory scheduling
+    /// hint — returning `FIBER_PARKED (3)` is always conforming, so a guest still loops for
+    /// completion; it issues this form only when it has nothing else to run, to avoid
+    /// busy-polling a lone parked fiber. After the parity commits the cooperative bytecode
+    /// driver genuinely idles the resumer (`TaskState::BlockedOnFiber`, zero fuel), the
+    /// wasm-JIT inherits that via its `DriveMode::InterpDriven` fold, and the Cranelift JIT
+    /// parks the resumer's OS thread on `Domain.futex_cv` via the `fiber_resume_block` thunk;
+    /// only the OS-thread-parallel bytecode drivers (`drive_parallel`, single-vCPU
+    /// `Vcpu::run`) take the advisory `FIBER_PARKED` downgrade. `block: false` never idles.
+    /// Advisory only — no new semantics, invariant 9 preserved.
     ContResume {
         k: ValIdx,
         arg: ValIdx,
-    },
-    /// §12 fiber resume, **blocking** variant (`cont.resume.block`, ISSUES.md I48). Identical to
-    /// [`Inst::ContResume`] — same `(status: i32, value: i64)` result, same 0/1 statuses — except
-    /// the runtime **may idle the resuming vCPU** on the resumed fiber's own registered waiter
-    /// (futex notify / timeout / completion / revoke) instead of returning the runtime-only
-    /// `FIBER_PARKED (3)` poll status. This is an **advisory scheduling hint**, not a new
-    /// semantics: returning `FIBER_PARKED` is always a conforming implementation, so a guest must
-    /// still loop for completion exactly as with `cont.resume`; the guest issues this form only
-    /// when it has *nothing else to run* (DESIGN.md §12 — mechanism, not policy) to avoid
-    /// busy-polling a lone parked fiber. Because a `FIBER_PARKED` return conforms, the fast
-    /// backends and the deterministic explorer alias it to `cont.resume` (no idle core needed, no
-    /// compile veto, no divergence — invariant 9); only the tree-walk M:N scheduler idles.
-    ContResumeBlock {
-        k: ValIdx,
-        arg: ValIdx,
+        block: bool,
     },
     /// §12 fiber suspend (`suspend`): from within a running fiber, suspend back to the
     /// resumer delivering `value` (`i64`); evaluates to the `i64` `arg` of the next resume.
@@ -2743,7 +2740,7 @@ impl Inst {
 
             // ---- Fibers, threads, and non-local control transfer. ----
             Inst::ContNew { .. } => fx(false, false, false, true), // allocates a fiber; runs nothing yet
-            Inst::ContResume { .. } | Inst::ContResumeBlock { .. } | Inst::Suspend { .. } => {
+            Inst::ContResume { .. } | Inst::Suspend { .. } => {
                 fx(true, true, true, true) // stack switch → clobber
             }
             Inst::SetJmp { .. } => fx(true, false, true, true), // writes an opaque token into the guest jmp_buf
@@ -2849,8 +2846,7 @@ impl Inst {
                 addr: a, count: b, ..
             }
             | Inst::ContNew { func: a, sp: b }
-            | Inst::ContResume { k: a, arg: b }
-            | Inst::ContResumeBlock { k: a, arg: b }
+            | Inst::ContResume { k: a, arg: b, .. }
             | Inst::LongJmp { buf: a, val: b }
             | Inst::ThreadSpawn { sp: a, arg: b, .. }
             | Inst::ReplaceLane { a, b, .. }
@@ -2986,8 +2982,8 @@ impl Inst {
             | Inst::V128Store { .. } => 0,
             // `vcpu.tls.get` appends one `i64`; `durable.shadow_base` likewise (a window byte offset).
             Inst::VcpuTlsGet | Inst::DurableShadowBase => 1,
-            // `cont.resume` (and its blocking variant) are the multi-result non-call ops: `(status, value)`.
-            Inst::ContResume { .. } | Inst::ContResumeBlock { .. } => 2,
+            // `cont.resume` (in both its blocking and non-blocking forms) is the multi-result non-call op: `(status, value)`.
+            Inst::ContResume { .. } => 2,
             // `cap.self.type_id`/`covers` append one `i32`. (The `cap.self.count`/`get`/`resolve`/
             // `label`/`attest` reflection ops are now `cap.call CAP_SELF` — counted by their `sig`.)
             Inst::CapSelfTypeId { .. } | Inst::CapSelfCovers { .. } | Inst::ExportHandle { .. } => {
@@ -3144,7 +3140,6 @@ impl Func {
                     i,
                     Inst::ContNew { .. }
                         | Inst::ContResume { .. }
-                        | Inst::ContResumeBlock { .. }
                         | Inst::Suspend { .. }
                         | Inst::ThreadSpawn { .. }
                         | Inst::ThreadJoin { .. }
@@ -3166,10 +3161,7 @@ impl Func {
             b.insts.iter().any(|i| {
                 matches!(
                     i,
-                    Inst::ContNew { .. }
-                        | Inst::ContResume { .. }
-                        | Inst::ContResumeBlock { .. }
-                        | Inst::Suspend { .. }
+                    Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. }
                 )
             })
         })
@@ -3201,7 +3193,6 @@ impl Func {
                     i,
                     Inst::ContNew { .. }
                         | Inst::ContResume { .. }
-                        | Inst::ContResumeBlock { .. }
                         | Inst::Suspend { .. }
                         | Inst::ThreadSpawn { .. }
                         | Inst::ThreadJoin { .. }
@@ -5417,7 +5408,11 @@ mod effects_tests {
                 handle: 0,
                 args: vec![],
             },
-            Inst::ContResume { k: 0, arg: 1 },
+            Inst::ContResume {
+                k: 0,
+                arg: 1,
+                block: false,
+            },
             Inst::ThreadJoin { handle: 0 },
             Inst::GcRoots {
                 heap_lo: 0,

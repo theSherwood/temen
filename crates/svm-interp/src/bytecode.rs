@@ -974,8 +974,7 @@ fn scan_seams(funcs: &[Func]) -> Seams {
                     | Inst::SetJmp { .. }
                     | Inst::LongJmp { .. } => s.has_park_seam = true,
                     Inst::ContNew { .. }
-                    | Inst::ContResume { .. }
-                    | Inst::ContResumeBlock { .. } // I48: advisory alias to cont.resume here
+                    | Inst::ContResume { .. } // I48: `block` flag is advisory here
                     | Inst::Suspend { .. } => s.has_fiber = true,
                     Inst::ThreadSpawn { .. }
                     | Inst::ThreadJoin { .. }
@@ -1722,22 +1721,16 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             sp: g(*sp),
             dst,
         },
-        Inst::ContResume { k, arg } => Op::ContResume {
-            k: g(*k),
-            arg: g(*arg),
-            dst,
-            blocking: false,
-        },
-        // I48 — the blocking variant idles the resumer's task on the fiber's event (see the
+        // I48 — the `block: true` form idles the resumer's task on the fiber's event (see the
         // cooperative driver's `Outcome::ContResume` / fiber-park arms + `TaskState::BlockedOnFiber`)
         // instead of spinning the poll. Advisory still holds: `FIBER_PARKED` remains a legal
         // transient (the guest keeps its loop), so the deterministic explorer and any non-idling
         // path stay conforming (invariant 9).
-        Inst::ContResumeBlock { k, arg } => Op::ContResume {
+        Inst::ContResume { k, arg, block } => Op::ContResume {
             k: g(*k),
             arg: g(*arg),
             dst,
-            blocking: true,
+            blocking: *block,
         },
         Inst::Suspend { value } => Op::Suspend {
             value: g(*value),

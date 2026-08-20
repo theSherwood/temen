@@ -326,7 +326,7 @@ fn inst_operands(i: &Inst) -> Option<Vec<ValIdx>> {
             v
         }
         ContNew { func, sp } => vec![*func, *sp],
-        ContResume { k, arg } => vec![*k, *arg],
+        ContResume { k, arg, .. } => vec![*k, *arg],
         Suspend { value } => vec![*value],
         _ => return None,
     })
@@ -945,7 +945,9 @@ fn transform_func(
                         idx: *idx,
                         args: args.clone(),
                     },
-                    Inst::ContResume { k, arg } => SuspendKind::Resume { k: *k, arg: *arg },
+                    // `block` is advisory scheduling only — not preserved across the durable
+                    // suspend record; replay re-issues a plain (non-blocking) resume.
+                    Inst::ContResume { k, arg, .. } => SuspendKind::Resume { k: *k, arg: *arg },
                     Inst::Suspend { value } => SuspendKind::Yield { value: *value },
                     Inst::ThreadJoin { handle } => SuspendKind::ThreadJoin { handle: *handle },
                     Inst::MemoryWait {
@@ -1202,7 +1204,14 @@ fn transform_func(
             SuspendKind::Resume { k, arg } => {
                 let kk = reloaded[spill_slot(*k as usize).expect("resume handle spilled")];
                 let aa = reloaded[spill_slot(*arg as usize).expect("resume arg spilled")];
-                ab.many(Inst::ContResume { k: kk, arg: aa }, pt.nres)
+                ab.many(
+                    Inst::ContResume {
+                        k: kk,
+                        arg: aa,
+                        block: false,
+                    },
+                    pt.nres,
+                )
             }
             // `suspend` re-park (slice 3.1.3): a parked fiber's suspend is the globally-deepest
             // frozen frame, so flip the state word to NORMAL, then re-execute `suspend` — which

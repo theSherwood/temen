@@ -165,9 +165,10 @@ mod op {
     pub const ATOMIC_CMPXCHG: u8 = 0xC9; // ty, addr, expected, replacement, offset
 
     // §12 fibers (stack switching).
-    pub const CONT_RESUME_BLOCK: u8 = 0xBF; // I48 blocking variant: k, arg (advisory; = CONT_RESUME)
+    // 0xBF is a retired opcode gap: it was CONT_RESUME_BLOCK (I48 blocking variant), now folded
+    // into CONT_RESUME's trailing `block` flag byte. Left unassigned, not renumbered.
     pub const CONT_NEW: u8 = 0xCA; // func (funcref idx), sp (data-stack base)
-    pub const CONT_RESUME: u8 = 0xCB; // k, arg
+    pub const CONT_RESUME: u8 = 0xCB; // k, arg, block (1 byte: 0 = cont.resume, 1 = cont.resume.block)
     pub const SUSPEND: u8 = 0xCC; // value
     pub const THREAD_SPAWN: u8 = 0xCD; // func (funcidx), arg -> i32 handle
     pub const THREAD_JOIN: u8 = 0xCE; // handle -> i64 result
@@ -1031,15 +1032,11 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             write_uleb(out, *func as u64);
             write_uleb(out, *sp as u64);
         }
-        Inst::ContResume { k, arg } => {
+        Inst::ContResume { k, arg, block } => {
             out.push(op::CONT_RESUME);
             write_uleb(out, *k as u64);
             write_uleb(out, *arg as u64);
-        }
-        Inst::ContResumeBlock { k, arg } => {
-            out.push(op::CONT_RESUME_BLOCK);
-            write_uleb(out, *k as u64);
-            write_uleb(out, *arg as u64);
+            out.push(*block as u8);
         }
         Inst::Suspend { value } => {
             out.push(op::SUSPEND);
@@ -2413,10 +2410,7 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
         op::CONT_RESUME => Inst::ContResume {
             k: c.idx()?,
             arg: c.idx()?,
-        },
-        op::CONT_RESUME_BLOCK => Inst::ContResumeBlock {
-            k: c.idx()?,
-            arg: c.idx()?,
+            block: c.byte()? != 0,
         },
         op::SUSPEND => Inst::Suspend { value: c.idx()? },
         op::SETJMP => Inst::SetJmp { buf: c.idx()? },

@@ -373,7 +373,11 @@ pub fn struct_rows() -> Vec<StructRow> {
         "cont.resume",
         Enc::Byte(0xCB),
         vec![i64t, i64t],
-        Inst::ContResume { k: 0, arg: 1 },
+        Inst::ContResume {
+            k: 0,
+            arg: 1,
+            block: false,
+        },
         false,
     ));
     rows.push(inst_row(
@@ -709,7 +713,6 @@ pub fn row_home(inst: &Inst) -> RowHome {
         | Inst::CapSelfCovers { .. }
         | Inst::ContNew { .. }
         | Inst::ContResume { .. }
-        | Inst::ContResumeBlock { .. }
         | Inst::Suspend { .. }
         | Inst::ThreadSpawn { .. }
         | Inst::ThreadJoin { .. }

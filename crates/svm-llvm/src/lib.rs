@@ -11821,7 +11821,14 @@ fn lower_vm_builtin(
             let k = ctx.operand_i64(vm_arg(c, 0)?)?; // i64 fiber handle
             let arg = ctx.operand_i64(vm_arg(c, 1)?)?;
             let done = ctx.operand_i64(vm_arg(c, 2)?)?; // `int *done`
-            let rs = ctx.push_multi(Inst::ContResume { k, arg }, 2); // (status, value)
+            let rs = ctx.push_multi(
+                Inst::ContResume {
+                    k,
+                    arg,
+                    block: false,
+                },
+                2,
+            ); // (status, value)
             ctx.push_effect(Inst::Store {
                 op: StoreOp::I32,
                 addr: done,

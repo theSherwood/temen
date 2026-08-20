@@ -589,8 +589,13 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
         Inst::VcpuTlsSet { val } => format!("vcpu.tls.set v{val}"),
         // §12 fibers (stack switching).
         Inst::ContNew { func, sp } => format!("cont.new v{func} v{sp}"),
-        Inst::ContResume { k, arg } => format!("cont.resume v{k} v{arg}"),
-        Inst::ContResumeBlock { k, arg } => format!("cont.resume.block v{k} v{arg}"),
+        Inst::ContResume { k, arg, block } => {
+            if *block {
+                format!("cont.resume.block v{k} v{arg}")
+            } else {
+                format!("cont.resume v{k} v{arg}")
+            }
+        }
         Inst::Suspend { value } => format!("suspend v{value}"),
         Inst::SetJmp { buf } => format!("setjmp v{buf}"),
         Inst::LongJmp { buf, val } => format!("longjmp v{buf} v{val}"),
@@ -2789,12 +2794,20 @@ impl<'a> Parser<'a> {
         if op == "cont.resume" {
             let k = self.value(names)?;
             let arg = self.value(names)?;
-            return Ok(Inst::ContResume { k, arg });
+            return Ok(Inst::ContResume {
+                k,
+                arg,
+                block: false,
+            });
         }
         if op == "cont.resume.block" {
             let k = self.value(names)?;
             let arg = self.value(names)?;
-            return Ok(Inst::ContResumeBlock { k, arg });
+            return Ok(Inst::ContResume {
+                k,
+                arg,
+                block: true,
+            });
         }
         if op == "suspend" {
             return Ok(Inst::Suspend {

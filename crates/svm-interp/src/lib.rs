@@ -13021,13 +13021,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // and a loser faults (D57) — and switch into it, delivering `arg`. The two results
                 // `(status, value)` are appended to *this* frame later, when `k` suspends or
                 // returns control here (see `Suspend` and `Return`).
-                Inst::ContResume { k, arg } | Inst::ContResumeBlock { k, arg } => {
-                    // I48 — the **blocking** variant (`cont.resume.block`) idles this vCPU on the
-                    // resumed fiber's own registered waiter instead of returning the FIBER_PARKED
-                    // poll status (see the `StillParked` arm). Advisory: every other path is
-                    // byte-identical to `cont.resume`, so the flag only matters when the target is
-                    // still parked.
-                    let blocking = matches!(inst, Inst::ContResumeBlock { .. });
+                Inst::ContResume { k, arg, block } => {
+                    // I48 — the **blocking** form (`block: true`, `cont.resume.block`) idles this
+                    // vCPU on the resumed fiber's own registered waiter instead of returning the
+                    // FIBER_PARKED poll status (see the `StillParked` arm). Advisory: every other
+                    // path is byte-identical to `cont.resume`, so the flag only matters when the
+                    // target is still parked.
+                    let blocking = *block;
                     // Fuel unification: resuming a fiber is a control transfer that per-op fuel used to
                     // meter (every op the fiber ran decremented the counter). Under safepoint metering
                     // it must charge here too — one fuel per `cont.resume` op, exactly as the bytecode
@@ -14333,7 +14333,6 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         | Inst::CapCall { .. }
         | Inst::ContNew { .. }
         | Inst::ContResume { .. }
-        | Inst::ContResumeBlock { .. }
         | Inst::Suspend { .. }
         | Inst::SetJmp { .. }
         | Inst::LongJmp { .. }

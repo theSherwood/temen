@@ -560,10 +560,10 @@ fn check_inst(
             w(*sp, V::I64)?;
             vec![V::I64]
         }
-        Inst::ContResume { k, arg } | Inst::ContResumeBlock { k, arg } => {
+        Inst::ContResume { k, arg, block: _ } => {
             w(*k, V::I64)?;
             w(*arg, V::I64)?;
-            vec![V::I32, V::I64] // (status, value) — I48 blocking variant types identically
+            vec![V::I32, V::I64] // (status, value) — the I48 blocking form types identically
         }
         Inst::Suspend { value } => {
             w(*value, V::I64)?;

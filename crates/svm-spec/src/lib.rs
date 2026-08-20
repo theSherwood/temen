@@ -1715,7 +1715,6 @@ pub fn coverage(inst: &Inst) -> Class {
         | Inst::CapSelfCovers { .. } => Class::Host,
         Inst::ContNew { .. }
         | Inst::ContResume { .. }
-        | Inst::ContResumeBlock { .. }
         | Inst::Suspend { .. }
         | Inst::ThreadSpawn { .. }
         | Inst::ThreadJoin { .. }

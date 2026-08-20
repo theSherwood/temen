@@ -308,8 +308,7 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
         // ---- §12 fibers / threads / futex: Cranelift lowers them to host-runtime calls only where
         // the stack-switch substrate exists; the wasm-JIT (leaf) never runs concurrency itself. ---
         Inst::ContNew { .. }
-        | Inst::ContResume { .. }
-        | Inst::ContResumeBlock { .. } // I48: advisory alias to cont.resume on every backend
+        | Inst::ContResume { .. } // I48: the `block` flag is advisory scheduling only
         | Inst::Suspend { .. }
         | Inst::ThreadSpawn { .. }
         | Inst::ThreadJoin { .. }

@@ -5452,12 +5452,11 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 // §12 fibers/threads: lowered to host runtime calls, but only where the stack-switch
                 // substrate exists (`svm_fiber::supported()` — x86-64 unix). Elsewhere, bail so the
                 // differential harness skips rather than miscompiles.
+                // I48: the `block: true` form lowers to a resume thunk that parks the OS thread on
+                // the domain condvar (see below); `block: false` returns FIBER_PARKED and the guest
+                // loops. Both accepted wherever `cont.resume` is.
                 Inst::ContNew { .. }
                 | Inst::ContResume { .. }
-                // I48: the blocking variant lowers to the same resume thunk (advisory — the JIT
-                // vCPU is a real thread, so it returns FIBER_PARKED and the guest loops; the
-                // oracle is the tier that idles). Accepted wherever `cont.resume` is.
-                | Inst::ContResumeBlock { .. }
                 | Inst::Suspend { .. }
                 | Inst::ThreadSpawn { .. }
                 | Inst::ThreadJoin { .. }
@@ -6368,8 +6367,8 @@ fn lower_block(
         // domain condvar and re-resumes until the fiber completes/suspends — a sleep, not a spin,
         // so the JIT idles like the oracle and the cooperative bytecode driver (INVARIANTS.md #9).
         // Both append the two results (status:i32, value:i64) to match the IR's shape.
-        if let Inst::ContResume { k, arg } | Inst::ContResumeBlock { k, arg } = inst {
-            let blocking = matches!(inst, Inst::ContResumeBlock { .. });
+        if let Inst::ContResume { k, arg, block } = inst {
+            let blocking = *block;
             let ss =
                 b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
             let status_ptr = b.ins().stack_addr(I64, ss, 0);
