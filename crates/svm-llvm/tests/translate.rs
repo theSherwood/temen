@@ -12451,6 +12451,13 @@ fn demo_bash_translates_and_verifies() {
         "echo start; (x=5; echo in-$x); echo end",
         "echo a | { read x; echo \"got-$x\"; }; echo tail",
         "echo one | { read a; echo p1-$a; } | { read b; echo p2-$b; }; echo done2",
+        // Slice 4 — traps/signals: async delivery into bash's C handlers (the shim registers the
+        // handler stack in a ctor), in the parent, in a fork twin, ignored, and repeated.
+        "trap \"echo INT-caught\" INT; kill -INT $$; echo after",
+        "trap \"echo child-int\" INT; (kill -INT $$); echo done3",
+        "trap \"\" INT; kill -INT $$; echo ignored-ok",
+        "trap \"echo u1\" USR1; kill -USR1 $$; kill -USR1 $$; echo twice",
+        "trap \"echo bye\" EXIT; (echo sub); echo main",
     ] {
         let config = svm_run::RunConfig {
             args: vec![b"bash".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()],

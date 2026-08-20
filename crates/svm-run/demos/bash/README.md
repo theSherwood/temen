@@ -105,10 +105,25 @@ and registers it as a filesystem executable inside the posix grant (`c_posix.rs`
 `stage_executable` shape — `bash_probe` takes `BASH_PROBE_BIN=<dir>`). Gate: eight
 external-command scripts in the capstone differential (18 scripts total).
 
+## Slice 4 (signals rung DONE) — traps deliver
+
+`trap … INT` + `kill -INT $$` runs the trap (in the parent AND in a fork-twin subshell), ignored
+(`trap "" INT`) and repeated deliveries match, EXIT traps compose with subshells. The whole fix
+was **one shim line**: async delivery (#796 L2) is gated on a registered handler stack (the
+interp's safepoint redirect runs the C handler on a dedicated stack) and bash never calls
+`sigaltstack` on this config — band 0 now registers a static 16 KiB stack in a ctor
+(`llvm.global_ctors`, which the synthesized `_start` already runs). Gate: five trap scripts in
+the capstone differential (23 scripts total).
+
+Known nuance (deferred until a real script trips it): `(kill -INT $$); echo rc=$?` — `$?` after
+the shell ITSELF is signaled from a subshell while waiting differs (svm 128, native 0: bash's
+`wait_sigint` discard logic vs the personality's `128+sig` zombie status encoding).
+
 ## What remains (the slice ladder from the #802 sketch)
 
-- **Slice 4 remainder**: traps/signals under fork (`trap`, `kill`, SIGINT delivery), `$?`-heavy
-  and here-doc scripts; then interactive on the #797 terminal.
+- **Slice 4 remainder**: here-docs, `$?` edge above; then interactive on the #797 terminal
+  (readline re-enabled or the dumb-terminal path, the controlling-terminal ops, job control
+  foreground/background).
 - Known band-0 papering (revisit when a differential trips over one): `fstat` synthesizes a
   chr-device for fds 0-2 and re-stats the recorded open path otherwise; `st_ino` is a path hash
   (same-file checks distinguish paths, not hardlinks); `sigsuspend` returns `EINTR` without

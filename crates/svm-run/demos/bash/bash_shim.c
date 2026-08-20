@@ -279,6 +279,15 @@ int sigsuspend(const void *mask) {
   __bash_errno = 4; /* EINTR — the only POSIX return; real suspension rides the signals slice */
   return -1;
 }
+/* Async-signal delivery (#796 L2) is gated on a REGISTERED handler stack — the interp's safepoint
+ * redirect runs the C handler on a dedicated stack, never the interrupted one — and is poll-only
+ * without it. bash never calls sigaltstack on this config, so register a static stack before
+ * `main` (a ctor: the synthesized `_start` runs `llvm.global_ctors`). Fork twins inherit the
+ * registration over their own private window copy (POSIX). */
+static char px_sigstack_[16384];
+__attribute__((constructor)) static void px_sig_init_(void) {
+  px_call_(PX_SIGALTSTACK, (long)px_sigstack_, sizeof(px_sigstack_), 0, 0);
+}
 
 /* terminal — the op termios is the 32-byte personality layout {lflag: i64, cc[8], vmin: i64,
  * vtime: i64}; marshal to/from glibc termios {iflag,oflag,cflag,lflag: u32@0..16, line: u8@16,
