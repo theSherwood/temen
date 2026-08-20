@@ -7,10 +7,10 @@
 //! same source the text printer uses — so a renamed op renames its catalog row automatically.
 //!
 //! **Granularity note.** Rows fan out over the *semantic* immediates (type prefix, sub-op, lane
-//! shape). They deliberately do **not** fan out over immediates that change neither support nor
-//! observable result — the memory-access `align` hint, and the atomic `Ordering` (all backends
-//! execute every ordering sequentially-consistent; DESIGN §12 / `Ordering`'s doc). Those collapse to
-//! one representative row.
+//! shape). The memory-access `align` hint and the load/store/rmw/cmpxchg atomic `Ordering` (both
+//! write-only — every backend executed seq-cst regardless; DESIGN §12) left the wire at the wire
+//! rev, so there is nothing left to collapse for them. `AtomicFence` keeps its `Ordering`, but it
+//! is not fanned out (all orderings share support/result).
 
 use svm_ir::*;
 
@@ -364,7 +364,6 @@ fn memory(ops: &mut Vec<Op>) {
             op,
             addr: 0,
             offset: 0,
-            align: 0,
         };
         push(
             ops,
@@ -381,7 +380,6 @@ fn memory(ops: &mut Vec<Op>) {
             addr: 0,
             value: 1,
             offset: 0,
-            align: 0,
         };
         push(
             ops,
@@ -441,7 +439,6 @@ fn atomics(ops: &mut Vec<Op>) {
             ty,
             addr: 0,
             offset: 0,
-            order: Ordering::SeqCst,
         };
         push(
             ops,
@@ -455,7 +452,6 @@ fn atomics(ops: &mut Vec<Op>) {
             addr: 0,
             value: 1,
             offset: 0,
-            order: Ordering::SeqCst,
         };
         push(
             ops,
@@ -471,7 +467,6 @@ fn atomics(ops: &mut Vec<Op>) {
                 addr: 0,
                 value: 1,
                 offset: 0,
-                order: Ordering::SeqCst,
             };
             push(
                 ops,
@@ -487,7 +482,6 @@ fn atomics(ops: &mut Vec<Op>) {
             expected: 1,
             replacement: 2,
             offset: 0,
-            order: Ordering::SeqCst,
         };
         push(
             ops,
@@ -551,11 +545,7 @@ fn simd(ops: &mut Vec<Op>) {
         Inst::ConstV128([0; 16]),
         unit(&[], Inst::ConstV128([0; 16]), &[v], false),
     );
-    let ld = Inst::V128Load {
-        addr: 0,
-        offset: 0,
-        align: 0,
-    };
+    let ld = Inst::V128Load { addr: 0, offset: 0 };
     push(
         ops,
         "v128.load".into(),
@@ -567,7 +557,6 @@ fn simd(ops: &mut Vec<Op>) {
         addr: 0,
         value: 1,
         offset: 0,
-        align: 0,
     };
     push(
         ops,

@@ -1494,12 +1494,7 @@ impl Bb {
 }
 
 fn load(op: LoadOp, addr: ValIdx, offset: u64) -> Inst {
-    Inst::Load {
-        op,
-        addr,
-        offset,
-        align: 0,
-    }
+    Inst::Load { op, addr, offset }
 }
 
 fn store(op: StoreOp, addr: ValIdx, value: ValIdx, offset: u64) -> Inst {
@@ -1508,7 +1503,6 @@ fn store(op: StoreOp, addr: ValIdx, value: ValIdx, offset: u64) -> Inst {
         addr,
         value,
         offset,
-        align: 0,
     }
 }
 

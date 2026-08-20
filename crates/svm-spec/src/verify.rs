@@ -331,29 +331,17 @@ fn check_inst(
             vec![]
         }
 
-        // ----- atomics (§12): a load may not be release-flavored, a store may not be
-        // acquire-flavored; a fence takes any ordering -----
-        Inst::AtomicLoad {
-            ty, addr, order, ..
-        } => {
+        // ----- atomics (§12): load/store/rmw/cmpxchg execute seq-cst and carry no ordering; only
+        // the fence keeps one (and it accepts any) -----
+        Inst::AtomicLoad { ty, addr, .. } => {
             need_memory(has_memory)?;
-            if !order.valid_for_load() {
-                return Err("atomic load with release ordering".into());
-            }
             w(*addr, V::I64)?;
             vec![ty.val()]
         }
         Inst::AtomicStore {
-            ty,
-            addr,
-            value,
-            order,
-            ..
+            ty, addr, value, ..
         } => {
             need_memory(has_memory)?;
-            if !order.valid_for_store() {
-                return Err("atomic store with acquire ordering".into());
-            }
             w(*addr, V::I64)?;
             w(*value, ty.val())?;
             vec![]

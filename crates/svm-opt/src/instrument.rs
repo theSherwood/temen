@@ -319,7 +319,6 @@ mod tests {
                 addr: 0,
                 value: 1,
                 offset: 8,
-                align: 3,
             },
             Inst::ConstI32(0),  // v2
             Inst::ConstI64(32), // v3
@@ -332,7 +331,6 @@ mod tests {
                 op: LoadOp::I64,
                 addr: 0,
                 offset: 8,
-                align: 3,
             }, // v4
         ];
         Module {
@@ -458,31 +456,24 @@ mod tests {
     /// One value of each `Inst` variant that reads or writes guest memory per [`Inst::effects`]
     /// (plus the excluded ones), so `classification_is_exhaustive` exercises the full set.
     fn representative_insts() -> Vec<Inst> {
-        use svm_ir::{AtomicRmwOp, Ordering};
+        use svm_ir::AtomicRmwOp;
         vec![
             Inst::Load {
                 op: LoadOp::I32,
                 addr: 0,
                 offset: 0,
-                align: 2,
             },
             Inst::Store {
                 op: StoreOp::I32,
                 addr: 0,
                 value: 1,
                 offset: 0,
-                align: 2,
             },
-            Inst::V128Load {
-                addr: 0,
-                offset: 0,
-                align: 4,
-            },
+            Inst::V128Load { addr: 0, offset: 0 },
             Inst::V128Store {
                 addr: 0,
                 value: 1,
                 offset: 0,
-                align: 4,
             },
             Inst::MemCopy {
                 dst: 0,
@@ -503,14 +494,12 @@ mod tests {
                 ty: IntTy::I32,
                 addr: 0,
                 offset: 0,
-                order: Ordering::SeqCst,
             },
             Inst::AtomicStore {
                 ty: IntTy::I32,
                 addr: 0,
                 value: 1,
                 offset: 0,
-                order: Ordering::SeqCst,
             },
             Inst::AtomicRmw {
                 ty: IntTy::I32,
@@ -518,7 +507,6 @@ mod tests {
                 addr: 0,
                 value: 1,
                 offset: 0,
-                order: Ordering::SeqCst,
             },
             Inst::AtomicCmpxchg {
                 ty: IntTy::I32,
@@ -526,7 +514,6 @@ mod tests {
                 expected: 1,
                 replacement: 2,
                 offset: 0,
-                order: Ordering::SeqCst,
             },
             Inst::MemoryWait {
                 ty: IntTy::I32,

@@ -1452,7 +1452,6 @@ pub fn mem_rows() -> Vec<MemRow> {
                 op,
                 addr: v[0],
                 offset: off,
-                align: 0,
             }),
             eval: Box::new(move |x, off, win| load_eval(op, as_u64(x[0]), off, win).map(Some)),
         });
@@ -1472,7 +1471,6 @@ pub fn mem_rows() -> Vec<MemRow> {
                 addr: v[0],
                 value: v[1],
                 offset: off,
-                align: 0,
             }),
             eval: Box::new(move |x, off, win| {
                 store_eval(op, as_u64(x[0]), off, x[1], win).map(|()| None)

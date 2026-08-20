@@ -132,7 +132,6 @@ pub fn struct_rows() -> Vec<StructRow> {
             ty: IntTy::I32,
             addr: 0,
             offset: 0,
-            order: Ordering::SeqCst,
         },
         true,
     ));
@@ -145,7 +144,6 @@ pub fn struct_rows() -> Vec<StructRow> {
             addr: 0,
             value: 1,
             offset: 0,
-            order: Ordering::SeqCst,
         },
         true,
     ));
@@ -159,7 +157,6 @@ pub fn struct_rows() -> Vec<StructRow> {
             addr: 0,
             value: 1,
             offset: 0,
-            order: Ordering::SeqCst,
         },
         true,
     ));
@@ -173,7 +170,6 @@ pub fn struct_rows() -> Vec<StructRow> {
             expected: 1,
             replacement: 2,
             offset: 0,
-            order: Ordering::SeqCst,
         },
         true,
     ));
@@ -190,11 +186,7 @@ pub fn struct_rows() -> Vec<StructRow> {
         "v128.load",
         Enc::Prefixed(0xFE, 0x01),
         vec![i64t],
-        Inst::V128Load {
-            addr: 0,
-            offset: 0,
-            align: 0,
-        },
+        Inst::V128Load { addr: 0, offset: 0 },
         true,
     ));
     rows.push(inst_row(
@@ -205,7 +197,6 @@ pub fn struct_rows() -> Vec<StructRow> {
             addr: 0,
             value: 1,
             offset: 0,
-            align: 0,
         },
         true,
     ));

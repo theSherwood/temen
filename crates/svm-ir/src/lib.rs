@@ -1794,14 +1794,6 @@ impl Ordering {
     pub fn from_name(s: &str) -> Option<Ordering> {
         Self::ALL.iter().copied().find(|o| o.name() == s)
     }
-    /// A load may not carry release semantics (`Release`/`AcqRel`).
-    pub fn valid_for_load(self) -> bool {
-        !matches!(self, Ordering::Release | Ordering::AcqRel)
-    }
-    /// A store may not carry acquire semantics (`Acquire`/`AcqRel`).
-    pub fn valid_for_store(self) -> bool {
-        !matches!(self, Ordering::Acquire | Ordering::AcqRel)
-    }
 }
 
 /// Non-terminator instructions. Each produces exactly one result — appended at the
@@ -1901,22 +1893,19 @@ pub enum Inst {
         a: ValIdx,
     },
     /// Load `op`'s width from the confined effective address `addr + offset`.
-    /// `align` is a power-of-two alignment *hint* (log2); it does not affect
-    /// semantics (unaligned access is allowed). Confinement masking is implicit.
+    /// Unaligned access is allowed; confinement masking is implicit.
     Load {
         op: LoadOp,
         addr: ValIdx,
         offset: u64,
-        align: u8,
     },
     /// Store `value` (`op`'s width) at the confined effective address. Produces no
-    /// SSA result. `align` is a hint (see [`Inst::Load`]).
+    /// SSA result.
     Store {
         op: StoreOp,
         addr: ValIdx,
         value: ValIdx,
         offset: u64,
-        align: u8,
     },
     /// Bulk copy `len` bytes from the confined span `[src, src+len)` to `[dst, dst+len)`
     /// (**non-overlapping**; lowered from `llvm.memcpy`). Both spans are confined **as a whole**
@@ -1953,7 +1942,6 @@ pub enum Inst {
         ty: IntTy,
         addr: ValIdx,
         offset: u64,
-        order: Ordering,
     },
     /// §12 atomic store — a naturally-aligned write of `value` (`ty`) to `addr + offset`; a
     /// misaligned effective address **traps**. Produces no SSA result (like [`Inst::Store`]).
@@ -1962,7 +1950,6 @@ pub enum Inst {
         addr: ValIdx,
         value: ValIdx,
         offset: u64,
-        order: Ordering,
     },
     /// §12 atomic read-modify-write: atomically apply `op` with `value` to `*(addr+offset)`
     /// (`ty`-wide, naturally aligned ⇒ else **traps**) and yield the **old** value.
@@ -1972,7 +1959,6 @@ pub enum Inst {
         addr: ValIdx,
         value: ValIdx,
         offset: u64,
-        order: Ordering,
     },
     /// §12 atomic compare-exchange: if `*(addr+offset) == expected`, store `replacement`; always
     /// yield the **old** value (`ty`-wide, naturally aligned ⇒ else **traps**).
@@ -1982,7 +1968,6 @@ pub enum Inst {
         expected: ValIdx,
         replacement: ValIdx,
         offset: u64,
-        order: Ordering,
     },
     /// Direct call to a function by index (fully static; the verifier checks the
     /// index and argument types). Appends the callee's result values — **0, 1, or
@@ -2345,11 +2330,10 @@ pub enum Inst {
     /// `v128.load`: read 16 little-endian bytes from the confined effective address
     /// `addr + offset` into a `v128`. The single widened (16-byte) masked access — the
     /// only escape-TCB delta SIMD adds (§17/D58); confinement masking is implicit, as for
-    /// [`Inst::Load`]. `align` is a hint (see [`Inst::Load`]).
+    /// [`Inst::Load`].
     V128Load {
         addr: ValIdx,
         offset: u64,
-        align: u8,
     },
     /// `v128.store`: write the 16 little-endian bytes of `value` at the confined effective
     /// address. Produces no SSA result (like [`Inst::Store`]).
@@ -2357,7 +2341,6 @@ pub enum Inst {
         addr: ValIdx,
         value: ValIdx,
         offset: u64,
-        align: u8,
     },
     /// `<shape>.splat`: broadcast a scalar (the shape's [`VShape::lane_val`] type) into
     /// every lane, producing a `v128`.
@@ -3543,7 +3526,6 @@ pub fn synth_manifest_start(
                 addr,
                 value,
                 offset: 0,
-                align: 0,
             });
         }
     }
@@ -5344,7 +5326,6 @@ mod effects_tests {
             op: LoadOp::I64,
             addr: 0,
             offset: 0,
-            align: 0,
         }
         .effects();
         assert!(load.can_trap && load.reads_mem && !load.writes_mem && !load.side_effect);
@@ -5355,7 +5336,6 @@ mod effects_tests {
             addr: 0,
             value: 1,
             offset: 0,
-            align: 0,
         }
         .effects();
         assert!(store.can_trap && store.writes_mem && !store.reads_mem);
@@ -5368,7 +5348,6 @@ mod effects_tests {
             ty: IntTy::I32,
             addr: 0,
             offset: 0,
-            order: Ordering::SeqCst,
         }
         .effects();
         assert!(al.reads_mem && al.side_effect && !al.removable_if_dead());
@@ -5378,7 +5357,6 @@ mod effects_tests {
             addr: 0,
             value: 1,
             offset: 0,
-            order: Ordering::SeqCst,
         }
         .effects();
         assert!(rmw.reads_mem && rmw.writes_mem && rmw.side_effect && rmw.can_trap);

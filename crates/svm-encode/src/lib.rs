@@ -132,8 +132,9 @@ mod op {
                               // the wire rev (#900) — the `cap.self.*` reflection ops are now `cap.call CAP_SELF op N`. Left as
                               // gaps — not renumbered, not reused.
 
-    // Memory ops. Each carries: address operand, [value operand for stores], an
-    // immediate uleb offset, and an alignment-hint byte.
+    // Memory ops. Each carries: address operand, [value operand for stores], and an
+    // immediate uleb offset. (The wire-rev cut dropped the write-only alignment-hint byte;
+    // no verifier or backend read it. Natural-alignment traps are width-derived.)
     pub const STORE: u8 = 0x84; // + StoreOp index (0..=8) -> 0x84..=0x8C
     pub const STORE_END: u8 = 0x8C;
     // Bulk-memory ops (D62): dst, src/val, len operand idxs (uleb). No sub-index.
@@ -195,8 +196,8 @@ mod op {
     pub const SIMD: u8 = 0xFE;
     pub mod simd {
         pub const CONST: u8 = 0x00; // + 16 raw value bytes (LE)
-        pub const LOAD: u8 = 0x01; // addr, offset (uleb), align (byte)
-        pub const STORE: u8 = 0x02; // addr, value, offset, align
+        pub const LOAD: u8 = 0x01; // addr, offset (uleb)
+        pub const STORE: u8 = 0x02; // addr, value, offset
         pub const SPLAT: u8 = 0x03; // shape, a
         pub const EXTRACT_LANE: u8 = 0x04; // shape, lane (byte), signed (byte), a
         pub const REPLACE_LANE: u8 = 0x05; // shape, lane (byte), a, b
@@ -896,25 +897,21 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             op: o,
             addr,
             offset,
-            align,
         } => {
             out.push(op::LOAD + o.index());
             write_uleb(out, *addr as u64);
             write_uleb(out, *offset);
-            out.push(*align);
         }
         Inst::Store {
             op: o,
             addr,
             value,
             offset,
-            align,
         } => {
             out.push(op::STORE + o.index());
             write_uleb(out, *addr as u64);
             write_uleb(out, *value as u64);
             write_uleb(out, *offset);
-            out.push(*align);
         }
         Inst::MemCopy { dst, src, len } => {
             out.push(op::MEM_COPY);
@@ -934,31 +931,23 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             write_uleb(out, *val as u64);
             write_uleb(out, *len as u64);
         }
-        Inst::AtomicLoad {
-            ty,
-            addr,
-            offset,
-            order,
-        } => {
+        Inst::AtomicLoad { ty, addr, offset } => {
             out.push(op::ATOMIC_LOAD);
             out.push(int_ty_byte(*ty));
             write_uleb(out, *addr as u64);
             write_uleb(out, *offset);
-            out.push(order.index());
         }
         Inst::AtomicStore {
             ty,
             addr,
             value,
             offset,
-            order,
         } => {
             out.push(op::ATOMIC_STORE);
             out.push(int_ty_byte(*ty));
             write_uleb(out, *addr as u64);
             write_uleb(out, *value as u64);
             write_uleb(out, *offset);
-            out.push(order.index());
         }
         Inst::AtomicRmw {
             ty,
@@ -966,7 +955,6 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             addr,
             value,
             offset,
-            order,
         } => {
             out.push(op::ATOMIC_RMW);
             out.push(int_ty_byte(*ty));
@@ -974,7 +962,6 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             write_uleb(out, *addr as u64);
             write_uleb(out, *value as u64);
             write_uleb(out, *offset);
-            out.push(order.index());
         }
         Inst::AtomicCmpxchg {
             ty,
@@ -982,7 +969,6 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             expected,
             replacement,
             offset,
-            order,
         } => {
             out.push(op::ATOMIC_CMPXCHG);
             out.push(int_ty_byte(*ty));
@@ -990,7 +976,6 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             write_uleb(out, *expected as u64);
             write_uleb(out, *replacement as u64);
             write_uleb(out, *offset);
-            out.push(order.index());
         }
         Inst::Call { func, args } => {
             out.push(op::CALL);
@@ -1103,29 +1088,22 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             out.push(op::simd::CONST);
             out.extend_from_slice(bytes);
         }
-        Inst::V128Load {
-            addr,
-            offset,
-            align,
-        } => {
+        Inst::V128Load { addr, offset } => {
             out.push(op::SIMD);
             out.push(op::simd::LOAD);
             write_uleb(out, *addr as u64);
             write_uleb(out, *offset);
-            out.push(*align);
         }
         Inst::V128Store {
             addr,
             value,
             offset,
-            align,
         } => {
             out.push(op::SIMD);
             out.push(op::simd::STORE);
             write_uleb(out, *addr as u64);
             write_uleb(out, *value as u64);
             write_uleb(out, *offset);
-            out.push(*align);
         }
         Inst::Splat { shape, a } => {
             out.push(op::SIMD);
@@ -1384,13 +1362,11 @@ fn decode_simd(c: &mut Cursor) -> Result<Inst, DecodeError> {
         op::simd::LOAD => Inst::V128Load {
             addr: c.idx()?,
             offset: c.uleb()?,
-            align: c.byte()?,
         },
         op::simd::STORE => Inst::V128Store {
             addr: c.idx()?,
             value: c.idx()?,
             offset: c.uleb()?,
-            align: c.byte()?,
         },
         op::simd::SPLAT => Inst::Splat {
             shape: dec_shape(c)?,
@@ -2348,14 +2324,12 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
             op: LoadOp::from_index(b - op::LOAD).ok_or(DecodeError::BadOpcode(b))?,
             addr: c.idx()?,
             offset: c.uleb()?,
-            align: c.byte()?,
         },
         op::STORE..=op::STORE_END => Inst::Store {
             op: StoreOp::from_index(b - op::STORE).ok_or(DecodeError::BadOpcode(b))?,
             addr: c.idx()?,
             value: c.idx()?,
             offset: c.uleb()?,
-            align: c.byte()?,
         },
         op::MEM_COPY => Inst::MemCopy {
             dst: c.idx()?,
@@ -2377,14 +2351,12 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
             ty: int_ty_from(c.byte()?, b)?,
             addr: c.idx()?,
             offset: c.uleb()?,
-            order: ord_from(c.byte()?, b)?,
         },
         op::ATOMIC_STORE => Inst::AtomicStore {
             ty: int_ty_from(c.byte()?, b)?,
             addr: c.idx()?,
             value: c.idx()?,
             offset: c.uleb()?,
-            order: ord_from(c.byte()?, b)?,
         },
         op::ATOMIC_RMW => Inst::AtomicRmw {
             ty: int_ty_from(c.byte()?, b)?,
@@ -2392,7 +2364,6 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
             addr: c.idx()?,
             value: c.idx()?,
             offset: c.uleb()?,
-            order: ord_from(c.byte()?, b)?,
         },
         op::ATOMIC_CMPXCHG => Inst::AtomicCmpxchg {
             ty: int_ty_from(c.byte()?, b)?,
@@ -2400,7 +2371,6 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
             expected: c.idx()?,
             replacement: c.idx()?,
             offset: c.uleb()?,
-            order: ord_from(c.byte()?, b)?,
         },
 
         op::CONT_NEW => Inst::ContNew {

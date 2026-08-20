@@ -393,51 +393,33 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
         Inst::FToITrap { op, a } => format!("{} v{a}", op.trap_name()),
         Inst::IToFConv { op, a } => format!("{} v{a}", op.name()),
         Inst::Cast { op, a } => format!("{} v{a}", op.sig().0),
-        Inst::Load {
-            op,
-            addr,
-            offset,
-            align,
-        } => format!("{} v{addr}{}", op.info().0, memarg(*offset, *align)),
+        Inst::Load { op, addr, offset } => {
+            format!("{} v{addr}{}", op.info().0, memarg(*offset))
+        }
         Inst::Store {
             op,
             addr,
             value,
             offset,
-            align,
-        } => format!(
-            "{} v{addr} v{value}{}",
-            op.info().0,
-            memarg(*offset, *align)
-        ),
+        } => format!("{} v{addr} v{value}{}", op.info().0, memarg(*offset)),
         // Bulk-memory ops (D62).
         Inst::MemCopy { dst, src, len } => format!("mem.copy v{dst} v{src} v{len}"),
         Inst::MemMove { dst, src, len } => format!("mem.move v{dst} v{src} v{len}"),
         Inst::MemFill { dst, val, len } => format!("mem.fill v{dst} v{val} v{len}"),
-        // §12 atomics: `<ty>.atomic.<op>[.<order>]`, naturally aligned (no `align=`, only `offset=`).
-        // The default `seqcst` ordering is omitted, so seq-cst atomics round-trip unchanged.
-        Inst::AtomicLoad {
-            ty,
-            addr,
-            offset,
-            order,
-        } => format!(
-            "{}.atomic.load{} v{addr}{}",
-            ty.prefix(),
-            ord_suffix(*order),
-            memarg(*offset, 0)
-        ),
+        // §12 atomics: `<ty>.atomic.<op>`, naturally aligned (no `align=`, only `offset=`).
+        // Execution is uniformly seq-cst; the ordering suffix left the wire at the wire rev.
+        Inst::AtomicLoad { ty, addr, offset } => {
+            format!("{}.atomic.load v{addr}{}", ty.prefix(), memarg(*offset))
+        }
         Inst::AtomicStore {
             ty,
             addr,
             value,
             offset,
-            order,
         } => format!(
-            "{}.atomic.store{} v{addr} v{value}{}",
+            "{}.atomic.store v{addr} v{value}{}",
             ty.prefix(),
-            ord_suffix(*order),
-            memarg(*offset, 0)
+            memarg(*offset)
         ),
         Inst::AtomicRmw {
             ty,
@@ -445,13 +427,11 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
             addr,
             value,
             offset,
-            order,
         } => format!(
-            "{}.atomic.rmw.{}{} v{addr} v{value}{}",
+            "{}.atomic.rmw.{} v{addr} v{value}{}",
             ty.prefix(),
             op.name(),
-            ord_suffix(*order),
-            memarg(*offset, 0)
+            memarg(*offset)
         ),
         Inst::AtomicCmpxchg {
             ty,
@@ -459,12 +439,10 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
             expected,
             replacement,
             offset,
-            order,
         } => format!(
-            "{}.atomic.cmpxchg{} v{addr} v{expected} v{replacement}{}",
+            "{}.atomic.cmpxchg v{addr} v{expected} v{replacement}{}",
             ty.prefix(),
-            ord_suffix(*order),
-            memarg(*offset, 0)
+            memarg(*offset)
         ),
         Inst::Call { func, args } => format!("call {func}{}", arglist(args)),
         Inst::RefFunc { func } => format!("ref.func {func}"),
@@ -622,19 +600,14 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
 
         // ----- §17 SIMD (D58) — lane shape carried by the op, bytes printed little-endian. -----
         Inst::ConstV128(bytes) => format!("v128.const{}", byte_list(bytes)),
-        Inst::V128Load {
-            addr,
-            offset,
-            align,
-        } => {
-            format!("v128.load v{addr}{}", memarg(*offset, *align))
+        Inst::V128Load { addr, offset } => {
+            format!("v128.load v{addr}{}", memarg(*offset))
         }
         Inst::V128Store {
             addr,
             value,
             offset,
-            align,
-        } => format!("v128.store v{addr} v{value}{}", memarg(*offset, *align)),
+        } => format!("v128.store v{addr} v{value}{}", memarg(*offset)),
         Inst::Splat { shape, a } => format!("{}.splat v{a}", shape.name()),
         Inst::ExtractLane {
             shape,
@@ -760,14 +733,12 @@ fn split_order(rest: &str) -> (&str, Ordering) {
     (rest, Ordering::SeqCst)
 }
 
-/// Render the optional `offset=`/`align=` suffix, omitting zero defaults.
-fn memarg(offset: u64, align: u8) -> String {
+/// Render the optional `offset=` suffix, omitting the zero default. (The `align=` memarg suffix
+/// left the surface at the wire rev — the alignment hint was write-only.)
+fn memarg(offset: u64) -> String {
     let mut s = String::new();
     if offset != 0 {
         let _ = write!(s, " offset={offset}");
-    }
-    if align != 0 {
-        let _ = write!(s, " align={align}");
     }
     s
 }
@@ -2398,42 +2369,45 @@ impl<'a> Parser<'a> {
                 timeout,
             });
         }
+        // Load/store/rmw/cmpxchg execute uniformly seq-cst and no longer carry an ordering on the
+        // wire. A `.<order>` suffix here is a **parse error** (fail-closed): the old surface silently
+        // strengthened weak orderings to seq-cst, which would now be a lie about what the wire means.
         let (base, order) = split_order(rest);
+        if order != Ordering::SeqCst {
+            return Err(ParseError(format!(
+                "atomic ordering suffix on `{}.atomic.{rest}` is no longer accepted \
+                 (atomic load/store/rmw/cmpxchg execute seq-cst; the wire carries no ordering)",
+                ty.prefix()
+            )));
+        }
         match base {
             "load" => {
                 let addr = self.value(names)?;
-                let (offset, _) = self.parse_memarg()?;
-                Ok(Inst::AtomicLoad {
-                    ty,
-                    addr,
-                    offset,
-                    order,
-                })
+                let offset = self.parse_memarg()?;
+                Ok(Inst::AtomicLoad { ty, addr, offset })
             }
             "store" => {
                 let addr = self.value(names)?;
                 let value = self.value(names)?;
-                let (offset, _) = self.parse_memarg()?;
+                let offset = self.parse_memarg()?;
                 Ok(Inst::AtomicStore {
                     ty,
                     addr,
                     value,
                     offset,
-                    order,
                 })
             }
             "cmpxchg" => {
                 let addr = self.value(names)?;
                 let expected = self.value(names)?;
                 let replacement = self.value(names)?;
-                let (offset, _) = self.parse_memarg()?;
+                let offset = self.parse_memarg()?;
                 Ok(Inst::AtomicCmpxchg {
                     ty,
                     addr,
                     expected,
                     replacement,
                     offset,
-                    order,
                 })
             }
             _ => {
@@ -2444,11 +2418,10 @@ impl<'a> Parser<'a> {
                     .ok_or_else(|| ParseError(format!("unknown atomic rmw op: {opname}")))?;
                 let addr = self.value(names)?;
                 let value = self.value(names)?;
-                let (offset, _) = self.parse_memarg()?;
+                let offset = self.parse_memarg()?;
                 Ok(Inst::AtomicRmw {
                     ty,
                     op,
-                    order,
                     addr,
                     value,
                     offset,
@@ -2880,24 +2853,22 @@ impl<'a> Parser<'a> {
         }
         if let Some(o) = LoadOp::from_name(&op) {
             let addr = self.value(names)?;
-            let (offset, align) = self.parse_memarg()?;
+            let offset = self.parse_memarg()?;
             return Ok(Inst::Load {
                 op: o,
                 addr,
                 offset,
-                align,
             });
         }
         if let Some(o) = StoreOp::from_name(&op) {
             let addr = self.value(names)?;
             let value = self.value(names)?;
-            let (offset, align) = self.parse_memarg()?;
+            let offset = self.parse_memarg()?;
             return Ok(Inst::Store {
                 op: o,
                 addr,
                 value,
                 offset,
-                align,
             });
         }
         // §12 atomics: `<ty>.atomic.<load|store|cmpxchg|rmw.<op>>`.
@@ -2915,22 +2886,17 @@ impl<'a> Parser<'a> {
         }
         if op == "v128.load" {
             let addr = self.value(names)?;
-            let (offset, align) = self.parse_memarg()?;
-            return Ok(Inst::V128Load {
-                addr,
-                offset,
-                align,
-            });
+            let offset = self.parse_memarg()?;
+            return Ok(Inst::V128Load { addr, offset });
         }
         if op == "v128.store" {
             let addr = self.value(names)?;
             let value = self.value(names)?;
-            let (offset, align) = self.parse_memarg()?;
+            let offset = self.parse_memarg()?;
             return Ok(Inst::V128Store {
                 addr,
                 value,
                 offset,
-                align,
             });
         }
         if op == "v128.not" {
@@ -3426,9 +3392,11 @@ impl<'a> Parser<'a> {
 
     /// Parse the optional `offset=<int>` / `align=<int>` suffix of a memory op
     /// (either order, both optional; defaults 0).
-    fn parse_memarg(&mut self) -> Result<(u64, u8), ParseError> {
+    /// Parse the optional `offset=` memarg suffix. The `align=` suffix was removed at the wire rev
+    /// (the alignment hint was write-only); an explicit `align=` is now a **parse error**
+    /// (fail-closed) rather than a silently-ignored token.
+    fn parse_memarg(&mut self) -> Result<u64, ParseError> {
         let mut offset = 0u64;
-        let mut align = 0u8;
         while let Some(Tok::Ident(s)) = self.peek() {
             let key = s.clone();
             match key.as_str() {
@@ -3440,16 +3408,16 @@ impl<'a> Parser<'a> {
                         .map_err(|_| ParseError(format!("offset out of range: {v}")))?;
                 }
                 "align" => {
-                    self.next()?;
-                    self.expect(&Tok::Equals)?;
-                    let v = self.parse_int()?;
-                    align = u8::try_from(v)
-                        .map_err(|_| ParseError(format!("align out of range: {v}")))?;
+                    return Err(ParseError(
+                        "`align=` memarg is no longer accepted (the alignment hint left the wire \
+                         at the wire rev)"
+                            .into(),
+                    ));
                 }
                 _ => break,
             }
         }
-        Ok((offset, align))
+        Ok(offset)
     }
 
     /// A float literal — accepts an integer token too (e.g. `f64.const 2`).
