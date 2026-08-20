@@ -12253,6 +12253,147 @@ entry:
     }
 }
 
+/// The **core-pipe builtins on the on-ramp** (#802 slice 4 / FORK.md §8.6): `__vm_pipe` mints a
+/// host-served pipe into this domain's powerbox (self-namespace op 16), `__vm_write`/`__vm_read`
+/// transfer on the *specific* end handles (`Stream` ops 1/0 — unlike the `write`/`read`
+/// recognizers, which reach the ambient streams), and `__vm_close` releases an end (op 2) —
+/// closing the last writer makes the reader see true EOF (0), not a hang. The lowerings mirror the
+/// chibicc frontend's (`codegen_ir.c`) byte-for-byte, so the #972 tag-protocol shim wrappers
+/// (`posix_utils/util.c`, `bash_shim.c` band 0) work identically on both frontends.
+#[test]
+fn core_pipe_builtins_roundtrip() {
+    let src = r#"
+int printf(const char *, ...);
+long __vm_pipe(int *fds);
+long __vm_read(int h, void *buf, long len);
+long __vm_write(int h, const void *buf, long len);
+int __vm_close(int h);
+int main(void) {
+  int h[2];
+  char buf[4];
+  if (__vm_pipe(h) != 0) return 1;
+  if (__vm_write(h[1], "abc", 3) != 3) return 2;
+  __vm_close(h[1]);
+  if (__vm_read(h[0], buf, 3) != 3) return 3;
+  buf[3] = 0;
+  if (__vm_read(h[0], buf, 1) != 0) return 4; /* last writer closed => true EOF, not a park */
+  __vm_close(h[0]);
+  printf("piped:%s\n", buf);
+  return 0;
+}
+"#;
+    let Some(ll) = compile_to_ll("core_pipe_builtins", src) else {
+        return;
+    };
+    let t = svm_llvm::translate_ll_path(&ll).expect("translate core-pipe builtins");
+    svm_verify::verify_module(&t.module).expect("verify core-pipe builtins");
+    let inst = svm_run::instantiate(t.module.clone()).expect("instantiate");
+    // Interpreter tier only: the capability pipe path needs the `Real` scheduler (`CAP_SELF_PIPE`)
+    // — the same tier boundary the chibicc-world pipe witnesses pin (`c_posix.rs` DUAL_WORLD).
+    for backend in [svm_run::Backend::TreeWalk] {
+        let run = inst
+            .run(backend, &svm_run::RunConfig::default())
+            .unwrap_or_else(|e| panic!("{backend:?}: core-pipe run failed: {e}"));
+        assert!(
+            matches!(
+                &run.outcome,
+                svm_run::Outcome::Returned(v) if v == &[svm_run::Value::I32(0)]
+            ),
+            "{backend:?}: main's return = the failing step (got {:?})",
+            run.outcome
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout),
+            "piped:abc\n",
+            "{backend:?}: the bytes crossed the pipe"
+        );
+    }
+}
+
+/// **`fork()` over the named posix capability** (#802 slice 4): the full lane a forking on-ramp
+/// program (bash) rides — `posix_cap`'s grant wires the async-signal door (which carries the #799
+/// caller-request door, so op 51 actually forks instead of `-ENOSYS`), the fork engine duplicates
+/// a host whose fixed powerbox holds a **pristine** guest-JIT grant (previously an unconditional
+/// `-EAGAIN`), and the twin's private window copy includes the **`vm_map`-committed tail pages**
+/// (the waist malloc's heap — previously a fail-closed refusal for every malloc-using program).
+/// The child proves the copied heap byte, writes it through the adopted core pipe (#972 tag
+/// redirect), and exits via the personality; the parent reads it and proves no aliasing.
+#[test]
+fn fork_over_the_named_posix_cap_copies_the_heap() {
+    let src = r#"
+int printf(const char *, ...);
+void *malloc(unsigned long n);
+extern int __vm_cap_resolve(const char *name, long len);
+extern long __vm_host_call(int h, int op, long a, long b, long c, long d);
+long __vm_pipe(int *fds);
+long __vm_read(int h, void *buf, long len);
+long __vm_write(int h, const void *buf, long len);
+int __vm_close(int h);
+static int px(void) {
+  static int h = -1;
+  if (h < 0) h = __vm_cap_resolve("posix", 5);
+  return h;
+}
+static long tag(long r) { return r <= -1048576 ? -(r + 1048576) : -1; }
+int main(void) {
+  char *heap = (char *)malloc(64); /* vm_map'd tail heap: the fork must copy it */
+  int h[2];
+  int fds[2];
+  char buf[8];
+  heap[0] = 'M';
+  if (__vm_pipe(h) != 0) return 1;
+  if (__vm_host_call(px(), 52, h[0], h[1], (long)fds, 0) != 0) return 2; /* pipe_adopt */
+  long pid = __vm_host_call(px(), 51, 0, 0, 0, 0); /* fork */
+  if (pid < 0) return 3;
+  if (pid == 0) { /* child: prove the copied heap byte, send it, exit */
+    heap[0] = heap[0] == 'M' ? 'c' : '?';
+    long r = __vm_host_call(px(), 0, fds[1], (long)heap, 1, 0); /* write */
+    long t = tag(r);
+    if (t >= 0) r = __vm_write((int)t, heap, 1);
+    __vm_host_call(px(), 4, r == 1 ? 0 : 9, 0, 0, 0); /* exit */
+  }
+  /* parent: close our write-end copy, read the child's byte, prove no aliasing. */
+  long c = __vm_host_call(px(), 6, fds[1], 0, 0, 0); /* close */
+  long ct = tag(c);
+  if (ct >= 0) __vm_close((int)ct);
+  long r = __vm_host_call(px(), 1, fds[0], (long)buf, 8, 0); /* read */
+  long t = tag(r);
+  if (t >= 0) r = __vm_read((int)t, buf, 8);
+  if (r != 1 || buf[0] != 'c') return 4;
+  if (heap[0] != 'M') return 5; /* the twin's heap write did not alias the parent */
+  printf("forked:%c parent:%c\n", buf[0], heap[0]);
+  return 0;
+}
+"#;
+    let Some(ll) = compile_to_ll("fork_posix_cap", src) else {
+        return;
+    };
+    let t = svm_llvm::translate_ll_path(&ll).expect("translate fork witness");
+    svm_verify::verify_module(&t.module).expect("verify fork witness");
+    let inst = svm_run::instantiate(t.module.clone()).expect("instantiate");
+    let (cap, _posix) = svm_run::posix::posix_cap(0, 0, Vec::new());
+    let run = inst
+        .run_with_caps(
+            svm_run::Backend::TreeWalk,
+            &svm_run::RunConfig::default(),
+            &[("posix", cap)],
+        )
+        .expect("run fork witness");
+    assert!(
+        matches!(
+            &run.outcome,
+            svm_run::Outcome::Returned(v) if v == &[svm_run::Value::I32(0)]
+        ),
+        "main's return = the failing step (got {:?})",
+        run.outcome
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "forked:c parent:M\n",
+        "the child's copied-heap byte crossed the pipe; the parent's heap is unaliased"
+    );
+}
+
 /// Path to `demos/bash`.
 fn bash_demo_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../svm-run/demos/bash")
@@ -12305,6 +12446,13 @@ fn demo_bash_translates_and_verifies() {
         "echo $((6*7))",
         "for i in a b c; do echo $i; done",
         "f() { echo fn-$1; }; f arg",
+        // Slice 4 — fork/pipes: command substitution, subshells, builtin pipelines (real fork
+        // twins over adopted core pipes), with trailing commands pinning the foreground waits.
+        "echo `echo nested`",
+        "x=$(echo one; echo two); echo \"$x\"",
+        "echo start; (x=5; echo in-$x); echo end",
+        "echo a | { read x; echo \"got-$x\"; }; echo tail",
+        "echo one | { read a; echo p1-$a; } | { read b; echo p2-$b; }; echo done2",
     ] {
         let config = svm_run::RunConfig {
             args: vec![b"bash".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()],

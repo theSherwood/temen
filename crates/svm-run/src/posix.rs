@@ -28,7 +28,22 @@ pub fn posix_cap(heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> (HostCap, Pos
     // #863 — the personality's own fork factory rides along, so a `fork()` through the powerbox
     // path gets real POSIX semantics (own fd table/cwd/env/signals, shared memfs), not a shared blob.
     let fork = svm_posix::cap_fork_factory(&posix);
-    (HostCap::host_proc_forkable(0, make, fork), posix)
+    // #802 slice 4 — the grant installs everything `svm_posix::grant` installs on the name-binding
+    // path, not just the handler: the async-signal door (which also carries the #799
+    // caller-request door — without it `fork` (op 51) has no park request and returns `-ENOSYS`),
+    // the #972 exec-remap hook, and the #801 op vtable (so an exec'd image's `__px_*` manifest
+    // binds through the coverage walk).
+    let p = posix.clone();
+    let cap = HostCap::custom(svm_interp::cap_id::HOST_PROC, 0, move |h, _win| {
+        let handle = h.grant_host_proc_forkable(make(), std::sync::Arc::clone(&fork));
+        let (door, armed) = svm_posix::cap_signal_source(&p);
+        h.set_signal_source(door, armed);
+        h.push_exec_remap_hook(svm_posix::cap_exec_remap_hook(&p));
+        let (names, sigs) = svm_posix::cap_vtable();
+        h.set_host_proc_vtable(handle, names, sigs);
+        handle
+    });
+    (cap, posix)
 }
 
 /// The **`net` capability** over an existing personality (POSIX.md §5a) — grant it alongside the

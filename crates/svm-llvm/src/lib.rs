@@ -12533,6 +12533,67 @@ fn lower_vm_builtin(
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
+        // FORK.md §8.6 — the **core-pipe builtins** (#972/#802 slice 4), mirroring the chibicc
+        // frontend's lowerings byte-for-byte so the tag protocol's shim wrappers (`util.c` /
+        // `bash_shim.c` band 0) work identically on both frontends:
+        //   `long __vm_pipe(int *fds)` — mint a host-served pipe into this domain's powerbox
+        //   (self-namespace op 16; writes `fds[0]` = read end, `fds[1]` = write end; 0 / -errno).
+        "__vm_pipe" => {
+            let fds = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let handle = ctx.push(Inst::ConstI32(0)); // self-namespace: the handle is unused
+            let sig = svm_ir::FuncType {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+            };
+            let r = ctx.push(Inst::CapCall {
+                type_id: svm_ir::CAP_SELF_TYPE_ID,
+                op: 16, // CAP_SELF_PIPE
+                sig,
+                handle,
+                args: vec![fds],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        //   `long __vm_read(int h, void *buf, long len)` / `__vm_write(...)` — transfer on a
+        //   **specific** `Stream`/pipe-end handle (ops 0/1), unlike the `read`/`write` recognizers
+        //   which reach the ambient powerbox streams. Returns the byte count / -errno.
+        //   `int __vm_close(int h)` — close the handle (op 2; a write end's last close drops the
+        //   writer count → reader EOF).
+        "__vm_read" | "__vm_write" => {
+            let handle = ctx.operand_i32(vm_arg(c, 0)?)?;
+            let buf = ctx.operand_i64(vm_arg(c, 1)?)?;
+            let len = ctx.operand_i64(vm_arg(c, 2)?)?;
+            let sig = svm_ir::FuncType {
+                params: vec![ValType::I64, ValType::I64],
+                results: vec![ValType::I64],
+            };
+            let r = ctx.push(Inst::CapCall {
+                type_id: svm_ir::cap_id::STREAM,
+                op: if name == "__vm_read" { 0 } else { 1 },
+                sig,
+                handle,
+                args: vec![buf, len],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        "__vm_close" => {
+            let handle = ctx.operand_i32(vm_arg(c, 0)?)?;
+            let sig = svm_ir::FuncType {
+                params: vec![],
+                results: vec![ValType::I64],
+            };
+            let r = ctx.push(Inst::CapCall {
+                type_id: svm_ir::cap_id::STREAM,
+                op: 2,
+                sig,
+                handle,
+                args: vec![],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
         // §13/§4b `SharedRegion` call: `long __vm_region_call(int handle, int op, long a, long b,
         // long c, long d)` → `cap.call SHARED_REGION op handle (a,b,c,d)`. The bridge a guest uses to
         // `map`/`unmap` a file-backed region an mmap-capable fs minted (`FS_MAP_REGION`) — same fixed

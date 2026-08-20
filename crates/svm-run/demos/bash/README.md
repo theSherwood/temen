@@ -61,15 +61,42 @@ differential compares), `strnlen`/`strdup`/`strncpy`/`strcat`/`strstr`/`strcases
 `imaxdiv`, and the wide-char band (`mbsrtowcs`/`wcs*`/`isw*`/`towlower`/`wctype` — ASCII,
 MB_CUR_MAX = 1).
 
+## Slice 4 (fork/pipes rung DONE) — command substitution, subshells, builtin pipelines
+
+bash **forks** on this lane: `` echo `echo nested` ``, `$(…)` (multiple, multi-line), `(subshell)`,
+and builtin pipelines (`echo a | { read x; …; } | …` with trailing commands) all byte-match the
+oracle. What it took (each pinned):
+
+1. **The core-pipe builtins on the on-ramp** — `__vm_pipe`/`__vm_read`/`__vm_write`/`__vm_close`
+   now lower exactly as the chibicc frontend's (`codegen_ir.c`), so band 0's #972 tag-protocol
+   wrappers complete (interpreter tier — `CAP_SELF_PIPE` needs the `Real` scheduler). Pin:
+   `core_pipe_builtins_roundtrip`.
+2. **`posix_cap` grants everything `grant` grants** — the async-signal door (which carries the
+   #799 caller-request door: without it `fork` was `-ENOSYS`), the #972 exec-remap hook, the #801
+   op vtable (svm-run `posix.rs` + the new `svm_posix::cap_signal_source`/`cap_exec_remap_hook`/
+   `cap_vtable`).
+3. **A pristine guest-JIT grant forks** — the fixed powerbox prefix mints an (unused) `Jit`
+   domain on every svm-run host; `fork_powerbox` refused it wholesale. A domain with no units, no
+   installs, no native ctx now duplicates as an equally-empty grant (same quota, same index);
+   live JIT state still fails closed.
+4. **`fork_private` copies the `vm_map`-committed tail pages** — the waist malloc's heap lives in
+   the reserved tail, so every malloc-using on-ramp program's fork was refused (`-EAGAIN`, which
+   bash surfaces as `fork: retry`). Plain `Rw`/`Ro` tail pages now copy page-wise into the twin;
+   `Backed` (§13) stays fail-closed. Pin: `fork_private_copies_vm_mapped_tail_pages`.
+5. **The any-child blocking wait benches** — bash's no-job-control `waitchld` blocks in
+   `waitpid(-1, …, 0)`; the #799 bench covered only specific pids, so the parent raced past its
+   unfinished subshell/pipeline (the `end` before `in-5`'s newline diff). Op 28 now benches on
+   the lowest live core-twin child for `-1` (correct for foreground waits — the caller loops
+   reaping until all children are gone; the true any-child park key is a later rung).
+
+End-to-end pin: `fork_over_the_named_posix_cap_copies_the_heap` + five fork-era scripts in the
+capstone differential.
+
 ## What remains (the slice ladder from the #802 sketch)
 
-- **Slice 4 — the differential suite**: fork/exec/pipes — command substitution today PARKS forever
-  (the fork op fires but the child's pipe plumbing needs the core-pipe builtins:
-  `__vm_pipe`/`__vm_read`/`__vm_write`/`__vm_close` are chibicc-world recognizers the on-ramp
-  doesn't lower yet, so the #972 tag protocol can't complete — band 0 returns a clean `EIO` on a
-  tag until then). Then pipelines over the #801 `/bin`, subshells, redirections, traps; then
-  interactive on the #797 terminal (also the `set_signal_source` wiring — `posix_cap`'s grant
-  installs no async-signal door yet, so delivery is poll-only on this lane).
+- **Slice 4 tail**: `exec` of the #801 `/bin` executables from bash (external commands — needs
+  the staged-exec image path from `posix_libc/exec.c` adapted to band 0), redirections to memfs
+  files, traps/signals under fork; then interactive on the #797 terminal.
 - Known band-0 papering (revisit when a differential trips over one): `fstat` synthesizes a
   chr-device for fds 0-2 and re-stats the recorded open path otherwise; `st_ino` is a path hash
   (same-file checks distinguish paths, not hardlinks); `sigsuspend` returns `EINTR` without

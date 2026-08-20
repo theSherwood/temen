@@ -51,11 +51,11 @@ extern long __vm_host_call(int h, int op, long a, long b, long c, long d);
 enum {
   PX_WRITE = 0, PX_READ = 1, PX_EXIT = 4, PX_OPEN = 5, PX_CLOSE = 6, PX_LSEEK = 7,
   PX_UNLINK = 8, PX_GETCWD = 9, PX_CHDIR = 10, PX_STAT = 13, PX_OPENDIR = 14, PX_READDIR = 15,
-  PX_CLOSEDIR = 16, PX_PIPE = 23, PX_DUP2 = 24, PX_DUP = 25, PX_FCNTL = 26, PX_WAITPID = 28,
+  PX_CLOSEDIR = 16, PX_DUP2 = 24, PX_DUP = 25, PX_FCNTL = 26, PX_WAITPID = 28,
   PX_SIGNAL = 30, PX_KILL = 31, PX_MKDIR = 37, PX_RENAME = 38, PX_RMDIR = 39,
   PX_SIGPROCMASK = 40, PX_SIGACTION = 41, PX_SIGALTSTACK = 42, PX_GETPID = 44, PX_SETPGID = 45,
   PX_GETPGID = 46, PX_TCGETPGRP = 47, PX_TCSETPGRP = 48, PX_ISATTY = 49, PX_GETPPID = 50,
-  PX_FORK = 51, PX_TCGETATTR = 54, PX_TCSETATTR = 55, PX_TCGETWINSIZE = 56,
+  PX_FORK = 51, PX_PIPE_ADOPT = 52, PX_TCGETATTR = 54, PX_TCSETATTR = 55, PX_TCGETWINSIZE = 56,
 };
 
 static int px_handle_ = -1;
@@ -71,20 +71,26 @@ static long px_ret_(long r) {
   return r;
 }
 /* #972 tag protocol: an op landing on a core pipe/terminal end returns PX_TAG_BASE - handle
- * (<= -(1<<20)); the wrapper re-issues on the core handle. The on-ramp lane has no
- * `__vm_read`/`__vm_write` builtins yet (that lands with the fork/exec/pipes slice), so a tag here
- * is a clean EIO, never a misread errno. Real errnos stay > -4096 and pass through. */
+ * (<= -(1<<20)); the wrapper re-issues the transfer on the core handle via the core-pipe
+ * builtins, where empty-with-writers PARKS and writer-count 0 is true EOF (the `util.c` shape).
+ * Real errnos stay > -4096 and pass through. */
+extern long __vm_pipe(int *fds);
+extern long __vm_read(int h, void *buf, long len);
+extern long __vm_write(int h, const void *buf, long len);
+extern int __vm_close(int h);
 static long px_tag_(long r) { return r <= -1048576 ? -(r + 1048576) : -1; }
 
 long write(int fd, const void *buf, unsigned long n) {
   long r = px_call_(PX_WRITE, fd, (long)buf, (long)n, 0);
-  if (px_tag_(r) >= 0) return px_ret_(-5); /* EIO: core-pipe fds arrive with the pipes slice */
+  long h = px_tag_(r);
+  if (h >= 0) r = __vm_write((int)h, buf, (long)n);
   if (r == -32) px_call_(PX_KILL, 0, 13, 0, 0); /* -EPIPE: raise SIGPIPE per disposition */
   return px_ret_(r);
 }
 long read(int fd, void *buf, unsigned long n) {
   long r = px_call_(PX_READ, fd, (long)buf, (long)n, 0);
-  if (px_tag_(r) >= 0) return px_ret_(-5);
+  long h = px_tag_(r);
+  if (h >= 0) r = __vm_read((int)h, buf, (long)n);
   return px_ret_(r);
 }
 /* fd → path, recorded at open so fstat can re-stat (the memfs op surface is path-keyed). */
@@ -106,7 +112,11 @@ int open(const char *path, int flags, ...) {
 int close(int fd) {
   if (fd >= 0 && fd < PX_NFDPATH) px_fdpath_[fd][0] = 0;
   long r = px_call_(PX_CLOSE, fd, 0, 0, 0);
-  if (px_tag_(r) >= 0) return 0; /* last close of a core end: released with the pipes slice */
+  long h = px_tag_(r);
+  if (h >= 0) { /* last close of an adopted core end: release the powerbox handle */
+    __vm_close((int)h);
+    return 0;
+  }
   return (int)px_ret_(r);
 }
 long lseek(int fd, long off, int whence) { return px_ret_(px_call_(PX_LSEEK, fd, off, whence, 0)); }
@@ -122,7 +132,16 @@ char *getcwd(char *buf, unsigned long size) {
   return px_call_(PX_GETCWD, (long)buf, (long)size, 0, 0) < 0 ? 0 : buf;
 }
 int chdir(const char *p) { return (int)px_ret_(px_call_(PX_CHDIR, (long)p, (long)strlen(p), 0, 0)); }
-int pipe(int *fds) { return (int)px_ret_(px_call_(PX_PIPE, (long)fds, 0, 0, 0)); }
+/* pipe — mint a CORE pipe (blocking cross-process semantics: empty-with-writers parks the reader,
+ * writer-count 0 is EOF) and adopt the two powerbox ends into this process's fd table (#972 —
+ * `pipe_adopt` writes the `int[2]` fds). The in-personality PX_PIPE (op 23) is the older
+ * non-blocking lane; fork twins need the core one. */
+int pipe(int *fds) {
+  int h[2];
+  long r = __vm_pipe(h);
+  if (r != 0) return (int)px_ret_(r);
+  return (int)px_ret_(px_call_(PX_PIPE_ADOPT, h[0], h[1], (long)fds, 0));
+}
 int dup(int fd) { return (int)px_ret_(px_call_(PX_DUP, fd, 0, 0, 0)); }
 int dup2(int o, int n) { return (int)px_ret_(px_call_(PX_DUP2, o, n, 0, 0)); }
 int fcntl(int fd, int cmd, ...) {
