@@ -19,10 +19,11 @@ use svm_browser::{
     svm_coop_jit_result_types_ptr, svm_coop_jit_wasm_by_handle_len,
     svm_coop_jit_wasm_by_handle_ptr, svm_coop_jit_wasm_len, svm_coop_jit_wasm_ptr, svm_coop_mapped,
     svm_coop_mapped_now, svm_coop_nfuncs, svm_coop_open, svm_coop_paged, svm_coop_pagestate_len,
-    svm_coop_pagestate_ptr, svm_coop_run, svm_coop_shim_ptr, svm_coop_shim_wasm, svm_coop_slot_code,
-    svm_coop_table_gen, svm_coop_table_log2, svm_coop_value, svm_coop_wasm_len, svm_coop_wasm_ptr,
-    svm_coop_win_len, svm_coop_win_ptr, svm_run_value, svm_status, svm_stdout_len, svm_stdout_ptr,
-    COOP_RUN_DONE, COOP_RUN_JIT_INVOKE, COOP_RUN_TIERUP, COOP_RUN_TRAP, STATUS_OK, STATUS_TRAP, STATUS_UNSUPPORTED,
+    svm_coop_pagestate_ptr, svm_coop_run, svm_coop_shim_ptr, svm_coop_shim_wasm,
+    svm_coop_slot_code, svm_coop_table_gen, svm_coop_table_log2, svm_coop_value, svm_coop_wasm_len,
+    svm_coop_wasm_ptr, svm_coop_win_len, svm_coop_win_ptr, svm_run_value, svm_status,
+    svm_stdout_len, svm_stdout_ptr, COOP_RUN_DONE, COOP_RUN_JIT_INVOKE, COOP_RUN_TIERUP,
+    COOP_RUN_TRAP, STATUS_OK, STATUS_TRAP, STATUS_UNSUPPORTED,
 };
 use svm_interp::{Host, StreamRole};
 use wasmi::{
@@ -631,10 +632,9 @@ impl CoopB2Driver {
                         }
                         let plen = svm_coop_pagestate_len();
                         // SAFETY: pending-event page-state table, stable until the deliver.
-                        let table = unsafe {
-                            std::slice::from_raw_parts(svm_coop_pagestate_ptr(), plen)
-                        }
-                        .to_vec();
+                        let table =
+                            unsafe { std::slice::from_raw_parts(svm_coop_pagestate_ptr(), plen) }
+                                .to_vec();
                         let table_base = WIN_BASE as usize + win_len;
                         let need = (table_base + plen).div_ceil(1 << 16) as u32;
                         let have = mem.size(&c) as u32;
@@ -976,10 +976,18 @@ fn coop_rodata_and_midinvoke_grow_match_the_oracle() {
         );
         let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
         assert_eq!(opened, 0, "coop open (status {})", svm_status());
-        assert_ne!(svm_coop_paged(), 0, "the rodata guest opens the coop run paged");
+        assert_ne!(
+            svm_coop_paged(),
+            0,
+            "the rodata guest opens the coop run paged"
+        );
         let (_d, tierups) = drive_coop_b2_session_allow_trap(&m);
         assert!(tierups >= 1, "the leaf tiers up on the coop path");
-        assert_eq!(svm_status(), want.status, "coop status parity (store={store})");
+        assert_eq!(
+            svm_status(),
+            want.status,
+            "coop status parity (store={store})"
+        );
         if !want_trap {
             assert_eq!(svm_coop_value(), want.value, "coop value parity (Ro load)");
         }
@@ -1002,9 +1010,21 @@ fn coop_rodata_and_midinvoke_grow_match_the_oracle() {
     assert_ne!(svm_coop_paged(), 0, "paged");
     let (d, tierups) = drive_coop_b2_session_allow_trap(&m);
     assert!(tierups >= 1, "the leaf tiers up");
-    assert!(!d.bounces().is_empty(), "the grow helper bounces: {:?}", d.bounces());
-    assert_eq!(svm_status(), want.status, "coop status parity (mid-invoke grow)");
-    assert_eq!(svm_coop_value(), want.value, "coop value parity through the grown page");
+    assert!(
+        !d.bounces().is_empty(),
+        "the grow helper bounces: {:?}",
+        d.bounces()
+    );
+    assert_eq!(
+        svm_status(),
+        want.status,
+        "coop status parity (mid-invoke grow)"
+    );
+    assert_eq!(
+        svm_coop_value(),
+        want.value,
+        "coop value parity through the grown page"
+    );
     svm_coop_close();
 }
 
@@ -1554,7 +1574,12 @@ export 0 func "_start" 0
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
 
     let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
-    assert_eq!(opened, 0, "a fiber guest must be admitted (status {})", svm_status());
+    assert_eq!(
+        opened,
+        0,
+        "a fiber guest must be admitted (status {})",
+        svm_status()
+    );
     let (_d, tierups, _invokes) = drive_coop_b2_session(&m);
     assert!(tierups >= 1, "the leaf still tiers up beside the fibers");
     assert_eq!(svm_status(), want.status, "status parity with the oracle");
@@ -1603,8 +1628,15 @@ block 0 (vsp: i64, varg: i64) {{
     let bytes = svm_encode::encode_module(&m);
 
     let want = onramp_exec(&m, b"");
-    assert_eq!(want.status, STATUS_OK, "the fiber-hosting unit compiles + invokes interpreted");
-    assert_eq!(want.value, 2 * PROBE + FIBER_UNIT_K, "both yielded values arrive");
+    assert_eq!(
+        want.status, STATUS_OK,
+        "the fiber-hosting unit compiles + invokes interpreted"
+    );
+    assert_eq!(
+        want.value,
+        2 * PROBE + FIBER_UNIT_K,
+        "both yielded values arrive"
+    );
 
     let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
     assert_eq!(opened, 0, "open must admit (status {})", svm_status());
@@ -1720,7 +1752,10 @@ block 0 (vslot: i64, vx: i64) {
     };
     const A_BASE: i64 = 4096;
     const B_BASE: i64 = 8192;
-    let (sa, sb) = (stage_blob("a", A_BASE, &blob_a), stage_blob("c", B_BASE, &blob_b));
+    let (sa, sb) = (
+        stage_blob("a", A_BASE, &blob_a),
+        stage_blob("c", B_BASE, &blob_b),
+    );
     let (la, lb) = (blob_a.len(), blob_b.len());
     const X: i64 = 5000;
     let src = format!(
@@ -1783,7 +1818,11 @@ fn coop_high_index_dispatch_beyond_the_table_floor_matches_the_oracle() {
     const TARGET: usize = 1050;
     const INPUT: i64 = 12345;
     const DISTINCT: i64 = 777;
-    assert_eq!(TARGET & 1023, 26, "the fixed-1024 mask lands on an identity slot");
+    assert_eq!(
+        TARGET & 1023,
+        26,
+        "the fixed-1024 mask lands on an identity slot"
+    );
     let mut fns = format!(
         r#"func () -> (i64) {{
 block 0 () {{
@@ -1821,12 +1860,19 @@ block 0 (v0: i64) {{
     let src = format!("memory 16\n{fns}export 0 func \"_start\" 0\n");
     let m = svm_text::parse_module(&src).expect("parse");
     svm_verify::verify_module(&m).expect("verify");
-    assert!(m.funcs.len() > (1usize << 10), "the guest must exceed the 1024-slot floor");
+    assert!(
+        m.funcs.len() > (1usize << 10),
+        "the guest must exceed the 1024-slot floor"
+    );
     let bytes = svm_encode::encode_module(&m);
 
     let want = onramp_exec(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
-    assert_eq!(want.value, INPUT + DISTINCT, "oracle: the dispatch reaches slot {TARGET}");
+    assert_eq!(
+        want.value,
+        INPUT + DISTINCT,
+        "oracle: the dispatch reaches slot {TARGET}"
+    );
 
     let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
     assert_eq!(opened, 0, "open must admit (status {})", svm_status());
@@ -2009,7 +2055,11 @@ export 0 func "_start" 0
 
     let want = onramp_exec(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
-    assert_eq!(want.value, (X + 11) + (77 + 22), "oracle: bounce-created fiber + later resume");
+    assert_eq!(
+        want.value,
+        (X + 11) + (77 + 22),
+        "oracle: bounce-created fiber + later resume"
+    );
 
     let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
     assert_eq!(opened, 0, "open must admit (status {})", svm_status());
@@ -2091,7 +2141,8 @@ export 0 func "_start" 0
 
     let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
     assert_eq!(
-        opened, 0,
+        opened,
+        0,
         "#888: the leaf with a direct cross-tier call must be eligible (status {})",
         svm_status()
     );
@@ -2112,7 +2163,10 @@ export 0 func "_start" 0
     // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
     let got_out =
         unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
-    assert_eq!(got_out, want.stdout, "stdout parity (bounce ordering included)");
+    assert_eq!(
+        got_out, want.stdout,
+        "stdout parity (bounce ordering included)"
+    );
     svm_coop_close();
 }
 
@@ -2174,9 +2228,17 @@ export 0 func "_start" 0
     assert_eq!(want.value, PROBE + PLEAF_K, "oracle value");
 
     let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
-    assert_eq!(opened, 0, "a dead concurrency op must not refuse (status {})", svm_status());
+    assert_eq!(
+        opened,
+        0,
+        "a dead concurrency op must not refuse (status {})",
+        svm_status()
+    );
     let (_d, tierups, _invokes) = drive_coop_b2_session(&m);
-    assert!(tierups >= 1, "the pure leaf must tier up beside the dead op");
+    assert!(
+        tierups >= 1,
+        "the pure leaf must tier up beside the dead op"
+    );
     assert_eq!(svm_status(), want.status, "status parity with the oracle");
     assert_eq!(svm_coop_value(), want.value, "value parity");
     // SAFETY: capture slots staged at DONE; this thread is the only accessor (FFI_LOCK).
@@ -2227,7 +2289,10 @@ export 0 func "_start" 0
     let bytes = svm_encode::encode_module(&m);
 
     let want = onramp_exec(&m, b"");
-    assert_eq!(want.status, STATUS_OK, "oracle sanity (notify with no waiters returns 0)");
+    assert_eq!(
+        want.status, STATUS_OK,
+        "oracle sanity (notify with no waiters returns 0)"
+    );
 
     let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
     assert_eq!(opened, 0, "admitted (status {})", svm_status());
@@ -2300,7 +2365,12 @@ export 0 func "_start" 0
     assert_eq!(want.value, expect, "oracle value");
 
     let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
-    assert_eq!(opened, 0, "#889: the cap-bearing hot loop must be admitted (status {})", svm_status());
+    assert_eq!(
+        opened,
+        0,
+        "#889: the cap-bearing hot loop must be admitted (status {})",
+        svm_status()
+    );
     let (d, tierups, _invokes) = drive_coop_b2_session(&m);
     assert!(tierups >= 1, "the hot loop must tier up (non-vacuity)");
     assert_eq!(
@@ -2313,7 +2383,10 @@ export 0 func "_start" 0
     // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
     let got_out =
         unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
-    assert_eq!(got_out, want.stdout, "stdout parity — per-iteration writes interleave as interpreted");
+    assert_eq!(
+        got_out, want.stdout,
+        "stdout parity — per-iteration writes interleave as interpreted"
+    );
     svm_coop_close();
 }
 
