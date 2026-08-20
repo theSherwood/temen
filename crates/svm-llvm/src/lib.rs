@@ -12555,6 +12555,29 @@ fn lower_vm_builtin(
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
+        //   `long __vm_exec_module(mod, grants_ptr, grants_n, entry, size_log2)` — **true
+        //   cross-module `execve`** (self-namespace op 14, `CAP_SELF_EXEC`): the calling vCPU
+        //   becomes the granted command module in place, keeping its task so a parent's `wait`
+        //   reaps the command's exit. Never returns on success; `-errno` on failure (POSIX).
+        "__vm_exec_module" => {
+            let args = (0..5)
+                .map(|i| ctx.operand_i64(vm_arg(c, i)?))
+                .collect::<Result<Vec<_>, _>>()?;
+            let handle = ctx.push(Inst::ConstI32(0)); // self-namespace: the handle is unused
+            let sig = svm_ir::FuncType {
+                params: vec![ValType::I64; 5],
+                results: vec![ValType::I64],
+            };
+            let r = ctx.push(Inst::CapCall {
+                type_id: svm_ir::CAP_SELF_TYPE_ID,
+                op: 14, // CAP_SELF_EXEC
+                sig,
+                handle,
+                args,
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
         //   `long __vm_read(int h, void *buf, long len)` / `__vm_write(...)` — transfer on a
         //   **specific** `Stream`/pipe-end handle (ops 0/1), unlike the `read`/`write` recognizers
         //   which reach the ambient powerbox streams. Returns the byte count / -errno.

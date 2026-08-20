@@ -12468,15 +12468,123 @@ fn demo_bash_translates_and_verifies() {
             .env("HOME", "/")
             .output()
             .expect("run the native oracle");
+        let code = match &run.outcome {
+            svm_run::Outcome::Exited(c) => *c,
+            svm_run::Outcome::Returned(v) => match v.first() {
+                Some(svm_run::Value::I32(c)) => *c,
+                Some(svm_run::Value::I64(c)) => *c as i32,
+                _ => -1,
+            },
+        };
         assert_eq!(
-            run.outcome,
-            svm_run::Outcome::Exited(native.status.code().unwrap_or(-1)),
-            "bash -c {script:?}: exit status differs from the oracle"
+            code,
+            native.status.code().unwrap_or(-1),
+            "bash -c {script:?}: exit status differs from the oracle (outcome {:?})",
+            run.outcome
         );
         assert_eq!(
             String::from_utf8_lossy(&posix.stdout()),
             String::from_utf8_lossy(&native.stdout),
             "bash -c {script:?}: stdout differs from the oracle"
+        );
+    }
+
+    // ▶ Slice 4 tail — **external commands**: stage the #801 /bin (the chibicc-world coreutils,
+    // compiled by `stage_bin.sh` to `.svm` command modules) and run exec'd pipelines —
+    // fork → execve("/bin/…") → waitpid, PATH lookup, redirections to memfs files, command
+    // substitution over exec'd stages. Skips loudly when chibicc can't build (no make/cc).
+    let staged = Command::new("bash")
+        .arg(bash_demo_dir().join("stage_bin.sh"))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !staged {
+        eprintln!("note: skipping bash external-command gate (chibicc unavailable)");
+        return;
+    }
+    let bin_dir = std::env::temp_dir().join("svm_bash_cache/bin");
+    let mut bins: Vec<(String, svm_ir::Module, u8)> = Vec::new();
+    for e in std::fs::read_dir(&bin_dir).expect("read staged /bin") {
+        let p = e.expect("dir entry").path();
+        if p.extension().is_none_or(|x| x != "svm") {
+            continue;
+        }
+        let name = p.file_stem().unwrap().to_string_lossy().into_owned();
+        let ir = std::fs::read_to_string(&p).expect("read command IR");
+        let m = svm_text::parse_module(&ir).expect("parse command");
+        svm_verify::verify_module(&m).expect("verify command");
+        let wl = m.memory.expect("command window").size_log2;
+        bins.push((format!("/bin/{name}"), m, wl));
+    }
+    assert!(bins.len() >= 10, "the staged /bin arrived");
+    let bins = std::sync::Arc::new(bins);
+    // Both sides run each script in a fresh cwd ("/" on the memfs; a fresh tempdir natively), so
+    // the relative-path redirection lands in a private file on each side.
+    let native_cwd = std::env::temp_dir().join(format!("svm_bash_gate_{}", std::process::id()));
+    std::fs::create_dir_all(&native_cwd).expect("native cwd");
+    for script in [
+        "/bin/echo external",
+        "echo viaPATH | cat",
+        "seq 5 | head -n 2",
+        "seq 100 | wc -l",
+        "x=$(seq 3 | wc -l); echo \"n=$x\"",
+        "true && echo t; false || echo f",
+        "seq 3 | sort | uniq | wc -l",
+        "echo hi > f; cat f",
+    ] {
+        let config = svm_run::RunConfig {
+            args: vec![b"bash".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()],
+            env: vec![b"PATH=/bin".to_vec(), b"HOME=/".to_vec()],
+            ..Default::default()
+        };
+        // posix_cap plus the /bin registration, which must happen inside the grant (module
+        // handles live in the run's Host) — the `stage_executable` shape from c_posix.rs.
+        let (posix, make) = svm_posix::cap(0, 0, Vec::new());
+        let fork = svm_posix::cap_fork_factory(&posix);
+        let p = posix.clone();
+        let bins_for_grant = std::sync::Arc::clone(&bins);
+        let cap = svm_run::HostCap::custom(svm_interp::cap_id::HOST_PROC, 0, move |h, _win| {
+            let handle = h.grant_host_proc_forkable(make(), std::sync::Arc::clone(&fork));
+            let (door, armed) = svm_posix::cap_signal_source(&p);
+            h.set_signal_source(door, armed);
+            h.push_exec_remap_hook(svm_posix::cap_exec_remap_hook(&p));
+            let (names, sigs) = svm_posix::cap_vtable();
+            h.set_host_proc_vtable(handle, names, sigs);
+            for (path, m, wl) in bins_for_grant.iter() {
+                let mh = h.grant_module(m);
+                p.register_executable(path, mh, *wl);
+            }
+            handle
+        });
+        let run = inst
+            .run_with_caps(svm_run::Backend::TreeWalk, &config, &[("posix", cap)])
+            .unwrap_or_else(|e| panic!("bash -c {script:?} (external) failed: {e}"));
+        let native = Command::new(&oracle)
+            .args(["-c", script])
+            .env_clear()
+            .env("PATH", "/bin")
+            .env("HOME", "/")
+            .current_dir(&native_cwd)
+            .output()
+            .expect("run the native oracle");
+        let code = match &run.outcome {
+            svm_run::Outcome::Exited(c) => *c,
+            svm_run::Outcome::Returned(v) => match v.first() {
+                Some(svm_run::Value::I32(c)) => *c,
+                Some(svm_run::Value::I64(c)) => *c as i32,
+                _ => -1,
+            },
+        };
+        assert_eq!(
+            code,
+            native.status.code().unwrap_or(-1),
+            "bash -c {script:?} (external): exit status differs from the oracle (outcome {:?})",
+            run.outcome
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&posix.stdout()),
+            String::from_utf8_lossy(&native.stdout),
+            "bash -c {script:?} (external): stdout differs from the oracle"
         );
     }
 }

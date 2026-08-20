@@ -122,8 +122,9 @@ CF=(-O2 -emit-llvm -S -fno-vectorize -fno-slp-vectorize -DNDEBUG -D_GNU_SOURCE)
 DEMOS="$HERE/.."
 clang "${CF[@]}" "$HERE/bash_shim.c" -o "$OUT/_bashshim.ll" || { echo "bash_shim FAIL"; exit 14; }
 # The personality's own guest libc: bash's fnmatch/regcomp/regexec are the #800 implementations,
-# linked as ordinary guest code (their `__px_malloc`/`__px_free` externs bridge in bash_shim.c).
-for f in fnmatch regex; do
+# and execve/execv/execvp are the #801 staged-exec (slice 4) — linked as ordinary guest code
+# (their `__px_*` externs bridge in bash_shim.c; `__vm_exec_module` is a core builtin).
+for f in fnmatch regex exec; do
   clang "${CF[@]}" "$DEMOS/posix_libc/$f.c" -o "$OUT/_px_$f.ll" || { echo "posix_libc/$f FAIL"; exit 14; }
 done
 # The reused waist (the Tcl set): the Postgres printf/scanf engines + the guest strtod.

@@ -92,11 +92,23 @@ oracle. What it took (each pinned):
 End-to-end pin: `fork_over_the_named_posix_cap_copies_the_heap` + five fork-era scripts in the
 capstone differential.
 
+## Slice 4 (exec rung DONE) — external commands: the #801 `/bin` from bash
+
+bash **execs**: `/bin/echo`, PATH lookup, exec'd pipelines (`seq 3 | sort | uniq | wc -l` — four
+exec'd programs), redirections to memfs files, and command substitution over exec'd stages all
+byte-match the oracle. The lane: `posix_libc/exec.c` (the #801 execve/execv/execvp, staged-pack
+argv over the args region + `CAP_SELF_EXEC` image-replace) links as guest code — its `__px_*`
+externs bridge in band 5, and `__vm_exec_module` joins the on-ramp's core-builtin lowerings
+(self-namespace op 14, mirroring chibicc). `stage_bin.sh` compiles the `posix_utils` coreutils
+(the chibicc world, unchanged) to `.svm` command modules; the harness grants each as a `Module`
+and registers it as a filesystem executable inside the posix grant (`c_posix.rs`'s
+`stage_executable` shape — `bash_probe` takes `BASH_PROBE_BIN=<dir>`). Gate: eight
+external-command scripts in the capstone differential (18 scripts total).
+
 ## What remains (the slice ladder from the #802 sketch)
 
-- **Slice 4 tail**: `exec` of the #801 `/bin` executables from bash (external commands — needs
-  the staged-exec image path from `posix_libc/exec.c` adapted to band 0), redirections to memfs
-  files, traps/signals under fork; then interactive on the #797 terminal.
+- **Slice 4 remainder**: traps/signals under fork (`trap`, `kill`, SIGINT delivery), `$?`-heavy
+  and here-doc scripts; then interactive on the #797 terminal.
 - Known band-0 papering (revisit when a differential trips over one): `fstat` synthesizes a
   chr-device for fds 0-2 and re-stats the recorded open path otherwise; `st_ino` is a path hash
   (same-file checks distinguish paths, not hardlinks); `sigsuspend` returns `EINTR` without

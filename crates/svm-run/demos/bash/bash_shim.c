@@ -949,3 +949,25 @@ unsigned long __isoc23_strtoumax(const char *s, char **end, int base) {
  * surface. Bridge the two vocabularies with trivial wrappers — the `cap` dummy is dropped. */
 long __px_malloc(int cap, long n) { (void)cap; return (long)malloc((unsigned long)n); }
 long __px_free(int cap, long p) { (void)cap; free((void *)p); return 0; }
+/* The `../posix_libc/exec.c` externs (#801 execve/execv/execvp, linked as guest code): forwards
+ * to the personality ops. Its `__vm_exec_module` is a core builtin the on-ramp lowers directly. */
+long __px_exec_resolve(int cap, long path, long len) {
+  (void)cap;
+  return px_call_(53, path, len, 0, 0); /* PX_EXEC_RESOLVE */
+}
+long __px_getenv(int cap, long name, long len) {
+  (void)cap;
+  return px_call_(11, name, len, 0, 0); /* PX_GETENV (the personality env, not main's envp) */
+}
+long __px_open(int cap, long path, long len, long flags) {
+  (void)cap;
+  return px_call_(PX_OPEN, path, len, flags, 0);
+}
+long __px_read(int cap, long fd, long buf, long len) {
+  (void)cap;
+  return px_call_(PX_READ, fd, buf, len, 0);
+}
+long __px_close(int cap, long fd) {
+  (void)cap;
+  return px_call_(PX_CLOSE, fd, 0, 0, 0);
+}
