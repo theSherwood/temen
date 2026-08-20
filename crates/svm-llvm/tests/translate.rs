@@ -12290,24 +12290,22 @@ int main(void) {
     let inst = svm_run::instantiate(t.module.clone()).expect("instantiate");
     // Interpreter tier only: the capability pipe path needs the `Real` scheduler (`CAP_SELF_PIPE`)
     // — the same tier boundary the chibicc-world pipe witnesses pin (`c_posix.rs` DUAL_WORLD).
-    for backend in [svm_run::Backend::TreeWalk] {
-        let run = inst
-            .run(backend, &svm_run::RunConfig::default())
-            .unwrap_or_else(|e| panic!("{backend:?}: core-pipe run failed: {e}"));
-        assert!(
-            matches!(
-                &run.outcome,
-                svm_run::Outcome::Returned(v) if v == &[svm_run::Value::I32(0)]
-            ),
-            "{backend:?}: main's return = the failing step (got {:?})",
-            run.outcome
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&run.stdout),
-            "piped:abc\n",
-            "{backend:?}: the bytes crossed the pipe"
-        );
-    }
+    let run = inst
+        .run(svm_run::Backend::TreeWalk, &svm_run::RunConfig::default())
+        .unwrap_or_else(|e| panic!("core-pipe run failed: {e}"));
+    assert!(
+        matches!(
+            &run.outcome,
+            svm_run::Outcome::Returned(v) if v == &[svm_run::Value::I32(0)]
+        ),
+        "main's return = the failing step (got {:?})",
+        run.outcome
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "piped:abc\n",
+        "the bytes crossed the pipe"
+    );
 }
 
 /// **`fork()` over the named posix capability** (#802 slice 4): the full lane a forking on-ramp
