@@ -12190,6 +12190,69 @@ entry:
     }
 }
 
+/// **Old-C INDIRECT call-site drift** (#802 slice 3 — the function-pointer twin of the direct-call
+/// rule above): bash's `typedef int Function ()` tables call cleanups through `(ptr, ...)` sites
+/// whose runtime target is a plain `void ()` / `void (ptr)` definition. The native ABI hides the
+/// drift; the strict typed `call_indirect` would trap `IndirectCallType`. The translator routes a
+/// varargs indirect site through a synthesized **static dispatcher**: each address-taken candidate
+/// gets a funcref-equality arm making the DIRECT call with the definition's own signature (args
+/// width-coerced, a missing result padded 0), and everything else — here the exact-typed second
+/// target — falls to the strict `call_indirect` unchanged.
+#[test]
+fn old_c_indirect_call_drift_dispatches_to_the_definition() {
+    let src = "\
+@g = global i64 0
+@p = global ptr @bump
+@q = global ptr @exact
+define void @bump() {
+entry:
+  store i64 41, ptr @g, align 8
+  ret void
+}
+define i32 @exact(ptr %a) {
+entry:
+  %v = load i64, ptr %a, align 8
+  %t = trunc i64 %v to i32
+  %r = add i32 %t, 1
+  ret i32 %r
+}
+define i64 @run() {
+entry:
+  %f = load ptr, ptr @p, align 8
+  %r0 = call i32 (ptr, ...) %f(ptr @g)
+  %f2 = load ptr, ptr @q, align 8
+  %r1 = call i32 (ptr, ...) %f2(ptr @g)
+  %a = add i32 %r0, %r1
+  %w = zext i32 %a to i64
+  ret i64 %w
+}
+";
+    let t = svm_llvm::translate_ll_str(src).expect("translate old-C indirect drift");
+    let run_idx = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == "run")
+        .expect("run exported")
+        .1;
+    let module = t.module;
+    svm_verify::verify_module(&module).expect("verify old-C indirect drift");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let interp = svm_interp::run(&module, run_idx, &full, &mut fuel).expect("interp run");
+    // `bump` (void ()) ran through the dispatcher arm (side effect: g = 41, result padded 0);
+    // `exact` (i32 (ptr)) took the strict default and returned 41 + 1.
+    assert_eq!(
+        interp,
+        vec![Value::I64(42)],
+        "dispatched drift call ran the definition; exact-typed target kept strict semantics"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&module, run_idx, &slots).expect("jit run") {
+        JitOutcome::Returned(s) => assert_eq!(s[0], 42, "JIT agrees (interp said {interp:?})"),
+        other => panic!("unexpected JIT outcome {other:?}"),
+    }
+}
+
 /// Path to `demos/bash`.
 fn bash_demo_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../svm-run/demos/bash")
@@ -12229,4 +12292,45 @@ fn demo_bash_translates_and_verifies() {
         t.module.funcs.len()
     );
     svm_verify::verify_module(&t.module).expect("bash verifies");
+
+    // ▶ Slice 3 — the RUN gate: `bash -c <script>` on the interpreter (setjmp/fork are interp-only
+    // tiers) with the svm-posix personality granted as the named "posix" capability (the shim's
+    // band 0 resolves it via `__vm_cap_resolve` and drives the op ABI through `__vm_host_call`).
+    // Byte-differential against the native oracle the script just built, under the same argv/env.
+    let oracle = std::env::temp_dir().join("svm_bash_cache/bash-5.2.21/bash");
+    let inst = svm_run::instantiate(t.module.clone()).expect("instantiate bash");
+    for script in [
+        "echo hi",
+        "x=world; echo \"hello $x\"",
+        "echo $((6*7))",
+        "for i in a b c; do echo $i; done",
+        "f() { echo fn-$1; }; f arg",
+    ] {
+        let config = svm_run::RunConfig {
+            args: vec![b"bash".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()],
+            env: vec![b"PATH=/bin".to_vec(), b"HOME=/".to_vec()],
+            ..Default::default()
+        };
+        let (cap, posix) = svm_run::posix::posix_cap(0, 0, Vec::new());
+        let run = inst
+            .run_with_caps(svm_run::Backend::TreeWalk, &config, &[("posix", cap)])
+            .unwrap_or_else(|e| panic!("bash -c {script:?} failed: {e}"));
+        let native = Command::new(&oracle)
+            .args(["-c", script])
+            .env_clear()
+            .env("PATH", "/bin")
+            .env("HOME", "/")
+            .output()
+            .expect("run the native oracle");
+        assert_eq!(
+            run.outcome,
+            svm_run::Outcome::Exited(native.status.code().unwrap_or(-1)),
+            "bash -c {script:?}: exit status differs from the oracle"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&posix.stdout()),
+            String::from_utf8_lossy(&native.stdout),
+            "bash -c {script:?}: stdout differs from the oracle"
+        );
+    }
 }

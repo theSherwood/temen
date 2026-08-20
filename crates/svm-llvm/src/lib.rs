@@ -841,7 +841,36 @@ fn translate_impl(
         eh_subtype_ids,
     };
 
-    // All non-stub function indices are now fixed (`next_helper` = `_start` + defined + helpers). Any
+    // §varargs / old-C **indirect** drift (#802): pre-scan for varargs indirect call sites (the
+    // `typedef int Function ()` pattern — a `(...)` call through a function pointer whose runtime
+    // target's real signature the site cannot know) and mint one static-dispatch function per
+    // distinct site shape, indexed after the helpers. Sites route through the dispatcher, which
+    // direct-calls each address-taken candidate with its definition's own signature and falls back
+    // to the strict `call_indirect` for everything else (see `synth_dispatcher`). Bodies are built
+    // after translation, once the address-taken set is complete.
+    let dispatch_shapes = collect_dispatch_shapes(m, &m.types);
+    let mut dispatch_map: HashMap<DispatchKey, u32> = HashMap::new();
+    let mut dispatch_plans: Vec<(DispatchKey, u32)> = Vec::new();
+    for key in dispatch_shapes {
+        let idx = take(true).expect("dispatcher index");
+        dispatch_map.insert(key.clone(), idx);
+        dispatch_plans.push((key, idx));
+    }
+    // The address-taken set the dispatcher arms draw from: funcrefs baked into global initializers
+    // (function-pointer tables in data) now, plus every `RefFunc` the per-function translation
+    // emits (recorded at the lowering itself).
+    let taken: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
+    if !dispatch_plans.is_empty() {
+        let mut t = taken.borrow_mut();
+        for g in &m.global_vars {
+            if let Some(init) = &g.initializer {
+                record_initializer_funcrefs(init.as_ref(), &name2idx, &mut t);
+            }
+        }
+    }
+
+    // All non-stub function indices are now fixed (`next_helper` = `_start` + defined + helpers +
+    // dispatchers). Any
     // trap stubs for undefined externals (opt-in) get appended *after* the helpers, so their indices
     // start here. `stubs` is threaded (as `Option<&RefCell<StubTable>>`) into every function's
     // translation; call sites that fall through to an unresolved external mint a stub on demand.
@@ -892,6 +921,8 @@ fn translate_impl(
             ba,
             &mut dbg,
             stubs.as_ref(),
+            &dispatch_map,
+            &taken,
         )
         // Name the function in the error — a bare "value N not available" is opaque in a
         // whole-program module of thousands of functions (the Postgres bring-up).
@@ -1153,6 +1184,28 @@ fn translate_impl(
     if need_snprintf {
         // Fail-closed trap for a non-constant-format snprintf (string.format) — takes no args → i32.
         funcs.push(synth_trap_stub(vec![], vec![ValType::I32]));
+    }
+    // §varargs / old-C indirect drift (#802): the static dispatchers, appended after the helpers at
+    // their pre-minted indices. Bodies are built HERE — after every function is translated — because
+    // only now is the address-taken set complete (initializer funcrefs + every emitted `RefFunc`).
+    // Named in the §6 waist so a dispatched trap backtrace is legible.
+    if !dispatch_plans.is_empty() {
+        let variadic_idx: HashSet<u32> = defined
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.is_var_arg)
+            .map(|(i, _)| base + i as u32)
+            .collect();
+        let t = taken.borrow();
+        for (k, (key, idx)) in dispatch_plans.iter().enumerate() {
+            debug_assert_eq!(funcs.len() as u32, *idx, "dispatcher index drift");
+            let arms = dispatch_arms(key, &t, &funcs, base, defined.len(), &variadic_idx);
+            funcs.push(synth_dispatcher(key, &arms));
+            dbg.func_names.push(FuncName {
+                func: *idx,
+                name: format!("__svm_indirect_dispatch{k}"),
+            });
+        }
     }
     // Opt-in trap stubs for undefined externals, appended last — after every helper — so each lands at
     // its assigned `stub_base + ordinal` index (see `StubTable`); at this point `funcs.len()` equals
@@ -2629,6 +2682,8 @@ fn translate_func(
     ba: Option<&blockaddr::BlockAddrs>,
     dbg: &mut DebugAcc,
     stubs: Option<&RefCell<StubTable>>,
+    dispatch_map: &HashMap<DispatchKey, u32>,
+    taken: &RefCell<HashSet<u32>>,
 ) -> Result<(Func, u64), Error> {
     // A `(...)`-defined function (`f.is_var_arg`) lowers like any other: its IR signature is
     // `(sp, fixed-params…)` — the variadic arguments are not IR parameters but are read by `va_start`
@@ -2737,6 +2792,8 @@ fn translate_func(
             dbg,
             &mut aux_blocks,
             stubs,
+            dispatch_map,
+            taken,
         )?);
     }
     blocks.extend(aux_blocks);
@@ -3202,6 +3259,414 @@ fn indirect_sig(c: &crate::ll::ast::Call, types: &Types) -> Result<svm_ir::FuncT
             Ok(svm_ir::FuncType { params, results })
         }
         other => unsup(format!("indirect call through non-function type {other}")),
+    }
+}
+
+/// §varargs / old-C **indirect** drift (#802) — the shape of one varargs indirect call site: the
+/// lowered types of ALL its arguments, the site type's fixed params (a prefix of `args` in count),
+/// and its results. One static dispatcher is synthesized per distinct shape; sites map to it by
+/// this key. Only int-class shapes qualify (see [`dispatch_key_for`]).
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct DispatchKey {
+    args: Vec<ValType>,
+    fixed: Vec<ValType>,
+    results: Vec<ValType>,
+}
+
+impl DispatchKey {
+    /// The §3c runtime type the site's `call_indirect` checks: `(sp, fixed…) -> results`.
+    fn site_type(&self) -> svm_ir::FuncType {
+        let mut params = vec![ValType::I64];
+        params.extend_from_slice(&self.fixed);
+        svm_ir::FuncType {
+            params,
+            results: self.results.clone(),
+        }
+    }
+}
+
+/// The dispatch key for a call instruction, or `None` when the site does not qualify: it must be
+/// **indirect** (no callee name) through a **varargs** function type — the old-C
+/// unspecified-params marker (`typedef int Function ()`; an ANSI-typed indirect site never carries
+/// `...`) — with int-class (`i32`/`i64`) arguments and at most one int-class result. Anything else
+/// keeps the strict lowering.
+fn dispatch_key_for(c: &crate::ll::ast::Call, types: &Types) -> Option<DispatchKey> {
+    if callee_name(c).is_some() {
+        return None;
+    }
+    let Type::FuncType {
+        result_type,
+        param_types,
+        is_var_arg: true,
+    } = c.function_ty.as_ref()
+    else {
+        return None;
+    };
+    let int_ok = |v: &ValType| matches!(v, ValType::I32 | ValType::I64);
+    let fixed: Vec<ValType> = param_types
+        .iter()
+        .map(|p| val_type(p.as_ref()).ok())
+        .collect::<Option<_>>()?;
+    let args: Vec<ValType> = c
+        .arguments
+        .iter()
+        .map(|(a, _)| val_type(a.get_type(types).as_ref()).ok())
+        .collect::<Option<_>>()?;
+    let results = result_types(result_type.as_ref(), types).ok()?;
+    if fixed.len() > args.len()
+        || results.len() > 1
+        || !fixed.iter().all(int_ok)
+        || !args.iter().all(int_ok)
+        || !results.iter().all(int_ok)
+    {
+        return None;
+    }
+    Some(DispatchKey {
+        args,
+        fixed,
+        results,
+    })
+}
+
+/// Pre-scan the module for qualifying varargs indirect call sites (see [`dispatch_key_for`]),
+/// returning the deduplicated site shapes in first-seen order. Empty for ANSI-typed programs —
+/// the whole feature costs nothing unless old-C `(...)` function-pointer calls exist.
+fn collect_dispatch_shapes(m: &LModule, types: &Types) -> Vec<DispatchKey> {
+    let mut seen: Vec<DispatchKey> = Vec::new();
+    for f in &m.functions {
+        for bb in &f.basic_blocks {
+            for instr in &bb.instrs {
+                let Instruction::Call(c) = instr else {
+                    continue;
+                };
+                if let Some(k) = dispatch_key_for(c, types) {
+                    if !seen.contains(&k) {
+                        seen.push(k);
+                    }
+                }
+            }
+        }
+    }
+    seen
+}
+
+/// Record every **function reference in a global initializer** (a funcref baked into the data
+/// image — bash's builtin/cleanup tables) into the address-taken set. Recursive over the constant
+/// aggregate/cast shapes an initializer can carry; the instruction-operand side is recorded at the
+/// `RefFunc` lowering itself.
+fn record_initializer_funcrefs(
+    c: &Constant,
+    name2idx: &HashMap<String, u32>,
+    taken: &mut HashSet<u32>,
+) {
+    match c {
+        Constant::GlobalReference { name, .. } => {
+            if let Some(&i) = name2idx.get(&name_str(name)) {
+                taken.insert(i);
+            }
+        }
+        Constant::Struct { values, .. } => {
+            for v in values {
+                record_initializer_funcrefs(v.as_ref(), name2idx, taken);
+            }
+        }
+        Constant::Array { elements, .. } | Constant::Vector(elements) => {
+            for v in elements {
+                record_initializer_funcrefs(v.as_ref(), name2idx, taken);
+            }
+        }
+        Constant::Trunc(u)
+        | Constant::ZExt(u)
+        | Constant::SExt(u)
+        | Constant::PtrToInt(u)
+        | Constant::IntToPtr(u)
+        | Constant::BitCast(u)
+        | Constant::AddrSpaceCast(u) => {
+            record_initializer_funcrefs(u.operand.as_ref(), name2idx, taken)
+        }
+        Constant::GetElementPtr(g) => {
+            record_initializer_funcrefs(g.address.as_ref(), name2idx, taken)
+        }
+        _ => {}
+    }
+}
+
+/// One dispatcher arm: an address-taken defined function the old-C ABI could reach from this site
+/// shape — its index, its C params (the lowered params *minus* the leading SP), and its results.
+struct DispatchArm {
+    func: u32,
+    params: Vec<ValType>,
+    results: Vec<ValType>,
+}
+
+/// Filter the recorded address-taken set down to this shape's arms: non-variadic **defined**
+/// functions with int-class params/results the site's argument list can feed (params a
+/// width-coercible prefix of the args). A function whose lowered type **equals** the site type is
+/// excluded — the strict `call_indirect` default already serves it. Sorted by index so the
+/// emitted module is deterministic.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_arms(
+    key: &DispatchKey,
+    taken: &HashSet<u32>,
+    funcs: &[Func],
+    base: u32,
+    ndefined: usize,
+    variadic_idx: &HashSet<u32>,
+) -> Vec<DispatchArm> {
+    let site = key.site_type();
+    let int_ok = |v: &ValType| matches!(v, ValType::I32 | ValType::I64);
+    let mut idxs: Vec<u32> = taken
+        .iter()
+        .copied()
+        .filter(|&t| t >= base && (t - base) < ndefined as u32)
+        .collect();
+    idxs.sort_unstable();
+    let mut arms = Vec::new();
+    for t in idxs {
+        if variadic_idx.contains(&t) {
+            continue;
+        }
+        let f = &funcs[t as usize];
+        if f.params.first() != Some(&ValType::I64) {
+            continue; // no leading SP — not a C-shaped function
+        }
+        let params = &f.params[1..];
+        if params.len() > key.args.len()
+            || !params.iter().all(int_ok)
+            || f.results.len() > 1
+            || !f.results.iter().all(&int_ok)
+        {
+            continue;
+        }
+        let full = svm_ir::FuncType {
+            params: f.params.clone(),
+            results: f.results.clone(),
+        };
+        if full == site {
+            continue; // exact type: the default `call_indirect` serves it unchanged
+        }
+        arms.push(DispatchArm {
+            func: t,
+            params: params.to_vec(),
+            results: f.results.clone(),
+        });
+    }
+    arms
+}
+
+/// Synthesize the **static dispatcher** for one site shape (#802 old-C indirect drift):
+/// `(sp, fref, args…) -> results`. A chain of funcref-equality tests routes each address-taken
+/// candidate to a **direct call with its own definition's signature** (args width-coerced, a
+/// missing result padded with 0, an extra result dropped) — the indirect twin of the `def_sigs`
+/// direct-call rule. The default arm is the strict varargs `call_indirect` (extras deposited into
+/// this frame's scratch, the va-area pointer at the callee's frame slot 0), so exact-typed and
+/// genuinely-variadic targets behave exactly as before and anything unknown still fail-closes
+/// with `IndirectCallType`. CFI is never widened: every arm is a direct call to a
+/// statically-named function.
+fn synth_dispatcher(key: &DispatchKey, arms: &[DispatchArm]) -> Func {
+    use svm_ir::StoreOp;
+    let n = key.args.len();
+    let nf = key.fixed.len();
+    let extras = n - nf;
+    // Frame: the va scratch for the default arm's deposit (8 bytes per extra), 16-aligned.
+    let frame = ((extras as u64 * 8).max(8) + 15) & !15;
+    let mut params = vec![ValType::I64, ValType::I64]; // sp, fref
+    params.extend_from_slice(&key.args);
+    let p = params.len() as u32; // first inst value index in every block (all blocks carry P params)
+    let all: Vec<u32> = (0..p).collect();
+    let na = arms.len() as u32;
+    // Blocks: tests 0..na (test k falls through to k+1), default at `na`, arm bodies at na+1+k.
+    let mut blocks: Vec<Block> = Vec::new();
+    for (k, arm) in arms.iter().enumerate() {
+        blocks.push(Block {
+            params: params.clone(),
+            insts: vec![
+                Inst::RefFunc { func: arm.func },
+                Inst::Convert {
+                    op: ConvOp::ExtendI32U,
+                    a: p,
+                },
+                Inst::IntCmp {
+                    ty: IntTy::I64,
+                    op: CmpOp::Eq,
+                    a: 1,
+                    b: p + 1,
+                },
+            ],
+            term: Terminator::BrIf {
+                cond: p + 2,
+                then_blk: na + 1 + k as u32,
+                then_args: all.clone(),
+                else_blk: k as u32 + 1,
+                else_args: all.clone(),
+            },
+        });
+    }
+    // Default: the strict varargs `call_indirect` — deposit extras at own scratch (sp+0…), store
+    // the area pointer at the target's frame slot 0, coerce the fixed args to the site type.
+    {
+        let mut insts: Vec<Inst> = Vec::new();
+        let mut v = p;
+        for e in 0..extras {
+            let av = 2 + nf as u32 + e as u32;
+            let op = match key.args[nf + e] {
+                ValType::I32 => StoreOp::I32,
+                _ => StoreOp::I64,
+            };
+            insts.push(Inst::Store {
+                op,
+                addr: 0,
+                value: av,
+                offset: e as u64 * 8,
+                align: 0,
+            });
+        }
+        insts.push(Inst::ConstI64(frame as i64));
+        let framev = v;
+        v += 1;
+        insts.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::Add,
+            a: 0,
+            b: framev,
+        });
+        let tcs = v;
+        v += 1;
+        insts.push(Inst::Store {
+            op: StoreOp::I64,
+            addr: tcs,
+            value: 0,
+            offset: 0,
+            align: 0,
+        });
+        insts.push(Inst::Convert {
+            op: ConvOp::WrapI64,
+            a: 1,
+        });
+        let idx32 = v;
+        v += 1;
+        let mut cargs = vec![tcs];
+        for (j, want) in key.fixed.iter().enumerate() {
+            let av = 2 + j as u32;
+            match (key.args[j], want) {
+                (ValType::I32, ValType::I64) => {
+                    insts.push(Inst::Convert {
+                        op: ConvOp::ExtendI32U,
+                        a: av,
+                    });
+                    cargs.push(v);
+                    v += 1;
+                }
+                (ValType::I64, ValType::I32) => {
+                    insts.push(Inst::Convert {
+                        op: ConvOp::WrapI64,
+                        a: av,
+                    });
+                    cargs.push(v);
+                    v += 1;
+                }
+                _ => cargs.push(av),
+            }
+        }
+        insts.push(Inst::CallIndirect {
+            ty: key.site_type(),
+            idx: idx32,
+            args: cargs,
+        });
+        let ret = if key.results.is_empty() {
+            vec![]
+        } else {
+            vec![v]
+        };
+        blocks.push(Block {
+            params: params.clone(),
+            insts,
+            term: Terminator::Return(ret),
+        });
+    }
+    // Arm bodies: the direct call with the definition's own signature.
+    for arm in arms {
+        let mut insts: Vec<Inst> = Vec::new();
+        let mut v = p;
+        insts.push(Inst::ConstI64(frame as i64));
+        let framev = v;
+        v += 1;
+        insts.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::Add,
+            a: 0,
+            b: framev,
+        });
+        let csp = v;
+        v += 1;
+        let mut cargs = vec![csp];
+        for (j, want) in arm.params.iter().enumerate() {
+            let av = 2 + j as u32;
+            match (key.args[j], want) {
+                (ValType::I32, ValType::I64) => {
+                    insts.push(Inst::Convert {
+                        op: ConvOp::ExtendI32U,
+                        a: av,
+                    });
+                    cargs.push(v);
+                    v += 1;
+                }
+                (ValType::I64, ValType::I32) => {
+                    insts.push(Inst::Convert {
+                        op: ConvOp::WrapI64,
+                        a: av,
+                    });
+                    cargs.push(v);
+                    v += 1;
+                }
+                _ => cargs.push(av),
+            }
+        }
+        insts.push(Inst::Call {
+            func: arm.func,
+            args: cargs,
+        });
+        let callv = v;
+        if !arm.results.is_empty() {
+            v += 1;
+        }
+        let ret = match (key.results.first(), arm.results.first()) {
+            (None, _) => vec![],
+            (Some(want), Some(have)) if want == have => vec![callv],
+            (Some(ValType::I64), Some(ValType::I32)) => {
+                insts.push(Inst::Convert {
+                    op: ConvOp::ExtendI32U,
+                    a: callv,
+                });
+                vec![v]
+            }
+            (Some(ValType::I32), Some(ValType::I64)) => {
+                insts.push(Inst::Convert {
+                    op: ConvOp::WrapI64,
+                    a: callv,
+                });
+                vec![v]
+            }
+            (Some(ValType::I32), None) => {
+                insts.push(Inst::ConstI32(0));
+                vec![v]
+            }
+            (Some(ValType::I64), None) => {
+                insts.push(Inst::ConstI64(0));
+                vec![v]
+            }
+            _ => vec![callv], // unreachable by the int-only arm filter
+        };
+        blocks.push(Block {
+            params: params.clone(),
+            insts,
+            term: Terminator::Return(ret),
+        });
+    }
+    Func {
+        params,
+        results: key.results.clone(),
+        blocks,
     }
 }
 
@@ -15556,6 +16021,12 @@ struct BlockCtx<'a> {
     /// `None` in the strict default. A direct call that resolves to no defined function / helper /
     /// capability mints (or reuses) a stub index here instead of failing translation.
     stubs: Option<&'a RefCell<StubTable>>,
+    /// §varargs / old-C indirect drift (#802): site shape → the pre-minted static dispatcher's
+    /// function index. Empty when the module has no qualifying varargs indirect sites.
+    dispatch_map: &'a HashMap<DispatchKey, u32>,
+    /// The address-taken function set the dispatcher arms draw from — every `RefFunc` this
+    /// translation emits is recorded here (the data-image side comes from the initializer walk).
+    taken: &'a RefCell<HashSet<u32>>,
     insts: Vec<Inst>,
     idx_of: HashMap<ValueId, ValIdx>,
     /// Aggregate SSA values (a small by-value struct), tracked field-wise: value-id → its scalar
@@ -16303,6 +16774,9 @@ impl<'a> BlockCtx<'a> {
                     if let Some(&a) = self.globals.get(&n) {
                         Ok(self.push(Inst::ConstI64(a as i64)))
                     } else if let Some(func) = self.name2idx.get(&n).copied().or(stub_idx) {
+                        // #802 old-C indirect drift: an operand-position funcref is address-taken —
+                        // record it so the static dispatchers' arm sets are complete.
+                        self.taken.borrow_mut().insert(func);
                         let r = self.push(Inst::RefFunc { func });
                         Ok(self.push(Inst::Convert {
                             op: ConvOp::ExtendI32U,
@@ -16448,6 +16922,8 @@ fn translate_block(
     dbg: &mut DebugAcc,
     aux_blocks: &mut Vec<Block>,
     stubs: Option<&RefCell<StubTable>>,
+    dispatch_map: &HashMap<DispatchKey, u32>,
+    taken: &RefCell<HashSet<u32>>,
 ) -> Result<Block, Error> {
     let param_ids = &block_params[bi];
     // Materialize the block parameters. A scalar value (incl. the data-SP, which types as `i64`) is
@@ -16498,6 +16974,8 @@ fn translate_block(
         func_idx: bc_func_idx,
         blockaddrs: ba,
         stubs,
+        dispatch_map,
+        taken,
         insts: Vec::new(),
         idx_of: HashMap::new(),
         agg: HashMap::new(),
@@ -17874,27 +18352,40 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // va-area is deposited at all, and the widths the fixed args coerce to (the native ABI
         // hides all three). An arity violation the ABI cannot paper over fails closed.
         let def_sig = callee_name(c).and_then(|n| ctx.def_sigs.get(&n).cloned());
-        let (fixed, coerce_to): (Option<usize>, Option<Vec<ValType>>) = match def_sig {
-            Some((params, true)) => {
-                if params.len() > c.arguments.len() {
-                    return unsup("call passes fewer args than the definition's fixed params");
+        // §varargs / old-C **indirect** drift (#802): a `(...)` call through a function POINTER can
+        // name a non-variadic definition whose type the site cannot know (bash's `typedef int
+        // Function ()` cleanup tables: `(*cleanup)(arg)` against `void pop_stream(void)`). The
+        // native ABI papers over the drift; the typed `call_indirect` would fail-closed
+        // (`IndirectCallType`). Route such a site through the module's pre-minted static dispatcher
+        // for its shape — the indirect twin of the `def_sigs` direct-call rule (see
+        // `synth_dispatcher`): the deposit is skipped here because the dispatcher owns ALL
+        // marshaling (its default arm reproduces the strict varargs `call_indirect` exactly).
+        let dispatcher = dispatch_key_for(c, types).and_then(|k| ctx.dispatch_map.get(&k).copied());
+        let (fixed, coerce_to): (Option<usize>, Option<Vec<ValType>>) = if dispatcher.is_some() {
+            (None, None)
+        } else {
+            match def_sig {
+                Some((params, true)) => {
+                    if params.len() > c.arguments.len() {
+                        return unsup("call passes fewer args than the definition's fixed params");
+                    }
+                    (Some(params.len()), Some(params))
                 }
-                (Some(params.len()), Some(params))
-            }
-            Some((params, false)) => {
-                if params.len() != c.arguments.len() {
-                    return unsup("call arity differs from a non-variadic definition");
+                Some((params, false)) => {
+                    if params.len() != c.arguments.len() {
+                        return unsup("call arity differs from a non-variadic definition");
+                    }
+                    (None, Some(params))
                 }
-                (None, Some(params))
+                None => match c.function_ty.as_ref() {
+                    Type::FuncType {
+                        param_types,
+                        is_var_arg: true,
+                        ..
+                    } => (Some(param_types.len()), None),
+                    _ => (None, None),
+                },
             }
-            None => match c.function_ty.as_ref() {
-                Type::FuncType {
-                    param_types,
-                    is_var_arg: true,
-                    ..
-                } => (Some(param_types.len()), None),
-                _ => (None, None),
-            },
         };
         if let Some(fixed) = fixed {
             let scratch_off = *ctx.frame.get(&VARARG_SCRATCH).ok_or_else(|| {
@@ -17970,12 +18461,23 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                     .right()
                     .ok_or_else(|| Error::Unsupported("inline-asm call".into()))?;
                 let fref64 = ctx.operand(op)?; // the function pointer (i64)
-                let idx = ctx.push(Inst::Convert {
-                    op: ConvOp::WrapI64,
-                    a: fref64,
-                }); // → i32 funcref index
-                let ty = indirect_sig(c, types)?;
-                Inst::CallIndirect { ty, idx, args }
+                match dispatcher {
+                    // #802 old-C indirect drift: a dispatched site calls the static dispatcher
+                    // directly — `(sp, fref, raw args…)`; it owns the coercions, the va deposit
+                    // (default arm), and the strict `call_indirect` fallback.
+                    Some(d) => {
+                        args.insert(1, fref64);
+                        Inst::Call { func: d, args }
+                    }
+                    None => {
+                        let idx = ctx.push(Inst::Convert {
+                            op: ConvOp::WrapI64,
+                            a: fref64,
+                        }); // → i32 funcref index
+                        let ty = indirect_sig(c, types)?;
+                        Inst::CallIndirect { ty, idx, args }
+                    }
+                }
             }
         };
         // A tail-position call (`tail`/`musttail`, the block's `ret` returns exactly this result)

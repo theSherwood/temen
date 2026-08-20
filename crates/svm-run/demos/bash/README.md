@@ -11,8 +11,8 @@ controlling terminal #797, `longjmp`-from-a-handler #802-slice-1).
 config → **native oracle build** (also generates y.tab.c and the `.def`-built builtins) → per-TU
 bitcode with each Makefile's own flags (152 TUs: the link-line objects + libbuiltins/libglob/
 libsh/libhistory(hist* only — the rest are readline standalone shims that duplicate bash's own)/
-libtilde) → `llvm-link` + `bash_shim.c` + the reused waist → **translate: 1716 funcs (~0.7 s),
-verify: clean**. Gate: `demo_bash_translates_and_verifies` (svm-llvm `translate.rs`, `#[ignore]`d
+libtilde) → `llvm-link` + `bash_shim.c` + the reused waist → **translate (~0.8 s), verify:
+clean**. Gate: `demo_bash_translates_and_verifies` (svm-llvm `translate.rs`, `#[ignore]`d
 for wall-clock).
 
 The bring-up config (`configure` flags, each with a reason in the script): `--without-bash-malloc`
@@ -20,6 +20,18 @@ The bring-up config (`configure` flags, each with a reason in the script): `--wi
 #797 terminal in slice 4), `--disable-nls`, `--disable-net-redirections` (no sockets), and
 `ac_cv_type_long_double=no` (the printf builtin's `%Lf` would need x86_fp80 — denying the type
 keeps `floatmax_t = double` in guest AND oracle). **Job control stays on.**
+
+## Slice 3 (DONE) — first run: `bash -c` differential vs the oracle
+
+The OS lane: the embedder grants the svm-posix personality as the **named "posix" capability**
+(`svm_run::posix::posix_cap` + `run_with_caps` — the `posix_cap.rs` idiom); the shim's **band 0**
+resolves it once (`__vm_cap_resolve("posix")`) and defines the real libc entry points
+(open/read/write/stat/dirs/signals/termios/process ops) over `__vm_host_call` op dispatch,
+marshaling C conventions (NUL strings, glibc struct layouts) to the op ABI. No translator lane was
+added — this is the same named-cap route `posix_cap.rs`/`fs_cap.rs` already prove. bash runs the
+**interpreter** (setjmp/fork are interp-only tiers). Gate: the run half of
+`demo_bash_translates_and_verifies` — five `bash -c` scripts (echo/vars/arithmetic/for/functions),
+stdout + exit byte-compared against the native oracle under identical argv/env.
 
 ## The gap-walk (the Tcl discipline: every gap gets a pinned unit test)
 
@@ -32,15 +44,37 @@ keeps `floatmax_t = double` in guest AND oracle). **Job control stays on.**
    the drift; the lowering now follows the **definition** for direct calls — arity split,
    va-area deposit only for a genuinely variadic callee, and integer args coerced to the
    definition's widths. Pin: `old_c_call_site_drift_follows_the_definition`.
+3. **Old-C INDIRECT call-site drift** — the function-pointer twin: `typedef int Function ()`
+   tables call cleanups through `(ptr, ...)` sites whose runtime target is a plain `void ()`
+   (`add_unwind_protect(pop_stream, NULL)` → `(*cleanup)(arg)`). The strict typed `call_indirect`
+   trapped `IndirectCallType` (a pinned security contract — never loosened). The translator now
+   routes a **varargs indirect site** (the old-C unspecified-params marker; ANSI code never has
+   one) through a synthesized **static dispatcher**: a funcref-equality chain direct-calls each
+   address-taken candidate with its definition's own signature (args width-coerced, missing result
+   padded 0), and everything else — exact-typed targets, real variadic targets, unknown funcrefs —
+   falls to the strict `call_indirect` unchanged. CFI is never widened (every arm is a direct call
+   to a statically-named function). Pin: `old_c_indirect_call_drift_dispatches_to_the_definition`.
+
+Shim-side stub walk to first run: `qsort` (the tcl_shim heapsort — the on-ramp does not
+synthesize it), `strerror` (glibc-matching strings — bash prints them in error messages the
+differential compares), `strnlen`/`strdup`/`strncpy`/`strcat`/`strstr`/`strcasestr`/`strchrnul`,
+`imaxdiv`, and the wide-char band (`mbsrtowcs`/`wcs*`/`isw*`/`towlower`/`wctype` — ASCII,
+MB_CUR_MAX = 1).
 
 ## What remains (the slice ladder from the #802 sketch)
 
-- **Slice 3 — first run**: wire the stdio `FILE*` surface (a trial run already reaches deep into
-  `shell.c` startup and stops at `xtrace_set: NULL file pointer` — stderr is a real `FILE*` in
-  bash) + the OS shim over the svm-posix ops; `bash -c 'echo hi'` byte-differential vs the
-  oracle. `bash_shim.c` grows from the stub report, the same walk every capstone did.
-- **Slice 4 — the differential suite**: pipelines over the #801 `/bin`, subshells, redirections,
-  traps; then interactive on the #797 terminal.
+- **Slice 4 — the differential suite**: fork/exec/pipes — command substitution today PARKS forever
+  (the fork op fires but the child's pipe plumbing needs the core-pipe builtins:
+  `__vm_pipe`/`__vm_read`/`__vm_write`/`__vm_close` are chibicc-world recognizers the on-ramp
+  doesn't lower yet, so the #972 tag protocol can't complete — band 0 returns a clean `EIO` on a
+  tag until then). Then pipelines over the #801 `/bin`, subshells, redirections, traps; then
+  interactive on the #797 terminal (also the `set_signal_source` wiring — `posix_cap`'s grant
+  installs no async-signal door yet, so delivery is poll-only on this lane).
+- Known band-0 papering (revisit when a differential trips over one): `fstat` synthesizes a
+  chr-device for fds 0-2 and re-stats the recorded open path otherwise; `st_ino` is a path hash
+  (same-file checks distinguish paths, not hardlinks); `sigsuspend` returns `EINTR` without
+  suspending; readline/progcomp externs stay trap stubs (`--disable-readline`; the `complete`
+  builtin would hit them).
 
 | File | Role |
 |---|---|
