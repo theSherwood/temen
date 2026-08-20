@@ -741,7 +741,7 @@ impl Parser {
         while self.peek() == Some(&Token::Comma) {
             self.pos += 1; // `,`
             if self.eat_word("align") {
-                alignment = self.int_lit_u32()?;
+                alignment = self.int_lit_align()?;
             } else if matches!(self.peek(), Some(Token::Meta(_))) {
                 // `!kind !N` metadata — capture the `!dbg` `DIGlobalVariableExpression` id (§6 globals).
                 let is_dbg = matches!(self.peek(), Some(Token::Meta(k)) if k == "dbg");
@@ -2301,7 +2301,7 @@ impl Parser {
             }
             self.pos += 1; // `,`
             if self.eat_word("align") {
-                alignment = self.int_lit_u32()?;
+                alignment = self.int_lit_align()?;
             } else if self.eat_word("addrspace") {
                 self.skip_balanced_parens();
             } else {
@@ -2413,13 +2413,27 @@ impl Parser {
             && matches!(self.peek2(), Some(Token::Word(w)) if w == "align")
         {
             self.pos += 2; // `,` `align`
-            self.int_lit_u32()
+            self.int_lit_align()
         } else {
             Ok(0)
         }
     }
 
-    /// Consume an integer literal as a `u32` (alignments, small counts).
+    /// Consume an **alignment** literal. LLVM permits alignments up to 2^32 — one past `u32` —
+    /// and clang stamps the maximum (`align 4294967296`) on deliberately-trapping null stores
+    /// (bash's `programming_error` path surfaced it). The alignment of an access that can only
+    /// trap carries no meaning here, so saturate rather than refuse the whole module.
+    fn int_lit_align(&mut self) -> PResult<u32> {
+        match self.bump() {
+            Some(Token::Int(s)) => s
+                .parse::<u64>()
+                .map(|v| v.min(u32::MAX as u64) as u32)
+                .map_err(|_| ParseError::new(self.pos, format!("bad integer `{s}`"))),
+            other => self.err(format!("expected an integer, found {other:?}")),
+        }
+    }
+
+    /// Consume an integer literal as a `u32` (small counts).
     fn int_lit_u32(&mut self) -> PResult<u32> {
         match self.bump() {
             Some(Token::Int(s)) => s

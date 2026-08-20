@@ -1873,6 +1873,40 @@ pub fn cap_fork_factory(posix: &Posix) -> HostProcFork {
     fork_factory(Arc::clone(&posix.world), Arc::clone(&posix.root))
 }
 
+/// The interp-facing **async-signal door** (+ its shared `armed` flag) over an existing
+/// personality's root process — what [`grant`] installs via `Host::set_signal_source` on the
+/// name-binding path, exposed so the powerbox path (`HostCap` — svm-run's `posix_cap`) can wire
+/// the same thing. Without it the lane has no async delivery AND no **caller-request door**
+/// (#799: `set_park_request` rides the signal source), so `fork` (op 51) returns `-ENOSYS` —
+/// bash's fork-retry loop then spins forever (#802 slice 4 found it exactly this way).
+pub fn cap_signal_source(
+    posix: &Posix,
+) -> (
+    Arc<dyn SignalSource + Send + Sync>,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
+    let armed = posix
+        .root
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .sig_armed
+        .clone();
+    (Arc::new(SignalDoor(Arc::clone(&posix.root))), armed)
+}
+
+/// The #972 **exec-remap hook** over an existing personality's root process (see
+/// [`exec_remap_hook`]) — the powerbox-path counterpart of the install [`grant`] does.
+pub fn cap_exec_remap_hook(posix: &Posix) -> svm_interp::ExecRemapHook {
+    exec_remap_hook(Arc::clone(&posix.root))
+}
+
+/// The #801 op **vtable** (names + signatures, op-ordered) — what [`grant`] publishes via
+/// `Host::set_host_proc_vtable` so an exec'd image's `__px_*` manifest binds through the §3.5
+/// coverage walk. Exposed for the powerbox path.
+pub fn cap_vtable() -> (Vec<String>, Vec<svm_ir::FuncType>) {
+    px_vtable()
+}
+
 /// The **`net` capability** as a factory over an existing personality (POSIX.md §5a) — the same
 /// shape as [`cap`], granted under its **own name** (e.g. `"net"`). Each call produces a `HostProc`
 /// over the *same* shared state, so the socket fds it mints live in the same fd table the libc
@@ -1994,6 +2028,27 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
                 p: &mut p,
                 wake_after: Vec::new(),
             };
+            if std::env::var_os("SVM_PX_TRACE").is_some() {
+                if op == OP_WRITE {
+                    let txt = mem
+                        .as_ref()
+                        .and_then(|m| {
+                            m.read_bytes(
+                                args.get(1).copied().unwrap_or(0) as u64,
+                                args.get(2).copied().unwrap_or(0).max(0) as u64,
+                            )
+                        })
+                        .map(|b| String::from_utf8_lossy(&b).into_owned())
+                        .unwrap_or_default();
+                    eprintln!(
+                        "[px] op=0 fd={} {:?}",
+                        args.first().copied().unwrap_or(-1),
+                        txt
+                    );
+                } else {
+                    eprintln!("[px] op={op} args={args:?}");
+                }
+            }
             let res = match op {
                 OP_WRITE => st.write(args, mem),
                 OP_READ => st.read(args, mem),
@@ -3048,16 +3103,49 @@ impl Ctx<'_> {
             // `-ECHILD` below then doubles as the placeholder (parking routes discard it)
             // AND the degraded poll answer (non-parking routes/tiers keep the historical
             // spin — same results, decline-never-diverge).
-            if (opts & (WNOHANG | WUNTRACED | WCONTINUED)) == 0 && pid > 0 {
+            if (opts & (WNOHANG | WUNTRACED | WCONTINUED)) == 0 {
                 if let Some(req) = self.p.park_req.clone() {
-                    let target_is_core_twin = match self.w.procs.get(&(pid as i32)) {
-                        Some(ProcEntry::Live(t)) => {
-                            t.lock().unwrap_or_else(|e| e.into_inner()).core_task
+                    let target: Option<u64> = if pid > 0 {
+                        match self.w.procs.get(&(pid as i32)) {
+                            Some(ProcEntry::Live(t)) => t
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .core_task
+                                .then_some(pid as u64),
+                            _ => None,
                         }
-                        _ => false,
+                    } else if pid == -1 {
+                        // #802 slice 4 — the **any-child** blocking wait (`waitpid(-1, …, 0)`,
+                        // bash's no-job-control `waitchld`: its subshell/command-substitution/
+                        // foreground-pipeline waits all ride this): bench on the LOWEST live
+                        // core-twin child. The caller-request door carries one park key, so
+                        // this is an approximation of "any child" — correct for foreground
+                        // waits, where the caller loops reaping until ALL its children are
+                        // gone (a wake on any one of them re-runs the loop, and every
+                        // foreground stage exits). A never-exiting BACKGROUND child could
+                        // absorb the bench while a foreground sibling's exit goes unnoticed —
+                        // background jobs ride the `WNOHANG`/job-control paths today, and the
+                        // true any-child park key is a later rung. Before this, `-ECHILD`
+                        // came back immediately and bash raced past its unfinished subshell.
+                        let self_pid = self.p.pid;
+                        let mut lowest: Option<u64> = None;
+                        for (&tpid, e) in self.w.procs.iter() {
+                            let ProcEntry::Live(t) = e else { continue };
+                            if tpid == self_pid {
+                                continue;
+                            }
+                            let tp = t.lock().unwrap_or_else(|e| e.into_inner());
+                            if !tp.core_task || tp.ppid != self_pid {
+                                continue;
+                            }
+                            lowest = Some(lowest.map_or(tpid as u64, |l| l.min(tpid as u64)));
+                        }
+                        lowest
+                    } else {
+                        None
                     };
-                    if target_is_core_twin {
-                        req(svm_interp::ParkEvent::TaskExit(pid as u64));
+                    if let Some(t) = target {
+                        req(svm_interp::ParkEvent::TaskExit(t));
                     }
                 }
             }
