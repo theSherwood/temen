@@ -143,16 +143,16 @@ Roughly where things stand:
   and Cranelift-compiles it into the guest's own domain).
 - Tooling: durable domains (freeze/thaw + snapshot codec), a DAP debug server,
   memory-access hooks, a partial evaluator, and a wasm64 browser build of the
-  interpreter.
+  interpreter hosting a live playground (Doom, Lua, Postgres, SQLite, QuickJS,
+  Tcl, and more, in the browser).
 - **Continuous fuzzing** of the security-critical invariants (see [Fuzzing](#fuzzing)).
 
 **Still ahead**
 - Narrow-scalar promotion, honoring weak memory orderings (both backends are seq-cst
   today), wider SIMD (`v256`/`v512`), isolation tiers, Spectre hardening, source-level
   DWARF for JIT code, and broader LLVM/wasm frontend coverage.
-- The big bring-ups in flight: **shareware Doom** in the browser playground, **GNU
-  bash** on the POSIX personality, **single-user Postgres**, and QuickJS through
-  test262 (see the READMEs under [`demos/`](crates/svm-run/demos)).
+- The bring-ups in flight: **GNU bash** on the POSIX personality, and QuickJS
+  through full test262 (see the READMEs under [`demos/`](crates/svm-run/demos)).
 - The security-certification workstream: today's bar is "appears to work," not
   "certified secure" (see `DESIGN.md` §2a/§18).
 
@@ -222,10 +222,13 @@ behind getting Clay, jsmn, and friends to run.
 The heavyweights run through the **LLVM on-ramp** (`svm-llvm`): the **unmodified
 SQLite amalgamation** — in-memory and disk-backed via the Fs capability — plus
 **LMDB** and a **QuickJS** embedding all run sandboxed, byte-identical to the same
-sources built natively (full test262 for QuickJS is still in progress). Bigger bring-ups —
-shareware **Doom**, GNU **bash** on the POSIX personality, single-user **Postgres**
-— are in flight at various stages; each demo directory's README states honestly
-where it stands.
+sources built natively (full test262 for QuickJS is still in progress). And the
+**browser playground** (`browser/`) runs real programs live, client-side:
+**shareware Doom** (playable — arrow keys, Ctrl fires), **Lua 5.4.7**, **single-user
+PostgreSQL 17.5**, SQLite, QuickJS, **Tcl 8.6**, chibicc compiling its own source,
+a Nim toolchain, and a shell over the POSIX personality. The big bring-up still in
+flight is GNU **bash**; each demo directory's README states honestly where it
+stands.
 
 Embedders can call the same path directly — `svm_run::run_powerbox(&module, stdin)`
 returns the outcome plus captured output. It's the one reusable piece of host glue
