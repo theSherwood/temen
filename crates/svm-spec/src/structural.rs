@@ -257,7 +257,7 @@ pub fn struct_rows() -> Vec<StructRow> {
         false,
     ));
     // `cap.self.count`/`get`/`resolve`/`label`/`attest` are no longer distinct wire ops (opcodes
-    // 0x7A/0x7B/0x7E/0x7F/0xBE are retired gaps) — they encode as `cap.call CAP_SELF op N`, pinned by
+    // 0x7F/0xBE are retired gaps) — they encode as `cap.call CAP_SELF op N`, pinned by
     // the `cap.call` row above.
     // The pre-resolution import form: no valid module contains it (verifier rejects an
     // unresolved import), so `verifies: false` — round-trip + byte pin only.
@@ -283,7 +283,7 @@ pub fn struct_rows() -> Vec<StructRow> {
     // design (a surviving `call.sym` is an unresolved symbol) — round-trip + byte pin only.
     rows.push(StructRow {
         id: "call_sym".into(),
-        encoding: Enc::Byte(0x0E),
+        encoding: Enc::Byte(0x7B),
         verifies: false,
         is_term: false,
         module: inst_module(
@@ -338,7 +338,7 @@ pub fn struct_rows() -> Vec<StructRow> {
     // only; the manifest-bearing accept/reject legs are `spec_verify` directed cases.
     rows.push(StructRow {
         id: "import_attach".into(),
-        encoding: Enc::Byte(0x63),
+        encoding: Enc::Byte(0x7E),
         verifies: false,
         is_term: false,
         module: inst_module(

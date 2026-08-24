@@ -101,36 +101,35 @@ mod op {
     pub const EXTEND_I32_S: u8 = 0x60;
     pub const EXTEND_I32_U: u8 = 0x61;
     pub const WRAP_I64: u8 = 0x62;
-    pub const IMPORT_ATTACH: u8 = 0x63; // v4: import idx, handle operand idx -> i32 status
+    // 0x63 (was IMPORT_ATTACH): consolidated into the call/cap band at 0x7E in the wire rev
+    // (#900). Left as a gap — not reused.
 
     pub const SELECT: u8 = 0x70;
+
+    // Consolidated call/cap/import/reflection band (0x73..=0x7E), wire rev (#900) stage 5.
+    // The scattered call/cap/import single-ops (formerly at 0x0A..=0x0E and 0x63) were pulled
+    // into this one coherent family, reusing the opcode gaps the earlier cuts freed.
     pub const CALL: u8 = 0x73; // direct call: uleb funcidx, then arg idx-list
     pub const CALL_INDIRECT: u8 = 0x74; // sig (params,results), idx, arg idx-list
     pub const REF_FUNC: u8 = 0x75; // uleb funcidx -> i32 funcref
-                                   // 0x76 (was PTR_FROM_INT), 0x77 (was PTR_TO_INT), 0x78 (was PTR_ADD): retired in the
-                                   // wire rev (#900). Left as gaps — not renumbered, not reused.
+    pub const CALL_IMPORT_DYN: u8 = 0x76; // v7 §3.5: type idx, op, sig, handle operand, arg idx-list
+    pub const EXPORT_HANDLE: u8 = 0x77; // v7 §3.5: impl-export idx -> i32 handle
+    pub const CAP_SELF_TYPE_ID: u8 = 0x78; // v7 §3.5: type idx -> i32 runtime type_id
     pub const CAP_CALL: u8 = 0x79; // type_id, op, sig, handle, arg idx-list
-                                   // 0x7A (was CAP_SELF_COUNT), 0x7B (was CAP_SELF_GET): retired in the
-                                   // wire rev (#900) — the `cap.self.*` reflection ops are now
-                                   // `cap.call CAP_SELF op N`. Left as gaps — not renumbered, not reused.
+    pub const CAP_SELF_COVERS: u8 = 0x7A; // v7 §3.5: handle operand, type idx -> i32 covers
+    pub const CALL_SYM: u8 = 0x7B; // v8 §7/§22 link-form symbolic call: import idx, sig, handle, arg idx-list
     pub const CALL_IMPORT: u8 = 0x7C; // manifest capability call (v8): import idx, op, sig, arg idx-list
-                                      // v7 §3.5 opcodes live in the low band (0x0A..=0x0D): every 0x1X..0xFX slot above is
-                                      // either assigned or inside a computed range (CAST/FTOI/ITOF/LOAD families, SIMD prefix).
-    pub const CALL_IMPORT_DYN: u8 = 0x0A; // v7 §3.5: type idx, op, sig, handle operand, arg idx-list
-    pub const EXPORT_HANDLE: u8 = 0x0B; // v7 §3.5: impl-export idx -> i32 handle
-    pub const CAP_SELF_TYPE_ID: u8 = 0x0C; // v7 §3.5: type idx -> i32 runtime type_id
-    pub const CAP_SELF_COVERS: u8 = 0x0D; // v7 §3.5: handle operand, type idx -> i32 covers
-    pub const CALL_SYM: u8 = 0x0E; // v8 §7/§22 link-form symbolic call: import idx, sig, handle, arg idx-list
+    pub const FMA: u8 = 0x7D; // scalar fused multiply-add: ty byte (0=f32,1=f64), a, b, c
+    pub const IMPORT_ATTACH: u8 = 0x7E; // v4: import idx, handle operand idx -> i32 status
+                                        // 0x7F (was CAP_SELF_LABEL), 0xBE (was CAP_SELF_ATTEST): retired in the wire rev
+                                        // (#900) — the `cap.self.*` reflection ops are now `cap.call CAP_SELF op N`. Left as
+                                        // gaps — not renumbered, not reused.
 
     // v9 link-form data addresses (D-LINK), decodable **only in the object dialect** (header
     // flag bit 0): a runnable module never carries them — `link` rewrites each to `ConstI64`.
     pub const DATA_SELF: u8 = 0x07; // uleb offset -> i64 (own-data address)
     pub const DATA_SYM: u8 = 0x08; // length-prefixed name bytes, sleb addend -> i64 (cross-unit)
     pub const DATA_TOP: u8 = 0x09; // (no payload) -> i64 (post-link top-of-data)
-    pub const FMA: u8 = 0x7D; // scalar fused multiply-add: ty byte (0=f32,1=f64), a, b, c
-                              // 0x7E (was CAP_SELF_RESOLVE), 0x7F (was CAP_SELF_LABEL), 0xBE (was CAP_SELF_ATTEST): retired in
-                              // the wire rev (#900) — the `cap.self.*` reflection ops are now `cap.call CAP_SELF op N`. Left as
-                              // gaps — not renumbered, not reused.
 
     // Memory ops. Each carries: address operand, [value operand for stores], and an
     // immediate uleb offset. (The wire-rev cut dropped the write-only alignment-hint byte;
@@ -2291,8 +2290,8 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
             import: c.idx()?,
             handle: c.idx()?,
         },
-        // 0x7A/0x7B/0x7E/0x7F/0xBE (the retired `cap.self.*` reflection opcodes) are wire gaps now —
-        // the ops travel as `cap.call CAP_SELF op N` (decoded by the `CAP_CALL` arm).
+        // 0x7F/0xBE (the retired `cap.self.*` reflection opcodes) are wire gaps now — the ops
+        // travel as `cap.call CAP_SELF op N` (decoded by the `CAP_CALL` arm).
         op::VCPU_TLS_GET => Inst::VcpuTlsGet,
         op::VCPU_TLS_SET => Inst::VcpuTlsSet { val: c.idx()? },
         op::DURABLE_SHADOW_BASE => Inst::DurableShadowBase,
