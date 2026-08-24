@@ -2,154 +2,122 @@
 
 [![CI](https://github.com/thesherwood/vm/actions/workflows/ci.yml/badge.svg)](https://github.com/thesherwood/vm/actions/workflows/ci.yml)
 
-A compilation target and sandbox VM: as secure (for the host) as WebAssembly,
-faster than wasm on the interface / 64-bit-memory / startup axes, with a simpler and
-more flexible interface, and real virtual memory.
+A compilation target and sandbox VM — a WebAssembly alternative for running
+untrusted native code, aimed at being **as secure for the host as wasm, faster on
+the axes that matter, with a simpler interface and real virtual memory.**
+
+> ⚠️ **Status: early research build, heavy WIP.** A lot works end-to-end today, but
+> nothing here is stable, certified, or ready to depend on. "Appears to work" is
+> reachable; "is certified secure" is explicitly future work. See
+> [Status](#status) below.
 
 The full design lives in [`DESIGN.md`](DESIGN.md); the working agreement (keep it
-simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
-[`AGENTS.md`](AGENTS.md).
+simple; test/fuzz/bench early; data-oriented design) is in [`AGENTS.md`](AGENTS.md),
+and the security rules a change must not break are in [`INVARIANTS.md`](INVARIANTS.md).
 
-> Status: **Phase 3 + cross-platform parity (3.5) complete, deep into Phase 4 (concurrency, nesting,
-> durability, second/third frontends, tooling)** — the core loop, the Cranelift JIT, and the
-> C frontend are all in place. The full **scalar IR** (integer /
-> float ops, linear memory with confinement masking, direct / indirect / tail calls +
-> the function table, `select`, `br_table`, `unreachable`) plus **capabilities**
-> (`cap.call` over a host-owned handle table, and the MVP powerbox — `Stream` / `Exit`
-> / `Clock` / `Memory`, §3c/§3e) flow through text ⇄ binary ⇄ verifier ⇄ reference
-> interpreter ⇄ JIT, with the masking unit isolated and fuzzed, and a **generative
-> interpreter-vs-JIT differential fuzzer** (a verifier-valid IR generator → both backends
-> must agree on result + trap; stable-CI seed loop + a libFuzzer `diff` target). The
-> **Cranelift JIT** (§9)
-> now lowers the **entire IR** — integer/float ops, conversions, the §4 memory
-> **masking lowering** (I1), function-table **indirect-call dispatch** (I2), direct/
-> indirect/tail calls, trap detection, and **`cap.call` through a host thunk** — all
-> **differential-tested against the interpreter** oracle (§18), including trap kinds and
-> host side effects. A **C frontend** (`frontend/chibicc`, a vendored chibicc fork with an
-> `--emit-ir` backend, §3d) compiles a broad C subset — ints/longs/floats, locals,
-> pointers, arrays, structs/unions, globals & string literals (incl. **pointer
-> initializers / relocations** — `char *p = "..."`, `&global`, function-pointer tables),
-> the full operator set
-> incl. short-circuit `&&`/`||`/`?:`, `if`/`while`/`for`/`do`/`switch` with
-> `break`/`continue` and **general `goto`/labels**, functions and **recursion** (via a threaded data-stack pointer),
-> **function pointers** (a function designator decays to its `ref.func` index; `fp(args)`
-> lowers to `call_indirect` through the function table, I2), **by-value structs/unions**
-> (passed by hidden pointer, returned via `sret`, D39; whole-aggregate assignment),
-> **varargs + a guest-C `printf`** over the powerbox, and **`malloc`/`free`** (a guest
-> allocator that grows the window via the Memory capability — the shipped `<stdlib.h>`) — all of
-> which **verify and run identically on the interpreter and the
-> JIT**, hello-world and a heap-allocated linked list included (the §18 Phase-2 "it works"
-> milestone). The §3d **SSA-promotion pass** lifts non-address-taken scalar locals out of
-> memory into SSA values (threaded as block params), so the JIT register-allocates them — a
-> hot loop body drops from ~22 load/store ops to zero. **Production trap-catching** runs across
-> **Linux / macOS / Windows**: a reserved window with a guard page + a fault handler (unix
-> SIGSEGV/SIGBUS + `siglongjmp`; Windows VEH) turns an out-of-window fault into a clean
-> `MemoryFault` (§4/§5 detect-and-kill), and the large
-> reserved-window model is the default; **read-only data segments** (§3a/D40) and a real
-> **Memory capability** (`map`/`unmap`/`protect`/`page_size`) exist — including **guest-controlled growth**
-> into the reserved tail (the §1a sparse-address-space / lazy-page-supply differentiator: a guest
-> `map`s pages anywhere in its large reserved window, the kernel demand-pages them, and an
-> uncommitted access faults), backed by real `mprotect` and differentially fuzzed against the
-> interpreter — and exposed to C as the **default guest `malloc`** (the shipped `<stdlib.h>`): any
-> program that `#include <stdlib.h>` gets a `malloc`/`free`/`calloc`/`realloc` whose heap grows
-> megabytes past the initial window through the Memory capability, byte-identically to native `cc`
-> (`demos/heapgrow`). **Concurrency primitives** have landed (§12; x86-64 + aarch64 unix and
-> x86-64 Windows): stackful
-> **fibers** (`cont.*`), **threads** (`thread.spawn`/`join`, **1:1** — one vCPU per OS thread),
-> **C11 atomics**, and a **`wait`/`notify` futex** — the VM ships these as *primitives* with **no
-> built-in scheduler** (D22/D56), and a C-compatible **`<pthread.h>`** (`create`/`join`/`mutex`/
-> `cond`) is built over them in the libc, so multithreaded C runs identically on the interpreter
-> (the deterministic interleaving oracle, `explore_all`) and the JIT (real OS threads).
-> **§14 nesting (VM-in-VM) has landed on both backends**: a guest holding an **`Instantiator`**
-> capability carves a power-of-two **sub-window** and spawns a child domain there — confinement
-> composes recursively at depth-independent cost, an attenuable **`AddressSpace`** capability
-> manages pages, and **co-fiber** children (`spawn_coroutine`/`resume`/`yield`) cooperate with
-> their parent, including **fault-driven yield** (`spawn_demand_coroutine`): a demand-paged child's
-> first touch of a page suspends it to its parent, which supplies the page and resumes — real
-> hardware lazy paging on the JIT (the fault handler suspends the child's fiber), prot-map faults
-> on the interpreter, byte-identical by differential. **Separate-module nested children** are in
-> too: the host grants a **`Module` capability** for a different verified module, and a guest
-> instantiates it as a child domain — the plugin-in-plugin story, its data segments materialized
-> into the carve (lazily, for demand-paged children). And **cross-domain `SharedRegion`
-> `create`/`grant`** closes the §13/§14 data plane: a guest mints a shareable region via its
-> `AddressSpace` and grants it into a child domain — parent and child then share bytes zero-copy.
-> This reaches **all the way to C**: the powerbox grants `_start` an `AddressSpace` handle, and the
-> libc exposes `<svm.h>` (`__vm_region_create`/`map`/`unmap`/`page_size`), so a stock C guest mints a
-> region and maps it at two adjacent offsets to build the **magic ring buffer** (a single
-> wrap-around access becomes one contiguous store) — verified end to end on both backends.
-> The §5 **fuel/epoch kill-path** now exists on *both* backends: the interpreter bounds execution
-> with its per-step fuel counter, and the JIT polls a host-owned interrupt cell at loop back-edges
-> and function entries, so a host watchdog stops a **runaway guest** (infinite loop / unbounded
-> recursion) with `OutOfFuel` instead of hanging — guest-undisableable, and exposed on the CLI via
-> `SVM_DEADLINE_MS`. It kills a **whole multithreaded domain** from one interrupt: spinning vCPUs
-> poll the shared cell, a vCPU parked in a futex `wait`/`join` re-checks it and unwinds too, and a
-> runaway **nested §14 child** polls the parent's cell as well — so the kill reaches every JIT
-> execution context (root, sibling vCPUs, nested children).
-> **Parking-on-blocking** (§12) has landed (and retired the earlier `IoRing` prototype on the
-> numbers): an *offloadable* host-capability registration punts genuinely-blocking calls onto a
-> bounded host **offload pool**, and the eval loops park the caller — vCPU parked, host lock
-> released, worker thread freed — until the completion re-queues it, delivered in submission
-> order. Sync ops never pay for the machinery, and the M:N schedulers (guest work-stealing over
-> `thread.spawn`/futex, D56/D57) overlap blocking host calls without any second host-call ABI.
-> **Fibers are migratable (D57 complete, DESIGN §23):** `cont.resume` on any vCPU claims a suspended
-> fiber and continues its *native stack* on that OS thread — a loom-verified single-owner protocol
-> arbitrates racing claims, with an empirical net (randomized-migration interp↔JIT differential,
-> ASan with real fiber-switch annotations, concurrent-steal stress) in place of unavailable expert
-> review — capstoned by `demos/steal_fibers`, a guest **work-stealing scheduler over stackful
-> tasks** that suspends from inside nested call frames (inexpressible for stackless state machines).
-> A **second frontend, `svm-wasm`**, transpiles **core wasm → IR** (reconstructing SSA from the
-> stack machine) and runs real clang-compiled programs and **real C libraries** — the jsmn JSON
-> tokenizer and B-Con SHA-256 — byte-identically to native, including bulk memory
-> (`memory.copy`/`fill`), `memory.grow`, **function imports** (a wasm `call` → a `cap.call`),
-> **v128 SIMD** (a real `clang -msimd128 -O2` saxpy → first-class `v128` IR, ~1.0× Wasmtime), and
-> **wasm threads** (`*.atomic.*` + shared/imported memory; the **wasi-threads** `wasi:thread/spawn`
-> lowers to SVM's *native* `thread.spawn` — the same bytes `wasmtime-wasi-threads` runs, but
-> concurrency *in* the VM: on a spawn-heavy parallel kernel SVM is **~1.35× faster** than
-> Wasmtime+wasi-threads, parity on steady-state compute); it benches the §1a thesis on the *same
-> bytes* Wasmtime runs. The host-call boundary is now
-> **devirtualized** (D45): a `cap.call` to a statically-known capability op is a register-to-register
-> direct call, taking `hostcall` from ~parity to ~1.5× faster than Wasmtime. And **§15 spawn
-> quotas** — host-configurable fiber/vCPU ceilings enforced identically on both backends (CLI
-> `SVM_MAX_FIBERS`/`SVM_MAX_VCPUS`) — contain a spawn-bomb (`FiberFault`/`ThreadFault`), DoS
-> containment that complements the kill-path's bound on runaway execution.
-> A **guest-driven JIT** (the **`Jit`** capability, §22) closes the "JIT inside the sandbox" gap wasm
-> handles poorly: guest code (e.g. an interpreter) builds serialized SVM IR at runtime, hands the blob
-> across `cap.call`, and the host **verifies** it (the same `decode`+`verify` gate every module passes,
-> plus a memory-match precondition) and **Cranelift-compiles** it into the guest's *own* domain — same
-> window, same powerbox; verification, not isolation, is the trust boundary. The compiled unit is reached
-> by `invoke` (a trampoline) or, once `install`ed into the `call_indirect` table, as a first-class
-> **funcref** at native speed (all four old↔new cross-call directions differentially pinned). It runs
-> end-to-end **from C** (`<svm.h>`: `__vm_jit_compile`/`invoke2`/`install`/…): a guest bytecode interpreter
-> that **JITs itself** (`demos/jit/jit_demo.c`). Long REPL sessions don't exhaust the code arena —
-> `JitSession` does **whole-module compaction** on a byte watermark (cranelift-jit has no per-function
-> free), transparently — and worker threads can **compile concurrently** (a per-domain `Mutex<Host>`
-> serializes compiles while execution stays parallel), with full platform parity. All on **both backends,
-> differentially identical**.
-> Beyond the runtime, several **frontends and tooling subsystems** have landed (each with its own
-> design doc):
-> a second-and-a-half frontend, **`svm-llvm`** — an **LLVM-bitcode → IR** translator (the AOT LLVM
-> on-ramp, D54/§20a; `LLVM.md`) that runs `clang -O2 -emit-llvm` output and clears its exit criterion
-> (all chibicc corpus libraries byte-identical to native on both backends); **durable domains**
-> (`svm-durable` + `svm-snapshot`, D60/§21; `DURABILITY.md`) — an IR→IR **freeze/thaw** transform plus
-> a backend-independent, recompile-survivable **snapshot codec**, so a running domain can be quiesced,
-> serialized, and restored bytewise (single- and multi-vCPU, both backends); **time-travel-capable
-> debugging** (`svm-dap`, §19; `DEBUGGING.md`) — an interpreter-backed **Debug Adapter Protocol**
-> server (breakpoints / stepping / backtrace / source-level locals over the IR debug info, no DWARF/JIT
-> needed); **memory-access instrumentation hooks** (§19; `HOOKS.md`) — an opt-in, **zero-cost-when-off**
-IR→IR pass that fires an embedder hook (observe or veto) around every guest memory op, identical across
-all three backends, for memory-safety validation and cache/page-fault scoring; a **partial evaluator**
-(`svm-peval`, §20c) — a semantics-preserving IR→IR
-> optimizer plus the first **Futamura projection** (specialize an interpreter + fixed program into a
-> residual); a minimal **WASI preview1** host shim (§7, the `wasi_named_imports` test) over the `svm-wasm` import
-> mechanism; **conservative-GC support** (`gc.roots` control-stack root enumeration for a guest's own
-> collector, `GC.md`); and the **interpreter-as-wasm browser build** (`browser/`, §21; `BROWSER.md`) —
-> the bytecode engine compiled to **wasm64** so SVM guests run client-side.
-> Still ahead:
-> narrow-scalar promotion, honoring *weak* memory orderings (both backends seq-cst today), wider SIMD
-> (`v256`/`v512` — fixed-128 `v128` is done across all backends, D58), isolation tiers, Spectre
-> hardening, source-level **DWARF** for JIT-compiled code, and broadening LLVM/wasm frontend coverage.
-> This is a research build; "appears to work" is reachable, "is certified secure" is an explicit
-> post-MVP workstream (see `DESIGN.md` §2a/§18).
+## Why this exists
+
+WebAssembly proved you can run untrusted code safely at near-native speed, and it's
+the bar we measure against. But wasm carries baggage for the systems-programming use
+case: a flat 32-bit linear memory, a heavy interface (WASI + the component model +
+WIT + lift/lower marshalling), no runtime nesting, and design choices (GC,
+`externref`, JS interop) aimed at a broader market than native code needs.
+
+This project asks: if you target **only** systems/native languages (C, C++, Rust,
+Zig, Swift) and drop the rest, how much simpler and faster can the sandbox be? The
+answer we're chasing:
+
+- **Security parity with wasm, honestly scoped.** The bar is "as secure for the host
+  as [Wasmtime](https://wasmtime.dev)," not a proof of escape-impossibility. We share
+  Wasmtime's most security-critical component — the [Cranelift](https://cranelift.dev)
+  code generator — so the trust boundary we actually own is small: a tiny,
+  single-pass **verifier** plus one isolated **memory-confinement** lowering pass.
+  Both are kept dependency-free and fuzzed continuously.
+- **Faster where wasm is weak.** Sharing Cranelift means tight scalar compute runs at
+  *parity* with wasm by construction — we don't pretend to beat the same backend. The
+  speed budget is spent *around* compute: the host-call / I/O interface (zero-copy
+  buffers, no component-model marshalling), a clean 64-bit address space, host-native
+  SIMD, faster startup (SSA is already on the wire), and irregular control flow.
+- **A simpler interface.** Scalars, `(ptr, len)` own/borrow buffers, and capability
+  handles — no IDL, no lift/lower, structured data is just bytes.
+- **Real, guest-visible virtual memory.** The guest holds an attenuable address-space
+  capability (`map`/`unmap`/`protect` within its window) — sparse address spaces,
+  demand paging, and lending sub-ranges out — not just `memory.grow` on one blob.
+- **Nested sandboxes (VM-in-VM).** A guest can spawn a child domain in a sub-window
+  with an attenuated subset of its own capabilities; confinement composes to any
+  depth. Multi-tenant hosts and plugin-in-plugin fall out for free.
+
+The deliberate trade: managed languages are **not** first-class (no GC, no JS
+interop, no UTF-16 / `externref` / component-IDL surface). Narrowing the market is
+what buys the small verifier and lean ABI — that's the product.
+
+## What it aims to be
+
+The end state is a small, trustworthy core with several interchangeable pieces:
+
+- **One IR** — block-local typed SSA over a CFG — that source frontends target and
+  every backend consumes.
+- **Frontends** that lower real code to the IR: a C compiler, a core-wasm
+  transpiler, and an LLVM-bitcode translator (so anything the LLVM toolchain emits
+  can be sandboxed).
+- **Backends** that all must agree, byte-for-byte, on every program (the parity
+  invariant): a tree-walk interpreter (the differential oracle), a portable bytecode
+  interpreter, a Cranelift JIT (the native-speed path), and a wasm-JIT (for the
+  browser).
+- **A capability-based host interface** (the "powerbox") as the *only* channel out of
+  the sandbox, plus host-provided capabilities for memory, I/O, concurrency, nesting,
+  durability, and more.
+- **Tooling** built on the same core: a debugger, an optimizer/partial evaluator,
+  snapshot/restore for durable domains, and instrumentation hooks.
+
+## Status
+
+**This is a research build under active, rapid development.** Much of the above
+already runs end-to-end and is differentially tested backend-against-backend, but
+APIs, formats, and internals churn constantly, and the security claims are a
+*target*, not a finished guarantee.
+
+Roughly where things stand:
+
+**Working today**
+- The full scalar IR (integer/float ops, linear memory with confinement masking,
+  direct/indirect/tail calls, function table, `select`, `br_table`) flows through
+  text ⇄ binary ⇄ verifier ⇄ interpreter ⇄ JIT.
+- The **Cranelift JIT** lowers the entire IR, differentially tested against the
+  interpreter oracle (results, trap kinds, and host side effects).
+- A **C frontend** (a vendored [chibicc](https://github.com/rui314/chibicc) fork)
+  compiles a broad C subset — structs/unions by value, function pointers, varargs +
+  `printf`, `goto`, recursion, `malloc`/`free` over the Memory capability — and real
+  third-party C libraries run sandboxed byte-identically to a native build (Clay,
+  jsmn, SHA-256, xxHash, miniz/tinfl, stb_perlin, tiny-regex-c, and more; see
+  [`demos/`](crates/svm-run/demos)).
+- **Two more frontends**: `svm-wasm` (core-wasm → IR, incl. v128 SIMD and
+  wasi-threads) and `svm-llvm` (LLVM-bitcode → IR).
+- **Real virtual memory**: a reserved window with guard page + fault handler turns an
+  out-of-window access into a clean trap on Linux / macOS / Windows; guest-controlled
+  demand-paged growth via the Memory capability.
+- **Concurrency primitives**: stackful fibers, 1:1 threads, C11 atomics, a
+  `wait`/`notify` futex, and a C `<pthread.h>` built over them — no built-in
+  scheduler (guests build their own M:N runtimes).
+- **Nesting (VM-in-VM)** on both backends, cross-domain shared regions, a
+  host-enforced **fuel/epoch kill-path** for runaway guests, and spawn quotas for
+  DoS containment.
+- A **guest-driven JIT** capability (a guest builds IR at runtime, the host verifies
+  and Cranelift-compiles it into the guest's own domain).
+- Tooling: durable domains (freeze/thaw + snapshot codec), a DAP debug server,
+  memory-access hooks, a partial evaluator, and a wasm64 browser build of the
+  interpreter.
+- **Continuous fuzzing** of the security-critical invariants (see [Fuzzing](#fuzzing)).
+
+**Still ahead**
+- Narrow-scalar promotion, honoring weak memory orderings (both backends are seq-cst
+  today), wider SIMD (`v256`/`v512`), isolation tiers, Spectre hardening, source-level
+  DWARF for JIT code, and broader LLVM/wasm frontend coverage.
+- The security-certification workstream: today's bar is "appears to work," not
+  "certified secure" (see `DESIGN.md` §2a/§18).
+
+For a blow-by-blow of what landed and why each demo mattered, see the git history and
+the per-subsystem design docs referenced from [`DESIGN.md`](DESIGN.md).
 
 ## Layout
 
@@ -239,48 +207,16 @@ echo 'int main(){ return 42; }' > /tmp/r.c
 cargo run -p svm-run -- /tmp/r.c ; echo "exit $?"        # → exit 42
 ```
 
-`calc.c` (recursion + a function-pointer dispatch table) and `rational.c` (by-value
-struct args/returns through direct and indirect calls) are larger real programs, each
-checked byte-for-byte against a native `cc` build in `svm-run`'s tests. **`clay/clay_demo.c`
-runs the real-world [Clay](https://github.com/nicbarker/clay) UI layout library** (a ~5k-line
-third-party C header, vendored) sandboxed: it compiles through the frontend to ~93k lines of
-IR, verifies, and runs on the JIT, producing the same render commands as a native build.
-Getting it to run drove a batch of frontend/IR/JIT fixes (anonymous-aggregate designated
-inits, ternary-returns-struct, >16-byte struct returns, mixed-width shifts, program-sized
-windows, a contiguous JIT code arena, gcc-parity packed-enum/struct layout) — see `FRONTEND.md`.
-**`jsmn/jsmn_demo.c`** runs the [jsmn](https://github.com/zserge/jsmn) zero-allocation JSON
-tokenizer — a different shape (char/state-machine string scanning) that ran identically to a
-native build with no new fixes, validating string handling, escapes, nesting, and error paths.
-**`sha256/sha_demo.c`** runs Brad Conte's public-domain SHA-256 — the pure integer/bit shape
-(32-bit wrapping arithmetic, rotates-as-shifts, a round-key table) — matching the standard test
-vectors; it flushed a `func_index` null-token crash on undefined-function calls (now a clean error).
-**`xxhash/xxh_demo.c`** runs [xxHash](https://github.com/Cyan4973/xxHash)'s scalar XXH32/XXH64
-against the standard vectors; it added `_Static_assert` (C11) support to the frontend.
-**`tinfl/tinfl_demo.c`** runs [miniz](https://github.com/richgel999/miniz)'s `tinfl` DEFLATE/zlib
-*inflate* engine — a coroutine-style state machine (a deeply nested `switch`, bit-buffer shifts,
-Huffman tables, a 32 KiB LZ77 dictionary inside the decompressor struct); it inflates an embedded
-zlib stream byte-identically to a native build, with no new fixes.
-**`perlin/perlin_demo.c`** runs [stb_perlin](https://github.com/nothings/stb) (Sean Barrett's 3D
-Perlin noise) — the first **floating-point-heavy** shakedown (dense f32 gradient dot products, the
-quintic ease polynomial, trilinear lerps, int↔float conversion, octave multiply/accumulate); it
-prints fixed-point-scaled noise so any f32 divergence would show in the digits, and it matches a
-native build byte-for-byte.
-**`regex/regex_demo.c`** runs [tiny-regex-c](https://github.com/kokke/tiny-regex-c) — a
-Rob-Pike-style **backtracking** matcher (`re_match` recurses through
-`matchpattern`/`matchstar`/`matchplus`, retrying on failure), a new control-flow shape that
-exercises data-stack threading and goto/branch lowering; it matches a native build with no new
-fixes.
-**`heapgrow/heapgrow.c`** **consumes the Memory capability** through plain `#include <stdlib.h>`:
-the shipped guest libc's `malloc` grows its heap into the reserved tail on demand via the
-`__vm_map` builtin (`cap.call` on the granted Memory handle). It allocates 1 MiB — ~16× its initial
-window — and runs byte-identically to a native build, demonstrating the §1a "large/sparse programs"
-path from portable C (nothing in the source is SVM-specific).
+The CLI accepts `.svm` (text IR), `.svmb` (binary), or `.c` (compiled through
+`frontend/chibicc`, located via `$SVM_CHIBICC` or the in-repo build). Many of these
+demos run real third-party C libraries sandboxed and are checked byte-for-byte
+against a native `cc` build in `svm-run`'s tests — see [`FRONTEND.md`](FRONTEND.md)
+for the story behind getting Clay, jsmn, and friends to run.
 
-Accepts `.svm` (text IR), `.svmb` (binary), or `.c` (compiled through `frontend/chibicc`,
-located via `$SVM_CHIBICC` or the in-repo build). Embedders can call the same path directly —
-`svm_run::run_powerbox(&module, stdin)` returns the outcome plus captured output; it is the one
-reusable host glue (the `cap.call` trampoline + powerbox grant), not escape-TCB (the verifier,
-run first, is what makes a module safe).
+Embedders can call the same path directly — `svm_run::run_powerbox(&module, stdin)`
+returns the outcome plus captured output. It's the one reusable piece of host glue
+(the `cap.call` trampoline + powerbox grant), and it is *not* escape-TCB: the
+verifier, run first, is what makes a module safe.
 
 ## Fuzzing
 
@@ -304,15 +240,14 @@ cargo +nightly fuzz run durable         # freeze → serialize → restore → t
 cargo +nightly fuzz run coverage_walk   # verifier coverage walker
 ```
 
-Invariants under test (the security hinge, §2a/§4): on arbitrary bytes, `decode`
-fails closed (never panics/OOMs/hangs), `verify` never panics, any *verified* module
-is safe to interpret, the masking unit confines every access into its window, and
-the formats round-trip without changing the IR. The two `spec_*` targets extend the
-executable ISA spec (`SPEC.md`) from its deterministic boundary lattices into
-unbounded exploration: `spec_ops` drives random operand values through each op and
-checks all three backends against the spec's reference semantics, and `spec_verify`
-holds the production verifier and the independent reference verifier in accept/reject
-agreement over generated + mutated modules.
+The invariants under test are the security hinge (§2a/§4): on arbitrary bytes,
+`decode` fails closed (never panics/OOMs/hangs), `verify` never panics, any *verified*
+module is safe to interpret, the masking unit confines every access into its window,
+and the formats round-trip without changing the IR. The two `spec_*` targets extend
+the executable ISA spec (`SPEC.md`) into unbounded exploration: `spec_ops` drives
+random operands through each op and checks all backends against the reference
+semantics, and `spec_verify` holds the production verifier and an independent
+reference verifier in accept/reject agreement over generated + mutated modules.
 
 ## Example IR (text form)
 
