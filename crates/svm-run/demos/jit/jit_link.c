@@ -130,7 +130,7 @@ static long emit_service(char *buf) {
 
 // `client(a, b) = F(a, b) + 100`, where `F` is an **unresolved symbol** the loader binds by name.
 // Opcodes: 0x10 = i32.const (the symbol's handle placeholder — patched to the resolved slot and
-// reused as the call_indirect index), 0x0E = call.sym (v8 link form), 0x11 = i64.const,
+// reused as the call_indirect index), 0x7B = call.sym (v8 link form), 0x11 = i64.const,
 // 0x40 = i64.add. Values: v0,v1 = params; v2 = handle const; v3 = F(a,b); v4 = 100; v5 = v3+v4.
 static long emit_client(char *buf) {
   emit_header(buf);
@@ -155,7 +155,7 @@ static long emit_client(char *buf) {
   eb(buf, 4);    // 4 instructions
   eb(buf, 0x10); // v2 = i32.const 0  (import handle placeholder)
   sleb(buf, 0);
-  eb(buf, 0x0E);          // v3 = call.sym "F" ... (v8 link-form placeholder)
+  eb(buf, 0x7B);          // v3 = call.sym "F" ... (v8 link-form placeholder)
   uleb(buf, 0);           //   import index 0
   emit_i64_pair_sig(buf); //   self-describing sig (i64, i64) -> (i64)
   uleb(buf, 2);           //   handle operand = v2

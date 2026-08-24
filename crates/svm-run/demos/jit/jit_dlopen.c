@@ -147,7 +147,7 @@ static long emit_poly(char *buf) {
   eb(buf, 4);    // 4 instructions
   eb(buf, 0x10); // v2 = i32.const 0  (import handle placeholder)
   sleb(buf, 0);
-  eb(buf, 0x0E); // v3 = call.sym "mul" (import 0) (a, a) — v8 link-form placeholder
+  eb(buf, 0x7B); // v3 = call.sym "mul" (import 0) (a, a) — v8 link-form placeholder
   uleb(buf, 0);
   emit_i64_pair_sig(buf);
   uleb(buf, 2); // handle = v2
@@ -156,7 +156,7 @@ static long emit_poly(char *buf) {
   uleb(buf, 0);
   eb(buf, 0x10); // v4 = i32.const 0  (import handle placeholder)
   sleb(buf, 0);
-  eb(buf, 0x0E); // v5 = call.sym "add" (import 1) (v3, b) — v8 link-form placeholder
+  eb(buf, 0x7B); // v5 = call.sym "add" (import 1) (v3, b) — v8 link-form placeholder
   uleb(buf, 1);
   emit_i64_pair_sig(buf);
   uleb(buf, 4); // handle = v4
