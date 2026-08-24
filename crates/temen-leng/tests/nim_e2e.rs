@@ -503,6 +503,70 @@ fn nim_write_runs_under_the_powerbox() {
     );
 }
 
+/// **#1054 — the nim→powerbox link is unit-order-independent.** A program with a `LongString` const
+/// (a string literal ≥ 8 bytes, past hexer's small-string optimization) linked against the nim
+/// runtime must print the same correct bytes **no matter what order the whole units are linked in**.
+/// This exercises [`temen_leng::link_whole_powerbox_manifest`] *directly* (no `system`-first
+/// reorder), so it pins the real fix — the guest heap seed in the synthesized `_start`
+/// ([`temen_leng`]'s `synth_start_unit`), which places the allocator arena above all placed data.
+/// Pre-fix, the arena started at 0 and overlapped static data: a heap allocation could reuse the
+/// address of the program's `"the Temen"` const, and `add`/realloc then scribbled its length so
+/// `write` dumped ~4 KiB of stray bytes — but *only* for orders that placed the const where an
+/// allocation landed, which is why it looked like the linker was order-sensitive (it is not).
+#[test]
+fn nim_powerbox_link_is_unit_order_independent() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP: nimony toolchain not found (set NIMONY_BIN/NIM_BIN or install on PATH)");
+        return;
+    };
+    let mods = compile_to_leng(
+        &path,
+        "import std/syncio\n\nproc greet(name: string): string =\n  \"hello, \" & name & \"\\n\"\n\nwrite(stdout, greet(\"Nim\"))\nwrite(stdout, greet(\"the Temen\"))\n",
+    );
+    let units: Vec<temen_leng::WholeModule> = mods
+        .iter()
+        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+        .collect();
+    // The runtime ([compute shim, syscall adapter]) is order-independent — build it once.
+    let runtime = temen_leng::nim_powerbox_runtime(&units).expect("build nim runtime");
+    let expected: &[u8] = b"hello, Nim\nhello, the Temen\n";
+
+    // Cover both extremes and a reversal: `system`-first (the previously-working order),
+    // `system`-last (the previously-corrupting order), and the collected order reversed.
+    let n = units.len();
+    let sys_first = {
+        let mut v: Vec<usize> = (0..n).collect();
+        v.sort_by_key(|&i| !units[i].stem.starts_with("sysv"));
+        v
+    };
+    let sys_last = {
+        let mut v: Vec<usize> = (0..n).collect();
+        v.sort_by_key(|&i| units[i].stem.starts_with("sysv"));
+        v
+    };
+    let reversed: Vec<usize> = (0..n).rev().collect();
+
+    for order in [&sys_first, &sys_last, &reversed] {
+        let ordered: Vec<temen_leng::WholeModule> = order
+            .iter()
+            .map(|&i| temen_leng::WholeModule {
+                stem: units[i].stem,
+                src: units[i].src,
+            })
+            .collect();
+        let m = temen_leng::link_whole_powerbox_manifest(&ordered, runtime.clone())
+            .unwrap_or_else(|e| panic!("link (order {order:?}): {e}"));
+        temen_verify::verify_module(&m)
+            .unwrap_or_else(|e| panic!("verify (order {order:?}): {e:?}"));
+        let run = temen_run::run_powerbox(&m, &[])
+            .unwrap_or_else(|e| panic!("run_powerbox (order {order:?}): {e}"));
+        assert_eq!(
+            run.stdout, expected,
+            "stdout must be correct for unit order {order:?} (heap must not overlap static data)"
+        );
+    }
+}
+
 /// Manifest-link `mods` (retaining `write`/`read`/`_exit`/… as bindable imports), then run the
 /// `exportc` `main` on **both engines** with `sysWrite` bound to a stdout capture and the other
 /// syscall leaves stubbed, asserting the two capture the same bytes (§9 interp/JIT parity on the
