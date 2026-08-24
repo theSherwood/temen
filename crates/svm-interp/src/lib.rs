@@ -2228,6 +2228,7 @@ fn drive_over_cell(
                 park_cell.store(
                     match ev {
                         ParkEvent::TaskExit(id) => id,
+                        ParkEvent::TaskExitAny => u64::MAX - 1,
                         ParkEvent::ForkSelf => u64::MAX,
                     },
                     Ordering::SeqCst,
@@ -4088,6 +4089,19 @@ type TaskId = u64;
 /// run; parked siblings are torn down, their outcomes unobservable.
 const ROOT_TASK: TaskId = 0;
 
+/// #802 interactive rung 3 — the [`ParkEvent::TaskExitAny`] sentinel the dispatch arms hand the
+/// drive loop inside `Blocked::ReapWait { child }`. Never a real task id (ids count up from 0)
+/// and never a `posix_reap_waiters` key: the park insert translates it to the per-parent
+/// wildcard key below before benching.
+const REAP_ANY_CHILD: TaskId = TaskId::MAX;
+
+/// The per-parent **any-child wildcard key**: `REAP_ANY_BASE | parent-domain-key` benches a
+/// `waitpid(-1, …)` caller in `posix_reap_waiters` so every child-transition drain point (twin
+/// completion, the `Blocked::Stopped` insert, [`Scheduler::wake_stopped`]) can wake it by the
+/// parent alone — no drain point needs to know *which* children the parent has. High-bit tagged
+/// so the keyspace cannot collide with real task ids.
+const REAP_ANY_BASE: TaskId = 1 << 63;
+
 /// A finished vCPU's outcome, parked in the scheduler until a `thread.join` claims it (or, for the
 /// root, until [`drive`] reads it). Carries `mem`/`fuel` so the root's window can be snapshot and its
 /// fuel read back after the worker that ran it is gone. (The powerbox is **shared** across all vCPUs of
@@ -4602,6 +4616,15 @@ struct Sched {
     /// twin-completion point (after the exit hooks retire the personality entry, so the
     /// re-executed op reaps), by the EINTR sweep, and at teardown.
     posix_reap_waiters: BTreeMap<TaskId, VecDeque<Box<VCpu>>>,
+    /// #802 rung 3 — pending any-child transitions, keyed by the [`REAP_ANY_BASE`] wildcard key.
+    /// Closes the park-vs-transition race for [`ParkEvent::TaskExitAny`]: a child transition that
+    /// finds **no** benched wildcard waiter marks the parent's key here (level-triggered), and a
+    /// wildcard bench insert that finds its key marked consumes the mark and re-admits instead of
+    /// parking — the rewound op re-executes and reports the transition it would have slept
+    /// through. A mark the parent already consumed by other means costs one spurious re-admit
+    /// (the re-executed op finds nothing fresh and re-benches, mark now clear) — never a spin:
+    /// each transition sets at most one mark.
+    reap_any_pending: BTreeSet<TaskId>,
     /// FORK.md §8.6 — vCPUs/fibers parked in a **blocking pipe read** ([`Blocked::PipeRead`]), keyed
     /// by pipe id. Woken by a `write` to that pipe (data available) or by its last write end closing
     /// (writer count → 0, EOF); both drain the entry into `runnable` and the read re-issues. Same shape
@@ -4858,8 +4881,26 @@ impl Scheduler {
         let mut s = self.lock();
         let woken = s.stopped.remove(&domain).unwrap_or_default();
         let n = woken.len() as u32;
+        // #802 interactive — a CONTINUE is a reportable transition for a parent benched in a
+        // blocking `waitpid(…, WCONTINUED)` (`Blocked::ReapWait` on this task): re-admit those
+        // benchers too, mirroring the stop-park and twin-completion drains — the rewound op
+        // re-executes and the personality reports the fresh continue (`cont_fresh`).
+        let mut reap_hits: Vec<Box<VCpu>> = Vec::new();
+        for v in &woken {
+            if let Some(ws) = s.posix_reap_waiters.remove(&v.id) {
+                reap_hits.extend(ws);
+            }
+            // #802 rung 3 — a CONTINUE is an any-child transition too: wake (or mark for) the
+            // continued twin's parent's wildcard benchers.
+            if let Some(parent) = s.forked_twins.get(&v.id).map(|t| t.parent) {
+                wake_posix_reap_any_locked(&mut s, parent);
+            }
+        }
         for v in woken {
             s.runnable.push_back(v);
+        }
+        for w in reap_hits {
+            s.runnable.push_back(w);
         }
         if n > 0 {
             self.work.notify_all();
@@ -5257,6 +5298,67 @@ impl Scheduler {
     /// vCPU twin, and the return-twice re-admissions (`reply_orig`/pid-mode for the original,
     /// `reply_twin` for the twin). `Err(v)` hands the intact caller back — each route decides its
     /// own failure delivery (re-park the ticket waiter; `-EAGAIN` as the call's result).
+    /// Wire (or RE-wire) a domain's signal-door closures over `host`'s OWN cells and domain id —
+    /// the domain-scoped, weak run-wake/stop/kill/park-request set (#863 slice 3 / #798 / #796 /
+    /// #799). Called at a fork twin's birth, and again at an **exec image-replace** (#802
+    /// interactive): the fork-time closures captured the pre-exec host's domain id, so a
+    /// post-exec continue's `wake_stopped(old_dom)` would drain nothing while the child parks
+    /// under the new id (observed: `fg` after `^Z` never resumed an exec'd `cat`).
+    fn wire_signal_doors(self: &Arc<Self>, host: &Arc<Mutex<Host>>) {
+        let hg = host.lock_unpoisoned();
+        let dom = hg.domain_id() as usize;
+        let stop_flag = hg.stop_flag.clone();
+        let term_flag = hg.term_flag.clone();
+        let park_request = hg.park_request.clone();
+        let source = hg.signal_poll().map(|(_, s)| s);
+        drop(hg); // release before `set_wake` (the door takes the personality's own lock)
+        if let Some(source) = source {
+            let sched_weak = Arc::downgrade(self);
+            source.set_pipe_wake(Arc::new(move |pipe| {
+                if let Some(sc) = sched_weak.upgrade() {
+                    sc.wake_pipe_readers(pipe);
+                }
+            }));
+            let sched_weak = Arc::downgrade(self);
+            source.set_wake(Arc::new(move || {
+                if let Some(sc) = sched_weak.upgrade() {
+                    sc.interrupt_interruptible_parks(dom, true);
+                }
+            }));
+            // #798 slice 2 — the stop/continue closure, minted with the wake.
+            let sched_weak = Arc::downgrade(self);
+            source.set_stop(Arc::new(move |stopped| {
+                stop_flag.store(stopped, Ordering::SeqCst);
+                if !stopped {
+                    if let Some(sc) = sched_weak.upgrade() {
+                        sc.wake_stopped(dom);
+                    }
+                }
+            }));
+            // #796 default actions — the terminate closure, minted with the wake/stop.
+            let sched_weak = Arc::downgrade(self);
+            source.set_kill(Arc::new(move || {
+                term_flag.store(true, Ordering::SeqCst);
+                if let Some(sc) = sched_weak.upgrade() {
+                    sc.interrupt_interruptible_parks(dom, false);
+                    sc.wake_stopped(dom);
+                }
+            }));
+            // #799 — the park-request closure, minted with the wake/stop/kill.
+            let park_cell = park_request.clone();
+            source.set_park_request(Arc::new(move |ev| {
+                park_cell.store(
+                    match ev {
+                        ParkEvent::TaskExit(id) => id,
+                        ParkEvent::TaskExitAny => u64::MAX - 1,
+                        ParkEvent::ForkSelf => u64::MAX,
+                    },
+                    Ordering::SeqCst,
+                );
+            }));
+        }
+    }
+
     fn fork_vcpu(
         self: &Arc<Self>,
         mut v: Box<VCpu>,
@@ -5330,59 +5432,7 @@ impl Scheduler {
         // by `fork_powerbox`) gets its own **domain-scoped, weak** run-wake at birth, so a
         // deliverable signal raised against the twin (`kill(pid)`) interrupts ITS blocked syscalls —
         // and only its (invariant 12). Weak: the run's `Arc` dies with the run, no teardown needed.
-        {
-            let hg = twin_host.lock_unpoisoned();
-            let dom = hg.domain_id() as usize;
-            let stop_flag = hg.stop_flag.clone();
-            let term_flag = hg.term_flag.clone();
-            let park_request = hg.park_request.clone();
-            let source = hg.signal_poll().map(|(_, s)| s);
-            drop(hg); // release before `set_wake` (the door takes the personality's own lock)
-            if let Some(source) = source {
-                let sched_weak = Arc::downgrade(self);
-                source.set_pipe_wake(Arc::new(move |pipe| {
-                    if let Some(sc) = sched_weak.upgrade() {
-                        sc.wake_pipe_readers(pipe);
-                    }
-                }));
-                let sched_weak = Arc::downgrade(self);
-                source.set_wake(Arc::new(move || {
-                    if let Some(sc) = sched_weak.upgrade() {
-                        sc.interrupt_interruptible_parks(dom, true);
-                    }
-                }));
-                // #798 slice 2 — the twin's stop/continue closure, minted with its wake.
-                let sched_weak = Arc::downgrade(self);
-                source.set_stop(Arc::new(move |stopped| {
-                    stop_flag.store(stopped, Ordering::SeqCst);
-                    if !stopped {
-                        if let Some(sc) = sched_weak.upgrade() {
-                            sc.wake_stopped(dom);
-                        }
-                    }
-                }));
-                // #796 default actions — the twin's terminate closure, minted with its wake/stop.
-                let sched_weak = Arc::downgrade(self);
-                source.set_kill(Arc::new(move || {
-                    term_flag.store(true, Ordering::SeqCst);
-                    if let Some(sc) = sched_weak.upgrade() {
-                        sc.interrupt_interruptible_parks(dom, false);
-                        sc.wake_stopped(dom);
-                    }
-                }));
-                // #799 — the twin's park-request closure, minted with its wake/stop/kill.
-                let park_cell = park_request.clone();
-                source.set_park_request(Arc::new(move |ev| {
-                    park_cell.store(
-                        match ev {
-                            ParkEvent::TaskExit(id) => id,
-                            ParkEvent::ForkSelf => u64::MAX,
-                        },
-                        Ordering::SeqCst,
-                    );
-                }));
-            }
-        }
+        self.wire_signal_doors(&twin_host);
         let parent_key = domain_key_of(&v); // the forking domain — this twin's parent (per-parent reap)
         let mut twin = v.fork_twin(twin_id, twin_mem, twin_host);
         twin.pending = Some(Pending::CapResult(reply_twin));
@@ -5615,6 +5665,30 @@ fn wake_reap_any(s: &mut Sched, id: TaskId) -> bool {
         true
     } else {
         false
+    }
+}
+
+/// #802 rung 3 — a child of `parent` (a domain key) just transitioned (exit, stop, or continue):
+/// wake any [`ParkEvent::TaskExitAny`] bencher parked under the parent's wildcard key, or mark
+/// the key pending (see [`Sched::reap_any_pending`]) so a bench racing this drain re-admits at
+/// its insert instead of sleeping through the transition. Returns whether waiters were woken
+/// (callers notify the worker pool). Distinct from [`wake_reap_any`] — that is the core
+/// servicer-reap lane (`Pending::ReapPid` completion); this is the #799 personality bench lane
+/// (rewound op, no pending value).
+fn wake_posix_reap_any_locked(s: &mut Sched, parent: usize) -> bool {
+    let key = REAP_ANY_BASE | parent as TaskId;
+    match s.posix_reap_waiters.remove(&key) {
+        Some(ws) => {
+            let woke = !ws.is_empty();
+            for w in ws {
+                s.runnable.push_back(w);
+            }
+            woke
+        }
+        None => {
+            s.reap_any_pending.insert(key);
+            false
+        }
     }
 }
 
@@ -5859,6 +5933,15 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
 /// safepoint (the park gate). Parked daemons are abandoned, never waited out (`MAX_WAIT` stays a
 /// pure anti-wedge backstop).
 fn teardown_run(s: &mut Sched) {
+    if std::env::var_os("SVM_TRAP_TRACE").is_some() {
+        eprintln!(
+            "TEARDOWN live={} stopped={} pipe_w={} runnable={}",
+            s.live,
+            s.stopped.values().map(|v| v.len()).sum::<usize>(),
+            s.pipe_waiters.values().map(|v| v.len()).sum::<usize>(),
+            s.runnable.len()
+        );
+    }
     s.shutdown = true;
     let mut victims: Vec<Box<VCpu>> = s.runnable.drain(..).collect();
     victims.extend(std::mem::take(&mut s.join_waiters).into_values());
@@ -5901,6 +5984,28 @@ fn teardown_run(s: &mut Sched) {
     for (_, q) in std::mem::take(&mut s.admit_waiters) {
         victims.extend(q);
     }
+    // #802 interactive rung 3 — blocking PIPE readers/writers and `waitpid` benchers die with the
+    // run too: a background twin parked in a terminal/pipe read at the root's exit (bash leaves a
+    // stopped-or-parked `cat &` behind) otherwise leaks, `live` never reaches 0, and the run
+    // hangs instead of completing.
+    victims.extend(
+        std::mem::take(&mut s.pipe_waiters)
+            .into_values()
+            .flatten()
+            .filter_map(|w| w.into_victim()),
+    );
+    victims.extend(
+        std::mem::take(&mut s.pipe_write_waiters)
+            .into_values()
+            .flatten()
+            .filter_map(|w| w.into_victim()),
+    );
+    victims.extend(
+        std::mem::take(&mut s.posix_reap_waiters)
+            .into_values()
+            .flatten(),
+    );
+    s.reap_any_pending.clear();
     for v in victims {
         let reason = s
             .dead
@@ -6358,6 +6463,13 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     }
                     sched.work.notify_all();
                 }
+                // #802 rung 3 — and any-child benchers of this twin's PARENT (the wildcard key),
+                // or mark the transition pending for a bench racing this drain.
+                if let Some(parent) = s.forked_twins.get(&id).map(|t| t.parent) {
+                    if wake_posix_reap_any_locked(&mut s, parent) {
+                        sched.work.notify_all();
+                    }
+                }
                 // §12 domain lifetime: a member of an already-dead domain finishing *after* the
                 // teardown sweep (it was running — teardown is non-preemptive) observes the domain's
                 // end, not its own late Ok: post-teardown sibling effects are unspecified, but the
@@ -6505,7 +6617,21 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     sched.work.notify_all();
                     return;
                 };
-                if s.results.contains_key(&child) {
+                if child == REAP_ANY_CHILD {
+                    // #802 rung 3 — the any-child bench: park under the caller's per-parent
+                    // wildcard key, which every child-transition drain point wakes. The race
+                    // check is the pending mark (`reap_any_pending`), not `results` — a
+                    // personality-lane twin's outcome lingers in `results` after the guest
+                    // reaps it from the personality table, so a `results` scan would re-admit
+                    // (and spin) forever once any child had ever exited.
+                    let key = REAP_ANY_BASE | domain_key_of(&v) as TaskId;
+                    if s.reap_any_pending.remove(&key) {
+                        s.runnable.push_back(v);
+                        sched.work.notify_one();
+                    } else {
+                        s.posix_reap_waiters.entry(key).or_default().push_back(v);
+                    }
+                } else if s.results.contains_key(&child) {
                     s.runnable.push_back(v);
                     sched.work.notify_one();
                 } else {
@@ -6535,6 +6661,25 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     return;
                 };
                 if still_stopped && !term {
+                    // #798/#802 interactive — a child ENTERING the stop park is a reportable
+                    // state change for a parent benched in a blocking `waitpid(…, WUNTRACED)`
+                    // (`Blocked::ReapWait` on this task): re-admit it, exactly as the
+                    // twin-completion point does — the rewound op re-executes and the
+                    // personality reports the fresh stop (`stop_fresh`).
+                    let id = v.id;
+                    if let Some(ws) = s.posix_reap_waiters.remove(&id) {
+                        for w in ws {
+                            s.runnable.push_back(w);
+                        }
+                        sched.work.notify_all();
+                    }
+                    // #802 rung 3 — a STOP is an any-child transition too: wake (or mark for)
+                    // the parent's wildcard benchers, so `waitpid(-1, WUNTRACED)` reports it.
+                    if let Some(parent) = s.forked_twins.get(&id).map(|t| t.parent) {
+                        if wake_posix_reap_any_locked(&mut s, parent) {
+                            sched.work.notify_all();
+                        }
+                    }
                     s.stopped.entry(dom).or_default().push_back(v);
                 } else {
                     s.runnable.push_back(v);
@@ -6856,6 +7001,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     quota,
                     dt,
                 );
+                // #802 interactive — RE-wire the door over the rebuilt vCPU's host (fresh
+                // domain id): see [`Scheduler::wire_signal_doors`].
+                if let SchedRef::Real(sc) = &v.sched {
+                    sc.wire_signal_doors(&v.host);
+                }
                 continue;
             }
             // Only an `Inspector`-driven vCPU pauses, and those are never on the executor (DEBUGGING.md S4).
@@ -10872,6 +11022,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             park_cell.store(
                                                 match ev {
                                                     ParkEvent::TaskExit(id) => id,
+                                                    ParkEvent::TaskExitAny => u64::MAX - 1,
                                                     ParkEvent::ForkSelf => u64::MAX,
                                                 },
                                                 Ordering::SeqCst,
@@ -11315,6 +11466,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             park_cell.store(
                                                 match ev {
                                                     ParkEvent::TaskExit(id) => id,
+                                                    ParkEvent::TaskExitAny => u64::MAX - 1,
                                                     ParkEvent::ForkSelf => u64::MAX,
                                                 },
                                                 Ordering::SeqCst,
@@ -11990,10 +12142,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // Rw tail is deliberately not counted (its backing depth is embedder-specific
                     // — fail closed, invariant 9); a non-power-of-two prefix likewise refuses.
                     let win_bytes = mem.as_ref().map(|m| m.window.mapped()).unwrap_or(0);
-                    eprintln!(
-                        "EXECDBG mapped={win_bytes} reserved={:?}",
-                        mem.as_ref().map(|m| m.window.reserved())
-                    );
                     let win_log2 = win_bytes
                         .is_power_of_two()
                         .then(|| win_bytes.trailing_zeros() as u8);
@@ -12041,6 +12189,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         Arc::clone(&hg.sig_armed),
                                     );
                                 }
+                                // #802 interactive — the door's stop/kill/park-request closures
+                                // (minted at the twin's fork wiring) store into THESE cells; the
+                                // exec'd vCPU polls its new host's. Share the cells across the
+                                // image-replace, or a post-exec ^Z/kill sets a flag nothing reads
+                                // (observed: an exec'd `cat` ignored SIGTSTP — the fg job could
+                                // never stop).
+                                ch.stop_flag = Arc::clone(&hg.stop_flag);
+                                ch.term_flag = Arc::clone(&hg.term_flag);
+                                ch.park_request = Arc::clone(&hg.park_request);
                                 // #801 — exec is the SAME PROCESS, so the host-served personality
                                 // moves verbatim (same handler over the same Proc — fds, pid,
                                 // env survive exec, POSIX), never through the spawn re-grant
@@ -12419,6 +12576,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let request = hg.take_park_request();
                     let reap_park = match request {
                         Some(ParkEvent::TaskExit(id)) => Some(id),
+                        // #802 rung 3 — the any-child bench: the sentinel flows through the same
+                        // rewind+park; the drive loop's insert translates it to the per-parent key.
+                        Some(ParkEvent::TaskExitAny) => Some(REAP_ANY_CHILD),
                         _ => None,
                     };
                     let fork_self = matches!(request, Some(ParkEvent::ForkSelf));
@@ -12797,6 +12957,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let request = hg.take_park_request();
                     let reap_park = match request {
                         Some(ParkEvent::TaskExit(id)) => Some(id),
+                        // #802 rung 3 — the any-child bench: the sentinel flows through the same
+                        // rewind+park; the drive loop's insert translates it to the per-parent key.
+                        Some(ParkEvent::TaskExitAny) => Some(REAP_ANY_CHILD),
                         _ => None,
                     };
                     let fork_self = matches!(request, Some(ParkEvent::ForkSelf));
@@ -16780,6 +16943,12 @@ pub enum ParkEvent {
     /// the twin-completion point that already fires the exit hooks, so the re-executed op finds
     /// the personality's table entry already retired.
     TaskExit(TaskId),
+    /// #802 interactive rung 3 — bench the caller until **any of its child tasks** transitions
+    /// (exit, stop, or continue): the true `waitpid(-1, …)` event. Parked under a per-parent
+    /// wildcard key that every child-transition drain point also wakes, so a shell blocked on
+    /// its foreground child cannot sleep through a *different* child's exit the way a
+    /// single-task bench ([`Self::TaskExit`] on an arbitrary live child) could.
+    TaskExitAny,
     /// #799 — `fork()` through the personality: clone the calling vCPU (return-twice). Not a
     /// park but the same request plumbing (cell → dispatch arm → a `Step` the drive loop acts
     /// on — the `Step::Exec` image-replace precedent): the drive loop hands the caller's own
@@ -18070,12 +18239,13 @@ impl Host {
     /// #799 — take the pending caller request (`None` = none). Consume-everywhere discipline:
     /// every dispatch-completion arm calls this, so a request made on a non-parkable route can
     /// never leak into a later call's park decision (the `take_stdin_parked` precedent).
-    /// Cell encoding: `0` = none, [`u64::MAX`] = [`ParkEvent::ForkSelf`], else the
-    /// [`ParkEvent::TaskExit`] task id.
+    /// Cell encoding: `0` = none, [`u64::MAX`] = [`ParkEvent::ForkSelf`], `u64::MAX - 1` =
+    /// [`ParkEvent::TaskExitAny`], else the [`ParkEvent::TaskExit`] task id.
     fn take_park_request(&self) -> Option<ParkEvent> {
         match self.park_request.swap(0, Ordering::SeqCst) {
             0 => None,
             u64::MAX => Some(ParkEvent::ForkSelf),
+            v if v == u64::MAX - 1 => Some(ParkEvent::TaskExitAny),
             id => Some(ParkEvent::TaskExit(id)),
         }
     }

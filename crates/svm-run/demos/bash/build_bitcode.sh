@@ -142,8 +142,13 @@ TR="$HERE/../../../svm-llvm/target/release/examples/try_translate"
 if [ -x "$TR" ]; then
   # SVM_STUB_EXTERNS=1: trap-stub the OS surface the guest never reaches. The surface bash DOES
   # reach binds to the svm-posix ops by bare libc name (Lane C) — slice 3's run wires the rest.
+  # INFORMATIONAL ONLY (`|| true`): try_translate also attempts a JIT RUN, which bash always
+  # declines (exec_module/setjmp/fork are interp-only tiers), so its nonzero exit is expected —
+  # under `pipefail` it silently failed this whole script from slice 4 on, and the capstone's
+  # differential + interactive gates skipped as "offline". The real run gate is the capstone
+  # (`demo_bash_translates_and_verifies`), which drives the interp backend itself.
   echo "translate + verify:"
-  SVM_STUB_EXTERNS=1 "$TR" "$LINKED" 2>&1 | grep -v '\[stub\]' | head -5
+  SVM_STUB_EXTERNS=1 "$TR" "$LINKED" 2>&1 | grep -v '\[stub\]' | head -5 || true
 else
   echo "note: build the translator first:  (cd crates/svm-llvm && cargo build --release --example try_translate)"
 fi
