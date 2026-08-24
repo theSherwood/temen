@@ -465,12 +465,12 @@ mod tests {
         // past what compiles here.
         files.push((
             "prog.nim".into(),
-            b"import std/syncio\n\nproc greet(name: string): string =\n  \"hello, \" & name & \"\\n\"\n\nwrite(stdout, greet(\"Nim\"))\nwrite(stdout, greet(\"the SVM\"))\n".to_vec(),
+            b"import std/syncio\n\nproc greet(name: string): string =\n  \"hello, \" & name & \"\\n\"\n\nwrite(stdout, greet(\"Nim\"))\nwrite(stdout, greet(\"the Temen\"))\n".to_vec(),
         ));
         let r = compile_nim(&nifler, &nimsem, &hexer, files, "prog.nim");
         assert_eq!(
             r.as_deref(),
-            Ok("hello, Nim\nhello, the SVM\n"),
+            Ok("hello, Nim\nhello, the Temen\n"),
             "in-browser compile+run of a proc + string-concat program"
         );
     }

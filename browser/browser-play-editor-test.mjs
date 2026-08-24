@@ -203,7 +203,7 @@ try {
   }), card(nimcCard));
   nimc.state === 'done' && nimc.result.endsWith('B stdout') &&
     nimc.stdout.includes('hello, Nim') &&
-    nimc.stdout.includes('hello, the SVM')
+    nimc.stdout.includes('hello, the Temen')
     ? ok('whole-program nim compiler card: the full toolchain compiled + ran a Nim program in-browser')
     : fail(`nimc run: state=${nimc.state} result=${nimc.result} stdout=${nimc.stdout.slice(0, 120)}`);
 
