@@ -368,6 +368,13 @@ const O_WRONLY: i64 = 1;
 const O_RDWR: i64 = 2;
 const EACCES: i64 = -13;
 const ENOTTY: i64 = -25; // #797: not a terminal // #801: a memfs file without the executable registration
+/// #802 rung-3 tail — the **restart sentinel** (Linux's kernel-internal `ERESTART`): a terminal
+/// read that just STOPPED its caller (SIGTTIN) returns this instead of minting the input tag, and
+/// the guest read wrappers re-issue the op in a loop — the stop lands at the re-issued dispatch's
+/// safepoint poll, so the reader is benched BEFORE it can touch the input pipe. Mirrors the
+/// kernel's stop-then-transparently-restart contract; without it a `bg`-continued background
+/// reader raced its own stop and STOLE the next typed line from the foreground shell.
+const ERESTART: i64 = -85;
 const O_CREAT: i64 = 0o100;
 const O_TRUNC: i64 = 0o1000;
 const O_APPEND: i64 = 0o2000;
@@ -2555,11 +2562,17 @@ impl Ctx<'_> {
         if fd == 0 && self.w.terminal.is_some() && matches!(self.fd(fd), Some(FdEntry::Stdin)) {
             // #798/#802 interactive rung 3 — a BACKGROUND read from the terminal rings SIGTTIN
             // (default action: STOP) before the tag mints, mirroring the write-side SIGTTOU
-            // doorbell. The stop fires after this dispatch's locks drop; the guest then parks on
-            // the (empty) input pipe, a keystroke's wake re-admits it, and the safepoint poll
-            // parks it Stopped BEFORE the rewound read re-executes — so the keystroke goes to
-            // the foreground shell and a later `fg` + SIGCONT re-runs the read as foreground.
+            // doorbell.
             self.tty_background_check(SIGTTIN);
+            // Rung-3 tail — if that delivery STOPPED us (or a stop was already pending), the tag
+            // must NOT mint: return the restart sentinel so the guest wrapper re-issues the op
+            // and the stop lands at that dispatch's safepoint poll. The previously-documented
+            // "park on the empty pipe, stop before the rewound read" ordering was a race: a
+            // `bg`-continued reader whose stop fire lagged one dispatch consumed the next typed
+            // line before parking (POSIX stops BEFORE the I/O; the `bg` probe caught the steal).
+            if self.p.stopped_sig.is_some() {
+                return Ok(vec![ERESTART]);
+            }
             // #797 interactive rung 2 — mint the tag from THIS process's own token (handle
             // values are per-powerbox; the world's is the root namespace's). A process without
             // one (pre-terminal, spawn delegate) keeps the world handle.

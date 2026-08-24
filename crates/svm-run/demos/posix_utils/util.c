@@ -22,10 +22,15 @@ long __px_kill(int cap, long pid, long sig);
 
 static long u_h_(long r) { return r <= -1048576 ? -(r + 1048576) : -1; }
 long read(long fd, void *buf, long n) {
-  long r = __px_read(0, fd, (long)buf, n);
-  long h = u_h_(r);
-  if (h < 0) return r;
-  return __vm_read((int)h, buf, n);
+  for (;;) {
+    long r = __px_read(0, fd, (long)buf, n);
+    if (r == -85) continue; /* -ERESTART: SIGTTIN stopped us before the read (rung-3 tail) —
+                               re-issue; the stop benches at the re-issued dispatch and a later
+                               SIGCONT re-runs the op under the then-current pgid. */
+    long h = u_h_(r);
+    if (h < 0) return r;
+    return __vm_read((int)h, buf, n);
+  }
 }
 long write(long fd, void *buf, long n) {
   long r = __px_write(0, fd, (long)buf, n);

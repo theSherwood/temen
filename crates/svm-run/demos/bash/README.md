@@ -190,13 +190,28 @@ background-job block in the capstone). Three mechanisms, each a real gap the ses
 Also en route: root exit now sweeps parked pipe readers/writers and `waitpid` benchers in
 `teardown_run` (a pre-existing leak — a twin parked in a pipe read at root exit hung the run).
 
+## Rung-3 tail (DONE) — `bg` without the read steal; here-docs pinned
+
+- **The `-ERESTART` sentinel** — `bg`'s SIGCONT re-issued the stopped job's terminal read, which
+  re-rang SIGTTIN, but the deferred stop fire lagged one dispatch and the reader CONSUMED the
+  next typed line before parking (the second `jobs` after `bg` reached cat, not bash). POSIX
+  stops *before* the I/O and the kernel transparently restarts it after continue — so the read
+  op now returns `-ERESTART` (-85) instead of minting the input tag while a stop is pending, and
+  both guest read wrappers (`bash_shim.c`, `posix_utils/util.c`) loop on it: the stop lands at
+  the re-issued dispatch's safepoint poll, before the pipe is touched. Gated by a fourth
+  interactive session block (`cat & → jobs → bg → jobs → kill -9 %1 → exit`, asserting the
+  second `jobs` still lists the job).
+- **Here-docs came free** — the slice-4 "remaining" note was stale: bash spools each here-doc
+  into an unlinked temp file, which the #800/#801 fs surface already serves. All shapes work
+  (expansion, quoted-delimiter, `<<-`, here-strings, builtin `read`/loops, exec'd commands);
+  six differential scripts now pin them.
+
 ## What remains (the slice ladder from the #802 sketch)
 
-- **Rung 3 tail**: `bg` (works mechanically — SIGCONT + the re-read re-rings SIGTTIN — but has
-  no dedicated gate), and the `^D`-EOF nuance (the one-shot EOF is writer-count state, so the
-  shell's next read can consume an EOF meant for the job — native VEOF is a queued, one-READ
-  event; the capstone sessions don't currently trip it).
-- **Slice 4 remainder**: here-docs, the `$?`-after-self-SIGINT edge above.
+- The `^D`-EOF nuance (the one-shot EOF is writer-count state, so the shell's next read can
+  consume an EOF meant for the job — native VEOF is a queued, one-READ event; the capstone
+  sessions don't currently trip it).
+- The `$?`-after-self-SIGINT edge above (slice 4's known nuance).
 - Known band-0 papering (revisit when a differential trips over one): `fstat` synthesizes a
   chr-device for fds 0-2 and re-stats the recorded open path otherwise; `st_ino` is a path hash
   (same-file checks distinguish paths, not hardlinks); `sigsuspend` returns `EINTR` without
