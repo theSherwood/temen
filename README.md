@@ -18,14 +18,21 @@ and the security rules a change must not break are in [`INVARIANTS.md`](INVARIAN
 ## Why this exists
 
 WebAssembly proved you can run untrusted code safely at near-native speed, and it's
-the bar we measure against. But wasm carries baggage for the systems-programming use
-case: a flat 32-bit linear memory, a heavy interface (WASI + the component model +
-WIT + lift/lower marshalling), no runtime nesting, and design choices (GC,
-`externref`, JS interop) aimed at a broader market than native code needs.
+the bar we measure against. But wasm carries baggage: a flat 32-bit linear memory, a
+heavy interface (WASI + the component model + WIT + lift/lower marshalling), no
+runtime nesting, awkward concurrency, and design choices — a built-in GC, `externref`,
+UTF-16, JS interop — shaped by the browser and a broad managed-language market rather
+than by the needs of code running natively on a host.
 
-This project asks: if you target **only** systems/native languages (C, C++, Rust,
-Zig, Swift) and drop the rest, how much simpler and faster can the sandbox be? The
-answer we're chasing:
+This project asks the opposite question: build the sandbox for **running untrusted
+native (and native-ish) code on a host** — aimed first at systems languages (C, C++,
+Rust, Zig, Swift), though not limited to them — and see how much simpler, faster, and
+more capable it can be. It is **not tied to JavaScript's needs**, and while it stays
+committed to *not* absorbing wasm's GC complexity, it isn't hostile to managed
+languages either: a guest can bring its own collector and the VM helps it (conservative
+root enumeration), instead of baking a garbage collector into the platform.
+
+What we're chasing:
 
 - **Security parity with wasm, honestly scoped.** The bar is "as secure for the host
   as [Wasmtime](https://wasmtime.dev)," not a proof of escape-impossibility. We share
@@ -33,23 +40,52 @@ answer we're chasing:
   code generator — so the trust boundary we actually own is small: a tiny,
   single-pass **verifier** plus one isolated **memory-confinement** lowering pass.
   Both are kept dependency-free and fuzzed continuously.
+- **A radically simpler interface.** Scalars, `(ptr, len)` own/borrow buffers, and
+  capability handles — no IDL, no lift/lower, structured data is just bytes. The host
+  exposes an **open capability surface** (the "powerbox") instead of a fixed WASI menu,
+  and it's the *only* channel out of the sandbox.
 - **Faster where wasm is weak.** Sharing Cranelift means tight scalar compute runs at
   *parity* with wasm by construction — we don't pretend to beat the same backend. The
-  speed budget is spent *around* compute: the host-call / I/O interface (zero-copy
-  buffers, no component-model marshalling), a clean 64-bit address space, host-native
-  SIMD, faster startup (SSA is already on the wire), and irregular control flow.
-- **A simpler interface.** Scalars, `(ptr, len)` own/borrow buffers, and capability
-  handles — no IDL, no lift/lower, structured data is just bytes.
+  speed budget is spent *around* compute, and this is where a lot of it lives:
+    - **Zero-copy host calls / I/O** — borrow buffers are read in place through the
+      page table, so a guest region can go straight to a device or GPU with no
+      copy-out (vs wasm's mandatory linear-memory→host hop), and `cap.call` is a
+      devirtualized register-to-register call, not component-model marshalling.
+    - **A clean 64-bit address space** — a real 64-bit window, no 32-bit index type,
+      so large or sparse programs are a first-class target instead of a fight.
+    - **Faster startup** — SSA is already on the wire (no reconstruction from a stack
+      machine), and decls-before-bodies let per-function verify+JIT run in parallel.
+    - **Native irregular control flow** — irreducible CFGs (which wasm can't express
+      without a relooper), plus tail calls, multi-return, and first-class stack
+      switching as a single primitive.
+    - **Host-native SIMD** — the LLVM on-ramp targets the actual CPU's 128-bit SIMD,
+      richer than wasm's portable `simd128`.
 - **Real, guest-visible virtual memory.** The guest holds an attenuable address-space
   capability (`map`/`unmap`/`protect` within its window) — sparse address spaces,
   demand paging, and lending sub-ranges out — not just `memory.grow` on one blob.
-- **Nested sandboxes (VM-in-VM).** A guest can spawn a child domain in a sub-window
-  with an attenuated subset of its own capabilities; confinement composes to any
-  depth. Multi-tenant hosts and plugin-in-plugin fall out for free.
+- **Simpler concurrency, all the way up.** Fibers, 1:1 threads, and cross-domain
+  processes are exposed as clean primitives — plus atomics and a futex — so building
+  M:N schedulers, async runtimes, and multithreaded code is far less awkward than on
+  wasm. The VM ships the primitives, not a scheduler.
+- **Nested sandboxes with no extra virtualization cost.** A guest can spawn a child
+  domain in a sub-window with an attenuated subset of its own capabilities;
+  confinement composes to any depth at depth-independent per-access cost. Multi-tenant
+  hosts and plugin-in-plugin fall out for free.
+- **A JIT *inside* the sandbox.** A guest (say, a language runtime) can build IR at
+  run time, hand it across a capability, and have the host verify and Cranelift-compile
+  it into the guest's *own* domain — verification, not isolation, is the trust
+  boundary. wasm handles this poorly.
+- **Durable domains.** A running domain can be quiesced, serialized, and restored
+  bytewise — recompile-survivable and backend-independent — so guests can be
+  snapshotted, migrated, or persisted.
+- **Time-travel debugging.** An interpreter-backed debugger (Debug Adapter Protocol)
+  gives source-level breakpoints, stepping, and backtraces over the IR's debug info —
+  no DWARF or JIT needed — with time-travel (step backward) as the WIP headline.
 
-The deliberate trade: managed languages are **not** first-class (no GC, no JS
-interop, no UTF-16 / `externref` / component-IDL surface). Narrowing the market is
-what buys the small verifier and lean ABI — that's the product.
+The through-line: leaving out the browser/managed-language surface (a built-in GC,
+JS interop, UTF-16, `externref`, a component IDL) is what keeps the verifier and ABI
+small enough to trust — and that lean core is what makes the memory, concurrency,
+nesting, and tooling wins above affordable.
 
 ## What it aims to be
 
