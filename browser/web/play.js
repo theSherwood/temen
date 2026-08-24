@@ -840,7 +840,7 @@ int main(void) {
     kind: 'module',
     url: './assets/nim_hello.temen',
     mode: 'io',
-    desc: "A **real Nim program** — `import std/syncio` / `write(stdout, \"hello, svm\\n\")` — compiled " +
+    desc: "A **real Nim program** — `import std/syncio` / `write(stdout, \"hello, temen\\n\")` — compiled " +
       "all the way to a runnable Temen module and **run client-side in the sandbox**. The full nimony " +
       "toolchain (nifler → nimony → hexer) lowered the Nim to Leng, `temen-leng` translated + linked it " +
       "against the real compiled `system` module, and the nim→powerbox bridge wired its bottom edge to " +

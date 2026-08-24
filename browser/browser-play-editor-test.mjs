@@ -98,7 +98,7 @@ try {
   }
 
   // The "run real Nim" card: runs the committed nim_hello.temen — a real Nim program
-  // (`write(stdout, "hello, svm\n")`) compiled through nimony → temen-leng → the nim→powerbox bridge to a
+  // (`write(stdout, "hello, temen\n")`) compiled through nimony → temen-leng → the nim→powerbox bridge to a
   // runnable module — and shows its **real stdout**, a Nim program printing on the Temen, client-side.
   // The asset is committed (always present), so no build guard.
   const nimCard = 'nim (Nim → Temen, runs)';
@@ -107,7 +107,7 @@ try {
     state: document.querySelector(`${sel} .state`).dataset.state,
     stdout: document.querySelector(`${sel} .stdout`).textContent,
   }), card(nimCard));
-  nim.state === 'done' && nim.stdout.includes('hello, svm')
+  nim.state === 'done' && nim.stdout.includes('hello, temen')
     ? ok('run-real-Nim card: nim_hello.temen printed its greeting in-browser')
     : fail(`nim run: state=${nim.state} stdout=${nim.stdout.slice(0, 80)}`);
 
