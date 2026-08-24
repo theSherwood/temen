@@ -340,7 +340,7 @@ fn demo_clay_layout_runs() {
         String::from_utf8_lossy(&out.stdout),
         "3 render commands:\n\
          \x20 cmd 1 bbox=(16,16 768x40)\n\
-         \x20 cmd 3 bbox=(16,16 152x18)\n\
+         \x20 cmd 3 bbox=(16,16 168x18)\n\
          \x20 cmd 1 bbox=(16,64 768x520)\n",
     );
 }
