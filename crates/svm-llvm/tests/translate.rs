@@ -12731,4 +12731,78 @@ fn demo_bash_translates_and_verifies() {
             "no dup'd-tty termios failures (stderr: {err:?})"
         );
     }
+
+    // ▶ Interactive rung 3 (#802): **background jobs** — `cat &` starts a job that immediately
+    // reads the terminal from the BACKGROUND, which rings SIGTTIN and stops it (default action);
+    // the parent learns of the stop through the freshly-generated **SIGCHLD** (bash's `waitchld`
+    // handler — without it `jobs` said Running and `fg` skipped its SIGCONT), so `jobs` lists it
+    // Stopped and `fg` continue-and-foregrounds it for real: the resumed cat reads the next typed
+    // line. The session also pins the any-child park key (`ParkEvent::TaskExitAny`): bash's
+    // foreground `waitpid(-1, WUNTRACED)` benches under the per-parent wildcard, so a stopped
+    // background sibling can no longer absorb the bench while the foreground child exits
+    // (the `cat &` hang this rung started from).
+    {
+        let (posix3, make) = svm_posix::cap(0, 0, Vec::new());
+        let fork = svm_posix::cap_fork_factory(&posix3);
+        let p = posix3.clone();
+        let bins_for_grant = std::sync::Arc::clone(&bins);
+        let cap3 = svm_run::HostCap::custom(svm_interp::cap_id::HOST_PROC, 0, move |h, _win| {
+            let handle = h.grant_host_proc_forkable(make(), std::sync::Arc::clone(&fork));
+            let (door, armed) = svm_posix::cap_signal_source(&p);
+            h.set_signal_source(door, armed);
+            h.push_exec_remap_hook(svm_posix::cap_exec_remap_hook(&p));
+            let (names, sigs) = svm_posix::cap_vtable();
+            h.set_host_proc_vtable(handle, names, sigs);
+            for (path, m, wl) in bins_for_grant.iter() {
+                let mh = h.grant_module(m);
+                p.register_executable(path, mh, *wl);
+            }
+            p.enable_terminal(h);
+            handle
+        });
+        let feeder = {
+            let px = posix3.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                for keys in ["cat &\n", "jobs\n", "fg\n", "via-bg-fg\n", "\x04", "exit\n"] {
+                    px.feed_terminal(keys.as_bytes());
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+            })
+        };
+        let config = svm_run::RunConfig {
+            args: vec![b"bash".to_vec(), b"-i".to_vec()],
+            env: vec![
+                b"PATH=/bin".to_vec(),
+                b"HOME=/".to_vec(),
+                b"PS1=$ ".to_vec(),
+            ],
+            ..Default::default()
+        };
+        let run = inst
+            .run_with_caps(svm_run::Backend::TreeWalk, &config, &[("posix", cap3)])
+            .expect("bash -i background-job session");
+        feeder.join().expect("feeder thread");
+        assert_eq!(
+            run.outcome,
+            svm_run::Outcome::Exited(0),
+            "clean session exit (no lingering stopped job blocked `exit`)"
+        );
+        let out = String::from_utf8_lossy(&posix3.stdout()).into_owned();
+        let err = String::from_utf8_lossy(&posix3.stderr()).into_owned();
+        assert!(
+            err.contains("[1] "),
+            "bash announced the background job (stderr: {err:?})"
+        );
+        assert!(
+            out.contains("[1]+  Stopped                 cat"),
+            "jobs listed the SIGTTIN-stopped background job — the SIGCHLD reached bash \
+             (stdout: {out:?})"
+        );
+        let echoes = out.matches("via-bg-fg").count();
+        assert!(
+            echoes >= 2,
+            "the fg'd background cat read the terminal (echo + cat's copy; stdout: {out:?})"
+        );
+    }
 }

@@ -312,6 +312,7 @@ const UNMASKABLE: u64 = (1 << 9) | (1 << 19);
 use svm_ir::errno::*;
 
 /// #798 — the job-control signal numbers (Linux values, like every signum here).
+const SIGCHLD: i32 = 17; // a child stopped, continued, or exited (#802 rung 3 — now generated)
 const SIGCONT: i32 = 18; // continue a stopped process (also deliverable if caught)
 const SIGSTOP: i32 = 19; // unconditional stop (uncatchable)
 const SIGTSTP: i32 = 20; // the terminal ^Z — stop unless caught/ignored
@@ -1353,23 +1354,49 @@ impl Posix {
         if !(1..=63).contains(&signum) {
             return EINVAL;
         }
-        let wake = {
+        let (wake, transitioned) = {
             let w = self.world.lock().unwrap_or_else(|e| e.into_inner());
             match w.procs.get(&pid) {
                 Some(ProcEntry::Live(t)) => {
                     let mut tp = t.lock().unwrap_or_else(|e| e.into_inner());
                     // The delivery gate (#798 slice 2): pending, stop, or continue by the
                     // target's dispositions; fired below, after the locks drop.
-                    tp.deliver_signal(signum)
+                    let was_stopped = tp.stopped_sig.is_some();
+                    let f = tp.deliver_signal(signum);
+                    // #802 rung 3 — stopped or continued: SIGCHLD its parent (below, unlocked).
+                    let trans = (was_stopped != tp.stopped_sig.is_some()).then_some(tp.ppid);
+                    (f, trans)
                 }
-                Some(ProcEntry::Zombie { .. }) => None, // exists until reaped; takes no signal
+                Some(ProcEntry::Zombie { .. }) => (None, None), // unreaped; takes no signal
                 None => return ESRCH,
             }
         };
         if let Some(f) = wake {
             f();
         }
+        if let Some(ppid) = transitioned {
+            self.chld_to(ppid);
+        }
         0
+    }
+
+    /// #802 rung 3 — deliver `SIGCHLD` to table process `ppid` (a child of theirs transitioned),
+    /// firing the returned wake after the locks drop. The embedder-path twin of
+    /// [`Ctx::notify_parent_chld`]; an absent, dead, or handler-less parent is a no-op.
+    fn chld_to(&self, ppid: i32) {
+        let wake = {
+            let w = self.world.lock().unwrap_or_else(|e| e.into_inner());
+            match w.procs.get(&ppid) {
+                Some(ProcEntry::Live(t)) => t
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .deliver_signal(SIGCHLD),
+                _ => None,
+            }
+        };
+        if let Some(f) = wake {
+            f();
+        }
     }
 }
 
@@ -1829,9 +1856,9 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
         let exit_world = Arc::clone(&world);
         let exit_child = Arc::clone(&child);
         let exit = Arc::new(move |status: i64| {
-            let (term, pgid) = {
+            let (term, pgid, ppid) = {
                 let c = exit_child.lock().unwrap_or_else(|e| e.into_inner());
-                (c.term_sig, c.pgid)
+                (c.term_sig, c.pgid, c.ppid)
             };
             let encoded = match term {
                 Some(sig) => sig & 0x7f,
@@ -1845,6 +1872,17 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
                     pgid,
                 },
             );
+            // #802 rung 3 — the exit is a child transition: pend SIGCHLD in the parent, ARM
+            // ONLY (the returned fire is deliberately dropped — this hook runs under the core's
+            // scheduler lock, and the parent's run-wake would re-take it). A parent benched in
+            // a blocking `waitpid` is woken by the core's own twin-completion drain; a parent
+            // parked elsewhere consumes the pending signal at its next delivery point.
+            if let Some(ProcEntry::Live(t)) = w.procs.get(&ppid) {
+                let _ = t
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .deliver_signal(SIGCHLD);
+            }
         });
         ForkedProc {
             handler: handler(Arc::clone(&world), Arc::clone(&child)),
@@ -2515,6 +2553,13 @@ impl Ctx<'_> {
         // pipe (park on empty, EINTR, one-shot ^D EOF — the #972 path). The Stdin sentinel
         // stays the preloaded-stdin world's binding.
         if fd == 0 && self.w.terminal.is_some() && matches!(self.fd(fd), Some(FdEntry::Stdin)) {
+            // #798/#802 interactive rung 3 — a BACKGROUND read from the terminal rings SIGTTIN
+            // (default action: STOP) before the tag mints, mirroring the write-side SIGTTOU
+            // doorbell. The stop fires after this dispatch's locks drop; the guest then parks on
+            // the (empty) input pipe, a keystroke's wake re-admits it, and the safepoint poll
+            // parks it Stopped BEFORE the rewound read re-executes — so the keystroke goes to
+            // the foreground shell and a later `fg` + SIGCONT re-runs the read as foreground.
+            self.tty_background_check(SIGTTIN);
             // #797 interactive rung 2 — mint the tag from THIS process's own token (handle
             // values are per-powerbox; the world's is the root namespace's). A process without
             // one (pre-terminal, spawn delegate) keeps the world handle.
@@ -3152,47 +3197,45 @@ impl Ctx<'_> {
             // STOP (the `Blocked::Stopped` insert drain), and the re-executed op reports.
             if (opts & WNOHANG) == 0 {
                 if let Some(req) = self.p.park_req.clone() {
-                    let target: Option<u64> = if pid > 0 {
+                    let target: Option<svm_interp::ParkEvent> = if pid > 0 {
                         match self.w.procs.get(&(pid as i32)) {
                             Some(ProcEntry::Live(t)) => t
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
                                 .core_task
-                                .then_some(pid as u64),
+                                .then_some(svm_interp::ParkEvent::TaskExit(pid as u64)),
                             _ => None,
                         }
                     } else if pid == -1 {
-                        // #802 slice 4 — the **any-child** blocking wait (`waitpid(-1, …, 0)`,
-                        // bash's no-job-control `waitchld`: its subshell/command-substitution/
-                        // foreground-pipeline waits all ride this): bench on the LOWEST live
-                        // core-twin child. The caller-request door carries one park key, so
-                        // this is an approximation of "any child" — correct for foreground
-                        // waits, where the caller loops reaping until ALL its children are
-                        // gone (a wake on any one of them re-runs the loop, and every
-                        // foreground stage exits). A never-exiting BACKGROUND child could
-                        // absorb the bench while a foreground sibling's exit goes unnoticed —
-                        // background jobs ride the `WNOHANG`/job-control paths today, and the
-                        // true any-child park key is a later rung. Before this, `-ECHILD`
-                        // came back immediately and bash raced past its unfinished subshell.
+                        // #802 slice 4 / rung 3 — the **any-child** blocking wait
+                        // (`waitpid(-1, …)`, bash's `waitchld`: subshell, command-substitution,
+                        // foreground-pipeline, and — with job control — the `WUNTRACED`
+                        // foreground wait all ride this): with ≥1 live core-twin child, bench
+                        // on the WILDCARD key (`ParkEvent::TaskExitAny`) — every child
+                        // transition (exit, stop, continue) wakes it, so a never-exiting
+                        // background child cannot absorb the bench while a foreground
+                        // sibling's exit goes unnoticed (the failure the old lowest-live-child
+                        // approximation had: `cat &` then a foreground command hung the shell
+                        // on the stopped cat). Before slice 4, `-ECHILD` came back immediately
+                        // and bash raced past its unfinished subshell.
                         let self_pid = self.p.pid;
-                        let mut lowest: Option<u64> = None;
-                        for (&tpid, e) in self.w.procs.iter() {
-                            let ProcEntry::Live(t) = e else { continue };
-                            if tpid == self_pid {
-                                continue;
-                            }
-                            let tp = t.lock().unwrap_or_else(|e| e.into_inner());
-                            if !tp.core_task || tp.ppid != self_pid {
-                                continue;
-                            }
-                            lowest = Some(lowest.map_or(tpid as u64, |l| l.min(tpid as u64)));
-                        }
-                        lowest
+                        self.w
+                            .procs
+                            .iter()
+                            .any(|(&tpid, e)| {
+                                let ProcEntry::Live(t) = e else { return false };
+                                if tpid == self_pid {
+                                    return false;
+                                }
+                                let tp = t.lock().unwrap_or_else(|e| e.into_inner());
+                                tp.core_task && tp.ppid == self_pid
+                            })
+                            .then_some(svm_interp::ParkEvent::TaskExitAny)
                     } else {
                         None
                     };
-                    if let Some(t) = target {
-                        req(svm_interp::ParkEvent::TaskExit(t));
+                    if let Some(ev) = target {
+                        req(ev);
                     }
                 }
             }
@@ -3261,12 +3304,19 @@ impl Ctx<'_> {
             }
             // Through the delivery gate (#798 slice 2): a self-raised SIGTSTP stops US at the
             // next per-op poll — the fire is deferred past this dispatch's locks like any other.
+            let was_stopped = self.p.stopped_sig.is_some();
             if let Some(f) = self.p.deliver_signal(sig as i32) {
                 self.wake_after.push(f);
+            }
+            // #802 rung 3 — a stop/continue is a child transition: SIGCHLD our parent.
+            if was_stopped != self.p.stopped_sig.is_some() {
+                let ppid = self.p.ppid;
+                self.notify_parent_chld(ppid);
             }
             return 0;
         }
         // #863 slice 2 — any other pid is a process-table lookup.
+        let transitioned: Option<i32>;
         match self.w.procs.get(&(pid as i32)) {
             Some(ProcEntry::Live(t)) => {
                 // Not self (guarded above), so this is a different mutex — World → Proc, the
@@ -3278,15 +3328,22 @@ impl Ctx<'_> {
                 // The delivery gate (#798 slice 2) decides pending/stop/continue by the TARGET's
                 // dispositions; whatever it returns fires only after this dispatch's locks drop
                 // ([`Ctx::wake_after`]), never under ours.
+                let was_stopped = tp.stopped_sig.is_some();
                 if let Some(f) = tp.deliver_signal(sig as i32) {
                     self.wake_after.push(f);
                 }
-                0
+                // #802 rung 3 — target stopped or continued: SIGCHLD its parent (after the
+                // target's lock drops — sibling `Proc` locks never nest).
+                transitioned = (was_stopped != tp.stopped_sig.is_some()).then_some(tp.ppid);
             }
             // A zombie exists until reaped (POSIX: kill succeeds) but takes no signal.
-            Some(ProcEntry::Zombie { .. }) => 0,
-            None => ESRCH,
+            Some(ProcEntry::Zombie { .. }) => return 0,
+            None => return ESRCH,
         }
+        if let Some(ppid) = transitioned {
+            self.notify_parent_chld(ppid);
+        }
+        0
     }
 
     /// `kill(-pgid, sig)` (#798) — the **process-group sweep**: raise `sig` on every live table
@@ -3296,12 +3353,19 @@ impl Ctx<'_> {
     /// group existence.
     fn kill_pgroup(&mut self, pgid: i32, sig: i64) -> i64 {
         let mut any = false;
+        // #802 rung 3 — members the sweep stopped or continued: their parents get SIGCHLD
+        // after the iteration (never while a member's `Proc` is held — sibling locks don't nest).
+        let mut transitioned: Vec<i32> = Vec::new();
         // Self first (no table lock — this dispatch already holds our `Proc`).
         if self.p.pgid == pgid {
             any = true;
             if sig != 0 {
+                let was_stopped = self.p.stopped_sig.is_some();
                 if let Some(f) = self.p.deliver_signal(sig as i32) {
                     self.wake_after.push(f);
+                }
+                if was_stopped != self.p.stopped_sig.is_some() {
+                    transitioned.push(self.p.ppid);
                 }
             }
         }
@@ -3319,10 +3383,17 @@ impl Ctx<'_> {
             }
             any = true;
             if sig != 0 {
+                let was_stopped = tp.stopped_sig.is_some();
                 if let Some(f) = tp.deliver_signal(sig as i32) {
                     self.wake_after.push(f);
                 }
+                if was_stopped != tp.stopped_sig.is_some() {
+                    transitioned.push(tp.ppid);
+                }
             }
+        }
+        for ppid in transitioned {
+            self.notify_parent_chld(ppid);
         }
         if any {
             0
@@ -3440,7 +3511,37 @@ impl Ctx<'_> {
             // (POSIX: an ignored TTOU write goes through); caught pends. The stop fires after
             // this dispatch's locks drop, so the current I/O completes first — close enough to
             // the letter (POSIX stops before the I/O) and honest about it.
+            let was_stopped = self.p.stopped_sig.is_some();
             if let Some(f) = self.p.deliver_signal(sig) {
+                self.wake_after.push(f);
+            }
+            // #802 rung 3 — the stop is a child transition: SIGCHLD the parent (POSIX), so an
+            // interactive shell's handler (bash's `waitchld`) learns a background job stopped
+            // for tty access before the user types `fg` (which only SIGCONTs a job it knows
+            // is stopped).
+            if !was_stopped && self.p.stopped_sig.is_some() {
+                let ppid = self.p.ppid;
+                self.notify_parent_chld(ppid);
+            }
+        }
+    }
+
+    /// #802 rung 3 — a child of `ppid` just transitioned (stopped, continued, or exited): raise
+    /// `SIGCHLD` in the parent through its delivery gate (POSIX), deferring the fire like any
+    /// other delivery ([`Ctx::wake_after`]). A parent without a handler discards it at generation
+    /// (`SIGCHLD` is default-ignore); the shell that installs one (interactive bash) gets its
+    /// `waitchld` run and keeps its job table live. Self-delivery when the signaler IS the
+    /// parent (`fg`'s own `killpg(SIGCONT)`); an absent or dead parent is a no-op.
+    fn notify_parent_chld(&mut self, ppid: i32) {
+        if ppid == self.p.pid {
+            if let Some(f) = self.p.deliver_signal(SIGCHLD) {
+                self.wake_after.push(f);
+            }
+            return;
+        }
+        if let Some(ProcEntry::Live(t)) = self.w.procs.get(&ppid) {
+            let mut tp = t.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(f) = tp.deliver_signal(SIGCHLD) {
                 self.wake_after.push(f);
             }
         }
