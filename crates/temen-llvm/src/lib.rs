@@ -1028,15 +1028,9 @@ fn translate_impl(
         // funcrefs resolve through `name2idx`, now built).
         let ctors = collect_global_ctors(m, &name2idx)?;
         // Both entries share `StartBuilder`; `synth_start_argv` adds the §3e args-buffer → `argv[]`
-        // parsing for a `main(int, char**)`, `synth_start` is the plain `main(void)` entry.
-        // §14 child-entry mode (#1011 slice 3c): an argv-taking `main` under child-entry is not yet
-        // supported (the argv `_start`'s multi-block return would also need the i64-status widening);
-        // refuse it as a clean translate-time error rather than silently emit a non-child entry.
-        if opts.child_entry && wants_argv {
-            return Err(Error::Unsupported(
-                "child_entry: an argv-taking main is not yet supported".into(),
-            ));
-        }
+        // parsing for a `main(int, char**)`, `synth_start` is the plain `main(void)` entry. Both honor
+        // §14 child-entry mode (#1011 slice 3c) — the starter param + i64-status return — so a
+        // `main(argc, argv)` phase (e.g. `nifler p <in> <out>`) is `instantiate_module`-able too.
         let build_start: StartBuilder = if wants_argv {
             synth_start_argv
         } else {
@@ -4365,10 +4359,12 @@ fn synth_start_argv(
     // #964 guarded layout: every low-scratch address (heap words, the args blob) shifts up by this
     // (0 = legacy).
     scratch: u64,
-    // §14 child-entry mode: shares [`StartBuilder`] with [`synth_start`]. An argv-taking child entry is
-    // not yet supported (deferred to a later slice-3c increment); the caller refuses the combination, so
-    // this is always `false` here.
-    _child_entry: bool,
+    // §14 child-entry mode (#1011 slice 3c): the entry takes a starter capability (`v0`, ignored — the
+    // child reaches its caps through re-granted named imports) and returns `main`'s result widened to the
+    // `i64` status the parent reads via `join`, matching the `instantiate_module` child ABI. The argv
+    // parsing itself is identical (a child reads its parent-seeded args buffer at `POWERBOX_ARGS_BASE`
+    // exactly as a top-level run does).
+    child_entry: bool,
 ) -> Func {
     use temen_ir::{LoadOp, StoreOp};
     let args_base = (scratch + temen_ir::POWERBOX_ARGS_BASE) as i64;
@@ -4401,10 +4397,15 @@ fn synth_start_argv(
     // ---- block 0: entry — resolve handles by name, seed the heap, load argc, jump into the argv loop.
     // A **paramless** `_start` (S15 c): the granted handles are resolved by name into the stash (the
     // name bytes staged transiently at `entry_sp`, above the argv array the loop below writes), not
-    // received as positional args.
-    let params: Vec<ValType> = Vec::new();
+    // received as positional args. Under §14 child-entry the entry instead takes the starter capability
+    // as `v0` (ignored); block 0's own values renumber above it (they are `next`-based).
+    let params: Vec<ValType> = if child_entry {
+        vec![ValType::I64]
+    } else {
+        Vec::new()
+    };
     let mut insts: Vec<Inst> = Vec::new();
-    let mut next: ValIdx = 0;
+    let mut next: ValIdx = params.len() as ValIdx;
     if let Some(hb) = heap_base {
         for off in [scratch + HEAP_BRK, scratch + HEAP_TOP] {
             insts.push(Inst::ConstI64(off as i64));
@@ -4565,10 +4566,28 @@ fn synth_start_argv(
             func: main_idx,
             args: vec![13, 14, 1],
         });
-        let term = if main_results.is_empty() {
+        // main's result is v15 (params 1 + 14 value insts before the call). A top-level entry returns
+        // it verbatim (or `()` for a void main); a §14 child entry returns the i64 status the parent
+        // joins — `0` for void, else `main`'s result widened to i64.
+        let term = if child_entry {
+            match main_results.first() {
+                None => {
+                    d.push(Inst::ConstI64(0)); // void main → status 0, at v15
+                    Terminator::Return(vec![15])
+                }
+                Some(ValType::I64) => Terminator::Return(vec![15]),
+                Some(_) => {
+                    d.push(Inst::Convert {
+                        op: ConvOp::ExtendI32U,
+                        a: 15,
+                    }); // widen i32 status → v16
+                    Terminator::Return(vec![16])
+                }
+            }
+        } else if main_results.is_empty() {
             Terminator::Return(vec![])
         } else {
-            Terminator::Return(vec![15]) // main's result (params 1 + 14 value insts before the call)
+            Terminator::Return(vec![15])
         };
         let b5 = Block {
             params: vec![ValType::I64],
@@ -4576,7 +4595,12 @@ fn synth_start_argv(
             term,
         };
         return Func {
-            results: main_results.to_vec(),
+            // A §14 child entry always returns the i64 join status; a top-level entry returns main's.
+            results: if child_entry {
+                vec![ValType::I64]
+            } else {
+                main_results.to_vec()
+            },
             blocks: vec![b0, b1, b2, b3, b4, b5],
             params: params.clone(),
         };
@@ -4732,10 +4756,27 @@ fn synth_start_argv(
         func: main_idx,
         args: vec![13, 15, 16, 1],
     });
-    let term = if main_results.is_empty() {
+    // main's result is v17 (params 2 + 15 value insts before the call); §14 child entry returns the i64
+    // status (0 for void, else widened), a top-level entry returns main's value verbatim. See block 5.
+    let term = if child_entry {
+        match main_results.first() {
+            None => {
+                e.push(Inst::ConstI64(0)); // void main → status 0, at v17
+                Terminator::Return(vec![17])
+            }
+            Some(ValType::I64) => Terminator::Return(vec![17]),
+            Some(_) => {
+                e.push(Inst::Convert {
+                    op: ConvOp::ExtendI32U,
+                    a: 17,
+                }); // widen i32 status → v18
+                Terminator::Return(vec![18])
+            }
+        }
+    } else if main_results.is_empty() {
         Terminator::Return(vec![])
     } else {
-        Terminator::Return(vec![17]) // main's result (params 2 + 15 value insts before the call)
+        Terminator::Return(vec![17])
     };
     let b10 = Block {
         params: vec![ValType::I64, ValType::I64],
@@ -4744,7 +4785,12 @@ fn synth_start_argv(
     };
 
     Func {
-        results: main_results.to_vec(),
+        // A §14 child entry always returns the i64 join status; a top-level entry returns main's result.
+        results: if child_entry {
+            vec![ValType::I64]
+        } else {
+            main_results.to_vec()
+        },
         blocks: vec![b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10],
         params: params.clone(),
     }

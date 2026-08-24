@@ -635,6 +635,14 @@ pub struct Compiled {
     /// `len - 1` of the natural table (`next_power_of_two(n_funcs)`), used to mask a `ref.func`/fiber
     /// funcref to a module-local slot (the fiber/coroutine dispatch is module-0-natural).
     table_mask: usize,
+    /// The module's §7 import manifest + type section, retained **only for a §14 separate-module
+    /// child** (op 5 / op 13) so [`Vcpu::new_confined_child_core`] can bind each import slot against the
+    /// child's granted powerbox ([`Host::bind_child_manifest`] — the same call the tree-walker's op-13
+    /// arm makes), letting a compiled phase child reach its re-granted `fs`/`stdout` through `call.import`
+    /// rather than `CapFault`ing. Empty for the root program and same-module (op-0) children — their
+    /// imports are bound by the run harness, not here — so binding is a no-op for every legacy path.
+    imports: std::sync::Arc<[temen_ir::Import]>,
+    types: std::sync::Arc<[temen_ir::TypeEntry]>,
 }
 
 impl Compiled {
@@ -1174,7 +1182,27 @@ fn compile_module_with(funcs: &[Func], fuse: bool) -> Option<Compiled> {
             .map(|f| (f.params.clone(), f.results.clone()))
             .collect(),
         table_mask,
+        // The manifest is attached only by the §14 separate-module spawn path (`with_manifest`); a
+        // plain compile (root program, same-module child) carries none, so child-spawn binding is a
+        // no-op for it.
+        imports: std::sync::Arc::from(Vec::new()),
+        types: std::sync::Arc::from(Vec::new()),
     })
+}
+
+impl Compiled {
+    /// Attach a §14 child's import manifest + type section (from its [`ModuleGrant`]) so
+    /// [`Vcpu::new_confined_child_core`] can bind it against the child's granted powerbox. Used only on
+    /// the `instantiate_module` (op 5 / op 13) commit path.
+    fn with_manifest(
+        mut self,
+        imports: std::sync::Arc<[temen_ir::Import]>,
+        types: std::sync::Arc<[temen_ir::TypeEntry]>,
+    ) -> Compiled {
+        self.imports = imports;
+        self.types = types;
+        self
+    }
 }
 
 fn compile_func(f: &Func, arities: &[usize], fuse: bool) -> Option<Program> {
@@ -3105,6 +3133,15 @@ impl<'p> Vcpu<'p> {
         // Install any re-granted caps (op-13 grant list) into the child powerbox under their names. The
         // starter entry args stay `[Instantiator, AddressSpace]`; re-granted caps are name-resolved.
         install_grants(&mut host);
+        // IMPORTS.md phase 3 / §3.3 — bind the child module's import manifest against its powerbox, so a
+        // §14 separate-module phase child's generic imports (`write`/`read`/`exit`, and any named grant
+        // like `fs`) reach their re-granted caps through `call.import` rather than `CapFault`ing on first
+        // use — the resumable-engine counterpart of the tree-walker op-13 arm's `bind_child_manifest`.
+        // Empty (root program / same-module child) → `Ok`, so every legacy path is unchanged; a `required`
+        // slot with nothing to bind fails the spawn closed (`Malformed`), matching the tree-walker's
+        // fail-closed refusal.
+        host.bind_child_manifest(&cunit.imports, &cunit.types)
+            .map_err(|_| Trap::Malformed)?;
         let args = if want_as {
             vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
         } else {
@@ -3571,19 +3608,34 @@ impl<'p> Vcpu<'p> {
         budget: i32,
         dst: u32,
     ) -> Result<Option<VcpuEvent>, Trap> {
-        // Resolve the granted module from the run's powerbox (the shared one when attached).
-        let (cfuncs, cmem_log2, cdata) = match self.shared_host {
+        // Resolve the granted module from the run's powerbox (the shared one when attached). Its
+        // import manifest + type section come along so the child's `call.import`s bind at spawn.
+        let (cfuncs, cmem_log2, cdata, cimports, ctypes) = match self.shared_host {
             Some(m) => {
                 let g = m.lock_unpoisoned();
                 let g = g.resolve_module(mh)?;
-                (g.funcs.clone(), g.memory_log2, g.data.clone())
+                (
+                    g.funcs.clone(),
+                    g.memory_log2,
+                    g.data.clone(),
+                    g.imports.clone(),
+                    g.types.clone(),
+                )
             }
             None => {
                 let g = self.host.resolve_module(mh)?;
-                (g.funcs.clone(), g.memory_log2, g.data.clone())
+                (
+                    g.funcs.clone(),
+                    g.memory_log2,
+                    g.data.clone(),
+                    g.imports.clone(),
+                    g.types.clone(),
+                )
             }
         };
-        let child_compiled = compile_module(&cfuncs).ok_or(Trap::Malformed)?;
+        let child_compiled = compile_module(&cfuncs)
+            .ok_or(Trap::Malformed)?
+            .with_manifest(cimports, ctypes);
         let ok_entry = child_compiled
             .sigs
             .get(entry as usize)
@@ -3601,7 +3653,11 @@ impl<'p> Vcpu<'p> {
             ibase,
             self.mem.as_ref().map_or(0, |m| m.null_guard),
         );
-        let mod_ok = cmem_log2 == Some(size_log2 as u8);
+        // A separate-module child's carve must be **at least** its declared memory (FORK.md §8.6 / #773
+        // — a larger window is a safe superset: confinement (§2) still masks every access to the actual
+        // carve, and the span above the declared memory is the heap room an allocating phase grows into
+        // via `vm_map`). `<=`, matching the cooperative/parallel drive arms.
+        let mod_ok = cmem_log2.is_some_and(|ml| ml <= size_log2 as u8);
         if !ok_entry || !fits || !mod_ok {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
             return Ok(None);
@@ -6587,7 +6643,9 @@ fn dbg_instantiate_module(
         ibase,
         shared_mem.as_ref().map_or(0, |m| m.null_guard),
     );
-    let mod_ok = cmem_log2 == Some(size_log2 as u8);
+    // A larger carve than the child's declared memory is a safe superset (§2 masks to the actual
+    // carve); the extra span is heap room for an allocating phase's `vm_map`. `<=`, matching the arms.
+    let mod_ok = cmem_log2.is_some_and(|ml| ml <= size_log2 as u8);
     if !ok_entry || !fits || !mod_ok {
         tasks[ti]
             .vt
@@ -10475,7 +10533,11 @@ impl CoopSched {
                         ibase,
                         mem.as_ref().map_or(0, |m| m.null_guard),
                     );
-                    let mod_ok = cmem_log2 == Some(size_log2 as u8);
+                    // A separate-module child's carve must be **at least** its declared memory (FORK.md §8.6 / #773
+                    // — a larger window is a safe superset: confinement (§2) still masks every access to the actual
+                    // carve, and the span above the declared memory is the heap room an allocating phase grows into
+                    // via `vm_map`). `<=`, matching the cooperative/parallel drive arms.
+                    let mod_ok = cmem_log2.is_some_and(|ml| ml <= size_log2 as u8);
                     if !ok_entry || !fits || !mod_ok {
                         tasks[ti]
                             .vt
@@ -12028,7 +12090,11 @@ fn run_vcpu_parallel<'scope, 'env>(
                     ibase,
                     mem.as_ref().map_or(0, |m| m.null_guard),
                 );
-                let mod_ok = cmem_log2 == Some(size_log2 as u8);
+                // A separate-module child's carve must be **at least** its declared memory (FORK.md §8.6 / #773
+                // — a larger window is a safe superset: confinement (§2) still masks every access to the actual
+                // carve, and the span above the declared memory is the heap room an allocating phase grows into
+                // via `vm_map`). `<=`, matching the cooperative/parallel drive arms.
+                let mod_ok = cmem_log2.is_some_and(|ml| ml <= size_log2 as u8);
                 if !ok_entry || !fits || !mod_ok {
                     vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
                     continue;
