@@ -12554,6 +12554,21 @@ fn demo_bash_translates_and_verifies() {
         // because the slice-4 README listed them as a remaining gap).
         "read a b <<< \"x y\"; echo \"read:$a/$b\"",
         "while read -r l; do echo \"loop:$l\"; done <<EOF\nl1\nl2\nEOF",
+        // Language differential — the pure-in-shell surface a 50-construct probe found working
+        // byte-identical to native (arrays, parameter expansion, brace expansion, arithmetic,
+        // [[ ]], printf, namerefs, extglob… all already exercised across the suite); these two
+        // pin the constructs that needed a FIX to reach parity:
+        //   • BASH_REMATCH — `[[ =~ ]]` filled no capture array until the guest regex_t/regmatch_t
+        //     ABI was matched to the host glibc <regex.h> (re_nsub@48, regoff_t=int); the match
+        //     itself always worked, so only the captures are the regression witness.
+        //   • process substitution `<(…)`/`>(…)` — bash's HAVE_DEV_FD path opens `/dev/fd/N`,
+        //     which the personality now resolves as a dup of that fd (a builtin producer/consumer
+        //     keeps it off the /bin path so it runs in this no-/bin block).
+        "[[ 2026-08-24 =~ ([0-9]+)-([0-9]+)-([0-9]+) ]]; \
+         echo \"${BASH_REMATCH[0]}|${BASH_REMATCH[1]}|${BASH_REMATCH[3]}|${#BASH_REMATCH[@]}\"",
+        "while read l; do echo \"ps:$l\"; done < <(printf 'x\\ny\\n')",
+        "echo hi > >(while read l; do echo \"up:$l\"; done); wait",
+        "echo piped | { read x < /dev/stdin; echo \"got:$x\"; }",
     ] {
         let config = temen_run::RunConfig {
             args: vec![b"bash".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()],

@@ -39,17 +39,29 @@ long __px_free(int cap, long ptr);
 #define RX_MAXSUB 32
 #define RX_STEPS 200000
 
+/* ABI note (#802 language differential): bash's TUs allocate `regex_t`/`regmatch_t` from the
+ * build host's glibc <regex.h> and read `re_nsub` + the `pmatch` offsets across the call, so this
+ * guest lib must match glibc's ABI byte-for-byte, NOT define a convenient layout. On the target
+ * (x86-64 glibc): sizeof(regex_t)==64 with re_nsub@48, and regmatch_t is {int rm_so; int rm_eo}
+ * (regoff_t is `int`, 8 bytes total). Getting this wrong still MATCHES (the internal fields are
+ * self-consistent within the guest) but leaves BASH_REMATCH empty — bash read re_nsub and the
+ * match offsets from the wrong places. The guest's own scratch fields overlay glibc's leading
+ * buffer/allocated/used/syntax/fastmap/translate slots (bash never reinterprets those for a
+ * compiled pattern; `regfree` frees rx_prog_ == glibc `buffer`). */
 typedef struct {
-  long re_nsub;
-  void *rx_prog_;   /* one block: instructions then class bitmaps */
-  long rx_nprog_;
-  long rx_ncls_;
-  int rx_cflags_;
-} regex_t;
+  void *rx_prog_;   /* @0  (glibc buffer)    — instructions then class bitmaps */
+  long rx_nprog_;   /* @8  (glibc allocated) */
+  long rx_ncls_;    /* @16 (glibc used) */
+  long rx_cflags_;  /* @24 (glibc syntax) */
+  void *rx_pad0_;   /* @32 (glibc fastmap)   — unused */
+  void *rx_pad1_;   /* @40 (glibc translate) — unused */
+  long re_nsub;     /* @48 (glibc re_nsub)   — the field bash reads */
+  long rx_pad2_;    /* @56 (glibc bitfields) — unused */
+} regex_t;          /* 64 bytes, glibc-compatible */
 
 typedef struct {
-  long rm_so;
-  long rm_eo;
+  int rm_so;        /* regoff_t (glibc: int) */
+  int rm_eo;
 } regmatch_t;
 
 /* --- AST ------------------------------------------------------------------ */
