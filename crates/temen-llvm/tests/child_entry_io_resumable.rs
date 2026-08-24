@@ -85,9 +85,9 @@ fn drive(
                     Some(host) => bytecode::Vcpu::new_confined_child_over_host(
                         prog, module, entry, back, size_log2, fuel, host,
                     ),
-                    None => {
-                        bytecode::Vcpu::new_confined_child(prog, module, entry, back, size_log2, fuel)
-                    }
+                    None => bytecode::Vcpu::new_confined_child(
+                        prog, module, entry, back, size_log2, fuel,
+                    ),
                 }
                 .expect("confined child builds");
                 let r = drive(prog, child_base, child);
