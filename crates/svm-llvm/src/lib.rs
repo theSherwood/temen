@@ -3232,6 +3232,11 @@ const HOST_PROC_TYPE_ID: u32 = 13;
 /// capability, reached from C via `__vm_region_call` (the zero-copy file-mmap bridge, §4b). Pinned
 /// numerically like [`HOST_PROC_TYPE_ID`]; `svm-run`'s `shared_region_type_id_matches` test locks them.
 const SHARED_REGION_TYPE_ID: u32 = 4;
+/// The `Instantiator` interface id (`svm_interp::cap_id::INSTANTIATOR`) — the §14 VM-in-VM spawner,
+/// reached from a guest via `__vm_instantiate` (op 13, `instantiate_module_named`) and `__vm_join`
+/// (op 1). Pinned numerically like [`HOST_PROC_TYPE_ID`]; `svm-run`'s `instantiator_type_id_matches`
+/// test locks the two together.
+const INSTANTIATOR_TYPE_ID: u32 = 6;
 
 /// End of the low reserved region (`[0, 32)`) that held the retired capability-handle stash
 /// (IMPORTS.md phase 3 — imports are manifest slots the host binds; nothing is stashed). Kept as
@@ -12076,6 +12081,54 @@ fn lower_vm_builtin(
                 sig,
                 handle,
                 args,
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // §14 VM-in-VM spawn: `long __vm_instantiate(int inst, long module, long grants_ptr,
+        // long grants_n, long entry, long off, long size_log2, long quota)` →
+        // `cap.call INSTANTIATOR 13 inst (module, grants_ptr, grants_n, entry, off, size_log2, quota)`
+        // — the `instantiate_module_named` (op 13) primitive that runs a host-granted separate `Module`
+        // AND re-grants a named grant list into the child's powerbox (the guest-orchestrated shell/driver
+        // primitive: a compiled phase child resolves an inherited `"fs"` by name and does real I/O).
+        // `inst` is the reflection-discovered `Instantiator` handle (`__vm_cap_at`, interface id 6); the
+        // 16-byte grant records (`{name_off:u32, name_len:u32, handle:i32, flags:u32}`) live at
+        // `grants_ptr` in the guest window. Returns the child handle (`-EINVAL` on a bad carve/entry).
+        "__vm_instantiate" => {
+            let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Instantiator handle
+            let args = (1..8)
+                .map(|i| ctx.operand_i64(vm_arg(c, i)?)) // module, grants_ptr, grants_n, entry, off, sl, quota
+                .collect::<Result<Vec<_>, _>>()?;
+            let sig = svm_ir::FuncType {
+                params: vec![ValType::I64; 7],
+                results: vec![ValType::I64],
+            };
+            let r = ctx.push(Inst::CapCall {
+                type_id: INSTANTIATOR_TYPE_ID,
+                op: 13,
+                sig,
+                handle,
+                args,
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // §14 join: `long __vm_join(int inst, long child)` → `cap.call INSTANTIATOR 1 inst (child)` — the
+        // happens-before that publishes the child's window writes and returns its result. `inst` is the
+        // Instantiator handle, `child` the handle `__vm_instantiate` returned.
+        "__vm_join" => {
+            let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Instantiator handle
+            let child = ctx.operand_i64(vm_arg(c, 1)?)?;
+            let sig = svm_ir::FuncType {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+            };
+            let r = ctx.push(Inst::CapCall {
+                type_id: INSTANTIATOR_TYPE_ID,
+                op: 1,
+                sig,
+                handle,
+                args: vec![child],
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
