@@ -1132,6 +1132,31 @@ fn func_uses_region_ops(f: &Func) -> bool {
     })
 }
 
+/// Whether any function reaches an `ADDRESS_SPACE` `unmap`/`protect` (iface 5 ops 1–2) — the
+/// paged-carryable subset of [`module_uses_page_ops`]: the #750 per-access page check traps
+/// `Ro`/`Unmapped` exactly where the interpreter's `check_prot` does, so a self-page-managing guest
+/// can tier up **paged** instead of module-gating to emit-nothing. Deliberately excludes the
+/// `SharedRegion` aliasing ops, which even paged mode cannot carry ([`func_uses_region_ops`]) —
+/// flipping such a guest paged would gate identically while paying the page-check emit for nothing.
+/// Public for the tier-up opens (the browser's `svm_coop_open`) to key their paged flip on actual
+/// page-op usage, not only on a `readonly` data segment (#1009's original heuristic).
+pub fn module_uses_unmap_protect(m: &Module) -> bool {
+    m.funcs.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            b.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    Inst::CapCall {
+                        type_id: cap_id::ADDRESS_SPACE,
+                        op: 1..=2,
+                        ..
+                    }
+                )
+            })
+        })
+    })
+}
+
 /// Whether `f` uses a D62 bulk-memory op — excluded from the #750 paged subset (the emitted span
 /// check has no per-page walk; such functions stay on the interpreter).
 fn func_uses_bulk_mem(f: &Func) -> bool {
