@@ -101,39 +101,39 @@ mod op {
     pub const EXTEND_I32_S: u8 = 0x60;
     pub const EXTEND_I32_U: u8 = 0x61;
     pub const WRAP_I64: u8 = 0x62;
-    pub const IMPORT_ATTACH: u8 = 0x63; // v4: import idx, handle operand idx -> i32 status
+    // 0x63 (was IMPORT_ATTACH): consolidated into the call/cap band at 0x7E in the wire rev
+    // (#900). Left as a gap — not reused.
 
     pub const SELECT: u8 = 0x70;
+
+    // Consolidated call/cap/import/reflection band (0x73..=0x7E), wire rev (#900) stage 5.
+    // The scattered call/cap/import single-ops (formerly at 0x0A..=0x0E and 0x63) were pulled
+    // into this one coherent family, reusing the opcode gaps the earlier cuts freed.
     pub const CALL: u8 = 0x73; // direct call: uleb funcidx, then arg idx-list
     pub const CALL_INDIRECT: u8 = 0x74; // sig (params,results), idx, arg idx-list
     pub const REF_FUNC: u8 = 0x75; // uleb funcidx -> i32 funcref
-    pub const PTR_FROM_INT: u8 = 0x76; // i64 -> i64 (no-op provenance cast)
-    pub const PTR_TO_INT: u8 = 0x77;
-    pub const PTR_ADD: u8 = 0x78; // (i64, i64) -> i64
+    pub const CALL_IMPORT_DYN: u8 = 0x76; // v7 §3.5: type idx, op, sig, handle operand, arg idx-list
+    pub const EXPORT_HANDLE: u8 = 0x77; // v7 §3.5: impl-export idx -> i32 handle
+    pub const CAP_SELF_TYPE_ID: u8 = 0x78; // v7 §3.5: type idx -> i32 runtime type_id
     pub const CAP_CALL: u8 = 0x79; // type_id, op, sig, handle, arg idx-list
-    pub const CAP_SELF_COUNT: u8 = 0x7A; // §7 reflection: () -> i32 count
-    pub const CAP_SELF_GET: u8 = 0x7B; // §7 reflection: idx -> (i32 handle, i32 type_id)
+    pub const CAP_SELF_COVERS: u8 = 0x7A; // v7 §3.5: handle operand, type idx -> i32 covers
+    pub const CALL_SYM: u8 = 0x7B; // v8 §7/§22 link-form symbolic call: import idx, sig, handle, arg idx-list
     pub const CALL_IMPORT: u8 = 0x7C; // manifest capability call (v8): import idx, op, sig, arg idx-list
-                                      // v7 §3.5 opcodes live in the low band (0x0A..=0x0D): every 0x1X..0xFX slot above is
-                                      // either assigned or inside a computed range (CAST/FTOI/ITOF/LOAD families, SIMD prefix).
-    pub const CALL_IMPORT_DYN: u8 = 0x0A; // v7 §3.5: type idx, op, sig, handle operand, arg idx-list
-    pub const EXPORT_HANDLE: u8 = 0x0B; // v7 §3.5: impl-export idx -> i32 handle
-    pub const CAP_SELF_TYPE_ID: u8 = 0x0C; // v7 §3.5: type idx -> i32 runtime type_id
-    pub const CAP_SELF_COVERS: u8 = 0x0D; // v7 §3.5: handle operand, type idx -> i32 covers
-    pub const CALL_SYM: u8 = 0x0E; // v8 §7/§22 link-form symbolic call: import idx, sig, handle, arg idx-list
+    pub const FMA: u8 = 0x7D; // scalar fused multiply-add: ty byte (0=f32,1=f64), a, b, c
+    pub const IMPORT_ATTACH: u8 = 0x7E; // v4: import idx, handle operand idx -> i32 status
+                                        // 0x7F (was CAP_SELF_LABEL), 0xBE (was CAP_SELF_ATTEST): retired in the wire rev
+                                        // (#900) — the `cap.self.*` reflection ops are now `cap.call CAP_SELF op N`. Left as
+                                        // gaps — not renumbered, not reused.
 
     // v9 link-form data addresses (D-LINK), decodable **only in the object dialect** (header
     // flag bit 0): a runnable module never carries them — `link` rewrites each to `ConstI64`.
     pub const DATA_SELF: u8 = 0x07; // uleb offset -> i64 (own-data address)
     pub const DATA_SYM: u8 = 0x08; // length-prefixed name bytes, sleb addend -> i64 (cross-unit)
     pub const DATA_TOP: u8 = 0x09; // (no payload) -> i64 (post-link top-of-data)
-    pub const FMA: u8 = 0x7D; // scalar fused multiply-add: ty byte (0=f32,1=f64), a, b, c
-    pub const CAP_SELF_RESOLVE: u8 = 0x7E; // §7 reflection: (name_ptr, name_len) -> i32 handle|-errno
-    pub const CAP_SELF_LABEL: u8 = 0x7F; // §7 reflection: (handle, buf_ptr, buf_cap) -> i32 label len
-    pub const CAP_SELF_ATTEST: u8 = 0xBE; // §6 attestation: () -> i32 packed provenance
 
-    // Memory ops. Each carries: address operand, [value operand for stores], an
-    // immediate uleb offset, and an alignment-hint byte.
+    // Memory ops. Each carries: address operand, [value operand for stores], and an
+    // immediate uleb offset. (The wire-rev cut dropped the write-only alignment-hint byte;
+    // no verifier or backend read it. Natural-alignment traps are width-derived.)
     pub const STORE: u8 = 0x84; // + StoreOp index (0..=8) -> 0x84..=0x8C
     pub const STORE_END: u8 = 0x8C;
     // Bulk-memory ops (D62): dst, src/val, len operand idxs (uleb). No sub-index.
@@ -165,9 +165,10 @@ mod op {
     pub const ATOMIC_CMPXCHG: u8 = 0xC9; // ty, addr, expected, replacement, offset
 
     // §12 fibers (stack switching).
-    pub const CONT_RESUME_BLOCK: u8 = 0xBF; // I48 blocking variant: k, arg (advisory; = CONT_RESUME)
+    // 0xBF is a retired opcode gap: it was CONT_RESUME_BLOCK (I48 blocking variant), now folded
+    // into CONT_RESUME's trailing `block` flag byte. Left unassigned, not renumbered.
     pub const CONT_NEW: u8 = 0xCA; // func (funcref idx), sp (data-stack base)
-    pub const CONT_RESUME: u8 = 0xCB; // k, arg
+    pub const CONT_RESUME: u8 = 0xCB; // k, arg, block (1 byte: 0 = cont.resume, 1 = cont.resume.block)
     pub const SUSPEND: u8 = 0xCC; // value
     pub const THREAD_SPAWN: u8 = 0xCD; // func (funcidx), arg -> i32 handle
     pub const THREAD_JOIN: u8 = 0xCE; // handle -> i64 result
@@ -194,8 +195,8 @@ mod op {
     pub const SIMD: u8 = 0xFE;
     pub mod simd {
         pub const CONST: u8 = 0x00; // + 16 raw value bytes (LE)
-        pub const LOAD: u8 = 0x01; // addr, offset (uleb), align (byte)
-        pub const STORE: u8 = 0x02; // addr, value, offset, align
+        pub const LOAD: u8 = 0x01; // addr, offset (uleb)
+        pub const STORE: u8 = 0x02; // addr, value, offset
         pub const SPLAT: u8 = 0x03; // shape, a
         pub const EXTRACT_LANE: u8 = 0x04; // shape, lane (byte), signed (byte), a
         pub const REPLACE_LANE: u8 = 0x05; // shape, lane (byte), a, b
@@ -207,7 +208,7 @@ mod op {
         pub const BITSELECT: u8 = 0x0B; // a, b, mask
         pub const SHUFFLE: u8 = 0x0C; // 16 lane bytes, a, b
         pub const SWIZZLE: u8 = 0x0D; // a, b
-        pub const WIDTH_BYTES: u8 = 0x0E; // (no payload) -> i32
+                                      // 0x0E (was WIDTH_BYTES): retired in the wire rev (#900). Left as a gap — not reused.
         pub const VINT_CMP: u8 = 0x0F; // shape, op, a, b
         pub const VFLOAT_CMP: u8 = 0x10; // shape, op, a, b
         pub const VSHIFT: u8 = 0x11; // shape, op, a (v128), amt (i32)
@@ -243,12 +244,12 @@ mod op {
 const MAGIC: [u8; 4] = *b"SVM\x00";
 // v10 (CALLS.md 7.4) adds the impl-export **`threaded` policy byte** — the provider's own
 // concurrency-policy declaration (`0` = single, `1` = threaded), one uleb after each offer's op
-// list. Any other value is a decode error (fail-closed, like every reserved encoding). v10 is the
-// first bump made after committed `.svmb` assets existed, so it carries the format's one
-// **compatibility window**: the decoder also accepts v9 (whose impl-exports read as `single` —
-// exactly what every v9-era offer was), until the assets regenerate (ISSUES.md). The
-// exact-current-VERSION rule below predates stored blobs and resumes once the window closes.
-// v9 adds the **flags byte** (directly after the version) and the **object dialect** (flag bit 0):
+// list. Any other value is a decode error (fail-closed, like every reserved encoding). v10 briefly
+// carried the format's one **compatibility window** — the decoder also accepted v9 (whose
+// impl-exports, lacking the policy byte, read as `single`) to keep the committed `.svmb` assets
+// loading until they regenerated. The wire rev (#900) regenerated every asset onto v10, so the
+// window is retired: the decoder is back to accepting the exact current `VERSION` only.
+// v9 added the **flags byte** (directly after the version) and the **object dialect** (flag bit 0):
 // a serialized *link unit* — the binary twin of a pre-link text unit (named consumer: the external
 // toolchain blocked on format standardization, owner-approved 2026-07-30). An object file may carry
 // the constructs `link` resolves away: the `data.ptr` relocation section (after data), the
@@ -785,28 +786,9 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             write_uleb(out, *import as u64);
             write_uleb(out, *handle as u64);
         }
-        // §7 capability reflection intrinsics.
-        Inst::CapSelfCount => out.push(op::CAP_SELF_COUNT),
-        Inst::CapSelfAttest => out.push(op::CAP_SELF_ATTEST),
-        Inst::CapSelfGet { idx } => {
-            out.push(op::CAP_SELF_GET);
-            write_uleb(out, *idx as u64);
-        }
-        Inst::CapSelfResolve { name_ptr, name_len } => {
-            out.push(op::CAP_SELF_RESOLVE);
-            write_uleb(out, *name_ptr as u64);
-            write_uleb(out, *name_len as u64);
-        }
-        Inst::CapSelfLabel {
-            handle,
-            buf_ptr,
-            buf_cap,
-        } => {
-            out.push(op::CAP_SELF_LABEL);
-            write_uleb(out, *handle as u64);
-            write_uleb(out, *buf_ptr as u64);
-            write_uleb(out, *buf_cap as u64);
-        }
+        // §7 capability reflection: `cap.self.count`/`get`/`resolve`/`label`/`attest` are no longer
+        // distinct wire ops — they encode as their `cap.call CAP_SELF op N` form (the generic
+        // `Inst::CapCall` arm above).
         // v7 §3.5 reflection: intern own type entry / probe coverage of a held handle.
         Inst::CapSelfTypeId { ty } => {
             out.push(op::CAP_SELF_TYPE_ID);
@@ -914,25 +896,21 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             op: o,
             addr,
             offset,
-            align,
         } => {
             out.push(op::LOAD + o.index());
             write_uleb(out, *addr as u64);
             write_uleb(out, *offset);
-            out.push(*align);
         }
         Inst::Store {
             op: o,
             addr,
             value,
             offset,
-            align,
         } => {
             out.push(op::STORE + o.index());
             write_uleb(out, *addr as u64);
             write_uleb(out, *value as u64);
             write_uleb(out, *offset);
-            out.push(*align);
         }
         Inst::MemCopy { dst, src, len } => {
             out.push(op::MEM_COPY);
@@ -952,31 +930,23 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             write_uleb(out, *val as u64);
             write_uleb(out, *len as u64);
         }
-        Inst::AtomicLoad {
-            ty,
-            addr,
-            offset,
-            order,
-        } => {
+        Inst::AtomicLoad { ty, addr, offset } => {
             out.push(op::ATOMIC_LOAD);
             out.push(int_ty_byte(*ty));
             write_uleb(out, *addr as u64);
             write_uleb(out, *offset);
-            out.push(order.index());
         }
         Inst::AtomicStore {
             ty,
             addr,
             value,
             offset,
-            order,
         } => {
             out.push(op::ATOMIC_STORE);
             out.push(int_ty_byte(*ty));
             write_uleb(out, *addr as u64);
             write_uleb(out, *value as u64);
             write_uleb(out, *offset);
-            out.push(order.index());
         }
         Inst::AtomicRmw {
             ty,
@@ -984,7 +954,6 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             addr,
             value,
             offset,
-            order,
         } => {
             out.push(op::ATOMIC_RMW);
             out.push(int_ty_byte(*ty));
@@ -992,7 +961,6 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             write_uleb(out, *addr as u64);
             write_uleb(out, *value as u64);
             write_uleb(out, *offset);
-            out.push(order.index());
         }
         Inst::AtomicCmpxchg {
             ty,
@@ -1000,7 +968,6 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             expected,
             replacement,
             offset,
-            order,
         } => {
             out.push(op::ATOMIC_CMPXCHG);
             out.push(int_ty_byte(*ty));
@@ -1008,7 +975,6 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             write_uleb(out, *expected as u64);
             write_uleb(out, *replacement as u64);
             write_uleb(out, *offset);
-            out.push(order.index());
         }
         Inst::Call { func, args } => {
             out.push(op::CALL);
@@ -1021,19 +987,6 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
         }
         Inst::FToITrap { op: o, a } => {
             out.push(op::FTOI_TRAP + o.index());
-            write_uleb(out, *a as u64);
-        }
-        Inst::PtrAdd { a, b } => {
-            out.push(op::PTR_ADD);
-            write_uleb(out, *a as u64);
-            write_uleb(out, *b as u64);
-        }
-        Inst::PtrCast { to_int, a } => {
-            out.push(if *to_int {
-                op::PTR_TO_INT
-            } else {
-                op::PTR_FROM_INT
-            });
             write_uleb(out, *a as u64);
         }
         Inst::CallIndirect { ty, idx, args } => {
@@ -1063,15 +1016,11 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             write_uleb(out, *func as u64);
             write_uleb(out, *sp as u64);
         }
-        Inst::ContResume { k, arg } => {
+        Inst::ContResume { k, arg, block } => {
             out.push(op::CONT_RESUME);
             write_uleb(out, *k as u64);
             write_uleb(out, *arg as u64);
-        }
-        Inst::ContResumeBlock { k, arg } => {
-            out.push(op::CONT_RESUME_BLOCK);
-            write_uleb(out, *k as u64);
-            write_uleb(out, *arg as u64);
+            out.push(*block as u8);
         }
         Inst::Suspend { value } => {
             out.push(op::SUSPEND);
@@ -1138,29 +1087,22 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             out.push(op::simd::CONST);
             out.extend_from_slice(bytes);
         }
-        Inst::V128Load {
-            addr,
-            offset,
-            align,
-        } => {
+        Inst::V128Load { addr, offset } => {
             out.push(op::SIMD);
             out.push(op::simd::LOAD);
             write_uleb(out, *addr as u64);
             write_uleb(out, *offset);
-            out.push(*align);
         }
         Inst::V128Store {
             addr,
             value,
             offset,
-            align,
         } => {
             out.push(op::SIMD);
             out.push(op::simd::STORE);
             write_uleb(out, *addr as u64);
             write_uleb(out, *value as u64);
             write_uleb(out, *offset);
-            out.push(*align);
         }
         Inst::Splat { shape, a } => {
             out.push(op::SIMD);
@@ -1394,10 +1336,6 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             write_uleb(out, *a as u64);
             write_uleb(out, *b as u64);
         }
-        Inst::SimdWidthBytes => {
-            out.push(op::SIMD);
-            out.push(op::simd::WIDTH_BYTES);
-        }
     }
 }
 
@@ -1423,13 +1361,11 @@ fn decode_simd(c: &mut Cursor) -> Result<Inst, DecodeError> {
         op::simd::LOAD => Inst::V128Load {
             addr: c.idx()?,
             offset: c.uleb()?,
-            align: c.byte()?,
         },
         op::simd::STORE => Inst::V128Store {
             addr: c.idx()?,
             value: c.idx()?,
             offset: c.uleb()?,
-            align: c.byte()?,
         },
         op::simd::SPLAT => Inst::Splat {
             shape: dec_shape(c)?,
@@ -1641,7 +1577,6 @@ fn decode_simd(c: &mut Cursor) -> Result<Inst, DecodeError> {
             a: c.idx()?,
             b: c.idx()?,
         },
-        op::simd::WIDTH_BYTES => Inst::SimdWidthBytes,
         other => return Err(DecodeError::BadOpcode(other)),
     })
 }
@@ -1820,13 +1755,12 @@ fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> 
         return Err(DecodeError::BadMagic);
     }
     let v = c.byte()?;
-    // v10 accepts **v9** as a one-version compatibility window (the only such window): 17
-    // committed `.svmb` assets (the browser playground/fixtures — chibicc, QuickJS, the canvas
-    // demos) predate the impl-export policy byte and regenerate only through their heavyweight
-    // LLVM on-ramps. A v9 impl-export simply has no policy byte — it reads as `single`, exactly
-    // what every v9-era offer was. The window retires (back to exact-version) when the assets
-    // regenerate (tracked in ISSUES.md); everything below v9 stays rejected.
-    if v != VERSION && v != 9 {
+    // Exact-version only: the decoder accepts the current `VERSION` and nothing else. The v9
+    // compatibility window (v9 impl-exports read as `single`, no policy byte) was retired once
+    // every committed `.svmb` asset regenerated onto v10 in the wire rev (#900) — its whole
+    // purpose was to keep those pre-policy-byte blobs loading until then. Every other version,
+    // v9 included, now fails closed.
+    if v != VERSION {
         return Err(DecodeError::BadVersion(v));
     }
     // v9 flags byte. Reserved bits fail closed; the object bit is rejected on the runnable path
@@ -1975,16 +1909,12 @@ fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> 
             ops.push(c.uleb()? as FuncIdx);
         }
         // v10 (CALLS.md 7.4): the declared concurrency policy — any value past the two defined
-        // ones is a malformed module (fail-closed, never a guessed policy). A v9 blob has no
-        // policy byte: every v9-era offer was `single`, so that is what it declares.
-        let threaded = if v >= 10 {
-            match c.uleb()? {
-                0 => false,
-                1 => true,
-                p => return Err(DecodeError::BadOfferPolicy(p)),
-            }
-        } else {
-            false
+        // ones is a malformed module (fail-closed, never a guessed policy). Always present now
+        // that the v9 window (which had no policy byte) is retired.
+        let threaded = match c.uleb()? {
+            0 => false,
+            1 => true,
+            p => return Err(DecodeError::BadOfferPolicy(p)),
         };
         impl_exports.push(svm_ir::ImplExport {
             name,
@@ -2270,18 +2200,6 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
             args: decode_idxs(c)?,
         },
         op::REF_FUNC => Inst::RefFunc { func: c.idx()? },
-        op::PTR_FROM_INT => Inst::PtrCast {
-            to_int: false,
-            a: c.idx()?,
-        },
-        op::PTR_TO_INT => Inst::PtrCast {
-            to_int: true,
-            a: c.idx()?,
-        },
-        op::PTR_ADD => Inst::PtrAdd {
-            a: c.idx()?,
-            b: c.idx()?,
-        },
         op::FMA => {
             let ty = match c.byte()? {
                 0 => FloatTy::F32,
@@ -2367,18 +2285,8 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
             import: c.idx()?,
             handle: c.idx()?,
         },
-        op::CAP_SELF_COUNT => Inst::CapSelfCount,
-        op::CAP_SELF_ATTEST => Inst::CapSelfAttest,
-        op::CAP_SELF_GET => Inst::CapSelfGet { idx: c.idx()? },
-        op::CAP_SELF_RESOLVE => Inst::CapSelfResolve {
-            name_ptr: c.idx()?,
-            name_len: c.idx()?,
-        },
-        op::CAP_SELF_LABEL => Inst::CapSelfLabel {
-            handle: c.idx()?,
-            buf_ptr: c.idx()?,
-            buf_cap: c.idx()?,
-        },
+        // 0x7F/0xBE (the retired `cap.self.*` reflection opcodes) are wire gaps now — the ops
+        // travel as `cap.call CAP_SELF op N` (decoded by the `CAP_CALL` arm).
         op::VCPU_TLS_GET => Inst::VcpuTlsGet,
         op::VCPU_TLS_SET => Inst::VcpuTlsSet { val: c.idx()? },
         op::DURABLE_SHADOW_BASE => Inst::DurableShadowBase,
@@ -2410,14 +2318,12 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
             op: LoadOp::from_index(b - op::LOAD).ok_or(DecodeError::BadOpcode(b))?,
             addr: c.idx()?,
             offset: c.uleb()?,
-            align: c.byte()?,
         },
         op::STORE..=op::STORE_END => Inst::Store {
             op: StoreOp::from_index(b - op::STORE).ok_or(DecodeError::BadOpcode(b))?,
             addr: c.idx()?,
             value: c.idx()?,
             offset: c.uleb()?,
-            align: c.byte()?,
         },
         op::MEM_COPY => Inst::MemCopy {
             dst: c.idx()?,
@@ -2439,14 +2345,12 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
             ty: int_ty_from(c.byte()?, b)?,
             addr: c.idx()?,
             offset: c.uleb()?,
-            order: ord_from(c.byte()?, b)?,
         },
         op::ATOMIC_STORE => Inst::AtomicStore {
             ty: int_ty_from(c.byte()?, b)?,
             addr: c.idx()?,
             value: c.idx()?,
             offset: c.uleb()?,
-            order: ord_from(c.byte()?, b)?,
         },
         op::ATOMIC_RMW => Inst::AtomicRmw {
             ty: int_ty_from(c.byte()?, b)?,
@@ -2454,7 +2358,6 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
             addr: c.idx()?,
             value: c.idx()?,
             offset: c.uleb()?,
-            order: ord_from(c.byte()?, b)?,
         },
         op::ATOMIC_CMPXCHG => Inst::AtomicCmpxchg {
             ty: int_ty_from(c.byte()?, b)?,
@@ -2462,7 +2365,6 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
             expected: c.idx()?,
             replacement: c.idx()?,
             offset: c.uleb()?,
-            order: ord_from(c.byte()?, b)?,
         },
 
         op::CONT_NEW => Inst::ContNew {
@@ -2472,10 +2374,7 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
         op::CONT_RESUME => Inst::ContResume {
             k: c.idx()?,
             arg: c.idx()?,
-        },
-        op::CONT_RESUME_BLOCK => Inst::ContResumeBlock {
-            k: c.idx()?,
-            arg: c.idx()?,
+            block: c.byte()? != 0,
         },
         op::SUSPEND => Inst::Suspend { value: c.idx()? },
         op::SETJMP => Inst::SetJmp { buf: c.idx()? },
@@ -3208,13 +3107,13 @@ mod debug_tests {
         assert_eq!(decoded, m);
     }
 
-    /// CALLS.md 7.4 — the v10 decoder's one **compatibility window**: a v9 blob (no impl-export
-    /// policy byte) decodes, its offers reading as `single` — the 17 committed `.svmb` assets'
-    /// lifeline until they regenerate. The v9 bytes are derived from the v10 encoder itself
-    /// (encode `threaded: false`/`true` twins; the single differing byte IS the policy byte;
-    /// strip it and stamp v9), so the pin tracks the real layout, not a hand copy of it.
+    /// CALLS.md 7.4 — the v9 compatibility window is **retired**: now that every committed `.svmb`
+    /// asset has regenerated onto v10 (wire rev #900), a v9 blob (no impl-export policy byte) must
+    /// fail closed like any other non-current version. The v9 bytes are derived from the v10
+    /// encoder itself (encode `threaded: false`/`true` twins; the single differing byte IS the
+    /// policy byte; strip it and stamp v9), so the pin tracks the real layout, not a hand copy.
     #[test]
-    fn a_v9_blob_with_an_impl_export_decodes_as_single() {
+    fn a_v9_blob_is_rejected_now_that_the_window_is_retired() {
         let mut m = module(None);
         m.funcs.push(Func {
             params: vec![],
@@ -3252,13 +3151,12 @@ mod debug_tests {
         let mut v9 = b_single.clone();
         v9.remove(diffs[0]);
         v9[4] = 9;
-        let decoded = decode_module(&v9).expect("v9 decodes through the window");
-        assert_eq!(decoded.impl_exports.len(), 1);
-        assert!(
-            !decoded.impl_exports[0].threaded,
-            "a v9 offer reads as single"
-        );
-        // The same bytes stamped v8 stay rejected — the window is exactly one version wide.
+        // The window is closed: v9 now fails closed, exactly like every other non-current version.
+        assert!(matches!(
+            decode_module(&v9),
+            Err(DecodeError::BadVersion(9))
+        ));
+        // …and the same bytes stamped v8 were already rejected — nothing below VERSION decodes.
         let mut v8 = v9.clone();
         v8[4] = 8;
         assert!(matches!(

@@ -139,7 +139,7 @@ static long emit_caller(char *buf) {
   eb(buf, 2);    // 2 instructions
   eb(buf, 0x10); // v2 = i32.const 0  (import handle placeholder)
   sleb(buf, 0);
-  eb(buf, 0x0E); // v3 = call.sym "f" (import 0) (v0, v1) — v8 link-form placeholder
+  eb(buf, 0x7B); // v3 = call.sym "f" (import 0) (v0, v1) — v8 link-form placeholder
   uleb(buf, 0);
   emit_i64_pair_sig(buf);
   uleb(buf, 2); // handle = v2

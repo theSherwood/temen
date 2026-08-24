@@ -477,12 +477,12 @@ func () -> (i64) {
 block 0 () {
   a8 = i64.const 8
   val = i64.const 987654
-  i64.atomic.store.release a8 val
+  i64.atomic.store a8 val
   sp = i64.const 0
   h = thread.spawn 1 sp sp
   a0 = i64.const 0
   one = i32.const 1
-  i32.atomic.store.release a0 one
+  i32.atomic.store a0 one
   a0n = i64.const 0
   n1 = i32.const 1
   woke = atomic.notify a0n n1
@@ -497,7 +497,7 @@ block 0 (sp: i64, arg: i64) {
   tmo = i64.const 1000000000
   st = i32.atomic.wait a0 exp tmo
   a8 = i64.const 8
-  got = i64.atomic.load.acquire a8
+  got = i64.atomic.load a8
   return got
   }
 }
