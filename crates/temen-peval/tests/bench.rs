@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use temen_interp::Value;
 use temen_ir::{
     BinOp, Block, CmpOp, ConvOp, Data, Func, FuncType, Inst, IntTy, LoadOp, Memory, Module,
-    StoreOp, Terminator, ValType, DEFAULT_RESERVED_LOG2,
+    StoreOp, Terminator, TypeEntry, ValType, DEFAULT_RESERVED_LOG2,
 };
 use temen_jit::{CompiledModule, JitOutcome, Quota, INERT_CAP_THUNK};
 use temen_peval::{
@@ -1225,7 +1225,7 @@ fn build_threaded_interpreter(program: &[(u8, i64)]) -> Module {
         params: vec![t(), t(), ValType::I32, t()], // 0: acc, 1: pc, 2: op (funcref idx), 3: input
         insts: vec![
             Inst::CallIndirect {
-                ty: sig(),
+                ty: 0, // #922: sig() interned at type index 0
                 idx: 2,
                 args: vec![0, 3],
             }, // 4: result
@@ -1251,7 +1251,7 @@ fn build_threaded_interpreter(program: &[(u8, i64)]) -> Module {
                 a: 6,
             }, // 7: idx (i32)
             Inst::CallIndirect {
-                ty: sig(),
+                ty: 0, // #922: sig() interned at type index 0
                 idx: 7,
                 args: vec![0, 2],
             }, // 8: result
@@ -1297,6 +1297,7 @@ fn build_threaded_interpreter(program: &[(u8, i64)]) -> Module {
             readonly: true,
             bytes: program.iter().map(|&(op, _)| op).collect(),
         }],
+        types: vec![TypeEntry::Func(sig())], // #922: the call_indirect handler sig, index 0
         ..Default::default()
     }
 }

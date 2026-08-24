@@ -1940,6 +1940,10 @@ fn drive(
 
 /// [`drive`] over an already-shared function table — the §3.2 wired-offer dispatch reuses the
 /// offer's `Arc<[Func]>` verbatim instead of re-copying the table per call.
+/// One B2-installed unit to re-apply onto a sub-run's fresh dispatch table: `(slot, funcs, types)`
+/// — the unit's own type section (#922) rides alongside its funcs so its interned call sigs resolve.
+type JitReapply = (u32, Arc<[Func]>, Arc<[temen_ir::TypeEntry]>);
+
 fn drive_arc(
     funcs: Arc<[Func]>,
     types: Arc<[temen_ir::TypeEntry]>,
@@ -1970,7 +1974,7 @@ fn drive_arc(
     // table below can re-apply it. Empty for a fresh run (nothing installed), so it is a pure no-op
     // there; on a thaw it re-installs each captured unit at its slot, so a `call_indirect` through an
     // installed slot resolves after freeze/thaw. Install order is preserved (dense module ids).
-    let jit_reapply: Vec<(u32, Arc<[Func]>, Arc<[temen_ir::TypeEntry]>)> = host
+    let jit_reapply: Vec<JitReapply> = host
         .jit_all_installs()
         .into_iter()
         .filter_map(|(d, slot, unit)| {
@@ -2110,7 +2114,7 @@ fn drive_arc_shared(
         let h = cell.lock_unpoisoned();
         // Install-durability (§12.5): a provider cell with B2-installed units gets them re-applied
         // onto the sub-run's fresh dispatch table, exactly as the by-value wrapper does.
-        let reapply: Vec<(u32, Arc<[Func]>, Arc<[temen_ir::TypeEntry]>)> = h
+        let reapply: Vec<JitReapply> = h
             .jit_all_installs()
             .into_iter()
             .filter_map(|(d, slot, unit)| {
@@ -2184,7 +2188,7 @@ fn drive_over_cell(
     thaw_child_state: Vec<FrozenChildState>,
     thaw_root_sp: Option<u64>,
     handoff: bool,
-    jit_reapply: Vec<(u32, Arc<[Func]>, Arc<[temen_ir::TypeEntry]>)>,
+    jit_reapply: Vec<JitReapply>,
 ) -> TracedRun {
     // CALLS.md 4d — copy the root domain's direct-handoff knob into the run-global scheduler flag.
     let sched = {
@@ -3715,6 +3719,7 @@ pub fn explore_all_bruteforce(
 /// Run a single schedule under the exhaustive checker: a fresh memory image and root vCPU (at
 /// memory-op granularity), driven by `policy` ([`Policy::Brute`] or [`Policy::Dpor`]). Returns the root
 /// task's outcome.
+#[allow(clippy::too_many_arguments)]
 fn run_one_schedule(
     funcs: &Arc<[Func]>,
     types: &Arc<[temen_ir::TypeEntry]>,

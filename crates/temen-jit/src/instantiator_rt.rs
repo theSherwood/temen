@@ -591,6 +591,7 @@ impl Nursery {
     /// # Safety
     /// `trap_out` is the live trap cell. The returned slices borrow host-owned storage valid for the
     /// run (the [`ModuleResolver`](crate::ModuleResolver) contract).
+    #[allow(clippy::type_complexity)]
     unsafe fn resolve_child(
         &self,
         module: i64,

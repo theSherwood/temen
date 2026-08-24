@@ -5073,7 +5073,7 @@ mod import_tests {
                 Inst::CallSym {
                     // v3 = write(handle=v0, v1, v2)
                     import: 0,
-                    sig: sig_write.clone(),
+                    sig: 0, // #922: sig_write, interned by add_func_import at type index 0
                     handle: 0,
                     args: vec![1, 2],
                 },
@@ -5081,7 +5081,7 @@ mod import_tests {
                 Inst::CallSym {
                     // exit(handle=v0, v4)
                     import: 1,
-                    sig: sig_exit.clone(),
+                    sig: 1, // #922: sig_exit, interned by add_func_import at type index 1
                     handle: 0,
                     args: vec![4],
                 },
@@ -5142,7 +5142,11 @@ mod import_tests {
             } => {
                 assert_eq!((*type_id, *op, *handle), (0, 1, 0));
                 assert_eq!(args, &vec![1, 2]);
-                assert_eq!(sig.results.len(), 1);
+                // #922: the resolved cap.call carries an interned type index into `r.types`.
+                let TypeEntry::Func(ft) = &r.types[*sig as usize] else {
+                    panic!("cap.call sig must name a func type");
+                };
+                assert_eq!(ft.results.len(), 1);
             }
             other => panic!("expected CapCall, got {other:?}"),
         }
@@ -5275,13 +5279,6 @@ mod link_layout_tests {
 mod effects_tests {
     use super::*;
 
-    fn sig() -> FuncType {
-        FuncType {
-            params: vec![],
-            results: vec![ValType::I64],
-        }
-    }
-
     #[test]
     fn pure_ops_have_no_effects_and_are_removable() {
         for inst in [
@@ -5400,14 +5397,14 @@ mod effects_tests {
                 args: vec![],
             },
             Inst::CallIndirect {
-                ty: sig(),
+                ty: 0, // #922: only effects() is tested here; the sig is never resolved
                 idx: 0,
                 args: vec![],
             },
             Inst::CapCall {
                 type_id: 0,
                 op: 0,
-                sig: sig(),
+                sig: 0, // #922: only effects() is tested here; the sig is never resolved
                 handle: 0,
                 args: vec![],
             },

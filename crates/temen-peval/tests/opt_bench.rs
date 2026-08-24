@@ -592,7 +592,7 @@ fn interproc_case() -> Module {
             insts: vec![
                 Inst::RefFunc { func: 1 }, // v2 = funcref(1)
                 Inst::CallIndirect {
-                    ty: sig,
+                    ty: 0, // #922: sig interned at type-section index 0
                     idx: 2,
                     args: vec![0, 1],
                 }, // v3
@@ -628,6 +628,7 @@ fn interproc_case() -> Module {
     };
     Module {
         funcs: vec![entry, leaf, dead],
+        types: vec![temen_ir::TypeEntry::Func(sig)], // #922: call_indirect sig, index 0
         ..Default::default()
     }
 }

@@ -1513,6 +1513,7 @@ fn check_inst(
     Ok(Some(ty))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_terminator(
     fi: u32,
     bi: u32,

@@ -558,10 +558,7 @@ mod tests {
             Inst::CapCall {
                 type_id: temen_ir::CAP_SELF_TYPE_ID,
                 op: 2,
-                sig: temen_ir::FuncType {
-                    params: vec![ValType::I64, ValType::I64],
-                    results: vec![ValType::I32],
-                },
+                sig: 0, // #922: only `effects()` classification is tested here, sig is never resolved
                 handle: 0,
                 args: vec![1, 2],
             },
