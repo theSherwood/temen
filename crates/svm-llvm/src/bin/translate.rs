@@ -55,6 +55,7 @@ fn try_main() -> Result<(), String> {
     let mut host_page: u64 = svm_ir::POWERBOX_STACK_PAGE;
     let mut stub_externs = false;
     let mut null_guard = false;
+    let mut child_entry = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -73,6 +74,9 @@ fn try_main() -> Result<(), String> {
             // #964 trap-on-NULL: the guarded layout (low scratch shifted one guard up + the
             // `__null_guard` marker export), so a host may seed `[0, 16384)` unmapped.
             "--null-guard" => null_guard = true,
+            // §14 child-entry mode (#1011 slice 3c): synthesize the powerbox entry with the
+            // `instantiate_module` child ABI, so a guest driver can spawn this module as a phase child.
+            "--child-entry" => child_entry = true,
             _ if a.starts_with('-') => return Err(format!("unknown flag `{a}`")),
             _ => {
                 if input.replace(a.clone()).is_some() {
@@ -96,6 +100,7 @@ fn try_main() -> Result<(), String> {
         stub_unresolved_externs: stub_externs,
         stack_page: host_page,
         null_guard,
+        child_entry,
     };
     let is_ll = Path::new(&input).extension().is_some_and(|e| e == "ll");
     let translated = if is_ll {

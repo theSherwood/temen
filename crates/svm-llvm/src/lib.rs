@@ -267,6 +267,16 @@ pub struct TranslateOptions {
     /// **Off by default** — the legacy layout is byte-identical to before this knob existed, and an
     /// unmarked module is never guarded (old artifacts keep running unchanged).
     pub null_guard: bool,
+    /// **§14 child-entry mode** (#1011 slice 3c): synthesize the powerbox entry (`_start`, function 0)
+    /// with the `instantiate_module` child ABI — `(i64 starter) -> (i64 status)` — instead of the
+    /// paramless top-level powerbox entry, so a guest-orchestrated driver can `instantiate_module`
+    /// (op 13) this module as a confined phase child. The starter capability is ignored (the child
+    /// reaches its `fs`/`stdout`/… through the re-granted named caps in its powerbox, bound to its
+    /// manifest imports at spawn — the same imports a top-level run binds); `main`'s result is widened
+    /// to the `i64` status the parent reads back via `join`. **Off by default** — a normal powerbox
+    /// program keeps its paramless entry. Only meaningful when a `_start` is synthesized at all (a
+    /// program that uses the powerbox); an argv-taking `main` under this mode is not yet supported.
+    pub child_entry: bool,
 }
 
 impl Default for TranslateOptions {
@@ -277,6 +287,7 @@ impl Default for TranslateOptions {
             stub_unresolved_externs: false,
             stack_page: DEFAULT_STACK_PAGE,
             null_guard: false,
+            child_entry: false,
         }
     }
 }
@@ -1018,6 +1029,14 @@ fn translate_impl(
         let ctors = collect_global_ctors(m, &name2idx)?;
         // Both entries share `StartBuilder`; `synth_start_argv` adds the §3e args-buffer → `argv[]`
         // parsing for a `main(int, char**)`, `synth_start` is the plain `main(void)` entry.
+        // §14 child-entry mode (#1011 slice 3c): an argv-taking `main` under child-entry is not yet
+        // supported (the argv `_start`'s multi-block return would also need the i64-status widening);
+        // refuse it as a clean translate-time error rather than silently emit a non-child entry.
+        if opts.child_entry && wants_argv {
+            return Err(Error::Unsupported(
+                "child_entry: an argv-taking main is not yet supported".into(),
+            ));
+        }
         let build_start: StartBuilder = if wants_argv {
             synth_start_argv
         } else {
@@ -1033,6 +1052,7 @@ fn translate_impl(
             stack_page,
             tls_layout.root_base,
             scratch,
+            opts.child_entry,
         );
         funcs.insert(0, start);
     }
@@ -4197,7 +4217,7 @@ fn collect_global_ctors(m: &LModule, name2idx: &HashMap<String, u32>) -> Result<
 /// n_handles, heap_base, ctors) -> Func`. A `type` alias so the dispatch can pick one by function
 /// pointer without tripping `clippy::type_complexity`.
 type StartBuilder =
-    fn(u32, &[ValType], u64, Option<u64>, &[u32], bool, u64, Option<u64>, u64) -> Func;
+    fn(u32, &[ValType], u64, Option<u64>, &[u32], bool, u64, Option<u64>, u64, bool) -> Func;
 
 /// Synthesize the **powerbox entry** (`_start`, function 0) for a program that uses host
 /// capabilities — a **paramless** entry (IMPORTS.md phase 3): capabilities are manifest slots the
@@ -4221,13 +4241,23 @@ fn synth_start(
     root_tls_base: Option<u64>,
     // #964 guarded layout: every low-scratch address shifts up by this (0 = legacy).
     scratch: u64,
+    // §14 child-entry mode (#1011 slice 3c): the entry takes a starter capability (ignored) and returns
+    // an `i64` status, so a driver can `instantiate_module` (op 13) this module as a confined child.
+    child_entry: bool,
 ) -> Func {
     use svm_ir::StoreOp;
     let mut insts: Vec<Inst> = Vec::new();
     // A **paramless** `_start` (IMPORTS.md phase 3): capabilities are manifest slots the host binds
-    // before entry — no resolve prologue, no handle stash, no positional handle args.
-    let params: Vec<ValType> = Vec::new();
-    let mut next: ValIdx = 0;
+    // before entry — no resolve prologue, no handle stash, no positional handle args. Under §14
+    // child-entry mode the entry instead takes the starter capability as `v0` (ignored — the child
+    // reaches its caps through re-granted named imports, bound like any run's), matching the
+    // `instantiate_module` child ABI.
+    let params: Vec<ValType> = if child_entry {
+        vec![ValType::I64]
+    } else {
+        Vec::new()
+    };
+    let mut next: ValIdx = params.len() as ValIdx;
     // Initialize the heap: the bump pointer and the committed boundary both start at `heap_base` (the
     // window's mapped boundary — the first reserved page); the allocator `vm_map`-commits upward.
     if let Some(hb) = heap_base {
@@ -4271,13 +4301,34 @@ fn synth_start(
         func: main_idx,
         args: vec![sp],
     });
-    let term = if main_results.is_empty() {
-        Terminator::Return(vec![])
+    // The entry's result: a top-level powerbox entry returns `main`'s value verbatim (or `()` for a
+    // void `main`); a §14 child entry always returns an `i64` status — `0` for a void `main`, else
+    // `main`'s result widened to `i64` — the value the parent reads back through `join`.
+    let (results, term) = if child_entry {
+        match main_results.first() {
+            None => {
+                insts.push(Inst::ConstI64(0)); // void `main`: status 0
+                let z = next;
+                (vec![ValType::I64], Terminator::Return(vec![z]))
+            }
+            Some(ValType::I64) => (vec![ValType::I64], Terminator::Return(vec![next])),
+            Some(_) => {
+                let main_ret = next;
+                next += 1;
+                insts.push(Inst::Convert {
+                    op: ConvOp::ExtendI32U, // widen `main`'s i32 status to the i64 the ABI returns
+                    a: main_ret,
+                });
+                (vec![ValType::I64], Terminator::Return(vec![next]))
+            }
+        }
+    } else if main_results.is_empty() {
+        (Vec::new(), Terminator::Return(vec![]))
     } else {
-        Terminator::Return(vec![next]) // main's single result, appended by the call
+        (main_results.to_vec(), Terminator::Return(vec![next])) // main's single result, appended by the call
     };
     Func {
-        results: main_results.to_vec(),
+        results,
         blocks: vec![Block {
             params: params.clone(),
             insts,
@@ -4314,6 +4365,10 @@ fn synth_start_argv(
     // #964 guarded layout: every low-scratch address (heap words, the args blob) shifts up by this
     // (0 = legacy).
     scratch: u64,
+    // §14 child-entry mode: shares [`StartBuilder`] with [`synth_start`]. An argv-taking child entry is
+    // not yet supported (deferred to a later slice-3c increment); the caller refuses the combination, so
+    // this is always `false` here.
+    _child_entry: bool,
 ) -> Func {
     use svm_ir::{LoadOp, StoreOp};
     let args_base = (scratch + svm_ir::POWERBOX_ARGS_BASE) as i64;
