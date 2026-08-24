@@ -1,6 +1,6 @@
 # Temen
 
-[![CI](https://github.com/thesherwood/vm/actions/workflows/ci.yml/badge.svg)](https://github.com/thesherwood/vm/actions/workflows/ci.yml)
+[![CI](https://github.com/theSherwood/temen/actions/workflows/ci.yml/badge.svg)](https://github.com/theSherwood/temen/actions/workflows/ci.yml)
 
 A compilation target and sandbox VM — a WebAssembly alternative for running
 untrusted native code, aimed at being **as secure for the host as wasm, faster on
