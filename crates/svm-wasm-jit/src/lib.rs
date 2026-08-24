@@ -1216,12 +1216,13 @@ fn cap_oversized(m: &Module, in_subset: &mut [bool]) {
 /// of its emit set **before** allocating: the whole-program/reactor entries decline (`Unsupported` —
 /// the open chain falls through to the tier-up driver), the tier-up entries degrade (drop the
 /// largest-estimate functions to cross-tier leaves until the total fits), and the §22 unit emitter
-/// declines (the invoke runs interpreted). Calibrated on the shipped assets: the largest legitimate
-/// card (SQLite) estimates 33 MiB, and the known engine-killer (Postgres, 15 067 funcs) estimates
-/// 119 MiB — 64 MiB gives every shipped guest ≥2x headroom while staying ~2x under the known-fatal
-/// size. Fail-safe like the per-function valve: a decline/degrade only routes more code to the
-/// interpreter oracle, never an escape.
-const MAX_EST_EMITTED_MODULE_BYTES: usize = 64 << 20;
+/// declines (the invoke runs interpreted). Calibrated on the shipped assets (reactor emit sets):
+/// the largest legitimate card is nifler at 94 MiB — which emits and runs fine in the 1 GiB
+/// browser build — then nimsem 34 MiB, SQLite 24 MiB; the known engine-killer (Postgres,
+/// 15 067 funcs) estimates 117 MiB. 104 MiB sits mid-gap: ~11% headroom over the largest known-good
+/// emit and ~11% under the known-fatal size. Fail-safe like the per-function valve: a
+/// decline/degrade only routes more code to the interpreter oracle, never an escape.
+const MAX_EST_EMITTED_MODULE_BYTES: usize = 104 << 20;
 
 /// The function indices `f` calls (direct `Call`s + tail-call terminators — the latter keeps the
 /// reachability sound even though a tail call itself isn't emitted).
@@ -1940,7 +1941,7 @@ pub fn compile_module_reactor_capped(
 
 /// [`compile_module_reactor_capped`] with an explicit **module-total** emit budget (#1038 — see
 /// [`MAX_EST_EMITTED_MODULE_BYTES`], which the public entries pass). The parameter exists so the
-/// budget decline can be tested with a small module instead of a genuine 64 MiB one.
+/// budget decline can be tested with a small module instead of a genuine 104 MiB one.
 #[doc(hidden)]
 pub fn compile_module_reactor_budgeted(
     m: &Module,
@@ -2181,7 +2182,7 @@ pub fn compile_module_tierup_b2(
 
 /// [`compile_module_tierup_b2`] with an explicit **module-total** emit budget (#1038; the public
 /// entries pass [`MAX_EST_EMITTED_MODULE_BYTES`]) — exists so the degrade loop can be tested with a
-/// small module instead of a genuine 64 MiB one.
+/// small module instead of a genuine 104 MiB one.
 #[doc(hidden)]
 pub fn compile_module_tierup_b2_budgeted(
     m: &Module,

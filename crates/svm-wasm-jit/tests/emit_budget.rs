@@ -66,13 +66,13 @@ fn wide_module(n_callees: usize, loads_each: usize) -> Module {
     m
 }
 
-/// The real-constant pin: a module whose emit set estimates over the 64 MiB budget (12 leaves x
-/// 48k loads, each under the 6.5 MB per-function cap, summing ~74 MiB — the Postgres shape in
+/// The real-constant pin: a module whose emit set estimates over the 104 MiB budget (20 leaves x
+/// 48k loads, each under the 6.5 MB per-function cap, summing ~123 MiB — the Postgres shape in
 /// miniature) must DECLINE the whole-program emit with
 /// the budget error, before any allocation. Pre-#1038 this call OOM-aborted the wasm engine.
 #[test]
 fn over_budget_whole_program_declines_before_emitting() {
-    let m = wide_module(12, 48_000);
+    let m = wide_module(20, 48_000);
     let err = svm_wasm_jit::compile_module_reactor(&m, 0, false)
         .expect_err("an over-budget module must decline, not emit");
     assert!(
@@ -85,7 +85,7 @@ fn over_budget_whole_program_declines_before_emitting() {
 /// declines instead (the seam then runs the invoke interpreted, fail-closed).
 #[test]
 fn over_budget_unit_emit_declines() {
-    let m = wide_module(12, 48_000);
+    let m = wide_module(20, 48_000);
     let err = svm_wasm_jit::compile_module_b2(&m, false, 10)
         .expect_err("an over-budget unit must decline, not emit");
     assert!(

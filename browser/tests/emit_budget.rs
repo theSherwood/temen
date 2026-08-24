@@ -14,8 +14,8 @@ use svm_browser::{
 use svm_ir::{Block, Export, Func, Inst, LoadOp, Memory, Module, Terminator, ValType};
 
 /// The over-budget shape (the Postgres miniature shared with svm-wasm-jit's `emit_budget.rs`):
-/// `_start` calls 12 load-padded leaves, each under the 6.5 MB per-function cap, summing ~74 MiB
-/// estimated — over the 64 MiB module budget.
+/// `_start` calls 20 load-padded leaves, each under the 6.5 MB per-function cap, summing ~123 MiB
+/// estimated — over the 104 MiB module budget.
 fn wide_module(n_callees: usize, loads_each: usize) -> Module {
     let mut funcs = Vec::with_capacity(n_callees + 1);
     let mut insts = vec![Inst::ConstI64(16384)];
@@ -69,7 +69,7 @@ fn wide_module(n_callees: usize, loads_each: usize) -> Module {
 
 #[test]
 fn over_budget_open_declines_and_the_engine_survives() {
-    let big = svm_encode::encode_module(&wide_module(12, 48_000));
+    let big = svm_encode::encode_module(&wide_module(20, 48_000));
     // 1. The whole-program open DECLINES (pre-#1038 this OOM-aborted the instance here).
     let opened = svm_onramp_jit_run_open(big.as_ptr(), big.len(), core::ptr::null(), 0, 0);
     assert_eq!(
