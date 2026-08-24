@@ -944,6 +944,14 @@ struct Proc {
     /// twin-completion wake covers, so exactly the ones a blocking `waitpid` may bench on.
     /// `false` for the root and for spawn/re-grant clones (personality-allocated pids).
     core_task: bool,
+    /// #797 interactive rung 2 — this process's OWN handle on the terminal input pipe (the
+    /// world's [`Terminal::input_handle`] is the ROOT namespace's; handle values are per-powerbox,
+    /// so every process needs its own). Seeded at [`Posix::enable_terminal`] (root), cloned by
+    /// [`Proc::fork`] (the twin's cloned table keeps the value valid), and re-pointed by
+    /// [`exec_remap_hook`] when an exec carries the end into a fresh powerbox — exactly the
+    /// [`CorePipeToken`] discipline the fd table's adopted pipe ends follow. `None` = fall back
+    /// to the world handle (a pre-terminal or spawn-delegate process).
+    term_in: Option<CorePipeToken>,
 }
 
 /// One dispatch's view over the two personality lock domains — the shared [`World`] and the calling
@@ -1072,6 +1080,10 @@ impl Posix {
             input_pipe: pipe,
             canon_buf: Vec::new(),
         });
+        // #797 interactive rung 2 — the ROOT's own terminal token (`h` was minted in its
+        // powerbox); forks clone it, execs re-point it (see [`Proc::term_in`]).
+        drop(w);
+        self.root.lock().unwrap_or_else(|e| e.into_inner()).term_in = Some(CorePipeToken::new(h));
     }
 
     /// #797 — deliver keystrokes to the terminal: the **line discipline runs here**, at feed
@@ -1768,6 +1780,15 @@ fn exec_remap_hook(proc_: Arc<Mutex<Proc>>) -> svm_interp::ExecRemapHook {
                 }
             }
         }
+        // #797 interactive rung 2 — the terminal input end rides the same exec carry (it is a
+        // PipeEnd binding in the old powerbox); re-point this process's terminal token like any
+        // adopted pipe end, so an exec'd child's `read(0)` still taps the terminal.
+        if let Some(t) = p.term_in.as_ref() {
+            let cur = t.get();
+            if let Some((_, nh)) = pairs.iter().find(|(o, _)| *o == cur) {
+                t.handle.store(*nh, Ordering::Relaxed);
+            }
+        }
     })
 }
 
@@ -2011,6 +2032,7 @@ fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
         restart_ok: false,
         park_req: None,
         core_task: false,
+        term_in: None,
     }
 }
 
@@ -2112,6 +2134,9 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
                 OP_FORK => Ok(vec![st.fork_request()]),
                 _ => Err(Trap::CapFault),
             };
+            if std::env::var_os("SVM_PX_TRACE").is_some() && op == OP_READ {
+                eprintln!("[px] read -> {res:?}");
+            }
             // Fire a deferred cross-process wake (see [`Ctx::wake_after`]) only after both guards
             // drop — and from a **detached thread**: the interp invoked this handler while holding
             // our domain's `Host` lock, the wake takes the scheduler lock, and scheduler-lock
@@ -2384,6 +2409,9 @@ impl Proc {
             restart_ok: self.restart_ok,
             park_req: None, // the twin's own door lands at mint, like the wake/stop/kill
             core_task: false, // stamped by [`fork_factory`] beside the pid
+            // #797 — the twin's own terminal token: same handle value (the twin's cloned
+            // powerbox table keeps it valid), its own cell (an exec re-points per-process).
+            term_in: self.term_in.as_ref().map(|t| CorePipeToken::new(t.get())),
         }
     }
 }
@@ -2486,12 +2514,17 @@ impl Ctx<'_> {
         // #797 — with the terminal enabled, fd 0 IS the terminal: tag-redirect to the input
         // pipe (park on empty, EINTR, one-shot ^D EOF — the #972 path). The Stdin sentinel
         // stays the preloaded-stdin world's binding.
-        if fd == 0 {
-            if let Some(t) = self.w.terminal.as_ref() {
-                if matches!(self.fd(fd), Some(FdEntry::Stdin)) {
-                    return Ok(vec![PX_TAG_BASE - t.input_handle as i64]);
-                }
-            }
+        if fd == 0 && self.w.terminal.is_some() && matches!(self.fd(fd), Some(FdEntry::Stdin)) {
+            // #797 interactive rung 2 — mint the tag from THIS process's own token (handle
+            // values are per-powerbox; the world's is the root namespace's). A process without
+            // one (pre-terminal, spawn delegate) keeps the world handle.
+            let h = self
+                .p
+                .term_in
+                .as_ref()
+                .map(|t| t.get())
+                .unwrap_or_else(|| self.w.terminal.as_ref().unwrap().input_handle);
+            return Ok(vec![PX_TAG_BASE - h as i64]);
         }
         enum Src {
             Stdin,
@@ -2691,7 +2724,10 @@ impl Ctx<'_> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let fd = *args.first().ok_or(Trap::Malformed)?;
         let ptr = *args.get(1).ok_or(Trap::Malformed)? as u64;
-        let Some(t) = self.w.terminal.as_ref().filter(|_| (0..=2).contains(&fd)) else {
+        // A dup'd tty fd (bash parks the terminal at fd 255) is the terminal too — the same
+        // duplicated-sentinel rule `isatty`/`tcgetpgrp` follow, not a literal 0..=2.
+        let is_term = self.fd_is_terminal(fd);
+        let Some(t) = self.w.terminal.as_ref().filter(|_| is_term) else {
             return Ok(vec![ENOTTY]);
         };
         let mut out = Vec::with_capacity(32);
@@ -2715,7 +2751,10 @@ impl Ctx<'_> {
         let fd = *args.first().ok_or(Trap::Malformed)?;
         let ptr = *args.get(1).ok_or(Trap::Malformed)? as u64;
         let bytes = mem.read_bytes(ptr, 32).ok_or(Trap::Malformed)?;
-        let Some(t) = self.w.terminal.as_mut().filter(|_| (0..=2).contains(&fd)) else {
+        // A dup'd tty fd (bash parks the terminal at fd 255) is the terminal too — the same
+        // duplicated-sentinel rule `isatty`/`tcgetpgrp` follow, not a literal 0..=2.
+        let is_term = self.fd_is_terminal(fd);
+        let Some(t) = self.w.terminal.as_mut().filter(|_| is_term) else {
             return Ok(vec![ENOTTY]);
         };
         t.lflag = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
@@ -2736,7 +2775,10 @@ impl Ctx<'_> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let fd = *args.first().ok_or(Trap::Malformed)?;
         let ptr = *args.get(1).ok_or(Trap::Malformed)? as u64;
-        let Some(t) = self.w.terminal.as_ref().filter(|_| (0..=2).contains(&fd)) else {
+        // A dup'd tty fd (bash parks the terminal at fd 255) is the terminal too — the same
+        // duplicated-sentinel rule `isatty`/`tcgetpgrp` follow, not a literal 0..=2.
+        let is_term = self.fd_is_terminal(fd);
+        let Some(t) = self.w.terminal.as_ref().filter(|_| is_term) else {
             return Ok(vec![ENOTTY]);
         };
         let mut out = Vec::with_capacity(8);
@@ -3103,7 +3145,12 @@ impl Ctx<'_> {
             // `-ECHILD` below then doubles as the placeholder (parking routes discard it)
             // AND the degraded poll answer (non-parking routes/tiers keep the historical
             // spin — same results, decline-never-diverge).
-            if (opts & (WNOHANG | WUNTRACED | WCONTINUED)) == 0 {
+            // #802 interactive — `WUNTRACED`/`WCONTINUED` no longer disqualify the bench:
+            // interactive bash's foreground wait is `waitpid(-1, …, WUNTRACED)` (blocking, to
+            // catch ^Z stops). A fresh stop/continue already reported above without reaching
+            // here; the bench wakes on the child's EXIT (the twin-completion drain) or its
+            // STOP (the `Blocked::Stopped` insert drain), and the re-executed op reports.
+            if (opts & WNOHANG) == 0 {
                 if let Some(req) = self.p.park_req.clone() {
                     let target: Option<u64> = if pid > 0 {
                         match self.w.procs.get(&(pid as i32)) {

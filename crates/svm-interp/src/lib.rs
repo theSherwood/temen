@@ -4858,8 +4858,21 @@ impl Scheduler {
         let mut s = self.lock();
         let woken = s.stopped.remove(&domain).unwrap_or_default();
         let n = woken.len() as u32;
+        // #802 interactive — a CONTINUE is a reportable transition for a parent benched in a
+        // blocking `waitpid(…, WCONTINUED)` (`Blocked::ReapWait` on this task): re-admit those
+        // benchers too, mirroring the stop-park and twin-completion drains — the rewound op
+        // re-executes and the personality reports the fresh continue (`cont_fresh`).
+        let mut reap_hits: Vec<Box<VCpu>> = Vec::new();
+        for v in &woken {
+            if let Some(ws) = s.posix_reap_waiters.remove(&v.id) {
+                reap_hits.extend(ws);
+            }
+        }
         for v in woken {
             s.runnable.push_back(v);
+        }
+        for w in reap_hits {
+            s.runnable.push_back(w);
         }
         if n > 0 {
             self.work.notify_all();
@@ -5257,6 +5270,66 @@ impl Scheduler {
     /// vCPU twin, and the return-twice re-admissions (`reply_orig`/pid-mode for the original,
     /// `reply_twin` for the twin). `Err(v)` hands the intact caller back — each route decides its
     /// own failure delivery (re-park the ticket waiter; `-EAGAIN` as the call's result).
+    /// Wire (or RE-wire) a domain's signal-door closures over `host`'s OWN cells and domain id —
+    /// the domain-scoped, weak run-wake/stop/kill/park-request set (#863 slice 3 / #798 / #796 /
+    /// #799). Called at a fork twin's birth, and again at an **exec image-replace** (#802
+    /// interactive): the fork-time closures captured the pre-exec host's domain id, so a
+    /// post-exec continue's `wake_stopped(old_dom)` would drain nothing while the child parks
+    /// under the new id (observed: `fg` after `^Z` never resumed an exec'd `cat`).
+    fn wire_signal_doors(self: &Arc<Self>, host: &Arc<Mutex<Host>>) {
+        let hg = host.lock_unpoisoned();
+        let dom = hg.domain_id() as usize;
+        let stop_flag = hg.stop_flag.clone();
+        let term_flag = hg.term_flag.clone();
+        let park_request = hg.park_request.clone();
+        let source = hg.signal_poll().map(|(_, s)| s);
+        drop(hg); // release before `set_wake` (the door takes the personality's own lock)
+        if let Some(source) = source {
+            let sched_weak = Arc::downgrade(self);
+            source.set_pipe_wake(Arc::new(move |pipe| {
+                if let Some(sc) = sched_weak.upgrade() {
+                    sc.wake_pipe_readers(pipe);
+                }
+            }));
+            let sched_weak = Arc::downgrade(self);
+            source.set_wake(Arc::new(move || {
+                if let Some(sc) = sched_weak.upgrade() {
+                    sc.interrupt_interruptible_parks(dom, true);
+                }
+            }));
+            // #798 slice 2 — the stop/continue closure, minted with the wake.
+            let sched_weak = Arc::downgrade(self);
+            source.set_stop(Arc::new(move |stopped| {
+                stop_flag.store(stopped, Ordering::SeqCst);
+                if !stopped {
+                    if let Some(sc) = sched_weak.upgrade() {
+                        sc.wake_stopped(dom);
+                    }
+                }
+            }));
+            // #796 default actions — the terminate closure, minted with the wake/stop.
+            let sched_weak = Arc::downgrade(self);
+            source.set_kill(Arc::new(move || {
+                term_flag.store(true, Ordering::SeqCst);
+                if let Some(sc) = sched_weak.upgrade() {
+                    sc.interrupt_interruptible_parks(dom, false);
+                    sc.wake_stopped(dom);
+                }
+            }));
+            // #799 — the park-request closure, minted with the wake/stop/kill.
+            let park_cell = park_request.clone();
+            source.set_park_request(Arc::new(move |ev| {
+                park_cell.store(
+                    match ev {
+                        ParkEvent::TaskExit(id) => id,
+                        ParkEvent::ForkSelf => u64::MAX,
+                    },
+                    Ordering::SeqCst,
+                );
+            }));
+        }
+    }
+
     fn fork_vcpu(
         self: &Arc<Self>,
         mut v: Box<VCpu>,
@@ -5330,59 +5403,7 @@ impl Scheduler {
         // by `fork_powerbox`) gets its own **domain-scoped, weak** run-wake at birth, so a
         // deliverable signal raised against the twin (`kill(pid)`) interrupts ITS blocked syscalls —
         // and only its (invariant 12). Weak: the run's `Arc` dies with the run, no teardown needed.
-        {
-            let hg = twin_host.lock_unpoisoned();
-            let dom = hg.domain_id() as usize;
-            let stop_flag = hg.stop_flag.clone();
-            let term_flag = hg.term_flag.clone();
-            let park_request = hg.park_request.clone();
-            let source = hg.signal_poll().map(|(_, s)| s);
-            drop(hg); // release before `set_wake` (the door takes the personality's own lock)
-            if let Some(source) = source {
-                let sched_weak = Arc::downgrade(self);
-                source.set_pipe_wake(Arc::new(move |pipe| {
-                    if let Some(sc) = sched_weak.upgrade() {
-                        sc.wake_pipe_readers(pipe);
-                    }
-                }));
-                let sched_weak = Arc::downgrade(self);
-                source.set_wake(Arc::new(move || {
-                    if let Some(sc) = sched_weak.upgrade() {
-                        sc.interrupt_interruptible_parks(dom, true);
-                    }
-                }));
-                // #798 slice 2 — the twin's stop/continue closure, minted with its wake.
-                let sched_weak = Arc::downgrade(self);
-                source.set_stop(Arc::new(move |stopped| {
-                    stop_flag.store(stopped, Ordering::SeqCst);
-                    if !stopped {
-                        if let Some(sc) = sched_weak.upgrade() {
-                            sc.wake_stopped(dom);
-                        }
-                    }
-                }));
-                // #796 default actions — the twin's terminate closure, minted with its wake/stop.
-                let sched_weak = Arc::downgrade(self);
-                source.set_kill(Arc::new(move || {
-                    term_flag.store(true, Ordering::SeqCst);
-                    if let Some(sc) = sched_weak.upgrade() {
-                        sc.interrupt_interruptible_parks(dom, false);
-                        sc.wake_stopped(dom);
-                    }
-                }));
-                // #799 — the twin's park-request closure, minted with its wake/stop/kill.
-                let park_cell = park_request.clone();
-                source.set_park_request(Arc::new(move |ev| {
-                    park_cell.store(
-                        match ev {
-                            ParkEvent::TaskExit(id) => id,
-                            ParkEvent::ForkSelf => u64::MAX,
-                        },
-                        Ordering::SeqCst,
-                    );
-                }));
-            }
-        }
+        self.wire_signal_doors(&twin_host);
         let parent_key = domain_key_of(&v); // the forking domain — this twin's parent (per-parent reap)
         let mut twin = v.fork_twin(twin_id, twin_mem, twin_host);
         twin.pending = Some(Pending::CapResult(reply_twin));
@@ -6535,6 +6556,18 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     return;
                 };
                 if still_stopped && !term {
+                    // #798/#802 interactive — a child ENTERING the stop park is a reportable
+                    // state change for a parent benched in a blocking `waitpid(…, WUNTRACED)`
+                    // (`Blocked::ReapWait` on this task): re-admit it, exactly as the
+                    // twin-completion point does — the rewound op re-executes and the
+                    // personality reports the fresh stop (`stop_fresh`).
+                    let id = v.id;
+                    if let Some(ws) = s.posix_reap_waiters.remove(&id) {
+                        for w in ws {
+                            s.runnable.push_back(w);
+                        }
+                        sched.work.notify_all();
+                    }
                     s.stopped.entry(dom).or_default().push_back(v);
                 } else {
                     s.runnable.push_back(v);
@@ -6856,6 +6889,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     quota,
                     dt,
                 );
+                // #802 interactive — RE-wire the door over the rebuilt vCPU's host (fresh
+                // domain id): see [`Scheduler::wire_signal_doors`].
+                if let SchedRef::Real(sc) = &v.sched {
+                    sc.wire_signal_doors(&v.host);
+                }
                 continue;
             }
             // Only an `Inspector`-driven vCPU pauses, and those are never on the executor (DEBUGGING.md S4).
@@ -11990,10 +12028,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // Rw tail is deliberately not counted (its backing depth is embedder-specific
                     // — fail closed, invariant 9); a non-power-of-two prefix likewise refuses.
                     let win_bytes = mem.as_ref().map(|m| m.window.mapped()).unwrap_or(0);
-                    eprintln!(
-                        "EXECDBG mapped={win_bytes} reserved={:?}",
-                        mem.as_ref().map(|m| m.window.reserved())
-                    );
                     let win_log2 = win_bytes
                         .is_power_of_two()
                         .then(|| win_bytes.trailing_zeros() as u8);
@@ -12041,6 +12075,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         Arc::clone(&hg.sig_armed),
                                     );
                                 }
+                                // #802 interactive — the door's stop/kill/park-request closures
+                                // (minted at the twin's fork wiring) store into THESE cells; the
+                                // exec'd vCPU polls its new host's. Share the cells across the
+                                // image-replace, or a post-exec ^Z/kill sets a flag nothing reads
+                                // (observed: an exec'd `cat` ignored SIGTSTP — the fg job could
+                                // never stop).
+                                ch.stop_flag = Arc::clone(&hg.stop_flag);
+                                ch.term_flag = Arc::clone(&hg.term_flag);
+                                ch.park_request = Arc::clone(&hg.park_request);
                                 // #801 — exec is the SAME PROCESS, so the host-served personality
                                 // moves verbatim (same handler over the same Proc — fds, pid,
                                 // env survive exec, POSIX), never through the spawn re-grant

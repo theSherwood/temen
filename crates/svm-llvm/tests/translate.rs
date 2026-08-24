@@ -12651,4 +12651,84 @@ fn demo_bash_translates_and_verifies() {
             "bash -i: ^D printed bash's `exit` farewell (stderr: {err:?})"
         );
     }
+
+    // ▶ Interactive rung 2 (#802): **job control** — `^Z` stops the foreground external command,
+    // `jobs` lists it, `fg` resumes it WITH the terminal, and the resumed job reads keystrokes
+    // again. This session pins the whole chain: the exec'd child's terminal-backed `read(0)`
+    // (the per-process `term_in` token riding the exec carry), the blocking
+    // `waitpid(-1, WUNTRACED)` bench (and its wake when the child STOPS, not just exits), the
+    // exec image-replace re-wiring the signal door over the new host/domain
+    // (`wire_signal_doors` — without it `fg`'s SIGCONT woke nobody), and the dup'd-tty
+    // `tcgetattr`/`tcsetattr` gates (bash parks the terminal at fd 255).
+    {
+        // The custom-grant shape (the /bin registration and the terminal enable both live inside
+        // the grant — module handles and the input pipe belong to the run's Host).
+        let (posix2, make) = svm_posix::cap(0, 0, Vec::new());
+        let fork = svm_posix::cap_fork_factory(&posix2);
+        let p = posix2.clone();
+        let bins_for_grant = std::sync::Arc::clone(&bins);
+        let cap2 = svm_run::HostCap::custom(svm_interp::cap_id::HOST_PROC, 0, move |h, _win| {
+            let handle = h.grant_host_proc_forkable(make(), std::sync::Arc::clone(&fork));
+            let (door, armed) = svm_posix::cap_signal_source(&p);
+            h.set_signal_source(door, armed);
+            h.push_exec_remap_hook(svm_posix::cap_exec_remap_hook(&p));
+            let (names, sigs) = svm_posix::cap_vtable();
+            h.set_host_proc_vtable(handle, names, sigs);
+            for (path, m, wl) in bins_for_grant.iter() {
+                let mh = h.grant_module(m);
+                p.register_executable(path, mh, *wl);
+            }
+            p.enable_terminal(h);
+            handle
+        });
+        let feeder = {
+            let px = posix2.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                for keys in [
+                    "cat\n", "\x1a", "jobs\n", "fg\n", "via-fg\n", "\x04", "exit\n",
+                ] {
+                    px.feed_terminal(keys.as_bytes());
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+            })
+        };
+        let config = svm_run::RunConfig {
+            args: vec![b"bash".to_vec(), b"-i".to_vec()],
+            env: vec![
+                b"PATH=/bin".to_vec(),
+                b"HOME=/".to_vec(),
+                b"PS1=$ ".to_vec(),
+            ],
+            ..Default::default()
+        };
+        let run = inst
+            .run_with_caps(svm_run::Backend::TreeWalk, &config, &[("posix", cap2)])
+            .expect("bash -i job-control session");
+        feeder.join().expect("feeder thread");
+        assert_eq!(
+            run.outcome,
+            svm_run::Outcome::Exited(0),
+            "clean session exit"
+        );
+        let out = String::from_utf8_lossy(&posix2.stdout()).into_owned();
+        let err = String::from_utf8_lossy(&posix2.stderr()).into_owned();
+        assert!(
+            out.contains("[1]+  Stopped                 cat"),
+            "jobs listed the ^Z-stopped foreground job (stdout: {out:?})"
+        );
+        assert!(
+            err.contains("Stopped"),
+            "bash reported the stop at the prompt (stderr: {err:?})"
+        );
+        let echoes = out.matches("via-fg").count();
+        assert!(
+            echoes >= 2,
+            "the fg-resumed cat read the terminal again (echo + cat's copy; stdout: {out:?})"
+        );
+        assert!(
+            !err.contains("tcsetattr"),
+            "no dup'd-tty termios failures (stderr: {err:?})"
+        );
+    }
 }

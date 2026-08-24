@@ -3883,7 +3883,10 @@ int main(int argc, char **argv) {
   if (r != pid) return 2;
   if ((status & 0xff) != 0x7f) return 3;                /* stopped marker */
   if (((status >> 8) & 0xff) != 20) return 4;           /* by SIGTSTP */
-  if (__vm_fs(28, -1, (long)&status, 2, 0) != -10) return 6;  /* report-once */
+  if (__vm_fs(28, -1, (long)&status, 3, 0) != -10) return 6;  /* report-once: the WNOHANG probe
+                                              (#802 — a blocking WUNTRACED wait now BENCHES until
+                                              the child's next transition, POSIX; the pre-#802
+                                              plain-2 probe relied on the old polling answer) */
   if (__vm_fs(31, pid, 10, 0, 0) != 0) return 7;        /* the 10 lands while stopped: HELD */
   for (i = 0; i < 200000; i = i + 1) sink = i;          /* every chance to run, were it runnable */
   if (__vm_fs(28, pid, (long)&status, 1, 0) != -10) return 8;  /* WNOHANG probe (#799 — a plain

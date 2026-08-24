@@ -140,15 +140,36 @@ in `demo_bash_translates_and_verifies`; `bash_probe` drives ad-hoc sessions via
   probe) now allocates instead of failing into the `shell-init: error retrieving current
   directory` warning.
 
+## Interactive rung 2 (DONE) — job control: `^Z` / `jobs` / `fg`
+
+The full foreground chain works, native-shaped (`[1]+  Stopped  cat`, `fg` resumes with the
+terminal, the resumed job reads keystrokes). What the walk took (gated by the job-control block
+in the capstone):
+
+1. **The exec'd child's terminal-backed `read(0)`** — one world-level terminal handle can't
+   serve every powerbox namespace: each `Proc` now carries its own `term_in` token (seeded at
+   `enable_terminal`, cloned by fork, re-pointed by the exec-remap hook — the terminal end rides
+   the same exec carry the adopted pipe ends do).
+2. **The blocking `WUNTRACED` wait benches** — interactive bash's foreground wait is
+   `waitpid(-1, …, WUNTRACED)` (no `WNOHANG`); the #799 bench treated any `WUNTRACED` as
+   poll-only, so bash got `-ECHILD` and raced back to the prompt, competing with the job for the
+   terminal. Op 28 now benches any non-`WNOHANG` wait, and a child ENTERING the stop park drains
+   `ReapWait` benchers on its task (the `^Z` → stop-report wake).
+3. **The exec image-replace re-wires the signal door** (`Scheduler::wire_signal_doors`, shared
+   with the fork mint) — the fork-time closures captured the pre-exec host's domain id and flag
+   cells, so `fg`'s SIGCONT woke a domain that no longer existed while the child parked under
+   the new one.
+4. **Dup'd-tty termios** — bash parks the terminal at fd 255; the `tc*` ops now gate on the
+   duplicated-sentinel rule (`fd_is_terminal`), not a literal fd 0..=2.
+
 ## What remains (the slice ladder from the #802 sketch)
 
-- **Interactive rung 2 — background jobs**: `^Z`/`jobs`/`fg`/`bg`. The walk found the gap: an
-  exec'd child's fd 0 is a **drained stdin snapshot**, not the terminal — `cat` at the prompt
-  EOFs instantly instead of reading the terminal, so there is never a live foreground job to
-  stop. Needs the #801 exec plumbing to hand the child the terminal-backed fd 0 (and then the
-  VSUSP feed path + the stop report through interactive `waitpid(WUNTRACED)` — the #798
-  machinery, already personality-side).
-- **Slice 4 remainder**: here-docs, the `$?` edge above.
+- **Interactive rung 3 — background starts**: `cat &` hangs — a background terminal read must
+  ring SIGTTIN and STOP the reader (#798's doorbell covers writes; reads currently park on the
+  input pipe and steal keystrokes from the shell). Then `bg`, and the `^D`-EOF nuance (the
+  one-shot EOF is writer-count state, so the shell's next read can consume an EOF meant for the
+  job — native VEOF is a queued, one-READ event).
+- **Slice 4 remainder**: here-docs, the `$?`-after-self-SIGINT edge above.
 - Known band-0 papering (revisit when a differential trips over one): `fstat` synthesizes a
   chr-device for fds 0-2 and re-stats the recorded open path otherwise; `st_ino` is a path hash
   (same-file checks distinguish paths, not hardlinks); `sigsuspend` returns `EINTR` without
