@@ -17827,9 +17827,16 @@ fn module_digest(m: &Module) -> [u8; 32] {
 /// `decode_module` + `verify_module` reconstruct them losslessly on thaw. Debug info is dropped
 /// (untrusted, backend-ignored). `encode_module` is canonical, so `decode`→`encode` round-trips
 /// byte-identically, which is what keeps the §12.6 re-serialize invariant a plain `==`.
-fn encode_jit_unit(funcs: &[Func], mem_log2: Option<u8>) -> Vec<u8> {
+fn encode_jit_unit(
+    funcs: &[Func],
+    types: &[temen_ir::TypeEntry],
+    mem_log2: Option<u8>,
+) -> Vec<u8> {
     let m = Module {
         funcs: funcs.to_vec(),
+        // FuncType interning (#922): the unit's type section must ride `unit_ir` so a restore's
+        // `decode_module` + `verify_module` can resolve the interned call type indices.
+        types: types.to_vec(),
         memory: mem_log2.map(|size_log2| Memory { size_log2 }),
         ..Module::default()
     };
@@ -19212,7 +19219,7 @@ impl Host {
                     .units
                     .iter()
                     .map(|u| DurableJitUnit {
-                        unit_ir: encode_jit_unit(&u.funcs, d.mem_log2),
+                        unit_ir: encode_jit_unit(&u.funcs, &u.types, d.mem_log2),
                         install_type_id: u.install_type_id,
                     })
                     .collect(),
