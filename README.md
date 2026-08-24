@@ -82,10 +82,9 @@ What we're chasing:
   gives source-level breakpoints, stepping, and backtraces over the IR's debug info —
   no DWARF or JIT needed — with time-travel (step backward) as the WIP headline.
 
-The through-line: leaving out the browser/managed-language surface (a built-in GC,
-JS interop, UTF-16, `externref`, a component IDL) is what keeps the verifier and ABI
-small enough to trust — and that lean core is what makes the memory, concurrency,
-nesting, and tooling wins above affordable.
+The through-line: leaving out the browser-shaped surface is what keeps the verifier
+and ABI small enough to trust — and that lean core is what makes the memory,
+concurrency, nesting, and tooling wins above affordable.
 
 ## What it aims to be
 
@@ -128,7 +127,9 @@ Roughly where things stand:
   jsmn, SHA-256, xxHash, miniz/tinfl, stb_perlin, tiny-regex-c, and more; see
   [`demos/`](crates/svm-run/demos)).
 - **Two more frontends**: `svm-wasm` (core-wasm → IR, incl. v128 SIMD and
-  wasi-threads) and `svm-llvm` (LLVM-bitcode → IR).
+  wasi-threads) and `svm-llvm` (LLVM-bitcode → IR) — the LLVM on-ramp runs the
+  **unmodified SQLite amalgamation** (in-memory and disk-backed via the Fs
+  capability) and a **QuickJS** embedding byte-identically to native builds.
 - **Real virtual memory**: a reserved window with guard page + fault handler turns an
   out-of-window access into a clean trap on Linux / macOS / Windows; guest-controlled
   demand-paged growth via the Memory capability.
@@ -149,6 +150,9 @@ Roughly where things stand:
 - Narrow-scalar promotion, honoring weak memory orderings (both backends are seq-cst
   today), wider SIMD (`v256`/`v512`), isolation tiers, Spectre hardening, source-level
   DWARF for JIT code, and broader LLVM/wasm frontend coverage.
+- The big bring-ups in flight: **shareware Doom** in the browser playground, **GNU
+  bash** on the POSIX personality, **single-user Postgres**, and QuickJS through
+  test262 (see the READMEs under [`demos/`](crates/svm-run/demos)).
 - The security-certification workstream: today's bar is "appears to work," not
   "certified secure" (see `DESIGN.md` §2a/§18).
 
@@ -214,40 +218,34 @@ guest's code:
 
 ```sh
 cargo run -p svm-run -- crates/svm-run/demos/hello.svmt   # text IR → "hello, sandbox!"
-cargo run -p svm-run -- crates/svm-run/demos/hello.c     # C source (via the chibicc frontend)
-cargo run -p svm-run -- crates/svm-run/demos/calc.c      # a recursive-descent calculator
-cargo run -p svm-run -- crates/svm-run/demos/rational.c  # exact-rational arithmetic
-cargo run -p svm-run -- crates/svm-run/demos/clay/clay_demo.c  # the Clay UI layout library!
-cargo run -p svm-run -- crates/svm-run/demos/jsmn/jsmn_demo.c  # the jsmn JSON tokenizer
-cargo run -p svm-run -- crates/svm-run/demos/sha256/sha_demo.c # SHA-256 (known test vectors)
-cargo run -p svm-run -- crates/svm-run/demos/xxhash/xxh_demo.c # xxHash (XXH32/XXH64)
-cargo run -p svm-run -- crates/svm-run/demos/tinfl/tinfl_demo.c # miniz tinfl (DEFLATE inflate)
-cargo run -p svm-run -- crates/svm-run/demos/perlin/perlin_demo.c # stb_perlin (3D Perlin noise, floats)
-cargo run -p svm-run -- crates/svm-run/demos/regex/regex_demo.c   # tiny-regex-c (backtracking matcher)
-cargo run -p svm-run -- crates/svm-run/demos/heapgrow/heapgrow.c  # a guest heap that grows via the Memory cap
-cargo run -p svm-run -- crates/svm-run/demos/jit/jit_demo.c      # a guest bytecode interpreter that JITs itself (§22)
-cargo run -p svm-run -- crates/svm-run/demos/jit/jit_threads.c   # worker threads each Cranelift-compile concurrently
-cargo run -p svm-run -- crates/svm-run/demos/raytrace/raytrace.c # ASCII sphere raytracer (guest-side libm: sin/exp/sqrt)
-cargo run -p svm-run -- crates/svm-run/demos/mat4/mat4.c         # 4×4 matrix×vec4 via 128-bit SIMD (§17 v128)
-cargo run -p svm-run -- crates/svm-run/demos/crc32/crc32.c       # CRC-32 over stdin (exercises bswap)
-cargo run -p svm-run -- crates/svm-run/demos/hexdump/hexdump.c   # hexdump -C-style tool (varargs printf)
-cargo run -p svm-run -- crates/svm-run/demos/lineedit/lineedit.c # tiny line editor (overlapping memmove)
-cargo run -p svm-run -- crates/svm-run/demos/sortvec/sortvec.c   # growable int vector + sort (realloc)
-cargo run -p svm-run -- crates/svm-run/demos/mn_sched/mn_sched.c # guest M:N scheduler — sharded stackful fibers (§23)
-cargo run -p svm-run -- crates/svm-run/demos/work_stealing/work_stealing.c       # work-stealing M:N over stackless tasks (§23)
-cargo run -p svm-run -- crates/svm-run/demos/steal_fibers/steal_fibers.c         # work-stealing over migratable stackful fibers (D57)
-cargo run -p svm-run -- crates/svm-run/demos/malloc_threads/malloc_threads.c     # concurrent malloc from many vCPUs (thread-safe heap)
-cargo run -p svm-run -- crates/svm-run/demos/async_io/async_io.c                 # async event loop over the §9/§12 I/O ring
-cargo run -p svm-run -- crates/svm-run/demos/async_work_stealing/async_work_stealing.c # async work-stealing M:N runtime (capstone)
+cargo run -p svm-run -- crates/svm-run/demos/hello.c      # C source (via the chibicc frontend)
+cargo run -p svm-run -- crates/svm-run/demos/clay/clay_demo.c        # the Clay UI layout library
+cargo run -p svm-run -- crates/svm-run/demos/raytrace/raytrace.c     # ASCII raytracer (guest-side libm)
+cargo run -p svm-run -- crates/svm-run/demos/mat4/mat4.c             # 128-bit SIMD matrix math
+cargo run -p svm-run -- crates/svm-run/demos/heapgrow/heapgrow.c     # malloc heap growth via the Memory cap
+cargo run -p svm-run -- crates/svm-run/demos/jit/jit_demo.c          # a guest interpreter that JITs itself
+cargo run -p svm-run -- crates/svm-run/demos/steal_fibers/steal_fibers.c  # work-stealing over migratable fibers
 echo 'int main(){ return 42; }' > /tmp/r.c
-cargo run -p svm-run -- /tmp/r.c ; echo "exit $?"        # → exit 42
+cargo run -p svm-run -- /tmp/r.c ; echo "exit $?"         # → exit 42
 ```
 
 The CLI accepts `.svm` (text IR), `.svmb` (binary), or `.c` (compiled through
-`frontend/chibicc`, located via `$SVM_CHIBICC` or the in-repo build). Many of these
-demos run real third-party C libraries sandboxed and are checked byte-for-byte
-against a native `cc` build in `svm-run`'s tests — see [`FRONTEND.md`](FRONTEND.md)
-for the story behind getting Clay, jsmn, and friends to run.
+`frontend/chibicc`, located via `$SVM_CHIBICC` or the in-repo build).
+
+That's a sample — [`demos/`](crates/svm-run/demos) holds dozens more, each picked to
+stress a different shape and checked byte-for-byte against a native `cc` build:
+real third-party C libraries (jsmn, SHA-256, xxHash, miniz/tinfl, stb_perlin,
+tiny-regex-c, monocypher…), guest M:N schedulers and async runtimes over the
+concurrency primitives, and more. See [`FRONTEND.md`](FRONTEND.md) for the story
+behind getting Clay, jsmn, and friends to run.
+
+The heavyweights run through the **LLVM on-ramp** (`svm-llvm`): the **unmodified
+SQLite amalgamation** — in-memory and disk-backed via the Fs capability — plus
+**LMDB** and a **QuickJS** embedding all run sandboxed, byte-identical to the same
+sources built natively (full test262 for QuickJS is still in progress). Bigger bring-ups —
+shareware **Doom**, GNU **bash** on the POSIX personality, single-user **Postgres**
+— are in flight at various stages; each demo directory's README states honestly
+where it stands.
 
 Embedders can call the same path directly — `svm_run::run_powerbox(&module, stdin)`
 returns the outcome plus captured output. It's the one reusable piece of host glue
