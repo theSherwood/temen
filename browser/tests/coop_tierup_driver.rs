@@ -19,10 +19,11 @@ use svm_browser::{
     svm_coop_jit_result_types_ptr, svm_coop_jit_wasm_by_handle_len,
     svm_coop_jit_wasm_by_handle_ptr, svm_coop_jit_wasm_len, svm_coop_jit_wasm_ptr, svm_coop_mapped,
     svm_coop_mapped_now, svm_coop_nfuncs, svm_coop_open, svm_coop_paged, svm_coop_pagestate_len,
-    svm_coop_pagestate_ptr, svm_coop_run, svm_coop_shim_ptr, svm_coop_shim_wasm, svm_coop_slot_code,
-    svm_coop_table_gen, svm_coop_table_log2, svm_coop_value, svm_coop_wasm_len, svm_coop_wasm_ptr,
-    svm_coop_win_len, svm_coop_win_ptr, svm_run_value, svm_status, svm_stdout_len, svm_stdout_ptr,
-    COOP_RUN_DONE, COOP_RUN_JIT_INVOKE, COOP_RUN_TIERUP, COOP_RUN_TRAP, STATUS_OK, STATUS_TRAP,
+    svm_coop_pagestate_ptr, svm_coop_run, svm_coop_shim_ptr, svm_coop_shim_wasm,
+    svm_coop_slot_code, svm_coop_table_gen, svm_coop_table_log2, svm_coop_value, svm_coop_wasm_len,
+    svm_coop_wasm_ptr, svm_coop_win_len, svm_coop_win_ptr, svm_run_value, svm_status,
+    svm_stdout_len, svm_stdout_ptr, COOP_RUN_DONE, COOP_RUN_JIT_INVOKE, COOP_RUN_TIERUP,
+    COOP_RUN_TRAP, STATUS_OK, STATUS_TRAP, STATUS_UNSUPPORTED,
 };
 use svm_interp::{Host, StreamRole};
 use wasmi::{
@@ -631,10 +632,9 @@ impl CoopB2Driver {
                         }
                         let plen = svm_coop_pagestate_len();
                         // SAFETY: pending-event page-state table, stable until the deliver.
-                        let table = unsafe {
-                            std::slice::from_raw_parts(svm_coop_pagestate_ptr(), plen)
-                        }
-                        .to_vec();
+                        let table =
+                            unsafe { std::slice::from_raw_parts(svm_coop_pagestate_ptr(), plen) }
+                                .to_vec();
                         let table_base = WIN_BASE as usize + win_len;
                         let need = (table_base + plen).div_ceil(1 << 16) as u32;
                         let have = mem.size(&c) as u32;
@@ -976,10 +976,18 @@ fn coop_rodata_and_midinvoke_grow_match_the_oracle() {
         );
         let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
         assert_eq!(opened, 0, "coop open (status {})", svm_status());
-        assert_ne!(svm_coop_paged(), 0, "the rodata guest opens the coop run paged");
+        assert_ne!(
+            svm_coop_paged(),
+            0,
+            "the rodata guest opens the coop run paged"
+        );
         let (_d, tierups) = drive_coop_b2_session_allow_trap(&m);
         assert!(tierups >= 1, "the leaf tiers up on the coop path");
-        assert_eq!(svm_status(), want.status, "coop status parity (store={store})");
+        assert_eq!(
+            svm_status(),
+            want.status,
+            "coop status parity (store={store})"
+        );
         if !want_trap {
             assert_eq!(svm_coop_value(), want.value, "coop value parity (Ro load)");
         }
@@ -1002,9 +1010,21 @@ fn coop_rodata_and_midinvoke_grow_match_the_oracle() {
     assert_ne!(svm_coop_paged(), 0, "paged");
     let (d, tierups) = drive_coop_b2_session_allow_trap(&m);
     assert!(tierups >= 1, "the leaf tiers up");
-    assert!(!d.bounces().is_empty(), "the grow helper bounces: {:?}", d.bounces());
-    assert_eq!(svm_status(), want.status, "coop status parity (mid-invoke grow)");
-    assert_eq!(svm_coop_value(), want.value, "coop value parity through the grown page");
+    assert!(
+        !d.bounces().is_empty(),
+        "the grow helper bounces: {:?}",
+        d.bounces()
+    );
+    assert_eq!(
+        svm_status(),
+        want.status,
+        "coop status parity (mid-invoke grow)"
+    );
+    assert_eq!(
+        svm_coop_value(),
+        want.value,
+        "coop value parity through the grown page"
+    );
     svm_coop_close();
 }
 
@@ -1389,21 +1409,24 @@ fn coop_invoked_unit_bounces_and_native_edges_match_the_oracle() {
     );
 
     let (d, _tierups, invokes) = drive_coop_b2_session(&m);
-    // Non-vacuity: the unit ran emitted (invoke), its cap-calling edge **bounced** through the
-    // invoke-confined registry (slot 1 in the bounce log), and the pure leaf dispatched **natively**
-    // (slot 2 absent) — the exact edge split #846 pins, now on the cooperative driver.
+    // Non-vacuity: the unit ran emitted (invoke), and — post-#889 outlining (#1026 slice 1: this
+    // driver now outlines cap sites exactly like the pump) — the helper `f1` itself **emits** (its
+    // cap sites hoist to wrappers), so BOTH program slots dispatch natively and the live-window
+    // bounces are f1's outlined wrappers 8/9 (append order: f0's map/compile/invoke/write = 4–7,
+    // f1's grow/write = 8/9). The mid-invoke growth now happens inside wrapper 8's bounce — same
+    // contract, the pump's `linked_unit_bounces` shape on the cooperative driver.
     assert!(
         invokes >= 1,
         "the linked unit must run emitted (invoke non-vacuity)"
     );
     assert!(
-        d.bounces().contains(&1),
-        "the cap-calling helper must have bounced during the invoke: {:?}",
+        d.bounces().contains(&8) && d.bounces().contains(&9),
+        "the helper's outlined wrappers must bounce during the invoke: {:?}",
         d.bounces()
     );
     assert!(
-        !d.bounces().contains(&2),
-        "the eligible leaf must dispatch natively, never bounce: {:?}",
+        !d.bounces().contains(&1) && !d.bounces().contains(&2),
+        "the helper and the leaf both emit — program slots dispatch natively, never bounce: {:?}",
         d.bounces()
     );
     assert_eq!(svm_status(), want.status, "status parity with the oracle");
@@ -1419,5 +1442,1005 @@ fn coop_invoked_unit_bounces_and_native_edges_match_the_oracle() {
         got_out, want.stdout,
         "stdout parity (bounce ordering included)"
     );
+    svm_coop_close();
+}
+
+// ================================================================================================
+// #1026 slice 1 — the single-vCPU pump's differentials, ported onto the cooperative driver.
+//
+// The pump (`svm_onramp_tierup_*`) is being collapsed into this driver (coop subsumes its admission
+// set and is faster — see the issue). These ports establish equivalent coverage here BEFORE the
+// pump and its harness are deleted: every pump differential without a coop twin gets one, run
+// through the full `CoopB2Driver` against the same `onramp_exec` oracle. Guests are verbatim from
+// `tierup_driver.rs` unless a comment says otherwise; the one semantic adjustment is the
+// reachable-concurrency test — the pump DECLINES a runtime-reached `atomic.notify`, while this
+// driver SERVICES it, so the port asserts full parity instead of a clean trap (strictly stronger).
+// ================================================================================================
+
+/// The ported guests' leaf constant (the pump file's `LEAF_K`; this file's own is 424242).
+const PLEAF_K: i64 = 40404;
+/// What the fiber-hosting unit adds inside its fiber (distinct from `UNIT_K`/`PLEAF_K`).
+const FIBER_UNIT_K: i64 = 777;
+/// What the direct-cross-tier helper adds.
+const XT_K: i64 = 222;
+/// Hot-loop constants: per-iteration multiplier, staging cell, iteration count (== bounce count).
+const HOT_K: i64 = 77;
+const SLOT2: i64 = 2064;
+const HOT_N: i64 = 4;
+
+/// Stage `blob` into guest memory at `base` as i64 stores (`prefix` uniquifies the SSA names).
+fn stage_blob(prefix: &str, base: i64, blob: &[u8]) -> String {
+    let mut s = String::new();
+    for (i, chunk) in blob.chunks(8).enumerate() {
+        let mut word = [0u8; 8];
+        word[..chunk.len()].copy_from_slice(chunk);
+        let val = i64::from_le_bytes(word);
+        let addr = base + (i as i64) * 8;
+        s.push_str(&format!(
+            "  v{prefix}a{i} = i64.const {addr}\n  v{prefix}v{i} = i64.const {val}\n  i64.store v{prefix}a{i} v{prefix}v{i}\n"
+        ));
+    }
+    s
+}
+
+/// The pump's `jit_guest_text_with`, verbatim (single-vCPU — no `thread.spawn`; this driver admits
+/// it the same way): `_start` grows `[64 KiB, 80 KiB)`, stages `blob`, `vm_jit_compile`s it,
+/// `vm_jit_invoke2`s with the grown-page probe, streams. `extra_funcs` appends program functions
+/// (e.g. a fiber body a unit names by raw slot — #845).
+fn coop_jit_guest_text_with(blob: &[u8], extra_funcs: &str) -> String {
+    let (out_h, mem_h) = onramp_out_mem_handles();
+    let blob_len = blob.len();
+    let stores = stage_blob("s", BLOB_BASE, blob);
+    format!(
+        r#"memory 16
+import 0 "vm_jit_compile" (i64, i64) -> (i64)
+import 1 "vm_jit_invoke2" (i64, i64) -> (i64)
+func () -> (i64) {{
+block 0 () {{
+  vas = i32.const {mem_h}
+  voff = i64.const 65536
+  vlen = i64.const 16384
+  vprot = i32.const 3
+  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+{stores}  vbp = i64.const {BLOB_BASE}
+  vbl = i64.const {blob_len}
+  vcode = call.import 0 (vbp, vbl)
+  vprobe = i64.const {PROBE}
+  vres = call.import 1 (vcode, vprobe)
+  vsl = i64.const {SLOT}
+  i64.store vsl vres
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vres
+  }}
+}}
+{extra_funcs}export 0 func "_start" 0
+"#
+    )
+}
+
+/// Pump port (#835): a **fiber**-using guest (`cont.new`/`cont.resume`/`suspend` — the JACL
+/// scheduler shape) is admitted, its fibers serviced in-engine, and its eligible leaf still tiers
+/// up — parity with the oracle.
+#[test]
+fn coop_fiber_guest_is_admitted_and_matches_the_oracle() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let src = r#"memory 16
+func () -> (i64) {
+block 0 () {
+  v0 = ref.func 2
+  v1 = i64.const 0
+  v2 = cont.new v0 v1
+  v3 = i64.const 7
+  vs1, vv1 = cont.resume v2 v3
+  vs2, vv2 = cont.resume v2 v3
+  vprobe = i64.const 1234
+  vres = call 1 (vprobe)
+  va = i64.add vv1 vres
+  vb = i64.add va vv2
+  vs1e = i64.extend_i32_s vs1
+  vk1 = i64.const 1000000
+  vc = i64.mul vs1e vk1
+  vs2e = i64.extend_i32_s vs2
+  vk2 = i64.const 10000000
+  vd = i64.mul vs2e vk2
+  ve = i64.add vb vc
+  vf = i64.add ve vd
+  return vf
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vk = i64.const 40404
+  vsum = i64.add v0 vk
+  return vsum
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vk = i64.const 100
+  vs = i64.add varg vk
+  vv = suspend vs
+  return vv
+  }
+}
+export 0 func "_start" 0
+"#;
+    let m = svm_text::parse_module(src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+
+    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(
+        opened,
+        0,
+        "a fiber guest must be admitted (status {})",
+        svm_status()
+    );
+    let (_d, tierups, _invokes) = drive_coop_b2_session(&m);
+    assert!(tierups >= 1, "the leaf still tiers up beside the fibers");
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(svm_coop_value(), want.value, "value parity with the oracle");
+    svm_coop_close();
+}
+
+/// Pump port (#845): a guest-compiled **fiber-hosting** unit is admitted by the validator and runs
+/// observably identical — on the **interpreter** on both paths: a fiber unit never emits, so the
+/// driver surfaces **zero** JIT_INVOKE events (emitting one would run fiber ops on a wasm frame).
+#[test]
+fn coop_fiber_hosting_unit_is_admitted_and_matches_the_oracle() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let fiber_unit_blob = {
+        let src = r#"memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vf = i32.const 1
+  vsp = i64.const 0
+  vk = cont.new vf vsp
+  vs1, vv1 = cont.resume vk v0
+  vs2, vv2 = cont.resume vk v0
+  vr = i64.add vv1 vv2
+  return vr
+  }
+}
+"#;
+        let m = svm_text::parse_module(src).expect("parse fiber unit");
+        svm_verify::verify_module(&m).expect("verify fiber unit");
+        svm_encode::encode_module(&m)
+    };
+    let fiber_body = format!(
+        r#"func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vk = i64.const {FIBER_UNIT_K}
+  vs = i64.add varg vk
+  vv = suspend vs
+  return vv
+  }}
+}}
+"#
+    );
+    let m = svm_text::parse_module(&coop_jit_guest_text_with(&fiber_unit_blob, &fiber_body))
+        .expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+
+    let want = onramp_exec(&m, b"");
+    assert_eq!(
+        want.status, STATUS_OK,
+        "the fiber-hosting unit compiles + invokes interpreted"
+    );
+    assert_eq!(
+        want.value,
+        2 * PROBE + FIBER_UNIT_K,
+        "both yielded values arrive"
+    );
+
+    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "open must admit (status {})", svm_status());
+    let (_d, _tierups, invokes) = drive_coop_b2_session(&m);
+    assert_eq!(
+        invokes, 0,
+        "a fiber unit never runs emitted (compile_jit declines it) — the invoke stays interpreted"
+    );
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(svm_coop_value(), want.value, "value parity with the oracle");
+    svm_coop_close();
+}
+
+/// Pump port (#845's closed half, driver-independent): a **futex**-using unit (`atomic.notify`) is
+/// still refused by the validator (`-EINVAL` from `vm_jit_compile`), so the guest's invoke of the
+/// bogus code handle traps — pinned on the oracle (both drivers inherit it).
+#[test]
+fn coop_futex_unit_is_still_refused() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let unit_src = r#"memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vaddr = i64.const 0
+  vcnt = i32.const 0
+  vw = atomic.notify vaddr vcnt
+  return v0
+  }
+}
+"#;
+    let unit = svm_text::parse_module(unit_src).expect("parse futex unit");
+    svm_verify::verify_module(&unit).expect("verify futex unit");
+    let blob = svm_encode::encode_module(&unit);
+    let m = svm_text::parse_module(&coop_jit_guest_text_with(&blob, "")).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let want = onramp_exec(&m, b"");
+    assert_ne!(
+        want.status, STATUS_OK,
+        "a futex unit must fail compile (-EINVAL) → the invoke of the bogus handle traps"
+    );
+}
+
+/// Pump port: a guest with **no** eligible leaf (all fiber ops, nothing emittable) must refuse the
+/// open (`STATUS_UNSUPPORTED`) so the page runs the plain bytecode path — same fail-closed gate.
+#[test]
+fn coop_open_fails_closed_without_an_eligible_leaf() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let src = r#"memory 16
+func () -> (i64) {
+block 0 () {
+  vf = i32.const 1
+  vsp = i64.const 0
+  vk = cont.new vf vsp
+  varg = i64.const 1
+  vs1, vv1 = cont.resume vk varg
+  return vv1
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vv = suspend varg
+  return vv
+  }
+}
+export 0 func "_start" 0
+"#;
+    let m = svm_text::parse_module(src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(
+        opened, -STATUS_UNSUPPORTED,
+        "nothing for the emitted tier to run → clean refusal (bytecode fallback)"
+    );
+    svm_coop_close();
+}
+
+/// Pump port (#846, unit→**unit** native): the guest compiles + `install`s pure unit A, then
+/// compiles unit B whose `call_indirect` reaches A's install slot — both emitted, the edge
+/// dispatches natively (zero bounces), matching the oracle.
+#[test]
+fn coop_installed_unit_edge_dispatches_natively() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let (out_h, jit_h) = onramp_out_jit_handles();
+    let unit_a_src = r#"memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vk = i64.const 7
+  vsum = i64.add v0 vk
+  return vsum
+  }
+}
+"#;
+    let unit_b_src = r#"memory 16
+func (i64, i64) -> (i64) {
+block 0 (vslot: i64, vx: i64) {
+  vs = i32.wrap_i64 vslot
+  vr = call_indirect (i64) -> (i64) vs (vx)
+  vk = i64.const 100
+  vsum = i64.add vr vk
+  return vsum
+  }
+}
+"#;
+    let blob_a = {
+        let u = svm_text::parse_module(unit_a_src).expect("parse A");
+        svm_verify::verify_module(&u).expect("verify A");
+        svm_encode::encode_module(&u)
+    };
+    let blob_b = {
+        let u = svm_text::parse_module(unit_b_src).expect("parse B");
+        svm_verify::verify_module(&u).expect("verify B");
+        svm_encode::encode_module(&u)
+    };
+    const A_BASE: i64 = 4096;
+    const B_BASE: i64 = 8192;
+    let (sa, sb) = (
+        stage_blob("a", A_BASE, &blob_a),
+        stage_blob("c", B_BASE, &blob_b),
+    );
+    let (la, lb) = (blob_a.len(), blob_b.len());
+    const X: i64 = 5000;
+    let src = format!(
+        r#"memory 16
+import 0 "vm_jit_compile" (i64, i64) -> (i64)
+import 1 "vm_jit_invoke2" (i64, i64, i64) -> (i64)
+func () -> (i64) {{
+block 0 () {{
+{sa}{sb}  vap = i64.const {A_BASE}
+  val = i64.const {la}
+  vca = call.import 0 (vap, val)
+  vjit = i32.const {jit_h}
+  vslot = cap.call 11 3 (i64) -> (i64) vjit (vca)
+  vbp = i64.const {B_BASE}
+  vbl = i64.const {lb}
+  vcb = call.import 0 (vbp, vbl)
+  vx = i64.const {X}
+  vres = call.import 1 (vcb, vslot, vx)
+  vsl = i64.const {SLOT}
+  i64.store vsl vres
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vres
+  }}
+}}
+export 0 func "_start" 0
+"#
+    );
+    let m = svm_text::parse_module(&src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(want.value, X + 7 + 100, "oracle: B → installed A → +100");
+
+    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "open must admit (status {})", svm_status());
+    let (d, _tierups, invokes) = drive_coop_b2_session(&m);
+    assert!(invokes >= 1, "unit B must run emitted (non-vacuity)");
+    assert!(
+        d.bounces().is_empty(),
+        "both units are emitted — the installed edge must dispatch natively: {:?}",
+        d.bounces()
+    );
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(svm_coop_value(), want.value, "value parity with the oracle");
+    svm_coop_close();
+}
+
+/// Pump port (#1009 Mechanism 1): a guest with **more than 1024 functions** whose tier-up-eligible
+/// dispatch leaf `call_indirect`s a slot beyond the 1024-slot floor — the emitted table and the
+/// interpreter's `SharedSlots` must both size to `next_power_of_two(n_funcs)` so the two tiers mask
+/// identically (a fixed-1024 mask silently reached a wrong, identically-typed function).
+#[test]
+fn coop_high_index_dispatch_beyond_the_table_floor_matches_the_oracle() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let out_h = onramp_out_handle();
+    const TARGET: usize = 1050;
+    const INPUT: i64 = 12345;
+    const DISTINCT: i64 = 777;
+    assert_eq!(
+        TARGET & 1023,
+        26,
+        "the fixed-1024 mask lands on an identity slot"
+    );
+    let mut fns = format!(
+        r#"func () -> (i64) {{
+block 0 () {{
+  vin = i64.const {INPUT}
+  vres = call 1 (vin)
+  vsl = i64.const {SLOT}
+  i64.store vsl vres
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vres
+  }}
+}}
+"#
+    );
+    fns.push_str(&format!(
+        r#"func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vs = i32.const {TARGET}
+  vr = call_indirect (i64) -> (i64) vs (v0)
+  return vr
+  }}
+}}
+"#
+    ));
+    for i in 2..=TARGET {
+        if i == TARGET {
+            fns.push_str(&format!(
+                "func (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  vk = i64.const {DISTINCT}\n  vr = i64.add v0 vk\n  return vr\n  }}\n}}\n"
+            ));
+        } else {
+            fns.push_str("func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  return v0\n  }\n}\n");
+        }
+    }
+    let src = format!("memory 16\n{fns}export 0 func \"_start\" 0\n");
+    let m = svm_text::parse_module(&src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    assert!(
+        m.funcs.len() > (1usize << 10),
+        "the guest must exceed the 1024-slot floor"
+    );
+    let bytes = svm_encode::encode_module(&m);
+
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(
+        want.value,
+        INPUT + DISTINCT,
+        "oracle: the dispatch reaches slot {TARGET}"
+    );
+
+    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "open must admit (status {})", svm_status());
+    assert!(
+        (1u32 << svm_coop_table_log2()) >= m.funcs.len() as u32,
+        "the table must cover every function: 1<<{} < {}",
+        svm_coop_table_log2(),
+        m.funcs.len()
+    );
+    let (d, tierups, _invokes) = drive_coop_b2_session(&m);
+    assert!(tierups >= 1, "the dispatch leaf must tier up");
+    assert!(
+        d.bounces().is_empty(),
+        "the indirect edge reaches an emitted function natively: {:?}",
+        d.bounces()
+    );
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        svm_coop_value(),
+        want.value,
+        "value parity — the emitted high-index dispatch must reach slot {TARGET}, not {}",
+        TARGET & 1023
+    );
+    svm_coop_close();
+}
+
+/// Pump port (#880, TIERUP-region bounce + growth): a tiered-up leaf's `call_indirect` lands on a
+/// **shim** (the target hosts a fiber, so it stays interpreter-resident), whose callback grows the
+/// window and streams — the leaf then stores into the just-grown page, correct only through the
+/// post-bounce `"mapped"` fan-out; the bounce's stdout interleaves exactly as interpreted.
+#[test]
+fn coop_tierup_region_bounce_grows_and_streams() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let (out_h, mem_h) = onramp_out_mem_handles();
+    const X: i64 = 1234;
+    let src = format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  vx = i64.const {X}
+  vres = call 1 (vx)
+  vsl = i64.const {SLOT}
+  i64.store vsl vres
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vres
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vs2 = i32.const 2
+  va = call_indirect (i64) -> (i64) vs2 (v0)
+  vsum = i64.add v0 va
+  vaddr = i64.const 65552
+  i64.store vaddr vsum
+  vld = i64.load vaddr
+  return vld
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vas = i32.const {mem_h}
+  voff = i64.const 65536
+  vlen = i64.const 16384
+  vprot = i32.const 3
+  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vout = i32.const {out_h}
+  vzero = i64.const 0
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vzero, vlen8)
+  vf = i32.const 3
+  vk2 = cont.new vf vzero
+  vs1, vv1 = cont.resume vk2 vzero
+  vk = i64.const {BOUNCE_K}
+  vsum = i64.add v0 vk
+  return vsum
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  return varg
+  }}
+}}
+export 0 func "_start" 0
+"#
+    );
+    let m = svm_text::parse_module(&src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(want.value, 2 * X + BOUNCE_K, "oracle value");
+
+    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "open must admit (status {})", svm_status());
+    let (d, tierups, _invokes) = drive_coop_b2_session(&m);
+    assert!(tierups >= 1, "the leaf must tier up");
+    assert!(
+        d.bounces().contains(&2),
+        "the fiber-hosting target must bounce through the slot shim: {:?}",
+        d.bounces()
+    );
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        svm_coop_value(),
+        want.value,
+        "value parity (mid-region growth admitted post-bounce)"
+    );
+    // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
+    let got_out =
+        unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
+    assert_eq!(got_out, want.stdout, "stdout parity (bounce ordering)");
+    svm_coop_close();
+}
+
+/// Pump port (#880, run-registry fiber persistence): a fiber created inside a TIERUP-region bounce
+/// registers in the **run-level** registry — `_start` (interpreted) resumes it *after* the emitted
+/// region returned. An invoke-confined registry would `FiberFault` where the interpreter succeeds;
+/// pins the context split in the driver's bounce.
+#[test]
+fn coop_fiber_from_tierup_bounce_persists() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let (out_h, _mem_h) = onramp_out_mem_handles();
+    const X: i64 = 500;
+    let src = format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  vx = i64.const {X}
+  vr1 = call 1 (vx)
+  vha = i64.const 2104
+  vh = i64.load vha
+  varg = i64.const 77
+  vs2, vv2 = cont.resume vh varg
+  vres = i64.add vr1 vv2
+  vsl = i64.const {SLOT}
+  i64.store vsl vres
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vres
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vs2 = i32.const 2
+  vr = call_indirect (i64) -> (i64) vs2 (v0)
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vf = i32.const 3
+  vsp = i64.const 0
+  vk = cont.new vf vsp
+  vs1, vv1 = cont.resume vk v0
+  vha = i64.const 2104
+  i64.store vha vk
+  return vv1
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vk = i64.const 11
+  vs = i64.add varg vk
+  vv = suspend vs
+  vk2 = i64.const 22
+  vr = i64.add vv vk2
+  return vr
+  }}
+}}
+export 0 func "_start" 0
+"#
+    );
+    let m = svm_text::parse_module(&src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(
+        want.value,
+        (X + 11) + (77 + 22),
+        "oracle: bounce-created fiber + later resume"
+    );
+
+    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "open must admit (status {})", svm_status());
+    let (d, tierups, _invokes) = drive_coop_b2_session(&m);
+    assert!(tierups >= 1, "the dispatching leaf must tier up");
+    assert!(
+        d.bounces().contains(&2),
+        "the fiber-creating target must bounce: {:?}",
+        d.bounces()
+    );
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        svm_coop_value(),
+        want.value,
+        "value parity — the bounce-created fiber persisted into the run registry"
+    );
+    svm_coop_close();
+}
+
+/// Pump port (#888/#889, direct cross-tier over the live window): an eligible leaf's **direct
+/// `Call`** to a cap-calling helper — post-#889 the helper's cap sites are outlined, so the helper
+/// itself emits and the live-window bounces are its wrappers 4/5 (grow + stream), with the leaf
+/// storing into the just-grown page after the bounce.
+#[test]
+fn coop_direct_cross_tier_call_bounces_over_the_live_window() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let (out_h, mem_h) = onramp_out_mem_handles();
+    let src = format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  vx = i64.const 7
+  vres = call 1 (vx)
+  vsl = i64.const {SLOT}
+  i64.store vsl vres
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vres
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vk = i64.const {PLEAF_K}
+  vsum = i64.add v0 vk
+  vg = call 2 (vsum)
+  vaddr = i64.const {PROBE}
+  i64.store vaddr vg
+  vld = i64.load vaddr
+  return vld
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vas = i32.const {mem_h}
+  voff = i64.const 65536
+  vlen = i64.const 16384
+  vprot = i32.const 3
+  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vout = i32.const {out_h}
+  vzero = i64.const 0
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vzero, vlen8)
+  vk = i64.const {XT_K}
+  vsum = i64.add v0 vk
+  return vsum
+  }}
+}}
+export 0 func "_start" 0
+"#
+    );
+    let m = svm_text::parse_module(&src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(want.value, 7 + PLEAF_K + XT_K, "oracle value");
+
+    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(
+        opened,
+        0,
+        "#888: the leaf with a direct cross-tier call must be eligible (status {})",
+        svm_status()
+    );
+    let (d, tierups, _invokes) = drive_coop_b2_session(&m);
+    assert!(tierups >= 1, "the widened leaf must tier up (non-vacuity)");
+    assert!(
+        d.bounces().contains(&4) && d.bounces().contains(&5),
+        "the cap-calling helper's outlined wrappers must bounce over the live window: {:?}",
+        d.bounces()
+    );
+    assert!(
+        !d.bounces().contains(&2),
+        "#889: the helper itself must emit (its cap sites are outlined), not bounce: {:?}",
+        d.bounces()
+    );
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(svm_coop_value(), want.value, "value parity");
+    // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
+    let got_out =
+        unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
+    assert_eq!(
+        got_out, want.stdout,
+        "stdout parity (bounce ordering included)"
+    );
+    svm_coop_close();
+}
+
+/// Pump port (#926 slice 1): a guest whose concurrency op is **linked but dead** (unreachable) is
+/// admitted, its dead op never reached, and its pure leaf tiers up — parity with the oracle.
+#[test]
+fn coop_dead_concurrency_op_is_admitted_and_tiers_up() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let (out_h, mem_h) = onramp_out_mem_handles();
+    let src = format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  vas = i32.const {mem_h}
+  voff = i64.const 65536
+  vlen = i64.const 16384
+  vprot = i32.const 3
+  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vprobe = i64.const {PROBE}
+  vres = call 1 (vprobe)
+  vsl = i64.const {SLOT}
+  i64.store vsl vres
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vres
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vk = i64.const {PLEAF_K}
+  vsum = i64.add v0 vk
+  vp = i64.const 8
+  vaddr = i64.add v0 vp
+  i64.store vaddr vsum
+  vld = i64.load vaddr
+  return vld
+  }}
+}}
+func () -> (i64) {{
+block 0 () {{
+  vaddr = i64.const 0
+  vexp = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait vaddr vexp vto
+  vst64 = i64.extend_i32_s vst
+  return vst64
+  }}
+}}
+export 0 func "_start" 0
+"#
+    );
+    let m = svm_text::parse_module(&src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(want.value, PROBE + PLEAF_K, "oracle value");
+
+    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(
+        opened,
+        0,
+        "a dead concurrency op must not refuse (status {})",
+        svm_status()
+    );
+    let (_d, tierups, _invokes) = drive_coop_b2_session(&m);
+    assert!(
+        tierups >= 1,
+        "the pure leaf must tier up beside the dead op"
+    );
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(svm_coop_value(), want.value, "value parity");
+    // SAFETY: capture slots staged at DONE; this thread is the only accessor (FFI_LOCK).
+    let got_out =
+        unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
+    assert_eq!(got_out, want.stdout, "stdout parity");
+    svm_coop_close();
+}
+
+/// Pump port (#926 slice 1), **adjusted**: a guest that actually reaches an `atomic.notify` — the
+/// pump DECLINES it (`TIERUP_RUN_TRAP` → interpreter re-run); this driver **services** it (the
+/// point of the cooperative scheduler), so the strictly stronger property holds: the guest runs to
+/// DONE with full parity, its leaf having tiered up first.
+#[test]
+fn coop_reachable_concurrency_op_is_serviced_and_matches_the_oracle() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let out_h = onramp_out_handle();
+    let src = format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  vprobe = i64.const 7
+  vres = call 1 (vprobe)
+  vsl = i64.const {SLOT}
+  i64.store vsl vres
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  vaddr = i64.const 0
+  vcnt = i32.const 1
+  vn = atomic.notify vaddr vcnt
+  vn64 = i64.extend_i32_s vn
+  return vn64
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vk = i64.const {PLEAF_K}
+  vsum = i64.add v0 vk
+  return vsum
+  }}
+}}
+export 0 func "_start" 0
+"#
+    );
+    let m = svm_text::parse_module(&src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+
+    let want = onramp_exec(&m, b"");
+    assert_eq!(
+        want.status, STATUS_OK,
+        "oracle sanity (notify with no waiters returns 0)"
+    );
+
+    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "admitted (status {})", svm_status());
+    let (_d, tierups, _invokes) = drive_coop_b2_session(&m);
+    assert!(tierups >= 1, "the leaf tiered up before the concurrency op");
+    assert_eq!(
+        svm_status(),
+        want.status,
+        "the reachable atomic.notify is SERVICED here (the pump declined it) — full parity"
+    );
+    assert_eq!(svm_coop_value(), want.value, "value parity");
+    svm_coop_close();
+}
+
+/// Pump port (#889, the card shape): a hot loop with **one inline stdout `cap.call` per iteration**
+/// — the site outlines, the loop emits and tiers up, and each iteration's cap write bounces to the
+/// outlined wrapper (index 3), interleaving stdout exactly as interpreted.
+#[test]
+fn coop_hot_loop_with_inline_cap_write_emits_and_bounces_per_iteration() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let out_h = onramp_out_handle();
+    let src = format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  vn = i64.const {HOT_N}
+  vres = call 1 (vn)
+  vsl = i64.const {SLOT}
+  i64.store vsl vres
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vres
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vacc0 = i64.const 0
+  br 1(v0, vacc0)
+}}
+block 1 (vi: i64, vacc: i64) {{
+  vk = i64.const {HOT_K}
+  vmul = i64.mul vi vk
+  vacc2 = i64.add vacc vmul
+  vsl2 = i64.const {SLOT2}
+  i64.store vsl2 vacc2
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl2, vlen8)
+  vone = i64.const -1
+  vnext = i64.add vi vone
+  vz = i64.const 0
+  vgo = i64.ne vnext vz
+  br_if vgo 1(vnext, vacc2) 2(vacc2)
+}}
+block 2 (vr: i64) {{
+  return vr
+  }}
+}}
+export 0 func "_start" 0
+"#
+    );
+    let m = svm_text::parse_module(&src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    let expect = HOT_K * (1..=HOT_N).sum::<i64>();
+    assert_eq!(want.value, expect, "oracle value");
+
+    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(
+        opened,
+        0,
+        "#889: the cap-bearing hot loop must be admitted (status {})",
+        svm_status()
+    );
+    let (d, tierups, _invokes) = drive_coop_b2_session(&m);
+    assert!(tierups >= 1, "the hot loop must tier up (non-vacuity)");
+    assert_eq!(
+        d.bounces(),
+        &vec![3u32; HOT_N as usize][..],
+        "each iteration's cap write bounces to f1's outlined wrapper, nothing else bounces"
+    );
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(svm_coop_value(), want.value, "value parity");
+    // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
+    let got_out =
+        unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
+    assert_eq!(
+        got_out, want.stdout,
+        "stdout parity — per-iteration writes interleave as interpreted"
+    );
+    svm_coop_close();
+}
+
+/// Pump port (#835 capstone, asset-gated): the real JACL self-hosted compiler-guest — `vm_jit_*`
+/// imports + fiber scheduler — runs through this driver observably identical to the interpreter
+/// oracle, emitted events serviced by the full B2 driver as they surface. Absent asset ⇒ SKIP.
+#[test]
+fn coop_jacl_compiler_runs_through_the_driver() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../codegen/selfhost/build/jacl_compiler.svmb"
+    );
+    let Ok(bytes) = std::fs::read(path) else {
+        eprintln!("SKIP: jacl_compiler.svmb absent (run codegen/selfhost/build_compiler_svmb.sh)");
+        return;
+    };
+    let compiler = svm_encode::decode_module(&bytes).expect("decode jacl_compiler.svmb");
+    const MACRO_SRC: &[u8] = b"defmacro unless {cond body} { syntax-quote [if ~cond {} ~body] }\n\
+                               mut hit 0\nunless [== 1 2] { set hit 5 }\nhit\n";
+
+    let want = onramp_exec(&compiler, MACRO_SRC);
+    let opened = svm_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        MACRO_SRC.as_ptr(),
+        MACRO_SRC.len(),
+        0,
+    );
+    if opened != 0 {
+        // The driver may still refuse the giant module (fail-closed); pin the refusal is clean.
+        assert_eq!(opened, -STATUS_UNSUPPORTED, "refusal must be clean");
+        eprintln!("SKIP: coop refused the compiler-guest (clean bytecode fallback)");
+        return;
+    }
+    // Uncapped drive (the compiler fires many events — the session driver's runaway caps are for
+    // the small synthetic guests).
+    let mut d = CoopB2Driver::new();
+    loop {
+        match svm_coop_run() {
+            COOP_RUN_JIT_INVOKE => d.service_jit_invoke(),
+            COOP_RUN_TIERUP => {
+                let f = svm_coop_func() as usize;
+                d.service_tierup(compiler.funcs[f].results.len());
+            }
+            COOP_RUN_DONE => break,
+            ev => panic!("unexpected pump event {ev} (status {})", svm_status()),
+        }
+    }
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(svm_coop_value(), want.value, "value parity with the oracle");
+    // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
+    let got_out =
+        unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
+    assert_eq!(got_out, want.stdout, "stdout parity with the oracle");
     svm_coop_close();
 }

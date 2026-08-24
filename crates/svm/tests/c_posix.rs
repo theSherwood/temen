@@ -2998,3 +2998,64 @@ int main(void) {{\n\
         "argv survives a second twin's execve"
     );
 }
+
+/// #802 slice 1 — **the bash keystone idiom: `longjmp` OUT of a signal handler** back to a
+/// `setjmp` re-entry point (`throw_to_top_level` from `sigint_sighandler` — bash's entire
+/// error/interrupt model). Three things must hold, in bash's exact shape:
+/// 1. the escape: a handler delivered against a **parked terminal read** longjmps to the
+///    top-level `setjmp`, abandoning the interrupted read's own EINTR return path;
+/// 2. re-armed delivery: a **second** `^C` after the escape delivers again — the unwind must not
+///    leave the signal marked handler-in-progress (#796 block-during-handler), or bash would eat
+///    exactly one interrupt per session;
+/// 3. liveness: after two escapes the terminal still works — a real line arrives.
+#[test]
+fn c_longjmp_out_of_a_signal_handler_bash_shape() {
+    let src = format!(
+        "{PIPE_SHIM}\n\
+long __px_signal(int cap, long signum, long handler);\n\
+long __px_sigaltstack(int cap, long sp, long size);\n\
+typedef long jmp_buf[8];\n\
+int setjmp(jmp_buf env);\n\
+void longjmp(jmp_buf env, int val);\n\
+static jmp_buf top_level;\n\
+static char sigstk[16384];\n\
+static volatile int throws;\n\
+static void handler(int sig) {{\n\
+  if (sig != 2) return;\n\
+  throws = throws + 1;\n\
+  longjmp(top_level, throws);      /* bash: throw_to_top_level */\n\
+}}\n\
+static char b[8];\n\
+int main(void) {{\n\
+  __px_signal(0, 2, (long)handler);        /* catch SIGINT */\n\
+  __px_sigaltstack(0, (long)sigstk, 16384); /* async delivery on (the #796 policy gate) */\n\
+  int r = setjmp(top_level);               /* bash's reader-loop re-entry point */\n\
+  if (r == 0) {{\n\
+    read(0, b, 8);                         /* parks; first ^C -> handler -> longjmp(1) */\n\
+    return 90;                             /* unreachable: the escape abandons the EINTR path */\n\
+  }}\n\
+  if (r == 1) {{\n\
+    read(0, b, 8);                         /* parks again; the second ^C must deliver */\n\
+    return 89;                             /* unreachable */\n\
+  }}\n\
+  if (r != 2) return 80 + r;\n\
+  long n = read(0, b, 8);                  /* liveness: a real line still arrives */\n\
+  if (n != 2 || b[0] != 'x') return 70;\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_terminal(
+        &src,
+        vec![
+            (60, b"\x03".to_vec()),
+            (160, b"\x03".to_vec()),
+            (260, b"x\n".to_vec()),
+        ],
+        None,
+    );
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "handler longjmp escaped twice, delivery re-armed, terminal alive"
+    );
+}

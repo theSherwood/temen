@@ -12150,3 +12150,546 @@ entry:
         other => panic!("unexpected JIT outcome {other:?}"),
     }
 }
+
+// --- GNU bash (#802 slice 2) — the whole-shell bring-up gate + the two gaps it surfaced ---------
+
+/// **Max-alignment literal** — the first on-ramp gap bash surfaced: clang stamps
+/// `align 4294967296` (2^32, one past `u32`) on a deliberately-trapping null store (bash's
+/// `programming_error` path emits `store volatile i64 …, ptr null, align 4294967296`). The
+/// alignment of an access that can only trap carries no meaning, so the `.ll` parser saturates
+/// rather than refusing the whole module. Pinned on a benign global store.
+#[test]
+fn align_u32_max_saturates() {
+    let src = "\
+@g = global i64 0
+define i64 @run() {
+entry:
+  store i64 7, ptr @g, align 4294967296
+  %r = load i64, ptr @g, align 8
+  ret i64 %r
+}
+";
+    let t = svm_llvm::translate_ll_str(src).expect("translate max-align");
+    let module = t.module;
+    svm_verify::verify_module(&module).expect("verify max-align");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let interp = svm_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
+    assert_eq!(interp, vec![Value::I64(7)], "the store landed");
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&module, 0, &slots).expect("jit run") {
+        JitOutcome::Returned(s) => assert_eq!(s[0], 7, "JIT agrees (interp said {interp:?})"),
+        other => panic!("unexpected JIT outcome {other:?}"),
+    }
+}
+
+/// **Old-C call-site drift** — the second gap bash surfaced: an empty-parens prototype
+/// (`extern void f ();`) lets every call site invent its own function type, so a site can drift
+/// from the definition in arity, widths, AND variadicity — bash calls the plain `(ptr, ptr)`
+/// definition `add_unwind_protect` through a `(ptr, i32, ...)` site type. The native ABI hides
+/// the drift (args share registers); the lowering follows the DEFINITION: the site's variadic
+/// shape is dropped for the non-variadic callee (no va-area deposit into the callee's frame) and
+/// the `i32` argument zero-extends to the definition's pointer width.
+#[test]
+fn old_c_call_site_drift_follows_the_definition() {
+    let src = "\
+@sink = global i64 1
+define void @f(ptr %a, ptr %b) {
+entry:
+  %v = ptrtoint ptr %b to i64
+  store i64 %v, ptr %a, align 8
+  ret void
+}
+define i64 @run() {
+entry:
+  call void (ptr, i32, ...) @f(ptr @sink, i32 42)
+  %r = load i64, ptr @sink, align 8
+  ret i64 %r
+}
+";
+    let t = svm_llvm::translate_ll_str(src).expect("translate old-C drift");
+    let run_idx = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == "run")
+        .expect("run exported")
+        .1;
+    let module = t.module;
+    svm_verify::verify_module(&module).expect("verify old-C drift");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let interp = svm_interp::run(&module, run_idx, &full, &mut fuel).expect("interp run");
+    assert_eq!(
+        interp,
+        vec![Value::I64(42)],
+        "the i32 arg reached the ptr param zero-extended"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&module, run_idx, &slots).expect("jit run") {
+        JitOutcome::Returned(s) => assert_eq!(s[0], 42, "JIT agrees (interp said {interp:?})"),
+        other => panic!("unexpected JIT outcome {other:?}"),
+    }
+}
+
+/// **Old-C INDIRECT call-site drift** (#802 slice 3 — the function-pointer twin of the direct-call
+/// rule above): bash's `typedef int Function ()` tables call cleanups through `(ptr, ...)` sites
+/// whose runtime target is a plain `void ()` / `void (ptr)` definition. The native ABI hides the
+/// drift; the strict typed `call_indirect` would trap `IndirectCallType`. The translator routes a
+/// varargs indirect site through a synthesized **static dispatcher**: each address-taken candidate
+/// gets a funcref-equality arm making the DIRECT call with the definition's own signature (args
+/// width-coerced, a missing result padded 0), and everything else — here the exact-typed second
+/// target — falls to the strict `call_indirect` unchanged.
+#[test]
+fn old_c_indirect_call_drift_dispatches_to_the_definition() {
+    let src = "\
+@g = global i64 0
+@p = global ptr @bump
+@q = global ptr @exact
+define void @bump() {
+entry:
+  store i64 41, ptr @g, align 8
+  ret void
+}
+define i32 @exact(ptr %a) {
+entry:
+  %v = load i64, ptr %a, align 8
+  %t = trunc i64 %v to i32
+  %r = add i32 %t, 1
+  ret i32 %r
+}
+define i64 @run() {
+entry:
+  %f = load ptr, ptr @p, align 8
+  %r0 = call i32 (ptr, ...) %f(ptr @g)
+  %f2 = load ptr, ptr @q, align 8
+  %r1 = call i32 (ptr, ...) %f2(ptr @g)
+  %a = add i32 %r0, %r1
+  %w = zext i32 %a to i64
+  ret i64 %w
+}
+";
+    let t = svm_llvm::translate_ll_str(src).expect("translate old-C indirect drift");
+    let run_idx = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == "run")
+        .expect("run exported")
+        .1;
+    let module = t.module;
+    svm_verify::verify_module(&module).expect("verify old-C indirect drift");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let interp = svm_interp::run(&module, run_idx, &full, &mut fuel).expect("interp run");
+    // `bump` (void ()) ran through the dispatcher arm (side effect: g = 41, result padded 0);
+    // `exact` (i32 (ptr)) took the strict default and returned 41 + 1.
+    assert_eq!(
+        interp,
+        vec![Value::I64(42)],
+        "dispatched drift call ran the definition; exact-typed target kept strict semantics"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&module, run_idx, &slots).expect("jit run") {
+        JitOutcome::Returned(s) => assert_eq!(s[0], 42, "JIT agrees (interp said {interp:?})"),
+        other => panic!("unexpected JIT outcome {other:?}"),
+    }
+}
+
+/// The **core-pipe builtins on the on-ramp** (#802 slice 4 / FORK.md §8.6): `__vm_pipe` mints a
+/// host-served pipe into this domain's powerbox (self-namespace op 16), `__vm_write`/`__vm_read`
+/// transfer on the *specific* end handles (`Stream` ops 1/0 — unlike the `write`/`read`
+/// recognizers, which reach the ambient streams), and `__vm_close` releases an end (op 2) —
+/// closing the last writer makes the reader see true EOF (0), not a hang. The lowerings mirror the
+/// chibicc frontend's (`codegen_ir.c`) byte-for-byte, so the #972 tag-protocol shim wrappers
+/// (`posix_utils/util.c`, `bash_shim.c` band 0) work identically on both frontends.
+#[test]
+fn core_pipe_builtins_roundtrip() {
+    let src = r#"
+int printf(const char *, ...);
+long __vm_pipe(int *fds);
+long __vm_read(int h, void *buf, long len);
+long __vm_write(int h, const void *buf, long len);
+int __vm_close(int h);
+int main(void) {
+  int h[2];
+  char buf[4];
+  if (__vm_pipe(h) != 0) return 1;
+  if (__vm_write(h[1], "abc", 3) != 3) return 2;
+  __vm_close(h[1]);
+  if (__vm_read(h[0], buf, 3) != 3) return 3;
+  buf[3] = 0;
+  if (__vm_read(h[0], buf, 1) != 0) return 4; /* last writer closed => true EOF, not a park */
+  __vm_close(h[0]);
+  printf("piped:%s\n", buf);
+  return 0;
+}
+"#;
+    let Some(ll) = compile_to_ll("core_pipe_builtins", src) else {
+        return;
+    };
+    let t = svm_llvm::translate_ll_path(&ll).expect("translate core-pipe builtins");
+    svm_verify::verify_module(&t.module).expect("verify core-pipe builtins");
+    let inst = svm_run::instantiate(t.module.clone()).expect("instantiate");
+    // Interpreter tier only: the capability pipe path needs the `Real` scheduler (`CAP_SELF_PIPE`)
+    // — the same tier boundary the chibicc-world pipe witnesses pin (`c_posix.rs` DUAL_WORLD).
+    let run = inst
+        .run(svm_run::Backend::TreeWalk, &svm_run::RunConfig::default())
+        .unwrap_or_else(|e| panic!("core-pipe run failed: {e}"));
+    assert!(
+        matches!(
+            &run.outcome,
+            svm_run::Outcome::Returned(v) if v == &[svm_run::Value::I32(0)]
+        ),
+        "main's return = the failing step (got {:?})",
+        run.outcome
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "piped:abc\n",
+        "the bytes crossed the pipe"
+    );
+}
+
+/// **`fork()` over the named posix capability** (#802 slice 4): the full lane a forking on-ramp
+/// program (bash) rides — `posix_cap`'s grant wires the async-signal door (which carries the #799
+/// caller-request door, so op 51 actually forks instead of `-ENOSYS`), the fork engine duplicates
+/// a host whose fixed powerbox holds a **pristine** guest-JIT grant (previously an unconditional
+/// `-EAGAIN`), and the twin's private window copy includes the **`vm_map`-committed tail pages**
+/// (the waist malloc's heap — previously a fail-closed refusal for every malloc-using program).
+/// The child proves the copied heap byte, writes it through the adopted core pipe (#972 tag
+/// redirect), and exits via the personality; the parent reads it and proves no aliasing.
+#[test]
+fn fork_over_the_named_posix_cap_copies_the_heap() {
+    let src = r#"
+int printf(const char *, ...);
+void *malloc(unsigned long n);
+extern int __vm_cap_resolve(const char *name, long len);
+extern long __vm_host_call(int h, int op, long a, long b, long c, long d);
+long __vm_pipe(int *fds);
+long __vm_read(int h, void *buf, long len);
+long __vm_write(int h, const void *buf, long len);
+int __vm_close(int h);
+static int px(void) {
+  static int h = -1;
+  if (h < 0) h = __vm_cap_resolve("posix", 5);
+  return h;
+}
+static long tag(long r) { return r <= -1048576 ? -(r + 1048576) : -1; }
+int main(void) {
+  char *heap = (char *)malloc(64); /* vm_map'd tail heap: the fork must copy it */
+  int h[2];
+  int fds[2];
+  char buf[8];
+  heap[0] = 'M';
+  if (__vm_pipe(h) != 0) return 1;
+  if (__vm_host_call(px(), 52, h[0], h[1], (long)fds, 0) != 0) return 2; /* pipe_adopt */
+  long pid = __vm_host_call(px(), 51, 0, 0, 0, 0); /* fork */
+  if (pid < 0) return 3;
+  if (pid == 0) { /* child: prove the copied heap byte, send it, exit */
+    heap[0] = heap[0] == 'M' ? 'c' : '?';
+    long r = __vm_host_call(px(), 0, fds[1], (long)heap, 1, 0); /* write */
+    long t = tag(r);
+    if (t >= 0) r = __vm_write((int)t, heap, 1);
+    __vm_host_call(px(), 4, r == 1 ? 0 : 9, 0, 0, 0); /* exit */
+  }
+  /* parent: close our write-end copy, read the child's byte, prove no aliasing. */
+  long c = __vm_host_call(px(), 6, fds[1], 0, 0, 0); /* close */
+  long ct = tag(c);
+  if (ct >= 0) __vm_close((int)ct);
+  long r = __vm_host_call(px(), 1, fds[0], (long)buf, 8, 0); /* read */
+  long t = tag(r);
+  if (t >= 0) r = __vm_read((int)t, buf, 8);
+  if (r != 1 || buf[0] != 'c') return 4;
+  if (heap[0] != 'M') return 5; /* the twin's heap write did not alias the parent */
+  printf("forked:%c parent:%c\n", buf[0], heap[0]);
+  return 0;
+}
+"#;
+    let Some(ll) = compile_to_ll("fork_posix_cap", src) else {
+        return;
+    };
+    let t = svm_llvm::translate_ll_path(&ll).expect("translate fork witness");
+    svm_verify::verify_module(&t.module).expect("verify fork witness");
+    let inst = svm_run::instantiate(t.module.clone()).expect("instantiate");
+    let (cap, _posix) = svm_run::posix::posix_cap(0, 0, Vec::new());
+    let run = inst
+        .run_with_caps(
+            svm_run::Backend::TreeWalk,
+            &svm_run::RunConfig::default(),
+            &[("posix", cap)],
+        )
+        .expect("run fork witness");
+    assert!(
+        matches!(
+            &run.outcome,
+            svm_run::Outcome::Returned(v) if v == &[svm_run::Value::I32(0)]
+        ),
+        "main's return = the failing step (got {:?})",
+        run.outcome
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "forked:c parent:M\n",
+        "the child's copied-heap byte crossed the pipe; the parent's heap is unaliased"
+    );
+}
+
+/// Path to `demos/bash`.
+fn bash_demo_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../svm-run/demos/bash")
+}
+
+/// **▶ GNU bash translates + verifies** (#802 slice 2 — the whole-shell gate). Runs the faithful
+/// `demos/bash/build_bitcode.sh` (fetch bash 5.2.21 → configure the bring-up config → native
+/// oracle → 152 per-TU bitcodes with each Makefile's own flags → llvm-link + shim + waist) and
+/// translates the ~7.8 MB module through the on-ramp with trap-stubbed unreached externs:
+/// 1716 functions, verified. The RUN gate (the stdio/OS wiring) is slice 3 — a trial run today
+/// reaches deep into `shell.c` startup before the unwired `FILE*` surface stops it.
+/// `#[ignore]`d for wall-clock only (fetch + configure + a full native build — minutes); skips
+/// loudly (never fails) when clang/curl/make are unavailable — grep for `skipping bash`.
+#[test]
+#[ignore = "capstone: fetches + builds all of bash (minutes); run with --ignored"]
+fn demo_bash_translates_and_verifies() {
+    let script = bash_demo_dir().join("build_bitcode.sh");
+    let linked = std::env::temp_dir().join("svm_bash_cache/bash_linked.ll");
+    let ok = Command::new("bash")
+        .arg(&script)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok || !linked.exists() {
+        eprintln!("note: skipping bash (build_bitcode.sh failed — offline or no clang/make?)");
+        return;
+    }
+    let opts = svm_llvm::TranslateOptions {
+        stub_unresolved_externs: true,
+        ..Default::default()
+    };
+    let t = svm_llvm::translate_ll_path_with_options(linked.to_str().unwrap(), opts)
+        .expect("bash translates");
+    assert!(
+        t.module.funcs.len() > 1500,
+        "the whole shell translated ({} funcs)",
+        t.module.funcs.len()
+    );
+    svm_verify::verify_module(&t.module).expect("bash verifies");
+
+    // ▶ Slice 3 — the RUN gate: `bash -c <script>` on the interpreter (setjmp/fork are interp-only
+    // tiers) with the svm-posix personality granted as the named "posix" capability (the shim's
+    // band 0 resolves it via `__vm_cap_resolve` and drives the op ABI through `__vm_host_call`).
+    // Byte-differential against the native oracle the script just built, under the same argv/env.
+    let oracle = std::env::temp_dir().join("svm_bash_cache/bash-5.2.21/bash");
+    let inst = svm_run::instantiate(t.module.clone()).expect("instantiate bash");
+    for script in [
+        "echo hi",
+        "x=world; echo \"hello $x\"",
+        "echo $((6*7))",
+        "for i in a b c; do echo $i; done",
+        "f() { echo fn-$1; }; f arg",
+        // Slice 4 — fork/pipes: command substitution, subshells, builtin pipelines (real fork
+        // twins over adopted core pipes), with trailing commands pinning the foreground waits.
+        "echo `echo nested`",
+        "x=$(echo one; echo two); echo \"$x\"",
+        "echo start; (x=5; echo in-$x); echo end",
+        "echo a | { read x; echo \"got-$x\"; }; echo tail",
+        "echo one | { read a; echo p1-$a; } | { read b; echo p2-$b; }; echo done2",
+        // Slice 4 — traps/signals: async delivery into bash's C handlers (the shim registers the
+        // handler stack in a ctor), in the parent, in a fork twin, ignored, and repeated.
+        "trap \"echo INT-caught\" INT; kill -INT $$; echo after",
+        "trap \"echo child-int\" INT; (kill -INT $$); echo done3",
+        "trap \"\" INT; kill -INT $$; echo ignored-ok",
+        "trap \"echo u1\" USR1; kill -USR1 $$; kill -USR1 $$; echo twice",
+        "trap \"echo bye\" EXIT; (echo sub); echo main",
+    ] {
+        let config = svm_run::RunConfig {
+            args: vec![b"bash".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()],
+            env: vec![b"PATH=/bin".to_vec(), b"HOME=/".to_vec()],
+            ..Default::default()
+        };
+        let (cap, posix) = svm_run::posix::posix_cap(0, 0, Vec::new());
+        let run = inst
+            .run_with_caps(svm_run::Backend::TreeWalk, &config, &[("posix", cap)])
+            .unwrap_or_else(|e| panic!("bash -c {script:?} failed: {e}"));
+        let native = Command::new(&oracle)
+            .args(["-c", script])
+            .env_clear()
+            .env("PATH", "/bin")
+            .env("HOME", "/")
+            .output()
+            .expect("run the native oracle");
+        let code = match &run.outcome {
+            svm_run::Outcome::Exited(c) => *c,
+            svm_run::Outcome::Returned(v) => match v.first() {
+                Some(svm_run::Value::I32(c)) => *c,
+                Some(svm_run::Value::I64(c)) => *c as i32,
+                _ => -1,
+            },
+        };
+        assert_eq!(
+            code,
+            native.status.code().unwrap_or(-1),
+            "bash -c {script:?}: exit status differs from the oracle (outcome {:?})",
+            run.outcome
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&posix.stdout()),
+            String::from_utf8_lossy(&native.stdout),
+            "bash -c {script:?}: stdout differs from the oracle"
+        );
+    }
+
+    // ▶ Slice 4 tail — **external commands**: stage the #801 /bin (the chibicc-world coreutils,
+    // compiled by `stage_bin.sh` to `.svm` command modules) and run exec'd pipelines —
+    // fork → execve("/bin/…") → waitpid, PATH lookup, redirections to memfs files, command
+    // substitution over exec'd stages. Skips loudly when chibicc can't build (no make/cc).
+    let staged = Command::new("bash")
+        .arg(bash_demo_dir().join("stage_bin.sh"))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !staged {
+        eprintln!("note: skipping bash external-command gate (chibicc unavailable)");
+        return;
+    }
+    let bin_dir = std::env::temp_dir().join("svm_bash_cache/bin");
+    let mut bins: Vec<(String, svm_ir::Module, u8)> = Vec::new();
+    for e in std::fs::read_dir(&bin_dir).expect("read staged /bin") {
+        let p = e.expect("dir entry").path();
+        if p.extension().is_none_or(|x| x != "svm") {
+            continue;
+        }
+        let name = p.file_stem().unwrap().to_string_lossy().into_owned();
+        let ir = std::fs::read_to_string(&p).expect("read command IR");
+        let m = svm_text::parse_module(&ir).expect("parse command");
+        svm_verify::verify_module(&m).expect("verify command");
+        let wl = m.memory.expect("command window").size_log2;
+        bins.push((format!("/bin/{name}"), m, wl));
+    }
+    assert!(bins.len() >= 10, "the staged /bin arrived");
+    let bins = std::sync::Arc::new(bins);
+    // Both sides run each script in a fresh cwd ("/" on the memfs; a fresh tempdir natively), so
+    // the relative-path redirection lands in a private file on each side.
+    let native_cwd = std::env::temp_dir().join(format!("svm_bash_gate_{}", std::process::id()));
+    std::fs::create_dir_all(&native_cwd).expect("native cwd");
+    for script in [
+        "/bin/echo external",
+        "echo viaPATH | cat",
+        "seq 5 | head -n 2",
+        "seq 100 | wc -l",
+        "x=$(seq 3 | wc -l); echo \"n=$x\"",
+        "true && echo t; false || echo f",
+        "seq 3 | sort | uniq | wc -l",
+        "echo hi > f; cat f",
+    ] {
+        let config = svm_run::RunConfig {
+            args: vec![b"bash".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()],
+            env: vec![b"PATH=/bin".to_vec(), b"HOME=/".to_vec()],
+            ..Default::default()
+        };
+        // posix_cap plus the /bin registration, which must happen inside the grant (module
+        // handles live in the run's Host) — the `stage_executable` shape from c_posix.rs.
+        let (posix, make) = svm_posix::cap(0, 0, Vec::new());
+        let fork = svm_posix::cap_fork_factory(&posix);
+        let p = posix.clone();
+        let bins_for_grant = std::sync::Arc::clone(&bins);
+        let cap = svm_run::HostCap::custom(svm_interp::cap_id::HOST_PROC, 0, move |h, _win| {
+            let handle = h.grant_host_proc_forkable(make(), std::sync::Arc::clone(&fork));
+            let (door, armed) = svm_posix::cap_signal_source(&p);
+            h.set_signal_source(door, armed);
+            h.push_exec_remap_hook(svm_posix::cap_exec_remap_hook(&p));
+            let (names, sigs) = svm_posix::cap_vtable();
+            h.set_host_proc_vtable(handle, names, sigs);
+            for (path, m, wl) in bins_for_grant.iter() {
+                let mh = h.grant_module(m);
+                p.register_executable(path, mh, *wl);
+            }
+            handle
+        });
+        let run = inst
+            .run_with_caps(svm_run::Backend::TreeWalk, &config, &[("posix", cap)])
+            .unwrap_or_else(|e| panic!("bash -c {script:?} (external) failed: {e}"));
+        let native = Command::new(&oracle)
+            .args(["-c", script])
+            .env_clear()
+            .env("PATH", "/bin")
+            .env("HOME", "/")
+            .current_dir(&native_cwd)
+            .output()
+            .expect("run the native oracle");
+        let code = match &run.outcome {
+            svm_run::Outcome::Exited(c) => *c,
+            svm_run::Outcome::Returned(v) => match v.first() {
+                Some(svm_run::Value::I32(c)) => *c,
+                Some(svm_run::Value::I64(c)) => *c as i32,
+                _ => -1,
+            },
+        };
+        assert_eq!(
+            code,
+            native.status.code().unwrap_or(-1),
+            "bash -c {script:?} (external): exit status differs from the oracle (outcome {:?})",
+            run.outcome
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&posix.stdout()),
+            String::from_utf8_lossy(&native.stdout),
+            "bash -c {script:?} (external): stdout differs from the oracle"
+        );
+    }
+
+    // ▶ Interactive rung 1 (#802 interactive slice): `bash -i` on the **#797 controlling
+    // terminal** (`posix_cap_terminal`), a feeder thread typing while the shell runs (the
+    // `run_interp_terminal` witness shape — feed timing is best-effort, so the assertions are on
+    // session RESULTS, not on parking/interleaving). The session proves: the prompt loop (PS1 on
+    // fd 2 between commands), a command typed at the prompt runs, `^C` at the prompt aborts the
+    // line and sets `$? = 130` (SIGINT through the feed-time line discipline), and `^D` on an
+    // empty line exits the shell cleanly with bash's `exit` farewell.
+    {
+        let (cap, posix) = svm_run::posix::posix_cap_terminal(0, 0);
+        let feeder = {
+            let px = posix.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                for keys in ["echo hi\n", "\x03", "echo rc=$?\n", "\x04"] {
+                    px.feed_terminal(keys.as_bytes());
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            })
+        };
+        let config = svm_run::RunConfig {
+            args: vec![b"bash".to_vec(), b"-i".to_vec()],
+            env: vec![
+                b"PATH=/bin".to_vec(),
+                b"HOME=/".to_vec(),
+                b"PS1=$ ".to_vec(),
+            ],
+            ..Default::default()
+        };
+        let run = inst
+            .run_with_caps(svm_run::Backend::TreeWalk, &config, &[("posix", cap)])
+            .expect("bash -i session");
+        feeder.join().expect("feeder thread");
+        assert_eq!(
+            run.outcome,
+            svm_run::Outcome::Exited(0),
+            "bash -i: the ^D exit carries the last command's status"
+        );
+        let out = String::from_utf8_lossy(&posix.stdout()).into_owned();
+        let err = String::from_utf8_lossy(&posix.stderr()).into_owned();
+        assert!(
+            out.contains("echo hi\nhi\n"),
+            "bash -i: the typed command echoed and ran (stdout: {out:?})"
+        );
+        assert!(
+            out.contains("rc=130"),
+            "bash -i: ^C at the prompt set $? = 130 (stdout: {out:?})"
+        );
+        assert!(
+            err.matches("$ ").count() >= 3,
+            "bash -i: the PS1 prompt re-printed between commands (stderr: {err:?})"
+        );
+        assert!(
+            err.contains("exit"),
+            "bash -i: ^D printed bash's `exit` farewell (stderr: {err:?})"
+        );
+    }
+}

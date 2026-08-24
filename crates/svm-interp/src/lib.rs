@@ -13238,6 +13238,26 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         return Err(Trap::Malformed); // the setjmp frame has already returned
                     }
                     frames.truncate(point.depth);
+                    // #802 — a longjmp that unwinds OUT of an injected signal handler leaves the
+                    // handler exactly like a return does: pop each crossed guard entry and fire
+                    // `handler_returned()` per crossed handler, so the personality restores its
+                    // block-during-handler mask and a LATER instance of the signal can deliver.
+                    // (bash's whole interrupt model: `throw_to_top_level` longjmps out of
+                    // `sigint_sighandler` — without this, one ^C silences SIGINT for the session.)
+                    // Guard entries record the post-push frame count, so `e > frames.len()` after
+                    // the truncate is exactly the crossed handlers; a longjmp WITHIN a handler
+                    // (its setjmp deeper than the injection) crosses nothing and is untouched.
+                    while sig_handler_stack.last().is_some_and(|&e| e > frames.len()) {
+                        sig_handler_stack.pop();
+                        if let Some((_, source)) = &signal_poll {
+                            source.handler_returned();
+                        }
+                        // The longjmp also abandoned the op the delivery interrupted (rewound,
+                        // never re-run) — its pending park-interrupt flag must die with it, or
+                        // the NEXT blocking op spuriously returns `-EINTR` for a signal already
+                        // handled (POSIX: EINTR is per-interrupted-call).
+                        host.lock_unpoisoned().take_sig_interrupt();
+                    }
                     let f = &mut frames[point.depth - 1];
                     f.block = point.block;
                     f.inst = point.inst;
@@ -13924,7 +13944,17 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     }
                 }
             }
-            Terminator::Unreachable => return Err(Trap::Unreachable),
+            Terminator::Unreachable => {
+                if std::env::var_os("SVM_TRAP_TRACE").is_some() {
+                    eprintln!(
+                        "UNREACHTRAP f{} b{} (frames: {:?})",
+                        frames[top].func,
+                        frames[top].block,
+                        frames.iter().map(|f| f.func).collect::<Vec<_>>()
+                    );
+                }
+                return Err(Trap::Unreachable);
+            }
             // Tail calls replace the top frame in place — no depth growth.
             Terminator::ReturnCall { func, args } => {
                 step(fuel, kill.as_deref())?; // fuel unification: function-entry safepoint
@@ -17577,11 +17607,21 @@ impl Host {
         // closure itself, and a partial carry would silently drop capabilities, so one factory-less
         // entry fails the whole fork closed (the pre-PR-5 behavior).
         let procs_forkable = self.host_procs.iter().all(|e| e.fork.is_some());
+        // #802 slice 4 — a **pristine** guest-JIT grant (the fixed powerbox prefix mints one on
+        // every `svm-run` host, whether or not the guest ever JITs) duplicates as a fresh grant:
+        // no units, no installs, no registered native context — nothing to carry, so the twin gets
+        // an equally-empty domain at the same index (its cloned table's `Binding::Jit` resolves)
+        // with the same remaining quota. Any *live* JIT state still fails the fork closed: units
+        // and installs are per-image artifacts the core cannot faithfully duplicate.
+        let jit_pristine = self
+            .jit_domains
+            .iter()
+            .all(|d| d.units.is_empty() && d.installed.is_empty() && d.native_ctx == 0);
         // The core can duplicate only a simple domain; anything else the personality must re-wire.
         let simple = procs_forkable
             && self.offers.is_empty()
             && self.pending_live_impls.is_empty()
-            && self.jit_domains.is_empty()
+            && jit_pristine
             && self.blockings.is_empty()
             && self.window_minters.is_empty()
             && self.svc_queue.is_empty()
@@ -17606,6 +17646,21 @@ impl Host {
         let mut twin = Host::new(); // fresh `domain_id`
                                     // Own handle namespace, same bindings (indices into the shared backings below).
         twin.table = self.table.clone();
+        // Pristine guest-JIT grants (see `jit_pristine` above): the twin gets equally-empty
+        // domains at the same indices, same remaining quota — its cloned table's `Binding::Jit`
+        // slots resolve, and a twin that compiles does so into its own domain.
+        twin.jit_domains = self
+            .jit_domains
+            .iter()
+            .map(|d| JitDomainState {
+                mem_log2: d.mem_log2,
+                units: Vec::new(),
+                native_ctx: 0,
+                units_left: d.units_left,
+                bytes_left: d.bytes_left,
+                installed: Vec::new(),
+            })
+            .collect();
         // Shared `Arc` backings — fork shares these (shared memory, pipe fds, module code).
         twin.regions = self.regions.clone();
         twin.pipes = self.pipes.clone();
@@ -20798,7 +20853,7 @@ impl Host {
     /// every other coordinate-free cap copies its binding as-is. Returns the child handle,
     /// or `None` for a forged / non-grantable cap. (A pipe end is checked first: it is index-carrying,
     /// so `resolve_copyable` would refuse it.)
-    fn regrant_into_child(&mut self, handle: i32, child: &mut Host) -> Option<i32> {
+    pub(crate) fn regrant_into_child(&mut self, handle: i32, child: &mut Host) -> Option<i32> {
         if let Some((write, backing)) = self.resolve_pipe_end(handle) {
             return Some(child.install_pipe_end(write, backing));
         }
@@ -22530,6 +22585,12 @@ impl Mem {
         // original all-`Rw` restriction refused every personality-linked fork). An entry beyond
         // the mapped prefix stays fail-closed: its bytes are outside `window_snapshot`.
         let mapped_pages = self.window.mapped() / self.page;
+        // #802 slice 4 — pages the guest `vm_map`-committed in the **reserved tail** (the on-ramp
+        // waist malloc grows its heap there, so every malloc-using on-ramp program has them) are
+        // per-domain memory a POSIX fork must duplicate: collected here for the page-wise copy
+        // below. Plain `Rw`/`Ro` only; `Backed` still fails the whole fork closed (shared §13
+        // bytes), and an `Unmapped` tail entry carries no bytes.
+        let mut tail_pages: Vec<u64> = Vec::new();
         let prot_copy: BTreeMap<u64, PageProt> = if self.has_regions.load(Ordering::Relaxed) {
             return None;
         } else if !self.prot_dirty.load(Ordering::Acquire) {
@@ -22540,10 +22601,16 @@ impl Mem {
                 && space
                     .prot
                     .iter()
-                    .all(|(&pg, p)| !matches!(p, PageProt::Backed { .. }) && pg < mapped_pages);
+                    .all(|(_, p)| !matches!(p, PageProt::Backed { .. }));
             if !ok {
                 return None;
             }
+            tail_pages = space
+                .prot
+                .iter()
+                .filter(|(&pg, p)| pg >= mapped_pages && matches!(p, PageProt::Rw | PageProt::Ro))
+                .map(|(&pg, _)| pg)
+                .collect();
             space.prot.clone()
         };
         let reserved = self.window.reserved();
@@ -22558,6 +22625,18 @@ impl Mem {
         twin.seed(&self.window_snapshot());
         if !prot_copy.is_empty() {
             twin.space_write().prot = prot_copy;
+        }
+        // The `vm_map`-committed tail pages (collected above): commit a zeroed page in the twin's
+        // own backing, then copy the parent's bytes — base-relative on both sides, like
+        // [`snapshot`](Mem::snapshot). The prot entries came over in `prot_copy`.
+        let base = self.window.base();
+        let tbase = twin.window.base();
+        for &pg in &tail_pages {
+            let off = pg * self.page;
+            twin.back.zero(tbase + off, self.page);
+            for i in 0..self.page {
+                twin.set_byte(off + i, self.byte(base + off + i));
+            }
         }
         // #964: the twin runs the same module — its NULL guard (already in `prot_copy` as pages,
         // and enforced by `prot_pages`' refusal via this field) carries over.
@@ -24654,6 +24733,26 @@ mod mem_fork_tests {
             0x7F,
             "twin byte unchanged by a parent write"
         );
+    }
+
+    /// #802 slice 4 — a page the guest `vm_map`-committed in the **reserved tail** (the on-ramp
+    /// waist malloc's heap lives there) is per-domain memory a POSIX fork must duplicate: the twin
+    /// gets its own copy — not a refusal (the old behavior, which failed every malloc-using
+    /// on-ramp program's fork with `-EAGAIN`), and not an alias.
+    #[test]
+    fn fork_private_copies_vm_mapped_tail_pages() {
+        let mut m = Mem::with_reservation(18, 16); // 64 KiB mapped, 256 KiB reserved
+        let page = m.page;
+        assert_eq!(m.map(1 << 16, page, PROT_READ | PROT_WRITE), 0);
+        m.set_byte(1 << 16, 0x5A);
+        m.set_byte((1 << 16) + page - 1, 0xA5);
+        let twin = m
+            .fork_private()
+            .expect("a window with a vm_map'd tail page forks");
+        assert_eq!(twin.byte(1 << 16), 0x5A, "tail page copied");
+        assert_eq!(twin.byte((1 << 16) + page - 1), 0xA5, "to its last byte");
+        twin.set_byte(1 << 16, 0x01);
+        assert_eq!(m.byte(1 << 16), 0x5A, "private copy, not aliased");
     }
 }
 

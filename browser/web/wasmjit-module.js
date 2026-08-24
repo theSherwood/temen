@@ -166,245 +166,18 @@ const tierupJitArg = (slot, tc) => tc === 0 ? Number(BigInt.asIntN(32, slot))
 const tierupJitRes = (ret, tc) => tc === 0 || tc === 1 ? BigInt(ret)
   : (tc === 2 ? f64buf.setFloat32(0, ret, true) : f64buf.setFloat64(0, ret, true), f64buf.getBigInt64(0, true));
 
-// Drive an already-opened **leaf tier-up** run (#809) — the InterpDriven complement to `driveJitRun`:
-// the interpreter owns `_start` (it `vm_map`s / does host I/O, so the whole-program emit declined), and
-// each tier-up-eligible pure leaf surfaces as a TIERUP event serviced here on the emitted module. The
-// per-event contract (worker.js's PAR_TIERUP, single-shot edition): re-arm the emitted `"fuel"` global,
-// write the event's committed-extent snapshot to `"mapped"` (#717 host sync), call
-// `f{func}(win, env, ...i64 args)` over the cdylib's shared memory (the run window lives inside it — no
-// copies), and deliver the i64 result slots (or a trap) back to the parked vCPU. On DONE the cdylib has
-// staged stdout/stderr/exit/value into the usual shared slots. A trapped run throws so the caller falls
-// back to the interpreter oracle (INVARIANT 9 — diverge toward refusal).
-//
-// A `vm_jit_*`-importing guest (#835, the JACL compiler shape) additionally surfaces JIT_INVOKE
-// events: a guest-compiled §22 unit runs here as `f0(win, env, ...args)` on its own emitted wasm
-// (instantiated once per code handle — worker.js's `jitUnitFor` shape), args/results marshalled by
-// the event's scalar type codes, with the same per-call `"mapped"` sync. The engine only surfaces
-// invokes whose unit emitted and whose window state is representable; everything else it services
-// on the interpreter itself, so this handler never has to decline.
-async function driveTierupRun(ex, memory, cacheKey) {
-  const u8 = () => new Uint8Array(memory.buffer);
-  const i64 = () => new BigInt64Array(memory.buffer);
-  const win = Number(ex.svm_onramp_tierup_win_ptr());
-
-  // ---- #846/#880: the linked-unit driver — one shared funcref table + the live-state bounce ---
-  // The main module and every §22 unit emit against this table (Model B2): `call_indirect`
-  // dispatches through it, and the driver populates its slots from the engine's mirror at each
-  // event boundary — an installed unit's emitted `f0`, an emitted program function's `f{i}` from
-  // the main module, or a **bounce shim** (engine-generated trampoline) for interpreter-resident
-  // targets. The bounce (`env.call_interp`) runs the target on a nested interpretation over the
-  // run's LIVE window/powerbox/fuel, then fans the fresh `"mapped"` extent out to every live
-  // instance (a callback may have vm_map-grown the window mid-region). With the shared table,
-  // `call_indirect`-bearing program functions tier up too (#880 — the dispatch-loop shape).
-  // Proven observably identical to `onramp_exec` by tests/tierup_driver.rs's `TierupDriver`
-  // (wasmi playing this file's role).
-  const tsize = 1 << ex.svm_onramp_tierup_table_log2();
-  const table = new WebAssembly.Table({ initial: tsize, maximum: tsize, element: 'anyfunc' });
-  const mappedGlobals = []; // every live instance's "mapped" — the post-bounce fan-out set
-  const fuelGlobals = [];
-  // #1009 paged: a rodata guest's main module is emitted PAGED — its `"pagestate"` global must point
-  // at the per-event page-state table before every emitted call (§750). The table's bytes live in
-  // this module's linear memory (the pump's `Vec` — one shared memory), so the accessor's pointer is
-  // exactly the global's value, zero copies. Only the main module is paged (units are not), so this
-  // set holds at most one global.
-  const pagestateGlobals = [];
-  const registerGlobals = (exports) => {
-    if (exports.mapped) mappedGlobals.push(exports.mapped);
-    if (exports.fuel) fuelGlobals.push(exports.fuel);
-    if (exports.pagestate) pagestateGlobals.push(exports.pagestate);
-  };
-  const unitImports = () => ({ env: {
-    memory,
-    __indirect_function_table: table,
-    trap: () => {},
-    call_interp: (target, argsPtr) => {
-      const rc = ex.svm_onramp_tierup_call_interp(target, argsPtr);
-      // #717 fan-out: growth a bounced callback made is visible from the next instruction on. #1009
-      // paged: the grow also rebuilt the page-state table (in `call_interp`), so fan the fresh
-      // COVERAGE out to `"mapped"` and re-point `"pagestate"` at the fresh base (the `Vec` may have
-      // reallocated) — the emitted access after the bounce then admits the grown pages.
-      if (ex.svm_onramp_tierup_paged()) {
-        const cover = ex.svm_onramp_tierup_mapped();
-        for (const g of mappedGlobals) g.value = cover;
-        const ps = Number(ex.svm_onramp_tierup_pagestate_ptr());
-        for (const g of pagestateGlobals) g.value = ps;
-      } else {
-        const now = ex.svm_onramp_tierup_mapped_now();
-        for (const g of mappedGlobals) g.value = now;
-      }
-      if (rc !== 0) throw new Error('bounce trap'); // unwind to the deliver below
-    },
-  } });
-
-  // Compile + instantiate the main emitted module once per Run, reused across every event. The
-  // compiled Module is cached across Runs under a key distinct from the whole-program `_start`
-  // emit (a different artifact: same guest, tier-up exports). No instance cache: the eligible set
-  // is per-open, and a Run holds its instance for all its events anyway.
-  const tierupKey = cacheKey === undefined ? undefined : `${cacheKey}#tierup`;
-  let module = cacheGet(tierupKey);
-  if (module === undefined) {
-    const wptr = Number(ex.svm_onramp_tierup_wasm_ptr());
-    const wlen = ex.svm_onramp_tierup_wasm_len();
-    module = await WebAssembly.compile(u8().slice(wptr, wptr + wlen));
-    cachePut(tierupKey, module);
-    jitCacheStats.compiles++;
-  } else {
-    jitCacheStats.hits++;
-  }
-  const instance = await WebAssembly.instantiate(module, unitImports());
-  const emitted = instance.exports;
-  const envCell = Number(ex.svm_alloc(ex.svm_wasmjit_env_bytes()));
-  registerGlobals(emitted);
-  // Per-code-handle unit instances and per-(slot, occupant) bounce shims; per-Run only. Async
-  // instantiation (the drive loop awaits it) — a macro unit can exceed the main thread's sync
-  // compile allowance.
-  const jitUnits = new Map();
-  const shims = new Map();
-  const instantiateUnit = async (bytes) => {
-    const inst = await WebAssembly.instantiate(await WebAssembly.compile(bytes), unitImports());
-    registerGlobals(inst.exports);
-    return inst.exports;
-  };
-  const shimFor = async (slot, code) => {
-    const key = `${slot}#${code}`;
-    let f = shims.get(key);
-    if (f === undefined) {
-      const len = ex.svm_onramp_tierup_shim_wasm(slot);
-      if (len === 0) return null;
-      const bytes = u8().slice(Number(ex.svm_onramp_tierup_shim_ptr()), Number(ex.svm_onramp_tierup_shim_ptr()) + len);
-      f = (await instantiateUnit(bytes))['t'];
-      shims.set(key, f);
-    }
-    return f;
-  };
-  const unitFor = async (code, bytes) => {
-    let unit = jitUnits.get(code);
-    if (unit === undefined) {
-      unit = await instantiateUnit(bytes);
-      jitUnits.set(code, unit);
-    }
-    return unit;
-  };
-  // Rebuild the table from the engine's slot mirror. Installs only happen between events (a unit
-  // with a cap.call never emits), so an event-boundary sync is exact for the whole event.
-  const nfuncs = ex.svm_onramp_tierup_nfuncs();
-  // The engine's slot mirror only changes on a §22 install/uninstall (a `cap.call`-bearing unit
-  // never emits, so installs happen strictly between events). `svm_onramp_tierup_table_gen` bumps on
-  // each — cache the last-synced generation and rebuild the table only when it advances, so a
-  // dispatch-heavy card that never installs (lua/qjs/sqlite/tcl) syncs the ~4 K-slot table ONCE
-  // instead of on every one of tens of thousands of tier-ups (#1009 — the pump's dominant cost).
-  let syncedGen = -1;
-  const syncTable = async () => {
-    const gen = ex.svm_onramp_tierup_table_gen();
-    if (gen === syncedGen) return;
-    for (let slot = 0; slot < tsize; slot++) {
-      let entry = null;
-      if (slot < nfuncs) {
-        entry = emitted['f' + slot] ?? await shimFor(slot, -2);
-      } else {
-        const code = ex.svm_onramp_tierup_slot_code(slot);
-        if (code >= 0) {
-          const len = ex.svm_onramp_tierup_jit_wasm_by_handle_len(code);
-          entry = len > 0
-            ? (await unitFor(code, u8().slice(Number(ex.svm_onramp_tierup_jit_wasm_by_handle_ptr()),
-                                              Number(ex.svm_onramp_tierup_jit_wasm_by_handle_ptr()) + len)))['f0']
-            : await shimFor(slot, code);
-        }
-      }
-      table.set(slot, entry);
-    }
-    syncedGen = gen;
-  };
-
-  try {
-    for (;;) {
-      const ev = ex.svm_onramp_tierup_run();
-      if (ev === 3 /* TIERUP_RUN_JIT_INVOKE */) {
-        // A guest-compiled §22 unit with emitted wasm: sync the table, instantiate once per code
-        // handle, then `f0(win, env, ...args)` with the per-event `"mapped"`/fuel sync fanned out
-        // to every live instance (a unit's table dispatch may run any of them).
-        await syncTable();
-        const code = ex.svm_onramp_tierup_jit_code();
-        const unit = await unitFor(code, u8().slice(Number(ex.svm_onramp_tierup_jit_wasm_ptr()),
-                                                    Number(ex.svm_onramp_tierup_jit_wasm_ptr()) + ex.svm_onramp_tierup_jit_wasm_len()));
-        const argvPtr = Number(ex.svm_onramp_tierup_argv_ptr());
-        const n = ex.svm_onramp_tierup_argv_len();
-        const ptypes = new Uint8Array(memory.buffer, Number(ex.svm_onramp_tierup_jit_param_types_ptr()), n);
-        const args = [];
-        for (let i = 0; i < n; i++) args.push(tierupJitArg(i64()[(argvPtr >> 3) + i], ptypes[i]));
-        const mapped = ex.svm_onramp_tierup_mapped(); // #717 host sync, as TIERUP below
-        for (const g of mappedGlobals) g.value = mapped;
-        for (const g of fuelGlobals) g.value = 1n << 61n;
-        new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
-        try {
-          const ret = unit['f0'](win, envCell, ...args);
-          const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
-          const rn = ex.svm_onramp_tierup_jit_result_types_len();
-          const rtypes = new Uint8Array(memory.buffer, Number(ex.svm_onramp_tierup_jit_result_types_ptr()), rn);
-          const rlen = Math.max(1, rets.length) * 8;
-          const rptr = Number(ex.svm_alloc(rlen));
-          for (let i = 0; i < rets.length; i++) i64()[(rptr >> 3) + i] = tierupJitRes(rets[i], rtypes[i]);
-          ex.svm_onramp_tierup_deliver_jit(rptr, rets.length);
-          ex.svm_dealloc(rptr, rlen);
-        } catch {
-          // A wasm trap — or a bounce callback's trap/exit, which the engine staged and
-          // `deliver_jit_trap` resolves as the real trap kind (an exit ends the run as EXIT).
-          ex.svm_onramp_tierup_deliver_jit_trap();
-        }
-        continue;
-      }
-      if (ev !== 1 /* TIERUP_RUN_TIERUP */) break; // 0 = done (slots staged), 2 = trapped (status 3)
-      // #880: a tiered-up leaf's `call_indirect` dispatches through the shared table — sync it
-      // (and the per-event `"mapped"`/fuel fan-out covers every instance the dispatch may reach).
-      await syncTable();
-      const func = ex.svm_onramp_tierup_func();
-      const argvPtr = Number(ex.svm_onramp_tierup_argv_ptr());
-      const n = ex.svm_onramp_tierup_argv_len();
-      const args = [];
-      for (let i = 0; i < n; i++) args.push(i64()[(argvPtr >> 3) + i]);
-      // #717 host sync: the event's committed extent → every live `"mapped"` global, so the bounds
-      // checks admit exactly what the interpreter's page map does for this call.
-      const tmapped = ex.svm_onramp_tierup_mapped();
-      for (const g of mappedGlobals) g.value = tmapped;
-      for (const g of fuelGlobals) g.value = 1n << 61n; // re-arm across events on reused instances
-      // #1009 paged: point the emitted page check at the freshly rebuilt table (its base can move as
-      // the pump's `Vec` reallocates between events, so read it every time). On an unpaged run the
-      // set is empty and `_paged` is 0 — no-op.
-      if (ex.svm_onramp_tierup_paged()) {
-        const ps = Number(ex.svm_onramp_tierup_pagestate_ptr());
-        for (const g of pagestateGlobals) g.value = ps;
-      }
-      new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
-      try {
-        const ret = emitted['f' + func](win, envCell, ...args);
-        const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
-        const rlen = Math.max(1, rets.length) * 8;
-        const rptr = Number(ex.svm_alloc(rlen));
-        for (let i = 0; i < rets.length; i++) i64()[(rptr >> 3) + i] = BigInt(rets[i]);
-        ex.svm_onramp_tierup_deliver(rptr, rets.length);
-        ex.svm_dealloc(rptr, rlen);
-      } catch {
-        ex.svm_onramp_tierup_deliver_trap();
-      }
-    }
-  } finally {
-    ex.svm_dealloc(envCell, ex.svm_wasmjit_env_bytes());
-    ex.svm_onramp_tierup_close();
-  }
-  const status = ex.svm_status();
-  if (status === 3 /* STATUS_TRAP */) throw new Error('tier-up run trapped (declined to the interpreter)');
-  return status;
-}
-
-// #926 slice 2 — the **cooperative** tier-up driver: the single-thread, no-Worker host loop for a
-// genuinely threaded guest (`thread.spawn`) that `driveTierupRun` above declines (its single-vCPU
-// pump traps at the spawn event). It wraps the `svm_coop_*` cdylib (`CoopRun`), which multiplexes
-// every vCPU of the run — the root and its `thread.spawn` descendants — on this one wasm thread and
-// services concurrency, fibers, and §22 install/invoke **internally**, so only tier-up, a §22
-// `Jit.invoke` of an emitted unit, and the run's end reach here. Mirrors `driveTierupRun` in full —
-// the B2 shared driver table (`call_indirect` tiers up, #880), the `env.call_interp` live-state bounce,
-// and the JIT_INVOKE arm — for a genuinely threaded guest. Proven observably identical to `onramp_exec`
-// by tests/coop_tierup_driver.rs (wasmi playing this file's role over a threaded guest).
+// The **cooperative tier-up driver** (#926 slice 2; since #1026 the ONE fallback tier when the
+// whole-program emit declines): the single-thread, no-Worker host loop for an InterpDriven guest —
+// single-vCPU or genuinely threaded alike. It wraps the `svm_coop_*` cdylib (`CoopRun`), whose
+// scheduler multiplexes every vCPU of the run — the root and its `thread.spawn` descendants — on
+// this one wasm thread and services concurrency, fibers, and §22 install/invoke **internally**, so
+// only tier-up, a §22 `Jit.invoke` of an emitted unit, and the run's end reach here. The per-event
+// contract (worker.js's PAR_TIERUP shape): sync the B2 shared driver table (`call_indirect` tiers
+// up, #880) when its generation advances, re-arm `"fuel"`, write the event's `"mapped"` sync (#717;
+// a paged run also points `"pagestate"` at the live table, #1009), call `f{func}(win, env, ...args)`
+// over the cdylib's shared memory, and deliver the results (or the trap) back to the parked vCPU;
+// `env.call_interp` is the live-state bounce. Proven observably identical to `onramp_exec` by
+// tests/coop_tierup_driver.rs (wasmi playing this file's role).
 async function driveCoopTierupRun(ex, memory, cacheKey) {
   const u8 = () => new Uint8Array(memory.buffer);
   const i64 = () => new BigInt64Array(memory.buffer);
@@ -412,7 +185,7 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
 
   const mappedGlobals = []; // every live instance's "mapped" — the post-bounce fan-out set (#717)
   const fuelGlobals = [];
-  const pagestateGlobals = []; // #1009 paged: the "pagestate" base, the coop twin of driveTierupRun's
+  const pagestateGlobals = []; // #1009 paged: the "pagestate" base globals (only a paged main module has one)
   const registerGlobals = (exports) => {
     if (exports.mapped) mappedGlobals.push(exports.mapped);
     if (exports.fuel) fuelGlobals.push(exports.fuel);
@@ -499,7 +272,7 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
   // target. Exactly `driveTierupRun`'s `syncTable`, over the `svm_coop_*` accessors.
   const nfuncs = ex.svm_coop_nfuncs();
   // #1009: rebuild the table only when the slot mirror changed (a §22 install/uninstall bumps
-  // `svm_coop_table_gen`) — the driveTierupRun cache, over the coop accessors.
+  // `svm_coop_table_gen`) — a card that never installs syncs the table once, not per tier-up.
   let syncedGen = -1;
   const syncTable = async () => {
     const gen = ex.svm_coop_table_gen();
@@ -617,28 +390,20 @@ export async function runJitModule(ex, memory, moduleBytes, stdinBytes, cacheKey
   // shared=1: this demo instantiates the emitted module against the cdylib's **shared** memory
   // (cross-origin-isolated threads build). A plain single-threaded host passes 0.
   const opened = ex.svm_onramp_jit_run_open(modP, moduleBytes.length, stdinP, stdinLen, 1);
-  // `_start` not whole-program-emittable (an InterpDriven guest — it `vm_map`s, streams, …): try the
-  // leaf tier-up run (#809) before giving the buffers up — the interpreter drives `_start`, its
-  // eligible pure leaves run on emitted wasm, and a `vm_jit_*` guest's runtime-compiled §22 units run
-  // emitted too (#835). Refused (nothing emittable ever / threads/futex) → fall through to the throw
-  // and the caller's plain-interpreter fallback.
-  let tierup = false;
-  if (opened !== 0 && ex.svm_onramp_tierup_open &&
-      ex.svm_onramp_tierup_open(modP, moduleBytes.length, stdinP, stdinLen, 1) === 0) {
-    tierup = true;
-  }
-  // #926 slice 2: the single-vCPU tier-up declined (a guest that reaches a `thread.spawn`/futex event
-  // — the JACL-with-runtime-threads shape). Try the **cooperative** driver, which multiplexes those
-  // vCPUs on this one wasm thread and still tiers up their hot leaves. Refused → fall through to the
-  // caller's plain-interpreter fallback, exactly as before.
+  // `_start` not whole-program-emittable (an InterpDriven guest — it `vm_map`s, streams,
+  // `thread.spawn`s, hosts fibers, …): try the **cooperative** tier-up driver before giving the
+  // buffers up — its scheduler multiplexes every vCPU of the run on this one wasm thread, the
+  // interpreter drives `_start`, eligible pure leaves run on emitted wasm, and a `vm_jit_*` guest's
+  // runtime-compiled §22 units run emitted too (#835). This is the ONE fallback tier (#1026: the
+  // single-vCPU pump it used to try first was a strict subset, and slower). Refused (nothing
+  // emittable ever) → fall through to the throw and the caller's plain-interpreter fallback.
   let coop = false;
-  if (opened !== 0 && !tierup && ex.svm_coop_open &&
+  if (opened !== 0 && ex.svm_coop_open &&
       ex.svm_coop_open(modP, moduleBytes.length, stdinP, stdinLen, 1) === 0) {
     coop = true;
   }
   ex.svm_dealloc(modP, moduleBytes.length);
   if (stdinP) ex.svm_dealloc(stdinP, stdinLen);
-  if (tierup) return driveTierupRun(ex, memory, cacheKey);
   if (coop) return driveCoopTierupRun(ex, memory, cacheKey);
   if (opened !== 0) {
     throw new Error(`JIT module open failed: status ${ex.svm_status()} (2 = _start not emittable)`);

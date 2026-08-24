@@ -687,6 +687,14 @@ mod tests {
         assert_eq!(svm_interp::cap_id::SHARED_REGION, 4);
     }
 
+    /// `svm-llvm` pins `Instantiator`'s interface id numerically (`INSTANTIATOR_TYPE_ID`, for the
+    /// `__vm_instantiate`/`__vm_join` §14 spawn builtins a guest driver lowers to); this locks that
+    /// pin to the real constant.
+    #[test]
+    fn instantiator_type_id_matches() {
+        assert_eq!(svm_interp::cap_id::INSTANTIATOR, 6);
+    }
+
     /// The §4b zero-copy op end to end at the capability boundary: `host_fs_mmap`'s `FS_MAP_REGION`
     /// opens a real file and mints a **file-backed `SharedRegion`** whose size matches, while a plain
     /// `host_fs` refuses the op (no minting authority). Combined with `file_region_tests` (which prove

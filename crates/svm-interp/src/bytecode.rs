@@ -2777,6 +2777,14 @@ pub struct Vcpu<'p> {
     /// dst slot the emitted region's results land in, and their types (to re-tag the delivered raw
     /// slots — the caller's window base is the one the spill persisted).
     pending_tierup: Option<(usize, Box<[ValType]>)>,
+    /// #1011 slice 3a: a **pre-built granted child powerbox** the resumable engine's op-13 arm hands to
+    /// the driver. When a `cap.call INSTANTIATOR 13` (with a grant list) surfaces [`VcpuEvent::Instantiate`],
+    /// the engine has already re-granted the child's named caps (a shared `fs`) from *this* vCPU's own
+    /// powerbox into a fresh `Host` (approach A, interpreter-side) and stashes it here; the driver takes
+    /// it via [`take_granted_host`](Self::take_granted_host) and runs the child with
+    /// [`new_confined_child_over_host`](Self::new_confined_child_over_host). `None` for a grant-less
+    /// op-0/op-5/op-17 child (the driver builds a fresh attenuated powerbox).
+    pending_granted_host: Option<Host>,
 }
 
 impl<'p> Vcpu<'p> {
@@ -2974,6 +2982,7 @@ impl<'p> Vcpu<'p> {
             jit_eligible: None,
             jit_page_checked: false,
             pending_tierup: None,
+            pending_granted_host: None,
         })
     }
 
@@ -2998,6 +3007,82 @@ impl<'p> Vcpu<'p> {
         size_log2: u8,
         fuel: u64,
     ) -> Result<Vcpu<'p>, Trap> {
+        // The plain op-0 confined child: attenuated `Instantiator`+`AddressSpace` only, no re-granted
+        // I/O caps (the browser/native drivers' path). Delegates with a no-op grant installer.
+        Self::new_confined_child_granted(prog, module, entry, back, size_log2, fuel, &mut |_| {})
+    }
+
+    /// Like [`new_confined_child`](Self::new_confined_child), but the caller may install **re-granted
+    /// caps** into the child's powerbox before it runs — the §14 op-13 grant list (a shared `fs`, an
+    /// inherited `stdout`), reached by the child through `cap.self.resolve` (#1011 slice 3a). The
+    /// `install_grants` closure receives the freshly-built child `Host` (with its `Instantiator`+
+    /// `AddressSpace` already granted) and, for each grant, calls the parent's
+    /// [`Host::regrant_into_child`] + [`Host::register_cap_name`] — so the grant *policy* (which handles
+    /// are `can_regrant`-eligible) stays with the caller (the interpreter's cap dispatch), and this
+    /// constructor stays pure mechanism (INVARIANTS §4). A confined child so built still masks every
+    /// window access to its own carve (§2 unchanged) — a re-granted cap is a cross-tier `cap.call`, not
+    /// a window access.
+    pub fn new_confined_child_granted(
+        prog: &'p VcpuProgram,
+        module: u32,
+        entry: u32,
+        back: std::sync::Arc<super::Region>,
+        size_log2: u8,
+        fuel: u64,
+        install_grants: &mut dyn FnMut(&mut Host),
+    ) -> Result<Vcpu<'p>, Trap> {
+        Self::new_confined_child_core(
+            prog,
+            module,
+            entry,
+            back,
+            size_log2,
+            fuel,
+            Host::new(),
+            install_grants,
+        )
+    }
+
+    /// Like [`new_confined_child`](Self::new_confined_child), but the child runs over a **caller-built
+    /// powerbox** that already carries its re-granted caps (#1011 slice 3a production wiring): the
+    /// resumable engine's op-13 arm builds the granted child `Host` from the parent's own powerbox
+    /// (`regrant_into_child`, interpreter-side — approach A) and hands it here through the
+    /// [`take_granted_host`](Self::take_granted_host) stash, so a JIT-tier driver runs a granted phase
+    /// child (a shared `fs`) without the driver ever touching the parent's authority. The starter
+    /// `Instantiator`+`AddressSpace` are granted on top of the provided host, exactly as for a plain
+    /// child.
+    pub fn new_confined_child_over_host(
+        prog: &'p VcpuProgram,
+        module: u32,
+        entry: u32,
+        back: std::sync::Arc<super::Region>,
+        size_log2: u8,
+        fuel: u64,
+        host: Host,
+    ) -> Result<Vcpu<'p>, Trap> {
+        Self::new_confined_child_core(
+            prog,
+            module,
+            entry,
+            back,
+            size_log2,
+            fuel,
+            host,
+            &mut |_| {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_confined_child_core(
+        prog: &'p VcpuProgram,
+        module: u32,
+        entry: u32,
+        back: std::sync::Arc<super::Region>,
+        size_log2: u8,
+        fuel: u64,
+        mut host: Host,
+        install_grants: &mut dyn FnMut(&mut Host),
+    ) -> Result<Vcpu<'p>, Trap> {
         if size_log2 >= 64 {
             return Err(Trap::Malformed);
         }
@@ -3012,9 +3097,14 @@ impl<'p> Vcpu<'p> {
             .get(entry as usize)
             .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
         let child_size = 1u64 << size_log2;
-        let mut host = Host::new();
+        // `host` may already carry re-granted caps (op-13, via `new_confined_child_over_host`); the
+        // starter `Instantiator`+`AddressSpace` are granted on top. `install_grants` is the closure form
+        // (op-13 via `new_confined_child_granted`), run after the starter caps.
         let cinst = host.grant_instantiator(0, child_size);
         let cas = host.grant_address_space(0, child_size);
+        // Install any re-granted caps (op-13 grant list) into the child powerbox under their names. The
+        // starter entry args stay `[Instantiator, AddressSpace]`; re-granted caps are name-resolved.
+        install_grants(&mut host);
         let args = if want_as {
             vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
         } else {
@@ -3050,6 +3140,7 @@ impl<'p> Vcpu<'p> {
             jit_eligible: None,
             jit_page_checked: false,
             pending_tierup: None,
+            pending_granted_host: None,
         })
     }
 
@@ -3338,16 +3429,33 @@ impl<'p> Vcpu<'p> {
                     grants,
                     budget,
                 }) => {
-                    // op 13 (named grants) is driven by the scheduler `drive` arm (the browser's
-                    // `compile_and_run_with_host` path); this standalone single-vCPU resume path builds
-                    // no child powerbox, so it declines a grant list rather than silently drop it.
-                    if grants.is_some() {
-                        return VcpuEvent::Trapped(Trap::Malformed);
-                    }
+                    // op 13 (`instantiate_module_named`): re-grant the named cap list into the child's
+                    // powerbox (#1011 slice 3a production wiring) so a JIT-tier phase child resolves an
+                    // inherited `fs`/`stdout` by name. Parse + `can_regrant`-gate the list first (fail
+                    // closed before any spawn commits); then, once `event_instantiate_module` commits the
+                    // spawn, re-grant from this vCPU's own authority and stash the child powerbox for the
+                    // driver (`take_granted_host` → `new_confined_child_over_host`). A grant-less op-5
+                    // child is unchanged. (op 11's same-module named-grant form still declines below —
+                    // the nim driver spawns separate-module children, so only op 13 is wired here.)
+                    let glist = match grants {
+                        Some((gptr, gn)) => match self.read_grant_list(gptr, gn) {
+                            Ok(l) => Some(l),
+                            Err(t) => return VcpuEvent::Trapped(t),
+                        },
+                        None => None,
+                    };
                     match self.event_instantiate_module(
                         ibase, isz, mh, entry, off, size_log2, quota, budget, dst,
                     ) {
-                        Ok(Some(ev)) => return ev,
+                        Ok(Some(ev)) => {
+                            if let Some(list) = glist {
+                                match self.regrant_list_into_child(&list) {
+                                    Ok(h) => self.pending_granted_host = Some(h),
+                                    Err(t) => return VcpuEvent::Trapped(t),
+                                }
+                            }
+                            return ev;
+                        }
                         Ok(None) => {} // -EINVAL landed in place — keep running
                         Err(t) => return VcpuEvent::Trapped(t),
                     }
@@ -3542,9 +3650,90 @@ impl<'p> Vcpu<'p> {
         }))
     }
 
+    /// **Read + `can_regrant`-gate a §14 op-13 grant list** (#1011 slice 3a production wiring), the
+    /// resumable-engine counterpart of the cooperative driver's op-13 record parse. Read the `grants_n`
+    /// × 16-byte records from this vCPU's confined window (`{name_off:u32, name_len:u32, handle:i32,
+    /// flags:u32}`), resolve each `(name, handle)`, and reject a non-re-grantable handle with `CapFault`
+    /// — fail closed **before** any spawn commits, exactly as the tree-walker gates the list at parse
+    /// time (a refused list leaves the child unspawned). No state changes here (`&self`); the actual
+    /// re-grant is [`regrant_list_into_child`](Self::regrant_list_into_child), run only after the spawn
+    /// commits.
+    fn read_grant_list(&self, grants_ptr: u64, grants_n: u64) -> Result<Vec<(String, i32)>, Trap> {
+        let mem = self.mem.as_ref().ok_or(Trap::Malformed)?;
+        let mut list: Vec<(String, i32)> = Vec::new();
+        for i in 0..grants_n {
+            let rec = mem.read_window(grants_ptr + i * 16, 16)?;
+            let name_off = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
+            let name_len = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
+            let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+            let name_bytes = mem.read_window(name_off, name_len)?;
+            let name = String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
+            // `can_regrant` gate against the run's powerbox (shared when attached) — the same policy
+            // check the cooperative arm applies while parsing the records.
+            match self.shared_host {
+                Some(m) => {
+                    let hg = m.lock_unpoisoned();
+                    hg.can_regrant(handle).then_some(()).ok_or(Trap::CapFault)?;
+                }
+                None => self
+                    .host
+                    .can_regrant(handle)
+                    .then_some(())
+                    .ok_or(Trap::CapFault)?,
+            }
+            list.push((name, handle));
+        }
+        Ok(list)
+    }
+
+    /// **Re-grant a validated op-13 grant list into a fresh child powerbox** (#1011 slice 3a): for each
+    /// `(name, handle)` (already `can_regrant`-gated by [`read_grant_list`](Self::read_grant_list)),
+    /// call this vCPU's [`Host::regrant_into_child`] and install the child-side handle under its name
+    /// (`register_cap_name`) — so the confined child resolves an inherited `fs`/`stdout` by name
+    /// (`cap.self.resolve`) with the same authority the tree-walker grants. Run **only after the spawn
+    /// commits** (the cooperative arm's ordering — a refused spawn mutates no host). The starter
+    /// `Instantiator`+`AddressSpace` are added on top in
+    /// [`new_confined_child_over_host`](Self::new_confined_child_over_host); this host carries only the
+    /// re-granted caps. INVARIANTS §4: the grant *policy* stays here (the interpreter), the constructor
+    /// stays pure mechanism.
+    fn regrant_list_into_child(&mut self, list: &[(String, i32)]) -> Result<Host, Trap> {
+        let mut child = Host::new();
+        match self.shared_host {
+            Some(m) => {
+                let mut hg = m.lock_unpoisoned();
+                for (name, handle) in list {
+                    let cg = hg
+                        .regrant_into_child(*handle, &mut child)
+                        .ok_or(Trap::CapFault)?;
+                    child.register_cap_name(name, cg);
+                }
+            }
+            None => {
+                for (name, handle) in list {
+                    let cg = self
+                        .host
+                        .regrant_into_child(*handle, &mut child)
+                        .ok_or(Trap::CapFault)?;
+                    child.register_cap_name(name, cg);
+                }
+            }
+        }
+        Ok(child)
+    }
+
     /// Deliver a `thread.spawn` handle (after `Spawn`).
     pub fn deliver_handle(&mut self, handle: i32) {
         self.deliver_code(handle);
+    }
+
+    /// Take the pre-built **granted child powerbox** stashed for the just-surfaced
+    /// [`VcpuEvent::Instantiate`] (#1011 slice 3a): `Some(host)` when the child was spawned by a §14
+    /// op-13 `instantiate_module_named` with a grant list — the engine already re-granted its named caps
+    /// (a shared `fs`) from this vCPU's powerbox — so the driver runs it with
+    /// [`new_confined_child_over_host`](Self::new_confined_child_over_host); `None` for a grant-less
+    /// child, run with [`new_confined_child`](Self::new_confined_child). One-shot per `Instantiate`.
+    pub fn take_granted_host(&mut self) -> Option<Host> {
+        self.pending_granted_host.take()
     }
 
     /// Deliver a `Wait` wasm code or a `Notify` woken-count into the pending dst.
