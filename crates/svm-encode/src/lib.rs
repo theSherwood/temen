@@ -244,12 +244,12 @@ mod op {
 const MAGIC: [u8; 4] = *b"SVM\x00";
 // v10 (CALLS.md 7.4) adds the impl-export **`threaded` policy byte** — the provider's own
 // concurrency-policy declaration (`0` = single, `1` = threaded), one uleb after each offer's op
-// list. Any other value is a decode error (fail-closed, like every reserved encoding). v10 is the
-// first bump made after committed `.svmb` assets existed, so it carries the format's one
-// **compatibility window**: the decoder also accepts v9 (whose impl-exports read as `single` —
-// exactly what every v9-era offer was), until the assets regenerate (ISSUES.md). The
-// exact-current-VERSION rule below predates stored blobs and resumes once the window closes.
-// v9 adds the **flags byte** (directly after the version) and the **object dialect** (flag bit 0):
+// list. Any other value is a decode error (fail-closed, like every reserved encoding). v10 briefly
+// carried the format's one **compatibility window** — the decoder also accepted v9 (whose
+// impl-exports, lacking the policy byte, read as `single`) to keep the committed `.svmb` assets
+// loading until they regenerated. The wire rev (#900) regenerated every asset onto v10, so the
+// window is retired: the decoder is back to accepting the exact current `VERSION` only.
+// v9 added the **flags byte** (directly after the version) and the **object dialect** (flag bit 0):
 // a serialized *link unit* — the binary twin of a pre-link text unit (named consumer: the external
 // toolchain blocked on format standardization, owner-approved 2026-07-30). An object file may carry
 // the constructs `link` resolves away: the `data.ptr` relocation section (after data), the
@@ -1755,13 +1755,12 @@ fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> 
         return Err(DecodeError::BadMagic);
     }
     let v = c.byte()?;
-    // v10 accepts **v9** as a one-version compatibility window (the only such window): 17
-    // committed `.svmb` assets (the browser playground/fixtures — chibicc, QuickJS, the canvas
-    // demos) predate the impl-export policy byte and regenerate only through their heavyweight
-    // LLVM on-ramps. A v9 impl-export simply has no policy byte — it reads as `single`, exactly
-    // what every v9-era offer was. The window retires (back to exact-version) when the assets
-    // regenerate (tracked in ISSUES.md); everything below v9 stays rejected.
-    if v != VERSION && v != 9 {
+    // Exact-version only: the decoder accepts the current `VERSION` and nothing else. The v9
+    // compatibility window (v9 impl-exports read as `single`, no policy byte) was retired once
+    // every committed `.svmb` asset regenerated onto v10 in the wire rev (#900) — its whole
+    // purpose was to keep those pre-policy-byte blobs loading until then. Every other version,
+    // v9 included, now fails closed.
+    if v != VERSION {
         return Err(DecodeError::BadVersion(v));
     }
     // v9 flags byte. Reserved bits fail closed; the object bit is rejected on the runnable path
@@ -1910,16 +1909,12 @@ fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> 
             ops.push(c.uleb()? as FuncIdx);
         }
         // v10 (CALLS.md 7.4): the declared concurrency policy — any value past the two defined
-        // ones is a malformed module (fail-closed, never a guessed policy). A v9 blob has no
-        // policy byte: every v9-era offer was `single`, so that is what it declares.
-        let threaded = if v >= 10 {
-            match c.uleb()? {
-                0 => false,
-                1 => true,
-                p => return Err(DecodeError::BadOfferPolicy(p)),
-            }
-        } else {
-            false
+        // ones is a malformed module (fail-closed, never a guessed policy). Always present now
+        // that the v9 window (which had no policy byte) is retired.
+        let threaded = match c.uleb()? {
+            0 => false,
+            1 => true,
+            p => return Err(DecodeError::BadOfferPolicy(p)),
         };
         impl_exports.push(svm_ir::ImplExport {
             name,
@@ -3112,13 +3107,13 @@ mod debug_tests {
         assert_eq!(decoded, m);
     }
 
-    /// CALLS.md 7.4 — the v10 decoder's one **compatibility window**: a v9 blob (no impl-export
-    /// policy byte) decodes, its offers reading as `single` — the 17 committed `.svmb` assets'
-    /// lifeline until they regenerate. The v9 bytes are derived from the v10 encoder itself
-    /// (encode `threaded: false`/`true` twins; the single differing byte IS the policy byte;
-    /// strip it and stamp v9), so the pin tracks the real layout, not a hand copy of it.
+    /// CALLS.md 7.4 — the v9 compatibility window is **retired**: now that every committed `.svmb`
+    /// asset has regenerated onto v10 (wire rev #900), a v9 blob (no impl-export policy byte) must
+    /// fail closed like any other non-current version. The v9 bytes are derived from the v10
+    /// encoder itself (encode `threaded: false`/`true` twins; the single differing byte IS the
+    /// policy byte; strip it and stamp v9), so the pin tracks the real layout, not a hand copy.
     #[test]
-    fn a_v9_blob_with_an_impl_export_decodes_as_single() {
+    fn a_v9_blob_is_rejected_now_that_the_window_is_retired() {
         let mut m = module(None);
         m.funcs.push(Func {
             params: vec![],
@@ -3156,13 +3151,12 @@ mod debug_tests {
         let mut v9 = b_single.clone();
         v9.remove(diffs[0]);
         v9[4] = 9;
-        let decoded = decode_module(&v9).expect("v9 decodes through the window");
-        assert_eq!(decoded.impl_exports.len(), 1);
-        assert!(
-            !decoded.impl_exports[0].threaded,
-            "a v9 offer reads as single"
-        );
-        // The same bytes stamped v8 stay rejected — the window is exactly one version wide.
+        // The window is closed: v9 now fails closed, exactly like every other non-current version.
+        assert!(matches!(
+            decode_module(&v9),
+            Err(DecodeError::BadVersion(9))
+        ));
+        // …and the same bytes stamped v8 were already rejected — nothing below VERSION decodes.
         let mut v8 = v9.clone();
         v8[4] = 8;
         assert!(matches!(
