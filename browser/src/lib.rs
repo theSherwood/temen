@@ -8923,8 +8923,12 @@ pub extern "C" fn svm_coop_open(
     // `.rodata` this way) emits the shared table PAGED: one durable `Ro` page makes the window
     // non-one-bound-representable, so the per-call #717 `scalar_extent` sync would decline EVERY
     // tier-up. Paged mode replaces the decline with a per-access page check that traps
-    // `Ro`/`Unmapped` exactly where the interpreter's `check_prot` does (fail-closed).
-    let paged = all_shimmable && m.data.iter().any(|d| d.readonly);
+    // `Ro`/`Unmapped` exactly where the interpreter's `check_prot` does (fail-closed). A guest that
+    // reaches `unmap`/`protect` itself needs the same treatment even with no rodata — non-paged the
+    // emitter module-gates it to emit-nothing (decline), paged it tiers up (the `sync_pagestate`
+    // per-event/-bounce refresh carries the runtime remaps).
+    let paged = all_shimmable
+        && (m.data.iter().any(|d| d.readonly) || svm_wasm_jit::module_uses_unmap_protect(&m));
     let page_log2 = svm_interp::host_page_size().trailing_zeros() as u8;
     let emitted_res = if paged {
         svm_wasm_jit::compile_module_tierup_b2_paged(

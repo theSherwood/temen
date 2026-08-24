@@ -1028,6 +1028,59 @@ fn coop_rodata_and_midinvoke_grow_match_the_oracle() {
     svm_coop_close();
 }
 
+/// The paged-flip gap: a guest that `protect`s its own pages (`cap.call 5 2`) but carries **no**
+/// `readonly` data segment. Keyed on rodata alone, `svm_coop_open` emitted it non-paged, the
+/// emitter's window-remapping gate module-gated it to emit-nothing, and the open **declined** —
+/// interpreter-only for a guest paged mode carries fine. Now the flip also keys on
+/// `module_uses_unmap_protect`: the guest opens paged, the leaf tiers up, and the post-`protect`
+/// access matches the oracle (Ro load succeeds, Ro store traps) through the per-event
+/// `sync_pagestate` refresh.
+#[test]
+fn coop_unmap_protect_guest_without_rodata_opens_paged() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let (_out_h, mem_h) = onramp_out_mem_handles();
+
+    for (store, want_trap) in [(false, false), (true, true)] {
+        let body = if store {
+            "  i64.store v0 v0\n  vl = i64.load v0\n  return vl\n"
+        } else {
+            "  vl = i64.load v0\n  return vl\n"
+        };
+        // `_start` seeds the page while it is still Rw, `protect`s [64 KiB, 80 KiB) read-only
+        // (interp-serviced — a cap.call-bearing function never emits), then calls the leaf.
+        let src = format!(
+            "memory 17\nfunc () -> (i64) {{\nblock 0 () {{\n  vp = i64.const 65536\n  i64.store vp vp\n  vas = i32.const {mem_h}\n  voff = i64.const 65536\n  vlen = i64.const 16384\n  vprot = i32.const 1\n  vr = cap.call 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)\n  vres = call 1 (vp)\n  return vres\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n{body}  }}\n}}\nexport 0 func \"_start\" 0\n"
+        );
+        let m = svm_text::parse_module(&src).expect("parse");
+        svm_verify::verify_module(&m).expect("verify");
+        let bytes = svm_encode::encode_module(&m);
+        let want = onramp_exec(&m, b"");
+        assert_eq!(
+            want.status,
+            if want_trap { STATUS_TRAP } else { STATUS_OK },
+            "oracle sanity (store={store})"
+        );
+        let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+        assert_eq!(opened, 0, "coop open (status {})", svm_status());
+        assert_ne!(
+            svm_coop_paged(),
+            0,
+            "the unmap/protect guest opens the coop run paged (no rodata needed)"
+        );
+        let (_d, tierups) = drive_coop_b2_session_allow_trap(&m);
+        assert!(tierups >= 1, "the leaf tiers up on the coop path");
+        assert_eq!(
+            svm_status(),
+            want.status,
+            "coop status parity (store={store})"
+        );
+        if !want_trap {
+            assert_eq!(svm_coop_value(), want.value, "coop value parity (Ro load)");
+        }
+        svm_coop_close();
+    }
+}
+
 /// The added constant of the `call_indirect`-reached leaf (`f2`), distinct from the unit's `UNIT_K`.
 const LEAF_K: i64 = 424242;
 
