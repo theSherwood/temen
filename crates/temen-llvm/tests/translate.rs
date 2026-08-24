@@ -12570,6 +12570,13 @@ fn demo_bash_translates_and_verifies() {
         "echo hi > >(while read l; do echo \"up:$l\"; done); wait",
         "read x < /dev/stdin <<< \"hi\"; echo \"got:$x\"",
         "exec 3< <(printf 'a\\nb\\n'); read x < /dev/fd/3; echo \"fd3:$x\"",
+        // #1057 — the last stage of a pipeline that terminates via `exit()` (every forked bash
+        // pipeline stage / group command reaching `exit_shell`) must reap with its real code,
+        // not the fork-twin crash status (128). Pre-fix these all reported `rc=128`; the status
+        // was masked in every earlier pipe script by a trailing command.
+        "true | { false; }; echo \"rc=$?\"",
+        "false | { true; }; echo \"rc=$?\"",
+        "echo hi | { read x; echo \"got:$x\"; }; echo \"after=$?\"",
     ] {
         let config = temen_run::RunConfig {
             args: vec![b"bash".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()],

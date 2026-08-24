@@ -229,13 +229,21 @@ Two needed a fix:
 Six scripts pin these in the capstone (BASH_REMATCH captures, both process-substitution
 directions, `/dev/stdin`).
 
+## Pipeline `$?` (DONE — #1057)
+
+The last stage of a pipeline that terminates via `exit()` (every forked bash pipeline stage /
+group command reaching `exit_shell`) used to report `$? = 128` — the fork-twin **crash** status —
+instead of its real exit code. Root cause: `reap_status` in temen-interp mapped **every**
+`Err(Trap)` to `REAP_CRASH_STATUS`, but `Trap::Exit(code)` is a *clean* guest `exit(code)` ("not
+an error — the domain asked to terminate"), exactly what the root path already turns into
+`Outcome::Exited(code)`. A fork twin that exits via `exit()` rather than returning must reap with
+that code. One-arm fix (`Err(Trap::Exit(code)) => code & 0xff`); only genuine traps
+(unreachable, memory/cap faults) still reap 128. Surfaced by the language differential, masked in
+every earlier pipe script by a trailing command. Pinned by three pipeline scripts in the
+capstone (`true | { false; }` → `rc=1`, etc.).
+
 ## What remains (the slice ladder from the #802 sketch)
 
-- **#1057 — pipeline `$?` is 128** (its own slice): the last stage of any pipeline
-  (`true | { true; }`, `cmd | grep -q x`) reaps as `REAP_CRASH_STATUS` (128) instead of its real
-  exit, though it exits cleanly and no trap fires. Surfaced by the language differential; masked
-  in every existing pipe script by a trailing command. Real scripts branch on pipeline status
-  constantly, so this is S2.
 - The `^D`-EOF nuance (the one-shot EOF is writer-count state, so the shell's next read can
   consume an EOF meant for the job — native VEOF is a queued, one-READ event; the capstone
   sessions don't currently trip it).
