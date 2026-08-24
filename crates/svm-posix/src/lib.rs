@@ -3316,8 +3316,7 @@ impl Ctx<'_> {
             return 0;
         }
         // #863 slice 2 — any other pid is a process-table lookup.
-        let transitioned: Option<i32>;
-        match self.w.procs.get(&(pid as i32)) {
+        let transitioned: Option<i32> = match self.w.procs.get(&(pid as i32)) {
             Some(ProcEntry::Live(t)) => {
                 // Not self (guarded above), so this is a different mutex — World → Proc, the
                 // canonical order, serialized against other multi-`Proc` paths by the world lock.
@@ -3334,12 +3333,12 @@ impl Ctx<'_> {
                 }
                 // #802 rung 3 — target stopped or continued: SIGCHLD its parent (after the
                 // target's lock drops — sibling `Proc` locks never nest).
-                transitioned = (was_stopped != tp.stopped_sig.is_some()).then_some(tp.ppid);
+                (was_stopped != tp.stopped_sig.is_some()).then_some(tp.ppid)
             }
             // A zombie exists until reaped (POSIX: kill succeeds) but takes no signal.
             Some(ProcEntry::Zombie { .. }) => return 0,
             None => return ESRCH,
-        }
+        };
         if let Some(ppid) = transitioned {
             self.notify_parent_chld(ppid);
         }
