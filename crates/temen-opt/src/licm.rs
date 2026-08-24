@@ -105,9 +105,9 @@ fn edges(term: &Terminator) -> Vec<(u32, &Vec<Value>)> {
 /// Run loop-invariant code motion. `funcs` / `has_memory` are only for `func_value_types` (to type
 /// the threaded parameters). Semantics-preserving; the cleanup fixpoint DCEs the emptied-out
 /// originals.
-pub fn licm(f: &Func, funcs: &[Func], has_memory: bool) -> Func {
+pub fn licm(f: &Func, funcs: &[Func], types: &[temen_ir::TypeEntry], has_memory: bool) -> Func {
     let fn_results: Vec<usize> = funcs.iter().map(|fu| fu.results.len()).collect();
-    let mut s = to_ssa(f, &fn_results);
+    let mut s = to_ssa(f, &fn_results, types);
     let nblocks = s.blocks.len();
     if nblocks == 0 {
         return from_ssa(&s);
@@ -118,7 +118,7 @@ pub fn licm(f: &Func, funcs: &[Func], has_memory: bool) -> Func {
     let nvals = s.num_values as usize;
 
     // Per-value types (for the threaded parameters) and definition blocks.
-    let types_local = func_value_types(f, funcs, has_memory);
+    let types_local = func_value_types(f, funcs, types, has_memory);
     let mut gtype = vec![ValType::I32; nvals];
     for (vals, tys) in s.values.iter().zip(types_local.iter()) {
         for (&g, &ty) in vals.iter().zip(tys.iter()) {
@@ -139,7 +139,7 @@ pub fn licm(f: &Func, funcs: &[Func], has_memory: bool) -> Func {
             if is_const(inst) {
                 const_def.insert(s.values[b][slot], inst.clone());
             }
-            slot += inst.result_count(&fn_results);
+            slot += inst.result_count(&fn_results, types);
         }
     }
     // inst_results[b][ii] and in_args[b][j] (all incoming args for parameter j of block b).
@@ -148,7 +148,7 @@ pub fn licm(f: &Func, funcs: &[Func], has_memory: bool) -> Func {
         let mut per = Vec::with_capacity(blk.insts.len());
         let mut slot = blk.params.len();
         for inst in &blk.insts {
-            let rc = inst.result_count(&fn_results);
+            let rc = inst.result_count(&fn_results, types);
             per.push(s.values[b][slot..slot + rc].to_vec());
             slot += rc;
         }

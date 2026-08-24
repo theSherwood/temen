@@ -795,10 +795,13 @@ unsafe fn jit_native_op(
             let funcs = host
                 .jit_unit_funcs(compiled.domain, compiled.unit)
                 .expect("unit was just stored");
+            let types = host
+                .jit_unit_types(compiled.domain, compiled.unit)
+                .expect("unit was just stored");
             // SAFETY: `cm` is the in-flight run's CompiledModule (jit_cap_run registered it);
             // the guest is suspended in this synchronous cap.call, so this transient re-entry
             // aliases no live reference (run_raw's contract).
-            match (*cm).define_extra(&funcs) {
+            match (*cm).define_extra(&funcs, &types) {
                 Ok(defs) => {
                     // The unit entry (func 0): trampoline for `invoke`, natural code + type_id
                     // for B2 `install` into the call_indirect table.
@@ -980,9 +983,12 @@ unsafe fn jit_native_op(
             let funcs = host
                 .jit_unit_funcs(compiled.domain, compiled.unit)
                 .expect("unit was just stored");
+            let types = host
+                .jit_unit_types(compiled.domain, compiled.unit)
+                .expect("unit was just stored");
             // SAFETY: identical contract to op 0 — `cm` is the in-flight run's CompiledModule and
             // the guest is suspended in this synchronous cap.call, so the re-entry aliases nothing.
-            match (*cm).define_extra(&funcs) {
+            match (*cm).define_extra(&funcs, &types) {
                 Ok(defs) => {
                     let d = defs[0];
                     host.set_jit_unit_native(
@@ -1283,7 +1289,7 @@ pub fn grant_jit_durable(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
     // in `temen-durable`; the TCB `Host` only stores the data and calls the predicate.
     host.set_jit_durable_gate(
         temen_durable::unit_suspends_untainted,
-        temen_durable::tainted_signatures_of(&m.funcs),
+        temen_durable::tainted_signatures_of(&m.funcs, &m.types),
     );
     host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), table_log2)
 }
@@ -1499,7 +1505,8 @@ pub fn recompact_into(
         let Some(funcs) = host.jit_unit_funcs(domain, unit) else {
             continue; // no IR retained (cannot happen for a compiled unit) — skip defensively
         };
-        let defs = fresh.define_extra(&funcs)?;
+        let types = host.jit_unit_types(domain, unit).unwrap_or_default();
+        let defs = fresh.define_extra(&funcs, &types)?;
         let d = defs[0];
         host.set_jit_unit_native(domain, unit, d.tramp as usize, d.code as usize, d.type_id);
         if let Some(slots) = code_to_slots.get(&(old_install_code as u64)) {
@@ -1556,7 +1563,8 @@ pub fn reconstruct_jit_units(
             let Some(funcs) = host.jit_unit_funcs(domain, unit) else {
                 continue; // no IR retained (cannot happen for a restored unit) — skip defensively
             };
-            let defs = cm.define_extra(&funcs)?;
+            let types = host.jit_unit_types(domain, unit).unwrap_or_default();
+            let defs = cm.define_extra(&funcs, &types)?;
             let d = defs[0];
             host.set_jit_unit_native(domain, unit, d.tramp as usize, d.code as usize, d.type_id);
         }
@@ -1885,13 +1893,15 @@ pub unsafe extern "C" fn module_resolver(
 ) -> i32 {
     let host = &*(ctx as *const Host);
     match host.resolve_module_parts(handle) {
-        Some((funcs, n_funcs, memory_log2, data, n_data)) => {
+        Some((funcs, n_funcs, memory_log2, data, n_data, types, n_types)) => {
             *out = temen_jit::ResolvedModule {
                 funcs,
                 n_funcs,
                 memory_log2,
                 data,
                 n_data,
+                types,
+                n_types,
             };
             1
         }
@@ -4710,6 +4720,9 @@ impl IfaceShape {
 #[derive(Clone)]
 struct OfferBinding {
     funcs: Arc<[temen_ir::Func]>,
+    /// #922 — the offering module's type section, so `wire_offer_func` can carry it into the
+    /// minted offer entry (the offer's residual funcs reference interned call type indices).
+    types: Arc<[temen_ir::TypeEntry]>,
     ops: Arc<[u32]>,
     op: u32,
     /// §3.2 v2: `Some` = an **instanced** offer ([`HostCap::offer_proc`]) — the provider
@@ -4897,6 +4910,7 @@ impl HostCap {
             unbound: false,
             offer: Some(OfferBinding {
                 funcs: provider.funcs.clone().into(),
+                types: provider.types.clone().into(),
                 ops: e.ops.clone().into(),
                 op,
                 provider: None,
@@ -4956,6 +4970,7 @@ impl HostCap {
             unbound: false,
             offer: Some(OfferBinding {
                 funcs: provider.funcs.clone().into(),
+                types: provider.types.clone().into(),
                 ops: e.ops.clone().into(),
                 op,
                 provider: Some(Arc::new(provider.clone())),
@@ -5761,7 +5776,7 @@ impl Instance {
                             // §3.2 v2 instanced offer: a fresh provider instance from the
                             // module's initial image, per host — backends stay in lockstep.
                             Some(m) => h.wire_offer_proc_with_policy(m, &off.ops, off.policy),
-                            None => h.wire_offer_func(&off.funcs, &off.ops),
+                            None => h.wire_offer_func(&off.funcs, &off.types, &off.ops),
                         }
                         .expect("offer validated at instantiation");
                         h.register_cap_name(name, handle);

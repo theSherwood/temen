@@ -182,6 +182,31 @@ const REF_NULL: i32 = -1;
 /// cell only governs the `size`/`grow` *return values*; an access past the reserved span traps under
 /// Temen's trap-confinement (matching wasm's out-of-bounds trap). A module that never grows is unchanged
 /// (no cell, the tight initial-sized window, `memory.size` a constant).
+/// Intern `ft` into the module **type section** (#922), returning its index. Idempotent: an equal
+/// `TypeEntry::Func` already present is reused, so id-equality coincides with structural equality —
+/// exactly what the call variants' interned type index requires.
+fn intern_func_type(types: &mut Vec<temen_ir::TypeEntry>, ft: &FuncType) -> u32 {
+    if let Some(i) = types
+        .iter()
+        .position(|e| matches!(e, temen_ir::TypeEntry::Func(f) if f == ft))
+    {
+        return i as u32;
+    }
+    types.push(temen_ir::TypeEntry::Func(ft.clone()));
+    (types.len() - 1) as u32
+}
+
+/// The type-section index of `ft` (#922 lowering side). The section is pre-interned with every call
+/// signature before lowering, so a miss is impossible on a well-formed transpile; `0` is a fail-safe
+/// fallback (the verifier would reject a wrong index anyway).
+fn func_type_index(types: &[temen_ir::TypeEntry], ft: &FuncType) -> u32 {
+    types
+        .iter()
+        .position(|e| matches!(e, temen_ir::TypeEntry::Func(f) if f == ft))
+        .map(|i| i as u32)
+        .unwrap_or(0)
+}
+
 pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     // Fail-closed on malformed / invalid wasm *before* any lowering. The lowering pass below indexes
     // attacker-controlled type/function/global/local/table/branch indices and derives operand-stack
@@ -619,6 +644,19 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
         .iter()
         .map(|&ti| types[ti as usize].clone())
         .collect();
+    // #922: pre-intern every wasm-declared signature into the module type section, so a
+    // `call_indirect`/`return_call_indirect` site (which references a wasm type index) and every
+    // `call.import` sig resolve to a stable type-section index during lowering — no mutation of the
+    // section is needed mid-lowering. Import sigs are already interned above; this adds the rest.
+    for (p, r) in &types {
+        intern_func_type(
+            &mut manifest_types,
+            &FuncType {
+                params: p.clone(),
+                results: r.clone(),
+            },
+        );
+    }
     // Collect debug locations whenever any embedded DWARF is present (source lines *or* variables).
     let want_locs = !debug_blobs.is_empty();
     // Global `(code-relative offset, func, block, inst)` map for the DWARF→IR pc resolution below,
@@ -633,6 +671,7 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             &ty.0,
             &ty.1,
             &types,
+            &manifest_types,
             &func_sigs,
             &globals_types,
             globals_base,
@@ -1213,6 +1252,10 @@ struct Lower<'a> {
     reachable: bool,
     control: Vec<Frame>,
     types: &'a [(Vec<ValType>, Vec<ValType>)],
+    /// The module **type section** (#922), pre-interned with every call signature: a `call.import` /
+    /// `call_indirect` / `return_call_indirect` resolves its `FuncType` to a stable index here (see
+    /// [`func_type_index`]) instead of carrying the signature inline.
+    type_section: &'a [temen_ir::TypeEntry],
     /// Per-function signatures by function index (for `call`). No imports, so wasm function index =
     /// our `Module` function index.
     func_sigs: &'a [(Vec<ValType>, Vec<ValType>)],
@@ -1556,6 +1599,7 @@ fn lower_func(
     params: &[ValType],
     results: &[ValType],
     types: &[(Vec<ValType>, Vec<ValType>)],
+    type_section: &[temen_ir::TypeEntry],
     func_sigs: &[(Vec<ValType>, Vec<ValType>)],
     global_types: &[ValType],
     globals_base: u64,
@@ -1604,6 +1648,7 @@ fn lower_func(
         reachable: true,
         control: Vec::new(),
         types,
+        type_section,
         func_sigs,
         global_types,
         globals_base,
@@ -2182,10 +2227,11 @@ fn call_op(lo: &mut Lower, func: u32) -> Result<(), Error> {
         }
         args.reverse(); // stack top is the last argument
         let results = sig.results.clone();
+        let sig_idx = func_type_index(lo.type_section, &sig); // #922: interned type index
         let inst = Inst::CallImport {
             import: slot,
             op: 0,
-            sig,
+            sig: sig_idx,
             args,
         };
         let res = lo.emit_call(inst, results.len());
@@ -2308,10 +2354,13 @@ fn call_indirect_op(lo: &mut Lower, type_index: u32, table_index: u32) -> Result
         args.push(lo.pop()?.0);
     }
     args.reverse();
-    let ty = FuncType {
-        params: params.clone(),
-        results: results.clone(),
-    };
+    let ty = func_type_index(
+        lo.type_section,
+        &FuncType {
+            params: params.clone(),
+            results: results.clone(),
+        },
+    ); // #922: interned type index
     let res = lo.emit_call(
         Inst::CallIndirect {
             ty,
@@ -2391,7 +2440,7 @@ fn return_call_indirect_op(lo: &mut Lower, type_index: u32, table_index: u32) ->
         args.push(lo.pop()?.0);
     }
     args.reverse();
-    let ty = FuncType { params, results };
+    let ty = func_type_index(lo.type_section, &FuncType { params, results }); // #922: interned index
     lo.set_term(Terminator::ReturnCallIndirect {
         ty,
         idx: funcref,

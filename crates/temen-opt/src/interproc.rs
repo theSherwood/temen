@@ -17,7 +17,7 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
-use temen_ir::{Block, Export, Func, FuncIdx, FuncType, Inst, Module, Terminator, ValType};
+use temen_ir::{Block, Export, Func, FuncIdx, Inst, Module, Terminator, ValType};
 use temen_verify::func_value_types;
 
 use crate::{each_operand, get, map_operands, map_term_operands, Known};
@@ -243,6 +243,7 @@ fn inline_single_block_call(
     call_idx: usize,
     callee: &Block,
     fn_results: &[usize],
+    types: &[temen_ir::TypeEntry],
 ) -> Block {
     let p = caller.params.len() as u32;
 
@@ -251,10 +252,10 @@ fn inline_single_block_call(
     let mut n = p;
     for inst in &caller.insts {
         result_start.push(n);
-        n += inst.result_count(fn_results) as u32;
+        n += inst.result_count(fn_results, types) as u32;
     }
     let base_c = result_start[call_idx];
-    let rc = caller.insts[call_idx].result_count(fn_results) as u32;
+    let rc = caller.insts[call_idx].result_count(fn_results, types) as u32;
     let args: Vec<u32> = match &caller.insts[call_idx] {
         Inst::Call { args, .. } => args.clone(),
         _ => unreachable!("call site must be a direct call"),
@@ -275,7 +276,7 @@ fn inline_single_block_call(
         map_operands(&mut inst, &mut |o| {
             map[o as usize].expect("operand defined before use")
         });
-        let rcount = caller.insts[i].result_count(fn_results) as u32;
+        let rcount = caller.insts[i].result_count(fn_results, types) as u32;
         for r in 0..rcount {
             map[(result_start[i] + r) as usize] = Some(*next);
             *next += 1;
@@ -292,7 +293,7 @@ fn inline_single_block_call(
     let mut cn = cp as u32;
     for inst in &callee.insts {
         c_result_start.push(cn);
-        cn += inst.result_count(fn_results) as u32;
+        cn += inst.result_count(fn_results, types) as u32;
     }
     let mut cmap: Vec<u32> = vec![0; cn as usize];
     for (j, cslot) in cmap.iter_mut().enumerate().take(cp) {
@@ -301,7 +302,7 @@ fn inline_single_block_call(
     for (ci, inst) in callee.insts.iter().enumerate() {
         let mut inst = inst.clone();
         map_operands(&mut inst, &mut |o| cmap[o as usize]);
-        let rcount = callee.insts[ci].result_count(fn_results) as u32;
+        let rcount = callee.insts[ci].result_count(fn_results, types) as u32;
         for r in 0..rcount {
             cmap[(c_result_start[ci] + r) as usize] = next;
             next += 1;
@@ -462,6 +463,7 @@ fn inline_multi_block_call(
     call_idx: usize,
     callee: &Func,
     fn_results: &[usize],
+    types: &[temen_ir::TypeEntry],
     caller_block_types: &[ValType],
 ) -> Vec<Block> {
     let b = &caller.blocks[bi];
@@ -472,10 +474,10 @@ fn inline_multi_block_call(
     let mut n = p;
     for inst in &b.insts {
         result_start.push(n);
-        n += inst.result_count(fn_results) as u32;
+        n += inst.result_count(fn_results, types) as u32;
     }
     let base_c = result_start[call_idx];
-    let rc = b.insts[call_idx].result_count(fn_results) as u32;
+    let rc = b.insts[call_idx].result_count(fn_results, types) as u32;
     let call_args: Vec<u32> = match &b.insts[call_idx] {
         Inst::Call { args, .. } => args.clone(),
         _ => unreachable!("call site must be a direct call"),
@@ -552,7 +554,7 @@ fn inline_multi_block_call(
     for i in (call_idx + 1)..b.insts.len() {
         let mut inst = b.insts[i].clone();
         map_operands(&mut inst, &mut |o| map[o as usize]);
-        let rcount = b.insts[i].result_count(fn_results) as u32;
+        let rcount = b.insts[i].result_count(fn_results, types) as u32;
         for r in 0..rcount {
             map[(result_start[i] + r) as usize] = next_cont;
             next_cont += 1;
@@ -585,6 +587,7 @@ fn inline_multi_block_call(
 /// [`dead_func_elim`]. Debug info is dropped once anything is inlined (instruction positions shift).
 pub fn inline_calls(m: &Module) -> Module {
     let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
+    let types = &m.types;
     let has_memory = m.memory.is_some();
     let mut funcs = m.funcs.clone();
     let mut budget = INLINE_INSN_BUDGET;
@@ -617,11 +620,16 @@ pub fn inline_calls(m: &Module) -> Module {
         if funcs[callee].blocks.len() == 1 {
             // Straight-line callee: splice its body in place (no new blocks, no threading).
             let callee_block = funcs[callee].blocks[0].clone();
-            funcs[ci].blocks[bi] =
-                inline_single_block_call(&funcs[ci].blocks[bi], ii, &callee_block, &fn_results);
+            funcs[ci].blocks[bi] = inline_single_block_call(
+                &funcs[ci].blocks[bi],
+                ii,
+                &callee_block,
+                &fn_results,
+                types,
+            );
         } else {
             // Callee has internal control flow: splice its CFG in, threading captured values through.
-            let block_types = func_value_types(&funcs[ci], &funcs, has_memory);
+            let block_types = func_value_types(&funcs[ci], &funcs, types, has_memory);
             let callee_fn = funcs[callee].clone();
             funcs[ci].blocks = inline_multi_block_call(
                 &funcs[ci],
@@ -629,6 +637,7 @@ pub fn inline_calls(m: &Module) -> Module {
                 ii,
                 &callee_fn,
                 &fn_results,
+                types,
                 &block_types[bi],
             );
         }
@@ -723,10 +732,14 @@ impl Cp {
 /// Per block-local value, the constant it statically holds here — like [`crate::block_consts`] but a
 /// `ref.func` counts as its funcidx (a funcref **is** its index; the identity table), so a constant
 /// funcref flows through the analysis as an `i32` and can resolve a `call_indirect`.
-fn block_knowns(b: &Block, fn_results: &[usize]) -> Vec<Option<Known>> {
+fn block_knowns(
+    b: &Block,
+    fn_results: &[usize],
+    types: &[temen_ir::TypeEntry],
+) -> Vec<Option<Known>> {
     let mut k = vec![None; b.params.len()];
     for inst in &b.insts {
-        let rc = inst.result_count(fn_results);
+        let rc = inst.result_count(fn_results, types);
         if rc == 1 {
             k.push(match inst {
                 Inst::RefFunc { func } => Some(Known::I32(*func as i32)),
@@ -773,6 +786,7 @@ pub fn const_prop(m: &Module) -> Module {
         return m.clone();
     }
     let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
+    let types = &m.types;
 
     // Parameters we cannot fully see are seeded `Top`.
     let mut opaque = vec![false; n];
@@ -822,10 +836,14 @@ pub fn const_prop(m: &Module) -> Module {
         }
     };
     // The target of an indirect call whose index resolves to a signature-matching constant funcref.
-    let target = |cp: Cp, ty: &FuncType| -> Option<usize> {
+    // `ty` is an interned `types` index (FuncType interning, #922); resolve it to the signature.
+    let target = |cp: Cp, ty: u32| -> Option<usize> {
+        let Some(temen_ir::TypeEntry::Func(ft)) = m.types.get(ty as usize) else {
+            return None;
+        };
         if let Cp::Const(Known::I32(g)) = cp {
             let g = g as usize;
-            if g < n && m.funcs[g].params == ty.params && m.funcs[g].results == ty.results {
+            if g < n && m.funcs[g].params == ft.params && m.funcs[g].results == ft.results {
                 return Some(g);
             }
         }
@@ -839,7 +857,7 @@ pub fn const_prop(m: &Module) -> Module {
             let np = caller.params.len();
             for (bi, b) in caller.blocks.iter().enumerate() {
                 let fp = if bi == 0 { np } else { 0 };
-                let knowns = block_knowns(b, &fn_results);
+                let knowns = block_knowns(b, &fn_results, types);
                 // Collect (callee, arg-lattice-values) for every call this block makes, reading `val`.
                 let mut feeds: Vec<(usize, Vec<Cp>)> = Vec::new();
                 let mut push = |callee: usize, args: &[u32], val: &[Vec<Cp>]| {
@@ -853,7 +871,7 @@ pub fn const_prop(m: &Module) -> Module {
                     match inst {
                         Inst::Call { func, args } => push(*func as usize, args, &val),
                         Inst::CallIndirect { ty, idx, args } => {
-                            if let Some(g) = target(eval(&val, ci, fp, &knowns, *idx), ty) {
+                            if let Some(g) = target(eval(&val, ci, fp, &knowns, *idx), *ty) {
                                 push(g, args, &val);
                             }
                         }
@@ -863,7 +881,7 @@ pub fn const_prop(m: &Module) -> Module {
                 match &b.term {
                     Terminator::ReturnCall { func, args } => push(*func as usize, args, &val),
                     Terminator::ReturnCallIndirect { ty, idx, args } => {
-                        if let Some(g) = target(eval(&val, ci, fp, &knowns, *idx), ty) {
+                        if let Some(g) = target(eval(&val, ci, fp, &knowns, *idx), *ty) {
                             push(g, args, &val);
                         }
                     }
@@ -899,7 +917,7 @@ pub fn const_prop(m: &Module) -> Module {
         let np = caller.params.len();
         for (bi, b) in caller.blocks.iter().enumerate() {
             let fp = if bi == 0 { np } else { 0 };
-            let knowns = block_knowns(b, &fn_results);
+            let knowns = block_knowns(b, &fn_results, types);
             let idx_top = |idx: u32| eval(&val, ci, fp, &knowns, idx) == Cp::Top;
             for inst in &b.insts {
                 if let Inst::CallIndirect { idx, .. } = inst {
@@ -962,10 +980,15 @@ pub fn const_prop(m: &Module) -> Module {
 /// (a funcref **is** its funcidx) or an in-range `ConstI32` (a funcref is a plain `i32`; the identity
 /// table). Parameters, out-of-range constants, and everything else are `None`. Same block-local
 /// forward scan as [`crate::block_consts`], specialized to funcref constants.
-fn block_funcrefs(b: &Block, fn_results: &[usize], num_funcs: usize) -> Vec<Option<u32>> {
+fn block_funcrefs(
+    b: &Block,
+    fn_results: &[usize],
+    types: &[temen_ir::TypeEntry],
+    num_funcs: usize,
+) -> Vec<Option<u32>> {
     let mut known: Vec<Option<u32>> = vec![None; b.params.len()];
     for inst in &b.insts {
-        let rc = inst.result_count(fn_results);
+        let rc = inst.result_count(fn_results, types);
         if rc == 1 {
             known.push(match *inst {
                 Inst::RefFunc { func } => Some(func),
@@ -986,10 +1009,20 @@ fn block_funcrefs(b: &Block, fn_results: &[usize], num_funcs: usize) -> Vec<Opti
 /// (and, on a signature mismatch or out-of-range index, **traps**) exactly as before. Direct-calling a
 /// signature-mismatched target would run the wrong function instead of trapping, so the sig check is
 /// load-bearing for soundness, not just an optimization guard.
-fn resolve_devirt(known: &[Option<u32>], idx: u32, ty: &FuncType, funcs: &[Func]) -> Option<u32> {
+fn resolve_devirt(
+    known: &[Option<u32>],
+    idx: u32,
+    ty: u32,
+    types: &[temen_ir::TypeEntry],
+    funcs: &[Func],
+) -> Option<u32> {
     let k = known.get(idx as usize).copied().flatten()?;
     let f = funcs.get(k as usize)?;
-    (f.params == ty.params && f.results == ty.results).then_some(k)
+    // `ty` is an interned `types` index (FuncType interning, #922); resolve to the signature.
+    let temen_ir::TypeEntry::Func(ft) = types.get(ty as usize)? else {
+        return None;
+    };
+    (f.params == ft.params && f.results == ft.results).then_some(k)
 }
 
 /// **Constant-funcref devirtualization.** Rewrite a `call_indirect` / `return_call_indirect` whose
@@ -1006,16 +1039,17 @@ fn resolve_devirt(known: &[Option<u32>], idx: u32, ty: &FuncType, funcs: &[Func]
 /// traps identically. Debug info is dropped on any rewrite (an instruction changed).
 pub fn devirtualize(m: &Module) -> Module {
     let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
+    let types = &m.types;
     let num_funcs = m.funcs.len();
     let mut funcs = m.funcs.clone();
     let mut changed = false;
 
     for f in &mut funcs {
         for b in &mut f.blocks {
-            let known = block_funcrefs(b, &fn_results, num_funcs);
+            let known = block_funcrefs(b, &fn_results, types, num_funcs);
             for inst in &mut b.insts {
                 let repl = if let Inst::CallIndirect { ty, idx, args } = inst {
-                    resolve_devirt(&known, *idx, ty, &m.funcs).map(|k| Inst::Call {
+                    resolve_devirt(&known, *idx, *ty, types, &m.funcs).map(|k| Inst::Call {
                         func: k,
                         args: core::mem::take(args),
                     })
@@ -1028,7 +1062,7 @@ pub fn devirtualize(m: &Module) -> Module {
                 }
             }
             let repl = if let Terminator::ReturnCallIndirect { ty, idx, args } = &mut b.term {
-                resolve_devirt(&known, *idx, ty, &m.funcs).map(|k| Terminator::ReturnCall {
+                resolve_devirt(&known, *idx, *ty, types, &m.funcs).map(|k| Terminator::ReturnCall {
                     func: k,
                     args: core::mem::take(args),
                 })

@@ -148,7 +148,10 @@ fn run(guest_src: &str, unit_src: &str, mode: Mode) -> Result<Vec<Value>, Trap> 
                 // value a codegen host writes to the emitted unit's `"mapped"` global).
                 assert_eq!(mapped, Some(1u64 << 16), "fully-mapped guest window extent");
                 match mode {
-                    Mode::Interp => vcpu.deliver_jit_invoke(resolve_unit(handle, code)),
+                    Mode::Interp => vcpu.deliver_jit_invoke(
+                        resolve_unit(handle, code),
+                        Arc::from(unit_m.types.clone()), // #922: the invoked unit's type section
+                    ),
                     Mode::Codegen => {
                         // Authority still resolves through the powerbox (a forged handle must trap
                         // identically); then run the unit standalone over argv — what emitted `f0` computes.

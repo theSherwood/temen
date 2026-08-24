@@ -393,7 +393,7 @@ fn frame_value_types(v: &VCpu, frame: &Frame) -> Vec<ValType> {
         return Vec::new();
     }
     match v.funcs.get(frame.func as usize) {
-        Some(f) => temen_verify::func_value_types(f, &v.funcs, v.mem.is_some())
+        Some(f) => temen_verify::func_value_types(f, &v.funcs, &v.types, v.mem.is_some())
             .into_iter()
             .nth(frame.block)
             .unwrap_or_default(),
@@ -692,6 +692,7 @@ struct SeekCheckpoint {
 #[derive(Clone)]
 struct SeekInit {
     funcs: Arc<[Func]>,
+    types: Arc<[temen_ir::TypeEntry]>,
     func: FuncIdx,
     args: Arc<[Value]>,
     fuel: u64,
@@ -889,6 +890,7 @@ impl Inspector {
         mut host: Host,
     ) -> Inspector {
         let funcs: Arc<[Func]> = m.funcs.to_vec().into();
+        let types: Arc<[temen_ir::TypeEntry]> = m.types.to_vec().into();
         let args: Arc<[Value]> = args.into();
         let data: Arc<[Data]> = m.data.clone().into();
         host.record_caps(); // W1: tape the cap inputs so `seek` can re-execute faithfully
@@ -896,6 +898,7 @@ impl Inspector {
         let shared = Arc::new(Mutex::new(DebugShared::new()));
         let root = Self::fresh_single_root(
             Arc::clone(&funcs),
+            Arc::clone(&types),
             func,
             &args,
             fuel,
@@ -914,6 +917,7 @@ impl Inspector {
             focus: None,
             seek_init: Some(SeekInit {
                 funcs,
+                types,
                 func,
                 args,
                 fuel,
@@ -935,6 +939,7 @@ impl Inspector {
     #[allow(clippy::too_many_arguments)]
     fn fresh_single_root(
         funcs: Arc<[Func]>,
+        types: Arc<[temen_ir::TypeEntry]>,
         func: FuncIdx,
         args: &[Value],
         fuel: u64,
@@ -956,6 +961,7 @@ impl Inspector {
         let dt = Arc::new(DomainTable::new(&funcs, 0));
         let mut root = VCpu::new(
             funcs,
+            types,
             func,
             args,
             mem,
@@ -1021,6 +1027,7 @@ impl Inspector {
         seed: Option<u64>,
     ) -> Inspector {
         let funcs: Arc<[Func]> = m.funcs.to_vec().into();
+        let types: Arc<[temen_ir::TypeEntry]> = m.types.to_vec().into();
         let args_arc: Arc<[Value]> = args.into();
         let data: Arc<[Data]> = m.data.clone().into();
         let schedule: Arc<[u64]> = schedule.into();
@@ -1030,6 +1037,7 @@ impl Inspector {
         let shared = Arc::new(Mutex::new(DebugShared::new()));
         let sched = Self::fresh_scheduled(
             Arc::clone(&funcs),
+            Arc::clone(&types),
             func,
             args,
             fuel,
@@ -1050,6 +1058,7 @@ impl Inspector {
             focus: None,
             seek_init: Some(SeekInit {
                 funcs,
+                types,
                 func,
                 args: args_arc,
                 fuel,
@@ -1073,6 +1082,7 @@ impl Inspector {
     #[allow(clippy::too_many_arguments)]
     fn fresh_scheduled(
         funcs: Arc<[Func]>,
+        types: Arc<[temen_ir::TypeEntry]>,
         func: FuncIdx,
         args: &[Value],
         fuel: u64,
@@ -1100,6 +1110,7 @@ impl Inspector {
             let dt = Arc::new(DomainTable::new(&funcs, 0));
             let mut root = VCpu::new(
                 Arc::clone(&funcs),
+                Arc::clone(&types),
                 func,
                 args,
                 mem,
@@ -1162,6 +1173,7 @@ impl Inspector {
             Some(schedule) => {
                 let mut sched = Self::fresh_scheduled(
                     init.funcs,
+                    init.types,
                     init.func,
                     &init.args,
                     init.fuel,
@@ -1229,6 +1241,7 @@ impl Inspector {
         };
         let mut root = Self::fresh_single_root(
             init.funcs.clone(),
+            init.types.clone(),
             init.func,
             &init.args,
             init.fuel,
@@ -1839,7 +1852,7 @@ pub fn run_with_host_traced(
         mm.seed_null_guard(temen_ir::module_null_guard(m).unwrap_or(0)); // #964
         mm
     });
-    drive(&m.funcs, func, args, fuel, &mut mem, host)
+    drive(&m.funcs, &m.types, func, args, fuel, &mut mem, host)
 }
 
 /// Host-carrying counterpart of [`run_fast`]: try the [`bytecode`] engine first, fall back to the
@@ -1907,19 +1920,29 @@ pub fn run_fast_traced(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64
 /// thread runs it to completion — so non-threaded runs pay no pool overhead.
 fn drive(
     funcs: &[Func],
+    types: &[temen_ir::TypeEntry],
     entry: FuncIdx,
     args: &[Value],
     fuel: &mut u64,
     mem: &mut Option<Mem>,
     host: &mut Host,
 ) -> TracedRun {
-    drive_arc(funcs.to_vec().into(), entry, args, fuel, mem, host)
+    drive_arc(
+        funcs.to_vec().into(),
+        types.to_vec().into(),
+        entry,
+        args,
+        fuel,
+        mem,
+        host,
+    )
 }
 
 /// [`drive`] over an already-shared function table — the §3.2 wired-offer dispatch reuses the
 /// offer's `Arc<[Func]>` verbatim instead of re-copying the table per call.
 fn drive_arc(
     funcs: Arc<[Func]>,
+    types: Arc<[temen_ir::TypeEntry]>,
     entry: FuncIdx,
     args: &[Value],
     fuel: &mut u64,
@@ -1947,10 +1970,13 @@ fn drive_arc(
     // table below can re-apply it. Empty for a fresh run (nothing installed), so it is a pure no-op
     // there; on a thaw it re-installs each captured unit at its slot, so a `call_indirect` through an
     // installed slot resolves after freeze/thaw. Install order is preserved (dense module ids).
-    let jit_reapply: Vec<(u32, Arc<[Func]>)> = host
+    let jit_reapply: Vec<(u32, Arc<[Func]>, Arc<[temen_ir::TypeEntry]>)> = host
         .jit_all_installs()
         .into_iter()
-        .filter_map(|(d, slot, unit)| host.jit_unit_funcs(d, unit).map(|f| (slot, f)))
+        .filter_map(|(d, slot, unit)| {
+            host.jit_unit_funcs(d, unit)
+                .and_then(|f| host.jit_unit_types(d, unit).map(|t| (slot, f, t)))
+        })
         .collect();
     // §12.8 concurrent-thaw stage 1: a thaw restores the frozen window with the global **freeze** word
     // still `UNWINDING` (the artifact froze there), while the per-context **thaw** word now carries the
@@ -2029,6 +2055,7 @@ fn drive_arc(
     let host_shared = Arc::new(Mutex::new(std::mem::take(host)));
     let r = drive_over_cell(
         funcs,
+        types,
         entry,
         args,
         fuel,
@@ -2068,6 +2095,7 @@ fn drive_arc(
 /// empty by construction.
 fn drive_arc_shared(
     funcs: Arc<[Func]>,
+    types: Arc<[temen_ir::TypeEntry]>,
     entry: FuncIdx,
     args: &[Value],
     fuel: &mut u64,
@@ -2082,10 +2110,13 @@ fn drive_arc_shared(
         let h = cell.lock_unpoisoned();
         // Install-durability (§12.5): a provider cell with B2-installed units gets them re-applied
         // onto the sub-run's fresh dispatch table, exactly as the by-value wrapper does.
-        let reapply: Vec<(u32, Arc<[Func]>)> = h
+        let reapply: Vec<(u32, Arc<[Func]>, Arc<[temen_ir::TypeEntry]>)> = h
             .jit_all_installs()
             .into_iter()
-            .filter_map(|(d, slot, unit)| h.jit_unit_funcs(d, unit).map(|f| (slot, f)))
+            .filter_map(|(d, slot, unit)| {
+                h.jit_unit_funcs(d, unit)
+                    .and_then(|f| h.jit_unit_types(d, unit).map(|t| (slot, f, t)))
+            })
             .collect();
         (
             h.quota(),
@@ -2107,6 +2138,7 @@ fn drive_arc_shared(
     }
     drive_over_cell(
         funcs,
+        types,
         entry,
         args,
         fuel,
@@ -2135,6 +2167,7 @@ fn drive_arc_shared(
 #[allow(clippy::too_many_arguments)]
 fn drive_over_cell(
     funcs: Arc<[Func]>,
+    types: Arc<[temen_ir::TypeEntry]>,
     entry: FuncIdx,
     args: &[Value],
     fuel: &mut u64,
@@ -2151,7 +2184,7 @@ fn drive_over_cell(
     thaw_child_state: Vec<FrozenChildState>,
     thaw_root_sp: Option<u64>,
     handoff: bool,
-    jit_reapply: Vec<(u32, Arc<[Func]>)>,
+    jit_reapply: Vec<(u32, Arc<[Func]>, Arc<[temen_ir::TypeEntry]>)>,
 ) -> TracedRun {
     // CALLS.md 4d — copy the root domain's direct-handoff knob into the run-global scheduler flag.
     let sched = {
@@ -2266,11 +2299,12 @@ fn drive_over_cell(
         // occupancy onto the fresh table, in install order, so a thawed `call_indirect` resolves. A
         // no-op for a fresh run (`jit_reapply` empty). `jit_table_log2` was restored from the
         // artifact on thaw, so the padding these slots land in exists.
-        for (slot, unit_funcs) in &jit_reapply {
-            dt.install_at(*slot, Arc::clone(unit_funcs));
+        for (slot, unit_funcs, unit_types) in &jit_reapply {
+            dt.install_at(*slot, Arc::clone(unit_funcs), Arc::clone(unit_types));
         }
         let mut root = Box::new(VCpu::new(
             Arc::clone(&funcs),
+            Arc::clone(&types),
             entry,
             args,
             mem.take(),
@@ -2358,6 +2392,7 @@ fn drive_over_cell(
                 let child_mem = root.mem.as_ref().map(|m| m.fork_for_thread());
                 let mut child = Box::new(VCpu::new(
                     Arc::clone(&funcs),
+                    Arc::clone(&types),
                     ff.func as FuncIdx,
                     &[
                         Value::I64(ff.args.first().copied().unwrap_or(0)),
@@ -2490,6 +2525,10 @@ fn drive_over_cell(
                     None => Some(Arc::clone(&funcs)),
                     Some(d) => host_shared.lock_unpoisoned().module_by_digest(&d),
                 };
+                let ctypes = match fnr.module_digest {
+                    None => Some(Arc::clone(&types)),
+                    Some(d) => host_shared.lock_unpoisoned().module_types_by_digest(&d),
+                }; // (#922)
                 let Some(cfuncs) = cfuncs else {
                     if parent == id {
                         while root.threads.len() <= fnr.slot {
@@ -2502,9 +2541,12 @@ fn drive_over_cell(
                     }
                     continue;
                 };
-                // Flip the child's carve from its frozen phase to a thaw: clear its own global
-                // freeze word and set its context-0 thaw word — `begin_thaw`, at the **absolute**
-                // carve offset (the carve rides the root image at any depth).
+                // The child's type section pairs with its funcs (same digest lookup); a missing
+                // one is an empty section (the funcs unwrap above already gated the real absence).
+                let ctypes = ctypes.unwrap_or_else(|| Arc::from(Vec::new())); // (#922)
+                                                                              // Flip the child's carve from its frozen phase to a thaw: clear its own global
+                                                                              // freeze word and set its context-0 thaw word — `begin_thaw`, at the **absolute**
+                                                                              // carve offset (the carve rides the root image at any depth).
                 if let Some(m) = root.mem.as_mut() {
                     let _ = m.write_bytes(abs_carve + STATE_OFF, &STATE_NORMAL.to_le_bytes());
                     let _ = m.write_bytes(
@@ -2591,6 +2633,7 @@ fn drive_over_cell(
                 holder_hosts.push((cid, Arc::clone(&child_host)));
                 let mut child = Box::new(VCpu::new(
                     Arc::clone(&cfuncs),
+                    Arc::clone(&ctypes),
                     fnr.entry,
                     &child_args,
                     child_mem,
@@ -2738,7 +2781,7 @@ pub fn run_capture_reserved(
         mm.seed_null_guard(temen_ir::module_null_guard(m).unwrap_or(0)); // #964
         mm
     });
-    let (r, ..) = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
+    let (r, ..) = drive(&m.funcs, &m.types, func, args, fuel, &mut mem, &mut host);
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot(init_mem.len() as u64))
@@ -2776,7 +2819,7 @@ pub fn run_capture_reserved_with_host(
         mm.seed_null_guard(temen_ir::module_null_guard(m).unwrap_or(0)); // #964
         mm
     });
-    let (r, ..) = drive(&m.funcs, func, args, fuel, &mut mem, host);
+    let (r, ..) = drive(&m.funcs, &m.types, func, args, fuel, &mut mem, host);
     // Snapshot past the backed prefix to also cover reserved-tail pages the guest grew (the §1a
     // growth path), matching the JIT's `_with_host` capture span so the escape-oracle byte-compares
     // them too.
@@ -2839,7 +2882,7 @@ pub fn run_capture_reserved_with_host_prots(
         }
         mm
     });
-    let (r, ..) = drive(&m.funcs, func, args, fuel, &mut mem, host);
+    let (r, ..) = drive(&m.funcs, &m.types, func, args, fuel, &mut mem, host);
     let (snap, prots) = mem
         .as_ref()
         .map(|mm| (mm.snapshot_window(SNAP_CAP), mm.snapshot_prots(SNAP_CAP)))
@@ -2875,7 +2918,7 @@ pub fn run_capture_sub(
         mm.seed_null_guard(temen_ir::module_null_guard(m).unwrap_or(0)); // #964
         mm
     });
-    let (r, ..) = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
+    let (r, ..) = drive(&m.funcs, &m.types, func, args, fuel, &mut mem, &mut host);
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot_parent(parent_bytes))
@@ -2900,6 +2943,7 @@ pub fn run_scheduled(
         return Err(Trap::Malformed);
     }
     let funcs: Arc<[Func]> = m.funcs.clone().into();
+    let types: Arc<[temen_ir::TypeEntry]> = m.types.clone().into();
     let mem = m.memory.map(|mc| {
         let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
         mm.init_data(&m.data);
@@ -2915,6 +2959,7 @@ pub fn run_scheduled(
         let dt = Arc::new(DomainTable::new(&funcs, 0)); // DPOR: no Jit install, natural table
         let root = Box::new(VCpu::new(
             funcs,
+            types,
             func,
             args,
             mem,
@@ -3456,11 +3501,13 @@ pub fn replay_schedule(
         return Err(Trap::Malformed);
     }
     let funcs: Arc<[Func]> = m.funcs.clone().into();
+    let types: Arc<[temen_ir::TypeEntry]> = m.types.clone().into();
     // The plan forces each scheduling choice (`Dpor::pick`); an empty `prior` is fine — sleep sets
     // only affect *exploration*, never a forced replay.
     let mut dpor = Dpor::new(plan.to_vec(), Vec::new());
     run_one_schedule(
         &funcs,
+        &types,
         &m.memory,
         &m.data,
         func,
@@ -3489,6 +3536,7 @@ fn explore_core(
         return (1, true);
     }
     let funcs: Arc<[Func]> = m.funcs.clone().into();
+    let types: Arc<[temen_ir::TypeEntry]> = m.types.clone().into();
 
     let mut stack: Vec<DporSlot> = Vec::new();
     let mut schedules = 0u64;
@@ -3502,6 +3550,7 @@ fn explore_core(
         let mut dpor = Dpor::new(plan, prior);
         let result = run_one_schedule(
             &funcs,
+            &types,
             &m.memory,
             &m.data,
             func,
@@ -3608,6 +3657,7 @@ pub fn explore_all_bruteforce(
         };
     }
     let funcs: Arc<[Func]> = m.funcs.clone().into();
+    let types: Arc<[temen_ir::TypeEntry]> = m.types.clone().into();
 
     let mut plan: Vec<usize> = Vec::new();
     let mut outcomes: Vec<Result<Vec<Value>, Trap>> = Vec::new();
@@ -3618,6 +3668,7 @@ pub fn explore_all_bruteforce(
         let mut choices = Choices::new(plan);
         let result = run_one_schedule(
             &funcs,
+            &types,
             &m.memory,
             &m.data,
             func,
@@ -3666,6 +3717,7 @@ pub fn explore_all_bruteforce(
 /// task's outcome.
 fn run_one_schedule(
     funcs: &Arc<[Func]>,
+    types: &Arc<[temen_ir::TypeEntry]>,
     memory: &Option<Memory>,
     data: &[Data],
     func: FuncIdx,
@@ -3689,6 +3741,7 @@ fn run_one_schedule(
         let dt = Arc::new(DomainTable::new(funcs, 0)); // DPOR: no Jit install, natural table
         let mut root = VCpu::new(
             Arc::clone(funcs),
+            Arc::clone(types),
             func,
             args,
             mem,
@@ -3802,6 +3855,10 @@ fn unpack_slot(w: u64) -> TableSlot {
 struct DomainTable {
     slots: Box<[AtomicU64]>,
     units: Mutex<Vec<Arc<[Func]>>>,
+    /// Per-installed-unit type section, kept in lockstep with `units` (FuncType interning, #922):
+    /// `unit_types[i]` is the type section of the unit installed as module `i + 1`, so a call
+    /// variant executed in that unit resolves its interned signature.
+    unit_types: Mutex<Vec<Arc<[temen_ir::TypeEntry]>>>,
 }
 
 impl DomainTable {
@@ -3826,6 +3883,7 @@ impl DomainTable {
         DomainTable {
             slots,
             units: Mutex::new(Vec::new()),
+            unit_types: Mutex::new(Vec::new()),
         }
     }
 
@@ -3845,13 +3903,14 @@ impl DomainTable {
     /// padding slot, returning the slot. `None` if every reserved slot is full. Writers serialize
     /// under the `units` lock (rare — only inside a synchronous `cap.call`, the guest suspended); the
     /// slot store is `Release` so the pushed unit is visible to any reader that observes the slot.
-    fn install(&self, unit: Arc<[Func]>) -> Option<u32> {
+    fn install(&self, unit: Arc<[Func]>, unit_types: Arc<[temen_ir::TypeEntry]>) -> Option<u32> {
         let mut units = self.units.lock_unpoisoned();
         let slot = self
             .slots
             .iter()
             .position(|s| (s.load(Ordering::Relaxed) >> 32) as u32 == TABLE_EMPTY)?;
         units.push(unit);
+        self.unit_types.lock_unpoisoned().push(unit_types); // lockstep (#922)
         let module = units.len() as u32; // module k ≡ units[k-1]
         self.slots[slot].store(pack_slot(module, 0), Ordering::Release);
         Some(slot as u32)
@@ -3864,13 +3923,14 @@ impl DomainTable {
     /// dense and each slot maps to its own re-applied unit. Out-of-range / real-function slots are a
     /// no-op (a forged captured slot can only mis-dispatch within the guest's own table — never
     /// escape — but stay defensive). Not on the concurrent hot path (run setup, before any vCPU).
-    fn install_at(&self, slot: u32, unit: Arc<[Func]>) {
+    fn install_at(&self, slot: u32, unit: Arc<[Func]>, unit_types: Arc<[temen_ir::TypeEntry]>) {
         let s = slot as usize;
         if s >= self.slots.len() {
             return;
         }
         let mut units = self.units.lock_unpoisoned();
         units.push(unit);
+        self.unit_types.lock_unpoisoned().push(unit_types); // lockstep (#922)
         let module = units.len() as u32; // module k ≡ units[k-1]
         self.slots[s].store(pack_slot(module, 0), Ordering::Release);
     }
@@ -3882,7 +3942,11 @@ impl DomainTable {
     /// own function `i`. `None` if fewer than `unit.len()` padding slots are free (matches the JIT's
     /// fail-closed). Deterministic: the first free slots in order, so both backends pick the same set
     /// from an identical table state. Serialized under the `units` lock like [`Self::install`].
-    fn install_unit_funcs(&self, unit: Arc<[Func]>) -> Option<Vec<u32>> {
+    fn install_unit_funcs(
+        &self,
+        unit: Arc<[Func]>,
+        unit_types: Arc<[temen_ir::TypeEntry]>,
+    ) -> Option<Vec<u32>> {
         let n = unit.len();
         let mut units = self.units.lock_unpoisoned();
         // CALLS.md 6a — dedup: a unit already installed (same `Arc`) reuses its slots. Repeat
@@ -3917,6 +3981,7 @@ impl DomainTable {
             return None;
         }
         units.push(unit);
+        self.unit_types.lock_unpoisoned().push(unit_types); // lockstep (#922)
         let module = units.len() as u32; // module k ≡ units[k-1]
         for (func, &slot) in free.iter().enumerate() {
             self.slots[slot].store(pack_slot(module, func as u32), Ordering::Release);
@@ -3943,6 +4008,10 @@ impl DomainTable {
     /// A clone of the installed-units prefix (Arc clones — cheap). A reader calls this only on a
     /// local-cache miss (a unit installed since its last sync); the `Mutex` acquire pairs with the
     /// `install` slot `Release` to make the pushed unit visible.
+    fn unit_types_snapshot(&self) -> Vec<Arc<[temen_ir::TypeEntry]>> {
+        self.unit_types.lock_unpoisoned().clone()
+    }
+
     fn units_snapshot(&self) -> Vec<Arc<[Func]>> {
         self.units.lock_unpoisoned().clone()
     }
@@ -3981,6 +4050,45 @@ fn resolve_module(
         *local_units = dt.units_snapshot(); // a unit installed since our last sync
     }
     local_units.get(i).cloned()
+}
+
+/// Resolve an interned call signature index (FuncType interning, #922) to its `FuncType`, against
+/// the running frame's module type section (`cur_types`). A verified module always names a `Func`
+/// entry here; a malformed one yields the empty signature (observed as zero args/results) rather
+/// than trapping in this hot path — the verifier is what rejects a bad index.
+static EMPTY_SIG: FuncType = FuncType {
+    params: Vec::new(),
+    results: Vec::new(),
+};
+fn call_sig(types: &[temen_ir::TypeEntry], sig: u32) -> &FuncType {
+    match types.get(sig as usize) {
+        Some(temen_ir::TypeEntry::Func(ft)) => ft,
+        _ => &EMPTY_SIG,
+    }
+}
+
+/// The type-section sibling of [`resolve_module`] (FuncType interning, #922): resolve the running
+/// frame's module id to its type section so a call variant's interned `sig` index resolves. Module
+/// 0 is the primary program, [`INVOKE_MODULE`] the transient invoked unit, `≥ 1` an installed unit
+/// (whose types ride `dt.unit_types`, kept in lockstep with `dt.units`).
+fn resolve_module_types(
+    types: &Arc<[temen_ir::TypeEntry]>,
+    local_unit_types: &mut Vec<Arc<[temen_ir::TypeEntry]>>,
+    invoked_types: &Option<Arc<[temen_ir::TypeEntry]>>,
+    dt: &DomainTable,
+    m: u32,
+) -> Option<Arc<[temen_ir::TypeEntry]>> {
+    if m == 0 {
+        return Some(Arc::clone(types));
+    }
+    if m == INVOKE_MODULE {
+        return invoked_types.clone();
+    }
+    let i = (m - 1) as usize;
+    if i >= local_unit_types.len() {
+        *local_unit_types = dt.unit_types_snapshot();
+    }
+    local_unit_types.get(i).cloned()
 }
 
 /// Resolve a `call_indirect` through the shared [`DomainTable`]: mask the guest index, one `Acquire`
@@ -4333,6 +4441,7 @@ const EXEC_ARGS_END: u64 = 16384;
 
 struct ExecReq {
     funcs: Arc<[Func]>,
+    types: Arc<[temen_ir::TypeEntry]>,
     data: Arc<[Data]>,
     entry: u64,
     child_size: u64,
@@ -6955,6 +7064,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             Step::Exec(req) => {
                 let ExecReq {
                     funcs,
+                    types,
                     data,
                     entry,
                     child_size,
@@ -6990,6 +7100,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 }
                 *v = VCpu::new(
                     funcs,
+                    types,
                     entry as FuncIdx,
                     &entry_args,
                     mem,
@@ -8682,6 +8793,13 @@ struct ChildMod {
 struct VCpu {
     /// The owned function table; `Frame::func` resolves against it.
     funcs: Arc<[Func]>,
+    /// This vCPU's primary program (module 0) type section — the home for every call variant's
+    /// interned signature (FuncType interning, #922). Resolved per running frame's module like
+    /// `funcs` (module 0 here; installed units carry their own, `invoked` its own).
+    types: Arc<[temen_ir::TypeEntry]>,
+    /// The type section of the transient `invoked` unit (module [`INVOKE_MODULE`]), paralleling
+    /// `invoked`; `Some` only for an invoke child (FuncType interning, #922).
+    invoked_types: Option<Arc<[temen_ir::TypeEntry]>>,
     /// The §12 fiber table — **shared by every vCPU of the domain** (root + `thread.spawn`
     /// children, D57 3b-i), so any vCPU can resume any fiber; the registry's claim is the
     /// single-owner arbiter. Nested §14 children / separate domains get a fresh registry.
@@ -8936,6 +9054,7 @@ impl VCpu {
     #[allow(clippy::too_many_arguments)]
     fn new(
         funcs: Arc<[Func]>,
+        types: Arc<[temen_ir::TypeEntry]>,
         entry: FuncIdx,
         args: &[Value],
         mem: Option<Mem>,
@@ -8949,6 +9068,8 @@ impl VCpu {
     ) -> VCpu {
         VCpu {
             funcs,
+            types,
+            invoked_types: None,
             registry: Arc::new(FiberRegistry::new()),
             chain: vec![ROOT_FIBER],
             cur: ROOT_FIBER,
@@ -9023,6 +9144,8 @@ impl VCpu {
     ) -> Box<VCpu> {
         Box::new(VCpu {
             funcs: Arc::clone(&self.funcs),
+            types: Arc::clone(&self.types),
+            invoked_types: self.invoked_types.clone(),
             registry: Arc::new(FiberRegistry::new()), // its own fiber table (a separate domain)
             chain: vec![ROOT_FIBER],
             cur: ROOT_FIBER,
@@ -9086,8 +9209,10 @@ impl VCpu {
     #[allow(clippy::too_many_arguments)]
     fn new_invoke(
         parent: Arc<[Func]>,
+        parent_types: Arc<[temen_ir::TypeEntry]>,
         dt: Arc<DomainTable>,
         unit: Arc<[Func]>,
+        unit_types: Arc<[temen_ir::TypeEntry]>,
         args: &[Value],
         mem: Option<Mem>,
         host: Arc<Mutex<Host>>,
@@ -9101,12 +9226,14 @@ impl VCpu {
         // func i — the interpreter mirror of the JIT's `define_extra` auto-install. `None` (no
         // `ref.func`, or too few reserved slots) leaves `ref.func` unremapped, exactly like the JIT.
         let invoked_ref_slots = if unit_uses_ref_func(&unit) {
-            dt.install_unit_funcs(unit.clone())
+            dt.install_unit_funcs(unit.clone(), unit_types.clone())
         } else {
             None
         };
         VCpu {
             funcs: parent,
+            types: parent_types,
+            invoked_types: Some(unit_types),
             registry: Arc::new(FiberRegistry::new()),
             chain: vec![ROOT_FIBER],
             cur: ROOT_FIBER,
@@ -9551,12 +9678,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     }
 
     let funcs = Arc::clone(&v.funcs); // module 0 (this vCPU's primary program), immutable for the run
+    let types = Arc::clone(&v.types); // module 0 type section (#922)
     let spawn_quota = v.quota; // §15 fiber/vCPU ceilings (distinct from the Instantiator's i64 fuel quota)
                                // `dt` is the **shared** domain table (atomic slots + the writer-locked installed
                                // units); reads off it are lock-free. `units` here is this vCPU's **local clone** of
                                // the installed-units prefix, refreshed lazily on a miss (`resolve_module`) so neither
                                // a running unit frame nor the `Jit.install` arm needs the shared lock on the hot loop.
     let VCpu {
+        types: _,      // module 0 type section — already cloned above (#922)
+        invoked_types, // the invoked unit's type section (module INVOKE_MODULE), if any
         registry,
         chain,
         cur,
@@ -9747,6 +9877,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     let mut cur_module = frames.last().map(|f| f.module).unwrap_or(0);
     let mut cur_funcs: Arc<[Func]> =
         resolve_module(&funcs, units, invoked, dt, cur_module).ok_or(Trap::Malformed)?;
+    // FuncType interning (#922): the running frame's module type section, resolved and cached
+    // exactly like `cur_funcs` so a call variant's interned `sig` index resolves. `local_unit_types`
+    // is this run's lazily-synced clone of the installed-unit type sections (the `dt.unit_types`
+    // sibling of `units`).
+    let mut local_unit_types: Vec<Arc<[temen_ir::TypeEntry]>> = Vec::new();
+    let mut cur_types: Arc<[temen_ir::TypeEntry]> =
+        resolve_module_types(&types, &mut local_unit_types, invoked_types, dt, cur_module)
+            .ok_or(Trap::Malformed)?;
 
     // I48 — fiber slots whose current resume used `cont.resume.block`, so a park inside them
     // idles the vCPU (via `fiber_park!`) instead of unwinding `FIBER_PARKED` to the resumer.
@@ -10013,9 +10151,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             {
                                                 Some((_, s_)) => s_.clone(),
                                                 None => {
-                                                    let s_ = dt.install_unit_funcs(
-                                                        entry_.funcs.clone(),
-                                                    );
+                                                    let s_ = dt.install_unit_funcs(entry_.funcs.clone(), entry_.types.clone());
                                                     unit_ref_cache.push((key_, s_.clone()));
                                                     s_
                                                 }
@@ -10149,6 +10285,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             cur_module = frames[top].module;
             cur_funcs =
                 resolve_module(&funcs, units, invoked, dt, cur_module).ok_or(Trap::Malformed)?;
+            cur_types =
+                resolve_module_types(&types, &mut local_unit_types, invoked_types, dt, cur_module)
+                    .ok_or(Trap::Malformed)?;
         }
         let fs: &[Func] = &cur_funcs;
         let block = fs
@@ -10450,20 +10589,25 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 ($h:expr, $args:expr) => {{
                     let ch =
                         get(&frames[top].vals, *$args.first().ok_or(Trap::Malformed)?)?.i64() as i32;
-                    let (domain, cu, unit_funcs) = {
+                    let (domain, cu, unit_funcs, unit_types) = {
                         let hg = host.lock_unpoisoned();
                         let domain = hg.resolve_jit_domain($h)?;
                         let (cd, cu) = hg.resolve_jit_code(ch)?;
                         if cd != domain {
                             return Err(Trap::CapFault);
                         }
-                        (domain, cu, hg.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?)
+                        (
+                            domain,
+                            cu,
+                            hg.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?,
+                            hg.jit_unit_types(cd, cu).ok_or(Trap::CapFault)?, // (#922)
+                        )
                     };
                     // Append the unit to the **shared** domain table (module id = its 1-based
                     // index) and fill the next empty slot — visible at once to every vCPU of the
                     // domain (DESIGN.md §22). The padding starts at `funcs.len()` on both backends,
                     // so the first install lands at the same index the JIT's `install` returns.
-                    let res = match dt.install(unit_funcs) {
+                    let res = match dt.install(unit_funcs, unit_types.clone()) {
                         Some(slot) => {
                             // Record the occupancy on the domain so it survives the run (the table is
                             // a per-run transient) and rides a snapshot (DURABILITY.md §12.5).
@@ -10504,7 +10648,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // handle-as-arg — e.g. the Instantiator's module ops), so read it as a slot.
                     let ch =
                         get(&frames[top].vals, *$args.first().ok_or(Trap::Malformed)?)?.i64() as i32;
-                    let unit_funcs = {
+                    let (unit_funcs, unit_types) = {
                         let hg = host.lock_unpoisoned();
                         let domain = hg.resolve_jit_domain($h)?;
                         let (cd, cu) = hg.resolve_jit_code(ch)?;
@@ -10512,7 +10656,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         if cd != domain {
                             return Err(Trap::CapFault);
                         }
-                        hg.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?
+                        // FuncType interning (#922): the unit's funcs + its type section.
+                        (
+                            hg.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?,
+                            hg.jit_unit_types(cd, cu).ok_or(Trap::CapFault)?,
+                        )
                     };
                     let entry = unit_funcs.first().ok_or(Trap::CapFault)?;
                     // Strict arity: the cap.call's declared signature must match the unit entry's
@@ -10542,8 +10690,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // recursion is bounded by the same stack-overflow bound as ordinary recursion.
                     let mut child = VCpu::new_invoke(
                         Arc::clone(&funcs),
+                        Arc::clone(&types), // parent_types = module 0 type section (#922)
                         Arc::clone(dt),
                         unit_funcs,
+                        unit_types, // the invoked unit's type section (#922)
                         &child_args,
                         child_mem,
                         Arc::clone(host),
@@ -10605,7 +10755,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         units,
                         invoked,
                         get_i32(&frames[top].vals, *idx)?,
-                        ty,
+                        call_sig(&cur_types, *ty),
                     )?;
                     let argv = collect(&frames[top].vals, args)?;
                     if depth as usize + *parked_frames + frames.len() > MAX_CALL_DEPTH as usize {
@@ -11096,6 +11246,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         || Arc::clone(&funcs),
                                         |cm| Arc::clone(&cm.funcs),
                                     );
+                                    let ctypes = child_mod.as_ref().map_or_else(
+                                        || Arc::clone(&types),
+                                        |cm| Arc::clone(&cm.types),
+                                    ); // (#922)
                                     let csched = sched.clone();
                                     // §4 subtree freeze (DURABILITY.md): the child's [`FrozenNested`]
                                     // residue must reach the **root** host, not the child's private
@@ -11145,6 +11299,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
                                         let mut child = VCpu::new(
                                             cfuncs,
+                                            ctypes,
                                             entry as u32,
                                             &child_args, // [Instantiator] or [Instantiator, AddressSpace]
                                             child_mem,
@@ -11510,6 +11665,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         _ => spawn_quota,
                                     };
                                     let cfuncs = Arc::clone(&cm.funcs);
+                                    let ctypes = Arc::clone(&cm.types); // child module type section (#922)
                                     let csched = sched.clone();
                                     let kflag = Arc::new(AtomicBool::new(false));
                                     let kflag_child = Arc::clone(&kflag);
@@ -11522,6 +11678,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
                                         let mut child = VCpu::new(
                                             cfuncs,
+                                            ctypes,
                                             entry as u32,
                                             &child_args,
                                             Some(fm),
@@ -11603,7 +11760,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     sig,
                 } => {
                     let h = get_i32(&frames[top].vals, *handle)?;
-                    jit_invoke_body!(h, args, sig)
+                    jit_invoke_body!(h, args, call_sig(&cur_types, *sig))
                 }
                 // §3.6 slices 2+3+5b — the service points. `svc.poll` (op 9) serves everything
                 // currently runnable and returns the count of *completed* dispatches;
@@ -11638,7 +11795,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // frame is a parked ancestor): probeable refusal — the serve loop
                             // is the domain's outermost dispatcher (re-entry into a domain is
                             // a fresh dispatch, never a nested drain).
-                            if !sig.results.is_empty() {
+                            if !call_sig(&cur_types, *sig).results.is_empty() {
                                 frames[top].vals.push(Reg::from_i64(EINVAL));
                             }
                             continue;
@@ -11695,7 +11852,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         && serve_run.is_none()
                         && mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING)
                     {
-                        if !sig.results.is_empty() {
+                        if !call_sig(&cur_types, *sig).results.is_empty() {
                             frames[top].vals.push(Reg::from_i64(0));
                         }
                         continue;
@@ -11825,7 +11982,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         };
                         return Ok(Inner::Park(Blocked::SvcWait { key, deadline_ns }));
                     }
-                    if !sig.results.is_empty() {
+                    if !call_sig(&cur_types, *sig).results.is_empty() {
                         frames[top].vals.push(Reg::from_i64(*serve_count));
                     }
                     *serve_count = 0;
@@ -11893,7 +12050,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         }
                         _ => EINVAL,
                     };
-                    if !sig.results.is_empty() {
+                    if !call_sig(&cur_types, *sig).results.is_empty() {
                         frames[top].vals.push(Reg::from_i64(r));
                     }
                 }
@@ -11969,7 +12126,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         }
                         _ => EINVAL,
                     };
-                    if !sig.results.is_empty() {
+                    if !call_sig(&cur_types, *sig).results.is_empty() {
                         frames[top].vals.push(Reg::from_i64(r));
                     }
                 }
@@ -12000,7 +12157,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     } else {
                         EINVAL
                     };
-                    if !sig.results.is_empty() {
+                    if !call_sig(&cur_types, *sig).results.is_empty() {
                         frames[top].vals.push(Reg::from_i64(r));
                     }
                 }
@@ -12042,7 +12199,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             None => EFAULT,
                         },
                     };
-                    if !sig.results.is_empty() {
+                    if !call_sig(&cur_types, *sig).results.is_empty() {
                         frames[top].vals.push(Reg::from_i64(r));
                     }
                 }
@@ -12059,7 +12216,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     sig,
                     ..
                 } => {
-                    if !sig.results.is_empty() {
+                    if !call_sig(&cur_types, *sig).results.is_empty() {
                         frames[top].vals.push(Reg::from_i64(*fuel as i64));
                     }
                 }
@@ -12298,6 +12455,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             }
                             return Ok(Inner::Exec(Box::new(ExecReq {
                                 funcs: cm.funcs,
+                                types: cm.types,
                                 data: cm.data,
                                 entry,
                                 child_size,
@@ -12306,7 +12464,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 entry_args,
                             })));
                         }
-                        None if !sig.results.is_empty() => {
+                        None if !call_sig(&cur_types, *sig).results.is_empty() => {
                             frames[top].vals.push(Reg::from_i64(EINVAL));
                         }
                         None => {}
@@ -12363,7 +12521,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             let served =
                                                 callee.lock_unpoisoned().svc_results.remove(&t);
                                             if let Some(rv) = served {
-                                                if !sig.results.is_empty() {
+                                                if !call_sig(&cur_types, *sig).results.is_empty() {
                                                     frames[top].vals.push(Reg::from_i64(rv));
                                                 }
                                                 continue;
@@ -12410,7 +12568,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 return Ok(Inner::Park(Blocked::CapReply { ticket: t, callee }));
                             }
                             None => {
-                                if !sig.results.is_empty() {
+                                if !call_sig(&cur_types, *sig).results.is_empty() {
                                     frames[top].vals.push(Reg::from_i64(EAGAIN));
                                 }
                                 continue;
@@ -12457,7 +12615,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // lock **before** waiting (the §5b serialization fix), then take the scalar
                     // completion. The placeholder `results` is discarded.
                     if let Some(id) = pending_id {
-                        if sig.results.len() > 1 {
+                        if call_sig(&cur_types, *sig).results.len() > 1 {
                             // Parkable ops carry a single-slot scalar reply (invariant 8) — a
                             // wider declared signature is a registration bug, fail-closed. Checked
                             // BEFORE any park: a fault after the vCPU is filed is unrecoverable.
@@ -12484,7 +12642,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // punt-inside-a-fiber kernel.
                         if *cur != ROOT_FIBER
                             && !durable
-                            && matches!(sig.results.as_slice(), [ValType::I64])
+                            && matches!(
+                                call_sig(&cur_types, *sig).results.as_slice(),
+                                [ValType::I64]
+                            )
                         {
                             if let SchedRef::Real(sr) = sched {
                                 let regc = Arc::clone(registry);
@@ -12516,14 +12677,17 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         let parkable = *cur == ROOT_FIBER
                             && !durable
                             && matches!(sched, SchedRef::Real(_))
-                            && matches!(sig.results.as_slice(), [ValType::I64]);
+                            && matches!(
+                                call_sig(&cur_types, *sig).results.as_slice(),
+                                [ValType::I64]
+                            );
                         if parkable {
                             return Ok(Inner::Park(Blocked::CapPending { id }));
                         }
                         // Degenerate blocking wait (slice 1): single-fiber guests, durable
                         // callers, non-i64 signatures, the deterministic explorer.
                         let r = comps.wait(id);
-                        if let Some(ty) = sig.results.first() {
+                        if let Some(ty) = call_sig(&cur_types, *sig).results.first() {
                             frames[top].vals.push(Reg::from_value(slot_to_val(*ty, r)));
                         }
                         continue;
@@ -12655,7 +12819,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         return Ok(Inner::Park(Blocked::ForkSelf));
                     }
                     if !eintr_done {
-                        for (s, ty) in results.iter().zip(&sig.results) {
+                        for (s, ty) in results.iter().zip(&call_sig(&cur_types, *sig).results) {
                             frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
                         }
                     }
@@ -12690,7 +12854,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     match b.op {
                         3 => jit_install_body!(h, args),
                         4 => jit_uninstall_body!(h, args),
-                        _ => jit_invoke_body!(h, args, sig),
+                        _ => jit_invoke_body!(h, args, call_sig(&cur_types, *sig)),
                     }
                 }
                 Inst::CallImport {
@@ -12737,7 +12901,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             let served =
                                                 callee.lock_unpoisoned().svc_results.remove(&t);
                                             if let Some(rv) = served {
-                                                if !sig.results.is_empty() {
+                                                if !call_sig(&cur_types, *sig).results.is_empty() {
                                                     frames[top].vals.push(Reg::from_i64(rv));
                                                 }
                                                 continue;
@@ -12784,7 +12948,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 return Ok(Inner::Park(Blocked::CapReply { ticket: t, callee }));
                             }
                             None => {
-                                if !sig.results.is_empty() {
+                                if !call_sig(&cur_types, *sig).results.is_empty() {
                                     frames[top].vals.push(Reg::from_i64(EAGAIN));
                                 }
                                 continue;
@@ -12820,7 +12984,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // later direct call's park decision — the read keeps its historical 0-EOF.
                     let _ = hg.take_stdin_parked();
                     let _ = hg.take_park_request(); // #799: likewise — degrade to the poll answer
-                    for (s, ty) in results.iter().zip(&sig.results) {
+                    for (s, ty) in results.iter().zip(&call_sig(&cur_types, *sig).results) {
                         frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
                     }
                 }
@@ -12868,7 +13032,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             let served =
                                                 callee.lock_unpoisoned().svc_results.remove(&t);
                                             if let Some(rv) = served {
-                                                if !sig.results.is_empty() {
+                                                if !call_sig(&cur_types, *sig).results.is_empty() {
                                                     frames[top].vals.push(Reg::from_i64(rv));
                                                 }
                                                 continue;
@@ -12911,7 +13075,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 return Ok(Inner::Park(Blocked::CapReply { ticket: t, callee }));
                             }
                             None => {
-                                if !sig.results.is_empty() {
+                                if !call_sig(&cur_types, *sig).results.is_empty() {
                                     frames[top].vals.push(Reg::from_i64(EAGAIN));
                                 }
                                 continue;
@@ -13022,7 +13186,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         sched.wake_pipe_writers(pipe);
                     }
                     if !eintr_done {
-                        for (s, ty) in results.iter().zip(&sig.results) {
+                        for (s, ty) in results.iter().zip(&call_sig(&cur_types, *sig).results) {
                             frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
                         }
                     }
@@ -13066,7 +13230,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         hg.cap_dispatch_slots(temen_ir::CAP_DYN_TYPE_ID, packed, h, &argv, gm)?;
                     let _ = hg.take_stdin_parked(); // no dyn-parking this slice (see call.import)
                     let _ = hg.take_park_request(); // #799: likewise — degrade to the poll answer
-                    for (s, tyv) in results.iter().zip(&sig.results) {
+                    for (s, tyv) in results.iter().zip(&call_sig(&cur_types, *sig).results) {
                         frames[top]
                             .vals
                             .push(Reg::from_value(slot_to_val(*tyv, *s)));
@@ -13527,6 +13691,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let child_host = Arc::clone(host); // inherit the domain powerbox
                     let child_fuel = *fuel; // the child's own metering budget (a copy)
                     let cfuncs = Arc::clone(&funcs);
+                    let ctypes = Arc::clone(&types); // (#922)
                     let cdt = Arc::clone(dt); // **share** the domain table: a post-spawn install is visible here (§6 #2)
                                               // **Share** the fiber registry (D57 3b-i): one handle namespace per domain, so
                                               // the child can resume fibers the parent (or a sibling) created and suspended.
@@ -13544,6 +13709,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let made = sched.spawn(move |id| {
                         let mut child = VCpu::new(
                             cfuncs,
+                            ctypes,
                             entry,
                             &[Value::I64(spv), Value::I64(av)], // (sp, arg) — the fiber-style entry
                             child_mem,
@@ -14141,7 +14307,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     units,
                     invoked,
                     get_i32(&frames[top].vals, *idx)?,
-                    ty,
+                    call_sig(&cur_types, *ty),
                 )?;
                 let argv = collect(&frames[top].vals, args)?;
                 frames[top] = Frame {
@@ -16582,6 +16748,9 @@ pub enum OfferPolicy {
 #[derive(Clone)]
 pub struct OfferEntry {
     pub funcs: Arc<[Func]>,
+    /// The handler module's type section (FuncType interning, #922) — the home for its call
+    /// variants' interned signatures when the handler funcs run via `drive_arc*`.
+    pub types: Arc<[temen_ir::TypeEntry]>,
     pub ops: Arc<[u32]>,
     pub sigs: Arc<[FuncType]>,
     /// §3.5 declared op **names** (the coverage-binding contract), from the offer's interface
@@ -17510,7 +17679,7 @@ pub type JitValidator = fn(&[u8], Option<u8>, &[u8]) -> Result<Arc<[Func]>, i64>
 /// unit's functions and the program's tainted signatures, return `true` to **reject** the unit
 /// (suspendable at an untainted signature — DURABILITY.md §12.5). Injected as a bare `fn` so this TCB
 /// crate keeps no `temen-durable` dependency (the analysis lives in the injecting tier).
-pub type JitDurableGate = fn(&[Func], &[FuncType]) -> bool;
+pub type JitDurableGate = fn(&[Func], &[temen_ir::TypeEntry], &[FuncType]) -> bool;
 
 /// A wasm-JIT **emitter** the browser tier installs (DESIGN.md §22, the "guest-compiled units on the
 /// wasm tier" slice): given a *validated closed-unit* blob (the exact bytes `compile` accepted), it
@@ -17540,6 +17709,9 @@ pub struct JitCompiled {
 /// (`install_code`/`install_type_id`, for B2 table `install`).
 struct JitUnit {
     funcs: Arc<[Func]>,
+    /// The unit's type section (FuncType interning, #922) — the home for its call variants'
+    /// interned signatures. Rides the persisted `unit_ir` bytes across freeze/restore.
+    types: Arc<[temen_ir::TypeEntry]>,
     native_code: usize,
     install_code: usize,
     install_type_id: u32,
@@ -19065,6 +19237,7 @@ impl Host {
                 temen_verify::verify_module(&m).map_err(|_| JitRestoreError::Verify)?;
                 units.push(JitUnit {
                     funcs: Arc::from(m.funcs),
+                    types: Arc::from(m.types), // FuncType interning (#922): rides `unit_ir`
                     native_code: 0,
                     install_code: 0,
                     install_type_id: u.install_type_id,
@@ -19459,7 +19632,12 @@ impl Host {
     /// wiring party holding both ends calls this — declaring the offer conferred nothing.
     ///
     /// Returns `None` (nothing minted) for an empty op list or an out-of-range funcidx.
-    pub fn wire_offer_func(&mut self, funcs: &Arc<[Func]>, ops: &[u32]) -> Option<i32> {
+    pub fn wire_offer_func(
+        &mut self,
+        funcs: &Arc<[Func]>,
+        types: &Arc<[temen_ir::TypeEntry]>,
+        ops: &[u32],
+    ) -> Option<i32> {
         if ops.is_empty() || ops.iter().any(|&f| f as usize >= funcs.len()) {
             return None;
         }
@@ -19474,6 +19652,7 @@ impl Host {
         let idx = self.offers.len() as u32;
         self.offers.push(OfferEntry {
             funcs: Arc::clone(funcs),
+            types: Arc::clone(types),
             ops: ops.into(),
             sigs,
             names: Arc::from(Vec::new()),
@@ -19508,6 +19687,7 @@ impl Host {
         policy: OfferPolicy,
     ) -> Option<i32> {
         let funcs: Arc<[Func]> = m.funcs.clone().into();
+        let types: Arc<[temen_ir::TypeEntry]> = m.types.clone().into();
         if ops.is_empty() || ops.iter().any(|&f| f as usize >= funcs.len()) {
             return None;
         }
@@ -19530,6 +19710,7 @@ impl Host {
         let idx = self.offers.len() as u32;
         self.offers.push(OfferEntry {
             funcs,
+            types,
             ops: ops.into(),
             sigs,
             names: Arc::from(Vec::new()),
@@ -19993,6 +20174,7 @@ impl Host {
         let m = self.self_module.clone().ok_or(Trap::CapFault)?;
         let e = m.impl_exports.get(k as usize).ok_or(Trap::CapFault)?;
         let funcs: Arc<[Func]> = m.funcs.clone().into();
+        let types: Arc<[temen_ir::TypeEntry]> = m.types.clone().into();
         if e.ops.is_empty() || e.ops.iter().any(|&f| f as usize >= funcs.len()) {
             return Err(Trap::CapFault);
         }
@@ -20021,6 +20203,7 @@ impl Host {
         let idx = self.offers.len() as u32;
         self.offers.push(OfferEntry {
             funcs,
+            types,
             ops: Arc::from(e.ops.clone()),
             sigs,
             names,
@@ -20247,6 +20430,16 @@ impl Host {
             .map(|g| Arc::clone(&g.funcs))
     }
 
+    /// The type section of the granted module matching `digest` (FuncType interning, #922) — the
+    /// sibling of [`Self::module_by_digest`] so a re-granted separate-module thread child resolves
+    /// its call variants' interned signatures.
+    fn module_types_by_digest(&self, digest: &[u8; 32]) -> Option<Arc<[temen_ir::TypeEntry]>> {
+        self.modules
+            .iter()
+            .find(|g| g.durable && &g.digest == digest)
+            .map(|g| Arc::clone(&g.types))
+    }
+
     /// §13.4 slice 4c — the whole granted `Module` matching a nested record's digest, for the
     /// thaw to register as the re-created serving child's **self module** (serve admission +
     /// handler resolution need the module, not just its functions).
@@ -20275,10 +20468,19 @@ impl Host {
     /// (the generic dispatch on a `Module` handle is an inert `CapFault`), so no host address ever
     /// leaks into a guest-readable value.
     #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity)]
     pub fn resolve_module_parts(
         &self,
         handle: i32,
-    ) -> Option<(*const Func, usize, i32, *const Data, usize)> {
+    ) -> Option<(
+        *const Func,
+        usize,
+        i32,
+        *const Data,
+        usize,
+        *const temen_ir::TypeEntry,
+        usize,
+    )> {
         let g = self.resolve_module(handle).ok()?;
         Some((
             g.funcs.as_ptr(),
@@ -20286,6 +20488,10 @@ impl Host {
             g.memory_log2.map_or(-1, |l| l as i32),
             g.data.as_ptr(),
             g.data.len(),
+            // #922: the child module's type section, so the JIT nesting runtime can resolve the
+            // child's interned `call_indirect` type indices when it re-compiles the child.
+            g.types.as_ptr(),
+            g.types.len(),
         ))
     }
 
@@ -20684,13 +20890,20 @@ impl Host {
             Ok(_) => return Ok(Err(EINVAL)), // an empty unit has no entry to invoke
             Err(e) => return Ok(Err(e)),
         };
+        // FuncType interning (#922): the unit's type section. Re-decode the already-validated
+        // `bytes` (linking is source-to-source and never changes the type section, so this holds
+        // for `compile_linked` too); a decode failure is impossible here (validation just passed).
+        // Decoded before the durable fence so the gate can resolve interned call type indices.
+        let types: Arc<[temen_ir::TypeEntry]> = temen_encode::decode_module(bytes)
+            .map(|m| Arc::from(m.types))
+            .unwrap_or_else(|_| Arc::from(Vec::new()));
         // Durable install fence (DURABILITY.md §12.5, R8 fork-critical case): in a durable run, a
         // *suspendable* unit whose entry signature the program does not taint is rejected — else a
         // `call_indirect` reaching an installed slot at an un-instrumented site would silently lose
         // the unit's continuation on thaw. Fail closed here so the unit can never be installed. The
         // predicate + tainted set are injected by the durable grant; this TCB crate runs no analysis.
         if let Some(gate) = durable_gate {
-            if gate(&funcs, durable_tainted) {
+            if gate(&funcs, &types, durable_tainted) {
                 return Ok(Err(EINVAL));
             }
         }
@@ -20708,6 +20921,7 @@ impl Host {
         };
         d.units.push(JitUnit {
             funcs,
+            types,
             native_code: 0,
             install_code: 0,
             install_type_id: 0,
@@ -20780,6 +20994,15 @@ impl Host {
             .get(domain as usize)
             .and_then(|d| d.units.get(unit as usize))
             .map(|u| Arc::clone(&u.funcs))
+    }
+
+    /// The unit's type section (FuncType interning, #922) — the sibling of [`Self::jit_unit_funcs`]
+    /// so an `invoke`d unit resolves its call variants' interned signatures as module INVOKE_MODULE.
+    pub fn jit_unit_types(&self, domain: u32, unit: u32) -> Option<Arc<[temen_ir::TypeEntry]>> {
+        self.jit_domains
+            .get(domain as usize)
+            .and_then(|d| d.units.get(unit as usize))
+            .map(|u| Arc::clone(&u.types))
     }
 
     /// The emitted wasm the [`JitWasmEmitter`] produced for a unit at `compile` time (`f0(win, env,
@@ -21713,6 +21936,7 @@ impl Host {
                                 let mut impl_fuel = OFFER_FUEL;
                                 let (res, _, _) = drive_arc_shared(
                                     entry.funcs.clone(),
+                                    entry.types.clone(),
                                     f,
                                     &vals,
                                     &mut impl_fuel,
@@ -21790,6 +22014,7 @@ impl Host {
                             let mut impl_fuel = OFFER_FUEL;
                             let (res, _, _) = drive_arc(
                                 entry.funcs.clone(),
+                                entry.types.clone(),
                                 f,
                                 &vals,
                                 &mut impl_fuel,
@@ -21836,6 +22061,7 @@ impl Host {
                         let mut impl_fuel = OFFER_FUEL;
                         let (res, _, _) = drive_arc(
                             entry.funcs.clone(),
+                            entry.types.clone(),
                             f,
                             &vals,
                             &mut impl_fuel,
@@ -25505,7 +25731,7 @@ mod domain_table_tests {
         // A second view — a worker thread / invoke child sharing the same live table.
         let worker = Arc::clone(&dt);
 
-        let slot = dt.install(unit(2)).expect("install"); // a (i32,i32)->(i32) unit
+        let slot = dt.install(unit(2), Arc::from(Vec::new())).expect("install"); // a (i32,i32)->(i32) unit
         assert_eq!(
             slot, 1,
             "first padding slot is just past the 1 module function"
@@ -25534,7 +25760,7 @@ mod domain_table_tests {
     fn uninstall_clears_and_guards() {
         let parent: Arc<[Func]> = unit(1);
         let dt = Arc::new(DomainTable::new(&parent, 2)); // 4 slots, 1 real func
-        let slot = dt.install(unit(1)).expect("install") as usize;
+        let slot = dt.install(unit(1), Arc::from(Vec::new())).expect("install") as usize;
         assert_eq!(slot, 1);
         assert!(!dt.uninstall(0, 1), "slot 0 is the real function");
         assert!(!dt.uninstall(99, 1), "out of range");
@@ -25556,7 +25782,7 @@ mod domain_table_tests {
     fn resolve_module_routes_program_invoke_and_installed() {
         let parent: Arc<[Func]> = unit(1);
         let dt = Arc::new(DomainTable::new(&parent, 2));
-        dt.install(unit(2)).expect("install"); // module 1
+        dt.install(unit(2), Arc::from(Vec::new())).expect("install"); // module 1
         let invoked = Some(unit(3));
         let mut local: Vec<Arc<[Func]>> = Vec::new();
 

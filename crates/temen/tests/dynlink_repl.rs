@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use temen_encode::encode_module;
+use temen_encode::{decode_module, encode_module};
 use temen_ir::{Resolved, DEFAULT_RESERVED_LOG2};
 use temen_jit::{CompiledModule, JitOutcome, Quota, INERT_CAP_THUNK};
 use temen_run::jit_resolve_and_validate;
@@ -73,10 +73,13 @@ impl Repl {
             table.get(n).map(|&(slot, _)| Resolved::Slot(slot))
         })
         .expect("resolve the definition's imports against the REPL symbol table");
+        // #922: resolution preserves the type section, so the decoded blob's types resolve the
+        // interned call sigs in the resolved funcs.
+        let types = decode_module(&blob).expect("decode definition").types;
 
         let defs = self
             .cm
-            .define_extra(&funcs)
+            .define_extra(&funcs, &types)
             .expect("compile the definition");
         let slot = self
             .cm

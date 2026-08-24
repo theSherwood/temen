@@ -55,9 +55,25 @@
 #![forbid(unsafe_code)]
 
 use temen_ir::{
-    BinOp, Block, BlockIdx, CmpOp, Func, FuncIdx, Inst, IntTy, LoadOp, Module, StoreOp, Terminator,
-    ValIdx, ValType,
+    BinOp, Block, BlockIdx, CmpOp, Func, FuncIdx, FuncType, Inst, IntTy, LoadOp, Module, StoreOp,
+    Terminator, TypeEntry, ValIdx, ValType,
 };
+
+/// Resolve an interned call type index (#922) into its [`FuncType`]. The call variants
+/// (`CallIndirect`, `CapCall`, …) carry a `u32` index into the module's type section; a
+/// well-formed (verified) module always resolves to a `TypeEntry::Func`. A miss returns a
+/// static empty signature so callers stay total — the verifier already rejects a dangling
+/// or non-func index, so this only ever fires on already-invalid IR.
+fn sig_of(types: &[TypeEntry], t: u32) -> &FuncType {
+    static EMPTY: FuncType = FuncType {
+        params: Vec::new(),
+        results: Vec::new(),
+    };
+    match types.get(t as usize) {
+        Some(TypeEntry::Func(ft)) => ft,
+        _ => &EMPTY,
+    }
+}
 
 // `FuncIdx` is used by `SuspendKind::Propagated` below.
 
@@ -217,7 +233,7 @@ pub fn transform_module_assume_confined(m: &Module) -> Result<Module, TransformE
 
 fn transform_module_inner(m: &Module, enforce_r9: bool) -> Result<Module, TransformError> {
     let func_results: Vec<Vec<ValType>> = m.funcs.iter().map(|f| f.results.clone()).collect();
-    let may_suspend = compute_may_suspend(&m.funcs);
+    let may_suspend = compute_may_suspend(&m.funcs, &m.types);
     let tainted_sigs = tainted_signatures(&m.funcs, &may_suspend);
     let any_instrumented = may_suspend.iter().any(|&s| s);
 
@@ -240,7 +256,8 @@ fn transform_module_inner(m: &Module, enforce_r9: bool) -> Result<Module, Transf
 
     for (i, f) in m.funcs.iter().enumerate() {
         if may_suspend[i] {
-            let (nf, frame_size) = transform_func(f, &func_results, &may_suspend, &tainted_sigs)?;
+            let (nf, frame_size) =
+                transform_func(f, &func_results, &may_suspend, &tainted_sigs, &m.types)?;
             out.funcs[i] = nf;
             max_frame = max_frame.max(frame_size);
         }
@@ -406,7 +423,7 @@ fn term_targets(t: &Terminator) -> Vec<BlockIdx> {
 /// function taints its own signature). Marking the caller (rather than ignoring the
 /// indirect call) is what flips R8 from fail-**open** — silent under-instrumentation — to
 /// sound: `transform_func` then either instruments the site or fails the module closed.
-fn compute_may_suspend(funcs: &[Func]) -> Vec<bool> {
+fn compute_may_suspend(funcs: &[Func], types: &[TypeEntry]) -> Vec<bool> {
     let mut ms = vec![false; funcs.len()];
     for (i, f) in funcs.iter().enumerate() {
         if f.blocks.iter().any(|b| {
@@ -431,11 +448,12 @@ fn compute_may_suspend(funcs: &[Func]) -> Vec<bool> {
         // function has that exact signature. Re-derived each round from the live `ms`. Collect the
         // newly-tainted functions first (read-only over `ms`), then apply — so the taint predicate's
         // borrow of `ms` doesn't clash with the mutation.
-        let tainted = |ty: &temen_ir::FuncType| -> bool {
+        let tainted = |ty: u32| -> bool {
+            let ft = sig_of(types, ty);
             funcs
                 .iter()
                 .enumerate()
-                .any(|(j, g)| ms[j] && g.params == ty.params && g.results == ty.results)
+                .any(|(j, g)| ms[j] && g.params == ft.params && g.results == ft.results)
         };
         let to_mark: Vec<usize> = funcs
             .iter()
@@ -445,7 +463,7 @@ fn compute_may_suspend(funcs: &[Func]) -> Vec<bool> {
                     && f.blocks.iter().any(|b| {
                         b.insts.iter().any(|x| match x {
                             Inst::Call { func, .. } => ms[*func as usize],
-                            Inst::CallIndirect { ty, .. } => tainted(ty),
+                            Inst::CallIndirect { ty, .. } => tainted(*ty),
                             _ => false,
                         })
                         // A direct or indirect **tail** call into a may-suspend callee also suspends
@@ -454,7 +472,7 @@ fn compute_may_suspend(funcs: &[Func]) -> Vec<bool> {
                         // under-instrumented).
                         || match &b.term {
                             Terminator::ReturnCall { func, .. } => ms[*func as usize],
-                            Terminator::ReturnCallIndirect { ty, .. } => tainted(ty),
+                            Terminator::ReturnCallIndirect { ty, .. } => tainted(*ty),
                             _ => false,
                         }
                     })
@@ -494,8 +512,8 @@ fn tainted_signatures(funcs: &[Func], ms: &[bool]) -> Vec<temen_ir::FuncType> {
 /// of one of these types has a poll/unwind seam. Computed on the program's (pre-transform)
 /// functions, this is the set a durable host stashes so it can gate later `Jit.compile`s
 /// ([`unit_suspends_untainted`]). Exposed for the durable-JIT install fence (DURABILITY.md §12.5).
-pub fn tainted_signatures_of(funcs: &[Func]) -> Vec<temen_ir::FuncType> {
-    let ms = compute_may_suspend(funcs);
+pub fn tainted_signatures_of(funcs: &[Func], types: &[TypeEntry]) -> Vec<temen_ir::FuncType> {
+    let ms = compute_may_suspend(funcs, types);
     tainted_signatures(funcs, &ms)
 }
 
@@ -511,12 +529,13 @@ pub fn tainted_signatures_of(funcs: &[Func]) -> Vec<temen_ir::FuncType> {
 /// transform preserves signatures. Injected into the durable `Host` as its taint gate.
 pub fn unit_suspends_untainted(
     unit_funcs: &[Func],
+    unit_types: &[TypeEntry],
     program_tainted: &[temen_ir::FuncType],
 ) -> bool {
     if unit_funcs.is_empty() {
         return false; // no entry to invoke; the empty-unit case is rejected elsewhere
     }
-    let ms = compute_may_suspend(unit_funcs);
+    let ms = compute_may_suspend(unit_funcs, unit_types);
     if !ms[0] {
         return false; // entry cannot suspend → no continuation to lose → safe
     }
@@ -539,7 +558,8 @@ enum SuspendKind {
     /// signature, whatever the `idx` resolves to has a `REWINDING`-aware prologue and rewinds in
     /// turn. `ty` reconstructs the op; `idx`/`args` are its block-local operands (spilled + reloaded).
     PropagatedIndirect {
-        ty: temen_ir::FuncType,
+        /// Interned call type index (#922) into the module type section — reconstructs the op.
+        ty: u32,
         idx: ValIdx,
         args: Vec<ValIdx>,
     },
@@ -588,7 +608,8 @@ enum SuspendKind {
     SvcServe {
         type_id: u32,
         op: u32,
-        sig: temen_ir::FuncType,
+        /// Interned call type index (#922) into the module type section — reconstructs the op.
+        sig: u32,
         handle: ValIdx,
         args: Vec<ValIdx>,
     },
@@ -689,20 +710,21 @@ fn transform_func(
     func_results: &[Vec<ValType>],
     may_suspend: &[bool],
     tainted_sigs: &[temen_ir::FuncType],
+    type_section: &[TypeEntry],
 ) -> Result<(Func, u64), TransformError> {
     // Whether a `call_indirect` of this signature could reach a may-suspend target (R8) — the same
     // by-signature rule `compute_may_suspend` used to mark this function may-suspend in the first
     // place. Kept identical to that rule so the instrumentation set == the taint set (re-issue
     // soundness: every possible indirect target is instrumented, so the reloaded `idx` can only
-    // resolve to a `REWINDING`-aware callee).
-    let is_tainted = |ty: &temen_ir::FuncType| tainted_sigs.iter().any(|s| s == ty);
+    // resolve to a `REWINDING`-aware callee). `ty` is an interned type index (#922).
+    let is_tainted = |ty: u32| tainted_sigs.iter().any(|s| s == sig_of(type_section, ty));
     // Out of scope: a **tail** call (direct or indirect) into a may-suspend callee — the frame is
     // replaced, so there is no poll to unwind at. Rejected (fail closed), so a tail-dispatched
     // suspending callee never leaves a caller silently under-instrumented.
     for blk in &f.blocks {
         let reject = match &blk.term {
             Terminator::ReturnCall { func, .. } => may_suspend[*func as usize],
-            Terminator::ReturnCallIndirect { ty, .. } => is_tainted(ty),
+            Terminator::ReturnCallIndirect { ty, .. } => is_tainted(*ty),
             _ => false,
         };
         if reject {
@@ -717,7 +739,7 @@ fn transform_func(
         let mut types = blk.params.clone();
         let mut vend = Vec::with_capacity(blk.insts.len());
         for inst in &blk.insts {
-            types.extend(result_types(inst, &types, func_results)?);
+            types.extend(result_types(inst, &types, func_results, type_section)?);
             vend.push(types.len());
         }
         let scs: Vec<usize> = blk
@@ -731,7 +753,7 @@ fn transform_func(
                 | Inst::ThreadJoin { .. }
                 | Inst::MemoryWait { .. } => true,
                 Inst::Call { func, .. } => may_suspend[*func as usize],
-                Inst::CallIndirect { ty, .. } => is_tainted(ty),
+                Inst::CallIndirect { ty, .. } => is_tainted(*ty),
                 _ => false,
             })
             .map(|(pos, _)| pos)
@@ -934,7 +956,7 @@ fn transform_func(
                     } => SuspendKind::SvcServe {
                         type_id: temen_ir::CAP_SELF_TYPE_ID,
                         op: *sop,
-                        sig: sig.clone(),
+                        sig: *sig,
                         handle: *handle,
                         args: args.clone(),
                     },
@@ -944,7 +966,7 @@ fn transform_func(
                         args: args.clone(),
                     },
                     Inst::CallIndirect { ty, idx, args } => SuspendKind::PropagatedIndirect {
-                        ty: ty.clone(),
+                        ty: *ty,
                         idx: *idx,
                         args: args.clone(),
                     },
@@ -969,12 +991,18 @@ fn transform_func(
                     ),
                 };
                 let nres = match (&kind, &blk.insts[pos]) {
-                    (SuspendKind::Leaf, Inst::CapCall { sig, .. }) => sig.results.len(),
-                    (SuspendKind::SvcServe { .. }, Inst::CapCall { sig, .. }) => sig.results.len(),
+                    (SuspendKind::Leaf, Inst::CapCall { sig, .. }) => {
+                        sig_of(type_section, *sig).results.len()
+                    }
+                    (SuspendKind::SvcServe { .. }, Inst::CapCall { sig, .. }) => {
+                        sig_of(type_section, *sig).results.len()
+                    }
                     (SuspendKind::Propagated { callee, .. }, _) => {
                         func_results[*callee as usize].len()
                     }
-                    (SuspendKind::PropagatedIndirect { ty, .. }, _) => ty.results.len(),
+                    (SuspendKind::PropagatedIndirect { ty, .. }, _) => {
+                        sig_of(type_section, *ty).results.len()
+                    }
                     (SuspendKind::Resume { .. }, _) => 2, // (status, value)
                     (SuspendKind::Yield { .. }, _) => 1,  // the resume arg
                     (SuspendKind::ThreadJoin { .. }, _) => 1, // the join result (i64)
@@ -1192,7 +1220,7 @@ fn transform_func(
                     .collect();
                 ab.many(
                     Inst::CallIndirect {
-                        ty: ty.clone(),
+                        ty: *ty,
                         idx: ridx,
                         args: mapped,
                     },
@@ -1286,7 +1314,7 @@ fn transform_func(
                     Inst::CapCall {
                         type_id: *type_id,
                         op: *op,
-                        sig: sig.clone(),
+                        sig: *sig,
                         handle: hh,
                         args: aa,
                     },
@@ -1578,6 +1606,7 @@ fn result_types(
     inst: &Inst,
     types: &[ValType],
     func_results: &[Vec<ValType>],
+    type_section: &[TypeEntry],
 ) -> Result<Vec<ValType>, TransformError> {
     use Inst::*;
     Ok(match inst {
@@ -1597,8 +1626,8 @@ fn result_types(
             .get(*func as usize)
             .cloned()
             .ok_or(TransformError::UnsupportedShape)?,
-        CapCall { sig, .. } => sig.results.clone(),
-        CallIndirect { ty, .. } => ty.results.clone(),
+        CapCall { sig, .. } => sig_of(type_section, *sig).results.clone(),
+        CallIndirect { ty, .. } => sig_of(type_section, *ty).results.clone(),
         RefFunc { .. } => vec![ValType::I32],
         // Fiber control ops (§12 / Phase 3): an i64 handle, a `(status, value)` pair, a resume arg.
         ContNew { .. } => vec![ValType::I64],

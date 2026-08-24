@@ -54,12 +54,12 @@ fn intern(
 }
 
 /// Reassociate constant chains in every block of a function.
-pub fn reassociate(f: &Func, fn_results: &[usize]) -> Func {
-    let mut s = to_ssa(f, fn_results);
+pub fn reassociate(f: &Func, fn_results: &[usize], types: &[temen_ir::TypeEntry]) -> Func {
+    let mut s = to_ssa(f, fn_results, types);
     for bi in 0..s.blocks.len() {
         // Each pass collapses one level; iterate so `((x+a)+b)+c` fully folds. Cap guards pathologies.
         for _ in 0..16 {
-            if !reassociate_block(&mut s, bi, fn_results) {
+            if !reassociate_block(&mut s, bi, fn_results, types) {
                 break;
             }
         }
@@ -68,7 +68,12 @@ pub fn reassociate(f: &Func, fn_results: &[usize]) -> Func {
 }
 
 /// One reassociation pass over block `bi`. Returns whether it rewrote anything.
-fn reassociate_block(s: &mut SsaFunc, bi: usize, fn_results: &[usize]) -> bool {
+fn reassociate_block(
+    s: &mut SsaFunc,
+    bi: usize,
+    fn_results: &[usize],
+    types: &[temen_ir::TypeEntry],
+) -> bool {
     let nparams = s.blocks[bi].params.len();
 
     // Value → its constant (if a literal `const`) and Value → its defining instruction.
@@ -76,7 +81,7 @@ fn reassociate_block(s: &mut SsaFunc, bi: usize, fn_results: &[usize]) -> bool {
     let mut def: BTreeMap<Value, Inst> = BTreeMap::new();
     let mut slot = nparams;
     for inst in &s.blocks[bi].insts {
-        let rc = inst.result_count(fn_results);
+        let rc = inst.result_count(fn_results, types);
         if rc == 1 {
             let v = s.values[bi][slot];
             if let Some(k) = const_value(inst) {
@@ -96,7 +101,7 @@ fn reassociate_block(s: &mut SsaFunc, bi: usize, fn_results: &[usize]) -> bool {
     let mut rewrites: BTreeMap<Value, (BinOp, Value, Value)> = BTreeMap::new();
     let mut slot = nparams;
     for inst in &s.blocks[bi].insts {
-        let rc = inst.result_count(fn_results);
+        let rc = inst.result_count(fn_results, types);
         if rc == 1 {
             let ov = s.values[bi][slot];
             if let &Inst::IntBin { ty, op, a, b } = inst {
@@ -159,7 +164,7 @@ fn reassociate_block(s: &mut SsaFunc, bi: usize, fn_results: &[usize]) -> bool {
     let orig = core::mem::take(&mut s.blocks[bi].insts);
     let mut slot = nparams;
     for inst in orig {
-        let rc = inst.result_count(fn_results);
+        let rc = inst.result_count(fn_results, types);
         let ni = if rc == 1 {
             let ov = s.values[bi][slot];
             match rewrites.get(&ov) {

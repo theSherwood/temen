@@ -28,15 +28,14 @@ fn module(text: &str) -> Arc<temen_ir::Module> {
 #[test]
 fn serve_qualifies_still_folds_fork_for_cranelift() {
     use temen_interp::bytecode::serve_qualifies;
-    use temen_ir::{Block, Func, FuncType, Inst, Terminator, ValType, CAP_SELF_TYPE_ID};
+    use temen_ir::{Block, Func, Inst, Terminator, ValType, CAP_SELF_TYPE_ID};
 
-    let self_cap = |op: u32, results: Vec<ValType>| Inst::CapCall {
+    // #922: `serve_qualifies` inspects only the cap-op, never the signature, so any interned
+    // type index (0) is fine here — `results` still shapes the surrounding func's declared results.
+    let self_cap = |op: u32, _results: Vec<ValType>| Inst::CapCall {
         type_id: CAP_SELF_TYPE_ID,
         op,
-        sig: FuncType {
-            params: vec![],
-            results: results.clone(),
-        },
+        sig: 0,
         handle: 0,
         args: vec![],
     };

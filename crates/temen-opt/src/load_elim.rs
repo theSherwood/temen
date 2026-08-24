@@ -176,13 +176,18 @@ fn clobber_free(
 /// uses were forwarded) from a block, renumbering its block-local values, exactly as `dce_block` packs
 /// down survivors. No surviving operand references a removed load's result, so its dropped local index
 /// is never looked up.
-fn remove_insts(b: &Block, rem: &BTreeSet<u32>, fn_results: &[usize]) -> Block {
+fn remove_insts(
+    b: &Block,
+    rem: &BTreeSet<u32>,
+    fn_results: &[usize],
+    types: &[temen_ir::TypeEntry],
+) -> Block {
     let nparams = b.params.len() as u32;
     let mut result_start = Vec::with_capacity(b.insts.len());
     let mut total = nparams;
     for inst in &b.insts {
         result_start.push(total);
-        total += inst.result_count(fn_results) as u32;
+        total += inst.result_count(fn_results, types) as u32;
     }
     let mut map: Vec<Option<u32>> = vec![None; total as usize];
     for p in 0..nparams {
@@ -198,7 +203,7 @@ fn remove_insts(b: &Block, rem: &BTreeSet<u32>, fn_results: &[usize]) -> Block {
         map_operands(&mut ni, &mut |o| {
             map[o as usize].expect("operand defined before use")
         });
-        let rc = inst.result_count(fn_results) as u32;
+        let rc = inst.result_count(fn_results, types) as u32;
         for r in 0..rc {
             map[(result_start[i] + r) as usize] = Some(next);
             next += 1;
@@ -219,9 +224,14 @@ fn remove_insts(b: &Block, rem: &BTreeSet<u32>, fn_results: &[usize]) -> Block {
 /// Run cross-block redundant-load elimination. `funcs` / `has_memory` are only for `func_value_types`
 /// (typing the threaded parameters). Semantics-preserving; the surrounding cleanup drops any parameter
 /// this pass threads through but leaves unused.
-pub fn load_elim(f: &Func, funcs: &[Func], has_memory: bool) -> Func {
+pub fn load_elim(
+    f: &Func,
+    funcs: &[Func],
+    types: &[temen_ir::TypeEntry],
+    has_memory: bool,
+) -> Func {
     let fn_results: Vec<usize> = funcs.iter().map(|fu| fu.results.len()).collect();
-    let s = to_ssa(f, &fn_results);
+    let s = to_ssa(f, &fn_results, types);
     let nblocks = s.blocks.len();
     if nblocks == 0 {
         return from_ssa(&s);
@@ -229,7 +239,7 @@ pub fn load_elim(f: &Func, funcs: &[Func], has_memory: bool) -> Func {
     let cfg = Cfg::new(&f.blocks);
     let idom = cfg.dominators();
     let rpo = cfg.rpo();
-    let vn = crate::vn::value_numbers(&s, &cfg, &fn_results);
+    let vn = crate::vn::value_numbers(&s, &cfg, &fn_results, types);
     let nvals = s.num_values as usize;
 
     let mut def_block = vec![0u32; nvals];
@@ -273,7 +283,7 @@ pub fn load_elim(f: &Func, funcs: &[Func], has_memory: bool) -> Func {
                 }
                 _ => {}
             }
-            slot += inst.result_count(&fn_results);
+            slot += inst.result_count(&fn_results, types);
         }
     }
 
@@ -343,7 +353,7 @@ pub fn load_elim(f: &Func, funcs: &[Func], has_memory: bool) -> Func {
     }
 
     // Thread each source value into the load's block and forward the load's uses to it.
-    let types_local = func_value_types(f, funcs, has_memory);
+    let types_local = func_value_types(f, funcs, types, has_memory);
     let mut gtype = vec![ValType::I32; nvals];
     for (vals, tys) in s.values.iter().zip(types_local.iter()) {
         for (&g, &ty) in vals.iter().zip(tys.iter()) {
@@ -381,7 +391,7 @@ pub fn load_elim(f: &Func, funcs: &[Func], has_memory: bool) -> Func {
     }
     let mut blocks = f2.blocks;
     for (b, rem) in by_block {
-        blocks[b as usize] = remove_insts(&blocks[b as usize], &rem, &fn_results);
+        blocks[b as usize] = remove_insts(&blocks[b as usize], &rem, &fn_results, types);
     }
     Func {
         params: f2.params,

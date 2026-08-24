@@ -88,10 +88,27 @@ pub fn instrument_mem_hooks(m: &Module, spec: MemHookSpec) -> (Module, MemHookSt
     // Positions key on (func, block, inst) — stale after insertion, so drop rather than mislead.
     out.debug_info = None;
     let mut stats = MemHookStats::default();
+    // The inserted hook `cap.call`s need their signatures in the type section (FuncType interning,
+    // #922); intern into a growing copy and write it back (appending never moves existing indices).
+    let mut types = m.types.clone();
     for f in &mut out.funcs {
-        instrument_func(f, &fn_results, spec, &mut stats);
+        instrument_func(f, &fn_results, &mut types, spec, &mut stats);
     }
+    out.types = types;
     (out, stats)
+}
+
+/// Intern a signature into `types`, returning its index (dedup) — the instrumentation pass's
+/// local mirror of the parser's `intern_func_type` (FuncType interning, #922).
+fn intern_ft(types: &mut Vec<temen_ir::TypeEntry>, ft: temen_ir::FuncType) -> u32 {
+    if let Some(i) = types
+        .iter()
+        .position(|t| matches!(t, temen_ir::TypeEntry::Func(g) if *g == ft))
+    {
+        return i as u32;
+    }
+    types.push(temen_ir::TypeEntry::Func(ft));
+    (types.len() - 1) as u32
 }
 
 /// The hook event a memory op announces, with operands still as **old** (pre-renumbering)
@@ -199,6 +216,7 @@ fn mem_event_of(inst: &Inst) -> Option<Ev> {
 fn instrument_func(
     f: &mut Func,
     fn_results: &[usize],
+    types: &mut Vec<temen_ir::TypeEntry>,
     spec: MemHookSpec,
     stats: &mut MemHookStats,
 ) {
@@ -268,20 +286,24 @@ fn instrument_func(
                         vec![remap[dst as usize], remap[len as usize]],
                     ),
                 };
-                insts.push(Inst::CapCall {
-                    type_id: spec.type_id,
-                    op,
-                    sig: FuncType {
+                let sig = intern_ft(
+                    types,
+                    FuncType {
                         params: vec![ValType::I64; args.len()],
                         results: vec![],
                     },
+                );
+                insts.push(Inst::CapCall {
+                    type_id: spec.type_id,
+                    op,
+                    sig,
                     handle,
                     args,
                 });
                 stats.hooked_ops += 1;
                 stats.inserted_insts += insts.len() - before;
             }
-            let n = inst.result_count(fn_results);
+            let n = inst.result_count(fn_results, types);
             let mut ni = inst;
             map_operands(&mut ni, &mut |v| remap[v as usize]);
             insts.push(ni);

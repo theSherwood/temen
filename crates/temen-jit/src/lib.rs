@@ -273,6 +273,21 @@ fn distinct_types(funcs: &[Func]) -> Vec<FuncType> {
     out
 }
 
+/// Resolve an interned call type index (#922) into its [`FuncType`]. The call variants
+/// (`CallIndirect`, `CapCall`, …) carry a `u32` index into the unit's type section; a verified
+/// module always resolves to a `TypeEntry::Func`. A miss returns a static empty signature so
+/// callers stay total (the verifier already rejects a dangling / non-func index up front).
+fn sig_of(type_section: &[temen_ir::TypeEntry], t: u32) -> &FuncType {
+    static EMPTY: FuncType = FuncType {
+        params: Vec::new(),
+        results: Vec::new(),
+    };
+    match type_section.get(t as usize) {
+        Some(temen_ir::TypeEntry::Func(ft)) => ft,
+        _ => &EMPTY,
+    }
+}
+
 /// The type id of `ty` among `distinct`, or [`NO_MATCH_TYPE_ID`] if absent.
 fn type_id_of(distinct: &[FuncType], ty: &FuncType) -> u32 {
     distinct
@@ -310,7 +325,11 @@ fn intern_type(distinct: &mut Vec<FuncType>, ty: &FuncType) -> Result<u32, JitEr
 /// lowered, so a site whose signature is only defined by a *later* unit must already hold the
 /// real id — interning up front keeps id-equality ≡ structural equality across units instead
 /// of freezing a site to the always-trapping `NO_MATCH_TYPE_ID`.
-fn intern_unit_sigs(distinct: &mut Vec<FuncType>, funcs: &[Func]) -> Result<(), JitError> {
+fn intern_unit_sigs(
+    distinct: &mut Vec<FuncType>,
+    funcs: &[Func],
+    type_section: &[temen_ir::TypeEntry],
+) -> Result<(), JitError> {
     for f in funcs {
         intern_type(
             distinct,
@@ -322,11 +341,11 @@ fn intern_unit_sigs(distinct: &mut Vec<FuncType>, funcs: &[Func]) -> Result<(), 
         for b in &f.blocks {
             for i in &b.insts {
                 if let Inst::CallIndirect { ty, .. } = i {
-                    intern_type(distinct, ty)?;
+                    intern_type(distinct, sig_of(type_section, *ty))?;
                 }
             }
             if let Terminator::ReturnCallIndirect { ty, .. } = &b.term {
-                intern_type(distinct, ty)?;
+                intern_type(distinct, sig_of(type_section, *ty))?;
             }
         }
     }
@@ -612,6 +631,11 @@ pub struct ResolvedModule {
     pub memory_log2: i32,
     pub data: *const Data,
     pub n_data: usize,
+    /// #922 — the module's **type section**, so the §14 nesting runtime can resolve a
+    /// separate-module child's interned `call_indirect` type indices when re-compiling it. Same
+    /// outlives-the-run contract as `funcs`/`data`.
+    pub types: *const temen_ir::TypeEntry,
+    pub n_types: usize,
 }
 
 /// The host callback the §14 nesting runtime uses to resolve a guest's **`Module` handle** to the
@@ -2581,7 +2605,7 @@ impl CompiledModule {
         let fuel_addr = fuel.map_or(0, |p| p as i64);
         // Calls can reach any function, so every function must be lowerable.
         for f in &m.funcs {
-            ensure_supported(f)?;
+            ensure_supported(f, &m.types)?;
         }
 
         // Plan the guest window if the module declares memory (allocation happens per `run`):
@@ -2657,7 +2681,7 @@ impl CompiledModule {
         // `define_extra`/install of a function with that signature can satisfy the site,
         // keeping id-equality ≡ structural equality across units (DESIGN.md §22).
         let mut distinct = distinct_types(&m.funcs);
-        intern_unit_sigs(&mut distinct, &m.funcs)?;
+        intern_unit_sigs(&mut distinct, &m.funcs, &m.types)?;
         let distinct = distinct;
 
         // The host thunk + ctx addresses, baked into `cap.call` sites as constants.
@@ -2779,6 +2803,7 @@ impl CompiledModule {
         let nursery: Option<Box<instantiator_rt::Nursery>> = if module_uses_instantiator(m) {
             Some(Box::new(instantiator_rt::Nursery::new(
                 m.funcs.clone().into(),
+                m.types.clone().into(),
                 cap_thunk,
                 cap_ctx,
                 resolve_module,
@@ -2931,6 +2956,7 @@ impl CompiledModule {
                 &ids,
                 &m.funcs,
                 &distinct,
+                &m.types,
                 cap,
                 fiber,
                 thread,
@@ -3687,6 +3713,7 @@ impl CompiledModule {
             let seed = std::mem::take(&mut (*this).frozen_nested_seed);
             if let Some(n) = &(*this)._nursery {
                 let funcs = n.funcs();
+                let types = n.types();
                 let epoch = n.epoch_addr();
                 let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
                 let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new())); // thaw captures none
@@ -3706,6 +3733,7 @@ impl CompiledModule {
                     // copies it into the child's own guarded window, rewinds it, and copies it back.
                     match compile_child_and_run(
                         &funcs,
+                        &types,
                         entry,
                         rec.carve_off,
                         rec.size_log2,
@@ -3969,12 +3997,16 @@ impl CompiledModule {
     /// Functions using §12 fibers/threads are rejected (`Unsupported`) — the MVP restricts
     /// incremental definition to single-threaded code (DESIGN.md §22 "Concurrency"), and lowering
     /// `cont.*`/`thread.*` here would need per-unit runtime wiring this slice doesn't do.
-    pub fn define_extra(&mut self, funcs: &[Func]) -> Result<Vec<DefinedFn>, JitError> {
+    pub fn define_extra(
+        &mut self,
+        funcs: &[Func],
+        types: &[temen_ir::TypeEntry],
+    ) -> Result<Vec<DefinedFn>, JitError> {
         if funcs.is_empty() {
             return Ok(Vec::new());
         }
         for f in funcs {
-            ensure_supported(f)?;
+            ensure_supported(f, types)?;
             // Threads/futex ARE hosted (CONSOLIDATION.md §11) — but only when the domain stood up a
             // thread scheduler (`enable_thread_hosting`, driven by a thread-hosting `Jit` grant, or a
             // parent that itself uses threads). Without it the thunk addresses are null, so a
@@ -3999,7 +4031,7 @@ impl CompiledModule {
         // append-only registry BEFORE lowering, so the ids baked into this unit's dispatch
         // checks are real, stable ids — id-equality ≡ structural equality across all units
         // sharing this module, past and future (DESIGN.md §22; see `intern_type`).
-        intern_unit_sigs(&mut self.distinct, funcs)?;
+        intern_unit_sigs(&mut self.distinct, funcs, types)?;
         // Declare the unit's functions first so intra-unit direct calls can reference any of them.
         let ids: Vec<FuncId> = funcs
             .iter()
@@ -4057,6 +4089,7 @@ impl CompiledModule {
                 &ids,
                 funcs,
                 &self.distinct,
+                types,
                 self.cap,
                 self.fiber,
                 self.thread,
@@ -4482,6 +4515,8 @@ impl CompiledModule {
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn compile_child_and_run(
     funcs: &[Func],
+    // #922 — the child module's type section, threaded to `compile_child` (and on to a grandchild).
+    types: &[temen_ir::TypeEntry],
     child_entry: FuncIdx,
     sub_base: u64,
     child_size_log2: u8,
@@ -4529,6 +4564,7 @@ pub(crate) unsafe fn compile_child_and_run(
     {
         let n = Box::new(instantiator_rt::Nursery::new(
             funcs.to_vec().into(),
+            types.to_vec().into(),
             instantiator_rt::child_instantiator_thunk,
             &*child_win_size as *const u64 as *mut core::ffi::c_void,
             None, // same-module grandchildren only (separate-module is a later slice)
@@ -4566,6 +4602,7 @@ pub(crate) unsafe fn compile_child_and_run(
     // `Instantiator` (if any) is routed by `child_inst` above.
     let child = compile_child(
         funcs,
+        types,
         child_entry,
         child_size_log2,
         empty_cap_thunk,
@@ -4655,6 +4692,7 @@ pub(crate) unsafe fn compile_child_and_run(
                 let gc_args = vec![0i64; gc_nargs];
                 let out = compile_child_and_run(
                     funcs,
+                    types,
                     gc_entry,
                     rec.carve_off,
                     rec.size_log2,
@@ -4904,6 +4942,9 @@ fn declare_all_funcs(module: &mut JITModule, funcs: &[Func]) -> Result<Vec<FuncI
 #[allow(clippy::too_many_arguments)] // a child compile threads its full cap/kill/futex/nesting context
 fn compile_child(
     funcs: &[Func],
+    // #922 — the child module's type section, so `call_indirect`/`cap.call` interned type indices
+    // in `funcs` resolve to their `FuncType` during lowering.
+    types: &[temen_ir::TypeEntry],
     child_entry: FuncIdx,
     child_size_log2: u8,
     cap_thunk: CapThunk,
@@ -4941,7 +4982,7 @@ fn compile_child(
         .ok_or(JitError::Malformed)?
         .clone();
     for f in funcs {
-        ensure_supported(f)?;
+        ensure_supported(f, types)?;
         // A child using §12 fibers/threads would compile against null fiber/thread thunks (no
         // per-child runtime yet) — reject rather than emit a call through a null pointer.
         if f.uses_fibers_or_threads() {
@@ -4996,6 +5037,7 @@ fn compile_child(
             &ids,
             funcs,
             &distinct,
+            types,
             cap,
             FiberEnv::null(),
             thread_env,
@@ -5137,6 +5179,8 @@ pub fn child_compiles() -> u64 {
 #[cfg(fiber_rt)]
 pub(crate) fn compile_nondurable_child(
     funcs: &[Func],
+    // #922 — the child module's type section, threaded to `compile_child`.
+    types: &[temen_ir::TypeEntry],
     child_entry: FuncIdx,
     child_size_log2: u8,
     epoch_addr: usize,
@@ -5147,6 +5191,7 @@ pub(crate) fn compile_nondurable_child(
 ) -> Result<ChildCode, JitError> {
     compile_child(
         funcs,
+        types,
         child_entry,
         child_size_log2,
         empty_cap_thunk,
@@ -5325,7 +5370,7 @@ fn sig_from(
 
 /// Reject functions using any op outside the integer slice, so `build_clif` can lower
 /// the remainder totally. Keeping the check separate keeps the lowering readable.
-fn ensure_supported(f: &Func) -> Result<(), JitError> {
+fn ensure_supported(f: &Func, type_section: &[temen_ir::TypeEntry]) -> Result<(), JitError> {
     // The sret return-area (used for `>MAX_REG_RESULTS` results) carries 8-byte slots, so a
     // many-result signature containing a `v128` can't pass through it — reject uniformly on every
     // target (the interpreter still covers it). This function's own results + any indirect
@@ -5335,13 +5380,13 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
     }
     for blk in &f.blocks {
         if let Terminator::ReturnCallIndirect { ty, .. } = &blk.term {
-            if sret_blocked_by_v128(&ty.results) {
+            if sret_blocked_by_v128(&sig_of(type_section, *ty).results) {
                 return Err(JitError::Unsupported("v128 in a many-result signature"));
             }
         }
         for inst in &blk.insts {
             if let Inst::CallIndirect { ty, .. } = inst {
-                if sret_blocked_by_v128(&ty.results) {
+                if sret_blocked_by_v128(&sig_of(type_section, *ty).results) {
                     return Err(JitError::Unsupported("v128 in a many-result signature"));
                 }
             }
@@ -5722,6 +5767,10 @@ struct Lower<'a> {
     funcs: &'a [Func],
     /// Distinct module signatures, for `call_indirect` type ids.
     distinct: &'a [FuncType],
+    /// The unit's **type section** (#922): the call variants (`call_indirect`, `cap.call`, …)
+    /// carry a `u32` index into this, which the lowering resolves to the `FuncType` it needs for
+    /// the call signature and (via [`type_id_of`]/[`intern_type`]) the dispatch type id.
+    type_section: &'a [temen_ir::TypeEntry],
     /// The current function's **return-area pointer** variable when it returns via sret
     /// ([`uses_sret`] of its results), else `None`. A `Return` stores results through it; a tail
     /// call forwards it (the tail callee shares the caller's result type, so its sret-ness matches).
@@ -5778,6 +5827,7 @@ fn build_clif(
     ids: &[FuncId],
     funcs: &[Func],
     distinct: &[FuncType],
+    type_section: &[temen_ir::TypeEntry],
     cap: CapEnv,
     fiber: FiberEnv,
     thread: ThreadEnv,
@@ -5890,6 +5940,7 @@ fn build_clif(
         fuel_addr,
         ids,
         distinct,
+        type_section,
         srclocs,
         func_idx,
         var_labels,
@@ -6133,6 +6184,7 @@ fn lower_block(
             continue;
         }
         if let Inst::CallIndirect { ty, idx, args } = inst {
+            let ty = sig_of(lower.type_section, *ty); // #922: resolve interned call type index
             let code = indirect_dispatch(b, lower, get(&vals, *idx)?, ty);
             let sig = b.import_signature(sig_from(module, &ty.params, &ty.results));
             let mut cargs = ctx_args(b, lower);
@@ -6154,14 +6206,15 @@ fn lower_block(
             args,
         } = inst
         {
-            // CALLS.md §10.6 / increment 5 — `fuel.remaining` (self-namespace op 13): read the
-            // domain's remaining fuel **inline**, from the same host-owned cell `emit_fuel_check`
-            // charges, mirroring the interp arm that pushes `*fuel` (and charging none of its own).
-            // Fuel is safepoint-anchored and bit-exact across engines, so this returns the identical
-            // value the tree-walker does under the differential oracle (which arms counted fuel on
-            // the JIT). When no fuel is armed for this compile (`fuel_addr == 0` — the production CLI
-            // bounds runaways via the interrupt kill-path, not a counter) there is no cell to read,
-            // so report `i64::MAX` ("unmetered"): the honest answer for an unbudgeted run.
+            let sig = sig_of(lower.type_section, *sig); // #922: resolve interned call type index
+                                                        // CALLS.md §10.6 / increment 5 — `fuel.remaining` (self-namespace op 13): read the
+                                                        // domain's remaining fuel **inline**, from the same host-owned cell `emit_fuel_check`
+                                                        // charges, mirroring the interp arm that pushes `*fuel` (and charging none of its own).
+                                                        // Fuel is safepoint-anchored and bit-exact across engines, so this returns the identical
+                                                        // value the tree-walker does under the differential oracle (which arms counted fuel on
+                                                        // the JIT). When no fuel is armed for this compile (`fuel_addr == 0` — the production CLI
+                                                        // bounds runaways via the interrupt kill-path, not a counter) there is no cell to read,
+                                                        // so report `i64::MAX` ("unmetered"): the honest answer for an unbudgeted run.
             if *type_id == temen_ir::CAP_SELF_TYPE_ID && *op == 13 {
                 if !sig.results.is_empty() {
                     let v = if lower.fuel_addr != 0 {
@@ -6214,6 +6267,7 @@ fn lower_block(
             ..
         } = inst
         {
+            let sig = sig_of(lower.type_section, *sig); // #922: resolve interned call type index
             let h0 = b.ins().iconst(I32, 0);
             lower_cap_call(
                 module,
@@ -6235,6 +6289,7 @@ fn lower_block(
             import, sig, args, ..
         } = inst
         {
+            let sig = sig_of(lower.type_section, *sig); // #922: resolve interned call type index
             let h0 = b.ins().iconst(I32, 0);
             lower_cap_call(
                 module,
@@ -6259,6 +6314,7 @@ fn lower_block(
             args,
         } = inst
         {
+            let sig = sig_of(lower.type_section, *sig); // #922: resolve interned call type index
             let h = get(&vals, *handle)?;
             lower_cap_call(
                 module,
@@ -7696,6 +7752,7 @@ fn lower_block(
         }
         Terminator::ReturnCallIndirect { ty, idx, args } => {
             // Indirect tail call: table dispatch (§3c) then a guaranteed tail call.
+            let ty = sig_of(lower.type_section, *ty); // #922: resolve interned call type index
             let code = indirect_dispatch(b, lower, get(&vals, *idx)?, ty);
             let sig = b.import_signature(sig_from(module, &ty.params, &ty.results));
             let mut cargs = ctx_args(b, lower);

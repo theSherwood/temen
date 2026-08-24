@@ -1986,7 +1986,9 @@ pub enum Inst {
     /// runtime-check the selected function's signature against `ty`, then call.
     /// `idx` is an `i32` table index; results are `ty.results`.
     CallIndirect {
-        ty: FuncType,
+        /// Index into [`Module::types`] naming the [`TypeEntry::Func`] signature to
+        /// runtime-check the selected function against (FuncType interning, #922).
+        ty: u32,
         idx: ValIdx,
         args: Vec<ValIdx>,
     },
@@ -2007,7 +2009,9 @@ pub enum Inst {
     CapCall {
         type_id: u32,
         op: u32,
-        sig: FuncType,
+        /// Index into [`Module::types`] naming the operation's [`TypeEntry::Func`]
+        /// signature (FuncType interning, #922); its results are appended.
+        sig: u32,
         handle: ValIdx,
         args: Vec<ValIdx>,
     },
@@ -2025,7 +2029,10 @@ pub enum Inst {
     CallImport {
         import: u32,
         op: u32,
-        sig: FuncType,
+        /// Index into [`Module::types`] naming the op's [`TypeEntry::Func`] signature
+        /// (FuncType interning, #922). The verifier resolves the op's signature through
+        /// the import's declared interface and checks `types[sig]` equals it.
+        sig: u32,
         args: Vec<ValIdx>,
     },
     /// §7/§22 **link-form symbolic call** — the loader ABI's placeholder, never executable.
@@ -2045,7 +2052,9 @@ pub enum Inst {
     /// the **next wire rev** (whenever one happens for its own reasons); no rev is spent on it.
     CallSym {
         import: u32,
-        sig: FuncType,
+        /// Index into [`Module::types`] naming the call's [`TypeEntry::Func`] signature
+        /// (FuncType interning, #922).
+        sig: u32,
         handle: ValIdx,
         args: Vec<ValIdx>,
     },
@@ -2097,7 +2106,10 @@ pub enum Inst {
     CallImportDyn {
         ty: u32,
         op: u32,
-        sig: FuncType,
+        /// Index into [`Module::types`] naming the op's [`TypeEntry::Func`] signature
+        /// (FuncType interning, #922); the verifier checks `types[sig]` equals the
+        /// op-`op` signature of the interface `types[ty]`.
+        sig: u32,
         handle: ValIdx,
         args: Vec<ValIdx>,
     },
@@ -2951,8 +2963,16 @@ impl Inst {
     ///
     /// Most instructions append exactly one; `Store` appends none; a `Call` appends
     /// its callee's result count, so it needs the per-function result arities
-    /// (indexed by [`FuncIdx`]) to answer; `CallIndirect` carries its own signature.
-    pub fn result_count(&self, fn_results: &[usize]) -> usize {
+    /// (indexed by [`FuncIdx`]) to answer; the call variants name their signature by a
+    /// `types` index (FuncType interning, #922), so `types` is needed to resolve the arity.
+    pub fn result_count(&self, fn_results: &[usize], types: &[TypeEntry]) -> usize {
+        // Resolve the result arity of an interned signature (a `types` index naming a
+        // `TypeEntry::Func`). A malformed index/kind reports 0 — the verifier is what
+        // rejects it; this stays total (used to trace SSA slot layout, `gc.roots` masks).
+        let sig_results = |t: u32| match types.get(t as usize) {
+            Some(TypeEntry::Func(ft)) => ft.results.len(),
+            _ => 0,
+        };
         match self {
             Inst::Store { .. }
             | Inst::MemCopy { .. }
@@ -2973,11 +2993,11 @@ impl Inst {
                 1
             }
             Inst::Call { func, .. } => fn_results.get(*func as usize).copied().unwrap_or(0),
-            Inst::CallIndirect { ty, .. } => ty.results.len(),
-            Inst::CapCall { sig, .. } => sig.results.len(),
-            Inst::CallImport { sig, .. } => sig.results.len(),
-            Inst::CallImportDyn { sig, .. } => sig.results.len(),
-            Inst::CallSym { sig, .. } => sig.results.len(),
+            Inst::CallIndirect { ty, .. } => sig_results(*ty),
+            Inst::CapCall { sig, .. } => sig_results(*sig),
+            Inst::CallImport { sig, .. } => sig_results(*sig),
+            Inst::CallImportDyn { sig, .. } => sig_results(*sig),
+            Inst::CallSym { sig, .. } => sig_results(*sig),
             _ => 1,
         }
     }
@@ -3022,7 +3042,9 @@ pub enum Terminator {
     /// Indirect tail call (`return_call_indirect`): like [`Terminator::ReturnCall`]
     /// but dispatched through the function table (masked + signature-checked, §3c).
     ReturnCallIndirect {
-        ty: FuncType,
+        /// Index into [`Module::types`] naming the [`TypeEntry::Func`] signature to
+        /// runtime-check the selected function against (FuncType interning, #922).
+        ty: u32,
         idx: ValIdx,
         args: Vec<ValIdx>,
     },
@@ -4190,6 +4212,9 @@ pub fn resolve_imports_with(
         .collect::<Result<_, _>>()?;
     let mut out = module.clone();
     let fn_results: Vec<usize> = out.funcs.iter().map(|f| f.results.len()).collect();
+    // The call variants name their signature by a `types` index now (#922); snapshot the type
+    // section so `result_count` can resolve arities while `out.funcs` is mutably borrowed below.
+    let types = out.types.clone();
     for f in &mut out.funcs {
         for b in &mut f.blocks {
             // Map each value index to its defining instruction (block params → `None`) — a `Slot`
@@ -4197,7 +4222,7 @@ pub fn resolve_imports_with(
             // a *different* instruction than the `CallSym` we're rewriting.
             let mut def_of: Vec<Option<usize>> = vec![None; b.params.len()];
             for (p, inst) in b.insts.iter().enumerate() {
-                for _ in 0..inst.result_count(&fn_results) {
+                for _ in 0..inst.result_count(&fn_results, &types) {
                     def_of.push(Some(p));
                 }
             }
@@ -4211,9 +4236,9 @@ pub fn resolve_imports_with(
                     .ok_or(ImportError::BadImportIndex(import))?;
                 // Pull the call's pieces out of the placeholder so we can rebuild it.
                 let (sig, args) = match &mut b.insts[i] {
-                    Inst::CallSym { sig, args, .. } => {
-                        (core::mem::take(sig), core::mem::take(args))
-                    }
+                    // `sig` is now an interned `types` index (Copy); the rewritten call reuses
+                    // the same index for `CapCall.sig` / `CallIndirect.ty` (FuncType interning, #922).
+                    Inst::CallSym { sig, args, .. } => (*sig, core::mem::take(args)),
                     _ => unreachable!(),
                 };
                 b.insts[i] = match bind {
