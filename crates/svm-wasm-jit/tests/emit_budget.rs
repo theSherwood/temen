@@ -39,7 +39,6 @@ fn wide_module(n_callees: usize, loads_each: usize) -> Module {
                 op: LoadOp::I64,
                 addr: 0,
                 offset: 0,
-                align: 3,
             };
             loads_each
         ];
