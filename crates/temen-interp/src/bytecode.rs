@@ -3653,7 +3653,11 @@ impl<'p> Vcpu<'p> {
             ibase,
             self.mem.as_ref().map_or(0, |m| m.null_guard),
         );
-        let mod_ok = cmem_log2 == Some(size_log2 as u8);
+        // A separate-module child's carve must be **at least** its declared memory (FORK.md §8.6 / #773
+        // — a larger window is a safe superset: confinement (§2) still masks every access to the actual
+        // carve, and the span above the declared memory is the heap room an allocating phase grows into
+        // via `vm_map`). `<=`, matching the cooperative/parallel drive arms.
+        let mod_ok = cmem_log2.is_some_and(|ml| ml <= size_log2 as u8);
         if !ok_entry || !fits || !mod_ok {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
             return Ok(None);
@@ -6639,7 +6643,9 @@ fn dbg_instantiate_module(
         ibase,
         shared_mem.as_ref().map_or(0, |m| m.null_guard),
     );
-    let mod_ok = cmem_log2 == Some(size_log2 as u8);
+    // A larger carve than the child's declared memory is a safe superset (§2 masks to the actual
+    // carve); the extra span is heap room for an allocating phase's `vm_map`. `<=`, matching the arms.
+    let mod_ok = cmem_log2.is_some_and(|ml| ml <= size_log2 as u8);
     if !ok_entry || !fits || !mod_ok {
         tasks[ti]
             .vt
@@ -10527,7 +10533,11 @@ impl CoopSched {
                         ibase,
                         mem.as_ref().map_or(0, |m| m.null_guard),
                     );
-                    let mod_ok = cmem_log2 == Some(size_log2 as u8);
+                    // A separate-module child's carve must be **at least** its declared memory (FORK.md §8.6 / #773
+                    // — a larger window is a safe superset: confinement (§2) still masks every access to the actual
+                    // carve, and the span above the declared memory is the heap room an allocating phase grows into
+                    // via `vm_map`). `<=`, matching the cooperative/parallel drive arms.
+                    let mod_ok = cmem_log2.is_some_and(|ml| ml <= size_log2 as u8);
                     if !ok_entry || !fits || !mod_ok {
                         tasks[ti]
                             .vt
@@ -12080,7 +12090,11 @@ fn run_vcpu_parallel<'scope, 'env>(
                     ibase,
                     mem.as_ref().map_or(0, |m| m.null_guard),
                 );
-                let mod_ok = cmem_log2 == Some(size_log2 as u8);
+                // A separate-module child's carve must be **at least** its declared memory (FORK.md §8.6 / #773
+                // — a larger window is a safe superset: confinement (§2) still masks every access to the actual
+                // carve, and the span above the declared memory is the heap room an allocating phase grows into
+                // via `vm_map`). `<=`, matching the cooperative/parallel drive arms.
+                let mod_ok = cmem_log2.is_some_and(|ml| ml <= size_log2 as u8);
                 if !ok_entry || !fits || !mod_ok {
                     vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
                     continue;

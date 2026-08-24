@@ -17988,6 +17988,16 @@ impl Host {
             "write" => Some((cap_id::STREAM, 1u32)),
             "read" => Some((cap_id::STREAM, 0u32)),
             "exit" => Some((cap_id::EXIT, 0u32)),
+            // §3e/§4 memory management (`vm_map`/`vm_unmap`/`vm_protect`/`vm_page_size` = ops 0/1/2/3 on
+            // the `AddressSpace` cap — the same map the reference resolver uses, `temen-run` §7). An
+            // allocating §14 child (a real compiler phase's `malloc`) binds these to the child's own
+            // auto-granted `AddressSpace` (`first_of` below), whose range is exactly `[0, child_size)` —
+            // so a child grows its heap only inside its carve (confinement, §2, unchanged), rather than
+            // `CapFault`ing on its first `malloc`.
+            "vm_map" => Some((cap_id::ADDRESS_SPACE, 0u32)),
+            "vm_unmap" => Some((cap_id::ADDRESS_SPACE, 1u32)),
+            "vm_protect" => Some((cap_id::ADDRESS_SPACE, 2u32)),
+            "vm_page_size" => Some((cap_id::ADDRESS_SPACE, 3u32)),
             _ => None,
         };
         let first_of = |h: &Host, tid: u32| -> Option<i32> {
