@@ -2,7 +2,7 @@
 // codebook/jpegdct) on `short` (16-bit) arrays with `long` accumulators, vendored verbatim from
 // embench-iot src/edn/libedn.c. Unlike the idealized `fir` confine kernel (single dot, int data),
 // this exercises edn's real construct mix: strided 16-bit loads, `long`-accumulated dot products,
-// and the in-place filters — the workload embench reports svm-jit ~1.4x behind wt64 on (which the
+// and the in-place filters — the workload embench reports temen-jit ~1.4x behind wt64 on (which the
 // best-of-25 harness is here to confirm or refute, as it did for matmult).
 #define N 100
 #define ORDER 50

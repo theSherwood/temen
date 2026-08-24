@@ -16,7 +16,7 @@ the canonical "what/how/when."
 
 §19 names four pillars. The 2026-06 reassessment (this branch) established that their
 *architectural premises are built and cross-platform-validated* — the out-of-band control
-stack + per-fiber two-stack split (§5/§3d, `svm-fiber`), the deterministic interpreter oracle
+stack + per-fiber two-stack split (§5/§3d, `temen-fiber`), the deterministic interpreter oracle
 (§12/§18, `run_scheduled`/`explore_all`), capabilities (§3c/§7), and SSA promotion (§3d) — but
 the *debug surfaces themselves* are not. So this is not green-field design; it is wiring known
 surfaces onto substrate that already exists and is tested.
@@ -39,23 +39,23 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 
 | Capability | State | Where |
 |---|---|---|
-| Out-of-band per-fiber control stack (CFI; backtrace *integrity*) | **Built** | §5/§3d, `svm-fiber`, `fiber_rt` |
-| Deterministic scheduled replay (seed) | **Built** | `svm-interp` `run_scheduled` |
-| Exhaustive DPOR model checker (all interleavings) | **Built** | `svm-interp` `explore_all` (+ `_bruteforce` oracle) |
+| Out-of-band per-fiber control stack (CFI; backtrace *integrity*) | **Built** | §5/§3d, `temen-fiber`, `fiber_rt` |
+| Deterministic scheduled replay (seed) | **Built** | `temen-interp` `run_scheduled` |
+| Exhaustive DPOR model checker (all interleavings) | **Built** | `temen-interp` `explore_all` (+ `_bruteforce` oracle) |
 | Interp↔JIT differential testing of concurrency | **Built** | `jit_fuzz.rs`, `concurrent_fuzz.rs`, `fiber_fuzz.rs` |
 | SSA promotion (the inspectability-tension source) | **Built** | §3d, frontend promote pass |
 | Fuel/quota metering *properties* | **Built** | `Host::set_quota`/`quota`, §15 |
-| `cap.call` I/O record log (`CapTape`) — input caps `Clock` + stdin `read` + **any host-fn** (slots **and** buffer writes); replayed for faithful `seek` | **Built — W1 slices 2, 5** | `svm-interp` `Host::record_caps` / `CapTape` / `RecordingMem` |
-| Schedule record log (`SchedTape`) — capture a live interleaving as a replayable plan; seeded schedule fuzzing | **Built — W1 slice 4** (interp; SC ⇒ schedule *is* memory order) | `svm-interp` `Inspector::sched_tape` / `attach_scheduled_seeded` |
-| W7 model-check → replayable witness (find a failing interleaving, reproduce it) | **Built — slice 1** | `svm-interp` `find_schedule` / `replay_schedule` / `Witness` |
-| W1 time-travel — `seek(t)` / `step_back`: single-threaded (op `clock`) **and** multithreaded (global `turn`); faithful via `CapTape` | **Built — slices 1–3** | `svm-interp` `Inspector::seek` / `turn` / `step_back` |
-| Interpreter stepping / breakpoint / watchpoint / cap.call stop / backtrace / value+window read | **Built — slices 1–3** | `svm-interp` `Inspector` (single-threaded) |
-| Multithreaded debugging — fixed-schedule `thread.spawn` guest, per-thread breakpoints, replay a failing interleaving, inspect any thread (`select_task`), time-travel to a global turn | **Built — Milestone B slices 1–3** | `svm-interp` `Inspector::attach_scheduled` / `SchedDriver` |
-| Source-level debugging — chibicc `-g` → `debug.var` + `debug.loc` → named locals & `file:line` (interpreter `source_loc` nearest-preceding) | **Built — W4 slices 5–6** | `codegen_ir.c`, `svm-text`, `svm-interp` |
-| Backtrace *materialization* (unwind tables → frames) | **Built** — gdb-facing DWARF CFI (`.debug_frame`) + a host-side fiber-rooted walk of a *suspended* fiber (W5 JIT/DWARF Stage 4), **and** the always-on **trap-time** backtrace: a JIT trap (memory fault *or* explicit check) symbolizes its stack into `last_trap_backtrace()`, folded into the host kill message (W3 Stages 0–3, unix) | §5, `svm-jit` `trap_backtrace`/`fiber_backtrace`/`dwarf` |
-| Debug-info ABI (frontend-neutral IR waist; source locs + var locs + structured types) | **Built — neutral core + structured `TypeRef` table (text **and** binary); chibicc `-g` emits the full waist; **wasm ingests embedded DWARF (source lines + vars + aggregate/pointer/array types)**; **LLVM ingests `!DILocation` source lines + (`-O0`) `dbg.declare` variables/types from the textual `.ll` metadata (`ll::debug`)** — three independent producers on both halves; DAP consumes types** (D-DBG-7/§6) | `svm-ir` `DebugInfo`/`TypeDef`, `svm-text`, `svm-encode`, `svm-interp`, `codegen_ir.c`, `svm-wasm`, `svm-llvm` |
-| DAP server (interpreter-backed: source breakpoints + **conditions**, **data breakpoints** (watchpoints, incl. cross-thread), frames, locals, **source-line** stepping (in/over/out), **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`** expressions/hover incl. **member/index/arrow** (`a.b`, `arr[i]`, `p->x`), **Variables-pane struct/array/pointer expansion**, **`powerbox` launch mode** — run a capability-using guest (a chibicc `printf`) under the on-ramp I/O powerbox, streaming its captured stdout as `output` events that **rewind on reverse** via the CapTape replay) | **Built — W5 slices 1–6 + W4 slices 8, 10, 11** | `svm-dap` (`DapServer` / `backend` / `expr` / `run_stdio`) |
-| DWARF emission (gdb/lldb on JIT native code) | **Built — W5 JIT/DWARF tier, Stages 0–4** — source-line breakpoints, `print` of register **and** spilled variables, `bt` across guest frames, type DIEs, GDB JIT registration, and a fiber-rooted backtrace; all confirmed under gdb 15.1 (Stage 5 DAP-over-JIT + guest-window-memory var forms deferred) | `svm-jit` `dwarf`/`gdb`/`symbolize`/`var_locations` |
+| `cap.call` I/O record log (`CapTape`) — input caps `Clock` + stdin `read` + **any host-fn** (slots **and** buffer writes); replayed for faithful `seek` | **Built — W1 slices 2, 5** | `temen-interp` `Host::record_caps` / `CapTape` / `RecordingMem` |
+| Schedule record log (`SchedTape`) — capture a live interleaving as a replayable plan; seeded schedule fuzzing | **Built — W1 slice 4** (interp; SC ⇒ schedule *is* memory order) | `temen-interp` `Inspector::sched_tape` / `attach_scheduled_seeded` |
+| W7 model-check → replayable witness (find a failing interleaving, reproduce it) | **Built — slice 1** | `temen-interp` `find_schedule` / `replay_schedule` / `Witness` |
+| W1 time-travel — `seek(t)` / `step_back`: single-threaded (op `clock`) **and** multithreaded (global `turn`); faithful via `CapTape` | **Built — slices 1–3** | `temen-interp` `Inspector::seek` / `turn` / `step_back` |
+| Interpreter stepping / breakpoint / watchpoint / cap.call stop / backtrace / value+window read | **Built — slices 1–3** | `temen-interp` `Inspector` (single-threaded) |
+| Multithreaded debugging — fixed-schedule `thread.spawn` guest, per-thread breakpoints, replay a failing interleaving, inspect any thread (`select_task`), time-travel to a global turn | **Built — Milestone B slices 1–3** | `temen-interp` `Inspector::attach_scheduled` / `SchedDriver` |
+| Source-level debugging — chibicc `-g` → `debug.var` + `debug.loc` → named locals & `file:line` (interpreter `source_loc` nearest-preceding) | **Built — W4 slices 5–6** | `codegen_ir.c`, `temen-text`, `temen-interp` |
+| Backtrace *materialization* (unwind tables → frames) | **Built** — gdb-facing DWARF CFI (`.debug_frame`) + a host-side fiber-rooted walk of a *suspended* fiber (W5 JIT/DWARF Stage 4), **and** the always-on **trap-time** backtrace: a JIT trap (memory fault *or* explicit check) symbolizes its stack into `last_trap_backtrace()`, folded into the host kill message (W3 Stages 0–3, unix) | §5, `temen-jit` `trap_backtrace`/`fiber_backtrace`/`dwarf` |
+| Debug-info ABI (frontend-neutral IR waist; source locs + var locs + structured types) | **Built — neutral core + structured `TypeRef` table (text **and** binary); chibicc `-g` emits the full waist; **wasm ingests embedded DWARF (source lines + vars + aggregate/pointer/array types)**; **LLVM ingests `!DILocation` source lines + (`-O0`) `dbg.declare` variables/types from the textual `.ll` metadata (`ll::debug`)** — three independent producers on both halves; DAP consumes types** (D-DBG-7/§6) | `temen-ir` `DebugInfo`/`TypeDef`, `temen-text`, `temen-encode`, `temen-interp`, `codegen_ir.c`, `temen-wasm`, `temen-llvm` |
+| DAP server (interpreter-backed: source breakpoints + **conditions**, **data breakpoints** (watchpoints, incl. cross-thread), frames, locals, **source-line** stepping (in/over/out), **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`** expressions/hover incl. **member/index/arrow** (`a.b`, `arr[i]`, `p->x`), **Variables-pane struct/array/pointer expansion**, **`powerbox` launch mode** — run a capability-using guest (a chibicc `printf`) under the on-ramp I/O powerbox, streaming its captured stdout as `output` events that **rewind on reverse** via the CapTape replay) | **Built — W5 slices 1–6 + W4 slices 8, 10, 11** | `temen-dap` (`DapServer` / `backend` / `expr` / `run_stdio`) |
+| DWARF emission (gdb/lldb on JIT native code) | **Built — W5 JIT/DWARF tier, Stages 0–4** — source-line breakpoints, `print` of register **and** spilled variables, `bt` across guest frames, type DIEs, GDB JIT registration, and a fiber-rooted backtrace; all confirmed under gdb 15.1 (Stage 5 DAP-over-JIT + guest-window-memory var forms deferred) | `temen-jit` `dwarf`/`gdb`/`symbolize`/`var_locations` |
 | `Inspector`/`Monitor` capability *type* | **Missing** (pattern only) | — |
 | DRF-or-trap hardened race-detection tier | **Missing** (designed, §12) | — |
 
@@ -66,16 +66,16 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 The project has **three execution engines** but only **two debug modalities**, so "parity" means
 different things depending on which pair you compare:
 
-- **Tree-walker** (`svm-interp`, the default `run`/`Inspector` path) — the **reference debug engine and
+- **Tree-walker** (`temen-interp`, the default `run`/`Inspector` path) — the **reference debug engine and
   correctness oracle**. The full `Inspector` surface (breakpoints + conditions, watchpoints, in/over/out
   + reverse stepping, time-travel, multithreaded, the whole DAP server) runs here. When you debug *via
   DAP*, you are always on the tree-walker.
-- **Bytecode** (`svm-interp::bytecode`, the perf rewrite reached by `run_with_host_fast`) — preserves the
+- **Bytecode** (`temen-interp::bytecode`, the perf rewrite reached by `run_with_host_fast`) — preserves the
   `IrPc = (block, inst)` debug seam *by construction* (`Program::src` reverse map). `bytecode::ir_trace`
   reproduces the tree-walker's `seek(0,1,…)` stepping-location sequence op-for-op, but only for
   **single-vCPU, seam-free** runs; it **falls back to the tree-walker** for watchpoints, real
   breakpoint-stops, concurrency/coroutines, and time-travel.
-- **JIT** (`svm-jit`) — a *different modality*: it emits **DWARF** for **gdb/lldb** (W5 Stages 0–4) and an
+- **JIT** (`temen-jit`) — a *different modality*: it emits **DWARF** for **gdb/lldb** (W5 Stages 0–4) and an
   always-on trap-time source backtrace; it does **not** use the `Inspector`, and DAP-over-JIT (Stage 5)
   is deferred. The unifying mechanism that keeps all three agreeing on *where in the source* a program
   point is, is the §6 debug-info **narrow waist** (W4): every engine consumes the *same* neutral
@@ -89,12 +89,12 @@ different things depending on which pair you compare:
   `jit_trap_backtrace.rs`/`interp_trap_backtrace.rs`/`jit_per_fiber_trap.rs` (source backtraces),
   in-crate `symbolize` tests, the `gdb_attach` example (gdb 15.1).
 - *Interp ↔ JIT value/trap parity* — a large cross-engine suite (`simd`, `fiber_fuzz`, `jit_*`,
-  `multivcpu_trap_origin`, `dynlink`, plus svm-llvm `cross_engine`/`corpus_diff`). This is **result**
+  `multivcpu_trap_origin`, `dynlink`, plus temen-llvm `cross_engine`/`corpus_diff`). This is **result**
   parity, not **debug** parity.
 
 ### Known gaps (the regression risks this section tracks)
 
-- **G1 — direct cross-engine *source-location* parity assertion. ✅ Landed (`crates/svm/tests/debug_parity.rs`).**
+- **G1 — direct cross-engine *source-location* parity assertion. ✅ Landed (`crates/temen/tests/debug_parity.rs`).**
   Compiles one `-g` module and checks the tree-walker's `source_loc`, the bytecode engine's `ir_trace`
   location, **and** the JIT's `src_ranges`/`symbolize` agree on the same op→line mapping (straight-line,
   loop with repeated lines, branch). The two interpreters must match **op-for-op**; the JIT's line set
@@ -141,7 +141,7 @@ different things depending on which pair you compare:
   step-over (run a call to completion) and step-out (return from a frame) land at the same op and agree
   on the call result. So the bytecode engine now has the full **forward-debug** primitive surface —
   breakpoints, cross-frame inspection, backtrace, stepping — all parity-tested against the tree-walker.
-  *Remaining, and scope-bounded (as of this passage — since superseded):* the `svm-dap` server calls 18
+  *Remaining, and scope-bounded (as of this passage — since superseded):* the `temen-dap` server calls 18
   distinct `Inspector` methods; `DebugRun` covers the forward-debug subset, but the rest — `seek`/
   `step_back` (reverse debugging), `set_watchpoint` (data breakpoints), `select_task`/`threads`/
   `stopped_task` (multithreading) — were then outside the bytecode engine's single-vCPU debug scope.
@@ -153,7 +153,7 @@ different things depending on which pair you compare:
   the same `VarLoc`s as `Inspector::read_var` (SSA from the typed slot, window/fixed from window memory),
   with `read_var_by_name_parity` checking it matches op-for-op — so `DebugRun` now mirrors the Inspector's
   full forward API (breakpoints, stepping, backtrace, indexed **and** named inspection), all parity-tested.
-  **The server-side seam now landed.** `svm-dap` grew a `Debuggee` trait (the ~20 forward-subset
+  **The server-side seam now landed.** `temen-dap` grew a `Debuggee` trait (the ~20 forward-subset
   methods `DapServer` drives), implemented for both the tree-walker `Inspector` and a new
   `BytecodeBackend` over `DebugRun` (persistent breakpoint set + fuel; `DebugRun` gained public
   `var_addr`/`read_window` for aggregate/pointer expansion). A launch `"engine":"bytecode"` argument
@@ -165,25 +165,25 @@ different things depending on which pair you compare:
   is what a browser DAP frontend (over the wasm FFI) drives. The JIT path is Stage 5 (separate). The
   *static* source-map half is covered transitively by **G1**.
 
-  **Browser wire landed (slice 2).** The `browser/` cdylib exposes `svm_dap_request` — a JSON-in /
-  JSON-out pump over `DapServer::handle`, backed by the bytecode `Debuggee` — plus `svm_dap_reset` and
-  the `svm_dap_response_ptr`/`_len` accessors; `web/dap.js` is the JS client, and
+  **Browser wire landed (slice 2).** The `browser/` cdylib exposes `temen_dap_request` — a JSON-in /
+  JSON-out pump over `DapServer::handle`, backed by the bytecode `Debuggee` — plus `temen_dap_reset` and
+  the `temen_dap_response_ptr`/`_len` accessors; `web/dap.js` is the JS client, and
   `browser-dap-test.mjs` drives a full initialize→launch→breakpoint→variables→terminate conversation
   in real Chromium on the bytecode engine.
 
   **Playground debug panel landed (slice 3) + auto debug-info for hand-written text (slice 3b).**
-  The playground gained a "Debugger (SVM)" card driving the slice-2 wire end-to-end in the page: a
+  The playground gained a "Debugger (Temen)" card driving the slice-2 wire end-to-end in the page: a
   CodeMirror breakpoint gutter + stopped-line highlight (`editor.js`), and a `play.js` DAP session
   (initialize → launch `"engine":"bytecode"` → `setBreakpoints` from the gutter →
   `configurationDone`, then Continue / Step Over / Step In / Step Out / Stop) rendering each stop's
   named locals in a Variables pane — Chromium-verified by the editor smoke (pause at the pre-placed
   breakpoint with `i=5/acc=0`, Continue to `i=4/acc=5`, Stop restores the editor). And a
-  hand-written SVM program needs no explicit `debug` section: `svm-text::parse_module_debug`
+  hand-written Temen program needs no explicit `debug` section: `temen-text::parse_module_debug`
   synthesizes one from the source itself — a line table (each instruction → its source line) plus
   block-scoped SSA value names (params from the header, results visible once assigned); an explicit
   `debug` section still wins verbatim, and plain `parse_module` stays byte-for-byte unchanged.
-  `svm-dap` launches through it, so breakpoints bind by line and values read back by name for any
-  playground program out of the box (tests: `svm-text` synthesis, `dap_bytecode.rs`; the Chromium
+  `temen-dap` launches through it, so breakpoints bind by line and values read back by name for any
+  playground program out of the box (tests: `temen-text` synthesis, `dap_bytecode.rs`; the Chromium
   smoke drives the auto-debugged demo).
 
   **Reverse debugging landed on the bytecode engine (slice 4).** `DebugRun` gained an **op clock**
@@ -207,9 +207,9 @@ different things depending on which pair you compare:
   (fibers/coroutines/threads/non-pristine memory/stateful host) — same subset predicate as
   `VCpu::checkpointable`. Also caches the deterministic stoppable-op timeline (`RevTrace`) so `step_back`
   finds its target by lookup instead of a redundant probe replay. Gated by the warm≡cold oracle
-  `crates/svm-dap/tests/dap_checkpoints.rs` (a checkpoint-restored `seek` ≡ a from-0 `seek` at every
+  `crates/temen-dap/tests/dap_checkpoints.rs` (a checkpoint-restored `seek` ≡ a from-0 `seek` at every
   probe, forward and on a full backward sweep, with `checkpoint_count > 0` proving the ladder is
-  exercised) — the bytecode counterpart of `crates/svm/tests/debug_checkpoints.rs`. Measured **~42×** on
+  exercised) — the bytecode counterpart of `crates/temen/tests/debug_checkpoints.rs`. Measured **~42×** on
   a 64k-op reverse sweep (an `#[ignore]`d timing bench in the same file).
 
   **Extended to the multi-vCPU `ScheduledDebugRun` (slice 4-perf, threaded).** The scheduled `seek`
@@ -330,7 +330,7 @@ different things depending on which pair you compare:
   the full-set replace) — the exact request pair a VS Code data breakpoint issues, driven over the wasm
   FFI. A promoted SSA scalar has no window address, so the server returns a `null` `dataId` and the
   toggle is greyed — honestly unwatchable. The armed set is re-armed on every stop and cleared with the
-  session. A new demo card ("Debugger (SVM — watchpoints …)") carries a counter at a fixed window
+  session. A new demo card ("Debugger (Temen — watchpoints …)") carries a counter at a fixed window
   address named `count` via an explicit `debug` section, so the watch is armable and trips ("data
   breakpoint", stopping before the loop-body store writes it) — the one hand-written case where a named
   variable is memory-located rather than SSA-promoted. Covered by `dap_over_bytecode_named_watchpoint_
@@ -352,7 +352,7 @@ different things depending on which pair you compare:
   cross-thread watchpoints stay single-vCPU-only for now (the backend reports `supports_reverse` /
   `supports_watch` `false` in scheduled mode, so `stepBack`/`setDataBreakpoints` fail cleanly); `wait`/
   `notify`/fibers/`instantiate`/coroutines surface as `SchedStop::Declined`. Parity-tested against the
-  tree-walker `attach_scheduled` oracle (`crates/svm/tests/bytecode_debug_threads.rs`: a worker
+  tree-walker `attach_scheduled` oracle (`crates/temen/tests/bytecode_debug_threads.rs`: a worker
   breakpoint fires once per spawned thread on distinct vCPUs, `select_task` inspects another thread
   mid-stop, single-step advances the stopped thread, and the determinate result matches all three
   engines) and at the DAP level (`dap_over_bytecode_multithreaded_*`).
@@ -361,7 +361,7 @@ different things depending on which pair you compare:
   grows a **thread selector** — one chip per live vCPU from DAP `threads`, the stopped thread marked ●
   and focused by default; clicking another chip issues a per-thread `stackTrace` (`select_task`) and
   re-renders its stack **without resuming**, while Step/Continue still drive the stopped thread. A new
-  demo card ("Debugger (SVM — threads)") spawns two workers that atomically bump a shared counter with a
+  demo card ("Debugger (Temen — threads)") spawns two workers that atomically bump a shared counter with a
   breakpoint pre-placed in the worker, so Debug stops in each worker in turn. `browser-play-editor-
   test.mjs` drives it in real Chromium (three thread chips, the stopped one selected + marked, focusing
   another thread mid-stop, Continue past the first worker).
@@ -398,7 +398,7 @@ different things depending on which pair you compare:
   (was `SchedStop::Declined`): `bytecode_scheduled_wait_notify_completes` matches the tree-walker oracle
   and the M:N executor, `bytecode_breakpoint_after_a_wait_fires_once_woken` proves the worker actually
   parked and was woken, and `dap_over_bytecode_multithreaded_wait_notify` drives it over DAP. A
-  "Debugger (SVM — wait / notify)" playground demo (browser-verified: the worker stops after the wait,
+  "Debugger (Temen — wait / notify)" playground demo (browser-verified: the worker stops after the wait,
   woken by the root's notify, then finishes).
 
   **§12 fibers on the single-vCPU engine (slice 12).** `DebugRun` now holds a `VTask` (an active `Vm`
@@ -409,9 +409,9 @@ different things depending on which pair you compare:
   minus threads/durability. So breakpoints fire **inside** a resumed fiber, `step` descends into it, the
   backtrace/`read_var` inspect the active continuation, and reverse `seek` replays across the switches
   (deterministic). The shared `FrameReader` is unchanged — it just reads `vt.active`. Covered by
-  `crates/svm/tests/bytecode_debug_fibers.rs` (breakpoint inside a fiber, step-into a resumed fiber,
+  `crates/temen/tests/bytecode_debug_fibers.rs` (breakpoint inside a fiber, step-into a resumed fiber,
   oracle parity across the suspend/resume, deterministic tick-replay), `dap_over_bytecode_breakpoint_
-  inside_a_fiber` (over DAP), and a "Debugger (SVM — fibers / generators)" playground demo
+  inside_a_fiber` (over DAP), and a "Debugger (Temen — fibers / generators)" playground demo
   (browser-verified: cont.resume steps into the fiber, the generator finishes → 36). A fiber-only guest
   is spawn-free, so it routes to `DebugRun`.
 
@@ -796,7 +796,7 @@ deterministic / normal modes:
 - **Breakpoints**: a set of `(func, block, op-index)` or IR-PC values; the step loop checks
   before executing. Cheap.
 - **Watchpoints**: `(addr, len, RW)` ranges checked in the masked load/store helpers in
-  `svm-mem`; fires with the offending vCPU/fiber id. Address watchpoints are the headline win.
+  `temen-mem`; fires with the offending vCPU/fiber id. Address watchpoints are the headline win.
 - **Stepping**: step-op / step-over (skip to matching frame depth) / step-out using the reified
   frame stack; **per-fiber** because each fiber is a separate `Vec<Frame>`.
 - **Concurrency control**: because the interpreter owns the M:N scheduler, the debugger can
@@ -866,7 +866,7 @@ by `dpor.rs` matching the brute-force oracle. *Not yet:* W1 record/replay is the
 already built) into an actual rendered backtrace, per fiber, even after heap corruption.
 
 **Current substrate.** Integrity is done: out-of-band control stack (§5), per-fiber control+data
-pair (§3d/§23), three `svm-fiber` ABIs. On the **interpreter** a backtrace is already free — the
+pair (§3d/§23), three `temen-fiber` ABIs. On the **interpreter** a backtrace is already free — the
 reified `Vec<Frame>` *is* the call stack; W2 exposes it directly. The missing piece is the
 **JIT**, where the control stack is the Cranelift-managed machine stack and walking it needs
 frame/unwind metadata.
@@ -936,7 +936,7 @@ links, a span backstop, a 64-frame cap — so a corrupt chain terminates, async-
   return address (callers at `ret - 1`, inside the call), stopping at the first non-guest frame;
   adjacent duplicates collapse. (The frame-pointer *walk* itself lives in `trap_shim.c`'s handler —
   see the wrinkle above.) Unit-tested with a synthetic capture + a fake symbolizer.
-- [x] **Stage 1 — memory-fault backtrace.** The `svm_handler` walks the chain and stashes
+- [x] **Stage 1 — memory-fault backtrace.** The `temen_handler` walks the chain and stashes
   `pc + rets[]`; `mem::take_trap_frame` reads them; `CompiledModule::trap_backtrace` symbolizes them
   into a `Vec<JitFrameLoc>` published by `last_trap_backtrace()` after every `run`. *Tests
   (`jit_trap_backtrace.rs`, unix):* an out-of-bounds store reports a backtrace naming the faulting
@@ -975,7 +975,7 @@ links, a span backstop, a 64-frame cap — so a corrupt chain terminates, async-
 - [x] **Stage 2 — explicit-check trap backtrace.** An explicit trap has no signal — the lowered check
   stores its kind and `return`s, unwinding the guest frames — so the capture happens *at the trap
   site*: `emit_trap` (the single origin every explicit trap routes through — div/rem, `unreachable`,
-  `OutOfFuel`, indirect-call-type) emits a `call svm_capture_explicit_trap` before the store+return,
+  `OutOfFuel`, indirect-call-type) emits a `call temen_capture_explicit_trap` before the store+return,
   gated on `-g`. The helper walks the frame-pointer chain from its caller (the trapping guest frame,
   found via `__builtin_frame_address`) into the *same* thread-local the signal path uses, so the host
   symbolizes both identically; the trap site rides in `rets[0]` (symbolized at `ret − 1`, like every
@@ -995,10 +995,10 @@ links, a span backstop, a 64-frame cap — so a corrupt chain terminates, async-
 - [x] **Stage 4 — per-fiber attribution under migration (§23/D57).** The capture was vCPU-thread-rooted,
   so a work-stealing-migrated fiber (which may resume on a different vCPU thread than it suspended on)
   couldn't be *named*. Now the fiber runtime publishes the **running fiber handle** into a shared
-  `trap_capture.c` thread-local across the resume seam (`svm_set_current_fiber`, save/restore-bracketed
+  `trap_capture.c` thread-local across the resume seam (`temen_set_current_fiber`, save/restore-bracketed
   around `(*fib).resume` exactly like the durable shadow-SP swap — stack-disciplined for nested
-  resumes), and every capture path stashes it: unix memory-fault (`svm_store_trap_frame`) + explicit
-  (`svm_capture_explicit_trap`) read it directly, the Windows VEH snapshots it (`svm_current_fiber`).
+  resumes), and every capture path stashes it: unix memory-fault (`temen_store_trap_frame`) + explicit
+  (`temen_capture_explicit_trap`) read it directly, the Windows VEH snapshots it (`temen_current_fiber`).
   It rides through `take_trap_frame` → the `Domain` handoff → `CompiledModule::last_trap_fiber()`
   (`Some(handle)` for a fiber, `Some(-1)` for the root, `None` on a clean run), and the kill message
   names it (`… [fiber N] …`). Captured *at the trap instant*, so migration can't misattribute it — the
@@ -1044,8 +1044,8 @@ Exception Handler (it walks the faulting `CONTEXT`'s `Rbp` chain in `mem.rs`, va
 
 **Function names** (the readability finish-up): the §6 debug-info waist gained a `func → name` table
 (`debug_info.func_names`, text `debug.fname <func> "<name>"`, binary-encoded). **All three frontends
-populate it under `-g`** — chibicc emits `debug.fname` per function; svm-wasm reads each
-`DW_TAG_subprogram` `DW_AT_name` (mapped to its IR function by PC range); svm-llvm reads each
+populate it under `-g`** — chibicc emits `debug.fname` per function; temen-wasm reads each
+`DW_TAG_subprogram` `DW_AT_name` (mapped to its IR function by PC range); temen-llvm reads each
 `DISubprogram` source name (correlated to the IR function index by linkage name). Threaded through
 every backtrace renderer — `JitFrameLoc::func_name`, the interpreter's free `func_name(m, func)`, the
 kill message (`#0 file:line:col in compute`), and gdb's DWARF `DW_AT_name` + ELF `.symtab` — so frames
@@ -1056,7 +1056,7 @@ explicit-trap helper live in a shared `trap_capture.c`, and `emit_trap` threads 
 pointer in via Cranelift `get_frame_pointer` (sidestepping MSVC's missing `__builtin_frame_address`),
 so div-by-zero / `unreachable` / `OutOfFuel` / indirect-call-type traps capture on **unix and Windows**
 (ISSUES I5 — **resolved**, `windows-latest` confirmed green). Per-fiber naming under work-stealing
-migration (ISSUES I6) landed as Stage 4 above (`svm_set_current_fiber` / `last_trap_fiber()`,
+migration (ISSUES I6) landed as Stage 4 above (`temen_set_current_fiber` / `last_trap_fiber()`,
 `jit_per_fiber_trap.rs`).
 
 ---
@@ -1144,8 +1144,8 @@ source-level half of W2.
   binary-only (it is opaque bytes). Lean that way.
 
 **Effort / risk.** **Moderate** for the neutral core + chibicc (new IR section + encode/decode +
-verifier skip + frontend threading + text syntax; `svm-ir`, `svm-encode`, `svm-text`,
-`svm-verify` skip, `codegen_ir.c`). Low *risk* (additive, strippable, no TCB). The LLVM/wasm
+verifier skip + frontend threading + text syntax; `temen-ir`, `temen-encode`, `temen-text`,
+`temen-verify` skip, `codegen_ir.c`). Low *risk* (additive, strippable, no TCB). The LLVM/wasm
 ingest sides are scoped by their own on-ramps (LLVM.md/WASM.md), targeting this waist.
 
 **Acceptance.** A C program compiled with `--emit-ir -g` round-trips its neutral core through
@@ -1184,7 +1184,7 @@ the source-level loop on the interpreter.
 **Acceptance.** Set a breakpoint in VS Code on a `.c` line; it binds; hitting it shows the
 source frame and inspectable locals.
 
-**Built — slice 1 (interpreter-backed DAP server).** A new `svm-dap` crate translates Debug Adapter
+**Built — slice 1 (interpreter-backed DAP server).** A new `temen-dap` crate translates Debug Adapter
 Protocol requests onto the `Inspector` — so the **interpreter is the stepping engine** and source
 mapping comes straight from the §6/W4 debug info, with **no DWARF and no JIT** (the doc's recommended
 first tier; optimized-code inspection is sidestepped entirely). `DapServer::handle(request) ->
@@ -1195,7 +1195,7 @@ over `debug.loc`, snapping forward to the next line with code), `configurationDo
 `debug.var` and resolve through `read_var`), `continue`/`next`/`stepIn`/`stepOut`, `disconnect`, and
 the `stopped`/`terminated` events. JSON is hand-rolled (no serde — matching the workspace's
 dependency ethos); `run_stdio` is the `Content-Length`-framed wire loop a real client (VS Code)
-connects to, and the `svm-dap` binary is the server. Test (`dap.rs`): a scripted conversation sets a
+connects to, and the `temen-dap` binary is the server. Test (`dap.rs`): a scripted conversation sets a
 breakpoint on `sum.c:7`, hits it, and reads back the source frame plus `i = 3` / `acc = 0` — the
 acceptance, no editor needed.
 
@@ -1249,7 +1249,7 @@ editor-facing refinements, both pure DAP/interpreter-side (no ABI change):
   frame's source line changes*, so the editor advances a line at a time rather than stuttering
   op-by-op across one C line. (`stepOut` already lands in the caller.) A safety op-cap guards against
   unmapped code.
-- **Scalar expression evaluator** (`svm-dap::expr`, ~one screen, hand-rolled): integer literals,
+- **Scalar expression evaluator** (`temen-dap::expr`, ~one screen, hand-rolled): integer literals,
   frame variables, `()`, unary `- ! ~`, and the C arithmetic/bitwise/comparison/logical binops with
   C precedence; values are `i64`. It powers a richer `evaluate` (watch / hover / REPL — a bare
   variable keeps its typed form, anything else evaluates to an integer) **and conditional
@@ -1289,8 +1289,8 @@ expansion in slice 11; richer render names (the C tag) in slice 12 (all below).
 `pp[0].y`) over the structured types. The scalar `expr` evaluator grew a frontend-agnostic
 [`expr::Resolver`] trait + a [`Value`] = `Int | Place{addr, type_id}`: parsing/precedence stay in
 `expr` (now with postfix `.`/`->`/`[]`), while the *semantics* (name lookup, member/index/deref,
-integer coercion) are a callback the caller implements. `svm-dap`'s `EvalEnv` is that callback —
-pure address arithmetic over `TypeDef` + window reads, no `svm-ir`/frontend types in `expr`
+integer coercion) are a callback the caller implements. `temen-dap`'s `EvalEnv` is that callback —
+pure address arithmetic over `TypeDef` + window reads, no `temen-ir`/frontend types in `expr`
 itself. `eval_int` (conditional breakpoints) is unchanged, now a thin wrapper over the same core.
 Tests (`dap.rs`): member/index/mixed arithmetic over a struct+array, and `->`/pointer-indexing
 through a pointer; bad accesses (`p.nope`, `p.x.y`, `pp->x->y`) fail cleanly. (Pointer-deref
@@ -1301,7 +1301,7 @@ slice 13.)
 structured type's `size` (`scalar_width` → `TypeDef.size`), not the variable's *name*; the old
 C-name heuristic (`ty_width`) survives only as the fallback for name-only / legacy debug info with
 no `type_id`. That removes the one remaining C-specific assumption from the normal consumer path —
-an audit of `svm-interp` + `svm-dap` finds **zero** chibicc/frontend references and `ty_width` as
+an audit of `temen-interp` + `temen-dap` finds **zero** chibicc/frontend references and `ty_width` as
 the lone C-name site. A standing **neutrality test** (`dap.rs`,
 `dap_inspects_a_non_c_frontend_by_structured_layout_only`) inspects a debug section with *non-C*
 type names (`i32`, `Pair`, an `x.rs` file) and asserts the interpreter + DAP read and expand it
@@ -1358,13 +1358,13 @@ the JIT's addresses are *machine* pcs, so even a carried blob's line program and
 expressions must be rewritten anyway). So: synthesize DWARF from the §6 core uniformly; the native
 DWARF blobs become an optional later fidelity enhancement, not a prerequisite.
 
-**Current substrate (what exists).** `svm-jit` compiles IR → machine code via `cranelift-jit`
+**Current substrate (what exists).** `temen-jit` compiles IR → machine code via `cranelift-jit`
 (`JITModule`), one `cranelift_frontend::FunctionBuilder` per function. Cranelift already provides the
 two hooks this tier needs: `func.set_srcloc(inst, SourceLoc)` (an opaque `u32` we own, attached per
 instruction → carried into the compiled address map) and `ValueLabelsRanges = HashMap<ValueLabel,
 Vec<ValueLocRange>>` (value-location lists — *the* W6-JIT substrate, a value's
 register/stack-slot over a machine-pc range). It does **not** yet set srclocs, label values, emit
-unwind info, or produce any DWARF. The project **hand-rolls DWARF parsing** (`svm-wasm`'s
+unwind info, or produce any DWARF. The project **hand-rolls DWARF parsing** (`temen-wasm`'s
 `dwarf_line.rs`/`dwarf_info.rs`), so the ethos is to **hand-roll the writer** (the inverse) rather
 than add `gimli`; revisit only if loclist encoding gets heavy. No `gimli`/`object` deps today.
 
@@ -1374,7 +1374,7 @@ DWARF variable locations) finally land — they are stages here, not separate wo
 
 **Staged plan (slices — update status as they land):**
 
-- [x] **Stage 0 — SourceLoc threading (foundation). — Built.** `svm-jit`'s `lower_block` stamps each
+- [x] **Stage 0 — SourceLoc threading (foundation). — Built.** `temen-jit`'s `lower_block` stamps each
   emitted op with a `cranelift SourceLoc` = its `debug_info.locs` index, via a `(func,block,inst) →
   index` map (`SrcLocMap`) built in `compile` only when the module carries `-g` (threaded through
   the `Lower` struct, so the non-debug path is byte-identical). No debugger yet.
@@ -1390,19 +1390,19 @@ DWARF variable locations) finally land — they are stages here, not separate wo
 - [x] **Stage 2 — `.debug_line` + `.debug_info` synthesis + GDB JIT registration (line-level
   gdb/lldb). — built.**
   - [x] **2a — `.debug_line` synthesis.** A hand-rolled DWARF v4/DWARF32 line-program emitter
-    (`svm-jit`'s `dwarf` module, the inverse of `dwarf_line`) turns the Stage 1 `SrcRange` map into a
+    (`temen-jit`'s `dwarf` module, the inverse of `dwarf_line`) turns the Stage 1 `SrcRange` map into a
     `.debug_line` section — one self-contained sequence per range (`set_address(lo)` → set
     file/col/line → `copy` → `set_address(hi)` → `end_sequence`), so gaps never bleed a line into
     the next. `CompiledModule::debug_line_section()` exposes it. Test (`jit_srcloc.rs`): the emitted
-    bytes **round-trip through `svm_wasm::dwarf_line::parse`** and reconstruct the exact
+    bytes **round-trip through `temen_wasm::dwarf_line::parse`** and reconstruct the exact
     machine-address → (file, line) map; a non-`-g` module emits nothing.
   - [x] **2b — `.debug_info`.** `dwarf::debug_info` emits a CU DIE + a `DW_TAG_subprogram` per
     function (synthesized `fnN` name, `DW_AT_low_pc` + `DW_AT_high_pc` offset form) with a matching
     `.debug_abbrev`; `CompiledModule::debug_info_sections()` derives each function's `[low_pc,
     high_pc)` as the span of its source-mapped ranges. Test (`jit_srcloc.rs`): the pair
-    **round-trips through `svm_wasm::dwarf_info::parse`** to one subprogram whose `low_pc`/`high_pc`
+    **round-trips through `temen_wasm::dwarf_info::parse`** to one subprogram whose `low_pc`/`high_pc`
     match the function's machine extent.
-  - [x] **2c — in-memory ELF + GDB JIT registration.** `svm-jit`'s `gdb` module hand-rolls a minimal
+  - [x] **2c — in-memory ELF + GDB JIT registration.** `temen-jit`'s `gdb` module hand-rolls a minimal
     ELF64 (`build_elf`): an `SHT_NOBITS` `.text` whose `sh_addr` is the *live* code address (gdb
     reads the bytes from the inferior), the three `.debug_*` sections, and a `.symtab`/`.strtab`
     naming one `STT_FUNC` per function at its real `[lo, hi)`. `CompiledModule::elf_object()` builds
@@ -1418,7 +1418,7 @@ DWARF variable locations) finally land — they are stages here, not separate wo
     no source lines, so a `break file.c:N` never binds. ✅ **Manual acceptance confirmed:** under gdb
     15.1, `break compute.c:3` binds to the live JIT'd address (`fn0+3`) and stops there when the code
     runs (`Breakpoint 1, fn0 () at compute.c:3`); see the `gdb_attach` example
-    (`crates/svm/examples/gdb_attach.rs`) for the repro harness + the exact `gdb --batch` invocation.
+    (`crates/temen/examples/gdb_attach.rs`) for the repro harness + the exact `gdb --batch` invocation.
     *Effort: high.*
 - [~] **Stage 3 — W6-JIT value locations + DWARF variables (inspect source vars). — register vars
   done; CFA/spill forms landed with Stage 4's 4b; only the guest-window memory forms
@@ -1447,7 +1447,7 @@ DWARF variable locations) finally land — they are stages here, not separate wo
     Inter-type references (`pointee`/`elem`/field `ty`) are CU-relative `DW_FORM_ref4`s resolved by a
     fixup pass once each type DIE's offset is known. `CompiledModule` carries the `TypeDef`s;
     `debug_info_sections()` emits them ahead of the subprograms. Tests (`jit_srcloc.rs`): the base/
-    pointer/array/struct graph **round-trips through `svm_wasm::dwarf_info::parse`** with every
+    pointer/array/struct graph **round-trips through `temen_wasm::dwarf_info::parse`** with every
     `DW_AT_type` ref resolving to the right DIE, and binutils `readelf --debug-dump=info` parses it
     cleanly (refs shown as `<0x18>` → the `int` DIE). The 2b subprogram round-trip is unchanged.
   - [x] **3c — `DW_TAG_variable` DIEs + register locations. — built.** `dwarf::debug_info` now emits
@@ -1510,7 +1510,7 @@ DWARF variable locations) finally land — they are stages here, not separate wo
     backtrace is exactly `[helper @ fib.c:9 (innermost), entry @ fib.c:5]`, and a module with no
     created fiber yields an empty walk. *Effort (whole stage): med–high.*
 - [ ] **Stage 5 — DAP-over-JIT (optional; editor parity at native speed).** Either drive the JIT
-  under `svm-dap` (breakpoints via software `int3` patching or single-step over DWARF line
+  under `temen-dap` (breakpoints via software `int3` patching or single-step over DWARF line
   boundaries) so VS Code debugs native-speed code, **or** keep the interpreter as the DAP stepping
   engine and use the JIT only for speed (the two-engine question below). *Effort: high.*
 
@@ -1598,7 +1598,7 @@ Mazurkiewicz trace, so the witness is already near-minimal).
 **Acceptance.** A one-command "model-check this concurrent entry" reports the set of outcomes
 and, on a failure, hands back a schedule that `run_scheduled` reproduces and W2 can step.
 
-**Built — slice 1 (witness find + replay).** `svm-interp` now exposes the model checker as a
+**Built — slice 1 (witness find + replay).** `temen-interp` now exposes the model checker as a
 debugging tool: `find_schedule(m, func, args, fuel, max, pred) -> Option<Witness>` model-checks
 across interleavings (DPOR) and returns the **first** schedule whose outcome matches `pred`
 (deadlock / trap / specific bad result) as a replayable `Witness { plan, outcome,
@@ -1716,7 +1716,7 @@ When these are settled, fold the resolved ones into `DESIGN.md` §19 / the decis
 ## 13. Milestone-0 designs — S4, S5 (+ S1/S3 pinned, S2)
 
 Detailed pass of the shared-core items (§2a) on the **interpreter path**. Grounded in the
-interpreter as built (`crates/svm-interp/src/lib.rs`) and the frontend (`codegen_ir.c`); line
+interpreter as built (`crates/temen-interp/src/lib.rs`) and the frontend (`codegen_ir.c`); line
 refs are to the state on this branch. Designing the two highest-leverage items (S4, S5)
 **pinned S1 and S3** as a consequence (see "Cascade"), and S2 (`VarLoc`) follows from the
 frontend's existing local classification — so **five of the six core items are settled here**;
@@ -1848,10 +1848,10 @@ Three consequences:
 This pins S2 against S1 (`IrPcRange` keys on `IrPc`) and **closes the interpreter-path core:
 S1–S5 settled, only S6 (JIT-tier) remains.**
 
-### Built — Milestone A slice 1 (`svm-interp::Inspector`)
+### Built — Milestone A slice 1 (`temen-interp::Inspector`)
 
-First implementation landed against these designs (`crates/svm-interp/src/lib.rs`, tests in
-`crates/svm/tests/debug.rs`):
+First implementation landed against these designs (`crates/temen-interp/src/lib.rs`, tests in
+`crates/temen/tests/debug.rs`):
 
 - **S4 seam** — `VCpu` gained `debug: Option<Box<DebugCtx>>`; the per-op hook in `run_inner`
   consults `DebugCtx::before_op(IrPc)` and returns the new `Inner::Pause`/`Step::Pause` on a
@@ -1883,14 +1883,14 @@ takes a caller-prepared `Host` (the powerbox): `grant_*` the capabilities, pass 
 paused) powerbox to read effects — captured stdout, clock, grants. `set_cap_call_stops(true)`
 pauses *before* every `cap.call` with `StopReason::CapCall { type_id, op }` (the handle/args are
 live; `step` to perform it) — the §7 host boundary and the future W1 record/replay hook (S5). The
-module must be import-resolved (`svm_run::resolve_capability_imports`) per the new named-import
+module must be import-resolved (`temen_run::resolve_capability_imports`) per the new named-import
 model on `main`; the interpreter runs only concrete `cap.call`s. Three tests: end-to-end stdout
 capture, a boundary stop with the effect deferred until `step`, and the toggle defaulting off.
 
 **Slice 4 — W4 debug-info waist, neutral core (text).** The frontend-neutral waist (D-DBG-7/§6)
-landed as `svm_ir::DebugInfo { files, locs, vars }` on `Module::debug_info: Option<DebugInfo>`,
+landed as `temen_ir::DebugInfo { files, locs, vars }` on `Module::debug_info: Option<DebugInfo>`,
 with `VarLoc ∈ { Window{off}, Ssa{value} }` (= S2). The **text** form round-trips it
-(`debug.file` / `debug.loc` / `debug.var` directives, `svm-text`); the binary form stays
+(`debug.file` / `debug.loc` / `debug.var` directives, `temen-text`); the binary form stays
 debug-stripped for now (like the import-free rule — a follow-up). The verifier never reads it
 (§2a). The `Inspector` consumes it: `source_loc(IrPc) -> SourceLoc`, source-enriched `backtrace`
 frames, and `read_var(frame, name, width) -> VarValue` (the W4→S2 bridge — `Ssa` reads
@@ -1944,7 +1944,7 @@ formatted per `TypeDef`. Full design in §7.
 
 **Slice 10 — `evaluate` member / index / arrow.** Completes the `evaluate` half: `evaluate` resolves
 `a.b` / `arr[i]` / `p->x` (and mixes like `p.x + arr[i]`) over the structured types. The `expr`
-evaluator grew a frontend-agnostic `Resolver` trait + a `Value` (`Int | Place`); `svm-dap`'s
+evaluator grew a frontend-agnostic `Resolver` trait + a `Value` (`Int | Place`); `temen-dap`'s
 `EvalEnv` implements the navigation as address arithmetic over `TypeDef` + window reads. Full
 design in §7.
 
@@ -1971,19 +1971,19 @@ longer trips integer division-by-zero. The bare-variable `evaluate`/Variables sc
 formats window bytes through the structured type, so a `double` reads as `2.5`, not its bit
 pattern. Tests: `expr` unit tests (promotion, short-circuit) + a DAP test over a window `double`.
 
-**Slice 14 — binary serialization of the debug section.** `svm-encode` now encodes/decodes the
+**Slice 14 — binary serialization of the debug section.** `temen-encode` now encodes/decodes the
 full `DebugInfo` (files, locs, the structured type table, vars) as a strippable section appended
 after the funcs, so debug info survives the binary IR form, not just text. It's **append-only and
 back-compatible**: a module with no debug info encodes byte-identically to before (the decoder
-treats "no bytes after the funcs" as `None`), so existing blobs and `svm-snapshot` digests are
+treats "no bytes after the funcs" as `None`), so existing blobs and `temen-snapshot` digests are
 unchanged — verified by a prefix assertion. The decoder keeps the untrusted-input discipline
 (bounded counts, UTF-8-checked strings, validated discriminants → typed `DecodeError`s) and the
-verifier still ignores the section (§2a). Tests (`svm-encode`): a module exercising every
+verifier still ignores the section (§2a). Tests (`temen-encode`): a module exercising every
 `TypeDef` variant + `VarLoc` + `type_id` round-trips; the no-debug case stays a byte-prefix; a
 corrupted section fails to decode without panicking.
 
 **Slice 15 — wasm DWARF → `debug.loc` (the second producer; frontend-neutrality demonstrated).**
-`svm-wasm` now ingests a guest's embedded DWARF `.debug_line` and maps it onto the **same neutral
+`temen-wasm` now ingests a guest's embedded DWARF `.debug_line` and maps it onto the **same neutral
 `DebugInfo` waist** chibicc populates — so a *second*, independent frontend produces source
 locations the interpreter/DAP consume unchanged. A small hand-rolled DWARF v2–v4 line-program
 reader (`dwarf_line.rs`, no `gimli` dep — matching the crate's lean ethos) decodes the
@@ -2100,8 +2100,8 @@ Point p` ingests as an `Aggregate{x@0,y@4,size 8}`, `int row[3]` as `Array{count
 Point *pp` as a `Pointer` whose pointee is the same aggregate — all `WindowVia` into the C frame.
 
 **Slice 24 — LLVM `!DILocation` → the waist (a *third* producer feeds the source-line half).** The
-AOT LLVM-bitcode on-ramp (`svm-llvm`) now populates the §6 neutral core's **source-line half**: each
-LLVM instruction's `!DILocation` (via `llvm-ir`'s `HasDebugLoc`) is keyed onto the SVM `(func,
+AOT LLVM-bitcode on-ramp (`temen-llvm`) now populates the §6 neutral core's **source-line half**: each
+LLVM instruction's `!DILocation` (via `llvm-ir`'s `HasDebugLoc`) is keyed onto the Temen `(func,
 block, inst)` pc it lowered to, with a deduped `files` table — a `DebugAcc` threaded through
 `translate_func`/`translate_block` (each defined function's final index is `base + i`, accounting
 for the synthesized `_start`). A non-`-g` build carries no debug section (byte-identical to before).
@@ -2117,7 +2117,7 @@ metadata reader `ll::debug` — validated byte-identical against it — and dele
 dropped libLLVM; LLVM.md §8 Q1b PR3/PR4. The ingest semantics below are unchanged.)*
 The pinned `llvm-ir` 0.11.3 leaves the structured metadata graph unimplemented
 (`Metadata::from_llvm_ref` is `unimplemented!`, `MetadataOperand` is payloadless), so a new
-[`svm-llvm::di`] module reads the DI graph **directly through `llvm-sys`** (the fallback reader
+[`temen-llvm::di`] module reads the DI graph **directly through `llvm-sys`** (the fallback reader
 `LLVM.md` §8 sanctioned), re-parsing the same `.bc` into its own context and walking it. At `-O0
 -g` every C local is an `alloca` + `llvm.dbg.declare(addr, !DILocalVariable, !DIExpression)`; the
 reader recovers each variable's **name + structured type** (a recursive, cycle-safe `intern_type`
@@ -2159,24 +2159,24 @@ all three on the source-line half, all three on the variable+type half.)
 
 **Slice 27 — the LLVM producer driven through the *DAP server* end-to-end.** The prior LLVM slices
 proved the waist at the interpreter-`Inspector` level; this one closes the loop through the **actual
-W5 DAP consumer**. A real LLVM-bitcode → SVM-IR translation (with its §6 debug info) is serialized to
+W5 DAP consumer**. A real LLVM-bitcode → TEMEN-IR translation (with its §6 debug info) is serialized to
 text (`print_module` — the debug info survives the round-trip the DAP server launches from) and
 driven over the Debug Adapter Protocol: a source breakpoint **binds by line** to the recorded clang
 path, the Variables pane **expands the LLVM-ingested `struct`** (a nonzero `variablesReference` →
 `x`/`y` members), and **`evaluate("p.x + p.y")`** reads members over the structured type. So the LLVM
 frontend's debug output is fully DAP-inspectable, the same as chibicc's and wasm's — the §6 waist is
 *frontend-neutral all the way to the debugger UI*, not just at ingest. Test (`dap_over_llvm.rs`, a
-new `svm-dap` dev-dep on the LLVM-only lane): a `-O0 -g` `struct Point` guest stops at its `return`
+new `temen-dap` dev-dep on the LLVM-only lane): a `-O0 -g` `struct Point` guest stops at its `return`
 line and expands to `x=5, y=6`, with `evaluate` yielding `11`.
 
 **Slice 28 — module-scoped globals (a schema-level waist extension across all consumers).** Source
 **global** variables don't fit the function-scoped, data-SP-relative local model, so the §6 waist
 gains two small, frontend-neutral primitives: a `VarLoc::Fixed { addr }` (an *absolute* window
 address, not `data-SP + off`) and a `GLOBAL_SCOPE` sentinel `VarInfo::func` (`u32::MAX`, visible in
-*every* frame). These thread through the whole stack — `svm-ir` (the variant + sentinel), `svm-encode`
-(tag 4), `svm-text` (`debug.var global "<n>" fixed <addr>`, in both the parser **and** the
-header-prescan), `svm-interp` (`read_var`/`var_addr` resolve `Fixed`; a `var_in_scope` helper ORs the
-sentinel into every lookup), and `svm-dap` (globals show in each frame's Variables pane and resolve in
+*every* frame). These thread through the whole stack — `temen-ir` (the variant + sentinel), `temen-encode`
+(tag 4), `temen-text` (`debug.var global "<n>" fixed <addr>`, in both the parser **and** the
+header-prescan), `temen-interp` (`read_var`/`var_addr` resolve `Fixed`; a `var_in_scope` helper ORs the
+sentinel into every lookup), and `temen-dap` (globals show in each frame's Variables pane and resolve in
 `evaluate`). The LLVM producer then reads each global's `!dbg` `DIGlobalVariableExpression` (via a
 direct `llvm-sys` walk — `LLVMGlobalCopyAllMetadata` → `DIGlobalVariable`, op 1 = name / op 3 = type)
 and correlates it by **symbol name** to `globals_layout`'s window address → a `Fixed` global with its

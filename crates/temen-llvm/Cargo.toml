@@ -1,0 +1,50 @@
+[package]
+name = "temen-llvm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# The AOT **LLVM-bitcode → TEMEN-IR on-ramp** (D54; see `LLVM.md`). Like the chibicc fork and
+# `temen-wasm`, it is a **frontend, not part of the escape-TCB**: it consumes `temen-ir` to produce
+# a verifier-checked `Module` and is never a dependency of `temen-jit`/`temen-interp`. Its output is
+# re-verified, so a translation bug is a clean error, not an escape (§2a).
+#
+# It reads **textual LLVM IR** (`.ll`) with an in-house, pure-Rust reader (`ll`) — **no libLLVM link**
+# (LLVM.md §8 Q1a). The legacy `translate_bc_path` disassembles a `.bc` out-of-process via `llvm-dis`
+# (an ordinary build-time tool, like `clang` — §Q2), so nothing links libLLVM into this crate.
+
+[dependencies]
+temen-ir = { path = "../temen-ir" }
+# The `temen-llvm-translate` CLI emits the translated module as text (`.temt`) or binary (`.temen`);
+# pure-Rust serializers (no LLVM), shared with the runtime crates.
+temen-text = { path = "../temen-text" }
+temen-encode = { path = "../temen-encode" }
+
+[dev-dependencies]
+temen-verify = { path = "../temen-verify" }
+temen-interp = { path = "../temen-interp" }
+# The JIT, so every translation test is also an interp↔JIT differential (the §18 oracle).
+temen-jit = { path = "../temen-jit" }
+# The partial evaluator (§20c): the end-to-end Futamura demo specializes a real LLVM-translated
+# interpreter against a fixed program and measures the size/speed win (`tests/peval_demo.rs`).
+temen-peval = { path = "../temen-peval" }
+# The reference host/powerbox — drives a capability-using program (`_start`) end-to-end (the Lane C
+# demo: real stdout + exit code vs native), and resolves §7 named imports to concrete capabilities.
+temen-run = { path = "../temen-run" }
+# The POSIX personality — the `posix_cap` bridge test grants it by name and reads its captured state.
+temen-posix = { path = "../temen-posix" }
+# The W5 DAP server — drives a *real* LLVM-translated module (its §6 debug info, serialized to text)
+# through the Debug Adapter Protocol end-to-end, proving the LLVM producer feeds the DAP consumer.
+temen-dap = { path = "../temen-dap" }
+# The W5 §3e self-host oracle: `w5_leng_run` runs the guest temen-leng on temen and asserts its in-sandbox
+# translation is byte-identical to the same `translate_to_text` run host-side. `default-features = false`
+# = the integer-only guest build (the fixture is built the same way), though the fixed Leng module has
+# no floats so the emitted text is identical either way.
+temen-leng = { path = "../temen-leng", default-features = false }
+
+# The library is the lib target; the `temen-llvm-translate` CLI is an explicit bin so the
+# **separate-artifact** path is scriptable: translate a `.bc` once to a `.temt`/`.temen` module plus a
+# `.syms` export sidecar, then a frontend links many programs against it (`temen_ir::link`).
+[[bin]]
+name = "temen-llvm-translate"
+path = "src/bin/translate.rs"

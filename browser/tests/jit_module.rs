@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use svm_browser::{onramp_exec, JitOnrampRun};
+use temen_browser::{onramp_exec, JitOnrampRun};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
 const WIN_LOG2: u8 = 25; // 32 MiB window (holds Lua/SQLite's heap; the emitted run can't grow it)
@@ -25,15 +25,15 @@ struct Out {
 }
 
 /// Interpreter oracle via `onramp_exec`.
-fn interp(m: &svm_ir::Module, stdin: &[u8]) -> (Out, u128) {
+fn interp(m: &temen_ir::Module, stdin: &[u8]) -> (Out, u128) {
     let t0 = Instant::now();
     let o = onramp_exec(m, stdin);
     let us = t0.elapsed().as_micros();
     (
         Out {
             stdout: o.stdout,
-            exited: o.status == svm_browser::STATUS_EXIT,
-            code: if o.status == svm_browser::STATUS_EXIT {
+            exited: o.status == temen_browser::STATUS_EXIT,
+            code: if o.status == temen_browser::STATUS_EXIT {
                 o.exit_code
             } else {
                 o.value as i32
@@ -44,7 +44,7 @@ fn interp(m: &svm_ir::Module, stdin: &[u8]) -> (Out, u128) {
 }
 
 /// wasm-JIT run: emitted `f0` on `wasmi`, cross-tier helpers on the interpreter over the shared window.
-fn jit(m: &svm_ir::Module, stdin: &[u8]) -> (Out, u128) {
+fn jit(m: &temen_ir::Module, stdin: &[u8]) -> (Out, u128) {
     let engine = Engine::default();
     let pages = ((WIN_BASE as u64 + WIN_SIZE) / (64 * 1024)) as u32;
     let mut store: Store<Option<JitOnrampRun>> = Store::new(&engine, None);
@@ -68,12 +68,12 @@ fn jit(m: &svm_ir::Module, stdin: &[u8]) -> (Out, u128) {
         .slots()
         .iter()
         .map(|v| match v {
-            svm_interp::Value::I32(x) => *x,
-            svm_interp::Value::I64(x) => *x as i32,
+            temen_interp::Value::I32(x) => *x,
+            temen_interp::Value::I64(x) => *x as i32,
             _ => 0,
         })
         .collect();
-    let rtys: Vec<svm_ir::ValType> = run.func_sig(0).1.to_vec();
+    let rtys: Vec<temen_ir::ValType> = run.func_sig(0).1.to_vec();
     let module = match WModule::new(&engine, &emitted_wasm) {
         Ok(m) => m,
         Err(e) => panic!(
@@ -101,7 +101,7 @@ fn jit(m: &svm_ir::Module, stdin: &[u8]) -> (Out, u128) {
                     let (p, rs) = r.func_sig(func as u32);
                     (p.to_vec(), rs.to_vec())
                 };
-                let args: Vec<svm_interp::Value> = {
+                let args: Vec<temen_interp::Value> = {
                     let data = memory.data(&caller);
                     params
                         .iter()
@@ -110,8 +110,8 @@ fn jit(m: &svm_ir::Module, stdin: &[u8]) -> (Out, u128) {
                             let o = args_ptr as usize + i * 8;
                             let raw = u64::from_le_bytes(data[o..o + 8].try_into().unwrap());
                             match t {
-                                svm_ir::ValType::I32 => svm_interp::Value::I32(raw as i32),
-                                _ => svm_interp::Value::I64(raw as i64),
+                                temen_ir::ValType::I32 => temen_interp::Value::I32(raw as i32),
+                                _ => temen_interp::Value::I64(raw as i64),
                             }
                         })
                         .collect()
@@ -129,8 +129,8 @@ fn jit(m: &svm_ir::Module, stdin: &[u8]) -> (Out, u128) {
                                 break;
                             }
                             let raw = match v {
-                                svm_interp::Value::I32(x) => *x as u32 as u64,
-                                svm_interp::Value::I64(x) => *x as u64,
+                                temen_interp::Value::I32(x) => *x as u32 as u64,
+                                temen_interp::Value::I64(x) => *x as u64,
                                 _ => 0,
                             };
                             let o = args_ptr as usize + i * 8;
@@ -166,7 +166,7 @@ fn jit(m: &svm_ir::Module, stdin: &[u8]) -> (Out, u128) {
     let mut results: Vec<Val> = rtys
         .iter()
         .map(|t| match t {
-            svm_ir::ValType::I32 => Val::I32(0),
+            temen_ir::ValType::I32 => Val::I32(0),
             _ => Val::I64(0),
         })
         .collect();
@@ -206,12 +206,12 @@ fn jit(m: &svm_ir::Module, stdin: &[u8]) -> (Out, u128) {
     )
 }
 
-fn asset(name: &str) -> Option<svm_ir::Module> {
-    let p = format!("web/assets/{name}.svmb");
+fn asset(name: &str) -> Option<temen_ir::Module> {
+    let p = format!("web/assets/{name}.temen");
     if !Path::new(&p).exists() {
         return None;
     }
-    Some(svm_encode::decode_module(&std::fs::read(&p).unwrap()).expect("decode"))
+    Some(temen_encode::decode_module(&std::fs::read(&p).unwrap()).expect("decode"))
 }
 
 fn differential(name: &str, stdin: &[u8]) {

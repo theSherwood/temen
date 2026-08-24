@@ -1,0 +1,26 @@
+[package]
+name = "temen-webgpu"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# A **headless WebGPU compute capability** for the Temen (LLVM.md §"GPU via a WebGPU capability").
+# The host holds a real GPU device via `wgpu`; the guest drives it over the generic §7
+# host-defined-capability surface (`__vm_cap_resolve` + `__vm_host_call`), so it needs **no
+# translator change** and is never on the escape-TCB — the cap is re-verified IR like any other.
+#
+# Kept **out of the workspace** (root `Cargo.toml` `exclude`, like `temen-llvm`/`fuzz`/`bench`) so the
+# heavy `wgpu` dependency never enters the default `cargo build`/`test`. Runs headless via lavapipe
+# (Mesa software Vulkan) in CI — no physical GPU required.
+
+[dependencies]
+temen-run = { path = "../temen-run" }
+temen-interp = { path = "../temen-interp" }
+wgpu = "24"
+pollster = "0.4"
+
+[dev-dependencies]
+temen-llvm = { path = "../temen-llvm" }
+temen-verify = { path = "../temen-verify" }
+# Encode the guest-rendered RGBA into a PNG (demo 3 artifact) in the test.
+image = { version = "0.25", default-features = false, features = ["png"] }

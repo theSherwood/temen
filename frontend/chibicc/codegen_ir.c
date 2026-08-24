@@ -1,6 +1,6 @@
-// codegen_ir.c — SVM text IR backend for chibicc (DESIGN.md §3d).
+// codegen_ir.c — Temen text IR backend for chibicc (DESIGN.md §3d).
 //
-// Walks chibicc's typed AST and emits the SVM text IR our verifier/interpreter/JIT
+// Walks chibicc's typed AST and emits the Temen text IR our verifier/interpreter/JIT
 // consume, instead of x86-64 assembly. This is the C frontend's lowering: source UB is
 // resolved here into the IR's total semantics (§3b), and the *verifier* — not this code
 // — is what enforces escape-freedom (§2a), so the frontend is outside the escape-TCB.
@@ -32,7 +32,7 @@
 // data-SP. **Stdio over the powerbox** (§3e): `write`/`read`/`exit` are recognized builtins
 // lowered to a §7 **named import** (`call.sym "write"/"read"/"exit"`) on the stashed
 // Stream/Exit handle — the host binds each name to its (type_id, op) at load (see
-// `svm_run::default_cap_resolver`), so real C reaches stdout/stdin and terminates with an exit
+// `temen_run::default_cap_resolver`), so real C reaches stdout/stdin and terminates with an exit
 // code without the frontend hardcoding the capability's interface id. (Likewise every `__vm_*`
 // capability builtin below: the frontend emits `call.sym "<name>"` + the handle; the host
 // resolves the operation. The non-capability `__vm_*` ops — atomics/fibers/threads — stay IR
@@ -74,7 +74,7 @@ extern bool opt_child_entry; // --child-entry: emit function 0 with the §14 chi
 // --emit-object: emit a *linkable unit* (native `cc -c`), not a whole program. Each non-`static`
 // function is `export`ed by name, and a call to a declared-but-undefined function is lowered to a
 // **function-symbol import** (`call.sym "name"` with the callee's real signature) instead of the
-// generic capability import — so `svm_ir::link` resolves it to a direct cross-unit call. `static`
+// generic capability import — so `temen_ir::link` resolves it to a direct cross-unit call. `static`
 // functions stay internal (never exported), so same-named file-local statics across TUs never
 // collide. `_start` is still emitted only for the unit that defines `main` (the entry unit).
 extern bool opt_emit_object;
@@ -246,7 +246,7 @@ static int case_block_of(Node *n) {
 
 // Each C label (and the `goto`s that target it) maps to one IR block, keyed by chibicc's
 // resolved `unique_label`. A block number is allocated on first reference — whether that
-// is the label or a (forward) `goto` — so forward gotos work (svm-text resolves block
+// is the label or a (forward) `goto` — so forward gotos work (temen-text resolves block
 // targets by name, not position). Reset per function.
 static char *label_name[1024];
 static int label_blk[1024];
@@ -296,7 +296,7 @@ static int start_off; // 1 if a `_start` occupies function index 0, else 0
 #define RESERVED_BYTES 32
 
 // The §3e powerbox **args buffer** (argv/env) the runtime seeds at `[POWERBOX_ARGS_BASE,
-// POWERBOX_ARGS_END)` (matching `svm_ir::POWERBOX_ARGS_BASE`/`POWERBOX_ARGS_END`): `{ argc:u32-LE,
+// POWERBOX_ARGS_END)` (matching `temen_ir::POWERBOX_ARGS_BASE`/`POWERBOX_ARGS_END`): `{ argc:u32-LE,
 // envc:u32-LE }` then the packed NUL-terminated argv+env strings. A `main(int, char**)` program's
 // `_start` parses this into `argc`/`argv` (see `emit_start`); to keep the buffer clear of writable
 // globals, such a program's data region is shifted to start at `POWERBOX_ARGS_END` (`layout_globals`).
@@ -1019,7 +1019,7 @@ static int gen_builtin_exit(Node *node) {
 }
 
 // `<setjmp.h>` non-local jump (FORK.md / #795 — the bash keystone). `setjmp`/`_setjmp`/`__setjmp`/
-// `sigsetjmp` lower to the runtime `setjmp` op (svm-ir): it checkpoints the current frame's resume point
+// `sigsetjmp` lower to the runtime `setjmp` op (temen-ir): it checkpoints the current frame's resume point
 // (block/pc/SSA vals/data-SP) keyed by the `jmp_buf` window address and returns `0` on the direct call; a
 // later `longjmp` on the same buffer unwinds the stack back here and re-enters, returning the long-jump
 // value ("returns twice"). The whole runtime (op, checkpoint table, both dispatch arms) already exists —
@@ -1099,7 +1099,7 @@ static int gen_builtin_page_size(Node *node) {
 // stdout/stdin without recursing into its own definition. `__vm_stream_write(buf,len)` /
 // `__vm_stream_read(buf,len)` lower to `call.sym "stream_write"/"stream_read"` on the Stream cap (the
 // host binds each name to its `(type_id, op)` — Stream op1/op0 — at load). The on-ramp reaches the same
-// endpoints through the `__vm_stream_*` svm-llvm intrinsics; this is the emit-object equivalent.
+// endpoints through the `__vm_stream_*` temen-llvm intrinsics; this is the emit-object equivalent.
 static int gen_builtin_stream_raw(Node *node, const char *name) {
   Node *a = node->args;
   if (!a || !a->next || a->next->next)
@@ -1119,7 +1119,7 @@ static int gen_builtin_stream_raw(Node *node, const char *name) {
 // generic host-cap lowering (`gen_builtin_import`) is off — so file I/O needs a recognized builtin. This
 // is it: `__vm_fs(op, a, b, c, d)` lowers to `call.sym "vm_fs"` with the **op selected by arg0** (mirroring
 // `__vm_host_call(handle, op, …)` but as a single named import), so the whole fs op protocol
-// (open/read/write/seek/close/stat — `crates/svm-run/src/fs.rs`) rides one manifest slot the host binds to
+// (open/read/write/seek/close/stat — `crates/temen-run/src/fs.rs`) rides one manifest slot the host binds to
 // a seeded memfs. Args are simple expressions (like the other `__vm_*` builtins); no branching args.
 static int gen_builtin_fs(Node *node) {
   int argc = 0;
@@ -1168,7 +1168,7 @@ static int gen_builtin_blocking_handle(Node *node) {
 
 // `__vm_cap(i)` returns the i-th stashed powerbox handle (an `i32`) — the reserved-region slot at
 // byte offset `i*4` (i in 0..7: stdout, stdin, exit, memory, addrspace, ioring, blocking, jit; see
-// the VM_CAP_* macros in include/svm.h). This is how C code obtains a capability handle to pass as
+// the VM_CAP_* macros in include/temen.h). This is how C code obtains a capability handle to pass as
 // the first argument of a §7 named-import capability call (`gen_builtin_import`) — so a *new* host
 // capability is reachable as a plain `extern` with no frontend change.
 static int gen_builtin_cap(Node *node) {
@@ -1188,7 +1188,7 @@ static int gen_builtin_cap(Node *node) {
 // to `call.sym "<name>"`: the first C argument is the capability **handle** (an `i32`, e.g. from
 // `__vm_cap`), the rest are the operation arguments, and the op signature is the C signature minus
 // the handle. The host binds the name to a concrete `(type_id, op)` at load (the §7 late binding,
-// `svm_run::default_cap_resolver`), so a brand-new capability needs no frontend change — just an
+// `temen_run::default_cap_resolver`), so a brand-new capability needs no frontend change — just an
 // `extern` declaration and a host that knows the name. Args are simple expressions (no branching),
 // like the other capability builtins.
 static int gen_builtin_import(Node *node) {
@@ -1582,7 +1582,7 @@ static int gen_builtin_fiber_resume(Node *node) {
   cg("  i32.store v%d v%d\n", done, status); // *done = cont.resume status: 0 suspended (guest
   // yield; value = yielded i64), 1 returned, 3 FIBER_PARKED (event-parked on a `memory.wait`
   // inside the fiber — value 0, not done; re-poll with another resume). Treating `!= 1` as
-  // "suspended, take value" drops the continuation on a park (§3.6 slice 5a; svm PR #442).
+  // "suspended, take value" drops the continuation on a park (§3.6 slice 5a; temen PR #442).
   return value;                                       // the yielded/returned i64
 }
 
@@ -2062,7 +2062,7 @@ static int gen_expr(Node *node) {
         //
         // In `--emit-object` mode this is different: an undefined extern is a **cross-TU function**,
         // not a capability. Fall through to the normal call path, which emits a `call.sym "name"`
-        // function-symbol import (see the emission below) for `svm_ir::link` to resolve to a direct
+        // function-symbol import (see the emission below) for `temen_ir::link` to resolve to a direct
         // call against the defining unit. The intercepted builtins above (`write`/`read`/`exit`,
         // `__vm_*`) still win in both modes — a personality that needs a raw capability reaches it
         // through those, exactly as it does today.
@@ -2364,10 +2364,10 @@ static void gen_for(Node *node) {
   if (node->cond) {
     int c = gen_truth(node->cond); // normalize to an i32 0/1 br_if condition
     // Emit the test INVERTED so the body is the fall-through (else) edge and the loop exit is the
-    // taken (then) edge. svm-jit lowers a `br_if`'s second target as the fall-through, so putting
+    // taken (then) edge. temen-jit lowers a `br_if`'s second target as the fall-through, so putting
     // the body there costs one taken branch per iteration (the back-edge) instead of two (a taken
     // branch into the body *plus* the back-edge). Pure layout win — ~2x on a tight data-stack loop
-    // (the `locals_c` bench) — and it mirrors what svm-wasm emits for `br_if $done`. This is the
+    // (the `locals_c` bench) — and it mirrors what temen-wasm emits for `br_if $done`. This is the
     // test-at-top form (`for`/`while`); `do/while` already tests on the back-edge, so it's untouched.
     int nc = nv++;
     cg("  v%d = i32.eqz v%d\n", nc, c);
@@ -3109,7 +3109,7 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
   // unchanged, and there is no implicit guest/host slot-index agreement: the guest asks for
   // "stdout", the host answers or fails closed. A `export "_start" 0` marks func 0 as the powerbox
   // entry (the old 3-8 `i32` params that used to tag it are gone; see `is_named_powerbox_entry`).
-  // Names + slot order match `svm_run::POWERBOX_CAP_NAMES` / the `VM_CAP_*` order. Only the caps the
+  // Names + slot order match `temen_run::POWERBOX_CAP_NAMES` / the `VM_CAP_*` order. Only the caps the
   // program actually uses (`cap_mask`) are resolved — a personality-only program resolves none.
 #define NHANDLES 8
   static const char *const cap_names[NHANDLES] = {"stdout", "stdin",  "exit",     "memory",
@@ -3176,7 +3176,7 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
   // build `argv[]` (a `char*` per arg, plus the `argv[argc] == NULL` terminator) at `data_end` (the
   // entry SP, reused after the transient name scratch above), then call `main(main_sp, argc, argv)`
   // with `main`'s frame relocated just above the array (16-byte aligned) so it never overwrites `argv[]`. The
-  // loop mirrors `svm-llvm`'s `synth_start_argv`. Block value numbers are block-local (chibicc IR).
+  // loop mirrors `temen-llvm`'s `synth_start_argv`. Block value numbers are block-local (chibicc IR).
   if (needs_argv) {
     int mi = func_index(main_fn);
     int vab = nv++;
@@ -3689,7 +3689,7 @@ void codegen_ir(Obj *prog, FILE *out) {
   for (int i = 0; i < nfuncs; i++)
     gen_func(funcs[i]);
 
-  // `--emit-object`: publish this unit's external-linkage symbols so `svm_ir::link` can resolve
+  // `--emit-object`: publish this unit's external-linkage symbols so `temen_ir::link` can resolve
   // another unit's `call.sym` to a direct call. Every non-`static` function is exported by name at
   // its module index; `static` functions stay internal (unexported), so file-local statics of the
   // same name in different TUs never collide. `emit_start` already exported `_start` as export 0

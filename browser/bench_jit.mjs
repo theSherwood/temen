@@ -1,11 +1,11 @@
-// V8 (Node) timing runner for the **svm-wasmjit** cross-engine row: it times SVM IR **JIT-compiled
-// to wasm** (the `svm-wasmjit` emitter) running the same LLVM-frontend IR kernel as `bench.mjs`'s
-// svm-bytecode-wasm row — so the two rows, side by side, are the interpreter-in-wasm vs the
+// V8 (Node) timing runner for the **temen-wasmjit** cross-engine row: it times Temen IR **JIT-compiled
+// to wasm** (the `temen-wasmjit` emitter) running the same LLVM-frontend IR kernel as `bench.mjs`'s
+// temen-bytecode-wasm row — so the two rows, side by side, are the interpreter-in-wasm vs the
 // JIT-in-wasm on identical IR (see BROWSER.md § "wasm-JIT tier"). Unlike the interpreter row, the
-// module is **compiled once** (like the native svm-jit row) and only the emitted `f{func}` calls are
+// module is **compiled once** (like the native temen-jit row) and only the emitted `f{func}` calls are
 // timed; a kernel outside the JIT's integer subset exits 4 so the driver marks the row n/a.
 //
-//   node bench_jit.mjs <svm_browser.wasm> <kernel.svmbc> <func> <sp> <small> <large>
+//   node bench_jit.mjs <temen_browser.wasm> <kernel.temenc> <func> <sp> <small> <large>
 //
 // stdout: two lines — "<per_iter_ns>" then "<result@small>" — matching bench.mjs's parse, the second
 // line a correctness anchor the Rust driver cross-checks against native bytecode (a mismatch is a
@@ -16,7 +16,7 @@ import { engineImports } from './engine-imports.mjs';
 
 const [wasmPath, kernelPath, funcS, spS, smallS, largeS] = process.argv.slice(2);
 if (!largeS) {
-  console.error('usage: node bench_jit.mjs <svm_browser.wasm> <kernel.svmbc> <func> <sp> <small> <large>');
+  console.error('usage: node bench_jit.mjs <temen_browser.wasm> <kernel.temenc> <func> <sp> <small> <large>');
   process.exit(2);
 }
 const func = Number(funcS);
@@ -33,27 +33,27 @@ const u8 = () => new Uint8Array(ex.memory.buffer);
 
 // Emit the kernel to a NON-SHARED wasm module (shared=0), rooted at `func` as the JIT entry.
 const bytes = readFileSync(kernelPath);
-const mptr = ex.svm_alloc(bytes.length);
+const mptr = ex.temen_alloc(bytes.length);
 u8().set(bytes, Number(mptr));
-if (ex.svm_wasmjit_compile_full(mptr, bytes.length, func, 0) !== 1) {
-  ex.svm_dealloc(mptr, bytes.length);
+if (ex.temen_wasmjit_compile_full(mptr, bytes.length, func, 0) !== 1) {
+  ex.temen_dealloc(mptr, bytes.length);
   console.error(`kernel func ${func} not JIT-eligible (outside the integer subset)`);
   process.exit(4); // the driver marks this row n/a
 }
-ex.svm_dealloc(mptr, bytes.length);
-const wptr = Number(ex.svm_wasmjit_ptr()), wlen = ex.svm_wasmjit_len();
+ex.temen_dealloc(mptr, bytes.length);
+const wptr = Number(ex.temen_wasmjit_ptr()), wlen = ex.temen_wasmjit_len();
 const emitted = u8().slice(wptr, wptr + wlen);
 
-// Instantiate the emitted module against the cdylib's OWN linear memory (so an svm_alloc'ed window
+// Instantiate the emitted module against the cdylib's OWN linear memory (so an temen_alloc'ed window
 // + env cell are addressable in both). `call_interp` runs an interp leaf via the cdylib; a nonzero
-// return is a trap (thrown). `env.trap` records the SVM trap code.
+// return is a trap (thrown). `env.trap` records the Temen trap code.
 let lastTrap = 0;
 const emod = await WebAssembly.compile(emitted);
 const einst = await WebAssembly.instantiate(emod, {
   env: {
     memory: ex.memory,
     trap: (code) => { lastTrap = code; },
-    call_interp: (f, argsPtr) => { if (ex.svm_wasmjit_call_interp(f, argsPtr) !== 0) throw new Error('cross-tier trap'); },
+    call_interp: (f, argsPtr) => { if (ex.temen_wasmjit_call_interp(f, argsPtr) !== 0) throw new Error('cross-tier trap'); },
   },
 });
 const entry = einst.exports[`f${func}`];
@@ -63,9 +63,9 @@ if (!entry) { console.error(`emitted module has no f${func}`); process.exit(3); 
 // (fuel + cross-tier scratch). A huge positive fuel budget so the per-dispatch debit never runs out
 // across all timed reps (the counter is not reset between calls).
 const WIN_BYTES = 1 << 24; // 16 MiB
-const win = Number(ex.svm_alloc(WIN_BYTES));
-ex.svm_wasmjit_init_window(win, WIN_BYTES); // lay the module's data segments into the window
-const env = Number(ex.svm_alloc(ex.svm_wasmjit_env_bytes()));
+const win = Number(ex.temen_alloc(WIN_BYTES));
+ex.temen_wasmjit_init_window(win, WIN_BYTES); // lay the module's data segments into the window
+const env = Number(ex.temen_alloc(ex.temen_wasmjit_env_bytes()));
 // Fuel lives in the emitted module's `fuel` global now (register-allocatable — the per-dispatch
 // debit no longer touches linear memory). Seed the generous budget once; it debits monotonically
 // across all timed reps (never resets), and 1<<61 dwarfs the total dispatch count of the bench.

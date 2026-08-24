@@ -1,0 +1,24 @@
+[package]
+name = "temen-wasm-jit"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Runtime deps: temen-ir only — the emitter is escape-TCB-adjacent (its output confines guest
+# addresses), so it stays dependency-free and auditable, like temen-mask/temen-verify.
+[dependencies]
+temen-ir.workspace = true
+
+# Dev-only: the differential harness runs emitted wasm on `wasmi` (a pure-Rust wasm interpreter —
+# far lighter than Wasmtime, which stays out of the workspace per the bench/ precedent) against the
+# bytecode-engine oracle. The `simd` feature (added in wasmi 0.47) enables the §17 v128 differential;
+# `tests/simd.rs` builds its engine with `Config::wasm_simd(true)`.
+[dev-dependencies]
+temen-text.workspace = true
+temen-verify.workspace = true
+temen-interp.workspace = true
+temen-jit.workspace = true
+temen-encode.workspace = true
+wasmi = { version = "0.47", features = ["simd"] }

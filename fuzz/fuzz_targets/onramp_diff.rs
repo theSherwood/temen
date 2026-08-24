@@ -1,6 +1,6 @@
 //! libFuzzer target: LLVM on-ramp source-oracle differential (`DESIGN.md` §18).
 //!
-//! The input bytes drive the structured generator (`crates/svm-llvm/tests/support/llgen.rs`,
+//! The input bytes drive the structured generator (`crates/temen-llvm/tests/support/llgen.rs`,
 //! shared with the stable `onramp_diff` test): it emits a well-defined, terminating `@run()` and
 //! computes its result *as it emits* (the oracle). We translate through the LLVM on-ramp and
 //! assert every backend that can execute it (tree-walker always; bytecode/JIT when they don't
@@ -13,7 +13,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-#[path = "../../crates/svm-llvm/tests/support/llgen.rs"]
+#[path = "../../crates/temen-llvm/tests/support/llgen.rs"]
 mod llgen;
 
 fuzz_target!(|data: &[u8]| {

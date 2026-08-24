@@ -1,19 +1,19 @@
 // V8 (Node) end-to-end check of the **warm-runtime snapshot** across the wasm boundary, driving the
-// shipping engine FFI the playground would use (`svm_warm_open` / `svm_warm_eval` / `svm_warm_close`).
-// The native `crates/svm-llvm/examples/qjs_snapshot.rs` prototype proves the Rust logic; this proves the
+// shipping engine FFI the playground would use (`temen_warm_open` / `temen_warm_eval` / `temen_warm_close`).
+// The native `crates/temen-llvm/examples/qjs_snapshot.rs` prototype proves the Rust logic; this proves the
 // same warm-once / restore-per-Run round-trip works through the cdylib, over an owned window, and — the
 // point of the feature — that a restored `eval_run` matches the cold `_start` path byte-for-byte
 // (fresh-per-Run isolation) while skipping the QuickJS runtime rebuild.
 //
-//   node warm-snapshot-test.mjs [svm_browser.wasm] [qjs_snapshot.svmb]
+//   node warm-snapshot-test.mjs [temen_browser.wasm] [qjs_snapshot.temen]
 //
 // Exits 0 on success (all parity checks pass), 1 on any mismatch.
 import { readFileSync, existsSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import { engineImports } from './engine-imports.mjs';
 
-const wasmPath = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/svm_browser.wasm';
-const modPath = process.argv[3] ?? 'web/assets/qjs_snapshot.svmb';
+const wasmPath = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/temen_browser.wasm';
+const modPath = process.argv[3] ?? 'web/assets/qjs_snapshot.temen';
 
 // Skip cleanly if the (fetch-gated) two-phase QuickJS asset isn't present — same posture as the other
 // on-ramp browser tests (see ci.yml: "skips cleanly if absent").
@@ -30,18 +30,18 @@ const mod = await WebAssembly.compile(readFileSync(wasmPath));
 const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
 const ex = (await WebAssembly.instantiate(mod, engineImports(memory))).exports;
 const membuf = () => (ex.memory ?? memory).buffer;
-const is64 = ex.svm_abi_is64() === 1;
+const is64 = ex.temen_abi_is64() === 1;
 const N = (x) => (is64 ? BigInt(x) : Number(x));
 
 // Alloc `bytes.length` in linear memory and copy in; re-fetch the view (alloc may grow/detach memory).
 const put = (bytes) => {
-  const p = ex.svm_alloc(N(bytes.length));
+  const p = ex.temen_alloc(N(bytes.length));
   new Uint8Array(membuf()).set(bytes, Number(p));
-  return { p, len: N(bytes.length), free: () => ex.svm_dealloc(p, N(bytes.length)) };
+  return { p, len: N(bytes.length), free: () => ex.temen_dealloc(p, N(bytes.length)) };
 };
 const readStdout = () => {
-  const p = Number(ex.svm_stdout_ptr());
-  const l = Number(ex.svm_stdout_len());
+  const p = Number(ex.temen_stdout_ptr());
+  const l = Number(ex.temen_stdout_len());
   return p && l ? Buffer.from(new Uint8Array(membuf(), p, l)).toString() : '';
 };
 const fail = (m) => {
@@ -51,15 +51,15 @@ const fail = (m) => {
 
 const modBytes = readFileSync(modPath);
 
-// COLD: the original one-shot path — `svm_run_onramp` runs `_start` (read → init → eval → print).
+// COLD: the original one-shot path — `temen_run_onramp` runs `_start` (read → init → eval → print).
 function cold(js) {
   const m = put(modBytes);
   const s = put(Buffer.from(js));
   const t = performance.now();
-  Number(ex.svm_run_onramp(m.p, m.len, s.p, s.len));
+  Number(ex.temen_run_onramp(m.p, m.len, s.p, s.len));
   const ms = performance.now() - t;
   const out = readStdout();
-  const status = ex.svm_status();
+  const status = ex.temen_status();
   s.free();
   m.free();
   return { out, ms, status };
@@ -69,10 +69,10 @@ function cold(js) {
 function warmEval(js) {
   const s = put(Buffer.from(js));
   const t = performance.now();
-  Number(ex.svm_warm_eval(s.p, s.len));
+  Number(ex.temen_warm_eval(s.p, s.len));
   const ms = performance.now() - t;
   const out = readStdout();
-  const status = ex.svm_status();
+  const status = ex.temen_status();
   s.free();
   return { out, ms, status };
 }
@@ -94,10 +94,10 @@ const programs = [
 // Open the warm session once (runs `warmup`, snapshots the post-init image).
 const t0 = performance.now();
 const m = put(modBytes);
-const live = Number(ex.svm_warm_open(m.p, m.len));
+const live = Number(ex.temen_warm_open(m.p, m.len));
 const warmupMs = performance.now() - t0;
 m.free();
-if (live < 0 || ex.svm_status() !== 0) fail(`svm_warm_open: status ${ex.svm_status()}`);
+if (live < 0 || ex.temen_status() !== 0) fail(`temen_warm_open: status ${ex.temen_status()}`);
 console.error(`warm session opened: warmup ${warmupMs.toFixed(0)} ms, live image ${(live / (1 << 20)).toFixed(1)} MiB`);
 
 console.log(`\n${'program'.padEnd(16)}${'cold ms'.padStart(10)}${'warm ms'.padStart(10)}${'speedup'.padStart(9)}  parity`);
@@ -118,7 +118,7 @@ for (const [name, js] of programs) {
   }
 }
 
-ex.svm_warm_close();
+ex.temen_warm_close();
 
 if (!allOk) fail('cold≡warm parity mismatch');
 console.log('\nOK: warm-runtime snapshot — eval_run over the restored snapshot matches cold _start byte-for-byte');

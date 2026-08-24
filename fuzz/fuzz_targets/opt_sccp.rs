@@ -9,11 +9,11 @@
 
 use libfuzzer_sys::fuzz_target;
 
-#[path = "../../crates/svm/tests/support/irgen.rs"]
+#[path = "../../crates/temen/tests/support/irgen.rs"]
 mod irgen;
 
-use svm_interp::Trap;
-use svm_verify::verify_module;
+use temen_interp::Trap;
+use temen_verify::verify_module;
 
 fuzz_target!(|data: &[u8]| {
     let mut g = irgen::Gen::from_bytes(data);
@@ -22,14 +22,14 @@ fuzz_target!(|data: &[u8]| {
         return; // only optimize verifier-valid modules
     }
 
-    let opt = svm_opt::optimize_module(&m);
+    let opt = temen_opt::optimize_module(&m);
     verify_module(&opt).expect("optimized module must re-verify");
 
     let args = irgen::gen_args(&mut g, &m.funcs[0].params);
     let mut fuel_a = 5_000_000u64;
     let mut fuel_b = 5_000_000u64;
-    let r0 = svm_interp::run(&m, 0, &args, &mut fuel_a);
-    let r1 = svm_interp::run(&opt, 0, &args, &mut fuel_b);
+    let r0 = temen_interp::run(&m, 0, &args, &mut fuel_a);
+    let r1 = temen_interp::run(&opt, 0, &args, &mut fuel_b);
 
     // A smaller residual can finish where the original hit the fuel ceiling (or vice versa); that is
     // not a miscompile, so only compare when neither run ran out of fuel.

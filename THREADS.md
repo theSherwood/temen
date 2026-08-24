@@ -1,6 +1,6 @@
-# THREADS.md — genuinely multithreaded SVM in wasm
+# THREADS.md — genuinely multithreaded Temen in wasm
 
-Tracks making SVM-in-wasm run with **real parallelism** (multiple OS threads / Web Workers over one
+Tracks making TEMEN-in-wasm run with **real parallelism** (multiple OS threads / Web Workers over one
 shared memory), *without* losing the cooperative single-worker model we already have. Companion to
 `BROWSER.md` (the interpreter-as-wasm-guest port, which ran concurrency cooperatively on one thread
 when this doc opened). Living doc: update the **Plan** tracker as work lands; fold into `DESIGN.md`
@@ -11,7 +11,7 @@ once it closes.
 > children, shared-`Host` I/O, the playground). Threads-touching work since then lives in its
 > owning docs: **per-Worker wasm-JIT tier-up** of the parallel driver's vCPUs
 > (`Vcpu::with_jit_eligible` → `VcpuEvent::TierUp`; `vcpu_tierup.rs`, `threads-spawn.mjs
-> SVM_TIERUP=1` → 4000 with 8 tier-ups fired, the Chromium `#tierup` item — plus §22/§14
+> TEMEN_TIERUP=1` → 4000 with 8 tier-ups fired, the Chromium `#tierup` item — plus §22/§14
 > per-Worker codegen and the `VcpuReactor` frame loop over the resumable vCPU) in `BROWSER.md`;
 > `VcpuEvent::StdinPark` (exhausted interactive stdin parks a resumable vCPU instead of spinning)
 > in `BOOTSPEED.md`; the native-side futex extensions (canonical-key `FutexKey::{Anon,Region}`,
@@ -59,8 +59,8 @@ host-facing — an **executor seam** (`Cooperative` | `Parallel`, the same shape
 `SchedRef::Real` vs `Det`) the host selects at the run entry. wasm makes shared memory a *module-level*
 property, so in practice:
 
-- **`svm_browser.wasm`** (today) — import-free, **cooperative-only**, runs anywhere.
-- **`svm_browser_threads.wasm`** (`--features threads`) — shared memory + `+atomics` + a Worker-spawn
+- **`temen_browser.wasm`** (today) — import-free, **cooperative-only**, runs anywhere.
+- **`temen_browser_threads.wasm`** (`--features threads`) — shared memory + `+atomics` + a Worker-spawn
   import; the host picks cooperative **or** parallel at run time within it. (Cooperative still works
   here — and *must* use the queue futex, since a lone Worker can't `atomic.wait` on itself.)
 
@@ -74,7 +74,7 @@ property, so in practice:
   increments of a single shared cell. Result: **atomic → exactly 4,000,000** (`i32.atomic.rmw.add`
   across two OS threads on contended memory), and the **non-atomic path lost ~1.4M updates** —
   proving the workers genuinely ran in parallel, so the atomic correctness isn't serialized luck.
-- [x] **Step 2 — `Region::Shared` svm-mem backing.** A new `Region` variant over **caller-owned**
+- [x] **Step 2 — `Region::Shared` temen-mem backing.** A new `Region` variant over **caller-owned**
   memory (`unsafe fn Region::shared(base, size)`), with the *same* raw-pointer hardware atomics as
   the unix `Mapped` mmap backing — but borrowed, not owned, and available on **every** target (so it
   spans the wasm shared linear memory). The atomic/byte/word bodies lower to `core::sync::atomic`
@@ -92,17 +92,17 @@ property, so in practice:
   backing**: `Mem::with_reservation_over(Arc<Region>)` + the public `bytecode::compile_and_run_capture_over`
   take a caller-built `Region::shared` window instead of an engine-`mmap`ped one. The engine stays
   `#![forbid(unsafe_code)]` (it accepts a pre-built `Arc<Region>`; the `unsafe` borrow lives in the
-  embedder's `Region::shared`); `Region` is now re-exported from `svm-interp`. Verified
+  embedder's `Region::shared`); `Region` is now re-exported from `temen-interp`. Verified
   (`bytecode_shared_window.rs`): a compute+memory guest over the caller-owned window is **byte-identical**
   (result + final image) to the engine's own backing and its writes land in the caller's buffer, and
   the 8-vCPU `thread.spawn`+atomics+futex kernel runs cooperatively over the shared window → **4000**.
   This is the exact window the parallel mode will run every Worker over.
 - [x] **Step 4a — the engine runs over **shared wasm linear memory** (real-wasm integration).** The
-  whole point of steps 1–3, now proven in the actual artifact: the **full** SVM engine (not the spike)
+  whole point of steps 1–3, now proven in the actual artifact: the **full** Temen engine (not the spike)
   builds as a wasm **threads module** — `+atomics`/`+bulk-memory`/`+mutable-globals` ·
-  `--shared-memory --import-memory` · `build-std=std,panic_abort` — so svm-interp/svm-mem with all
+  `--shared-memory --import-memory` · `build-std=std,panic_abort` — so temen-interp/temen-mem with all
   their `Mutex`/`RwLock`/`Arc` compile and instantiate over a host `SharedArrayBuffer` (a major
-  de-risk: ~54 s, clean). New export `svm_run_shared(mod, len, win_ptr, win_size, arg)` runs a guest
+  de-risk: ~54 s, clean). New export `temen_run_shared(mod, len, win_ptr, win_size, arg)` runs a guest
   over a `Region::shared` window the **host** carves out of that shared linear memory (Step 3's
   `compile_and_run_capture_over`). Verified (`threads-engine.mjs`): the 8-vCPU `thread.spawn`+atomics+
   futex kernel runs over a window **in the SharedArrayBuffer** → **4000**. Stateless (no `static mut`),
@@ -110,14 +110,14 @@ property, so in practice:
   this is the substrate + window the parallel driver distributes; the default build stays import-free
   (185/185 differential intact).
 - [x] **Step 4b — genuine multi-core parallelism in wasm (independent domains).** Real `worker_threads`
-  (separate OS threads) each run the **full SVM engine** over the **one shared** `SharedArrayBuffer`,
+  (separate OS threads) each run the **full Temen engine** over the **one shared** `SharedArrayBuffer`,
   each over its own guest window — **concurrently**. The hard wasm-threads hurdle is solved: each
   Worker is bootstrapped with its **own stack + TLS block** (export `__stack_pointer` / `__tls_*` /
   `__wasm_init_tls`; the main thread pre-allocates the per-Worker stacks+TLS in shared memory so a
   Worker never touches the shared default stack before its own is set). Verified
   (`threads-parallel.mjs`): **4 and 8 Workers** each run the 8-vCPU `thread.spawn`+atomics+futex kernel
   (so 8×8 = 64 vCPUs total) over disjoint windows → every Worker returns **4000**, robust across
-  repeats. So SVM runs genuinely in parallel across cores in wasm — N programs, N threads, one shared
+  repeats. So Temen runs genuinely in parallel across cores in wasm — N programs, N threads, one shared
   memory. (The runs are *independent* — each Worker its own window; one guest's `thread.spawn` vCPUs
   fanned across Workers is step 4c.)
 - [x] **Step 4c — the shared-memory `thread.spawn` parallel driver (native slice).** The host-selected
@@ -145,12 +145,12 @@ property, so in practice:
   where the **root** genuinely parks until the last worker `notify`s it → **8**, both matching the oracle
   and stable across 100/50 real-race repeats. So `Parallel` now covers `thread.spawn`/`join` +
   `memory.wait`/`notify` + atomics + compute — the complete pure-threads model — genuinely in parallel.
-- [x] **Step 4c-miri — race/UB verification of the parallel driver.** `svm-interp/tests/parallel_miri.rs`
+- [x] **Step 4c-miri — race/UB verification of the parallel driver.** `temen-interp/tests/parallel_miri.rs`
   drives the **real interpreter**'s concurrent atomic + non-atomic accesses over one `Region::shared`
   backing across genuine OS threads, exercising the whole parallel machinery (per-thread `fork_for_thread`
   views, the cross-thread `Futex` park/wake, the spawn/join registry). **Miri reports no data race, UB, or
-  provenance error** (4-vCPU counter → 200; 2-thread futex handoff → 987654). The test lives in `svm-interp`
-  (small dep set + `svm-text` dev-dep) so Miri can build it — the `svm` integration crate pulls in the
+  provenance error** (4-vCPU counter → 200; 2-thread futex handoff → 987654). The test lives in `temen-interp`
+  (small dep set + `temen-text` dev-dep) so Miri can build it — the `temen` integration crate pulls in the
   Cranelift JIT Miri can't compile. So the genuinely-parallel substrate is now both differentially correct
   *and* memory-model-clean.
 
@@ -221,8 +221,8 @@ property, so in practice:
     into the shared linear memory; its pointer is published in a process-wide `static` which — under
     `--shared-memory` — *is* shared, so every Worker's instance reads it (the same sharing the leaked
     `VcpuProgram` already relies on, minus the JS hand-off). A worker vCPU's `Jit.install`/`uninstall`/
-    `invoke` is serviced **inside `svm_par_run`** against this powerbox + the shared `Domain`, so the JS
-    host services no new events — the only new glue is one `svm_par_powerbox(guest)` + `svm_par_compile_jit`
+    `invoke` is serviced **inside `temen_par_run`** against this powerbox + the shared `Domain`, so the JS
+    host services no new events — the only new glue is one `temen_par_powerbox(guest)` + `temen_par_compile_jit`
     call on setup (`browser/src/lib.rs`). During the run the powerbox is read-only (the unit is compiled
     before any spawn), so the concurrent `&Host` reads need no lock; the install/dispatch mutation lives
     in the `Domain` (already interior-mutable + thread-safe). Proven: `threads-spawn.mjs` runs the
@@ -279,7 +279,7 @@ property, so in practice:
         `Spawn`: start a Worker/thread running `Vcpu::new_confined_child(prog, module, entry,
         carve_region, size_log2, fuel)` and wire its completion slot into `join`. Per DESIGN.md §14
         ("a sub-window is indistinguishable from a top-level window") the carve region — a fresh
-        `Region::shared` at `parent_win + carve` — simply *is* the child's window: **no new `svm-mem`
+        `Region::shared` at `parent_win + carve` — simply *is* the child's window: **no new `temen-mem`
         machinery** (the earlier estimate was wrong). The attenuated powerbox (`Instantiator` +
         `AddressSpace` over the child's own range, its entry args) and the child's own domain
         (`own_dom`: a natural table over its module in the shared source — the fresh table is the
@@ -288,10 +288,10 @@ property, so in practice:
         Proven natively by `bytecode_vcpu_orchestration_instantiate.rs` (fan-out 40, **depth-2
         nesting** 72, module fan-out 600 — each vs the cooperative oracle) +
         `vcpu_instantiate_miri.rs` (aliasing carve-region views race/UB/provenance-clean under Miri);
-        in Node by `threads-spawn.mjs` `SVM_INST=1` (nested = **17 Workers across three
+        in Node by `threads-spawn.mjs` `TEMEN_INST=1` (nested = **17 Workers across three
         generations**); and in **real Chromium** by the `#inst` work item (40 / 72×17 Workers / 600).
-        Browser glue: `svm_par_powerbox_inst` (the §14 recipe: root `Instantiator` span + optional
-        granted module — the root builds its powerbox in `svm_par_root`), `svm_par_child_confined`,
+        Browser glue: `temen_par_powerbox_inst` (the §14 recipe: root `Instantiator` span + optional
+        granted module — the root builds its powerbox in `temen_par_root`), `temen_par_child_confined`,
         `PAR_INSTANTIATE = 6`, and an `INSTANTIATE` arm in the JS hosts that relays the operands into
         a new Worker whose `win`/`winSize` are the carve. Also fixed a latent JS-host bug D2 exposed:
         cached `Int32Array`/`BigInt64Array` views go stale when the shared `WebAssembly.Memory` grows
@@ -304,25 +304,25 @@ property, so in practice:
   resolution, an invoked §22 unit's calls) goes through the lock — per-call serialization, lock-free
   compute/atomics between calls, the exact 4c-host model. **No JS in the loop**: the `Host` is fully
   virtual (stdout is an in-memory buffer), so dispatch is in-engine; the browser publishes one leaked
-  `Mutex<Host>` (`svm_par_powerbox_io`, the same shared-linear-memory sharing as the §22/§14 recipes;
+  `Mutex<Host>` (`temen_par_powerbox_io`, the same shared-linear-memory sharing as the §22/§14 recipes;
   last-published recipe wins), roots get `[out_handle]` seeded, and the page reads stdout back after
-  the run (`svm_par_stdout_len`/`_ptr`). Proven: `bytecode_vcpu_orchestration_caps.rs` (the proven
+  the run (`temen_par_stdout_len`/`_ptr`). Proven: `bytecode_vcpu_orchestration_caps.rs` (the proven
   schedule-independent 4c-host kernel — 8 workers each `cap.call`-write "tick\n" + atomic add —
   result AND stdout byte-identical to the cooperative oracle), `vcpu_shared_host_miri.rs` (concurrent
-  `cap.call` on one `Mutex<Host>` race/UB-clean under Miri), Node `threads-spawn.mjs` `SVM_IO=1`, and
+  `cap.call` on one `Mutex<Host>` race/UB-clean under Miri), Node `threads-spawn.mjs` `TEMEN_IO=1`, and
   **real Chromium** (the `#capio` work item: 9 Workers → counter 8, stdout `"tick\n"×8`). Also adds
-  the browser vCPU-bomb **backstop**: a shared live-vCPU counter in the `svm_par_*` constructors
-  (admit/retire around `svm_par_free`), capped at 256 — cruder than the native drivers' spawner
+  the browser vCPU-bomb **backstop**: a shared live-vCPU counter in the `temen_par_*` constructors
+  (admit/retire around `temen_par_free`), capped at 256 — cruder than the native drivers' spawner
   `ThreadFault` (a refused construction fails the run via the JS host), but it bounds Worker creation.
 - [x] **4e — the playground (`browser/web/play.html`) — the motivating demo, live.** The "web
-  interpreter playground" this whole plan cites as its motivation now exists: SVM text typed into an
-  editor is parsed → verified → encoded **inside the wasm sandbox** (`svm_parse` — `svm-text`/
-  `svm-verify`/`svm-encode` are already in the cdylib; rejects come back as error *messages*), then
+  interpreter playground" this whole plan cites as its motivation now exists: Temen text typed into an
+  editor is parsed → verified → encoded **inside the wasm sandbox** (`temen_parse` — `temen-text`/
+  `temen-verify`/`temen-encode` are already in the cdylib; rejects come back as error *messages*), then
   runs across **real Web Workers** under a selectable powerbox recipe: none (compute), 4d host I/O
   (stdout read back onto the page), §22 guest-JIT, or a §14 root `Instantiator` (sandboxed children
   on their own Workers). The Worker orchestration was extracted from the validation page into
   `web/par.js` so both pages drive the same machinery; a plain run explicitly clears the
-  last-published recipe (`svm_par_powerbox_none`) since a playground runs modes in any order — the
+  last-published recipe (`temen_par_powerbox_none`) since a playground runs modes in any order — the
   one seam the recipe model (built for scripted back-to-back runs) had left open. Gated in Chromium
   by `browser-test.mjs`: five examples through the editor (hello 14 + stdout, threads 4000, io 8 +
   8×"tick\n", jit 1136, inst 40) plus a garbage-source parse-reject.
@@ -333,12 +333,12 @@ property, so in practice:
   - **The cross-Worker blocking futex** (`browser/threads-spike/threads-futex.mjs`): proved
     `memory.atomic.wait`/`notify` works across OS threads from Rust (`core::arch::wasm32`) — park/wake,
     not-equal, and timeout paths — the foundational unknown, mirroring how Step 1 de-risked atomics.
-  - **A resumable per-vCPU API** in `svm-interp` (`VcpuProgram` + `Vcpu` + `VcpuEvent`): platform-agnostic,
+  - **A resumable per-vCPU API** in `temen-interp` (`VcpuProgram` + `Vcpu` + `VcpuEvent`): platform-agnostic,
     no threads/FFI — `run` advances one vCPU until a host-serviced event (`Spawn`/`Join`/`Wait`/`Notify`),
     the host services it and `deliver_*`s the result. Proven natively by `bytecode_vcpu_orchestration.rs`
     (a `std::thread` host — the native model of the JS host — drives the counter kernel to 4000 and a
     futex handoff to 987654), which is the wasm driver's **differential oracle**.
-  - **The wasm driver** (`browser/src/lib.rs` `svm_par_*` C-ABI + `browser/threads-spawn.mjs`): each vCPU
+  - **The wasm driver** (`browser/src/lib.rs` `temen_par_*` C-ABI + `browser/threads-spawn.mjs`): each vCPU
     runs on its own Worker through the resumable API; the host services `thread.spawn` → start a Worker,
     `thread.join` → `Atomics.wait` on the child's completion slot, `memory.wait`/`notify` → `Atomics` on
     the futex word. The 4b per-Worker stack/TLS bootstrap and the "main can't `atomic.wait`" wrinkle are
@@ -355,9 +355,9 @@ property, so in practice:
   root) runs on a Worker; `threads-spawn.mjs`'s main thread only compiles, carves the window, and fans
   out Workers — it never blocks.
 - **Per-thread stack + TLS** — *resolved*: each vCPU's Worker sets its own `__stack_pointer` +
-  `__wasm_init_tls` (the 4b bootstrap); a spawner `svm_par_alloc`s the child's stack/TLS before asking
+  `__wasm_init_tls` (the 4b bootstrap); a spawner `temen_par_alloc`s the child's stack/TLS before asking
   main to start it.
-- **Thread-safe ABI** — *resolved*: the parallel `svm_par_*` path is stateless (no `static mut`); each
+- **Thread-safe ABI** — *resolved*: the parallel `temen_par_*` path is stateless (no `static mut`); each
   vCPU's state is a heap `Box` in the shared linear memory, and the `VcpuProgram` is shared read-only by
   pointer. (The thread-safe shared allocator was de-risked by 4b.)
 - **Data init once** — *resolved*: only the root `Vcpu::new_root` seeds + data-initialises the window; a
@@ -375,38 +375,38 @@ rustup toolchain install nightly -c rust-src
 # served its purpose; its result is recorded above and the code remains in git history.
 
 # Step 2/3/4c — the substrate, engine bridge, and parallel drivers (native, in CI)
-cargo test -p svm-mem shared                          # Region::Shared cross-thread atomics + fuzz
-cargo test -p svm --test bytecode_shared_window       # engine over a caller-owned shared window
-cargo test -p svm --test bytecode_parallel            # 4c: native parallel driver vs oracle
-cargo test -p svm --test bytecode_parallel_caps       # 4c-host: shared-powerbox cap.call vs oracle
-cargo test -p svm --test bytecode_vcpu_orchestration  # 4c-wasm: resumable Vcpu API, host-orchestrated
-cargo test -p svm --test bytecode_parallel_jit            # 4c-domain B: §22 JIT in drive_parallel vs oracle
-cargo test -p svm --test bytecode_vcpu_orchestration_jit  # 4c-domain C1: §22 JIT via resumable Vcpu vs oracle
-cargo test -p svm --test bytecode_parallel_instantiate    # 4c-domain §14-A: instantiate in drive_parallel vs oracle
-cargo test -p svm --test bytecode_vcpu_orchestration_instantiate  # 4c-domain §14-D2: confined children via resumable Vcpu
-cargo +nightly miri test -p svm-interp --test parallel_miri       # 4c: parallel driver + shared host race-free
-cargo +nightly miri test -p svm-interp --test parallel_jit_miri   # 4c-domain B: §22 JIT shared-Domain race-free
-cargo +nightly miri test -p svm-interp --test parallel_instantiate_miri  # 4c-domain §14-A: confined child race-free
-cargo +nightly miri test -p svm-interp --test vcpu_instantiate_miri      # 4c-domain §14-D2: carve-region views race-free
-cargo test -p svm --test bytecode_vcpu_orchestration_caps         # 4d: shared-powerbox cap.call via resumable Vcpu vs oracle
-cargo +nightly miri test -p svm-interp --test vcpu_shared_host_miri      # 4d: shared Mutex<Host> cap.call race-free
+cargo test -p temen-mem shared                          # Region::Shared cross-thread atomics + fuzz
+cargo test -p temen --test bytecode_shared_window       # engine over a caller-owned shared window
+cargo test -p temen --test bytecode_parallel            # 4c: native parallel driver vs oracle
+cargo test -p temen --test bytecode_parallel_caps       # 4c-host: shared-powerbox cap.call vs oracle
+cargo test -p temen --test bytecode_vcpu_orchestration  # 4c-wasm: resumable Vcpu API, host-orchestrated
+cargo test -p temen --test bytecode_parallel_jit            # 4c-domain B: §22 JIT in drive_parallel vs oracle
+cargo test -p temen --test bytecode_vcpu_orchestration_jit  # 4c-domain C1: §22 JIT via resumable Vcpu vs oracle
+cargo test -p temen --test bytecode_parallel_instantiate    # 4c-domain §14-A: instantiate in drive_parallel vs oracle
+cargo test -p temen --test bytecode_vcpu_orchestration_instantiate  # 4c-domain §14-D2: confined children via resumable Vcpu
+cargo +nightly miri test -p temen-interp --test parallel_miri       # 4c: parallel driver + shared host race-free
+cargo +nightly miri test -p temen-interp --test parallel_jit_miri   # 4c-domain B: §22 JIT shared-Domain race-free
+cargo +nightly miri test -p temen-interp --test parallel_instantiate_miri  # 4c-domain §14-A: confined child race-free
+cargo +nightly miri test -p temen-interp --test vcpu_instantiate_miri      # 4c-domain §14-D2: carve-region views race-free
+cargo test -p temen --test bytecode_vcpu_orchestration_caps         # 4d: shared-powerbox cap.call via resumable Vcpu vs oracle
+cargo +nightly miri test -p temen-interp --test vcpu_shared_host_miri      # 4d: shared Mutex<Host> cap.call race-free
 
 # Step 1-futex / 4c-wasm — the cross-Worker blocking futex (`browser/threads-spike/threads-futex.mjs`)
 # was retired with the spike above; its result is recorded above and the code remains in git history.
 
 # Step 4a/4b — the FULL engine as a wasm threads module, run over a SharedArrayBuffer window.
 # The `--export=__stack_pointer/__tls_*/__wasm_init_tls` are the per-Worker bootstrap hooks (4b).
-cargo run --bin gencorpus                             # → corpus/threads.svmbc
+cargo run --bin gencorpus                             # → corpus/threads.temenc
 RUSTFLAGS="-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals \
   -Clink-arg=--shared-memory -Clink-arg=--import-memory -Clink-arg=--max-memory=1073741824 \
   -Clink-arg=--export=__stack_pointer -Clink-arg=--export=__tls_base \
   -Clink-arg=--export=__tls_size -Clink-arg=--export=__tls_align -Clink-arg=--export=__wasm_init_tls" \
   cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown
-W=target/wasm32-unknown-unknown/release/svm_browser.wasm
-node threads-engine.mjs   "$W" corpus/threads.svmbc 4000      # 4a: engine over a shared-mem window
-node threads-parallel.mjs "$W" corpus/threads.svmbc 4000 8    # 4b: 8 Workers, independent domains → 4000
-node threads-spawn.mjs    "$W" corpus/threads.svmbc 4000      # 4c-wasm: ONE guest's vCPUs across Workers
-node threads-spawn.mjs    "$W" corpus/futex.svmbc   987654    # 4c-wasm: the cross-Worker futex handoff
+W=target/wasm32-unknown-unknown/release/temen_browser.wasm
+node threads-engine.mjs   "$W" corpus/threads.temenc 4000      # 4a: engine over a shared-mem window
+node threads-parallel.mjs "$W" corpus/threads.temenc 4000 8    # 4b: 8 Workers, independent domains → 4000
+node threads-spawn.mjs    "$W" corpus/threads.temenc 4000      # 4c-wasm: ONE guest's vCPUs across Workers
+node threads-spawn.mjs    "$W" corpus/futex.temenc   987654    # 4c-wasm: the cross-Worker futex handoff
 node browser-test.mjs             # 4c-wasm + 4d + 4e in a REAL browser (Chromium): validation page + playground
 ```
 

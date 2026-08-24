@@ -1,0 +1,1238 @@
+//! `temen-snapshot` — the durable-domain **snapshot artifact codec** (DURABILITY.md §12).
+//!
+//! A **tooling-tier, +0-TCB** crate: it (de)serializes a quiesced durable domain into the
+//! backend-independent, recompile-survivable artifact of §12, and back. It pairs with
+//! `temen-durable` (the IR→IR freeze/thaw transform) but does not depend on it — the transform
+//! produces the in-window shadow state; this crate only moves bytes + authority.
+//!
+//! # What an artifact is (§12.0)
+//!
+//! A frozen single-vCPU domain is described almost entirely by its **window image** — the
+//! shadow stack, spilled live values, and the state word are all guest-resident bytes, so
+//! they ride along in the window for free. What lives *host-side* and is captured separately
+//! is the **handle table** (authority, not the resources it names — §12.5 / D-scope). The
+//! artifact binds the **instrumented-module digest** (R5 / D-hash): restore refuses on a
+//! mismatch, which is the durability boundary from §1 (the shadow schema is a function of the
+//! instrumented module's structure).
+//!
+//! # Container (§12.1)
+//!
+//! `b"SVMD"`, a `u16` format version, then ascending-tag TLV sections (`tag`/`len`/body, so a
+//! reader can skip unknown tags). Encoding is **canonical** — minimal LEB128, fixed section
+//! order, sparse entries ascending — so the §12.6 invariant "re-serialize a freshly-restored
+//! domain at the same safepoint is byte-identical" is a plain `==`.
+//!
+//! # Scope
+//!
+//! Single vCPU. The window image is sparse with **zero-page elision** and carries per-page
+//! protection (`Rw`/`Ro`/`Unmapped`, §12.3) — see [`freeze_with_prots`] / [`restore_with_prots`];
+//! the flat [`freeze`]/[`restore`] treat the whole window as `Rw`. **Fibers** ride along (§12.4 /
+//! slice 3.1.5): a freeze flattens each parked fiber's continuation into the window image and
+//! records its small residue (`temen_interp::FrozenFiber`) in a **control section** (tag 2), which
+//! `restore` re-seeds into the `Host`; the section is elided when there are no fibers, so a
+//! no-fiber artifact is byte-identical to the pre-fiber format. Capturing real protections from a
+//! running backend and re-establishing them on the runtime window (escape-TCB) is the next Phase-2
+//! slice; the dispatch table stays a module-derived no-op (§12.4). A `Backed` (§13 shared-region)
+//! page is out of scope — D-region: freeze refuses a domain holding shared regions. The TLV
+//! container is forward-compatible.
+
+#![forbid(unsafe_code)]
+
+use temen_encode::{digest256, encode_module};
+use temen_interp::{
+    DurableBinding, DurableHandle, DurableJitDomain, DurableJitUnit, FrozenChildState, FrozenFiber,
+    FrozenNested, FrozenVCpu, Host, NonDurableHandle, StreamRole, SvcDispatch, SHADOW_BASE,
+};
+use temen_ir::Module;
+
+/// Container magic (§12.2): "TEMEN-Durable".
+const MAGIC: &[u8; 4] = b"SVMD";
+/// Format version; bump on an incompatible change (§12.2). v2 (recycling step 2): each fiber residue
+/// record carries its **generation** (the high bits of a recycled-slot guest handle), so a thaw
+/// re-seeds a recycled fiber at the generation its handle expects. v3 (i64 fiber handles): the handle
+/// widened from `i32` to `i64` (16-bit slot + 48-bit generation), so a handle held live across a
+/// suspend now spills **8** bytes in the shadow stack instead of 4 — the window image layout changed,
+/// so a v2 artifact would mis-thaw and is rejected. (The residue generation is still `uleb`, so that
+/// field alone stays wire-compatible; the version gate is for the shadow-image shift.) v4 (slice 3.4:
+/// nested spawns): each spawned-vCPU residue record carries its **`parent_task`** (the task that spawned
+/// it), so a thaw rebuilds the per-parent join-table topology of a multi-level vCPU tree — a grandchild's
+/// handle resolves in its parent child's table, not the root's. The field is a new `uleb` appended to
+/// each Section-2 vCPU record, so a v3 artifact's vCPU section would mis-parse and is rejected. v5 (§12.8
+/// 4A.5: per-context shadow-SP): each context's shadow-SP word moved from the single global
+/// `SHADOW_SP_OFF` (offset 8) into the **first 8 bytes of its own region** (`shadow_region_base(ctx)`),
+/// with frames now starting 8 bytes later — so concurrent vCPUs never share an SP word. The window
+/// image layout changed (SP word location + an 8-byte frame shift), so a v4 artifact mis-thaws and is
+/// rejected. v6 (§12.8 4A.5 follow-up A: concurrent join results): each spawned-vCPU residue record carries
+/// a `completed_result` flag (+ the i64 when set) — a concurrent child that finished before the freeze
+/// point but wasn't yet joined, so its `thread.join` result rides the artifact and the thaw delivers it
+/// without re-running the child. One extra `uleb` (0) per record otherwise, so a v5 record mis-parses.
+/// v7 (§12.8 concurrent-thaw stage 1: per-context thaw state): the durable **thaw** state word
+/// (`REWINDING`/`NORMAL`) moved from the single global `STATE_OFF` (offset 0) into each context's own
+/// region (at `STATE_IN_REGION_OFF` = 8 past its shadow-SP word), with frames now starting another 8
+/// bytes later (`REGION_HEADER_LEN` 8→16). The **freeze** word (`UNWINDING`) stays global. The window
+/// image layout changed (in-region state word + an 8-byte frame shift), so a v6 artifact mis-thaws and
+/// is rejected. v8 (§4 subtree freeze): the §14 **nested-child** re-attach residue (`FrozenNested`:
+/// slot + carve geometry + entry) is appended to Section 2 after the vCPU residue, only when present —
+/// so a nested-free artifact keeps the pre-nesting Section-2 byte layout (only the version differs). v9
+/// (§4 subtree freeze, completed children): each nested record gains a `completed_result` flag (+ the
+/// i64 when set) — a §14 child that finished before the freeze but wasn't yet joined rides its
+/// `thread.join` result and the thaw delivers it without re-running the child (reload-not-reissue). One
+/// extra `uleb` (0) per nested record otherwise, so a v8 nested record mis-parses. v10 (fiber-handle
+/// index widening): the cross-backend fiber-handle encoding changed from `(gen << 16) | slot` to
+/// `(gen << 24) | slot` (24-bit index / 40-bit generation) once the arena stack backend lifted the
+/// concurrency ceiling. The residue's `generation`/`slot` fields are still stored *separately* as
+/// `uleb`, so the Section-2 byte layout is unchanged — but a fiber handle the guest held **packed** in
+/// its window across the freeze would decode to a different `(slot, generation)` under the new shift,
+/// so a v9 artifact is rejected rather than mis-resolved. (The generation field was later narrowed
+/// 40→32 bits, reserving the top byte for guest pointer-tagging — DESIGN.md §3c / INVARIANTS.md §11 —
+/// **without** a format bump: the residue generation is still a separate `uleb`, and every reachable
+/// generation is `< 2^32` (a recycle counter), so a packed handle that ever *resolved* decodes
+/// identically; only unreachable `≥ 2^32` generations, which never validated, would differ.) v11 (§4 separate-module children): each
+/// nested record gains a 32-byte **module digest** (a content hash of the child's granted module,
+/// emitted only for a separate-module child — one `uleb` `0` for a same-module child, else `1` + the
+/// 32 bytes), so the thaw resolves the child against the restore host's re-granted modules. One extra
+/// `uleb` (0) per same-module nested record otherwise, so a v10 nested record mis-parses. v12 (§4
+/// depth-2+ nesting): each nested record gains a `parent_task` `uleb` (the task that instantiated the
+/// child) right after `slot`, so the format represents nesting to **arbitrary depth** — a grandchild's
+/// `parent_task` is its parent-child's task, not `0`. The interp thaw reconstructs the subtree
+/// topologically from it (parents before children). One extra `uleb` per nested record (0 for a
+/// depth-1 direct child of the root), so a v11 nested record mis-parses; retires the v11 freeze-time
+/// refusal that fail-closed on any non-zero `parent_task`.
+/// v13 (DURABILITY.md §13.4 step 3: serve state): a new Section 4 (`TAG_SERVE`, after the handle
+/// table) carries the domain's serve trio — the inbound dispatch queue (`svc_queue`, FIFO order),
+/// the completion cells (`svc_results`, canonical ascending ticket), and the ticket counter
+/// (`svc_next_ticket`) — all plain guest-meaningful data (§13.2 "serialize as-is"; tickets are
+/// cut-internal under §13.1). Elided when the trio is empty/zero, so a never-served domain's
+/// artifact keeps the v12 section layout (only the version differs).
+/// v14 (§13.4 slice 4c: per-child host state): each nested record gains an optional
+/// **child-state** blob — `uleb 0`, or `uleb 1` + the child's serve trio (queue / completion
+/// cells / ticket counter, the v13 shapes) + its durable handle table (the §12.5 record shape) —
+/// merged from the child's own freeze residue (`FrozenChildState`, keyed `(parent_task, slot)`).
+/// The thaw seeds the re-created child's fresh host from it verbatim (slots/generations
+/// preserved), so a serving or cap-holding child survives the subtree cut. One extra `uleb` (0)
+/// per plain nested record otherwise, so a v13 nested record mis-parses.
+/// v15 (§13.4 slice 4d: durable live-impl caps): the handle-table binding codec gains a
+/// `LiveImpl { slot, export }` tag (`B_LIVE_IMPL`) — a `child_offer` cap over a §14 child, named
+/// structurally by the callee's join slot (a `DomainId`/`Arc` never rides the artifact). A v14
+/// artifact holding no live-impl cap is byte-identical (only the version differs); one that does
+/// couldn't have been produced by v14 (freeze refused it), so there's no v14 mis-parse to guard.
+/// v16 (DURABILITY.md §12.5 Slice 2: durable guest-JIT): the handle-table binding codec gains
+/// `JitDomain { idx }` / `JitCode { domain, unit }` tags (`B_JIT_DOMAIN`/`B_JIT_CODE`), and a new
+/// Section 5 (`TAG_JIT`, after the serve state) carries each granted §22 domain's out-of-line unit
+/// state — the memory-match precondition, compile quotas, and units (each unit's instrumented+
+/// verified IR + `install` type id), rebuilt positionally on thaw so the binding indices re-resolve.
+/// Elided when the domain holds no granted JIT, so a JIT-free artifact keeps the v15 layout (only
+/// the version differs); one holding a JIT cap couldn't have been produced by v15 (freeze refused
+/// it), so there's no v15 mis-parse to guard.
+/// v17 (§12.5 install-durability): Section 5 (`TAG_JIT`) gains a leading `table_log2` header (the
+/// domain's `call_indirect` table reservation, restored so a thaw's dispatch table has the padding
+/// the installs land in) and a per-domain **install occupancy** list — `(slot, unit)` pairs, in
+/// install order — re-applied to the thaw run's table so a `call_indirect` through an installed slot
+/// resolves. A v16 JIT section had neither, so it mis-parses under v17; a JIT-free artifact is
+/// unaffected (Section 5 stays elided).
+const FORMAT_VERSION: u16 = 17;
+/// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
+/// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
+/// granularity so a captured prot map lines up with the image, one entry per page.
+pub const PAGE: usize = 4096;
+const _: () = assert!(PAGE as u64 == temen_interp::DURABLE_SNAPSHOT_PAGE);
+
+// ---- Section tags (ascending, §12.2-12.5). ----
+const TAG_HEADER: u64 = 0;
+const TAG_WINDOW: u64 = 1;
+/// Control state (§12.4) — the freeze/thaw fiber residue (slice 3.1.5). Emitted only when the
+/// domain has frozen fibers, so a single-vCPU/no-fiber artifact is byte-identical to before.
+const TAG_CONTROL: u64 = 2;
+const TAG_HANDLES: u64 = 3;
+/// Serve state (DURABILITY.md §13.4 step 3, v13) — the domain's inbound dispatch queue,
+/// completion cells, and ticket counter. Emitted only when non-empty (see `FORMAT_VERSION`).
+const TAG_SERVE: u64 = 4;
+/// Durable guest-JIT state (DURABILITY.md §12.5 Slice 2, v16) — each granted §22 domain's
+/// out-of-line units (instrumented+verified IR + `install` type id) and compile quotas. Emitted
+/// only when the domain holds granted JIT, so a JIT-free artifact keeps the pre-JIT layout.
+const TAG_JIT: u64 = 5;
+
+// ---- Binding descriptors (§12.5). One tag byte + value-typed payload. ----
+const B_STREAM: u8 = 0;
+const B_EXIT: u8 = 1;
+const B_CLOCK: u8 = 2;
+// B_MEMORY (3) retired with the CONSOLIDATION §4 Memory→AddressSpace fold — whole-window
+// authority now rides B_ADDRESS_SPACE `{0, u64::MAX}`; the tag stays reserved.
+// B_YIELDER (4) retired with the §2.3 coroutine deletion; the tag stays reserved.
+const B_ADDRESS_SPACE: u8 = 5;
+const B_INSTANTIATOR: u8 = 6;
+const B_LIVE_IMPL: u8 = 7;
+/// §22 guest-JIT bindings (Slice 2). Index-only payloads — the domain's units ride [`TAG_JIT`].
+const B_JIT_DOMAIN: u8 = 8;
+const B_JIT_CODE: u8 = 9;
+
+const PROT_RW: u8 = 0;
+const PROT_RO: u8 = 1;
+const PROT_UNMAPPED: u8 = 2;
+
+/// Per-page protection carried in the window image (§12.3), mirroring the runtime page model
+/// (`temen-interp`'s `PageProt` / the JIT window). A `Backed` (§13 `SharedRegion`-aliased) page
+/// is **not** representable — D-region: v1 freeze refuses a domain with shared regions, so the
+/// caller rejects those before serializing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PageProt {
+    /// Read/write — the default. A zero `Rw` page is elided from the image (restore re-zeros it).
+    Rw,
+    /// Read-only (e.g. a D40 `readonly` data segment). Always stored (bytes + prot), even if
+    /// zero, so restore can re-establish the protection.
+    Ro,
+    /// Unmapped / uncommitted — no bytes stored; restore leaves it zero and inaccessible.
+    Unmapped,
+}
+
+/// Why a domain can't be frozen.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum FreezeError {
+    /// A live handle isn't re-grantable, so freeze refuses rather than dropping authority
+    /// (§12.5). The domain must close/drain it first.
+    NonDurableHandle(NonDurableHandle),
+    /// The window length isn't a power of two `≥ PAGE` — it can't be a valid masked window.
+    WindowGeometry(usize),
+    /// The supplied per-page protection map's length doesn't match the window's page count.
+    ProtCount { pages: usize, prots: usize },
+    /// A live `AddressSpace`/`Instantiator` binding names a range outside the window being
+    /// frozen (e.g. a guest `sub`-minted a beyond-window child off the whole-window form) —
+    /// restore would reject the artifact (`RestoreError::BindingOutOfWindow`), so freeze fails
+    /// closed at the same line rather than producing an unrestorable snapshot.
+    BindingOutOfWindow { slot: u32 },
+}
+
+/// Why restoring an artifact failed. All are fail-closed: restore never yields partial state.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum RestoreError {
+    /// Not an `SVMD` container.
+    BadMagic,
+    /// A format version this build doesn't understand.
+    UnsupportedVersion(u16),
+    /// The byte stream ended mid-field (a section length or varint ran off the end).
+    Truncated,
+    /// A section body was malformed (bad varint, unknown binding tag, leftover bytes, …).
+    Malformed,
+    /// A required section is missing (header / window / handles, or the control section when the
+    /// header declares fibers).
+    MissingSection(u64),
+    /// The artifact's instrumented-module digest doesn't match the module restore was handed
+    /// (R5 / §12.6 invariant 2 — the durability boundary).
+    ModuleMismatch,
+    /// The artifact's window geometry doesn't match the module's declared memory.
+    GeometryMismatch,
+    /// A handle named a slot outside the table capacity.
+    SlotOutOfRange(u32),
+    /// An `AddressSpace`/`Instantiator` binding's `[base, base+size)` is not a power-of-two-aligned
+    /// sub-range of the window `[0, mapped)`. A restored (untrusted, persisted) artifact must satisfy
+    /// the same window-containment invariant the grant path guarantees — otherwise a forged `base`
+    /// drives the §14 JIT instantiator's `unsafe` window copy out of bounds (a host-memory escape).
+    BindingOutOfWindow,
+    /// A §22 guest-JIT unit in the [`TAG_JIT`] section didn't decode or failed re-verification
+    /// (Slice 2). The artifact is untrusted, so its units must clear the verifier again before
+    /// their funcs become invocable — a failure is fail-closed (no domains reconstructed).
+    JitReconstruct,
+}
+
+/// An `AddressSpace`/`Instantiator` binding carries a `[base, base+size)` sub-range that the §14 JIT
+/// instantiator's `unsafe` window copy (`from_raw_parts(parent_mem_base + base + off, child_size)`)
+/// *assumes* lies within the window, with `size` a power of two and `base` a multiple of it — the
+/// invariant `Host::grant_address_space`/`grant_instantiator` document and the live grant path
+/// establishes. The window image and the (non-cryptographic) module digest don't cover this field,
+/// so a forged artifact could otherwise smuggle an out-of-window `base` straight into that pointer
+/// arithmetic. Re-check it here at the deserialization boundary; bindings with no address payload
+/// always pass.
+fn binding_in_window(binding: &DurableBinding, mapped: u64) -> bool {
+    let (base, size) = match *binding {
+        // The whole-window `AddressSpace` form (`{0, u64::MAX}` — the retired `Memory` kind,
+        // CONSOLIDATION §4) carries no concrete range: nothing consumes it as pointer
+        // arithmetic (the dispatch arm defers to the backend's `mem` bounding), so like the
+        // other address-payload-free bindings it always passes. Exact-match only — a
+        // `u64::MAX` size at any other base is malformed and falls through to the checks.
+        DurableBinding::AddressSpace {
+            base: 0,
+            size: u64::MAX,
+        } => return true,
+        DurableBinding::AddressSpace { base, size }
+        | DurableBinding::Instantiator { base, size } => (base, size),
+        _ => return true,
+    };
+    size != 0
+        && size.is_power_of_two()
+        && base & (size - 1) == 0
+        && base.checked_add(size).is_some_and(|end| end <= mapped)
+}
+
+/// Serialize a quiesced durable domain into a §12 artifact: the `window` image (the shadow
+/// state rides along) bound to `module`'s digest, plus `host`'s re-grantable handle table.
+/// Refuses if a live handle isn't durable (§12.5). Every page is treated as `Rw` (the flat
+/// window model); for a window with read-only / unmapped pages use [`freeze_with_prots`].
+pub fn freeze(module: &Module, window: &[u8], host: &Host) -> Result<Vec<u8>, FreezeError> {
+    let npages = window.len() / PAGE;
+    freeze_with_prots(module, window, &vec![PageProt::Rw; npages], host)
+}
+
+/// [`freeze`] with an explicit per-page protection map (§12.3): `prots[i]` is the protection of
+/// the window page at `[i*PAGE, (i+1)*PAGE)` and must cover every page. `Ro` pages are always
+/// stored (bytes + prot) so restore can re-establish them; `Unmapped` pages store no bytes;
+/// zero `Rw` pages are elided.
+pub fn freeze_with_prots(
+    module: &Module,
+    window: &[u8],
+    prots: &[PageProt],
+    host: &Host,
+) -> Result<Vec<u8>, FreezeError> {
+    if !window.len().is_power_of_two() || window.len() < PAGE {
+        return Err(FreezeError::WindowGeometry(window.len()));
+    }
+    let npages = window.len() / PAGE;
+    if prots.len() != npages {
+        return Err(FreezeError::ProtCount {
+            pages: npages,
+            prots: prots.len(),
+        });
+    }
+    let handles = host
+        .capture_durable_handles()
+        .map_err(FreezeError::NonDurableHandle)?;
+    // Freeze-side twin of the restore boundary's `binding_in_window` gate: refuse to emit an
+    // artifact restore would reject, so out-of-window authority fails at freeze with a clear
+    // error instead of surfacing as a Malformed artifact later.
+    if let Some(h) = handles
+        .iter()
+        .find(|h| !binding_in_window(&h.binding, window.len() as u64))
+    {
+        return Err(FreezeError::BindingOutOfWindow { slot: h.slot });
+    }
+    // The freeze/thaw fiber residue (§12.4 / slice 3.1.5), canonical = ascending slot.
+    let mut fibers = host.frozen_fibers().to_vec();
+    fibers.sort_by_key(|f| f.slot);
+    // The freeze/thaw spawned-vCPU residue (§12.4 / slice 3.2.1), canonical = ascending task. The
+    // root's extent rides alongside (its continuation is in the window image like everyone's, but the
+    // shared active-SP word holds only the last child's extent at freeze end).
+    let mut vcpus = host.frozen_vcpus().to_vec();
+    vcpus.sort_by_key(|v| v.task);
+    // The §14 nested-child residue (DURABILITY.md §4, v8). Each child's continuation is in its own
+    // carve inside the window image; this is the re-attach record. v12 carries each record's
+    // `parent_task` on the wire (see the encode below), so the format now represents nesting to
+    // **arbitrary depth** and the interp thaw reconstructs the subtree topologically from it. Canonical
+    // order is `(parent_task, slot)` — `slot` is only unique *within* a parent's namespace (the root's
+    // first child and that child's first grandchild are both `slot 0`), so the parent tag is the
+    // primary key. This matches the interp thaw's own sort (parents before children). For a depth-1
+    // artifact (every `parent_task == 0`) this reduces to ascending slot, as in v8–v11.
+    let mut nested = host.frozen_nested().to_vec();
+    nested.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
+    // §13.4 slice 4c: per-child host state, merged into each nested record by (parent_task, slot).
+    let child_state = host.frozen_child_state().to_vec();
+    let root_sp = host.frozen_root_sp().unwrap_or(SHADOW_BASE);
+    let digest = digest256(&encode_module(module));
+    let reserved_log2 = window.len().trailing_zeros() as u8;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+
+    // Section 0 — Header (§12.2).
+    section(&mut out, TAG_HEADER, |b| {
+        b.extend_from_slice(&digest);
+        b.push(reserved_log2);
+        write_uleb(b, window.len() as u64); // mapped
+        write_uleb(b, PAGE as u64); // host page size at capture
+        write_uleb(b, 1 + vcpus.len() as u64); // vcpu_count = root + spawned (§12.4 / slice 3.2.1)
+        write_uleb(b, fibers.len() as u64); // fiber_count (§12.4)
+    });
+
+    // Section 1 — Window image (§12.3): sparse + zero-eliding, ascending page index. A page is
+    // stored when it carries protection or content the restore can't infer: `Ro`/`Unmapped`
+    // always, `Rw` only when non-zero (an elided page restores as zero `Rw`).
+    section(&mut out, TAG_WINDOW, |b| {
+        let entries: Vec<(usize, &[u8])> = window
+            .chunks_exact(PAGE)
+            .enumerate()
+            .filter(|&(i, p)| match prots[i] {
+                PageProt::Rw => p.iter().any(|&x| x != 0),
+                PageProt::Ro | PageProt::Unmapped => true,
+            })
+            .collect();
+        write_uleb(b, entries.len() as u64);
+        for (idx, page) in entries {
+            write_uleb(b, idx as u64);
+            match prots[idx] {
+                PageProt::Rw => {
+                    b.push(PROT_RW);
+                    b.extend_from_slice(page);
+                }
+                PageProt::Ro => {
+                    b.push(PROT_RO);
+                    b.extend_from_slice(page);
+                }
+                PageProt::Unmapped => b.push(PROT_UNMAPPED), // no bytes
+            }
+        }
+    });
+
+    // Section 2 — Control state (§12.4): the frozen-fiber residue, plus (slice 3.2.1) the spawned-vCPU
+    // residue. Each continuation lives in its in-window shadow region (already in the window image);
+    // this records the small host-side residue needed to re-enter it on thaw. Emitted only when there
+    // are fibers or spawned vCPUs. The vCPU residue is **appended** after the fiber residue and only
+    // when present, so a fiber-only (or single-vCPU no-fiber) artifact is byte-identical to before.
+    if !fibers.is_empty() || !vcpus.is_empty() || !nested.is_empty() {
+        section(&mut out, TAG_CONTROL, |b| {
+            write_uleb(b, fibers.len() as u64);
+            for f in &fibers {
+                write_uleb(b, f.slot as u64);
+                write_uleb(b, f.func as u32 as u64);
+                write_uleb(b, f.sp as u64);
+                write_uleb(b, f.shadow_sp);
+                write_uleb(b, f.generation); // 48-bit fiber generation (recycling step 2)
+            }
+            if !vcpus.is_empty() {
+                write_uleb(b, vcpus.len() as u64);
+                for v in &vcpus {
+                    write_uleb(b, v.task as u64);
+                    write_uleb(b, v.parent_task as u64); // slice 3.4 (v4): who spawned it (nested spawns)
+                    write_uleb(b, v.func as u32 as u64);
+                    write_uleb(b, v.args.len() as u64);
+                    for &a in &v.args {
+                        write_uleb(b, a as u64);
+                    }
+                    write_uleb(b, v.shadow_sp);
+                    // §12.8 4A.5 follow-up A (v6): a completed-but-unjoined concurrent child carries its
+                    // join result (1 + the i64); a normal frozen child writes 0.
+                    match v.completed_result {
+                        None => write_uleb(b, 0),
+                        Some(r) => {
+                            write_uleb(b, 1);
+                            write_uleb(b, r as u64);
+                        }
+                    }
+                }
+                write_uleb(b, root_sp); // the root vCPU's flattened extent (its implicit residue)
+            }
+            // §4 subtree freeze (v8): the nested-child re-attach residue is **appended** after the
+            // fiber + vCPU residue and only when present, so fiber-/vCPU-only artifacts keep the
+            // pre-nesting Section-2 byte layout (only the container version differs).
+            if !nested.is_empty() {
+                write_uleb(b, nested.len() as u64);
+                for n in &nested {
+                    write_uleb(b, n.slot as u64);
+                    // v12: the task that instantiated this child (depth-2+ nesting). `0` for a direct
+                    // child of the root; a grandchild carries its parent-child's task. The interp thaw
+                    // groups the residue by this to re-attach parents before their children.
+                    write_uleb(b, n.parent_task as u64);
+                    write_uleb(b, n.carve_off);
+                    write_uleb(b, n.size_log2 as u64);
+                    write_uleb(b, n.entry as u64);
+                    // v11: a separate-module child carries its module content digest (1 + 32 bytes)
+                    // so a thaw resolves it against the restore host's re-granted modules; a
+                    // same-module child writes 0 (runs the parent's own funcs).
+                    match n.module_digest {
+                        None => write_uleb(b, 0),
+                        Some(d) => {
+                            write_uleb(b, 1);
+                            b.extend_from_slice(&d);
+                        }
+                    }
+                    // v9: a completed-but-unjoined child carries its join result (1 + the i64); a
+                    // still-running child writes 0 (re-attached + rewound on thaw instead).
+                    match n.completed_result {
+                        None => write_uleb(b, 0),
+                        Some(r) => {
+                            write_uleb(b, 1);
+                            write_uleb(b, r as u64);
+                        }
+                    }
+                    // v14 (§13.4 slice 4c): the child's host state — serve trio + durable
+                    // handle table — when its self-unwind recorded one; 0 for a plain child.
+                    let cs = child_state
+                        .iter()
+                        .find(|c| c.parent_task == n.parent_task && c.slot == n.slot);
+                    match cs {
+                        None => write_uleb(b, 0),
+                        Some(c) => {
+                            write_uleb(b, 1);
+                            write_serve_trio(b, &c.svc_queue, &c.svc_results, c.svc_next_ticket);
+                            write_handle_recs(b, &c.handles);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Section 3 — Handle table (§12.5): ascending slot (capture already orders it).
+    section(&mut out, TAG_HANDLES, |b| write_handle_recs(b, &handles));
+
+    // Section 4 — Serve state (DURABILITY.md §13.4 step 3, v13): the domain's inbound queue
+    // (FIFO order), completion cells (ascending ticket — `svc_state` yields the `BTreeMap`
+    // order), and ticket counter. Plain data (§13.2 "serialize as-is"); tickets are
+    // cut-internal under §13.1. Elided when the trio is empty/zero, so a never-served
+    // domain's artifact keeps the pre-serve section layout.
+    let (svc_queue, svc_results, svc_next_ticket) = host.svc_state();
+    if !svc_queue.is_empty() || !svc_results.is_empty() || svc_next_ticket != 0 {
+        section(&mut out, TAG_SERVE, |b| {
+            write_serve_trio(b, &svc_queue, &svc_results, svc_next_ticket)
+        });
+    }
+
+    // Section 5 — Durable guest-JIT state (DURABILITY.md §12.5 Slice 2, v16): each granted §22
+    // domain's out-of-line units + compile quotas. The handle table (Section 3) carries the
+    // `JitDomain`/`JitCode` *bindings* (indices); this carries the *state* those indices name,
+    // rebuilt positionally on thaw. Elided when no JIT is granted, so a JIT-free artifact keeps
+    // the pre-JIT section layout (only the version differs).
+    let jit = host.capture_durable_jit();
+    if !jit.is_empty() {
+        let table_log2 = host.jit_table_log2();
+        section(&mut out, TAG_JIT, |b| write_jit(b, table_log2, &jit));
+    }
+
+    Ok(out)
+}
+
+/// Serialize the durable guest-JIT domains (Section 5, v17). Canonical: the `table_log2` header,
+/// then domains and units in index order (capture already yields them so), install occupancy in
+/// install order — all minimal LEB128.
+fn write_jit(b: &mut Vec<u8>, table_log2: u8, jit: &[DurableJitDomain]) {
+    b.push(table_log2); // v17: the run's call_indirect table reservation
+    write_uleb(b, jit.len() as u64);
+    for d in jit {
+        match d.mem_log2 {
+            None => write_uleb(b, 0),
+            Some(m) => {
+                write_uleb(b, 1);
+                b.push(m);
+            }
+        }
+        write_uleb(b, d.units_left as u64);
+        write_uleb(b, d.bytes_left);
+        write_uleb(b, d.units.len() as u64);
+        for u in &d.units {
+            write_uleb(b, u.install_type_id as u64);
+            write_uleb(b, u.unit_ir.len() as u64);
+            b.extend_from_slice(&u.unit_ir);
+        }
+        // v17: B2 install occupancy — (slot, unit) in install order.
+        write_uleb(b, d.installed.len() as u64);
+        for &(slot, unit) in &d.installed {
+            write_uleb(b, slot as u64);
+            write_uleb(b, unit as u64);
+        }
+    }
+}
+
+/// Restore a §12 artifact: validate it against `module` (R5 digest gate + geometry), re-grant
+/// its handle table into `host` (a fresh table the embedder supplies behind its own resources,
+/// D-scope), and return the reconstructed window bytes (protections dropped — every page is
+/// `Rw` content). The caller flips the state word to `REWINDING` and re-enters to thaw. Use
+/// [`restore_with_prots`] when the window has `Ro`/`Unmapped` pages to re-establish.
+pub fn restore(artifact: &[u8], module: &Module, host: &mut Host) -> Result<Vec<u8>, RestoreError> {
+    restore_with_prots(artifact, module, host).map(|(window, _)| window)
+}
+
+/// [`restore`] that also recovers the per-page protection map (§12.3): `prots[i]` is the
+/// protection to re-establish on the window page at `[i*PAGE, (i+1)*PAGE)` (default `Rw` for an
+/// elided page). Re-applying these to the runtime window is the escape-TCB restore step.
+pub fn restore_with_prots(
+    artifact: &[u8],
+    module: &Module,
+    host: &mut Host,
+) -> Result<(Vec<u8>, Vec<PageProt>), RestoreError> {
+    let mut r = Reader::new(artifact);
+    if r.take(4)? != MAGIC {
+        return Err(RestoreError::BadMagic);
+    }
+    let version = u16::from_le_bytes([r.u8()?, r.u8()?]);
+    if version != FORMAT_VERSION {
+        return Err(RestoreError::UnsupportedVersion(version));
+    }
+
+    let (mut header, mut win_body, mut handles_body, mut control_body) = (None, None, None, None);
+    let mut serve_body = None;
+    let mut jit_body = None;
+    while !r.at_end() {
+        let tag = r.uleb()?;
+        let len = r.uleb()? as usize;
+        let body = r.take(len)?;
+        match tag {
+            TAG_HEADER => header = Some(body),
+            TAG_WINDOW => win_body = Some(body),
+            TAG_CONTROL => control_body = Some(body),
+            TAG_HANDLES => handles_body = Some(body),
+            TAG_SERVE => serve_body = Some(body),
+            TAG_JIT => jit_body = Some(body),
+            // Fail closed on an unknown tag (#915/§8). The version gate above already pins
+            // `version == FORMAT_VERSION`, so no artifact this build emits can carry one — silently
+            // skipping it was dead "forward-compat" that only opened a canonicality hole (a
+            // junk-section artifact restoring identically to a clean one). Reject it.
+            _ => return Err(RestoreError::Malformed),
+        }
+    }
+    let header = header.ok_or(RestoreError::MissingSection(TAG_HEADER))?;
+    let win_body = win_body.ok_or(RestoreError::MissingSection(TAG_WINDOW))?;
+    let handles_body = handles_body.ok_or(RestoreError::MissingSection(TAG_HANDLES))?;
+
+    // ---- Header: the R5 identity gate, then geometry. ----
+    let mut h = Reader::new(header);
+    let digest = h.take(32)?;
+    let reserved_log2 = h.u8()?;
+    let mapped = h.uleb()? as usize;
+    let page_size = h.uleb()? as usize;
+    let vcpu_count = h.uleb()?;
+    let fiber_count = h.uleb()?;
+    // Spawned (`thread.spawn`) vCPUs = total − the always-present root (slice 3.2.1).
+    let spawned_count = vcpu_count.checked_sub(1).ok_or(RestoreError::Malformed)?;
+    if digest != digest256(&encode_module(module)) {
+        return Err(RestoreError::ModuleMismatch);
+    }
+    if let Some(mem) = &module.memory {
+        if mem.size_log2 != reserved_log2 {
+            return Err(RestoreError::GeometryMismatch);
+        }
+    }
+    if page_size != PAGE || mapped != 1usize << reserved_log2 {
+        return Err(RestoreError::GeometryMismatch);
+    }
+
+    // ---- Window image: zeroed window (default `Rw`); splat each stored page + its prot. ----
+    let mut window = vec![0u8; mapped];
+    let mut prots = vec![PageProt::Rw; mapped / PAGE];
+    let mut w = Reader::new(win_body);
+    let n_pages = w.uleb()?;
+    let mut last: Option<u64> = None;
+    for _ in 0..n_pages {
+        let idx = w.uleb()?;
+        if last.is_some_and(|p| idx <= p) {
+            return Err(RestoreError::Malformed); // non-canonical: pages must ascend
+        }
+        last = Some(idx);
+        let page = idx as usize;
+        let start = page
+            .checked_mul(PAGE)
+            .filter(|&s| s + PAGE <= mapped)
+            .ok_or(RestoreError::Malformed)?;
+        match w.u8()? {
+            PROT_RW => {
+                window[start..start + PAGE].copy_from_slice(w.take(PAGE)?);
+            }
+            PROT_RO => {
+                window[start..start + PAGE].copy_from_slice(w.take(PAGE)?);
+                prots[page] = PageProt::Ro;
+            }
+            PROT_UNMAPPED => prots[page] = PageProt::Unmapped, // no bytes; window stays zero
+            _ => return Err(RestoreError::Malformed),
+        }
+    }
+    if !w.at_end() {
+        return Err(RestoreError::Malformed);
+    }
+
+    // ---- Handle table: decode, bounds-check, re-grant. ----
+    let mut hr = Reader::new(handles_body);
+    let n = hr.uleb()?;
+    let mut handles = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let slot = u32::try_from(hr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+        if slot >= Host::handle_capacity() {
+            return Err(RestoreError::SlotOutOfRange(slot));
+        }
+        let generation = u32::try_from(hr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+        let type_id = u32::try_from(hr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+        let binding = read_binding(&mut hr)?;
+        // Re-establish the window-containment invariant the §14 JIT instantiator's `unsafe` relies on:
+        // a forged AddressSpace/Instantiator `base`/`size` must not name memory outside `[0, mapped)`.
+        if !binding_in_window(&binding, mapped as u64) {
+            return Err(RestoreError::BindingOutOfWindow);
+        }
+        handles.push(DurableHandle {
+            slot,
+            generation,
+            type_id,
+            binding,
+        });
+    }
+    if !hr.at_end() {
+        return Err(RestoreError::Malformed);
+    }
+
+    // ---- Durable guest-JIT state (§12.5 Slice 2, v16): decode Section 5, bounds-check the handle
+    // table's JIT indices against it, and rebuild the domains (each unit re-verified). Do this
+    // *before* re-granting the table so a forged `JitDomain`/`JitCode` index that names no restored
+    // domain/unit is rejected here — otherwise the guest's first `compile`/`invoke` would index
+    // `jit_domains` out of bounds. Absent section ⇒ no JIT granted (any JIT binding then fails the
+    // bounds check). ----
+    let (jit_table_log2, jit) = decode_jit(jit_body)?;
+    for h in &handles {
+        let ok = match h.binding {
+            DurableBinding::JitDomain { idx } => (idx as usize) < jit.len(),
+            DurableBinding::JitCode { domain, unit } => jit
+                .get(domain as usize)
+                .is_some_and(|d| (unit as usize) < d.units.len()),
+            _ => true,
+        };
+        if !ok {
+            return Err(RestoreError::JitReconstruct);
+        }
+    }
+    host.restore_durable_jit(&jit)
+        .map_err(|_| RestoreError::JitReconstruct)?;
+    // v17: restore the call_indirect table reservation so the thaw run's dispatch table has the
+    // padding the re-applied installs land in (a fresh host defaults to 0).
+    host.set_jit_table_log2(jit_table_log2);
+    host.restore_durable_handles(&handles);
+
+    // ---- Control state (§12.4): decode the frozen-fiber + spawned-vCPU residue and seed it for the
+    // thaw. The section is present iff there are fibers or spawned vCPUs (canonical); restore re-seeds
+    // the Host so the next (REWINDING) run re-creates the fibers and re-spawns the vCPUs. ----
+    let (fibers, vcpus, root_sp, nested, child_state) =
+        decode_control(control_body, fiber_count, spawned_count)?;
+    host.set_frozen_fibers(fibers);
+    if !vcpus.is_empty() {
+        host.set_frozen_vcpus(vcpus);
+        host.set_frozen_root_sp(root_sp);
+    }
+    if !nested.is_empty() {
+        host.set_frozen_nested(nested);
+    }
+    if !child_state.is_empty() {
+        host.set_frozen_child_state(child_state);
+    }
+
+    // ---- Serve state (§13.4 step 3, v13): decode the serve trio and restore it. The section is
+    // present iff the trio is non-empty (canonical); its absence restores the empty default. ----
+    if let Some(body) = serve_body {
+        let mut sr = Reader::new(body);
+        let (queue, results, next_ticket) = read_serve_trio(&mut sr)?;
+        if !sr.at_end() {
+            return Err(RestoreError::Malformed);
+        }
+        if queue.is_empty() && results.is_empty() && next_ticket == 0 {
+            return Err(RestoreError::Malformed); // non-canonical: an empty trio elides the section
+        }
+        host.set_svc_state(queue, results, next_ticket);
+    }
+
+    Ok((window, prots))
+}
+
+/// Decode Section 2: the frozen-fiber residue (canonical ascending slot), then — appended only when
+/// `spawned_count > 0` (slice 3.2.1) — the spawned-vCPU residue (canonical ascending task) and the
+/// root's extent. Enforces the header's counts. A `None` body is valid only when both counts are zero
+/// (the section is elided then). Returns `(fibers, vcpus, root_sp, nested)`.
+#[allow(clippy::type_complexity)]
+fn decode_control(
+    body: Option<&[u8]>,
+    fiber_count: u64,
+    spawned_count: u64,
+) -> Result<
+    (
+        Vec<FrozenFiber>,
+        Vec<FrozenVCpu>,
+        u64,
+        Vec<FrozenNested>,
+        Vec<FrozenChildState>,
+    ),
+    RestoreError,
+> {
+    let body = match (body, fiber_count, spawned_count) {
+        (None, 0, 0) => {
+            return Ok((Vec::new(), Vec::new(), SHADOW_BASE, Vec::new(), Vec::new()));
+            // no residue ⇒ no section
+        }
+        (None, _, _) => return Err(RestoreError::MissingSection(TAG_CONTROL)),
+        (Some(b), _, _) => b,
+    };
+    let mut cr = Reader::new(body);
+    let n = cr.uleb()?;
+    if n != fiber_count {
+        return Err(RestoreError::Malformed); // header and section must agree
+    }
+    let mut fibers = Vec::with_capacity(n as usize);
+    let mut last: Option<u64> = None;
+    for _ in 0..n {
+        let slot = cr.uleb()?;
+        if last.is_some_and(|p| slot <= p) {
+            return Err(RestoreError::Malformed); // non-canonical: slots must ascend
+        }
+        last = Some(slot);
+        let func = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)? as i32;
+        let sp = cr.uleb()? as i64;
+        let shadow_sp = cr.uleb()?;
+        let generation = cr.uleb()?; // 48-bit fiber generation (u64); a pre-widening artifact's
+                                     // small value decodes identically (wire-compatible).
+        fibers.push(FrozenFiber {
+            slot: usize::try_from(slot).map_err(|_| RestoreError::Malformed)?,
+            func,
+            sp,
+            shadow_sp,
+            generation,
+        });
+    }
+    // Spawned-vCPU residue (slice 3.2.1): present iff the header declares spawned vCPUs.
+    let mut vcpus = Vec::with_capacity(spawned_count as usize);
+    let mut root_sp = SHADOW_BASE;
+    if spawned_count > 0 {
+        let nv = cr.uleb()?;
+        if nv != spawned_count {
+            return Err(RestoreError::Malformed); // header and section must agree
+        }
+        let mut last: Option<u64> = None;
+        for _ in 0..nv {
+            let task = cr.uleb()?;
+            if last.is_some_and(|p| task <= p) {
+                return Err(RestoreError::Malformed); // non-canonical: tasks must ascend
+            }
+            last = Some(task);
+            let parent_task = cr.uleb()?; // slice 3.4 (v4): the spawning task (nested spawns)
+            let func = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)? as i32;
+            let nargs = cr.uleb()?;
+            let mut args = Vec::with_capacity(nargs as usize);
+            for _ in 0..nargs {
+                args.push(cr.uleb()? as i64);
+            }
+            let shadow_sp = cr.uleb()?;
+            // §12.8 4A.5 follow-up A (v6): completed-but-unjoined concurrent child's join result.
+            let completed_result = match cr.uleb()? {
+                0 => None,
+                _ => Some(cr.uleb()? as i64),
+            };
+            vcpus.push(FrozenVCpu {
+                task: usize::try_from(task).map_err(|_| RestoreError::Malformed)?,
+                parent_task: usize::try_from(parent_task).map_err(|_| RestoreError::Malformed)?,
+                func,
+                args,
+                shadow_sp,
+                completed_result,
+            });
+        }
+        root_sp = cr.uleb()?;
+    }
+    // §4 subtree freeze (v8): the optional nested-child residue trails the section; its presence is
+    // exactly "bytes remain" (canonical: absent when empty, ascending `(parent_task, slot)` — `slot`
+    // is only unique within a parent's namespace, so the parent tag is the primary key; v12).
+    let mut nested = Vec::new();
+    let mut child_state = Vec::new();
+    if !cr.at_end() {
+        let nn = cr.uleb()?;
+        let mut last: Option<(u64, u64)> = None; // (parent_task, slot)
+        for _ in 0..nn {
+            let slot = cr.uleb()?;
+            // v12: the task that instantiated this child (depth-2+ nesting); `0` for a direct child of
+            // the root. The interp thaw reconstructs the subtree topologically from it.
+            let parent_task_raw = cr.uleb()?;
+            let key = (parent_task_raw, slot);
+            if last.is_some_and(|p| key <= p) {
+                return Err(RestoreError::Malformed); // non-canonical: (parent_task, slot) must ascend
+            }
+            last = Some(key);
+            let parent_task =
+                usize::try_from(parent_task_raw).map_err(|_| RestoreError::Malformed)?;
+            let carve_off = cr.uleb()?;
+            let size_log2 = u8::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+            let entry = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+            // v11: separate-module child's module content digest.
+            let module_digest = match cr.uleb()? {
+                0 => None,
+                _ => Some(
+                    cr.take(32)?
+                        .try_into()
+                        .map_err(|_| RestoreError::Malformed)?,
+                ),
+            };
+            // v9: completed-but-unjoined child's join result.
+            let completed_result = match cr.uleb()? {
+                0 => None,
+                _ => Some(cr.uleb()? as i64),
+            };
+            // v14 (§13.4 slice 4c): the child's optional host state.
+            if cr.uleb()? != 0 {
+                let (svc_queue, svc_results, svc_next_ticket) = read_serve_trio(&mut cr)?;
+                let nh = cr.uleb()?;
+                let mut handles = Vec::with_capacity(nh as usize);
+                for _ in 0..nh {
+                    let hslot = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+                    let generation =
+                        u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+                    let type_id = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+                    let binding = read_binding(&mut cr)?;
+                    // The child-window containment gate, mirroring the root handle table's
+                    // `binding_in_window`: a child's AddressSpace/Instantiator base/size are
+                    // carve-relative and must stay inside its own window.
+                    if !binding_in_window(&binding, 1u64 << size_log2) {
+                        return Err(RestoreError::BindingOutOfWindow);
+                    }
+                    handles.push(DurableHandle {
+                        slot: hslot,
+                        generation,
+                        type_id,
+                        binding,
+                    });
+                }
+                child_state.push(FrozenChildState {
+                    parent_task,
+                    slot: usize::try_from(slot).map_err(|_| RestoreError::Malformed)?,
+                    svc_queue,
+                    svc_results,
+                    svc_next_ticket,
+                    handles,
+                });
+            }
+            nested.push(FrozenNested {
+                // v12: carried on the wire (above), so a restored subtree reconstructs to arbitrary
+                // depth — a grandchild's `parent_task` is its parent-child's task, not `0`.
+                parent_task,
+                slot: usize::try_from(slot).map_err(|_| RestoreError::Malformed)?,
+                carve_off,
+                size_log2,
+                entry,
+                module_digest,
+                completed_result,
+            });
+        }
+    }
+    if !cr.at_end() {
+        return Err(RestoreError::Malformed);
+    }
+    Ok((fibers, vcpus, root_sp, nested, child_state))
+}
+
+/// Decode Section 5: the `table_log2` header and the durable guest-JIT domains (v17). A `None` body
+/// ⇒ no JIT granted (`table_log2 = 0`, empty set). Enforces canonical minimal encoding via the
+/// shared [`Reader`]; a unit's IR is carried opaquely here (its decode + re-verify happens in
+/// [`Host::restore_durable_jit`]). Returns `(table_log2, domains)`.
+fn decode_jit(body: Option<&[u8]>) -> Result<(u8, Vec<DurableJitDomain>), RestoreError> {
+    let Some(body) = body else {
+        return Ok((0, Vec::new()));
+    };
+    let mut jr = Reader::new(body);
+    let table_log2 = jr.u8()?;
+    let nd = jr.uleb()?;
+    let mut domains = Vec::with_capacity(nd as usize);
+    for _ in 0..nd {
+        let mem_log2 = match jr.uleb()? {
+            0 => None,
+            1 => Some(jr.u8()?),
+            _ => return Err(RestoreError::Malformed),
+        };
+        let units_left = u32::try_from(jr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+        let bytes_left = jr.uleb()?;
+        let nu = jr.uleb()?;
+        let mut units = Vec::with_capacity(nu as usize);
+        for _ in 0..nu {
+            let install_type_id = u32::try_from(jr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+            let ir_len = jr.uleb()? as usize;
+            let unit_ir = jr.take(ir_len)?.to_vec();
+            units.push(DurableJitUnit {
+                unit_ir,
+                install_type_id,
+            });
+        }
+        // v17: B2 install occupancy — (slot, unit) in install order.
+        let ni = jr.uleb()?;
+        let mut installed = Vec::with_capacity(ni as usize);
+        for _ in 0..ni {
+            let slot = u32::try_from(jr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+            let unit = u32::try_from(jr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+            installed.push((slot, unit));
+        }
+        domains.push(DurableJitDomain {
+            mem_log2,
+            units_left,
+            bytes_left,
+            units,
+            installed,
+        });
+    }
+    if !jr.at_end() {
+        return Err(RestoreError::Malformed);
+    }
+    // Canonical: an empty JIT set elides the section (freeze only emits it when non-empty).
+    if domains.is_empty() {
+        return Err(RestoreError::Malformed);
+    }
+    Ok((table_log2, domains))
+}
+
+// ---- Shared section encoders (#915): the serve-trio and handle-record wire shapes are written
+// byte-for-byte the same for the domain-level sections and each frozen child's inline state, so they
+// have one encoder each here rather than a hand-copied pair. (The *decoders* legitimately diverge —
+// the root handle table also bounds-checks the slot against `Host::handle_capacity()` — so they stay
+// inline.) ----
+
+/// Encode a serve trio (§13.4): the dispatch `queue` (FIFO), completion `results` (ascending ticket),
+/// and the `next_ticket` counter. Length-prefixed ULEB throughout; the exact bytes both serve sites
+/// emit, pinned by the §12.6 byte-identity tests.
+fn write_serve_trio(
+    b: &mut Vec<u8>,
+    queue: &[SvcDispatch],
+    results: &[(u64, i64)],
+    next_ticket: u64,
+) {
+    write_uleb(b, queue.len() as u64);
+    for d in queue {
+        write_uleb(b, d.export as u64);
+        write_uleb(b, d.op as u64);
+        write_uleb(b, d.args.len() as u64);
+        for &a in &d.args {
+            write_uleb(b, a as u64);
+        }
+        write_uleb(b, d.ticket);
+    }
+    write_uleb(b, results.len() as u64);
+    for &(t, v) in results {
+        write_uleb(b, t);
+        write_uleb(b, v as u64);
+    }
+    write_uleb(b, next_ticket);
+}
+
+/// A decoded serve trio (§13.4): the inbound dispatch queue, the completion cells `(ticket, value)`
+/// in canonical ascending-ticket order, and the next-ticket counter.
+type ServeTrio = (Vec<SvcDispatch>, Vec<(u64, i64)>, u64);
+
+/// Decode a serve trio — the exact inverse of [`write_serve_trio`], shared by the two decode sites
+/// (the root serve section and a child domain's state). Each caller does its own framing/canonicality
+/// checks (section `at_end`, empty-trio elision) around it. (#915)
+fn read_serve_trio(r: &mut Reader) -> Result<ServeTrio, RestoreError> {
+    let nq = r.uleb()?;
+    let mut queue = Vec::with_capacity(nq as usize);
+    for _ in 0..nq {
+        let export = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?;
+        let op = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?;
+        let nargs = r.uleb()?;
+        let mut args = Vec::with_capacity(nargs as usize);
+        for _ in 0..nargs {
+            args.push(r.uleb()? as i64);
+        }
+        let ticket = r.uleb()?;
+        queue.push(SvcDispatch {
+            export,
+            op,
+            args,
+            ticket,
+        });
+    }
+    let nr = r.uleb()?;
+    let mut results = Vec::with_capacity(nr as usize);
+    let mut last: Option<u64> = None;
+    for _ in 0..nr {
+        let t = r.uleb()?;
+        if last.is_some_and(|p| t <= p) {
+            return Err(RestoreError::Malformed); // non-canonical: tickets must ascend
+        }
+        last = Some(t);
+        let v = r.uleb()? as i64;
+        results.push((t, v));
+    }
+    let next_ticket = r.uleb()?;
+    Ok((queue, results, next_ticket))
+}
+
+/// Encode a handle table (§12.5): a length prefix then each record's `slot`/`generation`/`type_id`
+/// and its binding. The exact bytes both handle-table sites emit.
+fn write_handle_recs(b: &mut Vec<u8>, handles: &[DurableHandle]) {
+    write_uleb(b, handles.len() as u64);
+    for h in handles {
+        write_uleb(b, h.slot as u64);
+        write_uleb(b, h.generation as u64);
+        write_uleb(b, h.type_id as u64);
+        write_binding(b, &h.binding);
+    }
+}
+
+// ---- Binding (de)serialization (§12.5) ----
+
+fn write_binding(b: &mut Vec<u8>, binding: &DurableBinding) {
+    match *binding {
+        DurableBinding::Stream(role) => {
+            b.push(B_STREAM);
+            b.push(match role {
+                StreamRole::In => 0,
+                StreamRole::Out => 1,
+                StreamRole::Err => 2,
+            });
+        }
+        DurableBinding::Exit => b.push(B_EXIT),
+        DurableBinding::Clock => b.push(B_CLOCK),
+        DurableBinding::AddressSpace { base, size } => {
+            b.push(B_ADDRESS_SPACE);
+            write_uleb(b, base);
+            write_uleb(b, size);
+        }
+        DurableBinding::Instantiator { base, size } => {
+            b.push(B_INSTANTIATOR);
+            write_uleb(b, base);
+            write_uleb(b, size);
+        }
+        DurableBinding::LiveImpl { slot, export } => {
+            b.push(B_LIVE_IMPL);
+            write_uleb(b, slot as u64);
+            write_uleb(b, export as u64);
+        }
+        DurableBinding::JitDomain { idx } => {
+            b.push(B_JIT_DOMAIN);
+            write_uleb(b, idx as u64);
+        }
+        DurableBinding::JitCode { domain, unit } => {
+            b.push(B_JIT_CODE);
+            write_uleb(b, domain as u64);
+            write_uleb(b, unit as u64);
+        }
+    }
+}
+
+fn read_binding(r: &mut Reader) -> Result<DurableBinding, RestoreError> {
+    Ok(match r.u8()? {
+        B_STREAM => DurableBinding::Stream(match r.u8()? {
+            0 => StreamRole::In,
+            1 => StreamRole::Out,
+            2 => StreamRole::Err,
+            _ => return Err(RestoreError::Malformed),
+        }),
+        B_EXIT => DurableBinding::Exit,
+        B_CLOCK => DurableBinding::Clock,
+        // B_MEMORY (3): retired with the §4 Memory→AddressSpace fold — a pre-§4 artifact carrying
+        // one fails decode closed rather than resurrecting a dead cap kind.
+        // B_YIELDER (4): retired with the §2.3 coroutine deletion — same fail-closed treatment.
+        B_ADDRESS_SPACE => DurableBinding::AddressSpace {
+            base: r.uleb()?,
+            size: r.uleb()?,
+        },
+        B_INSTANTIATOR => DurableBinding::Instantiator {
+            base: r.uleb()?,
+            size: r.uleb()?,
+        },
+        B_LIVE_IMPL => DurableBinding::LiveImpl {
+            slot: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
+            export: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
+        },
+        B_JIT_DOMAIN => DurableBinding::JitDomain {
+            idx: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
+        },
+        B_JIT_CODE => DurableBinding::JitCode {
+            domain: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
+            unit: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
+        },
+        _ => return Err(RestoreError::Malformed),
+    })
+}
+
+// ---- Container helpers ----
+
+/// Emit a TLV section: tag, then the body's length, then the body built by `f`.
+fn section(out: &mut Vec<u8>, tag: u64, f: impl FnOnce(&mut Vec<u8>)) {
+    let mut body = Vec::new();
+    f(&mut body);
+    write_uleb(out, tag);
+    write_uleb(out, body.len() as u64);
+    out.extend_from_slice(&body);
+}
+
+/// Minimal-length LEB128 (the canonical encoding §12.1 requires).
+fn write_uleb(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// A bounds-checked forward cursor over the artifact bytes.
+struct Reader<'a> {
+    b: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(b: &'a [u8]) -> Reader<'a> {
+        Reader { b, pos: 0 }
+    }
+    fn at_end(&self) -> bool {
+        self.pos >= self.b.len()
+    }
+    fn take(&mut self, n: usize) -> Result<&'a [u8], RestoreError> {
+        let end = self.pos.checked_add(n).ok_or(RestoreError::Truncated)?;
+        let s = self.b.get(self.pos..end).ok_or(RestoreError::Truncated)?;
+        self.pos = end;
+        Ok(s)
+    }
+    fn u8(&mut self) -> Result<u8, RestoreError> {
+        Ok(self.take(1)?[0])
+    }
+    fn uleb(&mut self) -> Result<u64, RestoreError> {
+        let mut v = 0u64;
+        let mut shift = 0u32;
+        loop {
+            let byte = self.u8()?;
+            if shift >= 64 || (shift == 63 && byte > 1) {
+                return Err(RestoreError::Malformed); // overflow / non-canonical
+            }
+            v |= ((byte & 0x7f) as u64) << shift;
+            if byte & 0x80 == 0 {
+                if byte == 0 && shift != 0 {
+                    return Err(RestoreError::Malformed); // non-minimal trailing zero byte
+                }
+                return Ok(v);
+            }
+            shift += 7;
+        }
+    }
+}
+
+/// A 256-bit **non-cryptographic** digest of `bytes` (D-hash): four independent multiplicative
+/// lanes with distinct odd primes, length-mixed. Guards *accidental* restore-into-wrong-module
+/// (§12.6 invariant 2), not an adversary (a guest can't forge past confinement — §3), so no
+/// crypto-hash dependency is pulled into the toolchain.
+#[cfg(test)]
+mod binding_window_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_only_out_of_window_or_malformed_address_bindings() {
+        let mapped = 1u64 << 18; // 256 KiB window
+        let ok = |base, size| {
+            binding_in_window(&DurableBinding::Instantiator { base, size }, mapped)
+                && binding_in_window(&DurableBinding::AddressSpace { base, size }, mapped)
+        };
+        // Legitimate sub-ranges: the whole window, an aligned interior carve, the top slot.
+        assert!(ok(0, mapped));
+        assert!(ok(1 << 12, 1 << 12));
+        assert!(ok(mapped - (1 << 12), 1 << 12));
+        // Out of window, off the top, and base+size overflow (top size-aligned base).
+        assert!(!ok(mapped, 1 << 12));
+        assert!(!ok(mapped - (1 << 12), 1 << 13));
+        assert!(!ok(!((1u64 << 12) - 1), 1 << 12));
+        // Malformed: zero size, non-power-of-two size, base not a multiple of size.
+        assert!(!ok(0, 0));
+        assert!(!ok(0, 3 << 12));
+        assert!(!ok(1 << 11, 1 << 12));
+        // Address-payload-free bindings always pass (nothing to confine) — including the
+        // whole-window AddressSpace form (§4: the retired Memory kind), but only at base 0:
+        // a u64::MAX size anywhere else is malformed, not whole-window.
+        assert!(binding_in_window(&DurableBinding::Exit, mapped));
+        assert!(binding_in_window(
+            &DurableBinding::AddressSpace {
+                base: 0,
+                size: u64::MAX
+            },
+            mapped
+        ));
+        assert!(!binding_in_window(
+            &DurableBinding::AddressSpace {
+                base: 1 << 12,
+                size: u64::MAX
+            },
+            mapped
+        ));
+        assert!(!binding_in_window(
+            &DurableBinding::Instantiator {
+                base: 0,
+                size: u64::MAX
+            },
+            mapped
+        ));
+    }
+}

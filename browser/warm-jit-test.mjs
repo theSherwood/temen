@@ -1,11 +1,11 @@
 // V8 (Node) end-to-end check of the **warm+JIT** eval tier (WASM_AOT.md warm+JIT), driving the shipping
-// engine FFI the playground uses (`svm_warm_open` + `svm_warm_jit_*`) plus the browser driver
+// engine FFI the playground uses (`temen_warm_open` + `temen_warm_jit_*`) plus the browser driver
 // (`runWarmJit` from wasmjit-module.js). The interpreter warm path (`warm-snapshot-test.mjs`) already
 // proves eval_run-over-the-snapshot ≡ cold `_start`; this proves the **emitted-wasm** eval_run agrees
 // with the interpreter warm eval byte-for-byte, keeps fresh-per-Run isolation, and — the point of the
 // tier — accelerates a compute-heavy eval while init stays paid-once.
 //
-//   node warm-jit-test.mjs [svm_browser.wasm] [qjs_snapshot.svmb]
+//   node warm-jit-test.mjs [temen_browser.wasm] [qjs_snapshot.temen]
 //
 // Exits 0 on success (all parity + isolation checks pass), 1 on any mismatch.
 import { readFileSync, existsSync } from 'node:fs';
@@ -13,8 +13,8 @@ import { performance } from 'node:perf_hooks';
 import { engineImports } from './engine-imports.mjs';
 import { runWarmJit, primeWarmJit, jitCacheStats } from './web/wasmjit-module.js';
 
-const wasmPath = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/svm_browser.wasm';
-const modPath = process.argv[3] ?? 'web/assets/qjs_snapshot.svmb';
+const wasmPath = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/temen_browser.wasm';
+const modPath = process.argv[3] ?? 'web/assets/qjs_snapshot.temen';
 
 if (!existsSync(modPath)) {
   console.log(`SKIP: ${modPath} not built (QuickJS on-ramp asset absent)`);
@@ -25,16 +25,16 @@ const mod = await WebAssembly.compile(readFileSync(wasmPath));
 const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
 const ex = (await WebAssembly.instantiate(mod, engineImports(memory))).exports;
 const membuf = () => (ex.memory ?? memory).buffer;
-const is64 = ex.svm_abi_is64() === 1;
+const is64 = ex.temen_abi_is64() === 1;
 const N = (x) => (is64 ? BigInt(x) : Number(x));
 const put = (bytes) => {
-  const p = ex.svm_alloc(N(bytes.length));
+  const p = ex.temen_alloc(N(bytes.length));
   new Uint8Array(membuf()).set(bytes, Number(p));
-  return { p, len: N(bytes.length), free: () => ex.svm_dealloc(p, N(bytes.length)) };
+  return { p, len: N(bytes.length), free: () => ex.temen_dealloc(p, N(bytes.length)) };
 };
 const readStdout = () => {
-  const p = Number(ex.svm_stdout_ptr());
-  const l = Number(ex.svm_stdout_len());
+  const p = Number(ex.temen_stdout_ptr());
+  const l = Number(ex.temen_stdout_len());
   return p && l ? Buffer.from(new Uint8Array(membuf(), p, l)).toString() : '';
 };
 const fail = (m) => { console.error(`FAIL: ${m}`); process.exit(1); };
@@ -46,10 +46,10 @@ const enc = (s) => Buffer.from(s);
 function warmInterp(js) {
   const s = put(enc(js));
   const t = performance.now();
-  Number(ex.svm_warm_eval(s.p, s.len));
+  Number(ex.temen_warm_eval(s.p, s.len));
   const ms = performance.now() - t;
   const out = readStdout();
-  const status = ex.svm_status();
+  const status = ex.temen_status();
   s.free();
   return { out, ms, status };
 }
@@ -64,9 +64,9 @@ async function warmJit(js) {
 // Open the warm session once (runs `warmup`, snapshots the post-init image).
 {
   const m = put(modBytes);
-  const live = Number(ex.svm_warm_open(m.p, m.len));
+  const live = Number(ex.temen_warm_open(m.p, m.len));
   m.free();
-  if (live < 0 || ex.svm_status() !== 0) fail(`svm_warm_open: status ${ex.svm_status()}`);
+  if (live < 0 || ex.temen_status() !== 0) fail(`temen_warm_open: status ${ex.temen_status()}`);
   console.error(`warm session opened: live image ${(live / (1 << 20)).toFixed(1)} MiB`);
 }
 
@@ -156,7 +156,7 @@ for (const [name, js] of programs) {
   );
 }
 
-ex.svm_warm_close();
+ex.temen_warm_close();
 
 if (!allOk) fail('warm+JIT parity/isolation/instance-cache mismatch');
 console.log('\nOK: warm+JIT — emitted eval_run matches warm-interp byte-for-byte, isolation + instance cache hold');

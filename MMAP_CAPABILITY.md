@@ -29,7 +29,7 @@ what capability shape?**
 
 ## 2. Where we are: the emulation, and why it's coherent-but-limited
 
-Slice BL added three ops to the `HostFn` **fs** capability (`crates/svm-run/src/fs.rs`):
+Slice BL added three ops to the `HostFn` **fs** capability (`crates/temen-run/src/fs.rs`):
 
 - `FS_MMAP(fd, file_offset, len, win_buf)` — `pread` the file region **into a guest-owned buffer**,
   record `win_buf → (fd, file_offset, len)`.
@@ -55,12 +55,12 @@ Its limits, precisely:
 
 ## 3. The machinery already in the tree
 
-We are not starting from zero. The interface registry (`svm-interp` `iface`) already has **real**
+We are not starting from zero. The interface registry (`temen-interp` `iface`) already has **real**
 window-aliasing capabilities, and DESIGN.md §13/§14 is the frame:
 
 - **`SharedRegion` (iface 4)** — a host memory object (`memfd`/Windows section) aliased into the
   window with a **real shared mapping** (`mmap(MAP_SHARED|MAP_FIXED)` of the region's `os_fd` over
-  `[win_off, win_off+len)`, `svm-run` `map_region`). The *same* backing can map at multiple window
+  `[win_off, win_off+len)`, `temen-run` `map_region`). The *same* backing can map at multiple window
   offsets → hardware-coherent aliasing (the magic-ring-buffer primitive). This is ~90% of the host
   mechanism a zero-copy **file** mapping needs — it just aliases a *memfd*, not a real file fd.
 - **`AddressSpace` (iface 5)** / **`Memory` (iface 3)** — `map`/`unmap`/`protect`/`page_size` within
@@ -68,7 +68,7 @@ window-aliasing capabilities, and DESIGN.md §13/§14 is the frame:
 - **`HostFn` (iface 13)** — the embedder-registered escape hatch the fs cap (and the BL emulation)
   rides. Semantics live in the embedder's closure, *outside* the VM's escape-TCB match.
 
-The key architectural fact — and the whole bridge (§4b) — is that `map_region` (`svm-run`) already
+The key architectural fact — and the whole bridge (§4b) — is that `map_region` (`temen-run`) already
 aliases **any `os_fd`** into the window via `mmap(MAP_SHARED | MAP_FIXED, fd, …)`; today that `os_fd`
 is a memfd, but **a real file's fd is an equally valid `os_fd` for `MAP_SHARED`.** So
 `mmap(win_off, len, MAP_SHARED|MAP_FIXED, file_fd, file_off)` *is* zero-copy, OS-coherent,
@@ -165,7 +165,7 @@ emulation is not throwaway: the bridge (§4b) must honor the *same* contract.
 ### 4d. Crash injection & recovery proof (**shipped in slice 1**)
 
 Implemented as a **test-only** crash hook: the `*_crashy` fs backends (`mem_fs_crashy`/`host_fs_crashy`,
-`crates/svm-run/src/fs.rs`) add op `FS_CRASH_ARM(n)` — arm a simulated power loss after `n` further
+`crates/temen-run/src/fs.rs`) add op `FS_CRASH_ARM(n)` — arm a simulated power loss after `n` further
 durability barriers. When it trips, every persisting op (`msync`/`sync`/`munmap` flush/`write`/
 `truncate`) silently drops its effect (the file freezes at the last completed barrier) while reads keep
 working (a dead process's file is still readable on reopen). The default `mem_fs`/`host_fs` grants have
@@ -173,7 +173,7 @@ working (a dead process's file is still readable on reopen). The default `mem_fs
 on a shipping grant. (Resolves open questions §6.1 *expose torn writes* and §6.2 *crashy constructor
 variant*.)
 
-The proof is `demo_lmdb_crash_recovery` (`crates/svm-llvm/tests/translate.rs`): the guest commits
+The proof is `demo_lmdb_crash_recovery` (`crates/temen-llvm/tests/translate.rs`): the guest commits
 snapshot **v1** durably, arms the crash, commits snapshot **v2** (same keys, different values) whose
 durability the crash may swallow, then reopens and prints the surviving scan. Sweeping the crash point
 across *every* barrier of v2's commit, the recovered state must byte-match either the committed v1 or
@@ -211,10 +211,10 @@ Proposed order:
    point across a transaction's commit and proves LMDB recovers to the last committed snapshot at
    every barrier — never a torn mix. Self-contained, no FFI.
 2. **Zero-copy real aliasing via the bridge (§4b).** ✅ **Shipped.** Concretely:
-   - `FileBacking` (`svm-run`) — a `SharedRegion` backing whose `os_fd` is a real host file; the
+   - `FileBacking` (`temen-run`) — a `SharedRegion` backing whose `os_fd` is a real host file; the
      interpreter/JIT aliasing paths are backing-agnostic, so it aliases the file into a window with
      **no new escape-TCB code** (`map_region` reused unchanged). `new_file_region(file, len)`.
-   - `RegionMinter` + `HostFnRegion` (`svm-interp`) — the delivery mechanism: the narrow authority
+   - `RegionMinter` + `HostFnRegion` (`temen-interp`) — the delivery mechanism: the narrow authority
      (mint a `SharedRegion`, nothing else of the `Host`) handed to an opt-in mmap-capable fs handler,
      so the closure can return a region handle. Resolves the "how does the fs `HostFn` deliver the
      handle" question below.

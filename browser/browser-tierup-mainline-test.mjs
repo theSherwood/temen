@@ -1,7 +1,7 @@
 // Mainline wasm-JIT tier-up over a LIVE window (WASM_AOT.md slice 2 + the slice-0 JACL residual). The
 // existing `tierup` index case covers the `thread.spawn` shape (fresh activation, argv marshalled); this
-// covers the shape the JACL consumer's SVM_BROWSER_TIERUP_FINDINGS.md flagged and that slice 2 turns on
-// for SVM-text compute cards: a **mainline** root frame that loops calling a hot leaf which reads a DATA
+// covers the shape the JACL consumer's TEMEN_BROWSER_TIERUP_FINDINGS.md flagged and that slice 2 turns on
+// for TEMEN-text compute cards: a **mainline** root frame that loops calling a hot leaf which reads a DATA
 // SEGMENT out of the live, mid-computation window. Run the SAME guest plain (all-interp) and with tier-up
 // across real Workers; both must return the same value AND tier-up must actually fire (tierups > 0) — a
 // value match with tierups==0 would be a vacuous pass (nothing tiered up). A stale/mis-based window or
@@ -77,13 +77,13 @@ const res = await page.evaluate(async ({ src }) => {
   const run = par.makeRunner(eng);
   const u8 = () => new Uint8Array(eng.memory.buffer);
 
-  // Parse SVM text → module bytes in-sandbox, exactly like the playground's SVM-text card.
+  // Parse Temen text → module bytes in-sandbox, exactly like the playground's TEMEN-text card.
   const srcBytes = new TextEncoder().encode(src);
-  const p = eng.ex.svm_alloc(srcBytes.length);
+  const p = eng.ex.temen_alloc(srcBytes.length);
   u8().set(srcBytes, p);
-  const ok = eng.ex.svm_parse(p, srcBytes.length);
-  const out = u8().slice(eng.ex.svm_parse_ptr(), eng.ex.svm_parse_ptr() + eng.ex.svm_parse_len());
-  eng.ex.svm_dealloc(p, srcBytes.length);
+  const ok = eng.ex.temen_parse(p, srcBytes.length);
+  const out = u8().slice(eng.ex.temen_parse_ptr(), eng.ex.temen_parse_ptr() + eng.ex.temen_parse_len());
+  eng.ex.temen_dealloc(p, srcBytes.length);
   if (ok !== 1) return { parseError: new TextDecoder().decode(out) };
   const guest = out;
 

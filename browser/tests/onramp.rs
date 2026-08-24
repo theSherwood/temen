@@ -1,10 +1,10 @@
-//! The **on-ramp powerbox** entry (`onramp_exec` / the wasm `svm_run_onramp` export): a `.svmb`
-//! straight off `svm-llvm-translate` runs under the fixed §3e `VM_CAP_*` grant prefix the LLVM
+//! The **on-ramp powerbox** entry (`onramp_exec` / the wasm `temen_run_onramp` export): a `.temen`
+//! straight off `temen-llvm-translate` runs under the fixed §3e `VM_CAP_*` grant prefix the LLVM
 //! on-ramp's synthesized `_start` expects — the seam that lets the browser run real C/C++ guests
-//! (Lua, SQLite) the same way `svm-run` does natively.
+//! (Lua, SQLite) the same way `temen-run` does natively.
 //!
-//! The fixture `fixtures/hello_onramp.svmb` is `crates/svm-run/demos/hello.c` compiled with stock
-//! `clang -O2 -emit-llvm` and translated (`svm-llvm-translate hello.bc -o hello_onramp.svmb
+//! The fixture `fixtures/hello_onramp.temen` is `crates/temen-run/demos/hello.c` compiled with stock
+//! `clang -O2 -emit-llvm` and translated (`temen-llvm-translate hello.bc -o hello_onramp.temen
 //! --host-page 65536 --null-guard` — the #964 guarded layout, so this fixture also pins the
 //! marked powerbox path in the browser). The
 //! current on-ramp emits the **by-name** paramless `_start` (S15), whose manifest imports
@@ -13,7 +13,7 @@
 //! manifest entry shape fails closed). Larger guests (malloc → the memory cap, Lua, SQLite Phase A)
 //! are verified out-of-tree via `cargo run --example run_onramp`.
 
-use svm_browser::{onramp_exec, STATUS_OK, STATUS_UNSUPPORTED};
+use temen_browser::{onramp_exec, STATUS_OK, STATUS_UNSUPPORTED};
 
 /// A pre-manifest **legacy positional** entry shape: func 0 takes its `write` handle as a
 /// parameter (slot-order delivery) and is not exported as `_start`. Phase 4 deleted the
@@ -32,7 +32,7 @@ block 0 (v0: i32) {
 
 #[test]
 fn legacy_positional_import_blob_is_rejected() {
-    let m = svm_text::parse_module(LEGACY_POSITIONAL).expect("parse legacy module");
+    let m = temen_text::parse_module(LEGACY_POSITIONAL).expect("parse legacy module");
     assert!(
         !m.imports.is_empty(),
         "the fixture must actually carry an import manifest"
@@ -46,8 +46,8 @@ fn legacy_positional_import_blob_is_rejected() {
 
 #[test]
 fn hello_onramp_prints_through_the_powerbox() {
-    let bytes = include_bytes!("fixtures/hello_onramp.svmb");
-    let m = svm_encode::decode_module(bytes).expect("decode hello_onramp.svmb");
+    let bytes = include_bytes!("fixtures/hello_onramp.temen");
+    let m = temen_encode::decode_module(bytes).expect("decode hello_onramp.temen");
     let out = onramp_exec(&m, b"");
     assert_eq!(out.status, STATUS_OK, "on-ramp guest should run cleanly");
     assert_eq!(

@@ -1,14 +1,14 @@
 //! **Warm-runtime snapshot of a `vm_map`-growing guest** (#816) — end-to-end through the real
-//! `svm_warm_open`/`svm_warm_eval` FFI: a guest whose `warmup` grows the window past its declared
+//! `temen_warm_open`/`temen_warm_eval` FFI: a guest whose `warmup` grows the window past its declared
 //! size must restore per eval to the same mapped geometry (the committed-extent round-trip), with
 //! fresh-per-Run isolation intact. Before #816 this shape required the `WARM_MAPPED_LOG2` over-size
 //! workaround (declared ≥ heap) — this guest deliberately declares a 64-KiB window and heaps past it.
 //!
 //! The negative half of the contract (an unseeded fresh `Mem` faults on the grown page) is pinned
-//! at the engine seam in `svm-interp/tests/run_over_grown.rs`.
+//! at the engine seam in `temen-interp/tests/run_over_grown.rs`.
 
-use svm_browser::{svm_status, svm_warm_close, svm_warm_eval, svm_warm_open};
-use svm_interp::{Host, StreamRole};
+use temen_browser::{temen_status, temen_warm_close, temen_warm_eval, temen_warm_open};
+use temen_interp::{Host, StreamRole};
 
 /// Marker the warmup plants in the grown page; scratch cell the evals write (must NOT persist).
 const MARKER: i64 = 424242;
@@ -33,7 +33,7 @@ fn memory_handle() -> i32 {
 /// `marker + scratch`.
 fn guest_text() -> String {
     let h = memory_handle();
-    let brk = svm_ir::POWERBOX_HEAP_BRK;
+    let brk = temen_ir::POWERBOX_HEAP_BRK;
     format!(
         r#"memory 16
 func (i64) -> (i64) {{
@@ -72,17 +72,17 @@ export 1 func "eval_run" 1
 
 #[test]
 fn warm_session_restores_a_grown_heap_across_evals() {
-    let mut m = svm_text::parse_module(&guest_text()).expect("parse");
-    // Belt-and-braces: the text `export` lines must have resolved (svm_warm_open requires both).
+    let mut m = temen_text::parse_module(&guest_text()).expect("parse");
+    // Belt-and-braces: the text `export` lines must have resolved (temen_warm_open requires both).
     assert!(m.resolve_export("warmup").is_some() && m.resolve_export("eval_run").is_some());
-    svm_verify::verify_module(&m).expect("verify");
-    let bytes = svm_encode::encode_module(&m);
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
 
-    let live = svm_warm_open(bytes.as_ptr(), bytes.len());
+    let live = temen_warm_open(bytes.as_ptr(), bytes.len());
     assert!(
         live > 0,
         "warm open must succeed for a growing guest (status {})",
-        svm_status()
+        temen_status()
     );
     // The image must cover the grown marker (brk was advanced past it by warmup).
     assert!(
@@ -91,8 +91,8 @@ fn warm_session_restores_a_grown_heap_across_evals() {
     );
 
     // Eval 1: marker restored from the grown page, scratch fresh (0) → MARKER + 0.
-    let v1 = svm_warm_eval(core::ptr::null(), 0);
-    assert_eq!(svm_status(), 0, "eval 1 status");
+    let v1 = temen_warm_eval(core::ptr::null(), 0);
+    assert_eq!(temen_status(), 0, "eval 1 status");
     assert_eq!(
         v1, MARKER,
         "eval 1 must read the vm_map-grown marker over a restored extent"
@@ -100,14 +100,14 @@ fn warm_session_restores_a_grown_heap_across_evals() {
 
     // Eval 2: identical — the restore re-establishes the SAME committed extent and the scratch the
     // prior eval wrote is wiped (fresh-per-Run isolation, INVARIANT #6).
-    let v2 = svm_warm_eval(core::ptr::null(), 0);
-    assert_eq!(svm_status(), 0, "eval 2 status");
+    let v2 = temen_warm_eval(core::ptr::null(), 0);
+    assert_eq!(temen_status(), 0, "eval 2 status");
     assert_eq!(
         v2, MARKER,
         "eval 2 must see byte-identical warm state (no scratch leak)"
     );
 
-    svm_warm_close();
+    temen_warm_close();
     // Ensure the module the test built stays alive to here (the FFI copied what it needed).
     m.exports.clear();
 }

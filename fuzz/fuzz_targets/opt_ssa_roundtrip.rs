@@ -10,10 +10,10 @@
 
 use libfuzzer_sys::fuzz_target;
 
-#[path = "../../crates/svm/tests/support/irgen.rs"]
+#[path = "../../crates/temen/tests/support/irgen.rs"]
 mod irgen;
 
-use svm_opt::ssa::{from_ssa, to_ssa};
+use temen_opt::ssa::{from_ssa, to_ssa};
 
 fuzz_target!(|data: &[u8]| {
     let mut g = irgen::Gen::from_bytes(data);

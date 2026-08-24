@@ -9,14 +9,14 @@ once the slices land (repo convention).
 
 **Do not build a fifth backend.** Both halves of "wasm-AOT" already exist:
 
-- **"AOT" is the offline lane we already ship.** `svm-llvm`/`svm-opt`/`svm-peval` are ahead-of-time,
+- **"AOT" is the offline lane we already ship.** `temen-llvm`/`temen-opt`/`temen-peval` are ahead-of-time,
   host-side, and produce verified IR; every playground demo module (Lua, SQLite, DOOM, QuickJS,
-  Postgres) is *already* AOT-compiled that way into `.svmb` (`LLVM.md`, `OPT.md`, DESIGN §20).
-- **"Emit wasm" is backend 4.** `svm-wasm-jit` turns verified IR into a real `WebAssembly.Module`
+  Postgres) is *already* AOT-compiled that way into `.temen` (`LLVM.md`, `OPT.md`, DESIGN §20).
+- **"Emit wasm" is backend 4.** `temen-wasm-jit` turns verified IR into a real `WebAssembly.Module`
   and, where it engages, already lands **at or below native Cranelift** on compute (`xorshift`
   2.0 ns emitted vs 1.9 ns native; 16–112× over the interpreter-in-wasm —
-  `bench/cross-engine/README.md` § "SVM-in-wasm, the JIT tier"). Emitting *earlier* ("AOT-at-
-  `svm_par_compile`", BROWSER.md) is a compile-point choice, not a new backend.
+  `bench/cross-engine/README.md` § "TEMEN-in-wasm, the JIT tier"). Emitting *earlier* ("AOT-at-
+  `temen_par_compile`", BROWSER.md) is a compile-point choice, not a new backend.
 
 What a new backend *cannot* fix is the leaf-accelerator wall: a wasm frame can't unwind for a stack
 switch, so fibers, `thread.spawn`/`join`, `memory.wait`, page ops, and every `cap.call` must bounce
@@ -35,7 +35,7 @@ Three separate causes, none of which a new backend addresses:
 2. **No compiled-output reuse.** Every Run re-emits and re-instantiates; JIT break-even is
    ~10⁵–10⁶ iterations, so *light scripts run net slower under the JIT* (`play.js`; the
    cross-engine README calls a compiled-module cache "the dominant inefficiency the steady-state
-   table omits"). Only `.svmb` *bytes* are cached today, not emitted wasm or instances.
+   table omits"). Only `.temen` *bytes* are cached today, not emitted wasm or instances.
 3. **Per-access confinement in giant functions.** For Lua/SQLite the JIT engages but yields only
    ~3×/~1.3×: the cost is `emit_confine`'s ~7-op bounds-check-and-mask on **every** guest access,
    on top of wasm's own linear-memory bounds check (the double indirection the bench measures as
@@ -56,7 +56,7 @@ Three separate causes, none of which a new backend addresses:
 The one genuine win hiding in "output pure wasm" is cause 3: emit a module whose linear memory *is*
 the guest window, and the engine's own bounds check subsumes ours — deleting the ~7-op inline
 sequence per access. That is a real ~2× on memory-bound guests, and post-D63 the semantic gap is
-small (both SVM and wasm now **trap** OOB; what differs is the boundary — SVM's power-of-two
+small (both Temen and wasm now **trap** OOB; what differs is the boundary — Temen's power-of-two
 `mapped` vs wasm's page-granular size — see the updated WASM.md divergence note).
 
 But it moves confinement out of the one fuzzed masking pass and into "trust the engine," which is
@@ -69,17 +69,17 @@ scheduled here.
 
 ## 4. The JACL consumer finding (adopted as slice 0)
 
-`jacl_impl/docs/SVM_BROWSER_TIERUP_FINDINGS.md` is a named consumer hitting the exact path slice 2
-depends on: per-function tier-up (`compile_module_tierup` + `VcpuEvent::TierUp` via `svm_par_run`)
+`jacl_impl/docs/TEMEN_BROWSER_TIERUP_FINDINGS.md` is a named consumer hitting the exact path slice 2
+depends on: per-function tier-up (`compile_module_tierup` + `VcpuEvent::TierUp` via `temen_par_run`)
 of a **mainline** `InterpDriven` guest trapped `MemoryFault → unreachable` inside the emitted body,
 before any `env.call_interp`. Their ranked hypotheses — all consistent with our code:
 
 1. **Window/data-materialization mismatch.** The tier-up lane was built for `thread.spawn` bodies
    (fresh activation, argv marshalled). Mainline tier-up requires the emitted function to run over
    the *live, mid-computation* window with `m.data` already materialized and the same `win` base.
-   The whole-module paths have explicit materialization (`svm_wasmjit_init_window`,
-   `browser/src/lib.rs`); the `svm_par_run`/`PAR_TIERUP` lane's window provenance needs a diff
-   against `svm_run_onramp`'s init.
+   The whole-module paths have explicit materialization (`temen_wasmjit_init_window`,
+   `browser/src/lib.rs`); the `temen_par_run`/`PAR_TIERUP` lane's window provenance needs a diff
+   against `temen_run_onramp`'s init.
 2. **Baked `size_log2` mismatch** — `mapped` is frozen at emit time; a window instantiated or grown
    past it faults legitimate accesses.
 3. **Subset-classification hole** (least likely — the trap preceded any cross-tier call).
@@ -93,10 +93,10 @@ Ordered by leverage ÷ risk; each lands with tests per AGENTS.md.
 
 ### Slice 0 — mainline tier-up over a live window (DIAGNOSED; gate fix landed)
 
-**Diagnosis (empirical, native).** A new native harness (`svm-wasm-jit/tests/tierup_live_window.rs`)
+**Diagnosis (empirical, native).** A new native harness (`temen-wasm-jit/tests/tierup_live_window.rs`)
 drives the real loop — `bytecode::VcpuReactor` opens over a caller-owned window, runs `_start`
 (materializing `m.data`), and tiers up a mainline `Call` onto emitted wasm mirrored over that live
-window. It is the native twin of the browser `svm_par_run`/`PAR_TIERUP` lane, which had **no native
+window. It is the native twin of the browser `temen_par_run`/`PAR_TIERUP` lane, which had **no native
 coverage** (every prior `tierup.rs` test ran each `f{func}` in isolation over a hand-seeded window).
 
 Against the JACL doc's ranked hypotheses:
@@ -122,8 +122,8 @@ false]`), a control that still emits without the page op, and a cross-entry agre
 
 **Scope honesty.** This closes the confirmed native-reproducible defect. One JACL hypothesis-1
 residue can only be checked with the browser Worker harness (node + the wasm cdylib), out of reach
-here: whether the `svm_par_run`/`PAR_TIERUP` lane's `win`/`size_log2` provenance matches
-`svm_run_onramp` for a guest that *grows* its window mid-run. The native evidence says the shared-
+here: whether the `temen_par_run`/`PAR_TIERUP` lane's `win`/`size_log2` provenance matches
+`temen_run_onramp` for a guest that *grows* its window mid-run. The native evidence says the shared-
 `win` contract is sound when sizes match; the remaining risk is purely the grow/remap case, which
 the landed gate now routes to the interpreter anyway (a page-managing guest emits nothing). If a
 future consumer needs a *page-managing* guest accelerated, that is the gated-(b)-with-elision
@@ -131,11 +131,11 @@ escalation NESTED_JIT Track 3 documents — not in scope here.
 
 ### Slice 1 — compiled-output cache (the biggest playground feel-fix)
 
-Two halves sharing **one content key** (the module's encoded-image digest — `svm_encode::digest256`
+Two halves sharing **one content key** (the module's encoded-image digest — `temen_encode::digest256`
 over `encode_module`, the same identity the durable module-grant registry already uses). Cache
 **code**, never window/guest state.
 
-- **Native — LANDED (`svm-run` embedder seam).** `svm_run::CompiledCache`: a content-keyed map of
+- **Native — LANDED (`temen-run` embedder seam).** `temen_run::CompiledCache`: a content-keyed map of
   `PowerboxProgram`s (the existing build-once/run-many split, now dedup'd by module identity rather
   than object identity). `run(&module, stdin)` compiles a module on first sighting and reuses the
   native code on every later identical module — byte-identical to `run_powerbox` either way. Fills
@@ -159,8 +159,8 @@ over `encode_module`, the same identity the durable module-grant registry alread
     JIT" footgun is fixed), **qjs_repl ~4.4 s → ~2.5 s (~1.8×)** — the reused Module keeps V8's
     tiered-up code warm across Runs, saving far more than the ~30–50 ms `WebAssembly.compile` alone.
 - **Browser — step 2 (deferred, gated on need).** Have the cdylib itself skip *re-emit* across Runs
-  (replace the per-Run `PAR_RUN_GEN` emit-dedup key with the `svm_encode::digest256` content key —
-  the same one `svm_run::CompiledCache` uses). Higher-risk (it edits the I22 shared-stash lifetime).
+  (replace the per-Run `PAR_RUN_GEN` emit-dedup key with the `temen_encode::digest256` content key —
+  the same one `temen_run::CompiledCache` uses). Higher-risk (it edits the I22 shared-stash lifetime).
   Step 1's warm numbers already clear the footgun gate, so this waits for a measured re-emit cost that
   step 1 doesn't cover.
 - **Gate:** (native, met) `compiled_cache.rs` green + `run_powerbox` parity; (browser, met) second
@@ -173,7 +173,7 @@ Slice 1 caches *code*; it does nothing about **cause 4** — the program-indepen
 re-runs every Run. This prototype attacks that directly: run the guest's init **once**, snapshot the
 post-init guest memory, and **restore the snapshot per Run**, evaluating only the user's code on top.
 
-- **Shape.** Split the on-ramp driver into three exports (`crates/svm-run/demos/quickjs/qjs_snapshot.c`):
+- **Shape.** Split the on-ramp driver into three exports (`crates/temen-run/demos/quickjs/qjs_snapshot.c`):
   `main` (the original cold read→init→eval→print, the baseline), `warmup` (init runtime+context+bindings
   into statics, then return — no stdin, no eval, so the produced memory is program-independent), and
   `eval_run` (read stdin, eval over the warm context, print). The host snapshots after `warmup` and
@@ -199,7 +199,7 @@ post-init guest memory, and **restore the snapshot per Run**, evaluating only th
   leaves page state one bound can't represent (sparse/`Ro`/`Unmapped`) fails closed at open. The
   warm+JIT tier is unchanged: it opens only for `WasmDriven` (no-page-op) modules, so a growing guest
   evaluates on the interpreter warm path until the tier-up driver work (#809) reaches it.
-- **Measured native** (`crates/svm-llvm/examples/qjs_snapshot.rs`, release, bytecode interpreter, the
+- **Measured native** (`crates/temen-llvm/examples/qjs_snapshot.rs`, release, bytecode interpreter, the
   same QuickJS on-ramp module as the playground): warmup once ~23 ms; **live warm image ~4.1 MiB**;
   restore ~3.5 ms (memcpy the live prefix).
 
@@ -213,17 +213,17 @@ post-init guest memory, and **restore the snapshot per Run**, evaluating only th
   `0.1+0.2`, the loop sum `4999950000`). The fixed ~24 ms init is replaced by a ~3.5 ms restore — the
   win is largest for light scripts (where init dominated) and shrinks as the eval itself grows, exactly
   as cause 4 predicts.
-- **Browser plumbing — PROTOTYPED (`svm_warm_open`/`svm_warm_eval`/`svm_warm_close`).** A stateful
+- **Browser plumbing — PROTOTYPED (`temen_warm_open`/`temen_warm_eval`/`temen_warm_close`).** A stateful
   browser session (`browser/src/lib.rs`, the twin of the native prototype and of the `PgSession`
-  reactor): `svm_warm_open` decodes the two-phase driver, enlarges the mapped window to `WARM_MAPPED_LOG2`
+  reactor): `temen_warm_open` decodes the two-phase driver, enlarges the mapped window to `WARM_MAPPED_LOG2`
   (2^26 — the same keep-the-heap-inside trick), runs `warmup` **once** over an owned window, and keeps
-  the live prefix `[0, brk)` as the warm image; `svm_warm_eval` restores that image (zeroing only the
+  the live prefix `[0, brk)` as the warm image; `temen_warm_eval` restores that image (zeroing only the
   heap tail a prior eval grew, for byte-identical fresh state) and runs `eval_run`, staging stdout into
-  the same capture slots `svm_run_onramp` uses; `svm_warm_close` frees it. Reuses `grant_onramp_caps` and
+  the same capture slots `temen_run_onramp` uses; `temen_warm_close` frees it. Reuses `grant_onramp_caps` and
   `SharedProgram::run_over(seed_data=false)`. Keeping the whole ~4 MiB image (vs the reactor `Session`'s
   256 KiB `REACTOR_SNAP_CAP`) is what closes the gap for QuickJS.
 - **Measured in Node/V8** (`browser/warm-snapshot-test.mjs`, the shipping engine FFI, the committed
-  `web/assets/qjs_snapshot.svmb`): warmup once ~430 ms — i.e. the QuickJS runtime rebuild **is** the
+  `web/assets/qjs_snapshot.temen`): warmup once ~430 ms — i.e. the QuickJS runtime rebuild **is** the
   ~380–430 ms warm floor — then:
 
   | program | cold ms | warm ms (restore+eval) | speedup |
@@ -232,7 +232,7 @@ post-init guest memory, and **restore the snapshot per Run**, evaluating only th
   | fib/sort/JSON (user's) | ~400 | ~70 | ~6× |
   | 100k-iter loop | ~4600 | ~2900 | ~1.6× |
 
-  Byte-identical cold≡warm output on all three (`svm_run_onramp` `_start`/cold vs `svm_warm_eval`/warm).
+  Byte-identical cold≡warm output on all three (`temen_run_onramp` `_start`/cold vs `temen_warm_eval`/warm).
   The "do-nothing program takes >1 s" case collapses to ~2 ms — the whole fixed init is gone. The win is
   far larger than native because the browser runs QuickJS init through the interpreter-in-wasm; it also
   composes with the slice-1 code cache (cache keeps V8's code warm, snapshot skips `JS_NewRuntime`).
@@ -250,20 +250,20 @@ post-init guest memory, and **restore the snapshot per Run**, evaluating only th
   button for the interp≡JIT parity run. Fail-closed is unchanged: a non-eligible or trapping module
   throws and the card falls back to the interpreter. `compile_tier_eligibility`/`analyze` stay the
   single routing predicate (INVARIANTS #9). Nothing to change here.
-- **SVM-text compute recipe — now tiers up (the gap the plan named).** The SVM-text editor's
+- **TEMEN-text compute recipe — now tiers up (the gap the plan named).** The TEMEN-text editor's
   `plain` ("none / compute only") recipe ran pure-interpreter across Workers with no JIT path.
   `runText` now passes `tierup: true` for it, so the interpreter drives and hot in-subset functions
   run on emitted wasm over the same live window (fail-closed per-function; the `§22-jit`/`§14-inst`
   recipes keep their own JIT, `io` stays on the interpreter for now). The done-line reports how many
   regions tiered up.
-- **This also closes slice 0's browser residual.** That path is the `svm_par_run`/`PAR_TIERUP`
+- **This also closes slice 0's browser residual.** That path is the `temen_par_run`/`PAR_TIERUP`
   **mainline tier-up over a live window** the JACL postmortem flagged — the one piece slice 0 could
   only pin natively. `browser-tierup-mainline-test.mjs` (new) now validates it in real Chromium: an
-  SVM-text compute guest whose root loops calling a **window-round-tripping** leaf returns the
+  TEMEN-text compute guest whose root loops calling a **window-round-tripping** leaf returns the
   identical value with tier-up on as all-interpreter (INVARIANT 9), with tier-up actually firing
-  (50 000 regions). (Aside surfaced by the test: the SVM-text `run()` path does not materialize
+  (50 000 regions). (Aside surfaced by the test: the TEMEN-text `run()` path does not materialize
   `data` segments into the window — a pre-existing property, not introduced here; both tiers read
-  identically, so it's a differential no-op. A follow-on if a hand-written SVM-text guest ever needs
+  identically, so it's a differential no-op. A follow-on if a hand-written TEMEN-text guest ever needs
   a data segment.)
 - **Gate (met):** `browser-test.mjs` (the full playground, tier-up now on for `plain`) stays green,
   and `browser-tierup-mainline-test.mjs` pins interp≡tier-up + non-vacuity.
@@ -275,8 +275,8 @@ bounds-**trap** branch when the address is *provably* in-window, reusing the nat
 existing D63 "guard-when-bounded" analysis rather than inventing one.
 
 - **Stage 1 (shared proof).** Lifted `UB_TOP`/`ub_at`/`ub_of`/`in_window` out of the native JIT's
-  private copy into `svm_ir::bounds` — one audited definition of the confinement veto predicate for
-  both JITs (INVARIANTS #9), behavior-preserving for `svm-jit` (jit_diff stays green).
+  private copy into `temen_ir::bounds` — one audited definition of the confinement veto predicate for
+  both JITs (INVARIANTS #9), behavior-preserving for `temen-jit` (jit_diff stays green).
 - **Stage 2 (wasm elision).** `emit_block_body` threads a per-block upper-bound map (`ubs`) in
   lockstep with the emitter's own value numbering (reset per block; block params = `UB_TOP`), and at
   each Load/Store/atomic/v128 access `elide_access` consults `in_window`. When proven bounded, the
@@ -287,11 +287,11 @@ existing D63 "guard-when-bounded" analysis rather than inventing one.
   kernels that actually fire the elision (`(v0 & K)*W`, the top-byte boundary, the width-8
   no-elide edge, a mixed elided/non-elided block), a size proof that the branch is really removed
   (`elision_actually_removes_bytes`), and a 3000-iteration `elision_boundary_sweep` asserting
-  trap+value parity with the interpreter oracle around the window edge. `svm_ir::bounds` carries unit
+  trap+value parity with the interpreter oracle around the window edge. `temen_ir::bounds` carries unit
   tests for `in_window` overflow-safety and `ub_of`'s rules.
 - **Scope.** Matches the native proof exactly (const / `& K` / `+`/`|`/`^` / `* W` / `ExtendI32U`) —
   notably it does **not** yet model `PtrAdd` (the C-frontend address op), so C-guest addresses stay
-  conservatively checked, same as on `svm-jit`. Widening the proof (or the "same-base dominating
+  conservatively checked, same as on `temen-jit`. Widening the proof (or the "same-base dominating
   check" redundancy form) is a follow-on if a measured target needs it.
 - **Measured target (next):** Lua 5M-loop / SQLite REPL throughput on the playground path and the
   bench README's `chase`/`chase_rand` rows — to quantify the win on real programs. If it plateaus,

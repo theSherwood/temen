@@ -1,4 +1,4 @@
-// Pure-JS (V8) mirror of kernels.c — i32-LCG arithmetic via Math.imul, same computations as the C/SVM
+// Pure-JS (V8) mirror of kernels.c — i32-LCG arithmetic via Math.imul, same computations as the C/Temen
 // kernels. Per-iteration = (min time at n=201000 − at n=1000) / 200000, min over reps, warmed up.
 const now = () => Number(process.hrtime.bigint());
 const M = 1103515245, K = 12345;

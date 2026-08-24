@@ -1,6 +1,6 @@
 # rustbench — real-program cross-engine perf
 
-Diverse `no_std` Rust workloads (a real program each) run on **svm-jit** vs **Wasmtime-w64** vs
+Diverse `no_std` Rust workloads (a real program each) run on **temen-jit** vs **Wasmtime-w64** vs
 **native**, timed by the large/small-`n` subtraction (min over reps) — the `confine` methodology, but
 on real programs (hash-table churn, a bytecode interpreter, a batch sort, a recursive-descent parser,
 base64 encode, a grid BFS) instead of confinement micro-kernels.
@@ -11,15 +11,15 @@ supplies the heap), so it compiles cleanly to every lane with no shim assembly �
 a real program like Lua impractical here. Each workload is `prelude.rs` (allocator/panic/PRNG)
 prepended to `workloads/<name>.rs` (the `run(n) -> i64` logic).
 
-**The honest comparison is `svm÷wt64`** — both LP64, same widths, same Cranelift backend. The `wt/w32`
+**The honest comparison is `temen÷wt64`** — both LP64, same widths, same Cranelift backend. The `wt/w32`
 column is the *flattered* ILP32 comparison (32-bit addressing + free 4 GiB guards) and is shown for
 context only.
 
 ## Toolchain
 
-The svm-jit lane emits **textual** LLVM IR (`--emit=llvm-ir`) and reads it with svm-llvm's
+The temen-jit lane emits **textual** LLVM IR (`--emit=llvm-ir`) and reads it with temen-llvm's
 version-tolerant `.ll` reader — no `llvm-dis`, **no LLVM-version pin** (I24), so the **system default**
-rustc drives the native/svm/wasm32 lanes (validated on rustc 1.94 / LLVM 21). wasm64 is a tier-3
+rustc drives the native/temen/wasm32 lanes (validated on rustc 1.94 / LLVM 21). wasm64 is a tier-3
 target, so its lane needs nightly `build-std`.
 
 ```
@@ -27,8 +27,8 @@ rustup target add wasm32-unknown-unknown               # wasm32 lane (default to
 rustup toolchain install nightly --component rust-src   # wasm64 via -Z build-std
 ```
 
-Any missing piece just blanks that column; svm-jit + native need only a working `rustc`. Set
-`SVM_RUSTBENCH_RUSTC` to pick a specific toolchain (e.g. `+1.81.0` to reproduce the old LLVM-18 build).
+Any missing piece just blanks that column; temen-jit + native need only a working `rustc`. Set
+`TEMEN_RUSTBENCH_RUSTC` to pick a specific toolchain (e.g. `+1.81.0` to reproduce the old LLVM-18 build).
 
 ## Run (from `bench/`)
 
@@ -36,10 +36,10 @@ Any missing piece just blanks that column; svm-jit + native need only a working 
 cargo run --release --bin rustbench
 ```
 
-Sample (this machine, ×native; `svm÷wt64` lower = svm-jit faster):
+Sample (this machine, ×native; `temen÷wt64` lower = temen-jit faster):
 
 ```
-workload    native(ns)   svm-jit    wt/w64    wt/w32   svm÷wt64
+workload    native(ns)   temen-jit    wt/w64    wt/w32   temen÷wt64
 hashmap            3.6     1.9x      1.8x      1.3x     ~1.05x
 vm                46       2.9x      2.3x      1.3x     ~1.22x
 sort             920       2.0x      2.2x      1.3x     ~0.90x
@@ -47,14 +47,14 @@ parse            148       2.4x      2.0x      1.5x     ~1.23x
 base64            84       3.1x      3.6x      1.6x     ~0.87x
 ```
 
-svm-jit lands within ~±20% of Wasmtime-w64 across the five — competitive/parity, workload-dependent
+temen-jit lands within ~±20% of Wasmtime-w64 across the five — competitive/parity, workload-dependent
 (faster on `sort`/`base64`, a bit behind on the branchy interpreter and parser), consistent with the
 "as fast as wasm" goal on real programs.
 
 ## Correctness (the harness earns its keep)
 
-Every lane's `run(small)` is cross-checked against svm-jit before timing — a MISCOMPILE aborts. Adding
-these workloads immediately surfaced two real **svm-llvm translation bugs** on rustc-emitted bitcode
+Every lane's `run(small)` is cross-checked against temen-jit before timing — a MISCOMPILE aborts. Adding
+these workloads immediately surfaced two real **temen-llvm translation bugs** on rustc-emitted bitcode
 (opaque-pointer / auto-vectorizer patterns clang didn't happen to emit): `workloads/bfs.rs` (grid BFS)
 faulted, then returned garbage, while native/Wasmtime agreed. Root-caused and fixed — a constexpr-GEP
 stride that ignored the source element type, and a 2-lane (`<2 x i32>`) min/max that compared the

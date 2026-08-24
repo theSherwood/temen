@@ -3,10 +3,10 @@
 > **Status: Phases 1–2 landed + Phase 3.1 (single-fiber freeze/thaw) complete on the interpreter
 > + Phase 3.3 (JIT parity) complete single-vCPU and multi-vCPU freeze + thaw + **slice 3.4 (full
 > multi-vCPU scope: nested spawns + child-owned fibers, both backends, snapshot v4)**.** This file is the single source of truth for the *design and
-> implementation status* of durable domains. Built so far: the `svm-durable` IR→IR transform
-> (arbitrary single-vCPU CFGs **+ the §12 fiber control ops**), the `svm-interp` handle-table
+> implementation status* of durable domains. Built so far: the `temen-durable` IR→IR transform
+> (arbitrary single-vCPU CFGs **+ the §12 fiber control ops**), the `temen-interp` handle-table
 > durability primitives (§12.5) **+ the per-fiber shadow-SP swap / freeze driver (D-fiber-cont
-> option A)**, the `svm-snapshot` artifact codec (§12 container + window image + handle table +
+> option A)**, the `temen-snapshot` artifact codec (§12 container + window image + handle table +
 > the R5 identity gate **+ Section-2 fiber residue**), and **per-page protection capture +
 > re-establish on both backends** (Phase 2). A single-fiber domain round-trips
 > `freeze → serialize → restore → thaw` end-to-end. The master design is `DESIGN.md` (D-notes,
@@ -28,28 +28,28 @@ sounds).
 
 Grounding the proposal in what already exists (verified against the tree):
 
-- **IR shape is ideal for the codec.** `svm-ir` is a flat CFG of block-local typed
-  SSA with explicit block params and **no phi nodes** (`crates/svm-ir/src/lib.rs`
+- **IR shape is ideal for the codec.** `temen-ir` is a flat CFG of block-local typed
+  SSA with explicit block params and **no phi nodes** (`crates/temen-ir/src/lib.rs`
   `Block { params, insts, term }`). So resume-point liveness is *free*: a
   continuation block's `params` already are the live set, and the verifier
-  (`svm-verify`) does no liveness/dominance analysis — it is a single linear forward
+  (`temen-verify`) does no liveness/dominance analysis — it is a single linear forward
   type pass.
 - **Dispatch primitive exists.** `Terminator::BrTable` (verifier-constrained: valid
-  well-typed arm or trapping default, checks in `crates/svm-verify/src/lib.rs`) is
+  well-typed arm or trapping default, checks in `crates/temen-verify/src/lib.rs`) is
   exactly the rewind dispatch we need. No new instruction.
 - **Suspension is explicit IR.** `Suspend`, `ContResume`, `ContNew`, and `CapCall`
   are real instructions; `Func::uses_concurrency()` already scans for them.
-- **Memory substrate is close.** `svm-mem` owns the window; page protections
+- **Memory substrate is close.** `temen-mem` owns the window; page protections
   (`PageProt`) and bulk snapshot-read (`read_into`, `SNAP_CAP`) already exist for the
   escape-oracle. **Restore (write pages back + re-establish prots) does not exist yet
   and is new escape-TCB code** — see §6/§9.
 - **Nesting is real.** A child window is a power-of-two sub-range of the parent's via
-  `Window::sub()` (`crates/svm-mask/src/lib.rs`). This is the §4 subtree.
-- **The oracle is production machinery.** `crates/svm/tests/jit_diff.rs` and
+  `Window::sub()` (`crates/temen-mask/src/lib.rs`). This is the §4 subtree.
+- **The oracle is production machinery.** `crates/temen/tests/jit_diff.rs` and
   `fuzz/fuzz_targets/diff.rs` already run every program on interp and JIT and assert
   equivalence. The new snapshot property (§7) plugs straight in.
-- **Tooling-tier precedent.** `svm-text` is a non-TCB crate depending only on
-  `svm-ir`. The transform pass follows the same pattern (+0 TCB).
+- **Tooling-tier precedent.** `temen-text` is a non-TCB crate depending only on
+  `temen-ir`. The transform pass follows the same pattern (+0 TCB).
 
 ---
 
@@ -106,7 +106,7 @@ points) until all native stacks are empty. **Thaw** = restore memory, set
 **Why not host-side frame capture (annotate existing stacks).** Capture is feasible
 (FP-walk + call-site stack maps decode frames into the interp `Frame`). Restore is
 not: native re-entry stubs that rebuild each frame *are* asyncify's rewind, but
-implemented in `svm-jit` with per-arch unsafe, *outside the differential oracle*. The
+implemented in `temen-jit` with per-arch unsafe, *outside the differential oracle*. The
 transform puts the same logic in verified IR, inside the oracle. (Full comparison: §8.
 Note: the rejection rests on "per-arch unsafe outside the oracle," **not** on D56 —
 see §8 for why the earlier D56 framing was wrong.)
@@ -129,7 +129,7 @@ state (function-table indices, the in-window data stack) in its window, and the 
 is **masked, verified dispatch** — not memory integrity.
 
 **Why this is +0 to the security argument.** Per `DESIGN.md` §4/D38, the escape hinge
-is the **confinement-masking lowering** (`svm-mask`), not the verifier. The shadow
+is the **confinement-masking lowering** (`temen-mask`), not the verifier. The shadow
 stack is ordinary guest memory, so its stores/loads go through that same masked path
 as any guest access — the existing hinge already covers it. The verifier still secures
 typing/control-flow/index-ranges of the instrumented IR. A transform bug is a
@@ -155,10 +155,10 @@ is a parser over attacker-controlled frames in the host.
 only freezable modules and may only spawn durable children.* STW quiesces the subtree
 as a unit.
 
-**Status: enforcement landed** (`crates/svm/tests/durable_nesting.rs`) — the first slice of
+**Status: enforcement landed** (`crates/temen/tests/durable_nesting.rs`) — the first slice of
 nested-guest durability. The freezable bit is a **grant-time attestation**:
 `Host::grant_durable_module` marks a `Module` grant as instrumented (the host ran
-`svm_durable::transform_module` — a compile-mode fact the runtime cannot re-derive from the
+`temen_durable::transform_module` — a compile-mode fact the runtime cannot re-derive from the
 IR, so it is attested like verification; plain `grant_module` grants unmarked). A **durable**
 domain's §14 ops then enforce the rule fail-closed (`-EINVAL`, like a bad carve): `instantiate`
 / `spawn_coroutine` (module forms 5/6/7) refuse an **unmarked** grant; a **same-module** child
@@ -167,26 +167,26 @@ stays admissible (it runs the parent's own instrumented funcs); and the admitted
 shadow state and its own nested instantiates re-apply the same admission rule (the subtree
 property, recursively). Guest-driven `Jit.compile` (§22) is a module installation too, and the
 host-side instrumentation hook now **lands (Slice 1)**: a **durable `Jit` grant**
-(`svm_run::grant_jit_durable`) installs a validator that runs `svm_durable::transform_module`
+(`temen_run::grant_jit_durable`) installs a validator that runs `temen_durable::transform_module`
 on each submitted unit before verify — the "host runs the pass on submitted IR" composition —
-so a durable domain **admits** the (instrumented) unit instead of refusing (`svm-interp` still
-runs no pass; the embedder-injected validator does, keeping `svm-durable` out of the TCB). A
+so a durable domain **admits** the (instrumented) unit instead of refusing (`temen-interp` still
+runs no pass; the embedder-injected validator does, keeping `temen-durable` out of the TCB). A
 unit outside the strict transform's scope (a guest-memory suspend point) fails closed. Pinned by
-`crates/svm/tests/durable_guest_jit.rs` (admit-vs-refuse gate; end-to-end NORMAL compile+invoke ≡
+`crates/temen/tests/durable_guest_jit.rs` (admit-vs-refuse gate; end-to-end NORMAL compile+invoke ≡
 non-durable). **Persisting the `JitCode`/`JitDomain` handles across a snapshot now lands (Slice 2).**
 A `Jit` domain's out-of-line unit state — each unit's already-instrumented+verified IR and the
-compile quotas — rides a new snapshot **Section 5** (`TAG_JIT`, svm-snapshot format v16;
+compile quotas — rides a new snapshot **Section 5** (`TAG_JIT`, temen-snapshot format v16;
 `Host::capture_durable_jit`), and the handle table's `JitDomain { idx }` / `JitCode { domain, unit }`
 bindings become durable (`DurableBinding`), re-pinned into the positionally-rebuilt `jit_domains` on
 thaw. Restore **re-decodes and re-verifies** each unit (the artifact is untrusted, so its funcs must
 clear the verifier again — the deserialization-boundary re-check, and a forged handle index is
 bounds-rejected fail-closed), then an interpreter run invokes the reconstructed unit directly. So a
 guest that compiled a unit **keeps it across a checkpoint** instead of draining it (`drain_non_durable`
-no longer closes JIT handles). Pinned by `svm-snapshot/tests/jit_roundtrip.rs` (byte-identical
+no longer closes JIT handles). Pinned by `temen-snapshot/tests/jit_roundtrip.rs` (byte-identical
 re-serialize; JIT-free elision; fail-closed on a corrupt/tampered unit) and
 `durable_guest_jit.rs::durable_jit_domain_survives_freeze_and_invokes` (compile → freeze → restore →
 invoke ≡ 42). **Native reconstruct-on-thaw now lands (Slice 3).** The **native/wasm** code pointers are
-process-local, so they restore to `0`; `svm_run::reconstruct_jit_units` re-compiles each restored
+process-local, so they restore to `0`; `temen_run::reconstruct_jit_units` re-compiles each restored
 **live-handled** unit into the thaw run's `CompiledModule` (`define_extra` + `set_jit_unit_native`) —
 the cold-start twin of `recompact_into`. `jit_cap_run` runs it transparently after compiling the
 module and before re-entering the guest (a no-op for a fresh run, which holds no restored units), so a
@@ -228,11 +228,11 @@ module-wide guest-memory rejection notwithstanding — the vector uses neither m
 "the unit suspends" is only known at install/compile time (not at the program transform, which is why a
 blunt transform-level reject would wrongly kill the tested new→old unit `call_indirect` and durable
 non-suspending dispatch), the fence lives at **`Jit.compile`**: a durable domain **rejects a
-*suspendable* unit whose entry signature the program does not taint** (`svm_durable::
+*suspendable* unit whose entry signature the program does not taint** (`temen_durable::
 unit_suspends_untainted`, injected as the `Host` taint gate by `grant_jit_durable` alongside the
 program's `tainted_signatures_of`). Can't compile ⇒ can't install ⇒ the un-instrumented-site path is
-unreachable. The analysis lives in `svm-durable`; the TCB `Host` only stores the tainted-sig data and
-calls the injected predicate (no `svm-durable` dependency in the TCB). A non-suspending unit, or a
+unreachable. The analysis lives in `temen-durable`; the TCB `Host` only stores the tainted-sig data and
+calls the injected predicate (no `temen-durable` dependency in the TCB). A non-suspending unit, or a
 suspending unit whose signature the program *does* taint (the seam exists — the in-flight test's case),
 is admitted. Pinned by `durable_guest_jit.rs::durable_jit_compile_fences_suspending_untainted_unit`
 (all three branches). *Remaining lift (not a soundness gap):* **widening** the taint so such programs are
@@ -258,7 +258,7 @@ join result — the child is never re-run (`durable_nesting.rs::freeze_after_nes
 `cont.resume`/`suspend` — cap.call is not counted — so the freeze-after-join test drives a fiber
 after the join to place the trigger.)* The **bytecode** engine's durable-capture entry now
 **declines** §14 modules (falling back to the tree-walker, which owns the durable nesting rules —
-svm-run's bytecode backend already falls back on decline), exactly as it declines `thread.*`: its
+temen-run's bytecode backend already falls back on decline), exactly as it declines `thread.*`: its
 own instantiate arm has neither the admission check nor the fail-closed, and would otherwise mint
 the same thaw-faulting artifact. **Subtree freeze — first slice landed (stage A+B, interp, in-memory).** The fail-closed is
 **lifted for the covered shape**: a freeze over a **live same-module depth-1 child** now freezes
@@ -305,7 +305,7 @@ live child → serialize → restore into a fresh host → **§12.6 canonical re
 **Separate-module children (v11).** A live child running a *granted separate module* (op 5) survives
 too, with the module **host-supplied at restore** (D-scope): its `FrozenNested` record carries only a
 32-byte **content digest** of the child module's semantic image (`module_digest`, hashed by the shared
-`svm_encode::digest256`, the same function behind the codec's root R5 gate), never the module bytes.
+`temen_encode::digest256`, the same function behind the codec's root R5 gate), never the module bytes.
 The thaw resolves that digest against the restore host's re-granted modules (`Host::module_by_digest`)
 and runs the *child*'s funcs; a **missing or mismatched** re-grant fails closed — the parent's
 re-executed `join` traps rather than mis-run a wrong module in the carve (the per-child R5 identity
@@ -334,7 +334,7 @@ the chain). The freeze refusal drops the old `v.nested_child` blocker but keeps 
 fail-closed case. Pinned by `durable_nesting.rs::freeze_with_live_depth2_grandchild_thaws_and_completes`
 (a same-module 3-level module: root → child → `0..100=4950` grandchild loop; the armed freeze records
 **two** residue records with the right `parent_task` tags; the thaw rewinds both levels and both joins
-deliver 4950 up to the root). **Codec (v12).** The subtree now survives the on-disk `svm-snapshot`
+deliver 4950 up to the root). **Codec (v12).** The subtree now survives the on-disk `temen-snapshot`
 artifact, not just the in-memory arc: each `FrozenNested` wire record carries its `parent_task`
 (a `uleb` right after `slot`), so the format represents nesting to **arbitrary depth**, and `restore`
 re-seeds the residue byte-for-byte — the grandchild's non-zero tag round-trips, not just the live
@@ -352,7 +352,7 @@ whole nesting subsystem (depth-1 and depth-2).
 
 **JIT parity (design; the interpreter is the oracle).** All of the above — depth-1, depth-2, and the
 codec — is **interpreter-only**. The JIT's durable `instantiate`/`coro_spawn` **fail closed**
-(`svm-jit/instantiator_rt.rs`: `if rt.durable { -EINVAL }`; the nursery's `durable` flag is set at the
+(`temen-jit/instantiator_rt.rs`: `if rt.durable { -EINVAL }`; the nursery's `durable` flag is set at the
 common bottom of every run entry, `set_durable`), and `FrozenNested` has no JIT analog. Parity re-walks
 the interpreter's own arc, each slice **differential** against it — a byte-identical durable reserve is
 the all-or-nothing oracle (D-notes, §18):
@@ -402,7 +402,7 @@ compute* child (e.g. `PARENT_SELF_LOOP`'s func 1, a loop with no `cap.call` → 
 poll sites**) by *never scheduling it*: the parent, already `UNWINDING`, executes `instantiate` (which
 only enqueues the child) then spills at its trailing poll before the child's vCPU ever runs; the child
 rides as `FrozenNested { completed_result: None }` and is re-run from entry on thaw (interp map,
-`svm-interp` lines ~6243/6278/3844). The **JIT cannot reproduce that**: it runs the child *synchronously
+`temen-interp` lines ~6243/6278/3844). The **JIT cannot reproduce that**: it runs the child *synchronously
 inside* `instantiate`, and a non-instrumented child has nothing to unwind at — it runs to completion
 where the interpreter froze it at entry, so the two diverge. JIT freeze-export therefore targets an
 **instrumented** child that unwinds at a poll *both* backends hit identically — a loop that is
@@ -426,7 +426,7 @@ falls back to a freeze→thaw→result round-trip rather than a byte-identical c
   `cap.call`s to a nested nursery. There is a proven in-tree pattern; this is the one real new
   mechanism the freeze slice needs.
 - **Carve seeding.** Seed the child carve's ctx-0 control words to the parent's durable phase before
-  the run (the `svm-interp` layout from the slice-1 map: state word `@0`, ctx-0 thaw word `@72`, ctx-0
+  the run (the `temen-interp` layout from the slice-1 map: state word `@0`, ctx-0 thaw word `@72`, ctx-0
   shadow-SP word `@64` = `shadow_frame_base(0)` = 80). Under a freeze the seeded phase is `UNWINDING`,
   so the child unwinds at its first poll — the JIT analog of the interp's mid-freeze `instantiate`
   seeding the child's carve `UNWINDING`.
@@ -445,7 +445,7 @@ and separate-module children are follow-ups. (2) **freeze export — LANDED.** A
 (window `UNWINDING`) now captures a live §14 child on the JIT: `compile_child_and_run` seeds the
 child's carve with the **parent's** phase (read from the parent window's ctx-0 state word) so an
 instrumented child is born unwinding; after the run it reads the carve's state word
-(`window_is_unwinding`) and reports "unwound"; `instantiate` records a `svm_jit::FrozenNested`
+(`window_is_unwinding`) and reports "unwound"; `instantiate` records a `temen_jit::FrozenNested`
 (parent_task, slot, carve geometry, entry) into the run's `Nursery`; the top-level run drains it into
 `frozen_nested_out`, returned by a new `_durable_nested` entry (a separate entry, so the many `_durable`
 callers are untouched). Pinned by `durable_nesting_jit.rs::jit_freeze_captures_live_nested_child_matching_interp`.
@@ -458,7 +458,7 @@ identical — so the differential is on the *record*, not the frozen continuatio
 *carve* would require the freeze points to coincide; that (and the true correctness proof) is the
 **freeze→thaw→result round-trip** — the thaw slice below. (3) **thaw — LANDED (round-trip closed).**
 `compile_child_and_run` gains a thaw mode: it prepares the child's restored carve to **rewind** as
-`svm-durable::begin_thaw` does (global state `NORMAL`, ctx-0 thaw word `REWINDING`, SP word + shadow
+`temen-durable::begin_thaw` does (global state `NORMAL`, ctx-0 thaw word `REWINDING`, SP word + shadow
 stack **preserved** — the frozen continuation the rewind replays). Before the parent re-enters, a new
 `run_inner` hook (mirroring the multi-vCPU `thaw_reattach_and_run`) re-runs each `frozen_nested_seed`
 child over its carve in thaw mode and publishes the result at its join slot (`Nursery::seed_child_result`);
@@ -502,7 +502,7 @@ module digest for a host-supplied re-grant at thaw) are the remaining §14 gap.
 *(The §14 surface itself has since grown — PROCESS.md's S-slices. The grant-carrying instantiate
 forms (S2 `instantiate_granted` / `instantiate_named`, Stage-1 `instantiate_module_named`) **fail
 closed (`-EINVAL`) under a durable JIT run** — a granted child's separate powerbox host has no freeze
-story yet, the same exclusion as the separate-module child (`svm-jit/src/instantiator_rt.rs`). And
+story yet, the same exclusion as the separate-module child (`temen-jit/src/instantiator_rt.rs`). And
 `cap.self.attest` (S6) stamps a nested child `freeze_exposed = durable`, adding one follow-up here: a
 durable freeze/thaw must capture + restore the child's `Attestation` — the thaw re-attach currently
 defaults it (PROCESS.md O14).)*
@@ -556,11 +556,11 @@ branch is perfectly predicted; the real cost is the `i32.load` of the state word
 word lives **in the guest window** (a masked load each poll) deliberately — so the
 window snapshot captures it for free (§12.0). A register/host-side state word would be
 faster but needs separate capture: that's the main perf lever if `NORMAL`-state
-overhead ever shows up on `svm-bench`. **Non-durable modules pay none of this** — the
-pass is opt-in and no runtime/TCB crate depends on `svm-durable`.
+overhead ever shows up on `temen-bench`. **Non-durable modules pay none of this** — the
+pass is opt-in and no runtime/TCB crate depends on `temen-durable`.
 
 **Measured (interpreter, back-edge polls).** `cargo run --release --example
-durable_overhead -p svm-durable` times a transformed loop vs the same loop
+durable_overhead -p temen-durable` times a transformed loop vs the same loop
 un-transformed (steady-state, large/small-`n` subtraction), plus freeze/thaw. On the
 **tree-walking interpreter** the always-on back-edge poll costs **~+25–28 ns/iter**,
 which is **+50% on a realistic arithmetic-body loop and ~+75% on a minimal-body loop** —
@@ -580,7 +580,7 @@ call* as may-suspend, and `call_indirect` is the normal lowering for C function
 pointers / vtables. So "untouched" holds for **direct-call** compute (sha256/perlin/
 xxhash shapes); function-pointer-heavy C still gets instrumented. The 10–30% worst
 case may be more common than "compute is free" implies. *Validate by running the pass
-over `svm-bench` + demos — the harness makes this ~a day.*
+over `temen-bench` + demos — the harness makes this ~a day.*
 
 ---
 
@@ -594,7 +594,7 @@ interp), and the existing generative fuzzer **proves** it via one new property:
 > for any valid module and any snapshot point:
 > run-to-snapshot → serialize → restore → run-to-end  ≡  uninterrupted run
 
-checked on interp, on JIT, and cross-backend (extends `crates/svm/tests/jit_diff.rs`
+checked on interp, on JIT, and cross-backend (extends `crates/temen/tests/jit_diff.rs`
 and `fuzz/fuzz_targets/diff.rs`). Equivalence is continuously tested, not asserted.
 The §5 residue is drained identically on both backends, so no backend ever decodes a
 native stack.
@@ -602,7 +602,7 @@ native stack.
 **Landed — the equivalence surface is now wider than the original two backends.** The
 **bytecode engine** runs the same instrumented IR through its own durable-capture entry,
 including the fiber freeze driver + thaw seeding, checked **byte-for-byte** against the
-tree-walker oracle and the §12 codec (`crates/svm/tests/bytecode_durable.rs`,
+tree-walker oracle and the §12 codec (`crates/temen/tests/bytecode_durable.rs`,
 `bytecode_durable_fibers.rs`, `bytecode_durable_fibers_freeze.rs`). And the engine's **wasm
 port** proves the same single-fiber freeze/thaw *in wasm*: a NORMAL run, an UNWINDING freeze
 to a 128 KiB snapshot byte-identical to native, and a REWINDING thaw fed that snapshot back —
@@ -638,12 +638,12 @@ transform-specific work; everything else in §9 is needed by *any* snapshot desi
 
 ## 9. Implementation plan & status
 
-New non-TCB crate (tooling tier, like `svm-text`) for the pass; thin plumbing
+New non-TCB crate (tooling tier, like `temen-text`) for the pass; thin plumbing
 elsewhere. Net ~1.5–3k lines.
 
 - **TCB impact:** the **pass itself is +0 TCB** (tooling tier; an embedder running
   pre-instrumented modules links none of it). **But phase 2 adds a small escape-TCB
-  surface** — page+prot *restore* lives in `svm-mem`, which is escape-TCB. Honest
+  surface** — page+prot *restore* lives in `temen-mem`, which is escape-TCB. Honest
   accounting: +0 TCB for the codec, +small escape-TCB for the restore path (covered
   by the oracle).
 
@@ -666,11 +666,11 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   digest; v1 = re-grantable handles only.
 - **[~] Phase 1 — Transform + interp round-trip. Go/no-go: PASSED.** The
   freeze→serialize→restore→thaw round-trip works on the real interpreter
-  (`crates/svm-durable`, `tests/roundtrip.rs`): an in-window shadow stack + state
+  (`crates/temen-durable`, `tests/roundtrip.rs`): an in-window shadow stack + state
   word + `br_table` rewind reconstructs a frozen single-vCPU domain bytewise, and the
   thawed run reloads the saved `cap.call` result rather than re-issuing it.
-  - **Landed:** the `svm-durable` tooling-tier crate (+0 TCB, depends only on
-    `svm-ir`); the IR→IR transform — now covering **arbitrary single-/multi-block CFGs**
+  - **Landed:** the `temen-durable` tooling-tier crate (+0 TCB, depends only on
+    `temen-ir`); the IR→IR transform — now covering **arbitrary single-/multi-block CFGs**
     (branches, loops, joins) with **any number of resume points** across **call chains**
     (leaf `cap.call` reload vs. propagated `Call` re-issue, R8); the §12.7 frame layout;
     round-trip + inert-instrumentation + verifier tests (`tests/roundtrip.rs`,
@@ -690,10 +690,10 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
     on a cooperating-toolchain contract; corruption is self-contained and fails safe.
     Hard isolation against adversarial guests (guard-paged §12.7) is optional
     defense-in-depth.
-  - **Snapshot artifact codec + handle durability landed.** The `svm-interp` handle-table
-    durability primitives (§12.5) and the `svm-snapshot` §12 container — header w/ R5
+  - **Snapshot artifact codec + handle durability landed.** The `temen-interp` handle-table
+    durability primitives (§12.5) and the `temen-snapshot` §12 container — header w/ R5
     digest, sparse zero-eliding window image, Section-3 handle table — now give a real
-    `freeze → bytes → restore → thaw` on the interpreter (`crates/svm-snapshot`), with the
+    `freeze → bytes → restore → thaw` on the interpreter (`crates/temen-snapshot`), with the
     §12.6 canonical + identity-gated invariants tested.
 - **[x] Phase 2 — JIT parity + real memory snapshot.** Same instrumented IR on JIT (the
   `durable_jit` cross-backend property holds); **artifact codec done**; **per-page protection
@@ -706,9 +706,9 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   **D-fiber-cont RESOLVED (option A).** **Sub-phase 3.1 (one interp fiber) is complete** —
   per-fiber shadow regions + shadow-SP swap, both thaw arms, the freeze driver, and the
   Section-2 residue codec give an end-to-end single-fiber `freeze → serialize → restore → thaw`
-  on the interpreter (§12.8, `svm-durable/tests/fiber.rs` + `svm-snapshot/tests/roundtrip.rs`).
+  on the interpreter (§12.8, `temen-durable/tests/fiber.rs` + `temen-snapshot/tests/roundtrip.rs`).
   **3.2–3.4 have since landed too:** multi-vCPU + per-context layout on the interp
-  (`svm-durable/tests/multivcpu.rs`), JIT parity for fibers and spawned vCPUs
+  (`temen-durable/tests/multivcpu.rs`), JIT parity for fibers and spawned vCPUs
   (`durable_fibers_jit.rs`, `durable_multivcpu_jit.rs`), and the 3.4 closers — nested spawns +
   child-owned fibers, both backends (§12.8 "Slice 3.4", staging A–D all DONE). (Dispatch table
   is a no-op — §12.4.) The *concurrent* STW continued under Phase 4 Slice A below.
@@ -749,24 +749,24 @@ extra mechanism beyond snapshot/restore.
 | --- | --- | --- | --- |
 | R1 | Phase-3 quiesce vs. D57 migratable-fiber single-owner protocol (a fiber may be mid-migration / owned by another OS thread at safepoint request). The crux of the schedule variance. | §5, §9 | open |
 | R2 | `Blocking.work` cancellation needed before snapshot-latency guarantees are tight. | §5 | open |
-| R3 | escape-TCB growth from the page+prot **restore** path in `svm-mem`. | §6, §9 | open |
+| R3 | escape-TCB growth from the page+prot **restore** path in `temen-mem`. | §6, §9 | open |
 | R4 | `SharedRegion` cross-tree sharing: co-snapshot the sharing group, or regions carry a snapshot protocol? Decide as a `SharedRegion` constraint. | §4 | open |
 | R5 | Snapshot-format identity: artifact is coupled to the *instrumented-module* hash, not just backend-independent. Must be pinned in the format. | §1, §9 | open |
 | R6 | v1 latency bound includes "longest poll-free path" until back-edge polls (phase 4); a tight direct-call compute loop is un-preemptable in v1. | §5, §6 | open |
-| R7 | Breadth of instrumentation: "any indirect call = may-suspend" instruments more ordinary C than "compute is free" suggests. Validate on `svm-bench`. | §6 | open |
+| R7 | Breadth of instrumentation: "any indirect call = may-suspend" instruments more ordinary C than "compute is free" suggests. Validate on `temen-bench`. | §6 | open |
 
-**Phase-1 implementation hazards** (introduced by the `svm-durable` transform as built;
+**Phase-1 implementation hazards** (introduced by the `temen-durable` transform as built;
 the transform *fails closed* — out-of-scope shapes return a `TransformError` rather
 than miscompiling, so these are latent/extension hazards, not silent-miscompile bugs):
 
 | # | Risk / question | Where | Status |
 | --- | --- | --- | --- |
-| R8 | **Call-chain propagation landed; deepest-frame assumption resolved.** The transform now instruments any may-suspend function (transitive `cap.call` closure over the direct-call graph) whose single block suspends on one op: a leaf `cap.call` (reload result + flip `NORMAL`) **or** a propagated `Call` (reload pre-call live set + **re-issue the call**, leaving the state `REWINDING` so the callee rewinds). Real multi-frame stacks; only the innermost leaf flips to `NORMAL`. Covered by `tests/chain.rs` (2-/3-level chains, live-value-across-call) and the generator now emits depth-`1..=4` chains, so the interp (`durable_fuzz`) and cross-backend (`durable_jit`) properties exercise it. **Multiple resume points** and **multi-block CFGs** (branches, loops, joins) now land too — each block is split at its suspend ops, branch targets are remapped, and a global `br_table` dispatch routes the thaw (`tests/multipoint.rs`, `tests/multiblock.rs`; the generator emits multi-frame/multi-point/multi-block modules). **`call_indirect` to a may-suspend target now lands (the fork-critical case — bash dispatches builtins through function-pointer tables).** The target is a runtime table index, so the analysis taints **by signature** (§6): a `call_indirect` of type `T` is may-suspend iff some function of type `T` is — the ceiling of static precision (the natural table maps every function into a slot; there is no element/table section to narrow it, and `Jit.install` can add targets at run time). The site instruments as a `PropagatedIndirect` suspend kind — the indirect twin of a propagated `Call`: spill the live set **including the reloaded table index**, and on thaw **re-issue the `call_indirect`**; because the taint rule instruments *every* function of the signature, the reloaded index can only re-select a `REWINDING`-aware callee, which rewinds in turn. This also **flips R8 from fail-open to sound** — a suspend-only-through-`call_indirect` module was previously accepted and silently under-instrumented; it is now instrumented (or, for indirect **tail** calls where there is no poll to unwind at, rejected fail-closed like direct tail calls). Covered by `tests/indirect.rs` (round-trip, live-across-indirect, mixed direct/indirect chain, tail-call rejection); the generator mixes direct and indirect chain links, so `durable_fuzz` (interp) and `durable_jit` (cross-backend, plus a deterministic `indirect_call_freeze_thaw_cross_backend`) exercise it automatically. The by-signature rule's breadth cost is R7. A chain deeper than the reserve holds traps cleanly on freeze (R9 overflow guard), rather than overflowing. | §2, §6, §12.7, `svm-durable` | addressed |
-| R9 | **Placement, not an isolation boundary — cheap for MVP.** The control state + shadow stack are a reserved low slice `[0, DURABLE_RESERVE)` (one 64 KiB page) of the domain's *own* window; guest memory is `[DURABLE_RESERVE, window)`, part of the same budget-accounted allotment (the wasm shadow-stack / `__heap_base` convention). Because the window is per-domain and runtime-masked, a guest that writes the reserve corrupts only **its own** durability — never another domain or the host — and it **fails safe**: a forged resume id hits the `br_table` default → `Unreachable`; a wild shadow-SP stays masked in-window; the host validates the artifact (module hash) on restore. **MVP path:** `transform_module_assume_confined` instruments memory-using guests on the cooperating-toolchain contract that the guest's data/heap is based at `DURABLE_RESERVE` (`tests/guest_memory.rs` shows guest memory round-tripping). Strict `transform_module` still fails closed (`GuestUsesMemory`) for untrusted modules. **Optional defense-in-depth (not MVP):** hard isolation against an *adversarial* guest — guard-paged per-fiber placement (§12.7) or per-access confinement. The shadow stack now **traps on overflow**: the freeze-path `UNWIND` check refuses a push whose top would cross `DURABLE_RESERVE`, so a too-deep call chain fails safe (a clean trap) instead of growing into guest memory (`tests/overflow.rs`). See **[DECISION D-shadow-overflow]** below for why this lives in the transform rather than a unified backend recursion ceiling. | §12.7, `svm-durable` | mitigated (placement + fail-safe + overflow trap; hard isolation optional) |
+| R8 | **Call-chain propagation landed; deepest-frame assumption resolved.** The transform now instruments any may-suspend function (transitive `cap.call` closure over the direct-call graph) whose single block suspends on one op: a leaf `cap.call` (reload result + flip `NORMAL`) **or** a propagated `Call` (reload pre-call live set + **re-issue the call**, leaving the state `REWINDING` so the callee rewinds). Real multi-frame stacks; only the innermost leaf flips to `NORMAL`. Covered by `tests/chain.rs` (2-/3-level chains, live-value-across-call) and the generator now emits depth-`1..=4` chains, so the interp (`durable_fuzz`) and cross-backend (`durable_jit`) properties exercise it. **Multiple resume points** and **multi-block CFGs** (branches, loops, joins) now land too — each block is split at its suspend ops, branch targets are remapped, and a global `br_table` dispatch routes the thaw (`tests/multipoint.rs`, `tests/multiblock.rs`; the generator emits multi-frame/multi-point/multi-block modules). **`call_indirect` to a may-suspend target now lands (the fork-critical case — bash dispatches builtins through function-pointer tables).** The target is a runtime table index, so the analysis taints **by signature** (§6): a `call_indirect` of type `T` is may-suspend iff some function of type `T` is — the ceiling of static precision (the natural table maps every function into a slot; there is no element/table section to narrow it, and `Jit.install` can add targets at run time). The site instruments as a `PropagatedIndirect` suspend kind — the indirect twin of a propagated `Call`: spill the live set **including the reloaded table index**, and on thaw **re-issue the `call_indirect`**; because the taint rule instruments *every* function of the signature, the reloaded index can only re-select a `REWINDING`-aware callee, which rewinds in turn. This also **flips R8 from fail-open to sound** — a suspend-only-through-`call_indirect` module was previously accepted and silently under-instrumented; it is now instrumented (or, for indirect **tail** calls where there is no poll to unwind at, rejected fail-closed like direct tail calls). Covered by `tests/indirect.rs` (round-trip, live-across-indirect, mixed direct/indirect chain, tail-call rejection); the generator mixes direct and indirect chain links, so `durable_fuzz` (interp) and `durable_jit` (cross-backend, plus a deterministic `indirect_call_freeze_thaw_cross_backend`) exercise it automatically. The by-signature rule's breadth cost is R7. A chain deeper than the reserve holds traps cleanly on freeze (R9 overflow guard), rather than overflowing. | §2, §6, §12.7, `temen-durable` | addressed |
+| R9 | **Placement, not an isolation boundary — cheap for MVP.** The control state + shadow stack are a reserved low slice `[0, DURABLE_RESERVE)` (one 64 KiB page) of the domain's *own* window; guest memory is `[DURABLE_RESERVE, window)`, part of the same budget-accounted allotment (the wasm shadow-stack / `__heap_base` convention). Because the window is per-domain and runtime-masked, a guest that writes the reserve corrupts only **its own** durability — never another domain or the host — and it **fails safe**: a forged resume id hits the `br_table` default → `Unreachable`; a wild shadow-SP stays masked in-window; the host validates the artifact (module hash) on restore. **MVP path:** `transform_module_assume_confined` instruments memory-using guests on the cooperating-toolchain contract that the guest's data/heap is based at `DURABLE_RESERVE` (`tests/guest_memory.rs` shows guest memory round-tripping). Strict `transform_module` still fails closed (`GuestUsesMemory`) for untrusted modules. **Optional defense-in-depth (not MVP):** hard isolation against an *adversarial* guest — guard-paged per-fiber placement (§12.7) or per-access confinement. The shadow stack now **traps on overflow**: the freeze-path `UNWIND` check refuses a push whose top would cross `DURABLE_RESERVE`, so a too-deep call chain fails safe (a clean trap) instead of growing into guest memory (`tests/overflow.rs`). See **[DECISION D-shadow-overflow]** below for why this lives in the transform rather than a unified backend recursion ceiling. | §12.7, `temen-durable` | mitigated (placement + fail-safe + overflow trap; hard isolation optional) |
 | R10 | **No concurrency protection on the in-window control state** (state word, shadow-SP). Fine at single-vCPU; a hazard once fibers/multi-vCPU arrive (relates to R1, but specifically about the control words racing). *Mitigated for slice 3.2.1:* a freeze/thaw run (state ≠ `NORMAL`) is forced **single-worker**, and the runtime swaps both control words per-vCPU per dispatch — so the words are never touched concurrently. A lock-free parallel STW for the shadow-SP is **planned via per-context SP** (4A.5 — each context keeps its SP in its own region, addressed through a runtime-private per-context register, so the shared word and its lock both disappear; `FORMAT_VERSION` 4→5). The state word stays per-context-swapped (only flipped, not accumulated, so it needs no lock). | §3, §12.7 | mitigated (single-worker STW); 4A.5 = lock-free SP |
-| R11 | **Equivalence now fuzzed (Phase-1 scope), both single-backend and cross-backend.** The §7/§12.6 property runs over a generator of **in-scope** durable modules: (a) interpreter-only — *inert in `NORMAL`* (instrumented == un-instrumented) and *round-trip* (freeze→serialize→restore→thaw ≡ uninterrupted, reload-not-reissue) — `crates/svm-durable/tests/durable_fuzz.rs` + libFuzzer `fuzz/fuzz_targets/durable.rs`; (b) cross-backend — interp vs Cranelift JIT agree on the NORMAL result, leave a **byte-identical freeze artifact**, and a JIT thaw of the **interpreter-frozen** artifact under a different host clock reproduces the result — `crates/svm/tests/durable_jit.rs` + libFuzzer `fuzz/fuzz_targets/durable_jit.rs`. Both stable drivers run in CI without nightly. Coverage broadens automatically as the transform generalizes (R8). | §7, §12.6 | addressed (Phase-1 scope) |
+| R11 | **Equivalence now fuzzed (Phase-1 scope), both single-backend and cross-backend.** The §7/§12.6 property runs over a generator of **in-scope** durable modules: (a) interpreter-only — *inert in `NORMAL`* (instrumented == un-instrumented) and *round-trip* (freeze→serialize→restore→thaw ≡ uninterrupted, reload-not-reissue) — `crates/temen-durable/tests/durable_fuzz.rs` + libFuzzer `fuzz/fuzz_targets/durable.rs`; (b) cross-backend — interp vs Cranelift JIT agree on the NORMAL result, leave a **byte-identical freeze artifact**, and a JIT thaw of the **interpreter-frozen** artifact under a different host clock reproduces the result — `crates/temen/tests/durable_jit.rs` + libFuzzer `fuzz/fuzz_targets/durable_jit.rs`. Both stable drivers run in CI without nightly. Coverage broadens automatically as the transform generalizes (R8). | §7, §12.6 | addressed (Phase-1 scope) |
 
-**[DECISION D-shadow-overflow — RESOLVED: freeze-path guard in the transform, not a unified backend recursion ceiling.]** The shadow stack mirrors the call stack (one frame per suspended activation), so it can only overflow the reserve if the call stack is very deep. We bound it with a check on the freeze-path `UNWIND` (trap if a push would cross `DURABLE_RESERVE`) rather than forcing both backends to a common call-depth ceiling. Rationale: shadow overflow is a **tooling-tier** concern (`svm-durable`, +0 TCB), and the guard sits on the **cold** freeze path, so it costs nothing on the per-call hot path; unifying the ceiling would mean an **escape-TCB JIT codegen change** (the JIT has no depth counter today — recursion rides the native stack; the interp caps at `MAX_CALL_DEPTH = 256`) with a permanent per-call cost, to fix an edge case. Consequence: a domain recursed deeper than the reserve holds simply **cannot be frozen** (the freeze traps) — a safe, coherent limitation. Cross-backend recursion *determinism* (interp 256 vs JIT native-stack) remains a separate, latent, un-exercised divergence; unifying the ceiling is the deliberate fix to make **on its own merits** if/when it matters (the overflow guard then becomes a redundant cheap backstop).
+**[DECISION D-shadow-overflow — RESOLVED: freeze-path guard in the transform, not a unified backend recursion ceiling.]** The shadow stack mirrors the call stack (one frame per suspended activation), so it can only overflow the reserve if the call stack is very deep. We bound it with a check on the freeze-path `UNWIND` (trap if a push would cross `DURABLE_RESERVE`) rather than forcing both backends to a common call-depth ceiling. Rationale: shadow overflow is a **tooling-tier** concern (`temen-durable`, +0 TCB), and the guard sits on the **cold** freeze path, so it costs nothing on the per-call hot path; unifying the ceiling would mean an **escape-TCB JIT codegen change** (the JIT has no depth counter today — recursion rides the native stack; the interp caps at `MAX_CALL_DEPTH = 256`) with a permanent per-call cost, to fix an edge case. Consequence: a domain recursed deeper than the reserve holds simply **cannot be frozen** (the freeze traps) — a safe, coherent limitation. Cross-backend recursion *determinism* (interp 256 vs JIT native-stack) remains a separate, latent, un-exercised divergence; unifying the ceiling is the deliberate fix to make **on its own merits** if/when it matters (the overflow guard then becomes a redundant cheap backstop).
 
 
 ---
@@ -799,7 +799,7 @@ objects into the artifact.
 
 ### 12.1 Container
 
-A sectioned binary, LEB128 varints, same conventions as `svm-encode`. Sections are
+A sectioned binary, LEB128 varints, same conventions as `temen-encode`. Sections are
 TLV (`tag: uleb`, `len: uleb`, body) so a restore-side reader can skip unknown tags
 (forward-compatible). **Canonical form is required** — sparse entries ascending by
 index, no redundant entries, fixed varint widths — so "re-serialize after restore at
@@ -810,10 +810,10 @@ needs.
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| magic | `b"SVMD"` | SVM-Durable |
+| magic | `b"SVMD"` | TEMEN-Durable |
 | format version | u16 | bump on incompatible change |
-| instrumented-module digest | 32 bytes | digest of the `svm-encode` bytes of the **instrumented** module (R5). Restore refuses on mismatch — this is the durability boundary from §1. |
-| window geometry | `reserved_log2: u8`, `mapped: u64` | matches `Module::memory` / `svm_mask::Window`; stored for a fail-fast check |
+| instrumented-module digest | 32 bytes | digest of the `temen-encode` bytes of the **instrumented** module (R5). Restore refuses on mismatch — this is the durability boundary from §1. |
+| window geometry | `reserved_log2: u8`, `mapped: u64` | matches `Module::memory` / `temen_mask::Window`; stored for a fail-fast check |
 | host page size at capture | u32 | page granularity of §12.3 |
 | vCPU count, fiber count | uleb, uleb | sizes §12.4 |
 
@@ -830,7 +830,7 @@ Captured at the quiescent point. Sparse over **committed** pages, with zero-page
 elision. Per entry:
 
 - `page_index: uleb` (window offset ÷ page)
-- `prot: u8` — `Rw=0, Ro=1, Unmapped=2` (mirrors `PageProt`, `svm-interp` `:5962`)
+- `prot: u8` — `Rw=0, Ro=1, Unmapped=2` (mirrors `PageProt`, `temen-interp` `:5962`)
 - if `prot ∈ {Rw, Ro}`: page bytes (run-length / zero-eliding to keep it small)
 
 The in-window shadow stacks + state words ride along in this image for free (§12.0).
@@ -854,20 +854,20 @@ construction. What's stored:
   fiber/funcref handles stay valid across restore; its in-window shadow-stack
   location; and `suspended | runnable` status. The pending `Suspend`/`ContResume`
   value is already spilled in-window at the resume point, so it is *not* stored here.
-- **Dispatch table** (`DomainTable`, `svm-interp:2002`): the table's **identity** part is
+- **Dispatch table** (`DomainTable`, `temen-interp:2002`): the table's **identity** part is
   module-derived — `slot i → (module 0, func i)` plus trapping padding — so it is re-created
   bit-identically on thaw from the same module, and only the runtime mutation needs capturing.
   That mutation is B2 `install` of guest-JIT units. **Install-durability (§12.5) now captures it:**
   the occupancy — `(slot, unit)` per installed unit, plus the table reservation `table_log2` — is
   recorded on the domain (`JitDomainState.installed`, not the per-run table), rides Section 5 beside
   the units, and is **re-applied** when a run builds its table (`DomainTable::install_at` at run
-  entry; the native tier via `svm_run::reconstruct_jit_units` → `CompiledModule::install_at`), so a
+  entry; the native tier via `temen_run::reconstruct_jit_units` → `CompiledModule::install_at`), so a
   `call_indirect` through an installed slot resolves after a freeze/thaw. The identity slots stay a
   pure function of the module (not stored).
 
 ### 12.5 Section 3 — Handle table (durability classification)
 
-Per **live** slot (`Slot.entry.is_some()`, `svm-interp` `:4427`), sparse:
+Per **live** slot (`Slot.entry.is_some()`, `temen-interp` `:4427`), sparse:
 
 - `slot_index: uleb`, `generation: u32`, `type_id: u32`, durable binding descriptor.
 
@@ -899,14 +899,14 @@ so guest-held handle values stay valid — the auto-allocating `grant`/`grant_*`
 `grant_at(slot, generation, type_id, binding)`, that pins both. (`Host` is not
 escape-TCB; the verifier/mask hinge is untouched — §3.)
 
-**Status: Host primitives landed.** `svm-interp` now implements the §12.5 classification
-and pinning on `Host` (`crates/svm-interp/tests/handle_durability.rs`):
+**Status: Host primitives landed.** `temen-interp` now implements the §12.5 classification
+and pinning on `Host` (`crates/temen-interp/tests/handle_durability.rs`):
 `capture_durable_handles() -> Result<Vec<DurableHandle>, NonDurableHandle>` (the
 re-grantable set in ascending slot order, or a clean refusal naming the first non-durable
 slot — freeze is all-or-nothing), `restore_durable_handles` + the `grant_at` pin, and
 `handle_capacity()` for the codec's bounds check. The value-typed descriptors
 (`DurableBinding`/`DurableHandle`) are public; `Binding` stays private. The byte-level
-**Section 3** serialization is now wired into the `svm-snapshot` container (§12.6 below).
+**Section 3** serialization is now wired into the `temen-snapshot` container (§12.6 below).
 
 **Handle hardening — `drain_non_durable` landed (Phase-4).** The complement to the capture refusal:
 `Host::drain_non_durable() -> Vec<NonDurableHandle>` **closes every live non-durable handle** (the exact
@@ -918,9 +918,9 @@ succeeds, so a subtree that held non-durable authority becomes **snapshottable**
 "freeze refuses unless the non-durable handles are closed/drained first". The freeze is host-driven (STW),
 so the embedder calls this at a freeze safepoint (the STW quiesce + §12.8 4A.7 guarantee no vCPU is
 mid-host-call; async offload residue drains via `quiesce_pool` first). Pinned by
-`svm-interp/tests/handle_durability.rs` (drain makes a clock+blocking+host_fn domain snapshottable; a
+`temen-interp/tests/handle_durability.rs` (drain makes a clock+blocking+host_fn domain snapshottable; a
 drained handle faults at its use site; an all-durable drain is a no-op) and
-`svm-snapshot/tests/roundtrip.rs::freeze_succeeds_after_draining_a_non_durable_handle` (the freeze
+`temen-snapshot/tests/roundtrip.rs::freeze_succeeds_after_draining_a_non_durable_handle` (the freeze
 *refusal* becomes a successful serialize after the drain). *In-flight residue* draining for a busy
 `Blocking` (vs. an idle handle) rides the §5 run-end pool quiesce / the deferred `Blocking`
 cancellation (R2); the guest-facing first-class `cap.self.close` op (vs. this host primitive) is a possible
@@ -939,29 +939,29 @@ Two derived invariants the fuzzer checks directly:
 2. **Identity-gated:** restore against a mismatched instrumented-module digest
    refuses cleanly (never partial state) — R5.
 
-**Status: codec landed (single-vCPU Phase-1 shape).** `svm-snapshot` (tooling-tier, +0
-TCB; depends on `svm-ir`/`svm-encode`/`svm-interp`, **not** `svm-durable`) implements the
+**Status: codec landed (single-vCPU Phase-1 shape).** `temen-snapshot` (tooling-tier, +0
+TCB; depends on `temen-ir`/`temen-encode`/`temen-interp`, **not** `temen-durable`) implements the
 §12 container: `freeze(module, window, host) -> Vec<u8>` and `restore(artifact, module,
 &mut host) -> window`. Header carries the 256-bit non-crypto instrumented-module digest
 (D-hash); the window image is sparse with zero-page elision (the shadow state rides along)
 and carries **per-page protection** (`Rw`/`Ro`/`Unmapped`, §12.3) — `freeze_with_prots` /
 `restore_with_prots`, with the flat `freeze`/`restore` treating the window as all-`Rw`
-(`tests/prots.rs`); Section 3 is the handle table. `crates/svm-snapshot/tests/roundtrip.rs` drives the real
+(`tests/prots.rs`); Section 3 is the handle table. `crates/temen-snapshot/tests/roundtrip.rs` drives the real
 freeze→serialize→restore→thaw on the interpreter and asserts both invariants above plus the
-non-durable freeze refusal. The **cross-backend** property (`crates/svm/tests/durable_jit.rs`
+non-durable freeze refusal. The **cross-backend** property (`crates/temen/tests/durable_jit.rs`
 + the libFuzzer `durable_jit` target) now runs through the codec too: it serializes each
 backend's freeze and asserts a **byte-identical artifact** across interp/JIT, checks the
 canonical re-serialize invariant, and thaws the **restored** interpreter artifact on the JIT.
 **Capture + re-establish** landed for the interpreter: `run_capture_reserved_with_host_prots`
 both **seeds** an initial per-page protection map (restore) and **returns** the post-run map
 (freeze) — `CapturedProt` (`Rw`/`Ro`/`Unmapped`/`Backed`) at the fixed `DURABLE_SNAPSHOT_PAGE`
-(= codec `PAGE`) granularity. `crates/svm/tests/durable_prot_capture.rs` shows a D40 `readonly`
+(= codec `PAGE`) granularity. `crates/temen/tests/durable_prot_capture.rs` shows a D40 `readonly`
 data segment captured as `Ro` and surviving freeze→restore through the codec (where Phase-1's
 flat all-`Rw` image would have lost it), **and** that re-establishing the map on a thawed run
 makes a write to a restored `Ro` page fault — while the same window without it writes through. A
 `Backed` page maps to a freeze refusal / is skipped on restore (D-region: the embedder re-grants
 the region). **JIT re-establish parity** also landed:
-`svm_jit::compile_and_run_capture_reserved_with_host_prots` takes a `WindowProt` map and applies
+`temen_jit::compile_and_run_capture_reserved_with_host_prots` takes a `WindowProt` map and applies
 it to the freshly-seeded window (`protect_ro` / new `protect_none` via real
 `mprotect`/`VirtualProtect`) before the run, so a thawed `Ro`/`Unmapped` page faults on the JIT
 exactly as on the interpreter (`durable_prot_capture.rs` asserts both). Note module-defined
@@ -978,7 +978,7 @@ The §12.4 **fiber control state** now rides along too (Section 2 — the `Froze
 slice 3.1.5): a freeze flattens each parked fiber's continuation into the window image and records
 its residue (slot/funcref/sp/shadow-SP) in a TLV control section (tag 2, elided when there are no
 fibers, so no-fiber artifacts stay byte-identical); `restore` re-seeds the `Host`. A single-fiber
-domain now round-trips through the real artifact (`crates/svm-snapshot/tests/roundtrip.rs`,
+domain now round-trips through the real artifact (`crates/temen-snapshot/tests/roundtrip.rs`,
 including the §12.6 canonical re-serialize invariant). Remaining Phase-3 control-state work is
 **multi-vCPU** (per-context state words) and the **dispatch table** (a module-derived no-op today).
 
@@ -1073,7 +1073,7 @@ gets its page, runs to its next poll. Both are semantically invisible (a poll si
 point the program already passes through).
 
 **(b) The crux — making a guest-suspended fiber's continuation durable.** A fiber the
-guest `Suspend`ed sits in `RegFiber::Parked(Vec<Frame>)` (interp, `svm-interp:2966`) or
+guest `Suspend`ed sits in `RegFiber::Parked(Vec<Frame>)` (interp, `temen-interp:2966`) or
 as a **native stack** (`FiberSlot.fiber`, JIT). Neither is durable, and — unlike the §5
 residues — it **must not be run forward** (no `ContResume` is coming; advancing it would
 execute work the guest never requested). So its parked continuation must become
@@ -1111,21 +1111,21 @@ guest).
 **Sub-phases.** 3.1 — freeze/thaw **one fiber, single vCPU, interpreter-only** (isolates
 "continuation in a shadow stack" from thread coordination). *In progress:* the transform
 recognizes `cont.new`/`cont.resume`/`suspend` as may-suspend points and a fiber'd module is
-**NORMAL-inert** under instrumentation + verifies (`svm-durable/tests/fiber.rs`); the
+**NORMAL-inert** under instrumentation + verifies (`temen-durable/tests/fiber.rs`); the
 **per-fiber shadow-stack layout + shadow-SP swap landed** (slice 3.1.1), the **resumer-side
 `cont.resume` thaw arm** re-issues the resume on rewind (slice 3.1.2), and the **fiber-side
 `suspend` re-park arm** flips to `NORMAL` and re-executes `suspend` on rewind (slice 3.1.3) —
 so **both fiber thaw arms are now wired** (no fiber arm fails closed). The **freeze driver
 flattens idle parked fibers** into their shadow regions (slice 3.1.4), and the **end-to-end
 single-fiber round-trip works** (slice 3.1.5): freeze exports each flattened fiber's residue
-(`svm_interp::FrozenFiber` via the `Host`), and a thaw re-seeds the registry and re-enters the
+(`temen_interp::FrozenFiber` via the `Host`), and a thaw re-seeds the registry and re-enters the
 root under `REWINDING` — the resumer re-issues `cont.resume`, the fiber rewinds and re-parks,
-then runs forward to the same result as the uninterrupted run (`svm-durable/tests/fiber.rs`).
-The byte-level snapshot **Section-2 codec** lands too: `svm-snapshot` serializes the
+then runs forward to the same result as the uninterrupted run (`temen-durable/tests/fiber.rs`).
+The byte-level snapshot **Section-2 codec** lands too: `temen-snapshot` serializes the
 `FrozenFiber` residue (slot/funcref/sp/shadow-SP) into a TLV control section (elided when there
 are no fibers, so no-fiber artifacts stay byte-identical) and `restore` re-seeds the `Host`, so a
 full `freeze → serialize → restore → thaw ≡ uninterrupted` runs through the **real artifact**
-(`svm-snapshot/tests/roundtrip.rs`, incl. the §12.6 canonical re-serialize invariant). **3.1 is
+(`temen-snapshot/tests/roundtrip.rs`, incl. the §12.6 canonical re-serialize invariant). **3.1 is
 complete on the interpreter, and now generatively fuzzed**: `durable_fuzz`'s
 `fiber_freeze_thaw_equivalence_over_generated_modules` (+ the `durable_fiber` libFuzzer target)
 drive a root+fiber generator — varying suspend counts, values live across each suspend, multi-point
@@ -1137,8 +1137,8 @@ resume/suspend — through the freeze→thaw round-trip (R11).
 brackets a fiber's residency — entry swaps in, exit swaps back, so `fiber_suspend` needs no change),
 keyed off a `durable` flag + window base armed on the root `FiberRuntime` at entry and a per-`FiberSlot`
 saved-SP. Gated by `compile_and_run_capture_reserved_with_host_durable`; tested by
-`crates/svm/tests/durable_fibers_jit.rs` (each context routes to its own region, cross-checked
-against `svm_interp`'s `SHADOW_*`). Slice **3.3.2 landed**: the JIT **freeze driver**
+`crates/temen/tests/durable_fibers_jit.rs` (each context routes to its own region, cross-checked
+against `temen_interp`'s `SHADOW_*`). Slice **3.3.2 landed**: the JIT **freeze driver**
 (`fiber_rt::freeze_drive`, hooked into `run_code_raw` after the root unwinds, gated on the
 `UNWINDING` state word) flattens every still-`RUNNABLE` (parked) fiber into its shadow region by
 resuming it under `UNWINDING` via the ordinary `fiber_resume` path — its post-suspend poll fires
@@ -1146,7 +1146,7 @@ before any guest code runs, so it unwinds with zero forward progress and its `Fi
 runs host-side and unguarded — a flattening fiber touches only the committed reserve, so no guard
 page can fault. Tested by a **cross-backend freeze comparison** (`jit_freeze_driver_flattens_a_fiber_matching_interp`):
 interp and JIT freeze the same instrumented fiber module into a **byte-identical durable reserve**.
-Slice **3.3.3 landed**, closing JIT parity: the freeze driver **exports** a `svm_jit::FrozenFiber`
+Slice **3.3.3 landed**, closing JIT parity: the freeze driver **exports** a `temen_jit::FrozenFiber`
 residue per flattened fiber (entry funcref + data-SP retained in the `FiberSlot` at `cont.new`,
 flattened shadow-SP read after), and a thaw **re-seeds** those fibers into the run-shared table
 before re-entering under `REWINDING` (`fiber_rt::seed_frozen_fibers` builds each via the shared
@@ -1167,13 +1167,13 @@ residue (so it couldn't thaw); now, when it actually unwound (its shadow region 
 non-instrumented fiber), it is captured as residue (`Frozen` on the interp) and re-seeded on thaw,
 where it rewinds at its in-flight (leaf/propagated/resume) point and runs **forward** — the active
 analogue of an idle fiber's re-park. Tested both backends incl. **reload-not-reissue** of the
-in-flight `cap.call` (`svm-durable/tests/fiber.rs::active_resume_chain_fiber_freezes_and_thaws`,
+in-flight `cap.call` (`temen-durable/tests/fiber.rs::active_resume_chain_fiber_freezes_and_thaws`,
 `durable_fibers_jit.rs::interp_frozen_active_chain_fiber_thaws_on_the_jit`).
 
 **[~] Slice 3.2.1 — first multi-vCPU freeze/thaw (interp; no live fibers).** A domain whose root
 has spawned a `thread.spawn` child freezes mid-run and thaws to equal the uninterrupted run
-(`svm-snapshot/tests/roundtrip.rs::multivcpu_freeze_serialize_restore_thaw_through_the_codec`,
-`svm-durable/tests/multivcpu.rs`). The choreography is **transform-free** — `svm-durable` only gains
+(`temen-snapshot/tests/roundtrip.rs::multivcpu_freeze_serialize_restore_thaw_through_the_codec`,
+`temen-durable/tests/multivcpu.rs`). The choreography is **transform-free** — `temen-durable` only gains
 *typing* for `thread.spawn`/`thread.join` (they aren't checkpoints; they're copied verbatim and their
 results spill/reload like any scalar). Mechanism:
 
@@ -1212,9 +1212,9 @@ meet — never an overlap. Contexts stay *derived* from slot/task (reproduced de
 so no snapshot-format change and no new residue fields. The `FiberRegistry` gained a vCPU-context
 counter (`reserve_vcpu_context` hands out the next top-down region under the lock; `cont.new`
 cross-checks the combined bound; thaw re-seeds the count). Tested: a root that owns a fiber **and**
-spawns a vCPU freezes/thaws correctly, in-memory (`svm-durable/tests/multivcpu.rs`) and through the
+spawns a vCPU freezes/thaws correctly, in-memory (`temen-durable/tests/multivcpu.rs`) and through the
 codec (the control section carries both fiber and vCPU residue; canonical re-freeze stays
-byte-identical — `svm-snapshot/tests/roundtrip.rs`). Cross-backend parity unaffected (fibers unchanged;
+byte-identical — `temen-snapshot/tests/roundtrip.rs`). Cross-backend parity unaffected (fibers unchanged;
 the JIT has no multi-vCPU durable path yet).
 
 **[~] vCPU-context recycling (interp) — done.** A spawned vCPU's shadow context is now **freed when
@@ -1229,7 +1229,7 @@ child at freeze* is **not reachable yet**: a freeze-from-start drives every vCPU
 (residue stays dense), and a *mid-run* multi-vCPU freeze needs a true stop-the-world (the
 `arm_freeze_after` trigger flips only the running vCPU's per-context state word), which is Phase 4. So
 the gap-tolerance is exercised only on the dense path today; the cap-lifting is pinned by
-`svm-durable/tests/vcpu_recycle.rs` (20 sequential and 8×2 concurrent spawn/join cycles, both of which
+`temen-durable/tests/vcpu_recycle.rs` (20 sequential and 8×2 concurrent spawn/join cycles, both of which
 would `ThreadFault` at the 16th lifetime spawn without recycling).
 
 **[DESIGN] 4A.6 — recycled-context async freeze (sparse-residue payoff).** The recycling note above flagged
@@ -1263,12 +1263,12 @@ a **post-thaw spawn** reuses a recycled gap instead of colliding with a re-attac
 context). A full *behavioral* post-thaw-spawn collision test is timing-dependent (the re-attached child must
 still be live when the new spawn lands), so the allocator unit test covers the gap deterministically instead.
 
-*Codec follow-up — landed.* The recycled artifact now round-trips through the **svm-snapshot §12 codec**:
+*Codec follow-up — landed.* The recycled artifact now round-trips through the **temen-snapshot §12 codec**:
 `recycled_context_artifact_canonical_re_freeze_through_the_codec` (`durable_concurrent_jit`) drives the *same*
 real concurrent-freeze residue (B frozen + A completed, A's context recycled) through serialize → restore →
 re-serialize and asserts the **§12.6 invariant 1 (canonical re-freeze) is byte-identical** — the recycled vCPU
 residue (`completed_result` included) and the sparse window image (recycled regions zero-elided) survive intact.
-Since the codec is `svm_interp::Host`-based and the interp can't *produce* a recycled residue (single-worker, so
+Since the codec is `temen_interp::Host`-based and the interp can't *produce* a recycled residue (single-worker, so
 `completed_result` is always `None`), the test bridges the JIT residue (field-identical mirror types) into a
 fresh codec-ready host granting only the durable clock (the harness's signalling host-fn is non-durable, which
 the codec rightly refuses). *Interp note:* recycling is done interp-side, but the interp has no async concurrent
@@ -1285,14 +1285,14 @@ latency excludes *new* host calls once a freeze is requested (narrowing R6); can
 call is the full offload-cancellation story, still deferred (R2). The **direct** `Blocking.work` cap.call is gated (it parks a vCPU with
 no poll site); the batched `io_ring.submit` variant of this gate left with the ring's §12
 retirement (2026-08-07). The refusal lives in the **shared** capability
-dispatch that *both* backends funnel a `cap.call` through (the JIT via `svm-run`'s `cap_thunk`), so it is
+dispatch that *both* backends funnel a `cap.call` through (the JIT via `temen-run`'s `cap_thunk`), so it is
 backend-agnostic. It is gated on `Host::is_durable` (a non-durable guest's byte at window offset 0 is ordinary
 data, not a freeze word): durability is now declared on the *Host* for durable runs on **both** backends — the
 interpreter already required it, and the JIT's `concurrent_freeze` harness now sets it too (the JIT otherwise
-signals durability only to its own runtime via `set_durable_env`; `svm-jit` has no `svm_interp` dependency, so the
+signals durability only to its own runtime via `set_durable_env`; `temen-jit` has no `temen_interp` dependency, so the
 gate reads the Host flag the embedder sets). A live `Blocking` handle was already non-durable at serialize (§12.5,
 `capture_durable_handles`); this adds the **run-time** refusal so the STW doesn't stall before reaching that gate.
-Pinned by `svm-interp/tests/blocking_freeze_refusal.rs` (a freeze-landed direct call *and* a batched offload submit
+Pinned by `temen-interp/tests/blocking_freeze_refusal.rs` (a freeze-landed direct call *and* a batched offload submit
 both fail closed; `NORMAL` runs; a non-durable run never spuriously refuses) — deterministic, covering the JIT's
 blocking path via the shared dispatch without racing an async controller against a real OS thread. *(A
 deterministic full-run JIT test can't reach the gate: any earlier safepoint poll unwinds the vCPU before it
@@ -1325,7 +1325,7 @@ fibers → children, in spawn order) and therefore the same side-effect interlea
 the clock first). Running the child *immediately* at the spawn point instead reverses that interleaving
 and diverges the frozen window. Each deferred child runs in its own context (point `SHADOW_SP_OFF` at its
 region, run the child entry via the existing guarded-range path), captures its flattened extent as a
-**`FrozenVCpu`** residue (a JIT mirror of `svm_interp::FrozenVCpu`) when it unwinds under `UNWINDING`, and
+**`FrozenVCpu`** residue (a JIT mirror of `temen_interp::FrozenVCpu`) when it unwinds under `UNWINDING`, and
 publishes its result to its `Done` cell; the last child leaves the active shadow-SP at its own extent,
 matching the interp's dispatch-last convention. `NORMAL` durable runs keep concurrent OS threads (matching
 the interp's multi-worker `NORMAL`).
@@ -1418,7 +1418,7 @@ never reaches a safepoint and the freeze hangs; and the freeze run is only safe 
 **single-worker**. This slice adds polls a compute loop can't skip, plus the multi-worker→single-worker
 quiesce handshake for a true async stop-the-world.
 
-**Poll mechanism (in the IR transform, not codegen).** `svm-durable`'s `transform_func` emits a
+**Poll mechanism (in the IR transform, not codegen).** `temen-durable`'s `transform_func` emits a
 state-word check at every **loop back-edge** (target block id ≤ source — the reducible back-edge
 heuristic; irreducible CFGs fall back to all branch terminators) + extends the function-entry prologue
 to unwind on `UNWINDING` (not just `REWINDING`). This is the same observe-and-unwind it already emits
@@ -1466,7 +1466,7 @@ below) (LOOM); 4A.6 recycled-context async freeze (sparse-residue payoff); 4A.7 
 (all-platform CI green; the `claude/durable-next-slices-tracker` branch is fully merged — every
 durable suite lives in the main tree). The former remaining queue has landed too: the **`atomic.wait`
 thaw fail-closed lift** (concurrent-thaw rework — stages 1–3 all LANDED under *"Concurrent thaw"*
-below; `durable_concurrent_jit.rs`) and **4A.6 / 4A.7** (`svm-durable/tests/vcpu_recycle.rs`; the
+below; `durable_concurrent_jit.rs`) and **4A.6 / 4A.7** (`temen-durable/tests/vcpu_recycle.rs`; the
 `Blocking` fail-closed, both backends) — details in the *"Phase 4 Slice A.5 — per-context
 shadow-SP"* follow-up notes below.
 
@@ -1528,7 +1528,7 @@ SP, never a global one.
   a deterministic trigger; `request_freeze` round-trip; cross-backend.
 
 **Progress (stage i).** *Landed:* (a) the `durable.shadow_base` IR op + a runtime-private per-OS-thread
-register (`svm-jit`'s `durable_shadow`, the interp's `run_inner`), mirroring `vcpu.tls.get` but with no
+register (`temen-jit`'s `durable_shadow`, the interp's `run_inner`), mirroring `vcpu.tls.get` but with no
 guest write op; (b) a **byte-identical bridge** — the durable transform reads the active context's
 shadow-SP **word address** from that register at all four SP sites (dispatch / unwind check / unwind
 spill / arm) instead of `ConstI64(SHADOW_SP_OFF)`, with the register still resolving to the shared
@@ -1545,7 +1545,7 @@ original site map is retained below for reference:
 - **Layout.** Put each context's SP word at **`shadow_region_base(ctx) + 0`** (the region's first 8
   bytes); frames follow at `+ 8`, so `SHADOW_SP_OFF` (global offset 8) is retired. The transform is
   layout-agnostic: `durable.shadow_base` returns `shadow_region_base(active ctx)` and the SP word is at
-  `+0`, so no within-region stride constant leaks into `svm-durable`. Empty extent = `region_base + 8`.
+  `+0`, so no within-region stride constant leaks into `temen-durable`. Empty extent = `region_base + 8`.
 - **Register value.** Flip `durable.shadow_base` from `SHADOW_SP_OFF` to `shadow_region_base(active
   ctx)`. *Interp:* resolve in `run_inner` from `(cur == ROOT_FIBER ? vcpu_ctx : cur + 1)` (both in
   scope) — no seed needed. *JIT:* `durable_shadow::seed(region_base)` at each point the active context
@@ -1560,7 +1560,7 @@ original site map is retained below for reference:
   `root_shadow_sp` 538, `thaw_root_sp` lib.rs 2395, `os_thread_rt` 825), and the **"spilled?" extent
   checks** (e.g. `fiber_rt` `flat_sp > fiber_region_base(slot)` → `+ 8`).
 - **Helpers / format.** `init_durable_window` writes the root SP word at `window[SHADOW_BASE] =
-  SHADOW_BASE + 8` (offset 8 unused). `svm-snapshot`'s `SHADOW_BASE` residue defaults (root_sp, the
+  SHADOW_BASE + 8` (offset 8 unused). `temen-snapshot`'s `SHADOW_BASE` residue defaults (root_sp, the
   empty-section path) → `SHADOW_BASE + 8`. Bump `FORMAT_VERSION` 4 → 5. Guard with the `durable_jit`
   cross-backend fuzz (byte-identical interp↔JIT) — the all-or-nothing oracle for this step.
 
@@ -1573,7 +1573,7 @@ register and, on a freeze-unwind (UNWINDING + spilled past its frame base), reco
 barrier's serialization unnecessary, so each child's freeze-unwind simply completes its OS thread and
 `join_all` blocks until all have; the concurrent residue is then drained (after the join) so the
 snapshot sees a fully-quiesced window. The quiesce barrier is retained as a loom-verified primitive.
-Pinned by `crates/svm/tests/durable_concurrent_jit.rs`: a root + two children all freeze mid-loop under
+Pinned by `crates/temen/tests/durable_concurrent_jit.rs`: a root + two children all freeze mid-loop under
 an async `request_freeze` and the thaw reproduces the result (each total in its own guest-memory slot, so
 the round-trip is robust to which context froze when). The tests use a **spawn-before-freeze handshake**
 (the root signals via a host fn once children are spawned; the controller requests the freeze only then)
@@ -1814,8 +1814,8 @@ sequenced slice:
      guest handle is `(generation << FIBER_GEN_SHIFT) | slot` (slot in the low 16 bits, since
      `MAX_FIBERS = 1<<16`); `cont.resume`'s `claim` rejects a generation mismatch. All generations are 0
      until step 3, so a handle is exactly its slot — byte-identical to before and to the JIT. Pinned by
-     `svm-durable/tests/fiber.rs::forged_fiber_generation_is_rejected`. Cross-backend parity unaffected.
-   - **[~] JIT side done.** `svm-jit`'s `fiber_rt` `cont.new` now emits `(generation << FIBER_GEN_SHIFT)
+     `temen-durable/tests/fiber.rs::forged_fiber_generation_is_rejected`. Cross-backend parity unaffected.
+   - **[~] JIT side done.** `temen-jit`'s `fiber_rt` `cont.new` now emits `(generation << FIBER_GEN_SHIFT)
      | slot` (`generation()` of the fresh slot — 0) and `cont.resume` claims via the new generation-
      checked `Ownership::claim_gen(handle_gen)` instead of `claim` (which read the generation from the
      current word and so couldn't reject a stale handle). Behavior-preserving at generation 0
@@ -1839,7 +1839,7 @@ sequenced slice:
    one uleb per fiber), and `seed_frozen` re-seeds at it (interp `gens[slot]`, JIT
    `Ownership::new_owned_at`) — so a thaw of a recycled fiber re-establishes the generation its guest
    handle expects. With the **mid-run freeze trigger** now in place (below), this is exercised end-to-end:
-   `svm-snapshot/tests/roundtrip.rs::recycled_fiber_freeze_serialize_restore_thaw_through_the_codec`
+   `temen-snapshot/tests/roundtrip.rs::recycled_fiber_freeze_serialize_restore_thaw_through_the_codec`
    recycles slot 0 (fiber A finishes → generation 1), parks fiber B there, freezes mid-run, and confirms
    B is flattened + re-seeded at generation 1 and the thaw round-trips (also pinned at the codec leg by
    `fiber_residue_generation_round_trips_through_the_codec`). The JIT leg now matches (step 4): both
@@ -1859,7 +1859,7 @@ sequenced slice:
    slice, now done; see "vCPU-context recycling" under slice 3.2.2 above.)*
 4. **[x] Cross-backend parity + fuzz — done.** The recycled freeze/thaw leg is exercised on both
    backends, both hand-written and **fuzzed**:
-   - *Pinned:* `svm/tests/durable_fibers_jit.rs::jit_and_interp_freeze_a_recycled_fiber_identically_and_thaw_on_the_jit`
+   - *Pinned:* `temen/tests/durable_fibers_jit.rs::jit_and_interp_freeze_a_recycled_fiber_identically_and_thaw_on_the_jit`
      arms both backends to freeze a recycled (generation 1) parked fiber at the same safepoint,
      confirms a **byte-identical durable reserve + residue**, and **thaws the artifact on the JIT**.
    - *Fuzzed:* a recycling-churn generator (`durgen::gen_recycle_fiber_module` — recycle a slot 1..=3
@@ -1891,7 +1891,7 @@ choke), a cap.call freeze is already reachable at the first safepoint, and the p
 covers general mid-run freeze. This also models that production path (an async controller flipping
 `UNWINDING` from another OS thread, picked up at the next poll — the existing mechanism already handles
 that; what was missing was a *deterministic single-threaded* way to test it). Constants are cross-checked
-in `layout_abi.rs`; placement is pinned by `svm-durable/tests/freeze_trigger.rs` (arm-after-N freezes
+in `layout_abi.rs`; placement is pinned by `temen-durable/tests/freeze_trigger.rs` (arm-after-N freezes
 after exactly N fiber safepoints; arming past the last runs to completion; an unarmed run is untouched).
 Note this is the **deterministic test trigger**, not the bounded-latency STW story (Phase 4's back-edge
 polls + `Blocking.work` cancellation — see the latency caveat); a poll-free compute loop still won't
@@ -1914,10 +1914,10 @@ recycles — unreachable in practice (centuries even at 10⁶ finishes/s).
 
 The change is a type-system change anchored at the verifier (`cont.new` yields `i64`; `cont.resume`'s
 handle operand is `i64`; the `status` result stays `i32`), mirrored through **three** value-type
-copies — `svm-verify`, the `svm-durable` transform's own `result_types` (used to spill/reload the
+copies — `temen-verify`, the `temen-durable` transform's own `result_types` (used to spill/reload the
 handle across suspends), and both backends' runtime/codegen — plus the `FIBER_GEN_MASK` /
 `FIBER_HANDLE_GEN_MASK` widening (interp + JIT), the `FrozenFiber.generation` field (`u32`→`u64`), and
-the C/LLVM on-ramps (`int64_t` handle; chibicc widens the resume handle, mirroring svm-llvm
+the C/LLVM on-ramps (`int64_t` handle; chibicc widens the resume handle, mirroring temen-llvm
 `operand_i64`). **Snapshot format bumped to v3:** the residue generation alone is wire-compatible
 (`uleb`), but a handle held live across a suspend now spills **8** bytes in the shadow stack instead of
 4 — the window-image layout changed, so a v2 artifact would mis-thaw and is rejected. Covered by the
@@ -1936,7 +1936,7 @@ each a small reviewable commit on the interpreter only:
    i*SHADOW_STRIDE, +SHADOW_STRIDE)` within `[0, DURABLE_RESERVE)` (root = context 0; fiber
    slot `s` = context `s+1`). The *active* shadow-SP stays at the fixed `SHADOW_SP_OFF`, and
    the **interpreter's `cont.*` execution** save/restores it to/from a per-context saved slot
-   on every fiber switch (`shadow_switch` in `svm-interp`, called from the `cont.resume`,
+   on every fiber switch (`shadow_switch` in `temen-interp`, called from the `cont.resume`,
    `suspend`, and fiber base-frame `Return` arms); `cont.new` assigns the new fiber's region
    (refusing — clean `FiberFault` — if the reserve is full). A non-running context's saved-SP
    lives host-side (the root's on `VCpu::root_shadow_sp`, a fiber's in the registry's parallel
@@ -1953,14 +1953,14 @@ each a small reviewable commit on the interpreter only:
    transform simple, and costs only that the JIT must replicate the ~3-site swap in its own
    fiber-switch path in 3.3 (guarded by the cross-backend artifact-equality property). Cost
    acknowledged: the layout constants (`SHADOW_SP_OFF`/`SHADOW_BASE`/`DURABLE_RESERVE`) are
-   now duplicated across the TCB `svm-interp` and tooling `svm-durable` — cross-checked by
-   `svm-durable/tests/layout_abi.rs` so they can't drift.
+   now duplicated across the TCB `temen-interp` and tooling `temen-durable` — cross-checked by
+   `temen-durable/tests/layout_abi.rs` so they can't drift.
 
    Gated on a domain-level `Host::set_durable` flag (propagated to every vCPU by `drive`), so
    a non-durable fiber run never touches the reserve. Tests: existing single-vCPU durable
-   tests still pass (root = context 0); `svm/tests/durable_fibers.rs` proves two fibers get
+   tests still pass (root = context 0); `temen/tests/durable_fibers.rs` proves two fibers get
    **distinct** regions (a host-fn probes the active shadow-SP from inside each context) and
-   that a non-durable run leaves the reserve untouched. *Touched only `svm-interp` (the swap +
+   that a non-durable run leaves the reserve untouched. *Touched only `temen-interp` (the swap +
    region tracking) — the transform is unchanged.* **Open sub-question deferred:** the
    transform's shadow-overflow guard still trips at the global `DURABLE_RESERVE`, not a
    per-region bound, so a fiber recursed past `SHADOW_STRIDE` could grow into a neighbor's
@@ -1970,7 +1970,7 @@ each a small reviewable commit on the interpreter only:
    re-issue, but emits `Inst::ContResume { k, arg }` (operands reloaded from the spilled slots —
    `used[k]/used[arg]` already mark them) and threads its **two** results `(status, value)` into
    the continuation; the fail-closed trap arm now applies to `Yield` only. *Touched only
-   `svm-durable`.* Tested structurally (`svm-durable/tests/fiber.rs`): the instrumented module
+   `temen-durable`.* Tested structurally (`temen-durable/tests/fiber.rs`): the instrumented module
    verifies, stays NORMAL-inert, and gains one re-issued `cont.resume` per resume point while
    `suspend` gains none (its arm is still a bare `Unreachable`). **A full thaw that re-enters a
    suspended fiber is not yet exercisable** — the re-issued resume reconstructs the fiber via the
@@ -1986,7 +1986,7 @@ each a small reviewable commit on the interpreter only:
    frozen frame), **not** in the resumer's `Resume` arm — so the resumer regains control already
    in NORMAL. *Turned out transform-only:* the interp's existing `Suspend` handler re-parks via
    the registry, and the 3.1.1 shadow-SP swap routes the SP, so no `RegFiber` change was needed.
-   Tested structurally (`svm-durable/tests/fiber.rs`): both fiber arms now re-issue their op and
+   Tested structurally (`temen-durable/tests/fiber.rs`): both fiber arms now re-issue their op and
    the only `Unreachable` blocks left are the per-function forged-id TRAPs. **End-to-end thaw
    still needs 3.1.4–5** (a parked fiber's continuation isn't captured until the freeze driver
    flattens it into its shadow stack and the snapshot records its metadata).
@@ -2003,27 +2003,27 @@ each a small reviewable commit on the interpreter only:
    The existing capture entry point then snapshots a window that already includes the flattened
    fibers. *Host-side driver, not escape-TCB; single-vCPU (3.1) — a fiber still on an active resume
    chain at freeze, and multi-vCPU STW, are 3.1.5/3.2 follow-ups.* Tested
-   (`svm-durable/tests/fiber.rs`): a parked fiber lands a frame in its **own** region (distinct
+   (`temen-durable/tests/fiber.rs`): a parked fiber lands a frame in its **own** region (distinct
    from the root's) and unwinds **at its suspend point** (resume id 1) — a precise zero-forward-progress check.
 
 5. **[DONE (interp round-trip); snapshot codec follow-up] End-to-end test + fiber residue.** The
-   freeze driver records each flattened fiber as a `svm_interp::FrozenFiber` (slot, entry funcref,
+   freeze driver records each flattened fiber as a `temen_interp::FrozenFiber` (slot, entry funcref,
    data-sp, shadow-SP) and hands it back through the `Host`; `freeze_drive` leaves the active
    shadow-SP at the **root's** region so the captured window is thaw-ready. A thaw re-seeds the
    registry (`drive` recreates each as a `Pending` fiber at its dense slot, with its shadow-SP in
    the `shadow` table) and re-enters the root under `REWINDING`: the resumer re-issues
    `cont.resume`, the seeded fiber re-runs its entry → rewinds → re-parks, then forward execution
-   completes. `svm-durable/tests/fiber.rs::single_fiber_freeze_thaw_round_trips` proves `freeze →
+   completes. `temen-durable/tests/fiber.rs::single_fiber_freeze_thaw_round_trips` proves `freeze →
    (window + residue) → thaw ≡ uninterrupted` (107), and the `durable_fuzz` fiber property fuzzes
    it over a generated root+fiber space (varying suspend counts, live-across-suspend values,
    multi-point resume/suspend). The byte-level **Section-2 codec** (below) carries the residue
    through the real artifact too.
 
-   **[DONE] Section-2 codec.** `svm-snapshot` now carries the fiber residue: `freeze` writes a TLV
+   **[DONE] Section-2 codec.** `temen-snapshot` now carries the fiber residue: `freeze` writes a TLV
    control section (tag 2) of `(slot, funcref, sp, shadow_sp)` per fiber — ascending slot,
    header `fiber_count`-gated, **elided when there are no fibers** so the no-fiber artifact is
    byte-identical to the pre-fiber format — and `restore` decodes it and re-seeds the `Host`
-   (`set_frozen_fibers`). `svm-snapshot/tests/roundtrip.rs::fiber_freeze_serialize_restore_thaw_through_the_codec`
+   (`set_frozen_fibers`). `temen-snapshot/tests/roundtrip.rs::fiber_freeze_serialize_restore_thaw_through_the_codec`
    drives the full round-trip through the **serialized artifact** (107) and the §12.6 canonical
    re-serialize invariant. (Per-fiber `generation` is deferred with the JIT shared-registry
    recycling work; interp slots aren't recycled, so slot alone keys the handle today.)
@@ -2127,7 +2127,7 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
    (`Scheduler::purge_fiber_wait_park`) and an inert `i32 0` status pushed — the
    `MemoryWait` point spills `out − nres`, so the placeholder is never captured and the
    thaw arm re-issues the wait against the restored cell. Round-trip pinned in
-   `svm-durable/tests/fiber.rs`: the unwoken-park freeze→thaw re-issues the wait, which
+   `temen-durable/tests/fiber.rs`: the unwoken-park freeze→thaw re-issues the wait, which
    re-parks and re-derives its waiter entry, and the replayed store+notify complete it
    identically to the uninterrupted run; the woken branch and the cap-park refusal are
    pinned freeze-side. One step-3 note from the woken-branch analysis: re-entering a
@@ -2140,14 +2140,14 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
    **BUILT 2026-07-24** (the trio): snapshot v13 adds a `TAG_SERVE` section (after the handle
    table) carrying the inbound queue (FIFO), the completion cells (canonical ascending
    ticket), and the ticket counter — read/written through `Host::{svc_state, set_svc_state}`,
-   elided when empty, round-trip + §12.6 re-freeze pinned in `svm-snapshot`. The per-consumer
+   elided when empty, round-trip + §12.6 re-freeze pinned in `temen-snapshot`. The per-consumer
    fields turned out to need **no capture at a legal freeze point**: a parked consumer's
    `serve_count` is provably 0 (the wait parks only when the queue is drained *and* the count
    was handed back) and its `serve_run` is `None` — and a freeze that lands **mid-handler**
    now fails closed at the serve epilogue (under `UNWINDING` the handler's exit is an unwind
    return whose `(FIBER_RETURNED, 0)` would have settled a *bogus zero* into the caller's
    completion cell — a silent-corruption hole this step closes; pinned in
-   `svm-durable/tests/serve.rs`). The `serve_run` reply-linkage record stays step 4, where
+   `temen-durable/tests/serve.rs`). The `serve_run` reply-linkage record stays step 4, where
    mid-handler freezes become capturable instead of refused.
 4. **Subtree thaw wiring** — restore hosts, re-link `LiveImplEntry` callees by `DomainId`,
    re-park callers (race-check against restored cells), mark `svc.wait` consumers runnable.
@@ -2169,9 +2169,9 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
    `NORMAL` (the mid-handler gate guarantees the serve point is the deepest frozen frame),
    reloads handle + args, and re-executes: the drain runs against the *restored* queue — an
    empty one re-parks `svc.wait` exactly as an uninterrupted run would ("thaw marks them
-   runnable" via re-execution, no waiter capture). Pinned in `svm-durable/tests/serve.rs`
+   runnable" via re-execution, no waiter capture). Pinned in `temen-durable/tests/serve.rs`
    (in-memory round trip + the op-number cross-crate pin) and
-   `svm-snapshot/tests/roundtrip.rs` (the full artifact: freeze at the serve point →
+   `temen-snapshot/tests/roundtrip.rs` (the full artifact: freeze at the serve point →
    restore → thaw drains the restored dispatch, completion cell fills). Remaining in step 4:
    multi-domain subtree wiring — restore *hosts* plural, `LiveImplEntry` re-link by
    `DomainId`, caller re-parks with the settle race-check.
@@ -2234,7 +2234,7 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
      window — a direct write is clobbered by that swap) and re-admits it. The re-executed
      `svc.wait` takes the 4b sentinel and unwinds, so the domain freezes with its (empty)
      serve trio in the v13 section instead of the run hanging. One-shot. Pinned in
-     `svm-durable/tests/serve.rs` (`an_idle_server_freezes_on_quiesce_and_thaws_still_serving`):
+     `temen-durable/tests/serve.rs` (`an_idle_server_freezes_on_quiesce_and_thaws_still_serving`):
      freeze a root server idle in its accept loop → thaw with a dispatch seeded into the
      restored queue → the re-issued `svc.wait` drains and serves it (handler reply + count),
      the flagship end to end.
@@ -2248,7 +2248,7 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
      drain walks `svc_waiters` in `domain_id` order — root first — so the root freezes first
      and records the still-running child as a re-attach `FrozenNested` (`completed=None`),
      then the child's own 4c self-unwind records its `FrozenChildState`; the two stay
-     `(parent_task, slot)`-consistent. Pinned in `svm-durable/tests/serve.rs`
+     `(parent_task, slot)`-consistent. Pinned in `temen-durable/tests/serve.rs`
      (`a_nested_two_server_subtree_freezes_on_quiesce_and_thaws_still_serving`): freeze →
      thaw (runtime re-creates the child, seeds its host from the residue, rewinds it to its
      `svc.wait` arm) → re-arm freeze-on-quiesce → the thawed subtree re-parks both servers
@@ -2266,7 +2266,7 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
      re-link (the callee host doesn't exist yet); the thaw's nested re-creation collects each
      direct child's host by join slot and `relink_live_impl`s the placeholder to it,
      re-fetching the offer shape from the re-created child's module. Pinned in
-     `svm-snapshot/tests/roundtrip.rs`
+     `temen-snapshot/tests/roundtrip.rs`
      (`a_supervisor_holding_a_live_cap_freezes_and_thaws_with_the_cap_relinked`): a supervisor
      mints a cap over a child server's `echo`, parks in `svc.wait` holding it, freezes on
      quiesce (was `ThreadFault` pre-4d), and after thaw calls `echo(7)` through the re-linked
@@ -2285,7 +2285,7 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
      its serve module** and could not dispatch (`-EINVAL`/`EAGAIN` at the first offer call).
      One line at the spawn (`child.parent_task = <spawning vCPU id>`) fixes it; direct children
      are unchanged (root id is `0`). Pinned by
-     `svm-durable/tests/serve.rs::a_three_level_nested_server_subtree_keys_the_grandchild_serve_state_to_its_real_parent`
+     `temen-durable/tests/serve.rs::a_three_level_nested_server_subtree_keys_the_grandchild_serve_state_to_its_real_parent`
      (freeze → thaw → re-freeze; the grandchild's serve state is attributed to C1, not the root,
      at every step — the assertion fails without the fix).
    * **Nested-holder re-link — BUILT 2026-07-28.** With the depth-2 keying fixed and the
@@ -2295,7 +2295,7 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
      `(holder task, join slot)` edge (root-direct children key on `(id, slot)`, a grandchild on
      `(its parent-child cid, slot)`). A child C1's durable cap onto a grandchild C2 now re-links
      on thaw. Pinned end to end by
-     `svm-durable/tests/serve.rs::a_nested_holder_freezes_and_thaws_with_the_grandchild_cap_relinked`:
+     `temen-durable/tests/serve.rs::a_nested_holder_freezes_and_thaws_with_the_grandchild_cap_relinked`:
      freeze the three-level cap-holding subtree, thaw, seed the root's queue, and the root drives
      `fwd(7) → C1 forwards leaf(7)` through the re-linked grandchild cap → **107** (fails with
      `-11`/`EAGAIN` without the generalization). **Still open:** the wire/child-regrant
@@ -2315,7 +2315,7 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
    (`serving_freeze_serialize_restore_thaw_through_the_codec`) captures the in-flight
    dispatch in the v13 serve trio and the thaw's re-issued serve op drains it *exactly once*
    (served-once), and the new guard
-   (`a_completed_cross_cut_dispatch_is_not_resurrected_on_refreeze`, `svm-snapshot/tests/
+   (`a_completed_cross_cut_dispatch_is_not_resurrected_on_refreeze`, `temen-snapshot/tests/
    roundtrip.rs`) pins the other half — a *completed* boundary call is **not resurrected**:
    thaw → serve → re-freeze → restore yields an empty queue (no re-dispatch) and the delivered
    result **reloads** from the completion cell rather than re-issuing (R8/R11 at the serve
@@ -2349,4 +2349,4 @@ refusing the freeze, exactly as `has_blocked_parks` does today.
 > Rejected: host-side frame capture (per-arch unsafe, outside the differential
 > oracle) and CRIU-lite (same-binary only). The confinement-masking lowering stays the
 > escape hinge (D38); the codec pass adds +0 TCB, the page+prot restore path adds a
-> small escape-TCB surface in `svm-mem`; non-durable modules pay nothing.
+> small escape-TCB surface in `temen-mem`; non-durable modules pay nothing.

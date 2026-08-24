@@ -1,10 +1,10 @@
-// Minimal POSIX <semaphore.h> for the SVM sandbox target — a counting semaphore over the same
+// Minimal POSIX <semaphore.h> for the Temen sandbox target — a counting semaphore over the same
 // 32-bit atomics + `wait`/`notify` futex the <pthread.h> mutex/cond/barrier are built on
 // (DESIGN §12/D56: the VM ships primitives, the libc is policy). Unnamed, in-process semaphores
 // only (`pshared` is meaningless in a single shared window and is ignored); `sem_open`/named
 // semaphores and `sem_timedwait` are out of scope until programs demand them.
-#ifndef __SVM_SEMAPHORE_H
-#define __SVM_SEMAPHORE_H
+#ifndef __TEMEN_SEMAPHORE_H
+#define __TEMEN_SEMAPHORE_H
 
 #include <pthread.h> // the __vm_* primitive declarations
 
@@ -55,4 +55,4 @@ static int sem_getvalue(sem_t *s, int *sval) {
   return 0;
 }
 
-#endif // __SVM_SEMAPHORE_H
+#endif // __TEMEN_SEMAPHORE_H

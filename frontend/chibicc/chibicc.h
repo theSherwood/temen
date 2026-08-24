@@ -423,7 +423,7 @@ void codegen(Obj *prog, FILE *out);
 int align_to(int n, int align);
 
 //
-// codegen_ir.c — SVM text IR backend (DESIGN.md §3d)
+// codegen_ir.c — Temen text IR backend (DESIGN.md §3d)
 //
 
 void codegen_ir(Obj *prog, FILE *out);

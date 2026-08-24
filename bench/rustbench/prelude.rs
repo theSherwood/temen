@@ -1,6 +1,6 @@
 // Shared no_std prelude prepended to every workload by the `rustbench` driver. It gives real heap
 // data structures (Vec/BTreeMap/…) with a bump `#[global_allocator]` and ZERO libc surface — the
-// property that lets a real Rust program compile cleanly to svm-jit (LP64 bitcode), Wasmtime
+// property that lets a real Rust program compile cleanly to temen-jit (LP64 bitcode), Wasmtime
 // (wasm32/wasm64), and native, with no shim assembly. Each workload exports `run(n) -> i64` and
 // calls `reset_arena()` first so the bump allocator is fresh per call (runs are timed many times).
 #![no_std]
@@ -12,7 +12,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
 
-// 32 MiB arena — bounds the svm guest window (larger risks "window too large" for the JIT) and is
+// 32 MiB arena — bounds the temen guest window (larger risks "window too large" for the JIT) and is
 // ample for these workloads, which reset it every `run`.
 const ARENA: usize = 32 * 1024 * 1024;
 static mut HEAP: [u8; ARENA] = [0; ARENA];
@@ -41,7 +41,7 @@ fn ph(_: &core::panic::PanicInfo) -> ! {
 
 // The native-lane staticlib links precompiled `alloc` (built with unwind), which references the
 // personality even under `panic=abort`; it is never called, so a stub satisfies the linker. Harmless
-// (unused) on the svm/wasm lanes.
+// (unused) on the temen/wasm lanes.
 #[no_mangle]
 pub extern "C" fn rust_eh_personality() {}
 

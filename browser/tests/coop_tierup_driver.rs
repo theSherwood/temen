@@ -1,6 +1,6 @@
-//! **Cooperative on-ramp tier-up** (#926 slice 2) — the native differential for the `svm_coop_*`
+//! **Cooperative on-ramp tier-up** (#926 slice 2) — the native differential for the `temen_coop_*`
 //! event-pump FFI. A genuinely threaded on-ramp guest (its `_start` `thread.spawn`s a worker, so the
-//! single-vCPU `svm_onramp_tierup_*` driver would *decline* it at the spawn event) must run observably
+//! single-vCPU `temen_onramp_tierup_*` driver would *decline* it at the spawn event) must run observably
 //! identical to the plain bytecode path (`onramp_exec`, INVARIANTS.md #9) when its hot leaf is serviced
 //! on the emitted wasm — with wasmi playing the browser's JS host (`driveCoopTierupRun`). The
 //! cooperative driver multiplexes the root and the worker on one wasm thread and tiers up **both**
@@ -8,24 +8,25 @@
 //!
 //! This proves the cooperative-driver FFI wiring end-to-end: open → pump → service → deliver → capture,
 //! over a thread topology the single-vCPU pump cannot run at all. The engine seam itself (multi-task
-//! resumable tier-up + `deliver` routing) is pinned natively in `svm-interp/tests/coop_tierup.rs`.
+//! resumable tier-up + `deliver` routing) is pinned natively in `temen-interp/tests/coop_tierup.rs`.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use svm_browser::{
-    onramp_exec, svm_coop_argv_len, svm_coop_argv_ptr, svm_coop_call_interp, svm_coop_close,
-    svm_coop_deliver, svm_coop_deliver_jit, svm_coop_deliver_jit_trap, svm_coop_deliver_trap,
-    svm_coop_func, svm_coop_jit_code, svm_coop_jit_param_types_ptr, svm_coop_jit_result_types_len,
-    svm_coop_jit_result_types_ptr, svm_coop_jit_wasm_by_handle_len,
-    svm_coop_jit_wasm_by_handle_ptr, svm_coop_jit_wasm_len, svm_coop_jit_wasm_ptr, svm_coop_mapped,
-    svm_coop_mapped_now, svm_coop_nfuncs, svm_coop_open, svm_coop_paged, svm_coop_pagestate_len,
-    svm_coop_pagestate_ptr, svm_coop_run, svm_coop_shim_ptr, svm_coop_shim_wasm,
-    svm_coop_slot_code, svm_coop_table_gen, svm_coop_table_log2, svm_coop_value, svm_coop_wasm_len,
-    svm_coop_wasm_ptr, svm_coop_win_len, svm_coop_win_ptr, svm_run_value, svm_status,
-    svm_stdout_len, svm_stdout_ptr, COOP_RUN_DONE, COOP_RUN_JIT_INVOKE, COOP_RUN_TIERUP,
+use temen_browser::{
+    onramp_exec, temen_coop_argv_len, temen_coop_argv_ptr, temen_coop_call_interp,
+    temen_coop_close, temen_coop_deliver, temen_coop_deliver_jit, temen_coop_deliver_jit_trap,
+    temen_coop_deliver_trap, temen_coop_func, temen_coop_jit_code, temen_coop_jit_param_types_ptr,
+    temen_coop_jit_result_types_len, temen_coop_jit_result_types_ptr,
+    temen_coop_jit_wasm_by_handle_len, temen_coop_jit_wasm_by_handle_ptr, temen_coop_jit_wasm_len,
+    temen_coop_jit_wasm_ptr, temen_coop_mapped, temen_coop_mapped_now, temen_coop_nfuncs,
+    temen_coop_open, temen_coop_paged, temen_coop_pagestate_len, temen_coop_pagestate_ptr,
+    temen_coop_run, temen_coop_shim_ptr, temen_coop_shim_wasm, temen_coop_slot_code,
+    temen_coop_table_gen, temen_coop_table_log2, temen_coop_value, temen_coop_wasm_len,
+    temen_coop_wasm_ptr, temen_coop_win_len, temen_coop_win_ptr, temen_run_value, temen_status,
+    temen_stdout_len, temen_stdout_ptr, COOP_RUN_DONE, COOP_RUN_JIT_INVOKE, COOP_RUN_TIERUP,
     COOP_RUN_TRAP, STATUS_OK, STATUS_TRAP, STATUS_UNSUPPORTED,
 };
-use svm_interp::{Host, StreamRole};
+use temen_interp::{Host, StreamRole};
 use wasmi::{
     Caller, Engine, Func, FuncRef, Instance, Linker, Memory, MemoryType, Module as WModule, Store,
     Table, TableType, Val,
@@ -107,12 +108,12 @@ export 0 func "_start" 0
 fn service_coop_on_wasmi(n_results: usize) -> Option<Vec<i64>> {
     // SAFETY: the paused task is parked inside the TIERUP event; the session stash (wasm, argv,
     // window) is stable until the deliver call, and this thread is the only accessor (FFI_LOCK).
-    let wasm = unsafe { std::slice::from_raw_parts(svm_coop_wasm_ptr(), svm_coop_wasm_len()) };
-    let func = svm_coop_func();
-    let argv = unsafe { std::slice::from_raw_parts(svm_coop_argv_ptr(), svm_coop_argv_len()) };
-    let win_len = svm_coop_win_len();
-    let win_ptr = svm_coop_win_ptr() as *mut u8;
-    let mapped = svm_coop_mapped();
+    let wasm = unsafe { std::slice::from_raw_parts(temen_coop_wasm_ptr(), temen_coop_wasm_len()) };
+    let func = temen_coop_func();
+    let argv = unsafe { std::slice::from_raw_parts(temen_coop_argv_ptr(), temen_coop_argv_len()) };
+    let win_len = temen_coop_win_len();
+    let win_ptr = temen_coop_win_ptr() as *mut u8;
+    let mapped = temen_coop_mapped();
 
     let engine = Engine::default();
     let module = WModule::new(&engine, wasm).expect("emitted wasm must validate");
@@ -231,9 +232,9 @@ block 0 (v0: i64) {{
 }}
 "#
     );
-    let m = svm_text::parse_module(&src).expect("unit parse");
-    svm_verify::verify_module(&m).expect("unit verify");
-    svm_encode::encode_module(&m)
+    let m = temen_text::parse_module(&src).expect("unit parse");
+    temen_verify::verify_module(&m).expect("unit verify");
+    temen_encode::encode_module(&m)
 }
 
 /// A **threaded** `vm_jit_*` guest (the JACL-with-runtime-threads shape): `_start` (the root vCPU)
@@ -303,8 +304,8 @@ fn run_emitted_coop(
     mapped: i64,
     n_results: usize,
 ) -> Option<Vec<i64>> {
-    let win_len = svm_coop_win_len();
-    let win_ptr = svm_coop_win_ptr() as *mut u8;
+    let win_len = temen_coop_win_len();
+    let win_ptr = temen_coop_win_ptr() as *mut u8;
     let engine = Engine::default();
     let module = WModule::new(&engine, wasm).expect("emitted wasm must validate");
     let mut store: Store<i32> = Store::new(&engine, 0);
@@ -381,18 +382,18 @@ fn run_emitted_coop(
 fn service_coop_jit_on_wasmi(n_results: usize) -> Option<Vec<i64>> {
     // SAFETY: the JIT_INVOKE operand stash is stable until deliver; only accessor (FFI_LOCK).
     let wasm =
-        unsafe { std::slice::from_raw_parts(svm_coop_jit_wasm_ptr(), svm_coop_jit_wasm_len()) };
-    let argv =
-        unsafe { std::slice::from_raw_parts(svm_coop_argv_ptr(), svm_coop_argv_len()) }.to_vec();
-    run_emitted_coop(wasm, "f0", &argv, svm_coop_mapped(), n_results)
+        unsafe { std::slice::from_raw_parts(temen_coop_jit_wasm_ptr(), temen_coop_jit_wasm_len()) };
+    let argv = unsafe { std::slice::from_raw_parts(temen_coop_argv_ptr(), temen_coop_argv_len()) }
+        .to_vec();
+    run_emitted_coop(wasm, "f0", &argv, temen_coop_mapped(), n_results)
 }
 
 #[test]
 fn coop_jit_invoke_pump_matches_the_bytecode_oracle() {
     let _g = FFI_LOCK.lock().unwrap();
-    let m = svm_text::parse_module(&coop_jit_guest_text(&unit_blob())).expect("parse");
-    svm_verify::verify_module(&m).expect("verify");
-    let bytes = svm_encode::encode_module(&m);
+    let m = temen_text::parse_module(&coop_jit_guest_text(&unit_blob())).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
 
     // The oracle services the invoke interpreted; the pump runs the unit on emitted wasm.
     let want = onramp_exec(&m, b"");
@@ -403,36 +404,36 @@ fn coop_jit_invoke_pump_matches_the_bytecode_oracle() {
         "oracle: worker 0 + unit(probe) = probe + UNIT_K, through the grown page"
     );
 
-    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
     assert_eq!(
         opened,
         0,
         "open must admit the threaded vm_jit_* guest (no eligible leaf, jit importer) (status {})",
-        svm_status()
+        temen_status()
     );
 
     let mut jit_invokes = 0u32;
     loop {
-        match svm_coop_run() {
+        match temen_coop_run() {
             COOP_RUN_JIT_INVOKE => {
                 jit_invokes += 1;
                 assert!(jit_invokes < 50, "runaway invokes");
                 // #717: the event's committed extent is the grown window (a declared-only bound would
                 // refuse the unit's probe store and diverge from the oracle).
                 assert_eq!(
-                    svm_coop_mapped(),
+                    temen_coop_mapped(),
                     65536 + 16384,
                     "the JIT_INVOKE mapped operand carries the grown extent"
                 );
-                let n = svm_coop_jit_result_types_len();
+                let n = temen_coop_jit_result_types_len();
                 match service_coop_jit_on_wasmi(n) {
-                    Some(res) => svm_coop_deliver_jit(res.as_ptr(), res.len()),
-                    None => svm_coop_deliver_jit_trap(),
+                    Some(res) => temen_coop_deliver_jit(res.as_ptr(), res.len()),
+                    None => temen_coop_deliver_jit_trap(),
                 }
             }
             COOP_RUN_TIERUP => panic!("unexpected TIERUP from the leafless vm_jit_* guest"),
             COOP_RUN_DONE => break,
-            ev => panic!("unexpected pump event {ev} (status {})", svm_status()),
+            ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
         }
     }
     // Non-vacuity: the unit ran on its emitted wasm on the cooperative driver (which also multiplexed
@@ -442,21 +443,25 @@ fn coop_jit_invoke_pump_matches_the_bytecode_oracle() {
         "expected exactly one emitted Jit.invoke, got {jit_invokes}"
     );
 
-    assert_eq!(svm_status(), want.status, "status parity with the oracle");
-    assert_eq!(svm_coop_value(), want.value, "value parity with the oracle");
+    assert_eq!(temen_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        temen_coop_value(),
+        want.value,
+        "value parity with the oracle"
+    );
     // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
     let got_out =
-        unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
     assert_eq!(got_out, want.stdout, "stdout parity with the oracle");
-    svm_coop_close();
+    temen_coop_close();
 }
 
 #[test]
 fn coop_tierup_pump_matches_the_bytecode_oracle() {
     let _g = FFI_LOCK.lock().unwrap();
-    let m = svm_text::parse_module(&coop_guest_text()).expect("parse");
-    svm_verify::verify_module(&m).expect("verify");
-    let bytes = svm_encode::encode_module(&m);
+    let m = temen_text::parse_module(&coop_guest_text()).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
 
     // The oracle: the plain bytecode path the page falls back to today (multiplexes the threads
     // cooperatively on the interpreter — INVARIANTS.md #9).
@@ -470,29 +475,29 @@ fn coop_tierup_pump_matches_the_bytecode_oracle() {
     );
 
     // The cooperative tier-up pump under test.
-    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
     assert_eq!(
         opened,
         0,
         "open must accept the threaded eligible-leaf guest (status {})",
-        svm_status()
+        temen_status()
     );
 
     let n_results = m.funcs[2].results.len();
     let mut tierups = 0u32;
     loop {
-        match svm_coop_run() {
+        match temen_coop_run() {
             COOP_RUN_TIERUP => {
                 tierups += 1;
                 assert!(tierups < 50, "runaway tier-ups");
-                assert_eq!(svm_coop_func(), 2, "only the leaf (func 2) tiers up");
+                assert_eq!(temen_coop_func(), 2, "only the leaf (func 2) tiers up");
                 match service_coop_on_wasmi(n_results) {
-                    Some(res) => svm_coop_deliver(res.as_ptr(), res.len()),
-                    None => svm_coop_deliver_trap(),
+                    Some(res) => temen_coop_deliver(res.as_ptr(), res.len()),
+                    None => temen_coop_deliver_trap(),
                 }
             }
             COOP_RUN_DONE => break,
-            ev => panic!("unexpected pump event {ev} (status {})", svm_status()),
+            ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
         }
     }
     // Non-vacuity: exactly two tier-ups — the root's `call 2` and the worker's — proving the
@@ -503,24 +508,28 @@ fn coop_tierup_pump_matches_the_bytecode_oracle() {
         "expected 2 tier-ups (root + worker), got {tierups}"
     );
 
-    assert_eq!(svm_status(), want.status, "status parity with the oracle");
-    assert_eq!(svm_coop_value(), want.value, "value parity with the oracle");
+    assert_eq!(temen_status(), want.status, "status parity with the oracle");
     assert_eq!(
-        svm_run_value(),
+        temen_coop_value(),
         want.value,
-        "the page-facing `svm_run_value` slot is staged too"
+        "value parity with the oracle"
+    );
+    assert_eq!(
+        temen_run_value(),
+        want.value,
+        "the page-facing `temen_run_value` slot is staged too"
     );
     // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
     let got_out =
-        unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
     assert_eq!(got_out, want.stdout, "stdout parity with the oracle");
-    svm_coop_close();
+    temen_coop_close();
 }
 
 // ============================================================================================
 // #926 slice 2f: the B2 driver-table half — `call_indirect` tiers up on the cooperative path.
 // A persistent driver (the Rust twin of `driveCoopTierupRun`) with **one shared funcref table**
-// resynced from the engine's slot mirror (`svm_coop_nfuncs`/`svm_coop_slot_code`/…) at each event, so
+// resynced from the engine's slot mirror (`temen_coop_nfuncs`/`temen_coop_slot_code`/…) at each event, so
 // an emitted `call_indirect` dispatches natively (to a program `f{i}` or an installed unit's `f0`) or
 // through a bounce shim, exactly as the browser would. The single-shot analogue is `tierup_driver.rs`.
 // ============================================================================================
@@ -559,11 +568,11 @@ impl CoopB2Driver {
     fn new() -> CoopB2Driver {
         let engine = Engine::default();
         let mut store: Store<DriverData> = Store::new(&engine, DriverData::default());
-        let win_len = svm_coop_win_len();
+        let win_len = temen_coop_win_len();
         let pages = ((WIN_BASE as usize + win_len) as u32).div_ceil(1 << 16) + 1;
         let memory = Memory::new(&mut store, MemoryType::new(pages, None)).unwrap();
         store.data_mut().mem = Some(memory);
-        let tsize = 1u32 << svm_coop_table_log2();
+        let tsize = 1u32 << temen_coop_table_log2();
         let table = Table::new(
             &mut store,
             TableType::new(wasmi::core::ValType::FuncRef, tsize, Some(tsize)),
@@ -571,7 +580,7 @@ impl CoopB2Driver {
         )
         .unwrap();
         let main_wasm =
-            unsafe { std::slice::from_raw_parts(svm_coop_wasm_ptr(), svm_coop_wasm_len()) }
+            unsafe { std::slice::from_raw_parts(temen_coop_wasm_ptr(), temen_coop_wasm_len()) }
                 .to_vec();
         let mut d = CoopB2Driver {
             store,
@@ -610,7 +619,7 @@ impl CoopB2Driver {
                       args_ptr: i32|
                       -> Result<(), wasmi::Error> {
                     let mem = c.data().mem.unwrap();
-                    let win_ptr = svm_coop_win_ptr() as *mut u8;
+                    let win_ptr = temen_coop_win_ptr() as *mut u8;
                     // Make the emitted frames' window writes visible to the engine before the callback.
                     let mut w = vec![0u8; win_len];
                     mem.read(&c, WIN_BASE as usize, &mut w).unwrap();
@@ -618,22 +627,22 @@ impl CoopB2Driver {
                     unsafe { std::slice::from_raw_parts_mut(win_ptr, win_len) }.copy_from_slice(&w);
                     let mut slots = [0u8; 512];
                     mem.read(&c, args_ptr as usize, &mut slots).unwrap();
-                    let rc = svm_coop_call_interp(target as u32, slots.as_mut_ptr());
+                    let rc = temen_coop_call_interp(target as u32, slots.as_mut_ptr());
                     let live = unsafe { std::slice::from_raw_parts(win_ptr, win_len) };
                     mem.write(&mut c, WIN_BASE as usize, live).unwrap();
                     mem.write(&mut c, args_ptr as usize, &slots).unwrap();
                     // #717 fan-out: a bounced callback may have `vm_map`-grown the window. #1009
                     // paged: the grow refreshed the page-state table (`call_interp` rebuilt it) —
                     // fan the fresh coverage to `"mapped"`, re-copy the table, re-point `"pagestate"`.
-                    if svm_coop_paged() != 0 {
-                        let cover = svm_coop_mapped();
+                    if temen_coop_paged() != 0 {
+                        let cover = temen_coop_mapped();
                         for g in c.data().mapped_globals.clone() {
                             g.set(&mut c, Val::I64(cover)).unwrap();
                         }
-                        let plen = svm_coop_pagestate_len();
+                        let plen = temen_coop_pagestate_len();
                         // SAFETY: pending-event page-state table, stable until the deliver.
                         let table =
-                            unsafe { std::slice::from_raw_parts(svm_coop_pagestate_ptr(), plen) }
+                            unsafe { std::slice::from_raw_parts(temen_coop_pagestate_ptr(), plen) }
                                 .to_vec();
                         let table_base = WIN_BASE as usize + win_len;
                         let need = (table_base + plen).div_ceil(1 << 16) as u32;
@@ -646,7 +655,7 @@ impl CoopB2Driver {
                             g.set(&mut c, Val::I32(table_base as i32)).unwrap();
                         }
                     } else {
-                        let now = svm_coop_mapped_now();
+                        let now = temen_coop_mapped_now();
                         for g in c.data().mapped_globals.clone() {
                             g.set(&mut c, Val::I64(now)).unwrap();
                         }
@@ -683,11 +692,11 @@ impl CoopB2Driver {
         if let Some(f) = self.shims.get(&(slot, code)) {
             return Some(*f);
         }
-        let len = svm_coop_shim_wasm(slot);
+        let len = temen_coop_shim_wasm(slot);
         if len == 0 {
             return None;
         }
-        let bytes = unsafe { std::slice::from_raw_parts(svm_coop_shim_ptr(), len) }.to_vec();
+        let bytes = unsafe { std::slice::from_raw_parts(temen_coop_shim_ptr(), len) }.to_vec();
         let inst = self.instantiate(&bytes);
         let f = inst.get_func(&self.store, "t").expect("shim exports t");
         self.shims.insert((slot, code), f);
@@ -697,12 +706,12 @@ impl CoopB2Driver {
     /// Rebuild the shared table from the engine's slot mirror — the per-event sync (installs only
     /// happen between events, so a synced table is exact for the whole event).
     fn sync_table(&mut self) {
-        let gen = svm_coop_table_gen() as i64;
+        let gen = temen_coop_table_gen() as i64;
         if gen == self.synced_gen {
             return;
         }
-        let nfuncs = svm_coop_nfuncs();
-        let tsize = 1usize << svm_coop_table_log2();
+        let nfuncs = temen_coop_nfuncs();
+        let tsize = 1usize << temen_coop_table_log2();
         for slot in 0..tsize {
             let entry: Option<Func> = if slot < nfuncs {
                 match self.main.get_func(&self.store, &format!("f{slot}")) {
@@ -710,17 +719,17 @@ impl CoopB2Driver {
                     None => self.shim(slot as u32, -2),
                 }
             } else {
-                let code = svm_coop_slot_code(slot as u32);
+                let code = temen_coop_slot_code(slot as u32);
                 if code < 0 {
                     None
-                } else if svm_coop_jit_wasm_by_handle_len(code) > 0 {
+                } else if temen_coop_jit_wasm_by_handle_len(code) > 0 {
                     let inst = match self.unit_insts.get(&code) {
                         Some(i) => *i,
                         None => {
                             let bytes = unsafe {
                                 std::slice::from_raw_parts(
-                                    svm_coop_jit_wasm_by_handle_ptr(),
-                                    svm_coop_jit_wasm_by_handle_len(code),
+                                    temen_coop_jit_wasm_by_handle_ptr(),
+                                    temen_coop_jit_wasm_by_handle_len(code),
                                 )
                             }
                             .to_vec();
@@ -747,7 +756,7 @@ impl CoopB2Driver {
 
     /// Sync window + globals into the shared instances before running an emitted entry.
     fn prime(&mut self, mapped: i64) {
-        let win_ptr = svm_coop_win_ptr() as *mut u8;
+        let win_ptr = temen_coop_win_ptr() as *mut u8;
         // SAFETY: the paused task is parked on the pending event; the window is exclusive.
         let live = unsafe { std::slice::from_raw_parts(win_ptr, self.win_len) };
         self.memory
@@ -764,10 +773,10 @@ impl CoopB2Driver {
         }
         // #1009 paged: copy the page-state table in after the window and point `"pagestate"` at it
         // (the browser shares memory, zero-copy; here the emitted module has its own).
-        if svm_coop_paged() != 0 {
-            let plen = svm_coop_pagestate_len();
+        if temen_coop_paged() != 0 {
+            let plen = temen_coop_pagestate_len();
             // SAFETY: pending-event page-state table, stable until the deliver.
-            let table = unsafe { std::slice::from_raw_parts(svm_coop_pagestate_ptr(), plen) };
+            let table = unsafe { std::slice::from_raw_parts(temen_coop_pagestate_ptr(), plen) };
             let table_base = WIN_BASE as usize + self.win_len;
             let need = (table_base + plen).div_ceil(1 << 16) as u32;
             let have = self.memory.size(&self.store) as u32;
@@ -787,7 +796,7 @@ impl CoopB2Driver {
 
     /// Mirror the emitted writes back into the live window before the vCPU resumes.
     fn writeback(&mut self) {
-        let win_ptr = svm_coop_win_ptr() as *mut u8;
+        let win_ptr = temen_coop_win_ptr() as *mut u8;
         let mut buf = vec![0u8; self.win_len];
         self.memory
             .read(&self.store, WIN_BASE as usize, &mut buf)
@@ -800,15 +809,15 @@ impl CoopB2Driver {
     /// main module's `f{func}` (whose `call_indirect` now dispatches through the table), deliver.
     fn service_tierup(&mut self, n_results: usize) {
         self.sync_table();
-        self.prime(svm_coop_mapped());
-        let func = svm_coop_func();
+        self.prime(temen_coop_mapped());
+        let func = temen_coop_func();
         let f = self
             .main
             .get_func(&self.store, &format!("f{func}"))
             .unwrap_or_else(|| panic!("f{func} not exported"));
-        let n = svm_coop_argv_len();
+        let n = temen_coop_argv_len();
         // SAFETY: pending-event operand stash, stable until the deliver.
-        let argv = unsafe { std::slice::from_raw_parts(svm_coop_argv_ptr(), n) };
+        let argv = unsafe { std::slice::from_raw_parts(temen_coop_argv_ptr(), n) };
         let mut params = vec![Val::I32(WIN_BASE as i32), Val::I32(ENV_PTR as i32)];
         params.extend(argv.iter().map(|a| Val::I64(*a)));
         let mut results: Vec<Val> = (0..n_results).map(|_| Val::I64(0)).collect();
@@ -824,9 +833,9 @@ impl CoopB2Driver {
                         _ => panic!("non-integer TIERUP result"),
                     })
                     .collect();
-                svm_coop_deliver(slots.as_ptr(), slots.len());
+                temen_coop_deliver(slots.as_ptr(), slots.len());
             }
-            Err(_) => svm_coop_deliver_trap(),
+            Err(_) => temen_coop_deliver_trap(),
         }
     }
 
@@ -834,13 +843,13 @@ impl CoopB2Driver {
     /// `call_indirect` dispatches through the shared table), deliver results or the trap.
     fn service_jit_invoke(&mut self) {
         self.sync_table();
-        self.prime(svm_coop_mapped());
-        let code = svm_coop_jit_code();
+        self.prime(temen_coop_mapped());
+        let code = temen_coop_jit_code();
         let inst = match self.unit_insts.get(&code) {
             Some(i) => *i,
             None => {
                 let bytes = unsafe {
-                    std::slice::from_raw_parts(svm_coop_jit_wasm_ptr(), svm_coop_jit_wasm_len())
+                    std::slice::from_raw_parts(temen_coop_jit_wasm_ptr(), temen_coop_jit_wasm_len())
                 }
                 .to_vec();
                 let i = self.instantiate(&bytes);
@@ -849,10 +858,10 @@ impl CoopB2Driver {
             }
         };
         let f0 = inst.get_func(&self.store, "f0").expect("unit exports f0");
-        let n = svm_coop_argv_len();
+        let n = temen_coop_argv_len();
         // SAFETY: pending-event operand stash, stable until the deliver.
-        let argv = unsafe { std::slice::from_raw_parts(svm_coop_argv_ptr(), n) };
-        let ptypes = unsafe { std::slice::from_raw_parts(svm_coop_jit_param_types_ptr(), n) };
+        let argv = unsafe { std::slice::from_raw_parts(temen_coop_argv_ptr(), n) };
+        let ptypes = unsafe { std::slice::from_raw_parts(temen_coop_jit_param_types_ptr(), n) };
         let mut params = vec![Val::I32(WIN_BASE as i32), Val::I32(ENV_PTR as i32)];
         for (a, tc) in argv.iter().zip(ptypes) {
             params.push(match tc {
@@ -862,8 +871,8 @@ impl CoopB2Driver {
                 _ => Val::F64(f64::from_bits(*a as u64).into()),
             });
         }
-        let rn = svm_coop_jit_result_types_len();
-        let rtypes = unsafe { std::slice::from_raw_parts(svm_coop_jit_result_types_ptr(), rn) };
+        let rn = temen_coop_jit_result_types_len();
+        let rtypes = unsafe { std::slice::from_raw_parts(temen_coop_jit_result_types_ptr(), rn) };
         let mut results: Vec<Val> = rtypes
             .iter()
             .map(|tc| match tc {
@@ -888,9 +897,9 @@ impl CoopB2Driver {
                         _ => panic!("non-scalar result"),
                     })
                     .collect();
-                svm_coop_deliver_jit(slots.as_ptr(), slots.len());
+                temen_coop_deliver_jit(slots.as_ptr(), slots.len());
             }
-            Err(_) => svm_coop_deliver_jit_trap(),
+            Err(_) => temen_coop_deliver_jit_trap(),
         }
     }
 
@@ -901,11 +910,11 @@ impl CoopB2Driver {
 
 /// Drive an opened coop session to DONE with the full B2 driver. Returns the driver (for its bounce
 /// log) and the `(tierups, invokes)` counters.
-fn drive_coop_b2_session(m: &svm_ir::Module) -> (CoopB2Driver, u32, u32) {
+fn drive_coop_b2_session(m: &temen_ir::Module) -> (CoopB2Driver, u32, u32) {
     let mut d = CoopB2Driver::new();
     let (mut tierups, mut invokes) = (0u32, 0u32);
     loop {
-        match svm_coop_run() {
+        match temen_coop_run() {
             COOP_RUN_JIT_INVOKE => {
                 invokes += 1;
                 assert!(invokes < 50, "runaway invokes");
@@ -914,32 +923,32 @@ fn drive_coop_b2_session(m: &svm_ir::Module) -> (CoopB2Driver, u32, u32) {
             COOP_RUN_TIERUP => {
                 tierups += 1;
                 assert!(tierups < 50, "runaway tier-ups");
-                let f = svm_coop_func() as usize;
+                let f = temen_coop_func() as usize;
                 d.service_tierup(m.funcs[f].results.len());
             }
             COOP_RUN_DONE => break,
-            ev => panic!("unexpected pump event {ev} (status {})", svm_status()),
+            ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
         }
     }
     (d, tierups, invokes)
 }
 
 /// [`drive_coop_b2_session`] that tolerates a trap (an expected fault, e.g. an `Ro` store) instead of
-/// panicking — drive to DONE or TRAP; the caller reads [`svm_status`] to assert trap-parity.
-fn drive_coop_b2_session_allow_trap(m: &svm_ir::Module) -> (CoopB2Driver, u32) {
+/// panicking — drive to DONE or TRAP; the caller reads [`temen_status`] to assert trap-parity.
+fn drive_coop_b2_session_allow_trap(m: &temen_ir::Module) -> (CoopB2Driver, u32) {
     let mut d = CoopB2Driver::new();
     let mut tierups = 0u32;
     loop {
-        match svm_coop_run() {
+        match temen_coop_run() {
             COOP_RUN_JIT_INVOKE => d.service_jit_invoke(),
             COOP_RUN_TIERUP => {
                 tierups += 1;
                 assert!(tierups < 100, "runaway tier-ups");
-                let f = svm_coop_func() as usize;
+                let f = temen_coop_func() as usize;
                 d.service_tierup(m.funcs[f].results.len());
             }
             COOP_RUN_DONE | COOP_RUN_TRAP => break,
-            ev => panic!("unexpected pump event {ev} (status {})", svm_status()),
+            ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
         }
     }
     (d, tierups)
@@ -948,7 +957,7 @@ fn drive_coop_b2_session_allow_trap(m: &svm_ir::Module) -> (CoopB2Driver, u32) {
 /// #1009 paged, on the cooperative path: a rodata guest whose eligible leaf accesses its `Ro` page
 /// (load succeeds, store traps) and, in a second guest, a page grown mid-invoke through a bounce —
 /// both matching the `onramp_exec` oracle. The coop twin of `tierup_driver`'s paged differentials:
-/// exercises `svm_coop_open`'s paged flip, `CoopRun`'s `page_checked` + `mem_map_*`, and the coop
+/// exercises `temen_coop_open`'s paged flip, `CoopRun`'s `page_checked` + `mem_map_*`, and the coop
 /// driver's `"pagestate"` wiring + mid-invoke refresh.
 #[test]
 fn coop_rodata_and_midinvoke_grow_match_the_oracle() {
@@ -963,51 +972,55 @@ fn coop_rodata_and_midinvoke_grow_match_the_oracle() {
             "  vl = i64.load v0\n  return vl\n"
         };
         let src = format!(
-            "memory 17\ndata ro 65536 \"svm-coop-rodata-payload!!\"\nfunc () -> (i64) {{\nblock 0 () {{\n  vp = i64.const 65536\n  vr = call 1 (vp)\n  return vr\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n{body}  }}\n}}\nexport 0 func \"_start\" 0\n"
+            "memory 17\ndata ro 65536 \"temen-coop-rodata-payload!!\"\nfunc () -> (i64) {{\nblock 0 () {{\n  vp = i64.const 65536\n  vr = call 1 (vp)\n  return vr\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n{body}  }}\n}}\nexport 0 func \"_start\" 0\n"
         );
-        let m = svm_text::parse_module(&src).expect("parse");
-        svm_verify::verify_module(&m).expect("verify");
-        let bytes = svm_encode::encode_module(&m);
+        let m = temen_text::parse_module(&src).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        let bytes = temen_encode::encode_module(&m);
         let want = onramp_exec(&m, b"");
         assert_eq!(
             want.status,
             if want_trap { STATUS_TRAP } else { STATUS_OK },
             "oracle sanity (store={store})"
         );
-        let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
-        assert_eq!(opened, 0, "coop open (status {})", svm_status());
+        let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+        assert_eq!(opened, 0, "coop open (status {})", temen_status());
         assert_ne!(
-            svm_coop_paged(),
+            temen_coop_paged(),
             0,
             "the rodata guest opens the coop run paged"
         );
         let (_d, tierups) = drive_coop_b2_session_allow_trap(&m);
         assert!(tierups >= 1, "the leaf tiers up on the coop path");
         assert_eq!(
-            svm_status(),
+            temen_status(),
             want.status,
             "coop status parity (store={store})"
         );
         if !want_trap {
-            assert_eq!(svm_coop_value(), want.value, "coop value parity (Ro load)");
+            assert_eq!(
+                temen_coop_value(),
+                want.value,
+                "coop value parity (Ro load)"
+            );
         }
-        svm_coop_close();
+        temen_coop_close();
     }
 
     // A page grown mid-invoke through a bounce round-trips (the pagestate is refreshed in the bounce).
     const X: i64 = 4321;
     let src = format!(
-        "memory 16\ndata ro 32768 \"svm-coop-rodata-flip!!\"\nfunc () -> (i64) {{\nblock 0 () {{\n  vx = i64.const {X}\n  vr = call 1 (vx)\n  return vr\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  vg = call 2 (v0)\n  va = i64.const 65552\n  i64.store va v0\n  vl = i64.load va\n  return vl\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  vas = i32.const {mem_h}\n  voff = i64.const 65536\n  vlen = i64.const 16384\n  vprot = i32.const 3\n  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)\n  return v0\n  }}\n}}\nexport 0 func \"_start\" 0\n"
+        "memory 16\ndata ro 32768 \"temen-coop-rodata-flip!!\"\nfunc () -> (i64) {{\nblock 0 () {{\n  vx = i64.const {X}\n  vr = call 1 (vx)\n  return vr\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  vg = call 2 (v0)\n  va = i64.const 65552\n  i64.store va v0\n  vl = i64.load va\n  return vl\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  vas = i32.const {mem_h}\n  voff = i64.const 65536\n  vlen = i64.const 16384\n  vprot = i32.const 3\n  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)\n  return v0\n  }}\n}}\nexport 0 func \"_start\" 0\n"
     );
-    let m = svm_text::parse_module(&src).expect("parse");
-    svm_verify::verify_module(&m).expect("verify");
-    let bytes = svm_encode::encode_module(&m);
+    let m = temen_text::parse_module(&src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
     let want = onramp_exec(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity (mid-invoke grow)");
     assert_eq!(want.value, X, "oracle value");
-    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
-    assert_eq!(opened, 0, "coop open (status {})", svm_status());
-    assert_ne!(svm_coop_paged(), 0, "paged");
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "coop open (status {})", temen_status());
+    assert_ne!(temen_coop_paged(), 0, "paged");
     let (d, tierups) = drive_coop_b2_session_allow_trap(&m);
     assert!(tierups >= 1, "the leaf tiers up");
     assert!(
@@ -1016,20 +1029,20 @@ fn coop_rodata_and_midinvoke_grow_match_the_oracle() {
         d.bounces()
     );
     assert_eq!(
-        svm_status(),
+        temen_status(),
         want.status,
         "coop status parity (mid-invoke grow)"
     );
     assert_eq!(
-        svm_coop_value(),
+        temen_coop_value(),
         want.value,
         "coop value parity through the grown page"
     );
-    svm_coop_close();
+    temen_coop_close();
 }
 
 /// The paged-flip gap: a guest that `protect`s its own pages (`cap.call 5 2`) but carries **no**
-/// `readonly` data segment. Keyed on rodata alone, `svm_coop_open` emitted it non-paged, the
+/// `readonly` data segment. Keyed on rodata alone, `temen_coop_open` emitted it non-paged, the
 /// emitter's window-remapping gate module-gated it to emit-nothing, and the open **declined** —
 /// interpreter-only for a guest paged mode carries fine. Now the flip also keys on
 /// `module_uses_unmap_protect`: the guest opens paged, the leaf tiers up, and the post-`protect`
@@ -1051,33 +1064,37 @@ fn coop_unmap_protect_guest_without_rodata_opens_paged() {
         let src = format!(
             "memory 17\nfunc () -> (i64) {{\nblock 0 () {{\n  vp = i64.const 65536\n  i64.store vp vp\n  vas = i32.const {mem_h}\n  voff = i64.const 65536\n  vlen = i64.const 16384\n  vprot = i32.const 1\n  vr = cap.call 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)\n  vres = call 1 (vp)\n  return vres\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n{body}  }}\n}}\nexport 0 func \"_start\" 0\n"
         );
-        let m = svm_text::parse_module(&src).expect("parse");
-        svm_verify::verify_module(&m).expect("verify");
-        let bytes = svm_encode::encode_module(&m);
+        let m = temen_text::parse_module(&src).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        let bytes = temen_encode::encode_module(&m);
         let want = onramp_exec(&m, b"");
         assert_eq!(
             want.status,
             if want_trap { STATUS_TRAP } else { STATUS_OK },
             "oracle sanity (store={store})"
         );
-        let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
-        assert_eq!(opened, 0, "coop open (status {})", svm_status());
+        let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+        assert_eq!(opened, 0, "coop open (status {})", temen_status());
         assert_ne!(
-            svm_coop_paged(),
+            temen_coop_paged(),
             0,
             "the unmap/protect guest opens the coop run paged (no rodata needed)"
         );
         let (_d, tierups) = drive_coop_b2_session_allow_trap(&m);
         assert!(tierups >= 1, "the leaf tiers up on the coop path");
         assert_eq!(
-            svm_status(),
+            temen_status(),
             want.status,
             "coop status parity (store={store})"
         );
         if !want_trap {
-            assert_eq!(svm_coop_value(), want.value, "coop value parity (Ro load)");
+            assert_eq!(
+                temen_coop_value(),
+                want.value,
+                "coop value parity (Ro load)"
+            );
         }
-        svm_coop_close();
+        temen_coop_close();
     }
 }
 
@@ -1149,9 +1166,9 @@ export 0 func "_start" 0
 #[test]
 fn coop_indirect_leaf_tiers_up_natively() {
     let _g = FFI_LOCK.lock().unwrap();
-    let m = svm_text::parse_module(&coop_indirect_guest_text()).expect("parse");
-    svm_verify::verify_module(&m).expect("verify");
-    let bytes = svm_encode::encode_module(&m);
+    let m = temen_text::parse_module(&coop_indirect_guest_text()).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
 
     // Oracle: the plain bytecode path. `f1(probe) = f2(probe) + 1 = (probe + LEAF_K) + 1`; worker 0.
     let want = onramp_exec(&m, b"");
@@ -1162,12 +1179,12 @@ fn coop_indirect_leaf_tiers_up_natively() {
         "oracle: call_indirect(f2)(probe) + 1, through the grown page"
     );
 
-    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
     assert_eq!(
         opened,
         0,
         "open must admit the threaded call_indirect guest (status {})",
-        svm_status()
+        temen_status()
     );
 
     let (d, tierups, invokes) = drive_coop_b2_session(&m);
@@ -1181,13 +1198,17 @@ fn coop_indirect_leaf_tiers_up_natively() {
         "the indirect edge targets an emitted function — native, never bounced: {:?}",
         d.bounces()
     );
-    assert_eq!(svm_status(), want.status, "status parity with the oracle");
-    assert_eq!(svm_coop_value(), want.value, "value parity with the oracle");
+    assert_eq!(temen_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        temen_coop_value(),
+        want.value,
+        "value parity with the oracle"
+    );
     // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
     let got_out =
-        unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
     assert_eq!(got_out, want.stdout, "stdout parity with the oracle");
-    svm_coop_close();
+    temen_coop_close();
 }
 
 /// The on-ramp powerbox's stdout + **jit** handles (grant order incl. the conditional `Jit` grant a
@@ -1221,9 +1242,9 @@ block 0 (v0: i64) {
 }
 "#;
     let blob = {
-        let u = svm_text::parse_module(unit_src).expect("parse unit");
-        svm_verify::verify_module(&u).expect("verify unit");
-        svm_encode::encode_module(&u)
+        let u = temen_text::parse_module(unit_src).expect("parse unit");
+        temen_verify::verify_module(&u).expect("verify unit");
+        temen_encode::encode_module(&u)
     };
     let blob_len = blob.len();
     let mut stores = String::new();
@@ -1284,9 +1305,9 @@ export 0 func "_start" 0
 #[test]
 fn coop_leaf_reaches_installed_unit_natively() {
     let _g = FFI_LOCK.lock().unwrap();
-    let m = svm_text::parse_module(&coop_installed_unit_guest_text()).expect("parse");
-    svm_verify::verify_module(&m).expect("verify");
-    let bytes = svm_encode::encode_module(&m);
+    let m = temen_text::parse_module(&coop_installed_unit_guest_text()).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
 
     // Oracle: `f1(slot, X) = unit(X) + 100 = (X + 7) + 100`; worker 0. (X = 4000.)
     let want = onramp_exec(&m, b"");
@@ -1297,12 +1318,12 @@ fn coop_leaf_reaches_installed_unit_natively() {
         "oracle: leaf → installed unit → +100"
     );
 
-    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
     assert_eq!(
         opened,
         0,
         "open must admit the threaded install-slot guest (status {})",
-        svm_status()
+        temen_status()
     );
 
     let (d, tierups, _invokes) = drive_coop_b2_session(&m);
@@ -1318,13 +1339,17 @@ fn coop_leaf_reaches_installed_unit_natively() {
         "the install-slot edge reaches the unit's emitted f0 — native: {:?}",
         d.bounces()
     );
-    assert_eq!(svm_status(), want.status, "status parity with the oracle");
-    assert_eq!(svm_coop_value(), want.value, "value parity with the oracle");
+    assert_eq!(temen_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        temen_coop_value(),
+        want.value,
+        "value parity with the oracle"
+    );
     // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
     let got_out =
-        unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
     assert_eq!(got_out, want.stdout, "stdout parity with the oracle");
-    svm_coop_close();
+    temen_coop_close();
 }
 
 // ---- #926 slice 2g: the invoke-confined bounce — an emitted `Jit.invoke` unit bounces cross-tier ----
@@ -1361,9 +1386,9 @@ block 0 (v0: i64) {{
 }}
 "#
     );
-    let unit = svm_text::parse_module(&unit_src).expect("unit parse");
-    svm_verify::verify_module(&unit).expect("unit verify");
-    let blob = svm_encode::encode_module(&unit);
+    let unit = temen_text::parse_module(&unit_src).expect("unit parse");
+    temen_verify::verify_module(&unit).expect("unit verify");
+    let blob = temen_encode::encode_module(&unit);
     let blob_len = blob.len();
     let mut stores = String::new();
     for (i, chunk) in blob.chunks(8).enumerate() {
@@ -1440,9 +1465,9 @@ export 0 func "_start" 0
 #[test]
 fn coop_invoked_unit_bounces_and_native_edges_match_the_oracle() {
     let _g = FFI_LOCK.lock().unwrap();
-    let m = svm_text::parse_module(&coop_invoke_bounce_guest_text()).expect("parse");
-    svm_verify::verify_module(&m).expect("verify");
-    let bytes = svm_encode::encode_module(&m);
+    let m = temen_text::parse_module(&coop_invoke_bounce_guest_text()).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
 
     // Oracle: bounce (+K, grow), grown-page store/load, native ×3; worker 0.
     let want = onramp_exec(&m, b"");
@@ -1453,12 +1478,12 @@ fn coop_invoked_unit_bounces_and_native_edges_match_the_oracle() {
         "oracle: bounce (+K, grow), grown-page store/load, native ×3"
     );
 
-    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
     assert_eq!(
         opened,
         0,
         "open must admit the threaded bouncing-invoke guest (status {})",
-        svm_status()
+        temen_status()
     );
 
     let (d, _tierups, invokes) = drive_coop_b2_session(&m);
@@ -1482,26 +1507,26 @@ fn coop_invoked_unit_bounces_and_native_edges_match_the_oracle() {
         "the helper and the leaf both emit — program slots dispatch natively, never bounce: {:?}",
         d.bounces()
     );
-    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(temen_status(), want.status, "status parity with the oracle");
     assert_eq!(
-        svm_coop_value(),
+        temen_coop_value(),
         want.value,
         "value parity (growth-mid-invoke visible post-bounce)"
     );
     // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
     let got_out =
-        unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
     assert_eq!(
         got_out, want.stdout,
         "stdout parity (bounce ordering included)"
     );
-    svm_coop_close();
+    temen_coop_close();
 }
 
 // ================================================================================================
 // #1026 slice 1 — the single-vCPU pump's differentials, ported onto the cooperative driver.
 //
-// The pump (`svm_onramp_tierup_*`) is being collapsed into this driver (coop subsumes its admission
+// The pump (`temen_onramp_tierup_*`) is being collapsed into this driver (coop subsumes its admission
 // set and is faster — see the issue). These ports establish equivalent coverage here BEFORE the
 // pump and its harness are deleted: every pump differential without a coop twin gets one, run
 // through the full `CoopB2Driver` against the same `onramp_exec` oracle. Guests are verbatim from
@@ -1620,24 +1645,28 @@ block 0 (vsp: i64, varg: i64) {
 }
 export 0 func "_start" 0
 "#;
-    let m = svm_text::parse_module(src).expect("parse");
-    svm_verify::verify_module(&m).expect("verify");
-    let bytes = svm_encode::encode_module(&m);
+    let m = temen_text::parse_module(src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
     let want = onramp_exec(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
 
-    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
     assert_eq!(
         opened,
         0,
         "a fiber guest must be admitted (status {})",
-        svm_status()
+        temen_status()
     );
     let (_d, tierups, _invokes) = drive_coop_b2_session(&m);
     assert!(tierups >= 1, "the leaf still tiers up beside the fibers");
-    assert_eq!(svm_status(), want.status, "status parity with the oracle");
-    assert_eq!(svm_coop_value(), want.value, "value parity with the oracle");
-    svm_coop_close();
+    assert_eq!(temen_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        temen_coop_value(),
+        want.value,
+        "value parity with the oracle"
+    );
+    temen_coop_close();
 }
 
 /// Pump port (#845): a guest-compiled **fiber-hosting** unit is admitted by the validator and runs
@@ -1660,9 +1689,9 @@ block 0 (v0: i64) {
   }
 }
 "#;
-        let m = svm_text::parse_module(src).expect("parse fiber unit");
-        svm_verify::verify_module(&m).expect("verify fiber unit");
-        svm_encode::encode_module(&m)
+        let m = temen_text::parse_module(src).expect("parse fiber unit");
+        temen_verify::verify_module(&m).expect("verify fiber unit");
+        temen_encode::encode_module(&m)
     };
     let fiber_body = format!(
         r#"func (i64, i64) -> (i64) {{
@@ -1675,10 +1704,10 @@ block 0 (vsp: i64, varg: i64) {{
 }}
 "#
     );
-    let m = svm_text::parse_module(&coop_jit_guest_text_with(&fiber_unit_blob, &fiber_body))
+    let m = temen_text::parse_module(&coop_jit_guest_text_with(&fiber_unit_blob, &fiber_body))
         .expect("parse");
-    svm_verify::verify_module(&m).expect("verify");
-    let bytes = svm_encode::encode_module(&m);
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
 
     let want = onramp_exec(&m, b"");
     assert_eq!(
@@ -1691,16 +1720,20 @@ block 0 (vsp: i64, varg: i64) {{
         "both yielded values arrive"
     );
 
-    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
-    assert_eq!(opened, 0, "open must admit (status {})", svm_status());
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "open must admit (status {})", temen_status());
     let (_d, _tierups, invokes) = drive_coop_b2_session(&m);
     assert_eq!(
         invokes, 0,
         "a fiber unit never runs emitted (compile_jit declines it) — the invoke stays interpreted"
     );
-    assert_eq!(svm_status(), want.status, "status parity with the oracle");
-    assert_eq!(svm_coop_value(), want.value, "value parity with the oracle");
-    svm_coop_close();
+    assert_eq!(temen_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        temen_coop_value(),
+        want.value,
+        "value parity with the oracle"
+    );
+    temen_coop_close();
 }
 
 /// Pump port (#845's closed half, driver-independent): a **futex**-using unit (`atomic.notify`) is
@@ -1719,11 +1752,11 @@ block 0 (v0: i64) {
   }
 }
 "#;
-    let unit = svm_text::parse_module(unit_src).expect("parse futex unit");
-    svm_verify::verify_module(&unit).expect("verify futex unit");
-    let blob = svm_encode::encode_module(&unit);
-    let m = svm_text::parse_module(&coop_jit_guest_text_with(&blob, "")).expect("parse");
-    svm_verify::verify_module(&m).expect("verify");
+    let unit = temen_text::parse_module(unit_src).expect("parse futex unit");
+    temen_verify::verify_module(&unit).expect("verify futex unit");
+    let blob = temen_encode::encode_module(&unit);
+    let m = temen_text::parse_module(&coop_jit_guest_text_with(&blob, "")).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
     let want = onramp_exec(&m, b"");
     assert_ne!(
         want.status, STATUS_OK,
@@ -1755,15 +1788,15 @@ block 0 (vsp: i64, varg: i64) {
 }
 export 0 func "_start" 0
 "#;
-    let m = svm_text::parse_module(src).expect("parse");
-    svm_verify::verify_module(&m).expect("verify");
-    let bytes = svm_encode::encode_module(&m);
-    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let m = temen_text::parse_module(src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
     assert_eq!(
         opened, -STATUS_UNSUPPORTED,
         "nothing for the emitted tier to run → clean refusal (bytecode fallback)"
     );
-    svm_coop_close();
+    temen_coop_close();
 }
 
 /// Pump port (#846, unit→**unit** native): the guest compiles + `install`s pure unit A, then
@@ -1794,14 +1827,14 @@ block 0 (vslot: i64, vx: i64) {
 }
 "#;
     let blob_a = {
-        let u = svm_text::parse_module(unit_a_src).expect("parse A");
-        svm_verify::verify_module(&u).expect("verify A");
-        svm_encode::encode_module(&u)
+        let u = temen_text::parse_module(unit_a_src).expect("parse A");
+        temen_verify::verify_module(&u).expect("verify A");
+        temen_encode::encode_module(&u)
     };
     let blob_b = {
-        let u = svm_text::parse_module(unit_b_src).expect("parse B");
-        svm_verify::verify_module(&u).expect("verify B");
-        svm_encode::encode_module(&u)
+        let u = temen_text::parse_module(unit_b_src).expect("parse B");
+        temen_verify::verify_module(&u).expect("verify B");
+        temen_encode::encode_module(&u)
     };
     const A_BASE: i64 = 4096;
     const B_BASE: i64 = 8192;
@@ -1838,16 +1871,16 @@ block 0 () {{
 export 0 func "_start" 0
 "#
     );
-    let m = svm_text::parse_module(&src).expect("parse");
-    svm_verify::verify_module(&m).expect("verify");
-    let bytes = svm_encode::encode_module(&m);
+    let m = temen_text::parse_module(&src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
 
     let want = onramp_exec(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(want.value, X + 7 + 100, "oracle: B → installed A → +100");
 
-    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
-    assert_eq!(opened, 0, "open must admit (status {})", svm_status());
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "open must admit (status {})", temen_status());
     let (d, _tierups, invokes) = drive_coop_b2_session(&m);
     assert!(invokes >= 1, "unit B must run emitted (non-vacuity)");
     assert!(
@@ -1855,9 +1888,13 @@ export 0 func "_start" 0
         "both units are emitted — the installed edge must dispatch natively: {:?}",
         d.bounces()
     );
-    assert_eq!(svm_status(), want.status, "status parity with the oracle");
-    assert_eq!(svm_coop_value(), want.value, "value parity with the oracle");
-    svm_coop_close();
+    assert_eq!(temen_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        temen_coop_value(),
+        want.value,
+        "value parity with the oracle"
+    );
+    temen_coop_close();
 }
 
 /// Pump port (#1009 Mechanism 1): a guest with **more than 1024 functions** whose tier-up-eligible
@@ -1911,13 +1948,13 @@ block 0 (v0: i64) {{
         }
     }
     let src = format!("memory 16\n{fns}export 0 func \"_start\" 0\n");
-    let m = svm_text::parse_module(&src).expect("parse");
-    svm_verify::verify_module(&m).expect("verify");
+    let m = temen_text::parse_module(&src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
     assert!(
         m.funcs.len() > (1usize << 10),
         "the guest must exceed the 1024-slot floor"
     );
-    let bytes = svm_encode::encode_module(&m);
+    let bytes = temen_encode::encode_module(&m);
 
     let want = onramp_exec(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
@@ -1927,12 +1964,12 @@ block 0 (v0: i64) {{
         "oracle: the dispatch reaches slot {TARGET}"
     );
 
-    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
-    assert_eq!(opened, 0, "open must admit (status {})", svm_status());
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "open must admit (status {})", temen_status());
     assert!(
-        (1u32 << svm_coop_table_log2()) >= m.funcs.len() as u32,
+        (1u32 << temen_coop_table_log2()) >= m.funcs.len() as u32,
         "the table must cover every function: 1<<{} < {}",
-        svm_coop_table_log2(),
+        temen_coop_table_log2(),
         m.funcs.len()
     );
     let (d, tierups, _invokes) = drive_coop_b2_session(&m);
@@ -1942,14 +1979,14 @@ block 0 (v0: i64) {{
         "the indirect edge reaches an emitted function natively: {:?}",
         d.bounces()
     );
-    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(temen_status(), want.status, "status parity with the oracle");
     assert_eq!(
-        svm_coop_value(),
+        temen_coop_value(),
         want.value,
         "value parity — the emitted high-index dispatch must reach slot {TARGET}, not {}",
         TARGET & 1023
     );
-    svm_coop_close();
+    temen_coop_close();
 }
 
 /// Pump port (#880, TIERUP-region bounce + growth): a tiered-up leaf's `call_indirect` lands on a
@@ -2013,16 +2050,16 @@ block 0 (vsp: i64, varg: i64) {{
 export 0 func "_start" 0
 "#
     );
-    let m = svm_text::parse_module(&src).expect("parse");
-    svm_verify::verify_module(&m).expect("verify");
-    let bytes = svm_encode::encode_module(&m);
+    let m = temen_text::parse_module(&src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
 
     let want = onramp_exec(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(want.value, 2 * X + BOUNCE_K, "oracle value");
 
-    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
-    assert_eq!(opened, 0, "open must admit (status {})", svm_status());
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "open must admit (status {})", temen_status());
     let (d, tierups, _invokes) = drive_coop_b2_session(&m);
     assert!(tierups >= 1, "the leaf must tier up");
     assert!(
@@ -2030,17 +2067,17 @@ export 0 func "_start" 0
         "the fiber-hosting target must bounce through the slot shim: {:?}",
         d.bounces()
     );
-    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(temen_status(), want.status, "status parity with the oracle");
     assert_eq!(
-        svm_coop_value(),
+        temen_coop_value(),
         want.value,
         "value parity (mid-region growth admitted post-bounce)"
     );
     // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
     let got_out =
-        unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
     assert_eq!(got_out, want.stdout, "stdout parity (bounce ordering)");
-    svm_coop_close();
+    temen_coop_close();
 }
 
 /// Pump port (#880, run-registry fiber persistence): a fiber created inside a TIERUP-region bounce
@@ -2102,9 +2139,9 @@ block 0 (vsp: i64, varg: i64) {{
 export 0 func "_start" 0
 "#
     );
-    let m = svm_text::parse_module(&src).expect("parse");
-    svm_verify::verify_module(&m).expect("verify");
-    let bytes = svm_encode::encode_module(&m);
+    let m = temen_text::parse_module(&src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
 
     let want = onramp_exec(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
@@ -2114,8 +2151,8 @@ export 0 func "_start" 0
         "oracle: bounce-created fiber + later resume"
     );
 
-    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
-    assert_eq!(opened, 0, "open must admit (status {})", svm_status());
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "open must admit (status {})", temen_status());
     let (d, tierups, _invokes) = drive_coop_b2_session(&m);
     assert!(tierups >= 1, "the dispatching leaf must tier up");
     assert!(
@@ -2123,13 +2160,13 @@ export 0 func "_start" 0
         "the fiber-creating target must bounce: {:?}",
         d.bounces()
     );
-    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(temen_status(), want.status, "status parity with the oracle");
     assert_eq!(
-        svm_coop_value(),
+        temen_coop_value(),
         want.value,
         "value parity — the bounce-created fiber persisted into the run registry"
     );
-    svm_coop_close();
+    temen_coop_close();
 }
 
 /// Pump port (#888/#889, direct cross-tier over the live window): an eligible leaf's **direct
@@ -2184,20 +2221,20 @@ block 0 (v0: i64) {{
 export 0 func "_start" 0
 "#
     );
-    let m = svm_text::parse_module(&src).expect("parse");
-    svm_verify::verify_module(&m).expect("verify");
-    let bytes = svm_encode::encode_module(&m);
+    let m = temen_text::parse_module(&src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
 
     let want = onramp_exec(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(want.value, 7 + PLEAF_K + XT_K, "oracle value");
 
-    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
     assert_eq!(
         opened,
         0,
         "#888: the leaf with a direct cross-tier call must be eligible (status {})",
-        svm_status()
+        temen_status()
     );
     let (d, tierups, _invokes) = drive_coop_b2_session(&m);
     assert!(tierups >= 1, "the widened leaf must tier up (non-vacuity)");
@@ -2211,16 +2248,16 @@ export 0 func "_start" 0
         "#889: the helper itself must emit (its cap sites are outlined), not bounce: {:?}",
         d.bounces()
     );
-    assert_eq!(svm_status(), want.status, "status parity with the oracle");
-    assert_eq!(svm_coop_value(), want.value, "value parity");
+    assert_eq!(temen_status(), want.status, "status parity with the oracle");
+    assert_eq!(temen_coop_value(), want.value, "value parity");
     // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
     let got_out =
-        unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
     assert_eq!(
         got_out, want.stdout,
         "stdout parity (bounce ordering included)"
     );
-    svm_coop_close();
+    temen_coop_close();
 }
 
 /// Pump port (#926 slice 1): a guest whose concurrency op is **linked but dead** (unreachable) is
@@ -2272,33 +2309,33 @@ block 0 () {{
 export 0 func "_start" 0
 "#
     );
-    let m = svm_text::parse_module(&src).expect("parse");
-    svm_verify::verify_module(&m).expect("verify");
-    let bytes = svm_encode::encode_module(&m);
+    let m = temen_text::parse_module(&src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
 
     let want = onramp_exec(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(want.value, PROBE + PLEAF_K, "oracle value");
 
-    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
     assert_eq!(
         opened,
         0,
         "a dead concurrency op must not refuse (status {})",
-        svm_status()
+        temen_status()
     );
     let (_d, tierups, _invokes) = drive_coop_b2_session(&m);
     assert!(
         tierups >= 1,
         "the pure leaf must tier up beside the dead op"
     );
-    assert_eq!(svm_status(), want.status, "status parity with the oracle");
-    assert_eq!(svm_coop_value(), want.value, "value parity");
+    assert_eq!(temen_status(), want.status, "status parity with the oracle");
+    assert_eq!(temen_coop_value(), want.value, "value parity");
     // SAFETY: capture slots staged at DONE; this thread is the only accessor (FFI_LOCK).
     let got_out =
-        unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
     assert_eq!(got_out, want.stdout, "stdout parity");
-    svm_coop_close();
+    temen_coop_close();
 }
 
 /// Pump port (#926 slice 1), **adjusted**: a guest that actually reaches an `atomic.notify` — the
@@ -2337,9 +2374,9 @@ block 0 (v0: i64) {{
 export 0 func "_start" 0
 "#
     );
-    let m = svm_text::parse_module(&src).expect("parse");
-    svm_verify::verify_module(&m).expect("verify");
-    let bytes = svm_encode::encode_module(&m);
+    let m = temen_text::parse_module(&src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
 
     let want = onramp_exec(&m, b"");
     assert_eq!(
@@ -2347,17 +2384,17 @@ export 0 func "_start" 0
         "oracle sanity (notify with no waiters returns 0)"
     );
 
-    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
-    assert_eq!(opened, 0, "admitted (status {})", svm_status());
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "admitted (status {})", temen_status());
     let (_d, tierups, _invokes) = drive_coop_b2_session(&m);
     assert!(tierups >= 1, "the leaf tiered up before the concurrency op");
     assert_eq!(
-        svm_status(),
+        temen_status(),
         want.status,
         "the reachable atomic.notify is SERVICED here (the pump declined it) — full parity"
     );
-    assert_eq!(svm_coop_value(), want.value, "value parity");
-    svm_coop_close();
+    assert_eq!(temen_coop_value(), want.value, "value parity");
+    temen_coop_close();
 }
 
 /// Pump port (#889, the card shape): a hot loop with **one inline stdout `cap.call` per iteration**
@@ -2408,21 +2445,21 @@ block 2 (vr: i64) {{
 export 0 func "_start" 0
 "#
     );
-    let m = svm_text::parse_module(&src).expect("parse");
-    svm_verify::verify_module(&m).expect("verify");
-    let bytes = svm_encode::encode_module(&m);
+    let m = temen_text::parse_module(&src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
 
     let want = onramp_exec(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     let expect = HOT_K * (1..=HOT_N).sum::<i64>();
     assert_eq!(want.value, expect, "oracle value");
 
-    let opened = svm_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
     assert_eq!(
         opened,
         0,
         "#889: the cap-bearing hot loop must be admitted (status {})",
-        svm_status()
+        temen_status()
     );
     let (d, tierups, _invokes) = drive_coop_b2_session(&m);
     assert!(tierups >= 1, "the hot loop must tier up (non-vacuity)");
@@ -2431,16 +2468,16 @@ export 0 func "_start" 0
         &vec![3u32; HOT_N as usize][..],
         "each iteration's cap write bounces to f1's outlined wrapper, nothing else bounces"
     );
-    assert_eq!(svm_status(), want.status, "status parity with the oracle");
-    assert_eq!(svm_coop_value(), want.value, "value parity");
+    assert_eq!(temen_status(), want.status, "status parity with the oracle");
+    assert_eq!(temen_coop_value(), want.value, "value parity");
     // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
     let got_out =
-        unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
     assert_eq!(
         got_out, want.stdout,
         "stdout parity — per-iteration writes interleave as interpreted"
     );
-    svm_coop_close();
+    temen_coop_close();
 }
 
 /// Pump port (#835 capstone, asset-gated): the real JACL self-hosted compiler-guest — `vm_jit_*`
@@ -2451,18 +2488,20 @@ fn coop_jacl_compiler_runs_through_the_driver() {
     let _g = FFI_LOCK.lock().unwrap();
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../../codegen/selfhost/build/jacl_compiler.svmb"
+        "/../../../codegen/selfhost/build/jacl_compiler.temen"
     );
     let Ok(bytes) = std::fs::read(path) else {
-        eprintln!("SKIP: jacl_compiler.svmb absent (run codegen/selfhost/build_compiler_svmb.sh)");
+        eprintln!(
+            "SKIP: jacl_compiler.temen absent (run codegen/selfhost/build_compiler_temen.sh)"
+        );
         return;
     };
-    let compiler = svm_encode::decode_module(&bytes).expect("decode jacl_compiler.svmb");
+    let compiler = temen_encode::decode_module(&bytes).expect("decode jacl_compiler.temen");
     const MACRO_SRC: &[u8] = b"defmacro unless {cond body} { syntax-quote [if ~cond {} ~body] }\n\
                                mut hit 0\nunless [== 1 2] { set hit 5 }\nhit\n";
 
     let want = onramp_exec(&compiler, MACRO_SRC);
-    let opened = svm_coop_open(
+    let opened = temen_coop_open(
         bytes.as_ptr(),
         bytes.len(),
         MACRO_SRC.as_ptr(),
@@ -2479,21 +2518,25 @@ fn coop_jacl_compiler_runs_through_the_driver() {
     // the small synthetic guests).
     let mut d = CoopB2Driver::new();
     loop {
-        match svm_coop_run() {
+        match temen_coop_run() {
             COOP_RUN_JIT_INVOKE => d.service_jit_invoke(),
             COOP_RUN_TIERUP => {
-                let f = svm_coop_func() as usize;
+                let f = temen_coop_func() as usize;
                 d.service_tierup(compiler.funcs[f].results.len());
             }
             COOP_RUN_DONE => break,
-            ev => panic!("unexpected pump event {ev} (status {})", svm_status()),
+            ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
         }
     }
-    assert_eq!(svm_status(), want.status, "status parity with the oracle");
-    assert_eq!(svm_coop_value(), want.value, "value parity with the oracle");
+    assert_eq!(temen_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        temen_coop_value(),
+        want.value,
+        "value parity with the oracle"
+    );
     // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
     let got_out =
-        unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
     assert_eq!(got_out, want.stdout, "stdout parity with the oracle");
-    svm_coop_close();
+    temen_coop_close();
 }

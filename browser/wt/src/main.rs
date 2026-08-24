@@ -3,13 +3,13 @@
 //! `corpus.mjs` runs the 119-case corpus through the **wasm32** build in Node. wasm64 — the
 //! production target — could only be validated by the embedded `--invoke` probes (the Wasmtime CLI
 //! can't write the scratch buffers the alloc ABI needs). This harness closes that gap: it loads the
-//! **wasm64** module through a real Wasmtime embedding (memory64), `svm_alloc`s + writes each corpus
+//! **wasm64** module through a real Wasmtime embedding (memory64), `temen_alloc`s + writes each corpus
 //! module/stdin/window, calls the exports, reads results/streams/snapshots back, and compares to the
 //! *same* `corpus.json` ground truth — so the differential is byte-identical on **both** targets.
 //!
 //! Usage (from `browser/`, after `cargo run --bin gencorpus`):
 //!   cargo run --manifest-path wt/Cargo.toml --release -- \
-//!     target/wasm64-unknown-unknown/release/svm_browser.wasm
+//!     target/wasm64-unknown-unknown/release/temen_browser.wasm
 
 use serde_json::Value as J;
 use std::fs;
@@ -55,15 +55,15 @@ impl Vm {
     }
 
     fn status(&mut self) -> i32 {
-        self.invoke("svm_status", &[]) as i32
+        self.invoke("temen_status", &[]) as i32
     }
 
-    /// `svm_alloc(len)` then write `bytes`; returns `(ptr, len)`. Empty ⇒ `(0, 0)` (null).
+    /// `temen_alloc(len)` then write `bytes`; returns `(ptr, len)`. Empty ⇒ `(0, 0)` (null).
     fn load(&mut self, bytes: &[u8]) -> (i64, i64) {
         if bytes.is_empty() {
             return (0, 0);
         }
-        let ptr = self.invoke("svm_alloc", &[Val::I64(bytes.len() as i64)]);
+        let ptr = self.invoke("temen_alloc", &[Val::I64(bytes.len() as i64)]);
         self.mem
             .write(&mut self.store, ptr as usize, bytes)
             .expect("write into linear memory");
@@ -72,10 +72,10 @@ impl Vm {
 
     fn free(&mut self, ptr: i64, len: i64) {
         if ptr != 0 && len != 0 {
-            // `svm_dealloc` returns void — call with a zero-length results slice.
-            let f = self.inst.get_func(&mut self.store, "svm_dealloc").unwrap();
+            // `temen_dealloc` returns void — call with a zero-length results slice.
+            let f = self.inst.get_func(&mut self.store, "temen_dealloc").unwrap();
             f.call(&mut self.store, &[Val::I64(ptr), Val::I64(len)], &mut [])
-                .expect("svm_dealloc");
+                .expect("temen_dealloc");
         }
     }
 
@@ -151,16 +151,16 @@ fn read_module(file: &str) -> Vec<u8> {
 fn main() {
     let wasm = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "target/wasm64-unknown-unknown/release/svm_browser.wasm".into());
+        .unwrap_or_else(|| "target/wasm64-unknown-unknown/release/temen_browser.wasm".into());
     let corpus: J = serde_json::from_str(&fs::read_to_string("corpus.json").expect("corpus.json"))
         .expect("parse corpus.json");
 
     let mut vm = Vm::new(&wasm);
-    let is64 = vm.invoke("svm_abi_is64", &[]) == 1;
+    let is64 = vm.invoke("temen_abi_is64", &[]) == 1;
     println!("module: {wasm}  ({})", if is64 { "wasm64" } else { "wasm32" });
     let mut sc = Score { total: 0, fail: 0 };
 
-    // ---- compute-like: svm_run / svm_run0 (compute, fiber, tailcall, simd, reflect) ----------
+    // ---- compute-like: temen_run / temen_run0 (compute, fiber, tailcall, simd, reflect) ----------
     let run_compute_like = |vm: &mut Vm, sc: &mut Score, section: &str, export1: &str| {
         for m in arr(&corpus, section) {
             let bytes = read_module(&s(m, "file"));
@@ -172,12 +172,12 @@ fn main() {
                 let want_status = i(case, "status") as i32;
                 let want_value = i(case, "value");
                 let (p, l) = vm.load(&bytes);
-                let got = if export1 == "svm_run_reflect" {
+                let got = if export1 == "temen_run_reflect" {
                     vm.invoke(export1, &[Val::I64(p), Val::I64(l), Val::I64(arg)])
                 } else if nargs == 0 {
-                    vm.invoke("svm_run0", &[Val::I64(p), Val::I64(l)])
+                    vm.invoke("temen_run0", &[Val::I64(p), Val::I64(l)])
                 } else {
-                    vm.invoke("svm_run", &[Val::I64(p), Val::I64(l), Val::I64(arg)])
+                    vm.invoke("temen_run", &[Val::I64(p), Val::I64(l), Val::I64(arg)])
                 };
                 let st = vm.status();
                 vm.free(p, l);
@@ -196,24 +196,24 @@ fn main() {
         }
     };
     println!("[compute / fiber / tailcall / simd / float]");
-    run_compute_like(&mut vm, &mut sc, "compute", "svm_run"); // incl. fail-closed `unsup`
-    run_compute_like(&mut vm, &mut sc, "fiber", "svm_run");
-    run_compute_like(&mut vm, &mut sc, "tailcall", "svm_run");
-    run_compute_like(&mut vm, &mut sc, "simd", "svm_run");
-    run_compute_like(&mut vm, &mut sc, "float", "svm_run"); // scalar f32/f64, bit-exact
+    run_compute_like(&mut vm, &mut sc, "compute", "temen_run"); // incl. fail-closed `unsup`
+    run_compute_like(&mut vm, &mut sc, "fiber", "temen_run");
+    run_compute_like(&mut vm, &mut sc, "tailcall", "temen_run");
+    run_compute_like(&mut vm, &mut sc, "simd", "temen_run");
+    run_compute_like(&mut vm, &mut sc, "float", "temen_run"); // scalar f32/f64, bit-exact
     println!("[reflection]");
-    run_compute_like(&mut vm, &mut sc, "reflect", "svm_run_reflect");
+    run_compute_like(&mut vm, &mut sc, "reflect", "temen_run_reflect");
 
-    // ---- powerbox: svm_run_pb + captured streams / exit -------------------------------------
+    // ---- powerbox: temen_run_pb + captured streams / exit -------------------------------------
     println!("[powerbox]");
     for c in arr(&corpus, "powerbox") {
         let (mp, ml) = vm.load(&read_module(&s(c, "file")));
         let (sp, sl) = vm.load(&unhex(&s(c, "stdin")));
-        let got = vm.invoke("svm_run_pb", &[Val::I64(mp), Val::I64(ml), Val::I64(sp), Val::I64(sl)]);
+        let got = vm.invoke("temen_run_pb", &[Val::I64(mp), Val::I64(ml), Val::I64(sp), Val::I64(sl)]);
         let st = vm.status();
-        let out = hex(&vm.read_out("svm_stdout_ptr", "svm_stdout_len"));
-        let err = hex(&vm.read_out("svm_stderr_ptr", "svm_stderr_len"));
-        let exit = vm.invoke("svm_exit_code", &[]) as i32;
+        let out = hex(&vm.read_out("temen_stdout_ptr", "temen_stdout_len"));
+        let err = hex(&vm.read_out("temen_stderr_ptr", "temen_stderr_len"));
+        let exit = vm.invoke("temen_exit_code", &[]) as i32;
         vm.free(mp, ml);
         vm.free(sp, sl);
         let ws = i(c, "status") as i32;
@@ -225,17 +225,17 @@ fn main() {
         sc.check(&s(c, "name"), ok, &format!("status {st}"));
     }
 
-    // ---- capture + gc-roots: svm_run_capture + snapshot -------------------------------------
+    // ---- capture + gc-roots: temen_run_capture + snapshot -------------------------------------
     let run_capture_like = |vm: &mut Vm, sc: &mut Score, section: &str| {
         for c in arr(&corpus, section) {
             let (mp, ml) = vm.load(&read_module(&s(c, "file")));
             let (ip, il) = vm.load(&unhex(&s(c, "init")));
             let got = vm.invoke(
-                "svm_run_capture",
+                "temen_run_capture",
                 &[Val::I64(mp), Val::I64(ml), Val::I64(ip), Val::I64(il), Val::I64(i(c, "arg"))],
             );
             let st = vm.status();
-            let snap = hex(&vm.read_out("svm_snapshot_ptr", "svm_snapshot_len"));
+            let snap = hex(&vm.read_out("temen_snapshot_ptr", "temen_snapshot_len"));
             vm.free(mp, ml);
             vm.free(ip, il);
             let ws = i(c, "status") as i32;
@@ -248,17 +248,17 @@ fn main() {
     println!("[gc.roots]");
     run_capture_like(&mut vm, &mut sc, "gcroots");
 
-    // ---- durability: svm_run_durable + snapshot ---------------------------------------------
+    // ---- durability: temen_run_durable + snapshot ---------------------------------------------
     println!("[durability]");
     for c in arr(&corpus, "durable") {
         let (mp, ml) = vm.load(&read_module(&s(c, "file")));
         let (ip, il) = vm.load(&unhex(&s(c, "init")));
         let got = vm.invoke(
-            "svm_run_durable",
+            "temen_run_durable",
             &[Val::I64(mp), Val::I64(ml), Val::I64(ip), Val::I64(il), Val::I64(i(c, "clock"))],
         );
         let st = vm.status();
-        let snap = hex(&vm.read_out("svm_snapshot_ptr", "svm_snapshot_len"));
+        let snap = hex(&vm.read_out("temen_snapshot_ptr", "temen_snapshot_len"));
         vm.free(mp, ml);
         vm.free(ip, il);
         let ws = i(c, "status") as i32;
@@ -287,15 +287,15 @@ fn main() {
         }
     };
     println!("[nested children]");
-    run_single(&mut vm, &mut sc, "nested", "svm_run_nested", None);
+    run_single(&mut vm, &mut sc, "nested", "temen_run_nested", None);
     println!("[SharedRegion]");
-    run_single(&mut vm, &mut sc, "region", "svm_run_region", None);
+    run_single(&mut vm, &mut sc, "region", "temen_run_region", None);
     println!("[guest-JIT]");
-    run_single(&mut vm, &mut sc, "jit", "svm_run_jit", None);
+    run_single(&mut vm, &mut sc, "jit", "temen_run_jit", None);
     println!("[dynamic linking]");
-    run_single(&mut vm, &mut sc, "dynlink", "svm_run_dynlink", Some("link"));
+    run_single(&mut vm, &mut sc, "dynlink", "temen_run_dynlink", Some("link"));
 
-    // ---- scale: a 2 MiB stdin→stdout echo through svm_alloc ----------------------------------
+    // ---- scale: a 2 MiB stdin→stdout echo through temen_alloc ----------------------------------
     println!("[scale]");
     {
         const SIZE: usize = 2 << 20;
@@ -303,11 +303,11 @@ fn main() {
         for (k, b) in input.iter_mut().enumerate() {
             *b = (k.wrapping_mul(2654435761) & 0xff) as u8;
         }
-        let (mp, ml) = vm.load(&read_module("corpus/bigecho.svmbc"));
+        let (mp, ml) = vm.load(&read_module("corpus/bigecho.temenc"));
         let (sp, sl) = vm.load(&input);
-        vm.invoke("svm_run_pb", &[Val::I64(mp), Val::I64(ml), Val::I64(sp), Val::I64(sl)]);
+        vm.invoke("temen_run_pb", &[Val::I64(mp), Val::I64(ml), Val::I64(sp), Val::I64(sl)]);
         let st = vm.status();
-        let out = vm.read_out("svm_stdout_ptr", "svm_stdout_len");
+        let out = vm.read_out("temen_stdout_ptr", "temen_stdout_len");
         vm.free(mp, ml);
         vm.free(sp, sl);
         let ok = st == 0 && out == input;

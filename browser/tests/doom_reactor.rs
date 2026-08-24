@@ -1,5 +1,5 @@
 //! **Doom boots + renders in the browser reactor** (Doom slice 4) — the end-to-end proof that the
-//! playground's run model (the wasm `svm_onramp_open_fs` → [`OnrampReactor::open_with_fs`] path)
+//! playground's run model (the wasm `temen_onramp_open_fs` → [`OnrampReactor::open_with_fs`] path)
 //! drives real Doom: `_start` (`doomgeneric_Create`) reads the shareware IWAD through the reactor's
 //! `fs` capability, then each `tick` (`doomgeneric_Tick`) renders one frame (at `build.sh`'s compiled-in
 //! resolution — Doom's native 320×200 by default) over the
@@ -7,14 +7,14 @@
 //! Rust the wasm export wraps — the slice-3c `doom_diff` differential already proved the *pixels* are
 //! byte-exact; this proves the *reactor wiring* (fs-served WAD in, per-frame `tick`, `display` out).
 //!
-//! `#[ignore]`d — it needs the built `doom.svmb` (`demos/doom/build.sh`; not vendored). The shareware
-//! `doom1.wad` **is** vendored (`crates/svm-run/demos/doom/doom1.wad`). Paths are overridable via
-//! `DOOM_SVMB` / `DOOM_WAD` (defaults match the demo scripts' cache; point `DOOM_WAD` at the vendored
+//! `#[ignore]`d — it needs the built `doom.temen` (`demos/doom/build.sh`; not vendored). The shareware
+//! `doom1.wad` **is** vendored (`crates/temen-run/demos/doom/doom1.wad`). Paths are overridable via
+//! `DOOM_TEMEN` / `DOOM_WAD` (defaults match the demo scripts' cache; point `DOOM_WAD` at the vendored
 //! file to skip the fetch). Run:
-//!   sh crates/svm-run/demos/doom/fetch.sh && sh crates/svm-run/demos/doom/build.sh
-//!   cargo test -p svm-browser --test doom_reactor -- --ignored --nocapture
+//!   sh crates/temen-run/demos/doom/fetch.sh && sh crates/temen-run/demos/doom/build.sh
+//!   cargo test -p temen-browser --test doom_reactor -- --ignored --nocapture
 
-use svm_browser::{OnrampReactor, STATUS_OK};
+use temen_browser::{OnrampReactor, STATUS_OK};
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -23,14 +23,14 @@ fn env_or(key: &str, default: &str) -> String {
 #[test]
 #[ignore = "needs demos/doom/{fetch,build}.sh artifacts + doom1.wad; slow"]
 fn doom_boots_and_renders_in_the_reactor() {
-    let svmb = std::fs::read(env_or("DOOM_SVMB", "/tmp/doomgeneric_cache/bc/doom.svmb"))
-        .expect("built doom.svmb — run demos/doom/build.sh first");
+    let temen = std::fs::read(env_or("DOOM_TEMEN", "/tmp/doomgeneric_cache/bc/doom.temen"))
+        .expect("built doom.temen — run demos/doom/build.sh first");
     let wad = std::fs::read(env_or("DOOM_WAD", "/tmp/doomgeneric_cache/doom1.wad"))
         .expect("shareware doom1.wad");
     assert_eq!(&wad[..4], b"IWAD", "shareware IWAD");
 
-    let m = svm_encode::decode_module(&svmb).expect("decode doom.svmb");
-    // Open the reactor with the WAD served behind `fs` (the wasm `svm_onramp_open_fs` path). `_start`
+    let m = temen_encode::decode_module(&temen).expect("decode doom.temen");
+    // Open the reactor with the WAD served behind `fs` (the wasm `temen_onramp_open_fs` path). `_start`
     // runs Doom's whole init here — Z_Init, W_Init (reads the WAD through `fs`), R_Init, the lot.
     let mut r = OnrampReactor::open_with_fs(&m, "doom1.wad".to_string(), wad)
         .expect("Doom's _start (doomgeneric_Create) runs to completion over the fs-served WAD");

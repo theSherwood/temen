@@ -1,13 +1,13 @@
 //! **Futamura projection of a register-machine bytecode VM** — the Lua / QuickJS execution model
 //! (a register file + a constant program + a decode-and-dispatch loop), a step up from the
-//! tape-machine Brainfuck demo (`crates/svm-llvm/tests/peval_demo.rs`).
+//! tape-machine Brainfuck demo (`crates/temen-llvm/tests/peval_demo.rs`).
 //!
-//! A real register VM written in C is compiled `clang -O2 → LLVM → svm-llvm → svm-IR`, then
-//! partial-evaluated by `svm-peval` against a fixed bytecode program (the `prog` pointer is opaque to
+//! A real register VM written in C is compiled `clang -O2 → LLVM → temen-llvm → temen-IR`, then
+//! partial-evaluated by `temen-peval` against a fixed bytecode program (the `prog` pointer is opaque to
 //! clang, but we declare it + its readonly bytes constant — the §20c caller contract). The residual
 //! is the *compiled* program: the opcode decode and the `br_table` dispatch fold away, leaving the
 //! data-dependent loop over the register file. We measure the residual against the un-specialized
-//! interpreter across **all four backends** (tree-walk, bytecode, svm-jit, svm-wasm-jit on Wasmtime).
+//! interpreter across **all four backends** (tree-walk, bytecode, temen-jit, temen-wasm-jit on Wasmtime).
 //!
 //! Run: `cargo run --release --manifest-path bench/Cargo.toml --bin peval_regvm`
 //!
@@ -22,10 +22,10 @@ use std::hint::black_box;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use svm_ir::{Module, ValType, DEFAULT_RESERVED_LOG2};
-use svm_jit::{CompiledModule, JitOutcome, Quota, INERT_CAP_THUNK};
-use svm_peval::{optimize_module, specialize, SpecArg};
-use svm_verify::verify_module;
+use temen_ir::{Module, ValType, DEFAULT_RESERVED_LOG2};
+use temen_jit::{CompiledModule, JitOutcome, Quota, INERT_CAP_THUNK};
+use temen_peval::{optimize_module, specialize, SpecArg};
+use temen_verify::verify_module;
 
 const WIN_BASE: u32 = 0x1_0000;
 const ENV_PTR: u32 = 1024;
@@ -75,7 +75,7 @@ fn prog_bytes() -> Vec<u8> {
     words.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 
-fn compile_c_to_svm(src: &str) -> (Module, i64) {
+fn compile_c_to_temen(src: &str) -> (Module, i64) {
     let base = std::env::temp_dir().join("peval_regvm");
     let cf = base.with_extension("c");
     let ll = base.with_extension("ll");
@@ -95,14 +95,14 @@ fn compile_c_to_svm(src: &str) -> (Module, i64) {
         .unwrap()
         .success();
     assert!(ok, "clang failed (need clang on PATH)");
-    let t = svm_llvm::translate_ll_path(&ll).expect("svm-llvm translate");
+    let t = temen_llvm::translate_ll_path(&ll).expect("temen-llvm translate");
     let _ = std::fs::remove_file(&cf);
     let _ = std::fs::remove_file(&ll);
     (t.module, t.entry_sp as i64)
 }
 
 fn run_entry(m: &Module) -> u32 {
-    // svm-llvm prepends the data-stack pointer, so `run(prog, input)` is `run(sp, prog, input)`.
+    // temen-llvm prepends the data-stack pointer, so `run(prog, input)` is `run(sp, prog, input)`.
     m.exports
         .iter()
         .find(|e| e.name == "run")
@@ -140,10 +140,10 @@ fn prog_addr(m: &Module) -> i64 {
 
 fn tree_walk(m: &Module, entry: u32, args: &[i64]) -> i64 {
     let mut fuel = u64::MAX;
-    let vs: Vec<svm_interp::Value> = args.iter().map(|&a| svm_interp::Value::I64(a)).collect();
-    match svm_interp::run(m, entry, &vs, &mut fuel) {
+    let vs: Vec<temen_interp::Value> = args.iter().map(|&a| temen_interp::Value::I64(a)).collect();
+    match temen_interp::run(m, entry, &vs, &mut fuel) {
         Ok(v) => match v.as_slice() {
-            [svm_interp::Value::I64(x)] => *x,
+            [temen_interp::Value::I64(x)] => *x,
             o => panic!("bad tree-walk result {o:?}"),
         },
         Err(t) => panic!("tree-walk trapped: {t:?}"),
@@ -152,10 +152,10 @@ fn tree_walk(m: &Module, entry: u32, args: &[i64]) -> i64 {
 
 fn bytecode(m: &Module, entry: u32, args: &[i64]) -> i64 {
     let mut fuel = u64::MAX;
-    let vs: Vec<svm_interp::Value> = args.iter().map(|&a| svm_interp::Value::I64(a)).collect();
-    match svm_interp::bytecode::compile_and_run(m, entry, &vs, &mut fuel) {
+    let vs: Vec<temen_interp::Value> = args.iter().map(|&a| temen_interp::Value::I64(a)).collect();
+    match temen_interp::bytecode::compile_and_run(m, entry, &vs, &mut fuel) {
         Some(Ok(v)) => match v.as_slice() {
-            [svm_interp::Value::I64(x)] => *x,
+            [temen_interp::Value::I64(x)] => *x,
             o => panic!("bad bytecode result {o:?}"),
         },
         Some(Err(t)) => panic!("bytecode trapped: {t:?}"),
@@ -164,7 +164,7 @@ fn bytecode(m: &Module, entry: u32, args: &[i64]) -> i64 {
 }
 
 fn jit_run(m: &Module, entry: u32, args: &[i64]) -> i64 {
-    match svm_jit::compile_and_run(m, entry, args) {
+    match temen_jit::compile_and_run(m, entry, args) {
         Ok(JitOutcome::Returned(v)) => v[0],
         o => panic!("jit outcome {o:?}"),
     }
@@ -195,10 +195,10 @@ fn jit_call(cm: &mut CompiledModule, args: &[i64]) -> i64 {
     }
 }
 
-/// Compile with svm-wasm-jit and run `f{entry}` on Wasmtime with the confined-window ABI.
+/// Compile with temen-wasm-jit and run `f{entry}` on Wasmtime with the confined-window ABI.
 fn wasmjit_prepare(m: &Module, entry: u32) -> (wasmtime::Store<i32>, wasmtime::Instance, String) {
     use wasmtime::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store};
-    let wasm = svm_wasm_jit::compile_module(m).expect("wasm-jit emit");
+    let wasm = temen_wasm_jit::compile_module(m).expect("wasm-jit emit");
     let engine = Engine::default();
     let module = WModule::new(&engine, &wasm).expect("emitted wasm validates");
     let mut store: Store<i32> = Store::new(&engine, 0);
@@ -208,7 +208,7 @@ fn wasmjit_prepare(m: &Module, entry: u32) -> (wasmtime::Store<i32>, wasmtime::I
         .write(&mut store, ENV_PTR as usize, &(1i64 << 52).to_le_bytes())
         .unwrap();
     // Seed the window from the module's data segments (each at WIN_BASE + offset) so the interpreter
-    // reads its readonly program — what the browser / bench linkers do (svm-wasm-jit entry_data test).
+    // reads its readonly program — what the browser / bench linkers do (temen-wasm-jit entry_data test).
     for seg in &m.data {
         memory
             .write(
@@ -274,7 +274,7 @@ fn blocks(m: &Module, entry: u32) -> usize {
 }
 
 fn main() {
-    let (m, sp) = compile_c_to_svm(VM_C);
+    let (m, sp) = compile_c_to_temen(VM_C);
     verify_module(&m).expect("interpreter verifies");
     let entry = run_entry(&m);
     let pa = prog_addr(&m);
@@ -314,7 +314,7 @@ fn main() {
         assert_eq!(
             jit_run(&residual, 0, &[input]),
             want,
-            "svm-jit residual @ {input}"
+            "temen-jit residual @ {input}"
         );
         let (mut si, ii, fi) = wasmjit_prepare(&m, entry);
         assert_eq!(
@@ -350,12 +350,12 @@ fn main() {
             best_of(reps, || bytecode(&residual, 0, &[n])),
         ),
         (
-            "svm-jit     ",
+            "temen-jit     ",
             best_of(reps, || jit_call(&mut cm_i, &[sp, pa, n])),
             best_of(reps, || jit_call(&mut cm_r, &[n])),
         ),
         (
-            "svm-wasm-jit",
+            "temen-wasm-jit",
             best_of(reps, || wasmjit_run(&mut wi_s, &wi_i, &wi_f, &[sp, pa, n])),
             best_of(reps, || wasmjit_run(&mut wr_s, &wr_i, &wr_f, &[n])),
         ),

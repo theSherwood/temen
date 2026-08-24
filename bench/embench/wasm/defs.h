@@ -1,7 +1,7 @@
 /* Definitions of the few libc functions the Embench `run` path actually *calls* (as opposed to the
  * `memcpy`/`memset`/`memmove` that `-mbulk-memory` lowers to wasm instructions, or `memcmp`/`bcmp`
- * that `wrapper.c`'s `SVM_BUILD` block defines). Force-included ahead of the kernel sources for the
- * wasm32 build (`clang -include`), which is `-nostdlib` and so has no real libc. The host SVM build
+ * that `wrapper.c`'s `TEMEN_BUILD` block defines). Force-included ahead of the kernel sources for the
+ * wasm32 build (`clang -include`), which is `-nostdlib` and so has no real libc. The host Temen build
  * gets these from the on-ramp's synthesized helpers instead and never includes this file. */
 #include <stddef.h>
 size_t strlen(const char *s) {

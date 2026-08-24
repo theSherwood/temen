@@ -1,4 +1,4 @@
-//! libFuzzer target for the §3.5 **coverage walk** (`svm_interp::coverage_remap`) — the
+//! libFuzzer target for the §3.5 **coverage walk** (`temen_interp::coverage_remap`) — the
 //! grouped-import binding hinge. On arbitrary requirement/provider `(name, sig)` lists the
 //! walk must never panic, and a returned remap must actually witness coverage:
 //!
@@ -14,7 +14,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use svm_ir::{FuncType, ValType};
+use temen_ir::{FuncType, ValType};
 
 /// Decode a small `(names, sigs)` pool from raw fuzz bytes: names from a tiny alphabet (so
 /// requirement/provider names collide often — the interesting case), signatures from a small
@@ -49,20 +49,35 @@ fuzz_target!(|data: &[u8]| {
     let (prov_names, prov_sigs) = lists(&mut d);
     // Both name-keyed (names present) and legacy positional (names dropped) provider forms.
     for prov_names in [prov_names.as_slice(), &[]] {
-        let Some(remap) = svm_interp::coverage_remap(&req_names, &req_sigs, prov_names, &prov_sigs)
+        let Some(remap) =
+            temen_interp::coverage_remap(&req_names, &req_sigs, prov_names, &prov_sigs)
         else {
             continue;
         };
-        assert_eq!(remap.len(), req_sigs.len(), "one remap entry per required op");
+        assert_eq!(
+            remap.len(),
+            req_sigs.len(),
+            "one remap entry per required op"
+        );
         for (i, &p) in remap.iter().enumerate() {
             let p = p as usize;
             assert!(p < prov_sigs.len(), "remap entry in provider range");
-            assert_eq!(prov_sigs[p], req_sigs[i], "mapped signature equals requirement");
+            assert_eq!(
+                prov_sigs[p], req_sigs[i],
+                "mapped signature equals requirement"
+            );
             if prov_names.is_empty() {
                 let first = prov_sigs.iter().position(|s| *s == req_sigs[i]);
-                assert_eq!(first, Some(p), "legacy fallback maps to the first sig match");
+                assert_eq!(
+                    first,
+                    Some(p),
+                    "legacy fallback maps to the first sig match"
+                );
             } else {
-                assert_eq!(prov_names[p], req_names[i], "mapped name equals requirement");
+                assert_eq!(
+                    prov_names[p], req_names[i],
+                    "mapped name equals requirement"
+                );
             }
         }
     }

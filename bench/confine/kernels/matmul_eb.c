@@ -3,11 +3,11 @@
 // the real embench `matmult-int` inner structure: `int` (32-bit) indices, a memory-accumulated
 // `Res[Outer][Inner] +=`, and — the ingredient that matters — a per-iteration bulk array copy.
 //
-// That copy is why svm-jit trails Wasmtime-w64 here (~1.3x). LLVM lowers `da[k]=sa[k]` over the whole
+// That copy is why temen-jit trails Wasmtime-w64 here (~1.3x). LLVM lowers `da[k]=sa[k]` over the whole
 // array to a `memcpy`; the wasm64 lane (built with -mbulk-memory) turns it into a single `memory.copy`
-// that is range-checked once, while svm-llvm lowers the same memcpy to an *inline chunked copy* where
+// that is range-checked once, while temen-llvm lowers the same memcpy to an *inline chunked copy* where
 // every 8-byte chunk is an individually confinement-masked load/store (see MAX_MEM_UNROLL in
-// crates/svm-llvm/src/lib.rs). Two 3200-byte copies/iter => ~1600 masked accesses vs ~2 range checks.
+// crates/temen-llvm/src/lib.rs). Two 3200-byte copies/iter => ~1600 masked accesses vs ~2 range checks.
 #define N 20
 typedef long matrix[N][N];
 static matrix ArrayA_ref, ArrayA, ArrayB_ref, ArrayB, ResultArray;

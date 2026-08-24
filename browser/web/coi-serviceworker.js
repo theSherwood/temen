@@ -1,6 +1,6 @@
 /*! coi-serviceworker v0.1.7 - Guido Zuidhof and contributors, licensed under MIT */
 // Vendored (github.com/gzuidhof/coi-serviceworker). GitHub Pages can't set response headers, but the
-// SVM playground needs `crossOriginIsolated` (SharedArrayBuffer for the shared WebAssembly.Memory the
+// Temen playground needs `crossOriginIsolated` (SharedArrayBuffer for the shared WebAssembly.Memory the
 // multi-Worker engine runs over). This service worker re-adds COOP/COEP to every response on the
 // client, so the page becomes cross-origin isolated on a static host. Locally (serve.mjs already sets
 // the headers) it detects isolation is present and does nothing.

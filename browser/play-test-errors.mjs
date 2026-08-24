@@ -1,7 +1,7 @@
 // Shared benign-404 filter for tests that load `play.html`.
 //
-// A warm card (issues #804/#805) pre-warms its snapshot on page load, fetching its `.svmb`. A
-// **deploy-built** asset (e.g. `tcl_snapshot.svmb`, whose Tcl fetch + toolchain isn't in the
+// A warm card (issues #804/#805) pre-warms its snapshot on page load, fetching its `.temen`. A
+// **deploy-built** asset (e.g. `tcl_snapshot.temen`, whose Tcl fetch + toolchain isn't in the
 // committed-asset browser job) is absent there, so that fetch 404s — a benign console error the
 // browser logs and JS can't suppress (the prewarm's `.catch` degrades the card, but the console
 // entry remains). Every page-load test with a strict console handler would fail on it.

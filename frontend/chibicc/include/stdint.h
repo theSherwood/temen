@@ -1,7 +1,7 @@
-#ifndef __SVM_CHIBICC_STDINT_H
-#define __SVM_CHIBICC_STDINT_H
+#ifndef __TEMEN_CHIBICC_STDINT_H
+#define __TEMEN_CHIBICC_STDINT_H
 
-// Minimal freestanding <stdint.h> for the SVM chibicc frontend (LP64, §3d). Shipping our own
+// Minimal freestanding <stdint.h> for the Temen chibicc frontend (LP64, §3d). Shipping our own
 // keeps `#include <stdint.h>` from pulling the system libc's <sys/cdefs.h>, which — because
 // chibicc does not define __GNUC__ — `#define`s `__attribute__(x)` to nothing, silently
 // stripping attributes like `__attribute__((packed))` (e.g. real C's packed enums) before the

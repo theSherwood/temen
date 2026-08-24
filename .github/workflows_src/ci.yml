@@ -37,7 +37,7 @@ env:
   # The Postgres the playground ships. One source of truth on purpose: it keys the build-input cache
   # *and* is read by build-pg-assets.mjs. If those two ever disagree, a bump would hit the old
   # version's cached bitcode + cluster, skip the rebuild, and ship the old Postgres — silently.
-  SVM_PG_VER: "17.5"
+  TEMEN_PG_VER: "17.5"
 
 jobs:
 
@@ -70,7 +70,7 @@ jobs:
       - run: cargo build --workspace
       # ISSUES.md I30 durable mitigation (three sightings: a rust-lld SIGBUS, then two runner
       # losses ~50 s into this step on 2026-07-23): the test build's parallel LINK phase is the
-      # memory peak — several svm-jit test binaries (each pulling the large Cranelift + Wasmtime
+      # memory peak — several temen-jit test binaries (each pulling the large Cranelift + Wasmtime
       # rlibs) linking concurrently can OOM a 16 GB runner under neighbor pressure, which kills
       # the runner agent (no logs, step frozen "in_progress"). Cap build parallelism to bound
       # concurrent links; the step is warm-cache dominated, so the wall-clock cost is small.
@@ -98,16 +98,16 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - run: node browser/check-play-assets.mjs
 
-  # Tier-2 end-to-end: build the real nimony toolchain and run `crates/svm-leng/tests/nim_e2e.rs`,
+  # Tier-2 end-to-end: build the real nimony toolchain and run `crates/temen-leng/tests/nim_e2e.rs`,
   # which compiles small **Nim source** programs through `nimony c` (→ nifler → nimony → hexer) and
-  # runs them on both SVM engines. Nothing mid-pipeline is committed — the toolchain regenerates the
+  # runs them on both Temen engines. Nothing mid-pipeline is committed — the toolchain regenerates the
   # `.x.nif` each run, so the tests can't rot against a stale snapshot. Without this job the same
   # tests still run in `check` but *skip* (no toolchain); here they actually execute.
   # NOTE (owner): actions pinned by SHA per repo convention EXCEPT `alaviss/setup-nim` (no vetted SHA
   # to hand) — pin it when you copy this over. The nimony build is heavy (~10-15 min cold); the cache
   # makes warm runs cheap.
   nim-e2e:
-    name: nim end-to-end (real toolchain → svm)
+    name: nim end-to-end (real toolchain → temen)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -161,9 +161,9 @@ jobs:
       - name: Build nimony toolchain
         run: scripts/ci/provision-nimony.sh "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
       - name: Nim end-to-end tests (both engines)
-        run: cargo test -p svm-leng --test nim_e2e -- --nocapture
+        run: cargo test -p temen-leng --test nim_e2e -- --nocapture
       - name: Nim language conformance matrix (#956)
-        run: cargo test -p svm-leng --test nim_conformance -- --nocapture
+        run: cargo test -p temen-leng --test nim_conformance -- --nocapture
 
   # The CI token can't push `.github/workflows/` (needs the `workflow` OAuth scope), so agent-authored
   # workflow changes are staged in `.github/workflows_src/` and the owner copies them over
@@ -324,12 +324,12 @@ jobs:
         with: { toolchain: "${{ env.RUST_STABLE }}" }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: loom model check
-        run: cargo test -p svm-jit --lib loom
+        run: cargo test -p temen-jit --lib loom
         env:
           RUSTFLAGS: "--cfg loom"
 
-  svm-llvm:
-    name: svm-llvm (LLVM→IR on-ramp · Linux-only)
+  temen-llvm:
+    name: temen-llvm (LLVM→IR on-ramp · Linux-only)
     runs-on: ubuntu-latest
     # Normal lane time is ~20 min. Without a timeout, one wedged fixture compile burns the 6-hour
     # GitHub default before reporting — seen once as a rustc hang inside std_guest's build-std
@@ -342,7 +342,7 @@ jobs:
           toolchain: ${{ env.RUST_STABLE }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with: { workspaces: crates/svm-llvm }
+        with: { workspaces: crates/temen-llvm }
       - name: install LLVM/clang 18 (out-of-process build tools, no dev headers)
         # The on-ramp now reads **textual `.ll`** via an in-house parser — it no longer links
         # libLLVM, so the `-dev` headers/lib are gone. The test harness still shells out to two
@@ -365,18 +365,18 @@ jobs:
         # Without it the `peval_futamura`/`peval_jit`/`peval_in_sandbox` tests auto-skip (don't fail).
         run: rustup toolchain install 1.81.0 --profile minimal
       - name: fmt · clippy · test
-        working-directory: crates/svm-llvm
+        working-directory: crates/temen-llvm
         run: |
           cargo fmt --all --check
           cargo clippy --all-targets -- -D warnings
           cargo test
 
   std-guest:
-    name: rust-svm std lane (build-std · lean + threads · nightly)
-    # The `std_guest` suite auto-skips in the always-on `svm-llvm` job (it needs a nightly toolchain
-    # with `rust-src` and the svm std overlay applied — absent there). This job provides that lane so
-    # the tests actually run: both target specs (lean `x86_64-unknown-svm` and threaded
-    # `x86_64-unknown-svm-threads`) are compiled via `-Zbuild-std`, translated, verified, and run.
+    name: rust-temen std lane (build-std · lean + threads · nightly)
+    # The `std_guest` suite auto-skips in the always-on `temen-llvm` job (it needs a nightly toolchain
+    # with `rust-src` and the temen std overlay applied — absent there). This job provides that lane so
+    # the tests actually run: both target specs (lean `x86_64-unknown-temen` and threaded
+    # `x86_64-unknown-temen-threads`) are compiled via `-Zbuild-std`, translated, verified, and run.
     # Nightly-only (like `cc1-self-compile-giants` / `full-depth-gates` / `nim-e2e`): each test does a
     # full `build-std` (~40 s) and they run serially, too slow for the per-PR gate.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -390,7 +390,7 @@ jobs:
       RUSTFLAGS: ""
       # #788 wedge guard, enforced inside the harness (`build_std_bin_ll_target`): kill and skip any
       # single `build-std` that runs longer than this, so one hung `rustc` can't stall the job.
-      SVM_STD_BUILD_TIMEOUT_SECS: "480"
+      TEMEN_STD_BUILD_TIMEOUT_SECS: "480"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -400,11 +400,11 @@ jobs:
       - name: install nightly + rust-src (for -Zbuild-std)
         run: rustup toolchain install nightly --profile minimal --component rust-src
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with: { workspaces: crates/svm-llvm }
-      - name: apply the svm std overlay to nightly's rust-src
-        run: crates/svm-llvm/rust-svm/apply-overlay.sh
+        with: { workspaces: crates/temen-llvm }
+      - name: apply the temen std overlay to nightly's rust-src
+        run: crates/temen-llvm/rust-temen/apply-overlay.sh
       - name: std_guest suite (lean + threads specs)
-        working-directory: crates/svm-llvm
+        working-directory: crates/temen-llvm
         # Single-threaded: the tests already run serially, and forcing one thread keeps the build-std
         # timeout accounting per-test rather than racing several `rustc` builds at once.
         run: cargo test --test std_guest -- --test-threads=1 --nocapture
@@ -415,7 +415,7 @@ jobs:
     # The guest compiler runs under the tree-walk interpreter — slow but finite. Bound a wedged run
     # rather than sit at GitHub's 6 h default; generous vs. a cold-cache build + the ~2 min run.
     timeout-minutes: 25
-    # ISSUES.md I30: the svm test-binary LINK phase (Cranelift + Wasmtime rlibs) is the memory peak;
+    # ISSUES.md I30: the temen test-binary LINK phase (Cranelift + Wasmtime rlibs) is the memory peak;
     # drop test debug info (symbols/backtraces survive, only line tables go) as the `check` job does.
     env:
       CARGO_PROFILE_TEST_DEBUG: "0"
@@ -442,7 +442,7 @@ jobs:
       # filter) runs *every* heavy c_link gate — both `whole_cc1_self_compiles…` and the stage-2
       # `whole_cc1_compiles_its_own_tu…` (the guest compiling chibicc's own TUs) — so a new heavy test
       # gates automatically rather than silently going unrun.
-      - run: cargo test -p svm --test c_link -j 2 -- --ignored
+      - run: cargo test -p temen --test c_link -j 2 -- --ignored
 
   cc1-self-compile-giants:
     name: cc1 self-compile - giant TUs (nightly)
@@ -452,13 +452,13 @@ jobs:
     # five tractable TUs in the always-on cc1-self-compile job this completes per-TU byte-identity
     # across ALL NINE cc1 TUs - the sufficient condition for the chibicc2 == chibicc3 fixpoint
     # (SELFHOST_C.md section 5 E): the guest's objects link to the native-built guest, which reproduces
-    # its own output. The whole_cc1_compiles_giant_tus test self-skips unless SVM_SELFHOST_GIANTS=1.
+    # its own output. The whole_cc1_compiles_giant_tus test self-skips unless TEMEN_SELFHOST_GIANTS=1.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
       CARGO_PROFILE_TEST_DEBUG: "0"
-      SVM_SELFHOST_GIANTS: "1"
+      TEMEN_SELFHOST_GIANTS: "1"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -468,7 +468,7 @@ jobs:
       - name: install clang (native reference compiler)
         timeout-minutes: 15
         run: sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure* && sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/*.sources 2>/dev/null || true && sudo apt-get update && sudo apt-get install -y clang
-      - run: cargo test -p svm --test c_link -j 2 -- --ignored whole_cc1_compiles_giant_tus
+      - run: cargo test -p temen --test c_link -j 2 -- --ignored whole_cc1_compiles_giant_tus
 
   full-depth-gates:
     name: full-depth interpreter gates (nightly)
@@ -479,7 +479,7 @@ jobs:
     # with the native `cc` build. They're #[ignore]d purely for wall-clock — a whole interpreter on the
     # tree-walker is minutes per suite (api.lua alone ~7 min on bytecode; the lua sweep ~15 min) — so
     # like `miri`/giants they ride the daily schedule + manual dispatch, not the per-PR gate. Before
-    # this job these gates ran only when someone typed `--ignored` by hand: the svm-llvm job's plain
+    # this job these gates ran only when someone typed `--ignored` by hand: the temen-llvm job's plain
     # `cargo test` covers only the JIT variants, and that JIT-only blind spot already let the QuickJS
     # on-ramp recipe drift unseen once (translate.rs). The capstones self-skip loudly (never fail) when
     # clang/curl/make/openlibm are unavailable — grep the log for `skipping` before trusting a green run.
@@ -494,9 +494,9 @@ jobs:
         with:
           toolchain: ${{ env.RUST_STABLE }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with: { workspaces: crates/svm-llvm }
+        with: { workspaces: crates/temen-llvm }
       - name: install LLVM/clang 18 (+ make/curl for the capstone fetchers)
-        # Same out-of-process build tools as the svm-llvm job (clang-18 + llvm-dis for the on-ramp);
+        # Same out-of-process build tools as the temen-llvm job (clang-18 + llvm-dis for the on-ramp);
         # make + curl let the Tcl/sqlite capstones fetch and build their sources rather than self-skip.
         run: |
           # ISSUES.md I67: drop the runner's unused microsoft/azure apt sources so a transient
@@ -505,42 +505,42 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y llvm-18 clang-18 make curl
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
-      # svm-llvm is workspace-excluded, so run from its own directory (like the `svm-llvm` job) rather
-      # than `-p svm-llvm`. `--ignored` per test binary runs exactly that binary's ignored set: the lua
+      # temen-llvm is workspace-excluded, so run from its own directory (like the `temen-llvm` job) rather
+      # than `-p temen-llvm`. `--ignored` per test binary runs exactly that binary's ignored set: the lua
       # binaries hold only the full-depth suites, and `translate`'s ignored set is the three capstones
       # (both #[ignore]d Tcl demos + the full sqlite sweep) — no perf benches ride along.
       - name: Lua full-depth suite (bytecode + tree-walker)
-        working-directory: crates/svm-llvm
+        working-directory: crates/temen-llvm
         run: |
           cargo test --test lua_tlib  -- --ignored
           cargo test --test lua_all   -- --ignored
           cargo test --test lua_sweep -- --ignored
       - name: whole-language capstones (Tcl REPL/init, full sqlite sweep)
-        working-directory: crates/svm-llvm
+        working-directory: crates/temen-llvm
         # --nocapture so the loud self-skips ("skipping tcl"/"skipping quickjs") are visible in the log;
         # a green run with a skip note is NOT a real pass (see the harness comments in translate.rs).
         run: cargo test --test translate -- --ignored --nocapture
 
   miri:
-    # Run the unsafe memory substrate under Miri's UB/provenance + data-race checkers. svm-mem is
+    # Run the unsafe memory substrate under Miri's UB/provenance + data-race checkers. temen-mem is
     # Miri-aware (a heap-backed fallback replaces the mmap FFI under `cfg(miri)`), so its raw-pointer
     # atomics and the Mapped-vs-Paged differential get provenance/race-checked — complementing loom
     # (which models the protocol atomics) and TSan.
     #
-    # Nightly + manual only (CI speed): Miri interprets svm-mem and takes ~18 min — second only to the
+    # Nightly + manual only (CI speed): Miri interprets temen-mem and takes ~18 min — second only to the
     # windows `build · test` on the run's critical path. The unsafe substrate it guards changes rarely,
     # so it rides the daily `schedule` cron like the other deep UB checks (asan/tsan/asan-jit-setjmp)
     # rather than gating every PR. NOTE: if `miri` is a *required* status check in branch protection,
     # drop it from that list (a skipped required check blocks merges).
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    name: miri (svm-mem unsafe substrate)
+    name: miri (temen-mem unsafe substrate)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with: { components: miri }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo +nightly miri test -p svm-mem
+      - run: cargo +nightly miri test -p temen-mem
         env:
           # Miri's weak-memory emulation ICEs on the differential test's mixed-size atomic accesses
           # ("partially overlapping store buffer when previous write was atomic" — a Miri bug, not ours).
@@ -563,9 +563,9 @@ jobs:
       - run: cargo audit
 
   asan:
-    # AddressSanitizer over the fiber stack-switch paths. svm-fiber's `asan` feature emits the
+    # AddressSanitizer over the fiber stack-switch paths. temen-fiber's `asan` feature emits the
     # __sanitizer_{start,finish}_switch_fiber annotations so ASan can follow manual stack switches.
-    name: ASan (svm-fiber switches)
+    name: ASan (temen-fiber switches)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
@@ -573,8 +573,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with: { components: rust-src }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: cargo test -p svm-fiber (ASan + asan feature)
-        run: cargo test -p svm-fiber --features asan -Z build-std --target x86_64-unknown-linux-gnu
+      - name: cargo test -p temen-fiber (ASan + asan feature)
+        run: cargo test -p temen-fiber --features asan -Z build-std --target x86_64-unknown-linux-gnu
         env:
           RUSTFLAGS: "-Zsanitizer=address"
           # The scheduler intentionally leaks values live on a dropped-suspended fiber's stack
@@ -582,8 +582,8 @@ jobs:
           ASAN_OPTIONS: "detect_leaks=0"
 
   tsan:
-    # ThreadSanitizer over the shared-region hardware atomics (svm-mem's parallel vCPU substrate).
-    name: TSan (svm-mem concurrency)
+    # ThreadSanitizer over the shared-region hardware atomics (temen-mem's parallel vCPU substrate).
+    name: TSan (temen-mem concurrency)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
@@ -591,8 +591,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with: { components: rust-src }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: cargo test -p svm-mem (TSan)
-        run: cargo test -p svm-mem --tests -Z build-std --target x86_64-unknown-linux-gnu
+      - name: cargo test -p temen-mem (TSan)
+        run: cargo test -p temen-mem --tests -Z build-std --target x86_64-unknown-linux-gnu
         env:
           RUSTFLAGS: "-Zsanitizer=thread"
 
@@ -606,14 +606,14 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { workspaces: browser }
       - run: rustup target add wasm32-unknown-unknown
-      # gencorpus (native) writes corpus.json + corpus/*.svmbc; build the wasm32 lib; diff in Node
+      # gencorpus (native) writes corpus.json + corpus/*.temenc; build the wasm32 lib; diff in Node
       # (Node is preinstalled on ubuntu-latest — corpus.mjs needs only WebAssembly + BigInt).
       - name: wasm32 corpus differential (119/119 vs native)
         working-directory: browser
         run: |
           cargo run --bin gencorpus
           cargo build --release --lib --target wasm32-unknown-unknown
-          node corpus.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm
+          node corpus.mjs target/wasm32-unknown-unknown/release/temen_browser.wasm
 
   wasm64-differential:
     name: wasm64 differential (Wasmtime embedding)
@@ -636,11 +636,11 @@ jobs:
           cargo build -Z build-std=std,panic_abort --release --lib \
             --target wasm64-unknown-unknown
           cargo run --manifest-path wt/Cargo.toml --release -- \
-            target/wasm64-unknown-unknown/release/svm_browser.wasm
+            target/wasm64-unknown-unknown/release/temen_browser.wasm
 
   asan-jit-setjmp:
     # AddressSanitizer over the JIT setjmp/longjmp path (Option B: libc _setjmp/_longjmp called
-    # inline from JITted code — memory-unsafe native-stack manipulation, so it gets svm-fiber-grade
+    # inline from JITted code — memory-unsafe native-stack manipulation, so it gets temen-fiber-grade
     # rigor, LLVM.md §"JIT longjmp"). Runs the on-ramp setjmp differential (all engines incl. the
     # live JIT == native) under ASan. The baked _setjmp/_longjmp addresses resolve to ASan's
     # interceptors, which unpoison the stack on the non-local jump — so a returns-twice mishandle
@@ -653,8 +653,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with: { components: rust-src }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with: { workspaces: crates/svm-llvm }
-      - name: install LLVM/clang 18 (build tools for the svm-llvm test harness)
+        with: { workspaces: crates/temen-llvm }
+      - name: install LLVM/clang 18 (build tools for the temen-llvm test harness)
         run: |
           # ISSUES.md I67: drop the runner's unused microsoft/azure apt sources so a transient
           # 403/outage from those mirrors can't fail `apt-get update` before we install anything.
@@ -662,8 +662,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y llvm-18 clang-18
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
-      - name: cargo test -p svm-llvm setjmp (ASan, JIT path live)
-        run: cargo test --manifest-path crates/svm-llvm/Cargo.toml --tests -Z build-std --target x86_64-unknown-linux-gnu setjmp
+      - name: cargo test -p temen-llvm setjmp (ASan, JIT path live)
+        run: cargo test --manifest-path crates/temen-llvm/Cargo.toml --tests -Z build-std --target x86_64-unknown-linux-gnu setjmp
         env:
           # -Zsanitizer=address replaces the workflow-global `-D warnings`: -Z build-std recompiles
           # std from source, which would trip warnings-as-errors (same reason the wasm64 lane clears it).
@@ -689,8 +689,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with: { components: rust-src }
-      # Three workspaces: `browser` (the wasm engine), the root (svm-run's `prep_svmb`/`build_image`),
-      # and the workspace-excluded `crates/svm-llvm` (`svm-llvm-translate`). The latter two build the
+      # Three workspaces: `browser` (the wasm engine), the root (temen-run's `prep_temen`/`build_image`),
+      # and the workspace-excluded `crates/temen-llvm` (`temen-llvm-translate`). The latter two build the
       # Postgres regenerate half below; caching them is what keeps a warm run's re-translate at ~30s
       # instead of a release rebuild of the translator on every run.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -698,7 +698,7 @@ jobs:
           workspaces: |
             browser
             .
-            crates/svm-llvm
+            crates/temen-llvm
       # Playwright + Chromium aren't preinstalled on the runner (unlike Node); install both.
       # ISSUES.md I34: an npm/CDN stall wedged this step >30 min on 2026-07-23 (24 s – 3 min
       # healthy) — bound it so a stall fails fast into a re-run instead of pinning the runner.
@@ -713,7 +713,7 @@ jobs:
           npx playwright install --with-deps chromium
 
       # LLVM is needed on EVERY run, not just a cold one: build-pg-assets.mjs hands the translator
-      # `postgres_shimmed.bc`, and the `.bc` path shells `llvm-dis` out-of-process (svm-llvm links no
+      # `postgres_shimmed.bc`, and the `.bc` path shells `llvm-dis` out-of-process (temen-llvm links no
       # libLLVM). clang/flex/bison are Postgres's own build deps — used only on a cold input cache.
       - name: install LLVM/clang 18 (+ Postgres build deps)
         run: |
@@ -733,16 +733,16 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            /tmp/svm_pg_cache/postgres_shimmed.bc
-            /tmp/svm_pg_cache/pgdata
-          key: pg-inputs-v1-${{ env.SVM_PG_VER }}-${{ hashFiles('crates/svm-run/demos/postgres/**') }}
-      # SVM_PG_VER comes from the workflow env above — the same value that keyed the cache.
+            /tmp/temen_pg_cache/postgres_shimmed.bc
+            /tmp/temen_pg_cache/pgdata
+          key: pg-inputs-v1-${{ env.TEMEN_PG_VER }}-${{ hashFiles('crates/temen-run/demos/postgres/**') }}
+      # TEMEN_PG_VER comes from the workflow env above — the same value that keyed the cache.
       - name: build + stage Postgres artifacts
         working-directory: browser
         env:
-          SVM_PG_CACHE: /tmp/svm_pg_cache
+          TEMEN_PG_CACHE: /tmp/temen_pg_cache
         run: node build-pg-assets.mjs
-      # Stage chibicc.svmb for the playground C-compiler card so browser-play-editor-test.mjs runs its
+      # Stage chibicc.temen for the playground C-compiler card so browser-play-editor-test.mjs runs its
       # compile-and-run assertion (rather than SKIPping). Uses the same LLVM-18/clang installed above;
       # fail-soft so a build hiccup degrades to a SKIP, never a red build (the test guards on the asset).
       - name: build + stage chibicc asset
@@ -752,10 +752,10 @@ jobs:
         # copy over as-is; `|` makes the body literal. Fixed here so the workflows-in-sync guard's
         # copy-over can't break CI parsing.
         run: |
-          node -e "try{require('child_process').execFileSync('bash',['../crates/svm-run/demos/chibicc_selfhost/build_chibicc_svmb.sh'],{stdio:'inherit'});require('fs').copyFileSync('/tmp/svm_chibicc_cache/chibicc.svmb','web/assets/chibicc.svmb');console.log('staged chibicc.svmb')}catch(e){console.log('chibicc asset skipped: '+e.message)}"
+          node -e "try{require('child_process').execFileSync('bash',['../crates/temen-run/demos/chibicc_selfhost/build_chibicc_temen.sh'],{stdio:'inherit'});require('fs').copyFileSync('/tmp/temen_chibicc_cache/chibicc.temen','web/assets/chibicc.temen');console.log('staged chibicc.temen')}catch(e){console.log('chibicc asset skipped: '+e.message)}"
       # The self-host closure image (chibicc_selfhost.img) for the "chibicc compiles its own source" card:
       # chibicc's own cc1 TU sources + the glibc header closure, seeded so browser-play-editor-test.mjs can
-      # run chibicc.svmb --emit-object over them and diff the object against native chibicc (which this step
+      # run chibicc.temen --emit-object over them and diff the object against native chibicc (which this step
       # also builds, for `-M` closure discovery + the byte-identity oracle). Fail-soft → the test SKIPs.
       - name: build + stage self-host closure image
         working-directory: browser
@@ -775,28 +775,28 @@ jobs:
           node browser-test.mjs
           # wasm-JIT reactor differential: each committed reactor guest (bounce/life/mandelzoom) must
           # render byte-identically on the interpreter and the emitted-wasm tier (cap-call outlining).
-          # Reuses the threads module built above + the committed `.svmb` assets — no extra toolchain.
+          # Reuses the threads module built above + the committed `.temen` assets — no extra toolchain.
           node browser-jit-reactor-test.mjs
           # slice-1 cross-Run compiled-Module cache (WASM_AOT.md): re-Running the same module with a
           # stable key must produce byte-identical stdout every Run and compile exactly once. Uses the
           # committed hello_c/qjs_repl assets; skips cleanly if absent.
           node browser-jit-cache-test.mjs
-          # warm-runtime snapshot (WASM_AOT.md follow-on): svm_warm_open runs the QuickJS `warmup` once,
-          # svm_warm_eval restores the post-init image and runs `eval_run` — which must match the cold
+          # warm-runtime snapshot (WASM_AOT.md follow-on): temen_warm_open runs the QuickJS `warmup` once,
+          # temen_warm_eval restores the post-init image and runs `eval_run` — which must match the cold
           # `_start` path byte-for-byte while skipping the runtime rebuild. Uses the committed
-          # qjs_snapshot.svmb; skips cleanly if absent.
+          # qjs_snapshot.temen; skips cleanly if absent.
           node warm-snapshot-test.mjs
-          # warm+JIT (WASM_AOT.md warm+JIT): svm_warm_jit_open emits `eval_run` to wasm and runWarmJit
-          # drives it over the restored snapshot — must match warm-interp (svm_warm_eval) byte-for-byte,
+          # warm+JIT (WASM_AOT.md warm+JIT): temen_warm_jit_open emits `eval_run` to wasm and runWarmJit
+          # drives it over the restored snapshot — must match warm-interp (temen_warm_eval) byte-for-byte,
           # keep fresh-per-Run isolation, and accelerate a compute-heavy eval. Same asset; skips if absent.
           node warm-jit-test.mjs
           # Lua warm snapshot (issue #805): the two-phase lua_snapshot driver — warm eval_run over the
           # restored snapshot must match the cold _start (interp + warm+JIT) byte-for-byte, and isolation
-          # must hold. Uses the committed lua_snapshot.svmb; skips cleanly if absent.
+          # must hold. Uses the committed lua_snapshot.temen; skips cleanly if absent.
           node lua-warm-snapshot-test.mjs
           # Tcl warm snapshot (issue #805 follow-on): the two-phase tcl_snapshot driver — warm eval_run over
           # the restored snapshot must match the cold _start byte-for-byte, and isolation must hold (Tcl's
-          # warm+JIT declines, so interpreter-only). The tcl_snapshot.svmb is deploy-built (Tcl fetch +
+          # warm+JIT declines, so interpreter-only). The tcl_snapshot.temen is deploy-built (Tcl fetch +
           # toolchain isn't in this job), so this SKIPs cleanly when it's absent.
           node tcl-warm-snapshot-test.mjs
           # snapshot worker (WASM_AOT.md warm+JIT · issues #804/#805): each warm card (QuickJS, Lua) runs its
@@ -806,21 +806,21 @@ jobs:
           # assets; skips cleanly if absent.
           node snapshot-worker-test.mjs
           # slice-2 mainline tier-up over a live window (WASM_AOT.md + the slice-0 JACL residual): an
-          # SVM-text compute guest whose root loops calling a window-round-tripping leaf must return the
+          # TEMEN-text compute guest whose root loops calling a window-round-tripping leaf must return the
           # same value with tier-up on as all-interp, and tier-up must actually fire (the shape the
-          # SVM-text 'plain' recipe now defaults on). No assets — parses in-page via svm_parse.
+          # TEMEN-text 'plain' recipe now defaults on). No assets — parses in-page via temen_parse.
           node browser-tierup-mainline-test.mjs
           node browser-play-editor-test.mjs
           # chibicc compile-time on V8 (bytecode vs wasm-JIT) — prints the speedup and asserts the two
           # tiers emit byte-identical IR (a second guard alongside chibicc_jit.rs). Uses the committed/
-          # staged chibicc.svmb; SKIPs if it's absent. Timing is informational — it only FAILs on IR
+          # staged chibicc.temen; SKIPs if it's absent. Timing is informational — it only FAILs on IR
           # divergence. See SELFHOST_C.md §7 (wasm-JIT tier) / PR #483.
           node bench_chibicc_jit.mjs
           node pg-reload-test.mjs
-          # The svm-posix shell card (STAGE1.md): stage the committed shell fixture into web/assets,
-          # then drive `svm_run_shell` in real Chromium and assert the script's stdout. The test
+          # The temen-posix shell card (STAGE1.md): stage the committed shell fixture into web/assets,
+          # then drive `temen_run_shell` in real Chromium and assert the script's stdout. The test
           # skips cleanly if the asset is absent, so the copy is what makes it actually run.
-          cp tests/fixtures/shell.svmb web/assets/shell.svmb
+          cp tests/fixtures/shell.temen web/assets/shell.temen
           node browser-shell-test.mjs
           # DAP-over-bytecode debugger through the wasm FFI: drive a full initialize→launch→breakpoint→
           # variables→terminate conversation in Chromium on the bytecode engine (DEBUGGING.md).
@@ -843,13 +843,13 @@ jobs:
           SITE="$GITHUB_WORKSPACE/_site"
           mkdir -p "$SITE/web/assets" "$SITE/target/wasm32-unknown-unknown/release"
           cp -r web/. "$SITE/web/"
-          cp target/wasm32-unknown-unknown/release/svm_browser.wasm "$SITE/target/wasm32-unknown-unknown/release/"
+          cp target/wasm32-unknown-unknown/release/temen_browser.wasm "$SITE/target/wasm32-unknown-unknown/release/"
           cat > "$SITE/index.html" <<'HTML'
           <!doctype html>
           <html lang="en"><head><meta charset="utf-8" />
           <meta http-equiv="refresh" content="0; url=web/play.html" />
-          <title>SVM playground</title></head>
-          <body><p>Redirecting to the <a href="web/play.html">SVM playground</a>…</p></body></html>
+          <title>Temen playground</title></head>
+          <body><p>Redirecting to the <a href="web/play.html">Temen playground</a>…</p></body></html>
           HTML
           # Marker the scheduled pages.yml gate reads to know the site is already at HEAD (skip its build).
           echo "$GITHUB_SHA" > "$SITE/DEPLOYED_SHA"
@@ -902,7 +902,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: |
-            crates/svm-llvm
+            crates/temen-llvm
             bench/cross-engine/wasmtime-rs
       - name: install LLVM/clang 18 (clang for the kernels & wasm, llvm-dis for the on-ramp)
         run: |
@@ -923,17 +923,17 @@ jobs:
       - name: embench differential (strict — MISCOMPILE or on-ramp failure ⇒ red)
         env:
           EMBENCH_STRICT: "1"
-        run: cargo run --release --example embench --manifest-path crates/svm-llvm/Cargo.toml
+        run: cargo run --release --example embench --manifest-path crates/temen-llvm/Cargo.toml
 
   cross-engine-differential:
-    # Soundness gate for the cross-engine bench harness (crates/svm-llvm/examples/cross_engine.rs).
+    # Soundness gate for the cross-engine bench harness (crates/temen-llvm/examples/cross_engine.rs).
     # It runs each kernel's LLVM-frontend IR on the bytecode engine *compiled to wasm* (the
-    # `svm-bytecode-wasm` row, via browser/bench.mjs on Node) and cross-checks every result against
+    # `temen-bytecode-wasm` row, via browser/bench.mjs on Node) and cross-checks every result against
     # native bytecode. The harness prints `MISCOMPILE` on a mismatch but doesn't itself exit non-zero,
     # so this step greps for it — and asserts the row actually ran, so a missing cdylib/node can't pass
-    # silently. Linux-only, like `svm-llvm` (the on-ramp shells out to clang/llvm-dis). The perf
+    # silently. Linux-only, like `temen-llvm` (the on-ramp shells out to clang/llvm-dis). The perf
     # numbers it also prints are informational — the perf signal is the separate non-gating `bench` job.
-    name: cross-engine differential (svm-bytecode-wasm vs native)
+    name: cross-engine differential (temen-bytecode-wasm vs native)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -943,7 +943,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: |
-            crates/svm-llvm
+            crates/temen-llvm
             browser
       - name: install LLVM/clang 18 (clang for the kernels, llvm-dis for the on-ramp)
         run: |
@@ -954,24 +954,24 @@ jobs:
           sudo apt-get install -y llvm-18 clang-18
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
       - run: rustup target add wasm32-unknown-unknown
-      - name: build the svm-browser wasm32 cdylib (so the svm-bytecode-wasm row runs)
+      - name: build the temen-browser wasm32 cdylib (so the temen-bytecode-wasm row runs)
         run: cargo build --release --lib --target wasm32-unknown-unknown --manifest-path browser/Cargo.toml
       - name: cross-engine differential (MISCOMPILE ⇒ red)
         run: |
           set -o pipefail
-          cargo run --release --example cross_engine --manifest-path crates/svm-llvm/Cargo.toml 2>&1 | tee xe.log
+          cargo run --release --example cross_engine --manifest-path crates/temen-llvm/Cargo.toml 2>&1 | tee xe.log
           if grep -q MISCOMPILE xe.log; then
             echo "::error::cross-engine differential found a MISCOMPILE"; exit 1
           fi
-          if ! grep -q '^svm-bytecode-wasm,' xe.log; then
-            echo "::error::svm-bytecode-wasm row did not run (node or svm-browser cdylib missing?)"; exit 1
+          if ! grep -q '^temen-bytecode-wasm,' xe.log; then
+            echo "::error::temen-bytecode-wasm row did not run (node or temen-browser cdylib missing?)"; exit 1
           fi
 
   stack-guard:
-    # `stack-check` gates the `svm-jit` guard test suites (`tests/stack_check.rs`,
+    # `stack-check` gates the `temen-jit` guard test suites (`tests/stack_check.rs`,
     # `tests/stack_guard_fuzz.rs`) into this dedicated lane — the gating `check` job builds without it,
     # so this is the ONLY lane that compiles + runs them (single- and multi-vCPU fiber recursion must
-    # trap StackOverflow). The arena stack allocator they exercise is svm-fiber's always-on default, so
+    # trap StackOverflow). The arena stack allocator they exercise is temen-fiber's always-on default, so
     # no feature selects it. Linux runtime + a windows-gnu cross-check for compile parity (the arena's
     # VirtualAlloc path and the ABI-param threading) without needing a Windows runtime runner.
     name: fiber-scaling features (stack-check)
@@ -982,13 +982,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with: { toolchain: "${{ env.RUST_STABLE }}", components: clippy }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo clippy -p svm-jit --features stack-check --all-targets -- -D warnings
-      - run: cargo test -p svm-jit --features stack-check
+      - run: cargo clippy -p temen-jit --features stack-check --all-targets -- -D warnings
+      - run: cargo test -p temen-jit --features stack-check
       # The stack-guard soundness fuzz's hole-oracle is the PROT_NONE guard page, present only on the
       # default (non-arena) backend. The line above runs the check on the arena backend it ships with;
       # this runs the fuzz on the guard-page backend so a frame that slips past the check faults
       # (MemoryFault/crash) instead of silently corrupting a neighbour slot. (STACK_GUARD_FLIP.md #1.)
-      - run: cargo test -p svm-jit --features stack-check --test stack_guard_fuzz
+      - run: cargo test -p temen-jit --features stack-check --test stack_guard_fuzz
       # Compile parity for the feature-gated code on Windows. mingw is needed for the §5 trap-capture
       # C shim (as in the `check` job's cross-check).
       - run: rustup target add x86_64-pc-windows-gnu
@@ -997,7 +997,7 @@ jobs:
       - name: install mingw cross toolchain
         timeout-minutes: 15
         run: sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure* && sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/*.sources 2>/dev/null || true && sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
-      - run: cargo clippy -p svm-jit --features stack-check --all-targets --target x86_64-pc-windows-gnu -- -D warnings
+      - run: cargo clippy -p temen-jit --features stack-check --all-targets --target x86_64-pc-windows-gnu -- -D warnings
 
   stack-guard-cross-os:
     # Runtime coverage of the feature-gated code on aarch64 (macOS) + x86-64 Windows — the arena's
@@ -1017,10 +1017,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with: { toolchain: "${{ env.RUST_STABLE }}" }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo test -p svm-jit --features stack-check
+      - run: cargo test -p temen-jit --features stack-check
 
   rustbench:
-    name: rustbench (real-program perf · svm-jit vs Wasmtime-w64)
+    name: rustbench (real-program perf · temen-jit vs Wasmtime-w64)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     continue-on-error: true

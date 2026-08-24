@@ -3,13 +3,13 @@
 Status: **partially built — re-reconciled 2026-07-28** (prior reconcile 2026-07-24).
 Written 2026-07-17 as a pure scoping doc. Since then the critical path (W1) **shipped through a
 different mechanism than sketched below** — a **DAP-over-the-wasm-FFI** debugger, not the low-level
-`svm_dbg_*` ABI this doc proposed — and now lives in `DEBUGGING.md` (browser slices); the
+`temen_dbg_*` ABI this doc proposed — and now lives in `DEBUGGING.md` (browser slices); the
 memory-instrumentation substrate (W3's dependency) lives in `HOOKS.md`. This doc is kept for the
 **remaining** workstreams and as the requirements record; built parts are marked and
 cross-referenced below, not restated.
 
 The 2026-07-28 pass corrected two rows the 07-24 reconcile left stale: **W4** (the `StdinPark`
-suspend/resume seam did in fact ship in the browser, via the `svm_pg_*` console path) and **W5**
+suspend/resume seam did in fact ship in the browser, via the `temen_pg_*` console path) and **W5**
 (chibicc now compiles C in the browser — `SELFHOST_C.md` marks all five self-host steps done
 2026-07-24, with printf/float follow-ons through 07-28). It also demoted **W6** to honest status
 (only the *native* seeded scheduler exists; the browser/tooling items are unbuilt) and added a
@@ -18,11 +18,11 @@ prospective interactive embedder (c_interpret) that the W1–W6 scope does not y
 
 | Workstream | Status | Home |
 |---|---|---|
-| **W1** interactive debug on the bytecode engine (browser) | **Built** — DAP-over-wasm (`svm_dap_*` cdylib exports, `web/dap.js`, `browser-dap-test.mjs` gates CI); incl. step-back / reverse time-travel, watchpoints, multithreaded debug | `DEBUGGING.md` browser slices |
-| **W2** machine-state view | **Partial** — named locals/frames read back over DAP; the finite-register-file *mode* (v2) unbuilt | `svm-dap`, `DEBUGGING.md` |
-| **W3** memory-access scoring | **Substrate built** (`Instance::with_mem_hooks`, the `svm-opt` instrumentation pass, C ABI `svm_instance_with_mem_hooks`, 3-backend parity gate); **not** wired into the browser cdylib | `HOOKS.md` |
-| **W4** blocking-input suspend/resume | **Built 2026-07-30** — the engine seam (`VcpuEvent::StdinPark`, `svm_pg_*` console path), `CapTape` replay, **and the debug-session verb**: a `blockStdin` launch flag parks an exhausted `read` as a `stopped` event (reason `"stdin"`, no clock advance), the custom `provideStdin` request appends bytes and a resume re-issues the read, and a reverse `seek` replays provided inputs from the tape with **no re-park**. Fail-closed launch gate (bytecode + powerbox + single-vCPU only); parked placeholder reads never tape. Gated by `browser/tests/chibicc_debug.rs` (round-trip + replay + inertness pin) and `dap_bytecode.rs` (gate) | `bytecode.rs` `DebugRun`, `svm-dap`, this doc |
-| **W5** in-browser C→module compile | **Built** — chibicc compiles C client-side today (`chibicc.svmb` asset + `svm_run_onramp_fs` + `svm_parse`) | `SELFHOST_C.md`, `TODO.md`, `BROWSER.md` |
+| **W1** interactive debug on the bytecode engine (browser) | **Built** — DAP-over-wasm (`temen_dap_*` cdylib exports, `web/dap.js`, `browser-dap-test.mjs` gates CI); incl. step-back / reverse time-travel, watchpoints, multithreaded debug | `DEBUGGING.md` browser slices |
+| **W2** machine-state view | **Partial** — named locals/frames read back over DAP; the finite-register-file *mode* (v2) unbuilt | `temen-dap`, `DEBUGGING.md` |
+| **W3** memory-access scoring | **Substrate built** (`Instance::with_mem_hooks`, the `temen-opt` instrumentation pass, C ABI `temen_instance_with_mem_hooks`, 3-backend parity gate); **not** wired into the browser cdylib | `HOOKS.md` |
+| **W4** blocking-input suspend/resume | **Built 2026-07-30** — the engine seam (`VcpuEvent::StdinPark`, `temen_pg_*` console path), `CapTape` replay, **and the debug-session verb**: a `blockStdin` launch flag parks an exhausted `read` as a `stopped` event (reason `"stdin"`, no clock advance), the custom `provideStdin` request appends bytes and a resume re-issues the read, and a reverse `seek` replays provided inputs from the tape with **no re-park**. Fail-closed launch gate (bytecode + powerbox + single-vCPU only); parked placeholder reads never tape. Gated by `browser/tests/chibicc_debug.rs` (round-trip + replay + inertness pin) and `dap_bytecode.rs` (gate) | `bytecode.rs` `DebugRun`, `temen-dap`, this doc |
+| **W5** in-browser C→module compile | **Built** — chibicc compiles C client-side today (`chibicc.temen` asset + `temen_run_onramp_fs` + `temen_parse`) | `SELFHOST_C.md`, `TODO.md`, `BROWSER.md` |
 | **W6** small host/tooling items | **Mostly remaining** — only the *native* seeded scheduler (`attach_scheduled_seeded`) exists; the four browser/tooling items (seed-via-ABI, `display` frame-query, memory-map JSON, compile metrics) are unbuilt | mixed |
 | **—** consumer-surfaced needs not yet scoped | **Not scoped** — telemetry stream, cache-coherence view, adversarial+replayable scheduling, paging counters, state writes, sem/barrier libc | new section below |
 
@@ -32,17 +32,17 @@ the original design text is left as the record.
 
 An *interactive embedder* is a host that drives a guest **step by step and inspects it
 between steps**: debugger frontends, educational programming environments, REPLs and
-playgrounds, profiling/visualization tools. Natively, SVM already serves them — the
-tree-walker's `Inspector` (`svm-interp`) has stepping, breakpoints, watchpoints, time-travel,
-and a DAP server (`svm-dap`) on top (`DEBUGGING.md`). **In the browser, at the time of writing, it
+playgrounds, profiling/visualization tools. Natively, Temen already serves them — the
+tree-walker's `Inspector` (`temen-interp`) has stepping, breakpoints, watchpoints, time-travel,
+and a DAP server (`temen-dap`) on top (`DEBUGGING.md`). **In the browser, at the time of writing, it
 did not**: the browser build (`browser/`, `BROWSER.md`) ran the bytecode engine through
-run-to-completion entries (`svm_run*`) only. W1 has since closed the debug half of that gap via
+run-to-completion entries (`temen_run*`) only. W1 has since closed the debug half of that gap via
 DAP-over-wasm (see the status block above); the profiling/input/compile halves (W3–W5) remain.
 
 This doc scopes the workstreams that close that gap, plus a few adjacent host/tooling
 capabilities interactive embedders keep needing. Requirements are stated embedder-neutrally;
 several prospective consumers (e.g. educational debugger frontends) want this surface, and
-nothing here couples SVM to any one of them. Acceptance is against SVM's own oracles — the
+nothing here couples Temen to any one of them. Acceptance is against Temen's own oracles — the
 native `Inspector` and the differential house style — not any consumer's test suite.
 
 Design invariants inherited from `DEBUGGING.md` §0 (do not relitigate): the debugger is a
@@ -55,15 +55,15 @@ escape; the interpreter tier is the debug engine.
 
 | Piece | State | Where |
 |---|---|---|
-| Full interactive debug surface, native | Built | `svm-interp` `Inspector`, `svm-dap` (`DEBUGGING.md`) |
-| Bytecode-engine debug seam: op-for-op stepping-location + per-step window/SSA-value traces (single-vCPU, seam-free) | Built, **batch-shaped** | `bytecode.rs` `ir_trace`/`ir_window_trace`/`ir_value_trace` (`crates/svm-interp/src/bytecode.rs:3003/:3045/:3101`) |
-| Bytecode values inspectable: stable, unique slot per SSA value (`regs[base + i]`, typed by `func_value_types`; no reuse/coalescing), parity-proven vs the tree-walker | Built | `DEBUGGING.md` §1b G2, `crates/svm/tests/debug_parity.rs` |
+| Full interactive debug surface, native | Built | `temen-interp` `Inspector`, `temen-dap` (`DEBUGGING.md`) |
+| Bytecode-engine debug seam: op-for-op stepping-location + per-step window/SSA-value traces (single-vCPU, seam-free) | Built, **batch-shaped** | `bytecode.rs` `ir_trace`/`ir_window_trace`/`ir_value_trace` (`crates/temen-interp/src/bytecode.rs:3003/:3045/:3101`) |
+| Bytecode values inspectable: stable, unique slot per SSA value (`regs[base + i]`, typed by `func_value_types`; no reuse/coalescing), parity-proven vs the tree-walker | Built | `DEBUGGING.md` §1b G2, `crates/temen/tests/debug_parity.rs` |
 | Single-op stepping bit-identical to run-to-completion (`budget = 1`) | Built | `bytecode.rs:1391/:2997` |
 | Deterministic, self-contained browser `Host` (streams accumulate, stdin is a buffer, `Clock` is a counter) | Built | `BROWSER.md` § Decisions |
 | Host-serviced vCPU events (spill frame → host services → `deliver_*` resumes) | Built (pattern) | `bytecode.rs:1842ff` (`VcpuEvent`, tier-up path) |
 | Cooperative multi-vCPU `drive` + deterministic timeout selection | Built | `bytecode.rs:4623` |
-| Memory-access instrumentation pass (observe/veto every guest memory op, zero-cost-when-off, all backends) | Built natively | `HOOKS.md`, `Instance::with_mem_hooks` (`crates/svm-run/src/lib.rs:4110`) |
-| Source-level debug info waist (`debug.loc`/`debug.var`/types), chibicc `-g` | Built | `svm-ir` `DebugInfo`, W4 in `DEBUGGING.md` |
+| Memory-access instrumentation pass (observe/veto every guest memory op, zero-cost-when-off, all backends) | Built natively | `HOOKS.md`, `Instance::with_mem_hooks` (`crates/temen-run/src/lib.rs:4110`) |
+| Source-level debug info waist (`debug.loc`/`debug.var`/types), chibicc `-g` | Built | `temen-ir` `DebugInfo`, W4 in `DEBUGGING.md` |
 | `display` / `keyboard` / `fs` browser capabilities | Built | `browser/src/lib.rs` (~:1831), `demos/doom/` |
 
 The key prior finding (`DEBUGGING.md` §1b): *the bytecode tier is fully inspectable, not
@@ -77,8 +77,8 @@ wasm FFI), so the memory-access row below is now the only substrate piece the *r
 ## W1 — Interactive debug sessions on the bytecode engine (the critical path)
 
 > **Status (2026-07-24): BUILT — differently.** Shipped as a **DAP-over-the-wasm-FFI** debugger
-> rather than the `svm_dbg_*` ABI sketched below: the `browser/` cdylib exposes `svm_dap_request` /
-> `svm_dap_reset` / `svm_dap_response_ptr` / `_len` (`browser/src/lib.rs`) — a JSON-in / JSON-out
+> rather than the `temen_dbg_*` ABI sketched below: the `browser/` cdylib exposes `temen_dap_request` /
+> `temen_dap_reset` / `temen_dap_response_ptr` / `_len` (`browser/src/lib.rs`) — a JSON-in / JSON-out
 > pump over `DapServer::handle`, backed by the bytecode `Debuggee` — with `web/dap.js` as the JS
 > client and `browser-dap-test.mjs` gating CI (initialize→launch→breakpoint→stackTrace→variables→
 > continue on the engine the playground ships). Step-back / reverse time-travel, watchpoints (data
@@ -108,10 +108,10 @@ threads/`Instant`; `BROWSER.md` § Decisions).
 3. **Breakpoints/watchpoints** as step-loop checks: source breakpoints via `debug.loc`;
    watchpoints via the W3 hook pass or a per-step window diff — whichever is simplest that
    meets acceptance.
-4. **cdylib ABI** (same `svm_alloc` conventions as existing entries):
-   `svm_dbg_new(module, stdin, caps) → session`, `svm_dbg_step / step_back / run_until`,
-   `svm_dbg_pc / source_loc / step_count / seek`, `svm_dbg_read_reg / read_var / read_window
-   / write_window`, `svm_dbg_frames_json`, breakpoint/watchpoint set/clear/list. Fuel bounds
+4. **cdylib ABI** (same `temen_alloc` conventions as existing entries):
+   `temen_dbg_new(module, stdin, caps) → session`, `temen_dbg_step / step_back / run_until`,
+   `temen_dbg_pc / source_loc / step_count / seek`, `temen_dbg_read_reg / read_var / read_window
+   / write_window`, `temen_dbg_frames_json`, breakpoint/watchpoint set/clear/list. Fuel bounds
    every `run_until`.
 5. **Threads follow-on**: multi-vCPU debug rides the cooperative `drive` with a deterministic
    scheduler and a global turn counter (the `Inspector::turn` shape). Not in the v1 slice.
@@ -126,7 +126,7 @@ Fuel stops a runaway `run_until`.
 ## W2 — Machine-state view (rides on W1)
 
 > **Status (2026-07-24): PARTIAL.** v1's named locals/frames read back over the DAP surface
-> (`svm-dap` `read_var`, exercised by `browser-dap-test.mjs`). The v2 **finite-register-file
+> (`temen-dap` `read_var`, exercised by `browser-dap-test.mjs`). The v2 **finite-register-file
 > compile mode** below is unbuilt.
 
 **Need.** Debugger UIs want a "machine panel": a register file, a program counter, a stack
@@ -144,7 +144,7 @@ type.
 - **v2 (optional follow-on):** an opt-in **finite register file** compile mode in
   `compile_func`: cap slots at a small named set (e.g. 16), spill excess to the data stack
   (visible in the window), pass leading args in designated registers. Naming should be
-  RISC-flavored (`a0–a7`/`ra`/`sp`/`t*`): SVM IR is a load/store machine whose compares
+  RISC-flavored (`a0–a7`/`ra`/`sp`/`t*`): Temen IR is a load/store machine whose compares
   produce values — there are no flags, so borrowing a flags-ISA's names would misdescribe the
   machine. Differentially tested against the unconstrained mode (house style). This makes
   register scarcity, spilling, and calling conventions *observable* — useful to any embedder
@@ -160,15 +160,15 @@ through the wasm ABI). SP visibly moves across call/return; a `v128` local rende
 locality models, heat maps, access ordering — without touching the engine.
 
 > **Status (2026-07-24): SUBSTRATE BUILT, browser-wiring REMAINING.** The `HOOKS.md` pass is
-> complete natively (P0–P3 + the C ABI `svm_instance_with_mem_hooks` + a 3-backend parity gate,
-> `crates/svm/tests/mem_hooks_diff.rs`); only the on-demand native high-throughput seam (P4) is
+> complete natively (P0–P3 + the C ABI `temen_instance_with_mem_hooks` + a 3-backend parity gate,
+> `crates/temen/tests/mem_hooks_diff.rs`); only the on-demand native high-throughput seam (P4) is
 > open. It is **not** exported from the `browser/` cdylib — so this section (reaching it from the
 > browser) is the genuine remaining work.
 
 **Today.** The `HOOKS.md` pass fires an embedder hook around every guest memory op, identical
 across backends, zero-cost when off — with cache/page-fault scoring as a named use case. It
 is wired natively (`Instance::with_mem_hooks`); it is **not yet** exported from the browser
-cdylib (no `svm_*` mem-hook entry) — confirmed 2026-07-24.
+cdylib (no `temen_*` mem-hook entry) — confirmed 2026-07-24.
 
 **Direction.** (1) Confirm the hook pass runs on the bytecode engine under wasm; add a
 hook-install flag to the W1 session. (2) Ship access-stream consumers (e.g. a small L1/L2
@@ -182,15 +182,15 @@ ordering, and browser counters match the native run of the same hook stream.
 
 > **Status (2026-07-28): PARTIAL — the suspend/resume seam shipped, in the browser.** A `read` on
 > an exhausted stdin buffer suspends the vCPU instead of returning EOF, via `VcpuEvent::StdinPark`
-> (`crates/svm-interp/src/bytecode.rs`), with `Vcpu::set_stdin_blocking` / `push_stdin` to arm and
-> resume. It is wired into the browser cdylib as the console path: `svm_pg_open` boots a guest
+> (`crates/temen-interp/src/bytecode.rs`), with `Vcpu::set_stdin_blocking` / `push_stdin` to arm and
+> resume. It is wired into the browser cdylib as the console path: `temen_pg_open` boots a guest
 > suspended at the first stdin read, `pg_pump` returns on the park, and the query entry pushes bytes
 > and resumes (`browser/src/lib.rs`). What's **remaining** vs. the sketch below: it is packaged as
-> the `svm_pg_*` REPL/Postgres path, **not** as a generic `svm_dbg_provide_stdin` on the **W1 debug
-> session**. **Update 2026-07-30:** the `CapTape`/`seek`-replay half **landed** — the `svm-dap`
+> the `temen_pg_*` REPL/Postgres path, **not** as a generic `temen_dbg_provide_stdin` on the **W1 debug
+> session**. **Update 2026-07-30:** the `CapTape`/`seek`-replay half **landed** — the `temen-dap`
 > backend records nondeterministic cap inputs (clock / stdin `read` / host-fn) and replays the tape
 > on every rebuild, so reverse debugging reproduces earlier stdout byte-identically
-> (`svm-dap/src/backend.rs` `replay_cap_tape`; `browser/tests/chibicc_debug.rs`).
+> (`temen-dap/src/backend.rs` `replay_cap_tape`; `browser/tests/chibicc_debug.rs`).
 > **CLOSED 2026-07-30 (same day, the plan's slice 1):** the debug-session verb landed. A
 > `blockStdin: true` launch flag arms `Host::set_stdin_blocking` on the session powerbox; an
 > exhausted `read` yields `Outcome::StdinPark` (op not executed, `op_clock` held), surfaced as
@@ -214,7 +214,7 @@ and resumes via a `deliver_*` call (the tier-up path).
 
 **Direction.** A `WaitingForInput`-style outcome on the W1 session (and optionally the plain
 run entries): when the stdin capability's `read` finds no bytes, suspend the vCPU via the
-`VcpuEvent` pattern and return a distinct status; `svm_dbg_provide_stdin(ptr, len)` appends
+`VcpuEvent` pattern and return a distinct status; `temen_dbg_provide_stdin(ptr, len)` appends
 and resumes. Provided bytes join the run's deterministic input record (the `CapTape` idea from
 `DEBUGGING.md` W1), so a later `seek` replays them faithfully without re-suspending.
 
@@ -225,11 +225,11 @@ and resumes. Provided bytes join the run's deterministic input record (the `CapT
 
 > **Status (2026-07-28): BUILT — see `SELFHOST_C.md`.** The browser compiles C source client-side
 > today. The chosen approach was **not** to port chibicc to wasm32 against a wasm libc; it is the
-> broader **self-hosting** design: compile chibicc *to an SVM IR module* via the LLVM on-ramp, run
-> that `chibicc.svmb` as an ordinary guest on the bytecode engine with source + `include/*.h` seeded
-> into memfs, and close the loop with the encode step. That shipped: `browser/web/assets/chibicc.svmb`
-> is a committed asset, `svm_run_onramp_fs` (`browser/src/lib.rs`) runs it over a seeded fs + argv,
-> and the cdylib's `svm_parse` does the text-IR → verify → encode. `SELFHOST_C.md` marks all five
+> broader **self-hosting** design: compile chibicc *to an Temen IR module* via the LLVM on-ramp, run
+> that `chibicc.temen` as an ordinary guest on the bytecode engine with source + `include/*.h` seeded
+> into memfs, and close the loop with the encode step. That shipped: `browser/web/assets/chibicc.temen`
+> is a committed asset, `temen_run_onramp_fs` (`browser/src/lib.rs`) runs it over a seeded fs + argv,
+> and the cdylib's `temen_parse` does the text-IR → verify → encode. `SELFHOST_C.md` marks all five
 > self-host steps done 2026-07-24, with `#include`/`printf` and `%f/%e/%g` follow-ons through
 > 2026-07-28; `TODO.md` corroborates ("chibicc compiles C in the browser"). Gated by
 > `browser/tests/chibicc_printf.rs` + the Chromium editor gate. The section below is the original
@@ -242,13 +242,13 @@ in, verified module out, no server round-trip, sub-second warm compiles.
 
 **Today.** `frontend/chibicc` runs natively only. This is already tracked as `BROWSER.md`'s
 "real-language playground tab" open item ("pre-compiled modules first, in-wasm compilation
-later"); the playground's `svm_parse` (text IR → verify → encode inside the cdylib) shows the
+later"); the playground's `temen_parse` (text IR → verify → encode inside the cdylib) shows the
 in-wasm pattern.
 
 **Direction.** chibicc is plain C99 with modest libc needs; compile it to wasm as a
 **separate** module the embedder's worker calls (`--emit-ir` + the encoder: C source in,
-`.svmb` out), keeping the Rust cdylib untouched. Always emit `-g` — the W1 surface depends on
-debug info. (Running chibicc as an SVM guest over `fs` is a nice later dogfood, not the first
+`.temen` out), keeping the Rust cdylib untouched. Always emit `-g` — the W1 surface depends on
+debug info. (Running chibicc as an Temen guest over `fs` is a nice later dogfood, not the first
 slice.) Details belong to the `BROWSER.md` item; this doc adds the requirement that the
 compile path emits debug info and the W6 compile metrics.
 
@@ -259,7 +259,7 @@ warm compile of a few-hundred-line program well under a second.
 
 - **Compile metrics from the frontend.** Emit per-file node/size counts alongside
   `--emit-ir` output (a walk at emit time). Embedders use these for complexity budgets and
-  UI display; SVM cost: a small report, no new machinery.
+  UI display; Temen cost: a small report, no new machinery.
 - **Deterministic-scheduler seed exposure.** The cooperative scheduler's seed should be
   get/settable through the browser ABI so embedders can reproduce and vary interleavings
   (pairs with the W1 threads follow-on; the native `attach_scheduled_seeded` already exists).
@@ -277,14 +277,14 @@ warm compile of a few-hundred-line program well under a second.
 ## Consumer-surfaced requirements not yet scoped
 
 Added 2026-07-28 from a mapping pass against a prospective interactive embedder (c_interpret, an
-educational C environment; its side lives in that repo's `SVM_MIGRATION.md`). These are real
+educational C environment; its side lives in that repo's `TEMEN_MIGRATION.md`). These are real
 capability needs its UI depends on that **no W1–W6 slice currently covers**. They are stated
-embedder-neutrally and remain demand-driven — nothing here couples SVM to any one consumer, and none
+embedder-neutrally and remain demand-driven — nothing here couples Temen to any one consumer, and none
 is a *blocker* (no architectural obstacle was found); they are unscoped scope, listed so the tracker
-is honest about the gap. Acceptance, as elsewhere, is against SVM's own oracles.
+is honest about the gap. Acceptance, as elsewhere, is against Temen's own oracles.
 
 - **X1 — Concurrency telemetry as a drained stream.** Beyond point-in-time race *witnesses* (which
-  SVM has natively), embedders that teach concurrency consume per-yield **streams**: intra-step
+  Temen has natively), embedders that teach concurrency consume per-yield **streams**: intra-step
   profiling samples (flame charts), context-switch / synchronization-event / **causality-edge**
   records (timeline swimlanes, mutex-handoff/join/condvar arrows), and per-global "contested"
   shared-state tracking. This is the largest gap — a whole visualization surface with no slice.
@@ -307,9 +307,9 @@ is honest about the gap. Acceptance, as elsewhere, is against SVM's own oracles.
   let students **write** a register/slot, an FP lane, and window bytes mid-session (with time-travel
   staying consistent). This is DAP `setVariable` / `writeMemory` over the W1 session — small, but not
   in the current W2 scope.
-- **X6 — Semaphore & barrier guest libc.** SVM's threading design covers mutex + condvar; embedders
+- **X6 — Semaphore & barrier guest libc.** Temen's threading design covers mutex + condvar; embedders
   also use **semaphores and barriers** (`sem_*`, `pthread_barrier_*`). These need guest-libc
-  equivalents over SVM's threading primitives (a frontend/libc item, not an engine one).
+  equivalents over Temen's threading primitives (a frontend/libc item, not an engine one).
 
 ### Cost model (2026-07-30, as-built): everything is opt-in
 
@@ -324,7 +324,7 @@ branch per `vm_map`/`vm_unmap` capability call** (allocator-growth frequency, no
 access; accounting only runs with a limit set) plus two words on `Host`. No per-op, per-access,
 or per-turn cost exists anywhere for a domain that opts into nothing.
 
-### Closure sketch (2026-07-30) — mechanisms that stay SVM-shaped
+### Closure sketch (2026-07-30) — mechanisms that stay TEMEN-shaped
 
 How each X-item closes without new engine surface, without consumer coupling, and with models kept
 out of the TCB. Everything below is either an observer seam, host-side tooling in the cdylib, guest
@@ -348,7 +348,7 @@ libc, or a standard DAP verb.
     hook stream (instrumented) must be identical — a house-style differential that also pins the
     sink's op coverage.
 
-  Design notes verified against the as-built hook (`MemEvent`, `svm-run/src/lib.rs`):
+  Design notes verified against the as-built hook (`MemEvent`, `temen-run/src/lib.rs`):
   - `MemEvent` carries **no vCPU identity**, and coherence state is meaningless without it. Add
     attribution **at dispatch, host-side** (sink or hook) — on the cooperative tier the dispatcher
     knows the executing vCPU — so the event type, the instrumentation pass, and the engine are
@@ -373,7 +373,7 @@ libc, or a standard DAP verb.
   writer per range) — a third host-side hook consumer.
 - **X3 generalizes W6's seed item.** Expose **scheduler policy** (seed + quantum bounds) rather
   than the seed alone; quantum = 1 *is* the chaos case, and the native deterministic explorer
-  already runs memop-granularity `quantum = 1` (`svm-interp`). Forced switch = a debug-session
+  already runs memop-granularity `quantum = 1` (`temen-interp`). Forced switch = a debug-session
   verb that ends the current turn at the next safe point — driver-side, deterministic, recordable.
 - **X5 is standard DAP.** Implement `setVariable` / `writeMemory` on the existing backend, and
   record debugger writes on the same input tape as W4's provided stdin (the `CapTape` shape) so a
@@ -384,7 +384,7 @@ libc, or a standard DAP verb.
   `memory.notify` by `codegen_ir.c`) — sem/barrier are the same construction, currently declared
   out of scope in that header. (An earlier draft cited the postgres demo's `ipc_shim.c`; corrected
   — that shim is a single-process no-op counter, not a futex user.) Zero engine surface.
-- **Batching:** `svm_dap_request` is one-request-per-pump today; accept a **JSON array of requests
+- **Batching:** `temen_dap_request` is one-request-per-pump today; accept a **JSON array of requests
   per pump** (replies already come back as an array). One FFI crossing per step for a step + N
   state reads, embedder-neutral, no new ABI entries.
 
@@ -401,15 +401,15 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 
 - Consumer-side integration (any embedder's UI, worker glue, content, or test suites).
 - ~~DAP-over-the-browser-build~~ **(reversed 2026-07-24 — this became the chosen path).** The
-  doc originally proposed a lower-level JS-shaped `svm_dbg_*` ABI and ruled DAP-over-the-browser
-  out; in the event, DAP-over-the-wasm-FFI (`svm_dap_*` + `web/dap.js`) is what shipped for W1, and
-  the `svm_dbg_*` ABI was never built. `DEBUGGING.md` is the DAP story on both the native and
+  doc originally proposed a lower-level JS-shaped `temen_dbg_*` ABI and ruled DAP-over-the-browser
+  out; in the event, DAP-over-the-wasm-FFI (`temen_dap_*` + `web/dap.js`) is what shipped for W1, and
+  the `temen_dbg_*` ABI was never built. `DEBUGGING.md` is the DAP story on both the native and
   browser builds.
 - Porting the tree-walker (and its OS-thread `Scheduler`) to wasm — the bytecode engine is
   the browser debug tier, per the fail-closed decision in `BROWSER.md`.
 - Matching any particular consumer's legacy machine model (register names, flags registers,
-  fixed address layouts). W2 exposes SVM's real machine state; a finite-register *mode* is
-  the one concession, and it is SVM-shaped.
+  fixed address layouts). W2 exposes Temen's real machine state; a finite-register *mode* is
+  the one concession, and it is TEMEN-shaped.
 
 ## Suggested slice order
 
@@ -423,7 +423,7 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    below (the `StdinPark` route corrected to the Host-cap seam). See the W4 status block above.
 >    Original integration note (2026-07-30, verified):
 >    in a debug run stdin is served by the **Host's stdin cap** (`grant_io_powerbox`, `host.stdin`
->    — `svm-dap/src/backend.rs`), not the Vcpu event loop, so `VcpuEvent::StdinPark` is *not* the
+>    — `temen-dap/src/backend.rs`), not the Vcpu event loop, so `VcpuEvent::StdinPark` is *not* the
 >    seam here. The work: a **would-block outcome** on the stdin cap when the buffer is exhausted
 >    (instead of serving EOF), surfaced as a new stop variant threaded `DebugRun`/
 >    `ScheduledDebugRun` stop enums → the `Debuggee` trait → the DAP `stopped` event; a custom
@@ -434,19 +434,19 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 > 2. ~~**DAP array-pump.**~~ **DONE 2026-07-30** — as specced (`browser/src/lib.rs` pump matches
 >    `Json::Arr` and flat-maps `handle`; gated by `browser/tests/dap_batch.rs`: four responses in
 >    order + the stopped event in one crossing; singleton unchanged). Original:
->    `svm_dap_request` accepts a JSON **array** of requests per pump (replies
+>    `temen_dap_request` accepts a JSON **array** of requests per pump (replies
 >    already come back as an array); singletons unchanged. Integration (verified): a pure
->    `browser/src/lib.rs` change at the `server.handle` call — `svm_dap::parse` already returns
+>    `browser/src/lib.rs` change at the `server.handle` call — `temen_dap::parse` already returns
 >    `Json::Arr` for a top-level array (today it falls through to a clean single failure), so the
 >    pump matches `Arr` and flat-maps `handle` per element; `web/dap.js` already parses the reply
 >    as an array and filters by `type`, so the JS client needs no change. Acceptance: a step + N
 >    state reads in one FFI crossing; existing DAP tests pass untouched.
 > 3. ~~**Debug-session access sink**~~ **DONE 2026-07-30** — as specced: `MemEvent` moved to
->    `svm-interp` (re-exported by `svm-run`), `mem_event_of` raw-address decode, sinks on both
+>    `temen-interp` (re-exported by `temen-run`), `mem_event_of` raw-address decode, sinks on both
 >    debug engines fired from every advance path (seek replay included), backend `SharedSink`
 >    re-installed on rebuilds (rev-trace probes silent), and the **bulk-op watchpoint blind spot
 >    fixed on both engines** via the shared `watch_accesses` decode (v128 included; `access_of` /
->    DPOR untouched). Gated by `crates/svm/tests/access_sink_diff.rs`: sink stream ≡ the
+>    DPOR untouched). Gated by `crates/temen/tests/access_sink_diff.rs`: sink stream ≡ the
 >    `mem_hooks_diff.rs` hook stream, dst-write + src-read `mem.copy` watchpoints stop both
 >    engines identically, and the sink is inert (result + op-clock bit-identical). Original spec:
 >    the hinge for X2/X4/X1-shared-state. Generalize the per-op
@@ -456,7 +456,7 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    `access_of` (`lib.rs`), and it is **single-range only — `mem.copy`/`mem.move`/`mem.fill`
 >    fall through to `MemAccess::None`**. So the sink needs a multi-range event vocabulary — not
 >    a plumbed-through `MemAccess`; **decided (owner, 2026-07-30): the sink vocabulary is
->    `MemEvent`** (`svm-run`, whose `Copy`/`Fill` carry spans), shared verbatim with the hook
+>    `MemEvent`** (`temen-run`, whose `Copy`/`Fill` carry spans), shared verbatim with the hook
 >    pass so the differential compares like with like. Threading (verified): the sink rides the
 >    same path as the existing `watch_specs` — a field on `BytecodeBackend` re-installed after
 >    every `seek` rebuild (`fresh_single`), a slot on `DebugRun`/`ScheduledDebugRun` next to
@@ -470,28 +470,28 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    stream** on the same program (uninstrumented vs. instrumented) across the full `MemEvent`
 >    vocabulary; a bulk-op watchpoint fires at the same clock on both engines; all debug parity
 >    tests pass with a sink installed.
-> 4. ~~**X2 + X4's fault counter**~~ **DONE 2026-07-30** — `svm-dap::models::MemModel`: per-vCPU
+> 4. ~~**X2 + X4's fault counter**~~ **DONE 2026-07-30** — `temen-dap::models::MemModel`: per-vCPU
 >    L1s + shared L2 with MESI line states and LRU, first-touch fault counter, `memModel` launch
 >    arg + `memModelStats` request (counters + line-state grids JSON), armed through a `Debuggee`
 >    capability probe (tree-walker fails closed). Seek consistency by a **model-side snapshot
 >    ladder at the engine's stride** (no new engine seam needed — the `checkpoint_clocks()` idea
 >    was dropped as unnecessary): `seek(t)` model state ≡ a from-0 run to `t`, pinned through the
->    real checkpoint ladder. The **W3 browser export** landed as `svm_mem_profile` (+ stats
->    readback): the cdylib adds wasm-clean `svm-opt`, instruments locally (manifest-carrying
->    modules refused, the svm-run slot-0 rule), and feeds the same model — with the **two feeds
+>    real checkpoint ladder. The **W3 browser export** landed as `temen_mem_profile` (+ stats
+>    readback): the cdylib adds wasm-clean `temen-opt`, instruments locally (manifest-carrying
+>    modules refused, the temen-run slot-0 rule), and feeds the same model — with the **two feeds
 >    pinned equal** (`browser/tests/mem_profile.rs`: hook-fed ≡ sink-fed stats-for-stats;
->    `crates/svm-dap/tests/mem_model.rs`: ordering, faults, seek consistency, DAP flow). Original
+>    `crates/temen-dap/tests/mem_model.rs`: ordering, faults, seek consistency, DAP flow). Original
 >    spec: A
 >    configurable cache model (levels/sets/ways/line size; per-vCPU L1s + shared L2 via the
 >    attribution) with counters + a line-state JSON dump, and a first-touch shadow-set fault
 >    counter. Fed by the slice-3 sink under debug and by the W3 pass in run mode — this slice
 >    includes the **W3 browser export**. Integration (verified): the browser crate depends on
->    **neither `svm-run` nor `svm-opt`** (it runs the engine directly via
+>    **neither `temen-run` nor `temen-opt`** (it runs the engine directly via
 >    `compile_and_run_with_host`), so the W3 export is *not* re-exporting
->    `Instance::with_mem_hooks` — it adds the wasm-clean `svm-opt` dep (deps: `svm-ir` +
->    `svm-verify` only) and reproduces the rewrite + handle bake-in locally in the cdylib,
->    re-honoring the manifest exclusion (`svm-run`'s hooks refuse a manifest-carrying instance);
->    natural entries are `svm_run`/`svm_run0` (via `run_at`) and the powerbox twins. Model
+>    `Instance::with_mem_hooks` — it adds the wasm-clean `temen-opt` dep (deps: `temen-ir` +
+>    `temen-verify` only) and reproduces the rewrite + handle bake-in locally in the cdylib,
+>    re-honoring the manifest exclusion (`temen-run`'s hooks refuse a manifest-carrying instance);
+>    natural entries are `temen_run`/`temen_run0` (via `run_at`) and the powerbox twins. Model
 >    snapshotting: there is **no checkpoint callback** — the ladder is private to the DAP backend
 >    and self-disables silently when a run leaves the checkpointable subset — so the model
 >    snapshots by watching `Debuggee::clock()`/`turn()` at its own stride; expose
@@ -507,11 +507,11 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    (`set_mem_map_limit` / `memoryLimit` launch arg): a `vm_map` past the limit returns
 >    `-ENOMEM` probeably (invariant 5 — guest `malloc` observes NULL), `vm_unmap` returns bytes
 >    to the budget, and the accounting rides `HostReplaySubstate` so checkpoint restores keep it.
->    Gated by `crates/svm-dap/tests/memory_map.rs`. Original spec: the window memory-map JSON
+>    Gated by `crates/temen-dap/tests/memory_map.rs`. Original spec: the window memory-map JSON
 >    (data segments, heap extent, data-stack region, cap-mapped regions) and a
 >    **Memory-capability growth cap** so guest `malloc` over `vm_map` returns NULL at the limit. Integration (verified): the map JSON
 >    derives from `AddrSpace.prot`/`.regions` + the window geometry (`Mem.window`
->    mapped/reserved) + the `svm-ir` powerbox layout constants (args/stack), with the **heap
+>    mapped/reserved) + the `temen-ir` powerbox layout constants (args/stack), with the **heap
 >    cursor read from guest memory** — `POWERBOX_HEAP_BRK`/`_TOP` are window words at offsets
 >    32/40, a `read_window`, not host state (`Mem::layout_snapshot` is the serialization
 >    precedent). The growth cap is greenfield: **nothing accounts `vm_map` growth today** — the
@@ -530,7 +530,7 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    (threaded bytecode only, fail-closed elsewhere), re-armed on seek rebuilds (the replay
 >    refills the tape deterministically — pinned bit-identical). The shared-state consumer rides
 >    `MemModel` (per-word last-writer + contested over the attributed sink, in `memModelStats`).
->    Gated by `crates/svm-dap/tests/sched_trace.rs` — including the honest negative: a fixture
+>    Gated by `crates/temen-dap/tests/sched_trace.rs` — including the honest negative: a fixture
 >    whose wait falls through `WAIT_NOT_EQUAL` shows *no* park edge. Original spec: an optional,
 >    zero-cost-when-off event
 >    tape on the cooperative debug scheduler (turn start/end, park/wake with reason, waker→wakee
@@ -553,7 +553,7 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    sink/trace). Precedence: coroutine pin > forced > stepping thread > policy pick. DAP: `seed`
 >    honored on the threaded bytecode engine (single-vCPU + seed fails closed), `forceSwitch`
 >    request (optional `threadId`, replies with the resolved one). Gated by
->    `crates/svm-dap/tests/sched_policy.rs`: per-seed determinism + genuine variation vs. the
+>    `crates/temen-dap/tests/sched_policy.rs`: per-seed determinism + genuine variation vs. the
 >    default, seeded schedule and forced switches surviving `seek` bit-identically (via the
 >    slice-6 tape), fail-closed launches/requests, and cross-session tape reproduction over DAP.
 >    Original spec: Reframed by verification: the bytecode debug
@@ -583,7 +583,7 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    `memoryReference` + offset), advertised via `supportsSetVariable` /
 >    `supportsWriteMemoryRequest`; both decline cleanly on the tree-walker (invariant 9 — no
 >    engine divergence, the request just fails). Gated by
->    `crates/svm-dap/tests/state_writes.rs`: var + window + threaded writes shifting results and
+>    `crates/temen-dap/tests/state_writes.rs`: var + window + threaded writes shifting results and
 >    surviving `seek(0)` re-drive bit-identically, pre-write-clock state reading original,
 >    DAP round-trip incl. Variables-pane readback, and fail-closed surfaces.
 > 9. ~~**X6 — guest-libc sem/barrier.**~~ **DONE 2026-07-31** — zero engine surface, as designed:
@@ -594,7 +594,7 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    `frontend/chibicc/include/semaphore.h` (CAS-decrement while positive, park on the exhausted
 >    word, post = add + notify; `init/destroy/wait/trywait/post/getvalue`). Both headers are now
 >    also seeded into the browser playground's `/include` set — from the *frontend copies* via
->    `include_str!`, one source of truth. Gated by `svm/tests/c_frontend.rs`
+>    `include_str!`, one source of truth. Gated by `temen/tests/c_frontend.rs`
 >    (`c_sem_value_semantics`, `c_sem_producer_consumer` — bounded ring, sum 36 + slots restored —
 >    and `c_pthread_barrier_phases` — 4 participants × 3 phases, full-count-after-wait + exactly
 >    one `PTHREAD_BARRIER_SERIAL_THREAD` per phase), all differential interp == JIT via
@@ -611,7 +611,7 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 > the reverse coordinate — turn multithreaded, clock single-threaded; forward or backward via
 > the checkpoint ladder, landing as an ordinary stop and replying with the landed `t`). Both
 > were engine-supported already (`read_window` / `Debuggee::seek`) — DONE as dispatch arms,
-> gated by `crates/svm-dap/tests/read_seek.rs` on both engines. The spike itself measured
+> gated by `crates/temen-dap/tests/read_seek.rs` on both engines. The spike itself measured
 > ~0.08 ms per step+poll and ~2 ms `stepBack` through the wasm32 cdylib — the embedder-side
 > latency questions the plan deferred are settled.
 >
@@ -620,13 +620,13 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 > - **Exit code over DAP.** A finished run now precedes `terminated` with a standard `exited`
 >   event carrying the code — `main`'s return through the powerbox `exit` cap (`Trap::Exit`), a
 >   compute session's returned scalar, or `1` for an abnormal trap. Unblocks the consumer's
->   "exited with N" readout. Gated by `crates/svm-dap/tests/exit_code.rs`.
+>   "exited with N" readout. Gated by `crates/temen-dap/tests/exit_code.rs`.
 > - **The powerbox on the scheduled (multi-vCPU) debug engine.** A `thread.spawn` module launched
 >   with a *deny-all* host, so a threaded C guest's `malloc`/`printf`/`exit` `CapFault`ed and the
 >   debugger couldn't run threading lessons. `ScheduledDebugRun` now takes the same on-ramp
 >   powerbox `DebugRun` does (`build_scheduled_run`/`fresh_scheduled`, re-armed on every seek
 >   rebuild + rev-trace probe; `host()`/`stdout` surfaced, CapTape captured for both engines).
->   Gated by `crates/svm-dap/tests/threaded_powerbox.rs` (output + exit code + seek).
+>   Gated by `crates/temen-dap/tests/threaded_powerbox.rs` (output + exit code + seek).
 > - **The playground allocator grows.** The seeded `browser/playground-include/stdlib.h` shipped a
 >   fixed 64 KiB static arena — too small for a pthread stack (256 KiB), so `pthread_create`
 >   failed in the playground even with the powerbox wired. Replaced with the frontend's
@@ -642,9 +642,9 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >   via a `locate()` in `build_scheduled_run` (the seek path already called it post-replay; a
 >   fresh launch didn't). Now `stepIn` advances one source line at a time with a resolvable frame,
 >   and the second vCPU appears in the thread list *while stepping* once the root passes
->   `thread.spawn`. Gated by `crates/svm-dap/tests/threaded_powerbox.rs`
+>   `thread.spawn`. Gated by `crates/temen-dap/tests/threaded_powerbox.rs`
 >   (`threaded_stepping_stops_and_spawns_mid_run`), and — the seam the browser threads panel
->   actually reads — `crates/svm-dap/tests/dap_bytecode.rs`
+>   actually reads — `crates/temen-dap/tests/dap_bytecode.rs`
 >   (`dap_over_bytecode_threaded_step_keeps_a_resolvable_frame`) pins that after each threaded
 >   `stepIn` the stopped thread resolves a source frame (not the pre-`locate()` empty backtrace) and
 >   a spawned worker resolves its own frame mid-step. Line **breakpoints** already stop on the

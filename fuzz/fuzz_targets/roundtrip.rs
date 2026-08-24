@@ -9,9 +9,9 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use svm_encode::{decode_module, decode_unit, encode_module, encode_unit};
-use svm_text::{parse_module, print_module};
-use svm_verify::verify_module;
+use temen_encode::{decode_module, decode_unit, encode_module, encode_unit};
+use temen_text::{parse_module, print_module};
+use temen_verify::verify_module;
 
 fuzz_target!(|data: &[u8]| {
     // Object dialect (v9): for any decodable *unit*, `decode_unit ∘ encode_unit = id`, and the

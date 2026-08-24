@@ -1,7 +1,7 @@
 // Browser wasm-JIT tier — the Node proof (BROWSER.md § "wasm-JIT tier", slice 2). The fast-iteration
 // twin of the Chromium `#wasmjit` page item: it exercises the exact browser path — emit via the
-// cdylib's `svm_wasmjit_compile`, instantiate the emitted module against the cdylib's shared linear
-// memory, and call `f0` directly — comparing the JIT result to the `svm_run` interpreter (the
+// cdylib's `temen_wasmjit_compile`, instantiate the emitted module against the cdylib's shared linear
+// memory, and call `f0` directly — comparing the JIT result to the `temen_run` interpreter (the
 // oracle) and confirming the trap kinds line up. Runs on the **threads** wasm32 cdylib (imported
 // shared memory, exactly the browser page's build) on Node's WebAssembly; no Playwright, no Workers
 // (the compute kernel is single-threaded — genuine multi-Worker JIT is slice 4).
@@ -14,7 +14,7 @@ import { compileJit } from './web/wasmjit.js';
 import { engineImports } from './engine-imports.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
-const wasmPath = process.argv[2] ?? join(ROOT, 'target/wasm32-unknown-unknown/release/svm_browser.wasm');
+const wasmPath = process.argv[2] ?? join(ROOT, 'target/wasm32-unknown-unknown/release/temen_browser.wasm');
 
 const mod = await WebAssembly.compile(readFileSync(wasmPath));
 if (!WebAssembly.Module.imports(mod).some((i) => i.kind === 'memory')) {
@@ -25,27 +25,27 @@ if (!WebAssembly.Module.imports(mod).some((i) => i.kind === 'memory')) {
 const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
 const { exports: ex } = await WebAssembly.instantiate(mod, engineImports(memory));
 
-// Encode an SVM text module through the cdylib's own front end (svm_parse) so this harness needs no
-// .svmbc fixtures — it produces exactly the bytes `svm_wasmjit_compile` / `svm_run` consume.
+// Encode an Temen text module through the cdylib's own front end (temen_parse) so this harness needs no
+// .temenc fixtures — it produces exactly the bytes `temen_wasmjit_compile` / `temen_run` consume.
 function encode(src) {
   const bytes = new TextEncoder().encode(src);
-  const p = ex.svm_alloc(bytes.length);
+  const p = ex.temen_alloc(bytes.length);
   new Uint8Array(memory.buffer).set(bytes, Number(p));
-  const ok = ex.svm_parse(p, bytes.length);
-  ex.svm_dealloc(p, bytes.length);
-  const optr = Number(ex.svm_parse_ptr());
-  const out = new Uint8Array(memory.buffer).slice(optr, optr + ex.svm_parse_len());
+  const ok = ex.temen_parse(p, bytes.length);
+  ex.temen_dealloc(p, bytes.length);
+  const optr = Number(ex.temen_parse_ptr());
+  const out = new Uint8Array(memory.buffer).slice(optr, optr + ex.temen_parse_len());
   if (ok !== 1) throw new Error(`parse: ${new TextDecoder().decode(out)}`);
   return out;
 }
 
 // The interpreter oracle: decode + run func 0 on the bytecode engine, returning its i64 result.
 function interp(moduleBytes, arg) {
-  const p = ex.svm_alloc(moduleBytes.length);
+  const p = ex.temen_alloc(moduleBytes.length);
   new Uint8Array(memory.buffer).set(moduleBytes, Number(p));
-  const r = ex.svm_run(p, moduleBytes.length, BigInt(arg));
-  const st = ex.svm_status();
-  ex.svm_dealloc(p, moduleBytes.length);
+  const r = ex.temen_run(p, moduleBytes.length, BigInt(arg));
+  const st = ex.temen_status();
+  ex.temen_dealloc(p, moduleBytes.length);
   return { st, r };
 }
 
@@ -119,7 +119,7 @@ block 0 (v0: i64) {
 
 // Mixed-tier (slice 3c): an integer caller (JITted) sums a SIMD leaf f(i)=2i over 0..n. The leaf
 // (v128 internally → out of subset, memory-free) runs on the bytecode interpreter via
-// env.call_interp; the whole-guest interp oracle (svm_run) must agree. (Floats are now in-subset,
+// env.call_interp; the whole-guest interp oracle (temen_run) must agree. (Floats are now in-subset,
 // so a float leaf would be JITted directly rather than crossing tiers.)
 const MIXED = `
 func (i64) -> (i64) {
@@ -232,7 +232,7 @@ async function main() {
   for (const [name, src, winSize] of [['alu', ALU, 1 << 16], ['mem', MEM, 1 << 16]]) {
     const bytes = encode(src);
     const jit = await compileJit(ex, bytes, { memory });
-    if (!jit) { report(`${name} (eligible)`, false, 'svm_wasmjit_compile refused an in-subset module'); continue; }
+    if (!jit) { report(`${name} (eligible)`, false, 'temen_wasmjit_compile refused an in-subset module'); continue; }
     let allEq = true;
     for (const arg of sweep) {
       const { st, r } = interp(bytes, arg);
@@ -258,7 +258,7 @@ async function main() {
     const bytes = encode(MIXED);
     const jit = await compileJit(ex, bytes, { memory });
     let allEq = jit !== null;
-    if (!jit) report('mixed (eligible)', false, 'svm_wasmjit_compile refused a mixed-tier module');
+    if (!jit) report('mixed (eligible)', false, 'temen_wasmjit_compile refused a mixed-tier module');
     else for (const arg of sweep) {
       const { st, r } = interp(bytes, arg);
       if (st !== 0) { allEq = false; break; }
@@ -274,7 +274,7 @@ async function main() {
     const bytes = encode(DISPATCH);
     const jit = await compileJit(ex, bytes, { memory });
     let allEq = jit !== null;
-    if (!jit) report('call_indirect (eligible)', false, 'svm_wasmjit_compile refused an in-subset dispatch module');
+    if (!jit) report('call_indirect (eligible)', false, 'temen_wasmjit_compile refused an in-subset dispatch module');
     else for (const arg of sweep) {
       const { st, r } = interp(bytes, arg);
       if (st !== 0) { allEq = false; break; }
@@ -290,7 +290,7 @@ async function main() {
     const bytes = encode(SIMD);
     const jit = await compileJit(ex, bytes, { memory });
     let allEq = jit !== null;
-    if (!jit) report('simd (eligible)', false, 'svm_wasmjit_compile refused an in-subset v128 module');
+    if (!jit) report('simd (eligible)', false, 'temen_wasmjit_compile refused an in-subset v128 module');
     else for (const arg of sweep) {
       const { st, r } = interp(bytes, arg);
       if (st !== 0) { allEq = false; break; }
@@ -316,7 +316,7 @@ async function main() {
     report(`speedup (alu n=${N})`, eq, `jit ${jitMs.toFixed(1)}ms vs interp ${intMs.toFixed(1)}ms → ${(intMs / jitMs).toFixed(1)}×`);
   }
 
-  console.log(`\n${failed ? 'FAIL' : 'PASS'}: SVM IR JIT-compiled to wasm, run in a wasm host against the ` +
+  console.log(`\n${failed ? 'FAIL' : 'PASS'}: Temen IR JIT-compiled to wasm, run in a wasm host against the ` +
     `cdylib's own memory, matches the bytecode interpreter`);
   process.exit(failed ? 1 : 0);
 }

@@ -1,9 +1,9 @@
 // chibicc compile-time — **bytecode interpreter vs wasm-JIT**, timed on Node's V8 (the browser
 // engine), no Playwright. The fast-iteration twin of the playground C-compiler card: for each C
-// program it runs chibicc.svmb's compile pass twice — once on the bytecode interpreter
-// (`svm_run_onramp_fs`) and once on the wasm-JIT (`runJitCompiler`, which emits chibicc's `_start` to
+// program it runs chibicc.temen's compile pass twice — once on the bytecode interpreter
+// (`temen_run_onramp_fs`) and once on the wasm-JIT (`runJitCompiler`, which emits chibicc's `_start` to
 // wasm, `WebAssembly.compile`s it, and runs it, bouncing cap-calls cross-tier) — asserts the emitted
-// SVM-IR is byte-identical across tiers, and reports the wall-clock speedup. Runs on the **threads**
+// TEMEN-IR is byte-identical across tiers, and reports the wall-clock speedup. Runs on the **threads**
 // wasm32 cdylib (imported shared memory, exactly the page's build) on Node's WebAssembly.
 //
 // Usage:  node bench_chibicc_jit.mjs [module.wasm]   (build the threads cdylib first — see browser-test.mjs)
@@ -15,10 +15,10 @@ import { runJitCompiler } from './web/wasmjit-module.js';
 import { engineImports } from './engine-imports.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
-const wasmPath = process.argv[2] ?? join(ROOT, 'target/wasm32-unknown-unknown/release/svm_browser.wasm');
-const chibiccPath = join(ROOT, 'web/assets/chibicc.svmb');
+const wasmPath = process.argv[2] ?? join(ROOT, 'target/wasm32-unknown-unknown/release/temen_browser.wasm');
+const chibiccPath = join(ROOT, 'web/assets/chibicc.temen');
 if (!existsSync(chibiccPath)) {
-  console.log('SKIP: web/assets/chibicc.svmb not built (run build-onramp-assets.mjs)');
+  console.log('SKIP: web/assets/chibicc.temen not built (run build-onramp-assets.mjs)');
   process.exit(0);
 }
 
@@ -33,19 +33,19 @@ const compiler = new Uint8Array(readFileSync(chibiccPath));
 
 const dec = new TextDecoder();
 const readStdout = () => dec.decode(new Uint8Array(memory.buffer).slice(
-  Number(ex.svm_stdout_ptr()), Number(ex.svm_stdout_ptr()) + Number(ex.svm_stdout_len())));
+  Number(ex.temen_stdout_ptr()), Number(ex.temen_stdout_ptr()) + Number(ex.temen_stdout_len())));
 
-// Compile `src` on the **bytecode interpreter** (`svm_run_onramp_fs`, debug off), returning its IR.
+// Compile `src` on the **bytecode interpreter** (`temen_run_onramp_fs`, debug off), returning its IR.
 function bytecodeCompile(srcBytes) {
-  const p = Number(ex.svm_alloc(compiler.length));
-  const sp = Number(ex.svm_alloc(srcBytes.length));
+  const p = Number(ex.temen_alloc(compiler.length));
+  const sp = Number(ex.temen_alloc(srcBytes.length));
   const u8 = new Uint8Array(memory.buffer);
   u8.set(compiler, p);
   u8.set(srcBytes, sp);
-  ex.svm_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length, 0);
+  ex.temen_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length, 0);
   const ir = readStdout();
-  ex.svm_dealloc(p, compiler.length);
-  ex.svm_dealloc(sp, srcBytes.length);
+  ex.temen_dealloc(p, compiler.length);
+  ex.temen_dealloc(sp, srcBytes.length);
   return ir;
 }
 

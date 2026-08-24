@@ -1,6 +1,6 @@
 # Op × backend parity matrix
 
-**Generated — do not edit by hand.** Regenerate with `cargo run -p svm-parity` after changing the manifest (`crates/svm-parity/src/`). This file is the human-readable view of the exhaustive, test-checked classifier in `svm-parity`; the conformance test (`crates/svm-parity/tests/conformance.rs`) pins every non-skipped row against what the backends actually compile.
+**Generated — do not edit by hand.** Regenerate with `cargo run -p temen-parity` after changing the manifest (`crates/temen-parity/src/`). This file is the human-readable view of the exhaustive, test-checked classifier in `temen-parity`; the conformance test (`crates/temen-parity/tests/conformance.rs`) pins every non-skipped row against what the backends actually compile.
 
 Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines observable behavior); the bytecode interpreter is held bit-exact against it; the Cranelift and wasm JITs are fail-closed accelerators that fold their non-subset back to the oracle (INVARIANTS.md #9).
 
@@ -15,7 +15,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 
 ## scalar integer
 
-| op | svm-tree-walk | svm-bytecode | svm-jit | svm-wasm-jit | notes |
+| op | temen-tree-walk | temen-bytecode | temen-jit | temen-wasm-jit | notes |
 |----|:----:|:----:|:----:|:----:|-------|
 | `i32.const` | ✅ | ✅ | ✅ | ✅ |  |
 | `i32.add` | ✅ | ✅ | ✅ | ✅ |  |
@@ -87,7 +87,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 
 ## scalar float
 
-| op | svm-tree-walk | svm-bytecode | svm-jit | svm-wasm-jit | notes |
+| op | temen-tree-walk | temen-bytecode | temen-jit | temen-wasm-jit | notes |
 |----|:----:|:----:|:----:|:----:|-------|
 | `f32.const` | ✅ | ✅ | ✅ | ✅ |  |
 | `f32.add` | ✅ | ✅ | ✅ | ✅ |  |
@@ -136,7 +136,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 
 ## conversions
 
-| op | svm-tree-walk | svm-bytecode | svm-jit | svm-wasm-jit | notes |
+| op | temen-tree-walk | temen-bytecode | temen-jit | temen-wasm-jit | notes |
 |----|:----:|:----:|:----:|:----:|-------|
 | `i64.extend_i32_s` | ✅ | ✅ | ✅ | ✅ |  |
 | `i64.extend_i32_u` | ✅ | ✅ | ✅ | ✅ |  |
@@ -174,7 +174,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 
 ## memory
 
-| op | svm-tree-walk | svm-bytecode | svm-jit | svm-wasm-jit | notes |
+| op | temen-tree-walk | temen-bytecode | temen-jit | temen-wasm-jit | notes |
 |----|:----:|:----:|:----:|:----:|-------|
 | `i32.load` | ✅ | ✅ | ✅ | ✅ |  |
 | `i64.load` | ✅ | ✅ | ✅ | ✅ |  |
@@ -205,7 +205,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 
 ## atomics
 
-| op | svm-tree-walk | svm-bytecode | svm-jit | svm-wasm-jit | notes |
+| op | temen-tree-walk | temen-bytecode | temen-jit | temen-wasm-jit | notes |
 |----|:----:|:----:|:----:|:----:|-------|
 | `i32.atomic.load` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
 | `i32.atomic.store` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
@@ -231,7 +231,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 
 ## simd v128
 
-| op | svm-tree-walk | svm-bytecode | svm-jit | svm-wasm-jit | notes |
+| op | temen-tree-walk | temen-bytecode | temen-jit | temen-wasm-jit | notes |
 |----|:----:|:----:|:----:|:----:|-------|
 | `v128.const` | ✅ | ✅ | ✅ | ✅ |  |
 | `v128.load` | ✅ | ✅ | ✅ | ✅ |  |
@@ -464,7 +464,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 
 ## calls & control
 
-| op | svm-tree-walk | svm-bytecode | svm-jit | svm-wasm-jit | notes |
+| op | temen-tree-walk | temen-bytecode | temen-jit | temen-wasm-jit | notes |
 |----|:----:|:----:|:----:|:----:|-------|
 | `ref.func` | ✅ | ✅ | ✅ | ✅ |  |
 | `call` | ✅ | ✅ | ✅ | ✅ |  |
@@ -472,7 +472,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 
 ## capabilities & reflection
 
-| op | svm-tree-walk | svm-bytecode | svm-jit | svm-wasm-jit | notes |
+| op | temen-tree-walk | temen-bytecode | temen-jit | temen-wasm-jit | notes |
 |----|:----:|:----:|:----:|:----:|-------|
 | `cap.call` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `vcpu.tls.get` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
@@ -488,7 +488,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 
 ## process, serve & fork
 
-| op | svm-tree-walk | svm-bytecode | svm-jit | svm-wasm-jit | notes |
+| op | temen-tree-walk | temen-bytecode | temen-jit | temen-wasm-jit | notes |
 |----|:----:|:----:|:----:|:----:|-------|
 | `instantiate` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `join` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
@@ -496,14 +496,14 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 | `child_offer` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `svc.poll` | ✅ | ✅ | ✅ | ⛔ | native serve-loop core (svc.poll/svc.wait) for a serve-qualified module; else folds to the oracle; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `svc.wait` | ✅ | ✅ | ✅ | ⛔ | native serve-loop core (svc.poll/svc.wait) for a serve-qualified module; else folds to the oracle; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
-| `clone_caller` | ✅ | ✅ | 🚧 | ⛔ | native on tree-walk + bytecode; Cranelift still folds (serve loop in svm-run, native-frame twin) — the next slice (FORK.md §9.1); leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
-| `reap` | ✅ | ✅ | 🚧 | ⛔ | native on tree-walk + bytecode; Cranelift still folds (serve loop in svm-run, native-frame twin) — the next slice (FORK.md §9.1); leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `clone_caller` | ✅ | ✅ | 🚧 | ⛔ | native on tree-walk + bytecode; Cranelift still folds (serve loop in temen-run, native-frame twin) — the next slice (FORK.md §9.1); leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `reap` | ✅ | ✅ | 🚧 | ⛔ | native on tree-walk + bytecode; Cranelift still folds (serve loop in temen-run, native-frame twin) — the next slice (FORK.md §9.1); leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `fuel.remaining` | ✅ | 🚧 | ✅ | ⛔ | declines the module (folds to the oracle) rather than adding a native op; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `exec_module` | ✅ | 🚧 | 🚧 | ⛔ | eval-loop-only image-replace (Step::Exec); the fast tiers decline the module and fold to the oracle (FORK.md §8.6); leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 
 ## fibers, threads & non-local control
 
-| op | svm-tree-walk | svm-bytecode | svm-jit | svm-wasm-jit | notes |
+| op | temen-tree-walk | temen-bytecode | temen-jit | temen-wasm-jit | notes |
 |----|:----:|:----:|:----:|:----:|-------|
 | `cont.new` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `cont.resume` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
@@ -517,7 +517,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 
 ## terminators
 
-| op | svm-tree-walk | svm-bytecode | svm-jit | svm-wasm-jit | notes |
+| op | temen-tree-walk | temen-bytecode | temen-jit | temen-wasm-jit | notes |
 |----|:----:|:----:|:----:|:----:|-------|
 | `return` | ✅ | ✅ | ✅ | ✅ |  |
 | `unreachable` | ✅ | ✅ | ✅ | ✅ |  |

@@ -15,9 +15,9 @@
 #![allow(dead_code)]
 
 use crate::capture::{self as peval_capture, Located, TargetDesc};
-use svm_interp::{IrPc, Stop, StopReason, Value};
-use svm_ir::{Block, Func, Inst, LoadOp, Module, Terminator, ValType};
-use svm_peval::{specialize_with_config, SpecArg, SpecConfig};
+use temen_interp::{IrPc, Stop, StopReason, Value};
+use temen_ir::{Block, Func, Inst, LoadOp, Module, Terminator, ValType};
+use temen_peval::{specialize_with_config, SpecArg, SpecConfig};
 
 const CAPTURE_LEN: usize = 8 << 20;
 // Lua 5.4.7 offsets (call-free loop ⇒ the 104-byte ci over-slice is safe: no adjacent-frame collision).
@@ -41,12 +41,12 @@ fn rd_i32(w: &[u8], a: u64) -> i32 {
 }
 
 pub fn lua_module() -> Module {
-    // From the out-of-workspace bench crate, the fixture lives under the svm-llvm crate's tests.
+    // From the out-of-workspace bench crate, the fixture lives under the temen-llvm crate's tests.
     let p = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../crates/svm-llvm/tests/fixtures/lua/lua_eval.ll"
+        "/../crates/temen-llvm/tests/fixtures/lua/lua_eval.ll"
     );
-    svm_llvm::translate_ll_path(p).expect("translate").module
+    temen_llvm::translate_ll_path(p).expect("translate").module
 }
 pub fn luav_execute(m: &Module) -> u32 {
     m.exports
@@ -56,7 +56,7 @@ pub fn luav_execute(m: &Module) -> u32 {
         .func
 }
 
-fn read_entry(insp: &mut svm_interp::Inspector, luav: u32) -> (i64, u64, u64) {
+fn read_entry(insp: &mut temen_interp::Inspector, luav: u32) -> (i64, u64, u64) {
     let entry = IrPc {
         module: 0,
         func: luav,
@@ -114,7 +114,7 @@ pub fn auto_rolled(m: &Module, script: &str) -> AutoRolled {
     let dispatch = peval_capture::dispatch_block(m, luav);
 
     // Locate the register base + entry scalars.
-    let inst = svm_run::instantiate(m.clone()).expect("instantiate");
+    let inst = temen_run::instantiate(m.clone()).expect("instantiate");
     let mut insp0 = inst.debug_attach(script.as_bytes().to_vec(), u64::MAX);
     let (sp, l, ci) = read_entry(&mut insp0, luav);
     let w0 = insp0.read_window(0, CAPTURE_LEN).expect("window");
@@ -134,7 +134,7 @@ pub fn auto_rolled(m: &Module, script: &str) -> AutoRolled {
     };
     let script_owned = script.to_string();
     let make_insp = move || {
-        let inst = svm_run::instantiate(m.clone()).expect("instantiate");
+        let inst = temen_run::instantiate(m.clone()).expect("instantiate");
         let mut insp = inst.debug_attach(script_owned.as_bytes().to_vec(), u64::MAX);
         read_entry(&mut insp, luav);
         insp
@@ -336,7 +336,7 @@ pub fn auto_rolled(m: &Module, script: &str) -> AutoRolled {
             (r, e)
         }
     };
-    svm_verify::verify_module(&residual).expect("residual verifies");
+    temen_verify::verify_module(&residual).expect("residual verifies");
 
     let counter_ix = d.varying.iter().position(|&a| a == d.counter).unwrap();
     // The **result register**: the chunk's `return <v>` compiles to a `RETURN1 A` (or `RETURN A ...`)

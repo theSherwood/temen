@@ -11,12 +11,12 @@
 #   or run:                     scripts/ci/install-git-hooks.sh
 #
 # Escape hatches:
-#   SVM_HOOK_SKIP=1        git push   # skip the hook entirely (same as `git push --no-verify`)
-#   SVM_HOOK_SKIP_TESTS=1  git push   # run fmt+clippy+build, skip the (slower) test step
+#   TEMEN_HOOK_SKIP=1        git push   # skip the hook entirely (same as `git push --no-verify`)
+#   TEMEN_HOOK_SKIP_TESTS=1  git push   # run fmt+clippy+build, skip the (slower) test step
 set -euo pipefail
 
-if [ "${SVM_HOOK_SKIP:-0}" = "1" ]; then
-  echo "pre-push: SVM_HOOK_SKIP=1 — skipping local checks."
+if [ "${TEMEN_HOOK_SKIP:-0}" = "1" ]; then
+  echo "pre-push: TEMEN_HOOK_SKIP=1 — skipping local checks."
   exit 0
 fi
 
@@ -44,12 +44,12 @@ run() {
   "$@"
 }
 
-echo "pre-push: running the fast CI subset (set SVM_HOOK_SKIP=1 to bypass)…"
+echo "pre-push: running the fast CI subset (set TEMEN_HOOK_SKIP=1 to bypass)…"
 run cargo fmt --all --check
 run cargo clippy --workspace --all-targets -- -D warnings
 run cargo build --workspace
-if [ "${SVM_HOOK_SKIP_TESTS:-0}" = "1" ]; then
-  echo "pre-push: SVM_HOOK_SKIP_TESTS=1 — skipping tests."
+if [ "${TEMEN_HOOK_SKIP_TESTS:-0}" = "1" ]; then
+  echo "pre-push: TEMEN_HOOK_SKIP_TESTS=1 — skipping tests."
 else
   run cargo test --workspace
 fi

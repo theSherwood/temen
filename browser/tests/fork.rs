@@ -11,7 +11,7 @@ fn run_fork_forks_returns_twice_through_the_bytecode_drive() {
     // `100` = the original resumed past `fork()` with reply_orig AND both replies (100 + 200) reached
     // the shared stdout — i.e. the twin genuinely ran over its private window + duplicated powerbox.
     assert_eq!(
-        svm_browser::run_fork(),
+        temen_browser::run_fork(),
         100,
         "the fork twin ran and returned twice on the browser's bytecode drive"
     );

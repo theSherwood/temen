@@ -1,9 +1,9 @@
 // Browser wasm-JIT tier — §22 **Model B2** domain wiring (BROWSER.md § "wasm-JIT tier"). An
 // `install`ed unit becomes a funcref another instance's `call_indirect` reaches, through one shared
 // `WebAssembly.Table` the host owns. This is the JS analog of the native differential host in
-// `crates/svm-wasm-jit/tests/b2_install.rs`: the interpreter's `DomainTable` is host-populated, so
+// `crates/temen-wasm-jit/tests/b2_install.rs`: the interpreter's `DomainTable` is host-populated, so
 // here the JS host owns the table and writes each slot on `install`/`uninstall` — the emitted units
-// (via `svm_wasmjit_compile_b2`) *import* the table and populate nothing.
+// (via `temen_wasmjit_compile_b2`) *import* the table and populate nothing.
 //
 // Scope: this wires **one instance-domain** (a single Worker / single `WebAssembly.Table`). wasm
 // funcrefs are not transferable across Workers, so cross-Worker B2 needs each Worker to hold its own
@@ -16,11 +16,11 @@ function memoryOf(ex, memory) {
   return memory ?? ex.memory;
 }
 
-// Read the most-recently-emitted wasm bytes out of the cdylib's linear memory (a later `svm_alloc`
+// Read the most-recently-emitted wasm bytes out of the cdylib's linear memory (a later `temen_alloc`
 // could move the stash, so copy eagerly).
 function takeEmitted(ex, mem) {
-  const wptr = Number(ex.svm_wasmjit_ptr());
-  const wlen = ex.svm_wasmjit_len();
+  const wptr = Number(ex.temen_wasmjit_ptr());
+  const wlen = ex.temen_wasmjit_len();
   return new Uint8Array(mem.buffer).slice(wptr, wptr + wlen);
 }
 
@@ -52,17 +52,17 @@ export function openB2Domain(ex, { tableLog2, shared = true, memory = null } = {
       // A B2 unit reaches other units through the shared table, not the interpreter — but a unit may
       // still have genuine cross-tier interp leaves. Route them as the compute path does.
       call_interp: (func, argsPtr) => {
-        if (ex.svm_wasmjit_call_interp(func, argsPtr) !== 0) throw new Error('cross-tier trap');
+        if (ex.temen_wasmjit_call_interp(func, argsPtr) !== 0) throw new Error('cross-tier trap');
       },
       __indirect_function_table: table,
     },
   });
 
   async function compile(moduleBytes) {
-    const mptr = ex.svm_alloc(moduleBytes.length);
+    const mptr = ex.temen_alloc(moduleBytes.length);
     new Uint8Array(mem.buffer).set(moduleBytes, Number(mptr));
-    const ok = ex.svm_wasmjit_compile_b2(mptr, moduleBytes.length, tableLog2, shared ? 1 : 0);
-    ex.svm_dealloc(mptr, moduleBytes.length);
+    const ok = ex.temen_wasmjit_compile_b2(mptr, moduleBytes.length, tableLog2, shared ? 1 : 0);
+    ex.temen_dealloc(mptr, moduleBytes.length);
     if (ok !== 1) return null; // outside the emitter subset → caller keeps the interpreter tier
     const wasm = takeEmitted(ex, mem);
     const module = await WebAssembly.compile(wasm);

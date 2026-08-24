@@ -1,5 +1,5 @@
 [package]
-name = "svm-fuzz"
+name = "temen-fuzz"
 version = "0.0.0"
 edition = "2021"
 publish = false
@@ -13,22 +13,22 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-svm = { path = "../crates/svm" }
-svm-ir = { path = "../crates/svm-ir" }
-svm-encode = { path = "../crates/svm-encode" }
-svm-verify = { path = "../crates/svm-verify" }
-svm-spec = { path = "../crates/svm-spec" } # executable ISA spec — oracle for the spec_* targets
-svm-interp = { path = "../crates/svm-interp" }
-svm-jit = { path = "../crates/svm-jit" }
-svm-durable = { path = "../crates/svm-durable" }
-svm-snapshot = { path = "../crates/svm-snapshot" } # §12 snapshot codec, exercised x-backend by durable_jit
-svm-run = { path = "../crates/svm-run" } # production cap.call thunk, for irgen's Memory-cap success path
-svm-mask = { path = "../crates/svm-mask" }
-svm-text = { path = "../crates/svm-text" }
-svm-wasm = { path = "../crates/svm-wasm" } # untrusted core-wasm frontend, fuzzed for fail-closed decode
-svm-opt = { path = "../crates/svm-opt" } # generic IR→IR optimizer, fuzzed for the SSA round-trip identity
-svm-llvm = { path = "../crates/svm-llvm" } # LLVM on-ramp, fuzzed for translation miscompiles (onramp_diff)
-svm-wasm-jit = { path = "../crates/svm-wasm-jit" } # backend 4, fuzzed for confinement miscompiles (wasm_diff)
+temen = { path = "../crates/temen" }
+temen-ir = { path = "../crates/temen-ir" }
+temen-encode = { path = "../crates/temen-encode" }
+temen-verify = { path = "../crates/temen-verify" }
+temen-spec = { path = "../crates/temen-spec" } # executable ISA spec — oracle for the spec_* targets
+temen-interp = { path = "../crates/temen-interp" }
+temen-jit = { path = "../crates/temen-jit" }
+temen-durable = { path = "../crates/temen-durable" }
+temen-snapshot = { path = "../crates/temen-snapshot" } # §12 snapshot codec, exercised x-backend by durable_jit
+temen-run = { path = "../crates/temen-run" } # production cap.call thunk, for irgen's Memory-cap success path
+temen-mask = { path = "../crates/temen-mask" }
+temen-text = { path = "../crates/temen-text" }
+temen-wasm = { path = "../crates/temen-wasm" } # untrusted core-wasm frontend, fuzzed for fail-closed decode
+temen-opt = { path = "../crates/temen-opt" } # generic IR→IR optimizer, fuzzed for the SSA round-trip identity
+temen-llvm = { path = "../crates/temen-llvm" } # LLVM on-ramp, fuzzed for translation miscompiles (onramp_diff)
+temen-wasm-jit = { path = "../crates/temen-wasm-jit" } # backend 4, fuzzed for confinement miscompiles (wasm_diff)
 # `simd` enables wasmi's §17 v128 proposal (`Config::wasm_simd`), needed by `wasm_diff` (the core v128
 # lane ops are in the wasm-JIT's integer subset). The emitted wasm runs under wasmi as the escape oracle.
 wasmi = { version = "0.47", features = ["simd"] }

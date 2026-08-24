@@ -1,0 +1,477 @@
+//! IMPORTS.md **§3.2** — provider-side interface offers wired into import slots, end to end:
+//! a provider module declares `export "adder" impl <funcidx>...`, the embedder binds a
+//! consumer's import slot to one op of that offer (`HostCap::offer_func`), and the consumer's
+//! `call.import` executes the offered guest function — identically on all three backends,
+//! through the one shared generic dispatch (v1 pure dispatch: the impl computes over its
+//! arguments alone — no window, no capabilities).
+
+use temen_run::{instantiate_with_imports, Backend, HostCap, Imports, Outcome, RunConfig};
+use temen_text::parse_module;
+
+/// The provider: func 1 implements `add(a, b) = a + b`; the offer's op 0 names it.
+const PROVIDER: &str = "\
+type 0 func (i64, i64) -> (i64)
+type 1 interface { add: 0 }
+export 0 interface \"adder\" 1 { add: 1 }
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  return v0
+  }
+}
+
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.add va vb
+  return vs
+  }
+}
+";
+
+/// The consumer: `_start` calls the wired `add` op with (40, 2) and exits with the sum.
+const CONSUMER: &str = "\
+import 0 \"add\" (i64, i64) -> (i64)
+import 1 \"exit\" (i32) -> ()
+
+func () -> () {
+block 0 () {
+  vh = i32.const 0
+  va = i64.const 40
+  vb = i64.const 2
+  vr = call.import 0 (va, vb)
+  vc = i32.wrap_i64 vr
+  call.import 1 (vc)
+  unreachable
+  }
+}
+
+export 0 func \"_start\" 0
+";
+
+#[test]
+fn a_wired_offer_runs_identically_on_all_three_backends() {
+    let provider = parse_module(PROVIDER).expect("provider parses");
+    temen_verify::verify_module(&provider).expect("provider verifies");
+    let consumer = parse_module(CONSUMER).expect("consumer parses");
+
+    let registry = Imports::new()
+        .provide(
+            "add",
+            HostCap::offer_func(&provider, "adder", 0).expect("offer resolves"),
+        )
+        .provide("exit", HostCap::exit());
+    let inst = instantiate_with_imports(consumer.clone(), registry).expect("instantiate");
+    assert_eq!(inst.module(), &consumer, "no rewrite (phase-1 invariant)");
+
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let r = inst
+            .run(backend, &RunConfig::default())
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(
+            r.outcome,
+            Outcome::Exited(42),
+            "{backend:?}: the wired guest impl must compute 40 + 2"
+        );
+    }
+}
+
+#[test]
+fn offer_signature_mismatch_fails_instantiation_closed() {
+    let provider = parse_module(PROVIDER).expect("provider parses");
+    // The consumer declares the wrong signature for the wired op: (i64) -> (i64) vs the
+    // offer's (i64, i64) -> (i64). Structural, fail-closed, at instantiation — before any run.
+    let consumer = parse_module(
+        "import 0 \"add\" (i64) -> (i64)\n\
+         import 1 \"exit\" (i32) -> ()\n\
+         func () -> () {\n\
+         block 0 () {\n\
+           vh = i32.const 0\n\
+           vc = i32.const 0\n\
+           call.import 1 (vc)\n\
+           unreachable\n\
+           }\n\
+         }\n\
+         export 0 func \"_start\" 0\n",
+    )
+    .expect("consumer parses");
+    let registry = Imports::new()
+        .provide(
+            "add",
+            HostCap::offer_func(&provider, "adder", 0).expect("offer resolves"),
+        )
+        .provide("exit", HostCap::exit());
+    let err = match instantiate_with_imports(consumer, registry) {
+        Err(e) => e,
+        Ok(_) => panic!("a signature mismatch must refuse instantiation"),
+    };
+    assert!(
+        err.contains("§3.2"),
+        "the refusal names the wiring rule: {err}"
+    );
+}
+
+/// A stateful provider: `bump() -> i64` increments a counter in the provider's OWN window —
+/// the §3.2 v2 exporter-domain-state service, offered as `export "counter" impl 0`.
+const STATEFUL_PROVIDER: &str = "\
+memory 16
+type 0 func () -> (i64)
+type 1 interface { add: 0 }
+export 0 interface \"counter\" 1 { add: 0 }
+
+func () -> (i64) {
+block 0 () {
+  va = i64.const 0
+  vc = i64.load va
+  v1 = i64.const 1
+  vn = i64.add vc v1
+  i64.store va vn
+  return vn
+  }
+}
+";
+
+/// The consumer: calls `bump` three times and exits with the third count — 3 only if the
+/// provider's window state persisted across the calls.
+const STATEFUL_CONSUMER: &str = "\
+import 0 \"bump\" () -> (i64)
+import 1 \"exit\" (i32) -> ()
+
+func () -> () {
+block 0 () {
+  vh = i32.const 0
+  v1 = call.import 0 ()
+  v2 = call.import 0 ()
+  v3 = call.import 0 ()
+  vc = i32.wrap_i64 v3
+  call.import 1 (vc)
+  unreachable
+  }
+}
+
+export 0 func \"_start\" 0
+";
+
+#[test]
+fn an_instanced_offer_keeps_state_across_calls_on_all_three_backends() {
+    let provider = parse_module(STATEFUL_PROVIDER).expect("provider parses");
+    temen_verify::verify_module(&provider).expect("provider verifies");
+    let consumer = parse_module(STATEFUL_CONSUMER).expect("consumer parses");
+
+    let registry = Imports::new()
+        .provide(
+            "bump",
+            HostCap::offer_proc(&provider, "counter", 0).expect("offer resolves"),
+        )
+        .provide("exit", HostCap::exit());
+    let inst = instantiate_with_imports(consumer, registry).expect("instantiate");
+
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let r = inst
+            .run(backend, &RunConfig::default())
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(
+            r.outcome,
+            Outcome::Exited(3),
+            "{backend:?}: the provider's window state must persist across the three calls"
+        );
+    }
+}
+
+/// CALLS.md increment 3, slice 1 (lock-narrowing) — two vCPUs of one domain call the SAME
+/// instanced offer concurrently. Each `bump` is wrapped in a retry-on-`-EAGAIN` loop, so under
+/// the try-enter admission a contended caller re-attempts rather than losing an increment; the
+/// root spawns a worker, both bump once, join, then the root bumps a third time and exits with
+/// the count. The provider window state is shared, so exactly three successful increments land
+/// regardless of interleaving ⇒ `Exited(3)`. The point is **safety under the narrowed lock**
+/// (the sub-run now runs with the caller powerbox lock released, `state → hg` order): the run
+/// must neither deadlock nor corrupt the shared counter. (A deterministic *liveness* test — that
+/// the cap surface stays live *during* a blocking handler — waits for cooperative handler parking
+/// in increment 4; a blocking nested `drive_arc` still ties up its worker thread this slice.)
+const STATEFUL_MULTI_CONSUMER: &str = "\
+memory 16
+import 0 \"bump\" () -> (i64)
+import 1 \"exit\" (i32) -> ()
+
+func () -> () {
+block 0 () {
+  vsp = i64.const 0
+  vh = thread.spawn 1 vsp vsp
+  vaddr = i64.const 0
+  i32.store vaddr vh
+  br 1()
+  }
+block 1 () {
+  vr = call.import 0 ()
+  vz = i64.const 0
+  vlt = i64.lt_s vr vz
+  br_if vlt 1() 2()
+  }
+block 2 () {
+  va2 = i64.const 0
+  vh2 = i32.load va2
+  vj = thread.join vh2
+  br 3()
+  }
+block 3 () {
+  vr2 = call.import 0 ()
+  vz2 = i64.const 0
+  vlt2 = i64.lt_s vr2 vz2
+  br_if vlt2 3() 4(vr2)
+  }
+block 4 (vfinal: i64) {
+  vc = i32.wrap_i64 vfinal
+  call.import 1 (vc)
+  unreachable
+  }
+}
+
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  br 1()
+  }
+block 1 () {
+  vr = call.import 0 ()
+  vz = i64.const 0
+  vlt = i64.lt_s vr vz
+  br_if vlt 1() 2(vr)
+  }
+block 2 (vw: i64) {
+  return vw
+  }
+}
+
+export 0 func \"_start\" 0
+";
+
+#[test]
+fn concurrent_instanced_offer_calls_are_safe_under_the_narrowed_lock() {
+    let provider = parse_module(STATEFUL_PROVIDER).expect("provider parses");
+    temen_verify::verify_module(&provider).expect("provider verifies");
+    let consumer = parse_module(STATEFUL_MULTI_CONSUMER).expect("consumer parses");
+
+    // The offer is called through the eval loop (the tree-walker services the narrowed path;
+    // the bytecode engine declines offer ops and falls back to it), so both backends exercise
+    // `drive_instanced_offer` under two concurrent vCPUs of one domain.
+    for backend in [Backend::TreeWalk, Backend::Bytecode] {
+        let registry = Imports::new()
+            .provide(
+                "bump",
+                HostCap::offer_proc(&provider, "counter", 0).expect("offer resolves"),
+            )
+            .provide("exit", HostCap::exit());
+        let inst = instantiate_with_imports(consumer.clone(), registry).expect("instantiate");
+        let r = inst
+            .run(backend, &RunConfig::default())
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(
+            r.outcome,
+            Outcome::Exited(3),
+            "{backend:?}: three successful concurrent+serial bumps must land exactly, no deadlock"
+        );
+    }
+}
+
+#[test]
+fn offer_func_fails_closed_on_unknown_offer_or_op() {
+    let provider = parse_module(PROVIDER).expect("provider parses");
+    assert!(HostCap::offer_func(&provider, "nope", 0).is_none());
+    assert!(HostCap::offer_func(&provider, "adder", 1).is_none());
+}
+
+// --- §3.5 grouped host-native providers (HostCap::iface) --------------------------------------
+
+/// A consumer that imports a **whole interface** and uses only one op: a grouped import `log`
+/// declaring `interface { write }` (a subset of the host `Stream`'s read/write/close), called
+/// as `call.import 0.write`. `write(buf, len) -> nwritten` writes the 3 data bytes and returns
+/// 3, which the guest passes to `exit` — the cross-backend observable.
+const GROUPED_CONSUMER: &str = "\
+memory 16
+data 0 \"hi\\n\"
+type 0 func (i64, i64) -> (i64)
+type 1 interface { write: 0 }
+type 2 func (i32) -> ()
+import 0 interface \"log\" 1
+import 1 func \"exit\" 2
+func 0 () -> () {
+block 0 () {
+  v0 = i64.const 0
+  v1 = i64.const 3
+  v2 = call.import 0.write (v0, v1)
+  v3 = i32.wrap_i64 v2
+  call.import 1 (v3)
+  unreachable
+  }
+}
+export 0 func \"_start\" 0
+";
+
+/// The provided host interface, in the `Stream` handle's **native op order**: read=0, write=1,
+/// close=2. A consumer needing only `write` covers it (subset); the frozen remap sends the
+/// consumer's op 0 to the handle's native op 1.
+fn stream_shape() -> temen_run::IfaceShape {
+    use temen_ir::{FuncType, ValType};
+    let rw = FuncType {
+        params: vec![ValType::I64, ValType::I64],
+        results: vec![ValType::I64],
+    };
+    temen_run::IfaceShape::new()
+        .op("read", rw.clone())
+        .op("write", rw)
+        .op(
+            "close",
+            FuncType {
+                params: vec![],
+                results: vec![],
+            },
+        )
+}
+
+#[test]
+fn a_grouped_host_interface_binds_a_subset_and_dispatches_across_backends() {
+    let consumer = parse_module(GROUPED_CONSUMER).expect("consumer parses");
+    let shape = stream_shape();
+    let registry = Imports::new()
+        .provide(
+            "log",
+            // A host-native `Stream` (stdout) offered as a whole interface; the consumer binds a
+            // subset and the remap routes its `write` to the stream's native op 1.
+            HostCap::iface(&shape, |h, _| h.grant_stream(temen_interp::StreamRole::Out)),
+        )
+        .provide("exit", HostCap::exit());
+    let inst = instantiate_with_imports(consumer, registry).expect("instantiate");
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let r = inst
+            .run(backend, &RunConfig::default())
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(
+            r.outcome,
+            Outcome::Exited(3),
+            "{backend:?}: the grouped write dispatched through the remap and returned nwritten"
+        );
+    }
+}
+
+#[test]
+fn a_grouped_host_interface_that_does_not_cover_fails_instantiation() {
+    // The consumer requires `read`, which the provided shape has — but with a *different*
+    // signature than the consumer declared, so coverage fails closed at instantiation.
+    let consumer = parse_module(
+        "type 0 func (i32) -> (i32)\n\
+         type 1 interface { read: 0 }\n\
+         import 0 interface \"log\" 1\n\
+         func 0 () -> () {\n\
+         block 0 () {\n\
+           return\n\
+           }\n\
+         }\n\
+         export 0 func \"_start\" 0\n",
+    )
+    .expect("consumer parses");
+    let shape = stream_shape(); // read is (i64,i64)->(i64), not (i32)->(i32)
+    let registry = Imports::new().provide(
+        "log",
+        HostCap::iface(&shape, |h, _| h.grant_stream(temen_interp::StreamRole::Out)),
+    );
+    let err = match instantiate_with_imports(consumer, registry) {
+        Err(e) => e,
+        Ok(_) => panic!("a non-covering grouped import must refuse instantiation"),
+    };
+    assert!(
+        err.contains("§3.5") && err.contains("not covered"),
+        "the refusal names the coverage rule: {err}"
+    );
+}
+
+#[test]
+fn a_grouped_host_interface_from_the_preseeded_builtin_shape_dispatches() {
+    // IMPORTS.md §3.5 intern pre-seeding: the host `Stream` shape is published, so the embedder
+    // offers a host-native stdout stream as a whole interface *without* re-declaring read/write/close
+    // by hand — `IfaceShape::builtin` sources the canonical shape. The consumer's `write` still
+    // routes through the remap to the stream's native op 1, identically on every backend.
+    let consumer = parse_module(GROUPED_CONSUMER).expect("consumer parses");
+    let shape = temen_run::IfaceShape::builtin(temen_interp::cap_id::STREAM)
+        .expect("Stream is a pre-seeded built-in");
+    let registry = Imports::new()
+        .provide(
+            "log",
+            HostCap::iface(&shape, |h, _| h.grant_stream(temen_interp::StreamRole::Out)),
+        )
+        .provide("exit", HostCap::exit());
+    let inst = instantiate_with_imports(consumer, registry).expect("instantiate");
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let r = inst
+            .run(backend, &RunConfig::default())
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(
+            r.outcome,
+            Outcome::Exited(3),
+            "{backend:?}: the canonical built-in shape covers the consumer and dispatched write"
+        );
+    }
+}
+
+/// CALLS.md 7.3 — the same stateful instanced offer wired **`Threaded`** keeps its semantics on
+/// all three backends: the eval-loop tier animates with no admission gate (7.1), and the
+/// JIT/host-side tier runs the handler in a sub-run **over the instance's live shared cell**
+/// (`drive_arc_shared`) instead of refusing `-EAGAIN` — the 7.3 arm this pins. Sequential calls,
+/// so the pin is pure tier parity: `Exited(3)` everywhere, exactly as the `Single` wire above.
+#[test]
+fn a_threaded_offer_keeps_state_across_calls_on_all_three_backends() {
+    let provider = parse_module(STATEFUL_PROVIDER).expect("provider parses");
+    temen_verify::verify_module(&provider).expect("provider verifies");
+    let consumer = parse_module(STATEFUL_CONSUMER).expect("consumer parses");
+
+    let registry = Imports::new()
+        .provide(
+            "bump",
+            HostCap::offer_proc_threaded(&provider, "counter", 0).expect("offer resolves"),
+        )
+        .provide("exit", HostCap::exit());
+    let inst = instantiate_with_imports(consumer, registry).expect("instantiate");
+
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let r = inst
+            .run(backend, &RunConfig::default())
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(
+            r.outcome,
+            Outcome::Exited(3),
+            "{backend:?}: a Threaded instance's window state persists across calls on every tier"
+        );
+    }
+}
+
+/// CALLS.md 7.4 — the module's **own** `threaded` declaration flows through the plain
+/// [`HostCap::offer_proc`] wire (no host-side policy override): the wired instance runs under the
+/// declared policy on every backend. Sequential calls, so the pin is that the declaration parses,
+/// wires, and keeps three-backend parity — the policy-distinguishing observables live in
+/// `temen-interp`'s `threaded_offers` (buried re-entry, host-side arm).
+#[test]
+fn a_module_declared_threaded_offer_wires_and_runs_on_all_three_backends() {
+    let threaded_src = STATEFUL_PROVIDER.replace(
+        "export 0 interface \"counter\" 1",
+        "export 0 interface \"counter\" threaded 1",
+    );
+    let provider = parse_module(&threaded_src).expect("provider parses");
+    temen_verify::verify_module(&provider).expect("provider verifies");
+    let consumer = parse_module(STATEFUL_CONSUMER).expect("consumer parses");
+
+    let registry = Imports::new()
+        .provide(
+            "bump",
+            HostCap::offer_proc(&provider, "counter", 0).expect("offer resolves"),
+        )
+        .provide("exit", HostCap::exit());
+    let inst = instantiate_with_imports(consumer, registry).expect("instantiate");
+
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let r = inst
+            .run(backend, &RunConfig::default())
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(
+            r.outcome,
+            Outcome::Exited(3),
+            "{backend:?}: the declared-threaded instance keeps state and parity on every tier"
+        );
+    }
+}

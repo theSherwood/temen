@@ -1,5 +1,5 @@
 // **#750 paged-tier tail-cost bench, V8 half.** Times the four memory-hot kernels emitted by
-// `cargo run --release -p svm-wasm-jit --example paged_bench_emit` on Node/V8 — the engine the real
+// `cargo run --release -p temen-wasm-jit --example paged_bench_emit` on Node/V8 — the engine the real
 // consumer (the browser tier-up) runs on — through three tier-up modules: `plain.wasm` (mask-only),
 // `paged.wasm` (per-access software page check, fully-Rw table), and `nullguard.wasm` (the
 // dedicated NULL-page compare the trap-on-NULL design weighs against full paged mode). Same

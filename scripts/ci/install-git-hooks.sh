@@ -10,4 +10,4 @@ cd "$repo_root"
 git config core.hooksPath .githooks
 echo "Enabled .githooks (core.hooksPath=.githooks)."
 echo "The pre-push hook now runs the fast CI subset before each push."
-echo "Bypass once with:  SVM_HOOK_SKIP=1 git push   (or git push --no-verify)"
+echo "Bypass once with:  TEMEN_HOOK_SKIP=1 git push   (or git push --no-verify)"

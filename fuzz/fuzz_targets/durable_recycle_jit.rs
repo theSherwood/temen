@@ -12,7 +12,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-#[path = "../../crates/svm/tests/support/durjit.rs"]
+#[path = "../../crates/temen/tests/support/durjit.rs"]
 mod durjit;
 
 fuzz_target!(|data: &[u8]| {

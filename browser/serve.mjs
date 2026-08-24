@@ -14,7 +14,7 @@ const TYPES = {
   '.js': 'text/javascript',
   '.mjs': 'text/javascript',
   '.wasm': 'application/wasm',
-  '.svmbc': 'application/octet-stream',
+  '.temenc': 'application/octet-stream',
   '.json': 'application/json',
 };
 

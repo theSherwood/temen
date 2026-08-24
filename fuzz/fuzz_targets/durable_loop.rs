@@ -10,7 +10,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-#[path = "../../crates/svm-durable/tests/support/durgen.rs"]
+#[path = "../../crates/temen-durable/tests/support/durgen.rs"]
 mod durgen;
 
 fuzz_target!(|data: &[u8]| {

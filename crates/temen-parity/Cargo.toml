@@ -1,0 +1,27 @@
+[package]
+name = "temen-parity"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# The op × backend **parity matrix** (DESIGN.md §3, INVARIANTS.md #9): a single, exhaustive,
+# code-derived source of truth for which ops each of the four backends runs vs. folds back to the
+# oracle, and why. The library is pure data over `temen-ir` (no backend deps, so it stays cheap and
+# the classification cannot accidentally depend on a backend's internals); the *conformance* test
+# (`tests/`) is the honesty pin — it dev-deps all four backends and proves the manifest matches what
+# they actually compile.
+[dependencies]
+temen-ir.workspace = true
+
+[dev-dependencies]
+temen-verify.workspace = true
+temen-interp.workspace = true
+temen-jit.workspace = true
+temen-wasm-jit.workspace = true
+
+[[bin]]
+# Regenerate the checked-in human-readable matrix (`OPS_PARITY.md`): `cargo run -p temen-parity`.
+name = "temen-parity-gen"
+path = "src/bin/gen.rs"

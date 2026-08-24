@@ -1,0 +1,280 @@
+--- a/library/std/src/sys/alloc/mod.rs
++++ b/library/std/src/sys/alloc/mod.rs
+@@ -113,6 +113,10 @@
+         mod zkvm;
+         use zkvm as imp;
+     }
++    target_os = "temen" => {
++        mod temen;
++        use temen as imp;
++    }
+ }
+ 
+ pub use imp::{alloc, dealloc, realloc};
+--- a/library/std/src/sys/thread_local/mod.rs
++++ b/library/std/src/sys/thread_local/mod.rs
+@@ -30,6 +30,7 @@
+         target_os = "zkvm",
+         target_os = "trusty",
+         target_os = "vexos",
++        all(target_os = "temen", not(target_env = "threads")),
+     ) => {
+         mod no_threads;
+         pub use no_threads::{EagerStorage, LazyStorage, thread_local_inner};
+@@ -101,6 +102,7 @@
+             target_os = "zkvm",
+             target_os = "trusty",
+             target_os = "vexos",
++            target_os = "temen",
+         ) => {
+             pub(crate) fn enable() {
+                 // FIXME: Right now there is no concept of "thread exit" on
+--- a/library/std/src/sys/random/mod.rs
++++ b/library/std/src/sys/random/mod.rs
+@@ -107,6 +107,7 @@
+         target_os = "xous",
+         target_os = "vexos",
+         target_os = "l4re",
++        target_os = "temen",
+     ) => {
+         // FIXME: finally remove std support for wasm32-unknown-unknown
+         // FIXME: add random data generation to xous
+@@ -124,6 +125,7 @@
+     target_os = "xous",
+     target_os = "vexos",
+     target_os = "l4re",
++    target_os = "temen",
+ )))]
+ pub fn hashmap_random_keys() -> (u64, u64) {
+     let mut buf = [0; 16];
+--- a/library/std/src/sys/io/error/mod.rs
++++ b/library/std/src/sys/io/error/mod.rs
+@@ -33,6 +33,7 @@
+     }
+     any(
+         target_os = "vexos",
++        target_os = "temen",
+         target_family = "wasm",
+         target_os = "zkvm",
+         target_os = "trusty",
+--- a/library/std/src/sys/stdio/mod.rs
++++ b/library/std/src/sys/stdio/mod.rs
+@@ -41,6 +41,10 @@
+         mod xous;
+         pub use xous::*;
+     }
++    target_os = "temen" => {
++        mod temen;
++        pub use temen::*;
++    }
+     target_os = "zkvm" => {
+         mod zkvm;
+         pub use zkvm::*;
+--- a/library/std/src/sys/exit.rs
++++ b/library/std/src/sys/exit.rs
+@@ -154,6 +154,13 @@
+         target_os = "xous" => {
+             crate::os::xous::ffi::exit(code as u32)
+         }
++        target_os = "temen" => {
++            // The powerbox `Exit` capability (temen-llvm Lane C binds `exit`; POSIX.md op 4).
++            unsafe extern "C" {
++                fn exit(code: i32) -> !;
++            }
++            unsafe { exit(code) }
++        }
+         _ => {
+             let _ = code;
+             crate::intrinsics::abort()
+--- a/library/std/src/sys/pal/mod.rs
++++ b/library/std/src/sys/pal/mod.rs
+@@ -60,6 +60,10 @@
+         mod zkvm;
+         pub use self::zkvm::*;
+     }
++    target_os = "temen" => {
++        mod temen;
++        pub use self::temen::*;
++    }
+     _ => {
+         mod unsupported;
+         pub use self::unsupported::*;
+--- a/library/std/src/sys/args/mod.rs
++++ b/library/std/src/sys/args/mod.rs
+@@ -10,6 +10,7 @@
+     target_os = "uefi",
+     target_os = "wasi",
+     target_os = "xous",
++    target_os = "temen",
+ ))]
+ mod common;
+ 
+@@ -57,6 +58,10 @@
+         mod zkvm;
+         pub use zkvm::*;
+     }
++    target_os = "temen" => {
++        mod temen;
++        pub use temen::*;
++    }
+     _ => {
+         mod unsupported;
+         pub use unsupported::*;
+--- a/library/std/src/sys/time/mod.rs
++++ b/library/std/src/sys/time/mod.rs
+@@ -44,6 +44,10 @@
+         mod xous;
+         use xous as imp;
+     }
++    target_os = "temen" => {
++        mod temen;
++        use temen as imp;
++    }
+     _ => {
+         mod unsupported;
+         use unsupported as imp;
+--- a/library/std/src/sys/env/mod.rs
++++ b/library/std/src/sys/env/mod.rs
+@@ -11,6 +11,7 @@
+     target_os = "uefi",
+     target_os = "wasi",
+     target_os = "xous",
++    target_os = "temen",
+ ))]
+ mod common;
+ 
+@@ -55,6 +56,10 @@
+         mod zkvm;
+         pub use zkvm::*;
+     }
++    target_os = "temen" => {
++        mod temen;
++        pub use temen::*;
++    }
+     _ => {
+         mod unsupported;
+         pub use unsupported::*;
+--- a/library/std/src/sys/fs/mod.rs
++++ b/library/std/src/sys/fs/mod.rs
+@@ -45,6 +45,10 @@
+         mod vexos;
+         use vexos as imp;
+     }
++    target_os = "temen" => {
++        mod temen;
++        use temen as imp;
++    }
+     _ => {
+         mod unsupported;
+         use unsupported as imp;
+--- a/library/std/src/sys/pipe/mod.rs
++++ b/library/std/src/sys/pipe/mod.rs
+@@ -13,6 +13,10 @@
+         mod motor;
+         pub use motor::{Pipe, pipe};
+     }
++    target_os = "temen" => {
++        mod temen;
++        pub use temen::{Pipe, pipe};
++    }
+     _ => {
+         mod unsupported;
+         pub use unsupported::{Pipe, pipe};
+--- a/library/std/src/sys/process/mod.rs
++++ b/library/std/src/sys/process/mod.rs
+@@ -15,6 +15,10 @@
+         mod motor;
+         use motor as imp;
+     }
++    target_os = "temen" => {
++        mod temen;
++        use temen as imp;
++    }
+     _ => {
+         mod unsupported;
+         use unsupported as imp;
+--- a/library/std/src/sys/net/connection/mod.rs
++++ b/library/std/src/sys/net/connection/mod.rs
+@@ -29,6 +29,10 @@
+         mod uefi;
+         pub use uefi::*;
+     }
++    target_os = "temen" => {
++        mod temen;
++        pub use temen::*;
++    }
+     _ => {
+         mod unsupported;
+         pub use unsupported::*;
+--- a/library/std/src/sys/sync/mutex/mod.rs
++++ b/library/std/src/sys/sync/mutex/mod.rs
+@@ -1,5 +1,6 @@
+ cfg_select! {
+     any(
++        all(target_os = "temen", target_env = "threads"),
+         all(target_os = "windows", not(target_vendor = "win7")),
+         target_os = "linux",
+         target_os = "android",
+--- a/library/std/src/sys/sync/condvar/mod.rs
++++ b/library/std/src/sys/sync/condvar/mod.rs
+@@ -1,5 +1,6 @@
+ cfg_select! {
+     any(
++        all(target_os = "temen", target_env = "threads"),
+         all(target_os = "windows", not(target_vendor="win7")),
+         target_os = "linux",
+         target_os = "android",
+--- a/library/std/src/sys/sync/once/mod.rs
++++ b/library/std/src/sys/sync/once/mod.rs
+@@ -9,6 +9,7 @@
+ 
+ cfg_select! {
+     any(
++        all(target_os = "temen", target_env = "threads"),
+         all(target_os = "windows", not(target_vendor="win7")),
+         target_os = "linux",
+         target_os = "android",
+--- a/library/std/src/sys/sync/rwlock/mod.rs
++++ b/library/std/src/sys/sync/rwlock/mod.rs
+@@ -1,5 +1,6 @@
+ cfg_select! {
+     any(
++        all(target_os = "temen", target_env = "threads"),
+         all(target_os = "windows", not(target_vendor = "win7")),
+         target_os = "linux",
+         target_os = "android",
+--- a/library/std/src/sys/sync/thread_parking/mod.rs
++++ b/library/std/src/sys/sync/thread_parking/mod.rs
+@@ -1,5 +1,6 @@
+ cfg_select! {
+     any(
++        all(target_os = "temen", target_env = "threads"),
+         all(target_os = "windows", not(target_vendor = "win7")),
+         target_os = "linux",
+         target_os = "android",
+--- a/library/std/src/sys/sync/futex/mod.rs
++++ b/library/std/src/sys/sync/futex/mod.rs
+@@ -35,5 +35,9 @@
+     target_os = "motor" => {
+         pub use moto_rt::futex::*;
+     }
++    all(target_os = "temen", target_env = "threads") => {
++        mod temen;
++        pub use temen::*;
++    }
+     _ => {}
+ }
+--- a/library/std/src/sys/thread/mod.rs
++++ b/library/std/src/sys/thread/mod.rs
+@@ -1,4 +1,11 @@
+ cfg_select! {
++    all(target_os = "temen", target_env = "threads") => {
++        mod temen;
++        pub use temen::{
++            DEFAULT_MIN_STACK_SIZE, Thread, available_parallelism, current_os_id, set_name,
++            sleep, yield_now,
++        };
++    }
+     target_os = "hermit" => {
+         mod hermit;
+         pub use hermit::{Thread, available_parallelism, sleep, yield_now, DEFAULT_MIN_STACK_SIZE};

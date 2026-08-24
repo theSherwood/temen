@@ -9,14 +9,14 @@
 
 const CM = window.CodeMirror;
 
-// A minimal highlighting mode for **SVM text** (the CLIF/LLVM-flavored IR form; grammar in the
-// `svm-text` crate). Rule order matters — first match wins:
+// A minimal highlighting mode for **Temen text** (the CLIF/LLVM-flavored IR form; grammar in the
+// `temen-text` crate). Rule order matters — first match wins:
 //   - `;` line comments and `"…"` strings first;
 //   - dotted opcodes (`i64.const`, `cap.call`, `thread.spawn`, `mem.fill`, `atomic.rmw.add`) before
 //     the bare-type rule, so `i64.const` isn't split at `i64`;
 //   - structural keywords / terminators, scalar+vector types, `blockN` labels, `vN` SSA values,
 //     numbers (decimal + hex), and the `->` signature arrow.
-CM.defineSimpleMode('svm', {
+CM.defineSimpleMode('temen', {
   start: [
     { regex: /;.*/, token: 'comment' },
     { regex: /"(?:[^\\"]|\\.)*"/, token: 'string' },
@@ -31,8 +31,8 @@ CM.defineSimpleMode('svm', {
   meta: { lineComment: ';' },
 });
 
-// CodeMirror mode string for a demo's declared `lang`. SVM text is the default.
-const MODE = { svm: 'svm', lua: 'lua', sql: 'text/x-sql', c: 'text/x-csrc', js: 'text/javascript',
+// CodeMirror mode string for a demo's declared `lang`. Temen text is the default.
+const MODE = { temen: 'temen', lua: 'lua', sql: 'text/x-sql', c: 'text/x-csrc', js: 'text/javascript',
   // The CodeMirror bundle carries no shell or Nim grammar; plain text (no mis-highlighting) suits the
   // shell-script and Nim front-end cards fine.
   shell: 'text/plain', nim: 'text/plain' };
@@ -49,10 +49,10 @@ export function createEditor(textarea, lang) {
     tabSize: 2,
     indentUnit: 2,
     lineWrapping: false,
-    mode: MODE[lang] || MODE.svm,
+    mode: MODE[lang] || MODE.temt,
     // Two dedicated gutters left of the line numbers: parse/verify error markers, and the debugger's
     // breakpoint dots (DEBUGGING.md — the DAP-over-bytecode panel).
-    gutters: ['svm-error-gutter', 'dap-bp-gutter', 'CodeMirror-linenumbers'],
+    gutters: ['temen-error-gutter', 'dap-bp-gutter', 'CodeMirror-linenumbers'],
   });
 
   // --- per-instance parse/verify error surfacing --------------------------------------------------
@@ -64,7 +64,7 @@ export function createEditor(textarea, lang) {
   let errorWidget = null;
   const clearError = () => {
     if (errorLine === null) return;
-    cm.setGutterMarker(errorLine, 'svm-error-gutter', null);
+    cm.setGutterMarker(errorLine, 'temen-error-gutter', null);
     cm.removeLineClass(errorLine, 'background', 'cm-error-line');
     if (errorWidget) { errorWidget.clear(); errorWidget = null; }
     errorLine = null;
@@ -85,7 +85,7 @@ export function createEditor(textarea, lang) {
     marker.className = 'cm-error-marker';
     marker.textContent = '●';
     marker.title = message;
-    cm.setGutterMarker(errorLine, 'svm-error-gutter', marker);
+    cm.setGutterMarker(errorLine, 'temen-error-gutter', marker);
     cm.addLineClass(errorLine, 'background', 'cm-error-line');
     const widget = document.createElement('div');
     widget.className = 'cm-error-widget';

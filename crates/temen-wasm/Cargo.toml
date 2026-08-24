@@ -1,0 +1,27 @@
+[package]
+name = "temen-wasm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# A **frontend**, not part of the escape-TCB: it consumes the core crates (temen-ir/temen-text) to
+# produce a verifier-checked `Module` from core wasm, and is never a dependency of temen-jit/temen-interp.
+# Like the chibicc fork, its output is re-verified, so a transpiler bug is a clean error, not an escape.
+
+[dependencies]
+temen-ir = { path = "../temen-ir" }
+wasmparser = "0.251"
+
+[dev-dependencies]
+temen-text = { path = "../temen-text" }
+temen-verify = { path = "../temen-verify" }
+temen-interp = { path = "../temen-interp" }
+temen-jit = { path = "../temen-jit" }
+# The host glue (`cap_thunk`) for the import differential tests: bridges the JIT's `cap.call` ABI to a
+# reference `Host` so a transpiled import runs on both backends. Not a normal dep — the transpiler
+# itself emits only verifier-checked IR and never links the runtime.
+temen-run = { path = "../temen-run" }
+wat = "1"
+# `wast` parses the `.wast` directive format (modules + `assert_return`/`assert_trap`) for the
+# spec-conformance harness (`tests/spec.rs`). Only exercised when `SPEC_DIR` points at the corpus.
+wast = "251"

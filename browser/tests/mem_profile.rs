@@ -1,17 +1,17 @@
 //! The W3 **run-mode memory profiler** in the cdylib (INTERACTIVE_EMBEDDING.md slice 4):
-//! `svm_mem_profile` instruments a compute module with the mem-hook pass, runs it on the bytecode
+//! `temen_mem_profile` instruments a compute module with the mem-hook pass, runs it on the bytecode
 //! engine feeding a `MemModel`, and stashes the stats JSON. Pins: (a) the hook-fed model equals a
 //! **sink-fed** model on the same guest, stats-for-stats — the cdylib's local hook decode can't
 //! drift from the sink vocabulary unnoticed; (b) the strided-vs-sequential miss ordering through
-//! the entry; (c) a manifest-carrying module is refused fail-closed (the svm-run slot-0 rule).
+//! the entry; (c) a manifest-carrying module is refused fail-closed (the temen-run slot-0 rule).
 //!
 //! One `#[test]`: the entry's stash is a main-thread singleton.
 
 use std::sync::{Arc, Mutex};
-use svm_browser::{svm_mem_profile, svm_mem_profile_stats_len, svm_mem_profile_stats_ptr};
-use svm_dap::models::{MemModel, MemModelCfg};
-use svm_interp::bytecode::DebugRun;
-use svm_text::parse_module;
+use temen_browser::{temen_mem_profile, temen_mem_profile_stats_len, temen_mem_profile_stats_ptr};
+use temen_dap::models::{MemModel, MemModelCfg};
+use temen_interp::bytecode::DebugRun;
+use temen_text::parse_module;
 
 fn store_loop(iters: i64, stride: i64) -> String {
     format!(
@@ -43,9 +43,9 @@ block 2 () {{
 /// Run the profiler entry over `src` with default geometry; returns `(status, stats JSON text)`.
 fn profile(src: &str) -> (i32, String) {
     let m = parse_module(src).expect("parses");
-    let bytes = svm_encode::encode_module(&m);
-    let status = svm_mem_profile(bytes.as_ptr(), bytes.len(), 0, 0, 0, 0, 0, 0, 0);
-    let (p, l) = (svm_mem_profile_stats_ptr(), svm_mem_profile_stats_len());
+    let bytes = temen_encode::encode_module(&m);
+    let status = temen_mem_profile(bytes.as_ptr(), bytes.len(), 0, 0, 0, 0, 0, 0, 0);
+    let (p, l) = (temen_mem_profile_stats_ptr(), temen_mem_profile_stats_len());
     let raw = if p.is_null() || l == 0 {
         Vec::new()
     } else {
@@ -94,7 +94,7 @@ fn run_mode_profile_matches_the_sink_and_orders_misses() {
     let (st2, strided_stats) = profile(&store_loop(128, 512));
     assert_eq!(st2, 0);
     let misses = |s: &str| -> i64 {
-        svm_dap::parse(s)
+        temen_dap::parse(s)
             .and_then(|j| {
                 j.get("l1")
                     .and_then(|l| l.get("misses"))
@@ -108,7 +108,7 @@ fn run_mode_profile_matches_the_sink_and_orders_misses() {
         "strided ({t_miss}) ≫ sequential ({s_miss})"
     );
 
-    // (c) A manifest-carrying module is refused fail-closed (slot-0 rule), like svm-run's hooks.
+    // (c) A manifest-carrying module is refused fail-closed (slot-0 rule), like temen-run's hooks.
     let manifest_src = r#"memory 16
 import 0 "write" (i64, i64) -> (i64)
 
@@ -120,9 +120,9 @@ block 0 () {
 }
 "#;
     let m = parse_module(manifest_src).expect("parses");
-    let bytes = svm_encode::encode_module(&m);
+    let bytes = temen_encode::encode_module(&m);
     assert_eq!(
-        svm_mem_profile(bytes.as_ptr(), bytes.len(), 0, 0, 0, 0, 0, 0, 0),
+        temen_mem_profile(bytes.as_ptr(), bytes.len(), 0, 0, 0, 0, 0, 0, 0),
         -2,
         "manifest-carrying module refused"
     );

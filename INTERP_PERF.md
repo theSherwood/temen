@@ -1,6 +1,6 @@
 # INTERP_PERF.md — Reference-interpreter performance
 
-The reference interpreter (`crates/svm-interp`) is the escape-TCB **oracle**: the JIT is
+The reference interpreter (`crates/temen-interp`) is the escape-TCB **oracle**: the JIT is
 differentially tested against it, so it must stay total, panic-free, `#![forbid(unsafe_code)]`, and
 deterministically detect-and-trap. It is also the metered, debuggable, cooperatively-scheduled
 execution engine (fuel, breakpoints/watchpoints, fibers/threads, durability). All of that is per-op
@@ -14,7 +14,7 @@ It is a living document: update the **Status** table and the **Phase tracker** a
 
 ## Status
 
-Benchmark: `cargo test -p svm --release --test interp_perf -- --nocapture --ignored`
+Benchmark: `cargo test -p temen --release --test interp_perf -- --nocapture --ignored`
 (three hand-written kernels run through interp / JIT, plus a CPython reference for the same
 computation via `tests/interp_perf.py`). Numbers are ns per loop iteration on the dev box; treat as
 ratios, not absolutes (the build machine is noisy — the bench takes best-of-N with a big−small
@@ -105,7 +105,7 @@ durable/fiber/concurrent/dynlink suites, debug). Cumulative: alu ~319 → ~66 ns
 - **Allocation-free common return** — gather results into a reusable buffer, copy into the caller.
 - **Tier-1 raw-slot value model** — `Frame.vals: Vec<Reg>` (16-byte POD: scalar bits in `lo`, v128
   in `lo`/`hi`) replacing the 24-byte `Value` enum; op-directed reads; boundary conversions only at
-  API / cap / debugger. Debugger value-typing reuses `svm_verify::func_value_types` (single source
+  API / cap / debugger. Debugger value-typing reuses `temen_verify::func_value_types` (single source
   of truth).
 - **Fast-path dispatch for pure ops** — the hottest ops (`Const*`, `IntBin`, `IntCmp`, then the
   float/convert/select set, then `Load`/`Store`) dispatch directly in the eval loop, reusing the
@@ -138,7 +138,7 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
 
 ### Phase 1 — compile pass + per-block bytecode (shape A)
 
-> **ROI spike (done — `crates/svm/tests/bytecode_spike.rs`):** a self-contained flat-bytecode
+> **ROI spike (done — `crates/temen/tests/bytecode_spike.rs`):** a self-contained flat-bytecode
 > compiler+executor measured **~3.5× faster** on the ALU kernel (62.5 → 17.8 ns/iter) and **~3.0×**
 > on the call/return kernel (78.7 → 26.0 ns/iter) than the tree-walker, *keeping the per-op fuel
 > check, under `forbid(unsafe)`*. The call path uses **register windows** (one big register file, each
@@ -155,7 +155,7 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
 
 - Add a `compile` step: per function, a cached `Program` of per-block compiled ops. Each op carries
   pre-resolved operand **slot offsets**, its result slot, and (for terminators) resolved block
-  targets. Built once per run (indexed by `FuncIdx`), reusing `svm_verify` types for slot widths.
+  targets. Built once per run (indexed by `FuncIdx`), reusing `temen_verify` types for slot widths.
 - Execute the compiled ops in the existing `'frames`/block loop; the inner per-op work becomes
   "read pre-resolved slots → compute → write result slot", no `ValIdx` decode, no per-op type
   re-derivation.
@@ -165,11 +165,11 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
 - **Success:** full oracle green; measurable drop on alu/call kernels; no API change.
 
 ### Phase 2 — memory-op specialization + software fast-path
-- **[done] A/B baseline ("benchmark first").** Extended `crates/svm/src/bin/bench.rs` with an
+- **[done] A/B baseline ("benchmark first").** Extended `crates/temen/src/bin/bench.rs` with an
   interpreter A/B: the same four loop kernels run through the **tree-walker** (`run`) and the
   **bytecode engine** (`bytecode::compile_and_run`), per-iteration compute isolated by large/small-`n`
   subtraction (cancels the bytecode engine's per-run compile + each engine's frame setup), min over
-  reps. Run with `cargo run --release --bin svm-bench`. Baseline (one dev box, ns/iter, tw → bc):
+  reps. Run with `cargo run --release --bin temen-bench`. Baseline (one dev box, ns/iter, tw → bc):
 
   | kernel          | tree-walker | bytecode | tw/bc |
   |-----------------|------------:|---------:|------:|
@@ -195,26 +195,26 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
   when `!prot_dirty` (the common case — no syscalls/coroutines/§13 regions, so every prefix page is
   plain committed RW and `!prot_dirty ⟹ !has_regions`) and the access lies wholly in the backed
   prefix (`Window::checked`, one mask + bound): they read/write through new **non-atomic
-  width-specialized** `svm_mem::Region::read_word`/`write_word` (one possibly-unaligned machine
+  width-specialized** `temen_mem::Region::read_word`/`write_word` (one possibly-unaligned machine
   load/store, not `width` per-byte atomic ops), bypassing `confine_checked`'s per-op `last_fault`
   atomic store and the `check_prot` page scan, and drop the `Value`↔slot round-trip on store. The
   word ops are sound here because the bytecode engine is **cooperative single-threaded** (exactly one
   vCPU touches the backing at a time — no race); the genuinely concurrent tree-walker + §12 atomics
   keep the per-byte Relaxed paths. Any non-common case (RO/unmapped/reserved-tail/regions, or a
   recoverable demand fault) falls to the cold `Mem::load`/`store`, preserving exact trap + `last_fault`
-  semantics. Measured (same box, `svm-bench` A/B): mem kernel **~82 → ~71 ns** bytecode (~13%), ratio
-  ~1.31× → ~1.38×; other kernels within noise. Full `svm` suite (73 binaries incl. `bytecode_diff`,
-  `escape_oracle`, `jit_diff`, `simd`) + `svm-mem` green; fmt/clippy clean.
+  semantics. Measured (same box, `temen-bench` A/B): mem kernel **~82 → ~71 ns** bytecode (~13%), ratio
+  ~1.31× → ~1.38×; other kernels within noise. Full `temen` suite (73 binaries incl. `bytecode_diff`,
+  `escape_oracle`, `jit_diff`, `simd`) + `temen-mem` green; fmt/clippy clean.
   - *Finding:* the residual mem cost is **per-op interpreter overhead** (per-op fuel + budget check),
     not the memory access itself — that is Phase-3 territory (move fuel to back-edges), which would
     lift *all* kernels including `mem`.
 - **[done] Bulk memory (`memory.copy`/`fill`) through the D62 fast path.** The bytecode engine
   previously shared the tree-walker's scalar snapshot copy; new `mem_copy_fast`/`mem_fill_fast` do
   the same whole-span confinement + per-page prot scan as the oracle, then one bulk
-  `Region::copy_within`/`fill` (overlap-safe memmove / memset in `svm-mem`, which isolates the
+  `Region::copy_within`/`fill` (overlap-safe memmove / memset in `temen-mem`, which isolates the
   audited `unsafe`) instead of the scalar loop — same single-threaded-cooperative contract as
   `read_word`/`write_word`. The tree-walker keeps the scalar `mem_copy`/`mem_fill` as the
-  independent oracle; the `svm-mem` Mapped/Shared-vs-Paged differential fuzzers cover the new ops.
+  independent oracle; the `temen-mem` Mapped/Shared-vs-Paged differential fuzzers cover the new ops.
 - **Success:** memory kernel drops toward the software floor; escape_oracle + shared_region +
   address_space still byte-identical.
 
@@ -230,14 +230,14 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
     `OutOfFuel` and tolerates per-op accounting differences, so the differential wouldn't break — but
     the win doesn't justify the contract change.)
   - **The real floor is the match dispatch + the `regs` bounds checks**, and those can't be elided:
-    `svm-interp` is `#![forbid(unsafe_code)]` (it is the trusted reference oracle), so every guest op
+    `temen-interp` is `#![forbid(unsafe_code)]` (it is the trusted reference oracle), so every guest op
     pays 2–3 bounds-checked register accesses. These are *predictable* branches, so a branch predictor
     makes them ~free — which is why removing them would land in the same ~3–5% range as the budget
     experiment. The Phase-2 mem win (~13%) was larger precisely because it removed *real work* (a
-    per-byte atomic loop → one machine load via `svm-mem`, which isolates audited `unsafe`), not a
+    per-byte atomic loop → one machine load via `temen-mem`, which isolates audited `unsafe`), not a
     predicted branch.
   - **Decision:** keep per-op fuel/budget. Squeezing the register file would need either an
-    audited-`unsafe` register-file crate (svm-mem-style — a `forbid-unsafe`-principle decision for a
+    audited-`unsafe` register-file crate (temen-mem-style — a `forbid-unsafe`-principle decision for a
     ~3–5% expected gain) or Phase 4; neither is justified while the interpreter is the oracle + the
     JIT-not-viable fallback (the JIT is the production hot path) and the bytecode engine already runs
     **~1.7–2.5× faster than the tree-walker** across the kernels.
@@ -257,7 +257,7 @@ bounds) and closed it as near-ceiling (~3–5%, predicted-branch-bound). Phase 5
 **orthogonal** axis Phase 3 never touched — the **number of trips** — entirely in the compile pass,
 `#![forbid(unsafe_code)]` intact. Fewer ops executed multiplies against *every* per-op cost at once,
 so this is where the remaining safe headroom is. Prior-art placement: these are the moves that put
-svm-bytecode into the wasm3 / Wasmi-0.32 register-interpreter frontier (~10–12× native); they do
+temen-bytecode into the wasm3 / Wasmi-0.32 register-interpreter frontier (~10–12× native); they do
 **not** close to the JIT (that gap is structural — compilation + MMU + cross-op optimization — and
 stays the JIT's job).
 
@@ -378,7 +378,7 @@ stays the JIT's job).
   file, not dispatch, as the bottleneck. Do not do it blind.
 
 - **Deferred (spends TCB — not Phase 5).** Audited-`unsafe` unchecked register access
-  (`get_unchecked` where the compile pass proved the slot in-window — the `svm-mem` precedent; ~3–5%,
+  (`get_unchecked` where the compile pass proved the slot in-window — the `temen-mem` precedent; ~3–5%,
   predicted branches) and function-pointer tail-threaded dispatch (needs the `unsafe` from the
   former; ~3–5%). These are the last ~2× toward the frontier and a `forbid-unsafe` renegotiation for
   a small gain — revisit only if 5a–5c land and the profile still justifies it.
@@ -397,7 +397,7 @@ not by shaving predicted branches. The JIT stays the answer for near-native.
 
 ## Fuel unification (safepoint-anchored)
 
-> **This is the fuel-unification PR** (branch `claude/svm-fuel-unification-fkhrs0`), split from the
+> **This is the fuel-unification PR** (branch `claude/temen-fuel-unification-fkhrs0`), split from the
 > op-count perf work (merged in #444) so its blast radius is handled deliberately. **Landed here:**
 > both interpreters meter fuel at IR safepoints (§ below), the §5 `kill` poll is decoupled to stay
 > per-op, and the fuel-denominated exhaustion tests + the `impl_fuel` reserve are recalibrated — the
@@ -538,7 +538,7 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
 
 - Full differential oracle must stay green: `jit_diff`, `jit_fuzz`, `fiber_fuzz`, `concurrent_fuzz`,
   `concurrent_escape_fuzz`, `escape_oracle`, `shared_region`, `durable_jit`, `durable_fibers_jit`,
-  `dynlink`, `address_space`, `cap_self`, `fuzz_smoke`, `debug`, and the `svm-interp` unit tests.
+  `dynlink`, `address_space`, `cap_self`, `fuzz_smoke`, `debug`, and the `temen-interp` unit tests.
 - `fmt` + `clippy` clean; workspace builds; `#![forbid(unsafe_code)]` intact.
 - Benchmark A/B on the same machine (multi-run, since the box is noisy) — record deltas here.
 - Land in small, individually-green, bisectable commits (the Tier-1 slot rewrite was one big change
@@ -564,8 +564,8 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
 - [x] **Phase 0** — contained in-place wins (PR #52). alu ~319 → ~66 ns (~5×).
 - [~] **Phase 1** — compile pass + resolved bytecode + equality harness.
   - [x] ROI spike (`bytecode_spike.rs`): ~3.5× ALU, ~3.0× call.
-  - [x] **Slice 1b** — production compiler + register-window executor (`svm-interp/src/bytecode.rs`,
-        scalar + memory + direct-call subset) + equality harness (`crates/svm/tests/bytecode_diff.rs`,
+  - [x] **Slice 1b** — production compiler + register-window executor (`temen-interp/src/bytecode.rs`,
+        scalar + memory + direct-call subset) + equality harness (`crates/temen/tests/bytecode_diff.rs`,
         exact-equality on 4000 generated modules + kernels). Standalone `compile_and_run` path, not
         yet the default. Perf vs the tree-walker: alu 1.46×, call 1.76×, mem 1.13× (uses 16-byte
         `Reg` + per-op fuel, so below the raw-`i64` spike; slot narrowing + mem fast-path are later).
@@ -609,8 +609,8 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
           seam-requiring op, so eligibility is automatic) and fall back to the tree-walker `run`
           otherwise. **`run` itself is unchanged** — it stays the reference oracle the JIT and the
           bytecode engine are both diffed against (the refined strategy: tree-walker = test-only
-          oracle, *kept not retired*). The umbrella `svm::run_text` now uses `run_fast`. New harness
-          `run_fast_matches_run_on_generated_modules` (covers routing + fallback); full `svm` suite
+          oracle, *kept not retired*). The umbrella `temen::run_text` now uses `run_fast`. New harness
+          `run_fast_matches_run_on_generated_modules` (covers routing + fallback); full `temen` suite
           (58 binaries incl. `jit_diff`/`fiber_fuzz`/`concurrent_fuzz`/`dynlink`) green. Production
           guest execution is the JIT; the interpreter's role is oracle / escape-TCB checker, so this
           speeds the interpreter-only and differential paths without touching the oracle.
@@ -785,8 +785,8 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
               and a trap — plus result equality. (Follow-on status: **backtrace** landed
               (`run_with_host_fast_traced`, gated by `bytecode_traced.rs`), and **reverse debugging**
               (seek/stepBack by deterministic replay) + **watchpoints** (per-op effective-address
-              check) landed on the bytecode engine via the `svm-dap` `Debuggee` backend seam over
-              `DebugRun` (`crates/svm-dap/src/backend.rs`), both with `dap_over_bytecode_*`
+              check) landed on the bytecode engine via the `temen-dap` `Debuggee` backend seam over
+              `DebugRun` (`crates/temen-dap/src/backend.rs`), both with `dap_over_bytecode_*`
               tree-walker-parity tests. Still tree-walker-only: cap-call stops and multithreaded
               debug — a debug run reaching a seam op falls back.)
         - [x] **1c-7** — §GC `gc.roots` (conservative root enumeration). **Correctness criterion is
@@ -808,12 +808,12 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
               fold-down-mask rejection (`Malformed`, the §6 host-leak guard). Window memory is read back
               via a new `bytecode::compile_and_run_capture` (mirrors `run_capture_reserved`).
         - [x] **1c-6** — durability **freeze/thaw** (single-vCPU, single-fiber). The key realization
-              (DURABILITY.md §2): freeze/thaw is **IR-driven** — the `svm-durable` transform rewrites a
+              (DURABILITY.md §2): freeze/thaw is **IR-driven** — the `temen-durable` transform rewrites a
               module so that, with the in-window state word `UNWINDING`, each function flattens its live
               continuation into the in-window shadow stack and returns; `REWINDING` rebuilds it. The
               native/bytecode continuation is **never** serialized, so for a single-fiber program the
               bytecode engine supports freeze/thaw simply by *running the transformed module over a
-              seeded window* — and (verified by reading the `svm-snapshot` codec) a single-vCPU
+              seeded window* — and (verified by reading the `temen-snapshot` codec) a single-vCPU
               no-fiber §12 artifact's residue section (the only consumer of the freeze driver's
               `frozen_root_sp`/fibers/vcpus) is **omitted**, so the artifact depends only on the module
               digest + window image + handle table, all of which the bytecode engine reproduces. New
@@ -867,7 +867,7 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
                   residue); restore+re-freeze is byte-identical; and the REWINDING thaw (fibers
                   re-seeded) reproduces the result and ends NORMAL.
 - [~] **Phase 2** — memory-op specialization + software fast-path.
-  - [x] A/B interpreter baseline (tree-walker vs bytecode, four kernels) in `svm-bench`.
+  - [x] A/B interpreter baseline (tree-walker vs bytecode, four kernels) in `temen-bench`.
   - [x] Lock-free `check_prot` fast path (`prot_dirty` flag) + `read_le`/`write_le` `has_regions`
         hoist. Tree-walker memory kernel ~176 → ~147 ns (~17%); all oracle suites byte-identical.
   - [x] Width-specialized scalar load/store + inlined common-case confinement (bytecode mem kernel

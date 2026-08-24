@@ -1,10 +1,10 @@
-# Detached (`[workspace]`) wasm entry crate — the SVM bytecode interpreter compiled to wasm so a
-# host (browser / any wasm runtime) can run an SVM guest. Kept out of the main workspace because it
+# Detached (`[workspace]`) wasm entry crate — the Temen bytecode interpreter compiled to wasm so a
+# host (browser / any wasm runtime) can run an Temen guest. Kept out of the main workspace because it
 # targets wasm64 via `-Z build-std` (nightly), like `fuzz/`/`bench/`. See BROWSER.md.
 [workspace]
 
 [package]
-name = "svm-browser"
+name = "temen-browser"
 version = "0.0.0"
 edition = "2021"
 
@@ -21,59 +21,59 @@ path = "src/genfixture.rs"
 name = "gencorpus"
 path = "src/gencorpus.rs"
 
-# `live` adds the host-backed powerbox entry `svm_run_live`, which declares real wasm **imports**
-# (`svm_host.host_write` / `host_now_ns`). Off by default so the standard artifact stays import-free
-# (`svm_run`/`run_guest`/`svm_run_pb` need no host functions); build `--features live` for the
+# `live` adds the host-backed powerbox entry `temen_run_live`, which declares real wasm **imports**
+# (`temen_host.host_write` / `host_now_ns`). Off by default so the standard artifact stays import-free
+# (`temen_run`/`run_guest`/`temen_run_pb` need no host functions); build `--features live` for the
 # console/clock-bound variant. See BROWSER.md.
 [features]
 live = []
-# Opt-in per-function call profiler (tier-up break-even measurement) — surfaces `svm_callprof_*`
+# Opt-in per-function call profiler (tier-up break-even measurement) — surfaces `temen_callprof_*`
 # and enables the interp's counter. Never in a shipped build; a measurement cdylib only.
-callprof = ["svm-interp/callprof"]
+callprof = ["temen-interp/callprof"]
 
 [dependencies]
-svm-interp = { path = "../crates/svm-interp" }
-svm-encode = { path = "../crates/svm-encode" }
-svm-text   = { path = "../crates/svm-text" }
+temen-interp = { path = "../crates/temen-interp" }
+temen-encode = { path = "../crates/temen-encode" }
+temen-text   = { path = "../crates/temen-text" }
 # The Debug Adapter Protocol server (DEBUGGING.md), driven over the bytecode `Debuggee` backend so
-# the playground can debug SVM guests. Pure request→messages logic + hand-rolled JSON — wasm-clean
-# (`run_stdio`, its only std::io surface, is never called here). See `svm_dap_request`.
-svm-dap    = { path = "../crates/svm-dap" }
+# the playground can debug Temen guests. Pure request→messages logic + hand-rolled JSON — wasm-clean
+# (`run_stdio`, its only std::io surface, is never called here). See `temen_dap_request`.
+temen-dap    = { path = "../crates/temen-dap" }
 # `Module` is named by the fixture/corpus bins and by `powerbox_exec` (shared with the cdylib).
-svm-ir     = { path = "../crates/svm-ir" }
-svm-fs     = { path = "../crates/svm-fs" }
+temen-ir     = { path = "../crates/temen-ir" }
+temen-fs     = { path = "../crates/temen-fs" }
 # The `exec` capability ABI + `JobTable`/`run_args` (EXEC.md) — the multibinary driver's child-spawn
-# surface. Pure (deps `svm-ir` + `svm-interp`), so it builds for wasm. Used by the in-browser nimony
+# surface. Pure (deps `temen-ir` + `temen-interp`), so it builds for wasm. Used by the in-browser nimony
 # compiler card (#958): `nimsem` spawns `nifler` as an `exec` child over the shared memfs.
-svm-exec = { path = "../crates/svm-exec" }
-# The Leng→SVM-IR translator + the nim→powerbox / runtime-shim linkers (NIM.md §3d/§3e). Pure
-# (deps `svm-ir` + `svm-text` + `svm-encode`), so it builds for wasm — it links the compiled Nim
+temen-exec = { path = "../crates/temen-exec" }
+# The Leng→TEMEN-IR translator + the nim→powerbox / runtime-shim linkers (NIM.md §3d/§3e). Pure
+# (deps `temen-ir` + `temen-text` + `temen-encode`), so it builds for wasm — it links the compiled Nim
 # in-browser (the same `link_nim_powerbox`/`link_whole_with_runtime` the headless driver uses).
-svm-leng = { path = "../crates/svm-leng" }
+temen-leng = { path = "../crates/temen-leng" }
 # The escape-freedom verifier — the security hinge of the guest-driven `Jit` cap's validator
-# (decode → verify → preconditions). Pure (only deps `svm-ir`), so it builds for wasm.
-svm-verify = { path = "../crates/svm-verify" }
+# (decode → verify → preconditions). Pure (only deps `temen-ir`), so it builds for wasm.
+temen-verify = { path = "../crates/temen-verify" }
 
 # The W3 mem-hook instrumentation pass (INTERACTIVE_EMBEDDING.md slice 4): the run-mode profiling
-# entry rewrites the module locally — the cdylib depends on neither svm-run nor its OS-bound PAL.
-# Pure (deps `svm-ir` + `svm-verify`), so it builds for wasm.
-svm-opt = { path = "../crates/svm-opt" }
+# entry rewrites the module locally — the cdylib depends on neither temen-run nor its OS-bound PAL.
+# Pure (deps `temen-ir` + `temen-verify`), so it builds for wasm.
+temen-opt = { path = "../crates/temen-opt" }
 # The durability transform (freeze/thaw IR rewrite) — used by the `gencorpus` ground truth and the
-# `run_durable` probe to instrument a module + seed the durable window. Pure (only `svm-ir`).
-svm-durable = { path = "../crates/svm-durable" }
-# The wasm-JIT emitter (browser wasm-JIT tier, slice 1). Pure (only `svm-ir`); its output is
-# compiled + run by the JS host against this cdylib's own linear memory — see `svm_wasmjit_compile`.
-svm-wasm-jit = { path = "../crates/svm-wasm-jit" }
+# `run_durable` probe to instrument a module + seed the durable window. Pure (only `temen-ir`).
+temen-durable = { path = "../crates/temen-durable" }
+# The wasm-JIT emitter (browser wasm-JIT tier, slice 1). Pure (only `temen-ir`); its output is
+# compiled + run by the JS host against this cdylib's own linear memory — see `temen_wasmjit_compile`.
+temen-wasm-jit = { path = "../crates/temen-wasm-jit" }
 # The POSIX personality (POSIX.md) — a `HostFn` provider implementing the libc/memfs surface a
-# fork-less shell links against, plus a §7 import-name resolver. Deps only `svm-ir` + `svm-interp`
+# fork-less shell links against, plus a §7 import-name resolver. Deps only `temen-ir` + `temen-interp`
 # (both already here and wasm-clean), so the on-ramp posix entry (`onramp_posix_exec`) compiles into
-# the wasm cdylib. This is what lets the real `svm-posix` shell run in the playground (STAGE1.md).
-svm-posix = { path = "../crates/svm-posix" }
+# the wasm cdylib. This is what lets the real `temen-posix` shell run in the playground (STAGE1.md).
+temen-posix = { path = "../crates/temen-posix" }
 
 [profile.release]
 panic = "abort"
 
 [dev-dependencies]
 # The native wasm-JIT reactor differential (`tests/jit_reactor.rs`) runs the emitted `tick` on `wasmi`
-# (playing the browser's JS host) against the interpreter reactor oracle. Matches svm-wasmjit's dev-dep.
+# (playing the browser's JS host) against the interpreter reactor oracle. Matches temen-wasmjit's dev-dep.
 wasmi = { version = "0.47", features = ["simd"] }

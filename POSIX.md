@@ -1,9 +1,9 @@
 # POSIX personality — libc as host capabilities
 
-> Status: **core surface landed.** `svm-posix` provides ops 0–20 (stdio, `malloc`/`free`,
+> Status: **core surface landed.** `temen-posix` provides ops 0–20 (stdio, `malloc`/`free`,
 > `exit`, the memfs + fd table, cwd, env, argv, and the Stage-1 `exec` surface) as a `HostFn`
 > capability, differential-tested on both backends. A compiled-C shell runs on it
-> (`crates/svm/tests/c_shell.rs`) and dispatches external commands to spawned confined
+> (`crates/temen/tests/c_shell.rs`) and dispatches external commands to spawned confined
 > children (`stage1_posix_spawn.rs`; the spawn work is tracked in `STAGE1.md`). Update the
 > **ABI table** and the **Status** as ops land.
 
@@ -33,17 +33,17 @@ boundary DESIGN.md §7 draws.
 
 ## 2. The mechanism already exists: §7 named imports → `HostFn`
 
-The WASI shim (the `wasi_named_imports` test) is the working template (a 2-op WASI shim); `svm-posix` generalizes it.
+The WASI shim (the `wasi_named_imports` test) is the working template (a 2-op WASI shim); `temen-posix` generalizes it.
 
-1. The shell (C) compiles to SVM IR with its libc calls left as **unresolved named imports**
-   — `CallImport { "env.malloc" }`, `"posix.open"`, … (chibicc / `svm-llvm` emit these for
+1. The shell (C) compiles to Temen IR with its libc calls left as **unresolved named imports**
+   — `CallImport { "env.malloc" }`, `"posix.open"`, … (chibicc / `temen-llvm` emit these for
    any unresolved symbol).
-2. At **load**, `svm_ir::resolve_imports` (driven by `svm_run::resolve_capability_imports`)
+2. At **load**, `temen_ir::resolve_imports` (driven by `temen_run::resolve_capability_imports`)
    binds each name to a `(type_id, op)` on a capability handle and lowers `CallImport` →
-   `cap.call`. `svm_posix::resolve(name)` supplies the name → `(HOST_FN, op)` map.
+   `cap.call`. `temen_posix::resolve(name)` supplies the name → `(HOST_FN, op)` map.
 3. A `HostFn` handler implements each op **host-side**, reading/writing the guest window
    through the masked `GuestMem`. All names share **one** `HOST_FN` handle; the op number
-   distinguishes the call (svm-wasm/chibicc thread a single capability handle).
+   distinguishes the call (temen-wasm/chibicc thread a single capability handle).
 
 Nothing here touches the verifier or the confinement lowering. A `HostFn` is untrusted host
 code reached only through a masked handle — a translation or personality bug is a clean
@@ -93,7 +93,7 @@ none-the-wiser — the "one ABI, two bindings" below, real by construction.
 **The handle binds by name too — no powerbox slot (PROCESS.md S15).** The personality is a
 per-domain **singleton**, so its handle is supplied by the resolver, not threaded by the
 guest: each libc import's handle operand is a `ConstI32` **placeholder** patched at resolve
-(`svm_ir::Resolved::CapBound`, via `svm_posix::resolve_bound(handle)` — grant first, then
+(`temen_ir::Resolved::CapBound`, via `temen_posix::resolve_bound(handle)` — grant first, then
 resolve; DESIGN.md §7's "late binding is the general form of the powerbox"). Consequences:
 the guest's libc has **real C signatures** (`open(path, flags)`, `getenv(name)`, `malloc(n)`
 — the NUL→`(ptr,len)` adaptation is a thin guest wrapper); the module's **import section is
@@ -145,7 +145,7 @@ only to mark the boundary.
 | 30 | `signal(signum, handler)` | `-> prev \| -errno` | host signal state | **done (L0)** — records disposition (`SIG_DFL`/`SIG_IGN`/handler ptr); returns previous; `SIGKILL`/`SIGSTOP` immutable (`-EINVAL`, #796); a reset to `SIG_DFL` runs a pending signal's default action |
 | 31 | `kill(pid, sig)` | `-> 0 \| -errno` | host process table | **done (#863/#798)** — pid-targeted: `0`/own pid = self (`raise`), a table pid = THAT process's pending set (+ its run woken when deliverable), `-pgid` = the **group sweep**; zombies exist-until-reaped; `-ESRCH` unknown. (`kill(0,s)` = raise-to-self, a deliberate POSIX divergence every pre-table guest relies on) |
 | 32 | `sigcheck(_)` | `-> handler \| 0` | host signal state | **done (L0)** — doorbell poll: clears+returns the next pending **caught** handler; ignored/default dropped |
-| 33 | `clock(clock_id)` | `-> nanos` | host clock (pinnable, `set_clock`) | **done** — monotonic (`id 1`) / realtime; the svm `std` `time` PAL path |
+| 33 | `clock(clock_id)` | `-> nanos` | host clock (pinnable, `set_clock`) | **done** — monotonic (`id 1`) / realtime; the temen `std` `time` PAL path |
 | 34 | `getenv_r(name, nlen, buf, cap)` | `-> len \| -1` | host env map | **done** — buffer-writing `getenv` (no arena); size-then-fetch |
 | 35 | `unsetenv(name, nlen)` | `-> 0 \| -errno` | host env map | **done** — absent name is a success no-op |
 | 36 | `environ(i, buf, cap)` | `-> len \| -1` | host env map | **done** — `i`-th `KEY=VALUE`, keys sorted; `-1` past the end |
@@ -173,7 +173,7 @@ only to mark the boundary.
 | — | default actions + `EINTR` | doorbell (§9 L1/L2) | host signal state | **partial** — **L2 async delivery to a running loop is DONE** (#796): with a handler + `sigaltstack`, the interp redirects a caught, unmasked signal into `void handler(int)` at a per-op safepoint and resumes. **`EINTR` on blocked calls is DONE** (#863: a deliverable signal — embedder `^C`, `kill(pid)` — interrupts the target domain's blocked pipe I/O and `wait` reaps with `-EINTR`, domain-scoped per INVARIANTS.md #12). **Stop/continue is DONE** (#798: `SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU` default actions park the domain at a safepoint; `SIGCONT` resumes; a stopped process holds all delivery until continued). **Default-action terminate is DONE** (#796: an unhandled fatal signal fires the core's `SignalSource::set_kill` door — the domain's term flag, death at the next per-op poll, `waitpid` reports `WIFSIGNALED` — while ignored/default-ignore signals are discarded at generation; a masked or stopped process holds a fatal signal until unblock/continue, `SIGKILL` excepted). **Block-during-handler + nested delivery are DONE** (#796: delivery pushes the mask and blocks the signal + its `sa_mask` for the handler's duration, restored via `SignalSource::handler_returned`; a different unmasked signal nests, same-signal reentry cannot). **`SA_RESTART` is DONE** (#796: a restart-flagged delivery re-issues an interrupted blocking pipe op — handler runs promptly, the op re-parks — and leaves a parked `wait` parked, the handler landing at the wait's completion; plain `signal()` stays SysV no-restart). **L1 park coverage is COMPLETE for the POSIX-syscall parks** (#796 slice D: blocking **stream** reads — the stdin/prompt park — join pipe I/O and `wait` in the EINTR sweep, same `SA_RESTART` gating, plus a pre-park pending check at the stream-park insert; mid-flight cap calls, serve-loop parks, futex waits and `thread.join` are deliberately NOT interruptible — not syscall boundaries). **Remaining:** JIT/bytecode parity for the async safepoint (#932) |
 | — | `fork/vfork/execve` | Stage 3 | durable clone (§7) | **parked** — return-twice / image-replace need the durable-clone capstone (R8 ✓); `spawn`+`waitpid` (ops 27–29) cover the fork-free process model a shell drives today |
 | — | `strlen/memcpy/snprintf/qsort/ctype/math` | pure | **guest code** (no cap) | n/a |
-| — | `fnmatch` / `putenv` / `wait3` / `wait4` | pure / thin wrappers | **guest code** (`crates/svm-run/demos/posix_libc/`) | **done (#800)** — `fnmatch(3)` with `FNM_PATHNAME`/`PERIOD`/`NOESCAPE`/`CASEFOLD` + `[[:class:]]`, differential-tested against the host libc's; `putenv` over setenv/unsetenv (bare name removes, glibc-style; copies, never aliases); `wait3`/`wait4` over op 28 (incl. the blocking reap) with rusage zeroed; **`regcomp`/`regexec`/`regfree`** — POSIX ERE with captures (bash's `[[ =~ ]]`/`BASH_REMATCH`), leftmost-longest, differential-tested (spans + captures) against the host's `regexec(3)`; **`glob`/`globfree`** — memfs segment walk over opendir/readdir + `fnmatch` (`FNM_PERIOD` dot rule), sorted, `GLOB_MARK`/`NOCHECK`/`APPEND`/`DOOFFS`. Still to come: `getline` (needs a minimal `FILE` layer) |
+| — | `fnmatch` / `putenv` / `wait3` / `wait4` | pure / thin wrappers | **guest code** (`crates/temen-run/demos/posix_libc/`) | **done (#800)** — `fnmatch(3)` with `FNM_PATHNAME`/`PERIOD`/`NOESCAPE`/`CASEFOLD` + `[[:class:]]`, differential-tested against the host libc's; `putenv` over setenv/unsetenv (bare name removes, glibc-style; copies, never aliases); `wait3`/`wait4` over op 28 (incl. the blocking reap) with rusage zeroed; **`regcomp`/`regexec`/`regfree`** — POSIX ERE with captures (bash's `[[ =~ ]]`/`BASH_REMATCH`), leftmost-longest, differential-tested (spans + captures) against the host's `regexec(3)`; **`glob`/`globfree`** — memfs segment walk over opendir/readdir + `fnmatch` (`FNM_PERIOD` dot rule), sorted, `GLOB_MARK`/`NOCHECK`/`APPEND`/`DOOFFS`. Still to come: `getline` (needs a minimal `FILE` layer) |
 
 ## 5a. The `net` capability — sockets without growing the libc table
 
@@ -218,19 +218,19 @@ UDP (`sendto`/`recvfrom` on the memnet) is a follow-up slice on the same cap.
 
 ## 6. Roadmap
 
-1. **Spike (done):** `svm-posix` crate — `write`/`read`/`malloc`/`free`/`exit` as a `HostFn`,
-   differential interp↔JIT (`svm-posix` tests). Proves the arena-in-window + host-bookkeeping
+1. **Spike (done):** `temen-posix` crate — `write`/`read`/`malloc`/`free`/`exit` as a `HostFn`,
+   differential interp↔JIT (`temen-posix` tests). Proves the arena-in-window + host-bookkeeping
    model and the cross-backend parity.
 2. **Named-import binding (done):** a real C `main` (via chibicc) links its libc calls to the
    personality through named imports — the real linking path, not hand-written cap.calls
-   (`crates/svm/tests/c_posix.rs`). Bound in the §7 **general form**: `resolve_bound` supplies
+   (`crates/temen/tests/c_posix.rs`). Bound in the §7 **general form**: `resolve_bound` supplies
    the handle at resolve (`Resolved::CapBound`), so the guest libc has real C signatures and
    no powerbox slot (§4 above; the fixed-`_start` retirement is PROCESS.md S15).
 3. **fs + fd table (done):** `open`/`read`/`write`/`close`/`stat`/`readdir` over the memfs,
    with a host-side fd table (ops 5–16 above); a real free-list allocator.
 4. **A first shell (done — a compiled-C shell, not BusyBox):** fork-less at Stage 0 — `sh -c`,
    builtins, redirection, pipelines (staged through memfs temp files; `ls | grep` via the
-   `Pipe` cap is still open) — `crates/svm/tests/c_shell.rs`. This is the playground target.
+   `Pipe` cap is still open) — `crates/temen/tests/c_shell.rs`. This is the playground target.
 5. **Signals (L0), time** (env landed — ops 11/12), then Stage 3 (`fork`/`exec`) on top of
    `Instantiator` / clone. The `exec` half landed first as Stage 1 spawn — ops 19/20 plus the
    shell's own `Instantiator` op 13 + `join` — tracked in `STAGE1.md`; `fork` remains.

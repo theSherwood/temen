@@ -1,5 +1,5 @@
 // Real-browser (V8) end-to-end for the **DAP-over-bytecode** debugger exposed through the wasm FFI
-// (DEBUGGING.md, browser slice). Drives a full DAP conversation against the cdylib's `svm_dap_*`
+// (DEBUGGING.md, browser slice). Drives a full DAP conversation against the cdylib's `temen_dap_*`
 // entry — the same request→messages logic the native `dap.rs` tests exercise, but marshalled through
 // wasm from JS: initialize → launch (engine "bytecode") → setBreakpoints → run to the breakpoint →
 // stackTrace → variables → continue to termination. Asserts the source frame binds and the loop
@@ -24,7 +24,7 @@ page.on('pageerror', (e) => errors.push(String(e)));
 page.on('console', (m) => { if (m.type() === 'error' && !benignAssetMiss(m)) errors.push(m.text()); });
 await page.goto(`http://127.0.0.1:${port}/web/play.html`);
 
-// A tiny SVM guest with a §6 debug section: a source line at the loop body (sum.c:7) and the two loop
+// A tiny Temen guest with a §6 debug section: a source line at the loop body (sum.c:7) and the two loop
 // variables mapped to their SSA slots — the same fixture the native DAP tests use.
 const LOOP_SUM_DBG = `
 func (i32) -> (i32) {

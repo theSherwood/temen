@@ -4,23 +4,23 @@
 //! sandboxed chibicc exactly as it does under the native frontend. Native tests can't spin the
 //! cross-Worker vCPU host, so this proves the *compile* pipeline end to end — the headers parse,
 //! the `__vm_*` builtins lower to the thread/atomic/futex ops, and the emitted IR parses back;
-//! *execution* parity (interp == JIT) for the same fixtures is `svm/tests/c_frontend.rs`.
-//! Fail-soft: SKIPs if `chibicc.svmb` isn't built.
+//! *execution* parity (interp == JIT) for the same fixtures is `temen/tests/c_frontend.rs`.
+//! Fail-soft: SKIPs if `chibicc.temen` isn't built.
 
-use svm_browser::{onramp_fs_exec, playground_include_files, STATUS_EXIT, STATUS_OK};
+use temen_browser::{onramp_fs_exec, playground_include_files, STATUS_EXIT, STATUS_OK};
 
-fn chibicc_svmb() -> Option<svm_ir::Module> {
-    let p = concat!(env!("CARGO_MANIFEST_DIR"), "/web/assets/chibicc.svmb");
+fn chibicc_temen() -> Option<temen_ir::Module> {
+    let p = concat!(env!("CARGO_MANIFEST_DIR"), "/web/assets/chibicc.temen");
     let bytes = std::fs::read(p).ok()?;
-    Some(svm_encode::decode_module(&bytes).expect("decode chibicc.svmb"))
+    Some(temen_encode::decode_module(&bytes).expect("decode chibicc.temen"))
 }
 
 /// Compile `src` with the seeded playground headers and return the emitted IR text.
-fn compile(chibicc: &svm_ir::Module, src: &str) -> String {
+fn compile(chibicc: &temen_ir::Module, src: &str) -> String {
     let mut files: Vec<(String, Vec<u8>)> = playground_include_files();
     files.push(("in.c".to_string(), src.as_bytes().to_vec()));
     let dirs = vec!["include".to_string()];
-    let image = svm_fs::encode_image(&files, &dirs);
+    let image = temen_fs::encode_image(&files, &dirs);
     let compiled = onramp_fs_exec(
         chibicc,
         &image,
@@ -42,8 +42,8 @@ fn compile(chibicc: &svm_ir::Module, src: &str) -> String {
 /// and parse back as a module.
 #[test]
 fn pthread_and_semaphore_programs_compile_in_the_playground() {
-    let Some(chibicc) = chibicc_svmb() else {
-        eprintln!("SKIP: chibicc.svmb absent");
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
         return;
     };
     let ir = compile(
@@ -91,7 +91,7 @@ int main(void) {
     for op in ["thread.spawn", "thread.join", "atomic"] {
         assert!(ir.contains(op), "the emitted IR carries `{op}`:\n{ir:.400}");
     }
-    let m = svm_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"));
+    let m = temen_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"));
     assert!(!m.funcs.is_empty(), "a non-empty module");
 }
 
@@ -101,8 +101,8 @@ int main(void) {
 /// against the seeded header, the emitted IR must carry the atomic ops.
 #[test]
 fn stdatomic_lowers_to_real_atomics_in_the_playground() {
-    let Some(chibicc) = chibicc_svmb() else {
-        eprintln!("SKIP: chibicc.svmb absent");
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
         return;
     };
     let ir = compile(
@@ -121,6 +121,6 @@ int main(void) {
         ir.contains("atomic.rmw.add"),
         "atomic_fetch_add lowered to a real atomic RMW (not plain +=):\n{ir:.400}"
     );
-    let m = svm_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"));
+    let m = temen_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"));
     assert!(!m.funcs.is_empty(), "a non-empty module");
 }

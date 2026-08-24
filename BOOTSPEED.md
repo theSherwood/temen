@@ -1,6 +1,6 @@
 # Boot speed — cold-start cost of the Postgres demo, measured
 
-The Postgres-in-the-sandbox demo (`crates/svm-run/demos/postgres`, `LLVM.md` slices BM–CO) boots
+The Postgres-in-the-sandbox demo (`crates/temen-run/demos/postgres`, `LLVM.md` slices BM–CO) boots
 PostgreSQL 17.5 `--single` to a live `backend>` and runs real queries. For a **browser** demo the
 question is start-up latency: how long from page load to a backend ready to take a query. This note
 decomposes that cost with measured numbers (not the old "~100 s" folklore, which was a *debug* build
@@ -13,14 +13,14 @@ near-instant, but the numbers say you don't need it to ship.
 
 ## The cost, decomposed
 
-Module: the whole-program Postgres module — **~15 068 functions, 20 MB `.svmb`**. Native numbers are
+Module: the whole-program Postgres module — **~15 068 functions, 20 MB `.temen`**. Native numbers are
 release builds on a shared box (treat sub-second values as ±15 %); measured by
-`crates/svm-run/examples/prep_svmb.rs` (module prep) and the boot harness (guest run).
+`crates/temen-run/examples/prep_temen.rs` (module prep) and the boot harness (guest run).
 
-| phase | translate at load | ship pre-translated `.svmb` |
+| phase | translate at load | ship pre-translated `.temen` |
 |---|--:|--:|
-| translate bitcode → SVM-IR | **14 s** (16 KiB pages) / **45 s** (64 KiB browser pages + serialize) | 0 — done at build time |
-| decode `.svmb` | — | ~0.45 s |
+| translate bitcode → TEMEN-IR | **14 s** (16 KiB pages) / **45 s** (64 KiB browser pages + serialize) | 0 — done at build time |
+| decode `.temen` | — | ~0.45 s |
 | resolve capability imports | — | 0 if pre-resolved (else ~0.38 s) |
 | **verify** (escape-freedom TCB gate — *never* skippable) | (in the translate path) | ~0.55 s |
 | bytecode-compile (interpreter cold cost) | ~0.20 s | ~0.19 s |
@@ -38,20 +38,20 @@ Two caveats baked into the guest-boot number:
 
 ## The wasm tax (the browser reality)
 
-In the browser the SVM itself is compiled to wasm, so both module-prep and guest-execution pay a
+In the browser the Temen itself is compiled to wasm, so both module-prep and guest-execution pay a
 sandbox tax. Two measurements pin it down:
 
-**Module prep inside wasm — measured.** `browser/bench_prep.mjs` drives the `svm-browser` cdylib's
-`svm_prep_bench` (decode + verify + bytecode-compile) on V8 over the same 20 MB resolved module:
+**Module prep inside wasm — measured.** `browser/bench_prep.mjs` drives the `temen-browser` cdylib's
+`temen_prep_bench` (decode + verify + bytecode-compile) on V8 over the same 20 MB resolved module:
 
 | | decode + verify + compile |
 |---|--:|
-| native (`prep_svmb`) | ~1.16 s |
+| native (`prep_temen`) | ~1.16 s |
 | **in wasm on V8** (`bench_prep.mjs`) | **~1.03–1.11 s** |
 | **tax** | **~1×** (indistinguishable — V8 JITs the prep work as well as native) |
 
 **Guest execution inside wasm — from the committed cross-engine bench** (`bench/cross-engine`, the
-`svm-bytecode` vs `svm-bytecode-wasm` rows — the *same* engine, native vs compiled-to-wasm, on
+`temen-bytecode` vs `temen-bytecode-wasm` rows — the *same* engine, native vs compiled-to-wasm, on
 identical IR):
 
 | workload | wasm/native |
@@ -64,19 +64,19 @@ Compute is barely taxed; only serial pointer-chasing pays real cost. Postgres bo
 blend ~2–2.5×.
 
 **In-browser — now measured end-to-end.** `browser/bench_pg.mjs` boots the real Postgres module inside
-the `svm-browser` cdylib on V8 (mount the data image on the `fs` cap, run to a queried backend): decode
+the `temen-browser` cdylib on V8 (mount the data image on the `fs` cap, run to a queried backend): decode
 + verify + compile + full boot + the `CREATE/INSERT/SELECT` round-trip lands at **~6–8 s** (V8-warmup
 variance; the guest run dominates). That is higher than the ~4–5 s the kernel-tax extrapolation
 projected — Postgres boot is *even more* pointer-chasing-heavy than the `chase_rand` kernel (double
-memory indirection: SVM confinement **and** wasm bounds, every catalog/buffer load), so the guest-boot
+memory indirection: Temen confinement **and** wasm bounds, every catalog/buffer load), so the guest-boot
 tax runs ~4–5× rather than the ~2–2.5× blend. Shippable with a spinner; the lever to shrink it is
 snapshot/restore of the post-boot state (deferred — see the levers above).
 
 ## The levers, ranked
 
-1. **Ship pre-translated (`.svmb`), not bitcode.** Removes the 14–45 s translate from every load,
-   leaving ~2.6 s. Biggest win, lowest effort — build-pipeline plumbing. `svm-llvm-translate … --binary
-   --host-page 65536` emits the browser-target module; `prep_svmb in.svmb out.svmb` resolves + verifies
+1. **Ship pre-translated (`.temen`), not bitcode.** Removes the 14–45 s translate from every load,
+   leaving ~2.6 s. Biggest win, lowest effort — build-pipeline plumbing. `temen-llvm-translate … --binary
+   --host-page 65536` emits the browser-target module; `prep_temen in.temen out.temen` resolves + verifies
    + re-serializes it so load skips resolve too.
 2. **Ship a cleanly-shut-down data image.** No WAL recovery on boot. Trivial (boot once, shut down,
    snapshot the data dir).
@@ -92,38 +92,38 @@ snapshot/restore of the post-boot state (deferred — see the levers above).
 ## What's left (to validate the projection / build the demo)
 
 - **✅ Milestone A — Postgres boots on a virtual (in-memory) filesystem.** `mem_fs_from_host_dir`
-  (`crates/svm-run/src/fs.rs`) seeds an in-memory `fs` cap from a data-dir image; Postgres `--single`
+  (`crates/temen-run/src/fs.rs`) seeds an in-memory `fs` cap from a data-dir image; Postgres `--single`
   then runs the full `CREATE TABLE` / `INSERT` / `SELECT` / `ORDER BY` / aggregate round-trip on it and
   exits cleanly (`Exited(0)`) — **zero real filesystem**, the exact requirement of the browser path.
   (Getting there needed three `mem_fs` fixes: consistent path normalization across all file ops, a
   read-only *directory* open so Postgres can `fsync` dirs at checkpoint, and a `0700` data-dir mode.)
   The seed step (~40 MB image) takes ~35 ms; the guest run ~1.2 s natively.
 - **✅ Data image — a self-contained, shippable filesystem blob.** `encode_image`/`decode_image` +
-  `mem_fs_from_archive` (`crates/svm-run/src/fs.rs`) serialize a cluster into one `SVMFSIM1` byte blob
+  `mem_fs_from_archive` (`crates/temen-run/src/fs.rs`) serialize a cluster into one `SVMFSIM1` byte blob
   that mounts on the `fs` cap with **no host filesystem** — the browser's data half. `build_image`
   (example) produces it from an on-disk cluster (Postgres' 39 MB `initdb` tree → a 41 MB image in ~3 s);
   Postgres `--single` boots from the mounted archive and runs the round-trip (`Exited(0)`). So the
-  demo's two artifacts are now both buildable: `{postgres_resolved.svmb, pgdata.img}`.
+  demo's two artifacts are now both buildable: `{postgres_resolved.temen, pgdata.img}`.
 - **✅ The in-memory `fs` cap is now wasm-reachable.** Extracted the pure protocol + `mem_fs` +
-  data-image format into the **`svm-fs`** crate (depends only on `svm-interp`, builds for `wasm32`);
-  `svm-run` keeps the real-filesystem `host_fs` + the `HostCap` wrappers and re-exports `svm-fs`, so
-  `svm_run::fs::*` is unchanged.
-- **✅ Postgres boots in wasm — measured.** The `svm-browser` cdylib's `svm_run_pg` entry (decode +
-  verify → grant `stdout/stdin/exit/memory` + an `svm_fs::mem_fs_seeded_handler` over `pgdata.img` →
+  data-image format into the **`temen-fs`** crate (depends only on `temen-interp`, builds for `wasm32`);
+  `temen-run` keeps the real-filesystem `host_fs` + the `HostCap` wrappers and re-exports `temen-fs`, so
+  `temen_run::fs::*` is unchanged.
+- **✅ Postgres boots in wasm — measured.** The `temen-browser` cdylib's `temen_run_pg` entry (decode +
+  verify → grant `stdout/stdin/exit/memory` + an `temen_fs::mem_fs_seeded_handler` over `pgdata.img` →
   seed the `--single` argv → reserved-window bytecode run) boots the real database on V8 to a queried
   backend, ~6–8 s (`browser/bench_pg.mjs`). The reserved-memory path works in wasm; the module stays
   import-free (no graphical caps granted).
-- **✅ In the playground.** Postgres is a first-class example in the SVM **playground**
+- **✅ In the playground.** Postgres is a first-class example in the Temen **playground**
   (`browser/web/play.html` / `play.js`, the "PostgreSQL (17.5 — write & run SQL)" example): the editor's
   SQL is fed as stdin, the pre-translated+resolved module + `pgdata.img` are fetched (staged into
   `web/assets/` by `browser/build-pg-assets.mjs` — gitignored, like the Lua/SQLite assets), and
-  `svm_run_pg` boots the backend on the **threads** engine the playground already runs, reading the
+  `temen_run_pg` boots the backend on the **threads** engine the playground already runs, reading the
   output back onto the page. `browser/browser-test.mjs` drives it in real Chromium via Playwright —
   selects the example, clicks Run, asserts the query result — alongside every other playground example
   (the check skips when the artifacts aren't staged). **The demo is done: a real PostgreSQL, in the
   browser, in the playground next to Lua and SQLite, sandboxed.**
 - **✅ Persistent interactive session — per-query boot eliminated.** The playground now runs Postgres as
-  a *live* backend (`svm_pg_open`/`_query`/`_close`), not a fresh boot per query. The enabling mechanism
+  a *live* backend (`temen_pg_open`/`_query`/`_close`), not a fresh boot per query. The enabling mechanism
   is a **blocking-stdin park** in the interpreter: with `Host::set_stdin_blocking`, a `read` on an
   exhausted stdin buffer suspends the resumable `bytecode::Vcpu` (`VcpuEvent::StdinPark`) instead of
   returning EOF (which makes `--single` exit), so the backend parks at its `backend>` prompt; the host
@@ -133,12 +133,12 @@ snapshot/restore of the post-boot state (deferred — see the levers above).
   **one** remaining latency is the first boot, whose lever is snapshot/restore of the post-boot state
   (freeze/thaw — deferred; the session makes it much less pressing, since you pay it once per page).
 - **✅ Session persists across page reloads.** The database now survives a refresh. The `fs` cap is
-  mounted through `svm_fs::mem_fs_seeded_shared`, which hands the host a `MemFsHandle` onto the live data
-  dir; `svm_pg_snapshot` serializes it back to an `svm_fs::encode_image` blob, which `play.js` stores in
-  IndexedDB after each query and re-mounts on the next visit (`svm_pg_open` boots from the saved image
+  mounted through `temen_fs::mem_fs_seeded_shared`, which hands the host a `MemFsHandle` onto the live data
+  dir; `temen_pg_snapshot` serializes it back to an `temen_fs::encode_image` blob, which `play.js` stores in
+  IndexedDB after each query and re-mounts on the next visit (`temen_pg_open` boots from the saved image
   instead of the pristine one, and Postgres runs its own startup recovery over it). A `CREATE TABLE` +
   `INSERT` is still there after a reload; `\reset` in the console wipes the saved image. Proven three
-  ways: a `svm-fs` unit test (the snapshot mechanism), `browser/tests/pg_snapshot_roundtrip.rs` (the
+  ways: a `temen-fs` unit test (the snapshot mechanism), `browser/tests/pg_snapshot_roundtrip.rs` (the
   native round-trip through real Postgres recovery), and `browser/pg_snapshot_test.mjs` (the same
   round-trip through the shipping wasm artifact). This is orthogonal to freeze/thaw of the *post-boot*
   state above — it persists the *data dir*, not the booted process image.
@@ -146,20 +146,20 @@ snapshot/restore of the post-boot state (deferred — see the levers above).
 ## Reproducing the measurements
 
 ```
-# 1. translate → browser-target .svmb (build-time), then resolve+verify+re-serialize + time each phase:
-svm-llvm-translate postgres_shimmed.bc -o postgres.svmb --binary --host-page 65536 --stub-externs
-cargo run --release -p svm-run --example prep_svmb -- postgres.svmb postgres_resolved.svmb
+# 1. translate → browser-target .temen (build-time), then resolve+verify+re-serialize + time each phase:
+temen-llvm-translate postgres_shimmed.bc -o postgres.temen --binary --host-page 65536 --stub-externs
+cargo run --release -p temen-run --example prep_temen -- postgres.temen postgres_resolved.temen
 
 # 2. module-prep tax inside wasm (V8):
 cd browser && cargo build --release --lib --target wasm32-unknown-unknown
-node bench_prep.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm /path/to/postgres_resolved.svmb
+node bench_prep.mjs target/wasm32-unknown-unknown/release/temen_browser.wasm /path/to/postgres_resolved.temen
 
-# 3. guest-execution tax (committed cross-engine bench, svm-bytecode vs svm-bytecode-wasm):
+# 3. guest-execution tax (committed cross-engine bench, temen-bytecode vs temen-bytecode-wasm):
 #    see bench/cross-engine/README.md
 
 # 4. boot Postgres in wasm end-to-end (mount the data image, run the round-trip, time it):
-cargo run --release -p svm-run --example build_image -- /path/to/pgdata pgdata.img
+cargo run --release -p temen-run --example build_image -- /path/to/pgdata pgdata.img
 cd browser && cargo build --release --lib --target wasm32-unknown-unknown
-node bench_pg.mjs target/wasm32-unknown-unknown/release/svm_browser.wasm \
-    /path/to/postgres_resolved.svmb pgdata.img
+node bench_pg.mjs target/wasm32-unknown-unknown/release/temen_browser.wasm \
+    /path/to/postgres_resolved.temen pgdata.img
 ```

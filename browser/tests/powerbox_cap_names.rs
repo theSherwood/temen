@@ -1,11 +1,11 @@
 //! THREADS/BROWSER parity (PR #118, F7/F9): the wasm **powerbox** must register its granted
 //! capabilities under their canonical names in the `cap_names` directory, so a guest can resolve them
-//! at runtime with `cap.self.resolve` — exactly as `svm-run`'s powerbox does. Without the registration,
+//! at runtime with `cap.self.resolve` — exactly as `temen-run`'s powerbox does. Without the registration,
 //! `cap.self.resolve("stdout")` would `-EINVAL` and the guest couldn't re-find its own handles, a
 //! silent divergence from the native powerbox ground truth `powerbox_exec` is meant to mirror verbatim.
 
-use svm_browser::{powerbox_exec, STATUS_OK};
-use svm_text::parse_module;
+use temen_browser::{powerbox_exec, STATUS_OK};
+use temen_text::parse_module;
 
 // Resolve "stdout" → its handle at runtime (never reading the param slot), then write through the
 // resolved handle. Works only if the powerbox registered the canonical name.

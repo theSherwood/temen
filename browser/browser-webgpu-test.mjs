@@ -22,13 +22,13 @@ const res = await page.evaluate(async () => {
   const par = await import('./par.js'); const wg = await import('./webgpu.js');
   if (!wg.webgpuAvailable()) return { skip: 'no webgpu' };
   const eng = await par.loadEngine();
-  const bytes = new Uint8Array(await (await fetch('./assets/gpu_shader.svmb')).arrayBuffer());
+  const bytes = new Uint8Array(await (await fetch('./assets/gpu_shader.temen')).arrayBuffer());
   const canvas = document.createElement('canvas'); canvas.width=640; canvas.height=480; document.body.append(canvas);
   await wg.initWebGPU(canvas);
-  const p = eng.ex.svm_alloc(bytes.length); new Uint8Array(eng.memory.buffer).set(bytes, p);
-  const opened = eng.ex.svm_onramp_open(p, bytes.length); eng.ex.svm_dealloc(p, bytes.length);
+  const p = eng.ex.temen_alloc(bytes.length); new Uint8Array(eng.memory.buffer).set(bytes, p);
+  const opened = eng.ex.temen_onramp_open(p, bytes.length); eng.ex.temen_dealloc(p, bytes.length);
   if (opened !== 0) return { opened };
-  const statuses = []; for (let i=0;i<12;i++) statuses.push(eng.ex.svm_onramp_frame());
+  const statuses = []; for (let i=0;i<12;i++) statuses.push(eng.ex.temen_onramp_frame());
   const px = await wg.readbackForTest(60, 320, 240);
   let black=0, colored=0; for (let i=0;i<px.length;i+=4){ if(px[i]===0&&px[i+1]===0&&px[i+2]===0) black++; else colored++; }
   return { opened, statuses, black, colored, total: px.length/4 };

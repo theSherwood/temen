@@ -1,9 +1,9 @@
 # The `exec` capability — one interface, host processes or domains
 
 Design record for the subprocess capability (first consumer: **jacl**,
-`theSherwood/jacl_impl/docs/SVM_EXEC_ASK.md` — shell-out for `!cmd` /
+`theSherwood/jacl_impl/docs/TEMEN_EXEC_ASK.md` — shell-out for `!cmd` /
 `[exec …]`). Settled 2026-07-22 with the §3.6 consumer pinning
-(IMPORTS.md §3.6); implementation follows the `svm-fs` mold.
+(IMPORTS.md §3.6); implementation follows the `temen-fs` mold.
 
 ## The one-interface decision
 
@@ -14,9 +14,9 @@ interposition-invisibility property the import model already guarantees:
 
 | backend | what a spawn is | status |
 |---|---|---|
-| `host_exec(allowlist)` | a real host OS process, attenuated by an explicit program allowlist (the capability *is* the list, as `host_fs`'s *is* the root) | **BUILT 2026-07-22** (`svm-run/src/exec.rs`) |
-| `scripted_exec(table)` | no process at all: a `(argv-prefix → {stdout, stderr, exit})` table — the `mem_fs` analog; what differential tests and wasm/browser embedders grant | **BUILT 2026-07-22** (wasm-safe `svm-exec` crate) |
-| `domain_exec` | a **child svm domain** (host-served: the embedder implements the same ops over the Instantiator machinery it already has) | **BUILT 2026-07-23** (`svm-run/src/exec.rs`) |
+| `host_exec(allowlist)` | a real host OS process, attenuated by an explicit program allowlist (the capability *is* the list, as `host_fs`'s *is* the root) | **BUILT 2026-07-22** (`temen-run/src/exec.rs`) |
+| `scripted_exec(table)` | no process at all: a `(argv-prefix → {stdout, stderr, exit})` table — the `mem_fs` analog; what differential tests and wasm/browser embedders grant | **BUILT 2026-07-22** (wasm-safe `temen-exec` crate) |
+| `domain_exec` | a **child temen domain** (host-served: the embedder implements the same ops over the Instantiator machinery it already has) | **BUILT 2026-07-23** (`temen-run/src/exec.rs`) |
 | guest-served | a parent domain serves its child's `"exec"` with **its own code** — the none-the-wiser nested shell | §3.6 `Endpoint` (its first consumer) |
 
 This is how "a shell that manages real host processes" and "the same
@@ -103,25 +103,25 @@ seeded with the same entry, **interp == jit** on both; un-granted,
 resolve stays negative and the fallback runs; an allowlist miss is a
 negative return, not a trap.
 
-## Implementation shape (the svm-fs mold, exactly)
+## Implementation shape (the temen-fs mold, exactly)
 
 Protocol constants + the deterministic `scripted_exec` handler live in a
-**wasm-safe crate** (`svm-exec`, mirroring `svm-fs`) so the browser
+**wasm-safe crate** (`temen-exec`, mirroring `temen-fs`) so the browser
 cdylib can grant it; the real `host_exec` backend and the `HostCap`
-constructors live in `svm-run` (`exec.rs`, mirroring `fs.rs`).
+constructors live in `temen-run` (`exec.rs`, mirroring `fs.rs`).
 `domain_exec` lands beside them when built; the guest-served backend is
 §3.6/Endpoint work and is recorded there.
 
-**As built (2026-07-22).** `svm-exec` holds the protocol (op codes, errno,
+**As built (2026-07-22).** `temen-exec` holds the protocol (op codes, errno,
 NUL-argv parsing) plus the shared `JobTable` — every backend routes its
 non-`run` ops through the one table, so read/status/close semantics are
 backend-identical by construction — and `scripted_exec_handler` (longest
 argv-prefix wins; a miss is `-EPERM`, the *same* refusal an allowlist miss
 produces, so the failure mode doesn't reveal the backend either).
-`svm-run/src/exec.rs` adds `host_exec(allowlist)` (blocking one-shot spawn,
+`temen-run/src/exec.rs` adds `host_exec(allowlist)` (blocking one-shot spawn,
 stdin fed then closed, both streams captured, POSIX-shell status collapse)
-and the `HostCap` constructors, re-exporting `svm-exec` as one surface.
-Acceptance pinned by `crates/svm-run/tests/exec_cap.rs`: `echo hi` →
+and the `HostCap` constructors, re-exporting `temen-exec` as one surface.
+Acceptance pinned by `crates/temen-run/tests/exec_cap.rs`: `echo hi` →
 `hi\n` + exit 0, byte-identical host vs scripted, on all three backends;
 un-granted resolve negative with the fallback running; allowlist miss
 probeable, never a trap (the host test is unix-only — Windows has no
@@ -129,9 +129,9 @@ probeable, never a trap (the host test is unix-only — Windows has no
 differential).
 
 **As built (2026-07-23): `domain_exec`.** The third row lands beside
-`host_exec` in `svm-run/src/exec.rs`: `domain_exec(Vec<DomainProgram>)`
+`host_exec` in `temen-run/src/exec.rs`: `domain_exec(Vec<DomainProgram>)`
 — each entry a `{name, Arc<Instance>, Limits}` — where a `run` is a
-**fresh svm domain** (its own window, powerbox, fuel; no OS process
+**fresh temen domain** (its own window, powerbox, fuel; no OS process
 anywhere): `argv[0]` resolves by exact name through the registry (the
 registry *is* the attenuation; a miss is the same `-EPERM` as an
 allowlist/table miss), the wire `stdin` seeds the child's `Stream{In}`,

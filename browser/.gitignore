@@ -2,7 +2,7 @@
 /wt/target
 /threads-spike/target
 # regenerable fixtures/corpus (see `cargo run --bin genfixture` / `gencorpus`)
-*.svmbc
+*.temenc
 /corpus
 /corpus.json
 # scratch wasm patches
@@ -12,48 +12,48 @@ patched*.wasm
 /package.json
 /package-lock.json
 # on-ramp playground assets built by `build-onramp-assets.mjs` (regenerable). The tiny
-# `hello_c.svmb` is committed so the playground has a working example out of the box; the big
+# `hello_c.temen` is committed so the playground has a working example out of the box; the big
 # guests (Lua/SQLite) are built on demand / by the Pages pipeline.
 /web/assets/*.bc
 /web/assets/*.ll
-/web/assets/*.svmb
+/web/assets/*.temen
 /web/assets/*.wad
 /web/assets/*.img
-!/web/assets/hello_c.svmb
-# nim_hello.svmb — a real Nim program (`write(stdout, "hello, svm")`) compiled through nimony →
-# svm-leng → the nim→powerbox bridge to a runnable module, committed like `hello_c` so the "run real
-# Nim" playground card works out of the box. Regenerate with `cargo run -p svm-run --example
-# build_nim_hello_svmb` (needs the nimony toolchain); gated by `crates/svm-run/tests/nim_hello_asset.rs`.
-!/web/assets/nim_hello.svmb
-!/web/assets/gradient.svmb
-!/web/assets/bounce.svmb
-!/web/assets/life.svmb
-!/web/assets/mandelzoom.svmb
+!/web/assets/hello_c.temen
+# nim_hello.temen — a real Nim program (`write(stdout, "hello, svm")`) compiled through nimony →
+# temen-leng → the nim→powerbox bridge to a runnable module, committed like `hello_c` so the "run real
+# Nim" playground card works out of the box. Regenerate with `cargo run -p temen-run --example
+# build_nim_hello_temen` (needs the nimony toolchain); gated by `crates/temen-run/tests/nim_hello_asset.rs`.
+!/web/assets/nim_hello.temen
+!/web/assets/gradient.temen
+!/web/assets/bounce.temen
+!/web/assets/life.temen
+!/web/assets/mandelzoom.temen
 # QuickJS is committed prebuilt: its build needs a guest libm (openlibm) fetched from GitHub, which
-# the Pages pipeline can't reach — so the translated `.svmb` ships in-tree (like `hello_c`) and the
+# the Pages pipeline can't reach — so the translated `.temen` ships in-tree (like `hello_c`) and the
 # playground's JS demo works out of the box. `build-onramp-assets.mjs` rebuilds it in place when the
 # sources *are* fetchable, and otherwise leaves this committed artifact untouched.
-!/web/assets/qjs_repl.svmb
-# qjs_snapshot.svmb — the two-phase (`main`/`warmup`/`eval_run`) QuickJS driver for the WASM_AOT.md
-# warm-runtime snapshot (`svm_warm_*`), committed prebuilt for the same fetch-gated reason as
-# `qjs_repl.svmb`. `build-onramp-assets.mjs` rebuilds it in place when the sources are fetchable; the
+!/web/assets/qjs_repl.temen
+# qjs_snapshot.temen — the two-phase (`main`/`warmup`/`eval_run`) QuickJS driver for the WASM_AOT.md
+# warm-runtime snapshot (`temen_warm_*`), committed prebuilt for the same fetch-gated reason as
+# `qjs_repl.temen`. `build-onramp-assets.mjs` rebuilds it in place when the sources are fetchable; the
 # committed `warm-snapshot-test.mjs` uses it (and skips cleanly if absent).
-!/web/assets/qjs_snapshot.svmb
-# lua_snapshot.svmb — the two-phase (`main`/`warmup`/`eval_run`) Lua 5.4.7 driver for the warm-runtime
-# snapshot (issue #805), committed prebuilt like `qjs_snapshot.svmb` so the warm Lua card + the
+!/web/assets/qjs_snapshot.temen
+# lua_snapshot.temen — the two-phase (`main`/`warmup`/`eval_run`) Lua 5.4.7 driver for the warm-runtime
+# snapshot (issue #805), committed prebuilt like `qjs_snapshot.temen` so the warm Lua card + the
 # `snapshot-worker-test.mjs` browser test work out of the box (browser-real runs on committed assets
 # only). A generated binary asset (like the vendored `doom1.wad`): regenerate from
-# `lua_snapshot_harness.c` via the recipe in crates/svm-llvm/tests/fixtures/lua/README.md and commit it —
+# `lua_snapshot_harness.c` via the recipe in crates/temen-llvm/tests/fixtures/lua/README.md and commit it —
 # the ~76k-line intermediate `.ll` is NOT committed (no Rust test consumes it, unlike `lua_eval.ll`).
-!/web/assets/lua_snapshot.svmb
+!/web/assets/lua_snapshot.temen
 # chibicc (the in-browser C compiler, SELFHOST_C.md §7 step 5) is committed prebuilt for the same
 # reason: `build-onramp-assets.mjs` builds it fail-soft (skipped when clang/llvm-18 is absent or the
 # build hiccups), so relying on the deploy-time build alone silently ships a 404 (the I26/I42 class).
-# Shipping the translated `.svmb` in-tree makes the C-compiler card work out of the box; the build
+# Shipping the translated `.temen` in-tree makes the C-compiler card work out of the box; the build
 # script rebuilds it in place when the toolchain is present.
-!/web/assets/chibicc.svmb
-# svm-leng (the in-browser leng→SVM-IR self-host card, NIM.md §3e) is committed prebuilt for the same
-# reason: it's a copy of the in-tree `crates/svm-run/demos/leng_selfhost/svm-leng.svmb` asset (whose own
+!/web/assets/chibicc.temen
+# temen-leng (the in-browser leng→TEMEN-IR self-host card, NIM.md §3e) is committed prebuilt for the same
+# reason: it's a copy of the in-tree `crates/temen-run/demos/leng_selfhost/temen-leng.temen` asset (whose own
 # code-coupling gate keeps it in sync), so the self-host card works out of the box even when the
 # `-Z build-std`/`llvm-18` toolchain that rebuilds it is absent. `build-onramp-assets.mjs` copies it.
-!/web/assets/svm-leng.svmb
+!/web/assets/temen-leng.temen

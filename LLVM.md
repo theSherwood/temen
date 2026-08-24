@@ -1,7 +1,7 @@
-# LLVM-bitcode → IR on-ramp (`crates/svm-llvm`) — design & tracking
+# LLVM-bitcode → IR on-ramp (`crates/temen-llvm`) — design & tracking
 
 The plan, the constraints, and the prioritized work for the **third frontend**: an
-**ahead-of-time LLVM-bitcode → SVM-IR translator**. This is the big *breadth* play
+**ahead-of-time LLVM-bitcode → TEMEN-IR translator**. This is the big *breadth* play
 (D54) — one component buys every LLVM language (C, C++, Rust, Swift, Zig…) as a guest.
 
 This file is the working tracker for the on-ramp, the analog of `WASM.md` for the wasm
@@ -29,13 +29,13 @@ matches **native `cc`** end to end. **Slice N** binds the raw I/O primitives (`w
 the non-varargs **stdio** output family (`puts`/`putchar`/`putc`/`fputc`/`fwrite`/`fputs`/`fflush`,
 and `clang`'s `printf("…\n")`→`puts` / `printf("%c")`→`putc` lowering); **slice P** adds funnel-shift
 rotates (`llvm.fshl`/`fshr` → `rotl`/`rotr`) and **synthesized runtime mem-loop helpers**
-(`__svm_memset`/`__svm_memcpy` — the first multi-block helper, for a variable-length `memset`/`memcpy`).
+(`__temen_memset`/`__temen_memcpy` — the first multi-block helper, for a variable-length `memset`/`memcpy`).
 The **demo-driven breadth plan (demos 1–6) is now complete** — `hexdump` (varargs `printf`, slice W),
 `sortvec` (`realloc` + signed `%d`, X), `mat4` (`<4 x float>` SIMD, Y), `crc32` (`llvm.bswap`, Z),
 `lineedit` (overlap-safe `memmove`, AA), and `raytrace` (transcendental libm bundled as guest code,
 AB) all run byte-identical to native.**
-`crates/svm-llvm` does the **SSA → block-argument
-conversion** (LLVM dominance SSA + φ-nodes → SVM's block-local form via liveness; loops/joins/
+`crates/temen-llvm` does the **SSA → block-argument
+conversion** (LLVM dominance SSA + φ-nodes → Temen's block-local form via liveness; loops/joins/
 critical edges, no edge splitting), the integer scalar op set, the **§3d data-stack** (`alloca` →
 window frame slots, `load`/`store` incl. narrow widths, `getelementptr` → address arithmetic),
 **direct calls with the threaded data-SP** (every function takes a leading `sp`; a call passes
@@ -65,13 +65,13 @@ refer to `DESIGN.md`; "D54" etc. are its Decision Log.
 ## 1. Why LLVM, and why now
 
 The two on-ramps in DESIGN §20 are **LLVM → IR (breadth)** and **wasm → IR (compat)**.
-The wasm bridge (`svm-wasm`) is feature-complete for typical `clang`/`rustc -O2` output
+The wasm bridge (`temen-wasm`) is feature-complete for typical `clang`/`rustc -O2` output
 (see `WASM.md`); the LLVM bridge is the remaining frontier (HANDOFF §10 "▶ NEXT", D54).
 
 **Thesis (DESIGN §20): we are a strictly better LLVM target than wasm.** The things LLVM
 emits naturally and that wasm forces a frontend to *contort* are exactly our §1a edges:
 
-| LLVM emits | wasm forces | SVM gives it natively |
+| LLVM emits | wasm forces | Temen gives it natively |
 |---|---|---|
 | irreducible CFG | relooper / stackify (extra blocks+branches) | native irreducible CFG (D2/§3) |
 | 64-bit pointers | wasm32 windowing / wasm64 bounds checks | 64-bit address space + one mask (§4) |
@@ -80,7 +80,7 @@ emits naturally and that wasm forces a frontend to *contort* are exactly our §1
 | **SSA with φ-nodes** | stackify → consumer SSA reconstruction | **SSA on the wire**; φ → block params (§3a) |
 
 The last row is the cleanest win and the reason the LLVM path is *less* work than the
-wasm path in its core: `svm-wasm` had to **reconstruct SSA from a stack machine**; we
+wasm path in its core: `temen-wasm` had to **reconstruct SSA from a stack machine**; we
 **already have SSA** from LLVM and only need to translate it. LLVM φ-nodes map directly
 onto our typed block parameters (§3a "no phi nodes"): each `phi` at a block's head becomes
 a block parameter, and each predecessor's terminator supplies the matching branch
@@ -90,10 +90,10 @@ argument. (Critical edges get split first — standard.)
 
 ## 2. Decisions already taken (D54) — the frame
 
-- **Untrusted frontend, no TCB cost (§2a).** `svm-llvm` is the same trust class as the
-  chibicc fork and `svm-wasm`: it consumes the core crates to *produce* a Module, and is
-  **never a dependency of `svm-jit`/`svm-interp`**. Everything it emits is re-verified by
-  `svm-verify`, so a translation bug is a **clean error, never an escape**. Adding LLVM
+- **Untrusted frontend, no TCB cost (§2a).** `temen-llvm` is the same trust class as the
+  chibicc fork and `temen-wasm`: it consumes the core crates to *produce* a Module, and is
+  **never a dependency of `temen-jit`/`temen-interp`**. Everything it emits is re-verified by
+  `temen-verify`, so a translation bug is a **clean error, never an escape**. Adding LLVM
   costs zero escape-TCB — the eBPF lesson generalized (DESIGN §20).
 - **Architecture: AOT (HANDOFF §10 / D54).** The translator links libLLVM at build/dev
   time and is **off the runtime path** — it does *not* go into the ~5 MiB JIT binary. We
@@ -104,7 +104,7 @@ argument. (Critical edges get split first — standard.)
 - **Pin a frozen subset.** LLVM bitcode is **not a stable format** (DESIGN §20). We pin a
   specific LLVM version and a legalized subset of constructs we accept, exactly as PNaCl
   did. Anything outside the subset is a hard, fail-closed `Unsupported` error (never
-  silent mis-translation) — same discipline as `svm-wasm`'s `unsup(...)`.
+  silent mis-translation) — same discipline as `temen-wasm`'s `unsup(...)`.
 - **MVP scope (D54):** the **scalar + memory + call** subset that chibicc already proves
   end-to-end — aggregates via memory, hard-error on vectors and unsupported intrinsics —
   with a differential harness running the existing C demos through *stock LLVM* and
@@ -142,7 +142,7 @@ the `alloca`s that *remain* are genuinely address-taken → data-stack slots. Th
 classification falls out of LLVM's own promotion — no bespoke pass needed.
 
 ### 3b. Narrow integers — the wasm tradeoff (§3b note 1, "revisit at the LLVM on-ramp")
-SVM SSA value types are **`{i32, i64}`** only; `i8`/`i16` exist only as memory access
+Temen SSA value types are **`{i32, i64}`** only; `i8`/`i16` exist only as memory access
 widths. LLVM has native `i1`/`i8`/`i16`/`i24`/… So the translator must **collapse narrow
 integers to `i32`** and re-emit truncation explicitly — DESIGN §3b names this exact task:
 *"the LLVM on-ramp (D54) will need the same discipline when collapsing LLVM's native
@@ -169,7 +169,7 @@ verifier + IR semantics regardless (§2a), so a mistake is a wrong-answer bug, n
 
 ---
 
-## 4. LLVM IR → SVM IR mapping (the MVP surface)
+## 4. LLVM IR → Temen IR mapping (the MVP surface)
 
 The MVP target is the subset the chibicc demos already exercise. Mapping sketch (the
 "what lands first" contract; details firm up as code lands):
@@ -182,7 +182,7 @@ The MVP target is the subset the chibicc demos already exercise. Mapping sketch 
   module's `DataLayout`). By-value aggregate args/returns → hidden `sret` pointer (D39),
   exactly the chibicc ABI (HANDOFF §2 "By-value aggregates").
 - `<N x T>` vectors → **reject for MVP** (`Unsupported`); SIMD is a later pass mirroring
-  the §17/D58 `v128` work `svm-wasm` already did.
+  the §17/D58 `v128` work `temen-wasm` already did.
 
 **Instructions:**
 - arithmetic/bitwise/shift (`add`/`sub`/`mul`/`and`/…/`shl`/`lshr`/`ashr`) → the typed
@@ -199,7 +199,7 @@ The MVP target is the subset the chibicc demos already exercise. Mapping sketch 
 - `alloca` → bump the data-SP (a data-stack slot), §3d / HANDOFF §3.
 - `call` → `call` (direct) / `call_indirect` (function pointer, §3c funcref-index dispatch).
   `musttail`/`tail` → `return_call`/`return_call_indirect` (D6, both backends do true tail
-  calls — cf. `svm-wasm` `tests/tailcall.rs`).
+  calls — cf. `temen-wasm` `tests/tailcall.rs`).
 - `br`/`switch`/`ret`/`unreachable` → `br`/`br_if`/`br_table`/`return`/`trap` terminators.
   `switch` → `br_table` (dense) or a compare chain (sparse), mirroring chibicc `gen_switch`.
 - `phi` → **block parameters** (§1; the headline simplification).
@@ -209,7 +209,7 @@ The MVP target is the subset the chibicc demos already exercise. Mapping sketch 
   the libc surface to capabilities, it does not invent imports.
 
 **Intrinsics (MVP):** `llvm.memcpy`/`memset`/`memmove` → the loop/bulk lowering (cf.
-`svm-wasm` `memory.copy`/`fill`); `llvm.lifetime.*`/`llvm.dbg.*`/`llvm.assume` → drop;
+`temen-wasm` `memory.copy`/`fill`); `llvm.lifetime.*`/`llvm.dbg.*`/`llvm.assume` → drop;
 `llvm.trap` → `trap`; `llvm.*.with.overflow`, `llvm.ctlz/cttz/ctpop` → the `clz/ctz/popcnt`
 ops or expansions. **Everything else → fail-closed `Unsupported`.**
 
@@ -238,7 +238,7 @@ we get a three-lane differential with chibicc as the reference for *our IR shape
         ┌─────────────────┼──────────────────────────┐
         ▼                 ▼                          ▼
   Lane A: native      Lane B: chibicc → IR       Lane C (NEW): clang -emit-llvm
-   cc/clang binary       → interp / JIT             → .bc → svm-llvm → IR
+   cc/clang binary       → interp / JIT             → .bc → temen-llvm → IR
    (C-semantics            (proven; the              → interp / JIT
     ground truth)          IR-shape oracle)
         └─────────────────┴──────────────────────────┘
@@ -252,9 +252,9 @@ Why this is the strong setup:
 - **The interp↔JIT differential applies for free.** Lane C's output is just IR, so it rides
   the existing escape-oracle and the interp==JIT checks (HANDOFF §8) — a translator bug that
   produces verifier-valid-but-wrong IR is still caught by interp==JIT==native.
-- **Reuse the demo harness.** `assert_demo_matches_cc` (`crates/svm-run/tests/run.rs`) and
-  the chibicc invocation (`compile_c` in `svm-run/src/main.rs`) are the template; add a
-  `clang -emit-llvm -c -o demo.bc demo.c` → `svm-llvm` → run lane, asserting stdout/exit ==
+- **Reuse the demo harness.** `assert_demo_matches_cc` (`crates/temen-run/tests/run.rs`) and
+  the chibicc invocation (`compile_c` in `temen-run/src/main.rs`) are the template; add a
+  `clang -emit-llvm -c -o demo.bc demo.c` → `temen-llvm` → run lane, asserting stdout/exit ==
   native, demo by demo. Start with the **simplest demos first** (a `fib`/`calc`), graduate to
   the real libraries (jsmn, sha256, …) exactly as the chibicc rollout did (HANDOFF §2).
 - **Generative fuzzing comes later** — first make the fixed corpus green; the translator's
@@ -268,22 +268,22 @@ them), so Lane C adds no new build dependency the harness doesn't already have.
 
 ## 6. Crate & build plan (proposal — confirm before building)
 
-A new workspace crate **`crates/svm-llvm`**, modeled on `svm-wasm`:
+A new workspace crate **`crates/temen-llvm`**, modeled on `temen-wasm`:
 
-- **Deps:** `svm-ir` (produce the Module). **Dev-deps:** `svm-text`/`svm-verify`/
-  `svm-interp`/`svm-jit`/`svm-run` (the differential lanes), mirroring `svm-wasm/Cargo.toml`.
+- **Deps:** `temen-ir` (produce the Module). **Dev-deps:** `temen-text`/`temen-verify`/
+  `temen-interp`/`temen-jit`/`temen-run` (the differential lanes), mirroring `temen-wasm/Cargo.toml`.
 - **LLVM ingest binding — `llvm-ir` 0.11.3, feature `llvm-18` (DECIDED, §8 Q1).** It reads
   the legalized `.bc` via `llvm-sys` and hands the translator an **owned, pure-Rust AST**
   (`enum Instruction`), so the translator is a boring pattern-match-and-emit walk — no
   lifetimes, no `unsafe`, no LLVM context juggling (AGENTS.md "boring obvious"). It is *not*
   asked to run passes (legalization is out-of-process, §4), so its read-only nature is no
   loss. The libLLVM link it pulls in (via `llvm-sys`) is **build/dev-time only** and gated
-  so it never enters `svm-jit`/`svm-interp` (the D54 "off the runtime path" rule). Fallbacks
+  so it never enters `temen-jit`/`temen-interp` (the D54 "off the runtime path" rule). Fallbacks
   if it bites: `inkwell` (the maintained, version-tracking wrapper — same C-API limits) →
   then a hand-rolled `.ll` parser over `opt -S` output (zero libLLVM link, but a rot-prone
   parser we'd own). See §8 Q1 for why `llvm-ir` won.
 - **Output:** verifier-checked IR `Module`, re-verified in tests (untrusted-frontend, §2a).
-- **Tests:** `crates/svm-llvm/tests/` — a `translate.rs` (hand-written `.ll` snippets, the
+- **Tests:** `crates/temen-llvm/tests/` — a `translate.rs` (hand-written `.ll` snippets, the
   unit oracle) and the demo differential lane (Lane C above).
 
 This is a proposal; §6 decisions (binding choice, pin mechanics, CI gating of the libLLVM
@@ -299,10 +299,10 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
 ### Milestone 0 — scaffold & first light 🟢 — DONE
 - [x] Binding decided: `llvm-ir` 0.11.3 / `llvm-18` (§6, §8 Q1). Legalize out-of-process
       via `clang -O2 -emit-llvm` (+ `opt` as needed) (§4, §8 Q2).
-- [x] CI gating: `svm-llvm` **excluded from the workspace** (root `Cargo.toml`, alongside
+- [x] CI gating: `temen-llvm` **excluded from the workspace** (root `Cargo.toml`, alongside
       `fuzz`/`bench`), so `cargo build/test --workspace` never links libLLVM — confirmed via
-      `cargo metadata` (svm-llvm is not a member). The cross-OS runtime matrix is untouched.
-- [x] `crates/svm-llvm` skeleton: ingest a `.bc` (`translate_bc_path`), walk functions/blocks,
+      `cargo metadata` (temen-llvm is not a member). The cross-OS runtime matrix is untouched.
+- [x] `crates/temen-llvm` skeleton: ingest a `.bc` (`translate_bc_path`), walk functions/blocks,
       emit a `Module`, verify it. Builds + links libLLVM dynamically (see §8 Q4 for prereqs).
 - [x] First light green: `clang -O2 -emit-llvm` of `return 42`, an `i32` `add` over params, and
       `i64` arithmetic → translate → verify → interp, matching native semantics; plus a
@@ -369,7 +369,7 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
 
 **Slice F (DONE) — floats.**
 - [x] `f32`/`f64` arithmetic (`fadd`/`fsub`/`fmul`/`fdiv`/`fneg`), `fcmp` (ordered/unordered collapse
-      to the SVM op — NaN corner is a documented fidelity gap), `select`, the int↔float conversions
+      to the Temen op — NaN corner is a documented fidelity gap), `select`, the int↔float conversions
       (`sitofp`/`uitofp`/`fptosi`/`fptoui`, float→int **saturating** per §3b), `fpext`/`fptrunc`,
       `bitcast`, and the common float math intrinsics (`fmuladd`/`fma` lowered **unfused**;
       `sqrt`/`fabs`/`floor`/`ceil`/`trunc`/`rint`/`copysign`/`min`/`maxnum`) lowered inline. Float
@@ -395,7 +395,7 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
 
 **Slice I (DONE) — memory intrinsics.**
 - [x] `llvm.memcpy`/`memmove`/`memset` (constant length) lower to inline **chunked load/stores**
-      (widest-first 8/4/2/1, the plan `svm-wasm` uses for `memory.copy`/`fill`). Copies
+      (widest-first 8/4/2/1, the plan `temen-wasm` uses for `memory.copy`/`fill`). Copies
       **load-all-then-store-all** (overlap-safe → `memcpy` and `memmove` share a path); `memset`
       replicates the fill byte across an `i64` (`val·0x01010101_01010101`) and stores it chunk-wide.
       Variable-length / `> 4 KiB` is a clean `Unsupported` (needs a runtime loop). Also **page-aligned
@@ -426,14 +426,14 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
 
 **Slice L (DONE) — libm math calls.**
 - [x] A call to an *external* `sqrt`/`fabs`/`floor`/`ceil`/`trunc`/`rint`/`nearbyint`/`copysign`/
-      `fmin`/`fmax` (and the `…f` f32 variants) lowers to the matching SVM float op inline —
+      `fmin`/`fmax` (and the `…f` f32 variants) lowers to the matching Temen float op inline —
       `lower_libm_call`, gated on the name not being a guest-defined function. `round`
-      (half-away-from-zero) and transcendentals (`sin`/`cos`/`exp`/`log`/`pow`) have no SVM op, so
+      (half-away-from-zero) and transcendentals (`sin`/`cos`/`exp`/`log`/`pow`) have no Temen op, so
       they stay calls (`Unsupported` for now). Tested on `sqrt` and `fmin`.
 
 **Slice M (DONE) — integer min/max + bit intrinsics.**
 - [x] `llvm.smax`/`smin`/`umax`/`umin` → `icmp`+`select`; `llvm.ctlz`/`cttz`/`ctpop` →
-      `clz`/`ctz`/`popcnt` (the trailing `is_*_poison` `i1` ignored — SVM defines the zero case);
+      `clz`/`ctz`/`popcnt` (the trailing `is_*_poison` `i1` ignored — Temen defines the zero case);
       `llvm.abs` → `select(x<0, -x, x)` (`lower_int_intrinsic`). Tested on `smax` (a `?:` max),
       `ctlz`, `ctpop`, and an `abs`.
 
@@ -512,12 +512,12 @@ and `llvm.load.relative.i64(P, off)` returns `P + sext_i32(*(i32*)(P + off))` �
       into a fixed token array and printing each token's type/size/text, byte-identical to native.
 
 **Slice S (DONE) — `malloc`/heap (the §1a sparse address space; lands heapgrow).** `malloc`/`calloc`
-lower to a synthesized **bump allocator** (`synth_malloc` → `__svm_malloc(size)`) that grows the heap
+lower to a synthesized **bump allocator** (`synth_malloc` → `__temen_malloc(size)`) that grows the heap
 into the window's reserved tail by `vm_map`-committing pages on demand via the `Memory` capability.
 - [x] A program that allocates gets a **4-handle `_start`** (`stdout, stdin, exit, memory`); the
       powerbox grants `Memory` for a 4-param entry. `_start` stashes the handle and seeds the heap
       (`HEAP_BRK`/`HEAP_TOP` = the window's mapped boundary, the first reserved page).
-- [x] `__svm_malloc`: a 3-block CFG — align the request to 16; if it crosses the committed boundary,
+- [x] `__temen_malloc`: a 3-block CFG — align the request to 16; if it crosses the committed boundary,
       `CallImport "vm_map"(top, page_up(new) − top, RW)` (resolved to `Memory.map`) and advance the
       boundary; publish the new break and return the old. `free` is a no-op; the heap never reuses, so
       freshly-committed (`vm_map`-zeroed) pages make `calloc` ≡ `malloc`. `realloc` stays `Unsupported`.
@@ -527,7 +527,7 @@ into the window's reserved tail by `vm_map`-committing pages on demand via the `
 
 **Slice T (DONE) — multi-value struct returns.** A small by-value struct returned in registers (clang
 coerces it to e.g. `{ i64, i64 }` / `{ i64, ptr }`, as clay's `*Array_Allocate_Arena` and any C
-returning a 2-field struct) maps to an SVM **multi-result** function (§3a).
+returning a 2-field struct) maps to an Temen **multi-result** function (§3a).
 - [x] `result_types` flattens a small struct return to its scalar fields; a multi-result `call`
       records the aggregate field-wise (`BlockCtx.agg`, value-id → field indices) via `push_multi`;
       `insertvalue`/`extractvalue` build/read it; `ret` returns the fields. Aggregates are assumed not
@@ -564,7 +564,7 @@ bits 0–31, lane 1 = 32–63 — its little-endian image).
 ## Pending work — demo-driven plan
 
 The corpus is done; the remaining work is **general-C breadth**, pursued the same way that worked
-for the corpus: pick a small **real end-to-end demo** (`crates/svm-run/demos/`), drive it through
+for the corpus: pick a small **real end-to-end demo** (`crates/temen-run/demos/`), drive it through
 `clang -O2 → translate → verify → run` vs native, and close exactly the gaps it reveals. Each demo
 below is a whole-program, `write`-output C program (its own minimal libc, like the corpus demos) so
 it stays a clean differential against a native `cc` build. Ordered by value (printf first — it is
@@ -577,7 +577,7 @@ the dominant general-C gap).
 | 3 ✅ | **`mat4`** — 4×4 matrix × vec4 affine transform, print rows (`demos/mat4`, slice Y) | **128-bit SIMD** (`<4 x float>` → native `v128`) — DONE, byte-identical to native | floats, `printf` |
 | 4 ✅ | **`crc32`** — CRC-32 over stdin + a big-endian `u32` reader (`demos/crc32`, slice Z) | **`llvm.bswap`** (inline byte reversal) — DONE, byte-identical to native | shifts, `printf` |
 | 5 ✅ | **`lineedit`** — read a line, wrap in `[...]` (right shift) + delete middle char (left shift) (`demos/lineedit`, slice AA) | **overlapping `memmove`** (direction-aware runtime loop) — DONE, byte-identical to native | arrays, `read` |
-| 6 ✅ | **`raytrace`** — ASCII sphere raytracer: `sqrt` intersection + diffuse/sinusoidal/exp shading (`demos/raytrace`, slice AB) | **transcendental libm** — `sqrt`/`floor` lower to SVM ops; `sin`/`exp` bundled as **guest `libm`** (poly approximations) — DONE, byte-identical to native | floats, `write` |
+| 6 ✅ | **`raytrace`** — ASCII sphere raytracer: `sqrt` intersection + diffuse/sinusoidal/exp shading (`demos/raytrace`, slice AB) | **transcendental libm** — `sqrt`/`floor` lower to Temen ops; `sin`/`exp` bundled as **guest `libm`** (poly approximations) — DONE, byte-identical to native | floats, `write` |
 
 Notes:
 - **`printf` runs in the guest** (per the capability model): a guest-side format engine parses the
@@ -585,8 +585,8 @@ Notes:
   helpers → `Stream.write`; only the bytes cross the boundary. `%f` pulls in float formatting (defer
   to demo 3/6 if demo 1 stays integer/hex). Non-constant format strings stay `Unsupported`.
 - **transcendentals/libm**: a **guest** `libm` (guest code, not a host math capability) — keeps math
-  in the sandbox. `sqrt` lowers to the SVM op (slice F); `exp`/`log`/`pow` now have fdlibm
-  implementations in `crates/svm-run/demos/libm/libm.c` (a guest def shadows the on-ramp's trap stub);
+  in the sandbox. `sqrt` lowers to the Temen op (slice F); `exp`/`log`/`pow` now have fdlibm
+  implementations in `crates/temen-run/demos/libm/libm.c` (a guest def shadows the on-ramp's trap stub);
   `sin`/`cos`/… are the remaining additions. See the "Transcendentals → a guest `libm`" bullet above.
 - **`argc`/`argv`**: **DONE** — see *Slice BE* below. `envp`/`getenv`: **DONE** — see *Slice BF*.
 
@@ -598,7 +598,7 @@ sandbox" below; harness `demo_quickjs_eval_vs_native`). Bellard's **QuickJS**
 with **computed-goto** dispatch (`indirectbr`/`blockaddress` — DONE, slices AV+AW), **BigInt** (`libbf`),
 regex (`libregexp`), Unicode tables, and a **test262** runner. "Little is left unproven if it passes."
 It is a **big lift**, tracked as in-progress — the QuickJS analog of the Postgres capstone, not a
-one-slice demo. Reproduction + the full gap inventory live in `crates/svm-run/demos/quickjs/`
+one-slice demo. Reproduction + the full gap inventory live in `crates/temen-run/demos/quickjs/`
 (`qjs_eval.c` + `build_bitcode.sh` + README).
 
 **Spike findings (this session).** A minimal embedding — `JS_NewRuntime`/`JS_NewContext`/`JS_Eval` of a
@@ -619,7 +619,7 @@ shape SQLite/Postgres already solved**:
    Postgres-shimmed: mem/string (`memchr`/`memcmp`/`strlen`/`strcpy`/…), alloc (`malloc`/`realloc`/`free`/
    `malloc_usable_size`), the printf family (`printf`/`snprintf`/`vsnprintf`/`fwrite`/…), number
    parse/format (`__isoc23_strtol`/`strtod`/`lrint`). **New / worth attention:** `fesetround` (FP
-   rounding-mode control — SVM float ops are round-to-nearest; QuickJS toggles it around some
+   rounding-mode control — Temen float ops are round-to-nearest; QuickJS toggles it around some
    conversions), time (`clock_gettime`/`gettimeofday`/`localtime_r`), and `pthread_cond_*`/`pthread_mutex_*`
    (unused on a single-threaded eval → stubbable), `abort`.
 
@@ -643,7 +643,7 @@ function is fail-closed (astronomically rare). Test `dynamic_alloca_runtime_coun
 
 **`llvm.frameaddress` — DONE.** With alloca cleared, `JS_CallInternal` reached `js_check_stack_overflow`,
 which reads the stack pointer via `__builtin_frame_address(0)`. QuickJS assumes a *downward* native stack
-(`stack_limit = stack_top - stack_size`; overflow when `sp < stack_limit`), but the SVM data-stack grows
+(`stack_limit = stack_top - stack_size`; overflow when `sp < stack_limit`), but the Temen data-stack grows
 *up* — so `llvm.frameaddress(0)` lowers to the **downward proxy** `FRAME_ADDR_BASE - sp` (decreases with
 depth; the large base cancels out of the check's arithmetic, leaving "overflow when data-stack growth
 since `JS_UpdateStackTop` exceeds `stack_size`"). The result is only compared, never dereferenced; level
@@ -661,7 +661,7 @@ result crossing a block edge). The libc surface it exposed was filled in `demos/
 
 **`llvm.round.f64` — DONE, and it was the last translate gap.** `JS_ComputeMemoryUsage` calls C
 `round()` (nearest, ties *away from zero*) → `llvm.round`, distinct from the `llvm.roundeven` (ties to
-even) the on-ramp already handles, with no direct SVM op. Synthesized boundary-safely as
+even) the on-ramp already handles, with no direct Temen op. Synthesized boundary-safely as
 `t = trunc(x); |x-t| >= 0.5 ? t + copysign(1,x) : t` — `x-t` is exact, so no add-before-round
 double-rounding at `0.5⁻` (the bug in `trunc(x + copysign(0.5,x))`); inf/NaN fall through to `t`. Test
 `llvm_round_ties_away_from_zero` (incl. the `0.5⁻` boundary; interp == JIT).
@@ -678,7 +678,7 @@ native `cc` build**:
 ```
 
 Ladder-#? equivalent for the breadth lane: a full JS engine — NaN-boxing, a bytecode VM with
-computed-goto dispatch, BigInt (`libbf`), regex, Unicode — runs on the SVM under the powerbox, no
+computed-goto dispatch, BigInt (`libbf`), regex, Unicode — runs on the Temen under the powerbox, no
 ambient authority. Harness `demo_quickjs_eval_vs_native` (green; `#[ignore]`d only for wall-clock — a
 whole JS engine on the tree-walker takes tens of seconds).
 
@@ -694,20 +694,20 @@ printing after all.
 from the `Stream` cap, evaluates it, prints `print`/`console.log` output + the completion value) runs
 **byte-identical to native** (`demo_quickjs_repl_stdin`). Wired into `browser/build-onramp-assets.mjs`
 (fetch QuickJS + openlibm, compile the engine + shims, `llvm-link -S`, translate at `--host-page 65536`
-→ `qjs_repl.svmb`, ~4.3 MB) and registered as a **playground example** in `web/play.js` (with JS syntax
+→ `qjs_repl.temen`, ~4.3 MB) and registered as a **playground example** in `web/play.js` (with JS syntax
 highlighting — `editor.js`/the CodeMirror bundle now carry the `javascript` mode). **Confirmed in real
 Chromium/V8:** the tab evaluates JS and prints correct output (incl. shortest floats, `0.1+0.2` →
 `0.30000000000000004`) in ~0.6 s for a light program. Boot is milliseconds (no snapshot/restore).
 
 **wasm-JIT tier — ★ DONE, ~6× the interpreter, byte-identical.** QuickJS's `_start` now emits. Three
-emitter changes closed the gap (all in `svm-wasm-jit`): (1) **§12 atomics** — lowered to a
+emitter changes closed the gap (all in `temen-wasm-jit`): (1) **§12 atomics** — lowered to a
 single-threaded load/(rmw)/store sequence + alignment trap (a JIT-tier guest is concurrency-free, so
 this is observably identical to a hardware atomic *and* stays differential-testable on `wasmi`, which
 has no threads); (2) **`cap.self.resolve` outlining** — the powerbox `_start` synth's only
 out-of-subset op, hoisted into a cross-tier wrapper like `cap.call`, so func 0 itself becomes
 emittable; (3) **per-type pooled locals** — the emitter reused block-value locals across blocks, so
 `JS_CallInternal` dropped from 373646 locals (past V8's per-function cap) to 356. The single-shot
-module JIT path (`svm_onramp_jit_run_*` → `compile_module_reactor` rooted at `_start`) emits **1176 of
+module JIT path (`temen_onramp_jit_run_*` → `compile_module_reactor` rooted at `_start`) emits **1176 of
 1201** functions; only the 25 tiny host-boundary wrappers stay cross-tier. Verified in real Chromium/V8
 (`browser-jit-module-test.mjs`): stdout byte-identical across tiers, **~6×** faster (a
 fib+sort+loop+regex script: 80.4 s → 12.9 s). The playground JS tab's "wasm-JIT" toggle now runs it.
@@ -732,12 +732,12 @@ emitted wasm; "Prove interp ≡ JIT" confirms identical stdout.
 
 **Remaining slice sequence.** (a) ~~dynamic `alloca`~~ **done**; (b) ~~`llvm.frameaddress`~~ **done**;
 (c) ~~`select` of aggregates~~ **done**; (d) ~~`llvm.round`~~ **done** → ★ **the eval RUNS byte-identical
-to native**; (e) ~~`qjs_repl.c` + playground wiring~~ **done** (`.svmb` asset + `web/play.js` entry;
+to native**; (e) ~~`qjs_repl.c` + playground wiring~~ **done** (`.temen` asset + `web/play.js` entry;
 shortest-float printing confirmed working — no dtoa slice needed); (f) ~~real-browser verification of the
 playground tab~~ **done** (interp tier, real Chromium/V8); (g) ~~regex / `try`/`catch` / … breadth~~
 **done** (`demo_quickjs_breadth_vs_native`); ~~the open breadth item is **BigInt**~~ **done** (ISSUES.md
 I25 — an i128-large-constant translator bug, now fixed; the full JS surface runs byte-identical); (h)
-~~the **`svm-wasm-jit` emitter gap** so the JIT tier lights up (speed)~~ **done** — QuickJS emits and
+~~the **`temen-wasm-jit` emitter gap** so the JIT tier lights up (speed)~~ **done** — QuickJS emits and
 runs ~6× the interpreter, byte-identical (atomics + `cap.self.resolve` outlining + pooled locals; see
 the "wasm-JIT tier — ★ DONE" note); (i) the `run-test262.c` harness over an embedded slice — the
 self-validating suite, QuickJS's analog of SQLite's sqllogictest.
@@ -759,7 +759,7 @@ playground-registration job (see `demos/tcl/README.md`).
   TUs** (generic + unix + Spencer regex + TclOO + libtommath) to `.ll` with the Makefile's own flags,
   and `llvm-link`s them + the driver + `tcl_shim.c` + the reused printf/strtod shims into one ~19.6 MB
   module. The libc waist reuses the Postgres printf/scanf/ctype shims, the guest `strtod`, openlibm,
-  and the svm-posix caps; `tcl_shim.c` carries only Tcl's own OS surface (time/tty/locale/sockets).
+  and the temen-posix caps; `tcl_shim.c` carries only Tcl's own OS surface (time/tty/locale/sockets).
 - **DONE — Tcl translates (2669 funcs) + verifies**, after closing **three general on-ramp translator
   gaps** it surfaced (each with a direct interp≡JIT unit test): (1) **constexpr `icmp`** — a
   function-address-vs-sentinel compare LLVM leaves unfolded as a `select` operand (`Constant::ICmp`
@@ -769,7 +769,7 @@ playground-registration job (see `demos/tcl/README.md`).
   the symmetric inverse. Tests `constexpr_icmp_operand` / `vector_ptrtoint_identity`. The libc/OS waist
   (`tcl_shim.c`) is built out — qsort/bsearch, address-taken string ops, the glibc ctype tables, the
   time/tty/locale/socket/file surface as benign defined functions — with the unreached remainder
-  (zlib/scanf/fts) trap-stubbed via `SVM_STUB_EXTERNS`.
+  (zlib/scanf/fts) trap-stubbed via `TEMEN_STUB_EXTERNS`.
 - **DONE — RUNS byte-identical to native.** The last runtime blocker was `zlibVersion()`, which
   `TclZlibInit` (from `Tcl_CreateInterp`) reads for its package config; with the zlib/file/tty/locale
   surface given benign bodies, the Tcl core (2669 funcs) translates, verifies, and runs a stdin script
@@ -778,12 +778,12 @@ playground-registration job (see `demos/tcl/README.md`).
   the QuickJS capstone; run with `--ignored`, skips loudly offline). The playground card is live.
 - **DONE — full `Tcl_Init`** (`tcl_init.c`): the whole standard library — `clock`/`file`/`glob`/
   `auto_load`/`package require msgcat` — runs **byte-identical to native** (`demo_tcl_init_stdin`).
-  Rather than the svm-posix memfs (whose minimal `{mode,size}` `stat` mismatches Tcl's glibc `struct
+  Rather than the temen-posix memfs (whose minimal `{mode,size}` `stat` mismatches Tcl's glibc `struct
   stat`), an **in-guest `Tcl_Filesystem` VFS** serves the script library from embedded byte arrays
   (`gen_tcl_library.py` → `tcl_library.h`): the VFS callbacks fill Tcl's own `Tcl_StatBuf` in C (no ABI
-  gap), need **no filesystem capability**, and work identically native/svm/browser. `build_bitcode.sh`
-  links both variants; the playground card uses the full-init `tcl_init.svmb`.
-- **DONE — wasm-JIT tier.** `_start` is **wasm-JIT-emittable**: `tcl_init.svmb` runs on the
+  gap), need **no filesystem capability**, and work identically native/temen/browser. `build_bitcode.sh`
+  links both variants; the playground card uses the full-init `tcl_init.temen`.
+- **DONE — wasm-JIT tier.** `_start` is **wasm-JIT-emittable**: `tcl_init.temen` runs on the
   emitted-wasm tier in real V8 **byte-identical to the interpreter** (`browser-jit-module-test.mjs`
   now drives Tcl alongside Lua/SQLite/QuickJS), so the playground card is `jit: true` — the whole Tcl
   core + script library runs on emitted wasm in the browser, like Lua/SQLite/QuickJS.
@@ -792,7 +792,7 @@ playground-registration job (see `demos/tcl/README.md`).
 **Slice W (DONE) — varargs `printf`, the guest-side format engine (lands `hexdump`).** A
 `printf(fmt, …)` with a **constant** format string is parsed at translate time (`parse_format`):
 literal runs are written straight from the format global; each conversion lowers to the synthesized
-**`__svm_utoa`** (unsigned int → ASCII, a counted divide loop) plus width/zero-padding (a constant
+**`__temen_utoa`** (unsigned int → ASCII, a counted divide loop) plus width/zero-padding (a constant
 pre-fill of the scratch buffer `[FMT_BUF, FMT_BUF_END)`, then a `max(len,width)` write window) →
 `Stream.write`. Covers unsigned `%u`/`%x`, `%c`, `%%`, field width, the `0` flag, and length
 modifiers (the LLVM arg carries the real width — `%lx` ⇒ an `i64` arg). All formatting is **guest
@@ -800,12 +800,12 @@ code**; only the bytes cross the boundary. Tests: `demo_hexdump_vs_native` (a `h
 native, with stdin) + `printf_unsigned_formats` (mixed widths/pads/`%lx`/`%c`/`%%`).
 - *Deferred:* `%s` (runtime strlen), `%f`/`%g`/`%e` (float formatting), precision/`*`/`-`/`+`/space/`#`,
   non-constant format strings. **(`%s`, the flags, and precision landed — slices BA–BD below; float
-  landed later via the exact bignum `dtoa` family — `__svm_dtoa_{fix_big,sci,gen}` — incl. the float
+  landed later via the exact bignum `dtoa` family — `__temen_dtoa_{fix_big,sci,gen}` — incl. the float
   `0`/`#` flags; only `*` and non-constant formats remain deferred.)**
 
 **Slices BA–BD (DONE) — the `printf` breadth batch (no new demo; the format engine widened, each
 checked byte-for-byte vs native `printf`).**
-- **BA — `%s`** (runtime `strlen`): a synthesized `__svm_strlen` (counted forward scan) + a
+- **BA — `%s`** (runtime `strlen`): a synthesized `__temen_strlen` (counted forward scan) + a
   right-justified field-width pad; the string bytes are written straight from the argument pointer.
   Test: `printf_string_formats`.
 - **BB — flags `-`/`+`/space/`#` + zero-padded signed `%d`** (the previously fail-closed sign+pad
@@ -823,8 +823,8 @@ checked byte-for-byte vs native `printf`).**
   exact decimal conversion* (Dragon4/Ryū-class **big-integer** arithmetic — the fraction numerator
   alone needs > 64 bits for small magnitudes), which an `f64`-arithmetic approximation cannot give
   without silently breaking the on-ramp's byte-exact contract. Deferred to a bignum-backed formatter.
-  **(Since landed:** the bignum family — `dtoa_digits` (Dragon4 digit engine) + `__svm_dtoa_sci`
-  (`%e`), `__svm_dtoa_gen` (`%g`), `__svm_dtoa_fix_big` (`%f`, no magnitude ceiling) — correctly
+  **(Since landed:** the bignum family — `dtoa_digits` (Dragon4 digit engine) + `__temen_dtoa_sci`
+  (`%e`), `__temen_dtoa_gen` (`%g`), `__temen_dtoa_fix_big` (`%f`, no magnitude ceiling) — correctly
   rounded across the whole double range; tests `printf_float_{fixed,fixed_bignum,scientific,general,
   nonfinite,zero_pad,alt_form}`. The float `0` (zero-pad after the sign) and `#` (keep the point /
   trailing zeros) flags landed last, byte-for-byte vs glibc.)**
@@ -832,22 +832,22 @@ checked byte-for-byte vs native `printf`).**
 
 **Slice BE (DONE) — `argc`/`argv` (the §3e powerbox args buffer).** A `main(int argc, char** argv)`
 now works end-to-end. The decision was to keep the powerbox ABI **language-neutral**: the host
-delivers arguments as a flat byte blob at a *fixed, known window offset* (`svm_ir::POWERBOX_ARGS_BASE
+delivers arguments as a flat byte blob at a *fixed, known window offset* (`temen_ir::POWERBOX_ARGS_BASE
 = 128`, below the globals base), layout `{ argc:u32-LE, envc:u32-LE }` + packed NUL-terminated
 strings — exactly DESIGN §3e / D44's "args_buffer at a known window offset". *No* entry-signature
 change (`is_powerbox_entry` and handle granting are untouched), so nothing C-specific leaks into the
 VM. All `char**` construction lives in the on-ramp:
-- **Frontend** (`svm-llvm`): when `main`'s arity is `(sp, argc, argv)`, `synth_start_argv` replaces
+- **Frontend** (`temen-llvm`): when `main`'s arity is `(sp, argc, argv)`, `synth_start_argv` replaces
   the straight-line `_start` with a 6-block one — same handle-stash/heap-seed prologue, then it reads
   `argc`, walks the `argc` packed strings building `argv[]` (each entry points *into* the blob — no
   copy) with the `argv[argc] == NULL` terminator at the entry SP, parks `main`'s frame a page above,
   and calls `main(main_sp, argc, argv)`. The window now reserves stack whenever this entry is used
   (it dereferences the SP, unlike the no-arg `_start`). `main(void)` is unchanged; a `main(int)` is
   fail-closed. (`main(…, envp)` and `getenv` are now supported — *Slice BF*.)
-- **Runner** (`svm-run`): `run_powerbox_with_args` builds the blob from `(args, env)`, seeds it into
+- **Runner** (`temen-run`): `run_powerbox_with_args` builds the blob from `(args, env)`, seeds it into
   the window's low bytes via the JIT's `init_mem` (applied *before* data segments, which sit at/above
   `POWERBOX_ARGS_END`, so they never overlap), and rejects an over-large or NUL-bearing arg vector.
-  The CLI forwards its post-`--` arguments (`svm-run prog.svmb -- a b c`; `argv[0]` = the file name).
+  The CLI forwards its post-`--` arguments (`temen-run prog.temen -- a b c`; `argv[0]` = the file name).
   When *no* `-- args` are given it seeds **nothing** (`init_mem` stays `None`, byte-identical to a
   bare run) — both to avoid perturbing the guest's initial state and because the blob is unused by a
   `main(void)`; a program wanting `argc>=1` must be invoked with `--`. The environment is always empty
@@ -863,7 +863,7 @@ environment (`{argc, envc}` then the `argc` argv strings followed by the `envc` 
   above `argv[]`, and calls `main(main_sp, argc, argv, envp)` with the frame a page above *both*
   arrays. A 2-param `main` is still fail-closed. Test: `main_argc_argv_envp` (empty + multi-entry env,
   passed key-sorted to match `std::process::Command`'s `BTreeMap` ordering).
-- **`getenv(name)`**: a synthesized `__svm_getenv` helper (gated on `calls_external("getenv")`, which
+- **`getenv(name)`**: a synthesized `__temen_getenv` helper (gated on `calls_external("getenv")`, which
   also forces a powerbox `_start` since it has no import of its own). It reads the blob in the reserved
   low scratch directly — no `environ` global, no `_start` coupling — so it works at any `main` arity
   and returns `NULL` when the host seeded no env (the window reads `argc==envc==0`). It skips the
@@ -905,14 +905,14 @@ transactions, `quote()`/blobs, subqueries/EXISTS, `PRAGMA integrity_check`, and 
 Design points:
 - **Determinism is pinned in a `SQLITE_OS_OTHER=1` VFS** (`demos/sqlite/sqlite_demo.c`): xRandomness
   is a fixed-seed SplitMix64, xCurrentTime/Int64 a fixed instant (2024-01-01Z), xSleep a no-op — so
-  `datetime('now')` and `random()` agree between the native and SVM runs. `:memory:` +
+  `datetime('now')` and `random()` agree between the native and Temen runs. `:memory:` +
   `SQLITE_TEMP_STORE=3` means **no file I/O exists**; xOpen fail-closes (`SQLITE_CANTOPEN`), proving
   no path can even reach for disk. (Phase B replaces exactly this shim with a storage capability.)
 - **Needs SQLite ≥ 3.47**: earlier amalgamations carry `long double` literals in `sqlite3FpDecode`
   (`x86_fp80` in the IR — outside the f64 on-ramp); 3.47+ replaced that path with Dekker
   double-double arithmetic, so the build is f64-clean with no source patching.
-- **The on-ramp needed exactly two additions**: synthesized `__svm_strcspn` (the `strspn` scan with
-  the continue condition inverted) and `__svm_strrchr` (one forward scan, select-tracked last match)
+- **The on-ramp needed exactly two additions**: synthesized `__temen_strcspn` (the `strspn` scan with
+  the continue condition inverted) and `__temen_strrchr` (one forward scan, select-tracked last match)
   — everything else (1448 functions, translate ≈ 2.4 s, full script ≈ 3.4 s on the interpreter) rode
   the existing surface: malloc/realloc/free, mem\*/str\* helpers, the guest printf, sparse switches,
   and the varargs ABI (`sqlite3_str_vappendf`).
@@ -984,7 +984,7 @@ setjmp + File-capability capstone; ladder #7).** The feasibility spike for the *
 program on the ladder — "SQLite Phase B at 100×." Establishes the pipeline and, crucially, turns
 "integrate Postgres" into a **concrete, quantified gap list** (the point of picking a target is
 picking the gap it drives — §"Translator gaps these programs force"). The reproduction lives in
-`crates/svm-run/demos/postgres/` (`build_bitcode.sh` + `emit_bc.py` — fetched-not-vendored, PostgreSQL
+`crates/temen-run/demos/postgres/` (`build_bitcode.sh` + `emit_bc.py` — fetched-not-vendored, PostgreSQL
 license). What the spike established:
 - **Native oracle works.** Postgres **17.5** builds with `clang-18` (minimal config: no
   icu/ssl/zlib/readline/xml/gssapi), and `postgres --single -D <data> -O -j postgres` reads SQL on
@@ -1095,7 +1095,7 @@ that reshape the capstone estimate:
   functions**, and it now translates cleanly past all asm.
 - **The remaining surface is the OS/libc waist, and it is large.** With asm cleared, translation
   fail-closes at the **first undefined external** (`log`). The module has **251 distinct declared-only
-  externals**: **libm** (18 — `log`/`exp`/`pow`/`sin`/`cos`/… — transcendentals the SVM has no op for;
+  externals**: **libm** (18 — `log`/`exp`/`pow`/`sin`/`cos`/… — transcendentals the Temen has no op for;
   need a **bundled guest libm**, the raytrace "bring-your-own-libm" model, llvm-linked in), **file/OS
   syscalls** (~30 — `open`/`pread`/`pwrite`/`fsync`/`stat`/`mkdir`/`opendir`/`mmap`/… → the **`fs`
   capability** shim, gap #6), **proc/time/signal** (~24 — `getpid`/`geteuid`/`clock_gettime`/
@@ -1108,7 +1108,7 @@ that reshape the capstone estimate:
   above is the plan of record; each category is a follow-on slice.
 
 **Slice BQ (DONE) — the bundled guest libm (Postgres external category #4: the 18 transcendentals).**
-The SVM has no transcendental op (only the hardware float ops sqrt/floor/…), so `log`/`exp`/`pow`/
+The Temen has no transcendental op (only the hardware float ops sqrt/floor/…), so `log`/`exp`/`pow`/
 `sin`/`cos`/`tan`/`asin`/`acos`/`atan`/`atan2`/`sinh`/`cosh`/`tanh`/`cbrt`/`log10`/`log2`/`exp2`/`fmod`
 stay **guest code** — the raytrace "bring-your-own-libm" model, but a *real* libm (openlibm) rather than
 poly approximations, `llvm-link`ed into the module. Findings + deliverable:
@@ -1141,11 +1141,11 @@ escape: it is ordinary re-verified IR, §2a). Off by default (a typo'd callee st
 translate-time error for ordinary programs); opt in via `translate_bc_path_with_options` / the
 `--stub-externs` CLI flag for a large-program bring-up.
 - **Design.** Stubs are minted lazily into a shared `RefCell<StubTable>` threaded through the
-  translation (one per distinct name, keyed by name, using the first signature seen — the SVM sig is
+  translation (one per distinct name, keyed by name, using the first signature seen — the Temen sig is
   the threaded data-SP + the call's fixed params, matching the `args=[sp,…]` the site builds) and
   appended to `funcs` **last**, after `_start` + defined + helpers, so each lands at its assigned
   `stub_base + ordinal` index. Reuses the existing `synth_trap_stub`. A later mismatched-signature call
-  to the same name surfaces as a clean `svm-verify` type-id error, not an escape.
+  to the same name surfaces as a clean `temen-verify` type-id error, not an escape.
 - **Test** `unresolved_extern_stub_opt_in`: strict default fail-closes on `mystery`; opt-in translates
   + verifies + runs to a **clean exit** with the stub gated off (a dead stub is inert); and a *called*
   stub **traps** (`run_powerbox` errors). **283 translate tests green, fmt + clippy clean.**
@@ -1198,7 +1198,7 @@ threads through block params like any mask. Test `vector_mask_bitwise_any_match`
 (a==t2) | (a==t3)` idiom clang `-O2` folds to `or <4 x i1>` + one `sext` — verified present in the
 bitcode) is byte-identical to native. Also repairs a **pre-existing `main` break**: the upstream
 `TranslateOptions { stack_page }` addition left one test's struct literal un-reconciled (missing the
-field), so the svm-llvm lane didn't compile — fixed with `..Default::default()`. **287 translate tests
+field), so the temen-llvm lane didn't compile — fixed with `..Default::default()`. **287 translate tests
 green, fmt + clippy clean.** Effect: the Postgres module now translates past the mask type; the next
 gap is an unrelated SSA-liveness corner (`value … not available in block`) in a later function.
 
@@ -1265,7 +1265,7 @@ byte-for-byte the same, only the call instruction differs:
 - **The marshaling `fixed` match** dropped its `callee_name(c).is_some()` guard, so the variadic args
   are stored to scratch (not pushed as IR args) and the area pointer is deposited at `callee_sp + 0`,
   for an indirect callee too.
-- **`indirect_sig`** stopped rejecting `is_var_arg`: a `(...)` callee's SVM signature is
+- **`indirect_sig`** stopped rejecting `is_var_arg`: a `(...)` callee's Temen signature is
   `(sp, fixed-params…)` — `param_types` are exactly the fixed params — which is the *same* shape a
   defined `(...)` function lowers to (§varargs), so the `call_indirect` §3c type-id check matches.
 - Found as the Postgres `manifest_process_version` gap. Test `varargs_indirect_call`: a `(...)` helper
@@ -1304,14 +1304,14 @@ which is a *separate* wide-vector-type gap) whose inputs `0x0N000000` byte-swap 
 
 **★ Milestone:** this was the *last translate gap*. The whole Postgres backend — **832 modules /
 14 985 functions** — now translates through the on-ramp with `--stub-externs`, no fail-closed. The
-remaining step to a *verified* module: after `svm_ir::resolve_imports` binds the 4 powerbox caps
-(`read`/`write`/`exit`/`vm_map` → `cap.call`), `svm-verify` reports one **`TypeMismatch`** (an `i32` fed
+remaining step to a *verified* module: after `temen_ir::resolve_imports` binds the 4 powerbox caps
+(`read`/`write`/`exit`/`vm_map` → `cap.call`), `temen-verify` reports one **`TypeMismatch`** (an `i32` fed
 where `i64` is expected) in `ExecRenameStmt` — a translator correctness bug, the next slice. (Before
 that resolve step a raw `CallImport` is expected and correctly rejected by the verifier §7.) Then the
 **runtime** (initdb data dir + `fs` cap, storage manager, WAL, single-process shmem, catalog bootstrap).
 
 **Slice BY (DONE) — aggregate fan-out in the sparse-`switch` chain; the Postgres module now *verifies*.**
-The single `svm-verify` error across all 14 985 functions, in `ExecRenameStmt`. Root cause: three places
+The single `temen-verify` error across all 14 985 functions, in `ExecRenameStmt`. Root cause: three places
 expand a threaded block param — `block_params` (the param vids), `branch_args` (the args), and
 `block_param_types` (the param *types* a synthetic compare-chain block gets in `lower_sparse_switch`) —
 and the first two fan out **both** wide vectors *and* aggregates (a flat struct / i128 `(lo,hi)` /
@@ -1321,19 +1321,19 @@ and the first two fan out **both** wide vectors *and* aggregates (a flat struct 
 `zip` that types the chain block desynced right after the struct and mistyped every threaded value behind
 it → a `TypeMismatch`. One-branch fix: `block_param_types` now fans aggregates out too
 (`types.extend_from_slice(ftys)`), matching the other two. Found by driving translate → `resolve_imports`
-→ `svm-verify` and bisecting the failing edge with the verifier's own `func_value_types`. Test
+→ `temen-verify` and bisecting the failing edge with the verifier's own `func_value_types`. Test
 `switch_sparse_threads_aggregate` (hand `.ll` — clang's SROA scalarizes a struct before it can be
-threaded, so C can't isolate it — verifies + runs; the same `.ll` fails `svm-verify` with a `TypeMismatch`
+threaded, so C can't isolate it — verifies + runs; the same `.ll` fails `temen-verify` with a `TypeMismatch`
 before the fix). **294 translate tests green, fmt + clippy clean.**
 
 **★★ Milestone:** the whole Postgres backend — **832 modules / 14 985 functions** — now **translates
-*and* verifies**: after `resolve_imports` binds the 4 powerbox caps, `svm-verify` passes clean. What
+*and* verifies**: after `resolve_imports` binds the 4 powerbox caps, `temen-verify` passes clean. What
 remains is purely the **runtime** — `initdb` (natively) exposed via the `fs` cap; storage manager, WAL,
 single-process shmem, catalog bootstrap; real impls for the ~50 externals the query path calls.
 
 **Slice BZ (DONE) — the `fs` capability's metadata + directory surface; the runtime begins.** The
 translate/verify frontier is closed, so the work turns to *running* the module — and the first blocker is
-that the `fs` cap (`crates/svm-run/src/fs.rs`) could open/read/write/seek **files** but had no way to
+that the `fs` cap (`crates/temen-run/src/fs.rs`) could open/read/write/seek **files** but had no way to
 **walk a tree**: no `stat`, `mkdir`, `rmdir`, `opendir`/`readdir`. A natively-`initdb`'d cluster is a deep
 directory tree (`base/<db>/…`, `global/…`, `pg_wal/…`), and Postgres `stat`s and scans it pervasively at
 startup before it can open a single relation. Added ops 14–19: `stat` fills a fixed 72-byte little-endian
@@ -1345,7 +1345,7 @@ directories over its flat name table (a path is a directory if it was `mkdir`'d 
 file key), `host_fs` walks the real tree — so a differential runs identically on either. Tests
 `os_metadata_ops_parity_mem_vs_host` (the same scripted walk returns the same rc sequence + type bits +
 size on both backends) and `readdir_is_sorted_and_bounded` (sorted iteration; a too-small buffer fails
-closed without consuming the entry). **svm-run suite green, fmt + clippy clean.** Next (gap #11b): a guest
+closed without consuming the entry). **temen-run suite green, fmt + clippy clean.** Next (gap #11b): a guest
 OS-shim binding the file syscalls + proc/time to this cap, then the ~180 remaining pure-libc externs
 (stdio `FILE*`, locale, ctype, `strtod`/`snprintf`) byte-exact vs the native oracle.
 
@@ -1354,7 +1354,7 @@ OS-shim binding the file syscalls + proc/time to this cap, then the ~180 remaini
 `xlog.c` — `open`/`read`/`pread`/`write`/`pwrite`/`lseek`/`stat`/`fstat`/`lstat`/`access`/`unlink`/
 `rename`/`mkdir`/`rmdir`/`ftruncate`/`fsync`/`opendir`/`readdir`/`closedir`/`chdir`/`getcwd` — and in the
 whole-program bitcode every one is an undefined external (the guest links no libc). `os_shim.c`
-(`crates/svm-run/demos/postgres/`) **defines** them for a guest build, bridging each to
+(`crates/temen-run/demos/postgres/`) **defines** them for a guest build, bridging each to
 `__vm_cap_resolve("fs")` + `__vm_host_call` (the slice-BZ cap), mapping the C `open` flag bits to the
 cap's `FS_O_*`, and filling glibc's `struct stat`/`struct dirent` **by field** (the shim is compiled with
 the same headers as the caller, so offsets agree) from the 72-byte `StatBuf` the `FS_STAT` op returns.
@@ -1363,12 +1363,12 @@ back `DT_UNKNOWN` so callers `stat` for the type; `chdir`/`getcwd` treat the roo
 directory. Differential `demo_pg_oscap_vs_native`: `os_probe.c` drives a deterministic file+dir sequence
 (create/write/`stat`/`pread`/sorted dotfile-filtered `readdir`/`rename`/`rmdir`/`ftruncate`) and the guest
 byte-matches the native glibc oracle over **both** `mem_fs` and `host_fs` — and the `host_fs` root is
-empty afterward (the probe self-cleans), proving real files through real syscalls. **svm-llvm lane green
+empty afterward (the probe self-cleans), proving real files through real syscalls. **temen-llvm lane green
 (fmt + clippy `-D warnings` + the new test).** Next (gap #11c): proc/time/signal stubs, then the ~180
 pure-libc externs byte-exact vs native, then storage manager / WAL / shmem / catalog bootstrap.
 
 **Slice CB (DONE) — the guest pure-libc shim begins with ctype.** Companion to `os_shim.c` (syscalls):
-`libc_shim.c` (`crates/svm-run/demos/postgres/`) holds the *pure* libc surface — no capability, just
+`libc_shim.c` (`crates/temen-run/demos/postgres/`) holds the *pure* libc surface — no capability, just
 deterministic computation. First inhabitant: **ctype**. glibc's `<ctype.h>` `isalpha`/`isdigit`/… macros
 expand to `(*__ctype_b_loc())[c] & _ISbit`, a direct index into a locale table reached through
 `__ctype_b_loc`/`__ctype_tolower_loc`/`__ctype_toupper_loc` — undefined externals in the guest, and
@@ -1381,7 +1381,7 @@ literals removed the failure mode). Differential `demo_pg_ctype_vs_native`: `cty
 twelve classifications + `tolower`/`toupper` (read straight from the `*_loc` tables, the form Postgres
 uses — not the `tolower()` *function*, whose non-constant-`int` path is a separate surface) for every
 byte 0..255, and the guest byte-matches the native glibc oracle over the whole range — which pins every
-bit of every table. Pure computation, runs on the bare powerbox. **svm-llvm lane green.** Next (gap
+bit of every table. Pure computation, runs on the bare powerbox. **temen-llvm lane green.** Next (gap
 #11d): proc/time/signal stubs, then the rest of the pure-libc surface (stdio `FILE*`, locale,
 `strtod`/`snprintf`) byte-exact vs native, then storage manager / WAL / shmem / catalog bootstrap.
 
@@ -1402,7 +1402,7 @@ the one `errno` cell all shims write (glibc's `errno` is `*__errno_location()`),
 all-shims-in-one-TU Postgres build has a single definition. Tests: `demo_pg_string_vs_native` (byte-exact
 vs glibc over signs/bases/prefixes/endptr/ERANGE, bounded copies, tokenizing — `(int)`-printed so the
 64-bit results and their truncation agree even on the clamped cases) and `demo_pg_procstub` (the guest's
-fixed stub report). **svm-llvm lane green (fmt + clippy `-D warnings` + both tests).** The differential
+fixed stub report). **temen-llvm lane green (fmt + clippy `-D warnings` + both tests).** The differential
 earned its keep again — a missing `__errno_location` (only `os_shim.c` had defined it) trapped the string
 guest at runtime until the shared `errno` header. Next (gap #11e): stdio `FILE*`, `strftime`, the `scanf`
 family byte-exact vs native, then storage manager / WAL / shmem / catalog bootstrap.
@@ -1423,7 +1423,7 @@ format engine (the common `%Y %m %d %e %H %I %M %S %j %w %u %p %a %A %b %B %C` c
 wide-char** — `libc_shim.c` gains the C-locale byte↔wchar identity `mbstowcs`/`wcstombs`. Differentials:
 `demo_pg_stdio_vs_native` (write→reopen→`fgets`/`fgetc`/`ungetc`/`fread`/`fseek`/`ftell`/`feof`, byte-exact
 over **both** `mem_fs` and `host_fs`) and `demo_pg_time_vs_native` (five epochs incl. two leap days,
-TZ-independent conversions, + a wide-char round-trip; pure, on the bare powerbox). **svm-llvm lane green
+TZ-independent conversions, + a wide-char round-trip; pure, on the bare powerbox). **temen-llvm lane green
 (fmt + clippy `-D warnings` + both tests).** Next (gap #11f): the stream `FILE*` (`stdout`/`stderr` via an
 on-ramp fd-dispatch) and the varargs `fprintf`/`scanf` engines, then storage manager / WAL / shmem /
 catalog bootstrap.
@@ -1445,7 +1445,7 @@ fds from 0, overlapping the stream fds, so a file could land on fd 1 and its wri
 `alloc_fd` now **reserves 0/1/2** and files start at 3, making the two fd namespaces disjoint (a small
 `fs.rs` change, transparent to SQLite/LMDB which treat the fd opaquely). Test `demo_pg_stream_vs_native`:
 `stream_probe.c` writes to `stdout` (FILE*) *and* a real file and the guest byte-matches native glibc over
-`mem_fs` + `host_fs`. **All 301 translate tests green + svm-run suite + clippy/fmt on both crates** — the
+`mem_fs` + `host_fs`. **All 301 translate tests green + temen-run suite + clippy/fmt on both crates** — the
 on-ramp change is regression-free. Next (gap #11g): the varargs `fprintf`/`scanf` engines, then the
 storage/WAL/shmem/catalog subsystems, then the first real **boot** (relink the shims into the Postgres
 bitcode and drive `postgres --single` to its first live trap).
@@ -1465,7 +1465,7 @@ libc surface the boot needs: **`environ`**; the C-locale stubs **`setlocale`** (
 `demo_pg_wctype_vs_native` over every byte 0..255, the `iswX_l` variants forwarding to it); **`getopt`**
 (+ its `optarg`/`optind`/… globals); and **`strsignal`**. The differential-clean parts (wctype) are
 CI-tested; the rest are boot-support stubs validated by the boot advancing (the boot itself isn't a CI
-test — it needs the cached, fetched Postgres bitcode). **svm-llvm lane green (fmt + clippy `-D warnings`;
+test — it needs the cached, fetched Postgres bitcode). **temen-llvm lane green (fmt + clippy `-D warnings`;
 8 `demo_pg_*` tests).** Next (gap #11h): a **trap-identifying** diagnostic (self-naming stubs or
 partial-output-on-trap — the `Unreachable`/`MemoryFault` traps carry no name today, which makes the
 remaining chase slow) so each stub-trap is legible, then the storage manager / WAL / single-process
@@ -1481,10 +1481,10 @@ program has usually already said what's wrong (a progress line, an `ereport`, an
 legible. **First payoff, immediately:** re-running the boot, the trap error now reads
 `LOG:  could not find a "postgres" to execute` — Postgres's `find_my_exec` failing to resolve its own
 binary path (`readlink("/proc/self/exe")` / argv[0]), the concrete gap #11i starts from. A small,
-non-breaking `svm-run` change (the trap still returns `Err`, just an informative one — no `Outcome`
+non-breaking `temen-run` change (the trap still returns `Err`, just an informative one — no `Outcome`
 variant churn, no caller changes). Test `trap_error_surfaces_guest_output`: a guest writes a marker then
 calls an undefined extern (a `--stub-externs` `unreachable` stub), and the trap error must carry the
-marker. **svm-run + svm-llvm suites green, fmt + clippy `-D warnings` on both.** Next (gap #11i): resolve
+marker. **temen-run + temen-llvm suites green, fmt + clippy `-D warnings` on both.** Next (gap #11i): resolve
 `find_my_exec`, then drive the now-legible boot forward — storage manager / WAL / single-process shmem /
 catalog bootstrap, plus the varargs `fprintf`/`scanf` engines.
 
@@ -1507,7 +1507,7 @@ lower. **Guest code, no translator change** (the CA–CG shim model):
   `%d`/`%u`/`%x`/`%c`/`%s`/`%f`/`%e`/`%g` + width/precision/flags to **three targets** — `stdout`, a real
   **file** (fs cap, read back and echoed), and `stderr` — byte-identical to the native glibc oracle (which
   folds `stderr` into `stdout` unbuffered to match the guest's single write-through Stream) on **all three
-  engines**, over `mem_fs` and `host_fs`. **svm-llvm lane green (9 `demo_pg_*` tests, fmt + clippy
+  engines**, over `mem_fs` and `host_fs`. **temen-llvm lane green (9 `demo_pg_*` tests, fmt + clippy
   `-D warnings`).** Next (the format tail): the `fscanf`/`sscanf`/`vsscanf` **input** engine (gap #11i's
   remaining half), then the boot's storage manager / WAL / single-process shmem / catalog bootstrap.
 
@@ -1531,7 +1531,7 @@ no observable output, so they're exercised by the boot rather than a differentia
 guest output before it), which the CG diagnostic can't name because nothing was printed — so gap #11k is
 **self-naming stub-traps** (make the `--stub-externs` trap carry the missing extern's name) to make the
 remaining silent traps legible, then forward through the storage manager / WAL / catalog bootstrap.
-**svm-llvm lane green (fmt + clippy `-D warnings`; 9 `demo_pg_*` tests).**
+**temen-llvm lane green (fmt + clippy `-D warnings`; 9 `demo_pg_*` tests).**
 
 **Slice CJ (DONE) — the varargs `scanf` engine + a real `strtod` (gap #11l).** The *input* twin of CH:
 the runtime `sscanf`/`vsscanf`/`fscanf`/`vfscanf`/`scanf`/`vscanf` family Postgres parses config values,
@@ -1555,7 +1555,7 @@ no translator change:**
 - **Differential** `demo_pg_sscanf_vs_native` (`sscanf_probe.c`): the conversions **and** the return-count
   semantics (a scanf differential must check the count, not just the values — partial-match/EOF cases
   included), plus an `fscanf`-from-`stdin` half, byte-identical to native glibc on **all three engines**.
-  **svm-llvm lane green (10 `demo_pg_*` tests, fmt + clippy `-D warnings`).** Next: the boot's storage
+  **temen-llvm lane green (10 `demo_pg_*` tests, fmt + clippy `-D warnings`).** Next: the boot's storage
   manager / WAL / single-process shmem / catalog bootstrap (the `llvm-postgres` thread, past slice CI).
 
 **Slice CK (DONE) — self-naming stub-traps: the silent trap names itself (gap #11k).** The boot's early-init
@@ -1564,11 +1564,11 @@ the chase was back to guessing which of ~96 stubbed externs the live path hit. T
 the trap names itself, **without touching the confinement path**: under `--stub-externs` the on-ramp now
 records each stub's `(func idx → missing-extern name)` in the §6 **function-name table**
 (`DebugInfo.func_names` — strippable, verifier-ignored, §2a), so the interpreter's trap-time backtrace
-resolves its innermost frame (via `svm_interp::func_name`) to the extern's name. The stub body is
+resolves its innermost frame (via `temen_interp::func_name`) to the extern's name. The stub body is
 *unchanged* — a pure `Unreachable`, never a capability call — so nothing in the sensitive lowering moves.
 Test `stub_trap_names_the_extern`: a guest calls an undefined `frobnicate_widget` under `--stub-externs`, a
 traced run traps `Unreachable`, and the innermost backtrace frame must resolve to `frobnicate_widget`.
-**svm-llvm lane green.** This turned the boot chase into a tight run → read the named frame → close the gap
+**temen-llvm lane green.** This turned the boot chase into a tight run → read the named frame → close the gap
 → repeat loop, which drove slice CL.
 
 **Slice CL (DONE) — drive the named boot to real logging (a bundle).** With every trap self-naming (CK),
@@ -1591,7 +1591,7 @@ processing**, emitting fully-formatted, timestamped Postgres log lines (`… GMT
 configuration file "postgresql.conf" contains errors`) — no trap, a clean `Exited(1)`. It stops on a
 legible, *real* Postgres error: it can't read its **timezone data directory** (`…/share/postgresql/timezone`,
 an absolute path outside the fs-cap root → the cap correctly denies it). That's a capability/data-provisioning
-question (gap #11m), not a shim gap. **svm-llvm lane green (fmt + clippy `-D warnings`; the on-ramp changes
+question (gap #11m), not a shim gap. **temen-llvm lane green (fmt + clippy `-D warnings`; the on-ramp changes
 CI-tested — `stub_trap_names_the_extern`, `sigsetjmp_recognized`; the boot-support shims validated by the
 boot advancing; the boot itself isn't a CI test — it needs the fetched Postgres bitcode).**
 
@@ -1626,7 +1626,7 @@ bytecode engine — carried the boot all the way through real database startup t
 progress` / `redo starts at 0/147A9F0` / `redo done` / `checkpoint starting: end-of-recovery`. It stops in
 the end-of-recovery checkpoint (`CheckPointGuts → ProcessSyncRequests`) on a **`fn0` funcref** — a
 hashtable function pointer resolving to index 0 (a real on-ramp funcref bug, not a shim gap — gap #11o,
-its own slice). **svm-llvm lane green (fmt + clippy `-D warnings`; 12 `demo_pg_*` incl. the new
+its own slice). **temen-llvm lane green (fmt + clippy `-D warnings`; 12 `demo_pg_*` incl. the new
 `demo_pg_sem_vs_native`).** The boot reaches recovery in ~74 s on the bytecode engine — *boot speed* (a
 cold 15k-function boot) is now the gating concern for a browser demo, pointing at snapshot/restore of the
 post-boot state rather than cold-booting each time.
@@ -1652,8 +1652,8 @@ backend>  1: ?column? = "2"  (typeid = 23, len = 4, typmod = -1, byval = t)
 ```
 
 That is ladder-#7 (`DESIGN.md` §"Suggested ladder") delivered: the full PostgreSQL 17.5 backend — 832
-modules / ~14 985 functions — **translates, verifies, and runs a real query** on the SVM bytecode engine
-under the `fs` + powerbox capabilities, no ambient authority. **svm-llvm lane green (fmt + clippy
+modules / ~14 985 functions — **translates, verifies, and runs a real query** on the Temen bytecode engine
+under the `fs` + powerbox capabilities, no ambient authority. **temen-llvm lane green (fmt + clippy
 `-D warnings`; 13 `demo_pg_*` incl. the new `demo_pg_funcptr_vs_native`).** Next: *boot speed* — a cold
 boot is ~100 s on the interpreter, so a browser demo wants **snapshot/restore** of the post-recovery state
 (the §durability machinery) rather than a cold boot each time; and widening the SQL surface past the
@@ -1676,20 +1676,20 @@ step**. The capstone's `SELECT 1+1` simply never reached a transcendental. **Fix
 on-ramp float ops); the hand-written `pow` shim (`math_shim.c`) is retired in favor of openlibm's bit-exact
 `e_pow`. With it the whole round-trip runs clean (`Exited(0)`): `SELECT *`, `count`/`sum`/`avg` (numeric),
 **`ORDER BY … DESC`**, `UPDATE … WHERE`, `DELETE … WHERE`, and `GROUP BY … ORDER BY` all return correct
-rows. openlibm is fetched-not-vendored (BSD); `link_shims.sh` takes a pre-staged tree (`SVM_OPENLIBM_DIR` /
-`/tmp/openlibm`) when github egress is blocked. **svm-llvm lane green (fmt + clippy `-D warnings`; 13
+rows. openlibm is fetched-not-vendored (BSD); `link_shims.sh` takes a pre-staged tree (`TEMEN_OPENLIBM_DIR` /
+`/tmp/openlibm`) when github egress is blocked. **temen-llvm lane green (fmt + clippy `-D warnings`; 13
 `demo_pg_*`).** Next: still *boot speed* (snapshot/restore), and wider SQL (joins, indexes, subqueries).
 
 **Follow-on (landed) — Postgres in the browser: a persistent session that survives page reloads; boot
 speed measured (`BOOTSPEED.md`).** The "eventual browser demo" is real. The playground boots the whole
-backend **in wasm** (`browser/build-pg-assets.mjs`; the one-shot `svm_run_pg`) and now runs it as a
+backend **in wasm** (`browser/build-pg-assets.mjs`; the one-shot `temen_run_pg`) and now runs it as a
 **live interactive session** — the first Run boots to `backend>`, every Run after feeds the editor's
 SQL to the *same* backend (~30–120 ms vs the ~9–13 s in-browser boot) and state persists across
 queries, psql-style. The enabler was a **blocking-stdin park** in the interpreter
-(`Host::set_stdin_blocking` → `Outcome::StdinPark`/`VcpuEvent::StdinPark`, `svm-interp`; session
-exports `svm_pg_open`/`svm_pg_query`/`svm_pg_close`, `browser/src/lib.rs` + `browser/web/play.js`).
-The session also **survives page reloads**: the live data dir serializes out through `svm-fs`'s shared
-in-memory mount (`mem_fs_seeded_shared` + `MemFsHandle::image` → the `svm_pg_snapshot` export →
+(`Host::set_stdin_blocking` → `Outcome::StdinPark`/`VcpuEvent::StdinPark`, `temen-interp`; session
+exports `temen_pg_open`/`temen_pg_query`/`temen_pg_close`, `browser/src/lib.rs` + `browser/web/play.js`).
+The session also **survives page reloads**: the live data dir serializes out through `temen-fs`'s shared
+in-memory mount (`mem_fs_seeded_shared` + `MemFsHandle::image` → the `temen_pg_snapshot` export →
 IndexedDB), and a reboot from the saved image runs Postgres's own crash recovery over it — proven
 native (`browser/tests/pg_snapshot_roundtrip.rs`) and through the shipping wasm artifact
 (`browser/pg_snapshot_test.mjs`). And *boot speed* got a measured decomposition, **`BOOTSPEED.md`**:
@@ -1698,31 +1698,31 @@ cleanly-shut-down data image, cold start is ~2.6 s native / ~6–8 s in-browser 
 no snapshot/restore machinery required (freeze/thaw stays an optional lever). The open Postgres item
 is **wider SQL** (joins, indexes, subqueries).
 
-**Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
+**Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__temen_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
-`realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
-the old size from `p-16`, and `__svm_memcpy`s `min(old, n)` bytes (no overlap — the fresh block sits
+`realloc`. **`__temen_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
+the old size from `p-16`, and `__temen_memcpy`s `min(old, n)` bytes (no overlap — the fresh block sits
 above the old). `printf` gains signed `%d`/`%i`: the sign is computed (`-`), the magnitude formatted
-via `__svm_utoa`, the `-` written just below the digits and included only when negative; plain and
+via `__temen_utoa`, the `-` written just below the digits and included only when negative; plain and
 space-padded fields supported (zero-padded `%d` stays fail-closed — sign+pad ordering). Tests:
 `demo_sortvec_vs_native`, `printf_signed_formats`, `realloc_grow_preserves`. (heapgrow/calloc still
 pass — the data region stays freshly-`vm_map`-zeroed below the bump.)
 
 **Slice Y (DONE) — 128-bit SIMD (`<4 x float>` → native `v128`); lands `mat4`.** A 4-lane 32-bit
-vector maps to SVM's §17 `v128` (vs the 2-lane → packed-`i64`, since `<4 x …>` is 16 bytes): `load`/
+vector maps to Temen's §17 `v128` (vs the 2-lane → packed-`i64`, since `<4 x …>` is 16 bytes): `load`/
 `store` → `v128.load`/`store`; `fadd`/`fsub`/`fmul`/`fdiv` → `f32x4` `VFloatBin`; `extractelement`/
 `insertelement` → extract/replace lane; `shufflevector` → an `i8x16.shuffle` byte mask (an all-equal
 mask is a splat/broadcast); `<4 x …>` constants → `ConstV128`; `llvm.fmuladd.v4f32` → `f32x4` mul+add
 (unfused). The `<4 x i32>` shuffle masks are read as constants, not values. Tests:
 `demo_mat4_vs_native`, `vec4_float_scale` (a `<4 x float>` by-value arg/return + splat-mul).
 
-**Slice Z (DONE) — `llvm.bswap` (lands `crc32`).** No SVM byte-swap op, so it is synthesized inline:
+**Slice Z (DONE) — `llvm.bswap` (lands `crc32`).** No Temen byte-swap op, so it is synthesized inline:
 each source byte `i` is moved to destination byte `nbytes-1-i` via `((v >> 8*i) & 0xff) << 8*(nbytes-1-i)`,
 OR-accumulated (`i16`/`i32`/`i64`; `emit_bswap`). Tests: `demo_crc32_vs_native` (CRC-32 + a
 `__builtin_bswap32` big-endian reader, with stdin) and `bswap_intrinsic` (bswap32/64 vs native).
 
 **Slice AA (DONE) — overlap-safe `memmove` (lands `lineedit`).** A variable-length (or
-oversized-constant) `llvm.memmove` now calls the synthesized **`__svm_memmove(dst, src, len)`** — an
+oversized-constant) `llvm.memmove` now calls the synthesized **`__temen_memmove(dst, src, len)`** — an
 8-block, direction-aware counted byte copy: when `dst <=u src` it copies **forward** (`i = 0…len`),
 otherwise **backward** (`i = len…0`), so overlapping shifts are correct in either direction (the one
 thing `memcpy`'s load-all-then-store inline path can't do for runtime lengths). The helper is
@@ -1731,11 +1731,11 @@ inlines (already overlap-safe). Tests: `demo_lineedit_vs_native` (right+left ove
 stdin) and `memmove_overlap_runtime` (both directions over an 8-byte window vs native).
 
 **Slice AB (DONE) — transcendental libm, bundled as guest code (lands `raytrace`).** No new lowering:
-math beyond the SVM float ops (`sin`/`cos`/`exp`/`pow`/…) is supplied *by the program* as ordinary
+math beyond the Temen float ops (`sin`/`cos`/`exp`/`pow`/…) is supplied *by the program* as ordinary
 guest C (polynomial approximations), exactly as the corpus demos bundle their own `memset`. This is
 deliberate — it keeps math **in the sandbox** (no host math capability), and it is what makes the
 differential clean: native `cc` compiles the *same* guest `libm`, so every value is bit-identical.
-The only machine float ops in play already match across backends — `sqrt`/`floor` lower to SVM ops
+The only machine float ops in play already match across backends — `sqrt`/`floor` lower to Temen ops
 (slices F/L; IEEE-exact, matching native libm), `fmuladd` is unfused on both sides, and `+−*∕` are
 plain IEEE. The `raytrace` demo (one unit sphere, `sqrt` ray-sphere intersection, diffuse +
 `g_sin` surface bands + `g_exp` rim falloff, rendered to a char ramp) comes out byte-identical to
@@ -1743,12 +1743,12 @@ native. A note on the harness: native links now pass `-lm` so libm-calling demos
 become real calls at the native build's `-O0`); harmless for the rest. Tests: `demo_raytrace_vs_native`
 and `guest_libm_transcendental` (a guest `exp` + the `sqrt` op over a damped wave's RMS).
 - *Deferred:* a transcendental as an **external** libm call (e.g. linking the system `sin`) stays
-  `Unsupported` — there is no host math capability and no SVM op for it; the program must bring its
+  `Unsupported` — there is no host math capability and no Temen op for it; the program must bring its
   own (this slice). Adding a *bundled* guest `libm` header the on-ramp injects automatically (so
   unmodified code that calls `sin` links against guest poly code) is the natural follow-up.
 
-**Slice AC (DONE) — the `<svm.h>` capability/concurrency/GC builtins (P0+P1+Memory).** The
-low-level SVM surface the chibicc frontend exposes through `<svm.h>` (`frontend/chibicc/codegen_ir.c`,
+**Slice AC (DONE) — the `<temen.h>` capability/concurrency/GC builtins (P0+P1+Memory).** The
+low-level Temen surface the chibicc frontend exposes through `<temen.h>` (`frontend/chibicc/codegen_ir.c`,
 the oracle) now lowers on the LLVM on-ramp too, so a guest *language* emitting LLVM bitcode (e.g. a
 JACL runtime) reaches the VM's fibers, threads, atomics, futex, conservative GC roots, direct window
 memory management, and capability reflection — **no host math/scheduler capability, just the existing
@@ -1805,7 +1805,7 @@ runtime built on LLVM bitcode drives many concurrent blocking I/Os from one park
   workload needs them — the reserved AddressSpace(4) slot is ready.
 
 **Slice AE (DONE) — guest-driven JIT (§22).** The `Jit` capability now lowers on the on-ramp, so a
-guest that emits serialized SVM IR at runtime (a language runtime accelerating its own bytecode)
+guest that emits serialized Temen IR at runtime (a language runtime accelerating its own bytecode)
 reaches it from LLVM bitcode: `__vm_jit_compile`/`invoke2`/`release`/`install`/`uninstall`/
 `compile_linked` → `CallImport` on the stashed `Jit` handle (slot 7; imports `vm_jit_*` → `Jit` ops
 0/1/2/3/4/5). A JIT-using program is granted the **full 8-handle powerbox** (`Jit` is the last
@@ -1817,9 +1817,9 @@ its validator + call_indirect table). The host verifies + Cranelift-compiles the
   through Lane C on the JIT powerbox — the guest emits IR byte-by-byte, `compile`s + `invoke2`s a raw
   unit **and** an `install`ed unit reached via a C function pointer (`call_indirect`), agreeing with
   its own bytecode interpreter on a 49-input grid. The validator's memory-match is exact, so the test
-  probes svm-llvm's parent `size_log2` and patches the demo's blob descriptor to it (no magic
+  probes temen-llvm's parent `size_log2` and patches the demo's blob descriptor to it (no magic
   constant). 88 translate tests green, fmt + clippy clean.
-**Slice AF (DONE) — SharedRegion (§13/§14); completes the `<svm.h>` surface.** Guest-minted shareable
+**Slice AF (DONE) — SharedRegion (§13/§14); completes the `<temen.h>` surface.** Guest-minted shareable
 memory now lowers on the on-ramp: `__vm_region_create(len)` mints a region from the stashed
 `AddressSpace` handle (slot 4; import `vm_region_create` → `AddressSpace` op 5) and returns a **region
 handle**; `__vm_region_map`/`unmap`/`page_size` then `cap.call` *that* region handle (their first C
@@ -1831,7 +1831,7 @@ AddressSpace). This is the magic-ring-buffer / zero-copy parent↔child data pla
   (then `unmap`s), on the real JIT powerbox (true shared-memory aliasing via the host region factory);
   the `'Y'` success marker is checked against stdout. 89 translate tests green, fmt + clippy clean.
 
-The `<svm.h>` capability/concurrency/GC/JIT/region surface is now **complete** — the LLVM on-ramp has
+The `<temen.h>` capability/concurrency/GC/JIT/region surface is now **complete** — the LLVM on-ramp has
 full capability parity with the chibicc frontend. The next frontier is the D54 **breadth proof**
 (Milestone 2): the on-ramp consumes *any* LLVM frontend's bitcode, so other languages run with no
 translator change beyond what the C corpus proved.
@@ -1957,7 +1957,7 @@ breadth-proof capstone: not a unit test of a feature, but a recognizable program
 
 **Slice AP (DONE) — lane-wise vector integer conversions (`zext`/`sext`/`trunc`).** With the vector
 legalization landed (I2 / PR #56), the first of the four vector-op classes that block re-enabling
-auto-vectorization on the breadth lanes. svm-ir has **no vector-convert op**, so a `<N x iA> → <N x iB>`
+auto-vectorization on the breadth lanes. temen-ir has **no vector-convert op**, so a `<N x iA> → <N x iB>`
 widen/narrow **scalarizes**: explode the source into `N` per-lane scalars, convert each in its `i32`/
 `i64` container via the same `emit_ext`/`emit_trunc` the scalar path uses, then repack into the
 destination representation. The converter (`lower_vec_int_convert` + `vec_explode_int`/`vec_implode_int`/
@@ -1978,7 +1978,7 @@ vectorization is on — confirmed by flipping the lanes (9 fails → 5). Float-l
   all of `perlin`/`crc32`/`clay`/`xxhash`/`async_io`/the conversion demos pass together.
 
 **Slice AQ (DONE) — auto-vectorized vector rotate (`llvm.fshl.v4i32` / `fshr`).** The second vector-op
-class (lands `xxhash` when vectorized). svm-ir's `VShift` takes only a *scalar* shift amount, but the
+class (lands `xxhash` when vectorized). temen-ir's `VShift` takes only a *scalar* shift amount, but the
 auto-vectorizer emits **per-lane-varying constant** amounts (xxHash's `<1,7,12,18>`), so the on-ramp
 scalarizes the **rotate idiom** (`a == b`, the only funnel-shift form clang emits for `(x<<n)|(x>>(w-n))`)
 lane-wise: explode the data + amount lanes (reusing slice AP's `vec_explode_int`), rotate each lane with
@@ -2000,7 +2000,7 @@ byte-reversal (`<7,6,…,0>`) emits. A non-constant mask stays `Unsupported` (fa
   (`check_vectorized_vs_native`), vs native. 127 translate tests green, fmt + clippy clean.
 
 **Slice AS (DONE) — `<N x i1>` boolean-mask machinery (vector `icmp`/`fcmp`/`select`/movemask).** The
-fourth vector-op class (lands `crc32` when vectorized). svm-ir has **no first-class `<N x i1>` type**,
+fourth vector-op class (lands `crc32` when vectorized). temen-ir has **no first-class `<N x i1>` type**,
 so a mask is held **lane-wise** (`mask_lanes`: `N` scalar `0`/`1`s, the `<N x i1>` analog of the `agg`/
 `wide_vals` side-tables) and every producer/consumer is scalarized in a new `lower_mask` pass
 (dispatched after `lower_wide`): vector `icmp`/`fcmp` → `N` scalar `IntCmp`/`FCmp` (narrow lanes
@@ -2064,7 +2064,7 @@ surface from slices AC–AF already lowers them):
   unit concurrently (several `Jit.compile`s in flight, serialized through the per-domain `Mutex<Host>`
   the powerbox engages for a `thread.spawn`ing guest) and check the native code against a C reference.
   Combines the guest pthread shim with the `Jit` capability + the 8-handle powerbox; prints `0`. Like
-  the single-threaded demo it probes svm-llvm's window `size_log2` and patches the blob descriptor.
+  the single-threaded demo it probes temen-llvm's window `size_log2` and patches the blob descriptor.
   Test: `vm_jit_threads_demo`.
 - **157 translate tests green, fmt + clippy clean.** The on-ramp now runs **every demo the chibicc
   frontend does** — the breadth frontier is now *bigger* real-world programs (and other-language
@@ -2152,7 +2152,7 @@ Picking a target is really picking the *gap* it drives to completion. Current st
   (`invoke`/`landingpad`/`resume` + cleanups) reuses this stack-transfer core; the JIT `longjmp` + EH
   unblock Postgres `--single` and throwing C++ respectively.
 - **`%f` / `%g` / `%e` float formatting** — **DONE**: the correctly-rounded exact-decimal (Dragon4,
-  big-integer) formatter family landed (`__svm_dtoa_{fix_big,sci,gen}` over the `big_*` primitives),
+  big-integer) formatter family landed (`__temen_dtoa_{fix_big,sci,gen}` over the `big_*` primitives),
   exact across the whole double range (1e±300, subnormals, nonfinite), plus the float `0`/`#` flags.
   Remaining printf tail: `*` (dynamic width/precision), non-constant formats, `%a`.
 - **`qsort` + comparator function pointers** — the libc callback ABI (an indirect call from synthesized
@@ -2170,7 +2170,7 @@ The first end-to-end Lua producing *real output* (prior Lua tests checked a retu
 `print`, `string.upper`/`rep`/`sub`/`#`, `table.sort`/`concat`/`insert`/`remove`, `math.sqrt`/`pi`/
 `floor`/`max`/`abs`, `ipairs`, `pairs`, `type`, `tostring`. Fixture `tests/fixtures/lua/lua_stdlib.bc`
 (harness + guest-libc shim), test `tests/lua_stdlib.rs`. Translator work it forced: synthesized
-`__svm_strncmp`; `fputs`/`puts` of a **non-literal** string now emit a runtime `__svm_strlen`; the guest
+`__temen_strncmp`; `fputs`/`puts` of a **non-literal** string now emit a runtime `__temen_strlen`; the guest
 shim brings `log10`/`log2`/`tan` (+ fail-closed `acos`/`asin`/`atan2`), `strstr`, and a no-filesystem
 `stdio`.
 
@@ -2197,7 +2197,7 @@ Fixture `tests/fixtures/lua/lua_fmt.bc` (core + base/`string`/`table`/`math` + g
 guest `snprintf`), test `tests/lua_fmt.rs`, asserts the exact **stdout bytes** across
 `%d`/`%x`/`%#x`/`%o`, width/precision/flags (`%5d`/`%-5d`/`%05d`/`%+d`/`%10s`/`%.3s`), `%c`, `%.2f`/
 ``8.3f`/`%+.1f`, `%.3e`/`%g`/`%.10g`, `%q`, and `%%`. (A known edge at the time — `%f` of an extreme
-magnitude could differ by one digit, a 128-bit `dtoa_fix` limit — is gone: `__svm_dtoa_fix_big`
+magnitude could differ by one digit, a 128-bit `dtoa_fix` limit — is gone: `__temen_dtoa_fix_big`
 replaced that path with the exact bignum engine; `printf_float_fixed_bignum` asserts `1e300` exact.) This unblocks running **Lua's own test suite** (self-validating, the roadmap's gold standard) — the
 next Lua slice.
 
@@ -2258,7 +2258,7 @@ differential (`lua_coroutine.bc` / `tests/lua_coroutine.rs`, source `lua_corouti
 all three engines + native: `create`/`resume`/`yield` (multi-value both ways), the
 `suspended`/`running`/`normal`/`dead` status transitions, `running`/`isyieldable`, `wrap`, error
 propagation, **yield across `pcall`/`xpcall`** (the yieldable-pcall / continuation path),
-`coroutine.close` with `<close>` variables, and a producer/consumer pipeline. The `svm-fiber` machinery
+`coroutine.close` with `<close>` variables, and a producer/consumer pipeline. The `temen-fiber` machinery
 (native-stack switching for vCPUs/Workers) is a separate, host-side concern and is deliberately *not*
 involved.
 
@@ -2291,7 +2291,7 @@ importantly, the general mechanism they ride on:
   `__vm_host_call` (`cap.call HOST_FN op handle(a,b,c,d)` — the bridge to an **embedder-registered**
   `HostFn`, the wasm-import analogue). The translator stays pure mechanism: no fs semantics live in
   it, and *any* embedder capability is now reachable from C. No stash/ABI change.
-- **A configurable Fs capability** (`svm_run::fs`, *not* part of the default powerbox): a 7-op
+- **A configurable Fs capability** (`temen_run::fs`, *not* part of the default powerbox): a 7-op
   protocol (open/read/write/seek/close/remove/rename, negative-errno results, window-relative
   buffers) with two interchangeable backends behind it — `mem_fs()` (deterministic in-memory; the
   hermetic test default) and `host_fs(root)` (the **real** filesystem attenuated to a root
@@ -2431,7 +2431,7 @@ for a real implementation, split by whether it needs a *host-libm decision*:
     powerbox test harness, and it is only ever *set* by `strtod` (`ERANGE`) — so it lands where it is
     exercised end to end.
 - **Hard but decision-free:** **`strtod`** (string→double) — **DONE, as guest code** (the keystone for
-  *float* Lua: every decimal float literal hits it). `crates/svm-run/demos/strtod/strtod.c` is a
+  *float* Lua: every decimal float literal hits it). `crates/temen-run/demos/strtod/strtod.c` is a
   correctly-rounded decimal→`f64` parser. Correctly-rounded is *unique*, so it matches glibc bit-for-
   bit — and the method needs **no precomputed power-of-ten table** (nothing to mis-transcribe): parse
   every significant digit into a big integer, form the exact rational `N/Dn`, and take the nearest
@@ -2445,12 +2445,12 @@ for a real implementation, split by whether it needs a *host-libm decision*:
 - **Transcendentals → a guest `libm` (DECIDED — keep math in the sandbox).** `pow`/`exp`/`log`/
   `sin`/… can't be synthesized bit-exact to a *specific* host libm, and a host math capability would
   leak math out of the sandbox — so they ride as **guest code** (the §"transcendentals" preference,
-  the way the raytrace demo bundled `sin`/`exp`). **Started:** `crates/svm-run/demos/libm/libm.c` is a
+  the way the raytrace demo bundled `sin`/`exp`). **Started:** `crates/temen-run/demos/libm/libm.c` is a
   small self-contained guest libm — faithful **fdlibm** transcriptions of `exp`, `log`, and **`pow`**
   (genuinely accurate, not poly approximations), using only IEEE `+−*/`, compares, and union word
   access. A guest definition **shadows** the on-ramp's would-be `pow`/`exp`/`log` trap stubs, so
-  `llvm-link lua_core.bc libm.bc` makes them real. `pow` reuses `sqrt` (→ the SVM `f64.sqrt` op) and
-  `scalbn` (→ `__svm_ldexp`); **`sin`/`cos`** add fdlibm's `__kernel_sin`/`__kernel_cos` + the
+  `llvm-link lua_core.bc libm.bc` makes them real. `pow` reuses `sqrt` (→ the Temen `f64.sqrt` op) and
+  `scalbn` (→ `__temen_ldexp`); **`sin`/`cos`** add fdlibm's `__kernel_sin`/`__kernel_cos` + the
   **medium-path** argument reduction (accurate for `|x| ≤ 2²⁰·π/2 ≈ 1.65e6`, the bound where `n·pio2_1`
   stays an exact product — covering all realistic use; the `npio2_hw` fast-path table is dropped since
   always running the cancellation-correction is equally correct, and the full Payne-Hanek
@@ -2475,7 +2475,7 @@ string reader — this keeps the file-I/O surface (`fopen`/`fread`/`fprintf` fro
 CORE="lapi lcode lctype ldebug ldo ldump lfunc lgc llex lmem lobject lopcodes lparser \
       lstate lstring ltable ltm lundump lvm lzio"          # NOT: the lib*.c, lauxlib, lua.c, luac.c
 for f in $CORE harness; do clang -O2 -emit-llvm -c -Ilua-5.4.7/src $f.c -o $f.bc; done
-llvm-link *.bc -o lua_core.bc                              # one module → svm-llvm-translate
+llvm-link *.bc -o lua_core.bc                              # one module → temen-llvm-translate
 ```
 The full `luaL_*` build pulls in ~39 externals (file I/O dominates); the core-only build above is **21
 externals + 4 defined-varargs functions** — the true first-light surface.
@@ -2508,15 +2508,15 @@ externals + 4 defined-varargs functions** — the true first-light surface.
    libm slices" section above. Decimal only (hex floats / `inf`/`nan` / `errno` are follow-ups).
 4. **Small libc batch** (synthesized byte-loops / recognized intrinsics, like the existing
    `memcmp`/`strlen`). **Done (slice 2):** `strcmp`/`strchr`/`strcoll`(→`strcmp`),
-   `strcpy`/`strspn`/`strpbrk` — synthesized `__svm_*` byte loops (the nested-scan pair for
+   `strcpy`/`strspn`/`strpbrk` — synthesized `__temen_*` byte loops (the nested-scan pair for
    span/break); `abort`→trap (dropped like the Rust panic lang-items — the following `unreachable`
    traps). Tests `libc_strcmp_strchr_strcoll`, `libc_strcpy_strspn_strpbrk`, `libc_abort_translates`
    — all three engines == native, with `volatile`-loaded operands so clang `-O2` keeps the calls.
-   `ldexp`/`scalbn` synthesized as `__svm_ldexp` (the musl `scalbn` two-step-scale algorithm,
+   `ldexp`/`scalbn` synthesized as `__temen_ldexp` (the musl `scalbn` two-step-scale algorithm,
    bit-exact to libc incl. overflow→±inf and gradual underflow) — test `libc_ldexp_bit_exact` folds a
    grid of `x`×`n` (extremes included) into a checksum, identical to native on all three engines.
-   `fmod`/`frexp` synthesized bit-exact (no `frem` op exists): `__svm_fmod` via musl's exact 64-bit
-   long-division remainder loop, `__svm_frexp` the mantissa∈[0.5,1)/exponent split writing `*exp` —
+   `fmod`/`frexp` synthesized bit-exact (no `frem` op exists): `__temen_fmod` via musl's exact 64-bit
+   long-division remainder loop, `__temen_frexp` the mantissa∈[0.5,1)/exponent split writing `*exp` —
    tests `libc_fmod_bit_exact`/`libc_frexp_bit_exact`, all three engines == native.
    **Remaining:** `pow` (a **deliberate** fail-closed trap stub — bit-exact vs native needs the
    host-libm decision, §8; a program bringing its own `pow` shadows the stub), `localeconv` (a static
@@ -2642,21 +2642,21 @@ phases, both worth doing:
   its own section below.) **Sequenced into four slices** (each a self-contained PR):
   1. **Framebuffer output capability + canvas** — **DONE (slice BN).** A §7 by-name `HostFn`
      capability `display`, resolved like `fs`/`io`: `op 0 = present(ptr, w, h)` copies `w*h*4` RGBA
-     bytes out of the guest window. `svm-browser`'s `onramp_exec` captures the last frame into
-     `PbOutcome::framebuffer`; the wasm `svm_run_onramp` export exposes it via `svm_framebuffer_{ptr,
+     bytes out of the guest window. `temen-browser`'s `onramp_exec` captures the last frame into
+     `PbOutcome::framebuffer`; the wasm `temen_run_onramp` export exposes it via `temen_framebuffer_{ptr,
      len,width,height}`; `play.js` blits it to a `<canvas>` with one `putImageData`. First guest:
-     `crates/svm-run/demos/display/gradient.c` (a deterministic 128×128 RGBA gradient). Proven
+     `crates/temen-run/demos/display/gradient.c` (a deterministic 128×128 RGBA gradient). Proven
      byte-exact natively (`browser/tests/display.rs`, full-frame) and end-to-end in real Chromium
-     (`browser-test.mjs` reads the canvas back). The 324 B `gradient.svmb` is committed as a web asset.
+     (`browser-test.mjs` reads the canvas back). The 324 B `gradient.temen` is committed as a web asset.
   2. **Interactive frame loop + input capability** — **DONE (slice BO).** The **reactor** run model:
-     instead of running `main` to completion, the host instantiates once (`svm_onramp_open` runs
+     instead of running `main` to completion, the host instantiates once (`temen_onramp_open` runs
      `_start`) and calls the guest's exported `tick` **once per `requestAnimationFrame`**
-     (`svm_onramp_frame`), with globals/BSS persisting between frames via the 256 KiB `SNAP_CAP`
-     snapshot round-trip — `OnrampReactor` in `browser/src/lib.rs`, the browser twin of `svm-run`'s
+     (`temen_onramp_frame`), with globals/BSS persisting between frames via the 256 KiB `SNAP_CAP`
+     snapshot round-trip — `OnrampReactor` in `browser/src/lib.rs`, the browser twin of `temen-run`'s
      reactor `Session` over `bytecode::compile_and_run_capture_reserved_with_host`. Input rides a new
      by-name `keyboard` `HostFn` cap (`op 0 = poll()` → a packed `(pressed<<16)|keycode` event or
-     `-1`; the doomgeneric `DG_GetKey` shape), fed by `svm_onramp_key` from the page's keydown/keyup.
-     First guest: `crates/svm-run/demos/display/bounce.c` (a box you steer with the arrow keys).
+     `-1`; the doomgeneric `DG_GetKey` shape), fed by `temen_onramp_key` from the page's keydown/keyup.
+     First guest: `crates/temen-run/demos/display/bounce.c` (a box you steer with the arrow keys).
      Verified deterministically (`browser/tests/reactor.rs`, exact per-pixel box positions + input
      response across frames) and end-to-end in real Chromium (`browser-test.mjs`: the box animates and
      the arrow keys steer it). (Slice 2 persisted only the low `SNAP_CAP` window — see slice 3a, which
@@ -2665,23 +2665,23 @@ phases, both worth doing:
      persisted only the low 256 KiB (`SNAP_CAP`) and — decisively — `Mem::seed` clamps writes to the
      `mapped` boundary, so a `vm_map`-grown heap (which lives *above* `mapped`, where Doom's zone
      allocator sits) could **never** be round-tripped back. Fixed with a genuinely persistent instance:
-     **`bytecode::Reactor`** (`crates/svm-interp/src/bytecode.rs`) holds the guest `Mem` **live** across
+     **`bytecode::Reactor`** (`crates/temen-interp/src/bytecode.rs`) holds the guest `Mem` **live** across
      calls — globals, BSS, **and** the grown heap all persist for free because the window is never torn
      down. It calls the private `run` per frame with a cheap fresh `Domain` over the shared compiled
      source (an `Arc` clone); host caps are serviced inline, so I/O guests work. `OnrampReactor` now
-     wraps it (the `snap` round-trip is gone). Proof: `crates/svm-run/demos/display/life.c` — Conway's
+     wraps it (the `snap` round-trip is gone). Proof: `crates/temen-run/demos/display/life.c` — Conway's
      Game of Life with its grid in the **malloc heap above the mapped window**; the glider only advances
      if that heap persists. Deterministic (5 live cells throughout, translating (+1,+1) every 4
-     generations) — asserted in `browser/tests/reactor.rs` + a `svm-interp` unit test
+     generations) — asserted in `browser/tests/reactor.rs` + a `temen-interp` unit test
      (`tests/reactor.rs`, a counter at 293 KiB climbing across calls) + real Chromium (`browser-test.mjs`
      watches the glider advance). This unblocks Doom's memory footprint.
   3b. **doomgeneric translates + boots in the sandbox** — **DONE (slice BR)**;
-     `crates/svm-run/demos/doom/`. The platform layer (`doomgeneric_svm.c`, `DG_*` onto the
+     `crates/temen-run/demos/doom/`. The platform layer (`doomgeneric_temen.c`, `DG_*` onto the
      `display`/`keyboard` caps + a deterministic frame clock), the reactor entry (`main.c`:
      `doomgeneric_Create` once, `tick` = `doomgeneric_Tick`), a **complete libc shim** (`doom_libc.c`
      for string/ctype/stdlib/`sscanf`/stubs + the reused Lua `lua_files_stdio.c` `fs`-FILE layer and
      `lua_fmt_snprintf.c` printf engine), and `fetch.sh`/`build.sh`. Results: all **79** Doom TUs
-     compile clean and `svm-llvm-translate` produces a **797 KB `doom.svmb`** (`main`/`tick` exported)
+     compile clean and `temen-llvm-translate` produces a **797 KB `doom.temen`** (`main`/`tick` exported)
      with **zero unsupported IR constructs** — no SIMD/`i128`/inline-asm/vector-memory walls, and the
      on-ramp already lowers indirect calls through unprototyped `void (...)` (K&R) function pointers
      (an earlier spike using a *stale* translator binary misreported that as a gap). Driven through the
@@ -2694,7 +2694,7 @@ phases, both worth doing:
   3c. **doomgeneric renders — byte-exact frame-hash differential** — **DONE (slice BS)**. `doom_diff.c`
      is a headless platform whose `DG_DrawFrame` prints an FNV hash of each framebuffer; compiled BOTH
      as the guest (through the on-ramp) and native `cc`, it makes the rendered output a comparable
-     frame-hash stream (the §18 oracle, like the SQLite stdout differential). The `svm-run` test
+     frame-hash stream (the §18 oracle, like the SQLite stdout differential). The `temen-run` test
      `doom_diff` runs the guest over an in-memory WAD and asserts its hashes equal native's
      byte-for-byte. Over **200 frames** — the static title *and* the auto-played **demo1 (E1M1)
      gameplay** (64 unique hashes: live BSP/wall/floor/sprite/palette rendering + player movement) —
@@ -2702,8 +2702,8 @@ phases, both worth doing:
      Key fix: `DG_SleepMs` must *advance the virtual clock* (Doom's `TryRunTics` busy-waits on the
      clock; a no-op spins forever — that spin, not real work, was the earlier "20 B instructions to
      boot"). With it, init + 200 frames run in **~24 s on the release bytecode interpreter, no JIT**.
-     (`crates/svm-run/demos/doom/{doom_diff.c,diff.sh}`, `crates/svm-run/tests/doom_diff.rs`.)
-  4. **Doom in the playground** — wire the reactor `.svmb` + `doom1.wad` as browser assets, grant the
+     (`crates/temen-run/demos/doom/{doom_diff.c,diff.sh}`, `crates/temen-run/tests/doom_diff.rs`.)
+  4. **Doom in the playground** — wire the reactor `.temen` + `doom1.wad` as browser assets, grant the
      `fs` cap in the browser `OnrampReactor`, and drive the reactor loop in `play.js` (loop + keyboard
      already there); build/deploy via `pages.yml`. Correctness is already proven byte-exact (3c); this
      is the visible payoff (the wasm-JIT tier may be wanted for a smooth frame rate).
@@ -2722,7 +2722,7 @@ phases, both worth doing:
    operand-position). Robust for real interpreters.
 3. **`setjmp`/`longjmp`** — DONE on the interpreter (slice AX); JIT `longjmp` (native-stack switch) +
    **EH** on top (reuses the stack-transfer core) next.
-4. **`%f` / `%g` float formatting** (Dragon4 bignum) — **DONE** (the `__svm_dtoa_*` family + the
+4. **`%f` / `%g` float formatting** (Dragon4 bignum) — **DONE** (the `__temen_dtoa_*` family + the
    float `0`/`#` flags; see the printf slices above). SQLite/Postgres unblocked on this front.
 5. **SQLite Phase A (in-memory)** — **DONE** (slice BI: the 3.50.2 amalgamation byte-identical
    to native over a breadth script; deterministic OS_OTHER VFS; two on-ramp additions).
@@ -2733,7 +2733,7 @@ phases, both worth doing:
    (833 modules → one 78 MB `.ll` the reader ingests + fail-closes on), and the translator gap list
    is quantified — inline-`asm` (~9 templates), `atomicrmw`, `i128`, vector-memory, the fs/syscall
    shim. Config levers (portable atomics, no-`int128`) + a small asm recognize-and-lower table clear
-   the top blockers. See `crates/svm-run/demos/postgres/` for the reproduction.
+   the top blockers. See `crates/temen-run/demos/postgres/` for the reproduction.
 8. **The WebGPU capability** (its own section below) and **the network/egress capability** (curl/git) —
    the remaining capability frontiers.
 
@@ -2750,7 +2750,7 @@ stack back to an ancestor `setjmp`, across N intervening frames. The only way to
 primitive* is to make every call-return check "am I unwinding?" — which **taxes intervening frames**
 (the SJLJ-via-return-checks model). To keep intervening frames untaxed (the perf goal), the VM needs a
 real **"unwind to a saved stack checkpoint"** primitive — matching the "VM ships primitives" thesis.
-Plan: two svm-ir ops (or one checkpoint + one unwind) lowered from the recognized external `setjmp`/
+Plan: two temen-ir ops (or one checkpoint + one unwind) lowered from the recognized external `setjmp`/
 `_setjmp`/`sigsetjmp` (returns-twice) and `longjmp`/`siglongjmp` (noreturn) calls — gated on the program
 calling them, like every other capability, so non-users get nothing.
 
@@ -2761,7 +2761,7 @@ back to that depth (the intervening frames discarded with **no per-frame work** 
 restores the data-SP, and resumes at the saved pc with the `setjmp` result set to `v`. O(1)-ish capture,
 O(depth-discarded) unwind, both only when called.
 
-#### JIT `longjmp` — DONE (Option B; `crates/svm-jit/src/setjmp_rt.rs` + the `SetJmp`/`LongJmp` lowering)
+#### JIT `longjmp` — DONE (Option B; `crates/temen-jit/src/setjmp_rt.rs` + the `SetJmp`/`LongJmp` lowering)
 
 Cranelift code runs on the real native control stack, so `longjmp` must restore the native SP to the
 `setjmp` point. **Approach — Option B: call libc `_setjmp`/`_longjmp` from JITted code, with the
@@ -2793,10 +2793,10 @@ differential (all three engines == native, incl. value-live-across-setjmp + nest
   frame is UB). So `SetJmp` lowers to *two* calls: a thunk that hands back the host `jmp_buf` pointer, then
   an **inline `call _setjmp(buf_ptr)`**.
 - **Option A (rejected): a new arch-specific in-place context-save/restore asm primitive** (save
-  callee-saved + SP + return-addr without switching; one file per ABI like `svm-fiber`'s `switch_*`).
+  callee-saved + SP + return-addr without switching; one file per ABI like `temen-fiber`'s `switch_*`).
   Strictly more risk (hand-written unsafe asm per ABI) for no benefit over B unless libc `_setjmp` has a
   concrete problem — fall back to A only if B hits a wall.
-- **Rejected: the existing `svm-fiber` switch (`jump`/`make`, boost.context `fcontext`).** It is an
+- **Rejected: the existing `temen-fiber` switch (`jump`/`make`, boost.context `fcontext`).** It is an
   *asymmetric-coroutine* primitive — the captured `fctx` is a transient register block on the *suspended*
   stack, valid only while suspended; the moment you `jump` back and keep running it is reused/stale.
   `setjmp` needs **capture-in-place + keep running**, then `longjmp` from a deeper frame. Doesn't fit.
@@ -2805,7 +2805,7 @@ differential (all three engines == native, incl. value-live-across-setjmp + nest
   `pcall` uses `setjmp`. Keep it only as the fallback, not the goal.
 
 **Implementation steps (concrete):**
-1. **Host-side `jmp_buf` table + thunks** (new, in/next to `crates/svm-jit/src/fiber_rt.rs`, per-run like
+1. **Host-side `jmp_buf` table + thunks** (new, in/next to `crates/temen-jit/src/fiber_rt.rs`, per-run like
    the fiber runtime): `rt_setjmp_slot(ctx, guest_buf_addr) -> *mut JmpBuf` (alloc/find a host slot keyed
    by `(ctx, guest_buf_addr)`) and `rt_setjmp_lookup(ctx, guest_buf_addr) -> *mut JmpBuf` (or trap-marker
    on miss). **The `jmp_buf` is host-allocated and lives in this table — never the guest window** (it
@@ -2819,29 +2819,29 @@ differential (all three engines == native, incl. value-live-across-setjmp + nest
    i64` and the fiber thunks bake their addresses — the **call-to-baked-host-address template** is the
    `cap.call` / `cont.*` lowering already in the crate.
 3. **Un-bail + gate.** Remove `SetJmp`/`LongJmp` from the JIT's `_ => Err(JitError::Unsupported)` path (the
-   supportedness check ~`crates/svm-jit/src/lib.rs:3640`, the `if cfg!(fiber_rt)` block just above lists
+   supportedness check ~`crates/temen-jit/src/lib.rs:3640`, the `if cfg!(fiber_rt)` block just above lists
    the ops needing the runtime). Gate to the Unix targets first (like `fiber_rt`); the interpreters cover
    the rest. Thread the per-run `jmp_buf` table through the compile/run setup like the fiber runtime is.
-4. **Flip the test.** `check_setjmp_vs_native` (`crates/svm-llvm/tests/translate.rs`) currently asserts the
+4. **Flip the test.** `check_setjmp_vs_native` (`crates/temen-llvm/tests/translate.rs`) currently asserts the
    JIT *declines*; change that to run the JIT and assert it agrees with the interpreters + native.
 
 **The one real hazard — returns-twice vs Cranelift — and why it's largely defused (still must be proven):**
 `Inst::SetJmp` is a *call site*, so Cranelift already spills caller-saved values across it; callee-saved
 are saved/restored *by `_setjmp`/`_longjmp` themselves*; and clang already spilled every `setjmp`-crossing
-local to memory at `-O2` (returns-twice at the LLVM level), so they arrive as loads/stores in the SVM IR,
+local to memory at `-O2` (returns-twice at the LLVM level), so they arrive as loads/stores in the Temen IR,
 not long-lived SSA across the `SetJmp`. A value live across the `setjmp` in a callee-saved reg is restored
 to its `setjmp`-time value by `_longjmp` — correct for pre-`setjmp` values; values *modified* after
 `setjmp` are C-indeterminate anyway. **Verification bar (gating): a native differential on the JIT path
-run under ASan** (this is memory-unsafe native-stack manipulation; it gets `svm-fiber`-grade rigor —
-landed as the dedicated `ASan (JIT setjmp/longjmp)` CI lane alongside "ASan (svm-fiber switches)", running
-`cargo test -p svm-llvm … setjmp` under `-Zsanitizer=address`). Returns-twice stress cases landed: a value
+run under ASan** (this is memory-unsafe native-stack manipulation; it gets `temen-fiber`-grade rigor —
+landed as the dedicated `ASan (JIT setjmp/longjmp)` CI lane alongside "ASan (temen-fiber switches)", running
+`cargo test -p temen-llvm … setjmp` under `-Zsanitizer=address`). Returns-twice stress cases landed: a value
 live across the `setjmp` (`setjmp_value_live_across`), nested buffers (`setjmp_nested_buffers`), and the
 loop / deep-nesting `longjmp` across several frames (`setjmp_longjmp_loop_and_deep_nesting`).
 
 **Reference implementations to mirror (already landed, byte-identical to native):** the tree-walker
-(`crates/svm-interp/src/lib.rs` — `SetJmpPoint`, `setjmp_points`, the `SetJmp`/`LongJmp` arms in
-`run_inner`) and the bytecode engine (`crates/svm-interp/src/bytecode.rs` — `ByteSetJmp`, `Op::SetJmp`/
-`LongJmp`). The on-ramp lowering is `lower_setjmp_call` in `crates/svm-llvm/src/lib.rs`; the JIT path is `setjmp_rt.rs` + the `SetJmp`/`LongJmp` lowering arms in
+(`crates/temen-interp/src/lib.rs` — `SetJmpPoint`, `setjmp_points`, the `SetJmp`/`LongJmp` arms in
+`run_inner`) and the bytecode engine (`crates/temen-interp/src/bytecode.rs` — `ByteSetJmp`, `Op::SetJmp`/
+`LongJmp`). The on-ramp lowering is `lower_setjmp_call` in `crates/temen-llvm/src/lib.rs`; the JIT path is `setjmp_rt.rs` + the `SetJmp`/`LongJmp` lowering arms in
 `build_clif`. **Current state: all three engines run `setjmp`/`longjmp`** (the JIT via Option B, above),
 byte-identical to native, engines in sync, never divergent.
 
@@ -2882,7 +2882,7 @@ WebGPU does the validation for you (guest-authored WGSL is safe by construction)
 1. **GPU compute → readback → assert vs CPU** *(the ideal first demo)* — a WGSL compute shader
    over a guest-uploaded buffer, read back and checked against a CPU reference. Proves the whole data
    plane (upload → dispatch → readback) + the validated-buffer model, **with zero windowing**. —
-   **DONE.** The new **workspace-excluded `crates/svm-webgpu`** crate holds a `webgpu` [`HostCap`]
+   **DONE.** The new **workspace-excluded `crates/temen-webgpu`** crate holds a `webgpu` [`HostCap`]
    backed by **`wgpu`**: an op protocol (create_buffer / write_buffer / set_shader / dispatch /
    read_buffer) the guest drives over the generic §7 `__vm_cap_resolve("webgpu")` + `__vm_host_call`
    surface — **no translator change** (exactly the doc's prediction; the same shape as the `fs`/LMDB
@@ -2891,11 +2891,11 @@ WebGPU does the validation for you (guest-authored WGSL is safe by construction)
    kernels (an in-place `b[i]=b[i]*3+7` single-buffer map, and a two-buffer `c[i]=a[i]*a[i]+i` at
    `@binding(0)`/`@binding(1)`). Test `demo_webgpu_compute` runs it through the on-ramp on **all three
    engines** (tree-walk/bytecode/JIT), asserting the guest's self-check (`ALL MATCH cpu`); no native
-   oracle (the cap is SVM-only, like the async/JIT demos). Runs headless with **no physical GPU** via
+   oracle (the cap is TEMEN-only, like the async/JIT demos). Runs headless with **no physical GPU** via
    **lavapipe** (`force_fallback_adapter` → llvmpipe software Vulkan); the wgpu build is isolated to
-   this opt-in crate (like `svm-llvm`), so the default `cargo test` is untouched. **CI note:** the
+   this opt-in crate (like `temen-llvm`), so the default `cargo test` is untouched. **CI note:** the
    webgpu lane installs `mesa-vulkan-drivers`; without an adapter the test **skips cleanly**
-   (`adapter_available()`). Follow-ups: promote the cap into `svm-run` behind a feature; the
+   (`adapter_available()`). Follow-ups: promote the cap into `temen-run` behind a feature; the
    offscreen-render (demo 2) + Mandelbrot→PNG (demo 3) slices; richer bind-group/uniform support.
 2. **Offscreen render-to-texture → read pixels → hash** — "hello triangle" / a rotating cube to an
    offscreen attachment, pixels compared to a reference image. Proves the render pipeline headlessly.
@@ -2934,27 +2934,27 @@ samples — plus `wgpu`'s own CTS as a (meta) conformance check.
 
 ### Stretch goal — self-hosting: LLVM in the sandbox
 
-The moonshot beyond SQLite: run **LLVM itself** as an SVM guest. Not because LLVM "happens to run,"
+The moonshot beyond SQLite: run **LLVM itself** as an Temen guest. Not because LLVM "happens to run,"
 but because it closes a **self-hosting, capability-secured toolchain** loop — the sandbox hosting its
-own means of production. With LLVM in-guest and the existing §22 `Jit` capability (a guest emits SVM IR
+own means of production. With LLVM in-guest and the existing §22 `Jit` capability (a guest emits Temen IR
 → the host Cranelift-compiles it), the whole pipeline runs *inside the sandbox*:
 
 ```
 C/C++/Rust source → clang/LLVM (in-guest) → LLVM IR
-                  → svm-llvm translator (in-guest) → SVM IR
+                  → temen-llvm translator (in-guest) → Temen IR
                   → Jit capability → native code
 ```
 
-and the translator is itself Rust (which compiles Rust→LLVM→SVM), so the chain is self-hostable end to
+and the translator is itself Rust (which compiles Rust→LLVM→Temen), so the chain is self-hostable end to
 end. The payoff: a compiler-as-a-sandboxed-service, reproducible builds in a box, untrusted code that
 can compile *and* run other untrusted code with **zero ambient authority**. SQLite proves "a real
 program with real I/O under capabilities"; LLVM proves "the sandbox can host its own toolchain."
 
 **Scoping insight — the backend is (mostly) already ours.** "Run LLVM" is not one thing, and the
 single largest/ugliest part of LLVM — the **target backends + MC layer** (SelectionDAG/GlobalISel,
-object emission) — is **out of scope**: SVM already has a backend in the `Jit` capability. The target
+object emission) — is **out of scope**: Temen already has a backend in the `Jit` capability. The target
 is LLVM's **front + middle end** (IR data structures, the bitcode reader, the verifier, the `opt` pass
-pipeline), lowering to SVM IR and handing it to `Jit`. That deletes roughly the hardest third of LLVM.
+pipeline), lowering to Temen IR and handing it to `Jit`. That deletes roughly the hardest third of LLVM.
 Slices, smallest meaningful first (do **not** aim at clang first):
 1. **libLLVMCore in isolation** — a program that builds an IR `Module` in memory, runs the
    **verifier**, and prints it. The "hello world of embedding LLVM," dramatically smaller than clang,
@@ -2983,11 +2983,11 @@ Slices, smallest meaningful first (do **not** aim at clang first):
    **independently valuable**, because it is what *any* large C++ program needs (so growing C++/stdlib
    breadth is the honest first rung, see the ladder above).
 2. **C++ `thread_local` / TLS** — `@llvm.threadlocal.address` / `.tdata`/`.tbss` is **not lowered yet**
-   (the existing `__vm_vcpu_tls` is a different, SVM-specific per-vCPU register). LLVM uses
+   (the existing `__vm_vcpu_tls` is a different, TEMEN-specific per-vCPU register). LLVM uses
    `thread_local` for errno/ManagedStatic — a genuinely new feature to build.
 3. **File I/O capability** — LLVM reads/writes files: the **same** powerbox `File`/`Storage` capability
    SQLite Phase B needs. Shared prerequisite, not extra.
-4. **Translate-time scale** — the `svm-llvm` translator is demo-sized today; a multi-hundred-MB bitcode
+4. **Translate-time scale** — the `temen-llvm` translator is demo-sized today; a multi-hundred-MB bitcode
    module is a different regime (translator memory + throughput). Needs measurement, possibly streaming.
 5. **Stragglers** — a few inline-asm spots (mostly avoidable), possibly computed-goto in clang's
    lexer (the `indirectbr` work above). (`%f`/`%g` exact-decimal formatting is DONE.)
@@ -3044,7 +3044,7 @@ moonshot llc/clang.**
       tables (AV) and operand-position φ-threaded blockaddresses (AW), recovered via `llvm-sys`
       (`blockaddr.rs`), lowered to a `br_table` over block indices. Robust for real interpreters.
 - [ ] **SIMD** (`<N x T>` vectors) — a later pass mirroring §17/D58 `v128` (the proven
-      5-step pattern `svm-wasm` used). Reject cleanly until then.
+      5-step pattern `temen-wasm` used). Reject cleanly until then.
 - [ ] **Full intrinsic coverage** — expand the table in §4 as real programs demand.
 - [ ] **`i128`, `x86_fp80`/`fp128`, vector-of-pointers, scalable vectors** — reject.
 - [ ] **GC / managed languages** — permanent non-goal (same as wasm-GC in `WASM.md`):
@@ -3071,11 +3071,11 @@ libLLVM; D54 sanctions that as a build/dev-time dep (Q4 keeps it off the runtime
 **Debug-info nuance (the §6/D-DBG-7 waist).** The "debug metadata gap" above is *one-sided*:
 `llvm-ir` **does** expose per-instruction `!DILocation` (line/col/file, via `HasDebugLoc`), so the
 on-ramp populates the §6 neutral core's **source-line half** from it (`DebugAcc` in
-`crates/svm-llvm/src/lib.rs` → `DebugInfo.locs`; DEBUGGING.md slice 24) — making LLVM the *third*
+`crates/temen-llvm/src/lib.rs` → `DebugInfo.locs`; DEBUGGING.md slice 24) — making LLVM the *third*
 producer to feed the frontend-neutral waist. The **structured DI graph**
 (`DILocalVariable`/`DIType`/`llvm.dbg.value`) is missing from `llvm-ir` (`Metadata::from_llvm_ref` is
 `unimplemented!`, `MetadataOperand` is payloadless), so the **fallback-reader** decision above is now
-realized concretely: `crates/svm-llvm/src/di.rs` walks the DI nodes **directly through `llvm-sys`**
+realized concretely: `crates/temen-llvm/src/di.rs` walks the DI nodes **directly through `llvm-sys`**
 (the LLVM-C debug-info API), re-parsing the `.bc` into its own context. Slice 25 lands the `-O0 -g`
 case — every C local is an `alloca` + `dbg.declare`, recovered as a `TypeDef`-typed `VarLoc::Window`
 correlated to the IR by *alloca ordinal* (stable across the two parses). The LLVM-C DI API has no
@@ -3111,7 +3111,7 @@ C/C++ API (new LLVM versions *add* syntax rather than break existing syntax), so
 reading text instead of chasing a binding. It would also **collapse today's 3–4 libLLVM re-parses**
 (`from_bc_path` + `di` + `blockaddr` + `wideint`, each its own context) into **one** text pass carrying
 everything (instructions, `!DILocation`, `blockaddress`, full constants), and **remove the libLLVM build
-dependency entirely** (the reason `svm-llvm` is excluded from the workspace).
+dependency entirely** (the reason `temen-llvm` is excluded from the workspace).
 
 *Tradeoffs, so the next person can weigh it:*
 - **Speed.** `.ll` is bigger than `.bc` (≈3–10× bytes) and text-parsing is slower per byte than bitcode
@@ -3131,23 +3131,23 @@ dependency entirely** (the reason `svm-llvm` is excluded from the workspace).
   ongoing** for version bumps. By horizon: stay on LLVM 18 → forking is cheaper; track current Rust/clang
   long-term → the textual reader wins (and `llvm-ir` may not even support the version you need).
 
-**Status: DONE — the flip landed; `svm-llvm` links no libLLVM** (decided to build it after `llvm-ir`
+**Status: DONE — the flip landed; `temen-llvm` links no libLLVM** (decided to build it after `llvm-ir`
 kept biting, both on constants and the version ceiling; the textual reader now feeds the translator on
-every path, and `llvm-ir`/`llvm-sys` are dropped from `crates/svm-llvm/Cargo.toml`). The handoff block
+every path, and `llvm-ir`/`llvm-sys` are dropped from `crates/temen-llvm/Cargo.toml`). The handoff block
 below is kept as the implementation record.
 
 **Q1b — Textual `.ll` reader: migration plan & handoff.** Replacing the `llvm-ir`/libLLVM binding
 with a dependency-free textual-`.ll` reader. Approach, validation, and the staged sequence:
 
 - **Approach.** Keep the ~17k-line translator (`lib.rs`) unchanged; replace *only* the input layer.
-  A new `crates/svm-llvm/src/ll/` module: `ast.rs` mirrors the slice of `llvm-ir`'s data model the
+  A new `crates/temen-llvm/src/ll/` module: `ast.rs` mirrors the slice of `llvm-ir`'s data model the
   translator consumes (same variant/field names, same `get_type`/`try_get_result`/`named_struct_def`
   methods) but **owned by us** — no FFI, no version lock — with the **I14 fix baked in** (`Constant::Int`
   is a full `u128`). `lex.rs` tokenizes; `parse.rs` is a recursive-descent reader → `ast::Module`. The
   translator's `use llvm_ir::…` becomes `use crate::ll::…` (mechanical). One text pass also absorbs
   what `di.rs`/`blockaddr.rs`/`wideint.rs` re-walk today (4 libLLVM parses → 1, no libLLVM link).
 - **Validation oracle = `llvm-ir` itself.** A differential parity check (`assert_ll_parity`): compile
-  each test to *both* `.bc` and `.ll`, translate both, assert identical svm-ir. Keep `llvm-ir` as a
+  each test to *both* `.bc` and `.ll`, translate both, assert identical temen-ir. Keep `llvm-ir` as a
   dev-dep until parity holds across the corpus; only then flip the default and drop it. The existing
   215-test suite + this parity check are the regression gate. The translator's matches are the exact
   spec — complete the `Instruction`/`Constant`/`Terminator` enums by compiling `lib.rs` against `crate::ll`.
@@ -3203,7 +3203,7 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
   - **`translate_ll_path`/`translate_ll_str` + the `assert_ll_parity` harness — DONE.** `lib.rs` now
     exposes the textual entry (`ll::parse::parse_module` → `translate`), and `tests/translate.rs` has
     `compile_to_ll` (`clang -O2 -emit-llvm -S`) + `assert_ll_parity(name, c_src)`: compile each test C
-    to **both** `.bc` and `.ll`, translate both, assert byte-identical svm-ir (`svm_text::print_module`)
+    to **both** `.bc` and `.ll`, translate both, assert byte-identical temen-ir (`temen_text::print_module`)
     and `entry_sp`. Three parity tests pass on real `clang -O2` output the **core-slice parser already
     handles**: `ll_parity_trivial_add` (header + flagged binop + `ret`), `ll_parity_arith_chain`
     (binop chain with `±` immediates), `ll_parity_bitwise_shifts` (`shl`/`lshr`/`or`). The textual path
@@ -3377,7 +3377,7 @@ with a dependency-free textual-`.ll` reader. Approach, validation, and the stage
     `i128 urem` by a >64-bit *divisor* is a separate pre-existing translator gap, never exercised before
     because the reader fail-closed there). **Deleted:** `from_llvm_ir.rs`, `wideint.rs`, and the
     `llvm-sys` bodies of `di.rs`/`blockaddr.rs` (their data structs stay, filled by `ll::debug`/
-    `ll::parse`); **dropped the `llvm-ir`/`llvm-sys`/`either` deps.** `svm-llvm` links **no libLLVM**.
+    `ll::parse`); **dropped the `llvm-ir`/`llvm-sys`/`either` deps.** `temen-llvm` links **no libLLVM**.
   - **DONE — version tolerance proven; the rustc-1.81 pin dropped from the breadth lane.** The Rust
     on-ramp breadth lane (`rust_no_std_matches_native` and the `no_std`+`alloc` powerbox tests) now
     compiles with the **default** `rustc` (1.94 → **LLVM 21**) via `--emit=llvm-ir` straight to `.ll`
@@ -3409,13 +3409,13 @@ of the MVP. We never run an in-process pass manager or reimplement `mem2reg` (th
 `pnacl-opt` model). See §4 "Ingest pass pipeline".
 
 **Q3 — Pin mechanics (open):** how strictly to reject off-version bitcode, and where the
-frozen-subset allow-list lives (a single `unsup(...)`-style chokepoint, like `svm-wasm`).
+frozen-subset allow-list lives (a single `unsup(...)`-style chokepoint, like `temen-wasm`).
 
 **Q4 — CI gating (DONE for the build story; the CI yaml lane is the remaining piece):**
-`svm-llvm` is **excluded from the workspace** (root `Cargo.toml`, with `fuzz`/`bench`), so the
+`temen-llvm` is **excluded from the workspace** (root `Cargo.toml`, with `fuzz`/`bench`), so the
 default `cargo build/test --workspace` never resolves or links libLLVM and the cross-OS
-runtime matrix (`svm-jit`/`svm-interp` on Linux+macOS+Windows) is untouched (D54 off-the-
-runtime-path). The opt-in lane runs `cd crates/svm-llvm && cargo test`. **Build prerequisites —
+runtime matrix (`temen-jit`/`temen-interp` on Linux+macOS+Windows) is untouched (D54 off-the-
+runtime-path). The opt-in lane runs `cd crates/temen-llvm && cargo test`. **Build prerequisites —
 UPDATED after the textual-reader flip (PR4):**
 - **No `-dev` package, no libLLVM link.** The on-ramp reads textual `.ll` with an in-house parser,
   so `llvm-sys`/`llvm-ir` and the `prefer-dynamic` dance are gone. CI installs just base
@@ -3425,52 +3425,52 @@ UPDATED after the textual-reader flip (PR4):**
   its bundled LLVM (21 here) flows straight through the textual reader — the version-tolerance proof.
 
 **Q5 — CI yaml (DONE):** no job installs `llvm-18-dev` anymore — nothing links libLLVM. The
-Linux-only `svm-llvm` job installs base `llvm-18`/`clang-18` (build tools only — `clang` + `llvm-dis`)
+Linux-only `temen-llvm` job installs base `llvm-18`/`clang-18` (build tools only — `clang` + `llvm-dis`)
 and keeps a `rustup toolchain install 1.81.0` step scoped to the multi-crate `peval_*` Futamura probe
 alone (its `llvm-link-18`/`opt-18` can only ingest LLVM-18 IR, so that fixture needs a version-matched
 `rustc`; the Rust *breadth* lane runs on default stable — the version-tolerance proof). The three
-sibling jobs that run `svm-llvm` tests/examples (`asan-jit-setjmp`, `embench-differential`,
+sibling jobs that run `temen-llvm` tests/examples (`asan-jit-setjmp`, `embench-differential`,
 `cross-engine-differential`) got the same `llvm-18-dev` → `llvm-18` swap. All landed by maintainer
-pushes (the bot token lacks `workflow` scope): the `svm-llvm` lane verified green on CI run 1193 with
+pushes (the bot token lacks `workflow` scope): the `temen-llvm` lane verified green on CI run 1193 with
 the peval probe running (not skipping); embench + cross-engine verified green on the run for
 `31bcfcd` (asan-jit-setjmp is schedule-gated, exercised on the nightly).
 
 ---
 
 ## 9. Code map
-- Translator + frozen-subset chokepoint: `crates/svm-llvm/src/lib.rs` — `translate`/
+- Translator + frozen-subset chokepoint: `crates/temen-llvm/src/lib.rs` — `translate`/
   `translate_bc_path`, `val_type`/`operand_int_ty` (the §3b narrow-int collapse), `BlockCtx`
   (block-local SSA numbering, §3a), and the `unsup(...)` fail-closed chokepoint.
-- First-light differential: `crates/svm-llvm/tests/translate.rs` — `compile_to_bc` runs the
+- First-light differential: `crates/temen-llvm/tests/translate.rs` — `compile_to_bc` runs the
   pinned `clang -O2 -emit-llvm` pipeline; `run` does translate→verify→interp.
-- Crate config + build prereqs: `crates/svm-llvm/Cargo.toml` (no libLLVM deps since the
-  textual-reader flip — the in-house `.ll` reader lives in `crates/svm-llvm/src/ll/`; see §8
+- Crate config + build prereqs: `crates/temen-llvm/Cargo.toml` (no libLLVM deps since the
+  textual-reader flip — the in-house `.ll` reader lives in `crates/temen-llvm/src/ll/`; see §8
   Q1b/Q4); workspace exclusion in the root `Cargo.toml`.
 - The oracle to diff against (Lane B): chibicc `frontend/chibicc/codegen_ir.c` + the running
   demos in `demos/` — wired in at Milestone 1.
 
 ---
 
-## 10. Rust `std` on the on-ramp (svm-posix route)
+## 10. Rust `std` on the on-ramp (temen-posix route)
 
-Full-`std` Rust runs as an svm guest through this on-ramp, bound to the **POSIX personality**
-(`svm-posix`), not WASI. This section is the durable design record (folded from the retired
-`RUST_STD.md`, 2026-08); the overlay + target JSONs live in `crates/svm-llvm/rust-svm/` (see its
-`README.md`), and the differential tests are `crates/svm-llvm/tests/std_guest.rs` (a nightly,
+Full-`std` Rust runs as an temen guest through this on-ramp, bound to the **POSIX personality**
+(`temen-posix`), not WASI. This section is the durable design record (folded from the retired
+`RUST_STD.md`, 2026-08); the overlay + target JSONs live in `crates/temen-llvm/rust-temen/` (see its
+`README.md`), and the differential tests are `crates/temen-llvm/tests/std_guest.rs` (a nightly,
 scheduled CI lane — each test does a full `-Zbuild-std`, too slow for the per-PR gate).
 
-**Route decision (owner, 2026-08-11): svm-posix, not WASI.** Keep everything on the proven LLVM path
-(`rustc --emit=llvm-ir` → `svm-llvm`) and bind `std` to the personality ABI we already pin and test
+**Route decision (owner, 2026-08-11): temen-posix, not WASI.** Keep everything on the proven LLVM path
+(`rustc --emit=llvm-ir` → `temen-llvm`) and bind `std` to the personality ABI we already pin and test
 (`POSIX.md` §5). The cost is a small `std` platform layer (PAL) we author and maintain as a `rust-src`
 overlay. Alternatives rejected: **(B)** reuse `std::sys::unix` via a Linux-claiming triple + a guest
 libc shim — its raw `libc::syscall(SYS_*)` is exactly the numeric-syscall multiplexer the personality
 model exists to avoid (`POSIX.md` §1); **(C)** WASI — gives up toolchain independence and adds a
 wasm/WASI spec dependency (the WASI shim stays the deliberately-thin 2-op example); **(D)** `restricted_std`
 with *unpatched* std — modern std's leaf modules (`sys/{alloc,thread_local,random,io/error}`) enumerate
-`target_os` with **no catch-all**, so a novel `os=svm` fails to *build*. The minimum buildable overlay is
-a handful of `svm` leaf-arms + one allocator `imp`.
+`target_os` with **no catch-all**, so a novel `os=temen` fails to *build*. The minimum buildable overlay is
+a handful of `temen` leaf-arms + one allocator `imp`.
 
-**The seam — how `std` reaches svm-posix.** Two mechanisms:
+**The seam — how `std` reaches temen-posix.** Two mechanisms:
 1. **Generic host-call bridge (primary).** `__vm_cap_resolve("posix")` → a handle (§7 `cap.self.resolve`);
    `__vm_host_call(handle, op, a, b, c, d)` → `cap.call HOST_PROC`. The PAL declares these two `extern "C"`
    symbols and speaks the `POSIX.md` §5 op table directly — **no allowlist growth, no per-name plumbing**.
@@ -3486,24 +3486,24 @@ a handful of `svm` leaf-arms + one allocator `imp`.
 | Pin | Value |
 |---|---|
 | Panic strategy | `panic=abort` (target JSON + `-Zbuild-std=std,panic_abort`). Opt-in `panic=unwind` is deferred — #883 (the on-ramp's C++ Itanium EH substrate already supports it; no named guest consumer yet). |
-| Targets | Two specs: lean **`x86_64-unknown-svm`** (`singlethread=true`, `no_threads` std) and threaded **`x86_64-unknown-svm-threads`** (`singlethread=false`, `env=threads`, real atomic orderings + futex sync + Tier-2 per-vCPU TLS). The `no_threads` pin was the original v1 posture; threads landed via the #779 epic. |
+| Targets | Two specs: lean **`x86_64-unknown-temen`** (`singlethread=true`, `no_threads` std) and threaded **`x86_64-unknown-temen-threads`** (`singlethread=false`, `env=threads`, real atomic orderings + futex sync + Tier-2 per-vCPU TLS). The `no_threads` pin was the original v1 posture; threads landed via the #779 epic. |
 | Errno | In-band negative returns → `io::Error`; no errno TLS. |
 | Allocator | PAL `sys::alloc` → `extern "C" malloc/free` → synthesized guest bump allocator. |
-| `stat`/time layouts | svm-posix's, verbatim (`{st_mode, st_size}`; the Clock op's epoch/units) — the PAL is the only consumer, no reconciliation. |
+| `stat`/time layouts | temen-posix's, verbatim (`{st_mode, st_size}`; the Clock op's epoch/units) — the PAL is the only consumer, no reconciliation. |
 | HashMap seeding | Deterministic per-guest (`sys/random` leaf; address-derived seed on the fixed window/allocator layout). A real `getrandom` op is deferred (no consumer). |
-| Toolchain | One pinned **nightly** + `rust-src`; the PAL patch is applied onto the toolchain's `rust-src` (`rust-svm/apply-overlay.sh`, idempotent). The textual-`.ll` reader frees the *on-ramp* from LLVM-version pins (§3); the nightly pin is for build-std reproducibility only. |
+| Toolchain | One pinned **nightly** + `rust-src`; the PAL patch is applied onto the toolchain's `rust-src` (`rust-temen/apply-overlay.sh`, idempotent). The textual-`.ll` reader frees the *on-ramp* from LLVM-version pins (§3); the nightly pin is for build-std reproducibility only. |
 
 **Status (what works, byte-identical to native).** The whole platform layer landed: `std::{io (stdout/
 stderr/exit), env::args, time (Instant/SystemTime via `OP_CLOCK`), env (var/var_os/set/remove/vars), fs
 (File/metadata/read_dir/dir-ops over the memfs), net (TCP over memnet + the `net` cap), process::Command
 (fork-free spawn+capture via `OP_SPAWN2`), thread + sync + TLS (spawn/join, futex `Mutex`/`Condvar`/`mpsc`,
 Tier-2 per-vCPU TLS), collections::HashMap}`. Most of "std" (`Vec`/`String`/`fmt`/`iter`/collections) is
-re-exported `core`/`alloc` and always ran. The svm-posix ops the PAL needed — `OP_CLOCK`, `OP_GETENV_R`/
+re-exported `core`/`alloc` and always ran. The temen-posix ops the PAL needed — `OP_CLOCK`, `OP_GETENV_R`/
 `OP_UNSETENV`/`OP_ENVIRON`, `OP_SPAWN2`, the `net` cap — are all in (`POSIX.md`). **Deferred:** unwinding
 (#883); a real randomness op; live-child `Command` streaming (rides the fork/exec/bash epic, #799/#801).
 
 **Trust framing.** Everything here is untrusted, re-verified frontend + personality + guest code — the
-translator, the `svm-posix` personality, and `std` itself compiled as guest code. Zero escape-TCB, same
-class as chibicc/`svm-wasm` (§2a, D54; INVARIANTS §2/§9 untouched). A `std` or personality bug is a clean
+translator, the `temen-posix` personality, and `std` itself compiled as guest code. Zero escape-TCB, same
+class as chibicc/`temen-wasm` (§2a, D54; INVARIANTS §2/§9 untouched). A `std` or personality bug is a clean
 capability/verify error, never an escape.
 

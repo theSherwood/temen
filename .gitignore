@@ -3,8 +3,8 @@
 /fuzz/corpus
 /fuzz/artifacts
 /bench/target
-/crates/svm-llvm/target
-/crates/svm-webgpu/target
+/crates/temen-llvm/target
+/crates/temen-webgpu/target
 /.nimtool
 # Nim-devel compiler sources cloned by scripts/ci/provision-nimony.sh (the toolchain build);
 # `nimony`/`nativenif` themselves are git submodules, and their in-tree build outputs (bin/, nimcache)
@@ -12,4 +12,4 @@
 /nim-src
 **/*.rs.bk
 rustc-ice-*.txt
-crates/svm-llvm/tests/fixtures/leng_probe/Cargo.lock
+crates/temen-llvm/tests/fixtures/leng_probe/Cargo.lock

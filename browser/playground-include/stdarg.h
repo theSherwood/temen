@@ -1,7 +1,7 @@
 #ifndef __STDARG_H
 #define __STDARG_H
 
-// SVM flat-buffer varargs ABI (DESIGN.md §3d), matching frontend/chibicc/include/stdarg.h: the
+// Temen flat-buffer varargs ABI (DESIGN.md §3d), matching frontend/chibicc/include/stdarg.h: the
 // caller marshals each promoted variadic argument into one 8-byte slot in a contiguous buffer and
 // passes a pointer to it as a hidden trailing argument — `__va_area__` inside the callee.
 typedef char *va_list[1];

@@ -1,6 +1,6 @@
 # FORK.md — `fork()`-returns-twice, the durable-clone capstone
 
-The plan for POSIX `fork()` on svm (STAGE1.md item 3 / PROCESS.md §7 / the S11 stage) — **landed
+The plan for POSIX `fork()` on temen (STAGE1.md item 3 / PROCESS.md §7 / the S11 stage) — **landed
 on the tree-walk oracle** (PRs 1–5 + track 2; §5/§8 below are the as-built record). The parked call
 transport fork rides is settled as DESIGN.md §12a (was CALLS.md); this file keeps the fork
 *semantics* — reply-injection (§3), the child handle model (§4), the clone spec (§6), invariants
@@ -24,7 +24,7 @@ party appears only as the **callee/servicer** the caller is parked on.
 
 ## 2. The wall — open question O10 (confirmed in code)
 
-`freeze_drive` (`crates/svm-interp/src/lib.rs:6984`) **refuses** to freeze a fiber parked on an
+`freeze_drive` (`crates/temen-interp/src/lib.rs:6984`) **refuses** to freeze a fiber parked on an
 un-replied `cap.call` (`Blocked::CapReply`) — exactly fork's park point:
 
 > "An unwoken CAP park would spill the freeze placeholder into a `Leaf` frame (reloaded as the call's
@@ -58,7 +58,7 @@ re-issues.
 
 ## 4. How a parent names a child (the handle model — nesting-friendly by construction)
 
-The Instantiator ops (0 `instantiate`, 5/13 `instantiate_module`, `svm-interp:11376`) return an `i32`
+The Instantiator ops (0 `instantiate`, 5/13 `instantiate_module`, `temen-interp:11376`) return an `i32`
 **`child_handle`**, non-blocking. That handle is a **capability** — "holding the handle is the authority
 to nest (D19)". It resolves (in the *parent's* runtime) to a scheduler `TaskId` → the child's `VCpu`
 (its own `vcpu_ctx`, shadow region, and window carve via `nested_view`). Sibling ops already take it:
@@ -95,7 +95,7 @@ must be forkable — no design step may force the forking guest to be top-level.
   reloads its injected reply and resumes **past** the call. Return-twice, in one live run. This folds the
   old "durable-layer nucleus" and "targeted clone" together because (per the finding above) the injection
   state only exists under a servicer-triggered freeze. *The hardest substrate work; single-vCPU first.*
-- **PR 2 — the `fork` personality op + endpoint.** Add `"fork"` to `svm-posix resolve` as sugar over
+- **PR 2 — the `fork` personality op + endpoint.** Add `"fork"` to `temen-posix resolve` as sugar over
   PR 1's `clone`, the servicer replying `pid`/`0`. The clone-servicer lives with the domain's
   personality-provider / parent (which holds the `child_handle`), so it composes with nesting.
 - **PR 3 (later) — multi-vCPU `forkall`** (O11); CoW clone (deferred, S13).
@@ -147,7 +147,7 @@ the capture step first, TDD-first.
 The servicer-triggered path has a **natural harness** (a serve handler that captures its own caller),
 which sidesteps the whole-run-freeze dead-end. The linkage is already in the code:
 
-- A running handler carries `serve_run: Some(ServeRun { ticket, .. })` (`svm-interp:6729`) — the dispatch
+- A running handler carries `serve_run: Some(ServeRun { ticket, .. })` (`temen-interp:6729`) — the dispatch
   ticket its return would answer. (A `svc.*` op *under* a handler is refused `-EINVAL`, so the serve loop
   is the domain's outermost dispatcher — the clone op rides the same serve-frame position.)
 - Its caller is parked as `Sched::ticket_waiters[(callee_domain_id, ticket)] = Waiter::Fiber { reg, slot,
@@ -175,7 +175,7 @@ the freeze/flatten soundness change from the instantiation, interp==JIT, TDD-fir
 - **Increment 1 — the handler→caller linkage. DONE (this branch).** New eval-loop arm for op 11:
   returns `serve_run.ticket` when in a running handler (`*cur != serve_cur`), else `-EINVAL`; host-side
   dispatch answers a probeable `-EINVAL` (like svc.poll/wait). `CAP_SELF_CLONE_CALLER = 11` pinned.
-  Tests: `crates/svm-interp/tests/clone_caller.rs`. Proves *only* that the servicer can name the parked
+  Tests: `crates/temen-interp/tests/clone_caller.rs`. Proves *only* that the servicer can name the parked
   caller — no capture yet.
 - **Increment 2 — the reply-injection nucleus. DONE (PR #528).** `clone_caller(reply)` delivers `reply`
   to the parked caller *out-of-band* (`cap_reply_or_stash(ticket, reply)`) and sets `ServeRun.replied`, so
@@ -211,7 +211,7 @@ the freeze/flatten soundness change from the instantiation, interp==JIT, TDD-fir
   0/1 args = **pid mode**, what `fork()` desugars to — the original's reply is the twin's `TaskId`
   (parent sees pid), the twin's is the arg (0); a failed fork replies `-EAGAIN`, POSIX's fork-failure
   errno. Pinned end-to-end (parent joins pid 3; shared stdout shows `{0, 3}`).
-- **`"fork"` name binding. DONE.** `svm_posix::bind_with_fork(m, host, libc, Some((type_id, handle)))`
+- **`"fork"` name binding. DONE.** `temen_posix::bind_with_fork(m, host, libc, Some((type_id, handle)))`
   routes an import named `fork` to the parent-wired live fork offer; every other libc name to the shared
   `HOST_PROC` handle; no offer supplied → bind fails closed.
 - **Remaining for a real shell fork:** the **manager topology** (a parent module that spawns the guest,
@@ -220,18 +220,18 @@ the freeze/flatten soundness change from the instantiation, interp==JIT, TDD-fir
   `Waiter::Fiber` (non-root fiber) caller, which nested-child callers do **not** need (a §14 child parks
   as `Waiter::VCpu`, so nested-guest fork works without it).
 
-### 8.5 Track 2 plan — a real program forking on svm (2026-07-31, from the machinery map)
+### 8.5 Track 2 plan — a real program forking on temen (2026-07-31, from the machinery map)
 
 The substrate (pid-mode `clone_caller`, `fork_powerbox`, `fork_parked_caller`) has landed; **no new
 interp op is needed.** The remaining work is *integration plumbing* to get a compiled-C guest into the
-right topology. The minimal live-run fork demo already exists — `svm-interp/tests/clone_caller.rs`
+right topology. The minimal live-run fork demo already exists — `temen-interp/tests/clone_caller.rs`
 `SRC_FORK_PID`: a manager (func 0) spawns a server (func 1, a `svc.wait` loop whose func-2 handler runs
 pid-mode `clone_caller`), mints the fork offer with `child_offer` (Instantiator op 14), spawns the caller
 with `instantiate_named` (op 11) re-granting that offer, and the caller forks and both copies write pid/0
 to a shared stdout stream. That guest is **hand-written IR** and uses a **regranted stream** (no libc).
 The remaining slices turn that into a *compiled-C* program with *real libc*:
 
-- **Slice 1 — forkable libc. DONE (this PR).** `svm_posix::grant` mints libc via
+- **Slice 1 — forkable libc. DONE (this PR).** `temen_posix::grant` mints libc via
   `grant_host_proc_forkable` over the shared `Inner`, so a chibicc-world domain's libc carries across a
   twin (was fail-closed). `posix_cap` (on-ramp) was already forkable (§8.4).
 - **Slice 2 — bind a child's named `fork` import to the live fork offer. DONE.** *Refined from the
@@ -257,14 +257,14 @@ The remaining slices turn that into a *compiled-C* program with *real libc*:
   `long __fork(int h, long a)`; chibicc drops the leading `int h` as the cap-handle dummy, so the call
   lowers to `(i64)->(i64)`, matching the fork offer op. (Handle arg must be `int`, not `long`, or the
   emitted `call.sym` handle operand is `i64` and fails verify.)
-- **Slice 5 — the end-to-end test. DONE.** `crates/svm/tests/c_fork.rs`: a chibicc-compiled C `fork()`
+- **Slice 5 — the end-to-end test. DONE.** `crates/temen/tests/c_fork.rs`: a chibicc-compiled C `fork()`
   program under the manager topology, forking for real — parent sees the twin's pid (3), the twin sees 0,
   both copies `write(1, &slot, 8)` their result to the one shared stdout stream. **The first real
-  program forking on svm.** (Interp only, like every `clone_caller` test — the serve substrate is
+  program forking on temen.** (Interp only, like every `clone_caller` test — the serve substrate is
   eval-loop-only; JIT parity for the fork substrate is a separate track.)
 
 **Status (2026-07-31) — the real-libc capstone has landed; only the chibicc *frontend* remains.**
-`crates/svm/tests/fork_manager.rs` is the end-to-end real-libc fork: the manager spawns the server,
+`crates/temen/tests/fork_manager.rs` is the end-to-end real-libc fork: the manager spawns the server,
 mints the fork offer with `child_offer`, then spawns a guest via `instantiate_named` re-granting BOTH
 the fork offer *and* the forkable posix libc (slice 3's `regrant_into_child` `HostProc` branch), the
 guest resolves both by name, calls `fork()`, and BOTH copies `write(1, &ret, 8)` through the ONE shared
@@ -274,7 +274,7 @@ resolving caps by name, which is what lets it sidestep the `__px_` import binder
 one extra interp gate: `can_regrant`/`forkable_host_proc` — op-11's grant-list admission must accept a
 forkable `HostProc` as a re-grantable handle (previously only pipes/regions/offers/copyables passed).
 **Update (slice 2 done) — the fork *binding* is proven; only the chibicc *frontend* remains.**
-`crates/svm/tests/fork_import.rs` swaps the capstone's `cap.self.resolve` fork discovery for a **named
+`crates/temen/tests/fork_import.rs` swaps the capstone's `cap.self.resolve` fork discovery for a **named
 `fork` import** on a **separate guest module** spawned via op 13, bound to the live fork offer by
 `bind_child_manifest`. This is the exact runtime path a compiled-C `fork()` takes — the guest is now
 hand-written IR only because chibicc hasn't emitted it yet, not because any runtime piece is missing. The
@@ -283,8 +283,8 @@ the original slice-2 framing: the nested compiled-C path does **not** go through
 `bind_shim` (that is the *same-module top-level* libc-handle ABI); a separate-module command binds
 `write`/`read` by the manifest's reference policy and `fork` by the named-offer step.
 
-**Update (slices 4+5 done) — Track 2 is complete: a real compiled-C `fork()` runs on svm.**
-`crates/svm/tests/c_fork.rs` compiles an ordinary C `fork()` program with chibicc and forks it for real
+**Update (slices 4+5 done) — Track 2 is complete: a real compiled-C `fork()` runs on temen.**
+`crates/temen/tests/c_fork.rs` compiles an ordinary C `fork()` program with chibicc and forks it for real
 under the manager topology. Landing it needed one more interp fix: `Inst::CallSym` (chibicc's lowering
 for an extern call) did not probe `import_live_target`, so a symbolic slot bound to a live-callee offer
 went to the generic dispatch and answered `-EINVAL` instead of parking the caller — only `Inst::CallImport`
@@ -294,13 +294,13 @@ compiled-C `fork()` parks and returns twice like the hand-written form. All thre
 users (`c_shell_exec`, dynlink) stay green.
 
 Key refs: `c_fork.rs` (compiled-C fork), `fork_import.rs` (named-import fork binding), `fork_manager.rs` (the real-libc capstone), `SRC_FORK_PID` (`clone_caller.rs:276`), `SIBLING_AS_SERVICE` (`svc_serve_loop.rs:477`),
-`bind_with_fork` (`svm-posix/src/lib.rs`), `bind_shim` + harness (`crates/svm/tests/c_posix_spawn.rs`),
-op 13 compiled-C exec (`c_shell_exec.rs`), `regrant_into_child` (svm-interp).
+`bind_with_fork` (`temen-posix/src/lib.rs`), `bind_shim` + harness (`crates/temen/tests/c_posix_spawn.rs`),
+op 13 compiled-C exec (`c_shell_exec.rs`), `regrant_into_child` (temen-interp).
 
 ### 8.2 Increment 2 — the derived mechanism (two findings that settle it)
 
 **Finding A — the durable transform already lowers `cap.call` as `SuspendKind::Leaf`**
-(`svm-durable/src/lib.rs:855`): "the host performs the op; the deepest frame reloads its result." A caller
+(`temen-durable/src/lib.rs:855`): "the host performs the op; the deepest frame reloads its result." A caller
 parked on a durable-transformed `cap.call` therefore has *exactly* the Leaf continuation shape, whose thaw
 reloads the call's result at the **post-call resume point**. **Fork's reply-injection is nothing more than
 supplying that reloaded Leaf result** (§3) — the freeze/flatten path already positions the spill there. So
@@ -308,7 +308,7 @@ the caller's domain (and only it) must be durable-transformed; `clone_caller`'s 
 `flatten_fiber_for_freeze` Leaf spill rather than inventing a new continuation format.
 
 **Finding B — the parked caller *is* a self-contained vCPU (the clean path).** A caller is registered in
-`ticket_waiters[(callee_id, ticket)]` in **two** forms (`svm-interp` `Step::Park(CapReply)` at `:4879` and
+`ticket_waiters[(callee_id, ticket)]` in **two** forms (`temen-interp` `Step::Park(CapReply)` at `:4879` and
 the generic-arm fiber park at `:8929`):
   - a **root** caller → `Waiter::VCpu(v)` — the *entire* parked vCPU, holding its **own** `v.mem` (window),
     `v.frames` (the continuation sitting inside the pending `cap.call`), and durable state;
@@ -454,7 +454,7 @@ that leaves the caller running (POSIX `execve` **returns only on failure**) — 
 `Inner::Exec`/`Step::Exec`. `dispatch` materializes the command's data segments into the caller's window
 and swaps the vCPU to a fresh one (`VCpu::new`) running the command at its entry, then loops back to run
 it (no run-queue round trip, the page-fault-fast-lane shape). Proven by
-`svm-interp/tests/execve.rs`: a guest execs a separate command module that writes `"EXEC"` and exits
+`temen-interp/tests/execve.rs`: a guest execs a separate command module that writes `"EXEC"` and exits
 `42`; the guest's post-`exec` `return 99` **never runs** (the image was truly replaced), and a bogus
 command handle returns `-EINVAL` with the caller still running. Interp only, like every fork test.
 
@@ -513,7 +513,7 @@ deterministically returns `0`. Stable 0/40 under stress.
 
 **Run a real command end-to-end — a `cat` reading a real file. DONE (increment 3).** The command the
 child `execve`s is no longer a trivial `write("EXEC")` stub: it `open`/`read`/`close`s a file from a
-granted **`vm_fs` capability** (the shared in-memory filesystem, `crates/svm-fs`) and echoes the bytes
+granted **`vm_fs` capability** (the shared in-memory filesystem, `crates/temen-fs`) and echoes the bytes
 to stdout — real file I/O by a real separate program running as the child's task. Two increments, both
 in `c_fork.rs`:
 - **3a (isolation, no fork):** `a_nested_compiled_c_command_reads_a_file_through_a_granted_fs_cap` — a
@@ -523,7 +523,7 @@ in `c_fork.rs`:
 - **3b (the full loop):** `a_compiled_c_program_forks_execs_a_real_command_that_reads_a_file_and_waits`
   — `fork()` → `execve(cat)` → `wait()`, all compiled C, with the manager re-granting **five** caps
   (fork/wait offers, stdout, cmd, vm_fs). The parent reaps the `cat`'s exit (the byte count).
-- **The binding half (the one svm-interp change):** `bind_child_manifest` now binds a compiled-C
+- **The binding half (the one temen-interp change):** `bind_child_manifest` now binds a compiled-C
   `call.sym "vm_fs"` (chibicc's `__vm_fs`, op-in-arg0) to a **`HostProc`** re-granted to the child by
   name. A raw host cap carries no typed interface, so there's no coverage walk — a flat import binds
   op-0 straight to the handle, and the `CAP_IMPORT_TYPE_ID` translation routes the call (with the fs op
@@ -599,7 +599,7 @@ command returns `envp[0][2]='7'`=55). A libc `getenv` walking `envp`/`environ` i
 follow-up (a shim, not a substrate concern).
 
 **What breaks / is still missing** (the honest gap list from that experiment, shell-relevance order):
-- **~~argv/env-seeding ergonomics~~ — a process libc shim. DONE.** `crates/svm/tests/fork_shim.c` is the
+- **~~argv/env-seeding ergonomics~~ — a process libc shim. DONE.** `crates/temen/tests/fork_shim.c` is the
   guest-side layer a shell links so it writes the idiomatic loop —
   `pid = fork(); if (pid == 0) execvp(cmd, argv); else wait_pid(pid);` — over a NUL-terminated `argv[]`,
   instead of hand-marshalling the buffer: `fork`/`wait_pid`(`pid`/`-1`/`-pgid`)/`setpgid`/`execvp`
@@ -706,13 +706,13 @@ cap op by design. This section is the convergence plan and the as-built record.
 ### 9.0 Where it stands (2026-08-07)
 
 - **Honest matrix.** The process/serve/fork ops are their own `OPS_PARITY.md` family
-  (`process, serve & fork`), classified per-backend by `svm-parity`'s `parity_capcall` — instead of
+  (`process, serve & fork`), classified per-backend by `temen-parity`'s `parity_capcall` — instead of
   hiding inside the one `cap.call` row that (wrongly) read ✅✅✅. `clone_caller`/`reap` show ✅ on
   tree-walk + bytecode, 🚧 on Cranelift, ⛔ on the wasm-JIT (leaf accelerator — it folds *every* cap
   op by design, so fork stays ⛔ there like `cap.call`). `svc.poll`/`svc.wait` are ✅ on the fast
   backends (native serve loop when serve-qualified); the Instantiator spawn/join ops are ✅ too.
 - **Native bytecode fork — DONE.** `clone_caller` + `reap` run natively on the bytecode cooperative
-  serve driver. `clone_caller`/`reap` are a `has_fork` seam that `svc_park_veto` keeps (so svm-run's
+  serve driver. `clone_caller`/`reap` are a `has_fork` seam that `svc_park_veto` keeps (so temen-run's
   Cranelift routing still folds fork), while the bytecode compile gate takes a bounded
   `Seams::bytecode_serves_fork` escape past it — the per-backend split. The twin is the parked
   caller's `Vm` cloned at its post-call resume point over a private window (`Mem::fork_private`) +
@@ -786,18 +786,18 @@ Cranelift fork does **not** "follow the same arc" as bytecode — that earlier f
 bytecode twin works because a parked caller is a **reified `Vm` (Clone-derived)** at its post-call
 resume point. On the JIT there is **no reified continuation to clone**: `cap.call` is a synchronous
 host thunk, so a caller mid-call is a **live native OS-thread stack** — either running the handler
-inline (handoff) or thread-blocked on the `live_impl_call` Condvar (`svm-run/src/lib.rs:2270`). The
+inline (handoff) or thread-blocked on the `live_impl_call` Condvar (`temen-run/src/lib.rs:2270`). The
 JIT's durable machinery reifies a continuation into shadow-stack bytes **only at a poll safepoint,
 which is always *past* a completed `cap.call`** (a `SuspendKind::Leaf` spills + reloads the
-*already-returned* result; `svm-durable/src/lib.rs:888,929`). There is no `Blocked::CapReply` state
-on the JIT at all (`svm-jit/src/fiber_registry.rs` has no cap-park concept), and `freeze_drive`
-(`svm-jit/src/fiber_rt.rs:1121`) walks only voluntarily-suspended `RUNNABLE` fibers, whole-run.
+*already-returned* result; `temen-durable/src/lib.rs:888,929`). There is no `Blocked::CapReply` state
+on the JIT at all (`temen-jit/src/fiber_registry.rs` has no cap-park concept), and `freeze_drive`
+(`temen-jit/src/fiber_rt.rs:1121`) walks only voluntarily-suspended `RUNNABLE` fibers, whole-run.
 
 So the capstone is **not** DURABILITY §10 "clone at a quiescent point" (cheap snapshot/restore) — a
 forking caller is *not* quiescent. It is: **make a JIT `cap.call` a suspendable, pre-result durable
 safepoint**, so a forking caller unwinds to a reified continuation (shadow-stack bytes in the window)
 instead of thread-blocking. The snapshot format is already engine-agnostic and cloneable
-(`svm-snapshot`, magic `SVMD`), and the interp's live `fork_parked_caller` is the semantic oracle —
+(`temen-snapshot`, magic `SVMD`), and the interp's live `fork_parked_caller` is the semantic oracle —
 so the real work is turning the JIT call into a reifiable park. The four items, in dependency order:
 
 1. **The inject-vs-reload distinction is *runtime*, not a new compile-time `SuspendKind`** (refined
@@ -808,10 +808,10 @@ so the real work is turning the JIT call into a reifiable park. The four items, 
    The gap is therefore not "a new suspend kind" but item 2: getting the caller to reach a *reified,
    pre-result* park at the fork call so the slot exists to write. (The interp does the runtime version
    of exactly this — `pending = CapResult(reply)` on the live vCPU.)
-2. **Suspendable `cap.call` on the JIT — the load-bearing re-architecture** (`svm-jit` lowering +
-   `svm-run` serve path). *Why it is unavoidable:* in **both** live-offer transports the caller's
+2. **Suspendable `cap.call` on the JIT — the load-bearing re-architecture** (`temen-jit` lowering +
+   `temen-run` serve path). *Why it is unavoidable:* in **both** live-offer transports the caller's
    continuation is a **native Rust frame**, unreifiable — the enqueue path thread-blocks the caller on
-   the `live_impl_call` Condvar (`svm-run:2270`), and the handoff path runs the handler on the caller's
+   the `live_impl_call` Condvar (`temen-run:2270`), and the handoff path runs the handler on the caller's
    own thread with the caller's guest continuation suspended *below* it on the native C stack. A servicer
    in another frame/thread cannot reify either. The fix: a live-offer `cap.call` from a durable guest,
    when the reply is withheld, must **durable-unwind the caller's shadow stack (pre-result) back to the

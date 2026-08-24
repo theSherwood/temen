@@ -1,7 +1,7 @@
 //! libFuzzer target: the freeze/thaw equivalence property (DURABILITY.md §7/§12.6).
 //!
 //! The input bytes drive the in-scope durable-module generator
-//! (`crates/svm-durable/tests/support/durgen.rs`, shared with the stable
+//! (`crates/temen-durable/tests/support/durgen.rs`, shared with the stable
 //! `durable_fuzz` test): synthesize a verifier-valid in-scope module, then assert both
 //! that instrumentation is inert in `NORMAL` state and that
 //! freeze → serialize → restore → thaw equals the uninterrupted run. A crash here is a
@@ -12,7 +12,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-#[path = "../../crates/svm-durable/tests/support/durgen.rs"]
+#[path = "../../crates/temen-durable/tests/support/durgen.rs"]
 mod durgen;
 
 fuzz_target!(|data: &[u8]| {

@@ -1,6 +1,6 @@
 // The **snapshot worker** (WASM_AOT.md warm+JIT · issue #804). Owns the warm-runtime snapshot session for
 // the playground's warm cards (QuickJS) on a dedicated Web Worker with its **own private engine instance
-// and memory** — so the ~one-time QuickJS `warmup` (`svm_warm_open`) and every eval run entirely off the
+// and memory** — so the ~one-time QuickJS `warmup` (`temen_warm_open`) and every eval run entirely off the
 // main thread. The main thread pre-warms at page load and dispatches each Run as a message; it never
 // blocks on the ~0.9 s warmup or a compute-heavy eval.
 //
@@ -36,8 +36,8 @@ const readStr = (ptrFn, lenFn) => {
   const l = Number(ex[lenFn]());
   return p && l ? new TextDecoder().decode(u8().slice(p, p + l)) : '';
 };
-const readStdout = () => readStr('svm_stdout_ptr', 'svm_stdout_len');
-const readStderr = () => readStr('svm_stderr_ptr', 'svm_stderr_len');
+const readStdout = () => readStr('temen_stdout_ptr', 'temen_stdout_len');
+const readStderr = () => readStr('temen_stderr_ptr', 'temen_stderr_len');
 
 // Open (or reuse) the warm session for `url`'s module `bytes` — runs `warmup` once and snapshots the
 // post-init image (mirrors play.js's `ensureWarmSession`). Returns true on success; false if the module
@@ -45,11 +45,11 @@ const readStderr = () => readStr('svm_stderr_ptr', 'svm_stderr_len');
 function ensureWarm(url, bytes) {
   if (warmUrl === url) return true;
   if (!bytes) return false;
-  const p = Number(ex.svm_alloc(bytes.length));
+  const p = Number(ex.temen_alloc(bytes.length));
   u8().set(bytes, p);
-  const live = Number(ex.svm_warm_open(p, bytes.length));
-  ex.svm_dealloc(p, bytes.length);
-  if (live < 0 || ex.svm_status() !== 0) {
+  const live = Number(ex.temen_warm_open(p, bytes.length));
+  ex.temen_dealloc(p, bytes.length);
+  if (live < 0 || ex.temen_status() !== 0) {
     warmUrl = null;
     return false;
   }
@@ -64,7 +64,7 @@ async function evalWarm(source, jit) {
   if (jit) {
     try {
       const status = await runWarmJit(ex, memory, stdinBytes, `${warmUrl}#eval`, 1);
-      return { tier: 'warm+JIT', status, value: Number(ex.svm_run_value()), stdout: readStdout(), stderr: readStderr() };
+      return { tier: 'warm+JIT', status, value: Number(ex.temen_run_value()), stdout: readStdout(), stderr: readStderr() };
     } catch {
       // decline / trap → fall through to the warm interpreter
     }
@@ -72,14 +72,14 @@ async function evalWarm(source, jit) {
   let stdinP = 0;
   const len = stdinBytes ? stdinBytes.length : 0;
   if (len) {
-    stdinP = Number(ex.svm_alloc(len));
+    stdinP = Number(ex.temen_alloc(len));
     u8().set(stdinBytes, stdinP);
   }
-  const value = Number(ex.svm_warm_eval(stdinP, len));
-  const status = ex.svm_status();
+  const value = Number(ex.temen_warm_eval(stdinP, len));
+  const status = ex.temen_status();
   const stdout = readStdout();
   const stderr = readStderr();
-  if (stdinP) ex.svm_dealloc(stdinP, len);
+  if (stdinP) ex.temen_dealloc(stdinP, len);
   return { tier: 'warm-snapshot', status, value, stdout, stderr };
 }
 
@@ -93,7 +93,7 @@ self.onmessage = async (e) => {
       memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
       ({ exports: ex } = await WebAssembly.instantiate(msg.module, {
         env: { memory },
-        svm_host: { webgpu_op: () => -1n },
+        temen_host: { webgpu_op: () => -1n },
       }));
       self.postMessage({ type: 'ready' });
       return;
@@ -102,7 +102,7 @@ self.onmessage = async (e) => {
       const ok = ensureWarm(msg.url, msg.bytes);
       // Reply as soon as warm-interp is ready (the ~0.9 s `warmup`) — do NOT block on the JIT pre-compile,
       // so an early interpreter Run isn't delayed by it.
-      self.postMessage({ type: 'reply', id: msg.id, ok, status: ok ? 0 : ex.svm_status() });
+      self.postMessage({ type: 'reply', id: msg.id, ok, status: ok ? 0 : ex.temen_status() });
       if (ok && !interpWarmPromise) {
         // First, a dry warm-**interp** eval (empty input) so V8 compiles the interpreter eval path now,
         // off the main thread — the first real warm-snapshot Run then pays no first-call codegen.
@@ -142,7 +142,7 @@ self.onmessage = async (e) => {
     }
     if (msg.type === 'nimCompile') {
       // Compile a whole Nim program through the nimony toolchain on THIS worker (nifler → nimsem → hexer
-      // → svm-leng → link → run under the powerbox), so a multi-minute compile — or a runaway guest that
+      // → temen-leng → link → run under the powerbox), so a multi-minute compile — or a runaway guest that
       // never returns — stalls only this worker, never the page. Mirrors play.js's main-thread `runNimc`.
       if (!nimAssets) {
         self.postMessage({ type: 'reply', id: msg.id, ok: false, error: 'nim assets not loaded' });
@@ -151,14 +151,14 @@ self.onmessage = async (e) => {
       const { nifler, nimsem, hexer, stdlib } = nimAssets;
       const src = new TextEncoder().encode(msg.source);
       const main = new TextEncoder().encode(msg.main || 'prog.nim');
-      // Alloc every buffer before writing any (svm_alloc may grow/detach linear memory), then take one
+      // Alloc every buffer before writing any (temen_alloc may grow/detach linear memory), then take one
       // fresh view and fill them — the same discipline as play.js's `runNimc`.
-      const np = Number(ex.svm_alloc(nifler.length));
-      const smp = Number(ex.svm_alloc(nimsem.length));
-      const hp = Number(ex.svm_alloc(hexer.length));
-      const ip = Number(ex.svm_alloc(stdlib.length));
-      const sp = Number(ex.svm_alloc(src.length));
-      const mp = Number(ex.svm_alloc(main.length));
+      const np = Number(ex.temen_alloc(nifler.length));
+      const smp = Number(ex.temen_alloc(nimsem.length));
+      const hp = Number(ex.temen_alloc(hexer.length));
+      const ip = Number(ex.temen_alloc(stdlib.length));
+      const sp = Number(ex.temen_alloc(src.length));
+      const mp = Number(ex.temen_alloc(main.length));
       const view = u8();
       view.set(nifler, np);
       view.set(nimsem, smp);
@@ -166,16 +166,16 @@ self.onmessage = async (e) => {
       view.set(stdlib, ip);
       view.set(src, sp);
       view.set(main, mp);
-      ex.svm_compile_nim_fs(
+      ex.temen_compile_nim_fs(
         np, nifler.length, smp, nimsem.length, hp, hexer.length,
         ip, stdlib.length, sp, src.length, mp, main.length);
-      const status = ex.svm_status();
-      ex.svm_dealloc(np, nifler.length);
-      ex.svm_dealloc(smp, nimsem.length);
-      ex.svm_dealloc(hp, hexer.length);
-      ex.svm_dealloc(ip, stdlib.length);
-      ex.svm_dealloc(sp, src.length);
-      ex.svm_dealloc(mp, main.length);
+      const status = ex.temen_status();
+      ex.temen_dealloc(np, nifler.length);
+      ex.temen_dealloc(smp, nimsem.length);
+      ex.temen_dealloc(hp, hexer.length);
+      ex.temen_dealloc(ip, stdlib.length);
+      ex.temen_dealloc(sp, src.length);
+      ex.temen_dealloc(mp, main.length);
       self.postMessage({ type: 'reply', id: msg.id, ok: true, status, stdout: readStdout(), stderr: readStderr() });
       return;
     }

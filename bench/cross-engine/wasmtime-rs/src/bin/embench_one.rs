@@ -1,7 +1,7 @@
 //! In-process Wasmtime (Cranelift) timer for **one** Embench cross-engine kernel — the wasmtime
 //! counterpart to `bench/embench/wasm/run.mjs` (V8). Loads a self-contained module exporting
 //! `run(long n)` (no imports), warms it up so Cranelift compiles at instantiate, then prints one
-//! per-iteration time and the verify result, same methodology as the native/SVM/V8 drivers:
+//! per-iteration time and the verify result, same methodology as the native/Temen/V8 drivers:
 //! per_iter = (min t(large) - min t(small)) / (large - small), min over reps.
 //!
 //!   embench_one <kernel.wasm> <small> <large> <verify_n>

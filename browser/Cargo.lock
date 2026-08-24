@@ -167,136 +167,136 @@ dependencies = [
 ]
 
 [[package]]
-name = "svm-browser"
+name = "temen-browser"
 version = "0.0.0"
 dependencies = [
- "svm-dap",
- "svm-durable",
- "svm-encode",
- "svm-exec",
- "svm-fs",
- "svm-interp",
- "svm-ir",
- "svm-leng",
- "svm-opt",
- "svm-posix",
- "svm-text",
- "svm-verify",
- "svm-wasm-jit",
+ "temen-dap",
+ "temen-durable",
+ "temen-encode",
+ "temen-exec",
+ "temen-fs",
+ "temen-interp",
+ "temen-ir",
+ "temen-leng",
+ "temen-opt",
+ "temen-posix",
+ "temen-text",
+ "temen-verify",
+ "temen-wasm-jit",
  "wasmi",
 ]
 
 [[package]]
-name = "svm-dap"
+name = "temen-dap"
 version = "0.0.0"
 dependencies = [
- "svm-interp",
- "svm-ir",
- "svm-text",
+ "temen-interp",
+ "temen-ir",
+ "temen-text",
 ]
 
 [[package]]
-name = "svm-durable"
+name = "temen-durable"
 version = "0.0.0"
 dependencies = [
- "svm-ir",
+ "temen-ir",
 ]
 
 [[package]]
-name = "svm-encode"
+name = "temen-encode"
 version = "0.0.0"
 dependencies = [
- "svm-ir",
+ "temen-ir",
 ]
 
 [[package]]
-name = "svm-exec"
+name = "temen-exec"
 version = "0.0.0"
 dependencies = [
- "svm-interp",
- "svm-ir",
+ "temen-interp",
+ "temen-ir",
 ]
 
 [[package]]
-name = "svm-fs"
+name = "temen-fs"
 version = "0.0.0"
 dependencies = [
- "svm-interp",
- "svm-ir",
+ "temen-interp",
+ "temen-ir",
 ]
 
 [[package]]
-name = "svm-interp"
+name = "temen-interp"
 version = "0.0.0"
 dependencies = [
  "page_size",
- "svm-encode",
- "svm-ir",
- "svm-mask",
- "svm-mem",
- "svm-verify",
+ "temen-encode",
+ "temen-ir",
+ "temen-mask",
+ "temen-mem",
+ "temen-verify",
 ]
 
 [[package]]
-name = "svm-ir"
+name = "temen-ir"
 version = "0.0.0"
 
 [[package]]
-name = "svm-leng"
+name = "temen-leng"
 version = "0.0.0"
 dependencies = [
- "svm-encode",
- "svm-ir",
- "svm-text",
+ "temen-encode",
+ "temen-ir",
+ "temen-text",
 ]
 
 [[package]]
-name = "svm-mask"
+name = "temen-mask"
 version = "0.0.0"
 
 [[package]]
-name = "svm-mem"
+name = "temen-mem"
 version = "0.0.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
-name = "svm-opt"
+name = "temen-opt"
 version = "0.0.0"
 dependencies = [
  "libm",
- "svm-ir",
- "svm-verify",
+ "temen-ir",
+ "temen-verify",
 ]
 
 [[package]]
-name = "svm-posix"
+name = "temen-posix"
 version = "0.0.0"
 dependencies = [
- "svm-interp",
- "svm-ir",
+ "temen-interp",
+ "temen-ir",
 ]
 
 [[package]]
-name = "svm-text"
+name = "temen-text"
 version = "0.0.0"
 dependencies = [
- "svm-ir",
+ "temen-ir",
 ]
 
 [[package]]
-name = "svm-verify"
+name = "temen-verify"
 version = "0.0.0"
 dependencies = [
- "svm-ir",
+ "temen-ir",
 ]
 
 [[package]]
-name = "svm-wasm-jit"
+name = "temen-wasm-jit"
 version = "0.0.0"
 dependencies = [
- "svm-ir",
+ "temen-ir",
 ]
 
 [[package]]

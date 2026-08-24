@@ -4,21 +4,21 @@
 //! open_with_fs`] serves one read-only in-memory file behind that cap, using the same open/read/seek
 //! op protocol as the native `doom_diff` differential's WAD server.
 //!
-//! Fixture `fixtures/fsread.svmb` (`display/fsread.c`, `clang -O2` + `svm-llvm-translate --host-page
+//! Fixture `fixtures/fsread.temen` (`display/fsread.c`, `clang -O2` + `temen-llvm-translate --host-page
 //! 65536`): `_start` opens "data.bin", seeks to END for its size, seeks back, reads the bytes; each
 //! `tick` renders those bytes as a 16×16 grayscale frame (pixel i's R=G=B is byte i, or 0 past the
 //! end). So a served blob round-trips through the `fs` cap into guest memory and back out as pixels —
 //! the differential anchor for the reactor's file-serving plumbing.
 
-use svm_browser::{Frame, OnrampReactor, STATUS_OK};
+use temen_browser::{Frame, OnrampReactor, STATUS_OK};
 
 const W: u32 = 16;
 const H: u32 = 16;
 
 /// Open the fsread reactor with `blob` served as "data.bin" through the `fs` capability.
 fn open_with(blob: Vec<u8>) -> OnrampReactor {
-    let bytes = include_bytes!("fixtures/fsread.svmb");
-    let m = svm_encode::decode_module(bytes).expect("decode fsread.svmb");
+    let bytes = include_bytes!("fixtures/fsread.temen");
+    let m = temen_encode::decode_module(bytes).expect("decode fsread.temen");
     OnrampReactor::open_with_fs(&m, "data.bin".to_string(), blob).expect("open the fsread reactor")
 }
 
@@ -82,8 +82,8 @@ fn reactor_without_fs_open_still_works() {
     // A blob that never matches: the guest asks for "data.bin", we serve "other.bin", so `open`
     // returns ENOENT and the guest reads nothing (len stays 0). The reactor still runs — an absent
     // file is not a trap — and every pixel is 0.
-    let bytes = include_bytes!("fixtures/fsread.svmb");
-    let m = svm_encode::decode_module(bytes).expect("decode fsread.svmb");
+    let bytes = include_bytes!("fixtures/fsread.temen");
+    let m = temen_encode::decode_module(bytes).expect("decode fsread.temen");
     let mut r = OnrampReactor::open_with_fs(&m, "other.bin".to_string(), vec![1, 2, 3])
         .expect("open the fsread reactor");
     let f = step(&mut r);

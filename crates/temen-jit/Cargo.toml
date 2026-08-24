@@ -1,0 +1,73 @@
+[package]
+name = "temen-jit"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+# Passthrough to temen-fiber's ASan fiber-switch annotations (the sanitizer job).
+asan = ["temen-fiber/asan"]
+# Opt temen-fiber back to the guard-paged control-stack backend (rollback, or the guard-page overflow
+# oracle the `stack_guard_fuzz` test needs — run it with `--features guard-page-stacks`).
+guard-page-stacks = ["temen-fiber/guard-page-stacks"]
+# The software stack-limit check in every JIT function prologue is now ALWAYS emitted (it is the
+# escape-TCB overflow defense once the arena drops the guard page; see `emit_stack_check`), so this
+# feature no longer gates the check. It is retained as a no-op only so the existing CI invocations
+# (`--features stack-check`) keep working and to gate the guard-specific test suites
+# (`tests/stack_check.rs`, `tests/stack_guard_fuzz.rs`) into the dedicated lanes.
+stack-check = []
+
+[dev-dependencies]
+# Parse hand-written text IR in the `stack-check` guard test (temen-text → temen-ir; no dep cycle).
+temen-text = { path = "../temen-text" }
+# The bulk-memory differential test (`bulk_mem.rs`) cross-checks the JIT against both interpreters and
+# the verifier. None of these depend on temen-jit, so there is no cycle.
+temen-interp = { path = "../temen-interp" }
+temen-verify = { path = "../temen-verify" }
+
+[dependencies]
+cranelift-codegen = "0.132.0"
+cranelift-frontend = "0.132.0"
+cranelift-jit = "0.132.0"
+cranelift-module = "0.132.0"
+cranelift-native = "0.132.0"
+temen-ir.workspace = true
+# The native stack-switch substrate for JIT fibers/green threads (§12). Real impl on x86-64 unix;
+# elsewhere `supported()` is false and the JIT keeps bailing `Unsupported` on fiber ops.
+temen-fiber.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Guard-paged window + the SIGSEGV/SIGBUS detect-and-kill handler (§4/§5) — unix only;
+# other targets fall back to a plain heap window with no hardware guard.
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# The windows PAL (§4 "Platform support", Phase 3.5): VirtualAlloc/VirtualProtect/VirtualFree for
+# the reserved guard-paged window, and a Vectored Exception Handler + RtlCaptureContext for
+# detect-and-kill. Pure Rust (no C shim), so the path stays `cargo check --target *-windows-*`-able.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_SystemInformation",
+    "Win32_System_Kernel",
+    "Win32_System_Threading",
+] }
+
+[build-dependencies]
+# `build.rs` compiles src/trap_shim.c (the setjmp/siglongjmp recovery — a macro that needs the C
+# compiler's returns_twice handling, so it can't be sound raw FFI). The crate must be present on
+# *every* host (build scripts run on the host), but the shim is only compiled for **unix targets**
+# — `build.rs` gates the actual `cc::Build` call on `CARGO_CFG_UNIX`, so a windows build pulls `cc`
+# but never invokes a C compiler. (Gating the dep itself on `cfg(unix)` matches the *host*, which
+# breaks building on a windows host — the cross-check from a unix host can't catch that.)
+cc = "1"
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[lints.rust]
+# `--cfg loom` is set manually for loom model-checking runs; tell rustc it's expected.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

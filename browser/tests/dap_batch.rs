@@ -1,4 +1,4 @@
-//! The DAP **array-pump** (INTERACTIVE_EMBEDDING.md, the step+reads bundle): `svm_dap_request`
+//! The DAP **array-pump** (INTERACTIVE_EMBEDDING.md, the step+reads bundle): `temen_dap_request`
 //! accepts a top-level JSON *array* of requests and returns the concatenated reply array — a step
 //! plus N state reads in a single FFI crossing. A single object stays the one-request pump with an
 //! identical reply shape.
@@ -6,8 +6,10 @@
 //! One `#[test]` only: the pump's stashes (`DAP_SERVER`/`DAP_OUT`) are main-thread singletons, and
 //! Rust runs a binary's tests on threads.
 
-use svm_browser::{svm_dap_request, svm_dap_reset, svm_dap_response_len, svm_dap_response_ptr};
-use svm_dap::Json;
+use temen_browser::{
+    temen_dap_request, temen_dap_reset, temen_dap_response_len, temen_dap_response_ptr,
+};
+use temen_dap::Json;
 
 // The dap_bytecode.rs LOOP_SUM fixture: a countdown-sum loop with a §6/W4 debug section binding
 // sum.c:7 to the loop body and naming the two loop variables.
@@ -47,11 +49,11 @@ fn req(seq: i64, command: &str, args: Json) -> Json {
 /// Feed `msg` through the cdylib pump and parse the stashed reply array.
 fn pump(msg: &Json) -> Vec<Json> {
     let text = msg.to_string();
-    assert_eq!(svm_dap_request(text.as_ptr(), text.len()), 0, "pump ok");
+    assert_eq!(temen_dap_request(text.as_ptr(), text.len()), 0, "pump ok");
     let raw = unsafe {
-        std::slice::from_raw_parts(svm_dap_response_ptr(), svm_dap_response_len()).to_vec()
+        std::slice::from_raw_parts(temen_dap_response_ptr(), temen_dap_response_len()).to_vec()
     };
-    let reply = svm_dap::parse(std::str::from_utf8(&raw).expect("utf8")).expect("json");
+    let reply = temen_dap::parse(std::str::from_utf8(&raw).expect("utf8")).expect("json");
     match reply {
         Json::Arr(msgs) => msgs,
         other => panic!("reply is not an array: {other:?}"),
@@ -66,7 +68,7 @@ fn responses(msgs: &[Json]) -> Vec<&Json> {
 
 #[test]
 fn array_pump_batches_requests_in_one_crossing() {
-    svm_dap_reset();
+    temen_dap_reset();
 
     // A single object stays the one-request pump: one response.
     let one = pump(&req(1, "initialize", Json::obj(vec![])));

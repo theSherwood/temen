@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Regenerate the partial-evaluation performance report (PEVAL_BENCH.md).
 
-Runs the CSV-emitting partial-evaluation benches in `svm-peval` and `svm-llvm`
-with `SVM_BENCH_CSV=1`, collects the `CSV,<bench>,<case>,<metric>,<value>` rows
+Runs the CSV-emitting partial-evaluation benches in `temen-peval` and `temen-llvm`
+with `TEMEN_BENCH_CSV=1`, collects the `CSV,<bench>,<case>,<metric>,<value>` rows
 they print, and renders one consolidated markdown report.
 
     python3 scripts/peval_bench_report.py [output.md]   # default: PEVAL_BENCH.md
 
 It is slow (~2 min): it runs the `--ignored` timing benches, including the
 end-to-end Futamura ROI loop. Timings are single-run and machine-dependent —
-the report records the host so numbers are interpreted in context. `svm-llvm`
+the report records the host so numbers are interpreted in context. `temen-llvm`
 needs `clang` on PATH (it compiles the real BF/Lisp interpreters from C).
 """
 
@@ -23,35 +23,35 @@ import collections
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
-# (label, cwd, argv) — each command prints CSV rows on stdout when SVM_BENCH_CSV is set.
+# (label, cwd, argv) — each command prints CSV rows on stdout when TEMEN_BENCH_CSV is set.
 BENCHES = [
     (
         "size_corpus",
         REPO,
-        ["cargo", "test", "-p", "svm-peval", "--test", "bench", "size_corpus",
+        ["cargo", "test", "-p", "temen-peval", "--test", "bench", "size_corpus",
          "--", "--nocapture"],
     ),
     (
         "gain_spectrum",
         REPO,
-        ["cargo", "test", "-p", "svm-peval", "--test", "bench", "gain_spectrum",
+        ["cargo", "test", "-p", "temen-peval", "--test", "bench", "gain_spectrum",
          "--", "--ignored", "--nocapture"],
     ),
     (
         "roi_futamura_loop",
         REPO,
-        ["cargo", "test", "-p", "svm-peval", "--test", "bench", "roi_futamura_loop",
+        ["cargo", "test", "-p", "temen-peval", "--test", "bench", "roi_futamura_loop",
          "--", "--ignored", "--nocapture"],
     ),
     (
         "demo_corpus",
         REPO,
-        ["cargo", "test", "-p", "svm-peval", "--test", "bench", "demo_corpus",
+        ["cargo", "test", "-p", "temen-peval", "--test", "bench", "demo_corpus",
          "--", "--nocapture"],
     ),
     (
         "peval_corpus",
-        REPO / "crates" / "svm-llvm",
+        REPO / "crates" / "temen-llvm",
         ["cargo", "test", "--test", "peval_corpus", "corpus_metric_matrix",
          "--", "--ignored", "--nocapture"],
     ),
@@ -59,22 +59,22 @@ BENCHES = [
 
 # Human-readable one-liners for each bench section.
 DESCRIPTIONS = {
-    "size_corpus": "Static size reduction across toy interpreter shapes (svm-peval).",
+    "size_corpus": "Static size reduction across toy interpreter shapes (temen-peval).",
     "gain_spectrum": "Toy gain gradient: folding programs, then loops with growing per-iteration "
-                     "work — JIT run-time speedup, compile excluded (svm-peval).",
+                     "work — JIT run-time speedup, compile excluded (temen-peval).",
     "roi_futamura_loop": "End-to-end Futamura ROI: sum 1..N as a register-machine loop, all four "
-                         "execution configs (svm-peval).",
+                         "execution configs (temen-peval).",
     "demo_corpus": "The in-sandbox guest demos (peval_jit, peval_futamura), measured host-side: the "
-                   "size win of specializing each (interpreter → residual → optimized) (svm-peval).",
+                   "size win of specializing each (interpreter → residual → optimized) (temen-peval).",
     "peval_corpus": "Real clang-compiled interpreters (Brainfuck + Lisp) across a range of guest "
-                    "programs: size, PE/compile time, and run-time speedup (svm-llvm).",
+                    "programs: size, PE/compile time, and run-time speedup (temen-llvm).",
 }
 
 
 def run_all():
     """Run every bench; return rows [(bench, case, metric, value)] and any warnings."""
     rows, warnings = [], []
-    env = dict(os.environ, SVM_BENCH_CSV="1")
+    env = dict(os.environ, TEMEN_BENCH_CSV="1")
     for label, cwd, argv in BENCHES:
         print(f"  running {label} (cwd={cwd.name}) …", file=sys.stderr)
         proc = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True)

@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-if (!existsSync(join(HERE, 'target', 'wasm32-unknown-unknown', 'release', 'svm_browser.wasm'))) {
+if (!existsSync(join(HERE, 'target', 'wasm32-unknown-unknown', 'release', 'temen_browser.wasm'))) {
   console.log('SKIP: engine wasm not built (run the browser-real recipe first)');
   process.exit(0);
 }
@@ -23,7 +23,7 @@ if (!existsSync(join(HERE, 'target', 'wasm32-unknown-unknown', 'release', 'svm_b
 // leak-check pair) with the exact stdout each should print. Only cards whose asset is committed run.
 const CARDS = [
   {
-    name: 'JavaScript (QuickJS — write & run JS)', asset: 'qjs_snapshot.svmb',
+    name: 'JavaScript (QuickJS — write & run JS)', asset: 'qjs_snapshot.temen',
     plain: ['console.log("hi", 6 * 7);\n', 'hi 42'],
     heavy: ['let s=0;for(let i=0;i<200000;i++)s+=i;console.log("sum", s);\n', 'sum 19999900000'],
     leakSet: 'var leak = 4242; console.log("set", leak);\n',
@@ -31,7 +31,7 @@ const CARDS = [
     leakClean: (out) => out.includes('clean') && !out.includes('4242'),
   },
   {
-    name: 'Lua (5.4.7 — write & run)', asset: 'lua_snapshot.svmb',
+    name: 'Lua (5.4.7 — write & run)', asset: 'lua_snapshot.temen',
     plain: ['print("hi", 6 * 7)\n', 'hi\t42'],
     heavy: ['local s=0; for i=1,200000 do s=s+i end; print("sum", s)\n', 'sum\t20000100000'],
     leakSet: 'leaked = 4242; print("set", leaked)\n',
@@ -40,9 +40,9 @@ const CARDS = [
   },
   {
     // Tcl now runs BOTH warm tiers (#865: warm+JIT drives the emitted `eval_run` export, not the cold
-    // `_start`). The `tcl_snapshot.svmb` asset is deploy-built, so this entry is filtered out (skipped)
+    // `_start`). The `tcl_snapshot.temen` asset is deploy-built, so this entry is filtered out (skipped)
     // in the committed-asset CI job.
-    name: 'Tcl (8.6 — write & run)', asset: 'tcl_snapshot.svmb',
+    name: 'Tcl (8.6 — write & run)', asset: 'tcl_snapshot.temen',
     plain: ['puts [expr 6*7]\n', '42'],
     heavy: ['proc fib {n} {expr {$n<2?$n:[fib [expr $n-1]]+[fib [expr $n-2]]}}; puts [fib 20]\n', '6765'],
     leakSet: 'set leaked 4242; puts "set $leaked"\n',

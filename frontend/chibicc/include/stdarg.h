@@ -1,7 +1,7 @@
 #ifndef __STDARG_H
 #define __STDARG_H
 
-// SVM flat-buffer varargs ABI (DESIGN.md §3d). The caller marshals the promoted variadic
+// Temen flat-buffer varargs ABI (DESIGN.md §3d). The caller marshals the promoted variadic
 // arguments into a contiguous buffer — one 8-byte slot each — and passes a pointer to it
 // as a hidden trailing argument; inside the callee that pointer is `__va_area__`. This
 // replaces chibicc's x86-64 SysV register-save-area stdarg.h, which does not match our

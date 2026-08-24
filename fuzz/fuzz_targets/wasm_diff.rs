@@ -1,6 +1,6 @@
 //! libFuzzer target: generative interpreter-vs-**wasm-JIT** differential (`DESIGN.md` §18; issue
-//! #910). The input bytes drive the shared structured generator (`crates/svm/tests/support`), which
-//! synthesizes a verifier-valid module; it is emitted with `svm_wasm_jit::compile_module`, run under
+//! #910). The input bytes drive the shared structured generator (`crates/temen/tests/support`), which
+//! synthesizes a verifier-valid module; it is emitted with `temen_wasm_jit::compile_module`, run under
 //! `wasmi`, and held against the tree-walk oracle — result, termination, and (for a float-free memory
 //! module) the final window byte-for-byte. A crash here is a wasm-JIT confinement miscompile (the
 //! third confinement lowering — `emit_confine`/`emit_span_check`, INVARIANTS #2's "fuzzed hinge") or
@@ -11,7 +11,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-#[path = "../../crates/svm/tests/support/wasmdiff.rs"]
+#[path = "../../crates/temen/tests/support/wasmdiff.rs"]
 mod wasmdiff;
 
 fuzz_target!(|data: &[u8]| {

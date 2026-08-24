@@ -1,6 +1,6 @@
 //! **Real Lua: interpreter vs partial-evaluation residual vs native wasm (Wasmtime).**
 //!
-//! The Futamura arc (`crates/svm-llvm/tests/lua_futamura_*.rs`) measures the peval *residual* of the
+//! The Futamura arc (`crates/temen-llvm/tests/lua_futamura_*.rs`) measures the peval *residual* of the
 //! real `luaV_execute` against the interpreter and reports an ~11–19× per-iteration win — but only
 //! *within our own engine*. This bench adds the missing anchor: an **independent native baseline**,
 //! the same per-iteration kernel compiled Rust → wasm → Wasmtime (Cranelift). Three lanes, a gallery
@@ -11,9 +11,9 @@
 //! Kernels are real numeric loops whose body uses the loop variable and does genuine arithmetic
 //! (`s+i`, `s+i*i`, a fibonacci recurrence, `i%d` / `i//d` — the divisor a local, so a register
 //! operand). Each lane:
-//!   - **interpreter**: real `luaV_execute` through svm-jit on the Lua chunk (whole program).
+//!   - **interpreter**: real `luaV_execute` through temen-jit on the Lua chunk (whole program).
 //!   - **residual**: the dispatch-folded, loop-rolled specialization built by the shared
-//!     `futamura::auto_rolled` driver (the arc's payoff), through svm-jit.
+//!     `futamura::auto_rolled` driver (the arc's payoff), through temen-jit.
 //!   - **native**: the same per-iteration kernel in Rust, built to wasm32 and run on the same Wasmtime
 //!     this crate already links. All kernels live in one wasm module (built once) and the body reads
 //!     its inputs through `black_box`, so the optimizer can't close-form the loop.
@@ -25,15 +25,15 @@
 //! always runs.
 //!
 //! Run: `cargo run --release --manifest-path bench/Cargo.toml --bin peval_lua_vs_wasmtime`
-//! CSV:  `SVM_BENCH_CSV=1 cargo run --release … --bin peval_lua_vs_wasmtime`
+//! CSV:  `TEMEN_BENCH_CSV=1 cargo run --release … --bin peval_lua_vs_wasmtime`
 
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use svm_bench_vs_wasmtime::futamura::{auto_rolled, has_br_table, lua_module, with_readback};
-use svm_ir::Module;
+use temen_bench_vs_wasmtime::futamura::{auto_rolled, has_br_table, lua_module, with_readback};
+use temen_ir::Module;
 use wasmtime::{Config, Engine, Instance, Module as WtModule, Store, Val};
 
 // Differential trip counts (a 20M-iteration delta keeps the per-iteration number stable against
@@ -129,14 +129,14 @@ fn print_script(k: &Kernel, n: u64) -> String {
 }
 
 fn jit_run(m: &Module, e: u32, a: &[i64]) -> i64 {
-    match svm_jit::compile_and_run(m, e, a) {
-        Ok(svm_jit::JitOutcome::Returned(v)) => v[0],
+    match temen_jit::compile_and_run(m, e, a) {
+        Ok(temen_jit::JitOutcome::Returned(v)) => v[0],
         o => panic!("jit {o:?}"),
     }
 }
 
 fn interp_out(m: &Module, k: &Kernel, n: u64) -> i64 {
-    let out = svm_run::run_powerbox(m, print_script(k, n).as_bytes())
+    let out = temen_run::run_powerbox(m, print_script(k, n).as_bytes())
         .expect("interp")
         .stdout;
     String::from_utf8_lossy(&out)
@@ -176,7 +176,7 @@ fn build_wasm32(src_text: &str) -> Option<PathBuf> {
     let src = tmp("native.rs");
     std::fs::write(&src, src_text).ok()?;
     let wasm = tmp("native.wasm");
-    let rustc = std::env::var("SVM_RUSTBENCH_RUSTC").unwrap_or_else(|_| "rustc".into());
+    let rustc = std::env::var("TEMEN_RUSTBENCH_RUSTC").unwrap_or_else(|_| "rustc".into());
     let ok = Command::new(rustc)
         .args([
             "--edition",
@@ -197,7 +197,7 @@ fn build_wasm32(src_text: &str) -> Option<PathBuf> {
 
 /// `cargo +nightly build -Z build-std=core --target wasm64-unknown-unknown` in a throwaway project
 /// (wasm64 is tier-3, so it needs build-std). The LP64-matched native baseline DESIGN.md §1a cares
-/// about; opt in with `SVM_BENCH_W64=1`. `None` if nightly / rust-src / the target is absent.
+/// about; opt in with `TEMEN_BENCH_W64=1`. `None` if nightly / rust-src / the target is absent.
 fn build_wasm64(src_text: &str) -> Option<PathBuf> {
     let dir = tmp("w64proj");
     std::fs::create_dir_all(dir.join("src")).ok()?;
@@ -272,13 +272,13 @@ fn per_iter(t1: Duration, t2: Duration) -> f64 {
 }
 
 fn main() {
-    let csv = std::env::var("SVM_BENCH_CSV").is_ok();
-    let w64 = std::env::var("SVM_BENCH_W64").is_ok();
+    let csv = std::env::var("TEMEN_BENCH_CSV").is_ok();
+    let w64 = std::env::var("TEMEN_BENCH_W64").is_ok();
     let m = lua_module();
     let ks = kernels();
 
     // Native module: build all kernels once (or note the skip). wasm32 by default; wasm64 (the
-    // LP64-matched §1a baseline, needs nightly + build-std) when SVM_BENCH_W64=1.
+    // LP64-matched §1a baseline, needs nightly + build-std) when TEMEN_BENCH_W64=1.
     let src = native_source(&ks);
     let native_kind = if w64 { "wasm64" } else { "wasm32" };
     let mut native = if w64 {
@@ -312,7 +312,7 @@ fn main() {
         );
         let np = ar.dyn_cells.len();
         let (wm, we) = with_readback(&ar.residual, ar.entry, ar.acc_addr, np);
-        svm_verify::verify_module(&wm).expect("residual verifies");
+        temen_verify::verify_module(&wm).expect("residual verifies");
 
         let want = interp_out(&m, k, SAMPLE);
         assert_eq!(
@@ -335,14 +335,14 @@ fn main() {
         let interp_ns = {
             let t1 = best(|| {
                 black_box(
-                    svm_run::run_powerbox(&m, s1.as_bytes())
+                    temen_run::run_powerbox(&m, s1.as_bytes())
                         .expect("run")
                         .stdout,
                 );
             });
             let t2 = best(|| {
                 black_box(
-                    svm_run::run_powerbox(&m, s2.as_bytes())
+                    temen_run::run_powerbox(&m, s2.as_bytes())
                         .expect("run")
                         .stdout,
                 );
@@ -404,13 +404,13 @@ fn main() {
     if !csv {
         if native.is_some() {
             println!(
-                "\n(interp = luaV_execute via svm-jit; residual = folded auto_rolled via svm-jit; \
+                "\n(interp = luaV_execute via temen-jit; residual = folded auto_rolled via temen-jit; \
                  native = Rust→{native_kind}→Wasmtime.\n resid/nat = the residual's remaining gap to \
                  native — the Lua-ness that survives dispatch folding.{})",
                 if w64 {
                     ""
                 } else {
-                    " Set SVM_BENCH_W64=1 for the LP64-matched wasm64 baseline."
+                    " Set TEMEN_BENCH_W64=1 for the LP64-matched wasm64 baseline."
                 }
             );
         } else {

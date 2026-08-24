@@ -1,14 +1,14 @@
 //! The **`display` capability** — the framebuffer output waist (the path Doom rides). An on-ramp
 //! guest presents an RGBA frame via `__vm_cap_resolve("display")` + `__vm_host_call(h, 0, ptr, w, h)`,
 //! and [`onramp_exec`] captures it into `PbOutcome::framebuffer` for the browser to blit to a
-//! `<canvas>`. The wasm `svm_run_onramp` export exposes the same bytes via `svm_framebuffer_*`.
+//! `<canvas>`. The wasm `temen_run_onramp` export exposes the same bytes via `temen_framebuffer_*`.
 //!
-//! The fixture `fixtures/gradient.svmb` is `crates/svm-run/demos/display/gradient.c` compiled with
+//! The fixture `fixtures/gradient.temen` is `crates/temen-run/demos/display/gradient.c` compiled with
 //! stock `clang -O2 -emit-llvm` and translated (`--host-page 65536`, the wasm page — the same asset
 //! the playground fetches). Its image is a pure function of `(x, y)`, so the captured bytes are
 //! deterministic and a native `cc` build produces the identical frame (the differential anchor).
 
-use svm_browser::{onramp_exec, STATUS_OK};
+use temen_browser::{onramp_exec, STATUS_OK};
 
 const W: u32 = 128;
 const H: u32 = 128;
@@ -30,8 +30,8 @@ fn pixel(rgba: &[u8], x: u32, y: u32) -> [u8; 4] {
 
 #[test]
 fn gradient_presents_a_captured_frame() {
-    let bytes = include_bytes!("fixtures/gradient.svmb");
-    let m = svm_encode::decode_module(bytes).expect("decode gradient.svmb");
+    let bytes = include_bytes!("fixtures/gradient.temen");
+    let m = temen_encode::decode_module(bytes).expect("decode gradient.temen");
     let out = onramp_exec(&m, b"");
     assert_eq!(out.status, STATUS_OK, "the guest should run cleanly");
 

@@ -18,8 +18,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const need = ['web/assets/postgres_resolved.svmb', 'web/assets/pgdata.img',
-  'target/wasm32-unknown-unknown/release/svm_browser.wasm'];
+const need = ['web/assets/postgres_resolved.temen', 'web/assets/pgdata.img',
+  'target/wasm32-unknown-unknown/release/temen_browser.wasm'];
 const missing = need.filter((p) => !existsSync(join(HERE, p)));
 if (missing.length) {
   console.log(`SKIP: pg reload test — missing ${missing.join(', ')} (run \`node build-pg-assets.mjs\` + build the wasm)`);
@@ -27,7 +27,7 @@ if (missing.length) {
 }
 
 const PG = 'PostgreSQL (17.5 — write & run SQL)';
-const KEY = './assets/postgres_resolved.svmb'; // play.js keys the saved image by the module URL
+const KEY = './assets/postgres_resolved.temen'; // play.js keys the saved image by the module URL
 const sel = `[data-demo="${PG}"]`;
 
 // Resolve Playwright's `chromium` portably (CI installs it locally; this env has a global install).
@@ -54,7 +54,7 @@ const fail = (m) => { failed = true; console.log(`  FAIL: ${m}`); };
 // it opens the existing one play.js made, so probing can't race play.js into a storeless database.
 const savedSize = (page) => page.evaluate((k) => new Promise((resolve) => {
   const open = () => {
-    const req = indexedDB.open('svm-pg');
+    const req = indexedDB.open('temen-pg');
     req.onsuccess = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains('sessions')) return resolve(null);
@@ -65,7 +65,7 @@ const savedSize = (page) => page.evaluate((k) => new Promise((resolve) => {
     req.onerror = () => resolve(null);
   };
   if (indexedDB.databases) {
-    indexedDB.databases().then((list) => (list.some((d) => d.name === 'svm-pg') ? open() : resolve(null)));
+    indexedDB.databases().then((list) => (list.some((d) => d.name === 'temen-pg') ? open() : resolve(null)));
   } else {
     open();
   }

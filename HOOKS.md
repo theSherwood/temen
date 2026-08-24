@@ -17,7 +17,7 @@ posture (small trustworthy core; the confinement paths are the most sensitive co
 ## 2. Design: instrument the module, not the engines
 
 A hooked run executes a **rewritten module**: an IR-to-IR pass
-(`svm_opt::instrument::instrument_mem_hooks`) inserts, ahead of every guest memory op, a
+(`temen_opt::instrument::instrument_mem_hooks`) inserts, ahead of every guest memory op, a
 `cap.call` to an embedder-bound hook capability carrying the event kind and access coordinates.
 The engines are untouched — an instrumented module is an ordinary module.
 
@@ -53,7 +53,7 @@ Hooks fire **pre-access, pre-confinement-check**: the final event of a faulting 
 *attempted* faulting access, and the trace prefix is backend-identical.
 
 Event kinds (the `op` immediate of the inserted `cap.call`; constants in
-`svm_opt::instrument::mem_hook_op`, decoded to `svm_run::MemEvent`):
+`temen_opt::instrument::mem_hook_op`, decoded to `temen_run::MemEvent`):
 
 | kind | op | args |
 |---|---|---|
@@ -89,20 +89,20 @@ the pristine module (`MemHookStats::inserted_insts` lets an embedder scale `Limi
 
 ## 4. Implementation map
 
-- **Pass**: `crates/svm-opt/src/instrument.rs` — `instrument_mem_hooks(&Module, MemHookSpec)
+- **Pass**: `crates/temen-opt/src/instrument.rs` — `instrument_mem_hooks(&Module, MemHookSpec)
   -> (Module, MemHookStats)`. Pure, `no_std`, exhaustive block-local renumbering via the
   operand remapper (`map_operands`/`map_term_operands`). `MemHookSpec { type_id, handle }` keeps
-  svm-opt free of svm-interp; svm-run supplies `iface::HOST_FN`.
-- **Embedder API**: `crates/svm-run/src/lib.rs` — `Instance::with_mem_hooks(make)` instruments,
+  temen-opt free of temen-interp; temen-run supplies `iface::HOST_FN`.
+- **Embedder API**: `crates/temen-run/src/lib.rs` — `Instance::with_mem_hooks(make)` instruments,
   re-verifies (fail-closed), and stores the handler factory; `MemEvent` / `MemHookFn` are the
   public surface. The factory builds a fresh handler per host (`run_diff` grants two hosts);
   shared consumer state goes behind an `Arc` in the closure. `Instance::mem_hook_stats()` exposes
   the pass's inserted-op count for fuel scaling.
-- **C ABI**: `crates/svm-capi` — `svm_instance_with_mem_hooks(instance, hook, ctx)` consumes the
-  instance and returns a hooked one; the callback gets a flattened `SvmMemEvent { kind, addr, src,
-  size }` (the `SVM_MEM_*` kinds) and returns non-zero to veto. Trampolines into
-  `Instance::with_mem_hooks` exactly as `svm_imports_provide_host_fn` does for host-fns. Declared
-  in `include/svm.h`.
+- **C ABI**: `crates/temen-capi` — `temen_instance_with_mem_hooks(instance, hook, ctx)` consumes the
+  instance and returns a hooked one; the callback gets a flattened `TemenMemEvent { kind, addr, src,
+  size }` (the `TEMEN_MEM_*` kinds) and returns non-zero to veto. Trampolines into
+  `Instance::with_mem_hooks` exactly as `temen_imports_provide_host_fn` does for host-fns. Declared
+  in `include/temen.h`.
 - **Handle binding**: `cap.call` needs a handle constant at instrument time. Grants are
   deterministic, so `with_mem_hooks` discovers the value with a scratch first-grant on a fresh
   `Host`, bakes it, and `grant_caps` grants the hook **first** on every run's fresh host
@@ -110,26 +110,26 @@ the pristine module (`MemHookStats::inserted_insts` lets an embedder scale `Limi
   Bare-kernel exports (`run_kernel_diff`) run hostless on the JIT and are rejected for hooked
   instances with a clear error.
 - **Tests**:
-  - `crates/svm-opt/src/instrument.rs` unit tests — renumbering + re-verify; pristine ==
+  - `crates/temen-opt/src/instrument.rs` unit tests — renumbering + re-verify; pristine ==
     instrumented result with the expected trace (reference interpreter); an
     exhaustiveness gate cross-checking the hooked set against `Inst::effects()` so a future
     guest memory op cannot silently go untraced.
-  - `crates/svm/tests/mem_hooks_diff.rs` — the three-backend gate: identical event streams
+  - `crates/temen/tests/mem_hooks_diff.rs` — the three-backend gate: identical event streams
     (incl. v128 through the bytecode engine's `Op::Eval` fallback), unperturbed outcomes,
     faulting trace ends at the attempted access, veto aborts identically everywhere, and a
     multi-vCPU (`thread.spawn`) guest is observed without crashing (§6 findings).
-  - `crates/svm-capi/src/abi_tests.rs` — the C ABI observe + veto over all three backends.
-- **Worked example**: `crates/svm-run/examples/mem_hooks_cache_model.rs` — the educational use
+  - `crates/temen-capi/src/abi_tests.rs` — the C ABI observe + veto over all three backends.
+- **Worked example**: `crates/temen-run/examples/mem_hooks_cache_model.rs` — the educational use
   case made concrete: a direct-mapped cache + first-touch page-fault model driven by the event
   stream, scoring a cache-friendly vs a cache-hostile guest (identical 1024 loads, ~7.8× cycle
-  estimate gap). `cargo run -p svm-run --release --example mem_hooks_cache_model`.
+  estimate gap). `cargo run -p temen-run --release --example mem_hooks_cache_model`.
 
 ## 5. Zero-cost accounting
 
-Nothing under `crates/svm-interp`, `crates/svm-jit`, `crates/svm-mask`, or `crates/svm-mem`
+Nothing under `crates/temen-interp`, `crates/temen-jit`, `crates/temen-mask`, or `crates/temen-mem`
 changed for this feature — the un-opted path is the same machine code as before, by
-construction. The only touched crates are `svm-opt` (a new, never-called-by-default pass),
-`svm-run` (a `None` hooks field consulted at grant time, off the per-op path), and tests.
+construction. The only touched crates are `temen-opt` (a new, never-called-by-default pass),
+`temen-run` (a `None` hooks field consulted at grant time, off the per-op path), and tests.
 Benchmark A/B against `bench/baseline.txt` is still worth running on any commit that later
 touches an engine file; for this change the diff itself is the proof.
 
@@ -152,18 +152,18 @@ Adequate for scoring a student program (≤10⁹ accesses in seconds-to-minutes)
 ## 6. Status & follow-ups
 
 - [x] P0 — event vocabulary + firing contract (this doc, §3).
-- [x] P1 — instrumentation pass + re-verify + unit tests (`svm-opt`).
-- [x] P2 — `Instance::with_mem_hooks` + deterministic handle grant (`svm-run`).
-- [x] P3 — three-backend trace parity gate (`crates/svm/tests/mem_hooks_diff.rs`).
-- [x] C ABI surface (`svm-capi`): `svm_instance_with_mem_hooks(instance, hook, ctx)` +
-      `SvmMemEvent`/`SvmMemHook` in `include/svm.h`, observe + veto exercised in `abi_tests.rs`.
+- [x] P1 — instrumentation pass + re-verify + unit tests (`temen-opt`).
+- [x] P2 — `Instance::with_mem_hooks` + deterministic handle grant (`temen-run`).
+- [x] P3 — three-backend trace parity gate (`crates/temen/tests/mem_hooks_diff.rs`).
+- [x] C ABI surface (`temen-capi`): `temen_instance_with_mem_hooks(instance, hook, ctx)` +
+      `TemenMemEvent`/`TemenMemHook` in `include/temen.h`, observe + veto exercised in `abi_tests.rs`.
 - [x] Published hooked-run overhead number in the benchmark harness — `bench/`'s `hooks` bin
       (`cargo run --release --bin hooks`), hooked vs pristine on all three backends through the
       real `Instance::with_mem_hooks` path; first numbers in §5. `Instance::mem_hook_stats()`
       now exposes the pass's inserted-op count for fuel scaling.
 - [x] Multi-vCPU hooked runs **investigated** (finding, not a new mechanism): a `thread.spawn`
       guest runs hooked without crashing, and a spawned vCPU's accesses *are* observed. The run's
-      powerbox `Host` is shared across vCPUs via `Arc<Mutex<Host>>` (svm-interp lib.rs ~1881), so
+      powerbox `Host` is shared across vCPUs via `Arc<Mutex<Host>>` (temen-interp lib.rs ~1881), so
       the single hook handler is invoked **serialized under the host lock** — no data race, and a
       handler capturing plain state is sound. The one caveat is that **cross-vCPU event order is
       schedule-dependent** (within a vCPU it is ordered; `join`/atomics impose happens-before). So

@@ -2,7 +2,7 @@
  *
  * Embench source is NOT vendored here (mixed per-benchmark licenses); point the driver at a checkout
  * via $EMBENCH. This file `#include`s one benchmark's `.c` (so `run` can call its *static*
- * `benchmark_body`) and exposes a single entry the SVM frontend translates:
+ * `benchmark_body`) and exposes a single entry the Temen frontend translates:
  *
  *   long run(long n)  — run `n` Embench "iterations" (benchmark_body(n, GLOBAL_SCALE_FACTOR)) and
  *                       return verify_benchmark()'s strict pass/fail (1 == matched Embench's expected
@@ -11,15 +11,15 @@
  *
  * The benchmark's own `benchmark()` (which needs the scale-factor macros) is compiled but unused; we
  * call `benchmark_body` directly with our own `n`. `main` is compiled only for the native build
- * (timing harness); the SVM build defines SVM_BUILD so the bitcode carries no libc-calling `main`.
+ * (timing harness); the Temen build defines TEMEN_BUILD so the bitcode carries no libc-calling `main`.
  *
  * Required -D: BENCH_SRC="\"<abs path to the benchmark .c>\"" (the file defining benchmark_body /
  * initialise_benchmark). Optional:
  *   - BEEBS_SRC       — for benchmarks that use the BEEBS rand/heap (e.g. crc32).
  *   - BENCH_EXTRA1/2  — extra "\"...\""-quoted .c paths for *multi-translation-unit* kernels
  *                       (picojpeg/qrduino/xgboost): the library .c files are `#include`d here too, so the
- *                       whole kernel compiles as one TU → the SVM bitcode is a single module (no
- *                       llvm-link) and the native/SVM builds stay identical for an honest differential.
+ *                       whole kernel compiles as one TU → the Temen bitcode is a single module (no
+ *                       llvm-link) and the native/Temen builds stay identical for an honest differential.
  *   - BENCH_TAIL_ARGS — extra trailing args spliced into the benchmark_body() call for kernels whose
  *                       arity differs (e.g. md5sum takes a third `len`: pass -DBENCH_TAIL_ARGS=", MSG_SIZE").
  * Always pass -DNDEBUG (drops asserts → no __assert_fail extern).
@@ -35,14 +35,14 @@
 #endif
 
 /* One kernel (statemate) declares a file-scope `unsigned long time;` that clashes with <time.h>'s
- * `time()` in the native oracle build (the SVM build defines SVM_BUILD and never pulls <time.h>, so it
+ * `time()` in the native oracle build (the Temen build defines TEMEN_BUILD and never pulls <time.h>, so it
  * translates fine either way). Pull <time.h> in first — for the native build — so libc keeps its own
  * `time`, *then* rename just the kernel's global out of the way. A command-line `-Dtime=...` can't do
  * this: it's translation-unit-wide, so it renames libc's `time()` too and the clash just recurs under
- * the new name. Gated per-kernel via -DBENCH_TIME_RENAME=<newname>; applied to native and SVM alike so
+ * the new name. Gated per-kernel via -DBENCH_TIME_RENAME=<newname>; applied to native and Temen alike so
  * both compile the identical program (an honest differential). No-op for every other kernel. */
 #ifdef BENCH_TIME_RENAME
-#ifndef SVM_BUILD
+#ifndef TEMEN_BUILD
 #include <time.h>
 #endif
 #define time BENCH_TIME_RENAME
@@ -65,10 +65,10 @@
 #endif
 
 /* `verify_benchmark` compares result arrays with memcmp, which clang lowers to a `memcmp`/`bcmp`
- * libcall the SVM on-ramp has no definition for. Provide them in-module for the SVM build (compiled
+ * libcall the Temen on-ramp has no definition for. Provide them in-module for the Temen build (compiled
  * with -fno-builtin-memcmp/-bcmp so clang doesn't fold these back into self-calls); the native build
  * uses libc. memcpy/memset stay clang intrinsics the on-ramp already lowers. */
-#ifdef SVM_BUILD
+#ifdef TEMEN_BUILD
 #include <stddef.h>
 int
 memcmp (const void *a, const void *b, size_t n)
@@ -94,7 +94,7 @@ run (long n)
   return (long) verify_benchmark (r);
 }
 
-#ifndef SVM_BUILD
+#ifndef TEMEN_BUILD
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>

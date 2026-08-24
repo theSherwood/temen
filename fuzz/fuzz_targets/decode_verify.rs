@@ -10,10 +10,10 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use svm::default_args;
-use svm_encode::{decode_module, decode_unit, DecodeError};
-use svm_interp::run;
-use svm_verify::verify_module;
+use temen::default_args;
+use temen_encode::{decode_module, decode_unit, DecodeError};
+use temen_interp::run;
+use temen_verify::verify_module;
 
 fuzz_target!(|data: &[u8]| {
     // The object dialect (v9) is tooling-facing but shares this decoder: `decode_unit` must

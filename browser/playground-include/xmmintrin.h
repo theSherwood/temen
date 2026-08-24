@@ -1,5 +1,5 @@
-#ifndef __SVM_XMMINTRIN_H
-#define __SVM_XMMINTRIN_H
+#ifndef __TEMEN_XMMINTRIN_H
+#define __TEMEN_XMMINTRIN_H
 // Minimal SSE (packed single-precision, "_ps") surface for the playground. `__m128` is a chibicc
 // builtin type — a 16-byte SIMD vector backed by the IR `v128` value (four `float` lanes). These
 // prototypes are recognized as intrinsics by codegen and lowered directly to `f32x4`/`v128` ops;
@@ -21,4 +21,4 @@ __m128 _mm_loadu_ps(const float *p);
 void _mm_store_ps(float *p, __m128 v);
 void _mm_storeu_ps(float *p, __m128 v);
 
-#endif // __SVM_XMMINTRIN_H
+#endif // __TEMEN_XMMINTRIN_H

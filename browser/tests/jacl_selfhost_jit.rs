@@ -1,7 +1,7 @@
 //! JACL self-hosted compiler-guest — the two engine contracts the browser relies on.
 //!
-//! `jacl_compiler.svmb` is the JACL frontend compiled to SVM: it reads JACL source on stdin and
-//! writes SVM-IR on stdout, expanding macros IN-GUEST via the §22 `Jit` capability (`grant_onramp_caps`
+//! `jacl_compiler.temen` is the JACL frontend compiled to Temen: it reads JACL source on stdin and
+//! writes TEMEN-IR on stdout, expanding macros IN-GUEST via the §22 `Jit` capability (`grant_onramp_caps`
 //! grants it because the guest imports `vm_jit_*`). This test pins the two facts the playground's
 //! run path depends on:
 //!
@@ -16,10 +16,10 @@
 //! Making the compiler (or any linked JACL program) wasm-drivable needs a single-threaded, no-scheduler
 //! `jaclrt` build variant so no reachable function carries a concurrency op — tracked separately.
 //!
-//! Cross-repo asset: `jacl_compiler.svmb` is built by the outer jacl_impl repo
-//! (codegen/selfhost/build_compiler_svmb.sh). Absent ⇒ the test SKIPs.
+//! Cross-repo asset: `jacl_compiler.temen` is built by the outer jacl_impl repo
+//! (codegen/selfhost/build_compiler_temen.sh). Absent ⇒ the test SKIPs.
 
-use svm_browser::{onramp_exec, JitOnrampRun, STATUS_EXIT, STATUS_OK, STATUS_UNSUPPORTED};
+use temen_browser::{onramp_exec, JitOnrampRun, STATUS_EXIT, STATUS_OK, STATUS_UNSUPPORTED};
 
 const WIN_LOG2: u8 = 27; // 128 MiB — matches SELFHOST_WIN_LOG2 (the compiler + macro staging heap)
 const WIN_SIZE: u64 = 1 << WIN_LOG2;
@@ -28,18 +28,18 @@ const WIN_SIZE: u64 = 1 << WIN_LOG2;
 const MACRO_SRC: &str = "defmacro unless {cond body} { syntax-quote [if ~cond {} ~body] }\n\
                          mut hit 0\nunless [== 1 2] { set hit 5 }\nhit\n";
 
-fn jacl_compiler_svmb() -> Option<svm_ir::Module> {
-    // browser/ -> vendor/svm -> vendor -> jacl_impl root
+fn jacl_compiler_temen() -> Option<temen_ir::Module> {
+    // browser/ -> vendor/temen -> vendor -> jacl_impl root
     let p = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../../codegen/selfhost/build/jacl_compiler.svmb"
+        "/../../../codegen/selfhost/build/jacl_compiler.temen"
     );
     let bytes = std::fs::read(p).ok()?;
-    Some(svm_encode::decode_module(&bytes).expect("decode jacl_compiler.svmb"))
+    Some(temen_encode::decode_module(&bytes).expect("decode jacl_compiler.temen"))
 }
 
 /// Interpreter path — the oracle. Source on stdin, emitted IR on stdout.
-fn interp_compile(compiler: &svm_ir::Module, src: &str) -> String {
+fn interp_compile(compiler: &temen_ir::Module, src: &str) -> String {
     let out = onramp_exec(compiler, src.as_bytes());
     assert!(
         out.status == STATUS_OK || out.status == STATUS_EXIT,
@@ -51,16 +51,18 @@ fn interp_compile(compiler: &svm_ir::Module, src: &str) -> String {
 }
 
 /// Expand the tour's macro IN-GUEST on the browser's on-ramp interpreter — the tour fix. The JACL
-/// compiler drives the §22 `Jit` cap **through imports** (svm-llvm lowers `extern __vm_jit_*` to
+/// compiler drives the §22 `Jit` cap **through imports** (temen-llvm lowers `extern __vm_jit_*` to
 /// `call.import`), so `onramp_exec` runs it on the tree-walker (which routes import-bound `invoke`/
 /// `install`/`uninstall` to the driver; the bytecode engine only handles statically-resolved
 /// `cap.call (JIT, op)`). The symbol table is the canonical `Slot`/`Cap` wire form and the `Jit`
-/// grant mirrors svm-run's powerbox (1024-slot table + fiber hosting) so the staged macro — which
+/// grant mirrors temen-run's powerbox (1024-slot table + fiber hosting) so the staged macro — which
 /// runs on the compiler's scheduler root — resolves.
 #[test]
 fn jacl_bytecode_guest_jit_stages_the_tour_macro() {
-    let Some(compiler) = jacl_compiler_svmb() else {
-        eprintln!("SKIP: jacl_compiler.svmb absent (run codegen/selfhost/build_compiler_svmb.sh)");
+    let Some(compiler) = jacl_compiler_temen() else {
+        eprintln!(
+            "SKIP: jacl_compiler.temen absent (run codegen/selfhost/build_compiler_temen.sh)"
+        );
         return;
     };
     let ir = interp_compile(&compiler, MACRO_SRC);
@@ -78,8 +80,8 @@ fn jacl_bytecode_guest_jit_stages_the_tour_macro() {
 
 #[test]
 fn jacl_compiler_wasmjit_reactor_open_is_well_formed() {
-    let Some(compiler) = jacl_compiler_svmb() else {
-        eprintln!("SKIP: jacl_compiler.svmb absent");
+    let Some(compiler) = jacl_compiler_temen() else {
+        eprintln!("SKIP: jacl_compiler.temen absent");
         return;
     };
     // The single-shot wasm-JIT reactor either emits the compiler-guest (wasm-drivable `_start`) or

@@ -1,0 +1,69 @@
+[package]
+name = "temen"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Intentionally dependency-free (no criterion etc.) to keep build times low and the
+# TCB auditable. The benchmark harness uses only std (src/bin/bench.rs).
+[features]
+# Passthrough to temen-fiber's ASan fiber-switch annotations (the sanitizer job).
+asan = ["temen-jit/asan"]
+# The embedding front door (#918): `pub use temen_run` so a consumer reaches the runtime (instantiate
+# + powerbox + JIT) through this one umbrella crate. **Off by default** — the default build stays the
+# dependency-free, auditable pipeline core (see the comment above). Opt in with `--features run`.
+run = ["dep:temen-run"]
+
+[dependencies]
+temen-ir.workspace = true
+temen-text.workspace = true
+temen-encode.workspace = true
+temen-verify.workspace = true
+temen-interp.workspace = true
+# Optional embedding runtime, gated by the `run` feature (see [features]); keeps the default core
+# dependency-free. Also a dev-dependency below (the differential tests use it unconditionally).
+temen-run = { path = "../temen-run", optional = true }
+
+[[bin]]
+name = "temen-bench"
+path = "src/bin/bench.rs"
+
+# The Cranelift JIT is pulled in only for the differential tests (§18), so it stays
+# out of the umbrella crate's normal build and the auditable dependency-free core.
+[dev-dependencies]
+temen-jit.workspace = true
+# The op × backend parity matrix — its `supports()` predicate is the single source of the Cranelift
+# supported-op set, which the generated differential corpus (`parity_corpus.rs`) is checked against.
+temen-parity.workspace = true
+# The executable ISA spec (SPEC.md) — the op table + reference eval closures driving
+# the spec_* conformance suites (test-tier only; never a runtime dependency).
+temen-spec.workspace = true
+# The hand-rolled DWARF readers (`dwarf_line`/`dwarf_info`), reused to round-trip the JIT's DWARF
+# *emitter* (W5 JIT/DWARF tier) — emit in temen-jit, parse back here, assert they reconstruct.
+temen-wasm = { path = "../temen-wasm" }
+# The WAT assembler, for the folded WASI-bytes named-import test (`wasi_named_imports.rs`, ex-`temen-wasi`):
+# hand-written preview1 modules assembled to wasm, then transpiled by temen-wasm.
+wat = "1"
+# The embedding runtime — its `cap_thunk` (JIT CapThunk → reference-Host bridge) is shared by
+# the C-frontend differential tests instead of a copy-pasted local one.
+temen-run = { path = "../temen-run" }
+# The freeze/thaw transform, for the cross-backend durable differential (`durable_jit.rs`).
+temen-durable = { path = "../temen-durable" }
+# The §12 snapshot artifact codec, exercised across backends by `durable_jit.rs`.
+temen-snapshot = { path = "../temen-snapshot" }
+# The POSIX personality (libc as host caps): its `resolve`/`grant`/`Posix` drive the C-frontend
+# ↔ personality integration test (`c_posix.rs`) — real compiled C linking libc calls to the
+# HostFn personality through §7 named imports.
+temen-posix = { path = "../temen-posix" }
+# For the JIT-side `mprotect`-backed Memory-capability test harness (real page protection on
+# the guest window, mirroring the interpreter's page-protection model). Unix-only test.
+libc = "0.2"
+# The wasm-JIT emitter (backend 4): the §22 "guest-compiled units on the wasm tier" differential
+# (`jit_wasm_codegen.rs`) emits a runtime-compiled unit and runs it under `wasmi`, the same
+# escape-TCB-adjacent correctness contract the `temen-wasm-jit` crate's own differentials hold.
+temen-wasm-jit = { path = "../temen-wasm-jit" }
+# `simd` enables wasmi's §17 v128 proposal (`Config::wasm_simd`), needed by the generative wasm-JIT
+# differential (`wasm_diff.rs`) since the core v128 lane ops are in the emitter's integer subset.
+wasmi = { version = "0.47", features = ["simd"] }

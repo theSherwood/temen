@@ -1037,7 +1037,7 @@ static Member *struct_designator(Token **rest, Token *tok, Type *ty) {
     error_tok(tok, "expected a field designator");
 
   for (Member *mem = ty->members; mem; mem = mem->next) {
-    // Anonymous struct/union member. (SVM fix: upstream chibicc checked only TY_STRUCT
+    // Anonymous struct/union member. (Temen fix: upstream chibicc checked only TY_STRUCT
     // here, so a designated initializer `.field = …` on a struct containing an anonymous
     // *union* fell through to the regular branch and dereferenced mem->name (NULL) →
     // segfault. Match the canonical idiom in get_struct_member, which handles both.)
@@ -1223,7 +1223,7 @@ static void struct_initializer2(Token **rest, Token *tok, Initializer *init, Mem
   for (; mem && !is_end(tok); mem = mem->next) {
     Token *start = tok;
 
-    // Skip the separator comma when one is present. (SVM fix: upstream skipped it only on
+    // Skip the separator comma when one is present. (Temen fix: upstream skipped it only on
     // non-first members. But this continuation is also entered right after a *designated*
     // member with `tok` AT the comma — `{ .a = x, .b = y }` where `.a` lands in a nested
     // anonymous aggregate — so the first member must skip it too. The other caller, struct
@@ -3317,7 +3317,7 @@ static Token *function(Token *tok, Type *basety, VarAttr *attr) {
   fn->params = locals;
 
   if (ty->is_variadic)
-    // SVM ABI (§3d): __va_area__ is a pointer to the caller-marshalled varargs buffer,
+    // Temen ABI (§3d): __va_area__ is a pointer to the caller-marshalled varargs buffer,
     // not an x86-64 register-save area. See include/stdarg.h and codegen_ir.c.
     fn->va_area = new_lvar("__va_area__", pointer_to(ty_char));
   fn->alloca_bottom = new_lvar("__alloca_size__", pointer_to(ty_char));

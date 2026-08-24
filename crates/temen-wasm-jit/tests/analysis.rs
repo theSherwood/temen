@@ -1,0 +1,251 @@
+//! Tiering-analysis unit tests (BROWSER.md § "wasm-JIT tier", slice 3). `analyze` classifies each
+//! function as in-subset (the JIT emits it), an interp leaf (a cross-tier call runs it on the
+//! bytecode engine), or neither — and decides whether a guest can run mixed-tier at all.
+
+use temen_wasm_jit::analyze;
+
+fn m(src: &str) -> temen_ir::Module {
+    let m = temen_text::parse_module(src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    m
+}
+
+/// A pure-integer, single-function compute kernel: in-subset, mixed_ok.
+#[test]
+fn pure_integer() {
+    let a = analyze(&m(r#"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 3
+  v2 = i64.mul v0 v1
+  return v2
+  }
+}"#));
+    assert_eq!(a.in_subset, vec![true]);
+    assert_eq!(a.interp_leaf, vec![false]);
+    assert!(a.mixed_ok);
+}
+
+/// An integer caller with an **out-of-subset SIMD leaf** (integer signature — takes/returns i64 —
+/// but uses a *deferred* v128 op, `i16x8.dot_i8x16_s`, which this slice doesn't emit): the caller is
+/// in-subset, the leaf is interp-callable, the guest is mixed_ok. This is the motivating mixed-tier
+/// shape. (The core v128 lane ops are now in-subset, so the out-of-subset exemplar is the deferred
+/// widening/reduction family — here the `dot` reduction.)
+#[test]
+fn integer_caller_simd_leaf() {
+    let a = analyze(&m(r#"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = call 1 (v0)
+  return v1
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64x2.splat v0
+  v2 = i16x8.dot_i8x16_s v1 v1
+  v3 = i64x2.extract_lane 0 v2
+  return v3
+  }
+}"#));
+    assert_eq!(a.in_subset, vec![true, false]);
+    assert_eq!(a.interp_leaf, vec![false, true]);
+    assert!(a.reachable.iter().all(|&r| r));
+    assert!(
+        a.mixed_ok,
+        "integer caller + memory-free SIMD leaf must run mixed-tier"
+    );
+}
+
+/// Func 0 itself uses a deferred SIMD op → not in-subset → the JIT can't take the entry → not
+/// mixed_ok (the whole guest stays on the interpreter).
+#[test]
+fn simd_entry_not_mixed() {
+    let a = analyze(&m(r#"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64x2.splat v0
+  v2 = i16x8.dot_i8x16_s v1 v1
+  v3 = i64x2.extract_lane 0 v2
+  return v3
+  }
+}"#));
+    assert_eq!(a.in_subset, vec![false]);
+    assert!(!a.mixed_ok);
+}
+
+/// A SIMD callee that TOUCHES MEMORY is not an interp leaf (its fresh window would diverge from the
+/// shared one), so a guest calling it is not mixed_ok — it falls back to the full interpreter.
+#[test]
+fn memory_touching_leaf_blocks_mixed() {
+    let a = analyze(&m(r#"
+memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = call 1 (v0)
+  return v1
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64x2.splat v0
+  v2 = i16x8.dot_i8x16_s v1 v1
+  v3 = i64x2.extract_lane 0 v2
+  v4 = i64.const 0
+  i64.store v4 v3
+  return v3
+  }
+}"#));
+    assert_eq!(a.in_subset, vec![true, false]);
+    assert_eq!(
+        a.interp_leaf,
+        vec![false, false],
+        "a memory-touching callee is not an interp leaf"
+    );
+    assert!(!a.mixed_ok);
+}
+
+/// A SIMD callee that itself CALLS another function is not a (true) leaf — transitive tiers are a
+/// later refinement — so it blocks mixed_ok in this slice.
+#[test]
+fn non_leaf_simd_blocks_mixed() {
+    let a = analyze(&m(r#"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = call 1 (v0)
+  return v1
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64x2.splat v0
+  v2 = i16x8.dot_i8x16_s v1 v1
+  v3 = i64x2.extract_lane 0 v2
+  v4 = call 2 (v3)
+  return v4
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  return v0
+  }
+}"#));
+    assert!(
+        !a.interp_leaf[1],
+        "a non-leaf SIMD function is not interp-callable yet"
+    );
+    assert!(!a.mixed_ok);
+}
+
+/// Concurrency anywhere reachable forces the whole guest to the interpreter (a JITted frame can't
+/// unwind across a suspension).
+#[test]
+fn concurrency_not_mixed() {
+    let a = analyze(&m(r#"
+memory 16
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 0
+  v1 = thread.spawn 1 v0 v0
+  v2 = thread.join v1
+  return v2
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, v0: i64) {
+  v1 = i64.const 0
+  return v1
+  }
+}"#));
+    assert!(
+        !a.mixed_ok,
+        "a guest that spawns/joins must not run on the JIT tier"
+    );
+}
+
+/// A `call_indirect` dispatcher over two in-subset integer targets: the whole module is in-subset,
+/// so it's mixed_ok — and because an indirect call can reach *any* function, `has_indirect` forces
+/// every function reachable (the funcref table populates one slot per function).
+#[test]
+fn indirect_all_in_subset_mixed() {
+    let a = analyze(&m(r#"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i32.wrap_i64 v0
+  v2 = i64.const 7
+  v3 = call_indirect (i64) -> (i64) v1 (v2)
+  return v3
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 2
+  v2 = i64.mul v0 v1
+  return v2
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 100
+  v2 = i64.add v0 v1
+  return v2
+  }
+}"#));
+    assert_eq!(a.in_subset, vec![true, true, true]);
+    assert!(a.reachable.iter().all(|&r| r), "indirect ⇒ all reachable");
+    assert!(a.mixed_ok, "all-in-subset indirect dispatch is mixed_ok");
+}
+
+/// With a `call_indirect` present, an out-of-subset (deferred-SIMD) function anywhere in the module
+/// blocks mixed_ok — even though no *direct* edge reaches it — because the indirect call could
+/// select it, and its table slot has no emitted target. The conservative first-increment rule (all
+/// indirect targets must be in-subset) fails closed to the interpreter.
+#[test]
+fn indirect_with_simd_func_not_mixed() {
+    let a = analyze(&m(r#"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i32.wrap_i64 v0
+  v2 = i64.const 7
+  v3 = call_indirect (i64) -> (i64) v1 (v2)
+  return v3
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64x2.splat v0
+  v2 = i16x8.dot_i8x16_s v1 v1
+  v3 = i64x2.extract_lane 0 v2
+  return v3
+  }
+}"#));
+    assert_eq!(a.in_subset, vec![true, false]);
+    assert!(
+        !a.mixed_ok,
+        "an out-of-subset indirect target must fail closed"
+    );
+}
+
+/// An UNREACHABLE out-of-subset function doesn't block mixed_ok — only reachable functions matter.
+#[test]
+fn unreachable_out_of_subset_ok() {
+    let a = analyze(&m(r#"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  return v0
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = f64.convert_i64_s v0
+  v2 = call 1 (v0)
+  v3 = i64.trunc_sat_f64_s v1
+  return v3
+  }
+}"#));
+    assert_eq!(a.reachable, vec![true, false], "func 1 is never called");
+    assert!(
+        a.mixed_ok,
+        "an unreachable non-subset function is irrelevant"
+    );
+}

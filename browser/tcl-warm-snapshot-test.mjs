@@ -1,21 +1,21 @@
 // V8 (Node) check of the **Tcl warm-runtime snapshot** driver (issue #805 follow-on), the Tcl twin of
-// `lua-warm-snapshot-test.mjs`. Drives the shipping engine FFI (`svm_warm_open`/`svm_warm_eval`) over a
-// `tcl_snapshot.svmb` (the two-phase `warmup` = full `Tcl_Init` / `eval_run` = eval-only driver), and
-// asserts warm `eval_run` over the restored snapshot matches the cold `_start` (`svm_run_onramp`) output
+// `lua-warm-snapshot-test.mjs`. Drives the shipping engine FFI (`temen_warm_open`/`temen_warm_eval`) over a
+// `tcl_snapshot.temen` (the two-phase `warmup` = full `Tcl_Init` / `eval_run` = eval-only driver), and
+// asserts warm `eval_run` over the restored snapshot matches the cold `_start` (`temen_run_onramp`) output
 // byte-for-byte while skipping the `Tcl_Init` rebuild, plus fresh-per-Run isolation. It also drives the
 // **warm+JIT** tier (`runWarmJit` over the emitted `eval_run` export) and asserts it matches warm-interp
 // (#865: the tier used to trap because the driver drove the cold `_start` export instead of `eval_run`).
 //
-//   node tcl-warm-snapshot-test.mjs [svm_browser.wasm] [tcl_snapshot.svmb]
+//   node tcl-warm-snapshot-test.mjs [temen_browser.wasm] [tcl_snapshot.temen]
 //
-// The `.svmb` is deploy-built (the Tcl fetch+toolchain isn't in the committed-asset CI job), so this
+// The `.temen` is deploy-built (the Tcl fetch+toolchain isn't in the committed-asset CI job), so this
 // SKIPs cleanly when it's absent — like the other Tcl demos.
 import { readFileSync, existsSync } from 'node:fs';
 import { engineImports } from './engine-imports.mjs';
 import { runWarmJit } from './web/wasmjit-module.js';
 
-const wasmPath = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/svm_browser.wasm';
-const modPath = process.argv[3] ?? 'web/assets/tcl_snapshot.svmb';
+const wasmPath = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/temen_browser.wasm';
+const modPath = process.argv[3] ?? 'web/assets/tcl_snapshot.temen';
 if (!existsSync(modPath)) {
   console.log(`SKIP: ${modPath} not built (Tcl fetch/toolchain unavailable) — run build-onramp-assets.mjs`);
   process.exit(0);
@@ -25,20 +25,20 @@ const mod = await WebAssembly.compile(readFileSync(wasmPath));
 const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
 const ex = (await WebAssembly.instantiate(mod, engineImports(memory))).exports;
 const membuf = () => (ex.memory ?? memory).buffer;
-const put = (bytes) => { const p = ex.svm_alloc(bytes.length); new Uint8Array(membuf()).set(bytes, Number(p)); return { p, len: bytes.length, free: () => ex.svm_dealloc(p, bytes.length) }; };
-const readStdout = () => { const p = Number(ex.svm_stdout_ptr()), l = Number(ex.svm_stdout_len()); return p && l ? Buffer.from(new Uint8Array(membuf(), p, l)).toString() : ''; };
+const put = (bytes) => { const p = ex.temen_alloc(bytes.length); new Uint8Array(membuf()).set(bytes, Number(p)); return { p, len: bytes.length, free: () => ex.temen_dealloc(p, bytes.length) }; };
+const readStdout = () => { const p = Number(ex.temen_stdout_ptr()), l = Number(ex.temen_stdout_len()); return p && l ? Buffer.from(new Uint8Array(membuf(), p, l)).toString() : ''; };
 const fail = (m) => { console.error(`FAIL: ${m}`); process.exit(1); };
 const enc = (s) => Buffer.from(s);
 const modBytes = readFileSync(modPath);
 
-function cold(js) { const m = put(modBytes); const s = put(enc(js)); ex.svm_run_onramp(m.p, m.len, s.p, s.len); const out = readStdout(); const st = ex.svm_status(); s.free(); m.free(); return { out, st }; }
-function warm(js) { const s = put(enc(js)); ex.svm_warm_eval(s.p, s.len); const out = readStdout(); const st = ex.svm_status(); s.free(); return { out, st }; }
+function cold(js) { const m = put(modBytes); const s = put(enc(js)); ex.temen_run_onramp(m.p, m.len, s.p, s.len); const out = readStdout(); const st = ex.temen_status(); s.free(); m.free(); return { out, st }; }
+function warm(js) { const s = put(enc(js)); ex.temen_warm_eval(s.p, s.len); const out = readStdout(); const st = ex.temen_status(); s.free(); return { out, st }; }
 async function warmJit(js) { const st = await runWarmJit(ex, ex.memory ?? memory, enc(js), `${modPath}#eval`, 1); return { out: readStdout(), st }; }
 
 const m = put(modBytes);
-const live = Number(ex.svm_warm_open(m.p, m.len));
+const live = Number(ex.temen_warm_open(m.p, m.len));
 m.free();
-if (live < 0 || ex.svm_status() !== 0) fail(`svm_warm_open: status ${ex.svm_status()}`);
+if (live < 0 || ex.temen_status() !== 0) fail(`temen_warm_open: status ${ex.temen_status()}`);
 console.error(`warm session opened: live image ${(live / (1 << 20)).toFixed(2)} MiB`);
 
 const programs = [
@@ -90,8 +90,8 @@ if (!isolated) { console.log(`  run1: ${JSON.stringify(r1.out)}`); console.log(`
 // parity with warm-interp. The entry export index must be `eval_run`'s (NOT 0 = the cold `_start`,
 // whose Tcl_Init re-run trapped) — a regression to `f0` reintroduces the trap this asserts against.
 {
-  const opened = ex.svm_warm_jit_open(1);
-  const entry = ex.svm_warm_jit_entry_func();
+  const opened = ex.temen_warm_jit_open(1);
+  const entry = ex.temen_warm_jit_entry_func();
   const jitOk = opened === 0 && entry !== 0;
   allOk = allOk && jitOk;
   console.log(`\nwarm+JIT open: status ${opened} (0=OK), entry export f${entry} — ${jitOk ? 'OK — drives eval_run, not the cold _start (f0)' : 'FAIL — eval_run not emittable or entry is f0'}`);
@@ -114,6 +114,6 @@ if (!isolated) { console.log(`  run1: ${JSON.stringify(r1.out)}`); console.log(`
   }
 }
 
-ex.svm_warm_close();
+ex.temen_warm_close();
 if (!allOk) fail('Tcl warm snapshot parity/isolation mismatch');
 console.log('\nOK: Tcl warm snapshot — warm eval_run matches cold _start byte-for-byte (interp + warm+JIT), isolation holds');

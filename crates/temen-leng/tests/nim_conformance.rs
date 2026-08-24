@@ -1,0 +1,639 @@
+//! **Nim language conformance suite on the Temen** (#956, parent #954; NIM.md §3a). A gated fixture
+//! matrix that measures the *envelope* of Nim language features which compile-and-run on the Temen —
+//! generics, exceptions, closures, methods (dynamic dispatch), `seq`/`string`/`Table`, floats,
+//! iterators, `case`/variant objects, `ref` + ARC destructors — each driven through the **whole real
+//! toolchain** (`nimony c` → nifler → nimony → hexer emit Leng, `temen-leng` lowers + links) and **run
+//! on both engines** (§9 interp/JIT parity). A **compute** fixture links with the W3 compute shim and
+//! reads back an `int` global; an **I/O** fixture (a feature whose real stdlib pulls in the syscall
+//! bottom edge — `Table` → `panic` → `syncio`) links through the nim→powerbox manifest bridge and
+//! checks captured stdout under the POSIX personality.
+//!
+//! Unlike the exact-value tests in `nim_e2e.rs`, this suite tolerates *known* fail-closed features: each
+//! fixture carries an [`Expect`], and the test asserts the **measured** status matches it. A feature that
+//! starts working (Fails→Runs) or regresses (Runs→Fails) both fail the test — the first prompts flipping
+//! the expectation (and closing the feature's sub-issue), the second is a real regression. This is the
+//! "green/red matrix, each red a filed ticket" the issue asks for — the driver + oracle for the
+//! *language*-side breadth (all 15 features run end-to-end today).
+//!
+//! **Toolchain gating.** Needs the nimony toolchain (`nimony` + `nim` on `PATH`, or `NIMONY_BIN`/
+//! `NIM_BIN`); when absent the test **skips** (like `nim_e2e.rs`). CI's `nim-e2e` job provisions it.
+//! Set `NIM_CONFORMANCE_MEASURE=1` to print the matrix and skip the assertion (re-baselining aid).
+//!
+//! Shares no code with `nim_e2e.rs` on purpose: that file's helpers `panic!` on any pipeline failure
+//! (it asserts exact behavior), whereas this suite must catch a fail-closed and record it, so its
+//! pipeline primitives return `Result`/status instead.
+
+use std::panic::AssertUnwindSafe;
+use std::process::Command;
+use temen_interp::Value;
+use temen_ir::{LinkUnit, Module};
+
+// ---- toolchain gating (mirrors nim_e2e.rs) --------------------------------------------------------
+
+fn toolchain_path() -> Option<String> {
+    let path = std::env::var("PATH").unwrap_or_default();
+    let mut prefix = Vec::new();
+    if let Ok(d) = std::env::var("NIMONY_BIN") {
+        prefix.push(d);
+    }
+    if let Ok(d) = std::env::var("NIM_BIN") {
+        prefix.push(d);
+    }
+    let full = if prefix.is_empty() {
+        path.clone()
+    } else {
+        format!("{}:{}", prefix.join(":"), path)
+    };
+    let ok = full
+        .split(':')
+        .any(|d| !d.is_empty() && std::path::Path::new(d).join("nimony").exists())
+        || full
+            .split(':')
+            .any(|d| !d.is_empty() && std::path::Path::new(d).join("nimony").is_file());
+    ok.then_some(full)
+}
+
+// ---- the runtime compute shim's bottom-edge bindings (mirrors nim_e2e.rs) -------------------------
+
+const SHIM_BINDINGS: &[(&str, u32)] = &[
+    ("cExitSys", 0),
+    ("cGetpid", 1),
+    ("cKill", 2),
+    ("c_memcpy", 3),
+    ("c_memcmp", 4),
+    ("c_memset", 5),
+    ("mmap", 6),
+    ("atomicLoadN", 7),
+    ("atomicStoreN", 8),
+    ("atomicCompareExchangeN", 9),
+    ("atomicExchangeN", 10),
+    ("atomicAddFetch", 11),
+    ("atomicSubFetch", 12),
+    ("bswap64", 13),
+    ("ctz64", 14),
+    ("clz64", 15),
+    ("cWriteErr", 16),
+    ("dlopen", 17),
+    ("dlclose", 18),
+    ("dlsym", 19),
+];
+
+fn shim_index(name: &str) -> Option<u32> {
+    SHIM_BINDINGS
+        .iter()
+        .filter(|(p, _)| name.starts_with(p))
+        .max_by_key(|(p, _)| p.len())
+        .map(|(_, i)| *i)
+}
+
+// ---- the pipeline, Result-returning so a fail-closed is data, not a panic -------------------------
+
+/// The pipeline stage a fixture reaches before failing — the routing hint for its sub-issue.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Stage {
+    /// `nimony c` rejected the source — a nimony **front-end** gap (not temen-leng's).
+    Frontend,
+    /// `temen-leng` fail-closed lowering/linking the Leng — a #760 totality arm.
+    Translate,
+    /// The linked module failed verification.
+    Verify,
+    /// It ran but trapped, mismatched across engines, or returned the wrong value.
+    Run,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Status {
+    Runs,
+    Fails(Stage),
+}
+
+/// Compile Nim `source` with `nimony c --isMain` in a throwaway dir; return every module's Leng as
+/// `(stem, x_nif_text)`, or `Err` if the **front end** rejected it.
+fn compile_to_leng(nim_path: &str, source: &str) -> Result<Vec<(String, String)>, Stage> {
+    let tag = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        source.hash(&mut h);
+        h.finish()
+    };
+    let dir =
+        std::env::temp_dir().join(format!("temen_nim_conf_{}_{tag:016x}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mk tempdir");
+    std::fs::write(dir.join("prog.nim"), source).expect("write prog.nim");
+
+    let out = Command::new("nimony")
+        .args(["c", "--isMain", "prog.nim"])
+        .current_dir(&dir)
+        .env("PATH", nim_path)
+        .output()
+        .expect("run nimony");
+    if !out.status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(Stage::Frontend);
+    }
+    let mut mods = Vec::new();
+    collect_x_nif(&dir.join("nimcache"), &mut mods);
+    let _ = std::fs::remove_dir_all(&dir);
+    // No system module ⇒ the emit went sideways; treat as a front-end miss (nothing to lower).
+    if !mods.iter().any(|(s, _)| s.starts_with("sysv")) {
+        return Err(Stage::Frontend);
+    }
+    Ok(mods)
+}
+
+fn collect_x_nif(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_x_nif(&p, out);
+        } else if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+            if let Some(stem) = name.strip_suffix(".x.nif") {
+                if out.iter().all(|(s, _)| s != stem) {
+                    let bytes = std::fs::read(&p).unwrap();
+                    out.push((
+                        stem.to_string(),
+                        String::from_utf8_lossy(&bytes).into_owned(),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Link the compiled modules with the W3 runtime shim into one verified, import-free module, or `Err`
+/// with the stage that fail-closed (`Translate` for an `temen-leng` `Unsupported`, `Verify` for a bad
+/// module). Wrapped in `catch_unwind` because a residual translate path may `panic!`/`unreachable!`
+/// rather than return `Err` — for a conformance probe that is still a clean fail-closed, not an abort.
+fn link_with_runtime(mods: &[(String, String)]) -> Result<Module, Stage> {
+    let res = std::panic::catch_unwind(AssertUnwindSafe(|| link_inner(mods)));
+    match res {
+        Ok(inner) => inner,
+        Err(_) => Err(Stage::Translate),
+    }
+}
+
+fn link_inner(mods: &[(String, String)]) -> Result<Module, Stage> {
+    let mut import_names: Vec<String> = Vec::new();
+    for (stem, src) in mods.iter().filter(|(stem, _)| stem.starts_with("sysv")) {
+        let obj = temen_leng::compile_whole_object(&temen_leng::WholeModule { stem, src })
+            .map_err(|_| Stage::Translate)?;
+        let obj = temen_encode::decode_unit(&obj).map_err(|_| Stage::Translate)?;
+        for imp in &obj.imports {
+            if import_names.iter().all(|n| n != &imp.name) {
+                import_names.push(imp.name.clone());
+            }
+        }
+    }
+
+    const SHIM: &str = include_str!("../src/powerbox_compute_shim.temt.txt");
+    let shim = temen_text::parse_module(SHIM).expect("runtime shim parses");
+    let exports: Vec<(String, u32)> = import_names
+        .iter()
+        .filter_map(|n| shim_index(n).map(|i| (n.clone(), i)))
+        .collect();
+    let runtime = LinkUnit {
+        module: shim,
+        exports,
+        ..Default::default()
+    };
+
+    let mut ordered: Vec<&(String, String)> = mods.iter().collect();
+    ordered.sort_by_key(|(stem, _)| stem.starts_with("sysv"));
+    let units: Vec<temen_leng::WholeModule> = ordered
+        .iter()
+        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+        .collect();
+    let m =
+        temen_leng::link_whole_with_runtime(&units, vec![runtime]).map_err(|_| Stage::Translate)?;
+    temen_verify::verify_module(&m).map_err(|_| Stage::Verify)?;
+    if !m.imports.is_empty() {
+        return Err(Stage::Verify);
+    }
+    Ok(m)
+}
+
+/// Run the C `main` (full init chain), read back an `int` global by name prefix, and require §9
+/// interp/JIT parity. `Err(Stage::Run)` on a trap, a cross-engine mismatch, or a missing global.
+fn run_main_read_global(m: &Module, global_substr: &str) -> Result<i64, Stage> {
+    let res = std::panic::catch_unwind(AssertUnwindSafe(|| run_inner(m, global_substr)));
+    match res {
+        Ok(inner) => inner,
+        Err(_) => Err(Stage::Run),
+    }
+}
+
+fn run_inner(m: &Module, global_substr: &str) -> Result<i64, Stage> {
+    let main = m
+        .exports
+        .iter()
+        .find(|e| e.name == "main")
+        .ok_or(Stage::Run)?
+        .func;
+    let off = m
+        .data_exports
+        .iter()
+        .find(|e| e.name.starts_with(global_substr))
+        .ok_or(Stage::Run)?
+        .offset as usize;
+    let entry_sp = temen_ir::powerbox_entry_sp(m) as i64;
+    let heap_base = entry_sp + temen_ir::POWERBOX_STACK_RESERVE as i64;
+    let mut seed = vec![0u8; 1 << 20];
+    let brk = temen_ir::POWERBOX_HEAP_BRK as usize;
+    seed[brk..brk + 8].copy_from_slice(&heap_base.to_le_bytes());
+    let ivals = [
+        Value::I64(entry_sp),
+        Value::I32(0),
+        Value::I64(0),
+        Value::I64(0),
+    ];
+    let mut fuel = 500_000_000u64;
+    let (ir, imem) = temen_interp::run_capture(m, main, &ivals, &mut fuel, &seed);
+    if ir.is_err() || imem.len() < off + 8 {
+        return Err(Stage::Run);
+    }
+    let iv = i64::from_le_bytes(imem[off..off + 8].try_into().unwrap());
+    let (jout, jmem) = temen_jit::compile_and_run_capture(m, main, &[entry_sp, 0, 0, 0], &seed)
+        .map_err(|_| Stage::Run)?;
+    if !matches!(jout, temen_jit::JitOutcome::Returned(_)) || jmem.len() < off + 8 {
+        return Err(Stage::Run);
+    }
+    let jv = i64::from_le_bytes(jmem[off..off + 8].try_into().unwrap());
+    if iv != jv {
+        return Err(Stage::Run); // §9 parity break
+    }
+    Ok(iv)
+}
+
+// ---- the fixture matrix ---------------------------------------------------------------------------
+
+/// Whether a feature is expected to run end-to-end today, or fail closed (and where). Keep this column
+/// honest: it is the committed baseline the test gates against.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Expect {
+    Runs,
+    /// A feature known to fail closed, pinned to the stage it stops at. Retained scaffolding: the matrix
+    /// is 15/15 today so no fixture constructs this, but the suite's whole point is to tolerate the
+    /// *next* red — a new feature lands as `FailsClosed(stage)` with its ticket, then flips to `Runs`
+    /// when fixed. `allow(dead_code)` keeps the machinery (and the assertion arm below) alive meanwhile.
+    #[allow(dead_code)]
+    FailsClosed(Stage),
+}
+
+struct Fixture {
+    /// The language feature this exercises (the matrix row label).
+    feature: &'static str,
+    /// Nim source. A **compute** fixture (`io: None`) ends with a top-level `let r = <int expr>` — we
+    /// read `r.0.` back. An **I/O** fixture (`io: Some(_)`) `write`s to stdout — it links through the
+    /// nim→powerbox manifest bridge and runs `_start` under the POSIX personality on both engines, and
+    /// we check the captured stdout (for features whose real stdlib pulls in the I/O bottom edge, e.g.
+    /// `panic` → `syncio`, which the pure-compute shim can't bind — #993).
+    source: &'static str,
+    /// The `int` value a working **compute** run must produce (checked only when it Runs; ignored for
+    /// an `io` fixture).
+    expected: i64,
+    /// `Some(substr)` marks an **I/O** fixture whose captured stdout must contain `substr`.
+    io: Option<&'static str>,
+    /// The committed baseline: does it run today, or fail closed (and at which stage)?
+    expect: Expect,
+    /// The sub-issue tracking a fail-closed feature (for the printed matrix); `None` when it Runs.
+    ticket: Option<&'static str>,
+}
+
+/// Measure one fixture's actual end-to-end status (and, when it runs, its value).
+fn measure(path: &str, f: &Fixture) -> (Status, Option<i64>) {
+    let mods = match compile_to_leng(path, f.source) {
+        Ok(m) => m,
+        Err(s) => return (Status::Fails(s), None),
+    };
+    // An **I/O** fixture links through the nim→powerbox manifest bridge and checks captured stdout.
+    if let Some(want) = f.io {
+        return (measure_io(&mods, want), None);
+    }
+    let m = match link_with_runtime(&mods) {
+        Ok(m) => m,
+        Err(s) => return (Status::Fails(s), None),
+    };
+    match run_main_read_global(&m, "r.0.") {
+        Ok(v) if v == f.expected => (Status::Runs, Some(v)),
+        Ok(v) => (Status::Fails(Stage::Run), Some(v)), // ran, wrong value
+        Err(s) => (Status::Fails(s), None),
+    }
+}
+
+/// Measure an **I/O** fixture: manifest-link the modules (retaining the raw-syscall leaves as
+/// host-bound imports rather than fail-closing the compute link on them — `panic` → `syncio`'s
+/// `sysWrite`), run the powerbox `_start` on **both engines** under the POSIX personality, and require
+/// the two captured streams to agree (§9 parity) and to contain `want`. This is how a stdlib feature
+/// whose real code pulls in the I/O bottom edge (e.g. `Table`, via `panic`) is exercised — the compute
+/// shim can't bind those leaves (#993). Reuses `nim_e2e.rs`'s proven manifest+POSIX harness.
+fn measure_io(mods: &[(String, String)], want: &str) -> Status {
+    let linked = std::panic::catch_unwind(AssertUnwindSafe(|| io_link(mods)));
+    let m = match linked {
+        Ok(Ok(m)) => m,
+        Ok(Err(s)) => return Status::Fails(s),
+        Err(_) => return Status::Fails(Stage::Translate),
+    };
+    if temen_verify::verify_module(&m).is_err() || !temen_run::is_named_powerbox_entry(&m) {
+        return Status::Fails(Stage::Verify);
+    }
+    let interp = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        io_run(&m, temen_run::Backend::TreeWalk)
+    }));
+    let jit = std::panic::catch_unwind(AssertUnwindSafe(|| io_run(&m, temen_run::Backend::Jit)));
+    match (interp, jit) {
+        (Ok(Some(i)), Ok(Some(j))) if i == j && String::from_utf8_lossy(&i).contains(want) => {
+            Status::Runs
+        }
+        (Ok(Some(_)), Ok(Some(_))) => Status::Fails(Stage::Run), // ran, wrong/mismatched stdout
+        _ => Status::Fails(Stage::Run),
+    }
+}
+
+/// Manifest-link the modules with the compute shim bound to the pure-compute bottom edge, but via the
+/// **powerbox manifest** link so the raw-syscall leaves survive as host-bindable imports. `Err(stage)`
+/// on a translate/link failure. (Mirrors `nim_e2e.rs::run_io_program`'s link half.)
+fn io_link(mods: &[(String, String)]) -> Result<Module, Stage> {
+    let mut import_names: Vec<String> = Vec::new();
+    for (stem, src) in mods.iter().filter(|(stem, _)| stem.starts_with("sysv")) {
+        let obj = temen_leng::compile_whole_object(&temen_leng::WholeModule { stem, src })
+            .map_err(|_| Stage::Translate)?;
+        let obj = temen_encode::decode_unit(&obj).map_err(|_| Stage::Translate)?;
+        for imp in &obj.imports {
+            if import_names.iter().all(|n| n != &imp.name) {
+                import_names.push(imp.name.clone());
+            }
+        }
+    }
+    const SHIM: &str = include_str!("../src/powerbox_compute_shim.temt.txt");
+    let shim = temen_text::parse_module(SHIM).expect("runtime shim parses");
+    let exports: Vec<(String, u32)> = import_names
+        .iter()
+        .filter_map(|n| shim_index(n).map(|i| (n.clone(), i)))
+        .collect();
+    let runtime = LinkUnit {
+        module: shim,
+        exports,
+        ..Default::default()
+    };
+    let mut ordered: Vec<&(String, String)> = mods.iter().collect();
+    ordered.sort_by_key(|(stem, _)| stem.starts_with("sysv"));
+    let units: Vec<temen_leng::WholeModule> = ordered
+        .iter()
+        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+        .collect();
+    temen_leng::link_whole_powerbox_manifest(&units, vec![runtime]).map_err(|_| Stage::Translate)
+}
+
+/// Map a retained nimony syscall import to its POSIX-personality op (mirrors `nim_e2e.rs`).
+fn nim_posix_op(name: &str) -> u32 {
+    if name.starts_with("sysWrite") {
+        temen_posix::OP_WRITE
+    } else if name.starts_with("sysRead") {
+        temen_posix::OP_READ
+    } else if name.starts_with("sysOpen") {
+        temen_posix::OP_OPEN
+    } else if name.starts_with("sysClose") {
+        temen_posix::OP_CLOSE
+    } else if name.starts_with("sysLseek") {
+        temen_posix::OP_LSEEK
+    } else {
+        temen_posix::OP_WRITE // any other retained leaf (e.g. sysAssert) — a no-op-ish write sink
+    }
+}
+
+/// Run the manifest module's powerbox `_start` on `backend` with every retained syscall import bound to
+/// a shared POSIX personality; return the guest's stdout (`None` on a trap/instantiate failure).
+fn io_run(m: &Module, backend: temen_run::Backend) -> Option<Vec<u8>> {
+    let (posix, make) = temen_posix::cap(0, 0, Vec::new());
+    let make = std::sync::Arc::new(make);
+    let mut imports = temen_run::Imports::new();
+    for imp in &m.imports {
+        let make = std::sync::Arc::clone(&make);
+        imports = imports.provide(
+            imp.name.clone(),
+            temen_run::HostCap::host_proc(nim_posix_op(&imp.name), move || (*make)()),
+        );
+    }
+    let inst = temen_run::instantiate_with_imports(m.clone(), imports).ok()?;
+    inst.run(backend, &temen_run::RunConfig::default()).ok()?;
+    Some(posix.stdout())
+}
+
+/// The feature envelope (#956). Each fixture reduces its feature to an `int` global `r` so the same
+/// run-and-read-back probe measures them all. `expect`/`ticket` are set from the measured baseline
+/// below the fold — a fresh measurement is a one-liner: `NIM_CONFORMANCE_MEASURE=1 cargo test -p
+/// temen-leng --test nim_conformance -- --nocapture`.
+const FIXTURES: &[Fixture] = &[
+    // ---- anchors: features already proven by nim_e2e.rs, here as regression sentinels ----
+    Fixture {
+        feature: "arithmetic (in a proc)",
+        source: "proc calc(a, b: int): int = a * b + 6\nlet r = calc(6, 6)\n",
+        expected: 42,
+        io: None,
+        expect: Expect::Runs,
+        ticket: None,
+    },
+    Fixture {
+        feature: "control-flow (while/if)",
+        source: "proc sumTo(n: int): int =\n  result = 0\n  var i = 1\n  while i <= n:\n    result = result + i\n    i = i + 1\nlet r = sumTo(8) + 6\n",
+        expected: 42,
+        io: None,
+        expect: Expect::Runs,
+        ticket: None,
+    },
+    Fixture {
+        feature: "seq[int] (alloc/add/index)",
+        source: "proc build(n: int): int =\n  var s: seq[int] = @[]\n  var i = 0\n  while i < n:\n    s.add(i * i)\n    i = i + 1\n  result = 0\n  for x in s:\n    result = result + x\nlet r = build(5) + 12\n",
+        expected: 42,
+        io: None,
+        expect: Expect::Runs,
+        ticket: None,
+    },
+    // ---- the breadth envelope ----
+    Fixture {
+        feature: "generics",
+        source: "proc pick[T](a, b: T): T = a\nlet r = pick(42, 7)\n",
+        expected: 42,
+        io: None,
+        expect: Expect::Runs,
+        ticket: None,
+    },
+    Fixture {
+        // nimony's exceptions are an **`ErrorCode` enum** (an error-flag model), not object
+        // exceptions: `raise <ErrorCode>` in a `{.raises.}` routine, caught by `except ErrorCode`.
+        // `ErrorCode`/`ValueError` are `include`d into `system`, so no import. (#980)
+        feature: "exceptions (raise/try/except)",
+        source: "proc mayFail(x: int): int {.raises.} =\n  if x < 0: raise ValueError\n  else: x * 2\nproc safe(x: int): int =\n  try: mayFail(x)\n  except ErrorCode: -1\nlet r = safe(21)\n",
+        expected: 42,
+        // Runs (#980): hexer lowers `raise`/`try`/`except` to the error-flag model — a proc that can
+        // raise returns a `(ErrorCode, value)` tuple; the caller branches on the code and `jmp`s to the
+        // handler — all plain constructs temen-leng handles. The earlier "front-end gap" was the fixture
+        // using standard-Nim `newException`/object exceptions, which isn't nimony's model.
+        io: None,
+        expect: Expect::Runs,
+        ticket: None,
+    },
+    Fixture {
+        feature: "closures (capture upvalue)",
+        source: "proc outer(): int =\n  var n = 40\n  proc inner(): int {.closure.} = n + 2\n  inner()\nlet r = outer()\n",
+        expected: 42,
+        io: None,
+        expect: Expect::Runs,
+        ticket: None,
+    },
+    Fixture {
+        feature: "methods (dynamic dispatch)",
+        source: "type\n  Animal = ref object of RootObj\n  Dog = ref object of Animal\nmethod speak(a: Animal): int {.base.} = 0\nmethod speak(d: Dog): int = 42\nproc run(): int =\n  let a: Animal = Dog()\n  a.speak()\nlet r = run()\n",
+        expected: 42,
+        // Fixed in #979: the `Rtti` vtable's `mt` method table is now materialized (funcref relocs),
+        // so dynamic dispatch reaches the derived override (`Dog.speak` → 42), both engines agreeing.
+        io: None,
+        expect: Expect::Runs,
+        ticket: None,
+    },
+    Fixture {
+        feature: "string (.len)",
+        source: "let s = \"hello, world!\"\nlet r = s.len * 3 + 3\n",
+        expected: 42,
+        io: None,
+        expect: Expect::Runs,
+        ticket: None,
+    },
+    Fixture {
+        // `std/tables` `initTable`/`[]`/`[]=` are `.raises`, so they run inside a `try`/`except
+        // ErrorCode` (nimony's error-flag model). `tables` also pulls in `panic` → `syncio`'s
+        // `sysWrite`, a syscall leaf the *compute* shim can't bind — so this is an **I/O fixture**: it
+        // links through the powerbox manifest bridge and `write`s a marker, checked on stdout (#993).
+        feature: "Table[string,int]",
+        source: "import std/tables\nimport std/syncio\nproc run(): int =\n  try:\n    var t = initTable[string, int]()\n    t[\"a\"] = 42\n    result = t[\"a\"]\n  except ErrorCode:\n    result = -1\nif run() == 42:\n  write(stdout, \"table-ok\\n\")\n",
+        expected: 42,
+        io: Some("table-ok"),
+        expect: Expect::Runs,
+        ticket: None,
+    },
+    Fixture {
+        feature: "floats (arith + int conv)",
+        source: "let x = 3.5\nlet r = int(x * 12.0)\n",
+        expected: 42,
+        io: None,
+        expect: Expect::Runs,
+        ticket: None,
+    },
+    Fixture {
+        feature: "custom iterators (yield)",
+        source: "iterator countUp(n: int): int =\n  var i = 0\n  while i < n:\n    yield i\n    inc i\nproc run(): int =\n  result = 6\n  for x in countUp(9):\n    result = result + x\nlet r = run()\n",
+        expected: 42,
+        io: None,
+        expect: Expect::Runs,
+        ticket: None,
+    },
+    Fixture {
+        feature: "variant objects (case)",
+        source: "type\n  Kind = enum kA, kB\n  Node = object\n    case kind: Kind\n    of kA: a: int\n    of kB: b: int\nproc val(n: Node): int =\n  case n.kind\n  of kA: n.a\n  of kB: n.b\nlet r = val(Node(kind: kA, a: 42))\n",
+        expected: 42,
+        io: None,
+        expect: Expect::Runs,
+        ticket: None,
+    },
+    Fixture {
+        feature: "ref object",
+        source: "type Box = ref object\n  v: int\nproc run(): int =\n  var b = Box(v: 42)\n  b.v\nlet r = run()\n",
+        expected: 42,
+        io: None,
+        expect: Expect::Runs,
+        ticket: None,
+    },
+    Fixture {
+        feature: "object + ARC destructor",
+        source: "var freed {.global.}: int = 0\ntype Res = object\n  id: int\nproc `=destroy`(x: Res) =\n  freed = freed + x.id\nproc run() =\n  var x = Res(id: 42)\n  discard x\nrun()\nlet r = freed\n",
+        expected: 42,
+        io: None,
+        expect: Expect::Runs,
+        ticket: None,
+    },
+    // A top-level `let` whose initializer is an un-folded constant *arithmetic tree* — nimony emits it
+    // as an inline `gvar` initializer `(add (mul 2 3) 36)` rather than folding to `42` or routing it
+    // through the init chain (as a call-initializer like the anchors above is). temen-leng folds the
+    // constant arithmetic tree in the gvar initializer (`const_scalar_int`, #760).
+    Fixture {
+        feature: "const-arith gvar initializer",
+        source: "let r = 2 * 3 + 36\n",
+        expected: 42,
+        io: None,
+        expect: Expect::Runs,
+        ticket: None,
+    },
+];
+
+#[test]
+fn nim_conformance_matrix() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP: nimony toolchain not found (set NIMONY_BIN/NIM_BIN or install on PATH)");
+        return;
+    };
+    // Quiet the panic hook: the catch_unwind fail-closed paths would otherwise spew backtraces that
+    // read as failures. Restored after measurement.
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let measured: Vec<(Status, Option<i64>)> = FIXTURES.iter().map(|f| measure(&path, f)).collect();
+    std::panic::set_hook(prev);
+
+    // Print the matrix.
+    eprintln!("\n=== Nim → Temen conformance matrix (#956) ===");
+    eprintln!("{:<34} {:<14} note", "feature", "status");
+    eprintln!("{}", "-".repeat(72));
+    let mut regressions = Vec::new();
+    let mut improvements = Vec::new();
+    for (f, (st, val)) in FIXTURES.iter().zip(&measured) {
+        let status = match st {
+            Status::Runs => "RUNS".to_string(),
+            Status::Fails(s) => format!("fails:{s:?}").to_lowercase(),
+        };
+        let note = match (st, val) {
+            (Status::Runs, _) => String::new(),
+            (Status::Fails(Stage::Run), Some(v)) => format!("ran, got {v} (want {})", f.expected),
+            (Status::Fails(_), _) => f.ticket.map(|t| t.to_string()).unwrap_or_default(),
+        };
+        eprintln!("{:<34} {:<14} {}", f.feature, status, note);
+
+        let expected_runs = matches!(f.expect, Expect::Runs);
+        let measured_runs = matches!(st, Status::Runs);
+        if expected_runs && !measured_runs {
+            regressions.push((f.feature, st.clone()));
+        } else if !expected_runs && measured_runs {
+            improvements.push(f.feature);
+        } else if let (Expect::FailsClosed(want), Status::Fails(got)) = (&f.expect, st) {
+            if want != got {
+                // The feature still fails, but at a different stage than recorded — worth a nudge to
+                // re-route its ticket, but not a hard failure.
+                eprintln!(
+                    "  note: {} now fails at {got:?}, baseline said {want:?}",
+                    f.feature
+                );
+            }
+        }
+    }
+    let runs = measured.iter().filter(|(s, _)| *s == Status::Runs).count();
+    eprintln!("{}", "-".repeat(72));
+    eprintln!(
+        "{runs}/{} features run end-to-end on the Temen today\n",
+        FIXTURES.len()
+    );
+
+    if std::env::var("NIM_CONFORMANCE_MEASURE").is_ok() {
+        eprintln!("(measure mode: assertions skipped)");
+        return;
+    }
+    assert!(
+        regressions.is_empty(),
+        "conformance REGRESSED (was expected to run, now fails): {regressions:?}"
+    );
+    assert!(
+        improvements.is_empty(),
+        "conformance IMPROVED — flip these fixtures' `expect` to `Runs` and close their sub-issues: {improvements:?}"
+    );
+}

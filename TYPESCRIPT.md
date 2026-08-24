@@ -1,20 +1,20 @@
-# TYPESCRIPT.md — a static-first TypeScript frontend for SVM
+# TYPESCRIPT.md — a static-first TypeScript frontend for Temen
 
 Status: **design doc, pre-implementation**, written 2026-08-04. This records the
 load-bearing language-subset and object-model decisions for compiling TypeScript →
-SVM IR ahead of any code. It leans on the frontend trust model (`DESIGN.md` §2a,
+Temen IR ahead of any code. It leans on the frontend trust model (`DESIGN.md` §2a,
 `FRONTEND.md` §1), the guest-GC contract (`GC.md`), and the guest-JIT posture
 (DESIGN.md §3). Prior art in-tree: the C frontend (`FRONTEND.md`), nimony
-(`NIM.md`), JACL (external, vendors svm; guest-owned object model + GC), and
+(`NIM.md`), JACL (external, vendors temen; guest-owned object model + GC), and
 QuickJS-via-LLVM as the *full-engine* comparison point
-(`crates/svm-run/demos/quickjs/`).
+(`crates/temen-run/demos/quickjs/`).
 
 Fold settled sections into `DESIGN.md` and drop this file once implementation
 lands — the repo convention (cf. the former `WASM.md`/`SCHEDULING.md`).
 
 ## 0. TL;DR
 
-- **Goal.** Run real TypeScript *scripts* from the ecosystem fast on SVM — not the
+- **Goal.** Run real TypeScript *scripts* from the ecosystem fast on Temen — not the
   whole npm ecosystem, not full JS compatibility, and not an AssemblyScript-style
   new-language-in-TS-syntax. `number` stays f64. Well-typed code gets an unboxed
   fast path; the dynamic tail (`any`, unions, dictionaries) gets one boxed slow
@@ -56,7 +56,7 @@ from the ecosystem — compute-shaped scripts, plugins, kernels — with perform
 that beats an interpreted engine by a wide margin on typed code. Programs that
 lean on the banned dynamism (§2) are rejected at compile time with a clear
 error; that is the compatibility price, accepted deliberately. This sits between
-the two poles already explored: QuickJS-on-svm (full semantics, no speed) and
+the two poles already explored: QuickJS-on-temen (full semantics, no speed) and
 AssemblyScript (speed, but a different language — loses `number`, loses the
 ecosystem). We keep TS's types *and* its numeric semantics, and spend the
 compatibility budget only on the dynamism that actually costs machinery.
@@ -75,7 +75,7 @@ once: **new types are fine; new observable semantics are not.**
 type feedback — analyze once, emit specialized IR, done. Guards are *emitted*,
 never adaptively installed. Nothing in this design may require whole-program
 closure in a way that forecloses a later guest JIT compiling new code at
-runtime (svm supports guest JIT); this constraint is what settled §4.
+runtime (temen supports guest JIT); this constraint is what settled §4.
 
 **`any` is kept.** Ecosystem TS is shot through with `any`, `as`, and untyped
 values; banning them would shrink runnable code drastically for little gain.
@@ -116,7 +116,7 @@ representation (§3).
 - getters/setters as above.
 
 **Kept:** closures, classes, prototype-based *method dispatch on a frozen
-chain*, exceptions, generators/async (lower to svm fibers/continuations —
+chain*, exceptions, generators/async (lower to temen fibers/continuations —
 detail deferred), strings, arrays, `Map`/`Set`, JSON, structural typing,
 generics, unions, `any`.
 
@@ -288,7 +288,7 @@ monotonic and dumb, safe for a guest JIT to extend.
   compiler is a frontend like chibicc/nimony — the verifier re-checks everything
   it emits; the masking lowering (Invariant 2) confines every access. The TS
   *runtime* (GC, hash tables, boxing helpers, shape interning) is guest code in
-  the guest window, per the `GC.md` division of labor: svm provides root
+  the guest window, per the `GC.md` division of labor: temen provides root
   enumeration only, the guest owns its heap. `GC.md`'s high-byte payload-mask
   support (`(tag << 56) | offset` roots) is the intended hook for the boxed
   value representation — the tagging scheme should be chosen to fit it (§6).
@@ -318,7 +318,7 @@ monotonic and dumb, safe for a guest JIT to extend.
   and the `string` ↔ dynamic-world story.
 4. **Generics.** Erased-with-boxing vs. reachable-set specialization (the local,
   non-closed-world kind) — likely erased first, specialize by measurement.
-5. **Async/generators → fibers.** Mapping to svm continuations (§12/D22);
+5. **Async/generators → fibers.** Mapping to temen continuations (§12/D22);
   which of `Promise` semantics survive the subset.
 6. **Checker reuse.** Whether to consume `tsc`'s checked AST/types (heavy
   dependency, exact ecosystem semantics) or a from-scratch checker for the

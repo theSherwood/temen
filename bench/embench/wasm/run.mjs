@@ -1,7 +1,7 @@
 // V8 (Node) timing runner for the Embench cross-engine harness (see bench/embench/README.md).
 // Instantiates a self-contained kernel module (exports `run(long n)`, no imports), warms it up so
 // TurboFan tiers up, then reports one per-iteration time and the verify result — same methodology as
-// the native/SVM drivers: per_iter = (min t(large) - min t(small)) / (large - small), min over reps.
+// the native/Temen drivers: per_iter = (min t(large) - min t(small)) / (large - small), min over reps.
 //
 //   node run.mjs <kernel.wasm> <small> <large> <verify_n>
 // stdout: two lines — "<per_iter_ns>" then "<verify>" (matches the native harness's parse).

@@ -1,0 +1,163 @@
+/* Detect-and-kill trap recovery for the JIT (DESIGN.md §4/§5), unix only.
+ *
+ * The guest window is bracketed by a PROT_NONE guard page (allocated in Rust); the masking
+ * lowering confines every access to [0, size), so a fault in the guard region is a
+ * width-overrun at the very top of the window or — defense-in-depth — a masking/elision
+ * bug. We catch SIGSEGV/SIGBUS, and if the faulting address is inside the *currently armed*
+ * window's guarded range we siglongjmp back out of the JIT call, reporting a memory fault to
+ * the host instead of crashing it. Anything else chains to the previous disposition.
+ *
+ * setjmp/sigsetjmp are macros that need the compiler's `returns_twice` handling, so this
+ * lives in C (calling them via raw FFI from Rust is unsound). The recovery state is
+ * thread-local, so concurrent JIT runs on different threads are independent: the handler
+ * runs on the faulting thread and reads that thread's state.
+ */
+/* Feature-test macros must precede every include. `_XOPEN_SOURCE` exposes the (macOS-deprecated)
+ * ucontext routines + `ucontext_t` mcontext on Apple SDKs; `_GNU_SOURCE` gates glibc's REG_RIP/REG_RBP
+ * in <sys/ucontext.h>. Both are harmless where unneeded. */
+#define _XOPEN_SOURCE 700
+#define _GNU_SOURCE
+#include <setjmp.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ucontext.h>
+
+static _Thread_local sigjmp_buf g_buf;
+static _Thread_local volatile int g_armed = 0;
+static _Thread_local volatile uintptr_t g_lo = 0;
+static _Thread_local volatile uintptr_t g_hi = 0;
+
+/* The trap-time backtrace capture *state* and the frame-pointer walk live in `trap_capture.c` (shared
+ * with the windows VEH and the explicit-trap helper). The signal handler below extracts the faulting
+ * `(pc, fp)` from the ucontext and hands them to `temen_store_trap_frame`, which walks the chain and
+ * stashes it in a thread-local for the host to symbolize (DEBUGGING.md §5 W3). The walk must happen
+ * here, while the guest stack is intact: a siglongjmp unwinds back onto the same stack the post-fault
+ * host code then reuses, so the frames would be gone by the time the host could walk them. */
+extern void temen_store_trap_frame(uintptr_t pc, uintptr_t fp);
+
+/* Memory-fault capture: extract the faulting (pc, fp) from the signal ucontext and hand off the walk.
+ * Async-signal-safe: only the ucontext read + the (stack-reading, TLS-writing) store. */
+static void temen_capture_frame(void *uc) {
+    uintptr_t pc = 0, fp = 0;
+#if defined(__linux__) && defined(__x86_64__)
+    ucontext_t *c = (ucontext_t *)uc;
+    pc = (uintptr_t)c->uc_mcontext.gregs[REG_RIP];
+    fp = (uintptr_t)c->uc_mcontext.gregs[REG_RBP];
+#elif defined(__linux__) && defined(__aarch64__)
+    ucontext_t *c = (ucontext_t *)uc;
+    pc = (uintptr_t)c->uc_mcontext.pc;
+    fp = (uintptr_t)c->uc_mcontext.regs[29]; /* AAPCS64 frame pointer */
+#elif defined(__APPLE__) && defined(__x86_64__)
+    ucontext_t *c = (ucontext_t *)uc;
+    pc = (uintptr_t)c->uc_mcontext->__ss.__rip;
+    fp = (uintptr_t)c->uc_mcontext->__ss.__rbp;
+#elif defined(__APPLE__) && defined(__aarch64__)
+    ucontext_t *c = (ucontext_t *)uc;
+    pc = (uintptr_t)c->uc_mcontext->__ss.__pc;
+    fp = (uintptr_t)c->uc_mcontext->__ss.__fp;
+#else
+    (void)uc; /* an arch we don't decode: pc/fp stay 0 → the host yields an empty backtrace */
+#endif
+    temen_store_trap_frame(pc, fp); /* walk + stash in the shared (trap_capture.c) thread-local */
+}
+
+static struct sigaction g_old_segv;
+static struct sigaction g_old_bus;
+static struct sigaction g_old_ill;
+
+static void temen_chain(struct sigaction *old, int sig, siginfo_t *info, void *uc) {
+    if (old->sa_flags & SA_SIGINFO) {
+        if (old->sa_sigaction)
+            old->sa_sigaction(sig, info, uc);
+    } else if (old->sa_handler != SIG_DFL && old->sa_handler != SIG_IGN) {
+        old->sa_handler(sig);
+    } else {
+        /* No useful previous handler: restore the default and re-raise so the process dies
+         * with the usual diagnostics (this is a genuine host fault, not a guest one). */
+        signal(sig, SIG_DFL);
+        raise(sig);
+    }
+}
+
+static void temen_handler(int sig, siginfo_t *info, void *uc) {
+    uintptr_t addr = (uintptr_t)info->si_addr;
+    /* SIGILL = the confinement bounds-check trap (Cranelift `trapnz` → `ud2`/`udf`, the memory-fault
+     * lowering, DESIGN.md §4/§5). Unlike a guard-page SIGSEGV, `si_addr` is the faulting *instruction*
+     * PC (in JIT code), not a window data address, so the [lo,hi) range test does not apply: an
+     * illegal instruction inside an armed guarded guest call is always our emitted trap. Recover
+     * exactly like a guarded data fault (capture the frame, then siglongjmp out reporting a memory
+     * fault). Not armed ⇒ a genuine host illegal instruction: chain to the previous disposition. */
+    if (sig == SIGILL) {
+        if (g_armed) {
+            g_armed = 0;
+            temen_capture_frame(uc);
+            siglongjmp(g_buf, 1);
+        }
+        temen_chain(&g_old_ill, sig, info, uc);
+        return;
+    }
+    if (g_armed && addr >= g_lo && addr < g_hi) {
+        g_armed = 0;
+        temen_capture_frame(uc); /* stash the faulting frame before the stack unwinds (§5 W3) */
+        siglongjmp(g_buf, 1);  /* back to temen_run_guarded; does not return */
+    }
+    temen_chain(sig == SIGBUS ? &g_old_bus : &g_old_segv, sig, info, uc);
+}
+
+/* Install the handler once (idempotent enough for a std::sync::Once caller). */
+void temen_install_trap_handler(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = temen_handler;
+    /* SA_NODEFER: don't block SIGSEGV/SIGBUS while the handler runs. A demand fault suspends to the
+     * parent *from inside this handler*, and the parent must keep its own fault recovery (its guard,
+     * or a further demand fault) while the child sits suspended in its handler frame — a blocked
+     * synchronous signal would kill the process instead. The handler never faults on its own
+     * (it touches only thread-locals), so unblocked re-entry is not a recursion hazard. */
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &g_old_segv);
+    sigaction(SIGBUS, &sa, &g_old_bus);
+    /* SIGILL: the Cranelift `trapnz` confinement trap (see temen_handler). Same handler/flags. */
+    sigaction(SIGILL, &sa, &g_old_ill);
+}
+
+/* Run `fn(a, r, m, t, tc)` (a JIT entry trampoline) with faults in [lo, hi) caught.
+ * Returns 0 if it ran to completion, 1 if a guarded fault was caught and unwound.
+ *
+ * **Re-entrant** (§14 nesting): a guest may run a *child* guest (in its own window) from inside its
+ * own guarded call. The recovery state (buf/lo/hi/armed) is saved on this C stack frame and restored
+ * on exit, so the child's guard nests cleanly and the parent's recovery point is intact afterwards.
+ * A child fault unwinds to *this* (the child's) frame; the parent's frame is untouched. */
+int temen_run_guarded(void (*fn)(const long *, long *, unsigned char *, const void *, long *),
+                    const long *a, long *r, unsigned char *m, const void *t, long *tc,
+                    uintptr_t lo, uintptr_t hi) {
+    /* Save the caller's (possibly-armed parent) recovery state to restore on the way out. */
+    sigjmp_buf saved_buf;
+    memcpy(&saved_buf, &g_buf, sizeof saved_buf);
+    int saved_armed = g_armed;
+    uintptr_t saved_lo = g_lo;
+    uintptr_t saved_hi = g_hi;
+
+    g_lo = lo;
+    g_hi = hi;
+    if (sigsetjmp(g_buf, 1)) {
+        /* A guarded fault unwound back here — restore the parent's recovery state and report it. */
+        memcpy(&g_buf, &saved_buf, sizeof g_buf);
+        g_armed = saved_armed;
+        g_lo = saved_lo;
+        g_hi = saved_hi;
+        return 1;
+    }
+    g_armed = 1;
+    fn(a, r, m, t, tc);
+    /* Ran to completion — restore the parent's recovery state (re-arming the parent's range). */
+    memcpy(&g_buf, &saved_buf, sizeof g_buf);
+    g_armed = saved_armed;
+    g_lo = saved_lo;
+    g_hi = saved_hi;
+    return 0;
+}
+

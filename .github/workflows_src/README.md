@@ -29,18 +29,18 @@ identical until the next agent edit.
   `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
 
 - **`arena-stacks` no-op feature removed from the `stack-guard` + `stack-guard-cross-os` jobs (#919)** —
-  the `svm-fiber`/`svm-jit` `arena-stacks` feature was a retained no-op (the arena is svm-fiber's
+  the `temen-fiber`/`temen-jit` `arena-stacks` feature was a retained no-op (the arena is temen-fiber's
   always-on default backend now), so every `--features stack-check,arena-stacks` invocation just
   re-tested the default config. The two jobs now pass `--features stack-check` only (that feature still
-  gates the `svm-jit` guard test suites into the lane), and the two `cargo test -p svm-fiber --features
+  gates the `temen-jit` guard test suites into the lane), and the two `cargo test -p temen-fiber --features
   arena-stacks` rows — pure default-config re-runs, already covered by the `check` job's workspace test —
   are deleted. Job comment + `name:` updated (no longer "off by default"). **⚠️ Copy-over is required to
   keep these jobs green, not just to drain the `workflows-in-sync` guard:** the same PR deletes the
   `arena-stacks` Cargo feature, so until `cp .github/workflows_src/*.yml .github/workflows/` lands, the
   **live** `ci.yml` still runs `--features arena-stacks` against a crate that no longer defines it and
   the `stack-guard`/`stack-guard-cross-os` jobs fail with "does not contain this feature: arena-stacks".
-  After copy-over both are green (verified locally: `cargo test -p svm-jit --features stack-check` and the
-  default `svm-fiber`/`svm-jit` builds pass; `--features arena-stacks` now errors, as intended).
+  After copy-over both are green (verified locally: `cargo test -p temen-jit --features stack-check` and the
+  default `temen-fiber`/`temen-jit` builds pass; `--features arena-stacks` now errors, as intended).
 
 - **`fuzz-matrix-in-sync` job (#923)** — a new lightweight ubuntu job ("fuzz targets wired") that
   runs `scripts/ci/check-fuzz-matrix.sh`, which asserts the three places a fuzz target is named stay
@@ -54,8 +54,8 @@ identical until the next agent edit.
   .github/workflows_src/*.yml .github/workflows/` drains it.)
 
 - **Nim conformance matrix step in the `nim-e2e` job (#956)** — one step added right after the
-  `Nim end-to-end tests` step: `cargo test -p svm-leng --test nim_conformance -- --nocapture`. Runs the
-  new `crates/svm-leng/tests/nim_conformance.rs` — a feature→status matrix (generics, exceptions,
+  `Nim end-to-end tests` step: `cargo test -p temen-leng --test nim_conformance -- --nocapture`. Runs the
+  new `crates/temen-leng/tests/nim_conformance.rs` — a feature→status matrix (generics, exceptions,
   closures, methods, `seq`/`string`/`Table`, floats, iterators, variant objects, `ref`+ARC) driven
   through the whole real toolchain and asserted against a committed baseline (a feature that starts
   working *or* regresses fails the test). Self-skips (passes) without the toolchain, exactly like
@@ -83,7 +83,7 @@ identical until the next agent edit.
   peer of `diff`. Runs like every other target (`cargo fuzz run wasm_diff -- -max_total_time=300`). The
   matrix comment already says "keep this list in lockstep with `fuzz/fuzz_targets/*.rs`", so an unwired
   target would be zero coverage. Builds under the pinned nightly + `cargo-fuzz`; the stable
-  `crates/svm/tests/wasm_diff.rs` gates it per-PR from seeds. (Until copied over, the `workflows-in-sync`
+  `crates/temen/tests/wasm_diff.rs` gates it per-PR from seeds. (Until copied over, the `workflows-in-sync`
   guard stays red — the expected mirror-edit friction; `cp .github/workflows_src/*.yml
   .github/workflows/` drains it.)
 
@@ -95,7 +95,7 @@ identical until the next agent edit.
   Each site now also seds the mirrorlist/stanzas onto `https://archive.ubuntu.com` (fail-soft
   `|| true` — a healthy runner is untouched). Same class, same shape, one more door closed.
 
-- **`timeout-minutes: 45` on the `svm-llvm` job** (issue #906) — it was the only lane with no
+- **`timeout-minutes: 45` on the `temen-llvm` job** (issue #906) — it was the only lane with no
   timeout, so a wedged compile ran to GitHub's 6-hour default before reporting. Observed once: the
   `std_guest` native-oracle `rustc` hung 66+ min on PR #898's run (the suite unexpectedly *ran*
   there rather than auto-skipping — the runner had a usable nightly). The harness-side fix (the
@@ -104,7 +104,7 @@ identical until the next agent edit.
 
 - **`lua-warm-snapshot-test.mjs` + Lua coverage in `snapshot-worker-test.mjs` (`browser-real` job, issue
   #805)** — one line added after `node warm-jit-test.mjs`: `node lua-warm-snapshot-test.mjs` (Node/V8
-  cold ≡ warm ≡ warm+JIT byte-for-byte + isolation over the committed `lua_snapshot.svmb`). The existing
+  cold ≡ warm ≡ warm+JIT byte-for-byte + isolation over the committed `lua_snapshot.temen`). The existing
   `node snapshot-worker-test.mjs` line is unchanged, but the test itself now also drives the **Lua** warm
   card (one worker per module, so QuickJS + Lua stay warm at once). Both use committed assets; skip
   cleanly if absent. Verified locally (Node + Chromium). (Until copied over, the `workflows-in-sync` guard
@@ -112,29 +112,29 @@ identical until the next agent edit.
 
 - **`tcl-warm-snapshot-test.mjs` + Tcl coverage in `snapshot-worker-test.mjs` (`browser-real` job, issue
   #805 follow-on)** — one line added after `node lua-warm-snapshot-test.mjs`: `node
-  tcl-warm-snapshot-test.mjs` (Node/V8 cold ≡ warm byte-for-byte + isolation over `tcl_snapshot.svmb`;
+  tcl-warm-snapshot-test.mjs` (Node/V8 cold ≡ warm byte-for-byte + isolation over `tcl_snapshot.temen`;
   Tcl's warm+JIT declines, so interpreter-only). The `snapshot-worker-test.mjs` line is unchanged, but
-  the test now also drives the **Tcl** warm card (`noJit` — warm-snapshot-only). Tcl's `.svmb` is
+  the test now also drives the **Tcl** warm card (`noJit` — warm-snapshot-only). Tcl's `.temen` is
   **deploy-built** (the Tcl fetch + toolchain isn't in this job), so both tests SKIP/filter cleanly when
   it's absent — no new toolchain, no gating. Verified locally (Node + Chromium). (Until copied over, the
   `workflows-in-sync` guard stays red — the expected mirror-edit friction.)
 
 - **`warm-snapshot-test.mjs` in the `browser-real` job** — one line added to the Chromium test block
   (right after `node browser-jit-cache-test.mjs`): `node warm-snapshot-test.mjs`. Validates the
-  WASM_AOT.md warm-runtime snapshot: `svm_warm_open` runs the QuickJS `warmup` export once, then
-  `svm_warm_eval` restores the post-init image and runs `eval_run`, which must match the cold `_start`
-  path (`svm_run_onramp`) byte-for-byte while skipping the runtime rebuild. Uses the committed
-  `web/assets/qjs_snapshot.svmb`; skips cleanly if absent. Reuses the wasm the job already builds — no
+  WASM_AOT.md warm-runtime snapshot: `temen_warm_open` runs the QuickJS `warmup` export once, then
+  `temen_warm_eval` restores the post-init image and runs `eval_run`, which must match the cold `_start`
+  path (`temen_run_onramp`) byte-for-byte while skipping the runtime rebuild. Uses the committed
+  `web/assets/qjs_snapshot.temen`; skips cleanly if absent. Reuses the wasm the job already builds — no
   new toolchain. Verified locally in Node/V8. (Until copied over, the `workflows-in-sync` guard stays
   red — the expected mirror-edit friction; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
 
 - **`warm-jit-test.mjs` in the `browser-real` job** — one line added right after `node
   warm-snapshot-test.mjs`: `node warm-jit-test.mjs`. Validates the WASM_AOT.md **warm+JIT** tier
-  (issue #783): `svm_warm_jit_open` emits the QuickJS `eval_run` to wasm once, `runWarmJit` (from
+  (issue #783): `temen_warm_jit_open` emits the QuickJS `eval_run` to wasm once, `runWarmJit` (from
   `web/wasmjit-module.js`) drives it over the restored snapshot each Run — which must match the
-  interpreter warm path (`svm_warm_eval`) byte-for-byte, keep fresh-per-Run isolation (a `var` in one
+  interpreter warm path (`temen_warm_eval`) byte-for-byte, keep fresh-per-Run isolation (a `var` in one
   Run cannot leak into the next), and accelerate a compute-heavy eval (measured ~9× on a 500k-iteration
-  loop; a trivial program stays on warm-interp). Uses the committed `web/assets/qjs_snapshot.svmb`;
+  loop; a trivial program stays on warm-interp). Uses the committed `web/assets/qjs_snapshot.temen`;
   skips cleanly if absent. Reuses the threads wasm the job already builds — no new toolchain. Verified
   locally in Node/V8.
 
@@ -145,15 +145,15 @@ identical until the next agent edit.
   `play.html` and asserts the card runs end-to-end on both warm tiers (warm-snapshot + warm+JIT), that
   the work actually went **through the worker** (a `globalThis.__snapshotWorkerRuns` counter increments —
   so a silent main-thread fallback fails the test), and that fresh-per-Run isolation holds. Uses the
-  committed `web/assets/qjs_snapshot.svmb`; skips cleanly if absent. Reuses the threads wasm the job
+  committed `web/assets/qjs_snapshot.temen`; skips cleanly if absent. Reuses the threads wasm the job
   already builds — no new toolchain. Verified locally in Chromium. (Until copied over, the
   `workflows-in-sync` guard stays red — the expected mirror-edit friction.)
 
 - **`browser-tierup-mainline-test.mjs` in the `browser-real` job** — one line added to the Chromium
   test block (right after the already-copied `node browser-jit-cache-test.mjs`):
   `node browser-tierup-mainline-test.mjs`. Validates slice-2 mainline tier-up over a live window (the
-  slice-0 JACL residual): an SVM-text compute guest run with tier-up on must equal the all-interpreter
-  value and tier-up must fire (no assets — parses in-page via `svm_parse`). Reuses the threads module
+  slice-0 JACL residual): an TEMEN-text compute guest run with tier-up on must equal the all-interpreter
+  value and tier-up must fire (no assets — parses in-page via `temen_parse`). Reuses the threads module
   the job already builds — no new toolchain. Verified locally in Chromium. (The sibling
   `browser-jit-cache-test.mjs` line was already copied over in commit `90c3b6d`.)
 
@@ -161,7 +161,7 @@ identical until the next agent edit.
   `push: [main]` and `pull_request` triggers so a changeset that touches **only** Markdown skips the
   whole CI matrix (it's slow, and prose edits don't affect build/test/fuzz). `paths-ignore` skips a run
   only when *every* changed file matches, so a mixed code+doc commit still runs the full matrix. The one
-  generated-and-golden-tested Markdown file (`OPS_PARITY.md`, checked by `svm-parity/tests/golden.rs`) is
+  generated-and-golden-tested Markdown file (`OPS_PARITY.md`, checked by `temen-parity/tests/golden.rs`) is
   always regenerated alongside a `.rs` change, so mixed-changeset CI still covers it; only a lone
   hand-edit of that generated file would slip through, which is already a misuse. The `schedule` (nightly
   fuzz) and `workflow_dispatch` triggers are unaffected — they always run.
@@ -216,7 +216,7 @@ identical until the next agent edit.
 
 - **`cc1-self-compile-giants` job** — a new **nightly** (`schedule` + `workflow_dispatch`) Linux job
   that runs the giant cc1 TUs (`preprocess.c`/`parse.c`/`codegen_ir.c`) through the guest-vs-native
-  differential with `SVM_SELFHOST_GIANTS=1`. ~8 min locally (more on CI), too slow for the per-PR gate,
+  differential with `TEMEN_SELFHOST_GIANTS=1`. ~8 min locally (more on CI), too slow for the per-PR gate,
   so it rides the daily cron like `miri`. Together with the five tractable TUs in the always-on
   `cc1-self-compile` job it completes per-TU byte-identity across **all nine** cc1 TUs — the sufficient
   condition for the `chibicc2 == chibicc3` fixpoint. (The always-on job already runs the giant test too
@@ -226,7 +226,7 @@ identical until the next agent edit.
   the `#[ignore]`d full-depth *correctness* gates that no CI job previously ran: Lua's suite
   (`lua_tlib`/`lua_all`/`lua_sweep`) on both the bytecode engine and the tree-walker, plus the
   whole-language capstones (`demo_tcl_repl_stdin`/`demo_tcl_init_stdin` and the full
-  `demo_sqlite_logictest_full` sweep) via `cargo test --test … -- --ignored` from `crates/svm-llvm`
+  `demo_sqlite_logictest_full` sweep) via `cargo test --test … -- --ignored` from `crates/temen-llvm`
   (workspace-excluded, so run from its dir). Each asserts byte-identity with the native `cc` build.
   `#[ignore]`d only for wall-clock (minutes per suite on the tree-walker), so it rides the daily cron
   like `miri`/giants rather than the per-PR gate — closing the JIT-only blind spot that let the QuickJS
@@ -235,8 +235,8 @@ identical until the next agent edit.
   real validation of the ~90-min timeout budget.
 
 - **`nim-e2e` job** — builds the real nimony toolchain (`scripts/ci/provision-nimony.sh`, cached) and
-  runs `crates/svm-leng/tests/nim_e2e.rs`, which compiles small **Nim source** programs through
-  `nimony c` and runs them on both SVM engines. The tests self-skip (pass) in the always-on `check`
+  runs `crates/temen-leng/tests/nim_e2e.rs`, which compiles small **Nim source** programs through
+  `nimony c` and runs them on both Temen engines. The tests self-skip (pass) in the always-on `check`
   job because the toolchain isn't there; this job provides it so they actually execute. **Things
   to do on copy-over:** (1) pin `alaviss/setup-nim@0.1.1` by SHA (left as a tag — no vetted SHA to
   hand); (2) confirm the heavy cold build (~10-15 min) fits the runner budget — it's a mirror of
@@ -251,13 +251,13 @@ identical until the next agent edit.
   reddening the run (see the pending-changes entry above).
 
 - **`std-guest` job** (#821) — a new **nightly** (`schedule` + `workflow_dispatch`) Linux job that runs
-  the `crates/svm-llvm/tests/std_guest.rs` suite, which no CI job previously executed (it auto-skips in
-  the always-on `svm-llvm` job because nightly + `rust-src` + the applied svm std overlay aren't there).
-  The job installs nightly + `rust-src`, runs `rust-svm/apply-overlay.sh`, and runs the suite serially.
-  It exercises **both** target specs — the lean `x86_64-unknown-svm` and the new threaded
-  `x86_64-unknown-svm-threads` (`singlethread=false`: futex `sys/sync` + native TLS) — through
+  the `crates/temen-llvm/tests/std_guest.rs` suite, which no CI job previously executed (it auto-skips in
+  the always-on `temen-llvm` job because nightly + `rust-src` + the applied temen std overlay aren't there).
+  The job installs nightly + `rust-src`, runs `rust-temen/apply-overlay.sh`, and runs the suite serially.
+  It exercises **both** target specs — the lean `x86_64-unknown-temen` and the new threaded
+  `x86_64-unknown-temen-threads` (`singlethread=false`: futex `sys/sync` + native TLS) — through
   `-Zbuild-std` → on-ramp → verify → powerbox. Guards against the #788 build-std wedge two ways: a firm
-  `timeout-minutes: 75`, and a per-build kill-and-skip in the harness (`SVM_STD_BUILD_TIMEOUT_SECS`,
+  `timeout-minutes: 75`, and a per-build kill-and-skip in the harness (`TEMEN_STD_BUILD_TIMEOUT_SECS`,
   set to 480). `RUSTFLAGS: ""` overrides the workflow-global `-D warnings` (build-std recompiles std).
   First green run on CI is the real validation of the time budget (~12 tests × two targets × ~40 s
   serial). No new toolchain beyond nightly+rust-src.

@@ -1,20 +1,20 @@
 //! **The nimony compiler, in the browser** (NIM.md §3c/§3e; #958). The wasm port of the headless
-//! `nim_selfdrive` driver (`crates/svm-run/examples/nim_selfdrive.rs`): given only Nim source + the
+//! `nim_selfdrive` driver (`crates/temen-run/examples/nim_selfdrive.rs`): given only Nim source + the
 //! stdlib — **no native nimony** — it plays nifmake itself (computes each module's cache stem exactly
 //! as nimony does, crawls the `import` graph with `nifler`), runs `nimsem` + `hexer` over the closure
-//! as sandboxed SVM guests (nimsem spawns nifler over the shared memfs via a wasm-native `exec` cap),
-//! and links + runs the result with `svm-leng`. Every phase runs on the browser's bytecode engine;
+//! as sandboxed Temen guests (nimsem spawns nifler over the shared memfs via a wasm-native `exec` cap),
+//! and links + runs the result with `temen-leng`. Every phase runs on the browser's bytecode engine;
 //! the whole thing is client-side.
 //!
 //! Guests here run through [`bytecode::compile_and_run_capture_reserved_with_host`] — the same engine
-//! `svm_run_nifler_fs` (the single-phase card) already runs `nifler` on. The `exec` cap's child run is
-//! a *nested* guest run inside the parent's cap dispatch (as `svm-run`'s `domain_exec` does natively).
+//! `temen_run_nifler_fs` (the single-phase card) already runs `nifler` on. The `exec` cap's child run is
+//! a *nested* guest run inside the parent's cap dispatch (as `temen-run`'s `domain_exec` does natively).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use svm_interp::{bytecode, Host, HostProc, StreamRole, Trap, Value};
-use svm_ir::Module;
+use temen_interp::{bytecode, Host, HostProc, StreamRole, Trap, Value};
+use temen_ir::Module;
 
 use crate::{onramp_cap_resolver, onramp_check, pg_args_blob};
 
@@ -144,7 +144,7 @@ type FsFactory = Arc<dyn Fn() -> HostProc + Send + Sync>;
 
 /// Run phase module `m` with `argv` on the bytecode engine, granting the on-ramp powerbox
 /// (stdout/stdin/exit/memory), a fresh `fs` grant, and — for `nimsem` — an `exec` cap. Returns the
-/// guest's captured stdout and its exit/return code. Mirrors `svm-run`'s `run_with_caps` (and the
+/// guest's captured stdout and its exit/return code. Mirrors `temen-run`'s `run_with_caps` (and the
 /// browser's `pg_setup`) but with the shared-factory `fs` + optional `exec` the multibinary driver needs.
 fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) -> (Vec<u8>, i64) {
     if onramp_check(m).is_err() {
@@ -168,29 +168,29 @@ fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) ->
     // Manifest slot bindings for the on-ramp powerbox imports (stdout/stdin/exit/memory) — fs/exec are
     // reached by name (`cap.self.resolve`) instead, so they're not bound here.
     if !m.imports.is_empty() {
-        use svm_interp::cap_id;
+        use temen_interp::cap_id;
         let bindings = m
             .imports
             .iter()
             .map(|im| {
                 let Some(cap) = onramp_cap_resolver(&im.name) else {
-                    return svm_interp::BoundImport::rebindable(0, 0, None);
+                    return temen_interp::BoundImport::rebindable(0, 0, None);
                 };
                 let handle = match (cap.type_id, cap.op) {
                     (cap_id::STREAM, 1) => out,
                     (cap_id::STREAM, _) => inp,
                     (cap_id::EXIT, _) => exit,
                     (cap_id::ADDRESS_SPACE, _) => memory,
-                    _ => return svm_interp::BoundImport::rebindable(0, 0, None),
+                    _ => return temen_interp::BoundImport::rebindable(0, 0, None),
                 };
-                svm_interp::BoundImport::required(cap.type_id, cap.op, handle)
+                temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
             })
             .collect();
         host.set_import_bindings(bindings);
     }
     // Seed argv at the powerbox args base (the on-ramp `_start` parses argc/argv from it).
     let blob = pg_args_blob(&argv.iter().map(|s| s.as_bytes()).collect::<Vec<_>>());
-    let base = svm_ir::POWERBOX_ARGS_BASE as usize;
+    let base = temen_ir::POWERBOX_ARGS_BASE as usize;
     let mut init_mem = vec![0u8; base + blob.len()];
     init_mem[base..].copy_from_slice(&blob);
 
@@ -201,7 +201,7 @@ fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) ->
         &[],
         &mut fuel,
         &init_mem,
-        svm_ir::DEFAULT_RESERVED_LOG2,
+        temen_ir::DEFAULT_RESERVED_LOG2,
         &mut host,
     );
     let code = match outcome {
@@ -220,14 +220,14 @@ fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) ->
 /// The wasm-native `exec` cap: `nimsem`'s `system("nifler … parse …")` (routed by the shim to the
 /// `exec` capability) runs `nifler` as a nested guest over the **same** memfs. Only `nifler` is in the
 /// registry (argv[0] `nifler` or `/bin/nifler`); anything else is refused. Non-`run` ops
-/// (status/read/close) go through `svm_exec::JobTable`, exactly like `svm-run`'s `domain_exec`.
+/// (status/read/close) go through `temen_exec::JobTable`, exactly like `temen-run`'s `domain_exec`.
 fn make_exec(nifler: Arc<Module>, fs_factory: FsFactory) -> HostProc {
-    let mut jobs = svm_exec::JobTable::default();
+    let mut jobs = temen_exec::JobTable::default();
     Box::new(move |op, args, mem, _minter| {
-        if op != svm_exec::EXEC_RUN {
+        if op != temen_exec::EXEC_RUN {
             return Ok(vec![jobs.handle(op, args, mem)]);
         }
-        let (argv, _stdin) = match svm_exec::run_args(args, mem.as_deref()) {
+        let (argv, _stdin) = match temen_exec::run_args(args, mem.as_deref()) {
             Ok(x) => x,
             Err(e) => return Ok(vec![e]),
         };
@@ -235,11 +235,11 @@ fn make_exec(nifler: Arc<Module>, fs_factory: FsFactory) -> HostProc {
             argv.first().map(String::as_str),
             Some("nifler") | Some("/bin/nifler")
         ) {
-            return Ok(vec![svm_ir::errno::EPERM]);
+            return Ok(vec![temen_ir::errno::EPERM]);
         }
         let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
         let (stdout, exit) = run_phase(&nifler, &argv_refs, (fs_factory)(), None);
-        Ok(vec![jobs.push(svm_exec::Job {
+        Ok(vec![jobs.push(temen_exec::Job {
             stdout,
             stderr: vec![],
             out_pos: 0,
@@ -265,7 +265,7 @@ struct Mod {
 }
 
 /// Compile `main_nim` (present in `files` at its bare name, alongside any imported siblings) plus the
-/// stdlib (also in `files`, under `lib/`) entirely on the SVM through the real nimony phases, link it
+/// stdlib (also in `files`, under `lib/`) entirely on the Temen through the real nimony phases, link it
 /// through the nim→powerbox bridge, **run `_start` under the powerbox**, and return its captured
 /// **stdout** (empty for a program that writes nothing). `nifler`/`nimsem`/`hexer` are the decoded
 /// phase modules. `Ok(stdout)` on success, `Err(diagnostic)` on any phase/link/run failure.
@@ -276,11 +276,11 @@ pub fn compile_nim(
     files: Vec<(String, Vec<u8>)>,
     main_nim: &str,
 ) -> Result<String, String> {
-    let nifler_m = Arc::new(svm_encode::decode_module(nifler).map_err(|_| "decode nifler")?);
-    let nimsem_m = svm_encode::decode_module(nimsem).map_err(|_| "decode nimsem")?;
-    let hexer_m = svm_encode::decode_module(hexer).map_err(|_| "decode hexer")?;
+    let nifler_m = Arc::new(temen_encode::decode_module(nifler).map_err(|_| "decode nifler")?);
+    let nimsem_m = temen_encode::decode_module(nimsem).map_err(|_| "decode nimsem")?;
+    let hexer_m = temen_encode::decode_module(hexer).map_err(|_| "decode hexer")?;
 
-    let (factory, handle) = svm_fs::mem_fs_shared_factory(files, vec!["nimcache".into()]);
+    let (factory, handle) = temen_fs::mem_fs_shared_factory(files, vec!["nimcache".into()]);
     let factory: FsFactory = Arc::new(factory);
 
     // ---- phase 1: parse + crawl the import closure with nifler ------------------------------------
@@ -392,13 +392,13 @@ pub fn compile_nim(
     // ---- phase 4: link + run (main first, system last) -------------------------------------------
     let mut ordered: Vec<&(String, String)> = leng.iter().collect();
     ordered.sort_by_key(|(stem, _)| (*stem != main_stem, stem.starts_with("sysv")));
-    let units: Vec<svm_leng::WholeModule> = ordered
+    let units: Vec<temen_leng::WholeModule> = ordered
         .iter()
-        .map(|(stem, src)| svm_leng::WholeModule { stem, src })
+        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
 
-    let m = svm_leng::link_nim_powerbox(&units).map_err(|e| format!("nim→powerbox link: {e}"))?;
-    svm_verify::verify_module(&m).map_err(|e| format!("verify: {e:?}"))?;
+    let m = temen_leng::link_nim_powerbox(&units).map_err(|e| format!("nim→powerbox link: {e}"))?;
+    temen_verify::verify_module(&m).map_err(|e| format!("verify: {e:?}"))?;
     let out = crate::onramp_exec(&m, &[]);
     if out.status != crate::STATUS_OK && out.status != crate::STATUS_EXIT {
         return Err(format!("run failed (status {})", out.status));
@@ -406,7 +406,7 @@ pub fn compile_nim(
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn read(handle: &svm_fs::MemFsHandle, key: &str) -> Option<Vec<u8>> {
+fn read(handle: &temen_fs::MemFsHandle, key: &str) -> Option<Vec<u8>> {
     let (files, _) = handle.seed();
     files.into_iter().find(|(k, _)| k == key).map(|(_, v)| v)
 }
@@ -414,15 +414,15 @@ fn read(handle: &svm_fs::MemFsHandle, key: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     //! Native validation of the in-browser compiler over the bytecode engine (the same engine the
-    //! wasm cdylib uses). Skips unless the phase `.svmb` are staged at `/tmp/e2e_svmb` and the stdlib
+    //! wasm cdylib uses). Skips unless the phase `.temen` are staged at `/tmp/e2e_temen` and the stdlib
     //! at `.nimtool/nimony/lib` — build them with `demos/nim_e2e_chain/build_e2e_chain.sh`.
     use super::*;
 
     fn seed() -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<(String, Vec<u8>)>)> {
-        let dir = std::path::Path::new("/tmp/e2e_svmb");
+        let dir = std::path::Path::new("/tmp/e2e_temen");
         let lib = std::path::Path::new("../.nimtool/nimony/lib");
-        if !dir.join("nifler.svmb").exists() || !lib.exists() {
-            eprintln!("SKIP: phase .svmb or stdlib absent");
+        if !dir.join("nifler.temen").exists() || !lib.exists() {
+            eprintln!("SKIP: phase .temen or stdlib absent");
             return None;
         }
         let mut files = vec![];
@@ -447,9 +447,9 @@ mod tests {
             }
         }
         Some((
-            std::fs::read(dir.join("nifler.svmb")).unwrap(),
-            std::fs::read(dir.join("nimsem.svmb")).unwrap(),
-            std::fs::read(dir.join("hexer.svmb")).unwrap(),
+            std::fs::read(dir.join("nifler.temen")).unwrap(),
+            std::fs::read(dir.join("nimsem.temen")).unwrap(),
+            std::fs::read(dir.join("hexer.temen")).unwrap(),
             files,
         ))
     }
@@ -465,7 +465,7 @@ mod tests {
         // past what compiles here.
         files.push((
             "prog.nim".into(),
-            b"import std/syncio\n\nproc greet(name: string): string =\n  \"hello, \" & name & \"\\n\"\n\nwrite(stdout, greet(\"Nim\"))\nwrite(stdout, greet(\"the SVM\"))\n".to_vec(),
+            b"import std/syncio\n\nproc greet(name: string): string =\n  \"hello, \" & name & \"\\n\"\n\nwrite(stdout, greet(\"Nim\"))\nwrite(stdout, greet(\"the Temen\"))\n".to_vec(),
         ));
         let r = compile_nim(&nifler, &nimsem, &hexer, files, "prog.nim");
         assert_eq!(

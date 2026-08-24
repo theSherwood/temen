@@ -1,6 +1,6 @@
 //! **rustc-bitcode miscompile probe** (ISSUES.md I23 follow-on). A fast *correctness-only* sweep: for
 //! each `rustbench/probes/<name>.rs` workload (prelude + a `run(n)->i64`), compile it with the system
-//! rustc, translate the textual IR through `svm-llvm`, run it on `svm-jit`, and compare `run(n)` to a
+//! rustc, translate the textual IR through `temen-llvm`, run it on `temen-jit`, and compare `run(n)` to a
 //! native build over a spread of `n` — a MISCOMPILE (a trap on an in-bounds program, or a wrong value)
 //! is exactly the class of bug the rustbench harness caught for I23 (opaque-pointer / auto-vectorizer
 //! patterns clang doesn't emit but rustc does). No timing, so it iterates in seconds over many probes.
@@ -22,7 +22,7 @@ fn tmp(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("rustprobe_{}_{name}", std::process::id()))
 }
 fn rustc() -> Command {
-    match std::env::var("SVM_RUSTBENCH_RUSTC") {
+    match std::env::var("TEMEN_RUSTBENCH_RUSTC") {
         Ok(t) if t.starts_with('+') => {
             let mut c = Command::new("rustc");
             c.arg(&t);
@@ -40,9 +40,9 @@ fn compose(name: &str) -> Option<String> {
     Some(format!("{pre}\n{wl}"))
 }
 
-/// rustc `--emit=llvm-ir` → svm_llvm → svm_jit; returns a `run(n)` runner (Err on a trap).
-fn svm_runner(src: &Path) -> Option<impl FnMut(i64) -> Result<i64, String>> {
-    let ll = tmp("svm.ll");
+/// rustc `--emit=llvm-ir` → temen_llvm → temen_jit; returns a `run(n)` runner (Err on a trap).
+fn temen_runner(src: &Path) -> Option<impl FnMut(i64) -> Result<i64, String>> {
+    let ll = tmp("temen.ll");
     let ok = rustc()
         .args([
             "--edition",
@@ -62,7 +62,7 @@ fn svm_runner(src: &Path) -> Option<impl FnMut(i64) -> Result<i64, String>> {
     if !ok {
         return None;
     }
-    let t = match svm_llvm::translate_ll_path(&ll) {
+    let t = match temen_llvm::translate_ll_path(&ll) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("  translate error: {e:?}");
@@ -71,16 +71,16 @@ fn svm_runner(src: &Path) -> Option<impl FnMut(i64) -> Result<i64, String>> {
     };
     let sp = t.entry_sp as i64;
     let e = t.exports.iter().find(|(n, _)| n == "run")?.1;
-    let mut cm = match svm_jit::compile(&t.module, e) {
+    let mut cm = match temen_jit::compile(&t.module, e) {
         Ok(cm) => cm,
         Err(e) => {
-            eprintln!("  svm_jit::compile error: {e:?}");
+            eprintln!("  temen_jit::compile error: {e:?}");
             return None;
         }
     };
     Some(move |n: i64| -> Result<i64, String> {
         match cm.run(&[sp, n], None, None, None) {
-            Ok((svm_jit::JitOutcome::Returned(v), _)) => Ok(v[0]),
+            Ok((temen_jit::JitOutcome::Returned(v), _)) => Ok(v[0]),
             Ok((o, _)) => Err(format!("{o:?}")),
             Err(e) => Err(format!("run err {e:?}")),
         }
@@ -159,8 +159,8 @@ fn main() {
         if std::fs::write(&src, &text).is_err() {
             continue;
         }
-        let Some(mut svm) = svm_runner(&src) else {
-            eprintln!("{name}: svm lane unavailable — skip");
+        let Some(mut temen) = temen_runner(&src) else {
+            eprintln!("{name}: temen lane unavailable — skip");
             continue;
         };
         let Some(exe) = native_build(&src) else {
@@ -170,11 +170,11 @@ fn main() {
         let mut bad: Vec<String> = Vec::new();
         for &n in NS {
             let want = native_run(&exe, n);
-            let got = svm(n);
+            let got = temen(n);
             match (want, &got) {
                 (Some(w), Ok(g)) if *g == w => {}
-                (Some(w), Ok(g)) => bad.push(format!("n={n}: svm={g} native={w}")),
-                (Some(w), Err(e)) => bad.push(format!("n={n}: svm TRAP({e}) native={w}")),
+                (Some(w), Ok(g)) => bad.push(format!("n={n}: temen={g} native={w}")),
+                (Some(w), Err(e)) => bad.push(format!("n={n}: temen TRAP({e}) native={w}")),
                 (None, _) => bad.push(format!("n={n}: native failed")),
             }
         }

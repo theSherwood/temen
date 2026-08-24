@@ -1,7 +1,7 @@
 #ifndef __LIMITS_H
 #define __LIMITS_H
 
-// <limits.h> — the ILP32-`int` / LP64-`long` model chibicc targets on SVM (32-bit int, 64-bit long).
+// <limits.h> — the ILP32-`int` / LP64-`long` model chibicc targets on Temen (32-bit int, 64-bit long).
 #define CHAR_BIT 8
 #define SCHAR_MIN (-128)
 #define SCHAR_MAX 127

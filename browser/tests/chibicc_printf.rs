@@ -4,26 +4,28 @@
 //! compile to an unresolved `call.sym "printf"` and trap; now `<stdio.h>` carries a guest-C `printf`
 //! that formats over the powerbox's ambient `write`, so the program actually prints.
 //!
-//! Fail-soft: `chibicc.svmb` is a code-coupled asset (`browser/web/assets/`) that CI regenerates. If
+//! Fail-soft: `chibicc.temen` is a code-coupled asset (`browser/web/assets/`) that CI regenerates. If
 //! it is absent (a fresh tree without the build), the test SKIPs rather than failing — the Lua/Doom
 //! pattern.
 
-use svm_browser::{onramp_exec, onramp_fs_exec, playground_include_files, STATUS_EXIT, STATUS_OK};
+use temen_browser::{
+    onramp_exec, onramp_fs_exec, playground_include_files, STATUS_EXIT, STATUS_OK,
+};
 
-fn chibicc_svmb() -> Option<Vec<u8>> {
-    let p = concat!(env!("CARGO_MANIFEST_DIR"), "/web/assets/chibicc.svmb");
+fn chibicc_temen() -> Option<Vec<u8>> {
+    let p = concat!(env!("CARGO_MANIFEST_DIR"), "/web/assets/chibicc.temen");
     std::fs::read(p).ok()
 }
 
 /// Compile `src` with the seeded playground headers, run the result, return its captured stdout.
-fn compile_and_run(chibicc: &svm_ir::Module, src: &str) -> (i32, String) {
+fn compile_and_run(chibicc: &temen_ir::Module, src: &str) -> (i32, String) {
     // The memfs the card seeds: built-in headers under `include/` + the user's source at `in.c`.
     let mut files: Vec<(String, Vec<u8>)> = playground_include_files();
     files.push(("in.c".to_string(), src.as_bytes().to_vec()));
     let dirs = vec!["include".to_string()];
-    let image = svm_fs::encode_image(&files, &dirs);
+    let image = temen_fs::encode_image(&files, &dirs);
 
-    // Pass 1 — chibicc.svmb emits SVM-IR text on stdout. `--data-page 65536` mirrors the browser card
+    // Pass 1 — chibicc.temen emits TEMEN-IR text on stdout. `--data-page 65536` mirrors the browser card
     // (D40 isolation at the 64 KiB wasm host page), so this exercises exactly the shipped path.
     let compiled = onramp_fs_exec(
         chibicc,
@@ -37,10 +39,10 @@ fn compile_and_run(chibicc: &svm_ir::Module, src: &str) -> (i32, String) {
         compiled.status
     );
     let ir = String::from_utf8(compiled.stdout).expect("IR is utf8");
-    assert!(ir.contains("func"), "expected SVM IR, got: {ir:.200}");
+    assert!(ir.contains("func"), "expected Temen IR, got: {ir:.200}");
 
     // Pass 2 — parse the IR into a module and run it under the powerbox.
-    let m = svm_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}\n{ir}"));
+    let m = temen_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}\n{ir}"));
     let run = onramp_exec(&m, b"");
     (
         run.status,
@@ -50,11 +52,11 @@ fn compile_and_run(chibicc: &svm_ir::Module, src: &str) -> (i32, String) {
 
 #[test]
 fn printf_program_prints_through_the_powerbox() {
-    let Some(bytes) = chibicc_svmb() else {
-        eprintln!("SKIP: browser/web/assets/chibicc.svmb absent (run build-onramp-assets.mjs)");
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: browser/web/assets/chibicc.temen absent (run build-onramp-assets.mjs)");
         return;
     };
-    let chibicc = svm_encode::decode_module(&bytes).expect("decode chibicc.svmb");
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode chibicc.temen");
 
     let (status, out) = compile_and_run(
         &chibicc,
@@ -76,11 +78,11 @@ int main(void) {
 
 #[test]
 fn string_and_stdlib_headers_resolve_and_run() {
-    let Some(bytes) = chibicc_svmb() else {
-        eprintln!("SKIP: chibicc.svmb absent");
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
         return;
     };
-    let chibicc = svm_encode::decode_module(&bytes).expect("decode chibicc.svmb");
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode chibicc.temen");
 
     let (status, out) = compile_and_run(
         &chibicc,
@@ -102,11 +104,11 @@ int main(void) {
 
 #[test]
 fn float_formatting_matches_glibc_for_typical_values() {
-    let Some(bytes) = chibicc_svmb() else {
-        eprintln!("SKIP: chibicc.svmb absent");
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
         return;
     };
-    let chibicc = svm_encode::decode_module(&bytes).expect("decode chibicc.svmb");
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode chibicc.temen");
 
     // The seeded <stdio.h> formats %f/%e/%g in guest C, correctly rounded to the requested precision.
     // These are all cases where that matches glibc byte-for-byte (the bignum-only ties — an exact 0.5

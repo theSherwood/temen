@@ -1,7 +1,7 @@
 # Out-of-workspace (like `fuzz/`): pulls in Wasmtime, so the escape-TCB crates and the
 # stable `cargo build --workspace` never see it. Run with `cargo run --release` from here.
 [package]
-name = "svm-bench-vs-wasmtime"
+name = "temen-bench-vs-wasmtime"
 version = "0.0.0"
 edition = "2021"
 publish = false
@@ -17,32 +17,32 @@ name = "bench-vs-wasmtime"
 path = "src/main.rs"
 
 [dependencies]
-svm-ir = { path = "../crates/svm-ir" }
-svm-text = { path = "../crates/svm-text" }
-svm-jit = { path = "../crates/svm-jit" }
+temen-ir = { path = "../crates/temen-ir" }
+temen-text = { path = "../crates/temen-text" }
+temen-jit = { path = "../crates/temen-jit" }
 # The reference interpreter — the `interp` lane: the *same* IR the JIT runs, executed by the
-# tree-walking oracle (`crates/svm/src/bin/bench.rs` tracks it too). Apples-to-apples with the JIT.
-svm-interp = { path = "../crates/svm-interp" }
-# The AOT IR optimizer, for `--optimize`: run svm-opt over each kernel's IR before the SVM lanes,
+# tree-walking oracle (`crates/temen/src/bin/bench.rs` tracks it too). Apples-to-apples with the JIT.
+temen-interp = { path = "../crates/temen-interp" }
+# The AOT IR optimizer, for `--optimize`: run temen-opt over each kernel's IR before the Temen lanes,
 # so the Wasmtime-relative ratios reflect the optimizer (OPT.md Phase 5 follow-up). Re-verified with
-# svm-verify (a bad optimize falls back to the unoptimized IR, so a kernel never silently miscompiles).
-svm-opt = { path = "../crates/svm-opt" }
-svm-verify = { path = "../crates/svm-verify" }
-# The wasm→IR transpiler, for `--from-wasm`: run the *same* wasm bytes on SVM (transpiled to IR)
+# temen-verify (a bad optimize falls back to the unoptimized IR, so a kernel never silently miscompiles).
+temen-opt = { path = "../crates/temen-opt" }
+temen-verify = { path = "../crates/temen-verify" }
+# The wasm→IR transpiler, for `--from-wasm`: run the *same* wasm bytes on Temen (transpiled to IR)
 # and on Wasmtime — the apples-to-apples comparison, instead of hand-paired IR/WAT.
-svm-wasm = { path = "../crates/svm-wasm" }
+temen-wasm = { path = "../crates/temen-wasm" }
 # The partial-evaluation on-ramp + its wasm-JIT emitter, for the `peval_indirect` bin: it measures
 # approach-A (bounded-target dynamic call_indirect) across all four backends, running the wasm-JIT's
 # emitted wasm on the same Wasmtime (Cranelift) this crate already links.
-svm-peval = { path = "../crates/svm-peval" }
-svm-wasm-jit = { path = "../crates/svm-wasm-jit" }
-# The LLVM->IR on-ramp: the production svm-jit path (C -> clang -O2 bitcode -> SVM IR),
-# for the confinement-cost harness (`--bin confine`) that compares svm-jit vs Wasmtime-w64
+temen-peval = { path = "../crates/temen-peval" }
+temen-wasm-jit = { path = "../crates/temen-wasm-jit" }
+# The LLVM->IR on-ramp: the production temen-jit path (C -> clang -O2 bitcode -> Temen IR),
+# for the confinement-cost harness (`--bin confine`) that compares temen-jit vs Wasmtime-w64
 # on the same LP64 kernels the embench differential uses.
-svm-llvm = { path = "../crates/svm-llvm" }
+temen-llvm = { path = "../crates/temen-llvm" }
 # The embedding runtime, for the mem-hooks overhead probe (`--bin hooks`): it measures the real
 # embedder path (`Instance::with_mem_hooks`) on all three backends, hooked vs pristine (HOOKS.md §5).
-svm-run = { path = "../crates/svm-run" }
+temen-run = { path = "../crates/temen-run" }
 # Minimal Wasmtime: the Cranelift compiler + the runtime, nothing else (no component
 # model / gc / async), so we compare like-for-like (both lower core wasm via Cranelift).
 wasmtime = { version = "45", default-features = false, features = ["cranelift", "runtime", "std", "threads"] }

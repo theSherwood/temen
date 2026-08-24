@@ -15,7 +15,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use svm_mask::Window;
+use temen_mask::Window;
 
 /// Assert the crisp invariant for one window (top-level or §14 sub-window) under **trap-confinement**:
 /// `confine` is the raw effective address `base + addr + offset` (no masking), and `checked` admits an
@@ -67,14 +67,20 @@ fn check(w: Window, addr: u64, offset: u64, width: u32) {
         .is_some_and(|end| end <= reserved);
     match w.checked_reserved(addr, offset, width) {
         Some(c) => {
-            assert!(in_reserved, "checked_reserved admitted an out-of-reservation access");
+            assert!(
+                in_reserved,
+                "checked_reserved admitted an out-of-reservation access"
+            );
             assert_eq!(c, a, "checked_reserved must return the confined address");
         }
-        None => assert!(!in_reserved, "checked_reserved faulted on an in-reservation access"),
+        None => assert!(
+            !in_reserved,
+            "checked_reserved faulted on an in-reservation access"
+        ),
     }
 }
 
-/// Fuzz the **bulk-memory span confinement** reference (D62): `svm_mask::Window::span_checked` admits
+/// Fuzz the **bulk-memory span confinement** reference (D62): `temen_mask::Window::span_checked` admits
 /// a span `[ptr, ptr+len)` iff it lies in `[0, reserved)` (with `len == 0` an in-bounds no-op),
 /// computed overflow-free. This asserts it against a clean `u128` oracle for every input — the
 /// arithmetic is the subtle, security-critical part (a wrong bound would admit an out-of-window bulk
@@ -82,7 +88,7 @@ fn check(w: Window, addr: u64, offset: u64, width: u32) {
 fn check_span(w: Window, ptr: u64, len: u64) {
     let reserved = w.reserved();
     let base = w.base();
-    // The one span-OOB reference (`svm_mask::Window::span_checked`) — the arithmetic the JIT's
+    // The one span-OOB reference (`temen_mask::Window::span_checked`) — the arithmetic the JIT's
     // `confine_span` emits and the interpreter calls; fuzzed here so it is not transcribed.
     let masked = w.span_checked(ptr, len);
     // Independent oracle in u128 (cannot overflow): a non-empty span is in-bounds iff its end lies
@@ -90,10 +96,20 @@ fn check_span(w: Window, ptr: u64, len: u64) {
     let in_bounds = len == 0 || (ptr as u128 + len as u128) <= reserved as u128;
     match masked {
         Some(a) => {
-            assert!(in_bounds, "span_checked admitted an out-of-window span: ptr={ptr} len={len}");
-            assert_eq!(a, base.wrapping_add(ptr), "span_checked must return the confined base");
+            assert!(
+                in_bounds,
+                "span_checked admitted an out-of-window span: ptr={ptr} len={len}"
+            );
+            assert_eq!(
+                a,
+                base.wrapping_add(ptr),
+                "span_checked must return the confined base"
+            );
         }
-        None => assert!(!in_bounds, "span_checked faulted on an in-window span: ptr={ptr} len={len}"),
+        None => assert!(
+            !in_bounds,
+            "span_checked faulted on an in-window span: ptr={ptr} len={len}"
+        ),
     }
 }
 
@@ -118,8 +134,18 @@ fuzz_target!(|data: &[u8]| {
     // Fully-mapped form (mapped == reserved == size), the decoupled form, and a §14 sub-window at an
     // arbitrary base — all must keep every access confined to their own (sub-)region.
     check(Window::new(reserved_log2), addr, offset, width);
-    check(Window::with_mapped(reserved_log2, mapped), addr, offset, width);
-    check(Window::sub(base, reserved_log2, mapped), addr, offset, width);
+    check(
+        Window::with_mapped(reserved_log2, mapped),
+        addr,
+        offset,
+        width,
+    );
+    check(
+        Window::sub(base, reserved_log2, mapped),
+        addr,
+        offset,
+        width,
+    );
 
     // Bulk-memory span confinement (D62): drive the same reservation the scalar checks use, on a
     // top-level and a §14 sub-window. `offset`/`mapped`/`addr` cross-fill so both small and large

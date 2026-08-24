@@ -1,4 +1,4 @@
-# Sandbox VM
+# Temen
 
 [![CI](https://github.com/thesherwood/vm/actions/workflows/ci.yml/badge.svg)](https://github.com/thesherwood/vm/actions/workflows/ci.yml)
 
@@ -125,9 +125,9 @@ Roughly where things stand:
   `printf`, `goto`, recursion, `malloc`/`free` over the Memory capability — and real
   third-party C libraries run sandboxed byte-identically to a native build (Clay,
   jsmn, SHA-256, xxHash, miniz/tinfl, stb_perlin, tiny-regex-c, and more; see
-  [`demos/`](crates/svm-run/demos)).
-- **Two more frontends**: `svm-wasm` (core-wasm → IR, incl. v128 SIMD and
-  wasi-threads) and `svm-llvm` (LLVM-bitcode → IR) — the LLVM on-ramp runs the
+  [`demos/`](crates/temen-run/demos)).
+- **Two more frontends**: `temen-wasm` (core-wasm → IR, incl. v128 SIMD and
+  wasi-threads) and `temen-llvm` (LLVM-bitcode → IR) — the LLVM on-ramp runs the
   **unmodified SQLite amalgamation** (in-memory and disk-backed via the Fs
   capability) and a **QuickJS** embedding byte-identically to native builds.
 - **Real virtual memory**: a reserved window with guard page + fault handler turns an
@@ -153,7 +153,7 @@ Roughly where things stand:
   DWARF for JIT code, and broader LLVM/wasm frontend coverage.
 - The bring-ups in flight: **GNU bash** on the POSIX personality, a **Nim**
   toolchain, chibicc self-hosting, and QuickJS through full test262 (see the
-  READMEs under [`demos/`](crates/svm-run/demos)).
+  READMEs under [`demos/`](crates/temen-run/demos)).
 - The security-certification workstream: today's bar is "appears to work," not
   "certified secure" (see `DESIGN.md` §2a/§18).
 
@@ -165,15 +165,15 @@ the per-subsystem design docs referenced from [`DESIGN.md`](DESIGN.md).
 The workspace is ~27 crates; the full crate map lives in
 [`ARCHITECTURE.md`](ARCHITECTURE.md). What matters most is how few of them you have
 to trust. The **escape-TCB** — the code that must be correct for "verified ⇒ cannot
-escape" to hold — is a short, closed list: `svm-ir` (the IR), `svm-encode` (decode,
-the untrusted-input face), `svm-verify` (the verifier), `svm-mask` (the confinement
-masking unit), `svm-mem` (the guest-memory substrate), `svm-fiber` (the stack-switch
-primitive), and the JIT tiers (`svm-jit`, plus the browser pair
-`svm-wasm-jit`/`svm-wasmjit`).
+escape" to hold — is a short, closed list: `temen-ir` (the IR), `temen-encode` (decode,
+the untrusted-input face), `temen-verify` (the verifier), `temen-mask` (the confinement
+masking unit), `temen-mem` (the guest-memory substrate), `temen-fiber` (the stack-switch
+primitive), and the JIT tiers (`temen-jit`, plus the browser pair
+`temen-wasm-jit`/`temen-wasmjit`).
 
-The audit-critical core (`svm-ir`/`svm-mask`/`svm-encode`/`svm-verify`) is
+The audit-critical core (`temen-ir`/`temen-mask`/`temen-encode`/`temen-verify`) is
 deliberately **dependency-free** — small, fast to compile, auditable. The JITs are
-the designed exception: `svm-jit` shares Wasmtime's codegen (Cranelift) so that a
+the designed exception: `temen-jit` shares Wasmtime's codegen (Cranelift) so that a
 codegen escape bug is *their* bug class too, not a new one we invented.
 
 Everything else is outside the trust boundary: frontends are untrusted and their
@@ -188,39 +188,39 @@ cargo build --workspace
 cargo test  --workspace          # pipeline + differential + 250k-iter smoke fuzz
 cargo fmt   --all --check
 cargo clippy --workspace --all-targets
-cargo run --release --bin svm-bench   # decode / verify / interp throughput
+cargo run --release --bin temen-bench   # decode / verify / interp throughput
 ```
 
 ## Run a program in the sandbox
 
-The `svm-run` CLI compiles (if needed), verifies, and runs a guest program on the JIT under
+The `temen-run` CLI compiles (if needed), verifies, and runs a guest program on the JIT under
 the MVP powerbox (§3e) — `stdout`/`stderr` go to the real streams and it exits with the
 guest's code:
 
 ```sh
-cargo run -p svm-run -- crates/svm-run/demos/hello.svmt   # text IR → "hello, sandbox!"
-cargo run -p svm-run -- crates/svm-run/demos/hello.c      # C source (via the chibicc frontend)
-cargo run -p svm-run -- crates/svm-run/demos/clay/clay_demo.c        # the Clay UI layout library
-cargo run -p svm-run -- crates/svm-run/demos/raytrace/raytrace.c     # ASCII raytracer (guest-side libm)
-cargo run -p svm-run -- crates/svm-run/demos/mat4/mat4.c             # 128-bit SIMD matrix math
-cargo run -p svm-run -- crates/svm-run/demos/heapgrow/heapgrow.c     # malloc heap growth via the Memory cap
-cargo run -p svm-run -- crates/svm-run/demos/jit/jit_demo.c          # a guest interpreter that JITs itself
-cargo run -p svm-run -- crates/svm-run/demos/steal_fibers/steal_fibers.c  # work-stealing over migratable fibers
+cargo run -p temen-run -- crates/temen-run/demos/hello.temt   # text IR → "hello, sandbox!"
+cargo run -p temen-run -- crates/temen-run/demos/hello.c      # C source (via the chibicc frontend)
+cargo run -p temen-run -- crates/temen-run/demos/clay/clay_demo.c        # the Clay UI layout library
+cargo run -p temen-run -- crates/temen-run/demos/raytrace/raytrace.c     # ASCII raytracer (guest-side libm)
+cargo run -p temen-run -- crates/temen-run/demos/mat4/mat4.c             # 128-bit SIMD matrix math
+cargo run -p temen-run -- crates/temen-run/demos/heapgrow/heapgrow.c     # malloc heap growth via the Memory cap
+cargo run -p temen-run -- crates/temen-run/demos/jit/jit_demo.c          # a guest interpreter that JITs itself
+cargo run -p temen-run -- crates/temen-run/demos/steal_fibers/steal_fibers.c  # work-stealing over migratable fibers
 echo 'int main(){ return 42; }' > /tmp/r.c
-cargo run -p svm-run -- /tmp/r.c ; echo "exit $?"         # → exit 42
+cargo run -p temen-run -- /tmp/r.c ; echo "exit $?"         # → exit 42
 ```
 
-The CLI accepts `.svm` (text IR), `.svmb` (binary), or `.c` (compiled through
-`frontend/chibicc`, located via `$SVM_CHIBICC` or the in-repo build).
+The CLI accepts `.temt` (text IR), `.temen` (binary), or `.c` (compiled through
+`frontend/chibicc`, located via `$TEMEN_CHIBICC` or the in-repo build).
 
-That's a sample — [`demos/`](crates/svm-run/demos) holds dozens more, each picked to
+That's a sample — [`demos/`](crates/temen-run/demos) holds dozens more, each picked to
 stress a different shape and checked byte-for-byte against a native `cc` build:
 real third-party C libraries (jsmn, SHA-256, xxHash, miniz/tinfl, stb_perlin,
 tiny-regex-c, monocypher…), guest M:N schedulers and async runtimes over the
 concurrency primitives, and more. See [`FRONTEND.md`](FRONTEND.md) for the story
 behind getting Clay, jsmn, and friends to run.
 
-The heavyweights run through the **LLVM on-ramp** (`svm-llvm`): the **unmodified
+The heavyweights run through the **LLVM on-ramp** (`temen-llvm`): the **unmodified
 SQLite amalgamation** — in-memory and disk-backed via the Fs capability — plus
 **LMDB** and a **QuickJS** embedding all run sandboxed, byte-identical to the same
 sources built natively (full test262 for QuickJS is still in progress). And the
@@ -232,14 +232,14 @@ the WebGPU capability. Still in flight: GNU **bash**, a **Nim** toolchain, and
 chibicc compiling its own source; each demo directory's README states honestly
 where it stands.
 
-Embedders can call the same path directly — `svm_run::run_powerbox(&module, stdin)`
+Embedders can call the same path directly — `temen_run::run_powerbox(&module, stdin)`
 returns the outcome plus captured output. It's the one reusable piece of host glue
 (the `cap.call` trampoline + powerbox grant), and it is *not* escape-TCB: the
 verifier, run first, is what makes a module safe.
 
 ## Fuzzing
 
-Stable CI runs the smoke fuzz as ordinary tests (`crates/svm/tests/fuzz_smoke.rs`,
+Stable CI runs the smoke fuzz as ordinary tests (`crates/temen/tests/fuzz_smoke.rs`,
 `spec_fuzz_smoke.rs`). The coverage-guided targets all gate nightly (the `cargo-fuzz` CI
 matrix runs every target in `fuzz/fuzz_targets/` — no built-but-unwired fuzzer):
 
@@ -252,7 +252,7 @@ cargo +nightly fuzz run diff            # interp-vs-JIT differential (§18)
 cargo +nightly fuzz run onramp_diff     # LLVM on-ramp vs its source-semantics oracle (§18)
 cargo +nightly fuzz run wasm_transpile  # core-wasm → IR transpile (re-verified)
 cargo +nightly fuzz run spec_ops        # every backend matches the executable spec's eval (SPEC.md)
-cargo +nightly fuzz run spec_verify     # svm-verify vs the reference verifier agree (SPEC.md)
+cargo +nightly fuzz run spec_verify     # temen-verify vs the reference verifier agree (SPEC.md)
 cargo +nightly fuzz run opt_sccp        # optimizer preserves semantics (SCCP)
 cargo +nightly fuzz run opt_ssa_roundtrip   # SSA construct/destruct identity
 cargo +nightly fuzz run durable         # freeze → serialize → restore → thaw equivalence (+ _jit / _fiber / _loop / _recycle variants)
