@@ -1204,6 +1204,22 @@ fn cap_oversized(m: &Module, in_subset: &mut [bool]) {
     }
 }
 
+/// Cap on the **estimated** emitted size of the whole module (bytes) — the module-total analog of
+/// [`MAX_EST_EMITTED_FN_BYTES`] (#1038). The wasm-compiled engine runs under a hard linear-memory
+/// ceiling (1 GiB in the browser threads build), and an over-large emit runs out of memory *inside*
+/// `emit_module` — Rust's OOM handler then aborts the whole engine instance, the one failure in the
+/// tree that crashed instead of declining. Every emit entry now checks the [`est_emitted_size`] sum
+/// of its emit set **before** allocating: the whole-program/reactor entries decline (`Unsupported` —
+/// the open chain falls through to the tier-up driver), the tier-up entries degrade (drop the
+/// largest-estimate functions to cross-tier leaves until the total fits), and the §22 unit emitter
+/// declines (the invoke runs interpreted). Calibrated on the shipped assets (reactor emit sets):
+/// the largest legitimate card is nifler at 94 MiB — which emits and runs fine in the 1 GiB
+/// browser build — then nimsem 34 MiB, SQLite 24 MiB; the known engine-killer (Postgres,
+/// 15 067 funcs) estimates 117 MiB. 104 MiB sits mid-gap: ~11% headroom over the largest known-good
+/// emit and ~11% under the known-fatal size. Fail-safe like the per-function valve: a
+/// decline/degrade only routes more code to the interpreter oracle, never an escape.
+const MAX_EST_EMITTED_MODULE_BYTES: usize = 104 << 20;
+
 /// The function indices `f` calls (direct `Call`s + tail-call terminators — the latter keeps the
 /// reachability sound even though a tail call itself isn't emitted).
 fn func_callees(f: &Func) -> Vec<u32> {
@@ -1429,6 +1445,14 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
             "a function is outside the integer subset",
         ));
     }
+    // #1038: a module big enough to OOM the engine mid-emit declines instead — every caller of a
+    // whole-module emit treats the error as "run interpreted", fail-closed.
+    let est_total: usize = m.funcs.iter().map(est_emitted_size).sum();
+    if est_total > MAX_EST_EMITTED_MODULE_BYTES {
+        return Err(Error::Unsupported(
+            "estimated emitted module exceeds the engine memory budget",
+        ));
+    }
     let n = m.funcs.len();
     let emitted: Vec<usize> = (0..n).collect();
     let wasm_of: Vec<Option<u32>> = (0..n).map(|i| Some(IMPORTED_FUNCS + i as u32)).collect();
@@ -1604,6 +1628,14 @@ pub fn compile_module_b2(
     if !a.in_subset.iter().all(|&s| s) {
         return Err(Error::Unsupported(
             "a function is outside the integer subset",
+        ));
+    }
+    // #1038: a guest-submitted unit big enough to OOM the engine mid-emit declines instead — the
+    // §22 seam treats the error as "run this unit interpreted", fail-closed.
+    let est_total: usize = m.funcs.iter().map(est_emitted_size).sum();
+    if est_total > MAX_EST_EMITTED_MODULE_BYTES {
+        return Err(Error::Unsupported(
+            "estimated emitted module exceeds the engine memory budget",
         ));
     }
     let n = m.funcs.len();
@@ -1879,6 +1911,20 @@ pub fn compile_module_reactor_capped(
     shared_memory: bool,
     cap: usize,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    compile_module_reactor_budgeted(m, entry, shared_memory, cap, MAX_EST_EMITTED_MODULE_BYTES)
+}
+
+/// [`compile_module_reactor_capped`] with an explicit **module-total** emit budget (#1038 — see
+/// [`MAX_EST_EMITTED_MODULE_BYTES`], which the public entries pass). The parameter exists so the
+/// budget decline can be tested with a small module instead of a genuine 104 MiB one.
+#[doc(hidden)]
+pub fn compile_module_reactor_budgeted(
+    m: &Module,
+    entry: u32,
+    shared_memory: bool,
+    cap: usize,
+    module_budget: usize,
+) -> Result<(Vec<u8>, Vec<bool>), Error> {
     let n = m.funcs.len();
     let a = analyze_from(m, entry);
     // `oversized[i]` — an in-subset function pulled from the emitted set because its body exceeds the
@@ -1916,6 +1962,16 @@ pub fn compile_module_reactor_capped(
                 emitted.push(i);
                 emitted_bitmap[i] = true;
             }
+        }
+        // #1038: decline BEFORE emitting — an over-budget emit exhausts the wasm-compiled
+        // engine's linear memory inside `emit_module`, aborting the instance instead of failing
+        // closed. The open chain then falls through to the tier-up driver, whose emit set degrades
+        // to fit (see `compile_module_tierup_inner`).
+        let est_total: usize = emitted.iter().map(|&i| est_emitted_size(&m.funcs[i])).sum();
+        if est_total > module_budget {
+            return Err(Error::Unsupported(
+                "estimated emitted module exceeds the engine memory budget",
+            ));
         }
         let wasm = emit_module(
             m,
@@ -1998,6 +2054,13 @@ pub fn compile_module_reactor_keep(
             emitted_bitmap[i] = true;
         }
     }
+    // #1038: same module-total budget as the full reactor — a `keep` set can still be over-large.
+    let est_total: usize = emitted.iter().map(|&i| est_emitted_size(&m.funcs[i])).sum();
+    if est_total > MAX_EST_EMITTED_MODULE_BYTES {
+        return Err(Error::Unsupported(
+            "estimated emitted module exceeds the engine memory budget",
+        ));
+    }
     let wasm = emit_module(
         m,
         shared_memory,
@@ -2045,7 +2108,15 @@ pub fn compile_module_tierup_caps(
     shared_memory: bool,
     nested_caps: bool,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
-    compile_module_tierup_inner(m, shared_memory, nested_caps, None, None, None)
+    compile_module_tierup_inner(
+        m,
+        shared_memory,
+        nested_caps,
+        None,
+        None,
+        None,
+        MAX_EST_EMITTED_MODULE_BYTES,
+    )
 }
 
 /// #880 — [`compile_module_tierup`] over the **shared reserved table** (§22 Model B2): the emitted
@@ -2073,7 +2144,36 @@ pub fn compile_module_tierup_b2(
     shared_memory: bool,
     table_log2: u32,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
-    compile_module_tierup_inner(m, shared_memory, false, None, Some(table_log2), None)
+    compile_module_tierup_inner(
+        m,
+        shared_memory,
+        false,
+        None,
+        Some(table_log2),
+        None,
+        MAX_EST_EMITTED_MODULE_BYTES,
+    )
+}
+
+/// [`compile_module_tierup_b2`] with an explicit **module-total** emit budget (#1038; the public
+/// entries pass [`MAX_EST_EMITTED_MODULE_BYTES`]) — exists so the degrade loop can be tested with a
+/// small module instead of a genuine 104 MiB one.
+#[doc(hidden)]
+pub fn compile_module_tierup_b2_budgeted(
+    m: &Module,
+    shared_memory: bool,
+    table_log2: u32,
+    module_budget: usize,
+) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    compile_module_tierup_inner(
+        m,
+        shared_memory,
+        false,
+        None,
+        Some(table_log2),
+        None,
+        module_budget,
+    )
 }
 
 /// #1009 — [`compile_module_tierup_b2`] **paged** (#750): the shared-reserved-table dispatch mode
@@ -2099,6 +2199,7 @@ pub fn compile_module_tierup_b2_paged(
         Some(page_log2),
         Some(table_log2),
         None,
+        MAX_EST_EMITTED_MODULE_BYTES,
     )
 }
 
@@ -2122,7 +2223,15 @@ pub fn compile_module_tierup_paged(
     shared_memory: bool,
     page_log2: u8,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
-    compile_module_tierup_inner(m, shared_memory, false, Some(page_log2), None, None)
+    compile_module_tierup_inner(
+        m,
+        shared_memory,
+        false,
+        Some(page_log2),
+        None,
+        None,
+        MAX_EST_EMITTED_MODULE_BYTES,
+    )
 }
 
 /// **Experimental NULL-page guard** entry (measurement mode for the trap-on-NULL design; see the
@@ -2145,9 +2254,18 @@ pub fn compile_module_tierup_nullguard(
     shared_memory: bool,
     guard: u64,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
-    compile_module_tierup_inner(m, shared_memory, false, None, None, Some(guard))
+    compile_module_tierup_inner(
+        m,
+        shared_memory,
+        false,
+        None,
+        None,
+        Some(guard),
+        MAX_EST_EMITTED_MODULE_BYTES,
+    )
 }
 
+#[allow(clippy::too_many_arguments)] // the one assembly point every public tier-up entry feeds
 fn compile_module_tierup_inner(
     m: &Module,
     shared_memory: bool,
@@ -2155,6 +2273,7 @@ fn compile_module_tierup_inner(
     paged: Option<u8>,
     reserved_table_log2: Option<u32>,
     null_guard: Option<u64>,
+    module_budget: usize,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
     // #964: a `__null_guard`-marked module opts every tier into the NULL guard — derive it from the
     // marker whenever the caller didn't force one (the measurement entry still can), so the plain
@@ -2214,6 +2333,21 @@ fn compile_module_tierup_inner(
     // the interpreter — a cross-tier leaf here, since the tier-up `leaf` set below admits any
     // `marshallable_sig` non-subset function.
     cap_oversized(m, &mut in_subset);
+    // #1038: the module-total budget — DEGRADE instead of OOM (see `MAX_EST_EMITTED_MODULE_BYTES`).
+    // Drop the largest-estimate in-subset functions — they become cross-tier leaves (or their
+    // callers cascade off via the fixpoint below) exactly like `cap_oversized`'s — until the
+    // emitted total fits the engine's memory ceiling. Summed over `in_subset` (a superset of the
+    // final emit set), so the bound is conservative. Fail-safe like the per-function valve:
+    // dropping only routes more code to the interpreter oracle, never an escape.
+    let est: Vec<usize> = m.funcs.iter().map(est_emitted_size).collect();
+    let mut est_total: usize = (0..n).filter(|&i| in_subset[i]).map(|i| est[i]).sum();
+    while est_total > module_budget {
+        let Some(worst) = (0..n).filter(|&i| in_subset[i]).max_by_key(|&i| est[i]) else {
+            break;
+        };
+        in_subset[worst] = false;
+        est_total -= est[worst];
+    }
     // The cross-tier set — functions an emitted `Call`/`call_indirect` routes to `env.call_interp`.
     // Two widths, by who services the bounce:
     //   * **local table** (`reserved_table_log2 == None`): the strict [`interp_leaf`] set —
