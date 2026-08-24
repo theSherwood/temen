@@ -88,10 +88,15 @@ long write(int fd, const void *buf, unsigned long n) {
   return px_ret_(r);
 }
 long read(int fd, void *buf, unsigned long n) {
-  long r = px_call_(PX_READ, fd, (long)buf, (long)n, 0);
-  long h = px_tag_(r);
-  if (h >= 0) r = __vm_read((int)h, buf, (long)n);
-  return px_ret_(r);
+  for (;;) {
+    long r = px_call_(PX_READ, fd, (long)buf, (long)n, 0);
+    if (r == -85) continue; /* -ERESTART: stopped by SIGTTIN before the read (rung-3 tail) —
+                               re-issue; the stop benches us at the re-issued dispatch, and the
+                               post-SIGCONT retry re-runs the op with the then-current pgid. */
+    long h = px_tag_(r);
+    if (h >= 0) r = __vm_read((int)h, buf, (long)n);
+    return px_ret_(r);
+  }
 }
 /* fd → path, recorded at open so fstat can re-stat (the memfs op surface is path-keyed). */
 #define PX_NFDPATH 64

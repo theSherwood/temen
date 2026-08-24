@@ -12499,6 +12499,11 @@ fn demo_bash_translates_and_verifies() {
         "trap \"\" INT; kill -INT $$; echo ignored-ok",
         "trap \"echo u1\" USR1; kill -USR1 $$; kill -USR1 $$; echo twice",
         "trap \"echo bye\" EXIT; (echo sub); echo main",
+        // Rung-3 tail — here-docs/here-strings into BUILTIN readers (bash spools each one into
+        // an unlinked temp file, so these came free with the #800/#801 fs surface; pinned here
+        // because the slice-4 README listed them as a remaining gap).
+        "read a b <<< \"x y\"; echo \"read:$a/$b\"",
+        "while read -r l; do echo \"loop:$l\"; done <<EOF\nl1\nl2\nEOF",
     ] {
         let config = svm_run::RunConfig {
             args: vec![b"bash".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()],
@@ -12579,6 +12584,13 @@ fn demo_bash_translates_and_verifies() {
         "true && echo t; false || echo f",
         "seq 3 | sort | uniq | wc -l",
         "echo hi > f; cat f",
+        // Rung-3 tail — here-docs feeding an EXEC'D command (the temp-file fd rides the exec
+        // carry): expansion, the quoted-delimiter no-expansion form, `<<-` tab-stripping, and
+        // the here-string.
+        "cat <<EOF\nplain $((1+1))\nEOF",
+        "cat <<\"EOF\"\nno $HOME expand\nEOF",
+        "cat <<-TAB\n\tstripped\nTAB",
+        "cat <<< herestring",
     ] {
         let config = svm_run::RunConfig {
             args: vec![b"bash".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()],
@@ -12844,6 +12856,80 @@ fn demo_bash_translates_and_verifies() {
         assert!(
             echoes >= 2,
             "the fg'd background cat read the terminal (echo + cat's copy; stdout: {out:?})"
+        );
+    }
+
+    // ▶ Rung-3 tail (#802): **`bg` without the read steal** — `bg` SIGCONTs the stopped
+    // background job; its re-issued terminal read must ring SIGTTIN and re-stop it WITHOUT
+    // consuming input meant for the shell. The op returns the `-ERESTART` sentinel instead of
+    // minting the input tag while a stop is pending (the guest read wrappers loop on it), so the
+    // reader benches before it can touch the pipe — before this, the `bg`-continued cat raced
+    // its own deferred stop fire and STOLE the next typed line (the second `jobs` below reached
+    // cat, not bash, and listed nothing). `kill -9 %1` then reaps the job so `exit` is clean.
+    {
+        let (posix4, make) = svm_posix::cap(0, 0, Vec::new());
+        let fork = svm_posix::cap_fork_factory(&posix4);
+        let p = posix4.clone();
+        let bins_for_grant = std::sync::Arc::clone(&bins);
+        let cap4 = svm_run::HostCap::custom(svm_interp::cap_id::HOST_PROC, 0, move |h, _win| {
+            let handle = h.grant_host_proc_forkable(make(), std::sync::Arc::clone(&fork));
+            let (door, armed) = svm_posix::cap_signal_source(&p);
+            h.set_signal_source(door, armed);
+            h.push_exec_remap_hook(svm_posix::cap_exec_remap_hook(&p));
+            let (names, sigs) = svm_posix::cap_vtable();
+            h.set_host_proc_vtable(handle, names, sigs);
+            for (path, m, wl) in bins_for_grant.iter() {
+                let mh = h.grant_module(m);
+                p.register_executable(path, mh, *wl);
+            }
+            p.enable_terminal(h);
+            handle
+        });
+        let feeder = {
+            let px = posix4.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                for keys in [
+                    "cat &\n",
+                    "jobs\n",
+                    "bg\n",
+                    "jobs\n",
+                    "kill -9 %1\n",
+                    "exit\n",
+                ] {
+                    px.feed_terminal(keys.as_bytes());
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+            })
+        };
+        let config = svm_run::RunConfig {
+            args: vec![b"bash".to_vec(), b"-i".to_vec()],
+            env: vec![
+                b"PATH=/bin".to_vec(),
+                b"HOME=/".to_vec(),
+                b"PS1=$ ".to_vec(),
+            ],
+            ..Default::default()
+        };
+        let run = inst
+            .run_with_caps(svm_run::Backend::TreeWalk, &config, &[("posix", cap4)])
+            .expect("bash -i bg session");
+        feeder.join().expect("feeder thread");
+        assert_eq!(
+            run.outcome,
+            svm_run::Outcome::Exited(0),
+            "clean session exit (the killed job no longer blocks `exit`)"
+        );
+        let out = String::from_utf8_lossy(&posix4.stdout()).into_owned();
+        assert!(
+            out.contains("[1]+ cat &"),
+            "the bg builtin announced the continued job (stdout: {out:?})"
+        );
+        let stops = out.matches("[1]+  Stopped                 cat").count();
+        assert!(
+            stops >= 2,
+            "both `jobs` listed the stopped job — the second proves the typed line was NOT \
+             stolen by the bg-continued reader (stdout: {out:?})"
         );
     }
 }
