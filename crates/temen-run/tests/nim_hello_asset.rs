@@ -1,5 +1,5 @@
 //! **The committed `nim_hello.temen` playground asset, run in-sandbox** (NIM.md — the "run real Nim"
-//! card). A real Nim program (`demos/nim_hello/hello.nim` — `write(stdout, "hello, svm\n")`) compiled
+//! card). A real Nim program (`demos/nim_hello/hello.nim` — `write(stdout, "hello, temen\n")`) compiled
 //! all the way to a runnable powerbox module: `nimony c` → `temen_leng::link_nim_powerbox` (the nim→
 //! powerbox bottom-edge bridge) → verified + `encode_module`. Built by
 //! `cargo run -p temen-run --example build_nim_hello_temen` (needs the nimony toolchain), shipped
@@ -8,7 +8,7 @@
 //! This gate loads the committed bytes, decodes + **re-verifies** them (the fail-closed TCB floor —
 //! the shipped artifact must be a valid verified module), and **runs** it under the standard
 //! `temen_run::run_powerbox` (the engine the browser's `temen_run_onramp` wraps), asserting it prints
-//! `hello, svm` to the powerbox stdout — no toolchain needed, so it runs in the normal `check` job.
+//! `hello, temen` to the powerbox stdout — no toolchain needed, so it runs in the normal `check` job.
 //!
 //! **Code-coupled asset (the chibicc/Postgres lane).** If an IR/ABI/encoder change stops the committed
 //! module decoding, verifying, or running, this test fails the PR that caused the drift — regenerate
@@ -35,7 +35,7 @@ fn committed_asset_prints_hello() {
     let module = temen_encode::decode_module(ASSET).expect("decode nim_hello.temen");
     let run = temen_run::run_powerbox(&module, &[]).expect("run_powerbox nim_hello");
     assert_eq!(
-        run.stdout, b"hello, svm\n",
+        run.stdout, b"hello, temen\n",
         "real Nim program prints via the powerbox"
     );
 }
