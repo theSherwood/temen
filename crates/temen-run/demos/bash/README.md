@@ -231,6 +231,11 @@ directions, `/dev/stdin`).
 
 ## What remains (the slice ladder from the #802 sketch)
 
+- **#1057 — pipeline `$?` is 128** (its own slice): the last stage of any pipeline
+  (`true | { true; }`, `cmd | grep -q x`) reaps as `REAP_CRASH_STATUS` (128) instead of its real
+  exit, though it exits cleanly and no trap fires. Surfaced by the language differential; masked
+  in every existing pipe script by a trailing command. Real scripts branch on pipeline status
+  constantly, so this is S2.
 - The `^D`-EOF nuance (the one-shot EOF is writer-count state, so the shell's next read can
   consume an EOF meant for the job — native VEOF is a queued, one-READ event; the capstone
   sessions don't currently trip it).

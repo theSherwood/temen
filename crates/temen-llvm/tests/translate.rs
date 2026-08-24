@@ -12568,7 +12568,8 @@ fn demo_bash_translates_and_verifies() {
          echo \"${BASH_REMATCH[0]}|${BASH_REMATCH[1]}|${BASH_REMATCH[3]}|${#BASH_REMATCH[@]}\"",
         "while read l; do echo \"ps:$l\"; done < <(printf 'x\\ny\\n')",
         "echo hi > >(while read l; do echo \"up:$l\"; done); wait",
-        "echo piped | { read x < /dev/stdin; echo \"got:$x\"; }",
+        "read x < /dev/stdin <<< \"hi\"; echo \"got:$x\"",
+        "exec 3< <(printf 'a\\nb\\n'); read x < /dev/fd/3; echo \"fd3:$x\"",
     ] {
         let config = temen_run::RunConfig {
             args: vec![b"bash".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()],

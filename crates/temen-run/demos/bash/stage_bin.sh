@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# stage_bin.sh — compile the #801 coreutils (demos/posix_utils, the chibicc world) to `.temt` text
+# stage_bin.sh — compile the #801 coreutils (demos/posix_utils, the chibicc world) to `.temen` text
 # IR for bash's /bin: `bash_probe` (and the capstone gate) parses each file, grants it as a
 # `Module`, and registers it as a filesystem executable, exactly as `c_posix.rs`'s
 # `stage_coreutils` does in-test. bash then runs them as external commands (fork → execve).
@@ -19,6 +19,6 @@ for t in true false echo cat seq head wc sort uniq ls pwd grep; do
   else
     cat "$UT/util.c" "$UT/$t.c" >"$tu"
   fi
-  "$CC" -cc1 --emit-ir --child-entry -cc1-input "$tu" -cc1-output "$OUT/$t.temt" "$tu"
+  "$CC" -cc1 --emit-ir --child-entry -cc1-input "$tu" -cc1-output "$OUT/$t.temen" "$tu"
 done
 echo "staged: $OUT"
