@@ -74,8 +74,7 @@ fn wide_module(n_callees: usize, loads_each: usize) -> Module {
 fn over_budget_whole_program_declines_before_emitting() {
     let m = wide_module(12, 48_000);
     let err = svm_wasm_jit::compile_module_reactor(&m, 0, false)
-        .err()
-        .expect("an over-budget module must decline, not emit");
+        .expect_err("an over-budget module must decline, not emit");
     assert!(
         format!("{err:?}").contains("memory budget"),
         "the decline names the budget: {err:?}"
@@ -88,8 +87,7 @@ fn over_budget_whole_program_declines_before_emitting() {
 fn over_budget_unit_emit_declines() {
     let m = wide_module(12, 48_000);
     let err = svm_wasm_jit::compile_module_b2(&m, false, 10)
-        .err()
-        .expect("an over-budget unit must decline, not emit");
+        .expect_err("an over-budget unit must decline, not emit");
     assert!(
         format!("{err:?}").contains("memory budget"),
         "the decline names the budget: {err:?}"
@@ -102,8 +100,7 @@ fn over_budget_unit_emit_declines() {
 fn reactor_budget_boundary() {
     let m = wide_module(3, 100); // ~12.8 KiB per leaf
     let err = svm_wasm_jit::compile_module_reactor_budgeted(&m, 0, false, usize::MAX, 20_000)
-        .err()
-        .expect("over the explicit budget declines");
+        .expect_err("over the explicit budget declines");
     assert!(format!("{err:?}").contains("memory budget"));
     let (wasm, emitted) =
         svm_wasm_jit::compile_module_reactor_budgeted(&m, 0, false, usize::MAX, usize::MAX)
