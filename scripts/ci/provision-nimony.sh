@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the nimony toolchain (nifler → nimony → hexer → lengc …) for the Nim-source end-to-end
-# tests (`crates/svm-leng/tests/nim_e2e.rs`). Mirrors nim-lang/nimony's own CI build.
+# tests (`crates/temen-leng/tests/nim_e2e.rs`). Mirrors nim-lang/nimony's own CI build.
 #
 # Prerequisites: a Nim `devel` compiler on PATH (the caller installs it — e.g. the CI job uses the
 # `setup-nim` action). Produces the tools under `<workdir>/nimony/bin` and prints two `KEY=value`
@@ -10,7 +10,7 @@
 #
 # The nimony frontend (and its sibling `nativenif`) are vendored as **git submodules** — the exact
 # commit is pinned by the gitlink in `.gitmodules`, reproducible in-tree, and bumped deliberately in
-# lockstep with any svm-leng change the newer frontend requires (`git -C nimony checkout <ref>` +
+# lockstep with any temen-leng change the newer frontend requires (`git -C nimony checkout <ref>` +
 # commit the submodule). This replaces the old in-script clone-and-checkout of a hard-coded SHA.
 set -euo pipefail
 

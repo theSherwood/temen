@@ -1,6 +1,6 @@
 // Chromium smoke for the playground's per-demo card layout + CodeMirror editor (BROWSER.md §
 // playground). Drives the real page: the sidebar lists every demo, each demo is a self-contained card
-// (own editor + controls + output), SVM text highlights, a demo runs end-to-end, the editable-module
+// (own editor + controls + output), Temen text highlights, a demo runs end-to-end, the editable-module
 // stdin path reads its card's editor, parse errors pin the offending line, and Vim mode engages.
 //
 // Reuses the wasm32 module built by the CI real-browser job (and `serve.mjs` for COOP/COEP). Run:
@@ -12,12 +12,12 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-// The Lua/SQLite `.svmb` guests are built by `build-onramp-assets.mjs`, which the CI real-browser job
+// The Lua/SQLite `.temen` guests are built by `build-onramp-assets.mjs`, which the CI real-browser job
 // doesn't run (only committed assets are present there). So the editable-module stdin check only runs
 // when the Lua asset is actually built — otherwise it's SKIPped, not failed.
 const HERE = dirname(fileURLToPath(import.meta.url));
-const luaBuilt = existsSync(join(HERE, 'web', 'assets', 'lua_snapshot.svmb'));
-const chibiccBuilt = existsSync(join(HERE, 'web', 'assets', 'chibicc.svmb'));
+const luaBuilt = existsSync(join(HERE, 'web', 'assets', 'lua_snapshot.temen'));
+const chibiccBuilt = existsSync(join(HERE, 'web', 'assets', 'chibicc.temen'));
 // The self-host card needs the committed closure image (`build-selfhost-assets.mjs`); the byte-identity
 // check additionally needs the native `chibicc` (built by that same script) as the reference oracle.
 const selfhostBuilt = existsSync(join(HERE, 'web', 'assets', 'chibicc_selfhost.img'));
@@ -62,13 +62,13 @@ try {
     ? ok(`${layout.demos} demo cards, ${layout.navLinks} nav links, ${layout.editors} editors, vim keymap`)
     : fail(`layout: ${JSON.stringify(layout)}`);
 
-  // The hello card is SVM text → the custom mode highlights keywords, opcodes, and types.
+  // The hello card is Temen text → the custom mode highlights keywords, opcodes, and types.
   const tok = await page.evaluate((sel) => ({
     kw: !!document.querySelector(`${sel} .cm-keyword`),
     bi: !!document.querySelector(`${sel} .cm-builtin`),
     ty: !!document.querySelector(`${sel} .cm-type`),
   }), card('hello'));
-  tok.kw && tok.bi && tok.ty ? ok('SVM syntax highlighting active') : fail(`SVM tokens: ${JSON.stringify(tok)}`);
+  tok.kw && tok.bi && tok.ty ? ok('Temen syntax highlighting active') : fail(`Temen tokens: ${JSON.stringify(tok)}`);
 
   // Running the hello card reads its editor and completes (its 14-byte greeting length).
   await runCard(page, 'hello');
@@ -77,7 +77,7 @@ try {
     result: document.querySelector(`${sel} .result`).textContent.trim(),
   }), card('hello'));
   hello.state === 'done' && hello.result === '14'
-    ? ok('SVM text ran via the editor → 14')
+    ? ok('Temen text ran via the editor → 14')
     : fail(`hello run: ${JSON.stringify(hello)}`);
 
   // The Lua card mounted a Lua-mode editor with the Lua source…
@@ -94,35 +94,35 @@ try {
       card('Lua (5.4.7 — write & run)'));
     luaOut.includes('Hello from Lua') ? ok('editable-module stdin reads the card editor') : fail(`Lua stdout: ${luaOut.slice(0, 80)}`);
   } else {
-    console.log('  SKIP: editable-module stdin (lua_snapshot.svmb not built — run build-onramp-assets.mjs)');
+    console.log('  SKIP: editable-module stdin (lua_snapshot.temen not built — run build-onramp-assets.mjs)');
   }
 
-  // The "run real Nim" card: runs the committed nim_hello.svmb — a real Nim program
-  // (`write(stdout, "hello, svm\n")`) compiled through nimony → svm-leng → the nim→powerbox bridge to a
-  // runnable module — and shows its **real stdout**, a Nim program printing on the SVM, client-side.
+  // The "run real Nim" card: runs the committed nim_hello.temen — a real Nim program
+  // (`write(stdout, "hello, temen\n")`) compiled through nimony → temen-leng → the nim→powerbox bridge to a
+  // runnable module — and shows its **real stdout**, a Nim program printing on the Temen, client-side.
   // The asset is committed (always present), so no build guard.
-  const nimCard = 'nim (Nim → SVM, runs)';
+  const nimCard = 'nim (Nim → Temen, runs)';
   await runCard(page, nimCard, 30_000);
   const nim = await page.evaluate((sel) => ({
     state: document.querySelector(`${sel} .state`).dataset.state,
     stdout: document.querySelector(`${sel} .stdout`).textContent,
   }), card(nimCard));
-  nim.state === 'done' && nim.stdout.includes('hello, svm')
-    ? ok('run-real-Nim card: nim_hello.svmb printed its greeting in-browser')
+  nim.state === 'done' && nim.stdout.includes('hello, temen')
+    ? ok('run-real-Nim card: nim_hello.temen printed its greeting in-browser')
     : fail(`nim run: state=${nim.state} stdout=${nim.stdout.slice(0, 80)}`);
 
-  // The svm-leng self-host card (NIM.md §3e): its editor is pre-filled with a real hexer Leng file, and
-  // running it pipes that to the committed `svm-leng.svmb` (always present) on stdin — the translator
-  // emits SVM IR text on stdout and exits 0. The IR carries `func`/`block` (svm-text), proving the real
-  // leng→SVM-IR translator ran client-side over genuine nimony output.
-  const lengCard = 'svm-leng: translate real nimony Leng → SVM IR (self-host)';
+  // The temen-leng self-host card (NIM.md §3e): its editor is pre-filled with a real hexer Leng file, and
+  // running it pipes that to the committed `temen-leng.temen` (always present) on stdin — the translator
+  // emits Temen IR text on stdout and exits 0. The IR carries `func`/`block` (temen-text), proving the real
+  // leng→TEMEN-IR translator ran client-side over genuine nimony output.
+  const lengCard = 'temen-leng: translate real nimony Leng → Temen IR (self-host)';
   const lengSrc = await page.evaluate((sel) => {
     const cm = document.querySelector(`${sel} .CodeMirror`)?.CodeMirror;
     return (cm?.getValue() || '');
   }, card(lengCard));
   lengSrc.includes('stmts') && lengSrc.includes('wasMoved')
-    ? ok('svm-leng card → editor holds the real hexer Leng')
-    : fail(`svm-leng editor: ${lengSrc.slice(0, 80)}`);
+    ? ok('temen-leng card → editor holds the real hexer Leng')
+    : fail(`temen-leng editor: ${lengSrc.slice(0, 80)}`);
   await runCard(page, lengCard, 30_000);
   const leng = await page.evaluate((sel) => ({
     state: document.querySelector(`${sel} .state`).dataset.state,
@@ -135,11 +135,11 @@ try {
   // `(wasm-JIT)`, and a silent interpreter fallback would fail this assertion.
   leng.state === 'done' && leng.result === '0' && leng.stdout.includes('func') && leng.stdout.includes('block')
     && leng.msg.includes('wasm-JIT')
-    ? ok('svm-leng self-host card: real hexer Leng → SVM IR in-browser (wasm-JIT)')
-    : fail(`svm-leng run: state=${leng.state} msg=${leng.msg} result=${leng.result} stdout=${leng.stdout.slice(0, 80)}`);
+    ? ok('temen-leng self-host card: real hexer Leng → Temen IR in-browser (wasm-JIT)')
+    : fail(`temen-leng run: state=${leng.state} msg=${leng.msg} result=${leng.result} stdout=${leng.stdout.slice(0, 80)}`);
 
-  // "Prove interp ≡ JIT": run the translator on both tiers and assert the emitted SVM IR is byte-identical
-  // — the #1011 correctness gate for defaulting svm-leng onto the wasm-JIT.
+  // "Prove interp ≡ JIT": run the translator on both tiers and assert the emitted Temen IR is byte-identical
+  // — the #1011 correctness gate for defaulting temen-leng onto the wasm-JIT.
   await page.click(`${card(lengCard)} button.prove`);
   await page.waitForFunction(
     (sel) => ['done', 'error'].includes(document.querySelector(sel).dataset.state),
@@ -149,13 +149,13 @@ try {
     msg: document.querySelector(`${sel} .state`).textContent,
   }), card(lengCard));
   lengP.state === 'done' && lengP.msg.includes('byte-identical')
-    ? ok('svm-leng interpreter ≡ wasm-JIT — byte-identical emitted IR (in-browser)')
-    : fail(`svm-leng parity: ${JSON.stringify(lengP)}`);
+    ? ok('temen-leng interpreter ≡ wasm-JIT — byte-identical emitted IR (in-browser)')
+    : fail(`temen-leng parity: ${JSON.stringify(lengP)}`);
 
   // The nifler front-end card (NIM.md §3c/§3e slice 4, "compile Nim in the browser"): its editor holds
-  // a small Nim program, and running it inflates the committed `nifler.svmb.gz` (the first real nimony
+  // a small Nim program, and running it inflates the committed `nifler.temen.gz` (the first real nimony
   // phase, always present) and parses that Nim to nimony's NIF — the front edge of the toolchain, run
-  // client-side on the SVM. Assert the editor holds Nim and the run emits a parsed `.p.nif`.
+  // client-side on the Temen. Assert the editor holds Nim and the run emits a parsed `.p.nif`.
   const niflerCard = 'nifler: parse real Nim → NIF (nimony front-end, in your browser)';
   const niflerSrc = await page.evaluate(
     (sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.getValue(),
@@ -176,17 +176,17 @@ try {
   nifler.state === 'done' && nifler.result.endsWith('B') &&
     nifler.stdout.includes('(.nif') && nifler.stdout.includes('(proc fib') &&
     nifler.msg.includes('wasm-JIT')
-    ? ok('nifler front-end card: real Nim → parsed NIF in-browser (Nim parsed on the SVM, wasm-JIT)')
+    ? ok('nifler front-end card: real Nim → parsed NIF in-browser (Nim parsed on the Temen, wasm-JIT)')
     : fail(`nifler run: state=${nifler.state} msg=${nifler.msg} result=${nifler.result} stdout=${nifler.stdout.slice(0, 100)}`);
 
   // The whole-program nim compiler card (NIM.md §3c/§3e; #958) — the toolchain capstone: it inflates
-  // the three committed phase guests (`nifler`/`nimsem`/`hexer` `.svmb.gz`) + the stdlib image
+  // the three committed phase guests (`nifler`/`nimsem`/`hexer` `.temen.gz`) + the stdlib image
   // (`nim_stdlib.img.gz`, all committed → always present) and compiles the editor's whole Nim program
   // **client-side** — the page plays nifmake (stems, `import` crawl), runs nimsem (spawning nifler via
   // an `exec` cap) + hexer over the closure, links through the nim→powerbox bridge, and runs `_start`.
   // Assert the editor holds an I/O Nim program and the run prints the program's real stdout. This is the
   // heaviest card (four assets, multi-phase compile on the tree-walker), so a generous timeout.
-  const nimcCard = 'nim: compile & run a whole Nim program → SVM (the full toolchain, in your browser)';
+  const nimcCard = 'nim: compile & run a whole Nim program → Temen (the full toolchain, in your browser)';
   const nimcSrc = await page.evaluate(
     (sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.getValue(),
     card(nimcCard),
@@ -203,7 +203,7 @@ try {
   }), card(nimcCard));
   nimc.state === 'done' && nimc.result.endsWith('B stdout') &&
     nimc.stdout.includes('hello, Nim') &&
-    nimc.stdout.includes('hello, the SVM')
+    nimc.stdout.includes('hello, the Temen')
     ? ok('whole-program nim compiler card: the full toolchain compiled + ran a Nim program in-browser')
     : fail(`nimc run: state=${nimc.state} result=${nimc.result} stdout=${nimc.stdout.slice(0, 120)}`);
 
@@ -244,8 +244,8 @@ try {
     : fail(`nimc edit re-run: state=${nimc2.state} stdout=${nimc2.stdout.slice(0, 120)}`);
 
   // The QuickJS card is wired to the warm-runtime snapshot (WASM_AOT.md): it defaults to the warm path
-  // (svm_warm_open runs the QuickJS runtime init once, svm_warm_eval restores that image + evals per Run).
-  // Its qjs_snapshot.svmb is committed (always present), so no build guard is needed.
+  // (temen_warm_open runs the QuickJS runtime init once, temen_warm_eval restores that image + evals per Run).
+  // Its qjs_snapshot.temen is committed (always present), so no build guard is needed.
   {
     const qjsName = 'JavaScript (QuickJS — write & run JS)';
     const msOf = (t) => { const m = /· (\d+)ms/.exec(t); return m ? Number(m[1]) : NaN; };
@@ -286,14 +286,14 @@ try {
 
   // The C-compiler card mounted a C-mode editor.
   const cc = await page.evaluate((sel) => document.querySelector(`${sel} .CodeMirror`)?.CodeMirror?.getOption('mode'),
-    card('C compiler (chibicc → SVM — compile & run)'));
+    card('C compiler (chibicc → Temen — compile & run)'));
   cc === 'text/x-csrc' ? ok('chibicc card → C mode') : fail(`chibicc mode: ${cc}`);
 
-  // …and running it compiles the editor's C with chibicc.svmb IN THE BROWSER, svm_parse-es the emitted
+  // …and running it compiles the editor's C with chibicc.temen IN THE BROWSER, temen_parse-es the emitted
   // IR, runs the result, and shows main()'s return value. A trivial program pins an exact expected
-  // value; the stdout pane must carry the emitted SVM IR. (Skipped when the asset isn't built.)
+  // value; the stdout pane must carry the emitted Temen IR. (Skipped when the asset isn't built.)
   if (chibiccBuilt) {
-    const ccName = 'C compiler (chibicc → SVM — compile & run)';
+    const ccName = 'C compiler (chibicc → Temen — compile & run)';
     await page.evaluate((sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.setValue(
       'int main(void){ int x = 7 * 6; return x; }'), card(ccName));
     await runCard(page, ccName, 30_000);
@@ -307,7 +307,7 @@ try {
     // tier (the `.state` message reports `(wasm-JIT)`, so a silent interpreter fallback would fail here).
     cco.state === 'done' && cco.result === '42' && cco.ir.includes('func') && cco.ir.includes('_start')
     && cco.msg.includes('wasm-JIT')
-      ? ok('chibicc compiled C → SVM IR → ran it → 42 (in-browser, wasm-JIT)')
+      ? ok('chibicc compiled C → Temen IR → ran it → 42 (in-browser, wasm-JIT)')
       : fail(`chibicc run: ${JSON.stringify({ state: cco.state, msg: cco.msg, result: cco.result, ir: cco.ir.slice(0, 60) })}`);
 
     // "Prove interp ≡ JIT": compile the same C on both tiers and assert the emitted IR is byte-identical.
@@ -335,7 +335,7 @@ try {
       state: document.querySelector(`${sel} .state`).dataset.state,
       out: document.querySelector(`${sel} .stdout`).textContent,
     }), card(ccName));
-    pf.state === 'done' && pf.out.startsWith('i=1\ni=2\ni=3\npi=3.14 e=2.5\n') && pf.out.includes('SVM IR')
+    pf.state === 'done' && pf.out.startsWith('i=1\ni=2\ni=3\npi=3.14 e=2.5\n') && pf.out.includes('Temen IR')
       ? ok('chibicc #include <stdio.h> + printf (incl. %f/%g floats) → real output in-browser')
       : fail(`chibicc printf: ${JSON.stringify({ state: pf.state, out: pf.out.slice(0, 90) })}`);
 
@@ -388,15 +388,15 @@ try {
       ? ok('chibicc open_memstream + buffered FILE* (the self-host stdio) → ran in-browser')
       : fail(`chibicc memstream: ${JSON.stringify({ state: ms.state, out: ms.out.slice(0, 90) })}`);
   } else {
-    console.log('  SKIP: chibicc compile-and-run (chibicc.svmb not built — run build-onramp-assets.mjs)');
+    console.log('  SKIP: chibicc compile-and-run (chibicc.temen not built — run build-onramp-assets.mjs)');
   }
 
-  // The self-host capstone card (SELFHOST_C.md §7 step 5): chibicc.svmb compiles chibicc's *own* cc1
+  // The self-host capstone card (SELFHOST_C.md §7 step 5): chibicc.temen compiles chibicc's *own* cc1
   // TUs to linkable objects, in-browser, on the wasm-JIT. Pins: (1) it runs and emits a real object;
   // (2) the object is byte-identical to a native `chibicc --emit-object` (the fixpoint, over the real
   // glibc header closure seeded from the committed image); (3) the interpreter and JIT tiers agree.
   if (selfhostBuilt) {
-    const shName = 'chibicc compiles its own source (self-host → SVM)';
+    const shName = 'chibicc compiles its own source (self-host → Temen)';
     // Pick a substantial TU (tokenize.c, ~800 lines) via the card's translation-unit dropdown.
     const tuRel = 'frontend/chibicc/tokenize.c';
     await page.evaluate(([sel, tu]) => {
@@ -416,7 +416,7 @@ try {
     const wellFormed = sh.state === 'done' && guestObj.includes('func') && guestObj.includes('export')
       && sh.msg.includes('wasm-JIT');
     wellFormed
-      ? ok('self-host: chibicc compiled its own tokenize.c → linkable SVM-IR object in-browser (wasm-JIT)')
+      ? ok('self-host: chibicc compiled its own tokenize.c → linkable TEMEN-IR object in-browser (wasm-JIT)')
       : fail(`self-host run: ${JSON.stringify({ state: sh.state, msg: sh.msg, pane: sh.pane.slice(0, 80) })}`);
 
     // Byte-identity to native chibicc — the fixpoint, enforced. The native binary is the reference
@@ -424,8 +424,8 @@ try {
     // (no --data-page — the object is canonical). Skipped if the native binary isn't present.
     if (wellFormed && existsSync(nativeChibicc)) {
       const REPO = join(HERE, '..');
-      const prelude = 'crates/svm-run/demos/chibicc_selfhost/selfhost_prelude.h';
-      const refOut = join(REPO, 'target', 'selfhost_playtest_tokenize.svm');
+      const prelude = 'crates/temen-run/demos/chibicc_selfhost/selfhost_prelude.h';
+      const refOut = join(REPO, 'target', 'selfhost_playtest_tokenize.temt');
       try {
         execFileSync(nativeChibicc, [
           '-cc1', '-include', prelude, '-Ifrontend/chibicc', '-Ifrontend/chibicc/include',
@@ -473,7 +473,7 @@ try {
     const cm = document.querySelector(`${sel} .CodeMirror`).CodeMirror;
     const info = cm.lineInfo(2); // 0-based line 2 = the bad-opcode line
     return {
-      gutter: !!(info.gutterMarkers && info.gutterMarkers['svm-error-gutter']),
+      gutter: !!(info.gutterMarkers && info.gutterMarkers['temen-error-gutter']),
       lineClass: (info.bgClass || '').includes('cm-error-line'),
       widget: !!document.querySelector(`${sel} .cm-error-widget`),
     };
@@ -494,21 +494,21 @@ try {
     [...document.querySelectorAll('.demo')].filter((d) => d.querySelector('.jit-label')).map((d) => d.dataset.demo));
   const hasReactorJit = jitCards.includes('bounce (interactive — arrow keys)')
     && jitCards.includes('life (Conway — heap persistence)');
-  const hasModuleJit = jitCards.includes('hello (C → SVM)')
+  const hasModuleJit = jitCards.includes('hello (C → Temen)')
     && jitCards.includes('SQLite (:memory: — write & run SQL)');
-  const hasChibiccJit = jitCards.includes('C compiler (chibicc → SVM — compile & run)');
+  const hasChibiccJit = jitCards.includes('C compiler (chibicc → Temen — compile & run)');
   hasReactorJit && hasModuleJit && hasChibiccJit
     ? ok(`wasm-JIT toggle on ${jitCards.length} demos (reactors + hello/Lua/SQLite/chibicc modules)`)
     : fail(`jit cards: ${JSON.stringify(jitCards)}`);
 
   // The hello module card runs end-to-end via runModule (JIT toggle default-on): this exercises the
   // streamed module fetch (download-progress path) and the single-shot module JIT in CI, since
-  // hello_c.svmb is committed. Runs before the module parity check so the asset streams fresh (uncached).
-  await runCard(page, 'hello (C → SVM)');
+  // hello_c.temen is committed. Runs before the module parity check so the asset streams fresh (uncached).
+  await runCard(page, 'hello (C → Temen)');
   const helloMod = await page.evaluate((sel) => ({
     state: document.querySelector(`${sel} .state`).dataset.state,
     stdout: document.querySelector(`${sel} .stdout`).textContent,
-  }), card('hello (C → SVM)'));
+  }), card('hello (C → Temen)'));
   helloMod.state === 'done' && helloMod.stdout.length > 0
     ? ok(`hello module ran end-to-end (${JSON.stringify(helloMod.stdout.trim().slice(0, 20))})`)
     : fail(`hello module run: ${JSON.stringify(helloMod)}`);
@@ -526,12 +526,12 @@ try {
 
   // Prove interp ≡ JIT on the hello module (committed asset): the whole _start runs on both tiers and
   // the captured stdout is byte-identical (the module twin of the reactor's per-frame parity).
-  await page.click(`${card('hello (C → SVM)')} .prove`);
+  await page.click(`${card('hello (C → Temen)')} .prove`);
   await page.waitForFunction(
     (sel) => ['done', 'error'].includes(document.querySelector(sel).dataset.state),
-    `${card('hello (C → SVM)')} .state`, { timeout: 30_000 });
+    `${card('hello (C → Temen)')} .state`, { timeout: 30_000 });
   const modParity = await page.evaluate((sel) => document.querySelector(sel).textContent,
-    `${card('hello (C → SVM)')} .state`);
+    `${card('hello (C → Temen)')} .state`);
   modParity.includes('interpreter ≡ wasm-JIT') && modParity.includes('byte-identical stdout')
     ? ok(`module parity proven in-page: ${modParity}`)
     : fail(`module parity: ${modParity}`);
@@ -563,7 +563,7 @@ try {
     () => document.getElementById('engine-state').dataset.state === 'ready', { timeout: 30_000 });
 
   await setCM(sel, 'PERSIST_SENTINEL');
-  const saved = await page.evaluate(() => localStorage.getItem('svm-play:src:hello'));
+  const saved = await page.evaluate(() => localStorage.getItem('temen-play:src:hello'));
   saved === 'PERSIST_SENTINEL' ? ok('edit persisted to localStorage') : fail(`persist: ${saved}`);
   await page.reload({ waitUntil: 'load' });
   await waitReady();
@@ -572,7 +572,7 @@ try {
   await page.click(`${sel} .reset`);
   const afterReset = await page.evaluate((s) => ({
     val: document.querySelector(`${s} .CodeMirror`).CodeMirror.getValue(),
-    stored: localStorage.getItem('svm-play:src:hello'),
+    stored: localStorage.getItem('temen-play:src:hello'),
   }), sel);
   (afterReset.val !== 'PERSIST_SENTINEL' && afterReset.val.includes('cap.call') && afterReset.stored === null)
     ? ok('Reset restores the default source and clears storage')
@@ -588,7 +588,7 @@ try {
     return m ? m[0] : null;
   }, sel);
   if (shareURL && shareURL.includes('demo=hello')) {
-    await page.evaluate(() => localStorage.removeItem('svm-play:src:hello')); // prove the hash, not storage
+    await page.evaluate(() => localStorage.removeItem('temen-play:src:hello')); // prove the hash, not storage
     await page.goto(shareURL, { waitUntil: 'load' });
     await waitReady();
     (await getCM(sel)) === 'SHARED_ROUNDTRIP_42'
@@ -599,7 +599,7 @@ try {
 
   // The DAP debugger card: a breakpoint is pre-placed, Debug pauses on the bytecode engine at the
   // source line (highlighted), the Variables pane shows the loop locals, and Continue advances the loop.
-  const dbgCard = card('Debugger (SVM — breakpoints, step, variables)');
+  const dbgCard = card('Debugger (Temen — breakpoints, step, variables)');
   const dbg0 = await page.evaluate((sel) => ({
     hasDebugBtn: !!document.querySelector(`${sel} .debug`),
     bpDots: document.querySelectorAll(`${sel} .cm-bp-marker`).length,
@@ -655,7 +655,7 @@ try {
   // debugger runs the emitted IR — stopping on a **C source line** with the **C locals named** (i, acc).
   // A whole C program debugged at source level, client-side. (Compute-only: no printf → no powerbox.)
   if (chibiccBuilt) {
-    const ccDbg = card('C source-level debugging (chibicc → SVM — breakpoints on C lines)');
+    const ccDbg = card('C source-level debugging (chibicc → Temen — breakpoints on C lines)');
     const ccDbg0 = await page.evaluate((sel) => ({
       debugEnabled: !!document.querySelector(`${sel} .debug:not([disabled])`),
       gChecked: document.querySelector(`${sel} input[type=checkbox]`)?.checked === true, // the -g toggle (gOn)
@@ -715,7 +715,7 @@ try {
   // The watchpoint card: a counter at a fixed window address, named `count` by its `debug` section, so
   // the Variables pane can arm a data breakpoint on it. Debug pauses at the pre-placed loop-body
   // breakpoint; clicking `count`'s ● toggle arms the watch; Continue then stops for the data breakpoint.
-  const wpCard = card('Debugger (SVM — watchpoints / data breakpoints)');
+  const wpCard = card('Debugger (Temen — watchpoints / data breakpoints)');
   await page.click(`${wpCard} .debug`);
   await page.waitForFunction((sel) => document.querySelector(`${sel} .state`).textContent.includes('paused'),
     wpCard, { timeout: 20_000 });
@@ -744,7 +744,7 @@ try {
   // The threads card: a thread.spawn guest on the multithreaded scheduled bytecode engine. Debug stops
   // in a worker; the Variables pane grows a thread selector (one chip per live vCPU); selecting another
   // thread focuses its stack without resuming; Continue catches the second worker; the guest finishes.
-  const thCard = card('Debugger (SVM — threads)');
+  const thCard = card('Debugger (Temen — threads)');
   await page.click(`${thCard} .debug`);
   await page.waitForFunction((sel) => /paused .*thread-/.test(document.querySelector(`${sel} .state`).textContent),
     thCard, { timeout: 20_000 });
@@ -797,7 +797,7 @@ try {
   // The wait/notify card: a futex handoff. The worker parks on atomic.wait until the root's notify
   // wakes it; a breakpoint after the wait fires only once woken — proving wait/notify drive under the
   // debug scheduler. Then Continue finishes the handoff.
-  const wnCard = card('Debugger (SVM — wait / notify)');
+  const wnCard = card('Debugger (Temen — wait / notify)');
   await page.click(`${wnCard} .debug`);
   await page.waitForFunction((sel) => /paused .*thread-/.test(document.querySelector(`${sel} .state`).textContent),
     wnCard, { timeout: 20_000 });
@@ -814,7 +814,7 @@ try {
   // The fibers card: a generator. A breakpoint inside the fiber fires only once cont.resume switches
   // the debugged continuation into it — the debugger follows into the fiber and highlights its line;
   // Continue runs the suspend/resume handoff to completion.
-  const fbCard = card('Debugger (SVM — fibers / generators)');
+  const fbCard = card('Debugger (Temen — fibers / generators)');
   await page.click(`${fbCard} .debug`);
   await page.waitForFunction((sel) => document.querySelector(`${sel} .state`).textContent.includes('paused'),
     fbCard, { timeout: 20_000 });
@@ -834,7 +834,7 @@ try {
   // The fibers+threads card: two workers each run a generator fiber. A breakpoint inside the fiber body
   // fires on a *worker* vCPU (a thread selector appears; the stopped chip is not the root), proving fibers
   // compose with threads under the scheduled debugger. Continue catches the other worker; the run finishes.
-  const ftCard = card('Debugger (SVM — fibers + threads)');
+  const ftCard = card('Debugger (Temen — fibers + threads)');
   await page.click(`${ftCard} .debug`);
   await page.waitForFunction((sel) => /paused .*thread-/.test(document.querySelector(`${sel} .state`).textContent),
     ftCard, { timeout: 20_000 });
@@ -870,7 +870,7 @@ try {
   await page.selectOption('#theme', 'dark');
   const themed = await page.evaluate(() => ({
     attr: document.documentElement.dataset.theme,
-    stored: localStorage.getItem('svm-play:theme'),
+    stored: localStorage.getItem('temen-play:theme'),
   }));
   themed.attr === 'dark' && themed.stored === 'dark'
     ? ok('theme picker forces + persists dark') : fail(`theme: ${JSON.stringify(themed)}`);

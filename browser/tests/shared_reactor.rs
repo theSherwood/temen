@@ -7,7 +7,7 @@
 //! steps both reactors frame-for-frame over the bounce (animation + input) and life (malloc-heap
 //! persistence) fixtures and asserts the presented frames and stdout match exactly.
 
-use svm_browser::{Frame, OnrampReactor, SharedOnrampReactor, STATUS_OK};
+use temen_browser::{Frame, OnrampReactor, SharedOnrampReactor, STATUS_OK};
 
 // A 32 MiB owned window — comfortably covers the bounce/life mapped window plus their grown heap.
 const WIN_LOG2: u8 = 25;
@@ -16,8 +16,8 @@ const WIN_LOG2: u8 = 25;
 const LEFT: i32 = 37;
 const RIGHT: i32 = 39;
 
-fn decode(bytes: &[u8]) -> svm_ir::Module {
-    svm_encode::decode_module(bytes).expect("decode fixture")
+fn decode(bytes: &[u8]) -> temen_ir::Module {
+    temen_encode::decode_module(bytes).expect("decode fixture")
 }
 
 /// Assert two frames are byte-identical (dimensions + every RGBA byte).
@@ -45,7 +45,7 @@ fn step_both(internal: &mut OnrampReactor, shared: &mut SharedOnrampReactor, ctx
 
 #[test]
 fn bounce_frames_match_internal_reactor() {
-    let m = decode(include_bytes!("fixtures/bounce.svmb"));
+    let m = decode(include_bytes!("fixtures/bounce.temen"));
     let mut internal = OnrampReactor::open(&m).expect("open internal bounce reactor");
     let mut shared =
         SharedOnrampReactor::open_owned(&m, WIN_LOG2).expect("open shared bounce reactor");
@@ -78,7 +78,7 @@ fn bounce_frames_match_internal_reactor() {
 fn life_heap_persistence_matches_internal_reactor() {
     // Life keeps its grids on a malloc heap *above* the mapped window; a frame only matches across
     // reactors if the shared window persists the whole guest memory (heap included) between frames.
-    let m = decode(include_bytes!("fixtures/life.svmb"));
+    let m = decode(include_bytes!("fixtures/life.temen"));
     let mut internal = OnrampReactor::open(&m).expect("open internal life reactor");
     let mut shared =
         SharedOnrampReactor::open_owned(&m, WIN_LOG2).expect("open shared life reactor");

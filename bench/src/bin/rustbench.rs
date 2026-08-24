@@ -1,5 +1,5 @@
 //! **Real-program cross-engine perf harness** — diverse `no_std` Rust workloads (a real program each:
-//! a hash-table churn, a bytecode interpreter, a batch sort) run on **svm-jit** vs **Wasmtime-w64**
+//! a hash-table churn, a bytecode interpreter, a batch sort) run on **temen-jit** vs **Wasmtime-w64**
 //! vs **native**, timed by the large/small-`n` subtraction (min over reps) — the confine methodology,
 //! but on real programs instead of confinement micro-kernels.
 //!
@@ -11,15 +11,15 @@
 //!
 //! Lanes (each gracefully skipped if its toolchain is absent):
 //!   native   `rustc -O` → object, linked with the confine self-timer. The ×native baseline.
-//!   svm-jit  `rustc --emit=llvm-ir` → textual IR → the version-tolerant `svm_llvm` reader → `svm_jit`,
+//!   temen-jit  `rustc --emit=llvm-ir` → textual IR → the version-tolerant `temen_llvm` reader → `temen_jit`,
 //!            in-process. LP64. **No `llvm-dis`, no LLVM-version pin (I24) — any modern rustc works.**
 //!   wt/w64   `cargo +nightly build -Z build-std … --target wasm64-unknown-unknown` → Wasmtime
-//!            (memory64). **LP64 — the honest same-widths comparison; `svm÷wt64` is the headline.**
+//!            (memory64). **LP64 — the honest same-widths comparison; `temen÷wt64` is the headline.**
 //!   wt/w32   `rustc --target wasm32-unknown-unknown` → Wasmtime. ILP32 — the *flattered*
 //!            comparison (32-bit addressing + free 4 GiB guards), shown for context only.
 //!
-//! Toolchain: the **system default** `rustc` drives the native/svm/wasm32 lanes (set
-//! `SVM_RUSTBENCH_RUSTC` to pick another, e.g. `+1.81.0`); the wasm64 lane needs `+nightly` with the
+//! Toolchain: the **system default** `rustc` drives the native/temen/wasm32 lanes (set
+//! `TEMEN_RUSTBENCH_RUSTC` to pick another, e.g. `+1.81.0`); the wasm64 lane needs `+nightly` with the
 //! `rust-src` component. Add the `wasm32`/`wasm64` targets for the wasm lanes. Missing pieces just
 //! blank the column. Run from `bench/`:  cargo run --release --bin rustbench
 
@@ -30,13 +30,13 @@ use std::time::Instant;
 use wasmtime::{Config, Engine, Instance, Module, Store, Val};
 
 const REPS: u32 = 15;
-/// The rustc for the guest lanes. `SVM_RUSTBENCH_RUSTC` overrides the toolchain (e.g. `+1.81.0` to
+/// The rustc for the guest lanes. `TEMEN_RUSTBENCH_RUSTC` overrides the toolchain (e.g. `+1.81.0` to
 /// reproduce the old LLVM-18 build, or `+nightly`); the default is the **system default** toolchain.
-/// The svm-jit lane feeds *textual* LLVM IR to the version-tolerant on-ramp (I24), so it no longer
+/// The temen-jit lane feeds *textual* LLVM IR to the version-tolerant on-ramp (I24), so it no longer
 /// needs an LLVM-18 rustc — any modern rustc works, the same one the native/wasm lanes use.
 fn rustc() -> Command {
     let mut c = Command::new("rustc");
-    if let Ok(tc) = std::env::var("SVM_RUSTBENCH_RUSTC") {
+    if let Ok(tc) = std::env::var("TEMEN_RUSTBENCH_RUSTC") {
         c.arg(tc);
     }
     c
@@ -50,7 +50,7 @@ const WORKLOADS: &[(&str, i64, i64)] = &[
     ("parse", 1_000, 2_000_000),
     ("base64", 1_000, 1_000_000),
     ("bfs", 10, 5_000), // grid BFS: traversal, queue, pointer-chasing. Once miscompiled (ISSUES.md
-                        // I23) — a real bug this harness caught; two svm-llvm translation bugs, now fixed.
+                        // I23) — a real bug this harness caught; two temen-llvm translation bugs, now fixed.
 ];
 
 fn rb_dir() -> PathBuf {
@@ -143,14 +143,14 @@ fn native_lane(src: &Path, small: i64, large: i64) -> Option<(f64, i64)> {
     parse_ns_chk(&out.stdout)
 }
 
-/// `rustc --emit=llvm-ir` → svm_llvm → svm_jit (compiled once). Returns a runner + `run(small)`.
+/// `rustc --emit=llvm-ir` → temen_llvm → temen_jit (compiled once). Returns a runner + `run(small)`.
 ///
 /// Emits **textual** LLVM IR and feeds it to the version-tolerant `.ll` reader
-/// ([`svm_llvm::translate_ll_path`]) — no `llvm-dis`, so **any** rustc works (I24): the on-ramp is no
+/// ([`temen_llvm::translate_ll_path`]) — no `llvm-dis`, so **any** rustc works (I24): the on-ramp is no
 /// longer coupled to the producer's LLVM version, so this lane rides the same modern rustc as the
 /// native/wasm lanes instead of a pinned LLVM-18 toolchain.
-fn svmjit_runner(src: &Path, small: i64) -> Option<(impl FnMut(i64) -> i64, i64)> {
-    let ll = tmp("svm.ll");
+fn temenjit_runner(src: &Path, small: i64) -> Option<(impl FnMut(i64) -> i64, i64)> {
+    let ll = tmp("temen.ll");
     let ok = rustc()
         .args([
             "--edition",
@@ -170,14 +170,14 @@ fn svmjit_runner(src: &Path, small: i64) -> Option<(impl FnMut(i64) -> i64, i64)
     if !ok {
         return None;
     }
-    let t = svm_llvm::translate_ll_path(&ll).ok()?;
+    let t = temen_llvm::translate_ll_path(&ll).ok()?;
     let sp = t.entry_sp as i64;
     let e = t.exports.iter().find(|(n, _)| n == "run")?.1;
-    let mut cm = svm_jit::compile(&t.module, e).ok()?;
+    let mut cm = temen_jit::compile(&t.module, e).ok()?;
     let mut runner = move |n: i64| -> i64 {
-        match cm.run(&[sp, n], None, None, None).expect("svm-jit run") {
-            (svm_jit::JitOutcome::Returned(v), _) => v[0],
-            (o, _) => panic!("svm-jit did not return: {o:?}"),
+        match cm.run(&[sp, n], None, None, None).expect("temen-jit run") {
+            (temen_jit::JitOutcome::Returned(v), _) => v[0],
+            (o, _) => panic!("temen-jit did not return: {o:?}"),
         }
     };
     let want = runner(small);
@@ -255,7 +255,7 @@ fn build_wasm64(src_text: &str) -> Option<PathBuf> {
 
 fn main() {
     if !rustc_ok() {
-        eprintln!("rustbench: `rustc` unavailable (set SVM_RUSTBENCH_RUSTC to pick a toolchain). Skipping.");
+        eprintln!("rustbench: `rustc` unavailable (set TEMEN_RUSTBENCH_RUSTC to pick a toolchain). Skipping.");
         return;
     }
     let have_nightly = Command::new("rustc")
@@ -266,7 +266,7 @@ fn main() {
 
     println!(
         "{:<10} {:>11} {:>9} {:>9} {:>9} {:>10}   correctness",
-        "workload", "native(ns)", "svm-jit", "wt/w64", "wt/w32", "svm÷wt64"
+        "workload", "native(ns)", "temen-jit", "wt/w64", "wt/w32", "temen÷wt64"
     );
     for &(name, small, large) in WORKLOADS {
         let Some(text) = compose(name) else {
@@ -277,17 +277,17 @@ fn main() {
         if std::fs::write(&src, &text).is_err() {
             continue;
         }
-        let Some((mut svm_run, svm_want)) = svmjit_runner(&src, small) else {
-            eprintln!("note: {name}: svm-jit lane unavailable — skipped");
+        let Some((mut temen_run, temen_want)) = temenjit_runner(&src, small) else {
+            eprintln!("note: {name}: temen-jit lane unavailable — skipped");
             continue;
         };
-        // Build the wasm modules, then time svm-jit and wt/w64 back-to-back (the tracked headline),
-        // before the slower native/w32 lanes — keeping svm÷wt64 off their perturbation.
+        // Build the wasm modules, then time temen-jit and wt/w64 back-to-back (the tracked headline),
+        // before the slower native/w32 lanes — keeping temen÷wt64 off their perturbation.
         let w64 = have_nightly
             .then(|| build_wasm64(&text))
             .flatten()
             .and_then(|w| wt_runner(&w, true, small));
-        let svm_ns = per_iter(small, large, REPS, &mut svm_run);
+        let temen_ns = per_iter(small, large, REPS, &mut temen_run);
         let wt64 = w64.map(|(mut r, c)| (per_iter(small, large, REPS, &mut r), c));
 
         let native = native_lane(&src, small, large);
@@ -295,26 +295,26 @@ fn main() {
             .and_then(|w| wt_runner(&w, false, small))
             .map(|(mut r, c)| (per_iter(small, large, REPS, &mut r), c));
 
-        // Correctness: every available lane must agree with svm-jit on run(small).
+        // Correctness: every available lane must agree with temen-jit on run(small).
         let mut bad: Vec<String> = Vec::new();
         if let Some((_, c)) = native {
-            if c != svm_want {
+            if c != temen_want {
                 bad.push(format!("native={c}"));
             }
         }
         if let Some((_, c)) = wt64 {
-            if c != svm_want {
+            if c != temen_want {
                 bad.push(format!("wt64={c}"));
             }
         }
         if let Some((_, c)) = wt32 {
-            if c != svm_want {
+            if c != temen_want {
                 bad.push(format!("wt32={c}"));
             }
         }
         assert!(
             bad.is_empty(),
-            "{name}: MISCOMPILE — svm-jit(run({small}))={svm_want}, disagree: {}",
+            "{name}: MISCOMPILE — temen-jit(run({small}))={temen_want}, disagree: {}",
             bad.join(" ")
         );
 
@@ -323,14 +323,14 @@ fn main() {
             (Some(v), Some(n)) => format!("{:.2}x", v / n),
             _ => "—".to_string(),
         };
-        let svm_over_wt64 = wt64.map(|(ns, _)| format!("{:.3}x", svm_ns / ns));
+        let temen_over_wt64 = wt64.map(|(ns, _)| format!("{:.3}x", temen_ns / ns));
         println!(
             "{name:<10} {:>11} {:>9} {:>9} {:>9} {:>10}   OK",
             nat.map_or("—".to_string(), |n| format!("{n:.1}")),
-            relf(Some(svm_ns)),
+            relf(Some(temen_ns)),
             relf(wt64.map(|(ns, _)| ns)),
             relf(wt32.map(|(ns, _)| ns)),
-            svm_over_wt64.unwrap_or_else(|| "—".to_string()),
+            temen_over_wt64.unwrap_or_else(|| "—".to_string()),
         );
     }
 }

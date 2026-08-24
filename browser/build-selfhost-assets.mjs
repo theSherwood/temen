@@ -2,8 +2,8 @@
 // its own source" playground card mounts (SELFHOST_C.md §7 step 5). For each of chibicc's own cc1 TUs
 // it discovers the TU's full `#include` closure with `chibicc -M` (chibicc.h pulls ~96 glibc headers),
 // unions them across TUs (the closure is shared — seeded once), adds the TU sources + the self-host
-// prelude, and encodes one `svm_fs` image → `web/assets/chibicc_selfhost.img`. The card then runs
-// `chibicc.svmb --emit-object <tu>` over this memfs (the `svm_selfhost_*_emit_object_fs` FFI), emitting
+// prelude, and encodes one `temen_fs` image → `web/assets/chibicc_selfhost.img`. The card then runs
+// `chibicc.temen --emit-object <tu>` over this memfs (the `temen_selfhost_*_emit_object_fs` FFI), emitting
 // that TU's linkable object — chibicc compiling its own parser/tokenizer/codegen, client-side.
 //
 // Like `build-onramp-assets.mjs`, the image is **regenerable / gitignored** (it embeds the runner's
@@ -21,7 +21,7 @@ import { dirname, join } from 'node:path';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, '..');
 const CHIBICC = join(REPO, 'frontend/chibicc/chibicc');
-const PRELUDE = 'crates/svm-run/demos/chibicc_selfhost/selfhost_prelude.h';
+const PRELUDE = 'crates/temen-run/demos/chibicc_selfhost/selfhost_prelude.h';
 const OUT = join(HERE, 'web/assets/chibicc_selfhost.img');
 
 // The **tractable** cc1 TUs (SELFHOST_C.md — ≤ ~800 lines). The three giants (preprocess/parse/
@@ -35,7 +35,7 @@ function ensureChibicc() {
   execFileSync('make', ['chibicc'], { cwd: join(REPO, 'frontend/chibicc'), stdio: 'inherit' });
 }
 
-// svm_fs::encode_image wire form (crates/svm-fs/src/lib.rs): "SVMFSIM1" + dirs(u32 n, each u32 len+bytes)
+// temen_fs::encode_image wire form (crates/temen-fs/src/lib.rs): "SVMFSIM1" + dirs(u32 n, each u32 len+bytes)
 // + files(u32 n, each u32 len+path, u64 len+data). Little-endian.
 function encodeImage(files, dirs) {
   const enc = new TextEncoder(); const parts = []; let n = 0;
@@ -49,7 +49,7 @@ function encodeImage(files, dirs) {
 }
 
 // The union closure of the TU set, keyed exactly as the guest resolves paths (mirrors
-// `chibicc_tu_closure` in crates/svm/tests/c_link.rs): repo-relative for repo files, `usr/...` for
+// `chibicc_tu_closure` in crates/temen/tests/c_link.rs): repo-relative for repo files, `usr/...` for
 // system headers. Every ancestor dir is registered so the memfs mount has the directory nodes.
 ensureChibicc();
 const files = new Map(); const dirs = new Set();

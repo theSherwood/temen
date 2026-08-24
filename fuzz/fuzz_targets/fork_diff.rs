@@ -11,7 +11,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-#[path = "../../crates/svm/tests/support/fork_fuzz.rs"]
+#[path = "../../crates/temen/tests/support/fork_fuzz.rs"]
 mod fork_fuzz;
 
 fuzz_target!(|data: &[u8]| {

@@ -1,8 +1,8 @@
 /* Minimal freestanding-wasm `<string.h>` shim for the Embench cross-engine build (see
- * bench/embench/README.md). The host SVM build uses real libc headers + the on-ramp's synthesized
+ * bench/embench/README.md). The host Temen build uses real libc headers + the on-ramp's synthesized
  * helpers; the wasm32 build is `-nostdlib`, so it gets these prototypes plus the definitions in
  * `../defs.h`. `memcpy`/`memmove`/`memset` are clang intrinsics lowered to wasm bulk-memory
- * (`-mbulk-memory`); `memcmp`/`bcmp` are defined by `wrapper.c`'s `SVM_BUILD` block. */
+ * (`-mbulk-memory`); `memcmp`/`bcmp` are defined by `wrapper.c`'s `TEMEN_BUILD` block. */
 #ifndef _EMBENCH_WASM_STRING_H
 #define _EMBENCH_WASM_STRING_H
 #include <stddef.h>

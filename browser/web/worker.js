@@ -1,5 +1,5 @@
 // THREADS/BROWSER step 4c-wasm in a REAL browser — the per-vCPU Web Worker. One guest vCPU runs here
-// through the engine's resumable `Vcpu` API (`svm_par_run` → a host-serviced event → deliver → run
+// through the engine's resumable `Vcpu` API (`temen_par_run` → a host-serviced event → deliver → run
 // again) over the ONE shared linear memory. This is the browser twin of `threads-spawn.mjs`'s
 // `worker()`: the only differences are init delivery (a `postMessage` instead of Node `workerData`)
 // and that a spawn request is posted to the page (which creates every Worker — no nested Workers).
@@ -32,9 +32,9 @@ self.onmessage = async (e) => {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
     smod, entry, slog, fuel, tierup, gptr, glen, tierupCell, jitCodegen, jitService, instCodegen,
     jitB2, jitRuntime, tierupPaged } = e.data;
-  // I22 liveness backstop. The `svm_par_run` loop below already catches host traps, but the SETUP +
-  // codegen calls before it (WebAssembly.instantiate, svm_par_enable_jit / _jit_codegen /
-  // _inst_codegen, svm_par_child*) are the ones a rare shared-memory race actually trips (a double-free
+  // I22 liveness backstop. The `temen_par_run` loop below already catches host traps, but the SETUP +
+  // codegen calls before it (WebAssembly.instantiate, temen_par_enable_jit / _jit_codegen /
+  // _inst_codegen, temen_par_child*) are the ones a rare shared-memory race actually trips (a double-free
   // in the shared codegen stash → `memory access out of bounds` or a panic=abort `unreachable`). An
   // uncaught trap there rejects this async onmessage, and a Worker's unhandled rejection does NOT fire
   // `Worker.onerror` on the page — so a child that dies here never fills its completion slot and the
@@ -42,11 +42,11 @@ self.onmessage = async (e) => {
   // ANY trap becomes a clean vCPU trap: wake any joiner, and report `fail` with the captured panic site.
   let ex;
   try {
-  // The engine imports `svm_host.webgpu_op` (the `webgpu` capability's host seam). A Worker vCPU has
+  // The engine imports `temen_host.webgpu_op` (the `webgpu` capability's host seam). A Worker vCPU has
   // no GPU surface (the playground's GPU reactor runs on the main thread via par.js), so stub it to a
   // no-op — a guest that resolves the `webgpu` cap here gets -1 and skips. Without it the instantiate
-  // fails with "Import svm_host: module is not an object or function".
-  ({ exports: ex } = await WebAssembly.instantiate(module, { env: { memory }, svm_host: { webgpu_op: () => -1n } }));
+  // fails with "Import temen_host: module is not an object or function".
+  ({ exports: ex } = await WebAssembly.instantiate(module, { env: { memory }, temen_host: { webgpu_op: () => -1n } }));
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
   // Views over the shared memory, refreshed when stale: the shared WebAssembly.Memory can GROW
@@ -62,7 +62,7 @@ self.onmessage = async (e) => {
   // A §14 'confined' child's `win`/`winSize` are already its carve (the parent's window + the event's
   // offset) — a confined child is just a child with a shifted, smaller window (DESIGN.md §14).
   // wasm-JIT tier-up (threads slice): this Worker enables the tier-up bitmap in this instance —
-  // `svm_par_enable_jit` emits the tier-up module (a pure leaf reachable only via `thread.spawn`
+  // `temen_par_enable_jit` emits the tier-up module (a pure leaf reachable only via `thread.spawn`
   // still emits, since the guest keeps interpreting), stashes its bytes + the decoded module (so a
   // cross-tier leaf's `call_interp` works), and reports whether anything tier-ups. This Worker then
   // instantiates the emitted module against the ONE shared memory (each Worker instantiates its own —
@@ -70,66 +70,66 @@ self.onmessage = async (e) => {
   let emitted = null, envCell = 0;
   // #750: `tierupPaged` opts the run into the paged tier — unmap/protect guests keep their pure
   // leaves eligible; each TIERUP then also carries a page-state table (see the handler below).
-  const enableJit = tierupPaged ? ex.svm_par_enable_jit_paged : ex.svm_par_enable_jit;
+  const enableJit = tierupPaged ? ex.temen_par_enable_jit_paged : ex.temen_par_enable_jit;
   if (tierup && enableJit(gptr, glen) === 1) {
-    const wptr = Number(ex.svm_wasmjit_ptr()), wlen = ex.svm_wasmjit_len();
+    const wptr = Number(ex.temen_wasmjit_ptr()), wlen = ex.temen_wasmjit_len();
     const bytes = new Uint8Array(memory.buffer).slice(wptr, wptr + wlen);
     const emod = await WebAssembly.instantiate(await WebAssembly.compile(bytes), {
       env: {
         memory,
-        trap: () => {}, // an SVM-specific fault; the following `unreachable` throws, caught below
-        call_interp: (f, argsPtr) => { if (ex.svm_wasmjit_call_interp(f, argsPtr) !== 0) throw new Error('cross-tier trap'); },
+        trap: () => {}, // an TEMEN-specific fault; the following `unreachable` throws, caught below
+        call_interp: (f, argsPtr) => { if (ex.temen_wasmjit_call_interp(f, argsPtr) !== 0) throw new Error('cross-tier trap'); },
       },
     });
     emitted = emod.exports;
-    envCell = Number(ex.svm_par_alloc(ex.svm_wasmjit_env_bytes())); // fuel counter + cross-tier scratch
+    envCell = Number(ex.temen_par_alloc(ex.temen_wasmjit_env_bytes())); // fuel counter + cross-tier scratch
   }
 
   // §22 guest-JIT real codegen (BROWSER.md slice 5): the run's single §22 unit was emitted + stashed
-  // once at powerbox setup (svm_par_powerbox_jit_codegen); every Worker instantiates its own instance
+  // once at powerbox setup (temen_par_powerbox_jit_codegen); every Worker instantiates its own instance
   // against the ONE shared memory. On PAR_JIT_INVOKE this Worker runs the emitted `f0(win, env, args)`
   // instead of the interpreter. A `new WebAssembly.Module`/`Instance` here is synchronous (the unit is
   // small) so it needs no await inside the event loop.
   let jitUnit = null, jitEnvCell = 0;
-  if (jitCodegen) ex.svm_par_jit_codegen_service(jitService | 0); // 0=i32, 1=f64 service (per-instance)
-  if (jitCodegen && ex.svm_par_enable_jit_codegen() === 1 && ex.svm_par_jit_unit_wasm_len() > 0) {
-    const wptr = Number(ex.svm_par_jit_unit_wasm_ptr()), wlen = ex.svm_par_jit_unit_wasm_len();
+  if (jitCodegen) ex.temen_par_jit_codegen_service(jitService | 0); // 0=i32, 1=f64 service (per-instance)
+  if (jitCodegen && ex.temen_par_enable_jit_codegen() === 1 && ex.temen_par_jit_unit_wasm_len() > 0) {
+    const wptr = Number(ex.temen_par_jit_unit_wasm_ptr()), wlen = ex.temen_par_jit_unit_wasm_len();
     const bytes = new Uint8Array(memory.buffer).slice(wptr, wptr + wlen);
     const umod = new WebAssembly.Module(bytes);
     const uinst = new WebAssembly.Instance(umod, {
       env: {
         memory,
         trap: () => {},
-        call_interp: (f, argsPtr) => { if (ex.svm_wasmjit_call_interp(f, argsPtr) !== 0) throw new Error('cross-tier trap'); },
+        call_interp: (f, argsPtr) => { if (ex.temen_wasmjit_call_interp(f, argsPtr) !== 0) throw new Error('cross-tier trap'); },
       },
     });
     jitUnit = uinst.exports;
-    jitEnvCell = Number(ex.svm_par_alloc(ex.svm_wasmjit_env_bytes()));
+    jitEnvCell = Number(ex.temen_par_alloc(ex.temen_wasmjit_env_bytes()));
   }
 
   // §22 Model B2 cross-Worker (BROWSER.md § "wasm-JIT tier"): a runtime-`Jit.compile`d unit's
   // `call_indirect` must reach units another Worker `install`ed. wasm funcrefs can't cross Workers,
   // so this Worker holds its OWN funcref table mirroring the shared interpreter `Domain`'s slot→unit
   // map, and instantiates each installed unit locally (the emitted units import this table — the Rust
-  // emitter runs in B2 mode, `svm_par_jit_set_b2`). Enabled by `jitB2` (the page sets both).
+  // emitter runs in B2 mode, `temen_par_jit_set_b2`). Enabled by `jitB2` (the page sets both).
   //   Verified end-to-end by the CI-gated `jitb2` work item (main.js item 12): 8 Workers each
   //   runtime-compile + `install` a unit into the shared table (raced slots) and dispatch it on
   //   B2-emitted wasm through this mirror, interp ≡ B2 codegen ≡ 56. The emitter-level cross-instance
-  //   semantics are pinned native by `crates/svm-wasm-jit/tests/b2_install.rs`.
+  //   semantics are pinned native by `crates/temen-wasm-jit/tests/b2_install.rs`.
   let jitTable = null;
   const jitInstCache = new Map(); // code handle → instance.exports (per-Worker instantiation)
   if (jitB2) {
-    const size = 1 << ex.svm_par_jit_table_log2();
+    const size = 1 << ex.temen_par_jit_table_log2();
     jitTable = new WebAssembly.Table({ initial: size, maximum: size, element: 'anyfunc' });
   }
-  if ((jitB2 || jitRuntime) && !jitEnvCell) jitEnvCell = Number(ex.svm_par_alloc(ex.svm_wasmjit_env_bytes()));
+  if ((jitB2 || jitRuntime) && !jitEnvCell) jitEnvCell = Number(ex.temen_par_alloc(ex.temen_wasmjit_env_bytes()));
   // Instantiate a unit's emitted bytes importing this Worker's shared table, or null if not emitted.
   const jitInstantiate = (bytes) =>
     new WebAssembly.Instance(new WebAssembly.Module(bytes), {
       env: {
         memory,
         trap: () => {},
-        call_interp: (f, a) => { if (ex.svm_wasmjit_call_interp(f, a) !== 0) throw new Error('cross-tier trap'); },
+        call_interp: (f, a) => { if (ex.temen_wasmjit_call_interp(f, a) !== 0) throw new Error('cross-tier trap'); },
         __indirect_function_table: jitTable,
       },
     }).exports;
@@ -137,9 +137,9 @@ self.onmessage = async (e) => {
   const jitUnitFor = (code) => {
     let inst = jitInstCache.get(code);
     if (inst) return inst;
-    const len = ex.svm_par_jit_code_wasm_by_handle_len(code);
+    const len = ex.temen_par_jit_code_wasm_by_handle_len(code);
     if (len === 0) return null;
-    const ptr = Number(ex.svm_par_jit_code_wasm_by_handle_ptr(code));
+    const ptr = Number(ex.temen_par_jit_code_wasm_by_handle_ptr(code));
     inst = jitInstantiate(new Uint8Array(memory.buffer).slice(ptr, ptr + len));
     jitInstCache.set(code, inst);
     return inst;
@@ -147,9 +147,9 @@ self.onmessage = async (e) => {
   // Mirror the shared `Domain` slot→unit map into this Worker's table: `f0` of the installed unit, or
   // null for an empty/uninstalled slot (so a stale `call_indirect` traps). Called before each invoke.
   const jitSyncTable = () => {
-    const size = 1 << ex.svm_par_jit_table_log2();
+    const size = 1 << ex.temen_par_jit_table_log2();
     for (let slot = 0; slot < size; slot++) {
-      const code = ex.svm_par_jit_slot_code(slot);
+      const code = ex.temen_par_jit_slot_code(slot);
       if (code < 0) { jitTable.set(slot, null); continue; }
       const inst = jitUnitFor(code);
       jitTable.set(slot, inst ? inst['f0'] : null);
@@ -165,9 +165,9 @@ self.onmessage = async (e) => {
   // SAME confined-child completion-slot protocol as the interpreter's INSTANTIATE/JOIN arms below —
   // the grandchild spawns on its own Worker (page relay), and `env.join` blocks on its slot with
   // `Atomics.wait` (legal in a Worker). A non-nested (2-import) unit simply ignores the extra keys.
-  if (role === 'confined' && instCodegen && ex.svm_par_enable_inst_codegen() === 1
-      && ex.svm_par_inst_eligible(entry) === 1) {
-    const wptr = Number(ex.svm_par_inst_unit_wasm_ptr()), wlen = ex.svm_par_inst_unit_wasm_len();
+  if (role === 'confined' && instCodegen && ex.temen_par_enable_inst_codegen() === 1
+      && ex.temen_par_inst_eligible(entry) === 1) {
+    const wptr = Number(ex.temen_par_inst_unit_wasm_ptr()), wlen = ex.temen_par_inst_unit_wasm_len();
     const bytes = new Uint8Array(memory.buffer).slice(wptr, wptr + wlen);
     const childSlots = []; // env.instantiate handle (index) → grandchild completion slot ptr
     const threadSlots = []; // env.thread_spawn handle (index) → thread completion slot ptr
@@ -175,21 +175,21 @@ self.onmessage = async (e) => {
       env: {
         memory,
         trap: () => {},
-        call_interp: (f, a) => { if (ex.svm_wasmjit_call_interp(f, a) !== 0) throw new Error('cross-tier trap'); },
+        call_interp: (f, a) => { if (ex.temen_wasmjit_call_interp(f, a) !== 0) throw new Error('cross-tier trap'); },
         // §14 VM-in-VM spawn bounce. The emitted parent does no confinement itself, so the engine's
         // `event_instantiate` carve checks are replicated here: the grandchild's power-of-two carve
         // must be aligned and lie inside THIS child's own window (confinement composes); a violation
         // throws → this child's slot reads trapped, exactly as the interpreter traps the parent.
         // The `inst` handle arg is inert (0n) on the emitted tier — authority is this child's §14
         // construction itself (every confined child holds an attenuated Instantiator), mirroring the
-        // native harness (crates/svm-wasm-jit/tests/nested_vm.rs).
+        // native harness (crates/temen-wasm-jit/tests/nested_vm.rs).
         instantiate: (cwin, _inst, centry, off, cslog, quota) => {
           const gsize = 1 << Number(cslog), goff = Number(off);
           if (gsize > winSize || (goff & (gsize - 1)) !== 0 || goff + gsize > winSize)
             throw new Error('bad nested carve');
-          const gslot = ex.svm_par_alloc(SLOT);
-          const gstackTop = ex.svm_par_alloc(STACK) + STACK;
-          const gtlsBase = tlsSize > 0 ? roundUp(ex.svm_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
+          const gslot = ex.temen_par_alloc(SLOT);
+          const gstackTop = ex.temen_par_alloc(STACK) + STACK;
+          const gtlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
           // Fuel: min(quota, parent's) — the emitted tier tracks fuel coarsely (the env-cell
           // counter), so "parent's" is this child's own granted fuel from its init cfg.
           const pf = BigInt(fuel);
@@ -217,9 +217,9 @@ self.onmessage = async (e) => {
         // runs the granted unit's own `func` (smod — this Worker knows its module), over THIS
         // child's window (a thread shares its spawner's window = the carve).
         thread_spawn: (func, sp, arg) => {
-          const tslot = ex.svm_par_alloc(SLOT);
-          const tstackTop = ex.svm_par_alloc(STACK) + STACK;
-          const ttlsBase = tlsSize > 0 ? roundUp(ex.svm_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
+          const tslot = ex.temen_par_alloc(SLOT);
+          const tstackTop = ex.temen_par_alloc(STACK) + STACK;
+          const ttlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
           self.postMessage({
             kind: 'spawn', smod, func, sp: sp.toString(), arg: arg.toString(),
             win, winSize, fuel,
@@ -251,9 +251,9 @@ self.onmessage = async (e) => {
         },
       },
     });
-    const envCell = Number(ex.svm_par_alloc(ex.svm_wasmjit_env_bytes()));
+    const envCell = Number(ex.temen_par_alloc(ex.temen_wasmjit_env_bytes()));
     new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true); // ample fuel
-    const args = new Array(Number(ex.svm_par_inst_nparams(entry))).fill(0n); // cap handles, ignored
+    const args = new Array(Number(ex.temen_par_inst_nparams(entry))).fill(0n); // cap handles, ignored
     if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // count emitted children (non-vacuity)
     try {
       const ret = uinst.exports['f' + entry](win, envCell, ...args);
@@ -268,16 +268,16 @@ self.onmessage = async (e) => {
   }
 
   const v = role === 'root'
-    ? ex.svm_par_root(prog, win, winSize, func)
+    ? ex.temen_par_root(prog, win, winSize, func)
     : role === 'confined'
-      ? ex.svm_par_child_confined(prog, win, slog, smod, entry, BigInt(fuel))
-      : ex.svm_par_child(prog, win, winSize, smod | 0, func, BigInt(sp), BigInt(arg));
+      ? ex.temen_par_child_confined(prog, win, slog, smod, entry, BigInt(fuel))
+      : ex.temen_par_child(prog, win, winSize, smod | 0, func, BigInt(sp), BigInt(arg));
   if (v === 0) { self.postMessage({ kind: 'fail', why: 'vcpu build failed' }); return; }
 
   const handles = []; // local spawn handle (index) → child completion slot ptr
 
   for (;;) {
-    // I22 hang site. A host wasm trap escaping `svm_par_run` — `memory access out of bounds`, or
+    // I22 hang site. A host wasm trap escaping `temen_par_run` — `memory access out of bounds`, or
     // `unreachable` from a panic=abort engine panic — unwinds into this async `onmessage`, rejecting
     // it. A Worker's unhandled rejection does NOT fire `Worker.onerror` on the page, so par.js's
     // promise would never settle: the vCPU's DOM item would sit `pending` until the harness's 30s
@@ -286,7 +286,7 @@ self.onmessage = async (e) => {
     // cascade-hang, then report `fail` with the trap text so the page/harness self-identifies.
     let evc;
     try {
-      evc = ex.svm_par_run(v);
+      evc = ex.temen_par_run(v);
     } catch (err) {
       if (role !== 'root') {
         const iv = new Int32Array(memory.buffer);
@@ -297,41 +297,41 @@ self.onmessage = async (e) => {
       // If the trap was a panic=abort engine panic (surfaces as `unreachable`), the Rust panic hook
       // stashed FILE:LINE + message; the trap left memory intact, so read it back here (I22 (a)).
       try {
-        const plen = ex.svm_par_last_panic_len ? ex.svm_par_last_panic_len() : 0;
+        const plen = ex.temen_par_last_panic_len ? ex.temen_par_last_panic_len() : 0;
         if (plen > 0) {
-          const p = Number(ex.svm_par_last_panic_ptr());
+          const p = Number(ex.temen_par_last_panic_ptr());
           why += ` | panic: ${new TextDecoder().decode(new Uint8Array(memory.buffer).slice(p, p + plen))}`;
         }
       } catch { /* accessor absent (older build) or read failed — the trap text alone still ships */ }
       self.postMessage({ kind: 'fail', why });
-      return; // don't svm_par_free(v): the instance just trapped; the page terminates this Worker
+      return; // don't temen_par_free(v): the instance just trapped; the page terminates this Worker
     }
     if (evc === DONE) {
-      const value = ex.svm_par_ev_a(v); // i64 → BigInt
+      const value = ex.temen_par_ev_a(v); // i64 → BigInt
       i64()[(slot + 8) >> 3] = value; // publish result...
       Atomics.store(i32(), slot >> 2, 1); // ...set done flag...
       Atomics.notify(i32(), slot >> 2); // ...and wake a joiner
       if (role === 'root') self.postMessage({ kind: 'done', value: value.toString() });
-      ex.svm_par_free(v);
+      ex.temen_par_free(v);
       return;
     }
     if (evc === TRAP) {
       Atomics.store(i32(), slot >> 2, 2); // 2 = trapped
       Atomics.notify(i32(), slot >> 2);
       if (role === 'root') self.postMessage({ kind: 'trap' });
-      ex.svm_par_free(v);
+      ex.temen_par_free(v);
       return;
     }
     if (evc === SPAWN) {
       // ev_a packs (spawning frame's module << 32) | func, as the INSTANTIATE event does — the
       // child resolves `func` in that module (an installed §22 unit spawns its own functions).
-      const cam = ex.svm_par_ev_a(v);
+      const cam = ex.temen_par_ev_a(v);
       const csmod = Number(cam >> 32n), cfunc = Number(BigInt.asUintN(32, cam));
-      const csp = ex.svm_par_ev_b(v), carg = ex.svm_par_ev_c(v);
+      const csp = ex.temen_par_ev_b(v), carg = ex.temen_par_ev_c(v);
       // Allocate the child's completion slot + stack + TLS, then ask the page to start its Worker.
-      const cslot = ex.svm_par_alloc(SLOT);
-      const cstackTop = ex.svm_par_alloc(STACK) + STACK;
-      const ctlsBase = tlsSize > 0 ? roundUp(ex.svm_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
+      const cslot = ex.temen_par_alloc(SLOT);
+      const cstackTop = ex.temen_par_alloc(STACK) + STACK;
+      const ctlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
       self.postMessage({
         kind: 'spawn', smod: csmod, func: cfunc, sp: csp.toString(), arg: carg.toString(),
         win, winSize,
@@ -339,28 +339,28 @@ self.onmessage = async (e) => {
       });
       const handle = handles.length;
       handles.push(cslot);
-      ex.svm_par_deliver_handle(v, handle);
+      ex.temen_par_deliver_handle(v, handle);
       continue;
     }
     if (evc === JOIN) {
-      const cslot = handles[Number(ex.svm_par_ev_a(v))];
-      if (cslot === undefined) { ex.svm_par_deliver_join(v, 0n, 1); continue; } // bad handle → trap, never wait(0)
+      const cslot = handles[Number(ex.temen_par_ev_a(v))];
+      if (cslot === undefined) { ex.temen_par_deliver_join(v, 0n, 1); continue; } // bad handle → trap, never wait(0)
       Atomics.wait(i32(), cslot >> 2, 0); // block until the child sets its done flag
       const trapped = Atomics.load(i32(), cslot >> 2) === 2;
-      ex.svm_par_deliver_join(v, i64()[(cslot + 8) >> 3], trapped ? 1 : 0);
+      ex.temen_par_deliver_join(v, i64()[(cslot + 8) >> 3], trapped ? 1 : 0);
       continue;
     }
     if (evc === INSTANTIATE) {
       // §14 confined executor child (THREADS.md 4c-domain §14-D2): the engine already validated the
       // carve + built everything authority-bearing; the operands are inert integers we shuttle into
       // a new Worker (whose window IS the carve), joined via the same completion-slot protocol.
-      const am = ex.svm_par_ev_a(v); // (module << 32) | entry
+      const am = ex.temen_par_ev_a(v); // (module << 32) | entry
       const csmod = Number(am >> 32n), centry = Number(BigInt.asUintN(32, am));
-      const carve = Number(ex.svm_par_ev_b(v)), cslog = Number(ex.svm_par_ev_c(v));
-      const cfuel = ex.svm_par_ev_d(v); // i64 → BigInt, shuttled verbatim
-      const cslot = ex.svm_par_alloc(SLOT);
-      const cstackTop = ex.svm_par_alloc(STACK) + STACK;
-      const ctlsBase = tlsSize > 0 ? roundUp(ex.svm_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
+      const carve = Number(ex.temen_par_ev_b(v)), cslog = Number(ex.temen_par_ev_c(v));
+      const cfuel = ex.temen_par_ev_d(v); // i64 → BigInt, shuttled verbatim
+      const cslot = ex.temen_par_alloc(SLOT);
+      const cstackTop = ex.temen_par_alloc(STACK) + STACK;
+      const ctlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
       self.postMessage({
         kind: 'spawn', role: 'confined', smod: csmod, entry: centry, slog: cslog,
         fuel: cfuel.toString(), win: win + carve, winSize: 1 << cslog,
@@ -368,51 +368,51 @@ self.onmessage = async (e) => {
       });
       const handle = handles.length;
       handles.push(cslot);
-      ex.svm_par_deliver_handle(v, handle);
+      ex.temen_par_deliver_handle(v, handle);
       continue;
     }
     if (evc === WAIT) {
-      const addr = Number(ex.svm_par_ev_a(v));
-      const expected = Number(BigInt.asIntN(32, ex.svm_par_ev_b(v)));
-      const timeoutNs = ex.svm_par_ev_d(v);
+      const addr = Number(ex.temen_par_ev_a(v));
+      const expected = Number(BigInt.asIntN(32, ex.temen_par_ev_b(v)));
+      const timeoutNs = ex.temen_par_ev_d(v);
       const ms = timeoutNs <= 0n ? Infinity : Number(timeoutNs) / 1e6;
       const r = Atomics.wait(i32(), (win + addr) >> 2, expected, ms); // 'ok' | 'not-equal' | 'timed-out'
-      ex.svm_par_deliver_code(v, r === 'ok' ? 0 : r === 'not-equal' ? 1 : 2);
+      ex.temen_par_deliver_code(v, r === 'ok' ? 0 : r === 'not-equal' ? 1 : 2);
       continue;
     }
     if (evc === NOTIFY) {
-      const addr = Number(ex.svm_par_ev_a(v)), count = Number(ex.svm_par_ev_b(v));
-      ex.svm_par_deliver_code(v, Atomics.notify(i32(), (win + addr) >> 2, count));
+      const addr = Number(ex.temen_par_ev_a(v)), count = Number(ex.temen_par_ev_b(v));
+      ex.temen_par_deliver_code(v, Atomics.notify(i32(), (win + addr) >> 2, count));
       continue;
     }
     if (evc === TIERUP) {
       // Run the emitted `f{func}(win, env, ...i64 args)` over the shared window instead of
-      // interpreting. A trap throws (SVM fault → `env.trap` + `unreachable`, or a wasm trap) — we
+      // interpreting. A trap throws (Temen fault → `env.trap` + `unreachable`, or a wasm trap) — we
       // surface it as a vCPU trap. Otherwise marshal the i64 result slots back to the engine.
-      const func = Number(ex.svm_par_ev_a(v));
-      const argvPtr = Number(ex.svm_par_tierup_argv_ptr(v)), n = Number(ex.svm_par_tierup_argv_len(v));
+      const func = Number(ex.temen_par_ev_a(v));
+      const argvPtr = Number(ex.temen_par_tierup_argv_ptr(v)), n = Number(ex.temen_par_tierup_argv_len(v));
       const args = [];
       for (let i = 0; i < n; i++) args.push(i64()[(argvPtr >> 3) + i]); // i64 args → BigInt
       // #717 host sync: the event's committed-extent snapshot → the emitted `"mapped"` global, so
       // the emitted bounds check admits exactly what the interpreter would (idempotent over today's
       // fully-mapped par window; load-bearing once the window can `vm_map`-grow). On a #750 paged
       // run, operand b is the page-state table's COVERAGE (the engine computes it with the table).
-      emitted.mapped.value = ex.svm_par_ev_b(v);
+      emitted.mapped.value = ex.temen_par_ev_b(v);
       // #750 paged runs: point the emitted `"pagestate"` global at the engine-built table — its
       // Rust-heap address is a linear-memory address (one shared memory, zero copies). Empty (and
       // the global absent) on unpaged runs.
-      if (Number(ex.svm_par_tierup_pagestate_len(v)) > 0)
-        emitted.pagestate.value = Number(ex.svm_par_tierup_pagestate_ptr(v));
+      if (Number(ex.temen_par_tierup_pagestate_len(v)) > 0)
+        emitted.pagestate.value = Number(ex.temen_par_tierup_pagestate_ptr(v));
       new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true); // ample fuel; preempt = write < 0
       if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // count tier-ups (non-vacuity)
       try {
         const ret = emitted['f' + func](win, envCell, ...args);
         const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
-        const rptr = Number(ex.svm_par_alloc(Math.max(1, rets.length) * 8));
+        const rptr = Number(ex.temen_par_alloc(Math.max(1, rets.length) * 8));
         for (let i = 0; i < rets.length; i++) i64()[(rptr >> 3) + i] = BigInt(rets[i]);
-        ex.svm_par_deliver_tierup(v, rptr, rets.length);
+        ex.temen_par_deliver_tierup(v, rptr, rets.length);
       } catch {
-        ex.svm_par_deliver_tierup_trap(v);
+        ex.temen_par_deliver_tierup_trap(v);
       }
       continue;
     }
@@ -422,8 +422,8 @@ self.onmessage = async (e) => {
       // result slots. Args marshal by declared type (i32 → JS Number, i64 → BigInt) so a unit need not
       // be all-i64; results go back as `BigInt(ret)` (the engine re-tags by result type). A trap
       // throws and surfaces as a vCPU trap (as an interp invoke would).
-      const argvPtr = Number(ex.svm_par_jit_argv_ptr(v)), n = Number(ex.svm_par_jit_argv_len(v));
-      const ptypes = new Uint8Array(memory.buffer, Number(ex.svm_par_jit_param_types_ptr(v)), n);
+      const argvPtr = Number(ex.temen_par_jit_argv_ptr(v)), n = Number(ex.temen_par_jit_argv_len(v));
+      const ptypes = new Uint8Array(memory.buffer, Number(ex.temen_par_jit_param_types_ptr(v)), n);
       const args = [];
       for (let i = 0; i < n; i++) args.push(jitArg(i64()[(argvPtr >> 3) + i], ptypes[i]));
       new DataView(memory.buffer).setBigInt64(jitEnvCell, 1n << 61n, true); // ample fuel
@@ -434,27 +434,27 @@ self.onmessage = async (e) => {
       let unit = jitUnit;
       if (jitB2) {
         jitSyncTable();
-        unit = jitUnitFor(ex.svm_par_jit_code(v));
+        unit = jitUnitFor(ex.temen_par_jit_code(v));
       } else if (!unit) {
         // Runtime-`Jit.compile` path without B2: resolve the invoked unit by its code handle (each
         // Worker instantiates + caches per handle; the emitted bytes live on the shared host).
-        unit = jitUnitFor(ex.svm_par_jit_code(v));
+        unit = jitUnitFor(ex.temen_par_jit_code(v));
       }
-      if (!unit) { ex.svm_par_deliver_jit_invoke_trap(v); continue; }
+      if (!unit) { ex.temen_par_deliver_jit_invoke_trap(v); continue; }
       // #717 host sync: the event's committed-extent snapshot → the unit instance's `"mapped"`
       // global (same contract as TIERUP above; an invoke the scalar can't describe never surfaces
       // here — the engine services it on the interpreter instead).
-      unit.mapped.value = ex.svm_par_ev_b(v);
+      unit.mapped.value = ex.temen_par_ev_b(v);
       try {
         const ret = unit['f0'](win, jitEnvCell, ...args);
         const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
-        const rn = Number(ex.svm_par_jit_result_types_len(v));
-        const rtypes = new Uint8Array(memory.buffer, Number(ex.svm_par_jit_result_types_ptr(v)), rn);
-        const rptr = Number(ex.svm_par_alloc(Math.max(1, rets.length) * 8));
+        const rn = Number(ex.temen_par_jit_result_types_len(v));
+        const rtypes = new Uint8Array(memory.buffer, Number(ex.temen_par_jit_result_types_ptr(v)), rn);
+        const rptr = Number(ex.temen_par_alloc(Math.max(1, rets.length) * 8));
         for (let i = 0; i < rets.length; i++) i64()[(rptr >> 3) + i] = jitRes(rets[i], rtypes[i]);
-        ex.svm_par_deliver_jit_invoke(v, rptr, rets.length);
+        ex.temen_par_deliver_jit_invoke(v, rptr, rets.length);
       } catch {
-        ex.svm_par_deliver_jit_invoke_trap(v);
+        ex.temen_par_deliver_jit_invoke_trap(v);
       }
       continue;
     }
@@ -472,9 +472,9 @@ self.onmessage = async (e) => {
     } catch { /* memory unusable — nothing more we can do */ }
     let why = `vcpu ${role} setup/host trap: ${err && err.message ? err.message : err}`;
     try {
-      const plen = ex && ex.svm_par_last_panic_len ? ex.svm_par_last_panic_len() : 0;
+      const plen = ex && ex.temen_par_last_panic_len ? ex.temen_par_last_panic_len() : 0;
       if (plen > 0) {
-        const p = Number(ex.svm_par_last_panic_ptr());
+        const p = Number(ex.temen_par_last_panic_ptr());
         why += ` | panic: ${new TextDecoder().decode(new Uint8Array(memory.buffer).slice(p, p + plen))}`;
       }
     } catch { /* accessor absent or memory unusable — the trap text alone still ships */ }

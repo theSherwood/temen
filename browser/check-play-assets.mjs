@@ -36,28 +36,28 @@ const ASSETS_REL = 'browser/web/assets';
 // committed, or no longer referenced by play.js, is flagged. Committed assets do NOT belong here —
 // they pass the PR gate by being git-tracked.
 const BUILT_AT_DEPLOY = new Set([
-  'gpu_shader.svmb',      // build-onramp-assets.mjs
-  'doom.svmb',            // build-onramp-assets.mjs (id's DOOM source is fetched-and-built)
+  'gpu_shader.temen',      // build-onramp-assets.mjs
+  'doom.temen',            // build-onramp-assets.mjs (id's DOOM source is fetched-and-built)
   'doom1.wad',            // build-onramp-assets.mjs — staged from the vendored demos/doom/doom1.wad
-  'sqlite_repl.svmb',     // build-onramp-assets.mjs (fetches SQLite amalgamation)
-  'shell.svmb',           // build-onramp-assets.mjs (copies the committed tests/fixtures/shell.svmb)
-  'stage_runner.svmb',    // build-onramp-assets.mjs (the shell's __stage ring-filter runner)
-  'primes.svmb',          // build-onramp-assets.mjs (the shell's `primes` external command)
-  'upper.svmb',           // build-onramp-assets.mjs (the shell's `upper` stdin-filter command)
-  'tcl_snapshot.svmb',    // build-onramp-assets.mjs (fetches Tcl + openlibm; two-phase warm Tcl_Init driver)
-  'postgres_resolved.svmb', // build-pg-assets.mjs
+  'sqlite_repl.temen',     // build-onramp-assets.mjs (fetches SQLite amalgamation)
+  'shell.temen',           // build-onramp-assets.mjs (copies the committed tests/fixtures/shell.temen)
+  'stage_runner.temen',    // build-onramp-assets.mjs (the shell's __stage ring-filter runner)
+  'primes.temen',          // build-onramp-assets.mjs (the shell's `primes` external command)
+  'upper.temen',           // build-onramp-assets.mjs (the shell's `upper` stdin-filter command)
+  'tcl_snapshot.temen',    // build-onramp-assets.mjs (fetches Tcl + openlibm; two-phase warm Tcl_Init driver)
+  'postgres_resolved.temen', // build-pg-assets.mjs
   'pgdata.img',           // build-pg-assets.mjs
   'chibicc_selfhost.img', // build-selfhost-assets.mjs (chibicc's own TU sources + their glibc header closure)
 ]);
 
-// The subset of deploy-built assets allowed to be absent even in the assembled site. Only doom.svmb:
+// The subset of deploy-built assets allowed to be absent even in the assembled site. Only doom.temen:
 // its module build fetches id Software's DOOM source and needs the toolchain, so it can legitimately
 // be skipped (the card degrades to a build hint). The WAD it pairs with is NOT here — doom1.wad is
 // vendored in-tree (demos/doom/doom1.wad) and staged unconditionally, so it is always reachable
 // (retiring the dead-mirror class, ISSUES.md I42/I43). Every other referenced asset MUST be present.
 const MAY_BE_ABSENT = new Set([
-  'doom.svmb',
-  'tcl_snapshot.svmb', // build fetches Tcl (SourceForge) + openlibm (GitHub) + needs clang/llvm-link — the warm Tcl card degrades to a hint if absent
+  'doom.temen',
+  'tcl_snapshot.temen', // build fetches Tcl (SourceForge) + openlibm (GitHub) + needs clang/llvm-link — the warm Tcl card degrades to a hint if absent
   'chibicc_selfhost.img', // build-selfhost-assets.mjs needs a native chibicc + the glibc header tree
 ]);
 

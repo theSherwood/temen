@@ -1,6 +1,6 @@
 //! **chibicc single-shot wasm-JIT differential** — the fs+argv twin of `jit_module.rs`. The
-//! playground C-compiler card runs `chibicc.svmb` (whose whole program is `_start` = func 0) to emit
-//! SVM-IR text; this test emits that `_start` as wasm and runs `f0(win, env)` once on `wasmi`
+//! playground C-compiler card runs `chibicc.temen` (whose whole program is `_start` = func 0) to emit
+//! TEMEN-IR text; this test emits that `_start` as wasm and runs `f0(win, env)` once on `wasmi`
 //! (playing the browser's JS host), with chibicc's `fopen`/`read`/`write`/`exit` bouncing to the
 //! interpreter over the shared window through `env.call_interp` (so the seeded memfs `/in.c` +
 //! `/include/*.h` and the powerbox `write` resolve). The emitted IR must be **byte-identical** to the
@@ -8,22 +8,22 @@
 //! `chibicc_printf.rs`) — the JIT correctness contract for the compiler tier. Then it parses + runs the
 //! emitted IR and checks the program's own stdout, so the whole card pipeline is covered on the JIT.
 //!
-//! Fail-soft: `chibicc.svmb` is a code-coupled asset CI regenerates; absent, the test SKIPs.
+//! Fail-soft: `chibicc.temen` is a code-coupled asset CI regenerates; absent, the test SKIPs.
 
-use svm_browser::{
+use temen_browser::{
     onramp_exec, onramp_fs_exec, playground_include_files, JitOnrampRun, STATUS_EXIT, STATUS_OK,
 };
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
-const WIN_LOG2: u8 = 25; // 32 MiB — chibicc.svmb declares size_log2=25; the emitted run can't grow it
+const WIN_LOG2: u8 = 25; // 32 MiB — chibicc.temen declares size_log2=25; the emitted run can't grow it
 const WIN_SIZE: u64 = 1 << WIN_LOG2;
 const WIN_BASE: u32 = 0x1_0000; // window starts at 64 KiB (the env cell lives below it)
 const ENV_PTR: u32 = 1024;
 
-fn chibicc_svmb() -> Option<svm_ir::Module> {
-    let p = concat!(env!("CARGO_MANIFEST_DIR"), "/web/assets/chibicc.svmb");
+fn chibicc_temen() -> Option<temen_ir::Module> {
+    let p = concat!(env!("CARGO_MANIFEST_DIR"), "/web/assets/chibicc.temen");
     let bytes = std::fs::read(p).ok()?;
-    Some(svm_encode::decode_module(&bytes).expect("decode chibicc.svmb"))
+    Some(temen_encode::decode_module(&bytes).expect("decode chibicc.temen"))
 }
 
 /// The memfs the card seeds: built-in headers under `include/` + the user's source at `in.c`.
@@ -31,15 +31,15 @@ fn card_image(src: &str) -> Vec<u8> {
     let mut files: Vec<(String, Vec<u8>)> = playground_include_files();
     files.push(("in.c".to_string(), src.as_bytes().to_vec()));
     let dirs = vec!["include".to_string()];
-    svm_fs::encode_image(&files, &dirs)
+    temen_fs::encode_image(&files, &dirs)
 }
 
 /// The card's argv (mirrors `chibicc_printf.rs` + the shipped browser card).
 const ARGV: [&[u8]; 5] = [b"chibicc", b"--data-page", b"65536", b"-g0", b"/in.c"];
 
 /// Compile `src` with chibicc on the **wasm-JIT** (emitted `f0` on `wasmi`, cross-tier helpers on the
-/// interpreter over the shared window). Returns the emitted SVM-IR text (chibicc's stdout).
-fn jit_compile(chibicc: &svm_ir::Module, src: &str) -> String {
+/// interpreter over the shared window). Returns the emitted TEMEN-IR text (chibicc's stdout).
+fn jit_compile(chibicc: &temen_ir::Module, src: &str) -> String {
     let image = card_image(src);
     let engine = Engine::default();
     let pages = ((WIN_BASE as u64 + WIN_SIZE) / (64 * 1024)) as u32;
@@ -69,7 +69,7 @@ fn jit_compile(chibicc: &svm_ir::Module, src: &str) -> String {
     .expect("chibicc emittable as a single-shot JIT run");
 
     let emitted_wasm = run.emitted_wasm().to_vec();
-    let rtys: Vec<svm_ir::ValType> = run.func_sig(0).1.to_vec();
+    let rtys: Vec<temen_ir::ValType> = run.func_sig(0).1.to_vec();
     let module = WModule::new(&engine, &emitted_wasm).unwrap_or_else(|e| {
         panic!(
             "emitted _start ({} B) failed to validate: {e}",
@@ -96,7 +96,7 @@ fn jit_compile(chibicc: &svm_ir::Module, src: &str) -> String {
                     let (p, rs) = r.func_sig(func as u32);
                     (p.to_vec(), rs.to_vec())
                 };
-                let args: Vec<svm_interp::Value> = {
+                let args: Vec<temen_interp::Value> = {
                     let data = memory.data(&caller);
                     params
                         .iter()
@@ -105,8 +105,8 @@ fn jit_compile(chibicc: &svm_ir::Module, src: &str) -> String {
                             let o = args_ptr as usize + i * 8;
                             let raw = u64::from_le_bytes(data[o..o + 8].try_into().unwrap());
                             match t {
-                                svm_ir::ValType::I32 => svm_interp::Value::I32(raw as i32),
-                                _ => svm_interp::Value::I64(raw as i64),
+                                temen_ir::ValType::I32 => temen_interp::Value::I32(raw as i32),
+                                _ => temen_interp::Value::I64(raw as i64),
                             }
                         })
                         .collect()
@@ -124,8 +124,8 @@ fn jit_compile(chibicc: &svm_ir::Module, src: &str) -> String {
                                 break;
                             }
                             let raw = match v {
-                                svm_interp::Value::I32(x) => *x as u32 as u64,
-                                svm_interp::Value::I64(x) => *x as u64,
+                                temen_interp::Value::I32(x) => *x as u32 as u64,
+                                temen_interp::Value::I64(x) => *x as u64,
                                 _ => 0,
                             };
                             let o = args_ptr as usize + i * 8;
@@ -159,7 +159,7 @@ fn jit_compile(chibicc: &svm_ir::Module, src: &str) -> String {
     let mut results: Vec<Val> = rtys
         .iter()
         .map(|t| match t {
-            svm_ir::ValType::I32 => Val::I32(0),
+            temen_ir::ValType::I32 => Val::I32(0),
             _ => Val::I64(0),
         })
         .collect();
@@ -185,8 +185,8 @@ fn jit_compile(chibicc: &svm_ir::Module, src: &str) -> String {
     String::from_utf8(run.stdout().to_vec()).expect("emitted IR is utf8")
 }
 
-/// Compile `src` on the **interpreter** (the oracle), returning the emitted SVM-IR text.
-fn interp_compile(chibicc: &svm_ir::Module, src: &str) -> String {
+/// Compile `src` on the **interpreter** (the oracle), returning the emitted TEMEN-IR text.
+fn interp_compile(chibicc: &temen_ir::Module, src: &str) -> String {
     let image = card_image(src);
     let out = onramp_fs_exec(chibicc, &image, &ARGV, b"");
     assert!(
@@ -199,8 +199,8 @@ fn interp_compile(chibicc: &svm_ir::Module, src: &str) -> String {
 
 #[test]
 fn chibicc_jit_emits_identical_ir_and_runs() {
-    let Some(chibicc) = chibicc_svmb() else {
-        eprintln!("SKIP: browser/web/assets/chibicc.svmb absent (run build-onramp-assets.mjs)");
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: browser/web/assets/chibicc.temen absent (run build-onramp-assets.mjs)");
         return;
     };
 
@@ -218,7 +218,7 @@ int main(void) {
     let interp_ir = interp_compile(&chibicc, src);
     assert!(
         jit_ir.contains("func"),
-        "expected SVM IR, got: {jit_ir:.200}"
+        "expected Temen IR, got: {jit_ir:.200}"
     );
     assert_eq!(
         jit_ir, interp_ir,
@@ -226,7 +226,7 @@ int main(void) {
     );
 
     // 2. The whole card pipeline on the JIT: parse the emitted IR + run it, check the program's stdout.
-    let m = svm_text::parse_module(&jit_ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"));
+    let m = temen_text::parse_module(&jit_ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"));
     let run = onramp_exec(&m, b"");
     assert_eq!(run.status, STATUS_OK, "compiled program run status");
     assert_eq!(

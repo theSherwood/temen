@@ -1,6 +1,6 @@
 //! Approach-A (bounded-target dynamic `call_indirect`) ROI across **all four backends**:
-//! tree-walk interpreter, bytecode interpreter, Cranelift `svm-jit`, and `svm-wasm-jit` (its emitted
-//! wasm run on Wasmtime — same Cranelift engine family as svm-jit).
+//! tree-walk interpreter, bytecode interpreter, Cranelift `temen-jit`, and `temen-wasm-jit` (its emitted
+//! wasm run on Wasmtime — same Cranelift engine family as temen-jit).
 //!
 //! A loop dispatches, each iteration, through a data-dependent `call_indirect` to one of four
 //! handlers — the shape A targets. Without A the specializer declines the whole function
@@ -13,15 +13,15 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use svm_interp::{Trap, Value};
-use svm_ir::{
+use temen_interp::{Trap, Value};
+use temen_ir::{
     BinOp, Block, ConvOp, Func, FuncType, Inst, IntTy, Module, Terminator, ValType,
     DEFAULT_RESERVED_LOG2,
 };
-use svm_jit::{CompiledModule, JitOutcome, Quota, INERT_CAP_THUNK};
-use svm_peval::{specialize_with_config, SpecArg, SpecConfig};
+use temen_jit::{CompiledModule, JitOutcome, Quota, INERT_CAP_THUNK};
+use temen_peval::{specialize_with_config, SpecArg, SpecConfig};
 
-// The svm-wasm-jit env ABI (mirrors crates/svm-wasm-jit/tests/differential.rs).
+// The temen-wasm-jit env ABI (mirrors crates/temen-wasm-jit/tests/differential.rs).
 const WIN_BASE: u32 = 0x1_0000;
 const ENV_PTR: u32 = 1024;
 
@@ -72,7 +72,7 @@ fn dispatch_loop_module() -> Module {
                     Inst::ConstI64(0),
                     Inst::IntCmp {
                         ty: IntTy::I64,
-                        op: svm_ir::CmpOp::GtS,
+                        op: temen_ir::CmpOp::GtS,
                         a: 1,
                         b: 2,
                     },
@@ -156,12 +156,12 @@ fn dispatch_loop_module() -> Module {
 
 fn tree_walk(m: &Module, n: i64) -> i64 {
     let mut fuel = u64::MAX;
-    one(svm_interp::run(m, 0, &[Value::I64(n)], &mut fuel))
+    one(temen_interp::run(m, 0, &[Value::I64(n)], &mut fuel))
 }
 
 fn bytecode(m: &Module, n: i64) -> i64 {
     let mut fuel = u64::MAX;
-    match svm_interp::bytecode::compile_and_run(m, 0, &[Value::I64(n)], &mut fuel) {
+    match temen_interp::bytecode::compile_and_run(m, 0, &[Value::I64(n)], &mut fuel) {
         Some(r) => one(r),
         None => panic!("bytecode declined the module (out of subset)"),
     }
@@ -202,10 +202,10 @@ fn jit_run(cm: &mut CompiledModule, n: i64) -> i64 {
     }
 }
 
-/// Compile `m` with the svm-wasm-jit emitter and run `f0` on Wasmtime with the confined-window ABI.
+/// Compile `m` with the temen-wasm-jit emitter and run `f0` on Wasmtime with the confined-window ABI.
 fn wasmjit_prepare(m: &Module) -> (wasmtime::Store<i32>, wasmtime::Instance) {
     use wasmtime::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store};
-    let wasm = svm_wasm_jit::compile_module(m).expect("wasm-jit emit");
+    let wasm = temen_wasm_jit::compile_module(m).expect("wasm-jit emit");
     let engine = Engine::default();
     let module = WModule::new(&engine, &wasm).expect("emitted wasm validates");
     let mut store: Store<i32> = Store::new(&engine, 0);
@@ -267,7 +267,7 @@ fn best_of(reps: usize, mut f: impl FnMut() -> i64) -> Duration {
 
 fn main() {
     let m = dispatch_loop_module();
-    svm_verify::verify_module(&m).expect("interpreter verifies");
+    temen_verify::verify_module(&m).expect("interpreter verifies");
 
     assert!(
         specialize_with_config(&m, 0, &[SpecArg::Dynamic], &SpecConfig::default()).is_err(),
@@ -279,8 +279,8 @@ fn main() {
     };
     let raw = specialize_with_config(&m, 0, &[SpecArg::Dynamic], &cfg).expect("A specializes");
     // Ship-shape: the residual is what you'd emit, so run the CFG cleanup the pipeline applies.
-    let residual = svm_peval::optimize_module(&raw);
-    svm_verify::verify_module(&residual).expect("residual verifies");
+    let residual = temen_peval::optimize_module(&raw);
+    temen_verify::verify_module(&residual).expect("residual verifies");
 
     // Correctness: every backend, base and residual, agrees with the tree-walk oracle.
     for n in [0i64, 1, 7, 64, 1000] {
@@ -293,8 +293,8 @@ fn main() {
             ("bytecode/base", bytecode(&m, n)),
             ("bytecode/res", bytecode(&residual, n)),
             ("treewalk/res", tree_walk(&residual, n)),
-            ("svmjit/base", jit_run(&mut cmb, n)),
-            ("svmjit/res", jit_run(&mut cmr, n)),
+            ("temenjit/base", jit_run(&mut cmb, n)),
+            ("temenjit/res", jit_run(&mut cmr, n)),
             ("wasmjit/base", wasmjit_run(&mut sb, &ib, n)),
             ("wasmjit/res", wasmjit_run(&mut sr, &ir, n)),
         ] {
@@ -322,12 +322,12 @@ fn main() {
             best_of(reps, || bytecode(&residual, n)),
         ),
         (
-            "svm-jit     ",
+            "temen-jit     ",
             best_of(reps, || jit_run(&mut cmb, n)),
             best_of(reps, || jit_run(&mut cmr, n)),
         ),
         (
-            "svm-wasm-jit",
+            "temen-wasm-jit",
             best_of(reps, || wasmjit_run(&mut sb, &ib, n)),
             best_of(reps, || wasmjit_run(&mut sr, &ir, n)),
         ),

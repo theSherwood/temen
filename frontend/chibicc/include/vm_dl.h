@@ -1,7 +1,7 @@
 #ifndef VM_DL_H
 #define VM_DL_H
 // In-guest dynamic-linking loader — `vm_dlopen`/`vm_dlsym`/`vm_dlclose` over the `Jit` capability
-// (DESIGN.md §22). A "shared object" is serialized SVM IR; a symbol is an installed `call_indirect`
+// (DESIGN.md §22). A "shared object" is serialized Temen IR; a symbol is an installed `call_indirect`
 // slot (an **unforgeable funcref**, §3c-checked at the call). This header is the ergonomic layer over
 // the raw `__vm_jit_compile_linked` / `__vm_jit_install` primitives: it keeps a `name → slot` registry
 // and marshals it into the symbol-table buffer the host resolves against, so a loaded unit can
@@ -12,7 +12,7 @@
 // escape — worst case it corrupts its own window), loading is capability-gated (you need the `Jit`
 // handle, and the IR arrives through the powerbox — no ambient "load any file"), and `dlsym` yields a
 // checked funcref slot, not a raw pointer.
-#include <svm.h>
+#include <temen.h>
 
 #ifndef VM_DL_MAX
 #define VM_DL_MAX 64 // max simultaneously-loaded symbols
@@ -85,7 +85,7 @@ static long vm_dlsym(const char *name) {
   return -1;
 }
 
-// `vm_dlopen(name, ir, ir_len)`: load a unit (serialized SVM IR) that may import already-loaded
+// `vm_dlopen(name, ir, ir_len)`: load a unit (serialized Temen IR) that may import already-loaded
 // symbols **by name**. Resolve its imports against the registry, compile (the host re-verifies),
 // install it into the shared table, and register it under `name`. Returns the slot (>= 0), or a
 // negative errno (-22 link/verify failed, -28 table full, -12 registry full). Idempotent names are

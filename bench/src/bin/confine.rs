@@ -1,22 +1,22 @@
 //! **Confinement-cost perf harness** — a cross-engine table on confinement-dense kernels, the
 //! reliable/tracked instrument for the "close the gap to Wasmtime" work (DESIGN.md §1a).
 //!
-//! Motivation: the embench differential (`crates/svm-llvm/examples/embench.rs`) shows the gap on
+//! Motivation: the embench differential (`crates/temen-llvm/examples/embench.rs`) shows the gap on
 //! array/memory-dense kernels (matmult/edn/picojpeg), but it needs an external Embench checkout and
 //! is single-pass in CI — too noisy to tell a real 1.1× from a 1.3×. This driver is **self-contained**
 //! (kernels vendored under `bench/confine/kernels/`) and **best-of-N**, so it runs locally and in CI
-//! and gives stable per-kernel ratios. The headline is **svm-jit ÷ Wasmtime-w64** (the tracked
+//! and gives stable per-kernel ratios. The headline is **temen-jit ÷ Wasmtime-w64** (the tracked
 //! baseline gate); the other columns mirror embench's cross-engine set.
 //!
 //! Columns (each engine as ×native, like embench):
 //!   native   `clang -O2 -march=native` — the oracle, self-timed (per-iter ns via large/small subtraction)
-//!   svm-jit  production LLVM on-ramp (`clang -O2 -emit-llvm` → `svm_llvm` → `svm_jit`), in-process
-//!   svm-bc   the bytecode interpreter (`svm_interp::bytecode`), in-process — the same IR, tree-executed
+//!   temen-jit  production LLVM on-ramp (`clang -O2 -emit-llvm` → `temen_llvm` → `temen_jit`), in-process
+//!   temen-bc   the bytecode interpreter (`temen_interp::bytecode`), in-process — the same IR, tree-executed
 //!   v8/w32   `clang --target=wasm32` on V8 (Node), self-timed via `bench/embench/wasm/run.mjs`
 //!   v8/w64   `clang --target=wasm64` (memory64) on V8 (Node)
 //!   wt/w32   `clang --target=wasm32` on in-process Wasmtime (Cranelift)
 //!   wt/w64   `clang --target=wasm64` (memory64) on in-process Wasmtime — the same widths + backend as
-//!            svm-jit, so **svm÷wt64** is the honest Cranelift-vs-Cranelift, same-LP64-widths comparison.
+//!            temen-jit, so **temen÷wt64** is the honest Cranelift-vs-Cranelift, same-LP64-widths comparison.
 //!
 //! Every lane isolates per-iteration compute by the large/small-`n` subtraction `(t(large) − t(small))
 //! / Δn`, taken as the **min over reps** (the noise floor), and every engine's `run(small)` is
@@ -27,15 +27,15 @@
 //!
 //! Run from `bench/`:
 //!   cargo run --release --bin confine                    # human table
-//!   cargo run --release --bin confine -- --csv           # machine-readable: kernel,svm_ns,wt64_ns,ratio
+//!   cargo run --release --bin confine -- --csv           # machine-readable: kernel,temen_ns,wt64_ns,ratio
 //!   cargo run --release --bin confine -- --save baseline # write bench/confine/baseline.txt
-//!   cargo run --release --bin confine -- --check baseline --tol 0.15   # exit 1 if svm÷wt64 regressed >tol
+//!   cargo run --release --bin confine -- --check baseline --tol 0.15   # exit 1 if temen÷wt64 regressed >tol
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-use svm_interp::{bytecode, Value};
+use temen_interp::{bytecode, Value};
 use wasmtime::{Config, Engine, Instance, Module, Store, Val};
 
 const REPS: u32 = 25;
@@ -106,16 +106,16 @@ fn native_lane(cfile: &Path, small: i64, large: i64) -> Option<(f64, i64)> {
 }
 
 /// Compile `kernel.c` to LP64 bitcode, translate, and JIT it (compiled once, reused). Returns a
-/// `run(n)` runner plus `run(small)` — the caller times it. The two headline lanes (svm-jit, wt/w64)
+/// `run(n)` runner plus `run(small)` — the caller times it. The two headline lanes (temen-jit, wt/w64)
 /// return runners rather than self-timing so the caller can time them **back-to-back**, keeping the
-/// tracked `svm÷wt64` ratio off the perturbation of the slow informational lanes (native/interp/v8).
-fn svmjit_runner(cfile: &Path, small: i64) -> Option<(impl FnMut(i64) -> i64, i64)> {
+/// tracked `temen÷wt64` ratio off the perturbation of the slow informational lanes (native/interp/v8).
+fn temenjit_runner(cfile: &Path, small: i64) -> Option<(impl FnMut(i64) -> i64, i64)> {
     let (module, sp, e) = translate(cfile)?;
-    let mut cm = svm_jit::compile(&module, e).ok()?;
+    let mut cm = temen_jit::compile(&module, e).ok()?;
     let mut runner = move |n: i64| -> i64 {
-        match cm.run(&[sp, n], None, None, None).expect("svm-jit run") {
-            (svm_jit::JitOutcome::Returned(v), _) => v[0],
-            (other, _) => panic!("svm-jit did not return: {other:?}"),
+        match cm.run(&[sp, n], None, None, None).expect("temen-jit run") {
+            (temen_jit::JitOutcome::Returned(v), _) => v[0],
+            (other, _) => panic!("temen-jit did not return: {other:?}"),
         }
     };
     let want = runner(small);
@@ -125,7 +125,7 @@ fn svmjit_runner(cfile: &Path, small: i64) -> Option<(impl FnMut(i64) -> i64, i6
 /// Time `run(n)` on the bytecode interpreter (the same IR, tree-executed). `large` is calibrated down
 /// to `BC_TARGET_S` (the interp's per-iter is n-independent), so this stays bounded despite being
 /// ~600× native. Returns `(per_iter_ns, run(small))`.
-fn svmbc_lane(cfile: &Path, small: i64, large: i64) -> Option<(f64, i64)> {
+fn temenc_lane(cfile: &Path, small: i64, large: i64) -> Option<(f64, i64)> {
     let (module, sp, e) = translate(cfile)?;
     let runner = move |n: i64| -> i64 {
         let mut fuel = u64::MAX;
@@ -159,7 +159,7 @@ fn svmbc_lane(cfile: &Path, small: i64, large: i64) -> Option<(f64, i64)> {
 /// lower to `memory.copy`/`fill`, not undefined libc symbols).
 ///
 /// SIMD caveat: enabling `-msimd128` is the honest, embench-matching posture (both sides get their
-/// frontend's SIMD), but it does NOT make vectorizable kernels a clean codegen comparison. The svm-jit
+/// frontend's SIMD), but it does NOT make vectorizable kernels a clean codegen comparison. The temen-jit
 /// lane consumes **host** LP64 bitcode (x86 SSE2 baseline) while this lane targets **wasm simd128** —
 /// different SIMD ISAs (e.g. wasm has `i64x2.mul`, x86-128 doesn't), so LLVM vectorizes each
 /// differently. A vectorizable kernel's ratio can swing ±40% on this flag alone (matmul: 0.93x without
@@ -230,16 +230,16 @@ fn v8_lane(run_mjs: &Path, wasm: &Path, small: i64, large: i64) -> Option<(f64, 
     parse_ns_chk(&out.stdout)
 }
 
-/// Compile `kernel.c` to LP64 bitcode and translate to SVM IR; return `(module, entry_sp, run idx)`.
+/// Compile `kernel.c` to LP64 bitcode and translate to Temen IR; return `(module, entry_sp, run idx)`.
 ///
-/// On-ramp target: `-march=x86-64-v3 -mprefer-vector-width=128`. The svm-jit on-ramp consumes *host*
+/// On-ramp target: `-march=x86-64-v3 -mprefer-vector-width=128`. The temen-jit on-ramp consumes *host*
 /// bitcode, so unlike wasm (capped at the portable simd128 op set) it can target the real CPU's richer
 /// 128-bit SIMD. `x86-64-v3` (AVX2 — universal on x86 since ~2013) gives LLVM ops simd128 has but the
 /// SSE2 baseline lacks (`i32x4.mul`, wider widening muls, …); `-mprefer-vector-width=128` keeps LLVM at
 /// 128-bit so Cranelift (no YMM/ZMM regclass, D58) never has to split a 256-bit vector. Together this
 /// flips the vectorizable-kernel gap to parity-or-faster than Wasmtime-w64 (matmul 1.42x→0.89x), at
 /// +0 escape-TCB (more `v128` ops are value-only; the verifier re-checks). See DESIGN.md D64.
-fn translate(cfile: &Path) -> Option<(svm_ir::Module, i64, u32)> {
+fn translate(cfile: &Path) -> Option<(temen_ir::Module, i64, u32)> {
     let bc = std::env::temp_dir().join(format!("confine_{}.ll", std::process::id()));
     let ok = Command::new("clang")
         .args([
@@ -258,7 +258,7 @@ fn translate(cfile: &Path) -> Option<(svm_ir::Module, i64, u32)> {
     if !ok {
         return None;
     }
-    let t = svm_llvm::translate_ll_path(&bc).ok()?;
+    let t = temen_llvm::translate_ll_path(&bc).ok()?;
     let _ = std::fs::remove_file(&bc);
     let sp = t.entry_sp as i64;
     let e = t.exports.iter().find(|(n, _)| n == "run")?.1;
@@ -277,13 +277,13 @@ fn parse_ns_chk(stdout: &[u8]) -> Option<(f64, i64)> {
 struct Row {
     name: String,
     native: Option<f64>,
-    svmjit: Option<f64>,
-    svmbc: Option<f64>,
+    temenjit: Option<f64>,
+    temenc: Option<f64>,
     v8_32: Option<f64>,
     v8_64: Option<f64>,
     wt_32: Option<f64>,
     wt_64: Option<f64>,
-    svm_over_wt64: Option<f64>, // the tracked headline ratio
+    temen_over_wt64: Option<f64>, // the tracked headline ratio
 }
 
 fn main() {
@@ -320,38 +320,38 @@ fn main() {
             "{:<10} {:>11} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>9}   correctness",
             "kernel",
             "native(ns)",
-            "svm-jit",
-            "svm-bc",
+            "temen-jit",
+            "temen-bc",
             "v8/w32",
             "v8/w64",
             "wt/w32",
             "wt/w64",
-            "svm÷wt64"
+            "temen÷wt64"
         );
     }
     for &(name, small, large) in KERNELS {
         let cfile = dir.join(format!("{name}.c"));
-        // Build/compile every artifact first (nothing timed yet). The svm-jit lane is mandatory (the
+        // Build/compile every artifact first (nothing timed yet). The temen-jit lane is mandatory (the
         // whole point); everything else is best-effort.
-        let Some((mut svm_run, svm_want)) = svmjit_runner(&cfile, small) else {
-            eprintln!("note: {name}: svm-jit lane unavailable (clang/on-ramp) — skipped");
+        let Some((mut temen_run, temen_want)) = temenjit_runner(&cfile, small) else {
+            eprintln!("note: {name}: temen-jit lane unavailable (clang/on-ramp) — skipped");
             continue;
         };
         let wasm32 = build_wasm(&cfile, "wasm32");
         let wasm64 = build_wasm(&cfile, "wasm64");
         let wt64 = wasm64.as_deref().and_then(|w| wt_runner(w, true, small));
 
-        // Headline timing block: svm-jit and wt/w64 **back-to-back**, so the tracked `svm÷wt64` ratio
+        // Headline timing block: temen-jit and wt/w64 **back-to-back**, so the tracked `temen÷wt64` ratio
         // is measured under one consistent machine state (not straddling the slow native/interp/v8
         // lanes). Everything below this is informational.
-        let svm_ns = per_iter(small, large, REPS, &mut svm_run);
+        let temen_ns = per_iter(small, large, REPS, &mut temen_run);
         let wt_64 = wt64.map(|(mut r, c)| (per_iter(small, large, REPS, &mut r), c));
-        let svm_over_wt64 = wt_64.map(|(ns, _)| svm_ns / ns);
+        let temen_over_wt64 = wt_64.map(|(ns, _)| temen_ns / ns);
 
         // Informational lanes (timed after the headline; native subprocess + interp are slow).
         let native = native_lane(&cfile, small, large);
         let native_chk = native.map(|(_, c)| c);
-        let svmbc = svmbc_lane(&cfile, small, large);
+        let temenc = temenc_lane(&cfile, small, large);
         let wt_32 = wasm32
             .as_deref()
             .and_then(|w| wt_runner(w, false, small))
@@ -375,10 +375,10 @@ fn main() {
         }
 
         // Correctness: every available *64-bit* engine must agree with the oracle on `run(small)`.
-        // Native is the oracle when present, else svm-jit. The w32 lanes run at 32-bit `long` (ILP32)
+        // Native is the oracle when present, else temen-jit. The w32 lanes run at 32-bit `long` (ILP32)
         // — a *different program* whose checksum legitimately differs when a kernel's result overflows
         // 32 bits (embench §header), so they are informational-only and never gate.
-        let oracle = native_chk.unwrap_or(svm_want);
+        let oracle = native_chk.unwrap_or(temen_want);
         let mut bad: Vec<String> = Vec::new();
         let mut chk = |label: &str, w: Option<i64>| {
             if let Some(v) = w {
@@ -387,8 +387,8 @@ fn main() {
                 }
             }
         };
-        chk("svm-jit", Some(svm_want));
-        chk("svm-bc", svmbc.map(|(_, c)| c));
+        chk("temen-jit", Some(temen_want));
+        chk("temen-bc", temenc.map(|(_, c)| c));
         chk("v8/w64", v8_64.map(|(_, c)| c));
         chk("wt/w64", wt_64.map(|(_, c)| c));
         assert!(
@@ -400,13 +400,13 @@ fn main() {
         let row = Row {
             name: name.to_string(),
             native: native.map(|(ns, _)| ns),
-            svmjit: Some(svm_ns),
-            svmbc: svmbc.map(|(ns, _)| ns),
+            temenjit: Some(temen_ns),
+            temenc: temenc.map(|(ns, _)| ns),
             v8_32: v8_32.map(|(ns, _)| ns),
             v8_64: v8_64.map(|(ns, _)| ns),
             wt_32: wt_32.map(|(ns, _)| ns),
             wt_64: wt_64.map(|(ns, _)| ns),
-            svm_over_wt64,
+            temen_over_wt64,
         };
         if !quiet {
             // Engine columns as ×native (like embench); "—" when the lane or native is unavailable.
@@ -416,13 +416,13 @@ fn main() {
             };
             let nat = row.native.map_or("—".to_string(), |n| format!("{n:.1}"));
             let hl = row
-                .svm_over_wt64
+                .temen_over_wt64
                 .map_or("—".to_string(), |r| format!("{r:.3}x"));
             println!(
                 "{:<10} {nat:>11} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {hl:>9}   OK",
                 row.name,
-                rel(row.svmjit),
-                rel(row.svmbc),
+                rel(row.temenjit),
+                rel(row.temenc),
                 rel(row.v8_32),
                 rel(row.v8_64),
                 rel(row.wt_32),
@@ -433,28 +433,28 @@ fn main() {
     }
 
     if csv {
-        // kernel,native_ns,svmjit_ns,svmbc_ns,v8w32_ns,v8w64_ns,wtw32_ns,wtw64_ns,svm_over_wt64
+        // kernel,native_ns,temenjit_ns,temenc_ns,v8w32_ns,v8w64_ns,wtw32_ns,wtw64_ns,temen_over_wt64
         let f = |x: Option<f64>| x.map_or("".to_string(), |v| format!("{v:.4}"));
-        println!("kernel,native,svmjit,svmbc,v8w32,v8w64,wtw32,wtw64,svm_over_wt64");
+        println!("kernel,native,temenjit,temenc,v8w32,v8w64,wtw32,wtw64,temen_over_wt64");
         for r in &rows {
             println!(
                 "{},{},{},{},{},{},{},{},{}",
                 r.name,
                 f(r.native),
-                f(r.svmjit),
-                f(r.svmbc),
+                f(r.temenjit),
+                f(r.temenc),
                 f(r.v8_32),
                 f(r.v8_64),
                 f(r.wt_32),
                 f(r.wt_64),
-                f(r.svm_over_wt64),
+                f(r.temen_over_wt64),
             );
         }
     }
     if let Some(path) = save {
         let body: String = rows
             .iter()
-            .filter_map(|r| r.svm_over_wt64.map(|x| format!("{} {x:.4}\n", r.name)))
+            .filter_map(|r| r.temen_over_wt64.map(|x| format!("{} {x:.4}\n", r.name)))
             .collect();
         std::fs::write(&path, body).expect("write baseline");
         eprintln!("wrote {} kernel ratios to {path}", rows.len());
@@ -471,7 +471,7 @@ fn main() {
             let Some(now) = rows
                 .iter()
                 .find(|r| r.name == kn)
-                .and_then(|r| r.svm_over_wt64)
+                .and_then(|r| r.temen_over_wt64)
             else {
                 eprintln!("note: {kn} not measured this run");
                 continue;
@@ -490,7 +490,7 @@ fn main() {
         }
         if regressed {
             eprintln!(
-                "confine: a svm÷wt64 ratio grew by more than {:.0}%",
+                "confine: a temen÷wt64 ratio grew by more than {:.0}%",
                 tol * 100.0
             );
             std::process::exit(1);

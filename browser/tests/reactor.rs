@@ -2,18 +2,18 @@
 //! Unlike single-shot `onramp_exec`, an [`OnrampReactor`] instantiates once and calls the guest's
 //! exported `tick` per frame, persisting globals/BSS between frames, presenting a frame through
 //! `display` and draining input through `keyboard`. The browser drives it in a requestAnimationFrame
-//! loop; the wasm `svm_onramp_{open,frame,key,close}` exports wrap these same methods.
+//! loop; the wasm `temen_onramp_{open,frame,key,close}` exports wrap these same methods.
 //!
-//! Two fixtures, both `clang -O2 -emit-llvm` + `svm-llvm-translate --host-page 65536 --null-guard`
+//! Two fixtures, both `clang -O2 -emit-llvm` + `temen-llvm-translate --host-page 65536 --null-guard`
 //! (#964 — `life` has a `main`, so it carries the guarded-layout marker; `bounce` is an entry-less
 //! reactor kernel and stays unmarked):
-//! - `fixtures/bounce.svmb` (`display/bounce.c`) — the box's motion is a pure function of its initial
+//! - `fixtures/bounce.temen` (`display/bounce.c`) — the box's motion is a pure function of its initial
 //!   state + injected key events, asserted to the pixel (animation, input steering, state persistence).
-//! - `fixtures/life.svmb` (`display/life.c`) — Conway's Game of Life on a **malloc heap above the
+//! - `fixtures/life.temen` (`display/life.c`) — Conway's Game of Life on a **malloc heap above the
 //!   mapped window**; the glider only advances if the reactor persists the *whole* guest memory
 //!   (heap included) between frames — the Doom heap-persistence proof (slice 3).
 
-use svm_browser::{Frame, OnrampReactor, STATUS_OK};
+use temen_browser::{Frame, OnrampReactor, STATUS_OK};
 
 const W: u32 = 160;
 const H: u32 = 120;
@@ -23,8 +23,8 @@ const LEFT: i32 = 37;
 const RIGHT: i32 = 39;
 
 fn open() -> OnrampReactor {
-    let bytes = include_bytes!("fixtures/bounce.svmb");
-    let m = svm_encode::decode_module(bytes).expect("decode bounce.svmb");
+    let bytes = include_bytes!("fixtures/bounce.temen");
+    let m = temen_encode::decode_module(bytes).expect("decode bounce.temen");
     OnrampReactor::open(&m).expect("open the bounce reactor")
 }
 
@@ -92,8 +92,8 @@ fn reactor_responds_to_input() {
 // ---- heap-persistence (Doom slice 3): Conway's Game of Life over a malloc heap -------------------
 
 fn open_life() -> OnrampReactor {
-    let bytes = include_bytes!("fixtures/life.svmb");
-    let m = svm_encode::decode_module(bytes).expect("decode life.svmb");
+    let bytes = include_bytes!("fixtures/life.temen");
+    let m = temen_encode::decode_module(bytes).expect("decode life.temen");
     OnrampReactor::open(&m).expect("open the life reactor")
 }
 
@@ -155,8 +155,8 @@ fn reactor_persists_the_malloc_heap_across_frames() {
 
 /// Open the interactive Mandelbrot-zoom reactor (`display/mandelzoom.c`).
 fn open_mandel() -> OnrampReactor {
-    let bytes = include_bytes!("fixtures/mandelzoom.svmb");
-    let m = svm_encode::decode_module(bytes).expect("decode mandelzoom.svmb");
+    let bytes = include_bytes!("fixtures/mandelzoom.temen");
+    let m = temen_encode::decode_module(bytes).expect("decode mandelzoom.temen");
     OnrampReactor::open(&m).expect("open the mandelzoom reactor")
 }
 

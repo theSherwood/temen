@@ -1,16 +1,16 @@
-# wasm coverage & roadmap (`crates/svm-wasm`)
+# wasm coverage & roadmap (`crates/temen-wasm`)
 
 What the **wasm → IR transpiler** handles, what it doesn't, and the prioritized work to widen
-coverage. svm-wasm is a *second frontend* (after chibicc): it takes core wasm and reconstructs SSA
+coverage. temen-wasm is a *second frontend* (after chibicc): it takes core wasm and reconstructs SSA
 from the stack machine, so the §1a benchmark thesis can be measured on the **same bytes** Wasmtime
-runs. It is an **untrusted** frontend — everything it emits is re-verified by `svm-verify`, so a gap
+runs. It is an **untrusted** frontend — everything it emits is re-verified by `temen-verify`, so a gap
 here is a *capability* limit, never a safety one.
 
 **Status: feature-complete for *typical clang/rustc -O2 output*** (127 tests across
 `transpile.rs`/`imports.rs`/`simd.rs`/`atomics.rs`/`threads.rs`/`start.rs`/`tailcall.rs`/`bulk.rs`/`reftypes.rs`/`debug_line.rs`).
 Real clang programs + two real C
 libraries (jsmn, B-Con SHA-256) run **byte-identical to native**; a real `clang -msimd128 -O2` saxpy
-and a wasi-threads parallel kernel run on both backends. `bench --threads`: SVM ~1.35× faster than
+and a wasi-threads parallel kernel run on both backends. `bench --threads`: Temen ~1.35× faster than
 Wasmtime+wasi-threads on spawn-heavy, parity on compute.
 
 This file tracks the path to handling **all** of wasm (the full spec + finished proposals, incl.
@@ -49,14 +49,14 @@ memory64). Fold completed sections into `DESIGN.md` / drop this file once the ac
 interpreter and reports, per file, how the value assertions land. It is a **report, not a gate**
 (gated on the `SPEC_DIR` env var — unset in CI, so it skips): point it at a checkout and read the
 summary —
-`SPEC_DIR=…/spec/test/core cargo test -p svm-wasm --test spec -- --nocapture`.
+`SPEC_DIR=…/spec/test/core cargo test -p temen-wasm --test spec -- --nocapture`.
 
-Scope caveat: SVM runs **one entry over a fresh window per call**, with no persistent module
+Scope caveat: Temen runs **one entry over a fresh window per call**, with no persistent module
 *instance* across invokes, so assertions that depend on cross-invoke state (write memory then read it,
 mutate a global) can't be reproduced and are reported `skip`. The pass is meaningful for **pure**
 assertions — `(invoke "op" const-args) → result` — which is the shape of essentially all the
 numeric/conversion/**SIMD** value tests. (`assert_trap` on an OOB access is `trap-divergence`, not a
-fail — since D63 SVM *does* trap out-of-window (`MemoryFault`), but at its power-of-two window
+fail — since D63 Temen *does* trap out-of-window (`MemoryFault`), but at its power-of-two window
 boundary, not wasm's page-granular memory size, so the exact trap boundary can differ.)
 
 Result over the numeric + full SIMD suites (~60 files): **36.7k value assertions pass, 0 fail.** The
@@ -87,12 +87,12 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
 - [x] **Named import binding — DONE (single-handle).** A non-numeric import (e.g. a real WASI
   `("wasi_snapshot_preview1", "fd_write")`) now lowers to a §7 `Inst::CallImport "<module>.<name>"`
   (declared in `Module.imports`); the embedder binds the name to a concrete `(type_id, op)` at load via
-  `svm_ir::resolve_imports`. The numeric `module`=type_id / `name`=op convention still lowers to an
-  inline `cap.call`. svm-wasm stays pure mechanism — it never interprets host semantics. The
+  `temen_ir::resolve_imports`. The numeric `module`=type_id / `name`=op convention still lowers to an
+  inline `cap.call`. temen-wasm stays pure mechanism — it never interprets host semantics. The
   `wasi_named_imports` test is the worked example: a minimal preview1 shim (`fd_write`/`proc_exit`) as
-  an embedder `HostFn` capability (`svm_interp::iface::HOST_FN`, registered with `Host::grant_host_fn` —
-  WASI semantics live outside both svm-wasm and the interp TCB), plus a `resolve` policy. A real WASI
-  "hello world" runs end-to-end (`crates/svm/tests/wasi_named_imports.rs`). WASI's specific fd/clock/random
+  an embedder `HostFn` capability (`temen_interp::iface::HOST_FN`, registered with `Host::grant_host_fn` —
+  WASI semantics live outside both temen-wasm and the interp TCB), plus a `resolve` policy. A real WASI
+  "hello world" runs end-to-end (`crates/temen/tests/wasi_named_imports.rs`). WASI's specific fd/clock/random
   *semantics* stay a ⚪ non-goal — the shim is a host-layer subset, not conformant preview1.
 - [x] **Multi-*handle* import binding — DONE.** The transpiler now threads **one handle per distinct
   import interface** (keyed by the wasm `module` string, in first-appearance order) as the leading
@@ -101,7 +101,7 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   `cap.call`/`CallImport` rides its interface's slot handle; the embedder grants one capability per
   interface and passes the handles as the entry's leading args, in slot order. The module string is the
   grouping key because it is known at transpile time for both numeric and §7 named imports. Purely an
-  svm-wasm (frontend) change — the IR/interp/JIT already take a per-call handle. The `Lower` prefix
+  temen-wasm (frontend) change — the IR/interp/JIT already take a per-call handle. The `Lower` prefix
   machinery generalized `handle: Option<ValIdx>` → `handles: Vec<ValIdx>`; the old "one interface only"
   rejection is gone. Differential tests (interp == JIT) cover two distinct interfaces (Clock + Blocking)
   bound to two handles, threaded through both the entry and a cross-function `call`. (The
@@ -127,7 +127,7 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   (no runtime passive-data store); a static source-OOB is a clean transpile error. `tests/bulk.rs`
   (passive + active segments, partial range, runtime dest, multi-segment indexing, dynamic-len reject).
 - [~] **Reference types — single-table feature complete; only multiple tables remain.** Both ref types
-  are an **i32 index** in SVM — `funcref` → the §3c function-table index (already powers
+  are an **i32 index** in Temen — `funcref` → the §3c function-table index (already powers
   `call_indirect`), `externref` → a §7 capability handle (an opaque host-table index). So the whole
   "reference" half is i32 plumbing over **existing IR** (no new ops, no verifier rules — the table is
   just i32-granular window memory). **Done:** `funcref`/`externref` as values
@@ -159,18 +159,18 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   - [x] **SIMD memory variants — DONE.** `v128.load{8,16,32,64}_splat`, `load{8x8,16x4,32x2}_{s,u}`,
     `load{32,64}_zero`, `load/store{8,16,32,64}_lane` (clang `-msimd128` emits these constantly to
     broadcast/gather). No new IR — each composes a scalar `Load`/`Store` with `Splat`/`ReplaceLane`/
-    `ExtractLane`/`VWiden`. `svm-wasm/tests/simd.rs` (all shapes, interp == JIT).
+    `ExtractLane`/`VWiden`. `temen-wasm/tests/simd.rs` (all shapes, interp == JIT).
   - [x] **Integer lane compares — DONE.** `i8x16`/`i16x8`/`i32x4` `{eq,ne,lt,gt,le,ge}` s/u + the
     `i64x2` signed set → a per-lane all-ones/all-zeros mask (`Inst::VIntCmp`, one Cranelift `icmp`).
-    `crates/svm/tests/simd.rs` (round-trip + interp==JIT, oracle = Rust's own compares) and
-    `svm-wasm/tests/simd.rs` (the wasm bridge + a real `bitselect`-max idiom).
+    `crates/temen/tests/simd.rs` (round-trip + interp==JIT, oracle = Rust's own compares) and
+    `temen-wasm/tests/simd.rs` (the wasm bridge + a real `bitselect`-max idiom).
   - [x] **Integer min/max — DONE.** `i8x16`/`i16x8`/`i32x4` `{min,max}_{s,u}` (extends `VIntBinOp` →
     one Cranelift `smin`/`umin`/`smax`/`umax`; `i64x2` has no min/max op, and would not legalize so it
     bails on the JIT — the one remaining bail, now that `i8x16.mul` lowers via widen → `i16x8` mul →
     low-byte pack). Tests incl. a real lane-wise `clamp` kernel.
   - [x] **Float lane compares — DONE.** `f32x4`/`f64x2` `{eq,ne,lt,gt,le,ge}` → mask (`Inst::VFloatCmp`,
     one Cranelift `fcmp`; ordered, `ne` unordered — matches Rust's float operators, the test oracle,
-    incl. NaN). `crates/svm/tests/simd.rs` + `svm-wasm/tests/simd.rs`.
+    incl. NaN). `crates/temen/tests/simd.rs` + `temen-wasm/tests/simd.rs`.
   - [x] **Lane shifts — DONE.** `i8x16`/`i16x8`/`i32x4`/`i64x2` `{shl,shr_s,shr_u}` by a scalar `i32`
     amount mod the lane width (`Inst::VShift`; vector `ishl`/`ushr`/`sshr` — Cranelift legalizes every
     shape incl. `i8x16`). Oracle = Rust's scalar shifts at the lane width.
@@ -233,7 +233,7 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
     `i16x8`). JIT lowers to native `sqmul_round_sat`; oracle = the formula in `i64`, tests incl. the
     `-1.0·-1.0` corner that saturates to `i16::MAX`. Tests incl. a DSP idiom through the wasm bridge.
 - [x] **Narrow atomics — DONE.** `*.atomic.{load,store,rmw8/16/32.*,cmpxchg}{8,16}` (and i64's 32-bit
-  forms). SVM IR atomics are 32/64-bit only (the §3b narrow-integer decision), so the **8/16-bit**
+  forms). Temen IR atomics are 32/64-bit only (the §3b narrow-integer decision), so the **8/16-bit**
   forms emulate with a **32-bit word-CAS loop** in the transpiler: align to the containing word, then
   load → splice the sub-word (`(old & ~mask) | (new << shift & mask)`) → `cmpxchg`, retrying until it
   lands (load is loop-free: word-load + shift/mask). The i64 **32-bit** forms are word-sized (a native
@@ -248,7 +248,7 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
 - [x] **Relaxed SIMD — DONE (all 20)** (`-mrelaxed-simd`). A separate proposal of ~20 ops whose
   results are **implementation-defined within a spec-allowed set** — they let an engine emit one native
   instruction (x86 FMA, ARM rounding, `blendv`, `pmaddubsw`) without the fix-up sequence deterministic
-  SIMD needs to be bit-identical across architectures. SVM ships them via the **deterministic-choice**
+  SIMD needs to be bit-identical across architectures. Temen ships them via the **deterministic-choice**
   realization: each op lowers to *one* spec-allowed behavior computed identically in both backends, so
   the interp↔JIT differential holds (no value-insensitive exclusion needed yet):
   - `relaxed_madd`/`relaxed_nmadd` (f32x4/f64x2) → a genuine **fused FMA** (`Inst::VFma`; Cranelift
@@ -257,23 +257,23 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   - `relaxed_min`/`max` → the deterministic `fmin`/`fmax`; `relaxed_trunc_*` (4) → `trunc_sat`;
     `relaxed_laneselect` (4) → `bitselect` (exact for a valid all-0/all-1 mask); `relaxed_swizzle` →
     `swizzle`; `relaxed_q15mulr_s` → `q15mulr_sat`. All alias existing deterministic ops — transpiler
-    arms only, no new IR. `crates/svm/tests/simd.rs` (FMA vs `mul_add`, incl. fused≠mul+add cases) +
-    `svm-wasm/tests/simd.rs` (the `-mrelaxed-simd` shape on both backends).
+    arms only, no new IR. `crates/temen/tests/simd.rs` (FMA vs `mul_add`, incl. fused≠mul+add cases) +
+    `temen-wasm/tests/simd.rs` (the `-mrelaxed-simd` shape on both backends).
   - `relaxed_dot_i8x16_i7x16_s` → `Inst::VDotI8` (the deterministic **signed-i8 dot** → i16, the
     spec-allowed signed-×-signed behavior, not x86's unsigned-×-signed `pmaddubsw`; `swiden` + `imul`
     + `iadd_pairwise`, the same recipe Cranelift's own deterministic-relaxed mode uses). The
     `relaxed_dot_i8x16_i7x16_add_s` variant composes that dot with the existing `extadd_pairwise` +
-    `i32x4.add` (no extra IR). `crates/svm/tests/simd.rs` (incl. the i16 wrap corner) +
-    `svm-wasm/tests/simd.rs`.
+    `i32x4.add` (no extra IR). `crates/temen/tests/simd.rs` (incl. the i16 wrap corner) +
+    `temen-wasm/tests/simd.rs`.
   The deterministic-default rationale, since it's a recurring question:
   - **The base-SIMD "fixups" are op *semantics*, not a determinism tax.** `i32x4.trunc_sat_f32x4_s`
     *means* "saturate out-of-range, NaN→0"; the clamp instructions Cranelift emits on x86 are the cost
-    of computing **that operation**, not a surcharge SVM adds. Emitting raw `cvttps2dq` instead
+    of computing **that operation**, not a surcharge Temen adds. Emitting raw `cvttps2dq` instead
     wouldn't be "faster non-deterministic SIMD" — it would compute a *different function* than the
     bytecode specifies (wrong, not merely unportable). For the **vast majority** of v128 ops
     (arith/bitwise/shift/shuffle/lane/`i*` min-max) there is **zero fixup** — register-to-register,
     bit-identical across hardware for free. The handful with fixups (float→int trunc, float min/max,
-    narrow) emit *the same Cranelift lowering Wasmtime ships*, so SVM is at parity with the "as fast as
+    narrow) emit *the same Cranelift lowering Wasmtime ships*, so Temen is at parity with the "as fast as
     wasm" baseline it measures against (D36) — it never pays *more* than the engine it's compared to.
   - **The one genuine speed-vs-determinism knob already defaults to fast.** Float **NaN bit patterns**
     are host-defined in the default mode (fast, matches hardware) and canonicalized only in the opt-in
@@ -281,10 +281,10 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
     per lane* (DESIGN §17 "float lanes are NaN-insensitive in the differential"). So wherever leaving
     a result un-fixed-up is a real (free) choice, the default is *already* speed-first.
   - **What relaxed SIMD would actually cost is JIT trust, not "purity".** The interp↔JIT differential
-    is how SVM *trusts its own JIT* — the primary evidence Cranelift didn't miscompile into a
+    is how Temen *trusts its own JIT* — the primary evidence Cranelift didn't miscompile into a
     confinement escape (§18/I4), with the architecture-independent interpreter as the oracle. A native
     relaxed lowering makes interp and JIT legitimately diverge in *value* (not just NaN bits), so that
-    evidence evaporates for those ops. That's a security-model cost, in the exact dimension SVM
+    evidence evaporates for those ops. That's a security-model cost, in the exact dimension Temen
     competes on vs. "just run Wasmtime."
   - **What's shipped is the deterministic-choice realization** (above): each relaxed op runs one
     spec-allowed behavior, so a `-mrelaxed-simd` binary *runs correctly* and `relaxed_madd` even gets
@@ -318,14 +318,14 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
 ### ⚪ Non-goal (by design)
 
 - **wasm GC** (struct/array/i31, managed references). Not more opcodes — a *different execution model*
-  (managed heap + a tracing collector in the runtime), which contradicts SVM's linear-memory +
+  (managed heap + a tracing collector in the runtime), which contradicts Temen's linear-memory +
   small-TCB confinement thesis. The languages targeting wasm-GC (Java/Kotlin/Dart/Scheme) are outside
-  the C/C++/Rust niche SVM serves. Treat as a permanent non-goal, not "hard but someday."
+  the C/C++/Rust niche Temen serves. Treat as a permanent non-goal, not "hard but someday."
 
 ### ℹ️ Semantic divergence (not a missing feature)
 
 - **OOB trap boundary differs.** Since D63 (trap-confinement, superseding the old mask-and-continue
-  model) SVM **traps** an out-of-window access with `MemoryFault`, like wasm — but at its
+  model) Temen **traps** an out-of-window access with `MemoryFault`, like wasm — but at its
   power-of-two window boundary (`eff > mapped - width`, §4), where wasm traps at the instance's
   page-granular memory size. Not a miscompile for well-behaved programs, but a program that *relies
   on* the exact trap boundary (conformance tests; defensive trap-probing near the edge) can diverge
@@ -354,6 +354,6 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
    `elem` + `elem.drop`); only **multiple tables** remains.
 7. EH, multiple memories/tables, imported globals/tables — on demand. GC stays ⚪.
 
-Code map: the rejection sites are the `unsup(...)` calls in `crates/svm-wasm/src/lib.rs` (section
+Code map: the rejection sites are the `unsup(...)` calls in `crates/temen-wasm/src/lib.rs` (section
 parse + the `worker_op` operator catch-all `other => unsup("operator {…}")`); tests live in
-`crates/svm-wasm/tests/`.
+`crates/temen-wasm/tests/`.

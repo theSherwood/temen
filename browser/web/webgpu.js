@@ -1,6 +1,6 @@
 // The playground's **WebGPU servicer** for the guest `webgpu` capability. `initWebGPU(canvas)` sets up
-// a `navigator.gpu` device + the canvas context and installs `globalThis.__svm_webgpu_op`; the wasm
-// engine's `svm_host.webgpu_op` import (see par.js) delegates to it. The guest ships a WGSL shader
+// a `navigator.gpu` device + the canvas context and installs `globalThis.__temen_webgpu_op`; the wasm
+// engine's `temen_host.webgpu_op` import (see par.js) delegates to it. The guest ships a WGSL shader
 // once (op 0) and asks the host to present a frame each tick (op 1); the parallel pixel work runs on
 // the GPU. All per-op work is **synchronous** (device creation — the only async part — is awaited here
 // before the reactor loop starts), which is required: the reactor drives on the main thread, where a
@@ -31,11 +31,11 @@ export async function initWebGPU(canvas) {
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
   G = { device, ctx, format, canvas, uniform, pipeline: null, bindGroup: null };
-  globalThis.__svm_webgpu_op = servicer;
+  globalThis.__temen_webgpu_op = servicer;
 }
 
 export function teardownWebGPU() {
-  globalThis.__svm_webgpu_op = null;
+  globalThis.__temen_webgpu_op = null;
   if (G && G.device) {
     try {
       G.device.destroy();

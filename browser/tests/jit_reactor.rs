@@ -7,13 +7,13 @@
 //! emitted `f{tick}(win, env, sp)`, and services `env.call_interp` with [`JitOnrampReactor::run_cross_tier`].
 //! It asserts the emitted-`tick` frames are **byte-identical** to the interpreter reactor's frames (the
 //! [`SharedOnrampReactor`] oracle, itself proven ≡ `OnrampReactor` in slice 5b) — the JIT correctness
-//! gate. Requires the Doom assets (`doom.svmb` + `doom1.wad`); `#[ignore]`d without them.
+//! gate. Requires the Doom assets (`doom.temen` + `doom1.wad`); `#[ignore]`d without them.
 
-use svm_browser::{Frame, JitOnrampReactor, SharedOnrampReactor, STATUS_OK};
-use svm_interp::Value;
+use temen_browser::{Frame, JitOnrampReactor, SharedOnrampReactor, STATUS_OK};
+use temen_interp::Value;
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
-const DOOM_SVMB: &str = "/tmp/doomgeneric_cache/bc/doom.svmb";
+const DOOM_TEMEN: &str = "/tmp/doomgeneric_cache/bc/doom.temen";
 const WAD: &str = "web/assets/doom1.wad";
 
 // The emitted `tick`'s guest window is 2^24 = 16 MiB — covers Doom's zone heap (peaks ~11 MiB), so the
@@ -24,10 +24,10 @@ const WIN_BASE: u32 = 0x1_0000; // the window starts at 64 KiB (the env cell liv
 const ENV_PTR: u32 = 1024;
 const FRAMES: usize = 3;
 
-fn assets() -> Option<(svm_ir::Module, Vec<u8>)> {
-    let svmb = std::fs::read(DOOM_SVMB).ok()?;
+fn assets() -> Option<(temen_ir::Module, Vec<u8>)> {
+    let temen = std::fs::read(DOOM_TEMEN).ok()?;
     let wad = std::fs::read(WAD).ok()?;
-    Some((svm_encode::decode_module(&svmb).ok()?, wad))
+    Some((temen_encode::decode_module(&temen).ok()?, wad))
 }
 
 /// A stable hash of a presented frame (dims + RGBA), so a per-frame equality check is cheap to compare.
@@ -42,7 +42,7 @@ fn frame_hash(f: &Frame) -> u64 {
 
 /// The interpreter-reactor oracle: `SharedOnrampReactor` (≡ `OnrampReactor`, slice 5b) over Doom, N
 /// frames, returning each frame's `(hash, non_blank)`.
-fn interp_frames(m: &svm_ir::Module, wad: &[u8]) -> Vec<(u64, bool)> {
+fn interp_frames(m: &temen_ir::Module, wad: &[u8]) -> Vec<(u64, bool)> {
     // 2^25 backing gives the size_log2=22 guest room to `vm_map`-grow its heap (as the browser interp
     // reactor does); the frames are what the JIT run must reproduce.
     let mut r = SharedOnrampReactor::open_owned_with_fs(m, 25, "doom1.wad".into(), wad.to_vec())
@@ -59,7 +59,7 @@ fn interp_frames(m: &svm_ir::Module, wad: &[u8]) -> Vec<(u64, bool)> {
 
 /// The wasm-JIT run: emitted `tick` on `wasmi`, cross-tier helpers on the interpreter over the shared
 /// window. Returns each frame's `(hash, non_blank)`.
-fn jit_frames(m: &svm_ir::Module, wad: &[u8]) -> Vec<(u64, bool)> {
+fn jit_frames(m: &temen_ir::Module, wad: &[u8]) -> Vec<(u64, bool)> {
     let engine = Engine::default();
 
     // One non-growable linear memory holding the env cell (below WIN_BASE) and the 16 MiB window. The
@@ -128,7 +128,7 @@ fn jit_frames(m: &svm_ir::Module, wad: &[u8]) -> Vec<(u64, bool)> {
                             let o = args_ptr as usize + i * 8;
                             let raw = u64::from_le_bytes(data[o..o + 8].try_into().unwrap());
                             match t {
-                                svm_ir::ValType::I32 => Value::I32(raw as i32),
+                                temen_ir::ValType::I32 => Value::I32(raw as i32),
                                 _ => Value::I64(raw as i64),
                             }
                         })
@@ -183,15 +183,15 @@ fn jit_frames(m: &svm_ir::Module, wad: &[u8]) -> Vec<(u64, bool)> {
     let f_tick = instance
         .get_func(&store, &format!("f{tick}"))
         .expect("emitted f{tick} export");
-    // `f{tick}`'s result arity (the SVM `tick` may return a value, e.g. an i32 status).
-    let rtys: Vec<svm_ir::ValType> = store.data().as_ref().unwrap().func_sig(tick).1.to_vec();
+    // `f{tick}`'s result arity (the Temen `tick` may return a value, e.g. an i32 status).
+    let rtys: Vec<temen_ir::ValType> = store.data().as_ref().unwrap().func_sig(tick).1.to_vec();
     let mut results: Vec<Val> = rtys
         .iter()
         .map(|t| match t {
-            svm_ir::ValType::I32 => Val::I32(0),
-            svm_ir::ValType::I64 => Val::I64(0),
-            svm_ir::ValType::F32 => Val::F32(0.0f32.into()),
-            svm_ir::ValType::F64 => Val::F64(0.0f64.into()),
+            temen_ir::ValType::I32 => Val::I32(0),
+            temen_ir::ValType::I64 => Val::I64(0),
+            temen_ir::ValType::F32 => Val::F32(0.0f32.into()),
+            temen_ir::ValType::F64 => Val::F64(0.0f64.into()),
             _ => Val::I32(0),
         })
         .collect();
@@ -229,7 +229,7 @@ fn jit_frames(m: &svm_ir::Module, wad: &[u8]) -> Vec<(u64, bool)> {
 #[test]
 fn doom_jit_tick_matches_interpreter() {
     let Some((m, wad)) = assets() else {
-        eprintln!("skipping: Doom assets not present ({DOOM_SVMB} / {WAD})");
+        eprintln!("skipping: Doom assets not present ({DOOM_TEMEN} / {WAD})");
         return;
     };
     let interp = interp_frames(&m, &wad);

@@ -1,8 +1,8 @@
-# OPT.md — `svm-opt`, the generic svm-IR AOT optimizer
+# OPT.md — `temen-opt`, the generic temen-IR AOT optimizer
 
-Tracks building a **powerful, generic IR→IR AOT optimizer** that runs **outside svm (host-side
-tooling) and inside svm (guest-side, in-sandbox)** — the successor to the cleanup optimizer that
-lived in `svm-peval` (`optimize_module`, DESIGN.md §20c; moved here in Phase 0). Companion to `DESIGN.md`
+Tracks building a **powerful, generic IR→IR AOT optimizer** that runs **outside temen (host-side
+tooling) and inside temen (guest-side, in-sandbox)** — the successor to the cleanup optimizer that
+lived in `temen-peval` (`optimize_module`, DESIGN.md §20c; moved here in Phase 0). Companion to `DESIGN.md`
 §20a/§20c. Living doc: update the **Plan** tracker as work lands; fold into
 `DESIGN.md` once it closes.
 
@@ -10,7 +10,7 @@ lived in `svm-peval` (`optimize_module`, DESIGN.md §20c; moved here in Phase 0)
 
 ## Goal & shape
 
-`svm-peval` already contained a generic, closed-module, semantics-preserving optimizer — constant
+`temen-peval` already contained a generic, closed-module, semantics-preserving optimizer — constant
 folding (bit-exact with the interpreter, floats + all v128 lane ops), branch resolution,
 dead-block elimination, dead-value elimination, block merging, dead block-param elimination, and
 copy-prop/algebraic identities, iterated to fixpoint. The goal here is to grow that into a real
@@ -30,13 +30,13 @@ The value is *not* uniform across backends, and that shapes which passes are wor
 ## Posture: untrusted-for-escape, +0 TCB  [SETTLED — inherited from §20a/§20c]
 
 Identical to the LLVM on-ramp and the specializer: the optimizer is a pure `Module → Module`
-transform whose output is **re-verified** (`svm_verify::verify_module`) before it runs. An
+transform whose output is **re-verified** (`temen_verify::verify_module`) before it runs. An
 optimizer bug is a clean verify error or a miscompile caught by the differential oracle — never
 an escape. The verifier, the confinement-masking lowering, and the wire format do not change.
 
-## Inside *and* outside svm  [SETTLED — recipe proven by svm-peval]
+## Inside *and* outside temen  [SETTLED — recipe proven by temen-peval]
 
-The guest-side story costs nothing new if the crate follows the rules `svm-peval` already
+The guest-side story costs nothing new if the crate follows the rules `temen-peval` already
 satisfies:
 
 - `#![forbid(unsafe_code)]`, `no_std + alloc` (test harness gets `std`), dependency-free except
@@ -47,7 +47,7 @@ satisfies:
   explicit budget via `OptConfig` — a guest pays metered fuel to run the optimizer, and code
   growth costs metered `Jit.compile` time.
 
-Host-side AOT flow: `decode → optimize → verify → encode` (already wired in `svm-run` behind the
+Host-side AOT flow: `decode → optimize → verify → encode` (already wired in `temen-run` behind the
 `optimize` flag). Guest-side: `optimize → encode → §22 Jit.compile → invoke`, exactly the peval
 demos' shape.
 
@@ -74,16 +74,16 @@ consequences are the legality rules every pass must obey:
    unreferenced by any table-addressable path.
 
 All of this is encoded once, in a shared **per-`Inst` effects table** (pure / can-trap /
-reads-mem / writes-mem / host-observable / control), living next to the `Inst` enum in `svm-ir`
+reads-mem / writes-mem / host-observable / control), living next to the `Inst` enum in `temen-ir`
 so new instructions *must* classify. Every pass consults the table; no pass carries its own
-opinion about purity. (Landed — Phase 1a: `Inst::effects` in `svm-ir`, `removable_if_dead`
+opinion about purity. (Landed — Phase 1a: `Inst::effects` in `temen-ir`, `removable_if_dead`
 derived from it.)
 
 ## Architecture  [SETTLED — decision recorded below]
 
-**Crate:** new `crates/svm-opt`, depending only on `svm-ir` (workspace member, same manifest
+**Crate:** new `crates/temen-opt`, depending only on `temen-ir` (workspace member, same manifest
 shape as peval). The existing `optimize_module` + fold/remap machinery *moves* there;
-`svm-peval` depends on `svm-opt` for residual cleanup and stays about specialization.
+`temen-peval` depends on `temen-opt` for residual cleanup and stays about specialization.
 
 **The block-local-SSA question.** The wire IR's key discipline — values are block-local,
 cross-block dataflow only via block params, no dominance analysis anywhere (§3) — is what keeps
@@ -116,23 +116,23 @@ tracked enhancement, not a blocker.
 
 ## Plan
 
-- [x] **Phase 0 — carve-out.** Created `crates/svm-opt` (`no_std + alloc`, `forbid(unsafe_code)`,
-  optional `libm`); moved `optimize_module` + fold/remap machinery out of `svm-peval`; re-pointed
-  `svm-peval` / `svm-run`. Pure refactor, no behavior change; all existing tests green.
+- [x] **Phase 0 — carve-out.** Created `crates/temen-opt` (`no_std + alloc`, `forbid(unsafe_code)`,
+  optional `libm`); moved `optimize_module` + fold/remap machinery out of `temen-peval`; re-pointed
+  `temen-peval` / `temen-run`. Pure refactor, no behavior change; all existing tests green.
 - [x] **Phase 1 — infrastructure.**
-  - [x] **(a) The per-`Inst` effects/trap table in `svm-ir`** ([`Inst::effects`] → [`Effects`]:
+  - [x] **(a) The per-`Inst` effects/trap table in `temen-ir`** ([`Inst::effects`] → [`Effects`]:
     `can_trap` / `reads_mem` / `writes_mem` / `side_effect`; `is_pure` + `removable_if_dead`
     derived). Exhaustive match, no wildcard, so a new `Inst` variant must be classified to compile.
     The DVE pass's `is_removable_if_dead` now delegates to it — one purity oracle. Behavior-preserving
     (the classification reproduces the old whitelist exactly; harness unchanged) and unit-tested by
-    category in `svm-ir`.
-  - [x] **(b) CFG utilities** (`svm_opt::cfg`): `Cfg` (pred/succ adjacency), `postorder`/`rpo`,
+    category in `temen-ir`.
+  - [x] **(b) CFG utilities** (`temen_opt::cfg`): `Cfg` (pred/succ adjacency), `postorder`/`rpo`,
     iterative Cooper–Harvey–Kennedy `dominators` (correct on irreducible CFGs), Tarjan `sccs`, and
     irreducible-aware `loop_headers` (flags *every* entry of a multi-entry cycle). All traversals are
     iterative (no host-stack recursion) and fuzz-safe (out-of-range targets ignored, not panicked).
     `term_successors` now delegates to `cfg::successors`. Unit-tested incl. an irreducible two-entry
     loop, self-loop, and unreachable block.
-  - [x] **(c) The internal conventional-SSA form** (`svm_opt::ssa`): `to_ssa` renames block-local
+  - [x] **(c) The internal conventional-SSA form** (`temen_opt::ssa`): `to_ssa` renames block-local
     operands to a function-global `Value` space (via the exhaustive `map_operands`), tracking each
     value's `Def` site; `from_ssa` is its exact inverse. The round-trip is the **identity**
     (`from_ssa(to_ssa(f)) == f`), pinned by hand-built shapes (params/`br_table`/loops/multi-result
@@ -149,7 +149,7 @@ tracked enhancement, not a blocker.
     honest "no optimization" baseline. Budgets landed with the first budgeted pass, the Phase 3
     inliner (module-wide instruction budget + `MAX_CALLEE_INSTS`).
 - [x] **Phase 2 — global scalar passes.**
-  - [x] **SCCP** (`svm_opt::sccp`): sparse conditional constant propagation on the internal SSA
+  - [x] **SCCP** (`temen_opt::sccp`): sparse conditional constant propagation on the internal SSA
     form — a `Top ⊒ Const ⊒ Bottom` lattice propagated across the CFG (through block-parameter phis
     and loops) together with per-edge executability, so a value is only marked varying on account of
     edges that can actually be taken. The transfer function reuses `try_fold` (interpreter-exact), so
@@ -168,7 +168,7 @@ tracked enhancement, not a blocker.
     so the earlier def trivially dominates, no param threading. Tests (`tests/cse.rs`): redundant add
     deduped, nested equal subexpressions, and identical loads **not** deduped. Covered by the
     `opt_sccp` fuzz target (now exercises the whole `optimize_module` pipeline).
-  - [x] **Global GVN** (`svm_opt::gvn`): value-number **congruence** (a block parameter is congruent
+  - [x] **Global GVN** (`temen_opt::gvn`): value-number **congruence** (a block parameter is congruent
     to the value passed to it when every predecessor agrees), iterated to a fixpoint, so a
     recomputation at a **multi-predecessor join** is recognized as redundant even though its operands
     are fresh parameters — the case `merge_blocks` + `local_cse` cannot reach. A congruent value whose
@@ -181,7 +181,7 @@ tracked enhancement, not a blocker.
     de-relooping**: LLVM's relooper encodes irreducible control flow as a dispatch variable set to a
     local constant at each predecessor of a `br_table` header; if GVN threaded those into params,
     `jump_thread` could no longer see them, but leaving them local lets it resolve the dispatch per edge
-    until the header dies — recovering the irreducible CFG that **SVM IR runs natively and wasm can't
+    until the header dies — recovering the irreducible CFG that **Temen IR runs natively and wasm can't
     represent** (measured: transpiled-from-wasm `irreducible` kernel 1.17× → 0.40× vs Wasmtime,
     `tests/opt_bench.rs`). Runs before the per-function cleanup. Tests (`tests/gvn.rs`): diamond-join
     redundancy, a derived two-level expression across a diamond, a redundant **constant not threaded**, a
@@ -200,7 +200,7 @@ tracked enhancement, not a blocker.
     **constant reassociation** `(x OP c1) OP c2 → x OP (c1 OP c2)` for associative+commutative ops
     (Add/Mul/And/Or/Xor), which shrinks constant chains an op at a time and exposes CSE (two paths that
     reassociate to `x+8` then share one op). Tests in `tests/peephole.rs`.
-  - [x] **LICM** (`svm_opt::licm`): hoists pure, non-trapping loop-invariant computations to the
+  - [x] **LICM** (`temen_opt::licm`): hoists pure, non-trapping loop-invariant computations to the
     loop preheader. Invariance is computed iteratively through block-param phis (a value defined
     outside the loop is invariant; a loop parameter is invariant when every incoming arg is invariant
     or is the parameter itself — the archetypal `x` passed unchanged around the back edge; a pure op is
@@ -234,17 +234,17 @@ tracked enhancement, not a blocker.
   `ref.func` devirtualization through the identity table; dead-function elimination
   (export/table-aware, rule 5 above). All landed (below), plus interprocedural constant
   propagation beyond the plan.
-  - [x] **Dead-function elimination** (`svm_opt::interproc::dead_func_elim`): the first module-level
+  - [x] **Dead-function elimination** (`temen_opt::interproc::dead_func_elim`): the first module-level
     pass. Call-graph reachability closure from the roots (entry `func 0` + every named export) over
     `call`/`return_call`/`thread.spawn`/`ref.func` edges (the static-funcidx sites
-    `svm_ir::offset_func_indices` enumerates); survivors renumbered densely, every funcidx reference +
+    `temen_ir::offset_func_indices` enumerates); survivors renumbered densely, every funcidx reference +
     export target remapped (names preserved). Because a funcref **equals its funcidx** (identity table)
     and can be a plain `ConstI32`, an indirect dispatch could reach any function, so the pass bails to
     the identity while `call_indirect`/`return_call_indirect`/`cont.new` is present — devirtualization
     (below) removes those first, then DFE applies. `OptConfig.dfe` toggle (default on), runs once after
     the per-function passes; output re-verified; debug info dropped on any removal. Tests in
     `tests/interproc.rs`; covered by the `opt_sccp` fuzz target (whole pipeline).
-  - [x] **Budgeted direct-call inliner** (`svm_opt::interproc::inline_calls`): splices a small callee
+  - [x] **Budgeted direct-call inliner** (`temen_opt::interproc::inline_calls`): splices a small callee
     into a direct `call` site. A **single-block, straight-line** callee is substituted in place — its
     params bind to the call's args, its instruction results take fresh caller-local indices where the
     call was, and the call's result forwards to the callee's returned values (renumbered through the
@@ -264,7 +264,7 @@ tracked enhancement, not a blocker.
     captured value threaded through the join; a callee with a **loop** threaded around its back edge;
     full-pipeline devirt→inline→DFE), all re-verified; the peval differential suite + `opt_sccp` fuzz
     target now exercise it on real residuals.
-  - [x] **Constant-funcref devirtualization** (`svm_opt::interproc::devirtualize`): a
+  - [x] **Constant-funcref devirtualization** (`temen_opt::interproc::devirtualize`): a
     `call_indirect`/`return_call_indirect` whose `idx` is a compile-time-constant funcref (a
     `ref.func k`, or an in-range `ConstI32 k` — a funcref is a plain `i32`, the identity table) and
     `funcs[k]`'s signature matches `ty` → rewritten **in place** to a direct `call`/`return_call`
@@ -276,13 +276,13 @@ tracked enhancement, not a blocker.
     signature mismatch is left to trap); peval differential + `opt_sccp` fuzz cover the pipeline. This
     completes the Phase 3 trio (**devirt + inliner + DFE**); multi-block-callee inlining (below) has
     since landed too.
-  - [x] **Interprocedural constant propagation** (`svm_opt::interproc::const_prop`): a monotone
+  - [x] **Interprocedural constant propagation** (`temen_opt::interproc::const_prop`): a monotone
     interprocedural fixpoint computes, per parameter, the join of the value passed at every call that can
     reach it (lattice `Bottom`/`Const`/`Top`); a parameter that resolves to a single constant is
     materialized in the entry block and its uses rewritten (the signature is unchanged — the parameter is
     left dead, callers keep passing it). The per-function passes then fold through it (branch resolution,
     arithmetic) and DFE reclaims the now-dead code — the win the vs-Wasmtime data pointed at
-    (interprocedural transforms are svm-opt's JIT edge, since Cranelift is per-function). Complements
+    (interprocedural transforms are temen-opt's JIT edge, since Cranelift is per-function). Complements
     inlining: it reaches callees **too big to inline**, where inline+SCCP cannot fold the constant
     (ablation `const_prop` case: **+100 B**, an isolated win no other pass reproduces). The fixpoint also
     resolves the **const-funcref-callback cascade**: a constant funcref (a `ref.func` or in-range
@@ -317,7 +317,7 @@ tracked enhancement, not a blocker.
     hint). Only full-width same-type store→load pairs forward (`i32/i64/f32/f64`); narrowing/cross-type
     are excluded. A store **clobbers precisely**: it drops cached cells off a *different* base value
     (may alias) or the *same* base with an **overlapping** byte range, and **keeps same-base cells at
-    disjoint offsets** — sound under `svm_mask`'s trap-confinement, where two admitted accesses off one
+    disjoint offsets** — sound under `temen_mask`'s trap-confinement, where two admitted accesses off one
     base differ by exactly their offset gap (an out-of-range address traps, never wraps to alias), so
     disjoint offset ranges are disjoint bytes (the common struct-field pattern). An atomic / `mem.copy`
     / call still clobbers the whole map. **`v128` load/store** participate too (keyed by a distinct
@@ -327,7 +327,7 @@ tracked enhancement, not a blocker.
     store that must block forwarding; a disjoint-offset store that must *not*; an overlapping-offset
     store that must; `v128` store→load forwarding); the peval differential suite + `opt_sccp` fuzz
     cover the pipeline.
-  - [x] **Cross-block redundant-load elimination** (`svm_opt::load_elim`) — the memory analogue of
+  - [x] **Cross-block redundant-load elimination** (`temen_opt::load_elim`) — the memory analogue of
     GVN. A load whose location a **dominating** access (an earlier load, or a matching store)
     established, with **no memory write on any path between**, is removed and its result forwarded —
     threaded across blocks by `crate::thread::Threader`, exactly as GVN threads a congruent dominating
@@ -352,14 +352,14 @@ tracked enhancement, not a blocker.
     differential, 46 peval differentials, `opt_sccp` fuzz) exercises it. **Next:** loop-invariant load
     hoisting and an opt-in scratch-region contract for dead-store elimination (DSE needs a
     private-region guarantee to stay sound under shared-memory threads).
-- [ ] **Phase 5 — close out.** In-sandbox demo (guest runs `svm-opt` on a module and JITs the
+- [ ] **Phase 5 — close out.** In-sandbox demo (guest runs `temen-opt` on a module and JITs the
   result, peval-demo shape); peval + Wasmtime-relative numbers with the optimizer on;
   fold the settled design into `DESIGN.md` §20 and retire this doc to a tracker stub.
-  - [x] **Per-pass ablation harness** (`crates/svm-peval/tests/opt_bench.rs`): leave-one-out
+  - [x] **Per-pass ablation harness** (`crates/temen-peval/tests/opt_bench.rs`): leave-one-out
     over the six togglable passes on a corpus of a realistic
     specialization residual + pass-targeted micro-modules, reporting encoded size and both JIT and
     interpreter run time. Every variant is re-verified + interp-differential-tested, so the size test
-    is also a correctness/size guard. First findings: the JIT's own optimizer washes out svm-opt's
+    is also a correctness/size guard. First findings: the JIT's own optimizer washes out temen-opt's
     scalar passes (native run time flat), so their JIT-path value is size/compile; on the interpreter
     the full pipeline is ~1.3× on an invariant-heavy loop, LICM the dominant run-time pass (~1.17×),
     while LICM/GVN *cost* static size — motivating a hoist cost model. Broaden the corpus (more
@@ -390,25 +390,25 @@ The first ablation surfaced concrete next steps, tracked here so they aren't los
   read 2× its neighbors). Report medians + spread over several runs before treating any delta as load-
   bearing.
 - [ ] **Track OPT + PEVAL benchmarking in CI.** Today the pass-ablation harness
-  (`crates/svm-peval/tests/opt_bench.rs`) and the partial-evaluation bench
+  (`crates/temen-peval/tests/opt_bench.rs`) and the partial-evaluation bench
   (`scripts/peval_bench_report.py`) are run-on-demand only — their numbers aren't watched over time
   the way the `bench/` vs-Wasmtime harness is (the nightly, non-gating `bench` job). Wire both into
   CI on that same nightly lane so OPT/PEVAL size + speed regressions surface one commit old, per
   `AGENTS.md` ("benchmark as soon as there's anything to run"). This is what replaces the retired
   standalone snapshot reports (`OPT_BENCH.md` / `PEVAL_BENCH.md`, deleted 2026-07-24): committed
   point-in-time numbers go stale silently; a CI lane tracks them like everything else we benchmark.
-- [x] **Wasmtime-relative numbers** (Phase 5, DESIGN.md §1a). Wired svm-opt into the `bench/`
-  vs-Wasmtime harness behind `--optimize`: the same wasm bytes run on the SVM JIT (transpiled to IR,
-  optionally svm-opt'd) and on Wasmtime, both via Cranelift. `compute32 = svm-jit ÷ Wasmtime` best-of-5,
+- [x] **Wasmtime-relative numbers** (Phase 5, DESIGN.md §1a). Wired temen-opt into the `bench/`
+  vs-Wasmtime harness behind `--optimize`: the same wasm bytes run on the Temen JIT (transpiled to IR,
+  optionally temen-opt'd) and on Wasmtime, both via Cranelift. `compute32 = temen-jit ÷ Wasmtime` best-of-5,
   optimizer on vs off (the `bench/` `--optimize` harness, "Wasmtime-relative"). Headline: **`irreducible` 1.17× → 0.40×**
-  (svm-jit 2.5× *faster* than Wasmtime) via de-relooping — svm-opt recovers the irreducible CFG from
-  clang's relooped wasm and SVM runs it natively (wasm can't represent it, so Wasmtime pays a
+  (temen-jit 2.5× *faster* than Wasmtime) via de-relooping — temen-opt recovers the irreducible CFG from
+  clang's relooped wasm and Temen runs it natively (wasm can't represent it, so Wasmtime pays a
   per-iteration dispatch); the loop kernels also improve (`memsum`/`locals_c` ~1.2× → ~0.96×) from the
   GVN constant cost model tightening loops, and the rest is flat. This is the §1a bar made concrete
   *and* an independent confirmation of the ablation thesis: the JIT re-derives the scalar passes on
-  ordinary compute (neutral), and svm-opt's native-speed win is the structural transforms Cranelift
+  ordinary compute (neutral), and temen-opt's native-speed win is the structural transforms Cranelift
   can't reconstruct (de-reloop, un-thread). The bench falls back to unoptimized IR (with a note) if
-  svm-opt output ever fails re-verify, so a kernel is never silently miscompiled.
+  temen-opt output ever fails re-verify, so a kernel is never silently miscompiled.
 - [ ] **Note for Phase 3/4 targeting.** Because the JIT backend (`opt_level="speed"`) already does its
   own GVN/CSE/LICM, scalar passes are ~JIT-run-time-neutral; the higher-leverage host-JIT wins are the
   cross-boundary transforms Cranelift *cannot* see — inlining (Phase 3) and memory passes (Phase 4).
@@ -427,17 +427,17 @@ The first ablation surfaced concrete next steps, tracked here so they aren't los
 - [ ] Debug-info (line map) preservation through transforms.
 - [ ] Loop unrolling / peeling under `OptConfig` budgets.
 - [x] Interprocedural constant propagation (beyond what inlining exposes). Landed
-  (`svm_opt::interproc::const_prop`, Phase 3 above) — reaches callees too big to inline, plus the
+  (`temen_opt::interproc::const_prop`, Phase 3 above) — reaches callees too big to inline, plus the
   const-funcref-callback cascade through devirt.
 
 ## Open questions
 
-- ~~Where exactly the effects table lives: `svm-ir` vs `svm-opt`.~~ **Resolved (Phase 1a):** it
-  lives in `svm-ir` next to `Inst`, as `Inst::effects() -> Effects`, so the exhaustive match forces
+- ~~Where exactly the effects table lives: `temen-ir` vs `temen-opt`.~~ **Resolved (Phase 1a):** it
+  lives in `temen-ir` next to `Inst`, as `Inst::effects() -> Effects`, so the exhaustive match forces
   every new instruction to be classified before it compiles.
-- Whether `svm-run` grows a standalone optimize-only mode (`decode → optimize → verify →
+- Whether `temen-run` grows a standalone optimize-only mode (`decode → optimize → verify →
   encode`, no specialization) for AOT pipelines — cheap, probably Phase 0/2 boundary.
 - ~~How much of the specializer's CFG-cleanup entanglement moves vs stays.~~ **Resolved
-  (Phase 0):** the optimizer + fold/remap machinery moved wholesale; `svm-peval` depends on
-  `svm-opt` and re-exports the fold helpers (`crates/svm-peval/src/lib.rs`) — the seam is the
-  `svm-opt` public API, as expected.
+  (Phase 0):** the optimizer + fold/remap machinery moved wholesale; `temen-peval` depends on
+  `temen-opt` and re-exports the fold helpers (`crates/temen-peval/src/lib.rs`) — the seam is the
+  `temen-opt` public API, as expected.

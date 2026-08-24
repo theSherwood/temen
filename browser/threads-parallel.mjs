@@ -1,16 +1,16 @@
 // THREADS.md step 4b — genuine parallelism: N Node worker_threads (separate OS threads) each run the
-// full SVM engine over the ONE shared linear memory, each over its own guest window, **concurrently**.
+// full Temen engine over the ONE shared linear memory, each over its own guest window, **concurrently**.
 // Each Worker is bootstrapped the wasm-threads way: its own stack + TLS block (so the engine's deep
 // call stacks don't collide), set from addresses the main thread pre-allocated in the shared memory.
 //
 // Build the engine as a threads module exporting the stack/TLS globals, then run:
-//   node threads-parallel.mjs <module.wasm> [guest.svmbc] [expected] [workers]
+//   node threads-parallel.mjs <module.wasm> [guest.temenc] [expected] [workers]
 import { readFileSync } from 'node:fs';
 import { Worker, isMainThread, workerData, parentPort } from 'node:worker_threads';
 import { engineImports } from './engine-imports.mjs';
 
-const WASM = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/svm_browser.wasm';
-const GUEST = process.argv[3] ?? 'corpus/threads.svmbc';
+const WASM = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/temen_browser.wasm';
+const GUEST = process.argv[3] ?? 'corpus/threads.temenc';
 const EXPECT = BigInt(process.argv[4] ?? 4000);
 const WORKERS = Number(process.argv[5] ?? 4);
 const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
@@ -21,7 +21,7 @@ async function worker() {
   const { exports: ex } = await WebAssembly.instantiate(module, engineImports(memory));
   ex.__stack_pointer.value = stackTop; // a private stack region (grows down from the top)
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // a private TLS block
-  const got = ex.svm_run_shared(modPtr, modLen, winPtr, winSize, BigInt(arg));
+  const got = ex.temen_run_shared(modPtr, modLen, winPtr, winSize, BigInt(arg));
   parentPort.postMessage(String(got));
 }
 
@@ -38,16 +38,16 @@ async function main() {
 
   // Guest bytes are read-only → shared by all Workers. Everything else is per-Worker + disjoint.
   const guest = readFileSync(GUEST);
-  const modPtr = ex.svm_alloc(guest.length);
+  const modPtr = ex.temen_alloc(guest.length);
   u8().set(guest, modPtr);
   const winSize = 1 << 16, stackSize = 1 << 20;
   const tlsSize = ex.__tls_size.value, tlsAlign = ex.__tls_align.value || 1;
 
   const jobs = Array.from({ length: WORKERS }, () => {
-    const winPtr = ex.svm_alloc(winSize);
+    const winPtr = ex.temen_alloc(winSize);
     u8().fill(0, winPtr, winPtr + winSize);
-    const stackTop = ex.svm_alloc(stackSize) + stackSize;
-    const tlsBase = tlsSize > 0 ? roundUp(ex.svm_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
+    const stackTop = ex.temen_alloc(stackSize) + stackSize;
+    const tlsBase = tlsSize > 0 ? roundUp(ex.temen_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
     return { winPtr, winSize, stackTop, tlsBase };
   });
 
@@ -67,7 +67,7 @@ async function main() {
 
   const ok = results.every((r) => r === EXPECT);
   results.forEach((r, i) => console.log(`  worker ${i}: ${r}  ${r === EXPECT ? '✓' : '✗ (want ' + EXPECT + ')'}`));
-  console.log(`\n${ok ? 'PASS' : 'FAIL'}: ${WORKERS} SVM engine instances ran in parallel over shared ` +
+  console.log(`\n${ok ? 'PASS' : 'FAIL'}: ${WORKERS} Temen engine instances ran in parallel over shared ` +
     `memory (${ms.toFixed(0)} ms)`);
   process.exit(ok ? 0 : 1);
 }

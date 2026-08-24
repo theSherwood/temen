@@ -3,8 +3,8 @@
 // is cross-origin isolated (SharedArrayBuffer available), the powerbox guest printed "hello,
 // powerbox!", and one guest's vCPUs ran across real Web Workers to 4000. This closes the gap between
 // "runs on Node worker_threads" and "runs in an actual browser" — the thesis BROWSER.md rests on.
-// Also drives the **playground** (`web/play.html`) end to end: SVM text typed into the editor,
-// parsed/verified in-browser (`svm_parse`), run across Workers in every powerbox mode, plus a
+// Also drives the **playground** (`web/play.html`) end to end: Temen text typed into the editor,
+// parsed/verified in-browser (`temen_parse`), run across Workers in every powerbox mode, plus a
 // parse-reject negative.
 //
 // Usage:  node browser-test.mjs            (after building the threads wasm + gencorpus; see below)
@@ -46,7 +46,7 @@ let failed = false;
 try {
   const page = await browser.newPage();
   // Keep the pageerror texts (not just print them): I22 is a rare flake where a worker vCPU's
-  // `svm_par_run` takes an uncaught host wasm trap (`memory access out of bounds`, or `unreachable`
+  // `temen_par_run` takes an uncaught host wasm trap (`memory access out of bounds`, or `unreachable`
   // from a panic=abort engine panic). The rejection never reaches the page, so the item hangs
   // `pending` and the wait below times out — with no clue which check tripped. On timeout we dump
   // both the still-`pending` items and these captured messages so the next recurrence self-identifies.
@@ -60,7 +60,7 @@ try {
 
   // I22 mitigation: the index page exercises the rare shared-memory codegen-stash race (a worker vCPU
   // traps → its item fails, or on an older engine the page hangs). Root cause is a double-free on the
-  // shared `svm_par_enable_*` stashes (ISSUES.md I22) — not yet fixed in the engine, but it passes on a
+  // shared `temen_par_enable_*` stashes (ISSUES.md I22) — not yet fixed in the engine, but it passes on a
   // plain reload every time it's been observed. So retry the whole index page up to 3× (reloading
   // between) instead of forcing a manual CI re-run. Each retry is logged LOUDLY so the flake stays
   // visible (per AGENTS.md "log flakiness early"); a real regression fails all 3 attempts and stays red.
@@ -137,9 +137,9 @@ try {
   console.log(`  ${jitb2.text}`);
   console.log(`  ${instthreads.text}\n`);
 
-  // --- the playground (play.html): SVM text typed into the page, parsed in-browser, run across ----
+  // --- the playground (play.html): Temen text typed into the page, parsed in-browser, run across ----
   // Workers. Drives the page like a human: pick an example / type source, click Run, read the
-  // result + stdout panes. Covers every powerbox mode through the `svm_parse` front end, plus a
+  // result + stdout panes. Covers every powerbox mode through the `temen_parse` front end, plus a
   // parse-reject negative (garbage source → an error message, not a hang or a crash).
   const play = await browser.newPage();
   play.on('console', (m) => console.log(`  [play] ${m.text()}`));
@@ -185,7 +185,7 @@ try {
 
   // Negative: garbage source must come back as a parse error message (state 'error'). Set the hello
   // card's CodeMirror value (it hides the underlying textarea) and run that card.
-  await play.evaluate((s) => document.querySelector(`${s} .CodeMirror`).CodeMirror.setValue('func ( this is not svm text'),
+  await play.evaluate((s) => document.querySelector(`${s} .CodeMirror`).CodeMirror.setValue('func ( this is not temen text'),
     card('hello'));
   const bad = await runPlay('hello');
   const badOk = bad.state === 'error' && bad.status.includes('parse error');
@@ -194,8 +194,8 @@ try {
     `${badOk ? 'PASS' : 'FAIL'}`);
 
   // An on-ramp module: a real C guest (`hello.c`) compiled through the LLVM on-ramp and run via
-  // `svm_run_onramp` (not the text/`svm_parse` path). Uses the committed `web/assets/hello_c.svmb`.
-  check('hello (C → SVM, on-ramp module)', await runPlay('hello (C → SVM)'), '0', 'hello, sandbox!\n');
+  // `temen_run_onramp` (not the text/`temen_parse` path). Uses the committed `web/assets/hello_c.temen`.
+  check('hello (C → Temen, on-ramp module)', await runPlay('hello (C → Temen)'), '0', 'hello, sandbox!\n');
 
   // The framebuffer output path (the `display` capability): the gradient guest presents a 128×128
   // RGBA frame, which play.js blits to the canvas. Assert the canvas got the right dimensions and a
@@ -299,11 +299,11 @@ try {
 
   // PostgreSQL in the playground — a whole `postgres --single` boots inside wasm on the same threads
   // engine, mounts its data image on the `fs` cap, and runs SQL as a **live interactive session**
-  // (`svm_pg_open`/`_query`): the first Run boots to the prompt + runs the default batch; a second Run
+  // (`temen_pg_open`/`_query`): the first Run boots to the prompt + runs the default batch; a second Run
   // sends a NEW query to the *same* backend, proving state persists (the boot-once/query-many payoff).
   // The two large artifacts are gitignored / built by the heavy demo pipeline, so this SKIPS when they
   // aren't staged (CI without them stays green). Boot is multi-second — a generous timeout.
-  if (existsSync(join(ROOT, 'web/assets/postgres_resolved.svmb')) &&
+  if (existsSync(join(ROOT, 'web/assets/postgres_resolved.temen')) &&
       existsSync(join(ROOT, 'web/assets/pgdata.img'))) {
     const P = card('PostgreSQL (17.5 — write & run SQL)');
     const pgRun = async (timeout) => {
@@ -341,12 +341,12 @@ try {
 
   const ok = pageOk && checks.every(Boolean);
   failed = !ok;
-  console.log(`${ok ? 'PASS' : 'FAIL'}: SVM runs in a real browser — powerbox + genuine multi-Worker ` +
+  console.log(`${ok ? 'PASS' : 'FAIL'}: Temen runs in a real browser — powerbox + genuine multi-Worker ` +
     `parallelism (incl. §22 guest-JIT on a shared Domain, §14 confined executor children on their ` +
     `own Workers, and 4d host I/O from worker vCPUs through one shared powerbox) over a shared ` +
-    `WebAssembly.Memory under cross-origin isolation — plus the playground (SVM text parsed ` +
-    `in-browser via svm_parse, run across Workers in every powerbox mode) and the wasm-JIT tier ` +
-    `(SVM IR compiled to wasm in-browser, f0 called directly, matching the interpreter) — including ` +
+    `WebAssembly.Memory under cross-origin isolation — plus the playground (Temen text parsed ` +
+    `in-browser via temen_parse, run across Workers in every powerbox mode) and the wasm-JIT tier ` +
+    `(Temen IR compiled to wasm in-browser, f0 called directly, matching the interpreter) — including ` +
     `per-Worker JIT tier-up (a threaded guest's compute leaves run on emitted wasm on their own ` +
     `Workers), §22 guest-JIT real codegen (a guest's Jit.invoke runs the submitted unit on ` +
     `emitted wasm per-Worker), and §14 instantiate_module real codegen (a confined child runs its ` +

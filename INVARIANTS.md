@@ -160,12 +160,12 @@ alone (the fork factory serving that fork learns the same pid at mint), reap and
 are parent-scoped (`-ECHILD` for anyone else). The core manufactures no reachability — no
 domain-enumeration surface, no signal-an-arbitrary-id op, no global namespaces. Global
 views (a POSIX pid table, cross-tree `kill`) are **personality policy**, assembled from
-capabilities passed down the ancestry chain (svm-posix's shared `World` rides the
+capabilities passed down the ancestry chain (temen-posix's shared `World` rides the
 grant → fork → fork closure chain) — never substrate state. Wakes the core hands a
 personality are scoped to the target domain, never run-wide (`interrupt_interruptible_parks`
 takes a domain; #863 slice 3 — the three-generation `c_fork` witness pins that a `^C` at the
 parent never sweeps the child's park). *Violated by:* a core surface that resolves a pid/TaskId
 the caller's ancestry never disclosed, a new run-global sweep reachable from one domain's
 signal, or a personality handed more visibility than its grant chain carries. (Owner
-decision 2026-08-13; #863; the slice-2 process table deliberately landed in `svm-posix`,
+decision 2026-08-13; #863; the slice-2 process table deliberately landed in `temen-posix`,
 not the core.)

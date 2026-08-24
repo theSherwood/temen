@@ -1,5 +1,5 @@
-// The SVM **playground** — the human-facing demo the THREADS/BROWSER work builds toward: type SVM
-// text, it parses/verifies/encodes *inside the wasm sandbox* (`svm_parse`), and runs across real Web
+// The Temen **playground** — the human-facing demo the THREADS/BROWSER work builds toward: type Temen
+// text, it parses/verifies/encodes *inside the wasm sandbox* (`temen_parse`), and runs across real Web
 // Workers (`par.js`, the same orchestration the validation page uses). The powerbox select picks the
 // run's recipe: none (compute only), 4d host I/O (stdout read back onto the page), §22 guest-JIT, or
 // a §14 root `Instantiator` (sandboxed children on their own Workers). The page services no
@@ -16,7 +16,7 @@ import { formatPgOutput } from './pg-format.js';
 
 const $ = (id) => document.getElementById(id);
 
-// Each example: the SVM text, its powerbox mode, and what to expect. The kernels are the proven
+// Each example: the Temen text, its powerbox mode, and what to expect. The kernels are the proven
 // schedule-independent ones from `gencorpus.rs` (same ground truths the validation page asserts).
 const EXAMPLES = {
   hello: {
@@ -330,13 +330,13 @@ block 0 (v0: i64) {
 `,
   },
 
-  'Debugger (SVM — breakpoints, step, variables)': {
+  'Debugger (Temen — breakpoints, step, variables)': {
     debug: true,
     bp: 7, // a breakpoint pre-placed on line 8 (0-based 7), the loop body
     mode: 'plain',
     desc: 'The §DEBUGGING Debug Adapter Protocol debugger, running on the bytecode engine right here ' +
       'in the sandbox — no `debug` section needed. The engine auto-derives a line table and names the ' +
-      'SSA values straight from the SVM text, so any program you write here is debuggable. Click the ' +
+      'SSA values straight from the Temen text, so any program you write here is debuggable. Click the ' +
       'gutter to set/clear breakpoints (one is pre-placed on line 8), then press Debug: it stops at the ' +
       'line, highlights it, and shows the in-scope values (i / acc) in the Variables pane. Step and ' +
       'Continue walk the loop — watch acc accumulate. Run executes it normally (→ 15). Same DAP server ' +
@@ -361,7 +361,7 @@ block 2 (r: i64) {
 `,
   },
 
-  'Debugger (SVM — watchpoints / data breakpoints)': {
+  'Debugger (Temen — watchpoints / data breakpoints)': {
     debug: true,
     bp: 11, // a breakpoint pre-placed on line 12 (0-based 11), the loop body, so a session pauses to arm
     mode: 'plain',
@@ -399,7 +399,7 @@ block 2 (r: i64) {
   }
 }
 
-debug.file 0 "counter.svm"
+debug.file 0 "counter.temt"
 debug.fname 0 "count_up"
 debug.loc 0 0 0 0 7 3
 debug.loc 0 0 1 0 8 3
@@ -417,7 +417,7 @@ debug.var 0 "count" fixed 0 "long" 0
 `,
   },
 
-  'Debugger (SVM — threads)': {
+  'Debugger (Temen — threads)': {
     debug: true,
     bp: 19, // a breakpoint pre-placed on line 20 (0-based 19), the worker's atomic increment
     mode: 'plain',
@@ -459,7 +459,7 @@ block 0 (sp: i64, inc: i64) {
 `,
   },
 
-  'Debugger (SVM — wait / notify)': {
+  'Debugger (Temen — wait / notify)': {
     debug: true,
     bp: 27, // a breakpoint pre-placed on line 28 (0-based 27), the worker's read *after* the futex wait
     mode: 'plain',
@@ -504,7 +504,7 @@ block 0 (sp: i64, arg: i64) {
 `,
   },
 
-  'Debugger (SVM — fibers / generators)': {
+  'Debugger (Temen — fibers / generators)': {
     debug: true,
     bp: 18, // a breakpoint pre-placed on line 19 (0-based 18), inside the fiber body
     mode: 'plain',
@@ -544,7 +544,7 @@ block 0 (sp: i64, arg: i64) {
 `,
   },
 
-  'Debugger (SVM — fibers + threads)': {
+  'Debugger (Temen — fibers + threads)': {
     debug: true,
     bp: 36, // a breakpoint pre-placed on line 37 (0-based 36), inside the fiber body
     mode: 'plain',
@@ -601,24 +601,24 @@ block 0 (sp2: i64, arg2: i64) {
 `,
   },
 
-  // ---- on-ramp modules: real C/C++ guests, compiled through clang → svm-llvm and run as a
-  //      pre-built .svmb via `svm_run_onramp` (no in-browser parse). Built by
+  // ---- on-ramp modules: real C/C++ guests, compiled through clang → temen-llvm and run as a
+  //      pre-built .temen via `temen_run_onramp` (no in-browser parse). Built by
   //      `build-onramp-assets.mjs` at `--host-page 65536` (the wasm page). ------------------------
-  'hello (C → SVM)': {
+  'hello (C → Temen)': {
     kind: 'module',
     jit: true, // _start is wasm-JIT-emittable (proven byte-identical by browser-jit-module-test)
-    url: './assets/hello_c.svmb',
+    url: './assets/hello_c.temen',
     mode: 'io',
-    desc: 'crates/svm-run/demos/hello.c — a C program compiled with stock clang, translated by the ' +
+    desc: 'crates/temen-run/demos/hello.c — a C program compiled with stock clang, translated by the ' +
       'LLVM on-ramp, and run through the powerbox: it write(1, …)s a greeting and exits. The output ' +
       'below is the guest’s real stdout. Toggle "wasm-JIT" to run the whole program (_start) on ' +
       'emitted wasm instead of the interpreter — "Prove interp ≡ JIT" checks the stdout matches.',
   },
   'gradient (C → framebuffer)': {
     kind: 'module',
-    url: './assets/gradient.svmb',
+    url: './assets/gradient.temen',
     mode: 'io',
-    desc: 'crates/svm-run/demos/display/gradient.c — a C guest renders a 128×128 RGBA image and ' +
+    desc: 'crates/temen-run/demos/display/gradient.c — a C guest renders a 128×128 RGBA image and ' +
       'presents one frame through the `display` capability (resolved by name, like Lua’s io / ' +
       'SQLite’s VFS). The host reads the frame out of guest memory and blits it to the canvas on the ' +
       'right. This is the framebuffer output path the graphical demos (Doom) ride.',
@@ -626,10 +626,10 @@ block 0 (sp2: i64, arg2: i64) {
   'bounce (interactive — arrow keys)': {
     kind: 'reactor',
     jit: true, // tick() is wasm-JIT-emittable (proven byte-identical by browser-jit-reactor-test)
-    url: './assets/bounce.svmb',
+    url: './assets/bounce.temen',
     jit: true, // tick() emits after cap-call outlining — toggle "wasm-JIT" to run it near-natively
     mode: 'io',
-    desc: 'crates/svm-run/demos/display/bounce.c — a C guest whose exported tick() runs one frame. ' +
+    desc: 'crates/temen-run/demos/display/bounce.c — a C guest whose exported tick() runs one frame. ' +
       'Click Run, then steer the box with the arrow keys: the page calls tick() once per animation ' +
       'frame (the reactor run model), feeding key events in through the `keyboard` capability and ' +
       'blitting the frame it presents through `display`. State persists between frames. This is the ' +
@@ -639,10 +639,10 @@ block 0 (sp2: i64, arg2: i64) {
   'life (Conway — heap persistence)': {
     kind: 'reactor',
     jit: true, // tick() is wasm-JIT-emittable (proven byte-identical by browser-jit-reactor-test)
-    url: './assets/life.svmb',
+    url: './assets/life.temen',
     jit: true, // tick() emits after cap-call outlining — toggle "wasm-JIT" to run it near-natively
     mode: 'io',
-    desc: 'crates/svm-run/demos/display/life.c — Conway’s Game of Life. Its cell grid lives in the ' +
+    desc: 'crates/temen-run/demos/display/life.c — Conway’s Game of Life. Its cell grid lives in the ' +
       'malloc heap (which the on-ramp grows above the mapped window — exactly where Doom’s allocator ' +
       'will sit). Each tick computes the next generation from the current one, so the glider only ' +
       'advances if the reactor persists the guest’s whole memory (heap included) between frames. ' +
@@ -652,10 +652,10 @@ block 0 (sp2: i64, arg2: i64) {
   'Mandelbrot zoom (interactive — arrow keys)': {
     kind: 'reactor',
     jit: true, // tick() is wasm-JIT-emittable (proven byte-identical by browser-jit-reactor-test)
-    url: './assets/mandelzoom.svmb',
+    url: './assets/mandelzoom.temen',
     jit: true, // f64 tick() emits after cap-call outlining — toggle "wasm-JIT" for a ~24× speedup
     mode: 'io',
-    desc: 'crates/svm-run/demos/display/mandelzoom.c — a C guest whose exported tick() computes a ' +
+    desc: 'crates/temen-run/demos/display/mandelzoom.c — a C guest whose exported tick() computes a ' +
       'full double-precision Mandelbrot for the current view (in the sandbox, on the CPU — no GPU) ' +
       'and presents the RGBA frame through the `display` capability. Click Run: it auto-zooms toward ' +
       'a seahorse valley with a cycling rainbow palette; steer the zoom target with the arrow keys. ' +
@@ -666,10 +666,10 @@ block 0 (sp2: i64, arg2: i64) {
   },
   'GPU: Mandelbrot zoom (WebGPU shader)': {
     kind: 'reactor',
-    url: './assets/gpu_shader.svmb',
+    url: './assets/gpu_shader.temen',
     mode: 'io',
     webgpu: true,
-    desc: 'crates/svm-run/demos/display/gpu_shader.c — a sandboxed C guest ships a WGSL fragment ' +
+    desc: 'crates/temen-run/demos/display/gpu_shader.c — a sandboxed C guest ships a WGSL fragment ' +
       'shader once through a `webgpu` capability, then asks the host to present a frame each tick. ' +
       'The Mandelbrot escape-time loop runs on the **GPU** (via the browser’s WebGPU / navigator.gpu), ' +
       'so it stays smooth at 640×480 while zooming into a seahorse valley — only the tiny (frame, w, h) ' +
@@ -678,7 +678,7 @@ block 0 (sp2: i64, arg2: i64) {
   },
   'DOOM (1993 — arrow keys, Ctrl fires)': {
     kind: 'reactor',
-    url: './assets/doom.svmb',
+    url: './assets/doom.temen',
     wad: './assets/doom1.wad',
     jit: true, // the whole tick() is wasm-JIT-emittable — the "wasm-JIT" toggle runs it near-natively
     mode: 'io',
@@ -701,7 +701,7 @@ block 0 (sp2: i64, arg2: i64) {
     // over the restored snapshot), falling back to warm-interp if the eval declines.
     editable: true,
     lang: 'lua',
-    url: './assets/lua_snapshot.svmb',
+    url: './assets/lua_snapshot.temen',
     mode: 'io',
     desc: 'Lua 5.4.7 — its core (lexer, parser, GC, bytecode VM) plus the base/string/table/math/' +
       'coroutine/io/os libraries, compiled through the LLVM on-ramp. Edit the Lua on the left and ' +
@@ -744,32 +744,32 @@ for v in squares(6) do sq[#sq + 1] = v end
 print("squares:", table.concat(sq, " "))
 `,
   },
-  'C compiler (chibicc → SVM — compile & run)': {
+  'C compiler (chibicc → Temen — compile & run)': {
     kind: 'chibicc',
     debug: true, // source-level C debugging: tick "debug info (-g)", then Debug (see the debugger below)
     jit: true, // chibicc's _start emits to wasm (333 funcs; cap-call/float helpers bounce cross-tier) —
     //          toggle "wasm-JIT" to run the compile several× faster (byte-identical IR, gated by chibicc_jit.rs)
     editable: true,
     lang: 'c',
-    url: './assets/chibicc.svmb',
+    url: './assets/chibicc.temen',
     mode: 'io',
     desc: 'A real C compiler — chibicc, itself compiled through the LLVM on-ramp — running client-side ' +
-      'in the sandbox. Edit the C on the left and click Run: the page runs chibicc.svmb over your source ' +
-      '(seeded on an fs capability at /in.c), which emits SVM IR; the page then svm_parse-es that IR into ' +
+      'in the sandbox. Edit the C on the left and click Run: the page runs chibicc.temen over your source ' +
+      '(seeded on an fs capability at /in.c), which emits Temen IR; the page then temen_parse-es that IR into ' +
       'a module and runs it. Your program’s output (what printf writes) appears in the pane, with the ' +
-      'emitted SVM IR below it, and main()’s return value as the result. A libc ships as headers ' +
+      'emitted Temen IR below it, and main()’s return value as the result. A libc ships as headers ' +
       '(seeded under /include) — #include <stdio.h>/<string.h>/<stdlib.h>/<ctype.h>/<math.h>/<assert.h>/' +
       '<limits.h>/<stddef.h>/<errno.h> as guest C over the powerbox’s ambient write, including %f/%e/%g float ' +
       'formatting (correctly rounded to the requested precision — not a bignum shortest-round-trip, so a few ' +
       'exact-tie roundings can differ from glibc). Split the editor into a multi-file project with `//// file: name` ' +
       'marker lines — the code above the first marker is /in.c, and it can #include "name" the sibling files ' +
-      '(headers or extra .c, unity-build style). Compile a program and run it, entirely in the browser, on the SVM.',
+      '(headers or extra .c, unity-build style). Compile a program and run it, entirely in the browser, on the Temen.',
     src: `// Write C here, then click Run. printf output shows in the pane on the
-// right; the emitted SVM IR appears below it, and main()'s return is the result.
+// right; the emitted Temen IR appears below it, and main()'s return is the result.
 #include <stdio.h>
 
 int main(void) {
-  printf("Hello from C — compiled to SVM IR in your browser!\\n\\n");
+  printf("Hello from C — compiled to Temen IR in your browser!\\n\\n");
 
   // A little numerical integration: estimate pi via the Leibniz series.
   double pi = 0.0;
@@ -783,7 +783,7 @@ int main(void) {
 }
 `,
   },
-  'C source-level debugging (chibicc → SVM — breakpoints on C lines)': {
+  'C source-level debugging (chibicc → Temen — breakpoints on C lines)': {
     kind: 'chibicc',
     debug: true,
     gOn: true, // debug info starts ON: this card is ready to Debug (the compiler emits chibicc's -g waist)
@@ -791,7 +791,7 @@ int main(void) {
     jit: false,
     editable: true,
     lang: 'c',
-    url: './assets/chibicc.svmb',
+    url: './assets/chibicc.temen',
     mode: 'io',
     desc: 'Debug a **C program at source level**, entirely in the browser. chibicc compiles this C with ' +
       '`-g` (the DEBUGGING.md §6 debug-info waist — source lines + variable names), and the DAP debugger ' +
@@ -818,55 +818,55 @@ int main(void) {
 }
 `,
   },
-  'chibicc compiles its own source (self-host → SVM)': {
+  'chibicc compiles its own source (self-host → Temen)': {
     kind: 'selfhost',
     jit: true, // chibicc's _start emits to wasm; every cc1 TU (giants included) compiles in a few hundred ms
     editable: false,
-    url: './assets/chibicc.svmb',
+    url: './assets/chibicc.temen',
     image: './assets/chibicc_selfhost.img',
     // The tractable cc1 TUs (SELFHOST_C.md); the giants (preprocess/parse/codegen_ir) are added next.
     tus: ['strings.c', 'hashmap.c', 'unicode.c', 'type.c', 'tokenize.c'],
     mode: 'io',
     desc: 'The self-host capstone (SELFHOST_C.md): **chibicc compiles its own source, in your browser.** ' +
       'Pick one of chibicc’s own cc1 translation units — its tokenizer, parser, type system — and click ' +
-      'Run: chibicc.svmb (itself a C compiler, compiled to SVM IR through the LLVM on-ramp) compiles that ' +
-      'file in `--emit-object` mode into a linkable SVM-IR object, reading the ~96-file glibc header ' +
+      'Run: chibicc.temen (itself a C compiler, compiled to Temen IR through the LLVM on-ramp) compiles that ' +
+      'file in `--emit-object` mode into a linkable TEMEN-IR object, reading the ~96-file glibc header ' +
       'closure `chibicc.h` pulls from an in-memory filesystem seeded into the sandbox — no server, no ' +
       '/usr/include, all client-side. The emitted object is **byte-identical to a native chibicc build** ' +
       '(gated in CI). On the wasm-JIT even the 3400-line giants compile in a few hundred milliseconds; ' +
       '“Prove interp ≡ JIT” recompiles on both engines and checks the objects match to the byte.',
   },
-  'nim (Nim → SVM, runs)': {
+  'nim (Nim → Temen, runs)': {
     kind: 'module',
-    url: './assets/nim_hello.svmb',
+    url: './assets/nim_hello.temen',
     mode: 'io',
-    desc: "A **real Nim program** — `import std/syncio` / `write(stdout, \"hello, svm\\n\")` — compiled " +
-      "all the way to a runnable SVM module and **run client-side in the sandbox**. The full nimony " +
-      "toolchain (nifler → nimony → hexer) lowered the Nim to Leng, `svm-leng` translated + linked it " +
+    desc: "A **real Nim program** — `import std/syncio` / `write(stdout, \"hello, temen\\n\")` — compiled " +
+      "all the way to a runnable Temen module and **run client-side in the sandbox**. The full nimony " +
+      "toolchain (nifler → nimony → hexer) lowered the Nim to Leng, `temen-leng` translated + linked it " +
       "against the real compiled `system` module, and the nim→powerbox bridge wired its bottom edge to " +
       "the sandbox's caps (nimony's `write(fd,buf,len)` → the powerbox `write` stream). Click Run: the " +
-      "output below is the guest's **real stdout** — a Nim program printing on the SVM. (The Nim→Leng " +
-      "front end runs at build time for now, unlike the `svm-leng` card below, which runs the translator " +
-      "itself in your browser; committed `nim_hello.svmb`, gated by `nim_hello_asset.rs`.)",
+      "output below is the guest's **real stdout** — a Nim program printing on the Temen. (The Nim→Leng " +
+      "front end runs at build time for now, unlike the `temen-leng` card below, which runs the translator " +
+      "itself in your browser; committed `nim_hello.temen`, gated by `nim_hello_asset.rs`.)",
   },
   'nifler: parse real Nim → NIF (nimony front-end, in your browser)': {
     kind: 'nifler',
     editable: true,
     lang: 'nim',
-    url: './assets/nifler.svmb.gz',
+    url: './assets/nifler.temen.gz',
     mode: 'io',
     desc: "**Compile Nim in your browser** (NIM.md §3c/§3e slice 4): `nifler` — the *first real nimony " +
-      "compiler phase* (Nim source → parsed NIF) — is itself a Nim program, on-ramped to a verified SVM " +
+      "compiler phase* (Nim source → parsed NIF) — is itself a Nim program, on-ramped to a verified Temen " +
       "module through the LLVM/C on-ramp (slice 1), now **running client-side in the sandbox** over your " +
       "own code. Edit the Nim on the left and click Run: the page seeds it as `/in.nim` on an in-memory " +
       "`fs` cap, runs `nifler p /in.nim /out.p.nif`, and shows the `.p.nif` it emitted — the same real " +
       "nifler that parses Nim natively, **byte-identical to a native run** (gated by `nifler_asset.rs`). " +
-      "This is the **front edge** of the toolchain (Nim → NIF), the complement to the `svm-leng` card " +
-      "below (Leng → SVM IR); unlike the `nim (Nim → SVM, runs)` card above, whose front-end ran at " +
+      "This is the **front edge** of the toolchain (Nim → NIF), the complement to the `temen-leng` card " +
+      "below (Leng → Temen IR); unlike the `nim (Nim → Temen, runs)` card above, whose front-end ran at " +
       "*build* time, here a front-end phase runs **in the browser**. The ~17.7 MB module ships gzipped " +
       "(~3.8 MB) and inflates client-side; the guest reaches only the seeded `fs` — no ambient authority. " +
-      "No server, all in your browser, on the SVM.",
-    src: `# Edit this Nim, then Run: the real nifler (nimony's parser, compiled to SVM)
+      "No server, all in your browser, on the Temen.",
+    src: `# Edit this Nim, then Run: the real nifler (nimony's parser, compiled to Temen)
 # parses it into nimony's NIF — the first compiler phase, in your browser.
 proc fib(n: int): int =
   if n < 2: n
@@ -877,36 +877,36 @@ for x in xs:
   echo fib(x)
 `,
   },
-  'nim: compile & run a whole Nim program → SVM (the full toolchain, in your browser)': {
+  'nim: compile & run a whole Nim program → Temen (the full toolchain, in your browser)': {
     kind: 'nimc',
     editable: true,
     lang: 'nim',
     mode: 'io',
-    // Four assets: the three phase guests (gzipped `.svmb`) + the nimony stdlib image (gzipped).
+    // Four assets: the three phase guests (gzipped `.temen`) + the nimony stdlib image (gzipped).
     urls: {
-      nifler: './assets/nifler.svmb.gz',
-      nimsem: './assets/nimsem.svmb.gz',
-      hexer: './assets/hexer.svmb.gz',
+      nifler: './assets/nifler.temen.gz',
+      nimsem: './assets/nimsem.temen.gz',
+      hexer: './assets/hexer.temen.gz',
       stdlib: './assets/nim_stdlib.img.gz',
     },
     desc: "**Compile a whole Nim program in your browser** (NIM.md §3c/§3e; #958) — the capstone of the " +
-      "nimony-on-SVM slices. The `nifler` card above runs *one* phase (parse); this runs the **entire " +
+      "nimony-on-Temen slices. The `nifler` card above runs *one* phase (parse); this runs the **entire " +
       "nimony toolchain client-side**: the page plays nifmake itself — computes each module's cache stem " +
       "exactly as nimony does, crawls your program's `import` graph with `nifler`, then runs `nimsem` " +
       "(sema — itself spawning `nifler` as a sandboxed `exec` child over a shared in-memory `fs`) and " +
       "`hexer` (lower) over the whole closure, links the result through the nim→powerbox bridge with " +
-      "`svm-leng`, and **runs `_start` under the powerbox**. Every phase is a verified SVM guest; the " +
-      "stdlib is mounted from a committed `svm_fs` image. Edit the Nim on the left and click Run — the " +
-      "output below is your program's **real stdout**, produced by a Nim program the SVM compiled and " +
+      "`temen-leng`, and **runs `_start` under the powerbox**. Every phase is a verified Temen guest; the " +
+      "stdlib is mounted from a committed `temen_fs` image. Edit the Nim on the left and click Run — the " +
+      "output below is your program's **real stdout**, produced by a Nim program the Temen compiled and " +
       "ran end-to-end, no server. The default below shows a `proc`, a `string` parameter, and string " +
       "concatenation (`&`) all compiling through; the language conformance suite (#956) runs **15/15** " +
-      "features end-to-end on the SVM — generics, exceptions, methods, closures, `seq`/`string`/`Table`, " +
+      "features end-to-end on the Temen — generics, exceptions, methods, closures, `seq`/`string`/`Table`, " +
       "floats, iterators, variant/`ref` objects, ARC destructors. (`echo` isn't an identifier nimony " +
       "resolves yet — a front-end gap; use `write(stdout, …)` for output. The four assets total ~6.5 MB " +
       "gzipped and inflate in-browser.)",
     src: `# Edit this Nim, then Run. The whole nimony toolchain compiles it in your
-# browser — nifler (parse) -> nimsem (sema) -> hexer (lower) -> svm-leng
-# (translate + link) — and the result runs on the SVM. The text below is
+# browser — nifler (parse) -> nimsem (sema) -> hexer (lower) -> temen-leng
+# (translate + link) — and the result runs on the Temen. The text below is
 # your program's real stdout.
 import std/syncio
 
@@ -914,20 +914,20 @@ proc greet(name: string): string =
   "hello, " & name & "\\n"
 
 write(stdout, greet("Nim"))
-write(stdout, greet("the SVM"))
+write(stdout, greet("the Temen"))
 `,
   },
-  'svm-leng: translate real nimony Leng → SVM IR (self-host)': {
+  'temen-leng: translate real nimony Leng → Temen IR (self-host)': {
     kind: 'module',
     jit: true, // #1011: `compile_jit(Batch)` is WasmDriven with ~281/282 funcs emitted — the whole
     // translator runs as emitted wasm (the old "folds to the tree-walker" note conflated this with the
     // *native* Cranelift JIT's 64 MiB window cap, which the wasm-JIT doesn't have). Defaults to the
     // wasm-JIT tier; a decline/trap falls back to the interpreter, and "Prove interp ≡ JIT" checks parity.
     editable: true,
-    lang: 'svm',
-    url: './assets/svm-leng.svmb',
+    lang: 'temen',
+    url: './assets/temen-leng.temen',
     mode: 'io',
-    desc: "The **leng self-host capstone** (NIM.md §3e): svm-leng — the Leng→SVM-IR translator, itself compiled to a verified SVM module through the LLVM on-ramp — **running client-side in the sandbox**. The editor holds a **real hexer Leng file** (verbatim `hexer c` output from Nim's `system/stringimpl` — string types, `=wasMoved`, ARC). Click Run: the page pipes it to `svm-leng.svmb` on stdin, the translator parses the NIF and emits **SVM IR text** on stdout (shown below), and the run's exit code is the result (0 = ok, 2 = an unsupported/malformed Leng construct). The emitted IR is **byte-identical to running svm-leng natively** (gated in CI by `leng_selfhost_asset.rs`). By default the translator runs on the **wasm-JIT tier** (the whole `_start` emitted to wasm — #1011); untick *wasm-JIT* to compare the interpreter, or *Prove interp ≡ JIT* to check they agree byte-for-byte. Edit the Leng to translate your own — the same real translator, no server, all in your browser, on the SVM.",
+    desc: "The **leng self-host capstone** (NIM.md §3e): temen-leng — the Leng→TEMEN-IR translator, itself compiled to a verified Temen module through the LLVM on-ramp — **running client-side in the sandbox**. The editor holds a **real hexer Leng file** (verbatim `hexer c` output from Nim's `system/stringimpl` — string types, `=wasMoved`, ARC). Click Run: the page pipes it to `temen-leng.temen` on stdin, the translator parses the NIF and emits **Temen IR text** on stdout (shown below), and the run's exit code is the result (0 = ok, 2 = an unsupported/malformed Leng construct). The emitted IR is **byte-identical to running temen-leng natively** (gated in CI by `leng_selfhost_asset.rs`). By default the translator runs on the **wasm-JIT tier** (the whole `_start` emitted to wasm — #1011); untick *wasm-JIT* to compare the interpreter, or *Prove interp ≡ JIT* to check they agree byte-for-byte. Edit the Leng to translate your own — the same real translator, no server, all in your browser, on the Temen.",
     src: `(stmts
  (type :string.0. . (object . (fld :bytes.0 . (u 64)) (fld :more.0 . (ptr LongString.0.))))
  (type :LongString.0. . (object . (fld :fullLen.0 . (i +64)) (fld :rc.0 . (i +64)) (fld :capImpl.0 . (i +64)) (fld :data.0 . (uarray (c 8)))))
@@ -1126,23 +1126,23 @@ write(stdout, greet("the SVM"))
           (sizeof@l string.0.@1)))))))))))
 `,
   },
-  'Shell (svm-posix — write & run a script)': {
+  'Shell (temen-posix — write & run a script)': {
     kind: 'shell',
     jit: false, // the shell carries Instantiator/SharedRegion cap.calls → bytecode cooperative engine
     editable: true,
     lang: 'shell',
-    url: './assets/shell.svmb',
+    url: './assets/shell.temen',
     // The shell's PATH registry: the __stage ring-filter runner (concurrent pipelines) and the `primes`
     // external command (a separate compiled-C program the shell exec's as an op-13 §14 child).
     cmds: [
-      { name: '__stage', url: './assets/stage_runner.svmb' },
-      { name: 'primes', url: './assets/primes.svmb' },
-      { name: 'upper', url: './assets/upper.svmb' },
+      { name: '__stage', url: './assets/stage_runner.temen' },
+      { name: 'primes', url: './assets/primes.temen' },
+      { name: 'upper', url: './assets/upper.temen' },
     ],
     mode: 'io',
     desc: 'A real POSIX-style shell — a command interpreter compiled by the in-tree chibicc C ' +
-      'compiler onto the svm-posix personality — running client-side in the sandbox. The same shell ' +
-      'the differential test suite runs (crates/svm/tests/c_shell.rs), on the bytecode cooperative ' +
+      'compiler onto the temen-posix personality — running client-side in the sandbox. The same shell ' +
+      'the differential test suite runs (crates/temen/tests/c_shell.rs), on the bytecode cooperative ' +
       'engine. Type a script on the left and click Run: it is fed to the shell as stdin and the ' +
       'output appears below. Builtins include echo (with $VARs), cd/pwd, cat/grep/wc/head/tail/sort/' +
       'uniq/ls, test/[ ], redirection (> >> <), command lists (; && ||), if/then/else, and globbing ' +
@@ -1182,7 +1182,7 @@ if test -f fruits; then echo fruits exists; fi
     jit: true, // _start is wasm-JIT-emittable (proven byte-identical by browser-jit-module-test)
     editable: true,
     lang: 'sql',
-    url: './assets/sqlite_repl.svmb',
+    url: './assets/sqlite_repl.temen',
     mode: 'io',
     desc: 'The unmodified SQLite 3.50.2 amalgamation (~257k lines of C), compiled through the LLVM ' +
       'on-ramp. Edit the SQL on the left and click Run: it executes against a fresh in-memory ' +
@@ -1208,7 +1208,7 @@ SELECT n, a AS fib FROM fib;
     kind: 'module',
     warm: true, // WASM_AOT.md warm-runtime snapshot: init the QuickJS runtime once, then restore that
     // warm image and eval-only per Run — the "trivial program takes >1s" fixed init is paid once, so
-    // later Runs are ~milliseconds. Fresh-per-Run isolation is enforced in the engine (svm_warm_eval
+    // later Runs are ~milliseconds. Fresh-per-Run isolation is enforced in the engine (temen_warm_eval
     // restores the same post-warmup image each Run). Default path for this card.
     jit: true, // tick "wasm-JIT" for the **warm+JIT** tier (WASM_AOT.md): `eval_run` emitted to wasm and
     // run over the restored warm image — init stays paid-once, the eval runs near-native (the win is
@@ -1216,7 +1216,7 @@ SELECT n, a AS fib FROM fib;
     // card's JIT toggle to `runWarmJit` (not the cold `_start` path). See LLVM.md "Active target — QuickJS".
     editable: true,
     lang: 'js',
-    url: './assets/qjs_snapshot.svmb',
+    url: './assets/qjs_snapshot.temen',
     mode: 'io',
     desc: 'Bellard\'s unmodified QuickJS 2024-01-13 — a full JavaScript engine (NaN-boxing, a bytecode ' +
       'VM with computed-goto dispatch, BigInt, regex, Unicode) compiled through the LLVM on-ramp. Edit ' +
@@ -1243,7 +1243,7 @@ console.log("json:", JSON.stringify({ ok: true, nums: [1, 2, 3], nested: { pi: M
   },
   // Tcl — the reference Tcl 8.6 interpreter with FULL Tcl_Init: the standard script library (init.tcl,
   // clock, msgcat, …) is embedded and served through an in-guest Tcl_Filesystem VFS, so clock/file/
-  // glob/auto_load/package all work with no filesystem capability. The `tcl_snapshot.svmb` asset is built
+  // glob/auto_load/package all work with no filesystem capability. The `tcl_snapshot.temen` asset is built
   // by `build-onramp-assets.mjs`; runs byte-identical to native (`demo_tcl_init_stdin`).
   'Tcl (8.6 — write & run)': {
     kind: 'module',
@@ -1255,7 +1255,7 @@ console.log("json:", JSON.stringify({ ok: true, nums: [1, 2, 3], nested: { pi: M
     // driver drove the cold `_start` export, whose Tcl_Init re-run trapped in encoding init — now fixed.)
     editable: true,
     lang: 'tcl',
-    url: './assets/tcl_snapshot.svmb',
+    url: './assets/tcl_snapshot.temen',
     mode: 'io',
     desc: 'The reference Tcl 8.6.14 interpreter with the full standard library — its bytecode compiler ' +
       '+ execution engine, expr, string/list/dict, Henry Spencer regex, libtommath bignums, plus the ' +
@@ -1277,18 +1277,18 @@ puts [format "pi ~ %.4f, 255 = 0x%X, sqrt2 = %.6f" 3.14159265 255 [expr {sqrt(2)
 dict set d a 1; dict set d b 2
 puts "dict:       $d"
 puts "regexp:     [regexp -inline {(\\w+)@(\\w+)} user@host]"
-puts [string toupper "tcl on svm"]
+puts [string toupper "tcl on temen"]
 `,
   },
   'PostgreSQL (17.5 — write & run SQL)': {
     kind: 'pg',
     editable: true,
     lang: 'sql',
-    url: './assets/postgres_resolved.svmb',
+    url: './assets/postgres_resolved.temen',
     image: './assets/pgdata.img',
     mode: 'io',
     desc: 'A whole, unmodified PostgreSQL 17.5 --single backend — ~15,000 functions compiled LLVM → ' +
-      'SVM IR, verified, and run on the bytecode interpreter inside wasm. Its data directory is an ' +
+      'Temen IR, verified, and run on the bytecode interpreter inside wasm. Its data directory is an ' +
       'in-memory image mounted on a capability-scoped filesystem — no host filesystem, network, or ' +
       'ambient authority. It runs as a live **interactive session**: the first Run boots the backend ' +
       '(a few seconds), then each Run feeds your SQL to the *same* backend on its blocking stdin — so ' +
@@ -1331,7 +1331,7 @@ const setState = (c, state, text) => { c.el.state.dataset.state = state; c.el.st
 const logTo = (c, m) => { c.el.log.textContent += m + '\n'; };
 const setEngineState = (state, text) => { const e = $('engine-state'); e.dataset.state = state; e.textContent = text; };
 
-// Fetched `.svmb` bytes, cached (a 6 MB SQLite module is worth not re-downloading on every Run).
+// Fetched `.temen` bytes, cached (a 6 MB SQLite module is worth not re-downloading on every Run).
 const moduleCache = new Map();
 async function fetchModule(url, onProgress) {
   if (moduleCache.has(url)) return moduleCache.get(url);
@@ -1391,16 +1391,16 @@ const clockNow = () => performance.now();
 function runStart(c, fields = {}) {
   const rec = {
     demo: c.name,
-    kind: c.ex.kind || 'svm-text',
+    kind: c.ex.kind || 'temen-text',
     t0: clockNow(),
     last: clockNow(),
     stages: [],   // [{ stage, ms }] — the split we print so "where the time went" is visible
-    assets: [],   // [{ name, bytes, cached }] — every fetched .svmb + whether it was a cache hit
+    assets: [],   // [{ name, bytes, cached }] — every fetched .temen + whether it was a cache hit
     notes: {},    // free-form extras merged into the summary (workers, frames, sizes, …)
     ...fields,
   };
   console.info(
-    `▶ [SVM playground] ${rec.demo} — start · ${rec.kind}` +
+    `▶ [Temen playground] ${rec.demo} — start · ${rec.kind}` +
     `${rec.mode ? ` · ${rec.mode}` : ''} · ${rec.tier || 'interpreter'}`);
   return rec;
 }
@@ -1433,7 +1433,7 @@ function runEnd(rec, { ok = true, status, result } = {}) {
   if (!rec) return 0;
   const total = clockNow() - rec.t0;
   const label =
-    `${ok ? '✓' : '✗'} [SVM playground] ${rec.demo} — ${ok ? 'done' : 'FAILED'}` +
+    `${ok ? '✓' : '✗'} [Temen playground] ${rec.demo} — ${ok ? 'done' : 'FAILED'}` +
     ` · ${rec.tier || 'interpreter'}${rec.notes.fallback ? ' (fallback)' : ''} · ${total.toFixed(1)}ms`;
   (ok ? console.groupCollapsed : console.group).call(console, label);
   console.log('demo:', rec.demo, '· kind:', rec.kind, rec.mode ? `· mode: ${rec.mode}` : '');
@@ -1471,8 +1471,8 @@ async function fetchTimed(rec, c, url) {
 function presentFrame(c, w, h) {
   const canvas = c.el.canvas;
   if (!w || !h) { canvas.hidden = true; return; }
-  const sp = eng.ex.svm_framebuffer_ptr();
-  const sl = eng.ex.svm_framebuffer_len();
+  const sp = eng.ex.temen_framebuffer_ptr();
+  const sl = eng.ex.temen_framebuffer_len();
   const rgba = new Uint8ClampedArray(new Uint8Array(eng.memory.buffer).slice(sp, sp + sl));
   canvas.width = w;
   canvas.height = h;
@@ -1484,10 +1484,10 @@ function presentFrame(c, w, h) {
 // after the module has been deallocated). Shared by the interpreter and wasm-JIT module paths.
 const readModuleStdout = () =>
   new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(
-    eng.ex.svm_stdout_ptr(), eng.ex.svm_stdout_ptr() + eng.ex.svm_stdout_len()));
+    eng.ex.temen_stdout_ptr(), eng.ex.temen_stdout_ptr() + eng.ex.temen_stdout_len()));
 const readModuleStderr = () =>
   new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(
-    eng.ex.svm_stderr_ptr(), eng.ex.svm_stderr_ptr() + eng.ex.svm_stderr_len()));
+    eng.ex.temen_stderr_ptr(), eng.ex.temen_stderr_ptr() + eng.ex.temen_stderr_len()));
 
 // Inflate a gzip'd asset to a Uint8Array via the browser's built-in DecompressionStream (no library).
 // Used by the nifler card, whose ~17.7 MB module ships gzipped (~3.8 MB) — see `runNifler`.
@@ -1498,30 +1498,30 @@ async function gunzip(bytes) {
 }
 
 // Run a pre-built on-ramp module single-shot on the interpreter: alloc a buffer, copy the module in
-// (plus optional stdin), `svm_run_onramp` (the fixed §3e powerbox — stdout/stdin/exit/memory), read
+// (plus optional stdin), `temen_run_onramp` (the fixed §3e powerbox — stdout/stdin/exit/memory), read
 // the captured stdout, free. Returns { rv, status, stdout }. No Workers (these guests are
 // single-threaded), so it never touches the par.js shared-window path.
 function moduleInterp(bytes, stdinBytes) {
-  // Alloc both buffers *before* filling: svm_alloc may grow (detach) the linear memory, so take one
+  // Alloc both buffers *before* filling: temen_alloc may grow (detach) the linear memory, so take one
   // fresh view after all allocations and write into it.
-  const p = eng.ex.svm_alloc(bytes.length);
+  const p = eng.ex.temen_alloc(bytes.length);
   let stdinP = 0;
   const stdinLen = stdinBytes ? stdinBytes.length : 0;
-  if (stdinLen) stdinP = eng.ex.svm_alloc(stdinLen);
+  if (stdinLen) stdinP = eng.ex.temen_alloc(stdinLen);
   const view = new Uint8Array(eng.memory.buffer);
   view.set(bytes, p);
   if (stdinP) view.set(stdinBytes, stdinP);
-  const rv = eng.ex.svm_run_onramp(p, bytes.length, stdinP, stdinLen);
-  const status = eng.ex.svm_status();
+  const rv = eng.ex.temen_run_onramp(p, bytes.length, stdinP, stdinLen);
+  const status = eng.ex.temen_status();
   const stdout = readModuleStdout();
-  eng.ex.svm_dealloc(p, bytes.length);
-  if (stdinP) eng.ex.svm_dealloc(stdinP, stdinLen);
+  eng.ex.temen_dealloc(p, bytes.length);
+  if (stdinP) eng.ex.temen_dealloc(stdinP, stdinLen);
   return { rv, status, stdout };
 }
 
 // ---- warm-runtime snapshot (WASM_AOT.md): init once, restore-per-Run for a two-phase on-ramp guest ----
-// The engine holds ONE warm session (a Rust static: svm_warm_open/eval/close). `warmSessionUrl` tracks
-// which module it's warmed for; a new svm_warm_open replaces any prior session, so we (re)open lazily
+// The engine holds ONE warm session (a Rust static: temen_warm_open/eval/close). `warmSessionUrl` tracks
+// which module it's warmed for; a new temen_warm_open replaces any prior session, so we (re)open lazily
 // only when the module URL changes. Fresh-per-Run isolation is enforced in the engine (each eval restores
 // the same post-`warmup` image), so a `var` in one Run can't leak into the next — the card's
 // "each Run starts clean" promise holds.
@@ -1532,11 +1532,11 @@ let warmSessionUrl = null;
 // driver (no `warmup`/`eval_run` exports) or open traps — the caller then falls back to the cold path.
 function ensureWarmSession(bytes, url) {
   if (warmSessionUrl === url) return true;
-  const p = eng.ex.svm_alloc(bytes.length);
+  const p = eng.ex.temen_alloc(bytes.length);
   new Uint8Array(eng.memory.buffer).set(bytes, p);
-  const live = Number(eng.ex.svm_warm_open(p, bytes.length));
-  eng.ex.svm_dealloc(p, bytes.length);
-  if (live < 0 || eng.ex.svm_status() !== 0) {
+  const live = Number(eng.ex.temen_warm_open(p, bytes.length));
+  eng.ex.temen_dealloc(p, bytes.length);
+  if (live < 0 || eng.ex.temen_status() !== 0) {
     warmSessionUrl = null;
     return false;
   }
@@ -1550,17 +1550,17 @@ function warmEval(stdinBytes) {
   let stdinP = 0;
   const stdinLen = stdinBytes ? stdinBytes.length : 0;
   if (stdinLen) {
-    stdinP = eng.ex.svm_alloc(stdinLen);
+    stdinP = eng.ex.temen_alloc(stdinLen);
     new Uint8Array(eng.memory.buffer).set(stdinBytes, stdinP);
   }
-  const rv = Number(eng.ex.svm_warm_eval(stdinP, stdinLen));
-  const status = eng.ex.svm_status();
+  const rv = Number(eng.ex.temen_warm_eval(stdinP, stdinLen));
+  const status = eng.ex.temen_status();
   const stdout = readModuleStdout();
-  if (stdinP) eng.ex.svm_dealloc(stdinP, stdinLen);
+  if (stdinP) eng.ex.temen_dealloc(stdinP, stdinLen);
   return { rv, status, stdout };
 }
 
-// Pack a shell PATH registry — `[{ name, bytes }]` — into the blob `svm_run_shell` parses: a u32 entry
+// Pack a shell PATH registry — `[{ name, bytes }]` — into the blob `temen_run_shell` parses: a u32 entry
 // count, then per entry u32 name-length + UTF-8 name + u32 module-length + module bytes (all
 // little-endian). The `__stage` ring runner and every external command (`primes`, …) travel in one
 // buffer. Returns null for an empty registry (the shell then runs bare).
@@ -1583,30 +1583,30 @@ function buildCmdsBlob(cmds) {
   return blob;
 }
 
-// Run the `svm-posix` **shell** single-shot on the bytecode cooperative engine, through the
-// `svm_run_shell` entry (STAGE1.md) — it grants the POSIX personality and (when `cmdsBlob` is given)
+// Run the `temen-posix` **shell** single-shot on the bytecode cooperative engine, through the
+// `temen_run_shell` entry (STAGE1.md) — it grants the POSIX personality and (when `cmdsBlob` is given)
 // the shell's PATH registry: the `__stage` ring-filter runner and any external commands. The editor
 // text feeds the shell's stdin as the script. With `__stage` registered, `cat f | sort | uniq`-style
 // pipelines take the concurrent ring path (op 11 + SharedRegion + futex); external commands (`primes`)
 // spawn as op-13 §14 children. Returns { rv, status, stdout }.
 function shellInterp(bytes, stdinBytes, cmdsBlob) {
-  const p = eng.ex.svm_alloc(bytes.length);
+  const p = eng.ex.temen_alloc(bytes.length);
   let stdinP = 0;
   const stdinLen = stdinBytes ? stdinBytes.length : 0;
-  if (stdinLen) stdinP = eng.ex.svm_alloc(stdinLen);
+  if (stdinLen) stdinP = eng.ex.temen_alloc(stdinLen);
   let cmdsP = 0;
   const cmdsLen = cmdsBlob ? cmdsBlob.length : 0;
-  if (cmdsLen) cmdsP = eng.ex.svm_alloc(cmdsLen);
+  if (cmdsLen) cmdsP = eng.ex.temen_alloc(cmdsLen);
   const view = new Uint8Array(eng.memory.buffer);
   view.set(bytes, p);
   if (stdinP) view.set(stdinBytes, stdinP);
   if (cmdsP) view.set(cmdsBlob, cmdsP);
-  const rv = eng.ex.svm_run_shell(p, bytes.length, stdinP, stdinLen, cmdsP, cmdsLen);
-  const status = eng.ex.svm_status();
+  const rv = eng.ex.temen_run_shell(p, bytes.length, stdinP, stdinLen, cmdsP, cmdsLen);
+  const status = eng.ex.temen_status();
   const stdout = readModuleStdout();
-  eng.ex.svm_dealloc(p, bytes.length);
-  if (stdinP) eng.ex.svm_dealloc(stdinP, stdinLen);
-  if (cmdsP) eng.ex.svm_dealloc(cmdsP, cmdsLen);
+  eng.ex.temen_dealloc(p, bytes.length);
+  if (stdinP) eng.ex.temen_dealloc(stdinP, stdinLen);
+  if (cmdsP) eng.ex.temen_dealloc(cmdsP, cmdsLen);
   return { rv, status, stdout };
 }
 
@@ -1732,14 +1732,14 @@ async function runModule(c) {
     try {
       // Warm+JIT (WASM_AOT.md): evaluate the user's code on emitted wasm **over the restored warm image**
       // — the QuickJS runtime init stays paid-once (the snapshot), and the eval itself runs near-native.
-      // The warm session must be open first (svm_warm_jit_open emits `eval_run` from it); a decline/trap
+      // The warm session must be open first (temen_warm_jit_open emits `eval_run` from it); a decline/trap
       // throws → we fall back to the interpreter warm path below. The compiled Module is cached under a
       // key distinct from the cold `_start` module (a different emit rooted at `eval_run`).
       const needOpen = warmSessionUrl !== ex.url;
       if (needOpen) setState(c, 'running', 'warming up runtime (first Run)…');
       if (!ensureWarmSession(bytes, ex.url)) throw new Error('warm session unavailable for this module');
       status = await runWarmJit(eng.ex, eng.memory, stdinBytes, `${ex.url}#eval`);
-      rv = Number(eng.ex.svm_run_value());
+      rv = Number(eng.ex.temen_run_value());
       stdout = readModuleStdout();
       tier = 'warm+JIT';
     } catch (e) {
@@ -1749,14 +1749,14 @@ async function runModule(c) {
     }
   } else if (status === undefined && useJit) {
     try {
-      // Emit `_start` and run it on wasm; svm_onramp_jit_run_finish captures stdout/exit/value into the
-      // shared slots (read back via the usual accessors, exactly like the interpreter path). `svm_run_value`
-      // is the guest's returned result — the same value `svm_run_onramp` returns on the interpreter, so the
+      // Emit `_start` and run it on wasm; temen_onramp_jit_run_finish captures stdout/exit/value into the
+      // shared slots (read back via the usual accessors, exactly like the interpreter path). `temen_run_value`
+      // is the guest's returned result — the same value `temen_run_onramp` returns on the interpreter, so the
       // result matches on both tiers (a trap throws → we fall back to the interpreter below).
       // Cache the compiled Module across Runs keyed by the module's content-addressed URL — the
       // emitted `_start` depends only on the module, not the editor `stdinBytes` (slice 1, WASM_AOT.md).
       status = await runJitModule(eng.ex, eng.memory, bytes, stdinBytes, ex.url);
-      rv = Number(eng.ex.svm_run_value());
+      rv = Number(eng.ex.temen_run_value());
       stdout = readModuleStdout();
       tier = 'wasm-JIT';
     } catch (e) {
@@ -1785,7 +1785,7 @@ async function runModule(c) {
     rv = r.rv; status = r.status; stdout = r.stdout;
     // A framebuffer guest (gradient) presents through the interpreter path; the emittable JIT guests
     // above are stdout-only, so only the interpreter path blits a frame.
-    presentFrame(c, eng.ex.svm_framebuffer_width(), eng.ex.svm_framebuffer_height());
+    presentFrame(c, eng.ex.temen_framebuffer_width(), eng.ex.temen_framebuffer_height());
   }
   runStage(rec, `run:${tier}`, performance.now() - t0);
   runTier(rec, tier);
@@ -1805,14 +1805,14 @@ async function runModule(c) {
   }
 }
 
-// The in-browser C compiler (SELFHOST_C.md §7 step 5) — two SVM passes in the sandbox:
-//   1. compile: run `chibicc.svmb` over the editor's C, seeded on an `fs` cap at `/in.c`
-//      (`svm_run_onramp_fs`), and capture the emitted SVM-IR *text* on stdout;
-//   2. encode + run: `svm_parse` that text into a module, then run it (`moduleInterp`) — the compiled
+// The in-browser C compiler (SELFHOST_C.md §7 step 5) — two Temen passes in the sandbox:
+//   1. compile: run `chibicc.temen` over the editor's C, seeded on an `fs` cap at `/in.c`
+//      (`temen_run_onramp_fs`), and capture the emitted TEMEN-IR *text* on stdout;
+//   2. encode + run: `temen_parse` that text into a module, then run it (`moduleInterp`) — the compiled
 //      program's result is its `main` return value.
 // Pass 1 (running chibicc) is the slow part, so it takes the "wasm-JIT" toggle: chibicc's whole
 // `_start` emits to wasm (333 funcs; the cap-call/float helpers bounce cross-tier), running the compile
-// several× faster than the bytecode interpreter — with a fallback to `svm_run_onramp_fs` if the emit is
+// several× faster than the bytecode interpreter — with a fallback to `temen_run_onramp_fs` if the emit is
 // ever unavailable. Both tiers share the fixed powerbox + the same seeded memfs, so the emitted IR is
 // byte-identical (gated by `chibicc_jit.rs`). Header-free sources compile with an empty header image;
 // the demo corpus is return-value programs whose result is the value shown.
@@ -1841,7 +1841,7 @@ async function runChibicc(c) {
   // the memfs + argv and emits `_start`); otherwise run chibicc on the bytecode interpreter. Both leave
   // the emitted IR text on the stdout stash. Alloc happens inside the JIT driver / just below.
   setState(c, 'running', `compiling…${useJit ? ' [wasm-JIT]' : ''}`);
-  // `-g` iff the card's "debug info" checkbox is ticked (else clean, fast IR — see `svm_run_onramp_fs`).
+  // `-g` iff the card's "debug info" checkbox is ticked (else clean, fast IR — see `temen_run_onramp_fs`).
   const gOn = c.el.gflag && c.el.gflag.checked ? 1 : 0;
   runNote(rec, { srcBytes: srcBytes.length, debugInfo: !!gOn });
   const tCompile = performance.now();
@@ -1860,17 +1860,17 @@ async function runChibicc(c) {
     }
   }
   if (cstatus === undefined) {
-    // Alloc both buffers before writing (svm_alloc may detach linear memory), pass an empty header
+    // Alloc both buffers before writing (temen_alloc may detach linear memory), pass an empty header
     // image (0,0), and run chibicc on the interpreter.
-    const p = eng.ex.svm_alloc(compiler.length);
-    const sp = eng.ex.svm_alloc(srcBytes.length);
+    const p = eng.ex.temen_alloc(compiler.length);
+    const sp = eng.ex.temen_alloc(srcBytes.length);
     const view = new Uint8Array(eng.memory.buffer);
     view.set(compiler, p);
     view.set(srcBytes, sp);
-    eng.ex.svm_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length, gOn);
-    cstatus = eng.ex.svm_status();
-    eng.ex.svm_dealloc(p, compiler.length);
-    eng.ex.svm_dealloc(sp, srcBytes.length);
+    eng.ex.temen_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length, gOn);
+    cstatus = eng.ex.temen_status();
+    eng.ex.temen_dealloc(p, compiler.length);
+    eng.ex.temen_dealloc(sp, srcBytes.length);
   }
   const compileMs = runStage(rec, `compile:${compileTier}`, performance.now() - tCompile);
   // The headline tier is where the *compiler* ran (the wasm-JIT showcase); a wasm-JIT→interpreter note
@@ -1879,25 +1879,25 @@ async function runChibicc(c) {
   runTier(rec, compileTier);
   const ir = readModuleStdout();
   const cstderr = readModuleStderr();
-  c.el.stdout.textContent = ir; // show the emitted SVM IR
+  c.el.stdout.textContent = ir; // show the emitted Temen IR
   runNote(rec, { compileTier, irBytes: ir.length });
-  logTo(c, `compiled (${compileTier}): ${srcBytes.length}B C → ${ir.length}B SVM IR in ${compileMs.toFixed(0)}ms (status ${cstatus})`);
+  logTo(c, `compiled (${compileTier}): ${srcBytes.length}B C → ${ir.length}B Temen IR in ${compileMs.toFixed(0)}ms (status ${cstatus})`);
   if ((cstatus !== 0 && cstatus !== 5) || ir.length === 0) {
     setState(c, 'error', `compile failed: status ${cstatus}${cstderr ? ` — ${cstderr.trim()}` : ''}`);
     runEnd(rec, { ok: false, status: cstatus });
     return;
   }
 
-  // Pass 2 — encode the IR (svm_parse: parse + verify + encode) into a runnable module. Timed on its own
+  // Pass 2 — encode the IR (temen_parse: parse + verify + encode) into a runnable module. Timed on its own
   // so the console split shows how much of "run" is really encode vs. execution.
   const tEncode = performance.now();
   const irBytes = new TextEncoder().encode(ir);
-  const ip = eng.ex.svm_alloc(irBytes.length);
+  const ip = eng.ex.temen_alloc(irBytes.length);
   new Uint8Array(eng.memory.buffer).set(irBytes, ip);
-  const ok = eng.ex.svm_parse(ip, irBytes.length);
+  const ok = eng.ex.temen_parse(ip, irBytes.length);
   const parsed = new Uint8Array(eng.memory.buffer).slice(
-    eng.ex.svm_parse_ptr(), eng.ex.svm_parse_ptr() + eng.ex.svm_parse_len());
-  eng.ex.svm_dealloc(ip, irBytes.length);
+    eng.ex.temen_parse_ptr(), eng.ex.temen_parse_ptr() + eng.ex.temen_parse_len());
+  eng.ex.temen_dealloc(ip, irBytes.length);
   if (ok !== 1) {
     setState(c, 'error', `encode failed: ${new TextDecoder().decode(parsed)}`);
     runEnd(rec, { ok: false });
@@ -1906,8 +1906,8 @@ async function runChibicc(c) {
   runStage(rec, 'encode', performance.now() - tEncode);
   runNote(rec, { moduleBytes: parsed.length });
 
-  // Pass 3 — run the compiled .svmb artifact. It rides the wasm-JIT too (not just the compiler): the
-  // runner now reports the guest's returned value (`svm_run_value`, matching the interpreter oracle) and
+  // Pass 3 — run the compiled .temen artifact. It rides the wasm-JIT too (not just the compiler): the
+  // runner now reports the guest's returned value (`temen_run_value`, matching the interpreter oracle) and
   // reports a trap as a trap — so `runJitModule` throws on a trap and we fall back to the interpreter,
   // which runs it correctly. A clean JIT run is byte-identical to the oracle (INVARIANT 9).
   const tRun = performance.now();
@@ -1915,7 +1915,7 @@ async function runChibicc(c) {
   if (useJit) {
     try {
       const status = await runJitModule(eng.ex, eng.memory, parsed, null);
-      r = { rv: Number(eng.ex.svm_run_value()), status, stdout: readModuleStdout() };
+      r = { rv: Number(eng.ex.temen_run_value()), status, stdout: readModuleStdout() };
       runTierName = 'wasm-JIT';
     } catch (e) {
       logTo(c, `wasm-JIT run of compiled program declined (${e.message}); running it on the interpreter`);
@@ -1927,10 +1927,10 @@ async function runChibicc(c) {
   runNote(rec, { runTier: runTierName, compileMs: +compileMs.toFixed(1), runMs: +runMs.toFixed(1), progStdoutBytes: (r.stdout || '').length });
   c.el.result.textContent = `${r.rv}`;
   // The stdout pane shows the compiled program's OUTPUT (what a `printf` writes through the
-  // powerbox's ambient `write`), with the emitted SVM IR below it as a divider-separated section —
+  // powerbox's ambient `write`), with the emitted Temen IR below it as a divider-separated section —
   // so both the payoff and "look, real IR" are visible. A pure return-value program shows just IR.
   const progOut = r.stdout || '';
-  const irSection = `${'─'.repeat(18)} compiled to ${ir.length} B of SVM IR ${'─'.repeat(18)}\n${ir}`;
+  const irSection = `${'─'.repeat(18)} compiled to ${ir.length} B of Temen IR ${'─'.repeat(18)}\n${ir}`;
   c.el.stdout.textContent = progOut ? `${progOut}\n${irSection}` : irSection;
   // Status line now shows the compile/run split by tier, so "where the time went" is visible on-page.
   const split = `compile ${compileMs.toFixed(0)}ms (${compileTier}) · run ${runMs.toFixed(0)}ms (${runTierName})`;
@@ -1946,10 +1946,10 @@ async function runChibicc(c) {
 }
 
 // The **self-host** card (SELFHOST_C.md §7 step 5 — the capstone): chibicc compiles its *own* source in
-// the browser. Fetch `chibicc.svmb` + the committed closure image (its cc1 TU sources + the ~96-file
-// glibc header closure `chibicc.h` pulls, + the self-host prelude), then run `chibicc.svmb
+// the browser. Fetch `chibicc.temen` + the committed closure image (its cc1 TU sources + the ~96-file
+// glibc header closure `chibicc.h` pulls, + the self-host prelude), then run `chibicc.temen
 // --emit-object <selected TU>` over that memfs — chibicc compiling its own tokenizer / parser / codegen
-// into a linkable SVM-IR object, client-side. On the wasm-JIT every TU (giants included) compiles in a
+// into a linkable TEMEN-IR object, client-side. On the wasm-JIT every TU (giants included) compiles in a
 // few hundred ms; a bytecode fallback covers a missing emit. The emitted object IR shows in the pane.
 async function runSelfhost(c) {
   const ex = c.ex;
@@ -1990,19 +1990,19 @@ async function runSelfhost(c) {
     }
   }
   if (cstatus === undefined) {
-    // Alloc all three buffers before writing (svm_alloc may detach linear memory), then run on bytecode.
-    const p = eng.ex.svm_alloc(compiler.length);
-    const ip = eng.ex.svm_alloc(image.length);
-    const tp = eng.ex.svm_alloc(tuBytes.length);
+    // Alloc all three buffers before writing (temen_alloc may detach linear memory), then run on bytecode.
+    const p = eng.ex.temen_alloc(compiler.length);
+    const ip = eng.ex.temen_alloc(image.length);
+    const tp = eng.ex.temen_alloc(tuBytes.length);
     const view = new Uint8Array(eng.memory.buffer);
     view.set(compiler, p);
     view.set(image, ip);
     view.set(tuBytes, tp);
-    eng.ex.svm_selfhost_emit_object_fs(p, compiler.length, ip, image.length, tp, tuBytes.length, gOn);
-    cstatus = eng.ex.svm_status();
-    eng.ex.svm_dealloc(p, compiler.length);
-    eng.ex.svm_dealloc(ip, image.length);
-    eng.ex.svm_dealloc(tp, tuBytes.length);
+    eng.ex.temen_selfhost_emit_object_fs(p, compiler.length, ip, image.length, tp, tuBytes.length, gOn);
+    cstatus = eng.ex.temen_status();
+    eng.ex.temen_dealloc(p, compiler.length);
+    eng.ex.temen_dealloc(ip, image.length);
+    eng.ex.temen_dealloc(tp, tuBytes.length);
   }
   const compileMs = runStage(rec, `compile:${tier}`, performance.now() - tCompile);
   runTier(rec, tier);
@@ -2019,19 +2019,19 @@ async function runSelfhost(c) {
   }
   const bar = '─'.repeat(12);
   c.el.stdout.textContent =
-    `${bar} chibicc compiled its own ${short} → ${obj.length} B linkable SVM-IR object (${tier}) ${bar}\n${obj}`;
+    `${bar} chibicc compiled its own ${short} → ${obj.length} B linkable TEMEN-IR object (${tier}) ${bar}\n${obj}`;
   c.el.result.textContent = `${obj.length} B`;
   setState(c, 'done', `compiled ${short} (${tier}) · ${obj.length} B object · ${ms}ms`);
   runEnd(rec, { ok: true, status: cstatus, result: `${obj.length} B object` });
 }
 
 // Compile Nim in the browser — the nimony **front-end** card (NIM.md §3c/§3e slice 4). Fetch
-// `nifler.svmb` (the first real nimony phase, Nim → parsed NIF, on-ramped to SVM), seed the editor's
+// `nifler.temen` (the first real nimony phase, Nim → parsed NIF, on-ramped to Temen), seed the editor's
 // Nim as `/in.nim` on an in-memory `fs` cap, run `nifler p /in.nim /out.p.nif`, and show the `.p.nif`
 // it emitted. Mirrors `runSelfhost` (memfs-seeded phase), but the output is a **file** nifler wrote (read
 // back onto the stdout slot), not stdout text. Runs on the **wasm-JIT** first (#1011 slice 1 —
-// `svm_run_nifler_jit_open` emits nifler's `_start`, its `.p.nif` read back after the run), falling back to
-// the bytecode `svm_run_nifler_fs` when `_start` isn't wasm-drivable or the emitted run traps (INVARIANT 9).
+// `temen_run_nifler_jit_open` emits nifler's `_start`, its `.p.nif` read back after the run), falling back to
+// the bytecode `temen_run_nifler_fs` when `_start` isn't wasm-drivable or the emitted run traps (INVARIANT 9).
 async function runNifler(c) {
   const ex = c.ex;
   setState(c, 'running', 'fetching nifler…');
@@ -2041,13 +2041,13 @@ async function runNifler(c) {
   const rec = runStart(c, { tier: 'interpreter' });
   let compiler;
   try {
-    // The asset ships **gzipped** (`nifler.svmb.gz`, ~3.8 MB vs ~17.7 MB raw): fetch the compressed
+    // The asset ships **gzipped** (`nifler.temen.gz`, ~3.8 MB vs ~17.7 MB raw): fetch the compressed
     // bytes, then inflate them in the browser (DecompressionStream — no library) to the real module.
     const gz = await fetchTimed(rec, c, ex.url);
     compiler = await gunzip(gz);
-    logTo(c, `nifler.svmb.gz: ${gz.length}B → ${compiler.length}B module (inflated)`);
+    logTo(c, `nifler.temen.gz: ${gz.length}B → ${compiler.length}B module (inflated)`);
   } catch (e) {
-    setState(c, 'error', `${e.message} — run \`bash ../crates/svm-run/demos/nifler_svm/build_nifler_svmb.sh\` to generate it`);
+    setState(c, 'error', `${e.message} — run \`bash ../crates/temen-run/demos/nifler_temen/build_nifler_temen.sh\` to generate it`);
     logTo(c, `fetch/inflate failed: ${e.message}`);
     runNote(rec, { fetchError: e.message });
     runEnd(rec, { ok: false });
@@ -2058,9 +2058,9 @@ async function runNifler(c) {
   setState(c, 'running', 'parsing Nim…');
   const t0 = performance.now();
   // Try the **wasm-JIT** first (#1011 slice 1): emit nifler's `_start` and run the parse on emitted wasm,
-  // with the produced `.p.nif` read back on the stdout slot (`svm_run_nifler_jit_open` → `driveJitRun`).
+  // with the produced `.p.nif` read back on the stdout slot (`temen_run_nifler_jit_open` → `driveJitRun`).
   // A decline (STATUS_UNSUPPORTED, e.g. `_start` not wasm-drivable) or an emitted-run trap throws → we
-  // fall back to the bytecode `svm_run_nifler_fs` below, so the result matches on both tiers (INVARIANT 9).
+  // fall back to the bytecode `temen_run_nifler_fs` below, so the result matches on both tiers (INVARIANT 9).
   let status, tier;
   try {
     status = await runJitNifler(eng.ex, eng.memory, compiler, srcBytes, ex.url);
@@ -2071,16 +2071,16 @@ async function runNifler(c) {
     status = undefined;
   }
   if (status === undefined) {
-    // Alloc both buffers before writing (svm_alloc may detach linear memory), then run on bytecode.
-    const p = eng.ex.svm_alloc(compiler.length);
-    const sp = eng.ex.svm_alloc(srcBytes.length);
+    // Alloc both buffers before writing (temen_alloc may detach linear memory), then run on bytecode.
+    const p = eng.ex.temen_alloc(compiler.length);
+    const sp = eng.ex.temen_alloc(srcBytes.length);
     const view = new Uint8Array(eng.memory.buffer);
     view.set(compiler, p);
     view.set(srcBytes, sp);
-    Number(eng.ex.svm_run_nifler_fs(p, compiler.length, sp, srcBytes.length));
-    status = eng.ex.svm_status();
-    eng.ex.svm_dealloc(p, compiler.length);
-    eng.ex.svm_dealloc(sp, srcBytes.length);
+    Number(eng.ex.temen_run_nifler_fs(p, compiler.length, sp, srcBytes.length));
+    status = eng.ex.temen_status();
+    eng.ex.temen_dealloc(p, compiler.length);
+    eng.ex.temen_dealloc(sp, srcBytes.length);
     tier = 'interpreter';
   }
   const ms = runStage(rec, `parse:${tier}`, performance.now() - t0).toFixed(0);
@@ -2098,7 +2098,7 @@ async function runNifler(c) {
   }
   const bar = '─'.repeat(12);
   c.el.stdout.textContent =
-    `${bar} nifler parsed your Nim → ${nif.length} B .p.nif (nimony's NIF, on the SVM, ${tier}) ${bar}\n${nif}`;
+    `${bar} nifler parsed your Nim → ${nif.length} B .p.nif (nimony's NIF, on the Temen, ${tier}) ${bar}\n${nif}`;
   c.el.result.textContent = `${nif.length} B`;
   setState(c, 'done', `parsed Nim → ${nif.length} B .p.nif (${tier}) · ${ms}ms`);
   runEnd(rec, { ok: true, status, result: `${nif.length} B .p.nif` });
@@ -2106,7 +2106,7 @@ async function runNifler(c) {
 
 // Compile a **whole Nim program** in the browser — the nimony toolchain capstone (NIM.md §3c/§3e;
 // #958). Fetch the three phase guests (`nifler`/`nimsem`/`hexer`, gzipped) + the stdlib image
-// (gzipped), inflate them, then hand the editor's Nim as `<main>.nim` to `svm_compile_nim_fs`: the
+// (gzipped), inflate them, then hand the editor's Nim as `<main>.nim` to `temen_compile_nim_fs`: the
 // cdylib plays nifmake (computes stems, crawls the `import` graph with nifler), runs nimsem + hexer
 // over the closure (nimsem spawning nifler through a wasm-native `exec` cap over the shared memfs),
 // links through the nim→powerbox bridge, and runs `_start` under the powerbox. The program's real
@@ -2119,7 +2119,7 @@ async function runNimc(c) {
   c.el.stdout.textContent = '';
   c.el.canvas.hidden = true;
   const rec = runStart(c, { tier: 'interpreter' });
-  // Lazily fetch + inflate the four assets (each ships **gzipped**: phase `.svmb` are ~3–17 MB raw, the
+  // Lazily fetch + inflate the four assets (each ships **gzipped**: phase `.temen` are ~3–17 MB raw, the
   // stdlib image ~2.4 MB; DecompressionStream inflates in-browser, no library). In the worker path this
   // runs **once** — the worker caches the guests — so re-Runs ship only the source, not ~28 MB again.
   const getAssets = async () => {
@@ -2156,14 +2156,14 @@ async function runNimc(c) {
       const { nifler, nimsem, hexer, stdlib } = await getAssets();
       const srcBytes = new TextEncoder().encode(source);
       const mainBytes = new TextEncoder().encode(main);
-      // Alloc every buffer before writing any (svm_alloc may grow/detach linear memory), then take one
+      // Alloc every buffer before writing any (temen_alloc may grow/detach linear memory), then take one
       // fresh view and fill them.
-      const np = eng.ex.svm_alloc(nifler.length);
-      const smp = eng.ex.svm_alloc(nimsem.length);
-      const hp = eng.ex.svm_alloc(hexer.length);
-      const ip = eng.ex.svm_alloc(stdlib.length);
-      const sp = eng.ex.svm_alloc(srcBytes.length);
-      const mp = eng.ex.svm_alloc(mainBytes.length);
+      const np = eng.ex.temen_alloc(nifler.length);
+      const smp = eng.ex.temen_alloc(nimsem.length);
+      const hp = eng.ex.temen_alloc(hexer.length);
+      const ip = eng.ex.temen_alloc(stdlib.length);
+      const sp = eng.ex.temen_alloc(srcBytes.length);
+      const mp = eng.ex.temen_alloc(mainBytes.length);
       const view = new Uint8Array(eng.memory.buffer);
       view.set(nifler, np);
       view.set(nimsem, smp);
@@ -2171,21 +2171,21 @@ async function runNimc(c) {
       view.set(stdlib, ip);
       view.set(srcBytes, sp);
       view.set(mainBytes, mp);
-      eng.ex.svm_compile_nim_fs(
+      eng.ex.temen_compile_nim_fs(
         np, nifler.length, smp, nimsem.length, hp, hexer.length,
         ip, stdlib.length, sp, srcBytes.length, mp, mainBytes.length);
-      status = eng.ex.svm_status();
-      eng.ex.svm_dealloc(np, nifler.length);
-      eng.ex.svm_dealloc(smp, nimsem.length);
-      eng.ex.svm_dealloc(hp, hexer.length);
-      eng.ex.svm_dealloc(ip, stdlib.length);
-      eng.ex.svm_dealloc(sp, srcBytes.length);
-      eng.ex.svm_dealloc(mp, mainBytes.length);
+      status = eng.ex.temen_status();
+      eng.ex.temen_dealloc(np, nifler.length);
+      eng.ex.temen_dealloc(smp, nimsem.length);
+      eng.ex.temen_dealloc(hp, hexer.length);
+      eng.ex.temen_dealloc(ip, stdlib.length);
+      eng.ex.temen_dealloc(sp, srcBytes.length);
+      eng.ex.temen_dealloc(mp, mainBytes.length);
       out = readModuleStdout();
       err = readModuleStderr();
     }
   } catch (e) {
-    setState(c, 'error', `${e.message} — run \`bash ../crates/svm-run/demos/nim_e2e_chain/build_e2e_chain.sh\` to build the phase guests + stdlib image`);
+    setState(c, 'error', `${e.message} — run \`bash ../crates/temen-run/demos/nim_e2e_chain/build_e2e_chain.sh\` to build the phase guests + stdlib image`);
     logTo(c, `compile failed: ${e.message}`);
     runNote(rec, { fetchError: e.message });
     runEnd(rec, { ok: false });
@@ -2203,19 +2203,19 @@ async function runNimc(c) {
   }
   const bar = '─'.repeat(10);
   c.el.stdout.textContent =
-    `${bar} your Nim, compiled by the SVM (nifler → nimsem → hexer → svm-leng) and run — stdout ${bar}\n${out}`;
+    `${bar} your Nim, compiled by the Temen (nifler → nimsem → hexer → temen-leng) and run — stdout ${bar}\n${out}`;
   c.el.result.textContent = `${out.length} B stdout`;
   setState(c, 'done', `compiled + ran your Nim · ${out.length} B stdout · ${ms}ms`);
   runEnd(rec, { ok: true, status, result: `${out.length} B stdout` });
 }
 
-// Boot PostgreSQL `--single` single-shot on the main engine (the `svm_run_pg` entry): fetch the
+// Boot PostgreSQL `--single` single-shot on the main engine (the `temen_run_pg` entry): fetch the
 // pre-translated+resolved module + the data image, feed the editor's SQL as stdin, mount the image on
 // an in-memory `fs` cap, run to a queried backend, read the captured stdout. A fresh boot per Run.
-// Read the engine's captured stdout buffer (the `svm_pg_*` delta, or a `svm_run_pg` full capture).
+// Read the engine's captured stdout buffer (the `temen_pg_*` delta, or a `temen_run_pg` full capture).
 function readEngineStdout() {
-  const p = eng.ex.svm_stdout_ptr();
-  const l = eng.ex.svm_stdout_len();
+  const p = eng.ex.temen_stdout_ptr();
+  const l = eng.ex.temen_stdout_len();
   return new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(p, p + l));
 }
 
@@ -2227,12 +2227,12 @@ function readPgStdout() {
 
 // ---- persistent Postgres storage (IndexedDB) -----------------------------------------------------
 // The live backend's data dir is an in-memory `mem_fs`; on its own it evaporates when the page unloads.
-// After each query we snapshot that fs (`svm_pg_snapshot` → an `svm_fs` data image) and stash the image
+// After each query we snapshot that fs (`temen_pg_snapshot` → an `temen_fs` data image) and stash the image
 // in IndexedDB; the next session boots from the saved image instead of the pristine one — so a table you
 // CREATE (and its rows) survive a full page reload, recovered by Postgres' own startup recovery over the
 // snapshot. Keyed per module URL so distinct builds don't collide. All best-effort: any storage failure
 // just logs and the session keeps running in memory.
-const PG_DB = 'svm-pg';
+const PG_DB = 'temen-pg';
 const PG_STORE = 'sessions';
 const pgKey = (c) => c.ex.url;
 function pgIdb() {
@@ -2285,9 +2285,9 @@ function persistPg(c) {
   if (!c.pgSession) return;
   let bytes;
   try {
-    if (eng.ex.svm_pg_snapshot() !== 0) return;
-    const p = eng.ex.svm_pg_snapshot_ptr();
-    const l = eng.ex.svm_pg_snapshot_len();
+    if (eng.ex.temen_pg_snapshot() !== 0) return;
+    const p = eng.ex.temen_pg_snapshot_ptr();
+    const l = eng.ex.temen_pg_snapshot_len();
     if (!p || !l) return;
     bytes = new Uint8Array(eng.memory.buffer, p, l).slice(); // detach from the wasm buffer
   } catch (e) {
@@ -2310,7 +2310,7 @@ function persistPg(c) {
     });
 }
 
-// PostgreSQL as a **live interactive session** (the `svm_pg_open`/`_query`/`_close` path): the first Run
+// PostgreSQL as a **live interactive session** (the `temen_pg_open`/`_query`/`_close` path): the first Run
 // boots one `postgres --single` backend to the `backend>` prompt (a few seconds) and leaves it suspended
 // on its blocking stdin; every Run after feeds the editor's SQL to that *same* backend and resumes it to
 // the next prompt — so queries are sub-second and state persists across them. The output pane is a
@@ -2327,7 +2327,7 @@ async function runPg(c) {
   if (c.editor.getValue().trim() === '\\reset') {
     await pgClear(pgKey(c));
     if (c.pgSession) {
-      eng.ex.svm_pg_close();
+      eng.ex.temen_pg_close();
       c.pgSession = false;
       c.el.stop.disabled = true;
     }
@@ -2369,16 +2369,16 @@ async function runPg(c) {
     c.el.run.disabled = true;
     await new Promise((r) => setTimeout(r, 30)); // let the status paint before the synchronous boot
     try {
-      const modP = eng.ex.svm_alloc(modBytes.length);
-      const imgP = eng.ex.svm_alloc(imgBytes.length);
+      const modP = eng.ex.temen_alloc(modBytes.length);
+      const imgP = eng.ex.temen_alloc(imgBytes.length);
       const view = new Uint8Array(eng.memory.buffer);
       view.set(modBytes, modP);
       view.set(imgBytes, imgP);
       const t0 = performance.now();
-      const rc = eng.ex.svm_pg_open(modP, modBytes.length, imgP, imgBytes.length);
+      const rc = eng.ex.temen_pg_open(modP, modBytes.length, imgP, imgBytes.length);
       const ms = runStage(rec, restored ? 'restore' : 'boot', performance.now() - t0).toFixed(0);
-      eng.ex.svm_dealloc(modP, modBytes.length);
-      eng.ex.svm_dealloc(imgP, imgBytes.length);
+      eng.ex.temen_dealloc(modP, modBytes.length);
+      eng.ex.temen_dealloc(imgP, imgBytes.length);
       c.el.stdout.textContent += readPgStdout(); // the banner + first prompt
       if (rc !== 0) {
         // A saved image that won't boot is likely corrupt — drop it so the next Run starts clean.
@@ -2386,15 +2386,15 @@ async function runPg(c) {
           await pgClear(pgKey(c));
           logTo(c, 'saved session failed to boot — cleared it; Run again for a fresh database');
         }
-        setState(c, 'error', `boot failed: status ${eng.ex.svm_status()} (1=decode 3=trap 6=verify)`);
+        setState(c, 'error', `boot failed: status ${eng.ex.temen_status()} (1=decode 3=trap 6=verify)`);
         c.el.run.disabled = broken;
-        runNote(rec, { bootStatus: eng.ex.svm_status() });
+        runNote(rec, { bootStatus: eng.ex.temen_status() });
         runEnd(rec, { ok: false });
         return;
       }
       c.pgSession = true;
       c.el.stop.disabled = false;
-      logTo(c, restored ? `svm_pg_open: restored saved session in ${ms}ms` : `svm_pg_open: backend booted in ${ms}ms`);
+      logTo(c, restored ? `temen_pg_open: restored saved session in ${ms}ms` : `temen_pg_open: backend booted in ${ms}ms`);
     } catch (e) {
       setState(c, 'error', `boot error: ${e.message}`);
       c.el.run.disabled = broken;
@@ -2415,20 +2415,20 @@ async function runPg(c) {
   try {
     const text = sql.endsWith('\n') ? sql : sql + '\n';
     const b = new TextEncoder().encode(text);
-    const p = eng.ex.svm_alloc(b.length);
+    const p = eng.ex.temen_alloc(b.length);
     new Uint8Array(eng.memory.buffer).set(b, p);
     const t0 = performance.now();
-    const rc = eng.ex.svm_pg_query(p, b.length);
+    const rc = eng.ex.temen_pg_query(p, b.length);
     const ms = runStage(rec, 'query', performance.now() - t0).toFixed(0);
-    eng.ex.svm_dealloc(p, b.length);
+    eng.ex.temen_dealloc(p, b.length);
     // Append this query's output delta to the running transcript (result blocks → psql-style tables).
     c.el.stdout.textContent += readPgStdout();
     c.el.stdout.scrollTop = c.el.stdout.scrollHeight;
-    const status = eng.ex.svm_status();
+    const status = eng.ex.temen_status();
     runNote(rec, { sqlBytes: b.length });
     if (rc === 0) {
       setState(c, 'done', `query ran in ${ms}ms · session live · saved (reload to resume)`);
-      logTo(c, `svm_pg_query in ${ms}ms`);
+      logTo(c, `temen_pg_query in ${ms}ms`);
       persistPg(c); // snapshot the (possibly mutated) data dir so it survives a reload
       runEnd(rec, { ok: true, status });
     } else if (status === 5) {
@@ -2442,7 +2442,7 @@ async function runPg(c) {
       runEnd(rec, { ok: true, status });
     } else {
       setState(c, 'error', `query failed: status ${status}`);
-      logTo(c, `svm_pg_query status ${status}`);
+      logTo(c, `temen_pg_query status ${status}`);
       runEnd(rec, { ok: false, status });
     }
   } catch (e) {
@@ -2481,8 +2481,8 @@ function finalizeReactor(how) {
 // reactor loop is running, and routed to whichever tier (interpreter / wasm-JIT) is live.
 function sendReactorKey(keyCode, pressed) {
   if (reactorRAF === null) return;
-  if (jitReactor) eng.ex.svm_onramp_jit_key(keyCode, pressed);
-  else eng.ex.svm_onramp_key(keyCode, pressed);
+  if (jitReactor) eng.ex.temen_onramp_jit_key(keyCode, pressed);
+  else eng.ex.temen_onramp_key(keyCode, pressed);
 }
 
 // Cancel any running reactor loop and free the guest instance. Safe to call when none is running.
@@ -2497,7 +2497,7 @@ function stopReactor() {
     jitReactor.close();
     jitReactor = null;
   } else {
-    eng.ex.svm_onramp_close();
+    eng.ex.temen_onramp_close();
   }
   activeReactorCard = null;
 }
@@ -2545,8 +2545,8 @@ async function runReactor(c) {
     }
   }
   // Open the reactor: alloc, copy the module in, run _start (decode + grant powerbox). A guest that
-  // needs a served file (Doom reads its WAD at _start) is opened with svm_onramp_open_fs, which grants
-  // the `fs` capability over the fetched blob; every other reactor guest uses plain svm_onramp_open.
+  // needs a served file (Doom reads its WAD at _start) is opened with temen_onramp_open_fs, which grants
+  // the `fs` capability over the fetched blob; every other reactor guest uses plain temen_onramp_open.
   let wad = null;
   if (ex.wad) {
     try {
@@ -2577,28 +2577,28 @@ async function runReactor(c) {
     let opened;
     if (ex.wad) {
       const nameBytes = new TextEncoder().encode('doom1.wad');
-      const modP = eng.ex.svm_alloc(bytes.length);
-      const nameP = eng.ex.svm_alloc(nameBytes.length);
-      const wadP = eng.ex.svm_alloc(wad.length);
+      const modP = eng.ex.temen_alloc(bytes.length);
+      const nameP = eng.ex.temen_alloc(nameBytes.length);
+      const wadP = eng.ex.temen_alloc(wad.length);
       const view = new Uint8Array(eng.memory.buffer);
       view.set(bytes, modP);
       view.set(nameBytes, nameP);
       view.set(wad, wadP);
-      opened = eng.ex.svm_onramp_open_fs(modP, bytes.length, nameP, nameBytes.length, wadP, wad.length);
-      eng.ex.svm_dealloc(modP, bytes.length);
-      eng.ex.svm_dealloc(nameP, nameBytes.length);
-      eng.ex.svm_dealloc(wadP, wad.length);
+      opened = eng.ex.temen_onramp_open_fs(modP, bytes.length, nameP, nameBytes.length, wadP, wad.length);
+      eng.ex.temen_dealloc(modP, bytes.length);
+      eng.ex.temen_dealloc(nameP, nameBytes.length);
+      eng.ex.temen_dealloc(wadP, wad.length);
     } else {
-      const p = eng.ex.svm_alloc(bytes.length);
+      const p = eng.ex.temen_alloc(bytes.length);
       new Uint8Array(eng.memory.buffer).set(bytes, p);
-      opened = eng.ex.svm_onramp_open(p, bytes.length);
-      eng.ex.svm_dealloc(p, bytes.length);
+      opened = eng.ex.temen_onramp_open(p, bytes.length);
+      eng.ex.temen_dealloc(p, bytes.length);
     }
     if (opened !== 0) {
-      setState(c, 'error', `reactor open failed: status ${eng.ex.svm_status()} (2=unsupported 3=trap)`);
-      logTo(c, `svm_onramp_open failed: ${opened}`);
+      setState(c, 'error', `reactor open failed: status ${eng.ex.temen_status()} (2=unsupported 3=trap)`);
+      logTo(c, `temen_onramp_open failed: ${opened}`);
       activeReactorCard = null;
-      runNote(rec, { openStatus: eng.ex.svm_status() });
+      runNote(rec, { openStatus: eng.ex.temen_status() });
       runEnd(rec, { ok: false });
       return;
     }
@@ -2617,8 +2617,8 @@ async function runReactor(c) {
   // Publish the live loop's stats so a user Stop (out-of-band cancel) can still emit the console summary.
   reactorRun = { rec, t0, frames: 0 };
   const loop = () => {
-    const status = jitReactor ? jitReactor.frame() : eng.ex.svm_onramp_frame();
-    presentFrame(c, eng.ex.svm_framebuffer_width(), eng.ex.svm_framebuffer_height());
+    const status = jitReactor ? jitReactor.frame() : eng.ex.temen_onramp_frame();
+    presentFrame(c, eng.ex.temen_framebuffer_width(), eng.ex.temen_framebuffer_height());
     frames++;
     if (reactorRun) reactorRun.frames = frames;
     fpsFrames++;
@@ -2636,17 +2636,17 @@ async function runReactor(c) {
     reactorRAF = null;
     let trapDetail = '';
     if (status !== 0 && status !== 5) {
-      const n = jitReactor ? eng.ex.svm_onramp_jit_trap_len() : eng.ex.svm_onramp_trap_len();
+      const n = jitReactor ? eng.ex.temen_onramp_jit_trap_len() : eng.ex.temen_onramp_trap_len();
       if (n > 0) {
         trapDetail = new TextDecoder().decode(
-          new Uint8Array(eng.memory.buffer).slice(eng.ex.svm_stdout_ptr(), eng.ex.svm_stdout_ptr() + n));
+          new Uint8Array(eng.memory.buffer).slice(eng.ex.temen_stdout_ptr(), eng.ex.temen_stdout_ptr() + n));
       }
     }
     if (jitReactor) {
       jitReactor.close();
       jitReactor = null;
     } else {
-      eng.ex.svm_onramp_close();
+      eng.ex.temen_onramp_close();
     }
     activeReactorCard = null;
     c.el.run.disabled = broken;
@@ -2670,9 +2670,9 @@ async function runReactor(c) {
 // FNV-1a over the presented framebuffer, tagged with its dimensions (so a size divergence also shows).
 // Copied out of shared memory — a plain view would be a live alias.
 function hashFB() {
-  const w = eng.ex.svm_framebuffer_width();
-  const h = eng.ex.svm_framebuffer_height();
-  const p = Number(eng.ex.svm_framebuffer_ptr());
+  const w = eng.ex.temen_framebuffer_width();
+  const h = eng.ex.temen_framebuffer_height();
+  const p = Number(eng.ex.temen_framebuffer_ptr());
   const px = new Uint8Array(eng.memory.buffer).slice(p, p + w * h * 4);
   let hsh = 0x811c9dc5;
   for (let i = 0; i < px.length; i++) { hsh ^= px[i]; hsh = Math.imul(hsh, 0x01000193) >>> 0; }
@@ -2684,27 +2684,27 @@ function framesInterp(bytes, wad, n) {
   let opened;
   if (wad) {
     const nameBytes = new TextEncoder().encode('doom1.wad');
-    const modP = eng.ex.svm_alloc(bytes.length);
-    const nameP = eng.ex.svm_alloc(nameBytes.length);
-    const wadP = eng.ex.svm_alloc(wad.length);
+    const modP = eng.ex.temen_alloc(bytes.length);
+    const nameP = eng.ex.temen_alloc(nameBytes.length);
+    const wadP = eng.ex.temen_alloc(wad.length);
     const view = new Uint8Array(eng.memory.buffer);
     view.set(bytes, modP);
     view.set(nameBytes, nameP);
     view.set(wad, wadP);
-    opened = eng.ex.svm_onramp_open_fs(modP, bytes.length, nameP, nameBytes.length, wadP, wad.length);
-    eng.ex.svm_dealloc(modP, bytes.length);
-    eng.ex.svm_dealloc(nameP, nameBytes.length);
-    eng.ex.svm_dealloc(wadP, wad.length);
+    opened = eng.ex.temen_onramp_open_fs(modP, bytes.length, nameP, nameBytes.length, wadP, wad.length);
+    eng.ex.temen_dealloc(modP, bytes.length);
+    eng.ex.temen_dealloc(nameP, nameBytes.length);
+    eng.ex.temen_dealloc(wadP, wad.length);
   } else {
-    const p = eng.ex.svm_alloc(bytes.length);
+    const p = eng.ex.temen_alloc(bytes.length);
     new Uint8Array(eng.memory.buffer).set(bytes, p);
-    opened = eng.ex.svm_onramp_open(p, bytes.length);
-    eng.ex.svm_dealloc(p, bytes.length);
+    opened = eng.ex.temen_onramp_open(p, bytes.length);
+    eng.ex.temen_dealloc(p, bytes.length);
   }
-  if (opened !== 0) throw new Error(`interpreter open failed: status ${eng.ex.svm_status()}`);
+  if (opened !== 0) throw new Error(`interpreter open failed: status ${eng.ex.temen_status()}`);
   const hs = [];
-  for (let i = 0; i < n; i++) { if (eng.ex.svm_onramp_frame() !== 0) break; hs.push(hashFB()); }
-  eng.ex.svm_onramp_close();
+  for (let i = 0; i < n; i++) { if (eng.ex.temen_onramp_frame() !== 0) break; hs.push(hashFB()); }
+  eng.ex.temen_onramp_close();
   return hs;
 }
 
@@ -2788,7 +2788,7 @@ async function proveModuleParity(c) {
   try {
     // Yield a paint so "proving…" lands before the synchronous interpreter run blocks the thread.
     await new Promise((r) => setTimeout(r, 30));
-    // A warm card runs the two **warm** tiers, so prove those agree: warm-interp (`svm_warm_eval`) ≡
+    // A warm card runs the two **warm** tiers, so prove those agree: warm-interp (`temen_warm_eval`) ≡
     // warm+JIT (`runWarmJit`), both evaluating over the same restored snapshot.
     if (ex.warm) {
       if (!ensureWarmSession(bytes, ex.url)) throw new Error('warm session unavailable for this module');
@@ -2838,7 +2838,7 @@ async function proveModuleParity(c) {
 }
 
 // The chibicc-card twin of `proveModuleParity`: run **pass 1** (chibicc compiling the editor's C) on both
-// tiers and assert the emitted SVM-IR text is byte-identical — the compiler is the run-to-completion
+// tiers and assert the emitted TEMEN-IR text is byte-identical — the compiler is the run-to-completion
 // guest, its stdout is the IR. This is exactly what `chibicc_jit.rs` asserts natively.
 async function proveChibiccParity(c) {
   if (broken) return;
@@ -2869,14 +2869,14 @@ async function proveChibiccParity(c) {
     // Yield a paint so "proving…" lands before the synchronous interpreter compile blocks the thread.
     await new Promise((r) => setTimeout(r, 30));
     // Interpreter pass 1.
-    const p = eng.ex.svm_alloc(compiler.length);
-    const sp = eng.ex.svm_alloc(srcBytes.length);
+    const p = eng.ex.temen_alloc(compiler.length);
+    const sp = eng.ex.temen_alloc(srcBytes.length);
     const view = new Uint8Array(eng.memory.buffer);
     view.set(compiler, p);
     view.set(srcBytes, sp);
-    eng.ex.svm_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length, gOn);
-    eng.ex.svm_dealloc(p, compiler.length);
-    eng.ex.svm_dealloc(sp, srcBytes.length);
+    eng.ex.temen_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length, gOn);
+    eng.ex.temen_dealloc(p, compiler.length);
+    eng.ex.temen_dealloc(sp, srcBytes.length);
     const interpIr = readModuleStdout();
     // wasm-JIT pass 1.
     let jitIr;
@@ -2889,7 +2889,7 @@ async function proveChibiccParity(c) {
       return;
     }
     if (interpIr === jitIr) {
-      setState(c, 'done', `✓ interpreter ≡ wasm-JIT — byte-identical SVM IR (${jitIr.length}B)`);
+      setState(c, 'done', `✓ interpreter ≡ wasm-JIT — byte-identical Temen IR (${jitIr.length}B)`);
       logTo(c, `parity: ${jitIr.length}B emitted IR byte-identical on both tiers`);
     } else {
       setState(c, 'error', `✗ tiers diverged (interp ${interpIr.length}B / jit ${jitIr.length}B IR)`);
@@ -2932,17 +2932,17 @@ async function proveSelfhostParity(c) {
     // Yield a paint so "proving…" lands before the synchronous interpreter compile blocks the thread.
     await new Promise((r) => setTimeout(r, 30));
     // Interpreter emit-object.
-    const p = eng.ex.svm_alloc(compiler.length);
-    const ip = eng.ex.svm_alloc(image.length);
-    const tp = eng.ex.svm_alloc(tuBytes.length);
+    const p = eng.ex.temen_alloc(compiler.length);
+    const ip = eng.ex.temen_alloc(image.length);
+    const tp = eng.ex.temen_alloc(tuBytes.length);
     const view = new Uint8Array(eng.memory.buffer);
     view.set(compiler, p);
     view.set(image, ip);
     view.set(tuBytes, tp);
-    eng.ex.svm_selfhost_emit_object_fs(p, compiler.length, ip, image.length, tp, tuBytes.length, gOn);
-    eng.ex.svm_dealloc(p, compiler.length);
-    eng.ex.svm_dealloc(ip, image.length);
-    eng.ex.svm_dealloc(tp, tuBytes.length);
+    eng.ex.temen_selfhost_emit_object_fs(p, compiler.length, ip, image.length, tp, tuBytes.length, gOn);
+    eng.ex.temen_dealloc(p, compiler.length);
+    eng.ex.temen_dealloc(ip, image.length);
+    eng.ex.temen_dealloc(tp, tuBytes.length);
     const interpObj = readModuleStdout();
     // wasm-JIT emit-object.
     let jitObj;
@@ -2971,8 +2971,8 @@ async function proveSelfhostParity(c) {
 }
 
 // ---- the DAP debugger (DEBUGGING.md): breakpoints · stepping · variables, on the bytecode engine --
-// One debug session at a time. The panel drives the `svm-dap` server (bytecode backend) through the
-// `dap.js` client over the wasm FFI: launch the SVM text, run to a breakpoint, highlight the stopped
+// One debug session at a time. The panel drives the `temen-dap` server (bytecode backend) through the
+// `dap.js` client over the wasm FFI: launch the Temen text, run to a breakpoint, highlight the stopped
 // source line, and show the paused frame's named locals; Step/Continue advance it. This is the same
 // DAP an editor speaks — the playground is just another DAP frontend.
 let dapClient = null; // the active DAP client while a session runs (else null)
@@ -2981,16 +2981,16 @@ let dapWatch = new Set(); // source-variable names armed as data breakpoints (wa
 let dapScopeRef = 0; // the paused frame's Locals `variablesReference` (what `dataBreakpointInfo` scopes to)
 let dapStopped = 1; // the DAP threadId that hit the current stop (stepping always drives this thread)
 let dapThread = 1; // the DAP threadId currently being inspected (select a thread to view its stack)
-let dapSource = 'source.svm'; // the DAP source path breakpoints target this session (the launched
+let dapSource = 'source.temt'; // the DAP source path breakpoints target this session (the launched
                               // program's `debug.file`; for chibicc the compiled IR's `/in.c`, not the C editor)
 
 // The DAP source a breakpoint request targets — the program's own `debug.file 0 "…"` if it declares
-// one, else the name the engine's auto debug info uses (svm-text's AUTO_DEBUG_FILE = "source.svm"), so
+// one, else the name the engine's auto debug info uses (temen-text's AUTO_DEBUG_FILE = "source.temt"), so
 // breakpoints bind for a hand-written program with no explicit `debug` section. For chibicc this reads
 // the *compiled IR*'s `debug.file` (`/in.c`) — the C editor lines still map through chibicc's debug.loc.
 function dapSourceName(src) {
   const m = /debug\.file\s+0\s+"([^"]+)"/.exec(src);
-  return m ? m[1] : 'source.svm';
+  return m ? m[1] : 'source.temt';
 }
 
 // Push the card's current breakpoint lines (editor 0-based → DAP 1-based) to the server, against the
@@ -3099,28 +3099,28 @@ function dapHandle(c, reply) {
   }
 }
 
-// Fetch chibicc and compile the card's current C source to SVM-IR text with `-g` (the debug waist:
+// Fetch chibicc and compile the card's current C source to TEMEN-IR text with `-g` (the debug waist:
 // source lines + variable names), for a source-level debug session. Returns `{ ir, status, stderr }`;
 // the caller reports a failed compile. Mirrors `runChibicc`'s pass 1, always debug-on.
 async function chibiccCompileIR(c) {
   const compiler = await fetchModule(c.ex.url, onFetchProgress(c, baseName(c.ex.url)));
   const srcBytes = new TextEncoder().encode(c.editor.getValue());
   if (srcBytes.length === 0) return { ir: '', status: -1, stderr: 'empty source' };
-  const p = eng.ex.svm_alloc(compiler.length);
-  const sp = eng.ex.svm_alloc(srcBytes.length);
+  const p = eng.ex.temen_alloc(compiler.length);
+  const sp = eng.ex.temen_alloc(srcBytes.length);
   const view = new Uint8Array(eng.memory.buffer);
   view.set(compiler, p);
   view.set(srcBytes, sp);
-  eng.ex.svm_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length, 1); // 1 = -g
-  const status = eng.ex.svm_status();
+  eng.ex.temen_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length, 1); // 1 = -g
+  const status = eng.ex.temen_status();
   const ir = readModuleStdout();
   const stderr = readModuleStderr();
-  eng.ex.svm_dealloc(p, compiler.length);
-  eng.ex.svm_dealloc(sp, srcBytes.length);
+  eng.ex.temen_dealloc(p, compiler.length);
+  eng.ex.temen_dealloc(sp, srcBytes.length);
   return { ir, status, stderr };
 }
 
-// Start a debug session on the bytecode engine. For an SVM-text card the editor content *is* the
+// Start a debug session on the bytecode engine. For an TEMEN-text card the editor content *is* the
 // program. For the chibicc C card, compile the C with `-g` first and debug the emitted IR at **C source
 // level**: breakpoints on C lines + C locals by name bind through chibicc's `debug.loc`/`debug.var`,
 // while the editor keeps showing C. (The DAP backend runs deny-all, so a program that calls a host
@@ -3144,7 +3144,7 @@ async function startDebug(c) {
       return;
     }
     programText = compiled.ir;
-    logTo(c, `compiled with -g: ${compiled.ir.length}B debuggable SVM IR`);
+    logTo(c, `compiled with -g: ${compiled.ir.length}B debuggable Temen IR`);
   } else {
     programText = c.editor.getValue();
   }
@@ -3161,7 +3161,7 @@ async function startDebug(c) {
   if (c.ex.kind === 'chibicc') c.el.stdout.textContent = '';
   dapClient.send('initialize', {});
   // A chibicc C program runs under the on-ramp I/O powerbox, so a `printf` (a `write` cap) runs and its
-  // output streams back as `output` events instead of trapping; a hand-written SVM card stays deny-all.
+  // output streams back as `output` events instead of trapping; a hand-written Temen card stays deny-all.
   const launchArgs = { programText, function: 0, args: [], engine: 'bytecode' };
   if (c.ex.kind === 'chibicc') launchArgs.powerbox = 'onramp';
   const launch = dapClient.send('launch', launchArgs);
@@ -3202,12 +3202,12 @@ function endDebug(c, message) {
   if (message) setState(c, 'done', message);
 }
 
-// SVM **text** guests: parse+verify inside the sandbox (`svm_parse`), then run across Workers under the
+// Temen **text** guests: parse+verify inside the sandbox (`temen_parse`), then run across Workers under the
 // card's selected powerbox recipe.
 async function runText(c) {
   const mode = c.el.mode.value;
   // The `jit` powerbox recipe runs the guest on the §22 guest-JIT (host-compiled units in the shared
-  // Domain) — the wasm-JIT tier for SVM-text demos; every other recipe runs on the bytecode engine.
+  // Domain) — the wasm-JIT tier for TEMEN-text demos; every other recipe runs on the bytecode engine.
   const rec = runStart(c, { tier: mode === 'jit' ? 'wasm-JIT' : 'interpreter', mode });
   setState(c, 'running', 'parsing…');
   const src = c.editor.getValue();
@@ -3225,11 +3225,11 @@ async function runText(c) {
   }
   {
     const tParse = performance.now();
-    const p = eng.ex.svm_alloc(srcBytes.length);
+    const p = eng.ex.temen_alloc(srcBytes.length);
     u8().set(srcBytes, p);
-    const ok = eng.ex.svm_parse(p, srcBytes.length);
-    eng.ex.svm_dealloc(p, srcBytes.length);
-    const out = u8().slice(eng.ex.svm_parse_ptr(), eng.ex.svm_parse_ptr() + eng.ex.svm_parse_len());
+    const ok = eng.ex.temen_parse(p, srcBytes.length);
+    eng.ex.temen_dealloc(p, srcBytes.length);
+    const out = u8().slice(eng.ex.temen_parse_ptr(), eng.ex.temen_parse_ptr() + eng.ex.temen_parse_len());
     if (ok !== 1) {
       const msg = new TextDecoder().decode(out);
       setState(c, 'error', msg);
@@ -3316,7 +3316,7 @@ async function runDemo(c) {
 // A card's Stop: close a live Postgres session, end a running reactor, or abort a threaded text run.
 function stopDemo(c) {
   if (c.pgSession) {
-    eng.ex.svm_pg_close();
+    eng.ex.temen_pg_close();
     c.pgSession = false;
     c.el.run.disabled = broken;
     c.el.stop.disabled = true;
@@ -3342,7 +3342,7 @@ const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls)
 // Each editable card's source is persisted under its slug so edits survive a reload; "Reset" restores
 // the demo's default and drops the saved copy. localStorage is best-effort — a private-mode/quota
 // error must never break the page, so every access is guarded.
-const STORE_PREFIX = 'svm-play:src:';
+const STORE_PREFIX = 'temen-play:src:';
 const loadSaved = (id) => { try { return localStorage.getItem(STORE_PREFIX + id); } catch { return null; } };
 const saveSrc = (id, value, dflt) => {
   try {
@@ -3417,7 +3417,7 @@ function buildCard(name, ex) {
   section.append(el('h2', 'demo-title', name));
   section.append(el('p', 'desc', ex.desc || ''));
 
-  // SVM text (no `kind`) and editable modules (Lua/SQL/Postgres) get an editor; a fixed C guest or a
+  // Temen text (no `kind`) and editable modules (Lua/SQL/Postgres) get an editor; a fixed C guest or a
   // reactor gets a lightweight read-only note (its "source" is a pre-built binary).
   const editable = !ex.kind || !!ex.editable;
   const dflt = ex.src || '';
@@ -3428,7 +3428,7 @@ function buildCard(name, ex) {
     const wrap = el('div', 'editor');
     wrap.appendChild(ta);
     section.appendChild(wrap);
-    editor = createEditor(ta, ex.lang || 'svm');
+    editor = createEditor(ta, ex.lang || 'temen');
     // Restore a previously edited source, then persist every edit under this card's slug.
     const saved = loadSaved(id);
     if (saved != null && saved !== dflt) editor.setValue(saved);
@@ -3447,8 +3447,8 @@ function buildCard(name, ex) {
       ex.kind === 'reactor'
         ? `Pre-built on-ramp reactor module (${ex.url}). Click Run — the page calls tick() once per animation frame; the arrow keys steer it through the keyboard capability.`
         : ex.kind === 'selfhost'
-        ? `chibicc compiling its own source. Pick one of chibicc’s cc1 translation units and click Run — chibicc.svmb compiles that file to a linkable SVM-IR object, reading its ~96-file glibc header closure from the seeded in-memory filesystem, entirely in your browser. The emitted object appears below; "Prove interp ≡ JIT" recompiles it on both engines and checks they’re byte-identical.`
-        : `Pre-built on-ramp module (${ex.url}). Click Run — it executes as a real C/C++ guest via svm_run_onramp; its stdout appears below.`));
+        ? `chibicc compiling its own source. Pick one of chibicc’s cc1 translation units and click Run — chibicc.temen compiles that file to a linkable TEMEN-IR object, reading its ~96-file glibc header closure from the seeded in-memory filesystem, entirely in your browser. The emitted object appears below; "Prove interp ≡ JIT" recompiles it on both engines and checks they’re byte-identical.`
+        : `Pre-built on-ramp module (${ex.url}). Click Run — it executes as a real C/C++ guest via temen_run_onramp; its stdout appears below.`));
   }
 
   const controls = el('div', 'controls');
@@ -3514,7 +3514,7 @@ function buildCard(name, ex) {
     debugBtn = el('button', 'debug', 'Debug');
     debugBtn.title = ex.kind === 'chibicc'
       ? 'Compile with -g and debug the C at source level — breakpoints on C lines, C locals by name (tick "debug info (-g)" first)'
-      : 'Debug this SVM program on the bytecode engine — breakpoints, stepping, variables';
+      : 'Debug this Temen program on the bytecode engine — breakpoints, stepping, variables';
     debugBtn.disabled = true;
     controls.appendChild(debugBtn);
   }
@@ -3674,7 +3674,7 @@ function buildSidebar() {
 function setupTheme() {
   const sel = $('theme');
   let stored = 'auto';
-  try { stored = localStorage.getItem('svm-play:theme') || 'auto'; } catch { /* private mode */ }
+  try { stored = localStorage.getItem('temen-play:theme') || 'auto'; } catch { /* private mode */ }
   sel.value = stored;
   const mq = matchMedia('(prefers-color-scheme: dark)');
   const apply = (pref) => {
@@ -3682,7 +3682,7 @@ function setupTheme() {
     document.documentElement.dataset.theme = dark ? 'dark' : 'light';
   };
   sel.addEventListener('change', () => {
-    try { localStorage.setItem('svm-play:theme', sel.value); } catch { /* best-effort */ }
+    try { localStorage.setItem('temen-play:theme', sel.value); } catch { /* best-effort */ }
     apply(sel.value);
   });
   mq.addEventListener('change', () => { if (sel.value === 'auto') apply('auto'); }); // follow the OS live
@@ -3766,7 +3766,7 @@ async function main() {
     }
   } catch (e) {
     snapshotClient = null;
-    console.warn('[SVM playground] snapshot worker unavailable; warm cards use the main thread:', e.message);
+    console.warn('[Temen playground] snapshot worker unavailable; warm cards use the main thread:', e.message);
   }
 }
 

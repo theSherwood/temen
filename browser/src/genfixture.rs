@@ -1,5 +1,5 @@
-//! Host-side fixture generator: parse an SVM IR text module and write its `svm-encode` binary form
-//! to the path in `argv[1]`. `run.mjs` feeds the bytes to the wasm `svm_run` entry, so the wasm
+//! Host-side fixture generator: parse an Temen IR text module and write its `temen-encode` binary form
+//! to the path in `argv[1]`. `run.mjs` feeds the bytes to the wasm `temen_run` entry, so the wasm
 //! build is exercised on the **real decode path** (not an embedded module).
 
 use std::io::Write;
@@ -36,9 +36,9 @@ block 3 (v17: i64) {
 fn main() {
     let out = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "alu.svmbc".into());
-    let m = svm_text::parse_module(ALU).expect("parse ALU module");
-    let bytes = svm_encode::encode_module(&m);
+        .unwrap_or_else(|| "alu.temenc".into());
+    let m = temen_text::parse_module(ALU).expect("parse ALU module");
+    let bytes = temen_encode::encode_module(&m);
     let mut f = std::fs::File::create(&out).expect("create fixture file");
     f.write_all(&bytes).expect("write fixture");
     eprintln!("wrote {} bytes of encoded IR to {out}", bytes.len());

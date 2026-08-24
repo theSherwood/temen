@@ -4,22 +4,22 @@
 //! chibicc-the-guest resolves quote-includes against the source's own directory (`/`), so a program
 //! split across a header + a second translation unit compiles (unity-build style) and runs, entirely
 //! in-sandbox. These tests exercise the split (`split_multifile_source`) and the end-to-end compile.
-//! Fail-soft: SKIPs if `chibicc.svmb` isn't built.
+//! Fail-soft: SKIPs if `chibicc.temen` isn't built.
 
-use svm_browser::{
+use temen_browser::{
     onramp_exec, onramp_fs_exec, playground_include_files, split_multifile_source, STATUS_EXIT,
     STATUS_OK,
 };
 
-fn chibicc_svmb() -> Option<svm_ir::Module> {
-    let p = concat!(env!("CARGO_MANIFEST_DIR"), "/web/assets/chibicc.svmb");
+fn chibicc_temen() -> Option<temen_ir::Module> {
+    let p = concat!(env!("CARGO_MANIFEST_DIR"), "/web/assets/chibicc.temen");
     let bytes = std::fs::read(p).ok()?;
-    Some(svm_encode::decode_module(&bytes).expect("decode chibicc.svmb"))
+    Some(temen_encode::decode_module(&bytes).expect("decode chibicc.temen"))
 }
 
 /// Assemble the card's memfs exactly as `chibicc_card_image` does — built-in headers under `/include`
 /// plus the multi-file split of the editor buffer — then compile `/in.c` and run the result.
-fn compile_and_run(chibicc: &svm_ir::Module, editor: &str) -> (i32, String) {
+fn compile_and_run(chibicc: &temen_ir::Module, editor: &str) -> (i32, String) {
     let mut files: Vec<(String, Vec<u8>)> = playground_include_files();
     let mut dirs = vec!["include".to_string()];
     for (key, bytes) in split_multifile_source(editor.as_bytes()) {
@@ -31,7 +31,7 @@ fn compile_and_run(chibicc: &svm_ir::Module, editor: &str) -> (i32, String) {
         files.retain(|(k, _)| *k != key);
         files.push((key, bytes));
     }
-    let image = svm_fs::encode_image(&files, &dirs);
+    let image = temen_fs::encode_image(&files, &dirs);
     let compiled = onramp_fs_exec(
         chibicc,
         &image,
@@ -45,8 +45,8 @@ fn compile_and_run(chibicc: &svm_ir::Module, editor: &str) -> (i32, String) {
         String::from_utf8_lossy(&compiled.stderr)
     );
     let ir = String::from_utf8(compiled.stdout).expect("IR is utf8");
-    assert!(ir.contains("func"), "expected SVM IR, got: {ir:.200}");
-    let m = svm_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"));
+    assert!(ir.contains("func"), "expected Temen IR, got: {ir:.200}");
+    let m = temen_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"));
     let run = onramp_exec(&m, b"");
     (
         run.status,
@@ -74,8 +74,8 @@ fn split_marks_files() {
 /// quote-includes — compiles and runs (the unity-build path the memfs already resolves).
 #[test]
 fn three_file_project_compiles_and_runs() {
-    let Some(chibicc) = chibicc_svmb() else {
-        eprintln!("SKIP: chibicc.svmb absent");
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
         return;
     };
     let (status, out) = compile_and_run(
@@ -102,8 +102,8 @@ int fib(int n) { int x = 0, y = 1; for (int i = 0; i < n; i++) { int t = x + y; 
 /// A nested-directory include (`//// file: inc/vec.h`) resolves via `#include "inc/vec.h"`.
 #[test]
 fn nested_directory_include() {
-    let Some(chibicc) = chibicc_svmb() else {
-        eprintln!("SKIP: chibicc.svmb absent");
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
         return;
     };
     let (status, out) = compile_and_run(

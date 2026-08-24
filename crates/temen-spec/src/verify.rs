@@ -1,0 +1,896 @@
+//! The **reference verifier** (SPEC.md suite 2): an independent second implementation
+//! of the DESIGN.md §3b/§3c validity rules, written from the prose and the `temen-ir`
+//! type documentation — deliberately *not* from `temen-verify`'s code. The conformance
+//! suite (`crates/temen/tests/spec_verify.rs`) asserts the two implementations agree on
+//! accept/reject over the row modules, directed rule mutations, and an `irgen` sweep —
+//! closing the accept-direction gap: a production-verifier bug now needs the *same*
+//! bug here, independently, to survive.
+//!
+//! Errors are plain strings naming the violated rule — agreement is on accept/reject;
+//! pinning `temen-verify`'s precise error *variants* is the directed mutation tests' job.
+
+use temen_ir::*;
+
+type R = Result<(), String>;
+
+/// Verify a whole module against the §3b/§3c rules. `Ok(())` ⇔ the module is valid.
+pub fn verify(m: &Module) -> R {
+    // §3a: a declared window must have a representable power-of-two size.
+    if let Some(mem) = &m.memory {
+        if mem.size_log2 >= 64 {
+            return Err(format!(
+                "memory size_log2 {} unrepresentable",
+                mem.size_log2
+            ));
+        }
+    }
+    // §3a/D40: every data segment needs a window and must fit `[0, size)` without
+    // offset+len overflow.
+    for (i, d) in m.data.iter().enumerate() {
+        let Some(mem) = &m.memory else {
+            return Err(format!("data segment {i} without declared memory"));
+        };
+        match d.offset.checked_add(d.bytes.len() as u64) {
+            Some(end) if end <= mem.size() => {}
+            _ => return Err(format!("data segment {i} outside the window")),
+        }
+    }
+    // §7 / IMPORTS.md phase 1: import names must be uniquely resolvable (the instantiation
+    // policy binds by name), mirroring the export-name rule below.
+    for (i, imp) in m.imports.iter().enumerate() {
+        if m.imports[..i].iter().any(|o| o.name == imp.name) {
+            return Err(format!("duplicate import name {:?}", imp.name));
+        }
+    }
+    // §3.5 import shapes: every import references a well-formed type-section entry of its
+    // declared kind.
+    for (i, imp) in m.imports.iter().enumerate() {
+        let ok = match imp.shape {
+            temen_ir::ImportShape::Func(t) => {
+                matches!(m.types.get(t as usize), Some(temen_ir::TypeEntry::Func(_)))
+            }
+            temen_ir::ImportShape::Interface(t) => m.interface_ops(t).is_some(),
+        };
+        if !ok {
+            return Err(format!("import {i} shape reference is not well-formed"));
+        }
+    }
+    for (fi, f) in m.funcs.iter().enumerate() {
+        verify_func(
+            f,
+            &m.funcs,
+            &m.imports,
+            &m.types,
+            m.impl_exports.len(),
+            m.memory.is_some(),
+        )
+        .map_err(|e| format!("fn{fi}: {e}"))?;
+    }
+    // Exports name real functions, uniquely.
+    for (i, e) in m.exports.iter().enumerate() {
+        if e.func as usize >= m.funcs.len() {
+            return Err(format!("export {i} names function {} out of range", e.func));
+        }
+        if m.exports[..i].iter().any(|o| o.name == e.name) {
+            return Err(format!("duplicate export name {:?}", e.name));
+        }
+    }
+    // Interface offers (IMPORTS.md §3.2): non-empty op lists, every op names a real function,
+    // and one name namespace across function exports and offers.
+    for (i, e) in m.impl_exports.iter().enumerate() {
+        if e.ops.is_empty() {
+            return Err(format!("impl export {i} has no ops"));
+        }
+        for (oi, &f) in e.ops.iter().enumerate() {
+            if f as usize >= m.funcs.len() {
+                return Err(format!(
+                    "impl export {i} op {oi} names function {f} out of range"
+                ));
+            }
+        }
+        // v6 (OQ3): the offer implements its declared interface exactly — op count and each
+        // op's function type equal to the interface's signature, resolved through the type
+        // section's one index space (an interface is a tuple of Func-entry indices).
+        let Some(iface) = m.interface_ops(e.interface) else {
+            return Err(format!(
+                "impl export {i} interface {} is not a well-formed interface entry",
+                e.interface
+            ));
+        };
+        if e.ops.len() != iface.len() {
+            return Err(format!(
+                "impl export {i} implements {} ops but its interface declares {}",
+                e.ops.len(),
+                iface.len()
+            ));
+        }
+        for (oi, (&f, want)) in e.ops.iter().zip(&iface).enumerate() {
+            let ft = &m.funcs[f as usize];
+            if ft.params != want.params || ft.results != want.results {
+                return Err(format!(
+                    "impl export {i} op {oi} does not match its declared interface signature"
+                ));
+            }
+        }
+        if m.impl_exports[..i].iter().any(|o| o.name == e.name)
+            || m.exports.iter().any(|o| o.name == e.name)
+        {
+            return Err(format!("duplicate export name {:?}", e.name));
+        }
+    }
+    Ok(())
+}
+
+fn verify_func(
+    f: &Func,
+    funcs: &[Func],
+    imports: &[Import],
+    tsec: &[temen_ir::TypeEntry],
+    n_impl: usize,
+    has_memory: bool,
+) -> R {
+    // §3b rule 2: the entry block's params equal the function signature's params.
+    match f.blocks.first() {
+        Some(entry) if entry.params == f.params => {}
+        _ => return Err("entry block params != function params (or no blocks)".into()),
+    }
+    let fn_results: Vec<usize> = funcs.iter().map(|f| f.results.len()).collect();
+    for b in &f.blocks {
+        let mut types: Vec<ValType> = b.params.clone();
+        for inst in &b.insts {
+            check_inst(
+                inst,
+                &mut types,
+                funcs,
+                imports,
+                tsec,
+                n_impl,
+                has_memory,
+                b,
+                &fn_results,
+            )?;
+        }
+        check_term(&b.term, &types, f, funcs)?;
+    }
+    Ok(())
+}
+
+/// Resolve interface entry `t`'s op-`op` signature through the type section, or `None` when
+/// `t` is not a well-formed interface reference or `op` is out of range (§3.5).
+fn iface_op_sig(tsec: &[temen_ir::TypeEntry], t: u32, op: u32) -> Option<&temen_ir::FuncType> {
+    match tsec.get(t as usize)? {
+        temen_ir::TypeEntry::Interface(elems) => {
+            match tsec.get(elems.get(op as usize)?.ty as usize)? {
+                temen_ir::TypeEntry::Func(ft) => Some(ft),
+                temen_ir::TypeEntry::Interface(_) => None,
+            }
+        }
+        temen_ir::TypeEntry::Func(_) => None,
+    }
+}
+
+/// Whether `t` names a well-formed interface entry (every element a `Func` reference).
+fn iface_well_formed(tsec: &[temen_ir::TypeEntry], t: u32) -> bool {
+    match tsec.get(t as usize) {
+        Some(temen_ir::TypeEntry::Interface(elems)) => elems
+            .iter()
+            .all(|e| matches!(tsec.get(e.ty as usize), Some(temen_ir::TypeEntry::Func(_)))),
+        _ => false,
+    }
+}
+
+/// §3b rule 3: operand `v` is defined strictly earlier and has exactly type `want`.
+fn want(types: &[ValType], v: ValIdx, want: ValType) -> R {
+    // `cap` is `i32`-width data in guest code (IMPORTS.md §3.5): value-compatible with `i32`
+    // wherever operands flow, while staying distinct in signatures (structural matching and the
+    // boundary `cap` translation key on the marker, comparing `FuncType`s directly).
+    let compat = |t: ValType| {
+        t == want
+            || matches!(
+                (t, want),
+                (ValType::I32 | ValType::Cap, ValType::I32 | ValType::Cap)
+            )
+    };
+    match types.get(v as usize) {
+        None => Err(format!(
+            "value v{v} not defined yet ({} defined)",
+            types.len()
+        )),
+        Some(t) if compat(*t) => Ok(()),
+        Some(t) => Err(format!("v{v}: expected {want:?}, found {t:?}")),
+    }
+}
+
+fn need_memory(has_memory: bool) -> R {
+    if has_memory {
+        Ok(())
+    } else {
+        Err("memory op without a declared window".into())
+    }
+}
+
+/// One instruction: check operands, append result type(s). Exhaustive over `Inst`, so
+/// a new instruction forces a rule decision here (the same forcing function as
+/// [`crate::coverage`]).
+#[allow(clippy::too_many_arguments)]
+fn check_inst(
+    inst: &Inst,
+    types: &mut Vec<ValType>,
+    funcs: &[Func],
+    imports: &[Import],
+    tsec: &[temen_ir::TypeEntry],
+    n_impl: usize,
+    has_memory: bool,
+    block: &Block,
+    fn_results: &[usize],
+) -> R {
+    use ValType as V;
+    let w = |v: ValIdx, t: V| want(types, v, t);
+    // The type(s) this instruction appends; computed before mutating `types`.
+    let push: Vec<V> = match inst {
+        Inst::ConstI32(_) => vec![V::I32],
+        Inst::ConstI64(_) => vec![V::I64],
+        Inst::ConstF32(_) => vec![V::F32],
+        Inst::ConstF64(_) => vec![V::F64],
+        // Link-form data addresses append their resolved-to `i64`; immediates only, no operands.
+        Inst::DataSym { .. } | Inst::DataSelf { .. } | Inst::DataTop => vec![V::I64],
+        Inst::IntBin { ty, a, b, .. } => {
+            w(*a, ty.val())?;
+            w(*b, ty.val())?;
+            vec![ty.val()]
+        }
+        Inst::IntCmp { ty, a, b, .. } => {
+            w(*a, ty.val())?;
+            w(*b, ty.val())?;
+            vec![V::I32]
+        }
+        Inst::IntUn { ty, a, .. } => {
+            w(*a, ty.val())?;
+            vec![ty.val()]
+        }
+        Inst::Eqz { ty, a } => {
+            w(*a, ty.val())?;
+            vec![V::I32]
+        }
+        Inst::Convert { op, a } => {
+            let (_, src, dst) = op.sig();
+            w(*a, src)?;
+            vec![dst]
+        }
+        // §3b: the one polymorphic op — `a` fixes the type, `b` must match exactly.
+        Inst::Select { cond, a, b } => {
+            w(*cond, V::I32)?;
+            let t = *types
+                .get(*a as usize)
+                .ok_or_else(|| format!("select a v{a} not defined"))?;
+            w(*b, t)?;
+            vec![t]
+        }
+        Inst::FBin { ty, a, b, .. } => {
+            w(*a, ty.val())?;
+            w(*b, ty.val())?;
+            vec![ty.val()]
+        }
+        Inst::FUn { ty, a, .. } => {
+            w(*a, ty.val())?;
+            vec![ty.val()]
+        }
+        Inst::Fma { ty, a, b, c } => {
+            w(*a, ty.val())?;
+            w(*b, ty.val())?;
+            w(*c, ty.val())?;
+            vec![ty.val()]
+        }
+        Inst::FCmp { ty, a, b, .. } => {
+            w(*a, ty.val())?;
+            w(*b, ty.val())?;
+            vec![V::I32]
+        }
+        Inst::FToISat { op, a } | Inst::FToITrap { op, a } => {
+            let (from, to, _) = op.parts();
+            w(*a, from.val())?;
+            vec![to.val()]
+        }
+        Inst::IToFConv { op, a } => {
+            let (from, to, _) = op.parts();
+            w(*a, from.val())?;
+            vec![to.val()]
+        }
+        Inst::Cast { op, a } => {
+            let (_, src, dst) = op.sig();
+            w(*a, src)?;
+            vec![dst]
+        }
+
+        // ----- memory (§3b/§4): addresses are i64; every access needs a window -----
+        Inst::Load { op, addr, .. } => {
+            need_memory(has_memory)?;
+            w(*addr, V::I64)?;
+            vec![op.info().1]
+        }
+        Inst::Store {
+            op, addr, value, ..
+        } => {
+            need_memory(has_memory)?;
+            w(*addr, V::I64)?;
+            w(*value, op.info().1)?;
+            vec![]
+        }
+        Inst::MemCopy { dst, src, len } | Inst::MemMove { dst, src, len } => {
+            need_memory(has_memory)?;
+            w(*dst, V::I64)?;
+            w(*src, V::I64)?;
+            w(*len, V::I64)?;
+            vec![]
+        }
+        Inst::MemFill { dst, val, len } => {
+            need_memory(has_memory)?;
+            w(*dst, V::I64)?;
+            w(*val, V::I32)?;
+            w(*len, V::I64)?;
+            vec![]
+        }
+
+        // ----- atomics (§12): load/store/rmw/cmpxchg execute seq-cst and carry no ordering; only
+        // the fence keeps one (and it accepts any) -----
+        Inst::AtomicLoad { ty, addr, .. } => {
+            need_memory(has_memory)?;
+            w(*addr, V::I64)?;
+            vec![ty.val()]
+        }
+        Inst::AtomicStore {
+            ty, addr, value, ..
+        } => {
+            need_memory(has_memory)?;
+            w(*addr, V::I64)?;
+            w(*value, ty.val())?;
+            vec![]
+        }
+        Inst::AtomicRmw {
+            ty, addr, value, ..
+        } => {
+            need_memory(has_memory)?;
+            w(*addr, V::I64)?;
+            w(*value, ty.val())?;
+            vec![ty.val()]
+        }
+        Inst::AtomicCmpxchg {
+            ty,
+            addr,
+            expected,
+            replacement,
+            ..
+        } => {
+            need_memory(has_memory)?;
+            w(*addr, V::I64)?;
+            w(*expected, ty.val())?;
+            w(*replacement, ty.val())?;
+            vec![ty.val()]
+        }
+        Inst::AtomicFence { .. } => vec![],
+        Inst::MemoryWait {
+            ty,
+            addr,
+            expected,
+            timeout,
+        } => {
+            need_memory(has_memory)?;
+            w(*addr, V::I64)?;
+            w(*expected, ty.val())?;
+            w(*timeout, V::I64)?;
+            vec![V::I32]
+        }
+        Inst::MemoryNotify { addr, count } => {
+            need_memory(has_memory)?;
+            w(*addr, V::I64)?;
+            w(*count, V::I32)?;
+            vec![V::I32]
+        }
+
+        // ----- calls (§3b rule 5 / §3c): args match the signature exactly -----
+        Inst::Call { func, args } => {
+            let callee = funcs
+                .get(*func as usize)
+                .ok_or_else(|| format!("call to out-of-range fn{func}"))?;
+            check_args(types, args, &callee.params)?;
+            callee.results.clone()
+        }
+        Inst::CallIndirect { ty, idx, args } => {
+            w(*idx, V::I32)?;
+            check_args(types, args, &ty.params)?;
+            ty.results.clone()
+        }
+        Inst::RefFunc { func } => {
+            if *func as usize >= funcs.len() {
+                return Err(format!("ref.func to out-of-range fn{func}"));
+            }
+            vec![V::I32] // a funcref is a plain i32 table index (§3c/D37)
+        }
+        Inst::CapCall {
+            sig, handle, args, ..
+        } => {
+            w(*handle, V::I32)?; // forgeable index; safety is the runtime check (D37)
+            check_args(types, args, &sig.params)?;
+            sig.results.clone()
+        }
+        // §7/§22 symbolic call (v8): verifies exactly like a *flat* manifest import call
+        // (op 0) plus its legacy handle operand (i32; ignored by manifest dispatch, live to
+        // the linker). Executable when bound at instantiation; the linker's rewrite target
+        // when resolved first.
+        Inst::CallSym {
+            import,
+            sig,
+            handle,
+            args,
+        } => {
+            let Some(decl) = imports.get(*import as usize) else {
+                return Err(format!(
+                    "unresolved import {import} (out of manifest range)"
+                ));
+            };
+            let want_sig = match decl.shape {
+                temen_ir::ImportShape::Func(t) => match tsec.get(t as usize) {
+                    Some(temen_ir::TypeEntry::Func(ft)) => Some(ft),
+                    _ => None,
+                },
+                temen_ir::ImportShape::Interface(t) => iface_op_sig(tsec, t, 0),
+            };
+            let Some(want_sig) = want_sig else {
+                return Err(format!("import {import} op 0 out of range for its shape"));
+            };
+            if want_sig != sig {
+                return Err(format!("import {import} signature mismatch with manifest"));
+            }
+            w(*handle, V::I32)?;
+            check_args(types, args, &sig.params)?;
+            sig.results.clone()
+        }
+        // §7 / IMPORTS.md phase 1: a `call.import` is executable when its index names a declared
+        // import and its self-describing sig equals the manifest's (the canonical interface);
+        // out-of-range (including the empty-manifest legacy shape) or a sig disagreement is
+        // fail-closed. Operand typing mirrors `cap.call` (args per sig; no handle since v8).
+        Inst::CallImport {
+            import,
+            op,
+            sig,
+            args,
+        } => {
+            let Some(decl) = imports.get(*import as usize) else {
+                return Err(format!(
+                    "unresolved import {import} (out of manifest range)"
+                ));
+            };
+            // §3.5: resolve the consumer-local op through the declared shape and the type
+            // section — a flat `func` import has exactly op 0; a grouped import its
+            // interface's op list. The self-describing sig must equal the resolution.
+            let want_sig = match decl.shape {
+                temen_ir::ImportShape::Func(t) => match (op, tsec.get(t as usize)) {
+                    (0, Some(temen_ir::TypeEntry::Func(ft))) => Some(ft),
+                    _ => None,
+                },
+                temen_ir::ImportShape::Interface(t) => iface_op_sig(tsec, t, *op),
+            };
+            let Some(want_sig) = want_sig else {
+                return Err(format!(
+                    "import {import} op {op} out of range for its shape"
+                ));
+            };
+            if want_sig != sig {
+                return Err(format!("import {import} signature mismatch with manifest"));
+            }
+            check_args(types, args, &sig.params)?;
+            sig.results.clone()
+        }
+        // §3.5 dynamic-mode dispatch by type-section reference: well-formed interface, op in
+        // range, sig equal to the resolution; handle is a forgeable i32 (runtime §3c check).
+        Inst::CallImportDyn {
+            ty,
+            op,
+            sig,
+            handle,
+            args,
+        } => {
+            let Some(want_sig) = iface_op_sig(tsec, *ty, *op) else {
+                return Err(format!(
+                    "call.import.dyn type {ty} op {op} is not a well-formed interface op"
+                ));
+            };
+            if want_sig != sig {
+                return Err(format!("call.import.dyn type {ty} signature mismatch"));
+            }
+            w(*handle, V::I32)?;
+            check_args(types, args, &sig.params)?;
+            sig.results.clone()
+        }
+        // §3.5 `export.handle`: index must name a declared impl export; appends the handle.
+        Inst::ExportHandle { export } => {
+            if *export as usize >= n_impl {
+                return Err(format!("export.handle {export} out of range"));
+            }
+            vec![V::I32]
+        }
+        // §3.5 reflection: both reference a well-formed interface of this module.
+        Inst::CapSelfTypeId { ty } => {
+            if !iface_well_formed(tsec, *ty) {
+                return Err(format!(
+                    "cap.self.type_id {ty} is not a well-formed interface"
+                ));
+            }
+            vec![V::I32]
+        }
+        Inst::CapSelfCovers { handle, ty } => {
+            if !iface_well_formed(tsec, *ty) {
+                return Err(format!(
+                    "cap.self.covers {ty} is not a well-formed interface"
+                ));
+            }
+            w(*handle, V::I32)?;
+            vec![V::I32]
+        }
+        // Phase-2 `import.attach` (IMPORTS.md): the index must name a declared **rebindable**
+        // import; the handle operand is a forgeable i32 (validity is the runtime §3c check).
+        Inst::ImportAttach { import, handle } => {
+            let Some(decl) = imports.get(*import as usize) else {
+                return Err(format!("attach to unresolved import {import}"));
+            };
+            if decl.mode != ImportMode::Rebindable {
+                return Err(format!("attach to non-rebindable import {import}"));
+            }
+            w(*handle, V::I32)?;
+            vec![V::I32]
+        }
+        // `cap.self.count`/`get`/`resolve`/`label`/`attest` are now `cap.call CAP_SELF op N` — verified
+        // by the generic `CapCall` arm above.
+
+        // ----- fibers / threads / TLS (§12) -----
+        Inst::ContNew { func, sp } => {
+            w(*func, V::I32)?;
+            w(*sp, V::I64)?;
+            vec![V::I64]
+        }
+        Inst::ContResume { k, arg, block: _ } => {
+            w(*k, V::I64)?;
+            w(*arg, V::I64)?;
+            vec![V::I32, V::I64] // (status, value) — the I48 blocking form types identically
+        }
+        Inst::Suspend { value } => {
+            w(*value, V::I64)?;
+            vec![V::I64]
+        }
+        Inst::ThreadSpawn { func, sp, arg } => {
+            let callee = funcs
+                .get(*func as usize)
+                .ok_or_else(|| format!("thread.spawn of out-of-range fn{func}"))?;
+            // §12: the thread entry signature is fixed — (i64 sp, i64 arg) -> i64.
+            if callee.params != [V::I64, V::I64] || callee.results != [V::I64] {
+                return Err(format!("thread.spawn entry fn{func} has wrong signature"));
+            }
+            w(*sp, V::I64)?;
+            w(*arg, V::I64)?;
+            vec![V::I32]
+        }
+        Inst::ThreadJoin { handle } => {
+            w(*handle, V::I32)?;
+            vec![V::I64]
+        }
+        Inst::VcpuTlsGet => vec![V::I64],
+        Inst::VcpuTlsSet { val } => {
+            w(*val, V::I64)?;
+            vec![]
+        }
+        Inst::DurableShadowBase => vec![V::I64],
+
+        // ----- setjmp/longjmp: touch the guest jmp_buf, so they need a window -----
+        Inst::SetJmp { buf } => {
+            need_memory(has_memory)?;
+            w(*buf, V::I64)?;
+            vec![V::I32]
+        }
+        Inst::LongJmp { buf, val } => {
+            need_memory(has_memory)?;
+            w(*buf, V::I64)?;
+            w(*val, V::I32)?;
+            vec![]
+        }
+
+        // ----- GC root enumeration (GC.md): writes into the window; a *constant*
+        // payload mask may only clear the top byte -----
+        Inst::GcRoots {
+            heap_lo,
+            heap_hi,
+            mask,
+            buf,
+            cap,
+        } => {
+            need_memory(has_memory)?;
+            for v in [heap_lo, heap_hi, mask, buf, cap] {
+                w(*v, V::I64)?;
+            }
+            if let Some(m) = const_i64(block, fn_results, *mask) {
+                if (m as u64) | 0xFF00_0000_0000_0000 != u64::MAX {
+                    return Err(format!("gc.roots constant mask {m:#x} clears low bits"));
+                }
+            }
+            vec![V::I64]
+        }
+
+        // ----- SIMD (§17/D58): total lane typing -----
+        Inst::ConstV128(_) => vec![V::V128],
+        Inst::V128Load { addr, .. } => {
+            need_memory(has_memory)?;
+            w(*addr, V::I64)?;
+            vec![V::V128]
+        }
+        Inst::V128Store { addr, value, .. } => {
+            need_memory(has_memory)?;
+            w(*addr, V::I64)?;
+            w(*value, V::V128)?;
+            vec![]
+        }
+        Inst::Splat { shape, a } => {
+            w(*a, shape.lane_val())?;
+            vec![V::V128]
+        }
+        Inst::ExtractLane { shape, lane, a, .. } => {
+            if *lane >= shape.lanes() {
+                return Err(format!("lane {lane} out of range for {shape:?}"));
+            }
+            w(*a, V::V128)?;
+            vec![shape.lane_val()]
+        }
+        Inst::ReplaceLane {
+            shape, lane, a, b, ..
+        } => {
+            if *lane >= shape.lanes() {
+                return Err(format!("lane {lane} out of range for {shape:?}"));
+            }
+            w(*a, V::V128)?;
+            w(*b, shape.lane_val())?;
+            vec![V::V128]
+        }
+        Inst::VIntBin { shape, a, b, .. } | Inst::VIntCmp { shape, a, b, .. } => {
+            if shape.is_float() {
+                return Err("integer-lane op with a float shape".into());
+            }
+            w(*a, V::V128)?;
+            w(*b, V::V128)?;
+            vec![V::V128]
+        }
+        Inst::VShift { shape, a, amt, .. } => {
+            if shape.is_float() {
+                return Err("shift with a float shape".into());
+            }
+            w(*a, V::V128)?;
+            w(*amt, V::I32)?;
+            vec![V::V128]
+        }
+        Inst::VIntUn { shape, a, .. } => {
+            if shape.is_float() {
+                return Err("integer-lane op with a float shape".into());
+            }
+            w(*a, V::V128)?;
+            vec![V::V128]
+        }
+        Inst::VFloatBin { shape, a, b, .. }
+        | Inst::VFloatCmp { shape, a, b, .. }
+        | Inst::VPMinMax { shape, a, b, .. } => {
+            if !shape.is_float() {
+                return Err("float-lane op with an integer shape".into());
+            }
+            w(*a, V::V128)?;
+            w(*b, V::V128)?;
+            vec![V::V128]
+        }
+        Inst::VFloatUn { shape, a, .. } => {
+            if !shape.is_float() {
+                return Err("float-lane op with an integer shape".into());
+            }
+            w(*a, V::V128)?;
+            vec![V::V128]
+        }
+        Inst::VFma { shape, a, b, c, .. } => {
+            if !shape.is_float() {
+                return Err("float-lane op with an integer shape".into());
+            }
+            w(*a, V::V128)?;
+            w(*b, V::V128)?;
+            w(*c, V::V128)?;
+            vec![V::V128]
+        }
+        // Saturating add/sub and rounding average exist for i8x16/i16x8 only.
+        Inst::VSatBin { shape, a, b, .. } | Inst::VAvgr { shape, a, b } => {
+            if !matches!(shape, VShape::I8x16 | VShape::I16x8) {
+                return Err("sat/avgr op with a shape other than i8x16/i16x8".into());
+            }
+            w(*a, V::V128)?;
+            w(*b, V::V128)?;
+            vec![V::V128]
+        }
+        // Fixed-shape binary vector ops: nothing beyond v128 operands to enforce.
+        Inst::VDot { a, b }
+        | Inst::VDotI8 { a, b }
+        | Inst::VQ15MulrSat { a, b }
+        | Inst::Swizzle { a, b }
+        | Inst::VBitBin { a, b, .. } => {
+            w(*a, V::V128)?;
+            w(*b, V::V128)?;
+            vec![V::V128]
+        }
+        // Widen/extmul: the result shape must have a half-width source.
+        Inst::VWiden { shape, a, .. } => {
+            if shape.narrower().is_none() {
+                return Err("widen to a shape with no half-width source".into());
+            }
+            w(*a, V::V128)?;
+            vec![V::V128]
+        }
+        Inst::VExtMul { shape, a, b, .. } => {
+            if shape.narrower().is_none() {
+                return Err("extmul to a shape with no half-width source".into());
+            }
+            w(*a, V::V128)?;
+            w(*b, V::V128)?;
+            vec![V::V128]
+        }
+        Inst::VExtAddPairwise { shape, a, .. } => {
+            if !matches!(shape, VShape::I16x8 | VShape::I32x4) {
+                return Err("extadd_pairwise shape must be i16x8/i32x4".into());
+            }
+            w(*a, V::V128)?;
+            vec![V::V128]
+        }
+        Inst::VNarrow { shape, a, b, .. } => {
+            if !matches!(shape, VShape::I8x16 | VShape::I16x8) {
+                return Err("narrow to a shape other than i8x16/i16x8".into());
+            }
+            w(*a, V::V128)?;
+            w(*b, V::V128)?;
+            vec![V::V128]
+        }
+        Inst::VConvert { a, .. } | Inst::VPopcnt { a } | Inst::VNot { a } => {
+            w(*a, V::V128)?;
+            vec![V::V128]
+        }
+        Inst::VAnyTrue { a } => {
+            w(*a, V::V128)?;
+            vec![V::I32]
+        }
+        Inst::VAllTrue { shape, a } | Inst::VBitmask { shape, a } => {
+            if shape.is_float() {
+                return Err("boolean reduction with a float shape".into());
+            }
+            w(*a, V::V128)?;
+            vec![V::I32]
+        }
+        Inst::Bitselect { a, b, mask } => {
+            w(*a, V::V128)?;
+            w(*b, V::V128)?;
+            w(*mask, V::V128)?;
+            vec![V::V128]
+        }
+        Inst::Shuffle { lanes, a, b } => {
+            if lanes.iter().any(|&l| l >= 32) {
+                return Err("shuffle lane index >= 32".into());
+            }
+            w(*a, V::V128)?;
+            w(*b, V::V128)?;
+            vec![V::V128]
+        }
+    };
+    types.extend_from_slice(&push);
+    Ok(())
+}
+
+fn check_args(types: &[ValType], args: &[ValIdx], params: &[ValType]) -> R {
+    if args.len() != params.len() {
+        return Err(format!(
+            "call arg count {} != param count {}",
+            args.len(),
+            params.len()
+        ));
+    }
+    for (a, p) in args.iter().zip(params) {
+        want(types, *a, *p)?;
+    }
+    Ok(())
+}
+
+/// §3b rule 4 + terminator typing: exactly-one-terminator is structural in `temen-ir`
+/// (`Block::term`), so what remains is edge/return/tail-call checking.
+fn check_term(term: &Terminator, types: &[ValType], f: &Func, funcs: &[Func]) -> R {
+    use ValType as V;
+    let edge = |target: BlockIdx, args: &[ValIdx]| -> R {
+        let tb = f
+            .blocks
+            .get(target as usize)
+            .ok_or_else(|| format!("branch to out-of-range block{target}"))?;
+        if args.len() != tb.params.len() {
+            return Err(format!(
+                "branch to block{target}: {} args for {} params",
+                args.len(),
+                tb.params.len()
+            ));
+        }
+        for (a, p) in args.iter().zip(&tb.params) {
+            want(types, *a, *p)?;
+        }
+        Ok(())
+    };
+    match term {
+        Terminator::Br { target, args } => edge(*target, args),
+        Terminator::BrIf {
+            cond,
+            then_blk,
+            then_args,
+            else_blk,
+            else_args,
+        } => {
+            want(types, *cond, V::I32)?;
+            edge(*then_blk, then_args)?;
+            edge(*else_blk, else_args)
+        }
+        Terminator::BrTable {
+            idx,
+            targets,
+            default,
+        } => {
+            want(types, *idx, V::I32)?;
+            for (t, args) in targets {
+                edge(*t, args)?;
+            }
+            edge(default.0, &default.1)
+        }
+        Terminator::Return(vals) => {
+            if vals.len() != f.results.len() {
+                return Err(format!(
+                    "return of {} values from a {}-result function",
+                    vals.len(),
+                    f.results.len()
+                ));
+            }
+            for (v, r) in vals.iter().zip(&f.results) {
+                want(types, *v, *r)?;
+            }
+            Ok(())
+        }
+        // A tail call's args match the callee, and the callee's results must equal
+        // THIS function's results exactly (§3b — the callee returns on our behalf).
+        Terminator::ReturnCall { func, args } => {
+            let callee = funcs
+                .get(*func as usize)
+                .ok_or_else(|| format!("return_call to out-of-range fn{func}"))?;
+            check_args(types, args, &callee.params)?;
+            if callee.results != f.results {
+                return Err("tail-callee results != function results".into());
+            }
+            Ok(())
+        }
+        Terminator::ReturnCallIndirect { ty, idx, args } => {
+            want(types, *idx, V::I32)?;
+            check_args(types, args, &ty.params)?;
+            if ty.results != f.results {
+                return Err("tail-callee results != function results".into());
+            }
+            Ok(())
+        }
+        Terminator::Unreachable => Ok(()),
+    }
+}
+
+/// The constant an operand resolves to when its defining instruction is an earlier
+/// `i64.const` in this block (params and non-consts give `None`). Value numbering:
+/// params take `0..params.len()`, then each instruction its `result_count` indices.
+fn const_i64(b: &Block, fn_results: &[usize], v: ValIdx) -> Option<i64> {
+    let mut idx = b.params.len() as u32;
+    for inst in &b.insts {
+        let n = inst.result_count(fn_results) as u32;
+        if v >= idx && v < idx + n {
+            return match inst {
+                Inst::ConstI64(c) => Some(*c),
+                _ => None,
+            };
+        }
+        idx += n;
+    }
+    None
+}

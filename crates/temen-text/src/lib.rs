@@ -1,0 +1,3789 @@
+//! Text format for the IR — a CLIF/LLVM-flavored form 1:1 with the binary
+//! (`DESIGN.md` §3a, "text format first"). This is the human/agent debugging
+//! interface and the source for hand-written test corpora.
+//!
+//! It is a *dev tool*, not escape-TCB: the binary decoder (`temen-encode`) is the
+//! untrusted-input path. The parser still returns `Result` and never panics, but it
+//! need not be exhaustively hardened. The printer normalizes value names to `vN` and
+//! block labels to their indices, so a parse→print→parse round-trip is identity at
+//! the IR level. One grammar (the pre-§3.5 dual spellings are retired): braced
+//! numbered blocks, indexed exports, numeric branch targets. The streaming sugars
+//! (inline-signature imports, name-inline `call.sym`) and optional `func`/`type`
+//! labels are deliberate parts of that one grammar, not legacy.
+//!
+//! Example:
+//! ```text
+//! func (i32) -> (i32) {
+//!   block 0 (v0: i32) {
+//!     v1 = i32.const 10
+//!     v2 = i32.add v0 v1
+//!     return v2
+//!   }
+//! }
+//! ```
+#![forbid(unsafe_code)]
+
+use std::collections::HashMap;
+use std::fmt::Write as _;
+
+use temen_ir::{
+    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, Encoding, Export, FBinOp,
+    FCmpOp, FToI, FUnOp, Field, FloatTy, Func, FuncName, FuncType, IToF, ImplExport, Import, Inst,
+    IntTy, IntUnOp, LoadOp, Loc, Memory, Module, Ordering, ProducerBlob, StoreOp, Terminator,
+    TypeDef, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp,
+    VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValType, VarInfo, VarLoc,
+};
+
+/// Parse error with a human-readable message (dev tool; not safety-load-bearing).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ParseError(pub String);
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "parse error: {}", self.0)
+    }
+}
+
+fn err<T>(msg: impl Into<String>) -> Result<T, ParseError> {
+    Err(ParseError(msg.into()))
+}
+
+// ----------------------------------------------------------------------------
+// Printing
+// ----------------------------------------------------------------------------
+
+/// Render a module to canonical text.
+pub fn print_module(m: &Module) -> String {
+    let mut s = String::new();
+    for d in &m.data {
+        let _ = writeln!(
+            s,
+            "data {}{} \"{}\"",
+            if d.readonly { "ro " } else { "" },
+            d.offset,
+            escape_bytes(&d.bytes)
+        );
+    }
+    // Data-image pointer relocations (the data→data case): `data.ptr <at> self <off>` for a pointer
+    // into this unit's own data, `data.ptr <at> sym "<name>" <addend>` for a cross-unit one. `link`
+    // resolves and clears these, so they print only on a pre-link object.
+    for p in &m.data_ptrs {
+        match &p.target {
+            temen_ir::DataPtrTarget::SelfOff(off) => {
+                let _ = writeln!(s, "data.ptr {} self {off}", p.at);
+            }
+            temen_ir::DataPtrTarget::Sym { name, addend } => {
+                let _ = writeln!(s, "data.ptr {} sym \"{name}\" {addend}", p.at);
+            }
+        }
+    }
+    if let Some(mem) = &m.memory {
+        let _ = writeln!(s, "memory {}", mem.size_log2);
+        s.push('\n');
+    }
+    // The type section (§3.5 surface), one entry per line with its checked positional label:
+    // `type <idx> func (params) -> (results)` declares a signature; `type <idx> interface
+    // { name: ty, ... }` declares an interface with required op names. Printed before the
+    // imports that reference it.
+    if !m.types.is_empty() {
+        for (i, t) in m.types.iter().enumerate() {
+            match t {
+                temen_ir::TypeEntry::Func(sig) => {
+                    let _ = writeln!(
+                        s,
+                        "type {i} func ({}) -> ({})",
+                        types(&sig.params),
+                        types(&sig.results)
+                    );
+                }
+                temen_ir::TypeEntry::Interface(elems) => {
+                    let ops: Vec<String> = elems
+                        .iter()
+                        .map(|e| format!("{}: {}", e.name, e.ty))
+                        .collect();
+                    let _ = writeln!(s, "type {i} interface {{ {} }}", ops.join(", "));
+                }
+            }
+        }
+        s.push('\n');
+    }
+    // §7 capability imports (§3.5 surface, v8 names): `import <idx> func|interface "name"
+    // <typeidx> [rebindable]` — one name string (dotted namespacing by convention); the
+    // shape is a type-section reference.
+    if !m.imports.is_empty() {
+        for (i, imp) in m.imports.iter().enumerate() {
+            // A `rebindable` suffix marks the phase-2 mode; `required` (the default) is implicit.
+            let mode = match imp.mode {
+                temen_ir::ImportMode::Required => "",
+                temen_ir::ImportMode::Rebindable => " rebindable",
+            };
+            let (kind, t) = match imp.shape {
+                temen_ir::ImportShape::Func(t) => ("func", t),
+                temen_ir::ImportShape::Interface(t) => ("interface", t),
+            };
+            let _ = writeln!(s, "import {i} {kind} \"{}\" {t}{mode}", imp.name);
+        }
+        s.push('\n');
+    }
+    // Function exports (§3.5 surface): `export <idx> func "<name>" <funcidx>`.
+    if !m.exports.is_empty() {
+        for (i, e) in m.exports.iter().enumerate() {
+            let _ = writeln!(s, "export {i} func \"{}\" {}", e.name, e.func);
+        }
+        s.push('\n');
+    }
+    // Data exports (their own dense index sequence): `export <idx> data "<name>" <offset>`.
+    if !m.data_exports.is_empty() {
+        for (i, e) in m.data_exports.iter().enumerate() {
+            let _ = writeln!(s, "export {i} data \"{}\" {}", e.name, e.offset);
+        }
+        s.push('\n');
+    }
+    // Interface offers (§3.5 surface): `export <idx> interface "<name>" <t> { op: funcidx,
+    // ... }` — map keys are the interface's declared op names; if the interface reference
+    // does not resolve (an unverifiable module), fall back to bare positional funcidxs.
+    if !m.impl_exports.is_empty() {
+        for (i, e) in m.impl_exports.iter().enumerate() {
+            let entries: Vec<String> = match m.types.get(e.interface as usize) {
+                Some(temen_ir::TypeEntry::Interface(elems)) if elems.len() == e.ops.len() => elems
+                    .iter()
+                    .zip(&e.ops)
+                    .map(|(el, f)| format!("{}: {f}", el.name))
+                    .collect(),
+                _ => e.ops.iter().map(|f| f.to_string()).collect(),
+            };
+            let _ = writeln!(
+                s,
+                "export {i} interface \"{}\" {}{} {{ {} }}",
+                e.name,
+                // 7.4 — the provider's declared concurrency policy round-trips.
+                if e.threaded { "threaded " } else { "" },
+                e.interface,
+                entries.join(", ")
+            );
+        }
+        s.push('\n');
+    }
+    let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
+    for (i, f) in m.funcs.iter().enumerate() {
+        if i > 0 {
+            s.push('\n');
+        }
+        print_func_at(&mut s, f, &fn_results, m, Some(i));
+    }
+    print_debug_info(&mut s, m);
+    s
+}
+
+/// Print the frontend-neutral debug-info waist (DEBUGGING.md §6) as module-level directives after
+/// the functions: `debug.file <idx> "<path>"`, `debug.loc <fn> <bb> <i> <file> <line> <col>`,
+/// the structured type table (`debug.type` / `debug.field`), and
+/// `debug.var <fn> "<name>" win|ssa <n> "<type>" [<type_id>]`. Absent ⇒ nothing printed.
+fn print_debug_info(s: &mut String, m: &Module) {
+    let Some(di) = &m.debug_info else { return };
+    if di.files.is_empty()
+        && di.locs.is_empty()
+        && di.types.is_empty()
+        && di.vars.is_empty()
+        && di.blobs.is_empty()
+        && di.func_names.is_empty()
+    {
+        return;
+    }
+    s.push('\n');
+    for (i, f) in di.files.iter().enumerate() {
+        let _ = writeln!(s, "debug.file {i} \"{f}\"");
+    }
+    for fname in &di.func_names {
+        let _ = writeln!(s, "debug.fname {} \"{}\"", fname.func, fname.name);
+    }
+    for l in &di.locs {
+        let _ = writeln!(
+            s,
+            "debug.loc {} {} {} {} {} {}",
+            l.func, l.block, l.inst, l.file, l.line, l.col
+        );
+    }
+    // Type table: `debug.type <id> <kind> ...` (declaration order ⇒ dense ids), with an aggregate's
+    // members on following `debug.field <type_id> "<name>" <off> <field_ty>` lines.
+    for (id, t) in di.types.iter().enumerate() {
+        match t {
+            TypeDef::Base {
+                name,
+                encoding,
+                size,
+            } => {
+                let enc = match encoding {
+                    Encoding::Signed => "signed",
+                    Encoding::Unsigned => "unsigned",
+                    Encoding::Float => "float",
+                    Encoding::Bool => "bool",
+                };
+                let _ = writeln!(s, "debug.type {id} base \"{name}\" {enc} {size}");
+            }
+            TypeDef::Pointer {
+                name,
+                pointee,
+                size,
+            } => {
+                let _ = writeln!(s, "debug.type {id} ptr \"{name}\" {pointee} {size}");
+            }
+            TypeDef::Array { name, elem, count } => {
+                let _ = writeln!(s, "debug.type {id} array \"{name}\" {elem} {count}");
+            }
+            TypeDef::Aggregate { name, size, fields } => {
+                let _ = writeln!(s, "debug.type {id} agg \"{name}\" {size}");
+                for f in fields {
+                    let _ = writeln!(s, "debug.field {id} \"{}\" {} {}", f.name, f.offset, f.ty);
+                }
+            }
+            TypeDef::Opaque { name, size } => {
+                let _ = writeln!(s, "debug.type {id} opaque \"{name}\" {size}");
+            }
+        }
+    }
+    for v in &di.vars {
+        // `debug.var <fn> "<name>" <loc> "<ty>" [<type_id>]`, where `<fn>` is a function index or
+        // `global` (a module-scoped global, visible in every frame) and `<loc>` is `win <off>`,
+        // `ssa <value>`, `ssalist <n> <b0> <i0> <v0> …` (the location list, S2),
+        // `winvia <n> <b0> <i0> <v0> … <off>` (window via a per-pc base value + offset), or
+        // `fixed <addr>` (a global's absolute window address).
+        if v.func == temen_ir::GLOBAL_SCOPE {
+            let _ = write!(s, "debug.var global \"{}\" ", v.name);
+        } else {
+            let _ = write!(s, "debug.var {} \"{}\" ", v.func, v.name);
+        }
+        match &v.loc {
+            VarLoc::Window { off } => {
+                let _ = write!(s, "win {off}");
+            }
+            VarLoc::Ssa { value } => {
+                let _ = write!(s, "ssa {value}");
+            }
+            VarLoc::SsaList(locs) => {
+                let _ = write!(s, "ssalist {}", locs.len());
+                for l in locs {
+                    let _ = write!(s, " {} {} {}", l.block, l.inst, l.value);
+                }
+            }
+            VarLoc::WindowVia { base, off } => {
+                let _ = write!(s, "winvia {}", base.len());
+                for l in base {
+                    let _ = write!(s, " {} {} {}", l.block, l.inst, l.value);
+                }
+                let _ = write!(s, " {off}");
+            }
+            VarLoc::Fixed { addr } => {
+                let _ = write!(s, "fixed {addr}");
+            }
+        }
+        let _ = write!(s, " \"{}\"", v.ty);
+        if let Some(tid) = v.type_id {
+            let _ = write!(s, " {tid}");
+        }
+        // Optional lexical scope (§6 shadowing): `scope <start_line> <end_line>`.
+        if let Some((a, b)) = v.scope {
+            let _ = write!(s, " scope {a} {b}");
+        }
+        s.push('\n');
+    }
+    // Opaque per-producer rich blobs (§6): `debug.blob "<producer>" "<escaped bytes>"`.
+    for b in &di.blobs {
+        let _ = writeln!(
+            s,
+            "debug.blob \"{}\" \"{}\"",
+            b.producer,
+            escape_bytes(&b.bytes)
+        );
+    }
+}
+
+/// Escape data-segment bytes for the text form: printable ASCII verbatim (except `\` and `"`),
+/// everything else as `\xHH`. Round-trips through [`lex_string`].
+fn escape_bytes(bytes: &[u8]) -> String {
+    let mut s = String::new();
+    for &b in bytes {
+        match b {
+            b'\\' => s.push_str("\\\\"),
+            b'"' => s.push_str("\\\""),
+            0x20..=0x7e => s.push(b as char),
+            _ => {
+                let _ = write!(s, "\\x{b:02x}");
+            }
+        }
+    }
+    s
+}
+
+fn print_func_at(s: &mut String, f: &Func, fn_results: &[usize], m: &Module, idx: Option<usize>) {
+    // §3.5 settled surface: every definition carries its checked positional label, and one
+    // brace construct groups everything — `func N (…) -> (…) { block N (…) { … } }`.
+    let label = idx.map(|i| format!("{i} ")).unwrap_or_default();
+    let _ = writeln!(
+        s,
+        "func {label}({}) -> ({}) {{",
+        types(&f.params),
+        types(&f.results)
+    );
+    for (bi, b) in f.blocks.iter().enumerate() {
+        // Block header with named, typed parameters (params are indices 0..k).
+        let params: Vec<String> = b
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, t)| format!("v{}: {}", i, t.as_str()))
+            .collect();
+        let _ = writeln!(s, "  block {} ({}) {{", bi, params.join(", "));
+
+        let mut next = b.params.len() as u32; // next value index in this block
+                                              // The value index of the immediately-preceding instruction when it is an `i32.const 0` — the
+                                              // ignored dispatch handle a `cap.self.*` sugar CapCall points at. Lets the printer spell the
+                                              // sugar only when its handle is that adjacent const (so parse re-pairs them exactly); any
+                                              // other CapCall CAP_SELF prints as the raw `cap.call`, which round-trips on its own.
+        let mut prev_const0: Option<u32> = None;
+        for inst in &b.insts {
+            let n = inst.result_count(fn_results);
+            if n == 0 {
+                // No-result instruction (`store`, void `call`): no `vN =` binding.
+                let _ = writeln!(s, "    {}", print_inst(inst, m, prev_const0));
+            } else {
+                let lhs: Vec<String> = (0..n).map(|k| format!("v{}", next + k as u32)).collect();
+                let _ = writeln!(
+                    s,
+                    "    {} = {}",
+                    lhs.join(", "),
+                    print_inst(inst, m, prev_const0)
+                );
+            }
+            prev_const0 = matches!(inst, Inst::ConstI32(0)).then_some(next);
+            next += n as u32;
+        }
+        let _ = writeln!(s, "    {}", print_term(&b.term));
+        s.push_str("  }\n");
+    }
+    s.push_str("}\n");
+}
+
+fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
+    match inst {
+        Inst::ConstI32(c) => format!("i32.const {c}"),
+        Inst::ConstI64(c) => format!("i64.const {c}"),
+        // Link-form data addresses (resolved to `i64.const` by `link`): `data.sym "<name>" <addend>`
+        // for a cross-unit symbol, `data.self <offset>` for this unit's own data.
+        Inst::DataSym { name, addend } => {
+            format!("data.sym \"{}\" {addend}", String::from_utf8_lossy(name))
+        }
+        Inst::DataSelf { offset } => format!("data.self {offset}"),
+        Inst::DataTop => "data.top".to_string(),
+        Inst::IntBin { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
+        Inst::IntUn { ty, op, a } => format!("{}.{} v{a}", ty.prefix(), op.name()),
+        Inst::IntCmp { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
+        Inst::Eqz { ty, a } => format!("{}.eqz v{a}", ty.prefix()),
+        Inst::Convert { op, a } => format!("{} v{a}", op.sig().0),
+        Inst::Select { cond, a, b } => format!("select v{cond} v{a} v{b}"),
+        // `{:?}` gives the shortest round-tripping form with a decimal point
+        // (e.g. `2.0`, `1.5`, `-3.25`), so it re-tokenizes as a number.
+        Inst::ConstF32(bits) => format!("f32.const {:?}", f32::from_bits(*bits)),
+        Inst::ConstF64(bits) => format!("f64.const {:?}", f64::from_bits(*bits)),
+        Inst::FBin { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
+        Inst::FUn { ty, op, a } => format!("{}.{} v{a}", ty.prefix(), op.name()),
+        Inst::Fma { ty, a, b, c } => format!("{}.fma v{a} v{b} v{c}", ty.prefix()),
+        Inst::FCmp { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
+        Inst::FToISat { op, a } => format!("{} v{a}", op.name()),
+        Inst::FToITrap { op, a } => format!("{} v{a}", op.trap_name()),
+        Inst::IToFConv { op, a } => format!("{} v{a}", op.name()),
+        Inst::Cast { op, a } => format!("{} v{a}", op.sig().0),
+        Inst::Load { op, addr, offset } => {
+            format!("{} v{addr}{}", op.info().0, memarg(*offset))
+        }
+        Inst::Store {
+            op,
+            addr,
+            value,
+            offset,
+        } => format!("{} v{addr} v{value}{}", op.info().0, memarg(*offset)),
+        // Bulk-memory ops (D62).
+        Inst::MemCopy { dst, src, len } => format!("mem.copy v{dst} v{src} v{len}"),
+        Inst::MemMove { dst, src, len } => format!("mem.move v{dst} v{src} v{len}"),
+        Inst::MemFill { dst, val, len } => format!("mem.fill v{dst} v{val} v{len}"),
+        // §12 atomics: `<ty>.atomic.<op>`, naturally aligned (no `align=`, only `offset=`).
+        // Execution is uniformly seq-cst; the ordering suffix left the wire at the wire rev.
+        Inst::AtomicLoad { ty, addr, offset } => {
+            format!("{}.atomic.load v{addr}{}", ty.prefix(), memarg(*offset))
+        }
+        Inst::AtomicStore {
+            ty,
+            addr,
+            value,
+            offset,
+        } => format!(
+            "{}.atomic.store v{addr} v{value}{}",
+            ty.prefix(),
+            memarg(*offset)
+        ),
+        Inst::AtomicRmw {
+            ty,
+            op,
+            addr,
+            value,
+            offset,
+        } => format!(
+            "{}.atomic.rmw.{} v{addr} v{value}{}",
+            ty.prefix(),
+            op.name(),
+            memarg(*offset)
+        ),
+        Inst::AtomicCmpxchg {
+            ty,
+            addr,
+            expected,
+            replacement,
+            offset,
+        } => format!(
+            "{}.atomic.cmpxchg v{addr} v{expected} v{replacement}{}",
+            ty.prefix(),
+            memarg(*offset)
+        ),
+        Inst::Call { func, args } => format!("call {func}{}", arglist(args)),
+        Inst::RefFunc { func } => format!("ref.func {func}"),
+        Inst::CallIndirect { ty, idx, args } => format!(
+            "call_indirect ({}) -> ({}) v{idx}{}",
+            types(&ty.params),
+            types(&ty.results),
+            arglist(args)
+        ),
+        // §3.6 sugar: the service points print as `svc.poll`/`svc.wait` (greppable, per the
+        // design) — pure spelling over `cap.call CAP_SELF_TYPE_ID 9|10`; the ignored handle
+        // operand rides along so the round-trip is exact.
+        Inst::CapCall {
+            type_id: temen_ir::CAP_SELF_TYPE_ID,
+            op: op @ (9 | 10),
+            sig,
+            handle,
+            args,
+        } if sig.params.is_empty() && *sig.results == [ValType::I64] && args.is_empty() => {
+            let name = if *op == 9 { "svc.poll" } else { "svc.wait" };
+            format!("{name} v{handle}")
+        }
+        // Wire-rev sugar: the `cap.self.*` reflection ops (their typed `Inst::CapSelf*` fronts were
+        // retired to the generic `cap.call CAP_SELF op N`) print as their mnemonics. The ignored
+        // const-0 dispatch handle is not spelled — but only when it is the immediately-preceding
+        // `i32.const 0`, so the parser re-pairs the two exactly; any other handle (a shared or
+        // non-adjacent value) prints as the raw `cap.call` below, which round-trips unaided.
+        Inst::CapCall {
+            type_id: temen_ir::CAP_SELF_TYPE_ID,
+            op: op @ 0..=4,
+            sig,
+            handle,
+            args,
+        } if cap_self_sig_matches(*op, sig, args.len()) && Some(*handle) == prev_const0 => match op
+        {
+            0 => "cap.self.count".to_string(),
+            4 => "cap.self.attest".to_string(),
+            1 => format!("cap.self.get v{}", args[0]),
+            2 => format!("cap.self.resolve v{} v{}", args[0], args[1]),
+            _ => format!("cap.self.label v{} v{} v{}", args[0], args[1], args[2]),
+        },
+        Inst::CapCall {
+            type_id,
+            op,
+            sig,
+            handle,
+            args,
+        } => format!(
+            "cap.call {type_id} {op} ({}) -> ({}) v{handle}{}",
+            types(&sig.params),
+            types(&sig.results),
+            arglist(args)
+        ),
+        // Manifest capability call (§3.5, v8): `call.import <idx>[.<opname> | op <n>] (args)`.
+        // The op signature is recovered from the declaration through the type section on
+        // re-parse; the op prints by name when the grouped import's interface resolves,
+        // numerically otherwise, and not at all for op 0 of a flat import.
+        Inst::CallImport {
+            import, op, args, ..
+        } => {
+            let opsel = if *op == 0
+                && matches!(
+                    m.imports.get(*import as usize).map(|i| i.shape),
+                    Some(temen_ir::ImportShape::Func(_))
+                ) {
+                String::new()
+            } else {
+                match m
+                    .imports
+                    .get(*import as usize)
+                    .and_then(|i| match i.shape {
+                        temen_ir::ImportShape::Interface(t) => Some(t),
+                        temen_ir::ImportShape::Func(_) => None,
+                    })
+                    .and_then(|t| match m.types.get(t as usize) {
+                        Some(temen_ir::TypeEntry::Interface(elems)) => {
+                            elems.get(*op as usize).map(|e| e.name.clone())
+                        }
+                        _ => None,
+                    }) {
+                    Some(name) => format!(".{name}"),
+                    None => format!(" op {op}"),
+                }
+            };
+            format!("call.import {import}{opsel}{}", arglist(args))
+        }
+        // §7/§22 link-form symbolic call: `call.sym <import> v<handle> (args)` — the loader-ABI
+        // placeholder (never verifies; the linker rewrites it).
+        Inst::CallSym {
+            import,
+            handle,
+            args,
+            ..
+        } => format!("call.sym {import} v{handle}{}", arglist(args)),
+        // §3.5 dynamic mode: `call.import.dyn <ty>[.<opname> | op <n>] v<handle> (args)`.
+        Inst::CallImportDyn {
+            ty,
+            op,
+            handle,
+            args,
+            ..
+        } => {
+            let opsel = match m.types.get(*ty as usize) {
+                Some(temen_ir::TypeEntry::Interface(elems)) => match elems.get(*op as usize) {
+                    Some(e) => format!(".{}", e.name),
+                    None => format!(" op {op}"),
+                },
+                _ => format!(" op {op}"),
+            };
+            format!("call.import.dyn {ty}{opsel} v{handle}{}", arglist(args))
+        }
+        // §3.5 offer reification: `export.handle <impl-export idx>`.
+        Inst::ExportHandle { export } => format!("export.handle {export}"),
+        // Phase-2 `import.attach <idx> v<handle>`: rebind a rebindable slot to a held capability.
+        Inst::ImportAttach { import, handle } => format!("import.attach {import} v{handle}"),
+        // §7 capability reflection intrinsics that carry a type-section index (not expressible as a
+        // plain `cap.call` immediate) — kept as typed ops.
+        Inst::CapSelfTypeId { ty } => format!("cap.self.type_id {ty}"),
+        Inst::CapSelfCovers { handle, ty } => format!("cap.self.covers v{handle} {ty}"),
+        Inst::VcpuTlsGet => "vcpu.tls.get".to_string(),
+        Inst::DurableShadowBase => "durable.shadow_base".to_string(),
+        Inst::VcpuTlsSet { val } => format!("vcpu.tls.set v{val}"),
+        // §12 fibers (stack switching).
+        Inst::ContNew { func, sp } => format!("cont.new v{func} v{sp}"),
+        Inst::ContResume { k, arg, block } => {
+            if *block {
+                format!("cont.resume.block v{k} v{arg}")
+            } else {
+                format!("cont.resume v{k} v{arg}")
+            }
+        }
+        Inst::Suspend { value } => format!("suspend v{value}"),
+        Inst::SetJmp { buf } => format!("setjmp v{buf}"),
+        Inst::LongJmp { buf, val } => format!("longjmp v{buf} v{val}"),
+        // §GC conservative root enumeration.
+        Inst::GcRoots {
+            heap_lo,
+            heap_hi,
+            mask,
+            buf,
+            cap,
+        } => format!("gc.roots v{heap_lo} v{heap_hi} v{mask} v{buf} v{cap}"),
+        // §12 real threads (OS-thread vCPUs over shared memory).
+        Inst::ThreadSpawn { func, sp, arg } => format!("thread.spawn {func} v{sp} v{arg}"),
+        Inst::ThreadJoin { handle } => format!("thread.join v{handle}"),
+        // §12 futex wait/notify.
+        Inst::MemoryWait {
+            ty,
+            addr,
+            expected,
+            timeout,
+        } => format!("{}.atomic.wait v{addr} v{expected} v{timeout}", ty.prefix()),
+        Inst::MemoryNotify { addr, count } => format!("atomic.notify v{addr} v{count}"),
+        Inst::AtomicFence { order } => format!("atomic.fence{}", ord_suffix(*order)),
+
+        // ----- §17 SIMD (D58) — lane shape carried by the op, bytes printed little-endian. -----
+        Inst::ConstV128(bytes) => format!("v128.const{}", byte_list(bytes)),
+        Inst::V128Load { addr, offset } => {
+            format!("v128.load v{addr}{}", memarg(*offset))
+        }
+        Inst::V128Store {
+            addr,
+            value,
+            offset,
+        } => format!("v128.store v{addr} v{value}{}", memarg(*offset)),
+        Inst::Splat { shape, a } => format!("{}.splat v{a}", shape.name()),
+        Inst::ExtractLane {
+            shape,
+            lane,
+            signed,
+            a,
+        } => format!(
+            "{}.extract_lane{} {lane} v{a}",
+            shape.name(),
+            lane_sign_suffix(*shape, *signed)
+        ),
+        Inst::ReplaceLane { shape, lane, a, b } => {
+            format!("{}.replace_lane {lane} v{a} v{b}", shape.name())
+        }
+        Inst::VIntBin { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
+        Inst::VIntCmp { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
+        Inst::VShift { shape, op, a, amt } => {
+            format!("{}.{} v{a} v{amt}", shape.name(), op.name())
+        }
+        Inst::VFloatCmp { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
+        Inst::VPMinMax { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
+        Inst::VFloatBin { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
+        Inst::VFloatUn { shape, op, a } => format!("{}.{} v{a}", shape.name(), op.name()),
+        Inst::VIntUn { shape, op, a } => format!("{}.{} v{a}", shape.name(), op.name()),
+        Inst::VSatBin { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
+        Inst::VWiden { shape, op, a } => format!("{}.{} v{a}", shape.name(), op.name()),
+        Inst::VNarrow { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
+        Inst::VConvert { op, a } => format!("{} v{a}", op.name()),
+        Inst::VBitBin { op, a, b } => format!("v128.{} v{a} v{b}", op.name()),
+        Inst::VNot { a } => format!("v128.not v{a}"),
+        Inst::Bitselect { a, b, mask } => format!("v128.bitselect v{a} v{b} v{mask}"),
+        Inst::Shuffle { lanes, a, b } => format!("i8x16.shuffle{} v{a} v{b}", byte_list(lanes)),
+        Inst::Swizzle { a, b } => format!("i8x16.swizzle v{a} v{b}"),
+        Inst::VPopcnt { a } => format!("i8x16.popcnt v{a}"),
+        Inst::VAvgr { shape, a, b } => format!("{}.avgr_u v{a} v{b}", shape.name()),
+        Inst::VDot { a, b } => format!("i32x4.dot_i16x8_s v{a} v{b}"),
+        Inst::VDotI8 { a, b } => format!("i16x8.dot_i8x16_s v{a} v{b}"),
+        Inst::VExtMul { shape, op, a, b } => {
+            let (low, signed) = op.parts();
+            let src = shape.narrower().map(|s| s.name()).unwrap_or("?");
+            format!(
+                "{}.extmul_{}_{src}_{} v{a} v{b}",
+                shape.name(),
+                if low { "low" } else { "high" },
+                if signed { "s" } else { "u" },
+            )
+        }
+        Inst::VExtAddPairwise { shape, signed, a } => {
+            let src = shape.narrower().map(|s| s.name()).unwrap_or("?");
+            format!(
+                "{}.extadd_pairwise_{src}_{} v{a}",
+                shape.name(),
+                if *signed { "s" } else { "u" },
+            )
+        }
+        Inst::VQ15MulrSat { a, b } => format!("i16x8.q15mulr_sat_s v{a} v{b}"),
+        Inst::VFma {
+            shape,
+            neg,
+            a,
+            b,
+            c,
+        } => format!(
+            "{}.{} v{a} v{b} v{c}",
+            shape.name(),
+            if *neg { "fnma" } else { "fma" }
+        ),
+        Inst::VAnyTrue { a } => format!("v128.any_true v{a}"),
+        Inst::VAllTrue { shape, a } => format!("{}.all_true v{a}", shape.name()),
+        Inst::VBitmask { shape, a } => format!("{}.bitmask v{a}", shape.name()),
+    }
+}
+
+/// Render 16 bytes as ` b0 b1 ... b15` (decimal, leading space). Used by `v128.const`
+/// (little-endian value bytes) and `i8x16.shuffle` (byte indices).
+fn byte_list(bytes: &[u8; 16]) -> String {
+    let mut s = String::new();
+    for b in bytes {
+        s.push(' ');
+        s.push_str(&b.to_string());
+    }
+    s
+}
+
+/// The `_s`/`_u` suffix on a narrow-integer `extract_lane` (`i8x16`/`i16x8`); empty for
+/// the wider shapes where extraction is unambiguous.
+fn lane_sign_suffix(shape: VShape, signed: bool) -> &'static str {
+    match shape {
+        VShape::I8x16 | VShape::I16x8 => {
+            if signed {
+                "_s"
+            } else {
+                "_u"
+            }
+        }
+        _ => "",
+    }
+}
+
+/// The `.<order>` text suffix for an atomic op, empty for the default `seqcst` (so seq-cst atomics
+/// print exactly as before this surface existed).
+fn ord_suffix(order: Ordering) -> String {
+    match order {
+        Ordering::SeqCst => String::new(),
+        o => format!(".{}", o.name()),
+    }
+}
+
+/// Strip a trailing `.<order>` token off an atomic mnemonic tail, defaulting to `seqcst`. E.g.
+/// `"rmw.add.relaxed"` → `("rmw.add", Relaxed)`, `"load"` → `("load", SeqCst)`. (Ordering names never
+/// collide with op names, so this is unambiguous.)
+fn split_order(rest: &str) -> (&str, Ordering) {
+    for o in Ordering::ALL {
+        if o == Ordering::SeqCst {
+            continue;
+        }
+        if let Some(base) = rest.strip_suffix(o.name()) {
+            if let Some(base) = base.strip_suffix('.') {
+                return (base, o);
+            }
+        }
+    }
+    (rest, Ordering::SeqCst)
+}
+
+/// Render the optional `offset=` suffix, omitting the zero default. (The `align=` memarg suffix
+/// left the surface at the wire rev — the alignment hint was write-only.)
+fn memarg(offset: u64) -> String {
+    let mut s = String::new();
+    if offset != 0 {
+        let _ = write!(s, " offset={offset}");
+    }
+    s
+}
+
+fn print_term(t: &Terminator) -> String {
+    match t {
+        Terminator::Br { target, args } => format!("br {target}{}", arglist(args)),
+        Terminator::BrIf {
+            cond,
+            then_blk,
+            then_args,
+            else_blk,
+            else_args,
+        } => format!(
+            "br_if v{cond} {then_blk}{} {else_blk}{}",
+            arglist(then_args),
+            arglist(else_args)
+        ),
+        Terminator::BrTable {
+            idx,
+            targets,
+            default,
+        } => {
+            let ts: Vec<String> = targets
+                .iter()
+                .map(|(t, args)| format!("{t}{}", arglist(args)))
+                .collect();
+            format!(
+                "br_table v{idx} [{}] {}{}",
+                ts.join(", "),
+                default.0,
+                arglist(&default.1)
+            )
+        }
+        Terminator::Return(vals) => {
+            if vals.is_empty() {
+                "return".to_string()
+            } else {
+                let vs: Vec<String> = vals.iter().map(|v| format!("v{v}")).collect();
+                format!("return {}", vs.join(", "))
+            }
+        }
+        Terminator::ReturnCall { func, args } => format!("return_call {func}{}", arglist(args)),
+        Terminator::ReturnCallIndirect { ty, idx, args } => format!(
+            "return_call_indirect ({}) -> ({}) v{idx}{}",
+            types(&ty.params),
+            types(&ty.results),
+            arglist(args)
+        ),
+        Terminator::Unreachable => "unreachable".to_string(),
+    }
+}
+
+fn arglist(args: &[u32]) -> String {
+    let vs: Vec<String> = args.iter().map(|v| format!("v{v}")).collect();
+    format!("({})", vs.join(", "))
+}
+
+fn types(ts: &[ValType]) -> String {
+    let v: Vec<&str> = ts.iter().map(|t| t.as_str()).collect();
+    v.join(", ")
+}
+
+/// Does a `cap.call CAP_SELF_TYPE_ID op` carry the exact signature/arity of a `cap.self.*` reflection
+/// mnemonic (op 0 count, 1 get, 2 resolve, 3 label, 4 attest)? Guards the sugar print so only a
+/// canonical reflection call spells as `cap.self.*`; any other CapCall prints as raw `cap.call`.
+fn cap_self_sig_matches(op: u32, sig: &FuncType, argc: usize) -> bool {
+    use temen_ir::ValType::{I32, I64};
+    match op {
+        0 | 4 => sig.params.is_empty() && *sig.results == [I32] && argc == 0,
+        1 => *sig.params == [I32] && *sig.results == [I32, I32] && argc == 1,
+        2 => *sig.params == [I64, I64] && *sig.results == [I32] && argc == 2,
+        3 => *sig.params == [I32, I64, I64] && *sig.results == [I32] && argc == 3,
+        _ => false,
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Tokenizing
+// ----------------------------------------------------------------------------
+
+#[derive(Clone, PartialEq, Debug)]
+enum Tok {
+    LParen,
+    RParen,
+    LBrace,
+    RBrace,
+    LBracket,
+    RBracket,
+    Colon,
+    Comma,
+    Equals,
+    Arrow,
+    /// A standalone `.` — the §3.5 `call.import <imp>.<op>` separator. Only emitted where a
+    /// `.` is neither inside a float literal nor inside a dotted identifier.
+    Dot,
+    Ident(String),
+    Int(i64),
+    Float(f64),
+    /// A byte string `"..."` (data-segment bytes), with `\\`, `\"`, `\n`, `\t`, `\r`, `\0`,
+    /// and `\xHH` hex escapes — so arbitrary (non-UTF-8) bytes are representable.
+    Str(Vec<u8>),
+}
+
+// Tokenize, tracking the 1-based **source line** of every token (`lines[k]` is the start line of
+// `toks[k]`) so the parser can synthesize a debug line table for hand-written programs (auto debug
+// info — DEBUGGING.md). The line is recorded at each token's start; a multi-line string literal
+// advances the counter by the newlines it spans.
+fn tokenize(src: &str) -> Result<(Vec<Tok>, Vec<u32>), ParseError> {
+    let bytes = src.as_bytes();
+    let mut i = 0;
+    let mut line = 1u32;
+    let mut toks = Vec::new();
+    let mut lines = Vec::new();
+    macro_rules! emit {
+        ($t:expr) => {{
+            toks.push($t);
+            lines.push(line);
+        }};
+    }
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            b'\n' => {
+                line += 1;
+                i += 1;
+            }
+            b' ' | b'\t' | b'\r' => i += 1,
+            b';' => {
+                // line comment to end of line (the trailing `\n` is counted by the arm above)
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'(' => {
+                emit!(Tok::LParen);
+                i += 1;
+            }
+            b')' => {
+                emit!(Tok::RParen);
+                i += 1;
+            }
+            b'{' => {
+                emit!(Tok::LBrace);
+                i += 1;
+            }
+            b'}' => {
+                emit!(Tok::RBrace);
+                i += 1;
+            }
+            b'[' => {
+                emit!(Tok::LBracket);
+                i += 1;
+            }
+            b']' => {
+                emit!(Tok::RBracket);
+                i += 1;
+            }
+            b':' => {
+                emit!(Tok::Colon);
+                i += 1;
+            }
+            b'.' => {
+                emit!(Tok::Dot);
+                i += 1;
+            }
+            b',' => {
+                emit!(Tok::Comma);
+                i += 1;
+            }
+            b'=' => {
+                emit!(Tok::Equals);
+                i += 1;
+            }
+            b'-' => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'>' {
+                    emit!(Tok::Arrow);
+                    i += 2;
+                } else if bytes[i + 1..].starts_with(b"inf") {
+                    // `-inf`, as the float printer's `{:?}` emits it.
+                    emit!(Tok::Float(f64::NEG_INFINITY));
+                    i += 4;
+                } else {
+                    let (tok, ni) = lex_number(bytes, i)?;
+                    emit!(tok);
+                    i = ni;
+                }
+            }
+            b'0'..=b'9' => {
+                let (tok, ni) = lex_number(bytes, i)?;
+                emit!(tok);
+                i = ni;
+            }
+            b'"' => {
+                let start = i;
+                let (tok, ni) = lex_string(bytes, i)?;
+                emit!(tok);
+                line += bytes[start..ni].iter().filter(|&&b| b == b'\n').count() as u32;
+                i = ni;
+            }
+            _ if is_ident_start(c) => {
+                let start = i;
+                while i < bytes.len() && is_ident_char(bytes[i]) {
+                    i += 1;
+                }
+                let s = std::str::from_utf8(&bytes[start..i])
+                    .map_err(|_| ParseError("non-utf8 identifier".into()))?;
+                emit!(Tok::Ident(s.to_string()));
+            }
+            _ => return err(format!("unexpected character {:?}", c as char)),
+        }
+    }
+    Ok((toks, lines))
+}
+
+/// Lex an integer or float literal. A `.` or exponent makes it a float.
+fn lex_number(bytes: &[u8], start: usize) -> Result<(Tok, usize), ParseError> {
+    let mut i = start;
+    if bytes[i] == b'-' {
+        i += 1;
+    }
+    let mut has_digit = false;
+    let mut is_float = false;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+        has_digit = true;
+    }
+    // A `.` continues the number only when a digit follows — `0.5` is a float, but `0.read`
+    // (the §3.5 `call.import <imp>.<op>` form) is `Int(0)`, `Dot`, `Ident(read)`.
+    if i + 1 < bytes.len() && bytes[i] == b'.' && bytes[i + 1].is_ascii_digit() {
+        is_float = true;
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+            has_digit = true;
+        }
+    }
+    if i < bytes.len() && (bytes[i] | 0x20) == b'e' {
+        is_float = true;
+        i += 1;
+        if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+            i += 1;
+        }
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    if !has_digit {
+        return err("expected digits in number");
+    }
+    let s = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
+    if is_float {
+        let v: f64 = s
+            .parse()
+            .map_err(|_| ParseError(format!("invalid float: {s}")))?;
+        Ok((Tok::Float(v), i))
+    } else {
+        let v: i64 = s
+            .parse()
+            .map_err(|_| ParseError(format!("integer out of range: {s}")))?;
+        Ok((Tok::Int(v), i))
+    }
+}
+
+/// Lex a byte string `"..."` starting at `bytes[start] == '"'`. Supports `\\`, `\"`, `\n`,
+/// `\t`, `\r`, `\0`, and `\xHH` (two hex digits) escapes; every other byte is taken verbatim.
+/// Returns the [`Tok::Str`] and the index just past the closing quote.
+fn lex_string(bytes: &[u8], start: usize) -> Result<(Tok, usize), ParseError> {
+    let mut i = start + 1; // past the opening quote
+    let mut out = Vec::new();
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => return Ok((Tok::Str(out), i + 1)),
+            b'\\' => {
+                i += 1;
+                let e = *bytes
+                    .get(i)
+                    .ok_or_else(|| ParseError("unterminated escape in string".into()))?;
+                match e {
+                    b'\\' => out.push(b'\\'),
+                    b'"' => out.push(b'"'),
+                    b'n' => out.push(b'\n'),
+                    b't' => out.push(b'\t'),
+                    b'r' => out.push(b'\r'),
+                    b'0' => out.push(0),
+                    b'x' => {
+                        let hi = bytes.get(i + 1).copied().and_then(hex_val);
+                        let lo = bytes.get(i + 2).copied().and_then(hex_val);
+                        match (hi, lo) {
+                            (Some(h), Some(l)) => {
+                                out.push(h * 16 + l);
+                                i += 2;
+                            }
+                            _ => return Err(ParseError("invalid \\xHH escape".into())),
+                        }
+                    }
+                    _ => {
+                        return Err(ParseError(format!(
+                            "unknown string escape: \\{}",
+                            e as char
+                        )))
+                    }
+                }
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Err(ParseError("unterminated string".into()))
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn is_ident_start(c: u8) -> bool {
+    c.is_ascii_alphabetic() || c == b'_' || c == b'%'
+}
+fn is_ident_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'.'
+}
+
+// ----------------------------------------------------------------------------
+// Parsing
+// ----------------------------------------------------------------------------
+
+/// Parse a module from text.
+/// Parse Temen text to a [`Module`] (no debug info synthesized — a program with no explicit `debug`
+/// section gets `debug_info == None`, the long-standing behavior every consumer expects).
+pub fn parse_module(src: &str) -> Result<Module, ParseError> {
+    parse_module_inner(src, false)
+}
+
+/// Parse Temen text and, if the program carries **no** explicit `debug` section, synthesize one from the
+/// source: a line table (each instruction → its source line) and an SSA-value table (each value → its
+/// text name, scoped to its block). This makes any hand-written Temen program debuggable — set a
+/// breakpoint on a line, inspect the values by name — the DAP debugger's on-ramp for Temen text
+/// (DEBUGGING.md). A program that *does* declare `debug.*` is respected verbatim.
+pub fn parse_module_debug(src: &str) -> Result<Module, ParseError> {
+    parse_module_inner(src, true)
+}
+
+/// The synthetic source name auto debug info attributes lines to (matched by the DAP breakpoint
+/// request's `source.path`).
+pub const AUTO_DEBUG_FILE: &str = "source.temt";
+
+fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError> {
+    let (toks, lines) = tokenize(src)?;
+    // Calls may forward-reference functions defined later, so we need every
+    // function's result arity before parsing bodies (it determines how many value
+    // indices a `call` binds). A cheap header-only prescan supplies it.
+    let fn_results = prescan_fn_results(&toks)?;
+    let mut p = Parser {
+        toks: &toks,
+        lines: &lines,
+        pos: 0,
+        fn_results,
+        imports: Vec::new(),
+        types: Vec::new(),
+        auto_debug,
+        auto_locs: Vec::new(),
+        auto_vars: Vec::new(),
+        pending_self_handle: false,
+    };
+    let mut funcs = Vec::new();
+    let mut memory = None;
+    let mut data: Vec<Data> = Vec::new();
+    let mut data_ptrs: Vec<temen_ir::DataPtr> = Vec::new();
+    let mut exports: Vec<Export> = Vec::new();
+    let mut data_exports: Vec<temen_ir::DataExport> = Vec::new();
+    let mut impl_exports: Vec<ImplExport> = Vec::new();
+    let mut dbg_files: Vec<String> = Vec::new();
+    let mut dbg_locs: Vec<Loc> = Vec::new();
+    let mut dbg_types: Vec<TypeDef> = Vec::new();
+    let mut dbg_vars: Vec<VarInfo> = Vec::new();
+    let mut dbg_blobs: Vec<ProducerBlob> = Vec::new();
+    let mut dbg_func_names: Vec<FuncName> = Vec::new();
+    while !p.at_end() {
+        match p.peek() {
+            // Debug-info waist (DEBUGGING.md §6) — strippable tooling, parsed into `Module::
+            // debug_info`. `debug.file <idx> "<path>"` (dense indices); `debug.loc <fn> <bb> <i>
+            // <file> <line> <col>`; `debug.var <fn> "<name>" win|ssa <n> "<type>"`.
+            Some(Tok::Ident(s)) if s == "debug.file" => {
+                p.next()?;
+                let idx = p.parse_int()?;
+                if idx < 0 || idx as usize != dbg_files.len() {
+                    return err("debug.file indices must be dense and in declaration order");
+                }
+                let path = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("debug.file path is not valid UTF-8".into()))?;
+                dbg_files.push(path);
+            }
+            // `debug.fname <func> "<name>"` — the §6 function-name table (sparse `func → name`).
+            Some(Tok::Ident(s)) if s == "debug.fname" => {
+                p.next()?;
+                let func = p.parse_u32()?;
+                let name = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("debug.fname name is not valid UTF-8".into()))?;
+                dbg_func_names.push(FuncName { func, name });
+            }
+            Some(Tok::Ident(s)) if s == "debug.loc" => {
+                p.next()?;
+                dbg_locs.push(Loc {
+                    func: p.parse_u32()?,
+                    block: p.parse_u32()?,
+                    inst: p.parse_u32()?,
+                    file: p.parse_u32()?,
+                    line: p.parse_u32()?,
+                    col: p.parse_u32()?,
+                });
+            }
+            // Structured type table (DEBUGGING.md §6 `TypeRef`): `debug.type <id> <kind> ...` with
+            // dense ids in declaration order; an aggregate's members follow on `debug.field` lines.
+            Some(Tok::Ident(s)) if s == "debug.type" => {
+                p.next()?;
+                let id = p.parse_int()?;
+                if id < 0 || id as usize != dbg_types.len() {
+                    return err("debug.type ids must be dense and in declaration order");
+                }
+                let kind = p.parse_ident()?;
+                let name = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("debug.type name is not valid UTF-8".into()))?;
+                let t = match kind.as_str() {
+                    "base" => {
+                        let encoding = match p.parse_ident()?.as_str() {
+                            "signed" => Encoding::Signed,
+                            "unsigned" => Encoding::Unsigned,
+                            "float" => Encoding::Float,
+                            "bool" => Encoding::Bool,
+                            e => return err(format!("unknown debug.type base encoding: {e}")),
+                        };
+                        TypeDef::Base {
+                            name,
+                            encoding,
+                            size: p.parse_u32()?,
+                        }
+                    }
+                    "ptr" => TypeDef::Pointer {
+                        name,
+                        pointee: p.parse_u32()?,
+                        size: p.parse_u32()?,
+                    },
+                    "array" => TypeDef::Array {
+                        name,
+                        elem: p.parse_u32()?,
+                        count: p.parse_u32()?,
+                    },
+                    "agg" => TypeDef::Aggregate {
+                        name,
+                        size: p.parse_u32()?,
+                        fields: Vec::new(),
+                    },
+                    "opaque" => TypeDef::Opaque {
+                        name,
+                        size: p.parse_u32()?,
+                    },
+                    k => return err(format!("unknown debug.type kind: {k}")),
+                };
+                dbg_types.push(t);
+            }
+            Some(Tok::Ident(s)) if s == "debug.field" => {
+                p.next()?;
+                let ty_id = p.parse_int()?;
+                let name = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("debug.field name is not valid UTF-8".into()))?;
+                let offset = p.parse_u32()?;
+                let field_ty = p.parse_u32()?;
+                match dbg_types.get_mut(ty_id as usize) {
+                    Some(TypeDef::Aggregate { fields, .. }) => fields.push(Field {
+                        name,
+                        offset,
+                        ty: field_ty,
+                    }),
+                    _ => return err("debug.field references a non-aggregate (or undeclared) type"),
+                }
+            }
+            Some(Tok::Ident(s)) if s == "debug.var" => {
+                p.next()?;
+                // `<fn>` is a function index, or `global` for a module-scoped global.
+                let func = match p.peek() {
+                    Some(Tok::Ident(s)) if s == "global" => {
+                        p.next()?;
+                        temen_ir::GLOBAL_SCOPE
+                    }
+                    _ => p.parse_u32()?,
+                };
+                let name = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("debug.var name is not valid UTF-8".into()))?;
+                let loc = match p.parse_ident()?.as_str() {
+                    "win" => VarLoc::Window {
+                        off: p.parse_int()?,
+                    },
+                    "ssa" => VarLoc::Ssa {
+                        value: p.parse_u32()?,
+                    },
+                    "ssalist" => {
+                        let n = p.parse_u32()?;
+                        let mut locs = Vec::new();
+                        for _ in 0..n {
+                            locs.push(temen_ir::SsaLoc {
+                                block: p.parse_u32()?,
+                                inst: p.parse_u32()?,
+                                value: p.parse_u32()?,
+                            });
+                        }
+                        VarLoc::SsaList(locs)
+                    }
+                    "winvia" => {
+                        let n = p.parse_u32()?;
+                        let mut base = Vec::new();
+                        for _ in 0..n {
+                            base.push(temen_ir::SsaLoc {
+                                block: p.parse_u32()?,
+                                inst: p.parse_u32()?,
+                                value: p.parse_u32()?,
+                            });
+                        }
+                        VarLoc::WindowVia {
+                            base,
+                            off: p.parse_int()?,
+                        }
+                    }
+                    "fixed" => VarLoc::Fixed {
+                        addr: p.parse_u64()?,
+                    },
+                    k => {
+                        return err(format!(
+                            "debug.var location kind must be win, ssa, ssalist, winvia, or fixed, got {k}"
+                        ))
+                    }
+                };
+                let ty = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("debug.var type is not valid UTF-8".into()))?;
+                // Optional trailing structured type id (a bare integer). Directives that follow
+                // start with an `Ident`, and a func body opens with `(`/`func`, so an `Int` here is
+                // unambiguously the type ref.
+                let type_id = match p.peek() {
+                    Some(Tok::Int(_)) => Some(p.parse_u32()?),
+                    _ => None,
+                };
+                // Optional lexical scope (§6 shadowing): `scope <start_line> <end_line>`.
+                let scope = match p.peek() {
+                    Some(Tok::Ident(s)) if s == "scope" => {
+                        p.next()?;
+                        Some((p.parse_u32()?, p.parse_u32()?))
+                    }
+                    _ => None,
+                };
+                dbg_vars.push(VarInfo {
+                    func,
+                    name,
+                    ty,
+                    loc,
+                    type_id,
+                    scope,
+                });
+            }
+            // Opaque per-producer rich blob (§6): `debug.blob "<producer>" "<bytes>"`.
+            Some(Tok::Ident(s)) if s == "debug.blob" => {
+                p.next()?;
+                let producer = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("debug.blob producer is not valid UTF-8".into()))?;
+                let bytes = p.parse_str()?;
+                dbg_blobs.push(ProducerBlob { producer, bytes });
+            }
+            // Module-level `memory <size_log2>` declaration.
+            Some(Tok::Ident(s)) if s == "memory" => {
+                p.next()?;
+                let n = p.parse_int()?;
+                let size_log2 = u8::try_from(n)
+                    .map_err(|_| ParseError(format!("memory size_log2 out of range: {n}")))?;
+                memory = Some(Memory { size_log2 });
+            }
+            // §7 named import, dense indices in declaration order. v7 form:
+            // `import <idx> func|interface ["ns"] "name" <typeidx> [mode]` — the shape is a
+            // type-section reference. Legacy sugar: `import <idx> "name" (params) ->
+            // (results) [mode]` interns the signature as a `Func` type entry.
+            Some(Tok::Ident(s)) if s == "import" => {
+                p.next()?;
+                let n = p.parse_int()?;
+                if n < 0 || n as usize != p.imports.len() {
+                    return err("import indices must be dense and in declaration order");
+                }
+                let (name, shape) = if matches!(p.peek(), Some(Tok::Ident(k)) if k == "func" || k == "interface")
+                {
+                    let kind = p.parse_ident()?;
+                    let first = String::from_utf8(p.parse_str()?)
+                        .map_err(|_| ParseError("import name is not valid UTF-8".into()))?;
+                    // One string is the v8 name. Two strings are the legacy two-level
+                    // `("ns", "name")` form — joined with `.` per the dotted convention.
+                    let name = if matches!(p.peek(), Some(Tok::Str(_))) {
+                        let second = String::from_utf8(p.parse_str()?)
+                            .map_err(|_| ParseError("import name is not valid UTF-8".into()))?;
+                        if first.is_empty() {
+                            second
+                        } else {
+                            format!("{first}.{second}")
+                        }
+                    } else {
+                        first
+                    };
+                    let t = p.parse_u32()?;
+                    let shape = if kind == "func" {
+                        temen_ir::ImportShape::Func(t)
+                    } else {
+                        temen_ir::ImportShape::Interface(t)
+                    };
+                    (name, shape)
+                } else {
+                    let name = String::from_utf8(p.parse_str()?)
+                        .map_err(|_| ParseError("import name is not valid UTF-8".into()))?;
+                    let params = p.parse_type_list()?;
+                    p.expect(&Tok::Arrow)?;
+                    let results = p.parse_type_list()?;
+                    let t = p.intern_func_type(FuncType { params, results });
+                    (name, temen_ir::ImportShape::Func(t))
+                };
+                // Optional phase-2 mode suffix; absent = `required` (the default).
+                let mode = if matches!(p.peek(), Some(Tok::Ident(k)) if k == "rebindable") {
+                    p.next()?;
+                    temen_ir::ImportMode::Rebindable
+                } else {
+                    temen_ir::ImportMode::Required
+                };
+                p.imports.push(Import { name, shape, mode });
+            }
+            // Module-level `data [ro] <offset> "<bytes>"` segment (§3a / D40).
+            Some(Tok::Ident(s)) if s == "data" => {
+                p.next()?;
+                let readonly = matches!(p.peek(), Some(Tok::Ident(k)) if k == "ro");
+                if readonly {
+                    p.next()?;
+                }
+                let n = p.parse_int()?;
+                let offset = u64::try_from(n)
+                    .map_err(|_| ParseError(format!("negative data offset: {n}")))?;
+                let bytes = p.parse_str()?;
+                data.push(Data {
+                    offset,
+                    readonly,
+                    bytes,
+                });
+            }
+            // Data-image pointer relocation (the data→data case, D-LINK): `data.ptr <at> self
+            // <off>` writes this unit's own data address `dbase+off` at slot `at`; `data.ptr <at>
+            // sym "<name>" <addend>` writes a cross-unit data symbol's address. `link` resolves and
+            // clears these; a runnable module carries none. (`data.ptr` lexes as one ident, like the
+            // `debug.*` directives, so it never collides with the `data` segment arm above.)
+            Some(Tok::Ident(s)) if s == "data.ptr" => {
+                p.next()?;
+                let at = p.parse_u64()?;
+                let kind = p.parse_ident()?;
+                let target = match kind.as_str() {
+                    "self" => temen_ir::DataPtrTarget::SelfOff(p.parse_u64()?),
+                    "sym" => {
+                        let name = String::from_utf8(p.parse_str()?).map_err(|_| {
+                            ParseError("data.ptr sym name is not valid UTF-8".into())
+                        })?;
+                        let addend = p.parse_int()?;
+                        temen_ir::DataPtrTarget::Sym { name, addend }
+                    }
+                    k => return err(format!("data.ptr target must be self or sym: {k}")),
+                };
+                data_ptrs.push(temen_ir::DataPtr { at, target });
+            }
+            // The type section (OQ3; §3.5 surface): `type <idx> func (params) -> (results)`
+            // declares a signature entry; `type <idx> interface { name: ty, ... }` declares an
+            // interface entry with **required op names**. The index is a checked positional
+            // label (optional, as is the `func` kind keyword, for legacy sugar); a standalone
+            // `interface { ... }` line is also accepted.
+            Some(Tok::Ident(s)) if s == "type" => {
+                p.next()?;
+                if matches!(p.peek(), Some(Tok::Int(_))) {
+                    let n = p.parse_int()?;
+                    if n < 0 || n as usize != p.types.len() {
+                        return err("type indices must be dense and in declaration order");
+                    }
+                }
+                if matches!(p.peek(), Some(Tok::Ident(k)) if k == "interface") {
+                    p.next()?;
+                    let elems = p.parse_iface_elems()?;
+                    p.types.push(temen_ir::TypeEntry::Interface(elems));
+                } else {
+                    if matches!(p.peek(), Some(Tok::Ident(k)) if k == "func") {
+                        p.next()?;
+                    }
+                    let params = p.parse_type_list()?;
+                    p.expect(&Tok::Arrow)?;
+                    let results = p.parse_type_list()?;
+                    p.types
+                        .push(temen_ir::TypeEntry::Func(FuncType { params, results }));
+                }
+            }
+            Some(Tok::Ident(s)) if s == "interface" => {
+                p.next()?;
+                let elems = p.parse_iface_elems()?;
+                p.types.push(temen_ir::TypeEntry::Interface(elems));
+            }
+            // Exports (settled §3.5 forms only; the unindexed `export "name" N` and the
+            // `impl` offer spellings are retired): `export <idx> func "name" <funcidx>` and
+            // `export <idx> interface "name" <t> { op: funcidx, ... }` (offer; map keys must
+            // match the interface's declared op names, or bare funcidxs positionally).
+            Some(Tok::Ident(s)) if s == "export" => {
+                p.next()?;
+                if !matches!(p.peek(), Some(Tok::Int(_))) {
+                    return err(
+                        "export takes a dense index (the legacy `export \"name\" N` and `impl` spellings are retired)",
+                    );
+                }
+                let idx = p.parse_int()?;
+                let kind = p.parse_ident()?;
+                let name = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("export name is not valid UTF-8".into()))?;
+                match kind.as_str() {
+                    "func" => {
+                        if idx < 0 || idx as usize != exports.len() {
+                            return err("export indices must be dense and in declaration order");
+                        }
+                        let func = p.parse_u32()?;
+                        exports.push(Export { name, func });
+                    }
+                    "interface" => {
+                        if idx < 0 || idx as usize != impl_exports.len() {
+                            return err("offer indices must be dense and in declaration order");
+                        }
+                        // CALLS.md 7.4 — optional `threaded` keyword: the provider's own
+                        // concurrency-policy declaration (omitted ⇒ `single`).
+                        let threaded = matches!(p.peek(), Some(Tok::Ident(w)) if w == "threaded");
+                        if threaded {
+                            p.next()?;
+                        }
+                        let interface = p.parse_u32()?;
+                        let ops = p.parse_offer_ops(interface)?;
+                        impl_exports.push(ImplExport {
+                            name,
+                            interface,
+                            ops,
+                            threaded,
+                        });
+                    }
+                    // `export <idx> data "<name>" <offset>`: a data symbol at a window byte offset,
+                    // its own dense index sequence (like func/interface exports each have theirs).
+                    "data" => {
+                        if idx < 0 || idx as usize != data_exports.len() {
+                            return err(
+                                "data export indices must be dense and in declaration order",
+                            );
+                        }
+                        let offset = p.parse_u64()?;
+                        data_exports.push(temen_ir::DataExport { name, offset });
+                    }
+                    k => return err(format!("export kind must be func, interface, or data: {k}")),
+                }
+            }
+            _ => funcs.push(p.parse_func(funcs.len() as u32)?),
+        }
+    }
+    let no_explicit = dbg_files.is_empty()
+        && dbg_locs.is_empty()
+        && dbg_types.is_empty()
+        && dbg_vars.is_empty()
+        && dbg_blobs.is_empty()
+        && dbg_func_names.is_empty();
+    let debug_info = if !no_explicit {
+        // An explicit `debug` section wins verbatim.
+        Some(DebugInfo {
+            files: dbg_files,
+            locs: dbg_locs,
+            types: dbg_types,
+            vars: dbg_vars,
+            blobs: dbg_blobs,
+            func_names: dbg_func_names,
+        })
+    } else if auto_debug && !p.auto_locs.is_empty() {
+        // No explicit section, and the caller asked to synthesize one from the source.
+        Some(DebugInfo {
+            files: vec![AUTO_DEBUG_FILE.to_string()],
+            locs: std::mem::take(&mut p.auto_locs),
+            types: Vec::new(),
+            vars: std::mem::take(&mut p.auto_vars),
+            blobs: Vec::new(),
+            func_names: Vec::new(),
+        })
+    } else {
+        None
+    };
+    Ok(Module {
+        funcs,
+        memory,
+        data,
+        data_ptrs,
+        // `data.funcref` relocations have no text opcode — the nimony frontend attaches them to the
+        // parsed object module directly (they need the module stem, which the text layer lacks).
+        data_funcrefs: Vec::new(),
+        imports: std::mem::take(&mut p.imports),
+        exports,
+        data_exports,
+        impl_exports,
+        types: p.types,
+        debug_info,
+    })
+}
+
+/// Header-only pass: each function's result count, indexed by function order.
+/// Skips `memory` decls and function bodies (brace-matched).
+fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
+    let mut p = Parser {
+        toks,
+        lines: &[],
+        pos: 0,
+        fn_results: Vec::new(),
+        imports: Vec::new(),
+        types: Vec::new(),
+        auto_debug: false,
+        auto_locs: Vec::new(),
+        auto_vars: Vec::new(),
+        pending_self_handle: false,
+    };
+    let mut out = Vec::new();
+    while !p.at_end() {
+        match p.peek() {
+            Some(Tok::Ident(s)) if s == "memory" => {
+                p.next()?;
+                p.parse_int()?;
+            }
+            // §7 imports — skip in the header prescan. v7 form: `import <idx> func|interface
+            // ["ns"] "name" <typeidx> [mode]`; legacy: `import <idx> "name" (sig) [mode]`.
+            Some(Tok::Ident(s)) if s == "import" => {
+                p.next()?;
+                p.parse_int()?;
+                if matches!(p.peek(), Some(Tok::Ident(k)) if k == "func" || k == "interface") {
+                    p.next()?;
+                    p.parse_str()?;
+                    if matches!(p.peek(), Some(Tok::Str(_))) {
+                        p.parse_str()?;
+                    }
+                    p.parse_int()?;
+                } else {
+                    p.parse_str()?;
+                    p.parse_type_list()?;
+                    p.expect(&Tok::Arrow)?;
+                    p.parse_type_list()?;
+                }
+                // Optional phase-2 mode suffix.
+                if matches!(p.peek(), Some(Tok::Ident(k)) if k == "rebindable") {
+                    p.next()?;
+                }
+            }
+            Some(Tok::Ident(s)) if s == "data" => {
+                // `data [ro] <offset> "<bytes>"` — skip past it in the header prescan.
+                p.next()?;
+                if matches!(p.peek(), Some(Tok::Ident(k)) if k == "ro") {
+                    p.next()?;
+                }
+                p.parse_int()?;
+                p.parse_str()?;
+            }
+            // `data.ptr <at> self <off>` / `data.ptr <at> sym "<name>" <addend>` — skip in the
+            // header prescan (carries no function; lexes as its own ident, distinct from `data`).
+            Some(Tok::Ident(s)) if s == "data.ptr" => {
+                p.next()?;
+                p.parse_int()?; // at
+                let kind = p.parse_ident()?;
+                if kind == "sym" {
+                    p.parse_str()?; // name
+                }
+                p.parse_int()?; // self off / sym addend
+            }
+            // Type-section entries — skip in the header prescan. v7 form: `type <idx> func
+            // (sig)` / `type <idx> interface { ... }`; legacy: `type (sig)`.
+            Some(Tok::Ident(s)) if s == "type" => {
+                p.next()?;
+                if matches!(p.peek(), Some(Tok::Int(_))) {
+                    p.parse_int()?;
+                }
+                if matches!(p.peek(), Some(Tok::Ident(k)) if k == "interface") {
+                    p.next()?;
+                    p.expect(&Tok::LBrace)?;
+                    while !matches!(p.peek(), Some(Tok::RBrace)) {
+                        p.next()?;
+                    }
+                    p.expect(&Tok::RBrace)?;
+                } else {
+                    if matches!(p.peek(), Some(Tok::Ident(k)) if k == "func") {
+                        p.next()?;
+                    }
+                    p.parse_type_list()?;
+                    p.expect(&Tok::Arrow)?;
+                    p.parse_type_list()?;
+                }
+            }
+            Some(Tok::Ident(s)) if s == "interface" => {
+                p.next()?;
+                p.expect(&Tok::LBrace)?;
+                while !matches!(p.peek(), Some(Tok::RBrace)) {
+                    p.next()?;
+                }
+                p.expect(&Tok::RBrace)?;
+            }
+            // Exports — skip past them in the header prescan (settled forms only: `export
+            // <idx> func "name" <funcidx>` / `export <idx> interface "name" <t> { ... }`;
+            // the unindexed and `impl` spellings are retired).
+            Some(Tok::Ident(s)) if s == "export" => {
+                p.next()?;
+                p.parse_int()?;
+                let kind = p.parse_ident()?;
+                p.parse_str()?;
+                // 7.4 — skip the optional `threaded` policy keyword in the prescan.
+                if matches!(p.peek(), Some(Tok::Ident(k)) if k == "threaded") {
+                    p.next()?;
+                }
+                p.parse_int()?;
+                if kind == "interface" {
+                    p.expect(&Tok::LBrace)?;
+                    while !matches!(p.peek(), Some(Tok::RBrace)) {
+                        p.next()?;
+                    }
+                    p.expect(&Tok::RBrace)?;
+                }
+            }
+            Some(Tok::Ident(s)) if s == "func" => {
+                p.next()?;
+                if matches!(p.peek(), Some(Tok::Int(_))) {
+                    p.parse_int()?;
+                }
+                let _params = p.parse_type_list()?;
+                p.expect(&Tok::Arrow)?;
+                out.push(p.parse_type_list()?.len());
+                p.expect(&Tok::LBrace)?;
+                let mut depth = 1usize;
+                while depth > 0 {
+                    match p.next()? {
+                        Tok::LBrace => depth += 1,
+                        Tok::RBrace => depth -= 1,
+                        _ => {}
+                    }
+                }
+            }
+            // Debug-info directives (DEBUGGING.md §6) — skip in the header prescan; they carry no
+            // function arities. Consume exactly each directive's tokens to stay aligned.
+            Some(Tok::Ident(s)) if s == "debug.file" => {
+                p.next()?;
+                p.parse_int()?;
+                p.parse_str()?;
+            }
+            Some(Tok::Ident(s)) if s == "debug.fname" => {
+                p.next()?;
+                p.parse_int()?; // func index
+                p.parse_str()?; // name
+            }
+            Some(Tok::Ident(s)) if s == "debug.loc" => {
+                p.next()?;
+                for _ in 0..6 {
+                    p.parse_int()?;
+                }
+            }
+            Some(Tok::Ident(s)) if s == "debug.type" => {
+                p.next()?;
+                p.parse_int()?; // id
+                let kind = p.parse_ident()?;
+                p.parse_str()?; // name
+                                // Trailing operands vary by kind; consume them as bare integers.
+                let n = match kind.as_str() {
+                    "base" => {
+                        p.next()?; // encoding ident
+                        1 // size
+                    }
+                    "ptr" => 2,    // pointee, size
+                    "array" => 2,  // elem, count
+                    "agg" => 1,    // size
+                    "opaque" => 1, // size
+                    _ => return err("unknown debug.type kind in prescan"),
+                };
+                for _ in 0..n {
+                    p.parse_int()?;
+                }
+            }
+            Some(Tok::Ident(s)) if s == "debug.field" => {
+                p.next()?;
+                p.parse_int()?; // type id
+                p.parse_str()?; // name
+                p.parse_int()?; // offset
+                p.parse_int()?; // field type
+            }
+            Some(Tok::Ident(s)) if s == "debug.var" => {
+                p.next()?;
+                // func: a numeric index or the `global` keyword.
+                if matches!(p.peek(), Some(Tok::Ident(s)) if s == "global") {
+                    p.next()?;
+                } else {
+                    p.parse_int()?;
+                }
+                p.parse_str()?; // name
+                                // Location: `win <off>` / `ssa <value>` / `fixed <addr>` (one int),
+                                // or `ssalist <n>` / `winvia <n>` + 3n ints (+ a trailing offset).
+                let kind = p.parse_ident()?;
+                if kind == "ssalist" || kind == "winvia" {
+                    let n = p.parse_int()?;
+                    for _ in 0..n.max(0) * 3 {
+                        p.parse_int()?;
+                    }
+                    if kind == "winvia" {
+                        p.parse_int()?; // the trailing offset
+                    }
+                } else {
+                    p.parse_int()?; // win off / ssa value / fixed addr
+                }
+                p.parse_str()?; // type
+                if matches!(p.peek(), Some(Tok::Int(_))) {
+                    p.parse_int()?; // optional structured type id
+                }
+                if matches!(p.peek(), Some(Tok::Ident(s)) if s == "scope") {
+                    p.next()?;
+                    p.parse_int()?; // start line
+                    p.parse_int()?; // end line
+                }
+            }
+            Some(Tok::Ident(s)) if s == "debug.blob" => {
+                p.next()?;
+                p.parse_str()?; // producer
+                p.parse_str()?; // bytes
+            }
+            _ => return err("expected `func` or `memory`"),
+        }
+    }
+    Ok(out)
+}
+
+struct Parser<'a> {
+    toks: &'a [Tok],
+    /// The 1-based source line of each token (`lines[k]` ↔ `toks[k]`), for the auto debug line table.
+    /// Empty in the header prescan (which needs no positions).
+    lines: &'a [u32],
+    pos: usize,
+    /// Result arity of each function (by index), from the prescan.
+    fn_results: Vec<usize>,
+    /// §7 named imports declared at module top, in order; a `call.import <idx>` recovers its
+    /// op signature from here (imports always precede the functions that reference them).
+    imports: Vec<Import>,
+    /// The type section accumulated so far (v7): import shapes reference it, `call.import`
+    /// resolves op signatures/names through it, and legacy inline-signature sugar interns
+    /// into it.
+    types: Vec<temen_ir::TypeEntry>,
+    /// When set, synthesize debug info (a line table + SSA-value names) for a program that carries no
+    /// explicit `debug` section, so any hand-written Temen text is debuggable. Accumulated below.
+    auto_debug: bool,
+    auto_locs: Vec<Loc>,
+    auto_vars: Vec<VarInfo>,
+    /// Set by [`Self::parse_inst`] when it parses a `cap.self.*` sugar mnemonic — the wire-rev form
+    /// carries no dispatch-handle operand in text, so [`Self::parse_block`] materializes an ignored
+    /// `i32.const 0` just ahead of the emitted `cap.call CAP_SELF` and points its handle at it.
+    pending_self_handle: bool,
+}
+
+/// A branch edge whose target is still a label name.
+type PEdge = (String, Vec<u32>);
+
+/// Intermediate block whose terminator still refers to block labels by name.
+struct PBlock {
+    label: String,
+    params: Vec<ValType>,
+    insts: Vec<Inst>,
+    term: PTerm,
+    /// Source positions for the auto debug line table (empty unless `auto_debug`).
+    dbg: PBlockDbg,
+}
+
+/// Per-block source positions gathered while parsing, for synthesizing debug info: the block's
+/// terminator line (its scope end), the line of each instruction, and each SSA value's `(name,
+/// block-local index, scope-start line)` — params scoped from the header, results from just after the
+/// line that defines them (so a value shows only once assigned).
+#[derive(Default)]
+struct PBlockDbg {
+    term_line: u32,
+    inst_lines: Vec<u32>,
+    vars: Vec<(String, u32, u32)>,
+}
+
+enum PTerm {
+    Br(PEdge),
+    BrIf {
+        cond: u32,
+        then: PEdge,
+        els: PEdge,
+    },
+    BrTable {
+        idx: u32,
+        targets: Vec<PEdge>,
+        default: PEdge,
+    },
+    Return(Vec<u32>),
+    ReturnCall {
+        func: u32,
+        args: Vec<u32>,
+    },
+    ReturnCallIndirect {
+        ty: FuncType,
+        idx: u32,
+        args: Vec<u32>,
+    },
+    Unreachable,
+}
+
+impl<'a> Parser<'a> {
+    fn at_end(&self) -> bool {
+        self.pos >= self.toks.len()
+    }
+
+    fn peek(&self) -> Option<&Tok> {
+        self.toks.get(self.pos)
+    }
+
+    /// The 1-based source line of the upcoming token (`0` if positions weren't tracked / at EOF).
+    fn cur_line(&self) -> u32 {
+        self.lines.get(self.pos).copied().unwrap_or(0)
+    }
+
+    fn next(&mut self) -> Result<&Tok, ParseError> {
+        let t = self
+            .toks
+            .get(self.pos)
+            .ok_or(ParseError("unexpected end of input".into()))?;
+        self.pos += 1;
+        Ok(t)
+    }
+
+    fn expect(&mut self, want: &Tok) -> Result<(), ParseError> {
+        let got = self.next()?;
+        if got == want {
+            Ok(())
+        } else {
+            err(format!("expected {want:?}, found {got:?}"))
+        }
+    }
+
+    fn ident(&mut self) -> Result<String, ParseError> {
+        match self.next()? {
+            Tok::Ident(s) => Ok(s.clone()),
+            other => err(format!("expected identifier, found {other:?}")),
+        }
+    }
+
+    fn parse_func(&mut self, func_idx: u32) -> Result<Func, ParseError> {
+        // `func [N] (types) -> (types) { blocks }` — the §3.5 surface carries the index as a
+        // checked positional label; the label-less legacy form stays accepted.
+        let kw = self.ident()?;
+        if kw != "func" {
+            return err(format!("expected `func`, found `{kw}`"));
+        }
+        if matches!(self.peek(), Some(Tok::Int(_))) {
+            let n = self.parse_int()?;
+            if n < 0 || n as u32 != func_idx {
+                return err(format!(
+                    "func label {n} out of order (this is func {func_idx})"
+                ));
+            }
+        }
+        let params = self.parse_type_list()?;
+        self.expect(&Tok::Arrow)?;
+        let results = self.parse_type_list()?;
+        self.expect(&Tok::LBrace)?;
+
+        let mut pblocks = Vec::new();
+        while self.peek() != Some(&Tok::RBrace) {
+            if self.at_end() {
+                return err("unterminated function body");
+            }
+            pblocks.push(self.parse_block(pblocks.len() as u32)?);
+        }
+        self.expect(&Tok::RBrace)?;
+
+        // Resolve block labels to indices.
+        let mut labels: HashMap<String, u32> = HashMap::new();
+        for (i, b) in pblocks.iter().enumerate() {
+            if labels.insert(b.label.clone(), i as u32).is_some() {
+                return err(format!("duplicate block label `{}`", b.label));
+            }
+        }
+
+        // Synthesize this function's debug line table + SSA-value names (auto debug info): each
+        // instruction maps to its source line, and each value to its text name, scoped to its block.
+        if self.auto_debug {
+            for (b_idx, b) in pblocks.iter().enumerate() {
+                for (inst, &line) in b.dbg.inst_lines.iter().enumerate() {
+                    self.auto_locs.push(Loc {
+                        func: func_idx,
+                        block: b_idx as u32,
+                        inst: inst as u32,
+                        file: 0,
+                        line,
+                        col: 0,
+                    });
+                }
+                for (name, idx, scope_start) in &b.dbg.vars {
+                    self.auto_vars.push(VarInfo {
+                        func: func_idx,
+                        name: name.clone(),
+                        ty: String::new(),
+                        loc: VarLoc::Ssa { value: *idx },
+                        type_id: None,
+                        scope: Some((*scope_start, b.dbg.term_line)),
+                    });
+                }
+            }
+        }
+        let edge = |e: PEdge| -> Result<(u32, Vec<u32>), ParseError> {
+            let t = labels
+                .get(&e.0)
+                .copied()
+                .ok_or_else(|| ParseError(format!("unknown block label `{}`", e.0)))?;
+            Ok((t, e.1))
+        };
+
+        let mut blocks = Vec::new();
+        for b in pblocks {
+            let term = match b.term {
+                PTerm::Br(e) => {
+                    let (target, args) = edge(e)?;
+                    Terminator::Br { target, args }
+                }
+                PTerm::BrIf { cond, then, els } => {
+                    let (then_blk, then_args) = edge(then)?;
+                    let (else_blk, else_args) = edge(els)?;
+                    Terminator::BrIf {
+                        cond,
+                        then_blk,
+                        then_args,
+                        else_blk,
+                        else_args,
+                    }
+                }
+                PTerm::BrTable {
+                    idx,
+                    targets,
+                    default,
+                } => Terminator::BrTable {
+                    idx,
+                    targets: targets
+                        .into_iter()
+                        .map(edge)
+                        .collect::<Result<Vec<_>, _>>()?,
+                    default: edge(default)?,
+                },
+                PTerm::Return(v) => Terminator::Return(v),
+                PTerm::ReturnCall { func, args } => Terminator::ReturnCall { func, args },
+                PTerm::ReturnCallIndirect { ty, idx, args } => {
+                    Terminator::ReturnCallIndirect { ty, idx, args }
+                }
+                PTerm::Unreachable => Terminator::Unreachable,
+            };
+            blocks.push(Block {
+                params: b.params,
+                insts: b.insts,
+                term,
+            });
+        }
+
+        Ok(Func {
+            params,
+            results,
+            blocks,
+        })
+    }
+
+    /// Intern a signature into the accumulated type section (legacy inline-signature sugar).
+    fn intern_func_type(&mut self, ft: FuncType) -> u32 {
+        if let Some(i) = self
+            .types
+            .iter()
+            .position(|t| matches!(t, temen_ir::TypeEntry::Func(f) if *f == ft))
+        {
+            return i as u32;
+        }
+        self.types.push(temen_ir::TypeEntry::Func(ft));
+        (self.types.len() - 1) as u32
+    }
+
+    /// Resolve an op *name* against interface entry `ty`'s declared elements.
+    fn resolve_iface_op(&self, ty: u32, opname: &str) -> Result<u32, ParseError> {
+        let Some(temen_ir::TypeEntry::Interface(elems)) = self.types.get(ty as usize) else {
+            return err(format!("type {ty} is not a declared interface"));
+        };
+        elems
+            .iter()
+            .position(|e| e.name == opname)
+            .map(|i| i as u32)
+            .ok_or_else(|| ParseError(format!("interface {ty} has no op named `{opname}`")))
+    }
+
+    /// The signature of interface `ty`'s op `op`, resolved through the type section.
+    fn iface_op_sig(&self, ty: u32, op: u32) -> Result<FuncType, ParseError> {
+        let Some(temen_ir::TypeEntry::Interface(elems)) = self.types.get(ty as usize) else {
+            return err(format!("type {ty} is not a declared interface"));
+        };
+        let e = elems
+            .get(op as usize)
+            .ok_or_else(|| ParseError(format!("interface {ty} has no op {op}")))?;
+        match self.types.get(e.ty as usize) {
+            Some(temen_ir::TypeEntry::Func(ft)) => Ok(ft.clone()),
+            _ => err(format!(
+                "interface {ty} op {op} references type {}, which is not a func entry",
+                e.ty
+            )),
+        }
+    }
+
+    /// Resolve an op name through import `import`'s declared shape.
+    fn resolve_import_op(&self, import: u32, opname: &str) -> Result<u32, ParseError> {
+        let imp = self.imports.get(import as usize).ok_or_else(|| {
+            ParseError(format!("call.import references undeclared import {import}"))
+        })?;
+        match imp.shape {
+            temen_ir::ImportShape::Func(_) => {
+                if opname == imp.name {
+                    Ok(0)
+                } else {
+                    err(format!("flat import {import} has no op named `{opname}`"))
+                }
+            }
+            temen_ir::ImportShape::Interface(t) => self.resolve_iface_op(t, opname),
+        }
+    }
+
+    /// The signature of import `import`'s op `op`, resolved through the type section.
+    fn import_op_sig(&self, import: u32, op: u32) -> Result<FuncType, ParseError> {
+        let imp = self.imports.get(import as usize).ok_or_else(|| {
+            ParseError(format!("call.import references undeclared import {import}"))
+        })?;
+        match imp.shape {
+            temen_ir::ImportShape::Func(t) => {
+                if op != 0 {
+                    return err(format!("flat import {import} has only op 0, got {op}"));
+                }
+                match self.types.get(t as usize) {
+                    Some(temen_ir::TypeEntry::Func(ft)) => Ok(ft.clone()),
+                    _ => err(format!(
+                        "import {import} references type {t}, which is not a func entry"
+                    )),
+                }
+            }
+            temen_ir::ImportShape::Interface(t) => self.iface_op_sig(t, op),
+        }
+    }
+
+    /// `{ name: ty, ... }` — an interface's named-op element list (§3.5; names required).
+    fn parse_iface_elems(&mut self) -> Result<Vec<temen_ir::IfaceOp>, ParseError> {
+        self.expect(&Tok::LBrace)?;
+        let mut elems = Vec::new();
+        if !matches!(self.peek(), Some(Tok::RBrace)) {
+            loop {
+                let name = self.parse_ident()?;
+                self.expect(&Tok::Colon)?;
+                let ty = self.parse_u32()?;
+                elems.push(temen_ir::IfaceOp { name, ty });
+                if matches!(self.peek(), Some(Tok::Comma)) {
+                    self.next()?;
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect(&Tok::RBrace)?;
+        Ok(elems)
+    }
+
+    /// An offer's op map `{ op: funcidx, ... }` — keys resolved to positions through the
+    /// declared interface's op names — or bare funcidxs, taken positionally.
+    fn parse_offer_ops(&mut self, interface: u32) -> Result<Vec<u32>, ParseError> {
+        self.expect(&Tok::LBrace)?;
+        let mut named: Vec<(String, u32)> = Vec::new();
+        let mut positional: Vec<u32> = Vec::new();
+        if !matches!(self.peek(), Some(Tok::RBrace)) {
+            loop {
+                match self.peek() {
+                    Some(Tok::Int(_)) => positional.push(self.parse_u32()?),
+                    _ => {
+                        let name = self.parse_ident()?;
+                        self.expect(&Tok::Colon)?;
+                        let f = self.parse_u32()?;
+                        named.push((name, f));
+                    }
+                }
+                if matches!(self.peek(), Some(Tok::Comma)) {
+                    self.next()?;
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect(&Tok::RBrace)?;
+        if named.is_empty() {
+            return Ok(positional);
+        }
+        if !positional.is_empty() {
+            return err("offer op map mixes named and positional entries");
+        }
+        // Resolve names to positions through the interface declaration.
+        let Some(temen_ir::TypeEntry::Interface(elems)) = self.types.get(interface as usize) else {
+            return err(format!(
+                "offer references type {interface}, which is not a declared interface"
+            ));
+        };
+        let mut ops = vec![u32::MAX; elems.len()];
+        for (name, f) in named {
+            let Some(pos) = elems.iter().position(|e| e.name == name) else {
+                return err(format!(
+                    "offer op `{name}` is not in the declared interface"
+                ));
+            };
+            if ops[pos] != u32::MAX {
+                return err(format!("offer op `{name}` bound twice"));
+            }
+            ops[pos] = f;
+        }
+        if ops.contains(&u32::MAX) {
+            return err("offer op map must bind every op of the declared interface");
+        }
+        Ok(ops)
+    }
+
+    fn parse_type_list(&mut self) -> Result<Vec<ValType>, ParseError> {
+        self.expect(&Tok::LParen)?;
+        let mut ts = Vec::new();
+        while self.peek() != Some(&Tok::RParen) {
+            if !ts.is_empty() {
+                self.expect(&Tok::Comma)?;
+            }
+            ts.push(self.parse_type()?);
+        }
+        self.expect(&Tok::RParen)?;
+        Ok(ts)
+    }
+
+    fn parse_type(&mut self) -> Result<ValType, ParseError> {
+        let s = self.ident()?;
+        ValType::from_str(&s).ok_or_else(|| ParseError(format!("unknown type `{s}`")))
+    }
+
+    fn parse_block(&mut self, block_idx: u32) -> Result<PBlock, ParseError> {
+        // The one block form (settled §3.5, legacy labels retired): `block N (name: type, ...)
+        // { insts… term }` — the index is a checked positional label and the body is braced
+        // (labels are the index's decimal string, so numeric branch targets resolve).
+        let header_line = self.cur_line();
+        let label = self.ident()?;
+        if label != "block" {
+            return err(format!(
+                "expected `block {block_idx} (…) {{`, found `{label}` (the legacy `blockN(…):` label form is retired)"
+            ));
+        }
+        let n = self.parse_int()?;
+        if n < 0 || n as u32 != block_idx {
+            return err(format!(
+                "block label {n} out of order (this is block {block_idx})"
+            ));
+        }
+        let label = n.to_string();
+        // Per-block value-name table; parameters take indices 0..k.
+        let mut names: HashMap<String, u32> = HashMap::new();
+        let mut params = Vec::new();
+        // Auto debug positions (only filled when synthesizing debug info).
+        let mut dbg = PBlockDbg::default();
+
+        self.expect(&Tok::LParen)?;
+        while self.peek() != Some(&Tok::RParen) {
+            if !params.is_empty() {
+                self.expect(&Tok::Comma)?;
+            }
+            let n = self.ident()?;
+            self.expect(&Tok::Colon)?;
+            let t = self.parse_type()?;
+            let idx = params.len() as u32;
+            if names.insert(n.clone(), idx).is_some() {
+                return err(format!("duplicate value name `{n}`"));
+            }
+            // A parameter is live from the block header.
+            if self.auto_debug {
+                dbg.vars.push((n, idx, header_line));
+            }
+            params.push(t);
+        }
+        self.expect(&Tok::RParen)?;
+        self.expect(&Tok::LBrace)?;
+
+        let mut insts = Vec::new();
+        let mut next_idx = params.len() as u32;
+
+        // Parse instruction lines until we hit a terminator keyword.
+        loop {
+            let cur = self.cur_line();
+            let kw = match self.peek() {
+                Some(Tok::Ident(s)) => s.clone(),
+                _ => return err("expected instruction or terminator"),
+            };
+            if matches!(
+                kw.as_str(),
+                "br" | "br_if"
+                    | "br_table"
+                    | "return"
+                    | "return_call"
+                    | "return_call_indirect"
+                    | "unreachable"
+            ) {
+                let term = self.parse_term(&names)?;
+                dbg.term_line = cur;
+                self.expect(&Tok::RBrace)?;
+                return Ok(PBlock {
+                    label,
+                    params,
+                    insts,
+                    term,
+                    dbg,
+                });
+            }
+
+            // A value-producing instruction is `name(, name)* = opcode operands`; a
+            // no-result instruction (`store`, void `call`) is just `opcode operands`.
+            // The binding LHS (idents/commas ending in `=`) is what tells them apart.
+            let lhs = self.try_binding_lhs();
+            let mut inst = self.parse_inst(&names)?;
+            // A `cap.self.*` sugar mnemonic carries no dispatch handle in text. Point the emitted
+            // `cap.call CAP_SELF`'s handle at an ignored `i32.const 0`: reuse the immediately-preceding
+            // one when present — this is the printed sugar's own const-0 handle, so print∘parse is
+            // exact — otherwise materialize a fresh one (one text line then emits two instructions).
+            if self.pending_self_handle {
+                self.pending_self_handle = false;
+                let handle_idx = if matches!(insts.last(), Some(Inst::ConstI32(0))) {
+                    next_idx - 1
+                } else {
+                    let idx = next_idx;
+                    insts.push(Inst::ConstI32(0));
+                    next_idx += 1;
+                    if self.auto_debug {
+                        dbg.inst_lines.push(cur);
+                    }
+                    idx
+                };
+                if let Inst::CapCall { handle, .. } = &mut inst {
+                    *handle = handle_idx;
+                }
+            }
+            let n = inst.result_count(&self.fn_results);
+            if self.auto_debug {
+                dbg.inst_lines.push(cur);
+            }
+            match lhs {
+                Some(lhs) => {
+                    if lhs.len() != n {
+                        return err(format!(
+                            "instruction produces {n} result(s) but {} name(s) bound",
+                            lhs.len()
+                        ));
+                    }
+                    for name in lhs {
+                        if names.insert(name.clone(), next_idx).is_some() {
+                            return err(format!("duplicate value name `{name}`"));
+                        }
+                        // A result is live from *after* the line that assigns it (so it shows only
+                        // once computed — the stop is *before* the op).
+                        if self.auto_debug {
+                            dbg.vars.push((name, next_idx, cur + 1));
+                        }
+                        next_idx += 1;
+                    }
+                }
+                None if n == 0 => {}
+                None => return err("expected `name =` for a value-producing instruction"),
+            }
+            insts.push(inst);
+        }
+    }
+
+    /// If the upcoming tokens are a binding LHS — `ident (, ident)* =` — consume them
+    /// and return the names; otherwise consume nothing and return `None`.
+    fn try_binding_lhs(&mut self) -> Option<Vec<String>> {
+        let start = self.pos;
+        let mut names = Vec::new();
+        loop {
+            match self.toks.get(self.pos) {
+                Some(Tok::Ident(s)) => {
+                    names.push(s.clone());
+                    self.pos += 1;
+                }
+                _ => {
+                    self.pos = start;
+                    return None;
+                }
+            }
+            match self.toks.get(self.pos) {
+                Some(Tok::Comma) => self.pos += 1,
+                Some(Tok::Equals) => {
+                    self.pos += 1;
+                    return Some(names);
+                }
+                _ => {
+                    self.pos = start;
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// Parse a §12 atomic op given its `ty` and the mnemonic tail after `<ty>.atomic.`
+    /// (`load` / `store` / `cmpxchg` / `rmw.<op>`). Atomics carry an `offset=` memarg but no
+    /// `align` (the access is naturally aligned by definition).
+    fn parse_atomic(
+        &mut self,
+        ty: IntTy,
+        rest: &str,
+        names: &HashMap<String, u32>,
+    ) -> Result<Inst, ParseError> {
+        // `wait` carries no memory ordering; everything else may end in a `.<order>` suffix.
+        if rest == "wait" {
+            let addr = self.value(names)?;
+            let expected = self.value(names)?;
+            let timeout = self.value(names)?;
+            return Ok(Inst::MemoryWait {
+                ty,
+                addr,
+                expected,
+                timeout,
+            });
+        }
+        // Load/store/rmw/cmpxchg execute uniformly seq-cst and no longer carry an ordering on the
+        // wire. A `.<order>` suffix here is a **parse error** (fail-closed): the old surface silently
+        // strengthened weak orderings to seq-cst, which would now be a lie about what the wire means.
+        let (base, order) = split_order(rest);
+        if order != Ordering::SeqCst {
+            return Err(ParseError(format!(
+                "atomic ordering suffix on `{}.atomic.{rest}` is no longer accepted \
+                 (atomic load/store/rmw/cmpxchg execute seq-cst; the wire carries no ordering)",
+                ty.prefix()
+            )));
+        }
+        match base {
+            "load" => {
+                let addr = self.value(names)?;
+                let offset = self.parse_memarg()?;
+                Ok(Inst::AtomicLoad { ty, addr, offset })
+            }
+            "store" => {
+                let addr = self.value(names)?;
+                let value = self.value(names)?;
+                let offset = self.parse_memarg()?;
+                Ok(Inst::AtomicStore {
+                    ty,
+                    addr,
+                    value,
+                    offset,
+                })
+            }
+            "cmpxchg" => {
+                let addr = self.value(names)?;
+                let expected = self.value(names)?;
+                let replacement = self.value(names)?;
+                let offset = self.parse_memarg()?;
+                Ok(Inst::AtomicCmpxchg {
+                    ty,
+                    addr,
+                    expected,
+                    replacement,
+                    offset,
+                })
+            }
+            _ => {
+                let opname = base.strip_prefix("rmw.").ok_or_else(|| {
+                    ParseError(format!("unknown atomic op: {}.atomic.{rest}", ty.prefix()))
+                })?;
+                let op = AtomicRmwOp::from_name(opname)
+                    .ok_or_else(|| ParseError(format!("unknown atomic rmw op: {opname}")))?;
+                let addr = self.value(names)?;
+                let value = self.value(names)?;
+                let offset = self.parse_memarg()?;
+                Ok(Inst::AtomicRmw {
+                    ty,
+                    op,
+                    addr,
+                    value,
+                    offset,
+                })
+            }
+        }
+    }
+
+    /// Build a `cap.self.*` reflection op as its `cap.call CAP_SELF op N` form. Flags
+    /// [`Self::pending_self_handle`] so [`Self::parse_block`] materializes the ignored const-0
+    /// dispatch handle (the sugar text carries none); the placeholder handle here is overwritten there.
+    fn cap_self_capcall(&mut self, op: u32, sig: FuncType, args: Vec<u32>) -> Inst {
+        self.pending_self_handle = true;
+        Inst::CapCall {
+            type_id: temen_ir::CAP_SELF_TYPE_ID,
+            op,
+            sig,
+            handle: u32::MAX, // placeholder; parse_block points it at the injected i32.const 0
+            args,
+        }
+    }
+
+    fn parse_inst(&mut self, names: &HashMap<String, u32>) -> Result<Inst, ParseError> {
+        let op = self.ident()?;
+
+        // Ops whose full name is matched directly (no `prefix.suffix` split).
+        if op == "select" {
+            let cond = self.value(names)?;
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::Select { cond, a, b });
+        }
+        if op == "call" {
+            let n = self.parse_int()?;
+            let func = u32::try_from(n)
+                .map_err(|_| ParseError(format!("function index out of range: {n}")))?;
+            let args = self.parse_value_list(names)?;
+            return Ok(Inst::Call { func, args });
+        }
+        // §7 capability / symbolic calls:
+        //   manifest:    `call.import <idx>[.<opname> | op <n>] (args)` — sig from the decl;
+        //                a legacy `v<handle>` operand before the args parses and is discarded
+        //                (the slot binding identifies the capability since v8)
+        //   symbolic:    `call.sym <idx> v<handle> (args)` — the §7/§22 symbolic call
+        //   name-inline: `call.sym "name" (params)->(results) v<h> (args)` — the *streaming*
+        //                form: interns the name as a flat func import and yields a `CallSym`
+        // The name-inline form lets a streaming frontend (chibicc) emit a symbolic call per site
+        // with no pre-collected import table; the parser interns the name into `imports`.
+        if op == "call.import" || op == "call.sym" {
+            if op == "call.sym" && matches!(self.peek(), Some(Tok::Str(_))) {
+                // Name-inline sugar: interns the signature as a type entry and the name as a
+                // flat func import; the call is a link-form `CallSym` (the handle operand is
+                // the cap symbol's runtime handle / `Slot` patch target).
+                let name = String::from_utf8(self.parse_str()?)
+                    .map_err(|_| ParseError("call.import name is not valid UTF-8".into()))?;
+                let params = self.parse_type_list()?;
+                self.expect(&Tok::Arrow)?;
+                let results = self.parse_type_list()?;
+                let sig = FuncType { params, results };
+                let t = self.intern_func_type(sig.clone());
+                // Intern: reuse an existing import of the same (name, shape), else append.
+                let idx = self
+                    .imports
+                    .iter()
+                    .position(|imp| imp.name == name && imp.shape == temen_ir::ImportShape::Func(t))
+                    .unwrap_or_else(|| {
+                        self.imports.push(Import {
+                            name,
+                            shape: temen_ir::ImportShape::Func(t),
+                            mode: temen_ir::ImportMode::Required, // name-inline interning is required-mode
+                        });
+                        self.imports.len() - 1
+                    });
+                let handle = self.value(names)?;
+                let args = self.parse_value_list(names)?;
+                return Ok(Inst::CallSym {
+                    import: idx as u32,
+                    sig,
+                    handle,
+                    args,
+                });
+            }
+            if op == "call.sym" {
+                let import = self.parse_u32()?;
+                let sig = self.import_op_sig(import, 0)?;
+                let handle = self.value(names)?;
+                let args = self.parse_value_list(names)?;
+                return Ok(Inst::CallSym {
+                    import,
+                    sig,
+                    handle,
+                    args,
+                });
+            }
+            let import = self.parse_u32()?;
+            // Optional op selector: `.name` (resolved through the grouped import's
+            // interface) or `op <n>` (numeric). Absent = op 0 (the flat case).
+            let opidx = if matches!(self.peek(), Some(Tok::Dot)) {
+                self.next()?;
+                let opname = self.parse_ident()?;
+                self.resolve_import_op(import, &opname)?
+            } else if matches!(self.peek(), Some(Tok::Ident(k)) if k == "op") {
+                self.next()?;
+                self.parse_u32()?
+            } else {
+                0
+            };
+            let sig = self.import_op_sig(import, opidx)?;
+            let args = self.parse_value_list(names)?;
+            return Ok(Inst::CallImport {
+                import,
+                op: opidx,
+                sig,
+                args,
+            });
+        }
+        // Dynamic-mode dispatch by type-section reference (§3.5):
+        // `call.import.dyn <ty>[.<opname> | op <n>] v<handle> (args)`.
+        if op == "call.import.dyn" {
+            let ty = self.parse_u32()?;
+            let opidx = if matches!(self.peek(), Some(Tok::Dot)) {
+                self.next()?;
+                let opname = self.parse_ident()?;
+                self.resolve_iface_op(ty, &opname)?
+            } else if matches!(self.peek(), Some(Tok::Ident(k)) if k == "op") {
+                self.next()?;
+                self.parse_u32()?
+            } else {
+                0
+            };
+            let sig = self.iface_op_sig(ty, opidx)?;
+            let handle = self.value(names)?;
+            let args = self.parse_value_list(names)?;
+            return Ok(Inst::CallImportDyn {
+                ty,
+                op: opidx,
+                sig,
+                handle,
+                args,
+            });
+        }
+        if op == "export.handle" {
+            let export = self.parse_u32()?;
+            return Ok(Inst::ExportHandle { export });
+        }
+        if op == "cap.self.type_id" {
+            let ty = self.parse_u32()?;
+            return Ok(Inst::CapSelfTypeId { ty });
+        }
+        if op == "cap.self.covers" {
+            let handle = self.value(names)?;
+            let ty = self.parse_u32()?;
+            return Ok(Inst::CapSelfCovers { handle, ty });
+        }
+        if op == "ref.func" {
+            let n = self.parse_int()?;
+            let func = u32::try_from(n)
+                .map_err(|_| ParseError(format!("function index out of range: {n}")))?;
+            return Ok(Inst::RefFunc { func });
+        }
+        // Link-form data addresses: `data.sym "<name>" <addend>` (a cross-unit data symbol) and
+        // `data.self <offset>` (this unit's own data). Both yield an `i64` address; `link` rewrites
+        // them to `i64.const`. The name rides inline — there is no separate relocation table.
+        if op == "data.sym" {
+            let name = self.parse_str()?; // raw bytes (Copy-clone friendly Inst field)
+            let addend = self.parse_int()?;
+            return Ok(Inst::DataSym { name, addend });
+        }
+        if op == "data.self" {
+            let n = self.parse_int()?;
+            let offset = u64::try_from(n)
+                .map_err(|_| ParseError(format!("data.self offset out of range: {n}")))?;
+            return Ok(Inst::DataSelf { offset });
+        }
+        if op == "data.top" {
+            return Ok(Inst::DataTop);
+        }
+        // Phase-2 `import.attach <idx> v<handle>` (IMPORTS.md): rebind a rebindable import slot.
+        if op == "import.attach" {
+            let n = self.parse_int()?;
+            let import = u32::try_from(n)
+                .map_err(|_| ParseError(format!("import index out of range: {n}")))?;
+            let handle = self.value(names)?;
+            return Ok(Inst::ImportAttach { import, handle });
+        }
+        // §7 capability reflection intrinsics — sugar over `cap.call CAP_SELF op N`. The sugar text
+        // carries no dispatch handle; `cap_self_capcall` flags `parse_block` to materialize the
+        // ignored const-0 handle. (`cap.self.type_id`/`covers` carry a type-section index and stay
+        // typed ops — handled above.)
+        if op == "cap.self.count" {
+            return Ok(self.cap_self_capcall(
+                0,
+                FuncType {
+                    params: vec![],
+                    results: vec![ValType::I32],
+                },
+                vec![],
+            ));
+        }
+        if op == "cap.self.attest" {
+            return Ok(self.cap_self_capcall(
+                4,
+                FuncType {
+                    params: vec![],
+                    results: vec![ValType::I32],
+                },
+                vec![],
+            ));
+        }
+        if op == "cap.self.get" {
+            let idx = self.value(names)?;
+            return Ok(self.cap_self_capcall(
+                1,
+                FuncType {
+                    params: vec![ValType::I32],
+                    results: vec![ValType::I32, ValType::I32],
+                },
+                vec![idx],
+            ));
+        }
+        if op == "cap.self.resolve" {
+            let name_ptr = self.value(names)?;
+            let name_len = self.value(names)?;
+            return Ok(self.cap_self_capcall(
+                2,
+                FuncType {
+                    params: vec![ValType::I64, ValType::I64],
+                    results: vec![ValType::I32],
+                },
+                vec![name_ptr, name_len],
+            ));
+        }
+        if op == "cap.self.label" {
+            let handle = self.value(names)?;
+            let buf_ptr = self.value(names)?;
+            let buf_cap = self.value(names)?;
+            return Ok(self.cap_self_capcall(
+                3,
+                FuncType {
+                    params: vec![ValType::I32, ValType::I64, ValType::I64],
+                    results: vec![ValType::I32],
+                },
+                vec![handle, buf_ptr, buf_cap],
+            ));
+        }
+        // §12 per-vCPU TLS register.
+        if op == "vcpu.tls.get" {
+            return Ok(Inst::VcpuTlsGet);
+        }
+        if op == "durable.shadow_base" {
+            return Ok(Inst::DurableShadowBase);
+        }
+        if op == "vcpu.tls.set" {
+            let val = self.value(names)?;
+            return Ok(Inst::VcpuTlsSet { val });
+        }
+        if op == "call_indirect" {
+            let params = self.parse_type_list()?;
+            self.expect(&Tok::Arrow)?;
+            let results = self.parse_type_list()?;
+            let idx = self.value(names)?;
+            let args = self.parse_value_list(names)?;
+            return Ok(Inst::CallIndirect {
+                ty: FuncType { params, results },
+                idx,
+                args,
+            });
+        }
+        if op == "svc.poll" || op == "svc.wait" {
+            // §3.6 sugar over `cap.call CAP_SELF_TYPE_ID 9|10 () -> (i64) v<h> ()` — the
+            // service points, spelled greppably. The handle operand is carried but ignored.
+            let handle = self.value(names)?;
+            return Ok(Inst::CapCall {
+                type_id: temen_ir::CAP_SELF_TYPE_ID,
+                op: if op == "svc.poll" { 9 } else { 10 },
+                sig: temen_ir::FuncType {
+                    params: vec![],
+                    results: vec![ValType::I64],
+                },
+                handle,
+                args: vec![],
+            });
+        }
+        if op == "cap.call" {
+            let type_id = u32::try_from(self.parse_int()?)
+                .map_err(|_| ParseError("cap.call type_id out of range".into()))?;
+            let op_index = u32::try_from(self.parse_int()?)
+                .map_err(|_| ParseError("cap.call op index out of range".into()))?;
+            let params = self.parse_type_list()?;
+            self.expect(&Tok::Arrow)?;
+            let results = self.parse_type_list()?;
+            let handle = self.value(names)?;
+            let args = self.parse_value_list(names)?;
+            return Ok(Inst::CapCall {
+                type_id,
+                op: op_index,
+                sig: FuncType { params, results },
+                handle,
+                args,
+            });
+        }
+        if let Some(cv) = ConvOp::from_name(&op) {
+            return Ok(Inst::Convert {
+                op: cv,
+                a: self.value(names)?,
+            });
+        }
+        if let Some(o) = FToI::from_name(&op) {
+            return Ok(Inst::FToISat {
+                op: o,
+                a: self.value(names)?,
+            });
+        }
+        if let Some(o) = FToI::from_trap_name(&op) {
+            return Ok(Inst::FToITrap {
+                op: o,
+                a: self.value(names)?,
+            });
+        }
+        // Bulk-memory ops (D62): `mem.copy`/`mem.move`/`mem.fill` v{dst} v{src|val} v{len}.
+        if op == "mem.copy" || op == "mem.move" {
+            let dst = self.value(names)?;
+            let src = self.value(names)?;
+            let len = self.value(names)?;
+            return Ok(if op == "mem.copy" {
+                Inst::MemCopy { dst, src, len }
+            } else {
+                Inst::MemMove { dst, src, len }
+            });
+        }
+        if op == "mem.fill" {
+            let dst = self.value(names)?;
+            let val = self.value(names)?;
+            let len = self.value(names)?;
+            return Ok(Inst::MemFill { dst, val, len });
+        }
+        // §12 fibers (stack switching).
+        if op == "cont.new" {
+            let func = self.value(names)?;
+            let sp = self.value(names)?;
+            return Ok(Inst::ContNew { func, sp });
+        }
+        if op == "cont.resume" {
+            let k = self.value(names)?;
+            let arg = self.value(names)?;
+            return Ok(Inst::ContResume {
+                k,
+                arg,
+                block: false,
+            });
+        }
+        if op == "cont.resume.block" {
+            let k = self.value(names)?;
+            let arg = self.value(names)?;
+            return Ok(Inst::ContResume {
+                k,
+                arg,
+                block: true,
+            });
+        }
+        if op == "suspend" {
+            return Ok(Inst::Suspend {
+                value: self.value(names)?,
+            });
+        }
+        if op == "setjmp" {
+            return Ok(Inst::SetJmp {
+                buf: self.value(names)?,
+            });
+        }
+        if op == "longjmp" {
+            let buf = self.value(names)?;
+            let val = self.value(names)?;
+            return Ok(Inst::LongJmp { buf, val });
+        }
+        if op == "gc.roots" {
+            let heap_lo = self.value(names)?;
+            let heap_hi = self.value(names)?;
+            let mask = self.value(names)?;
+            let buf = self.value(names)?;
+            let cap = self.value(names)?;
+            return Ok(Inst::GcRoots {
+                heap_lo,
+                heap_hi,
+                mask,
+                buf,
+                cap,
+            });
+        }
+        // §12 real threads.
+        if op == "thread.spawn" {
+            let n = self.parse_int()?;
+            let func = u32::try_from(n)
+                .map_err(|_| ParseError(format!("function index out of range: {n}")))?;
+            let sp = self.value(names)?;
+            let arg = self.value(names)?;
+            return Ok(Inst::ThreadSpawn { func, sp, arg });
+        }
+        if op == "thread.join" {
+            return Ok(Inst::ThreadJoin {
+                handle: self.value(names)?,
+            });
+        }
+        if op == "atomic.notify" {
+            let addr = self.value(names)?;
+            let count = self.value(names)?;
+            return Ok(Inst::MemoryNotify { addr, count });
+        }
+        if let Some(tail) = op.strip_prefix("atomic.fence") {
+            let order = if tail.is_empty() {
+                Ordering::SeqCst
+            } else {
+                Ordering::from_name(tail.strip_prefix('.').unwrap_or(tail))
+                    .ok_or_else(|| ParseError(format!("unknown fence ordering: {op}")))?
+            };
+            return Ok(Inst::AtomicFence { order });
+        }
+        if let Some(o) = IToF::from_name(&op) {
+            return Ok(Inst::IToFConv {
+                op: o,
+                a: self.value(names)?,
+            });
+        }
+        if let Some(o) = CastOp::from_name(&op) {
+            return Ok(Inst::Cast {
+                op: o,
+                a: self.value(names)?,
+            });
+        }
+        if let Some(o) = LoadOp::from_name(&op) {
+            let addr = self.value(names)?;
+            let offset = self.parse_memarg()?;
+            return Ok(Inst::Load {
+                op: o,
+                addr,
+                offset,
+            });
+        }
+        if let Some(o) = StoreOp::from_name(&op) {
+            let addr = self.value(names)?;
+            let value = self.value(names)?;
+            let offset = self.parse_memarg()?;
+            return Ok(Inst::Store {
+                op: o,
+                addr,
+                value,
+                offset,
+            });
+        }
+        // §12 atomics: `<ty>.atomic.<load|store|cmpxchg|rmw.<op>>`.
+        if let Some(rest) = op.strip_prefix("i32.atomic.") {
+            return self.parse_atomic(IntTy::I32, rest, names);
+        }
+        if let Some(rest) = op.strip_prefix("i64.atomic.") {
+            return self.parse_atomic(IntTy::I64, rest, names);
+        }
+
+        // ----- §17 SIMD (D58) -----
+        if op == "v128.const" {
+            let bytes = self.parse_byte16()?;
+            return Ok(Inst::ConstV128(bytes));
+        }
+        if op == "v128.load" {
+            let addr = self.value(names)?;
+            let offset = self.parse_memarg()?;
+            return Ok(Inst::V128Load { addr, offset });
+        }
+        if op == "v128.store" {
+            let addr = self.value(names)?;
+            let value = self.value(names)?;
+            let offset = self.parse_memarg()?;
+            return Ok(Inst::V128Store {
+                addr,
+                value,
+                offset,
+            });
+        }
+        if op == "v128.not" {
+            return Ok(Inst::VNot {
+                a: self.value(names)?,
+            });
+        }
+        if op == "v128.any_true" {
+            return Ok(Inst::VAnyTrue {
+                a: self.value(names)?,
+            });
+        }
+        if op == "i8x16.popcnt" {
+            return Ok(Inst::VPopcnt {
+                a: self.value(names)?,
+            });
+        }
+        if op == "i32x4.dot_i16x8_s" {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VDot { a, b });
+        }
+        if op == "i16x8.dot_i8x16_s" {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VDotI8 { a, b });
+        }
+        if op == "i16x8.q15mulr_sat_s" {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VQ15MulrSat { a, b });
+        }
+        // Conversions are whole-instruction mnemonics (source/result shapes differ).
+        if let Some(o) = VCvtOp::from_name(op.as_str()) {
+            return Ok(Inst::VConvert {
+                op: o,
+                a: self.value(names)?,
+            });
+        }
+        if op == "v128.bitselect" {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            let mask = self.value(names)?;
+            return Ok(Inst::Bitselect { a, b, mask });
+        }
+        if let Some(s) = op.strip_prefix("v128.") {
+            if let Some(o) = VBitBinOp::from_name(s) {
+                let a = self.value(names)?;
+                let b = self.value(names)?;
+                return Ok(Inst::VBitBin { op: o, a, b });
+            }
+        }
+        if op == "i8x16.shuffle" {
+            let lanes = self.parse_byte16()?;
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::Shuffle { lanes, a, b });
+        }
+        if op == "i8x16.swizzle" {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::Swizzle { a, b });
+        }
+        if let Some((sh, suffix)) = op
+            .split_once('.')
+            .and_then(|(p, s)| VShape::from_name(p).map(|sh| (sh, s)))
+        {
+            return self.parse_shape_inst(sh, suffix, &op, names);
+        }
+
+        let (prefix, suffix) = op
+            .split_once('.')
+            .ok_or_else(|| ParseError(format!("unknown opcode `{op}`")))?;
+        match prefix {
+            "i32" => self.parse_int_inst(IntTy::I32, suffix, &op, names),
+            "i64" => self.parse_int_inst(IntTy::I64, suffix, &op, names),
+            "f32" => self.parse_float_inst(FloatTy::F32, suffix, &op, names),
+            "f64" => self.parse_float_inst(FloatTy::F64, suffix, &op, names),
+            _ => err(format!("unknown opcode `{op}`")),
+        }
+    }
+
+    /// Parse a `<shape>.<suffix>` SIMD op (splat/extract_lane/replace_lane and the
+    /// lane-wise int/float arithmetic). The whole-vector bitwise ops, `v128.const`,
+    /// load/store, shuffle/swizzle are matched by full name in [`Self::parse_inst`].
+    fn parse_shape_inst(
+        &mut self,
+        shape: VShape,
+        suffix: &str,
+        op: &str,
+        names: &HashMap<String, u32>,
+    ) -> Result<Inst, ParseError> {
+        if suffix == "splat" {
+            return Ok(Inst::Splat {
+                shape,
+                a: self.value(names)?,
+            });
+        }
+        if suffix == "all_true" {
+            return Ok(Inst::VAllTrue {
+                shape,
+                a: self.value(names)?,
+            });
+        }
+        if suffix == "bitmask" {
+            return Ok(Inst::VBitmask {
+                shape,
+                a: self.value(names)?,
+            });
+        }
+        // `extract_lane[_s|_u] <lane> v<a>` — the sign suffix is only meaningful for narrow
+        // integer shapes; accept (and ignore) it elsewhere only if absent.
+        if let Some(rest) = suffix.strip_prefix("extract_lane") {
+            let signed = match rest {
+                "" => true, // wide shapes: extraction is exact; `signed` is unused
+                "_s" => true,
+                "_u" => false,
+                _ => return err(format!("unknown opcode `{op}`")),
+            };
+            let lane = u8::try_from(self.parse_int()?)
+                .map_err(|_| ParseError(format!("lane index out of range in `{op}`")))?;
+            let a = self.value(names)?;
+            return Ok(Inst::ExtractLane {
+                shape,
+                lane,
+                signed,
+                a,
+            });
+        }
+        if suffix == "replace_lane" {
+            let lane = u8::try_from(self.parse_int()?)
+                .map_err(|_| ParseError(format!("lane index out of range in `{op}`")))?;
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::ReplaceLane { shape, lane, a, b });
+        }
+        // Dispatch the lane-arithmetic suffix by shape category — `add`/`sub`/`mul` name both an
+        // integer and a float op, so the shape decides which (a float op on an int shape, or vice
+        // versa, is then rejected at verify, not silently mis-parsed).
+        if shape.is_float() {
+            if let Some(o) = VFloatBinOp::from_name(suffix) {
+                let a = self.value(names)?;
+                let b = self.value(names)?;
+                return Ok(Inst::VFloatBin { shape, op: o, a, b });
+            }
+            if let Some(o) = VFloatUnOp::from_name(suffix) {
+                return Ok(Inst::VFloatUn {
+                    shape,
+                    op: o,
+                    a: self.value(names)?,
+                });
+            }
+            if let Some(o) = VFCmpOp::from_name(suffix) {
+                let a = self.value(names)?;
+                let b = self.value(names)?;
+                return Ok(Inst::VFloatCmp { shape, op: o, a, b });
+            }
+            if let Some(o) = VPMinMaxOp::from_name(suffix) {
+                let a = self.value(names)?;
+                let b = self.value(names)?;
+                return Ok(Inst::VPMinMax { shape, op: o, a, b });
+            }
+            if suffix == "fma" || suffix == "fnma" {
+                let a = self.value(names)?;
+                let b = self.value(names)?;
+                let c = self.value(names)?;
+                return Ok(Inst::VFma {
+                    shape,
+                    neg: suffix == "fnma",
+                    a,
+                    b,
+                    c,
+                });
+            }
+        } else if let Some(o) = VIntBinOp::from_name(suffix) {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VIntBin { shape, op: o, a, b });
+        } else if let Some(o) = VICmpOp::from_name(suffix) {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VIntCmp { shape, op: o, a, b });
+        } else if let Some(o) = VShiftOp::from_name(suffix) {
+            let a = self.value(names)?;
+            let amt = self.value(names)?;
+            return Ok(Inst::VShift {
+                shape,
+                op: o,
+                a,
+                amt,
+            });
+        } else if let Some(o) = VIntUnOp::from_name(suffix) {
+            return Ok(Inst::VIntUn {
+                shape,
+                op: o,
+                a: self.value(names)?,
+            });
+        } else if let Some(o) = VSatBinOp::from_name(suffix) {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VSatBin { shape, op: o, a, b });
+        } else if let Some(o) = VWidenOp::from_name(suffix) {
+            return Ok(Inst::VWiden {
+                shape,
+                op: o,
+                a: self.value(names)?,
+            });
+        } else if let Some(o) = VNarrowOp::from_name(suffix) {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VNarrow { shape, op: o, a, b });
+        } else if suffix == "avgr_u" {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VAvgr { shape, a, b });
+        } else if let Some(rest) = suffix.strip_prefix("extmul_") {
+            // rest = "<low|high>_<src-shape>_<s|u>"; the src shape is redundant (= shape.narrower).
+            let parts: Vec<&str> = rest.split('_').collect();
+            if let [half, _src, sign] = parts[..] {
+                let widen = match (half, sign) {
+                    ("low", "s") => Some(VWidenOp::LowS),
+                    ("low", "u") => Some(VWidenOp::LowU),
+                    ("high", "s") => Some(VWidenOp::HighS),
+                    ("high", "u") => Some(VWidenOp::HighU),
+                    _ => None,
+                };
+                if let Some(op_w) = widen {
+                    let a = self.value(names)?;
+                    let b = self.value(names)?;
+                    return Ok(Inst::VExtMul {
+                        shape,
+                        op: op_w,
+                        a,
+                        b,
+                    });
+                }
+            }
+        } else if let Some(rest) = suffix.strip_prefix("extadd_pairwise_") {
+            // rest = "<src-shape>_<s|u>"; src shape is redundant (= shape.narrower).
+            if let Some(sign) = rest.rsplit('_').next() {
+                let signed = match sign {
+                    "s" => Some(true),
+                    "u" => Some(false),
+                    _ => None,
+                };
+                if let Some(signed) = signed {
+                    return Ok(Inst::VExtAddPairwise {
+                        shape,
+                        signed,
+                        a: self.value(names)?,
+                    });
+                }
+            }
+        }
+        err(format!("unknown opcode `{op}`"))
+    }
+
+    /// Parse exactly 16 byte (`0..=255`) integer tokens into a `[u8; 16]` — the operand
+    /// of `v128.const` (value bytes) and `i8x16.shuffle` (byte indices).
+    fn parse_byte16(&mut self) -> Result<[u8; 16], ParseError> {
+        let mut bytes = [0u8; 16];
+        for slot in &mut bytes {
+            let v = self.parse_int()?;
+            *slot = u8::try_from(v).map_err(|_| ParseError(format!("byte out of range: {v}")))?;
+        }
+        Ok(bytes)
+    }
+
+    fn parse_int_inst(
+        &mut self,
+        ty: IntTy,
+        suffix: &str,
+        op: &str,
+        names: &HashMap<String, u32>,
+    ) -> Result<Inst, ParseError> {
+        if suffix == "const" {
+            let v = self.parse_int()?;
+            return Ok(match ty {
+                // An `i32.const` is a 32-bit pattern: accept both the signed-`i32` range and the
+                // unsigned-`u32` range (e.g. `4294967295` = `0xFFFFFFFF` = `-1`), as a C frontend
+                // emits unsigned constants like `0xFFFFFFFF`/`UINT32_MAX` by value.
+                IntTy::I32 => Inst::ConstI32(
+                    i32::try_from(v)
+                        .or_else(|_| u32::try_from(v).map(|u| u as i32))
+                        .map_err(|_| ParseError(format!("i32 const out of range: {v}")))?,
+                ),
+                IntTy::I64 => Inst::ConstI64(v),
+            });
+        }
+        if suffix == "eqz" {
+            return Ok(Inst::Eqz {
+                ty,
+                a: self.value(names)?,
+            });
+        }
+        if let Some(o) = IntUnOp::from_name(suffix) {
+            return Ok(Inst::IntUn {
+                ty,
+                op: o,
+                a: self.value(names)?,
+            });
+        }
+        if let Some(o) = BinOp::from_name(suffix) {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::IntBin { ty, op: o, a, b });
+        }
+        if let Some(o) = CmpOp::from_name(suffix) {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::IntCmp { ty, op: o, a, b });
+        }
+        err(format!("unknown opcode `{op}`"))
+    }
+
+    fn parse_float_inst(
+        &mut self,
+        ty: FloatTy,
+        suffix: &str,
+        op: &str,
+        names: &HashMap<String, u32>,
+    ) -> Result<Inst, ParseError> {
+        if suffix == "const" {
+            let v = self.parse_float()?;
+            return Ok(match ty {
+                FloatTy::F32 => Inst::ConstF32((v as f32).to_bits()),
+                FloatTy::F64 => Inst::ConstF64(v.to_bits()),
+            });
+        }
+        if let Some(o) = FBinOp::from_name(suffix) {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::FBin { ty, op: o, a, b });
+        }
+        if let Some(o) = FUnOp::from_name(suffix) {
+            return Ok(Inst::FUn {
+                ty,
+                op: o,
+                a: self.value(names)?,
+            });
+        }
+        if suffix == "fma" {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            let c = self.value(names)?;
+            return Ok(Inst::Fma { ty, a, b, c });
+        }
+        if let Some(o) = FCmpOp::from_name(suffix) {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::FCmp { ty, op: o, a, b });
+        }
+        err(format!("unknown opcode `{op}`"))
+    }
+
+    fn parse_term(&mut self, names: &HashMap<String, u32>) -> Result<PTerm, ParseError> {
+        let kw = self.ident()?;
+        Ok(match kw.as_str() {
+            "br" => PTerm::Br(self.parse_edge(names)?),
+            "br_if" => {
+                let cond = self.value(names)?;
+                let then = self.parse_edge(names)?;
+                let els = self.parse_edge(names)?;
+                PTerm::BrIf { cond, then, els }
+            }
+            "br_table" => {
+                let idx = self.value(names)?;
+                self.expect(&Tok::LBracket)?;
+                let mut targets = Vec::new();
+                while self.peek() != Some(&Tok::RBracket) {
+                    if !targets.is_empty() {
+                        self.expect(&Tok::Comma)?;
+                    }
+                    targets.push(self.parse_edge(names)?);
+                }
+                self.expect(&Tok::RBracket)?;
+                let default = self.parse_edge(names)?;
+                PTerm::BrTable {
+                    idx,
+                    targets,
+                    default,
+                }
+            }
+            "unreachable" => PTerm::Unreachable,
+            "return_call" => {
+                let n = self.parse_int()?;
+                let func = u32::try_from(n)
+                    .map_err(|_| ParseError(format!("function index out of range: {n}")))?;
+                let args = self.parse_value_list(names)?;
+                PTerm::ReturnCall { func, args }
+            }
+            "return_call_indirect" => {
+                let params = self.parse_type_list()?;
+                self.expect(&Tok::Arrow)?;
+                let results = self.parse_type_list()?;
+                let idx = self.value(names)?;
+                let args = self.parse_value_list(names)?;
+                PTerm::ReturnCallIndirect {
+                    ty: FuncType { params, results },
+                    idx,
+                    args,
+                }
+            }
+            "return" => {
+                let mut vals = Vec::new();
+                // Comma-separated value list; a return ends the block, so any ident
+                // that is not a known value name starts the next block — stop there.
+                while let Some(Tok::Ident(s)) = self.peek() {
+                    if !names.contains_key(s) {
+                        break;
+                    }
+                    vals.push(self.value(names)?);
+                    if self.peek() == Some(&Tok::Comma) {
+                        self.pos += 1;
+                    }
+                }
+                PTerm::Return(vals)
+            }
+            other => return err(format!("unknown terminator `{other}`")),
+        })
+    }
+
+    /// Parse `label(arg, arg, ...)`.
+    fn parse_edge(&mut self, names: &HashMap<String, u32>) -> Result<PEdge, ParseError> {
+        // §3.5 surface: numeric targets (`br 1 (…)`) — the label is the index's decimal
+        // string, matching braced `block N` headers. Legacy ident labels stay accepted.
+        let label = if matches!(self.peek(), Some(Tok::Int(_))) {
+            self.parse_int()?.to_string()
+        } else {
+            self.ident()?
+        };
+        let args = self.parse_value_list(names)?;
+        Ok((label, args))
+    }
+
+    /// Parse a parenthesized, comma-separated value list `(v, v, ...)`.
+    fn parse_value_list(&mut self, names: &HashMap<String, u32>) -> Result<Vec<u32>, ParseError> {
+        let mut args = Vec::new();
+        self.expect(&Tok::LParen)?;
+        while self.peek() != Some(&Tok::RParen) {
+            if !args.is_empty() {
+                self.expect(&Tok::Comma)?;
+            }
+            args.push(self.value(names)?);
+        }
+        self.expect(&Tok::RParen)?;
+        Ok(args)
+    }
+
+    fn value(&mut self, names: &HashMap<String, u32>) -> Result<u32, ParseError> {
+        let n = self.ident()?;
+        names
+            .get(&n)
+            .copied()
+            .ok_or_else(|| ParseError(format!("unknown value `{n}`")))
+    }
+
+    fn parse_int(&mut self) -> Result<i64, ParseError> {
+        match self.next()? {
+            Tok::Int(v) => Ok(*v),
+            other => err(format!("expected integer, found {other:?}")),
+        }
+    }
+
+    /// Parse a non-negative integer that fits in `u32` (debug-info indices/lines).
+    fn parse_u32(&mut self) -> Result<u32, ParseError> {
+        let v = self.parse_int()?;
+        u32::try_from(v).map_err(|_| ParseError(format!("expected a u32, found {v}")))
+    }
+
+    /// Parse a non-negative integer as `u64` (a global's fixed window address).
+    fn parse_u64(&mut self) -> Result<u64, ParseError> {
+        let v = self.parse_int()?;
+        u64::try_from(v)
+            .map_err(|_| ParseError(format!("expected a non-negative address, found {v}")))
+    }
+
+    /// Parse a bare identifier token (e.g. a `debug.var` location kind).
+    fn parse_ident(&mut self) -> Result<String, ParseError> {
+        match self.next()? {
+            Tok::Ident(s) => Ok(s.clone()),
+            other => err(format!("expected an identifier, found {other:?}")),
+        }
+    }
+
+    /// Parse a byte-string literal (data-segment bytes).
+    fn parse_str(&mut self) -> Result<Vec<u8>, ParseError> {
+        match self.next()? {
+            Tok::Str(b) => Ok(b.clone()),
+            other => err(format!("expected a string, found {other:?}")),
+        }
+    }
+
+    /// Parse the optional `offset=<int>` / `align=<int>` suffix of a memory op
+    /// (either order, both optional; defaults 0).
+    /// Parse the optional `offset=` memarg suffix. The `align=` suffix was removed at the wire rev
+    /// (the alignment hint was write-only); an explicit `align=` is now a **parse error**
+    /// (fail-closed) rather than a silently-ignored token.
+    fn parse_memarg(&mut self) -> Result<u64, ParseError> {
+        let mut offset = 0u64;
+        while let Some(Tok::Ident(s)) = self.peek() {
+            let key = s.clone();
+            match key.as_str() {
+                "offset" => {
+                    self.next()?;
+                    self.expect(&Tok::Equals)?;
+                    let v = self.parse_int()?;
+                    offset = u64::try_from(v)
+                        .map_err(|_| ParseError(format!("offset out of range: {v}")))?;
+                }
+                "align" => {
+                    return Err(ParseError(
+                        "`align=` memarg is no longer accepted (the alignment hint left the wire \
+                         at the wire rev)"
+                            .into(),
+                    ));
+                }
+                _ => break,
+            }
+        }
+        Ok(offset)
+    }
+
+    /// A float literal — accepts an integer token too (e.g. `f64.const 2`).
+    fn parse_float(&mut self) -> Result<f64, ParseError> {
+        match self.next()? {
+            Tok::Float(v) => Ok(*v),
+            Tok::Int(v) => Ok(*v as f64),
+            // Non-finite literals, as the printer's `{:?}` emits them (`inf` / `NaN`; the
+            // lexer handles `-inf`). All NaN text is the canonical quiet NaN — payload bits
+            // do not survive text (binary is the lossless carrier).
+            Tok::Ident(s) if s == "inf" => Ok(f64::INFINITY),
+            Tok::Ident(s) if s == "NaN" => Ok(f64::NAN),
+            other => err(format!("expected number, found {other:?}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod retired_forms {
+    use super::*;
+
+    // The pre-§3.5 dual grammars are retired: each spelling is a parse error, pinned
+    // here so a legacy path cannot quietly grow back.
+    #[test]
+    fn legacy_spellings_are_rejected() {
+        // `blockN(...):` indentation labels.
+        assert!(parse_module("func () -> () {\nblock0():\n  return\n}\n").is_err());
+        // Unindexed `export "name" N`.
+        assert!(parse_module(
+            "export \"main\" 0\nfunc () -> () {\nblock 0 () {\n  return\n  }\n}\n"
+        )
+        .is_err());
+        // The `impl` offer spelling.
+        assert!(parse_module(concat!(
+            "type 0 func () -> ()\ntype 1 interface { f: 0 }\n",
+            "export \"x\" impl 1 : 0\n",
+            "func () -> () {\nblock 0 () {\n  return\n  }\n}\n"
+        ))
+        .is_err());
+        // Name-inline under `call.import` (the streaming spelling is `call.sym`).
+        assert!(parse_module(concat!(
+            "func (i32) -> () {\nblock 0 (v0: i32) {\n",
+            "  call.import \"exit\" (i32) -> () v0 (v0)\n  unreachable\n  }\n}\n"
+        ))
+        .is_err());
+        // The retired pre-v8 handle operand on an indexed `call.import`.
+        assert!(parse_module(concat!(
+            "import 0 \"exit\" (i32) -> ()\n",
+            "func (i32) -> () {\nblock 0 (v0: i32) {\n",
+            "  call.import 0 v0 (v0)\n  unreachable\n  }\n}\n"
+        ))
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+mod import_text_tests {
+    use super::*;
+    use temen_ir::{Inst, ResolvedCap};
+
+    const SRC: &str = "\
+memory 16
+import 0 \"write\" (i64, i64) -> (i64)
+import 1 \"exit\" (i32) -> ()
+
+func (i32) -> () {
+block 0 (v0: i32) {
+  v1 = i64.const 0
+  v2 = i64.const 3
+  v3 = call.import 0 (v1, v2)
+  v4 = i32.const 0
+  call.import 1 (v4)
+  return
+  }
+}
+";
+
+    #[test]
+    fn imports_round_trip() {
+        let m = parse_module(SRC).expect("parse");
+        assert_eq!(m.imports.len(), 2);
+        assert_eq!(m.imports[0].name, "write");
+        assert_eq!(m.imports[1].name, "exit");
+        // The body carries two CallImports, sigs recovered from the import table.
+        let insts = &m.funcs[0].blocks[0].insts;
+        let imports: Vec<_> = insts
+            .iter()
+            .filter_map(|i| match i {
+                Inst::CallImport { import, .. } => Some(*import),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(imports, vec![0, 1]);
+        // Print → re-parse is identity.
+        let printed = print_module(&m);
+        let m2 = parse_module(&printed).expect("reparse");
+        assert_eq!(m, m2, "import syntax must round-trip");
+    }
+
+    #[test]
+    fn exports_round_trip() {
+        let src = "\
+export 0 func \"main\" 1
+export 1 func \"helper\" 0
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  return v0
+  }
+}
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  return v0
+  }
+}
+";
+        let m = parse_module(src).expect("parse");
+        assert_eq!(m.exports.len(), 2);
+        assert_eq!(m.resolve_export("main"), Some(1));
+        assert_eq!(m.resolve_export("helper"), Some(0));
+        // Print → re-parse is identity (exports preserved in declaration order).
+        let m2 = parse_module(&print_module(&m)).expect("reparse");
+        assert_eq!(m, m2, "export syntax must round-trip");
+    }
+
+    #[test]
+    fn impl_exports_round_trip() {
+        // Interface offers, §3.5 surface plus the legacy `impl` sugar — the settled form is
+        // `export <idx> interface "<name>" <t> { op: funcidx, ... }` with required op names.
+        let src = "\
+type 0 func (i64) -> (i64)
+type 1 interface { put: 0, get: 0 }
+export 0 func \"main\" 0
+export 0 interface \"logger\" 1 { put: 1, get: 0 }
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  return v0
+  }
+}
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  return v0
+  }
+}
+";
+        let m = parse_module(src).expect("parse");
+        assert_eq!(m.exports.len(), 1);
+        assert_eq!(m.impl_exports.len(), 1);
+        let offer = m.resolve_impl_export("logger").expect("offer");
+        assert_eq!(offer.ops, vec![1, 0]);
+        assert!(!offer.threaded, "policy defaults to single when undeclared");
+        // Print → re-parse is identity (offers preserved in declaration and op order).
+        let m2 = parse_module(&print_module(&m)).expect("reparse");
+        assert_eq!(m, m2, "impl export syntax must round-trip");
+
+        // CALLS.md 7.4 — the `threaded` policy keyword parses, resolves, and round-trips.
+        let src_t = src.replace(
+            "export 0 interface \"logger\" 1",
+            "export 0 interface \"logger\" threaded 1",
+        );
+        let mt = parse_module(&src_t).expect("threaded parses");
+        assert!(
+            mt.resolve_impl_export("logger").expect("offer").threaded,
+            "the declared policy is carried"
+        );
+        let mt2 = parse_module(&print_module(&mt)).expect("threaded reparse");
+        assert_eq!(mt, mt2, "the threaded keyword must round-trip");
+    }
+
+    #[test]
+    fn auto_debug_synthesizes_a_line_table_and_named_ssa_values() {
+        let src = "\
+func () -> (i64) {
+block 0 () {
+  vn = i64.const 5
+  vacc0 = i64.const 0
+  br 1(vn, vacc0)
+}
+block 1 (vi: i64, vacc: i64) {
+  vsum = i64.add vacc vi
+  vone = i64.const 1
+  vnext = i64.sub vi vone
+  br_if vnext 1(vnext, vsum) 2(vsum)
+}
+block 2 (vr: i64) {
+  return vr
+  }
+}
+";
+        // Plain parse leaves a program with no `debug` section as `None` (unchanged behavior).
+        assert!(parse_module(src).unwrap().debug_info.is_none());
+
+        // The debug parse synthesizes a source-named line table + SSA-value table.
+        let di = parse_module_debug(src)
+            .unwrap()
+            .debug_info
+            .expect("auto debug info");
+        assert_eq!(di.files, vec![AUTO_DEBUG_FILE.to_string()]);
+
+        // block1 inst0 (`vsum = i64.add`) is on source line 8; inst2 (`vnext = i64.sub`) on line 10.
+        let loc = |b, i| {
+            di.locs
+                .iter()
+                .find(|l| l.func == 0 && l.block == b && l.inst == i)
+                .unwrap()
+        };
+        assert_eq!(loc(1, 0).line, 8);
+        assert_eq!(loc(1, 2).line, 10);
+
+        // Loop params i/acc are ssa 0/1, live from the block header (line 7); the result `vsum`
+        // (block-local index 2) is scoped from just after its defining line (8 → 9).
+        let var = |n: &str| di.vars.iter().find(|v| v.name == n).unwrap();
+        assert!(matches!(var("vi").loc, VarLoc::Ssa { value: 0 }));
+        assert_eq!(var("vi").scope.unwrap().0, 7);
+        assert!(matches!(var("vacc").loc, VarLoc::Ssa { value: 1 }));
+        assert!(matches!(var("vsum").loc, VarLoc::Ssa { value: 2 }));
+        assert_eq!(var("vsum").scope.unwrap().0, 9);
+    }
+
+    // The linker's Cap lowering (IMPORTS.md §2.5: `resolve_imports_with` survives in the linker
+    // only) over parsed text IR — the parse → link integration, not an instantiation path.
+    // The link-form spelling is `call.sym` (indexed `call.import` is the manifest call, which
+    // the linker never touches); the symbolic call carries the live handle operand.
+    #[test]
+    fn linker_lowers_parsed_imports_to_capcalls() {
+        let src = "\
+memory 16
+import 0 \"write\" (i64, i64) -> (i64)
+import 1 \"exit\" (i32) -> ()
+
+func (i32) -> () {
+block 0 (v0: i32) {
+  v1 = i64.const 0
+  v2 = i64.const 3
+  v3 = call.sym 0 v0 (v1, v2)
+  v4 = i32.const 0
+  call.sym 1 v0 (v4)
+  return
+  }
+}
+";
+        let m = parse_module(src).expect("parse");
+        let r = temen_ir::resolve_imports_with(&m, |n| match n {
+            "write" => Some(temen_ir::Resolved::Cap(ResolvedCap { type_id: 0, op: 1 })),
+            "exit" => Some(temen_ir::Resolved::Cap(ResolvedCap { type_id: 1, op: 0 })),
+            _ => None,
+        })
+        .expect("resolve");
+        assert!(r.imports.is_empty());
+        let insts = &r.funcs[0].blocks[0].insts;
+        assert!(!insts.iter().any(|i| matches!(i, Inst::CallSym { .. })));
+        // write → cap.call 0 1, exit → cap.call 1 0.
+        let caps: Vec<_> = insts
+            .iter()
+            .filter_map(|i| match i {
+                Inst::CapCall { type_id, op, .. } => Some((*type_id, *op)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(caps, vec![(0, 1), (1, 0)]);
+    }
+}
+
+#[cfg(test)]
+mod import_inline_tests {
+    use super::*;
+    use temen_ir::Inst;
+
+    // Name-inline `call.sym "name" (sig) v<h> (args)` — the streaming form — needs no
+    // `import` declaration: the parser interns the name and yields a `CallSym`. Two sites
+    // with the same name+sig share one import index.
+    #[test]
+    fn name_inline_interns_imports() {
+        let src = "\
+func (i32) -> () {
+block 0 (v0: i32) {
+  v1 = i64.const 0
+  v2 = i64.const 3
+  v3 = call.sym \"write\" (i64, i64) -> (i64) v0 (v1, v2)
+  v4 = call.sym \"write\" (i64, i64) -> (i64) v0 (v1, v2)
+  v5 = i32.const 0
+  call.sym \"exit\" (i32) -> () v0 (v5)
+  return
+  }
+}
+";
+        let m = parse_module(src).expect("parse name-inline imports");
+        // Two distinct names → two interned imports; the repeated "write" reuses index 0.
+        assert_eq!(m.imports.len(), 2);
+        assert_eq!(m.imports[0].name, "write");
+        assert_eq!(m.imports[1].name, "exit");
+        let idxs: Vec<u32> = m.funcs[0].blocks[0]
+            .insts
+            .iter()
+            .filter_map(|i| match i {
+                Inst::CallSym { import, .. } => Some(*import),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(idxs, vec![0, 0, 1], "repeated write shares index 0");
+        // Canonical print → re-parse is identity (printer emits `call.sym` + decls).
+        assert_eq!(parse_module(&print_module(&m)).unwrap(), m);
+    }
+
+    #[test]
+    fn debug_fnames_round_trip() {
+        // The §6 function-name table parses, populates `debug_info.func_names`, and survives a
+        // print → re-parse round trip (the `debug.fname <func> "<name>"` directive).
+        let src = "\
+func (i32) -> (i32) {
+block 0 (v0: i32) {
+  return v0
+  }
+}
+func (i32) -> (i32) {
+block 0 (v0: i32) {
+  return v0
+  }
+}
+debug.file 0 \"a.c\"
+debug.fname 0 \"compute\"
+debug.fname 1 \"helper\"
+debug.loc 0 0 0 0 7 5
+";
+        let m = parse_module(src).expect("parse debug.fname");
+        let di = m.debug_info.as_ref().expect("module carries debug info");
+        assert_eq!(di.func_names.len(), 2);
+        assert_eq!(
+            (di.func_names[0].func, di.func_names[0].name.as_str()),
+            (0, "compute")
+        );
+        assert_eq!(
+            (di.func_names[1].func, di.func_names[1].name.as_str()),
+            (1, "helper")
+        );
+        assert_eq!(
+            parse_module(&print_module(&m)).unwrap(),
+            m,
+            "print → re-parse is identity"
+        );
+    }
+
+    #[test]
+    fn debug_info_with_only_func_names_survives_text_round_trip() {
+        // Regression (nightly `roundtrip` fuzz, input `[83,86,77,0,10,0,…,1,42,0]`): a module whose
+        // `debug_info` carries *only* a `func_names` entry (every other table empty) must still print
+        // its debug section, so `parse ∘ print = id`. The printer's emptiness guard used to check the
+        // other five `DebugInfo` fields but not `func_names`, so it emitted nothing and the round-trip
+        // collapsed `Some(DebugInfo { func_names: [..] })` to `None` — the I47 class, one field over.
+        let m = Module {
+            debug_info: Some(DebugInfo {
+                func_names: vec![FuncName {
+                    func: 42,
+                    name: String::new(),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_module(&print_module(&m)).unwrap(),
+            m,
+            "a func_names-only debug section must round-trip through text"
+        );
+    }
+}

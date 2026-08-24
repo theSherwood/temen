@@ -1,0 +1,12988 @@
+//! Translator tests: compile C through *stock clang* to legalized textual `.ll`, translate it to Temen
+//! IR, **verify** it (the untrusted-frontend re-check, §2a), and run it on **both** the reference
+//! interpreter and the Cranelift JIT — asserting they agree with each other and with the
+//! hand-computed result. This is the chibicc-as-oracle differential (LLVM.md §5) plus the §18
+//! interp↔JIT differential, applied to the LLVM on-ramp.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use temen_interp::Value;
+use temen_ir::ValType;
+use temen_jit::JitOutcome;
+
+/// Compile a C snippet to legalized LLVM **bitcode** (`.bc`) — retained only for the `.bc`↔`.ll`
+/// reader **parity** tests ([`assert_ll_parity`]), which need a genuine bitcode input to compare the
+/// `llvm-dis` shim against the in-house textual reader. Every other test compiles to textual `.ll`
+/// via [`compile_to_ll`] and translates through [`temen_llvm::translate_ll_path`] (the direction the
+/// on-ramp is developed on). `None` (skip, don't fail) when `clang` is unavailable.
+fn compile_to_bc(name: &str, src: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("temen_llvm_{}_{}.c", std::process::id(), name));
+    let bc = dir.join(format!("temen_llvm_{}_{}.bc", std::process::id(), name));
+    std::fs::write(&c, src).expect("write C source");
+    let status = Command::new("clang")
+        .args(["-O2", "-emit-llvm", "-c"])
+        .arg(&c)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(bc),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
+/// Compile a C snippet to legalized textual `.ll` **with debug info** (`-g`). Uses `-Og` (optimize for
+/// debugging): mem2reg/SROA still run — so scalars arrive promoted, the legalized shape the on-ramp
+/// needs — while the per-statement line table is preserved (`-O2` collapses a tiny function's lines
+/// onto one). So the §6 source-line ingest can be exercised against real, multi-line clang debug
+/// metadata. `None` (skip) if clang is unavailable.
+fn compile_to_ll_g(name: &str, src: &str) -> Option<PathBuf> {
+    compile_g(name, src, "-Og")
+}
+
+/// Compile at `-O0 -g`: every C local stays an `alloca` + `llvm.dbg.declare`, the shape the §6
+/// **variable** ingest reads (a `dbg.declare` → a `Window` frame slot). `None` (skip) if clang is
+/// unavailable.
+fn compile_to_ll_o0g(name: &str, src: &str) -> Option<PathBuf> {
+    compile_g(name, src, "-O0")
+}
+
+fn compile_g(name: &str, src: &str, opt: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("temen_llvm_g_{}_{}.c", std::process::id(), name));
+    let bc = dir.join(format!("temen_llvm_g_{}_{}.ll", std::process::id(), name));
+    std::fs::write(&c, src).expect("write C source");
+    let status = Command::new("clang")
+        .args([opt, "-g", "-emit-llvm", "-S"])
+        .arg(&c)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(bc),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
+fn to_slot(v: &Value) -> i64 {
+    match v {
+        Value::I32(x) => *x as i64,
+        Value::I64(x) => *x,
+        Value::F32(x) => x.to_bits() as i64,
+        Value::F64(x) => x.to_bits() as i64,
+        other => panic!("unsupported arg {other:?}"),
+    }
+}
+
+fn from_slot(t: ValType, s: i64) -> Value {
+    match t {
+        ValType::I32 => Value::I32(s as i32),
+        ValType::I64 => Value::I64(s),
+        ValType::F32 => Value::F32(f32::from_bits(s as u32)),
+        ValType::F64 => Value::F64(f64::from_bits(s as u64)),
+        other => panic!("unsupported result type {other:?}"),
+    }
+}
+
+/// Translate `src` (one defined function, the unit under test at index 0), verify, and run on
+/// **both** backends with `args`; assert they agree and equal `expect`. Returns silently if clang
+/// is unavailable.
+fn check(name: &str, src: &str, args: &[Value], expect: &[Value]) {
+    let Some(bc) = compile_to_ll(name, src) else {
+        return;
+    };
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
+    let module = t.module;
+    temen_verify::verify_module(&module).expect("verify translated IR");
+    let results = module.funcs[0].results.clone();
+
+    // The IR signature prepends the data-SP (§3d): the entry takes `(sp, c-args…)`. Pass the
+    // translator-computed initial data-stack base (just above the globals), then the C arguments.
+    let mut full: Vec<Value> = vec![Value::I64(t.entry_sp as i64)];
+    full.extend_from_slice(args);
+
+    let mut fuel = 10_000_000u64;
+    let interp = temen_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
+    assert_eq!(interp, expect, "{name}: interp result");
+
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    let jit = match temen_jit::compile_and_run(&module, 0, &slots).expect("jit run") {
+        JitOutcome::Returned(s) => s
+            .iter()
+            .zip(&results)
+            .map(|(&v, &t)| from_slot(t, v))
+            .collect::<Vec<_>>(),
+        other => panic!("{name}: unexpected JIT outcome {other:?}"),
+    };
+    assert_eq!(jit, expect, "{name}: JIT result (interp said {interp:?})");
+}
+
+/// Compile `src` (which defines `int run(int)` first and an `int main(){ return run(SEED); }`)
+/// with native `cc`, run it, and assert the Temen translation of `run(SEED)` matches the native exit
+/// code on **both** backends. The native compiler is the strongest oracle (the chibicc Tier-2
+/// pattern); `run` returns a byte so the full result survives the 8-bit Unix exit code.
+fn check_vs_native(name: &str, src: &str, seed: i32) {
+    let Some(bc) = compile_to_ll(name, src) else {
+        return;
+    };
+    let exe =
+        std::env::temp_dir().join(format!("temen_llvm_native_{}_{}", std::process::id(), name));
+    let c = std::env::temp_dir().join(format!("temen_llvm_{}_{}.c", std::process::id(), name));
+    // `-lm` so demos that call libm (`sqrt`/`floor`/…) link natively; harmless for the rest.
+    match Command::new("cc")
+        .arg(&c)
+        .arg("-lm")
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping {name} (cc unavailable)");
+            return;
+        }
+    }
+    let native = Command::new(&exe)
+        .status()
+        .expect("run native")
+        .code()
+        .unwrap() as u8;
+
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
+    let module = t.module;
+    temen_verify::verify_module(&module).expect("verify translated IR");
+    let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
+    let mut fuel = 100_000_000u64;
+    let interp = temen_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    let jit = match temen_jit::compile_and_run(&module, 0, &slots).expect("jit run") {
+        JitOutcome::Returned(s) => Value::I32(s[0] as i32),
+        other => panic!("{name}: unexpected JIT outcome {other:?}"),
+    };
+    assert_eq!(interp, vec![jit], "{name}: interp vs JIT");
+    let temen = match jit {
+        Value::I32(x) => x as u8,
+        _ => panic!("expected i32"),
+    };
+    assert_eq!(temen, native, "{name}: temen={temen} vs native cc={native}");
+}
+
+/// Translate + verify + run on both backends, asserting both **trap** (neither returns a value).
+/// Used for the data-stack guard: a deep recursion with a real frame must fault past the window's
+/// mapped region, not corrupt globals or return garbage.
+fn check_traps(name: &str, src: &str, args: &[Value]) {
+    let Some(bc) = compile_to_ll(name, src) else {
+        return;
+    };
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
+    let module = t.module;
+    temen_verify::verify_module(&module).expect("verify translated IR");
+    let mut full: Vec<Value> = vec![Value::I64(t.entry_sp as i64)];
+    full.extend_from_slice(args);
+
+    let mut fuel = 1_000_000_000u64;
+    let interp = temen_interp::run(&module, 0, &full, &mut fuel);
+    assert!(
+        interp.is_err(),
+        "{name}: interp should trap, got {interp:?}"
+    );
+
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match temen_jit::compile_and_run(&module, 0, &slots).expect("jit run") {
+        JitOutcome::Trapped(_) => {}
+        other => panic!("{name}: JIT should trap, got {other:?}"),
+    }
+}
+
+/// `temen_jit::compile` (compile once) → reuse `CompiledModule::run` returns the same result as the
+/// one-shot `compile_and_run`, across multiple inputs. Guards the compile-once API the cross-engine
+/// bench relies on for honest JIT timing (its loop must carry no per-call Cranelift codegen).
+#[test]
+fn jit_compile_once_run_many() {
+    let Some(bc) = compile_to_ll("compile_once", "int run(int x){ return x * x + 1; }") else {
+        return;
+    };
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate");
+    temen_verify::verify_module(&t.module).expect("verify");
+    let e = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == "run")
+        .map(|x| x.1)
+        .expect("run export");
+    let sp = t.entry_sp as i64;
+    let mut cm = temen_jit::compile(&t.module, e).expect("compile once");
+    let val = |o: JitOutcome| match o {
+        JitOutcome::Returned(v) => v[0] as i32,
+        other => panic!("unexpected outcome {other:?}"),
+    };
+    for x in [3i64, 10, -4] {
+        let once = val(cm.run(&[sp, x], None, None).expect("run").0);
+        let one_shot = val(temen_jit::compile_and_run(&t.module, e, &[sp, x]).expect("one-shot"));
+        assert_eq!(once, one_shot, "compile-once vs one-shot at x={x}");
+        assert_eq!(once, (x * x + 1) as i32, "result at x={x}");
+    }
+}
+
+#[test]
+fn byval_small_struct_arg() {
+    // A small struct passed by value — clang coerces it to an `i64` register. `run` packs {a,b}
+    // and calls `sumP(i64)`; the callee unpacks the fields.
+    let src = "struct P { int x; int y; }; int sumP(struct P); \
+               int run(int a, int b){ struct P p = {a, b}; return sumP(p); } \
+               __attribute__((noinline)) int sumP(struct P p){ return p.x + p.y; }";
+    check(
+        "bvarg",
+        src,
+        &[Value::I32(3), Value::I32(4)],
+        &[Value::I32(7)],
+    );
+}
+
+#[test]
+fn byval_small_struct_return() {
+    // A small struct returned by value — coerced to an `i64` return. `run` calls `mkP` and reads
+    // the returned fields.
+    let src = "struct P { int x; int y; }; struct P mkP(int, int); \
+               int run(int a, int b){ struct P p = mkP(a, b); return p.x * 10 + p.y; } \
+               __attribute__((noinline)) struct P mkP(int a, int b){ struct P p = {a, b}; return p; }";
+    check(
+        "bvret",
+        src,
+        &[Value::I32(3), Value::I32(4)],
+        &[Value::I32(34)],
+    );
+}
+
+#[test]
+fn byval_two_eightbyte_struct() {
+    // A 12-byte struct coerced to *two* registers `(i64, i32)` (two eightbytes).
+    let src = "struct Q { int x; int y; int z; }; int sumQ(struct Q); \
+               int run(int a, int b, int c){ struct Q q = {a, b, c}; return sumQ(q); } \
+               __attribute__((noinline)) int sumQ(struct Q q){ return q.x + q.y + q.z; }";
+    check(
+        "bvq",
+        src,
+        &[Value::I32(1), Value::I32(2), Value::I32(3)],
+        &[Value::I32(6)],
+    );
+}
+
+/// A **struct `phi`** — a small by-value struct (`{i64, i64}`) carried across a loop backedge,
+/// zero-initialized on the entry edge and rebuilt by `insertvalue` on the backedge, read by
+/// `extractvalue`. The aggregate side-table is block-local, so this exercises the **cross-block
+/// aggregate threading** (per-field block-param fan-out + `branch_args` field materialization) that
+/// makes Embench `wikisort`'s `MakeRange` result translate. Authored as IR because clang's SROA
+/// scalarizes such a carried struct into per-field `i64` φs in C, so a struct φ can't be coaxed from a
+/// small C kernel. `run(n)` accumulates `a=Σi`, `b=Σ2i` over `i∈[0,n)`, returns `a+b = 3·n·(n−1)/2`.
+#[test]
+fn struct_phi_cross_block() {
+    let ir = "\
+target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\
+target triple = \"x86_64-pc-linux-gnu\"\n\
+define i64 @run(i64 %n) {\n\
+entry:\n\
+  br label %loop\n\
+loop:\n\
+  %i = phi i64 [ 0, %entry ], [ %inext, %body ]\n\
+  %acc = phi { i64, i64 } [ zeroinitializer, %entry ], [ %accnext, %body ]\n\
+  %cmp = icmp slt i64 %i, %n\n\
+  br i1 %cmp, label %body, label %exit\n\
+body:\n\
+  %a = extractvalue { i64, i64 } %acc, 0\n\
+  %b = extractvalue { i64, i64 } %acc, 1\n\
+  %anew = add i64 %a, %i\n\
+  %ti = mul i64 %i, 2\n\
+  %bnew = add i64 %b, %ti\n\
+  %t = insertvalue { i64, i64 } undef, i64 %anew, 0\n\
+  %accnext = insertvalue { i64, i64 } %t, i64 %bnew, 1\n\
+  %inext = add i64 %i, 1\n\
+  br label %loop\n\
+exit:\n\
+  %ra = extractvalue { i64, i64 } %acc, 0\n\
+  %rb = extractvalue { i64, i64 } %acc, 1\n\
+  %r = add i64 %ra, %rb\n\
+  ret i64 %r\n\
+}\n";
+    // Textual LLVM IR — feed it straight to the in-house reader (no clang/`llvm-as` round-trip).
+    let t = temen_llvm::translate_ll_str(ir).expect("translate struct-φ IR");
+    temen_verify::verify_module(&t.module).expect("verify");
+    let run = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == "run")
+        .map(|x| x.1)
+        .expect("run export");
+    for n in [5i64, 7] {
+        let expect = 3 * n * (n - 1) / 2;
+        let mut fuel = 10_000_000u64;
+        let interp = match temen_interp::run(
+            &t.module,
+            run,
+            &[Value::I64(t.entry_sp as i64), Value::I64(n)],
+            &mut fuel,
+        )
+        .expect("interp")[0]
+        {
+            Value::I64(x) => x,
+            other => panic!("unexpected {other:?}"),
+        };
+        let jit = match temen_jit::compile_and_run(&t.module, run, &[t.entry_sp as i64, n])
+            .expect("jit")
+        {
+            JitOutcome::Returned(v) => v[0],
+            o => panic!("jit outcome {o:?}"),
+        };
+        assert_eq!(interp, jit, "struct-φ n={n}: interp vs jit");
+        assert_eq!(interp, expect, "struct-φ n={n}: result");
+    }
+}
+
+#[test]
+fn thread_local_tier2_vcpu_tls_isolation_and_pause_drop() {
+    // The threaded-`std` build's native TLS shape (NIM.md §3d Tier-2): a `thread_local` global,
+    // addressed via `llvm.threadlocal.address`, lowers to `vcpu.tls.get() + off` — so the *same*
+    // thread-local resolves to disjoint slots under different `vcpu.tls` bases. `iso(b0, b1)` stores
+    // 10 at `@tls` under base `b0`, 20 under `b1`, then re-reads under `b0`: it must read back **10**
+    // (not 20), proving the thread-local is base-relative and the two bases isolate. A
+    // `core::hint::spin_loop()` (`llvm.x86.sse2.pause`) sits between writes and is dropped.
+    //
+    // `@scratch0`/`@scratch1` are ordinary window globals; their addresses are the two TLS bases, so
+    // `@tls`'s slot (offset 0 in the block) lands inside each scratch buffer. `__vm_vcpu_tls_set`
+    // lowers to `vcpu.tls.set` (there is no `_start` here to seed the root base).
+    let ir = "\
+target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\
+target triple = \"x86_64-unknown-none\"\n\
+@tls = internal thread_local unnamed_addr global i64 0, align 8\n\
+@scratch0 = internal global [64 x i8] zeroinitializer, align 16\n\
+@scratch1 = internal global [64 x i8] zeroinitializer, align 16\n\
+declare ptr @llvm.threadlocal.address.p0(ptr)\n\
+declare void @llvm.x86.sse2.pause()\n\
+declare void @__vm_vcpu_tls_set(i64)\n\
+define i64 @iso(i64 %b0, i64 %b1) {\n\
+entry:\n\
+  call void @__vm_vcpu_tls_set(i64 %b0)\n\
+  %p0 = call ptr @llvm.threadlocal.address.p0(ptr @tls)\n\
+  store i64 10, ptr %p0, align 8\n\
+  call void @llvm.x86.sse2.pause()\n\
+  call void @__vm_vcpu_tls_set(i64 %b1)\n\
+  %p1 = call ptr @llvm.threadlocal.address.p0(ptr @tls)\n\
+  store i64 20, ptr %p1, align 8\n\
+  call void @__vm_vcpu_tls_set(i64 %b0)\n\
+  %p0b = call ptr @llvm.threadlocal.address.p0(ptr @tls)\n\
+  %v = load i64, ptr %p0b, align 8\n\
+  ret i64 %v\n\
+}\n";
+    let t = temen_llvm::translate_ll_str(ir).expect("translate thread-local IR");
+    temen_verify::verify_module(&t.module).expect("verify");
+    let sym = |n: &str| {
+        t.data_symbols
+            .iter()
+            .find(|s| s.name == n)
+            .unwrap_or_else(|| panic!("missing data symbol @{n}"))
+            .addr as i64
+    };
+    let (b0, b1) = (sym("scratch0"), sym("scratch1"));
+    let iso = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == "iso")
+        .map(|x| x.1)
+        .expect("iso export");
+    let mut fuel = 1_000_000u64;
+    let interp = match temen_interp::run(
+        &t.module,
+        iso,
+        &[
+            Value::I64(t.entry_sp as i64),
+            Value::I64(b0),
+            Value::I64(b1),
+        ],
+        &mut fuel,
+    )
+    .expect("interp")[0]
+    {
+        Value::I64(v) => v,
+        other => panic!("unexpected {other:?}"),
+    };
+    let jit = match temen_jit::compile_and_run(&t.module, iso, &[t.entry_sp as i64, b0, b1])
+        .expect("jit")
+    {
+        JitOutcome::Returned(v) => v[0],
+        o => panic!("jit outcome {o:?}"),
+    };
+    assert_eq!(interp, jit, "tls isolation: interp vs jit");
+    assert_eq!(
+        interp, 10,
+        "the thread-local is `vcpu.tls`-base-relative: b0's slot keeps 10 despite b1's write of 20"
+    );
+}
+
+#[test]
+fn constexpr_add_ptrtoint_global_operand() {
+    // An interior global pointer materialized as `add(ptrtoint(@g), k)` used directly as an operand
+    // (not a global initializer) — the threaded-`std` codegen emits socket-address string slicing this
+    // way rather than as a `getelementptr`. `@g` is an 11-byte constant (like `"127.0.0.1:0"`), so
+    // `f()` returns `&g + 7`. This pins the on-ramp's constexpr-operand fold for `add`/`sub`/`mul`.
+    let ir = "\
+target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\
+target triple = \"x86_64-unknown-none\"\n\
+@g = internal constant [11 x i8] c\"127.0.0.1:0\", align 1\n\
+define i64 @f() {\n\
+entry:\n\
+  ret i64 add (i64 ptrtoint (ptr @g to i64), i64 7)\n\
+}\n";
+    let t = temen_llvm::translate_ll_str(ir).expect("translate constexpr-add IR");
+    temen_verify::verify_module(&t.module).expect("verify");
+    let base = t
+        .data_symbols
+        .iter()
+        .find(|s| s.name == "g")
+        .expect("g symbol")
+        .addr as i64;
+    let f = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == "f")
+        .map(|x| x.1)
+        .expect("f export");
+    let mut fuel = 100_000u64;
+    let got = match temen_interp::run(&t.module, f, &[Value::I64(t.entry_sp as i64)], &mut fuel)
+        .expect("interp")[0]
+    {
+        Value::I64(v) => v,
+        other => panic!("unexpected {other:?}"),
+    };
+    assert_eq!(
+        got,
+        base + 7,
+        "add(ptrtoint(@g), 7) folds to the global address + 7"
+    );
+}
+
+#[test]
+fn llvm_is_constant_lowers_to_false() {
+    // `llvm.is.constant.*` (the `__builtin_constant_p` hint, emitted by std's `mpsc`/`Arc` fast paths)
+    // lowers to `i1 0`, as LLVM's own codegen does for a call that survives optimization. `f(x)`
+    // zero-extends the result, so it returns 0 for any argument.
+    let ir = "\
+target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\
+target triple = \"x86_64-unknown-none\"\n\
+declare i1 @llvm.is.constant.i32(i32)\n\
+define i64 @f(i32 %x) {\n\
+entry:\n\
+  %c = call i1 @llvm.is.constant.i32(i32 %x)\n\
+  %r = zext i1 %c to i64\n\
+  ret i64 %r\n\
+}\n";
+    let t = temen_llvm::translate_ll_str(ir).expect("translate is.constant IR");
+    temen_verify::verify_module(&t.module).expect("verify");
+    let f = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == "f")
+        .map(|x| x.1)
+        .expect("f export");
+    for x in [0i64, 7, 12345] {
+        let mut fuel = 100_000u64;
+        let got = match temen_interp::run(
+            &t.module,
+            f,
+            &[Value::I64(t.entry_sp as i64), Value::I64(x)],
+            &mut fuel,
+        )
+        .expect("interp")[0]
+        {
+            Value::I64(v) => v,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(got, 0, "is.constant(x={x}) → 0");
+    }
+}
+
+#[test]
+fn byval_sse_struct() {
+    // A `{double, double}` struct — two SSE eightbytes, coerced to `(double, double)`.
+    let src = "struct DD { double a; double b; }; double useDD(struct DD); \
+               double run(double x, double y){ struct DD d = {x, y}; return useDD(d); } \
+               __attribute__((noinline)) double useDD(struct DD d){ return d.a * d.b; }";
+    check(
+        "bvdd",
+        src,
+        &[Value::F64(3.0), Value::F64(4.0)],
+        &[Value::F64(12.0)],
+    );
+}
+
+#[test]
+fn byval_and_sret_large_struct() {
+    // A large struct returned via `sret` (`mkBig`) and passed via `byval` (`sumBig`) — both are
+    // hidden caller-allocated pointers in the IR.
+    let src = "struct Big { int a[8]; }; long sumBig(struct Big); struct Big mkBig(int); \
+               long run(int v, int i){ struct Big b = mkBig(v); return sumBig(b) + b.a[i & 7]; } \
+               __attribute__((noinline)) struct Big mkBig(int v){ struct Big b; for(int i=0;i<8;i++) b.a[i]=v+i; return b; } \
+               __attribute__((noinline)) long sumBig(struct Big b){ long s=0; for(int i=0;i<8;i++) s+=b.a[i]; return s; }";
+    check(
+        "bvbig",
+        src,
+        &[Value::I32(10), Value::I32(0)],
+        &[Value::I64(118)],
+    ); // sum 10..17 + 10
+}
+
+#[test]
+fn int_minmax_bit_intrinsics() {
+    // `a > b ? a : b` → `llvm.smax`; the bit builtins → `llvm.ctlz`/`ctpop`; `abs` → `llvm.abs`.
+    check(
+        "imax",
+        "int imax(int a, int b){ return a > b ? a : b; }",
+        &[Value::I32(3), Value::I32(7)],
+        &[Value::I32(7)],
+    );
+    check(
+        "clz",
+        "int clz(unsigned x){ return __builtin_clz(x); }",
+        &[Value::I32(1)],
+        &[Value::I32(31)],
+    );
+    check(
+        "pc",
+        "int pc(unsigned x){ return __builtin_popcount(x); }",
+        &[Value::I32(0xFF)],
+        &[Value::I32(8)],
+    );
+    check(
+        "absn",
+        "int ab(int x){ return x < 0 ? -x : x; }",
+        &[Value::I32(-5)],
+        &[Value::I32(5)],
+    );
+}
+
+#[test]
+fn libm_math_calls() {
+    // `sqrt`/`fmin` stay external libm calls at -O2 (errno) — we recognize the named function and
+    // lower it to the Temen float op inline.
+    check(
+        "sq",
+        "double sq(double x){ return __builtin_sqrt(x); }",
+        &[Value::F64(16.0)],
+        &[Value::F64(4.0)],
+    );
+    check(
+        "mn",
+        "double mn(double a, double b){ return __builtin_fmin(a, b); }",
+        &[Value::F64(3.0), Value::F64(5.0)],
+        &[Value::F64(3.0)],
+    );
+}
+
+#[test]
+fn function_pointer_table_global() {
+    // A global `static fp tbl[2] = {inc, dec}` — a relocation: each element serializes to the
+    // function's funcref index. `viafp` indexes the table at runtime and calls indirectly.
+    let src = "int inc(int); int dec(int); typedef int(*fp)(int); \
+               static fp tbl[2] = {inc, dec}; \
+               int viafp(int sel, int x){ return tbl[sel & 1](x); } \
+               __attribute__((noinline)) int inc(int x){ return x + 1; } \
+               __attribute__((noinline)) int dec(int x){ return x - 1; }";
+    check(
+        "fpt_inc",
+        src,
+        &[Value::I32(0), Value::I32(10)],
+        &[Value::I32(11)],
+    );
+    check(
+        "fpt_dec",
+        src,
+        &[Value::I32(1), Value::I32(10)],
+        &[Value::I32(9)],
+    );
+}
+
+#[test]
+fn struct_with_string_pointer_global() {
+    // A global struct holding a string pointer — the pointer field is a relocation (`@.str`
+    // address). The runtime reads the pointed-to char.
+    let src = "struct S { const char *name; int v; }; \
+               static const struct S g = { \"hi\", 7 }; \
+               int f(int i){ return g.name[i] + g.v; }";
+    check(
+        "sws_h",
+        src,
+        &[Value::I32(0)],
+        &[Value::I32('h' as i32 + 7)],
+    );
+    check(
+        "sws_i",
+        src,
+        &[Value::I32(1)],
+        &[Value::I32('i' as i32 + 7)],
+    );
+}
+
+#[test]
+fn memcpy_struct_copy() {
+    // `struct Big q = G` → `llvm.memcpy` (32 bytes) from a const global into a stack struct; we
+    // lower it to chunked load/stores. A runtime field read keeps the alloca + copy.
+    let src = "struct Big { int a[8]; }; \
+               static const struct Big G = { {1,2,3,4,5,6,7,8} }; \
+               int pick(int i){ struct Big q = G; q.a[0] += 100; return q.a[i & 7]; }";
+    check("pick_0", src, &[Value::I32(0)], &[Value::I32(101)]); // modified field
+    check("pick_3", src, &[Value::I32(3)], &[Value::I32(4)]);
+    check("pick_7", src, &[Value::I32(7)], &[Value::I32(8)]);
+}
+
+#[test]
+fn memset_fill() {
+    // `__builtin_memset(b, 0xAB, 16)` → `llvm.memset`; the fill byte is replicated across the
+    // chunked stores. A signed-char read sign-extends 0xAB to -85.
+    let src = "int hset(int i){ char b[16]; __builtin_memset(b, 0xAB, 16); return b[i & 15]; }";
+    check("hset_0", src, &[Value::I32(0)], &[Value::I32(-85)]);
+    check("hset_9", src, &[Value::I32(9)], &[Value::I32(-85)]);
+}
+
+#[test]
+fn data_stack_guard_traps_on_overflow() {
+    // A non-tail recursion (the `+ buf[k]` after the call keeps the result live) with a large
+    // 32 KiB frame — a *runtime* index `k` stops clang from shrinking the `volatile` array. A
+    // shallow call returns; a deep one overflows the data stack past the window's mapped region
+    // and faults (§5) — the guard catches it, no corruption. deep(n) sums 0..n (buf[k] == n).
+    let src = "int deep(int n){ volatile int buf[8192]; int k = n & 8191; buf[k] = n; \
+               if (n <= 0) return 0; return deep(n - 1) + buf[k]; }";
+    check("deep_3", src, &[Value::I32(3)], &[Value::I32(6)]); // 4 frames ≪ window
+    check_traps("deep_overflow", src, &[Value::I32(2000)]); // ~64 frames fills the ~2 MiB window
+}
+
+#[test]
+fn returns_constant() {
+    check(
+        "ret_const",
+        "int main(void){ return 42; }",
+        &[],
+        &[Value::I32(42)],
+    );
+}
+
+#[test]
+fn integer_add_with_params() {
+    check(
+        "add",
+        "int f(int a, int b){ return a + b; }",
+        &[Value::I32(40), Value::I32(2)],
+        &[Value::I32(42)],
+    );
+}
+
+#[test]
+fn i64_arithmetic() {
+    check(
+        "mul64",
+        "long g(long a, long b){ return a * b - 1; }",
+        &[Value::I64(7), Value::I64(6)],
+        &[Value::I64(41)],
+    );
+}
+
+#[test]
+fn icmp_select_zext() {
+    // -O2 if-converts this to icmp + zext i1 + select (a single block) — exercises the
+    // comparison, the i1→i32 zero-extend, and branchless select.
+    let src = "int classify(int x){ if (x < 0) return -1; if (x == 0) return 0; return 1; }";
+    check("classify_neg", src, &[Value::I32(-5)], &[Value::I32(-1)]);
+    check("classify_zero", src, &[Value::I32(0)], &[Value::I32(0)]);
+    check("classify_pos", src, &[Value::I32(7)], &[Value::I32(1)]);
+}
+
+#[test]
+fn loop_with_phi_popcount() {
+    // A data-dependent loop -O2 cannot close-form: a multi-block CFG with φ-nodes for the loop
+    // variables — the SSA→block-argument conversion (the slice-A headline).
+    let src = "int popcount(unsigned x){ int c = 0; while (x) { c += x & 1; x >>= 1; } return c; }";
+    check("pop_ff", src, &[Value::I32(0xFF)], &[Value::I32(8)]);
+    check("pop_0", src, &[Value::I32(0)], &[Value::I32(0)]);
+    check("pop_mix", src, &[Value::I32(0x10101)], &[Value::I32(3)]);
+}
+
+#[test]
+fn loop_with_branchy_body() {
+    // Collatz: a loop whose body branches (if/else) — back-edges, a join with φ, and nested
+    // control flow, all over i32.
+    let src = "int collatz(int n){ int c = 0; while (n != 1) { if (n & 1) n = 3*n + 1; else n = n/2; c++; } return c; }";
+    check("collatz_6", src, &[Value::I32(6)], &[Value::I32(8)]);
+    check("collatz_1", src, &[Value::I32(1)], &[Value::I32(0)]);
+    check("collatz_27", src, &[Value::I32(27)], &[Value::I32(111)]);
+}
+
+#[test]
+fn shifts_and_divrem() {
+    let src = "int mix(int a, int b){ return (a << 3) | (a >> 1) ^ (a / b) + (a % b); }";
+    // a=29,b=5: (29<<3)=232, (29>>1)=14, 29/5=5, 29%5=4 -> 5+4=9; 14^9=7; 232|7=239
+    check(
+        "mix",
+        src,
+        &[Value::I32(29), Value::I32(5)],
+        &[Value::I32(239)],
+    );
+}
+
+#[test]
+fn stack_array_sum() {
+    // An address-taken stack array indexed by a loop variable — `-O2` keeps it in memory
+    // (`alloca [N x i32]`, GEP, store/load), exercising the §3d data-stack frame. n ≤ 8 (array
+    // bound). sum of i*i for i in 0..n.
+    let src = "int sumsq(int n){ int a[8]; for(int i=0;i<n;i++) a[i]=i*i; int s=0; for(int i=0;i<n;i++) s+=a[i]; return s; }";
+    check("sumsq_5", src, &[Value::I32(5)], &[Value::I32(30)]); // 0+1+4+9+16
+    check("sumsq_8", src, &[Value::I32(8)], &[Value::I32(140)]); // +25+36+49
+    check("sumsq_0", src, &[Value::I32(0)], &[Value::I32(0)]);
+}
+
+#[test]
+fn stack_array_reverse() {
+    // Write then read in reverse — distinct store and load address arithmetic over the frame.
+    let src = "int revsum(int n){ int a[8]; for(int i=0;i<n;i++) a[i]=i+1; int s=0; for(int i=n-1;i>=0;i--) s=s*10+a[i]; return s; }";
+    check("rev_4", src, &[Value::I32(4)], &[Value::I32(4321)]);
+    check("rev_3", src, &[Value::I32(3)], &[Value::I32(321)]);
+}
+
+#[test]
+fn recursive_call_fib() {
+    // Self-recursion: the call survives `-O2` (can't fully inline), exercising direct `call` by
+    // index, the threaded data-SP, and result/argument marshalling. fib(0..) = 0,1,1,2,3,5,8,...
+    let src = "int fib(int n){ if (n < 2) return n; return fib(n-1) + fib(n-2); }";
+    check("fib_10", src, &[Value::I32(10)], &[Value::I32(55)]);
+    check("fib_1", src, &[Value::I32(1)], &[Value::I32(1)]);
+    check("fib_0", src, &[Value::I32(0)], &[Value::I32(0)]);
+}
+
+#[test]
+fn cross_function_call() {
+    // A call to a *different* function (kept distinct by `noinline`), so the entry (`g`, index 0)
+    // calls `add1` (index 1) — exercises the name→index resolution and a non-recursive call.
+    let src = "int add1(int x); int g(int x){ return add1(x) + add1(x + 10); } \
+               __attribute__((noinline)) int add1(int x){ return x + 1; }";
+    check("g_5", src, &[Value::I32(5)], &[Value::I32(22)]); // (5+1)+(15+1)=22
+    check("g_0", src, &[Value::I32(0)], &[Value::I32(12)]); // 1 + 11
+}
+
+#[test]
+fn switch_dense() {
+    // A dense `switch` -O2 keeps as a jump table → `br_table`.
+    let src = "int sw(int x){ switch (x) { case 0: return 100; case 1: return 200; \
+               case 2: return 300; case 3: return 400; default: return -1; } }";
+    check("sw_0", src, &[Value::I32(0)], &[Value::I32(100)]);
+    check("sw_2", src, &[Value::I32(2)], &[Value::I32(300)]);
+    check("sw_3", src, &[Value::I32(3)], &[Value::I32(400)]);
+    check("sw_def", src, &[Value::I32(9)], &[Value::I32(-1)]);
+    check("sw_neg", src, &[Value::I32(-5)], &[Value::I32(-1)]);
+}
+
+#[test]
+fn mutual_recursion_even_odd() {
+    // `-O2` lowers this mutual recursion into a `switch`-driven parity loop (the case that
+    // motivated switch support). even(n) = 1 if n even else 0.
+    let src = "int odd(int); \
+               int even(int n){ return n == 0 ? 1 : odd(n - 1); } \
+               int odd(int n){ return n == 0 ? 0 : even(n - 1); }";
+    check("even_10", src, &[Value::I32(10)], &[Value::I32(1)]);
+    check("even_7", src, &[Value::I32(7)], &[Value::I32(0)]);
+    check("even_0", src, &[Value::I32(0)], &[Value::I32(1)]);
+}
+
+#[test]
+fn global_const_table() {
+    // A `static const` lookup table → an `internal constant [4 x i32]` global; the read is a
+    // GEP on the global's window address + a load. Exercises read-only `data` segments (D40).
+    let src = "int tbl(int i){ static const int t[4] = {10,20,30,40}; return t[i & 3]; }";
+    check("tbl_0", src, &[Value::I32(0)], &[Value::I32(10)]);
+    check("tbl_2", src, &[Value::I32(2)], &[Value::I32(30)]);
+    check("tbl_5", src, &[Value::I32(5)], &[Value::I32(20)]); // 5 & 3 == 1
+}
+
+#[test]
+fn global_mutable_counter() {
+    // A mutable initialized global → a writable `data` segment; `++g` is load + add + store.
+    let src = "int g = 7; int bump(void){ return ++g; }";
+    check("bump", src, &[], &[Value::I32(8)]);
+}
+
+#[test]
+fn global_string_indexed() {
+    // A string literal → a `[N x i8]` constant global; a runtime-indexed read is GEP + narrow
+    // (`i8`) load, sign-extended to the `char` return.
+    let src = "int nth(int i){ return \"Xyz!\"[i & 3]; }";
+    check("nth_0", src, &[Value::I32(0)], &[Value::I32('X' as i32)]);
+    check("nth_1", src, &[Value::I32(1)], &[Value::I32('y' as i32)]);
+    check("nth_3", src, &[Value::I32(3)], &[Value::I32('!' as i32)]);
+}
+
+#[test]
+fn switch_with_gaps_via_global_table() {
+    // `-O2` compiles a gapped switch into a global lookup table + a range-check + GEP/load — so
+    // this now works via global-variable support (it was the case that revealed the need).
+    let src = "int sg(int x){ switch (x) { case 2: return 20; case 5: return 50; \
+               case 8: return 80; default: return 0; } }";
+    check("sg_2", src, &[Value::I32(2)], &[Value::I32(20)]);
+    check("sg_5", src, &[Value::I32(5)], &[Value::I32(50)]);
+    check("sg_4", src, &[Value::I32(4)], &[Value::I32(0)]); // a gap → default
+    check("sg_8", src, &[Value::I32(8)], &[Value::I32(80)]);
+}
+
+#[test]
+fn switch_sparse_compare_chain() {
+    // Far-apart `i64` cases (span ≫ MAX_SWITCH_SPAN) — clang keeps a real `switch` instruction, which
+    // the on-ramp lowers to an **equality compare chain** of synthetic blocks (a dense `br_table`
+    // would be astronomically large). Rust's niche-optimized enum discriminants produce exactly these.
+    // Every case, the default, and several between-case misses must agree on interp and JIT.
+    let src = "long sw(long x){ switch(x){ \
+               case 0: return 11; \
+               case 1000000L: return 22; \
+               case 1000000000000L: return 33; \
+               case -2000000000000L: return 44; \
+               default: return 99; } }";
+    check("ssw_0", src, &[Value::I64(0)], &[Value::I64(11)]);
+    check("ssw_1m", src, &[Value::I64(1_000_000)], &[Value::I64(22)]);
+    check(
+        "ssw_1t",
+        src,
+        &[Value::I64(1_000_000_000_000)],
+        &[Value::I64(33)],
+    );
+    check(
+        "ssw_neg",
+        src,
+        &[Value::I64(-2_000_000_000_000)],
+        &[Value::I64(44)],
+    );
+    check("ssw_def1", src, &[Value::I64(5)], &[Value::I64(99)]);
+    check("ssw_def2", src, &[Value::I64(-1)], &[Value::I64(99)]);
+    check(
+        "ssw_def3",
+        src,
+        &[Value::I64(999_999_999_999)],
+        &[Value::I64(99)],
+    );
+    check(
+        "ssw_defmin",
+        src,
+        &[Value::I64(i64::MIN)],
+        &[Value::I64(99)],
+    );
+    check(
+        "ssw_defmax",
+        src,
+        &[Value::I64(i64::MAX)],
+        &[Value::I64(99)],
+    );
+}
+
+#[test]
+fn switch_sparse_threads_live_ins_and_phi() {
+    // The hard case for the compare chain: the case bodies read `a`/`b` (live-ins that must be threaded
+    // through the synthetic chain blocks to the case targets), and the cases converge on a common
+    // successor whose `r` is a φ (so the chain's targets carry a branch argument). Exercises the full
+    // arg/live-in/φ threading, not just `(SP, operand)`.
+    let src = "long sw2(long x, long a, long b){ long r; switch(x){ \
+               case 0: r = a + 1; break; \
+               case 1000000000000L: r = b * 2; break; \
+               case -3000000000000L: r = a - b; break; \
+               default: r = a + b; break; } return r * 3; }";
+    // (x, a, b) with a=10, b=4
+    check(
+        "sw2_c0",
+        src,
+        &[Value::I64(0), Value::I64(10), Value::I64(4)],
+        &[Value::I64(33)],
+    ); // (10+1)*3
+    check(
+        "sw2_c1",
+        src,
+        &[Value::I64(1_000_000_000_000), Value::I64(10), Value::I64(4)],
+        &[Value::I64(24)], // (4*2)*3
+    );
+    check(
+        "sw2_c2",
+        src,
+        &[
+            Value::I64(-3_000_000_000_000),
+            Value::I64(10),
+            Value::I64(4),
+        ],
+        &[Value::I64(18)], // (10-4)*3
+    );
+    check(
+        "sw2_def",
+        src,
+        &[Value::I64(7), Value::I64(10), Value::I64(4)],
+        &[Value::I64(42)], // (10+4)*3
+    );
+}
+
+#[test]
+fn switch_sparse_threads_aggregate() {
+    // A sparse `switch` whose compare-chain threads an **aggregate** live-in (a by-value `{i64,i32}`
+    // struct held field-wise in the `agg` table) *alongside* scalar live-ins. `block_param_types` (the
+    // chain block's param typing) must fan the aggregate out into one type per field — exactly as
+    // `block_params`/`branch_args` do — or the `zip` in `lower_sparse_switch` desyncs after the struct
+    // and mistypes every threaded value behind it (a `temen-verify` `TypeMismatch`). This was the sole
+    // verify error in the whole Postgres backend (`ExecRenameStmt`'s `switch` over a `{i64,i32}`
+    // struct). Hand `.ll` because clang's SROA usually scalarizes a struct before it can be threaded.
+    let ll = "define i64 @f(i32 %sel, i64 %p, i32 %q) {\n\
+      entry:\n  \
+        %a0 = insertvalue {i64, i32} undef, i64 %p, 0\n  \
+        %agg = insertvalue {i64, i32} %a0, i32 %q, 1\n  \
+        %u = add i64 %p, 1\n  \
+        %w = add i32 %q, 2\n  \
+        switch i32 %sel, label %def [ i32 0, label %c0\n                                    i32 100000, label %c1\n                                    i32 200000, label %c2 ]\n\
+      c0:\n  \
+        %x0 = extractvalue {i64, i32} %agg, 0\n  \
+        %w0 = zext i32 %w to i64\n  \
+        %r0 = add i64 %x0, %u\n  \
+        %s0 = add i64 %r0, %w0\n  \
+        ret i64 %s0\n\
+      c1:\n  \
+        %x1 = extractvalue {i64, i32} %agg, 1\n  \
+        %z1 = zext i32 %x1 to i64\n  \
+        %w1 = zext i32 %w to i64\n  \
+        %r1 = add i64 %z1, %u\n  \
+        %s1 = add i64 %r1, %w1\n  \
+        ret i64 %s1\n\
+      c2:\n  \
+        %x2 = extractvalue {i64, i32} %agg, 0\n  \
+        %y2 = extractvalue {i64, i32} %agg, 1\n  \
+        %z2 = zext i32 %y2 to i64\n  \
+        %r2 = add i64 %x2, %z2\n  \
+        %s2 = add i64 %r2, %u\n  \
+        ret i64 %s2\n\
+      def:\n  \
+        %wd = zext i32 %w to i64\n  \
+        %rd = add i64 %u, %wd\n  \
+        ret i64 %rd\n }";
+    let t = temen_llvm::translate_ll_str(ll).expect("translate sparse-switch-aggregate .ll");
+    temen_verify::verify_module(&t.module).expect("verify sparse-switch-aggregate");
+    // f(sel, p=100, q=7): u=101, w=9. c0: 100+101+9=210; c1: 7+101+9=117; c2: 100+7+101=208; def: 101+9=110.
+    for (sel, want) in [(0i32, 210i64), (100000, 117), (200000, 208), (5, 110)] {
+        let full = vec![
+            Value::I64(t.entry_sp as i64),
+            Value::I32(sel),
+            Value::I64(100),
+            Value::I32(7),
+        ];
+        let mut fuel = 1_000_000u64;
+        let r = temen_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run");
+        assert_eq!(r, vec![Value::I64(want)], "sel={sel}");
+    }
+}
+
+#[test]
+fn switch_sparse_long_chain() {
+    // A six-case sparse switch → a five-block compare chain: stresses the synthetic-block indexing
+    // (each chain block branches to the next, the last to the default).
+    let src = "long swN(long x){ switch(x){ \
+               case 0: return 1; \
+               case 100000L: return 2; \
+               case 200000000L: return 3; \
+               case 300000000000L: return 4; \
+               case -400000000000L: return 5; \
+               case -500000L: return 6; \
+               default: return 0; } }";
+    check("swN_a", src, &[Value::I64(0)], &[Value::I64(1)]);
+    check("swN_b", src, &[Value::I64(100_000)], &[Value::I64(2)]);
+    check("swN_c", src, &[Value::I64(200_000_000)], &[Value::I64(3)]);
+    check(
+        "swN_d",
+        src,
+        &[Value::I64(300_000_000_000)],
+        &[Value::I64(4)],
+    );
+    check(
+        "swN_e",
+        src,
+        &[Value::I64(-400_000_000_000)],
+        &[Value::I64(5)],
+    );
+    check("swN_f", src, &[Value::I64(-500_000)], &[Value::I64(6)]);
+    check("swN_def", src, &[Value::I64(12345)], &[Value::I64(0)]);
+}
+
+#[test]
+fn switch_sparse_i32() {
+    // The `i32` (width ≤ 32) compare-chain path: far-apart 32-bit cases. Confirms the chain compares
+    // and materializes constants at `i32`, and a negative case round-trips.
+    let src = "int sw32(int x){ switch(x){ \
+               case 0: return 7; \
+               case 100000: return 8; \
+               case -200000: return 9; \
+               case 50000000: return 10; \
+               default: return -1; } }";
+    check("sw32_0", src, &[Value::I32(0)], &[Value::I32(7)]);
+    check("sw32_p", src, &[Value::I32(100_000)], &[Value::I32(8)]);
+    check("sw32_n", src, &[Value::I32(-200_000)], &[Value::I32(9)]);
+    check(
+        "sw32_big",
+        src,
+        &[Value::I32(50_000_000)],
+        &[Value::I32(10)],
+    );
+    check("sw32_def", src, &[Value::I32(1)], &[Value::I32(-1)]);
+    check(
+        "sw32_defmin",
+        src,
+        &[Value::I32(i32::MIN)],
+        &[Value::I32(-1)],
+    );
+}
+
+#[test]
+fn memcmp_synthesized_helper() {
+    // `memcmp(a, b, n)` with a **runtime** length (so clang emits a real `memcmp` call rather than
+    // folding it) → the synthesized `__temen_memcmp` counted-loop helper. `a = [1..8]`, `b` equal except
+    // `b[3] = x`, then the sign of `memcmp(a, b, n)` is returned. Covers equal, first-mismatch both
+    // directions, a short prefix that stops before the mismatch, and `n == 0`. Differential interp+JIT.
+    let src = "int f(int n, int x){ char a[8]; char b[8]; \
+               for (int i=0;i<8;i++){ a[i]=(char)(i+1); b[i]=(char)(i+1); } \
+               b[3]=(char)x; \
+               int r = __builtin_memcmp(a, b, (unsigned long)(unsigned)n); \
+               return (r>0)-(r<0); }";
+    check(
+        "mc_eq3",
+        src,
+        &[Value::I32(3), Value::I32(99)],
+        &[Value::I32(0)],
+    ); // first 3 match
+    check(
+        "mc_eq8",
+        src,
+        &[Value::I32(8), Value::I32(4)],
+        &[Value::I32(0)],
+    ); // b[3]==a[3]==4
+    check(
+        "mc_lt",
+        src,
+        &[Value::I32(8), Value::I32(99)],
+        &[Value::I32(-1)],
+    ); // a[3]=4 < 99
+    check(
+        "mc_gt",
+        src,
+        &[Value::I32(8), Value::I32(0)],
+        &[Value::I32(1)],
+    ); // a[3]=4 > 0
+    check(
+        "mc_short",
+        src,
+        &[Value::I32(4), Value::I32(99)],
+        &[Value::I32(-1)],
+    ); // mismatch in range
+    check(
+        "mc_zero",
+        src,
+        &[Value::I32(0), Value::I32(99)],
+        &[Value::I32(0)],
+    ); // n==0 → equal
+}
+
+#[test]
+fn fcmp_unordered_ordered() {
+    // The NaN-test float predicates `fcmp uno`/`ord` have no single temen-ir op; the on-ramp expands
+    // them (`uno` = `a!=a | b!=b`, `ord` = `a==a & b==b`). `__builtin_isunordered` emits `uno`, its
+    // negation emits `ord` (verified). Runtime args incl. NaN prevent folding. Differential interp+JIT.
+    let src = "int f(int which, double a, double b){ switch(which){ \
+               case 0: return __builtin_isunordered(a, b); \
+               case 1: return !__builtin_isunordered(a, b); \
+               default: return 0; } }";
+    let nan = f64::NAN;
+    // uno (which==0): 1 iff either operand is NaN.
+    check(
+        "uno_a",
+        src,
+        &[Value::I32(0), Value::F64(nan), Value::F64(1.0)],
+        &[Value::I32(1)],
+    );
+    check(
+        "uno_b",
+        src,
+        &[Value::I32(0), Value::F64(1.0), Value::F64(nan)],
+        &[Value::I32(1)],
+    );
+    check(
+        "uno_both",
+        src,
+        &[Value::I32(0), Value::F64(nan), Value::F64(nan)],
+        &[Value::I32(1)],
+    );
+    check(
+        "uno_none",
+        src,
+        &[Value::I32(0), Value::F64(1.0), Value::F64(2.0)],
+        &[Value::I32(0)],
+    );
+    // ord (which==1): 1 iff neither operand is NaN.
+    check(
+        "ord_nan",
+        src,
+        &[Value::I32(1), Value::F64(nan), Value::F64(1.0)],
+        &[Value::I32(0)],
+    );
+    check(
+        "ord_none",
+        src,
+        &[Value::I32(1), Value::F64(1.0), Value::F64(2.0)],
+        &[Value::I32(1)],
+    );
+}
+
+#[test]
+fn fcmp_ordered_unordered_predicates() {
+    // Every LLVM float compare predicate must be **NaN-correct**: the ordered forms (`olt`/`ole`/
+    // `ogt`/`oge`/`oeq`, and `one` via `islessgreater`) are false when an operand is NaN; the
+    // unordered forms (`une` from C `!=`, and `uge`/`ugt`/`ule`/`ult` from negating an ordered
+    // compare) are true. Earlier the on-ramp collapsed ordered/unordered to one op, so e.g. Lua's
+    // `luaV_flttointeger` (`n >= -2^63 && n < 2^63` after clang emits *unordered* forms) accepted a
+    // NaN and `NaN <= math.maxinteger` returned true. Differential interp+JIT with a runtime NaN.
+    let src = "int f(int which, double a, double b){ switch(which){ \
+               case 0: return a <  b;    /* olt */ \
+               case 1: return a <= b;    /* ole */ \
+               case 2: return a >  b;    /* ogt */ \
+               case 3: return a >= b;    /* oge */ \
+               case 4: return a == b;    /* oeq */ \
+               case 5: return a != b;    /* une */ \
+               case 6: return !(a <  b); /* uge */ \
+               case 7: return !(a <= b); /* ugt */ \
+               case 8: return !(a >  b); /* ule */ \
+               case 9: return !(a >= b); /* ult */ \
+               case 10: return __builtin_islessgreater(a, b); /* one */ \
+               default: return 0; } }";
+    // Expected truth of each predicate for (NaN, 1.0) and for the ordinary (1.0, 2.0).
+    let nan_expected = [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0];
+    let norm_expected = [1, 1, 0, 0, 0, 1, 0, 0, 1, 1, 1];
+    let nan = f64::NAN;
+    for (which, &e) in nan_expected.iter().enumerate() {
+        check(
+            &format!("fcmp_nan_{which}"),
+            src,
+            &[Value::I32(which as i32), Value::F64(nan), Value::F64(1.0)],
+            &[Value::I32(e)],
+        );
+    }
+    for (which, &e) in norm_expected.iter().enumerate() {
+        check(
+            &format!("fcmp_norm_{which}"),
+            src,
+            &[Value::I32(which as i32), Value::F64(1.0), Value::F64(2.0)],
+            &[Value::I32(e)],
+        );
+    }
+}
+
+#[test]
+fn bitreverse_intrinsic() {
+    // A bit-reversal loop `-O2` folds into `llvm.bitreverse.i32`; lowered inline via the log-N
+    // swap network. Checked against native `cc`.
+    let src = "unsigned br(unsigned x);\n\
+               int run(int s){\n\
+                 unsigned acc = 0;\n\
+                 for (int i = 0; i < 6; i++) acc = acc*7 + br((unsigned)(s + i) * 2654435761u);\n\
+                 return (int)(acc & 0x7fffffff);\n\
+               }\n\
+               unsigned br(unsigned x){\n\
+                 unsigned r = 0; for (int i = 0; i < 32; i++){ r = (r << 1) | (x & 1u); x >>= 1; } return r;\n\
+               }";
+    check_vs_native("bitreverse", src, 5);
+}
+
+#[test]
+fn narrow_minmax_noncanonical() {
+    // Regression for a silent miscompile found via Embench `qrduino`. clang `-O2` lowers a
+    // `if (x > y) swap(x, y)` over `unsigned char` to `llvm.umin.i8`/`umax.i8`, and folds `trunc(c - 1)`
+    // into `add i8 (trunc c), -1` — a result whose i32 container is **non-canonical** (high bits set,
+    // because the narrow `bin` path didn't mask sub-32 widths). The min/max then did an unsigned i32
+    // compare on the dirty container and picked the wrong operand. `tri` is qrduino's triangular index
+    // (`setmask`/`ismasked`). Straight-line (no loop, to avoid auto-vectorization) with a runtime
+    // center `c` so the `c±1` i8 arithmetic is actually emitted rather than const-folded.
+    let src = "int run(int s);\n\
+               static unsigned tri(unsigned char x, unsigned char y){\n\
+                 unsigned bt;\n\
+                 if (x > y){ bt = x; x = y; y = bt; }\n\
+                 bt = y; bt *= y; bt += y; bt >>= 1; bt += x; return bt;\n\
+               }\n\
+               int run(int s){\n\
+                 unsigned char c = (unsigned char) s;\n\
+                 unsigned acc = 0;\n\
+                 acc += tri(c-1, c);   acc += tri(c, c-1);\n\
+                 acc += tri(c-1, c+1); acc += tri(c+1, c-1);\n\
+                 acc += tri(c-2, c);   acc += tri(c, c-2);\n\
+                 return (int)(acc & 0x7f);\n\
+               }\n\
+               int main(void){ return run(18); }";
+    check_vs_native("narrow_minmax", src, 18);
+}
+
+#[test]
+fn narrow_signed_shift_div_rem() {
+    // A **signed** narrow op reads its whole i32 container as signed, but a narrow `iN` value loaded
+    // from memory is *zero-extended* (canonical) — its sign bit is buried at bit N-1, not the
+    // container's bit 31. So `ashr`/`sdiv`/`srem` on an `i8`/`i16` must sign-extend the operand first.
+    // Before the fix `ashr i8 0x80,7` gave `+1` (should be `-1`), which dropped Lua's `getobjname`
+    // operand name (`testMMMode` compiles to exactly `ashr i8 luaP_opmodes[op],7`); `(i8)-6/3` gave the
+    // unsigned `83`, not `-2`. `volatile` forces the values through memory (a real `load i8`), and the
+    // negatives exercise the sign path. Differential interp+JIT+native `cc`.
+    let src = "int run(int s);\n\
+               int run(int s){\n\
+                 volatile unsigned char ub = (unsigned char)(0x80 ^ (s & 0x20));\n\
+                 signed char sb = ub;                 /* negative i8 */\n\
+                 volatile unsigned short uh = (unsigned short)(0x8000 ^ (s << 4));\n\
+                 short sh = uh;                        /* negative i16 */\n\
+                 int r = 0;\n\
+                 r = r * 37 + (int)(sb >> 2);          /* ashr i8  */\n\
+                 r = r * 37 + (int)(sh >> 4);          /* ashr i16 */\n\
+                 r = r * 37 + (int)(sb / 3);           /* sdiv i8  */\n\
+                 r = r * 37 + (int)(sb % 3);           /* srem i8  */\n\
+                 r = r * 37 + (int)(sh / 7);           /* sdiv i16 */\n\
+                 r = r * 37 + (int)(sh % 7);           /* srem i16 */\n\
+                 r = r * 37 + (int)((unsigned char)ub >> 2);  /* lshr i8 stays unsigned */\n\
+                 return r & 0xff;\n\
+               }\n\
+               int main(void){ return run(5); }";
+    check_vs_native("narrow_signed_shift_div_rem", src, 5);
+}
+
+#[test]
+fn const_ptrtoint_i32_width() {
+    // A constexpr `ptrtoint (ptr @g to i32)` is an **i32** value: the translator folds constant
+    // pointers to their `i64` window address, but must honor ptrtoint's target width — emitting the
+    // raw I64 fed an i32 subtract and failed verification (TypeMismatch), hit by ltests.c's
+    // `strchr(ops, op) - ops` as `int`. The difference is address-independent, so the differential
+    // checks the value, not the (different) native vs guest addresses.
+    let src = "static const char ops[] = \"ZBRGLTIF\";\n\
+               int run(int s);\n\
+               int run(int s){\n\
+                 const char *p = ops + (s % 7) + 1;\n\
+                 int off = (int)(long)p - (int)(long)ops;   /* sub i32 …, ptrtoint(@ops to i32) */\n\
+                 return off * 3 + 1;\n\
+               }\n\
+               int main(void){ return run(4); }";
+    check_vs_native("const_ptrtoint_i32_width", src, 4);
+}
+
+#[test]
+fn signed_narrow_minmax() {
+    // Companion to `narrow_minmax_noncanonical`: a `signed char` min reduction that `-O2` lowers to a
+    // scalar `llvm.smin.i8` whose operand is a *negative* i8 (here -100). Narrow values are held
+    // canonical (zero-extended low bits), so -100 sits in the container as 0x9C = 156; a naive signed
+    // i32 compare would treat it as positive and pick the wrong operand. The min/max lowering must
+    // **sign**-extend narrow operands for the signed predicates (mirroring `ICmp`'s §3b handling) — the
+    // producer-side narrow masking alone doesn't suffice for the signed case.
+    let src = "int run(int s);\n\
+               static signed char redmin(int s){\n\
+                 signed char d[6] = {10, -5, 3, -100, (signed char) s, -1};\n\
+                 signed char m = 100;\n\
+                 for (int i = 0; i < 6; i++) m = d[i] < m ? d[i] : m;\n\
+                 return m;\n\
+               }\n\
+               int run(int s){ return (int)(unsigned char) redmin(s); }\n\
+               int main(void){ return run(7); }";
+    check_vs_native("signed_minmax", src, 7);
+}
+
+#[test]
+fn funnel_shift_i16() {
+    // `-O2` folds `(a << 1) | (b >> 15)` over `unsigned short` into `llvm.fshl.i16` — a *general*
+    // funnel shift (distinct operands), constant amount, at a sub-32 width. The on-ramp lowers it as
+    // `(a << s) | (b >>u (w - s))` in the i32 container and masks the result back to 16 bits (the value
+    // is narrower than its container). Found via Embench `picojpeg`.
+    let src = "int run(int s);\n\
+               static unsigned short fl(unsigned short a, unsigned short b){\n\
+                 return (unsigned short)((a << 1) | (b >> 15));\n\
+               }\n\
+               int run(int s){\n\
+                 unsigned short a = (unsigned short)(s * 40503u);\n\
+                 unsigned short b = (unsigned short)(s * 12345u + 7u);\n\
+                 unsigned short r = fl(a, b);\n\
+                 return (int)(r ^ (r >> 8)) & 0xff;\n\
+               }\n\
+               int main(void){ return run(3); }";
+    check_vs_native("funnel_i16", src, 3);
+}
+
+#[test]
+fn vector_mask_sext() {
+    // A byte-array compare-to-mask that `-O2` vectorizes to `icmp slt <16 x i8>` → `sext <16 x i1> to
+    // <16 x i8>`. The `<N x i1>` source is a lane-wise mask (`mask_lanes`, not a packed vector), so the
+    // vector-convert path resolves it via `mask_operand` and sign-extends each `0`/`1` lane to `0`/`-1`.
+    // Found via Embench `picojpeg` (a `select` mask materialized to a byte vector).
+    let src = "int run(int s);\n\
+               static signed char a[64], b[64], out[64];\n\
+               int run(int s){\n\
+                 for (int i = 0; i < 64; i++){ a[i] = (signed char)(s*7 + i*13); b[i] = (signed char)(s*3 + i*5 - 40); }\n\
+                 for (int i = 0; i < 64; i++) out[i] = -(signed char)(a[i] < b[i]);\n\
+                 int acc = 0;\n\
+                 for (int i = 0; i < 64; i++) acc = acc*3 + (out[i] & 0xff);\n\
+                 return acc & 0x7f;\n\
+               }\n\
+               int main(void){ return run(9); }";
+    check_vs_native("mask_sext", src, 9);
+}
+
+#[test]
+fn float_arithmetic_and_fmuladd() {
+    // a*b + a/b - b — `-O2` contracts `a*b + (a/b)` into `llvm.fmuladd`, which we lower unfused.
+    let src = "double fa(double a, double b){ return a*b + a/b - b; }";
+    check(
+        "fa",
+        src,
+        &[Value::F64(6.0), Value::F64(2.0)],
+        &[Value::F64(13.0)],
+    );
+}
+
+#[test]
+fn float_compare() {
+    let src = "int cmp(double a, double b){ return a < b ? 1 : (a == b ? 0 : -1); }";
+    check(
+        "cmp_lt",
+        src,
+        &[Value::F64(1.0), Value::F64(2.0)],
+        &[Value::I32(1)],
+    );
+    check(
+        "cmp_eq",
+        src,
+        &[Value::F64(2.0), Value::F64(2.0)],
+        &[Value::I32(0)],
+    );
+    check(
+        "cmp_gt",
+        src,
+        &[Value::F64(3.0), Value::F64(2.0)],
+        &[Value::I32(-1)],
+    );
+}
+
+#[test]
+fn float_int_conversions() {
+    check(
+        "i2d",
+        "double i2d(int n){ return (double)n + 0.5; }",
+        &[Value::I32(3)],
+        &[Value::F64(3.5)],
+    );
+    check(
+        "d2i",
+        "int d2i(double x){ return (int)(x * 2.0); }",
+        &[Value::F64(3.5)],
+        &[Value::I32(7)],
+    );
+}
+
+#[test]
+fn float_promote_demote() {
+    // f32 → f64 (fpext), arithmetic, then f64 → f32 (fptrunc).
+    let src = "float fp(float a, double b){ return (float)(a + b); }";
+    check(
+        "fp",
+        src,
+        &[Value::F32(1.5), Value::F64(2.25)],
+        &[Value::F32(3.75)],
+    );
+}
+
+#[test]
+fn float_intrinsics_abs_floor() {
+    // `fabs`/`floor` lower to `llvm.fabs`/`llvm.floor` (errno-free, so real intrinsics at -O2,
+    // unlike `sqrt` which stays a libc call pending the libc-binding slice).
+    check(
+        "ab",
+        "double ab(double x){ return __builtin_fabs(x); }",
+        &[Value::F64(-3.5)],
+        &[Value::F64(3.5)],
+    );
+    check(
+        "fl",
+        "double fl(double x){ return __builtin_floor(x); }",
+        &[Value::F64(3.7)],
+        &[Value::F64(3.0)],
+    );
+    check(
+        "fl_neg",
+        "double fl(double x){ return __builtin_floor(x); }",
+        &[Value::F64(-2.1)],
+        &[Value::F64(-3.0)],
+    );
+}
+
+#[test]
+fn indirect_call_via_function_pointer() {
+    // `pick` (noinline) returns a function pointer; `run` calls it indirectly — `-O2` keeps it a
+    // real `call_indirect`. Exercises taking a function's address (funcref), threading it as an
+    // i64 pointer through a `select`/return, and the §3c masked + type-checked indirect dispatch.
+    let src = "int inc(int); int dec(int); typedef int(*fp)(int); fp pick(int); \
+               int run(int sel, int x){ return pick(sel)(x); } \
+               __attribute__((noinline)) fp pick(int sel){ return sel ? inc : dec; } \
+               __attribute__((noinline)) int inc(int x){ return x + 1; } \
+               __attribute__((noinline)) int dec(int x){ return x - 1; }";
+    check(
+        "run_inc",
+        src,
+        &[Value::I32(1), Value::I32(10)],
+        &[Value::I32(11)],
+    );
+    check(
+        "run_dec",
+        src,
+        &[Value::I32(0), Value::I32(10)],
+        &[Value::I32(9)],
+    );
+}
+
+#[test]
+fn global_struct_fields() {
+    // A global struct {i32, i32, i64} read field-by-field — struct GEP (constant field offsets) +
+    // a read-only struct `data` segment with the {1,2,3} initializer laid out with field padding.
+    let src = "struct Point { int x; int y; long tag; }; \
+               const struct Point g = {1, 2, 3}; \
+               long sum(void){ return g.x + g.y + g.tag; }";
+    check("gstruct", src, &[], &[Value::I64(6)]);
+}
+
+#[test]
+fn array_of_structs() {
+    // `arr[i].field` — an array-of-struct GEP: a variable array index (stride = struct size) then
+    // a constant struct-field offset.
+    let src = "struct P { int x; int y; }; \
+               static const struct P arr[3] = {{1,2},{3,4},{5,6}}; \
+               int get(int i){ return arr[i].x + arr[i].y; }";
+    check("aos_1", src, &[Value::I32(1)], &[Value::I32(7)]); // 3+4
+    check("aos_2", src, &[Value::I32(2)], &[Value::I32(11)]); // 5+6
+}
+
+#[test]
+fn stack_struct() {
+    // A `volatile` struct local stays on the data stack (`alloca` of the struct) — exercises a
+    // struct-sized frame slot plus field store/load via struct GEP.
+    let src = "struct Point { int x; int y; long tag; }; \
+               long f(int a){ volatile struct Point p; p.x = a; p.y = a * 2; p.tag = a; \
+               return p.x + p.y + p.tag; }";
+    check("sstruct", src, &[Value::I32(5)], &[Value::I64(20)]); // 5+10+5
+}
+
+#[test]
+fn kitchen_sink_vs_native() {
+    // A large self-contained program exercising the whole translator at once — structs by value
+    // (Vec3 → byval), a function-pointer table (`ops`, a relocation + indirect call), floats +
+    // libm (`sqrt`/`fabs`), recursion (`fib`), loops + an array copy (→ memcpy), a const global
+    // array, `switch`, and the int min/max + bit intrinsics — folded to a byte and checked against
+    // native `cc`. `run` is defined first (func 0); `seed` is runtime so clang can't constant-fold.
+    let src = "\
+struct Vec3 { double x; double y; double z; }; \
+double dot(struct Vec3, struct Vec3); int fib(int); int add(int,int); int mul(int,int); \
+typedef int (*op)(int,int); static op ops[2] = { add, mul }; int apply(int,int,int); \
+static const int squares[8] = { 0,1,4,9,16,25,36,49 }; \
+int run(int seed){ \
+    unsigned h = 2166136261u ^ (unsigned)seed; \
+    struct Vec3 a = { 1.5, 2.0, (double)(3 + seed) }, b = { 4.0, 0.5, 2.0 }; \
+    double d = dot(a, b); \
+    h ^= (unsigned)(d * 8.0); h *= 16777619u; \
+    double s = __builtin_sqrt(d * d) + __builtin_fabs((double)(-seed)); \
+    h ^= (unsigned)s; h *= 16777619u; \
+    h ^= (unsigned)fib(12 + (seed & 1)); \
+    h ^= (unsigned)apply(0, seed, 4); h ^= (unsigned)apply(1, seed, 3); \
+    int arr[16]; for (int i=0;i<16;i++) arr[i] = i*i + seed; \
+    int arr2[16]; for (int i=0;i<16;i++) arr2[i] = arr[i]; \
+    int sum = 0; for (int i=0;i<16;i++) sum += arr2[i]; \
+    h ^= (unsigned)sum; \
+    for (int i=0;i<8;i++){ int v; \
+        switch ((i + seed) & 3){ \
+            case 0: v = __builtin_popcount((unsigned)(i+1)); break; \
+            case 1: v = (i > 4 ? i : 4); break; \
+            case 2: v = __builtin_clz((unsigned)(i+1)); break; \
+            default: v = squares[i] - i; break; } \
+        h += (unsigned)v; } \
+    return (int)((h ^ (h>>8) ^ (h>>16) ^ (h>>24)) & 0xFF); \
+} \
+int main(void){ return run(7); } \
+double dot(struct Vec3 a, struct Vec3 b){ return a.x*b.x + a.y*b.y + a.z*b.z; } \
+int fib(int n){ if (n < 2) return n; return fib(n-1) + fib(n-2); } \
+int add(int a, int b){ return a + b; } \
+int mul(int a, int b){ return a * b; } \
+int apply(int sel, int a, int b){ return ops[sel & 1](a, b); }";
+    check_vs_native("kitchen", src, 7);
+}
+
+/// The shared core of the powerbox differential: given the legalized `bc` and the C source file it
+/// came from, build the source natively with `cc`, run both, and assert the Temen translation's stdout
+/// **and** exit code match native. Exercises the whole Lane C on-ramp end-to-end (the synthesized
+/// `_start`, the handle stash, libc → `Stream`/`Exit`). Skips silently if `cc` is unavailable.
+fn powerbox_diff(name: &str, bc: &std::path::Path, c_src: &std::path::Path, stdin: &[u8]) {
+    powerbox_diff_cc_flags(name, bc, c_src, stdin, &[]);
+}
+
+/// [`powerbox_diff`] with extra `cc` flags for the **native oracle** build (e.g. the `-I` pointing
+/// at a fetched amalgamation). The bitcode side's extra flags are the caller's business.
+fn powerbox_diff_cc_flags(
+    name: &str,
+    bc: &std::path::Path,
+    c_src: &std::path::Path,
+    stdin: &[u8],
+    cc_extra: &[&str],
+) {
+    // Native oracle: build with `cc`, run, capture stdout + exit code.
+    let exe = std::env::temp_dir().join(format!("temen_llvm_pb_{}_{}", std::process::id(), name));
+    // `-lm` so demos that call libm (`sqrt`/`floor`/…) link natively; harmless for the rest.
+    match Command::new("cc")
+        .args(cc_extra)
+        .arg(c_src)
+        .arg("-lm")
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping {name} (cc unavailable)");
+            return;
+        }
+    }
+    let native = {
+        use std::io::Write;
+        let mut child = Command::new(&exe)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn native");
+        child.stdin.take().unwrap().write_all(stdin).ok();
+        child.wait_with_output().expect("run native")
+    };
+    let native_code = native.status.code().unwrap_or(-1) as u8;
+
+    // The on-ramp: translate → resolve §7 imports to concrete capabilities → verify → run.
+    let t = temen_llvm::translate_ll_path(bc).expect("translate bitcode");
+    assert!(
+        temen_run::is_named_powerbox_entry(&t.module),
+        "{name}: a libc program must produce a named-export powerbox entry (paramless _start, S15 c)"
+    );
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
+    temen_verify::verify_module(&module).expect("verify translated IR");
+    let run = temen_run::run_powerbox(&module, stdin).expect("powerbox run");
+
+    assert_eq!(
+        run.stdout, native.stdout,
+        "{name}: temen stdout {:?} vs native {:?}",
+        run.stdout, native.stdout
+    );
+    let temen_code = match run.outcome {
+        temen_run::Outcome::Exited(c) => c as u8,
+        temen_run::Outcome::Returned(ref v) => match v.first() {
+            Some(temen_interp::Value::I32(x)) => *x as u8,
+            _ => 0,
+        },
+    };
+    assert_eq!(
+        temen_code, native_code,
+        "{name}: temen exit {temen_code} vs native {native_code}"
+    );
+}
+
+/// Compile a **powerbox program** (real I/O via libc) from an inline source string and run the
+/// differential ([`powerbox_diff`]).
+fn check_powerbox_vs_native(name: &str, src: &str, stdin: &[u8]) {
+    let Some(bc) = compile_to_ll(name, src) else {
+        return;
+    };
+    let c = std::env::temp_dir().join(format!("temen_llvm_{}_{}.c", std::process::id(), name));
+    powerbox_diff(name, &bc, &c, stdin);
+}
+
+/// The argv differential: build/run the native binary with a **controlled `argv`** (`args[0]` as the
+/// process name, via `arg0`, so it matches the Temen blob) and a cleared+seeded environment, then run
+/// the Temen translation with the same vectors through [`temen_run::run_powerbox_with_args`], asserting
+/// stdout + exit code match. This is the only way to compare a `main(int, char**)` program: native
+/// `argv[0]` is otherwise the temp path, which the guest can't (and shouldn't) reproduce.
+fn check_powerbox_vs_native_args(name: &str, src: &str, args: &[&str], env: &[&str]) {
+    use std::os::unix::process::CommandExt;
+    let Some(bc) = compile_to_ll(name, src) else {
+        return;
+    };
+    let c = std::env::temp_dir().join(format!("temen_llvm_{}_{}.c", std::process::id(), name));
+    std::fs::write(&c, src).expect("write c source");
+    let exe = std::env::temp_dir().join(format!("temen_llvm_pba_{}_{}", std::process::id(), name));
+    match Command::new("cc").arg(&c).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping {name} (cc unavailable)");
+            return;
+        }
+    }
+    let mut cmd = Command::new(&exe);
+    cmd.arg0(args[0]).args(&args[1..]).env_clear();
+    for e in env {
+        let (k, v) = e.split_once('=').expect("env entry KEY=VALUE");
+        cmd.env(k, v);
+    }
+    let native = cmd.output().expect("run native");
+    let native_code = native.status.code().unwrap_or(-1) as u8;
+
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
+    temen_verify::verify_module(&module).expect("verify translated IR");
+    let argv: Vec<&[u8]> = args.iter().map(|s| s.as_bytes()).collect();
+    let envv: Vec<&[u8]> = env.iter().map(|s| s.as_bytes()).collect();
+    let run =
+        temen_run::run_powerbox_with_args(&module, b"", &argv, &envv).expect("powerbox run (args)");
+
+    assert_eq!(
+        run.stdout, native.stdout,
+        "{name}: temen stdout {:?} vs native {:?}",
+        run.stdout, native.stdout
+    );
+    let temen_code = match run.outcome {
+        temen_run::Outcome::Exited(c) => c as u8,
+        temen_run::Outcome::Returned(ref v) => match v.first() {
+            Some(temen_interp::Value::I32(x)) => *x as u8,
+            _ => 0,
+        },
+    };
+    assert_eq!(
+        temen_code, native_code,
+        "{name}: temen exit {temen_code} vs native {native_code}"
+    );
+}
+
+/// Run the powerbox differential on a **real corpus demo** (`crates/temen-run/demos/<rel>`) — a
+/// whole-program, self-contained C file (its own `memset`, `write`-only output). This is the D54
+/// "matches native clang" exit criterion applied to an actual library. The file is compiled *in
+/// place* so its same-directory `#include "…"`s resolve.
+fn check_demo_vs_native(name: &str, rel: &str, stdin: &[u8]) {
+    check_demo_vs_native_flags(name, rel, stdin, &[]);
+}
+
+/// Fetch (and cache) LMDB's source (`mdb.c`/`midl.c`/`lmdb.h`/`midl.h`) from the upstream GitHub
+/// mirror. OpenLDAP Public License — **not vendored** (fetched once per machine, like the SQLite
+/// amalgamation). Returns the cache dir, or `None` (skip) when offline.
+fn fetch_lmdb() -> Option<PathBuf> {
+    const BASE: &str = "https://raw.githubusercontent.com/LMDB/lmdb/mdb.master/libraries/liblmdb";
+    let cache = std::env::temp_dir().join("temen_lmdb_cache");
+    let _ = std::fs::create_dir_all(&cache);
+    for f in ["mdb.c", "midl.c", "lmdb.h", "midl.h"] {
+        let dst = cache.join(f);
+        if dst.exists() {
+            continue;
+        }
+        let ok = Command::new("curl")
+            .args(["-sfL", "--max-time", "120", "-o"])
+            .arg(&dst)
+            .arg(format!("{BASE}/{f}"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            let _ = std::fs::remove_file(&dst);
+            eprintln!("note: skipping lmdb ({f} fetch failed — offline?)");
+            return None;
+        }
+    }
+    Some(cache)
+}
+
+/// Fetch (and cache in the temp dir) the SQLite amalgamation for the Phase A capstone. Public
+/// domain, ~9 MB — deliberately **not vendored**; fetched once per machine and reused. Returns the
+/// directory containing `sqlite3.c`/`sqlite3.h`, or `None` (skip, with a note) when offline.
+/// Needs ≥ 3.47: earlier amalgamations carry `long double` literals in `sqlite3FpDecode`
+/// (`x86_fp80` in the IR); 3.47+ replaced that path with Dekker double-double arithmetic.
+fn fetch_sqlite_amalgamation() -> Option<PathBuf> {
+    const VERSION_DIR: &str = "sqlite-amalgamation-3500200";
+    const URL: &str = "https://sqlite.org/2025/sqlite-amalgamation-3500200.zip";
+    let cache = std::env::temp_dir().join("temen_sqlite_cache");
+    let dir = cache.join(VERSION_DIR);
+    if dir.join("sqlite3.c").exists() {
+        return Some(dir);
+    }
+    std::fs::create_dir_all(&cache).ok()?;
+    let zip = cache.join("amalgamation.zip");
+    let fetched = Command::new("curl")
+        .args(["-sfL", "--max-time", "120", "-o"])
+        .arg(&zip)
+        .arg(URL)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !fetched {
+        eprintln!("note: skipping sqlite (amalgamation fetch failed — offline?)");
+        return None;
+    }
+    let unzipped = Command::new("unzip")
+        .arg("-o")
+        .arg("-q")
+        .arg(&zip)
+        .arg("-d")
+        .arg(&cache)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !unzipped || !dir.join("sqlite3.c").exists() {
+        eprintln!("note: skipping sqlite (unzip failed)");
+        return None;
+    }
+    Some(dir)
+}
+
+/// Fetch (and cache) openlibm — the standalone BSD libm (JuliaMath/openlibm) — for the **bundled
+/// guest libm** (Postgres' transcendentals: the Temen has no transcendental op, so `log`/`exp`/`pow`/…
+/// stay guest code, llvm-linked in). Fetched-not-vendored; returns the extracted dir or `None`
+/// (skip) offline. Its C sources carry no inline asm (the asm lives in separate `amd64/`/`i387/`
+/// dirs we don't compile), and the double set translates through the on-ramp with zero gaps.
+fn fetch_openlibm() -> Option<PathBuf> {
+    const VER: &str = "0.8.5";
+    let cache = std::env::temp_dir().join("temen_openlibm_cache");
+    let dir = cache.join(format!("openlibm-{VER}"));
+    if dir.join("src/e_log.c").exists() {
+        return Some(dir);
+    }
+    std::fs::create_dir_all(&cache).ok()?;
+    let tgz = cache.join("openlibm.tar.gz");
+    let url = format!("https://github.com/JuliaMath/openlibm/archive/refs/tags/v{VER}.tar.gz");
+    let ok = Command::new("curl")
+        .args(["-sfL", "--max-time", "120", "-o"])
+        .arg(&tgz)
+        .arg(&url)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if ok {
+        let untarred = Command::new("tar")
+            .arg("xf")
+            .arg(&tgz)
+            .arg("-C")
+            .arg(&cache)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if untarred && dir.join("src/e_log.c").exists() {
+            return Some(dir);
+        }
+        eprintln!("note: openlibm untar failed; trying a shallow tag clone");
+    } else {
+        eprintln!("note: openlibm archive unavailable; trying a shallow tag clone");
+    }
+    // GitHub's archive endpoint is gated on some networks (403) while git over https stays
+    // reachable — the same split `demos/doom/fetch.sh` works around. The clone is tag-pinned to
+    // the same commit, so the sources are identical to the archive's.
+    std::fs::remove_dir_all(&dir).ok();
+    let cloned = Command::new("git")
+        .args([
+            "-c",
+            "advice.detachedHead=false",
+            "clone",
+            "-q",
+            "--depth",
+            "1",
+            "--branch",
+        ])
+        .arg(format!("v{VER}"))
+        .args(["https://github.com/JuliaMath/openlibm"])
+        .arg(&dir)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !cloned || !dir.join("src/e_log.c").exists() {
+        eprintln!("note: skipping libm (openlibm archive + clone both failed — offline?)");
+        return None;
+    }
+    Some(dir)
+}
+
+/// The openlibm double-precision source set the bundled libm needs — the 18 Postgres transcendentals'
+/// entry points plus their kernels (argument reduction `k_*`/`e_rem_pio2`, `k_exp`, `expm1`, scaling).
+/// `sqrt`/`fabs` the openlibm code calls resolve to on-ramp float ops (so no `e_sqrt` needed).
+const OPENLIBM_SRCS: &[&str] = &[
+    "e_log",
+    "e_log10",
+    "e_log2",
+    "e_exp",
+    "s_exp2",
+    "e_pow",
+    "s_sin",
+    "s_cos",
+    "s_tan",
+    "k_sin",
+    "k_cos",
+    "k_tan",
+    "e_rem_pio2",
+    "k_rem_pio2",
+    "e_asin",
+    "e_acos",
+    "s_atan",
+    "e_atan2",
+    "e_sinh",
+    "e_cosh",
+    "s_tanh",
+    "s_cbrt",
+    "e_fmod",
+    "s_scalbn",
+    "s_copysign",
+    "s_fabs",
+    "k_exp",
+    "s_expm1",
+];
+
+#[test]
+fn libm_bundled_vs_native() {
+    // **Bundle a real guest libm (openlibm) — the Postgres transcendental surface.** The Temen has no
+    // transcendental op, so `log`/`exp`/`pow`/`sin`/… stay **guest code** (the raytrace model, but a
+    // *real* libm, llvm-linked). This proves the on-ramp reproduces openlibm **bit-for-bit** vs
+    // native: both sides link the *same* openlibm (not the system `-lm`), so the differential isolates
+    // the math translation, and the driver (`demos/postgres/libm_probe.c`) FNV-hashes raw IEEE result
+    // bits + prints hex — so float formatting is out of the loop and the test asserts the math itself,
+    // over ~3600 evaluations. Unblocks the Postgres libm externals. Fetched-not-vendored; skips offline.
+    let Some(ol) = fetch_openlibm() else {
+        return;
+    };
+    let driver = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../temen-run/demos/postgres/libm_probe.c");
+    let pid = std::process::id();
+    let incs = [
+        format!("-I{}", ol.display()),
+        format!("-I{}/include", ol.display()),
+        format!("-I{}/src", ol.display()),
+        format!("-I{}/amd64", ol.display()),
+    ];
+    let cflags = [
+        "-O2",
+        "-fno-vectorize",
+        "-fno-slp-vectorize",
+        "-DASSEMBLER=0",
+    ];
+
+    // Guest: each openlibm source + the driver → `.ll`, then `llvm-link -S` into one module.
+    let mut bcs: Vec<PathBuf> = Vec::new();
+    for name in OPENLIBM_SRCS
+        .iter()
+        .copied()
+        .chain(std::iter::once("__driver"))
+    {
+        let (src, out) = if name == "__driver" {
+            (
+                driver.clone(),
+                std::env::temp_dir().join(format!("olbc_{pid}_driver.ll")),
+            )
+        } else {
+            (
+                ol.join("src").join(format!("{name}.c")),
+                std::env::temp_dir().join(format!("olbc_{pid}_{name}.ll")),
+            )
+        };
+        let mut cmd = Command::new("clang");
+        cmd.args(cflags).args(["-emit-llvm", "-S"]);
+        for i in &incs {
+            cmd.arg(i);
+        }
+        cmd.arg(&src).arg("-o").arg(&out);
+        match cmd.status() {
+            Ok(s) if s.success() => bcs.push(out),
+            _ => {
+                eprintln!("note: skipping libm (clang unavailable / compile failed on {name})");
+                return;
+            }
+        }
+    }
+    let linked = std::env::temp_dir().join(format!("olbc_{pid}_libm.ll"));
+    if !Command::new("llvm-link")
+        .arg("-S")
+        .args(&bcs)
+        .arg("-o")
+        .arg(&linked)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        eprintln!("note: skipping libm (llvm-link unavailable)");
+        return;
+    }
+
+    // Native oracle: the same driver + openlibm sources, **no `-lm`** (so both sides run openlibm).
+    let exe = std::env::temp_dir().join(format!("olbc_{pid}_native"));
+    let mut cc = Command::new("cc");
+    cc.args(["-O2", "-DASSEMBLER=0"]);
+    for i in &incs {
+        cc.arg(i);
+    }
+    cc.arg(&driver);
+    for name in OPENLIBM_SRCS {
+        cc.arg(ol.join("src").join(format!("{name}.c")));
+    }
+    cc.arg("-o").arg(&exe);
+    match cc.status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping libm (cc unavailable)");
+            return;
+        }
+    }
+    let native = Command::new(&exe).output().expect("run native libm");
+
+    // Guest: translate → resolve caps → verify → run (JIT via the powerbox).
+    let t = temen_llvm::translate_ll_path(&linked).expect("translate bundled libm");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
+    temen_verify::verify_module(&module).expect("verify libm module");
+    let run = temen_run::run_powerbox(&module, b"").expect("powerbox run libm");
+    assert!(
+        !native.stdout.is_empty() && native.status.success(),
+        "native libm oracle produced no output"
+    );
+    assert_eq!(
+        run.stdout,
+        native.stdout,
+        "libm: guest hash {} vs native {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&native.stdout)
+    );
+}
+
+/// Fetch (and cache) Bellard's QuickJS (2024-01-13, MIT) — the full-JS-engine breadth target
+/// (LLVM.md "Active target — QuickJS"). Fetched-not-vendored from the upstream mirror; returns the
+/// extracted dir or `None` (skip) offline. Core set: `quickjs.c` + `libregexp`/`libunicode`/`cutils`/
+/// `libbf`; no inline asm, no generated-at-build headers beyond what ships in the tarball.
+fn fetch_quickjs() -> Option<PathBuf> {
+    const VER: &str = "2024-01-13";
+    let cache = std::env::temp_dir().join("temen_quickjs_cache");
+    let dir = cache.join(format!("quickjs-{VER}"));
+    if dir.join("quickjs.c").exists() {
+        return Some(dir);
+    }
+    std::fs::create_dir_all(&cache).ok()?;
+    let txz = cache.join(format!("quickjs-{VER}.tar.xz"));
+    let url = format!("https://bellard.org/quickjs/quickjs-{VER}.tar.xz");
+    let ok = Command::new("curl")
+        .args(["-sfL", "--max-time", "120", "-o"])
+        .arg(&txz)
+        .arg(&url)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("note: skipping quickjs (fetch failed — offline?)");
+        return None;
+    }
+    let ok = Command::new("tar")
+        .arg("xf")
+        .arg(&txz)
+        .arg("-C")
+        .arg(&cache)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok || !dir.join("quickjs.c").exists() {
+        eprintln!("note: skipping quickjs (untar failed)");
+        return None;
+    }
+    Some(dir)
+}
+
+/// The openlibm sources QuickJS's `Math` object takes the address of beyond [`OPENLIBM_SRCS`]
+/// (the Postgres set) — inverse hyperbolics, `log1p`, `hypot`, and the rounding/sqrt set. The
+/// latter four only ever surface here: direct *calls* to `floor`/`ceil`/`trunc`/`sqrt` lower to
+/// Temen float ops (slice L), but the `Math` function table takes their *address*, which needs a
+/// real guest definition for the funcref table.
+const QUICKJS_OPENLIBM_EXTRA: &[&str] = &[
+    "s_asinh", "e_acosh", "e_atanh", "s_log1p", "e_hypot", "s_floor", "s_ceil", "s_trunc", "e_sqrt",
+];
+
+/// **▶ QuickJS eval — the full-JS-engine breadth target. RUNS byte-identical to native.** Wires the
+/// whole differential pipeline — fetch QuickJS + openlibm, compile the engine TUs + the
+/// `demos/quickjs/qjs_eval.c` driver + the guest libm + the libc/stdio shims to `.ll`, `llvm-link -S`
+/// into one textual module, then translate → verify → run vs a native `cc` oracle. The unmodified
+/// QuickJS 2024-01-13 engine (1175 funcs) translates, verifies, and executes the driver program
+/// (recursion + a `sort` closure + `JSON.stringify` + string methods + `toFixed`) with stdout
+/// byte-identical to native. Costs real wall-clock (it fetches openlibm and runs a whole JS engine
+/// on the tree-walking interpreter, tens of seconds) but runs in CI anyway: these tests are the
+/// only guard on the QuickJS on-ramp recipe (the address-taken `Math` set drifted unseen while
+/// they were `#[ignore]`d). A failed fetch skips loudly rather than failing — grep CI logs for
+/// `skipping quickjs` before trusting a green run.
+///
+/// Shared harness: build the linked QuickJS module for `driver_rel` (a `demos/quickjs/*.c` driver),
+/// run it under the powerbox with `stdin`, and assert stdout byte-matches the native `cc` oracle
+/// (fed the same stdin). Used by both the `qjs_eval` (built-in program) and `qjs_repl` (JS from
+/// stdin) tests. Skips cleanly when QuickJS/openlibm/clang are unavailable.
+fn quickjs_diff(driver_rel: &str, stdin: &[u8]) {
+    let (Some(qjs), Some(ol)) = (fetch_quickjs(), fetch_openlibm()) else {
+        eprintln!("note: skipping quickjs (QuickJS/openlibm fetch failed — offline?)");
+        return;
+    };
+    let pid = std::process::id();
+    let driver = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../temen-run/demos/quickjs")
+        .join(driver_rel);
+    let incs = [
+        format!("-I{}", qjs.display()),
+        format!("-I{}", ol.display()),
+        format!("-I{}/include", ol.display()),
+        format!("-I{}/src", ol.display()),
+        format!("-I{}/amd64", ol.display()),
+    ];
+    // On-ramp compile flags: no vectorization (capstone convention), NDEBUG drops `__assert_fail`.
+    let cflags = [
+        "-O2",
+        "-emit-llvm",
+        "-S",
+        "-fno-vectorize",
+        "-fno-slp-vectorize",
+        "-DNDEBUG",
+        "-D_GNU_SOURCE",
+        "-DCONFIG_VERSION=\"2024-01-13\"",
+        "-DASSEMBLER=0",
+    ];
+    // Per-driver discriminator so the two QuickJS tests don't collide on temp files under parallel
+    // `--ignored` runs.
+    let disc = driver_rel.replace(['.', '/', '\\'], "_");
+    // Compile QuickJS TUs + driver + the guest-libm set, each → textual `.ll`.
+    let qjs_tus = ["quickjs", "libregexp", "libunicode", "cutils", "libbf"];
+    let mut bcs: Vec<PathBuf> = Vec::new();
+    let compile = |src: PathBuf, tag: &str| -> Option<PathBuf> {
+        let out = std::env::temp_dir().join(format!("qjsbc_{pid}_{disc}_{tag}.ll"));
+        let mut cmd = Command::new("clang");
+        cmd.args(cflags);
+        for i in &incs {
+            cmd.arg(i);
+        }
+        cmd.arg(&src).arg("-o").arg(&out);
+        match cmd.status() {
+            Ok(s) if s.success() => Some(out),
+            _ => None,
+        }
+    };
+    for tu in qjs_tus {
+        match compile(qjs.join(format!("{tu}.c")), tu) {
+            Some(bc) => bcs.push(bc),
+            None => {
+                eprintln!("note: skipping quickjs (clang failed on {tu})");
+                return;
+            }
+        }
+    }
+    match compile(driver.clone(), "driver") {
+        Some(bc) => bcs.push(bc),
+        None => {
+            eprintln!("note: skipping quickjs (clang failed on driver)");
+            return;
+        }
+    }
+    for name in OPENLIBM_SRCS.iter().chain(QUICKJS_OPENLIBM_EXTRA) {
+        match compile(ol.join("src").join(format!("{name}.c")), name) {
+            Some(bc) => bcs.push(bc),
+            None => {
+                eprintln!("note: skipping quickjs (clang failed on libm {name})");
+                return;
+            }
+        }
+    }
+    // The guest libc/stdio waist the on-ramp doesn't synthesize: the reused Postgres printf engine
+    // (the runtime-va_list `vsnprintf` family), the correctly-rounded guest `strtod`, and the
+    // QuickJS misc shim (`fesetround`/`strtol`/`abort`/…). The native oracle keeps real libc — the
+    // shims match it byte-for-byte — so they go into the guest link only.
+    let demos = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../temen-run/demos");
+    let shims = [
+        (demos.join("postgres/printf_shim.c"), "printf_shim"),
+        (demos.join("strtod/strtod.c"), "strtod"),
+        (demos.join("quickjs/libc_shim.c"), "libc_shim"),
+    ];
+    for (src, tag) in &shims {
+        match compile(src.clone(), tag) {
+            Some(bc) => bcs.push(bc),
+            None => {
+                eprintln!("note: skipping quickjs (clang failed on shim {tag})");
+                return;
+            }
+        }
+    }
+    let linked = std::env::temp_dir().join(format!("qjsbc_{pid}_{disc}_linked.ll"));
+    // Merge the guest `.ll` TUs into one textual module with the default `llvm-link` (matching the
+    // system clang that produced them) — no LLVM-18 pin: the version-tolerant text reader ingests it.
+    let link_ok = Command::new("llvm-link")
+        .arg("-S")
+        .args(&bcs)
+        .arg("-o")
+        .arg(&linked)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !link_ok {
+        eprintln!("note: skipping quickjs (llvm-link unavailable)");
+        return;
+    }
+    // Native oracle: the same driver + engine + guest libm, no system `-lm`. Fed the same stdin.
+    let exe = std::env::temp_dir().join(format!("qjsbc_{pid}_{disc}_native"));
+    let mut cc = Command::new("cc");
+    cc.args([
+        "-O2",
+        "-D_GNU_SOURCE",
+        "-DCONFIG_VERSION=\"2024-01-13\"",
+        "-DASSEMBLER=0",
+    ]);
+    for i in &incs {
+        cc.arg(i);
+    }
+    cc.arg(&driver);
+    for tu in qjs_tus {
+        cc.arg(qjs.join(format!("{tu}.c")));
+    }
+    for name in OPENLIBM_SRCS.iter().chain(QUICKJS_OPENLIBM_EXTRA) {
+        cc.arg(ol.join("src").join(format!("{name}.c")));
+    }
+    cc.arg("-o").arg(&exe);
+    match cc.status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping quickjs (cc unavailable)");
+            return;
+        }
+    }
+    let native = {
+        use std::io::Write;
+        let mut child = Command::new(&exe)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn native quickjs");
+        child.stdin.take().unwrap().write_all(stdin).ok();
+        child.wait_with_output().expect("run native quickjs")
+    };
+    assert!(
+        native.status.success() && !native.stdout.is_empty(),
+        "native quickjs oracle produced no output"
+    );
+    // Guest: translate → resolve caps → verify → run under the powerbox with the same stdin, diff.
+    let t = temen_llvm::translate_ll_path(&linked).expect("translate quickjs");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
+    temen_verify::verify_module(&module).expect("verify quickjs module");
+    let run = temen_run::run_powerbox(&module, stdin).expect("powerbox run quickjs");
+    assert_eq!(
+        run.stdout,
+        native.stdout,
+        "quickjs: guest {:?} vs native {:?}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&native.stdout)
+    );
+}
+
+/// **▶ QuickJS eval — the full JS engine RUNS byte-identical to native.** The `qjs_eval.c` driver's
+/// built-in program (recursion + a `sort` closure + `JSON.stringify` + string methods + `toFixed`).
+#[test]
+fn demo_quickjs_eval_vs_native() {
+    quickjs_diff("qjs_eval.c", b"");
+}
+
+/// **▶ QuickJS REPL — evaluate JS piped in on stdin** (the playground driver, `qjs_repl.c`): the
+/// engine reads a program from the `Stream` capability, evaluates it, and prints `print`/`console.log`
+/// output plus the completion value — byte-identical to native over a JS program exercising a closure
+/// sort, `JSON.stringify`, and shortest float formatting (`0.1+0.2` → `0.30000000000000004`).
+#[test]
+fn demo_quickjs_repl_stdin() {
+    quickjs_diff(
+        "qjs_repl.c",
+        b"console.log('sum', [1,2,3,4].reduce((a,b)=>a+b,0));\n\
+          print([5,3,8,1].sort((a,b)=>a-b).join(','));\n\
+          JSON.stringify({pi: Math.PI, f: 0.1+0.2});",
+    );
+}
+
+/// **▶ QuickJS breadth — a wide slice of the JS language runs byte-identical to native.** The
+/// `qjs_breadth.c` program exercises regex (`libregexp`), `try`/`catch`, generators, `Map`/`Set`,
+/// closures, destructuring + spread, string methods, `JSON` round-trip, `Object`/`Array` higher-order
+/// methods, `Date`, and integer `Math` — proving the on-ramp runs far more than the eval smoke test.
+/// (BigInt is deliberately omitted — miscompiled through `libbf`, the one known JS-surface gap; see
+/// ISSUES.md.)
+#[test]
+fn demo_quickjs_breadth_vs_native() {
+    quickjs_diff("qjs_breadth.c", b"");
+}
+
+/// **▶ QuickJS BigInt — the `libbf` path runs byte-identical to native** (ISSUES.md I25, the last
+/// JS-surface gap). Isolates `libbf` from the whole engine: compiles only `libbf.c` + `cutils.c` + the
+/// `bf_probe.c` driver + the reused libc/printf shims, and diffs the printed BigInt results (literal
+/// `toString`, `+`, `*`) against native `cc`. The uncalled libm decls `libbf` carries are trap-stubbed
+/// (`stub_unresolved_externs`), so no openlibm fetch is needed — the integer BigInt path never calls
+/// them. Was garbage/hung before the i128-large-constant fix (`i128_parts` dropped the high limb).
+#[test]
+fn demo_quickjs_bigint_vs_native() {
+    let Some(qjs) = fetch_quickjs() else {
+        eprintln!("note: skipping quickjs bigint (QuickJS fetch failed — offline?)");
+        return;
+    };
+    let pid = std::process::id();
+    let demos = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../temen-run/demos");
+    let driver = demos.join("quickjs/bf_probe.c");
+    let inc = format!("-I{}", qjs.display());
+    let cflags = [
+        "-O2",
+        "-emit-llvm",
+        "-S",
+        "-fno-vectorize",
+        "-fno-slp-vectorize",
+        "-DNDEBUG",
+        "-D_GNU_SOURCE",
+        "-DCONFIG_VERSION=\"2024-01-13\"",
+        "-DASSEMBLER=0",
+    ];
+    let compile = |src: PathBuf, tag: &str| -> Option<PathBuf> {
+        let out = std::env::temp_dir().join(format!("bfbc_{pid}_{tag}.ll"));
+        let mut cmd = Command::new("clang");
+        cmd.args(cflags).arg(&inc).arg(&src).arg("-o").arg(&out);
+        matches!(cmd.status(), Ok(s) if s.success()).then_some(out)
+    };
+    let mut bcs = Vec::new();
+    let tus = [
+        (qjs.join("libbf.c"), "libbf"),
+        (qjs.join("cutils.c"), "cutils"),
+        (driver.clone(), "driver"),
+        (demos.join("postgres/printf_shim.c"), "printf_shim"),
+        (demos.join("strtod/strtod.c"), "strtod"),
+        (demos.join("quickjs/libc_shim.c"), "libc_shim"),
+    ];
+    for (src, tag) in &tus {
+        match compile(src.clone(), tag) {
+            Some(bc) => bcs.push(bc),
+            None => {
+                eprintln!("note: skipping bigint (clang failed on {tag})");
+                return;
+            }
+        }
+    }
+    let linked = std::env::temp_dir().join(format!("bfbc_{pid}_linked.ll"));
+    let link_ok = Command::new("llvm-link")
+        .arg("-S")
+        .args(&bcs)
+        .arg("-o")
+        .arg(&linked)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !link_ok {
+        eprintln!("note: skipping bigint (llvm-link unavailable)");
+        return;
+    }
+    // Native oracle: same driver + libbf + cutils, real libm.
+    let exe = std::env::temp_dir().join(format!("bfbc_{pid}_native"));
+    let ok = Command::new("cc")
+        .args([
+            "-O2",
+            "-D_GNU_SOURCE",
+            "-DCONFIG_VERSION=\"2024-01-13\"",
+            "-DASSEMBLER=0",
+        ])
+        .arg(&inc)
+        .arg(&driver)
+        .arg(qjs.join("libbf.c"))
+        .arg(qjs.join("cutils.c"))
+        .arg("-lm")
+        .arg("-o")
+        .arg(&exe)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("note: skipping bigint (cc unavailable)");
+        return;
+    }
+    let native = Command::new(&exe).output().expect("run native bigint");
+    assert!(
+        native.status.success() && !native.stdout.is_empty(),
+        "native bigint oracle produced no output"
+    );
+    // Guest: translate (stub the uncalled libm decls) → resolve caps → verify → run, diff.
+    let opts = temen_llvm::TranslateOptions {
+        stub_unresolved_externs: true,
+        ..Default::default()
+    };
+    let t = temen_llvm::translate_ll_path_with_options(&linked, opts).expect("translate bigint");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
+    temen_verify::verify_module(&module).expect("verify bigint module");
+    let run = temen_run::run_powerbox(&module, b"").expect("powerbox run bigint");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&native.stdout),
+        "bigint: guest vs native BigInt results diverge",
+    );
+}
+
+/// Like [`check_demo_vs_native`] but threads `extra` clang flags into the on-ramp's **`.ll`** compile
+/// only — the native `cc` oracle (in [`powerbox_diff`]) is unchanged. Used to pass
+/// `-fno-vectorize -fno-slp-vectorize` on demos whose hot code clang would auto-SIMD-vectorize:
+/// the vector lane (§17/D58) is outside the scalar on-ramp's scope, and exact integer code gives
+/// the identical bytes scalar-vs-vectorized, so the on-ramp consumes scalar `.ll` while the
+/// oracle keeps vectorizing — the same split the Rust lane uses (`rust_*` helper, LLVM.md).
+fn check_demo_vs_native_flags(name: &str, rel: &str, stdin: &[u8], extra: &[&str]) {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../temen-run/demos")
+        .join(rel);
+    let bc = std::env::temp_dir().join(format!(
+        "temen_llvm_demo_{}_{}.ll",
+        std::process::id(),
+        name
+    ));
+    let status = Command::new("clang")
+        .args(["-O2", "-emit-llvm", "-S"])
+        .args(extra)
+        .arg(&path)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            return;
+        }
+    }
+    powerbox_diff(name, &bc, &path, stdin);
+}
+
+#[test]
+fn powerbox_hello_write() {
+    // The headline Lane C demo: write a string to stdout, then return an exit code. The synthesized
+    // `_start` grants the handles, `write(1, …)` lowers to the `Stream` capability, `main`'s return
+    // is the exit code — all matching the native build byte-for-byte.
+    let src = "#include <unistd.h>\n\
+               int main(void){ write(1, \"hello, on-ramp!\\n\", 16); return 3; }";
+    check_powerbox_vs_native("pb_hello", src, b"");
+}
+
+#[test]
+fn powerbox_exit_capability() {
+    // `exit(code)` lowers to the `Exit` capability (terminal): the program writes, then exits with a
+    // non-zero code — the Temen `Outcome::Exited` must match the native process exit code.
+    let src = "#include <unistd.h>\n#include <stdlib.h>\n\
+               int main(void){ write(1, \"bye\\n\", 4); exit(7); }";
+    check_powerbox_vs_native("pb_exit", src, b"");
+}
+
+#[test]
+fn powerbox_echo_stdin() {
+    // A stdin → stdout round-trip through the `Stream` capability (read on the stdin handle, write on
+    // stdout), driven by a loop — exercises `read`, `write`, the handle stash, and a real data frame.
+    let src = "#include <unistd.h>\n\
+               int main(void){ char buf[64]; long n; \
+               while ((n = read(0, buf, sizeof buf)) > 0) write(1, buf, n); return 0; }";
+    check_powerbox_vs_native("pb_echo", src, b"ping pong\n");
+}
+
+#[test]
+fn inline_asm_barriers_dropped() {
+    // Inline-asm recognizer — the **barrier** templates the on-ramp drops (no architectural effect
+    // for a single-threaded, single-address-space guest): the empty compiler barrier (`""` +
+    // `~{memory}`), Postgres' `pg_memory_barrier` (`lock; addl $0,0(%rsp)`), and the PAUSE spin hint
+    // (`rep; nop`). The arithmetic around them must stay byte-identical to native — proving the drop
+    // neither perturbs the value flow nor breaks the `ret` in tail position.
+    let src = "#include <stdio.h>\n\
+        int main(void){ int x = 0; \
+          for (int i = 0; i < 5; i++) { \
+            x += i * 3; \
+            __asm__ __volatile__(\"\" ::: \"memory\"); \
+            __asm__ __volatile__(\"lock; addl $0,0(%%rsp)\" ::: \"memory\",\"cc\"); \
+          } \
+          __asm__ __volatile__(\"rep; nop\"); \
+          printf(\"%d\\n\", x); return 0; }";
+    check_powerbox_vs_native("asm_barriers", src, b"");
+}
+
+#[test]
+fn inline_asm_popcnt_lowers() {
+    // Inline-asm recognizer — the hardware `popcnt` fast-path (`pg_bitutils`' `pg_popcount*_asm`):
+    // `popcntq $1,$0` / `popcntl $1,$0` lower to the `Popcnt` unary op (as `llvm.ctpop` does), so the
+    // guest matches the native `popcnt` instruction (incl. the defined `popcnt(0) == 0`).
+    let src = "#include <stdio.h>\n\
+        static inline unsigned long pcq(unsigned long v){ unsigned long r; \
+          __asm__(\"popcntq %1,%0\" : \"=r\"(r) : \"rm\"(v) : \"cc\"); return r; } \
+        static inline unsigned int pcl(unsigned int v){ unsigned int r; \
+          __asm__(\"popcntl %1,%0\" : \"=r\"(r) : \"rm\"(v) : \"cc\"); return r; } \
+        int main(void){ \
+          printf(\"%d %d %d\\n\", (int)pcq(0xF0F0F0F0F0F0F0F0UL), (int)pcl(0xABCDu), (int)pcq(0)); \
+          return 0; }";
+    check_powerbox_vs_native("asm_popcnt", src, b"");
+}
+
+#[test]
+fn inline_asm_x86_atomics() {
+    // Inline-asm recognizer — the x86 atomic templates from Postgres' `arch-x86.h` (`pg_atomic_*`) and
+    // `s_lock.h` (TAS): `xchgb` (test-and-set), `xaddl` (fetch-add), `cmpxchgl; setz` (compare-exchange).
+    // Each lowers to the on-ramp's real atomic op (`AtomicRmw`/`AtomicCmpxchg`) — the identical IR the
+    // `atomicrmw`/`cmpxchg` *instructions* produce — so results match native byte-for-byte. Exercised
+    // single-threaded (deterministic), but the lowering is genuinely atomic (not a racy load-op-store).
+    let src = "#include <stdio.h>\n\
+        static inline char tas(volatile char *lock){ char _res = 1; \
+          __asm__ __volatile__(\"lock\\n\\txchgb %0,%1\\n\" : \"+q\"(_res), \"+m\"(*lock) :: \"memory\"); \
+          return _res; } \
+        static inline int xadd(volatile int *p, int add_){ int res; \
+          __asm__ __volatile__(\"lock\\n\\txaddl %0,%1\\n\" : \"=q\"(res), \"=m\"(*p) : \"0\"(add_), \"m\"(*p) : \"memory\",\"cc\"); \
+          return res; } \
+        static inline int cas(volatile int *p, int *expected, int newval){ char ret; \
+          __asm__ __volatile__(\"lock\\n\\tcmpxchgl %4,%5\\n   setz\\t%2\\n\" \
+            : \"=a\"(*expected), \"=m\"(*p), \"=q\"(ret) : \"a\"(*expected), \"r\"(newval), \"m\"(*p) : \"memory\",\"cc\"); \
+          return (int)ret; } \
+        int main(void){ \
+          char lock = 0; int a1 = tas(&lock); int a2 = tas(&lock); \
+          int cnt = 100; int o1 = xadd(&cnt, 5); int o2 = xadd(&cnt, -3); \
+          int v = 102, exp = 102; int ok = cas(&v, &exp, 999); \
+          int exp2 = 5; int ok2 = cas(&v, &exp2, 7); \
+          printf(\"%d %d %d %d %d %d %d %d %d\\n\", a1, a2, o1, o2, cnt, ok, v, ok2, exp2); return 0; }";
+    check_powerbox_vs_native("asm_atomics", src, b"");
+}
+
+#[test]
+fn inline_asm_unrecognized_is_fail_closed() {
+    // The asm allowlist is **closed**: a template that is not a recognized barrier/`popcnt`/… must be
+    // a clean `Unsupported`, never silently dropped or mis-lowered. This is the §2a chokepoint —
+    // executing opaque machine code would defeat the sandbox, so an unknown template fails closed.
+    let Some(bc) = compile_to_ll(
+        "asm_unknown",
+        "int f(int x){ int r; __asm__(\"movl %1,%0; incl %0\" : \"=r\"(r) : \"r\"(x) : \"cc\"); \
+           return r; } \
+         int main(void){ return f(41); }",
+    ) else {
+        return;
+    };
+    match temen_llvm::translate_ll_path(&bc) {
+        Err(temen_llvm::Error::Unsupported(_)) => {}
+        other => panic!("expected Unsupported for unrecognized inline asm, got {other:?}"),
+    }
+}
+
+#[test]
+fn powerbox_computed_output() {
+    // Compose the on-ramp's existing machinery with I/O: build a string in a stack buffer (a real
+    // data frame + stores), then write it out — the byte-exact stdout must match native.
+    let src = "#include <unistd.h>\n\
+               int main(void){ char buf[16]; for (int i = 0; i < 10; i++) buf[i] = '0' + i; \
+               buf[10] = '\\n'; write(1, buf, 11); return 0; }";
+    check_powerbox_vs_native("pb_computed", src, b"");
+}
+
+#[test]
+fn stdio_puts() {
+    // `puts(s)` writes the string + a newline. clang keeps it as a `puts` call (the on-ramp supplies
+    // the literal's length + the newline) — stdout must match native byte-for-byte.
+    let src = "#include <stdio.h>\nint main(void){ puts(\"hello, stdio\"); return 0; }";
+    check_powerbox_vs_native("pb_puts", src, b"");
+}
+
+#[test]
+fn stdio_printf_constant_string() {
+    // clang -O2 rewrites `printf("literal\n")` → `puts("literal")` — so a format-free printf works
+    // through the same path (no varargs). Two lines exercise repeated calls.
+    let src = "#include <stdio.h>\n\
+               int main(void){ printf(\"first line\\n\"); printf(\"second line\\n\"); return 0; }";
+    check_powerbox_vs_native("pb_printf_str", src, b"");
+}
+
+#[test]
+fn stdio_putchar_loop() {
+    // `putchar` (clang lowers it to `putc(c, stdout)`) writing each char of a computed range — a
+    // single byte staged through the stash scratch per call.
+    let src = "#include <stdio.h>\n\
+               int main(void){ for (int c = 'A'; c <= 'F'; c++) putchar(c); putchar('\\n'); return 0; }";
+    check_powerbox_vs_native("pb_putchar", src, b"");
+}
+
+#[test]
+fn stdio_fwrite_and_fputs() {
+    // `fwrite(buf, 1, n, stdout)` writes a byte slice; `fputs(s, stdout)` (clang lowers it to
+    // `fwrite`) writes a string with no newline. Mix both, plus a trailing newline via putchar.
+    let src = "#include <stdio.h>\n#include <string.h>\n\
+               int main(void){ const char* a = \"abc\"; fwrite(a, 1, 3, stdout); \
+               fputs(\"-def\", stdout); putchar('\\n'); return 0; }";
+    check_powerbox_vs_native("pb_fwrite", src, b"");
+}
+
+#[test]
+fn stdio_mixed_then_exit() {
+    // Compose stdio output with the `exit` capability: print via puts/printf, then exit(non-zero) —
+    // both the stdout bytes and the exit code must match the native build.
+    let src = "#include <stdio.h>\n#include <stdlib.h>\n\
+               int main(void){ puts(\"goodbye\"); printf(\"done\\n\"); exit(42); }";
+    check_powerbox_vs_native("pb_mixed_exit", src, b"");
+}
+
+#[test]
+fn funnel_shift_rotate() {
+    // SHA-style rotates: clang -O2 turns `(x<<n)|(x>>(w-n))` into `llvm.fshl`/`fshr` (the operands
+    // identical → a rotate). Lowered to `rotl`/`rotr`. Checked on i32 and i64 against hand values.
+    let src = "unsigned rotr32(unsigned x, unsigned n){ return (x >> n) | (x << (32 - n)); } \
+               unsigned long rotl64(unsigned long x, unsigned n){ return (x << n) | (x >> (64 - n)); }";
+    // rotr32(0x12345678, 8) = 0x78123456
+    check(
+        "rotr32",
+        src,
+        &[Value::I32(0x12345678), Value::I32(8)],
+        &[Value::I32(0x78123456u32 as i32)],
+    );
+}
+
+#[test]
+fn funnel_shift_general_const() {
+    // A **non-rotate** funnel shift with a constant amount — clang's canonical form for a double-word
+    // shift `(hi << k) | (lo >> (64 - k))` (the `fshl.i64(hi, lo, k)` Embench `aha-mont64`'s `modul64`
+    // emits). Distinct operands, so this is the general path: `(a << s) | (b >>u (w - s))`. Three
+    // amounts (1, 5, 63 — `(lo>>1)|(hi<<63)` canonicalizes to `fshl(.,.,63)`) and the full 64-bit result
+    // is folded down into the exit byte, so an error in *any* bit flips it. Bit-exact vs native `cc`.
+    let src = "int run(int seed) {\n\
+        \x20 unsigned long hi = (unsigned long) seed * 0x9E3779B97F4A7C15UL + 1;\n\
+        \x20 unsigned long lo = (unsigned long) seed * 0xC2B2AE3D27D4EB4FUL + 7;\n\
+        \x20 unsigned long a = (hi << 1)  | (lo >> 63);\n\
+        \x20 unsigned long b = (hi << 5)  | (lo >> 59);\n\
+        \x20 unsigned long c = (lo >> 1)  | (hi << 63);\n\
+        \x20 unsigned long r = a ^ (b * 3) ^ c;\n\
+        \x20 r ^= r >> 32; r ^= r >> 16; r ^= r >> 8;\n\
+        \x20 return (int)(r & 0xff);\n\
+        }\n\
+        int main(void) { return run(5); }\n";
+    check_vs_native("funnel_general", src, 5);
+}
+
+/// The synthesized `<ctype.h>` tables (`__ctype_b_loc` flags + `__ctype_tolower_loc`/`toupper_loc` case
+/// maps) and the `__temen_memchr` byte scan — exercised against glibc by hashing every classifier and both
+/// case maps over the **whole 0..255 range** plus a `memchr`. The native oracle uses real glibc C-locale
+/// ctype; the Temen build uses the synthesized read-only tables — they must agree (bit-exact via the folded
+/// FNV hash in the exit byte). Found needed by Embench `slre`.
+#[test]
+fn ctype_and_memchr_builtins() {
+    let src = "#include <ctype.h>\n#include <string.h>\n\
+        int run(int seed) {\n\
+        \x20 unsigned int h = 2166136261u;\n\
+        \x20 for (int c = 0; c < 256; c++) {\n\
+        \x20   unsigned f = 0;\n\
+        \x20   f |= isalpha(c)?1u:0; f |= isdigit(c)?2u:0; f |= isspace(c)?4u:0;\n\
+        \x20   f |= isupper(c)?8u:0; f |= islower(c)?16u:0; f |= isxdigit(c)?32u:0;\n\
+        \x20   f |= ispunct(c)?64u:0; f |= isalnum(c)?128u:0; f |= isprint(c)?256u:0;\n\
+        \x20   f |= isgraph(c)?512u:0; f |= iscntrl(c)?1024u:0; f |= isblank(c)?2048u:0;\n\
+        \x20   h = (h ^ f) * 16777619u;\n\
+        \x20   h = (h ^ (unsigned)tolower(c)) * 16777619u;\n\
+        \x20   h = (h ^ (unsigned)toupper(c)) * 16777619u;\n\
+        \x20 }\n\
+        \x20 static const char buf[] = \"find the needle in here\";\n\
+        \x20 const char *p = memchr(buf, 'n', sizeof(buf));\n\
+        \x20 h ^= p ? (unsigned)(p - buf) : 999u;\n\
+        \x20 const char *q = memchr(buf, 'Z', sizeof(buf));\n\
+        \x20 h ^= q ? 1u : 7u;\n\
+        \x20 h ^= (unsigned) seed;\n\
+        \x20 return (int)(h & 0x7fffffff);\n\
+        }\n\
+        int main(void){ return run(5); }\n";
+    check_vs_native("ctype_memchr", src, 5);
+}
+
+#[test]
+fn strlen_builtin() {
+    // A direct `strlen` call (not via `printf %s`) routes to the synthesized `__temen_strlen` NUL-scan
+    // helper — even in a `run`-only module with no `main` (the helper reads memory, needs no powerbox).
+    // Two calls (a base pointer and a `buf + k` offset) over a runtime-length string; bit-exact vs the
+    // native `cc` oracle on both backends. Found needed by Embench `slre`.
+    let src = "#include <string.h>\n\
+        int run(int seed) {\n\
+        \x20 const char *s = \"the quick brown fox jumps over the lazy dog\";\n\
+        \x20 const char *t = \"embench strlen test vector\";\n\
+        \x20 unsigned long total = strlen(s + (seed % 5)) + strlen(t + (seed % 3));\n\
+        \x20 return (int)(total & 0x7fffffff);\n\
+        }\n\
+        int main(void) { return run(7); }\n";
+    check_vs_native("strlen_builtin", src, 7);
+}
+
+#[test]
+fn variable_length_memset_loop() {
+    // A runtime-length zero-fill: clang's loop-idiom recognizer emits `llvm.memset.p0.i64` with a
+    // non-constant length, which lowers to a call to the synthesized `__temen_memset` loop helper.
+    // `run` zeroes `n` bytes of a stack buffer (seeded non-zero), then sums them → 0.
+    let src = "int run(int n){ unsigned char buf[300]; \
+               for (int i = 0; i < 300; i++) buf[i] = (unsigned char)(i + 1); \
+               for (int i = 0; i < n; i++) buf[i] = 0; \
+               int s = 0; for (int i = 0; i < 300; i++) s += buf[i]; return s; }";
+    check_vs_native(
+        "var_memset",
+        &format!("{src} int main(){{ return run(300); }}"),
+        300,
+    );
+}
+
+/// A **threaded (computed-`goto`) bytecode interpreter** — the canonical `indirectbr`/`blockaddress`
+/// idiom (`static void *tbl[] = {&&l0,…}; goto *tbl[op];`), the dispatch shape every real bytecode VM
+/// (SQLite's VDBE, Lua, QuickJS) is built on. clang `-O2` lowers `&&label` to `blockaddress` constants
+/// in the dispatch-table global and `goto *p` to an `indirectbr`. The on-ramp recovers the blockaddress
+/// targets from the text parse ([`temen_llvm::blockaddr::BlockAddrs`]) — baking each as its block index
+/// into the table global — and lowers the `indirectbr` to a `br_table` over those indices.
+/// The program is **derived from `n` at runtime** so no dispatch target constant-folds (which would let
+/// clang thread a `blockaddress` through a φ — an operand-position use, the deferred follow-up); every
+/// blockaddress stays in the table global. Verified byte-for-byte vs native on both backends.
+const COMPUTED_GOTO_SRC: &str = r#"
+int run(int n) {
+  static const void *const tbl[] = {&&op_halt, &&op_dbl, &&op_inc, &&op_xor};
+  unsigned char prog[16];
+  for (int i = 0; i < 15; i++) prog[i] = (unsigned char)(((n + i) * 2654435761u) % 4);
+  prog[15] = 0; /* guaranteed halt */
+  int pc = 0, acc = n, steps = 0;
+  goto *tbl[prog[pc]];
+op_dbl:  acc = acc * 2 + 1; pc++; if (++steps > 64) goto op_halt; goto *tbl[prog[pc]];
+op_inc:  acc += 3;         pc++; if (++steps > 64) goto op_halt; goto *tbl[prog[pc]];
+op_xor:  acc ^= 0x5a;      pc++; if (++steps > 64) goto op_halt; goto *tbl[prog[pc]];
+op_halt: return acc & 0xff;
+}
+int main(void) { return run(7); }
+"#;
+
+#[test]
+fn computed_goto_threaded_interpreter() {
+    check_vs_native("computed_goto", COMPUTED_GOTO_SRC, 7);
+}
+
+/// Structural companion to [`computed_goto_threaded_interpreter`]: prove the computed-`goto` path is
+/// actually exercised (not optimized away) — clang emitted `blockaddress`es into the dispatch global,
+/// the text parse recovered them, and the `indirectbr` lowered to a `br_table`.
+#[test]
+fn computed_goto_lowers_indirectbr_to_br_table() {
+    let Some(bc) = compile_to_ll("computed_goto_struct", COMPUTED_GOTO_SRC) else {
+        return;
+    };
+    // The reader recovered the dispatch table's `blockaddress` labels (internally, via `ll::parse`),
+    // so the `indirectbr` lowered to a `br_table` terminator.
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
+    temen_verify::verify_module(&t.module).expect("verify");
+    let has_br_table = t
+        .module
+        .funcs
+        .iter()
+        .flat_map(|f| f.blocks.iter())
+        .any(|b| matches!(b.term, temen_ir::Terminator::BrTable { .. }));
+    assert!(has_br_table, "indirectbr should lower to a br_table");
+}
+
+/// Computed `goto` where clang's `-O2` **jump-threading threads a `blockaddress` through a φ** (slice
+/// AW) — an *operand-position* blockaddress, not a global-table entry. This is the shape a real
+/// interpreter produces (and the AV follow-up): the program has a constant first dispatch
+/// (`prog[0] == 2`), so clang knows the entry target and threads `blockaddress(@run, …)` into a φ that
+/// feeds the `indirectbr`. The on-ramp recovers it from the text parse (`blockaddr::phi`, keyed by φ
+/// position) and materializes the block-index constant. Byte-identical to native on both backends.
+const COMPUTED_GOTO_PHI_SRC: &str = r#"
+int run(int n) {
+  static const void *const tbl[] = {&&op_halt, &&op_dbl, &&op_inc, &&op_loop};
+  static const unsigned char prog[] = {2, 1, 2, 3, 0}; /* inc,dbl,inc,loop,halt — constant first op */
+  int pc = 0, acc = n, iters = 0;
+  goto *tbl[prog[pc]];
+op_dbl:  acc *= 2; pc++; goto *tbl[prog[pc]];
+op_inc:  acc += 1; pc++; goto *tbl[prog[pc]];
+op_loop: if (++iters < 3) pc = 0; else pc++; goto *tbl[prog[pc]];
+op_halt: return acc & 0xff;
+}
+int main(void) { return run(7); }
+"#;
+
+#[test]
+fn computed_goto_phi_threaded_blockaddress() {
+    check_vs_native("computed_goto_phi", COMPUTED_GOTO_PHI_SRC, 7);
+}
+
+/// Structural companion: confirm clang actually threaded a `blockaddress` through a φ (so the
+/// operand-position recovery path — not just the global-table path — is exercised).
+#[test]
+fn computed_goto_phi_recovery_finds_operand_blockaddress() {
+    let Some(bc) = compile_to_ll("computed_goto_phi_struct", COMPUTED_GOTO_PHI_SRC) else {
+        return;
+    };
+    // The φ-threaded (operand-position) `blockaddress` recovery path resolves internally, so the
+    // module translates + verifies (no fail-closed). Its runtime correctness is covered by
+    // `computed_goto_phi_threaded_blockaddress` (a native differential).
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
+    temen_verify::verify_module(&t.module).expect("verify");
+}
+
+/// `<setjmp.h>` non-local jump (`setjmp`/`longjmp` → the `SetJmp`/`LongJmp` core ops). Compiles `run`
+/// plus `int main(){return run(SEED);}` natively (real libc `setjmp`/`longjmp`) and on the on-ramp,
+/// asserting **all three engines** — tree-walker, bytecode, and JIT — match the native exit code. The
+/// JIT runs `setjmp`/`longjmp` via libc `_setjmp`/`_longjmp` inline from JITted code (LLVM.md §"JIT
+/// `longjmp`"); on a target without that runtime it declines cleanly and the interpreters cover it.
+/// `run` returns a byte so the result survives the Unix exit code.
+fn check_setjmp_vs_native(name: &str, src: &str, seed: i32) {
+    let Some(bc) = compile_to_ll(name, src) else {
+        return;
+    };
+    let exe = std::env::temp_dir().join(format!("temen_llvm_sj_{}_{}", std::process::id(), name));
+    let c = std::env::temp_dir().join(format!("temen_llvm_{}_{}.c", std::process::id(), name));
+    match Command::new("cc").arg(&c).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping {name} (cc unavailable)");
+            return;
+        }
+    }
+    let native = Command::new(&exe)
+        .status()
+        .expect("run native")
+        .code()
+        .unwrap() as u8;
+
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
+    let module = t.module;
+    temen_verify::verify_module(&module).expect("verify translated IR");
+    let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
+    let mut fuel = 100_000_000u64;
+    let interp = temen_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
+    let temen = match interp.first() {
+        Some(Value::I32(x)) => *x as u8,
+        other => panic!("{name}: expected i32 result, got {other:?}"),
+    };
+    assert_eq!(
+        temen, native,
+        "{name}: tree-walker={temen} vs native cc={native}"
+    );
+
+    // The **bytecode** engine implements setjmp/longjmp too (interpreter-grade) and must agree — it
+    // runs the module (does not decline) and matches the tree-walker + native.
+    let mut bfuel = 100_000_000u64;
+    let bc_out = temen_interp::bytecode::compile_and_run(&module, 0, &full, &mut bfuel)
+        .expect("bytecode engine should run setjmp/longjmp (not decline)")
+        .expect("bytecode run");
+    let btemen = match bc_out.first() {
+        Some(Value::I32(x)) => *x as u8,
+        other => panic!("{name}: bytecode expected i32 result, got {other:?}"),
+    };
+    assert_eq!(
+        btemen, native,
+        "{name}: bytecode={btemen} vs native cc={native}"
+    );
+
+    // The JIT runs setjmp/longjmp natively (libc `_setjmp`/`_longjmp` inline from JITted code, with a
+    // host-side `jmp_buf` table — LLVM.md §"JIT `longjmp`", Option B) on the targets where its runtime
+    // exists (`setjmp_rt` = unix among `fiber_rt`). It must agree with the interpreters + native. On a
+    // target without the runtime it declines cleanly (the interpreters above already proved
+    // correctness); either way it must never miscompile.
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match temen_jit::compile_and_run(&module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => {
+            let jtemen = s[0] as i32 as u8;
+            assert_eq!(jtemen, native, "{name}: JIT={jtemen} vs native cc={native}");
+        }
+        Ok(other) => panic!("{name}: unexpected JIT outcome {other:?} on a valid setjmp program"),
+        Err(temen_jit::JitError::Unsupported(_)) => {
+            eprintln!(
+                "note: {name} JIT declined setjmp/longjmp (no native-stack runtime on this target)"
+            );
+        }
+        Err(e) => panic!("{name}: JIT errored on setjmp/longjmp: {e:?}"),
+    }
+}
+
+/// Compile a C program whose **first defined function** is `run(int seed)` (returning a result byte),
+/// translate it, and assert the tree-walker, bytecode, and JIT engines all reproduce the native exit
+/// code. The §varargs tests use this: `run` calls one or more `(...)`-defined helpers whose `va_arg`
+/// reads must match native. Unlike setjmp, the JIT must *run* varargs (it lowers to ordinary
+/// loads/stores/calls), so a JIT decline is a failure here.
+fn check_run_byte_vs_native(name: &str, src: &str, seed: i32) {
+    let Some(bc) = compile_to_ll(name, src) else {
+        return;
+    };
+    let exe = std::env::temp_dir().join(format!("temen_llvm_va_{}_{}", std::process::id(), name));
+    let c = std::env::temp_dir().join(format!("temen_llvm_{}_{}.c", std::process::id(), name));
+    // `-lm` so math-helper tests (`ldexp`, …) link against libc's math on the native side.
+    match Command::new("cc")
+        .arg(&c)
+        .arg("-lm")
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping {name} (cc unavailable)");
+            return;
+        }
+    }
+    let native = Command::new(&exe)
+        .status()
+        .expect("run native")
+        .code()
+        .unwrap() as u8;
+
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
+    let module = t.module;
+    temen_verify::verify_module(&module).expect("verify translated IR");
+    let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
+
+    let mut fuel = 100_000_000u64;
+    let interp = temen_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
+    let temen = match interp.first() {
+        Some(Value::I32(x)) => *x as u8,
+        other => panic!("{name}: expected i32 result, got {other:?}"),
+    };
+    assert_eq!(
+        temen, native,
+        "{name}: tree-walker={temen} vs native cc={native}"
+    );
+
+    let mut bfuel = 100_000_000u64;
+    let bc_out = temen_interp::bytecode::compile_and_run(&module, 0, &full, &mut bfuel)
+        .expect("bytecode compile")
+        .expect("bytecode run");
+    let btemen = match bc_out.first() {
+        Some(Value::I32(x)) => *x as u8,
+        other => panic!("{name}: bytecode expected i32 result, got {other:?}"),
+    };
+    assert_eq!(
+        btemen, native,
+        "{name}: bytecode={btemen} vs native cc={native}"
+    );
+
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match temen_jit::compile_and_run(&module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => {
+            let jtemen = s[0] as i32 as u8;
+            assert_eq!(jtemen, native, "{name}: JIT={jtemen} vs native cc={native}");
+        }
+        Ok(other) => panic!("{name}: unexpected JIT outcome {other:?} on a valid varargs program"),
+        Err(e) => panic!("{name}: JIT errored on varargs: {e:?}"),
+    }
+}
+
+#[test]
+fn varargs_int_double_mixed() {
+    // The first defined function `run` calls three `(...)`-defined helpers — an all-`int` list, an
+    // all-`double` list, and a mixed `int`/`double` list. Forcing every argument to the
+    // `overflow_arg_area` (gp_offset/fp_offset maxed in `va_start`, §varargs) means the helpers read
+    // their arguments positionally from the marshaled scratch; mixed int/SSE classes must still land
+    // byte-identical to native. The helpers are `noinline` so they survive `-O2` as real varargs
+    // definitions (not inlined + constant-folded away).
+    let src = "#include <stdarg.h>\n\
+        static long long vsum(int n, ...);\n\
+        static double vdsum(int n, ...);\n\
+        static long long vmix(int n, ...);\n\
+        int run(int seed){\n\
+          long long a = vsum(5, 10, 20, 30, 40, 50);\n\
+          double d = vdsum(3, 1.5, 2.5, 3.0);\n\
+          long long m = vmix(4, 100, 2.5, 200, 3.9);\n\
+          return (int)((a + (long long)d + m + seed) & 0xff);\n\
+        }\n\
+        __attribute__((noinline)) static long long vsum(int n, ...){\n\
+          va_list ap; va_start(ap,n); long long s=0;\n\
+          for(int i=0;i<n;i++) s+=va_arg(ap,int); va_end(ap); return s; }\n\
+        __attribute__((noinline)) static double vdsum(int n, ...){\n\
+          va_list ap; va_start(ap,n); double s=0;\n\
+          for(int i=0;i<n;i++) s+=va_arg(ap,double); va_end(ap); return s; }\n\
+        __attribute__((noinline)) static long long vmix(int n, ...){\n\
+          va_list ap; va_start(ap,n); long long s=0;\n\
+          for(int i=0;i<n;i++){ if(i&1) s+=(long long)va_arg(ap,double); else s+=va_arg(ap,int); }\n\
+          va_end(ap); return s; }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("varargs_mixed", src, 0);
+}
+
+#[test]
+fn varargs_zero_variadic() {
+    // A `(...)` function invoked with ONLY its fixed parameters (zero variadic args) — e.g. Lua's
+    // `lua_gc(L, what)`. The call site still deposits the overflow-area pointer (marshaling nothing),
+    // and the callee's `va_start` runs even though `va_arg` is never reached. Regression for the
+    // "varargs call without reserved scratch" frame-layout bug. `vz(7)` returns its fixed arg.
+    let src = "#include <stdarg.h>\n\
+        static int vz(int n, ...);\n\
+        int run(int seed){ return (vz(7) + vz(20) + seed) & 0xff; }\n\
+        __attribute__((noinline)) static int vz(int n, ...){\n\
+          va_list ap; va_start(ap, n); va_end(ap); return n; }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("varargs_zero", src, 0);
+}
+
+#[test]
+fn varargs_many_and_copy() {
+    // A long integer list (more than the six SysV integer-class registers) stresses the memory-path
+    // traversal; `va_copy` re-walks the same list from the start. `run` returns a byte. Sum 1..10 =
+    // 55, walked twice = 110.
+    let src = "#include <stdarg.h>\n\
+        static int vcount(int n, ...);\n\
+        int run(int seed){ return (vcount(10, 1,2,3,4,5,6,7,8,9,10) + seed) & 0xff; }\n\
+        __attribute__((noinline)) static int vcount(int n, ...){\n\
+          va_list ap, aq; va_start(ap,n); va_copy(aq, ap);\n\
+          long long s=0; for(int i=0;i<n;i++) s+=va_arg(ap,int);\n\
+          long long t=0; for(int i=0;i<n;i++) t+=va_arg(aq,int);\n\
+          va_end(aq); va_end(ap); return (int)(s+t); }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("varargs_many_copy", src, 0);
+}
+
+#[test]
+fn varargs_indirect_call() {
+    // A `(...)` function invoked through a **function pointer** (not a named callee). The variadic
+    // args must marshal into the caller's overflow scratch exactly as for a direct varargs call — the
+    // only difference is the call lowers to `call_indirect` (with an §3c type-id check against the
+    // `(sp, fixed-params…)` callee signature) rather than `call`. The pointer is chosen by a
+    // `volatile` index so clang can't devirtualize it back to a direct call, and clang emits it as a
+    // `tail call`, which also exercises the `return_call_indirect` tail path. Found as the Postgres
+    // `manifest_process_version` gap. `run(1)`: index 1 → `vmul(4, 2,3,4,5)` = 120, +1 = 121.
+    let src = "#include <stdarg.h>\n\
+        typedef long long (*vfn)(int, ...);\n\
+        static long long vsum(int n, ...);\n\
+        static long long vmul(int n, ...);\n\
+        int run(int seed){\n\
+          vfn arr[2] = { vsum, vmul };\n\
+          volatile int i = seed & 1;\n\
+          long long r = arr[i](4, 2, 3, 4, 5);\n\
+          return (int)((r + seed) & 0xff); }\n\
+        __attribute__((noinline)) static long long vsum(int n, ...){\n\
+          va_list ap; va_start(ap,n); long long s=0;\n\
+          for(int k=0;k<n;k++) s+=va_arg(ap,int); va_end(ap); return s; }\n\
+        __attribute__((noinline)) static long long vmul(int n, ...){\n\
+          va_list ap; va_start(ap,n); long long s=1;\n\
+          for(int k=0;k<n;k++) s*=va_arg(ap,int); va_end(ap); return s; }\n\
+        int main(void){ return run(1); }";
+    check_run_byte_vs_native("varargs_indirect", src, 1);
+}
+
+#[test]
+fn libc_strcmp_strchr_strcoll() {
+    // The synthesized `__temen_strcmp`/`__temen_strchr` byte loops (libc batch). The string pointers are
+    // read through `volatile` so clang's `-O2` cannot constant-fold the calls away — the helpers are
+    // genuinely exercised. `strcoll` aliases `strcmp` in the C locale. `run` packs six predicate bits
+    // (sign of three compares, two `strchr` hits + one miss, and the `strcoll` equality) into a byte;
+    // matching native cc on all three engines pins the synthesized loops.
+    let src = "#include <string.h>\n\
+        int run(int seed){\n\
+          const char *volatile pa = \"hello\";\n\
+          const char *volatile pb = \"help\";\n\
+          const char *a = pa; const char *b = pb;\n\
+          int r1 = strcmp(a,b);\n\
+          int r2 = strcmp(a,a);\n\
+          int r3 = strcmp(b,a);\n\
+          const char *f = strchr(a,'l');\n\
+          const char *g = strchr(a,'z');\n\
+          const char *h = strchr(a,0);\n\
+          int acc = 0;\n\
+          acc += (r1 < 0) ? 1 : 0;\n\
+          acc += (r2 == 0) ? 2 : 0;\n\
+          acc += (r3 > 0) ? 4 : 0;\n\
+          acc += (f == a + 2) ? 8 : 0;\n\
+          acc += (g == 0) ? 16 : 0;\n\
+          acc += (h == a + 5) ? 32 : 0;\n\
+          acc += (strcoll(a,a) == 0) ? 64 : 0;\n\
+          return (acc + seed) & 0xff;\n\
+        }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("libc_strcmp_strchr", src, 0);
+}
+
+#[test]
+fn libc_strcpy_strspn_strpbrk() {
+    // The synthesized `__temen_strcpy` (copy loop) and the nested-scan `__temen_strspn` / `__temen_strpbrk`.
+    // `volatile`-loaded operands keep the calls past `-O2`. Over "12.5e3xy": strspn vs the digit set
+    // is 2 ("12"), strpbrk vs "ex" lands on the 'e' at index 4, and the strcpy round-trips (checked
+    // via the strcmp helper). Three predicate bits → a byte, matching native cc on all three engines.
+    let src = "#include <string.h>\n\
+        int run(int seed){\n\
+          const char *volatile pv = \"12.5e3xy\";\n\
+          const char *s = pv;\n\
+          const char *volatile setv = \"0123456789\";\n\
+          const char *digits = setv;\n\
+          char buf[16];\n\
+          strcpy(buf, s);\n\
+          unsigned long n = strspn(s, digits);\n\
+          const char *p = strpbrk(s, \"ex\");\n\
+          int acc = 0;\n\
+          acc += (strcmp(buf, s) == 0) ? 1 : 0;\n\
+          acc += (n == 2) ? 2 : 0;\n\
+          acc += (p == s + 4) ? 4 : 0;\n\
+          return (acc + seed) & 0xff;\n\
+        }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("libc_strcpy_strspn_strpbrk", src, 0);
+}
+
+#[test]
+fn cross_block_i1_mask() {
+    // A `<2 x i1>` mask defined in one block and `extractelement`-d in *both* successors — the shape
+    // clang's SLP vectorizer emits for fused byte-tests (Lua's GC `atomic`). Regression for masks
+    // crossing block boundaries: they are now held in the `agg` table with an `[i32; N]` layout, so
+    // the per-lane fan-out in `block_params`/`branch_args` threads them across edges. Hand-written
+    // LLVM so the cross-block shape is guaranteed regardless of the optimizer. Expected per seed:
+    // a=seed&0xff; lane0=(a&1==0), lane1=(a&2==0); l0 ? (lane1?1:2) : (lane1?4:8).
+    let ll = "\
+target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\n\
+target triple = \"x86_64-unknown-linux-gnu\"\n\
+define i32 @run(i32 %seed) {\n\
+entry:\n\
+  %a = trunc i32 %seed to i8\n\
+  %v0 = insertelement <2 x i8> undef, i8 %a, i64 0\n\
+  %v = insertelement <2 x i8> %v0, i8 %a, i64 1\n\
+  %m = and <2 x i8> %v, <i8 1, i8 2>\n\
+  %mask = icmp eq <2 x i8> %m, zeroinitializer\n\
+  %l0 = extractelement <2 x i1> %mask, i64 0\n\
+  br i1 %l0, label %then, label %else\n\
+then:\n\
+  %l1t = extractelement <2 x i1> %mask, i64 1\n\
+  %rt = select i1 %l1t, i32 1, i32 2\n\
+  br label %done\n\
+else:\n\
+  %l1e = extractelement <2 x i1> %mask, i64 1\n\
+  %re = select i1 %l1e, i32 4, i32 8\n\
+  br label %done\n\
+done:\n\
+  %r = phi i32 [ %rt, %then ], [ %re, %else ]\n\
+  ret i32 %r\n\
+}\n";
+    // Textual LLVM IR — feed it straight to the in-house reader (no `llvm-as` round-trip).
+    let t = temen_llvm::translate_ll_str(ll).expect("translate mask IR");
+    let module = t.module;
+    temen_verify::verify_module(&module).expect("verify translated IR");
+    for (seed, expect) in [(0i32, 1i32), (1, 4), (2, 2), (3, 8)] {
+        let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
+        let mut fuel = 1_000_000u64;
+        let tw = temen_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
+        assert_eq!(
+            tw.first(),
+            Some(&Value::I32(expect)),
+            "tree-walker seed={seed}"
+        );
+        let mut bf = 1_000_000u64;
+        let bc = temen_interp::bytecode::compile_and_run(&module, 0, &full, &mut bf)
+            .expect("bytecode compile")
+            .expect("bytecode run");
+        assert_eq!(
+            bc.first(),
+            Some(&Value::I32(expect)),
+            "bytecode seed={seed}"
+        );
+        let slots: Vec<i64> = full.iter().map(to_slot).collect();
+        match temen_jit::compile_and_run(&module, 0, &slots) {
+            Ok(JitOutcome::Returned(s)) => assert_eq!(s[0] as i32, expect, "JIT seed={seed}"),
+            Ok(o) => panic!("unexpected JIT outcome {o:?}"),
+            Err(e) => panic!("JIT error {e:?}"),
+        }
+    }
+}
+
+#[test]
+fn libc_abort_translates() {
+    // C `abort()` on an unexecuted error path: it must *translate* (drop → the following `unreachable`
+    // traps) even though the clean run never reaches it. `seed` is a runtime parameter, so clang keeps
+    // the `abort` call. The taken path returns 7 == native.
+    let src = "#include <stdlib.h>\n\
+        int run(int seed){\n\
+          int x = seed + 7;\n\
+          if (x < 0) abort();\n\
+          return x & 0xff;\n\
+        }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("libc_abort", src, 0);
+}
+
+#[test]
+fn libc_ldexp_bit_exact() {
+    // The synthesized `__temen_ldexp` (scalbn) over a grid of finite `x` × exponents `n` spanning the
+    // extremes (overflow→±inf, gradual underflow→denormal/0, and the two-step scaling for |n| huge).
+    // Each result's raw f64 bits are folded into a checksum returned as a byte; bit-identical to libc
+    // `ldexp` on all three engines pins the algorithm. `volatile` inputs keep the calls past `-O2`.
+    let src = "#include <math.h>\n\
+        int run(int seed){\n\
+          volatile double xs[7] = {1.0, 3.14159265358979, 1e300, 1e-300, 0.0, -2.5, 7.0};\n\
+          volatile int ns[8] = {0, 1, 5, -7, 60, 1100, -1100, -60};\n\
+          unsigned long long acc = 1469598103934665603ULL;\n\
+          for (int i=0;i<7;i++) for (int j=0;j<8;j++) {\n\
+            double r = ldexp(xs[i], ns[j]);\n\
+            union { double d; unsigned long long u; } cvt; cvt.d = r;\n\
+            acc = (acc ^ cvt.u) * 1099511628211ULL;\n\
+          }\n\
+          unsigned long long h = acc ^ (acc>>32);\n\
+          h ^= h>>16; h ^= h>>8;\n\
+          return (int)((h + (unsigned)seed) & 0xff);\n\
+        }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("libc_ldexp", src, 0);
+}
+
+#[test]
+fn libc_frexp_bit_exact() {
+    // The synthesized `__temen_frexp` over a grid spanning the normal range, a power-of-two boundary,
+    // ±0, a negative value, a subnormal (`1e-310`), and the special path (±inf). For each input both
+    // the returned mantissa's raw f64 bits and the written exponent are folded into the checksum, so
+    // the result *and* the `*e` out-param are pinned bit-identical to libc `frexp` on all three
+    // engines. `volatile` inputs keep the calls past `-O2`.
+    let src = "#include <math.h>\n\
+        int run(int seed){\n\
+          volatile double xs[10] = {1.0, 0.5, 3.14159265358979, 1e300, 1e-300,\n\
+                                    0.0, -2.5, 1024.0, 1e-310, 1.0/0.0};\n\
+          volatile double neg = -1.0/0.0;\n\
+          unsigned long long acc = 1469598103934665603ULL;\n\
+          for (int i=0;i<10;i++) {\n\
+            int e; double m = frexp(xs[i], &e);\n\
+            union { double d; unsigned long long u; } cvt; cvt.d = m;\n\
+            acc = (acc ^ cvt.u) * 1099511628211ULL;\n\
+            acc = (acc ^ (unsigned long long)(unsigned)e) * 1099511628211ULL;\n\
+          }\n\
+          { int e; double m = frexp(neg, &e);\n\
+            union { double d; unsigned long long u; } cvt; cvt.d = m;\n\
+            acc = (acc ^ cvt.u) * 1099511628211ULL;\n\
+            acc = (acc ^ (unsigned long long)(unsigned)e) * 1099511628211ULL; }\n\
+          unsigned long long h = acc ^ (acc>>32);\n\
+          h ^= h>>16; h ^= h>>8;\n\
+          return (int)((h + (unsigned)seed) & 0xff);\n\
+        }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("libc_frexp", src, 0);
+}
+
+#[test]
+fn libc_fmod_bit_exact() {
+    // The synthesized `__temen_fmod` (musl's exact 64-bit remainder) over a 10×8 grid of (x, y) pairs:
+    // normal/normal, |x|<|y| (early return), |x|==|y| (±0), every sign combination, a large quotient
+    // (many loop iterations — `1e300 % 7`), subnormal inputs (`1e-310`, the smallest subnormal
+    // `4.9e-324`, a subnormal divisor `1e-311`), and the special paths (`y==0` and `x==inf` → NaN).
+    // A finite result is folded by its raw f64 bits (so it is pinned bit-identical to libc); a NaN
+    // result is folded as a canonical constant (payload-independent) so the check still verifies that
+    // both sides produce NaN without depending on the exact NaN payload. `volatile` keeps the calls.
+    let src = "#include <math.h>\n\
+        int run(int seed){\n\
+          volatile double xs[10] = {5.5, 7.0, -7.0, 1e300, 3.0, 2.0, -2.0, 1e-310, 4.9e-324, 1.0/0.0};\n\
+          volatile double ys[8]  = {2.0, 3.0, -3.0, 1e300, 7.0, 2.0, 1e-311, 0.0};\n\
+          unsigned long long acc = 1469598103934665603ULL;\n\
+          for (int i=0;i<10;i++) for (int j=0;j<8;j++) {\n\
+            double r = fmod(xs[i], ys[j]);\n\
+            unsigned long long bits;\n\
+            if (r != r) bits = 0x7ff8000000000000ULL; /* canonicalize any NaN */\n\
+            else { union { double d; unsigned long long u; } cvt; cvt.d = r; bits = cvt.u; }\n\
+            acc = (acc ^ bits) * 1099511628211ULL;\n\
+          }\n\
+          unsigned long long h = acc ^ (acc>>32);\n\
+          h ^= h>>16; h ^= h>>8;\n\
+          return (int)((h + (unsigned)seed) & 0xff);\n\
+        }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("libc_fmod", src, 0);
+}
+
+#[test]
+fn libc_localeconv_c_locale() {
+    // `localeconv()` returns the synthesized read-only C-locale `lconv` struct. Read `decimal_point`
+    // (".", plus its NUL), an empty string field (`thousands_sep`/`grouping` → ""), and two of the
+    // `char` fields (`frac_digits`/`p_sign_posn` → CHAR_MAX). With no `setlocale`, native runs in the
+    // "C" locale, so every field matches the synthesized struct — same byte on all three engines.
+    let src = "#include <locale.h>\n\
+        int run(int seed){\n\
+          struct lconv *lc = localeconv();\n\
+          int acc = 0;\n\
+          acc += (unsigned char)lc->decimal_point[0];\n\
+          acc += (unsigned char)lc->decimal_point[1];\n\
+          acc += (unsigned char)lc->thousands_sep[0];\n\
+          acc += (unsigned char)lc->grouping[0];\n\
+          acc += (lc->frac_digits & 0xff);\n\
+          acc += (lc->p_sign_posn & 0xff);\n\
+          return (acc + seed) & 0xff;\n\
+        }\n\
+        int main(void){ return run(0); }";
+    check_run_byte_vs_native("libc_localeconv", src, 0);
+}
+
+#[test]
+fn demo_libm_vs_native() {
+    // The bundled **guest `libm`** (`demos/libm/libm.c`, fdlibm `exp`/`log`/`pow`/`sin`/`cos`): a
+    // program that needs the transcendentals brings them as ordinary guest C — no host math
+    // capability, no translator intrinsic — and a guest definition shadows the libc-name binding the
+    // on-ramp would otherwise synthesize. The driver evaluates each over runtime grids and writes the
+    // raw f64 image; since the math is guest code, native `cc` compiles the same source, so the bytes
+    // are identical across the tree-walker, the bytecode VM, the JIT, and native. `pow` also exercises
+    // `sqrt` (→ the Temen `f64.sqrt` op, `y=0.5`) and `scalbn` (→ `__temen_ldexp`).
+    //
+    // Built with `-fno-vectorize -fno-slp-vectorize`: clang would auto-SIMD some of the polynomial
+    // evaluation into `<2 x double>` (the §17 vector lane, outside this scalar on-ramp's scope), and
+    // exact IEEE arithmetic gives the identical bytes scalar-vs-vectorized — so the on-ramp consumes
+    // scalar bitcode while the native oracle keeps vectorizing (the split the corpus demos use).
+    check_demo_vs_native_flags(
+        "libm",
+        "libm/libm_demo.c",
+        b"",
+        &["-fno-vectorize", "-fno-slp-vectorize"],
+    );
+}
+
+#[test]
+fn libm_guest_exp_log_accurate_vs_system() {
+    // Accuracy gate (native only): the byte-identical differential above proves the on-ramp *executes*
+    // the guest libm faithfully, but — same source on both lanes — it cannot catch a transcription
+    // error (both lanes would be equally wrong). So compile `libm.c` with its symbols renamed
+    // (`-Dexp=temen_exp -Dlog=temen_log`) and compare against the system `<math.h>` over a grid, asserting
+    // each result is within 2 ULP. This validates the fdlibm transcription against a real libm.
+    let probe = "#include <math.h>\n\
+        #include <stdint.h>\n\
+        double temen_exp(double); double temen_log(double); double temen_pow(double,double);\n\
+        double temen_sin(double); double temen_cos(double);\n\
+        static int ulp_ok(double a, double b){\n\
+          if (a==b) return 1;\n\
+          if (a!=a && b!=b) return 1; /* both NaN */\n\
+          int64_t ia, ib; __builtin_memcpy(&ia,&a,8); __builtin_memcpy(&ib,&b,8);\n\
+          if (ia<0) ia = (int64_t)0x8000000000000000ULL - ia;\n\
+          if (ib<0) ib = (int64_t)0x8000000000000000ULL - ib;\n\
+          int64_t d = ia>ib ? ia-ib : ib-ia; return d <= 2;\n\
+        }\n\
+        int main(void){\n\
+          double xs[] = {0.0,0.5,1.0,2.0,3.14159265,10.0,-1.0,-5.0,100.0,0.001,709.0,-700.0};\n\
+          double ls[] = {1.0,2.0,0.5,2.718281828459045,10.0,1e10,1e-10,0.001,1e300,123456.789};\n\
+          double pb[] = {2.0,3.0,-2.0,-2.0,10.0,0.5,9.0,-1.0,1.5,2.0,-3.0,0.5,7.0};\n\
+          double pe[] = {10.0,3.0,3.0,4.0,-2.0,0.5,0.5,2.0,2.5,0.5,3.0,-1.0,2.0};\n\
+          /* sin/cos: generic O(1)-result args (avoid exact multiples of pi where the residual is\n\
+             pathologically tiny), spanning every quadrant up to the medium-path bound (~1.6e6). */\n\
+          double ts[] = {0.3,0.5,0.7853981633974483,1.0,1.5,2.0,2.5,3.0,5.0,10.0,100.0,\n\
+                         1000.0,12345.678,1e5,1e6,-0.5,-3.0,-100.0};\n\
+          for (unsigned i=0;i<sizeof xs/sizeof*xs;i++) if(!ulp_ok(temen_exp(xs[i]), exp(xs[i]))) return 1;\n\
+          for (unsigned i=0;i<sizeof ls/sizeof*ls;i++) if(!ulp_ok(temen_log(ls[i]), log(ls[i]))) return 2;\n\
+          for (unsigned i=0;i<sizeof pb/sizeof*pb;i++) if(!ulp_ok(temen_pow(pb[i],pe[i]), pow(pb[i],pe[i]))) return 3;\n\
+          for (unsigned i=0;i<sizeof ts/sizeof*ts;i++) if(!ulp_ok(temen_sin(ts[i]), sin(ts[i]))) return 4;\n\
+          for (unsigned i=0;i<sizeof ts/sizeof*ts;i++) if(!ulp_ok(temen_cos(ts[i]), cos(ts[i]))) return 5;\n\
+          return 0;\n\
+        }";
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("temen_libm_acc_{}.c", std::process::id()));
+    let obj = dir.join(format!("temen_libm_acc_{}.o", std::process::id()));
+    let exe = dir.join(format!("temen_libm_acc_{}", std::process::id()));
+    let libm =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../temen-run/demos/libm/libm.c");
+    std::fs::write(&c, probe).expect("write probe");
+    // Compile the guest libm with its symbols renamed (`exp`→`temen_exp`, `log`→`temen_log`) so the probe
+    // can hold both it *and* the system `exp`/`log` for comparison.
+    let built = Command::new("cc")
+        .args([
+            "-O2",
+            "-fno-builtin",
+            "-Dexp=temen_exp",
+            "-Dlog=temen_log",
+            "-Dpow=temen_pow",
+            "-Dsin=temen_sin",
+            "-Dcos=temen_cos",
+            "-c",
+        ])
+        .arg(&libm)
+        .args(["-o"])
+        .arg(&obj)
+        .status();
+    match built {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping libm accuracy (cc unavailable)");
+            return;
+        }
+    }
+    // Link the probe (its own `exp`/`log` are the system libm) against the renamed guest object.
+    let linked = Command::new("cc")
+        .args(["-O2"])
+        .arg(&c)
+        .arg(&obj)
+        .args(["-lm", "-o"])
+        .arg(&exe)
+        .status()
+        .expect("link probe");
+    assert!(linked.success(), "probe link failed");
+    let code = Command::new(&exe)
+        .status()
+        .expect("run probe")
+        .code()
+        .unwrap();
+    assert_eq!(
+        code, 0,
+        "guest libm vs system: failing stage {code} (1=exp, 2=log, 3=pow, 4=sin, 5=cos)"
+    );
+}
+
+#[test]
+fn demo_strtod_vs_native() {
+    // The guest **`strtod`** (`demos/strtod/strtod.c`): a program that needs decimal→f64 parsing
+    // brings it as ordinary guest C, and the guest definition shadows the on-ramp's `strtod` trap
+    // stub. The driver parses a grid of decimal strings and writes each result's raw f64 image + the
+    // `endptr` offset; since the parser is guest code, native `cc` compiles the same source, so the
+    // bytes are identical across the tree-walker, the bytecode VM, the JIT, and native.
+    //
+    // Built `-fno-vectorize -fno-slp-vectorize` (the bignum limb loops would auto-SIMD to `<… x i32>`,
+    // the v128 lane outside this scalar on-ramp; exact integer arithmetic is identical
+    // scalar-vs-vectorized, the corpus-demo split).
+    check_demo_vs_native_flags(
+        "strtod",
+        "strtod/strtod_demo.c",
+        b"",
+        &["-fno-vectorize", "-fno-slp-vectorize"],
+    );
+}
+
+#[test]
+fn strtod_guest_correctly_rounded_vs_system() {
+    // Correctness gate (native only): the byte-identical differential proves the on-ramp *executes*
+    // the guest `strtod` faithfully, but — same source on both lanes — cannot catch an algorithm
+    // error. Correctly-rounded decimal→f64 is *unique*, so a correct guest `strtod` matches glibc's
+    // bit-for-bit. Compile `strtod.c` renamed (`-Dstrtod=temen_strtod`) and assert the returned bits
+    // *and* the `endptr` offset match the system `strtod` over a grid spanning the hard cases:
+    // subnormals + the smallest-subnormal halfway tie, the 2^53 boundary, max-double, overflow→inf,
+    // underflow→0, the 1e22/1e23 fast-path boundary, `0.30000000000000004`, and long digit strings —
+    // plus **hex floats** (`0x7.4`, `0x.ABCDEFp+24`, a 64-bit hex mantissa needing rounding, sub/
+    // overflow via `p`-exponents, and the malformed `0x`/`0x.`/`0x3.3.3` that must stop at the right
+    // `endptr`), the form Lua's own hex-float literals need.
+    let probe = "#include <stdlib.h>\n\
+        #include <string.h>\n\
+        double temen_strtod(const char*, char**);\n\
+        static int bad;\n\
+        static void chk(const char* s){\n\
+          char *e1,*e2; double a=temen_strtod(s,&e1), b=strtod(s,&e2);\n\
+          unsigned long long ua,ub; memcpy(&ua,&a,8); memcpy(&ub,&b,8);\n\
+          if (ua!=ub || (e1-s)!=(e2-s)) bad=1;\n\
+        }\n\
+        int main(void){\n\
+          const char* t[] = {\n\
+            \"0\",\"0.0\",\"-0.0\",\"1\",\"3.14\",\"0.5\",\"2.5\",\"100.0\",\"-2.5\",\"1e10\",\"1e-10\",\n\
+            \"1e100\",\"1e-100\",\"1.5e3\",\"123456789.123456789\",\"0.1\",\"0.3\",\n\
+            \"9007199254740992\",\"9007199254740993\",\"1.7976931348623157e308\",\n\
+            \"2.2250738585072014e-308\",\"5e-324\",\"4.9e-324\",\"2.4703282292062327e-324\",\n\
+            \"1e309\",\"1e-400\",\"0.0000001\",\"  42.0\",\"  -3.25e2\",\"1000000000000000000000\",\n\
+            \"0.30000000000000004\",\"1e22\",\"1e23\",\"0.000244140625\",\"1.25e-1\",\".5\",\"5.\",\n\
+            \"+1.5\",\"3.141592653589793\",\"1234567890123456789012345678901234567890\",\n\
+            \"9.881312916824931e-324\",\"1.1125369292536007e-308\",\"8.98846567431158e307\",\n\
+            \"abc\",\"\",\"17.0\",\"0.000244140625e3\",\n\
+            \"0x7.4\",\"0x.ABCDEFp+24\",\"0x0.51p+8\",\"0x.0p-3\",\"0xa.aP4\",\"0x4P-2\",\n\
+            \"0x0.7a7040a5a323c9d6\",\"0x.00000001\",\"0x1.8p1\",\"-0x1.8p1\",\"0x1.8\",\n\
+            \"0x1.fffffffffffffp1023\",\"0x1p1024\",\"0x1p-1074\",\"0x1p-1075\",\"0Xabcdef.0\",\n\
+            \"0x0.00000000000001\",\"0x.0000000000000000000000000000000000000000000074p4004\",\n\
+            \"0x\",\"0x.\",\"0x3.3.3\",\"0xGG\",\n\
+          };\n\
+          for (unsigned i=0;i<sizeof t/sizeof*t;i++) chk(t[i]);\n\
+          return bad;\n\
+        }";
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("temen_strtod_acc_{}.c", std::process::id()));
+    let obj = dir.join(format!("temen_strtod_acc_{}.o", std::process::id()));
+    let exe = dir.join(format!("temen_strtod_acc_{}", std::process::id()));
+    let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../temen-run/demos/strtod/strtod.c");
+    std::fs::write(&c, probe).expect("write probe");
+    let built = Command::new("cc")
+        .args(["-O2", "-fno-builtin", "-Dstrtod=temen_strtod", "-c"])
+        .arg(&src)
+        .args(["-o"])
+        .arg(&obj)
+        .status();
+    match built {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping strtod accuracy (cc unavailable)");
+            return;
+        }
+    }
+    let linked = Command::new("cc")
+        .args(["-O2"])
+        .arg(&c)
+        .arg(&obj)
+        .args(["-o"])
+        .arg(&exe)
+        .status()
+        .expect("link probe");
+    assert!(linked.success(), "probe link failed");
+    let code = Command::new(&exe)
+        .status()
+        .expect("run probe")
+        .code()
+        .unwrap();
+    assert_eq!(
+        code, 0,
+        "guest strtod != system strtod (bit/endptr mismatch)"
+    );
+}
+
+#[test]
+fn setjmp_longjmp_round_trip() {
+    // `setjmp` returns 0 on the direct call; `deep` `longjmp`s back with `n*7+1`, so `setjmp` "returns
+    // twice" and `run` yields that value. The longjmp unwinds across `deep`'s frame to the `setjmp`
+    // frame, restoring its data-SP and value state. Byte-identical to native libc.
+    let src = "#include <setjmp.h>\n\
+               static jmp_buf env;\n\
+               static void deep(int x){ longjmp(env, x*7+1); }\n\
+               int run(int n){ int r = setjmp(env); if (r==0){ deep(n); return -1; } return r & 0xff; }\n\
+               int main(void){ return run(5); }";
+    check_setjmp_vs_native("setjmp_basic", src, 5);
+}
+
+#[test]
+fn setjmp_longjmp_loop_and_deep_nesting() {
+    // A retry loop: each `longjmp` (from several frames deep) re-enters the `setjmp`, incrementing a
+    // counter carried in memory (a `volatile`/`static`, which survives the jump per C), until it
+    // reaches the limit — exercising repeated re-entry (the checkpoint is overwritten on each
+    // `setjmp`) and a multi-frame unwind. Byte-identical to native.
+    let src = "#include <setjmp.h>\n\
+               static jmp_buf env;\n\
+               static int counter;\n\
+               static void c(int d, int n){ if (d > 0) { c(d-1, n); return; } longjmp(env, n); }\n\
+               int run(int n){ counter = 0; int r = setjmp(env); \
+                 if (r != 0) counter += r; \
+                 if (counter < n) c(3, counter + 1); \
+                 return counter & 0xff; }\n\
+               int main(void){ return run(20); }";
+    check_setjmp_vs_native("setjmp_loop", src, 20);
+}
+
+#[test]
+fn setjmp_value_live_across() {
+    // The returns-twice hazard (LLVM.md §"JIT `longjmp`"): a `volatile` automatic is live across the
+    // `setjmp` — modified before the `longjmp` and read after the re-entry. Per C a `volatile` auto is
+    // preserved across `longjmp`; clang spills it to the stack at `-O2`, so it rides in guest window
+    // memory and survives the native `_longjmp`. Result = (100 + n + 7) & 0xff. Byte-identical to native.
+    let src = "#include <setjmp.h>\n\
+               static jmp_buf env;\n\
+               static void boom(int x){ longjmp(env, x); }\n\
+               int run(int n){ volatile int acc = 100; int r = setjmp(env); \
+                 if (r == 0){ acc += n; boom(7); return -1; } \
+                 return (acc + r) & 0xff; }\n\
+               int main(void){ return run(20); }";
+    check_setjmp_vs_native("setjmp_value_live", src, 20);
+}
+
+#[test]
+fn setjmp_nested_buffers() {
+    // Two distinct `jmp_buf`s (two host table slots): an inner `setjmp` then a `longjmp` to the
+    // **outer** buffer, skipping the inner — exercises keying by buffer address and a longjmp that
+    // crosses a frame holding a *different* live checkpoint. `setjmp(outer)` re-enters with 9 → 42.
+    let src = "#include <setjmp.h>\n\
+               static jmp_buf outer, inner;\n\
+               static void deep(void){ longjmp(outer, 9); }\n\
+               int run(int n){ if (setjmp(outer) != 0) return (40 + n) & 0xff; \
+                 if (setjmp(inner) == 0){ deep(); return -1; } return -2; }\n\
+               int main(void){ return run(2); }";
+    check_setjmp_vs_native("setjmp_nested_bufs", src, 2);
+}
+
+#[test]
+fn sigsetjmp_recognized() {
+    // `sigsetjmp`/`siglongjmp` — Postgres' `PG_TRY`/`ereport` non-local jump. The `sigsetjmp` macro
+    // expands to the actual libc symbol **`__sigsetjmp`** (glibc), which a whole-program build carries
+    // under that name; the on-ramp now recognizes it (alongside `setjmp`/`_setjmp`/`sigsetjmp`) and
+    // lowers it to the same `SetJmp` core op (the `savesigs` arg is ignored — the sandbox delivers no
+    // signals). `run(seed)` sets a checkpoint, jumps back through it with `seed+5`, and returns that —
+    // byte-identical to native across all three engines.
+    let src = "#include <setjmp.h>\n\
+               static sigjmp_buf env;\n\
+               static void jump(int x){ siglongjmp(env, x); }\n\
+               int run(int n){ int r = sigsetjmp(env, 1); \
+                 if (r == 0){ jump((n + 5) & 0xff); return -1; } return r; }\n\
+               int main(void){ return run(7); }";
+    check_setjmp_vs_native("sigsetjmp", src, 7);
+}
+
+#[test]
+fn demo_sha256_vs_native() {
+    // The first real corpus library end-to-end: B-Con's SHA-256 hashing "", "abc", and the
+    // pangram, printing each digest as hex via `write` — byte-identical to the native `clang` build.
+    // Exercises funnel-shift rotates, the variable-length `memset` loop helper, multi-function calls,
+    // the data stack, a const global table, and the `Stream` capability all at once (the D54 goal).
+    check_demo_vs_native("sha256", "sha256/sha_demo.c", b"");
+}
+
+#[test]
+fn demo_xxhash_vs_native() {
+    // xxHash (XXH32/64) over the same inputs — 32- and 64-bit funnel-shift rotates + wide integer
+    // mixing. Already covered by slices A–P; byte-identical to native `clang`.
+    check_demo_vs_native("xxhash", "xxhash/xxh_demo.c", b"");
+}
+
+#[test]
+fn demo_perlin_vs_native() {
+    // stb_perlin: float-heavy noise (`fmuladd`/`fabs` intrinsics, int↔float, a const gradient table).
+    // The float coverage (slice F) + `llvm.abs` (slice M) carry it — matching native `clang`.
+    check_demo_vs_native("perlin", "perlin/perlin_demo.c", b"");
+}
+
+#[test]
+fn demo_monocypher_vs_native() {
+    // Monocypher 4.0.2 (public domain): modern crypto — BLAKE2b, ChaCha20, Poly1305, and an X25519
+    // ECDH known-answer test. The crypto / 64-bit-carry shakedown: AEAD bit-mixing plus the curve's
+    // 25.5-bit-limb field arithmetic (`i32 × i32 → i64` products with carry propagation) stress the
+    // 64-bit shift/rotate/multiply paths hard. Outputs are hex (no float formatting); the X25519
+    // section also self-validates (both ECDH sides must agree, exit code = mismatch count).
+    // Byte-identical to native `clang`. Compiled with auto-vectorization off for the on-ramp
+    // (the crypto hot loops clang would SIMD-vectorize are the §17 vector lane, not the scalar
+    // arithmetic this demo targets); the native oracle keeps vectorizing — exact integer crypto
+    // agrees scalar-vs-vectorized. Mirrors the Rust lane.
+    check_demo_vs_native_flags(
+        "monocypher",
+        "monocypher/monocypher_demo.c",
+        b"",
+        &["-fno-vectorize", "-fno-slp-vectorize"],
+    );
+}
+
+#[test]
+fn demo_stb_image_vs_native() {
+    // Sean Barrett's stb_image (public domain), PNG-only: decode an embedded 24×24 RGBA PNG and
+    // write the raw decoded pixels. A real-parser shakedown — stb's built-in zlib inflate
+    // (Huffman + LZ77), the PNG row unfilters (None/Sub/Up/Average/Paeth — the test image cycles
+    // all five, hitting the narrow `unsigned char` predictor arithmetic, the slice-U class), the
+    // chunk/CRC walk, and heap traffic through the on-ramp's synthesized malloc/realloc/free. The
+    // native build decodes the same bytes → byte-exact oracle. Vectorization off for the on-ramp
+    // (the inflate/unfilter loops clang would SIMD-vectorize are the §17 lane); exact integer
+    // decoding agrees scalar-vs-vectorized.
+    check_demo_vs_native_flags(
+        "stb_image",
+        "stb_image/stb_image_demo.c",
+        b"",
+        &["-fno-vectorize", "-fno-slp-vectorize"],
+    );
+}
+
+#[test]
+fn demo_sqlite_vs_native() {
+    // **SQLite Phase A — the in-memory SQL-engine capstone (LLVM.md §8 ladder #5).** The unmodified
+    // SQLite amalgamation (3.50.2, ~257k lines — fetched + cached, public domain) compiled as a
+    // guest: `:memory:` database, deterministic `SQLITE_OS_OTHER` VFS (fixed-seed randomness, fixed
+    // clock, xOpen fail-closed — no file I/O can even be attempted), running a 29-statement breadth
+    // script: DDL + indexes, recursive-CTE inserts, aggregates, GROUP BY/HAVING, a self-join,
+    // string/CASE/NULL semantics, float formatting through SQLite's own %!.15g (Dekker double-double
+    // in 3.47+), CASTs, window functions, date/time off the pinned clock, random() off the pinned
+    // PRNG, UPDATE/DELETE + transactions, quote()/blobs, subqueries/EXISTS, PRAGMA integrity_check,
+    // and a deliberate error. Byte-identical stdout vs the same file built natively with `cc`.
+    // Vectorization off for the on-ramp like the other capstones; the oracle keeps vectorizing.
+    // (This slice forced exactly two on-ramp additions: `strcspn` + `strrchr`.)
+    let Some(amalg) = fetch_sqlite_amalgamation() else {
+        return;
+    };
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../temen-run/demos/sqlite/sqlite_demo.c");
+    let bc = std::env::temp_dir().join(format!("temen_llvm_demo_{}_sqlite.ll", std::process::id()));
+    let inc = format!("-I{}", amalg.display());
+    let status = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-S",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&inc)
+        .arg(&demo)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping sqlite (clang unavailable)");
+            return;
+        }
+    }
+    powerbox_diff_cc_flags("sqlite", &bc, &demo, b"", &[&inc]);
+}
+
+#[test]
+fn demo_sqlite_repl_stdin() {
+    // **The interactive SQL-editor guest** (`sqlite_repl.c`, the browser playground's REPL): the same
+    // unmodified amalgamation + deterministic VFS, but the driver reads a SQL script from **stdin**
+    // (the `Stream.read` capability) and prints each statement's result table / change count / error.
+    // A differential over a SQL script on stdin — DDL, INSERT, a headered SELECT, an aggregate, and a
+    // deliberate error — asserts the guest's stdout is byte-identical to the same file built with `cc`.
+    let Some(amalg) = fetch_sqlite_amalgamation() else {
+        return;
+    };
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../temen-run/demos/sqlite/sqlite_repl.c");
+    let bc = std::env::temp_dir().join(format!(
+        "temen_llvm_demo_{}_sqlite_repl.ll",
+        std::process::id()
+    ));
+    let inc = format!("-I{}", amalg.display());
+    let status = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-S",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&inc)
+        .arg(&demo)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping sqlite_repl (clang unavailable)");
+            return;
+        }
+    }
+    const SQL: &[u8] = b"CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);\n\
+        INSERT INTO t(b) VALUES ('x'), ('y'), ('z');\n\
+        SELECT a, upper(b) AS B FROM t WHERE a >= 2 ORDER BY a;\n\
+        SELECT count(*) AS n, group_concat(b) AS all_b FROM t;\n\
+        SELECT * FROM nope;\n";
+    powerbox_diff_cc_flags("sqlite_repl", &bc, &demo, SQL, &[&inc]);
+}
+
+/// Fetch (and cache) sqllogictest script files — SQLite's own SQL Logic Tests corpus
+/// (https://sqlite.org/sqllogictest/), via the long-stable gregrahn GitHub mirror (the fossil
+/// tarball endpoint rate-limits). Returns `(name, path)` pairs for whatever fetched; files that
+/// fail to download are skipped with a note (offline ⇒ empty vec ⇒ the test skips).
+fn fetch_sqllogictest_scripts() -> Vec<(&'static str, PathBuf)> {
+    const BASE: &str = "https://raw.githubusercontent.com/gregrahn/sqllogictest/master/test";
+    const FILES: &[(&str, &str)] = &[
+        ("select1", "select1.test"),
+        ("select2", "select2.test"),
+        ("select3", "select3.test"),
+        ("random_expr_0", "random/expr/slt_good_0.test"),
+        ("random_agg_0", "random/aggregates/slt_good_0.test"),
+        ("random_groupby_0", "random/groupby/slt_good_0.test"),
+        ("random_select_0", "random/select/slt_good_0.test"),
+    ];
+    let cache = std::env::temp_dir().join("temen_sqllogictest_cache");
+    let _ = std::fs::create_dir_all(&cache);
+    let mut out = Vec::new();
+    for (name, rel) in FILES {
+        let dst = cache.join(format!("{name}.test"));
+        if !dst.exists() {
+            let ok = Command::new("curl")
+                .args(["-sfL", "--max-time", "120", "-o"])
+                .arg(&dst)
+                .arg(format!("{BASE}/{rel}"))
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                let _ = std::fs::remove_file(&dst);
+                eprintln!("note: sqllogictest {name} fetch failed — skipping");
+                continue;
+            }
+        }
+        out.push((*name, dst.clone()));
+    }
+    out
+}
+
+#[test]
+fn demo_sqlite_logictest() {
+    // **SQLite's own test corpus in the sandbox.** A compact sqllogictest runner
+    // (`demos/sqlite/sqlite_logictest.c` — record parser, reference-exact value formatting,
+    // rowsort/valuesort, embedded MD5 for the `N values hashing to <md5>` form) reads each script
+    // from stdin and checks every record against the expected results SQLite's own corpus bakes
+    // in. Two independent gates per script:
+    //  1. **self-validation** — the guest's summary must report `failed=0`: tens of thousands of
+    //     SQLite's own expected query results hold when the engine runs in the sandbox;
+    //  2. **differential** — guest stdout must be byte-identical to the native build of the same
+    //     runner over the same stdin.
+    // This default test runs `select1.test` (1031 records) to keep the debug-build suite time
+    // sane; `demo_sqlite_logictest_full` (#[ignore]) sweeps all seven fetched scripts (~46k
+    // records / ~56k queries — per-record guest cost is small; a 15k-record file runs in ~4-5 s
+    // in release, but the debug-build test binary is ~15× slower).
+    run_sqllogictest(1);
+}
+
+/// The full seven-script sweep (select1-3 + four `random/*` torture files, ~46k records). Ignored
+/// by default (adds ~8 min to a debug-build run); run it locally / nightly with
+/// `cargo test --test translate demo_sqlite_logictest_full -- --ignored`.
+#[test]
+#[ignore]
+fn demo_sqlite_logictest_full() {
+    run_sqllogictest(usize::MAX);
+}
+
+fn run_sqllogictest(max_scripts: usize) {
+    let Some(amalg) = fetch_sqlite_amalgamation() else {
+        return;
+    };
+    let mut scripts = fetch_sqllogictest_scripts();
+    scripts.truncate(max_scripts);
+    if scripts.is_empty() {
+        return;
+    }
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../temen-run/demos/sqlite/sqlite_logictest.c");
+    let inc = format!("-I{}", amalg.display());
+    let pid = std::process::id();
+
+    let bc = std::env::temp_dir().join(format!("temen_llvm_demo_{pid}_slt.ll"));
+    let status = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-S",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&inc)
+        .arg(&demo)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping sqlite_logictest (clang unavailable)");
+            return;
+        }
+    }
+    let exe = std::env::temp_dir().join(format!("temen_llvm_pb_{pid}_slt"));
+    match Command::new("cc")
+        .arg(&inc)
+        .arg(&demo)
+        .args(["-lm", "-o"])
+        .arg(&exe)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping sqlite_logictest (cc unavailable)");
+            return;
+        }
+    }
+
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate sqllogictest runner");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
+    temen_verify::verify_module(&module).expect("verify");
+
+    for (name, path) in scripts {
+        let script = std::fs::read(&path).expect("read script");
+        let native = {
+            use std::io::Write;
+            let mut child = Command::new(&exe)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn native");
+            child.stdin.take().unwrap().write_all(&script).ok();
+            child.wait_with_output().expect("run native")
+        };
+        let run = temen_run::run_powerbox(&module, &script).expect("powerbox run");
+        let out = String::from_utf8_lossy(&run.stdout);
+        let summary = out.lines().last().unwrap_or("");
+        assert!(
+            summary.contains(" failed=0 "),
+            "{name}: sqllogictest failures in the sandbox — {summary}
+first FAILs:
+{}",
+            out.lines()
+                .filter(|l| l.starts_with("FAIL"))
+                .take(5)
+                .collect::<Vec<_>>()
+                .join(
+                    "
+"
+                )
+        );
+        assert_eq!(
+            run.stdout, native.stdout,
+            "{name}: guest stdout differs from native"
+        );
+        eprintln!("sqllogictest {name}: {summary}");
+    }
+}
+
+#[test]
+fn demo_lmdb_mmap_cap_vs_native() {
+    // **LMDB — an embedded memory-mapped B-tree KV store in the sandbox** (LLVM.md storage ladder,
+    // the *second* storage shape after SQLite's read/write VFS). LMDB (OpenLDAP's Lightning MDB, the
+    // original mmap'd B-tree that libmdbx later hardened) reads its B-tree straight out of a
+    // file-backed mmap — the data plane *is* the mapping. Here that mmap goes through the granted Fs
+    // capability's **mmap surface** (`FS_MMAP`/`FS_MSYNC`/`FS_MUNMAP`, `crates/temen-run/src/fs.rs`): a
+    // guest shim (`demos/lmdb/lmdb_shim.c`) bridges LMDB's `mmap`/`msync`/`pread`/`open`/… to
+    // `__vm_cap_resolve("fs")` + `__vm_host_call`, so the whole memory-mapped data plane flows through
+    // explicitly granted authority — zero ambient access. `MDB_WRITEMAP` makes every page (data +
+    // meta) land in the map, so the copy-in/flush-out emulation is coherent (the buffer is the sole
+    // authority); `MDB_NOLOCK|MDB_NOSUBDIR` keep it single-file, single-process (no lock table).
+    //
+    // Three assertions, mirroring SQLite Phase B:
+    //  1. **stdout differential** — the guest (mem_fs) byte-matches the native oracle (real mmap in a
+    //     temp dir) over fill → delete → close → reopen → point-lookups + full cursor scan (a running
+    //     checksum over the in-order B-tree walk) + stat;
+    //  2. **the capability story** — under `host_fs` the guest's `data.mdb` really lands on disk, and
+    //     the *native* LMDB binary opens that guest-written file and verifies it byte-identically:
+    //     cross-implementation on-disk-format proof, capability-written;
+    //  3. **the reverse** — the guest reads a native-written `data.mdb` through `host_fs`.
+    let Some(lmdb) = fetch_lmdb() else {
+        return;
+    };
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../temen-run/demos/lmdb/lmdb_demo.c");
+    let shim = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../temen-run/demos/lmdb/lmdb_shim.c");
+    let inc = format!("-I{}", lmdb.display());
+    let pid = std::process::id();
+    let tmp = std::env::temp_dir();
+
+    // Guest `.ll`: compile mdb.c/midl.c/demo/shim (-DTEMEN_GUEST) each, then llvm-link into one module.
+    let cflags = [
+        "-O2",
+        "-emit-llvm",
+        "-S",
+        "-DTEMEN_GUEST",
+        "-fno-vectorize",
+        "-fno-slp-vectorize",
+    ];
+    let mut bcs = Vec::new();
+    let compile = |src: PathBuf, tag: &str| -> Option<PathBuf> {
+        let out = tmp.join(format!("temen_llvm_lmdb_{pid}_{tag}.ll"));
+        let ok = Command::new("clang")
+            .args(cflags)
+            .arg(&inc)
+            .arg(&src)
+            .arg("-o")
+            .arg(&out)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        ok.then_some(out)
+    };
+    for (src, tag) in [
+        (lmdb.join("mdb.c"), "mdb"),
+        (lmdb.join("midl.c"), "midl"),
+        (demo.clone(), "demo"),
+        (shim.clone(), "shim"),
+    ] {
+        match compile(src, tag) {
+            Some(bc) => bcs.push(bc),
+            None => {
+                eprintln!("note: skipping lmdb (clang unavailable)");
+                return;
+            }
+        }
+    }
+    let linked = tmp.join(format!("temen_llvm_lmdb_{pid}.ll"));
+    // Merge the guest `.ll` TUs into one textual module with the default `llvm-link` (matching the
+    // system clang that produced them) — no LLVM-18 pin: the version-tolerant text reader ingests
+    // whatever `-S` emits.
+    let linked_ok = Command::new("llvm-link")
+        .arg("-S")
+        .args(&bcs)
+        .arg("-o")
+        .arg(&linked)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !linked_ok {
+        eprintln!("note: skipping lmdb (llvm-link unavailable)");
+        return;
+    }
+
+    // Native oracle: mdb.c + midl.c + demo (no shim → real glibc/mmap).
+    let exe = tmp.join(format!("temen_llvm_pb_{pid}_lmdb"));
+    let native_ok = Command::new("cc")
+        .arg("-O2")
+        .arg(&inc)
+        .arg(lmdb.join("mdb.c"))
+        .arg(lmdb.join("midl.c"))
+        .arg(&demo)
+        .args(["-lpthread", "-o"])
+        .arg(&exe)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !native_ok {
+        eprintln!("note: skipping lmdb (cc unavailable)");
+        return;
+    }
+
+    let t = temen_llvm::translate_ll_path(&linked).expect("translate lmdb guest");
+    let inst = temen_run::instantiate(t.module).expect("instantiate");
+    let config = |args: Vec<Vec<u8>>| temen_run::RunConfig {
+        limits: temen_run::Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: vec![],
+        memory_size_log2: None,
+        args,
+        env: vec![],
+        ..temen_run::RunConfig::default()
+    };
+
+    // Oracle bytes: create (fresh dir) + verify (same dir).
+    let nat_root = tmp.join(format!("temen-lmdb-nat-{pid}"));
+    let _ = std::fs::remove_dir_all(&nat_root);
+    std::fs::create_dir_all(&nat_root).expect("native root");
+    let oracle_create = Command::new(&exe)
+        .current_dir(&nat_root)
+        .output()
+        .expect("native create");
+    assert!(oracle_create.status.success(), "native create failed");
+    let oracle_verify = Command::new(&exe)
+        .arg("verify")
+        .current_dir(&nat_root)
+        .output()
+        .expect("native verify");
+    assert!(oracle_verify.status.success(), "native verify failed");
+
+    // 1. mem_fs: hermetic fill → reopen → verify, byte-identical stdout.
+    let out = inst
+        .run_with_caps(
+            temen_run::Backend::Bytecode,
+            &config(vec![]),
+            &[("fs", temen_run::fs::mem_fs())],
+        )
+        .expect("guest run (mem_fs)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&oracle_create.stdout),
+        "lmdb: guest (mem_fs) stdout vs native"
+    );
+
+    // 2. host_fs: the guest writes a real data.mdb; the NATIVE binary then verifies it.
+    let guest_root = tmp.join(format!("temen-lmdb-guest-{pid}"));
+    let _ = std::fs::remove_dir_all(&guest_root);
+    std::fs::create_dir_all(&guest_root).expect("guest root");
+    let out = inst
+        .run_with_caps(
+            temen_run::Backend::Bytecode,
+            &config(vec![]),
+            &[("fs", temen_run::fs::host_fs(guest_root.clone()))],
+        )
+        .expect("guest run (host_fs)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&oracle_create.stdout),
+        "lmdb: guest (host_fs) stdout vs native"
+    );
+    assert!(
+        guest_root.join("data.mdb").exists(),
+        "the guest-written LMDB database must land on the real disk"
+    );
+    let native_reads_guest = Command::new(&exe)
+        .arg("verify")
+        .current_dir(&guest_root)
+        .output()
+        .expect("native verify of guest db");
+    assert_eq!(
+        String::from_utf8_lossy(&native_reads_guest.stdout),
+        String::from_utf8_lossy(&oracle_verify.stdout),
+        "lmdb: native LMDB must read the capability-written mmap database"
+    );
+
+    // 3. The reverse: the guest (host_fs over the native dir) reads a native-written data.mdb.
+    let out = inst
+        .run_with_caps(
+            temen_run::Backend::Bytecode,
+            &config(vec![b"lmdb".to_vec(), b"verify".to_vec()]),
+            &[("fs", temen_run::fs::host_fs(nat_root.clone()))],
+        )
+        .expect("guest verify (host_fs over native dir)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&oracle_verify.stdout),
+        "lmdb: the guest must read the native-written mmap database"
+    );
+
+    let _ = std::fs::remove_dir_all(&nat_root);
+    let _ = std::fs::remove_dir_all(&guest_root);
+}
+
+#[test]
+fn demo_lmdb_crash_recovery() {
+    // **Crash-consistency of a memory-mapped store under the Fs capability** (MMAP_CAPABILITY.md
+    // slice 1). The mmap emulation's durability contract (§4c) says a write is durable only once a
+    // completed `msync`/`sync` barrier covers it; a power loss drops everything after the last such
+    // barrier. This test *demonstrates* the contract by injecting the crash: `mem_fs_crashy` arms a
+    // simulated power loss (`FS_CRASH_ARM`) after N durability barriers, and we sweep N across the
+    // whole of a second transaction's commit.
+    //
+    // The guest (`lmdb_demo.c` mode `crash`) commits snapshot v1 durably, arms the crash, then
+    // commits snapshot v2 (same 200 keys, different values) whose durability the crash may swallow,
+    // then reopens and prints the surviving scan. LMDB's double-buffered, checksummed meta pages
+    // guarantee **transaction atomicity under power loss**: the reopened database is either the
+    // fully-committed v1 or the fully-committed v2 — never a torn mix. So at *every* crash point the
+    // recovered snapshot must byte-match one of the two golden states; anything else is corruption.
+    // This is the capability-model payoff — the guest cannot corrupt the host's file even when it
+    // "dies" mid-write, because durability is mediated, not ambient.
+    let Some(lmdb) = fetch_lmdb() else {
+        return;
+    };
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../temen-run/demos/lmdb/lmdb_demo.c");
+    let shim = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../temen-run/demos/lmdb/lmdb_shim.c");
+    let inc = format!("-I{}", lmdb.display());
+    let pid = std::process::id();
+    let tmp = std::env::temp_dir();
+
+    // Guest `.ll`: compile mdb.c/midl.c/demo/shim (-DTEMEN_GUEST) each, then llvm-link into one module.
+    // (Distinct tag from demo_lmdb_mmap_cap_vs_native so the two tests can run in parallel.)
+    let cflags = [
+        "-O2",
+        "-emit-llvm",
+        "-S",
+        "-DTEMEN_GUEST",
+        "-fno-vectorize",
+        "-fno-slp-vectorize",
+    ];
+    let mut bcs = Vec::new();
+    let compile = |src: PathBuf, tag: &str| -> Option<PathBuf> {
+        let out = tmp.join(format!("temen_llvm_lmdbcrash_{pid}_{tag}.ll"));
+        let ok = Command::new("clang")
+            .args(cflags)
+            .arg(&inc)
+            .arg(&src)
+            .arg("-o")
+            .arg(&out)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        ok.then_some(out)
+    };
+    for (src, tag) in [
+        (lmdb.join("mdb.c"), "mdb"),
+        (lmdb.join("midl.c"), "midl"),
+        (demo.clone(), "demo"),
+        (shim.clone(), "shim"),
+    ] {
+        match compile(src, tag) {
+            Some(bc) => bcs.push(bc),
+            None => {
+                eprintln!("note: skipping lmdb crash-recovery (clang unavailable)");
+                return;
+            }
+        }
+    }
+    let linked = tmp.join(format!("temen_llvm_lmdbcrash_{pid}.ll"));
+    // Merge the guest `.ll` TUs into one textual module with the default `llvm-link` (matching the
+    // system clang that produced them) — no LLVM-18 pin: the version-tolerant text reader ingests
+    // whatever `-S` emits.
+    let linked_ok = Command::new("llvm-link")
+        .arg("-S")
+        .args(&bcs)
+        .arg("-o")
+        .arg(&linked)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !linked_ok {
+        eprintln!("note: skipping lmdb crash-recovery (llvm-link unavailable)");
+        return;
+    }
+
+    let t = temen_llvm::translate_ll_path(&linked).expect("translate lmdb guest");
+    let inst = temen_run::instantiate(t.module).expect("instantiate");
+    let config = |args: Vec<Vec<u8>>| temen_run::RunConfig {
+        limits: temen_run::Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: vec![],
+        memory_size_log2: None,
+        args,
+        env: vec![],
+        ..temen_run::RunConfig::default()
+    };
+    // Each run gets a FRESH crashy in-memory fs (empty, disarmed); the guest arms it internally.
+    let run = |args: Vec<Vec<u8>>| -> String {
+        let out = inst
+            .run_with_caps(
+                temen_run::Backend::Bytecode,
+                &config(args),
+                &[("fs", temen_run::fs::mem_fs_crashy())],
+            )
+            .expect("guest run (mem_fs_crashy)");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // Golden states: v1 = a single committed snapshot (mode 's'); v2 = crash mode with the crash
+    // DISARMED (n = -1), so txn2 always commits. They must be well-formed and distinct.
+    let golden_v1 = run(vec![b"lmdb".to_vec(), b"snap".to_vec()]);
+    let golden_v2 = run(vec![b"lmdb".to_vec(), b"crash".to_vec(), b"-1".to_vec()]);
+    assert!(
+        golden_v1.contains("snapshot: 200 entries"),
+        "v1 golden malformed: {golden_v1:?}"
+    );
+    assert!(
+        golden_v2.contains("snapshot: 200 entries"),
+        "v2 golden malformed: {golden_v2:?}"
+    );
+    assert_ne!(
+        golden_v1, golden_v2,
+        "the two committed snapshots must have distinct checksums"
+    );
+
+    // Sweep the crash point across every durability barrier of txn2's commit. n = 0 crashes on the
+    // very first barrier (→ rolls back to v1); large n never trips (→ v2 survives). Every point in
+    // between must still land on exactly one committed snapshot.
+    let mut seen_v1 = false;
+    let mut seen_v2 = false;
+    for n in 0..=24 {
+        let out = run(vec![
+            b"lmdb".to_vec(),
+            b"crash".to_vec(),
+            n.to_string().into_bytes(),
+        ]);
+        if out == golden_v1 {
+            seen_v1 = true;
+        } else if out == golden_v2 {
+            seen_v2 = true;
+        } else {
+            panic!(
+                "crash after {n} barriers left a TORN/corrupt state — durability contract violated:\n\
+                 got:  {out:?}\n  v1: {golden_v1:?}\n  v2: {golden_v2:?}"
+            );
+        }
+    }
+    // Coverage: the sweep must actually exercise the transition (a rollback *and* a survival),
+    // otherwise the "always consistent" result would be vacuous.
+    assert!(
+        seen_v1,
+        "no crash point rolled back to txn1 — sweep never hit the txn2 commit window"
+    );
+    assert!(
+        seen_v2,
+        "no crash point preserved txn2 — widen the sweep upper bound"
+    );
+
+    let _ = std::fs::remove_file(&linked);
+    for bc in &bcs {
+        let _ = std::fs::remove_file(bc);
+    }
+}
+
+#[test]
+fn demo_lmdb_mmap_zerocopy_vs_native() {
+    // **Zero-copy file-mmap through the capability bridge** (MMAP_CAPABILITY.md §4b, slice 2). Same
+    // LMDB guest as `demo_lmdb_mmap_cap_vs_native`, but granted `host_fs_mmap`: its `mmap` shim takes
+    // the **region path** (FS_MAP_REGION mints a file-backed `SharedRegion`; the guest `SharedRegion.
+    // map`s it over a page-aligned window buffer), so LMDB reads and writes its B-tree straight out of
+    // a **real MAP_SHARED alias of the file** — no copy-in, no per-access host call. (The fs-level
+    // `fs::tests::map_region_*` and `file_region_tests` prove the op mints a working file-backed
+    // region; this proves LMDB actually runs over it and the result is a native-compatible database.)
+    //
+    // Two directions, exactly like the copy-in differential, so a regression in the region path shows
+    // up as a mismatch: (1) the guest writes `data.mdb` through the alias and **native LMDB reads it**
+    // byte-for-byte; (2) the guest reads a **native-written** `data.mdb` through the alias.
+    let Some(lmdb) = fetch_lmdb() else {
+        return;
+    };
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../temen-run/demos/lmdb/lmdb_demo.c");
+    let shim = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../temen-run/demos/lmdb/lmdb_shim.c");
+    let inc = format!("-I{}", lmdb.display());
+    let pid = std::process::id();
+    let tmp = std::env::temp_dir();
+
+    // Guest bitcode (same recipe; distinct tag so it can run in parallel with the other LMDB tests).
+    let cflags = [
+        "-O2",
+        "-emit-llvm",
+        "-S",
+        "-DTEMEN_GUEST",
+        "-fno-vectorize",
+        "-fno-slp-vectorize",
+    ];
+    let mut bcs = Vec::new();
+    let compile = |src: PathBuf, tag: &str| -> Option<PathBuf> {
+        let out = tmp.join(format!("temen_llvm_lmdbzc_{pid}_{tag}.ll"));
+        let ok = Command::new("clang")
+            .args(cflags)
+            .arg(&inc)
+            .arg(&src)
+            .arg("-o")
+            .arg(&out)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        ok.then_some(out)
+    };
+    for (src, tag) in [
+        (lmdb.join("mdb.c"), "mdb"),
+        (lmdb.join("midl.c"), "midl"),
+        (demo.clone(), "demo"),
+        (shim.clone(), "shim"),
+    ] {
+        match compile(src, tag) {
+            Some(bc) => bcs.push(bc),
+            None => {
+                eprintln!("note: skipping lmdb zero-copy (clang unavailable)");
+                return;
+            }
+        }
+    }
+    let linked = tmp.join(format!("temen_llvm_lmdbzc_{pid}.ll"));
+    // Merge the guest `.ll` TUs into one textual module with the default `llvm-link` (matching the
+    // system clang that produced them) — no LLVM-18 pin: the version-tolerant text reader ingests
+    // whatever `-S` emits.
+    let linked_ok = Command::new("llvm-link")
+        .arg("-S")
+        .args(&bcs)
+        .arg("-o")
+        .arg(&linked)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !linked_ok {
+        eprintln!("note: skipping lmdb zero-copy (llvm-link unavailable)");
+        return;
+    }
+
+    // Native oracle.
+    let exe = tmp.join(format!("temen_llvm_pb_{pid}_lmdbzc"));
+    let native_ok = Command::new("cc")
+        .arg("-O2")
+        .arg(&inc)
+        .arg(lmdb.join("mdb.c"))
+        .arg(lmdb.join("midl.c"))
+        .arg(&demo)
+        .args(["-lpthread", "-o"])
+        .arg(&exe)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !native_ok {
+        eprintln!("note: skipping lmdb zero-copy (cc unavailable)");
+        return;
+    }
+
+    let t = temen_llvm::translate_ll_path(&linked).expect("translate lmdb guest");
+    let inst = temen_run::instantiate(t.module).expect("instantiate");
+    let config = |args: Vec<Vec<u8>>| temen_run::RunConfig {
+        limits: temen_run::Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: vec![],
+        memory_size_log2: None,
+        args,
+        env: vec![],
+        ..temen_run::RunConfig::default()
+    };
+
+    // Native create + verify (oracle stdout).
+    let nat_root = tmp.join(format!("temen-lmdbzc-nat-{pid}"));
+    let _ = std::fs::remove_dir_all(&nat_root);
+    std::fs::create_dir_all(&nat_root).expect("native root");
+    let oracle_create = Command::new(&exe)
+        .current_dir(&nat_root)
+        .output()
+        .expect("native create");
+    assert!(oracle_create.status.success(), "native create failed");
+    let oracle_verify = Command::new(&exe)
+        .arg("verify")
+        .current_dir(&nat_root)
+        .output()
+        .expect("native verify");
+    assert!(oracle_verify.status.success(), "native verify failed");
+
+    // 1. Guest over host_fs_mmap writes a real data.mdb *through the file alias*; native reads it.
+    let guest_root = tmp.join(format!("temen-lmdbzc-guest-{pid}"));
+    let _ = std::fs::remove_dir_all(&guest_root);
+    std::fs::create_dir_all(&guest_root).expect("guest root");
+    let out = inst
+        .run_with_caps(
+            temen_run::Backend::Bytecode,
+            &config(vec![]),
+            &[("fs", temen_run::fs::host_fs_mmap(guest_root.clone()))],
+        )
+        .expect("guest run (host_fs_mmap)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&oracle_create.stdout),
+        "lmdb zero-copy: guest (host_fs_mmap) stdout vs native"
+    );
+    assert!(
+        guest_root.join("data.mdb").exists(),
+        "the guest-written LMDB database must land on the real disk"
+    );
+    let native_reads_guest = Command::new(&exe)
+        .arg("verify")
+        .current_dir(&guest_root)
+        .output()
+        .expect("native verify of guest db");
+    assert_eq!(
+        String::from_utf8_lossy(&native_reads_guest.stdout),
+        String::from_utf8_lossy(&oracle_verify.stdout),
+        "lmdb zero-copy: native LMDB must read the region-aliased database the guest wrote"
+    );
+
+    // 2. Reverse: the guest reads a native-written data.mdb through the alias.
+    let out = inst
+        .run_with_caps(
+            temen_run::Backend::Bytecode,
+            &config(vec![b"lmdb".to_vec(), b"verify".to_vec()]),
+            &[("fs", temen_run::fs::host_fs_mmap(nat_root.clone()))],
+        )
+        .expect("guest verify (host_fs_mmap over native dir)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&oracle_verify.stdout),
+        "lmdb zero-copy: the guest must read the native-written database through the alias"
+    );
+
+    let _ = std::fs::remove_dir_all(&nat_root);
+    let _ = std::fs::remove_dir_all(&guest_root);
+    let _ = std::fs::remove_file(&linked);
+    for bc in &bcs {
+        let _ = std::fs::remove_file(bc);
+    }
+}
+
+#[test]
+fn demo_ring_buffer_magic_mapping_vs_native() {
+    // **The magic-ring-buffer primitive through the capability** (MMAP_CAPABILITY.md §4e, the
+    // two-window-offsets case). A guest maps ONE file-backed region at two adjacent window offsets
+    // (`FS_MAP_REGION` + two `SharedRegion.map`s via `__vm_region_call`), so a span running off the
+    // end of the ring wraps seamlessly to the start — a single `memcpy` crosses the boundary. The
+    // `Mem`-level aliasing is unit-tested (`shared_region_aliases_two_window_offsets`); this proves a
+    // real guest program *uses* the primitive end-to-end on **both backends** and matches the OS one
+    // byte-for-byte: the native oracle double-maps a `memfd` with raw `mmap(MAP_SHARED|MAP_FIXED)`,
+    // and the JIT does the same real double-mapping over its window (the interpreter models it in
+    // software) — so `native == interp == jit`.
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../temen-run/demos/ring/ring_demo.c");
+    let pid = std::process::id();
+    let tmp = std::env::temp_dir();
+
+    // Guest bitcode (single translation unit — no llvm-link; the on-ramp synthesizes libc).
+    let bc = tmp.join(format!("temen_ring_{pid}.ll"));
+    let bc_ok = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-S",
+            "-DTEMEN_GUEST",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&demo)
+        .arg("-o")
+        .arg(&bc)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !bc_ok {
+        eprintln!("note: skipping ring buffer (clang unavailable)");
+        return;
+    }
+
+    // Native oracle.
+    let exe = tmp.join(format!("temen_ring_nat_{pid}"));
+    let native_ok = Command::new("cc")
+        .arg("-O2")
+        .arg(&demo)
+        .arg("-o")
+        .arg(&exe)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !native_ok {
+        eprintln!("note: skipping ring buffer (cc unavailable)");
+        return;
+    }
+    let native = Command::new(&exe).output().expect("native ring run");
+    assert!(native.status.success(), "native ring run failed");
+
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate ring guest");
+    let inst = temen_run::instantiate(t.module).expect("instantiate");
+    let config = temen_run::RunConfig {
+        limits: temen_run::Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: vec![],
+        memory_size_log2: None,
+        args: vec![],
+        env: vec![],
+        ..temen_run::RunConfig::default()
+    };
+
+    // Run on BOTH backends. The interpreter models the alias in software (loads/stores route through
+    // the backing's read_byte/write_byte); the JIT does the REAL hardware double-mapping — two
+    // `mmap(MAP_SHARED | MAP_FIXED)` of the file's fd over the window sub-ranges
+    // (`MprotectWindow::map_region`), exactly like the native oracle. Both must match native
+    // byte-for-byte, so `native == interp == jit`. The region must be file-backed, so each run gets a
+    // fresh `host_fs_mmap` over its own temp dir.
+    for (backend, tag) in [
+        (temen_run::Backend::Bytecode, "interp"),
+        (temen_run::Backend::Jit, "jit"),
+    ] {
+        let root = tmp.join(format!("temen-ring-{tag}-{pid}"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("ring root");
+        let out = inst
+            .run_with_caps(
+                backend,
+                &config,
+                &[("fs", temen_run::fs::host_fs_mmap(root.clone()))],
+            )
+            .unwrap_or_else(|e| panic!("guest ring run ({tag}) failed: {e:?}"));
+        let guest_stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            guest_stdout,
+            String::from_utf8_lossy(&native.stdout),
+            "ring buffer: guest ({tag}, double-mapped region) vs native (double-mapped memfd)"
+        );
+        // Non-vacuous: the alias must have physically wrapped (a broken alias leaves offset 0 zeroed).
+        assert!(
+            guest_stdout.contains("wrap-alias: RAPWRAP"),
+            "the wrap overflow must be visible at offset 0 via the second mapping ({tag}): {guest_stdout:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    let _ = std::fs::remove_file(&bc);
+    let _ = std::fs::remove_file(&exe);
+}
+
+#[test]
+fn demo_sqlite_fs_cap_vs_native() {
+    // **SQLite Phase B — disk-backed persistence through the Fs capability** (LLVM.md §8, the
+    // north star's second half). Same amalgamation as Phase A, but the database is a real *file*:
+    // in the guest build every byte flows through the embedder-granted `fs` capability via a guest
+    // `sqlite3_vfs` (`demos/sqlite/sqlite_cap_vfs.c`) — xOpen/xRead/xWrite/xTruncate/xSync/
+    // xFileSize/xDelete/xAccess over `__vm_cap_resolve("fs")` + `__vm_host_call`. The rollback
+    // journal (default DELETE mode) is created, written, replayed (an explicit ROLLBACK), and
+    // deleted through the capability. Three assertions:
+    //  1. **stdout differential** — the guest (mem_fs) byte-matches the native oracle (stock unix
+    //     VFS in a temp dir) over create → close → reopen → verify;
+    //  2. **the capability story** — under `host_fs` the guest's `test.db` really lands on disk,
+    //     and the *native* binary opens that guest-written file and verifies it (byte-identical to
+    //     its own verify output): cross-implementation file-format proof, capability-written;
+    //  3. **the reverse direction** — the guest (host_fs) reads a *native-written* `test.db`.
+    let Some(amalg) = fetch_sqlite_amalgamation() else {
+        return;
+    };
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../temen-run/demos/sqlite/sqlite_cap_vfs.c");
+    let inc = format!("-I{}", amalg.display());
+    let pid = std::process::id();
+
+    // Guest bitcode (-DTEMEN_GUEST → SQLITE_OS_OTHER + the capability VFS).
+    let bc = std::env::temp_dir().join(format!("temen_llvm_demo_{pid}_sqlite_fs.ll"));
+    let status = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-S",
+            "-DTEMEN_GUEST",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&inc)
+        .arg(&demo)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping sqlite_fs (clang unavailable)");
+            return;
+        }
+    }
+    // Native oracle (stock unix VFS).
+    let exe = std::env::temp_dir().join(format!("temen_llvm_pb_{pid}_sqlite_fs"));
+    match Command::new("cc")
+        .arg(&inc)
+        .arg(&demo)
+        .args(["-lm", "-o"])
+        .arg(&exe)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping sqlite_fs (cc unavailable)");
+            return;
+        }
+    }
+
+    // Oracle bytes: create (fresh dir) + verify (same dir).
+    let nat_root = std::env::temp_dir().join(format!("temen-sqlite-fs-nat-{pid}"));
+    let _ = std::fs::remove_dir_all(&nat_root);
+    std::fs::create_dir_all(&nat_root).expect("native root");
+    let oracle_create = Command::new(&exe)
+        .current_dir(&nat_root)
+        .output()
+        .expect("native create");
+    assert!(oracle_create.status.success(), "native create failed");
+    let oracle_verify = Command::new(&exe)
+        .arg("verify")
+        .current_dir(&nat_root)
+        .output()
+        .expect("native verify");
+    assert!(oracle_verify.status.success(), "native verify failed");
+
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate sqlite_fs bitcode");
+    let inst = temen_run::instantiate(t.module).expect("instantiate");
+    let config = |args: Vec<Vec<u8>>| temen_run::RunConfig {
+        limits: temen_run::Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: vec![],
+        memory_size_log2: None,
+        args,
+        env: vec![],
+        ..temen_run::RunConfig::default()
+    };
+
+    // 1. mem_fs: hermetic create → reopen → verify, byte-identical stdout.
+    let out = inst
+        .run_with_caps(
+            temen_run::Backend::Bytecode,
+            &config(vec![]),
+            &[("fs", temen_run::fs::mem_fs())],
+        )
+        .expect("guest run (mem_fs)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&oracle_create.stdout),
+        "sqlite_fs: guest (mem_fs) stdout vs native"
+    );
+
+    // 2. host_fs: the guest writes a real test.db; the NATIVE binary then verifies it.
+    let guest_root = std::env::temp_dir().join(format!("temen-sqlite-fs-guest-{pid}"));
+    let _ = std::fs::remove_dir_all(&guest_root);
+    std::fs::create_dir_all(&guest_root).expect("guest root");
+    let out = inst
+        .run_with_caps(
+            temen_run::Backend::Bytecode,
+            &config(vec![]),
+            &[("fs", temen_run::fs::host_fs(guest_root.clone()))],
+        )
+        .expect("guest run (host_fs)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&oracle_create.stdout),
+        "sqlite_fs: guest (host_fs) stdout vs native"
+    );
+    assert!(
+        guest_root.join("test.db").exists(),
+        "the guest-written database must land on the real disk"
+    );
+    assert!(
+        !guest_root.join("test.db-journal").exists(),
+        "the rollback journal must have been deleted through the capability"
+    );
+    let native_reads_guest = Command::new(&exe)
+        .arg("verify")
+        .current_dir(&guest_root)
+        .output()
+        .expect("native verify of guest db");
+    assert_eq!(
+        String::from_utf8_lossy(&native_reads_guest.stdout),
+        String::from_utf8_lossy(&oracle_verify.stdout),
+        "sqlite_fs: native SQLite must read the capability-written database"
+    );
+
+    // 3. The reverse: the guest (host_fs over the native dir) reads a native-written test.db.
+    let out = inst
+        .run_with_caps(
+            temen_run::Backend::Bytecode,
+            &config(vec![b"sqlite_fs".to_vec(), b"verify".to_vec()]),
+            &[("fs", temen_run::fs::host_fs(nat_root.clone()))],
+        )
+        .expect("guest verify (host_fs over native dir)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&oracle_verify.stdout),
+        "sqlite_fs: the guest must read the native-written database"
+    );
+
+    let _ = std::fs::remove_dir_all(&nat_root);
+    let _ = std::fs::remove_dir_all(&guest_root);
+}
+
+#[test]
+fn demo_pg_oscap_vs_native() {
+    // **The guest OS-shim** (slice CA, Postgres runtime gap #11b). Postgres calls the libc syscall
+    // wrappers directly (`open`/`read`/`pread`/`stat`/`fstat`/`opendir`/`readdir`/`mkdir`/…) — in
+    // the whole-program bitcode those are undefined externals. `demos/postgres/os_shim.c` defines
+    // them for a guest build, bridging each to `__vm_cap_resolve("fs")` + `__vm_host_call` (the
+    // fs cap, now with the slice-BZ metadata/directory surface). `os_probe.c` drives a deterministic
+    // file+directory sequence; the guest (over `mem_fs` *and* `host_fs`) must byte-match the native
+    // oracle (real glibc over a real temp dir) — the shim reproduces libc's semantics over the cap.
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../temen-run/demos/postgres/os_probe.c");
+    let pid = std::process::id();
+
+    // Guest bitcode: os_probe.c `#include`s os_shim.c under -DTEMEN_GUEST (single TU, no llvm-link).
+    let bc = std::env::temp_dir().join(format!("temen_llvm_demo_{pid}_pg_oscap.ll"));
+    let status = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-S",
+            "-DTEMEN_GUEST",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&demo)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping pg_oscap (clang unavailable)");
+            return;
+        }
+    }
+    // Native oracle: plain cc, real glibc.
+    let exe = std::env::temp_dir().join(format!("temen_llvm_pb_{pid}_pg_oscap"));
+    match Command::new("cc").arg(&demo).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping pg_oscap (cc unavailable)");
+            return;
+        }
+    }
+    let nat_root = std::env::temp_dir().join(format!("temen-pg-oscap-nat-{pid}"));
+    let _ = std::fs::remove_dir_all(&nat_root);
+    std::fs::create_dir_all(&nat_root).expect("native root");
+    let oracle = Command::new(&exe)
+        .current_dir(&nat_root)
+        .output()
+        .expect("native run");
+    assert!(oracle.status.success(), "native oracle failed");
+    let _ = std::fs::remove_dir_all(&nat_root);
+
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate pg_oscap bitcode");
+    let inst = temen_run::instantiate(t.module).expect("instantiate");
+    let config = || temen_run::RunConfig {
+        limits: temen_run::Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: vec![],
+        memory_size_log2: None,
+        args: vec![],
+        env: vec![],
+        ..temen_run::RunConfig::default()
+    };
+
+    // 1. mem_fs: hermetic, byte-identical to the native oracle.
+    let out = inst
+        .run_with_caps(
+            temen_run::Backend::Bytecode,
+            &config(),
+            &[("fs", temen_run::fs::mem_fs())],
+        )
+        .expect("guest run (mem_fs)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&oracle.stdout),
+        "pg_oscap: guest (mem_fs) stdout vs native"
+    );
+
+    // 2. host_fs: the same walk over a real temp dir, still byte-identical — and self-cleaning (the
+    //    probe rmdir's `d` and unlinks `t`), so the root is empty afterward: real files, real syscalls.
+    let guest_root = std::env::temp_dir().join(format!("temen-pg-oscap-guest-{pid}"));
+    let _ = std::fs::remove_dir_all(&guest_root);
+    std::fs::create_dir_all(&guest_root).expect("guest root");
+    let out = inst
+        .run_with_caps(
+            temen_run::Backend::Bytecode,
+            &config(),
+            &[("fs", temen_run::fs::host_fs(guest_root.clone()))],
+        )
+        .expect("guest run (host_fs)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&oracle.stdout),
+        "pg_oscap: guest (host_fs) stdout vs native"
+    );
+    assert_eq!(
+        std::fs::read_dir(&guest_root).unwrap().count(),
+        0,
+        "the probe cleans up: the granted root is empty after the run"
+    );
+    let _ = std::fs::remove_dir_all(&guest_root);
+}
+
+#[test]
+fn demo_pg_ctype_vs_native() {
+    // **The guest ctype tables** (slice CB, Postgres runtime gap #11c). glibc's `<ctype.h>`
+    // `isalpha`/`isdigit`/`tolower`/… macros index locale tables reached through `__ctype_b_loc`/
+    // `__ctype_tolower_loc`/`__ctype_toupper_loc` — undefined externals in the guest, and the whole
+    // SQL scanner/parser classifies input through them. `demos/postgres/libc_shim.c` provides the
+    // C/POSIX-locale tables; `ctype_probe.c` prints all twelve classifications + tolower/toupper for
+    // every byte 0..255, and the guest must byte-match the native glibc build over the whole range
+    // (which pins every bit of the table). Pure computation — no capability, runs on the bare
+    // powerbox.
+    check_demo_vs_native_flags(
+        "pg_ctype",
+        "postgres/ctype_probe.c",
+        b"",
+        &["-DTEMEN_GUEST", "-fno-vectorize", "-fno-slp-vectorize"],
+    );
+}
+
+#[test]
+fn trap_error_surfaces_guest_output() {
+    // Trap diagnostic (slice CG): a guest writes a marker, then calls an undefined extern — a
+    // `--stub-externs` trap stub (`unreachable`). `run_with_caps` must fold the guest's captured
+    // output into the trap error, so a trapped program names its own failure. This is what let the
+    // Postgres boot report `LOG:  could not find a "postgres" to execute` instead of a blank trap.
+    let src = "#include <unistd.h>\n\
+               extern void temen_no_such_extern(void);\n\
+               int main(void){ write(1, \"BOOT-MARKER\\n\", 11); temen_no_such_extern(); return 0; }";
+    let Some(bc) = compile_to_ll("trap_output", src) else {
+        return;
+    };
+    let opts = temen_llvm::TranslateOptions {
+        stub_unresolved_externs: true,
+        ..Default::default()
+    };
+    let t = temen_llvm::translate_ll_path_with_options(&bc, opts).expect("translate");
+    let inst = temen_run::instantiate(t.module).expect("instantiate");
+    let config = temen_run::RunConfig {
+        limits: temen_run::Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: vec![],
+        memory_size_log2: None,
+        args: vec![],
+        env: vec![],
+        ..temen_run::RunConfig::default()
+    };
+    let err = inst
+        .run_with_caps(temen_run::Backend::Bytecode, &config, &[])
+        .expect_err("the guest must trap on the undefined-extern stub");
+    assert!(err.contains("Unreachable"), "expected a trap: {err}");
+    assert!(
+        err.contains("BOOT-MARKER"),
+        "the trap error must carry the guest's captured output: {err}"
+    );
+}
+
+#[test]
+fn demo_pg_funcptr_vs_native() {
+    // **Address-taken mem/string builtins** (mem_shim.c). The on-ramp synthesizes memcmp/memcpy/strlen/…
+    // for *direct* calls, but taking their address and calling indirectly (dynahash's `hashp->match =
+    // memcmp`, called via the pointer) resolves to a trap stub unless the function is *defined* — the
+    // exact bug that trapped Postgres' end-of-recovery checkpoint. `mem_shim.c` defines them; this probe
+    // calls each through a `volatile` pointer (no devirtualization) and byte-matches native glibc.
+    check_demo_vs_native_flags(
+        "pg_funcptr",
+        "postgres/funcptr_probe.c",
+        b"",
+        &[
+            "-DTEMEN_GUEST",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+            "-fno-builtin-memcpy",
+            "-fno-builtin-memmove",
+            "-fno-builtin-memset",
+            "-fno-builtin-memcmp",
+            "-fno-builtin-strlen",
+            "-fno-builtin-strcmp",
+            "-fno-builtin-strncmp",
+        ],
+    );
+}
+
+#[test]
+fn demo_pg_sem_vs_native() {
+    // **The guest POSIX counting semaphore** (ipc_shim.c). A single-process unnamed semaphore behaves
+    // identically under glibc, so this differential pins the fix for the boot hang: `sem_trywait` must
+    // *fail* (EAGAIN) at zero so `PGSemaphoreReset`'s `while (sem_trywait(s) >= 0);` drain terminates
+    // (a no-op `sem_trywait` spun forever). Init 2 → drain → post → drain; byte-exact vs native.
+    check_demo_vs_native_flags(
+        "pg_sem",
+        "postgres/sem_probe.c",
+        b"",
+        &["-DTEMEN_GUEST", "-fno-vectorize", "-fno-slp-vectorize"],
+    );
+}
+
+#[test]
+fn demo_pg_mmap_vs_native() {
+    // **The guest anonymous-mmap shim** (slice CI, gap #11i). `postgres --single` sets up its shared
+    // memory via `mmap(MAP_ANONYMOUS)`; in one address space that is just zeroed writable memory.
+    // `mmap_probe.c` checks it comes back zeroed, holds writes, and `munmap`s — byte-matching native.
+    // Pure — runs on the bare powerbox.
+    check_demo_vs_native_flags(
+        "pg_mmap",
+        "postgres/mmap_probe.c",
+        b"",
+        &["-DTEMEN_GUEST", "-fno-vectorize", "-fno-slp-vectorize"],
+    );
+}
+
+#[test]
+fn demo_pg_wctype_vs_native() {
+    // **The guest wide-ctype shim** (slice CF, gap #11g). `locale_shim.c`'s C/POSIX-locale iswX/towX
+    // family is ASCII classification; `wctype_probe.c` prints all twelve classes + case mapping for
+    // every code point 0..255 and the guest byte-matches native glibc (pinning the table; the iswX_l
+    // variants forward to these). Pure — runs on the bare powerbox.
+    check_demo_vs_native_flags(
+        "pg_wctype",
+        "postgres/wctype_probe.c",
+        b"",
+        &["-DTEMEN_GUEST", "-fno-vectorize", "-fno-slp-vectorize"],
+    );
+}
+
+#[test]
+fn demo_pg_string_vs_native() {
+    // **The guest string + integer-parsing shim** (slice CC, gap #11d). `libc_shim.c` adds the
+    // `<string.h>`/`<stdlib.h>` members Postgres uses that the on-ramp does not already synthesize —
+    // strcat/strncpy/strnlen/strstr/strchrnul/strdup/strlcpy/strlcat/strtok/strxfrm and
+    // strtol/strtoul/atoi (`__isoc23_*` aliases too; `strtod`/`snprintf` are already synthesized).
+    // `str_probe.c` exercises signs, bases, prefixes, endptr, ERANGE overflow, bounded copies, and
+    // tokenizing; the guest must byte-match native glibc over the lot.
+    check_demo_vs_native_flags(
+        "pg_string",
+        "postgres/str_probe.c",
+        b"",
+        &["-DTEMEN_GUEST", "-fno-vectorize", "-fno-slp-vectorize"],
+    );
+}
+
+#[test]
+fn demo_pg_procstub() {
+    // **The guest process/time/signal stubs** (slice CC, gap #11d). `proc_shim.c` returns fixed,
+    // deterministic values for a single-user sandbox backend — constant identity (non-root, so
+    // Postgres's root guard passes), a frozen clock, inert signal masks, no-op sleeps. Not a
+    // differential (a native `getpid`/`time` is nondeterministic): the guest's stdout must equal the
+    // fixed expected report. Pure — runs on the bare powerbox.
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../temen-run/demos/postgres/proc_probe.c");
+    let bc =
+        std::env::temp_dir().join(format!("temen_llvm_demo_{}_pg_proc.ll", std::process::id()));
+    let status = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-S",
+            "-DTEMEN_GUEST",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&demo)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping pg_proc (clang unavailable)");
+            return;
+        }
+    }
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate pg_proc bitcode");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
+    temen_verify::verify_module(&module).expect("verify");
+    let run = temen_run::run_powerbox(&module, b"").expect("powerbox run");
+    let expected = "\
+pid=1 ppid=0
+uid=1000 euid=1000 gid=1000 egid=1000
+umask=18 setsid=1
+gtod r=0 sec=1000000000 usec=0
+clock r=0 sec=1000000000 nsec=0
+time=1000000000
+nanosleep=0
+rlimit r=0 inf=1
+sigempty=0 sigaction=0
+sigprocmask=0 kill=0 raise=0
+";
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        expected,
+        "pg_proc: guest stub values"
+    );
+}
+
+#[test]
+fn demo_pg_time_vs_native() {
+    // **The guest time + wide-char shims** (slice CD, gap #11e). `time_shim.c` provides gmtime/
+    // localtime (UTC calendar math) + a strftime format engine; `libc_shim.c` the C-locale
+    // mbstowcs/wcstombs. `time_probe.c` formats several epochs (incl. leap days) through
+    // TZ-independent conversions and round-trips wide chars; the guest byte-matches native glibc.
+    // Pure — runs on the bare powerbox.
+    check_demo_vs_native_flags(
+        "pg_time",
+        "postgres/time_probe.c",
+        b"",
+        &["-DTEMEN_GUEST", "-fno-vectorize", "-fno-slp-vectorize"],
+    );
+}
+
+#[test]
+fn demo_pg_stdio_vs_native() {
+    // **The guest file-backed stdio shim** (slice CD, gap #11e). `stdio_shim.c` layers the buffered
+    // `FILE*` surface Postgres declares (fopen/fread/fwrite/fgets/fgetc/ungetc/fseek/ftell/feof/…)
+    // on os_shim.c's fs-cap syscalls. `stdio_probe.c` writes a file, reopens it, and reads it back
+    // every which way; the guest byte-matches the native glibc oracle over `mem_fs` and `host_fs`.
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../temen-run/demos/postgres/stdio_probe.c");
+    let pid = std::process::id();
+    let bc = std::env::temp_dir().join(format!("temen_llvm_demo_{pid}_pg_stdio.ll"));
+    let status = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-S",
+            "-DTEMEN_GUEST",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&demo)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping pg_stdio (clang unavailable)");
+            return;
+        }
+    }
+    let exe = std::env::temp_dir().join(format!("temen_llvm_pb_{pid}_pg_stdio"));
+    match Command::new("cc").arg(&demo).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping pg_stdio (cc unavailable)");
+            return;
+        }
+    }
+    let nat_root = std::env::temp_dir().join(format!("temen-pg-stdio-nat-{pid}"));
+    let _ = std::fs::remove_dir_all(&nat_root);
+    std::fs::create_dir_all(&nat_root).expect("native root");
+    let oracle = Command::new(&exe)
+        .current_dir(&nat_root)
+        .output()
+        .expect("native run");
+    assert!(oracle.status.success(), "native oracle failed");
+    let _ = std::fs::remove_dir_all(&nat_root);
+
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate pg_stdio bitcode");
+    let inst = temen_run::instantiate(t.module).expect("instantiate");
+    let config = || temen_run::RunConfig {
+        limits: temen_run::Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: vec![],
+        memory_size_log2: None,
+        args: vec![],
+        env: vec![],
+        ..temen_run::RunConfig::default()
+    };
+    for (label, cap) in [
+        ("mem_fs", temen_run::fs::mem_fs()),
+        ("host_fs", {
+            let root = std::env::temp_dir().join(format!("temen-pg-stdio-guest-{pid}"));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("guest root");
+            temen_run::fs::host_fs(root)
+        }),
+    ] {
+        let out = inst
+            .run_with_caps(temen_run::Backend::Bytecode, &config(), &[("fs", cap)])
+            .unwrap_or_else(|e| panic!("pg_stdio guest run ({label}): {e}"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&oracle.stdout),
+            "pg_stdio: guest ({label}) stdout vs native"
+        );
+    }
+    let _ =
+        std::fs::remove_dir_all(std::env::temp_dir().join(format!("temen-pg-stdio-guest-{pid}")));
+}
+
+#[test]
+fn demo_pg_stream_vs_native() {
+    // **The stdout/stderr stream `FILE*` path + the fs-cap file path coexisting** (slice CE, gap
+    // #11f). The on-ramp gained `__vm_stream_write`/`__vm_stream_read` builtins; os_shim.c's
+    // `write`/`read` fd-dispatch fds 0/1/2 to the powerbox Stream cap and everything else to the fs
+    // cap, and the fs cap now reserves fds 0/1/2 so a file fd (≥3) never collides with a stream fd.
+    // `stream_probe.c` writes to `stdout` (FILE*) *and* a real file; the guest byte-matches native
+    // glibc over `mem_fs` and `host_fs`.
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../temen-run/demos/postgres/stream_probe.c");
+    let pid = std::process::id();
+    let bc = std::env::temp_dir().join(format!("temen_llvm_demo_{pid}_pg_stream.ll"));
+    let status = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-S",
+            "-DTEMEN_GUEST",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&demo)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping pg_stream (clang unavailable)");
+            return;
+        }
+    }
+    let exe = std::env::temp_dir().join(format!("temen_llvm_pb_{pid}_pg_stream"));
+    match Command::new("cc").arg(&demo).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping pg_stream (cc unavailable)");
+            return;
+        }
+    }
+    let nat_root = std::env::temp_dir().join(format!("temen-pg-stream-nat-{pid}"));
+    let _ = std::fs::remove_dir_all(&nat_root);
+    std::fs::create_dir_all(&nat_root).expect("native root");
+    let oracle = Command::new(&exe)
+        .current_dir(&nat_root)
+        .output()
+        .expect("native run");
+    assert!(oracle.status.success(), "native oracle failed");
+    let _ = std::fs::remove_dir_all(&nat_root);
+
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate pg_stream bitcode");
+    let inst = temen_run::instantiate(t.module).expect("instantiate");
+    let config = || temen_run::RunConfig {
+        limits: temen_run::Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: vec![],
+        memory_size_log2: None,
+        args: vec![],
+        env: vec![],
+        ..temen_run::RunConfig::default()
+    };
+    for (label, cap) in [
+        ("mem_fs", temen_run::fs::mem_fs()),
+        ("host_fs", {
+            let root = std::env::temp_dir().join(format!("temen-pg-stream-guest-{pid}"));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("guest root");
+            temen_run::fs::host_fs(root)
+        }),
+    ] {
+        let out = inst
+            .run_with_caps(temen_run::Backend::Bytecode, &config(), &[("fs", cap)])
+            .unwrap_or_else(|e| panic!("pg_stream guest run ({label}): {e}"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&oracle.stdout),
+            "pg_stream: guest ({label}) stdout vs native"
+        );
+    }
+    let _ =
+        std::fs::remove_dir_all(std::env::temp_dir().join(format!("temen-pg-stream-guest-{pid}")));
+}
+
+#[test]
+fn demo_pg_fprintf_vs_native() {
+    // **The guest varargs printf engine** (slice CH, Postgres runtime gap #11g). `printf_shim.c`
+    // provides the runtime `printf`/`fprintf`/`vfprintf`/`snprintf` family (the Lua `string.format`
+    // formatter — byte-exact vs glibc; floats via the bignum `__vm_fmt_*` dtoa), composing with the
+    // slice-CE stream/file fd-dispatch. `fprintf_probe.c` formats to `stdout`, a real **file** (fs
+    // cap, read back and echoed), and `stderr` — byte-identical to the native glibc oracle (which
+    // folds `stderr` into `stdout` unbuffered to match the guest's single write-through Stream) on
+    // all three engines, over `mem_fs` and `host_fs`.
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../temen-run/demos/postgres/fprintf_probe.c");
+    let pid = std::process::id();
+    let bc = std::env::temp_dir().join(format!("temen_llvm_demo_{pid}_pg_fprintf.ll"));
+    let status = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-S",
+            "-DTEMEN_GUEST",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&demo)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping pg_fprintf (clang unavailable)");
+            return;
+        }
+    }
+    let exe = std::env::temp_dir().join(format!("temen_llvm_pb_{pid}_pg_fprintf"));
+    match Command::new("cc").arg(&demo).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping pg_fprintf (cc unavailable)");
+            return;
+        }
+    }
+    let nat_root = std::env::temp_dir().join(format!("temen-pg-fprintf-nat-{pid}"));
+    let _ = std::fs::remove_dir_all(&nat_root);
+    std::fs::create_dir_all(&nat_root).expect("native root");
+    let oracle = Command::new(&exe)
+        .current_dir(&nat_root)
+        .output()
+        .expect("native run");
+    assert!(oracle.status.success(), "native oracle failed");
+    let _ = std::fs::remove_dir_all(&nat_root);
+
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate pg_fprintf bitcode");
+    let inst = temen_run::instantiate(t.module).expect("instantiate");
+    let config = || temen_run::RunConfig {
+        limits: temen_run::Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: vec![],
+        memory_size_log2: None,
+        args: vec![],
+        env: vec![],
+        ..temen_run::RunConfig::default()
+    };
+    // All three engines over mem_fs; then host_fs (a real temp dir) once, to prove the fs-cap file
+    // path is backend-agnostic. Each must byte-match native.
+    for backend in [
+        temen_run::Backend::TreeWalk,
+        temen_run::Backend::Bytecode,
+        temen_run::Backend::Jit,
+    ] {
+        let out = inst
+            .run_with_caps(backend, &config(), &[("fs", temen_run::fs::mem_fs())])
+            .unwrap_or_else(|e| panic!("pg_fprintf guest run ({backend:?}, mem_fs): {e}"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&oracle.stdout),
+            "pg_fprintf: guest ({backend:?}, mem_fs) stdout vs native"
+        );
+    }
+    let guest_root = std::env::temp_dir().join(format!("temen-pg-fprintf-guest-{pid}"));
+    let _ = std::fs::remove_dir_all(&guest_root);
+    std::fs::create_dir_all(&guest_root).expect("guest root");
+    let out = inst
+        .run_with_caps(
+            temen_run::Backend::Bytecode,
+            &config(),
+            &[("fs", temen_run::fs::host_fs(guest_root.clone()))],
+        )
+        .expect("pg_fprintf guest run (host_fs)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&oracle.stdout),
+        "pg_fprintf: guest (host_fs) stdout vs native"
+    );
+    let _ = std::fs::remove_dir_all(&guest_root);
+}
+
+#[test]
+fn demo_pg_sscanf_vs_native() {
+    // **The guest varargs scanf engine + a real `strtod`** (slice CJ, Postgres runtime gap #11l).
+    // `scanf_shim.c` provides the runtime `sscanf`/`vsscanf`/`fscanf`/`scanf` family (the input
+    // twin of the CH `printf_shim.c`); its `%f`/`%lf` conversions need a real `strtod`, and the
+    // on-ramp's is a **trap stub** — so the guest brings the correctly-rounded bignum `strtod.c` (which
+    // shadows the stub; Postgres' `float8in` needs it at boot too). `sscanf_probe.c` drives the
+    // conversions Postgres parses config/version values with (d/i/u/o/x/c/s/f/[scanset]/n/`*`/width),
+    // checking the return count, then drives `fscanf` from the powerbox `stdin` — byte-identical to the
+    // native glibc oracle on all three engines.
+    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../temen-run/demos/postgres/sscanf_probe.c");
+    let pid = std::process::id();
+    let bc = std::env::temp_dir().join(format!("temen_llvm_demo_{pid}_pg_sscanf.ll"));
+    let status = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-S",
+            "-DTEMEN_GUEST",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&demo)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping pg_sscanf (clang unavailable)");
+            return;
+        }
+    }
+    let exe = std::env::temp_dir().join(format!("temen_llvm_pb_{pid}_pg_sscanf"));
+    match Command::new("cc").arg(&demo).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping pg_sscanf (cc unavailable)");
+            return;
+        }
+    }
+    // A stdin the `fscanf` half consumes: "%d %d %lf %s" then a trailing "%d".
+    let stdin_bytes: &[u8] = b"10 20 3.5 world 99";
+    let mut child = Command::new(&exe)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn native pg_sscanf");
+    use std::io::Write;
+    child.stdin.take().unwrap().write_all(stdin_bytes).ok();
+    let oracle = child.wait_with_output().expect("native pg_sscanf run");
+    assert!(oracle.status.success(), "native oracle failed");
+
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate pg_sscanf bitcode");
+    let inst = temen_run::instantiate(t.module).expect("instantiate");
+    let config = || temen_run::RunConfig {
+        limits: temen_run::Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: stdin_bytes.to_vec(),
+        memory_size_log2: None,
+        args: vec![],
+        env: vec![],
+        ..temen_run::RunConfig::default()
+    };
+    for backend in [
+        temen_run::Backend::TreeWalk,
+        temen_run::Backend::Bytecode,
+        temen_run::Backend::Jit,
+    ] {
+        let out = inst
+            .run_with_caps(backend, &config(), &[])
+            .unwrap_or_else(|e| panic!("pg_sscanf guest run ({backend:?}): {e}"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&oracle.stdout),
+            "pg_sscanf: guest ({backend:?}) stdout vs native"
+        );
+    }
+}
+
+#[test]
+fn demo_sat_vs_native() {
+    // A **DPLL SAT solver** (`demos/sat/sat.c`) — a self-validating pure-compute correctness
+    // indicator (LLVM.md ladder: "a SAT solver / perft slot in here too"). Backtracking search with
+    // unit propagation is branchy, array/pointer-heavy, and deeply recursive — a different translator
+    // shape from the corpus's hashers/parsers. Self-validating two ways: **planted** random 3-SAT
+    // instances are SAT by construction and the model is re-checked against every clause in-guest
+    // (`verify=OK`); **pigeonhole** PHP(3,2)/(4,3) are the classic UNSAT family. The fixed decision
+    // heuristic (lowest var, true-first) makes the model deterministic, so the on-ramp output is
+    // byte-identical to native `cc` on all three engines.
+    check_demo_vs_native("sat", "sat/sat.c", b"");
+}
+
+#[test]
+fn demo_regex_vs_native() {
+    // kokke/tiny-regex-c: a backtracking matcher over a table of (pattern, text) cases. Exercises
+    // `ptrtoint`/`freeze`, a constexpr GEP (interior string pointer), writable function-static arrays
+    // sharing the globals region with read-only string literals (the page-isolation fix), and deep
+    // recursive control flow — byte-identical to native `clang`.
+    check_demo_vs_native("regex", "regex/regex_demo.c", b"");
+}
+
+#[test]
+fn demo_jsmn_vs_native() {
+    // jsmn: a zero-allocation JSON parser. Parses an embedded document into a fixed token array and
+    // prints each token's type/size/text. Exercises `llvm.load.relative` — clang lowers the
+    // type→name `switch` into a relative lookup table (`&str − &table` offsets) — plus struct-array
+    // indexing and interior string pointers. Byte-identical to native `clang`.
+    check_demo_vs_native("jsmn", "jsmn/jsmn_demo.c", b"");
+}
+
+#[test]
+fn demo_heapgrow_vs_native() {
+    // The §1a headline: a guest **grows its own heap past the initial window** — allocating eight
+    // 128 KiB blocks (~1 MiB, ~16× the initial mapped window) through `malloc`, which commits
+    // reserved-tail pages on demand via the `Memory` capability (`vm_map`). Fills/sums/frees each and
+    // prints running totals — byte-identical to the native `cc` build (which uses the real `malloc`).
+    check_demo_vs_native("heapgrow", "heapgrow/heapgrow.c", b"");
+}
+
+#[test]
+fn heap_malloc_calloc_free() {
+    // The allocator directly: a `malloc` large enough to force `vm_map` growth past the initial
+    // window (filled/summed), a `free` (no-op), then a `calloc` that must read back as zero (freshly
+    // committed pages are zeroed and the bump heap never reuses). Exit code = (s + z) & 0xff vs native.
+    let src = "#include <stdlib.h>\n\
+               int run(void){ int *a = (int*)malloc(300000 * sizeof(int)); \
+               for (int i = 0; i < 300000; i++) a[i] = (i * 3 + 1) & 255; \
+               long s = 0; for (int i = 0; i < 300000; i++) s += a[i]; free(a); \
+               int *b = (int*)calloc(1000, sizeof(int)); \
+               long z = 0; for (int i = 0; i < 1000; i++) z += b[i]; \
+               return (int)((s + z) & 0xff); } \
+               int main(void){ return run(); }";
+    check_powerbox_vs_native("heap_alloc", src, b"");
+}
+
+#[test]
+fn ro_and_writable_global_page_isolation() {
+    // A read-only global (string literal) next to a writable one (a mutable array) must not share a
+    // protected page: a write to the writable global would otherwise fault on the read-only page
+    // (D40 is page-granular). `run` writes the array, reads the constant, returns their combination.
+    let src = "static char buf[8]; static const char msg[] = \"hi\"; \
+               int run(int n){ for (int i = 0; i < 8; i++) buf[i] = (char)(n + i); \
+               return buf[3] + msg[0] + msg[1]; }";
+    // buf[3] = n+3; msg = "hi" → 'h'(104) + 'i'(105). run(10): 13 + 104 + 105 = 222.
+    check_vs_native(
+        "ro_rw_page",
+        &format!("{src} int main(){{ return run(10); }}"),
+        10,
+    );
+}
+
+#[test]
+fn demo_clay_vs_native() {
+    // Clay UI layout: 2D points/dimensions as `<2 x float>`/`<2 x i32>` vectors (loads/stores/`fadd`/
+    // phi/extractelement) plus `{i64,ptr}` array returns — the on-ramp scalarizes each 2-lane vector
+    // to a packed `i64`. Lays out a small UI and prints the render commands, byte-identical to native.
+    // The eighth and final corpus demo (the D54 exit criterion).
+    check_demo_vs_native("clay", "clay/clay_demo.c", b"");
+}
+
+#[test]
+fn demo_calc_vs_native() {
+    // The chibicc `calc` demo (a recursive-descent arithmetic calculator) through the LLVM on-ramp.
+    // Exercises a **global array of string pointers** + a **global struct array holding function
+    // pointers** (both relocations, slice K), **indirect calls** through that dispatch table (slice G
+    // → `call_indirect`), and **recursion** (expr → term → factor). It drives itself from a global
+    // expression table and writes `"<expr> = <result>"` rows — byte-identical to native `cc`. The
+    // first of the two non-corpus chibicc demos the on-ramp now covers (LLVM is the main frontend).
+    check_demo_vs_native("calc", "calc.c", b"");
+}
+
+#[test]
+fn demo_rational_vs_native() {
+    // The chibicc `rational` demo (exact-rational arithmetic) through the LLVM on-ramp. Where `calc`
+    // stresses the function-pointer table, this hammers the **by-value aggregate ABI** (D39 / slice
+    // J): every op takes two `struct Rat` *by value* and returns one *by value* (the hidden-`sret`
+    // path), composed with recursion (Euclid's `gcd`) and an **indirect call that both passes and
+    // returns a struct by value** through a global dispatch table — sret + a function-pointer
+    // relocation + a struct-valued `call_indirect`, all at once. Byte-identical to native `cc`.
+    check_demo_vs_native("rational", "rational.c", b"");
+}
+
+/// Build a **guest-concurrency** corpus demo (`crates/temen-run/demos/<rel>`) that pulls in chibicc's
+/// bundled guest libc — `<pthread.h>` (a 1:1 threading layer over the `__vm_thread_spawn`/`join` +
+/// futex + atomic builtins) and `<stdlib.h>` (`malloc`). clang compiles the demo with the chibicc
+/// include dir on the path, so `pthread_create`/`pthread_mutex_*`/etc. resolve to that guest shim,
+/// which the on-ramp lowers to the §12 primitives (`thread.spawn`, `i32.atomic.wait`/`notify`, the
+/// `iN.atomic.*` ops). The same source built with native `cc` would instead use the platform pthreads
+/// — but these demos call `__vm_*` builtins / guest fibers with no native symbol, so they have no
+/// native oracle; the assertion is the **interleaving-invariant total** (the chibicc `c_guest_*`
+/// contract, now via the LLVM frontend). `None` (skip) if clang is unavailable.
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn compile_demo_libc_to_ll(name: &str, rel: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../temen-run/demos")
+        .join(rel);
+    let inc = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../frontend/chibicc/include");
+    let bc = std::env::temp_dir().join(format!("temen_llvm_cc_{}_{}.ll", std::process::id(), name));
+    let status = Command::new("clang")
+        .args(["-O2", "-emit-llvm", "-S"])
+        .arg("-I")
+        .arg(&inc)
+        .arg(&path)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(bc),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
+/// Compile an inline C **source string** with chibicc's guest-libc include dir on the path (the
+/// `<pthread.h>`/`<temen.h>` shims) → textual `.ll`. The text variant of [`compile_demo_libc_to_ll`], for a
+/// demo that must be *patched* before compiling (the guest-JIT blob descriptor). `None` if clang is
+/// unavailable.
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn compile_libc_src_to_ll(name: &str, src: &str) -> Option<PathBuf> {
+    let inc = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../frontend/chibicc/include");
+    let c = std::env::temp_dir().join(format!("temen_llvm_cc_{}_{}.c", std::process::id(), name));
+    let bc = std::env::temp_dir().join(format!("temen_llvm_cc_{}_{}.ll", std::process::id(), name));
+    std::fs::write(&c, src).expect("write C source");
+    let status = Command::new("clang")
+        .args(["-O2", "-emit-llvm", "-S"])
+        .arg("-I")
+        .arg(&inc)
+        .arg(&c)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(bc),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
+/// Run a guest-built concurrency scheduler demo (threads / stackful fibers / futex over the `__vm_*`
+/// primitives + the guest pthread shim) through the on-ramp on the **real powerbox** and assert its
+/// stdout. The printed total is interleaving-invariant — deterministic regardless of which worker ran
+/// each unit — so it is the same fixed value the chibicc `c_guest_*` tests check (the LLVM frontend
+/// must reach the same answer). A generous deadline guards against a hang (a livelocked scheduler is a
+/// failure, not an infinite test). Skips silently if clang is unavailable.
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn check_guest_concurrency_demo(name: &str, rel: &str, expect: &[u8]) {
+    let Some(bc) = compile_demo_libc_to_ll(name, rel) else {
+        return;
+    };
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
+    assert!(
+        temen_run::is_named_powerbox_entry(&t.module),
+        "{name}: a threads/libc program must produce a powerbox entry"
+    );
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
+    temen_verify::verify_module(&module).expect("verify translated IR");
+    let run = temen_run::run_powerbox_with_deadline(
+        &module,
+        b"",
+        Some(std::time::Duration::from_secs(60)),
+    )
+    .expect("powerbox run");
+    assert_eq!(
+        run.stdout, expect,
+        "{name}: stdout {:?} vs expected {:?}",
+        run.stdout, expect
+    );
+    let code = match run.outcome {
+        temen_run::Outcome::Exited(c) => c as u8,
+        temen_run::Outcome::Returned(ref v) => match v.first() {
+            Some(temen_interp::Value::I32(x)) => *x as u8,
+            _ => 0,
+        },
+    };
+    assert_eq!(code, 0, "{name}: exit/return code {code} (expected 0)");
+}
+
+/// The chibicc `work_stealing` demo through the LLVM on-ramp: a guest-built **work-stealing M:N
+/// scheduler** over *stackless* tasks (a global injector + per-worker deques + stealing, the tokio
+/// shape). Four vCPUs (`thread.spawn`) drain 16 tasks of 16 steps each, coordinating only through
+/// `pthread_mutex` (the futex) + C11 atomics — no fibers, no scheduler in the VM (D56). The grand
+/// total `NTASKS * STEPS = 256` is interleaving-invariant. Mirrors `c_frontend::c_guest_work_stealing`.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn demo_work_stealing_vs_chibicc() {
+    check_guest_concurrency_demo("work_stealing", "work_stealing/work_stealing.c", b"256\n");
+}
+
+/// The chibicc `mn_sched` demo through the LLVM on-ramp: a guest-built **sharded M:N green-thread
+/// scheduler** — `NWORKERS` OS threads (`thread.spawn`), each running a cooperative round-robin over
+/// `TASKS_PER_WORKER` **stackful fibers** (`__vm_fiber_new`/`resume`/`suspend` → `cont.*`), pinned
+/// per worker (fibers are thread-affine, D57). Coordinates through one shared atomic counter. The
+/// total `NWORKERS * TASKS_PER_WORKER * STEPS = 1024` is interleaving-invariant. Mirrors
+/// `c_frontend::c_guest_mn_scheduler`.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn demo_mn_sched_vs_chibicc() {
+    check_guest_concurrency_demo("mn_sched", "mn_sched/mn_sched.c", b"1024\n");
+}
+
+/// The chibicc `steal_fibers` demo through the LLVM on-ramp: a work-stealing scheduler over
+/// **stackful, migratable fibers** (D57) — suspended fibers are stolen across real OS threads and
+/// resumed inside nested call frames. Prints both interleaving-invariant totals: `256` work units and
+/// `121920`, the sum of returns whose values depend on locals carried across **every migration** (the
+/// stack-integrity check that a stackless state machine cannot express). Mirrors
+/// `c_frontend::c_guest_steal_fibers`.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn demo_steal_fibers_vs_chibicc() {
+    check_guest_concurrency_demo(
+        "steal_fibers",
+        "steal_fibers/steal_fibers.c",
+        b"256\n121920\n",
+    );
+}
+
+/// The chibicc `malloc_threads` demo through the LLVM on-ramp: concurrent `malloc` from `NWORKERS`
+/// vCPUs, exercising the **thread-safe** guest allocator. Each worker `malloc`s 64 disjoint blocks
+/// and fills every byte with a `(worker, block, offset)`-unique pattern; after join, main re-checks
+/// every byte — a clobber from an overlapping allocation (the race a non-thread-safe bump allocator
+/// would allow) would show as a corrupt block. Prints `0` (no corruption). Mirrors
+/// `c_frontend::c_guest_malloc_threads`.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn demo_malloc_threads_vs_chibicc() {
+    check_guest_concurrency_demo("malloc_threads", "malloc_threads/malloc_threads.c", b"0\n");
+}
+
+#[test]
+fn demo_hexdump_vs_native() {
+    // A `hexdump -C`-style tool: read stdin in 16-byte rows, print `%08lx  HH×16  |ascii|` via the
+    // guest-side `printf` format engine (parsed at translate time → `__temen_utoa` + width/zero-pad →
+    // `Stream.write`). Exercises `%08lx`/`%02x` (hex + width + zero-pad + `l` modifier) and literals;
+    // clang lowers the `%c` and `"…\n"` to `putchar`/`puts`. Byte-identical to native.
+    let input = b"Hello, hexdump!\nThe quick brown fox.\x00\x01\xff\xfe rest";
+    check_demo_vs_native("hexdump", "hexdump/hexdump.c", input);
+}
+
+#[test]
+fn demo_crc32_vs_native() {
+    // CRC-32 over stdin (shift/xor) + a big-endian u32 reader (`__builtin_bswap32` on host-endian
+    // loads) — drives `llvm.bswap` (an inline byte reversal). Prints the CRC and the be32 sum.
+    // Byte-identical to native.
+    let input = b"The quick brown fox jumps over the lazy dog.\nbig-endian!\x00\x01\x02\x03";
+    check_demo_vs_native("crc32", "crc32/crc32.c", input);
+}
+
+#[test]
+fn demo_raytrace_vs_native() {
+    // A tiny ASCII sphere raytracer: diffuse lighting + sinusoidal bands + an exponential rim, with
+    // a `libm` bundled as *guest code* (`g_sin`/`g_exp` poly approximations). `sqrt`/`floor` lower to
+    // Temen float ops; the transcendentals run in the guest, so native `cc` compiles the same source
+    // and every value is bit-identical. Byte-identical to native.
+    check_demo_vs_native("raytrace", "raytrace/raytrace.c", b"");
+}
+
+#[test]
+fn guest_libm_transcendental() {
+    // A guest `exp` (range-reduced Taylor) + the IEEE `sqrt` op: compute an RMS over a damped wave.
+    // The transcendental is guest code (native compiles the same), `sqrt` is the shared IEEE op, so
+    // the int-quantized result matches native exactly.
+    let src = "double sqrt(double); double floor(double); \
+               static double g_exp(double x){ const double LN2=0.69314718055994530942; \
+                 double kf=floor(x/LN2+0.5); int k=(int)kf; double r=x-kf*LN2; \
+                 double er=1.0+r*(1.0+r*(0.5+r*(1.0/6+r*(1.0/24+r/120)))); double p=1.0; \
+                 if(k>=0) for(int i=0;i<k;i++) p*=2.0; else for(int i=0;i<-k;i++) p*=0.5; \
+                 return er*p; } \
+               int run(int n){ double acc=0; \
+                 for(int i=0;i<n;i++){ double x=(double)i*0.1; double w=g_exp(-x*0.3); acc+=w*w; } \
+                 double rms=sqrt(acc/(double)n); return (int)(rms*1000.0); } \
+               int main(void){ return run(40); }";
+    check_vs_native("guest_libm", src, 40);
+}
+
+#[test]
+fn demo_lineedit_vs_native() {
+    // A tiny line editor: read a line, wrap it in `[...]` (a right shift, `dst > src` → backward
+    // copy), then delete the middle char (a left shift, `dst < src` → forward copy). The runtime
+    // length keeps clang from folding the `memmove`s inline, so both route to the synthesized
+    // direction-aware `__temen_memmove`. Byte-identical to native. Empty + non-empty inputs.
+    check_demo_vs_native("lineedit", "lineedit/lineedit.c", b"hello world\n");
+    check_demo_vs_native("lineedit_short", "lineedit/lineedit.c", b"ab\n");
+}
+
+#[test]
+fn memmove_overlap_runtime() {
+    // Variable-length `memmove` with overlap in both directions, driven through the guest helper.
+    // A right shift by 1 (dst > src, backward) then a left shift by 1 (dst < src, forward) over an
+    // 8-byte window; the surviving bytes must match native (which uses the libc `memmove`).
+    let src = "void *memmove(void *, const void *, unsigned long); \
+               int run(int n){ char b[16]; for (int i=0;i<8;i++) b[i]='a'+i; \
+               unsigned long m=(unsigned long)n; \
+               memmove(b+1, b, m);            /* shift right: dst>src */ \
+               memmove(b, b+1, m);            /* shift left:  dst<src */ \
+               int s=0; for (int i=0;i<8;i++) s+=b[i]; return s & 0x7f; } \
+               int main(void){ return run(7); }";
+    check_vs_native("memmove_overlap", src, 7);
+}
+
+#[test]
+fn bswap_intrinsic() {
+    // `__builtin_bswap32`/`bswap64` → inline byte reversal, checked vs native.
+    let src = "int run(int n){ unsigned x = 0x11223344u + (unsigned)n; \
+               unsigned long y = 0xaabbccdd00112233UL; \
+               unsigned s = __builtin_bswap32(x); unsigned long t = __builtin_bswap64(y); \
+               return (int)((s ^ (unsigned)t ^ (unsigned)(t >> 32)) & 0xff); } \
+               int main(void){ return run(5); }";
+    check_vs_native("bswap", src, 5);
+}
+
+#[test]
+fn demo_mat4_vs_native() {
+    // A 4×4 matrix × vec4 affine transform using `<4 x float>` (vector_size(16)) — `matvec`
+    // broadcasts each component and accumulates the columns (`llvm.fmuladd.v4f32`), printing the
+    // int-truncated results. Drives 128-bit SIMD: `v128.load`/`store`, `f32x4` mul/add, extract/
+    // replace lane, and the splat `shufflevector`. Byte-identical to native.
+    check_demo_vs_native("mat4", "mat4/mat4.c", b"");
+}
+
+#[test]
+fn vec4_float_scale() {
+    // A `<4 x float>` passed/returned by value (a `v128` call/ret) and scaled by a broadcast scalar
+    // (`splat` + `f32x4.mul`), then lane-summed. scale({1,2,3,4}, 3) = {3,6,9,12} → 30.
+    let src =
+        "typedef float float4 __attribute__((vector_size(16))); float4 scale(float4, float); \
+               int run(int n){ float4 v = {1.0f, 2.0f, 3.0f, 4.0f}; float4 r = scale(v, (float)n); \
+               return (int)(r[0] + r[1] + r[2] + r[3]); } \
+               __attribute__((noinline)) float4 scale(float4 v, float s){ return v * s; } \
+               int main(void){ return run(3); }";
+    check_vs_native("vec4_scale", src, 3);
+}
+
+#[test]
+fn demo_sortvec_vs_native() {
+    // A growable int vector + insertion sort: 50 pseudo-random signed ints into a `realloc`-doubling
+    // buffer (from `realloc(NULL,…)` ≡ malloc), sorted, printed 10/line via `printf("%d%c")`. Drives
+    // `realloc` (the header-bearing bump allocator: malloc + copy old contents) and signed `%d`.
+    check_demo_vs_native("sortvec", "sortvec/sortvec.c", b"");
+}
+
+#[test]
+fn printf_signed_formats() {
+    // Signed `%d` (incl. negatives) with plain and space-padded fields, mixed with `%u` — checked vs
+    // native. (Zero-padded `%d` is intentionally fail-closed, so it is not exercised here.)
+    let src = "#include <stdio.h>\n\
+               int main(void){ \
+                 printf(\"%d %d %d %6d\\n\", 0, -7, 12345, -42); \
+                 printf(\"u=%u neg=%d\\n\", 4000000000u, -1); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_d", src, b"");
+}
+
+#[test]
+fn tail_call_mutual_recursion() {
+    // `musttail` tail calls lower to the `return_call` terminator, so an unbounded tail/mutual
+    // recursion runs in **constant native-stack space**. `even`/`odd` tail-call each other 2,000,000
+    // deep — without tail-call lowering the JIT would recurse that far and blow the native stack;
+    // with `return_call` the frame is replaced, not nested. `noinline` stops clang from collapsing
+    // the pair, `musttail` forces a real tail call (not a rewritten loop). Both functions have no
+    // allocas (`frame_size == 0`), so the linear-memory data stack is constant too. vs native (which
+    // also TCOs `musttail`), byte-identical.
+    let src = "#include <stdio.h>\n\
+               __attribute__((noinline)) static int odd(int n);\n\
+               __attribute__((noinline)) static int even(int n) {\n\
+                   if (n == 0) return 1;\n\
+                   __attribute__((musttail)) return odd(n - 1);\n\
+               }\n\
+               __attribute__((noinline)) static int odd(int n) {\n\
+                   if (n == 0) return 0;\n\
+                   __attribute__((musttail)) return even(n - 1);\n\
+               }\n\
+               int main(void) {\n\
+                   printf(\"%d %d\\n\", even(2000000), odd(1999999));\n\
+                   return 0;\n\
+               }";
+    check_powerbox_vs_native("tail_mutual", src, b"");
+}
+
+// Narrow (i8/i16) atomics — emulated via the 32-bit CAS-loop helpers. rmw add (with wrap-around),
+// or/and/xor, exchange, load, store, and cmpxchg (success + failure) on a byte and a halfword.
+const ATOMICS_NARROW_SRC: &str = "#include <stdio.h>\n#include <stdatomic.h>\n\
+    int main(void){\n\
+        atomic_uchar c = 0;\n\
+        atomic_fetch_add(&c, 200); atomic_fetch_add(&c, 100);\n\
+        atomic_fetch_or(&c, 0x80); atomic_fetch_and(&c, 0xF0); atomic_fetch_xor(&c, 0x0F);\n\
+        unsigned char oc = atomic_exchange(&c, 50);\n\
+        unsigned char lc = atomic_load(&c);\n\
+        atomic_store(&c, 99);\n\
+        unsigned char e1 = 99; int ok1 = atomic_compare_exchange_strong(&c, &e1, 123);\n\
+        unsigned char e2 = 7;  int ok2 = atomic_compare_exchange_strong(&c, &e2, 0);\n\
+        atomic_ushort s = 1000; atomic_fetch_add(&s, 70000);\n\
+        printf(\"%d %d %d %d %d %d\\n\", oc, lc, ok1, ok2, atomic_load(&c), atomic_load(&s));\n\
+        return 0;\n\
+    }";
+
+#[test]
+fn atomics_narrow() {
+    check_powerbox_vs_native("atomics_narrow", ATOMICS_NARROW_SRC, b"");
+}
+
+#[test]
+fn atomics_narrow_lowers_and_runs() {
+    // Local validation (no native cc). c: 0→200→44(wrap)→172→160→175; oc=175, store 99, cas(99→123)
+    // ok, cas(7) fail, c=123. s: 1000+70000 ≡ 5464 (mod 2^16).
+    let Some(bc) = compile_to_ll("atomics_n", ATOMICS_NARROW_SRC) else {
+        return;
+    };
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
+    // The narrow CAS-loop helpers were synthesized (each contains an AtomicCmpxchg).
+    let cas_loops = t
+        .module
+        .funcs
+        .iter()
+        .filter(|f| {
+            f.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(i, temen_ir::Inst::AtomicCmpxchg { .. }))
+            })
+        })
+        .count();
+    assert!(
+        cas_loops >= 2,
+        "expected the rmw + cas narrow helpers, got {cas_loops}"
+    );
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
+    temen_verify::verify_module(&module).expect("verify translated IR");
+    let run = temen_run::run_powerbox(&module, b"").expect("powerbox run");
+    assert_eq!(run.stdout, b"175 50 1 0 123 5464\n");
+}
+
+// C11 `<stdatomic.h>` exercising every native atomic instruction the on-ramp now lowers: rmw
+// add/sub/and/or/xor and exchange, load, store, and compare-exchange (success + failure) on `i32`
+// and `i64`. Single-threaded, so seq-cst is trivially observable.
+const ATOMICS_WIDE_SRC: &str = "#include <stdio.h>\n#include <stdatomic.h>\n\
+    int main(void){\n\
+        atomic_int a = 0;\n\
+        atomic_fetch_add(&a, 5); atomic_fetch_sub(&a, 2);\n\
+        atomic_fetch_or(&a, 8); atomic_fetch_and(&a, 0xFF); atomic_fetch_xor(&a, 1);\n\
+        int old = atomic_exchange(&a, 100);\n\
+        int loaded = atomic_load(&a);\n\
+        atomic_store(&a, 42);\n\
+        int e1 = 42; int ok1 = atomic_compare_exchange_strong(&a, &e1, 99);\n\
+        int e2 = 7;  int ok2 = atomic_compare_exchange_strong(&a, &e2, 0);\n\
+        atomic_long b = 1000000000000L; atomic_fetch_add(&b, 1);\n\
+        printf(\"%d %d %d %d %d %ld\\n\", old, loaded, ok1, ok2, atomic_load(&a), atomic_load(&b));\n\
+        return 0;\n\
+    }";
+
+#[test]
+fn atomics_wide() {
+    check_powerbox_vs_native("atomics_wide", ATOMICS_WIDE_SRC, b"");
+}
+
+#[test]
+fn atomics_wide_lowers_and_runs() {
+    // Local validation (no native cc): the native atomics lower, verify, and run to the
+    // hand-computed result. a: 0→5→3→11→11→10; old=10, store 42, cas(42→99) ok, cas(7) fail, a=99;
+    // b: 1e12 + 1.
+    let Some(bc) = compile_to_ll("atomics_w", ATOMICS_WIDE_SRC) else {
+        return;
+    };
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
+    let has_atomic = t.module.funcs.iter().flat_map(|f| &f.blocks).any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(
+                i,
+                temen_ir::Inst::AtomicRmw { .. }
+                    | temen_ir::Inst::AtomicCmpxchg { .. }
+                    | temen_ir::Inst::AtomicLoad { .. }
+                    | temen_ir::Inst::AtomicStore { .. }
+            )
+        })
+    });
+    assert!(
+        has_atomic,
+        "expected native atomic ops in the lowered module"
+    );
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
+    temen_verify::verify_module(&module).expect("verify translated IR");
+    let run = temen_run::run_powerbox(&module, b"").expect("powerbox run");
+    assert_eq!(run.stdout, b"10 100 1 0 99 1000000000001\n");
+}
+
+#[test]
+fn unresolved_extern_stub_opt_in() {
+    // The opt-in `stub_unresolved_externs` (TranslateOptions): a call to a genuinely undefined external
+    // (no recognizer/helper/capability handles it) lowers to a trap stub instead of failing
+    // translation — deferring the fail-closed from translate time to run time. This is what lets a
+    // whole-program module (Postgres) with hundreds of externals *dead on the exercised path* translate
+    // + verify. The stub is ordinary re-verified IR: a *called* stub traps cleanly (never an escape), a
+    // dead one is inert. Three checks below pin exactly that.
+    use temen_llvm::TranslateOptions;
+    let stub = TranslateOptions {
+        stub_unresolved_externs: true,
+        ..TranslateOptions::default()
+    };
+
+    // (1) A dead undefined extern behind an opaque gate (`gate` is `volatile 0`, so clang can't prove
+    // the branch dead and keeps the `call @mystery` in the IR — yet it is never taken at runtime).
+    let Some(bc) = compile_to_ll(
+        "extern_stub_dead",
+        "#include <stdio.h>\n\
+         extern int mystery(int);\n\
+         volatile int gate = 0;\n\
+         int main(void){ int r = 7; if (gate) r = mystery(42); printf(\"%d\\n\", r); return 0; }",
+    ) else {
+        return;
+    };
+    // Strict default: a clean, fail-closed translate-time error.
+    match temen_llvm::translate_ll_path(&bc) {
+        Err(temen_llvm::Error::Unsupported(m)) if m.contains("mystery") => {}
+        other => panic!("strict default should fail closed on `mystery`, got {other:?}"),
+    }
+    // Opt-in: translates + verifies, and runs to a clean exit — the dead stub never executes.
+    let t = temen_llvm::translate_ll_path_with_options(&bc, stub).expect("stub translate");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
+    temen_verify::verify_module(&module).expect("verify stubbed module");
+    let run = temen_run::run_powerbox(&module, b"").expect("run (dead stub inert)");
+    assert_eq!(
+        run.stdout, b"7\n",
+        "the gated-off stub must not perturb the run"
+    );
+
+    // (2) The same extern, now on the *taken* path: the called stub must trap (run errors), never
+    // silently return or escape.
+    let Some(bc2) = compile_to_ll(
+        "extern_stub_called",
+        "#include <stdio.h>\n\
+         extern int mystery(int);\n\
+         int main(void){ int r = mystery(1); printf(\"%d\\n\", r); return 0; }",
+    ) else {
+        return;
+    };
+    let t2 = temen_llvm::translate_ll_path_with_options(&bc2, stub).expect("stub translate 2");
+    let module2 = t2.module; // phase 3: no rewrite
+    temen_verify::verify_module(&module2).expect("verify stubbed module 2");
+    assert!(
+        temen_run::run_powerbox(&module2, b"").is_err(),
+        "a called stub must trap (fail-closed at run time)"
+    );
+}
+
+#[test]
+fn stub_trap_names_the_extern() {
+    // Self-naming stub-traps. A *called* undefined-extern stub traps `Unreachable`, but the trap alone
+    // names nothing: for a large bring-up (Postgres `--single`) that traps on a stubbed extern on the
+    // *live* path, "which extern?" was blind guessing. The on-ramp now names each stub with its missing
+    // extern in the §6 function-name table, so the trap-time backtrace's innermost frame resolves — via
+    // `temen_interp::func_name` — to the extern's name. The stub body is unchanged (a pure `Unreachable`);
+    // only the strippable, verifier-ignored (§2a) name table grew, so the confinement path is untouched.
+    use temen_llvm::TranslateOptions;
+    let stub = TranslateOptions {
+        stub_unresolved_externs: true,
+        ..TranslateOptions::default()
+    };
+    let Some(bc) = compile_to_ll(
+        "stub_named",
+        "extern int frobnicate_widget(int);\n\
+         int run(int x){ return frobnicate_widget(x); }",
+    ) else {
+        return;
+    };
+    let t = temen_llvm::translate_ll_path_with_options(&bc, stub).expect("stub translate");
+    let entry_sp = t.entry_sp as i64;
+    assert!(
+        t.module
+            .debug_info
+            .as_ref()
+            .is_some_and(|d| d.func_names.iter().any(|f| f.name == "frobnicate_widget")),
+        "the stub must be named with its missing extern in debug_info.func_names"
+    );
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
+    temen_verify::verify_module(&module).expect("verify stubbed module");
+    let run = module
+        .exports
+        .iter()
+        .find(|e| e.name == "run")
+        .map(|e| e.func)
+        .expect("run export");
+    let mut fuel = 1_000_000u64;
+    let (res, backtrace, _) = temen_interp::run_fast_traced(
+        &module,
+        run,
+        &[Value::I64(entry_sp), Value::I32(7)],
+        &mut fuel,
+    );
+    assert!(
+        matches!(res, Err(temen_interp::Trap::Unreachable)),
+        "the called stub must trap Unreachable, got {res:?}"
+    );
+    let named = backtrace
+        .first()
+        .and_then(|pc| temen_interp::func_name(&module, pc.func));
+    assert_eq!(
+        named,
+        Some("frobnicate_widget"),
+        "the innermost trapped frame must name the missing extern (backtrace: {backtrace:?})"
+    );
+}
+
+#[test]
+fn vector_mask_bitwise_any_match() {
+    // The SIMD "**any lane matches**" idiom (Postgres' `simd.h`): several `<N x i1>` comparison masks
+    // combined with `or`/`and`, then `sext` to a full-width vector. clang `-O2` folds
+    // `sext(m1)|sext(m2)|sext(m3)` into `or <4 x i1>` masks + one `sext <4 x i1> to <4 x i32>` — the
+    // exact construct that blocked Postgres. The on-ramp now lowers mask-mask bitwise ops lane-wise
+    // (`sext` of a mask was already handled). Runtime `volatile` seed so nothing constant-folds; the
+    // 0/-1 result lanes fold to one `%u`. Byte-identical to native.
+    let src = "#include <stdio.h>\n\
+        typedef int v4i __attribute__((vector_size(16)));\n\
+        volatile int SEED = 7;\n\
+        int main(void){\n\
+          int s = SEED;\n\
+          v4i a = {s, s*2, s+5, s^3};\n\
+          v4i t1 = {7, 99, 12, 4}, t2 = {14, 8, 12, 100}, t3 = {0, 14, 3, 4};\n\
+          v4i any = (a == t1) | (a == t2) | (a == t3);\n\
+          v4i all = (a != t1) & (a != t2);\n\
+          unsigned acc = 0;\n\
+          for (int i=0;i<4;i++) acc = acc*131u + (unsigned)any[i] + 7u*(unsigned)all[i];\n\
+          printf(\"%u\\n\", acc); return 0; }";
+    check_powerbox_vs_native("vmask_any", src, b"");
+}
+
+#[test]
+fn unresolved_extern_funcptr_stub() {
+    // The **address-taken** counterpart to `unresolved_extern_stub_opt_in`: a *function pointer* to an
+    // undefined external (e.g. a comparator/dispatch-table entry — what blocked Postgres on `@memcmp`)
+    // resolves to the trap stub's funcref index. The undefined extern's signature comes from its
+    // `declare` prototype (the reference site carries only an opaque `ptr`). Under strict default this
+    // is a clean translate-time error; opt-in, the funcref is inert unless the pointer is *called*.
+    use temen_llvm::TranslateOptions;
+    let stub = TranslateOptions {
+        stub_unresolved_externs: true,
+        ..TranslateOptions::default()
+    };
+    // `gate ? mystery : other` takes the address of the undefined `mystery`; with `gate` a volatile 0
+    // the live target is `other`, so the run is clean and the `mystery` funcref (a stub) is never
+    // selected — proving an address-taken stub is inert until actually invoked.
+    let Some(bc) = compile_to_ll(
+        "extern_funcptr",
+        "#include <stdio.h>\n\
+         extern int mystery(int, int);\n\
+         static int other(int a, int b){ return a + b; }\n\
+         volatile int gate = 0;\n\
+         int main(void){ int (*p)(int,int) = gate ? mystery : other; \
+           printf(\"%d\\n\", p(3, 4)); return 0; }",
+    ) else {
+        return;
+    };
+    match temen_llvm::translate_ll_path(&bc) {
+        Err(temen_llvm::Error::Unsupported(m)) if m.contains("mystery") => {}
+        other => {
+            panic!("strict default should fail closed on address-taken `mystery`, got {other:?}")
+        }
+    }
+    let t = temen_llvm::translate_ll_path_with_options(&bc, stub).expect("stub translate");
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
+    temen_verify::verify_module(&module).expect("verify funcptr-stub module");
+    let run = temen_run::run_powerbox(&module, b"").expect("run (funcref stub inert)");
+    assert_eq!(
+        run.stdout, b"7\n",
+        "the unselected funcref stub must not perturb the run"
+    );
+}
+
+#[test]
+fn vector_ctpop_and_wide_reduce() {
+    // Two SIMD gaps from Postgres' `pg_popcount_*`, in one vectorizable loop: (1) `llvm.ctpop.vNiM` on
+    // a non-`i8x16` lane width (`pg_popcount_slow`'s `<2 x i64>`) — only `i8x16` has a native vector
+    // `ctpop`, so the on-ramp scalarizes any other width; (2) a **wide** `llvm.vector.reduce.add` over
+    // a >128-bit accumulator (`pg_popcount_avx512`'s `reduce.add.v8i64`) — folded across every chunk
+    // lane. A popcount-sum loop vectorizes at `-O2` into exactly this; the count matches native
+    // (hardware `popcnt`) on interp + JIT. `seed` is the runtime `main` arg so nothing constant-folds.
+    let src = "int main(int seed){\n\
+        unsigned long long arr[32];\n\
+        for (int i=0;i<32;i++) arr[i] = (unsigned long long)(i+seed) * 0x0102040810204080ULL ^ (0x5555ULL*(i+1));\n\
+        int c = 0;\n\
+        for (int i=0;i<32;i++) c += __builtin_popcountll(arr[i]);\n\
+        return c & 0x7f; }";
+    check_vs_native("vctpop", src, 1);
+}
+
+#[test]
+fn vector_bswap_128() {
+    // A 128-bit vector `llvm.bswap` (`<4 x i32>`) — reverses the bytes **within each lane**
+    // (element-wise, not across the register). No native vector op, so the on-ramp scalarizes: explode
+    // the lanes, `emit_bswap` each, repack (mirrors vector `ctpop`). Found in Postgres' `pg_sha256_final`
+    // (the big-endian digest write). A hand `.ll` (a `-O2` bswap loop over-vectorizes to `<16 x i32>`,
+    // a separate wide-vector-type gap): inputs `0x0N000000` byte-swap to lane `N`, folded
+    // `e0*1000 + e1*100 + e2*10 + e3` = 1234 — asymmetric, so a swapped byte or lane order is caught.
+    let ll = "declare <4 x i32> @llvm.bswap.v4i32(<4 x i32>)\n\
+        define i32 @main() {\n\
+        entry:\n  \
+        %v = call <4 x i32> @llvm.bswap.v4i32(<4 x i32> <i32 16777216, i32 33554432, i32 50331648, i32 67108864>)\n  \
+        %e0 = extractelement <4 x i32> %v, i32 0\n  \
+        %e1 = extractelement <4 x i32> %v, i32 1\n  \
+        %e2 = extractelement <4 x i32> %v, i32 2\n  \
+        %e3 = extractelement <4 x i32> %v, i32 3\n  \
+        %a = mul i32 %e0, 1000\n  \
+        %b = mul i32 %e1, 100\n  \
+        %c = mul i32 %e2, 10\n  \
+        %ab = add i32 %a, %b\n  \
+        %cd = add i32 %c, %e3\n  \
+        %r = add i32 %ab, %cd\n  \
+        ret i32 %r\n}";
+    let t = temen_llvm::translate_ll_str(ll).expect("translate vector-bswap .ll");
+    temen_verify::verify_module(&t.module).expect("verify vector-bswap");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = temen_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run vector-bswap");
+    assert_eq!(
+        r,
+        vec![Value::I32(1234)],
+        "bswap lanes → [1,2,3,4]; 1*1000+2*100+3*10+4 = 1234"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match temen_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0] as i32, 1234, "JIT vector-bswap = 1234"),
+        other => panic!("JIT vector-bswap: unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn vec_widen_narrow_native() {
+    // Native SIMD widen/narrow (D64): a full-128 ×2 `sext`/`zext` lowers to `swiden`/`uwiden` (not a
+    // per-lane explode/repack), and a 256→128 wrapping `trunc` to a byte `shuffle` (not the saturating
+    // `VNarrow`). Checks the lane values on both backends. Folds four conversions into one `i64`:
+    //   sext <8 x i16>→<8 x i32> lane0 = -1              → i64 -1
+    //   zext <8 x i16>→<8 x i32> lane0 = 0xFFFF = 65535  → i64 65535
+    //   trunc <8 x i32>→<8 x i16> lane0 = 0x0001_0001 & 0xFFFF = 1 (WRAP, not saturate to 0x7FFF)
+    //   sext <8 x i32>→<8 x i64> lane7 = -8              → i64 -8
+    //   fold: (-1)*1_000_000 + 65535*100 + 1*10 + (-8) = -1_000_000 + 6_553_500 + 10 - 8 = 5_553_502
+    let ll = "define i64 @run() {\n\
+        entry:\n  \
+        %sw = sext <8 x i16> <i16 -1, i16 2, i16 3, i16 4, i16 5, i16 6, i16 7, i16 8> to <8 x i32>\n  \
+        %s0 = extractelement <8 x i32> %sw, i32 0\n  \
+        %s0e = sext i32 %s0 to i64\n  \
+        %zw = zext <8 x i16> <i16 -1, i16 2, i16 3, i16 4, i16 5, i16 6, i16 7, i16 8> to <8 x i32>\n  \
+        %z0 = extractelement <8 x i32> %zw, i32 0\n  \
+        %z0e = zext i32 %z0 to i64\n  \
+        %nw = trunc <8 x i32> <i32 65537, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8> to <8 x i16>\n  \
+        %n0 = extractelement <8 x i16> %nw, i32 0\n  \
+        %n0e = zext i16 %n0 to i64\n  \
+        %ww = sext <8 x i32> <i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 -8> to <8 x i64>\n  \
+        %w7 = extractelement <8 x i64> %ww, i32 7\n  \
+        %a = mul i64 %s0e, 1000000\n  \
+        %b = mul i64 %z0e, 100\n  \
+        %c = mul i64 %n0e, 10\n  \
+        %ab = add i64 %a, %b\n  \
+        %cd = add i64 %c, %w7\n  \
+        %r = add i64 %ab, %cd\n  \
+        ret i64 %r\n}";
+    let t = temen_llvm::translate_ll_str(ll).expect("translate widen/narrow .ll");
+    temen_verify::verify_module(&t.module).expect("verify widen/narrow");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = temen_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run widen/narrow");
+    assert_eq!(
+        r,
+        vec![Value::I64(5_553_502)],
+        "sext/zext widen + wrapping narrow + i32→i64 widen lanes"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match temen_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0], 5_553_502, "JIT widen/narrow"),
+        other => panic!("JIT widen/narrow: unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn vec2_minmax_per_lane() {
+    // A **2-lane 32-bit** integer min/max (`<2 x i32>`, packed into an `i64` — §V). It has no 128-bit
+    // `VShape`, so it must be scalarized **per lane**: comparing the whole packed `i64` is a silent
+    // miscompile (`smax(<-1, 3>, 0)` keeps the `-1` lane because the packed word `0x3_FFFFFFFF` is
+    // positive). Found via the auto-vectorized `if d > 0 { h += d as i64 }` clamp reduction over an
+    // `i32` slice with negatives (rustbench `bfs`, ISSUES.md I23). Mixed-sign lanes catch the bug:
+    //   smax(<-1, 3>, <0,0>)       = <0, 3>   (per-lane; packed-scalar would keep <-1, 3>)
+    //   umin(<-1, 3>, <5, 5>)      = <5, 3>   (unsigned: min(0xFFFFFFFF,5)=5, min(3,5)=3)
+    // fold s0*1000 + s1*100 + u0*10 + u1 = 0 + 300 + 50 + 3 = 353.
+    let ll = "declare <2 x i32> @llvm.smax.v2i32(<2 x i32>, <2 x i32>)\n\
+        declare <2 x i32> @llvm.umin.v2i32(<2 x i32>, <2 x i32>)\n\
+        define i32 @main() {\n\
+        entry:\n  \
+        %s = call <2 x i32> @llvm.smax.v2i32(<2 x i32> <i32 -1, i32 3>, <2 x i32> zeroinitializer)\n  \
+        %s0 = extractelement <2 x i32> %s, i32 0\n  \
+        %s1 = extractelement <2 x i32> %s, i32 1\n  \
+        %u = call <2 x i32> @llvm.umin.v2i32(<2 x i32> <i32 -1, i32 3>, <2 x i32> <i32 5, i32 5>)\n  \
+        %u0 = extractelement <2 x i32> %u, i32 0\n  \
+        %u1 = extractelement <2 x i32> %u, i32 1\n  \
+        %a = mul i32 %s0, 1000\n  \
+        %b = mul i32 %s1, 100\n  \
+        %c = mul i32 %u0, 10\n  \
+        %ab = add i32 %a, %b\n  \
+        %cd = add i32 %c, %u1\n  \
+        %r = add i32 %ab, %cd\n  \
+        ret i32 %r\n}";
+    let t = temen_llvm::translate_ll_str(ll).expect("translate vec2-minmax .ll");
+    temen_verify::verify_module(&t.module).expect("verify vec2-minmax");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = temen_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run vec2-minmax");
+    assert_eq!(
+        r,
+        vec![Value::I32(353)],
+        "per-lane smax/umin: <0,3>/<5,3> ⇒ 0*1000+3*100+5*10+3 = 353"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match temen_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0] as i32, 353, "JIT vec2-minmax = 353"),
+        other => panic!("JIT vec2-minmax: unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn vec2_splat_constant() {
+    // LLVM 21's constant-splat shorthand `<2 x i32> splat (i32 K)` (≡ `<i32 K, i32 K>`). rustc's
+    // auto-vectorizer emits it pervasively (min/max clamps, elementwise ops); clang's textual output
+    // does not, so the on-ramp's `.ll` reader never saw it and fail-closed (`constant not yet
+    // supported: splat`) — blocking every auto-vectorized rustc module. Exercised through the 2-lane
+    // per-lane min/max path so the expanded lanes are actually observed:
+    //   smax(<-1, 3>, splat(2)) = <2, 3>  ⇒  s0*1000 + s1 = 2003.
+    let ll = "declare <2 x i32> @llvm.smax.v2i32(<2 x i32>, <2 x i32>)\n\
+        define i32 @main() {\n\
+        entry:\n  \
+        %s = call <2 x i32> @llvm.smax.v2i32(<2 x i32> <i32 -1, i32 3>, <2 x i32> splat (i32 2))\n  \
+        %s0 = extractelement <2 x i32> %s, i32 0\n  \
+        %s1 = extractelement <2 x i32> %s, i32 1\n  \
+        %a = mul i32 %s0, 1000\n  \
+        %r = add i32 %a, %s1\n  \
+        ret i32 %r\n}";
+    let t = temen_llvm::translate_ll_str(ll).expect("translate splat .ll");
+    temen_verify::verify_module(&t.module).expect("verify splat");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = temen_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run splat");
+    assert_eq!(
+        r,
+        vec![Value::I32(2003)],
+        "splat(2) ⇒ smax(<-1,3>,<2,2>)=<2,3>"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match temen_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0] as i32, 2003, "JIT splat = 2003"),
+        other => panic!("JIT splat: unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn vec2_abs_per_lane() {
+    // A **2-lane 32-bit** `llvm.abs` (`<2 x i32>`, packed into an `i64` — §V) scalarizes **per lane**,
+    // like the min/max siblings: a packed-word fall-through would `abs` the whole `i64` and corrupt the
+    // lanes (`abs(<-7, 4>)` packs to a *positive* `i64`, so it would pass through unchanged, extracting
+    // lane 0 as -7). Per lane: `abs(<-7, 4>) = <7, 4>` ⇒ a0*1000 + a1 = 7004. Found via a rustc
+    // auto-vectorized `.iter().map(|d| d.abs())` reduction (ISSUES.md I23 follow-on probes).
+    let ll = "declare <2 x i32> @llvm.abs.v2i32(<2 x i32>, i1)\n\
+        define i32 @main() {\n\
+        entry:\n  \
+        %a = call <2 x i32> @llvm.abs.v2i32(<2 x i32> <i32 -7, i32 4>, i1 false)\n  \
+        %a0 = extractelement <2 x i32> %a, i32 0\n  \
+        %a1 = extractelement <2 x i32> %a, i32 1\n  \
+        %m = mul i32 %a0, 1000\n  \
+        %r = add i32 %m, %a1\n  \
+        ret i32 %r\n}";
+    let t = temen_llvm::translate_ll_str(ll).expect("translate vec2-abs .ll");
+    temen_verify::verify_module(&t.module).expect("verify vec2-abs");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = temen_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run vec2-abs");
+    assert_eq!(
+        r,
+        vec![Value::I32(7004)],
+        "per-lane abs(<-7,4>)=<7,4> ⇒ 7*1000+4"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match temen_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0] as i32, 7004, "JIT vec2-abs = 7004"),
+        other => panic!("JIT vec2-abs: unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn constexpr_gep_i8_element_stride() {
+    // A **constexpr** `getelementptr (i8, ptr @g, i64 K)` strides by its **source element type** (`i8`
+    // ⇒ K bytes), *not* by `@g`'s pointee type. With opaque pointers the two differ — `@g` here is a
+    // `[8 x i32]`, so a naive evaluator scaling K by `sizeof([8 x i32])` (32) would land 8×/20× out of
+    // bounds (a fault or garbage). Found via a bump-allocator `HEAP` global whose `vec` accesses folded
+    // to `getelementptr (i8, ptr @HEAP, i64 8/16/…)` (rustbench, ISSUES.md I23):
+    //   byte 8  = &g[2] = 102,  byte 20 = &g[5] = 105,  sum = 207.
+    let ll = "@g = internal constant [8 x i32] \
+        [i32 100, i32 101, i32 102, i32 103, i32 104, i32 105, i32 106, i32 107]\n\
+        define i32 @main() {\n\
+        entry:\n  \
+        %a = load i32, ptr getelementptr (i8, ptr @g, i64 8)\n  \
+        %b = load i32, ptr getelementptr (i8, ptr @g, i64 20)\n  \
+        %r = add i32 %a, %b\n  \
+        ret i32 %r\n}";
+    let t = temen_llvm::translate_ll_str(ll).expect("translate constexpr-gep .ll");
+    temen_verify::verify_module(&t.module).expect("verify constexpr-gep");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = temen_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run constexpr-gep");
+    assert_eq!(
+        r,
+        vec![Value::I32(207)],
+        "i8-strided constexpr GEP: g[2]+g[5] = 102+105 = 207"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match temen_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0] as i32, 207, "JIT constexpr-gep = 207"),
+        other => panic!("JIT constexpr-gep: unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn freeze_of_aggregate() {
+    // `freeze` of an **aggregate** value (a small by-value struct held field-wise in `agg` — e.g. the
+    // `{i32,i32,i32,i32}` a `cpuid`/multi-result call yields, which blocked Postgres' `pg_popcount_*`
+    // dispatch) is the identity: rebind the fields. A hand-written `.ll` (`insertvalue` → `freeze` →
+    // `extractvalue`) exercises exactly that path (clang rarely emits an aggregate `freeze` from C).
+    let ll = "define i32 @main() {\n\
+        entry:\n  \
+        %s0 = insertvalue {i32, i32} undef, i32 7, 0\n  \
+        %s1 = insertvalue {i32, i32} %s0, i32 35, 1\n  \
+        %f = freeze {i32, i32} %s1\n  \
+        %x = extractvalue {i32, i32} %f, 1\n  \
+        ret i32 %x\n}";
+    let t = temen_llvm::translate_ll_str(ll).expect("translate freeze-agg .ll");
+    temen_verify::verify_module(&t.module).expect("verify freeze-agg");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = temen_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run freeze-agg");
+    assert_eq!(
+        r,
+        vec![Value::I32(35)],
+        "freeze of {{7,35}} then extractvalue 1 = 35"
+    );
+}
+
+#[test]
+fn struct_constant_return() {
+    // A **struct-constant** return — `ret {i64,i64} {i64 0, i64 6}` — is how QuickJS returns its
+    // `JS_EXCEPTION` sentinel (a 16-byte `JSValue` `{value, tag}` passed by value; tag 6 =
+    // exception). `agg_of` tracks only *local* aggregates, so a constant one dropped to the scalar
+    // `operand` path and was rejected; `agg_fields` now materializes it field-wise, like a struct φ
+    // incoming. A hand-written `.ll` (clang folds the simple C shapes to a `select`) exercises the
+    // constant return, the multi-result `call`, and the caller-side `extractvalue`.
+    let ll = "define i32 @main() {\n\
+        entry:\n  \
+        %v = call {i64, i64} @exc()\n  \
+        %t = extractvalue {i64, i64} %v, 1\n  \
+        %r = trunc i64 %t to i32\n  \
+        ret i32 %r\n}\n\
+        define {i64, i64} @exc() {\n\
+        entry:\n  \
+        ret {i64, i64} {i64 0, i64 6}\n}";
+    let t = temen_llvm::translate_ll_str(ll).expect("translate struct-const-return .ll");
+    temen_verify::verify_module(&t.module).expect("verify struct-const-return");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r =
+        temen_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run struct-const-return");
+    assert_eq!(
+        r,
+        vec![Value::I32(6)],
+        "JS_EXCEPTION-shaped {{0,6}}, field 1 = 6"
+    );
+}
+
+#[test]
+fn dynamic_alloca_runtime_count() {
+    // A **dynamic `alloca`** — `alloca i32, i64 %n` with a *runtime* element count — is how QuickJS's
+    // `JS_CallInternal` sizes its operand stack. The on-ramp lays static allocas at fixed frame
+    // offsets; a dynamic one bumps a per-frame `DYN_TOP` running top at runtime, and a call in the
+    // same function hands the callee that top so its frame sits *above* the variable-length region.
+    // `@consume` writes its own local `alloca` (999) before reading the caller's dynamic buffer — if
+    // the callee frame overlapped the dynamic allocation the store would clobber it and the result
+    // would be wrong. clang folds a constant-sized VLA back to a static alloca, so this is a
+    // hand-written `.ll`; `%n` comes from a call so it stays runtime. Checked interp == JIT.
+    let ll = "define i32 @main() {\n\
+        entry:\n  \
+        %n = call i64 @five()\n  \
+        %p = alloca i32, i64 %n\n  \
+        store i32 10, ptr %p\n  \
+        %p1 = getelementptr i32, ptr %p, i64 1\n  \
+        store i32 20, ptr %p1\n  \
+        %s = call i32 @consume(ptr %p)\n  \
+        ret i32 %s\n}\n\
+        define i64 @five() {\n\
+        entry:\n  \
+        ret i64 5\n}\n\
+        define i32 @consume(ptr %q) {\n\
+        entry:\n  \
+        %scratch = alloca i32\n  \
+        store i32 999, ptr %scratch\n  \
+        %a = load i32, ptr %q\n  \
+        %q1 = getelementptr i32, ptr %q, i64 1\n  \
+        %b = load i32, ptr %q1\n  \
+        %r = add i32 %a, %b\n  \
+        ret i32 %r\n}";
+    let t = temen_llvm::translate_ll_str(ll).expect("translate dynamic-alloca .ll");
+    temen_verify::verify_module(&t.module).expect("verify dynamic-alloca");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = temen_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run dynamic-alloca");
+    assert_eq!(
+        r,
+        vec![Value::I32(30)],
+        "p[0]+p[1] = 10+20 = 30 (callee frame sits above the dynamic region)"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match temen_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0] as i32, 30, "JIT dynamic-alloca = 30"),
+        other => panic!("JIT dynamic-alloca: unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn frameaddress_is_downward_stack_proxy() {
+    // `llvm.frameaddress(0)` (`__builtin_frame_address(0)`) is used as an opaque stack-pointer token
+    // for software stack-overflow checks — QuickJS's `js_check_stack_overflow`, hit per call in the
+    // interpreter core. The C idiom assumes a *downward* native stack, but the Temen data-stack grows
+    // *up*, so the on-ramp returns the downward proxy `FRAME_ADDR_BASE - sp`: it must *decrease* with
+    // call depth. `@main` (shallow, non-empty frame so the callee SP differs) takes its frame address,
+    // then `@deeper` (one call deeper, larger `sp`) takes its own — the deeper one must be strictly
+    // smaller. This is the exact monotonic property the overflow check relies on. Checked interp == JIT.
+    let ll = "define i32 @main() {\n\
+        entry:\n  \
+        %slot = alloca i64\n  \
+        store i64 0, ptr %slot\n  \
+        %a = call ptr @llvm.frameaddress.p0(i32 0)\n  \
+        %ai = ptrtoint ptr %a to i64\n  \
+        %d = call i64 @deeper()\n  \
+        %cmp = icmp ugt i64 %ai, %d\n  \
+        %r = zext i1 %cmp to i32\n  \
+        ret i32 %r\n}\n\
+        define i64 @deeper() {\n\
+        entry:\n  \
+        %f = call ptr @llvm.frameaddress.p0(i32 0)\n  \
+        %fi = ptrtoint ptr %f to i64\n  \
+        ret i64 %fi\n}\n\
+        declare ptr @llvm.frameaddress.p0(i32)";
+    let t = temen_llvm::translate_ll_str(ll).expect("translate frameaddress .ll");
+    temen_verify::verify_module(&t.module).expect("verify frameaddress");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = temen_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run frameaddress");
+    assert_eq!(
+        r,
+        vec![Value::I32(1)],
+        "deeper frame address < shallower (downward proxy: decreases with depth)"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match temen_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0] as i32, 1, "JIT frameaddress downward = 1"),
+        other => panic!("JIT frameaddress: unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn select_of_aggregate() {
+    // A `select` between two **aggregate** values — `select i1 %c, {i64,i64} %a, {i64,i64} %b` — is how
+    // QuickJS picks between two 16-byte `JSValue`s (blocked `js_array_iterator_next`). Aggregates live
+    // field-wise in the `agg` side-table, so the scalar `select` arm `ctx.operand`ed them and failed
+    // ("value not available in block"); the aggregate arm now lowers one scalar `Select` per field. The
+    // result crosses a block edge (`entry` → `next`), so this also exercises the `agg_layout` cross-block
+    // fan-out (`block_params`/`branch_args`). `@truth` returns 1 → the `{10,20}` operand wins; 10+20=30.
+    let ll = "define i64 @main() {\n\
+        entry:\n  \
+        %a0 = insertvalue {i64, i64} undef, i64 10, 0\n  \
+        %a = insertvalue {i64, i64} %a0, i64 20, 1\n  \
+        %b0 = insertvalue {i64, i64} undef, i64 30, 0\n  \
+        %b = insertvalue {i64, i64} %b0, i64 40, 1\n  \
+        %c = call i1 @truth()\n  \
+        %s = select i1 %c, {i64, i64} %a, {i64, i64} %b\n  \
+        br label %next\n\
+        next:\n  \
+        %f0 = extractvalue {i64, i64} %s, 0\n  \
+        %f1 = extractvalue {i64, i64} %s, 1\n  \
+        %r = add i64 %f0, %f1\n  \
+        ret i64 %r\n}\n\
+        define i1 @truth() {\n\
+        entry:\n  \
+        ret i1 1\n}";
+    let t = temen_llvm::translate_ll_str(ll).expect("translate select-aggregate .ll");
+    temen_verify::verify_module(&t.module).expect("verify select-aggregate");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = temen_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run select-aggregate");
+    assert_eq!(
+        r,
+        vec![Value::I64(30)],
+        "select picks {{10,20}} (cond true), crossing a block edge: 10+20 = 30"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match temen_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0], 30, "JIT select-aggregate = 30"),
+        other => panic!("JIT select-aggregate: unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn llvm_round_ties_away_from_zero() {
+    // C `round()` (`llvm.round`) is nearest, ties **away from zero** — distinct from `roundeven`
+    // (ties to even). QuickJS's `JS_ComputeMemoryUsage` hits it; it was the last QuickJS translate
+    // gap. The on-ramp synthesizes it boundary-safely as `|x-t|>=0.5 ? t+copysign(1,x) : t`. Checks:
+    // 2.5→3 and -2.5→-3 (ties away, *not* roundeven's 2/-2), 0.5→1, and the `0.5⁻` boundary
+    // `0x3FDFFFFFFFFFFFFF` = 0.49999999999999994 → 0 (the case where `trunc(x+0.5)` wrongly gives 1).
+    // Weighted `3*1000 + (-3)*100 + 1*10 + 0 = 2710`; interp == JIT.
+    let ll = "define i64 @main() {\n\
+        entry:\n  \
+        %a = call double @llvm.round.f64(double 2.5)\n  \
+        %b = call double @llvm.round.f64(double -2.5)\n  \
+        %c = call double @llvm.round.f64(double 0.5)\n  \
+        %d = call double @llvm.round.f64(double 0x3FDFFFFFFFFFFFFF)\n  \
+        %ia = fptosi double %a to i64\n  \
+        %ib = fptosi double %b to i64\n  \
+        %ic = fptosi double %c to i64\n  \
+        %id = fptosi double %d to i64\n  \
+        %t0 = mul i64 %ia, 1000\n  \
+        %t1 = mul i64 %ib, 100\n  \
+        %t2 = mul i64 %ic, 10\n  \
+        %s0 = add i64 %t0, %t1\n  \
+        %s1 = add i64 %t2, %id\n  \
+        %r = add i64 %s0, %s1\n  \
+        ret i64 %r\n}\n\
+        declare double @llvm.round.f64(double)";
+    let t = temen_llvm::translate_ll_str(ll).expect("translate llvm.round .ll");
+    temen_verify::verify_module(&t.module).expect("verify llvm.round");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = temen_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run llvm.round");
+    assert_eq!(
+        r,
+        vec![Value::I64(2710)],
+        "round: 2.5→3, -2.5→-3, 0.5→1, 0.5⁻→0 (ties away, boundary-safe)"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match temen_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0], 2710, "JIT llvm.round = 2710"),
+        other => panic!("JIT llvm.round: unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn vector_shift_per_lane_amount() {
+    // Per-lane (**non-constant-splat**) vector shifts — the shape real SSE/AVX SIMD emits (e.g.
+    // Postgres' `simd.h`). temen-ir's `VShift` takes one scalar count for all lanes, so the on-ramp
+    // scalarizes: shift each lane by its own amount and repack. Exercises 128-bit (`<4 x i32>`
+    // shl/lshr/ashr, `<2 x i64>` shl/lshr) and **wide** (`<8 x i32>` lshr/shl, 256-bit → the chunked
+    // i32x4 wide path). The seed + shift amounts are runtime (`volatile`), so clang can't constant-fold
+    // the shifts, and every result lane is folded into one `%u` (no wide-int printf). Byte-identical to
+    // native — the scalarized lanes must match the hardware vector shift.
+    let src = "#include <stdio.h>\n\
+        typedef unsigned int v4u __attribute__((vector_size(16)));\n\
+        typedef int v4i __attribute__((vector_size(16)));\n\
+        typedef unsigned long long v2u __attribute__((vector_size(16)));\n\
+        typedef unsigned int v8u __attribute__((vector_size(32)));\n\
+        volatile unsigned SEED = 7;\n\
+        int main(void){\n\
+          unsigned s = SEED;\n\
+          v4u a = {s, s*85u, s<<16, 0x80000000u|s}, shu = {s&3u, (s+1u)&7u, 3u, 2u};\n\
+          v4u rl = a << shu, rr = a >> shu;\n\
+          v4i sv = {-(int)s, 100, -1, 65536}, ra = sv >> (v4i){1, 2, 3, (int)(s&7u)};\n\
+          v2u b = {(unsigned long long)s, ((unsigned long long)s)<<32}, shb = {s&31u, 33u};\n\
+          v2u rb = b << shb, rb2 = b >> (v2u){1u, s&15u};\n\
+          v8u c = {s, 2u*s, s<<8, 0xFF00u^s, s|0x10000u, 5u*s, s>>1, 3u*s};\n\
+          v8u rc = c >> (v8u){3u,10u,s&7u,4u,1u,2u,s&15u,7u}, rc2 = c << (v8u){1u,2u,s&3u,4u,0u,1u,2u,3u};\n\
+          unsigned acc = 0;\n\
+          for (int i=0;i<4;i++){ acc = acc*131u + rl[i]; acc = acc*131u + rr[i]; acc = acc*131u + (unsigned)ra[i]; }\n\
+          for (int i=0;i<2;i++){ acc = acc*131u + (unsigned)rb[i] + (unsigned)(rb[i]>>32) + (unsigned)rb2[i]; }\n\
+          for (int i=0;i<8;i++){ acc = acc*131u + rc[i] + rc2[i]; }\n\
+          printf(\"%u\\n\", acc); return 0; }";
+    check_powerbox_vs_native("vshift_per_lane", src, b"");
+}
+
+#[test]
+fn tail_call_lowers_and_runs() {
+    // Local validation (no native `cc` needed): the `musttail` mutual recursion translates with
+    // `return_call` terminators, verifies, and runs to completion at 2,000,000 depth — which only
+    // works because the frame is replaced, not nested (a plain-`call` lowering would recurse 2M deep
+    // and overflow the native stack). `even(2e6)=1`, `odd(1999999)=even(1999998)=1` ⇒ "1 1\n".
+    let src = "#include <stdio.h>\n\
+               __attribute__((noinline)) static int odd(int n);\n\
+               __attribute__((noinline)) static int even(int n) {\n\
+                   if (n == 0) return 1;\n\
+                   __attribute__((musttail)) return odd(n - 1);\n\
+               }\n\
+               __attribute__((noinline)) static int odd(int n) {\n\
+                   if (n == 0) return 0;\n\
+                   __attribute__((musttail)) return even(n - 1);\n\
+               }\n\
+               int main(void) {\n\
+                   printf(\"%d %d\\n\", even(2000000), odd(1999999));\n\
+                   return 0;\n\
+               }";
+    let Some(bc) = compile_to_ll("tail_lower", src) else {
+        return; // clang unavailable
+    };
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
+    let n_tail = t
+        .module
+        .funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .filter(|b| {
+            matches!(
+                b.term,
+                temen_ir::Terminator::ReturnCall { .. }
+                    | temen_ir::Terminator::ReturnCallIndirect { .. }
+            )
+        })
+        .count();
+    assert!(
+        n_tail >= 2,
+        "expected ≥2 return_call terminators (even/odd tail calls), got {n_tail}"
+    );
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
+    temen_verify::verify_module(&module).expect("verify translated IR"); // checks return_call shape
+    let run = temen_run::run_powerbox(&module, b"").expect("powerbox run"); // 2M-deep, constant stack
+    assert_eq!(run.stdout, b"1 1\n", "mutual tail recursion result");
+}
+
+#[test]
+fn printf_float_scientific() {
+    // `%e`/`%E` via the bignum Dragon4 formatter (`__temen_dtoa_sci`) — exact, correctly-rounded across
+    // the whole double range (no magnitude cap). Covers default/explicit precision, the exponent sign
+    // and ≥2-digit padding, very large/small magnitudes (1e300, 1e-300 — impossible for the 128-bit
+    // `%f` path), uppercase `%E`, sign flags, width + justification, a carry-on-round, and inf/nan.
+    // Byte-for-byte stdout vs native.
+    let src = "#include <stdio.h>\n#include <math.h>\n\
+               int main(void){ \
+                 printf(\"%e\\n\", 3.14); \
+                 printf(\"%.2e %.0e\\n\", 12345.678, 9.6); \
+                 printf(\"%e %e\\n\", 1e300, 1e-300); \
+                 printf(\"%E\\n\", 6.022e23); \
+                 printf(\"%.3e\\n\", 9.9999); \
+                 printf(\"%+.1e % .1e\\n\", 1.5, 2.5); \
+                 printf(\"[%14.3e][%-14.3e]\\n\", 2.5, 2.5); \
+                 printf(\"%e %e\\n\", 0.0, -0.0); \
+                 volatile double inf = INFINITY, nan = NAN; \
+                 printf(\"%e %e %E\\n\", inf, -inf, nan); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_e", src, b"");
+}
+
+#[test]
+fn printf_float_general() {
+    // `%g`/`%G` via the bignum formatter (`__temen_dtoa_gen`): rounds to P significant digits, picks
+    // `%e` vs `%f` by exponent (`E < -4 || E >= P`), and strips trailing zeros. Covers both layout
+    // branches, the e/f boundary with a carry (999999.9 → 1e+06), trailing-zero stripping (100000,
+    // 42.0), tiny/huge magnitudes, `%G`, precision 0 (⇒ 1 sig digit), sign + width, and inf/nan.
+    // Byte-for-byte vs native.
+    let src = "#include <stdio.h>\n#include <math.h>\n\
+               int main(void){ \
+                 printf(\"%g %g\\n\", 3.14159, 100000.0); \
+                 printf(\"%g %g\\n\", 1000000.0, 0.0001); \
+                 printf(\"%g %g\\n\", 0.00001, 1.0/3.0); \
+                 printf(\"%.10g\\n\", 1.0/3.0); \
+                 printf(\"%g %g\\n\", 999999.9, 42.0); \
+                 printf(\"%g %g\\n\", 1e300, 1e-300); \
+                 printf(\"%G %.0g\\n\", 6.022e23, 1234.0); \
+                 printf(\"[%12g][%-12g]\\n\", -2.5, -2.5); \
+                 printf(\"%g %g\\n\", 0.0, -0.0); \
+                 volatile double inf = INFINITY, nan = NAN; \
+                 printf(\"%g %g %G\\n\", inf, -inf, nan); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_g", src, b"");
+}
+
+#[test]
+fn printf_float_fixed_bignum() {
+    // `%f` now goes through the exact bignum formatter (`__temen_dtoa_fix_big`), so large magnitudes
+    // that overflowed the old 128-bit path — and used to trap — format correctly, as does `%F` and
+    // higher precision. The integer parts here have 30–300+ digits. Byte-for-byte vs native.
+    let src = "#include <stdio.h>\n\
+               int main(void){ \
+                 printf(\"%.2f\\n\", 1e30); \
+                 printf(\"%.0f\\n\", 1e60); \
+                 printf(\"%.1f\\n\", 1.23456789e40); \
+                 printf(\"%f\\n\", 1e300); \
+                 printf(\"%.20f\\n\", 0.1); \
+                 printf(\"%F\\n\", 12345.678); \
+                 printf(\"%.40f\\n\", 1.0/3.0); \
+                 printf(\"[%50.2f]\\n\", 1e20); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_f_big", src, b"");
+}
+
+#[test]
+fn printf_float_zero_pad() {
+    // The float `0` flag (previously fail-closed): pad with '0' between the sign and the digits,
+    // right-justified only. Covers all three kinds (`%f`/`%e`/`%g`), signed values (the sign must
+    // stay at column 0 with zeros after it), the `+`/space sign flags under zero-fill, left-justify
+    // (C ignores `0` with `-`), a width narrower than the content (no padding), precision combos,
+    // inf/nan (C pads those with *spaces*, not zeros), and — the flag-bit-aliasing regression —
+    // `%010g` of 42.0, where zero-fill must NOT suppress `%g`'s trailing-zero strip (the `0` and
+    // `#` flag bits are distinct). Byte-for-byte stdout vs native.
+    let src = "#include <stdio.h>\n#include <math.h>\n\
+               int main(void){ \
+                 printf(\"[%08.3f]\\n\", 3.5); \
+                 printf(\"[%08.3f]\\n\", -3.5); \
+                 printf(\"[%+09.2f]\\n\", 42.0); \
+                 printf(\"[% 09.2f]\\n\", 42.0); \
+                 printf(\"[%-08.3f]\\n\", -3.5); \
+                 printf(\"[%03.2f]\\n\", 12345.678); \
+                 printf(\"[%015.4e]\\n\", -1234.5678); \
+                 printf(\"[%012.2e]\\n\", 9.6); \
+                 printf(\"[%010g]\\n\", -3.14159); \
+                 printf(\"[%010.3g]\\n\", 12345.678); \
+                 printf(\"[%010g]\\n\", 42.0); \
+                 printf(\"[%020f]\\n\", 1e10); \
+                 volatile double inf = INFINITY, nan = NAN; \
+                 printf(\"[%08f][%08f][%08e][%08g]\\n\", inf, -inf, nan, inf); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_zero_pad", src, b"");
+}
+
+#[test]
+fn printf_float_alt_form() {
+    // The float `#` flag (previously fail-closed): keep the decimal point at precision 0
+    // (`%#.0f`/`%#.0e`) and keep trailing zeros + the point for `%#g` (C alternate form). Covers
+    // both `%g` layout branches (f-form and e-form), a `%#g` whose fraction is entirely zeros
+    // (100000 → \"100000.\"), no-op `#` on a value that already has a point, and `#` combined with
+    // the `0` and sign flags. Byte-for-byte stdout vs native.
+    let src = "#include <stdio.h>\n#include <math.h>\n\
+               int main(void){ \
+                 printf(\"[%#.0f][%.0f]\\n\", 6.0, 6.0); \
+                 printf(\"[%#.0f]\\n\", -5.5); \
+                 printf(\"[%#.0e][%.0e]\\n\", 9.6, 9.6); \
+                 printf(\"[%#g][%g]\\n\", 42.0, 42.0); \
+                 printf(\"[%#g]\\n\", 100000.0); \
+                 printf(\"[%#g][%#g]\\n\", 1e300, 0.0001); \
+                 printf(\"[%#.1g][%#.10g]\\n\", 1e300, 1.0/3.0); \
+                 printf(\"[%#.3f][%#e]\\n\", 3.5, 3.14); \
+                 printf(\"[%#010.0f][%+#.0f]\\n\", -6.0, 6.0); \
+                 printf(\"[%#g][%#G]\\n\", 0.0, -0.0); \
+                 volatile double inf = INFINITY, nan = NAN; \
+                 printf(\"[%#08.0f][%#g]\\n\", inf, nan); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_alt", src, b"");
+}
+
+#[test]
+fn printf_float_fixed() {
+    // `%f` via the synthesized exact-decimal helper (`__temen_dtoa_fixed`, fixed 128-bit integer
+    // arithmetic — no host float formatting). Covers: default precision (6), explicit precision,
+    // round-half-to-even ties (2.5→2, 3.5→4), a non-exactly-representable decimal (0.1), field width
+    // with right/left justification, a negative value, the `+`/space sign flags, zero, and a value
+    // with a multi-digit integer part. Byte-for-byte stdout compared to the native clang build.
+    let src = "#include <stdio.h>\n\
+               int main(void){ \
+                 printf(\"%f\\n\", 3.14); \
+                 printf(\"%.2f\\n\", 3.14159); \
+                 printf(\"%.0f %.0f\\n\", 2.5, 3.5); \
+                 printf(\"%.3f\\n\", 0.1); \
+                 printf(\"[%8.2f][%-8.2f]\\n\", 3.5, 3.5); \
+                 printf(\"%f\\n\", -2.75); \
+                 printf(\"%+.1f % .1f\\n\", 1.5, 1.5); \
+                 printf(\"%.2f %.2f\\n\", 0.0, 100.0); \
+                 printf(\"%.3f\\n\", 12345.6789); \
+                 printf(\"%.10f\\n\", 0.5); \
+                 printf(\"%.1f\\n\", 9007199254740992.0); \
+                 printf(\"%.0f %.0f %.0f\\n\", 0.5, 1.5, 4.5); \
+                 printf(\"%.4f\\n\", 2.0 / 3.0); \
+                 printf(\"%.2f\\n\", -0.0); \
+                 printf(\"%.2f\\n\", 1e30); \
+                 printf(\"%.1f\\n\", 18014398509481984.0); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_f", src, b"");
+}
+
+#[test]
+fn printf_float_nonfinite() {
+    // `%f` of the non-finite doubles: `__temen_dtoa_fixed` writes "inf"/"nan" (lowercase, with the sign
+    // byte / `+`/space flags) just like glibc, rather than trapping. `volatile` keeps clang from
+    // constant-folding the printf away. stdout compared byte-for-byte to native.
+    let src = "#include <stdio.h>\n#include <math.h>\n\
+               int main(void){ \
+                 volatile double inf = INFINITY, nan = NAN, big = 1e308; \
+                 printf(\"%f %f\\n\", inf, -inf); \
+                 printf(\"%+f % f\\n\", inf, inf); \
+                 printf(\"%f\\n\", nan); \
+                 printf(\"[%8.2f][%-8.2f]\\n\", inf, inf); \
+                 printf(\"%f\\n\", big * 10.0); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_f_nonfinite", src, b"");
+}
+
+#[test]
+fn realloc_grow_preserves() {
+    // `realloc` must preserve the old contents across a grow (the header gives the copy length). Push
+    // 20 ints into a doubling buffer, then sum — exit code compared to native.
+    let src = "#include <stdlib.h>\n\
+               int run(int seed){ int *a = (int*)malloc(2 * sizeof(int)); int cap = 2, n = 0; \
+               for (int i = 0; i < 20; i++) { if (n == cap) { cap *= 2; a = (int*)realloc(a, (unsigned long)cap * sizeof(int)); } a[n++] = i * seed; } \
+               long s = 0; for (int i = 0; i < n; i++) s += a[i]; return (int)(s & 0xff); } \
+               int main(void){ return run(3); }";
+    check_powerbox_vs_native("realloc_grow", src, b"");
+}
+
+#[test]
+fn printf_unsigned_formats() {
+    // The `printf` engine directly: unsigned decimal/hex with field width + zero/space padding, a
+    // 64-bit (`%lx`) arg, `%c`, and `%%` — all in one mixed format (so clang keeps it as `printf`,
+    // not a `putchar`/`puts` special-case). stdout + exit compared to the native build.
+    let src = "#include <stdio.h>\n\
+               int main(void){ \
+                 printf(\"u=%u x=%x p=%05x w=%8x c=%c pct=%%\\n\", 42u, 255u, 7u, 0xabcu, 'Z'); \
+                 printf(\"%lx %02x\\n\", 0xdeadbeefcafeUL, 5u); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_u", src, b"");
+}
+
+#[test]
+fn main_argc_argv() {
+    // `int main(int argc, char** argv)`: the synthesized argv-parsing `_start` reads the §3e args
+    // buffer, builds `argv[]` (with the `argv[argc] == NULL` terminator), and passes `argc`/`argv`
+    // to `main` — checked byte-for-byte vs native with a controlled `argv`. Covers iterating argv,
+    // a NULL-terminator walk (`while (argv[i])`), and `argc` flowing to the exit code.
+    let src = "#include <stdio.h>\n\
+               int main(int argc, char** argv){ \
+                 printf(\"argc=%d\\n\", argc); \
+                 for (int i = 0; argv[i]; i++) printf(\"argv[%d]=%s\\n\", i, argv[i]); \
+                 return argc; }";
+    // The common case (program name only), then a multi-arg vector.
+    check_powerbox_vs_native_args("argv1", src, &["prog"], &[]);
+    check_powerbox_vs_native_args("argvN", src, &["myprog", "hello", "world", "42"], &[]);
+}
+
+#[test]
+fn main_argc_argv_envp() {
+    // `int main(int argc, char** argv, char** envp)`: the synthesized `_start` parses the §3e blob's
+    // `envc` env strings (packed right after the argv strings) into a second NULL-terminated `char**`
+    // parked just above `argv[]`, and passes it as the third parameter — checked byte-for-byte vs
+    // native with a controlled, `env_clear`ed environment. Covers walking `envp` to its NULL
+    // terminator and `argv`/`envp` coexisting at the entry stack base.
+    let src = "#include <stdio.h>\n\
+               int main(int argc, char** argv, char** envp){ \
+                 printf(\"argc=%d\\n\", argc); \
+                 for (int i = 0; argv[i]; i++) printf(\"argv[%d]=%s\\n\", i, argv[i]); \
+                 int n = 0; for (char** e = envp; *e; e++) { printf(\"env[%d]=%s\\n\", n++, *e); } \
+                 return n; }";
+    // Empty env (just the NULL terminator), then a multi-entry environment. The entries are passed in
+    // sorted-by-key order because `std::process::Command` stores its env in a `BTreeMap`, so native's
+    // child `environ` is key-sorted; the Temen blob preserves the order we hand it, so we match by
+    // pre-sorting (`EMPTY` < `FOO` < `PATH`).
+    check_powerbox_vs_native_args("envp0", src, &["prog"], &[]);
+    check_powerbox_vs_native_args(
+        "envpN",
+        src,
+        &["prog", "a"],
+        &["EMPTY=", "FOO=bar", "PATH=/x:/y"],
+    );
+}
+
+#[test]
+fn getenv_lookup() {
+    // `getenv` on a `main(void)` program (so it exercises the synthesized `__temen_getenv` decoupled
+    // from any argv parsing): it scans the §3e blob's env strings for `KEY=`, returning the value
+    // pointer or NULL. Covers a hit, a miss, and the prefix guard (`"F"` must not match `"FOO=..."`),
+    // checked byte-for-byte vs native `getenv` with a controlled, `env_clear`ed environment.
+    let src = "#include <stdio.h>\n#include <stdlib.h>\n\
+               int main(void){ \
+                 char* a = getenv(\"FOO\"); char* b = getenv(\"PATH\"); \
+                 char* c = getenv(\"MISSING\"); char* d = getenv(\"F\"); \
+                 printf(\"FOO=%s\\n\", a ? a : \"(null)\"); \
+                 printf(\"PATH=%s\\n\", b ? b : \"(null)\"); \
+                 printf(\"MISSING=%s\\n\", c ? c : \"(null)\"); \
+                 printf(\"F=%s\\n\", d ? d : \"(null)\"); \
+                 return 0; }";
+    check_powerbox_vs_native_args("getenv1", src, &["prog"], &["FOO=bar", "PATH=/x:/y"]);
+    // No environment at all: every lookup must be NULL (the blob reads envc == 0).
+    check_powerbox_vs_native_args("getenv0", src, &["prog"], &[]);
+}
+
+#[test]
+fn printf_precision_formats() {
+    // Integer min-digit precision (`%.Nd`/`%.Nx`, incl. `%.0` of zero → no digits, and precision
+    // overriding the `0` flag → space field padding) and string truncating precision (`%.Ns`),
+    // checked byte-for-byte vs native `printf`. `s` is a non-literal pointer (runtime strlen).
+    let src = "#include <stdio.h>\n\
+               int main(void){ \
+                 const char* s = \"hello world\"; \
+                 printf(\"|%.4d|%.4d|%.0d|%8.4d|%-8.4d|\\n\", 42, -42, 0, 42, 42); \
+                 printf(\"|%.4x|%#.4x|%08.4d|\\n\", 0xabu, 0xabu, 42); \
+                 printf(\"|%.5s|%.20s|%8.3s|\\n\", s, s, s); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_prec", src, b"");
+}
+
+#[test]
+fn printf_flag_formats() {
+    // The full flag matrix on integer conversions, checked byte-for-byte vs native `printf`:
+    //   `-` left-justify, `+`/space forced sign, `0` zero-pad (incl. the previously-fail-closed
+    //   zero-padded signed), and `#` (the `0x` hex prefix, suppressed for zero).
+    let src = "#include <stdio.h>\n\
+               int main(void){ \
+                 printf(\"|%-6d|%-6d|\\n\", 42, -42); \
+                 printf(\"|%+d|%+d|% d|% d|\\n\", 42, -42, 42, -42); \
+                 printf(\"|%05d|%05d|%+05d|\\n\", 42, -42, 42); \
+                 printf(\"|%#x|%#x|%#08x|\\n\", 255u, 0u, 0xabcu); \
+                 printf(\"|%-8x|%08x|\\n\", 0xbeefu, 0xbeefu); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_flags", src, b"");
+}
+
+#[test]
+fn printf_string_formats() {
+    // `%s` (runtime `strlen`) plain and right-justified in a field width, mixed with `%d`/`%c` so
+    // clang keeps it a real varargs `printf` (not a `puts` rewrite). A pointer that is *not* a string
+    // literal (the `b+1` tail) exercises the runtime strlen, not a constant length. stdout + exit vs
+    // native.
+    let src = "#include <stdio.h>\n\
+               int main(void){ \
+                 const char* a = \"hi\"; const char* b = \"world\"; \
+                 printf(\"[%s] [%8s] n=%d\\n\", a, b, 3); \
+                 printf(\"%s|%s|%c\\n\", b + 1, a, '!'); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_s", src, b"");
+}
+
+#[test]
+fn vec2_float_struct() {
+    // A `{float,float}` struct passed/returned by value — clang coerces it to `<2 x float>` and does
+    // `extractelement`/`insertelement`/lane-wise `fadd`. Scalarized to a packed i64. addv({1.5,2.5},
+    // {7,0.5}) = {8.5,3.0} → 8.5*10 + 3 = 88.
+    let src = "struct V2 { float x, y; }; struct V2 addv(struct V2 a, struct V2 b); \
+               int run(int n){ struct V2 a = {1.5f, 2.5f}; struct V2 b = {(float)n, 0.5f}; \
+               struct V2 c = addv(a, b); return (int)(c.x * 10.0f + c.y); } \
+               struct V2 addv(struct V2 a, struct V2 b){ struct V2 r = {a.x + b.x, a.y + b.y}; return r; } \
+               int main(void){ return run(7); }";
+    check_vs_native("vec2f", src, 7);
+}
+
+#[test]
+fn demo_tinfl_vs_native() {
+    // miniz's tinfl DEFLATE/zlib inflate engine: a deeply nested coroutine-macro state machine with
+    // Huffman fast/slow lookup tables (`mz_int16`) and a 32 KiB LZ77 dictionary. Inflates an embedded
+    // zlib stream and writes it out — byte-identical to native. (Regression for the narrow-signed
+    // `icmp` fix: the slow Huffman walk tests a sign-extended `i16` table entry `< 0`.)
+    check_demo_vs_native("tinfl", "tinfl/tinfl_demo.c", b"");
+}
+
+#[test]
+fn narrow_signed_compare() {
+    // §3b narrow-int hazard: a *signed* `i16`/`i8` value loaded zero-extended must be sign-extended
+    // before a signed `icmp` (else `< 0` is always false). Sum the negative entries of a signed-short
+    // table — wrong (0) without the fix. Compared to native `cc`.
+    let src = "int run(int n){ static const short t[6] = {-1, -100, 5, -32768, 32767, -7}; \
+               int s = 0; for (int k = 0; k < 6; k++) if (t[k] < 0) s += t[k]; \
+               return (s ^ n) & 0xff; } \
+               int main(void){ return run(0); }";
+    check_vs_native("narrow_signed_cmp", src, 0);
+}
+
+#[test]
+fn multi_value_struct_return() {
+    // A small by-value struct returned in two registers — clang coerces it to a `{ i64, i64 }`
+    // return (`insertvalue`/`ret`) the caller destructures with `extractvalue`. Exercises the §3a
+    // multi-result path: `mk` returns two values, `run` reads both. mk(7,14) → 7+14 = 21.
+    // `run` is defined first (the unit at index 0 the harness invokes); `mk` is declared then defined
+    // after, so it stays a real out-of-line multi-result call.
+    let src = "struct Pair { long a; long b; }; \
+               struct Pair mk(long a, long b); \
+               int run(int x){ struct Pair p = mk(x, (long)x * 2); return (int)(p.a + p.b); } \
+               __attribute__((noinline)) struct Pair mk(long a, long b){ struct Pair p = {a, b}; return p; } \
+               int main(void){ return run(7); }";
+    check_vs_native("multival", src, 7);
+}
+
+#[test]
+fn unsupported_is_fail_closed() {
+    // `long double` is `x86_fp80` on x86-64 — outside the f32/f64 scalar subset (`val_type` accepts
+    // only `FPType::{Single,Double}`). It must be a clean `Unsupported`, never a silent
+    // mis-translation (LLVM.md §2/§8, the fail-closed chokepoint). (i128 div/rem, the prior subject
+    // here, is now supported via the `__temen_udivmod128` helper — see the `i128_*` tests.)
+    let Some(bc) = compile_to_ll(
+        "fp80add",
+        "long double f(long double a, long double b){ return a + b; }",
+    ) else {
+        return;
+    };
+    match temen_llvm::translate_ll_path(&bc) {
+        Err(temen_llvm::Error::Unsupported(_)) => {}
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+// ============================================================================================
+// `<temen.h>` low-level builtins (P0+P1+Memory): the Temen capability/concurrency/GC surface the
+// LLVM on-ramp lowers to the matching Temen IR ops or `Memory` capability calls. These mirror the
+// chibicc oracle (`frontend/chibicc/codegen_ir.c`), so a guest language emitting LLVM bitcode
+// reaches fibers, threads, atomics, the futex, conservative GC roots, direct window memory
+// management, and capability reflection — the JACL GC + scheduler primitives.
+// ============================================================================================
+
+/// Translate `src` and return its verified module + entry-SP, or `None` if clang is unavailable.
+fn translate_verified(name: &str, src: &str) -> Option<(temen_ir::Module, u64)> {
+    let bc = compile_to_ll(name, src)?;
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
+    temen_verify::verify_module(&t.module).expect("verify translated IR");
+    Some((t.module, t.entry_sp))
+}
+
+/// Run the **first defined function** (index 0 — the unit under test, since no powerbox is
+/// synthesized for a pure-compute program) on the reference interpreter, the universal oracle for
+/// fibers/threads/atomics/GC (the JIT bails `Unsupported` on fibers/`cap.self`, like the chibicc
+/// tests). Returns the result values, or `None` if clang is unavailable.
+fn run_interp(name: &str, src: &str, args: &[Value]) -> Option<Vec<Value>> {
+    let (m, entry_sp) = translate_verified(name, src)?;
+    let mut full = vec![Value::I64(entry_sp as i64)];
+    full.extend_from_slice(args);
+    let mut fuel = 200_000_000u64;
+    Some(temen_interp::run(&m, 0, &full, &mut fuel).expect("interp run"))
+}
+
+/// Does any function's body contain an instruction matching `pred`? (Structural lowering check.)
+fn module_has_inst(m: &temen_ir::Module, pred: impl Fn(&temen_ir::Inst) -> bool) -> bool {
+    m.funcs
+        .iter()
+        .flat_map(|f| f.blocks.iter())
+        .flat_map(|b| b.insts.iter())
+        .any(pred)
+}
+
+// ---- §3e/§4 Memory capability: `__vm_map` / `__vm_page_size` (end-to-end on the JIT) ----------
+
+/// The guest **manages its own window** directly from C through `<temen.h>`: `__vm_page_size()` (Memory
+/// op 3) and `__vm_map(off,len,prot)` (op 0) grow the reserved tail, then a store/load round-trips
+/// through the freshly committed page. Run through the real powerbox (JIT) — which grants the
+/// `Memory` handle for the 4-param `_start` the on-ramp now synthesizes when a Memory builtin is used
+/// — proving the handle grant, the `CallImport` resolution, and the lowering all compose. The byte it
+/// writes is the success marker (`'Y'`), asserted against the captured stdout (`__vm_*` symbols don't
+/// exist in a native build, so this lane has no native oracle — the marker is the contract).
+#[test]
+fn vm_memory_map_and_page_size() {
+    let src = r#"
+long __vm_page_size(void);
+long __vm_map(long off, long len, int prot);
+long write(int fd, const void *buf, long n);
+int main(void) {
+  long ps = __vm_page_size();
+  volatile long vbase = 268435456;                /* 256 MiB — deep in the reserved tail */
+  long base = vbase;                              /* volatile defeats clang's constant inttoptr fold */
+  if (__vm_map(base, 4096, 3) != 0) { char e='E'; write(1,&e,1); return 1; }
+  int *p = (int *)base;
+  p[0] = 43981;                                   /* 0xABCD */
+  p[1] = p[0] + 1;
+  char ok = (ps >= 4096 && (ps & (ps - 1)) == 0 && p[1] == 43982) ? 'Y' : 'N';
+  write(1, &ok, 1);
+  return 0;
+}
+"#;
+    let Some(bc) = compile_to_ll("vm_mem", src) else {
+        return;
+    };
+    let m = temen_llvm::translate_ll_path(&bc)
+        .expect("translate bitcode")
+        .module;
+    // Structural: the Memory ops became `CallImport`s (resolved to the Memory cap at load). The raw
+    // module carries unresolved imports, so it is resolved *before* `verify` (a `CallImport` reaching
+    // the verifier is a fail-closed error — resolution is mandatory).
+    let import_names: Vec<&str> = m.imports.iter().map(|i| i.name.as_str()).collect();
+    assert!(
+        import_names.contains(&"vm_map") && import_names.contains(&"vm_page_size"),
+        "expected vm_map + vm_page_size imports, got {import_names:?}"
+    );
+    assert!(
+        temen_run::is_named_powerbox_entry(&m),
+        "a Memory-builtin program must produce a powerbox entry (granting the Memory handle)"
+    );
+    let module = m; // phase 3: the manifest binds at instantiation - no rewrite
+    temen_verify::verify_module(&module).expect("verify resolved IR");
+    let run = temen_run::run_powerbox(&module, b"").expect("powerbox run");
+    assert_eq!(
+        run.stdout, b"Y",
+        "memory round-trip marker (got {:?})",
+        run.stdout
+    );
+}
+
+// ---- §12 fibers: `__vm_fiber_new` / `resume` / `suspend` → `cont.new` / `resume` / `suspend` ---
+
+/// A fiber generator yields twice then returns, driven from C exactly like the chibicc oracle
+/// (`c_fiber_generator_yields_then_returns`). The entry is the first defined function (index 0); the
+/// fiber body `counter` is reached as a funcref through `cont.new`. Interpreter-only (fibers are an
+/// interp op). 101 + 102 + 103 = 306.
+#[test]
+#[cfg(unix)]
+fn vm_fibers_generator() {
+    let src = r#"
+long __vm_fiber_new(long (*f)(long), void *stack);
+long __vm_fiber_resume(long k, long arg, int *done);
+long __vm_fiber_suspend(long value);
+long counter(long start);
+static char stack0[8192];
+int driver(void) {
+  long k = __vm_fiber_new(counter, stack0); // i64 fiber handle (16-bit slot + 48-bit generation)
+  int done = 0;
+  long sum = 0;
+  long v = __vm_fiber_resume(k, 100, &done);
+  while (!done) { sum += v; v = __vm_fiber_resume(k, 0, &done); }
+  sum += v;
+  return (int)sum;
+}
+long counter(long start) {
+  __vm_fiber_suspend(start + 1);
+  __vm_fiber_suspend(start + 2);
+  return start + 3;
+}
+"#;
+    if let Some(r) = run_interp("vm_fibers", src, &[]) {
+        assert_eq!(r, vec![Value::I32(306)]);
+    }
+}
+
+// ---- §12 atomics: `__vm_atomic_*` → the `iN.atomic.*` ops (single-threaded value semantics) ----
+
+/// The atomic ops have plain value semantics when single-threaded, so they are checkable on **both**
+/// backends (the JIT lowers them to hardware atomics). Exercises 64- and 32-bit `add`/`load`/`store`
+/// and the 32-bit `cmpxchg`: x starts 5, +3 → 8, store 100, +1 → 101; a CAS 101→200 succeeds; final
+/// load = 200. Returns 200.
+#[test]
+fn vm_atomics_single_threaded() {
+    let src = r#"
+long __vm_atomic_add(void *p, long v);
+long __vm_atomic_load(void *p);
+void __vm_atomic_store(void *p, long v);
+int  __vm_atomic_add32(void *p, int v);
+int  __vm_atomic_cas32(void *p, int expected, int desired);
+int  __vm_atomic_load32(void *p);
+int f(void) {
+  long x = 5;
+  __vm_atomic_add(&x, 3);                 /* 8 */
+  __vm_atomic_store(&x, 100);             /* 100 */
+  if (__vm_atomic_load(&x) != 100) return -1;
+  int y = (int)x;
+  __vm_atomic_add32(&y, 1);               /* 101 */
+  int old = __vm_atomic_cas32(&y, 101, 200);  /* old=101, y=200 */
+  if (old != 101) return -2;
+  return __vm_atomic_load32(&y);          /* 200 */
+}
+"#;
+    check("vm_atomics", src, &[], &[Value::I32(200)]);
+}
+
+// ---- §12 futex: `__vm_wait32` / `__vm_notify` → `i32.atomic.wait` / `atomic.notify` ------------
+
+/// The futex primitives, exercised single-threaded so they return deterministically without
+/// blocking: `__vm_wait32(p, expected, …)` returns `1` ("not-equal") when `*p != expected`, and
+/// `__vm_notify(p, n)` returns `0` when no vCPU is parked. Interpreter-only (the JIT futex is
+/// platform/scheduler-gated). Returns 1*10 + 0 = 10.
+#[test]
+#[cfg(unix)]
+fn vm_futex_wait_notify() {
+    let src = r#"
+int __vm_wait32(void *p, int expected, long timeout_ns);
+int __vm_notify(void *p, int count);
+int f(void) {
+  int word = 7;
+  int waited = __vm_wait32(&word, 9, 0);  /* 7 != 9 → returns 1, no block */
+  int woke = __vm_notify(&word, 1);       /* no waiters → 0 */
+  return waited * 10 + woke;
+}
+"#;
+    if let Some(r) = run_interp("vm_futex", src, &[]) {
+        assert_eq!(r, vec![Value::I32(10)]);
+    }
+}
+
+// ---- §12 threads + atomics: `__vm_thread_spawn` / `join` → `thread.spawn` / `thread.join` -------
+
+/// Four worker vCPUs (`thread.spawn`, with a static funcidx) each atomically bump a shared global
+/// 500 times; the entry joins them and reads the total — `thread.join` and the cross-thread atomic
+/// `fetch-add` end to end on the interpreter's M:N executor (the chibicc `c_threads_atomic_counter`
+/// headline, via the LLVM on-ramp). 4 × 500 = 2000.
+#[test]
+#[cfg(unix)]
+fn vm_threads_atomic_counter() {
+    let src = r#"
+long __vm_atomic_add(void *p, long v);
+long __vm_atomic_load(void *p);
+int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);
+long __vm_thread_join(int h);
+long counter = 0;
+long worker(long arg);
+int driver(void) {
+  int a = __vm_thread_spawn(worker, (void *)0, 500);
+  int b = __vm_thread_spawn(worker, (void *)0, 500);
+  int c = __vm_thread_spawn(worker, (void *)0, 500);
+  int d = __vm_thread_spawn(worker, (void *)0, 500);
+  __vm_thread_join(a);
+  __vm_thread_join(b);
+  __vm_thread_join(c);
+  __vm_thread_join(d);
+  return (int)__vm_atomic_load(&counter);
+}
+long worker(long arg) {
+  for (long i = 0; i < arg; i++) __vm_atomic_add(&counter, 1);
+  return 0;
+}
+"#;
+    if let Some(r) = run_interp("vm_threads", src, &[]) {
+        assert_eq!(r, vec![Value::I32(2000)]);
+    }
+}
+
+// ---- §GC conservative roots: `__vm_gc_roots` → `gc.roots` --------------------------------------
+
+/// Conservative root enumeration scans the calling computation's live frames for candidate window
+/// pointers in `[lo, hi)`, writing them into a buffer and returning the total found. The precise set
+/// is a backend-specific over-approximation (GC.md §3.2), so this asserts the *contract*: the op
+/// lowers to `Inst::GcRoots`, runs without trapping, and returns a count within `[0, cap]` (here it
+/// scans the whole window, so any live in-range root the frame holds is counted). Interpreter-only.
+#[test]
+#[cfg(unix)]
+fn vm_gc_roots_smoke() {
+    let src = r#"
+long __vm_gc_roots(long heap_lo, long heap_hi, long mask, void *buf, long cap);
+static long out[64];
+int f(void) {
+  /* a live, in-range candidate pointer (into `out` itself) the conservative scan may see */
+  volatile long *root = out;
+  /* mask = ~0 is the untagged (identity) case: every scanned word is tested as-is. */
+  long n = __vm_gc_roots(0, 1 << 20, ~0L, out, 64);
+  (void)root;
+  /* `n` is the total candidates found (may exceed cap=64; a tiny frame stays well under 1024) —
+     the assertion is that the op ran, returned a sane non-negative count, and didn't trap. */
+  return (n >= 0 && n <= 1024) ? 1 : 0;
+}
+"#;
+    let Some((m, _)) = translate_verified("vm_gc", src) else {
+        return;
+    };
+    assert!(
+        module_has_inst(&m, |i| matches!(i, temen_ir::Inst::GcRoots { .. })),
+        "expected a gc.roots instruction"
+    );
+    if let Some(r) = run_interp("vm_gc", src, &[]) {
+        assert_eq!(r, vec![Value::I32(1)], "gc.roots count out of [0, cap]");
+    }
+}
+
+// ---- §12 per-vCPU TLS register: `__vm_vcpu_tls_get` / `__vm_vcpu_tls_set` -----------------------
+
+/// The per-vCPU TLS register lowers from the `<temen.h>` builtins and round-trips a written value:
+/// `__vm_vcpu_tls_set(99)` then `__vm_vcpu_tls_get()` returns 99 (the root vCPU is seeded to 0, then
+/// overwritten). Asserts the ops lowered and ran on the interpreter.
+#[test]
+#[cfg(unix)]
+fn vm_vcpu_tls_round_trip() {
+    let src = r#"
+long __vm_vcpu_tls_get(void);
+void __vm_vcpu_tls_set(long x);
+int f(void) {
+  __vm_vcpu_tls_set(99);
+  return (int)__vm_vcpu_tls_get();   /* the value we just set */
+}
+"#;
+    let Some((m, _)) = translate_verified("vm_vcpu_tls", src) else {
+        return;
+    };
+    assert!(
+        module_has_inst(&m, |i| matches!(i, temen_ir::Inst::VcpuTlsGet))
+            && module_has_inst(&m, |i| matches!(i, temen_ir::Inst::VcpuTlsSet { .. })),
+        "expected vcpu.tls.get + vcpu.tls.set instructions"
+    );
+    if let Some(r) = run_interp("vm_vcpu_tls", src, &[]) {
+        assert_eq!(r, vec![Value::I32(99)], "vcpu.tls round-trip");
+    }
+}
+
+// ---- Separate-artifact on-ramp: the export map + the `temen-llvm-translate` CLI ------------------
+
+/// A hand-written caller that resolves `twice` **by name**, used to prove the export map links:
+/// `temen_ir::link` rewrites the `call.import` to a direct cross-unit call. Every translated function
+/// takes the §3d data-stack pointer `sp` as its first parameter, so `twice` is `(i64 sp, i64 x) ->
+/// (i64)`; `twice` has no `alloca`s, so any `sp` works — the caller passes `0`. (`v1` is the unused
+/// capability-handle operand `call.import` carries; resolving to a direct call drops it.)
+#[cfg(unix)]
+const TWICE_CALLER: &str = "\
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 0
+  v2 = i64.const 0
+  v3 = call.sym \"twice\" (i64, i64) -> (i64) v1 (v2, v0)
+  return v3
+  }
+}
+";
+
+/// Link a translated runtime (its module + export map) against [`TWICE_CALLER`] and assert the
+/// cross-unit `twice(21) == 42` call resolves on the interpreter — the shared core of both the
+/// in-process ([`exports_feed_a_link_unit`]) and CLI ([`translate_cli_emits_module_and_syms`]) paths.
+#[cfg(unix)]
+fn assert_links_and_runs(runtime_module: temen_ir::Module, exports: Vec<(String, u32)>) {
+    use temen_ir::{link, LinkUnit};
+    assert!(
+        exports.iter().any(|(n, _)| n == "twice"),
+        "the runtime must export `twice`; got {exports:?}"
+    );
+    let runtime = LinkUnit {
+        module: runtime_module,
+        exports,
+        ..Default::default()
+    };
+    let app = LinkUnit {
+        module: temen_text::parse_module(TWICE_CALLER).expect("parse caller"),
+        ..Default::default()
+    };
+    let linked = link(&[runtime, app]).expect("link runtime + caller");
+    temen_verify::verify_module(&linked).expect("verify linked program");
+    // The caller is the last function (concatenated after the runtime's functions). twice(21) = 42.
+    let entry = (linked.funcs.len() - 1) as u32;
+    let mut fuel = 10_000_000u64;
+    let r = temen_interp::run(&linked, entry, &[Value::I64(21)], &mut fuel).expect("run linked");
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "cross-unit call to translated `twice`"
+    );
+}
+
+/// **Ask 1 — the export map.** `Translated::exports` pairs each defined function with its final
+/// `module.funcs` index (`base + i`), so a separately-compiled program can `call.import` a runtime
+/// function and have `temen_ir::link` resolve it. Translate a two-function library and link a caller
+/// against it purely by name.
+#[test]
+#[cfg(unix)]
+fn exports_feed_a_link_unit() {
+    let src = r#"
+long twice(long x) { return x + x; }
+long inc(long x) { return x + 1; }
+"#;
+    let Some(bc) = compile_to_ll("exports", src) else {
+        return;
+    };
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
+    // Every export indexes a real function, and both library functions are present.
+    for (name, idx) in &t.exports {
+        assert!(
+            (*idx as usize) < t.module.funcs.len(),
+            "export {name} → {idx} is out of range"
+        );
+    }
+    assert!(
+        t.exports.iter().any(|(n, _)| n == "inc"),
+        "inc must be exported; got {:?}",
+        t.exports
+    );
+    assert_links_and_runs(t.module, t.exports);
+}
+
+/// **Ask 2 — the `temen-llvm-translate` CLI.** Translate a library `.bc` to a binary object
+/// (`-o *.temeno`, the v9 object dialect), re-read it with `decode_unit`, rebuild the export map
+/// from the module's **in-band** export table, and link a caller against it — the scriptable,
+/// separate-artifact analogue of `exports_feed_a_link_unit` (formerly driven by the retired
+/// `.syms` sidecar). Also smoke-tests the runnable-binary (`.temen`) output path (it must
+/// `decode_module`).
+#[test]
+#[cfg(unix)]
+fn translate_cli_emits_linkable_object() {
+    let src = r#"
+long twice(long x) { return x + x; }
+"#;
+    let Some(bc) = compile_to_ll("cli", src) else {
+        return;
+    };
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let out = dir.join(format!("temen_llvm_cli_{pid}.temeno"));
+    let outb = dir.join(format!("temen_llvm_cli_{pid}.temen"));
+
+    let status = Command::new(env!("CARGO_BIN_EXE_temen-llvm-translate"))
+        .arg(&bc)
+        .arg("-o")
+        .arg(&out)
+        .status()
+        .expect("run temen-llvm-translate");
+    assert!(status.success(), "CLI exited non-zero");
+
+    // Binary path: `-o *.temen` selects `encode_module`; the bytes must round-trip through the decoder.
+    let statusb = Command::new(env!("CARGO_BIN_EXE_temen-llvm-translate"))
+        .arg(&bc)
+        .arg("-o")
+        .arg(&outb)
+        .status()
+        .expect("run temen-llvm-translate (binary)");
+    assert!(statusb.success(), "CLI (binary) exited non-zero");
+    temen_encode::decode_module(&std::fs::read(&outb).expect("read .temen"))
+        .expect("decode binary module");
+
+    // Re-read the object; its export table rides in-band (no sidecar to pair).
+    let module = temen_encode::decode_unit(&std::fs::read(&out).expect("read .temeno"))
+        .expect("decode emitted object");
+    let exports: Vec<(String, u32)> = module
+        .exports
+        .iter()
+        .map(|e| (e.name.clone(), e.func))
+        .collect();
+    assert!(
+        exports.iter().any(|(n, _)| n == "twice"),
+        "in-band export table names `twice`: {exports:?}"
+    );
+
+    assert_links_and_runs(module, exports);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&outb);
+}
+
+// ---- §7 capability reflection: `__vm_cap_count` / `__vm_cap_at` → `cap.self.count` / `.get` -----
+
+/// Capability **reflection**: a domain discovers what its host granted it. Run on the interpreter
+/// under a full 7-handle test powerbox host (the grants live in the host-owned table `cap.self.*`
+/// reads, independent of the call's params), so `__vm_cap_count()` returns 7 and `__vm_cap_at(0, &t)`
+/// yields a valid (non-negative) interface type_id. Returns count*10 + (t >= 0) = 71.
+/// Interpreter-only (the JIT bails `Unsupported` on `cap.self`, like fibers).
+#[test]
+#[cfg(unix)]
+fn vm_cap_reflection() {
+    use temen_interp::{Host, StreamRole};
+    let src = r#"
+int __vm_cap_count(void);
+int __vm_cap_at(int i, int *type_id_out);
+int f(void) {
+  int n = __vm_cap_count();
+  int t = -1;
+  __vm_cap_at(0, &t);
+  return n * 10 + (t >= 0 ? 1 : 0);
+}
+"#;
+    let Some((m, entry_sp)) = translate_verified("vm_cap", src) else {
+        return;
+    };
+    // Structural: the reflection ops are present, now as `cap.call CAP_SELF op 0/1`.
+    assert!(
+        module_has_inst(&m, |i| matches!(
+            i,
+            temen_ir::Inst::CapCall {
+                type_id: temen_ir::CAP_SELF_TYPE_ID,
+                op: 0,
+                ..
+            }
+        )) && module_has_inst(&m, |i| matches!(
+            i,
+            temen_ir::Inst::CapCall {
+                type_id: temen_ir::CAP_SELF_TYPE_ID,
+                op: 1,
+                ..
+            }
+        )),
+        "expected cap.self.count + cap.self.get (as cap.call CAP_SELF 0/1)"
+    );
+    // Run on the interpreter with a granted powerbox: 8 capabilities held → count 8.
+    let mut h = Host::new();
+    h.set_region_factory(temen_run::new_shared_region);
+    h.set_jit_validator(temen_run::jit_blob_validator);
+    let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    let _handles = [
+        h.grant_stream(StreamRole::Out),
+        h.grant_stream(StreamRole::In),
+        h.grant_exit(),
+        h.grant_memory(),
+        h.grant_address_space(0, win),
+        h.grant_blocking(std::time::Duration::ZERO, None),
+        h.grant_jit(None),
+    ];
+    let mut fuel = 50_000_000u64;
+    let r = temen_interp::run_with_host(&m, 0, &[Value::I64(entry_sp as i64)], &mut fuel, &mut h)
+        .expect("interp run");
+    assert_eq!(
+        r,
+        vec![Value::I32(71)],
+        "cap reflection: 7 caps, type_id >= 0"
+    );
+}
+
+// ---- §12 Blocking / test powerbox helpers -------------------------------------------------------
+
+/// Grant a powerbox on an interpreter `Host`, returning the first `n` handles (the prefix `_start`
+/// declares) as call args. Mirrors `temen/tests/c_frontend.rs::powerbox`; `block` is the `Blocking`
+/// op's dwell so an async batch is genuinely in flight when a vCPU parks.
+#[cfg(unix)]
+fn grant_powerbox(
+    h: &mut temen_interp::Host,
+    win: u64,
+    n: usize,
+    block: std::time::Duration,
+) -> Vec<Value> {
+    use temen_interp::StreamRole;
+    h.set_region_factory(temen_run::new_shared_region);
+    h.set_jit_validator(temen_run::jit_blob_validator);
+    let mem_log2 = (win != 0).then(|| win.trailing_zeros() as u8);
+    let all = [
+        h.grant_stream(StreamRole::Out),
+        h.grant_stream(StreamRole::In),
+        h.grant_exit(),
+        h.grant_memory(),
+        h.grant_address_space(0, win),
+        h.grant_blocking(block, None),
+        h.grant_jit(mem_log2),
+    ];
+    // Register each granted cap under its canonical name (`cap.self.resolve` — the discovery tier;
+    // `__vm_blocking_handle` and `__vm_cap_resolve` use it). The entry runs with `&[]`. This is the
+    // *test* powerbox: the product's six names (`temen_ir::POWERBOX_CAP_NAMES`) plus the test-only
+    // `Blocking` mock (§5a — the blocking tests exercise the offload pool / §12 parking through
+    // it, so this harness grants and names it itself).
+    const TEST_NAMES: [&str; 7] = [
+        "stdout",
+        "stdin",
+        "exit",
+        "memory",
+        "addrspace",
+        "blocking",
+        "jit",
+    ];
+    for (name, &handle) in TEST_NAMES.iter().zip(&all[..n]) {
+        h.register_cap_name(name, handle);
+    }
+    all[..n].iter().map(|&x| Value::I32(x)).collect()
+}
+
+/// Bind `m`'s import manifest against the powerbox handles [`grant_powerbox`] granted (IMPORTS.md
+/// phase 3): import `i`'s name maps to `(type_id, op)` via `temen_run::default_cap_resolver` and to
+/// the granted handle by interface — the same mapping `temen_run`'s `grant_caps` installs. Call after
+/// `grant_powerbox` for any harness that drives `run_with_host` directly.
+fn bind_powerbox_imports(h: &mut temen_interp::Host, m: &temen_ir::Module, granted: &[Value]) {
+    use temen_interp::cap_id;
+    if m.imports.is_empty() {
+        return;
+    }
+    let hv = |i: usize| match granted.get(i) {
+        Some(Value::I32(x)) => *x,
+        _ => 0,
+    };
+    let bindings = m
+        .imports
+        .iter()
+        .map(|im| {
+            let Some(cap) = temen_run::default_cap_resolver(&im.name) else {
+                return temen_interp::BoundImport::rebindable(0, 0, None);
+            };
+            let handle = match (cap.type_id, cap.op) {
+                (cap_id::STREAM, 1) => hv(0),
+                (cap_id::STREAM, _) => hv(1),
+                (cap_id::EXIT, _) => hv(2),
+                // One kind post-§4 (op-keyed like Stream): vm_map family → the
+                // whole-window grant, sub/region_create → the sized one.
+                (cap_id::ADDRESS_SPACE, 0..=3) => hv(3),
+                (cap_id::ADDRESS_SPACE, _) => hv(4),
+                (cap_id::BLOCKING, _) => hv(5),
+                (cap_id::JIT, _) => hv(6),
+                _ => return temen_interp::BoundImport::rebindable(0, 0, None),
+            };
+            temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
+        })
+        .collect();
+    h.set_import_bindings(bindings);
+}
+
+/// `__vm_cap(i)` reaches the **tail** powerbox handles (`i ≥ 4`): `__vm_cap(5)` (the test
+/// powerbox's Blocking slot) must equal `__vm_blocking_handle()` — the generic index reader and the
+/// named builtin agree. Run on the interpreter under the 7-handle test powerbox.
+#[test]
+#[cfg(unix)]
+fn vm_cap_index_reaches_tail_handles() {
+    let src = r#"
+int __vm_blocking_handle(void);
+int __vm_cap(int i);
+int main(void) { return (__vm_cap(5) == __vm_blocking_handle()) ? 7 : 0; }
+"#;
+    let Some((m, _)) = translate_verified("vm_cap_tail", src) else {
+        return;
+    };
+    // Phase 3: no resolve prologue — `__vm_blocking_handle` resolves at its call site, so exactly
+    // one `cap.self.resolve` appears in the whole module (in `main`, not `_start`).
+    assert_eq!(
+        m.funcs[0].blocks[0]
+            .insts
+            .iter()
+            .filter(|i| matches!(
+                i,
+                temen_ir::Inst::CapCall {
+                    type_id: temen_ir::CAP_SELF_TYPE_ID,
+                    op: 2,
+                    ..
+                }
+            ))
+            .count(),
+        0,
+        "phase 3: no resolve prologue in _start"
+    );
+    let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    let mut h = temen_interp::Host::new();
+    let granted = grant_powerbox(&mut h, win, 7, std::time::Duration::ZERO);
+    bind_powerbox_imports(&mut h, &m, &granted);
+    let mut fuel = 50_000_000u64;
+    let r = temen_interp::run_with_host(&m, 0, &[], &mut fuel, &mut h).expect("interp run");
+    assert_eq!(
+        r,
+        vec![Value::I32(7)],
+        "__vm_cap(5) == __vm_blocking_handle()"
+    );
+}
+
+// ---- §22 guest-driven JIT: `__vm_jit_compile` / `invoke2` / `release` / `install` / `uninstall` ---
+
+/// Structural: every guest-driven-JIT builtin lowers to a `CallImport` on the `Jit` import, and a
+/// program using them is granted the full test powerbox (the `Jit` handle is the last `VM_CAP_*`
+/// index, so `synth_start` grants the whole prefix). Verifies the import table + entry arity without
+/// the (heavier) end-to-end blob dance below.
+#[test]
+fn vm_jit_builtins_lower_and_grant_full_powerbox() {
+    let src = r#"
+long __vm_jit_compile(void *blob, long len);
+long __vm_jit_invoke2(long code, long a, long b);
+long __vm_jit_install(long code);
+long __vm_jit_uninstall(long slot);
+long __vm_jit_release(long code);
+static char blob[64];
+int main(void) {
+  long code = __vm_jit_compile(blob, 64);
+  long r = __vm_jit_invoke2(code, 2, 3);
+  long slot = __vm_jit_install(code);
+  __vm_jit_uninstall(slot);
+  __vm_jit_release(code);
+  return (int)(r + slot);
+}
+"#;
+    let Some(bc) = compile_to_ll("vm_jit_struct", src) else {
+        return;
+    };
+    let m = temen_llvm::translate_ll_path(&bc)
+        .expect("translate bitcode")
+        .module;
+    let imports: Vec<&str> = m.imports.iter().map(|i| i.name.as_str()).collect();
+    for want in [
+        "vm_jit_compile",
+        "vm_jit_invoke2",
+        "vm_jit_install",
+        "vm_jit_uninstall",
+        "vm_jit_release",
+    ] {
+        assert!(
+            imports.contains(&want),
+            "missing JIT import {want}: {imports:?}"
+        );
+    }
+    assert!(
+        temen_run::is_named_powerbox_entry(&m),
+        "a JIT-builtin program must produce a powerbox entry"
+    );
+    assert_eq!(
+        m.funcs[0].blocks[0]
+            .insts
+            .iter()
+            .filter(|i| matches!(
+                i,
+                temen_ir::Inst::CapCall {
+                    type_id: temen_ir::CAP_SELF_TYPE_ID,
+                    op: 2,
+                    ..
+                }
+            ))
+            .count(),
+        0,
+        "phase 3: no resolve prologue — the manifest declares the Jit imports"
+    );
+    // Resolves + re-verifies (every `CallImport` binds to the `Jit` capability).
+    let module = m; // phase 3: the manifest binds at instantiation - no rewrite
+    temen_verify::verify_module(&module).expect("verify resolved IR");
+}
+
+/// End-to-end: the **guest that JITs itself** (`demos/jit/jit_demo.c`) through the LLVM on-ramp. The
+/// guest emits serialized Temen IR byte-by-byte into its window, `__vm_jit_compile`s it, and checks
+/// `__vm_jit_invoke2` (raw unit) **and** an `__vm_jit_install`ed unit reached via a C function pointer
+/// (`call_indirect`) against its own bytecode interpreter on a 49-input grid — guest-emitted,
+/// host-verified, Cranelift-compiled, on the real JIT powerbox.
+///
+/// The blob's memory descriptor must declare the **same** `size_log2` as the parent (the validator's
+/// exact-match precondition). The demo hardcodes chibicc's `16`; temen-llvm sizes the parent window
+/// differently, so we translate once to learn its `size_log2`, patch the demo's descriptor to match,
+/// then translate+run the patched source (no magic constant — it tracks temen-llvm's sizing).
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn vm_jit_guest_self_jit_demo() {
+    // Replace the chibicc-only `#include <temen.h>` with the `__vm_jit_*` prototypes the demo uses (it
+    // declares `write` itself) — so clang resolves them without chibicc's include dir on the path
+    // (which would shadow the system `<stdlib.h>`/`<stdint.h>` for the other tests).
+    let jit_decls = "\
+long __vm_jit_compile(void *blob, long len);\n\
+long __vm_jit_invoke2(long code, long a, long b);\n\
+long __vm_jit_release(long code);\n\
+long __vm_jit_install(long code);\n\
+long __vm_jit_uninstall(long slot);\n";
+    let src0 = include_str!("../../temen-run/demos/jit/jit_demo.c")
+        .replace("#include <temen.h>", jit_decls);
+    let Some(bc0) = compile_to_ll("jit_probe", &src0) else {
+        return;
+    };
+    // Probe temen-llvm's parent window size (translation does not check the memory-match — that is a
+    // runtime precondition of `__vm_jit_compile`), then patch the blob's descriptor to it.
+    let s = temen_llvm::translate_ll_path(&bc0)
+        .expect("translate probe")
+        .module
+        .memory
+        .expect("powerbox program declares a window")
+        .size_log2;
+    let src = src0.replace("eb(buf, 16);", &format!("eb(buf, {s});"));
+    assert_ne!(
+        src, src0,
+        "expected to patch the blob memory descriptor `eb(buf, 16);`"
+    );
+
+    let Some(bc) = compile_to_ll("jit_demo", &src) else {
+        return;
+    };
+    let m = temen_llvm::translate_ll_path(&bc)
+        .expect("translate bitcode")
+        .module;
+    let module = m; // phase 3: the manifest binds at instantiation - no rewrite
+    temen_verify::verify_module(&module).expect("verify resolved IR");
+    let run = temen_run::run_powerbox(&module, b"").expect("powerbox run");
+    let out = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        out.contains("98 inputs agree (invoke + installed call_indirect)"),
+        "guest self-JIT (invoke + installed call_indirect) must agree on every input:\n{out}"
+    );
+}
+
+/// End-to-end: the **threaded** guest-driven JIT (`demos/jit/jit_threads.c`, DESIGN §22) through the
+/// LLVM on-ramp — the threaded sibling of `vm_jit_guest_self_jit_demo`. `NWORKERS` pthreads each build
+/// serialized Temen IR for a *distinct* unit at runtime and `__vm_jit_compile` it — so several
+/// `Jit.compile`s are in flight at once — then `__vm_jit_invoke2` the freshly-native code and check it
+/// against a C reference on a grid of inputs. Combines the guest pthread shim (`thread.spawn`) with the
+/// `Jit` capability + the **7-handle test powerbox**; the host serializes the concurrent compiles through
+/// the per-domain `Mutex<Host>` (engaged automatically for a `thread.spawn`ing guest) while execution
+/// stays parallel. Prints `0` — no worker's concurrently-JITed unit disagreed.
+///
+/// Like the single-threaded demo, the blob's memory descriptor must match the parent window's
+/// `size_log2` (the validator's exact-match precondition); the demo hardcodes chibicc's `16`, so we
+/// probe temen-llvm's window and patch `eb(&e, 16);` to it before the real translate+run.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn vm_jit_threads_demo() {
+    let src0 = include_str!("../../temen-run/demos/jit/jit_threads.c");
+    let Some(bc0) = compile_libc_src_to_ll("jit_threads_probe", src0) else {
+        return;
+    };
+    // Probe temen-llvm's parent window size, then patch the blob descriptor to it (no magic constant —
+    // it tracks temen-llvm's sizing, exactly as `vm_jit_guest_self_jit_demo` does).
+    let s = temen_llvm::translate_ll_path(&bc0)
+        .expect("translate probe")
+        .module
+        .memory
+        .expect("powerbox program declares a window")
+        .size_log2;
+    let src = src0.replace("eb(&e, 16);", &format!("eb(&e, {s});"));
+    assert_ne!(
+        src, src0,
+        "expected to patch the blob memory descriptor `eb(&e, 16);`"
+    );
+
+    let Some(bc) = compile_libc_src_to_ll("jit_threads", &src) else {
+        return;
+    };
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
+    assert_eq!(
+        t.module.funcs[0].blocks[0]
+            .insts
+            .iter()
+            .filter(|i| matches!(
+                i,
+                temen_ir::Inst::CapCall {
+                    type_id: temen_ir::CAP_SELF_TYPE_ID,
+                    op: 2,
+                    ..
+                }
+            ))
+            .count(),
+        0,
+        "phase 3: no resolve prologue — the manifest declares the Jit imports"
+    );
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
+    temen_verify::verify_module(&module).expect("verify resolved IR");
+    let run = temen_run::run_powerbox_with_deadline(
+        &module,
+        b"",
+        Some(std::time::Duration::from_secs(60)),
+    )
+    .expect("powerbox run");
+    assert_eq!(
+        run.stdout,
+        b"0\n",
+        "every worker's concurrently-JITed unit must agree with the reference (got {:?})",
+        String::from_utf8_lossy(&run.stdout)
+    );
+}
+
+// ---- §13/§14 SharedRegion: `__vm_region_create` / `map` / `unmap` / `page_size` -----------------
+
+/// The **magic ring buffer** in C through the LLVM on-ramp: a guest mints a `SharedRegion` from its
+/// `AddressSpace` handle, maps it at two adjacent window offsets, and a single 8-byte store straddling
+/// the seam wraps tail→head as one contiguous access — the whole point of the §13/§14 layout, with no
+/// host hand-holding (the host only installed the region factory + granted AddressSpace). Exercises
+/// `create` (on the stashed AddressSpace handle, slot 4) and `map`/`unmap`/`page_size` (on the returned
+/// region handle), and the **5-handle powerbox** `synth_start` now grants. Run on the JIT powerbox
+/// (real shared-memory aliasing); the success marker `'Y'` is asserted against stdout.
+#[test]
+#[cfg(unix)]
+fn vm_region_magic_ring_buffer() {
+    let src = r#"
+long __vm_region_create(long len);
+long __vm_region_map(int r, long win_off, long region_off, long len, int prot);
+long __vm_region_unmap(int r, long win_off, long len);
+long __vm_region_page_size(int r);
+long write(int fd, const void *buf, long n);
+int main(void) {
+  int r = (int)__vm_region_create(1 << 16);          /* mint a 64 KiB region */
+  if (r < 0) { char e='E'; write(1,&e,1); return 1; }
+  long g = __vm_region_page_size(r);                 /* host map granularity */
+  volatile long vbase = 268435456;                   /* 256 MiB — reserved tail, clear of data/stack */
+  long base = vbase;                                 /* volatile defeats constant inttoptr fold */
+  if (__vm_region_map(r, base, 0, g, 3) < 0)      { char e='1'; write(1,&e,1); return 2; }
+  if (__vm_region_map(r, base + g, 0, g, 3) < 0)  { char e='2'; write(1,&e,1); return 3; }
+  /* one 8-byte store straddling the seam: low half -> region tail, high half wraps -> region head */
+  *(unsigned long *)(base + g - 4) = 0x1122334455667788UL;
+  unsigned int head = *(unsigned int *)(base);             /* region head, via mapping 1 */
+  unsigned int tail = *(unsigned int *)(base + 2 * g - 4); /* region tail, via mapping 2 */
+  unsigned long combined = ((unsigned long)head << 32) | tail;
+  long u = __vm_region_unmap(r, base, g);                  /* exercise unmap too (must return 0) */
+  char ok = (combined == 0x1122334455667788UL && u == 0) ? 'Y' : 'N';
+  write(1, &ok, 1);
+  return 0;
+}
+"#;
+    let Some(bc) = compile_to_ll("vm_region", src) else {
+        return;
+    };
+    let m = temen_llvm::translate_ll_path(&bc)
+        .expect("translate bitcode")
+        .module;
+    // Structural (phase 3): `vm_region_create` (fixed AddressSpace interface) is a manifest
+    // import; map/unmap/page_size dispatch on the runtime-minted region handle — the *dynamic*
+    // addressing mode (`cap.call`), so they declare no import. And `_start` has no resolve
+    // prologue: the manifest binds at instantiation.
+    let imports: Vec<&str> = m.imports.iter().map(|i| i.name.as_str()).collect();
+    assert!(
+        imports.contains(&"vm_region_create"),
+        "missing region import vm_region_create: {imports:?}"
+    );
+    for gone in ["vm_region_map", "vm_region_unmap", "vm_region_page_size"] {
+        assert!(
+            !imports.contains(&gone),
+            "{gone} is dynamic-mode (cap.call) — it must not be a manifest import: {imports:?}"
+        );
+    }
+    assert_eq!(
+        m.funcs[0].blocks[0]
+            .insts
+            .iter()
+            .filter(|i| matches!(
+                i,
+                temen_ir::Inst::CapCall {
+                    type_id: temen_ir::CAP_SELF_TYPE_ID,
+                    op: 2,
+                    ..
+                }
+            ))
+            .count(),
+        0,
+        "phase 3: no resolve prologue in _start"
+    );
+    let module = m; // phase 3: the manifest binds at instantiation - no rewrite
+    temen_verify::verify_module(&module).expect("verify resolved IR");
+    let run = temen_run::run_powerbox(&module, b"").expect("powerbox run");
+    assert_eq!(
+        run.stdout, b"Y",
+        "magic ring buffer: seam-straddling store must wrap tail->head (got {:?})",
+        run.stdout
+    );
+}
+
+// ============================================================================================
+// Milestone 2 — beyond chibicc's C subset: the D54 **breadth proof**. The on-ramp consumes any
+// LLVM frontend's bitcode, so a freestanding C++ TU (`-fno-exceptions -fno-rtti`) — classes,
+// virtual dispatch (vtables → `call_indirect`), templates, mangled names — must run byte-identical
+// to native `clang++`, with no translator change beyond what the C corpus already proved. (The Rust
+// lane runs further down, on the default `rustc` via textual `.ll` — no toolchain pin.)
+// ============================================================================================
+
+/// Compile a freestanding C++ snippet to legalized LLVM-18 bitcode: `-fno-exceptions -fno-rtti`
+/// keeps EH/RTTI out (the §18 stance), `-O2` runs mem2reg/SROA and auto-vectorization (the on-ramp
+/// ingests the SIMD output). Returns `None` (skip) if `clang++` is unavailable.
+fn compile_cpp_to_ll(name: &str, src: &str) -> Option<PathBuf> {
+    compile_cpp_to_ll_flags(name, src, &["-fno-exceptions", "-fno-rtti"])
+}
+
+/// Like [`compile_cpp_to_ll`] but with caller-chosen flags — used by the EH tests, which keep
+/// exceptions on (drop `-fno-exceptions`) so `invoke`/`landingpad`/`__cxa_*` reach the on-ramp.
+fn compile_cpp_to_ll_flags(name: &str, src: &str, extra: &[&str]) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let cc = dir.join(format!("temen_llvm_{}_{}.cpp", std::process::id(), name));
+    let bc = dir.join(format!("temen_llvm_cpp_{}_{}.ll", std::process::id(), name));
+    std::fs::write(&cc, src).expect("write C++ source");
+    let status = Command::new("clang++")
+        .args(["-O2", "-emit-llvm", "-S"])
+        .args(extra)
+        .arg(&cc)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(bc),
+        _ => {
+            eprintln!("note: skipping {name} (clang++ unavailable)");
+            None
+        }
+    }
+}
+
+/// The C++ breadth differential: build the TU with native `clang++` and through the on-ramp, and
+/// assert identical stdout + exit. The program is a powerbox program (`extern "C" int main`, output
+/// via `extern "C" write`), exactly like the C corpus demos.
+fn check_cpp_vs_native(name: &str, src: &str, stdin: &[u8]) {
+    let Some(bc) = compile_cpp_to_ll(name, src) else {
+        return;
+    };
+    check_cpp_bc_vs_native(name, &bc, stdin);
+}
+
+/// The C++ **exception-handling** differential: same as [`check_cpp_vs_native`] but compiled with
+/// exceptions *on* (only `-fno-rtti`), so `invoke`/`landingpad`/`resume` + the `__cxa_*` runtime
+/// reach the on-ramp. The native oracle links the default (exceptions-on) `clang++`.
+fn check_cpp_eh_vs_native(name: &str, src: &str, stdin: &[u8]) {
+    let Some(bc) = compile_cpp_to_ll_flags(name, src, &["-fno-rtti"]) else {
+        return;
+    };
+    check_cpp_bc_vs_native(name, &bc, stdin);
+}
+
+fn check_cpp_bc_vs_native(name: &str, bc: &std::path::Path, stdin: &[u8]) {
+    let cc = std::env::temp_dir().join(format!("temen_llvm_{}_{}.cpp", std::process::id(), name));
+    let exe =
+        std::env::temp_dir().join(format!("temen_llvm_cppnat_{}_{}", std::process::id(), name));
+    match Command::new("clang++")
+        .arg(&cc)
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping {name} (clang++ link unavailable)");
+            return;
+        }
+    }
+    let native = {
+        use std::io::Write;
+        let mut child = Command::new(&exe)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn native");
+        child.stdin.take().unwrap().write_all(stdin).ok();
+        child.wait_with_output().expect("run native")
+    };
+    let native_code = native.status.code().unwrap_or(-1) as u8;
+
+    let t = temen_llvm::translate_ll_path(bc).expect("translate C++ bitcode");
+    assert!(
+        temen_run::is_named_powerbox_entry(&t.module),
+        "{name}: a libc-using C++ program must produce a powerbox entry"
+    );
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
+    temen_verify::verify_module(&module).expect("verify translated IR");
+    let run = temen_run::run_powerbox(&module, stdin).expect("powerbox run");
+    assert_eq!(
+        run.stdout, native.stdout,
+        "{name}: temen stdout {:?} vs native {:?}",
+        run.stdout, native.stdout
+    );
+    let temen_code = match run.outcome {
+        temen_run::Outcome::Exited(c) => c as u8,
+        temen_run::Outcome::Returned(ref v) => match v.first() {
+            Some(temen_interp::Value::I32(x)) => *x as u8,
+            _ => 0,
+        },
+    };
+    assert_eq!(
+        temen_code, native_code,
+        "{name}: temen exit {temen_code} vs native {native_code}"
+    );
+}
+
+/// Translate + verify a libc-using C++ program, then assert it **terminates** — the on-ramp traps
+/// (`std::terminate`) on an exception that no handler catches. Native `clang++` aborts with SIGABRT and
+/// a "terminate called…" stderr line, which is not byte-comparable to a guest trap, so this asserts the
+/// clean fault (a `Err` from the powerbox run) rather than diffing against native.
+fn check_cpp_eh_terminates(name: &str, src: &str) {
+    let Some(bc) = compile_cpp_to_ll_flags(name, src, &["-fno-rtti"]) else {
+        return;
+    };
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate C++ bitcode");
+    assert!(
+        temen_run::is_named_powerbox_entry(&t.module),
+        "{name}: a libc-using C++ program must produce a powerbox entry"
+    );
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
+    temen_verify::verify_module(&module).expect("verify translated IR");
+    let r = temen_run::run_powerbox(&module, b"");
+    assert!(
+        r.is_err(),
+        "{name}: an uncaught exception must terminate (trap), got {r:?}"
+    );
+}
+
+/// **C++ exceptions — uncaught exception terminates** — the handler-stack-underflow guard. A `throw`
+/// with no enclosing `try` anywhere up the call chain must `std::terminate` (the on-ramp traps),
+/// *not* long-jump into a bogus checkpoint slot (`HSP-1` underflowing past the empty handler stack).
+/// Two shapes: a bare top-level `throw`, and a throw caught only by a *non-matching* clause (so the
+/// landingpad re-raises via `_Unwind_Resume` and the exception escapes `main`). Both must fault.
+#[test]
+fn cpp_eh_uncaught_terminates() {
+    let prelude = r#"
+extern "C" int write(int fd, const char *buf, long n);
+static void puti(int v) {
+  char b[16]; int i = 16; unsigned u = (unsigned)v;
+  b[--i] = '\n';
+  do { b[--i] = '0' + u % 10; u /= 10; } while (u);
+  write(1, b + i, 16 - i);
+}
+"#;
+    // (a) No handler at all: the throw propagates straight out of `main`.
+    let no_handler = format!("{prelude}\nint main() {{ puti(1); throw 5; return 0; }}\n");
+    check_cpp_eh_terminates("cpp_eh_uncaught_no_handler", &no_handler);
+
+    // (b) A handler exists but its clause does not match the thrown type, so the exception unwinds
+    //     through it (`_Unwind_Resume`) and escapes `main`.
+    let wrong_handler = format!(
+        "{prelude}
+__attribute__((noinline)) static void thrower() {{ throw 5; }}   // int
+int main() {{
+  puti(1);
+  try {{ thrower(); }}
+  catch (double d) {{ puti(999); }}   // double never matches the int → escapes
+  puti(2);
+  return 0;
+}}
+"
+    );
+    check_cpp_eh_terminates("cpp_eh_uncaught_wrong_handler", &wrong_handler);
+}
+
+/// **C++ exceptions first light** — `throw`/`try`/`catch` through the on-ramp, built on the
+/// setjmp/longjmp stack-transfer core. A `noinline` thrower raises an `int` (caught by `catch(int)`)
+/// or a `const char*` (caught by `catch(...)`); the caller `invoke`s it and routes via the
+/// landingpad selector. Exercises `invoke`/`landingpad`/`resume`, `llvm.eh.typeid.for`, and the
+/// synthesized `__cxa_allocate_exception`/`__cxa_throw`/`__cxa_begin_catch`/`__cxa_end_catch`
+/// runtime — byte-identical to native `clang++` on all three engines.
+#[test]
+fn cpp_eh_throw_catch_int() {
+    let src = r#"
+extern "C" int write(int fd, const char *buf, long n);
+
+static void puti(int v) {
+  char b[16]; int i = 16;
+  int neg = v < 0; unsigned u = neg ? -(unsigned)v : (unsigned)v;
+  b[--i] = '\n';
+  do { b[--i] = '0' + u % 10; u /= 10; } while (u);
+  if (neg) b[--i] = '-';
+  write(1, b + i, 16 - i);
+}
+
+__attribute__((noinline)) static int thrower(int x) {
+  if (x < 0) throw x;
+  if (x == 5) throw "five";
+  return x * 2;
+}
+
+static int classify(int x) {
+  try { return thrower(x); }
+  catch (int e) { return e - 1000; }
+  catch (...)   { return 999; }
+}
+
+int main() {
+  for (int i = -2; i <= 6; i++) puti(classify(i));
+  return 0;
+}
+"#;
+    check_cpp_eh_vs_native("cpp_eh_throw_catch_int", src, b"");
+}
+
+/// **C++ exceptions — rethrow + cleanup unwind** — the paths the [`cpp_eh_throw_catch_int`] demo
+/// does *not* reach. `middle` catches an `int` and re-raises it with a bare `throw;`
+/// (`__cxa_rethrow`), which clang wraps in an `invoke` to a **cleanup-only landingpad** (calling
+/// `__cxa_end_catch` then `_Unwind_Resume` on the way out) — exercising `resume`/`_Unwind_Resume`
+/// and the preservation of the in-flight `cur_exn`/`cur_sel` across the rethrow. `relabel` instead
+/// throws a *fresh* exception from inside its catch (the first is fully caught, so the shared
+/// single-slot object/selector model is allowed to be overwritten). Both reach an outer handler;
+/// byte-identical to native `clang++` on all three engines pins the model.
+#[test]
+fn cpp_eh_rethrow_nested() {
+    let src = r#"
+extern "C" int write(int fd, const char *buf, long n);
+
+static void puti(int v) {
+  char b[16]; int i = 16;
+  int neg = v < 0; unsigned u = neg ? -(unsigned)v : (unsigned)v;
+  b[--i] = '\n';
+  do { b[--i] = '0' + u % 10; u /= 10; } while (u);
+  if (neg) b[--i] = '-';
+  write(1, b + i, 16 - i);
+}
+
+__attribute__((noinline)) static int inner(int x) {
+  if (x < 0) throw x;            // raise an int
+  return x;
+}
+
+// Catch the int and re-raise the *same* exception with a bare `throw;`. clang lowers the rethrow
+// as an invoke whose unwind edge is a cleanup-only landingpad (__cxa_end_catch + _Unwind_Resume).
+__attribute__((noinline)) static int middle(int x) {
+  try { return inner(x); }
+  catch (int) { throw; }
+}
+
+// Catch the int, then throw a *fresh* exception from inside the handler (clobbers the single slot,
+// which is fine: the original is fully caught before the new one is raised).
+__attribute__((noinline)) static int relabel(int x) {
+  try { return inner(x); }
+  catch (int e) { throw e * 100; }
+}
+
+static int outer(int x) {
+  try { return middle(x); }
+  catch (int e) { return e - 7; }   // catches the rethrown int
+}
+
+static int outer2(int x) {
+  try { return relabel(x); }
+  catch (int e) { return e + 1; }   // catches the fresh int
+}
+
+int main() {
+  for (int i = -2; i <= 2; i++) puti(outer(i));
+  for (int i = -2; i <= 2; i++) puti(outer2(i));
+  return 0;
+}
+"#;
+    check_cpp_eh_vs_native("cpp_eh_rethrow_nested", src, b"");
+}
+
+/// **C++ exceptions — multiple catch clauses** — a single `try` with several typed handlers plus a
+/// catch-all: `catch (A&) / catch (B&) / catch (int) / catch (...)`. A `noinline` thrower raises one
+/// of four things by argument; the landingpad's selector is matched against each clause's
+/// `llvm.eh.typeid.for` in turn, falling through to `catch (...)`. Exercises the multi-clause
+/// selector-dispatch chain (the demo only had one typed clause) and class-typed exception objects
+/// caught by reference. Byte-identical to native `clang++` across all three engines.
+#[test]
+fn cpp_eh_multi_catch() {
+    let src = r#"
+extern "C" int write(int fd, const char *buf, long n);
+
+static void puti(int v) {
+  char b[16]; int i = 16;
+  int neg = v < 0; unsigned u = neg ? -(unsigned)v : (unsigned)v;
+  b[--i] = '\n';
+  do { b[--i] = '0' + u % 10; u /= 10; } while (u);
+  if (neg) b[--i] = '-';
+  write(1, b + i, 16 - i);
+}
+
+struct A { int tag; };
+struct B { int tag; };
+
+__attribute__((noinline)) static int thrower(int x) {
+  if (x == 0) throw A{11};
+  if (x == 1) throw B{22};
+  if (x == 2) throw 7;
+  if (x == 3) throw "str";   // const char* — only the catch-all matches
+  return x;
+}
+
+static int classify(int x) {
+  try { return thrower(x); }
+  catch (A &a)  { return 1000 + a.tag; }
+  catch (B &b)  { return 2000 + b.tag; }
+  catch (int e) { return 3000 + e; }
+  catch (...)   { return 9999; }
+}
+
+int main() {
+  for (int i = 0; i <= 4; i++) puti(classify(i));
+  return 0;
+}
+"#;
+    check_cpp_eh_vs_native("cpp_eh_multi_catch", src, b"");
+}
+
+/// **C++ exceptions — propagation through a cleanup frame** — a throw unwinds through an intermediate
+/// function that installs no handler but owns a local with a non-trivial destructor (`Guard`). clang
+/// gives that frame a **cleanup-only** landingpad (run the destructor, then `_Unwind_Resume` to keep
+/// unwinding); the exception is caught two frames up. Pins that cleanup landingpads fire during
+/// propagation and that the handler-stack depth is restored correctly across the resumed unwind —
+/// the `log` accumulator observes each `Guard` destructor exactly once. Byte-identical to native.
+#[test]
+fn cpp_eh_unwind_cleanup() {
+    let src = r#"
+extern "C" int write(int fd, const char *buf, long n);
+
+static void puti(int v) {
+  char b[16]; int i = 16;
+  int neg = v < 0; unsigned u = neg ? -(unsigned)v : (unsigned)v;
+  b[--i] = '\n';
+  do { b[--i] = '0' + u % 10; u /= 10; } while (u);
+  if (neg) b[--i] = '-';
+  write(1, b + i, 16 - i);
+}
+
+struct Guard {
+  int *log; int id;
+  Guard(int *l, int i) : log(l), id(i) {}
+  ~Guard() { *log += id; }    // observable on unwind
+};
+
+__attribute__((noinline)) static int inner(int x) {
+  if (x < 0) throw x;
+  return x;
+}
+
+// No catch here: the throw propagates, but `g`'s destructor must run on the way out
+// (a cleanup-only landingpad → _Unwind_Resume).
+__attribute__((noinline)) static int middle(int x, int *log) {
+  Guard g(log, 10);
+  return inner(x);
+}
+
+// A second cleanup frame stacked on top, to pin nested cleanups during one unwind.
+__attribute__((noinline)) static int middle2(int x, int *log) {
+  Guard g(log, 3);
+  return middle(x, log);
+}
+
+static int outer(int x, int *log) {
+  try { return middle2(x, log); }
+  catch (int e) { return e; }
+}
+
+int main() {
+  int log = 0;
+  int r = outer(-5, &log);   // throws; unwinds through middle (+10) and middle2 (+3); caught
+  puti(r);                   // -5
+  puti(log);                 // 13
+  int log2 = 0;
+  int ok = outer(4, &log2);  // no throw: no destructors-on-unwind, normal return runs them once
+  puti(ok);                  // 4
+  puti(log2);                // 13 (both Guards destroyed on normal scope exit)
+  return 0;
+}
+"#;
+    check_cpp_eh_vs_native("cpp_eh_unwind_cleanup", src, b"");
+}
+
+/// **C++ exceptions — catch-by-value + destructor** — the path that forces `__cxa_end_catch` to stop
+/// being a no-op. The thrown type `E` has an observable copy-constructor (`+1`) and destructor
+/// (`+100`). `catch (E e)` copy-constructs a local from the exception object (`+1`), and on handler
+/// exit *two* destructors run: the local copy's (clang-emitted, `+100`) and the exception object's
+/// own (`__cxa_end_catch` → the synthesized `__temen_eh_destroy`, which runs the destructor funcref
+/// `__cxa_throw` registered, `+100`). `catch (E &e)` binds by reference (no copy, no local), so only
+/// the exception-object destructor runs (`+100`). Byte-identical to native `clang++` pins that the
+/// registered destructor fires exactly once per object across all three engines.
+#[test]
+fn cpp_eh_catch_by_value_dtor() {
+    let src = r#"
+extern "C" int write(int fd, const char *buf, long n);
+
+static void puti(int v) {
+  char b[16]; int i = 16;
+  int neg = v < 0; unsigned u = neg ? -(unsigned)v : (unsigned)v;
+  b[--i] = '\n';
+  do { b[--i] = '0' + u % 10; u /= 10; } while (u);
+  if (neg) b[--i] = '-';
+  write(1, b + i, 16 - i);
+}
+
+struct E {
+  int *log; int v;
+  E(int *l, int val) : log(l), v(val) {}
+  E(const E &o) : log(o.log), v(o.v) { *log += 1; }   // copy-ctor: observable
+  ~E() { *log += 100; }                                // dtor: observable
+};
+
+__attribute__((noinline)) static void thrower(int *log, int val) {
+  throw E(log, val);
+}
+
+static int by_value(int *log, int val) {
+  try { thrower(log, val); }
+  catch (E e) { return e.v; }   // copy in, local dtor + exception-object dtor (end_catch) out
+  return -1;
+}
+
+static int by_ref(int *log, int val) {
+  try { thrower(log, val); }
+  catch (E &e) { return e.v; }  // no copy; only the exception-object dtor (end_catch) runs
+  return -1;
+}
+
+int main() {
+  int a = 0;
+  int r1 = by_value(&a, 42);
+  puti(r1);   // 42
+  puti(a);    // copy(+1) + local-dtor(+100) + end_catch-dtor(+100) = 201
+
+  int b = 0;
+  int r2 = by_ref(&b, 7);
+  puti(r2);   // 7
+  puti(b);    // end_catch-dtor(+100) = 100
+  return 0;
+}
+"#;
+    check_cpp_eh_vs_native("cpp_eh_catch_by_value_dtor", src, b"");
+}
+
+/// **C++ exceptions — polymorphic catch** — a `catch (Base&)` must catch a thrown `Derived` (the
+/// Itanium `__do_catch` subtype walk), not just an exact-type match. A 3-level hierarchy
+/// `Derived : Mid : Base` is thrown at every level, plus an unrelated class and a primitive. Two
+/// handlers probe the relation: `catch (Base&)` matches all three classes (each *is-a* `Base`) but not
+/// the unrelated/`int` throws; `catch (Mid&)` matches `Derived`/`Mid` but **not** `Base` (a base is
+/// *not* a derived). The on-ramp drives this off the typeinfo base-chains parsed from the bitcode, so
+/// `llvm.eh.typeid.for`'s compare means "thrown is-a clause". Byte-identical to native `clang++`.
+#[test]
+fn cpp_eh_polymorphic_catch() {
+    let src = r#"
+extern "C" int write(int fd, const char *buf, long n);
+
+static void puti(int v) {
+  char b[16]; int i = 16;
+  int neg = v < 0; unsigned u = neg ? -(unsigned)v : (unsigned)v;
+  b[--i] = '\n';
+  do { b[--i] = '0' + u % 10; u /= 10; } while (u);
+  if (neg) b[--i] = '-';
+  write(1, b + i, 16 - i);
+}
+
+struct Base { int tag; Base(int t) : tag(t) {} };
+struct Mid : Base { Mid(int t) : Base(t) {} };
+struct Derived : Mid { Derived(int t) : Mid(t) {} };
+struct Other { int x; };
+
+__attribute__((noinline)) static void raise(int which) {
+  if (which == 0) throw Derived(10);
+  if (which == 1) throw Mid(20);
+  if (which == 2) throw Base(30);
+  if (which == 3) throw Other{40};
+  if (which == 4) throw 99;
+}
+
+// Base& catches anything is-a Base (Derived, Mid, Base); Other and int fall to the catch-all.
+static int catch_base(int which) {
+  try { raise(which); }
+  catch (Base &b) { return 100 + b.tag; }
+  catch (...)     { return 999; }
+}
+
+// Mid& catches Derived and Mid, but NOT Base (a base is not a derived); others fall to the catch-all.
+static int catch_mid(int which) {
+  try { raise(which); }
+  catch (Mid &m) { return 200 + m.tag; }
+  catch (...)    { return 888; }
+}
+
+int main() {
+  for (int i = 0; i <= 4; i++) puti(catch_base(i));   // 110 120 130 999 999
+  for (int i = 0; i <= 4; i++) puti(catch_mid(i));    // 210 220 888 888 888
+  return 0;
+}
+"#;
+    check_cpp_eh_vs_native("cpp_eh_polymorphic_catch", src, b"");
+}
+
+/// **C++ first light** — classes + virtual dispatch through the on-ramp. Two shapes derive a common
+/// polymorphic base; a loop sums their areas through a base pointer (a virtual call per element →
+/// a vtable load + `call_indirect`), and the total is printed. Exercises vtables (function-pointer
+/// global initializers, slice K), the `this` pointer, mangled names, and `call_indirect` (slice G) —
+/// byte-identical to native `clang++`.
+#[test]
+fn cpp_virtual_dispatch_first_light() {
+    let src = r#"
+extern "C" long write(int fd, const void *buf, long n);
+
+struct Shape {
+  virtual int area() const { return 0; }
+};
+struct Square : Shape {
+  int s;
+  Square(int s) : s(s) {}
+  int area() const override { return s * s; }
+};
+struct Rect : Shape {
+  int w, h;
+  Rect(int w, int h) : w(w), h(h) {}
+  int area() const override { return w * h; }
+};
+
+static int sum_areas(Shape **shapes, int n) {
+  int t = 0;
+  for (int i = 0; i < n; i++) t += shapes[i]->area();
+  return t;
+}
+
+extern "C" int main() {
+  Square sq(5);
+  Rect r(3, 4);
+  Shape *shapes[2] = { &sq, &r };
+  int t = sum_areas(shapes, 2); // 25 + 12 = 37
+
+  char buf[16];
+  int n = 0;
+  char tmp[16];
+  int k = 0;
+  if (t == 0) buf[n++] = '0';
+  while (t > 0) { tmp[k++] = (char)('0' + (t % 10)); t /= 10; }
+  while (k > 0) buf[n++] = tmp[--k];
+  buf[n++] = '\n';
+  write(1, buf, n);
+  return 0;
+}
+"#;
+    check_cpp_vs_native("cpp_vdispatch", src, b"");
+}
+
+/// C++ breadth, deeper: heap `new`/`delete`, **virtual destructors**, and templates. A polymorphic
+/// hierarchy is heap-allocated through `operator new` (defined over the guest `malloc`), summed via
+/// virtual dispatch, then `delete`d through a base pointer — exercising the *deleting destructor* the
+/// vtable carries (a virtual-call chain into `operator delete` → `free`). A function template
+/// monomorphizes to an ordinary function. Byte-identical to native `clang++`.
+#[test]
+fn cpp_new_delete_virtual_dtor_templates() {
+    let src = r#"
+extern "C" long write(int fd, const void *buf, long n);
+extern "C" void *malloc(unsigned long n);
+extern "C" void free(void *p);
+
+void *operator new(unsigned long n) { return malloc(n); }
+void operator delete(void *p) noexcept { free(p); }
+void operator delete(void *p, unsigned long) noexcept { free(p); }
+
+template <typename T> static T add(T a, T b) { return a + b; }
+
+struct Animal {
+  int legs;
+  Animal(int l) : legs(l) {}
+  virtual int sound() const { return 0; }
+  virtual ~Animal() {}
+};
+struct Dog : Animal {
+  Dog() : Animal(4) {}
+  int sound() const override { return 7; }
+};
+struct Bird : Animal {
+  Bird() : Animal(2) {}
+  int sound() const override { return 3; }
+};
+
+extern "C" int main() {
+  Animal *zoo[2];
+  zoo[0] = new Dog();
+  zoo[1] = new Bird();
+  int total = 0;
+  for (int i = 0; i < 2; i++)
+    total = add(total, zoo[i]->legs + zoo[i]->sound()); // (4+7) + (2+3) = 16
+  for (int i = 0; i < 2; i++)
+    delete zoo[i]; // virtual dtor via base ptr -> deleting dtor -> operator delete -> free
+
+  char buf[16];
+  int n = 0;
+  char tmp[16];
+  int k = 0;
+  if (total == 0) buf[n++] = '0';
+  while (total > 0) { tmp[k++] = (char)('0' + (total % 10)); total /= 10; }
+  while (k > 0) buf[n++] = tmp[--k];
+  buf[n++] = '\n';
+  write(1, buf, n);
+  return 0;
+}
+"#;
+    check_cpp_vs_native("cpp_new_delete", src, b"");
+}
+
+/// C++ **static initialization** — `@llvm.global_ctors`. A global object with a side-effecting
+/// constructor must run **before** `main` (the C++ [basic.start] order), exactly as native: the
+/// on-ramp's `_start` now calls the global constructors (priority order) before `main`. Here a global
+/// `Banner` ctor writes "init\n" and `main` writes "main\n" — the on-ramp must emit both, in order,
+/// byte-identical to native `clang++` (a bug that drops static init would print only "main\n").
+#[test]
+fn cpp_global_constructor_runs_before_main() {
+    let src = r#"
+extern "C" long write(int fd, const void *buf, long n);
+struct Banner {
+  Banner() { write(1, "init\n", 5); }
+};
+static Banner g_banner;
+extern "C" int main() {
+  write(1, "main\n", 5);
+  return 0;
+}
+"#;
+    check_cpp_vs_native("cpp_static_init", src, b"");
+}
+
+// ============================================================================================
+// Milestone 2 — Rust through the on-ramp (the D54 breadth headline). Since the on-ramp now reads
+// **textual `.ll`** (not bitcode via the version-locked `llvm-ir` binding), it ingests whatever LLVM
+// the *default* `rustc` bundles — no toolchain pin. The container's `rustc 1.94` emits **LLVM-21**
+// `.ll`, so this lane doubles as the **version-tolerance proof**: a newer LLVM than the old `llvm-ir`
+// ceiling (LLVM 19) flows straight through the textual reader. A `no_std`/`panic=abort` crate has no
+// EH/unwinding, so it lowers like C.
+// ============================================================================================
+
+/// Compile a `no_std`/`panic=abort` Rust source to legalized **textual LLVM IR** (`.ll`) via the
+/// default `rustc` (whatever LLVM it bundles — LLVM 21 in this container). `-O` runs mem2reg/SROA.
+/// Returns `None` (skip) only if `rustc` is entirely absent.
+fn compile_rust_to_ll(name: &str, src: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let rs = dir.join(format!("temen_llvm_{}_{}.rs", std::process::id(), name));
+    let ll = dir.join(format!(
+        "temen_llvm_rust_{}_{}.ll",
+        std::process::id(),
+        name
+    ));
+    std::fs::write(&rs, src).expect("write Rust source");
+    let status = Command::new("rustc")
+        .args([
+            "--emit=llvm-ir",
+            "--crate-type=lib",
+            "-C",
+            "panic=abort",
+            "-C",
+            "opt-level=2",
+            "-C",
+            "overflow-checks=off",
+            // `-O2` auto-vectorization stays **enabled**: the on-ramp now ingests the full SIMD
+            // output (slices AN–AT — legalization + conversions/rotate/shuffle/`<N x i1>` masks), so a
+            // `&[i32]` reduction becoming `<N x i32>` + a horizontal reduce is fine. (Determinism is
+            // preserved by the fixed-128 chunk legalization, not by suppressing vectorization.)
+        ])
+        .arg(&rs)
+        .arg("-o")
+        .arg(&ll)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(ll),
+        _ => {
+            eprintln!("note: skipping {name} (rustc unavailable)");
+            None
+        }
+    }
+}
+
+/// The body of `compute` (shared by the `no_std` bitcode lib and the native std oracle): a sum of
+/// squares. `clang`/`rustc -O2` closes this loop into a **polynomial with `i33` intermediates** (to
+/// hold `n·(n-1)·(2n-1)` before a magic-constant divide), so it exercises the on-ramp's non-power-of-
+/// two integer support — `i33` held in an `i64`, kept canonical by masking after the de-normalizing
+/// ops. `wrapping_*` matches `-C overflow-checks=off` (LLVM's `nsw`/`nuw` are wrap for us, §3b).
+const RUST_COMPUTE_BODY: &str = "{
+    let mut acc: i32 = 0;
+    let mut i: i32 = 0;
+    while i < n { acc = acc.wrapping_add(i.wrapping_mul(i)); i = i.wrapping_add(1); }
+    acc
+}";
+
+/// Run `compute(n)` through the on-ramp (a `no_std`/`panic=abort` lib → LLVM-18 bitcode → translate →
+/// both backends), asserting interp == JIT, and return the result. `None` if the toolchain is absent.
+fn rust_compute_onramp(n: i32) -> Option<i32> {
+    let src = format!(
+        "#![no_std]\n#![no_main]\n\
+         #[panic_handler] fn ph(_: &core::panic::PanicInfo) -> ! {{ loop {{}} }}\n\
+         #[no_mangle] pub extern \"C\" fn compute(n: i32) -> i32 {RUST_COMPUTE_BODY}\n"
+    );
+    let ll = compile_rust_to_ll("rs_compute", &src)?;
+    let t = temen_llvm::translate_ll_path(&ll).expect("translate Rust bitcode");
+    let module = t.module;
+    temen_verify::verify_module(&module).expect("verify translated Rust IR");
+    // A `no_std` lib has no `main`/powerbox; the panic handler (`rust_begin_unwind`, a `loop {}`) is
+    // also defined (at index 0), so locate `compute` by its IR signature `(i64 sp, i32) -> i32`.
+    let idx = module
+        .funcs
+        .iter()
+        .position(|f| f.params == [ValType::I64, ValType::I32] && f.results == [ValType::I32])
+        .expect("compute present") as u32;
+    let full = vec![Value::I64(t.entry_sp as i64), Value::I32(n)];
+    let mut fuel = 100_000_000u64;
+    let interp = match temen_interp::run(&module, idx, &full, &mut fuel)
+        .expect("interp run")
+        .as_slice()
+    {
+        [Value::I32(x)] => *x,
+        other => panic!("compute: expected one i32, got {other:?}"),
+    };
+    let slots = vec![t.entry_sp as i64, n as i64];
+    let jit = match temen_jit::compile_and_run(&module, idx, &slots).expect("jit run") {
+        JitOutcome::Returned(s) => s[0] as i32,
+        other => panic!("unexpected JIT outcome {other:?}"),
+    };
+    assert_eq!(interp, jit, "compute({n}): interp {interp} vs JIT {jit}");
+    Some(interp)
+}
+
+/// The native oracle: the **same** `compute` body compiled by the default `rustc` into a std binary that
+/// prints `compute(n)`, run natively. (A `no_std` lib can't be run directly; std `compute` is the
+/// identical function, so it is the ground truth — incl. the `i33` overflow/wrap path.)
+fn rust_compute_native(n: i32) -> Option<i32> {
+    let dir = std::env::temp_dir();
+    let rs = dir.join(format!("temen_llvm_{}_rsnat.rs", std::process::id()));
+    let exe = dir.join(format!("temen_llvm_{}_rsnat", std::process::id()));
+    std::fs::write(
+        &rs,
+        format!(
+            "fn compute(n: i32) -> i32 {RUST_COMPUTE_BODY}\n\
+             fn main() {{ println!(\"{{}}\", compute({n})); }}\n"
+        ),
+    )
+    .expect("write Rust source");
+    match Command::new("rustc")
+        .args(["-C", "opt-level=2", "-C", "overflow-checks=off"])
+        .arg(&rs)
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => return None,
+    }
+    let out = Command::new(&exe).output().expect("run native rust");
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("parse native compute"),
+    )
+}
+
+/// **Rust through the on-ramp — the D54 breadth headline.** A `no_std`/`panic=abort` Rust crate
+/// (a different frontend, its own ABI/lowering) translates and runs with no translator change beyond
+/// the C corpus, The chosen function forces
+/// LLVM's `i33` closed-form (the non-power-of-two integer support added here), and the values include
+/// `n` large enough that the `i33` intermediate **overflows 33 bits and wraps** — caught only by the
+/// native differential (interp == JIT alone would agree even if the masking were wrong). Every value
+/// matches native `rustc`.
+#[test]
+fn rust_no_std_matches_native() {
+    for n in [5i32, 1000, 46341, 200000, -7] {
+        let (Some(temen), Some(native)) = (rust_compute_onramp(n), rust_compute_native(n)) else {
+            return; // toolchain unavailable — skip
+        };
+        assert_eq!(
+            temen, native,
+            "compute({n}): on-ramp {temen} vs native rustc {native} (i33 wrap mismatch?)"
+        );
+    }
+}
+
+// ============================================================================================
+// Milestone 1 (DESIGN.md §20c) — `core + alloc` through the Rust on-ramp. The existing Rust lane proves
+// `core` (a pure compute fn). This proves the next layer: a heap-allocating `no_std` program whose
+// `#[global_allocator]` is backed by the guest `malloc`/`free` (the same `vm_map`-growing bump
+// allocator the C/C++ heap tests use). `Vec`/`Box` from `alloc` lower to `__rust_alloc` →
+// (our `#[global_allocator]`) → `extern "C" malloc`, so the on-ramp synthesizes the allocator and
+// the program grows its own heap. This is the prerequisite for running `temen-peval` (all
+// `Vec`/`BTreeMap`) as an temen-IR guest. Differential: stdout matches the *same* program built as a
+// native `std` Rust binary.
+// ============================================================================================
+
+/// Build a native `std` Rust binary from `src`, run it (feeding `stdin`), return its stdout. `None`
+/// (skip) if `rustc` is unavailable.
+fn rust_native_stdout(name: &str, src: &str, stdin: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Write;
+    let dir = std::env::temp_dir();
+    let rs = dir.join(format!("temen_llvm_{}_{}_nat.rs", std::process::id(), name));
+    let exe = dir.join(format!("temen_llvm_{}_{}_nat", std::process::id(), name));
+    std::fs::write(&rs, src).expect("write native Rust source");
+    match Command::new("rustc")
+        .args(["-C", "opt-level=2"])
+        .arg(&rs)
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => return None,
+    }
+    let mut child = Command::new(&exe)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn native rust");
+    child.stdin.take().unwrap().write_all(stdin).ok();
+    Some(child.wait_with_output().expect("run native rust").stdout)
+}
+
+/// Translate a `no_std`/`alloc` powerbox Rust program through the on-ramp and run it, returning its
+/// stdout. Mirrors [`powerbox_diff`]'s Temen half but for a Rust frontend: the program must produce a
+/// powerbox entry (it uses `malloc` + `write`), so we resolve §7 imports to capabilities, verify, and
+/// run through `run_powerbox`. `None` (skip) if `rustc` is unavailable.
+fn rust_powerbox_stdout(name: &str, src: &str, stdin: &[u8]) -> Option<Vec<u8>> {
+    let ll = compile_rust_to_ll(name, src)?;
+    let t = temen_llvm::translate_ll_path(&ll).expect("translate Rust heap bitcode");
+    assert!(
+        temen_run::is_named_powerbox_entry(&t.module),
+        "{name}: a heap-allocating Rust program must produce a powerbox entry"
+    );
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
+    temen_verify::verify_module(&module).expect("verify translated Rust IR");
+    Some(
+        temen_run::run_powerbox(&module, stdin)
+            .expect("powerbox run")
+            .stdout,
+    )
+}
+
+/// **`core + alloc` through the Rust on-ramp (DESIGN.md §20c).** A `no_std` Rust program with a
+/// `#[global_allocator]` over the guest `malloc`/`free` builds a `Vec` that grows past its initial
+/// capacity (many `RawVec` reallocs → `malloc`/`free` churn → `vm_map` heap growth), boxes a value,
+/// and prints a heap-derived sum. The whole `alloc` stack (`RawVec`, the global-allocator shims
+/// `__rust_alloc`/`__rust_dealloc`/`__rust_realloc`, `Box`) lowers through the on-ramp with no change
+/// beyond the C heap path, and the output is byte-identical to the same program as a native `std`
+/// binary. This is the layer `temen-peval` needs (it is all `Vec`/maps).
+#[test]
+fn rust_core_alloc_heap_matches_native() {
+    // The on-ramp guest: `no_std` + `alloc`, allocator backed by the guest `malloc`/`free`. Builds a
+    // growing `Vec<u64>` of squares (forces reallocs), a `Box`, sums on the heap, prints the decimal.
+    let onramp = r#"
+#![no_std]
+#![no_main]
+extern crate alloc;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::alloc::{GlobalAlloc, Layout};
+
+extern "C" {
+    fn malloc(n: usize) -> *mut u8;
+    fn free(p: *mut u8);
+    fn write(fd: i32, buf: *const u8, n: isize) -> isize;
+}
+
+struct Guest;
+unsafe impl GlobalAlloc for Guest {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 { malloc(l.size()) }
+    unsafe fn dealloc(&self, p: *mut u8, _l: Layout) { free(p) }
+}
+#[global_allocator]
+static A: Guest = Guest;
+
+#[panic_handler]
+fn ph(_: &core::panic::PanicInfo) -> ! { loop {} }
+
+fn putdec(mut x: u64) {
+    let mut buf = [0u8; 24];
+    let mut i = 24usize;
+    if x == 0 { i -= 1; buf[i] = b'0'; }
+    while x > 0 { i -= 1; buf[i] = b'0' + (x % 10) as u8; x /= 10; }
+    unsafe { write(1, buf.as_ptr().add(i), (24 - i) as isize); }
+    unsafe { write(1, b"\n".as_ptr(), 1); }
+}
+
+#[no_mangle]
+pub extern "C" fn main() -> i32 {
+    let mut v: Vec<u64> = Vec::new();
+    for i in 0..1000u64 { v.push(i * i); }   // grows -> realloc -> malloc/free churn
+    let mut sum: u64 = 0;
+    for &x in &v { sum = sum.wrapping_add(x); }
+    let boxed = Box::new(sum.wrapping_mul(2));
+    putdec(*boxed);
+    0
+}
+"#;
+    // The native `std` oracle: the *same* computation, printed with `println!`.
+    let native = r#"
+fn main() {
+    let mut v: Vec<u64> = Vec::new();
+    for i in 0..1000u64 { v.push(i * i); }
+    let mut sum: u64 = 0;
+    for &x in &v { sum = sum.wrapping_add(x); }
+    let boxed = Box::new(sum.wrapping_mul(2));
+    println!("{}", *boxed);
+}
+"#;
+    let (Some(temen), Some(nat)) = (
+        rust_powerbox_stdout("rs_heap", onramp, b""),
+        rust_native_stdout("rs_heap", native, b""),
+    ) else {
+        return; // toolchain unavailable — skip
+    };
+    assert_eq!(
+        temen,
+        nat,
+        "heap Rust: on-ramp stdout {:?} vs native {:?}",
+        String::from_utf8_lossy(&temen),
+        String::from_utf8_lossy(&nat)
+    );
+}
+
+/// **`BTreeMap` through the on-ramp (`core::slice::index` panic shims).** A `no_std` program builds a
+/// `BTreeMap<u64,u64>` past one node's capacity (so it splits — exercising node slicing / element
+/// shifts), then sums `k + v` over an ordered iteration, byte-identical to the native `std` build.
+/// `BTreeMap`'s node code is littered with slice range accesses whose bounds-panic helpers
+/// (`slice_{start,end}_index_len_fail`) are external `-> !` lang items; the on-ramp shims the whole
+/// `slice…_fail` family to `trap` (`is_rust_abort_call`). Before that, this hit
+/// `Unsupported("call to external/undefined function …slice_end_index_len_fail…")`. This is the
+/// collection `temen-peval` uses for its memo tables.
+#[test]
+fn rust_btreemap_matches_native() {
+    let logic = "let mut mp: alloc::collections::BTreeMap<u64,u64> = alloc::collections::BTreeMap::new();\n\
+        for i in 0..40u64 { mp.insert(i.wrapping_mul(7) % 101, i.wrapping_mul(3)); }\n\
+        let mut s: u64 = 0; for (k, v) in &mp { s = s.wrapping_add(*k).wrapping_add(*v); }\n\
+        putdec(s); putdec(mp.len() as u64);\n\
+        putdec(*mp.get(&0).unwrap_or(&999));";
+    let onramp = format!(
+        "#![no_std]\n#![no_main]\nextern crate alloc;\n\
+         use core::alloc::{{GlobalAlloc, Layout}};\n\
+         extern \"C\" {{ fn malloc(n: usize)->*mut u8; fn free(p:*mut u8); fn write(fd:i32,buf:*const u8,n:isize)->isize; }}\n\
+         struct G; unsafe impl GlobalAlloc for G {{ unsafe fn alloc(&self,l:Layout)->*mut u8{{malloc(l.size())}} unsafe fn dealloc(&self,p:*mut u8,_:Layout){{free(p)}} }}\n\
+         #[global_allocator] static A: G = G;\n\
+         #[panic_handler] fn ph(_:&core::panic::PanicInfo)->!{{loop{{}}}}\n\
+         fn putdec(x:u64){{let mut m=x;let mut b=[0u8;24];let mut i=24usize;if m==0{{i-=1;b[i]=b'0';}}while m>0{{i-=1;b[i]=b'0'+(m%10)as u8;m/=10;}}unsafe{{write(1,b.as_ptr().add(i),(24-i)as isize);write(1,b\"\\n\".as_ptr(),1);}}}}\n\
+         #[no_mangle] pub extern \"C\" fn main()->i32{{ {logic} 0 }}\n"
+    );
+    let native = format!(
+        "use std::collections::BTreeMap as _Unused; mod alloc {{ pub use std::collections; }}\n\
+         fn putdec(x:u64){{ println!(\"{{}}\", x); }}\n\
+         fn main(){{ {logic} }}\n"
+    );
+    let (Some(temen), Some(nat)) = (
+        rust_powerbox_stdout("rs_btree", &onramp, b""),
+        rust_native_stdout("rs_btree", &native, b""),
+    ) else {
+        return; // toolchain unavailable — skip
+    };
+    assert_eq!(
+        temen,
+        nat,
+        "BTreeMap on-ramp stdout {:?} vs native {:?}",
+        String::from_utf8_lossy(&temen),
+        String::from_utf8_lossy(&nat)
+    );
+}
+
+/// **ZST struct field → element-stride/offset layout (DESIGN.md §20c corruption).** A `no_std`
+/// program builds a `Vec<Inner>` where `Inner { data: Vec<u64>, tag: u64 }` *contains a `Vec`*, then
+/// indexes the outer vector (`v[i].tag`, `v[i].data.len()`, `v[i].data[0]`) and sums. A `Vec`/`RawVec`
+/// carries the zero-sized `alloc::alloc::Global` allocator marker (`type {}`), so the element stride of
+/// `Vec<Inner>` and the offset of `Inner.tag`/`Inner.data.len()` both depend on the on-ramp sizing an
+/// **empty struct as 0 bytes**. A previous `struct_layout` clamped it to 1, inflating every `RawVec` by
+/// a byte (24-byte `Vec`s padded to 32, `len` shifted 16→24) and desyncing every field offset from
+/// LLVM's GEPs — so an indexed `v[i].data.len()` read garbage (it returned the *outer* `Vec::len()`).
+/// This is precisely the bug that made the in-sandbox `temen-peval` (all nested `Vec`/`BTreeMap`) read a
+/// corrupted length and trap; a flat `Vec<u64>` (existing tests) never exercised a ZST-bearing element.
+/// Differential: byte-identical to the same program as a native `std` binary.
+#[test]
+fn rust_zst_struct_field_layout_matches_native() {
+    let logic = "\
+        struct Inner { data: alloc::vec::Vec<u64>, tag: u64 }\n\
+        let mut outer: alloc::vec::Vec<Inner> = alloc::vec::Vec::new();\n\
+        for i in 0..6u64 {\n\
+            let mut d: alloc::vec::Vec<u64> = alloc::vec::Vec::new();\n\
+            d.push(i.wrapping_mul(10)); d.push(i.wrapping_mul(10).wrapping_add(1));\n\
+            outer.push(Inner { data: d, tag: i.wrapping_mul(100) });\n\
+        }\n\
+        let mut s: u64 = 0;\n\
+        for i in 0..outer.len() {\n\
+            s = s.wrapping_add(outer[i].tag);\n\
+            s = s.wrapping_add(outer[i].data.len() as u64);\n\
+            s = s.wrapping_add(outer[i].data[0]);\n\
+        }\n\
+        putdec(s); putdec(outer.len() as u64);";
+    let onramp = format!(
+        "#![no_std]\n#![no_main]\nextern crate alloc;\n\
+         use core::alloc::{{GlobalAlloc, Layout}};\n\
+         extern \"C\" {{ fn malloc(n: usize)->*mut u8; fn free(p:*mut u8); fn write(fd:i32,buf:*const u8,n:isize)->isize; }}\n\
+         struct G; unsafe impl GlobalAlloc for G {{ unsafe fn alloc(&self,l:Layout)->*mut u8{{malloc(l.size())}} unsafe fn dealloc(&self,p:*mut u8,_:Layout){{free(p)}} }}\n\
+         #[global_allocator] static A: G = G;\n\
+         #[panic_handler] fn ph(_:&core::panic::PanicInfo)->!{{loop{{}}}}\n\
+         fn putdec(x:u64){{let mut m=x;let mut b=[0u8;24];let mut i=24usize;if m==0{{i-=1;b[i]=b'0';}}while m>0{{i-=1;b[i]=b'0'+(m%10)as u8;m/=10;}}unsafe{{write(1,b.as_ptr().add(i),(24-i)as isize);write(1,b\"\\n\".as_ptr(),1);}}}}\n\
+         #[no_mangle] pub extern \"C\" fn main()->i32{{ {logic} 0 }}\n"
+    );
+    let native = format!(
+        "mod alloc {{ pub use std::vec; }}\n\
+         fn putdec(x:u64){{ println!(\"{{}}\", x); }}\n\
+         fn main(){{ {logic} }}\n"
+    );
+    let (Some(temen), Some(nat)) = (
+        rust_powerbox_stdout("rs_zst", &onramp, b""),
+        rust_native_stdout("rs_zst", &native, b""),
+    ) else {
+        return; // toolchain unavailable — skip
+    };
+    assert_eq!(
+        temen,
+        nat,
+        "ZST-struct layout on-ramp stdout {:?} vs native {:?}",
+        String::from_utf8_lossy(&temen),
+        String::from_utf8_lossy(&nat)
+    );
+}
+
+/// The statements both the on-ramp `no_std` program and the native `std` oracle run — each prints one
+/// value with `putdec`. Exercises the saturating-arithmetic intrinsics (`llvm.{u,s}{add,sub}.sat`, on
+/// i32/i64, both the clamped and the non-clamped path) and the saturating float→int casts
+/// (`llvm.fpto{si,ui}.sat`, f32/f64 → i32/i64, incl. ±overflow and NaN). Each side defines `putdec`
+/// differently (manual `write` vs `println!`) but the call sequence is identical, so the stdout must
+/// match byte-for-byte.
+const RUST_SAT_BODY: &str = "
+    putdec((10u64).saturating_sub(25) as i64);   // usub.sat -> 0
+    putdec((100u64).saturating_sub(40) as i64);  // usub.sat -> 60
+    putdec(u64::MAX.saturating_add(5) as i64);   // uadd.sat -> u64::MAX (-1 as i64)
+    putdec((7u64).saturating_add(8) as i64);     // uadd.sat -> 15 (no clamp)
+    putdec(i64::MIN.saturating_sub(1));          // ssub.sat -> i64::MIN
+    putdec(i64::MAX.saturating_add(1));          // sadd.sat -> i64::MAX
+    putdec((5i64).saturating_add(3));            // sadd.sat -> 8 (no clamp)
+    putdec((-5i64).saturating_sub(3));           // ssub.sat -> -8 (no clamp)
+    putdec((7u32).saturating_sub(100) as i64);   // usub.sat.i32 -> 0
+    putdec(u32::MAX.saturating_add(2) as i64);   // uadd.sat.i32 -> u32::MAX
+    putdec(i32::MIN.saturating_sub(1) as i64);   // ssub.sat.i32 -> i32::MIN
+    putdec(i32::MAX.saturating_add(1) as i64);   // sadd.sat.i32 -> i32::MAX
+    putdec((1e30f64) as i64);                    // fptosi.sat.i64.f64 -> i64::MAX
+    putdec((-1e30f64) as i64);                   // -> i64::MIN
+    putdec((f64::NAN) as i64);                   // -> 0
+    putdec((3.99f64) as i64);                    // -> 3
+    putdec((1e30f64) as u64 as i64);             // fptoui.sat.i64.f64 -> u64::MAX (-1)
+    putdec((-7.0f64) as u64 as i64);             // -> 0 (clamped low)
+    putdec((1e20f32) as i32 as i64);             // fptosi.sat.i32.f32 -> i32::MAX
+    putdec((-1e20f32) as i32 as i64);            // -> i32::MIN
+    putdec((1e20f32) as u32 as i64);             // fptoui.sat.i32.f32 -> u32::MAX
+    putdec((2.5f32) as i32 as i64);              // -> 2
+";
+
+/// **Saturating arithmetic + saturating float→int casts through the on-ramp.** These are the LLVM
+/// intrinsics Rust emits for `saturating_add`/`saturating_sub` and float `as` integer casts — the gaps
+/// the specializer hit. The on-ramp lowers them inline (clamp via `select`; `FToISat`), and every
+/// result is byte-identical to the same program built natively, across the clamp/no-clamp and
+/// over/underflow/NaN cases on both `i32` and `i64`.
+#[test]
+fn rust_saturating_and_fp_sat_casts_match_native() {
+    let onramp = format!(
+        "#![no_std]\n#![no_main]\n\
+         extern \"C\" {{ fn write(fd: i32, buf: *const u8, n: isize) -> isize; }}\n\
+         #[panic_handler] fn ph(_: &core::panic::PanicInfo) -> ! {{ loop {{}} }}\n\
+         fn putdec(x: i64) {{\n\
+             let neg = x < 0;\n\
+             let mut mag: u64 = if neg {{ (x as u64).wrapping_neg() }} else {{ x as u64 }};\n\
+             let mut buf = [0u8; 24];\n\
+             let mut i = 24usize;\n\
+             if mag == 0 {{ i -= 1; buf[i] = b'0'; }}\n\
+             while mag > 0 {{ i -= 1; buf[i] = b'0' + (mag % 10) as u8; mag /= 10; }}\n\
+             if neg {{ i -= 1; buf[i] = b'-'; }}\n\
+             unsafe {{ write(1, buf.as_ptr().add(i), (24 - i) as isize); }}\n\
+             unsafe {{ write(1, b\"\\n\".as_ptr(), 1); }}\n\
+         }}\n\
+         #[no_mangle] pub extern \"C\" fn main() -> i32 {{ {RUST_SAT_BODY} 0 }}\n"
+    );
+    let native = format!(
+        "fn putdec(x: i64) {{ println!(\"{{}}\", x); }}\nfn main() {{ {RUST_SAT_BODY} }}\n"
+    );
+    let (Some(temen), Some(nat)) = (
+        rust_powerbox_stdout("rs_sat", &onramp, b""),
+        rust_native_stdout("rs_sat", &native, b""),
+    ) else {
+        return; // toolchain unavailable — skip
+    };
+    assert_eq!(
+        temen,
+        nat,
+        "saturating/fp-sat Rust: on-ramp stdout {:?} vs native {:?}",
+        String::from_utf8_lossy(&temen),
+        String::from_utf8_lossy(&nat)
+    );
+}
+
+#[test]
+fn bitint56_load_store_roundtrips() {
+    // A non-power-of-two integer (`_BitInt(56)` = `i56`) round-trips through memory: the on-ramp
+    // legalizes `load i56` (read the enclosing i64, mask to 56 bits), `store i56` (byte-exact, so it
+    // never clobbers an adjacent field), and the `i56 → i64` zero/sign-extend (in i64). A `volatile`
+    // local forces the real store+load. Differential on interp + JIT (`check`).
+    // Unsigned: store, load (mask), add — no sign extension.
+    let u = "unsigned long f(void){ volatile unsigned _BitInt(56) g = 0x1234567890ABULL; \
+             return (unsigned long)g + 1; }";
+    check("u56", u, &[], &[Value::I64(20_015_998_341_292)]);
+    // Signed negative: store, load, then sign-extend the 56-bit value to i64.
+    let s = "long f(void){ volatile _BitInt(56) g = -100; return (long)g; }";
+    check("s56", s, &[], &[Value::I64(-100)]);
+    // Signed positive (top niche bit clear): sign-extend must keep it positive.
+    let p = "long f(void){ volatile _BitInt(56) g = 0x1234567890AB; return (long)g; }";
+    check("p56", p, &[], &[Value::I64(20_015_998_341_291)]);
+}
+
+// ---- §6 / D-DBG-7: the debug-info waist (LLVM as the third producer) -------------------------
+
+/// The LLVM on-ramp populates the §6 frontend-neutral debug-info waist's **source-line half** from
+/// each instruction's `!DILocation` — the third independent frontend (after chibicc and the wasm
+/// DWARF producer) to feed the *same* neutral core, the cross-check that the waist isn't coupled to
+/// any one frontend (DEBUGGING.md §6). (The variable/type half is covered by the `_o0_`/`_og_`
+/// tests; here `n` rides in as an argument var, asserted minimally.)
+#[test]
+fn llvm_dilocation_maps_into_the_debug_info_waist() {
+    // A chain of dependent statements over a runtime input: each keeps its own source line and
+    // lowers to a real (non-terminator) arithmetic op, so several distinct lines reach the IR pcs
+    // (clang can't constant-fold the chain away, and nothing collapses onto one line).
+    let src = "\
+int chain(int n) {
+  int a = n + 1;
+  int b = a * 3;
+  int c = b - 2;
+  int d = c * c;
+  return d + a;
+}
+";
+    let Some(bc) = compile_to_ll_g("dilocation", src) else {
+        return; // toolchain unavailable — skip
+    };
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
+    // The debug section is strippable / untrusted-for-escape — it must not affect verification.
+    temen_verify::verify_module(&t.module).expect("verify");
+
+    let di = t
+        .module
+        .debug_info
+        .as_ref()
+        .expect("debug info populated from !DILocation");
+
+    // The file table names the C source (clang records its compile path).
+    assert!(
+        di.files.iter().any(|f| f.ends_with(".c")),
+        "file table names the C source: {:?}",
+        di.files
+    );
+    // Source lines are mapped onto IR pcs.
+    assert!(!di.locs.is_empty(), "some source locations were mapped");
+    // The parameter `n` is ingested via `dbg.value` (the variable half — exercised in depth by the
+    // `_o0_`/`_og_` tests).
+    assert!(
+        di.vars.iter().any(|v| v.name == "n"),
+        "the parameter is ingested"
+    );
+
+    // Every loc resolves to an in-range IR `(func, block, inst)` — the cross-check that the
+    // LLVM-instruction → TEMEN-op mapping is self-consistent.
+    for l in &di.locs {
+        assert!((l.file as usize) < di.files.len(), "loc file in range");
+        let f = l.func as usize;
+        assert!(f < t.module.funcs.len(), "loc func {f} in range");
+        let b = l.block as usize;
+        assert!(b < t.module.funcs[f].blocks.len(), "loc block in range");
+        assert!(
+            (l.inst as usize) < t.module.funcs[f].blocks[b].insts.len(),
+            "loc inst in range"
+        );
+        assert!(l.line >= 1, "a real source line");
+    }
+
+    // The body spans several source lines (the multiply/add at line 4, the return at line 5) — not
+    // everything collapsed onto the function's opening line.
+    let lines: std::collections::BTreeSet<u32> = di.locs.iter().map(|l| l.line).collect();
+    assert!(
+        lines.len() >= 3,
+        "the statement chain maps several distinct source lines: {lines:?}"
+    );
+
+    // §6 function names: the `DISubprogram` source name is ingested into `func_names` (mapped to its
+    // IR function index), so an LLVM-frontend backtrace reads `chain` instead of `fn{N}`.
+    let chain = di
+        .func_names
+        .iter()
+        .find(|fnm| fnm.name == "chain")
+        .expect("the chain() function name is ingested");
+    assert!(
+        (chain.func as usize) < t.module.funcs.len(),
+        "func_names index in range"
+    );
+}
+
+/// A non-`-g` build carries **no** debug section — the waist is absent (zero cost), byte-identical
+/// to before this producer existed.
+#[test]
+fn llvm_without_g_has_no_debug_info() {
+    let Some((m, _)) = translate_verified("no_g", "int id(int x) { return x; }") else {
+        return;
+    };
+    assert!(m.debug_info.is_none(), "no -g ⇒ no debug section");
+}
+
+/// The §6 **variable/type half** for LLVM: the textual metadata reader (`ll::debug`) walks the
+/// `-O0 -g` DI metadata to recover each source local's name + structured type, correlated to the IR by alloca
+/// ordinal, landing it in the waist as a `Window` var — the LLVM analog of the wasm DWARF
+/// aggregate/pointer/array ingest (DEBUGGING.md slice 25). Mirrors the wasm
+/// `wasm_dwarf_ingests_aggregate_pointer_and_array_types` test over the same struct/array/pointer
+/// shapes, the cross-frontend cross-check that the structured-type waist is genuinely neutral.
+#[test]
+fn llvm_o0_ingests_aggregate_pointer_and_array_variables() {
+    use temen_ir::{TypeDef, VarLoc};
+
+    // `pp = &p` forces the struct to stay in memory (a real dbg.declare/alloca, not a dbg.value).
+    let src = "\
+struct Point { int x; int y; };
+int dist(int n) {
+  struct Point p;
+  int row[3];
+  struct Point *pp = &p;
+  p.x = n; p.y = n + 1;
+  row[0] = n;
+  return p.x + p.y + row[0] + pp->x;
+}
+";
+    let Some(bc) = compile_to_ll_o0g("llvm_vars", src) else {
+        return; // toolchain unavailable — skip
+    };
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
+    temen_verify::verify_module(&t.module).expect("verify"); // debug info is escape-irrelevant
+    let di = t.module.debug_info.as_ref().expect("debug info");
+
+    let var = |n: &str| {
+        di.vars.iter().find(|v| v.name == n).unwrap_or_else(|| {
+            panic!(
+                "var {n}: {:?}",
+                di.vars.iter().map(|v| &v.name).collect::<Vec<_>>()
+            )
+        })
+    };
+    let var_type = |n: &str| &di.types[var(n).type_id.expect("typed") as usize];
+
+    // Every local is a `Window` frame slot (the alloca's data-stack offset); offsets are distinct.
+    let mut offs = Vec::new();
+    for n in ["p", "row", "pp"] {
+        let VarLoc::Window { off } = var(n).loc else {
+            panic!("{n} is a Window var, got {:?}", var(n).loc);
+        };
+        assert!(off >= 0 && (off as u64) < t.module.funcs[0].blocks.len() as u64 * 4096);
+        offs.push(off);
+    }
+    offs.sort();
+    offs.dedup();
+    assert_eq!(offs.len(), 3, "p/row/pp occupy distinct frame slots");
+
+    // `struct Point p` — aggregate x@0, y@4, both 4-byte ints, size 8.
+    let TypeDef::Aggregate { name, size, fields } = var_type("p") else {
+        panic!("p is a struct, got {:?}", var_type("p"));
+    };
+    assert_eq!(name, "struct Point");
+    assert_eq!(*size, 8);
+    assert_eq!(
+        fields
+            .iter()
+            .map(|f| (f.name.as_str(), f.offset))
+            .collect::<Vec<_>>(),
+        vec![("x", 0), ("y", 4)]
+    );
+    assert!(matches!(
+        &di.types[fields[0].ty as usize],
+        TypeDef::Base { size: 4, .. }
+    ));
+
+    // `int row[3]` — array of 3 ints.
+    let TypeDef::Array { elem, count, .. } = var_type("row") else {
+        panic!("row is an array, got {:?}", var_type("row"));
+    };
+    assert_eq!(*count, 3);
+    assert!(matches!(
+        &di.types[*elem as usize],
+        TypeDef::Base { size: 4, .. }
+    ));
+
+    // `struct Point *pp` — pointer whose pointee is the same aggregate as `p`.
+    let TypeDef::Pointer { pointee, name, .. } = var_type("pp") else {
+        panic!("pp is a pointer, got {:?}", var_type("pp"));
+    };
+    assert_eq!(name, "struct Point *");
+    assert!(matches!(
+        &di.types[*pointee as usize],
+        TypeDef::Aggregate { name, .. } if name == "struct Point"
+    ));
+}
+
+/// Runtime proof that the alloca-ordinal correlation lands on the **right** frame slots: stop the
+/// interpreter just before `dist` returns and read each source variable back through the §6 waist
+/// (`Window` reads at the resolved data-stack offset). Locks that the `dbg.declare` address →
+/// alloca ordinal → frame offset chain is correct, not merely structurally plausible.
+#[test]
+fn llvm_o0_variables_read_at_runtime() {
+    use temen_interp::{Inspector, IrPc, Stop, VarValue};
+
+    let src = "\
+struct Point { int x; int y; };
+int dist(int n) {
+  struct Point p;
+  int row[3];
+  struct Point *pp = &p;
+  p.x = n; p.y = n + 1;
+  row[0] = n;
+  return p.x + p.y + row[0] + pp->x;
+}
+";
+    let Some(bc) = compile_to_ll_o0g("llvm_vars_rt", src) else {
+        return; // toolchain unavailable — skip
+    };
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
+    temen_verify::verify_module(&t.module).expect("verify");
+
+    // Break at the last instruction of the last block — `dist` is branch-free at -O0, so by here
+    // every store (p.x=n, p.y=n+1, row[0]=n) has executed.
+    let lb = t.module.funcs[0].blocks.len() - 1;
+    let li = t.module.funcs[0].blocks[lb].insts.len() - 1;
+    let n = 5i32;
+    let args = [Value::I64(t.entry_sp as i64), Value::I32(n)];
+    let mut insp = Inspector::attach(&t.module, 0, &args, 50_000_000);
+    insp.set_breakpoint(IrPc {
+        module: 0,
+        func: 0,
+        block: lb,
+        inst: li,
+    });
+    assert!(
+        matches!(insp.run_until_stop(), Stop::Break { .. }),
+        "stopped at the return"
+    );
+
+    let i32_at = |vv: Option<VarValue>, off: usize| -> i32 {
+        match vv {
+            Some(VarValue::Bytes(b)) => i32::from_le_bytes(b[off..off + 4].try_into().unwrap()),
+            other => panic!("expected window bytes, got {other:?}"),
+        }
+    };
+    // `struct Point p` reads x = n, y = n + 1 (8 bytes: x then y).
+    let p = insp.read_var(0, "p", 8);
+    assert_eq!(i32_at(p.clone(), 0), n, "p.x");
+    assert_eq!(i32_at(p, 4), n + 1, "p.y");
+    // `int row[3]` — element 0 was set to n.
+    assert_eq!(i32_at(insp.read_var(0, "row", 4), 0), n, "row[0]");
+}
+
+/// The §6 variable half at **`-O2`/`-Og`**: `llvm.dbg.value` binds a source variable to an SSA
+/// value rather than memory (mem2reg/SROA promoted it). The `di` reader recovers `dbg.value`
+/// bindings to a function **argument** and the translator emits a `VarLoc::SsaList` over the
+/// argument's live range (its block-local index per block) — the LLVM frontend exercising the same
+/// location-list machinery chibicc and wasm use, the case where LLVM's debug intrinsics surviving
+/// optimization make the parameter inspectable for free (DEBUGGING.md slice 26).
+#[test]
+fn llvm_og_ingests_argument_via_dbg_value_ssalist() {
+    use temen_interp::{Inspector, IrPc, Stop, VarValue};
+    use temen_ir::{Encoding, TypeDef, VarLoc};
+
+    // A loop keeps `n` live across multiple blocks, so the SsaList spans more than the entry block.
+    let src = "\
+int scaled(int n) {
+  int total = 0;
+  for (int k = 0; k < 4; k++)
+    total += n;
+  return total;
+}
+";
+    let Some(bc) = compile_to_ll_g("og_arg", src) else {
+        return; // toolchain unavailable — skip
+    };
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
+    temen_verify::verify_module(&t.module).expect("verify");
+    let di = t.module.debug_info.as_ref().expect("debug info");
+
+    // `n` (the argument) is ingested as a typed SSA-located var with at least one location-list
+    // entry (no `Window` slot — it was promoted to a register).
+    let n_var = di.vars.iter().find(|v| v.name == "n").unwrap_or_else(|| {
+        panic!(
+            "n ingested: {:?}",
+            di.vars.iter().map(|v| &v.name).collect::<Vec<_>>()
+        )
+    });
+    let VarLoc::SsaList(locs) = &n_var.loc else {
+        panic!("n is an SsaList var, got {:?}", n_var.loc);
+    };
+    assert!(!locs.is_empty(), "n has location-list entries");
+    for l in locs {
+        assert!(
+            (l.block as usize) < t.module.funcs[0].blocks.len(),
+            "entry block in range"
+        );
+    }
+    assert!(matches!(
+        &di.types[n_var.type_id.expect("typed") as usize],
+        TypeDef::Base {
+            encoding: Encoding::Signed,
+            size: 4,
+            ..
+        }
+    ));
+
+    // Runtime: stop in the entry block and read `n` back through the SsaList → the argument value.
+    let n = 7i32;
+    let args = [Value::I64(t.entry_sp as i64), Value::I32(n)];
+    let mut insp = Inspector::attach(&t.module, 0, &args, 50_000_000);
+    // The first entry-block instruction is a step point with the argument already live.
+    insp.set_breakpoint(IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: 0,
+    });
+    assert!(
+        matches!(insp.run_until_stop(), Stop::Break { .. }),
+        "stopped in entry"
+    );
+    assert_eq!(
+        insp.read_var(0, "n", 4),
+        Some(VarValue::Value(Value::I32(n))),
+        "n reads the arg"
+    );
+}
+
+/// The §6 **module-scoped global** half (DEBUGGING.md slice 28): a source-level global variable is
+/// ingested from its `!dbg` `DIGlobalVariableExpression` as a `GLOBAL_SCOPE` `VarLoc::Fixed` var at
+/// the global's window address (correlated by symbol name to the globals layout) — visible in every
+/// frame, with its structured type. Reads back its data-segment value at runtime.
+#[test]
+fn llvm_ingests_source_globals_as_fixed_vars() {
+    use temen_interp::{Inspector, IrPc, Stop, VarValue};
+    use temen_ir::{TypeDef, VarLoc};
+
+    let src = "\
+int counter = 7;
+struct P { int a; int b; } origin = { 3, 4 };
+int bump(int n) { counter = counter + n; return counter + origin.a; }
+";
+    let Some(bc) = compile_to_ll_o0g("globals", src) else {
+        return; // toolchain unavailable — skip
+    };
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
+    temen_verify::verify_module(&t.module).expect("verify");
+    let di = t.module.debug_info.as_ref().expect("debug info");
+
+    let g = |n: &str| {
+        di.vars
+            .iter()
+            .find(|v| v.name == n && v.func == temen_ir::GLOBAL_SCOPE)
+            .unwrap_or_else(|| panic!("global {n} ingested"))
+    };
+    // `counter` is a fixed-address int global; `origin` a fixed-address struct (expandable).
+    let counter = g("counter");
+    let VarLoc::Fixed { addr: counter_addr } = counter.loc else {
+        panic!("counter is Fixed, got {:?}", counter.loc);
+    };
+    assert!(matches!(
+        &di.types[counter.type_id.expect("typed") as usize],
+        TypeDef::Base { size: 4, .. }
+    ));
+    let origin = g("origin");
+    assert!(matches!(origin.loc, VarLoc::Fixed { .. }));
+    assert!(matches!(
+        &di.types[origin.type_id.expect("typed") as usize],
+        TypeDef::Aggregate { name, .. } if name == "struct P"
+    ));
+    assert_ne!(counter_addr, 0, "a real window address");
+
+    // Runtime: at `bump`'s entry the data segment holds counter = 7; read it through the global.
+    let args = [Value::I64(t.entry_sp as i64), Value::I32(10)];
+    let mut insp = Inspector::attach(&t.module, 0, &args, 50_000_000);
+    insp.set_breakpoint(IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: 0,
+    });
+    assert!(
+        matches!(insp.run_until_stop(), Stop::Break { .. }),
+        "stopped at entry"
+    );
+    let read_i32 = |insp: &Inspector| match insp.read_var(0, "counter", 4) {
+        Some(VarValue::Bytes(b)) => i32::from_le_bytes(b[..4].try_into().unwrap()),
+        other => panic!("expected window bytes, got {other:?}"),
+    };
+    assert_eq!(
+        read_i32(&insp),
+        7,
+        "counter's initial value, read globally at entry"
+    );
+}
+
+// --- Rust breadth, deeper: `core`-using programs (enums/`match`, slices, iterators, `Option`) ----
+
+/// Translate a `no_std` Rust crate whose `items` define `#[no_mangle] pub extern "C" fn
+/// run(n: i32) -> i32` (+ any types/helpers), run `run(n)` on both backends (interp == JIT), and
+/// return the result. `None` if the toolchain is unavailable.
+fn rust_run_onramp(name: &str, items: &str, n: i32) -> Option<i32> {
+    let src = format!(
+        "#![no_std]\n#![no_main]\n\
+         #[panic_handler] fn ph(_: &core::panic::PanicInfo) -> ! {{ loop {{}} }}\n{items}\n"
+    );
+    let ll = compile_rust_to_ll(name, &src)?;
+    let t = temen_llvm::translate_ll_path(&ll).expect("translate Rust bitcode");
+    let module = t.module;
+    temen_verify::verify_module(&module).expect("verify translated Rust IR");
+    let idx = module
+        .funcs
+        .iter()
+        .position(|f| f.params == [ValType::I64, ValType::I32] && f.results == [ValType::I32])
+        .expect("run present") as u32;
+    let mut fuel = 200_000_000u64;
+    let interp = match temen_interp::run(
+        &module,
+        idx,
+        &[Value::I64(t.entry_sp as i64), Value::I32(n)],
+        &mut fuel,
+    )
+    .expect("interp run")
+    .as_slice()
+    {
+        [Value::I32(x)] => *x,
+        other => panic!("run: expected one i32, got {other:?}"),
+    };
+    let jit = match temen_jit::compile_and_run(&module, idx, &[t.entry_sp as i64, n as i64])
+        .expect("jit run")
+    {
+        JitOutcome::Returned(s) => s[0] as i32,
+        other => panic!("unexpected JIT outcome {other:?}"),
+    };
+    assert_eq!(interp, jit, "run({n}): interp {interp} vs JIT {jit}");
+    Some(interp)
+}
+
+/// Native oracle: the same `items` (with `run`) compiled by the default `rustc` into a std binary printing
+/// `run(n)`, run natively.
+fn rust_run_native(name: &str, items: &str, n: i32) -> Option<i32> {
+    let dir = std::env::temp_dir();
+    // Per-test unique paths (`name`) — tests run in parallel, so a shared path would race.
+    let rs = dir.join(format!(
+        "temen_llvm_{}_{}_rsrun.rs",
+        std::process::id(),
+        name
+    ));
+    let exe = dir.join(format!("temen_llvm_{}_{}_rsrun", std::process::id(), name));
+    std::fs::write(
+        &rs,
+        format!("{items}\nfn main() {{ println!(\"{{}}\", run({n})); }}\n"),
+    )
+    .expect("write Rust source");
+    match Command::new("rustc")
+        .args([
+            "--edition",
+            "2021",
+            "-C",
+            "opt-level=2",
+            "-C",
+            "overflow-checks=off",
+        ])
+        .arg(&rs)
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => return None,
+    }
+    let out = Command::new(&exe).output().expect("run native rust");
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("parse native run"),
+    )
+}
+
+/// Drive `items` (which define `run(i32)->i32`) through both lanes for each `n`, asserting the on-ramp
+/// matches native `rustc`.
+fn check_rust_run_vs_native(name: &str, items: &str, ns: &[i32]) {
+    for &n in ns {
+        let (Some(temen), Some(native)) = (
+            rust_run_onramp(name, items, n),
+            rust_run_native(name, items, n),
+        ) else {
+            return; // toolchain unavailable — skip
+        };
+        assert_eq!(
+            temen, native,
+            "{name}: run({n}) on-ramp {temen} vs native {native}"
+        );
+    }
+}
+
+/// **Real Rust** — idiomatic `core` (a `#[repr(u8)]` enum dispatched by `match`, fixed arrays +
+/// slice iteration, `Option` + `match`, an iterator `find` with a closure) through the on-ramp,
+/// byte-identical to native `rustc`. A bytecode-style fold over a data array, then an `Option`-typed
+/// search — the shapes a real `no_std` Rust program is built from. Exercises enum discriminants →
+/// `switch`/`br_table`, slice indexing, niche-optimized `Option<i32>`, and `-O2` iterator lowering.
+#[test]
+fn rust_core_enum_slice_option() {
+    let items = r#"
+#[no_mangle]
+pub extern "C" fn run(n: i32) -> i32 {
+    #[derive(Clone, Copy)]
+    #[repr(u8)]
+    enum Op { Add, Mul, Xor, Sub }
+    fn apply(op: Op, a: i32, x: i32) -> i32 {
+        match op {
+            Op::Add => a.wrapping_add(x),
+            Op::Mul => a.wrapping_mul(x),
+            Op::Xor => a ^ x,
+            Op::Sub => a.wrapping_sub(x),
+        }
+    }
+    let prog = [Op::Add, Op::Mul, Op::Xor, Op::Sub, Op::Add];
+    let data = [3i32, 1, 4, 1, 5, 9, 2, 6];
+    let mut acc = n;
+    let mut k = 0usize;
+    for &x in data.iter() {
+        acc = apply(prog[k % prog.len()], acc, x);
+        k += 1;
+    }
+    acc = acc.wrapping_add(match data.iter().copied().find(|&v| v > n) {
+        Some(v) => v,
+        None => -1,
+    });
+    acc
+}
+"#;
+    check_rust_run_vs_native("rs_core", items, &[0, 1, 5, 100, -3, 1000]);
+}
+
+/// **Real Rust** — by-value `struct`s, an array-of-struct with slice iteration + field access, a
+/// by-value struct argument, signed `/`+`%`, and an iterator `map().max()` yielding `Option<i32>`.
+/// The aggregate/by-value-struct shapes (clang's small-struct coercion, slice J) and `-O2` iterator
+/// lowering, from the Rust frontend — byte-identical to native `rustc`.
+#[test]
+fn rust_core_structs_and_iterators() {
+    let items = r#"
+#[no_mangle]
+pub extern "C" fn run(n: i32) -> i32 {
+    #[derive(Clone, Copy)]
+    struct Pt { x: i32, y: i32 }
+    fn norm(p: Pt) -> i32 { p.x.wrapping_mul(p.x).wrapping_add(p.y.wrapping_mul(p.y)) }
+    let pts = [
+        Pt { x: 1, y: 2 },
+        Pt { x: n, y: 3 },
+        Pt { x: 4, y: n / 2 },
+        Pt { x: n % 5, y: 7 },
+    ];
+    let mut s = 0i32;
+    for p in pts.iter() {
+        s = s.wrapping_add(norm(*p));
+    }
+    let best = pts.iter().map(|p| norm(*p)).max();
+    s.wrapping_add(match best { Some(m) => m, None => 0 })
+}
+"#;
+    check_rust_run_vs_native("rs_structs", items, &[0, 3, 10, -8, 100]);
+}
+
+/// **Real Rust panic paths** — a runtime division emits non-elidable div-by-zero + overflow checks
+/// whose panic branches call `core::panicking::panic_const_*` (external libcore). Under `panic=abort`
+/// the on-ramp lowers those to a trap (drop + the trailing `unreachable`), so the program *translates*
+/// — the gap that blocks essentially all real Rust. The divisor here is `(n & 7) + 1` through
+/// `black_box` (always ≥ 1, but opaque so the panic paths stay in the IR), so the non-panic path runs
+/// and `n / d` matches native `rustc` exactly. Without the fix, translation fails on the undefined
+/// `panic_const_div_by_zero` reference.
+#[test]
+fn rust_panic_path_div_traps_and_runs() {
+    let items = r#"
+#[no_mangle]
+pub extern "C" fn run(n: i32) -> i32 {
+    let tmp = (n & 7) + 1;                      // [1, 8] — never zero…
+    let d = unsafe { core::ptr::read_volatile(&tmp) }; // …but opaque (a volatile load), so the
+                                                // div-by-zero + overflow panic checks stay in the IR
+    (n / d).wrapping_add(n % d)
+}
+"#;
+    check_rust_run_vs_native("rs_panic", items, &[0, 1, 7, 100, -50, 1234]);
+}
+
+/// **Rust trait objects** — `&dyn Trait` dynamic dispatch through the on-ramp. Two types implement a
+/// trait; an array of `&dyn Shape` (each a `{data, vtable}` fat pointer) is iterated and the method is
+/// called dynamically — a vtable load + `call_indirect` per element, the Rust analog of the C++ vtable
+/// path (slice AG). Exercises Rust vtable globals (function-pointer initializers, slice K), fat-pointer
+/// aggregates, and dynamic dispatch — byte-identical to native `rustc`.
+#[test]
+fn rust_trait_object_dispatch() {
+    let items = r#"
+trait Shape {
+    fn area(&self) -> i32;
+}
+struct Sq(i32);
+struct Rect(i32, i32);
+impl Shape for Sq {
+    fn area(&self) -> i32 { self.0.wrapping_mul(self.0) }
+}
+impl Shape for Rect {
+    fn area(&self) -> i32 { self.0.wrapping_mul(self.1) }
+}
+
+#[no_mangle]
+pub extern "C" fn run(n: i32) -> i32 {
+    let sq = Sq(n);
+    let rect = Rect(n, 3);
+    let shapes: [&dyn Shape; 2] = [&sq, &rect];
+    let mut total = 0i32;
+    for s in shapes.iter() {
+        total = total.wrapping_add(s.area()); // dynamic dispatch via the vtable
+    }
+    total
+}
+"#;
+    check_rust_run_vs_native("rs_traits", items, &[0, 2, 7, -4, 100]);
+}
+
+/// **Rust slices as arguments** — `&[i32]` (a `{ptr, len}` fat pointer) passed across a real
+/// (`#[inline(never)]`) call boundary, plus a sub-slice (`&data[1..4]`). Exercises the slice-arg ABI
+/// and bounds-checked range indexing (provably in-bounds → elided), vs native `rustc`.
+#[test]
+fn rust_slice_argument() {
+    let items = r#"
+#[inline(never)]
+fn sum(s: &[i32]) -> i32 {
+    let mut t = 0i32;
+    for &x in s { t = t.wrapping_add(x); }
+    t
+}
+#[no_mangle]
+pub extern "C" fn run(n: i32) -> i32 {
+    let data = [n, n.wrapping_add(1), n.wrapping_add(2), 7, 5, 6];
+    sum(&data).wrapping_add(sum(&data[1..4]))
+}
+"#;
+    check_rust_run_vs_native("rs_slice", items, &[0, 10, -3]);
+}
+
+/// **Rust `Option::unwrap`** — the unwrap panic path (`core::panicking::panic` / `unwrap_failed`) is
+/// in the IR; under `panic=abort` it lowers to a trap (slice AI's recognizer). The value is always
+/// `Some` at runtime, so the non-panic path runs and matches native `rustc`.
+#[test]
+fn rust_option_unwrap() {
+    let items = r#"
+#[no_mangle]
+pub extern "C" fn run(n: i32) -> i32 {
+    let v: Option<i32> = if (n & 1) == 0 { Some(n.wrapping_mul(3)) } else { Some(n.wrapping_sub(1)) };
+    v.unwrap().wrapping_add(7) // always Some at runtime; the None panic path traps
+}
+"#;
+    check_rust_run_vs_native("rs_unwrap", items, &[0, 1, 8, -5]);
+}
+
+/// Run a `no_std` + `alloc` Rust crate (whose `items` define `fn compute() -> i32`) **through the
+/// powerbox**: the on-ramp synthesizes `#[no_mangle] extern "C" fn main` calling `compute`, so it gets
+/// a powerbox `_start` that grants the `Memory` handle and seeds the heap (the `vm_map`-growing bump
+/// allocator the program's `#[global_allocator]` reaches via `malloc`). Returns `compute()`'s value as
+/// the program's `u8` exit/return code, run on the JIT. `None` if the toolchain is unavailable.
+fn rust_alloc_onramp(name: &str, items: &str) -> Option<u8> {
+    let src = format!(
+        "#![no_std]\n#![no_main]\n\
+         #[panic_handler] fn ph(_: &core::panic::PanicInfo) -> ! {{ loop {{}} }}\n\
+         {items}\n\
+         #[no_mangle] pub extern \"C\" fn main() -> i32 {{ compute() }}\n"
+    );
+    let ll = compile_rust_to_ll(name, &src)?;
+    let t = temen_llvm::translate_ll_path(&ll).expect("translate Rust bitcode");
+    assert!(
+        temen_run::is_named_powerbox_entry(&t.module),
+        "{name}: an alloc program must produce a powerbox entry (Memory granted)"
+    );
+    let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
+    temen_verify::verify_module(&module).expect("verify translated Rust IR");
+    let run = temen_run::run_powerbox(&module, b"").expect("powerbox run");
+    Some(match run.outcome {
+        temen_run::Outcome::Exited(c) => c as u8,
+        temen_run::Outcome::Returned(ref v) => match v.first() {
+            Some(temen_interp::Value::I32(x)) => *x as u8,
+            _ => 0,
+        },
+    })
+}
+
+/// Native oracle: the same `items` (with `compute`) built as a std binary that `process::exit`s with
+/// `compute()`, run natively; its `u8` exit code is the ground truth.
+fn rust_alloc_native(name: &str, items: &str) -> Option<u8> {
+    let dir = std::env::temp_dir();
+    let rs = dir.join(format!(
+        "temen_llvm_{}_{}_alloc.rs",
+        std::process::id(),
+        name
+    ));
+    let exe = dir.join(format!("temen_llvm_{}_{}_alloc", std::process::id(), name));
+    std::fs::write(
+        &rs,
+        format!("{items}\nfn main() {{ std::process::exit(compute()); }}\n"),
+    )
+    .expect("write Rust source");
+    match Command::new("rustc")
+        .args([
+            "--edition",
+            "2021",
+            "-C",
+            "opt-level=2",
+            "-C",
+            "overflow-checks=off",
+        ])
+        .arg(&rs)
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => return None,
+    }
+    Some(
+        Command::new(&exe)
+            .status()
+            .expect("run native")
+            .code()
+            .unwrap_or(-1) as u8,
+    )
+}
+
+/// **Rust `alloc` / heap — `Vec` via a guest `#[global_allocator]`.** The headline for *real* Rust: a
+/// `no_std` + `alloc` crate whose global allocator routes to the guest `malloc`/`free`. Run through the
+/// powerbox (the on-ramp synthesizes `main` → `_start`, granting the `Memory` handle and the
+/// `vm_map`-growing bump allocator), `Vec::push` grows the heap (alloc + `memcpy` + free) and the sum
+/// is returned as the exit code — heap data structures from Rust, byte-identical to native `rustc`.
+#[test]
+fn rust_alloc_vec_via_global_allocator() {
+    let items = r#"
+extern crate alloc;
+use alloc::vec::Vec;
+use core::alloc::{GlobalAlloc, Layout};
+
+extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+}
+struct Guest;
+unsafe impl GlobalAlloc for Guest {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 { malloc(layout.size()) }
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) { free(ptr); }
+}
+#[global_allocator]
+static GA: Guest = Guest;
+
+fn compute() -> i32 {
+    let mut v: alloc::vec::Vec<i32> = Vec::new();
+    let mut i = 0i32;
+    while i < 64 {
+        v.push(i.wrapping_mul(i)); // grows the heap several times
+        i = i.wrapping_add(1);
+    }
+    let mut s: i32 = 0;
+    for &x in v.iter() {
+        s = s.wrapping_add(x);
+    }
+    s.rem_euclid(251) // a deterministic value in [0, 250] — fits the u8 exit code
+}
+"#;
+    let (Some(temen), Some(native)) = (
+        rust_alloc_onramp("rs_alloc", items),
+        rust_alloc_native("rs_alloc", items),
+    ) else {
+        return;
+    };
+    assert_eq!(
+        temen, native,
+        "rust alloc/Vec: on-ramp exit {temen} vs native {native}"
+    );
+    // Pin the value so the differential can't pass vacuously: Σ i² for i in 0..64 = 85344; % 251 = 4.
+    assert_eq!(temen, 4, "rust alloc/Vec: expected 4, got {temen}");
+}
+
+/// **Rust `Box` + `String` — a mini expression evaluator (the heap capstone).** A recursive-descent
+/// parser over a byte slice builds a `Box`ed recursive AST (`enum Expr { Num, Add(Box,Box), … }` — the
+/// canonical use of `Box`), `eval` walks it recursively, and `render` serializes it back into a
+/// `String` (heap text via the guest allocator). The result + the rendered length is returned — `Box`,
+/// `String`, recursive enums, slice parsing, and the panic paths (a malformed parse would trap) all at
+/// once, byte-identical to native `rustc`. A tiny interpreter, right at home next to the guest-JIT demo.
+#[test]
+fn rust_box_string_expr_evaluator() {
+    let items = r#"
+extern crate alloc;
+use alloc::boxed::Box;
+use alloc::string::String;
+use core::alloc::{GlobalAlloc, Layout};
+
+extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+}
+struct Guest;
+unsafe impl GlobalAlloc for Guest {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 { malloc(l.size()) }
+    unsafe fn dealloc(&self, p: *mut u8, _l: Layout) { free(p); }
+}
+#[global_allocator]
+static GA: Guest = Guest;
+
+enum Expr {
+    Num(i64),
+    Add(Box<Expr>, Box<Expr>),
+    Sub(Box<Expr>, Box<Expr>),
+    Mul(Box<Expr>, Box<Expr>),
+}
+
+fn eval(e: &Expr) -> i64 {
+    match e {
+        Expr::Num(n) => *n,
+        Expr::Add(a, b) => eval(a).wrapping_add(eval(b)),
+        Expr::Sub(a, b) => eval(a).wrapping_sub(eval(b)),
+        Expr::Mul(a, b) => eval(a).wrapping_mul(eval(b)),
+    }
+}
+
+fn render(e: &Expr, out: &mut String) {
+    match e {
+        Expr::Num(n) => {
+            let mut v = *n;
+            if v == 0 { out.push('0'); }
+            let mut tmp = [0u8; 20];
+            let mut k = 0;
+            while v > 0 { tmp[k] = b'0' + (v % 10) as u8; v /= 10; k += 1; }
+            while k > 0 { k -= 1; out.push(tmp[k] as char); }
+        }
+        Expr::Add(a, b) => { out.push('('); render(a, out); out.push('+'); render(b, out); out.push(')'); }
+        Expr::Sub(a, b) => { out.push('('); render(a, out); out.push('-'); render(b, out); out.push(')'); }
+        Expr::Mul(a, b) => { out.push('('); render(a, out); out.push('*'); render(b, out); out.push(')'); }
+    }
+}
+
+struct Parser<'a> { s: &'a [u8], pos: usize }
+impl<'a> Parser<'a> {
+    fn peek(&self) -> u8 { if self.pos < self.s.len() { self.s[self.pos] } else { 0 } }
+    fn bump(&mut self) -> u8 { let c = self.peek(); self.pos += 1; c }
+    fn number(&mut self) -> Box<Expr> {
+        let mut n: i64 = 0;
+        while self.peek().is_ascii_digit() {
+            n = n.wrapping_mul(10).wrapping_add((self.bump() - b'0') as i64);
+        }
+        Box::new(Expr::Num(n))
+    }
+    fn factor(&mut self) -> Box<Expr> {
+        if self.peek() == b'(' {
+            self.bump();
+            let e = self.expr();
+            self.bump(); // ')'
+            e
+        } else {
+            self.number()
+        }
+    }
+    fn term(&mut self) -> Box<Expr> {
+        let mut left = self.factor();
+        while self.peek() == b'*' {
+            self.bump();
+            let right = self.factor();
+            left = Box::new(Expr::Mul(left, right));
+        }
+        left
+    }
+    fn expr(&mut self) -> Box<Expr> {
+        let mut left = self.term();
+        loop {
+            match self.peek() {
+                b'+' => { self.bump(); let r = self.term(); left = Box::new(Expr::Add(left, r)); }
+                b'-' => { self.bump(); let r = self.term(); left = Box::new(Expr::Sub(left, r)); }
+                _ => break,
+            }
+        }
+        left
+    }
+}
+
+fn compute() -> i32 {
+    let input = b"2+3*4-(5-1)*2+10";          // = 2 + 12 - 8 + 10 = 16
+    let mut p = Parser { s: input, pos: 0 };
+    let ast = p.expr();
+    let result = eval(&ast);
+    let mut s = String::new();
+    render(&ast, &mut s);                       // a fully-parenthesized rendering
+    result.wrapping_add(s.len() as i64).rem_euclid(251) as i32
+}
+"#;
+    let (Some(temen), Some(native)) = (
+        rust_alloc_onramp("rs_expr", items),
+        rust_alloc_native("rs_expr", items),
+    ) else {
+        return;
+    };
+    assert_eq!(
+        temen, native,
+        "expr evaluator: on-ramp {temen} vs native {native}"
+    );
+    // Pin it (non-vacuous): eval = 16, render = `(((2+(3*4))-((5-1)*2))+10)` (26 chars); 42 % 251 = 42.
+    assert_eq!(temen, 42, "expr evaluator: expected 42, got {temen}");
+}
+
+// ============================================================================================
+// SIMD — focused tests pinning specific `-O2` **auto-vectorized** shapes (§17/D58 `v128`). The
+// C/C++/Rust breadth lanes now vectorize too (slices AN–AT), so the real corpus demos exercise SIMD
+// end to end; these tests additionally pin each shape/op-class (conversions, rotate, shuffle, masks)
+// to a known value for non-vacuity.
+// ============================================================================================
+
+/// Like [`compile_to_ll`] (auto-vectorization is enabled in both now), kept as the explicit SIMD
+/// harness so a reduction loop's `<4 x i32>` + `llvm.vector.reduce.*` is pinned to a known value.
+fn compile_to_ll_vectorized(name: &str, src: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("temen_llvm_{}_{}.c", std::process::id(), name));
+    let bc = dir.join(format!(
+        "temen_llvm_simd_{}_{}.ll",
+        std::process::id(),
+        name
+    ));
+    std::fs::write(&c, src).expect("write C source");
+    let status = Command::new("clang")
+        .args(["-O2", "-emit-llvm", "-S"])
+        .arg(&c)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(bc),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
+/// Like [`compile_to_ll_vectorized`] but targeting **AVX2** (`-mavx2`), so the auto-vectorizer emits
+/// wider-than-128-bit vectors (`<8 x i32>`, and `<16 x i32>` under interleave) — the exact shapes
+/// the I2 legalization pass splits into `v128` chunks. The `.ll` only *names* AVX vectors; the Temen
+/// JIT still lowers each chunk to SSE2/NEON, so no AVX2 hardware is needed to run the result.
+fn compile_to_ll_avx(name: &str, src: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("temen_llvm_{}_{}.c", std::process::id(), name));
+    let bc = dir.join(format!(
+        "temen_llvm_simd_{}_{}.ll",
+        std::process::id(),
+        name
+    ));
+    std::fs::write(&c, src).expect("write C source");
+    let status = Command::new("clang")
+        .args(["-O2", "-mavx2", "-emit-llvm", "-S"])
+        .arg(&c)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(bc),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
+/// Run `run(seed)` (function 0) from **vectorized** bitcode on both backends and assert it equals a
+/// native `cc` build's exit code (the on-ramp's SIMD lowering vs the scalar native result — they
+/// compute the same value).
+fn check_vectorized_vs_native(name: &str, src: &str, seed: i32) {
+    let Some(bc) = compile_to_ll_vectorized(name, src) else {
+        return;
+    };
+    check_simd_bc_vs_native(name, &bc, seed);
+}
+
+/// Like [`check_vectorized_vs_native`] but ingests **AVX2** auto-vectorized bitcode (wider-than-128
+/// shapes), which the I2 legalization pass splits into `v128` chunks. The native oracle is a plain
+/// scalar `cc` build of the same loop (gcc needs no `-mavx2`), so TEMEN-chunked == native-scalar.
+fn check_avx_vs_native(name: &str, src: &str, seed: i32) {
+    let Some(bc) = compile_to_ll_avx(name, src) else {
+        return;
+    };
+    check_simd_bc_vs_native(name, &bc, seed);
+}
+
+/// Shared body: build the source's `.c` natively with `cc`, run it, then translate `bc`, verify, and
+/// run `run(seed)` (function 0) on both backends — asserting interp == JIT == native exit code.
+fn check_simd_bc_vs_native(name: &str, bc: &Path, seed: i32) {
+    let exe = std::env::temp_dir().join(format!(
+        "temen_llvm_simdnat_{}_{}",
+        std::process::id(),
+        name
+    ));
+    let c = std::env::temp_dir().join(format!("temen_llvm_{}_{}.c", std::process::id(), name));
+    match Command::new("cc").arg(&c).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => return,
+    }
+    let native = Command::new(&exe)
+        .status()
+        .expect("run native")
+        .code()
+        .unwrap() as u8;
+
+    let t = temen_llvm::translate_ll_path(bc).expect("translate vectorized bitcode");
+    let module = t.module;
+    temen_verify::verify_module(&module).expect("verify translated IR");
+    let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
+    let mut fuel = 100_000_000u64;
+    let interp = temen_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    let jit = match temen_jit::compile_and_run(&module, 0, &slots).expect("jit run") {
+        JitOutcome::Returned(s) => Value::I32(s[0] as i32),
+        other => panic!("{name}: unexpected JIT outcome {other:?}"),
+    };
+    assert_eq!(interp, vec![jit], "{name}: interp vs JIT");
+    let temen = match jit {
+        Value::I32(x) => x as u8,
+        _ => panic!("expected i32"),
+    };
+    assert_eq!(temen, native, "{name}: temen={temen} vs native cc={native}");
+}
+
+/// **SIMD first light — an auto-vectorized integer reduction.** A `noinline` `sum` over an opaque
+/// pointer vectorizes at `-O2` to an `<4 x i32>` accumulator + `llvm.vector.reduce.add.v4i32`; the
+/// on-ramp ingests the vector lane add (`VIntBin i32x4`) and unrolls the reduce. `run(7)` fills a
+/// global with `7 + i²` (i in 0..20) and sums it = 140 + 2470 = 2610 (exit `2610 & 0xff = 50`), vs
+/// native — proving the on-ramp consumes real `-O2` vectorized output.
+#[test]
+fn simd_int_reduction_first_light() {
+    let src = "int sum(const int *a, int n);\n\
+        static int data[20];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 20; i++) data[i] = seed + i * i;\n\
+        \x20 return sum(data, 20);\n\
+        }\n\
+        __attribute__((noinline)) int sum(const int *a, int n) {\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < n; i++) s += a[i];\n\
+        \x20 return s;\n\
+        }\n\
+        int main(void) { return run(7); }\n";
+    check_vectorized_vs_native("simd_reduce", src, 7);
+}
+
+/// SIMD — an auto-vectorized **max reduction** (`llvm.vector.reduce.smax.v4i32`, + any `<4 x i32>`
+/// lane `smax`). `run(seed)` fills a global with a wave of values and takes the max, vs native —
+/// exercising the min/max reduce fold (`cmp`+`select`).
+#[test]
+fn simd_int_max_reduction() {
+    let src = "int amax(const int *a, int n);\n\
+        static int data[24];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 24; i++) data[i] = ((i * 7 + seed) & 31) - 13;\n\
+        \x20 return amax(data, 24) + 20;\n\
+        }\n\
+        __attribute__((noinline)) int amax(const int *a, int n) {\n\
+        \x20 int m = a[0];\n\
+        \x20 for (int i = 1; i < n; i++) if (a[i] > m) m = a[i];\n\
+        \x20 return m;\n\
+        }\n\
+        int main(void) { return run(3); }\n";
+    check_vectorized_vs_native("simd_max", src, 3);
+}
+
+/// **Capstone — ingesting *real* `-O2 -mavx2` auto-vectorized output.** The motivating I2 case: the
+/// same reduction loop, vectorized for AVX2, emits a wider-than-128 `<8 x i32>` accumulator +
+/// `llvm.vector.reduce.add.v8i32` (and `<16 x i32>` under interleave). The legalization pass splits
+/// each into `v128` chunks, so the on-ramp now ingests it (previously a fail-closed `Unsupported`),
+/// running byte-identical to the native scalar oracle on both backends.
+#[test]
+fn simd_autovec_avx2_reduction() {
+    let src = "int sum(const int *a, int n);\n\
+        static int data[64];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 64; i++) data[i] = seed + i * i;\n\
+        \x20 return sum(data, 64);\n\
+        }\n\
+        __attribute__((noinline)) int sum(const int *a, int n) {\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < n; i++) s += a[i];\n\
+        \x20 return s;\n\
+        }\n\
+        int main(void) { return run(7); }\n";
+    check_avx_vs_native("simd_avx2_reduce", src, 7);
+}
+
+/// `-O2 -mavx2` auto-vectorized **elementwise** kernel (`c[i] = a[i]*b[i] + a[i]`) — wide `<8 x i32>`
+/// lane multiply/add across `v128` chunks (no horizontal reduce), vs the native scalar oracle.
+#[test]
+fn simd_autovec_avx2_elementwise() {
+    let src = "void mul(const int *a, const int *b, int *c, int n);\n\
+        static int A[64], B[64], C[64];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 64; i++) { A[i] = seed + i; B[i] = i * 2 + 1; }\n\
+        \x20 mul(A, B, C, 64);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 64; i++) s += C[i];\n\
+        \x20 return s;\n\
+        }\n\
+        __attribute__((noinline)) void mul(const int *a, const int *b, int *c, int n) {\n\
+        \x20 for (int i = 0; i < n; i++) c[i] = a[i] * b[i] + a[i];\n\
+        }\n\
+        int main(void) { return run(4); }\n";
+    check_avx_vs_native("simd_avx2_elem", src, 4);
+}
+
+/// `-O2 -mavx2` auto-vectorized **wide lane shifts** (`shl`/`lshr`/`ashr` on a `<8 x i32>` by a
+/// constant splat) — ISSUES.md I11. The legalization pass splits the `<8 x i32>` shift into two
+/// `v128` `VShift` chunks (the `wide_int_shift` arm in `lower_wide`); before that the on-ramp
+/// fail-closed on `lshr <8 x i32>` even though the v128 case worked. Mixes a logical and an arithmetic shift so
+/// both `ShrU`/`Shl` and `ShrS` are exercised. Byte-identical to the native scalar oracle.
+#[test]
+fn simd_autovec_avx2_wide_shifts() {
+    let src = "void sh(const int *a, int *c, int n);\n\
+        static int A[64], C[64];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 64; i++) A[i] = (seed + i * 7) * 1103515245 + 12345;\n\
+        \x20 sh(A, C, 64);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 64; i++) s += C[i];\n\
+        \x20 return s & 0xff;\n\
+        }\n\
+        __attribute__((noinline)) void sh(const int *a, int *c, int n) {\n\
+        \x20 for (int i = 0; i < n; i++) c[i] = ((unsigned) a[i] >> 5) ^ (a[i] << 3) ^ (a[i] >> 2);\n\
+        }\n\
+        int main(void) { return run(9); }\n";
+    check_avx_vs_native("simd_avx2_wide_shifts", src, 9);
+}
+
+/// ISSUES.md I13 (root fix, isolated) — `<2 x i32>` lane arithmetic carried as a packed `i64` must be
+/// lane-wise for **every** cross-lane-unsafe op, not just `mul`: `add`/`sub` carry across the 32-bit lane
+/// boundary and `shl`/`lshr`/`ashr` shift bits between lanes. This uses an explicit `vector_size(8)`
+/// `<2 x i32>` so clang emits the ops directly (`add`, `mul`, `shl`), with large lane values chosen so a
+/// packed-`i64` op would visibly corrupt the high lane. Bit-exact vs the native `cc` oracle on both
+/// backends (and interp == JIT).
+#[test]
+fn simd_vec2_i32_lane_arith_add_shift_i13() {
+    let src = "typedef int v2 __attribute__((vector_size(8)));\n\
+        int run(int seed) {\n\
+        \x20 v2 a = {seed * 7 + 100000, seed + 30000};\n\
+        \x20 v2 b = {seed + 3, seed * 5 + 70000};\n\
+        \x20 v2 c = (a + b) * b;\n\
+        \x20 v2 d = c << 2;\n\
+        \x20 v2 e = d - a;\n\
+        \x20 return e[0] + e[1];\n\
+        }\n\
+        int main(void) { return run(4); }\n";
+    check_vs_native("i13_vec2_addshift", src, 4);
+}
+
+/// ISSUES.md I13 (root fix) — Embench `edn`'s `fir_no_red_ld` ("no-redundant-load" FIR) carries a
+/// `<2 x i16>` across the loop and auto-vectorizes the deinterleaved widening multiply to **`<2 x i32>`
+/// lane arithmetic**. A 2-lane 32-bit vector is held as a *packed* `i64` (lane 0 low, lane 1 high), and
+/// the lane `mul` was lowered as a single `i64` multiply on that packed image — which cross-contaminates
+/// the lanes (the low product's carry and the lane0×lane1 cross term corrupt lane 1). That was a silent
+/// miscompile (previously fail-closed by a φ guard). The fix lowers `<2 x i32>` integer arithmetic
+/// lane-wise. This pins the kernel **bit-exact (full 64-bit checksum)** vs the native `cc` oracle on
+/// both backends — and forces the `mul` lowering to be per-lane `i32`, never a packed `i64.mul`.
+#[test]
+fn simd_vec2_i32_carried_widening_mul_i13() {
+    // `run(long n)` runs the FIR `n` times over a seeded buffer and folds a weighted 64-bit checksum —
+    // wide enough that a corrupted high lane changes the result well beyond a low-byte coincidence.
+    let kernel = "void fir_no_red_ld(const short x[], const short h[], long y[]);\n\
+        void fir_no_red_ld(const short x[], const short h[], long y[]) {\n\
+        \x20 long i, j, sum0, sum1; short x0, x1, h0, h1;\n\
+        \x20 for (j = 0; j < 100; j += 2) { sum0 = 0; sum1 = 0; x0 = x[j];\n\
+        \x20   for (i = 0; i < 32; i += 2) {\n\
+        \x20     x1 = x[j+i+1]; h0 = h[i]; sum0 += x0*h0; sum1 += x1*h0;\n\
+        \x20     x0 = x[j+i+2]; h1 = h[i+1]; sum0 += x1*h1; sum1 += x0*h1; }\n\
+        \x20   y[j] = sum0 >> 15; y[j+1] = sum1 >> 15; }\n\
+        }\n\
+        long run(long n) {\n\
+        \x20 long acc = 0;\n\
+        \x20 for (long t = 0; t < n; t++) {\n\
+        \x20   short X[132], H[32]; long Y[100];\n\
+        \x20   for (int i=0;i<132;i++) X[i]=(short)((i*7+t*3+1)%97 - 48);\n\
+        \x20   for (int i=0;i<32;i++) H[i]=(short)((i*5+t+1)%31 - 15);\n\
+        \x20   for (int i=0;i<100;i++) Y[i]=0;\n\
+        \x20   fir_no_red_ld(X,H,Y);\n\
+        \x20   for (int i=0;i<100;i++) acc += Y[i]*(i+1);\n\
+        \x20 }\n\
+        \x20 return acc;\n\
+        }\n";
+    let main = "long run(long);\n#include <stdio.h>\n\
+        int main(void){ printf(\"%ld %ld\\n\", run(1), run(7)); return 0; }\n";
+    let Some(bc) = compile_to_ll("i13_vec2_fir", kernel) else {
+        return; // clang unavailable
+    };
+    // Native oracle: full 64-bit results for n=1 and n=7 via stdout.
+    let dir = std::env::temp_dir();
+    let csrc = dir.join(format!("temen_llvm_i13_{}.c", std::process::id()));
+    let exe = dir.join(format!("temen_llvm_i13_{}", std::process::id()));
+    std::fs::write(&csrc, format!("{kernel}{main}")).expect("write C");
+    match Command::new("cc").arg(&csrc).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping i13 (cc unavailable)");
+            return;
+        }
+    }
+    let out = Command::new(&exe).output().expect("run native");
+    let s = String::from_utf8_lossy(&out.stdout);
+    let nat: Vec<i64> = s
+        .split_whitespace()
+        .map(|w| w.parse().expect("native i64"))
+        .collect();
+    assert_eq!(nat.len(), 2, "native printed two checksums");
+
+    let t = temen_llvm::translate_ll_path(&bc)
+        .expect("translate (I13 root fix: no longer fail-closed)");
+    let module = &t.module;
+    temen_verify::verify_module(module).expect("verify");
+    let e = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == "run")
+        .map(|x| x.1)
+        .expect("run export");
+    for (k, &expect) in [1i64, 7].iter().zip(&nat) {
+        let mut fuel = 200_000_000u64;
+        let interp = temen_interp::run(
+            module,
+            e,
+            &[Value::I64(t.entry_sp as i64), Value::I64(*k)],
+            &mut fuel,
+        )
+        .expect("interp")[0];
+        let jit =
+            match temen_jit::compile_and_run(module, e, &[t.entry_sp as i64, *k]).expect("jit") {
+                JitOutcome::Returned(v) => v[0],
+                o => panic!("jit outcome {o:?}"),
+            };
+        let interp = match interp {
+            Value::I64(x) => x,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(interp, jit, "I13 n={k}: interp vs jit");
+        assert_eq!(interp, expect, "I13 n={k}: temen vs native cc");
+    }
+}
+
+/// `-O2 -mavx2` auto-vectorized **fixed-point DSP** kernel (Embench `edn`'s `vec_mpy` shape):
+/// `y[i] += (short)((scaler * x[i]) >> 15)`. The `short` widening multiply produces a wide `<8 x i32>`
+/// intermediate that is then **shifted** (`>>15`) and truncated back to `<8 x i16>` — the I11 shape the
+/// wide legalizer rejected before it dispatched shifts through the chunk path. Verified against the
+/// native scalar oracle on both backends.
+#[test]
+fn simd_autovec_avx2_fixed_point_shift() {
+    let src = "void vmpy(short *y, const short *x, short scaler, int n);\n\
+        static short Y[64], X[64];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 64; i++) { X[i] = (short)((seed + i) * 200); Y[i] = (short)(i * 3); }\n\
+        \x20 vmpy(Y, X, (short)(seed * 300 + 100), 64);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 64; i++) s += Y[i];\n\
+        \x20 return s;\n\
+        }\n\
+        __attribute__((noinline)) void vmpy(short *y, const short *x, short scaler, int n) {\n\
+        \x20 for (int i = 0; i < n; i++) y[i] += (short)((scaler * x[i]) >> 15);\n\
+        }\n\
+        int main(void) { return run(4); }\n";
+    check_avx_vs_native("simd_avx2_fixshift", src, 4);
+}
+
+// ============================================================================================
+// SIMD — the **other 128-bit lane shapes** (`i8x16`/`i16x8`/`i64x2`/`f64x2`), beyond the original
+// `i32x4`/`f32x4`. These use explicit `vector_size(16)` types compiled with vectorization *off*
+// (`compile_to_bc` / `check_vs_native`), so the on-ramp sees exactly the declared 128-bit shape —
+// no auto-vectorizer widening. A `noinline` helper takes opaque pointers so clang must emit real
+// `<N x T>` loads/ops, not scalarize them. Each `vec128_shape` op (load/store, `VIntBin`,
+// `VFloatBin`, `ExtractLane`) is exercised against the native oracle on both backends.
+// ============================================================================================
+
+/// `<2 x ptr>` — an SLP-vectorized pointer-pair copy (`load <2 x ptr>` → `store`, e.g. Embench
+/// `sglib-combined`'s linked-list/struct shuffles). A pointer lane is an `i64` window offset, so the
+/// on-ramp packs `<2 x ptr>` exactly like `<2 x i64>` (an `i64x2` v128) and the 16-byte move is a
+/// `V128Load`/`V128Store`. Compares pointer **identity** (portable: absolute addresses differ between
+/// native and temen, but "the copy preserved both pointers" does not).
+#[test]
+fn simd_ptr2_copy() {
+    let src = "struct N { int *a; int *b; };\n\
+        void cp(struct N *d, struct N *s);\n\
+        int run(int seed){\n\
+        \x20 int arr[4]; struct N s, d;\n\
+        \x20 s.a = &arr[seed & 3]; s.b = &arr[(seed + 1) & 3];\n\
+        \x20 cp(&d, &s);\n\
+        \x20 return (d.a == s.a && d.b == s.b) ? 7 : 0;\n\
+        }\n\
+        __attribute__((noinline)) void cp(struct N *d, struct N *s){ d->a = s->a; d->b = s->b; }\n\
+        int main(void){ return run(2); }\n";
+    check_vs_native("simd_ptr2_copy", src, 2);
+}
+
+/// `<2 x i64>` lane multiply + add + per-lane extract (`i64x2` `VIntBin` Mul/Add, `ExtractLane`).
+/// `run(7)`: a={7,9}, b={3,5}, c=a*b+b={24,50}; c[0]+c[1]=74.
+#[test]
+fn simd_i64x2_mul_add_extract() {
+    let src = "long long vdot(const long long *A, const long long *B);\n\
+        static long long A[2], B[2];\n\
+        int run(int seed) {\n\
+        \x20 A[0] = seed; A[1] = seed + 2; B[0] = 3; B[1] = 5;\n\
+        \x20 return (int)(vdot(A, B) & 0xff);\n\
+        }\n\
+        typedef long long i64x2 __attribute__((vector_size(16)));\n\
+        __attribute__((noinline)) long long vdot(const long long *A, const long long *B) {\n\
+        \x20 i64x2 a = *(const i64x2 *)A;\n\
+        \x20 i64x2 b = *(const i64x2 *)B;\n\
+        \x20 i64x2 c = a * b + b;\n\
+        \x20 return c[0] + c[1];\n\
+        }\n\
+        int main(void) { return run(7); }\n";
+    check_vs_native("simd_i64x2", src, 7);
+}
+
+/// `<16 x i8>` lane add through a `v128` load → add → store (`i8x16` load/`VIntBin` Add/store).
+/// Two distinct input arrays so `a + b` stays a real lane add (a self-add would strength-reduce to
+/// a vector shift). The tail-sum reads the stored bytes back from memory and folds them (auto-
+/// vectorized like the rest of the suite — the on-ramp ingests its `zext`/reduce lowering too).
+#[test]
+fn simd_i8x16_add_load_store() {
+    let src = "void vadd(const unsigned char *P, const unsigned char *Q, unsigned char *O);\n\
+        static unsigned char D[16], F[16], E[16];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 16; i++) { D[i] = (unsigned char)(seed + i); F[i] = (unsigned char)(3 * i + 1); }\n\
+        \x20 vadd(D, F, E);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 16; i++) s += E[i];\n\
+        \x20 return s & 0xff;\n\
+        }\n\
+        typedef unsigned char u8x16 __attribute__((vector_size(16)));\n\
+        __attribute__((noinline)) void vadd(const unsigned char *P, const unsigned char *Q, unsigned char *O) {\n\
+        \x20 u8x16 a = *(const u8x16 *)P;\n\
+        \x20 u8x16 b = *(const u8x16 *)Q;\n\
+        \x20 *(u8x16 *)O = a + b;\n\
+        }\n\
+        int main(void) { return run(5); }\n";
+    check_vs_native("simd_i8x16", src, 5);
+}
+
+/// `<8 x i16>` lane multiply through a `v128` load → mul → store (`i16x8` `VIntBin` Mul). Wraps
+/// mod 2^16 per lane; the scalar read-back truncates to the lane width.
+#[test]
+fn simd_i16x8_mul_load_store() {
+    let src = "void vmul(const unsigned short *P, const unsigned short *Q, unsigned short *O);\n\
+        static unsigned short D[8], F[8], E[8];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 8; i++) { D[i] = (unsigned short)(seed + i); F[i] = (unsigned short)(i + 1); }\n\
+        \x20 vmul(D, F, E);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 8; i++) s += E[i];\n\
+        \x20 return s & 0xff;\n\
+        }\n\
+        typedef unsigned short u16x8 __attribute__((vector_size(16)));\n\
+        __attribute__((noinline)) void vmul(const unsigned short *P, const unsigned short *Q, unsigned short *O) {\n\
+        \x20 u16x8 a = *(const u16x8 *)P;\n\
+        \x20 u16x8 b = *(const u16x8 *)Q;\n\
+        \x20 *(u16x8 *)O = a * b;\n\
+        }\n\
+        int main(void) { return run(2); }\n";
+    check_vs_native("simd_i16x8", src, 2);
+}
+
+/// `<16 x i8>` lane multiply through a `v128` load → mul → store (`i8x16` `VIntBin` Mul). x86 has no
+/// per-byte multiply, so the JIT emulates it (widen → `i16x8` multiply → low-byte pack); this pins
+/// that lowering against the native oracle on both backends. Wraps mod 2^8 per lane.
+#[test]
+fn simd_i8x16_mul_load_store() {
+    let src = "void vmul(const unsigned char *P, const unsigned char *Q, unsigned char *O);\n\
+        static unsigned char D[16], F[16], E[16];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 16; i++) { D[i] = (unsigned char)(seed + i); F[i] = (unsigned char)(i + 1); }\n\
+        \x20 vmul(D, F, E);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 16; i++) s += E[i];\n\
+        \x20 return s & 0xff;\n\
+        }\n\
+        typedef unsigned char u8x16 __attribute__((vector_size(16)));\n\
+        __attribute__((noinline)) void vmul(const unsigned char *P, const unsigned char *Q, unsigned char *O) {\n\
+        \x20 u8x16 a = *(const u8x16 *)P;\n\
+        \x20 u8x16 b = *(const u8x16 *)Q;\n\
+        \x20 *(u8x16 *)O = a * b;\n\
+        }\n\
+        int main(void) { return run(2); }\n";
+    check_vs_native("simd_i8x16_mul", src, 2);
+}
+
+/// `<4 x i32>` lane shifts by a **constant splat** (`shl`/`lshr`/`ashr` → `VShift`). The on-ramp
+/// ingests a vector shift whose amount is a constant-splat vector (the shape `clang -O2` emits for
+/// `v >> k`); a signed lane covers the arithmetic (`ashr`) path. Read-back folds the lanes.
+#[test]
+fn simd_i32x4_const_shifts() {
+    let src = "void vsh(const int *P, int *O);\n\
+        static int D[4], E[4];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 4; i++) D[i] = (seed << 8) - i * 12345;\n\
+        \x20 vsh(D, E);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 4; i++) s += E[i];\n\
+        \x20 return s & 0xff;\n\
+        }\n\
+        typedef int i32x4 __attribute__((vector_size(16)));\n\
+        typedef unsigned u32x4 __attribute__((vector_size(16)));\n\
+        __attribute__((noinline)) void vsh(const int *P, int *O) {\n\
+        \x20 i32x4 a = *(const i32x4 *)P;\n\
+        \x20 i32x4 sl = a << 3;\n\
+        \x20 i32x4 sa = a >> 2;\n\
+        \x20 u32x4 su = (u32x4)a >> 5u;\n\
+        \x20 *(i32x4 *)O = sl + sa + (i32x4)su;\n\
+        }\n\
+        int main(void) { return run(7); }\n";
+    check_vs_native("simd_i32x4_shift", src, 7);
+}
+
+/// `<2 x double>` lane multiply + add (`f64x2` `VFloatBin` Mul/Add). Finite values only, so the
+/// per-lane-NaN differential caveat (§17) doesn't apply; the derived integer result is exact.
+#[test]
+fn simd_f64x2_mul_add() {
+    let src = "double vfma(const double *A, const double *B);\n\
+        static double A[2], B[2];\n\
+        int run(int seed) {\n\
+        \x20 A[0] = seed; A[1] = seed + 1; B[0] = 2.0; B[1] = 3.0;\n\
+        \x20 return (int)vfma(A, B);\n\
+        }\n\
+        typedef double f64x2 __attribute__((vector_size(16)));\n\
+        __attribute__((noinline)) double vfma(const double *A, const double *B) {\n\
+        \x20 f64x2 a = *(const f64x2 *)A;\n\
+        \x20 f64x2 b = *(const f64x2 *)B;\n\
+        \x20 f64x2 c = a * b + b;\n\
+        \x20 return c[0] + c[1];\n\
+        }\n\
+        int main(void) { return run(4); }\n";
+    check_vs_native("simd_f64x2", src, 4);
+}
+
+// ============================================================================================
+// SIMD — **wider-than-128-bit** vectors legalized to fixed-128 `v128` chunks + a scalar tail (I2
+// fix-sketch step 1). These use explicit `vector_size` types (compiled with vectorization off) so
+// the on-ramp sees an exact wide shape, and `noinline` helpers with opaque pointers force real wide
+// loads/ops — all *within a single block* (no control flow), exercising the in-block splitter. The
+// `<8 x i32>` / `<4 x i64>` cases split into 2 clean `v128` chunks (no tail); the `<8 x i8>` case is
+// sub-128 and fully scalarized into the tail (0 chunks, 8 lane scalars).
+// ============================================================================================
+
+/// `<8 x i32>` (256-bit) elementwise add → split into **2 `i32x4` chunks** (load/`VIntBin`/store).
+#[test]
+fn simd_i32x8_add_store() {
+    let src = "void vadd8(const int *P, const int *Q, int *O);\n\
+        static int D[8], F[8], E[8];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 8; i++) { D[i] = seed + i; F[i] = 2 * i + 1; }\n\
+        \x20 vadd8(D, F, E);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 8; i++) s += E[i];\n\
+        \x20 return s & 0xff;\n\
+        }\n\
+        typedef int v8si __attribute__((vector_size(32)));\n\
+        __attribute__((noinline)) void vadd8(const int *P, const int *Q, int *O) {\n\
+        \x20 v8si a = *(const v8si *)P, b = *(const v8si *)Q;\n\
+        \x20 *(v8si *)O = a + b;\n\
+        }\n\
+        int main(void) { return run(5); }\n";
+    check_vs_native("simd_i32x8", src, 5);
+}
+
+/// `<8 x i32>` horizontal `llvm.vector.reduce.add.v8i32` (via `__builtin_reduce_add`) over 2 chunks
+/// — the wide-reduce fold (extract every lane of both chunks, sum). `__builtin_reduce_*` is a clang
+/// builtin (`cc`/gcc lacks it), so this uses `check` with a computed expected value (interp == JIT)
+/// rather than the native oracle. `run(3)`: Σ(3 + i²) for i in 0..8 = 24 + 140 = 164.
+#[test]
+fn simd_i32x8_reduce_add() {
+    let src = "int vred8(const int *P);\n\
+        static int D[8];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 8; i++) D[i] = seed + i * i;\n\
+        \x20 return vred8(D);\n\
+        }\n\
+        typedef int v8si __attribute__((vector_size(32)));\n\
+        __attribute__((noinline)) int vred8(const int *P) {\n\
+        \x20 v8si a = *(const v8si *)P;\n\
+        \x20 return __builtin_reduce_add(a);\n\
+        }\n\
+        int main(void) { return run(3); }\n";
+    check("simd_i32x8_red", src, &[Value::I32(3)], &[Value::I32(164)]);
+}
+
+/// `<4 x i64>` (256-bit) lane multiply + horizontal `reduce.add.v4i64` over **2 `i64x2` chunks**.
+/// `run(2)`: Σ (2+i)·(i+1) for i in 0..4 = 2 + 6 + 12 + 20 = 40.
+#[test]
+fn simd_i64x4_mul_reduce() {
+    let src = "long long vred4(const long long *P, const long long *Q);\n\
+        static long long D[4], F[4];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 4; i++) { D[i] = seed + i; F[i] = i + 1; }\n\
+        \x20 return (int)vred4(D, F);\n\
+        }\n\
+        typedef long long v4di __attribute__((vector_size(32)));\n\
+        __attribute__((noinline)) long long vred4(const long long *P, const long long *Q) {\n\
+        \x20 v4di a = *(const v4di *)P, b = *(const v4di *)Q;\n\
+        \x20 v4di c = a * b;\n\
+        \x20 return __builtin_reduce_add(c);\n\
+        }\n\
+        int main(void) { return run(2); }\n";
+    check("simd_i64x4", src, &[Value::I32(2)], &[Value::I32(40)]);
+}
+
+/// `<8 x i8>` (64-bit, sub-128) elementwise add — **fully scalarized into the tail** (0 chunks, 8
+/// lane scalars: a 16-byte `v128.load` would overrun its 8-byte image, so each lane is a byte op).
+#[test]
+fn simd_i8x8_add_tail() {
+    let src = "void vadd8b(const unsigned char *P, const unsigned char *Q, unsigned char *O);\n\
+        static unsigned char D[8], F[8], E[8];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 8; i++) { D[i] = (unsigned char)(seed + i); F[i] = (unsigned char)(3 * i + 1); }\n\
+        \x20 vadd8b(D, F, E);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 8; i++) s += E[i];\n\
+        \x20 return s & 0xff;\n\
+        }\n\
+        typedef unsigned char v8qi __attribute__((vector_size(8)));\n\
+        __attribute__((noinline)) void vadd8b(const unsigned char *P, const unsigned char *Q, unsigned char *O) {\n\
+        \x20 v8qi a = *(const v8qi *)P, b = *(const v8qi *)Q;\n\
+        \x20 *(v8qi *)O = a + b;\n\
+        }\n\
+        int main(void) { return run(5); }\n";
+    check_vs_native("simd_i8x8", src, 5);
+}
+
+/// **Cross-block wide vector.** A reduction loop carries an `<8 x i32>` accumulator across the loop
+/// backedge as a *wide phi* — the case the legalization fan-out exists for: one wide LLVM value
+/// becomes `K` block params (2 `i32x4` chunks here) supplied as `K` branch args on every edge into
+/// the loop header. `n` is opaque (a `noinline` param), so the loop is a real backedge, not unrolled.
+/// `run(3)`: Σ(3 + i) for i in 0..16 = 48 + 120 = 168.
+#[test]
+fn simd_i32x8_loop_accumulator() {
+    let src = "int vsum(const int *P, int n);\n\
+        static int D[16];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 16; i++) D[i] = seed + i;\n\
+        \x20 return vsum(D, 16);\n\
+        }\n\
+        typedef int v8si __attribute__((vector_size(32)));\n\
+        __attribute__((noinline)) int vsum(const int *P, int n) {\n\
+        \x20 v8si acc = {0, 0, 0, 0, 0, 0, 0, 0};\n\
+        \x20 for (int i = 0; i < n; i += 8) {\n\
+        \x20   v8si a = *(const v8si *)(P + i);\n\
+        \x20   acc += a;\n\
+        \x20 }\n\
+        \x20 return __builtin_reduce_add(acc);\n\
+        }\n\
+        int main(void) { return run(3); }\n";
+    check("simd_i32x8_loop", src, &[Value::I32(3)], &[Value::I32(168)]);
+}
+
+// ── Auto-vectorized lane-wise integer conversions (`zext`/`sext`/`trunc`) ──────────────────────
+// temen-ir has no vector-convert op, so the on-ramp scalarizes a `<N x iA> → <N x iB>` widen/narrow:
+// explode the source to lane scalars, convert each in its `i32`/`i64` container, repack into the
+// destination representation (packed-`i64` `<2 x i32>`, a single `v128`, or legalized wide chunks +
+// tail). These `check_vectorized_vs_native` tests ingest **real `clang -O2`** output that emits the
+// conversion (verified to vectorize), covering every source↔dest representation pairing: a wide-tail
+// source widening to a `v128` (`zext <4 x i8> → <4 x i32>`), a `v128` narrowing to a wide tail
+// (`trunc <8 x i32> → <8 x i8>`), a wide source narrowing to a `v128` (`trunc <2 x i64> → <2 x i32>`),
+// and a packed-`i64` `<2 x i32>` widening to a `v128` (`sext <2 x i32> → <2 x i64>`).
+
+/// `zext <4 x i8> → <4 x i32>` (a `u8 → int` widening store loop: wide-tail source widened to a
+/// `v128`), plus the seeding store's `trunc <16 x i32> → <16 x i8>`. A fixed-index read-back (no
+/// horizontal reduction) keeps the conversion the only vector op under test.
+#[test]
+fn simd_conv_zext_u8_to_i32() {
+    let src = "static unsigned char b[128]; static int out[128]; \
+               int run(int seed){ for(int i=0;i<128;i++) b[i]=(unsigned char)(seed+i); \
+               for(int i=0;i<128;i++) out[i]=b[i]; \
+               return (out[0]+out[63]+out[127]) & 0xff; } \
+               int main(void){ return run(7); }";
+    check_vectorized_vs_native("simd_conv_zext", src, 7);
+}
+
+/// `sext <2 x i32> → <2 x i64>` — a sign-extending `int → long long` store loop (the packed-`i64`
+/// `<2 x i32>` representation widened to an `i64x2` `v128`), the exact shape `heapgrow` emits.
+#[test]
+fn simd_conv_sext_i32_to_i64() {
+    let src = "int run(int seed){ int in[64]; long long out[64]; \
+               for(int i=0;i<64;i++) in[i]=seed-i; \
+               for(int i=0;i<64;i++) out[i]=(long long)in[i]; \
+               long long s=0; for(int i=0;i<64;i++) s+=out[i]; return (int)(s & 0xff); } \
+               int main(void){ return run(9); }";
+    check_vectorized_vs_native("simd_conv_sext", src, 9);
+}
+
+/// `trunc <2 x i64> → <2 x i32>` — a narrowing `long long → int` store loop (a wide `i64x2` source
+/// narrowed to a `v128`), the shape `revsum`/`heapgrow` emit.
+#[test]
+fn simd_conv_trunc_i64_to_i32() {
+    let src = "int run(int seed){ long long in[64]; int out[64]; \
+               for(int i=0;i<64;i++) in[i]=(long long)seed*1000+i; \
+               for(int i=0;i<64;i++) out[i]=(int)in[i]; \
+               int s=0; for(int i=0;i<64;i++) s+=out[i]; return s & 0xff; } \
+               int main(void){ return run(4); }";
+    check_vectorized_vs_native("simd_conv_trunc64", src, 4);
+}
+
+/// `trunc <8 x i16> → <8 x i8>` and `trunc <8 x i32> → <8 x i16>` (a `u16 → u8` narrowing store
+/// loop: `v128`/wide sources narrowed to a wide all-tail / `v128` destination). Fixed-index read-back
+/// keeps the conversions the only vector ops under test.
+#[test]
+fn simd_conv_trunc_to_u8() {
+    let src = "static unsigned short in[128]; static unsigned char out[128]; \
+               int run(int seed){ for(int i=0;i<128;i++) in[i]=(unsigned short)(seed*7+i); \
+               for(int i=0;i<128;i++) out[i]=(unsigned char)in[i]; \
+               return (out[0]+out[63]+out[127]) & 0xff; } \
+               int main(void){ return run(5); }";
+    check_vectorized_vs_native("simd_conv_trunc8", src, 5);
+}
+
+/// **Auto-vectorized vector rotate (`llvm.fshl.v4i32`).** A `(x<<13)|(x>>19)` rotate loop, which
+/// `clang -O2` recognizes as a funnel shift and vectorizes to `llvm.fshl.v4i32`. temen-ir's `VShift`
+/// takes only a scalar amount, so the on-ramp scalarizes the rotate idiom (`a == b`) lane-wise — each
+/// lane a scalar `Rotl`/`Rotr` (mask-mod-width, no shift-by-width edge) — then repacks the `v128`.
+/// This is the shape xxHash's `XXH32_round` emits. Fixed-index read-back avoids a vector reduction.
+#[test]
+fn simd_vector_rotate_fshl() {
+    let src = "static unsigned int a[64]; static unsigned int out[64]; \
+               int run(int seed){ for(int i=0;i<64;i++) a[i]=(unsigned)(seed*2654435761u + i); \
+               for(int i=0;i<64;i++){ unsigned x=a[i]; out[i]=(x<<13)|(x>>19); } \
+               return (int)((out[0]^out[31]^out[63]) & 0xff); } \
+               int main(void){ return run(7); }";
+    check_vectorized_vs_native("simd_rotate", src, 7);
+}
+
+/// **Wide non-splat shuffle (`shufflevector <8 x i8>` byte-reverse `<7,6,…,0>`).** A sub-128 vector
+/// (8 bytes → 0 chunks, 8 scalar tail lanes) permuted by a general constant mask — the legalized
+/// analog of the single-`v128` `Inst::Shuffle` path. The on-ramp explodes both operands' lanes,
+/// gathers per the mask (each result lane picks from the `a ++ b` concat), and repacks. This is the
+/// shape the `async_io` demo's byte-reversal emits; here forced via `__builtin_shufflevector`.
+#[test]
+fn simd_wide_shuffle_reverse() {
+    let src = "typedef unsigned char v8qi __attribute__((vector_size(8))); \
+               void rev8(const unsigned char *P, unsigned char *O); \
+               static unsigned char a[8], out[8]; \
+               int run(int seed){ for(int i=0;i<8;i++) a[i]=(unsigned char)(seed+i*3); \
+               rev8(a, out); \
+               return (out[0]*1 + out[3]*5 + out[7]*7) & 0xff; } \
+               __attribute__((noinline)) void rev8(const unsigned char *P, unsigned char *O){ \
+               v8qi v = *(const v8qi*)P; \
+               v8qi r = __builtin_shufflevector(v, v, 7,6,5,4,3,2,1,0); \
+               *(v8qi*)O = r; } \
+               int main(void){ return run(4); }";
+    check_vectorized_vs_native("simd_wide_shuffle", src, 4);
+}
+
+/// **`<N x i1>` boolean mask — vector `icmp` + `select`.** A `(a[i]==b[i]) ? a[i] : b[i]+1` loop,
+/// which `clang -O2` vectorizes to `icmp eq <4 x i32>` (producing a `<4 x i1>` mask) feeding
+/// `select <4 x i1>, …`. temen-ir has no first-class `<N x i1>`, so the on-ramp holds the mask lane-wise
+/// (per-lane scalar compare) and lowers the `select` as a per-lane scalar `select` over the exploded
+/// data, repacked. The same machinery (plus mask `extractelement`) carries the real `crc32` demo.
+#[test]
+fn simd_mask_icmp_select() {
+    let src = "static int a[64], b[64], out[64]; \
+               int run(int seed){ for(int i=0;i<64;i++){ a[i]=seed+i; b[i]=seed*2-i; } \
+               for(int i=0;i<64;i++) out[i] = (a[i]==b[i]) ? a[i] : (b[i]+1); \
+               return (out[0]+out[15]+out[31]+out[63]) & 0xff; } \
+               int main(void){ return run(8); }";
+    check_vectorized_vs_native("simd_mask_select", src, 8);
+}
+
+/// **Rust capstone — a `jsmn`-style JSON tokenizer (a real `no_std` program).** The analog of the C
+/// corpus's `jsmn` demo, in Rust: scan a JSON document (`&[u8]`) into a heap `Vec` of typed tokens
+/// (`enum Kind { Obj, Arr, Str, Prim }` + span), handling strings (with `\`-escapes), whitespace, and
+/// bare primitives, then fold a deterministic digest over the tokens. Exercises enums, `Vec<struct>`
+/// (heap, growth via the guest allocator), `&[u8]` scanning, `match` on bytes, and an enum-to-int
+/// cast — a recognizable real Rust library end to end, byte-identical to native `rustc`.
+#[test]
+fn rust_json_tokenizer_capstone() {
+    let items = r##"
+extern crate alloc;
+use alloc::vec::Vec;
+use core::alloc::{GlobalAlloc, Layout};
+
+extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+}
+struct Guest;
+unsafe impl GlobalAlloc for Guest {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 { malloc(l.size()) }
+    unsafe fn dealloc(&self, p: *mut u8, _l: Layout) { free(p); }
+}
+#[global_allocator]
+static GA: Guest = Guest;
+
+#[derive(Clone, Copy)]
+enum Kind { Obj, Arr, Str, Prim }
+
+#[derive(Clone, Copy)]
+struct Tok { kind: Kind, start: usize, end: usize }
+
+fn is_ws(c: u8) -> bool { matches!(c, b' ' | b'\t' | b'\n' | b'\r') }
+
+fn tokenize(js: &[u8]) -> Vec<Tok> {
+    let mut toks: Vec<Tok> = Vec::new();
+    let mut i = 0usize;
+    while i < js.len() {
+        let c = js[i];
+        if c == b'{' {
+            toks.push(Tok { kind: Kind::Obj, start: i, end: i });
+            i += 1;
+        } else if c == b'[' {
+            toks.push(Tok { kind: Kind::Arr, start: i, end: i });
+            i += 1;
+        } else if c == b'"' {
+            let start = i + 1;
+            i += 1;
+            while i < js.len() && js[i] != b'"' {
+                if js[i] == b'\\' { i += 1; } // skip the escaped char
+                i += 1;
+            }
+            toks.push(Tok { kind: Kind::Str, start, end: i });
+            i += 1; // closing quote
+        } else if is_ws(c) || c == b':' || c == b',' || c == b'}' || c == b']' {
+            i += 1;
+        } else {
+            let start = i;
+            while i < js.len()
+                && !is_ws(js[i])
+                && js[i] != b','
+                && js[i] != b'}'
+                && js[i] != b']'
+            {
+                i += 1;
+            }
+            toks.push(Tok { kind: Kind::Prim, start, end: i });
+        }
+    }
+    toks
+}
+
+fn compute() -> i32 {
+    let doc = br#"{ "name": "v\"m", "tags": ["a", "b", "c"], "n": 42, "ok": true, "x": null }"#;
+    let toks = tokenize(doc);
+    let mut acc: i64 = toks.len() as i64;
+    for t in toks.iter() {
+        acc = acc
+            .wrapping_mul(31)
+            .wrapping_add(t.kind as i64)
+            .wrapping_add(t.end.wrapping_sub(t.start) as i64);
+    }
+    acc.rem_euclid(251) as i32
+}
+"##;
+    let (Some(temen), Some(native)) = (
+        rust_alloc_onramp("rs_json", items),
+        rust_alloc_native("rs_json", items),
+    ) else {
+        return;
+    };
+    assert_eq!(
+        temen, native,
+        "json tokenizer: on-ramp {temen} vs native {native}"
+    );
+    // Pin it (non-vacuous): 14 tokens over the doc, folded digest % 251 = 135.
+    assert_eq!(
+        temen, 135,
+        "json tokenizer: expected digest 135, got {temen}"
+    );
+}
+
+/// §6 lexical-scope ingest from LLVM DI: an inner-block redeclaration (`DILexicalBlock`) is scoped
+/// to its block (decl line → the block's last instruction line, since `DILexicalBlock` has no end
+/// line), so reading `x` resolves to the in-scope shadow at the stopped pc — the LLVM producer
+/// driving the same shadowing resolution as chibicc/wasm.
+#[test]
+fn llvm_o0_resolves_shadowed_locals_by_lexical_scope() {
+    use temen_interp::{Inspector, IrPc, Stop, VarValue};
+    use temen_ir::VarLoc;
+
+    let src = "\
+int f(int n) {
+  int x = n + 1;
+  {
+    int x = n + 100;
+    n = n + x;
+  }
+  return x + n;
+}
+";
+    let Some(bc) = compile_to_ll_o0g("shadow", src) else {
+        return;
+    };
+    let t = temen_llvm::translate_ll_path(&bc).expect("translate");
+    temen_verify::verify_module(&t.module).expect("verify");
+    let di = t.module.debug_info.as_ref().expect("debug info");
+
+    // Two `x` vars; exactly one carries a lexical scope (the inner block), the other function-wide.
+    let xs: Vec<_> = di.vars.iter().filter(|v| v.name == "x").collect();
+    assert_eq!(xs.len(), 2, "both shadows ingested");
+    for x in &xs {
+        assert!(
+            matches!(x.loc, VarLoc::Window { .. }),
+            "x is a -O0 Window var"
+        );
+    }
+    let scoped: Vec<_> = xs.iter().filter_map(|v| v.scope).collect();
+    assert_eq!(
+        scoped.len(),
+        1,
+        "one inner-block scope; the outer is function-wide"
+    );
+    let (start, _end) = scoped[0];
+    assert_eq!(start, 4, "inner x scope starts at its declaration line");
+
+    // Runtime: read `x` resolves the right shadow at the stopped pc.
+    let pc_for_line = |line: u32| {
+        let l = di.locs.iter().find(|l| l.line == line)?;
+        Some(IrPc {
+            module: 0,
+            func: l.func,
+            block: l.block as usize,
+            inst: l.inst as usize,
+        })
+    };
+    let read_x_at = |line: u32| {
+        let mut insp = Inspector::attach(
+            &t.module,
+            0,
+            &[Value::I64(t.entry_sp as i64), Value::I32(5)],
+            5_000_000,
+        );
+        insp.set_breakpoint(pc_for_line(line).unwrap_or_else(|| panic!("no pc for line {line}")));
+        assert!(
+            matches!(insp.run_until_stop(), Stop::Break { .. }),
+            "stop at line {line}"
+        );
+        match insp.read_var(0, "x", 4) {
+            Some(VarValue::Bytes(b)) => i32::from_le_bytes(b[..4].try_into().unwrap()),
+            other => panic!("expected window bytes for x, got {other:?}"),
+        }
+    };
+    // Line 5 = `n = n + x` (inside the block): inner x = n + 100 = 105.
+    assert_eq!(read_x_at(5), 105, "inner shadow resolved inside the block");
+    // Line 7 = `return x + n` (after the block): outer x = n + 1 = 6.
+    assert_eq!(read_x_at(7), 6, "outer x resolved after the block");
+}
+
+/// I14 tier 2 — the i128 **widening-multiply** idiom (`(unsigned __int128)a * b >> 64`, a 64×64→128
+/// `mulhi`) now translates and runs on both engines, matching a `u128` oracle. This is the
+/// `aha-mont64 mulul64` core that previously fail-closed with `Unsupported("i128")`.
+#[test]
+fn i128_widening_mul_hi() {
+    let src = "unsigned long mulhi(unsigned long a, unsigned long b) {\n\
+        \x20 return (unsigned long)(((unsigned __int128)a * b) >> 64);\n\
+        }\n";
+    for (a, b) in [
+        (0x1234_5678_9abc_def0u64, 0xfedc_ba98_7654_3210u64),
+        (u64::MAX, u64::MAX),
+        (3, 5),
+        (1u64 << 63, 6),
+        (0xdead_beef_0000_0001, 0x0000_0001_cafe_babe),
+    ] {
+        let hi = (((a as u128) * (b as u128)) >> 64) as u64;
+        check(
+            "i128_mulhi",
+            src,
+            &[Value::I64(a as i64), Value::I64(b as i64)],
+            &[Value::I64(hi as i64)],
+        );
+    }
+}
+
+/// The full `mulul64` shape: one `unsigned __int128` product feeding **both** a low-half `trunc` and a
+/// high-half `lshr 64`+`trunc` — the same symbolic product consumed twice. The halves are combined
+/// through shifts (which don't distribute over `trunc`, so clang keeps them as the two separate i64
+/// truncs the real `mulul64` emits, rather than folding into an `xor i128`).
+#[test]
+fn i128_widening_mul_lo_and_hi() {
+    let src = "unsigned long mont(unsigned long a, unsigned long b) {\n\
+        \x20 unsigned __int128 p = (unsigned __int128)a * b;\n\
+        \x20 unsigned long lo = (unsigned long)p;\n\
+        \x20 unsigned long hi = (unsigned long)(p >> 64);\n\
+        \x20 return (hi ^ (lo >> 17)) + (lo ^ (hi >> 13));\n\
+        }\n";
+    for (a, b) in [
+        (0x1234_5678_9abc_def0u64, 0xfedc_ba98_7654_3210u64),
+        (u64::MAX, 7),
+        (0x8000_0000_0000_0000, 0x8000_0000_0000_0000),
+    ] {
+        let p = (a as u128) * (b as u128);
+        let (lo, hi) = (p as u64, (p >> 64) as u64);
+        let want = (hi ^ (lo >> 17)).wrapping_add(lo ^ (hi >> 13));
+        check(
+            "i128_mont",
+            src,
+            &[Value::I64(a as i64), Value::I64(b as i64)],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+/// I14 tier 3 (256-bit): the `zext i128 → mul i256 → lshr → trunc` **magic-number division** clang/LLVM
+/// emits for `u128 / constant` — the same shape `core::fmt` uses to print a `u128` (#778). Dividing a
+/// 128-bit value (built from `(hi, lo)` halves) by `10^18` produces the 4-limb multiply + double-word
+/// shift the on-ramp's `lower_i256` covers; folding **both** halves of the 128-bit quotient into the
+/// returned word checks the full result (not just a truncated low limb) against a `u128` oracle.
+#[test]
+fn i256_u128_magic_division() {
+    let src = "unsigned long f(unsigned long hi, unsigned long lo) {\n\
+        \x20 unsigned __int128 x = ((unsigned __int128)hi << 64) | lo;\n\
+        \x20 unsigned __int128 q = x / 1000000000000000000ULL;\n\
+        \x20 return (unsigned long)q ^ (unsigned long)(q >> 64);\n\
+        }\n";
+    for (hi, lo) in [
+        (0u64, 0u64),
+        (0, 1),
+        (0, u64::MAX),
+        (1, 0),                                         // 2^64
+        (u64::MAX, u64::MAX),                           // 2^128 - 1
+        (1u64 << 63, 0),                                // 2^127
+        (0x0de0_b6b3_a763_ffff, 0xffff_ffff_ffff_ffff), // ≈ 10^37-ish, near a magic boundary
+        (0x1234_5678_9abc_def0, 0xfedc_ba98_7654_3210),
+    ] {
+        let x = ((hi as u128) << 64) | (lo as u128);
+        let q = x / 1_000_000_000_000_000_000u128;
+        let want = (q as u64) ^ ((q >> 64) as u64);
+        check(
+            "i256_u128_div",
+            src,
+            &[Value::I64(hi as i64), Value::I64(lo as i64)],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+/// The overflow intrinsics at **sub-carrier widths** (`umul.with.overflow.i8` etc., via C's
+/// `__builtin_*_overflow` on narrow types): the flag must be computed at the *intrinsic* width, not
+/// the i32 carrier — `26 * 10` overflows u8 even though 260 fits the carrier — and the returned value
+/// is the **wrapped** one. (Found via `Ipv4Addr` parsing, #775: the carrier-width check silently
+/// mis-flagged u8 checked arithmetic.)
+#[test]
+fn narrow_overflow_intrinsics() {
+    let src = "unsigned f(unsigned char a, unsigned char b) {\n\
+        \x20 unsigned char r;\n\
+        \x20 unsigned ov = __builtin_mul_overflow(a, b, &r);\n\
+        \x20 unsigned char s;\n\
+        \x20 unsigned ov2 = __builtin_add_overflow(a, b, &s);\n\
+        \x20 return (ov << 24) | (ov2 << 16) | (r << 8) | s;\n\
+        }\n";
+    for (a, b) in [(26u8, 10u8), (12, 10), (255, 255), (0, 7), (250, 6)] {
+        let (r, ov) = a.overflowing_mul(b);
+        let (s, ov2) = a.overflowing_add(b);
+        let want = ((ov as u32) << 24) | ((ov2 as u32) << 16) | ((r as u32) << 8) | s as u32;
+        check(
+            "u8_overflow",
+            src,
+            &[Value::I32(a as i32), Value::I32(b as i32)],
+            &[Value::I32(want as i32)],
+        );
+    }
+}
+
+/// `insertvalue` into a **partially-defined constant** base — clang's `{ i1 true, i8 poison }` seed
+/// for an `(ok, value)` pair (the IPv4 parser's single-digit-octet path, #775). The defined `true`
+/// must survive; the old zero-fill-any-constant-base fallback silently dropped it (flag read false ⇒
+/// every single-digit octet failed to parse). Runs the shape from a hand-written `.ll` on the
+/// interpreter, both branch directions.
+#[test]
+fn insertvalue_partial_constant_base() {
+    let ll = "define i32 @probe(i32 %sel) {\n\
+        entry:\n\
+        \x20 %cond = icmp sgt i32 %sel, 0\n\
+        \x20 br i1 %cond, label %ok, label %fail\n\
+        ok:\n\
+        \x20 %v = insertvalue { i1, i8 } { i1 true, i8 poison }, i8 9, 1\n\
+        \x20 br label %join\n\
+        fail:\n\
+        \x20 br label %join\n\
+        join:\n\
+        \x20 %agg = phi { i1, i8 } [ %v, %ok ], [ { i1 false, i8 undef }, %fail ]\n\
+        \x20 %flag = extractvalue { i1, i8 } %agg, 0\n\
+        \x20 %val = extractvalue { i1, i8 } %agg, 1\n\
+        \x20 %z = zext i8 %val to i32\n\
+        \x20 %f = zext i1 %flag to i32\n\
+        \x20 %fh = mul i32 %f, 100\n\
+        \x20 %r = add i32 %fh, %z\n\
+        \x20 ret i32 %r\n\
+        }\n";
+    let dir = std::env::temp_dir().join(format!("temen_aggphi_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("tmp dir");
+    let path = dir.join("aggphi.ll");
+    std::fs::write(&path, ll).expect("write ll");
+    let t = temen_llvm::translate_ll_path(&path).expect("translate");
+    temen_verify::verify_module(&t.module).expect("verify");
+    for (sel, want) in [(1i32, 109i32), (0, 0)] {
+        let args = vec![Value::I64(t.entry_sp as i64), Value::I32(sel)];
+        let mut fuel = 1_000_000u64;
+        let r = temen_interp::run(&t.module, 0, &args, &mut fuel).expect("interp");
+        assert_eq!(
+            r,
+            vec![Value::I32(want)],
+            "sel={sel}: the constant base's defined `true` field must survive the insertvalue"
+        );
+    }
+}
+
+// ---- I14 tier 3: general i128 arithmetic (every i128 a materialized (lo, hi) pair) ----------------
+
+/// i128 `add`/`sub` with full carry/borrow across the word boundary. Builds two 128-bit values from
+/// four u64 halves, then folds both words of `x+y` and `x-y` into one i64 vs a `u128` oracle.
+#[test]
+fn i128_add_sub_carry() {
+    let src = "unsigned long f(unsigned long ah, unsigned long al, unsigned long bh, unsigned long bl) {\n\
+        \x20 unsigned __int128 x = ((unsigned __int128)ah << 64) | al;\n\
+        \x20 unsigned __int128 y = ((unsigned __int128)bh << 64) | bl;\n\
+        \x20 unsigned __int128 s = x + y;\n\
+        \x20 unsigned __int128 d = x - y;\n\
+        \x20 return ((unsigned long)s ^ (unsigned long)(s >> 64)) + ((unsigned long)d ^ (unsigned long)(d >> 64));\n\
+        }\n";
+    for (ah, al, bh, bl) in [
+        (1u64, 2u64, 3u64, 4u64),
+        (0, u64::MAX, 0, 1), // carry out of the low word
+        (5, 0, 9, u64::MAX), // borrow into the high word
+        (0xdead_beef, 0xffff_ffff_ffff_ffff, 0xcafe, 0x1),
+    ] {
+        let x = ((ah as u128) << 64) | al as u128;
+        let y = ((bh as u128) << 64) | bl as u128;
+        let s = x.wrapping_add(y);
+        let d = x.wrapping_sub(y);
+        let want = ((s as u64) ^ ((s >> 64) as u64)).wrapping_add((d as u64) ^ ((d >> 64) as u64));
+        check(
+            "i128_addsub",
+            src,
+            &[
+                Value::I64(ah as i64),
+                Value::I64(al as i64),
+                Value::I64(bh as i64),
+                Value::I64(bl as i64),
+            ],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+/// A **large i128 constant** (≥ 2⁶⁴) used as an arithmetic operand — the I25 miscompile. The on-ramp
+/// split an i128 constant into `(lo, hi)` with `hi` hardcoded to `0`, silently dropping the high 64
+/// bits: `2^126 - x` came out `(low(x)-flavored garbage)` instead of the real value. libbf's
+/// `udiv1norm` folds exactly this (`2^126` as a subtrahend), so BigInt division — and thus `bf_atof`,
+/// `(7n).toString()`, `6n*7n` — produced garbage / hung. Here `2^126 - x` must match a `u128` oracle,
+/// which it can't if the constant's high limb is zeroed.
+#[test]
+fn i128_large_constant_operand() {
+    let src = "unsigned long f(unsigned long xh, unsigned long xl) {\n\
+        \x20 unsigned __int128 x = ((unsigned __int128)xh << 64) | xl;\n\
+        \x20 unsigned __int128 num = ((unsigned __int128)1) << 126;\n\
+        \x20 unsigned __int128 a = num - x;\n\
+        \x20 return (unsigned long)(a >> 64) ^ (unsigned long)a;\n\
+        }\n";
+    for (xh, xl) in [
+        (0u64, 0u64),
+        (0u64, 0x8000_0000_0000_0000u64), // borrow into the high word (the udiv1norm shape)
+        (0x4000_0000_0000_0000u64, 0u64), // cancels the constant's high limb exactly
+        (0x1234_5678u64, 0x9abc_def0u64),
+        (u64::MAX, u64::MAX),
+    ] {
+        let x = ((xh as u128) << 64) | xl as u128;
+        let a = (1u128 << 126).wrapping_sub(x);
+        let want = ((a >> 64) as u64) ^ (a as u64);
+        check(
+            "i128_large_const",
+            src,
+            &[Value::I64(xh as i64), Value::I64(xl as i64)],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+/// Full 128×128→128 `mul` (the schoolbook expansion, both operands genuinely 128-bit) + `and`/`or`/
+/// `xor`, vs a `u128` oracle.
+#[test]
+fn i128_mul_and_bitwise() {
+    let src = "unsigned long f(unsigned long ah, unsigned long al, unsigned long bh, unsigned long bl) {\n\
+        \x20 unsigned __int128 x = ((unsigned __int128)ah << 64) | al;\n\
+        \x20 unsigned __int128 y = ((unsigned __int128)bh << 64) | bl;\n\
+        \x20 unsigned __int128 p = x * y;\n\
+        \x20 unsigned __int128 m = (x & y) ^ (x | y);\n\
+        \x20 return ((unsigned long)p ^ (unsigned long)(p >> 64)) + ((unsigned long)m ^ (unsigned long)(m >> 64));\n\
+        }\n";
+    for (ah, al, bh, bl) in [
+        (0, 3, 0, 5),
+        (1, 2, 3, 4),
+        (
+            0xffff_ffff,
+            0xffff_ffff_ffff_ffff,
+            0x1234,
+            0x5678_9abc_def0_1234,
+        ),
+        (u64::MAX, u64::MAX, u64::MAX, u64::MAX),
+    ] {
+        let x = ((ah as u128) << 64) | al as u128;
+        let y = ((bh as u128) << 64) | bl as u128;
+        let p = x.wrapping_mul(y);
+        let m = (x & y) ^ (x | y);
+        let want = ((p as u64) ^ ((p >> 64) as u64)).wrapping_add((m as u64) ^ ((m >> 64) as u64));
+        check(
+            "i128_mul",
+            src,
+            &[
+                Value::I64(ah as i64),
+                Value::I64(al as i64),
+                Value::I64(bh as i64),
+                Value::I64(bl as i64),
+            ],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+/// Double-word **variable** shifts: `shl` / logical `>>` / arithmetic `>>` by a runtime amount across
+/// the full `[0, 128)` range (including 0, `<64`, `==64`, `>64`) — the cross-word carry + `n>=64` word
+/// move that `aha-mont64`'s `modul64` needs. Vs a `u128`/`i128` oracle.
+#[test]
+fn i128_variable_shifts() {
+    let src = "unsigned long f(unsigned long h, unsigned long l, unsigned long s) {\n\
+        \x20 unsigned __int128 x = ((unsigned __int128)h << 64) | l;\n\
+        \x20 unsigned n = (unsigned)s & 127;\n\
+        \x20 unsigned __int128 a = x << n;\n\
+        \x20 unsigned __int128 b = x >> n;\n\
+        \x20 __int128 c = ((__int128)x) >> n;\n\
+        \x20 unsigned __int128 r = a ^ b ^ (unsigned __int128)c;\n\
+        \x20 return (unsigned long)r ^ (unsigned long)(r >> 64);\n\
+        }\n";
+    let h = 0xfedc_ba98_7654_3210u64;
+    let l = 0x0123_4567_89ab_cdefu64;
+    for s in [0u64, 1, 17, 63, 64, 65, 100, 127] {
+        let x = ((h as u128) << 64) | l as u128;
+        let n = s as u32 & 127;
+        let a = x << n;
+        let b = x >> n;
+        let c = ((x as i128) >> n) as u128;
+        let r = a ^ b ^ c;
+        let want = (r as u64) ^ ((r >> 64) as u64);
+        check(
+            "i128_shifts",
+            src,
+            &[
+                Value::I64(h as i64),
+                Value::I64(l as i64),
+                Value::I64(s as i64),
+            ],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+/// i128 **parameter and return** (clang's `{i64,i64}` ABI split): `__int128 a + 1` reconstructs the
+/// value from its two i64 halves and re-splits the result. Confirms the param/return path + the
+/// carry across the word boundary compute correctly (not just translate).
+#[test]
+fn i128_param_and_return() {
+    let src = "__int128 big(__int128 a){ return a + 1; }\n";
+    for (lo, hi) in [
+        (0u64, 0u64),
+        (u64::MAX, 0x1234),
+        (41, 0),
+        (u64::MAX, u64::MAX),
+    ] {
+        let a = ((hi as u128) << 64) | lo as u128;
+        let r = a.wrapping_add(1);
+        check(
+            "i128_big",
+            src,
+            &[Value::I64(lo as i64), Value::I64(hi as i64)],
+            &[
+                Value::I64(r as u64 as i64),
+                Value::I64((r >> 64) as u64 as i64),
+            ],
+        );
+    }
+}
+
+/// i128 comparisons across **all predicates** (signed + unsigned ordering, eq/ne), each compared to a
+/// native `i128`/`u128` oracle. Packs the ten results into an int.
+#[test]
+fn i128_compares_all_predicates() {
+    let src = "int cmp(unsigned long ah, unsigned long al, unsigned long bh, unsigned long bl) {\n\
+        \x20 unsigned __int128 x = ((unsigned __int128)ah << 64) | al;\n\
+        \x20 unsigned __int128 y = ((unsigned __int128)bh << 64) | bl;\n\
+        \x20 __int128 sx = (__int128)x, sy = (__int128)y;\n\
+        \x20 int r = 0;\n\
+        \x20 r |= (x <  y) << 0; r |= (x <= y) << 1; r |= (x >  y) << 2; r |= (x >= y) << 3;\n\
+        \x20 r |= (sx <  sy) << 4; r |= (sx <= sy) << 5; r |= (sx >  sy) << 6; r |= (sx >= sy) << 7;\n\
+        \x20 r |= (x == y) << 8; r |= (x != y) << 9;\n\
+        \x20 return r;\n\
+        }\n";
+    let cases = [
+        (1u64, 2u64, 1u64, 2u64),         // equal
+        (0, 1, 0, 2),                     // low differs
+        (1, 0, 2, 0),                     // high differs
+        (u64::MAX, 5, 0, 9),              // x huge (neg as signed), y small positive
+        (0x8000_0000_0000_0000, 0, 0, 1), // signedness boundary in the high word
+    ];
+    for (ah, al, bh, bl) in cases {
+        let x = ((ah as u128) << 64) | al as u128;
+        let y = ((bh as u128) << 64) | bl as u128;
+        let (sx, sy) = (x as i128, y as i128);
+        let mut r = 0i32;
+        r |= (x < y) as i32;
+        r |= ((x <= y) as i32) << 1;
+        r |= ((x > y) as i32) << 2;
+        r |= ((x >= y) as i32) << 3;
+        r |= ((sx < sy) as i32) << 4;
+        r |= ((sx <= sy) as i32) << 5;
+        r |= ((sx > sy) as i32) << 6;
+        r |= ((sx >= sy) as i32) << 7;
+        r |= ((x == y) as i32) << 8;
+        r |= ((x != y) as i32) << 9;
+        check(
+            "i128_cmp",
+            src,
+            &[
+                Value::I64(ah as i64),
+                Value::I64(al as i64),
+                Value::I64(bh as i64),
+                Value::I64(bl as i64),
+            ],
+            &[Value::I32(r)],
+        );
+    }
+}
+
+/// **Cross-block i128** (I14 tail): an `__int128` accumulator carried across a loop backedge — `-O2`
+/// promotes it to a `phi i128` at the loop header, so its `(lo, hi)` pair must fan out as two block
+/// params over the edge (the struct-φ machinery, now extended to i128). The entry incoming is a
+/// **constant i128 `0`** (the `n == 0` case returns it untouched), exercising the constant-i128 φ path.
+/// An i128 LCG grows into the high word within a couple of iterations, so a torn backedge corrupts the
+/// result. Bit-exact interp == JIT vs a native `u128` oracle.
+#[test]
+fn i128_cross_block_loop_accumulator() {
+    let src = "unsigned long f(unsigned long n, unsigned long seed) {\n\
+        \x20 unsigned __int128 acc = 0;\n\
+        \x20 for (unsigned long i = 0; i < n; i++)\n\
+        \x20   acc = acc * 6364136223846793005ull + seed + i;\n\
+        \x20 return (unsigned long)acc ^ (unsigned long)(acc >> 64);\n\
+        }\n";
+    for (n, seed) in [
+        (0u64, 7u64),
+        (1, 7),
+        (5, 0xdead_beef),
+        (50, 0x1234_5678_9abc_def0),
+    ] {
+        let mut acc: u128 = 0;
+        for i in 0..n {
+            acc = acc
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(seed as u128)
+                .wrapping_add(i as u128);
+        }
+        let want = (acc as u64) ^ ((acc >> 64) as u64);
+        check(
+            "i128_xblock_lcg",
+            src,
+            &[Value::I64(n as i64), Value::I64(seed as i64)],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+/// **Cross-block i128** with **two** loop-carried values: an `__int128` Fibonacci pair. Both `a` and
+/// `b` are `phi i128` across the backedge (constant entry incomings `0` and `1` — the latter a
+/// non-zero low word), so two independent i128 `(lo, hi)` pairs must thread their four block params in
+/// the right order. i128 Fibonacci overflows 64 bits around n≈93, so n=100 populates the high word.
+#[test]
+fn i128_cross_block_fib_pair() {
+    let src = "unsigned long fib(unsigned long n) {\n\
+        \x20 unsigned __int128 a = 0, b = 1;\n\
+        \x20 for (unsigned long i = 0; i < n; i++) { unsigned __int128 t = a + b; a = b; b = t; }\n\
+        \x20 return (unsigned long)a ^ (unsigned long)(a >> 64);\n\
+        }\n";
+    for n in [0u64, 1, 2, 93, 100] {
+        let (mut a, mut b): (u128, u128) = (0, 1);
+        for _ in 0..n {
+            let t = a.wrapping_add(b);
+            a = b;
+            b = t;
+        }
+        let want = (a as u64) ^ ((a >> 64) as u64);
+        check(
+            "i128_xblock_fib",
+            src,
+            &[Value::I64(n as i64)],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+/// **Unsigned i128 div + rem** (I14 tail): `udiv i128` / `urem i128` lower to the synthesized 128÷128
+/// long-division helper (`__temen_udivmod128`), which returns both quotient and remainder. Folds both
+/// words of `q` and `r` into the result, so an error in any word shows. Bit-exact interp == JIT vs a
+/// `u128` oracle, across small/large/high-word-divisor/divisor>dividend cases.
+#[test]
+fn i128_udiv_urem() {
+    let src = "unsigned long f(unsigned long ah, unsigned long al, unsigned long bh, unsigned long bl) {\n\
+        \x20 unsigned __int128 x = ((unsigned __int128)ah << 64) | al;\n\
+        \x20 unsigned __int128 y = ((unsigned __int128)bh << 64) | bl;\n\
+        \x20 unsigned __int128 q = x / y;\n\
+        \x20 unsigned __int128 r = x % y;\n\
+        \x20 return ((unsigned long)q ^ (unsigned long)(q >> 64)) + ((unsigned long)r ^ (unsigned long)(r >> 64));\n\
+        }\n";
+    for (ah, al, bh, bl) in [
+        (0u64, 100u64, 0u64, 7u64),                         // small / small
+        (5, 0, 0, 3),                                       // high-word dividend / tiny divisor
+        (u64::MAX, u64::MAX, 0, 0xffff_ffff),               // near-max / 32-bit divisor
+        (0x1234, 0x5678_9abc_def0_1234, 0x12, 0x3456_789a), // both have high words
+        (0, 3, 0, 100),                                     // divisor > dividend → q=0, r=x
+        (
+            0xdead_beef_cafe,
+            0x1111_2222_3333_4444,
+            0xbeef,
+            0x9999_8888_7777_6666,
+        ), // general
+    ] {
+        let x = ((ah as u128) << 64) | al as u128;
+        let y = ((bh as u128) << 64) | bl as u128;
+        let q = x / y;
+        let r = x % y;
+        let want = ((q as u64) ^ ((q >> 64) as u64)).wrapping_add((r as u64) ^ ((r >> 64) as u64));
+        check(
+            "i128_udivrem",
+            src,
+            &[
+                Value::I64(ah as i64),
+                Value::I64(al as i64),
+                Value::I64(bh as i64),
+                Value::I64(bl as i64),
+            ],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+/// **Signed i128 div + rem** (I14 tail): `sdiv i128` / `srem i128` reuse the unsigned helper — the
+/// lowering abs-es the operands and re-signs (quotient negative iff signs differ; remainder takes the
+/// dividend's sign, C truncation toward zero). All four sign combinations, vs a native `i128` oracle.
+#[test]
+fn i128_sdiv_srem() {
+    let src = "long g(unsigned long ah, unsigned long al, unsigned long bh, unsigned long bl) {\n\
+        \x20 __int128 x = (__int128)(((unsigned __int128)ah << 64) | al);\n\
+        \x20 __int128 y = (__int128)(((unsigned __int128)bh << 64) | bl);\n\
+        \x20 __int128 q = x / y;\n\
+        \x20 __int128 r = x % y;\n\
+        \x20 return ((long)q ^ (long)(q >> 64)) + ((long)r ^ (long)(r >> 64));\n\
+        }\n";
+    let cases: [(i128, i128); 8] = [
+        (100, 7),
+        (-100, 7),
+        (100, -7),
+        (-100, -7),
+        (-(1i128 << 100), 3),                 // large negative / small positive
+        ((1i128 << 120) - 1, -(1i128 << 40)), // large positive / negative high-word divisor
+        (-12345678901234567890, 1_000_000_007), // negative / positive prime
+        (7, 100),                             // |dividend| < |divisor| → q=0, r=dividend
+    ];
+    for (x, y) in cases {
+        let (ah, al) = (((x as u128) >> 64) as u64, x as u128 as u64);
+        let (bh, bl) = (((y as u128) >> 64) as u64, y as u128 as u64);
+        let q = x.wrapping_div(y);
+        let r = x.wrapping_rem(y);
+        let want = ((q as i64) ^ ((q >> 64) as i64)).wrapping_add((r as i64) ^ ((r >> 64) as i64));
+        check(
+            "i128_sdivrem",
+            src,
+            &[
+                Value::I64(ah as i64),
+                Value::I64(al as i64),
+                Value::I64(bh as i64),
+                Value::I64(bl as i64),
+            ],
+            &[Value::I64(want)],
+        );
+    }
+}
+
+/// **Wide / negative i128 *constants* fail closed** (I14). `llvm-ir` 0.11.3 truncates a `bits > 64`
+/// integer constant to its low word (a silent miscompile on a no-asserts libLLVM — `x % (2⁶⁴+1)` would
+/// run as `x % 1`), so the [`temen_llvm::wideint`] guard rejects any module holding an i128 literal
+/// outside `[0, 2⁶⁴)` with a clean `Unsupported` — never a wrong answer. Both a ≥2⁶⁴ literal (clang
+/// folds `0xFFFF…FFFF + 2` to `i128 18446744073709551617`) and a negative one (`add i128 %x, -5`).
+#[test]
+fn i128_wide_constant_now_translates() {
+    // I14 — **fixed** by the textual reader. The old `llvm-ir` path truncated a ≥2⁶⁴ / negative `i128`
+    // literal to its low word, so the on-ramp fail-closed (`Unsupported`) to avoid a miscompile; the
+    // in-house `.ll` reader carries the full 128-bit width, so these modules now **translate** instead.
+    // (The runtime correctness of `i128 urem` by a >64-bit *divisor* is a separate translator concern —
+    // that path was never exercised before, since the reader fail-closed here.)
+    for (name, src) in [
+        (
+            "i128_widec",
+            "unsigned long f(unsigned long lo, unsigned long hi){\n\
+             unsigned __int128 x = ((unsigned __int128)hi<<64)|lo;\n\
+             return (unsigned long)(x % ((unsigned __int128)0xFFFFFFFFFFFFFFFFULL + 2));\n }\n",
+        ),
+        (
+            "i128_negc",
+            "long g(unsigned long lo, unsigned long hi){\n\
+             __int128 x = (__int128)(((unsigned __int128)hi<<64)|lo);\n\
+             __int128 r = x + (__int128)(-5);\n\
+             return (long)((unsigned long)r) ^ (long)(r>>64);\n }\n",
+        ),
+    ] {
+        let Some(bc) = compile_to_ll(name, src) else {
+            return;
+        };
+        temen_llvm::translate_ll_path(&bc).unwrap_or_else(|e| {
+            panic!("{name}: expected the wide i128 constant to translate, got {e:?}")
+        });
+    }
+}
+
+/// A **small** i128 constant (`< 2⁶⁴`, incl. the loop-carried-φ entry value `0`) is *not* tripped by
+/// the wide-constant guard — it round-trips exactly from the low word and still translates + runs.
+#[test]
+fn i128_small_constant_still_runs() {
+    // An i128 accumulator seeded from the constant `0`, plus a small i128 literal addend.
+    let src = "unsigned long f(unsigned long n){\n\
+        unsigned __int128 acc = 0;\n\
+        for (unsigned long i=0;i<n;i++) acc = acc*3 + 1000000;\n\
+        return (unsigned long)acc ^ (unsigned long)(acc>>64);\n }\n";
+    for n in [0u64, 1, 5, 40] {
+        let mut acc: u128 = 0;
+        for _ in 0..n {
+            acc = acc.wrapping_mul(3).wrapping_add(1_000_000);
+        }
+        let want = (acc as u64) ^ ((acc >> 64) as u64);
+        check(
+            "i128_smallc",
+            src,
+            &[Value::I64(n as i64)],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
+#[test]
+fn i128_select_and_store_roundtrip() {
+    // Two i128 op lowerings the Postgres numeric path needs, both of which clang refuses to emit from
+    // simple C (it always *branches* a `? :` on a 128-bit value): `select i128` (numeric `sqrt_var`'s
+    // Newton's-method loop) and `store i128` (numeric `int2_accum`'s `sumX2` accumulator). A hand `.ll`
+    // (mirroring the `freeze_of_aggregate` approach) selects between two i128 values, stores the winner
+    // to an `alloca`, loads it back, and folds `lo - hi` — an **asymmetric** fold, so a swapped
+    // store/load half or a mis-picked select changes the result. a = (7<<64)|300, b = (2<<64)|100;
+    // a >u b so the select picks a → lo = 300, hi = 7 → 300 - 7 = 293.
+    let ll = "define i32 @main() {\n\
+        entry:\n  \
+        %p = alloca i128, align 16\n  \
+        %ah = shl i128 7, 64\n  \
+        %a = or i128 %ah, 300\n  \
+        %bh = shl i128 2, 64\n  \
+        %b = or i128 %bh, 100\n  \
+        %c = icmp ugt i128 %a, %b\n  \
+        %s = select i1 %c, i128 %a, i128 %b\n  \
+        store i128 %s, ptr %p, align 16\n  \
+        %r = load i128, ptr %p, align 16\n  \
+        %lo = trunc i128 %r to i64\n  \
+        %rsh = lshr i128 %r, 64\n  \
+        %hi = trunc i128 %rsh to i64\n  \
+        %d = sub i64 %lo, %hi\n  \
+        %d32 = trunc i64 %d to i32\n  \
+        ret i32 %d32\n}";
+    let t = temen_llvm::translate_ll_str(ll).expect("translate i128 select/store .ll");
+    temen_verify::verify_module(&t.module).expect("verify i128 select/store");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r =
+        temen_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run i128 select/store");
+    assert_eq!(
+        r,
+        vec![Value::I32(293)],
+        "select picks a=(7<<64)|300; stored+reloaded; lo-hi = 300-7 = 293"
+    );
+    // JIT parity — this path genuinely *runs* i128 select + i128 store/load (not a decline).
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match temen_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => {
+            assert_eq!(s[0] as i32, 293, "JIT i128 select/store = 293")
+        }
+        other => panic!("JIT i128 select/store: unexpected {other:?}"),
+    }
+}
+
+// ---- Textual `.ll` reader: differential parity vs the bitcode reader (LLVM.md §8 Q1b) -----------
+//
+// The migration's gate: the *same* C, compiled to **both** `.bc` and `.ll`, must translate to
+// **identical temen-ir** through the two readers — the bitcode→`ll` conversion shim
+// (`from_llvm_ir`) vs the in-house textual reader (`ll::parse`). Both now feed the same translator
+// (it consumes the owned `ll` AST), so a match proves the textual reader produced an equivalent AST.
+// This lets `parse.rs` grow incrementally with confidence; today it covers the core slice, so the
+// parity tests track real `clang -O2` output one shape at a time.
+
+/// Compile C to a textual `.ll` (the in-house reader's input), mirroring [`compile_to_bc`].
+fn compile_to_ll(name: &str, src: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("temen_llvm_{}_{}_ll.c", std::process::id(), name));
+    let ll = dir.join(format!("temen_llvm_{}_{}.ll", std::process::id(), name));
+    std::fs::write(&c, src).expect("write C source");
+    let status = Command::new("clang")
+        .args(["-O2", "-emit-llvm", "-S"])
+        .arg(&c)
+        .arg("-o")
+        .arg(&ll)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(ll),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
+/// Compile C++ (with exceptions) to a `.bc`/`.ll` — the EH constructs (`invoke`/`landingpad`/`resume`,
+/// `personality`) only appear from a C++ front end. `emit` is `-c` (bitcode) or `-S` (textual).
+fn compile_cpp(name: &str, src: &str, emit: &str, ext: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let cpp = dir.join(format!(
+        "temen_llvm_{}_{}_{}.cpp",
+        std::process::id(),
+        name,
+        ext
+    ));
+    let out = dir.join(format!(
+        "temen_llvm_{}_{}.{}",
+        std::process::id(),
+        name,
+        ext
+    ));
+    std::fs::write(&cpp, src).expect("write C++ source");
+    let status = Command::new("clang++")
+        .args(["-O1", "-fexceptions", "-emit-llvm", emit])
+        .arg(&cpp)
+        .arg("-o")
+        .arg(&out)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(out),
+        _ => {
+            eprintln!("note: skipping {name} (clang++ unavailable)");
+            None
+        }
+    }
+}
+
+/// The parity assertion core: both readers must translate to byte-identical temen-ir + `entry_sp`.
+/// Returns the (identical) temen-ir text so debug-info callers can sanity-check it's non-trivial.
+fn assert_paths_parity(name: &str, bc: &std::path::Path, ll: &std::path::Path) -> String {
+    let from_bc = temen_llvm::translate_bc_path(bc).expect("translate via bitcode");
+    let from_ll = temen_llvm::translate_ll_path(ll).expect("translate via textual .ll");
+    let bc_text = temen_text::print_module(&from_bc.module);
+    assert_eq!(
+        bc_text,
+        temen_text::print_module(&from_ll.module),
+        "temen-ir mismatch between the bitcode and textual readers for `{name}`",
+    );
+    assert_eq!(
+        from_bc.entry_sp, from_ll.entry_sp,
+        "entry_sp mismatch for `{name}`",
+    );
+    bc_text
+}
+
+/// Assert the bitcode and textual readers translate `src` to byte-identical temen-ir (their
+/// `print_module` text) and the same `entry_sp`. Skips cleanly if `clang` is unavailable.
+fn assert_ll_parity(name: &str, src: &str) {
+    let (Some(bc), Some(ll)) = (compile_to_bc(name, src), compile_to_ll(name, src)) else {
+        return;
+    };
+    assert_paths_parity(name, &bc, &ll);
+}
+
+/// Like [`assert_ll_parity`], but the source is C++ compiled with exceptions (for EH constructs).
+fn assert_ll_parity_cpp(name: &str, src: &str) {
+    let (Some(bc), Some(ll)) = (
+        compile_cpp(name, src, "-c", "bc"),
+        compile_cpp(name, src, "-S", "ll"),
+    ) else {
+        return;
+    };
+    assert_paths_parity(name, &bc, &ll);
+}
+
+/// Compile C with debug info at the given `opt`/`g` levels. The source filename is embedded in
+/// `!DIFile`, so *both* compiles must use the same `.c` path for the recovered debug paths to match.
+fn compile_debug(
+    name: &str,
+    src: &str,
+    opt: &str,
+    g: &str,
+    emit: &str,
+    ext: &str,
+) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("temen_llvm_{}_{}_g.c", std::process::id(), name));
+    let out = dir.join(format!(
+        "temen_llvm_{}_{}_g.{}",
+        std::process::id(),
+        name,
+        ext
+    ));
+    std::fs::write(&c, src).expect("write C source");
+    let status = Command::new("clang")
+        .args([opt, g, "-emit-llvm", emit])
+        .arg(&c)
+        .arg("-o")
+        .arg(&out)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(out),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
+/// Assert both readers recover identical debug info at the given `opt`/`g` levels — and that the
+/// output actually carries a `DIType` graph (guards against a trivial pass where neither reader
+/// produced any type/variable info).
+fn assert_ll_parity_debug_at(name: &str, src: &str, opt: &str, g: &str) {
+    let (Some(bc), Some(ll)) = (
+        compile_debug(name, src, opt, g, "-c", "bc"),
+        compile_debug(name, src, opt, g, "-S", "ll"),
+    ) else {
+        return;
+    };
+    let text = assert_paths_parity(name, &bc, &ll);
+    assert!(
+        text.contains("debug.type "),
+        "`{name}` produced no debug type graph — the debug parity check is trivial",
+    );
+}
+
+/// Full `-O0 -g` debug info: source positions **and** the `DIType` graph + `DILocalVariable`s
+/// (`llvm.dbg.declare` locals) + module globals — the whole §6 waist the bitcode `di` walk produces.
+fn assert_ll_parity_debug(name: &str, src: &str) {
+    assert_ll_parity_debug_at(name, src, "-O0", "-g");
+}
+
+#[test]
+fn ll_parity_debug_locals() {
+    // `-O0 -g`: each source local (params + `s`) becomes an `alloca` + `llvm.dbg.declare`. The reader
+    // must parse the `metadata`-typed call operands, correlate each declare's address to its alloca
+    // *ordinal* (→ a `Window` slot), and read the `!DILocalVariable` name/type — matching the bitcode
+    // `di` walk. Flat function (no nested block) ⇒ subprogram-scoped vars (`scope: None`).
+    assert_ll_parity_debug(
+        "ll_parity_dbg_loc",
+        "int add3(int a, int b, int c){ int s = a + b + c; return s; }\n",
+    );
+}
+
+#[test]
+fn ll_parity_debug_lexical_scope() {
+    // A shadowed variable in a nested block: the inner `s` is scoped to a `!DILexicalBlock`, so its
+    // §6 scope is `(decl_line, block_end_line)` — the block's end line derived from the max
+    // `!DILocation` line in its scope subtree (a `DILexicalBlock` carries no end line).
+    assert_ll_parity_debug(
+        "ll_parity_dbg_scope",
+        "int f(int x){\n\
+         \x20 int s = x;\n\
+         \x20 { int s = x + 10; s = s * 2; return s; }\n\
+         }\n",
+    );
+}
+
+#[test]
+fn ll_parity_debug_args_ssa() {
+    // `-Og -g`: with locals promoted to SSA, source args are tracked by `llvm.dbg.value(metadata i32
+    // %k, …)` instead of `dbg.declare`. The reader must correlate the value to argument `k` (→ `Arg`,
+    // which the translator resolves to an `SsaList` over the arg's live range) rather than an alloca.
+    assert_ll_parity_debug_at(
+        "ll_parity_dbg_arg",
+        "int square(int x){ return x * x; }\n\
+         int lin(int a, int b){ return a * 3 + b; }\n",
+        "-Og",
+        "-g",
+    );
+}
+
+#[test]
+fn ll_parity_debug_types_globals() {
+    // `-gline-tables-only` carries no type graph, so use full `-O0 -g` but keep the only function
+    // *local-free* (no `dbg.declare`, so `di.vars` stays empty — the local-var half is a later slice).
+    // The globals exercise the `DIType` interner: base `int`, a `struct` aggregate (with fields), and
+    // an array — all must intern in the same order + shape as the bitcode `di` walk.
+    assert_ll_parity_debug(
+        "ll_parity_dbg_tg",
+        "struct Point { int x; int y; };\n\
+         int counter = 5;\n\
+         struct Point origin;\n\
+         int table[3] = {1, 2, 3};\n\
+         int getcnt(void){ return counter; }\n",
+    );
+}
+
+#[test]
+fn ll_parity_debug_source_lines() {
+    // `-gline-tables-only`: each instruction's `!dbg !DILocation` (source line/column, file via the
+    // scope's `!DIFile`) + the `!DISubprogram` function name must match the bitcode reader.
+    assert_ll_parity_debug(
+        "ll_parity_dbg",
+        "int add(int a, int b){ int s = a + b; return s * 2; }\n\
+         int use(int x){ return add(x, x + 1); }\n",
+    );
+}
+
+#[test]
+fn ll_parity_debug_o2_phi_and_declare() {
+    // Full `-O2 -g` (#986, the Tcl/Postgres `-g` diagnosis builds): optimized debug output attaches
+    // `!dbg` where the plain-text parser once choked — trailing on a `phi`'s incoming list
+    // (`phi i32 [...], [...], !dbg !N` — the comma belongs to the metadata, not a next incoming)
+    // and function-level on an extern `declare` BEFORE the return type, mixed with return attrs
+    // (`declare !dbg !N noundef i32 @ext(...)`). The loop yields the phi; the extern the declare.
+    assert_ll_parity_debug_at(
+        "ll_parity_dbg_o2",
+        "extern int putchar(int);\n\
+         int f(int n){ int s = 0; for (int i = 0; i < n; i++) s += i; return putchar(s); }\n",
+        "-O2",
+        "-g",
+    );
+}
+
+#[test]
+fn ll_parity_trivial_add() {
+    // The simplest real `clang -O2` function: `define dso_local i32 @add(i32 %0, i32 %1) … { %3 =
+    // add nsw i32 %1, %0; ret i32 %3 }` — exercising the function header (linkage/param attrs/
+    // attribute-group ref), a flagged binop, and `ret`.
+    assert_ll_parity("ll_parity_add", "int add(int a, int b){ return a + b; }");
+}
+
+#[test]
+fn ll_parity_arith_chain() {
+    // A chain of binops with immediate operands, incl. a negative constant (`add … -7`) — exercises
+    // constant-int operands and operand ordering across `add`/`mul`.
+    assert_ll_parity("ll_parity_poly", "int poly(int x){ return x*x + 3*x - 7; }");
+}
+
+#[test]
+fn ll_parity_bitwise_shifts() {
+    // `shl`/`lshr`/`or` over an unsigned — the bitwise/shift core-slice ops.
+    assert_ll_parity(
+        "ll_parity_shifts",
+        "unsigned s(unsigned x){ return (x << 3) | (x >> 2); }",
+    );
+}
+
+#[test]
+fn ll_parity_sext_widen() {
+    // `sext i32 … to i64` + an `i64` add — the conversion path (a widening cast).
+    assert_ll_parity("ll_parity_widen", "long w(int x){ return (long)x + 1; }");
+}
+
+#[test]
+fn ll_parity_icmp_zext() {
+    // `icmp sgt` + `zext i1 … to i32` — a signed compare materialized to an int (the `a > b` shape).
+    assert_ll_parity("ll_parity_cmp", "int gt(int a, int b){ return a > b; }");
+}
+
+#[test]
+fn ll_parity_float_add() {
+    // `fadd float` — float arithmetic (no float *constant*, which is a later slice: hex-float parsing).
+    assert_ll_parity(
+        "ll_parity_fadd",
+        "float a(float x, float y){ return x + y; }",
+    );
+}
+
+#[test]
+fn ll_parity_phi_loop() {
+    // A `for`-loop sum: multi-block CFG with an unlabeled entry, `icmp`/`br i1`/labels, and a `phi`
+    // merging the two predecessors. Exercises implicit block numbering (the phi's `%entry`/`%body`
+    // refs must resolve to the same names the bitcode reader assigns).
+    assert_ll_parity(
+        "ll_parity_loop",
+        "int sum(int n){ int s = 0; for (int i = 0; i < n; i++) s += i; return s; }",
+    );
+}
+
+#[test]
+fn ll_parity_branch_phi() {
+    // An explicit `if`/`else` returning different values — a diamond CFG whose join is a `phi`.
+    assert_ll_parity(
+        "ll_parity_diamond",
+        "int pick(int c, int a, int b){ if (c) return a + 1; else return b - 1; }",
+    );
+}
+
+#[test]
+fn ll_parity_call_direct() {
+    // A direct `call` to a defined (noinline) function in the same module, whose result feeds an add —
+    // the callee becomes a GlobalReference carrying the reconstructed `i32 (i32)` function type.
+    assert_ll_parity(
+        "ll_parity_call",
+        "static __attribute__((noinline)) int dbl(int x){ return x + x; } \
+         int f(int x){ return dbl(x) + 1; }",
+    );
+}
+
+#[test]
+fn ll_parity_call_two_args() {
+    // A two-argument direct call (`i32 (i32, i32)`), exercising the arg list + fn-type reconstruction.
+    assert_ll_parity(
+        "ll_parity_call2",
+        "static __attribute__((noinline)) int sub(int a, int b){ return a - b; } \
+         int g(int a, int b){ return sub(a, b); }",
+    );
+}
+
+#[test]
+fn ll_parity_call_intrinsic() {
+    // `a > b ? a : b` lowers to `tail call i32 @llvm.smax.i32(i32 %0, i32 %1)` at -O2 — an intrinsic
+    // call (the shape that first forced calls; the translator lowers `llvm.smax` to `icmp`+`select`).
+    assert_ll_parity(
+        "ll_parity_smax",
+        "int mx(int a, int b){ return a > b ? a : b; }",
+    );
+}
+
+#[test]
+fn ll_parity_gep_load() {
+    // `getelementptr inbounds i32, ptr %p, i64 %i` + `load i32, ptr …` — pointer indexing + a load.
+    assert_ll_parity(
+        "ll_parity_gepload",
+        "int idx(const int *p, long i){ return p[i]; }",
+    );
+}
+
+#[test]
+fn ll_parity_gep_store() {
+    // `getelementptr` + a result-less `store i32 %v, ptr …` (the second dest-less instruction shape).
+    assert_ll_parity(
+        "ll_parity_gepstore",
+        "void wr(int *p, long i, int v){ p[i] = v; }",
+    );
+}
+
+#[test]
+fn ll_parity_alloca_volatile() {
+    // A `volatile` local forces `alloca i32` + `store volatile`/`load volatile` (defeating mem2reg).
+    assert_ll_parity(
+        "ll_parity_alloca",
+        "int viadd(int x){ volatile int t = x; return t + 1; }",
+    );
+}
+
+#[test]
+fn ll_parity_global_scalar() {
+    // A mutable scalar global (`@counter = global i32 0`) read + written by a function
+    // (`load`/`add`/`store` through `ptr @counter`).
+    assert_ll_parity(
+        "ll_parity_gscalar",
+        "int counter = 0; int bump(void){ return ++counter; }",
+    );
+}
+
+#[test]
+fn ll_parity_global_array() {
+    // A `constant [4 x i32]` lookup table indexed by a function — array type + array constant
+    // initializer + a `getelementptr [4 x i32], ptr @TBL, …`.
+    assert_ll_parity(
+        "ll_parity_garray",
+        "static const int TBL[4] = {10, 20, 30, 40}; int lookup(int i){ return TBL[i & 3]; }",
+    );
+}
+
+#[test]
+fn ll_parity_global_string() {
+    // A `private constant [N x i8] c\"…\\00\"` string returned by a function (`ret ptr @.str`) —
+    // byte-string constant + a `@.str` operand reference.
+    assert_ll_parity(
+        "ll_parity_gstring",
+        "const char *greeting(void){ return \"hi\"; }",
+    );
+}
+
+#[test]
+fn ll_parity_float_const_single() {
+    // `x * 0.5f` → `fmul float %…, 5.000000e-01` — a float constant in decimal form.
+    assert_ll_parity(
+        "ll_parity_fconst",
+        "float half(float x){ return x * 0.5f; }",
+    );
+}
+
+#[test]
+fn ll_parity_float_const_hex_double() {
+    // `x * 3.14` → `fmul double %…, 0x40091EB8…` — a double constant clang emits in `0x` hex form
+    // (3.14 isn't exactly representable), exercising the hex-image decode.
+    assert_ll_parity(
+        "ll_parity_dconst",
+        "double scale(double x){ return x * 3.14; }",
+    );
+}
+
+#[test]
+fn ll_parity_global_float_array() {
+    // A `constant [3 x double]` initializer — float constants in a global aggregate (decimal + hex).
+    assert_ll_parity(
+        "ll_parity_gfloat",
+        "static const double K[3] = {0.5, 3.14, 2.0}; double kth(int i){ return K[i]; }",
+    );
+}
+
+#[test]
+fn ll_parity_vector_add() {
+    // A `<4 x i32>` vector binop — vector types in operands/results.
+    assert_ll_parity(
+        "ll_parity_vadd",
+        "typedef int v4i __attribute__((vector_size(16))); v4i vadd(v4i a, v4i b){ return a + b; }",
+    );
+}
+
+#[test]
+fn ll_parity_vector_splat() {
+    // A splat: `insertelement <4 x i32> poison, i32 %x, i64 0` + `shufflevector … zeroinitializer` —
+    // insertelement/shufflevector + `poison`/`zeroinitializer` vector constants.
+    assert_ll_parity(
+        "ll_parity_vsplat",
+        "typedef int v4i __attribute__((vector_size(16))); v4i vsplat(int x){ return (v4i){x,x,x,x}; }",
+    );
+}
+
+#[test]
+fn ll_parity_vector_reduce() {
+    // `llvm.vector.reduce.add.v4i32` — a vector-reduction intrinsic call over a `<4 x i32>`.
+    assert_ll_parity(
+        "ll_parity_vreduce",
+        "typedef int v4i __attribute__((vector_size(16))); \
+         int vsum(v4i a){ return a[0]+a[1]+a[2]+a[3]; }",
+    );
+}
+
+#[test]
+fn ll_parity_const_gep() {
+    // A global initialized to a constant-expression GEP into another global
+    // (`@p = global ptr getelementptr inbounds ([10 x i32], ptr @arr, i64 0, i64 3)`).
+    assert_ll_parity("ll_parity_cgep", "int arr[10]; int *p = &arr[3];");
+}
+
+#[test]
+fn ll_parity_const_ptrtoint() {
+    // A nested constant-expression: `ptrtoint (ptr getelementptr(…) to i64)` as a global initializer.
+    assert_ll_parity("ll_parity_cptr", "int arr[10]; long addr = (long)&arr[1];");
+}
+
+#[test]
+fn ll_parity_invoke_landingpad() {
+    // C++ try/catch → `invoke … to label %ok unwind label %lpad` (a value-producing terminator),
+    // `landingpad { ptr, i32 } catch ptr null`, `extractvalue`, and the `__cxa_*` runtime calls. The
+    // translator only reserves the EH region when the module has a `main`, so include one.
+    let src = "int may_throw(int x){ if (x < 0) throw x; return x * 2; } \
+               int f(int x){ try { return may_throw(x); } catch (...) { return -1; } } \
+               int main(){ return f(-1) + f(3); }";
+    assert_ll_parity_cpp("ll_parity_eh", src);
+}
+
+#[test]
+fn ll_parity_atomics() {
+    // `atomicrmw`, `cmpxchg`, and `load atomic` — the atomic memory ops (orderings + syncscope), via
+    // `<stdatomic.h>`. (`fence` is omitted: the translator itself doesn't lower it.)
+    let src = "#include <stdatomic.h>\n\
+               int rmw(_Atomic int *p, int v){ return atomic_fetch_add(p, v); }\n\
+               int cx(_Atomic int *p, int a, int b){ atomic_compare_exchange_strong(p, &a, b); return a; }\n\
+               int ld(_Atomic int *p){ return atomic_load(p); }\n";
+    assert_ll_parity("ll_parity_atomic", src);
+}
+
+#[test]
+fn ll_parity_switch() {
+    // A `switch` terminator with a constant→label jump table (sparse cases + default).
+    assert_ll_parity(
+        "ll_parity_switch",
+        "int sw(int x){ switch(x){ case 0: return 10; case 1: return 20; case 7: return 30; \
+         default: return -1; } }",
+    );
+}
+
+#[test]
+fn ll_parity_struct_constant_global() {
+    // A global initialized to a **literal struct constant** (`@gp = global %struct.P { i32 7, i64 42 }`)
+    // — the `{ <ty> <c>, … }` aggregate-constant form real-world (Rust/C++) IR leans on heavily.
+    assert_ll_parity(
+        "ll_parity_structconst",
+        "struct P { int a; long b; }; struct P gp = { 7, 42 }; \
+         long gets(void){ return gp.a + gp.b; }",
+    );
+}
+
+#[test]
+fn ll_parity_struct_field() {
+    // A named struct type (`%struct.P = type { i32, i32 }`) + struct GEP
+    // (`getelementptr %struct.P, ptr %p, i64 0, i32 1`) for field access.
+    assert_ll_parity(
+        "ll_parity_struct",
+        "struct P { int a; int b; }; int field(const struct P *s){ return s->a + s->b; }",
+    );
+}
+
+#[test]
+fn ll_parity_call_void() {
+    // A result-less `call void @sink(...)` — the dest-less instruction shape (`tail call void …`).
+    assert_ll_parity(
+        "ll_parity_callvoid",
+        "static int g; static __attribute__((noinline)) void sink(int x){ g = x; } \
+         void v(int x){ sink(x); }",
+    );
+}
+
+// ── Tcl — the reference Tcl 8.6 interpreter on the on-ramp (in-progress target) ────────────────────
+//
+// The minimal-embedding REPL (`crates/temen-run/demos/tcl/tcl_repl.c`, no `Tcl_Init`) over the whole
+// Tcl language core. Unlike the QuickJS/Lua ports (a handful of .c files), Tcl is configure-based, so
+// the faithful build lives in `demos/tcl/build_bitcode.sh`: it configures Tcl, builds the native
+// oracle (`libtcl8.6.a`), compiles all 162 core TUs to `.ll` with the Makefile's own flags, and
+// `llvm-link`s them + the driver + `tcl_shim.c` + the reused printf/strtod shims into one module. The
+// test shells out to that script (idempotent + cached), builds the native *driver* oracle, then
+// translate → verify → run under the powerbox and diffs stdout.
+//
+// `#[ignore]`d only for wall-clock (it builds all of Tcl + openlibm and runs a whole interpreter on
+// the tree-walker), like the QuickJS capstone — run with `--ignored`. It passes: the Tcl core
+// translates, verifies, and runs byte-identical to native. Skips loudly (never fails) when
+// clang/curl/make/openlibm are unavailable — grep for `skipping tcl` before trusting a green run.
+
+/// Path to `demos/tcl`.
+fn tcl_demo_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../temen-run/demos/tcl")
+}
+
+/// Run the faithful `build_bitcode.sh` (fetch + configure + native oracle + per-TU bitcode + link)
+/// with `openlibm` staged (its dir threaded in via `OPENLIBM_DIR` so Tcl's address-taken `expr` math
+/// table — `&acos`/`&sin`/… — resolves; that constexpr-funcref is not trap-stubbable, so openlibm is
+/// required just to translate). Returns `(linked_ll, tcl_src_dir)` or `None` (skip) when unavailable.
+fn build_tcl(openlibm: &Path) -> Option<(PathBuf, PathBuf)> {
+    let cache = std::env::temp_dir().join("temen_tcl_cache");
+    let linked = cache.join("tcl_linked.ll");
+    let src = cache.join("tcl8.6.14");
+    let script = tcl_demo_dir().join("build_bitcode.sh");
+    let status = Command::new("bash")
+        .arg(&script)
+        .env("OPENLIBM_DIR", openlibm)
+        .status();
+    match status {
+        Ok(s) if s.success() && linked.exists() && src.join("unix/libtcl8.6.a").exists() => {
+            Some((linked, src))
+        }
+        _ => {
+            eprintln!("note: skipping tcl (build_bitcode.sh failed — offline or no clang/make?)");
+            None
+        }
+    }
+}
+
+/// Build the native **driver** oracle: `tcl_repl.c` + native `libtcl8.6.a` (`-lz -lm`). The stock
+/// `tclsh` the script also builds is *not* the oracle — the driver defines the REPL output shape, so
+/// the oracle must be the same driver compiled with `cc` (as the QuickJS test does).
+fn build_tcl_native_oracle(src: &Path) -> Option<PathBuf> {
+    let exe = std::env::temp_dir().join(format!("tcl_repl_native_{}", std::process::id()));
+    let ok = Command::new("cc")
+        .args(["-O2", "-I"])
+        .arg(src.join("generic"))
+        .arg("-I")
+        .arg(src.join("unix"))
+        .arg(tcl_demo_dir().join("tcl_repl.c"))
+        .arg(src.join("unix/libtcl8.6.a"))
+        .args(["-lz", "-lm", "-o"])
+        .arg(&exe)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    ok.then_some(exe)
+}
+
+/// **▶ Tcl REPL — evaluate a Tcl script piped in on stdin, byte-identical to native** (the playground
+/// driver). The whole Tcl 8.6 language core (bytecode compiler + engine, `expr`, `string`/`list`/`dict`,
+/// regex, libtommath) compiled through the on-ramp: translate → verify → run under the powerbox with
+/// `stdin`, asserting stdout byte-matches the native `cc` driver oracle. `#[ignore]`d only for
+/// wall-clock (configures + builds all 162 Tcl TUs + openlibm, then runs a whole interpreter on the
+/// tree-walker — tens of seconds), like the QuickJS capstone; run with `--ignored`. Skips loudly
+/// (never fails) when clang/curl/make/openlibm are unavailable — grep for `skipping tcl`.
+#[test]
+#[ignore = "capstone: builds all of Tcl + openlibm and runs a whole interpreter on the tree-walker (tens of seconds); run with --ignored"]
+fn demo_tcl_repl_stdin() {
+    let Some(ol) = fetch_openlibm() else {
+        eprintln!(
+            "note: skipping tcl (openlibm unavailable — the address-taken expr math needs it)"
+        );
+        return;
+    };
+    let Some((linked, src)) = build_tcl(&ol) else {
+        return;
+    };
+    let Some(oracle) = build_tcl_native_oracle(&src) else {
+        eprintln!("note: skipping tcl (native oracle cc build failed)");
+        return;
+    };
+    // A language-breadth script: recursion, lsort, format, dict, string, `expr` (incl. `**` and the
+    // transcendental `sqrt`, which exercises the linked guest openlibm).
+    let stdin: &[u8] =
+        b"proc fib {n} { expr {$n < 2 ? $n : [fib [expr {$n-1}]] + [fib [expr {$n-2}]]} }\n\
+        set out {}\n\
+        for {set i 0} {$i < 10} {incr i} { lappend out [fib $i] }\n\
+        puts \"fib: $out\"\n\
+        puts \"sorted: [lsort -integer {5 3 8 1 9 2 7}]\"\n\
+        puts [format \"pi ~ %.4f, 255 = 0x%X, sqrt2 = %.6f\" 3.14159265 255 [expr {sqrt(2)}]]\n\
+        dict set d a 1; dict set d b 2; puts \"dict: $d\"\n\
+        puts [string toupper {tcl on temen}]\n\
+        expr {2**10 + [string length hello]}\n";
+
+    let native = {
+        use std::io::Write;
+        let mut child = Command::new(&oracle)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn native tcl driver");
+        child.stdin.take().unwrap().write_all(stdin).ok();
+        child.wait_with_output().expect("run native tcl driver")
+    };
+    assert!(
+        native.status.success() && !native.stdout.is_empty(),
+        "native tcl oracle produced no output"
+    );
+
+    // Stub the OS surface unreached by the minimal REPL (zlib/scanf/fts) so the big program
+    // translates; the translator gaps Tcl surfaced (constexpr icmp, vector ptrtoint) are folded in.
+    let opts = temen_llvm::TranslateOptions {
+        stub_unresolved_externs: true,
+        ..Default::default()
+    };
+    let t = temen_llvm::translate_ll_path_with_options(&linked, opts).expect("translate tcl");
+    let module = t.module;
+    temen_verify::verify_module(&module).expect("verify tcl module");
+    let run = temen_run::run_powerbox(&module, stdin).expect("powerbox run tcl");
+    assert_eq!(
+        run.stdout,
+        native.stdout,
+        "tcl: guest {:?} vs native {:?}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&native.stdout)
+    );
+}
+
+/// Build the native **full-init** oracle: `tcl_init.c` + the embedded-library header (generated by
+/// `build_bitcode.sh` into `$cache/drivers/tcl_library.h`) + native `libtcl8.6.a`. Same driver the
+/// guest runs, so its stdout is the byte-exact reference.
+fn build_tcl_init_native_oracle(src: &Path) -> Option<PathBuf> {
+    let cache = std::env::temp_dir().join("temen_tcl_cache");
+    let exe = std::env::temp_dir().join(format!("tcl_init_native_{}", std::process::id()));
+    let ok = Command::new("cc")
+        .args(["-O2", "-I"])
+        .arg(src.join("generic"))
+        .arg("-I")
+        .arg(src.join("unix"))
+        .arg("-I")
+        .arg(cache.join("drivers")) // tcl_library.h
+        .arg(tcl_demo_dir().join("tcl_init.c"))
+        .arg(src.join("unix/libtcl8.6.a"))
+        .args(["-lz", "-lm", "-o"])
+        .arg(&exe)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    ok.then_some(exe)
+}
+
+/// **▶ Tcl full `Tcl_Init` — the whole standard library, byte-identical to native** (the "Full
+/// Tcl_Init" follow-up). `tcl_init.c` registers an in-guest `Tcl_Filesystem` VFS serving the Tcl
+/// script library from embedded byte arrays, then calls `Tcl_Init` — so `clock`/`file`/`glob`/
+/// `auto_load`/`package require msgcat` all work with **no filesystem capability**. Translate → verify
+/// → run under the powerbox with a stdin script, asserting stdout byte-matches the native `cc` driver.
+/// `#[ignore]`d for wall-clock only (builds all of Tcl + openlibm), like the REPL capstone; run with
+/// `--ignored`. Skips loudly when clang/curl/make/openlibm are unavailable.
+#[test]
+#[ignore = "capstone: builds all of Tcl + openlibm and runs the full-init interpreter on the tree-walker (tens of seconds); run with --ignored"]
+fn demo_tcl_init_stdin() {
+    let Some(ol) = fetch_openlibm() else {
+        eprintln!("note: skipping tcl_init (openlibm unavailable)");
+        return;
+    };
+    // build_tcl runs build_bitcode.sh, which also produces tcl_init_linked.ll + drivers/tcl_library.h.
+    let Some((_repl_linked, src)) = build_tcl(&ol) else {
+        return;
+    };
+    let init_linked = std::env::temp_dir().join("temen_tcl_cache/tcl_init_linked.ll");
+    if !init_linked.exists() {
+        eprintln!("note: skipping tcl_init (build produced no tcl_init_linked.ll)");
+        return;
+    }
+    let Some(oracle) = build_tcl_init_native_oracle(&src) else {
+        eprintln!("note: skipping tcl_init (native oracle cc build failed)");
+        return;
+    };
+    // Exercises the script library specifically: `clock format` (clock.tcl + auto-loaded msgcat),
+    // `glob` over the VFS mount, `file` ops, auto-loaded `parray`-adjacent commands, plus core language.
+    let stdin: &[u8] = b"puts \"Tcl [info patchlevel]\"\n\
+        puts \"clock: [clock format 1000000000 -gmt 1 -format {%Y-%m-%d %H:%M:%S}]\"\n\
+        puts \"lib: [lsort [glob -tails -directory //tcllib *.tcl]]\"\n\
+        puts \"file: [file join /a b c] [file extension x.tcl] [file rootname y.txt]\"\n\
+        puts \"dict: [dict merge {a 1} {b 2}]\"\n\
+        puts \"regexp: [regexp -inline {(\\w+)@(\\w+)} user@host]\"\n\
+        proc fib {n} { expr {$n < 2 ? $n : [fib [expr {$n-1}]] + [fib [expr {$n-2}]]} }\n\
+        puts \"fib: [lmap i {1 2 3 4 5 6 7 8} {fib $i}]\"\n";
+
+    let native = {
+        use std::io::Write;
+        let mut child = Command::new(&oracle)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn native tcl_init driver");
+        child.stdin.take().unwrap().write_all(stdin).ok();
+        child
+            .wait_with_output()
+            .expect("run native tcl_init driver")
+    };
+    assert!(
+        native.status.success() && !native.stdout.is_empty(),
+        "native tcl_init oracle produced no output"
+    );
+
+    let opts = temen_llvm::TranslateOptions {
+        stub_unresolved_externs: true,
+        ..Default::default()
+    };
+    let t =
+        temen_llvm::translate_ll_path_with_options(&init_linked, opts).expect("translate tcl_init");
+    let module = t.module;
+    temen_verify::verify_module(&module).expect("verify tcl_init module");
+    let run = temen_run::run_powerbox(&module, stdin).expect("powerbox run tcl_init");
+    assert_eq!(
+        run.stdout,
+        native.stdout,
+        "tcl_init: guest {:?} vs native {:?}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&native.stdout)
+    );
+}
+
+/// **Constexpr `icmp` in an instruction operand** — the first on-ramp gap the Tcl port surfaced
+/// (`DeleteScriptLimitCallback`: `select i1 icmp eq (ptr inttoptr(3), ptr @g), …`). A global address
+/// is never a small integer sentinel, so the compare folds to *false* at run time; the on-ramp lowers
+/// the constexpr to a real `IntCmp` (not a compile-time fold, since `@g` is a relocation). Both
+/// backends must agree and pick the false arm (222).
+#[test]
+fn constexpr_icmp_operand() {
+    let src = "\
+@g = global i32 0
+define i64 @run() {
+entry:
+  %r = select i1 icmp eq (ptr inttoptr (i64 3 to ptr), ptr @g), i64 111, i64 222
+  ret i64 %r
+}
+";
+    let t = temen_llvm::translate_ll_str(src).expect("translate constexpr icmp");
+    let module = t.module;
+    temen_verify::verify_module(&module).expect("verify constexpr icmp");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let interp = temen_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
+    assert_eq!(interp, vec![Value::I64(222)], "interp: false arm");
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match temen_jit::compile_and_run(&module, 0, &slots).expect("jit run") {
+        JitOutcome::Returned(s) => assert_eq!(s[0], 222, "JIT: false arm (interp said {interp:?})"),
+        other => panic!("unexpected JIT outcome {other:?}"),
+    }
+}
+
+/// **Vector `ptrtoint`/`inttoptr` identity** — the second on-ramp gap Tcl surfaced (`FinalizeOONextFilter`
+/// packs a pointer pair: `load <2 x ptr>` → `ptrtoint <2 x ptr> to <2 x i64>` → `trunc → <2 x i32>`).
+/// Pointers are i64 lanes, so the ptrtoint is a representational identity on the packed v128. Built
+/// here from two `inttoptr` constants (100, 200), round-tripped through the identity, extracting lane 1.
+#[test]
+fn vector_ptrtoint_identity() {
+    let src = "\
+define i64 @run() {
+entry:
+  %a = insertelement <2 x i64> undef, i64 100, i32 0
+  %b = insertelement <2 x i64> %a, i64 200, i32 1
+  %p = inttoptr <2 x i64> %b to <2 x ptr>
+  %i = ptrtoint <2 x ptr> %p to <2 x i64>
+  %e = extractelement <2 x i64> %i, i32 1
+  ret i64 %e
+}
+";
+    let Ok(t) = temen_llvm::translate_ll_str(src) else {
+        // The insertelement/extractelement scaffolding around the fix may not be supported in
+        // isolation on every build; the Tcl translate exercises the real `<2 x ptr>` load→ptrtoint→
+        // trunc path end to end. Skip rather than fail if the scaffold isn't lowerable.
+        eprintln!(
+            "note: skipping vector_ptrtoint_identity (vec insert/extract scaffold unsupported)"
+        );
+        return;
+    };
+    let module = t.module;
+    if temen_verify::verify_module(&module).is_err() {
+        eprintln!("note: skipping vector_ptrtoint_identity (verify)");
+        return;
+    }
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let interp = temen_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
+    assert_eq!(interp, vec![Value::I64(200)], "interp: lane 1");
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match temen_jit::compile_and_run(&module, 0, &slots).expect("jit run") {
+        JitOutcome::Returned(s) => assert_eq!(s[0], 200, "JIT: lane 1 (interp said {interp:?})"),
+        other => panic!("unexpected JIT outcome {other:?}"),
+    }
+}
+
+// --- GNU bash (#802 slice 2) — the whole-shell bring-up gate + the two gaps it surfaced ---------
+
+/// **Max-alignment literal** — the first on-ramp gap bash surfaced: clang stamps
+/// `align 4294967296` (2^32, one past `u32`) on a deliberately-trapping null store (bash's
+/// `programming_error` path emits `store volatile i64 …, ptr null, align 4294967296`). The
+/// alignment of an access that can only trap carries no meaning, so the `.ll` parser saturates
+/// rather than refusing the whole module. Pinned on a benign global store.
+#[test]
+fn align_u32_max_saturates() {
+    let src = "\
+@g = global i64 0
+define i64 @run() {
+entry:
+  store i64 7, ptr @g, align 4294967296
+  %r = load i64, ptr @g, align 8
+  ret i64 %r
+}
+";
+    let t = temen_llvm::translate_ll_str(src).expect("translate max-align");
+    let module = t.module;
+    temen_verify::verify_module(&module).expect("verify max-align");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let interp = temen_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
+    assert_eq!(interp, vec![Value::I64(7)], "the store landed");
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match temen_jit::compile_and_run(&module, 0, &slots).expect("jit run") {
+        JitOutcome::Returned(s) => assert_eq!(s[0], 7, "JIT agrees (interp said {interp:?})"),
+        other => panic!("unexpected JIT outcome {other:?}"),
+    }
+}
+
+/// **Old-C call-site drift** — the second gap bash surfaced: an empty-parens prototype
+/// (`extern void f ();`) lets every call site invent its own function type, so a site can drift
+/// from the definition in arity, widths, AND variadicity — bash calls the plain `(ptr, ptr)`
+/// definition `add_unwind_protect` through a `(ptr, i32, ...)` site type. The native ABI hides
+/// the drift (args share registers); the lowering follows the DEFINITION: the site's variadic
+/// shape is dropped for the non-variadic callee (no va-area deposit into the callee's frame) and
+/// the `i32` argument zero-extends to the definition's pointer width.
+#[test]
+fn old_c_call_site_drift_follows_the_definition() {
+    let src = "\
+@sink = global i64 1
+define void @f(ptr %a, ptr %b) {
+entry:
+  %v = ptrtoint ptr %b to i64
+  store i64 %v, ptr %a, align 8
+  ret void
+}
+define i64 @run() {
+entry:
+  call void (ptr, i32, ...) @f(ptr @sink, i32 42)
+  %r = load i64, ptr @sink, align 8
+  ret i64 %r
+}
+";
+    let t = temen_llvm::translate_ll_str(src).expect("translate old-C drift");
+    let run_idx = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == "run")
+        .expect("run exported")
+        .1;
+    let module = t.module;
+    temen_verify::verify_module(&module).expect("verify old-C drift");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let interp = temen_interp::run(&module, run_idx, &full, &mut fuel).expect("interp run");
+    assert_eq!(
+        interp,
+        vec![Value::I64(42)],
+        "the i32 arg reached the ptr param zero-extended"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match temen_jit::compile_and_run(&module, run_idx, &slots).expect("jit run") {
+        JitOutcome::Returned(s) => assert_eq!(s[0], 42, "JIT agrees (interp said {interp:?})"),
+        other => panic!("unexpected JIT outcome {other:?}"),
+    }
+}
+
+/// **Old-C INDIRECT call-site drift** (#802 slice 3 — the function-pointer twin of the direct-call
+/// rule above): bash's `typedef int Function ()` tables call cleanups through `(ptr, ...)` sites
+/// whose runtime target is a plain `void ()` / `void (ptr)` definition. The native ABI hides the
+/// drift; the strict typed `call_indirect` would trap `IndirectCallType`. The translator routes a
+/// varargs indirect site through a synthesized **static dispatcher**: each address-taken candidate
+/// gets a funcref-equality arm making the DIRECT call with the definition's own signature (args
+/// width-coerced, a missing result padded 0), and everything else — here the exact-typed second
+/// target — falls to the strict `call_indirect` unchanged.
+#[test]
+fn old_c_indirect_call_drift_dispatches_to_the_definition() {
+    let src = "\
+@g = global i64 0
+@p = global ptr @bump
+@q = global ptr @exact
+define void @bump() {
+entry:
+  store i64 41, ptr @g, align 8
+  ret void
+}
+define i32 @exact(ptr %a) {
+entry:
+  %v = load i64, ptr %a, align 8
+  %t = trunc i64 %v to i32
+  %r = add i32 %t, 1
+  ret i32 %r
+}
+define i64 @run() {
+entry:
+  %f = load ptr, ptr @p, align 8
+  %r0 = call i32 (ptr, ...) %f(ptr @g)
+  %f2 = load ptr, ptr @q, align 8
+  %r1 = call i32 (ptr, ...) %f2(ptr @g)
+  %a = add i32 %r0, %r1
+  %w = zext i32 %a to i64
+  ret i64 %w
+}
+";
+    let t = temen_llvm::translate_ll_str(src).expect("translate old-C indirect drift");
+    let run_idx = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == "run")
+        .expect("run exported")
+        .1;
+    let module = t.module;
+    temen_verify::verify_module(&module).expect("verify old-C indirect drift");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let interp = temen_interp::run(&module, run_idx, &full, &mut fuel).expect("interp run");
+    // `bump` (void ()) ran through the dispatcher arm (side effect: g = 41, result padded 0);
+    // `exact` (i32 (ptr)) took the strict default and returned 41 + 1.
+    assert_eq!(
+        interp,
+        vec![Value::I64(42)],
+        "dispatched drift call ran the definition; exact-typed target kept strict semantics"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match temen_jit::compile_and_run(&module, run_idx, &slots).expect("jit run") {
+        JitOutcome::Returned(s) => assert_eq!(s[0], 42, "JIT agrees (interp said {interp:?})"),
+        other => panic!("unexpected JIT outcome {other:?}"),
+    }
+}
+
+/// The **core-pipe builtins on the on-ramp** (#802 slice 4 / FORK.md §8.6): `__vm_pipe` mints a
+/// host-served pipe into this domain's powerbox (self-namespace op 16), `__vm_write`/`__vm_read`
+/// transfer on the *specific* end handles (`Stream` ops 1/0 — unlike the `write`/`read`
+/// recognizers, which reach the ambient streams), and `__vm_close` releases an end (op 2) —
+/// closing the last writer makes the reader see true EOF (0), not a hang. The lowerings mirror the
+/// chibicc frontend's (`codegen_ir.c`) byte-for-byte, so the #972 tag-protocol shim wrappers
+/// (`posix_utils/util.c`, `bash_shim.c` band 0) work identically on both frontends.
+#[test]
+fn core_pipe_builtins_roundtrip() {
+    let src = r#"
+int printf(const char *, ...);
+long __vm_pipe(int *fds);
+long __vm_read(int h, void *buf, long len);
+long __vm_write(int h, const void *buf, long len);
+int __vm_close(int h);
+int main(void) {
+  int h[2];
+  char buf[4];
+  if (__vm_pipe(h) != 0) return 1;
+  if (__vm_write(h[1], "abc", 3) != 3) return 2;
+  __vm_close(h[1]);
+  if (__vm_read(h[0], buf, 3) != 3) return 3;
+  buf[3] = 0;
+  if (__vm_read(h[0], buf, 1) != 0) return 4; /* last writer closed => true EOF, not a park */
+  __vm_close(h[0]);
+  printf("piped:%s\n", buf);
+  return 0;
+}
+"#;
+    let Some(ll) = compile_to_ll("core_pipe_builtins", src) else {
+        return;
+    };
+    let t = temen_llvm::translate_ll_path(&ll).expect("translate core-pipe builtins");
+    temen_verify::verify_module(&t.module).expect("verify core-pipe builtins");
+    let inst = temen_run::instantiate(t.module.clone()).expect("instantiate");
+    // Interpreter tier only: the capability pipe path needs the `Real` scheduler (`CAP_SELF_PIPE`)
+    // — the same tier boundary the chibicc-world pipe witnesses pin (`c_posix.rs` DUAL_WORLD).
+    let run = inst
+        .run(
+            temen_run::Backend::TreeWalk,
+            &temen_run::RunConfig::default(),
+        )
+        .unwrap_or_else(|e| panic!("core-pipe run failed: {e}"));
+    assert!(
+        matches!(
+            &run.outcome,
+            temen_run::Outcome::Returned(v) if v == &[temen_run::Value::I32(0)]
+        ),
+        "main's return = the failing step (got {:?})",
+        run.outcome
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "piped:abc\n",
+        "the bytes crossed the pipe"
+    );
+}
+
+/// **`fork()` over the named posix capability** (#802 slice 4): the full lane a forking on-ramp
+/// program (bash) rides — `posix_cap`'s grant wires the async-signal door (which carries the #799
+/// caller-request door, so op 51 actually forks instead of `-ENOSYS`), the fork engine duplicates
+/// a host whose fixed powerbox holds a **pristine** guest-JIT grant (previously an unconditional
+/// `-EAGAIN`), and the twin's private window copy includes the **`vm_map`-committed tail pages**
+/// (the waist malloc's heap — previously a fail-closed refusal for every malloc-using program).
+/// The child proves the copied heap byte, writes it through the adopted core pipe (#972 tag
+/// redirect), and exits via the personality; the parent reads it and proves no aliasing.
+#[test]
+fn fork_over_the_named_posix_cap_copies_the_heap() {
+    let src = r#"
+int printf(const char *, ...);
+void *malloc(unsigned long n);
+extern int __vm_cap_resolve(const char *name, long len);
+extern long __vm_host_call(int h, int op, long a, long b, long c, long d);
+long __vm_pipe(int *fds);
+long __vm_read(int h, void *buf, long len);
+long __vm_write(int h, const void *buf, long len);
+int __vm_close(int h);
+static int px(void) {
+  static int h = -1;
+  if (h < 0) h = __vm_cap_resolve("posix", 5);
+  return h;
+}
+static long tag(long r) { return r <= -1048576 ? -(r + 1048576) : -1; }
+int main(void) {
+  char *heap = (char *)malloc(64); /* vm_map'd tail heap: the fork must copy it */
+  int h[2];
+  int fds[2];
+  char buf[8];
+  heap[0] = 'M';
+  if (__vm_pipe(h) != 0) return 1;
+  if (__vm_host_call(px(), 52, h[0], h[1], (long)fds, 0) != 0) return 2; /* pipe_adopt */
+  long pid = __vm_host_call(px(), 51, 0, 0, 0, 0); /* fork */
+  if (pid < 0) return 3;
+  if (pid == 0) { /* child: prove the copied heap byte, send it, exit */
+    heap[0] = heap[0] == 'M' ? 'c' : '?';
+    long r = __vm_host_call(px(), 0, fds[1], (long)heap, 1, 0); /* write */
+    long t = tag(r);
+    if (t >= 0) r = __vm_write((int)t, heap, 1);
+    __vm_host_call(px(), 4, r == 1 ? 0 : 9, 0, 0, 0); /* exit */
+  }
+  /* parent: close our write-end copy, read the child's byte, prove no aliasing. */
+  long c = __vm_host_call(px(), 6, fds[1], 0, 0, 0); /* close */
+  long ct = tag(c);
+  if (ct >= 0) __vm_close((int)ct);
+  long r = __vm_host_call(px(), 1, fds[0], (long)buf, 8, 0); /* read */
+  long t = tag(r);
+  if (t >= 0) r = __vm_read((int)t, buf, 8);
+  if (r != 1 || buf[0] != 'c') return 4;
+  if (heap[0] != 'M') return 5; /* the twin's heap write did not alias the parent */
+  printf("forked:%c parent:%c\n", buf[0], heap[0]);
+  return 0;
+}
+"#;
+    let Some(ll) = compile_to_ll("fork_posix_cap", src) else {
+        return;
+    };
+    let t = temen_llvm::translate_ll_path(&ll).expect("translate fork witness");
+    temen_verify::verify_module(&t.module).expect("verify fork witness");
+    let inst = temen_run::instantiate(t.module.clone()).expect("instantiate");
+    let (cap, _posix) = temen_run::posix::posix_cap(0, 0, Vec::new());
+    let run = inst
+        .run_with_caps(
+            temen_run::Backend::TreeWalk,
+            &temen_run::RunConfig::default(),
+            &[("posix", cap)],
+        )
+        .expect("run fork witness");
+    assert!(
+        matches!(
+            &run.outcome,
+            temen_run::Outcome::Returned(v) if v == &[temen_run::Value::I32(0)]
+        ),
+        "main's return = the failing step (got {:?})",
+        run.outcome
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "forked:c parent:M\n",
+        "the child's copied-heap byte crossed the pipe; the parent's heap is unaliased"
+    );
+}
+
+/// Path to `demos/bash`.
+fn bash_demo_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../temen-run/demos/bash")
+}
+
+/// **▶ GNU bash translates + verifies** (#802 slice 2 — the whole-shell gate). Runs the faithful
+/// `demos/bash/build_bitcode.sh` (fetch bash 5.2.21 → configure the bring-up config → native
+/// oracle → 152 per-TU bitcodes with each Makefile's own flags → llvm-link + shim + waist) and
+/// translates the ~7.8 MB module through the on-ramp with trap-stubbed unreached externs:
+/// 1716 functions, verified. The RUN gate (the stdio/OS wiring) is slice 3 — a trial run today
+/// reaches deep into `shell.c` startup before the unwired `FILE*` surface stops it.
+/// `#[ignore]`d for wall-clock only (fetch + configure + a full native build — minutes); skips
+/// loudly (never fails) when clang/curl/make are unavailable — grep for `skipping bash`.
+#[test]
+#[ignore = "capstone: fetches + builds all of bash (minutes); run with --ignored"]
+fn demo_bash_translates_and_verifies() {
+    let script = bash_demo_dir().join("build_bitcode.sh");
+    let linked = std::env::temp_dir().join("temen_bash_cache/bash_linked.ll");
+    let ok = Command::new("bash")
+        .arg(&script)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok || !linked.exists() {
+        eprintln!("note: skipping bash (build_bitcode.sh failed — offline or no clang/make?)");
+        return;
+    }
+    let opts = temen_llvm::TranslateOptions {
+        stub_unresolved_externs: true,
+        ..Default::default()
+    };
+    let t = temen_llvm::translate_ll_path_with_options(linked.to_str().unwrap(), opts)
+        .expect("bash translates");
+    assert!(
+        t.module.funcs.len() > 1500,
+        "the whole shell translated ({} funcs)",
+        t.module.funcs.len()
+    );
+    temen_verify::verify_module(&t.module).expect("bash verifies");
+
+    // ▶ Slice 3 — the RUN gate: `bash -c <script>` on the interpreter (setjmp/fork are interp-only
+    // tiers) with the temen-posix personality granted as the named "posix" capability (the shim's
+    // band 0 resolves it via `__vm_cap_resolve` and drives the op ABI through `__vm_host_call`).
+    // Byte-differential against the native oracle the script just built, under the same argv/env.
+    let oracle = std::env::temp_dir().join("temen_bash_cache/bash-5.2.21/bash");
+    let inst = temen_run::instantiate(t.module.clone()).expect("instantiate bash");
+    for script in [
+        "echo hi",
+        "x=world; echo \"hello $x\"",
+        "echo $((6*7))",
+        "for i in a b c; do echo $i; done",
+        "f() { echo fn-$1; }; f arg",
+        // Slice 4 — fork/pipes: command substitution, subshells, builtin pipelines (real fork
+        // twins over adopted core pipes), with trailing commands pinning the foreground waits.
+        "echo `echo nested`",
+        "x=$(echo one; echo two); echo \"$x\"",
+        "echo start; (x=5; echo in-$x); echo end",
+        "echo a | { read x; echo \"got-$x\"; }; echo tail",
+        "echo one | { read a; echo p1-$a; } | { read b; echo p2-$b; }; echo done2",
+        // Slice 4 — traps/signals: async delivery into bash's C handlers (the shim registers the
+        // handler stack in a ctor), in the parent, in a fork twin, ignored, and repeated.
+        "trap \"echo INT-caught\" INT; kill -INT $$; echo after",
+        "trap \"echo child-int\" INT; (kill -INT $$); echo done3",
+        "trap \"\" INT; kill -INT $$; echo ignored-ok",
+        "trap \"echo u1\" USR1; kill -USR1 $$; kill -USR1 $$; echo twice",
+        "trap \"echo bye\" EXIT; (echo sub); echo main",
+        // Rung-3 tail — here-docs/here-strings into BUILTIN readers (bash spools each one into
+        // an unlinked temp file, so these came free with the #800/#801 fs surface; pinned here
+        // because the slice-4 README listed them as a remaining gap).
+        "read a b <<< \"x y\"; echo \"read:$a/$b\"",
+        "while read -r l; do echo \"loop:$l\"; done <<EOF\nl1\nl2\nEOF",
+    ] {
+        let config = temen_run::RunConfig {
+            args: vec![b"bash".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()],
+            env: vec![b"PATH=/bin".to_vec(), b"HOME=/".to_vec()],
+            ..Default::default()
+        };
+        let (cap, posix) = temen_run::posix::posix_cap(0, 0, Vec::new());
+        let run = inst
+            .run_with_caps(temen_run::Backend::TreeWalk, &config, &[("posix", cap)])
+            .unwrap_or_else(|e| panic!("bash -c {script:?} failed: {e}"));
+        let native = Command::new(&oracle)
+            .args(["-c", script])
+            .env_clear()
+            .env("PATH", "/bin")
+            .env("HOME", "/")
+            .output()
+            .expect("run the native oracle");
+        let code = match &run.outcome {
+            temen_run::Outcome::Exited(c) => *c,
+            temen_run::Outcome::Returned(v) => match v.first() {
+                Some(temen_run::Value::I32(c)) => *c,
+                Some(temen_run::Value::I64(c)) => *c as i32,
+                _ => -1,
+            },
+        };
+        assert_eq!(
+            code,
+            native.status.code().unwrap_or(-1),
+            "bash -c {script:?}: exit status differs from the oracle (outcome {:?})",
+            run.outcome
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&posix.stdout()),
+            String::from_utf8_lossy(&native.stdout),
+            "bash -c {script:?}: stdout differs from the oracle"
+        );
+    }
+
+    // ▶ Slice 4 tail — **external commands**: stage the #801 /bin (the chibicc-world coreutils,
+    // compiled by `stage_bin.sh` to `.temt` command modules) and run exec'd pipelines —
+    // fork → execve("/bin/…") → waitpid, PATH lookup, redirections to memfs files, command
+    // substitution over exec'd stages. Skips loudly when chibicc can't build (no make/cc).
+    let staged = Command::new("bash")
+        .arg(bash_demo_dir().join("stage_bin.sh"))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !staged {
+        eprintln!("note: skipping bash external-command gate (chibicc unavailable)");
+        return;
+    }
+    let bin_dir = std::env::temp_dir().join("temen_bash_cache/bin");
+    let mut bins: Vec<(String, temen_ir::Module, u8)> = Vec::new();
+    for e in std::fs::read_dir(&bin_dir).expect("read staged /bin") {
+        let p = e.expect("dir entry").path();
+        if p.extension().is_none_or(|x| x != "temen") {
+            continue;
+        }
+        let name = p.file_stem().unwrap().to_string_lossy().into_owned();
+        let ir = std::fs::read_to_string(&p).expect("read command IR");
+        let m = temen_text::parse_module(&ir).expect("parse command");
+        temen_verify::verify_module(&m).expect("verify command");
+        let wl = m.memory.expect("command window").size_log2;
+        bins.push((format!("/bin/{name}"), m, wl));
+    }
+    assert!(bins.len() >= 10, "the staged /bin arrived");
+    let bins = std::sync::Arc::new(bins);
+    // Both sides run each script in a fresh cwd ("/" on the memfs; a fresh tempdir natively), so
+    // the relative-path redirection lands in a private file on each side.
+    let native_cwd = std::env::temp_dir().join(format!("temen_bash_gate_{}", std::process::id()));
+    std::fs::create_dir_all(&native_cwd).expect("native cwd");
+    for script in [
+        "/bin/echo external",
+        "echo viaPATH | cat",
+        "seq 5 | head -n 2",
+        "seq 100 | wc -l",
+        "x=$(seq 3 | wc -l); echo \"n=$x\"",
+        "true && echo t; false || echo f",
+        "seq 3 | sort | uniq | wc -l",
+        "echo hi > f; cat f",
+        // Rung-3 tail — here-docs feeding an EXEC'D command (the temp-file fd rides the exec
+        // carry): expansion, the quoted-delimiter no-expansion form, `<<-` tab-stripping, and
+        // the here-string.
+        "cat <<EOF\nplain $((1+1))\nEOF",
+        "cat <<\"EOF\"\nno $HOME expand\nEOF",
+        "cat <<-TAB\n\tstripped\nTAB",
+        "cat <<< herestring",
+    ] {
+        let config = temen_run::RunConfig {
+            args: vec![b"bash".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()],
+            env: vec![b"PATH=/bin".to_vec(), b"HOME=/".to_vec()],
+            ..Default::default()
+        };
+        // posix_cap plus the /bin registration, which must happen inside the grant (module
+        // handles live in the run's Host) — the `stage_executable` shape from c_posix.rs.
+        let (posix, make) = temen_posix::cap(0, 0, Vec::new());
+        let fork = temen_posix::cap_fork_factory(&posix);
+        let p = posix.clone();
+        let bins_for_grant = std::sync::Arc::clone(&bins);
+        let cap = temen_run::HostCap::custom(temen_interp::cap_id::HOST_PROC, 0, move |h, _win| {
+            let handle = h.grant_host_proc_forkable(make(), std::sync::Arc::clone(&fork));
+            let (door, armed) = temen_posix::cap_signal_source(&p);
+            h.set_signal_source(door, armed);
+            h.push_exec_remap_hook(temen_posix::cap_exec_remap_hook(&p));
+            let (names, sigs) = temen_posix::cap_vtable();
+            h.set_host_proc_vtable(handle, names, sigs);
+            for (path, m, wl) in bins_for_grant.iter() {
+                let mh = h.grant_module(m);
+                p.register_executable(path, mh, *wl);
+            }
+            handle
+        });
+        let run = inst
+            .run_with_caps(temen_run::Backend::TreeWalk, &config, &[("posix", cap)])
+            .unwrap_or_else(|e| panic!("bash -c {script:?} (external) failed: {e}"));
+        let native = Command::new(&oracle)
+            .args(["-c", script])
+            .env_clear()
+            .env("PATH", "/bin")
+            .env("HOME", "/")
+            .current_dir(&native_cwd)
+            .output()
+            .expect("run the native oracle");
+        let code = match &run.outcome {
+            temen_run::Outcome::Exited(c) => *c,
+            temen_run::Outcome::Returned(v) => match v.first() {
+                Some(temen_run::Value::I32(c)) => *c,
+                Some(temen_run::Value::I64(c)) => *c as i32,
+                _ => -1,
+            },
+        };
+        assert_eq!(
+            code,
+            native.status.code().unwrap_or(-1),
+            "bash -c {script:?} (external): exit status differs from the oracle (outcome {:?})",
+            run.outcome
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&posix.stdout()),
+            String::from_utf8_lossy(&native.stdout),
+            "bash -c {script:?} (external): stdout differs from the oracle"
+        );
+    }
+
+    // ▶ Interactive rung 1 (#802 interactive slice): `bash -i` on the **#797 controlling
+    // terminal** (`posix_cap_terminal`), a feeder thread typing while the shell runs (the
+    // `run_interp_terminal` witness shape — feed timing is best-effort, so the assertions are on
+    // session RESULTS, not on parking/interleaving). The session proves: the prompt loop (PS1 on
+    // fd 2 between commands), a command typed at the prompt runs, `^C` at the prompt aborts the
+    // line and sets `$? = 130` (SIGINT through the feed-time line discipline), and `^D` on an
+    // empty line exits the shell cleanly with bash's `exit` farewell.
+    {
+        let (cap, posix) = temen_run::posix::posix_cap_terminal(0, 0);
+        let feeder = {
+            let px = posix.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                for keys in ["echo hi\n", "\x03", "echo rc=$?\n", "\x04"] {
+                    px.feed_terminal(keys.as_bytes());
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            })
+        };
+        let config = temen_run::RunConfig {
+            args: vec![b"bash".to_vec(), b"-i".to_vec()],
+            env: vec![
+                b"PATH=/bin".to_vec(),
+                b"HOME=/".to_vec(),
+                b"PS1=$ ".to_vec(),
+            ],
+            ..Default::default()
+        };
+        let run = inst
+            .run_with_caps(temen_run::Backend::TreeWalk, &config, &[("posix", cap)])
+            .expect("bash -i session");
+        feeder.join().expect("feeder thread");
+        assert_eq!(
+            run.outcome,
+            temen_run::Outcome::Exited(0),
+            "bash -i: the ^D exit carries the last command's status"
+        );
+        let out = String::from_utf8_lossy(&posix.stdout()).into_owned();
+        let err = String::from_utf8_lossy(&posix.stderr()).into_owned();
+        assert!(
+            out.contains("echo hi\nhi\n"),
+            "bash -i: the typed command echoed and ran (stdout: {out:?})"
+        );
+        assert!(
+            out.contains("rc=130"),
+            "bash -i: ^C at the prompt set $? = 130 (stdout: {out:?})"
+        );
+        assert!(
+            err.matches("$ ").count() >= 3,
+            "bash -i: the PS1 prompt re-printed between commands (stderr: {err:?})"
+        );
+        assert!(
+            err.contains("exit"),
+            "bash -i: ^D printed bash's `exit` farewell (stderr: {err:?})"
+        );
+    }
+
+    // ▶ Interactive rung 2 (#802): **job control** — `^Z` stops the foreground external command,
+    // `jobs` lists it, `fg` resumes it WITH the terminal, and the resumed job reads keystrokes
+    // again. This session pins the whole chain: the exec'd child's terminal-backed `read(0)`
+    // (the per-process `term_in` token riding the exec carry), the blocking
+    // `waitpid(-1, WUNTRACED)` bench (and its wake when the child STOPS, not just exits), the
+    // exec image-replace re-wiring the signal door over the new host/domain
+    // (`wire_signal_doors` — without it `fg`'s SIGCONT woke nobody), and the dup'd-tty
+    // `tcgetattr`/`tcsetattr` gates (bash parks the terminal at fd 255).
+    {
+        // The custom-grant shape (the /bin registration and the terminal enable both live inside
+        // the grant — module handles and the input pipe belong to the run's Host).
+        let (posix2, make) = temen_posix::cap(0, 0, Vec::new());
+        let fork = temen_posix::cap_fork_factory(&posix2);
+        let p = posix2.clone();
+        let bins_for_grant = std::sync::Arc::clone(&bins);
+        let cap2 =
+            temen_run::HostCap::custom(temen_interp::cap_id::HOST_PROC, 0, move |h, _win| {
+                let handle = h.grant_host_proc_forkable(make(), std::sync::Arc::clone(&fork));
+                let (door, armed) = temen_posix::cap_signal_source(&p);
+                h.set_signal_source(door, armed);
+                h.push_exec_remap_hook(temen_posix::cap_exec_remap_hook(&p));
+                let (names, sigs) = temen_posix::cap_vtable();
+                h.set_host_proc_vtable(handle, names, sigs);
+                for (path, m, wl) in bins_for_grant.iter() {
+                    let mh = h.grant_module(m);
+                    p.register_executable(path, mh, *wl);
+                }
+                p.enable_terminal(h);
+                handle
+            });
+        let feeder = {
+            let px = posix2.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                for keys in [
+                    "cat\n", "\x1a", "jobs\n", "fg\n", "via-fg\n", "\x04", "exit\n",
+                ] {
+                    px.feed_terminal(keys.as_bytes());
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+            })
+        };
+        let config = temen_run::RunConfig {
+            args: vec![b"bash".to_vec(), b"-i".to_vec()],
+            env: vec![
+                b"PATH=/bin".to_vec(),
+                b"HOME=/".to_vec(),
+                b"PS1=$ ".to_vec(),
+            ],
+            ..Default::default()
+        };
+        let run = inst
+            .run_with_caps(temen_run::Backend::TreeWalk, &config, &[("posix", cap2)])
+            .expect("bash -i job-control session");
+        feeder.join().expect("feeder thread");
+        assert_eq!(
+            run.outcome,
+            temen_run::Outcome::Exited(0),
+            "clean session exit"
+        );
+        let out = String::from_utf8_lossy(&posix2.stdout()).into_owned();
+        let err = String::from_utf8_lossy(&posix2.stderr()).into_owned();
+        assert!(
+            out.contains("[1]+  Stopped                 cat"),
+            "jobs listed the ^Z-stopped foreground job (stdout: {out:?})"
+        );
+        assert!(
+            err.contains("Stopped"),
+            "bash reported the stop at the prompt (stderr: {err:?})"
+        );
+        let echoes = out.matches("via-fg").count();
+        assert!(
+            echoes >= 2,
+            "the fg-resumed cat read the terminal again (echo + cat's copy; stdout: {out:?})"
+        );
+        assert!(
+            !err.contains("tcsetattr"),
+            "no dup'd-tty termios failures (stderr: {err:?})"
+        );
+    }
+
+    // ▶ Interactive rung 3 (#802): **background jobs** — `cat &` starts a job that immediately
+    // reads the terminal from the BACKGROUND, which rings SIGTTIN and stops it (default action);
+    // the parent learns of the stop through the freshly-generated **SIGCHLD** (bash's `waitchld`
+    // handler — without it `jobs` said Running and `fg` skipped its SIGCONT), so `jobs` lists it
+    // Stopped and `fg` continue-and-foregrounds it for real: the resumed cat reads the next typed
+    // line. The session also pins the any-child park key (`ParkEvent::TaskExitAny`): bash's
+    // foreground `waitpid(-1, WUNTRACED)` benches under the per-parent wildcard, so a stopped
+    // background sibling can no longer absorb the bench while the foreground child exits
+    // (the `cat &` hang this rung started from).
+    {
+        let (posix3, make) = temen_posix::cap(0, 0, Vec::new());
+        let fork = temen_posix::cap_fork_factory(&posix3);
+        let p = posix3.clone();
+        let bins_for_grant = std::sync::Arc::clone(&bins);
+        let cap3 =
+            temen_run::HostCap::custom(temen_interp::cap_id::HOST_PROC, 0, move |h, _win| {
+                let handle = h.grant_host_proc_forkable(make(), std::sync::Arc::clone(&fork));
+                let (door, armed) = temen_posix::cap_signal_source(&p);
+                h.set_signal_source(door, armed);
+                h.push_exec_remap_hook(temen_posix::cap_exec_remap_hook(&p));
+                let (names, sigs) = temen_posix::cap_vtable();
+                h.set_host_proc_vtable(handle, names, sigs);
+                for (path, m, wl) in bins_for_grant.iter() {
+                    let mh = h.grant_module(m);
+                    p.register_executable(path, mh, *wl);
+                }
+                p.enable_terminal(h);
+                handle
+            });
+        let feeder = {
+            let px = posix3.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                for keys in ["cat &\n", "jobs\n", "fg\n", "via-bg-fg\n", "\x04", "exit\n"] {
+                    px.feed_terminal(keys.as_bytes());
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+            })
+        };
+        let config = temen_run::RunConfig {
+            args: vec![b"bash".to_vec(), b"-i".to_vec()],
+            env: vec![
+                b"PATH=/bin".to_vec(),
+                b"HOME=/".to_vec(),
+                b"PS1=$ ".to_vec(),
+            ],
+            ..Default::default()
+        };
+        let run = inst
+            .run_with_caps(temen_run::Backend::TreeWalk, &config, &[("posix", cap3)])
+            .expect("bash -i background-job session");
+        feeder.join().expect("feeder thread");
+        assert_eq!(
+            run.outcome,
+            temen_run::Outcome::Exited(0),
+            "clean session exit (no lingering stopped job blocked `exit`)"
+        );
+        let out = String::from_utf8_lossy(&posix3.stdout()).into_owned();
+        let err = String::from_utf8_lossy(&posix3.stderr()).into_owned();
+        assert!(
+            err.contains("[1] "),
+            "bash announced the background job (stderr: {err:?})"
+        );
+        assert!(
+            out.contains("[1]+  Stopped                 cat"),
+            "jobs listed the SIGTTIN-stopped background job — the SIGCHLD reached bash \
+             (stdout: {out:?})"
+        );
+        let echoes = out.matches("via-bg-fg").count();
+        assert!(
+            echoes >= 2,
+            "the fg'd background cat read the terminal (echo + cat's copy; stdout: {out:?})"
+        );
+    }
+
+    // ▶ Rung-3 tail (#802): **`bg` without the read steal** — `bg` SIGCONTs the stopped
+    // background job; its re-issued terminal read must ring SIGTTIN and re-stop it WITHOUT
+    // consuming input meant for the shell. The op returns the `-ERESTART` sentinel instead of
+    // minting the input tag while a stop is pending (the guest read wrappers loop on it), so the
+    // reader benches before it can touch the pipe — before this, the `bg`-continued cat raced
+    // its own deferred stop fire and STOLE the next typed line (the second `jobs` below reached
+    // cat, not bash, and listed nothing). `kill -9 %1` then reaps the job so `exit` is clean.
+    {
+        let (posix4, make) = temen_posix::cap(0, 0, Vec::new());
+        let fork = temen_posix::cap_fork_factory(&posix4);
+        let p = posix4.clone();
+        let bins_for_grant = std::sync::Arc::clone(&bins);
+        let cap4 =
+            temen_run::HostCap::custom(temen_interp::cap_id::HOST_PROC, 0, move |h, _win| {
+                let handle = h.grant_host_proc_forkable(make(), std::sync::Arc::clone(&fork));
+                let (door, armed) = temen_posix::cap_signal_source(&p);
+                h.set_signal_source(door, armed);
+                h.push_exec_remap_hook(temen_posix::cap_exec_remap_hook(&p));
+                let (names, sigs) = temen_posix::cap_vtable();
+                h.set_host_proc_vtable(handle, names, sigs);
+                for (path, m, wl) in bins_for_grant.iter() {
+                    let mh = h.grant_module(m);
+                    p.register_executable(path, mh, *wl);
+                }
+                p.enable_terminal(h);
+                handle
+            });
+        let feeder = {
+            let px = posix4.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                for keys in [
+                    "cat &\n",
+                    "jobs\n",
+                    "bg\n",
+                    "jobs\n",
+                    "kill -9 %1\n",
+                    "exit\n",
+                ] {
+                    px.feed_terminal(keys.as_bytes());
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+            })
+        };
+        let config = temen_run::RunConfig {
+            args: vec![b"bash".to_vec(), b"-i".to_vec()],
+            env: vec![
+                b"PATH=/bin".to_vec(),
+                b"HOME=/".to_vec(),
+                b"PS1=$ ".to_vec(),
+            ],
+            ..Default::default()
+        };
+        let run = inst
+            .run_with_caps(temen_run::Backend::TreeWalk, &config, &[("posix", cap4)])
+            .expect("bash -i bg session");
+        feeder.join().expect("feeder thread");
+        assert_eq!(
+            run.outcome,
+            temen_run::Outcome::Exited(0),
+            "clean session exit (the killed job no longer blocks `exit`)"
+        );
+        let out = String::from_utf8_lossy(&posix4.stdout()).into_owned();
+        assert!(
+            out.contains("[1]+ cat &"),
+            "the bg builtin announced the continued job (stdout: {out:?})"
+        );
+        let stops = out.matches("[1]+  Stopped                 cat").count();
+        assert!(
+            stops >= 2,
+            "both `jobs` listed the stopped job — the second proves the typed line was NOT \
+             stolen by the bg-continued reader (stdout: {out:?})"
+        );
+    }
+}

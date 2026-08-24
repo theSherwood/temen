@@ -1,11 +1,11 @@
-# Detached (`[workspace]`) host harness: drive the **wasm64** `svm-browser` module through a real
+# Detached (`[workspace]`) host harness: drive the **wasm64** `temen-browser` module through a real
 # Wasmtime embedding, feeding it the same corpus `corpus.mjs` feeds the wasm32 build in Node — so the
 # full byte-for-byte differential runs on the production target too (the CLI `--invoke` can't write
-# the scratch buffers). See BROWSER.md. Standalone: only `wasmtime` + `serde_json`, no SVM crates.
+# the scratch buffers). See BROWSER.md. Standalone: only `wasmtime` + `serde_json`, no Temen crates.
 [workspace]
 
 [package]
-name = "svm-wt"
+name = "temen-wt"
 version = "0.0.0"
 edition = "2021"
 

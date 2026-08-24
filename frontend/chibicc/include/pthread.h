@@ -1,4 +1,4 @@
-// Minimal <pthread.h> for the SVM sandbox target — a **C-compatible 1:1 threading layer**.
+// Minimal <pthread.h> for the Temen sandbox target — a **C-compatible 1:1 threading layer**.
 //
 // DESIGN §12/D56: the VM ships threading *primitives* (`thread.spawn`/`thread.join`, the
 // `wait`/`notify` futex, C11 atomics) and **no scheduler**; the threading model is libc/runtime
@@ -14,8 +14,8 @@
 // signal/broadcast), barrier (init/destroy/wait — a generation counter over the futex). POSIX
 // semaphores live in <semaphore.h> (same construction, same primitives). Out of scope for now:
 // pthread_self/exit/once/cancel, attributes, rwlocks, TLS keys — add as programs demand them.
-#ifndef __SVM_PTHREAD_H
-#define __SVM_PTHREAD_H
+#ifndef __TEMEN_PTHREAD_H
+#define __TEMEN_PTHREAD_H
 
 #include <stddef.h> // size_t, NULL
 #include <stdlib.h> // malloc — per-thread data stack + start record
@@ -188,4 +188,4 @@ static int pthread_barrier_wait(pthread_barrier_t *b) {
   return 0;
 }
 
-#endif // __SVM_PTHREAD_H
+#endif // __TEMEN_PTHREAD_H

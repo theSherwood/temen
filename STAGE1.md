@@ -1,9 +1,9 @@
 # Stage 1 — external commands: `fork`/`exec`/`wait` for the shell
 
 Stage 0 (PROCESS.md §10 / S7) proved a real command interpreter runs on the
-`svm-posix` personality: redirection, pipelines, lists, variables, globbing,
+`temen-posix` personality: redirection, pipelines, lists, variables, globbing,
 `if`/`then`/`else`, and a dozen builtins, all differential-tested interp==JIT
-(`crates/svm/tests/c_shell.rs`). Everything there is **in-process** — pipelines
+(`crates/temen/tests/c_shell.rs`). Everything there is **in-process** — pipelines
 stage through memfs temp files, and there are no child processes.
 
 Stage 1 gives the shell **external commands**: run a program that is *not* a
@@ -24,7 +24,7 @@ glue, not new substrate**:
   confinement (a child cannot touch bytes outside its carve).
 - **`Module` (iface 8)** — host-verified code a guest may instantiate. The host
   grants a `Module` capability (`Host::grant_module`); on the JIT the child is
-  resolved through `svm_run::module_resolver` (never guest-reachable) and
+  resolved through `temen_run::module_resolver` (never guest-reachable) and
   compiled **at instantiate** — §14's "nesting cost paid at setup".
 - **Grants into children** — `instantiate_granted` (op 8) / `instantiate_named`
   (op 11) re-grant the parent's own capabilities (stdout/stderr/stdin) into the
@@ -59,7 +59,7 @@ map** the personality holds; command lookup is a map lookup; `exec` is spawn.
    with `main`'s frame relocated a page above; writable globals shift past
    `POWERBOX_ARGS_END` so the seeded argv never collides with a global (both
    opt-in for a `main`-with-params, so every `main(void)` program — incl. the
-   Stage-0 shell — is byte-identical). Modeled on svm-llvm's `synth_start_argv`
+   Stage-0 shell — is byte-identical). Modeled on temen-llvm's `synth_start_argv`
    (already vs-native there, but that frontend is an excluded LLVM-dependent
    crate; the self-contained demo needs chibicc parity). Output tracks argv,
    exit code = `argc`, differential interp==JIT; no confinement-path change. This
@@ -131,7 +131,7 @@ map** the personality holds; command lookup is a map lookup; `exec` is spawn.
    the union of two existing, fuzzed decode paths through the same confined-child
    spawn. Existing instantiate suites unchanged.
 
-4c. **op 13 driven by a compiled-C shell** *(done — `crates/svm/tests/c_shell_exec.rs`)*
+4c. **op 13 driven by a compiled-C shell** *(done — `crates/temen/tests/c_shell_exec.rs`)*
    — where 4b's parent was hand-written IR, here a **chibicc shell** (`main(argc,
    argv)`) parses its own powerbox args, looks the command up via a host fn,
    seeds the command's `argv` into a 128 KiB carve, lays a `"stdout"` grant record,
@@ -179,8 +179,8 @@ keystone of self-similarity. It is **not built**. Until it lands:
   a drop-in for unmodified compiled commands. Real redirection/pipelines of
   external commands wait on the endpoint work.
 
-5. **`spawn` in the personality** *(substrate done — `crates/svm/tests/stage1_posix_spawn.rs`)*
-   — `svm-posix` gained a minimal **`exec` surface**: a `PATH` registry (`name →
+5. **`spawn` in the personality** *(substrate done — `crates/temen/tests/stage1_posix_spawn.rs`)*
+   — `temen-posix` gained a minimal **`exec` surface**: a `PATH` registry (`name →
    Module` handle, `Posix::register_command`) reached by an `exec_lookup` op, plus
    an `exec_stdout` op handing back the forwardable stdout `Stream`. A compiled-C
    shell **running on the real personality** now dispatches an unknown command to
@@ -194,7 +194,7 @@ keystone of self-similarity. It is **not built**. Until it lands:
    three paths (builtin / external / not-found). Confinement untouched (op 13 is
    the existing fuzzed spawn path; the personality is authority-TCB, §2a).
 
-   **Folded into the full Stage-0 shell** *(done — `crates/svm/tests/c_shell.rs`)*:
+   **Folded into the full Stage-0 shell** *(done — `crates/temen/tests/c_shell.rs`)*:
    the real `c_shell.rs` shell now spawns external commands from its command
    dispatch — the `else` (was `<cmd>: not found`) branch does `exec_lookup` and,
    on a hit, `spawn_cmd` (grant record + args carve + op 13 + `join`), threading
@@ -212,8 +212,8 @@ keystone of self-similarity. It is **not built**. Until it lands:
    with concurrent OS-thread children communicating through a granted
    `SharedRegion` + canonical-key futex (PROCESS.md §4 "revised async-children
    plan"). This is the jump from sequential spawn/wait to true concurrency.
-   **[PROMOTED 2026-07-22 — an svm-owned todo, consumer-pinned.]** jacl (the
-   first shell-like language targeting svm) needs concurrent stages soon after
+   **[PROMOTED 2026-07-22 — an temen-owned todo, consumer-pinned.]** jacl (the
+   first shell-like language targeting temen) needs concurrent stages soon after
    sequential; this does not wait for a further request. The remaining build is
    step 2 of the revised plan (OS-thread children in own guarded windows; the
    canonical-key futex, step 1, landed as S1b) — sequential-first, concurrency
@@ -229,7 +229,7 @@ keystone of self-similarity. It is **not built**. Until it lands:
    `can_regrant`/`regrant_into_child` alias the same backing into the child's
    powerbox (the pipe-end pattern), so op-8/11/13 named grants (and detached
    spawns) carry the data plane; previously only coroutine children could
-   receive a region. Pinned by `svm-interp/tests/concurrent_stages.rs`: a
+   receive a region. Pinned by `temen-interp/tests/concurrent_stages.rs`: a
    parent mints a region, spawns a producer and a consumer as separate carves
    (own windows, own address spaces), and the two move four items through a
    **one-slot bounded ring** (flag + datum in the region), parking on the flag
@@ -242,7 +242,7 @@ keystone of self-similarity. It is **not built**. Until it lands:
    fallback.
 
    **[BUILT 2026-07-23 — the JIT pipeline.]** The fast backend runs the same
-   ring pin (`svm/tests/jit_concurrent_stages.rs`, byte-identical module,
+   ring pin (`temen/tests/jit_concurrent_stages.rs`, byte-identical module,
    differential vs the interp) — and the deep PAL turned out to be *already
    built*: `MprotectWindow::map_region` does real aliasing (memfd
    `mmap(MAP_SHARED|MAP_FIXED)` on unix, placeholder + `MapViewOfFile3` on
@@ -265,7 +265,7 @@ keystone of self-similarity. It is **not built**. Until it lands:
 
    **[BUILT 2026-07-23 — the `c_shell` personality `|` wiring.]** The Stage-0
    shell's `run_pipeline` now runs eligible pipelines **concurrently over
-   rings** (`crates/svm/tests/c_shell.rs`): when every stage after the first is
+   rings** (`crates/temen/tests/c_shell.rs`): when every stage after the first is
    a pure filter and the `__stage` runner is on PATH, the shell mints one
    region per `|`, spawns each later stage as an op-13 child of the runner
    (grants: `stdout` + input ring + output ring by name), runs stage 0 *in the
@@ -317,7 +317,7 @@ anyway (the JIT is 1:1 OS-thread; a single-worker interp run has no thread to
 run the child ahead of the parent). The **portable idiom** is to loop `poll`
 (yielding the worker between probes) until non-zero; the **terminal** value is
 identical across backends — `1` returning, `2` trapping. That is now pinned by
-`crates/svm/tests/lifecycle_poll_convergence.rs` (interp vs JIT, both cases).
+`crates/temen/tests/lifecycle_poll_convergence.rs` (interp vs JIT, both cases).
 See ISSUES.md I43. The `$?` = 128 + signal crash-status mapping is a shell/guest
 convention (not a substrate contract) and remains guest-personality work.
 
@@ -325,25 +325,25 @@ convention (not a substrate contract) and remains guest-personality work.
 
 The Stage-0 shell now runs as an **interactive card** in the browser playground — type a script,
 click Run, see its output, client-side in the sandbox. This is the same shell `c_shell.rs`
-differential-tests; the browser plumbing lives in the detached `svm-browser` crate (see
+differential-tests; the browser plumbing lives in the detached `temen-browser` crate (see
 `BROWSER.md` → "POSIX-personality on-ramp"). The pieces:
 
-- **`svm-posix` reaches the browser runtime.** `svm-posix` is a dependency of the `svm-browser`
-  cdylib; `svm_run_shell` / `posix_shell_exec` grant the personality and run the shell module on the
+- **`temen-posix` reaches the browser runtime.** `temen-posix` is a dependency of the `temen-browser`
+  cdylib; `temen_run_shell` / `posix_shell_exec` grant the personality and run the shell module on the
   **bytecode** engine (the tree-walker uses OS threads + a wall clock, absent under wasm), with the
   editor text as stdin and the personality's captured stdout as output.
 
 - **Sequential subset only.** The browser's bytecode compiler rejects `Instantiator`/`SharedRegion`
-  cap.calls, so the browser fixture is built with `-DSVM_SHELL_SEQUENTIAL`: `#ifndef` guards in
+  cap.calls, so the browser fixture is built with `-DTEMEN_SHELL_SEQUENTIAL`: `#ifndef` guards in
   `shell_main.c` drop the **external-command spawn** (slice 5, above) and the **concurrent ring
   pipelines** (slice 6). What ships is the full Stage-0 surface — builtins, redirection, in-window
   memfs pipelines, `;`/`&&`/`||` lists, `if`, variables, globbing, and `#` comments. External
   commands and concurrent pipelines stay native-only (they need the caps bytecode can't compile);
   the full shell keeps both.
 
-- **One source of truth.** The shell C source lives in `crates/svm-run/demos/shell/*.c`
+- **One source of truth.** The shell C source lives in `crates/temen-run/demos/shell/*.c`
   (`shim.c`/`ring.c`/`shell_main.c`), `include_str!`d by `c_shell.rs` and compiled into the committed
-  `browser/tests/fixtures/shell.svmb` by the (ignored) `gen_browser_shell_fixture` test — reusing the
+  `browser/tests/fixtures/shell.temen` by the (ignored) `gen_browser_shell_fixture` test — reusing the
   same chibicc compile + by-name import resolution the differential uses.
 
 - **The 64 KiB-page fix.** A chibicc `main(void)` guest with read-only data faulted in the browser
@@ -374,21 +374,21 @@ signals ladder). In dependency order:
    `getgrnam`, `setjmp` — proven — on top of the Postgres shim set). *Medium; incremental.*
    **[Slice 4a done 2026-07-29 — the two-worlds bridge.]** The POSIX personality (the process/fd/signal
    ABI of slices 1–3) lived only in the chibicc/name-binding world; the LLVM on-ramp reaches host caps by
-   name via `__vm_cap_resolve` + `__vm_host_call` (the `fs`-cap idiom). `svm_run::posix::posix_cap`
-   (over new `svm_posix::cap`) now exposes the personality as a named powerbox `HostCap`, so an on-ramp
+   name via `__vm_cap_resolve` + `__vm_host_call` (the `fs`-cap idiom). `temen_run::posix::posix_cap`
+   (over new `temen_posix::cap`) now exposes the personality as a named powerbox `HostCap`, so an on-ramp
    guest resolves `"posix"` and drives `pipe`/`dup2`/`posix_spawn`/`waitpid` through it — proven
-   cross-backend (interp==bytecode==JIT) by `crates/svm-llvm/tests/posix_cap.rs` (a compiled-C mini-shell
+   cross-backend (interp==bytecode==JIT) by `crates/temen-llvm/tests/posix_cap.rs` (a compiled-C mini-shell
    spawns a child with fd inheritance). This is the substrate a bash-on-LLVM `proc_shim` will call
    instead of the Postgres demo's inert process stubs. *(A program that reaches the host only through
-   `__vm_host_call` still needs a standard-libc call — e.g. `printf` — to trip svm-llvm's
+   `__vm_host_call` still needs a standard-libc call — e.g. `printf` — to trip temen-llvm's
    `needs_powerbox_entry` and get the synthesized `_start`; a real shell links libc, so it always does.)*
    **[Slice 4b done 2026-07-29 — the libc shim + a pipeline.]** `posix_shim.h` gives the on-ramp real-C
    `write`/`read`/`pipe`/`dup`/`dup2`/`waitpid` + a fork-free `sh_spawn` over the `"posix"` cap — the
    World-B analogue of `demos/shell/shim.c`, the layer a shell links. `pipeline.c` runs a real `gen | up`
    pipeline through it (wire stdout→pipe, run stage 1, restore stdout, wire pipe→stdin, run stage 2 —
    the classic redirect save/restore), landing "HELLO" on the personality's stdout, cross-backend.
-2. **Build `bash.svmb`** — autoconf cross-config for the svm "platform", `--noediting`, through the
-   `clang → svm-llvm-translate` on-ramp (S8), the same path Postgres/SQLite/QuickJS already ride.
+2. **Build `bash.temen`** — autoconf cross-config for the temen "platform", `--noediting`, through the
+   `clang → temen-llvm-translate` on-ramp (S8), the same path Postgres/SQLite/QuickJS already ride.
    *Medium/mechanical.* Gets bash to *link and start*.
 3. **`fork` (the gate)** — the substrate has **no fork-returns-twice**. The plan (§7 / Stage 3 / S11)
    implements it at the **personality** level over durable freeze → clone-window → thaw, with two hard
@@ -412,7 +412,7 @@ signals ladder). In dependency order:
    (`c_posix_spawn.rs`, interp==JIT): the embedder wires the spawn delegate to instantiate + run the
    child domain on its own Posix personality, and the child's uppercased stdin output flows to the
    shell's fd 1 while its exit status returns through `waitpid`. (The delegate is the test embedder —
-   promoting a reusable builder into `svm-run` waits on `svm-run` gaining an `svm-posix` dep, deferred
+   promoting a reusable builder into `temen-run` waits on `temen-run` gaining an `temen-posix` dep, deferred
    until a second consumer needs it.) **Remaining:** `fork`/`vfork`/`execve` (return-twice /
    image-replace) on the durable-clone capstone.
 5. **Signals** — L0 doorbell (a word bash polls at command boundaries; exact for `trap`, ships

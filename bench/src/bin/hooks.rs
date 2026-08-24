@@ -3,14 +3,14 @@
 //!
 //! The zero-cost claim for programs that *don't* opt in is structural (the engines are untouched —
 //! see HOOKS.md §2/§5), so it isn't what this measures. This times the **opted-in** path, the way
-//! a real consumer reaches it — `svm_run::Instance::with_mem_hooks` with a minimal counting hook —
+//! a real consumer reaches it — `temen_run::Instance::with_mem_hooks` with a minimal counting hook —
 //! against the same pristine module, on all three backends. The published quantity is
 //! **overhead per event** (hooked − pristine, divided by the events per iteration) and the
 //! resulting hooked **events/sec**: the numbers the HOOKS.md design so far only estimated
 //! (~50–100 ns/event on the interpreters, ~10–20 ns on the JIT — the consumer's own handler is on
 //! top of this probe's `AtomicU64` increment).
 //!
-//! Methodology matches the sibling harnesses (`crates/svm/src/bin/bench.rs`): per-iteration cost
+//! Methodology matches the sibling harnesses (`crates/temen/src/bin/bench.rs`): per-iteration cost
 //! is isolated by **subtraction** — `(time(N_LARGE) − time(N_SMALL)) / (N_LARGE − N_SMALL)` — which
 //! cancels each backend's fixed per-run cost (frame setup, bytecode compile, JIT compile: identical
 //! at both counts), and times are the **min** over repetitions. The event count is asserted, not
@@ -23,8 +23,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use svm_run::{instantiate, Backend, Instance, MemHookFn, RunConfig};
-use svm_text::parse_module;
+use temen_run::{instantiate, Backend, Instance, MemHookFn, RunConfig};
+use temen_text::parse_module;
 
 /// Loop-count pair for the subtraction; the kernel body does [`EVENTS_PER_ITER`] memory accesses.
 const N_SMALL: u64 = 1_000;

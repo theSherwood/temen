@@ -25,8 +25,8 @@ Disable again with `git config --unset core.hooksPath`.
 ## Bypass a single push
 
 ```sh
-SVM_HOOK_SKIP=1 git push        # skip the hook entirely (same as `git push --no-verify`)
-SVM_HOOK_SKIP_TESTS=1 git push  # run fmt + clippy + build, skip the slower test step
+TEMEN_HOOK_SKIP=1 git push        # skip the hook entirely (same as `git push --no-verify`)
+TEMEN_HOOK_SKIP_TESTS=1 git push  # run fmt + clippy + build, skip the slower test step
 ```
 
 The hook also auto-skips branch-deletion pushes (nothing to build).

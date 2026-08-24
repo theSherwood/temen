@@ -1,7 +1,7 @@
 # Frontend-independent instantiation & embedding
 
 Tracking doc for the work that turns the powerbox bootstrap — today baked into the C on-ramp
-(`svm-llvm`) — into a **public, frontend-neutral, wasm-like instantiation layer** with a uniform
+(`temen-llvm`) — into a **public, frontend-neutral, wasm-like instantiation layer** with a uniform
 run interface across all three backends (tree-walker, bytecode, JIT) and **C bindings** for
 embedders who don't want to drive Rust.
 
@@ -11,7 +11,7 @@ Branch: `claude/gifted-hopper-4cj3ll`. Started from PR #92.
 
 ## Goal
 
-A non-C frontend (e.g. JACL's codegen) that emits SVM-IR and links it itself should get the same
+A non-C frontend (e.g. JACL's codegen) that emits TEMEN-IR and links it itself should get the same
 "just works" experience the C frontend enjoys, *plus* the flexibility wasm embedders expect:
 
 - **Arbitrary imports/exports** — any number, with arbitrary names, signatures, and interfaces;
@@ -29,7 +29,7 @@ A non-C frontend (e.g. JACL's codegen) that emits SVM-IR and links it itself sho
 
 1. **Exports are first-class.** Add `Module.exports: Vec<Export>` (name → funcidx) to the IR, with
    text-grammar + binary-encode + verifier support. Today export names live only in
-   `svm_ir::LinkUnit` and are consumed by `link`; the runtime `Module` has no name table, so
+   `temen_ir::LinkUnit` and are consumed by `link`; the runtime `Module` has no name table, so
    `Instance::call("name")` currently relies on an ad-hoc side map. First-class exports make
    name-addressable entry points a real IR concept (wasm parity).
 
@@ -55,16 +55,16 @@ A non-C frontend (e.g. JACL's codegen) that emits SVM-IR and links it itself sho
 Grounded in the current code, so the plan builds on reality:
 
 - **One generic capability seam, shared by all backends.**
-  `Host::cap_dispatch_slots(type_id, op, handle, args, mem)` (`svm-interp/src/lib.rs:9324`) is the
+  `Host::cap_dispatch_slots(type_id, op, handle, args, mem)` (`temen-interp/src/lib.rs:9324`) is the
   single dispatch used by the tree-walker, the bytecode engine (`bytecode.rs:3726`), and the JIT
-  (via `svm-run`'s `cap_thunk` → same call). Only `Jit` (iface 11) is special-cased (it must
+  (via `temen-run`'s `cap_thunk` → same call). Only `Jit` (iface 11) is special-cased (it must
   re-enter Cranelift). Everything else is already uniform.
 - **Arbitrary host capabilities.** `Host::grant_host_fn(Box<dyn FnMut(op, &[i64],
-  Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap>>)` (`svm-interp/src/lib.rs:8920`, type at
+  Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap>>)` (`temen-interp/src/lib.rs:8920`, type at
   `:8325`): arbitrary op, arbitrary i64 args/results, guest-memory access, return-or-trap. Runs
   identically on interp and JIT through the seam above.
 - **Arbitrary named imports.** `Module.imports: Vec<Import{name, sig}>` (unbounded) +
-  `Inst::CallImport{import, sig, handle, args}` + `svm_ir::resolve_imports_with` (any name →
+  `Inst::CallImport{import, sig, handle, args}` + `temen_ir::resolve_imports_with` (any name →
   `Resolved::Cap{type_id, op}` / `Func` / `Slot`). The number/name/signature are already free.
 - **Runtime discoverability.** `cap.self.count` / `cap.self.get` (`CapSelfCount`/`CapSelfGet`) let a
   guest enumerate its own handles at runtime — an alternative/complement to a fixed-offset stash.
@@ -90,13 +90,13 @@ Limits {
 ```
 
 Note: the JIT and interp must share `reserved_log2` to remain a sound differential oracle
-(`svm-interp/src/lib.rs:1909`), so threading it through one config is strictly better than today.
+(`temen-interp/src/lib.rs:1909`), so threading it through one config is strictly better than today.
 
 ---
 
 ## Proposed shape
 
-`svm_run::Instance` (PR #92) is already a prototype of the uniform facade — it runs interp + JIT
+`temen_run::Instance` (PR #92) is already a prototype of the uniform facade — it runs interp + JIT
 through one call, converting `Value`↔slots. Generalize it:
 
 ```rust
@@ -119,34 +119,34 @@ impl Instance {
 }
 ```
 
-`Quota` is currently two structurally-identical types (`svm_interp::Quota`, `svm_jit::Quota`) —
-unify into one (in `svm-ir` or `svm-interp`) consumed by both backends.
+`Quota` is currently two structurally-identical types (`temen_interp::Quota`, `temen_jit::Quota`) —
+unify into one (in `temen-ir` or `temen-interp`) consumed by both backends.
 
 ---
 
 ## Roadmap / checklist
 
 ### Phase 0 — foundations (done)
-- [x] `svm_ir::synth_powerbox_start` — frontend-independent `_start` synthesis (PR #92).
-- [x] `svm_run::instantiate` / `Instance::call` — the differential wrapper (PR #92).
-- [x] Acceptance test: hand-written IR, no C, interp == jit (`crates/svm/tests/powerbox_instantiate.rs`).
-- [x] **Dedup the layout constants** — `svm-llvm` now references `svm_ir::POWERBOX_*` with
+- [x] `temen_ir::synth_powerbox_start` — frontend-independent `_start` synthesis (PR #92).
+- [x] `temen_run::instantiate` / `Instance::call` — the differential wrapper (PR #92).
+- [x] Acceptance test: hand-written IR, no C, interp == jit (`crates/temen/tests/powerbox_instantiate.rs`).
+- [x] **Dedup the layout constants** — `temen-llvm` now references `temen_ir::POWERBOX_*` with
   compile-time asserts pinning the C `_start` layout to the public ABI (one source of truth).
 
 ### Phase 1 — first-class exports (decision #1) — done
-- [x] `Module.exports: Vec<Export{name, func}>` in `svm-ir` + `Module::resolve_export(name)`.
-- [x] Text grammar (`svm-text`): `export "<name>" <funcidx>`, parse + print + round-trip.
-- [x] Binary encode/decode (`svm-encode`): v3 export section (after imports), round-trip.
+- [x] `Module.exports: Vec<Export{name, func}>` in `temen-ir` + `Module::resolve_export(name)`.
+- [x] Text grammar (`temen-text`): `export "<name>" <funcidx>`, parse + print + round-trip.
+- [x] Binary encode/decode (`temen-encode`): v3 export section (after imports), round-trip.
 - [x] Verifier: export funcidx in range (`ExportFuncOutOfRange`), names unique (`DuplicateExport`).
 - [x] `link` populates `Module.exports` from each unit's exports (declaration order, reindexed).
 - [x] `synth_powerbox_start` registers `"_start"` and shifts existing exports +1 (`offset_func_indices`).
-- [x] Producers populate exports: `svm-wasm` (wasm exports → table), `svm-llvm` (defined fns →
+- [x] Producers populate exports: `temen-wasm` (wasm exports → table), `temen-llvm` (defined fns →
       name-addressable C modules), `optimize_module` (carried through; 1:1 per-func).
 - [x] `Instance::call(name)` resolves through `Module::resolve_export` (the ad-hoc map is gone).
 - [x] Guest-JIT demos updated to emit the v3 blob format (version byte + empty export section).
 
 ### Phase 2 — name-based dynamic import binding (decision #2) — done
-- [x] `svm_run::Imports` — a name → `HostCap` registry; `HostCap::{stdout,stdin,exit,clock,host_fn,
+- [x] `temen_run::Imports` — a name → `HostCap` registry; `HostCap::{stdout,stdin,exit,clock,host_fn,
       custom}` cover built-ins and arbitrary host-defined interfaces (`HOST_FN` + op).
 - [x] `instantiate_with_imports(module, imports)` matches each `call.import "<name>"` by name →
       `(type_id, op)`, fail-closed on an unbound name; the fixed §3e powerbox is now one preset over
@@ -156,7 +156,7 @@ unify into one (in `svm-ir` or `svm-interp`) consumed by both backends.
       = stash slot order (slot `i` ↔ import `i`).
 - [x] `Instance::call` routes the powerbox entry through the name-bound registry when present, else
       the fixed powerbox; both share one differential body (`run_entry0_diff`). Acceptance:
-      `crates/svm/tests/powerbox_imports.rs` (arbitrary-named host-fn caps, unbound fail-closed,
+      `crates/temen/tests/powerbox_imports.rs` (arbitrary-named host-fn caps, unbound fail-closed,
       standard names as a preset), interp == jit.
 - [x] A runtime name→handle directory (F7): the guest resolves a capability name to its handle at
       runtime via `cap.self` op 2 (dlopen-style), over the `Host` `cap_names` directory populated at
@@ -166,8 +166,8 @@ unify into one (in `svm-ir` or `svm-interp`) consumed by both backends.
 
 ### Phase 3 — uniform run config across backends — done
 - [x] `Limits` is the single unified quota knob the consumer sets (`max_fibers`/`max_vcpus` =
-      "CPUs available", `fuel`, `deadline`); the facade converts to `svm_interp::Quota` /
-      `svm_jit::Quota` internally, so the two structurally-identical backend `Quota` types stay an
+      "CPUs available", `fuel`, `deadline`); the facade converts to `temen_interp::Quota` /
+      `temen_jit::Quota` internally, so the two structurally-identical backend `Quota` types stay an
       impl detail the embedder never touches. (Deduping them into one shared type would churn both
       escape-TCB-adjacent crates for no consumer-visible gain — left as optional cleanup.)
 - [x] `Limits` + `RunConfig` (fuel = interpreters' per-op budget, ignored by the JIT; deadline = the
@@ -175,7 +175,7 @@ unify into one (in `svm-ir` or `svm-interp`) consumed by both backends.
       asymmetry is modeled honestly and documented per-knob rather than papered over.
 - [x] `Backend` selector + `Instance::run(backend, &config)` single-backend facade; `Instance::run_diff`
       for the tree-walk == JIT oracle; `call`/`call_with_stdin` are now `run_diff` with a default/stdin
-      config. Acceptance: `crates/svm/tests/powerbox_run.rs` (every backend under one config; fuel
+      config. Acceptance: `crates/temen/tests/powerbox_run.rs` (every backend under one config; fuel
       bounds the interpreters not the JIT; window override on every backend).
 - [x] `memory_size_log2` threaded through all three backends (window override per run). `reserved_log2`
       deliberately **not** exposed: it's a guard-region policy, not "memory available", and both
@@ -192,16 +192,16 @@ weaken the §3c type-check's closed-enum audit surface for only a diagnostics ga
       `Host::cap_label(handle)` and guest-side via `cap.self.label` (opcode `0x7F`).
 
 ### Phase 5 — C bindings — done
-- [x] `svm-capi` crate (`rlib` + `cdylib` + `staticlib`) + hand-written `include/svm.h` over the whole
+- [x] `temen-capi` crate (`rlib` + `cdylib` + `staticlib`) + hand-written `include/temen.h` over the whole
       surface: parse (text/binary), `synth_powerbox_start`, name-keyed imports (built-ins +
       C-callback host caps), `instantiate`/`instantiate_with_imports`, `run`(backend)/`run_diff`,
       `Limits`/`RunConfig` (fuel/deadline/quota/stdin/memory), and outcome + stdout/stderr readback.
 - [x] Host-capability callback ABI: a C `(ctx, op, args*, n_args, results*, results_cap, mem) -> i32`
       function pointer bridged to `HostFn` (return = result count, negative = trap). The `mem` arg is
-      the calling guest's window as an opaque `SvmGuestMem*`, read/written through the bounds-checked
-      `svm_guest_read`/`svm_guest_write` accessors (F5, landed — was a compute-only follow-up).
+      the calling guest's window as an opaque `TemenGuestMem*`, read/written through the bounds-checked
+      `temen_guest_read`/`temen_guest_write` accessors (F5, landed — was a compute-only follow-up).
 - [x] Memory/error model: opaque handles with explicit `*_free`; `instantiate*` consume their inputs;
-      status codes + a thread-local `svm_last_error()`; every entry point `catch_unwind`s so a panic
+      status codes + a thread-local `temen_last_error()`; every entry point `catch_unwind`s so a panic
       never crosses into C.
 - [x] Tests: a CI-portable Rust ABI test (`src/abi_tests.rs`) drives the `extern "C"` surface end to
       end incl. a function-pointer host callback, all three backends, fuel/memory config, and
@@ -219,7 +219,7 @@ rather than converged:
 | Path | Backends | Caps | Used by |
 |---|---|---|---|
 | `Instance::{call,run,run_diff}` (this work) | all 3 | fixed or name-bound | new tests, C ABI |
-| `run_powerbox*` → `run_powerbox_inner` → `Instance::run` (F1) | JIT | fixed 8-handle powerbox | **the CLI** (`svm-run` bin) |
+| `run_powerbox*` → `run_powerbox_inner` → `Instance::run` (F1) | JIT | fixed 8-handle powerbox | **the CLI** (`temen-run` bin) |
 | `run_kernel` | bare | none | kernels / bench |
 | `run_c_full` (test) → `Instance::run_diff` (F1) | interp+JIT | fixed | chibicc suite |
 | `JitSession` | JIT | fixed | guest-JIT REPL |
@@ -245,7 +245,7 @@ only the funcidx crosses back, never a host pointer.
 - The JIT half is one path too: `powerbox_compile_run` (now `func` + `snapshot_cap` parameterized,
   returning a `JitRun`) under a single `jit_run` mid-level entry; `run_jit` and the reactor's per-call
   capture are thin callers (the bespoke `jit_call_capture` is gone).
-- `run_c_full` (the chibicc differential harness) drives through `svm_run::instantiate` +
+- `run_c_full` (the chibicc differential harness) drives through `temen_run::instantiate` +
   `Instance::run_diff` — the test suite exercises the same core as the CLI/embedders.
 
 The CLI is unchanged — same `run_powerbox*` signatures, JIT-only, no re-verify/re-resolve of already-
@@ -266,23 +266,23 @@ IMPORTS.md phase 4 — but the rule and its rationale stand.)* Rule: *pure funct
 
 ## Phase 6 — the reactor model: a live instance you call into — slice 1 done
 
-**Landed (slice 1).** `svm_run::Session` (a live, stateful instance) + `Instance::start(backend,
+**Landed (slice 1).** `temen_run::Session` (a live, stateful instance) + `Instance::start(backend,
 config) -> Session` and `Session::call_export(name, args) -> results`: instantiate once, run `_start`
 once, then call exports repeatedly with the guest window (globals, BSS) **persisting** between calls.
 *(The "handle stash" this slice originally persisted is deleted — IMPORTS.md phase 4; capability
 delivery is the host-side import-binding table, which persists on the session's `Host`.)* Persistence is by **round-tripping the low `SNAP_CAP` (256 KiB) window snapshot** each
 call — the span all three backends already snapshot — so no TCB-internal changes were needed; the
 capability handles persist because the stash lives in that window. Exports use `(i64 sp, args…)`:
-`call_export` synthesizes the `sp` ([`svm_ir::powerbox_entry_sp`], now public) and appends the args.
+`call_export` synthesizes the `sp` ([`temen_ir::powerbox_entry_sp`], now public) and appends the args.
 
 **All-three-backend differential.** `Instance::start_diff -> DiffSession`; `DiffSession::call_export`
 steps the tree-walker, bytecode engine, and JIT in lockstep and asserts they agree on results,
 stdout/stderr, and the persistent window prefix `[0, entry_sp)` after every call (the transient data
 stack above `entry_sp` — backend-specific frame layout — is excluded). This is the powerbox layer's
 first direct exercise of the bytecode engine (Followup F10). Acceptance:
-`crates/svm/tests/powerbox_reactor.rs` (persistent accumulator across calls on each backend; the
-three-way stateful diff; session independence) + a C-ABI mirror (`svm_instance_start`,
-`svm_session_call_export`, `svm_session_stdout`, `svm_session_free`; `svm-capi` ABI test).
+`crates/temen/tests/powerbox_reactor.rs` (persistent accumulator across calls on each backend; the
+three-way stateful diff; session independence) + a C-ABI mirror (`temen_instance_start`,
+`temen_session_call_export`, `temen_session_stdout`, `temen_session_free`; `temen-capi` ABI test).
 
 **Slice-1 scope / deferred:** single-threaded guests only (a §12-thread guest is rejected by `start`);
 the JIT recompiles per `call_export` (a per-funcidx `CompiledModule` cache is the obvious
@@ -314,7 +314,7 @@ across backends, with named export calls.
   → then `call_export("name", args) -> results` **repeatedly**, with the window (globals, heap) and the
   granted capability handles **persisting** between calls.
 
-### Proposed API (`svm-run`)
+### Proposed API (`temen-run`)
 
 ```rust
 /// A live, stateful instance: capabilities granted once, window persists across calls.
@@ -367,7 +367,7 @@ impl Session {
 A hand-written module that exports `add(i64 sp, i64 x) -> i64` accumulating into a persistent global,
 called via `Session::call_export("add", …)` several times, returns the running total (proving window
 state persists), with **all three backends** (tree-walk, bytecode, JIT) agreeing across the call
-sequence. Plus a C-ABI mirror (`svm_session_*`).
+sequence. Plus a C-ABI mirror (`temen_session_*`).
 
 ### Scope notes
 - Keep `command`-mode `Instance::run`/`run_diff` unchanged (the program use case).
@@ -379,7 +379,7 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
 ## Followups / known gaps (logged, not yet scheduled)
 
 - **F1 — converge the host runners.** *Landed.* Three convergences, all behind unchanged public
-  signatures and verified against the full suite (workspace + the 88-test `c_frontend` + svm-llvm's
+  signatures and verified against the full suite (workspace + the 88-test `c_frontend` + temen-llvm's
   8-handle chibicc/`Jit.install` programs):
   1. `run_powerbox_inner` delegates to `Instance::run(Backend::Jit, config)` — the powerbox-grant
      logic (`grant_powerbox_prefix`) and the JIT compile→run + §5 watchdog are no longer duplicated;
@@ -392,7 +392,7 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
      export func + `REACTOR_SNAP_CAP` snapshot) are now thin callers of it — the bespoke
      `jit_call_capture` is gone.
   4. The test-only `run_c_full` (chibicc interp+JIT differential harness) is folded onto
-     `svm_run::instantiate` + `Instance::run_diff` — every C test now exercises the same grant/run core
+     `temen_run::instantiate` + `Instance::run_diff` — every C test now exercises the same grant/run core
      the CLI and embedders use, not a hand-rolled compile/run.
 - **F2 — name-addressable nested guests.** *Landed.* `Module.exports` is retained in the host's
   `ModuleGrant`, and the `Module` capability (iface 8) gained `op 0 resolve_export(name_ptr, name_len)
@@ -411,18 +411,18 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
 - **F4 — `argv`/env through `Instance`/`RunConfig`.** *Landed (with F1).* `RunConfig` now carries
   `args`/`env`; `RunConfig::init_mem` builds the §3e args buffer (the single source, shared by the
   `run_powerbox*` wrappers and `Instance::run`/`run_diff`), seeding all three backends run-once. The C
-  ABI surface does not yet expose a setter for these (logged inline; a `svm_run_config_set_args` is the
+  ABI surface does not yet expose a setter for these (logged inline; a `temen_run_config_set_args` is the
   remaining bit).
-- **F5 — guest-memory access from C callbacks.** *Landed.* An `SvmHostFn` now receives the calling
-  guest's window as an opaque `SvmGuestMem*` (last param; `NULL` if the module declares none),
-  read/written through the **bounds-checked** `svm_guest_read` / `svm_guest_write` accessors — the raw
+- **F5 — guest-memory access from C callbacks.** *Landed.* An `TemenHostFn` now receives the calling
+  guest's window as an opaque `TemenGuestMem*` (last param; `NULL` if the module declares none),
+  read/written through the **bounds-checked** `temen_guest_read` / `temen_guest_write` accessors — the raw
   window pointer is never exposed, so a C callback gets the same §7 confinement (fail-closed
-  `SVM_ERR_FAILED` out of bounds / on a read-only/unmapped write) the built-in `Stream`/`Memory` caps
+  `TEMEN_ERR_FAILED` out of bounds / on a read-only/unmapped write) the built-in `Stream`/`Memory` caps
   do. The shim wraps the live `GuestMem` borrow for the duration of one call only. Test:
   `abi_tests::host_fn_reads_and_writes_guest_memory_via_c_abi` (`upcase` reads+uppercases+writes the
-  window, streamed back out, on all three backends); `svm.h` + `examples/hello.c` updated.
-- **F6 — unify `Quota`.** *Landed.* The §15 spawn quota is one type in `svm-ir`, re-exported as
-  `svm_interp::Quota` / `svm_jit::Quota`; the field-by-field facade conversion is gone (see the §F1
+  window, streamed back out, on all three backends); `temen.h` + `examples/hello.c` updated.
+- **F6 — unify `Quota`.** *Landed.* The §15 spawn quota is one type in `temen-ir`, re-exported as
+  `temen_interp::Quota` / `temen_jit::Quota`; the field-by-field facade conversion is gone (see the §F1
   notes / `jit_run`). Values + clamping unchanged (both ceilings `1<<16`).
 - **F7 — runtime name→handle directory.** *Landed.* A guest can resolve a capability **by name to its
   handle at runtime** — dlopen-style discovery, the dynamic counterpart to load-time name binding — via
@@ -439,9 +439,9 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
   unknown-name `-EINVAL`; canonical names match the stashed handles) and `cap_self.rs` (text + binary
   round-trip). *Update (PROCESS.md S15, c1–c4):* the resolve path is now the powerbox's **only**
   bootstrap — every synthesized `_start` is paramless and stashes its handles via `cap.self.resolve`
-  over a name list (`svm_ir::POWERBOX_CAP_NAMES[..n]` for the fixed set;
+  over a name list (`temen_ir::POWERBOX_CAP_NAMES[..n]` for the fixed set;
   `synth_powerbox_start_with_names` / `_for_imports` for a module's own import names), with the
-  runner binding name → implementation **+ handle** (`Resolved::CapBound`, `svm_run::powerbox_resolver`,
+  runner binding name → implementation **+ handle** (`Resolved::CapBound`, `temen_run::powerbox_resolver`,
   `powerbox_named.rs`). The positional handle-parameter `_start` is retired at every frontend; the
   runner keeps positional entry only as a low-level primitive for hand-written IR kernels.
   *Update (IMPORTS.md phase 4):* the resolve-and-stash bootstrap itself is now retired too — a
@@ -449,7 +449,7 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
   (`Host::set_import_bindings`) and `call.import` dispatches through the binding, so the
   synthesized `_start` prologue, the stash, `Resolved::CapBound`, `powerbox_resolver`, the
   `synth_powerbox_start*` family, and the runner's positional-entry powerbox path are all
-  **deleted** (the §2.5 grep-clean gate, `crates/svm/tests/imports_gate.rs`, checks they stay
+  **deleted** (the §2.5 grep-clean gate, `crates/temen/tests/imports_gate.rs`, checks they stay
   gone). `cap.self.resolve`/`count`/`get` remain as the guest-side discovery tier.
 - **F8 — full dynamic stash sizing** (Phase 2 deferral): lift the ≤8-with-heap / ≤32-without cap by
   placing the heap base above an arbitrary-N stash.
@@ -517,11 +517,11 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
   one more reflection op (`cap.self.ops(handle)` populated at grant time like F7/F9) — logged here so
   the choice is deliberate; the default is to keep op vocabularies wholly between embedder and guest
   (§2a: the VM stays mechanism, never semantics).
-- **F15 — a process substrate (the execution half; svm as a base for shells and OSes).** *Now
+- **F15 — a process substrate (the execution half; temen as a base for shells and OSes).** *Now
   designed and in flight — the design lives in `PROCESS.md` and the spawn/wait/exec epic is tracked
-  in `STAGE1.md`; landed-slice status at the end of this entry.* The long-term aim is for svm to be a
+  in `STAGE1.md`; landed-slice status at the end of this entry.* The long-term aim is for temen to be a
   substrate a **shell or OS personality** runs on. Two halves: a *filesystem* (the **Fs capability**,
-  `svm_run::fs` — the VFS `open`/`read`/…, plus the file-backed `mmap`/`msync` storage shape) and a
+  `temen_run::fs` — the VFS `open`/`read`/…, plus the file-backed `mmap`/`msync` storage shape) and a
   *process model*. The filesystem half exists; this is the process half.
 
   The primitives are largely already here — a **process is a confined child domain**: DESIGN.md §14's
@@ -531,7 +531,7 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
   `kill`. And §2/§9 already name **"a separate process" as the robust distrust boundary**, so a
   first-class process model *aligns with* the isolation-tier design rather than fighting it. What a
   shell would additionally need, none of it a departure from the model:
-  1. **A `Process`/`Spawn` capability** — launch a program (an svm module for an in-VM child; or, for
+  1. **A `Process`/`Spawn` capability** — launch a program (an temen module for an in-VM child; or, for
      the standalone-binary case, a real host process behind a `HostFn`) with **argv/env**, returning a
      handle, and **`wait` for its exit status** (the parent observing the child's `Exit` code — today
      `Exit` terminates but is not *waitable* by a parent).

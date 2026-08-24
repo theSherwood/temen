@@ -1,9 +1,9 @@
 # Cross-engine micro-benchmarks
 
-Compares the SVM backends against native, WebAssembly, JavaScript, and Python on the same compute
+Compares the Temen backends against native, WebAssembly, JavaScript, and Python on the same compute
 kernels, to place the bytecode engine and JIT on an absolute scale. **One C source** (`kernels.c`)
-feeds every engine — including the SVM ones, which run IR produced by the **real LLVM frontend**
-(`clang -emit-llvm` → `svm-llvm`), not hand-written IR.
+feeds every engine — including the Temen ones, which run IR produced by the **real LLVM frontend**
+(`clang -emit-llvm` → `temen-llvm`), not hand-written IR.
 
 ## Engines
 
@@ -12,33 +12,33 @@ feeds every engine — including the SVM ones, which run IR produced by the **re
 | `native` | `clang -O2` (C kernels), timed in-process |
 | `wasm32` / `wasm64` | `clang --target=wasm{32,64}` → run on Node/V8 (TurboFan, warmed up) |
 | `js(v8)` | the same kernels as pure JavaScript on V8 |
-| `svm-jit` | this repo's Cranelift JIT (`svm_jit::compile` once → `CompiledModule::run`), on **LLVM-frontend** IR |
-| `svm-bytecode` | this repo's bytecode engine (`bytecode::compile_and_run`), on LLVM-frontend IR |
-| `svm-bytecode-wasm` | the **same bytecode engine compiled to wasm** (the `BROWSER.md` `svm-browser` cdylib) running the same IR on Node/V8 — the cost of double-sandboxing the interpreter (optional: needs `node`) |
-| `svm-wasmjit` | the same IR **JIT-compiled to wasm** (the `svm-wasmjit` emitter, `BROWSER.md` § "wasm-JIT tier") and run on Node/V8 — beside `svm-bytecode-wasm` it is JIT-in-wasm vs interpreter-in-wasm on identical IR. Now covers **every** kernel — integer, scalar-float, `call_indirect`, and SIMD (`vadd`). (The last two lit up once `v128` moved in-subset: this bench bundles every kernel into one module, and `call_indirect` requires the *whole* module in-subset, which the SIMD `vadd` kernel used to break.) `result@small` is cross-checked against native bytecode (a mismatch is a loud `MISCOMPILE`). Driven by `browser/bench_jit.mjs` (optional: needs `node` + the cdylib) |
-| `svm-tree-walk` | this repo's tree-walking oracle (`svm_interp::run`), on LLVM-frontend IR |
+| `temen-jit` | this repo's Cranelift JIT (`temen_jit::compile` once → `CompiledModule::run`), on **LLVM-frontend** IR |
+| `temen-bytecode` | this repo's bytecode engine (`bytecode::compile_and_run`), on LLVM-frontend IR |
+| `temen-bytecode-wasm` | the **same bytecode engine compiled to wasm** (the `BROWSER.md` `temen-browser` cdylib) running the same IR on Node/V8 — the cost of double-sandboxing the interpreter (optional: needs `node`) |
+| `temen-wasmjit` | the same IR **JIT-compiled to wasm** (the `temen-wasmjit` emitter, `BROWSER.md` § "wasm-JIT tier") and run on Node/V8 — beside `temen-bytecode-wasm` it is JIT-in-wasm vs interpreter-in-wasm on identical IR. Now covers **every** kernel — integer, scalar-float, `call_indirect`, and SIMD (`vadd`). (The last two lit up once `v128` moved in-subset: this bench bundles every kernel into one module, and `call_indirect` requires the *whole* module in-subset, which the SIMD `vadd` kernel used to break.) `result@small` is cross-checked against native bytecode (a mismatch is a loud `MISCOMPILE`). Driven by `browser/bench_jit.mjs` (optional: needs `node` + the cdylib) |
+| `temen-tree-walk` | this repo's tree-walking oracle (`temen_interp::run`), on LLVM-frontend IR |
 | `python` | CPython 3 |
-| `wasm32/64(wasmtime)` | the same wasm on Wasmtime (Cranelift, like `svm-jit`) — in-process via `wasmtime-rs/`, or via the `wasmtime` CLI with `wasmtime_bench.py` |
-| `wasm32/64(pulley)` | the same wasm on Wasmtime's **Pulley** portable bytecode *interpreter* (`target("pulley64")`) — the interpreter-tier baseline for `svm-bytecode`, in-process via `wasmtime-rs/` |
+| `wasm32/64(wasmtime)` | the same wasm on Wasmtime (Cranelift, like `temen-jit`) — in-process via `wasmtime-rs/`, or via the `wasmtime` CLI with `wasmtime_bench.py` |
+| `wasm32/64(pulley)` | the same wasm on Wasmtime's **Pulley** portable bytecode *interpreter* (`target("pulley64")`) — the interpreter-tier baseline for `temen-bytecode`, in-process via `wasmtime-rs/` |
 
-The SVM rows come from compiling `kernels.c` with `clang -O2 -emit-llvm -c` (the D54 on-ramp's
-legalized subset, **vectorization on**), translating the bitcode to SVM IR with
-`svm_llvm::translate_bc_path`, and timing each kernel on the three engines — so they reflect IR the
-toolchain actually produces. (Driver: `crates/svm-llvm/examples/cross_engine.rs`.)
+The Temen rows come from compiling `kernels.c` with `clang -O2 -emit-llvm -c` (the D54 on-ramp's
+legalized subset, **vectorization on**), translating the bitcode to Temen IR with
+`temen_llvm::translate_bc_path`, and timing each kernel on the three engines — so they reflect IR the
+toolchain actually produces. (Driver: `crates/temen-llvm/examples/cross_engine.rs`.)
 
 ## Kernels
 
 Each loops `n` times in **int32** arithmetic. Loops are fold-resistant *by construction* — an
 `a = a*1103515245 + 12345 + i` **i32-LCG** recurrence (multiplicative, so `clang`'s SCEV can't
-closed-form it) or data-dependent loads — rather than inline-asm barriers, because the LLVM→SVM
+closed-form it) or data-dependent loads — rather than inline-asm barriers, because the LLVM→Temen
 on-ramp rejects inline asm. i32 throughout so JS can match via `Math.imul`.
 
 - `alu` — the bare i32-LCG recurrence. **A demonstrator, not the headline scalar number:** clang's
-  backend collapses this recurrence (4 steps → one multiply by `M⁴`), which svm-jit doesn't, so it reads
-  ~8× native. It's the *only* kernel where svm-jit trails native (see ISSUES.md I9) — `xorshift` is the
+  backend collapses this recurrence (4 steps → one multiply by `M⁴`), which temen-jit doesn't, so it reads
+  ~8× native. It's the *only* kernel where temen-jit trails native (see ISSUES.md I9) — `xorshift` is the
   fair scalar number.
 - `xorshift` — a serial scalar hash (`a ^= a<<13; a ^= a>>17; a += i`) clang **can't** strength-reduce.
-  The representative scalar-throughput kernel: svm-jit ≈ native here.
+  The representative scalar-throughput kernel: temen-jit ≈ native here.
 - `call` — each iteration calls a `noinline` LCG `step` (a real call/return).
 - `call_indirect` — same `step` dispatched through an opaque function pointer.
 - `mem` — `cell = a; a = LCG(cell, i)` — a store→load the optimizers **forward and delete** (so this is
@@ -66,26 +66,26 @@ Three more kernels go beyond the synthetic micros:
   so every engine still returns an `i32`.
 - `vadd` — a **vectorizable** reduction `s += (k ^ seed)` with no array (seed runtime, so it can't be
   folded; nothing to fall out of bounds). Auto-vectorizing backends collapse it to vector adds: **native
-  uses AVX2 (256-bit), while wasm (the `v128` spec) and svm-jit (the on-ramp's determinism-fixed 128-bit
-  legalization) use 128-bit SIMD** — so native leads `vadd` ~2×, and svm-jit lands right with the wasm
+  uses AVX2 (256-bit), while wasm (the `v128` spec) and temen-jit (the on-ramp's determinism-fixed 128-bit
+  legalization) use 128-bit SIMD** — so native leads `vadd` ~2×, and temen-jit lands right with the wasm
   engines (see ISSUES.md I8). The interpreters stay scalar. (Replaces the old `vsum`, whose known-content
-  array let Cranelift fold the loop to a bogus ~0 on svm-jit and read out of bounds at large `n`.) The
+  array let Cranelift fold the loop to a bogus ~0 on temen-jit and read out of bounds at large `n`.) The
   Wasmtime *CLI* driver omits `vadd` — its ~7 ms process spawn can't resolve a sub-0.1 ns/iter kernel
   (use the in-process `wasmtime-rs/` driver).
 
 ## Methodology
 
 - **Per-iteration isolation:** `(time(large n) − time(small n)) / Δn`, cancelling fixed per-run cost
-  (frame setup, V8 warmup, and the chase/array preludes). **Min over reps** rejects noise. The non-SVM
-  drivers use `n = 1000 → 201000`; the SVM driver uses `n = 1000 → 2_000_000`. The **svm-jit row
-  compiles once** (`svm_jit::compile` → reuse `CompiledModule::run`) so its timed loop carries no
+  (frame setup, V8 warmup, and the chase/array preludes). **Min over reps** rejects noise. The non-Temen
+  drivers use `n = 1000 → 201000`; the Temen driver uses `n = 1000 → 2_000_000`. The **temen-jit row
+  compiles once** (`temen_jit::compile` → reuse `CompiledModule::run`) so its timed loop carries no
   Cranelift codegen — earlier it used `compile_and_run` (recompile every call), whose ~5–6 ms jitter
   swamped a fast vectorized loop's signal (the two min-over-reps compiles don't cancel exactly through the
   subtraction); the bytecode/tree-walk rows re-drive their engine each call, but that setup is cheap and
   cancels.
 - **No closed-form folding:** the kernels resist folding by construction (i32-LCG / data-dependent
-  loads), so native, wasm, and SVM all honestly execute every iteration — no inline-asm barriers (which
-  the LLVM→SVM on-ramp rejects).
+  loads), so native, wasm, and Temen all honestly execute every iteration — no inline-asm barriers (which
+  the LLVM→Temen on-ramp rejects).
 
 ## Compile latency & engine break-even
 
@@ -95,10 +95,10 @@ iterations a workload must run before a JIT (or even a bytecode) compile pays fo
 tree-walking. The `compile_latency` driver measures it (same LLVM-frontend IR, same kernels):
 
 ```sh
-cd crates/svm-llvm && cargo run --release --example compile_latency
+cd crates/temen-llvm && cargo run --release --example compile_latency
 ```
 
-It reports, per kernel: one-time **translate** (LLVM bitcode → SVM IR), each engine's **cold** cost
+It reports, per kernel: one-time **translate** (LLVM bitcode → Temen IR), each engine's **cold** cost
 (the `n → 0` intercept of `T(n) = cold + n·iter` — the fixed per-`compile_and_run` cost), the
 steady-state **per-iter**, and the **break-even** iteration counts (`cold + n·iter` crossover between
 engines, i.e. compile once + run `n` times).
@@ -113,8 +113,8 @@ Indicative shape of the result (absolute numbers are machine-dependent):
   per-iter win (~1–2 ns vs ~30–70 ns) only repays its compile past ~75k–450k iterations.
 - This is the dominant inefficiency the steady-state table omits, and it directly motivates a
   **compiled-module cache** (compile once, reuse across invocations). The compile-once *primitive* now
-  exists — `svm_jit::compile(m, func) → CompiledModule`, reused via `CompiledModule::run` (the
-  cross-engine svm-jit row uses it) — so amortizing compile across invocations is a caching policy on top,
+  exists — `temen_jit::compile(m, func) → CompiledModule`, reused via `CompiledModule::run` (the
+  cross-engine temen-jit row uses it) — so amortizing compile across invocations is a caching policy on top,
   not a missing capability; the one-shot `compile_and_run` remains for single-run callers.
 
 Caveat: a kernel with a large in-function *prelude* (e.g. `fnv`'s 4 KiB buffer fill) inflates the
@@ -123,8 +123,8 @@ microseconds so its `cold` stays ~pure compile.
 
 ## Interpreter-tier absolute scale
 
-The cross-engine table places the *JIT* (`svm-jit`) next to native/V8/Wasmtime-Cranelift. To place the
-*interpreters* (`svm-bytecode`, `svm-tree-walk`) on an absolute scale, the table includes two
+The cross-engine table places the *JIT* (`temen-jit`) next to native/V8/Wasmtime-Cranelift. To place the
+*interpreters* (`temen-bytecode`, `temen-tree-walk`) on an absolute scale, the table includes two
 interpreter baselines that execute the **same compiled bytecode** of the same C — **Pulley**
 (Wasmtime's production portable bytecode interpreter, added via `wasmtime-rs/`) and CPython (`python`,
 though that interprets a Python *transliteration*, not the same compiled IR). Pulley is the fair
@@ -133,7 +133,7 @@ methodology.
 
 Indicative shape (per-iter ns; absolute numbers machine-dependent):
 
-| kernel | `svm-tree-walk` | `svm-bytecode` | `wasm(pulley)` |
+| kernel | `temen-tree-walk` | `temen-bytecode` | `wasm(pulley)` |
 |---|--:|--:|--:|
 | alu | ~51 | ~28 | ~3 |
 | xorshift | ~70 | ~37 | ~14 |
@@ -141,27 +141,27 @@ Indicative shape (per-iter ns; absolute numbers machine-dependent):
 | fnv | ~115 | ~74 | ~7 |
 | fma | ~31 | ~16 | ~9 |
 
-Reading: **`svm-bytecode` is ~2× faster than the tree-walker** (the bytecode tier earns its keep), but
+Reading: **`temen-bytecode` is ~2× faster than the tree-walker** (the bytecode tier earns its keep), but
 still **~3–9× behind Pulley** — real headroom in the bytecode dispatch loop (instruction encoding /
-dispatch overhead), not an algorithmic gap. Both SVM interpreters are the same order of magnitude as a
+dispatch overhead), not an algorithmic gap. Both Temen interpreters are the same order of magnitude as a
 production wasm interpreter, and both are ~20–50× off the JIT (cf. the steady-state table) — which is
 why the JIT exists and why the break-even analysis above matters for tier selection.
 
-## SVM-in-wasm — the interpreter inside the wasm sandbox
+## TEMEN-in-wasm — the interpreter inside the wasm sandbox
 
 `BROWSER.md` proves the bytecode engine *runs correctly* compiled to wasm, but never measures what that
-*costs*. The `svm-bytecode-wasm` row closes that: it times the **exact same bytecode engine, compiled
-to wasm** (the `svm-browser` cdylib), running the **same LLVM-frontend IR** as the native `svm-bytecode`
+*costs*. The `temen-bytecode-wasm` row closes that: it times the **exact same bytecode engine, compiled
+to wasm** (the `temen-browser` cdylib), running the **same LLVM-frontend IR** as the native `temen-bytecode`
 row, on Node/V8. The two rows are byte-identical engines on byte-identical IR — so their ratio *is* the
-overhead of double-sandboxing the interpreter inside the wasm host (V8's sandbox over SVM's own). The
-driver feeds each kernel through `browser/bench.mjs` (which `svm_alloc`s the encoded module once and
-times `svm_run_bench(func, sp, n)` by the same large/small-`n` subtraction) and **cross-checks every
+overhead of double-sandboxing the interpreter inside the wasm host (V8's sandbox over Temen's own). The
+driver feeds each kernel through `browser/bench.mjs` (which `temen_alloc`s the encoded module once and
+times `temen_run_bench(func, sp, n)` by the same large/small-`n` subtraction) and **cross-checks every
 result against native bytecode** — a verify mismatch is reported as a `MISCOMPILE`, so the row doubles as
 a wasm-vs-native differential.
 
 Indicative shape (per-iter ns; absolute numbers machine-dependent; `wasm/native` = the sandbox tax):
 
-| kernel | `svm-bytecode` | `svm-bytecode-wasm` | wasm/native |
+| kernel | `temen-bytecode` | `temen-bytecode-wasm` | wasm/native |
 |---|--:|--:|--:|
 | alu | ~55 | ~70 | ~1.3× |
 | xorshift | ~67 | ~87 | ~1.3× |
@@ -173,25 +173,25 @@ Indicative shape (per-iter ns; absolute numbers machine-dependent; `wasm/native`
 Reading: **pure-compute kernels pay only ~1.2–1.4×** to run the interpreter inside wasm — V8 JITs the
 dispatch loop well, so the engine's own work is barely taxed. The **dependent-load memory kernels pay
 much more** (`chase` ~1.9×, `chase_rand` ~3.4×): every guest load now goes through *two* memory
-indirections — SVM's mask/guard confinement *and* wasm's linear-memory bounds — and the chase chain is
+indirections — Temen's mask/guard confinement *and* wasm's linear-memory bounds — and the chase chain is
 serial, so that latency can't be hidden by ILP. That's the honest picture of the browser path's cost: a
 modest tax on compute, a real one on pointer-chasing workloads. (Optional row: it needs `node` and the
-`svm-browser` wasm32 cdylib — the driver builds it once on demand, or skips the row with a note. wasm32
+`temen-browser` wasm32 cdylib — the driver builds it once on demand, or skips the row with a note. wasm32
 on V8 is the actual browser target; no Wasmtime/`build-std` required.)
 
-## SVM-in-wasm, the JIT tier (`svm-wasmjit` vs `svm-bytecode-wasm`)
+## TEMEN-in-wasm, the JIT tier (`temen-wasmjit` vs `temen-bytecode-wasm`)
 
-The `svm-bytecode-wasm` row runs the *interpreter* inside wasm. The `svm-wasmjit` row runs the same IR
-**JIT-compiled to wasm** (the `svm-wasmjit` emitter — `BROWSER.md` § "wasm-JIT tier"): SVM IR → a
+The `temen-bytecode-wasm` row runs the *interpreter* inside wasm. The `temen-wasmjit` row runs the same IR
+**JIT-compiled to wasm** (the `temen-wasmjit` emitter — `BROWSER.md` § "wasm-JIT tier"): Temen IR → a
 WebAssembly module, which V8 then tiers up to native. Side by side, the two rows isolate exactly what
 the browser JIT tier buys — JIT-in-wasm vs interpreter-in-wasm, identical IR, same V8. The integer +
 scalar-float subset is emitted (a SIMD or `call_indirect` kernel, or a fused-`fma` one, has no
-`svm-wasmjit` row); every row's `result@small` is cross-checked against native bytecode, so the row
+`temen-wasmjit` row); every row's `result@small` is cross-checked against native bytecode, so the row
 doubles as a wasm-JIT-vs-native differential — a mismatch prints a loud `MISCOMPILE`.
 
 Indicative shape (per-iter ns; absolute numbers machine-dependent):
 
-| kernel | `svm-bytecode-wasm` | `svm-wasmjit` | interp/jit | `svm-jit` (native Cranelift) |
+| kernel | `temen-bytecode-wasm` | `temen-wasmjit` | interp/jit | `temen-jit` (native Cranelift) |
 |---|--:|--:|--:|--:|
 | alu | ~65 | ~1.8 | **~36×** | ~1.9 |
 | xorshift | ~82 | ~2.0 | **~41×** | ~1.9 |
@@ -203,14 +203,14 @@ Indicative shape (per-iter ns; absolute numbers machine-dependent):
 | fma (f64 `a*b+c`) | ~34 | ~2.7 | ~13× | ~2.8 |
 
 Reading: JITting the IR to wasm is **~16–112× faster than interpreting it inside wasm**, and lands
-**at or below native Cranelift `svm-jit`** on most kernels — V8's TurboFan optimizes the emitted wasm as
+**at or below native Cranelift `temen-jit`** on most kernels — V8's TurboFan optimizes the emitted wasm as
 well as (sometimes better than) our `-O` Cranelift backend, and it pays none of the interpreter's
 double-sandbox tax because the guest's masking/bounds are *compiled in*, not re-checked per op. The
 pointer-chase kernels (`chase_rand`) still bottleneck on memory latency (the same wall every compiled
 engine hits), so their speedup is smaller. So the honest browser-JIT picture: **near-native compute for
 the integer + scalar-float subset** (`fma`'s f64 recurrence JITs to ~2.7 ns, on top of native
 Cranelift), converging on the memory hierarchy for pointer-chasing — the payoff the wasm-JIT tier
-exists for, now measured, not asserted. (Same optionality as `svm-bytecode-wasm`: needs `node` +
+exists for, now measured, not asserted. (Same optionality as `temen-bytecode-wasm`: needs `node` +
 the cdylib; a non-eligible kernel is simply skipped.)
 
 ## End-to-end real programs
@@ -221,7 +221,7 @@ frontend across all four engines, and **cross-checks every engine's result bit-e
 (so it doubles as a whole-stack differential test):
 
 ```sh
-cd crates/svm-llvm && cargo run --release --example end_to_end
+cd crates/temen-llvm && cargo run --release --example end_to_end
 ```
 
 - `json` — build a small JSON object from a seed, tokenize it (string/number scan + nesting depth), sum
@@ -229,9 +229,9 @@ cd crates/svm-llvm && cargo run --release --example end_to_end
 - `dfa` — count substrings matching `[a-z]+@[a-z]+\.[a-z]+` via a hand-coded scanner (regex/lexer shape).
 - `lz` — an LZ77-style compressor (longest-match search in a sliding window) — memory + match-search heavy.
 - `vm` — a tiny stack-machine **bytecode interpreter** running a generated program (an interpreter on
-  the SVM).
+  the Temen).
 
-Result: **all four engines return bit-identical to native**, and **svm-jit lands ~1.4–2.6× native
+Result: **all four engines return bit-identical to native**, and **temen-jit lands ~1.4–2.6× native
 (geomean ~1.7×)** on these control-flow-heavy programs — a touch behind its ~1.3× on the straight-line
 `corpus_diff` kernels, as expected where branchy code favors clang's mature backend over Cranelift. The
 interpreters run these programs ~30–110× (bytecode) / ~40–155× (tree-walk) slower than the JIT — the
@@ -243,17 +243,17 @@ per-iter is normalized, so the columns stay comparable.)
 
 Every section above measures *speed*; `footprint` measures *size*, the other axis for a VM meant to
 host many sandboxes. It deliberately runs from the **deployed-sandbox perspective**: the LLVM frontend
-is an **AOT tool** (`svm-llvm-translate` → SVM IR), and the IR — not the compiler — is what travels to
-the sandbox, so the probe lives in `svm-run` and **links no libLLVM** (verified: `ldd` shows none). It
-takes an AOT-produced `.svmb`/`.svm` and reports each representation's size plus the peak process RSS to
+is an **AOT tool** (`temen-llvm-translate` → Temen IR), and the IR — not the compiler — is what travels to
+the sandbox, so the probe lives in `temen-run` and **links no libLLVM** (verified: `ldd` shows none). It
+takes an AOT-produced `.temen`/`.temt` and reports each representation's size plus the peak process RSS to
 build + hold each engine's artifact (re-exec'd per engine):
 
 ```sh
 # AOT (the only place LLVM tools are used — produces the shippable IR):
 clang -O2 -emit-llvm -c bench/cross-engine/kernels.c -o /tmp/k.bc
-( cd crates/svm-llvm && cargo run --release --bin svm-llvm-translate -- /tmp/k.bc -o /tmp/k.svmb )
+( cd crates/temen-llvm && cargo run --release --bin temen-llvm-translate -- /tmp/k.bc -o /tmp/k.temen )
 # Runtime probe (no libLLVM — the real sandbox view):
-cargo run -p svm-run --release --example footprint -- /tmp/k.svmb
+cargo run -p temen-run --release --example footprint -- /tmp/k.temen
 ```
 
 Indicative (machine-dependent; ~11 functions, ~680 IR instructions):
@@ -272,7 +272,7 @@ memory is dominated by the *JIT compiler's working set*, not the emitted code �
 the compile-latency section) for a compiled-module cache and for running short-lived / many guests on
 the bytecode tier. **None of the frontend's LLVM toolchain is in the sandbox** — the AOT step shells
 out to `clang`/`llvm-dis`, and even the frontend itself links no libLLVM (textual `.ll` reader).
-(New `svm_jit::CompiledModule::code_byte_count` and `svm_interp::bytecode::Compiled::op_count`
+(New `temen_jit::CompiledModule::code_byte_count` and `temen_interp::bytecode::Compiled::op_count`
 accessors expose the exact sizes.)
 
 ## Capability-call (host-boundary) overhead
@@ -280,11 +280,11 @@ accessors expose the exact sizes.)
 `cap.call` is how a guest reaches the host (I/O, clock, spawn, and the durable safepoint path), yet
 it's absent from the compute tables. `cap_call` times a loop of one `cap.call` to the cheapest cap (the
 clock read) minus an identical no-cap loop, isolating the boundary cost on each engine — the JIT
-through the real `svm_run::cap_thunk` (§9 marshalling + indirect dispatch), the interpreters through the
+through the real `temen_run::cap_thunk` (§9 marshalling + indirect dispatch), the interpreters through the
 in-process `Host`:
 
 ```sh
-cd crates/svm-llvm && cargo run --release --example cap_call
+cd crates/temen-llvm && cargo run --release --example cap_call
 ```
 
 Indicative for the clock cap: **~54 ns/call JIT-generic, ~5.7 ns JIT-fast (D45), ~40 ns bytecode,
@@ -303,7 +303,7 @@ own work on top.)
 
 ## Parallel scaling — many isolated guests at once
 
-The SVM exists to host many sandboxed guests; `parallel` measures whether *W* concurrent guests deliver
+The Temen exists to host many sandboxed guests; `parallel` measures whether *W* concurrent guests deliver
 ~*W*× throughput. Each OS thread runs its **own** guest (the JIT a private `CompiledModule`, the
 interpreters the shared read-only `&Module`) with no shared mutable runtime state, so it probes the
 runtime for hidden contention (global locks, allocator, false sharing) that would cap multi-tenancy. The
@@ -311,7 +311,7 @@ kernel is a serial `xorshift64*` (pure ALU, no memory) so only the runtime — n
 could limit scaling. Runtime-only (no libLLVM):
 
 ```sh
-cargo run -p svm-run --release --example parallel
+cargo run -p temen-run --release --example parallel
 ```
 
 Indicative (machine-dependent; a 4-physical-core host), scaling = `throughput(W) / (W · throughput(1))`:
@@ -337,7 +337,7 @@ model-check thread interleavings on one OS thread, so they're excluded. Driven t
 (the concurrent path serializes host access via a per-domain `Mutex<Host>`); runtime-only, no libLLVM:
 
 ```sh
-cargo run -p svm-run --release --example thread_scaling
+cargo run -p temen-run --release --example thread_scaling
 ```
 
 Indicative (4-physical-core host), `efficiency = slope(1)/slope(W)`, `speedup = W·efficiency`:
@@ -358,17 +358,17 @@ locking + spawn/join — paid once, not per iteration.
 ## Embench-IoT — externally-comparable kernels
 
 Everything above uses *our* kernels; `embench` runs the recognized **Embench-IoT** embedded suite
-through the LLVM frontend across native + all three SVM engines, for numbers comparable to published
+through the LLVM frontend across native + all three Temen engines, for numbers comparable to published
 Embench results. The source isn't vendored (mixed per-benchmark licenses) — point it at a checkout
 (`bench/embench/wrapper.c` `#include`s each kernel and exposes `long run(long n)` →
 `verify_benchmark`'s strict pass/fail, used as both the timed kernel and the cross-engine oracle):
 
 ```sh
 curl -sSL https://github.com/embench/embench-iot/archive/refs/heads/master.tar.gz | tar xz -C /tmp
-EMBENCH=/tmp/embench-iot-master cargo run -p svm-llvm --release --example embench
+EMBENCH=/tmp/embench-iot-master cargo run -p temen-llvm --release --example embench
 ```
 
-Indicative (svm-jit ÷ native; **every engine bit-exact = native, `verify`=1**):
+Indicative (temen-jit ÷ native; **every engine bit-exact = native, `verify`=1**):
 
 | benchmark | ratio |
 |---|--:|
@@ -380,7 +380,7 @@ Indicative (svm-jit ÷ native; **every engine bit-exact = native, `verify`=1**):
 
 **geomean ~1.6× native over 5 kernels**, all bit-identical across tree-walk / bytecode / JIT / native.
 The tail is the familiar one: `matmult-int` vectorizes, so vs native it pays both the 128-bit-vs-AVX2
-SIMD-*width* gap **and** the Cranelift-vs-TurboFan codegen gap (ISSUES I8 — svm-jit ≈ wasm(wasmtime),
+SIMD-*width* gap **and** the Cranelift-vs-TurboFan codegen gap (ISSUES I8 — temen-jit ≈ wasm(wasmtime),
 both Cranelift; V8 leads at the same width), exactly like `corpus_diff`'s `matmul8`. Honestly skipped (real on-ramp coverage gaps, not
 silent): `edn` (a wide-vector legalization edge — `<8 x i32>` in a context the I2 pass doesn't cover)
 and `aha-mont64` (`i128` 64×64→128 Montgomery multiply). This is real third-party code — so the suite
@@ -393,17 +393,17 @@ doubles as a whole-stack differential test on programs we didn't write.
 bench/cross-engine/run.sh        # prints engine,kernel,ns_per_iter CSV
 ```
 
-Needs `clang`, `node`, `python3`; the SVM rows additionally need the **LLVM-18 CLI tools**
-(`llvm-dis`, for `svm-llvm`'s textual reader — no libLLVM is linked), and `run.sh` skips them with a
-note if they're absent. (`crates/svm/examples/megabench.rs` is a separate hand-written-IR variant
+Needs `clang`, `node`, `python3`; the Temen rows additionally need the **LLVM-18 CLI tools**
+(`llvm-dis`, for `temen-llvm`'s textual reader — no libLLVM is linked), and `run.sh` skips them with a
+note if they're absent. (`crates/temen/examples/megabench.rs` is a separate hand-written-IR variant
 that needs no LLVM toolchain at all, with its own simpler kernels — not part of this table.)
 
-To also compare against **Wasmtime** (Cranelift JIT, like `svm-jit`) and **Pulley** (its bytecode
-interpreter, the `svm-bytecode` baseline), run it against the wasm modules `run.sh` built. Two drivers:
+To also compare against **Wasmtime** (Cranelift JIT, like `temen-jit`) and **Pulley** (its bytecode
+interpreter, the `temen-bytecode` baseline), run it against the wasm modules `run.sh` built. Two drivers:
 
 ```sh
 # accurate, in-process (covers every kernel; emits both wasm{32,64}(wasmtime) Cranelift rows and
-# wasm{32,64}(pulley) interpreter rows; directly comparable to the in-process V8 / SVM rows):
+# wasm{32,64}(pulley) interpreter rows; directly comparable to the in-process V8 / Temen rows):
 ( cd bench/cross-engine/wasmtime-rs && cargo build --release )   # one-time: fetches + builds Wasmtime
 bench/cross-engine/wasmtime-rs/target/release/wasmtime-bench bench/cross-engine/k{32,64}.wasm
 

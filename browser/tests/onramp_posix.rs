@@ -1,21 +1,21 @@
-//! The **POSIX personality** on-ramp entry (`onramp_posix_exec` / the wasm `svm_run_onramp_posix`
+//! The **POSIX personality** on-ramp entry (`onramp_posix_exec` / the wasm `temen_run_onramp_posix`
 //! export) — STAGE1.md "real posix shell in the playground", slice 1. Where `onramp_exec` runs a
-//! `.svmb` under the fixed §3e powerbox (stdout/stdin/exit/memory), this runs it under the full
-//! `svm-posix` personality: one `HostProc` capability implementing the libc/memfs surface, with the
-//! module's manifest imports bound to it **by name** (`svm_posix::bind`). This is the seam the real
-//! `svm-posix` shell (and any chibicc program linking the personality libc) runs through.
+//! `.temen` under the fixed §3e powerbox (stdout/stdin/exit/memory), this runs it under the full
+//! `temen-posix` personality: one `HostProc` capability implementing the libc/memfs surface, with the
+//! module's manifest imports bound to it **by name** (`temen_posix::bind`). This is the seam the real
+//! `temen-posix` shell (and any chibicc program linking the personality libc) runs through.
 //!
 //! Slice 1 proves the personality reaches the browser runtime and the crate still builds for wasm:
 //! a hand-written manifest module reads its input from the personality's stdin and echoes it to the
 //! personality's stdout — the shell's exact I/O path — plus the fail-closed gates. The full shell
-//! `.svmb` asset + the playground card are slice 2.
+//! `.temen` asset + the playground card are slice 2.
 
-use svm_browser::{onramp_posix_exec, STATUS_OK, STATUS_UNSUPPORTED};
+use temen_browser::{onramp_posix_exec, STATUS_OK, STATUS_UNSUPPORTED};
 
 /// A paramless `_start` (the phase-4 manifest shape) that `read(0, buf, 256)`s the personality's
 /// preloaded stdin into the guest window, then `write(1, buf, n)`s it back — an `echo` of stdin
 /// through the personality. Imports (first-occurrence order) are `read`/`write`, bound by name to
-/// `svm_posix`'s `OP_READ`/`OP_WRITE`. Returns the byte count `write` reports.
+/// `temen_posix`'s `OP_READ`/`OP_WRITE`. Returns the byte count `write` reports.
 const ECHO_STDIN: &str = r#"memory 15
 export 0 func "_start" 0
 func () -> (i64) {
@@ -35,7 +35,7 @@ block 0 () {
 
 #[test]
 fn posix_personality_echoes_stdin_through_the_playground_entry() {
-    let m = svm_text::parse_module(ECHO_STDIN).expect("parse echo module");
+    let m = temen_text::parse_module(ECHO_STDIN).expect("parse echo module");
     assert_eq!(
         m.imports
             .iter()
@@ -55,7 +55,7 @@ fn posix_personality_echoes_stdin_through_the_playground_entry() {
 }
 
 /// An import the personality does not provide (`add_seven` is not a libc name) makes
-/// `svm_posix::bind` fail closed — the run is `STATUS_UNSUPPORTED`, nothing is bound. (The
+/// `temen_posix::bind` fail closed — the run is `STATUS_UNSUPPORTED`, nothing is bound. (The
 /// `Instantiator`/ring imports the shell's concurrent paths use land the same way until a later
 /// slice teaches this entry those names.)
 const NON_POSIX_IMPORT: &str = r#"memory 15
@@ -72,7 +72,7 @@ block 0 () {
 
 #[test]
 fn a_non_posix_import_fails_closed() {
-    let m = svm_text::parse_module(NON_POSIX_IMPORT).expect("parse module");
+    let m = temen_text::parse_module(NON_POSIX_IMPORT).expect("parse module");
     let out = onramp_posix_exec(&m, b"");
     assert_eq!(
         out.status, STATUS_UNSUPPORTED,
@@ -96,7 +96,7 @@ block 0 (v0: i32) {
 
 #[test]
 fn legacy_positional_entry_is_rejected() {
-    let m = svm_text::parse_module(LEGACY_POSITIONAL).expect("parse module");
+    let m = temen_text::parse_module(LEGACY_POSITIONAL).expect("parse module");
     let out = onramp_posix_exec(&m, b"");
     assert_eq!(
         out.status, STATUS_UNSUPPORTED,

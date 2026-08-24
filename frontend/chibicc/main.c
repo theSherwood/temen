@@ -7,9 +7,9 @@ typedef enum {
 StringArray include_paths;
 bool opt_fcommon = true;
 bool opt_fpic;
-bool opt_emit_ir; // emit SVM text IR instead of x86-64 assembly
-bool opt_emit_object; // --emit-object: emit a linkable SVM unit (cc -c), not a whole program
-bool opt_g;       // -g: also emit the SVM debug-info section (DEBUGGING.md §6 waist)
+bool opt_emit_ir; // emit Temen text IR instead of x86-64 assembly
+bool opt_emit_object; // --emit-object: emit a linkable Temen unit (cc -c), not a whole program
+bool opt_g;       // -g: also emit the Temen debug-info section (DEBUGGING.md §6 waist)
 bool opt_child_entry; // --child-entry: emit function 0 with the §14 child ABI (spawnable via instantiate_module)
 int opt_data_page = 16384; // --data-page: RO/writable data isolation granularity (§3a / D40); 64 KiB for the wasm browser
 
@@ -142,10 +142,10 @@ static void parse_args(int argc, char **argv) {
       continue;
     }
 
-    // `--emit-object`: emit a *linkable SVM unit* (native `cc -c`) instead of a whole program —
+    // `--emit-object`: emit a *linkable Temen unit* (native `cc -c`) instead of a whole program —
     // non-`static` functions are `export`ed and calls to undefined externs become function-symbol
-    // imports (`call.sym "name"`) for `svm_ir::link` to resolve cross-unit. Implies `--emit-ir`
-    // (units are always SVM IR). Used to compile a multi-TU program (e.g. chibicc's own source) one
+    // imports (`call.sym "name"`) for `temen_ir::link` to resolve cross-unit. Implies `--emit-ir`
+    // (units are always Temen IR). Used to compile a multi-TU program (e.g. chibicc's own source) one
     // TU at a time and link the units, mirroring separate compilation.
     if (!strcmp(argv[i], "--emit-object")) {
       opt_emit_object = true;
@@ -173,7 +173,7 @@ static void parse_args(int argc, char **argv) {
       continue;
     }
 
-    // `-g`: emit the SVM debug-info section alongside the IR (only meaningful with --emit-ir).
+    // `-g`: emit the Temen debug-info section alongside the IR (only meaningful with --emit-ir).
     // Caught here before the generic "-g*" ignore block below so it sets our flag; `-ggdb` etc.
     // still fall through to be ignored.
     if (!strcmp(argv[i], "-g")) {
@@ -606,7 +606,7 @@ static void cc1(void) {
   size_t buflen;
   FILE *output_buf = open_memstream(&buf, &buflen);
 
-  // Traverse the AST to emit code: SVM text IR (our backend) or x86-64 assembly.
+  // Traverse the AST to emit code: Temen text IR (our backend) or x86-64 assembly.
   if (opt_emit_ir)
     codegen_ir(prog, output_buf);
   else

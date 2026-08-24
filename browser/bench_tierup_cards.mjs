@@ -1,6 +1,6 @@
 // #839: bench the single-shot tier-up path vs the plain bytecode path, per card, with event
 // counts — the "measure what the pump buys or costs" task. For each (card, workload) it runs:
-//   1. plain bytecode:  svm_run_onramp
+//   1. plain bytecode:  temen_run_onramp
 //   2. the playground path: runJitModule (whole-program JIT → tier-up pump → coop, as play.js)
 // asserting stdout parity, and reporting wall-clock plus TIERUP/JIT_INVOKE/bounce counts (counted
 // through a Proxy over the cdylib exports — zero engine changes). Cold (first Run, includes the
@@ -16,7 +16,7 @@ import { runJitModule } from './web/wasmjit-module.js';
 import { engineImports } from './engine-imports.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
-const wasmPath = process.argv[2] ?? join(ROOT, 'target/wasm32-unknown-unknown/release/svm_browser.wasm');
+const wasmPath = process.argv[2] ?? join(ROOT, 'target/wasm32-unknown-unknown/release/temen_browser.wasm');
 const mod = await WebAssembly.compile(readFileSync(wasmPath));
 const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
 const { exports: ex } = await WebAssembly.instantiate(mod, engineImports(memory));
@@ -25,45 +25,45 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 const u8 = () => new Uint8Array(memory.buffer);
 const readStdout = () => dec.decode(u8().slice(
-  Number(ex.svm_stdout_ptr()), Number(ex.svm_stdout_ptr()) + Number(ex.svm_stdout_len())));
+  Number(ex.temen_stdout_ptr()), Number(ex.temen_stdout_ptr()) + Number(ex.temen_stdout_len())));
 
-// Event counters, observed from outside: one TIERUP service reads svm_coop_func once; a
-// JIT_INVOKE reads svm_coop_jit_wasm_ptr once; every cross-tier bounce goes through
-// svm_coop_call_interp (#1026: the coop driver is the one fallback tier; the pump is gone).
+// Event counters, observed from outside: one TIERUP service reads temen_coop_func once; a
+// JIT_INVOKE reads temen_coop_jit_wasm_ptr once; every cross-tier bounce goes through
+// temen_coop_call_interp (#1026: the coop driver is the one fallback tier; the pump is gone).
 let forcePump = false;
 const counts = { tierups: 0, invokes: 0, bounces: 0, path: 'interp' };
 const resetCounts = () => { counts.tierups = 0; counts.invokes = 0; counts.bounces = 0; counts.path = 'interp'; };
 const exCounted = Object.fromEntries(Object.entries(Object.getOwnPropertyDescriptors(ex)).map(([k, d]) => {
   const v = d.value;
   if (typeof v !== 'function') return [k, v];
-  if (k === 'svm_coop_func') return [k, (...a) => { counts.tierups++; return v(...a); }];
-  if (k === 'svm_coop_jit_wasm_ptr') return [k, (...a) => { counts.invokes++; return v(...a); }];
-  if (k === 'svm_coop_call_interp') return [k, (...a) => { counts.bounces++; return v(...a); }];
-  if (k === 'svm_onramp_jit_run_call_interp') return [k, (...a) => { counts.bounces++; return v(...a); }];
-  if (k === 'svm_onramp_jit_run_open')
+  if (k === 'temen_coop_func') return [k, (...a) => { counts.tierups++; return v(...a); }];
+  if (k === 'temen_coop_jit_wasm_ptr') return [k, (...a) => { counts.invokes++; return v(...a); }];
+  if (k === 'temen_coop_call_interp') return [k, (...a) => { counts.bounces++; return v(...a); }];
+  if (k === 'temen_onramp_jit_run_call_interp') return [k, (...a) => { counts.bounces++; return v(...a); }];
+  if (k === 'temen_onramp_jit_run_open')
     return [k, (...a) => {
       if (forcePump) return -2; // pretend "_start not emittable" so runJitModule falls to coop
       const r = v(...a);
       if (r === 0) counts.path = 'whole-program';
       return r;
     }];
-  if (k === 'svm_coop_open')
+  if (k === 'temen_coop_open')
     return [k, (...a) => { const r = v(...a); if (r === 0) counts.path = 'coop'; return r; }];
   return [k, v];
 }));
 
 function bytecodeRun(modBytes, stdinBytes) {
-  const mp = Number(ex.svm_alloc(modBytes.length));
+  const mp = Number(ex.temen_alloc(modBytes.length));
   u8().set(modBytes, mp);
-  const sp = Number(ex.svm_alloc(stdinBytes.length));
+  const sp = Number(ex.temen_alloc(stdinBytes.length));
   u8().set(stdinBytes, sp);
   const t0 = performance.now();
-  ex.svm_run_onramp(mp, modBytes.length, sp, stdinBytes.length);
+  ex.temen_run_onramp(mp, modBytes.length, sp, stdinBytes.length);
   const ms = performance.now() - t0;
   const out = readStdout();
-  const st = ex.svm_status();
-  ex.svm_dealloc(mp, modBytes.length);
-  ex.svm_dealloc(sp, stdinBytes.length);
+  const st = ex.temen_status();
+  ex.temen_dealloc(mp, modBytes.length);
+  ex.temen_dealloc(sp, stdinBytes.length);
   return { ms, out, st };
 }
 
@@ -72,19 +72,19 @@ async function pumpRun(modBytes, stdinBytes, cacheKey) {
   const t0 = performance.now();
   await runJitModule(exCounted, memory, modBytes, stdinBytes, cacheKey);
   const ms = performance.now() - t0;
-  return { ms, out: readStdout(), st: ex.svm_status(), ...counts };
+  return { ms, out: readStdout(), st: ex.temen_status(), ...counts };
 }
 
 const N = 3;
 const cards = [
-  ['hello_c', 'web/assets/hello_c.svmb', ''],
-  ['lua', 'web/assets/lua_snapshot.svmb',
+  ['hello_c', 'web/assets/hello_c.temen', ''],
+  ['lua', 'web/assets/lua_snapshot.temen',
     'local s = 0\nfor i = 1, 300000 do s = s + i % 7 end\nprint(s)\n'],
-  ['quickjs', 'web/assets/qjs_repl.svmb',
+  ['quickjs', 'web/assets/qjs_repl.temen',
     'let s = 0; for (let i = 1; i <= 100000; i++) s += i % 7; print(s);\n'],
-  ['sqlite', 'web/assets/sqlite_repl.svmb',
+  ['sqlite', 'web/assets/sqlite_repl.temen',
     'WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt LIMIT 50000) SELECT sum(x%7) FROM cnt;\n'],
-  ['tcl', 'web/assets/tcl_repl.svmb',
+  ['tcl', 'web/assets/tcl_repl.temen',
     'set s 0\nfor {set i 1} {$i <= 20000} {incr i} { set s [expr {$s + $i % 7}] }\nputs $s\n'],
 ];
 

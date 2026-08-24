@@ -1,4 +1,4 @@
-# FRONTEND.md — the C frontend (chibicc → SVM IR)
+# FRONTEND.md — the C frontend (chibicc → Temen IR)
 
 Implementation reference for the C frontend: what C is supported, how it lowers to
 the IR, and where to add things in `codegen_ir.c`. The *design* of the C ABI lives in
@@ -6,8 +6,8 @@ the IR, and where to add things in `codegen_ir.c`. The *design* of the C ABI liv
 implementation map. The frontend is **outside the escape-TCB** (§2a): the verifier
 re-checks whatever it emits, so a frontend bug is a clean error, never an escape.
 
-> A second/third frontend exists alongside this one: `svm-wasm` (core wasm → IR,
-> `WASM.md`) and `svm-llvm` (LLVM bitcode → IR, `LLVM.md`). This doc is the C/chibicc
+> A second/third frontend exists alongside this one: `temen-wasm` (core wasm → IR,
+> `WASM.md`) and `temen-llvm` (LLVM bitcode → IR, `LLVM.md`). This doc is the C/chibicc
 > frontend only.
 
 ---
@@ -45,15 +45,15 @@ pulled the system `<sys/cdefs.h>`, which — because chibicc isn't `__GNUC__` �
 
 ### Real libraries that run end-to-end
 Each is a vendored third-party C library, compiled through the frontend, verified, and run on
-**both backends**, matching a native `cc` build byte-for-byte (the tests are in `svm-run` /
-`crates/svm/tests/c_frontend.rs`):
+**both backends**, matching a native `cc` build byte-for-byte (the tests are in `temen-run` /
+`crates/temen/tests/c_frontend.rs`):
 
 - **Clay** (UI layout, ~5k-line header; the capstone) — `demos/clay/`, ~93k lines of IR. Drove
   the bulk of the frontend/IR/JIT fixes: anonymous-aggregate designated inits (the two `parse.c`
   fixes above), ternary-returns-struct (`gen_cond` carries the arm's *address*, merge type i64),
   >16-byte struct returns (skip chibicc's SysV hidden return-buffer param — our §3d sret covers
   every size), mixed-width shifts (a shift keeps its amount's own width — widen/narrow to the
-  value's width before `iN.shl/shr`), full-u32 `i32.const` in svm-text (`0xFFFFFFFF` = -1),
+  value's width before `iN.shl/shr`), full-u32 `i32.const` in temen-text (`0xFFFFFFFF` = -1),
   program-sized windows (size the window to globals/BSS + a stack reserve; Clay's ~250 KB arena
   needs `memory 21`, small programs keep 64 KB), and a contiguous JIT code arena
   (`ArenaMemoryProvider`: code+rodata from one 256 MiB arena, so ASLR can't place them > 2 GiB
@@ -78,19 +78,19 @@ Each is a vendored third-party C library, compiled through the frontend, verifie
 
 ### Invocation
 ```
-frontend/chibicc/chibicc -cc1 --emit-ir -cc1-input a.c -cc1-output a.svm a.c
+frontend/chibicc/chibicc -cc1 --emit-ir -cc1-input a.c -cc1-output a.temt a.c
 ```
 `-cc1` runs the compiler in-process (no gcc-style driver subprocess); `--emit-ir`
 dispatches to `codegen_ir` (see `cc1()` in `main.c`, where the wiring lives). Two more
-flags: `-g` also emits the SVM debug-info section (file/line table, function names,
+flags: `-g` also emits the Temen debug-info section (file/line table, function names,
 structured types, `debug.var` — `DEBUGGING.md` §6), and `--child-entry` emits function 0
 with the §14 child ABI (`(i64 starter) -> (i64 status)`) so a compiled-C command is
 spawnable as an `instantiate_module` child — a shell "exec" (`STAGE1.md`;
-`crates/svm/tests/stage1_exec_command.rs`). Build with
+`crates/temen/tests/stage1_exec_command.rs`). Build with
 `make -C frontend/chibicc` (needs `make` + a C compiler; both present in CI). Build
 artifacts (`*.o`, the `chibicc` binary) are git-ignored.
 
-### Test harness (`crates/svm/tests/c_frontend.rs`, two tiers)
+### Test harness (`crates/temen/tests/c_frontend.rs`, two tiers)
 `make`s the fork once, compiles each C snippet to IR, **verifies it**, then:
 - **Tier 1 (all tests):** runs `main` (function 0 = `_start`) on **both the interpreter
   and the JIT** under identical mock powerboxes and asserts they agree on result, trap,
@@ -100,7 +100,7 @@ artifacts (`*.o`, the `chibicc` binary) are git-ignored.
   semantics. Incl. recursion (Ackermann), floats, printf, bubble sort, sieve, linked list.
   Needs `cc` (already required to build the fork).
 ```
-cargo test -p svm --test c_frontend
+cargo test -p temen --test c_frontend
 ```
 
 ### What C is supported today
@@ -115,10 +115,10 @@ over the powerbox; **`malloc`/`free`/`calloc`/`realloc`** (guest allocator, heap
 Memory cap). All verify and run identically on interp + JIT, and match native `cc`.
 An unmodified **`main(argc, argv)`** also runs: the synthetic `_start` parses the §3e args
 buffer (`POWERBOX_ARGS_BASE`) into a real `argv[]` and calls it (`STAGE1.md`;
-`crates/svm/tests/stage1_argv_main.rs`). And a guest **definition** of `write`/`read`/`exit`
+`crates/temen/tests/stage1_argv_main.rs`). And a guest **definition** of `write`/`read`/`exit`
 shadows the builtin (the builtins apply only to declared-but-undefined names) — which is how
 a personality libc owns those names over §7 imports; real compiled C runs on the POSIX
-personality this way (PROCESS.md S15(b); `crates/svm/tests/c_posix.rs` / `c_shell.rs`,
+personality this way (PROCESS.md S15(b); `crates/temen/tests/c_posix.rs` / `c_shell.rs`,
 `POSIX.md`).
 
 Anything unsupported is a **hard `error_tok`** (with the AST node kind), by design — we never
@@ -158,7 +158,7 @@ real SSA value threaded as a block parameter of every block, exactly like the da
   cross-block value is the data-SP, passed as each block's `v0`. `nv` (value counter)
   **resets per block**; `nb` numbers blocks; `term` tracks whether the current block is
   already terminated (to drop dead code / avoid double terminators).
-- **Blocks resolve by label name** in `svm-text` (appearance order = index), so we emit
+- **Blocks resolve by label name** in `temen-text` (appearance order = index), so we emit
   blocks sequentially with **forward label references** (`br block7(v0)` before block 7
   exists) — no buffering needed. The **entry block must be first** (index 0).
 - **Functions are ordered with `main` first**, behind a synthetic **`_start`** (function 0,
@@ -223,7 +223,7 @@ the helpers.
 ### General `goto`/labels
 Each C label maps to one IR block keyed by chibicc's resolved `unique_label` (`label_block_of`,
 reset per function); the block number is allocated on first reference — label *or* a forward
-`goto` — which is sound because svm-text resolves block targets **by name**, not position
+`goto` — which is sound because temen-text resolves block targets **by name**, not position
 (`labels: HashMap<String,u32>` over appearance order). `ND_LABEL` falls into its block (if
 reachable) then `open_block`s it; `ND_GOTO` (after the existing break/continue match) branches to
 the target block, threading the data-SP + promoted locals via `cvals()` — identical to loops. The
@@ -316,8 +316,8 @@ working agreement is in `AGENTS.md`.
 ```
 make -C frontend/chibicc
 printf 'int fib(int n){if(n<2)return n;return fib(n-1)+fib(n-2);} int main(){return fib(10);}\n' > /tmp/t.c
-frontend/chibicc/chibicc -cc1 --emit-ir -cc1-input /tmp/t.c -cc1-output /tmp/t.svm /tmp/t.c
-cat /tmp/t.svm                        # func 0 = _start, func 1 = main calling func 2 = fib; n promotes to v1
-cargo test -p svm --test c_frontend   # interp == JIT, and == cc
-cargo test -p svm --test jit_fuzz     # 4000 generated modules, interp == JIT
+frontend/chibicc/chibicc -cc1 --emit-ir -cc1-input /tmp/t.c -cc1-output /tmp/t.temt /tmp/t.c
+cat /tmp/t.temt                        # func 0 = _start, func 1 = main calling func 2 = fib; n promotes to v1
+cargo test -p temen --test c_frontend   # interp == JIT, and == cc
+cargo test -p temen --test jit_fuzz     # 4000 generated modules, interp == JIT
 ```

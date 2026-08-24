@@ -1,19 +1,19 @@
-//! SVM **bytecode interpreter as a wasm guest** — the browser entry point (see `BROWSER.md`).
+//! Temen **bytecode interpreter as a wasm guest** — the browser entry point (see `BROWSER.md`).
 //!
 //! Exports for a wasm host (browser / any runtime):
 //!   * [`run_guest`] — a self-contained, no-import smoke probe (an embedded compute kernel), used by
 //!     the wasm32 anchors in `run.mjs`.
-//!   * [`svm_alloc`]/[`svm_dealloc`] — the host allocates a buffer in linear memory (no fixed cap),
-//!     writes an **encoded SVM IR module** (the `svm-encode` binary form) into it, and frees it
+//!   * [`temen_alloc`]/[`temen_dealloc`] — the host allocates a buffer in linear memory (no fixed cap),
+//!     writes an **encoded Temen IR module** (the `temen-encode` binary form) into it, and frees it
 //!     after the run.
-//!   * [`svm_run`] — the production shape: `svm_run(ptr, len, arg)` decodes the module at
+//!   * [`temen_run`] — the production shape: `temen_run(ptr, len, arg)` decodes the module at
 //!     `[ptr, len)`, runs function 0 on the **bytecode engine** with a **deny-all `Host`**
 //!     (compute-only), and returns its first `i64` result. **Fail-closed:** a module the engine
 //!     can't compile yields `STATUS_UNSUPPORTED` rather than any tree-walker fallback.
-//!   * [`svm_run_pb`] — the **powerbox**: streams/clock/exit, I/O marshalled through allocations.
-//!     `svm_run_live` (feature `live`) instead binds those to real host imports.
+//!   * [`temen_run_pb`] — the **powerbox**: streams/clock/exit, I/O marshalled through allocations.
+//!     `temen_run_live` (feature `live`) instead binds those to real host imports.
 //!
-//! Status of the last run is read separately via [`svm_status`] (a single `i64` return can't
+//! Status of the last run is read separately via [`temen_status`] (a single `i64` return can't
 //! disambiguate an error from a guest result of the same value).
 
 // Every `#[no_mangle] extern "C"` export here is a wasm-host FFI boundary that, by construction,
@@ -25,8 +25,8 @@
 use std::alloc::Layout;
 
 #[cfg(feature = "live")]
-use svm_interp::HostProc;
-use svm_interp::{bytecode, Host, StreamRole, Trap, Value};
+use temen_interp::HostProc;
+use temen_interp::{bytecode, Host, StreamRole, Trap, Value};
 
 // The `webgpu` capability's host import (browser: `navigator.gpu` via `webgpu_op`). Wasm-only — native
 // builds (the Rust reactor tests) have no such import, so the cap is simply not granted there.
@@ -37,16 +37,16 @@ mod webgpu;
 // ---- self-contained smoke probe (no host imports) --------------------------------------------
 
 /// In-wasm roundtrip probe: parse → **encode** → **decode** → run, entirely inside the sandbox, so
-/// the production `svm-encode` decode path (which `svm_run` relies on) is exercised on whatever
+/// the production `temen-encode` decode path (which `temen_run` relies on) is exercised on whatever
 /// target this is built for — incl. wasm64 via `wasmtime --invoke run_roundtrip`. Returns the ALU
 /// result for `arg = 1` (`1442695040888963407`), or `i64::MIN` on any failure.
 #[no_mangle]
 pub extern "C" fn run_roundtrip() -> i64 {
-    let Ok(m) = svm_text::parse_module(ALU) else {
+    let Ok(m) = temen_text::parse_module(ALU) else {
         return i64::MIN;
     };
-    let bytes = svm_encode::encode_module(&m);
-    let Ok(m2) = svm_encode::decode_module(&bytes) else {
+    let bytes = temen_encode::encode_module(&m);
+    let Ok(m2) = temen_encode::decode_module(&bytes) else {
         return i64::MIN;
     };
     let mut fuel = u64::MAX;
@@ -91,7 +91,7 @@ block 3 (v17: i64) {
 /// `i64::MIN` is the in-band failure sentinel (parse/compile/trap).
 #[no_mangle]
 pub extern "C" fn run_guest(n: i64) -> i64 {
-    let Ok(m) = svm_text::parse_module(ALU) else {
+    let Ok(m) = temen_text::parse_module(ALU) else {
         return i64::MIN;
     };
     let mut fuel = u64::MAX;
@@ -184,7 +184,7 @@ block 3 () {
 /// Run the embedded concurrency probe; returns `4000`, or `i64::MIN` on any failure.
 #[no_mangle]
 pub extern "C" fn run_threads() -> i64 {
-    let Ok(m) = svm_text::parse_module(THREADS) else {
+    let Ok(m) = temen_text::parse_module(THREADS) else {
         return i64::MIN;
     };
     let mut fuel = u64::MAX;
@@ -357,7 +357,7 @@ block 4 (vr: i64, vho: i32) {
 /// run_fork` exercises the fork substrate on wasm.
 #[no_mangle]
 pub extern "C" fn run_fork() -> i64 {
-    let Ok(m) = svm_text::parse_module(FORK_TWIN) else {
+    let Ok(m) = temen_text::parse_module(FORK_TWIN) else {
         return i64::MIN;
     };
     let m = std::sync::Arc::new(m);
@@ -397,7 +397,7 @@ pub extern "C" fn run_fork() -> i64 {
 
 // ---- production entry: run an encoded guest module -------------------------------------------
 
-/// `svm_run` completed and returned a guest `i64`.
+/// `temen_run` completed and returned a guest `i64`.
 pub const STATUS_OK: i32 = 0;
 /// The bytes at the scratch buffer were not a well-formed encoded module.
 pub const STATUS_DECODE_ERR: i32 = 1;
@@ -408,31 +408,31 @@ pub const STATUS_TRAP: i32 = 3;
 /// The guest returned, but not a single `i64` (compute-only v1 only surfaces `i64`).
 pub const STATUS_BAD_RESULT: i32 = 4;
 
-/// Most recent status (a `STATUS_*` code), read via [`svm_status`] after any run entry.
+/// Most recent status (a `STATUS_*` code), read via [`temen_status`] after any run entry.
 static mut LAST_STATUS: i32 = STATUS_OK;
 
 // ---- linear-memory allocator: the host manages I/O buffers of arbitrary size ------------------
 //
-// Replaces the old fixed scratch buffers. The host calls [`svm_alloc`] to reserve `len` bytes in
+// Replaces the old fixed scratch buffers. The host calls [`temen_alloc`] to reserve `len` bytes in
 // *this module's* linear memory (the Rust allocator grows it as needed — no 1 MiB cap), writes the
-// encoded module / stdin there, passes the `(ptr, len)` to a run entry, then [`svm_dealloc`]s it.
+// encoded module / stdin there, passes the `(ptr, len)` to a run entry, then [`temen_dealloc`]s it.
 // Allocations are plain bytes (alignment 1), so `dealloc` only needs the same `len`.
 
 /// Allocate `len` bytes (alignment 1) in linear memory; returns the pointer (null for `len == 0` or
-/// on allocation failure). Pair every non-null result with a [`svm_dealloc`] of the same `len`.
+/// on allocation failure). Pair every non-null result with a [`temen_dealloc`] of the same `len`.
 #[no_mangle]
-pub extern "C" fn svm_alloc(len: usize) -> *mut u8 {
+pub extern "C" fn temen_alloc(len: usize) -> *mut u8 {
     match Layout::from_size_align(len, 1) {
         Ok(layout) if len != 0 => unsafe { std::alloc::alloc(layout) },
         _ => core::ptr::null_mut(),
     }
 }
 
-/// Free a [`svm_alloc`]ation — `ptr`/`len` must match the original request. No-op for a null `ptr`
-/// or `len == 0`. (Do **not** call this on the `svm_stdout_ptr`/`svm_stderr_ptr` buffers: those are
-/// cdylib-managed, reclaimed on the next [`svm_run_pb`].)
+/// Free a [`temen_alloc`]ation — `ptr`/`len` must match the original request. No-op for a null `ptr`
+/// or `len == 0`. (Do **not** call this on the `temen_stdout_ptr`/`temen_stderr_ptr` buffers: those are
+/// cdylib-managed, reclaimed on the next [`temen_run_pb`].)
 #[no_mangle]
-pub extern "C" fn svm_dealloc(ptr: *mut u8, len: usize) {
+pub extern "C" fn temen_dealloc(ptr: *mut u8, len: usize) {
     if ptr.is_null() || len == 0 {
         return;
     }
@@ -444,25 +444,25 @@ pub extern "C" fn svm_dealloc(ptr: *mut u8, len: usize) {
 /// `1` on a 64-bit (`wasm64`/`memory64`) build, `0` on `wasm32` — so a host harness knows whether
 /// the pointer/length ABI values are `i64` (BigInt) or `i32`.
 #[no_mangle]
-pub extern "C" fn svm_abi_is64() -> i32 {
+pub extern "C" fn temen_abi_is64() -> i32 {
     (core::mem::size_of::<usize>() == 8) as i32
 }
 
 /// Status of the most recent run entry (one of the `STATUS_*` codes).
 #[no_mangle]
-pub extern "C" fn svm_status() -> i32 {
+pub extern "C" fn temen_status() -> i32 {
     // SAFETY: single-threaded wasm; plain `i32` read.
     unsafe { LAST_STATUS }
 }
 
-/// Decode the `len` bytes at `ptr` as an SVM IR module, run function 0 on the bytecode engine with
+/// Decode the `len` bytes at `ptr` as an Temen IR module, run function 0 on the bytecode engine with
 /// `args` and a deny-all `Host`, and return its first `i64` result (`0` on any non-`OK` status —
-/// read [`svm_status`] to disambiguate). Sets [`LAST_STATUS`]. Shared by [`svm_run`]/[`svm_run0`].
+/// read [`temen_status`] to disambiguate). Sets [`LAST_STATUS`]. Shared by [`temen_run`]/[`temen_run0`].
 fn run_at(ptr: *const u8, len: usize, args: &[Value]) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees `[ptr, ptr+len)` is a live `svm_alloc`ation it just filled.
+    // SAFETY: the host guarantees `[ptr, ptr+len)` is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
@@ -470,7 +470,7 @@ fn run_at(ptr: *const u8, len: usize, args: &[Value]) -> i64 {
         }
     };
     let mut fuel = u64::MAX;
-    let mut host = svm_interp::Host::new(); // deny-all powerbox (compute-only)
+    let mut host = temen_interp::Host::new(); // deny-all powerbox (compute-only)
     match bytecode::compile_and_run_with_host(&m, 0, args, &mut fuel, &mut host) {
         None => {
             set(STATUS_UNSUPPORTED);
@@ -495,42 +495,42 @@ fn run_at(ptr: *const u8, len: usize, args: &[Value]) -> i64 {
 
 /// Run the encoded module at `[ptr, ptr+len)` passing a single `i64` argument (the common shape).
 #[no_mangle]
-pub extern "C" fn svm_run(ptr: *const u8, len: usize, arg: i64) -> i64 {
+pub extern "C" fn temen_run(ptr: *const u8, len: usize, arg: i64) -> i64 {
     run_at(ptr, len, &[Value::I64(arg)])
 }
 
 /// Run the encoded module at `[ptr, ptr+len)` with **no** arguments — e.g. the `() -> (i64)` thread
 /// kernels that spawn/join cooperatively on the engine's `drive`.
 #[no_mangle]
-pub extern "C" fn svm_run0(ptr: *const u8, len: usize) -> i64 {
+pub extern "C" fn temen_run0(ptr: *const u8, len: usize) -> i64 {
     run_at(ptr, len, &[])
 }
 
-/// `verify_module` rejected the decoded module ([`svm_prep_bench`]).
+/// `verify_module` rejected the decoded module ([`temen_prep_bench`]).
 pub const STATUS_VERIFY_ERR: i32 = 6;
 
 /// **Benchmark entry: the safe module-load path a browser must run before it can execute a guest.**
 /// Decode the module at `[ptr, ptr+len)`, `verify_module` it (the escape-freedom TCB gate — never
 /// skippable, however trusted the producer), and `bytecode::compile_module` it (the interpreter's
-/// per-module cold cost). Sets [`svm_status`]; returns the function count (`0` on any error). The host
+/// per-module cold cost). Sets [`temen_status`]; returns the function count (`0` on any error). The host
 /// times this call to measure the **module-prep tax inside the wasm sandbox** — decode + verify +
-/// compile of a *pre-translated, pre-resolved* `.svmb` — the wasm counterpart to the native
-/// `prep_svmb` example. This is the one-time cost a fast-loading demo pays per page load (translation
+/// compile of a *pre-translated, pre-resolved* `.temen` — the wasm counterpart to the native
+/// `prep_temen` example. This is the one-time cost a fast-loading demo pays per page load (translation
 /// is done at build time); its ratio to the native example is the sandbox tax on loading (see
 /// `BOOTSPEED.md`). No powerbox run happens here. Driven by `browser/bench_prep.mjs`.
 #[no_mangle]
-pub extern "C" fn svm_prep_bench(ptr: *const u8, len: usize) -> i64 {
+pub extern "C" fn temen_prep_bench(ptr: *const u8, len: usize) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees `[ptr, ptr+len)` is a live `svm_alloc`ation it just filled.
+    // SAFETY: the host guarantees `[ptr, ptr+len)` is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
             return 0;
         }
     };
-    if svm_verify::verify_module(&m).is_err() {
+    if temen_verify::verify_module(&m).is_err() {
         set(STATUS_VERIFY_ERR);
         return 0;
     }
@@ -546,16 +546,16 @@ pub extern "C" fn svm_prep_bench(ptr: *const u8, len: usize) -> i64 {
 /// module at `[mod_ptr, mod_len)`, run function `func` on the bytecode engine with the frontend's
 /// `(sp, n)` calling convention — `(sp, n)` for a ≥2-param entry, `(n)` for a 1-param one — under a
 /// deny-all `Host`, and return its first result widened to `i64` (`0` on any non-`OK` status; read
-/// [`svm_status`]). Each argument is coerced to its declared `ValType` so a 32-bit `n` param (the
+/// [`temen_status`]). Each argument is coerced to its declared `ValType` so a 32-bit `n` param (the
 /// `cross_engine` kernels) and a 64-bit one (the `embench` kernels, `long n`) both run correctly.
 ///
 /// This is the seam the cross-engine benchmark uses to time the **bytecode engine running inside
-/// wasm** (`crates/svm-llvm/examples/cross_engine.rs`'s `svm-bytecode-wasm` row, driven via
-/// `browser/bench.mjs`) on the *same* LLVM-frontend IR the native `svm-bytecode` row runs — isolating
-/// the cost of the wasm sandbox over the interpreter. `svm_run`/`svm_run0` only reach function 0 with
+/// wasm** (`crates/temen-llvm/examples/cross_engine.rs`'s `temen-bytecode-wasm` row, driven via
+/// `browser/bench.mjs`) on the *same* LLVM-frontend IR the native `temen-bytecode` row runs — isolating
+/// the cost of the wasm sandbox over the interpreter. `temen_run`/`temen_run0` only reach function 0 with
 /// a fixed arity, so a dedicated entry is needed to drive a kernel exported at an arbitrary index.
 #[no_mangle]
-pub extern "C" fn svm_run_bench(
+pub extern "C" fn temen_run_bench(
     mod_ptr: *const u8,
     mod_len: usize,
     func: u32,
@@ -563,9 +563,9 @@ pub extern "C" fn svm_run_bench(
     n: i64,
 ) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
@@ -587,7 +587,7 @@ pub extern "C" fn svm_run_bench(
         .map(|(i, ty)| {
             let raw = supplied.get(i).copied().unwrap_or(0);
             match ty {
-                svm_ir::ValType::I32 => Value::I32(raw as i32),
+                temen_ir::ValType::I32 => Value::I32(raw as i32),
                 _ => Value::I64(raw),
             }
         })
@@ -622,12 +622,12 @@ pub extern "C" fn svm_run_bench(
 
 // ---- shared-memory window: run the engine over a caller-owned region of *this* linear memory ----
 //
-// THREADS.md step 4. `svm_run` runs over a window the engine backs internally; `svm_run_shared` runs
+// THREADS.md step 4. `temen_run` runs over a window the engine backs internally; `temen_run_shared` runs
 // over a window the **host** carves out of this module's linear memory (`[win_ptr, win_size)`, via
-// `svm_alloc`). Built as a wasm threads module (shared memory + `+atomics`), that linear memory is
+// `temen_alloc`). Built as a wasm threads module (shared memory + `+atomics`), that linear memory is
 // the host's `SharedArrayBuffer`, so the window lives in shared memory — the substrate the parallel
 // mode's per-vCPU Workers will all execute over. Today still cooperative (one thread); the only
-// change from `svm_run` is *where the guest window lives*. Stateless (no `static mut`), so two
+// change from `temen_run` is *where the guest window lives*. Stateless (no `static mut`), so two
 // Workers running it over **disjoint** windows don't race on engine ABI globals.
 
 /// Decode the module at `[mod_ptr, mod_len)` and run function 0 over the guest window
@@ -636,22 +636,23 @@ pub extern "C" fn svm_run_bench(
 /// decode/unsupported/trap/non-`i64`. The host reads the guest's memory effects directly from the
 /// window region afterward.
 #[no_mangle]
-pub extern "C" fn svm_run_shared(
+pub extern "C" fn temen_run_shared(
     mod_ptr: *const u8,
     mod_len: usize,
     win_ptr: *mut u8,
     win_size: usize,
     arg: i64,
 ) -> i64 {
-    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let Ok(m) = svm_encode::decode_module(bytes) else {
+    let Ok(m) = temen_encode::decode_module(bytes) else {
         return i64::MIN;
     };
-    // SAFETY: the host guarantees `[win_ptr, win_size)` is a live `svm_alloc`ed region of this linear
+    // SAFETY: the host guarantees `[win_ptr, win_size)` is a live `temen_alloc`ed region of this linear
     // memory used solely as this guest window for the call. The `unsafe` borrow lives here in the
     // embedder; the engine stays `#![forbid(unsafe_code)]` and just takes the `Arc<Region>`.
-    let back = std::sync::Arc::new(unsafe { svm_interp::Region::shared(win_ptr, win_size as u64) });
+    let back =
+        std::sync::Arc::new(unsafe { temen_interp::Region::shared(win_ptr, win_size as u64) });
     let arity = m.funcs.first().map_or(0, |f| f.params.len());
     let args: &[Value] = if arity >= 1 { &[Value::I64(arg)] } else { &[] };
     let mut fuel = u64::MAX;
@@ -669,7 +670,7 @@ pub extern "C" fn svm_run_shared(
 //
 // wasm32 has no `thread::spawn`, so one guest's `thread.spawn`ed vCPUs are distributed across **Web
 // Workers** by the JS host: each Worker runs **one** vCPU via the engine's resumable `Vcpu` API
-// (`svm_par_run` → an event the host services → deliver the result → run again) over the **one** shared
+// (`temen_par_run` → an event the host services → deliver the result → run again) over the **one** shared
 // linear-memory window. The host services the events with real cross-Worker primitives: `thread.spawn`
 // → start a Worker, `thread.join` → `Atomics.wait` on the child's completion slot, `memory.wait`/
 // `notify` → `Atomics.wait`/`notify` on the futex word — so this is genuinely parallel, the native
@@ -681,17 +682,17 @@ pub extern "C" fn svm_run_shared(
 // run (never freed), so the borrow is sound — the `unsafe` of asserting that lives in this embedder.
 
 /// Allocate `len` bytes **16-aligned** (so windows / futex words / completion slots are naturally
-/// aligned for `Atomics` / the engine's hardware atomics, which `svm_alloc`'s align-1 does not
+/// aligned for `Atomics` / the engine's hardware atomics, which `temen_alloc`'s align-1 does not
 /// guarantee). Leaked for the run (the parallel demo never frees; the process exits). Null on `len==0`.
 #[no_mangle]
-pub extern "C" fn svm_par_alloc(len: usize) -> *mut u8 {
+pub extern "C" fn temen_par_alloc(len: usize) -> *mut u8 {
     match Layout::from_size_align(len, 16) {
         Ok(layout) if len != 0 => unsafe { std::alloc::alloc_zeroed(layout) },
         _ => core::ptr::null_mut(),
     }
 }
 
-/// Event codes returned by [`svm_par_run`] — the host switches on these (operands via `svm_par_ev_*`).
+/// Event codes returned by [`temen_par_run`] — the host switches on these (operands via `temen_par_ev_*`).
 pub const PAR_DONE: i32 = 0;
 pub const PAR_TRAP: i32 = 1;
 pub const PAR_SPAWN: i32 = 2;
@@ -700,27 +701,27 @@ pub const PAR_WAIT: i32 = 4;
 pub const PAR_NOTIFY: i32 = 5;
 pub const PAR_INSTANTIATE: i32 = 6;
 /// wasm-JIT tier-up (browser wasm-JIT threads slice): the vCPU reached a `Call` to a JIT-eligible
-/// function. `svm_par_ev_a` = the func index; `svm_par_ev_b` = the window's committed extent, which
+/// function. `temen_par_ev_a` = the func index; `temen_par_ev_b` = the window's committed extent, which
 /// the Worker MUST write to the emitted module's `"mapped"` global before the call (#717 host sync —
 /// over today's fully-mapped par window it equals the emit-time default, so the write is idempotent;
 /// over a grown window it is what keeps the emitted bounds check in lockstep with the interpreter).
-/// `svm_par_tierup_argv_ptr`/`_len` give the marshalled i64 args. The Worker runs the emitted
-/// `f{func}` and calls `svm_par_deliver_tierup`/`_trap`.
+/// `temen_par_tierup_argv_ptr`/`_len` give the marshalled i64 args. The Worker runs the emitted
+/// `f{func}` and calls `temen_par_deliver_tierup`/`_trap`.
 pub const PAR_TIERUP: i32 = 7;
 /// §22 guest-JIT **real codegen** (BROWSER.md § "wasm-JIT tier", slice 5): a guest's `Jit.invoke`
-/// surfaces here (codegen mode on — [`svm_par_powerbox_jit_codegen`]) so the Worker runs the
-/// submitted unit on **emitted wasm** (`svm_par_jit_unit_wasm_ptr`/`_len` — one immutable module per
-/// run) instead of the interpreter. `svm_par_jit_code` keys the Worker's per-unit instance cache;
-/// `svm_par_jit_argv_ptr`/`_len` give the args as i64 slots, `svm_par_jit_param_types_ptr` their wasm
-/// types (i32/i64) so the Worker marshals each to a JS `Number`/`BigInt`. `svm_par_ev_b` = the
+/// surfaces here (codegen mode on — [`temen_par_powerbox_jit_codegen`]) so the Worker runs the
+/// submitted unit on **emitted wasm** (`temen_par_jit_unit_wasm_ptr`/`_len` — one immutable module per
+/// run) instead of the interpreter. `temen_par_jit_code` keys the Worker's per-unit instance cache;
+/// `temen_par_jit_argv_ptr`/`_len` give the args as i64 slots, `temen_par_jit_param_types_ptr` their wasm
+/// types (i32/i64) so the Worker marshals each to a JS `Number`/`BigInt`. `temen_par_ev_b` = the
 /// window's committed extent, which the Worker MUST write to the unit instance's `"mapped"` global
 /// before the call (#717 host sync, same contract as [`PAR_TIERUP`] — an invoke whose window state
 /// the scalar cannot represent never surfaces here; it is serviced on the interpreter instead). The
-/// Worker runs the emitted `f{entry}(win, env, …args)` and calls `svm_par_deliver_jit_invoke`/`_trap`.
+/// Worker runs the emitted `f{entry}(win, env, …args)` and calls `temen_par_deliver_jit_invoke`/`_trap`.
 pub const PAR_JIT_INVOKE: i32 = 8;
 
-/// A boxed resumable vCPU plus the operands of its last [`svm_par_run`] event (flattened to four
-/// `i64`s the host reads via [`svm_par_ev_a`]–[`svm_par_ev_d`]).
+/// A boxed resumable vCPU plus the operands of its last [`temen_par_run`] event (flattened to four
+/// `i64`s the host reads via [`temen_par_ev_a`]–[`temen_par_ev_d`]).
 pub struct ParVcpu {
     inner: bytecode::Vcpu<'static>,
     a: i64,
@@ -728,41 +729,41 @@ pub struct ParVcpu {
     c: i64,
     d: i64,
     /// The marshalled arguments of a pending [`PAR_TIERUP`] event (raw i64 slots) — read by the
-    /// Worker via [`svm_par_tierup_argv_ptr`]/[`svm_par_tierup_argv_len`] to call the emitted region.
+    /// Worker via [`temen_par_tierup_argv_ptr`]/[`temen_par_tierup_argv_len`] to call the emitted region.
     tierup_argv: Vec<i64>,
     /// The marshalled arguments of a pending [`PAR_JIT_INVOKE`] event (raw i64 slots) — read by the
-    /// Worker via [`svm_par_jit_argv_ptr`]/[`svm_par_jit_argv_len`] to call the emitted §22 unit.
+    /// Worker via [`temen_par_jit_argv_ptr`]/[`temen_par_jit_argv_len`] to call the emitted §22 unit.
     jit_argv: Vec<i64>,
     /// The code handle of a pending [`PAR_JIT_INVOKE`] (the Worker caches one emitted instance per unit).
     jit_code: i32,
     /// Per-arg / per-result **scalar type codes** of a pending [`PAR_JIT_INVOKE`] (`0` = i32, `1` =
     /// i64, `2` = f32, `3` = f64) so the Worker marshals each i64 slot to/from the wasm type the
     /// emitted `f{entry}` uses: an i32 arg is a JS `Number`, an i64 a `BigInt`, a float the *value*
-    /// the slot's bits reinterpret to. Read via [`svm_par_jit_param_types_ptr`] /
-    /// [`svm_par_jit_result_types_ptr`] — a §22 unit need not be all-i64.
+    /// the slot's bits reinterpret to. Read via [`temen_par_jit_param_types_ptr`] /
+    /// [`temen_par_jit_result_types_ptr`] — a §22 unit need not be all-i64.
     jit_param_types: Vec<u8>,
     jit_result_types: Vec<u8>,
     /// The emitted wasm of a pending [`PAR_JIT_INVOKE`]'s **runtime-compiled** unit (the shared-host
-    /// path, [`svm_par_powerbox_jit_runtime`]): the JS host reads its bytes via
-    /// [`svm_par_jit_code_wasm_ptr`]/[`svm_par_jit_code_wasm_len`] to instantiate the unit once,
+    /// path, [`temen_par_powerbox_jit_runtime`]): the JS host reads its bytes via
+    /// [`temen_par_jit_code_wasm_ptr`]/[`temen_par_jit_code_wasm_len`] to instantiate the unit once,
     /// caching the instance by [`jit_code`](ParVcpu::jit_code). `None` for the fixed-unit codegen path
     /// (that reads the run-wide [`JIT_UNIT_WASM`] stash). The `Arc` keeps the bytes alive for the read.
     jit_wasm: Option<std::sync::Arc<[u8]>>,
     /// #750 paged runs: the page-state table for a pending [`PAR_TIERUP`], rebuilt from the live
     /// page map at each event ([`bytecode::build_pagestate_table`]). Its bytes live in this
-    /// module's linear memory, so [`svm_par_tierup_pagestate_ptr`] IS the address the Worker
+    /// module's linear memory, so [`temen_par_tierup_pagestate_ptr`] IS the address the Worker
     /// writes to the emitted module's `"pagestate"` global. Empty on unpaged runs.
     pagestate: Vec<u8>,
 }
 
-/// SVM scalar `ValType` → the Worker's marshalling type code (`0` = i32, `1` = i64, `2` = f32, `3` =
+/// Temen scalar `ValType` → the Worker's marshalling type code (`0` = i32, `1` = i64, `2` = f32, `3` =
 /// f64). `None` for `v128` (the Worker has no lane marshalling — such a unit stays on the interp).
-fn scalar_type_code(t: svm_ir::ValType) -> Option<u8> {
+fn scalar_type_code(t: temen_ir::ValType) -> Option<u8> {
     match t {
-        svm_ir::ValType::I32 => Some(0),
-        svm_ir::ValType::I64 => Some(1),
-        svm_ir::ValType::F32 => Some(2),
-        svm_ir::ValType::F64 => Some(3),
+        temen_ir::ValType::I32 => Some(0),
+        temen_ir::ValType::I64 => Some(1),
+        temen_ir::ValType::F32 => Some(2),
+        temen_ir::ValType::F64 => Some(3),
         _ => None,
     }
 }
@@ -805,7 +806,7 @@ fn with_tierup(inner: bytecode::Vcpu<'static>) -> bytecode::Vcpu<'static> {
 }
 
 /// The JIT tier-up eligibility bitmap for this instance's guest (per-Worker: each computes its own
-/// from the module bytes via [`svm_par_enable_jit`], since an `Arc` can't cross Worker instances).
+/// from the module bytes via [`temen_par_enable_jit`], since an `Arc` can't cross Worker instances).
 static mut PAR_JIT_ELIGIBLE: Option<std::sync::Arc<[bool]>> = None;
 
 /// Clone the published tier-up bitmap, if any.
@@ -815,7 +816,7 @@ fn par_jit_eligible() -> Option<std::sync::Arc<[bool]>> {
 }
 
 /// #750: whether this instance's tier-up module was emitted **paged**
-/// ([`svm_par_enable_jit_paged`]) — the vCPUs then skip the scalar decline and every `PAR_TIERUP`
+/// ([`temen_par_enable_jit_paged`]) — the vCPUs then skip the scalar decline and every `PAR_TIERUP`
 /// carries a freshly built page-state table (operand `b` = its coverage).
 static mut PAR_JIT_PAGED: bool = false;
 
@@ -825,7 +826,7 @@ fn par_jit_paged() -> bool {
 }
 
 // ==== I22 fix: emit each per-Worker codegen unit exactly ONCE per run ============================
-// `svm_par_enable_jit` / `_jit_codegen` / `_inst_codegen` each emit wasm and `stash()` it into a
+// `temen_par_enable_jit` / `_jit_codegen` / `_inst_codegen` each emit wasm and `stash()` it into a
 // `static mut`. JS instantiates every Worker against ONE shared linear memory, so those statics are a
 // SINGLE shared copy — NOT "per instance" as the older SAFETY comments claimed. So N Workers each
 // calling `enable_*` in their own setup, concurrently, raced on `stash()`'s `dealloc(old_ptr)`: two
@@ -838,7 +839,7 @@ fn par_jit_paged() -> bool {
 // generation; later Workers skip the emit and reuse the shared stash (identical bytes either way). The
 // stash is thus written once per run and never freed mid-run, so the Workers' reads of the emitted
 // bytes are stable. A SPIN-lock (not a `Mutex`) so the page's own `enable_*` call — which happens on
-// the main thread inside `svm_par_powerbox_jit_codegen` — can never hit a forbidden `Atomics.wait`; it
+// the main thread inside `temen_par_powerbox_jit_codegen` — can never hit a forbidden `Atomics.wait`; it
 // is always uncontended (no Worker is alive yet), so it acquires without spinning.
 //
 // The emit runs while the lock is held, so under `panic = "abort"` a compile panic would leave the
@@ -891,23 +892,23 @@ static INST_CG_RESULT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI
 /// Enable wasm-JIT **tier-up** for the module at `[mod_ptr, mod_len)` (`BROWSER.md` § "wasm-JIT
 /// tier", per-Worker JIT): emit the tier-up module and compute which functions the interpreter
 /// should surface as [`PAR_TIERUP`] (the browser then runs the emitted `f{func}` on the Worker
-/// instead of interpreting). Unlike the whole-module `svm_wasmjit_compile`, this does **not** need
+/// instead of interpreting). Unlike the whole-module `temen_wasmjit_compile`, this does **not** need
 /// the guest's func 0 to be JITtable — the guest keeps running on the resumable interpreter (which
 /// drives `thread.spawn`/`join`, atomics, `memory.wait`), and only a direct `Call` to an emitted
 /// pure region tiers up. So a compute leaf reachable **only** through `thread.spawn` still tiers up,
-/// which is the whole point of the threads tier ([`svm_wasm_jit::compile_jit`] with
-/// [`svm_wasm_jit::Shape::Threaded`]).
+/// which is the whole point of the threads tier ([`temen_wasm_jit::compile_jit`] with
+/// [`temen_wasm_jit::Shape::Threaded`]).
 ///
 /// A function is eligible iff it is **emitted** (in-subset, all its calls route) **and** has an
 /// **all-i64** signature — so the Worker passes every arg / reads every result as a plain `BigInt`
 /// i64 slot with no per-param type info (which the emitted `WebAssembly.Module` doesn't expose to
 /// JS). Non-i64 scalar params (i32, floats) are a later refinement. On success this stashes the
-/// emitted wasm (read via [`svm_wasmjit_ptr`]/[`svm_wasmjit_len`]) and the decoded module (for the
-/// cross-tier [`svm_wasmjit_call_interp`]), so the Worker needs only this one call — no separate
-/// `svm_wasmjit_compile`. Returns `1` when at least one function tier-ups, else `0` (everything
+/// emitted wasm (read via [`temen_wasmjit_ptr`]/[`temen_wasmjit_len`]) and the decoded module (for the
+/// cross-tier [`temen_wasmjit_call_interp`]), so the Worker needs only this one call — no separate
+/// `temen_wasmjit_compile`. Returns `1` when at least one function tier-ups, else `0` (everything
 /// interprets). Call on **every** instance (page + each Worker) before building vCPUs, same bytes.
 #[no_mangle]
-pub extern "C" fn svm_par_enable_jit(mod_ptr: *const u8, mod_len: usize) -> i32 {
+pub extern "C" fn temen_par_enable_jit(mod_ptr: *const u8, mod_len: usize) -> i32 {
     use std::sync::atomic::Ordering;
     par_install_panic_capture(); // I22: capture a setup-time engine panic's FILE:LINE (not a bare `unreachable`)
                                  // I22: emit once per run under CODEGEN_LOCK; a later Worker reuses the shared stash (see the
@@ -919,9 +920,9 @@ pub extern "C" fn svm_par_enable_jit(mod_ptr: *const u8, mod_len: usize) -> i32 
         return TIERUP_RESULT.load(Ordering::Relaxed);
     }
     let result = (|| {
-        // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+        // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
         let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-        let Ok(m) = svm_encode::decode_module(bytes) else {
+        let Ok(m) = temen_encode::decode_module(bytes) else {
             return 0;
         };
         // Emit the tier-up module against the shared linear memory (the browser threads build) and take
@@ -929,15 +930,15 @@ pub extern "C" fn svm_par_enable_jit(mod_ptr: *const u8, mod_len: usize) -> i32 
         // single top-level frame — vCPUs enter via `thread.spawn`), so `compile_jit` picks tier-up. `Err`
         // only if the assembler itself rejects the set — treat as "no tier-up" (fail-closed: the guest
         // keeps interpreting).
-        let Ok(svm_wasm_jit::Artifact {
+        let Ok(temen_wasm_jit::Artifact {
             wasm,
             emitted: emit,
             ..
-        }) = svm_wasm_jit::compile_jit(&m, svm_wasm_jit::Shape::Threaded, true)
+        }) = temen_wasm_jit::compile_jit(&m, temen_wasm_jit::Shape::Threaded, true)
         else {
             return 0;
         };
-        let all_i64 = |ts: &[svm_ir::ValType]| ts.iter().all(|t| *t == svm_ir::ValType::I64);
+        let all_i64 = |ts: &[temen_ir::ValType]| ts.iter().all(|t| *t == temen_ir::ValType::I64);
         let eligible: Vec<bool> = m
             .funcs
             .iter()
@@ -962,15 +963,15 @@ pub extern "C" fn svm_par_enable_jit(mod_ptr: *const u8, mod_len: usize) -> i32 
     result
 }
 
-/// [`svm_par_enable_jit`], but the tier-up module is emitted **paged** (#750,
+/// [`temen_par_enable_jit`], but the tier-up module is emitted **paged** (#750,
 /// `compile_module_tierup_paged` with this instance's software page size): `unmap`/`protect`
 /// guests keep their pure leaves eligible, and every emitted access consults the per-event
-/// page-state table (see [`svm_par_tierup_pagestate_ptr`]; the Worker writes its base to the
+/// page-state table (see [`temen_par_tierup_pagestate_ptr`]; the Worker writes its base to the
 /// emitted `"pagestate"` global and event operand `b` — the table's coverage — to `"mapped"`).
 /// A run calls exactly ONE of the two enable entries (they share the once-per-run stash).
 /// Same contract otherwise: call on every instance before building vCPUs, same bytes.
 #[no_mangle]
-pub extern "C" fn svm_par_enable_jit_paged(mod_ptr: *const u8, mod_len: usize) -> i32 {
+pub extern "C" fn temen_par_enable_jit_paged(mod_ptr: *const u8, mod_len: usize) -> i32 {
     use std::sync::atomic::Ordering;
     par_install_panic_capture();
     let guard = CodegenGuard::acquire();
@@ -979,17 +980,17 @@ pub extern "C" fn svm_par_enable_jit_paged(mod_ptr: *const u8, mod_len: usize) -
         return TIERUP_RESULT.load(Ordering::Relaxed);
     }
     let result = (|| {
-        // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+        // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
         let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-        let Ok(m) = svm_encode::decode_module(bytes) else {
+        let Ok(m) = temen_encode::decode_module(bytes) else {
             return 0;
         };
-        let page_log2 = svm_interp::host_page_size().trailing_zeros() as u8;
-        let Ok((wasm, emit)) = svm_wasm_jit::compile_module_tierup_paged(&m, true, page_log2)
+        let page_log2 = temen_interp::host_page_size().trailing_zeros() as u8;
+        let Ok((wasm, emit)) = temen_wasm_jit::compile_module_tierup_paged(&m, true, page_log2)
         else {
             return 0;
         };
-        let all_i64 = |ts: &[svm_ir::ValType]| ts.iter().all(|t| *t == svm_ir::ValType::I64);
+        let all_i64 = |ts: &[temen_ir::ValType]| ts.iter().all(|t| *t == temen_ir::ValType::I64);
         let eligible: Vec<bool> = m
             .funcs
             .iter()
@@ -1024,13 +1025,13 @@ fn first_i64(vals: &[Value]) -> i64 {
 /// Compile the module at `[mod_ptr, mod_len)` into a shareable [`bytecode::VcpuProgram`], returned as a
 /// leaked pointer (lives for the run; shared read-only across Workers). Null on decode/unsupported.
 #[no_mangle]
-pub extern "C" fn svm_par_compile(
+pub extern "C" fn temen_par_compile(
     mod_ptr: *const u8,
     mod_len: usize,
 ) -> *mut bytecode::VcpuProgram {
-    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let Ok(m) = svm_encode::decode_module(bytes) else {
+    let Ok(m) = temen_encode::decode_module(bytes) else {
         return core::ptr::null_mut();
     };
     match bytecode::VcpuProgram::compile(&m) {
@@ -1051,7 +1052,7 @@ unsafe fn prog_ref(prog: *mut bytecode::VcpuProgram) -> &'static bytecode::VcpuP
 // `--shared-memory` — lives in that shared memory, so every Worker's instance reads the same value
 // (the same mechanism the `Box::leak`ed `VcpuProgram` uses, but a `static` instead of a JS-threaded
 // pointer). A worker vCPU's `Jit.install`/`uninstall`/`invoke` is then serviced **inside**
-// [`svm_par_run`] against this powerbox + the shared `Domain` — so the JS host services no new events
+// [`temen_par_run`] against this powerbox + the shared `Domain` — so the JS host services no new events
 // (it never sees a JIT op, needs no new glue). During the run the powerbox is read-only (the unit is
 // compiled at setup, before any spawn), so the concurrent `&Host` reads need no lock; the install/
 // dispatch mutation lives in the `Domain`, which is already interior-mutable + thread-safe.
@@ -1067,11 +1068,11 @@ struct ParPowerbox {
 /// The leaked [`ParPowerbox`] pointer (or `0`), shared across Workers via shared linear memory.
 static PAR_PB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// `2^4 = 16` dispatch-table slots — the `Jit` table reservation matched by [`svm_par_compile_jit`]
+/// `2^4 = 16` dispatch-table slots — the `Jit` table reservation matched by [`temen_par_compile_jit`]
 /// and the powerbox grant so guest `install` lands in range (mirrors [`jit_exec`]).
 const PAR_JIT_TABLE_LOG2: u8 = 4;
 
-/// `2^10 = 1024` dispatch-table slots for the on-ramp `Jit` grant — matches svm-run's
+/// `2^10 = 1024` dispatch-table slots for the on-ramp `Jit` grant — matches temen-run's
 /// `CLI_JIT_TABLE_LOG2`. A self-hosted guest (the JACL compiler) binds a staged unit's `Slot` imports
 /// to its own functions by index, so the table must cover the host program's function count (~800).
 /// This is the **minimum**: a guest with more functions needs a bigger table (see
@@ -1098,15 +1099,15 @@ fn tierup_table_log2(n_funcs: usize) -> u8 {
 /// on success, `0` on decode / parse / compile failure. Call **once** (on the main thread) before the
 /// run; the published pointer outlives it.
 #[no_mangle]
-pub extern "C" fn svm_par_powerbox(guest_ptr: *const u8, guest_len: usize) -> i32 {
+pub extern "C" fn temen_par_powerbox(guest_ptr: *const u8, guest_len: usize) -> i32 {
     par_run_gen_bump(); // I22: one bump per run — gates the once-per-run codegen emit (see CodegenGuard)
                         // SAFETY: the host guarantees `[guest_ptr, guest_len)` is a live allocation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(guest_ptr, guest_len) };
-    let Ok(m) = svm_encode::decode_module(bytes) else {
+    let Ok(m) = temen_encode::decode_module(bytes) else {
         return 0;
     };
-    let service = match svm_text::parse_module(JIT_SERVICE) {
-        Ok(s) => svm_encode::encode_module(&s),
+    let service = match temen_text::parse_module(JIT_SERVICE) {
+        Ok(s) => temen_encode::encode_module(&s),
         Err(_) => return 0,
     };
     let mut host = Host::new();
@@ -1129,7 +1130,7 @@ pub extern "C" fn svm_par_powerbox(guest_ptr: *const u8, guest_len: usize) -> i3
 /// Codegen mode: when set, a guest's `Jit.invoke` of the emitted unit surfaces as [`PAR_JIT_INVOKE`]
 /// so the Worker runs it on wasm; else the invoke is serviced in-Rust on the interpreter (as before).
 static PAR_JIT_CODEGEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// The emitted wasm of the run's single §22 unit (stashed once at [`svm_par_powerbox_jit_codegen`]
+/// The emitted wasm of the run's single §22 unit (stashed once at [`temen_par_powerbox_jit_codegen`]
 /// setup; immutable + shared across Workers, each instantiates its own instance). `(null, 0)` ⇒ none.
 static mut JIT_UNIT_WASM: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 
@@ -1153,13 +1154,13 @@ block 0 (v0: f64, v1: f64) {
 
 /// Which §22 unit the codegen powerbox host-compiles + emits: `0` = the i32 [`JIT_SERVICE`] (the
 /// default, matching the interp `#jit` item), `1` = the f64 [`JIT_SERVICE_FLOAT`]. The JS host sets
-/// this (via [`svm_par_jit_codegen_service`]) before the run to exercise int vs float marshalling.
+/// this (via [`temen_par_jit_codegen_service`]) before the run to exercise int vs float marshalling.
 static PAR_JIT_SERVICE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 /// Select the codegen unit for the next run (`0` = i32 service, `1` = f64 service). Set on every
 /// instance (page + each Worker) before enabling codegen, with the same value.
 #[no_mangle]
-pub extern "C" fn svm_par_jit_codegen_service(kind: i32) {
+pub extern "C" fn temen_par_jit_codegen_service(kind: i32) {
     PAR_JIT_SERVICE.store(kind, std::sync::atomic::Ordering::Release);
 }
 
@@ -1174,20 +1175,20 @@ fn codegen_service_src() -> &'static str {
 /// Toggle codegen mode on the current §22 powerbox (`on != 0` ⇒ `Jit.invoke` runs on emitted wasm;
 /// `0` ⇒ the interpreter services it in-Rust). Lets a host run the **same** guest + unit both ways
 /// for a differential (the emitted region must match the interpreter). Set by
-/// [`svm_par_powerbox_jit_codegen`]; a host that wants the interpreter path flips it off.
+/// [`temen_par_powerbox_jit_codegen`]; a host that wants the interpreter path flips it off.
 #[no_mangle]
-pub extern "C" fn svm_par_jit_set_codegen(on: i32) {
+pub extern "C" fn temen_par_jit_set_codegen(on: i32) {
     PAR_JIT_CODEGEN.store(on != 0, std::sync::atomic::Ordering::Release);
 }
 
 /// Enable §22 real codegen for the run: emit the run's unit (the scalar service selected by
 /// [`codegen_service_src`] — i32 [`JIT_SERVICE`] or f64 [`JIT_SERVICE_FLOAT`]) into the shared
 /// [`JIT_UNIT_WASM`] stash and set codegen mode. Every Worker calls this in its setup (like
-/// [`svm_par_enable_jit`] for tier-up), but — since the stash is a single shared copy across Workers
+/// [`temen_par_enable_jit`] for tier-up), but — since the stash is a single shared copy across Workers
 /// (I22) — only the **first** caller of the run actually emits (under `CODEGEN_LOCK`); the rest reuse
 /// it. Returns `1` on success, `0` if the unit is outside the emitter subset.
 #[no_mangle]
-pub extern "C" fn svm_par_enable_jit_codegen() -> i32 {
+pub extern "C" fn temen_par_enable_jit_codegen() -> i32 {
     use std::sync::atomic::Ordering;
     par_install_panic_capture(); // I22: capture a setup-time engine panic's FILE:LINE (not a bare `unreachable`)
     let guard = CodegenGuard::acquire();
@@ -1196,17 +1197,21 @@ pub extern "C" fn svm_par_enable_jit_codegen() -> i32 {
         return JIT_CG_RESULT.load(Ordering::Relaxed);
     }
     let result = (|| {
-        let Ok(service_m) = svm_text::parse_module(codegen_service_src()) else {
+        let Ok(service_m) = temen_text::parse_module(codegen_service_src()) else {
             return 0;
         };
         // The §22 codegen service unit is a fixed, fully-in-subset scalar function, so `compile_jit`
         // emits it whole and wasm-driven (rooted at func 0). Defensively require that — the §22 path
         // runs the unit as emitted `f0`, so an interpreter-driven fallback would be a bug; fail closed.
-        let Ok(svm_wasm_jit::Artifact {
+        let Ok(temen_wasm_jit::Artifact {
             wasm,
-            drive: svm_wasm_jit::DriveMode::WasmDriven { .. },
+            drive: temen_wasm_jit::DriveMode::WasmDriven { .. },
             ..
-        }) = svm_wasm_jit::compile_jit(&service_m, svm_wasm_jit::Shape::Batch { entry: 0 }, true)
+        }) = temen_wasm_jit::compile_jit(
+            &service_m,
+            temen_wasm_jit::Shape::Batch { entry: 0 },
+            true,
+        )
         else {
             return 0;
         };
@@ -1220,25 +1225,25 @@ pub extern "C" fn svm_par_enable_jit_codegen() -> i32 {
     result
 }
 
-/// Build the **shared powerbox** for a §22 **real-codegen** run: like [`svm_par_powerbox`] but the
+/// Build the **shared powerbox** for a §22 **real-codegen** run: like [`temen_par_powerbox`] but the
 /// host-compiled unit is the scalar service selected by [`codegen_service_src`] (i32 [`JIT_SERVICE`]
 /// or f64 [`JIT_SERVICE_FLOAT`]), and its wasm is emitted (via
-/// [`svm_wasm_jit::compile_jit`] with [`svm_wasm_jit::Shape::Batch`], shared memory) + stashed so a guest `Jit.invoke`
+/// [`temen_wasm_jit::compile_jit`] with [`temen_wasm_jit::Shape::Batch`], shared memory) + stashed so a guest `Jit.invoke`
 /// runs the emitted region on the Worker instead of the interpreter. Returns `1` on success, `0` on
 /// decode/parse/compile/emit failure (fail-closed: the caller keeps the interpreter). Call **once**
 /// (on the main thread) before the run.
 #[no_mangle]
-pub extern "C" fn svm_par_powerbox_jit_codegen(guest_ptr: *const u8, guest_len: usize) -> i32 {
+pub extern "C" fn temen_par_powerbox_jit_codegen(guest_ptr: *const u8, guest_len: usize) -> i32 {
     par_run_gen_bump(); // I22: one bump per run — gates the once-per-run codegen emit (see CodegenGuard)
                         // SAFETY: the host guarantees `[guest_ptr, guest_len)` is a live allocation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(guest_ptr, guest_len) };
-    let Ok(m) = svm_encode::decode_module(bytes) else {
+    let Ok(m) = temen_encode::decode_module(bytes) else {
         return 0;
     };
-    let Ok(service_m) = svm_text::parse_module(codegen_service_src()) else {
+    let Ok(service_m) = temen_text::parse_module(codegen_service_src()) else {
         return 0;
     };
-    let service = svm_encode::encode_module(&service_m);
+    let service = temen_encode::encode_module(&service_m);
     let mut host = Host::new();
     let jit = host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), PAR_JIT_TABLE_LOG2);
     host.set_jit_validator(browser_jit_validator);
@@ -1247,9 +1252,9 @@ pub extern "C" fn svm_par_powerbox_jit_codegen(guest_ptr: *const u8, guest_len: 
         _ => return 0,
     };
     // Emit the unit wasm on **this** (page) instance too, so a single-vCPU run driven on the page
-    // works; each Worker emits its own copy via [`svm_par_enable_jit_codegen`] (per-instance stash).
+    // works; each Worker emits its own copy via [`temen_par_enable_jit_codegen`] (per-instance stash).
     // Fail-closed if the unit is outside the emitter subset — then there is nothing to run on wasm.
-    if svm_par_enable_jit_codegen() != 1 {
+    if temen_par_enable_jit_codegen() != 1 {
         return 0;
     }
     let pb = Box::into_raw(Box::new(ParPowerbox { host, jit, code }));
@@ -1260,17 +1265,17 @@ pub extern "C" fn svm_par_powerbox_jit_codegen(guest_ptr: *const u8, guest_len: 
     1
 }
 
-/// Pointer / length of the run's emitted §22 unit wasm (see [`svm_par_powerbox_jit_codegen`]).
+/// Pointer / length of the run's emitted §22 unit wasm (see [`temen_par_powerbox_jit_codegen`]).
 #[no_mangle]
-pub extern "C" fn svm_par_jit_unit_wasm_ptr() -> *const u8 {
+pub extern "C" fn temen_par_jit_unit_wasm_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(JIT_UNIT_WASM)).0 }
 }
 #[no_mangle]
-pub extern "C" fn svm_par_jit_unit_wasm_len() -> usize {
+pub extern "C" fn temen_par_jit_unit_wasm_len() -> usize {
     unsafe { (*core::ptr::addr_of!(JIT_UNIT_WASM)).1 }
 }
 
-/// Borrow the published powerbox (`None` until [`svm_par_powerbox`] ran). The pointer is published with
+/// Borrow the published powerbox (`None` until [`temen_par_powerbox`] ran). The pointer is published with
 /// `Release`; this `Acquire` load pairs with it so the `Host` it built is visible to this Worker.
 fn par_pb() -> Option<&'static ParPowerbox> {
     let p = PAR_PB.load(std::sync::atomic::Ordering::Acquire) as *const ParPowerbox;
@@ -1285,7 +1290,7 @@ fn par_resolve_unit(
     pb: &ParPowerbox,
     handle: i32,
     code: i32,
-) -> Result<std::sync::Arc<[svm_ir::Func]>, Trap> {
+) -> Result<std::sync::Arc<[temen_ir::Func]>, Trap> {
     let domain = pb.host.resolve_jit_domain(handle)?;
     let (cd, cu) = pb.host.resolve_jit_code(code)?;
     if cd != domain {
@@ -1306,7 +1311,7 @@ fn par_resolve_unit(
 /// The §14 run recipe: `Instantiator` authority over `[0, win_size)` + an optional `Module` grant.
 struct ParInstCfg {
     win_size: u64,
-    module: Option<svm_ir::Module>,
+    module: Option<temen_ir::Module>,
 }
 
 /// The leaked [`ParInstCfg`] pointer (or `0`), shared across Workers via shared linear memory.
@@ -1316,14 +1321,18 @@ static PAR_INST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize
 /// `[mod_ptr, mod_len)` is decoded as the **granted module** for `instantiate_module` (`0` len ⇒ no
 /// grant). Returns `1`, or `0` on a bad module. Call once (on the main thread) before the run.
 #[no_mangle]
-pub extern "C" fn svm_par_powerbox_inst(win_size: u64, mod_ptr: *const u8, mod_len: usize) -> i32 {
+pub extern "C" fn temen_par_powerbox_inst(
+    win_size: u64,
+    mod_ptr: *const u8,
+    mod_len: usize,
+) -> i32 {
     par_run_gen_bump(); // I22: one bump per run — gates the once-per-run codegen emit (see CodegenGuard)
     let module = if mod_len == 0 {
         None
     } else {
         // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live allocation it just filled.
         let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-        match svm_encode::decode_module(bytes) {
+        match temen_encode::decode_module(bytes) {
             Ok(m) => Some(m),
             Err(_) => return 0,
         }
@@ -1337,7 +1346,7 @@ pub extern "C" fn svm_par_powerbox_inst(win_size: u64, mod_ptr: *const u8, mod_l
     1
 }
 
-/// Borrow the published §14 recipe (`None` until [`svm_par_powerbox_inst`] ran). Leaked + read-only,
+/// Borrow the published §14 recipe (`None` until [`temen_par_powerbox_inst`] ran). Leaked + read-only,
 /// as [`par_pb`].
 fn par_inst() -> Option<&'static ParInstCfg> {
     let p = PAR_INST.load(std::sync::atomic::Ordering::Acquire) as *const ParInstCfg;
@@ -1355,18 +1364,18 @@ fn par_inst() -> Option<&'static ParInstCfg> {
 
 /// The emitted wasm of the run's granted §14 unit (per-instance stash; `(null, 0)` ⇒ none).
 static mut INST_UNIT_WASM: (*mut u8, usize) = (core::ptr::null_mut(), 0);
-/// The granted unit's per-function eligibility ([`svm_wasm_jit::compile_nested`]'s `emitted` bitmap):
+/// The granted unit's per-function eligibility ([`temen_wasm_jit::compile_nested`]'s `emitted` bitmap):
 /// `f{i}` is emitted + safe to call directly. A confined child whose entry is eligible runs on wasm;
 /// else it interprets.
 static mut INST_ELIGIBLE: Option<Vec<bool>> = None;
 
 /// Enable §14 real codegen for the run: emit the granted unit ([`ParInstCfg::module`]) to wasm and
 /// stash it + the per-function eligibility. Called by each Worker before it builds a confined child
-/// (like [`svm_par_enable_jit_codegen`]), but — the stash is a single shared copy across Workers (I22)
+/// (like [`temen_par_enable_jit_codegen`]), but — the stash is a single shared copy across Workers (I22)
 /// — only the **first** caller of the run emits (under `CODEGEN_LOCK`); the rest reuse it. Returns
 /// `1` on success, `0` if there is no granted module or it is outside the emitter subset.
 #[no_mangle]
-pub extern "C" fn svm_par_enable_inst_codegen() -> i32 {
+pub extern "C" fn temen_par_enable_inst_codegen() -> i32 {
     use std::sync::atomic::Ordering;
     par_install_panic_capture(); // I22: capture a setup-time engine panic's FILE:LINE (not a bare `unreachable`)
     let guard = CodegenGuard::acquire();
@@ -1387,18 +1396,18 @@ pub extern "C" fn svm_par_enable_inst_codegen() -> i32 {
         // Worker via the `env.instantiate`/`env.join`/`env.thread_*` imports (serviced through the same
         // confined-child completion-slot protocol as the interpreter path); a fiber-bearing unit falls
         // to an interpreter-driven tier-up. Either way `emitted[i]` is the sound "safe to call `f{i}`
-        // directly" signal the Worker gates on (`svm_par_inst_eligible`): a fiber reachable from the
+        // directly" signal the Worker gates on (`temen_par_inst_eligible`): a fiber reachable from the
         // entry drops it from `emitted` (the tier-up fixpoint), and a `thread.spawn`ed fiber runs in its
         // own spawned interpreter vCPU — never across the emitted frame. The Worker offers the whole
         // nested import set unconditionally, so the uniform layout `compile_nested` emits just works.
         // ADDRESS_SPACE wrappers are NOT outlined here (the browser's `call_interp` carries no powerbox
         // yet), so a `sub`/`page_size` entry stays interpreter-driven; a `map`/`unmap`/`protect` unit
         // emits nothing and interprets wholly (mask-only confinement can't honor page state).
-        let Ok(svm_wasm_jit::Artifact {
+        let Ok(temen_wasm_jit::Artifact {
             wasm,
             emitted: eligible,
             ..
-        }) = svm_wasm_jit::compile_nested(m, true)
+        }) = temen_wasm_jit::compile_nested(m, true)
         else {
             return 0;
         };
@@ -1414,21 +1423,21 @@ pub extern "C" fn svm_par_enable_inst_codegen() -> i32 {
     result
 }
 
-/// Pointer / length of this instance's emitted §14 unit wasm (see [`svm_par_enable_inst_codegen`]).
+/// Pointer / length of this instance's emitted §14 unit wasm (see [`temen_par_enable_inst_codegen`]).
 #[no_mangle]
-pub extern "C" fn svm_par_inst_unit_wasm_ptr() -> *const u8 {
+pub extern "C" fn temen_par_inst_unit_wasm_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(INST_UNIT_WASM)).0 }
 }
 #[no_mangle]
-pub extern "C" fn svm_par_inst_unit_wasm_len() -> usize {
+pub extern "C" fn temen_par_inst_unit_wasm_len() -> usize {
     unsafe { (*core::ptr::addr_of!(INST_UNIT_WASM)).1 }
 }
 
 /// Whether the granted unit's function `entry` is emitted (safe to run `f{entry}` on wasm). `0` when
 /// codegen isn't enabled, `entry` is out of range, or that function is out of the emitter subset.
 #[no_mangle]
-pub extern "C" fn svm_par_inst_eligible(entry: u32) -> i32 {
-    // SAFETY: single-reader per instance; set by `svm_par_enable_inst_codegen`.
+pub extern "C" fn temen_par_inst_eligible(entry: u32) -> i32 {
+    // SAFETY: single-reader per instance; set by `temen_par_enable_inst_codegen`.
     let e = unsafe { (*core::ptr::addr_of!(INST_ELIGIBLE)).as_ref() };
     e.and_then(|v| v.get(entry as usize))
         .copied()
@@ -1438,7 +1447,7 @@ pub extern "C" fn svm_par_inst_eligible(entry: u32) -> i32 {
 /// The granted unit's `entry` param count (1 or 2 — the instantiator/address-space cap handles a pure
 /// unit ignores). The Worker passes this many `0` args to the emitted `f{entry}`. `0` if no recipe.
 #[no_mangle]
-pub extern "C" fn svm_par_inst_nparams(entry: u32) -> usize {
+pub extern "C" fn temen_par_inst_nparams(entry: u32) -> usize {
     par_inst()
         .and_then(|c| c.module.as_ref())
         .and_then(|m| m.funcs.get(entry as usize))
@@ -1465,11 +1474,11 @@ static PAR_IO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::
 
 /// Publish the run's **shared I/O powerbox**: a fresh `Host` granted a `Stream(Out)`, wrapped in the
 /// `Mutex` every vCPU will dispatch `cap.call` through. The root is seeded with `[out_handle]`
-/// (`svm_par_root`); read the accumulated stdout back after the run via [`svm_par_stdout_len`] +
-/// [`svm_par_stdout_ptr`]. Call once (on the main thread) before the run; last-published run recipe
+/// (`temen_par_root`); read the accumulated stdout back after the run via [`temen_par_stdout_len`] +
+/// [`temen_par_stdout_ptr`]. Call once (on the main thread) before the run; last-published run recipe
 /// wins (the §22/§14 recipes are cleared, and vice versa).
 #[no_mangle]
-pub extern "C" fn svm_par_powerbox_io() -> i32 {
+pub extern "C" fn temen_par_powerbox_io() -> i32 {
     par_run_gen_bump(); // I22: one bump per run — gates the once-per-run codegen emit (see CodegenGuard)
     let mut host = Host::new();
     let out = host.grant_stream(StreamRole::Out);
@@ -1489,7 +1498,7 @@ pub extern "C" fn svm_par_powerbox_io() -> i32 {
 /// powerbox run (the playground can run modes in any order) needs this explicit "none" publish, or
 /// the stale recipe would seed the new root with args its entry doesn't take.
 #[no_mangle]
-pub extern "C" fn svm_par_powerbox_none() {
+pub extern "C" fn temen_par_powerbox_none() {
     par_run_gen_bump(); // I22: one bump per run — gates the once-per-run codegen emit (see CodegenGuard)
     PAR_PB.store(0, std::sync::atomic::Ordering::Release);
     PAR_INST.store(0, std::sync::atomic::Ordering::Release);
@@ -1498,7 +1507,7 @@ pub extern "C" fn svm_par_powerbox_none() {
     PAR_JIT_CODEGEN.store(false, std::sync::atomic::Ordering::Release);
 }
 
-/// Borrow the published I/O powerbox (`None` until [`svm_par_powerbox_io`] ran). Leaked; interior
+/// Borrow the published I/O powerbox (`None` until [`temen_par_powerbox_io`] ran). Leaked; interior
 /// mutability is the `Mutex` (cross-Worker-safe on wasm atomics, like the `Domain`'s `ModuleSource`).
 fn par_io() -> Option<&'static ParIoCfg> {
     let p = PAR_IO.load(std::sync::atomic::Ordering::Acquire) as *const ParIoCfg;
@@ -1528,16 +1537,16 @@ static PAR_JIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize:
 /// Publish the runtime-`Jit.compile` powerbox: a fresh `Host` granted `Jit` (memory-match precondition
 /// from the guest's declared memory) with [`browser_jit_validator`] + [`browser_jit_wasm_emitter`]
 /// installed, wrapped in the shared `Mutex` the vCPU dispatches `cap.call` through. The root is seeded
-/// `[jit]` ([`svm_par_root`]); the guest builds an IR blob, `compile`s it (emitting wasm), and
-/// `invoke`s it on the emitted region. Codegen on by default (flip with [`svm_par_jit_set_codegen`] to
+/// `[jit]` ([`temen_par_root`]); the guest builds an IR blob, `compile`s it (emitting wasm), and
+/// `invoke`s it on the emitted region. Codegen on by default (flip with [`temen_par_jit_set_codegen`] to
 /// run the interpreter path for a differential). Call once (on the main thread) before the run; the
 /// other run recipes are cleared (last-published-wins). Returns `1`, or `0` on a bad guest module.
 #[no_mangle]
-pub extern "C" fn svm_par_powerbox_jit_runtime(guest_ptr: *const u8, guest_len: usize) -> i32 {
+pub extern "C" fn temen_par_powerbox_jit_runtime(guest_ptr: *const u8, guest_len: usize) -> i32 {
     par_run_gen_bump(); // I22: one bump per run
                         // SAFETY: the host guarantees `[guest_ptr, guest_len)` is a live allocation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(guest_ptr, guest_len) };
-    let Ok(m) = svm_encode::decode_module(bytes) else {
+    let Ok(m) = temen_encode::decode_module(bytes) else {
         return 0;
     };
     let mut host = Host::new();
@@ -1556,7 +1565,7 @@ pub extern "C" fn svm_par_powerbox_jit_runtime(guest_ptr: *const u8, guest_len: 
     1
 }
 
-/// Borrow the published runtime-`Jit.compile` powerbox (`None` until [`svm_par_powerbox_jit_runtime`]).
+/// Borrow the published runtime-`Jit.compile` powerbox (`None` until [`temen_par_powerbox_jit_runtime`]).
 fn par_jit_rt() -> Option<&'static ParJitCfg> {
     let p = PAR_JIT.load(std::sync::atomic::Ordering::Acquire) as *const ParJitCfg;
     // SAFETY: once published the powerbox is leaked (never freed); all access is via the `Mutex`.
@@ -1570,7 +1579,13 @@ fn par_resolve_unit_rt(
     h: &Host,
     handle: i32,
     code: i32,
-) -> Result<(std::sync::Arc<[svm_ir::Func]>, Option<std::sync::Arc<[u8]>>), Trap> {
+) -> Result<
+    (
+        std::sync::Arc<[temen_ir::Func]>,
+        Option<std::sync::Arc<[u8]>>,
+    ),
+    Trap,
+> {
     let domain = h.resolve_jit_domain(handle)?;
     let (cd, cu) = h.resolve_jit_code(code)?;
     if cd != domain {
@@ -1584,7 +1599,7 @@ fn par_resolve_unit_rt(
 /// empty), shared across every Worker (one arena / one set of statics behind the shared memory). The
 /// shared interpreter `Domain` dispatch table is atomics-in-memory but has no slot→emitted-wasm link;
 /// this records it at the (Rust-serviced) `install`/`uninstall` sites so a Worker can rebuild its own
-/// `WebAssembly.Table` from `(slot → code → svm_par_jit_code_wasm_by_handle)`. Sized lazily to the
+/// `WebAssembly.Table` from `(slot → code → temen_par_jit_code_wasm_by_handle)`. Sized lazily to the
 /// grant reservation `1 << PAR_JIT_TABLE_LOG2`.
 static PAR_JIT_SLOT_CODE: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
 
@@ -1619,31 +1634,31 @@ fn par_jit_b2() -> bool {
 /// Toggle Model-B2 emission for the runtime-compile tier (see [`PAR_JIT_B2`]). The JS host sets this
 /// on iff it provides each Worker a shared `WebAssembly.Table` import.
 #[no_mangle]
-pub extern "C" fn svm_par_jit_set_b2(on: i32) {
+pub extern "C" fn temen_par_jit_set_b2(on: i32) {
     PAR_JIT_B2.store(on != 0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The §22 `Jit` dispatch-table reservation (`log2` of the slot count) — the size the JS host makes
 /// each per-Worker `WebAssembly.Table`, matching the emitted `call_indirect` mask `idx & (2^n - 1)`.
 #[no_mangle]
-pub extern "C" fn svm_par_jit_table_log2() -> u32 {
+pub extern "C" fn temen_par_jit_table_log2() -> u32 {
     PAR_JIT_TABLE_LOG2 as u32
 }
 
 /// The code handle installed at dispatch-table `slot` (or `-1` if empty) — the mirror map a Worker
 /// reads to rebuild its per-Worker `WebAssembly.Table` (§22 B2 cross-Worker).
 #[no_mangle]
-pub extern "C" fn svm_par_jit_slot_code(slot: u32) -> i32 {
+pub extern "C" fn temen_par_jit_slot_code(slot: u32) -> i32 {
     let v = PAR_JIT_SLOT_CODE.lock().unwrap_or_else(|e| e.into_inner());
     v.get(slot as usize).copied().unwrap_or(-1)
 }
 
 /// Emitted-wasm length for **any** code handle in the runtime domain (not just the pending invoke's),
 /// so a Worker can instantiate a slot's unit it hasn't itself invoked. `0` if none. The bytes (via
-/// [`svm_par_jit_code_wasm_by_handle_ptr`]) live in the shared host's heap = shared linear memory,
+/// [`temen_par_jit_code_wasm_by_handle_ptr`]) live in the shared host's heap = shared linear memory,
 /// held for the process, so the returned pointer stays valid.
 #[no_mangle]
-pub extern "C" fn svm_par_jit_code_wasm_by_handle_len(handle: i32) -> usize {
+pub extern "C" fn temen_par_jit_code_wasm_by_handle_len(handle: i32) -> usize {
     par_jit_rt()
         .and_then(|cfg| {
             let g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
@@ -1655,9 +1670,9 @@ pub extern "C" fn svm_par_jit_code_wasm_by_handle_len(handle: i32) -> usize {
         .unwrap_or(0)
 }
 
-/// Pointer to the emitted-wasm for `handle` (see [`svm_par_jit_code_wasm_by_handle_len`]).
+/// Pointer to the emitted-wasm for `handle` (see [`temen_par_jit_code_wasm_by_handle_len`]).
 #[no_mangle]
-pub extern "C" fn svm_par_jit_code_wasm_by_handle_ptr(handle: i32) -> *const u8 {
+pub extern "C" fn temen_par_jit_code_wasm_by_handle_ptr(handle: i32) -> *const u8 {
     par_jit_rt()
         .and_then(|cfg| {
             let g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
@@ -1671,8 +1686,8 @@ pub extern "C" fn svm_par_jit_code_wasm_by_handle_ptr(handle: i32) -> *const u8 
 
 /// Live-vCPU counter across Workers — the browser path's anti-bomb **backstop** (the native drivers
 /// give the spawner a clean `ThreadFault`; here a construction past the cap returns null and the JS
-/// host fails the run — cruder, but it bounds Worker creation). Incremented by the `svm_par_*` vCPU
-/// constructors, decremented by [`svm_par_free`].
+/// host fails the run — cruder, but it bounds Worker creation). Incremented by the `temen_par_*` vCPU
+/// constructors, decremented by [`temen_par_free`].
 static PAR_LIVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// Far above any legitimate fan-out (a tab with 256 live Workers is already pathological), far below
 /// a Worker bomb's ambition.
@@ -1688,21 +1703,21 @@ fn par_vcpu_admit() -> bool {
     true
 }
 
-/// Un-admit a vCPU that failed to construct (the success path decrements via [`svm_par_free`]).
+/// Un-admit a vCPU that failed to construct (the success path decrements via [`temen_par_free`]).
 fn par_vcpu_retire() {
     PAR_LIVE.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
 }
 
-/// Like [`svm_par_compile`], but reserve the `Jit` dispatch table (matching the powerbox grant) so a
-/// guest `install` lands in range. Use this (not [`svm_par_compile`]) for a §22-JIT run.
+/// Like [`temen_par_compile`], but reserve the `Jit` dispatch table (matching the powerbox grant) so a
+/// guest `install` lands in range. Use this (not [`temen_par_compile`]) for a §22-JIT run.
 #[no_mangle]
-pub extern "C" fn svm_par_compile_jit(
+pub extern "C" fn temen_par_compile_jit(
     mod_ptr: *const u8,
     mod_len: usize,
 ) -> *mut bytecode::VcpuProgram {
-    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let Ok(m) = svm_encode::decode_module(bytes) else {
+    let Ok(m) = temen_encode::decode_module(bytes) else {
         return core::ptr::null_mut();
     };
     match bytecode::VcpuProgram::compile_with_jit_table(&m, PAR_JIT_TABLE_LOG2) {
@@ -1714,7 +1729,7 @@ pub extern "C" fn svm_par_compile_jit(
 /// Build the **root** vCPU (function `func`) over the shared window `[win_ptr, win_size)`; it seeds +
 /// data-initialises the window (the once). Returns a boxed [`ParVcpu`] pointer, null on a bad func.
 #[no_mangle]
-pub extern "C" fn svm_par_root(
+pub extern "C" fn temen_par_root(
     prog: *mut bytecode::VcpuProgram,
     win_ptr: *mut u8,
     win_size: usize,
@@ -1724,13 +1739,14 @@ pub extern "C" fn svm_par_root(
         return core::ptr::null_mut();
     }
     // SAFETY: the host guarantees `[win_ptr, win_size)` is a live shared window for the run.
-    let back = std::sync::Arc::new(unsafe { svm_interp::Region::shared(win_ptr, win_size as u64) });
+    let back =
+        std::sync::Arc::new(unsafe { temen_interp::Region::shared(win_ptr, win_size as u64) });
     // A §14 run builds the root's **own** powerbox from the published recipe (`Instantiator` +
     // optional `Module` grant; §14 resolves authority in-Vm, so the grants must live in the vCPU's
     // host) and seeds the root with the handles. A §22-JIT run seeds `(jit, code)` from the shared
     // powerbox; a 4d I/O run attaches the shared `Mutex<Host>` and seeds `[out]`; a plain run gets
     // no args. Signatures unchanged either way — the JS host just calls the matching
-    // `svm_par_powerbox*` first.
+    // `temen_par_powerbox*` first.
     if let Some(cfg) = par_inst() {
         let mut host = Host::new();
         let inst = host.grant_instantiator(0, cfg.win_size);
@@ -1799,7 +1815,7 @@ pub extern "C" fn svm_par_root(
 /// `module` is the spawning frame's module from the `PAR_SPAWN` event (`ev_a >> 32`) — `func`
 /// resolves there and the child's root frame starts there (module-0 for plain guests).
 #[no_mangle]
-pub extern "C" fn svm_par_child(
+pub extern "C" fn temen_par_child(
     prog: *mut bytecode::VcpuProgram,
     win_ptr: *mut u8,
     win_size: usize,
@@ -1821,14 +1837,15 @@ pub extern "C" fn svm_par_child(
     }
     let sl = win_size.trailing_zeros() as u8;
     // SAFETY: the host guarantees `[win_ptr, win_size)` is the same live shared window.
-    let back = std::sync::Arc::new(unsafe { svm_interp::Region::shared(win_ptr, win_size as u64) });
+    let back =
+        std::sync::Arc::new(unsafe { temen_interp::Region::shared(win_ptr, win_size as u64) });
     let args = [Value::I64(sp), Value::I64(arg)];
     // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
     match bytecode::Vcpu::new_child_sized(unsafe { prog_ref(prog) }, module, func, &args, back, sl)
     {
         Ok(inner) => {
             // A §22 **runtime-compile** run shares the JIT `Mutex<Host>` across every vCPU (mirroring
-            // the root, `svm_par_root`), so a worker `thread.spawn`ed onto this Worker can `compile` /
+            // the root, `temen_par_root`), so a worker `thread.spawn`ed onto this Worker can `compile` /
             // `invoke` against the *same* domain: a unit compiled on any Worker is invokable here, and
             // its emitted bytes (in the shared host's heap = shared linear memory) are read locally and
             // instantiated per-Worker. Concurrent `compile`s serialize on the `Mutex` (DESIGN.md §22).
@@ -1857,7 +1874,7 @@ pub extern "C" fn svm_par_child(
 /// built in-engine ([`bytecode::Vcpu::new_confined_child`]) — no authority crosses JS. Called on the
 /// child's Worker. Null on a bad module/entry.
 #[no_mangle]
-pub extern "C" fn svm_par_child_confined(
+pub extern "C" fn temen_par_child_confined(
     prog: *mut bytecode::VcpuProgram,
     carve_ptr: *mut u8,
     size_log2: u32,
@@ -1871,7 +1888,7 @@ pub extern "C" fn svm_par_child_confined(
     // SAFETY: the host guarantees the carve is inside the parent's live window (the engine validated
     // it before surfacing the event); aliasing views of the shared memory are the §13 data plane.
     let back =
-        std::sync::Arc::new(unsafe { svm_interp::Region::shared(carve_ptr, 1u64 << size_log2) });
+        std::sync::Arc::new(unsafe { temen_interp::Region::shared(carve_ptr, 1u64 << size_log2) });
     // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
     // (No shared-host attach: a §14 confined child's powerbox is its own attenuated one, built
     // in-engine — its capability set never includes the run's I/O grants.)
@@ -1894,25 +1911,25 @@ pub extern "C" fn svm_par_child_confined(
 /// Pointer / length of the accumulated stdout in the run's shared I/O powerbox (4d). Call `len`
 /// **first** — it snapshots the buffer under the powerbox lock into a stable stash `ptr` then reads —
 /// after the run completes (the root's `done`; a mid-run call sees a prefix). `0` when no
-/// [`svm_par_powerbox_io`] was published.
+/// [`temen_par_powerbox_io`] was published.
 #[no_mangle]
-pub extern "C" fn svm_par_stdout_len() -> usize {
+pub extern "C" fn temen_par_stdout_len() -> usize {
     let Some(io) = par_io() else { return 0 };
     let bytes = {
         let g = io.host.lock().unwrap_or_else(|e| e.into_inner());
         g.stdout.clone()
     };
     // SAFETY: the stash slot is only touched from the main thread (the JS host reads results after
-    // the run), matching the `svm_run_pb` accessors' single-reader contract.
+    // the run), matching the `temen_run_pb` accessors' single-reader contract.
     unsafe { stash(&mut *core::ptr::addr_of_mut!(PAR_OUT), bytes) };
     unsafe { (*core::ptr::addr_of!(PAR_OUT)).1 }
 }
 #[no_mangle]
-pub extern "C" fn svm_par_stdout_ptr() -> *const u8 {
+pub extern "C" fn temen_par_stdout_ptr() -> *const u8 {
     // SAFETY: as above — main-thread single-reader stash.
     unsafe { (*core::ptr::addr_of!(PAR_OUT)).0 }
 }
-/// The stashed 4d stdout snapshot (`svm_par_stdout_len` fills it; `_ptr` reads it).
+/// The stashed 4d stdout snapshot (`temen_par_stdout_len` fills it; `_ptr` reads it).
 static mut PAR_OUT: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 
 // ---- I22 diagnostics: capture a Rust panic's location+message ----------------------------------
@@ -1954,24 +1971,24 @@ fn par_install_panic_capture() {
     });
 }
 
-/// Pointer to the captured-panic buffer (read `svm_par_last_panic_len` bytes). Valid after any trap.
+/// Pointer to the captured-panic buffer (read `temen_par_last_panic_len` bytes). Valid after any trap.
 #[no_mangle]
-pub extern "C" fn svm_par_last_panic_ptr() -> *const u8 {
+pub extern "C" fn temen_par_last_panic_ptr() -> *const u8 {
     core::ptr::addr_of!(PAR_PANIC_BUF) as *const u8
 }
 /// Length of the last captured panic message (0 = none captured this image).
 #[no_mangle]
-pub extern "C" fn svm_par_last_panic_len() -> usize {
+pub extern "C" fn temen_par_last_panic_len() -> usize {
     PAR_PANIC_LEN.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Advance the vCPU until it finishes, traps, or hits a host-serviced event; returns a `PAR_*` code.
-/// The host reads operands via `svm_par_ev_a`–`d`, services the event, calls the matching `deliver`,
-/// then calls `svm_par_run` again.
+/// The host reads operands via `temen_par_ev_a`–`d`, services the event, calls the matching `deliver`,
+/// then calls `temen_par_run` again.
 #[no_mangle]
-pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
+pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
     par_install_panic_capture(); // I22: so a mid-run engine panic self-identifies (FILE:LINE) not a bare `unreachable`
-                                 // SAFETY: `v` is a live `ParVcpu` from `svm_par_root`/`svm_par_child`, owned by this Worker.
+                                 // SAFETY: `v` is a live `ParVcpu` from `temen_par_root`/`temen_par_child`, owned by this Worker.
     let v = unsafe { &mut *v };
     // Loop so §22 JIT events (serviced in-Rust against the shared powerbox) never surface to the JS
     // host — it only ever sees the multi-vCPU events `spawn`/`join`/`wait`/`notify` (+ `done`/`trap`).
@@ -1983,7 +2000,7 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
             }
             bytecode::VcpuEvent::Trapped(_) => return PAR_TRAP,
             // wasm-JIT tier-up: hand the func index + marshalled args to the Worker, which runs the
-            // emitted `f{func}` and delivers the results (`svm_par_deliver_tierup`) or a trap.
+            // emitted `f{func}` and delivers the results (`temen_par_deliver_tierup`) or a trap.
             // Operand `b` carries the window's scalar committed extent — the Worker writes it to the
             // emitted module's `"mapped"` global before the call, so the emitted bounds check admits
             // exactly what the interpreter would over a `vm_map`-grown window (#717 host sync).
@@ -1993,7 +2010,7 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
                     // #750: rebuild the page-state table from the live map (frozen while emitted
                     // code runs); operand `b` becomes the table's COVERAGE — the value the Worker
                     // writes to the emitted `"mapped"` global — and the table bytes are read via
-                    // `svm_par_tierup_pagestate_ptr`/`_len` (their address in this module's linear
+                    // `temen_par_tierup_pagestate_ptr`/`_len` (their address in this module's linear
                     // memory IS the `"pagestate"` global's value: one shared memory, zero copies).
                     let info = v.inner.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
                     let (table, cover) = bytecode::build_pagestate_table(&info);
@@ -2085,7 +2102,7 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
             } => {
                 // Scalar arg/result type codes (i32/i64/f32/f64) the JS host marshals each i64 slot
                 // by; `None` if any operand is v128 (no lane marshalling — the unit stays on interp).
-                let codes = |ts: &[svm_ir::ValType]| {
+                let codes = |ts: &[temen_ir::ValType]| {
                     ts.iter()
                         .map(|t| scalar_type_code(*t))
                         .collect::<Option<Vec<u8>>>()
@@ -2101,7 +2118,7 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
                 if let Some(cfg) = par_jit_rt() {
                     // §22 **runtime-compile** path: the guest compiled its *own* unit into the shared
                     // host, its wasm emitted there; run it on that per-unit wasm (JS instantiates it
-                    // keyed by the code handle, reading `svm_par_jit_code_wasm_ptr`/`_len`). Authority
+                    // keyed by the code handle, reading `temen_par_jit_code_wasm_ptr`/`_len`). Authority
                     // resolves through the same host — a forged / cross-domain handle traps identically.
                     // Codegen off / v128 / a unit outside the emitter subset ⇒ the interpreter services it.
                     let resolved = {
@@ -2135,7 +2152,7 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
                         None => return PAR_TRAP,
                         Some(pb) => {
                             let codegen = par_jit_codegen()
-                                && svm_par_jit_unit_wasm_len() > 0
+                                && temen_par_jit_unit_wasm_len() > 0
                                 && ptypes.is_some()
                                 && rtypes.is_some()
                                 && mapped.is_some();
@@ -2160,7 +2177,7 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
             }
             // §14 confined executor child (THREADS.md 4c-domain §14-D2): all authority-bearing work
             // already happened in-Vm — the operands are inert integers the JS host shuttles into a
-            // new Worker running `svm_par_child_confined` over `[win + carve, +2^size_log2)`, joined
+            // new Worker running `temen_par_child_confined` over `[win + carve, +2^size_log2)`, joined
             // through the same completion-slot protocol as `PAR_SPAWN`.
             bytecode::VcpuEvent::Instantiate {
                 module,
@@ -2184,7 +2201,7 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
 
 macro_rules! par_ev_getter {
     ($name:ident, $field:ident) => {
-        /// Read an operand of the last [`svm_par_run`] event.
+        /// Read an operand of the last [`temen_par_run`] event.
         #[no_mangle]
         pub extern "C" fn $name(v: *mut ParVcpu) -> i64 {
             // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
@@ -2192,29 +2209,29 @@ macro_rules! par_ev_getter {
         }
     };
 }
-par_ev_getter!(svm_par_ev_a, a);
-par_ev_getter!(svm_par_ev_b, b);
-par_ev_getter!(svm_par_ev_c, c);
-par_ev_getter!(svm_par_ev_d, d);
+par_ev_getter!(temen_par_ev_a, a);
+par_ev_getter!(temen_par_ev_b, b);
+par_ev_getter!(temen_par_ev_c, c);
+par_ev_getter!(temen_par_ev_d, d);
 
 /// Deliver a `thread.spawn` handle (after `PAR_SPAWN`).
 #[no_mangle]
-pub extern "C" fn svm_par_deliver_handle(v: *mut ParVcpu, handle: i32) {
+pub extern "C" fn temen_par_deliver_handle(v: *mut ParVcpu, handle: i32) {
     // SAFETY: `v` is a live `ParVcpu` awaiting a delivery.
     unsafe { (*v).inner.deliver_handle(handle) };
 }
 
 /// Deliver a `memory.wait` code / `memory.notify` count (after `PAR_WAIT` / `PAR_NOTIFY`).
 #[no_mangle]
-pub extern "C" fn svm_par_deliver_code(v: *mut ParVcpu, code: i32) {
+pub extern "C" fn temen_par_deliver_code(v: *mut ParVcpu, code: i32) {
     // SAFETY: `v` is a live `ParVcpu` awaiting a delivery.
     unsafe { (*v).inner.deliver_code(code) };
 }
 
 /// Deliver a joined child's result (after `PAR_JOIN`): `val` is its first return value, or — if
-/// `is_trap != 0` — the child trapped and the joiner traps on its next `svm_par_run`.
+/// `is_trap != 0` — the child trapped and the joiner traps on its next `temen_par_run`.
 #[no_mangle]
-pub extern "C" fn svm_par_deliver_join(v: *mut ParVcpu, val: i64, is_trap: i32) {
+pub extern "C" fn temen_par_deliver_join(v: *mut ParVcpu, val: i64, is_trap: i32) {
     // SAFETY: `v` is a live `ParVcpu` awaiting a delivery.
     let v = unsafe { &mut *v };
     if is_trap != 0 {
@@ -2225,18 +2242,18 @@ pub extern "C" fn svm_par_deliver_join(v: *mut ParVcpu, val: i64, is_trap: i32) 
 }
 
 /// Pointer to the marshalled tier-up args (raw i64 slots) after a [`PAR_TIERUP`] event — the Worker
-/// reads `svm_par_tierup_argv_len` of them to call the emitted `f{func}`.
+/// reads `temen_par_tierup_argv_len` of them to call the emitted `f{func}`.
 #[no_mangle]
-pub extern "C" fn svm_par_tierup_argv_ptr(v: *mut ParVcpu) -> *const i64 {
+pub extern "C" fn temen_par_tierup_argv_ptr(v: *mut ParVcpu) -> *const i64 {
     // SAFETY: `v` is a live `ParVcpu`; the buffer lives until the next event overwrites it.
     unsafe { (*v).tierup_argv.as_ptr() }
 }
 
 /// #750: the pending [`PAR_TIERUP`]'s page-state table base (paged runs only — see
-/// [`svm_par_enable_jit_paged`]). The bytes live in this module's linear memory, so this pointer
+/// [`temen_par_enable_jit_paged`]). The bytes live in this module's linear memory, so this pointer
 /// is exactly the value the Worker writes to the emitted module's `"pagestate"` global.
 #[no_mangle]
-pub extern "C" fn svm_par_tierup_pagestate_ptr(v: *mut ParVcpu) -> *const u8 {
+pub extern "C" fn temen_par_tierup_pagestate_ptr(v: *mut ParVcpu) -> *const u8 {
     // SAFETY: `v` is a live `ParVcpu`; the buffer lives until the next event overwrites it.
     unsafe { (*v).pagestate.as_ptr() }
 }
@@ -2244,14 +2261,14 @@ pub extern "C" fn svm_par_tierup_pagestate_ptr(v: *mut ParVcpu) -> *const u8 {
 /// Byte length of the pending tier-up's page-state table (`0` on an unpaged run — the Worker
 /// skips the `"pagestate"` write, which the unpaged module doesn't export anyway).
 #[no_mangle]
-pub extern "C" fn svm_par_tierup_pagestate_len(v: *mut ParVcpu) -> usize {
+pub extern "C" fn temen_par_tierup_pagestate_len(v: *mut ParVcpu) -> usize {
     // SAFETY: `v` is a live `ParVcpu`.
     unsafe { (*v).pagestate.len() }
 }
 
-/// Number of tier-up args (see [`svm_par_tierup_argv_ptr`]).
+/// Number of tier-up args (see [`temen_par_tierup_argv_ptr`]).
 #[no_mangle]
-pub extern "C" fn svm_par_tierup_argv_len(v: *mut ParVcpu) -> usize {
+pub extern "C" fn temen_par_tierup_argv_len(v: *mut ParVcpu) -> usize {
     // SAFETY: `v` is a live `ParVcpu`.
     unsafe { (*v).tierup_argv.len() }
 }
@@ -2259,7 +2276,7 @@ pub extern "C" fn svm_par_tierup_argv_len(v: *mut ParVcpu) -> usize {
 /// Deliver the results of a tier-up region (after `PAR_TIERUP`): `[results_ptr, n)` are the emitted
 /// `f{func}`'s i64 result slots. The vCPU resumes with them in the awaiting call's dst.
 #[no_mangle]
-pub extern "C" fn svm_par_deliver_tierup(v: *mut ParVcpu, results_ptr: *const i64, n: usize) {
+pub extern "C" fn temen_par_deliver_tierup(v: *mut ParVcpu, results_ptr: *const i64, n: usize) {
     // SAFETY: `v` is a live `ParVcpu` awaiting a delivery; `[results_ptr, n)` is a live host buffer.
     let v = unsafe { &mut *v };
     let results = unsafe { core::slice::from_raw_parts(results_ptr, n) };
@@ -2267,9 +2284,9 @@ pub extern "C" fn svm_par_deliver_tierup(v: *mut ParVcpu, results_ptr: *const i6
 }
 
 /// Deliver a **trap** from a tier-up region (the emitted `f{func}` threw — memory fault / fuel /
-/// div-by-zero / `unreachable`). The vCPU traps on its next `svm_par_run`, as if interp had trapped.
+/// div-by-zero / `unreachable`). The vCPU traps on its next `temen_par_run`, as if interp had trapped.
 #[no_mangle]
-pub extern "C" fn svm_par_deliver_tierup_trap(v: *mut ParVcpu) {
+pub extern "C" fn temen_par_deliver_tierup_trap(v: *mut ParVcpu) {
     // SAFETY: `v` is a live `ParVcpu` awaiting a delivery.
     unsafe { (*v).inner.deliver_tierup_trap(Trap::Unreachable) };
 }
@@ -2277,57 +2294,57 @@ pub extern "C" fn svm_par_deliver_tierup_trap(v: *mut ParVcpu) {
 /// The code handle of a pending [`PAR_JIT_INVOKE`] — the Worker keys its per-unit emitted-instance
 /// cache by this (one wasm instance per submitted unit; args differ per invoke).
 #[no_mangle]
-pub extern "C" fn svm_par_jit_code(v: *mut ParVcpu) -> i32 {
+pub extern "C" fn temen_par_jit_code(v: *mut ParVcpu) -> i32 {
     // SAFETY: `v` is a live `ParVcpu`.
     unsafe { (*v).jit_code }
 }
 
 /// Pointer to the marshalled §22 invoke args (raw i64 slots) after a [`PAR_JIT_INVOKE`] event — the
-/// Worker reads `svm_par_jit_argv_len` of them to call the emitted unit's `f{entry}`.
+/// Worker reads `temen_par_jit_argv_len` of them to call the emitted unit's `f{entry}`.
 #[no_mangle]
-pub extern "C" fn svm_par_jit_argv_ptr(v: *mut ParVcpu) -> *const i64 {
+pub extern "C" fn temen_par_jit_argv_ptr(v: *mut ParVcpu) -> *const i64 {
     // SAFETY: `v` is a live `ParVcpu`; the buffer lives until the next event overwrites it.
     unsafe { (*v).jit_argv.as_ptr() }
 }
 
-/// Number of §22 invoke args (see [`svm_par_jit_argv_ptr`]).
+/// Number of §22 invoke args (see [`temen_par_jit_argv_ptr`]).
 #[no_mangle]
-pub extern "C" fn svm_par_jit_argv_len(v: *mut ParVcpu) -> usize {
+pub extern "C" fn temen_par_jit_argv_len(v: *mut ParVcpu) -> usize {
     // SAFETY: `v` is a live `ParVcpu`.
     unsafe { (*v).jit_argv.len() }
 }
 
 /// Per-arg **scalar type codes** of a pending [`PAR_JIT_INVOKE`] (`0` = i32, `1` = i64, `2` = f32,
 /// `3` = f64), one byte per arg — the Worker reads them to marshal each i64 slot to the wasm type the
-/// emitted `f{entry}` uses. Length equals [`svm_par_jit_argv_len`].
+/// emitted `f{entry}` uses. Length equals [`temen_par_jit_argv_len`].
 #[no_mangle]
-pub extern "C" fn svm_par_jit_param_types_ptr(v: *mut ParVcpu) -> *const u8 {
+pub extern "C" fn temen_par_jit_param_types_ptr(v: *mut ParVcpu) -> *const u8 {
     // SAFETY: `v` is a live `ParVcpu`; the buffer lives until the next event overwrites it.
     unsafe { (*v).jit_param_types.as_ptr() }
 }
 
 /// Per-result **scalar type codes** of a pending [`PAR_JIT_INVOKE`] (same encoding as
-/// [`svm_par_jit_param_types_ptr`]) — the Worker marshals each emitted-`f{entry}` result back to its
-/// i64 result slot (a float's *bits*, an integer's value) for [`svm_par_deliver_jit_invoke`].
+/// [`temen_par_jit_param_types_ptr`]) — the Worker marshals each emitted-`f{entry}` result back to its
+/// i64 result slot (a float's *bits*, an integer's value) for [`temen_par_deliver_jit_invoke`].
 #[no_mangle]
-pub extern "C" fn svm_par_jit_result_types_ptr(v: *mut ParVcpu) -> *const u8 {
+pub extern "C" fn temen_par_jit_result_types_ptr(v: *mut ParVcpu) -> *const u8 {
     // SAFETY: `v` is a live `ParVcpu`; the buffer lives until the next event overwrites it.
     unsafe { (*v).jit_result_types.as_ptr() }
 }
 
-/// Number of §22 invoke results (see [`svm_par_jit_result_types_ptr`]).
+/// Number of §22 invoke results (see [`temen_par_jit_result_types_ptr`]).
 #[no_mangle]
-pub extern "C" fn svm_par_jit_result_types_len(v: *mut ParVcpu) -> usize {
+pub extern "C" fn temen_par_jit_result_types_len(v: *mut ParVcpu) -> usize {
     // SAFETY: `v` is a live `ParVcpu`.
     unsafe { (*v).jit_result_types.len() }
 }
 
 /// Pointer / length of a pending [`PAR_JIT_INVOKE`]'s **runtime-compiled** unit wasm (the shared-host
-/// path, [`svm_par_powerbox_jit_runtime`]): the JS host instantiates it once and caches the instance by
+/// path, [`temen_par_powerbox_jit_runtime`]): the JS host instantiates it once and caches the instance by
 /// [`jit_code`](ParVcpu::jit_code). `(null, 0)` for the fixed-unit codegen path (that reads the run-wide
-/// [`svm_par_jit_unit_wasm_ptr`] stash instead). The bytes stay valid until the next `svm_par_run`.
+/// [`temen_par_jit_unit_wasm_ptr`] stash instead). The bytes stay valid until the next `temen_par_run`.
 #[no_mangle]
-pub extern "C" fn svm_par_jit_code_wasm_ptr(v: *mut ParVcpu) -> *const u8 {
+pub extern "C" fn temen_par_jit_code_wasm_ptr(v: *mut ParVcpu) -> *const u8 {
     // SAFETY: `v` is a live `ParVcpu`.
     unsafe {
         (*v).jit_wasm
@@ -2336,7 +2353,7 @@ pub extern "C" fn svm_par_jit_code_wasm_ptr(v: *mut ParVcpu) -> *const u8 {
     }
 }
 #[no_mangle]
-pub extern "C" fn svm_par_jit_code_wasm_len(v: *mut ParVcpu) -> usize {
+pub extern "C" fn temen_par_jit_code_wasm_len(v: *mut ParVcpu) -> usize {
     // SAFETY: `v` is a live `ParVcpu`.
     unsafe { (*v).jit_wasm.as_ref().map_or(0, |w| w.len()) }
 }
@@ -2345,7 +2362,7 @@ pub extern "C" fn svm_par_jit_code_wasm_len(v: *mut ParVcpu) -> usize {
 /// are the emitted `f{entry}`'s i64 result slots. The vCPU resumes with them in the invoke's dst —
 /// identical to the interpreter having run the unit.
 #[no_mangle]
-pub extern "C" fn svm_par_deliver_jit_invoke(v: *mut ParVcpu, results_ptr: *const i64, n: usize) {
+pub extern "C" fn temen_par_deliver_jit_invoke(v: *mut ParVcpu, results_ptr: *const i64, n: usize) {
     // SAFETY: `v` is a live `ParVcpu` awaiting a delivery; `[results_ptr, n)` is a live host buffer.
     let v = unsafe { &mut *v };
     let results = unsafe { core::slice::from_raw_parts(results_ptr, n) };
@@ -2353,18 +2370,18 @@ pub extern "C" fn svm_par_deliver_jit_invoke(v: *mut ParVcpu, results_ptr: *cons
 }
 
 /// Deliver a **trap** from a §22 unit run on emitted wasm (the emitted region threw). The vCPU traps
-/// on its next `svm_par_run`, as if the interpreted invoke had trapped.
+/// on its next `temen_par_run`, as if the interpreted invoke had trapped.
 #[no_mangle]
-pub extern "C" fn svm_par_deliver_jit_invoke_trap(v: *mut ParVcpu) {
+pub extern "C" fn temen_par_deliver_jit_invoke_trap(v: *mut ParVcpu) {
     // SAFETY: `v` is a live `ParVcpu` awaiting a delivery.
     unsafe { (*v).inner.deliver_jit_invoke_trap(Trap::Unreachable) };
 }
 
 /// Free a finished vCPU.
 #[no_mangle]
-pub extern "C" fn svm_par_free(v: *mut ParVcpu) {
+pub extern "C" fn temen_par_free(v: *mut ParVcpu) {
     if !v.is_null() {
-        // SAFETY: `v` came from `Box::into_raw` in `svm_par_root`/`svm_par_child` and is freed once.
+        // SAFETY: `v` came from `Box::into_raw` in `temen_par_root`/`temen_par_child` and is freed once.
         drop(unsafe { Box::from_raw(v) });
         par_vcpu_retire(); // the live-cap admit from this vCPU's constructor
     }
@@ -2376,11 +2393,11 @@ pub extern "C" fn svm_par_free(v: *mut ParVcpu) {
 // monotonic clock, and exit). The `Host` powerbox is already self-contained and **deterministic** —
 // stream writes accumulate in `Host::stdout`/`stderr`, `read` draws from `Host::stdin`, and
 // `Clock.now` is a strictly-increasing counter — so no wasm host *imports* are needed: I/O crosses
-// the boundary the same way the module does, through `svm_alloc`ed memory. The host writes stdin to
+// the boundary the same way the module does, through `temen_alloc`ed memory. The host writes stdin to
 // an allocation it passes in; the captured streams come back as cdylib-managed allocations the host
 // reads (via the `*_ptr`/`*_len` exports) before the next call. The cdylib stays import-free.
 
-/// The guest called `Exit.exit(code)` (a non-error trap); read the code via [`svm_exit_code`].
+/// The guest called `Exit.exit(code)` (a non-error trap); read the code via [`temen_exit_code`].
 pub const STATUS_EXIT: i32 = 5;
 
 /// A captured RGBA framebuffer a guest presented through the `display` capability: `width`×`height`
@@ -2408,13 +2425,13 @@ pub struct PbOutcome {
 
 /// The canonical names of the browser powerbox's capabilities, in grant order — the vocabulary a
 /// powerbox guest resolves against via `cap.self.resolve` (F7) / labels via `cap.self.label` (F9). The
-/// browser ABI grants `(stdout, stdin, exit, stderr, clock)` by arity (its set differs from `svm-run`'s
+/// browser ABI grants `(stdout, stdin, exit, stderr, clock)` by arity (its set differs from `temen-run`'s
 /// fixed §3e prefix after slot 3, since the capabilities differ), so the names follow that order.
 const POWERBOX_CAP_NAMES: [&str; 5] = ["stdout", "stdin", "exit", "stderr", "clock"];
 
 /// Run `m`'s function 0 under the **browser powerbox**, seeding `stdin` and capturing the streams.
 ///
-/// Capabilities are granted by the entry's **arity** (so `hello.svmt`'s 3-handle `(out, in, exit)`
+/// Capabilities are granted by the entry's **arity** (so `hello.temt`'s 3-handle `(out, in, exit)`
 /// shape works unchanged), in this order — the browser embedder's ABI:
 ///
 /// | param # | capability        | `cap.call` type_id |
@@ -2425,9 +2442,9 @@ const POWERBOX_CAP_NAMES: [&str; 5] = ["stdout", "stdin", "exit", "stderr", "clo
 /// | 4       | `Stream(Err)`     | 0 (op 1 = write)   |
 /// | 5       | `Clock`           | 2 (op 0 = now)     |
 ///
-/// Shared verbatim by the wasm [`svm_run_pb`] export and the native `gencorpus` ground truth, so the
+/// Shared verbatim by the wasm [`temen_run_pb`] export and the native `gencorpus` ground truth, so the
 /// differential compares the *same* logic on both builds.
-pub fn powerbox_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
+pub fn powerbox_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
     let arity = m.funcs.first().map_or(0, |f| f.params.len());
     let mut host = Host::new();
     host.stdin = stdin.to_vec();
@@ -2448,7 +2465,7 @@ pub fn powerbox_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
         slots.push(Value::I32(host.grant_clock()));
     }
     // §7 register each granted capability under its canonical name (F7/F9, PR #118) so a guest can
-    // `cap.self.resolve` / `cap.self.label` it at runtime — mirroring `svm-run`'s powerbox so the
+    // `cap.self.resolve` / `cap.self.label` it at runtime — mirroring `temen-run`'s powerbox so the
     // browser stays a faithful twin. Names parallel the grant order above; only the `arity` actually
     // granted are registered.
     for (name, slot) in POWERBOX_CAP_NAMES.iter().zip(&slots) {
@@ -2479,19 +2496,19 @@ pub fn powerbox_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
 }
 
 /// The canonical names of the **on-ramp** powerbox prefix, in grant order — the fixed §3e `VM_CAP_*`
-/// vocabulary the LLVM on-ramp's synthesized `_start` expects (and `svm-run` grants). This differs
+/// vocabulary the LLVM on-ramp's synthesized `_start` expects (and `temen-run` grants). This differs
 /// from [`POWERBOX_CAP_NAMES`] after slot 3: the hand-written browser corpus uses `(stderr, clock)`
 /// at slots 4/5, but an on-ramp guest wants `(memory, addrspace)` there — `memory` is what `malloc`
 /// grows the heap through, so Lua/SQLite need it. See `LLVM.md` §N (the powerbox on-ramp).
 const ONRAMP_CAP_NAMES: [&str; 5] = ["stdout", "stdin", "exit", "memory", "addrspace"];
 
-/// The reference host's §7 capability-import name policy — a browser-side twin of `svm-run`'s
+/// The reference host's §7 capability-import name policy — a browser-side twin of `temen-run`'s
 /// `default_cap_resolver`. The on-ramp emits `call.sym "<name>"` for each libc→capability shim
 /// (`write`/`read`/`exit`/`vm_map`/…); this lowers each name to the `(type_id, op)` its `cap.call`
 /// runs, so the resolved module verifies and runs. The **handle** (which stream/region) is supplied
 /// by the powerbox stash, not this map — `write`/`read` share `Stream`, differing only by handle.
-pub(crate) fn onramp_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
-    use svm_interp::cap_id;
+pub(crate) fn onramp_cap_resolver(name: &str) -> Option<temen_ir::ResolvedCap> {
+    use temen_interp::cap_id;
     let (type_id, op): (u32, u32) = match name {
         "write" => (cap_id::STREAM, 1),
         "read" => (cap_id::STREAM, 0),
@@ -2505,7 +2522,7 @@ pub(crate) fn onramp_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
         "vm_region_unmap" => (cap_id::SHARED_REGION, 1),
         "vm_region_page_size" => (cap_id::SHARED_REGION, 3),
         // Guest-driven JIT (§22) — the macro-staging on-ramp grants the Jit cap; mirrors
-        // svm-run's default_cap_resolver so a compiler-guest's `__vm_jit_*` builtins bind.
+        // temen-run's default_cap_resolver so a compiler-guest's `__vm_jit_*` builtins bind.
         "vm_jit_compile" => (cap_id::JIT, 0),
         "vm_jit_compile_linked" => (cap_id::JIT, 5),
         "vm_jit_invoke2" => (cap_id::JIT, 1),
@@ -2514,21 +2531,21 @@ pub(crate) fn onramp_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
         "vm_jit_uninstall" => (cap_id::JIT, 4),
         _ => return None,
     };
-    Some(svm_ir::ResolvedCap { type_id, op })
+    Some(temen_ir::ResolvedCap { type_id, op })
 }
 
 /// Gate an on-ramp module (IMPORTS.md phase 4): the runtime never rewrites. A module that declares
 /// imports must carry the **powerbox entry shape** — a paramless func 0 exported as `_start`
-/// (`svm-run`'s `is_named_powerbox_entry`) — so its manifest slots can bind at instantiation
+/// (`temen-run`'s `is_named_powerbox_entry`) — so its manifest slots can bind at instantiation
 /// ([`grant_onramp_caps`] installs the bindings; `call.import` dispatches through them). An
 /// import-bearing module without that shape **fails closed** (the pre-manifest `resolve_imports`
 /// rewrite died with phase 4). An import-free module passes as-is: its entry runs with no args
 /// (missing params zero-seed, the `Session` convention) and reaches capabilities only by name via
 /// `cap.self.resolve`.
-pub(crate) fn onramp_check(m: &svm_ir::Module) -> Result<(), ()> {
+pub(crate) fn onramp_check(m: &temen_ir::Module) -> Result<(), ()> {
     // An import-free module passes as-is; an import-bearing one must carry the shared powerbox
     // entry shape (#912) so its manifest slots can bind.
-    if m.imports.is_empty() || svm_ir::is_named_powerbox_entry(m) {
+    if m.imports.is_empty() || temen_ir::is_named_powerbox_entry(m) {
         Ok(())
     } else {
         Err(())
@@ -2548,7 +2565,7 @@ type KeyQueue = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i32>>
 /// `present(ptr, w, h)`, copies `w*h*4` RGBA bytes out of the window into the returned frame cell) and
 /// `keyboard` (op 0 = `poll()`, dequeues one packed event from the returned queue, or `-1`).
 ///
-/// The on-ramp entry is the phase-4 powerbox shape (mirroring `svm-run`'s `grant_caps`): a
+/// The on-ramp entry is the phase-4 powerbox shape (mirroring `temen-run`'s `grant_caps`): a
 /// **paramless** `_start` whose manifest imports bind to slot bindings at instantiation, and which
 /// resolves any further capability by name via `cap.self.resolve`. The whole prefix is granted and
 /// registered under its canonical names; a guest resolves only the names it uses, so registering
@@ -2558,7 +2575,7 @@ type KeyQueue = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i32>>
 /// [`OnrampReactor`], so both grant the identical powerbox.
 fn grant_onramp_caps(
     host: &mut Host,
-    m: &svm_ir::Module,
+    m: &temen_ir::Module,
     fs: Option<(String, Vec<u8>)>,
 ) -> (std::sync::Arc<std::sync::Mutex<Option<Frame>>>, KeyQueue) {
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
@@ -2574,7 +2591,7 @@ fn grant_onramp_caps(
     }
     // §22 guest-driven JIT: grant the `Jit` cap **iff** the guest declares a `__vm_jit_*` import
     // (principle of least authority — a plain on-ramp guest gets no Jit). The JACL self-hosted
-    // compiler uses it to expand macros in-guest. Match svm-run's powerbox grant so a self-hosted
+    // compiler uses it to expand macros in-guest. Match temen-run's powerbox grant so a self-hosted
     // guest behaves identically: a 1024-slot dispatch table (a staged unit's `Slot` imports call back
     // into the host program's ~800 functions by index) and fiber hosting (a staged macro runs on the
     // compiler's scheduler root, which suspends). `browser_jit_validator` verifies every submitted
@@ -2592,13 +2609,13 @@ fn grant_onramp_caps(
     // on-ramp policy and to the granted handle by interface. A name outside the policy (or the
     // dynamic-only SharedRegion ops) leaves its slot unbound — fail-closed at dispatch.
     if !m.imports.is_empty() {
-        use svm_interp::cap_id;
+        use temen_interp::cap_id;
         let bindings = m
             .imports
             .iter()
             .map(|im| {
                 let Some(cap) = onramp_cap_resolver(&im.name) else {
-                    return svm_interp::BoundImport::rebindable(0, 0, None);
+                    return temen_interp::BoundImport::rebindable(0, 0, None);
                 };
                 let handle = match (cap.type_id, cap.op) {
                     (cap_id::STREAM, 1) => handles[0],
@@ -2610,11 +2627,11 @@ fn grant_onramp_caps(
                     (cap_id::ADDRESS_SPACE, _) => handles[4],
                     (cap_id::JIT, _) => match jit_h {
                         Some(h) => h,
-                        None => return svm_interp::BoundImport::rebindable(0, 0, None),
+                        None => return temen_interp::BoundImport::rebindable(0, 0, None),
                     },
-                    _ => return svm_interp::BoundImport::rebindable(0, 0, None),
+                    _ => return temen_interp::BoundImport::rebindable(0, 0, None),
                 };
-                svm_interp::BoundImport::required(cap.type_id, cap.op, handle)
+                temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
             })
             .collect();
         host.set_import_bindings(bindings);
@@ -2758,11 +2775,11 @@ fn grant_onramp_caps(
     (frame, keys)
 }
 
-/// Run `m`'s function 0 under the **on-ramp powerbox** — the ABI `svm-llvm`'s synthesized `_start`
-/// expects, so a `.svmb` straight off `svm-llvm-translate` (Lua, SQLite, …) runs unchanged. This is
+/// Run `m`'s function 0 under the **on-ramp powerbox** — the ABI `temen-llvm`'s synthesized `_start`
+/// expects, so a `.temen` straight off `temen-llvm-translate` (Lua, SQLite, …) runs unchanged. This is
 /// the twin of [`powerbox_exec`] with the fixed §3e `VM_CAP_*` grant prefix instead of the browser
 /// corpus's `(…, stderr, clock)` set: [`grant_onramp_caps`] grants `stdout, stdin, exit, memory,
-/// addrspace` (mirroring `svm-run`'s `grant_powerbox_prefix`) and registers each under its name, and
+/// addrspace` (mirroring `temen-run`'s `grant_powerbox_prefix`) and registers each under its name, and
 /// the by-name `_start` resolves what it needs via `cap.self.resolve`.
 ///
 /// The entry is the phase-4 powerbox shape ([`onramp_check`]): a paramless `_start` whose manifest
@@ -2770,7 +2787,7 @@ fn grant_onramp_caps(
 /// handle-args) entry form died in phase 4 and an import-bearing module without the manifest entry
 /// shape is fail-closed (`STATUS_UNSUPPORTED`). The `fs` capability (SQLite Phase B, Lua
 /// `files.lua`) is a `host_proc` resolved by name — a Stage-1 follow-on, not part of this prefix.
-pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
+pub fn onramp_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
     let unsupported = || PbOutcome {
         status: STATUS_UNSUPPORTED,
         value: 0,
@@ -2818,33 +2835,33 @@ pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
 }
 
 /// On-ramp powerbox **with the §22 `Jit` capability granted** — for the self-hosted JACL
-/// compiler-guest (`jacl_compiler.svmb`), which expands macros in-guest by compiling each macro body
+/// compiler-guest (`jacl_compiler.temen`), which expands macros in-guest by compiling each macro body
 /// with `vm_jit_compile_linked` and running it with `vm_jit_invoke2`. This now delegates to
 /// [`onramp_exec`], which grants the `Jit` cap conditionally (any guest importing `vm_jit_*`) via
 /// [`grant_onramp_caps`] and runs a Jit-importing guest on the tree-walker so its import-bound
 /// `invoke`/`install` reach the driver (see `onramp_exec`). Kept as a named entry for callers that
 /// specifically mean "run the compiler-guest".
-pub fn onramp_jit_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
+pub fn onramp_jit_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
     onramp_exec(m, stdin)
 }
 
 /// Run `m`'s function 0 under the **POSIX personality** (POSIX.md / STAGE1.md) instead of the fixed
-/// on-ramp powerbox — the seam that lets the real `svm-posix` shell (and any chibicc program linking
-/// the personality libc) run in the browser. [`svm_posix::grant`] registers one `HostProc` capability
+/// on-ramp powerbox — the seam that lets the real `temen-posix` shell (and any chibicc program linking
+/// the personality libc) run in the browser. [`temen_posix::grant`] registers one `HostProc` capability
 /// implementing the libc/memfs surface (`read`/`write`/`open`/`opendir`/`getcwd`/…), and
-/// [`svm_posix::bind`] binds the module's manifest imports to it **by name** (IMPORTS.md phase 4 —
+/// [`temen_posix::bind`] binds the module's manifest imports to it **by name** (IMPORTS.md phase 4 —
 /// slot `i` ↔ import `i`, bound at instantiation; the module bytes are never rewritten). `stdin`
 /// preloads `read(0, …)`; the guest's `write(1, …)` accumulates in the personality's stdout, returned
 /// here (the personality owns stdout, not the browser `Host`'s Stream cap).
 ///
 /// The entry is the phase-4 shape ([`onramp_check`]): a paramless func 0 exported `_start`. A module
-/// whose imports are not all POSIX names fails closed ([`svm_posix::bind`] returns `false`) — the
+/// whose imports are not all POSIX names fails closed ([`temen_posix::bind`] returns `false`) — the
 /// `Instantiator`/ring imports the shell's *concurrent* paths use are a later slice; this first slice
 /// runs the sequential personality (files, redirects, in-process pipelines) only.
 ///
 /// Runs on the **bytecode** engine (the browser's interpreter tier), the same engine [`onramp_exec`]
 /// uses; the personality's `HostProc` dispatches through the guest window `bytecode` hands it.
-pub fn onramp_posix_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
+pub fn onramp_posix_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
     let unsupported = || PbOutcome {
         status: STATUS_UNSUPPORTED,
         value: 0,
@@ -2861,9 +2878,9 @@ pub fn onramp_posix_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
     // `c_shell` harness grants it); the shell's static data + stack sit below. `stdin` seeds `read(0)`.
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     let heap_base = win.saturating_sub(64 << 10);
-    let (px_h, posix) = svm_posix::grant(&mut host, heap_base, win, stdin.to_vec());
+    let (px_h, posix) = temen_posix::grant(&mut host, heap_base, win, stdin.to_vec());
     // Bind every manifest import to the personality by name; fail closed on a non-POSIX import.
-    if !svm_posix::bind(m, &mut host, px_h) {
+    if !temen_posix::bind(m, &mut host, px_h) {
         return unsupported();
     }
     let mut fuel = u64::MAX;
@@ -2888,7 +2905,7 @@ pub fn onramp_posix_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
     }
 }
 
-/// Run the **`svm-posix` shell** (STAGE1.md; `crates/svm/tests/c_shell.rs`) — a real command
+/// Run the **`temen-posix` shell** (STAGE1.md; `crates/temen/tests/c_shell.rs`) — a real command
 /// interpreter compiled by chibicc onto the personality — with `stdin` as the script. This is the
 /// playground's shell card: the same module bytes the differential test runs, executed in the browser.
 ///
@@ -2899,13 +2916,13 @@ pub fn onramp_posix_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
 /// paths), but the sequential Stage-0 surface never **executes** them — with no commands registered,
 /// `exec_lookup` misses and pipelines fall back to the in-window memfs — so the module runs cleanly;
 /// only the *reserved-window* bytecode entry statically refuses such modules, and this plain entry does
-/// not. Cross-checked against the tree-walk/JIT oracle by `crates/svm/tests/c_shell.rs`'s bytecode arm.
+/// not. Cross-checked against the tree-walk/JIT oracle by `crates/temen/tests/c_shell.rs`'s bytecode arm.
 ///
 /// Grants match the differential's setup and order so the shell's `cap.self` reflection discovers the
 /// same interfaces: a forwardable `stdout` `Stream`, an `Instantiator` + `AddressSpace` over the whole
 /// window (inert this slice — see above), and the POSIX personality itself (its captured stdout is the
 /// shell's output). The personality heap is the top 64 KiB (the shell never `malloc`s).
-pub fn posix_shell_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
+pub fn posix_shell_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
     posix_shell_exec_with(m, stdin, &[])
 }
 
@@ -2918,9 +2935,9 @@ pub fn posix_shell_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
 /// discovers the same handles as the byte-checked differential and its output (shell builtins + child
 /// stages) lands in one captured stdout.
 pub fn posix_shell_exec_with(
-    m: &svm_ir::Module,
+    m: &temen_ir::Module,
     stdin: &[u8],
-    cmds: &[(&str, &svm_ir::Module)],
+    cmds: &[(&str, &temen_ir::Module)],
 ) -> PbOutcome {
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     let mut host = Host::new();
@@ -2943,7 +2960,7 @@ pub fn posix_shell_exec_with(
         })
         .collect();
     let heap_base = win.saturating_sub(64 << 10);
-    let (_px, posix) = svm_posix::grant(&mut host, heap_base, win, stdin.to_vec());
+    let (_px, posix) = temen_posix::grant(&mut host, heap_base, win, stdin.to_vec());
     posix.set_stdout_sink(sink);
     posix.set_exec_stdout(out_h);
     posix.set_exec_stdin(in_h, in_fifo);
@@ -2973,11 +2990,11 @@ pub fn posix_shell_exec_with(
 }
 
 /// Build the §3e powerbox args blob — `{ argc:u32-LE, envc:u32-LE }` then packed NUL-terminated
-/// strings — for seeding at `POWERBOX_ARGS_BASE` (the browser twin of `svm-run`'s `build_args_blob`,
+/// strings — for seeding at `POWERBOX_ARGS_BASE` (the browser twin of `temen-run`'s `build_args_blob`,
 /// no env). The on-ramp `_start` parses it into `argc`/`argv`.
 pub(crate) fn pg_args_blob(argv: &[&[u8]]) -> Vec<u8> {
     // The shared powerbox args-buffer layout (#912); the Postgres on-ramp passes no environment.
-    svm_ir::write_args_blob(argv, &[])
+    temen_ir::write_args_blob(argv, &[])
 }
 
 /// Shared Postgres powerbox setup (used by the one-shot [`pg_exec`] and the persistent [`PgSession`]):
@@ -2987,10 +3004,10 @@ pub(crate) fn pg_args_blob(argv: &[&[u8]]) -> Vec<u8> {
 /// `STATUS_*` on failure. `host`'s stdin is left empty and non-blocking; the caller sets those per
 /// run mode.
 fn pg_setup(
-    m: &svm_ir::Module,
+    m: &temen_ir::Module,
     image: &[u8],
     argv: &[&[u8]],
-) -> Result<(Host, Vec<u8>, svm_fs::MemFsHandle), i32> {
+) -> Result<(Host, Vec<u8>, temen_fs::MemFsHandle), i32> {
     // IMPORTS.md phase 4: an import-bearing module must be a manifest module (paramless exported
     // `_start`) — the runtime binds slots, it never rewrites. Fail closed otherwise.
     onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
@@ -3012,52 +3029,52 @@ fn pg_setup(
     // granted handles (`Stream` disambiguated by op). A name outside this headless powerbox (e.g.
     // the dynamic-only SharedRegion ops) leaves its slot unbound — fail-closed at dispatch.
     if !m.imports.is_empty() {
-        use svm_interp::cap_id;
+        use temen_interp::cap_id;
         let bindings = m
             .imports
             .iter()
             .map(|im| {
                 let Some(cap) = onramp_cap_resolver(&im.name) else {
-                    return svm_interp::BoundImport::rebindable(0, 0, None);
+                    return temen_interp::BoundImport::rebindable(0, 0, None);
                 };
                 let handle = match (cap.type_id, cap.op) {
                     (cap_id::STREAM, 1) => out,
                     (cap_id::STREAM, _) => inp,
                     (cap_id::EXIT, _) => exit,
                     (cap_id::ADDRESS_SPACE, _) => memory,
-                    _ => return svm_interp::BoundImport::rebindable(0, 0, None),
+                    _ => return temen_interp::BoundImport::rebindable(0, 0, None),
                 };
-                svm_interp::BoundImport::required(cap.type_id, cap.op, handle)
+                temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
             })
             .collect();
         host.set_import_bindings(bindings);
     }
     // Mount the shipped data image as an in-memory `fs` cap (decode is fail-closed). The **shared**
     // mount hands back a `MemFsHandle`, so a persistent session can snapshot the live data dir back out
-    // later ([`svm_pg_snapshot`]); the one-shot `pg_exec` simply drops it.
-    let (files, dirs) = svm_fs::decode_image(image).map_err(|_| STATUS_DECODE_ERR)?;
-    let (fs_hostfn, fs_handle) = svm_fs::mem_fs_seeded_shared(files, dirs);
+    // later ([`temen_pg_snapshot`]); the one-shot `pg_exec` simply drops it.
+    let (files, dirs) = temen_fs::decode_image(image).map_err(|_| STATUS_DECODE_ERR)?;
+    let (fs_hostfn, fs_handle) = temen_fs::mem_fs_seeded_shared(files, dirs);
     let fsh = host.grant_host_proc(fs_hostfn);
     host.register_cap_name("fs", fsh);
     // Seed the caller's `argv` at the powerbox args base (Postgres: a slashed `argv[0]` so
     // `find_my_exec` resolves; chibicc: `["chibicc", "/in.c"]`). #964: a `__null_guard`-marked
     // module reads its args one guard higher — place the blob where its `_start` looks.
     let blob = pg_args_blob(argv);
-    let base = svm_ir::module_args_base(m) as usize;
+    let base = temen_ir::module_args_base(m) as usize;
     let mut init_mem = vec![0u8; base + blob.len()];
     init_mem[base..].copy_from_slice(&blob);
     Ok((host, init_mem, fs_handle))
 }
 
 /// Run **PostgreSQL `--single`** in the wasm sandbox: mount the data-image `image` on the `fs` cap
-/// (`svm_fs::mem_fs_seeded_handler` — a real in-memory filesystem, no host fs), seed the `--single`
+/// (`temen_fs::mem_fs_seeded_handler` — a real in-memory filesystem, no host fs), seed the `--single`
 /// argv, and run the module's `_start` on the **reserved-window** bytecode engine (Postgres grows its
 /// heap through the `memory` cap into the reserved tail). `stdin` is the SQL script; the backend's
 /// output comes back on the captured `stdout`. The one entry that boots a *real database* in the
 /// browser — and the direct in-wasm measurement of the guest boot (BOOTSPEED.md). The `stdout, stdin,
 /// exit, memory, fs` caps are reached by name (`cap.self.resolve`) or through the module's manifest
 /// slot bindings — the paramless `_start` takes no handle args (IMPORTS.md phase 4).
-pub fn pg_exec(m: &svm_ir::Module, image: &[u8], stdin: &[u8]) -> PbOutcome {
+pub fn pg_exec(m: &temen_ir::Module, image: &[u8], stdin: &[u8]) -> PbOutcome {
     onramp_fs_exec(m, image, &PG_SINGLE_ARGV, stdin)
 }
 
@@ -3065,12 +3082,17 @@ pub fn pg_exec(m: &svm_ir::Module, image: &[u8], stdin: &[u8]) -> PbOutcome {
 const PG_SINGLE_ARGV: [&[u8]; 5] = [b"./postgres", b"--single", b"-D", b".", b"postgres"];
 
 /// Generic on-ramp run with a seeded multi-file `fs` cap + caller-supplied `argv` — the shape
-/// [`pg_exec`] (Postgres) and [`svm_run_onramp_fs`] (chibicc-the-guest) share. Mounts the memfs
+/// [`pg_exec`] (Postgres) and [`temen_run_onramp_fs`] (chibicc-the-guest) share. Mounts the memfs
 /// `image` on the `fs` cap, seeds `argv` at `POWERBOX_ARGS_BASE`, feeds `stdin`, and runs `_start`
 /// on the reserved-window engine (the guest may grow a heap through the `memory` cap). Unlike
 /// [`onramp_exec`], the guest reads its input from served files, not stdin — chibicc `fopen`s
 /// `/in.c` + `/include/*.h`.
-pub fn onramp_fs_exec(m: &svm_ir::Module, image: &[u8], argv: &[&[u8]], stdin: &[u8]) -> PbOutcome {
+pub fn onramp_fs_exec(
+    m: &temen_ir::Module,
+    image: &[u8],
+    argv: &[&[u8]],
+    stdin: &[u8],
+) -> PbOutcome {
     let unsupported = |status: i32| PbOutcome {
         status,
         value: 0,
@@ -3091,7 +3113,7 @@ pub fn onramp_fs_exec(m: &svm_ir::Module, image: &[u8], argv: &[&[u8]], stdin: &
         &[],
         &mut fuel,
         &init_mem,
-        svm_ir::DEFAULT_RESERVED_LOG2,
+        temen_ir::DEFAULT_RESERVED_LOG2,
         &mut host,
     ) {
         None => (STATUS_UNSUPPORTED, 0, 0),
@@ -3121,7 +3143,7 @@ pub fn onramp_fs_exec(m: &svm_ir::Module, image: &[u8], argv: &[&[u8]], stdin: &
 /// file is `Vec::new()` if the phase never wrote it (a parse error — the caller shows the guest's
 /// stderr instead). The run's own `stdout`/`stderr` still ride the returned [`PbOutcome`].
 fn onramp_fs_exec_readback(
-    m: &svm_ir::Module,
+    m: &temen_ir::Module,
     image: &[u8],
     argv: &[&[u8]],
     stdin: &[u8],
@@ -3147,7 +3169,7 @@ fn onramp_fs_exec_readback(
         &[],
         &mut fuel,
         &init_mem,
-        svm_ir::DEFAULT_RESERVED_LOG2,
+        temen_ir::DEFAULT_RESERVED_LOG2,
         &mut host,
     ) {
         None => (STATUS_UNSUPPORTED, 0, 0),
@@ -3181,10 +3203,10 @@ fn onramp_fs_exec_readback(
 
 /// **Boot Postgres in wasm.** Decode + verify the module at `[mod_ptr, mod_len)`, mount the data image
 /// at `[img_ptr, img_len)` on the `fs` cap, feed the SQL at `[stdin_ptr, stdin_len)`, and run. Sets
-/// [`svm_status`]/[`svm_exit_code`]; the backend's output is read back via `svm_stdout_ptr`/`_len`.
+/// [`temen_status`]/[`temen_exit_code`]; the backend's output is read back via `temen_stdout_ptr`/`_len`.
 /// Returns the guest's `i64` result (`0` on any non-`OK`/`EXIT`). Driven by `browser/bench_pg.mjs`.
 #[no_mangle]
-pub extern "C" fn svm_run_pg(
+pub extern "C" fn temen_run_pg(
     mod_ptr: *const u8,
     mod_len: usize,
     img_ptr: *const u8,
@@ -3193,7 +3215,7 @@ pub extern "C" fn svm_run_pg(
     stdin_len: usize,
 ) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees each range is a live `svm_alloc`ation it just filled.
+    // SAFETY: the host guarantees each range is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
     let stdin: &[u8] = if stdin_ptr.is_null() || stdin_len == 0 {
@@ -3201,14 +3223,14 @@ pub extern "C" fn svm_run_pg(
     } else {
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }
     };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
             return 0;
         }
     };
-    if svm_verify::verify_module(&m).is_err() {
+    if temen_verify::verify_module(&m).is_err() {
         set(STATUS_VERIFY_ERR);
         return 0;
     }
@@ -3348,8 +3370,8 @@ pub fn playground_include_files() -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-/// The chibicc card's argv (shared by the bytecode [`svm_run_onramp_fs`] and the JIT
-/// [`svm_onramp_jit_run_open_fs`]). `--data-page 65536`: the compiled program runs in the browser
+/// The chibicc card's argv (shared by the bytecode [`temen_run_onramp_fs`] and the JIT
+/// [`temen_onramp_jit_run_open_fs`]). `--data-page 65536`: the compiled program runs in the browser
 /// (64 KiB wasm host page), so its read-only globals must not share a host page with writable data
 /// (D40). Debug info is **off by default** (the `debug.*` waist is ~a third of the emitted IR, so a
 /// clean run compiles far less IR); pass `debug_info` (a `-g` flag) only when the user opts into
@@ -3365,7 +3387,7 @@ fn chibicc_card_argv(debug_info: bool) -> Vec<&'static [u8]> {
 
 /// The **self-host** card's argv (SELFHOST_C.md §5): compile one of chibicc's *own* cc1 TUs to a
 /// linkable **object** unit (`--emit-object`, `cc -c`), reading the TU + its full system-header closure
-/// from the seeded memfs. Mirrors `guest_emit_object` in `crates/svm/tests/c_link.rs` — relative `-I`s
+/// from the seeded memfs. Mirrors `guest_emit_object` in `crates/temen/tests/c_link.rs` — relative `-I`s
 /// (the fs cap refuses absolute paths), the self-host prelude force-included (chibicc's parser can't
 /// ingest modern glibc's ISO-C23 `strtoul`/… redirects), output to stdout (no out arg). `tu` is the
 /// memfs-relative input path (e.g. `frontend/chibicc/hashmap.c`). Borrows `tu`; caller keeps it alive.
@@ -3377,7 +3399,7 @@ fn chibicc_selfhost_argv(tu: &[u8], debug_info: bool) -> Vec<&[u8]> {
         b"chibicc",
         b"--emit-object",
         b"-include",
-        b"crates/svm-run/demos/chibicc_selfhost/selfhost_prelude.h",
+        b"crates/temen-run/demos/chibicc_selfhost/selfhost_prelude.h",
         b"-Ifrontend/chibicc",
         b"-Ifrontend/chibicc/include",
         b"-Iusr/include/x86_64-linux-gnu",
@@ -3403,7 +3425,7 @@ fn chibicc_card_image(img_ptr: *const u8, img_len: usize, src: &[u8]) -> Result<
     } else {
         // SAFETY: the host guarantees `[img_ptr, img_len)` is a live allocation it just filled.
         let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
-        svm_fs::decode_image(image).map_err(|_| STATUS_DECODE_ERR)?
+        temen_fs::decode_image(image).map_err(|_| STATUS_DECODE_ERR)?
     };
     // Seed the built-in playground libc headers under `/include` so a compiled program can
     // `#include <stdio.h>` etc. — a caller-supplied image (same key) takes precedence.
@@ -3442,7 +3464,7 @@ fn chibicc_card_image(img_ptr: *const u8, img_len: usize, src: &[u8]) -> Result<
         files.retain(|(k, _)| *k != key);
         files.push((key, bytes));
     }
-    Ok(svm_fs::encode_image(&files, &dirs))
+    Ok(temen_fs::encode_image(&files, &dirs))
 }
 
 /// Split a card editor buffer into memfs files on `//// file: NAME` marker lines. The text before the
@@ -3487,13 +3509,13 @@ pub fn split_multifile_source(src: &[u8]) -> Vec<(String, Vec<u8>)> {
 /// mounting the user's source at `in.c` (the guest opens `/in.c`), the built-in playground libc
 /// headers under `include/` ([`playground_include_files`] — `<stdio.h>` etc.), plus, if `img_len > 0`,
 /// any caller headers from the `encode_image` blob at `[img_ptr, img_len)` (which win on a key clash).
-/// Seeds `argv = ["chibicc", "/in.c"]` and runs. The emitted SVM-IR **text** comes back on
-/// `svm_stdout_ptr`/`_len`, ready to hand to [`svm_parse`] → a runnable module. The seeded headers are
+/// Seeds `argv = ["chibicc", "/in.c"]` and runs. The emitted TEMEN-IR **text** comes back on
+/// `temen_stdout_ptr`/`_len`, ready to hand to [`temen_parse`] → a runnable module. The seeded headers are
 /// guest C compiled in on `#include`, so a `printf` program prints (over the powerbox's ambient
-/// `write`) instead of trapping on an unresolved call. Sets [`svm_status`]/[`svm_exit_code`]; returns
+/// `write`) instead of trapping on an unresolved call. Sets [`temen_status`]/[`temen_exit_code`]; returns
 /// the guest's `i64` result (`0` on any non-`OK`/`EXIT`).
 #[no_mangle]
-pub extern "C" fn svm_run_onramp_fs(
+pub extern "C" fn temen_run_onramp_fs(
     mod_ptr: *const u8,
     mod_len: usize,
     img_ptr: *const u8,
@@ -3503,17 +3525,17 @@ pub extern "C" fn svm_run_onramp_fs(
     debug_info: i32,
 ) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees each range is a live `svm_alloc`ation it just filled.
+    // SAFETY: the host guarantees each range is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let src = unsafe { core::slice::from_raw_parts(src_ptr, src_len) };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
             return 0;
         }
     };
-    if svm_verify::verify_module(&m).is_err() {
+    if temen_verify::verify_module(&m).is_err() {
         set(STATUS_VERIFY_ERR);
         return 0;
     }
@@ -3537,43 +3559,43 @@ pub extern "C" fn svm_run_onramp_fs(
 }
 
 /// **Compile Nim in the browser — the nimony front-end card** (NIM.md §3c/§3e, "nimony in the browser"
-/// slice 4). Run `nifler.svmb` — the *first real nimony compiler phase* (Nim source → parsed NIF),
-/// itself a Nim program on-ramped to SVM through the C on-ramp (slice 1) — over the editor's Nim.
+/// slice 4). Run `nifler.temen` — the *first real nimony compiler phase* (Nim source → parsed NIF),
+/// itself a Nim program on-ramped to Temen through the C on-ramp (slice 1) — over the editor's Nim.
 /// Decode + verify the phase module at `[mod_ptr, mod_len)`, seed an in-memory `fs` cap with the user's
 /// source at `in.nim`, run `nifler p /in.nim /out.p.nif` (the parse command), and hand the emitted
-/// `.p.nif` **text** back on `svm_stdout_ptr`/`_len` — the same real nifler that parses Nim natively,
+/// `.p.nif` **text** back on `temen_stdout_ptr`/`_len` — the same real nifler that parses Nim natively,
 /// now running client-side in the sandbox on the reader's own code. Unlike the pre-built
-/// `nim (Nim → SVM, runs)` card (whose front-end ran at *build* time), this runs a front-end phase
-/// **in the browser**; unlike the `svm-leng` back-end card (Leng → IR), this is the front edge (Nim →
-/// NIF). The guest reaches only the seeded `fs` — no ambient authority. Sets [`svm_status`]/
-/// [`svm_exit_code`]; returns the guest's `i64` result (`0` on any non-`OK`/`EXIT`). On a parse error
-/// (`nifler` wrote no `.p.nif`) the guest's own stderr rides `svm_stderr_ptr`/`_len` and the stdout
+/// `nim (Nim → Temen, runs)` card (whose front-end ran at *build* time), this runs a front-end phase
+/// **in the browser**; unlike the `temen-leng` back-end card (Leng → IR), this is the front edge (Nim →
+/// NIF). The guest reaches only the seeded `fs` — no ambient authority. Sets [`temen_status`]/
+/// [`temen_exit_code`]; returns the guest's `i64` result (`0` on any non-`OK`/`EXIT`). On a parse error
+/// (`nifler` wrote no `.p.nif`) the guest's own stderr rides `temen_stderr_ptr`/`_len` and the stdout
 /// capture is empty, so the card can surface the diagnostic.
 #[no_mangle]
-pub extern "C" fn svm_run_nifler_fs(
+pub extern "C" fn temen_run_nifler_fs(
     mod_ptr: *const u8,
     mod_len: usize,
     src_ptr: *const u8,
     src_len: usize,
 ) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees each range is a live `svm_alloc`ation it just filled.
+    // SAFETY: the host guarantees each range is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let src = unsafe { core::slice::from_raw_parts(src_ptr, src_len) };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
             return 0;
         }
     };
-    if svm_verify::verify_module(&m).is_err() {
+    if temen_verify::verify_module(&m).is_err() {
         set(STATUS_VERIFY_ERR);
         return 0;
     }
     // Seed the source as `in.nim`; nifler parses `/in.nim` and writes `/out.p.nif` (both memfs keys,
     // slashless in the store). The emitted `.p.nif` is the file we read back and show.
-    let image = svm_fs::encode_image(&[("in.nim".to_string(), src.to_vec())], &[]);
+    let image = temen_fs::encode_image(&[("in.nim".to_string(), src.to_vec())], &[]);
     let argv: [&[u8]; 4] = [b"nifler", b"p", b"/in.nim", b"/out.p.nif"];
     let (out, produced) = onramp_fs_exec_readback(&m, &image, &argv, &[], "out.p.nif");
     set(out.status);
@@ -3588,7 +3610,7 @@ pub extern "C" fn svm_run_nifler_fs(
 }
 
 /// A cached nifler emit (#1011 slice 1): the `Arc`-shared emit products keyed by a content hash of the
-/// phase module bytes, so a re-Run of the same `nifler.svmb` skips the ~2 s `compile_jit` **and** the
+/// phase module bytes, so a re-Run of the same `nifler.temen` skips the ~2 s `compile_jit` **and** the
 /// ~2 s `Module` clone — a re-parse becomes build-window + drive. Single-threaded wasm ⇒ a plain static;
 /// one slot (the card runs one nifler). Populated on the first JIT parse, reused on every later one.
 struct NiflerEmitCache {
@@ -3598,7 +3620,7 @@ struct NiflerEmitCache {
 static mut NIFLER_EMIT: Option<NiflerEmitCache> = None;
 
 /// A cheap content key for the phase module bytes: FNV-1a over the length plus the first and last 4 KiB.
-/// Distinct committed `.svmb` assets differ in length or head/tail, so this keys the cache without
+/// Distinct committed `.temen` assets differ in length or head/tail, so this keys the cache without
 /// hashing all ~17 MB on every Run; a rebuilt asset changes the key and re-emits.
 fn nifler_module_key(bytes: &[u8]) -> u64 {
     let mut h = 0xcbf29ce4_84222325u64;
@@ -3615,33 +3637,33 @@ fn nifler_module_key(bytes: &[u8]) -> u64 {
     h
 }
 
-/// **Wasm-JIT twin of [`svm_run_nifler_fs`]** (#1011 slice 1 — route the nifler phase run through the
-/// wasm-JIT). Decode + verify `nifler.svmb`, seed the editor's Nim as `/in.nim`, and open a single-shot
+/// **Wasm-JIT twin of [`temen_run_nifler_fs`]** (#1011 slice 1 — route the nifler phase run through the
+/// wasm-JIT). Decode + verify `nifler.temen`, seed the editor's Nim as `/in.nim`, and open a single-shot
 /// JIT run of `nifler p /in.nim /out.p.nif` rooted at `_start` — so the ~8k-func nifler phase runs on
 /// **emitted wasm** (its `fopen`/`write`/`exit` bounce cross-tier) instead of the tree-walker. Its output
 /// is the `.p.nif` file it writes, so the run **retains the memfs handle** and
-/// [`svm_onramp_jit_run_finish`] reads `out.p.nif` back onto the stdout slot — the card reads it via the
-/// usual [`svm_stdout_ptr`] accessor, identical to the bytecode path. Drive it with the shared
-/// `svm_onramp_jit_run_*` exports. Returns `0`, else a negative `STATUS_*` (also in [`LAST_STATUS`]) —
+/// [`temen_onramp_jit_run_finish`] reads `out.p.nif` back onto the stdout slot — the card reads it via the
+/// usual [`temen_stdout_ptr`] accessor, identical to the bytecode path. Drive it with the shared
+/// `temen_onramp_jit_run_*` exports. Returns `0`, else a negative `STATUS_*` (also in [`LAST_STATUS`]) —
 /// notably [`STATUS_UNSUPPORTED`] if `_start` isn't wasm-drivable (the card falls back to
-/// [`svm_run_nifler_fs`]).
+/// [`temen_run_nifler_fs`]).
 ///
 /// The emit is **cached** ([`NiflerEmitCache`]): the first parse pays the emit + `Module` clone; every
 /// later parse of the same nifler reuses the `Arc`-shared emit and only rebuilds the fresh window + memfs
 /// (with the new source), so a re-parse runs near the emitted-wasm run cost rather than re-emitting.
 #[no_mangle]
-pub extern "C" fn svm_run_nifler_jit_open(
+pub extern "C" fn temen_run_nifler_jit_open(
     mod_ptr: *const u8,
     mod_len: usize,
     src_ptr: *const u8,
     src_len: usize,
 ) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees each range is a live `svm_alloc`ation it just filled.
+    // SAFETY: the host guarantees each range is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let src = unsafe { core::slice::from_raw_parts(src_ptr, src_len) };
-    // Same memfs + argv the bytecode `svm_run_nifler_fs` builds: source at `/in.nim`, parse to `/out.p.nif`.
-    let image = svm_fs::encode_image(&[("in.nim".to_string(), src.to_vec())], &[]);
+    // Same memfs + argv the bytecode `temen_run_nifler_fs` builds: source at `/in.nim`, parse to `/out.p.nif`.
+    let image = temen_fs::encode_image(&[("in.nim".to_string(), src.to_vec())], &[]);
     let argv: [&[u8]; 4] = [b"nifler", b"p", b"/in.nim", b"/out.p.nif"];
     let key = nifler_module_key(bytes);
     // Cache hit: reuse the shared emit (no decode / verify / emit / clone). The cached module is a valid
@@ -3664,14 +3686,14 @@ pub extern "C" fn svm_run_nifler_jit_open(
         )
     } else {
         // Miss: decode + verify + emit, then stash the emit for next time.
-        let m = match svm_encode::decode_module(bytes) {
+        let m = match temen_encode::decode_module(bytes) {
             Ok(m) => m,
             Err(_) => {
                 set(STATUS_DECODE_ERR);
                 return -STATUS_DECODE_ERR;
             }
         };
-        if svm_verify::verify_module(&m).is_err() {
+        if temen_verify::verify_module(&m).is_err() {
             set(STATUS_VERIFY_ERR);
             return -STATUS_VERIFY_ERR;
         }
@@ -3714,16 +3736,16 @@ pub extern "C" fn svm_run_nifler_jit_open(
 /// [`nimc::compile_nim`]: it plays nifmake (computes stems, crawls the `import` graph with nifler),
 /// runs nimsem + hexer over the closure (nimsem spawning nifler through a wasm-native `exec` cap over
 /// the shared store), links through the nim→powerbox bridge, and runs `_start` under the powerbox.
-/// The program's **stdout** comes back on `svm_stdout_ptr`/`_len`; a compile/link/run failure puts the
-/// diagnostic on `svm_stderr_ptr`/`_len` and sets a non-OK [`svm_status`]. `img` is an `svm_fs`
+/// The program's **stdout** comes back on `temen_stdout_ptr`/`_len`; a compile/link/run failure puts the
+/// diagnostic on `temen_stderr_ptr`/`_len` and sets a non-OK [`temen_status`]. `img` is an `temen_fs`
 /// image of the stdlib (keys under `lib/`, with a flattened `lib/std/…`→`lib/…` view); `main` is the
 /// editor source's file name (e.g. `prog.nim`).
 ///
 /// # Safety
-/// Each pointer/len names a live `svm_alloc`ation the host just filled.
+/// Each pointer/len names a live `temen_alloc`ation the host just filled.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
-pub unsafe extern "C" fn svm_compile_nim_fs(
+pub unsafe extern "C" fn temen_compile_nim_fs(
     nifler_ptr: *const u8,
     nifler_len: usize,
     nimsem_ptr: *const u8,
@@ -3746,7 +3768,7 @@ pub unsafe extern "C" fn svm_compile_nim_fs(
     let src = sl(src_ptr, src_len).to_vec();
     let main = String::from_utf8_lossy(sl(main_ptr, main_len)).into_owned();
 
-    let (mut files, _dirs) = match svm_fs::decode_image(image) {
+    let (mut files, _dirs) = match temen_fs::decode_image(image) {
         Ok(x) => x,
         Err(_) => {
             set(STATUS_DECODE_ERR);
@@ -3777,16 +3799,16 @@ pub unsafe extern "C" fn svm_compile_nim_fs(
     }
 }
 
-/// **Self-host card — bytecode tier** (SELFHOST_C.md §7 step 5, the capstone). Run `chibicc.svmb` in
+/// **Self-host card — bytecode tier** (SELFHOST_C.md §7 step 5, the capstone). Run `chibicc.temen` in
 /// `--emit-object` mode over one of chibicc's *own* cc1 TUs, seeded from `[img_ptr, img_len)` — the
 /// committed closure image (`chibicc_selfhost.img`: the TU sources + their glibc header closure +
-/// `selfhost_prelude.h`) — and emit that TU's linkable **object** unit as SVM-IR **text** on
-/// `svm_stdout_ptr`/`_len`. `[tu_ptr, tu_len)` is the memfs-relative TU path. Unlike
-/// [`svm_run_onramp_fs`] (which merges the playground libc + seeds `/in.c`), the image is passed
+/// `selfhost_prelude.h`) — and emit that TU's linkable **object** unit as TEMEN-IR **text** on
+/// `temen_stdout_ptr`/`_len`. `[tu_ptr, tu_len)` is the memfs-relative TU path. Unlike
+/// [`temen_run_onramp_fs`] (which merges the playground libc + seeds `/in.c`), the image is passed
 /// **raw** — the self-host closure is self-contained. The wasm-JIT twin is
-/// [`svm_selfhost_jit_emit_object_fs`]. Sets [`svm_status`]/[`svm_exit_code`]; returns the guest result.
+/// [`temen_selfhost_jit_emit_object_fs`]. Sets [`temen_status`]/[`temen_exit_code`]; returns the guest result.
 #[no_mangle]
-pub extern "C" fn svm_selfhost_emit_object_fs(
+pub extern "C" fn temen_selfhost_emit_object_fs(
     mod_ptr: *const u8,
     mod_len: usize,
     img_ptr: *const u8,
@@ -3796,18 +3818,18 @@ pub extern "C" fn svm_selfhost_emit_object_fs(
     debug_info: i32,
 ) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees each range is a live `svm_alloc`ation it just filled.
+    // SAFETY: the host guarantees each range is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
     let tu = unsafe { core::slice::from_raw_parts(tu_ptr, tu_len) };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
             return 0;
         }
     };
-    if svm_verify::verify_module(&m).is_err() {
+    if temen_verify::verify_module(&m).is_err() {
         set(STATUS_VERIFY_ERR);
         return 0;
     }
@@ -3824,13 +3846,13 @@ pub extern "C" fn svm_selfhost_emit_object_fs(
 }
 
 // ==== persistent interactive Postgres session (the browser console) ===============================
-// `svm_run_pg` boots a *fresh* backend per call, runs the SQL to EOF, and lets it exit — every query
+// `temen_run_pg` boots a *fresh* backend per call, runs the SQL to EOF, and lets it exit — every query
 // pays the multi-second boot and loses all state. A `PgSession` keeps ONE backend alive: boot to the
 // `backend>` prompt once, then each query pushes SQL onto the (now **blocking**) stdin and resumes the
 // vCPU until it parks at the next read — so queries after the first are sub-second and DDL/DML persist
 // across them, exactly like a real `psql` session. This rides the [`bytecode::Vcpu::set_stdin_blocking`]
 // park (a `read` on an exhausted buffer suspends instead of returning EOF) over the same reserved
-// window `svm_run_pg` uses; Postgres `--single` is single-threaded, so the only events are the stdin
+// window `temen_run_pg` uses; Postgres `--single` is single-threaded, so the only events are the stdin
 // park, a clean exit, or a trap.
 
 /// A live single-user Postgres backend suspended at a stdin read. Owns its leaked [`bytecode::VcpuProgram`]
@@ -3844,12 +3866,12 @@ struct PgSession {
     stdout_pos: usize,
     /// The backend exited or trapped — no further queries are possible.
     ended: bool,
-    /// Live handle onto the session's `mem_fs` data dir, so [`svm_pg_snapshot`] can serialize the
+    /// Live handle onto the session's `mem_fs` data dir, so [`temen_pg_snapshot`] can serialize the
     /// current database (tables, WAL, catalogs) back out for the host to persist across reloads.
-    fs_snap: svm_fs::MemFsHandle,
+    fs_snap: temen_fs::MemFsHandle,
 }
 
-/// The one live session (single-threaded wasm ⇒ a plain static). `None` until [`svm_pg_open`].
+/// The one live session (single-threaded wasm ⇒ a plain static). `None` until [`temen_pg_open`].
 static mut PG_SESSION: Option<PgSession> = None;
 
 /// Drop the live session (if any) and **reclaim** its leaked program. Order matters: the vCPU (which
@@ -3888,7 +3910,7 @@ fn pg_pump(s: &mut PgSession) -> i32 {
 }
 
 /// Stash the session's stdout **delta** (bytes since the last hand-back) into the `OUT` buffer the
-/// `svm_stdout_ptr`/`_len` accessors expose, advancing the cursor.
+/// `temen_stdout_ptr`/`_len` accessors expose, advancing the cursor.
 fn pg_flush_stdout(s: &mut PgSession) {
     let out = &s.vcpu.host_mut().stdout;
     let delta = out.get(s.stdout_pos..).unwrap_or(&[]).to_vec();
@@ -3900,11 +3922,11 @@ fn pg_flush_stdout(s: &mut PgSession) {
 /// **Open a persistent Postgres session.** Decode + verify the module at `[mod_ptr, mod_len)`, mount the
 /// data image at `[img_ptr, img_len)` on the `fs` cap, and boot `postgres --single` to its `backend>`
 /// prompt — leaving it **suspended at the first stdin read** (blocking stdin) rather than running to
-/// exit. Replaces any prior session. Sets [`svm_status`]; the banner + prompt land in `svm_stdout_*`.
-/// Returns `0` on a ready backend, else the negative `STATUS_*`. Drive with [`svm_pg_query`], end with
-/// [`svm_pg_close`].
+/// exit. Replaces any prior session. Sets [`temen_status`]; the banner + prompt land in `temen_stdout_*`.
+/// Returns `0` on a ready backend, else the negative `STATUS_*`. Drive with [`temen_pg_query`], end with
+/// [`temen_pg_close`].
 #[no_mangle]
-pub extern "C" fn svm_pg_open(
+pub extern "C" fn temen_pg_open(
     mod_ptr: *const u8,
     mod_len: usize,
     img_ptr: *const u8,
@@ -3912,17 +3934,17 @@ pub extern "C" fn svm_pg_open(
 ) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     pg_close_session(); // a fresh open supersedes any live session
-                        // SAFETY: the host guarantees each range is a live `svm_alloc`ation it just filled.
+                        // SAFETY: the host guarantees each range is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
             return -STATUS_DECODE_ERR;
         }
     };
-    if svm_verify::verify_module(&m).is_err() {
+    if temen_verify::verify_module(&m).is_err() {
         set(STATUS_VERIFY_ERR);
         return -STATUS_VERIFY_ERR;
     }
@@ -3949,7 +3971,7 @@ pub extern "C" fn svm_pg_open(
         &[],
         &init_mem,
         host,
-        svm_ir::DEFAULT_RESERVED_LOG2,
+        temen_ir::DEFAULT_RESERVED_LOG2,
     ) {
         Ok(v) => v,
         Err(_) => {
@@ -3980,11 +4002,11 @@ pub extern "C" fn svm_pg_open(
 
 /// **Run one query on the open session.** Push the SQL at `[sql_ptr, sql_len)` (a trailing newline is
 /// added if absent, so `--single` executes it) onto the backend's stdin and resume until it parks at the
-/// next prompt. Sets [`svm_status`]; the query's output (result rows + the next `backend>`) lands in
-/// `svm_stdout_*` as a **delta** (just this query's bytes). Returns `0` on a ready backend, else the
+/// next prompt. Sets [`temen_status`]; the query's output (result rows + the next `backend>`) lands in
+/// `temen_stdout_*` as a **delta** (just this query's bytes). Returns `0` on a ready backend, else the
 /// negative `STATUS_*` (incl. [`STATUS_UNSUPPORTED`] if no session is open or it already ended).
 #[no_mangle]
-pub extern "C" fn svm_pg_query(sql_ptr: *const u8, sql_len: usize) -> i32 {
+pub extern "C" fn temen_pg_query(sql_ptr: *const u8, sql_len: usize) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: single-threaded wasm; exclusive access to the session static.
     let Some(session) = (unsafe { (*core::ptr::addr_of_mut!(PG_SESSION)).as_mut() }) else {
@@ -3995,7 +4017,7 @@ pub extern "C" fn svm_pg_query(sql_ptr: *const u8, sql_len: usize) -> i32 {
         set(STATUS_UNSUPPORTED);
         return -STATUS_UNSUPPORTED;
     }
-    // SAFETY: the host guarantees `[sql_ptr, sql_len)` is a live `svm_alloc`ation it just filled.
+    // SAFETY: the host guarantees `[sql_ptr, sql_len)` is a live `temen_alloc`ation it just filled.
     let sql: &[u8] = if sql_ptr.is_null() || sql_len == 0 {
         &[]
     } else {
@@ -4017,15 +4039,15 @@ pub extern "C" fn svm_pg_query(sql_ptr: *const u8, sql_len: usize) -> i32 {
 
 /// **Snapshot the open session's database** to a shippable data image. Serializes the live `mem_fs`
 /// data dir — every file the backend has written (heap tables, indexes, WAL, catalogs) — into the same
-/// [`svm_fs::encode_image`] blob [`svm_pg_open`] mounts, so the host can persist it (e.g. IndexedDB) and
+/// [`temen_fs::encode_image`] blob [`temen_pg_open`] mounts, so the host can persist it (e.g. IndexedDB) and
 /// reopen from it on the next visit: Postgres runs its normal startup recovery over the snapshot and all
 /// committed state comes back. Best taken while the backend is parked at its prompt (between queries),
 /// when the fs is quiescent — the natural resting state of an idle session. The bytes land in a
-/// cdylib-managed allocation exposed by `svm_pg_snapshot_ptr`/`_len`, valid until the next snapshot (do
-/// **not** `svm_dealloc` it). Sets [`svm_status`]; returns `0` on success, `-STATUS_UNSUPPORTED` if no
+/// cdylib-managed allocation exposed by `temen_pg_snapshot_ptr`/`_len`, valid until the next snapshot (do
+/// **not** `temen_dealloc` it). Sets [`temen_status`]; returns `0` on success, `-STATUS_UNSUPPORTED` if no
 /// session is open.
 #[no_mangle]
-pub extern "C" fn svm_pg_snapshot() -> i32 {
+pub extern "C" fn temen_pg_snapshot() -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: single-threaded wasm; exclusive access to the session static. A snapshot only reads the
     // fs handle, so an `ended` (exited/trapped) session is still serializable — its data dir holds the
@@ -4035,28 +4057,28 @@ pub extern "C" fn svm_pg_snapshot() -> i32 {
         return -STATUS_UNSUPPORTED;
     };
     let image = session.fs_snap.image();
-    // SAFETY: single-threaded wasm; read back only via the `svm_pg_snapshot_*` accessors.
+    // SAFETY: single-threaded wasm; read back only via the `temen_pg_snapshot_*` accessors.
     unsafe { stash(&mut *core::ptr::addr_of_mut!(PG_SNAP), image) };
     set(STATUS_OK);
     0
 }
 
 /// Close the open Postgres session (drop the backend + reclaim its program). Idempotent; a no-op when
-/// none is open. The next [`svm_pg_open`] starts a fresh backend.
+/// none is open. The next [`temen_pg_open`] starts a fresh backend.
 #[no_mangle]
-pub extern "C" fn svm_pg_close() {
+pub extern "C" fn temen_pg_close() {
     pg_close_session();
 }
 
 /// A live per-frame **reactor** over an on-ramp guest — the interactive/graphical run model (the path
-/// Doom rides), the browser twin of `svm-run`'s reactor `Session`. Instantiate once: run `_start`
+/// Doom rides), the browser twin of `temen-run`'s reactor `Session`. Instantiate once: run `_start`
 /// (func 0) to stash the granted handles and run the C initializer, then call the guest's exported
 /// `tick` once per host-driven frame. State (globals/BSS within the 256 KiB `SNAP_CAP` window)
 /// **persists** between frames via the snapshot round-trip. Each `tick` presents a frame through the
 /// `display` capability (captured into `frame`) and drains input through the `keyboard` capability
 /// (`keys`, fed by the host). Single-threaded; the guest keeps its per-frame state in globals/BSS (a
 /// grown `malloc` heap above the window is **not** persisted yet — the same slice-1 reactor scope as
-/// `svm-run`, and the reason Doom itself needs the heap-persistence follow-on).
+/// `temen-run`, and the reason Doom itself needs the heap-persistence follow-on).
 pub struct OnrampReactor {
     /// The persistent single-vCPU instance — its guest window (globals, BSS, **and** the grown heap)
     /// stays live between frames, so heavy-heap guests (Life, eventually Doom) keep their state.
@@ -4064,7 +4086,7 @@ pub struct OnrampReactor {
     host: Host,
     /// The reactor calling convention's data-stack base (`powerbox_entry_sp`), passed to each `tick`.
     entry_sp: u64,
-    tick: svm_ir::FuncIdx,
+    tick: temen_ir::FuncIdx,
     frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
     keys: KeyQueue,
     /// The `Debug` string of the last frame's trap (diagnostic; `None` until a `tick` traps).
@@ -4077,7 +4099,7 @@ impl OnrampReactor {
     /// per-frame `tick` calls. `Err(status)` if an import-bearing module lacks the manifest entry
     /// shape (fail-closed, IMPORTS.md phase 4), there is no exported `tick`, the module is outside
     /// the engine's subset, or the entry traps.
-    pub fn open(m: &svm_ir::Module) -> Result<OnrampReactor, i32> {
+    pub fn open(m: &temen_ir::Module) -> Result<OnrampReactor, i32> {
         Self::open_inner(m, None)
     }
 
@@ -4087,18 +4109,21 @@ impl OnrampReactor {
     /// reads its IWAD through the `fs` cap during init, so the file must be served before `_start`
     /// runs — which this does, since [`grant_onramp_caps`] grants it ahead of the `_start` call.
     pub fn open_with_fs(
-        m: &svm_ir::Module,
+        m: &temen_ir::Module,
         name: String,
         data: Vec<u8>,
     ) -> Result<OnrampReactor, i32> {
         Self::open_inner(m, Some((name, data)))
     }
 
-    fn open_inner(m: &svm_ir::Module, fs: Option<(String, Vec<u8>)>) -> Result<OnrampReactor, i32> {
+    fn open_inner(
+        m: &temen_ir::Module,
+        fs: Option<(String, Vec<u8>)>,
+    ) -> Result<OnrampReactor, i32> {
         onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
         // The per-frame entry: the guest's exported `tick` (reactor convention `(sp) -> …`).
         let tick = m.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
-        let entry_sp = svm_ir::powerbox_entry_sp(m);
+        let entry_sp = temen_ir::powerbox_entry_sp(m);
         let mut host = Host::new();
         let (frame, keys) = grant_onramp_caps(&mut host, m, fs);
         let mut inst = bytecode::Reactor::open(m).ok_or(STATUS_UNSUPPORTED)?;
@@ -4162,7 +4187,7 @@ impl OnrampReactor {
 }
 
 /// Like [`OnrampReactor`], but the guest window lives in a **caller-provided region of this module's
-/// own linear memory** (a [`Region::shared`](svm_interp::Region::shared) over `[win_ptr, win_size)`)
+/// own linear memory** (a [`Region::shared`](temen_interp::Region::shared) over `[win_ptr, win_size)`)
 /// rather than a window the engine backs internally. That relocation is the substrate the wasm-JIT
 /// **reactor** tier needs (BROWSER.md § "wasm-JIT tier", slice 5b): the emitted `tick` — a JS-compiled
 /// wasm module that imports `env.memory` = *this* cdylib's linear memory — must read and write the same
@@ -4183,9 +4208,9 @@ pub struct SharedOnrampReactor {
     /// a `Box<[u8]>`'s heap allocation is stable across moves of the struct.
     _backing: Option<Box<[u8]>>,
     /// The shared backing region (kept so its lifetime is tied to the reactor's).
-    _back: std::sync::Arc<svm_interp::Region>,
+    _back: std::sync::Arc<temen_interp::Region>,
     entry_sp: u64,
-    tick: svm_ir::FuncIdx,
+    tick: temen_ir::FuncIdx,
     frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
     keys: KeyQueue,
     last_trap: Option<String>,
@@ -4196,14 +4221,14 @@ impl SharedOnrampReactor {
     /// (allocated + kept alive here) — the native/test entry. `win_log2` must be ≥ the module's mapped
     /// size and large enough for the guest's grown heap. See [`open_shared`](Self::open_shared) for the
     /// FFI entry that borrows a caller-owned window.
-    pub fn open_owned(m: &svm_ir::Module, win_log2: u8) -> Result<SharedOnrampReactor, i32> {
+    pub fn open_owned(m: &temen_ir::Module, win_log2: u8) -> Result<SharedOnrampReactor, i32> {
         Self::open_owned_inner(m, win_log2, None)
     }
 
     /// Like [`open_owned`](Self::open_owned) but also grant an `fs` capability serving one read-only
     /// file `data` under `name` (the WAD read path — see [`OnrampReactor::open_with_fs`]).
     pub fn open_owned_with_fs(
-        m: &svm_ir::Module,
+        m: &temen_ir::Module,
         win_log2: u8,
         name: String,
         data: Vec<u8>,
@@ -4212,7 +4237,7 @@ impl SharedOnrampReactor {
     }
 
     fn open_owned_inner(
-        m: &svm_ir::Module,
+        m: &temen_ir::Module,
         win_log2: u8,
         fs: Option<(String, Vec<u8>)>,
     ) -> Result<SharedOnrampReactor, i32> {
@@ -4222,36 +4247,36 @@ impl SharedOnrampReactor {
         // SAFETY: `backing` (a `Box<[u8]>` of `win_size` bytes) is owned by the returned struct and its
         // heap allocation is pointer-stable across the struct's moves, so `[ptr, win_size)` stays valid
         // and exclusively this reactor's window for its whole lifetime.
-        let back = std::sync::Arc::new(unsafe { svm_interp::Region::shared(ptr, win_size) });
+        let back = std::sync::Arc::new(unsafe { temen_interp::Region::shared(ptr, win_size) });
         Self::open_over(m, back, Some(backing), fs)
     }
 
     /// Open a shared-window reactor over a **caller-owned** window `[win_ptr, win_ptr+win_size)` of this
-    /// module's linear memory — the FFI entry (the host `svm_alloc`s the window and keeps it live for
+    /// module's linear memory — the FFI entry (the host `temen_alloc`s the window and keeps it live for
     /// the reactor's lifetime).
     ///
     /// # Safety
     /// `[win_ptr, win_size)` must be a live region of this module's linear memory, used solely as this
     /// reactor's window and kept valid (not freed, not reused) until the reactor is dropped.
     pub unsafe fn open_shared(
-        m: &svm_ir::Module,
+        m: &temen_ir::Module,
         win_ptr: *mut u8,
         win_size: u64,
         fs: Option<(String, Vec<u8>)>,
     ) -> Result<SharedOnrampReactor, i32> {
-        let back = std::sync::Arc::new(svm_interp::Region::shared(win_ptr, win_size));
+        let back = std::sync::Arc::new(temen_interp::Region::shared(win_ptr, win_size));
         Self::open_over(m, back, None, fs)
     }
 
     fn open_over(
-        m: &svm_ir::Module,
-        back: std::sync::Arc<svm_interp::Region>,
+        m: &temen_ir::Module,
+        back: std::sync::Arc<temen_interp::Region>,
         backing: Option<Box<[u8]>>,
         fs: Option<(String, Vec<u8>)>,
     ) -> Result<SharedOnrampReactor, i32> {
         onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
         let tick = m.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
-        let entry_sp = svm_ir::powerbox_entry_sp(m);
+        let entry_sp = temen_ir::powerbox_entry_sp(m);
         let mut host = Host::new();
         let (frame, keys) = grant_onramp_caps(&mut host, m, fs);
         // Run the entry (func 0) once over the shared window with no args (phase 4: the manifest
@@ -4337,7 +4362,7 @@ impl SharedOnrampReactor {
 /// guest stays confined to the (larger, still power-of-two) window.
 pub struct JitOnrampReactor {
     /// The import-resolved, window-enlarged module — cross-tier callees are interpreted from it.
-    module: svm_ir::Module,
+    module: temen_ir::Module,
     /// The module compiled **once** for cross-tier runs. Recompiling per `env.call_interp` bounce
     /// (a handful per frame) otherwise dominates the frame — for Doom, ~6 ms × 3 ≈ 19 ms of a 20 ms
     /// frame; cached, a cross-tier call is just build-window + interpret.
@@ -4347,12 +4372,12 @@ pub struct JitOnrampReactor {
     host: Host,
     /// Keep-alive for an owned backing (native path); `None` when the window is caller-owned (FFI).
     _backing: Option<Box<[u8]>>,
-    back: std::sync::Arc<svm_interp::Region>,
+    back: std::sync::Arc<temen_interp::Region>,
     /// The window base as a byte offset in this module's linear memory — the emitted `f{tick}`'s `win`
     /// argument (the address the emitted code masks its accesses against).
     win_base: usize,
     entry_sp: u64,
-    tick: svm_ir::FuncIdx,
+    tick: temen_ir::FuncIdx,
     /// The emitted wasm for the whole `tick` (the host compiles + runs it) and the per-function emitted
     /// bitmap (`emitted[i]` ⇒ `f{i}` runs on wasm; the rest bounce through `run_cross_tier`).
     emitted_wasm: Vec<u8>,
@@ -4369,7 +4394,7 @@ impl JitOnrampReactor {
     /// identical). `Err(status)` if imports don't resolve, there is no `tick`, `_start` traps, or the
     /// `tick` isn't wasm-JIT-emittable (it falls back to [`SharedOnrampReactor`]).
     pub fn open_owned_jit(
-        m: &svm_ir::Module,
+        m: &temen_ir::Module,
         win_log2: u8,
         shared_memory: bool,
         fs: Option<(String, Vec<u8>)>,
@@ -4380,7 +4405,7 @@ impl JitOnrampReactor {
         // SAFETY: `backing` is owned by the returned struct and its heap allocation is pointer-stable
         // across the struct's moves, so `[ptr, win_size)` stays valid + exclusive for the run.
         let win_base = ptr as usize;
-        let back = std::sync::Arc::new(unsafe { svm_interp::Region::shared(ptr, win_size) });
+        let back = std::sync::Arc::new(unsafe { temen_interp::Region::shared(ptr, win_size) });
         Self::open_over_jit(
             m,
             back,
@@ -4399,7 +4424,7 @@ impl JitOnrampReactor {
     /// `[win_ptr, win_size)` must be a live region of this module's linear memory, used solely as this
     /// reactor's window and kept valid until the reactor is dropped.
     pub unsafe fn open_shared_jit(
-        m: &svm_ir::Module,
+        m: &temen_ir::Module,
         win_ptr: *mut u8,
         win_size: u64,
         win_log2: u8,
@@ -4407,13 +4432,13 @@ impl JitOnrampReactor {
         fs: Option<(String, Vec<u8>)>,
     ) -> Result<JitOnrampReactor, i32> {
         let win_base = win_ptr as usize;
-        let back = std::sync::Arc::new(svm_interp::Region::shared(win_ptr, win_size));
+        let back = std::sync::Arc::new(temen_interp::Region::shared(win_ptr, win_size));
         Self::open_over_jit(m, back, None, win_base, win_log2, shared_memory, fs)
     }
 
     fn open_over_jit(
-        m: &svm_ir::Module,
-        back: std::sync::Arc<svm_interp::Region>,
+        m: &temen_ir::Module,
+        back: std::sync::Arc<temen_interp::Region>,
         backing: Option<Box<[u8]>>,
         win_base: usize,
         win_log2: u8,
@@ -4426,7 +4451,7 @@ impl JitOnrampReactor {
         // compute with a once-per-frame present/poll cap call still emits (its hot path runs on wasm;
         // only the cap wrapper bounces to the interpreter). Mutates the module BOTH tiers use: the
         // emitter reads it below, and `run_cross_tier` runs the wrappers on the interpreter.
-        svm_wasm_jit::outline_cap_calls(&mut module);
+        temen_wasm_jit::outline_cap_calls(&mut module);
         // Enlarge the mapped window to cover the guest's grown heap (see the struct docs).
         if let Some(mc) = module.memory.as_mut() {
             if (mc.size_log2 as u32) < win_log2 as u32 {
@@ -4434,7 +4459,7 @@ impl JitOnrampReactor {
             }
         }
         let tick = module.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
-        let entry_sp = svm_ir::powerbox_entry_sp(&module);
+        let entry_sp = temen_ir::powerbox_entry_sp(&module);
         let mut host = Host::new();
         let (frame, keys) = grant_onramp_caps(&mut host, &module, fs);
         // Compile the module **once** — reused for the entry and every per-frame cross-tier bounce.
@@ -4452,13 +4477,13 @@ impl JitOnrampReactor {
         // wasm-drivable (a JITted frame can't unwind across a stack switch), so it reports
         // `InterpDriven` instead of emitting a reactor this driver couldn't run — fall back to the
         // pure interpreter then, exactly as when the `tick` is out of subset.
-        let artifact = svm_wasm_jit::compile_jit(
+        let artifact = temen_wasm_jit::compile_jit(
             &module,
-            svm_wasm_jit::Shape::Reactor { entry: tick },
+            temen_wasm_jit::Shape::Reactor { entry: tick },
             shared_memory,
         )
         .map_err(|_| STATUS_UNSUPPORTED)?;
-        let svm_wasm_jit::DriveMode::WasmDriven { .. } = artifact.drive else {
+        let temen_wasm_jit::DriveMode::WasmDriven { .. } = artifact.drive else {
             return Err(STATUS_UNSUPPORTED);
         };
         let (emitted_wasm, emitted) = (artifact.wasm, artifact.emitted);
@@ -4501,8 +4526,8 @@ impl JitOnrampReactor {
         self.entry_sp
     }
 
-    /// The SVM index of the exported `tick` — the emitted export name is `f{tick}`.
-    pub fn tick(&self) -> svm_ir::FuncIdx {
+    /// The Temen index of the exported `tick` — the emitted export name is `f{tick}`.
+    pub fn tick(&self) -> temen_ir::FuncIdx {
         self.tick
     }
 
@@ -4526,7 +4551,7 @@ impl JitOnrampReactor {
 
     /// The signature of cross-tier `func` (the host marshals `env.call_interp`'s i64 arg/result slots
     /// per these types).
-    pub fn func_sig(&self, func: u32) -> (&[svm_ir::ValType], &[svm_ir::ValType]) {
+    pub fn func_sig(&self, func: u32) -> (&[temen_ir::ValType], &[temen_ir::ValType]) {
         let f = &self.module.funcs[func as usize];
         (&f.params, &f.results)
     }
@@ -4571,7 +4596,7 @@ impl JitOnrampReactor {
 /// cheaply `Arc`-cloned — reusing them skips the ~2 s emit + ~2 s `Module` clone on a re-Run of the same
 /// guest (nifler). The interpreter's `SharedProgram` is already an `Arc`-backed cheap clone.
 type CachedEmit = (
-    std::sync::Arc<svm_ir::Module>,
+    std::sync::Arc<temen_ir::Module>,
     std::sync::Arc<bytecode::SharedProgram>,
     std::sync::Arc<[u8]>,
     Vec<bool>,
@@ -4580,13 +4605,13 @@ type CachedEmit = (
 pub struct JitOnrampRun {
     /// The outlined module. `Arc` so a cached emit (nifler, #1011 slice 1) is shared with the run
     /// instead of deep-cloned — a nifler `Module` clone costs ~2 s, as much as the emit itself.
-    module: std::sync::Arc<svm_ir::Module>,
+    module: std::sync::Arc<temen_ir::Module>,
     /// The compiled interpreter program for cross-tier bounces. `Arc` so the nifler emit cache shares it
     /// across Runs (its data image is otherwise copied per Run).
     program: std::sync::Arc<bytecode::SharedProgram>,
     host: Host,
     _backing: Option<Box<[u8]>>,
-    back: std::sync::Arc<svm_interp::Region>,
+    back: std::sync::Arc<temen_interp::Region>,
     win_base: usize,
     /// The emitted `_start` wasm. `Arc<[u8]>` for the same reason as `module` — the nifler emit cache
     /// shares these ~40 MB across Runs (the JS driver's V8-compiled Module is cached separately).
@@ -4602,8 +4627,8 @@ pub struct JitOnrampRun {
     exit_code: i32,
     exited: bool,
     /// The value the emitted `f0` returned (the guest's top-level result), reported by the JS driver via
-    /// [`svm_onramp_jit_run_report`]. Meaningful only when the run *returned* (not exited/trapped) — it is
-    /// what [`svm_run_onramp`]'s `value` is on the interpreter, so the two tiers agree on the result.
+    /// [`temen_onramp_jit_run_report`]. Meaningful only when the run *returned* (not exited/trapped) — it is
+    /// what [`temen_run_onramp`]'s `value` is on the interpreter, so the two tiers agree on the result.
     returned_value: i64,
     /// Set when the emitted `f0` unwound on a **trap** (a wasm `unreachable`, or a cross-tier bounce that
     /// trapped rather than `exit`ed) instead of returning. The JS driver can't tell an `exit` unwind from
@@ -4613,10 +4638,10 @@ pub struct JitOnrampRun {
     trapped: bool,
     /// A phase guest whose output is a **file it wrote to the memfs**, not stdout (nifler `p /in.nim
     /// /out.p.nif` — #1011 slice 1): the retained `MemFsHandle` + the memfs key to read back. When set,
-    /// [`output`](Self::output) returns that file's bytes instead of `stdout`, so `svm_onramp_jit_run_finish`
+    /// [`output`](Self::output) returns that file's bytes instead of `stdout`, so `temen_onramp_jit_run_finish`
     /// hands the produced file to the card exactly as the bytecode `onramp_fs_exec_readback` does. `None`
     /// for a stdout guest (Lua/chibicc), whose memfs handle is dropped.
-    fs_readback: Option<(svm_fs::MemFsHandle, String)>,
+    fs_readback: Option<(temen_fs::MemFsHandle, String)>,
 }
 
 /// How a single-shot JIT run feeds its guest — the twin of [`onramp_exec`] (stdin) vs
@@ -4644,7 +4669,7 @@ impl JitOnrampRun {
     /// `[win_ptr, win_size)` must be a live region of this module's linear memory, used solely as this
     /// run's window and kept valid until the run is dropped.
     pub unsafe fn open_shared_run(
-        m: &svm_ir::Module,
+        m: &temen_ir::Module,
         win_ptr: *mut u8,
         win_size: u64,
         win_log2: u8,
@@ -4652,7 +4677,7 @@ impl JitOnrampRun {
         stdin: Vec<u8>,
     ) -> Result<JitOnrampRun, i32> {
         let win_base = win_ptr as usize;
-        let back = std::sync::Arc::new(svm_interp::Region::shared(win_ptr, win_size));
+        let back = std::sync::Arc::new(temen_interp::Region::shared(win_ptr, win_size));
         Self::open_over_run(
             m,
             back,
@@ -4672,7 +4697,7 @@ impl JitOnrampRun {
     /// larger (Lua declares 64 MiB), so the allocated window always equals the size the emitter masks
     /// to; a smaller allocation would fault any access into the module's upper address range.
     pub fn open_owned_run(
-        m: &svm_ir::Module,
+        m: &temen_ir::Module,
         win_log2: u8,
         shared_memory: bool,
         stdin: Vec<u8>,
@@ -4683,9 +4708,9 @@ impl JitOnrampRun {
     /// Like [`open_owned_run`](Self::open_owned_run), but the guest reads its input from a seeded
     /// **memfs** `image` (mounted on the `fs` cap) with `argv` seeded at `POWERBOX_ARGS_BASE` — the
     /// single-shot JIT twin of [`onramp_fs_exec`]. This is the chibicc-in-the-browser card's fast tier:
-    /// chibicc `fopen`s `/in.c` + `/include/*.h`, emits SVM-IR text on stdout.
+    /// chibicc `fopen`s `/in.c` + `/include/*.h`, emits TEMEN-IR text on stdout.
     pub fn open_owned_run_fs(
-        m: &svm_ir::Module,
+        m: &temen_ir::Module,
         win_log2: u8,
         shared_memory: bool,
         image: &[u8],
@@ -4708,10 +4733,10 @@ impl JitOnrampRun {
     /// Like [`open_owned_run_fs`](Self::open_owned_run_fs), but the guest's output is a **file it writes
     /// to the memfs** (at key `readback`), not stdout — the single-shot JIT twin of
     /// [`onramp_fs_exec_readback`], for a phase guest like nifler (`p /in.nim /out.p.nif`, #1011 slice 1).
-    /// `svm_onramp_jit_run_finish` reads that key back and hands it to the card on the stdout slot, exactly
+    /// `temen_onramp_jit_run_finish` reads that key back and hands it to the card on the stdout slot, exactly
     /// as the bytecode path does.
     pub fn open_owned_run_fs_readback(
-        m: &svm_ir::Module,
+        m: &temen_ir::Module,
         win_log2: u8,
         shared_memory: bool,
         image: &[u8],
@@ -4751,7 +4776,7 @@ impl JitOnrampRun {
     /// module's linear memory, used solely as this run's window, valid until the run is dropped.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn open_shared_run_fs(
-        m: &svm_ir::Module,
+        m: &temen_ir::Module,
         win_ptr: *mut u8,
         win_size: u64,
         win_log2: u8,
@@ -4761,7 +4786,7 @@ impl JitOnrampRun {
         stdin: Vec<u8>,
     ) -> Result<JitOnrampRun, i32> {
         let win_base = win_ptr as usize;
-        let back = std::sync::Arc::new(svm_interp::Region::shared(win_ptr, win_size));
+        let back = std::sync::Arc::new(temen_interp::Region::shared(win_ptr, win_size));
         Self::open_over_run(
             m,
             back,
@@ -4782,7 +4807,7 @@ impl JitOnrampRun {
     }
 
     fn open_owned_run_with(
-        m: &svm_ir::Module,
+        m: &temen_ir::Module,
         win_log2: u8,
         shared_memory: bool,
         input: RunInput,
@@ -4795,7 +4820,7 @@ impl JitOnrampRun {
     /// only the fresh window backing + per-run powerbox are built around the shared emit; on a miss the
     /// emit runs and `cached` is `None`.
     fn open_owned_run_with_cached(
-        m: &svm_ir::Module,
+        m: &temen_ir::Module,
         win_log2: u8,
         shared_memory: bool,
         input: RunInput,
@@ -4814,7 +4839,7 @@ impl JitOnrampRun {
         let win_base = ptr as usize;
         // SAFETY: `backing` is owned by the returned struct and pointer-stable across its moves, so
         // `[ptr, win_size)` stays valid + exclusive for the run.
-        let back = std::sync::Arc::new(unsafe { svm_interp::Region::shared(ptr, win_size) });
+        let back = std::sync::Arc::new(unsafe { temen_interp::Region::shared(ptr, win_size) });
         Self::open_over_run(
             m,
             back,
@@ -4831,8 +4856,8 @@ impl JitOnrampRun {
 
     #[allow(clippy::too_many_arguments)]
     fn open_over_run(
-        m: &svm_ir::Module,
-        back: std::sync::Arc<svm_interp::Region>,
+        m: &temen_ir::Module,
+        back: std::sync::Arc<temen_interp::Region>,
         backing: Option<Box<[u8]>>,
         win_ptr: *mut u8,
         win_size: u64,
@@ -4851,7 +4876,7 @@ impl JitOnrampRun {
             None => {
                 onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
                 let mut module = m.clone();
-                svm_wasm_jit::outline_cap_calls(&mut module);
+                temen_wasm_jit::outline_cap_calls(&mut module);
                 // Enlarge the mapped window to cover the guest's heap (fixed — emitted code can't grow it).
                 if let Some(mc) = module.memory.as_mut() {
                     if (mc.size_log2 as u32) < win_log2 as u32 {
@@ -4866,13 +4891,13 @@ impl JitOnrampRun {
                 // `env.call_interp`. The front door reports `InterpDriven` (→ fall back to the pure
                 // interpreter) if `_start` is out of subset or its reachable set can suspend — this
                 // driver can only run a wasm-driven artifact.
-                let artifact = svm_wasm_jit::compile_jit(
+                let artifact = temen_wasm_jit::compile_jit(
                     &module,
-                    svm_wasm_jit::Shape::Batch { entry: 0 },
+                    temen_wasm_jit::Shape::Batch { entry: 0 },
                     shared_memory,
                 )
                 .map_err(|_| STATUS_UNSUPPORTED)?;
-                let svm_wasm_jit::DriveMode::WasmDriven { .. } = artifact.drive else {
+                let temen_wasm_jit::DriveMode::WasmDriven { .. } = artifact.drive else {
                     return Err(STATUS_UNSUPPORTED);
                 };
                 (
@@ -4957,25 +4982,25 @@ impl JitOnrampRun {
     /// export (not `_start`), the window is **not** re-seeded with data segments (the caller restores the
     /// warm image before each drive), and the entry's `sp` rides along as the emitted `f0`'s trailing
     /// slot. Returns [`STATUS_UNSUPPORTED`] if `eval_run` isn't wasm-drivable — the caller then evaluates
-    /// on the interpreter warm path ([`svm_warm_eval`]).
+    /// on the interpreter warm path ([`temen_warm_eval`]).
     ///
     /// # Safety
     /// `back` must alias the live warm-session window `[win_ptr, 1 << win_log2)`, kept valid until the
-    /// run is dropped (it is owned by the [`WarmSession`] that holds this run, freed in `svm_warm_close`).
+    /// run is dropped (it is owned by the [`WarmSession`] that holds this run, freed in `temen_warm_close`).
     #[allow(clippy::too_many_arguments)]
     unsafe fn open_warm_eval(
-        m: &svm_ir::Module,
-        back: std::sync::Arc<svm_interp::Region>,
+        m: &temen_ir::Module,
+        back: std::sync::Arc<temen_interp::Region>,
         win_ptr: *mut u8,
         win_log2: u8,
         shared_memory: bool,
-        eval_fn: svm_ir::FuncIdx,
+        eval_fn: temen_ir::FuncIdx,
         entry_sp: u64,
     ) -> Result<JitOnrampRun, i32> {
         onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
         let win_base = win_ptr as usize;
         let mut module = m.clone();
-        svm_wasm_jit::outline_cap_calls(&mut module);
+        temen_wasm_jit::outline_cap_calls(&mut module);
         // The warm module already declares the mapped window; keep the belt-and-braces enlarge for parity
         // with `open_over_run` (a no-op when `size_log2 == win_log2`).
         if let Some(mc) = module.memory.as_mut() {
@@ -4983,7 +5008,7 @@ impl JitOnrampRun {
                 mc.size_log2 = win_log2;
             }
         }
-        // The powerbox the interpreter warm path grants (`svm_warm_eval`) — a fresh host is re-granted per
+        // The powerbox the interpreter warm path grants (`temen_warm_eval`) — a fresh host is re-granted per
         // Run via [`reset_warm`]; this one seeds `open`, replaced before the first drive.
         let mut host = Host::new();
         let (frame, _keys) = grant_onramp_caps(&mut host, &module, None);
@@ -4993,13 +5018,13 @@ impl JitOnrampRun {
         );
         // Emit rooted at `eval_run` (not `_start`); the reachable-set / concurrency gates are unchanged,
         // so a driver whose eval can suspect or leaves the subset declines to the interpreter.
-        let artifact = svm_wasm_jit::compile_jit(
+        let artifact = temen_wasm_jit::compile_jit(
             &module,
-            svm_wasm_jit::Shape::Batch { entry: eval_fn },
+            temen_wasm_jit::Shape::Batch { entry: eval_fn },
             shared_memory,
         )
         .map_err(|_| STATUS_UNSUPPORTED)?;
-        let svm_wasm_jit::DriveMode::WasmDriven { .. } = artifact.drive else {
+        let temen_wasm_jit::DriveMode::WasmDriven { .. } = artifact.drive else {
             return Err(STATUS_UNSUPPORTED);
         };
         let (emitted_wasm, emitted) = (artifact.wasm, artifact.emitted);
@@ -5025,7 +5050,7 @@ impl JitOnrampRun {
 
     /// Reset a cached warm+JIT run for a fresh Run: rebuild the powerbox (a clean `Host` + `grant_onramp_
     /// caps`, so captured streams and the frame cell start empty) and clear the finish flags. The caller
-    /// restores the warm image into the window separately (`svm_warm_jit_prepare`); together they give the
+    /// restores the warm image into the window separately (`temen_warm_jit_prepare`); together they give the
     /// same fresh-per-Run state the interpreter warm path gets, so no guest state crosses Runs.
     fn reset_warm(&mut self, stdin: Vec<u8>) {
         let mut host = Host::new();
@@ -5059,7 +5084,7 @@ impl JitOnrampRun {
         &self.emitted
     }
     /// The signature of cross-tier `func` (the host marshals `env.call_interp`'s i64 slots per these).
-    pub fn func_sig(&self, func: u32) -> (&[svm_ir::ValType], &[svm_ir::ValType]) {
+    pub fn func_sig(&self, func: u32) -> (&[temen_ir::ValType], &[temen_ir::ValType]) {
         let f = &self.module.funcs[func as usize];
         (&f.params, &f.results)
     }
@@ -5093,7 +5118,7 @@ impl JitOnrampRun {
         &self.host.stderr
     }
     /// The run's **primary output**: the retained memfs file for a file-output phase guest (nifler's
-    /// `.p.nif`, [`fs_readback`](Self::fs_readback)), else `stdout`. `svm_onramp_jit_run_finish` hands
+    /// `.p.nif`, [`fs_readback`](Self::fs_readback)), else `stdout`. `temen_onramp_jit_run_finish` hands
     /// this to the card on the stdout slot, so a JIT phase guest surfaces its produced file exactly as the
     /// bytecode `onramp_fs_exec_readback` does.
     fn output(&self) -> Vec<u8> {
@@ -5156,9 +5181,9 @@ pub struct CapOutcome {
 /// Run `m`'s function 0 over a window seeded with `init` (deny-all `Host`), and capture the final
 /// window image. This is the "host hands in a buffer, the guest transforms it in place, the host
 /// reads it back" shape: [`bytecode::compile_and_run_capture`] snapshots the first `init.len()`
-/// bytes of memory after the run. Shared verbatim by the wasm [`svm_run_capture`] export and the
+/// bytes of memory after the run. Shared verbatim by the wasm [`temen_run_capture`] export and the
 /// native `gencorpus` ground truth, so the differential compares identical logic.
-pub fn capture_exec(m: &svm_ir::Module, init: &[u8], arg: i64) -> CapOutcome {
+pub fn capture_exec(m: &temen_ir::Module, init: &[u8], arg: i64) -> CapOutcome {
     let mut fuel = u64::MAX;
     match bytecode::compile_and_run_capture(m, 0, &[Value::I64(arg)], &mut fuel, init) {
         None => CapOutcome {
@@ -5188,8 +5213,8 @@ pub fn capture_exec(m: &svm_ir::Module, init: &[u8], arg: i64) -> CapOutcome {
 /// **nested-child** seam: function 0 may `instantiate`/`join` confined child domains over power-of-two
 /// sub-windows of that range (a child runs on the cooperative executor, confined by masking to its
 /// slice, joinable through the shared thread machinery). Returns `(status, i64-widened value)`.
-/// Shared by the wasm [`svm_run_nested`] export and the native `gencorpus` ground truth.
-pub fn instantiate_exec(m: &svm_ir::Module) -> (i32, i64) {
+/// Shared by the wasm [`temen_run_nested`] export and the native `gencorpus` ground truth.
+pub fn instantiate_exec(m: &temen_ir::Module) -> (i32, i64) {
     let mut host = Host::new();
     let inst = host.grant_instantiator(0, 128 << 10);
     let mut fuel = 5_000_000u64;
@@ -5204,28 +5229,28 @@ pub fn instantiate_exec(m: &svm_ir::Module) -> (i32, i64) {
     }
 }
 
-/// Captured stdout / stderr of the most recent [`svm_run_pb`], as cdylib-managed allocations
+/// Captured stdout / stderr of the most recent [`temen_run_pb`], as cdylib-managed allocations
 /// `(ptr, len)`. Each is a leaked boxed slice (exact length, alignment 1) freed when the next
-/// [`svm_run_pb`] replaces it — so the host reads it via the `*_ptr`/`*_len` exports *before* the
+/// [`temen_run_pb`] replaces it — so the host reads it via the `*_ptr`/`*_len` exports *before* the
 /// next call and never frees it itself.
 static mut OUT: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 static mut ERR: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 static mut EXIT_CODE: i32 = 0;
 /// The value the guest's top-level function returned on the most recent run (the `value` in
-/// [`svm_run_onramp`]'s outcome, and the single-shot JIT run's captured `f0` return). Read via
-/// [`svm_run_value`] so both tiers surface the same result for a *returned* run — the parity the
+/// [`temen_run_onramp`]'s outcome, and the single-shot JIT run's captured `f0` return). Read via
+/// [`temen_run_value`] so both tiers surface the same result for a *returned* run — the parity the
 /// interpreter oracle defines (INVARIANT 9).
 static mut RUN_VALUE: i64 = 0;
-/// Captured data image of the most recent [`svm_pg_snapshot`] (same cdylib-managed lifetime as `OUT`:
-/// a leaked boxed slice, valid until the next snapshot; read via `svm_pg_snapshot_ptr`/`_len`).
+/// Captured data image of the most recent [`temen_pg_snapshot`] (same cdylib-managed lifetime as `OUT`:
+/// a leaked boxed slice, valid until the next snapshot; read via `temen_pg_snapshot_ptr`/`_len`).
 static mut PG_SNAP: (*mut u8, usize) = (core::ptr::null_mut(), 0);
-/// Captured final window image of the most recent [`svm_run_capture`] (same cdylib-managed lifetime
-/// as `OUT`/`ERR`: valid until the next `svm_run_capture`).
+/// Captured final window image of the most recent [`temen_run_capture`] (same cdylib-managed lifetime
+/// as `OUT`/`ERR`: valid until the next `temen_run_capture`).
 static mut SNAP: (*mut u8, usize) = (core::ptr::null_mut(), 0);
-/// Captured framebuffer (RGBA) the most recent [`svm_run_onramp`] guest presented via the `display`
+/// Captured framebuffer (RGBA) the most recent [`temen_run_onramp`] guest presented via the `display`
 /// capability, plus its dimensions. `(null, 0)` / `0`×`0` when the guest presented no frame. Same
-/// cdylib-managed lifetime as `OUT` (valid until the next `svm_run_onramp`; the host reads it via the
-/// `svm_framebuffer_*` exports and never frees it).
+/// cdylib-managed lifetime as `OUT` (valid until the next `temen_run_onramp`; the host reads it via the
+/// `temen_framebuffer_*` exports and never frees it).
 static mut FB: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 static mut FB_W: u32 = 0;
 static mut FB_H: u32 = 0;
@@ -5250,18 +5275,18 @@ fn stash(slot: &mut (*mut u8, usize), data: Vec<u8>) {
 }
 
 // ---- Per-function call profiler FFI (opt-in `callprof` feature; tier-up break-even measurement) ---
-// Not present in a shipped build. Arm with `svm_callprof_reset(n_funcs)`, run a guest via
-// `svm_run_onramp`, then `svm_callprof_dump()` and read the buffer (LE `u64` per function).
+// Not present in a shipped build. Arm with `temen_callprof_reset(n_funcs)`, run a guest via
+// `temen_run_onramp`, then `temen_callprof_dump()` and read the buffer (LE `u64` per function).
 #[cfg(feature = "callprof")]
 static mut CALLPROF: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 #[cfg(feature = "callprof")]
 #[no_mangle]
-pub extern "C" fn svm_callprof_reset(n: usize) {
+pub extern "C" fn temen_callprof_reset(n: usize) {
     bytecode::callprof_reset(n);
 }
 #[cfg(feature = "callprof")]
 #[no_mangle]
-pub extern "C" fn svm_callprof_dump() {
+pub extern "C" fn temen_callprof_dump() {
     let counts = bytecode::callprof_snapshot();
     let mut bytes = Vec::with_capacity(counts.len() * 8);
     for c in counts {
@@ -5271,37 +5296,37 @@ pub extern "C" fn svm_callprof_dump() {
 }
 #[cfg(feature = "callprof")]
 #[no_mangle]
-pub extern "C" fn svm_callprof_ptr() -> *const u8 {
+pub extern "C" fn temen_callprof_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(CALLPROF)).0 }
 }
 #[cfg(feature = "callprof")]
 #[no_mangle]
-pub extern "C" fn svm_callprof_len() -> usize {
+pub extern "C" fn temen_callprof_len() -> usize {
     unsafe { (*core::ptr::addr_of!(CALLPROF)).1 }
 }
 
 /// Decode the module at `[mod_ptr, mod_len)` and run function 0 under the **powerbox** (see
 /// [`powerbox_exec`]): grant streams/clock/exit, seed stdin from `[stdin_ptr, stdin_len)` (a null /
 /// zero-length range ⇒ empty stdin), capture the streams + exit code, and return the guest's `i64`
-/// result (`0` on any non-`OK`/`EXIT` status). Read [`svm_status`] / [`svm_exit_code`] /
-/// `svm_stdout_ptr`+`svm_stdout_len` / `svm_stderr_ptr`+`svm_stderr_len` afterward. Sets
+/// result (`0` on any non-`OK`/`EXIT` status). Read [`temen_status`] / [`temen_exit_code`] /
+/// `temen_stdout_ptr`+`temen_stdout_len` / `temen_stderr_ptr`+`temen_stderr_len` afterward. Sets
 /// [`LAST_STATUS`].
 #[no_mangle]
-pub extern "C" fn svm_run_pb(
+pub extern "C" fn temen_run_pb(
     mod_ptr: *const u8,
     mod_len: usize,
     stdin_ptr: *const u8,
     stdin_len: usize,
 ) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees both ranges are live `svm_alloc`ations it just filled.
+    // SAFETY: the host guarantees both ranges are live `temen_alloc`ations it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let stdin: &[u8] = if stdin_ptr.is_null() || stdin_len == 0 {
         &[]
     } else {
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }
     };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
@@ -5320,29 +5345,29 @@ pub extern "C" fn svm_run_pb(
 }
 
 /// Decode the module at `[mod_ptr, mod_len)` and run function 0 under the **on-ramp powerbox** (see
-/// [`onramp_exec`]) — the ABI a `.svmb` off `svm-llvm-translate` expects, so real C/C++ guests (Lua,
-/// SQLite) run unchanged. Same capture/accessor contract as [`svm_run_pb`]: seed stdin from
+/// [`onramp_exec`]) — the ABI a `.temen` off `temen-llvm-translate` expects, so real C/C++ guests (Lua,
+/// SQLite) run unchanged. Same capture/accessor contract as [`temen_run_pb`]: seed stdin from
 /// `[stdin_ptr, stdin_len)` (null / zero-length ⇒ empty), read the streams via
-/// `svm_stdout_ptr`+`svm_stdout_len` / `svm_stderr_ptr`+`svm_stderr_len`, the exit code via
-/// [`svm_exit_code`], and the status via [`svm_status`]. Returns the guest's `i64` result. The
-/// captures share `OUT`/`ERR`/`EXIT_CODE` with `svm_run_pb` — read them before the next call either
+/// `temen_stdout_ptr`+`temen_stdout_len` / `temen_stderr_ptr`+`temen_stderr_len`, the exit code via
+/// [`temen_exit_code`], and the status via [`temen_status`]. Returns the guest's `i64` result. The
+/// captures share `OUT`/`ERR`/`EXIT_CODE` with `temen_run_pb` — read them before the next call either
 /// export makes.
 #[no_mangle]
-pub extern "C" fn svm_run_onramp(
+pub extern "C" fn temen_run_onramp(
     mod_ptr: *const u8,
     mod_len: usize,
     stdin_ptr: *const u8,
     stdin_len: usize,
 ) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees both ranges are live `svm_alloc`ations it just filled.
+    // SAFETY: the host guarantees both ranges are live `temen_alloc`ations it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let stdin: &[u8] = if stdin_ptr.is_null() || stdin_len == 0 {
         &[]
     } else {
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }
     };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
@@ -5375,7 +5400,7 @@ pub extern "C" fn svm_run_onramp(
 // image, then restores that image before each `eval_run` — so every Run evaluates the user's code over
 // a warm runtime it did not have to rebuild. Fresh-per-Run isolation holds: each Run restores the SAME
 // program-independent image into the window (no guest state crosses Runs). The native prototype is
-// `crates/svm-llvm/examples/qjs_snapshot.rs`; this is its browser twin, a stateful session like
+// `crates/temen-llvm/examples/qjs_snapshot.rs`; this is its browser twin, a stateful session like
 // `PgSession`. Requires a two-phase driver module exporting `warmup` + `eval_run` (both `(i64 sp)`).
 //
 // Memory model (the wrinkle the native prototype de-risked): the on-ramp heap grows **above** the
@@ -5395,7 +5420,7 @@ struct WarmSession {
     prog: bytecode::SharedProgram,
     /// The module (memory patched to the mapped window) — re-granted onto a fresh host per eval so the
     /// deterministic powerbox handles match the snapshot's window-relative state.
-    module: svm_ir::Module,
+    module: temen_ir::Module,
     /// The warmup image's explicit page-state entries (#816, the `Mem::map_info` encoding): the
     /// on-ramp's `protect`ed rodata inside the prefix and the `vm_map`-grown heap tail alike.
     /// Re-established (without zeroing) before every eval, so the guest restores to the same
@@ -5405,11 +5430,11 @@ struct WarmSession {
     win: u64,
     /// The powerbox data-stack base (`powerbox_entry_sp`), passed as each entry's `sp` arg.
     entry_sp: u64,
-    eval_fn: svm_ir::FuncIdx,
+    eval_fn: temen_ir::FuncIdx,
     /// The owned window backing (kept alive for the session; `back` aliases it).
     win_ptr: *mut u8,
     win_layout: Layout,
-    back: std::sync::Arc<svm_interp::Region>,
+    back: std::sync::Arc<temen_interp::Region>,
     /// The program-independent warm image — the live prefix `[0, brk)` captured after `warmup`.
     image: Vec<u8>,
     /// High-water of bytes any prior eval may have dirtied (≥ `image.len()`): the restore zeroes
@@ -5419,34 +5444,34 @@ struct WarmSession {
     /// (heap bump words included) sits one guard up, so every brk read/seed offsets by this.
     scratch: u64,
     /// The cached warm+JIT run (WASM_AOT.md warm+JIT): `eval_run` emitted to wasm **once**, then driven
-    /// per Run over the restored warm image. `None` until [`svm_warm_jit_open`]; reusing the emit across
+    /// per Run over the restored warm image. `None` until [`temen_warm_jit_open`]; reusing the emit across
     /// Runs is what keeps a warm+JIT Run off the ~one-time cdylib emit. Held here (not in a global) so
-    /// [`svm_warm_close`] tears it down while its window alias is still valid, before the window is freed.
+    /// [`temen_warm_close`] tears it down while its window alias is still valid, before the window is freed.
     jit: Option<Box<JitOnrampRun>>,
 }
 
-/// The one live warm session (single-threaded wasm ⇒ a plain static). `None` until [`svm_warm_open`].
+/// The one live warm session (single-threaded wasm ⇒ a plain static). `None` until [`temen_warm_open`].
 static mut WARM_SESSION: Option<WarmSession> = None;
 
 /// Read the on-ramp guest heap bump pointer (`POWERBOX_HEAP_BRK`, shifted one guard up on the #964
 /// marked layout — pass the module's `scratch` base) from a window image.
 fn warm_read_brk(win: &[u8], scratch: u64) -> usize {
-    let o = (scratch + svm_ir::POWERBOX_HEAP_BRK) as usize;
+    let o = (scratch + temen_ir::POWERBOX_HEAP_BRK) as usize;
     i64::from_le_bytes(win[o..o + 8].try_into().unwrap()) as usize
 }
 
 /// Open a warm session over the two-phase driver module at `[mod_ptr, mod_len)`: run `warmup` once and
-/// keep its post-init guest image for [`svm_warm_eval`]. Returns the live-image byte length on success
-/// (≥ 0), or `-1` with [`svm_status`] set (`UNSUPPORTED` if the module isn't a warm-snapshot driver —
+/// keep its post-init guest image for [`temen_warm_eval`]. Returns the live-image byte length on success
+/// (≥ 0), or `-1` with [`temen_status`] set (`UNSUPPORTED` if the module isn't a warm-snapshot driver —
 /// no `warmup`/`eval_run` exports, or its declared window ≥ the mapped window; `TRAP` if `warmup`
-/// traps). Closes any prior session first. Drive with [`svm_warm_eval`], end with [`svm_warm_close`].
+/// traps). Closes any prior session first. Drive with [`temen_warm_eval`], end with [`temen_warm_close`].
 #[no_mangle]
-pub extern "C" fn svm_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
+pub extern "C" fn temen_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    svm_warm_close();
-    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    temen_warm_close();
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
@@ -5472,7 +5497,7 @@ pub extern "C" fn svm_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
         set(STATUS_UNSUPPORTED);
         return -1;
     };
-    let entry_sp = svm_ir::powerbox_entry_sp(&m);
+    let entry_sp = temen_ir::powerbox_entry_sp(&m);
     let win = 1u64 << WARM_MAPPED_LOG2;
     let Some(prog) = bytecode::SharedProgram::compile(&m) else {
         set(STATUS_UNSUPPORTED);
@@ -5482,7 +5507,7 @@ pub extern "C" fn svm_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
         set(STATUS_UNSUPPORTED);
         return -1;
     };
-    // SAFETY: non-zero 8-aligned size; the buffer is this session's window, freed in `svm_warm_close`.
+    // SAFETY: non-zero 8-aligned size; the buffer is this session's window, freed in `temen_warm_close`.
     let win_ptr = unsafe { std::alloc::alloc_zeroed(layout) };
     if win_ptr.is_null() {
         set(STATUS_TRAP);
@@ -5490,20 +5515,20 @@ pub extern "C" fn svm_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
     }
     // Seed the on-ramp heap bump words (`_start` normally does this): brk = top = heap_base.
     // #964: a marked module's heap words sit one guard up.
-    let scratch = svm_ir::module_null_guard(&m).unwrap_or(0);
+    let scratch = temen_ir::module_null_guard(&m).unwrap_or(0);
     // SAFETY: `win_ptr` owns `win` zeroed bytes; no engine run is in flight (sole access here).
     unsafe {
         let w = core::slice::from_raw_parts_mut(win_ptr, win as usize);
         let hb = (heap_base as i64).to_le_bytes();
         let (b, t) = (
-            (scratch + svm_ir::POWERBOX_HEAP_BRK) as usize,
-            (scratch + svm_ir::POWERBOX_HEAP_TOP) as usize,
+            (scratch + temen_ir::POWERBOX_HEAP_BRK) as usize,
+            (scratch + temen_ir::POWERBOX_HEAP_TOP) as usize,
         );
         w[b..b + 8].copy_from_slice(&hb);
         w[t..t + 8].copy_from_slice(&hb);
     }
     // SAFETY: `[win_ptr, win)` is this session's exclusive window; the engine takes the `Arc<Region>`.
-    let back = std::sync::Arc::new(unsafe { svm_interp::Region::shared(win_ptr, win) });
+    let back = std::sync::Arc::new(unsafe { temen_interp::Region::shared(win_ptr, win) });
     let mut host = Host::new();
     let _ = grant_onramp_caps(&mut host, &m, None);
     let mut fuel = u64::MAX;
@@ -5562,10 +5587,10 @@ pub extern "C" fn svm_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
 
 /// Evaluate `[stdin_ptr, stdin_len)` (the user's source) over the warm session: restore the snapshot
 /// into the window, run `eval_run`, and stage its stdout/stderr/exit into the shared capture slots
-/// (read via `svm_stdout_ptr`/`_len`, `svm_stderr_ptr`/`_len`, `svm_exit_code`; status via
-/// [`svm_status`]). Returns the guest's `i64` result, or `-1` with `UNSUPPORTED` if no session is open.
+/// (read via `temen_stdout_ptr`/`_len`, `temen_stderr_ptr`/`_len`, `temen_exit_code`; status via
+/// [`temen_status`]). Returns the guest's `i64` result, or `-1` with `UNSUPPORTED` if no session is open.
 #[no_mangle]
-pub extern "C" fn svm_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64 {
+pub extern "C" fn temen_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: single-threaded wasm; exclusive access to the session for this call.
     let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(WARM_SESSION)).as_mut() }) else {
@@ -5575,7 +5600,7 @@ pub extern "C" fn svm_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64 {
     let stdin: &[u8] = if stdin_ptr.is_null() || stdin_len == 0 {
         &[]
     } else {
-        // SAFETY: the host guarantees `[stdin_ptr, stdin_len)` is a live `svm_alloc`ation it filled.
+        // SAFETY: the host guarantees `[stdin_ptr, stdin_len)` is a live `temen_alloc`ation it filled.
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }
     };
     // Restore the warm image, and zero the tail any prior eval grew the heap into — so this Run sees
@@ -5626,7 +5651,7 @@ pub extern "C" fn svm_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64 {
             .unwrap_or(&[])
             .iter()
             .filter(|&&(_, kind)| kind == 1)
-            .map(|&(off, _)| off.saturating_add(svm_interp::host_page_size()))
+            .map(|&(off, _)| off.saturating_add(temen_interp::host_page_size()))
             .max()
             .unwrap_or(0)
             .min(s.win) as usize;
@@ -5645,10 +5670,10 @@ pub extern "C" fn svm_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64 {
     value
 }
 
-/// Tear down the warm session (free its window), if any. Idempotent; the next [`svm_warm_open`] starts
+/// Tear down the warm session (free its window), if any. Idempotent; the next [`temen_warm_open`] starts
 /// a fresh one.
 #[no_mangle]
-pub extern "C" fn svm_warm_close() {
+pub extern "C" fn temen_warm_close() {
     // SAFETY: single-threaded wasm; take the session and free its owned window.
     unsafe {
         if let Some(s) = (*core::ptr::addr_of_mut!(WARM_SESSION)).take() {
@@ -5661,7 +5686,7 @@ pub extern "C" fn svm_warm_close() {
 
 // ===== warm+JIT: run the warm session's `eval_run` on the emitted-wasm tier ========================
 //
-// WASM_AOT.md warm+JIT. The interpreter warm path ([`svm_warm_eval`]) already skips the QuickJS runtime
+// WASM_AOT.md warm+JIT. The interpreter warm path ([`temen_warm_eval`]) already skips the QuickJS runtime
 // rebuild, but evaluates on the bytecode interpreter — so a compute-heavy program still pays interpreter
 // speed for the eval itself. This tier emits the module's `eval_run` to wasm **once** and drives it over
 // the restored warm image each Run, so the eval runs near-native while init stays paid-once. The emit is
@@ -5685,9 +5710,9 @@ fn warm_jit_ref() -> Option<&'static JitOnrampRun> {
 /// second call reuses the cached emit (returns `0`). `shared != 0` ⇒ the emitted module imports a shared
 /// memory (the cross-origin-isolated threads build), matching the memory the host instantiates it against.
 /// Returns `0`, else a negative `STATUS_*` (also in [`LAST_STATUS`]): [`STATUS_UNSUPPORTED`] if no warm
-/// session is open or `eval_run` isn't wasm-drivable (the page then evaluates via [`svm_warm_eval`]).
+/// session is open or `eval_run` isn't wasm-drivable (the page then evaluates via [`temen_warm_eval`]).
 #[no_mangle]
-pub extern "C" fn svm_warm_jit_open(shared: i32) -> i32 {
+pub extern "C" fn temen_warm_jit_open(shared: i32) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: single-threaded wasm; exclusive access to the session for this call.
     let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(WARM_SESSION)).as_mut() }) else {
@@ -5727,7 +5752,7 @@ pub extern "C" fn svm_warm_jit_open(shared: i32) -> i32 {
 /// (seeding stdin from `[stdin_ptr, stdin_len)`). Call before each drive. Returns `0`, else
 /// `-STATUS_UNSUPPORTED` if no warm+JIT run is open.
 #[no_mangle]
-pub extern "C" fn svm_warm_jit_prepare(stdin_ptr: *const u8, stdin_len: usize) -> i32 {
+pub extern "C" fn temen_warm_jit_prepare(stdin_ptr: *const u8, stdin_len: usize) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: single-threaded wasm; exclusive access to the session for this call.
     let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(WARM_SESSION)).as_mut() }) else {
@@ -5739,7 +5764,7 @@ pub extern "C" fn svm_warm_jit_prepare(stdin_ptr: *const u8, stdin_len: usize) -
         return -STATUS_UNSUPPORTED;
     }
     // Restore the program-independent warm image, zeroing any tail a prior eval grew into — byte-identical
-    // warm state each Run (identical to [`svm_warm_eval`]'s restore).
+    // warm state each Run (identical to [`temen_warm_eval`]'s restore).
     // SAFETY: `win_ptr` owns `win ≥ dirty_end` bytes; no engine run is in flight (sole access here).
     unsafe {
         let w = core::slice::from_raw_parts_mut(s.win_ptr, s.win as usize);
@@ -5749,7 +5774,7 @@ pub extern "C" fn svm_warm_jit_prepare(stdin_ptr: *const u8, stdin_len: usize) -
     let stdin: Vec<u8> = if stdin_ptr.is_null() || stdin_len == 0 {
         Vec::new()
     } else {
-        // SAFETY: the host guarantees `[stdin_ptr, stdin_len)` is a live `svm_alloc`ation it filled.
+        // SAFETY: the host guarantees `[stdin_ptr, stdin_len)` is a live `temen_alloc`ation it filled.
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
     };
     s.jit.as_mut().unwrap().reset_warm(stdin);
@@ -5759,21 +5784,21 @@ pub extern "C" fn svm_warm_jit_prepare(stdin_ptr: *const u8, stdin_len: usize) -
 
 /// Pointer / length of the emitted `eval_run` wasm bytes (valid until the warm session is closed).
 #[no_mangle]
-pub extern "C" fn svm_warm_jit_wasm_ptr() -> *const u8 {
+pub extern "C" fn temen_warm_jit_wasm_ptr() -> *const u8 {
     warm_jit_ref().map_or(core::ptr::null(), |r| r.emitted_wasm().as_ptr())
 }
 #[no_mangle]
-pub extern "C" fn svm_warm_jit_wasm_len() -> usize {
+pub extern "C" fn temen_warm_jit_wasm_len() -> usize {
     warm_jit_ref().map_or(0, |r| r.emitted_wasm().len())
 }
 /// The window base as a byte offset in this module's linear memory — the emitted `f0`'s `win` arg.
 #[no_mangle]
-pub extern "C" fn svm_warm_jit_win_ptr() -> usize {
+pub extern "C" fn temen_warm_jit_win_ptr() -> usize {
     warm_jit_ref().map_or(0, |r| r.win_base())
 }
 /// The entry `sp` the emitted entry takes as its trailing `i64` slot (the powerbox data-stack base).
 #[no_mangle]
-pub extern "C" fn svm_warm_jit_entry_sp() -> i64 {
+pub extern "C" fn temen_warm_jit_entry_sp() -> i64 {
     warm_jit_ref().map_or(0, |r| match r.slots().first() {
         Some(Value::I64(x)) => *x,
         Some(Value::I32(x)) => *x as i64,
@@ -5782,13 +5807,13 @@ pub extern "C" fn svm_warm_jit_entry_sp() -> i64 {
 }
 
 /// The emitted **export index of the warm+JIT entry** — the driver must call `f{this}`, NOT `f0`. The
-/// emit exports one `f{svm_idx}` per SVM function, and the warm+JIT emit is rooted at the module's
+/// emit exports one `f{temen_idx}` per Temen function, and the warm+JIT emit is rooted at the module's
 /// `eval_run` (not the cold `_start`, which is func 0). So the entry export is `f{eval_fn}` where
-/// `eval_fn` is `eval_run`'s SVM function index. Driving `f0` instead runs the cold `_start`
+/// `eval_fn` is `eval_run`'s Temen function index. Driving `f0` instead runs the cold `_start`
 /// (init + eval), which for a driver whose init re-runs on the restored image traps or diverges (#865).
-/// Valid after [`svm_warm_jit_open`]; 0 (a harmless `f0`) if no warm session is open.
+/// Valid after [`temen_warm_jit_open`]; 0 (a harmless `f0`) if no warm session is open.
 #[no_mangle]
-pub extern "C" fn svm_warm_jit_entry_func() -> u32 {
+pub extern "C" fn temen_warm_jit_entry_func() -> u32 {
     // SAFETY: single-threaded wasm; shared read of the session static.
     unsafe {
         (*core::ptr::addr_of!(WARM_SESSION))
@@ -5798,10 +5823,10 @@ pub extern "C" fn svm_warm_jit_entry_func() -> u32 {
 }
 
 /// **Cross-tier bounce** for the warm+JIT run — the emitted `f0`'s `env.call_interp(func, args_ptr)`
-/// relays here (identical contract to [`svm_onramp_jit_run_call_interp`], over the warm run's
+/// relays here (identical contract to [`temen_onramp_jit_run_call_interp`], over the warm run's
 /// window/powerbox).
 #[no_mangle]
-pub extern "C" fn svm_warm_jit_call_interp(func: u32, args_ptr: *mut u8) -> i32 {
+pub extern "C" fn temen_warm_jit_call_interp(func: u32, args_ptr: *mut u8) -> i32 {
     // SAFETY: single-threaded wasm; exclusive access to the run for this call.
     let Some(run) = (unsafe {
         (*core::ptr::addr_of_mut!(WARM_SESSION))
@@ -5842,10 +5867,10 @@ pub extern "C" fn svm_warm_jit_call_interp(func: u32, args_ptr: *mut u8) -> i32 
     }
 }
 
-/// Record how the emitted warm `f0` finished (see [`svm_onramp_jit_run_report`]). Call before
-/// [`svm_warm_jit_finish`].
+/// Record how the emitted warm `f0` finished (see [`temen_onramp_jit_run_report`]). Call before
+/// [`temen_warm_jit_finish`].
 #[no_mangle]
-pub extern "C" fn svm_warm_jit_report(threw: i32, value: i64) {
+pub extern "C" fn temen_warm_jit_report(threw: i32, value: i64) {
     // SAFETY: single-threaded wasm; exclusive access to the run.
     if let Some(run) = unsafe {
         (*core::ptr::addr_of_mut!(WARM_SESSION))
@@ -5857,13 +5882,13 @@ pub extern "C" fn svm_warm_jit_report(threw: i32, value: i64) {
 }
 
 /// Capture the finished warm+JIT run's streams / exit / value into the shared `OUT`/`ERR`/`EXIT_CODE`/
-/// `RUN_VALUE` slots (read via the usual `svm_stdout_*` / `svm_exit_code` / `svm_run_value` accessors),
-/// and advance the session's heap high-water so the next [`svm_warm_jit_prepare`] zeroes the right tail.
-/// Same status contract as [`svm_onramp_jit_run_finish`] — so warm+JIT and the interpreter warm path
+/// `RUN_VALUE` slots (read via the usual `temen_stdout_*` / `temen_exit_code` / `temen_run_value` accessors),
+/// and advance the session's heap high-water so the next [`temen_warm_jit_prepare`] zeroes the right tail.
+/// Same status contract as [`temen_onramp_jit_run_finish`] — so warm+JIT and the interpreter warm path
 /// agree on result + exit + trap (INVARIANT 9). Call once after `f0` returns/unwinds (and after
-/// [`svm_warm_jit_report`]). Returns the `STATUS_*`.
+/// [`temen_warm_jit_report`]). Returns the `STATUS_*`.
 #[no_mangle]
-pub extern "C" fn svm_warm_jit_finish() -> i32 {
+pub extern "C" fn temen_warm_jit_finish() -> i32 {
     // SAFETY: single-threaded wasm; exclusive access to the session for this call.
     let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(WARM_SESSION)).as_mut() }) else {
         return STATUS_UNSUPPORTED;
@@ -5881,7 +5906,7 @@ pub extern "C" fn svm_warm_jit_finish() -> i32 {
         (STATUS_OK, 0, run.returned_value())
     };
     // Track the eval's heap high-water so the next restore zeroes exactly what it dirtied (mirrors
-    // [`svm_warm_eval`]).
+    // [`temen_warm_eval`]).
     // SAFETY: `win_ptr` owns `win` bytes; read the post-eval brk, no run in flight.
     unsafe {
         let w = core::slice::from_raw_parts(s.win_ptr, s.win as usize);
@@ -5901,28 +5926,28 @@ pub extern "C" fn svm_warm_jit_finish() -> i32 {
 }
 
 /// Decode the module at `[mod_ptr, mod_len)` and run function 0 under the **POSIX personality** (see
-/// [`onramp_posix_exec`]) — the entry the real `svm-posix` shell runs through in the playground. Same
-/// capture/accessor contract as [`svm_run_onramp`]: seed stdin from `[stdin_ptr, stdin_len)`, read the
-/// captured streams via `svm_stdout_ptr`+`svm_stdout_len` / `svm_stderr_ptr`+`svm_stderr_len`, the
-/// exit code via [`svm_exit_code`], and the status via [`svm_status`]. Returns the guest's `i64`
-/// result. Shares the `OUT`/`ERR`/`EXIT_CODE` capture slots with `svm_run_onramp` — read them before
+/// [`onramp_posix_exec`]) — the entry the real `temen-posix` shell runs through in the playground. Same
+/// capture/accessor contract as [`temen_run_onramp`]: seed stdin from `[stdin_ptr, stdin_len)`, read the
+/// captured streams via `temen_stdout_ptr`+`temen_stdout_len` / `temen_stderr_ptr`+`temen_stderr_len`, the
+/// exit code via [`temen_exit_code`], and the status via [`temen_status`]. Returns the guest's `i64`
+/// result. Shares the `OUT`/`ERR`/`EXIT_CODE` capture slots with `temen_run_onramp` — read them before
 /// the next call either export makes.
 #[no_mangle]
-pub extern "C" fn svm_run_onramp_posix(
+pub extern "C" fn temen_run_onramp_posix(
     mod_ptr: *const u8,
     mod_len: usize,
     stdin_ptr: *const u8,
     stdin_len: usize,
 ) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees both ranges are live `svm_alloc`ations it just filled.
+    // SAFETY: the host guarantees both ranges are live `temen_alloc`ations it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let stdin: &[u8] = if stdin_ptr.is_null() || stdin_len == 0 {
         &[]
     } else {
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }
     };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
@@ -5943,11 +5968,11 @@ pub extern "C" fn svm_run_onramp_posix(
 /// Parse the shell's **PATH-registry blob** at `[ptr, len)` into `(name, module)` pairs. Layout, all
 /// integers little-endian: a `u32` entry count, then per entry a `u32` name length + that many UTF-8
 /// name bytes + a `u32` module length + that many encoded-module bytes. It bundles the `__stage`
-/// ring-filter runner and every external command (`primes`, …) into one buffer so `svm_run_shell` takes
+/// ring-filter runner and every external command (`primes`, …) into one buffer so `temen_run_shell` takes
 /// a single extra arg. Defensive: a truncated or malformed blob, or an entry whose module fails to
 /// decode, drops that entry (and everything after a length that overruns) rather than trapping — the
 /// shell still runs, just without the affected command. Returns owned `(String, Module)`s.
-fn parse_shell_cmds(bytes: &[u8]) -> Vec<(String, svm_ir::Module)> {
+fn parse_shell_cmds(bytes: &[u8]) -> Vec<(String, temen_ir::Module)> {
     let mut out = Vec::new();
     let rd_u32 = |b: &[u8], at: usize| -> Option<usize> {
         b.get(at..at + 4)
@@ -5978,25 +6003,25 @@ fn parse_shell_cmds(bytes: &[u8]) -> Vec<(String, svm_ir::Module)> {
             break;
         };
         off += mlen;
-        if let Ok(m) = svm_encode::decode_module(mod_bytes) {
+        if let Ok(m) = temen_encode::decode_module(mod_bytes) {
             out.push((name.to_string(), m));
         }
     }
     out
 }
 
-/// Decode the module at `[mod_ptr, mod_len)` and run it as the **`svm-posix` shell** (see
+/// Decode the module at `[mod_ptr, mod_len)` and run it as the **`temen-posix` shell** (see
 /// [`posix_shell_exec`]) with `[stdin_ptr, stdin_len)` as the script — the playground's shell card.
 /// `[cmds_ptr, cmds_len)`, when non-empty, is the **PATH-registry blob** ([`parse_shell_cmds`]): the
 /// `__stage` ring-filter runner (so `cat f | sort | uniq` takes the **concurrent ring path** — op 11 +
 /// `SharedRegion` + futex) and any **external commands** (`primes N`, …) the shell `exec`s as op-13
 /// §14 children. Pass `cmds_len = 0` to run bare (memfs pipelines, no external commands). Same
-/// capture/accessor contract as [`svm_run_onramp`]: read the captured stdout via `svm_stdout_ptr`+
-/// `svm_stdout_len`, the exit code via [`svm_exit_code`], the status via [`svm_status`]. Returns the
+/// capture/accessor contract as [`temen_run_onramp`]: read the captured stdout via `temen_stdout_ptr`+
+/// `temen_stdout_len`, the exit code via [`temen_exit_code`], the status via [`temen_status`]. Returns the
 /// guest's `i64` result. Shares the `OUT`/`ERR`/`EXIT_CODE` capture slots with the other run exports —
 /// read them before the next call.
 #[no_mangle]
-pub extern "C" fn svm_run_shell(
+pub extern "C" fn temen_run_shell(
     mod_ptr: *const u8,
     mod_len: usize,
     stdin_ptr: *const u8,
@@ -6005,14 +6030,14 @@ pub extern "C" fn svm_run_shell(
     cmds_len: usize,
 ) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees both ranges are live `svm_alloc`ations it just filled.
+    // SAFETY: the host guarantees both ranges are live `temen_alloc`ations it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let stdin: &[u8] = if stdin_ptr.is_null() || stdin_len == 0 {
         &[]
     } else {
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }
     };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
@@ -6027,7 +6052,7 @@ pub extern "C" fn svm_run_shell(
         let cb = unsafe { core::slice::from_raw_parts(cmds_ptr, cmds_len) };
         parse_shell_cmds(cb)
     };
-    let cmds: Vec<(&str, &svm_ir::Module)> = owned.iter().map(|(n, m)| (n.as_str(), m)).collect();
+    let cmds: Vec<(&str, &temen_ir::Module)> = owned.iter().map(|(n, m)| (n.as_str(), m)).collect();
     let out = posix_shell_exec_with(&m, stdin, &cmds);
     set(out.status);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
@@ -6039,15 +6064,15 @@ pub extern "C" fn svm_run_shell(
     out.value
 }
 
-/// **In-browser link + run of a frontend-emitted program** (docs/SVM_BROWSER_PLAN.md option (b)):
+/// **In-browser link + run of a frontend-emitted program** (docs/TEMEN_BROWSER_PLAN.md option (b)):
 /// the live-editing path, language-agnostic. Given a **program** unit and a **library** unit —
-/// each either SVM-IR **text** or a **binary object** (`.svmo` bytes, the v9 object dialect;
-/// told apart by the `SVM\0` magic, so the two params mix freely) — and the name of the export
+/// each either TEMEN-IR **text** or a **binary object** (`.temeno` bytes, the v9 object dialect;
+/// told apart by the `Temen\0` magic, so the two params mix freely) — and the name of the export
 /// to run, this loads both, links them (`link_with_manifest`), wraps the named entry in a
 /// powerbox `_start` (`synth_manifest_start`), verifies, and runs it through the same on-ramp
-/// powerbox as [`svm_run_onramp`] — so freshly-emitted source runs without a native link/encode
-/// step. Results are read back through the same accessors (`svm_stdout_ptr`/`_len`,
-/// `svm_status`, `svm_exit_code`).
+/// powerbox as [`temen_run_onramp`] — so freshly-emitted source runs without a native link/encode
+/// step. Results are read back through the same accessors (`temen_stdout_ptr`/`_len`,
+/// `temen_status`, `temen_exit_code`).
 ///
 /// This is the generic browser counterpart to the native link path: **nothing here is specific to
 /// any source language.** A program's own-data addresses ride in its module text as `data.self
@@ -6060,7 +6085,7 @@ pub extern "C" fn svm_run_shell(
 /// unit 0 (re-exporting the library's own inline exports), so the program's calls into the library
 /// resolve by name.
 #[no_mangle]
-pub extern "C" fn svm_link_run(
+pub extern "C" fn temen_link_run(
     prog_ptr: *const u8,
     prog_len: usize,
     lib_ptr: *const u8,
@@ -6087,14 +6112,14 @@ pub extern "C" fn svm_link_run(
     };
     let stdin = slice(stdin_ptr, stdin_len);
 
-    // A unit is binary iff it opens with the container magic (`SVM\0`) — text IR can't start
+    // A unit is binary iff it opens with the container magic (`Temen\0`) — text IR can't start
     // with a NUL, so the sniff is unambiguous. Binary rides `decode_unit` (the object dialect;
     // a resolved runnable module is a degenerate unit and loads fine), text rides the parser.
-    let load_unit = |bytes: &[u8]| -> Option<svm_ir::Module> {
+    let load_unit = |bytes: &[u8]| -> Option<temen_ir::Module> {
         if bytes.starts_with(b"SVM\0") {
-            svm_encode::decode_unit(bytes).ok()
+            temen_encode::decode_unit(bytes).ok()
         } else {
-            svm_text::parse_module(core::str::from_utf8(bytes).ok()?).ok()
+            temen_text::parse_module(core::str::from_utf8(bytes).ok()?).ok()
         }
     };
     let program = match load_unit(slice(prog_ptr, prog_len)) {
@@ -6111,19 +6136,19 @@ pub extern "C" fn svm_link_run(
             return 0;
         }
     };
-    let lib_exports: Vec<(String, svm_ir::FuncIdx)> = lib
+    let lib_exports: Vec<(String, temen_ir::FuncIdx)> = lib
         .exports
         .iter()
         .map(|e| (e.name.clone(), e.func))
         .collect();
 
-    let linked = match svm_ir::link_with_manifest(&[
-        svm_ir::LinkUnit {
+    let linked = match temen_ir::link_with_manifest(&[
+        temen_ir::LinkUnit {
             module: lib,
             exports: lib_exports,
             ..Default::default()
         },
-        svm_ir::LinkUnit {
+        temen_ir::LinkUnit {
             module: program,
             exports: vec![(entry_name.to_string(), 0)],
             ..Default::default()
@@ -6142,7 +6167,7 @@ pub extern "C" fn svm_link_run(
             return 0;
         }
     };
-    let module = match svm_ir::synth_manifest_start(linked, entry, false) {
+    let module = match temen_ir::synth_manifest_start(linked, entry, false) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_UNSUPPORTED);
@@ -6152,7 +6177,7 @@ pub extern "C" fn svm_link_run(
     // Verify before running: a program that references an undefined proc links to an unresolvable
     // manifest import / out-of-range target, which would otherwise fault deep in the engine. Reject
     // it cleanly (STATUS_UNSUPPORTED) so a typo can't take down the playground's wasm instance.
-    if svm_verify::verify_module(&module).is_err() {
+    if temen_verify::verify_module(&module).is_err() {
         set(STATUS_UNSUPPORTED);
         return 0;
     }
@@ -6168,41 +6193,41 @@ pub extern "C" fn svm_link_run(
     out.value
 }
 
-/// Pointer / length of the RGBA framebuffer the most recent [`svm_run_onramp`] guest presented via
-/// the `display` capability (`(null, 0)` if none). `svm_framebuffer_width`/`_height` give its
-/// dimensions; `len` is `width*height*4`. Valid until the next `svm_run_onramp`; do not `svm_dealloc`.
+/// Pointer / length of the RGBA framebuffer the most recent [`temen_run_onramp`] guest presented via
+/// the `display` capability (`(null, 0)` if none). `temen_framebuffer_width`/`_height` give its
+/// dimensions; `len` is `width*height*4`. Valid until the next `temen_run_onramp`; do not `temen_dealloc`.
 #[no_mangle]
-pub extern "C" fn svm_framebuffer_ptr() -> *const u8 {
+pub extern "C" fn temen_framebuffer_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(FB)).0 }
 }
 #[no_mangle]
-pub extern "C" fn svm_framebuffer_len() -> usize {
+pub extern "C" fn temen_framebuffer_len() -> usize {
     unsafe { (*core::ptr::addr_of!(FB)).1 }
 }
 #[no_mangle]
-pub extern "C" fn svm_framebuffer_width() -> u32 {
+pub extern "C" fn temen_framebuffer_width() -> u32 {
     unsafe { FB_W }
 }
 #[no_mangle]
-pub extern "C" fn svm_framebuffer_height() -> u32 {
+pub extern "C" fn temen_framebuffer_height() -> u32 {
     unsafe { FB_H }
 }
 
 /// The live per-frame [`OnrampReactor`] (interactive/graphical guests: bounce, eventually Doom).
-/// `None` until [`svm_onramp_open`]; single-threaded wasm, so a plain static is sound.
+/// `None` until [`temen_onramp_open`]; single-threaded wasm, so a plain static is sound.
 static mut REACTOR: Option<OnrampReactor> = None;
 
 /// Open a per-frame **reactor** over the on-ramp module at `[mod_ptr, mod_len)` (an interactive guest
 /// exporting `tick`): decode, grant the powerbox, run `_start`. Returns `0` on success, else a
 /// negative `STATUS_*`; also sets [`LAST_STATUS`]. Replaces any prior reactor. Drive it with
-/// [`svm_onramp_frame`], feed input with [`svm_onramp_key`], and read each frame via the
-/// `svm_framebuffer_*` exports; close with [`svm_onramp_close`].
+/// [`temen_onramp_frame`], feed input with [`temen_onramp_key`], and read each frame via the
+/// `temen_framebuffer_*` exports; close with [`temen_onramp_close`].
 #[no_mangle]
-pub extern "C" fn svm_onramp_open(mod_ptr: *const u8, mod_len: usize) -> i32 {
+pub extern "C" fn temen_onramp_open(mod_ptr: *const u8, mod_len: usize) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
@@ -6223,13 +6248,13 @@ pub extern "C" fn svm_onramp_open(mod_ptr: *const u8, mod_len: usize) -> i32 {
     }
 }
 
-/// Like [`svm_onramp_open`] but also grant an `fs` capability serving one read-only file — the bytes
+/// Like [`temen_onramp_open`] but also grant an `fs` capability serving one read-only file — the bytes
 /// at `[data_ptr, data_len)` under the name at `[name_ptr, name_len)` (the WAD read path Doom needs:
-/// its `_start` reads the IWAD through `fs`). The host `svm_alloc`s and fills both buffers before the
+/// its `_start` reads the IWAD through `fs`). The host `temen_alloc`s and fills both buffers before the
 /// call and frees them after (the file bytes are copied into the reactor's `fs` server). Returns `0`
 /// on success, else a negative `STATUS_*`; also sets [`LAST_STATUS`]. Replaces any prior reactor.
 #[no_mangle]
-pub extern "C" fn svm_onramp_open_fs(
+pub extern "C" fn temen_onramp_open_fs(
     mod_ptr: *const u8,
     mod_len: usize,
     name_ptr: *const u8,
@@ -6238,11 +6263,11 @@ pub extern "C" fn svm_onramp_open_fs(
     data_len: usize,
 ) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees each `[ptr, len)` is a live `svm_alloc`ation it just filled.
+    // SAFETY: the host guarantees each `[ptr, len)` is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let name = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
     let data = unsafe { core::slice::from_raw_parts(data_ptr, data_len) };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
@@ -6265,11 +6290,11 @@ pub extern "C" fn svm_onramp_open_fs(
 }
 
 /// Advance the open reactor by one frame: call the guest's `tick`, stash the presented frame (read
-/// via `svm_framebuffer_*`) and any stdout delta (read via `svm_stdout_*`), and return the frame
+/// via `temen_framebuffer_*`) and any stdout delta (read via `temen_stdout_*`), and return the frame
 /// status (`0` = keep going, [`STATUS_EXIT`] = the guest exited, else a trap). Returns
 /// [`STATUS_UNSUPPORTED`] if no reactor is open. Sets [`LAST_STATUS`].
 #[no_mangle]
-pub extern "C" fn svm_onramp_frame() -> i32 {
+pub extern "C" fn temen_onramp_frame() -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: single-threaded wasm; exclusive access to the reactor for this call.
     let reactor = unsafe { (*core::ptr::addr_of_mut!(REACTOR)).as_mut() };
@@ -6296,7 +6321,7 @@ pub extern "C" fn svm_onramp_frame() -> i32 {
 /// Enqueue a key event for the open reactor's guest to `poll` next frame (`pressed`: 1 = down,
 /// 0 = up; `keycode`: the platform key id, e.g. a JS `keyCode`). No-op if no reactor is open.
 #[no_mangle]
-pub extern "C" fn svm_onramp_key(keycode: i32, pressed: i32) {
+pub extern "C" fn temen_onramp_key(keycode: i32, pressed: i32) {
     // SAFETY: single-threaded wasm; shared read of the reactor's key queue.
     if let Some(reactor) = unsafe { (*core::ptr::addr_of!(REACTOR)).as_ref() } {
         reactor.push_key(keycode, pressed);
@@ -6305,28 +6330,28 @@ pub extern "C" fn svm_onramp_key(keycode: i32, pressed: i32) {
 
 /// Close the open reactor, freeing its instance. Idempotent.
 #[no_mangle]
-pub extern "C" fn svm_onramp_close() {
+pub extern "C" fn temen_onramp_close() {
     // SAFETY: single-threaded wasm; exclusive access to drop the reactor.
     unsafe { *core::ptr::addr_of_mut!(REACTOR) = None };
 }
 
 /// Diagnostic: stash the open reactor's last-trap `Debug` string into [`OUT`] and return its length
-/// (`0` if no reactor / no trap). Read the bytes via [`svm_stdout_ptr`]. Lets the page surface *why* a
+/// (`0` if no reactor / no trap). Read the bytes via [`temen_stdout_ptr`]. Lets the page surface *why* a
 /// reactor `tick` trapped (the `Trap` variant), not just the `STATUS_TRAP` code.
 #[no_mangle]
-pub extern "C" fn svm_onramp_trap_len() -> usize {
+pub extern "C" fn temen_onramp_trap_len() -> usize {
     // SAFETY: single-threaded wasm; shared read of the reactor.
     let s = unsafe { (*core::ptr::addr_of!(REACTOR)).as_ref() }.map_or("", |r| r.last_trap());
     let bytes = s.as_bytes().to_vec();
     let len = bytes.len();
-    // SAFETY: single-threaded wasm; the stash is read back only via `svm_stdout_ptr`.
+    // SAFETY: single-threaded wasm; the stash is read back only via `temen_stdout_ptr`.
     unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
     len
 }
 
 // ---- cross-tier `env.call_interp` slot ABI (shared by the three servicers below) ------------------
 //
-// The emitter (svm-wasm-jit `emit_slot_store` / `emit_slot_load`) packs each cross-tier arg/result
+// The emitter (temen-wasm-jit `emit_slot_store` / `emit_slot_load`) packs each cross-tier arg/result
 // into the env scratch at a **running slot offset** computed from the callee's signature: scalars
 // (`i32` widened, `f32` low 4 bytes, `i64`/`f64` whole) take one 8-byte slot, a `v128` takes two
 // (16 raw little-endian bytes, #749). These helpers are the host end of that single encoding, so
@@ -6335,12 +6360,12 @@ pub extern "C" fn svm_onramp_trap_len() -> usize {
 
 /// Running byte offsets of each value of a signature side in the scratch (params and results each
 /// start at 0 — result slots overlay arg slots). Mirrors the emitter's `slot_off`.
-fn slot_offs(types: &[svm_ir::ValType]) -> Vec<usize> {
+fn slot_offs(types: &[temen_ir::ValType]) -> Vec<usize> {
     let mut offs = Vec::with_capacity(types.len());
     let mut off = 0usize;
     for t in types {
         offs.push(off);
-        off += if *t == svm_ir::ValType::V128 { 16 } else { 8 };
+        off += if *t == temen_ir::ValType::V128 { 16 } else { 8 };
     }
     offs
 }
@@ -6349,18 +6374,18 @@ fn slot_offs(types: &[svm_ir::ValType]) -> Vec<usize> {
 ///
 /// SAFETY: the caller guarantees `args_ptr + off` addresses the full slot(s) of `ty` (8 bytes, 16
 /// for `v128`) inside the env scratch.
-unsafe fn read_slot_value(ty: svm_ir::ValType, args_ptr: *const u8, off: usize) -> Value {
+unsafe fn read_slot_value(ty: temen_ir::ValType, args_ptr: *const u8, off: usize) -> Value {
     let raw8 = || -> u64 {
         let mut b = [0u8; 8];
         unsafe { core::ptr::copy_nonoverlapping(args_ptr.add(off), b.as_mut_ptr(), 8) };
         u64::from_le_bytes(b)
     };
     match ty {
-        svm_ir::ValType::I32 => Value::I32(raw8() as i32),
-        svm_ir::ValType::I64 => Value::I64(raw8() as i64),
-        svm_ir::ValType::F32 => Value::F32(f32::from_bits(raw8() as u32)),
-        svm_ir::ValType::F64 => Value::F64(f64::from_bits(raw8())),
-        svm_ir::ValType::V128 => {
+        temen_ir::ValType::I32 => Value::I32(raw8() as i32),
+        temen_ir::ValType::I64 => Value::I64(raw8() as i64),
+        temen_ir::ValType::F32 => Value::F32(f32::from_bits(raw8() as u32)),
+        temen_ir::ValType::F64 => Value::F64(f64::from_bits(raw8())),
+        temen_ir::ValType::V128 => {
             let mut b = [0u8; 16];
             unsafe { core::ptr::copy_nonoverlapping(args_ptr.add(off), b.as_mut_ptr(), 16) };
             Value::V128(b)
@@ -6399,10 +6424,10 @@ mod xcall_slot_tests {
     /// The two-slot `v128` scratch layout (#749): running offsets skip 16 bytes past a `v128`, and
     /// every marshallable value round-trips write→read bit-exactly at its offset — the host half of
     /// the encoding the emitter's `slot_off`/`emit_slot_store`/`emit_slot_load` produce (the wasmi
-    /// differential in svm-wasm-jit `cross_tier.rs` pins the emitter half against this same layout).
+    /// differential in temen-wasm-jit `cross_tier.rs` pins the emitter half against this same layout).
     #[test]
     fn v128_two_slot_layout_round_trips() {
-        use svm_ir::ValType;
+        use temen_ir::ValType;
         let sig = [
             ValType::V128,
             ValType::I64,
@@ -6466,15 +6491,15 @@ mod xcall_slot_tests {
 
 // ---- the wasm-JIT reactor (Doom's whole `tick` on emitted wasm) — BROWSER.md §"wasm-JIT tier" 5d ---
 //
-// Unlike the interpreter reactor (`svm_onramp_*`), the per-frame `tick` runs as a **JS-compiled**
-// emitted wasm module (`svm_wasmjit`), instantiated by `play.js` against this cdylib's own linear
+// Unlike the interpreter reactor (`temen_onramp_*`), the per-frame `tick` runs as a **JS-compiled**
+// emitted wasm module (`temen_wasmjit`), instantiated by `play.js` against this cdylib's own linear
 // memory. Each frame the page calls the emitted `f{tick}(win, env, sp)` directly; its cross-tier
-// helpers relay `env.call_interp` back to [`svm_onramp_jit_call_interp`], which runs the callee on the
+// helpers relay `env.call_interp` back to [`temen_onramp_jit_call_interp`], which runs the callee on the
 // interpreter over the same window with the powerbox (so `display`/`keyboard`/`fs`/`exit` resolve).
 // The window lives in a Rust-owned `Box` inside linear memory; the page reads its base
-// ([`svm_onramp_jit_win_ptr`]) for the emitted `win` argument and reads the emitted bytes to compile.
+// ([`temen_onramp_jit_win_ptr`]) for the emitted `win` argument and reads the emitted bytes to compile.
 
-/// The live wasm-JIT reactor. `None` until [`svm_onramp_jit_open_fs`]; single-threaded wasm.
+/// The live wasm-JIT reactor. `None` until [`temen_onramp_jit_open_fs`]; single-threaded wasm.
 static mut JIT_REACTOR: Option<JitOnrampReactor> = None;
 
 /// The JIT reactor's mapped-window log2 — 16 MiB, covering Doom's grown zone heap so the emitter's
@@ -6482,18 +6507,18 @@ static mut JIT_REACTOR: Option<JitOnrampReactor> = None;
 const JIT_WIN_LOG2: u8 = 24;
 
 /// Open a **wasm-JIT reactor** over the on-ramp module at `[mod_ptr, mod_len)` with **no `fs` file** —
-/// the reactor analogue of [`svm_onramp_open`], with the whole `tick` emitted to wasm (for interactive
+/// the reactor analogue of [`temen_onramp_open`], with the whole `tick` emitted to wasm (for interactive
 /// guests that need no served file: bounce/life/mandelzoom). Decodes, enlarges the window, runs
 /// `_start` on the interpreter, and emits the whole `tick`. Returns `0` on success, else a negative
 /// `STATUS_*` (also set in [`LAST_STATUS`]) — notably [`STATUS_UNSUPPORTED`] if the `tick` isn't
 /// wasm-JIT-emittable (the page falls back to the interp reactor). Otherwise identical to
-/// [`svm_onramp_jit_open_fs`]; drive/close with the same `svm_onramp_jit_*` exports.
+/// [`temen_onramp_jit_open_fs`]; drive/close with the same `temen_onramp_jit_*` exports.
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_open(mod_ptr: *const u8, mod_len: usize) -> i32 {
+pub extern "C" fn temen_onramp_jit_open(mod_ptr: *const u8, mod_len: usize) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
@@ -6520,13 +6545,13 @@ pub extern "C" fn svm_onramp_jit_open(mod_ptr: *const u8, mod_len: usize) -> i32
 /// WAD). Decodes, enlarges the window, runs `_start` on the interpreter, and emits the whole `tick`.
 /// Returns `0` on success, else a negative `STATUS_*` (also set in [`LAST_STATUS`]) — notably
 /// [`STATUS_UNSUPPORTED`] if the `tick` isn't wasm-JIT-emittable (the page falls back to the interp
-/// reactor). Replaces any prior JIT reactor. After success, read [`svm_onramp_jit_wasm_ptr`]/`_len`
-/// (emitted bytes), [`svm_onramp_jit_win_ptr`], [`svm_onramp_jit_entry_sp`], [`svm_onramp_jit_tick`],
-/// and [`svm_onramp_jit_env_bytes`] to set up the emitted module; drive it with
-/// [`svm_onramp_jit_call_interp`] + [`svm_onramp_jit_present`]; feed input with
-/// [`svm_onramp_jit_key`]; close with [`svm_onramp_jit_close`].
+/// reactor). Replaces any prior JIT reactor. After success, read [`temen_onramp_jit_wasm_ptr`]/`_len`
+/// (emitted bytes), [`temen_onramp_jit_win_ptr`], [`temen_onramp_jit_entry_sp`], [`temen_onramp_jit_tick`],
+/// and [`temen_onramp_jit_env_bytes`] to set up the emitted module; drive it with
+/// [`temen_onramp_jit_call_interp`] + [`temen_onramp_jit_present`]; feed input with
+/// [`temen_onramp_jit_key`]; close with [`temen_onramp_jit_close`].
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_open_fs(
+pub extern "C" fn temen_onramp_jit_open_fs(
     mod_ptr: *const u8,
     mod_len: usize,
     name_ptr: *const u8,
@@ -6535,11 +6560,11 @@ pub extern "C" fn svm_onramp_jit_open_fs(
     data_len: usize,
 ) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees each `[ptr, len)` is a live `svm_alloc`ation it just filled.
+    // SAFETY: the host guarantees each `[ptr, len)` is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let name = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
     let data = unsafe { core::slice::from_raw_parts(data_ptr, data_len) };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
@@ -6565,35 +6590,35 @@ pub extern "C" fn svm_onramp_jit_open_fs(
 /// Pointer / length of the emitted `tick` wasm bytes (valid until the reactor is replaced/closed; the
 /// page copies them out and `WebAssembly.compile`s them). `(null, 0)` if no reactor is open.
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_wasm_ptr() -> *const u8 {
+pub extern "C" fn temen_onramp_jit_wasm_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }
         .map_or(core::ptr::null(), |r| r.emitted_wasm().as_ptr())
 }
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_wasm_len() -> usize {
+pub extern "C" fn temen_onramp_jit_wasm_len() -> usize {
     unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }.map_or(0, |r| r.emitted_wasm().len())
 }
 
 /// The window base as a byte offset in this module's linear memory — the emitted `f{tick}`'s `win`.
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_win_ptr() -> usize {
+pub extern "C" fn temen_onramp_jit_win_ptr() -> usize {
     unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }.map_or(0, |r| r.win_base())
 }
 /// The reactor calling-convention data-stack base — the emitted `f{tick}`'s `sp` argument.
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_entry_sp() -> i64 {
+pub extern "C" fn temen_onramp_jit_entry_sp() -> i64 {
     unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }.map_or(0, |r| r.entry_sp() as i64)
 }
-/// The SVM index of the exported `tick` — the emitted export is `f{tick}`.
+/// The Temen index of the exported `tick` — the emitted export is `f{tick}`.
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_tick() -> u32 {
+pub extern "C" fn temen_onramp_jit_tick() -> u32 {
     unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }.map_or(0, |r| r.tick())
 }
-/// The `env` cell size (fuel counter + cross-tier scratch) the page must `svm_alloc` for the emitted
+/// The `env` cell size (fuel counter + cross-tier scratch) the page must `temen_alloc` for the emitted
 /// module's `env` argument.
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_env_bytes() -> usize {
-    svm_wasm_jit::ENV_CELL_BYTES
+pub extern "C" fn temen_onramp_jit_env_bytes() -> usize {
+    temen_wasm_jit::ENV_CELL_BYTES
 }
 
 /// **Cross-tier bounce** — the emitted `tick`'s `env.call_interp(func, args_ptr)` relays here. Runs
@@ -6601,7 +6626,7 @@ pub extern "C" fn svm_onramp_jit_env_bytes() -> usize {
 /// arg/result slots at `args_ptr` (in linear memory). Returns `0` on success, [`STATUS_EXIT`] if the
 /// callee `Exit`ed, else [`STATUS_TRAP`] — the page throws on any nonzero to unwind the emitted `tick`.
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_call_interp(func: u32, args_ptr: *mut u8) -> i32 {
+pub extern "C" fn temen_onramp_jit_call_interp(func: u32, args_ptr: *mut u8) -> i32 {
     // SAFETY: single-threaded wasm; exclusive access to the reactor for this call.
     let Some(reactor) = (unsafe { (*core::ptr::addr_of_mut!(JIT_REACTOR)).as_mut() }) else {
         return STATUS_UNSUPPORTED;
@@ -6638,10 +6663,10 @@ pub extern "C" fn svm_onramp_jit_call_interp(func: u32, args_ptr: *mut u8) -> i3
     }
 }
 
-/// Stash the frame the last emitted `tick` presented through `display` into the `svm_framebuffer_*`
+/// Stash the frame the last emitted `tick` presented through `display` into the `temen_framebuffer_*`
 /// slots (the page blits it after each frame). Returns `1` if a frame was presented, else `0`.
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_present() -> i32 {
+pub extern "C" fn temen_onramp_jit_present() -> i32 {
     // SAFETY: single-threaded wasm; shared read of the reactor.
     let frame =
         unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }.and_then(|r| r.take_frame());
@@ -6649,7 +6674,7 @@ pub extern "C" fn svm_onramp_jit_present() -> i32 {
         Some(f) => (f.rgba, f.width, f.height),
         None => return 0,
     };
-    // SAFETY: single-threaded wasm; the capture slots are read back only via the `svm_framebuffer_*`.
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the `temen_framebuffer_*`.
     unsafe {
         stash(&mut *core::ptr::addr_of_mut!(FB), rgba);
         FB_W = w;
@@ -6660,7 +6685,7 @@ pub extern "C" fn svm_onramp_jit_present() -> i32 {
 
 /// Enqueue a key event for the JIT reactor's guest to `poll` next frame (`pressed`: 1 = down, 0 = up).
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_key(keycode: i32, pressed: i32) {
+pub extern "C" fn temen_onramp_jit_key(keycode: i32, pressed: i32) {
     // SAFETY: single-threaded wasm; shared read of the reactor's key queue.
     if let Some(r) = unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() } {
         r.push_key(keycode, pressed);
@@ -6668,21 +6693,21 @@ pub extern "C" fn svm_onramp_jit_key(keycode: i32, pressed: i32) {
 }
 
 /// Diagnostic: stash the JIT reactor's last-trap string into [`OUT`] and return its length (`0` if
-/// none). Read via [`svm_stdout_ptr`].
+/// none). Read via [`temen_stdout_ptr`].
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_trap_len() -> usize {
+pub extern "C" fn temen_onramp_jit_trap_len() -> usize {
     // SAFETY: single-threaded wasm; shared read of the reactor.
     let s = unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }.map_or("", |r| r.last_trap());
     let bytes = s.as_bytes().to_vec();
     let len = bytes.len();
-    // SAFETY: single-threaded wasm; the stash is read back only via `svm_stdout_ptr`.
+    // SAFETY: single-threaded wasm; the stash is read back only via `temen_stdout_ptr`.
     unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
     len
 }
 
 /// Close the open JIT reactor, freeing it (and its window `Box`). Idempotent.
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_close() {
+pub extern "C" fn temen_onramp_jit_close() {
     // SAFETY: single-threaded wasm; exclusive access to drop the reactor.
     unsafe { *core::ptr::addr_of_mut!(JIT_REACTOR) = None };
 }
@@ -6690,12 +6715,12 @@ pub extern "C" fn svm_onramp_jit_close() {
 // ---- single-shot module wasm-JIT run (Lua/SQLite on emitted wasm) — the run-to-completion twin ------
 //
 // The module-demo analogue of the reactor FFI above: the whole program is func 0 (`_start`), emitted and
-// run once as `f0(win, env, ...slots)`. The page compiles [`svm_onramp_jit_run_wasm_ptr`]/`_len`,
-// instantiates against the cdylib's linear memory with `env.call_interp` → [`svm_onramp_jit_run_call_interp`],
-// calls `f0` with [`svm_onramp_jit_run_win_ptr`] + the [`svm_onramp_jit_run_slot`] handles, then
-// [`svm_onramp_jit_run_finish`] captures stdout/stderr/exit into the shared `OUT`/`ERR`/`EXIT_CODE`.
+// run once as `f0(win, env, ...slots)`. The page compiles [`temen_onramp_jit_run_wasm_ptr`]/`_len`,
+// instantiates against the cdylib's linear memory with `env.call_interp` → [`temen_onramp_jit_run_call_interp`],
+// calls `f0` with [`temen_onramp_jit_run_win_ptr`] + the [`temen_onramp_jit_run_slot`] handles, then
+// [`temen_onramp_jit_run_finish`] captures stdout/stderr/exit into the shared `OUT`/`ERR`/`EXIT_CODE`.
 
-/// The live single-shot JIT run. `None` until [`svm_onramp_jit_run_open`]; single-threaded wasm.
+/// The live single-shot JIT run. `None` until [`temen_onramp_jit_run_open`]; single-threaded wasm.
 static mut JIT_RUN: Option<JitOnrampRun> = None;
 
 /// The single-shot run's fixed window log2 — 32 MiB, holding Lua/SQLite's heap (the emitted run can't
@@ -6706,9 +6731,9 @@ const JIT_RUN_WIN_LOG2: u8 = 25;
 /// resolve imports, outline cap-calls, grant the powerbox (seeding stdin from `[stdin_ptr, stdin_len)`),
 /// materialize `.data`, and emit rooted at `_start`. Returns `0`, else a negative `STATUS_*` (also set in
 /// [`LAST_STATUS`]) — notably [`STATUS_UNSUPPORTED`] if `_start` isn't emittable (the page falls back to
-/// [`svm_run_onramp`]). Replaces any prior run. Drive it with the `svm_onramp_jit_run_*` exports below.
+/// [`temen_run_onramp`]). Replaces any prior run. Drive it with the `temen_onramp_jit_run_*` exports below.
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_run_open(
+pub extern "C" fn temen_onramp_jit_run_open(
     mod_ptr: *const u8,
     mod_len: usize,
     stdin_ptr: *const u8,
@@ -6716,7 +6741,7 @@ pub extern "C" fn svm_onramp_jit_run_open(
     shared: i32,
 ) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let stdin: Vec<u8> = if stdin_ptr.is_null() || stdin_len == 0 {
         Vec::new()
@@ -6724,7 +6749,7 @@ pub extern "C" fn svm_onramp_jit_run_open(
         // SAFETY: same host guarantee for the stdin range.
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
     };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
@@ -6750,17 +6775,17 @@ pub extern "C" fn svm_onramp_jit_run_open(
 }
 
 /// Open a **single-shot wasm-JIT run** of the chibicc compiler card: decode the compiler module at
-/// `[mod_ptr, mod_len)`, assemble the same memfs [`svm_run_onramp_fs`] does (the user's source at
+/// `[mod_ptr, mod_len)`, assemble the same memfs [`temen_run_onramp_fs`] does (the user's source at
 /// `/in.c`, the built-in libc headers + any caller headers under `/include`), and emit `_start` as
 /// wasm — so the browser runs chibicc's compile on the **wasm-JIT** instead of the bytecode
 /// interpreter (the compiler's `fopen`/`write`/`exit` bounce cross-tier). The fast twin of
-/// `svm_run_onramp_fs`; drive it with the same `svm_onramp_jit_run_*` exports (call
-/// [`svm_onramp_jit_run_finish`] for the emitted IR on `svm_stdout_ptr`). `debug_info != 0` compiles
-/// with `-g` (source-level debug section) — off by default, as in `svm_run_onramp_fs`. Returns `0`,
+/// `temen_run_onramp_fs`; drive it with the same `temen_onramp_jit_run_*` exports (call
+/// [`temen_onramp_jit_run_finish`] for the emitted IR on `temen_stdout_ptr`). `debug_info != 0` compiles
+/// with `-g` (source-level debug section) — off by default, as in `temen_run_onramp_fs`. Returns `0`,
 /// else a negative `STATUS_*` (also in [`LAST_STATUS`]) — notably [`STATUS_UNSUPPORTED`] if `_start`
-/// isn't emittable (the page falls back to [`svm_run_onramp_fs`]).
+/// isn't emittable (the page falls back to [`temen_run_onramp_fs`]).
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_run_open_fs(
+pub extern "C" fn temen_onramp_jit_run_open_fs(
     mod_ptr: *const u8,
     mod_len: usize,
     img_ptr: *const u8,
@@ -6770,17 +6795,17 @@ pub extern "C" fn svm_onramp_jit_run_open_fs(
     debug_info: i32,
 ) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees each range is a live `svm_alloc`ation it just filled.
+    // SAFETY: the host guarantees each range is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let src = unsafe { core::slice::from_raw_parts(src_ptr, src_len) };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
             return -STATUS_DECODE_ERR;
         }
     };
-    if svm_verify::verify_module(&m).is_err() {
+    if temen_verify::verify_module(&m).is_err() {
         set(STATUS_VERIFY_ERR);
         return -STATUS_VERIFY_ERR;
     }
@@ -6813,15 +6838,15 @@ pub extern "C" fn svm_onramp_jit_run_open_fs(
 /// every cc1 TU (all byte-identical to native); the max-memory cap is 1 GiB, so this stays well within.
 const SELFHOST_WIN_LOG2: u8 = 27;
 
-/// **Self-host card — wasm-JIT tier** (the fast twin of [`svm_selfhost_emit_object_fs`]). Emit
-/// `chibicc.svmb`'s `_start` to wasm and run it in `--emit-object` mode over one of chibicc's own cc1
+/// **Self-host card — wasm-JIT tier** (the fast twin of [`temen_selfhost_emit_object_fs`]). Emit
+/// `chibicc.temen`'s `_start` to wasm and run it in `--emit-object` mode over one of chibicc's own cc1
 /// TUs (seeded from the raw closure image `[img_ptr, img_len)`, memfs-relative TU path
 /// `[tu_ptr, tu_len)`), so the browser compiles chibicc's own source on emitted wasm — every cc1 TU,
 /// giants included, in a few hundred ms (SELFHOST_C.md). Drives the same finish path as the shipping JIT
-/// card ([`svm_onramp_jit_run_finish`] → the object text on `svm_stdout_*`). Runs in a 128 MiB window
+/// card ([`temen_onramp_jit_run_finish`] → the object text on `temen_stdout_*`). Runs in a 128 MiB window
 /// ([`SELFHOST_WIN_LOG2`]). Returns `0`, else a negative `STATUS_*` (also in [`LAST_STATUS`]).
 #[no_mangle]
-pub extern "C" fn svm_selfhost_jit_emit_object_fs(
+pub extern "C" fn temen_selfhost_jit_emit_object_fs(
     mod_ptr: *const u8,
     mod_len: usize,
     img_ptr: *const u8,
@@ -6831,18 +6856,18 @@ pub extern "C" fn svm_selfhost_jit_emit_object_fs(
     debug_info: i32,
 ) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees each range is a live `svm_alloc`ation it just filled.
+    // SAFETY: the host guarantees each range is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
     let tu = unsafe { core::slice::from_raw_parts(tu_ptr, tu_len) };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
             return -STATUS_DECODE_ERR;
         }
     };
-    if svm_verify::verify_module(&m).is_err() {
+    if temen_verify::verify_module(&m).is_err() {
         set(STATUS_VERIFY_ERR);
         return -STATUS_VERIFY_ERR;
     }
@@ -6863,32 +6888,32 @@ pub extern "C" fn svm_selfhost_jit_emit_object_fs(
 
 /// Pointer / length of the emitted `_start` wasm bytes (valid until the run is replaced/closed).
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_run_wasm_ptr() -> *const u8 {
+pub extern "C" fn temen_onramp_jit_run_wasm_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(JIT_RUN)).as_ref() }
         .map_or(core::ptr::null(), |r| r.emitted_wasm().as_ptr())
 }
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_run_wasm_len() -> usize {
+pub extern "C" fn temen_onramp_jit_run_wasm_len() -> usize {
     unsafe { (*core::ptr::addr_of!(JIT_RUN)).as_ref() }.map_or(0, |r| r.emitted_wasm().len())
 }
 /// The window base as a byte offset in this module's linear memory — the emitted `f0`'s `win`.
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_run_win_ptr() -> usize {
+pub extern "C" fn temen_onramp_jit_run_win_ptr() -> usize {
     unsafe { (*core::ptr::addr_of!(JIT_RUN)).as_ref() }.map_or(0, |r| r.win_base())
 }
-/// The `env` cell size the page must `svm_alloc` for the emitted module's `env` argument.
+/// The `env` cell size the page must `temen_alloc` for the emitted module's `env` argument.
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_run_env_bytes() -> usize {
-    svm_wasm_jit::ENV_CELL_BYTES
+pub extern "C" fn temen_onramp_jit_run_env_bytes() -> usize {
+    temen_wasm_jit::ENV_CELL_BYTES
 }
 /// The number of capability-handle params `_start` takes — the emitted `f0`'s trailing `...slots` args.
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_run_slot_count() -> usize {
+pub extern "C" fn temen_onramp_jit_run_slot_count() -> usize {
     unsafe { (*core::ptr::addr_of!(JIT_RUN)).as_ref() }.map_or(0, |r| r.slots().len())
 }
 /// The `i`-th capability handle `_start` takes as a param (`0` if out of range / no run).
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_run_slot(i: usize) -> i32 {
+pub extern "C" fn temen_onramp_jit_run_slot(i: usize) -> i32 {
     unsafe { (*core::ptr::addr_of!(JIT_RUN)).as_ref() }.map_or(0, |r| match r.slots().get(i) {
         Some(Value::I32(x)) => *x,
         Some(Value::I64(x)) => *x as i32,
@@ -6897,9 +6922,9 @@ pub extern "C" fn svm_onramp_jit_run_slot(i: usize) -> i32 {
 }
 
 /// **Cross-tier bounce** — the emitted `f0`'s `env.call_interp(func, args_ptr)` relays here (identical
-/// contract to [`svm_onramp_jit_call_interp`], but over the single-shot run's window/powerbox).
+/// contract to [`temen_onramp_jit_call_interp`], but over the single-shot run's window/powerbox).
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_run_call_interp(func: u32, args_ptr: *mut u8) -> i32 {
+pub extern "C" fn temen_onramp_jit_run_call_interp(func: u32, args_ptr: *mut u8) -> i32 {
     // SAFETY: single-threaded wasm; exclusive access to the run for this call.
     let Some(run) = (unsafe { (*core::ptr::addr_of_mut!(JIT_RUN)).as_mut() }) else {
         return STATUS_UNSUPPORTED;
@@ -6928,7 +6953,7 @@ pub extern "C" fn svm_onramp_jit_run_call_interp(func: u32, args_ptr: *mut u8) -
             }
             0
         }
-        // The guest `exit`ed — unwind the emitted `f0`; `svm_onramp_jit_run_finish` reports the code.
+        // The guest `exit`ed — unwind the emitted `f0`; `temen_onramp_jit_run_finish` reports the code.
         Err(Trap::Exit(_)) => STATUS_EXIT,
         Err(t) => {
             run.set_last_trap(format!("{t:?}"));
@@ -6939,12 +6964,12 @@ pub extern "C" fn svm_onramp_jit_run_call_interp(func: u32, args_ptr: *mut u8) -
 
 /// Record how the emitted `f0` finished, from the JS driver's vantage: `value` is `f0`'s return (the
 /// guest's top-level result, meaningful only when it *returned*), and `threw != 0` iff the call unwound.
-/// Call this before [`svm_onramp_jit_run_finish`]. The driver can't tell an `exit` unwind from a trap
+/// Call this before [`temen_onramp_jit_run_finish`]. The driver can't tell an `exit` unwind from a trap
 /// unwind, so it reports "threw" and this pairs it with the Rust-side `exited` flag (set on a cross-tier
 /// `Exit`): a throw that did not `exit` is a trap. Optional — a caller that skips it gets the legacy
 /// "returned, value 0" reading (`jit-profile.mjs` doesn't care about the value).
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_run_report(threw: i32, value: i64) {
+pub extern "C" fn temen_onramp_jit_run_report(threw: i32, value: i64) {
     // SAFETY: single-threaded wasm; exclusive access to the run.
     if let Some(run) = unsafe { (*core::ptr::addr_of_mut!(JIT_RUN)).as_mut() } {
         run.record_outcome(threw != 0, value);
@@ -6952,15 +6977,15 @@ pub extern "C" fn svm_onramp_jit_run_report(threw: i32, value: i64) {
 }
 
 /// Capture the finished run's streams into the shared `OUT`/`ERR`/`EXIT_CODE`/`RUN_VALUE` + any presented
-/// frame into the `svm_framebuffer_*` slots, so the page reads them via the usual [`svm_stdout_ptr`] /
-/// [`svm_exit_code`] / [`svm_run_value`] / `svm_framebuffer_*` accessors — identical to
-/// [`svm_run_onramp`]'s contract, so the interpreter and the wasm-JIT agree on result + exit + trap
-/// (INVARIANT 9). Call once after `f0` returns or unwinds (and after [`svm_onramp_jit_run_report`]).
+/// frame into the `temen_framebuffer_*` slots, so the page reads them via the usual [`temen_stdout_ptr`] /
+/// [`temen_exit_code`] / [`temen_run_value`] / `temen_framebuffer_*` accessors — identical to
+/// [`temen_run_onramp`]'s contract, so the interpreter and the wasm-JIT agree on result + exit + trap
+/// (INVARIANT 9). Call once after `f0` returns or unwinds (and after [`temen_onramp_jit_run_report`]).
 /// Returns [`STATUS_EXIT`] if the guest `exit`ed, [`STATUS_TRAP`] if the emitted run unwound on a trap
 /// (a wasm `unreachable` / a cross-tier bounce that trapped — never a truncated `STATUS_OK`), else
 /// [`STATUS_OK`] with the returned value in `RUN_VALUE`.
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_run_finish() -> i32 {
+pub extern "C" fn temen_onramp_jit_run_finish() -> i32 {
     // SAFETY: single-threaded wasm; exclusive access to the run.
     let Some(run) = (unsafe { (*core::ptr::addr_of!(JIT_RUN)).as_ref() }) else {
         return STATUS_UNSUPPORTED;
@@ -6970,7 +6995,7 @@ pub extern "C" fn svm_onramp_jit_run_finish() -> i32 {
     let stdout = run.output();
     let stderr = run.stderr().to_vec();
     // Exit is checked first (a cross-tier `Exit` sets both `exited` and, via the JS driver, `trapped`);
-    // then a trap; then a clean return carrying the guest's result value. This mirrors `svm_run_onramp`'s
+    // then a trap; then a clean return carrying the guest's result value. This mirrors `temen_run_onramp`'s
     // `Exit` / other-`Err` / `Ok(value)` arms exactly, so a program has the same status + value on both
     // tiers.
     let (status, code, value) = if run.exited() {
@@ -7000,73 +7025,73 @@ pub extern "C" fn svm_onramp_jit_run_finish() -> i32 {
 
 /// Diagnostic: stash the single-shot run's last-trap string into [`OUT`] and return its length.
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_run_trap_len() -> usize {
+pub extern "C" fn temen_onramp_jit_run_trap_len() -> usize {
     let s = unsafe { (*core::ptr::addr_of!(JIT_RUN)).as_ref() }.map_or("", |r| r.last_trap());
     let bytes = s.as_bytes().to_vec();
     let len = bytes.len();
-    // SAFETY: single-threaded wasm; the stash is read back only via `svm_stdout_ptr`.
+    // SAFETY: single-threaded wasm; the stash is read back only via `temen_stdout_ptr`.
     unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
     len
 }
 
 /// Close the open single-shot run, freeing it (and its window `Box`). Idempotent.
 #[no_mangle]
-pub extern "C" fn svm_onramp_jit_run_close() {
+pub extern "C" fn temen_onramp_jit_run_close() {
     // SAFETY: single-threaded wasm; exclusive access to drop the run.
     unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = None };
 }
 
-/// Pointer / length of the captured stdout from the most recent [`svm_run_pb`] (valid until the next
-/// `svm_run_pb`; do not `svm_dealloc` it).
+/// Pointer / length of the captured stdout from the most recent [`temen_run_pb`] (valid until the next
+/// `temen_run_pb`; do not `temen_dealloc` it).
 #[no_mangle]
-pub extern "C" fn svm_stdout_ptr() -> *const u8 {
+pub extern "C" fn temen_stdout_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(OUT)).0 }
 }
 #[no_mangle]
-pub extern "C" fn svm_stdout_len() -> usize {
+pub extern "C" fn temen_stdout_len() -> usize {
     unsafe { (*core::ptr::addr_of!(OUT)).1 }
 }
-/// Pointer / length of the data image from the most recent [`svm_pg_snapshot`] (valid until the next
-/// snapshot; do not `svm_dealloc` it).
+/// Pointer / length of the data image from the most recent [`temen_pg_snapshot`] (valid until the next
+/// snapshot; do not `temen_dealloc` it).
 #[no_mangle]
-pub extern "C" fn svm_pg_snapshot_ptr() -> *const u8 {
+pub extern "C" fn temen_pg_snapshot_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(PG_SNAP)).0 }
 }
 #[no_mangle]
-pub extern "C" fn svm_pg_snapshot_len() -> usize {
+pub extern "C" fn temen_pg_snapshot_len() -> usize {
     unsafe { (*core::ptr::addr_of!(PG_SNAP)).1 }
 }
-/// Pointer / length of the captured stderr from the most recent [`svm_run_pb`] (same lifetime rule).
+/// Pointer / length of the captured stderr from the most recent [`temen_run_pb`] (same lifetime rule).
 #[no_mangle]
-pub extern "C" fn svm_stderr_ptr() -> *const u8 {
+pub extern "C" fn temen_stderr_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(ERR)).0 }
 }
 #[no_mangle]
-pub extern "C" fn svm_stderr_len() -> usize {
+pub extern "C" fn temen_stderr_len() -> usize {
     unsafe { (*core::ptr::addr_of!(ERR)).1 }
 }
-/// Exit code from the most recent [`svm_run_pb`] (valid when [`svm_status`] is [`STATUS_EXIT`]).
+/// Exit code from the most recent [`temen_run_pb`] (valid when [`temen_status`] is [`STATUS_EXIT`]).
 #[no_mangle]
-pub extern "C" fn svm_exit_code() -> i32 {
+pub extern "C" fn temen_exit_code() -> i32 {
     unsafe { EXIT_CODE }
 }
 
 /// The value the guest's top-level function returned on the most recent single-shot JIT run (valid when
-/// [`svm_status`] / the finish status is [`STATUS_OK`]; `0` after an exit or trap). This is the same
-/// result `svm_run_onramp` returns on the interpreter, so the page shows an identical value on both
+/// [`temen_status`] / the finish status is [`STATUS_OK`]; `0` after an exit or trap). This is the same
+/// result `temen_run_onramp` returns on the interpreter, so the page shows an identical value on both
 /// tiers for a returned program (INVARIANT 9).
 #[no_mangle]
-pub extern "C" fn svm_run_value() -> i64 {
+pub extern "C" fn temen_run_value() -> i64 {
     unsafe { RUN_VALUE }
 }
 
 /// Decode the module at `[mod_ptr, mod_len)` and run function 0 (single `i64` `arg`, deny-all
 /// `Host`) over a window **seeded** with `[init_ptr, init_len)`, then capture the final window image
 /// (see [`capture_exec`]). Returns the guest's `i64` result; sets [`LAST_STATUS`]. The captured image
-/// (the first `init_len` bytes of memory after the run) is read via [`svm_snapshot_ptr`] /
-/// [`svm_snapshot_len`] and is cdylib-managed (valid until the next call; do not `svm_dealloc` it).
+/// (the first `init_len` bytes of memory after the run) is read via [`temen_snapshot_ptr`] /
+/// [`temen_snapshot_len`] and is cdylib-managed (valid until the next call; do not `temen_dealloc` it).
 #[no_mangle]
-pub extern "C" fn svm_run_capture(
+pub extern "C" fn temen_run_capture(
     mod_ptr: *const u8,
     mod_len: usize,
     init_ptr: *const u8,
@@ -7074,14 +7099,14 @@ pub extern "C" fn svm_run_capture(
     arg: i64,
 ) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees both ranges are live `svm_alloc`ations it just filled.
+    // SAFETY: the host guarantees both ranges are live `temen_alloc`ations it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let init: &[u8] = if init_ptr.is_null() || init_len == 0 {
         &[]
     } else {
         unsafe { core::slice::from_raw_parts(init_ptr, init_len) }
     };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
@@ -7095,26 +7120,26 @@ pub extern "C" fn svm_run_capture(
     out.value
 }
 
-/// Pointer / length of the captured final window image from the most recent [`svm_run_capture`].
+/// Pointer / length of the captured final window image from the most recent [`temen_run_capture`].
 #[no_mangle]
-pub extern "C" fn svm_snapshot_ptr() -> *const u8 {
+pub extern "C" fn temen_snapshot_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(SNAP)).0 }
 }
 #[no_mangle]
-pub extern "C" fn svm_snapshot_len() -> usize {
+pub extern "C" fn temen_snapshot_len() -> usize {
     unsafe { (*core::ptr::addr_of!(SNAP)).1 }
 }
 
-// ---- playground: in-browser SVM-text front end (parse → verify → encode) ------------------------
+// ---- playground: in-browser TEMEN-text front end (parse → verify → encode) ------------------------
 
-/// Compile the **SVM text** at `[src_ptr, src_len)` (UTF-8) into the `svm-encode` binary form the
-/// `svm_run*` / `svm_par_*` entries consume: parse (`svm-text`) → verify (`svm-verify`) → encode.
+/// Compile the **Temen text** at `[src_ptr, src_len)` (UTF-8) into the `temen-encode` binary form the
+/// `temen_run*` / `temen_par_*` entries consume: parse (`temen-text`) → verify (`temen-verify`) → encode.
 /// Returns `1` and stashes the encoded module bytes, or `0` and stashes a UTF-8 error message
-/// (which stage failed and why). Read the stash via [`svm_parse_ptr`] + [`svm_parse_len`] before
+/// (which stage failed and why). Read the stash via [`temen_parse_ptr`] + [`temen_parse_len`] before
 /// the next call — this is the playground's front end, so rejects must come back as *messages*,
 /// not statuses.
 #[no_mangle]
-pub extern "C" fn svm_parse(src_ptr: *const u8, src_len: usize) -> i32 {
+pub extern "C" fn temen_parse(src_ptr: *const u8, src_len: usize) -> i32 {
     let bytes: &[u8] = if src_ptr.is_null() || src_len == 0 {
         &[]
     } else {
@@ -7130,31 +7155,31 @@ pub extern "C" fn svm_parse(src_ptr: *const u8, src_len: usize) -> i32 {
         Ok(s) => s,
         Err(e) => return put(0, format!("source is not UTF-8: {e}").into_bytes()),
     };
-    let m = match svm_text::parse_module(src) {
+    let m = match temen_text::parse_module(src) {
         Ok(m) => m,
         // `ParseError`'s Display already carries the "parse error: " prefix.
         Err(e) => return put(0, format!("{e}").into_bytes()),
     };
-    if let Err(e) = svm_verify::verify_module(&m) {
+    if let Err(e) = temen_verify::verify_module(&m) {
         return put(0, format!("verify error: {e:?}").into_bytes());
     }
-    put(1, svm_encode::encode_module(&m))
+    put(1, temen_encode::encode_module(&m))
 }
 
-/// Pointer / length of the most recent [`svm_parse`] output (module bytes on `1`, error text on `0`).
+/// Pointer / length of the most recent [`temen_parse`] output (module bytes on `1`, error text on `0`).
 #[no_mangle]
-pub extern "C" fn svm_parse_ptr() -> *const u8 {
+pub extern "C" fn temen_parse_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(PARSE)).0 }
 }
 #[no_mangle]
-pub extern "C" fn svm_parse_len() -> usize {
+pub extern "C" fn temen_parse_len() -> usize {
     unsafe { (*core::ptr::addr_of!(PARSE)).1 }
 }
-/// The stashed [`svm_parse`] output (same cdylib-managed lifetime as `OUT`/`ERR`).
+/// The stashed [`temen_parse`] output (same cdylib-managed lifetime as `OUT`/`ERR`).
 static mut PARSE: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 
 // ---- Debug Adapter Protocol (DEBUGGING.md) — the debugger, over the bytecode engine --------------
-// The playground drives the same `svm-dap` server the CLI/editor use, but selecting the **bytecode**
+// The playground drives the same `temen-dap` server the CLI/editor use, but selecting the **bytecode**
 // backend (`"engine":"bytecode"` in `launch`) so it debugs the engine that actually ships, never the
 // tree-walker (which stays the differential oracle). The wire is trivial: JS sends a DAP request JSON,
 // the cdylib parses it, calls the pure `DapServer::handle`, and stashes the reply (a JSON array of one
@@ -7162,34 +7187,34 @@ static mut PARSE: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 // drive, minus the `Content-Length` framing (`run_stdio`, unused in wasm).
 
 /// The live DAP session's server (single-threaded, main-thread only, like every stash here).
-static mut DAP_SERVER: Option<svm_dap::DapServer> = None;
-/// The stashed reply of the most recent [`svm_dap_request`] (cdylib-managed, like `PARSE`).
+static mut DAP_SERVER: Option<temen_dap::DapServer> = None;
+/// The stashed reply of the most recent [`temen_dap_request`] (cdylib-managed, like `PARSE`).
 static mut DAP_OUT: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 
 /// Start a fresh debug session (drop any prior server). Call before the `initialize` request so each
 /// session begins clean.
 #[no_mangle]
-pub extern "C" fn svm_dap_reset() -> i32 {
+pub extern "C" fn temen_dap_reset() -> i32 {
     // SAFETY: single-threaded main-thread state, like `PARSE`/`OUT`.
     unsafe {
-        *core::ptr::addr_of_mut!(DAP_SERVER) = Some(svm_dap::DapServer::new());
+        *core::ptr::addr_of_mut!(DAP_SERVER) = Some(temen_dap::DapServer::new());
     }
     0
 }
 
 /// Feed one DAP request (a JSON object at `[ptr, len)`) to the session server and stash the JSON array
-/// of reply messages (`[response, event…]`) for [`svm_dap_response_ptr`] + [`svm_dap_response_len`].
+/// of reply messages (`[response, event…]`) for [`temen_dap_response_ptr`] + [`temen_dap_response_len`].
 /// Returns `0`, or `-1` if the request isn't valid UTF-8 / JSON. Lazily creates the server if
-/// [`svm_dap_reset`] wasn't called first.
+/// [`temen_dap_reset`] wasn't called first.
 #[no_mangle]
-pub extern "C" fn svm_dap_request(ptr: *const u8, len: usize) -> i32 {
+pub extern "C" fn temen_dap_request(ptr: *const u8, len: usize) -> i32 {
     let bytes: &[u8] = if ptr.is_null() || len == 0 {
         &[]
     } else {
         // SAFETY: the host guarantees `[ptr, len)` is a live allocation it just filled.
         unsafe { core::slice::from_raw_parts(ptr, len) }
     };
-    // SAFETY: single-reader stash on the main thread, like the `svm_parse` accessors.
+    // SAFETY: single-reader stash on the main thread, like the `temen_parse` accessors.
     let put = |data: Vec<u8>| unsafe { stash(&mut *core::ptr::addr_of_mut!(DAP_OUT), data) };
     let text = match core::str::from_utf8(bytes) {
         Ok(s) => s,
@@ -7198,7 +7223,7 @@ pub extern "C" fn svm_dap_request(ptr: *const u8, len: usize) -> i32 {
             return -1;
         }
     };
-    let req = match svm_dap::parse(text) {
+    let req = match temen_dap::parse(text) {
         Some(j) => j,
         None => {
             put(Vec::new());
@@ -7209,7 +7234,7 @@ pub extern "C" fn svm_dap_request(ptr: *const u8, len: usize) -> i32 {
     let server = unsafe {
         let slot = &mut *core::ptr::addr_of_mut!(DAP_SERVER);
         if slot.is_none() {
-            *slot = Some(svm_dap::DapServer::new());
+            *slot = Some(temen_dap::DapServer::new());
         }
         slot.as_mut().unwrap()
     };
@@ -7219,14 +7244,14 @@ pub extern "C" fn svm_dap_request(ptr: *const u8, len: usize) -> i32 {
     // one-request pump; the reply shape is identical either way (`web/dap.js` already consumes an
     // array and filters by `type`).
     let reply = match &req {
-        svm_dap::Json::Arr(reqs) => {
+        temen_dap::Json::Arr(reqs) => {
             let mut msgs = Vec::new();
             for r in reqs {
                 msgs.extend(server.handle(r));
             }
-            svm_dap::Json::Arr(msgs)
+            temen_dap::Json::Arr(msgs)
         }
-        _ => svm_dap::Json::Arr(server.handle(&req)),
+        _ => temen_dap::Json::Arr(server.handle(&req)),
     }
     .to_string()
     .into_bytes();
@@ -7234,34 +7259,34 @@ pub extern "C" fn svm_dap_request(ptr: *const u8, len: usize) -> i32 {
     0
 }
 
-/// Pointer / length of the most recent [`svm_dap_request`] reply (a JSON array of DAP messages).
+/// Pointer / length of the most recent [`temen_dap_request`] reply (a JSON array of DAP messages).
 #[no_mangle]
-pub extern "C" fn svm_dap_response_ptr() -> *const u8 {
+pub extern "C" fn temen_dap_response_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(DAP_OUT)).0 }
 }
 #[no_mangle]
-pub extern "C" fn svm_dap_response_len() -> usize {
+pub extern "C" fn temen_dap_response_len() -> usize {
     unsafe { (*core::ptr::addr_of!(DAP_OUT)).1 }
 }
 
 // ---- W3 in the browser: run-mode memory profiling (INTERACTIVE_EMBEDDING.md slice 4) -------------
-// The debug tier feeds the host-side models through the access sink (`svm-dap`); a **non-debug**
+// The debug tier feeds the host-side models through the access sink (`temen-dap`); a **non-debug**
 // profiling run uses the W3 instrumentation pass instead: rewrite the module so every memory op
-// announces itself on a host-fn capability — the `svm-run` `with_mem_hooks` twin, reproduced here
-// because the cdylib depends on neither `svm-run` nor its OS-bound PAL (`svm-opt` is pure IR and
+// announces itself on a host-fn capability — the `temen-run` `with_mem_hooks` twin, reproduced here
+// because the cdylib depends on neither `temen-run` nor its OS-bound PAL (`temen-opt` is pure IR and
 // wasm-clean) — feed the same `MemModel`, and stash its stats JSON. The rewrite never meets a
 // debugger: run-mode entries inspect nothing, so the inserted ops are invisible by construction.
 
-/// The stashed stats JSON of the most recent [`svm_mem_profile`] run.
+/// The stashed stats JSON of the most recent [`temen_mem_profile`] run.
 static mut MEMPROF: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 
-/// The `svm-run` `decode_mem_event` twin (the op/arg layout is owned by
-/// `svm_opt::instrument::mem_hook_op`). Drift between the twins is pinned by
+/// The `temen-run` `decode_mem_event` twin (the op/arg layout is owned by
+/// `temen_opt::instrument::mem_hook_op`). Drift between the twins is pinned by
 /// `browser/tests/mem_profile.rs`, which compares this hook-fed model against a sink-fed one on
 /// the same guest, stats-for-stats.
-fn decode_mem_event(op: u32, args: &[i64]) -> Option<svm_interp::MemEvent> {
-    use svm_interp::MemEvent as E;
-    use svm_opt::instrument::mem_hook_op as k;
+fn decode_mem_event(op: u32, args: &[i64]) -> Option<temen_interp::MemEvent> {
+    use temen_interp::MemEvent as E;
+    use temen_opt::instrument::mem_hook_op as k;
     let a = |i: usize| args.get(i).copied().map(|v| v as u64);
     Some(match (op, args.len()) {
         (k::LOAD, 2) => E::Load {
@@ -7303,15 +7328,15 @@ fn decode_mem_event(op: u32, args: &[i64]) -> Option<svm_interp::MemEvent> {
 
 /// Profile `[ptr, len)`'s module (function 0, deny-all plus the hook grant — a compute guest):
 /// instrument with the W3 pass, re-verify (fail-closed like every rewrite), run on the bytecode
-/// engine feeding a [`svm_dap::models::MemModel`] (geometry from the args; `0` = the teaching
-/// default), and stash the stats JSON for [`svm_mem_profile_stats_ptr`]. Returns `0` on a clean
+/// engine feeding a [`temen_dap::models::MemModel`] (geometry from the args; `0` = the teaching
+/// default), and stash the stats JSON for [`temen_mem_profile_stats_ptr`]. Returns `0` on a clean
 /// run, `1` on a guest trap (stats still stashed — the final event is the attempted faulting
 /// access), `-1` undecodable, `-2` manifest-carrying (fail-closed: the hook grant would occupy
-/// import slot 0 — IMPORTS.md §2.1, the `svm-run` rule), `-3` failed re-verification, `-4`
+/// import slot 0 — IMPORTS.md §2.1, the `temen-run` rule), `-3` failed re-verification, `-4`
 /// outside the bytecode subset.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn svm_mem_profile(
+pub extern "C" fn temen_mem_profile(
     ptr: *const u8,
     len: usize,
     l1_sets: u32,
@@ -7326,7 +7351,7 @@ pub extern "C" fn svm_mem_profile(
     let put = |data: Vec<u8>| unsafe { stash(&mut *core::ptr::addr_of_mut!(MEMPROF), data) };
     // SAFETY: the host guarantees `[ptr, len)` is a live allocation it just filled.
     let bytes: &[u8] = unsafe { core::slice::from_raw_parts(ptr, len) };
-    let Ok(m) = svm_encode::decode_module(bytes) else {
+    let Ok(m) = temen_encode::decode_module(bytes) else {
         put(Vec::new());
         return -1;
     };
@@ -7340,19 +7365,19 @@ pub extern "C" fn svm_mem_profile(
         let mut scratch = Host::new();
         scratch.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![])))
     };
-    let spec = svm_opt::instrument::MemHookSpec {
-        type_id: svm_interp::cap_id::HOST_PROC,
+    let spec = temen_opt::instrument::MemHookSpec {
+        type_id: temen_interp::cap_id::HOST_PROC,
         handle,
     };
-    let (im, _stats) = svm_opt::instrument::instrument_mem_hooks(&m, spec);
-    if let Err(e) = svm_verify::verify_module(&im) {
+    let (im, _stats) = temen_opt::instrument::instrument_mem_hooks(&m, spec);
+    if let Err(e) = temen_verify::verify_module(&im) {
         put(format!("{e:?}").into_bytes()); // the error text, for diagnostics
         return -3;
     }
-    let d = svm_dap::models::MemModelCfg::default();
+    let d = temen_dap::models::MemModelCfg::default();
     let dim = |v: u32, def: u64| if v == 0 { def } else { v as u64 };
-    let cfg = svm_dap::models::MemModelCfg {
-        l1: svm_dap::models::CacheCfg {
+    let cfg = temen_dap::models::MemModelCfg {
+        l1: temen_dap::models::CacheCfg {
             sets: dim(l1_sets, d.l1.sets),
             ways: if l1_ways == 0 {
                 d.l1.ways
@@ -7361,7 +7386,7 @@ pub extern "C" fn svm_mem_profile(
             },
             line: dim(l1_line, d.l1.line),
         },
-        l2: svm_dap::models::CacheCfg {
+        l2: temen_dap::models::CacheCfg {
             sets: dim(l2_sets, d.l2.sets),
             ways: if l2_ways == 0 {
                 d.l2.ways
@@ -7372,7 +7397,7 @@ pub extern "C" fn svm_mem_profile(
         },
         page_size: dim(page_size, d.page_size),
     };
-    let model = Arc::new(Mutex::new(svm_dap::models::MemModel::new(cfg)));
+    let model = Arc::new(Mutex::new(temen_dap::models::MemModel::new(cfg)));
     model
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -7409,13 +7434,13 @@ pub extern "C" fn svm_mem_profile(
     status
 }
 
-/// Pointer / length of the most recent [`svm_mem_profile`] stats JSON.
+/// Pointer / length of the most recent [`temen_mem_profile`] stats JSON.
 #[no_mangle]
-pub extern "C" fn svm_mem_profile_stats_ptr() -> *const u8 {
+pub extern "C" fn temen_mem_profile_stats_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(MEMPROF)).0 }
 }
 #[no_mangle]
-pub extern "C" fn svm_mem_profile_stats_len() -> usize {
+pub extern "C" fn temen_mem_profile_stats_len() -> usize {
     unsafe { (*core::ptr::addr_of!(MEMPROF)).1 }
 }
 
@@ -7426,34 +7451,34 @@ pub extern "C" fn svm_mem_profile_stats_len() -> usize {
 /// `unreachable`; because the JS host calls the emitted function **directly** (not via this
 /// cdylib), that `unreachable` surfaces as a catchable `RuntimeError` at the JS boundary — the host
 /// reads the code it recorded to classify the trap (exactly the slice-1 differential model).
-pub const WASMJIT_TRAP_OUT_OF_FUEL: i32 = svm_wasm_jit::TRAP_OUT_OF_FUEL;
-pub const WASMJIT_TRAP_MEMORY_FAULT: i32 = svm_wasm_jit::TRAP_MEMORY_FAULT;
+pub const WASMJIT_TRAP_OUT_OF_FUEL: i32 = temen_wasm_jit::TRAP_OUT_OF_FUEL;
+pub const WASMJIT_TRAP_MEMORY_FAULT: i32 = temen_wasm_jit::TRAP_MEMORY_FAULT;
 
-/// Compile the encoded SVM module at `[mod_ptr, mod_len)` to a **WebAssembly module** (the wasm-JIT
+/// Compile the encoded Temen module at `[mod_ptr, mod_len)` to a **WebAssembly module** (the wasm-JIT
 /// tier). Returns `1` and stashes the emitted wasm bytes when the whole module is JIT-eligible (its
 /// every function is in the emitter's v1 subset), or `0` when it is not — the fail-closed signal for
-/// the host to keep running the module on the bytecode interpreter (`svm_run`). Read the bytes via
-/// [`svm_wasmjit_ptr`] + [`svm_wasmjit_len`] before the next call.
+/// the host to keep running the module on the bytecode interpreter (`temen_run`). Read the bytes via
+/// [`temen_wasmjit_ptr`] + [`temen_wasmjit_len`] before the next call.
 ///
 /// The emitted module imports `env.memory` + `env.trap`; the host instantiates it against **this
-/// cdylib's own linear memory** (its exported `memory`) so an `svm_alloc`ed window/`env` cell is
+/// cdylib's own linear memory** (its exported `memory`) so an `temen_alloc`ed window/`env` cell is
 /// addressable in both, then calls the exported `f{i}(win, env, ...args)` directly. `size_log2` of
 /// the module's declared memory bakes the guard bound into the emitted confinement, so the host
 /// need only size the window ≥ `1 << size_log2`.
 #[no_mangle]
-pub extern "C" fn svm_wasmjit_compile(mod_ptr: *const u8, mod_len: usize) -> i32 {
+pub extern "C" fn temen_wasmjit_compile(mod_ptr: *const u8, mod_len: usize) -> i32 {
     // The browser default: entry func 0, shared memory (`shared = 1`) — the emitted module links
-    // against this cdylib's shared linear memory (the threads build). See [`svm_wasmjit_compile_full`].
-    svm_wasmjit_compile_full(mod_ptr, mod_len, 0, 1)
+    // against this cdylib's shared linear memory (the threads build). See [`temen_wasmjit_compile_full`].
+    temen_wasmjit_compile_full(mod_ptr, mod_len, 0, 1)
 }
 
-/// [`svm_wasmjit_compile`] with the JIT entry and memory-shared flag exposed. `entry` is the SVM
+/// [`temen_wasmjit_compile`] with the JIT entry and memory-shared flag exposed. `entry` is the Temen
 /// function the host will call (the emitted export is `f{entry}`; the cross-engine bench runs an
 /// arbitrary kernel, not always func 0). `shared` selects the `env.memory` import's shared flag —
 /// `1` for the browser threads build (shared memory), `0` for a plain cdylib (the bench, whose
 /// exported memory is non-shared); it must match the memory the host links against.
 #[no_mangle]
-pub extern "C" fn svm_wasmjit_compile_full(
+pub extern "C" fn temen_wasmjit_compile_full(
     mod_ptr: *const u8,
     mod_len: usize,
     entry: u32,
@@ -7465,10 +7490,10 @@ pub extern "C" fn svm_wasmjit_compile_full(
         // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live allocation it just filled.
         unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) }
     };
-    let Ok(m) = svm_encode::decode_module(bytes) else {
+    let Ok(m) = temen_encode::decode_module(bytes) else {
         return 0;
     };
-    // This FFI services cross-tier leaves on a *throwaway* window ([`svm_wasmjit_call_interp`], via
+    // This FFI services cross-tier leaves on a *throwaway* window ([`temen_wasmjit_call_interp`], via
     // `bytecode::compile_and_run` with no window), so it can only accept guests whose cross-tier
     // callees are memory-free leaves — the `mixed_ok` condition. `compile_jit`'s wasm-driven path can
     // *also* emit reactor guests with memory/cap-touching cross-tier callees over a *shared* window,
@@ -7476,16 +7501,16 @@ pub extern "C" fn svm_wasmjit_compile_full(
     // `mixed_ok` guest the emitted wasm is byte-identical to the old `compile_module_mixed_entry`
     // (reactor's cross-tier set collapses to exactly the memory-free leaves). Emits `f{entry}`; a
     // fully-in-subset guest is the special case with no leaves.
-    if !svm_wasm_jit::analyze_from(&m, entry).mixed_ok {
+    if !temen_wasm_jit::analyze_from(&m, entry).mixed_ok {
         return 0;
     }
-    match svm_wasm_jit::compile_jit(&m, svm_wasm_jit::Shape::Batch { entry }, shared != 0) {
-        Ok(svm_wasm_jit::Artifact {
+    match temen_wasm_jit::compile_jit(&m, temen_wasm_jit::Shape::Batch { entry }, shared != 0) {
+        Ok(temen_wasm_jit::Artifact {
             wasm,
-            drive: svm_wasm_jit::DriveMode::WasmDriven { .. },
+            drive: temen_wasm_jit::DriveMode::WasmDriven { .. },
             ..
         }) => {
-            // SAFETY: single-reader stash on the main thread, like the `svm_parse` accessors.
+            // SAFETY: single-reader stash on the main thread, like the `temen_parse` accessors.
             unsafe { stash(&mut *core::ptr::addr_of_mut!(WASMJIT), wasm) };
             // Keep the decoded module for the cross-tier callback (it runs an interp leaf).
             unsafe { *core::ptr::addr_of_mut!(WASMJIT_MOD) = Some(m) };
@@ -7495,18 +7520,18 @@ pub extern "C" fn svm_wasmjit_compile_full(
     }
 }
 
-/// Emit a **§22 Model B2** unit: like [`svm_wasmjit_compile`] but the module *imports* one shared
+/// Emit a **§22 Model B2** unit: like [`temen_wasmjit_compile`] but the module *imports* one shared
 /// `env.__indirect_function_table` (sized `1 << table_log2` = the `Jit` grant's reservation) instead
 /// of declaring a private one, and populates no slots — the JS host owns the shared
 /// `WebAssembly.Table`, writing each unit's `f0` funcref into its slot on `install` (`table.set`) and
 /// nulling it on `uninstall`. So an installed unit is a funcref another instance's `call_indirect`
-/// reaches through the one shared table (`svm_wasm_jit::compile_module_b2`; the native differential is
-/// `crates/svm-wasm-jit/tests/b2_install.rs`). Emitted bytes are stashed exactly like
-/// [`svm_wasmjit_compile`] (read via [`svm_wasmjit_ptr`]/[`svm_wasmjit_len`]); `0` if the module is
+/// reaches through the one shared table (`temen_wasm_jit::compile_module_b2`; the native differential is
+/// `crates/temen-wasm-jit/tests/b2_install.rs`). Emitted bytes are stashed exactly like
+/// [`temen_wasmjit_compile`] (read via [`temen_wasmjit_ptr`]/[`temen_wasmjit_len`]); `0` if the module is
 /// outside the emitter subset. `shared` matches the linked memory's shared flag as in
-/// [`svm_wasmjit_compile_full`].
+/// [`temen_wasmjit_compile_full`].
 #[no_mangle]
-pub extern "C" fn svm_wasmjit_compile_b2(
+pub extern "C" fn temen_wasmjit_compile_b2(
     mod_ptr: *const u8,
     mod_len: usize,
     table_log2: u32,
@@ -7518,14 +7543,14 @@ pub extern "C" fn svm_wasmjit_compile_b2(
         // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live allocation it just filled.
         unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) }
     };
-    let Ok(m) = svm_encode::decode_module(bytes) else {
+    let Ok(m) = temen_encode::decode_module(bytes) else {
         return 0;
     };
-    match svm_wasm_jit::compile_module_b2(&m, shared != 0, table_log2) {
+    match temen_wasm_jit::compile_module_b2(&m, shared != 0, table_log2) {
         Ok(wasm) => {
-            // SAFETY: single-reader stash on the main thread, like the `svm_parse` accessors.
+            // SAFETY: single-reader stash on the main thread, like the `temen_parse` accessors.
             unsafe { stash(&mut *core::ptr::addr_of_mut!(WASMJIT), wasm) };
-            // Keep the decoded module for `svm_wasmjit_init_window` (its data segments) + call_interp.
+            // Keep the decoded module for `temen_wasmjit_init_window` (its data segments) + call_interp.
             unsafe { *core::ptr::addr_of_mut!(WASMJIT_MOD) = Some(m) };
             1
         }
@@ -7533,36 +7558,36 @@ pub extern "C" fn svm_wasmjit_compile_b2(
     }
 }
 
-/// Pointer / length of the most recent [`svm_wasmjit_compile`] output (emitted wasm bytes).
+/// Pointer / length of the most recent [`temen_wasmjit_compile`] output (emitted wasm bytes).
 #[no_mangle]
-pub extern "C" fn svm_wasmjit_ptr() -> *const u8 {
+pub extern "C" fn temen_wasmjit_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(WASMJIT)).0 }
 }
 #[no_mangle]
-pub extern "C" fn svm_wasmjit_len() -> usize {
+pub extern "C" fn temen_wasmjit_len() -> usize {
     unsafe { (*core::ptr::addr_of!(WASMJIT)).1 }
 }
 /// The stashed emitted-wasm bytes (same cdylib-managed lifetime as `OUT`/`ERR`).
 static mut WASMJIT: (*mut u8, usize) = (core::ptr::null_mut(), 0);
-/// The decoded module of the most recent [`svm_wasmjit_compile`], for [`svm_wasmjit_call_interp`].
-static mut WASMJIT_MOD: Option<svm_ir::Module> = None;
+/// The decoded module of the most recent [`temen_wasmjit_compile`], for [`temen_wasmjit_call_interp`].
+static mut WASMJIT_MOD: Option<temen_ir::Module> = None;
 
 /// Bytes the host must allocate for the `env` cell — the fuel counter plus the cross-tier scratch
 /// (`env.call_interp` marshals its i64 arg/result slots there). The JS linker sizes the `env`
 /// allocation with this.
 #[no_mangle]
-pub extern "C" fn svm_wasmjit_env_bytes() -> usize {
-    svm_wasm_jit::ENV_CELL_BYTES
+pub extern "C" fn temen_wasmjit_env_bytes() -> usize {
+    temen_wasm_jit::ENV_CELL_BYTES
 }
 
-/// Materialize the most recent [`svm_wasmjit_compile`] module's **data segments** into the window at
+/// Materialize the most recent [`temen_wasmjit_compile`] module's **data segments** into the window at
 /// `[win_ptr, win_ptr + win_size)` — the emitted code only loads/stores, so the host must lay the
 /// module's initialized data into the window before running `f{entry}` (exactly what the
 /// interpreter's window init does). Writes each `data.bytes` at `data.offset`, clamped to the
 /// window. Call once, after allocating the window, before the first run.
 #[no_mangle]
-pub extern "C" fn svm_wasmjit_init_window(win_ptr: *mut u8, win_size: usize) {
-    // SAFETY: set by the preceding `svm_wasmjit_compile`; single-threaded page use.
+pub extern "C" fn temen_wasmjit_init_window(win_ptr: *mut u8, win_size: usize) {
+    // SAFETY: set by the preceding `temen_wasmjit_compile`; single-threaded page use.
     let Some(m) = (unsafe { (*core::ptr::addr_of!(WASMJIT_MOD)).as_ref() }) else {
         return;
     };
@@ -7581,14 +7606,14 @@ pub extern "C" fn svm_wasmjit_init_window(win_ptr: *mut u8, win_size: usize) {
 
 /// Service one cross-tier call (BROWSER.md § "wasm-JIT tier", slice 3c). The emitted mixed-tier
 /// module calls this (via its `env.call_interp` import, relayed by the JS host) when JITted code
-/// reaches an **interp leaf**: `func` is the SVM function index, `args_ptr` points at its i64 arg
+/// reaches an **interp leaf**: `func` is the Temen function index, `args_ptr` points at its i64 arg
 /// slots in linear memory. Runs the leaf on the **bytecode interpreter** (the leaf is memory-free by
 /// construction — see the emitter's `interp_leaf`), writes its i64 result slots back over the same
 /// `args_ptr`, and returns `0`; on a trap returns `1` so the JS host throws (unwinding the emitted
 /// wasm to the top-level `f0` caller — the slice-1/2 trap model).
 #[no_mangle]
-pub extern "C" fn svm_wasmjit_call_interp(func: u32, args_ptr: *mut u8) -> i32 {
-    // SAFETY: `WASMJIT_MOD` is set by the preceding `svm_wasmjit_compile`; single-threaded page use.
+pub extern "C" fn temen_wasmjit_call_interp(func: u32, args_ptr: *mut u8) -> i32 {
+    // SAFETY: `WASMJIT_MOD` is set by the preceding `temen_wasmjit_compile`; single-threaded page use.
     let Some(m) = (unsafe { (*core::ptr::addr_of!(WASMJIT_MOD)).as_ref() }) else {
         return 1;
     };
@@ -7597,7 +7622,7 @@ pub extern "C" fn svm_wasmjit_call_interp(func: u32, args_ptr: *mut u8) -> i32 {
     };
     let nresults = callee.results.len();
     // SAFETY: the host guarantees `args_ptr` addresses the signature's full slot span (the env
-    // scratch, sized by `svm_wasmjit_env_bytes`).
+    // scratch, sized by `temen_wasmjit_env_bytes`).
     let args: Vec<Value> = callee
         .params
         .iter()
@@ -7623,9 +7648,9 @@ pub extern "C" fn svm_wasmjit_call_interp(func: u32, args_ptr: *mut u8) -> i32 {
 /// Run `m`'s function 0 under a deterministic **3-cap powerbox** — `Stream(Out)` (type 0), `Exit`
 /// (type 1), and a host-fn (type 13), granted in that order — so the §7 reflection ops
 /// `cap.self.count` / `cap.self.get` see a fixed, known capability table. Passes `arg` only if the
-/// entry takes one. Returns `(status, i64-widened value)`. Shared by [`svm_run_reflect`] and
+/// entry takes one. Returns `(status, i64-widened value)`. Shared by [`temen_run_reflect`] and
 /// `gencorpus`.
-pub fn reflect_exec(m: &svm_ir::Module, arg: i64) -> (i32, i64) {
+pub fn reflect_exec(m: &temen_ir::Module, arg: i64) -> (i32, i64) {
     let mut host = Host::new();
     let _ = host.grant_stream(StreamRole::Out); // handle 0, type_id 0
     let _ = host.grant_exit(); // handle 1, type_id 1
@@ -7648,14 +7673,14 @@ pub fn reflect_exec(m: &svm_ir::Module, arg: i64) -> (i32, i64) {
     }
 }
 
-// The **canonical** §22 `compile_linked` symbol-table wire form (mirrors `svm-run::decode_symbol_table`,
+// The **canonical** §22 `compile_linked` symbol-table wire form (mirrors `temen-run::decode_symbol_table`,
 // DESIGN.md §22): a LEB128 stream `count`, then per entry `name` (uleb len + UTF-8 bytes), a `kind`
 // byte, and its payload — `0` = `Slot(uleb)` (a shared `call_indirect` table slot: the *dynamic*-link
 // case a guest loader uses to bind a submitted unit's imports to functions of the host program it runs
 // inside — e.g. the JACL self-hosted compiler-guest binding a staged macro's `call.sym` imports to its
 // own `jaclrt` runtime funcs), `1` = `Cap(uleb type_id, uleb op)` (a host capability). Empty bytes ⇒
 // the closed-blob `compile` op (no bindings), so a unit with imports fails closed. This must match the
-// producer (the on-ramp/`svm-llvm` guest loader) byte-for-byte, so it is NOT a browser-private form.
+// producer (the on-ramp/`temen-llvm` guest loader) byte-for-byte, so it is NOT a browser-private form.
 
 /// A minimal fail-closed LEB128 cursor for [`decode_symtab`] (never panics / over-reads).
 struct SymCursor<'a> {
@@ -7697,7 +7722,7 @@ impl SymCursor<'_> {
 }
 
 /// Build a `compile_linked` symbol table (canonical wire form; used by the reference `Jit` tests).
-fn encode_symtab(entries: &[(&str, svm_ir::Resolved)]) -> Vec<u8> {
+fn encode_symtab(entries: &[(&str, temen_ir::Resolved)]) -> Vec<u8> {
     fn uleb(out: &mut Vec<u8>, mut v: u64) {
         loop {
             let b = (v & 0x7f) as u8;
@@ -7715,16 +7740,16 @@ fn encode_symtab(entries: &[(&str, svm_ir::Resolved)]) -> Vec<u8> {
         uleb(&mut out, name.len() as u64);
         out.extend_from_slice(name.as_bytes());
         match r {
-            svm_ir::Resolved::Slot(slot) => {
+            temen_ir::Resolved::Slot(slot) => {
                 out.push(0);
                 uleb(&mut out, *slot as u64);
             }
-            svm_ir::Resolved::Cap(cap) => {
+            temen_ir::Resolved::Cap(cap) => {
                 out.push(1);
                 uleb(&mut out, cap.type_id as u64);
                 uleb(&mut out, cap.op as u64);
             }
-            svm_ir::Resolved::Func(_) => {
+            temen_ir::Resolved::Func(_) => {
                 unreachable!("Func is not deliverable via the symbol table")
             }
         }
@@ -7733,7 +7758,7 @@ fn encode_symtab(entries: &[(&str, svm_ir::Resolved)]) -> Vec<u8> {
 }
 
 /// Decode a canonical `compile_linked` symbol table; `None` (fail-closed) on any malformation.
-fn decode_symtab(bytes: &[u8]) -> Option<Vec<(String, svm_ir::Resolved)>> {
+fn decode_symtab(bytes: &[u8]) -> Option<Vec<(String, temen_ir::Resolved)>> {
     // The closed-blob `compile` op passes no table (`&[]`) — the empty table (resolves nothing).
     if bytes.is_empty() {
         return Some(Vec::new());
@@ -7744,8 +7769,8 @@ fn decode_symtab(bytes: &[u8]) -> Option<Vec<(String, svm_ir::Resolved)>> {
     for _ in 0..count {
         let name = c.string()?;
         let resolved = match c.byte()? {
-            0 => svm_ir::Resolved::Slot(c.u32()?),
-            1 => svm_ir::Resolved::Cap(svm_ir::ResolvedCap {
+            0 => temen_ir::Resolved::Slot(c.u32()?),
+            1 => temen_ir::Resolved::Cap(temen_ir::ResolvedCap {
                 type_id: c.u32()?,
                 op: c.u32()?,
             }),
@@ -7757,14 +7782,14 @@ fn decode_symtab(bytes: &[u8]) -> Option<Vec<(String, svm_ir::Resolved)>> {
     (c.pos == bytes.len()).then_some(out)
 }
 
-/// The browser's [`svm_interp::JitValidator`] — the §22 security hinge for the guest-driven `Jit`
+/// The browser's [`temen_interp::JitValidator`] — the §22 security hinge for the guest-driven `Jit`
 /// cap: decode the symbol table → `decode_module` (fail-closed) → resolve named imports against the
 /// table (`Slot`/`Cap`) → `verify_module` (the escape-freedom gate) → the memory-match precondition →
-/// reject data segments and threads/futex ops. A pure-Rust replica of `svm-run`'s canonical validator
+/// reject data segments and threads/futex ops. A pure-Rust replica of `temen-run`'s canonical validator
 /// (same symtab wire form), so it builds for wasm with no Cranelift dep.
 ///
 /// **Fibers are admitted** (#845 — the §22 renegotiated 2026-07-30 split, matching the canonical
-/// gate in `svm-run`): `cont.*`/`suspend` switch stacks within the domain on the caller's thread,
+/// gate in `temen-run`): `cont.*`/`suspend` switch stacks within the domain on the caller's thread,
 /// so a unit that runs its own scheduler to completion never parks across the synchronous invoke.
 /// *Emitted* execution of a fiber-using unit stays fail-closed with no gate here: `compile_jit`'s
 /// `reachable_concurrency` guard never yields `WasmDriven` for one, so both wasm emitters return
@@ -7773,21 +7798,21 @@ fn browser_jit_validator(
     bytes: &[u8],
     mem_log2: Option<u8>,
     symtab: &[u8],
-) -> Result<std::sync::Arc<[svm_ir::Func]>, i64> {
+) -> Result<std::sync::Arc<[temen_ir::Func]>, i64> {
     const EINVAL: i64 = -22;
     let Some(table) = decode_symtab(symtab) else {
         return Err(EINVAL);
     };
-    let Ok(m) = svm_encode::decode_module(bytes) else {
+    let Ok(m) = temen_encode::decode_module(bytes) else {
         return Err(EINVAL);
     };
     // Bind named imports via the table (a Slot → `call_indirect`, a Cap → `cap.call`); an unresolved
     // import ⇒ fail closed (the module is re-verified after the rewrite).
     let resolve = |name: &str| table.iter().find(|(n, _)| n == name).map(|(_, r)| *r);
-    let Ok(m) = svm_ir::resolve_imports_with(&m, resolve) else {
+    let Ok(m) = temen_ir::resolve_imports_with(&m, resolve) else {
         return Err(EINVAL);
     };
-    if svm_verify::verify_module(&m).is_err() {
+    if temen_verify::verify_module(&m).is_err() {
         return Err(EINVAL);
     }
     if m.memory.map(|mc| mc.size_log2) != mem_log2 {
@@ -7802,24 +7827,24 @@ fn browser_jit_validator(
     Ok(m.funcs.into())
 }
 
-/// The wasm-JIT emitter the runtime-`Jit.compile` path installs ([`svm_par_powerbox_jit_runtime`],
+/// The wasm-JIT emitter the runtime-`Jit.compile` path installs ([`temen_par_powerbox_jit_runtime`],
 /// via [`Host::set_jit_wasm_emitter`]): emit a **validated closed unit**'s entry as `f0(win, env,
 /// args…)` against **shared** memory (the browser's `SharedArrayBuffer`), or `None` if it is outside
 /// the emitter subset — then `invoke` runs on the interpreter, fail-closed. A bare `fn`
-/// (`svm_interp::JitWasmEmitter`), so the core stores only the opaque bytes. The unit was already
+/// (`temen_interp::JitWasmEmitter`), so the core stores only the opaque bytes. The unit was already
 /// decode+verify+precondition-gated by [`browser_jit_validator`]; this re-decodes those same bytes.
 fn browser_jit_wasm_emitter(blob: &[u8]) -> Option<Vec<u8>> {
-    let m = svm_encode::decode_module(blob).ok()?;
+    let m = temen_encode::decode_module(blob).ok()?;
     if par_jit_b2() {
         // §22 Model B2 cross-Worker: emit a unit that imports the shared reserved funcref table, so its
         // `call_indirect` dispatches (at native wasm speed) to units installed in the per-Worker table
         // mirror. Whole-module in-subset only; otherwise fail-closed to the interpreter (`.ok()`).
-        return svm_wasm_jit::compile_module_b2(&m, true, PAR_JIT_TABLE_LOG2 as u32).ok();
+        return temen_wasm_jit::compile_module_b2(&m, true, PAR_JIT_TABLE_LOG2 as u32).ok();
     }
-    match svm_wasm_jit::compile_jit(&m, svm_wasm_jit::Shape::Batch { entry: 0 }, true) {
-        Ok(svm_wasm_jit::Artifact {
+    match temen_wasm_jit::compile_jit(&m, temen_wasm_jit::Shape::Batch { entry: 0 }, true) {
+        Ok(temen_wasm_jit::Artifact {
             wasm,
-            drive: svm_wasm_jit::DriveMode::WasmDriven { .. },
+            drive: temen_wasm_jit::DriveMode::WasmDriven { .. },
             ..
         }) => Some(wasm),
         // Interp-driven / unsupported ⇒ nothing to run as `f0`; the unit invokes on the interpreter.
@@ -7844,9 +7869,9 @@ block 0 (v0: i32, v1: i32) {
 /// the guest receives `(jit_handle, code_handle, a, b)`, `install`s the unit into its dispatch table
 /// (op 3), then `call_indirect`s it — guest-driven code loading, **interpreted** (the bytecode engine
 /// lowers the submitted unit to bytecode; no native backend). `a=6, b=7`. Returns `(status, value)`.
-pub fn jit_exec(m: &svm_ir::Module) -> (i32, i64) {
-    let service = match svm_text::parse_module(JIT_SERVICE) {
-        Ok(s) => svm_encode::encode_module(&s),
+pub fn jit_exec(m: &temen_ir::Module) -> (i32, i64) {
+    let service = match temen_text::parse_module(JIT_SERVICE) {
+        Ok(s) => temen_encode::encode_module(&s),
         Err(_) => return (STATUS_BAD_RESULT, 0),
     };
     let mut host = Host::new();
@@ -7895,9 +7920,9 @@ block 0 (v0: i32) {
 /// `cap.call 2 0`. The guest receives `(jit, code, clock)`, installs the unit and `call_indirect`s it
 /// passing the clock handle → `777`. With `link == false` the symbol table is empty, so the import is
 /// unresolved and `compile_linked` fails closed (`STATUS_TRAP`). Returns `(status, value)`.
-pub fn dynlink_exec(m: &svm_ir::Module, link: bool) -> (i32, i64) {
-    let unit = match svm_text::parse_module(DL_UNIT) {
-        Ok(u) => svm_encode::encode_module(&u),
+pub fn dynlink_exec(m: &temen_ir::Module, link: bool) -> (i32, i64) {
+    let unit = match temen_text::parse_module(DL_UNIT) {
+        Ok(u) => temen_encode::encode_module(&u),
         Err(_) => return (STATUS_BAD_RESULT, 0),
     };
     let mut host = Host::new();
@@ -7908,7 +7933,7 @@ pub fn dynlink_exec(m: &svm_ir::Module, link: bool) -> (i32, i64) {
     let symtab = if link {
         encode_symtab(&[(
             "clock",
-            svm_ir::Resolved::Cap(svm_ir::ResolvedCap { type_id: 2, op: 0 }),
+            temen_ir::Resolved::Cap(temen_ir::ResolvedCap { type_id: 2, op: 0 }),
         )])
     } else {
         Vec::new()
@@ -7934,11 +7959,11 @@ pub fn dynlink_exec(m: &svm_ir::Module, link: bool) -> (i32, i64) {
 /// (see [`dynlink_exec`]); `link != 0` binds the unit's `"clock"` import, `0` leaves it unresolved
 /// (fail-closed). Returns the guest's `i64` result; sets [`LAST_STATUS`].
 #[no_mangle]
-pub extern "C" fn svm_run_dynlink(mod_ptr: *const u8, mod_len: usize, link: i32) -> i64 {
+pub extern "C" fn temen_run_dynlink(mod_ptr: *const u8, mod_len: usize, link: i32) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
@@ -7953,11 +7978,11 @@ pub extern "C" fn svm_run_dynlink(mod_ptr: *const u8, mod_len: usize, link: i32)
 /// Decode the module at `[mod_ptr, mod_len)` and run function 0 under the **guest-JIT** powerbox (see
 /// [`jit_exec`]). Returns the guest's `i64` result; sets [`LAST_STATUS`].
 #[no_mangle]
-pub extern "C" fn svm_run_jit(mod_ptr: *const u8, mod_len: usize) -> i64 {
+pub extern "C" fn temen_run_jit(mod_ptr: *const u8, mod_len: usize) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
@@ -7973,8 +7998,12 @@ pub extern "C" fn svm_run_jit(mod_ptr: *const u8, mod_len: usize) -> i64 {
 /// `window` (its low bytes carry the state word `NORMAL`/`UNWINDING`/`REWINDING` + the shadow region),
 /// with a `Clock` cap seeded to `clock_v`. Single-vCPU / single-fiber freeze/thaw is *driven by the
 /// transform's emitted IR* (DURABILITY.md §2) — the engine just runs it. Returns `(status, value,
-/// final-window snapshot, clock_after)`. Shared by [`svm_run_durable`] and `gencorpus`.
-pub fn durable_run(inst: &svm_ir::Module, window: &[u8], clock_v: i64) -> (i32, i64, Vec<u8>, i64) {
+/// final-window snapshot, clock_after)`. Shared by [`temen_run_durable`] and `gencorpus`.
+pub fn durable_run(
+    inst: &temen_ir::Module,
+    window: &[u8],
+    clock_v: i64,
+) -> (i32, i64, Vec<u8>, i64) {
     let mut host = Host::new();
     host.set_durable(true);
     let clk = host.grant_clock();
@@ -8007,9 +8036,9 @@ pub fn durable_run(inst: &svm_ir::Module, window: &[u8], clock_v: i64) -> (i32, 
 /// Decode the **instrumented** module at `[mod_ptr, mod_len)`, run function 0 over the durable window
 /// at `[init_ptr, init_len)` (the state word lives in those bytes) with the clock seeded to `clock`
 /// (see [`durable_run`]). The final window image is captured to the snapshot slot
-/// (`svm_snapshot_ptr`/`svm_snapshot_len`). Returns the guest's `i64` result; sets [`LAST_STATUS`].
+/// (`temen_snapshot_ptr`/`temen_snapshot_len`). Returns the guest's `i64` result; sets [`LAST_STATUS`].
 #[no_mangle]
-pub extern "C" fn svm_run_durable(
+pub extern "C" fn temen_run_durable(
     mod_ptr: *const u8,
     mod_len: usize,
     init_ptr: *const u8,
@@ -8017,10 +8046,10 @@ pub extern "C" fn svm_run_durable(
     clock: i64,
 ) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees both ranges are live `svm_alloc`ations it just filled.
+    // SAFETY: the host guarantees both ranges are live `temen_alloc`ations it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let window = unsafe { core::slice::from_raw_parts(init_ptr, init_len) };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
@@ -8037,8 +8066,8 @@ pub extern "C" fn svm_run_durable(
 /// Run `m`'s function 0 with a host-granted **`SharedRegion`** (iface 4, 64 KiB) as its sole cap —
 /// the §13 host-backed memory object a guest `map`s into its window (op 0), aliasing the same backing
 /// at multiple offsets (the magic-ring-buffer primitive); op 2 `len`, op 3 `page_size`. Returns
-/// `(status, i64-widened value)`. Shared by [`svm_run_region`] and `gencorpus`.
-pub fn region_exec(m: &svm_ir::Module) -> (i32, i64) {
+/// `(status, i64-widened value)`. Shared by [`temen_run_region`] and `gencorpus`.
+pub fn region_exec(m: &temen_ir::Module) -> (i32, i64) {
     let mut host = Host::new();
     let h = host.grant_shared_region(1 << 16); // 64 KiB, comfortably larger than any host page
     let mut fuel = 5_000_000u64;
@@ -8056,11 +8085,11 @@ pub fn region_exec(m: &svm_ir::Module) -> (i32, i64) {
 /// Decode the module at `[mod_ptr, mod_len)` and run function 0 with a `SharedRegion` cap (see
 /// [`region_exec`]). Returns the guest's `i64` result; sets [`LAST_STATUS`].
 #[no_mangle]
-pub extern "C" fn svm_run_region(mod_ptr: *const u8, mod_len: usize) -> i64 {
+pub extern "C" fn temen_run_region(mod_ptr: *const u8, mod_len: usize) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
@@ -8076,11 +8105,11 @@ pub extern "C" fn svm_run_region(mod_ptr: *const u8, mod_len: usize) -> i64 {
 /// reflection (`cap.self.count`/`get`) is deterministic (see [`reflect_exec`]). Returns the guest's
 /// `i64` result; sets [`LAST_STATUS`].
 #[no_mangle]
-pub extern "C" fn svm_run_reflect(mod_ptr: *const u8, mod_len: usize, arg: i64) -> i64 {
+pub extern "C" fn temen_run_reflect(mod_ptr: *const u8, mod_len: usize, arg: i64) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
@@ -8097,11 +8126,11 @@ pub extern "C" fn svm_run_reflect(mod_ptr: *const u8, mod_len: usize, arg: i64) 
 /// confined child guests over sub-windows and `join` them. Returns the guest's `i64` result; sets
 /// [`LAST_STATUS`].
 #[no_mangle]
-pub extern "C" fn svm_run_nested(mod_ptr: *const u8, mod_len: usize) -> i64 {
+pub extern "C" fn temen_run_nested(mod_ptr: *const u8, mod_len: usize) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let m = match svm_encode::decode_module(bytes) {
+    let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
@@ -8142,7 +8171,10 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   }
 }
 "#;
-    let (Ok(hm), Ok(em)) = (svm_text::parse_module(HELLO), svm_text::parse_module(EXIT)) else {
+    let (Ok(hm), Ok(em)) = (
+        temen_text::parse_module(HELLO),
+        temen_text::parse_module(EXIT),
+    ) else {
         return -1;
     };
     let h = powerbox_exec(&hm, &[]);
@@ -8191,7 +8223,7 @@ block 3 () {
   }
 }
 "#;
-    let Ok(m) = svm_text::parse_module(ADDK) else {
+    let Ok(m) = temen_text::parse_module(ADDK) else {
         return -1;
     };
     // Seed 16 i64 words: word 0 = 1000, the rest 0.
@@ -8240,7 +8272,7 @@ block 0 (v0: i64) {
   }
 }
 "#;
-    let Ok(m) = svm_text::parse_module(SHARED) else {
+    let Ok(m) = temen_text::parse_module(SHARED) else {
         return -1;
     };
     match instantiate_exec(&m) {
@@ -8263,7 +8295,7 @@ block 0 (v0: i64) {
   }
 }
 "#;
-    let Ok(m) = svm_text::parse_module(S) else {
+    let Ok(m) = temen_text::parse_module(S) else {
         return -1;
     };
     let mut fuel = u64::MAX;
@@ -8292,14 +8324,14 @@ block 0 (v0: i32) {
   }
 }
 "#;
-    let Ok(m) = svm_text::parse_module(SRC) else {
+    let Ok(m) = temen_text::parse_module(SRC) else {
         return -1;
     };
-    let Ok(inst) = svm_durable::transform_module(&m) else {
+    let Ok(inst) = temen_durable::transform_module(&m) else {
         return -1;
     };
-    let mut win = svm_durable::init_durable_window(1 << 17);
-    svm_durable::write_state(&mut win, svm_durable::STATE_NORMAL);
+    let mut win = temen_durable::init_durable_window(1 << 17);
+    temen_durable::write_state(&mut win, temen_durable::STATE_NORMAL);
     match durable_run(&inst, &win, 1000) {
         (STATUS_OK, v, _, _) => v,
         _ => -1,
@@ -8322,7 +8354,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   }
 }
 "#;
-    let Ok(m) = svm_text::parse_module(G) else {
+    let Ok(m) = temen_text::parse_module(G) else {
         return -1;
     };
     match dynlink_exec(&m, true) {
@@ -8347,7 +8379,7 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   }
 }
 "#;
-    let Ok(m) = svm_text::parse_module(G) else {
+    let Ok(m) = temen_text::parse_module(G) else {
         return -1;
     };
     match jit_exec(&m) {
@@ -8376,7 +8408,7 @@ block 0 (v0: i32) {
   }
 }
 "#;
-    let Ok(m) = svm_text::parse_module(R) else {
+    let Ok(m) = temen_text::parse_module(R) else {
         return -1;
     };
     match region_exec(&m) {
@@ -8397,7 +8429,7 @@ block 0 () {
   }
 }
 "#;
-    let Ok(m) = svm_text::parse_module(R) else {
+    let Ok(m) = temen_text::parse_module(R) else {
         return -1;
     };
     match reflect_exec(&m, 0) {
@@ -8428,7 +8460,7 @@ block 0 () {
   }
 }
 "#;
-    let Ok(m) = svm_text::parse_module(G) else {
+    let Ok(m) = temen_text::parse_module(G) else {
         return -1;
     };
     let init = [0u8; 4096];
@@ -8466,7 +8498,7 @@ block 2 (v5: i64, v6: i64) {
   }
 }
 "#;
-    let Ok(m) = svm_text::parse_module(T) else {
+    let Ok(m) = temen_text::parse_module(T) else {
         return -1;
     };
     let mut fuel = u64::MAX;
@@ -8503,7 +8535,7 @@ block 0 (vsp: i64, varg: i64) {
   }
 }
 "#;
-    let Ok(m) = svm_text::parse_module(FIB) else {
+    let Ok(m) = temen_text::parse_module(FIB) else {
         return -1;
     };
     let mut fuel = u64::MAX;
@@ -8562,7 +8594,7 @@ block 0 (v0: i64) {
   }
 }
 "#;
-    let Ok(m) = svm_text::parse_module(CORO) else {
+    let Ok(m) = temen_text::parse_module(CORO) else {
         return -1;
     };
     match instantiate_exec(&m) {
@@ -8587,7 +8619,7 @@ block 0 (v0: i64) {
   }
 }
 "#;
-    let Ok(m) = svm_text::parse_module(SQRT) else {
+    let Ok(m) = temen_text::parse_module(SQRT) else {
         return -1;
     };
     let mut fuel = u64::MAX;
@@ -8614,11 +8646,11 @@ block 0 (v0: i64) {
 pub mod live {
     use super::*;
 
-    // The host functions the embedder must supply (module `svm_host`). `host_write` receives a
+    // The host functions the embedder must supply (module `temen_host`). `host_write` receives a
     // pointer into *this module's* linear memory (the bytes the guest wrote, copied out of its
     // window into a Rust buffer that lives on the wasm heap), so JS reads them as
     // `new Uint8Array(memory.buffer, ptr, len)`. `host_now_ns` returns real host time.
-    #[link(wasm_import_module = "svm_host")]
+    #[link(wasm_import_module = "temen_host")]
     extern "C" {
         /// `host_write(stream, ptr, len)` — `stream` 0 = stdout, 1 = stderr.
         fn host_write(stream: i32, ptr: *const u8, len: usize);
@@ -8635,11 +8667,11 @@ pub mod live {
     /// live, and `cap.call 13 0 () -> (i64) v<clock>()` to read the host clock. Returns the guest's
     /// `i64` result; sets [`LAST_STATUS`].
     #[no_mangle]
-    pub extern "C" fn svm_run_live(mod_ptr: *const u8, mod_len: usize) -> i64 {
-        // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    pub extern "C" fn temen_run_live(mod_ptr: *const u8, mod_len: usize) -> i64 {
+        // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
         let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
         let set = |s: i32| unsafe { LAST_STATUS = s };
-        let m = match svm_encode::decode_module(bytes) {
+        let m = match temen_encode::decode_module(bytes) {
             Ok(m) => m,
             Err(_) => {
                 set(STATUS_DECODE_ERR);
@@ -8725,14 +8757,14 @@ pub mod live {
 
 // ===== leaf tier-up: the §22 unit-emit parameters shared with the cooperative driver below =====
 //
-// (#1026: the single-vCPU tier-up pump — `svm_onramp_tierup_*`, #809 — was collapsed into the
+// (#1026: the single-vCPU tier-up pump — `temen_onramp_tierup_*`, #809 — was collapsed into the
 // cooperative driver below, which subsumes its admission set and is faster; its differentials live
 // on in `tests/coop_tierup_driver.rs`. These statics + the unit emitter survived the pump: they are
 // the coop run's §22 unit-emit seam.)
 
 /// The tier-up run's §22 unit-emit parameters (#835), read by [`onramp_tierup_unit_emitter`]
 /// (a bare `fn` — [`Host::set_jit_wasm_emitter`] stores no closure state): the run's memory-share
-/// flag and its window log2. Stored at [`svm_coop_open`]; single-threaded wasm.
+/// flag and its window log2. Stored at [`temen_coop_open`]; single-threaded wasm.
 static TIERUP_UNIT_SHARED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static TIERUP_UNIT_WIN_LOG2: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -8748,12 +8780,12 @@ static TIERUP_UNIT_TABLE_LOG2: std::sync::atomic::AtomicU8 =
 /// Slot callbacks reach installed units / eligible program `f{i}`s natively and everything else
 /// through a live-state bounce trampoline), or `None` if any function is outside the integer
 /// subset — then the invoke runs on the interpreter, fail-closed. The unit's mask is bumped to the
-/// run window first — the driver convention everywhere ([`svm_coop_open`] bumps the main module
+/// run window first — the driver convention everywhere ([`temen_coop_open`] bumps the main module
 /// the same way): the unit declares the guest's memory (the validator's memory-match
 /// precondition), but the run window is larger, and a declared-size mask would alias
 /// `vm_map`-grown addresses.
 fn onramp_tierup_unit_emitter(blob: &[u8]) -> Option<Vec<u8>> {
-    let mut m = svm_encode::decode_module(blob).ok()?;
+    let mut m = temen_encode::decode_module(blob).ok()?;
     let win_log2 = TIERUP_UNIT_WIN_LOG2.load(std::sync::atomic::Ordering::Relaxed);
     if let Some(mc) = m.memory.as_mut() {
         mc.size_log2 = mc.size_log2.max(win_log2);
@@ -8761,11 +8793,11 @@ fn onramp_tierup_unit_emitter(blob: &[u8]) -> Option<Vec<u8>> {
     let shared = TIERUP_UNIT_SHARED.load(std::sync::atomic::Ordering::Relaxed);
     // #1009 M1: mask against the run's shared-table size (the guest's), not `ONRAMP_JIT_TABLE_LOG2`.
     let table_log2 = TIERUP_UNIT_TABLE_LOG2.load(std::sync::atomic::Ordering::Relaxed);
-    svm_wasm_jit::compile_module_b2(&m, shared, table_log2 as u32).ok()
+    temen_wasm_jit::compile_module_b2(&m, shared, table_log2 as u32).ok()
 }
 
 // ============================================================================================
-// The **cooperative** tier-up driver (`svm_coop_*`) — #926 slice 2; since #1026 the ONE fallback
+// The **cooperative** tier-up driver (`temen_coop_*`) — #926 slice 2; since #1026 the ONE fallback
 // tier when the whole-program emit declines (the single-vCPU pump it superseded was a strict
 // subset, and slower).
 //
@@ -8778,11 +8810,11 @@ fn onramp_tierup_unit_emitter(blob: &[u8]) -> Option<Vec<u8>> {
 // routed to the tiering-up task's env by [`CoopRun::bounce`] (the confinement hinge).
 //
 // The capture/status statics (`OUT`/`ERR`/`FB`/`EXIT_CODE`/`RUN_VALUE`/`LAST_STATUS`) and the
-// `svm_alloc`/`svm_stdout_*` accessors are shared with the other run paths — only one runs at a
+// `temen_alloc`/`temen_stdout_*` accessors are shared with the other run paths — only one runs at a
 // time (single-threaded wasm; tests serialize on the FFI lock).
 // ============================================================================================
 
-/// Cooperative-driver event codes (returned by [`svm_coop_run`]) — the `CoopEvent` subset that
+/// Cooperative-driver event codes (returned by [`temen_coop_run`]) — the `CoopEvent` subset that
 /// reaches the host. Distinct constants from the `TIERUP_RUN_*` set for clarity, though the values
 /// coincide.
 pub const COOP_RUN_DONE: i32 = 0;
@@ -8792,7 +8824,7 @@ pub const COOP_RUN_JIT_INVOKE: i32 = 3;
 
 /// The live cooperative tier-up session — the `CoopRun` plus the host-facing operand/capture state
 /// (mirrors the relevant fields of `TierupRun`). The `backing` box owns the window `CoopRun`'s `Mem`
-/// addresses through a raw-pointer `Region`; both drop together at [`svm_coop_close`].
+/// addresses through a raw-pointer `Region`; both drop together at [`temen_coop_close`].
 struct CoopTierupRun {
     run: bytecode::CoopRun,
     /// The owned window buffer — in this module's linear memory, so emitted leaves address it through
@@ -8815,10 +8847,10 @@ struct CoopTierupRun {
     /// slot→code mirror itself lives on the engine's `CoopSched` (read via [`bytecode::CoopRun::slot_code`],
     /// since coop `Jit.install` happens inside the pump). `shim_wasm`/`jit_wasm_by_handle` each hold the
     /// last generated bounce-shim / by-handle unit-wasm, valid until the next call of its accessor.
-    sigs: Vec<(Vec<svm_ir::ValType>, Vec<svm_ir::ValType>)>,
+    sigs: Vec<(Vec<temen_ir::ValType>, Vec<temen_ir::ValType>)>,
     shim_wasm: Vec<u8>,
     jit_wasm_by_handle: Option<std::sync::Arc<[u8]>>,
-    /// A bounce callback's staged trap (see [`svm_coop_call_interp`] / [`svm_coop_deliver_trap`]).
+    /// A bounce callback's staged trap (see [`temen_coop_call_interp`] / [`temen_coop_deliver_trap`]).
     pending_bounce_trap: Option<Trap>,
     /// The guest's top-level result, staged at DONE.
     value: i64,
@@ -8856,7 +8888,7 @@ static mut COOP_RUN: Option<CoopTierupRun> = None;
 /// on refusal (decode error, an op outside the engine subset, or nothing for the emitted tier to
 /// run). Idempotent open: closes any prior run first.
 #[no_mangle]
-pub extern "C" fn svm_coop_open(
+pub extern "C" fn temen_coop_open(
     mod_ptr: *const u8,
     mod_len: usize,
     stdin_ptr: *const u8,
@@ -8864,10 +8896,10 @@ pub extern "C" fn svm_coop_open(
     shared: i32,
 ) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    svm_coop_close();
-    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    temen_coop_close();
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let Ok(m) = svm_encode::decode_module(bytes) else {
+    let Ok(m) = temen_encode::decode_module(bytes) else {
         set(STATUS_DECODE_ERR);
         return -STATUS_DECODE_ERR;
     };
@@ -8885,7 +8917,7 @@ pub extern "C" fn svm_coop_open(
     // shims; wrappers only append (existing `FuncIdx`es unchanged) and carry all-scalar signatures,
     // so the `all_shimmable` gate below is undisturbed.
     let mut m = m;
-    svm_wasm_jit::outline_cap_calls(&mut m);
+    temen_wasm_jit::outline_cap_calls(&mut m);
     let declared = m.memory.map_or(0, |mc| mc.size_log2);
     let win_log2 = JIT_RUN_WIN_LOG2.max(declared);
     // Emit with the mask bumped to the run window (the driver convention), so the emitted `"mapped"`
@@ -8901,16 +8933,16 @@ pub extern "C" fn svm_coop_open(
     // installed §22 units natively (old→new) and interpreter-resident targets through the live bounce.
     // A non-shimmable guest (v128 / over-arity) emits in the old local-table mode, where a null
     // shared-table slot can never diverge from the interpreter's dispatch. An unsupported shape declines.
-    let scalar = |t: &svm_ir::ValType| {
+    let scalar = |t: &temen_ir::ValType| {
         matches!(
             t,
-            svm_ir::ValType::I32
-                | svm_ir::ValType::I64
-                | svm_ir::ValType::F32
-                | svm_ir::ValType::F64
+            temen_ir::ValType::I32
+                | temen_ir::ValType::I64
+                | temen_ir::ValType::F32
+                | temen_ir::ValType::F64
         )
     };
-    let max_slots = (svm_wasm_jit::ENV_CELL_BYTES - 16) / 8;
+    let max_slots = (temen_wasm_jit::ENV_CELL_BYTES - 16) / 8;
     let all_shimmable = m.funcs.iter().all(|f| {
         f.params.iter().all(scalar)
             && f.results.iter().all(scalar)
@@ -8928,19 +8960,19 @@ pub extern "C" fn svm_coop_open(
     // emitter module-gates it to emit-nothing (decline), paged it tiers up (the `sync_pagestate`
     // per-event/-bounce refresh carries the runtime remaps).
     let paged = all_shimmable
-        && (m.data.iter().any(|d| d.readonly) || svm_wasm_jit::module_uses_unmap_protect(&m));
-    let page_log2 = svm_interp::host_page_size().trailing_zeros() as u8;
+        && (m.data.iter().any(|d| d.readonly) || temen_wasm_jit::module_uses_unmap_protect(&m));
+    let page_log2 = temen_interp::host_page_size().trailing_zeros() as u8;
     let emitted_res = if paged {
-        svm_wasm_jit::compile_module_tierup_b2_paged(
+        temen_wasm_jit::compile_module_tierup_b2_paged(
             &emit_m,
             shared != 0,
             table_log2 as u32,
             page_log2,
         )
     } else if all_shimmable {
-        svm_wasm_jit::compile_module_tierup_b2(&emit_m, shared != 0, table_log2 as u32)
+        temen_wasm_jit::compile_module_tierup_b2(&emit_m, shared != 0, table_log2 as u32)
     } else {
-        svm_wasm_jit::compile_module_tierup(&emit_m, shared != 0)
+        temen_wasm_jit::compile_module_tierup(&emit_m, shared != 0)
     };
     let (wasm, emit) = match emitted_res {
         Ok(x) => x,
@@ -8951,7 +8983,7 @@ pub extern "C" fn svm_coop_open(
     };
     // A function tiers up iff the emitter emitted it and its signature is all-i64 (the i64-slot
     // transport the host marshals by) — exactly the single-vCPU gate.
-    let all_i64 = |ts: &[svm_ir::ValType]| ts.iter().all(|t| *t == svm_ir::ValType::I64);
+    let all_i64 = |ts: &[temen_ir::ValType]| ts.iter().all(|t| *t == temen_ir::ValType::I64);
     let eligible: Vec<bool> = m
         .funcs
         .iter()
@@ -8970,12 +9002,12 @@ pub extern "C" fn svm_coop_open(
     let win_ptr = backing.as_mut_ptr();
     // SAFETY: `backing` is owned by the session and pointer-stable across its moves (boxed slice).
     let back =
-        std::sync::Arc::new(unsafe { svm_interp::Region::shared(win_ptr, 1u64 << win_log2) });
+        std::sync::Arc::new(unsafe { temen_interp::Region::shared(win_ptr, 1u64 << win_log2) });
     let mut host = Host::new();
     host.stdin = if stdin_ptr.is_null() || stdin_len == 0 {
         Vec::new()
     } else {
-        // SAFETY: the host guarantees the stdin range is a live `svm_alloc`ation it just filled.
+        // SAFETY: the host guarantees the stdin range is a live `temen_alloc`ation it just filled.
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
     };
     let (frame, _keys) = grant_onramp_caps(&mut host, &m, None);
@@ -9064,11 +9096,11 @@ pub extern "C" fn svm_coop_open(
 }
 
 /// Pump the cooperative run to its next host event: `COOP_RUN_TIERUP` (read the operands via the
-/// getters, run the emitted `f{func}`, then [`svm_coop_deliver`]/[`svm_coop_deliver_trap`]) or
+/// getters, run the emitted `f{func}`, then [`temen_coop_deliver`]/[`temen_coop_deliver_trap`]) or
 /// `COOP_RUN_DONE`/`COOP_RUN_TRAP` (the run ended — result + stdout/stderr/framebuffer are captured
 /// into the shared accessor slots). All concurrency is multiplexed inside the pump.
 #[no_mangle]
-pub extern "C" fn svm_coop_run() -> i32 {
+pub extern "C" fn temen_coop_run() -> i32 {
     // SAFETY: single-threaded wasm; exclusive access to the session for this call.
     let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() }) else {
         unsafe { LAST_STATUS = STATUS_UNSUPPORTED };
@@ -9095,7 +9127,7 @@ pub extern "C" fn svm_coop_run() -> i32 {
         } => {
             // The unit is emittable + all-scalar (the pump gated surfacing on it), so every type
             // maps to a scalar code; the host marshals the i64 slots by these.
-            let codes = |ts: &[svm_ir::ValType]| {
+            let codes = |ts: &[temen_ir::ValType]| {
                 ts.iter()
                     .map(|t| scalar_type_code(*t).unwrap_or(0))
                     .collect::<Vec<u8>>()
@@ -9142,37 +9174,37 @@ pub extern "C" fn svm_coop_run() -> i32 {
 
 /// The pending TIERUP's function index.
 #[no_mangle]
-pub extern "C" fn svm_coop_func() -> i32 {
+pub extern "C" fn temen_coop_func() -> i32 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.func as i32)
 }
 
 /// The pending TIERUP's committed extent — the value for the emitted `"mapped"` global (#717). On a
 /// **paged** run (#1009) this is the pending TIERUP's page-state table coverage.
 #[no_mangle]
-pub extern "C" fn svm_coop_mapped() -> i64 {
+pub extern "C" fn temen_coop_mapped() -> i64 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.mapped as i64)
 }
 
 /// #1009: whether this coop run's emitted module is **paged** — the driver must write the emitted
-/// `"pagestate"` global to [`svm_coop_pagestate_ptr`] before each TIERUP call (the pump's
+/// `"pagestate"` global to [`temen_coop_pagestate_ptr`] before each TIERUP call (the pump's
 /// `"mapped"` write). `0` on an unpaged run.
 #[no_mangle]
-pub extern "C" fn svm_coop_paged() -> i32 {
+pub extern "C" fn temen_coop_paged() -> i32 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.paged as i32)
 }
 
 /// #1009 paged: the pending TIERUP's page-state table base (its bytes live in this module's linear
 /// memory — the browser writes this pointer straight to the `"pagestate"` global; the wasmi
-/// differential copies them into its own memory). Meaningful only when [`svm_coop_paged`] is set.
+/// differential copies them into its own memory). Meaningful only when [`temen_coop_paged`] is set.
 #[no_mangle]
-pub extern "C" fn svm_coop_pagestate_ptr() -> *const u8 {
+pub extern "C" fn temen_coop_pagestate_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
         .map_or(core::ptr::null(), |s| s.pagestate.as_ptr())
 }
 
 /// #1009 paged: byte length of the pending TIERUP's page-state table (`0` on an unpaged run).
 #[no_mangle]
-pub extern "C" fn svm_coop_pagestate_len() -> usize {
+pub extern "C" fn temen_coop_pagestate_len() -> usize {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.pagestate.len())
 }
 
@@ -9180,58 +9212,58 @@ pub extern "C" fn svm_coop_pagestate_len() -> usize {
 /// services. The driver rebuilds its `WebAssembly.Table` only when this advances (the pump's
 /// advances (a §22 install/uninstall).
 #[no_mangle]
-pub extern "C" fn svm_coop_table_gen() -> u32 {
+pub extern "C" fn temen_coop_table_gen() -> u32 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.run.table_gen())
 }
 
 /// The pending TIERUP's marshalled i64 args (base pointer; valid until the next event).
 #[no_mangle]
-pub extern "C" fn svm_coop_argv_ptr() -> *const i64 {
+pub extern "C" fn temen_coop_argv_ptr() -> *const i64 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
         .map_or(core::ptr::null(), |s| s.argv.as_ptr())
 }
 
-/// Number of pending TIERUP args (see [`svm_coop_argv_ptr`]).
+/// Number of pending TIERUP args (see [`temen_coop_argv_ptr`]).
 #[no_mangle]
-pub extern "C" fn svm_coop_argv_len() -> usize {
+pub extern "C" fn temen_coop_argv_len() -> usize {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.argv.len())
 }
 
 /// The emitted tier-up module's bytes (compile + instantiate against this module's memory).
 #[no_mangle]
-pub extern "C" fn svm_coop_wasm_ptr() -> *const u8 {
+pub extern "C" fn temen_coop_wasm_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
         .map_or(core::ptr::null(), |s| s.emitted_wasm.as_ptr())
 }
 
 #[no_mangle]
-pub extern "C" fn svm_coop_wasm_len() -> usize {
+pub extern "C" fn temen_coop_wasm_len() -> usize {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.emitted_wasm.len())
 }
 
 /// The run window's base address in this module's linear memory (the emitted `f{i}`s' `win` arg).
 #[no_mangle]
-pub extern "C" fn svm_coop_win_ptr() -> *const u8 {
+pub extern "C" fn temen_coop_win_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
         .map_or(core::ptr::null(), |s| s.backing.as_ptr())
 }
 
 /// The run window's byte length (`1 << win_log2`).
 #[no_mangle]
-pub extern "C" fn svm_coop_win_len() -> usize {
+pub extern "C" fn temen_coop_win_len() -> usize {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.backing.len())
 }
 
 /// The guest's top-level result once [`COOP_RUN_DONE`] is reached.
 #[no_mangle]
-pub extern "C" fn svm_coop_value() -> i64 {
+pub extern "C" fn temen_coop_value() -> i64 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.value)
 }
 
 /// Deliver the emitted `f{func}`'s i64 result slots for the pending TIERUP, resuming the paused task.
 #[no_mangle]
-pub extern "C" fn svm_coop_deliver(rptr: *const i64, n: usize) {
-    // SAFETY: single-threaded wasm; `[rptr, n)` is a live `svm_alloc`ation the host just filled.
+pub extern "C" fn temen_coop_deliver(rptr: *const i64, n: usize) {
+    // SAFETY: single-threaded wasm; `[rptr, n)` is a live `temen_alloc`ation the host just filled.
     if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() } {
         let vals = if rptr.is_null() || n == 0 {
             &[][..]
@@ -9243,10 +9275,10 @@ pub extern "C" fn svm_coop_deliver(rptr: *const i64, n: usize) {
 }
 
 /// Deliver a trap from the emitted `f{func}` for the pending TIERUP. A bounce callback's staged trap
-/// (see [`svm_coop_call_interp`]) is delivered in preference, so a callback's `exit` ends the run as
+/// (see [`temen_coop_call_interp`]) is delivered in preference, so a callback's `exit` ends the run as
 /// `STATUS_EXIT` exactly as the interpreted call would.
 #[no_mangle]
-pub extern "C" fn svm_coop_deliver_trap() {
+pub extern "C" fn temen_coop_deliver_trap() {
     // SAFETY: single-threaded wasm; exclusive access to the session.
     if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() } {
         let t = s.pending_bounce_trap.take().unwrap_or(Trap::Unreachable);
@@ -9258,48 +9290,48 @@ pub extern "C" fn svm_coop_deliver_trap() {
 
 /// The pending JIT_INVOKE unit's code handle (the JS host's instance-cache key).
 #[no_mangle]
-pub extern "C" fn svm_coop_jit_code() -> i32 {
+pub extern "C" fn temen_coop_jit_code() -> i32 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.jit_code)
 }
 
 /// The pending JIT_INVOKE unit's emitted wasm bytes (compile + instantiate its `f0`).
 #[no_mangle]
-pub extern "C" fn svm_coop_jit_wasm_ptr() -> *const u8 {
+pub extern "C" fn temen_coop_jit_wasm_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
         .and_then(|s| s.jit_wasm.as_ref())
         .map_or(core::ptr::null(), |w| w.as_ptr())
 }
 
 #[no_mangle]
-pub extern "C" fn svm_coop_jit_wasm_len() -> usize {
+pub extern "C" fn temen_coop_jit_wasm_len() -> usize {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
         .and_then(|s| s.jit_wasm.as_ref())
         .map_or(0, |w| w.len())
 }
 
-/// The pending JIT_INVOKE's per-arg scalar type codes (length is [`svm_coop_argv_len`], as the args).
+/// The pending JIT_INVOKE's per-arg scalar type codes (length is [`temen_coop_argv_len`], as the args).
 #[no_mangle]
-pub extern "C" fn svm_coop_jit_param_types_ptr() -> *const u8 {
+pub extern "C" fn temen_coop_jit_param_types_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
         .map_or(core::ptr::null(), |s| s.jit_param_types.as_ptr())
 }
 
 /// The pending JIT_INVOKE's per-result scalar type codes (marshal the emitted `f0`'s returns by these).
 #[no_mangle]
-pub extern "C" fn svm_coop_jit_result_types_ptr() -> *const u8 {
+pub extern "C" fn temen_coop_jit_result_types_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
         .map_or(core::ptr::null(), |s| s.jit_result_types.as_ptr())
 }
 
 #[no_mangle]
-pub extern "C" fn svm_coop_jit_result_types_len() -> usize {
+pub extern "C" fn temen_coop_jit_result_types_len() -> usize {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.jit_result_types.len())
 }
 
 /// Deliver the emitted unit `f0`'s i64 result slots for the pending JIT_INVOKE, resuming the task.
 #[no_mangle]
-pub extern "C" fn svm_coop_deliver_jit(rptr: *const i64, n: usize) {
-    // SAFETY: single-threaded wasm; `[rptr, n)` is a live `svm_alloc`ation the host just filled.
+pub extern "C" fn temen_coop_deliver_jit(rptr: *const i64, n: usize) {
+    // SAFETY: single-threaded wasm; `[rptr, n)` is a live `temen_alloc`ation the host just filled.
     if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() } {
         let vals = if rptr.is_null() || n == 0 {
             &[][..]
@@ -9313,7 +9345,7 @@ pub extern "C" fn svm_coop_deliver_jit(rptr: *const i64, n: usize) {
 /// Deliver a trap from the emitted unit for the pending JIT_INVOKE (a bounce callback's staged trap in
 /// preference, so a callback's `exit` ends the run as `STATUS_EXIT` exactly as interpreted).
 #[no_mangle]
-pub extern "C" fn svm_coop_deliver_jit_trap() {
+pub extern "C" fn temen_coop_deliver_jit_trap() {
     // SAFETY: single-threaded wasm; exclusive access to the session.
     if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() } {
         let t = s.pending_bounce_trap.take().unwrap_or(Trap::Unreachable);
@@ -9324,13 +9356,13 @@ pub extern "C" fn svm_coop_deliver_jit_trap() {
 /// The emitted tier-up region's cross-tier `env.call_interp(target, args_ptr)`: bounce into the
 /// interp-resident leaf `target` over the **tiering-up task's** window/powerbox (routed by
 /// [`CoopRun::bounce`]). `args_ptr` is the env scratch (i64 slots, args→results in place). Returns
-/// `0` on success, `1` on a callback trap (staged for [`svm_coop_deliver_trap`]).
+/// `0` on success, `1` on a callback trap (staged for [`temen_coop_deliver_trap`]).
 #[no_mangle]
-pub extern "C" fn svm_coop_call_interp(target: u32, args_ptr: *mut u8) -> i32 {
+pub extern "C" fn temen_coop_call_interp(target: u32, args_ptr: *mut u8) -> i32 {
     let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() }) else {
         return 1;
     };
-    let max_slots = (svm_wasm_jit::ENV_CELL_BYTES - 16) / 8;
+    let max_slots = (temen_wasm_jit::ENV_CELL_BYTES - 16) / 8;
     // SAFETY: the host passes the env scratch, at least `max_slots` i64s wide.
     let io = unsafe { core::slice::from_raw_parts_mut(args_ptr as *mut i64, max_slots) };
     match s.run.bounce(target, io) {
@@ -9351,9 +9383,9 @@ pub extern "C" fn svm_coop_call_interp(target: u32, args_ptr: *mut u8) -> i32 {
 }
 
 /// The run window's committed scalar extent right now — the #717 value the host re-syncs to every
-/// emitted instance's `"mapped"` global after a [`svm_coop_call_interp`] bounce.
+/// emitted instance's `"mapped"` global after a [`temen_coop_call_interp`] bounce.
 #[no_mangle]
-pub extern "C" fn svm_coop_mapped_now() -> i64 {
+pub extern "C" fn temen_coop_mapped_now() -> i64 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
         .map_or(0, |s| s.run.window_scalar_extent() as i64)
 }
@@ -9365,7 +9397,7 @@ pub extern "C" fn svm_coop_mapped_now() -> i64 {
 /// `WebAssembly.Table` to `1 << this` (the emitted `call_indirect` mask). `0` (a 1-slot table) for a
 /// non-shimmable guest, which emits in local-table mode and never dispatches through the shared table.
 #[no_mangle]
-pub extern "C" fn svm_coop_table_log2() -> u32 {
+pub extern "C" fn temen_coop_table_log2() -> u32 {
     // SAFETY: single-threaded wasm; read of the session's host.
     unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() }
         .map_or(0, |s| s.run.host_mut().jit_table_log2() as u32)
@@ -9374,7 +9406,7 @@ pub extern "C" fn svm_coop_table_log2() -> u32 {
 /// The guest program's function count — the dispatch table's **natural prefix** (`slot i < nfuncs`
 /// dispatches program function `i`; slots at or past it hold installed §22 units or trap empty).
 #[no_mangle]
-pub extern "C" fn svm_coop_nfuncs() -> usize {
+pub extern "C" fn temen_coop_nfuncs() -> usize {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.sigs.len())
 }
 
@@ -9382,15 +9414,15 @@ pub extern "C" fn svm_coop_nfuncs() -> usize {
 /// host rebuilds its table from (from [`bytecode::CoopRun::slot_code`], since coop install happens
 /// inside the pump).
 #[no_mangle]
-pub extern "C" fn svm_coop_slot_code(slot: u32) -> i32 {
+pub extern "C" fn temen_coop_slot_code(slot: u32) -> i32 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(-1, |s| s.run.slot_code(slot))
 }
 
 /// Emitted-wasm length for **any** compiled unit by code handle (`0` if none — the unit is
 /// interpreter-only), so the JS host can instantiate an *installed* slot's unit it hasn't itself
-/// invoked. The bytes (via [`svm_coop_jit_wasm_by_handle_ptr`]) stay valid until the next call.
+/// invoked. The bytes (via [`temen_coop_jit_wasm_by_handle_ptr`]) stay valid until the next call.
 #[no_mangle]
-pub extern "C" fn svm_coop_jit_wasm_by_handle_len(code: i32) -> usize {
+pub extern "C" fn temen_coop_jit_wasm_by_handle_len(code: i32) -> usize {
     // SAFETY: single-threaded wasm; exclusive access to the session.
     let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() }) else {
         return 0;
@@ -9403,9 +9435,9 @@ pub extern "C" fn svm_coop_jit_wasm_by_handle_len(code: i32) -> usize {
     s.jit_wasm_by_handle.as_ref().map_or(0, |w| w.len())
 }
 
-/// Pointer to the emitted wasm the last [`svm_coop_jit_wasm_by_handle_len`] resolved.
+/// Pointer to the emitted wasm the last [`temen_coop_jit_wasm_by_handle_len`] resolved.
 #[no_mangle]
-pub extern "C" fn svm_coop_jit_wasm_by_handle_ptr() -> *const u8 {
+pub extern "C" fn temen_coop_jit_wasm_by_handle_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(core::ptr::null(), |s| {
         s.jit_wasm_by_handle
             .as_ref()
@@ -9414,15 +9446,15 @@ pub extern "C" fn svm_coop_jit_wasm_by_handle_ptr() -> *const u8 {
 }
 
 /// Generate the **bounce-shim module** for dispatch-table `slot` — a standalone one-function wasm
-/// module (`export "t"`, [`svm_wasm_jit::emit_slot_trampoline`]) with the slot occupant's env-prepended
-/// signature, whose body bounces to [`svm_coop_call_interp`] with `slot` baked in. The JS host
+/// module (`export "t"`, [`temen_wasm_jit::emit_slot_trampoline`]) with the slot occupant's env-prepended
+/// signature, whose body bounces to [`temen_coop_call_interp`] with `slot` baked in. The JS host
 /// `table.set`s its instance's `"t"` into the slot, so an emitted `call_indirect` to an
 /// interpreter-resident target lands on the live-state bounce. Returns the module's byte length
 /// (`0` = no shim: empty slot, or a signature the transport can't carry — the open-time `all_shimmable`
-/// gate makes the latter unreachable for a run whose units emit). Bytes via [`svm_coop_shim_ptr`],
+/// gate makes the latter unreachable for a run whose units emit). Bytes via [`temen_coop_shim_ptr`],
 /// valid until the next call.
 #[no_mangle]
-pub extern "C" fn svm_coop_shim_wasm(slot: u32) -> usize {
+pub extern "C" fn temen_coop_shim_wasm(slot: u32) -> usize {
     // SAFETY: single-threaded wasm; exclusive access to the session.
     let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() }) else {
         return 0;
@@ -9446,7 +9478,7 @@ pub extern "C" fn svm_coop_shim_wasm(slot: u32) -> usize {
         return 0;
     };
     let shared = TIERUP_UNIT_SHARED.load(std::sync::atomic::Ordering::Relaxed);
-    match svm_wasm_jit::emit_slot_trampoline(&params, &results, slot, shared) {
+    match temen_wasm_jit::emit_slot_trampoline(&params, &results, slot, shared) {
         Ok(w) => {
             s.shim_wasm = w;
             s.shim_wasm.len()
@@ -9458,9 +9490,9 @@ pub extern "C" fn svm_coop_shim_wasm(slot: u32) -> usize {
     }
 }
 
-/// Pointer to the shim module the last [`svm_coop_shim_wasm`] generated.
+/// Pointer to the shim module the last [`temen_coop_shim_wasm`] generated.
 #[no_mangle]
-pub extern "C" fn svm_coop_shim_ptr() -> *const u8 {
+pub extern "C" fn temen_coop_shim_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
         .map_or(core::ptr::null(), |s| s.shim_wasm.as_ptr())
 }
@@ -9468,7 +9500,7 @@ pub extern "C" fn svm_coop_shim_ptr() -> *const u8 {
 /// Close the open cooperative run, freeing its window. Idempotent. `CoopRun` owns everything it
 /// borrows (no leaked program), so dropping the session frees it all.
 #[no_mangle]
-pub extern "C" fn svm_coop_close() {
+pub extern "C" fn temen_coop_close() {
     // SAFETY: single-threaded wasm; take + drop the session.
     unsafe {
         *core::ptr::addr_of_mut!(COOP_RUN) = None;

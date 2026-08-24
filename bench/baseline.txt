@@ -1,6 +1,6 @@
-# svm-bench baseline — the tracked signal is the RATIO (svm / wasm), which is far more
+# temen-bench baseline — the tracked signal is the RATIO (temen / wasm), which is far more
 # portable across machines than the absolute ns. `--check` flags any ratio that grew
-# past the tolerance (svm got relatively slower). Regenerate after an intended change:
+# past the tolerance (temen got relatively slower). Regenerate after an intended change:
 #   cargo run --release -- --save-baseline baseline.txt
 # columns: kernel,compute_vs_wasm32,compute_vs_wasm64,cold_vs_wasmtime
 alu,1.016,NA,0.272

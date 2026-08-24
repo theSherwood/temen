@@ -1,6 +1,6 @@
 //! Host-side **differential corpus** generator. For each guest module it (1) encodes the module to
-//! its `svm-encode` binary form under `corpus/`, and (2) computes the **native** bytecode-engine
-//! result for a set of args — the ground truth `corpus.mjs` checks the wasm `svm_run` against.
+//! its `temen-encode` binary form under `corpus/`, and (2) computes the **native** bytecode-engine
+//! result for a set of args — the ground truth `corpus.mjs` checks the wasm `temen_run` against.
 //!
 //! The native run here uses the *exact same* `bytecode::compile_and_run` the wasm entry calls, so a
 //! mismatch isolates a wasm-compilation / sandbox effect (not an engine difference). The repo
@@ -11,17 +11,17 @@
 
 use std::io::Write;
 
-use svm_browser::{
+use temen_browser::{
     capture_exec, durable_run, dynlink_exec, instantiate_exec, jit_exec, powerbox_exec,
     reflect_exec, region_exec,
 };
-use svm_durable::{
+use temen_durable::{
     init_durable_window, transform_module, write_state, STATE_NORMAL, STATE_REWINDING,
     STATE_UNWINDING,
 };
-use svm_interp::{bytecode, Value};
+use temen_interp::{bytecode, Value};
 
-// Three op-family kernels lifted verbatim from `crates/svm/tests/bytecode_diff.rs` (known parseable
+// Three op-family kernels lifted verbatim from `crates/temen/tests/bytecode_diff.rs` (known parseable
 // and engine-supported), plus a divide-by-zero trap kernel.
 const ALU: &str = r#"
 func (i64) -> (i64) {
@@ -117,7 +117,7 @@ block 0 (v0: i64) {
 "#;
 
 // 8 vCPUs each `atomic.rmw.add` a shared counter 500× — total exactly 4000 on every interleaving.
-// Lifted from `crates/svm/tests/bytecode_threads.rs`; exercises `thread.spawn`/`join` + atomics on
+// Lifted from `crates/temen/tests/bytecode_threads.rs`; exercises `thread.spawn`/`join` + atomics on
 // the bytecode engine's cooperative `drive` (the browser concurrency model). Takes no args.
 const THREADS: &str = r#"
 memory 16
@@ -319,7 +319,7 @@ block 0 (vsp: i64, v0: i64) {
 // ---- powerbox guests: exercise the real capability set (streams / clock / exit) ----------------
 // Granted by entry arity (see `powerbox_exec`): 1 Stream(Out) · 2 Stream(In) · 3 Exit ·
 // 4 Stream(Err) · 5 Clock. I/O is deterministic (stdout/stderr buffers, monotonic clock), so the
-// native result here is an exact ground truth for the wasm `svm_run_pb`.
+// native result here is an exact ground truth for the wasm `temen_run_pb`.
 
 // `(out, in, exit)`: write a fixed 17-byte greeting to stdout via Stream.write (type 0, op 1).
 const PB_HELLO: &str = r#"
@@ -438,7 +438,7 @@ block 0 (v0: i32, v1: i32) {
 
 // Large-I/O echo guest (encoded for `corpus.mjs`'s alloc-ABI roundtrip, not the corpus): a 4 MiB
 // window, reads up to 4 MiB of stdin and echoes it to stdout — used to push **megabytes** through
-// `svm_alloc`ed buffers, well past the old fixed 1 MiB scratch cap.
+// `temen_alloc`ed buffers, well past the old fixed 1 MiB scratch cap.
 const BIG_ECHO: &str = r#"
 memory 22
 func (i32, i32, i32) -> (i32) {
@@ -485,7 +485,7 @@ block 3 () {
 "#;
 
 // ---- §14 nested child guests (confined sub-window domains) -------------------------------------
-// All lifted verbatim from `crates/svm/tests/bytecode_instantiate.rs` (known parseable + engine-
+// All lifted verbatim from `crates/temen/tests/bytecode_instantiate.rs` (known parseable + engine-
 // supported, checked bit-identical to the tree-walker there). Func 0 receives an `Instantiator`
 // (iface 6) over `[0, 128 KiB)`; `instantiate` is `cap.call 6 0`, `join` is `cap.call 6 1`.
 
@@ -630,8 +630,8 @@ block 0 (v0: i64) {
 "#;
 
 // ---- §12 fibers (cooperative continuation switching) -------------------------------------------
-// Lifted verbatim from `crates/svm/tests/bytecode_fibers.rs`. No powerbox needed (cont.* doesn't
-// touch the host), so these run through the plain `svm_run0` path. `cont.new`/`cont.resume`/`suspend`.
+// Lifted verbatim from `crates/temen/tests/bytecode_fibers.rs`. No powerbox needed (cont.* doesn't
+// touch the host), so these run through the plain `temen_run0` path. `cont.new`/`cont.resume`/`suspend`.
 
 // Resume delivers arg=7; the fiber returns arg+100 → resumer sees value 107.
 const FIB_RUN: &str = r#"
@@ -735,8 +735,8 @@ block 0 () {
 "#;
 
 // ---- §14 coroutines (Instantiator.spawn_coroutine / resume + Yielder.yield) --------------------
-// Lifted from `crates/svm/tests/bytecode_coroutines.rs`. Need an Instantiator (iface 6) like nested
-// children, so they run through the `svm_run_nested` path. spawn=op 2, resume=op 3; yield=iface 7 op 0.
+// Lifted from `crates/temen/tests/bytecode_coroutines.rs`. Need an Instantiator (iface 6) like nested
+// children, so they run through the `temen_run_nested` path. spawn=op 2, resume=op 3; yield=iface 7 op 0.
 
 // Parent spawns a coroutine confined to [64 KiB, 128 KiB), resumes it 3×; the child yields 100, then
 // 200+r1, then returns 999+r2 (r1=10, r2=20). Result 100 + 210 + 1019 + RETURNED*1_000_000.
@@ -794,7 +794,7 @@ block 0 (v0: i32) {
 "#;
 
 // ---- §22 guest-JIT (Jit.install + cross-module call_indirect, interpreted) ----------------------
-// From `crates/svm/tests/bytecode_dynlink.rs`. The unit (jit_exec's JIT_SERVICE = a*b+100) is
+// From `crates/temen/tests/bytecode_dynlink.rs`. The unit (jit_exec's JIT_SERVICE = a*b+100) is
 // host-compiled; the guest gets (jit, code, a=6, b=7). iface 11: op 3 install, op 4 uninstall.
 
 // Install the unit (→ table slot), then call_indirect it: 6*7 + 100 = 142.
@@ -910,7 +910,7 @@ block 0 (vsp: i64, vp: i64) {
 // unit is the f64 `fservice(6.0,7.0)=142.0` — so the Worker marshals the args' slot bits to JS
 // Numbers and the f64 result back to its bits (the float ABI path). Each worker truncates 142.0 → 142
 // and folds; 8 × 142 = 1136, identical to the interpreter. Run with the f64 codegen service selected
-// (`svm_par_jit_codegen_service(1)`). Root func 0 is identical; only the worker's invoke sig differs.
+// (`temen_par_jit_codegen_service(1)`). Root func 0 is identical; only the worker's invoke sig differs.
 const THREADS_JIT_INVOKE_F64: &str = r#"memory 16
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
@@ -1545,9 +1545,9 @@ block 0 (vsp: i64, vh: i64) {
 "#;
 
 // ---- durability (freeze / thaw, single-fiber, IR-driven) ---------------------------------------
-// From `crates/svm/tests/bytecode_durable.rs`. A program with two clock reads (each an unwind point);
+// From `crates/temen/tests/bytecode_durable.rs`. A program with two clock reads (each an unwind point);
 // the first value is live across the second, so a freeze after the first spills it to the shadow
-// stack and a thaw reloads it. base = clock_v + (clock_v + 1). The `svm-durable` transform
+// stack and a thaw reloads it. base = clock_v + (clock_v + 1). The `temen-durable` transform
 // instruments it; gencorpus bakes the *instrumented* module into the corpus.
 const DURABLE_SRC: &str = r#"memory 17
 func (i32) -> (i64) {
@@ -1577,7 +1577,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 "#;
 
 // ---- §13 SharedRegion (host-backed memory aliased into the window) -----------------------------
-// From `crates/svm/tests/shared_region.rs`. iface 4: op 0 map(win_off, region_off, len, prot),
+// From `crates/temen/tests/shared_region.rs`. iface 4: op 0 map(win_off, region_off, len, prot),
 // op 2 len, op 3 page_size. Host grants a 64 KiB region as func 0's arg.
 
 // Map the region at offset 0 and again at offset `page_size`, store a marker at 0, load it from the
@@ -1609,7 +1609,7 @@ block 0 (v0: i32) {
 "#;
 
 // ---- §7 reflection (cap.self.count / cap.self.get) over a fixed 3-cap powerbox -----------------
-// Lifted from `crates/svm/tests/bytecode_caps.rs`. Powerbox = Stream(Out) t0, Exit t1, host-fn t13.
+// Lifted from `crates/temen/tests/bytecode_caps.rs`. Powerbox = Stream(Out) t0, Exit t1, host-fn t13.
 
 // Number of caps the domain holds → 3.
 const SELF_COUNT: &str = r#"
@@ -1633,7 +1633,7 @@ block 0 (v0: i32) {
 "#;
 
 // ---- tail calls (`return_call` / `return_call_indirect`, O(1) window reuse) --------------------
-// Adapted from `crates/svm/tests/bytecode_tailcall.rs` to the single-i64-arg compute shape.
+// Adapted from `crates/temen/tests/bytecode_tailcall.rs` to the single-i64-arg compute shape.
 
 // Tail-recursive factorial accumulator f(n, acc) = n<1 ? acc : f(n-1, acc*n) via `return_call`; entry
 // seeds acc=1. Runs in O(1) state (window reuse). Terminates for every arg (n<1 returns acc), so it
@@ -1733,7 +1733,7 @@ block 0 (v0: i64) {
 "#;
 
 // ---- §GC conservative root enumeration (`gc.roots`) --------------------------------------------
-// Lifted from `crates/svm/tests/bytecode_gc_roots.rs`. `gc.roots vlo vhi vmask vbuf vcap` scans the
+// Lifted from `crates/temen/tests/bytecode_gc_roots.rs`. `gc.roots vlo vhi vmask vbuf vcap` scans the
 // activation for in-range words, writes them (ascending, deduped) to `vbuf`, returns the count. Run
 // via the capture path (seed a 4 KiB window, snapshot it back). wasm vs native is the *same* bytecode
 // engine, so it is byte-identical here (the soundness-vs-tree-walker caveat doesn't apply).
@@ -1885,7 +1885,7 @@ const FLOAT_ARGS: &[i64] = &[
 
 // Fail-closed UNSUPPORTED path: a module the bytecode engine rejects (`compile_module → None`) —
 // `cont.new` (fiber) **and** a coroutine `cap.call 6 2` in one module is an unsupported combination,
-// so `svm_run` must return STATUS_UNSUPPORTED, matching native. (Forged handle never runs.)
+// so `temen_run` must return STATUS_UNSUPPORTED, matching native. (Forged handle never runs.)
 const UNSUP: &str = r#"
 func () -> (i64) {
 block 0 () {
@@ -1913,7 +1913,7 @@ block 0 (vsp: i64, varg: i64) {
 /// Args fed to each kernel (all `(i64) -> (i64)`), incl. negatives and a large value.
 const ARGS: &[i64] = &[0, 1, 2, 5, 64, 1000, -1, -1000, 100_000];
 
-fn native(m: &svm_ir::Module, args: &[Value]) -> (i32, i64) {
+fn native(m: &temen_ir::Module, args: &[Value]) -> (i32, i64) {
     let mut fuel = u64::MAX;
     match bytecode::compile_and_run(m, 0, args, &mut fuel) {
         None => (2, 0),
@@ -1925,11 +1925,11 @@ fn native(m: &svm_ir::Module, args: &[Value]) -> (i32, i64) {
     }
 }
 
-/// Encode a text module to `corpus/<name>.svmbc` and return the parsed module + file path.
-fn emit(name: &str, src: &str) -> (svm_ir::Module, String) {
-    let m = svm_text::parse_module(src).unwrap_or_else(|e| panic!("parse {name}: {e:?}"));
-    let bytes = svm_encode::encode_module(&m);
-    let file = format!("corpus/{name}.svmbc");
+/// Encode a text module to `corpus/<name>.temenc` and return the parsed module + file path.
+fn emit(name: &str, src: &str) -> (temen_ir::Module, String) {
+    let m = temen_text::parse_module(src).unwrap_or_else(|e| panic!("parse {name}: {e:?}"));
+    let bytes = temen_encode::encode_module(&m);
+    let file = format!("corpus/{name}.temenc");
     std::fs::File::create(&file)
         .and_then(|mut f| f.write_all(&bytes))
         .expect("write module");
@@ -1985,7 +1985,7 @@ fn main() {
     json.push_str("],\n\"powerbox\":[\n");
     for (i, (name, src, stdin)) in powerbox.iter().enumerate() {
         let (m, file) = emit(name, src);
-        // Native ground truth via the *same* `powerbox_exec` the wasm `svm_run_pb` calls.
+        // Native ground truth via the *same* `powerbox_exec` the wasm `temen_run_pb` calls.
         let out = powerbox_exec(&m, stdin);
         json.push_str(&format!(
             "  {{\"name\":\"{name}\",\"file\":\"{file}\",\"stdin\":\"{}\",\"status\":{},\
@@ -2046,7 +2046,7 @@ fn main() {
         ("child_addrspace", CHILD_ADDRSPACE),
         ("child_badcarve", CHILD_BADCARVE),
         ("child_trap", CHILD_TRAP),
-        // §14 coroutines reuse the Instantiator grant, so they run on the same `svm_run_nested` path.
+        // §14 coroutines reuse the Instantiator grant, so they run on the same `temen_run_nested` path.
         ("coro_roundtrip", CORO),
         ("coro_forged", CORO_FORGED),
     ];
@@ -2060,7 +2060,7 @@ fn main() {
         ));
     }
     // Fiber corpus — §12 cooperative continuations; no powerbox, so run like compute (no-arg, via
-    // `svm_run0`). `native()` (deny-all `compile_and_run`) is the ground truth.
+    // `temen_run0`). `native()` (deny-all `compile_and_run`) is the ground truth.
     let fibers = [
         ("fib_run", FIB_RUN),
         ("fib_suspend", FIB_SUSPEND),
@@ -2078,7 +2078,7 @@ fn main() {
             if i + 1 == fibers.len() { "\n" } else { ",\n" },
         ));
     }
-    // Compute-style feature sections (1-arg sweep, svm_run): tail calls, SIMD/v128, scalar floats.
+    // Compute-style feature sections (1-arg sweep, temen_run): tail calls, SIMD/v128, scalar floats.
     let mut emit_sweep = |section: &str, mods: &[(&str, &str)], sweep: &[i64]| {
         json.push_str(&format!("],\n\"{section}\":[\n"));
         for (i, (name, src)) in mods.iter().enumerate() {
@@ -2122,7 +2122,7 @@ fn main() {
         ],
         FLOAT_ARGS,
     );
-    // Reflection corpus — §7 cap.self.* over the fixed 3-cap powerbox (run via svm_run_reflect).
+    // Reflection corpus — §7 cap.self.* over the fixed 3-cap powerbox (run via temen_run_reflect).
     // SELF_COUNT takes no arg (→ 3); SELF_GET sweeps cap indices (0,1,2 valid; 3 out of range).
     let reflect: &[(&str, &str, &[i64])] = &[
         ("self_count", SELF_COUNT, &[0]),
@@ -2148,7 +2148,7 @@ fn main() {
             "]},\n"
         });
     }
-    // Guest-JIT corpus — §22 install + cross-module call_indirect (interpreted); svm_run_jit.
+    // Guest-JIT corpus — §22 install + cross-module call_indirect (interpreted); temen_run_jit.
     let jit = [
         ("jit_install", JIT_INSTALL),
         ("jit_uninstall", JIT_UNINSTALL),
@@ -2167,7 +2167,7 @@ fn main() {
     // asserted in the JS host (like the threads kernel's 4000), not the corpus JSON: they need the
     // multi-Worker shared powerbox the single-vCPU corpus differential doesn't set up.
     emit("threads_jit_invoke", THREADS_JIT_INVOKE);
-    // §22 real-codegen float variant — the f64 invoke kernel (svm_par_jit_codegen_service(1)) → 1136.
+    // §22 real-codegen float variant — the f64 invoke kernel (temen_par_jit_codegen_service(1)) → 1136.
     emit("threads_jit_invoke_f64", THREADS_JIT_INVOKE_F64);
     emit("threads_jit_install", THREADS_JIT_INSTALL);
     // §14 instantiate **across Workers** (THREADS.md 4c-domain §14-D2) — the confined-executor-child
@@ -2181,8 +2181,8 @@ fn main() {
     // §22 multi-Worker twins: the runtime-compile units + the guests whose workers compile them
     // (blob offsets/lengths baked into the guest's `compile (ptr, len)` sites; the harness stages
     // the encoded unit files at those window offsets).
-    let rt_len = svm_encode::encode_module(&svm_text::parse_module(JIT_RT_UNIT).unwrap()).len();
-    let b2_len = svm_encode::encode_module(&svm_text::parse_module(JIT_B2_UNIT).unwrap()).len();
+    let rt_len = temen_encode::encode_module(&temen_text::parse_module(JIT_RT_UNIT).unwrap()).len();
+    let b2_len = temen_encode::encode_module(&temen_text::parse_module(JIT_B2_UNIT).unwrap()).len();
     emit("jit_rt_unit", JIT_RT_UNIT);
     emit("jit_b2_unit", JIT_B2_UNIT);
     emit("jit_rt", &jit_rt_guest(0x2000, rt_len));
@@ -2206,7 +2206,7 @@ fn main() {
             ));
         }
     }
-    // SharedRegion corpus — §13 host-backed memory; func 0 gets a 64 KiB region (svm_run_region).
+    // SharedRegion corpus — §13 host-backed memory; func 0 gets a 64 KiB region (temen_run_region).
     let region = [("region_alias", REGION_ALIAS), ("region_len", REGION_LEN)];
     json.push_str("],\n\"region\":[\n");
     for (i, (name, src)) in region.iter().enumerate() {
@@ -2221,10 +2221,10 @@ fn main() {
     // thaw (fed the freeze snapshot back). Each case bakes its window + clock + (status, value,
     // snapshot) ground truth; the wasm side runs the *same* instrumented module over the *same* window.
     {
-        let src = svm_text::parse_module(DURABLE_SRC).expect("parse durable src");
+        let src = temen_text::parse_module(DURABLE_SRC).expect("parse durable src");
         let inst = transform_module(&src).expect("durable transform scope");
-        let bytes = svm_encode::encode_module(&inst);
-        let file = "corpus/durable.svmbc".to_string();
+        let bytes = temen_encode::encode_module(&inst);
+        let file = "corpus/durable.temenc".to_string();
         std::fs::File::create(&file)
             .and_then(|mut f| f.write_all(&bytes))
             .expect("write durable module");

@@ -1,7 +1,7 @@
-# Sandbox VM — Design Notes
+# Temen — Design Notes
 
 *A WebAssembly alternative: secure, simple, flexible, fast, with real virtual memory.*
-*Codename: TBD. Status: living document — expect churn.*
+*Codename: Temen. Status: living document — expect churn.*
 
 ## How to read this doc
 
@@ -93,8 +93,8 @@ is spent *around* compute, where wasm is weak:
   bitcode, so it targets the *actual* CPU's 128-bit SIMD, which is **richer than
   wasm's portable `simd128`** (D64: compile guest C for `x86-64-v3` at 128-bit
   width). This pulls array kernels to **parity-or-faster than Wasmtime-w64** and
-  the embench geomean **ahead** (svm-jit 1.96× vs wt64 2.00× ×native). Residual:
-  svm-jit scalarizes vector integer *width-conversions* (`edn`, ~1.4×) — the next
+  the embench geomean **ahead** (temen-jit 1.96× vs wt64 2.00× ×native). Residual:
+  temen-jit scalarizes vector integer *width-conversions* (`edn`, ~1.4×) — the next
   evidence-driven `v128` widen/narrow op-set slice (D58).
 - **Startup / JIT latency:** faster — SSA on the wire (no SSA reconstruction);
   decls-before-bodies ⇒ parallel per-function verify+JIT (§3a).
@@ -291,17 +291,17 @@ The same verified IR is executed by **four backends** — each a distinct *execu
 strategy* (how IR becomes execution), each with a distinct job. This is the canonical
 naming; use these names (see "Naming standard" below).
 
-1. **tree-walk interpreter** (`svm_interp::run`/`run_with_host`; crate `svm-interp`) —
+1. **tree-walk interpreter** (`temen_interp::run`/`run_with_host`; crate `temen-interp`) —
    walks the SSA IR data structure directly. This is the reference **oracle**:
    escape-TCB, `#![forbid(unsafe_code)]`, total and panic-free *even on unverified
    input* (so it is safe to drive from a fuzzer, §18). Correctness is defined *here*.
-2. **bytecode interpreter** (`svm_interp::bytecode`; crate `svm-interp`) — the IR
+2. **bytecode interpreter** (`temen_interp::bytecode`; crate `temen-interp`) — the IR
    lowered to a flat, operand-resolved bytecode with threaded dispatch and its own
    single-OS-thread cooperative scheduler; also `#![forbid(unsafe_code)]`. It is
    faster than the tree-walker and is the **portable** execution path for targets
    where a JIT is unavailable, and the JIT-not-viable fallback generally.
-3. **Cranelift JIT** (crate `svm-jit`) — the production native **speed** path (§9).
-4. **wasm-JIT** (crate `svm-wasm-jit`) — emits WebAssembly
+3. **Cranelift JIT** (crate `temen-jit`) — the production native **speed** path (§9).
+4. **wasm-JIT** (crate `temen-wasm-jit`) — emits WebAssembly
    from the IR so hot guest compute runs on a wasm engine's optimizing tiers (§21,
    `BROWSER.md`). Fail-closed like the Cranelift JIT: anything outside its subset
    (`Error::Unsupported`) stays on the bytecode interpreter, which drives. It is a
@@ -317,12 +317,12 @@ platform runs a subset of the backends: native runs {tree-walk, bytecode, Cranel
 JIT}; browser runs {bytecode, wasm-JIT}. In particular the **bytecode interpreter
 compiled to wasm64** and shipped in the browser (§21, `browser/`) is *not* a fifth
 backend — it is backend 2 on the browser platform. Do not confuse this *outbound*
-direction (the VM compiled *to* wasm) with the inbound `svm-wasm` frontend (wasm bytes
+direction (the VM compiled *to* wasm) with the inbound `temen-wasm` frontend (wasm bytes
 → IR, §20), nor with the wasm-JIT (IR → wasm bytes).
 
 **Naming standard.** Because there are now two JITs, **never write bare "JIT"** — it is
-ambiguous. Say **"Cranelift JIT"** (backend 3, `svm-jit`; "native JIT" acceptable) or
-**"wasm-JIT"** (backend 4, `svm-wasm-jit`). "oracle" names a *role* (whichever engine
+ambiguous. Say **"Cranelift JIT"** (backend 3, `temen-jit`; "native JIT" acceptable) or
+**"wasm-JIT"** (backend 4, `temen-wasm-jit`). "oracle" names a *role* (whichever engine
 is authoritative — almost always the tree-walk interpreter), never a specific backend.
 "bytecode in wasm" / "interpreter-in-wasm" names backend 2 on the browser *platform*,
 never backend 4. Short ids: `tree-walk`, `bytecode`, `cranelift`, `wasm-jit`; platforms
@@ -331,15 +331,15 @@ never backend 4. Short ids: `tree-walk`, `bytecode`, `cranelift`, `wasm-jit`; pl
 The **tree-walk interpreter is the root oracle** against which every fast backend is
 continuously differential-tested:
 - the **bytecode interpreter is held bit-exact** against it (shared semantic helpers →
-  results, trap kind, *and* float/NaN bits all identical; `crates/svm/tests/bytecode_diff.rs`
+  results, trap kind, *and* float/NaN bits all identical; `crates/temen/tests/bytecode_diff.rs`
   — "the gate that must stay green before the bytecode path is made a default");
 - the **Cranelift JIT is held exact** against it *modulo* cross-backend float-NaN bit
   patterns, which are host-defined and deliberately unpinned (§3b;
-  `crates/svm/tests/jit_diff.rs`);
+  `crates/temen/tests/jit_diff.rs`);
 - the **wasm-JIT is held against the tree-walk oracle** the same way — NaN-insensitive,
   since the wasm engine's NaN propagation is likewise host-defined — on its supported
-  subset (`crates/svm-wasm-jit/tests/differential.rs` and the sibling `mixed`/`cross_tier`/
-  `entry_data`/`simd` gates, whose `oracle()` helpers run `svm_interp::run`; the cross-tier
+  subset (`crates/temen-wasm-jit/tests/differential.rs` and the sibling `mixed`/`cross_tier`/
+  `entry_data`/`simd` gates, whose `oracle()` helpers run `temen_interp::run`; the cross-tier
   interp-leaf drivers still run on the bytecode engine, since that is the production
   behavior under test, not the oracle).
 
@@ -480,8 +480,8 @@ an agent-driven build.
 
 **Two binary dialects, one container (wire v9; owner-approved 2026-07-30, unblocking
 an external consumer on format standardization).** A header flags byte after the
-version splits the container: the **runnable module** (`.svmb`, flag 0 — the
-untrusted-input TCB path, `decode_module`) and the **object / link unit** (`.svmo`,
+version splits the container: the **runnable module** (`.temen`, flag 0 — the
+untrusted-input TCB path, `decode_module`) and the **object / link unit** (`.temeno`,
 flag bit 0 — `decode_unit`, the linker's binary input). Only the object dialect
 carries the D-LINK scaffolding: the `data.ptr` relocation section, the data-export
 section, and the link-form `data.self`/`data.sym`/`data.top` opcodes.
@@ -491,7 +491,7 @@ reserved flag bits fail closed. Both dialects are one linear pass with no fixups
 (the link forms ride inline as instructions, position-independent — the retired
 `(func,block,inst)` reloc-table shape stays retired). An object's in-band export
 tables replaced the `.syms` sidecar (retired and removed — exports ride in the
-artifact in every form); `svm-run --link` is the CLI driver.
+artifact in every form); `temen-run --link` is the CLI driver.
 
 ---
 
@@ -508,7 +508,7 @@ security — UB in a sandbox IR would void the escape guarantee.
 - **Integer arithmetic** (i32/i64): `add sub mul` (two's-complement **wrap**),
   `div_s div_u rem_s rem_u` (**trap** on /0; `div_s` traps on INT_MIN/−1 — `rem_s`
   does **not**: only the quotient overflows there, the remainder 0 is representable,
-  so it returns 0, wasm-identical — as both backends and `svm-spec` pin),
+  so it returns 0, wasm-identical — as both backends and `temen-spec` pin),
   `and or xor shl shr_s shr_u rotl rotr` (shift amount mod bitwidth), `clz ctz
   popcnt`.
 - **Integer compare** (→ i32 0/1): `eq ne lt_s lt_u le_s le_u gt_s gt_u ge_s ge_u
@@ -517,10 +517,10 @@ security — UB in a sandbox IR would void the escape guarantee.
   abs neg ceil floor trunc nearest copysign fma` (`min`/`max` are wasm-identical:
   NaN-propagating, with `-0 < +0` — *not* IEEE minNum; `nearest` rounds ties to
   even; `fma` is the correctly-rounded fused multiply-add; `abs`/`neg`/`copysign`
-  are pure sign-bit ops, defined on NaN too — all pinned by `svm-spec`).
+  are pure sign-bit ops, defined on NaN too — all pinned by `temen-spec`).
 - **Float compare** (→ i32): `eq ne lt le gt ge`.
 - **Conversions:** `i64.extend_i32_s/u`, `i32.wrap_i64`, `extend8_s/extend16_s/
-  extend32_s` (the narrow sign-extends — *defined here + in `svm-ir`, the interpreter, **and the JIT**
+  extend32_s` (the narrow sign-extends — *defined here + in `temen-ir`, the interpreter, **and the JIT**
   (`ireduce`→`sextend`); the chibicc frontend still narrows with shifts — see "Narrow integer types" below*);
   `trunc_sat_f→i_s/u` (**saturating default**, deterministic; trapping
   variant available), `convert_i→f_s/u`, `f32.demote/f64.promote`; `reinterpret`
@@ -577,7 +577,7 @@ load/store/cast/atomic *boundaries*, which the current model already covers (exc
 narrow-atomic workload):** keep the `i32`/`i64` model; prefer the cheaper, TCB-preserving fixes
 over adding `i8`/`i16`:
 - **Use the already-specified `extend8_s`/`extend16_s` ops** so narrowing is one canonical,
-  fuzzable op instead of a shift pair. They exist in `svm-ir`, the interpreter, **and the JIT**
+  fuzzable op instead of a shift pair. They exist in `temen-ir`, the interpreter, **and the JIT**
   (lowered as `ireduce`→`sextend`; they ride the 4000-seed interp↔JIT differential, pinned by
   `jit_diff::jit_matches_interp_sign_extend_ops`). The chibicc frontend still emits shifts for
   narrowing casts (a future frontend can emit the op directly). This adds *no* narrow-arithmetic
@@ -754,7 +754,7 @@ Consequences:
     the zero-copy borrow buffer (`hostbuf`, ~1.8× *faster*) — needs none of this.** Revisit
     only if a real workload makes scalar host-call latency a measured bottleneck (D45).
   - **Update — D45 now implemented (opt-in), and it cleared the TCB concern above.** An optional
-    `svm_jit::FastCapResolver` lets the embedder hand the JIT a *specialized* host fn for a
+    `temen_jit::FastCapResolver` lets the embedder hand the JIT a *specialized* host fn for a
     statically-known `(type_id, op)`; the JIT emits a register-to-register direct call to it
     (resolved at compile time, baked), falling back to the generic thunk for any unclaimed op. The
     authority-TCB worry is sidestepped **by construction**: the specialized fns *delegate to the same
@@ -762,7 +762,7 @@ Consequences:
     `generation`) is unchanged — devirtualization moves only the *boundary* (register args, no
     runtime `(type_id, op)` dispatch), never the authority check. The resolver is gated on arity
     (`n_args`/`n_res`) so an odd-signature `cap.call` can't C-ABI-mismatch the fn. The production
-    powerbox (`svm-run`) fast-paths the window-independent hot op (`Clock.now`; `Blocking.work`
+    powerbox (`temen-run`) fast-paths the window-independent hot op (`Clock.now`; `Blocking.work`
     rode the same path until the mock left the product powerbox — CONSOLIDATION §5a).
     **Measured: hostcall ~1.24×→ ≈0.67× (≈1.5× *faster* than a Wasmtime import)** — the register-ABI
     win was larger than the "~parity ceiling" predicted, since it also drops the generic `i64`-array
@@ -795,7 +795,7 @@ against the window before the host borrows it in place (§9's "arg bounds-check"
 ### Uniform pointer tagging (`[tag:8][gen?][index]`)  [SETTLED — owner-approved 2026-08-04]
 
 A dynamic-language guest wants a **single tagged-value representation** across every
-pointer-like kind it manipulates. SVM makes that uniform by reserving the **top byte
+pointer-like kind it manipulates. Temen makes that uniform by reserving the **top byte
 (bits 56–63) of every pointer-like value for the guest's tag** and never using it
 itself. Concretely, all four kinds share the layout `[tag:8][generation?][index]` —
 tag at a *fixed* offset, index at the bottom, an optional generation between:
@@ -1056,9 +1056,9 @@ and `instantiate` carves below the guard are refused (the `mmap_min_addr`
 analogue), which is what keeps the baked per-tier guard constants sound.
 Unmarked modules keep the legacy layout byte-for-byte (the marker gates
 everything), so old artifacts — chibicc's generated programs, the nim assets,
-the shell fixtures — coexist with guarded ones. `svm-llvm-translate
+the shell fixtures — coexist with guarded ones. `temen-llvm-translate
 --null-guard` emits the guarded layout; the host seeds args marker-aware
-(`svm_ir::module_args_base`).
+(`temen_ir::module_args_base`).
 
 ### Deferred
 `File`/`Directory`/`openAt`, `Connector`/networking (§7), async submit/complete
@@ -1124,7 +1124,7 @@ the Phase-1 core loop.
     guard) is deliberately NOT offered: one fuzzed configuration, no deployment has justified
     trading the hardening.
 - **Confinement is one isolated lowering pass.** The bounds-check/clamp/guard logic is
-  a single, separately-fuzzable JIT component ([`svm_mask`] is its shared reference)
+  a single, separately-fuzzable JIT component ([`temen_mask`] is its shared reference)
   with the invariant *"every memory access is either proven bounded (guard-backed) or
   dominated by a bounds check of the final effective address into `[0, reserved)`
   (faulting otherwise) whose address is clamped by `& (reserved−1)` on the way to the
@@ -1186,7 +1186,7 @@ This yields the binding contract:
 > *speculative* confinement escape — so the two numbers are one coupled unit, owned by the
 > confinement pass (§18 security hinge), fuzzed together, never set independently.
 
-*The concrete blocker.* `crates/svm-jit/src/mem.rs` today reserves `round_up(reserved) +
+*The concrete blocker.* `crates/temen-jit/src/mem.rs` today reserves `round_up(reserved) +
 **one** guard page` (4 KiB). That single page is exactly right for the *checked* path (the
 clamp forces `< reserved`; `offset+width` can only nick the first guard page) but caps
 `trusted_reach` at `4 KiB − width`. So the transform is safe **today only** for sub-page
@@ -1207,7 +1207,7 @@ catches an architectural mis-elision (final-memory + trap divergence). (2) A **n
 speculative-overshoot fuzz probe** is required for Scope B: assert the allocator's
 `guard_size` ≥ every reach the elision analysis will trust, as a property test over random
 `(reserved, mapped, B, width)` — the `trusted_reach ≤ guard_size` invariant made
-executable, sitting beside the `svm_mask` unit. (3) Bench: `dot`/`matmul`/`cache` recover
+executable, sitting beside the `temen_mask` unit. (3) Bench: `dot`/`matmul`/`cache` recover
 toward mask-mode numbers; `mem_oob`-style probes prove the guard actually faults the elided
 overruns. **No escape-TCB code lands until this invariant is signed off** (the escape hinge,
 no expert reviewer — §18).
@@ -1220,7 +1220,7 @@ and the bounded window makes escape impossible without per-access checks.
 
 Confinement itself is portable arithmetic (the trap-confinement pass, §16/D51); only the
 **non-TCB PAL** — VA reserve/commit/protect/release + guard-fault→trap recovery —
-differs per OS. `crates/svm-jit/src/mem.rs` is a portable window model over a small
+differs per OS. `crates/temen-jit/src/mem.rs` is a portable window model over a small
 PAL seam, cfg-selected per target. The full test suite — confinement,
 detect-and-kill, the Memory cap, the interp↔JIT escape oracles, and (on unix) the
 C frontend — runs green on `ubuntu-latest` (x86-64 / 4 KiB), `macos-latest`
@@ -1248,7 +1248,7 @@ it does on all three.)
 granularity is the **host MMU page**, queried at runtime, *not* a hardcoded 4 KiB:
 x86-64 is 4 KiB, Apple Silicon is a fixed 16 KiB (no 4 KiB granule exists
 natively), other arm64 vary. All backends agree by querying the same value — the
-JIT/`svm-run` via `sysconf`, the `#![forbid(unsafe_code)]` interpreter via the safe
+JIT/`temen-run` via `sysconf`, the `#![forbid(unsafe_code)]` interpreter via the safe
 `page_size` crate — so protection, zeroing, and the page map line up page-for-page
 on any host, and the interp↔JIT differential is page-size-agnostic. Two
 host-specific subtleties the parity work surfaced: (1) `unmap` must **explicitly
@@ -1266,12 +1266,12 @@ execution is a later refinement.
 
 ### Target dependence (the explicit catalog)
 
-svm aims to be **target-uniform**: a module that verifies runs identically on every supported
+temen aims to be **target-uniform**: a module that verifies runs identically on every supported
 backend/target. The few genuinely target-dependent items are enumerated here so they stay few and
 visible; anything not listed is intended to be byte-for-byte uniform (the interp↔JIT escape oracle
 and differential enforce that for the confinement + codegen surface).
 
-- **Supported targets for native stack-switching** (`svm_fiber::supported()`): x86-64 unix,
+- **Supported targets for native stack-switching** (`temen_fiber::supported()`): x86-64 unix,
   aarch64 unix (incl. Apple Silicon), x86-64 Windows. The reference JIT derives `cfg(fiber_rt)`
   from this set.
 - **Features gated to that set** — present on **all three** supported targets; on others the **JIT
@@ -1292,7 +1292,7 @@ and differential enforce that for the confinement + codegen surface).
 - **PAL + page size** (see "Platform support" above): VA reserve/commit/protect/release and
   guard-fault recovery differ per OS (a non-TCB seam); page granularity is the host MMU page,
   queried at runtime. The *guarantee* is identical across targets.
-- **Arch/OS-specific code, all behind one seam** (`crates/svm-fiber/`): the register/stack switch
+- **Arch/OS-specific code, all behind one seam** (`crates/temen-fiber/`): the register/stack switch
   (`switch_{x86_64_sysv,aarch64,x86_64_windows}.rs`) and guard-paged stack allocation
   (`stack_{unix,windows}.rs`). They differ in saved-register frame layout and, on Windows, TEB
   `StackBase`/`StackLimit`/`DeallocationStack` swaps per switch, but expose one uniform
@@ -1871,7 +1871,7 @@ numbers:
    parks are whole-vCPU and guest-invisible; a punt **inside a fiber** parks the *fiber* — see
    fiber-park promotion below.
 
-Pinned constraints (tests in `svm/tests/host_park.rs`, `svm-run/tests/fast_cap.rs`): a parkable
+Pinned constraints (tests in `temen/tests/host_park.rs`, `temen-run/tests/fast_cap.rs`): a parkable
 registration is **never** `fast_cap_resolver`-claimed; **sync ops never pay for parkable ops'
 existence** — no completion id, no table touch unless a handler already returned `Offload`
 (`Completions::minted() == 0` pins); overlap pinned by rendezvous, never timing.
@@ -1953,10 +1953,10 @@ primitive still wants a second consumer.
   §5 hardened tier, not the default (TSan-class cost).
 - **Wire encoding of ordering (2026-08-20, wire rev):** the model stays
   C11-compatible, but the *wire* carries an ordering immediate **only where a
-  producer actually produces one** — i.e. on `atomic.fence` (svm-llvm maps LLVM
+  producer actually produces one** — i.e. on `atomic.fence` (temen-llvm maps LLVM
   fence orderings faithfully). The four atomic *ops* (`atomic.load` / `.store` /
   `.rmw` / `.cmpxchg`) dropped their `order` field: every producer hardcoded
-  `seqcst` there (svm-wasm is seq-cst by wasm spec; svm-llvm discards weak
+  `seqcst` there (temen-wasm is seq-cst by wasm spec; temen-llvm discards weak
   orderings at each atomic-op site), so the field carried zero information. This is
   a **representation** change, not a semantics change: execution was uniformly
   seq-cst before and after, and SC executions ⊆ the C11-allowed weak executions (a
@@ -2225,7 +2225,7 @@ default above still stands for every handle-gated capability.
 ### wasm-JIT tier coverage (the `compile_nested` front door)  [SETTLED — built]
 VM-in-VM runs correctly on **every** tier: fed to the general `compile_jit` front door a §14 unit
 runs interpreter-driven, the interpreter servicing `instantiate`/`join` via `VcpuStop::Instantiate`.
-The wasm-JIT tier (`svm-wasm-jit`; `BROWSER.md` "wasm-JIT tier") is a *performance* path that lowers a
+The wasm-JIT tier (`temen-wasm-jit`; `BROWSER.md` "wasm-JIT tier") is a *performance* path that lowers a
 nesting parent's `instantiate`/`join`/window-carve/`thread`/futex ops to host bounces
 (`env.instantiate` / `env.join` / `env.thread_*`) so the parent runs on emitted wasm. `compile_nested`
 is its single front door — the nesting analogue of `compile_jit` — deriving the drive mode from the
@@ -2241,7 +2241,7 @@ IR, so a verified unit always yields a runnable artifact:
   emitted; a fiber reachable from the entry by call edges drops it from the emitted set, and a
   `thread.spawn`ed fiber runs in its own spawned interpreter vCPU. Either way the emitted-function
   bitmap is a sound "safe to call `f{i}` directly" signal (the browser's per-instance
-  `svm_par_inst_eligible` gate reads it), and no new emitted-code or window-access surface is added
+  `temen_par_inst_eligible` gate reads it), and no new emitted-code or window-access surface is added
   (INVARIANTS.md #2 untouched). This is the wasm-tier counterpart of the §22 "fibers in a submitted
   unit" allowance.
 
@@ -2385,7 +2385,7 @@ our components.
 ### Platform abstraction & portability  [SETTLED — Linux/macOS/Windows at parity (Phase 3.5 done); seL4 backend still future]
 
 The escape-critical core is **already portable**: trap-confinement (§4) is pure
-arithmetic (`svm-mask` is `no_std`, dependency-free), so the security hinge carries no
+arithmetic (`temen-mask` is `no_std`, dependency-free), so the security hinge carries no
 OS-specific code. Portability concentrates in two **non-TCB** layers, isolated behind a thin
 **Platform Abstraction Layer** (PAL) in the runtime/JIT — never in the audited crates:
 
@@ -2407,7 +2407,7 @@ borrows a proven design rather than inventing one in §18's riskiest area.
 Windows tier 1 degrades to tier 0 (masking + MMU) or tier 3 (separate process). Tiers 0 and
 3 are portable. State this so the isolation story is not over-promised off Linux.
 
-**Staging:** Linux + macOS first (the unix path; the `compile_error!` in `svm-jit`
+**Staging:** Linux + macOS first (the unix path; the `compile_error!` in `temen-jit`
 gates genuinely-unsupported targets, not a permanent stance), Windows VEH/SEH next — **now
 done**. Window/mask/interp logic is platform-independent; only the PAL is per-OS. Windows
 landed as its own milestone — **Phase 3.5 (§18)** — and Linux/Windows/macOS are now kept at
@@ -2428,7 +2428,7 @@ design goal**; wasm v128 was only the lens that surfaced the gap. The op set is
 designed for real hardware SIMD on its own terms (build/inspect, integer/float
 lane arith, bitwise, shuffle/swizzle), grown **evidence-driven** — an op is added
 only when a real kernel emits it (same program-first discipline as the chibicc
-and wasm-transpiler op sets). The wasm bridge (§17→`svm-wasm`) maps wasm v128 →
+and wasm-transpiler op sets). The wasm bridge (§17→`temen-wasm`) maps wasm v128 →
 IR v128 and cleanly rejects what it can't map (`Unsupported`), its existing stance.
 
 - **Escape-TCB delta is small and isolated.** Vector arithmetic/lane/shuffle ops
@@ -2436,7 +2436,7 @@ IR v128 and cleanly rejects what it can't map (`Unsupported`), its existing stan
   gains total lane-typing rules. The *only* confinement change is the wider masked
   access: a `v128.load`/`store` masks the **final effective address** so
   `[addr, addr+16)` stays in-window (the same I1 invariant as scalar, 16 bytes
-  wide), so `svm-mask` + `fuzz/mask` gain 16-byte-width coverage (D38).
+  wide), so `temen-mask` + `fuzz/mask` gain 16-byte-width coverage (D38).
 - **Float lanes are NaN-insensitive in the differential.** Per-lane NaN bits
   aren't pinned across backends, so the interp↔JIT v128 differential is
   NaN-insensitive per lane and vector-float modules stay excluded from the
@@ -2446,7 +2446,7 @@ IR v128 and cleanly rejects what it can't map (`Unsupported`), its existing stan
   reports supported vector width) so guests/frontends can dispatch; the wider-width IR
   *types* (`v256`/`v512`) are deferred. The design skeleton is already right and the
   verification story holds: a wider type would add only total lane-typing (zero new
-  escape surface), the masked load/store just widens to 32/64 B on `svm-mask`'s
+  escape surface), the masked load/store just widens to 32/64 B on `temen-mask`'s
   width-parametric guard, and **the differential survives because lane semantics are
   width-agnostic** — the interpreter (exact per-lane) and the JIT (1× wide *or* split
   into 2×/4× `v128`) agree bit-for-bit on integer lanes, and the feature-detect query is
@@ -2486,7 +2486,7 @@ IR v128 and cleanly rejects what it can't map (`Unsupported`), its existing stan
   the host-native arm has nothing to lower to (splitting to `v128` buys nothing). So the mode
   is *designed-in but not buildable yet*; when Cranelift lands wide vectors it slots in as a
   non-default flag (e.g. a `SimdWidth::HostNative` legalization policy in the on-ramp +
-  `svm-jit`), leaving the deterministic default untouched. Until then, width-hungry work uses
+  `temen-jit`), leaving the deterministic default untouched. Until then, width-hungry work uses
   the host-provided vectorized capability *(a)* or the GPU broker *(b)* above.
 
 ### GPU = WebGPU via a sandboxed broker  [SETTLED]
@@ -2536,12 +2536,12 @@ ones as pillars and stage the expensive one.
 
 **Status (2026-06).** The *architectural premises* these pillars rest on are built and
 cross-platform-validated — the out-of-band control stack + per-fiber two-stack split (§5/§3d,
-`svm-fiber`), the deterministic interpreter oracle (§12, `run_scheduled`/`explore_all`),
+`temen-fiber`), the deterministic interpreter oracle (§12, `run_scheduled`/`explore_all`),
 capabilities (§3c/§7), and SSA promotion (§3d). **Two of the four debug surfaces have now
-shipped:** the **interpreter stepping engine** (the `svm-interp` `Inspector` — breakpoints,
+shipped:** the **interpreter stepping engine** (the `temen-interp` `Inspector` — breakpoints,
 single-step, backtrace, watchpoints over the masked window) and an **IR debug-info side-table**
 (W4) that carries source locations + named locals, consumed by an **interpreter-backed Debug
-Adapter Protocol server** (`svm-dap`, W5 slice 1; `DEBUGGING.md`) — so a client (VS Code) sets a
+Adapter Protocol server** (`temen-dap`, W5 slice 1; `DEBUGGING.md`) — so a client (VS Code) sets a
 source-line breakpoint, it binds, and hitting it shows the source frame with inspectable locals,
 with no DWARF and no JIT in the loop. **Still staged:** the `cap.call` record/replay log (pillar 1)
 and source-level **DWARF for JIT-compiled code** (pillar 4's full form). So pillars 2–4 are
@@ -2568,14 +2568,14 @@ realized in their interpreter-tier form; the DWARF/record-replay work remains.
 3. **Reference interpreter as a debug engine — cheap; vehicle mature, surface unbuilt.**
    Single-step / breakpoint / watchpoint over a masked, contiguous window is straightforward
    and deterministic with no JIT plumbing; address watchpoints are trivial (the window is one
-   buffer). The interpreter (`svm-interp`) is mature and is already the deterministic oracle,
-   it now also exposes the `Inspector` stepping API (breakpoints/step/backtrace/watchpoints) that `svm-dap` drives.
+   buffer). The interpreter (`temen-interp`) is mature and is already the deterministic oracle,
+   it now also exposes the `Inspector` stepping API (breakpoints/step/backtrace/watchpoints) that `temen-dap` drives.
 4. **Source-level debugging (the real work, staged).** Preserve source-location +
    variable-location info **frontend → an IR debug-info side-table (§3a) → Cranelift →
    DWARF**, so gdb/lldb and VS Code (via **DAP**) set breakpoints and inspect variables in
    the *source* language. Cranelift already emits DWARF for JIT code (Wasmtime precedent);
    the new piece is threading debug info through *our* IR. **The dependency is still step
-   zero:** the IR (`svm-ir`) carries no source-location fields and chibicc's `codegen_ir.c`
+   zero:** the IR (`temen-ir`) carries no source-location fields and chibicc's `codegen_ir.c`
    discards them, so the §3a side-table comes first. A cheap intermediate before full
    DWARF/DAP: a source↔IR-position side-table consumed by the interpreter (pillar 3), which
    needs no Cranelift work.
@@ -2584,7 +2584,7 @@ realized in their interpreter-tier form; the DWARF/record-replay work remains.
 `Monitor`): it *observes* a guest from outside, so it never widens the guest's authority and
 fits the ocap model. (§15's metering *properties* — fuel/quota — exist on `Host` today, but
 `Monitor` is still a **pattern**, not a built type — though the `Inspector` half is now real
-(`svm-interp`'s `Inspector`, driven by the `svm-dap` DAP server).) Debug info is **tooling,
+(`temen-interp`'s `Inspector`, driven by the `temen-dap` DAP server).) Debug info is **tooling,
 untrusted for escape** (§2a) — strippable, and the verifier never trusts it.
 
 **Memory-access instrumentation hooks (built, all backends — see `HOOKS.md`).** A distinct
@@ -2595,15 +2595,15 @@ access, and optionally **veto** it (a backend-identical trap). The two motivatin
 **memory-safety validation** and an **educational platform** that estimates cache misses / page
 faults from the access trace to score student programs. The hard constraint is **zero cost for
 programs that don't opt in**, met *structurally*: hooks are an **IR-to-IR instrumentation pass**
-(`svm-opt`) that inserts a `cap.call` before each memory op and re-verifies (fail-closed, §2a) —
+(`temen-opt`) that inserts a `cap.call` before each memory op and re-verifies (fail-closed, §2a) —
 the engines are untouched, so an un-hooked module is byte-identical, and a hooked module runs on
 all three backends with an event stream **identical by the §3 parity invariant** (the JIT
 included, with no change to the §4 masking lowering). Like the `Inspector`, a hook is a host-side
 *observe* capability that never widens guest authority (it rides the §7 `HostFn` interface). It is
 delivered by module rewrite, so it observes the **post-SSA-promotion** IR (same trade as pillar 4)
 and, under multi-vCPU (§12), the shared-`Host` handler sees every vCPU's accesses but in a
-schedule-dependent order. Surfaced as `Instance::with_mem_hooks` (`svm-run`) and
-`svm_instance_with_mem_hooks` (the C ABI, `svm-capi`); full design, phasing, and measured
+schedule-dependent order. Surfaced as `Instance::with_mem_hooks` (`temen-run`) and
+`temen_instance_with_mem_hooks` (the C ABI, `temen-capi`); full design, phasing, and measured
 hooked-run overhead in **`HOOKS.md`**.
 
 **Tension to record (it entangles the §3d perf pass — now concrete, not hypothetical):** SSA
@@ -2644,9 +2644,9 @@ non-negotiable **two-stack constraint** (§3d) — any frontend must place addre
 on the in-window data stack, scalars in SSA, control out-of-band, exactly as `codegen_ir.c`
 does. Generalizing that discipline to LLVM is the work.
 
-### 20a. The LLVM on-ramp, built (`crates/svm-llvm`)  [D54 exit criterion MET]
+### 20a. The LLVM on-ramp, built (`crates/temen-llvm`)  [D54 exit criterion MET]
 
-An AOT **LLVM-bitcode → SVM-IR translator**. Untrusted-for-escape (§2a): its output is
+An AOT **LLVM-bitcode → TEMEN-IR translator**. Untrusted-for-escape (§2a): its output is
 re-verified, so a translation bug is a clean error, never an escape — adding it cost **zero
 escape-TCB**. It links libLLVM at **build/dev time only** (via `llvm-ir`/`llvm-sys`, LLVM 18
 pinned), so it is **excluded from the workspace** and built as a Linux-dev-only CI lane — the
@@ -2656,7 +2656,7 @@ split falls out of LLVM's own promotion — address-taken `alloca`s that survive
 the rest → SSA) and the on-ramp only walks the legalized bitcode read-only.
 
 - **Core.** The headline is the **SSA → block-argument conversion** (the §1a win over wasm):
-  LLVM dominance-SSA + φ-nodes → SVM's block-local form via backward liveness — φ-results and
+  LLVM dominance-SSA + φ-nodes → Temen's block-local form via backward liveness — φ-results and
   threaded live-ins become block params, branches supply args; loops/joins/irreducible/critical
   edges need no edge splitting. Plus: narrow ints collapse to `i32` with re-emitted truncation /
   sign-extension at the hazards (§3b — incl. signed `icmp` on a narrow operand); pointers are `i64`;
@@ -2689,22 +2689,22 @@ the rest → SSA) and the on-ramp only walks the legalized bitcode read-only.
 
 ---
 
-### 20c. The partial-evaluation on-ramp (`crates/svm-peval`)  [BUILT — first Futamura projection, host-side + guest-side (in-sandbox)]
+### 20c. The partial-evaluation on-ramp (`crates/temen-peval`)  [BUILT — first Futamura projection, host-side + guest-side (in-sandbox)]
 
 A guest that wants to run JS/Python/Lisp/a DSL ships an **interpreter** (compiled to our IR
 via the C or LLVM on-ramp) and pays interpreter overhead forever, or hand-writes a per-language
-JIT on the §22 `Jit` capability. `svm-peval` adds a third option — the **first Futamura
+JIT on the §22 `Jit` capability. `temen-peval` adds a third option — the **first Futamura
 projection**: partial-evaluate the interpreter against a fixed program and get the *compiled*
 program out. `spec(interp, program)(input) ≡ interp(program, input)`, with the dispatch loop,
 opcode decode, and program-walking folded away. **Write only the interpreter, get the compiler
 for free** (weval's value proposition for SpiderMonkey, applied here).
 
 - **Posture — untrusted-for-escape, identical to the LLVM on-ramp (§20a).** The engine is a
-  pure host-side `Module → Module` transform (depends only on `svm-ir`). Its output is
-  re-verified (`svm_verify::verify_module`) before it runs, so a specializer bug is a clean
+  pure host-side `Module → Module` transform (depends only on `temen-ir`). Its output is
+  re-verified (`temen_verify::verify_module`) before it runs, so a specializer bug is a clean
   verify error, **never an escape**. The correctness spec is the differential oracle: the
   residual must equal the interpreter on **both** backends (interp and JIT) for every input.
-- **Why SVM is a good substrate.** SSA-on-the-wire (§3, §3a) skips weval's hardest first step
+- **Why Temen is a good substrate.** SSA-on-the-wire (§3, §3a) skips weval's hardest first step
   (SSA reconstruction from a stack machine); total/deterministic semantics (§3b — div/`INT_MIN`
   trap, shifts mod width, wrapping) make folding sound with no UB to reason around.
 - **Engine — online polyvariant symbolic execution** (weval's shape). Each SSA value is
@@ -2739,14 +2739,14 @@ for free** (weval's value proposition for SpiderMonkey, applied here).
     dead-block / dead-value elimination, block merging, dead block-param elimination — so
     residuals come out as tight straight-line/looped code, not `br`-chains.
 - **AOT, by construction.** Nothing is runtime-coupled: `specialize → verify → encode_module`
-  produces a shippable artifact; load it with `decode_module` and run or `svm_jit::compile_and_run`
+  produces a shippable artifact; load it with `decode_module` and run or `temen_jit::compile_and_run`
   it with zero specialization cost at run time (the host-side/offline architecture).
-- **Guest-side, in-sandbox — built.** The engine also runs *inside* the sandbox: `svm-peval`
-  compiles to svm-IR through the Rust→svm-IR on-ramp (`no_std` + `alloc`, `default-features = false`
+- **Guest-side, in-sandbox — built.** The engine also runs *inside* the sandbox: `temen-peval`
+  compiles to temen-IR through the Rust→temen-IR on-ramp (`no_std` + `alloc`, `default-features = false`
   to drop `libm`), so an ordinary guest can `specialize → encode_module → §22 Jit.compile → invoke`
   a residual without leaving its domain — the first Futamura projection performed in-sandbox by an
   untrusted program, the residual re-verified before it runs (zero new escape-TCB; the trust hinge is
-  verification, not the producer). Demonstrated end-to-end by `crates/svm-llvm/tests/peval_jit.rs`
+  verification, not the producer). Demonstrated end-to-end by `crates/temen-llvm/tests/peval_jit.rs`
   (a guest specializes + JITs a module) and `peval_futamura.rs` (a guest specializes a `br_table`
   interpreter against its program — dispatch + decode fold away — and JITs the result); the
   `specialize` closure's in-sandbox translate+run is regression-pinned by `peval_in_sandbox.rs`. The
@@ -2832,10 +2832,10 @@ A **durable** domain can be quiesced, serialized to `(window pages + per-page pr
 state, handle table)`, and later restored to **bytewise-equivalent** execution — possibly on the
 other backend, possibly on a different host, surviving a recompile, a Cranelift version bump, and
 ASLR (the precise meaning of "survive a recompile" is narrower than it sounds — see `DURABILITY.md`
-§1). Two crates, both **tooling-tier / +0-TCB** (they depend only on `svm-ir` and move bytes; an
+§1). Two crates, both **tooling-tier / +0-TCB** (they depend only on `temen-ir` and move bytes; an
 embedder running pre-instrumented modules links neither into the escape-TCB):
 
-- **`svm-durable` — the IR→IR freeze/thaw transform.** It instruments a function so an in-flight
+- **`temen-durable` — the IR→IR freeze/thaw transform.** It instruments a function so an in-flight
   may-suspend op (a `cap.call`, or a `Call` into a suspended chain) can be **unwound** into
   guest-resident shadow state and later **rewound** back into execution, byte-for-byte. The codec is
   pure IR — *no new instruction*: a state word (`NORMAL | UNWINDING | REWINDING`) + a per-fiber
@@ -2844,7 +2844,7 @@ embedder running pre-instrumented modules links neither into the escape-TCB):
   continues. The IR shape pays off here — a continuation block's `params` *are* the resume-point live
   set, so liveness is free and the verifier still does one linear pass. Handles arbitrary single-vCPU
   CFGs (branches, loops, joins), leaf `cap.call`s, and propagated call chains (re-issue vs. continue).
-- **`svm-snapshot` — the snapshot artifact codec.** (De)serializes a quiesced durable domain into a
+- **`temen-snapshot` — the snapshot artifact codec.** (De)serializes a quiesced durable domain into a
   backend-independent, recompile-survivable artifact and back. A frozen domain is described almost
   entirely by its **window image** (shadow stack, spilled live values, state word are all
   guest-resident bytes, so they ride along for free); what is captured host-side is the **handle
@@ -2859,41 +2859,41 @@ embedder running pre-instrumented modules links neither into the escape-TCB):
   refuses a domain holding shared regions).
 
 ### Browser embedding (the interpreter as a wasm guest)  [built]
-The bytecode **interpreter** (`svm-interp`'s `bytecode.rs`, `#![forbid(unsafe_code)]`, with its own
-single-OS-thread cooperative scheduler) compiles **to wasm** so an SVM guest runs **client-side** —
+The bytecode **interpreter** (`temen-interp`'s `bytecode.rs`, `#![forbid(unsafe_code)]`, with its own
+single-OS-thread cooperative scheduler) compiles **to wasm** so an Temen guest runs **client-side** —
 ship one `.wasm`, no native dependency. The payoff is portability/embeddability, **not** added
-isolation (inside wasm you are double-sandboxing: the host's wasm sandbox over SVM's own masking +
-guard pages). The production target is **wasm64** (memory64), because SVM addresses are `u64`
-end-to-end (`svm-mask` confines into `[0, 1<<reserved_log2)`); `wasm32` is kept only as a flag-free
+isolation (inside wasm you are double-sandboxing: the host's wasm sandbox over Temen's own masking +
+guard pages). The production target is **wasm64** (memory64), because Temen addresses are `u64`
+end-to-end (`temen-mask` confines into `[0, 1<<reserved_log2)`); `wasm32` is kept only as a flag-free
 Node smoke target for compute-only guests. Don't confuse this *outbound* direction (the VM compiled
-*to* wasm) with the *inbound* `svm-wasm` frontend (wasm bytes → IR, §20) — a guest could even be
-`svm-wasm`-transpiled and then run by this interpreter-in-wasm. See `BROWSER.md`.
+*to* wasm) with the *inbound* `temen-wasm` frontend (wasm bytes → IR, §20) — a guest could even be
+`temen-wasm`-transpiled and then run by this interpreter-in-wasm. See `BROWSER.md`.
 
 ### Conservative GC support (`gc.roots`)  [primitive built; collector is guest policy]
-SVM implements **no GC and no object model**. It contributes exactly one thing a guest's own
+Temen implements **no GC and no object model**. It contributes exactly one thing a guest's own
 collector cannot do itself: enumerate the roots living on the **out-of-band control stack +
 saved-register blocks** (§3d/§5) — the one place the guest cannot reach by masking. `gc.roots` does
 that conservatively (reporting candidate root words, with an optional top-byte-only payload mask for
 guests that tag pointers in the high byte). Everything else — heap, allocator, mark/sweep,
 object/line maps, world-stop coordination, scanning the in-window data stack + heap — is guest policy
 over primitives that already exist (the `Memory` cap, the futex, atomics). World-stop is cooperative
-and guest-coordinated; SVM provides no preemptive any-PC register-capturing stop (it would add
+and guest-coordinated; Temen provides no preemptive any-PC register-capturing stop (it would add
 escape-TCB). See `GC.md` (a draft RFC, converged with the JACL guest side).
 
 ---
 
 ## 22. Guest-driven JIT (the `Jit` capability)  [SETTLED — built, differentially tested]
 
-**The problem.** Can *guest* code (an interpreter running inside the sandbox) generate SVM IR at
+**The problem.** Can *guest* code (an interpreter running inside the sandbox) generate Temen IR at
 runtime, hand it to the VM to verify and Cranelift-compile, and call into the resulting native code?
 This is the "JIT-inside-the-sandbox" problem wasm handles poorly (W^X + immutable modules force a
-guest to ship its own interpreter forever, or round-trip to the host for a fresh module). SVM does it
+guest to ship its own interpreter forever, or round-trip to the host for a fresh module). Temen does it
 cleanly, because the submit-a-blob boundary already exists and **the verifier is designed to be the
 trust hinge for exactly this**. **Built and merged on both backends, differentially identical**
-(`crates/svm/tests/jit_cap.rs`, `jit_incremental.rs`, `jit_reentry.rs`, `jit_compaction.rs`).
+(`crates/temen/tests/jit_cap.rs`, `jit_incremental.rs`, `jit_reentry.rs`, `jit_compaction.rs`).
 
 **Shape (everything crosses `cap.call`, D55).** The guest builds a serialized IR blob (the binary
-`svm-encode` format) in its own window, `cap.call`s a granted **`Jit`** capability with a `(ptr, len)`,
+`temen-encode` format) in its own window, `cap.call`s a granted **`Jit`** capability with a `(ptr, len)`,
 and the host reads the blob, runs `decode_module` → `verify_module` **plus the memory-match
 precondition** (below), and — only if all pass — Cranelift-compiles it into a long-lived `JITModule`,
 returning a `CompiledCode` handle. Adding the capability needed **no verifier/IR/escape-TCB change** —
@@ -2929,9 +2929,9 @@ for compile-then-sandbox.
 | 4 `uninstall` | `(slot) -> 0 \| -errno` | clear an installed slot (reusable; stale calls trap). |
 | 5 `compile_linked` | `(ir, ir_len, symtab, symtab_len) -> code \| -errno` | like `compile`, but the unit may carry **unresolved §7 imports** bound by name against the guest-provided symbol table before verify — the dynamic-linking entry (below). Fail-closed. |
 
-C surface (`frontend/chibicc`, `<svm.h>`): `__vm_jit_compile/compile_linked/invoke2/install/uninstall/release`,
+C surface (`frontend/chibicc`, `<temen.h>`): `__vm_jit_compile/compile_linked/invoke2/install/uninstall/release`,
 the 8th of the fixed chibicc powerbox; the in-guest dynamic-linking loader `vm_dlopen`/`vm_dlsym`/`vm_dlclose`
-(`<vm_dl.h>`) sits on top (below). Demos in `crates/svm-run/demos/jit/` (`jit_demo.c` self-JITs a
+(`<vm_dl.h>`) sits on top (below). Demos in `crates/temen-run/demos/jit/` (`jit_demo.c` self-JITs a
 bytecode interpreter; `jit_threads.c` concurrently compiles from worker threads; `jit_repl.c` is the
 auto-compacting REPL driven by `JitSession`; `jit_link.c`/`jit_dlopen.c`/`jit_hotreload.c` link by name).
 
@@ -3086,7 +3086,7 @@ release-ordered atomic `FnEntry` writes (same `#[repr(C)]` layout, so `indirect_
 byte-identical). Install *visibility* rides the **guest's own** acquire/release on its ready flag, so a
 worker observes a completed install even on weakly-ordered targets — no dispatch-side acquire needed; the
 atomic `FnEntry` only guarantees a racy reader never sees a *torn* code pointer. **Threaded `compile`**
-works via `svm_run::cap_thunk_locked`, which serializes `cap.call` through a per-domain `Mutex<Host>` so
+works via `temen_run::cap_thunk_locked`, which serializes `cap.call` through a per-domain `Mutex<Host>` so
 concurrent `Jit.compile`s are sound (`define_extra`'s `&mut` is exclusive) **while execution stays fully
 parallel** — the W^X spike proved `ArenaMemoryProvider::finalize` only re-protects *non-finalized*
 segments (executing code, always on a finalized segment, is never touched → no stop-the-world), and i-cache
@@ -3116,7 +3116,7 @@ is an ordinary **closed** module — indistinguishable from any frontend's outpu
 like it. There is no runtime "linker" and no new IR execution semantics; a mis-link (wrong signature,
 missing symbol) is caught by re-verification, never trusted. Two flavors, both built:
 
-- **Static** (`svm_ir::link`, like `ld`) — merge separate units into **one module** before
+- **Static** (`temen_ir::link`, like `ld`) — merge separate units into **one module** before
   compilation: function symbols → a **direct `call`**, data symbols → **constant addresses** in one
   shared, 16-byte-aligned data window. `LinkUnit { module, exports, data_exports, relocations }`;
   per-unit data is relocated by the unit's data base, `FuncIdx` sites are reindexed by its function
@@ -3127,25 +3127,25 @@ missing symbol) is caught by re-verification, never trusted. Two flavors, both b
   reaches a function it does not share an index space with through the **shared `call_indirect` table**
   at a runtime-assigned slot. Both directions work: plugin→host and old/loaded→newly-installed.
 
-**The lowering primitive** is `svm_ir::resolve_imports_with`: each `CallSym` (the v8 symbolic-call
+**The lowering primitive** is `temen_ir::resolve_imports_with`: each `CallSym` (the v8 symbolic-call
 spelling; a bound `call.sym` also executes directly as flat import dispatch) rewrites **1:1** (no
 value renumbering) to `Cap(ResolvedCap)`→`cap.call` (the §7 case), `Func(FuncIdx)`→a direct `call`
 (static), or `Slot(u32)`→`call_indirect <slot>` (dynamic; the symbol's handle operand must be a
 `ConstI32` placeholder, patched to the slot and reused as the index). Unresolved/ill-typed → fail-closed.
 
 **Serializable imports (codec v2).** So a unit can be shipped as a `.so` with *undefined references*,
-the binary form (`svm-encode`) now round-trips the §7 **import section** (name + op signature) and the
+the binary form (`temen-encode`) now round-trips the §7 **import section** (name + op signature) and the
 `call.import` opcode. v1 was always import-free (imports resolved before encoding); decode stays
 untrusted-input TCB and re-verification still gates everything.
 
 **Host-assisted resolve (op 5, both backends).** The design question — does the rewrite run guest-side
 or host-side — is **settled host-assisted**: `compile_linked` takes a guest-provided **symbol-table
-buffer** and resolves *before* verify (`svm_run::jit_resolve_and_validate`: decode → `resolve_imports_with`
+buffer** and resolves *before* verify (`temen_run::jit_resolve_and_validate`: decode → `resolve_imports_with`
 → verify → the §22 precondition gate). Simpler than a guest-side rewriter (none to load/trust) and
 equally safe. The symbol table is a small LEB128 wire form (`count`, then per entry `name` + `kind` —
 `0`=`Slot(uleb)`, `1`=`Cap(uleb type_id, uleb op)`); its decoder is fail-closed and fuzzed (a new
 untrusted-input surface). The `JitValidator` seam carries the symtab bytes so resolution stays in
-`svm-run`; the closed `compile` op (0) is just the empty-table case.
+`temen-run`; the closed `compile` op (0) is just the empty-table case.
 
 **Security argument.** Resolution is rewrite-**then**-verify, so a missing name, a wrong import
 signature, or a non-const slot handle fails verification — nothing reaches Cranelift. The symbol
@@ -3161,14 +3161,14 @@ existing intern + dynamic table population, driven by a guest-controlled name ma
 = the registry lookup (a funcref **slot**); `vm_dlclose` = `uninstall` + drop. Re-opening a name is
 **hot reload**: the new version installs at a *new* slot and the registry repoints, so units already
 linked keep their old binding (they baked the old slot) while new resolves see the new one. **Why this
-beats POSIX `dlopen`:** the "shared object" is serialized SVM IR, **re-verified** on load (a malicious
+beats POSIX `dlopen`:** the "shared object" is serialized Temen IR, **re-verified** on load (a malicious
 one can't escape — worst case it corrupts its own window, a §1 non-goal); `dlsym` returns an
 **unforgeable funcref slot** (§3c-checked), not a raw pointer; and loading is **capability-gated** (you
 need the `Jit` handle, and the bytes arrive through the powerbox — no ambient "load any file").
 
 Tests/demos: `dynlink.rs` (IR-level static link, interp==JIT), `dynlink_runtime.rs` (runtime by-name),
 `dynlink_resolve.rs` (host-assisted resolve + the `Cap` kind), `dynlink_repl.rs` (the symbol-table REPL
-spec), `dynlink_cap.rs` (the `compile_linked` op + type-confusion trap, differential), `svm-run`
+spec), `dynlink_cap.rs` (the `compile_linked` op + type-confusion trap, differential), `temen-run`
 `symtab_tests` (decoder fuzz), and the guest-C `jit_link.c`/`jit_dlopen.c`/`jit_hotreload.c`. **Open
 follow-up:** data symbols through `vm_dlsym` (place data via `Memory`+`memory.init` applying a
 `DataReloc`, returning an address) — not yet wired; and a GOT/late-binding variant so *old* code can
@@ -3187,7 +3187,7 @@ when the track completed; the build history lives in the git log.)
 | Primitive | What it is | Why only the VM can provide it |
 |---|---|---|
 | **vCPU** (`thread.spawn`/`join`) | one real OS thread, 1:1 (D56) | parallelism across physical cores — not expressible in portable guest code |
-| **fiber** (`cont.new`/`resume`/`suspend`) | a *stackful* coroutine that owns a native call stack | switching the native execution stack needs the `svm-fiber` asm stack-switch — the guest's instruction set can't save/restore SP + callee-saved regs and redirect execution mid-function |
+| **fiber** (`cont.new`/`resume`/`suspend`) | a *stackful* coroutine that owns a native call stack | switching the native execution stack needs the `temen-fiber` asm stack-switch — the guest's instruction set can't save/restore SP + callee-saved regs and redirect execution mid-function |
 
 Plus the coordination glue that is *also* primitive-minimal: the `wait`/`notify` **futex**
 and **C11 atomics** over the shared window. Everything richer — mutexes, channels, M:N
@@ -3218,7 +3218,7 @@ owes only the two things migration needs that the guest cannot provide itself:
 So the entire VM-side surface is one shared slot table, each slot carrying an **`Ownership`
 word** — no deque, no policy, no scheduler.
 
-**The ownership protocol** (`svm-jit/src/fiber_registry.rs`, loom-model-checked): one
+**The ownership protocol** (`temen-jit/src/fiber_registry.rs`, loom-model-checked): one
 `AtomicU64` per slot packing `(generation, state)` with states `OWNED` (fresh, or pinned
 fault-suspended) / `RUNNABLE` (voluntarily suspended — the pool) / `RUNNING` (never
 claimable) / `FREE` (returned; generation bumped, so a stale handle's claim fails — the ABA
@@ -3238,7 +3238,7 @@ happens-before edge that makes resuming a native stack *another thread* saved so
   spin-detection fingerprint covers chain/frames/parked-root rather than the shared table.
 - **JIT**: the domain-shared `fiber_rt::SharedFiberTable` (slots are `Arc`'d; the boxed
   fiber stays address-stable across table growth; the finished fiber's stack is unmapped at
-  `finish`). The cross-thread resume calls the **unchanged** `svm-fiber` switch — none of
+  `finish`). The cross-thread resume calls the **unchanged** `temen-fiber` switch — none of
   the three ABIs carries thread-bound state (SysV/AAPCS64 save only callee-saved registers,
   no TLS/x18; MS-x64 swaps the TEB `StackBase`/`StackLimit`/`DeallocationStack` per switch).
   Per-thread state (`CURRENT_RT` for yielder pairing; the §5 guard recovery) is re-read
@@ -3276,9 +3276,9 @@ therefore rests on an **empirical net**, every layer of which is built and green
    generated programs whose fibers suspend/resume across sequences of spawned vCPUs,
    deterministic by construction; the safe-Rust interpreter is the oracle; cross-executor
    saved-stack resumes are *counted and asserted*, not assumed.
-2. **ASan with real fiber-switch annotations** — `svm-fiber` brackets every switch with
+2. **ASan with real fiber-switch annotations** — `temen-fiber` brackets every switch with
    `__sanitizer_start/finish_switch_fiber` behind the `asan` cargo feature (chained
-   `svm/asan → svm-jit/asan → svm-fiber/asan`), re-capturing came-from stack bounds at each
+   `temen/asan → temen-jit/asan → temen-fiber/asan`), re-capturing came-from stack bounds at each
    switch-in so even migrated resumes are tracked; the whole fiber suite runs clean under
    `-Zsanitizer=address`. (The feature link-requires the sanitizer runtime by design.)
 3. **Runtime single-owner assert** at the resume seam (`FiberSlot::running_on`): a
@@ -3333,12 +3333,12 @@ not confinement — and all eight are fixed:
 | 8 | LOW | futex `HashMap` entries never pruned → removed at `waiters == 0` |
 
 **Checked and found sound (no action):** the verifier (fail-closed, `forbid(unsafe_code)`,
-every bound checked); `svm-mask` `confine` (in-window for all inputs incl. `u64::MAX`;
-`Window::sub` can't wrap past its sub-range); the `svm-mem` unsafe contracts; JIT mask
+every bound checked); `temen-mask` `confine` (in-window for all inputs incl. `u64::MAX`;
+`Window::sub` can't wrap past its sub-range); the `temen-mem` unsafe contracts; JIT mask
 elision (`ub_of`/`in_window` upper-bound-sound, saturating, width-accounted); the cap.call
 ABI (buffers sized from the compile-time verified sig); trap propagation (re-checked after
 every call/thunk); `call_indirect` (Spectre-safe masked dispatch + type-id check); the
-`svm-fiber` switches (register/alignment-complete on all three ABIs; body panic → abort);
+`temen-fiber` switches (register/alignment-complete on all three ABIs; body panic → abort);
 the decoder (every count bounded, LEB128 overflow-guarded); the §5 kill-path (epoch-cell
 lifetime via `join_all`; parked vCPUs re-check); capability forgery resistance (generation
 + type_id checked under a Spectre-safe masked index; `create_region` capped).
@@ -3414,7 +3414,7 @@ team has **no expert safety net**.
   split-host supervisor, monitoring, GPU, revocation. *(**§17 SIMD has landed**:
   fixed-128 `v128` (D58) end-to-end across IR/text/encode/verify/interp/JIT/wasm with
   native Cranelift SSE2/NEON codegen; the only escape-TCB delta is the 16-byte masked
-  load/store on `svm-mask`'s width-parametric guard; v128 ops ride the 4000-seed
+  load/store on `temen-mask`'s width-parametric guard; v128 ops ride the 4000-seed
   interp↔JIT differential, a real clang `-msimd128` saxpy transpiles to verified SIMD
   IR, and the `bench` SIMD kernel is at ~1.0× Wasmtime (compute parity). Wider
   widths `v256`/`v512` deferred (D58). **Concurrency
@@ -3445,7 +3445,7 @@ as open-ended, not a byproduct of the build.
   the Cranelift JIT (`jit_diff`) and the bytecode interpreter (`bytecode_diff`, bit-exact)
   against it on a large random corpus — catches codegen/compile bugs without expert eyes.
   The wasm-JIT is held against the same oracle by its own harness
-  (`svm-wasm-jit/tests/differential.rs`). This is the §3 parity invariant (four backends, one
+  (`temen-wasm-jit/tests/differential.rs`). This is the §3 parity invariant (four backends, one
   observable behavior).
 - **Fuzz the verifier from day one** (invariant: verified ⇒ cannot escape) — the
   one security validation that doesn't need a continuous expert in the loop.
@@ -3537,15 +3537,15 @@ as open-ended, not a byproduct of the build.
 | D51 | **Portability via a thin non-TCB Platform Abstraction Layer** (VA reserve/commit/protect, guard-fault→trap, futex); confinement stays platform-independent; **Linux/macOS first, Windows (VEH/SEH) next**; tier-1 MPK is Linux-only and degrades elsewhere. Scheduled as **Phase 3.5** (§18): port Windows, then hold Linux/Windows/macOS parity via a gating three-OS CI matrix | Open (staged) | The escape hinge is portable arithmetic; only the safety-net/syscalls differ per-OS; Wasmtime already proves the cross-platform path, so lean on it (D36/§18) |
 | D52 | **Capability-boundary record/replay** as the primary debugging differentiator: in deterministic mode (§12) nondeterminism enters via capabilities (§7), so logging `cap.call` I/O + seeding that mode gives replayable, time-travel debugging; trustworthy backtraces come free from the out-of-band control stack (§5). **Caveat:** under multicore + relaxed atomics (§12/§23) race outcomes bypass the cap boundary, so faithful replay must also record schedule/memory-order choices (the interp's DPOR `explore_all` already reifies these) | Proposed (premises built; surfaces unbuilt) | Debugging ergonomics are a first-class goal; the ocap boundary is the cheap recording boundary *in single-vCPU mode*; the control stack survives heap corruption |
 | D53 | **Debug surfaces = three cheap pillars + staged DWARF:** reference-interpreter stepping/watchpoints, record/replay, and §5 backtraces now; source-level DWARF (frontend→IR debug side-table→Cranelift→DAP/gdb/lldb) staged. Debug info is untrusted tooling (§2a); debug builds **disable §3d promotion or emit value-locations** so locals stay inspectable; debugger is a host-side `Inspector` capability (like §15 `Monitor`). **Status:** premises built (control stack, deterministic interp, SSA promotion); no stepping API, cap.call log, or §3a debug side-table yet — the side-table is step zero for DWARF | Proposed (premises built; surfaces unbuilt) | The cheap pillars fall out of the architecture; DWARF is the real work; promotion-vs-inspectability is a real trade; debugger-as-capability never widens authority |
-| D54 | **Frontends are untrusted IR plugins (verifier re-checks all); multi-language via two on-ramps — LLVM-bitcode→IR translator (breadth, PNaCl-style, pinned subset, `crates/svm-llvm`) and wasm→IR bridge (compat, `svm-wasm`).** Our IR is a *better LLVM target than wasm* (irreducible CFG, 64-bit, multivalue, tail calls) | **Settled + built** (§20a): LLVM on-ramp passes the **exit criterion** — all 8 chibicc corpus libraries run byte-identical to native `clang` on both backends; general-C breadth (varargs `printf`, wider SIMD, libm) ongoing | IR-as-stable-ABI makes language breadth a no-TCB-cost effort (§2a); a bitcode translator beats a TableGen backend for an expert-scarce team (D49); the §1a edges are real LLVM-target advantages |
+| D54 | **Frontends are untrusted IR plugins (verifier re-checks all); multi-language via two on-ramps — LLVM-bitcode→IR translator (breadth, PNaCl-style, pinned subset, `crates/temen-llvm`) and wasm→IR bridge (compat, `temen-wasm`).** Our IR is a *better LLVM target than wasm* (irreducible CFG, 64-bit, multivalue, tail calls) | **Settled + built** (§20a): LLVM on-ramp passes the **exit criterion** — all 8 chibicc corpus libraries run byte-identical to native `clang` on both backends; general-C breadth (varargs `printf`, wider SIMD, libm) ongoing | IR-as-stable-ABI makes language breadth a no-TCB-cost effort (§2a); a bitcode translator beats a TableGen backend for an expert-scarce team (D49); the §1a edges are real LLVM-target advantages |
 | D55 | **One synchronous `cap.call` shape; async is a runtime construction over blocking-capable ops.** Synchrony is **interface-guaranteed**; **cost is tier-policy** the guest cannot observe: same-process nesting (tiers 0/1) is synchronous and ~free to any depth; cross-process (tier 3) keeps the shape but pays IPC and batches via §13 rings | Settled (clarification) | Unifies §9/§12/§14; the IR has only a synchronous call; "async-first" amortizes the *distrust* boundary, not the common case; matches zero-overhead nesting (§14) |
 | D56 | **Concurrency primitives only, no scheduler in the VM (honouring D22).** The VM exposes `cont.*` (fibers), `thread.spawn`/`thread.join` (a vCPU = **one real OS thread**, 1:1), and the `wait`/`notify` futex + C11 atomics — implemented in IR/interp/JIT. The guest runtime builds any M:N model over them. **A built-in M:N green-thread executor was implemented and then removed**: it gave deterministic seeded/exhaustive *JIT* scheduling but reintroduced exactly D22's costs (policy lock-in, the double-scheduler pathology, and the project's highest-risk unsafe — fiber migration across OS threads — in the runtime TCB). Verification keeps what mattered without it: the **interpreter** is the deterministic oracle (`run_scheduled`/`explore_all` exhaust interleavings at instruction granularity — a sound model of preemptive 1:1 threads), the real-thread JIT is differential-tested against it, and the futex glue is loom-checked | Settled (course-correction) | Removes the §12/D22 contradiction the executor introduced; shrinks the TCB; keeps the VM **less** opinionated than wasm on threading (threads are a 1:1 primitive, not a baked scheduler); the deterministic-exploration win lived in the interp oracle all along, not in owning the scheduler |
-| D58 | **SIMD = first-class fixed-128 `v128` with real hardware codegen (Cranelift→SSE2/NEON), not scalar expansion; wasm-parity is not a goal.** 128-bit is the guaranteed floor (SSE2/NEON universal), so a `v128` op = one real vector instruction. Op set designed for real hardware SIMD on its own terms and grown **evidence-driven** (an op is added only when a real kernel emits it). Escape-TCB delta is small/isolated: vector arith/lane/shuffle ops add **zero** escape surface (verifier gains total lane-typing only); the lone confinement change is the 16-byte masked `v128.load`/`store` on the final effective address (`svm-mask`+`fuzz/mask` gain 16-byte width, D38). Float lanes are NaN-insensitive in the interp↔JIT differential (NaN bits unpinned across backends → vector-float modules excluded from the byte-exact window oracle, as scalar floats are today). **Wider widths (`v256`/`v512`) feature-detected and DEFERRED — blocked by the backend, not the design.** The design skeleton is right (wider type = total lane-typing only; mask widens to 32/64 B on the width-parametric guard; the differential survives because lane semantics are width-agnostic — interp's exact lanes == JIT's 1×-wide-or-split, and the feature-detect query is per-machine not per-backend). What's missing is in **Cranelift: no YMM/ZMM register class** (`RegClass::Float` = XMM/128-bit; the `avx2`/`avx512` predicates only pick better 128-bit encodings), so a native `vpaddd ymm` needs a new register class + lowering *in the shared backend* = owning codegen, which D36/D49 refuse. The "native" arm is thus empty until Cranelift adds wide vectors upstream; the "split-to-`v128`" arm equals a hand-written `v128` loop. **ROI of guest-emitted wide SIMD is low**: can't capture throughput without forking the backend; **x86-only** (ARM's wide path is scalable SVE, rejected — no NEON-256); AVX-512 fragmented; many kernels memory-bound. **Higher-ROI homes:** a host-provided vectorized capability (host owns tuned AVX-512 behind `cap.call` + zero-copy borrow, §7/§13 — portable guest, zero backend cost) and the GPU broker. **Revisit trigger = Cranelift gaining upstream wide-vector support**, not "a kernel wants it." **Scalable vectors (SVE/RVV) rejected** (runtime-variable width makes the masked-access bounds proof runtime-variable; no backend support; fragmented benefit). | Settled (fixed-128); wider widths deferred | Real hardware SIMD is the goal; wasm was just the lens. Fixed-128 is the portable floor that always lowers to a real instruction with no scalar fallback. Wider widths are deferred not on evidence-discipline grounds but on a hard backend blocker (no Cranelift YMM/ZMM regclass) — owning that codegen contradicts the "as fast/secure as wasm via shared Cranelift" thesis (D36/D49); and width-hungry workloads are better served by a host SIMD capability or the GPU broker. Vector ops are value-only so the security story barely moves — only the masked access widens |
-| D57 | **Two concurrency primitives are the floor; "stackless tasks" add none.** vCPU (`thread.spawn`, 1:1) gives parallelism; fiber (`cont.*`) gives suspension of *native* execution. A **stackless task** (a guest-compiled state machine — struct + resume fn + a `switch` on a state field) is a *guest pattern* needing **zero** primitives: its suspend point is the state-machine transition, built from ordinary loads/stores/branches. So guest-built M:N comes in two flavors **today, with no VM change**: *sharded* M:N over **thread-affine** fibers (tasks pinned to their worker), and **work-stealing** M:N over **stackless** tasks (freely movable — moving a struct is a pointer hand-off, safe by construction; over `thread.spawn`+futex+atomics). Stackless is strictly *less expressive* (function-coloring: it can only suspend at points in a transformed body, not across arbitrary/unmodified frames), so fibers stay — they're the only way to cooperatively suspend **unmodified real code** and they underpin the §14 fault-driven yield (suspend at an arbitrary hardware-fault PC is inherently stackful). **Stackful migration over *migratable* fibers is ADOPTED and landed (slices 3a–3c):** it re-accepts D56's deliberately-removed cross-thread-fiber-migration unsafe, but as a **primitive** (the VM enforces a single-owner *resume-from-any-thread* — the loom-verified `Ownership` claim; the guest owns any stealing policy) rather than a VM scheduler — resolving D56's policy-lock-in / double-scheduler objections while accepting its TCB-risk one *with eyes open*: no expert reviewer is available for the asm/signal seam, so safety rests on the **empirical net** (§23 "verification story" — the randomized-migration interp↔JIT differential, ASan with real fiber-switch annotations in `svm-fiber`, a runtime single-owner assert at the resume seam, guard-paged stacks, concurrent-steal stress). Both backends migrate: the interp's run-shared registry (pure-data hand-off, the oracle) and the JIT's domain-shared table over the *unchanged* `svm-fiber` switch (no thread-bound state in any of the three ABIs; MS-x64 swaps the TEB stack fields per switch). Fault-suspended fibers stay pinned (`pin`, staged); slot recycling is staged behind generation-carrying handles on both backends. | Adopted (extends D56; 3a–3c landed) | Pins the primitive count at two and the "no VM scheduler" rule; records the migratable-fiber path honestly as a re-acceptance of a known high-risk unsafe, not a free win — to be earned, not assumed. Full design + verification story + demo evidence in **§23** |
+| D58 | **SIMD = first-class fixed-128 `v128` with real hardware codegen (Cranelift→SSE2/NEON), not scalar expansion; wasm-parity is not a goal.** 128-bit is the guaranteed floor (SSE2/NEON universal), so a `v128` op = one real vector instruction. Op set designed for real hardware SIMD on its own terms and grown **evidence-driven** (an op is added only when a real kernel emits it). Escape-TCB delta is small/isolated: vector arith/lane/shuffle ops add **zero** escape surface (verifier gains total lane-typing only); the lone confinement change is the 16-byte masked `v128.load`/`store` on the final effective address (`temen-mask`+`fuzz/mask` gain 16-byte width, D38). Float lanes are NaN-insensitive in the interp↔JIT differential (NaN bits unpinned across backends → vector-float modules excluded from the byte-exact window oracle, as scalar floats are today). **Wider widths (`v256`/`v512`) feature-detected and DEFERRED — blocked by the backend, not the design.** The design skeleton is right (wider type = total lane-typing only; mask widens to 32/64 B on the width-parametric guard; the differential survives because lane semantics are width-agnostic — interp's exact lanes == JIT's 1×-wide-or-split, and the feature-detect query is per-machine not per-backend). What's missing is in **Cranelift: no YMM/ZMM register class** (`RegClass::Float` = XMM/128-bit; the `avx2`/`avx512` predicates only pick better 128-bit encodings), so a native `vpaddd ymm` needs a new register class + lowering *in the shared backend* = owning codegen, which D36/D49 refuse. The "native" arm is thus empty until Cranelift adds wide vectors upstream; the "split-to-`v128`" arm equals a hand-written `v128` loop. **ROI of guest-emitted wide SIMD is low**: can't capture throughput without forking the backend; **x86-only** (ARM's wide path is scalable SVE, rejected — no NEON-256); AVX-512 fragmented; many kernels memory-bound. **Higher-ROI homes:** a host-provided vectorized capability (host owns tuned AVX-512 behind `cap.call` + zero-copy borrow, §7/§13 — portable guest, zero backend cost) and the GPU broker. **Revisit trigger = Cranelift gaining upstream wide-vector support**, not "a kernel wants it." **Scalable vectors (SVE/RVV) rejected** (runtime-variable width makes the masked-access bounds proof runtime-variable; no backend support; fragmented benefit). | Settled (fixed-128); wider widths deferred | Real hardware SIMD is the goal; wasm was just the lens. Fixed-128 is the portable floor that always lowers to a real instruction with no scalar fallback. Wider widths are deferred not on evidence-discipline grounds but on a hard backend blocker (no Cranelift YMM/ZMM regclass) — owning that codegen contradicts the "as fast/secure as wasm via shared Cranelift" thesis (D36/D49); and width-hungry workloads are better served by a host SIMD capability or the GPU broker. Vector ops are value-only so the security story barely moves — only the masked access widens |
+| D57 | **Two concurrency primitives are the floor; "stackless tasks" add none.** vCPU (`thread.spawn`, 1:1) gives parallelism; fiber (`cont.*`) gives suspension of *native* execution. A **stackless task** (a guest-compiled state machine — struct + resume fn + a `switch` on a state field) is a *guest pattern* needing **zero** primitives: its suspend point is the state-machine transition, built from ordinary loads/stores/branches. So guest-built M:N comes in two flavors **today, with no VM change**: *sharded* M:N over **thread-affine** fibers (tasks pinned to their worker), and **work-stealing** M:N over **stackless** tasks (freely movable — moving a struct is a pointer hand-off, safe by construction; over `thread.spawn`+futex+atomics). Stackless is strictly *less expressive* (function-coloring: it can only suspend at points in a transformed body, not across arbitrary/unmodified frames), so fibers stay — they're the only way to cooperatively suspend **unmodified real code** and they underpin the §14 fault-driven yield (suspend at an arbitrary hardware-fault PC is inherently stackful). **Stackful migration over *migratable* fibers is ADOPTED and landed (slices 3a–3c):** it re-accepts D56's deliberately-removed cross-thread-fiber-migration unsafe, but as a **primitive** (the VM enforces a single-owner *resume-from-any-thread* — the loom-verified `Ownership` claim; the guest owns any stealing policy) rather than a VM scheduler — resolving D56's policy-lock-in / double-scheduler objections while accepting its TCB-risk one *with eyes open*: no expert reviewer is available for the asm/signal seam, so safety rests on the **empirical net** (§23 "verification story" — the randomized-migration interp↔JIT differential, ASan with real fiber-switch annotations in `temen-fiber`, a runtime single-owner assert at the resume seam, guard-paged stacks, concurrent-steal stress). Both backends migrate: the interp's run-shared registry (pure-data hand-off, the oracle) and the JIT's domain-shared table over the *unchanged* `temen-fiber` switch (no thread-bound state in any of the three ABIs; MS-x64 swaps the TEB stack fields per switch). Fault-suspended fibers stay pinned (`pin`, staged); slot recycling is staged behind generation-carrying handles on both backends. | Adopted (extends D56; 3a–3c landed) | Pins the primitive count at two and the "no VM scheduler" rule; records the migratable-fiber path honestly as a re-acceptance of a known high-risk unsafe, not a free win — to be earned, not assumed. Full design + verification story + demo evidence in **§23** |
 | D59 | **Guest-driven JIT = the `Jit` capability (§22): a guest submits verified IR and gets native code in its *own* domain.** Verification, not isolation, is the trust boundary — a JIT'd unit is exactly as powerful as its submitter (same window/handles), with one new authority-TCB precondition (declared memory ≡ parent window; reject data segments + concurrency ops in a unit) keeping "no escape-TCB change" true. Model A (cap.call trampoline, default) sidesteps the baked function-table mask; Model B2 (`install` into a pre-reserved table) neutralizes it by pre-sizing — both ship, all four cross-call directions differentially pinned. Type identity is an append-only intern (id-equality ≡ structural equality), never read at runtime. Code reclaim is whole-module recompaction (no per-function free in cranelift-jit), driven by `recompact_jit`/`JitSession` on a byte watermark. Threaded `install` + threaded `compile` work with full platform parity (atomic `DomainTable`/`FnEntry`; `cap_thunk_locked` serializes compiles while execution stays parallel; no aarch64 `isb` needed). | Settled (built, differentially tested) | The "JIT inside the sandbox" wasm handles poorly; the submit-a-blob boundary + verifier-as-hinge already existed, so it was authority-TCB-mostly. Model A's worst case is perf/ergonomics (announced by a benchmark), B2's is a host-writes-into-live-table primitive — both earned their place; the sharded-module throughput optimization stays deferred until measured. Full design + security argument + reclaim/concurrency in §22 |
-| D60 | **Durable domains via an IR→IR freeze/thaw transform + a backend-independent snapshot codec (§21).** A domain is quiesced and serialized to `(window image + per-page prots, in-window shadow control state, host-side handle table)` and restored to bytewise-equivalent execution across recompiles/backends/hosts. The freeze/thaw transform (`svm-durable`) is pure IR — *no new instruction* (state word + per-fiber shadow stack in the window; unwind spills the live set, rewind `br_table`s on a resume id); the snapshot codec (`svm-snapshot`) is a canonical versioned-TLV container bound to the instrumented-module digest (restore refuses on mismatch). Both are tooling-tier, **+0 escape-TCB**. | Settled (built — single + multi-vCPU freeze/thaw on both backends, snapshot v4) | Durability falls out of total IR (D34), the out-of-band control stack (D5), and block-local-SSA liveness (D1) with no escape-TCB cost; the artifact's recompile-survival is the durability boundary. Full design + phase tracker in `DURABILITY.md` |
+| D60 | **Durable domains via an IR→IR freeze/thaw transform + a backend-independent snapshot codec (§21).** A domain is quiesced and serialized to `(window image + per-page prots, in-window shadow control state, host-side handle table)` and restored to bytewise-equivalent execution across recompiles/backends/hosts. The freeze/thaw transform (`temen-durable`) is pure IR — *no new instruction* (state word + per-fiber shadow stack in the window; unwind spills the live set, rewind `br_table`s on a resume id); the snapshot codec (`temen-snapshot`) is a canonical versioned-TLV container bound to the instrumented-module digest (restore refuses on mismatch). Both are tooling-tier, **+0 escape-TCB**. | Settled (built — single + multi-vCPU freeze/thaw on both backends, snapshot v4) | Durability falls out of total IR (D34), the out-of-band control stack (D5), and block-local-SSA liveness (D1) with no escape-TCB cost; the artifact's recompile-survival is the durability boundary. Full design + phase tracker in `DURABILITY.md` |
 | D61 | **Guard-relying base-hoist elision to claw back trap-confinement's load-dense-loop cost (§4).** Hoist one check+clamp of a loop-invariant unbounded base into the preheader, then elide the per-access check+clamp for accesses of proven reach `B`. Architecturally sound with the existing guard; the risk is the **speculative overshoot** `base_clamped + off_i ∈ [0, reserved + B)`, which binds the JIT elision analysis to the allocator by the invariant **`trusted_reach ≤ guard_size`** (a wrong bound = *speculative* escape). Blocker found: `mem.rs` reserves only **one** trailing guard page, capping safe reach at 4 KiB (Scope A, zero allocator change — captures the C stack-locals case) unless the guard is enlarged (Scope B — captures `dot`/`matmult`/`cache`, changes escape-TCB allocation). | **Proposed — design only; no escape-TCB code until the invariant is signed off** | The one measured trap-confinement regression is load-dense loops over an unbounded base (§1a `matmult +5%`, `cache +6.7%`); this is the staged wasm32-style guard-relying win (§4), deferred not on value but because its speculative-overshoot correctness turns on a coupled security-hinge invariant with no expert reviewer (§18). Verification: escape oracle (architectural) + a new `trusted_reach ≤ guard_size` fuzz probe (speculative) |
-| D62 | **Bulk-memory IR ops (`mem.copy`/`mem.move`/`mem.fill`) confined once per span, not per byte (§4).** New no-result ops lower `llvm.memcpy`/`memmove`/`memset` to a *single* whole-span range check (`[ptr, ptr+len) ⊆ [0, reserved)`, computed overflow-free via the `len > reserved` sub-check that guards the `reserved − len` subtraction, gated by `len != 0`) plus a base Spectre-clamp, then the platform `memcpy`/`memmove`/`memset` **libcall** (Cranelift `call_memcpy`/…, resolved by the JIT's `default_libcall_names`). Replaces svm-llvm's old lowering — a per-8-byte-chunk *masked* load/store unroll (≤ 4 KiB) or a byte-at-a-time `__svm_memcpy`/`memset`/`memmove` helper (larger/variable) — which paid one confinement check per chunk/byte. The tree-walk interpreter (the differential oracle) mirrors it with a scalar checked span copy/fill (overlap-safe snapshot); the **bytecode interpreter** takes a fast path — the same whole-span confinement + prot scan, then a single bulk `Region::copy_within`/`fill` (`memmove`/`memset` on the backing) instead of the scalar loop, under the same single-threaded-cooperative contract as its `read_word`/`write_word` — leaving the tree-walker as the independent scalar reference. **The wasm on-ramp also lowers `memory.copy`→`MemMove`/`memory.fill`→`MemFill`** (previously a per-chunk masked unroll ≤ 64 KiB / a scalar byte loop), so wasm-sourced bulk ops now take the same fast path as the LLVM on-ramp. **`table.copy` also lowers to `MemMove`** (`count*4` bytes — the table is window memory, so it is a guest span like `memory.copy`); only `memory.init`/`table.init` keep their const-store unroll, because their source is compile-time **host data** (data-segment bytes / element indices), not a guest span a `memmove` could copy. **A per-span guard-read probe (`probe_span`, ISSUES.md I21) closes the `mapped` vs `reserved` gap:** the range check bounds against `reserved`, but the interpreter faults on any byte past the *backed* `mapped` extent — so before each libcall the JIT reads the span's last byte through the guard (faulting up front, honoring guest `grow`, and independent of libc's `dst == src` short-circuit), making the JIT byte-identical to the interpreters on faulting bulk ops too (no partial write, no lost trap). | **Settled (built — svm-ir/verify/interp/bytecode/encode/text/peval/jit/llvm/wasm; bytecode interp + wasm on-ramp on the fast path, tree-walker the scalar oracle; `svm-mem` `Region::fill`/`copy_within` bulk primitives; `memcpy` helper retained only for realloc/snprintf/`__vm_fmt`; JIT `probe_span` per I21)** | Isolated as the dominant array-copy gap to Wasmtime-w64 (`confine` harness: the faithful `matmul_eb` kernel's memcpy was the whole difference from parity `matmul`); the bulk primitive is the `memory.copy`-class lowering Wasmtime uses — same confinement guarantee (whole span proven in-bounds before any access), checked once. Same "as secure as wasm" speculative posture as a bounds-checked `memory.copy` (§1a): the length is checked, the base clamped, the copy a non-speculated libcall — so no per-byte clamp. Measured: `matmul_eb` svm÷wt64 **1.264→1.202** (control `matmul` flat), all 19 embench kernels `verify=1`. Verification: a JIT↔both-interpreters differential (`svm-jit/tests/bulk_mem.rs` — fill/copy, overlapping move, zero-length-wild-pointer no-op, OOB + oversized-length fault) + the span-OOB-formula fuzz probe in `fuzz/mask` (JIT formula vs a `u128` oracle) |
-| D64 | **On-ramp SIMD target: compile guest C for a rich-128-bit profile (`-march=x86-64-v3 -mprefer-vector-width=128` on x86; NEON on ARM), not the `x86-64` baseline.** The LLVM on-ramp consumes **host** LP64 bitcode, so — unlike wasm, which is capped at the portable `simd128` op set for portability — svm-jit can target the *actual* CPU's richer 128-bit SIMD. The `x86-64` baseline (SSE2) is **poorer** than `simd128` (no `i32x4.mul`/`pmulld`, no wide widening muls), which under-vectorized guest code and made svm-jit look behind on array kernels; `x86-64-v3` (AVX2 — universal on x86 since ~2013) gives LLVM the ops `simd128` has, and `-mprefer-vector-width=128` keeps LLVM at 128-bit so **Cranelift never has to split a 256/512-bit vector** (it has no YMM/ZMM register class — D58). This is the axis where the host on-ramp *should* beat wasm (§1a's 64-bit/host-native advantage); the two frontend flags realize it. **+0 escape-TCB:** richer auto-vectorization only emits more **value-only** `v128` ops (verifier re-checks; D58); the confinement path is untouched. Cranelift still feature-detects the running CPU, so `x86-64-v3` bitcode **runs and verifies on any x64 host** (a rarer non-AVX2 host lowers the 128-bit ops via baseline encodings — correct, just slower). Also landed alongside: **fuse `sext(narrow load)` → a signed load** (`movsx (mem)` instead of `movzx`+register `movsx`) in svm-llvm's §3b load discipline — a correct scalar-signed-`short`/`char` win, +0 escape-TCB. | Settled (built — `bench/confine` svm lane + `embench` svm build on the target; signed-load fusion in svm-llvm) | The `confine` "parity/faster" reads (D63) were partly an artifact of the harness building the **wasm lanes without `-msimd128`** — comparing svm-jit-vectorized against Wasmtime-*scalar*. With SIMD on both sides the honest gap appeared (matmul 1.42×, edn 1.37×). Root-caused via A/B: the svm lane was under-targeting (SSE2), not a backend-codegen deficit — retargeting to `x86-64-v3` (128-wide) flips the vectorizable kernels to **parity-or-faster** (matmul 1.42→**0.91×**, matmul_eb 1.15→**1.04×**, fir 0.56→0.38×) and pulls the **embench geomean ahead of Wasmtime-w64 for the first time: svm-jit 1.96× vs wt64 2.00×** (was 2.12× vs 2.04×), all 19 kernels still `verify=1`. **Residual — `edn` stays ~1.43× at every frontend target** (not vectorization-availability): its codegen is **534 lane insert/extract ops (`vpinsr`/`vpextr`) vs 40 real `vpmulld`** — svm-jit lowers vector **integer width-conversions** (`<8×i16>`→`<8×i32>`→i64, edn's short→int→long DSP) by exploding to scalar lanes + repacking (`vec_explode`/`vec_implode`) instead of native SIMD widen/narrow (`vpmovsxwd`/`vpackssdw`). **Native widen/narrow landed (D65a) — but it revised this diagnosis.** Wiring the on-ramp's full-128 `sext`/`zext`→`swiden`/`uwiden` and 256→128 wrapping `trunc`→byte-`shuffle` cut edn's lane insert/extract ops **93% (563→39)** yet moved wall-clock only **~1.8% (svm÷wt64 1.478→1.452, clean same-machine A/B)** — so the scalarized width-conversions were **not** edn's dominant cost. **Per-kernel profiling (D65b) then root-caused the residual:** edn's gap is concentrated in the **dot-product MAC kernels** (`fir` 14.3×, `fir_no_red_ld` 8.0×, `mac` 8.0× svm÷native — ~75% of svm's edn time; the scalar/recursive kernels `latsynth`/`iir1`/`jpegdct` are 2–4×, i.e. fine). Their `long sum += (short)a*(short)b` vectorizes at **VF=2** (a `<2×i64>` accumulator — forced by the 128-bit cap on the `i64` accumulate), and svm **scalarizes the whole 2-lane sub-128 chain**: per-element `movswq` widening loads + `vpinsr` lane packs + shuffles (fir: 18 scalar-widen + 14 `vpinsr` + 14 shuffle + 48 `movq`) where native uses 4 `vpmovsxwq` + 2 `vpmuldq`. **The widening multiply is *not* the lever** (A/B-validated: replacing the `vpmullq` `mul <2×i64>` with a cheap `add` moved `fir` only ~6%, 5275→4938 ns — so `VExtMul` recognition was not built). The real cost is the pervasive **2-lane widening-load/pack scalarization**; closing it needs native sub-128 2-lane widen loads (`<2×i16>`→`<2×i64>` via one `pmovsxwq`), the fiddly packed-representation case D65a deliberately skipped, for an uncertain partial win — deferred. Native widen/narrow is kept as the **correct** lowering (matches wasm's `i32x4.extend_*`, +0 escape-TCB, smaller codegen) with a modest win, not the parity-closer this row implied. Caveat: baking a target into bitcode trades that artifact's portability (AVX2-compiled bitcode assumes AVX2) — wasm's portability/perf tradeoff, inverted in our favor for a JIT-per-host system (compile for the deployment baseline, or per-host). |
+| D62 | **Bulk-memory IR ops (`mem.copy`/`mem.move`/`mem.fill`) confined once per span, not per byte (§4).** New no-result ops lower `llvm.memcpy`/`memmove`/`memset` to a *single* whole-span range check (`[ptr, ptr+len) ⊆ [0, reserved)`, computed overflow-free via the `len > reserved` sub-check that guards the `reserved − len` subtraction, gated by `len != 0`) plus a base Spectre-clamp, then the platform `memcpy`/`memmove`/`memset` **libcall** (Cranelift `call_memcpy`/…, resolved by the JIT's `default_libcall_names`). Replaces temen-llvm's old lowering — a per-8-byte-chunk *masked* load/store unroll (≤ 4 KiB) or a byte-at-a-time `__temen_memcpy`/`memset`/`memmove` helper (larger/variable) — which paid one confinement check per chunk/byte. The tree-walk interpreter (the differential oracle) mirrors it with a scalar checked span copy/fill (overlap-safe snapshot); the **bytecode interpreter** takes a fast path — the same whole-span confinement + prot scan, then a single bulk `Region::copy_within`/`fill` (`memmove`/`memset` on the backing) instead of the scalar loop, under the same single-threaded-cooperative contract as its `read_word`/`write_word` — leaving the tree-walker as the independent scalar reference. **The wasm on-ramp also lowers `memory.copy`→`MemMove`/`memory.fill`→`MemFill`** (previously a per-chunk masked unroll ≤ 64 KiB / a scalar byte loop), so wasm-sourced bulk ops now take the same fast path as the LLVM on-ramp. **`table.copy` also lowers to `MemMove`** (`count*4` bytes — the table is window memory, so it is a guest span like `memory.copy`); only `memory.init`/`table.init` keep their const-store unroll, because their source is compile-time **host data** (data-segment bytes / element indices), not a guest span a `memmove` could copy. **A per-span guard-read probe (`probe_span`, ISSUES.md I21) closes the `mapped` vs `reserved` gap:** the range check bounds against `reserved`, but the interpreter faults on any byte past the *backed* `mapped` extent — so before each libcall the JIT reads the span's last byte through the guard (faulting up front, honoring guest `grow`, and independent of libc's `dst == src` short-circuit), making the JIT byte-identical to the interpreters on faulting bulk ops too (no partial write, no lost trap). | **Settled (built — temen-ir/verify/interp/bytecode/encode/text/peval/jit/llvm/wasm; bytecode interp + wasm on-ramp on the fast path, tree-walker the scalar oracle; `temen-mem` `Region::fill`/`copy_within` bulk primitives; `memcpy` helper retained only for realloc/snprintf/`__vm_fmt`; JIT `probe_span` per I21)** | Isolated as the dominant array-copy gap to Wasmtime-w64 (`confine` harness: the faithful `matmul_eb` kernel's memcpy was the whole difference from parity `matmul`); the bulk primitive is the `memory.copy`-class lowering Wasmtime uses — same confinement guarantee (whole span proven in-bounds before any access), checked once. Same "as secure as wasm" speculative posture as a bounds-checked `memory.copy` (§1a): the length is checked, the base clamped, the copy a non-speculated libcall — so no per-byte clamp. Measured: `matmul_eb` temen÷wt64 **1.264→1.202** (control `matmul` flat), all 19 embench kernels `verify=1`. Verification: a JIT↔both-interpreters differential (`temen-jit/tests/bulk_mem.rs` — fill/copy, overlapping move, zero-length-wild-pointer no-op, OOB + oversized-length fault) + the span-OOB-formula fuzz probe in `fuzz/mask` (JIT formula vs a `u128` oracle) |
+| D64 | **On-ramp SIMD target: compile guest C for a rich-128-bit profile (`-march=x86-64-v3 -mprefer-vector-width=128` on x86; NEON on ARM), not the `x86-64` baseline.** The LLVM on-ramp consumes **host** LP64 bitcode, so — unlike wasm, which is capped at the portable `simd128` op set for portability — temen-jit can target the *actual* CPU's richer 128-bit SIMD. The `x86-64` baseline (SSE2) is **poorer** than `simd128` (no `i32x4.mul`/`pmulld`, no wide widening muls), which under-vectorized guest code and made temen-jit look behind on array kernels; `x86-64-v3` (AVX2 — universal on x86 since ~2013) gives LLVM the ops `simd128` has, and `-mprefer-vector-width=128` keeps LLVM at 128-bit so **Cranelift never has to split a 256/512-bit vector** (it has no YMM/ZMM register class — D58). This is the axis where the host on-ramp *should* beat wasm (§1a's 64-bit/host-native advantage); the two frontend flags realize it. **+0 escape-TCB:** richer auto-vectorization only emits more **value-only** `v128` ops (verifier re-checks; D58); the confinement path is untouched. Cranelift still feature-detects the running CPU, so `x86-64-v3` bitcode **runs and verifies on any x64 host** (a rarer non-AVX2 host lowers the 128-bit ops via baseline encodings — correct, just slower). Also landed alongside: **fuse `sext(narrow load)` → a signed load** (`movsx (mem)` instead of `movzx`+register `movsx`) in temen-llvm's §3b load discipline — a correct scalar-signed-`short`/`char` win, +0 escape-TCB. | Settled (built — `bench/confine` temen lane + `embench` temen build on the target; signed-load fusion in temen-llvm) | The `confine` "parity/faster" reads (D63) were partly an artifact of the harness building the **wasm lanes without `-msimd128`** — comparing temen-jit-vectorized against Wasmtime-*scalar*. With SIMD on both sides the honest gap appeared (matmul 1.42×, edn 1.37×). Root-caused via A/B: the temen lane was under-targeting (SSE2), not a backend-codegen deficit — retargeting to `x86-64-v3` (128-wide) flips the vectorizable kernels to **parity-or-faster** (matmul 1.42→**0.91×**, matmul_eb 1.15→**1.04×**, fir 0.56→0.38×) and pulls the **embench geomean ahead of Wasmtime-w64 for the first time: temen-jit 1.96× vs wt64 2.00×** (was 2.12× vs 2.04×), all 19 kernels still `verify=1`. **Residual — `edn` stays ~1.43× at every frontend target** (not vectorization-availability): its codegen is **534 lane insert/extract ops (`vpinsr`/`vpextr`) vs 40 real `vpmulld`** — temen-jit lowers vector **integer width-conversions** (`<8×i16>`→`<8×i32>`→i64, edn's short→int→long DSP) by exploding to scalar lanes + repacking (`vec_explode`/`vec_implode`) instead of native SIMD widen/narrow (`vpmovsxwd`/`vpackssdw`). **Native widen/narrow landed (D65a) — but it revised this diagnosis.** Wiring the on-ramp's full-128 `sext`/`zext`→`swiden`/`uwiden` and 256→128 wrapping `trunc`→byte-`shuffle` cut edn's lane insert/extract ops **93% (563→39)** yet moved wall-clock only **~1.8% (temen÷wt64 1.478→1.452, clean same-machine A/B)** — so the scalarized width-conversions were **not** edn's dominant cost. **Per-kernel profiling (D65b) then root-caused the residual:** edn's gap is concentrated in the **dot-product MAC kernels** (`fir` 14.3×, `fir_no_red_ld` 8.0×, `mac` 8.0× temen÷native — ~75% of temen's edn time; the scalar/recursive kernels `latsynth`/`iir1`/`jpegdct` are 2–4×, i.e. fine). Their `long sum += (short)a*(short)b` vectorizes at **VF=2** (a `<2×i64>` accumulator — forced by the 128-bit cap on the `i64` accumulate), and temen **scalarizes the whole 2-lane sub-128 chain**: per-element `movswq` widening loads + `vpinsr` lane packs + shuffles (fir: 18 scalar-widen + 14 `vpinsr` + 14 shuffle + 48 `movq`) where native uses 4 `vpmovsxwq` + 2 `vpmuldq`. **The widening multiply is *not* the lever** (A/B-validated: replacing the `vpmullq` `mul <2×i64>` with a cheap `add` moved `fir` only ~6%, 5275→4938 ns — so `VExtMul` recognition was not built). The real cost is the pervasive **2-lane widening-load/pack scalarization**; closing it needs native sub-128 2-lane widen loads (`<2×i16>`→`<2×i64>` via one `pmovsxwq`), the fiddly packed-representation case D65a deliberately skipped, for an uncertain partial win — deferred. Native widen/narrow is kept as the **correct** lowering (matches wasm's `i32x4.extend_*`, +0 escape-TCB, smaller codegen) with a modest win, not the parity-closer this row implied. Caveat: baking a target into bitcode trades that artifact's portability (AVX2-compiled bitcode assumes AVX2) — wasm's portability/perf tradeoff, inverted in our favor for a JIT-per-host system (compile for the deployment baseline, or per-host). |
 | D63 | **Branchless per-access confinement (`select_spectre_guard`), superseding D38's `trapnz` + AND clamp — uniform for top-level *and* §14 nested windows.** A non-elided access lowers to `cmp; select_spectre_guard(oob, guard_offset, sub_base + addr+offset); load` — an out-of-bounds address is redirected (branchlessly, via cmov) to `guard_offset = round_up(win_reserved, page)`, the offset of the enclosing window's trailing guard page, so the access itself faults there (`MemoryFault`). Same architectural fault and same clear-fault-at-the-offending-access property as D38; same Spectre-v1 confinement (`select_spectre_guard` is a speculation barrier — a misspeculated OOB access also lands on the guard), via the **identical Cranelift primitive Wasmtime uses**. A **nested** sub-window redirects to the *parent's* guard (its own slice has committed parent memory on both sides, so redirecting to the child's `reserved` could alias the parent — a child→parent escape); redirecting the whole physical offset past `+ sub_base` lands an out-of-child access on the parent guard, never in the parent. In-process nesting is defense-in-depth, not a promised Spectre boundary (§2a). | Settled (supersedes D38's per-access shape; D38's escape-oracle contract unchanged) | The A/B (`confine` harness) refuted D38's "1-op AND beats Wasmtime's cmp→cmov" claim: the 40-bit reservation mask is not an x86 immediate, so the AND was a **RIP-relative load per access**, and the `trapnz` added a per-access **branch** — together ~1.06×/1.34× behind Wasmtime-w64 on `matmul`/`matmul_eb`. Branchless cmov-to-guard hoists the guard offset into a register and removes the branch, reaching **0.94×/0.97×** (parity/faster), with **nested windows on the same fast path** (no penalty). A `trapnz`-keeping cmov variant (clamp only) regressed (1.23×/1.55×) — the branch removal, not the cmov, is the win. **Guard target = `round_up(win_reserved, page)`, not `reserved`**: a sub-page window commits its prefix page-granularly, so only the page-aligned offset is `PROT_NONE` (caught by the escape oracle). Verification: OOB→`MemoryFault` + sub-window escape oracle (out-of-child faults, parent untouched) + `fuzz/mask` (the OOB predicate is unchanged) + escape oracle (§18) |
-| D65 | **The `rustbench` call-heavy gap to Wasmtime-w64 (`parse`/`bfs`, ~1.22× svm÷wt64) is diffuse — no single lever — after two hypotheses were measured and *rejected*.** On the six real-program `rustbench` workloads, svm-jit is **at parity-or-faster than wt64 on four** (hashmap 0.94×, vm 0.93×, sort 0.82×, base64 0.86×) and trails only on the two most **call/recursion-dense** (`parse` 14 call sites, `bfs` 13; the gap tracks call count). Two cheap env-gated A/Bs (throwaway, reverted) tested the obvious causes: **(1) the threaded-context ABI** — svm's natural CLIF ABI threads `(mem_base, fn_table_base, trap_out, stack_limit)` as explicit args through every call (vs Wasmtime's single pinned `vmctx` register), so a vmctx consolidation was the candidate fix. *Rejected*: doubling the threaded context to 8 args (`SVM_JIT_EXTRA_CTX`, verified in CLIF — 10-arg sigs, extras spilling to stack) produced **no systematic slowdown** on the call-heavy workloads (parse/bfs flat-to-faster, sign inconsistent = register-allocation noise), so arg marshalling is not the cost and a vmctx rewrite of the JIT ABI would not pay off. **(2) the per-entry checks** — svm emits `emit_epoch_check` (kill-poll) + `emit_stack_check` (`get_stack_pointer`+cmp+branch software stack guard) at every function entry, which wasm gets free via guard pages. *Minor*: skipping them (`SVM_JIT_SKIP_ENTRY_CHECKS`, measurement-only, drops a safety guard) recovered only **~6% on `parse`** (deepest recursion), ~3% on `vm`, and **~0% on `bfs`** — against a ±2% noise floor, a small diffuse cost, not the ~22% gap. | Settled (investigated; both fixes rejected on measurement — do not re-run without a new hypothesis) | The value is the **two negative results**: they cheaply pre-empted a risky JIT-ABI rewrite (vmctx) and a guard-disabling change, each of which measurement showed would deliver little. The residual gap is a handful of small per-call overheads (entry checks, call/ret, sp-threading) with no single dominant term — so per the prime directive (don't optimize the trusted core without a concrete measured win) the perf dig stops here. svm-jit is already "as fast as wasm" on real programs where it counts (4/6 workloads ahead). Method: `bench/rustbench` svm-jit ×native A/B under the two env flags; correctness cross-check stayed green throughout (the ABI perturbation was sound). |
+| D65 | **The `rustbench` call-heavy gap to Wasmtime-w64 (`parse`/`bfs`, ~1.22× temen÷wt64) is diffuse — no single lever — after two hypotheses were measured and *rejected*.** On the six real-program `rustbench` workloads, temen-jit is **at parity-or-faster than wt64 on four** (hashmap 0.94×, vm 0.93×, sort 0.82×, base64 0.86×) and trails only on the two most **call/recursion-dense** (`parse` 14 call sites, `bfs` 13; the gap tracks call count). Two cheap env-gated A/Bs (throwaway, reverted) tested the obvious causes: **(1) the threaded-context ABI** — temen's natural CLIF ABI threads `(mem_base, fn_table_base, trap_out, stack_limit)` as explicit args through every call (vs Wasmtime's single pinned `vmctx` register), so a vmctx consolidation was the candidate fix. *Rejected*: doubling the threaded context to 8 args (`TEMEN_JIT_EXTRA_CTX`, verified in CLIF — 10-arg sigs, extras spilling to stack) produced **no systematic slowdown** on the call-heavy workloads (parse/bfs flat-to-faster, sign inconsistent = register-allocation noise), so arg marshalling is not the cost and a vmctx rewrite of the JIT ABI would not pay off. **(2) the per-entry checks** — temen emits `emit_epoch_check` (kill-poll) + `emit_stack_check` (`get_stack_pointer`+cmp+branch software stack guard) at every function entry, which wasm gets free via guard pages. *Minor*: skipping them (`TEMEN_JIT_SKIP_ENTRY_CHECKS`, measurement-only, drops a safety guard) recovered only **~6% on `parse`** (deepest recursion), ~3% on `vm`, and **~0% on `bfs`** — against a ±2% noise floor, a small diffuse cost, not the ~22% gap. | Settled (investigated; both fixes rejected on measurement — do not re-run without a new hypothesis) | The value is the **two negative results**: they cheaply pre-empted a risky JIT-ABI rewrite (vmctx) and a guard-disabling change, each of which measurement showed would deliver little. The residual gap is a handful of small per-call overheads (entry checks, call/ret, sp-threading) with no single dominant term — so per the prime directive (don't optimize the trusted core without a concrete measured win) the perf dig stops here. temen-jit is already "as fast as wasm" on real programs where it counts (4/6 workloads ahead). Method: `bench/rustbench` temen-jit ×native A/B under the two env flags; correctness cross-check stayed green throughout (the ABI perturbation was sound). |

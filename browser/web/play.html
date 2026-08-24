@@ -9,7 +9,7 @@
     <script>
       (function () {
         try {
-          var pref = localStorage.getItem('svm-play:theme') || 'auto';
+          var pref = localStorage.getItem('temen-play:theme') || 'auto';
           var dark = pref === 'dark' || (pref === 'auto' && matchMedia('(prefers-color-scheme: dark)').matches);
           document.documentElement.dataset.theme = dark ? 'dark' : 'light';
         } catch (e) {
@@ -23,7 +23,7 @@
          already sets the headers). Sibling to this file, so its SW scope covers everything under web/;
          the same-origin wasm under target/ loads without CORP (COEP exempts same-origin). -->
     <script src="coi-serviceworker.js"></script>
-    <title>SVM playground</title>
+    <title>Temen playground</title>
     <style>
       :root {
         --bg: #ffffff; --fg: #1a1d21; --muted: #5c6673; --faint: #8a94a3;
@@ -146,7 +146,7 @@
       .CodeMirror.cm-readonly { opacity: 0.82; }
       .CodeMirror.cm-readonly .CodeMirror-cursor { display: none; }
       /* Parse/verify error decoration: a gutter dot, a highlighted line, and an inline message. */
-      .svm-error-gutter { width: 0.8rem; }
+      .temt-error-gutter { width: 0.8rem; }
       .cm-error-marker { color: #d1242f; cursor: help; }
       .cm-error-line { background: #fbe9eb; }
       /* Debugger: the breakpoint gutter + dot, and the paused source line (DAP panel). */
@@ -192,8 +192,8 @@
   </head>
   <body>
     <header class="top">
-      <h1>SVM playground</h1>
-      <p>SVM text across real Web Workers, and real C/C++ guests (Lua, SQLite, Postgres, DOOM) via the LLVM on-ramp — all client-side, in the sandbox.</p>
+      <h1>Temen playground</h1>
+      <p>Temen text across real Web Workers, and real C/C++ guests (Lua, SQLite, Postgres, DOOM) via the LLVM on-ramp — all client-side, in the sandbox.</p>
     </header>
     <div class="layout">
       <nav class="sidebar" aria-label="Demos">

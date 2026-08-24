@@ -1,18 +1,18 @@
 // Differential check: the wasm exports vs the native bytecode engine, over the corpus emitted by
 // `gencorpus`. Usage: node corpus.mjs <module.wasm>  (run gencorpus first).
 //
-// I/O crosses the boundary through the alloc ABI: the host `svm_alloc`s a buffer, writes the module
-// (and stdin), passes the `(ptr, len)` in, reads any captured streams, then `svm_dealloc`s — no
+// I/O crosses the boundary through the alloc ABI: the host `temen_alloc`s a buffer, writes the module
+// (and stdin), passes the `(ptr, len)` in, reads any captured streams, then `temen_dealloc`s — no
 // fixed scratch buffer, so module/stream sizes are unbounded (see the megabyte echo at the end).
 import { readFileSync } from 'node:fs';
 import { engineImports } from './engine-imports.mjs';
 
-const wasmPath = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/svm_browser.wasm';
+const wasmPath = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/temen_browser.wasm';
 const corpus = JSON.parse(readFileSync('corpus.json', 'utf8'));
 
 const mod = await WebAssembly.compile(readFileSync(wasmPath));
 const ex = (await WebAssembly.instantiate(mod, engineImports())).exports;
-const is64 = ex.svm_abi_is64() === 1;
+const is64 = ex.temen_abi_is64() === 1;
 const N = (x) => (is64 ? BigInt(x) : Number(x)); // usize ABI value
 const mem = () => new Uint8Array(ex.memory.buffer); // re-fetch (memory may grow under us)
 const hex = (u8) => Array.from(u8, (b) => b.toString(16).padStart(2, '0')).join('');
@@ -23,10 +23,10 @@ console.log(`module: ${wasmPath} (${is64 ? 'wasm64' : 'wasm32'})  imports:`,
 // Allocate `bytes.length` in linear memory, copy `bytes` in, return a handle (empty → null/0).
 const load = (bytes) => {
   if (bytes.length === 0) return { ptr: N(0), len: N(0), free() {} };
-  const ptr = ex.svm_alloc(N(bytes.length));
+  const ptr = ex.temen_alloc(N(bytes.length));
   mem().set(bytes, Number(ptr));
   const len = N(bytes.length);
-  return { ptr, len, free: () => ex.svm_dealloc(ptr, len) };
+  return { ptr, len, free: () => ex.temen_dealloc(ptr, len) };
 };
 const readOut = (ptrFn, lenFn) => {
   const ptr = Number(ptrFn()), len = Number(lenFn());
@@ -35,15 +35,15 @@ const readOut = (ptrFn, lenFn) => {
 
 let total = 0, fail = 0;
 
-// ---- compute / fiber corpora: svm_run / svm_run0 vs native ----------------------------------
+// ---- compute / fiber corpora: temen_run / temen_run0 vs native ----------------------------------
 // Fibers (§12 cont.*) need no powerbox, so they run on the same plain entries as compute.
 const runComputeLike = (list) => {
   for (const { name, file, nargs, cases } of list) {
     let bad = 0;
     for (const { arg, status, value } of cases) {
       const m = load(readFileSync(file)); // re-load each case (the engine may dirty the window)
-      const got = nargs === 0 ? ex.svm_run0(m.ptr, m.len) : ex.svm_run(m.ptr, m.len, BigInt(arg));
-      const gotStatus = ex.svm_status();
+      const got = nargs === 0 ? ex.temen_run0(m.ptr, m.len) : ex.temen_run(m.ptr, m.len, BigInt(arg));
+      const gotStatus = ex.temen_status();
       m.free();
       const okStatus = gotStatus === status;
       const okValue = status !== 0 || BigInt(got) === BigInt(value); // value only meaningful when OK
@@ -63,15 +63,15 @@ runComputeLike(corpus.float ?? []); // scalar f32/f64 — bit-exact (NaN payload
 runComputeLike(corpus.tailcall ?? []);
 runComputeLike(corpus.simd ?? []);
 
-// ---- powerbox corpus: svm_run_pb (streams/clock/exit) vs native -----------------------------
+// ---- powerbox corpus: temen_run_pb (streams/clock/exit) vs native -----------------------------
 for (const c of corpus.powerbox ?? []) {
   const m = load(readFileSync(c.file));
   const stdin = load(fromHex(c.stdin));
-  const got = ex.svm_run_pb(m.ptr, m.len, stdin.ptr, stdin.len);
-  const gotStatus = ex.svm_status();
-  const gotOut = hex(readOut(ex.svm_stdout_ptr, ex.svm_stdout_len));
-  const gotErr = hex(readOut(ex.svm_stderr_ptr, ex.svm_stderr_len));
-  const gotExit = ex.svm_exit_code();
+  const got = ex.temen_run_pb(m.ptr, m.len, stdin.ptr, stdin.len);
+  const gotStatus = ex.temen_status();
+  const gotOut = hex(readOut(ex.temen_stdout_ptr, ex.temen_stdout_len));
+  const gotErr = hex(readOut(ex.temen_stderr_ptr, ex.temen_stderr_len));
+  const gotExit = ex.temen_exit_code();
   m.free(); stdin.free();
   const okStatus = gotStatus === c.status;
   const okValue = c.status !== 0 || BigInt(got) === BigInt(c.value);
@@ -92,14 +92,14 @@ for (const c of corpus.powerbox ?? []) {
   }
 }
 
-// ---- capture / gc-roots corpora: svm_run_capture (final memory image) vs native -------------
+// ---- capture / gc-roots corpora: temen_run_capture (final memory image) vs native -------------
 const runCaptureLike = (list, kind) => {
   for (const c of list) {
     const m = load(readFileSync(c.file));
     const init = load(fromHex(c.init));
-    const got = ex.svm_run_capture(m.ptr, m.len, init.ptr, init.len, BigInt(c.arg));
-    const gotStatus = ex.svm_status();
-    const gotSnap = hex(readOut(ex.svm_snapshot_ptr, ex.svm_snapshot_len));
+    const got = ex.temen_run_capture(m.ptr, m.len, init.ptr, init.len, BigInt(c.arg));
+    const gotStatus = ex.temen_status();
+    const gotSnap = hex(readOut(ex.temen_snapshot_ptr, ex.temen_snapshot_len));
     m.free(); init.free();
     const okStatus = gotStatus === c.status;
     const okValue = c.status !== 0 || BigInt(got) === BigInt(c.value);
@@ -119,13 +119,13 @@ const runCaptureLike = (list, kind) => {
 runCaptureLike(corpus.capture ?? [], 'capture');
 runCaptureLike(corpus.gcroots ?? [], 'gc');
 
-// ---- reflection corpus: svm_run_reflect (§7 cap.self.* over a fixed 3-cap powerbox) ---------
+// ---- reflection corpus: temen_run_reflect (§7 cap.self.* over a fixed 3-cap powerbox) ---------
 for (const { name, file, cases } of corpus.reflect ?? []) {
   let bad = 0;
   for (const { arg, status, value } of cases) {
     const m = load(readFileSync(file));
-    const got = ex.svm_run_reflect(m.ptr, m.len, BigInt(arg));
-    const gotStatus = ex.svm_status();
+    const got = ex.temen_run_reflect(m.ptr, m.len, BigInt(arg));
+    const gotStatus = ex.temen_status();
     m.free();
     const ok = gotStatus === status && (status !== 0 || BigInt(got) === BigInt(value));
     total++;
@@ -137,11 +137,11 @@ for (const { name, file, cases } of corpus.reflect ?? []) {
   console.log(`  ${name}: ${cases.length - bad}/${cases.length} match`);
 }
 
-// ---- nested-child corpus: svm_run_nested (§14 confined child domains) vs native -------------
+// ---- nested-child corpus: temen_run_nested (§14 confined child domains) vs native -------------
 for (const c of corpus.nested ?? []) {
   const m = load(readFileSync(c.file));
-  const got = ex.svm_run_nested(m.ptr, m.len);
-  const gotStatus = ex.svm_status();
+  const got = ex.temen_run_nested(m.ptr, m.len);
+  const gotStatus = ex.temen_status();
   m.free();
   const okStatus = gotStatus === c.status;
   const okValue = c.status !== 0 || BigInt(got) === BigInt(c.value);
@@ -156,11 +156,11 @@ for (const c of corpus.nested ?? []) {
   }
 }
 
-// ---- guest-JIT corpus: svm_run_jit (§22 install + cross-module call_indirect) vs native -----
+// ---- guest-JIT corpus: temen_run_jit (§22 install + cross-module call_indirect) vs native -----
 for (const c of corpus.jit ?? []) {
   const m = load(readFileSync(c.file));
-  const got = ex.svm_run_jit(m.ptr, m.len);
-  const gotStatus = ex.svm_status();
+  const got = ex.temen_run_jit(m.ptr, m.len);
+  const gotStatus = ex.temen_status();
   m.free();
   const ok = gotStatus === c.status && (c.status !== 0 || BigInt(got) === BigInt(c.value));
   total++;
@@ -173,11 +173,11 @@ for (const c of corpus.jit ?? []) {
   }
 }
 
-// ---- dynamic-linking corpus: svm_run_dynlink (§22 compile_linked symbol resolution) vs native
+// ---- dynamic-linking corpus: temen_run_dynlink (§22 compile_linked symbol resolution) vs native
 for (const c of corpus.dynlink ?? []) {
   const m = load(readFileSync(c.file));
-  const got = ex.svm_run_dynlink(m.ptr, m.len, c.link);
-  const gotStatus = ex.svm_status();
+  const got = ex.temen_run_dynlink(m.ptr, m.len, c.link);
+  const gotStatus = ex.temen_status();
   m.free();
   const ok = gotStatus === c.status && (c.status !== 0 || BigInt(got) === BigInt(c.value));
   total++;
@@ -191,11 +191,11 @@ for (const c of corpus.dynlink ?? []) {
   }
 }
 
-// ---- SharedRegion corpus: svm_run_region (§13 host-backed memory aliasing) vs native --------
+// ---- SharedRegion corpus: temen_run_region (§13 host-backed memory aliasing) vs native --------
 for (const c of corpus.region ?? []) {
   const m = load(readFileSync(c.file));
-  const got = ex.svm_run_region(m.ptr, m.len);
-  const gotStatus = ex.svm_status();
+  const got = ex.temen_run_region(m.ptr, m.len);
+  const gotStatus = ex.temen_status();
   m.free();
   const ok = gotStatus === c.status && (c.status !== 0 || BigInt(got) === BigInt(c.value));
   total++;
@@ -208,13 +208,13 @@ for (const c of corpus.region ?? []) {
   }
 }
 
-// ---- durability corpus: svm_run_durable (freeze/thaw, IR-driven) vs native -----------------
+// ---- durability corpus: temen_run_durable (freeze/thaw, IR-driven) vs native -----------------
 for (const c of corpus.durable ?? []) {
   const m = load(readFileSync(c.file));
   const win = load(fromHex(c.init));
-  const got = ex.svm_run_durable(m.ptr, m.len, win.ptr, win.len, BigInt(c.clock));
-  const gotStatus = ex.svm_status();
-  const gotSnap = hex(readOut(ex.svm_snapshot_ptr, ex.svm_snapshot_len));
+  const got = ex.temen_run_durable(m.ptr, m.len, win.ptr, win.len, BigInt(c.clock));
+  const gotStatus = ex.temen_status();
+  const gotSnap = hex(readOut(ex.temen_snapshot_ptr, ex.temen_snapshot_len));
   m.free(); win.free();
   const okStatus = gotStatus === c.status;
   const okValue = c.status !== 0 || BigInt(got) === BigInt(c.value);
@@ -237,16 +237,16 @@ for (const c of corpus.durable ?? []) {
   const SIZE = 2 << 20; // 2 MiB, double the retired fixed-buffer cap
   const input = new Uint8Array(SIZE);
   for (let i = 0; i < SIZE; i++) input[i] = (i * 2654435761) & 0xff; // cheap pseudo-random pattern
-  const m = load(readFileSync('corpus/bigecho.svmbc'));
+  const m = load(readFileSync('corpus/bigecho.temenc'));
   const stdin = load(input);
-  ex.svm_run_pb(m.ptr, m.len, stdin.ptr, stdin.len);
-  const gotStatus = ex.svm_status();
-  const out = readOut(ex.svm_stdout_ptr, ex.svm_stdout_len);
+  ex.temen_run_pb(m.ptr, m.len, stdin.ptr, stdin.len);
+  const gotStatus = ex.temen_status();
+  const out = readOut(ex.temen_stdout_ptr, ex.temen_stdout_len);
   m.free(); stdin.free();
   const ok = gotStatus === 0 && out.length === SIZE && Buffer.compare(out, input) === 0;
   total++; if (!ok) fail++;
   console.log(`  bigecho: ${ok ? 'match' : 'FAIL'} (${(SIZE / (1 << 20)).toFixed(0)} MiB echoed ` +
-    `through svm_alloc; status ${gotStatus}, out ${out.length}B)`);
+    `through temen_alloc; status ${gotStatus}, out ${out.length}B)`);
 }
 
 console.log(`\n${total - fail}/${total} cases match native  ${fail ? 'FAILED' : 'ALL MATCH'}`);

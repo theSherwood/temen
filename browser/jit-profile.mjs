@@ -1,44 +1,44 @@
 // End-to-end wall-clock profiler for a REAL guest on the single-shot module wasm-JIT (BROWSER.md
 // Step 0 follow-up). For each guest it breaks the JIT run into phases — EMIT (our Rust emitter:
-// decode+outline+IR→wasm, `svm_onramp_jit_run_open*`), V8 COMPILE (`WebAssembly.compile`), INSTANTIATE,
+// decode+outline+IR→wasm, `temen_onramp_jit_run_open*`), V8 COMPILE (`WebAssembly.compile`), INSTANTIATE,
 // and RUN (`f0` to completion) — and counts CROSS-TIER BOUNCES (`env.call_interp`, the wasm→interp
 // relay) plus the wall-time inside them. This tells us where a real guest's time actually goes, vs the
-// synthetic hot-loop kernels the earlier benches used. Also runs the interpreter (`svm_run_onramp`) for
+// synthetic hot-loop kernels the earlier benches used. Also runs the interpreter (`temen_run_onramp`) for
 // a total-time baseline + a stdout correctness anchor. Plain (non-shared) cdylib; Node/V8.
-//   node jit-profile.mjs [path/to/svm_browser.wasm]
+//   node jit-profile.mjs [path/to/temen_browser.wasm]
 import { readFileSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import { engineImports } from './engine-imports.mjs';
 
-const wasmPath = process.argv[2] || 'target/wasm32-unknown-unknown/release/svm_browser.wasm';
+const wasmPath = process.argv[2] || 'target/wasm32-unknown-unknown/release/temen_browser.wasm';
 const eng = (await WebAssembly.instantiate(await WebAssembly.compile(readFileSync(wasmPath)), engineImports())).exports;
 const memory = eng.memory;
 const u8 = () => new Uint8Array(memory.buffer);
 const dec = (p, n) => new TextDecoder().decode(u8().slice(p, p + n));
-const readStdout = () => dec(Number(eng.svm_stdout_ptr()), eng.svm_stdout_len());
-const alloc = (bytes) => { const p = Number(eng.svm_alloc(bytes.length)); u8().set(bytes, p); return p; };
+const readStdout = () => dec(Number(eng.temen_stdout_ptr()), eng.temen_stdout_len());
+const alloc = (bytes) => { const p = Number(eng.temen_alloc(bytes.length)); u8().set(bytes, p); return p; };
 
 function interpRun(bytes, stdinBytes) {
   const mp = alloc(bytes);
   let sp = 0; const sl = stdinBytes ? stdinBytes.length : 0;
   if (sl) sp = alloc(stdinBytes);
   const t = performance.now();
-  eng.svm_run_onramp(mp, bytes.length, sp, sl);
+  eng.temen_run_onramp(mp, bytes.length, sp, sl);
   const ms = performance.now() - t;
   const out = readStdout();
-  eng.svm_dealloc(mp, bytes.length); if (sp) eng.svm_dealloc(sp, sl);
+  eng.temen_dealloc(mp, bytes.length); if (sp) eng.temen_dealloc(sp, sl);
   return { ms, out };
 }
 
 // Drive an already-opened JIT run, timing each phase + counting bounces.
 async function jitDrive() {
-  const wptr = Number(eng.svm_onramp_jit_run_wasm_ptr());
-  const wlen = eng.svm_onramp_jit_run_wasm_len();
+  const wptr = Number(eng.temen_onramp_jit_run_wasm_ptr());
+  const wlen = eng.temen_onramp_jit_run_wasm_len();
   const emitted = u8().slice(wptr, wptr + wlen);
-  const win = Number(eng.svm_onramp_jit_run_win_ptr());
-  const envBytes = eng.svm_onramp_jit_run_env_bytes();
+  const win = Number(eng.temen_onramp_jit_run_win_ptr());
+  const envBytes = eng.temen_onramp_jit_run_env_bytes();
   const slots = [];
-  for (let i = 0, n = eng.svm_onramp_jit_run_slot_count(); i < n; i++) slots.push(eng.svm_onramp_jit_run_slot(i));
+  for (let i = 0, n = eng.temen_onramp_jit_run_slot_count(); i < n; i++) slots.push(eng.temen_onramp_jit_run_slot(i));
 
   const tC = performance.now();
   const module = await WebAssembly.compile(emitted);
@@ -53,7 +53,7 @@ async function jitDrive() {
       call_interp: (func, argsPtr) => {
         bounces++;
         const b = performance.now();
-        const r = eng.svm_onramp_jit_run_call_interp(func, argsPtr);
+        const r = eng.temen_onramp_jit_run_call_interp(func, argsPtr);
         bounceMs += performance.now() - b;
         if (r !== 0) throw new Error('cross-tier stop');
       },
@@ -61,18 +61,18 @@ async function jitDrive() {
   });
   const instMs = performance.now() - tI;
 
-  const env = Number(eng.svm_alloc(envBytes));
+  const env = Number(eng.temen_alloc(envBytes));
   new DataView(memory.buffer).setBigInt64(env, 1n << 60n, true);
   const tR = performance.now();
   try { instance.exports.f0(win, env, ...slots); } catch { /* exit/trap unwinds f0 */ }
   const runMs = performance.now() - tR;
-  eng.svm_dealloc(env, envBytes);
-  eng.svm_onramp_jit_run_finish();
-  eng.svm_onramp_jit_run_close();
+  eng.temen_dealloc(env, envBytes);
+  eng.temen_onramp_jit_run_finish();
+  eng.temen_onramp_jit_run_close();
   return { emittedBytes: wlen, compileMs, instMs, runMs, bounces, bounceMs, out: readStdout() };
 }
 
-// The interpreter baseline double-interprets (guest bytecode on the SVM interp), so it is
+// The interpreter baseline double-interprets (guest bytecode on the Temen interp), so it is
 // pathologically slow for a compute-heavy guest (minutes for fib+loops on QuickJS). Off by default —
 // the JIT phase breakdown is the deliverable; set INTERP=1 for the total-speedup + correctness anchor.
 const WANT_INTERP = process.env.INTERP === '1';
@@ -82,10 +82,10 @@ async function profileStdin(name, modBytes, stdinBytes) {
   const modP = alloc(modBytes);
   const stdinP = stdinBytes.length ? alloc(stdinBytes) : 0;
   const tE = performance.now();
-  const opened = eng.svm_onramp_jit_run_open(modP, modBytes.length, stdinP, stdinBytes.length, 0);
+  const opened = eng.temen_onramp_jit_run_open(modP, modBytes.length, stdinP, stdinBytes.length, 0);
   const emitMs = performance.now() - tE;
-  eng.svm_dealloc(modP, modBytes.length); if (stdinP) eng.svm_dealloc(stdinP, stdinBytes.length);
-  if (opened !== 0) { console.log(`${name}: _start not emittable (status ${eng.svm_status()}) — interp-only`); return; }
+  eng.temen_dealloc(modP, modBytes.length); if (stdinP) eng.temen_dealloc(stdinP, stdinBytes.length);
+  if (opened !== 0) { console.log(`${name}: _start not emittable (status ${eng.temen_status()}) — interp-only`); return; }
   const jit = await jitDrive();
   report(name, emitMs, jit, interp);
 }
@@ -97,10 +97,10 @@ async function profileCompile(name, modBytes, srcBytes) {
   const modP = alloc(modBytes);
   const srcP = alloc(srcBytes);
   const tE = performance.now();
-  const opened = eng.svm_onramp_jit_run_open_fs(modP, modBytes.length, 0, 0, srcP, srcBytes.length, 0);
+  const opened = eng.temen_onramp_jit_run_open_fs(modP, modBytes.length, 0, 0, srcP, srcBytes.length, 0);
   const emitMs = performance.now() - tE;
-  eng.svm_dealloc(modP, modBytes.length); eng.svm_dealloc(srcP, srcBytes.length);
-  if (opened !== 0) { console.log(`${name}: _start not emittable (status ${eng.svm_status()})`); return; }
+  eng.temen_dealloc(modP, modBytes.length); eng.temen_dealloc(srcP, srcBytes.length);
+  if (opened !== 0) { console.log(`${name}: _start not emittable (status ${eng.temen_status()})`); return; }
   const jit = await jitDrive();
   report(name, emitMs, jit, null);
 }
@@ -137,7 +137,7 @@ let s=0;
 for(let i=0;i<20000;i++){ s=(s+i*2654435761)>>>0; console.log('row', i, s>>>0); }
 `;
 
-const dirAsset = (n) => readFileSync(new URL(`./web/assets/${n}.svmb`, import.meta.url));
+const dirAsset = (n) => readFileSync(new URL(`./web/assets/${n}.temen`, import.meta.url));
 const qjs = dirAsset('qjs_repl');
 await profileStdin('qjs · COMPUTE (loop + fib, ~no I/O)', qjs, new TextEncoder().encode(QJS_COMPUTE));
 await profileStdin('qjs · OUTPUT (20k console.log = 20k host writes)', qjs, new TextEncoder().encode(QJS_OUTPUT));

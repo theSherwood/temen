@@ -29,18 +29,18 @@ await page.goto(`http://127.0.0.1:${port}/web/play.html`);
 const CASES = [
   { name: 'hello_c', stdin: '' },
   { name: 'qjs_repl', stdin: "let s=0; for(let i=0;i<200000;i++) s+=i; console.log('sum', s);\n" },
-].filter((c) => existsSync(`${ROOT}/web/assets/${c.name}.svmb`));
+].filter((c) => existsSync(`${ROOT}/web/assets/${c.name}.temen`));
 
 const res = await page.evaluate(async (cases) => {
   const par = await import('./par.js');
   const wj = await import('./wasmjit-module.js');
   const eng = await par.loadEngine();
   const dec = (p, n) => new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(p, p + n));
-  const readStdout = () => dec(Number(eng.ex.svm_stdout_ptr()), eng.ex.svm_stdout_len());
+  const readStdout = () => dec(Number(eng.ex.temen_stdout_ptr()), eng.ex.temen_stdout_len());
 
   const out = {};
   for (const { name, stdin } of cases) {
-    const bytes = new Uint8Array(await (await fetch(`./assets/${name}.svmb`)).arrayBuffer());
+    const bytes = new Uint8Array(await (await fetch(`./assets/${name}.temen`)).arrayBuffer());
     const stdinBytes = new TextEncoder().encode(stdin);
     wj.jitCacheClear();
 
@@ -58,19 +58,19 @@ const res = await page.evaluate(async (cases) => {
     // open once, copy the emitted bytes, time a bare compile, then close without running.
     let compileMs = null, emittedLen = null;
     {
-      const modP = Number(eng.ex.svm_alloc(bytes.length));
+      const modP = Number(eng.ex.temen_alloc(bytes.length));
       new Uint8Array(eng.memory.buffer).set(bytes, modP);
-      const opened = eng.ex.svm_onramp_jit_run_open(modP, bytes.length, 0, 0, 1);
-      eng.ex.svm_dealloc(modP, bytes.length);
+      const opened = eng.ex.temen_onramp_jit_run_open(modP, bytes.length, 0, 0, 1);
+      eng.ex.temen_dealloc(modP, bytes.length);
       if (opened === 0) {
-        const wptr = Number(eng.ex.svm_onramp_jit_run_wasm_ptr());
-        const wlen = eng.ex.svm_onramp_jit_run_wasm_len();
+        const wptr = Number(eng.ex.temen_onramp_jit_run_wasm_ptr());
+        const wlen = eng.ex.temen_onramp_jit_run_wasm_len();
         const emitted = new Uint8Array(eng.memory.buffer).slice(wptr, wptr + wlen);
         emittedLen = emitted.length;
         const c0 = performance.now();
         await WebAssembly.compile(emitted);
         compileMs = performance.now() - c0;
-        eng.ex.svm_onramp_jit_run_close();
+        eng.ex.temen_onramp_jit_run_close();
       }
     }
 

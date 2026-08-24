@@ -28,14 +28,14 @@ The system is four ideas wearing many names:
 
 ## Core runtime
 
-- **`.svmt` / `.svmb` / `.svmo`** — the three module file forms. `.svmt` is the text IR
+- **`.temt` / `.temen` / `.temeno`** — the three module file forms. `.temt` is the text IR
   (dev/debug interface; can carry everything, including link scaffolding; the older
-  `.svm` spelling is deprecated — tools accept it with a rename note). `.svmb` is
+  `.temt` spelling is deprecated — tools accept it with a rename note). `.temen` is
   the **runnable** binary (wire v9 flag 0): the untrusted-input path, decoded by the
-  escape-TCB `decode_module`, never contains link scaffolding. `.svmo` is the binary
+  escape-TCB `decode_module`, never contains link scaffolding. `.temeno` is the binary
   **object / link unit** (v9 flag bit 0, `decode_unit`): a pre-link unit that may carry
   `data.ptr` relocations, data exports, and `data.self`/`data.sym`/`data.top`; the
-  linker (`svm_ir::link`, `svm-run --link`) resolves it into a runnable module.
+  linker (`temen_ir::link`, `temen-run --link`) resolves it into a runnable module.
 - **domain** — one isolated unit of execution: a module's code + its window + its
   powerbox. The root program is a domain; every §14 child and every provider instance is
   its own domain.
@@ -72,7 +72,7 @@ The system is four ideas wearing many names:
 - **type_id** — the runtime identity of an interface: a `u32` stored in each table entry
   and re-checked at every use. Small constants for the built-ins (`cap_id::STREAM = 0` …);
   interned per-host for guest-implemented interfaces.
-- **`cap_id`** — the `svm_interp::cap_id` module of built-in interface type_id constants
+- **`cap_id`** — the `temen_interp::cap_id` module of built-in interface type_id constants
   (`cap_id::STREAM` … `cap_id::BUDGET`, `cap_id::GUEST_IMPL_BASE`), read as capability type
   identifiers at their use sites (`type_id == cap_id::STREAM`). Renamed from `iface`; the
   `iface` name now belongs only to the `HostCap.iface` field and the `HostCap::iface` /
@@ -97,7 +97,7 @@ The system is four ideas wearing many names:
   confers nothing by itself.
 - **import name** — one string, compared only for equality by the core. Namespacing is
   a convention inside the string (dotted segments, most-significant first: `posix.fs`,
-  `app.log`; `svm.` reserved for platform interfaces) — wirer policy may match by
+  `app.log`; `temen.` reserved for platform interfaces) — wirer policy may match by
   prefix, the mechanism never parses names. (The v7 wire's vestigial `ns` field is
   deleted at v8.)
 - **manifest** — a module's import list as a whole: the up-front, fail-closed statement

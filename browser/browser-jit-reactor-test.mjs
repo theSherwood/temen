@@ -32,20 +32,20 @@ const res = await page.evaluate(async () => {
   // FNV-1a over the presented framebuffer (copied out of the shared memory — a plain view would be a
   // live alias). Tags with dimensions so a size divergence also shows.
   const hashFB = () => {
-    const w = eng.ex.svm_framebuffer_width(), h = eng.ex.svm_framebuffer_height();
-    const p = Number(eng.ex.svm_framebuffer_ptr());
+    const w = eng.ex.temen_framebuffer_width(), h = eng.ex.temen_framebuffer_height();
+    const p = Number(eng.ex.temen_framebuffer_ptr());
     const px = new Uint8Array(eng.memory.buffer).slice(p, p + w * h * 4);
     let hsh = 0x811c9dc5;
     for (let i = 0; i < px.length; i++) { hsh ^= px[i]; hsh = Math.imul(hsh, 0x01000193) >>> 0; }
     return `${w}x${h}:${(hsh >>> 0).toString(16)}`;
   };
   const runInterp = (bytes) => {
-    const p = eng.ex.svm_alloc(bytes.length); new Uint8Array(eng.memory.buffer).set(bytes, p);
-    const opened = eng.ex.svm_onramp_open(p, bytes.length); eng.ex.svm_dealloc(p, bytes.length);
+    const p = eng.ex.temen_alloc(bytes.length); new Uint8Array(eng.memory.buffer).set(bytes, p);
+    const opened = eng.ex.temen_onramp_open(p, bytes.length); eng.ex.temen_dealloc(p, bytes.length);
     if (opened !== 0) throw new Error(`interp open failed: ${opened}`);
     const hs = [];
-    for (let i = 0; i < NFRAMES; i++) { if (eng.ex.svm_onramp_frame() !== 0) break; hs.push(hashFB()); }
-    eng.ex.svm_onramp_close();
+    for (let i = 0; i < NFRAMES; i++) { if (eng.ex.temen_onramp_frame() !== 0) break; hs.push(hashFB()); }
+    eng.ex.temen_onramp_close();
     return hs;
   };
   const runJit = async (bytes) => {
@@ -57,7 +57,7 @@ const res = await page.evaluate(async () => {
   };
   const out = {};
   for (const name of ['bounce', 'life', 'mandelzoom']) {
-    const bytes = new Uint8Array(await (await fetch(`./assets/${name}.svmb`)).arrayBuffer());
+    const bytes = new Uint8Array(await (await fetch(`./assets/${name}.temen`)).arrayBuffer());
     let emitted = true, interpH = [], jitH = [];
     try {
       interpH = runInterp(bytes);

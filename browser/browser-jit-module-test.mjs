@@ -1,5 +1,5 @@
 // Real-browser (V8) differential + measurement for the **single-shot module wasm-JIT**: for each
-// on-ramp module (hello_c / Lua / SQLite), run the SAME guest through the interpreter (`svm_run_onramp`)
+// on-ramp module (hello_c / Lua / SQLite), run the SAME guest through the interpreter (`temen_run_onramp`)
 // and the emitted-wasm tier (`runJitModule`), assert stdout is BYTE-IDENTICAL, and print interp-vs-JIT
 // timing. V8 (unlike wasmi) compiles Lua/SQLite's huge functions, so this is where the module JIT is
 // exercised. Lua/SQLite assets are built on demand (gitignored); absent ones are skipped.
@@ -31,41 +31,41 @@ const CASES = [
   { name: 'qjs_repl', stdin: "function fib(n){return n<2?n:fib(n-1)+fib(n-2);}\nconsole.log('fib', Array.from({length:25},(_,i)=>fib(i)).join(' '));\nconst xs=[5,3,8,1,9,2,7]; console.log('sorted', xs.slice().sort((a,b)=>a-b).join(','));\nlet s=0; for(let i=0;i<500000;i++) s+=i; console.log('sum', s);\nconsole.log('re', 'a1b2c3'.replace(/[0-9]/g,'#'));\n" },
   // Full Tcl_Init: the script library (clock/file/glob) loads from the embedded VFS, so this drives
   // both the language core AND the auto_load/package path through the emitted-wasm tier.
-  { name: 'tcl_init', stdin: "proc fib {n} { expr {$n < 2 ? $n : [fib [expr {$n-1}]] + [fib [expr {$n-2}]]} }\nputs \"fib [lmap i {1 2 3 4 5 6 7 8} {fib $i}]\"\nputs \"sorted [lsort -integer {5 3 8 1 9 2 7}]\"\nputs \"clock [clock format 1000000000 -gmt 1 -format {%Y-%m-%d %H:%M:%S}]\"\nputs \"file [file join /a b c] ext=[file extension archive.tar.gz]\"\nputs [format {pi=%.4f 255=0x%X sqrt2=%.6f} 3.14159265 255 [expr {sqrt(2)}]]\nputs [string toupper {tcl on svm}]\n" },
-].filter((c) => existsSync(`${ROOT}/web/assets/${c.name}.svmb`));
+  { name: 'tcl_init', stdin: "proc fib {n} { expr {$n < 2 ? $n : [fib [expr {$n-1}]] + [fib [expr {$n-2}]]} }\nputs \"fib [lmap i {1 2 3 4 5 6 7 8} {fib $i}]\"\nputs \"sorted [lsort -integer {5 3 8 1 9 2 7}]\"\nputs \"clock [clock format 1000000000 -gmt 1 -format {%Y-%m-%d %H:%M:%S}]\"\nputs \"file [file join /a b c] ext=[file extension archive.tar.gz]\"\nputs [format {pi=%.4f 255=0x%X sqrt2=%.6f} 3.14159265 255 [expr {sqrt(2)}]]\nputs [string toupper {tcl on temen}]\n" },
+].filter((c) => existsSync(`${ROOT}/web/assets/${c.name}.temen`));
 
 const res = await page.evaluate(async (cases) => {
   const par = await import('./par.js');
   const { runJitModule } = await import('./wasmjit-module.js');
   const eng = await par.loadEngine();
   const dec = (p, n) => new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(p, p + n));
-  const readStdout = () => dec(Number(eng.ex.svm_stdout_ptr()), eng.ex.svm_stdout_len());
+  const readStdout = () => dec(Number(eng.ex.temen_stdout_ptr()), eng.ex.temen_stdout_len());
 
   const out = {};
   for (const { name, stdin } of cases) {
-    const bytes = new Uint8Array(await (await fetch(`./assets/${name}.svmb`)).arrayBuffer());
+    const bytes = new Uint8Array(await (await fetch(`./assets/${name}.temen`)).arrayBuffer());
     const stdinBytes = new TextEncoder().encode(stdin);
     // Interpreter oracle: capture stdout AND the guest-observable outcome — status + the returned value
-    // (svm_run_onramp returns the top-level result; svm_status is OK/EXIT). The wasm-JIT must agree on all
+    // (temen_run_onramp returns the top-level result; temen_status is OK/EXIT). The wasm-JIT must agree on all
     // three, not just stdout (INVARIANT 9 — same return/exit behavior on every backend).
     let interpOut, interpMs, interpStatus, interpValue;
     {
-      const mp = eng.ex.svm_alloc(bytes.length); new Uint8Array(eng.memory.buffer).set(bytes, mp);
-      let sp = 0; if (stdinBytes.length) { sp = eng.ex.svm_alloc(stdinBytes.length); new Uint8Array(eng.memory.buffer).set(stdinBytes, sp); }
+      const mp = eng.ex.temen_alloc(bytes.length); new Uint8Array(eng.memory.buffer).set(bytes, mp);
+      let sp = 0; if (stdinBytes.length) { sp = eng.ex.temen_alloc(stdinBytes.length); new Uint8Array(eng.memory.buffer).set(stdinBytes, sp); }
       const t0 = performance.now();
-      interpValue = Number(eng.ex.svm_run_onramp(mp, bytes.length, sp, stdinBytes.length));
-      interpStatus = eng.ex.svm_status();
+      interpValue = Number(eng.ex.temen_run_onramp(mp, bytes.length, sp, stdinBytes.length));
+      interpStatus = eng.ex.temen_status();
       interpMs = performance.now() - t0;
       interpOut = readStdout();
-      eng.ex.svm_dealloc(mp, bytes.length); if (sp) eng.ex.svm_dealloc(sp, stdinBytes.length);
+      eng.ex.temen_dealloc(mp, bytes.length); if (sp) eng.ex.temen_dealloc(sp, stdinBytes.length);
     }
-    // wasm-JIT: runJitModule returns the finish status (STATUS_OK/EXIT; it THROWS on a trap); svm_run_value
+    // wasm-JIT: runJitModule returns the finish status (STATUS_OK/EXIT; it THROWS on a trap); temen_run_value
     // is the returned result — the same slots the interpreter path reads.
     let jitOut, jitMs, err = null, status = null, jitValue = null;
     try {
       const t0 = performance.now();
       status = await runJitModule(eng.ex, eng.memory, bytes, stdinBytes);
-      jitValue = Number(eng.ex.svm_run_value());
+      jitValue = Number(eng.ex.temen_run_value());
       jitMs = performance.now() - t0;
       jitOut = readStdout();
     } catch (e) { err = e.message; }

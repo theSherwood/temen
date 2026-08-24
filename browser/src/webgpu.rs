@@ -11,7 +11,7 @@
 //! - op 1 `present`: `a` = frame counter, `b` = width, `c` = height. Writes the `(frame, w, h)`
 //!   uniform and renders one frame to the page canvas. → 0.
 
-#[link(wasm_import_module = "svm_host")]
+#[link(wasm_import_module = "temen_host")]
 extern "C" {
     /// The embedder-supplied WebGPU servicer. `ptr`/`len` point into this module's linear memory (the
     /// bytes the `HostProc` copied out of the guest window), so JS reads them as

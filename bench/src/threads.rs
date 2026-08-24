@@ -1,14 +1,14 @@
-//! **Concurrency benchmark: SVM vs Wasmtime + wasi-threads** (the `--threads` mode).
+//! **Concurrency benchmark: Temen vs Wasmtime + wasi-threads** (the `--threads` mode).
 //!
 //! The same wasm bytes — a wasi-threads-ABI parallel atomic counter (imports `wasi:thread/spawn` and
 //! a shared memory, exports `wasi_thread_start`) — run on:
-//!   * **SVM**: transpiled to IR and JIT-compiled; `thread.spawn` is a native 1:1 OS-thread vCPU over
+//!   * **Temen**: transpiled to IR and JIT-compiled; `thread.spawn` is a native 1:1 OS-thread vCPU over
 //!     the shared window (concurrency *in* the VM — DESIGN §1a).
 //!   * **Wasmtime + `wasmtime-wasi-threads`**: each spawned thread **re-instantiates** the module on a
 //!     new OS thread sharing the imported memory (concurrency bolted onto the host).
 //!
 //! Both lower atomics via Cranelift to the same hardware instructions, so steady-state compute is
-//! parity; the interesting axis is **spawn/teardown cost** — SVM's raw OS thread vs Wasmtime's
+//! parity; the interesting axis is **spawn/teardown cost** — Temen's raw OS thread vs Wasmtime's
 //! per-thread instantiation. We time only the parallel `run` (spawn + work + join), compiled once,
 //! best-of-`reps`, across a spawn-heavy and a compute-heavy point.
 
@@ -57,11 +57,11 @@ fn parallel_wat(nworkers: u32, steps: u32) -> String {
     )
 }
 
-/// Time the parallel `run` on SVM (compiled once; `thread.spawn` = native OS threads). Returns
+/// Time the parallel `run` on Temen (compiled once; `thread.spawn` = native OS threads). Returns
 /// `(result, best_of_reps)`.
-fn run_svm(wasm: &[u8], reps: usize) -> (i64, Duration) {
-    use svm_jit::{CompiledModule, JitOutcome, Quota, INERT_CAP_THUNK};
-    let t = svm_wasm::transpile(wasm).expect("svm transpile");
+fn run_temen(wasm: &[u8], reps: usize) -> (i64, Duration) {
+    use temen_jit::{CompiledModule, JitOutcome, Quota, INERT_CAP_THUNK};
+    let t = temen_wasm::transpile(wasm).expect("temen transpile");
     let run_idx = t
         .exports
         .iter()
@@ -73,7 +73,7 @@ fn run_svm(wasm: &[u8], reps: usize) -> (i64, Duration) {
         run_idx,
         INERT_CAP_THUNK,
         std::ptr::null_mut(),
-        svm_ir::DEFAULT_RESERVED_LOG2,
+        temen_ir::DEFAULT_RESERVED_LOG2,
         None,
         None,
         None,
@@ -82,16 +82,16 @@ fn run_svm(wasm: &[u8], reps: usize) -> (i64, Duration) {
         Quota::default(),
         0,
     )
-    .expect("svm jit compile");
+    .expect("temen jit compile");
     let mut best = Duration::MAX;
     let mut result = 0i64;
     for _ in 0..reps {
         let t0 = Instant::now();
-        let (out, _) = cm.run(&[], None, None, None).expect("svm run");
+        let (out, _) = cm.run(&[], None, None, None).expect("temen run");
         best = best.min(t0.elapsed());
         result = match out {
             JitOutcome::Returned(v) => v[0],
-            other => panic!("svm run did not return: {other:?}"),
+            other => panic!("temen run did not return: {other:?}"),
         };
     }
     (result, best)
@@ -140,31 +140,31 @@ fn run_wasmtime(engine: &Engine, wasm: &[u8], reps: usize) -> (i32, Duration) {
 /// Run the concurrency comparison and print a small table.
 pub fn run(engine: &Engine, reps: usize) {
     // (label, nworkers, steps): a spawn-heavy point (many short threads) and a compute-heavy point
-    // (few long threads). Spawn-heavy exposes SVM's lighter thread.spawn vs Wasmtime's per-thread
+    // (few long threads). Spawn-heavy exposes Temen's lighter thread.spawn vs Wasmtime's per-thread
     // re-instantiation; compute-heavy is steady-state (shared-Cranelift atomics ⇒ ~parity).
     let cases = [
         ("spawn-heavy   (64×1k)", 64u32, 1_000u32),
         ("balanced      (8×100k)", 8, 100_000),
         ("compute-heavy (4×2M)", 4, 2_000_000),
     ];
-    println!("concurrency: SVM (native thread.spawn) vs Wasmtime+wasi-threads, same wasm bytes");
-    println!("  best of {reps} runs; ratio = SVM ÷ Wasmtime (<1 ⇒ SVM faster)\n");
+    println!("concurrency: Temen (native thread.spawn) vs Wasmtime+wasi-threads, same wasm bytes");
+    println!("  best of {reps} runs; ratio = Temen ÷ Wasmtime (<1 ⇒ Temen faster)\n");
     println!(
         "  {:<24} {:>12} {:>12} {:>8}   {}",
-        "case", "SVM", "Wasmtime", "ratio", "result"
+        "case", "Temen", "Wasmtime", "ratio", "result"
     );
     for (label, nw, steps) in cases {
         let wasm = wat::parse_str(&parallel_wat(nw, steps)).expect("assemble wat");
-        let (svm_res, svm_t) = run_svm(&wasm, reps);
+        let (temen_res, temen_t) = run_temen(&wasm, reps);
         let (wt_res, wt_t) = run_wasmtime(engine, &wasm, reps);
         let want = (nw as i64) * (steps as i64);
-        assert_eq!(svm_res, want, "SVM {label} wrong result");
+        assert_eq!(temen_res, want, "Temen {label} wrong result");
         assert_eq!(wt_res as i64, want, "Wasmtime {label} wrong result");
-        let ratio = svm_t.as_secs_f64() / wt_t.as_secs_f64();
+        let ratio = temen_t.as_secs_f64() / wt_t.as_secs_f64();
         println!(
             "  {:<24} {:>10.3}ms {:>10.3}ms {:>8.2}   {}",
             label,
-            svm_t.as_secs_f64() * 1e3,
+            temen_t.as_secs_f64() * 1e3,
             wt_t.as_secs_f64() * 1e3,
             ratio,
             want,
@@ -172,7 +172,7 @@ pub fn run(engine: &Engine, reps: usize) {
     }
     println!(
         "\n  note: both lower atomics via Cranelift to the same hardware ops (compute ≈ parity);\n  \
-         the spawn-heavy row is the differentiator — SVM's raw OS-thread `thread.spawn` over the\n  \
+         the spawn-heavy row is the differentiator — Temen's raw OS-thread `thread.spawn` over the\n  \
          shared window vs Wasmtime re-instantiating the module per spawned thread."
     );
 }

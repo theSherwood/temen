@@ -1,38 +1,38 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/svm-ir",
-    "crates/svm-mask",
-    "crates/svm-mem",
-    "crates/svm-text",
-    "crates/svm-durable",
-    "crates/svm-encode",
-    "crates/svm-verify",
-    "crates/svm-opt",
-    "crates/svm-peval",
-    "crates/svm-interp",
-    "crates/svm-exec",
-    "crates/svm-fs",
-    "crates/svm-dap",
-    "crates/svm-snapshot",
-    "crates/svm-fiber",
-    "crates/svm-jit",
-    "crates/svm",
-    "crates/svm-spec",
-    "crates/svm-run",
-    "crates/svm-wasm",
-    "crates/svm-wasm-jit",
-    "crates/svm-leng",
-    "crates/svm-posix",
-    "crates/svm-capi",
-    "crates/svm-parity",
+    "crates/temen-ir",
+    "crates/temen-mask",
+    "crates/temen-mem",
+    "crates/temen-text",
+    "crates/temen-durable",
+    "crates/temen-encode",
+    "crates/temen-verify",
+    "crates/temen-opt",
+    "crates/temen-peval",
+    "crates/temen-interp",
+    "crates/temen-exec",
+    "crates/temen-fs",
+    "crates/temen-dap",
+    "crates/temen-snapshot",
+    "crates/temen-fiber",
+    "crates/temen-jit",
+    "crates/temen",
+    "crates/temen-spec",
+    "crates/temen-run",
+    "crates/temen-wasm",
+    "crates/temen-wasm-jit",
+    "crates/temen-leng",
+    "crates/temen-posix",
+    "crates/temen-capi",
+    "crates/temen-parity",
 ]
 # `fuzz/` is a cargo-fuzz crate (nightly + libfuzzer-sys); `bench/` pulls in Wasmtime for
-# the comparison harness; `crates/svm-llvm` is the AOT LLVM→IR on-ramp (D54 — an opt-in,
+# the comparison harness; `crates/temen-llvm` is the AOT LLVM→IR on-ramp (D54 — an opt-in,
 # Linux-dev-only lane, off the runtime path; links no libLLVM since the textual-`.ll` reader,
 # but its tests shell out to `clang`/`llvm-dis`). All three are kept out of the workspace so
 # `cargo build --workspace` / `cargo test` never pull them in.
-exclude = ["fuzz", "bench", "crates/svm-llvm", "crates/svm-webgpu"]
+exclude = ["fuzz", "bench", "crates/temen-llvm", "crates/temen-webgpu"]
 
 [workspace.package]
 edition = "2021"
@@ -42,27 +42,27 @@ rust-version = "1.94"
 # Keep the escape-TCB crates dependency-free (small, fast to compile, easy to audit).
 # External deps live only in dev/bench/fuzz.
 [workspace.dependencies]
-svm-ir = { path = "crates/svm-ir" }
-svm-mask = { path = "crates/svm-mask" }
-svm-mem = { path = "crates/svm-mem" }
-svm-text = { path = "crates/svm-text" }
-svm-durable = { path = "crates/svm-durable" }
-svm-encode = { path = "crates/svm-encode" }
-svm-verify = { path = "crates/svm-verify" }
-# `default-features = false` here so dependents opt into `libm-floats` explicitly (the in-svm build
-# needs it off); host consumers pull it in transitively via `svm-peval`'s default feature.
-svm-opt = { path = "crates/svm-opt", default-features = false }
-svm-peval = { path = "crates/svm-peval" }
-svm-interp = { path = "crates/svm-interp" }
-svm-exec = { path = "crates/svm-exec" }
-svm-fs = { path = "crates/svm-fs" }
-svm-posix = { path = "crates/svm-posix" }
-svm-snapshot = { path = "crates/svm-snapshot" }
-svm-fiber = { path = "crates/svm-fiber" }
-svm-jit = { path = "crates/svm-jit" }
-svm-spec = { path = "crates/svm-spec" }
-svm-wasm-jit = { path = "crates/svm-wasm-jit" }
-svm-parity = { path = "crates/svm-parity" }
+temen-ir = { path = "crates/temen-ir" }
+temen-mask = { path = "crates/temen-mask" }
+temen-mem = { path = "crates/temen-mem" }
+temen-text = { path = "crates/temen-text" }
+temen-durable = { path = "crates/temen-durable" }
+temen-encode = { path = "crates/temen-encode" }
+temen-verify = { path = "crates/temen-verify" }
+# `default-features = false` here so dependents opt into `libm-floats` explicitly (the in-temen build
+# needs it off); host consumers pull it in transitively via `temen-peval`'s default feature.
+temen-opt = { path = "crates/temen-opt", default-features = false }
+temen-peval = { path = "crates/temen-peval" }
+temen-interp = { path = "crates/temen-interp" }
+temen-exec = { path = "crates/temen-exec" }
+temen-fs = { path = "crates/temen-fs" }
+temen-posix = { path = "crates/temen-posix" }
+temen-snapshot = { path = "crates/temen-snapshot" }
+temen-fiber = { path = "crates/temen-fiber" }
+temen-jit = { path = "crates/temen-jit" }
+temen-spec = { path = "crates/temen-spec" }
+temen-wasm-jit = { path = "crates/temen-wasm-jit" }
+temen-parity = { path = "crates/temen-parity" }
 
 [profile.release]
 opt-level = 3

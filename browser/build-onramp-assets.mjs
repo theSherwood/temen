@@ -1,10 +1,10 @@
-// Build the playground's **on-ramp `.svmb` assets** — real C/C++ guests (Lua, SQLite) compiled
-// through `clang -O2 -emit-llvm` and translated by `svm-llvm-translate` into SVM-IR modules the
-// browser engine runs via `svm_run_onramp` (see `web/play.js`).
+// Build the playground's **on-ramp `.temen` assets** — real C/C++ guests (Lua, SQLite) compiled
+// through `clang -O2 -emit-llvm` and translated by `temen-llvm-translate` into TEMEN-IR modules the
+// browser engine runs via `temen_run_onramp` (see `web/play.js`).
 //
 // Every asset is translated with **`--host-page 65536`**: a wasm host has 64 KiB pages, so a
 // read-only global must not share a host page with the writable data stack (it would fault under
-// D40). The native default (16 KiB) is wrong for the browser — see the `svm-llvm` stack-page commit.
+// D40). The native default (16 KiB) is wrong for the browser — see the `temen-llvm` stack-page commit.
 //
 // Every clang-translated asset also gets **`--null-guard`** (#964): the guarded powerbox layout
 // (`__null_guard`-marked, scratch/args one guard up) so a NULL dereference traps on every tier.
@@ -16,7 +16,7 @@
 //
 // Usage:  node build-onramp-assets.mjs           (builds whatever the toolchain + caches allow)
 // Needs `clang`/`llvm-dis` on PATH. SQLite/Lua sources are fetched-and-cached (skipped offline).
-// Outputs to `web/assets/*.svmb` (gitignored except the tiny committed `hello_c.svmb`).
+// Outputs to `web/assets/*.temen` (gitignored except the tiny committed `hello_c.temen`).
 
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, existsSync, readFileSync, copyFileSync, rmSync } from 'node:fs';
@@ -30,40 +30,40 @@ const HOST_PAGE = '65536';
 mkdirSync(ASSETS, { recursive: true });
 
 // Build the translator once (release), reuse its path.
-const TR = join(REPO, 'crates', 'svm-llvm', 'target', 'release', 'svm-llvm-translate');
+const TR = join(REPO, 'crates', 'temen-llvm', 'target', 'release', 'temen-llvm-translate');
 function ensureTranslator() {
   if (existsSync(TR)) return;
-  console.log('building svm-llvm-translate…');
-  execFileSync('cargo', ['build', '--release', '--bin', 'svm-llvm-translate'], {
-    cwd: join(REPO, 'crates', 'svm-llvm'), stdio: 'inherit',
+  console.log('building temen-llvm-translate…');
+  execFileSync('cargo', ['build', '--release', '--bin', 'temen-llvm-translate'], {
+    cwd: join(REPO, 'crates', 'temen-llvm'), stdio: 'inherit',
   });
 }
 
-// clang a C source to bitcode, then translate to a 64 KiB-page `.svmb`. Extra clang flags per guest.
+// clang a C source to bitcode, then translate to a 64 KiB-page `.temen`. Extra clang flags per guest.
 function buildC(name, src, includes = [], defines = []) {
   const bc = join(ASSETS, `${name}.bc`);
-  const svmb = join(ASSETS, `${name}.svmb`);
+  const temen = join(ASSETS, `${name}.temen`);
   const flags = ['-O2', '-emit-llvm', '-c', '-fno-vectorize', '-fno-slp-vectorize'];
   execFileSync('clang', [...flags, ...defines, ...includes.map((i) => `-I${i}`), src, '-o', bc], { stdio: 'inherit' });
-  execFileSync(TR, [bc, '-o', svmb, '--host-page', HOST_PAGE, '--null-guard'], { stdio: 'inherit' });
-  const size = execFileSync('wc', ['-c', svmb]).toString().trim().split(/\s+/)[0];
-  console.log(`  ✓ ${name}.svmb (${size} B)`);
+  execFileSync(TR, [bc, '-o', temen, '--host-page', HOST_PAGE, '--null-guard'], { stdio: 'inherit' });
+  const size = execFileSync('wc', ['-c', temen]).toString().trim().split(/\s+/)[0];
+  console.log(`  ✓ ${name}.temen (${size} B)`);
 }
 
-// Translate an **already-committed** `.bc` fixture to a 64 KiB-page `.svmb` (no clang step — the
+// Translate an **already-committed** `.bc` fixture to a 64 KiB-page `.temen` (no clang step — the
 // bitcode is a golden input in the tree, e.g. the Lua test fixtures).
 function buildBc(name, bcPath) {
-  const svmb = join(ASSETS, `${name}.svmb`);
-  execFileSync(TR, [bcPath, '-o', svmb, '--host-page', HOST_PAGE, '--null-guard'], { stdio: 'inherit' });
-  const size = execFileSync('wc', ['-c', svmb]).toString().trim().split(/\s+/)[0];
-  console.log(`  ✓ ${name}.svmb (${size} B)`);
+  const temen = join(ASSETS, `${name}.temen`);
+  execFileSync(TR, [bcPath, '-o', temen, '--host-page', HOST_PAGE, '--null-guard'], { stdio: 'inherit' });
+  const size = execFileSync('wc', ['-c', temen]).toString().trim().split(/\s+/)[0];
+  console.log(`  ✓ ${name}.temen (${size} B)`);
 }
 
 ensureTranslator();
 
 // 1) hello — the tiny always-present example (also committed so the playground works out of the box).
 try {
-  buildC('hello_c', join(REPO, 'crates', 'svm-run', 'demos', 'hello.c'));
+  buildC('hello_c', join(REPO, 'crates', 'temen-run', 'demos', 'hello.c'));
 } catch (e) {
   console.log(`  ✗ hello_c: ${e.message}`);
 }
@@ -71,7 +71,7 @@ try {
 // 1b) gradient — the framebuffer demo: a C guest renders an RGBA image and presents one frame through
 //     the `display` capability; the page blits it to a <canvas>. The output waist Doom will ride.
 try {
-  buildC('gradient', join(REPO, 'crates', 'svm-run', 'demos', 'display', 'gradient.c'));
+  buildC('gradient', join(REPO, 'crates', 'temen-run', 'demos', 'display', 'gradient.c'));
 } catch (e) {
   console.log(`  ✗ gradient: ${e.message}`);
 }
@@ -80,7 +80,7 @@ try {
 //     requestAnimationFrame, steering a bouncing box with the arrow keys (the `keyboard` cap in, the
 //     `display` cap out). The per-frame run model + input waist Doom rides.
 try {
-  buildC('bounce', join(REPO, 'crates', 'svm-run', 'demos', 'display', 'bounce.c'));
+  buildC('bounce', join(REPO, 'crates', 'temen-run', 'demos', 'display', 'bounce.c'));
 } catch (e) {
   console.log(`  ✗ bounce: ${e.message}`);
 }
@@ -89,7 +89,7 @@ try {
 //     persist the guest's whole memory (heap included) between frames or the glider freezes. The
 //     heap-persistence proof Doom's zone allocator needs.
 try {
-  buildC('life', join(REPO, 'crates', 'svm-run', 'demos', 'display', 'life.c'));
+  buildC('life', join(REPO, 'crates', 'temen-run', 'demos', 'display', 'life.c'));
 } catch (e) {
   console.log(`  ✗ life: ${e.message}`);
 }
@@ -98,7 +98,7 @@ try {
 //     double-precision Mandelbrot for the current (auto-zooming, arrow-steerable) view on the CPU
 //     in-guest and presents it through `display`. Pure f64 + an integer palette — no libm bundled.
 try {
-  buildC('mandelzoom', join(REPO, 'crates', 'svm-run', 'demos', 'display', 'mandelzoom.c'));
+  buildC('mandelzoom', join(REPO, 'crates', 'temen-run', 'demos', 'display', 'mandelzoom.c'));
 } catch (e) {
   console.log(`  ✗ mandelzoom: ${e.message}`);
 }
@@ -106,7 +106,7 @@ try {
 // 1f) gpu_shader — the GPU demo: the guest ships a WGSL fragment shader through the `webgpu` capability
 //     and the browser renders it (a Mandelbrot zoom) each frame on the real GPU via navigator.gpu.
 try {
-  buildC('gpu_shader', join(REPO, 'crates', 'svm-run', 'demos', 'display', 'gpu_shader.c'));
+  buildC('gpu_shader', join(REPO, 'crates', 'temen-run', 'demos', 'display', 'gpu_shader.c'));
 } catch (e) {
   console.log(`  ✗ gpu_shader: ${e.message}`);
 }
@@ -114,8 +114,8 @@ try {
 // 2) SQLite (interactive) — the unmodified 3.50.2 amalgamation with a driver that reads a SQL script
 //    from **stdin** and runs it against an in-memory database, printing each statement's result table.
 //    The page pipes the editor's SQL in as stdin. Fetch-and-cache the amalgamation (same version +
-//    cache dir the svm-llvm test harness uses); skip offline.
-const CACHE = '/tmp/svm_sqlite_cache';
+//    cache dir the temen-llvm test harness uses); skip offline.
+const CACHE = '/tmp/temen_sqlite_cache';
 const AMALG = join(CACHE, 'sqlite-amalgamation-3500200');
 function ensureAmalgamation() {
   if (existsSync(join(AMALG, 'sqlite3.c'))) return true;
@@ -132,7 +132,7 @@ function ensureAmalgamation() {
 }
 if (ensureAmalgamation()) {
   try {
-    buildC('sqlite_repl', join(REPO, 'crates', 'svm-run', 'demos', 'sqlite', 'sqlite_repl.c'), [AMALG]);
+    buildC('sqlite_repl', join(REPO, 'crates', 'temen-run', 'demos', 'sqlite', 'sqlite_repl.c'), [AMALG]);
   } catch (e) {
     console.log(`  ✗ sqlite_repl: ${e.message}`);
   }
@@ -146,16 +146,16 @@ if (ensureAmalgamation()) {
 //     for the address-taken Math functions) + the reused printf/strtod/libc shims, `llvm-link`ed into
 //     one `.ll`, then translated. Fetched-and-cached (QuickJS from bellard.org, openlibm from GitHub —
 //     see `ensureOpenlibm` for why that one needs two mirrors); when either fetch is unavailable this
-//     rebuild is skipped and the **committed** `web/assets/qjs_repl.svmb` is left in place, so the JS
+//     rebuild is skipped and the **committed** `web/assets/qjs_repl.temen` is left in place, so the JS
 //     playground works out of the box regardless (see `web/assets/.gitignore` whitelist).
 const QJS_VER = '2024-01-13';
-const QJS_CACHE = '/tmp/svm_quickjs_cache';
+const QJS_CACHE = '/tmp/temen_quickjs_cache';
 const QJS_DIR = join(QJS_CACHE, `quickjs-${QJS_VER}`);
 const OL_VER = '0.8.5';
-const OL_CACHE = '/tmp/svm_openlibm_cache';
+const OL_CACHE = '/tmp/temen_openlibm_cache';
 const OL_DIR = join(OL_CACHE, `openlibm-${OL_VER}`);
 // The openlibm double set QuickJS's `Math` object takes the address of (kept in sync with the
-// svm-llvm test's OPENLIBM_SRCS + QUICKJS_OPENLIBM_EXTRA).
+// temen-llvm test's OPENLIBM_SRCS + QUICKJS_OPENLIBM_EXTRA).
 const OPENLIBM_SRCS = [
   'e_log', 'e_log10', 'e_log2', 'e_exp', 's_exp2', 'e_pow', 's_sin', 's_cos', 's_tan',
   'k_sin', 'k_cos', 'k_tan', 'e_rem_pio2', 'k_rem_pio2', 'e_asin', 'e_acos', 's_atan',
@@ -204,7 +204,7 @@ function ensureOpenlibm() {
   }
 }
 function buildQuickJS() {
-  const demos = join(REPO, 'crates', 'svm-run', 'demos');
+  const demos = join(REPO, 'crates', 'temen-run', 'demos');
   const cflags = ['-O2', '-emit-llvm', '-S', '-c', '-fno-vectorize', '-fno-slp-vectorize',
     '-DNDEBUG', '-D_GNU_SOURCE', `-DCONFIG_VERSION="${QJS_VER}"`, '-DASSEMBLER=0'];
   const incs = [QJS_DIR, OL_DIR, join(OL_DIR, 'include'), join(OL_DIR, 'src'), join(OL_DIR, 'amd64')]
@@ -223,14 +223,14 @@ function buildQuickJS() {
   for (const s of OPENLIBM_SRCS) shared.push(cc(join(OL_DIR, 'src', `${s}.c`), s));
   // Two drivers over the same engine: `qjs_repl` (single `main`, the shipping card) and `qjs_snapshot`
   // (the WASM_AOT.md warm-runtime-snapshot two-phase driver: `main` + `warmup` + `eval_run`).
-  const drivers = [['qjs_repl.c', 'repl', 'qjs_repl.svmb'], ['qjs_snapshot.c', 'snapshot', 'qjs_snapshot.svmb']];
+  const drivers = [['qjs_repl.c', 'repl', 'qjs_repl.temen'], ['qjs_snapshot.c', 'snapshot', 'qjs_snapshot.temen']];
   for (const [driverSrc, tag, out] of drivers) {
     const driverLl = cc(join(demos, 'quickjs', driverSrc), tag);
-    const linked = join(ASSETS, `${out.replace('.svmb', '')}_linked.ll`);
+    const linked = join(ASSETS, `${out.replace('.temen', '')}_linked.ll`);
     execFileSync('llvm-link', ['-S', driverLl, ...shared, '-o', linked], { stdio: 'inherit' });
-    const svmb = join(ASSETS, out);
-    execFileSync(TR, [linked, '-o', svmb, '--host-page', HOST_PAGE, '--null-guard'], { stdio: 'inherit' });
-    const size = execFileSync('wc', ['-c', svmb]).toString().trim().split(/\s+/)[0];
+    const temen = join(ASSETS, out);
+    execFileSync(TR, [linked, '-o', temen, '--host-page', HOST_PAGE, '--null-guard'], { stdio: 'inherit' });
+    const size = execFileSync('wc', ['-c', temen]).toString().trim().split(/\s+/)[0];
     console.log(`  ✓ ${out} (${size} B)`);
   }
 }
@@ -241,15 +241,15 @@ if (ensureQuickJS() && ensureOpenlibm()) {
     console.log(`  ✗ qjs_repl: ${e.message}`);
   }
 } else {
-  console.log('  – qjs_repl rebuild skipped (quickjs/openlibm fetch failed) — using committed qjs_repl.svmb');
+  console.log('  – qjs_repl rebuild skipped (quickjs/openlibm fetch failed) — using committed qjs_repl.temen');
 }
 
 // 2c) Tcl (interactive) — the reference Tcl 8.6 interpreter, built by its demo script
 //     (`demos/tcl/build_bitcode.sh`: configure → native oracle → 162-TU bitcode + openlibm → llvm-link).
-//     The script links these variants; the playground translates two to a 64 KiB-page `.svmb` with
+//     The script links these variants; the playground translates two to a 64 KiB-page `.temen` with
 //     `--stub-externs` (the `tcl_init` variant stays behind for the Rust translate test only):
-//       • `tcl_repl.svmb` — the minimal-embedding REPL (`tcl_repl.c`, no `Tcl_Init`, no filesystem).
-//       • `tcl_snapshot.svmb` — the two-phase warm-runtime-snapshot driver (`tcl_snapshot.c`:
+//       • `tcl_repl.temen` — the minimal-embedding REPL (`tcl_repl.c`, no `Tcl_Init`, no filesystem).
+//       • `tcl_snapshot.temen` — the two-phase warm-runtime-snapshot driver (`tcl_snapshot.c`:
 //         `warmup` = full `Tcl_Init` over an in-guest `Tcl_Filesystem` VFS serving the embedded script
 //         library so `clock`/`file`/`glob`/`auto_load`/`package` all work; `eval_run` = eval-only), so
 //         the playground warms the Tcl runtime once on the snapshot worker and evals per Run (issue
@@ -257,47 +257,47 @@ if (ensureQuickJS() && ensureOpenlibm()) {
 //     The playground warm Tcl card uses the snapshot asset. Fail-soft: skipped (example absent) if the
 //     toolchain/fetch is unavailable, like SQLite/Doom/chibicc offline.
 try {
-  const tclScript = join(REPO, 'crates', 'svm-run', 'demos', 'tcl', 'build_bitcode.sh');
+  const tclScript = join(REPO, 'crates', 'temen-run', 'demos', 'tcl', 'build_bitcode.sh');
   execFileSync('bash', [tclScript], { stdio: 'inherit' });
-  const cache = process.env.SVM_TCL_CACHE ?? '/tmp/svm_tcl_cache';
-  for (const [linkedName, svmbName] of [['tcl_linked.ll', 'tcl_repl.svmb'], ['tcl_snapshot_linked.ll', 'tcl_snapshot.svmb']]) {
+  const cache = process.env.TEMEN_TCL_CACHE ?? '/tmp/temen_tcl_cache';
+  for (const [linkedName, temenName] of [['tcl_linked.ll', 'tcl_repl.temen'], ['tcl_snapshot_linked.ll', 'tcl_snapshot.temen']]) {
     const linked = join(cache, linkedName);
     if (!existsSync(linked)) throw new Error(`build script produced no ${linkedName}`);
-    const svmb = join(ASSETS, svmbName);
+    const temen = join(ASSETS, temenName);
     // Tcl is guarded again (#986): its one NULL read was `TclSetupEnv` walking a NULL `environ`
     // (the extern was laid out as zeroed BSS) — `tcl_shim.c` now defines a real empty `environ`.
-    execFileSync(TR, [linked, '-o', svmb, '--host-page', HOST_PAGE, '--stub-externs', '--null-guard'], { stdio: 'inherit' });
-    const size = execFileSync('wc', ['-c', svmb]).toString().trim().split(/\s+/)[0];
-    console.log(`  ✓ ${svmbName} (${size} B)`);
+    execFileSync(TR, [linked, '-o', temen, '--host-page', HOST_PAGE, '--stub-externs', '--null-guard'], { stdio: 'inherit' });
+    const size = execFileSync('wc', ['-c', temen]).toString().trim().split(/\s+/)[0];
+    console.log(`  ✓ ${temenName} (${size} B)`);
   }
 } catch (e) {
   console.log(`  – tcl skipped (${e.message} — offline, or no clang/llvm-link)`);
 }
 
-// 3) Lua (interactive) — the warm Lua card ships the committed prebuilt **`lua_snapshot.svmb`** (the
+// 3) Lua (interactive) — the warm Lua card ships the committed prebuilt **`lua_snapshot.temen`** (the
 //    two-phase `main`/`warmup`/`eval_run` driver, issue #805), so nothing is built here. It's a
 //    generated binary asset like the vendored `doom1.wad`: regenerate it by hand from
-//    `lua_snapshot_harness.c` + Lua 5.4.7 via the recipe in `crates/svm-llvm/tests/fixtures/lua/README.md`
-//    ("Lua warm-runtime-snapshot fixture") and commit the resulting `.svmb`. We deliberately do NOT
+//    `lua_snapshot_harness.c` + Lua 5.4.7 via the recipe in `crates/temen-llvm/tests/fixtures/lua/README.md`
+//    ("Lua warm-runtime-snapshot fixture") and commit the resulting `.temen`. We deliberately do NOT
 //    commit the ~76k-line intermediate `.ll` (unlike `lua_eval.ll`, no Rust test consumes it).
 
 // 4) Doom (interactive reactor) — doomgeneric through the on-ramp, driven one `tick` per frame over
 //    the persistent window; `_start` reads the shareware IWAD through the `fs` capability. Two assets:
 //    the module (`demos/doom/{fetch,build}.sh` — id Software's Doom *source* is fetched-and-built,
 //    needs the toolchain) and the shareware `doom1.wad`, which is now **vendored in-tree**
-//    (`crates/svm-run/demos/doom/doom1.wad`) rather than fetched. Vendoring the WAD retires the
+//    (`crates/temen-run/demos/doom/doom1.wad`) rather than fetched. Vendoring the WAD retires the
 //    recurring dead-mirror outage (ISSUES.md I42/I43): a mirror going away can no longer drop the WAD.
 //    The WAD is staged unconditionally (it's a committed file — always reachable, no network); only
 //    the module stays fail-soft (skipped, so the playground omits the example, if the toolchain or the
 //    source fetch is unavailable).
-const DOOM = join(REPO, 'crates', 'svm-run', 'demos', 'doom');
+const DOOM = join(REPO, 'crates', 'temen-run', 'demos', 'doom');
 const DCACHE = '/tmp/doomgeneric_cache';
 const VENDORED_WAD = join(DOOM, 'doom1.wad');
 
-// Build doom.svmb via the demo scripts (fetch the sources, then compile+link+translate). Returns the
+// Build doom.temen via the demo scripts (fetch the sources, then compile+link+translate). Returns the
 // built module path, or null if the fetch/build failed (offline, or no clang/llvm-link).
 function ensureDoomModule() {
-  const built = join(DCACHE, 'bc', 'doom.svmb');
+  const built = join(DCACHE, 'bc', 'doom.temen');
   if (existsSync(built)) return built;
   try {
     execFileSync('sh', [join(DOOM, 'fetch.sh')], { stdio: 'inherit' });
@@ -323,77 +323,77 @@ function vendoredWad() {
 // Stage the WAD first, unconditionally — it's committed, so it's always reachable regardless of the
 // toolchain. The module build is the only fail-soft half now.
 copyFileSync(vendoredWad(), join(ASSETS, 'doom1.wad'));
-const doomSvmb = ensureDoomModule();
+const doomModule = ensureDoomModule();
 const mb = (n) => (readFileSync(n).length / (1024 * 1024)).toFixed(2);
-if (doomSvmb) {
-  copyFileSync(doomSvmb, join(ASSETS, 'doom.svmb'));
-  console.log(`  ✓ doom.svmb (${mb(doomSvmb)} MB) + doom1.wad (vendored, ${mb(join(ASSETS, 'doom1.wad'))} MB)`);
+if (doomModule) {
+  copyFileSync(doomModule, join(ASSETS, 'doom.temen'));
+  console.log(`  ✓ doom.temen (${mb(doomModule)} MB) + doom1.wad (vendored, ${mb(join(ASSETS, 'doom1.wad'))} MB)`);
 } else {
-  console.log(`  – doom.svmb skipped (module build failed — offline, or no toolchain?); doom1.wad (vendored) staged`);
+  console.log(`  – doom.temen skipped (module build failed — offline, or no toolchain?); doom1.wad (vendored) staged`);
 }
 
 // chibicc — the in-browser C compiler (SELFHOST_C.md §7 step 5). Multi-TU like QuickJS/Doom, so it's
 // built by its demo script (per-TU bitcode → llvm-link → translate → verify) and the resulting
-// `chibicc.svmb` copied in. The playground compiles a C source with it, `svm_parse`s the emitted IR,
+// `chibicc.temen` copied in. The playground compiles a C source with it, `temen_parse`s the emitted IR,
 // and runs the result. Fail-soft: no clang/llvm ⇒ the demo is simply absent (the card shows a build
 // hint), like Lua/Doom.
 try {
-  const chibiccScript = join(REPO, 'crates', 'svm-run', 'demos', 'chibicc_selfhost', 'build_chibicc_svmb.sh');
-  const chibiccCache = process.env.SVM_CHIBICC_CACHE ?? '/tmp/svm_chibicc_cache';
+  const chibiccScript = join(REPO, 'crates', 'temen-run', 'demos', 'chibicc_selfhost', 'build_chibicc_temen.sh');
+  const chibiccCache = process.env.TEMEN_CHIBICC_CACHE ?? '/tmp/temen_chibicc_cache';
   execFileSync('bash', [chibiccScript], { stdio: 'inherit' });
-  const built = join(chibiccCache, 'chibicc.svmb');
-  if (!existsSync(built)) throw new Error('build script produced no chibicc.svmb');
-  copyFileSync(built, join(ASSETS, 'chibicc.svmb'));
+  const built = join(chibiccCache, 'chibicc.temen');
+  if (!existsSync(built)) throw new Error('build script produced no chibicc.temen');
+  copyFileSync(built, join(ASSETS, 'chibicc.temen'));
   const kb = (readFileSync(built).length / 1024).toFixed(0);
-  console.log(`  ✓ chibicc.svmb (${kb} KB)`);
+  console.log(`  ✓ chibicc.temen (${kb} KB)`);
 } catch (e) {
   console.log(`  – chibicc skipped (${e.message} — offline, or no clang/llvm-18?)`);
 }
 
-// svm-leng — the in-browser leng→SVM-IR self-host card (NIM.md §3e): the real `svm-leng` translator,
-// compiled to a verified SVM module through the LLVM on-ramp, run over a real hexer Leng file. Unlike
-// chibicc it needs the `-Z build-std`/`llvm-18` toolchain to rebuild, so — like `shell.svmb` — its
-// bytes are the committed in-tree asset (`crates/svm-run/demos/leng_selfhost/svm-leng.svmb`, kept in
-// sync with `svm-leng` by that demo's own code-coupling gate). Copy it in (offline-safe); rebuild with
-// `bash crates/svm-run/demos/leng_selfhost/build_leng_svmb.sh` when `svm-leng`/the encoder changes.
+// temen-leng — the in-browser leng→TEMEN-IR self-host card (NIM.md §3e): the real `temen-leng` translator,
+// compiled to a verified Temen module through the LLVM on-ramp, run over a real hexer Leng file. Unlike
+// chibicc it needs the `-Z build-std`/`llvm-18` toolchain to rebuild, so — like `shell.temen` — its
+// bytes are the committed in-tree asset (`crates/temen-run/demos/leng_selfhost/temen-leng.temen`, kept in
+// sync with `temen-leng` by that demo's own code-coupling gate). Copy it in (offline-safe); rebuild with
+// `bash crates/temen-run/demos/leng_selfhost/build_leng_temen.sh` when `temen-leng`/the encoder changes.
 try {
-  const lengAsset = join(REPO, 'crates', 'svm-run', 'demos', 'leng_selfhost', 'svm-leng.svmb');
-  if (!existsSync(lengAsset)) throw new Error('demos/leng_selfhost/svm-leng.svmb missing (run build_leng_svmb.sh)');
-  copyFileSync(lengAsset, join(ASSETS, 'svm-leng.svmb'));
+  const lengAsset = join(REPO, 'crates', 'temen-run', 'demos', 'leng_selfhost', 'temen-leng.temen');
+  if (!existsSync(lengAsset)) throw new Error('demos/leng_selfhost/temen-leng.temen missing (run build_leng_temen.sh)');
+  copyFileSync(lengAsset, join(ASSETS, 'temen-leng.temen'));
   const kb = (readFileSync(lengAsset).length / 1024).toFixed(0);
-  console.log(`  ✓ svm-leng.svmb (${kb} KB)`);
+  console.log(`  ✓ temen-leng.temen (${kb} KB)`);
 } catch (e) {
-  console.log(`  – svm-leng skipped (${e.message})`);
+  console.log(`  – temen-leng skipped (${e.message})`);
 }
 
-// Shell — the `svm-posix` shell (STAGE1.md, playground-shell). Unlike the clang/on-ramp guests above,
+// Shell — the `temen-posix` shell (STAGE1.md, playground-shell). Unlike the clang/on-ramp guests above,
 // the shell is compiled by the in-tree **chibicc** onto the POSIX personality and run on the tree-walk
 // interpreter (it carries Instantiator cap.calls the wasm-JIT/bytecode paths don't take). Its module
-// bytes are the committed fixture `tests/fixtures/shell.svmb`, produced from the canonical source
-// (`crates/svm-run/demos/shell/*.c`) by the differential's generator:
-//   cargo test -p svm --test c_shell -- --ignored --exact gen_browser_shell_fixture
-// Copy it into web/assets/ (offline-safe, like the committed hello_c.svmb); rebuild the fixture with
+// bytes are the committed fixture `tests/fixtures/shell.temen`, produced from the canonical source
+// (`crates/temen-run/demos/shell/*.c`) by the differential's generator:
+//   cargo test -p temen --test c_shell -- --ignored --exact gen_browser_shell_fixture
+// Copy it into web/assets/ (offline-safe, like the committed hello_c.temen); rebuild the fixture with
 // the command above when the shell source changes.
 try {
-  const fixture = join(HERE, 'tests', 'fixtures', 'shell.svmb');
-  if (!existsSync(fixture)) throw new Error('tests/fixtures/shell.svmb missing (run the generator)');
-  copyFileSync(fixture, join(ASSETS, 'shell.svmb'));
+  const fixture = join(HERE, 'tests', 'fixtures', 'shell.temen');
+  if (!existsSync(fixture)) throw new Error('tests/fixtures/shell.temen missing (run the generator)');
+  copyFileSync(fixture, join(ASSETS, 'shell.temen'));
   const kb = (readFileSync(fixture).length / 1024).toFixed(0);
-  console.log(`  ✓ shell.svmb (${kb} KB)`);
+  console.log(`  ✓ shell.temen (${kb} KB)`);
   // The `__stage` ring-filter runner — granted alongside the shell so pipelines take the concurrent
-  // ring path (op 11 + SharedRegion + futex). Committed next to shell.svmb by the same generator.
-  const runner = join(HERE, 'tests', 'fixtures', 'stage_runner.svmb');
-  if (!existsSync(runner)) throw new Error('tests/fixtures/stage_runner.svmb missing (run the generator)');
-  copyFileSync(runner, join(ASSETS, 'stage_runner.svmb'));
+  // ring path (op 11 + SharedRegion + futex). Committed next to shell.temen by the same generator.
+  const runner = join(HERE, 'tests', 'fixtures', 'stage_runner.temen');
+  if (!existsSync(runner)) throw new Error('tests/fixtures/stage_runner.temen missing (run the generator)');
+  copyFileSync(runner, join(ASSETS, 'stage_runner.temen'));
   const rkb = (readFileSync(runner).length / 1024).toFixed(0);
-  console.log(`  ✓ stage_runner.svmb (${rkb} KB)`);
+  console.log(`  ✓ stage_runner.temen (${rkb} KB)`);
   // The external commands: `primes` (a generator) and `upper` (a stdin filter) — separate compiled-C
   // programs the shell exec's as op-13 children.
   for (const cmd of ['primes', 'upper']) {
-    const p = join(HERE, 'tests', 'fixtures', `${cmd}.svmb`);
-    if (!existsSync(p)) throw new Error(`tests/fixtures/${cmd}.svmb missing (run the generator)`);
-    copyFileSync(p, join(ASSETS, `${cmd}.svmb`));
-    console.log(`  ✓ ${cmd}.svmb (${(readFileSync(p).length / 1024).toFixed(0)} KB)`);
+    const p = join(HERE, 'tests', 'fixtures', `${cmd}.temen`);
+    if (!existsSync(p)) throw new Error(`tests/fixtures/${cmd}.temen missing (run the generator)`);
+    copyFileSync(p, join(ASSETS, `${cmd}.temen`));
+    console.log(`  ✓ ${cmd}.temen (${(readFileSync(p).length / 1024).toFixed(0)} KB)`);
   }
 } catch (e) {
   console.log(`  – shell skipped (${e.message})`);

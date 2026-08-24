@@ -19,7 +19,7 @@ This document has three maturity levels, deliberately kept distinct:
 
 1. **Positional powerbox args** — handles as leading entry args, threaded as
    leading `i32` params through *every* function (the wasm transpiler's
-   "data-SP trick"; ~73 sites in `svm-wasm`).
+   "data-SP trick"; ~73 sites in `temen-wasm`).
 2. **The window stash** — handles written into reserved window slots, reloaded
    by frontend code.
 3. **The numeric convention** — a wasm import `("42", "7")` meaning
@@ -109,13 +109,13 @@ guest→instantiator upcall channel); see §5.2.
 
 - **Root modules: `import i` = slot `i` is already the tree's behavior.** The
   name-bound path documents and implements exactly this — `NamedBinding` is
-  "slot `i` of the powerbox stash ↔ import `i`" (svm-run lib.rs:3477-3483),
+  "slot `i` of the powerbox stash ↔ import `i`" (temen-run lib.rs:3477-3483),
   `grant_caps` grants in import order on a fresh `Host` whose allocator is
   first-free-slot, so slots `0..N` are guaranteed. This design formalizes
   existing behavior rather than introducing new mechanism.
 - **Child modules: a reserved prefix.** `spawn_granted_child` /
   `spawn_named_child` auto-grant `Instantiator` into slot 0 and
-  `AddressSpace` into slot 1 before any named grants (svm-interp
+  `AddressSpace` into slot 1 before any named grants (temen-interp
   lib.rs:11294-11300, 11356-11367) — the same order the child entry already
   receives them as args. A child manifest therefore treats these as
   **implicit leading imports**: its named imports start at slot 2. This is
@@ -123,14 +123,14 @@ guest→instantiator upcall channel); see §5.2.
   naively to child modules.
 - **Mem-hooks instrumentation is exclusive with manifest binding.** The
   opt-in `with_mem_hooks` diagnostics path deliberately takes slot 0
-  ("hooks first", svm-run lib.rs:3884-3886). Under a manifest it is refused
+  ("hooks first", temen-run lib.rs:3884-3886). Under a manifest it is refused
   (simplest; it is a diagnostics-only mode) — offsetting the manifest by the
   hook-grant count is the fallback if refusing proves too restrictive.
 
 **The op selector — phase-1 scope decision** (audit finding, §7): today's
 data model is **one operation per import entry** — `Import { name, sig }`
 carries a single signature, and `Inst::CallImport` carries no `op` immediate
-(svm-ir lib.rs:1723). Phase 1 keeps exactly that: an import names one
+(temen-ir lib.rs:1723). Phase 1 keeps exactly that: an import names one
 operation (`"fs.read"`, `"fs.open"`, … — the existing `default_cap_resolver`
 name shape), `call.import i` invokes it, and instantiation records the
 resolved `(type_id, op)` per slot as **per-instance binding state** beside
@@ -212,7 +212,7 @@ exports) is §3.2.
 
 The headline conventions:
 
-- The numeric `("42","7")` module/name convention in `svm-wasm`.
+- The numeric `("42","7")` module/name convention in `temen-wasm`.
 - Handle threading as leading params of every transpiled function, the
   spawn-shim handle stash, and the powerbox window stash.
 - `Resolved::CapBound` and `patch_placeholder` (`SlotHandleNotConst` dies).
@@ -228,10 +228,10 @@ slot-addressed imports):
 
 - **The synthesized bootstrap prologues**: the `synth_powerbox_start` /
   `synth_powerbox_start_for_imports` / `synth_powerbox_start_with_names`
-  family (svm-ir lib.rs:2700-2741) — generated `_start` wrappers that stash
+  family (temen-ir lib.rs:2700-2741) — generated `_start` wrappers that stash
   positional handles or `cap.self.resolve` names at startup. A manifest
   module needs no synthesized prologue: its slots are bound before entry.
-- **`powerbox_resolver` and `svm-posix::resolve_bound`** — the
+- **`powerbox_resolver` and `temen-posix::resolve_bound`** — the
   `CapBound`-producing resolver wrappers (the "general-form powerbox"
   S15 path). Superseded by slot binding in `grant_caps`.
 - **The positional entry-args ABI** for capability delivery: the
@@ -246,7 +246,7 @@ slot-addressed imports):
   and backends ignore it (encode keeps round-tripping).
 - **Test/doc surface asserting the old world**: the
   `resolved.imports.is_empty()` / imports-cleared assertions across
-  `svm-posix`, `svm-run/tests`, `svm/tests/dynlink*`, `svm-text`'s
+  `temen-posix`, `temen-run/tests`, `temen/tests/dynlink*`, `temen-text`'s
   `resolves_to_capcalls_and_clears_imports`, and the c_frontend/c_posix/
   c_shell/powerbox_* test families that pin the stash/positional/by-name
   bootstraps — flipped or deleted with their phase-3 frontend migrations;
@@ -264,7 +264,7 @@ rather than asserted: no non-linker caller of `resolve_imports*`; no
 occurrence of `CapBound`, `patch_placeholder`, `SlotHandleNotConst`,
 `synth_powerbox_start`, `powerbox_resolver`, `resolve_bound`,
 `NAMED_IMPORT`, `handle_modules`, or `stash_base` outside the linker and
-this document's history; `svm-wasm` emits no leading handle params.
+this document's history; `temen-wasm` emits no leading handle params.
 
 ### 2.6 Security argument
 
@@ -318,14 +318,14 @@ recorded where they refined the plan:*
   modules exercise the new verifier arms, and a verified `call.import`
   reaching a bare host is a clean `CapFault` (fail-closed), never a panic.*
 
-- `svm-ir`: **no changes required.** `Inst::CallImport` already carries
+- `temen-ir`: **no changes required.** `Inst::CallImport` already carries
   `import`/`sig`/`handle`/`args` (lib.rs:1723); `Effects` already classifies
   it as a full clobber identical to `CapCall` (lib.rs:2339-2342).
-- `svm-encode` / `svm-text`: **no changes required.** Both already round-trip
+- `temen-encode` / `temen-text`: **no changes required.** Both already round-trip
   `Module.imports` and `CallImport` with tests (encode lib.rs:322-331,
   506-518, 1558-1566, 1888-1896; text lib.rs:66-73, 393-398, 1141-1153,
   1841-1878, `imports_round_trip`).
-- `svm-verify`: thread `imports: &[Import]` into `verify_func` (one-argument
+- `temen-verify`: thread `imports: &[Import]` into `verify_func` (one-argument
   change mirroring the existing `&funcs` thread-through, lib.rs:142/161).
   Flip the reject arm (lib.rs:275) to: `import < imports.len()`,
   `sig == imports[import].sig`, then the arg-count/arg-type/result checks
@@ -333,20 +333,20 @@ recorded where they refined the plan:*
   "unreachable" arms (lib.rs:446, 597). Add manifest validation to
   `verify_module` (which today never inspects `m.imports` at all): unique
   names, well-formed sigs.
-- `svm-interp` tree-walker: a `CallImport` arm beside the generic `CapCall`
+- `temen-interp` tree-walker: a `CallImport` arm beside the generic `CapCall`
   arm (lib.rs:6914-6934) — resolve table slot `import` (a `resolve_slot`
   sibling of `resolve`, lib.rs:11232) + the per-slot `(type_id, op)` binding
   record, then the existing `cap_dispatch_slots` tail. Flip `eval_inst`'s
   `Trap::Malformed` arm (lib.rs:7782). One-line `cap_stops` arm
   (lib.rs:414-423) so the debugger stops on it like `CapCall`.
-- `svm-interp` bytecode: `Op::CallImport` variant (ops are a Rust enum,
+- `temen-interp` bytecode: `Op::CallImport` variant (ops are a Rust enum,
   bytecode.rs:66 — no opcode-space concern), a `compile_inst` arm mirroring
   the generic `Op::CapCall` lowering (bytecode.rs:1217, replacing the
   `return None` reject at :1321), one exec arm beside :7856. Debug engines
   (`DebugRun`/`ScheduledDebugRun`/`debug_advance_fiber`) inherit it through
   the shared `Vm` op driver — audited: they classify only scheduler-seam
   outcomes, not inline ops. One debug test pinning that.
-- `svm-jit`: a lowering arm reusing `lower_cap_call`'s thunk call
+- `temen-jit`: a lowering arm reusing `lower_cap_call`'s thunk call
   (lib.rs:6945-6977) with `(type_id, op)` from the instantiation binding as
   immediates and the handle resolved from slot `import`; remove `CallImport`
   from the support-gate catch-all (lib.rs:4567). Baking `(type_id, op)` is
@@ -356,16 +356,16 @@ recorded where they refined the plan:*
   assertions keep passing (audited). Cache sharing *for import-bearing
   modules* arrives when the binding table is threaded (phase 2+, the
   instance-context consolidation of §1).
-- `svm-run`: bind in `Instance::grant_caps` (lib.rs:3884-3919) — it already
+- `temen-run`: bind in `Instance::grant_caps` (lib.rs:3884-3919) — it already
   iterates imports in declared order on a fresh Host; redirect from
   rewrite/positional-args to slot-filling + recording `(type_id, op)` per
   slot. `resolve_capability_imports` stays as the legacy path (its
   `imports.is_empty()` early-return already makes it a no-op for migrated
   callers). Refuse `with_mem_hooks` + manifest (slot-layout rule, §2.1).
-- `svm-spec` + fuzz: vectors for the new verifier arms (valid/invalid import
+- `temen-spec` + fuzz: vectors for the new verifier arms (valid/invalid import
   idx, sig mismatch, manifest dup names); extend verifier fuzzing to
   manifest-bearing modules.
-- `svm-snapshot`/`svm-durable`: **no changes required** (audited: restore
+- `temen-snapshot`/`temen-durable`: **no changes required** (audited: restore
   pins exact `(slot, generation)` via `grant_at`, DURABILITY.md §12.5
   declares slot stability as an invariant). Document the one non-guarantee:
   an empty `rebindable` slot's generation resets across restore (capture
@@ -390,7 +390,7 @@ notes:*
   rejected **statically** by the verifier (`AttachNotRebindable`). Dispatched
   through a second reserved pseudo-type_id (`CAP_IMPORT_ATTACH_TYPE_ID`), so
   all three backends share one host implementation, like phase 1.*
-- *`svm_verify::manifest_complete(m)` is the completeness bit: no `cap.call`
+- *`temen_verify::manifest_complete(m)` is the completeness bit: no `cap.call`
   anywhere ⇒ the manifest is the complete egress surface. Reflection does not
   affect the bit (discovery confers nothing without a dispatch).*
 - ***OQ5 resolved:** `cap.call` keeps its mnemonic and wire form — it simply
@@ -407,25 +407,25 @@ Still open from the phase-2 list: interface-grouped imports (`op` immediate +
 interface declarations, open question 3) and the JIT instance-context
 threading for import-bearing cache sharing.
 
-**Phase 3 — frontends.** `svm-wasm` de-threading (~73 handle-threading
-sites — the largest single item); `svm-llvm`; chibicc; `svm-posix` off
-`CapBound`. `svm-wasm-jit`: extend `outline_cap_calls` (lib.rs:1138-1181) to
+**Phase 3 — frontends.** `temen-wasm` de-threading (~73 handle-threading
+sites — the largest single item); `temen-llvm`; chibicc; `temen-posix` off
+`CapBound`. `temen-wasm-jit`: extend `outline_cap_calls` (lib.rs:1138-1181) to
 also outline `CallImport` — its tierability classifier already lists it as a
 host-boundary op (lib.rs:947-949) — and relax the `emit_module` import-free
 assertion (lib.rs:1352-1353) to "no `CallImport` call-site survives in an
 *emitted* function" (permit the manifest; capability dispatch already
 bounces to the interpreter tier, which phase 1 made import-capable, so the
 browser build inherits support).
-`svm-posix`/`svm-run` child spawns adopt the reserved-prefix child manifest
+`temen-posix`/`temen-run` child spawns adopt the reserved-prefix child manifest
 rule (§2.1).
 
 *Phase-3 status:*
 
-- *`svm-wasm-jit` — **landed.** `outline_cap_calls` outlines `CallImport`
+- *`temen-wasm-jit` — **landed.** `outline_cap_calls` outlines `CallImport`
   into the same cross-tier wrapper as `cap.call` (import index baked as an
   immediate); `emit_module` permits the manifest and rejects only an import
   op surviving in an emitted function (`tests/outline_callimport.rs`).*
-- *`svm-wasm` — **landed.** Every wasm function import (numeric convention
+- *`temen-wasm` — **landed.** Every wasm function import (numeric convention
   and §7 named alike) is one manifest entry `"<module>.<name>"`; a `call`
   lowers to `call.import <slot>` with a dummy handle operand. Deleted: the
   `NAMED_IMPORT` sentinel and the numeric-vs-named split, `handle_modules`,
@@ -433,11 +433,11 @@ rule (§2.1).
   at direct/indirect/tail call sites), the spawn-shim handle stash (`§12`
   spawn now needs only the tid counter — bindings are host state shared
   across vCPUs), and the start-wrapper handle threading. Embedders migrated
-  to `Host::set_import_bindings` (svm-wasm's own differential tests,
+  to `Host::set_import_bindings` (temen-wasm's own differential tests,
   the `wasi_named_imports` test — its `bind` helper replaces `resolve_imports` + handle-arg —
   and the bench thunk/fast-resolver, which now map the
   `CAP_IMPORT_TYPE_ID` sentinel dispatch by arity).*
-- *`svm-llvm` — **landed.** `_start` synths dropped the by-name resolve
+- *`temen-llvm` — **landed.** `_start` synths dropped the by-name resolve
   prologue and the `[0,32)` handle stash (paramless entry, zero prologue
   instructions); every call site's vestigial handle operand is a dummy
   const; `__vm_cap(i)` enumerates via `cap.self.get`;
@@ -448,7 +448,7 @@ rule (§2.1).
 - *chibicc — **landed.** Same shape: no resolve prologue, no stash,
   `dummy_handle()` operands, `__vm_cap` via `cap.self.get`, region ops in
   dynamic mode, `__vm_blocking_handle` by-name at the call site.*
-- *Runtime/instantiation — **landed.** `svm_run::instantiate`, the CLI, and
+- *Runtime/instantiation — **landed.** `temen_run::instantiate`, the CLI, and
   `run_powerbox` keep the manifest for a named powerbox entry and bind each
   slot in `grant_caps` (name → `(type_id, op)` via `default_cap_resolver`,
   handle by interface); the legacy rewrite remains only for positional
@@ -456,13 +456,13 @@ rule (§2.1).
   tree-walker's special `Jit` servicing translate the
   `CAP_IMPORT_TYPE_ID` sentinel through the binding table *before* their
   interface interception (shared macro bodies — one implementation).
-  `svm-posix::bind` supersedes `resolve_bound` at its use sites. The
+  `temen-posix::bind` supersedes `resolve_bound` at its use sites. The
   browser's on-ramp binds manifest modules (`onramp_prepare` keeps the
   rewrite only for legacy positional blobs). **§2.1 child manifests:**
   `ModuleGrant` retains the import list; an op-13 spawn binds the child's
   slots against its granted powerbox on both backends
   (`Host::bind_child_manifest`, the interp inline + the JIT's
-  `ChildManifestBinder` hook via `svm_run::child_bind_imports`).*
+  `ChildManifestBinder` hook via `temen_run::child_bind_imports`).*
 
 **Phase 4 — deletions**: the **full §2.5 inventory** — the five headline
 conventions *and* the secondary machinery (the `synth_powerbox_start*`
@@ -474,7 +474,7 @@ LOC. **Exit criterion: the §2.5 grep-clean completion gate passes** — done
 is checked, not asserted. *Status: **landed**, notes:*
 
 - *The gate is a **test**, not a grep run by hand:
-  `crates/svm/tests/imports_gate.rs` scans the tree's `.rs`/`.c`/`.h`
+  `crates/temen/tests/imports_gate.rs` scans the tree's `.rs`/`.c`/`.h`
   sources and fails on any reappearance of the deleted symbols, and pins
   `resolve_imports_with` call sites to the linker allowlist.
   `patch_placeholder`/`SlotHandleNotConst` survive only as the
@@ -548,7 +548,7 @@ Trust model served (the asymmetry, stated once):
 offer model — DESIGN.md §12a (was CALLS.md; full text in git history). What survives of this
 section's contract, unchanged: an `impl` export is an **offer** — declaring it confers
 nothing; authority moves only when a wiring party connects it to an importer, and provenance
-is recorded per §3.1. Wire format (impl-export section, v5/v6): documented in `svm-encode`.*
+is recorded per §3.1. Wire format (impl-export section, v5/v6): documented in `temen-encode`.*
 
 ### 3.3 Forwarding, wrapping, overriding — one act
 
@@ -640,7 +640,7 @@ func 0 () -> (i64) {
 - **An import name is one string; the core only compares it for equality**
   (settled 2026-07-22, replacing the earlier two-level `("env", "fs")` form).
   Namespacing is a *convention inside the string*, never a wire field: dotted
-  segments, most-significant first — `posix.fs`, `app.log` — with the `svm.`
+  segments, most-significant first — `posix.fs`, `app.log` — with the `temen.`
   prefix reserved for platform-defined interfaces. Wirer policy (forward
   everything under `posix.`, grant by prefix) is prefix matching in binder
   code, exactly where policy belongs; the mechanism stays name-blind. This is
@@ -898,7 +898,7 @@ declared entry requires must appear in the provided shape — the same
 fail-closed check as `wire_impl`, applied at the registry boundary. A
 consumer requiring only `{ read, len }` binds against this four-op provider.
 
-**Parent domain with a nested child, svm-ir** (the §3.3 wrap, grouped —
+**Parent domain with a nested child, temen-ir** (the §3.3 wrap, grouped —
 subset consumer):
 
 ```
@@ -1049,7 +1049,7 @@ with its reason recorded:
   first (Cap → `cap.call` on the live operand; Slot → `call_indirect` via the
   operand's patched `ConstI32`; Func → direct call). One spelling, two binding times:
   a symbolic call binds by name at whichever binding act comes first. Emitters that
-  never link (svm-llvm, svm-wasm, the printer's canonical output) produce the clean
+  never link (temen-llvm, temen-wasm, the printer's canonical output) produce the clean
   form only.
 - **[BUILT 2026-07-22] `cap` boundary translation.** A parameter or result the offer
   op signature types `cap` is re-granted at the offer-call boundary: caller→provider
@@ -1081,7 +1081,7 @@ with its reason recorded:
   backends. The host-side mirror of a guest offer: `impl_service` wires a guest module as
   the provider, `iface` wires a host-native handle.
 - **[BUILT 2026-07-22] Intern pre-seeding of built-in interface shapes.** Built-in
-  interfaces publish a canonical op-signature shape (`svm_interp::builtin_iface_shape`),
+  interfaces publish a canonical op-signature shape (`temen_interp::builtin_iface_shape`),
   pre-seeded into the per-host intern (`preseeded_iface_shapes`): a guest interface
   declaration structurally equal to a pre-seeded shape now interns to the **built-in id**
   rather than a fresh guest id — D59 extended across the host-native/guest-impl divide, so
@@ -1099,7 +1099,7 @@ with its reason recorded:
   convention for built-ins is unsettled) and `HOST_FN` (per-registration semantics, no
   canonical shape) are the deliberate exceptions; each additional built-in shape lands when
   its signature convention is pinned and a consumer needs it.
-- **[BUILT 2026-07-22] The `svm_interp::iface` constants module is now `cap_id`.** The
+- **[BUILT 2026-07-22] The `temen_interp::iface` constants module is now `cap_id`.** The
   built-in interface type-id constants (`cap_id::STREAM` … `cap_id::BUDGET`,
   `cap_id::GUEST_IMPL_BASE`) read as capability type identifiers at their use sites
   (`type_id == cap_id::STREAM`); the `iface` name is retained only for the `HostCap.iface`
@@ -1235,11 +1235,11 @@ dynamic mode, reflection) cover discovery of *granted* capabilities only.
    slot; DURABILITY.md §12.5 pins "reinstate the same `(slot, generation)`"
    as a hard invariant; the snapshot roundtrip test proves guest-held packed
    handle values survive restore.
-2. ~~Does anything in `svm-wasm-jit`/browser assume import-free modules
+2. ~~Does anything in `temen-wasm-jit`/browser assume import-free modules
    post-load?~~ — **RESOLVED (audit, §7): yes, one site** — `emit_module`
-   hard-rejects non-empty imports (svm-wasm-jit lib.rs:1352-1353). Fix scoped
+   hard-rejects non-empty imports (temen-wasm-jit lib.rs:1352-1353). Fix scoped
    in phase 3; the browser adds no independent assumption (its `env.*` wasm
-   imports are unrelated to SVM capability imports, and capability dispatch
+   imports are unrelated to Temen capability imports, and capability dispatch
    bounces to the interpreter tier).
 3. ~~Wire format for the manifest's interface declarations~~ — **RESOLVED
    (wire v6, 2026-07-20): the single type section landed.** A module declares
@@ -1280,7 +1280,7 @@ dynamic mode, reflection) cover discovery of *granted* capabilities only.
    of v6 — the interface section), and with the rewrite deleted the digest
    is per-module instead of per-instantiation, a strict improvement. No
    codec change was needed.
-7. **Globals (wasm parity) — OPEN, design wanted (2026-07-21).** svm-ir has
+7. **Globals (wasm parity) — OPEN, design wanted (2026-07-21).** temen-ir has
    no globals of any kind: state is SSA values, the window, or host-side
    capability state. Wasm uses globals for three distinct jobs, and any
    design should treat them separately rather than import the feature
@@ -1317,6 +1317,6 @@ findings, with the §2 deltas they forced:
 | Track | Verdict | Load-bearing findings |
 |---|---|---|
 | Verifier / encode / text / load pipeline | Works; small adaptations | `verify_func` lacks `imports` in scope — one-arg thread-through (mirrors `&funcs`). Encode + text already round-trip manifests and `call.import`, tested. `verify_module` never inspects `m.imports` today (manifest itself unchecked — phase 1 adds validation). `grant_caps` already grants in import order = the natural binding hook. |
-| Runtime dispatch (interp, bytecode, JIT, wasmjit, opt/peval) | Thin adapters everywhere | Effects model + svm-opt already treat `CallImport` identically to `CapCall`; svm-peval is effects-generic. Bytecode debug engines inherit new ops via the shared `Vm` driver. JIT: bake `(type_id,op)` phase-1 (cache unaffected — only empty-powerbox children are cached today); thread the binding for cache sharing later. **Design gap caught: `CallImport` has no `op` immediate → phase 1 is one-op-per-import (§2.1).** |
+| Runtime dispatch (interp, bytecode, JIT, wasmjit, opt/peval) | Thin adapters everywhere | Effects model + temen-opt already treat `CallImport` identically to `CapCall`; temen-peval is effects-generic. Bytecode debug engines inherit new ops via the shared `Vm` driver. JIT: bake `(type_id,op)` phase-1 (cache unaffected — only empty-powerbox children are cached today); thread the binding for cache sharing later. **Design gap caught: `CallImport` has no `op` immediate → phase 1 is one-op-per-import (§2.1).** |
 | Handle table / prefix | Works; one real landmine, fixed in §2.1 | Root path already implements "import i = slot i" (`NamedBinding`). The DESIGN.md "first handle 0 vs 1" divergence is the *fiber* registry (separate table, already unified, D57) — false alarm for imports. **Real landmine: child auto-grants occupy slots 0/1 → reserved-prefix child manifest rule (§2.1).** `with_mem_hooks` steals slot 0 → exclusive with manifests (§2.1). Table is `Arc<Mutex<Host>>` across vCPUs — slot reads thread-safe. |
 | Durability / snapshots | Works as-is | Slot indices already stable ABI (`grant_at` pins `(slot, generation)`; DURABILITY.md §12.5 invariant; roundtrip test). Digest currently over post-rewrite bytes — removing the rewrite makes it per-module (improvement). Non-guarantee documented: empty `rebindable` slots reset generation across restore. |

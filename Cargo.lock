@@ -612,280 +612,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "svm"
-version = "0.0.0"
-dependencies = [
- "libc",
- "svm-durable",
- "svm-encode",
- "svm-interp",
- "svm-ir",
- "svm-jit",
- "svm-parity",
- "svm-posix",
- "svm-run",
- "svm-snapshot",
- "svm-spec",
- "svm-text",
- "svm-verify",
- "svm-wasm",
- "svm-wasm-jit",
- "wasmi",
- "wat",
-]
-
-[[package]]
-name = "svm-capi"
-version = "0.0.0"
-dependencies = [
- "svm-encode",
- "svm-interp",
- "svm-ir",
- "svm-run",
- "svm-text",
-]
-
-[[package]]
-name = "svm-dap"
-version = "0.0.0"
-dependencies = [
- "svm-interp",
- "svm-ir",
- "svm-text",
-]
-
-[[package]]
-name = "svm-durable"
-version = "0.0.0"
-dependencies = [
- "svm-interp",
- "svm-ir",
- "svm-text",
- "svm-verify",
-]
-
-[[package]]
-name = "svm-encode"
-version = "0.0.0"
-dependencies = [
- "svm-ir",
-]
-
-[[package]]
-name = "svm-exec"
-version = "0.0.0"
-dependencies = [
- "svm-interp",
- "svm-ir",
-]
-
-[[package]]
-name = "svm-fiber"
-version = "0.0.0"
-dependencies = [
- "libc",
- "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "svm-fs"
-version = "0.0.0"
-dependencies = [
- "svm-interp",
- "svm-ir",
-]
-
-[[package]]
-name = "svm-interp"
-version = "0.0.0"
-dependencies = [
- "page_size",
- "svm-encode",
- "svm-ir",
- "svm-mask",
- "svm-mem",
- "svm-text",
- "svm-verify",
-]
-
-[[package]]
-name = "svm-ir"
-version = "0.0.0"
-
-[[package]]
-name = "svm-jit"
-version = "0.0.0"
-dependencies = [
- "cc",
- "cranelift-codegen",
- "cranelift-frontend",
- "cranelift-jit",
- "cranelift-module",
- "cranelift-native",
- "libc",
- "loom",
- "svm-fiber",
- "svm-interp",
- "svm-ir",
- "svm-text",
- "svm-verify",
- "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "svm-leng"
-version = "0.0.0"
-dependencies = [
- "svm-encode",
- "svm-interp",
- "svm-ir",
- "svm-jit",
- "svm-posix",
- "svm-run",
- "svm-text",
- "svm-verify",
-]
-
-[[package]]
-name = "svm-mask"
-version = "0.0.0"
-
-[[package]]
-name = "svm-mem"
-version = "0.0.0"
-dependencies = [
- "libc",
-]
-
-[[package]]
-name = "svm-opt"
-version = "0.0.0"
-dependencies = [
- "libm",
- "svm-interp",
- "svm-ir",
- "svm-verify",
-]
-
-[[package]]
-name = "svm-parity"
-version = "0.0.0"
-dependencies = [
- "svm-interp",
- "svm-ir",
- "svm-jit",
- "svm-verify",
- "svm-wasm-jit",
-]
-
-[[package]]
-name = "svm-peval"
-version = "0.0.0"
-dependencies = [
- "svm-encode",
- "svm-interp",
- "svm-ir",
- "svm-jit",
- "svm-opt",
- "svm-text",
- "svm-verify",
-]
-
-[[package]]
-name = "svm-posix"
-version = "0.0.0"
-dependencies = [
- "svm-interp",
- "svm-ir",
- "svm-jit",
- "svm-run",
- "svm-text",
- "svm-verify",
-]
-
-[[package]]
-name = "svm-run"
-version = "0.0.0"
-dependencies = [
- "libc",
- "svm-durable",
- "svm-encode",
- "svm-exec",
- "svm-fs",
- "svm-interp",
- "svm-ir",
- "svm-jit",
- "svm-leng",
- "svm-opt",
- "svm-peval",
- "svm-posix",
- "svm-text",
- "svm-verify",
- "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "svm-snapshot"
-version = "0.0.0"
-dependencies = [
- "svm-durable",
- "svm-encode",
- "svm-interp",
- "svm-ir",
- "svm-text",
- "svm-verify",
-]
-
-[[package]]
-name = "svm-spec"
-version = "0.0.0"
-dependencies = [
- "svm-ir",
-]
-
-[[package]]
-name = "svm-text"
-version = "0.0.0"
-dependencies = [
- "svm-ir",
-]
-
-[[package]]
-name = "svm-verify"
-version = "0.0.0"
-dependencies = [
- "svm-ir",
-]
-
-[[package]]
-name = "svm-wasm"
-version = "0.0.0"
-dependencies = [
- "svm-interp",
- "svm-ir",
- "svm-jit",
- "svm-run",
- "svm-text",
- "svm-verify",
- "wasmparser 0.251.0",
- "wast",
- "wat",
-]
-
-[[package]]
-name = "svm-wasm-jit"
-version = "0.0.0"
-dependencies = [
- "svm-encode",
- "svm-interp",
- "svm-ir",
- "svm-jit",
- "svm-text",
- "svm-verify",
- "wasmi",
-]
-
-[[package]]
 name = "syn"
 version = "2.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -901,6 +627,280 @@ name = "target-lexicon"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
+
+[[package]]
+name = "temen"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "temen-durable",
+ "temen-encode",
+ "temen-interp",
+ "temen-ir",
+ "temen-jit",
+ "temen-parity",
+ "temen-posix",
+ "temen-run",
+ "temen-snapshot",
+ "temen-spec",
+ "temen-text",
+ "temen-verify",
+ "temen-wasm",
+ "temen-wasm-jit",
+ "wasmi",
+ "wat",
+]
+
+[[package]]
+name = "temen-capi"
+version = "0.0.0"
+dependencies = [
+ "temen-encode",
+ "temen-interp",
+ "temen-ir",
+ "temen-run",
+ "temen-text",
+]
+
+[[package]]
+name = "temen-dap"
+version = "0.0.0"
+dependencies = [
+ "temen-interp",
+ "temen-ir",
+ "temen-text",
+]
+
+[[package]]
+name = "temen-durable"
+version = "0.0.0"
+dependencies = [
+ "temen-interp",
+ "temen-ir",
+ "temen-text",
+ "temen-verify",
+]
+
+[[package]]
+name = "temen-encode"
+version = "0.0.0"
+dependencies = [
+ "temen-ir",
+]
+
+[[package]]
+name = "temen-exec"
+version = "0.0.0"
+dependencies = [
+ "temen-interp",
+ "temen-ir",
+]
+
+[[package]]
+name = "temen-fiber"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "temen-fs"
+version = "0.0.0"
+dependencies = [
+ "temen-interp",
+ "temen-ir",
+]
+
+[[package]]
+name = "temen-interp"
+version = "0.0.0"
+dependencies = [
+ "page_size",
+ "temen-encode",
+ "temen-ir",
+ "temen-mask",
+ "temen-mem",
+ "temen-text",
+ "temen-verify",
+]
+
+[[package]]
+name = "temen-ir"
+version = "0.0.0"
+
+[[package]]
+name = "temen-jit"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "cranelift-codegen",
+ "cranelift-frontend",
+ "cranelift-jit",
+ "cranelift-module",
+ "cranelift-native",
+ "libc",
+ "loom",
+ "temen-fiber",
+ "temen-interp",
+ "temen-ir",
+ "temen-text",
+ "temen-verify",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "temen-leng"
+version = "0.0.0"
+dependencies = [
+ "temen-encode",
+ "temen-interp",
+ "temen-ir",
+ "temen-jit",
+ "temen-posix",
+ "temen-run",
+ "temen-text",
+ "temen-verify",
+]
+
+[[package]]
+name = "temen-mask"
+version = "0.0.0"
+
+[[package]]
+name = "temen-mem"
+version = "0.0.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "temen-opt"
+version = "0.0.0"
+dependencies = [
+ "libm",
+ "temen-interp",
+ "temen-ir",
+ "temen-verify",
+]
+
+[[package]]
+name = "temen-parity"
+version = "0.0.0"
+dependencies = [
+ "temen-interp",
+ "temen-ir",
+ "temen-jit",
+ "temen-verify",
+ "temen-wasm-jit",
+]
+
+[[package]]
+name = "temen-peval"
+version = "0.0.0"
+dependencies = [
+ "temen-encode",
+ "temen-interp",
+ "temen-ir",
+ "temen-jit",
+ "temen-opt",
+ "temen-text",
+ "temen-verify",
+]
+
+[[package]]
+name = "temen-posix"
+version = "0.0.0"
+dependencies = [
+ "temen-interp",
+ "temen-ir",
+ "temen-jit",
+ "temen-run",
+ "temen-text",
+ "temen-verify",
+]
+
+[[package]]
+name = "temen-run"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "temen-durable",
+ "temen-encode",
+ "temen-exec",
+ "temen-fs",
+ "temen-interp",
+ "temen-ir",
+ "temen-jit",
+ "temen-leng",
+ "temen-opt",
+ "temen-peval",
+ "temen-posix",
+ "temen-text",
+ "temen-verify",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "temen-snapshot"
+version = "0.0.0"
+dependencies = [
+ "temen-durable",
+ "temen-encode",
+ "temen-interp",
+ "temen-ir",
+ "temen-text",
+ "temen-verify",
+]
+
+[[package]]
+name = "temen-spec"
+version = "0.0.0"
+dependencies = [
+ "temen-ir",
+]
+
+[[package]]
+name = "temen-text"
+version = "0.0.0"
+dependencies = [
+ "temen-ir",
+]
+
+[[package]]
+name = "temen-verify"
+version = "0.0.0"
+dependencies = [
+ "temen-ir",
+]
+
+[[package]]
+name = "temen-wasm"
+version = "0.0.0"
+dependencies = [
+ "temen-interp",
+ "temen-ir",
+ "temen-jit",
+ "temen-run",
+ "temen-text",
+ "temen-verify",
+ "wasmparser 0.251.0",
+ "wast",
+ "wat",
+]
+
+[[package]]
+name = "temen-wasm-jit"
+version = "0.0.0"
+dependencies = [
+ "temen-encode",
+ "temen-interp",
+ "temen-ir",
+ "temen-jit",
+ "temen-text",
+ "temen-verify",
+ "wasmi",
+]
 
 [[package]]
 name = "thread_local"

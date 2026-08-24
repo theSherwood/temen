@@ -14,7 +14,7 @@ try {
     const { loadEngine } = await import('/web/par.js');
     const { openJitReactor } = await import('/web/wasmjit-reactor.js');
     const eng = await loadEngine();
-    const doom = new Uint8Array(await (await fetch('/web/assets/doom.svmb')).arrayBuffer());
+    const doom = new Uint8Array(await (await fetch('/web/assets/doom.temen')).arrayBuffer());
     const wad = new Uint8Array(await (await fetch('/web/assets/doom1.wad')).arrayBuffer());
     const reactor = await openJitReactor(eng.ex, eng.memory, doom, 'doom1.wad', wad);
     // Warm up past the cold regime: V8 must baseline- then optimizing-compile the ~1000-function

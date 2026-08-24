@@ -3,29 +3,29 @@
 //! with `open_memstream` (chibicc's `format()` builds every string through a memory stream), `strtold`
 //! (long double = double here), `strerror`, and the system-header stubs `chibicc.h` `#include`s
 //! (`<sys/stat.h>`, `<unistd.h>`, `<time.h>`, `<glob.h>`, …). With those seeded, chibicc-the-guest
-//! **compiles real chibicc `-cc1` translation units to valid SVM IR**, entirely in-sandbox — the
+//! **compiles real chibicc `-cc1` translation units to valid Temen IR**, entirely in-sandbox — the
 //! self-host lever. These tests compile several of chibicc's own `.c` files (tokenize/strings/hashmap/
 //! unicode — chosen to exercise the tokenizer, the `open_memstream` string builder, the allocator, and
-//! the UTF-8 path) and assert each parses + verifies as a module. Fail-soft: SKIPs without `chibicc.svmb`.
+//! the UTF-8 path) and assert each parses + verifies as a module. Fail-soft: SKIPs without `chibicc.temen`.
 //!
 //! Not yet covered (the remaining self-host slice): a single **unity** build of the whole compiler
 //! (all TUs + the `cc1_main` entry) into one runnable module — cross-TU references (e.g. parse.c's
 //! `struct_type`) only resolve when every TU is compiled together, and that whole-compiler amalgamation
 //! has its own tail. This gate pins that the per-TU compile — the hard libc/header work — is done.
 
-use svm_browser::{onramp_fs_exec, playground_include_files, STATUS_EXIT, STATUS_OK};
+use temen_browser::{onramp_fs_exec, playground_include_files, STATUS_EXIT, STATUS_OK};
 
-fn chibicc_svmb() -> Option<svm_ir::Module> {
-    let p = concat!(env!("CARGO_MANIFEST_DIR"), "/web/assets/chibicc.svmb");
+fn chibicc_temen() -> Option<temen_ir::Module> {
+    let p = concat!(env!("CARGO_MANIFEST_DIR"), "/web/assets/chibicc.temen");
     let bytes = std::fs::read(p).ok()?;
-    Some(svm_encode::decode_module(&bytes).expect("decode chibicc.svmb"))
+    Some(temen_encode::decode_module(&bytes).expect("decode chibicc.temen"))
 }
 
 /// Seed the playground libc + `chibicc.h` (a sibling of the source, quote-included), compile the
 /// chibicc translation unit `tu` (read from `frontend/chibicc/`), and return `(status, ir_len,
 /// parses_ok)`. The seeded headers are exactly what the card ships (`playground_include_files`), so
 /// this exercises the *shipped* libc — no test-only headers.
-fn compile_tu(chibicc: &svm_ir::Module, tu: &str) -> (i32, usize, bool) {
+fn compile_tu(chibicc: &temen_ir::Module, tu: &str) -> (i32, usize, bool) {
     let frontend = concat!(env!("CARGO_MANIFEST_DIR"), "/../frontend/chibicc");
     let mut files = playground_include_files();
     // chibicc.h at `/chibicc.h` — the TU `#include "chibicc.h"`s it (quote-include against `/`).
@@ -38,7 +38,7 @@ fn compile_tu(chibicc: &svm_ir::Module, tu: &str) -> (i32, usize, bool) {
         std::fs::read(format!("{frontend}/{tu}")).unwrap_or_else(|e| panic!("read {tu}: {e}")),
     ));
     let dirs = vec!["include".to_string(), "include/sys".to_string()];
-    let image = svm_fs::encode_image(&files, &dirs);
+    let image = temen_fs::encode_image(&files, &dirs);
 
     let out = onramp_fs_exec(
         chibicc,
@@ -49,32 +49,32 @@ fn compile_tu(chibicc: &svm_ir::Module, tu: &str) -> (i32, usize, bool) {
     let ir = String::from_utf8_lossy(&out.stdout).into_owned();
     let parses = (out.status == STATUS_OK || out.status == STATUS_EXIT)
         && ir.contains("func")
-        && svm_text::parse_module(&ir).is_ok();
+        && temen_text::parse_module(&ir).is_ok();
     (out.status, ir.len(), parses)
 }
 
-/// Real chibicc `-cc1` translation units compile to valid SVM IR in the sandbox. `strings.c` is the
+/// Real chibicc `-cc1` translation units compile to valid Temen IR in the sandbox. `strings.c` is the
 /// libc-surface load-bearer (chibicc's `format()` builds strings through `open_memstream` +
 /// `vfprintf` + `fclose`). Also pins the **`vm_map`-growable heap**: removing chibicc's fixed 24 MiB
-/// static arena (so `malloc` grows into the reserved tail on demand) dropped chibicc.svmb's declared
+/// static arena (so `malloc` grows into the reserved tail on demand) dropped chibicc.temen's declared
 /// memory — the arena was the bloat — which the `size_log2` check gates structurally.
 #[test]
 fn chibicc_translation_units_compile_to_valid_ir() {
-    let Some(chibicc) = chibicc_svmb() else {
-        eprintln!("SKIP: chibicc.svmb absent");
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
         return;
     };
     assert!(
         chibicc.memory.map_or(0, |m| m.size_log2) <= 24,
-        "growable heap ⇒ chibicc.svmb no longer carries a multi-MiB static arena in its window"
+        "growable heap ⇒ chibicc.temen no longer carries a multi-MiB static arena in its window"
     );
     for tu in ["tokenize.c", "strings.c", "hashmap.c", "unicode.c"] {
         let (status, ir_len, parses) = compile_tu(&chibicc, tu);
         assert!(
             parses,
-            "chibicc TU {tu} should compile to valid SVM IR (status {status}, {ir_len} B IR)"
+            "chibicc TU {tu} should compile to valid Temen IR (status {status}, {ir_len} B IR)"
         );
-        eprintln!("chibicc {tu} → {ir_len} B of SVM IR (parses + verifies)");
+        eprintln!("chibicc {tu} → {ir_len} B of Temen IR (parses + verifies)");
     }
 }
 
@@ -85,16 +85,16 @@ fn chibicc_translation_units_compile_to_valid_ir() {
 #[test]
 #[ignore = "heavy (~70s): chibicc's largest TU — the growable-heap stress proof"]
 fn largest_tu_compiles_with_the_growable_heap() {
-    let Some(chibicc) = chibicc_svmb() else {
-        eprintln!("SKIP: chibicc.svmb absent");
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
         return;
     };
     let (status, ir_len, parses) = compile_tu(&chibicc, "codegen_ir.c");
     assert!(
         parses,
-        "chibicc codegen_ir.c should compile to valid SVM IR (status {status}, {ir_len} B IR)"
+        "chibicc codegen_ir.c should compile to valid Temen IR (status {status}, {ir_len} B IR)"
     );
-    eprintln!("chibicc codegen_ir.c → {ir_len} B of SVM IR (parses + verifies)");
+    eprintln!("chibicc codegen_ir.c → {ir_len} B of Temen IR (parses + verifies)");
 }
 
 /// The load-bearing new capability, exercised at **runtime**: `open_memstream` → `fprintf` into the
@@ -102,9 +102,9 @@ fn largest_tu_compiles_with_the_growable_heap() {
 /// program using it compiles *and runs* correctly under the powerbox.
 #[test]
 fn open_memstream_round_trips_at_runtime() {
-    use svm_browser::onramp_exec;
-    let Some(chibicc) = chibicc_svmb() else {
-        eprintln!("SKIP: chibicc.svmb absent");
+    use temen_browser::onramp_exec;
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
         return;
     };
     let mut files = playground_include_files();
@@ -122,7 +122,7 @@ int main(void) {
 "#
         .to_vec(),
     ));
-    let image = svm_fs::encode_image(&files, &["include".to_string()]);
+    let image = temen_fs::encode_image(&files, &["include".to_string()]);
     let compiled = onramp_fs_exec(
         &chibicc,
         &image,
@@ -131,7 +131,7 @@ int main(void) {
     );
     assert!(compiled.status == STATUS_OK || compiled.status == STATUS_EXIT);
     let ir = String::from_utf8(compiled.stdout).expect("IR utf8");
-    let m = svm_text::parse_module(&ir).expect("parse IR");
+    let m = temen_text::parse_module(&ir).expect("parse IR");
     let run = onramp_exec(&m, b"");
     assert_eq!(run.status, STATUS_OK);
     assert_eq!(String::from_utf8_lossy(&run.stdout), "[0][1][4] len=9\n");

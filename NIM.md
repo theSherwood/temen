@@ -1,33 +1,33 @@
-# NIM.md — running Nim (nimony) on SVM, and self-hosting it
+# NIM.md — running Nim (nimony) on Temen, and self-hosting it
 
 Status: **scoping / design doc + phase-1 in progress**, written 2026-07-28. This is the
-work-breakdown and the load-bearing decisions for targeting SVM from
+work-breakdown and the load-bearing decisions for targeting Temen from
 [nimony](https://github.com/nim-lang/nimony) — the in-development next-generation Nim
 compiler. It leans on the on-ramp (`LLVM.md`), the C-selfhost template (`SELFHOST_C.md`),
 libc-as-capabilities (`POSIX.md`), and the frontend trust model (`FRONTEND.md` §1,
 `DESIGN.md` §2a). This doc is the *what/how/when*; it does not restate those.
 
 This doc stays its own file — it is **not** folded into `DESIGN.md`. `DESIGN.md` describes
-SVM itself; NIM.md describes a *guest* project that runs **on** SVM (nimony, a consumer of the
-substrate). The two never merge: svm's design and the design of something built atop it are
+Temen itself; NIM.md describes a *guest* project that runs **on** Temen (nimony, a consumer of the
+substrate). The two never merge: temen's design and the design of something built atop it are
 separate concerns, even where they touch the same seams.
 
 ## 0. TL;DR
 
-- **Goal.** Compile Nim → SVM IR, and eventually **self-host nimony on SVM** — the same
-  shape as chibicc-on-SVM (`SELFHOST_C.md`) and the Postgres/QuickJS guest assets.
+- **Goal.** Compile Nim → Temen IR, and eventually **self-host nimony on Temen** — the same
+  shape as chibicc-on-Temen (`SELFHOST_C.md`) and the Postgres/QuickJS guest assets.
 - **Two phases, cheapest-first.**
   - **Phase 1 (this doc's active work): the C on-ramp path — zero nimony code.**
-    nimony already emits C; SVM already ingests C→bitcode→SVM-IR via the proven LLVM
-    on-ramp (`LLVM.md`). So `nim → nimony → Leng → lengc(C) → clang -O2 → svm-llvm-translate
-    → prep_svmb`. This retires the real risk (does Nim-shaped codegen — ARC, error-flag
+    nimony already emits C; Temen already ingests C→bitcode→TEMEN-IR via the proven LLVM
+    on-ramp (`LLVM.md`). So `nim → nimony → Leng → lengc(C) → clang -O2 → temen-llvm-translate
+    → prep_temen`. This retires the real risk (does Nim-shaped codegen — ARC, error-flag
     exceptions, raw-pointer objects, the `system` runtime — survive the on-ramp and run
-    correctly under confinement?) and delivers **nimony-on-SVM for free**, exactly as
-    `chibicc.svmb` came for free from the same pipeline.
-  - **Phase 2 (optional, if warranted): a native `Leng → SVM-IR` backend.** A
-    `lengc`-style backend written in Nim, consuming Leng NIF and emitting SVM text — the
+    correctly under confinement?) and delivers **nimony-on-Temen for free**, exactly as
+    `chibicc.temen` came for free from the same pipeline.
+  - **Phase 2 (optional, if warranted): a native `Leng → TEMEN-IR` backend.** A
+    `lengc`-style backend written in Nim, consuming Leng NIF and emitting Temen text — the
     supported multi-backend seam (C/C++/LLVM-IR/arkham already coexist behind Leng). The
-    **"arkham-for-SVM"** play: drops the clang/LLVM build-time dependency and shapes SVM-IR
+    **"arkham-for-Temen"** play: drops the clang/LLVM build-time dependency and shapes TEMEN-IR
     directly from Leng.
 - **The one thing that could scare you — Leng assumes flat C-ABI memory with raw
   pointers — is already solved.** It is the C frontend's situation exactly: the guest gets a
@@ -69,7 +69,7 @@ Nim source
   is what makes Phase 2 tractable.
 - **Runtime shape — favorable:**
   - **ARC/ORC only, no tracing GC.** Destructors/dups are injected by hexer as **ordinary
-    Leng calls** → ordinary SVM-IR calls. No GC runtime to port.
+    Leng calls** → ordinary TEMEN-IR calls. No GC runtime to port.
   - **libc optional.** Default stdlib is **libc-free** (native allocator + raw-syscall IO);
     `-d:useLibc` opts into mimalloc. Raw syscalls → unresolved named imports the POSIX
     personality resolves at load (`POSIX.md`) — the exact self-host libc model.
@@ -81,14 +81,14 @@ Nim source
 
 ### Compatibility ledger (the "why this works")
 
-| nimony/Leng concern | Lands on SVM as |
+| nimony/Leng concern | Lands on Temen as |
 |---|---|
 | Flat C-ABI memory, raw `ptr`/`aptr`, unions, casts | Window + masking lowering, as for C; §3d pins x86-64-SysV struct layout — matches Leng's ABI |
-| ARC/ORC, destructors as calls | Ordinary SVM-IR calls; **no GC runtime** |
+| ARC/ORC, destructors as calls | Ordinary TEMEN-IR calls; **no GC runtime** |
 | libc-free / raw syscalls / mimalloc | Named imports → POSIX personality; allocator grows the window via the Memory cap |
-| Exceptions: error-flag + goto | SVM-IR general goto/branch (C frontend proves gnarly state machines) |
+| Exceptions: error-flag + goto | TEMEN-IR general goto/branch (C frontend proves gnarly state machines) |
 | Bit-reinterpret casts | Already lowered to `copyMem` upstream — not arbitrary bit-punning at Leng |
-| CPS/passive → state machines | Ordinary code over minimal `system.nim`; SVM threads (`THREADS.md`) |
+| CPS/passive → state machines | Ordinary code over minimal `system.nim`; Temen threads (`THREADS.md`) |
 | Leng is not SSA | SSA/block-params synthesized from named locals + goto — the on-ramp already does φ→block-args (`LLVM.md`); a native backend redoes this |
 
 ### Trust (both phases)
@@ -100,8 +100,8 @@ No self-hosting convenience may bypass verification (INVARIANTS §9).
 ## 2. Phase 1 — the C on-ramp path (active)
 
 **Pipeline.** `nim → nimony/hexer → Leng → lengc c → clang-18 -O2 -emit-llvm →
-svm-llvm-translate → prep_svmb (decode → verify → bytecode-compile gate)`, then run on
-interpreter + JIT. This is the **`build-pg-assets.mjs` / `build_chibicc_svmb.sh` pattern**,
+temen-llvm-translate → prep_temen (decode → verify → bytecode-compile gate)`, then run on
+interpreter + JIT. This is the **`build-pg-assets.mjs` / `build_chibicc_temen.sh` pattern**,
 retargeted at nimony's C output. Use the **LLVM on-ramp, not the chibicc C frontend**: Nim's
 C leans on compiler builtins (overflow — Leng's `keepovf`/`ovf`) that clang handles and
 chibicc does not.
@@ -113,19 +113,19 @@ chibicc does not.
    program exercises the exact patterns nimony/Leng emit: ARC refcount inc/dec + a destructor
    call, an error-flag + goto raise/handler, a tagged `object` with an inheritance-style first
    field, and a heap `seq`/`string`-like struct over `malloc`. Run interp == JIT == native.
-   **→ DONE 2026-07-28** — `crates/svm-run/demos/nimony/` (`arc_probe.c` + `build_probe.sh` +
+   **→ DONE 2026-07-28** — `crates/temen-run/demos/nimony/` (`arc_probe.c` + `build_probe.sh` +
    the `nimony_probe` runner example). The probe translates through the on-ramp to a **21-func,
-   9.3 KB `.svmb`** that decodes / verifies / bytecode-compiles, and runs **byte-identical to
+   9.3 KB `.temen`** that decodes / verifies / bytecode-compiles, and runs **byte-identical to
    native `clang -O2` on all three engines** (treewalk / bytecode / JIT), exit 0. Every call
    resolved to an on-ramp-recognized name with **no `--stub-externs`** — i.e. ARC destructor
    calls, the error-flag+goto unwind, first-member-base object dispatch, and `realloc`-grown
    seqs all lower and confine cleanly. The codegen-shape risk is retired; the remaining Phase-1
-   work is toolchain (step 2) + real libc surface (step 3), not "does Nim's shape fit SVM".
-2. **Real Nim codegen on SVM.** **→ PARTIALLY DONE 2026-07-28 via stock Nim as a stand-in.**
-   `crates/svm-run/demos/nimony/list_seq.nim` (ARC `ref object` linked list + a `seq`) is
+   work is toolchain (step 2) + real libc surface (step 3), not "does Nim's shape fit Temen".
+2. **Real Nim codegen on Temen.** **→ PARTIALLY DONE 2026-07-28 via stock Nim as a stand-in.**
+   `crates/temen-run/demos/nimony/list_seq.nim` (ARC `ref object` linked list + a `seq`) is
    compiled by the **stock Nim 2.2.10 ARC backend** (`--mm:arc -d:useMalloc -d:noSignalHandler`)
-   and on-ramped by `build_nim.sh` — the same `nim → C → clang -O2 → svm-llvm-translate →
-   prep_svmb` chain, then run on all three engines. **Result: byte-identical to a native `nim c`
+   and on-ramped by `build_nim.sh` — the same `nim → C → clang -O2 → temen-llvm-translate →
+   prep_temen` chain, then run on all three engines. **Result: byte-identical to a native `nim c`
    build (stdout `listSum=385 / seqSum=55`, exit 0) on treewalk / bytecode / JIT.** This is
    genuine Nim-runtime codegen (ARC destructors, heap `ref`, `realloc`-grown `seq`), not the
    hand-modeled `arc_probe.c` — and stock Nim and nimony share the ARC/ORC model + C-ABI shape.
@@ -134,14 +134,14 @@ chibicc does not.
      `exit`, `strlen`. *Far* smaller than chibicc's 41; no libc fill needed for this corpus.
    - **One gotcha found:** Nim installs SIGSEGV/etc. handlers at startup (`signal()` →
      stubbed → `Unreachable` trap); `-d:noSignalHandler` avoids it. Recorded in `build_nim.sh`.
-   - **Step 2 proper — genuine nimony output runs on SVM. → DONE 2026-07-28.** Built **Nim 2.3.1
+   - **Step 2 proper — genuine nimony output runs on Temen. → DONE 2026-07-28.** Built **Nim 2.3.1
      from source** (stable 2.2.10 can't compile `hastur`), bootstrapped **nimony** (`nim c -r
      src/hastur build all` → `bin/{nimony,hexer,lengc,nifler,…}`), and on-ramped nimony's *own*
-     `lengc c` output. `crates/svm-run/demos/nimony/sum_sq_nimony.nim` (an ARC `seq[int]` + a
+     `lengc c` output. `crates/temen-run/demos/nimony/sum_sq_nimony.nim` (an ARC `seq[int]` + a
      `var object`) compiles via the real pipeline (nifler → nimony → hexer → **Leng** → lengc C),
-     and `build_nimony.sh` on-ramps that C to a **95-func `.svmb`** that decodes / verifies /
+     and `build_nimony.sh` on-ramps that C to a **95-func `.temen`** that decodes / verifies /
      bytecode-compiles and runs **byte-identical to nimony's native run (`sum_sq=385 / count=10`,
-     exit 0) on treewalk / bytecode / JIT.** This is authentic nimony Leng→C→SVM-IR, not a
+     exit 0) on treewalk / bytecode / JIT.** This is authentic nimony Leng→C→TEMEN-IR, not a
      stand-in. **Two concrete on-ramp findings** (both normalized in `build_nimony.sh`, both
      recorded as follow-ups for a proper backend):
      - **nimony's runtime allocates via `mmap`, not `malloc`** (libc-free stdlib), plus a handful
@@ -151,7 +151,7 @@ chibicc does not.
        pointers (the load-bearing subtlety).
      - **TLS gap:** nimony marks the allocator/exception globals `__thread`; the on-ramp has no
        `llvm.threadlocal.address` lowering. For a single-threaded guest these are plain globals
-       (stripped in the build). *A real Leng→SVM-IR backend (Phase 2) would map these onto SVM's
+       (stripped in the build). *A real Leng→TEMEN-IR backend (Phase 2) would map these onto Temen's
        own thread-local/global model instead; the on-ramp TLS gap is worth a `LLVM.md` follow-up.*
 3. **On-ramp the real C**, `-mlong-double-64` if nimony emits `long double` (the chibicc F3
    lesson), `--host-page 65536` for a browser-targetable asset. Fill the libc bottom edge by
@@ -159,20 +159,20 @@ chibicc does not.
    surface is nearly identical (stdio, `malloc`/`realloc`, `str*`, `%.17g` via `__vm_fmt_gen`).
 4. **Differential-validate** each corpus program: guest stdout/exit byte-matches native
    `nim c` build (the `chibicc_run.rs` / `run_selfhost_diff.sh` two-tier pattern).
-5. **nimony-on-SVM (the self-host payoff).** On-ramp nimony's *own* C output into a
-   `nimony.svmb` guest — the same way `chibicc.svmb` is built. `nim → nimony.svmb → SVM-IR`
+5. **nimony-on-Temen (the self-host payoff).** On-ramp nimony's *own* C output into a
+   `nimony.temen` guest — the same way `chibicc.temen` is built. `nim → nimony.temen → TEMEN-IR`
    is then a composition of proven pieces; no new substrate.
 
 **Exit criteria.** (a) the Nim-shaped-C probe runs interp==JIT==native; (b) ≥1 real nimony C
-program runs on SVM matching native; (c) the libc fill-list is measured (the `--stub-externs`
+program runs on Temen matching native; (c) the libc fill-list is measured (the `--stub-externs`
 + stub-audit method, `SELFHOST_C.md` A.5).
 
 ### Current-sandbox status (2026-07-28)
 
-- ✅ `clang-18` present; ✅ `svm-llvm-translate` built; ✅ **step-1 probe green on all three
+- ✅ `clang-18` present; ✅ `temen-llvm-translate` built; ✅ **step-1 probe green on all three
   engines** (above).
 - ✅ Nim **2.2.10** (choosenim) + **Nim 2.3.1 built from source**; ✅ **nimony bootstrapped**
-  (`bin/{nimony,hexer,lengc,…}`); ✅ **genuine nimony Leng→C output runs on SVM, all three
+  (`bin/{nimony,hexer,lengc,…}`); ✅ **genuine nimony Leng→C output runs on Temen, all three
   engines, byte-identical to native nimony** (step 2 above); ✅ stock-Nim ARC program green too.
 - The C-on-ramp path (Phase 1) is now **proven end-to-end with the real compiler.** Remaining
   Phase-1 breadth: wider Nim/nimony corpus (strings, exceptions, closures, floats), the `mmap`
@@ -180,29 +180,29 @@ program runs on SVM matching native; (c) the libc fill-list is measured (the `--
   open design choice.
 - **Reproduce the nimony demo:** build Nim 2.3.1 (`git clone nim-lang/Nim && sh build_all.sh`),
   bootstrap nimony (`nim c -r src/hastur build all`), then
-  `NIMONY_BIN=…/nimony/bin/nimony bash crates/svm-run/demos/nimony/build_nimony.sh`.
+  `NIMONY_BIN=…/nimony/bin/nimony bash crates/temen-run/demos/nimony/build_nimony.sh`.
 
-## 3. Phase 2 — native `Leng → SVM-IR` backend (started)
+## 3. Phase 2 — native `Leng → TEMEN-IR` backend (started)
 
-A translator that consumes **Leng NIF** and emits **SVM IR** directly, bypassing C/clang. It
-drops the build-time clang/LLVM dependency and shapes SVM-IR straight from Leng, and it is the
+A translator that consumes **Leng NIF** and emits **Temen IR** directly, bypassing C/clang. It
+drops the build-time clang/LLVM dependency and shapes TEMEN-IR straight from Leng, and it is the
 supported extension pattern — C/C++/LLVM-IR/arkham already coexist behind Leng, plus the
 shoggoth optimizer.
 
-> **Capstone reached 2026-07-28: whole real modules verify.** `svm-leng` translates **entire**
+> **Capstone reached 2026-07-28: whole real modules verify.** `temen-leng` translates **entire**
 > real `hexer` modules — every proc plus globals, type decls, and cross-module imports — for three
 > real Nim programs (`addTwo`+`main`, `maxi`+`sumto`, `dot2`+`idx`), each **parsing and passing
-> `svm-verify`**, and the user `main` (an intra-module call) **runs end-to-end on both engines**
-> (`crates/svm-leng/tests/whole_real_module.rs`). Driving a whole module out turned the "what's
+> `temen-verify`**, and the user `main` (an intra-module call) **runs end-to-end on both engines**
+> (`crates/temen-leng/tests/whole_real_module.rs`). Driving a whole module out turned the "what's
 > left" list into a measured one — the last gaps that blocked real modules were small: `(true)`/
 > `(false)`/`(nil)` literals, `cast`, and coercing a bare-literal `ret` to the proc's result type
 > (an i32 `main` returning `0`). The remaining breadth (below) is genuinely optional for coverage,
 > not structural.
 
-**Placement decision (2026-07-28): a Rust crate `crates/svm-leng` in *this* repo** — the
-**fourth SVM frontend**, beside `svm-wasm` and `svm-llvm` (both Rust, both untrusted, both
+**Placement decision (2026-07-28): a Rust crate `crates/temen-leng` in *this* repo** — the
+**fourth Temen frontend**, beside `temen-wasm` and `temen-llvm` (both Rust, both untrusted, both
 verifier-rechecked). Rationale: it matches the established frontend pattern, reuses
-`svm-ir`/`svm-text`/`svm-verify` directly, and is **CI-testable with checked-in Leng fixtures,
+`temen-ir`/`temen-text`/`temen-verify` directly, and is **CI-testable with checked-in Leng fixtures,
 no nimony toolchain at build time**. (A Nim backend inside nimony's `src/lengc/` — the arkham
 analog — is the alternative; it is better for *eventual* pure self-hosting through Leng but
 couples to the nimony build and can't live in this repo. Revisit once the Rust translator has
@@ -211,10 +211,10 @@ escape-TCB** (DESIGN.md §2a): the verifier re-checks its output, so a bug is a 
 
 ### Walking skeleton — DONE 2026-07-28
 
-`crates/svm-leng` translates the **integer / arithmetic / local / direct-call** subset with
+`crates/temen-leng` translates the **integer / arithmetic / local / direct-call** subset with
 straight-line bodies and `ret`, and **fail-closes (`LengError::Unsupported`) on everything
-else** (the `svm-wasm`/`svm-llvm` `unsup(...)` discipline — never a silent mistranslation). It
-emits SVM text (chibicc's `codegen_ir.c` model) via `svm_text::parse_module`. Six end-to-end
+else** (the `temen-wasm`/`temen-llvm` `unsup(...)` discipline — never a silent mistranslation). It
+emits Temen text (chibicc's `codegen_ir.c` model) via `temen_text::parse_module`. Six end-to-end
 tests translate hand-written Leng-NIF (faithful to `doc/leng-spec.md`) → verify → **run on both
 the interpreter and the JIT with identical results** (§9 parity): constant arithmetic
 (`3 + 4*2`), params+locals, `div`/`mod`, i32↔i64 `conv`, cross-proc `call`, and the fail-closed
@@ -251,14 +251,14 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
 - **✅ integer scalars, arithmetic (`add`/`sub`/`mul`/`div`/`mod`), `neg`, width `conv`,
   locals (`var`/`asgn`), direct `call`, `ret`** — the landed skeleton.
 - **✅ control flow — DONE 2026-07-28.** `if`/`elif`/`else`, `while`, `scope`, nested `stmts`,
-  and comparisons (`eq`/`neq`/`lt`/`le`), lowered to **multi-block SVM-IR with locals threaded as
+  and comparisons (`eq`/`neq`/`lt`/`le`), lowered to **multi-block TEMEN-IR with locals threaded as
   block parameters** (the chibicc/on-ramp φ model — no separate dominance analysis; a merge is
   just the successor's block param). Value numbers reset per block; the entry block carries only
   the function params (the ABI), successors carry every slot. Tested on hand fixtures (max, a
   `while` sum, an `elif` sign chain) **and the real nimony `maxi` if/else** — interp == JIT on all.
   `case`→`br_table` and `lab`/`jmp` (Leng's low-level jump family) remain.
 - **Then, further out:**
-  - **C-ABI struct/union/enum layout** → SVM §3d (x86-64-SysV already pinned — Leng assumes the
+  - **C-ABI struct/union/enum layout** → Temen §3d (x86-64-SysV already pinned — Leng assumes the
     same ABI, so this is a match, not a negotiation).
   - **Memory:** Leng `ptr`/`aptr`/`at`/`pat`/`dot`/`deref`/`addr` → window loads/stores +
     `ptr.add`; every access confined by the masking lowering (INVARIANTS §2).
@@ -289,7 +289,7 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
       emitted together so **intra-module calls** resolve by index. Tested end-to-end: a global
       counter + `const` step + a `main → bumpN → bump` call chain, interp == JIT. Non-zero global
       initializers fail-close (a `data`-segment init is the refinement).
-    - **✅ cross-module `call` → SVM imports — DONE 2026-07-28.** A call to a callee not defined in
+    - **✅ cross-module `call` → Temen imports — DONE 2026-07-28.** A call to a callee not defined in
       the module becomes a declared `import N "name" (params) -> (ret)` + `call.import N`; the
       signature is fixed from the call site (param types from the args; return arity from position —
       a stmt-call is void, an expr-call returns a value), cached per symbol (inconsistent arity
@@ -301,7 +301,7 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
       import all at once. Signature inference is call-site-based (not the `.idx` export map); wiring
       the real export sigs (and JIT-side import binding in tests) are refinements.
 
-  **State:** `svm-leng` translates whole real-ish modules — integers, floats, control flow (incl.
+  **State:** `temen-leng` translates whole real-ish modules — integers, floats, control flow (incl.
   `break`/`continue` and `block` via `jmp`/`lab`), pointers, frames, objects/arrays (incl.
   constructors, copy, and **sret return**), **object-of-`RootObj` inheritance** (base-inlining +
   vtable header), enum/distinct scalars, **exceptions** (nimony's error-flag ABI), **seq/string**
@@ -339,7 +339,7 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
       caller-provided buffer *runs* on both engines. Its *operations* (`add`/`[]`/`len`/`toOpenArray`/
       `newSeq`) are stdlib procs that lower to **imports** (the **W3** runtime edge: they verify, and
       run once bound). Getting real seq bytes to lower needed four fixes: (1) import **names** escaped
-      for svm-text (the `[]` operator mangles to `\5B\5D…`, whose bare backslash the lexer rejected);
+      for temen-text (the `[]` operator mangles to `\5B\5D…`, whose bare backslash the lexer rejected);
       (2) aggregate **args** to imports passed by address; (3) aggregate-**returning** imports (sret
       imports, e.g. `toOpenArray`/`newSeqUninit`); (4) structured `break`/`continue` (a `for` lowers
       to `while (true) { … else break }`). Real nimony `getAt`/`firstLen` (index/len) and
@@ -404,9 +404,9 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
       **real nimony `classify`** (`0 / 1,2 / 3 / else`), interp == JIT.
   - **Calls + ARC:** indirect calls; destructor/dup calls pass through as ordinary calls;
     `onerr`/`errv` → branch-on-flag.
-  - **Overflow:** `keepovf`/`ovf` → SVM's trapping/checked arithmetic.
+  - **Overflow:** `keepovf`/`ovf` → Temen's trapping/checked arithmetic.
   - **Runtime bottom edge:** raw syscalls / allocator → POSIX personality named imports +
-    Memory cap, same as Phase 1 — and mapping nimony's TLS onto SVM's own model (the on-ramp
+    Memory cap, same as Phase 1 — and mapping nimony's TLS onto Temen's own model (the on-ramp
     gap found in Phase 1).
 
 **Risks:** nimony is v0.4.0, "heavy development" — the Leng grammar and C output are moving
@@ -416,16 +416,16 @@ the grammar). Effect inference (pipeline phase 3) and parts of CPS are not yet i
 
 ## 3a. Self-hosting roadmap — Path 2a (no C compiler)
 
-The end state we're building toward: **nimony compiles itself on SVM with no C compiler in the
-loop.** nimony is written in Nim, and `svm-leng` is its Leng→svm-ir backend. So the loop closes
-when both the nimony compiler *and* `svm-leng` itself run as svm modules. Two sub-questions —
-"can we translate the Leng nimony emits?" and "can the translator itself run on svm?" — and Path
-2a answers the second by bootstrapping the Rust `svm-leng` onto svm the same way any Rust program
-reaches svm: **Rust → wasm → the svm-wasm on-ramp → svm-ir.** No C compiler anywhere.
+The end state we're building toward: **nimony compiles itself on Temen with no C compiler in the
+loop.** nimony is written in Nim, and `temen-leng` is its Leng→temen-ir backend. So the loop closes
+when both the nimony compiler *and* `temen-leng` itself run as temen modules. Two sub-questions —
+"can we translate the Leng nimony emits?" and "can the translator itself run on temen?" — and Path
+2a answers the second by bootstrapping the Rust `temen-leng` onto temen the same way any Rust program
+reaches temen: **Rust → wasm → the temen-wasm on-ramp → temen-ir.** No C compiler anywhere.
 
 **Why not 2b (a Nim backend inside nimony's `lengc`, an arkham analog).** It would let nimony
-emit svm-ir directly, no separate translator. Ruled out: we have **no influence over the nimony
-repo**, so a backend living upstream is not a lever we control. `svm-leng` as an *external* Rust
+emit temen-ir directly, no separate translator. Ruled out: we have **no influence over the nimony
+repo**, so a backend living upstream is not a lever we control. `temen-leng` as an *external* Rust
 translator keeps the whole path in this tree.
 
 **The mapping is largely proven** (§3 above): integers, floats, control flow, pointers, frames,
@@ -438,7 +438,7 @@ plumbing. Five workstreams, roughly independent:
   general **`goto`** (the low-level `jmp`/`lab`/`jtrue`/`mflag`/`vflag` jump family), then
   **exceptions** (`try`/`onerr`/`raise` as an error-flag model), then **seq/string** (nimony's
   built-in containers). Non-zero global/data initializers land here too.
-  - **Measured from the language side (#956).** `crates/svm-leng/tests/nim_conformance.rs` is a
+  - **Measured from the language side (#956).** `crates/temen-leng/tests/nim_conformance.rs` is a
     toolchain-gated feature→status matrix (generics, exceptions, closures, methods, `seq`/`string`/
     `Table`, floats, iterators, variant objects, `ref`+ARC destructors), each driven Nim-source →
     whole toolchain → run on both engines and asserted against a committed baseline (a **compute**
@@ -447,7 +447,7 @@ plumbing. Five workstreams, roughly independent:
     vtable's `mt` method table is materialized as funcref relocs); **exceptions** run (#980) — hexer
     lowers `raise`/`try`/`except` to nimony's **error-flag model** (a can-raise proc returns an
     `(ErrorCode, value)` tuple; the caller branches on the code and `jmp`s to the handler), all
-    constructs svm-leng already handles, and the earlier "gap" was a fixture using standard-Nim
+    constructs temen-leng already handles, and the earlier "gap" was a fixture using standard-Nim
     `newException`, not nimony's model; **`oconstr` in expression position** landed (#990) — a
     tuple/object literal as an rvalue materializes into a scratch temp (the position-aware
     `agg_temp_bytes` reserves it); and **`Table`** runs (#993) — as an I/O fixture through the powerbox
@@ -458,37 +458,37 @@ plumbing. Five workstreams, roughly independent:
     starts working *or* regresses fails the test — the "green/red matrix, each red a ticket" the
     totality work grinds down.
 - **W2 — Linker (the long pole).** A real program is many modules; nimony emits one Leng file per
-  module. W2 resolves cross-module symbols, merges globals/data, and lays out one svm module from N
+  module. W2 resolves cross-module symbols, merges globals/data, and lays out one temen module from N
   Leng inputs — the analog of what the C on-ramp gets from `clang`+`lld` for free. **✅ Core done
-  (2026-07-29): `svm_leng::link_units` links real cross-module nimony code.** nimony references a
+  (2026-07-29): `temen_leng::link_units` links real cross-module nimony code.** nimony references a
   proc `P.` defined in module `stem` from elsewhere as `P.<stem>`; `link_units` translates each
   module's procs, exports them under those global names, and resolves every unit's cross-module
-  calls (named imports) against the exports via `svm_ir::link` — one merged, re-verified, import-free
+  calls (named imports) against the exports via `temen_ir::link` — one merged, re-verified, import-free
   module. Proven on a genuine 2-module program (`moda` importing `pkg/modb`: `useit(5)` calls
   `modb`'s compiled `helper` → 16) and a transitive A→B→C chain, both engines (`tests/link.rs`).
   This is the same link mechanism the end-to-end shim used, now across *real translated modules* —
   the shim's stand-in replaced by compiled Nim.
-  - **✅ Relocatable globals — DONE 2026-07-30 (aligned to the new `.svmo` object dialect).** The
-    tree landed a binary link-unit format (`.svmo`) + `svm-run --link`, with first-class export
+  - **✅ Relocatable globals — DONE 2026-07-30 (aligned to the new `.temeno` object dialect).** The
+    tree landed a binary link-unit format (`.temeno`) + `temen-run --link`, with first-class export
     tables and inline data-relocation instructions — `data.self <off>` (this unit's data),
     `data.sym "<name>" <addend>` (a cross-unit data symbol), `data.top` (top-of-data / heap start) —
-    that `link` resolves to concrete addresses. This filled the data-symbol gap. `svm-leng` is now
+    that `link` resolves to concrete addresses. This filled the data-symbol gap. `temen-leng` is now
     **dual-mode**: `translate`/`translate_procs` emit a directly *runnable* module (globals at fixed
-    absolute offsets, `.svmb` shape), while `link_units` emits a *link unit* (globals addressed via
-    `data.self`, `.svmo` shape) so `link` relocates each unit's data into disjoint window regions.
+    absolute offsets, `.temen` shape), while `link_units` emits a *link unit* (globals addressed via
+    `data.self`, `.temeno` shape) so `link` relocates each unit's data into disjoint window regions.
     This was load-bearing: an absolute-offset unit *silently aliased* under linking — two modules'
     globals both at offset 16, one clobbering the other — a fail-closed violation the `data.self`
     lowering fixes (regression test: two modules each read their *own* global, `tests/link.rs`).
-  - **✅ Through the `.svmo` narrow waist — DONE 2026-07-30.** `svm-leng` now emits real binary link
-    **objects**: `svm_leng::compile_object(unit)` → a `.svmo` with the unit's procs exported *in-band*
-    (`Module::exports`, stem-suffixed) — the counterpart of `svm-llvm-translate -o out.svmo`.
-    `link_units` routes through the format: compile each module to `.svmo`, `decode_unit` it back
+  - **✅ Through the `.temeno` narrow waist — DONE 2026-07-30.** `temen-leng` now emits real binary link
+    **objects**: `temen_leng::compile_object(unit)` → a `.temeno` with the unit's procs exported *in-band*
+    (`Module::exports`, stem-suffixed) — the counterpart of `temen-llvm-translate -o out.temeno`.
+    `link_units` routes through the format: compile each module to `.temeno`, `decode_unit` it back
     through the hardened firewall (a frontend is untrusted), pair a `LinkUnit` from its in-band export
-    tables (the same conversion `svm-run --link` does), then `svm_ir::link`. The linker stays shared;
-    the format is the only added seam. Proven cross-producer (`tests/object.rs`): a nimony `.svmo`
-    (`sumSeq`) links against a **separately produced runtime `.svmo`** — both binary objects, joined
+    tables (the same conversion `temen-run --link` does), then `temen_ir::link`. The linker stays shared;
+    the format is the only added seam. Proven cross-producer (`tests/object.rs`): a nimony `.temeno`
+    (`sumSeq`) links against a **separately produced runtime `.temeno`** — both binary objects, joined
     only through the format — and runs (Σ = 60, both engines). That composition is the point: the
-    runtime object is the stand-in the real compiled `system` module (or a C-runtime `.svmo`) will
+    runtime object is the stand-in the real compiled `system` module (or a C-runtime `.temeno`) will
     replace, and now they meet at a versioned, spec-pinned, fuzzed boundary rather than in-process.
   - **✅ Cross-module data symbols — DONE 2026-07-30.** A `gvar` referenced across the module
     boundary — hexer emits it as `counter.0.<defining-stem>`, in lvalue/rvalue position — now links.
@@ -522,7 +522,7 @@ plumbing. Five workstreams, roughly independent:
     automatically; `translate_proc_with_types` remains as the manual escape hatch for
     single-module entry points. A *standalone* `compile_object` of a unit with an external value
     type still fail-closes (the layout only exists across the link) — if that ever needs to work
-    without siblings, types would ride in-band in `.svmo`, a format question for later. Tested:
+    without siblings, types would ride in-band in `.temeno`, a format question for later. Tested:
     hand-written flat + *nested* external value types (both run, both engines), the standalone
     fail-closed case, and **real nimony `greet(): string = "hello"` running end-to-end** — linked
     against a stand-in system unit under the real stem, no prelude, the packed SSO word and nil
@@ -560,7 +560,7 @@ plumbing. Five workstreams, roughly independent:
   - **✅ Whole-module link objects — DONE 2026-07-30 (Path A shape).** `link_units` lifts a
     *hand-picked subset* of a module's procs (the "go deep" mode); a real program instead links
     *whole compiled modules* — every proc plus the scaffolding nimony emits (`ini`
-    module-initializer, C `main`, exportc gvars). `svm_leng::compile_whole_object`/`link_whole_units`
+    module-initializer, C `main`, exportc gvars). `temen_leng::compile_whole_object`/`link_whole_units`
     (over a `WholeModule{stem, src}`) do that: `Translator::module_with_names` translates every proc
     and returns their local names, which become the object's in-band export table (each proc under
     its global stem-suffixed name), so other modules' cross-module calls resolve. This is `lld` over
@@ -591,11 +591,11 @@ plumbing. Five workstreams, roughly independent:
     `exportc` symbols under their **C** names (the C `main`, and the `cmdCount`/`cmdLine`/`nimEnviron`
     gvars), alongside the mangled Leng names — `Translator::exportc_exports` scans proc/gvar
     `(pragmas (exportc "cname") …)` and adds a func/data export under `cname`. So the program's C-ABI
-    surface is findable: a host or `svm-run --link` can enter at `main`. Tested on real `moda`'s whole
+    surface is findable: a host or `temen-run --link` can enter at `main`. Tested on real `moda`'s whole
     object (`tests/object.rs`).
   - **◑ Real `system` module — STARTED 2026-07-30.** The `sysvq0asl` edges now bind to code
     translated from the **actual nimony `system` module**, not a hand-written stub — first real
-    stdlib code running on SVM (`tests/system.rs`): a driver's cross-module call binds to the real
+    stdlib code running on Temen (`tests/system.rs`): a driver's cross-module call binds to the real
     `=wasMoved` (string's ARC "moved-from" reset, `s.bytes = 0` through a `ptr string`, verbatim
     from `system/stringimpl.nim`), and it runs correctly on both engines. Getting there closed two
     translator gaps the real module surfaces: **gvar symbol/proc-pointer initializers** (e.g.
@@ -618,11 +618,11 @@ plumbing. Five workstreams, roughly independent:
     `system/stringimpl.nim`) and runs end-to-end on both engines, returning the literal. The long
     string's `LongString` blob is a `const` in greetLong's data; the linker **relocates** the string's
     `more` pointer to its placed address. This needed **const-to-const data relocations**
-    (`data.ptr <at> self <off>`, svm_ir D-LINK): a pointer stored *inside* one const's bytes to
+    (`data.ptr <at> self <off>`, temen_ir D-LINK): a pointer stored *inside* one const's bytes to
     another const (a `string` literal's `more = (addr strlit)`) — placeholder bytes the linker
     overwrites (`tests/system.rs`, `tests/strings.rs`).
   - **✅ Whole `system` module compiles — MET 2026-07-30 (Path A capstone).** `compile_whole_object`
-    lowers the **entire** real `system` module to a 129 KB `.svmo` link object — **297 functions**
+    lowers the **entire** real `system` module to a 129 KB `.temeno` link object — **297 functions**
     plus exactly the **25 bottom-edge C imports** (`mmap`, `c_memcpy`/`memset`/`memcmp`, the atomics,
     `bswap64`/`ctz64`/`clz64`, `cWriteErr`, `cExitSys`, `dlopen`/`dlsym`/`dlclose`). Getting the last
     procs to lower closed a run of translator gaps, each with a synthetic both-engines test
@@ -633,12 +633,12 @@ plumbing. Five workstreams, roughly independent:
     `o.vt.mt[i]` method-table walk, via cast-deref static typing + `i64` slot → `i32` funcref), and
     `baseobj` base-subobject upcasts. Linking the whole object end-to-end now needs only the 25
     imports bound (W3, below); the object itself is produced and structurally sound.
-  - **✅ Real Nim source runs on SVM, toolchain-driven — MET 2026-07-31 (W3, the Path A payoff).**
-    The 25 bottom-edge C imports bind to a **20-function SVM runtime shim** (a pure-IR link unit,
-    `tests/fixtures/system_runtime.svm.txt`): `mmap`→a bump allocator (cursor at window offset 8),
+  - **✅ Real Nim source runs on Temen, toolchain-driven — MET 2026-07-31 (W3, the Path A payoff).**
+    The 25 bottom-edge C imports bind to a **20-function Temen runtime shim** (a pure-IR link unit,
+    `tests/fixtures/system_runtime.temt.txt`): `mmap`→a bump allocator (cursor at window offset 8),
     `c_memcpy`→`mem.copy`, `c_memset`→`mem.fill`, `c_memcmp`→a byte-compare loop, the GCC atomics→
     plain memory ops (the in-process model is single-threaded), `ctz64`/`clz64`→`i64.ctz`/`clz`,
-    `bswap64`→a shift/or chain, `cWriteErr`→success, `munmap`/`dl*`/`_exit`→inert. `svm-leng` gained
+    `bswap64`→a shift/or chain, `cWriteErr`→success, `munmap`/`dl*`/`_exit`→inert. `temen-leng` gained
     `link_whole_with_runtime` (program + `system` + runtime units in one link).
     The test is **end-to-end from Nim source, not a committed artifact** (`tests/nim_e2e.rs`): it
     drives the real toolchain (`nimony c` → nifler → nimony → hexer) on small `.nim` programs, links
@@ -663,7 +663,7 @@ plumbing. Five workstreams, roughly independent:
     system `ini` writes it — but `ini` is minimal (it only resets an exception global); the
     initializer *is* the value, and nothing wrote it, so the first `call_indirect` through the gvar
     trapped (`IndirectCallType` through func 0 — surfacing deep in `cAbort`'s flush). Fixed with a
-    **`data.funcref` relocation** (the funcref twin of `data.ptr`, svm_ir D-LINK): `svm-leng`'s
+    **`data.funcref` relocation** (the funcref twin of `data.ptr`, temen_ir D-LINK): `temen-leng`'s
     `collect_globals` records a proctype gvar's proc initializer, `translate_object_module` emits a
     `DataFuncref{at, name}` under the initializer's stem-suffixed name, and `link` resolves it to the
     merged funcidx and writes it (4-byte `i32`, the value `ref.func` yields) into the gvar's data
@@ -676,7 +676,7 @@ plumbing. Five workstreams, roughly independent:
     now drives the toolchain on a real allocating program (`var s: seq[int] = @[]; while … s.add(i*i)`;
     sum it), links it with the runtime shim, runs its C `main` through the **entire init chain**, and
     reads the module global `r` back — `sumSquares(4) == 14` on **both engines** (§9 parity). This is
-    the first genuine heap allocation on SVM end-to-end: the allocator, `oomHandler`, the frame
+    the first genuine heap allocation on Temen end-to-end: the allocator, `oomHandler`, the frame
     handoff, and the funcref-initializer materialization all exercised at once, from source.
   - **✅ Both earlier follow-ups fixed by adopting the powerbox memory model** (2026-07-31). The
     root of both was that the linked module had no disciplined window layout: nimony based its
@@ -684,38 +684,38 @@ plumbing. Five workstreams, roughly independent:
     globals, the powerbox heap-brk words (offsets 32/40), and the seq the allocator was growing**.
     That corruption produced the `+20` phantom element in `for x in s` (an allocator chunk write
     stomping `s.len`) and the module-order sensitivity (the seq landing on live scratch depended on
-    layout). The fix mirrors svm-llvm's C on-ramp: globals based at `POWERBOX_STACK_PAGE` (16384, so
+    layout). The fix mirrors temen-llvm's C on-ramp: globals based at `POWERBOX_STACK_PAGE` (16384, so
     page 0 stays reserved for the heap-brk/args scratch), `$sp = powerbox_entry_sp` (64 KiB-aligned,
     above all globals), and the heap seeded above the 1 MiB stack reserve via `POWERBOX_HEAP_BRK`.
-    Globals / data stack / heap are now disjoint by construction — no SVM changes, the model the C
+    Globals / data stack / heap are now disjoint by construction — no Temen changes, the model the C
     on-ramp already runs under. `for x in s` now sums correctly (`sumSquares(5)` via `for` == 30 on
     both engines), and `s.len` is exact for every element count.
     - **Also fixed (uncovered once the layout stopped masking it): unsigned comparison lowering.**
-      `svm-leng` lowered `(u N)` comparisons as **signed** (`le_s`/`lt_s`); the TLSF allocator's
+      `temen-leng` lowered `(u N)` comparisons as **signed** (`le_s`/`lt_s`); the TLSF allocator's
       `uint32` bitmaps set bit 31, which a signed compare mis-orders — faulting `msbit`/`lsbit`
       during any reallocation past 2 elements. `compare` now emits `lt_u`/`le_u` when an operand is
       unsigned-typed (a `(u N)` slot or a `u`-suffixed/`conv`-typed form).
   The ARC-heavy string path already links and runs against real `=wasMoved`/`=destroy`.
 - **W3 — Runtime bottom edge** (scoped in detail in §3b). Raw syscalls / the allocator →
   POSIX-personality named imports + the Memory cap (same seam as Phase 1), and mapping nimony's TLS
-  onto svm's model (the on-ramp gap Phase 1 already surfaced). ARC destructors/dup calls pass
+  onto temen's model (the on-ramp gap Phase 1 already surfaced). ARC destructors/dup calls pass
   through as ordinary calls. **Key finding (§3b): the bottom edge is only ~15 C functions, and
   Phase 1 already binds them** — so the lever between "translates real nimony" and "runs it" is
   mostly W2 (linking the compiled `system` module), or a Phase-1-style host runtime shim.
 - **W4 — Multi-binary architecture (the other long pole).** nimony is not one binary: `nifmake`
-  spawns `nifler` → `nimony` → `hexer` → `lengc` as subprocesses. Running the compiler on svm
-  means either driving those phases in-process or giving svm a subprocess/exec personality. This
+  spawns `nifler` → `nimony` → `hexer` → `lengc` as subprocesses. Running the compiler on temen
+  means either driving those phases in-process or giving temen a subprocess/exec personality. This
   is an architecture question, not a translation one, and it's the biggest unknown.
-- **W5 — Bootstrap + browser** (scoped in detail in §3e). Compile the Rust `svm-leng` to run as an
-  svm guest, and run the loop (nimony-on-svm + svm-leng-on-svm) — first headless, then as a playground
-  demo. **Key finding (§3e): the endpoints are all mature (a Rust→svm primitive already works via the
-  `svm-llvm` on-ramp; a byte-exact C self-host template; a mature playground; `svm-leng`'s 3-crate
-  wasm-clean dep graph), and the greenfield middle — the first Rust crate run as an svm guest — is
+- **W5 — Bootstrap + browser** (scoped in detail in §3e). Compile the Rust `temen-leng` to run as an
+  temen guest, and run the loop (nimony-on-temen + temen-leng-on-temen) — first headless, then as a playground
+  demo. **Key finding (§3e): the endpoints are all mature (a Rust→temen primitive already works via the
+  `temen-llvm` on-ramp; a byte-exact C self-host template; a mature playground; `temen-leng`'s 3-crate
+  wasm-clean dep graph), and the greenfield middle — the first Rust crate run as an temen guest — is
   bring-out, not open architecture.** Recommended path: LLVM on-ramp for first light, the wasm on-ramp
   (the stated goal) after.
 
 **Near-term milestone — ✅ MET (2026-07-29, see §3b Path B): compile & run one real Nim program
-end-to-end** — source → nimony → hexer → `svm-leng` → svm-ir → runs on both engines with the right
+end-to-end** — source → nimony → hexer → `temen-leng` → temen-ir → runs on both engines with the right
 answer (a real seq build-and-sum returns `3`). That
 exercises W1 (totality on a whole program) and forces the first slice of W2/W3, and is the
 concrete "it works" we can point at before the long poles. Everything below `## 3a` (W2/W4
@@ -723,7 +723,7 @@ especially) is bounded but real; the backend mapping is the part that's no longe
 
 ## 3b. W3 scope — the runtime bottom edge (W1 is done; this is the next lever)
 
-With W1 closed, `svm-leng` **translates real nimony modules to verified svm-ir** — but the lowered
+With W1 closed, `temen-leng` **translates real nimony modules to verified temen-ir** — but the lowered
 code doesn't yet *run*, because it calls procs that aren't defined in the one module we translate.
 Scoping W3 means answering exactly *what* those calls are and *how* they bind. Two layers, and the
 boundary between them is the whole story:
@@ -733,35 +733,35 @@ boundary between them is the whole story:
 code** that nimony compiles into the `system` module's Leng (`sysvq0asl.x.nif`). They look like
 "imports" to us only because we translate one module in isolation. In a whole-program build they're
 *defined*, reached by **linking** the user module with the compiled `system` module — the `Func`/
-`Slot` bindings of `svm_ir::resolve_imports_with`. That's W2 (the linker), and it's the bulk of the
+`Slot` bindings of `temen_ir::resolve_imports_with`. That's W2 (the linker), and it's the bulk of the
 gap.
 
 **Layer 2 — the true bottom edge (this is W3).** What does the `system` module *itself* bottom out
 at? Measured directly from `hexer`-compiled `sysvq0asl.x.nif`, the runtime's **entire** external
 (`importc`) surface, minus pure C *type* names, is ~15 functions:
 
-| Group | Symbols | SVM binding |
+| Group | Symbols | Temen binding |
 | --- | --- | --- |
 | Allocator | `mmap`, `munmap` | the **Memory cap** (Phase 1 seam) |
 | Syscalls / process | `write`, `_exit`, `getpid`, `kill` | the **POSIX personality** (Phase 1 seam) |
 | libc mem | `memcpy`, `memset`, `memcmp` | host cap, or lower to `mem.copy`/`mem.fill` |
 | Atomics | `__atomic_{load,store,add_fetch,sub_fetch,exchange,compare_exchange}_n` (+ `__ATOMIC_*` order consts) | single-threaded guest → plain loads/stores |
-| Builtins | `__builtin_{bswap64,clzll,ctzll}` | direct svm ops (`bswap`/`clz`/`ctz`) |
+| Builtins | `__builtin_{bswap64,clzll,ctzll}` | direct temen ops (`bswap`/`clz`/`ctz`) |
 | Dynamic linking | `dlopen`, `dlsym`, `dlclose`, `dlerror` | unused by a static program → stub / fail-closed |
 
 **The key finding: W3's hard part is already retired.** This is the *same* C bottom edge Phase 1's
-on-ramp already binds — `crates/svm-run/demos/nimony/` runs a nimony-shaped module on all three
+on-ramp already binds — `crates/temen-run/demos/nimony/` runs a nimony-shaped module on all three
 engines today, with `write`/`mmap`/`_exit`/`memcpy` resolved through the POSIX personality + Memory
 cap. So the bindings exist and are proven; W3 is *wiring*, not invention. `resolve_imports_with`
 already lowers a named import to a host capability (`Cap`) — that's the seam.
 
 **✅ Pure-IR compute leaves — DONE 2026-08-11 (#761, slice 1).** The *compute* half of the bottom
-edge needs **no** host authority, so it binds as ordinary linked SVM functions instead of caps —
-keeping the runtime inside the pure-IR / both-engines model. `svm_leng::bottom_edge_runtime()` is a
+edge needs **no** host authority, so it binds as ordinary linked Temen functions instead of caps —
+keeping the runtime inside the pure-IR / both-engines model. `temen_leng::bottom_edge_runtime()` is a
 link unit providing `memcpy`/`memset` (→ `mem.copy`/`mem.fill`), `__builtin_bswap64`/`clzll`/`ctzll`/
 `popcountll` (→ `bswap` byte-shuffle / `clz`/`ctz`/`popcnt`), and the single-thread `__atomic_*` family
 (→ plain load/modify/store — correct for a single-vCPU guest, §3d); `bottom_edge_index` maps a C leaf
-name (or nimony's stem-qualified spelling) to its function. Pinned by `crates/svm-leng/tests/bottom_edge.rs`
+name (or nimony's stem-qualified spelling) to its function. Pinned by `crates/temen-leng/tests/bottom_edge.rs`
 — each leaf **interp == JIT == native**, plus a link test binding a user module's imports to the runtime.
 Remaining for #761: `memcmp` (a byte loop), and emitting the import under its `importc` C name so the
 real `system` module binds without a name map (wired in #762, where the real names are in hand). The
@@ -781,49 +781,49 @@ allocator (`mmap`/`munmap`) + syscalls stay on the Memory cap / POSIX seam — n
 
 Recommendation: **Path B first** — mirror Phase 1 (shim → real) to hit "runs a real Nim program
 end-to-end", then do W2 + Path A for fidelity. Remaining unknowns are small and known: nimony's TLS
-model onto svm (now settled — §3d: single-threaded `tvar → plain global`), and confirming the ARC
+model onto temen (now settled — §3d: single-threaded `tvar → plain global`), and confirming the ARC
 destructor protocol runs correctly against a real allocator.
 
 **✅ Path B — DONE 2026-07-29: the near-term milestone is met.** A real nimony seq program **runs
-end-to-end on SVM**, both engines, §9 parity. `svm-leng` lowers genuine `hexer` bytes for
-`sumSeq`/`makeSeq` to verified svm-ir with their stdlib ops as named imports; a tiny SVM **runtime
+end-to-end on Temen**, both engines, §9 parity. `temen-leng` lowers genuine `hexer` bytes for
+`sumSeq`/`makeSeq` to verified temen-ir with their stdlib ops as named imports; a tiny Temen **runtime
 shim** (the pure `toOpenArray`/`len`/`[]`/`inc` ops + a bump/realloc allocator for `newSeqUninit`/
-`add`, `=wasMoved`/`=destroy` as zero/no-op — eight functions, ~90 lines of svm-text) is **linked
-in** via `svm_ir::link`, binding each named import to a shim function. So the whole path — real Nim
-→ `nimony` → `hexer` → `svm-leng` → svm-ir → link → **run** — closes with the right answer:
+`add`, `=wasMoved`/`=destroy` as zero/no-op — eight functions, ~90 lines of temen-text) is **linked
+in** via `temen_ir::link`, binding each named import to a shim function. So the whole path — real Nim
+→ `nimony` → `hexer` → `temen-leng` → temen-ir → link → **run** — closes with the right answer:
 `sumSeq([10,20,30]) = 60`, `makeSeq(3)` builds `[0,1,2]` through the allocator, and a driver chaining
-`makeSeq(3)` → `sumSeq` returns `3` in one pass (`tests/end_to_end.rs`). Notably the shim is *SVM
+`makeSeq(3)` → `sumSeq` returns `3` in one pass (`tests/end_to_end.rs`). Notably the shim is *Temen
 code linked in*, not Rust host capabilities — so it stays inside the pure-IR / both-engines model
 and rides the same verifier. This is the linking mechanism W2 generalizes (many units → one), and
 the shim is the placeholder the real compiled `system` module (Path A) will replace.
 
-## 3c. W4 scope — the multi-binary driver (the unknown is retired: svm already has both seams)
+## 3c. W4 scope — the multi-binary driver (the unknown is retired: temen already has both seams)
 
 W4 asked (`## 3a` above): nimony is not one binary — `nifmake` spawns `nifler` → `nimony` →
-`hexer` → `lengc` as OS subprocesses, so running the compiler on svm means "either driving those
-phases in-process **or** giving svm a subprocess/exec personality," flagged as "the biggest
+`hexer` → `lengc` as OS subprocesses, so running the compiler on temen means "either driving those
+phases in-process **or** giving temen a subprocess/exec personality," flagged as "the biggest
 unknown." **Both halves of that dichotomy already exist as landed seams, and neither is new
 substrate** (INVARIANTS §1/§4, §4 below). W4 is no longer an open architecture question; it is a
 build-out on proven mechanism, exactly like W3 turned out to be.
 
 **The two seams, measured:**
 
-- **In-process — `svm_ir::link`** (`crates/svm-ir/src/lib.rs:3762`). Statically links N units into
+- **In-process — `temen_ir::link`** (`crates/temen-ir/src/lib.rs:3762`). Statically links N units into
   one import-free module: functions concatenated + reindexed, each unit's data placed in a
   host-page-aligned non-overlapping window region, cross-unit symbols resolved to direct calls.
   This is the **W2** seam, already proven on real nimony (`link_units`, §3 above). Its shape:
   **one** module, **one** window/powerbox, **one** flat export namespace (a collision is
   `LinkError::DuplicateSymbol`, `lib.rs:3835`).
-- **Subprocess/exec personality — the `exec` capability** (`EXEC.md`, `crates/svm-run/src/exec.rs`).
+- **Subprocess/exec personality — the `exec` capability** (`EXEC.md`, `crates/temen-run/src/exec.rs`).
   A guest imports one interface `"exec"` (resolved by name like `"fs"`); the wirer picks the
   backend. The load-bearing one is **`domain_exec`** (`exec.rs:61`, BUILT 2026-07-23): each spawn is
-  **a fresh child svm domain — its own window, powerbox, and fuel** — `argv[0]` resolves through a
+  **a fresh child temen domain — its own window, powerbox, and fuel** — `argv[0]` resolves through a
   program registry (a miss is `-EPERM`), the full argv rides the §3e args buffer so an ordinary
   `main(int, char**)` reads it standalone, wire `stdin` seeds the child, both output streams are
   captured, and the exit code is the child's entry result verbatim. It is **not** new substrate: it
-  is a `HostCap` composed over the §14 Instantiator machinery svm already has (op 13
+  is a `HostCap` composed over the §14 Instantiator machinery temen already has (op 13
   `instantiate_module_named` + `join`), the same mold as `fs`. Proven byte-for-byte on all three
-  engines (`crates/svm-run/tests/exec_cap.rs:141`), incl. stdin flowing into the child
+  engines (`crates/temen-run/tests/exec_cap.rs:141`), incl. stdin flowing into the child
   (`exec_cap.rs:219`).
 
 **Recommendation: the phase toolchain is `exec`/`domain_exec` (the subprocess route), not `link`.**
@@ -840,8 +840,8 @@ is itself a `link`ed module, and the driver `exec`s the phases in sequence.
 There is already a **working precedent at exactly W4's shape**: the compiled-C shell drives
 `instantiate_module_named` (op 13) + `join`, resolving `argv[0]` against a name → `Module` registry,
 running an unmodified `main(argc, argv)` child with inherited stdout and seeded argv, and threading
-each command's exit status into `$?` (`crates/svm/tests/c_shell_exec.rs`,
-`crates/svm/tests/stage1_exec_command.rs`). A `nifmake` driver is that shell with a fixed four-command
+each command's exit status into `$?` (`crates/temen/tests/c_shell_exec.rs`,
+`crates/temen/tests/stage1_exec_command.rs`). A `nifmake` driver is that shell with a fixed four-command
 script.
 
 **Passing intermediate files between phases.** nimony's phases hand `.p.nif`/`.s.nif`/`.nif`/`.c`
@@ -855,11 +855,11 @@ files down the chain. Two existing options, no new host op:
    - (a) **A store shared across domains** — the *data* layer. `mem_fs_seeded_handler` re-seeds a
      *fresh* store per grant (isolated filesystems), and `mem_fs_seeded_shared` shares one store but
      only host↔handle (its `MemFsHandle` is host-side, built for browser-Postgres session snapshots;
-     it's used single-guest in `crates/svm/tests/c_link.rs` to seed the cc1 memfs). Neither shares a
+     it's used single-guest in `crates/temen/tests/c_link.rs` to seed the cc1 memfs). Neither shares a
      store **guest↔guest**. That piece is now built and tested: **`mem_fs_shared_factory`**
-     (`svm-fs/src/lib.rs`) mints N `HostProc`s over one `Arc<Mutex<MemFsState>>`, so a file one domain
+     (`temen-fs/src/lib.rs`) mints N `HostProc`s over one `Arc<Mutex<MemFsState>>`, so a file one domain
      writes another reads — proven at the op level by `two_grants_from_the_factory_share_one_store`
-     (phase A writes `x`, a separate grant reads it back). It's an ordinary additive `svm-fs` helper:
+     (phase A writes `x`, a separate grant reads it back). It's an ordinary additive `temen-fs` helper:
      it changes no existing grant and hands the *caller* the choice to share, so it is **not** on the
      security boundary. (`mem_fs_seeded_shared` now delegates to it — one grant from the factory.)
    - (b) **Granting that store to a spawned child** — the *authority* layer, and the real gate. This
@@ -880,7 +880,7 @@ files down the chain. Two existing options, no new host op:
 one-shot** — no concurrent pipeline (`exec.rs:59`). For a compiler driver this is *fine*: the phases
 run strictly in sequence anyway. And the shared-memfs wiring (option 2) is deliberate, not the
 default grant. Remaining real W4 work is therefore **build-out, not invention**: (i) compile each
-phase (`nifler`/`nimony`/`hexer`/`lengc`) to an svm module — Phase 1's C on-ramp already does this
+phase (`nifler`/`nimony`/`hexer`/`lengc`) to an temen module — Phase 1's C on-ramp already does this
 for one binary, so it is four applications of a proven step; (ii) write the driver module that
 registers them and chains them with a shared memfs; (iii) confirming each phase's allocator/`system`
 runtime boots cleanly as an isolated child. (The **TLS model** that Phase 1's on-ramp surfaced is now
@@ -889,28 +889,28 @@ settled — see §3d: single-threaded `tvar → plain global`, done and tested.)
 **First slice — ✅ the mechanism, proven with stand-in phases.** Mirroring how Path B's shim proved
 the runtime edge before the real `system` module: a driver module runs stand-in "phase" child
 modules via the `exec` cap in sequence, **passing each phase's output as the next phase's input**,
-and the final result is the composition — the `nifmake` orchestration on svm, decoupled from the real
-toolchain (`crates/svm-run/tests/multibinary.rs`; the driver + stand-in phases are pure SVM modules
-over the `exec` cap, so the proof lives with that seam, not in `svm-leng`). Three cases, all green on
+and the final result is the composition — the `nifmake` orchestration on temen, decoupled from the real
+toolchain (`crates/temen-run/tests/multibinary.rs`; the driver + stand-in phases are pure Temen modules
+over the `exec` cap, so the proof lives with that seam, not in `temen-leng`). Three cases, all green on
 all three engines: (1) a two-phase hand-off (content-sensitive — `a → aa → aa!` — so it witnesses the
 data flow, not just that two children ran); (2) the **full four-phase depth** (nifler → nimony →
 hexer → lengc), `a → ab → abc → abcd → abcde`; and (3) **run-and-check-exit abort** — the driver reads
 each phase's exit status (`exec` op 3) and `br_if`s to a short-circuit block, so when a phase exits
 non-zero the pipeline stops with that phase's status and the later phases never run (the identical
 driver module, only the phase registry differs — so the abort is the driver reacting to status, the
-real `nifmake` control flow). This retires the "can the driver shape even run on svm" question,
+real `nifmake` control flow). This retires the "can the driver shape even run on temen" question,
 including its failure handling; what's left (above) is compiling the actual phases and — for the
 file-based hand-off specifically — the shared-memfs infra measured under "passing intermediate files."
 
 **Second slice — ✅ a real compiled program as an isolated `exec` child** (step (iii), on a real
-binary). The first slice's phases are hand-written; this runs output from the actual `Leng → SVM-IR`
+binary). The first slice's phases are hand-written; this runs output from the actual `Leng → TEMEN-IR`
 backend as a `domain_exec` child. A Leng module with real control flow (a counted `while` loop) is
-lowered by `svm-leng`, **verified**, registered as a phase, and `exec`d by the same nifmake-shaped
+lowered by `temen-leng`, **verified**, registered as a phase, and `exec`d by the same nifmake-shaped
 driver; its `main()` returns 55 (sum 1..10), `domain_exec` maps that return to the child's exit code,
 and the driver reads it back via the status op and re-exits with it — so **exit 55 witnesses the whole
 path**: frontend output → verify → isolated child domain → correct compute → status to driver
-(`crates/svm-run/tests/multibinary.rs::driver_runs_a_real_svm_leng_compiled_program_as_an_exec_child`,
-all three engines; svm-leng is a test-only dep of svm-run, no cycle). This proves a *real* compiled
+(`crates/temen-run/tests/multibinary.rs::driver_runs_a_real_temen_leng_compiled_program_as_an_exec_child`,
+all three engines; temen-leng is a test-only dep of temen-run, no cycle). This proves a *real* compiled
 binary boots and computes correctly as an isolated child — the previously-open half of (iii).
 
 The remaining half of (iii) is **heap/`system`-backed** phases, and it splits cleanly by what the
@@ -926,18 +926,18 @@ below), the same seam any bottom-edge cap would ride — so what's left is only 
 hand off via stdout→stdin piping; real `nifmake` passes *files*. This closes that: `domain_exec_with_fs`
 grants every phase child one shared in-memory filesystem (the `mem_fs_shared_factory` store), so a
 phase writes `mid` and a later phase reads it — the data crosses the child boundary through the file,
-not a pipe (`crates/svm-run/tests/multibinary.rs::driver_hands_off_a_file_between_phases_through_a_shared_memfs`,
+not a pipe (`crates/temen-run/tests/multibinary.rs::driver_hands_off_a_file_between_phases_through_a_shared_memfs`,
 all three engines: `gen` writes "OK" → `use` reads and echoes it → driver stdout "OK"). The
 child-capability grant that §3c held as owner-reviewed is **made and wired** as an *explicit,
 attenuated, parent-side opt-in*: the default `domain_exec` still gives a child only stdin/stdout, a
 child gains `fs` only through `domain_exec_with_fs`, and it gets *only* the one seeded in-memory store
 — no host filesystem, no ambient authority, no self-widening. The confinement default is pinned
 (`a_child_gets_fs_only_when_the_parent_grants_it`). With this, W4 is **build-out-complete on the
-mechanism**: driver shape, real compiled child, and the file hand-off all run on svm; what remains is
+mechanism**: driver shape, real compiled child, and the file hand-off all run on temen; what remains is
 compiling the four actual phase binaries (four applications of the on-ramp) and, for a heap phase, the
 self-seeding brk — no open architecture question.
 
-## 3d. TLS model — nimony's thread-vars onto svm (single-threaded now, `vcpu.tls` later)
+## 3d. TLS model — nimony's thread-vars onto temen (single-threaded now, `vcpu.tls` later)
 
 nimony marks its allocator and exception state `__thread` (thread-local); `hexer` emits these as Leng
 **`tvar`** (thread-var, the sibling of `gvar`). Phase 1's C on-ramp had no `llvm.threadlocal.address`
@@ -945,27 +945,27 @@ lowering, so `demos/nimony/build_nimony.sh` **strips `__thread`** before clang (
 `grep` guard that fails the build if any survives) — valid because the guest is single-threaded. This
 section commits the Phase-2 backend's model. It is a **two-tier** answer, and Tier 1 is done.
 
-**What svm actually offers (measured).** svm has exactly **one** thread-local primitive: a single
+**What temen actually offers (measured).** temen has exactly **one** thread-local primitive: a single
 per-vCPU `i64` register, the IR ops `vcpu.tls.get` / `vcpu.tls.set` (§12,
-`crates/svm-ir/src/lib.rs:1935-1959`), seeded to the dense vCPU id (root 0, children distinct;
-`crates/svm-interp/src/lib.rs:7810`) and read *at the execution point* so it tracks the current vCPU
+`crates/temen-ir/src/lib.rs:1935-1959`), seeded to the dense vCPU id (root 0, children distinct;
+`crates/temen-interp/src/lib.rs:7810`) and read *at the execution point* so it tracks the current vCPU
 across fiber migration (D57). It is **not** per-thread global storage — it is one word, meant to hold
 a *thread pointer*. Globals are process-global: a global is just a `Data { offset, readonly, bytes }`
-segment (`crates/svm-ir/src/lib.rs:4338`) in the **one shared window** every thread sees
-(`crates/svm-interp/src/bytecode.rs:8880` — "a thread shares its spawner's window/powerbox"); there
-is **no thread-local storage class** in svm-ir. A real `__thread` is therefore the guest's job:
+segment (`crates/temen-ir/src/lib.rs:4338`) in the **one shared window** every thread sees
+(`crates/temen-interp/src/bytecode.rs:8880` — "a thread shares its spawner's window/powerbox"); there
+is **no thread-local storage class** in temen-ir. A real `__thread` is therefore the guest's job:
 allocate a per-CPU block, put its base in `vcpu.tls`, and index thread-locals off it — the native
 fs/gs-base recipe. `DESIGN.md:949` lists `_Thread_local` (with threads) as deferred.
 
 **Tier 1 — `tvar` → plain global (committed, done).** For a single-threaded guest a thread-local has
-exactly one instance, so a plain global *is* that instance. svm-leng lowers `tvar` **identically to
+exactly one instance, so a plain global *is* that instance. temen-leng lowers `tvar` **identically to
 `gvar`**: one zero-initialized global at a fixed window offset, exported/linked as an ordinary data
 symbol (`translate.rs` `collect_globals`, the `gvar | tvar` arms). This mirrors the on-ramp's
 `__thread`-stripping and needs no new IR. It rests on one **invariant**, stated so it can't rot:
 *every guest we target runs single-threaded* — each nimony compiler phase is a batch process (W4 runs
-them as separate single-threaded domains, §3c), each svm domain is single-threaded, and nimony's own
+them as separate single-threaded domains, §3c), each temen domain is single-threaded, and nimony's own
 concurrency is **CPS/`.passive` → state machines** over a minimal `system.nim` (§1), not OS threads.
-Under that invariant the collapse is exact. Pinned by `crates/svm-leng/tests/thread_var.rs`: a `tvar`
+Under that invariant the collapse is exact. Pinned by `crates/temen-leng/tests/thread_var.rs`: a `tvar`
 persists across calls (write-then-read-back), a non-zero `tvar` initializer seeds the window, and a
 `tvar` **links cross-module** like a global (the shape of the real allocator's thread-vars in
 `system`, referenced from user code) — all on both engines. This is also already exercised
@@ -973,15 +973,15 @@ end-to-end: the heap programs of W3/Path A run against the compiled `system` mod
 state is thread-vars, and they get the right answer.
 
 **Tier 2 — real per-thread `__thread` over `vcpu.tls` (implemented).** For a genuinely multi-threaded
-guest (spawns svm threads *and* relies on per-thread `tvar` state), Tier 1's plain global is wrong —
+guest (spawns temen threads *and* relies on per-thread `tvar` state), Tier 1's plain global is wrong —
 all vCPUs would share one copy. The faithful lowering: (i) each `tvar` gets a fixed offset in a
 per-CPU **TLS block** instead of a window offset; (ii) at thread entry the runtime allocates a block
 and `vcpu.tls.set`s its base (the root vCPU too); (iii) every `tvar` access lowers to
-`vcpu.tls.get()` + the tvar's block offset, exactly as native code adds to the fs/gs base. svm
+`vcpu.tls.get()` + the tvar's block offset, exactly as native code adds to the fs/gs base. temen
 supplies the base register; the block layout and per-thread allocation are the backend/runtime's
 work — no new substrate.
 
-svm-leng implements (i) and (iii) — the backend's half — behind an opt-in `tls_mode`
+temen-leng implements (i) and (iii) — the backend's half — behind an opt-in `tls_mode`
 (`translate_tls` / `Translator::with_tls`; the `tvar` arm of `collect_globals` assigns block offsets,
 `lvalue_addr` emits `vcpu.tls.get() + off`). This holds **across modules**: `link_units_tls_with_runtime`
 runs a linker pre-pass (`export_tls_vars`) that pools every unit's thread-vars into one **shared block
@@ -991,7 +991,7 @@ cross-module global gets, except the offset is fixed at translate time (a `vcpu.
 the linker can't relocate later). Step (ii) is the runtime's job — the `vcpu.tls.set` at thread entry,
 the same division as the C runtime's fs/gs-base setup — so it stays outside the translator (a threaded
 guest's thread-start shim, the analog of Path B's allocator shim; `link_units_tls_with_runtime` takes
-it as an extra link unit). Proven in `crates/svm-leng/tests/thread_var.rs`, both engines: the lowering
+it as an extra link unit). Proven in `crates/temen-leng/tests/thread_var.rs`, both engines: the lowering
 routes a `tvar` through `vcpu.tls`; the `tvar` is **isolated per `vcpu.tls` base** (a driver sets base
 B0 and bumps +3, base B1 and bumps +5, reads each back as 3 and 5 — a shared global would read 8); and
 a `tvar` **defined in one unit, written cross-module and read via the defining unit's local name, hits
@@ -1010,87 +1010,87 @@ compiler is single-threaded — and both tiers are implemented and tested: Tier 
 additive follow-ups
 above.
 
-## 3e. W5 scope — bootstrap + browser (self-hosting the toolchain on svm)
+## 3e. W5 scope — bootstrap + browser (self-hosting the toolchain on temen)
 
-W5 asks (§3a): compile the Rust `svm-leng` to run **as a guest on svm**, and close the self-hosting
-loop — nimony-on-svm (W4) emits Leng, `svm-leng`-on-svm translates it to SVM-IR, which runs on svm —
+W5 asks (§3a): compile the Rust `temen-leng` to run **as a guest on temen**, and close the self-hosting
+loop — nimony-on-temen (W4) emits Leng, `temen-leng`-on-temen translates it to TEMEN-IR, which runs on temen —
 first headless, then as a browser playground card. Unlike W4 (whose "unknown" turned out already-built
 on both sides), W5 has a genuinely **greenfield middle**: **nothing has ever compiled a Rust crate to a
-module that runs on svm's own engines.** But it is bracketed by mature endpoints, so the invention is
+module that runs on temen's own engines.** But it is bracketed by mature endpoints, so the invention is
 narrow and the risk is bounded.
 
 **The template — C self-host, byte-exact, already in the browser.** chibicc (a C compiler) compiled to
-an svm module compiles *its own source* to valid SVM-IR entirely in-sandbox, byte-for-byte vs native
+an temen module compiles *its own source* to valid TEMEN-IR entirely in-sandbox, byte-for-byte vs native
 (`browser/tests/chibicc_selfhost.rs`, `browser/tests/chibicc_selfhost_asset.rs`, driven through the
-cdylib entry `svm_selfhost_emit_object_fs`; the self-host card seeds the libc headers into an in-window
-memfs). W5 is that exact shape with **`svm-leng` (Rust) in place of chibicc (C)**. Everything the C card
-needs — playground scaffold (`browser/web/play.html`), memfs mount, `.svmb` asset lane — is built and
+cdylib entry `temen_selfhost_emit_object_fs`; the self-host card seeds the libc headers into an in-window
+memfs). W5 is that exact shape with **`temen-leng` (Rust) in place of chibicc (C)**. Everything the C card
+needs — playground scaffold (`browser/web/play.html`), memfs mount, `.temen` asset lane — is built and
 reusable.
 
-**The one thing that doesn't exist: a Rust crate running as an svm guest.** Every `svm-wasm` transpile
-fixture is clang-produced C (`crates/svm-wasm/tests/fixtures/*_clang.wasm`); no rustc-emitted wasm has
-ever been fed to `svm_wasm::transpile` and run on svm. So the roadmap's stated chain — *"Rust → wasm →
-the svm-wasm on-ramp → svm-ir"* (§3a) — is unexercised for Rust. **But measuring the seam surfaced a
+**The one thing that doesn't exist: a Rust crate running as an temen guest.** Every `temen-wasm` transpile
+fixture is clang-produced C (`crates/temen-wasm/tests/fixtures/*_clang.wasm`); no rustc-emitted wasm has
+ever been fed to `temen_wasm::transpile` and run on temen. So the roadmap's stated chain — *"Rust → wasm →
+the temen-wasm on-ramp → temen-ir"* (§3a) — is unexercised for Rust. **But measuring the seam surfaced a
 lower-risk path the roadmap didn't assume.**
 
-**Two candidate Rust→svm-ir frontends, measured. Both converge on one svm-ir `Module` that runs
+**Two candidate Rust→temen-ir frontends, measured. Both converge on one temen-ir `Module` that runs
 identically (interp/JIT, and in the browser), so the choice is purely the *frontend*:**
-- **Path L — LLVM (already proven for Rust).** `rustc --emit=llvm-ir` → the `svm-llvm` reader
-  (`svm_llvm::translate_ll_path`) → svm. This is a *working lane today*: `bench/src/bin/rustbench.rs`
-  runs Rust on svm exactly this way (`rustbench.rs:14`, `146-173`). The Rust→svm primitive already
+- **Path L — LLVM (already proven for Rust).** `rustc --emit=llvm-ir` → the `temen-llvm` reader
+  (`temen_llvm::translate_ll_path`) → temen. This is a *working lane today*: `bench/src/bin/rustbench.rs`
+  runs Rust on temen exactly this way (`rustbench.rs:14`, `146-173`). The Rust→temen primitive already
   exists — just via LLVM, not wasm. Its risk is *scale*: rustbench compiles tiny `no_std` benchmarks,
-  not a multi-crate `std` translator. (rustbench's *wasm* lane, by contrast, runs on Wasmtime, not svm —
+  not a multi-crate `std` translator. (rustbench's *wasm* lane, by contrast, runs on Wasmtime, not temen —
   `rustbench.rs:18` — so it is no evidence for Path W.)
 - **Path W — wasm (the stated goal, greenfield for Rust).** `rustc --target wasm32-unknown-unknown` →
-  `svm_wasm::transpile` → svm. The on-ramp is mature and broad — bulk-memory, multi-value,
-  reference-types, `call_indirect`, SIMD (`crates/svm-wasm/src/lib.rs:14-47`) — with only narrow
+  `temen_wasm::transpile` → temen. The on-ramp is mature and broad — bulk-memory, multi-value,
+  reference-types, `call_indirect`, SIMD (`crates/temen-wasm/src/lib.rs:14-47`) — with only narrow
   fail-closed gaps (`table.grow`/`table.copy`/`table.init`, passive *element* segments, multi-memory —
   `lib.rs:44-46`) and a 16 MiB default ceiling on *unbounded* memory (`DEFAULT_MAX_GROW_PAGES = 256`,
   `lib.rs:113-117`; declare a `maximum` or watch the heap). It has simply never eaten rustc output.
 
 **Recommendation: Path L for first light, Path W as the stated end-goal — they share everything
-downstream.** Because once `svm-leng` is an svm-ir `Module` it runs the same and the browser plays
-`.svmb` either way, start with the path whose Rust→svm primitive already works (L), then bring up W (the
+downstream.** Because once `temen-leng` is an temen-ir `Module` it runs the same and the browser plays
+`.temen` either way, start with the path whose Rust→temen primitive already works (L), then bring up W (the
 roadmap's target, and the natural fit since the browser is wasm-native). Same "two seams, pick by the
 pragmatic constraint" call as W4's `exec`-over-`link`.
 
-**Why the endpoints make this bounded, not open.** `svm-leng`'s entire runtime dependency graph is
-**`svm-ir` + `svm-text` + `svm-encode`** (`crates/svm-leng/Cargo.toml`) — the three pure escape-TCB
+**Why the endpoints make this bounded, not open.** `temen-leng`'s entire runtime dependency graph is
+**`temen-ir` + `temen-text` + `temen-encode`** (`crates/temen-leng/Cargo.toml`) — the three pure escape-TCB
 crates already proven to compile to wasm inside the browser cdylib (root `Cargo.toml`; `browser/Cargo.toml`
-dep set). Its dev-deps (`svm-verify`/`interp`/`jit`) don't enter the artifact. And `svm-leng` is **pure
-computation** — text in, `Module` out; no `std::fs`/`std::io`/`File` anywhere (`crates/svm-leng/src`).
+dep set). Its dev-deps (`temen-verify`/`interp`/`jit`) don't enter the artifact. And `temen-leng` is **pure
+computation** — text in, `Module` out; no `std::fs`/`std::io`/`File` anywhere (`crates/temen-leng/src`).
 So the surface a guest build must satisfy is tiny.
 
 **Bounded gaps/decisions (all additive; none an architecture question):**
-- **Allocator.** `svm-leng` declares no `#[global_allocator]`; a guest build needs one (a bump
+- **Allocator.** `temen-leng` declares no `#[global_allocator]`; a guest build needs one (a bump
   allocator, the rustbench model — `rustbench.rs`). Additive.
-- **`std` posture + `HashMap` hasher.** `svm-leng` is a `std` crate using `HashMap`/`RefCell`
+- **`std` posture + `HashMap` hasher.** `temen-leng` is a `std` crate using `HashMap`/`RefCell`
   (`translate.rs`); `std`'s default `HashMap` pulls `getrandom` for `RandomState`, unavailable on a
   bare guest. Fix: a fixed-seed `BuildHasher` (or a light `no_std + alloc` rework). Small, mechanical.
-- **WASI is too thin for a `std`-`wasi` build.** The WASI shim (`crates/svm/tests/wasi_named_imports.rs`)
+- **WASI is too thin for a `std`-`wasi` build.** The WASI shim (`crates/temen/tests/wasi_named_imports.rs`)
   provides only `fd_write` + `proc_exit` and fails closed on the rest, so `wasm32-wasi` is out — which is
-  *why* Path W targets `wasm32-unknown-unknown` (and it's moot for Path L). Since `svm-leng` does no
+  *why* Path W targets `wasm32-unknown-unknown` (and it's moot for Path L). Since `temen-leng` does no
   I/O, this is a non-issue once the allocator is supplied.
 - **CI drift.** A guest build lives in a detached workspace (like `browser/`, `bench/`), which the
-  per-PR gate doesn't build (I55, `ISSUES.md`). A W5 asset needs an asset-lane check like `chibicc.svmb`'s.
+  per-PR gate doesn't build (I55, `ISSUES.md`). A W5 asset needs an asset-lane check like `chibicc.temen`'s.
 
 **Slices (each a checkpoint, smallest first):**
-1. **First light (Path L) — ✅ DONE.** A `no_std + alloc` Rust program doing **`svm-leng`-shaped work**
+1. **First light (Path L) — ✅ DONE.** A `no_std + alloc` Rust program doing **`temen-leng`-shaped work**
    (emit IR-ish text, then re-parse and fold it — `String`/`Vec` building, byte scanning, integer
-   format/parse) compiled `rustc --emit=llvm-ir` → `svm-llvm` and run **as a guest on svm**, matching a
+   format/parse) compiled `rustc --emit=llvm-ir` → `temen-llvm` and run **as a guest on temen**, matching a
    native oracle across 10 inputs (incl. edge cases), interp == JIT == native
-   (`crates/svm-llvm/tests/w5_rust_guest.rs`). This retires "purpose-built Rust in the self-host lane
-   runs correctly on svm" and exercises the exact `alloc`/string surface the real translator needs. (It
-   builds on the already-proven Rust→svm on-ramp — `rustbench`, the `peval` fixtures run real
-   multi-crate Rust on svm — so the pipeline itself is mature; this pins the *leng surface* on it.)
-2. **The real `svm-leng` translator lowers to verified SVM-IR *and runs correctly on svm* — ✅ DONE (2026-08-11).**
-   Measurement (2026-08-11) **overturned the feared prerequisite**: slice 1 guessed real `svm-leng`
+   (`crates/temen-llvm/tests/w5_rust_guest.rs`). This retires "purpose-built Rust in the self-host lane
+   runs correctly on temen" and exercises the exact `alloc`/string surface the real translator needs. (It
+   builds on the already-proven Rust→temen on-ramp — `rustbench`, the `peval` fixtures run real
+   multi-crate Rust on temen — so the pipeline itself is mature; this pins the *leng surface* on it.)
+2. **The real `temen-leng` translator lowers to verified TEMEN-IR *and runs correctly on temen* — ✅ DONE (2026-08-11).**
+   Measurement (2026-08-11) **overturned the feared prerequisite**: slice 1 guessed real `temen-leng`
    would need a `no_std` port of four crates. It does **not**. Rust generics monomorphize into the
-   crate's own IR, so a plain `std` `svm-leng` compiles to LLVM IR and the on-ramp translates it whole:
-   the `leng_probe` fixture (a `std` powerbox program calling `svm_leng::translate_to_text`) builds
-   `rustc +1.81` → `llvm-link-18` → `opt-18` → `svm-llvm` into a **236-func module that re-verifies**
-   (`crates/svm-llvm/tests/w5_leng_translates.rs`). Two small, real changes made it build: a **seedless
-   FNV hasher** for svm-leng's maps (`dethash.rs` — kills the `getrandom` the default `HashMap` pulls,
+   crate's own IR, so a plain `std` `temen-leng` compiles to LLVM IR and the on-ramp translates it whole:
+   the `leng_probe` fixture (a `std` powerbox program calling `temen_leng::translate_to_text`) builds
+   `rustc +1.81` → `llvm-link-18` → `opt-18` → `temen-llvm` into a **236-func module that re-verifies**
+   (`crates/temen-llvm/tests/w5_leng_translates.rs`). Two small, real changes made it build: a **seedless
+   FNV hasher** for temen-leng's maps (`dethash.rs` — kills the `getrandom` the default `HashMap` pulls,
    and makes output deterministic), and `map_or` for `is_none_or` (the guest toolchain floors at rustc
    1.81 / LLVM-18, to match the on-ramp's `llvm-*-18` tools). No `no_std`, no four-crate port.
    **Toolchain now aligned (2026-08-11).** The correct run needs the external libcore/liballoc symbols
@@ -1099,32 +1099,32 @@ So the surface a guest build must satisfy is tiny.
    `llvm-*-18` tools; with `rust-src` added, `build-std=std,panic_abort` +
    `build-std-features=panic_immediate_abort` compiles std from source and the whole thing links to a
    module whose **only externals are `malloc`/`free`/`calloc`/`bcmp`** — all four **synthesized** by
-   the on-ramp (`svm_llvm` §S bump allocator + `bcmp`/`memcmp` recognizer). So `fmt`/parse/panic are
+   the on-ramp (`temen_llvm` §S bump allocator + `bcmp`/`memcmp` recognizer). So `fmt`/parse/panic are
    real, and the run clears them.
-   **The integer-only self-host RUN is ✅ DONE (2026-08-11, path (b))** — the real `svm-leng`
-   translator now *executes* inside the sandbox to a correct result. `crates/svm-llvm/tests/w5_leng_run.rs`
+   **The integer-only self-host RUN is ✅ DONE (2026-08-11, path (b))** — the real `temen-leng`
+   translator now *executes* inside the sandbox to a correct result. `crates/temen-llvm/tests/w5_leng_run.rs`
    builds the `leng_probe` guest with `-Z build-std` (via `common::build_fixture_bc_std`), translates the
-   ~255-func module, re-verifies it, runs `svm_leng::translate_to_text` on the interpreter, and asserts
-   the emitted SVM text's checksum is **byte-identical to the same translation run host-side** (the §18
-   svm == native differential). Integer-only in two senses: the fixture depends on `svm-leng` with
+   ~255-func module, re-verifies it, runs `temen_leng::translate_to_text` on the interpreter, and asserts
+   the emitted Temen text's checksum is **byte-identical to the same translation run host-side** (the §18
+   temen == native differential). Integer-only in two senses: the fixture depends on `temen-leng` with
    `default-features = false` (float literals fail closed → no `flt2dec`/`dec2flt`), and
    `build-std-features=panic_immediate_abort` collapses panics to `abort` (no float *formatter* for panic
    messages). The entry is the guest's exported `main(sp) -> i32` — a plain compute entry (the fixture
    allocates from a static arena via its own `#[global_allocator]`, so no powerbox caps); the JIT declines
    the large build-std module (a backend `Malformed`, not a translation gap — it verifies), so the run
    pins the tree-walker. **This closes W5's core self-host claim: a real `std` Rust translator, compiled
-   the normal way, produces the same SVM-IR inside the sandbox as it does natively.**
+   the normal way, produces the same TEMEN-IR inside the sandbox as it does natively.**
 
-   **Path (a) — float-capable svm-leng — is now ✅ DONE too (2026-08-11).** The two float intrinsics
-   `svm_llvm` didn't lower, both in std's float path (reached only when svm-leng parses/formats float
+   **Path (a) — float-capable temen-leng — is now ✅ DONE too (2026-08-11).** The two float intrinsics
+   `temen_llvm` didn't lower, both in std's float path (reached only when temen-leng parses/formats float
    literals): `llvm.usub.sat.i8` in `dec2flt` — fixed earlier (the on-ramp gained i8/i16
-   `{u,s}{add,sub}.sat`, `crates/svm-llvm/tests/narrow_saturating.rs`) — and `llvm.fshl.v4i32` (a
+   `{u,s}{add,sub}.sat`, `crates/temen-llvm/tests/narrow_saturating.rs`) — and `llvm.fshl.v4i32` (a
    **general, non-rotate vector funnel shift**) in `flt2dec`/dragon4, the u128-bignum formatter. The
    on-ramp already lowered the rotate idiom and the scalar general funnel shift; the vector general form
    now scalarizes per lane to `(a << s) | (b >>u (w − s))` with a `select` on the `s == 0` width edge
-   (full-width `i32x4`/`i64x2` lanes only), pinned by `crates/svm-llvm/tests/vector_funnel_shift.rs`
+   (full-width `i32x4`/`i64x2` lanes only), pinned by `crates/temen-llvm/tests/vector_funnel_shift.rs`
    (interp == JIT == native across the edge + mod-32 wrap). With that in, the **full float-capable
-   `svm-leng`** (default features on — 278 funcs, up from the 255 of the integer-only guest) translates,
+   `temen-leng`** (default features on — 278 funcs, up from the 255 of the integer-only guest) translates,
    re-verifies, and **runs to the same correct checksum** on the interpreter (verified end-to-end;
    `llvm.fshl.v4i32` was the *only* remaining gap — no cascade of further float intrinsics). The
    integer-only guest (`default-features = false`) stays a supported lean build; `w5_leng_run.rs` uses it
@@ -1132,63 +1132,63 @@ So the surface a guest build must satisfy is tiny.
    requires it. Everything — integer code, `String`/`Vec`/`HashMap`, the allocator, and now the float
    formatter — translates and runs.
 
-   **The `svm-leng.svmb` self-host asset is now ✅ baked (2026-08-11) — the `chibicc_selfhost_asset`
-   analog.** `crates/svm-run/demos/leng_selfhost/` mirrors the chibicc/Postgres asset lane for the Rust
+   **The `temen-leng.temen` self-host asset is now ✅ baked (2026-08-11) — the `chibicc_selfhost_asset`
+   analog.** `crates/temen-run/demos/leng_selfhost/` mirrors the chibicc/Postgres asset lane for the Rust
    translator: a `leng_guest` powerbox program (reads a Leng-NIF module from stdin, `translate_to_text`,
-   writes SVM text to stdout — raw `read`/`write` + a bump allocator so the only externs are
-   `read`/`write`/`bcmp`), a `build_leng_svmb.sh` pipeline (`-Z build-std` → `llvm-link-18` →
-   `opt-18` → `svm-llvm-translate --binary` → `prep_svmb`, with a stub audit), a `corpus/` of **verbatim
+   writes Temen text to stdout — raw `read`/`write` + a bump allocator so the only externs are
+   `read`/`write`/`bcmp`), a `build_leng_temen.sh` pipeline (`-Z build-std` → `llvm-link-18` →
+   `opt-18` → `temen-llvm-translate --binary` → `prep_temen`, with a stub audit), a `corpus/` of **verbatim
    `hexer c` output** (Nim's `system/stringimpl` with ARC, control flow, gotos), and the committed
-   **`svm-leng.svmb`** (282 funcs, ~796 KB, decode/verify/bytecode-compile clean). The gate
-   `crates/svm-run/tests/leng_selfhost_asset.rs` runs the committed asset **in-sandbox over each real
-   hexer file** and asserts the emitted SVM text is byte-identical to native `svm_leng::translate_to_text`
+   **`temen-leng.temen`** (282 funcs, ~796 KB, decode/verify/bytecode-compile clean). The gate
+   `crates/temen-run/tests/leng_selfhost_asset.rs` runs the committed asset **in-sandbox over each real
+   hexer file** and asserts the emitted Temen text is byte-identical to native `temen_leng::translate_to_text`
    — a code-coupled gate needing no build toolchain (the oracle is the in-tree crate), so an
-   IR/ABI/encoder or `svm-leng` change that drifts the asset fails the PR (regenerate + commit, per the
-   demo `README.md`). This *is* the loop headless: real hexer Leng → real `svm-leng` running on svm →
-   verified SVM-IR, byte-exact.
+   IR/ABI/encoder or `temen-leng` change that drifts the asset fails the PR (regenerate + commit, per the
+   demo `README.md`). This *is* the loop headless: real hexer Leng → real `temen-leng` running on temen →
+   verified TEMEN-IR, byte-exact.
 
    And it now runs **client-side in the browser** too (item 4 below).
-3. **The loop, headless — ✅ demonstrated (2026-08-11).** real hexer Leng → `svm-leng`-on-svm →
-   verified SVM-IR, byte-exact (the `leng_selfhost` asset lane above). The self-hosting payoff, no
-   browser. (Chaining W4's nimony-on-svm to feed the Leng end-to-end in one process is the remaining
+3. **The loop, headless — ✅ demonstrated (2026-08-11).** real hexer Leng → `temen-leng`-on-temen →
+   verified TEMEN-IR, byte-exact (the `leng_selfhost` asset lane above). The self-hosting payoff, no
+   browser. (Chaining W4's nimony-on-temen to feed the Leng end-to-end in one process is the remaining
    integration step.)
 4. **The browser card — ✅ shipped (2026-08-11).** The Rust/leng analog of the chibicc self-host card:
    a playground card (`browser/web/play.js`, `kind: 'module'`) whose editor holds a **real hexer Leng
    file** (Nim `system/stringimpl` — ARC, `=wasMoved`) and whose Run pipes it to the committed
-   `svm-leng.svmb` (copied into `browser/web/assets/`) on stdin via `svm_run_onramp` — the fixed §3e
-   powerbox on the wasm engine. The translator emits **SVM IR text on stdout**, shown in the pane; the
-   run is ~200 ms and the emitted IR is byte-identical to native (`svm-leng.svmb` is the same asset the
+   `temen-leng.temen` (copied into `browser/web/assets/`) on stdin via `temen_run_onramp` — the fixed §3e
+   powerbox on the wasm engine. The translator emits **Temen IR text on stdout**, shown in the pane; the
+   run is ~200 ms and the emitted IR is byte-identical to native (`temen-leng.temen` is the same asset the
    `leng_selfhost_asset.rs` gate pins). Verified end-to-end in a real Chromium by
    `browser/browser-play-editor-test.mjs`; the asset-reference PR gate (`check-play-assets.mjs`) sees it
    committed. No server, no memfs image needed (stdin/stdout suffice — simpler than chibicc's header
-   closure): the real Rust translator, running on the SVM, in your browser.
+   closure): the real Rust translator, running on the Temen, in your browser.
 5. **Path W bring-up.** The stated end-goal: the same asset via `wasm32-unknown-unknown` →
-   `svm_wasm::transpile`, retiring the "first Rust guest through the wasm on-ramp" gap.
+   `temen_wasm::transpile`, retiring the "first Rust guest through the wasm on-ramp" gap.
 
-**Status: W5 is the one workstream with real greenfield** — the first Rust-crate-as-svm-guest — but it
-is bracketed by proven endpoints (a working Rust→svm primitive via LLVM, a byte-exact C self-host
+**Status: W5 is the one workstream with real greenfield** — the first Rust-crate-as-temen-guest — but it
+is bracketed by proven endpoints (a working Rust→temen primitive via LLVM, a byte-exact C self-host
 template, a mature playground, and a 3-crate wasm-clean dep graph), so it is **bring-up, not open
 architecture**.
 
 ## 4. Invariants this must respect
 
-- **Untrusted frontend, zero escape-TCB.** Same class as chibicc/`svm-wasm`/`svm-llvm`: the
+- **Untrusted frontend, zero escape-TCB.** Same class as chibicc/`temen-wasm`/`temen-llvm`: the
   verifier re-checks the produced module; a bug is a clean error (INVARIANTS §9, §2a).
 - **No new substrate.** Both phases close over existing seams — the on-ramp, the POSIX
-  personality, the Memory cap, `prep_svmb`, the `fs` cap memfs. No new host ops. Host stays
+  personality, the Memory cap, `prep_temen`, the `fs` cap memfs. No new host ops. Host stays
   mechanism (INVARIANTS §1/§4).
 - **Confinement is the masking lowering.** Nim raw pointers ride the same window+mask regime
   as C; no new emitted-code/window-access surface (INVARIANTS §2).
-- **Code-coupled asset.** `nimony.svmb` (and any corpus `.svmb`) regenerate on IR/ABI/encoder
+- **Code-coupled asset.** `nimony.temen` (and any corpus `.temen`) regenerate on IR/ABI/encoder
   change, gated in CI — the Postgres/chibicc asset-lane template.
 
 ## 5. Non-goals
 
 - Matching every Nim 2 feature — nimony's own coverage at v0.4.0 is the ceiling; effect
   inference etc. are upstream gaps.
-- A general Nim package/build tool on SVM (nimble, etc.). The unit is a compiled SVM module.
+- A general Nim package/build tool on Temen (nimble, etc.). The unit is a compiled Temen module.
 - Making the Phase-2 backend the *only* path — the on-ramp (Phase 1) stays the low-risk lane
-  and the self-host shipping path, exactly as the LLVM-built `chibicc.svmb` ships (§3 there).
+  and the self-host shipping path, exactly as the LLVM-built `chibicc.temen` ships (§3 there).
 
 ---
 
@@ -1205,8 +1205,8 @@ nim c -r src/hastur build all          # bootstrap the toolchain
 # emit Leng-derived C for a program (via the C backend):
 #   the toolchain drives nifler → nimony → hexer → lengc c; capture the generated .c
 
-# on-ramp the C (mirrors build_chibicc_svmb.sh)
+# on-ramp the C (mirrors build_chibicc_temen.sh)
 clang-18 -O2 -emit-llvm -c -mlong-double-64 prog.c -o prog.bc
-svm-llvm-translate prog.bc -o prog_raw.svmb --binary --host-page 65536 [--stub-externs]
-cargo run --release -p svm-run --example prep_svmb -- prog_raw.svmb prog.svmb
+temen-llvm-translate prog.bc -o prog_raw.temen --binary --host-page 65536 [--stub-externs]
+cargo run --release -p temen-run --example prep_temen -- prog_raw.temen prog.temen
 ```

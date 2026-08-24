@@ -1,4 +1,4 @@
-// Shared page-side Worker orchestration — one SVM guest's vCPUs across real Web Workers over one
+// Shared page-side Worker orchestration — one Temen guest's vCPUs across real Web Workers over one
 // shared `WebAssembly.Memory`. Extracted from `main.js` (THREADS.md 4c-wasm) so the validation page
 // and the playground (`play.js`) drive the exact same machinery. The page creates every Worker (no
 // nested Workers) and never blocks (a browser bans main-thread `Atomics.wait`); the Workers do all
@@ -8,7 +8,7 @@
 // origin root (local `serve.mjs`) and under a subpath (GitHub Pages serves a project site at
 // `/<repo>/`). The deployed site keeps the same `web/` + `target/…` layout, so `../target/…`
 // resolves correctly under either base.
-const WASM = new URL('../target/wasm32-unknown-unknown/release/svm_browser.wasm', import.meta.url);
+const WASM = new URL('../target/wasm32-unknown-unknown/release/temen_browser.wasm', import.meta.url);
 const STACK = 1 << 20, SLOT = 16;
 const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
 
@@ -26,15 +26,15 @@ export async function loadEngine() {
     throw new Error('not a threads build (no imported memory)');
   }
   const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
-  // The wasm imports `svm_host.webgpu_op` (the `webgpu` capability's host seam). It is a no-op unless a
-  // page installs a real servicer on `globalThis.__svm_webgpu_op` (play.js does, backed by the page's
+  // The wasm imports `temen_host.webgpu_op` (the `webgpu` capability's host seam). It is a no-op unless a
+  // page installs a real servicer on `globalThis.__temen_webgpu_op` (play.js does, backed by the page's
   // <canvas> + `navigator.gpu`). i64 args arrive as BigInt; the handler gets the shared `memory` so it
   // can read the WGSL bytes at `ptr`/`len`. Returns a BigInt (the wasm import result is i64).
   const importObj = {
     env: { memory },
-    svm_host: {
+    temen_host: {
       webgpu_op: (op, a, b, c, ptr, len) => {
-        const h = globalThis.__svm_webgpu_op;
+        const h = globalThis.__temen_webgpu_op;
         return h ? BigInt(h(op, a, b, c, ptr, len, memory)) : -1n;
       },
     },
@@ -45,14 +45,14 @@ export async function loadEngine() {
 
 // Build the runner over a loaded engine. The returned `runAcrossWorkers(guest, opts)` runs one
 // guest's `thread.spawn`ed / `instantiate`d vCPUs across real Web Workers and resolves
-// `{ value, started }`. `guest` is the **encoded module bytes** (a fetched `.svmbc` or an in-browser
-// `svm_parse` product). Options:
+// `{ value, started }`. `guest` is the **encoded module bytes** (a fetched `.temenc` or an in-browser
+// `temen_parse` product). Options:
 //   `jit`     ⇒ build the Rust-side §22 powerbox + reserve the JIT dispatch table;
 //   `inst`    ⇒ publish the §14 recipe (root `Instantiator` over the window + the optional granted
 //               `unit` module bytes) — the root vCPU builds its powerbox from it;
 //   `io`      ⇒ publish the 4d shared I/O powerbox (a `Mutex<Host>` in shared memory every vCPU
-//               dispatches `cap.call` through; read stdout back via `svm_par_stdout_*` after);
-//   none      ⇒ the recipes are explicitly cleared (`svm_par_powerbox_none`) so a plain compute run
+//               dispatches `cap.call` through; read stdout back via `temen_par_stdout_*` after);
+//   none      ⇒ the recipes are explicitly cleared (`temen_par_powerbox_none`) so a plain compute run
 //               isn't seeded by a previous run's recipe;
 //   `winSize` sizes the shared window; `signal` (an `AbortSignal`) stops the run: every Worker is
 //   terminated and the promise rejects. NOTE a stop tears down Workers mid-run — shared state (the
@@ -64,57 +64,57 @@ export function makeRunner({ module, memory, ex }) {
   const tlsSize = ex.__tls_size.value, tlsAlign = ex.__tls_align.value || 1;
 
   return async function runAcrossWorkers(guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, instCodegen = false, io = false, tierup = false, unit = null, winSize = 1 << 16, signal = null, jitB2 = false, jitRuntime = false, jitRuntimeCodegen = false, jitBlobs = [] } = {}) {
-    const gptr = ex.svm_par_alloc(guest.length);
+    const gptr = ex.temen_par_alloc(guest.length);
     u8().set(guest, gptr);
-    if (jit && ex.svm_par_powerbox(gptr, guest.length) !== 1) throw new Error('svm_par_powerbox failed');
+    if (jit && ex.temen_par_powerbox(gptr, guest.length) !== 1) throw new Error('temen_par_powerbox failed');
     // §22 real-codegen run: like `jit`, but the host-compiled unit's wasm is emitted + stashed, and a
     // guest `Jit.invoke` runs it on emitted wasm (each Worker instantiates the unit — see worker.js).
     // `jitService` selects the codegen unit (0 = i32 `service`, 1 = f64 `fservice`).
-    if (jitCodegen) ex.svm_par_jit_codegen_service(jitService);
+    if (jitCodegen) ex.temen_par_jit_codegen_service(jitService);
     // §22 Model B2 cross-Worker: emit runtime-compiled units importing the shared reserved funcref
     // table (a shared static, so setting it on this instance sets it for every Worker); each Worker
     // provides its own `WebAssembly.Table` mirror (`jitB2` in the cfg → worker.js). Verified by the
     // CI-gated `jitb2` work item — see BROWSER.md § "wasm-JIT tier".
-    if (jitB2) ex.svm_par_jit_set_b2(1);
+    if (jitB2) ex.temen_par_jit_set_b2(1);
     // §22 runtime-`Jit.compile` across Workers: publish the shared Mutex<Host> powerbox every vCPU
     // dispatches its cap.calls through (the guest compiles its OWN units at runtime); with
     // `jitRuntimeCodegen` each compiled unit's emitted wasm services `Jit.invoke` per-Worker
     // (worker.js instantiates per code handle). `jitBlobs` stages the unit blobs into the window
     // where the guest's `compile (ptr, len)` reads them.
     if (jitRuntime) {
-      // Self-clean: clear any prior run's recipe (svm_par_root checks the §14/§22-fixed recipes
+      // Self-clean: clear any prior run's recipe (temen_par_root checks the §14/§22-fixed recipes
       // first, so a stale one would hijack this run), and set the B2 flag explicitly both ways —
       // it is a sticky static that powerbox_none does not reset.
-      ex.svm_par_powerbox_none();
-      ex.svm_par_jit_set_b2(jitB2 ? 1 : 0);
-      if (ex.svm_par_powerbox_jit_runtime(gptr, guest.length) !== 1) throw new Error('svm_par_powerbox_jit_runtime failed');
-      ex.svm_par_jit_set_codegen(jitRuntimeCodegen ? 1 : 0);
+      ex.temen_par_powerbox_none();
+      ex.temen_par_jit_set_b2(jitB2 ? 1 : 0);
+      if (ex.temen_par_powerbox_jit_runtime(gptr, guest.length) !== 1) throw new Error('temen_par_powerbox_jit_runtime failed');
+      ex.temen_par_jit_set_codegen(jitRuntimeCodegen ? 1 : 0);
     }
-    if (jitCodegen && ex.svm_par_powerbox_jit_codegen(gptr, guest.length) !== 1) throw new Error('svm_par_powerbox_jit_codegen failed');
-    if (io && ex.svm_par_powerbox_io() !== 1) throw new Error('svm_par_powerbox_io failed');
-    if (!jit && !jitCodegen && !io && !inst && !instCodegen && !jitRuntime) ex.svm_par_powerbox_none();
-    const prog = (jit || jitCodegen || jitRuntime) ? ex.svm_par_compile_jit(gptr, guest.length) : ex.svm_par_compile(gptr, guest.length);
-    if (prog === 0) throw new Error('module unsupported on the parallel driver (svm_par_compile null)');
-    const win = ex.svm_par_alloc(winSize);
+    if (jitCodegen && ex.temen_par_powerbox_jit_codegen(gptr, guest.length) !== 1) throw new Error('temen_par_powerbox_jit_codegen failed');
+    if (io && ex.temen_par_powerbox_io() !== 1) throw new Error('temen_par_powerbox_io failed');
+    if (!jit && !jitCodegen && !io && !inst && !instCodegen && !jitRuntime) ex.temen_par_powerbox_none();
+    const prog = (jit || jitCodegen || jitRuntime) ? ex.temen_par_compile_jit(gptr, guest.length) : ex.temen_par_compile(gptr, guest.length);
+    if (prog === 0) throw new Error('module unsupported on the parallel driver (temen_par_compile null)');
+    const win = ex.temen_par_alloc(winSize);
     for (const b of jitBlobs) u8().set(b.bytes, win + b.off); // stage runtime-compile unit blobs
     // §14 real-codegen (`instCodegen`) publishes the same recipe as `inst`; each confined child whose
     // granted-unit entry is emitted runs it on wasm instead of interpreting (see worker.js).
     if (inst || instCodegen) {
       let uptr = 0, ulen = 0;
       if (unit) {
-        uptr = ex.svm_par_alloc(unit.length);
+        uptr = ex.temen_par_alloc(unit.length);
         u8().set(unit, uptr);
         ulen = unit.length;
       }
-      if (ex.svm_par_powerbox_inst(BigInt(winSize), uptr, ulen) !== 1) {
-        throw new Error('svm_par_powerbox_inst failed');
+      if (ex.temen_par_powerbox_inst(BigInt(winSize), uptr, ulen) !== 1) {
+        throw new Error('temen_par_powerbox_inst failed');
       }
     }
 
     // A shared i32 cell every Worker atomically bumps each time it runs an emitted region (a tier-up
     // or a §22 JIT-codegen invoke), so the caller can prove the seam actually fired (a result match
     // alone can't tell "ran emitted wasm" from "silently interpreted"). Read back after the run.
-    const tierupCell = (tierup || jitCodegen || instCodegen || jitRuntimeCodegen) ? ex.svm_par_alloc(4) : 0;
+    const tierupCell = (tierup || jitCodegen || instCodegen || jitRuntimeCodegen) ? ex.temen_par_alloc(4) : 0;
 
     const workers = new Set();
     let started = 0;
@@ -147,9 +147,9 @@ export function makeRunner({ module, memory, ex }) {
           w.postMessage({ module, memory, prog, win, winSize, tierup, jitCodegen, jitService, instCodegen, jitB2, jitRuntime, gptr, glen: guest.length, tierupCell, ...cfg });
         };
         // The root vCPU runs on its own Worker (the page can't Atomics.wait).
-        const rootSlot = ex.svm_par_alloc(SLOT);
-        const rootStackTop = ex.svm_par_alloc(STACK) + STACK;
-        const rootTlsBase = tlsSize > 0 ? roundUp(ex.svm_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
+        const rootSlot = ex.temen_par_alloc(SLOT);
+        const rootStackTop = ex.temen_par_alloc(STACK) + STACK;
+        const rootTlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
         startVcpu({ role: 'root', func: 0, slot: rootSlot, stackTop: rootStackTop, tlsBase: rootTlsBase });
       });
       const tierups = (tierup || jitCodegen || instCodegen || jitRuntimeCodegen) ? Atomics.load(new Int32Array(memory.buffer), tierupCell >> 2) : 0;
@@ -163,7 +163,7 @@ export function makeRunner({ module, memory, ex }) {
 // Read back the accumulated stdout of the last 4d I/O run (empty string when no I/O powerbox ran).
 // `slice` (not `subarray`) copies out of the SharedArrayBuffer — TextDecoder rejects shared views.
 export function readParStdout({ memory, ex }) {
-  const len = ex.svm_par_stdout_len();
+  const len = ex.temen_par_stdout_len();
   const u8 = new Uint8Array(memory.buffer);
-  return new TextDecoder().decode(u8.slice(ex.svm_par_stdout_ptr(), ex.svm_par_stdout_ptr() + len));
+  return new TextDecoder().decode(u8.slice(ex.temen_par_stdout_ptr(), ex.temen_par_stdout_ptr() + len));
 }

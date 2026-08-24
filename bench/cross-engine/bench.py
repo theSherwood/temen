@@ -1,5 +1,5 @@
 import time
-# CPython mirror of kernels.c — i32-LCG (masked to 32 bits), same computations as the C/SVM kernels.
+# CPython mirror of kernels.c — i32-LCG (masked to 32 bits), same computations as the C/Temen kernels.
 def now(): return time.perf_counter_ns()
 MASK = 0xffffffff
 def lcg(a, i): return (a * 1103515245 + 12345 + i) & MASK

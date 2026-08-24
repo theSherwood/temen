@@ -1,9 +1,9 @@
-//! SVM JIT vs. Wasmtime — the relative-performance harness (`DESIGN.md` §1a, AGENTS.md
+//! Temen JIT vs. Wasmtime — the relative-performance harness (`DESIGN.md` §1a, AGENTS.md
 //! "benchmark early, measured relative to wasm/Wasmtime").
 //!
 //! **Four lanes per compute kernel (the apples-to-apples comparison).** The same algorithm runs
-//! as: **JIT** (our `svm-jit`, Cranelift), **wasm** (Wasmtime, also Cranelift — wasm32 + wasm64),
-//! **interp** (our `svm-interp` reference interpreter — the *exact same IR* the JIT runs, so it is
+//! as: **JIT** (our `temen-jit`, Cranelift), **wasm** (Wasmtime, also Cranelift — wasm32 + wasm64),
+//! **interp** (our `temen-interp` reference interpreter — the *exact same IR* the JIT runs, so it is
 //! the cleanest apples-to-apples lane: only the execution strategy differs), and **native** (the
 //! algorithm hand-written once in Rust and compiled by `rustc`/LLVM straight into this binary — the
 //! bare-metal *ceiling*, no VM and no per-run compile step). The C-frontend kernels (`alu_c`,
@@ -38,7 +38,7 @@
 //! end-to-end** — it should stay at ≈parity with `alu`; if a promotable loop body regressed to
 //! memory it would drift toward the memory-bound path. It is skipped if the frontend can't build.
 //!
-//! Methodology (kept simple + dependency-light, like `crates/svm/src/bin/bench.rs`):
+//! Methodology (kept simple + dependency-light, like `crates/temen/src/bin/bench.rs`):
 //!   - *compute* is isolated by **subtraction**: time the kernel at a large and a small
 //!     iteration count and divide the difference by the iteration delta. For our engine each
 //!     timed run recompiles, but compile cost is identical at both counts so it cancels; for
@@ -49,18 +49,18 @@
 //!
 //! This is a watch-it-over-time regression harness, not a statistical benchmark. Run with:
 //!   cargo run --release                          # from bench/, human table
-//!   cargo run --release -- --from-wasm           # SVM IR transpiled from the WAT (same bytes as wasm)
-//!   cargo run --release -- --optimize            # run svm-opt over the SVM IR before the SVM lanes
+//!   cargo run --release -- --from-wasm           # Temen IR transpiled from the WAT (same bytes as wasm)
+//!   cargo run --release -- --optimize            # run temen-opt over the Temen IR before the Temen lanes
 //!   cargo run --release -- --csv                 # machine-readable line per kernel
 //!   cargo run --release -- --save-baseline FILE  # record the current ratios
 //!   cargo run --release -- --check FILE           # rerun + flag any ratio regression
 //!
 //! **Over-time regression tracking (AGENTS.md "catch regressions one commit old").** The
-//! absolute ns are machine-dependent, so the *tracked* quantity is the **ratio** (svm ÷
+//! absolute ns are machine-dependent, so the *tracked* quantity is the **ratio** (temen ÷
 //! wasm) per kernel — far more portable across machines than the raw timings. `--save-baseline`
 //! writes the three ratios per kernel (compute-vs-wasm32, compute-vs-wasm64, cold-vs-Wasmtime)
 //! to a committed file; `--check` reruns and **exits non-zero** if any ratio has grown by more
-//! than `--tol` (default 25%, i.e. svm got relatively slower) — that band absorbs runner noise
+//! than `--tol` (default 25%, i.e. temen got relatively slower) — that band absorbs runner noise
 //! while still catching a real regression (e.g. losing mask-elision moved `scatter` ≈1.21→1.53,
 //! +26%; losing SSA promotion would be far larger). `--check`/`--save-baseline` default to
 //! `--reps 5` (best-of, to stabilise the comparison); plain/`--csv` use one pass for speed.
@@ -73,8 +73,8 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use svm_interp::Value;
-use svm_jit::{
+use temen_interp::Value;
+use temen_jit::{
     compile_and_run, compile_and_run_with_host, compile_and_run_with_host_fast, JitOutcome,
 };
 
@@ -184,7 +184,7 @@ block3(v17: i64):
 
 /// `(i64 n) -> i64`: a §17 `v128` compute loop — an `i32x4` accumulator gains `[1,2,3,4]`
 /// each iteration, then a horizontal `extract_lane` sum. The "real hardware SIMD" datapoint
-/// (D58): SVM lowers the lane add to one native SSE2/NEON `paddd`, exactly as Wasmtime does
+/// (D58): Temen lowers the lane add to one native SSE2/NEON `paddd`, exactly as Wasmtime does
 /// (shared Cranelift). Result after `n` iters = (1+2+3+4)·n = 10n (mod 2^32), identical on
 /// every engine (the harness asserts agreement before timing).
 ///
@@ -581,12 +581,12 @@ block0(v0: i64):
 
 /// `(i64 n) -> i64`: a **memory-latency** loop — like `scatter` but over a 1 MiB array (mask
 /// `0x1FFFF` ⇒ 128 Ki `i64` slots), so the hashed store/load addresses miss L1/L2 (and on smaller
-/// machines L3). The interesting question: svm's confinement mask (§4) is ~one `AND`; once an access
-/// is memory-latency-bound the mask hides in the miss shadow, so svm should **track wasm** here even
+/// machines L3). The interesting question: temen's confinement mask (§4) is ~one `AND`; once an access
+/// is memory-latency-bound the mask hides in the miss shadow, so temen should **track wasm** here even
 /// though `locals_c`'s in-cache mask shows a gap.
 ///
-/// **Warm-buffer methodology (why this kernel needs a custom span).** svm allocates a *fresh* window
-/// per run (no warm-window API), so a naive small/large subtraction would leave svm paying page-fault
+/// **Warm-buffer methodology (why this kernel needs a custom span).** temen allocates a *fresh* window
+/// per run (no warm-window API), so a naive small/large subtraction would leave temen paying page-fault
 /// + cold-cache cost that Wasmtime (which reuses one warm `Store` across timing iterations) does not —
 /// an apples-to-oranges result. The fix: a **saturating `n_span`** — both `n_small` and `n_big` are
 /// large enough that *every* page is faulted and the cache reaches steady state in **both**, so that
@@ -787,7 +787,7 @@ fn native_calli(n: i64) -> i64 {
 /// provably lands in `[0, 131072)` = the array's const length, so LLVM elides the bounds check —
 /// matching the VMs' masked window access. It is **thread-local and reused** across calls (warm +
 /// faulted once). The first call (the cross-check) sees a zeroed buffer, so its result matches the
-/// cold svm/wasm lanes.
+/// cold temen/wasm lanes.
 ///
 /// **No per-iteration `black_box`.** A barrier inside the loop would serialize the loads and kill
 /// **memory-level parallelism** — the CPU overlapping successive independent cache-miss latencies —
@@ -816,12 +816,12 @@ fn native_cache(n: i64) -> i64 {
 
 /// Compile + run a kernel's IR entry once and return the single `i64` result. `lead` is the
 /// fixed leading args (e.g. the data-stack pointer chibicc threads as v0); `n` is appended.
-fn svm_call(m: &svm_ir::Module, entry: u32, lead: &[i64], n: i64) -> i64 {
+fn temen_call(m: &temen_ir::Module, entry: u32, lead: &[i64], n: i64) -> i64 {
     let mut args: Vec<i64> = lead.to_vec();
     args.push(n);
     match compile_and_run(m, entry, &args) {
         Ok(JitOutcome::Returned(s)) => s[0],
-        other => panic!("svm jit produced {other:?}"),
+        other => panic!("temen jit produced {other:?}"),
     }
 }
 
@@ -831,17 +831,17 @@ fn svm_call(m: &svm_ir::Module, entry: u32, lead: &[i64], n: i64) -> i64 {
 /// — we hand it `u64::MAX`, so a finite kernel never runs dry. Only used for `Compute` kernels (the
 /// `HostCall` kernels need a granted capability the interp lane doesn't wire up — they stay
 /// JIT-vs-wasm).
-fn interp_call(m: &svm_ir::Module, entry: u32, lead: &[i64], n: i64) -> i64 {
+fn interp_call(m: &temen_ir::Module, entry: u32, lead: &[i64], n: i64) -> i64 {
     let mut args: Vec<Value> = lead.iter().map(|&x| Value::I64(x)).collect();
     args.push(Value::I64(n));
     let mut fuel = u64::MAX;
-    match svm_interp::run(m, entry, &args, &mut fuel) {
+    match temen_interp::run(m, entry, &args, &mut fuel) {
         Ok(vals) => match vals.first() {
             Some(Value::I64(x)) => *x,
             Some(Value::I32(x)) => *x as i64,
-            other => panic!("svm interp produced {other:?}"),
+            other => panic!("temen interp produced {other:?}"),
         },
-        Err(t) => panic!("svm interp trapped: {t:?}"),
+        Err(t) => panic!("temen interp trapped: {t:?}"),
     }
 }
 
@@ -851,7 +851,7 @@ fn interp_call(m: &svm_ir::Module, entry: u32, lead: &[i64], n: i64) -> i64 {
 /// timing isolates the boundary-crossing cost rather than the work.
 ///
 /// # Safety
-/// Honours the [`svm_jit::CapThunk`] contract: `args`/`results` are valid for their declared
+/// Honours the [`temen_jit::CapThunk`] contract: `args`/`results` are valid for their declared
 /// lengths, and for op 1 the kernel passes in-window constants so `[ptr, ptr+len) ⊆ window`.
 unsafe extern "C" fn bench_thunk(
     _ctx: *mut c_void,
@@ -872,7 +872,7 @@ unsafe extern "C" fn bench_thunk(
     // `CAP_IMPORT_TYPE_ID` sentinel with the manifest slot as `op`. Each `HostCall` kernel imports
     // exactly one op and the two bench ops have distinct arities, so pick by arity there; the
     // hand-written IR's inline `cap.call 0 <op>` still selects by `op` directly.
-    let op = if type_id == svm_ir::CAP_IMPORT_TYPE_ID {
+    let op = if type_id == temen_ir::CAP_IMPORT_TYPE_ID {
         if n_args == 2 {
             1
         } else {
@@ -900,7 +900,7 @@ unsafe extern "C" fn bench_thunk(
 /// The §9/D45 **devirtualized** counterparts of [`bench_thunk`]'s ops: register-to-register host fns
 /// the JIT calls directly when `--fast-cap` is set. `op 0` (`x -> x+1`) and `op 1` (sum a `(ptr,len)`
 /// borrow buffer) — identical results to the generic thunk, but no stack marshalling / runtime
-/// dispatch. The ABI matches [`svm_jit::FastCapResolver`]: `(ctx, mem_base, mem_size, handle, trap_out,
+/// dispatch. The ABI matches [`temen_jit::FastCapResolver`]: `(ctx, mem_base, mem_size, handle, trap_out,
 /// args…)`.
 unsafe extern "C" fn fast_op0(
     _ctx: *mut c_void,
@@ -935,7 +935,7 @@ unsafe extern "C" fn bench_fast_resolver(
     // A `call.import` dispatch carries the `CAP_IMPORT_TYPE_ID` sentinel with the manifest slot as
     // `op` (phase 3); the bench ops have distinct arities, so select by arity there. Only claim an
     // op when the IR arity matches the specialized fn's (else the generic path).
-    let op = if type_id == svm_ir::CAP_IMPORT_TYPE_ID {
+    let op = if type_id == temen_ir::CAP_IMPORT_TYPE_ID {
         if n_args == 2 {
             1
         } else {
@@ -951,10 +951,10 @@ unsafe extern "C" fn bench_fast_resolver(
     }
 }
 
-/// Like [`svm_call`] but drives the cap.call trampoline ([`bench_thunk`]) — for `HostCall`
+/// Like [`temen_call`] but drives the cap.call trampoline ([`bench_thunk`]) — for `HostCall`
 /// kernels. The context pointer is unused (the thunk is stateless), so it is null. With `--fast-cap`
 /// the call instead takes the §9/D45 devirtualized fast path via [`bench_fast_resolver`].
-fn svm_call_host(m: &svm_ir::Module, entry: u32, lead: &[i64], n: i64) -> i64 {
+fn temen_call_host(m: &temen_ir::Module, entry: u32, lead: &[i64], n: i64) -> i64 {
     let mut args: Vec<i64> = lead.to_vec();
     args.push(n);
     let out = if FAST_CAP.load(Ordering::Relaxed) {
@@ -965,20 +965,20 @@ fn svm_call_host(m: &svm_ir::Module, entry: u32, lead: &[i64], n: i64) -> i64 {
             bench_thunk,
             std::ptr::null_mut(),
             bench_fast_resolver,
-            svm_jit::Quota::default(),
+            temen_jit::Quota::default(),
         )
     } else {
         compile_and_run_with_host(m, entry, &args, bench_thunk, std::ptr::null_mut())
     };
     match out {
         Ok(JitOutcome::Returned(s)) => s[0],
-        other => panic!("svm jit (host-call) produced {other:?}"),
+        other => panic!("temen jit (host-call) produced {other:?}"),
     }
 }
 
 /// What a kernel measures. `Compute` kernels run an import-less wasm module and the no-cap
-/// SVM JIT (per-iteration *compute*). `HostCall` kernels instead make one host crossing per
-/// iteration — SVM `cap.call` through a trampoline thunk vs a Wasmtime **imported host
+/// Temen JIT (per-iteration *compute*). `HostCall` kernels instead make one host crossing per
+/// iteration — Temen `cap.call` through a trampoline thunk vs a Wasmtime **imported host
 /// function** — so the subtraction isolates the *per-host-call* cost (§1a interface axis).
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -987,7 +987,7 @@ enum Mode {
 }
 
 /// A kernel resolved for this run: IR text — hand-written, or generated from C through the
-/// chibicc frontend — plus how to invoke its entry. `svm_call` appends `n` after `lead_args`.
+/// chibicc frontend — plus how to invoke its entry. `temen_call` appends `n` after `lead_args`.
 struct Resolved {
     name: String,
     ir: String,
@@ -1009,14 +1009,14 @@ struct Resolved {
 /// The hand-written [`KERNELS`] plus, when the C frontend is buildable, the chibicc-lowered
 /// kernels (`alu_c`, `locals_c` — see [`alu_from_c`] / [`locals_from_c`]).
 ///
-/// With `from_wasm`, each kernel's SVM IR is replaced by transpiling its `wat32` through `svm-wasm`
+/// With `from_wasm`, each kernel's Temen IR is replaced by transpiling its `wat32` through `temen-wasm`
 /// (the same bytes Wasmtime runs) — the genuine apples-to-apples comparison. This now covers the
 /// **`hostcall` / `hostbuf`** interface kernels too: their `host.op` / `host.sum` imports use the
 /// host-ABI convention (`module` = capability type_id, `name` = op), so they transpile to the same
 /// `cap.call` the hand-written IR used. Kernels the transpiler can't handle keep their hand-written
 /// IR, with a note saying why.
 ///
-/// **svm-wasm doesn't transpile (so these keep their hand-written IR under `--from-wasm`):**
+/// **temen-wasm doesn't transpile (so these keep their hand-written IR under `--from-wasm`):**
 /// **`memory.grow` / `memory.size`**, **passive** data/element segments, imports across multiple
 /// capability interfaces, **SIMD (v128)**, and **reference types** beyond funcref tables. (Supported:
 /// i32/i64/f32/f64 numeric + all conversions, locals, the full structured control set, linear memory,
@@ -1066,7 +1066,7 @@ fn resolve_kernels(from_wasm: bool) -> Vec<Resolved> {
                     k.lead_args = Vec::new();
                 }
                 Err(e) => eprintln!(
-                    "note: --from-wasm keeps `{}` hand-written (svm-wasm: {e})",
+                    "note: --from-wasm keeps `{}` hand-written (temen-wasm: {e})",
                     k.name
                 ),
             }
@@ -1075,7 +1075,7 @@ fn resolve_kernels(from_wasm: bool) -> Vec<Resolved> {
     v
 }
 
-/// Transpile a WAT kernel through `svm-wasm` to SVM IR text + the `run` entry index. The IR is printed
+/// Transpile a WAT kernel through `temen-wasm` to Temen IR text + the `run` entry index. The IR is printed
 /// and re-parsed by `measure`, so this also exercises the text round-trip.
 fn transpile_wat_to_ir(wat32: &str) -> Result<(String, u32), String> {
     let wasm = wat::parse_str(wat32).map_err(|e| e.to_string())?;
@@ -1083,21 +1083,21 @@ fn transpile_wat_to_ir(wat32: &str) -> Result<(String, u32), String> {
 }
 
 /// Like [`transpile_wat_to_ir`] but from already-assembled wasm bytes (the `irreducible` kernel's
-/// `clang` output) — run the *same relooped wasm* on svm under `--from-wasm`.
+/// `clang` output) — run the *same relooped wasm* on temen under `--from-wasm`.
 fn transpile_wasm_to_ir(wasm: &[u8]) -> Result<(String, u32), String> {
-    let t = svm_wasm::transpile(wasm).map_err(|e| e.to_string())?;
+    let t = temen_wasm::transpile(wasm).map_err(|e| e.to_string())?;
     let entry = t
         .exports
         .iter()
         .find(|(n, _)| n == "run")
         .map(|(_, i)| *i)
         .ok_or_else(|| "transpiled module has no `run` export".to_string())?;
-    Ok((svm_text::print_module(&t.module), entry))
+    Ok((temen_text::print_module(&t.module), entry))
 }
 
 /// Interface benchmark — **scalar host round-trip.** Each iteration makes one guest→host→guest
-/// crossing: SVM `cap.call` (op 0) through the trampoline thunk vs a Wasmtime imported function
-/// `host.op`, both `x -> x+1`. The subtraction isolates the per-call boundary cost. (Today SVM's
+/// crossing: Temen `cap.call` (op 0) through the trampoline thunk vs a Wasmtime imported function
+/// `host.op`, both `x -> x+1`. The subtraction isolates the per-call boundary cost. (Today Temen's
 /// `cap.call` lowers to a *generic* indirect thunk that packs args into an array — the
 /// devirtualize-to-direct-call optimization, D45, is deferred — so this is the honest baseline a
 /// future inlining win will move.)
@@ -1152,7 +1152,7 @@ block3(v15: i64):
 
 /// Interface benchmark — **zero-copy borrow buffer (the strongest §1a claim).** Each iteration
 /// hands the host a `(ptr, len)` buffer the host reads **in place** from the window (§7) and
-/// sums — no marshalling, no copy-out. SVM `cap.call` (op 1) passes the window base to the thunk
+/// sums — no marshalling, no copy-out. Temen `cap.call` (op 1) passes the window base to the thunk
 /// directly; the Wasmtime import `host.sum` must fetch the exported `memory` and slice it. Both
 /// are zero-copy in a *core* embedding (the larger §1a win is vs the component model's lift/lower,
 /// not measured here), so this isolates the per-call buffer-access overhead. Buffer is 64 B of
@@ -1224,13 +1224,13 @@ fn c_kernel(
     native: Option<fn(i64) -> i64>,
 ) -> Result<Resolved, String> {
     let ir = compile_c_to_ir(src)?;
-    let m = svm_text::parse_module(&ir).map_err(|e| format!("parse frontend IR: {e:?}"))?;
+    let m = temen_text::parse_module(&ir).map_err(|e| format!("parse frontend IR: {e:?}"))?;
     let entry = m
         .funcs
         .iter()
         .position(|f| {
-            f.params == [svm_ir::ValType::I64, svm_ir::ValType::I64]
-                && f.results == [svm_ir::ValType::I64]
+            f.params == [temen_ir::ValType::I64, temen_ir::ValType::I64]
+                && f.results == [temen_ir::ValType::I64]
         })
         .ok_or("no `run(i64,i64)->i64` entry in frontend output")? as u32;
     Ok(Resolved {
@@ -1268,9 +1268,9 @@ fn alu_from_c() -> Result<Resolved, String> {
 
 /// A **data-SP–relative** memory loop from C: an address-taken `volatile` stack array, so each
 /// iteration stores/loads through `sp + (i & 255)*8` — and `sp` is an *unbounded* i64 block
-/// param, so the JIT cannot prove the address in-window and masks every access. This is svm's
-/// **weakest** kernel: unlike `memsum`/`scatter` (provably-small indices ⇒ mask pre-elided ⇒ svm
-/// *beats* wasm64), here the mask can't be elided, so svm is slower than **both** wasm32 (~3.3×) and
+/// param, so the JIT cannot prove the address in-window and masks every access. This is temen's
+/// **weakest** kernel: unlike `memsum`/`scatter` (provably-small indices ⇒ mask pre-elided ⇒ temen
+/// *beats* wasm64), here the mask can't be elided, so temen is slower than **both** wasm32 (~3.3×) and
 /// wasm64 (~1.8×). Measured split: the mask is only ~1/3 of it (force-eliding drops it to ~2.2× wasm32
 /// / ~1.2× wasm64); the rest is structural — the threaded-`sp` add + chibicc-generated IR + the
 /// `volatile` memory-resident pattern, vs hand-written WAT over a pinned heap base. Closing the mask
@@ -1299,7 +1299,7 @@ fn locals_from_c() -> Result<Resolved, String> {
         (br $loop)))
     (local.get $acc)))
 "#;
-    // wasm64 oracle (`(memory i64 1)`): the **fair 64-bit comparison** — like SVM, the address is a
+    // wasm64 oracle (`(memory i64 1)`): the **fair 64-bit comparison** — like Temen, the address is a
     // 64-bit value, so Wasmtime emits an explicit bounds check per access (it can't lean on a 4 GiB
     // guard region the way wasm32 does). This is the apples-to-apples row for a 64-bit memory model.
     const WAT64: &str = r#"
@@ -1329,10 +1329,10 @@ fn locals_from_c() -> Result<Resolved, String> {
 }
 
 /// **Irreducible control flow (§1a/D2 differentiator).** A `goto` into the middle of a loop gives
-/// the loop two entry points → an irreducible CFG. SVM runs it natively (chibicc → IR, no
+/// the loop two entry points → an irreducible CFG. Temen runs it natively (chibicc → IR, no
 /// restructuring); the wasm lane is **`clang --target=wasm32`** output, where LLVM's wasm backend
 /// must reloop it (the Stackifier + `fix-irreducible-control-flow` pass — a dispatch branch per
-/// iteration), so the *same C* exercises "wasm forces a relooper, svm doesn't". The wasm here is a
+/// iteration), so the *same C* exercises "wasm forces a relooper, temen doesn't". The wasm here is a
 /// genuine C→wasm compile rather than hand-written WAT. No `native` lane (Rust has no `goto`; a
 /// structured rewrite would be a different CFG — same call we make for `simd`). `clang` `-O2` can
 /// sometimes remove the irreducibility, in which case the relooper cost is small — an honest
@@ -1349,13 +1349,13 @@ fn irreducible_from_c() -> Result<Resolved, String> {
         return a + b;\n}\n\
         int main(){ return (int)run(0); }\n";
     let ir = compile_c_to_ir(SRC)?;
-    let m = svm_text::parse_module(&ir).map_err(|e| format!("parse frontend IR: {e:?}"))?;
+    let m = temen_text::parse_module(&ir).map_err(|e| format!("parse frontend IR: {e:?}"))?;
     let entry = m
         .funcs
         .iter()
         .position(|f| {
-            f.params == [svm_ir::ValType::I64, svm_ir::ValType::I64]
-                && f.results == [svm_ir::ValType::I64]
+            f.params == [temen_ir::ValType::I64, temen_ir::ValType::I64]
+                && f.results == [temen_ir::ValType::I64]
         })
         .ok_or("no `run(i64,i64)->i64` entry in frontend output")? as u32;
     let wasm = compile_c_to_wasm(SRC)?;
@@ -1378,7 +1378,7 @@ fn irreducible_from_c() -> Result<Resolved, String> {
 /// skips the kernel) if `clang`'s wasm target is unavailable.
 fn compile_c_to_wasm(src: &str) -> Result<Vec<u8>, String> {
     use std::process::Command;
-    let base = std::env::temp_dir().join(format!("svm_bench_wasm_{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("temen_bench_wasm_{}", std::process::id()));
     let cfile = base.with_extension("c");
     let wfile = base.with_extension("wasm");
     std::fs::write(&cfile, src).map_err(|e| format!("write temp C: {e}"))?;
@@ -1420,9 +1420,9 @@ fn compile_c_to_ir(src: &str) -> Result<String, String> {
     if !ok {
         return Err("chibicc build failed".into());
     }
-    let base = std::env::temp_dir().join(format!("svm_bench_{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("temen_bench_{}", std::process::id()));
     let cfile = base.with_extension("c");
-    let irfile = base.with_extension("svm");
+    let irfile = base.with_extension("temen");
     std::fs::write(&cfile, src).map_err(|e| format!("write temp C: {e}"))?;
     let ok = Command::new(dir.join("chibicc"))
         .args([
@@ -1463,7 +1463,7 @@ fn wasm_entry(engine: &Engine, wasm: &[u8]) -> (Store<HostState>, TypedFunc<i64,
 fn wasm_entry_host(engine: &Engine, wasm: &[u8]) -> (Store<HostState>, TypedFunc<i64, i64>) {
     let module = Module::new(engine, wasm).expect("wasmtime compile");
     let mut linker: Linker<HostState> = Linker::new(engine);
-    // Imports use the svm-wasm host-ABI convention (module = capability type_id, name = op) so the
+    // Imports use the temen-wasm host-ABI convention (module = capability type_id, name = op) so the
     // *same WAT* transpiles to `cap.call <type_id> <op>` under `--from-wasm`: "0"/"0" → op 0 (scalar
     // x+1), "0"/"1" → op 1 (sum a borrow buffer), matching `bench_thunk`'s op dispatch.
     linker
@@ -1528,19 +1528,19 @@ fn wasm_compute_ns(
 /// Raw per-iteration timings for one kernel (ns for compute, ms for cold start), each the
 /// **min over `reps`** measurements (best observed per engine — the noise floor we compare).
 struct Raw {
-    svm_ns: f64,
+    temen_ns: f64,
     w32_ns: f64,
     w64_ns: Option<f64>,
     /// The interp lane's per-iteration ns (`Compute` kernels only — `None` for `HostCall`).
     interp_ns: Option<f64>,
     /// The native lane's per-iteration ns (kernels with a [`Kernel::native`] twin; `None` else).
     native_ns: Option<f64>,
-    svm_cold: f64,
+    temen_cold: f64,
     wmt_cold: f64,
 }
 
 impl Raw {
-    /// The machine-portable ratios we track (higher = svm/our lane slower): compute vs wasm32,
+    /// The machine-portable ratios we track (higher = temen/our lane slower): compute vs wasm32,
     /// compute vs wasm64 (when the kernel has a wasm64 form), cold start vs Wasmtime, the interp
     /// lane's slowdown vs our JIT (`interp ÷ jit`), and our JIT's overhead over the native ceiling
     /// (`jit ÷ native`, ≥1 ⇒ how many× the JIT runs over bare-metal). The last two are `None` for
@@ -1548,11 +1548,11 @@ impl Raw {
     /// machines than the absolute ns (see the baseline header).
     fn ratios(&self) -> Ratios {
         Ratios {
-            compute32: self.svm_ns / self.w32_ns,
-            compute64: self.w64_ns.map(|v| self.svm_ns / v),
-            cold: self.svm_cold / self.wmt_cold,
-            interp_vs_jit: self.interp_ns.map(|v| v / self.svm_ns),
-            jit_vs_native: self.native_ns.map(|v| self.svm_ns / v),
+            compute32: self.temen_ns / self.w32_ns,
+            compute64: self.w64_ns.map(|v| self.temen_ns / v),
+            cold: self.temen_cold / self.wmt_cold,
+            interp_vs_jit: self.interp_ns.map(|v| v / self.temen_ns),
+            jit_vs_native: self.native_ns.map(|v| self.temen_ns / v),
         }
     }
 }
@@ -1567,22 +1567,22 @@ struct Ratios {
     jit_vs_native: Option<f64>,
 }
 
-/// Run the svm-opt AOT optimizer over `m`, re-verifying the result, and return the optimized module
+/// Run the temen-opt AOT optimizer over `m`, re-verifying the result, and return the optimized module
 /// **and the entry function's new index**. The optimizer runs dead-function elimination, which can drop
 /// (e.g. an unused `main`) and renumber functions, so the caller's original `entry` index would be
 /// stale afterward. To keep it findable we tag the entry as an export before optimizing (a root DFE
 /// must preserve) and resolve its new index by that tag. A verify failure falls back to the unoptimized
 /// module with a note (and the original entry), so a kernel is never silently miscompiled — the
 /// cross-check below would also catch a wrong result.
-fn optimize_ir(m: &svm_ir::Module, entry: u32, name: &str) -> (svm_ir::Module, u32) {
+fn optimize_ir(m: &temen_ir::Module, entry: u32, name: &str) -> (temen_ir::Module, u32) {
     const TAG: &str = "__bench_entry";
     let mut tagged = m.clone();
-    tagged.exports.push(svm_ir::Export {
+    tagged.exports.push(temen_ir::Export {
         name: TAG.into(),
         func: entry,
     });
-    let opt = svm_opt::optimize_module(&tagged);
-    match svm_verify::verify_module(&opt) {
+    let opt = temen_opt::optimize_module(&tagged);
+    match temen_verify::verify_module(&opt) {
         Ok(()) => {
             let e = opt
                 .resolve_export(TAG)
@@ -1591,7 +1591,7 @@ fn optimize_ir(m: &svm_ir::Module, entry: u32, name: &str) -> (svm_ir::Module, u
         }
         Err(e) => {
             eprintln!(
-                "note: --optimize keeps `{name}` unoptimized (svm-opt output failed verify: {e:?})"
+                "note: --optimize keeps `{name}` unoptimized (temen-opt output failed verify: {e:?})"
             );
             (m.clone(), entry)
         }
@@ -1601,7 +1601,7 @@ fn optimize_ir(m: &svm_ir::Module, entry: u32, name: &str) -> (svm_ir::Module, u
 /// Time one kernel, taking the **best (min)** of `reps` passes per engine. Cross-checks every
 /// engine agrees on the result first, so we never benchmark a miscompile.
 fn measure(engine: &Engine, k: &Resolved, reps: u32, optimize: bool) -> Raw {
-    let m = svm_text::parse_module(&k.ir).expect("parse our IR text");
+    let m = temen_text::parse_module(&k.ir).expect("parse our IR text");
     let (m, entry) = if optimize {
         optimize_ir(&m, k.entry, &k.name)
     } else {
@@ -1618,16 +1618,16 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32, optimize: bool) -> Raw {
         .as_deref()
         .map(|wat| wat::parse_str(wat).expect("assemble wasm64 WAT"));
     // `Compute` kernels time the inner loop; `HostCall` kernels make one host crossing per
-    // iteration, so they use the no-cap vs cap-thunk SVM path, the import-linked wasm path, and
+    // iteration, so they use the no-cap vs cap-thunk Temen path, the import-linked wasm path, and
     // a smaller iteration span (a host call ≫ a compute op). A kernel may override the span
     // (`n_span`) — the cache-miss kernel does, since each iteration is DRAM-latency-bound.
     let (n_big, n_small) = k.n_span.unwrap_or(match k.mode {
         Mode::Compute => (N_BIG, N_SMALL),
         Mode::HostCall => (N_HOST_BIG, N_HOST_SMALL),
     });
-    let svm = |n: i64| match k.mode {
-        Mode::Compute => svm_call(&m, entry, &k.lead_args, n),
-        Mode::HostCall => svm_call_host(&m, entry, &k.lead_args, n),
+    let temen = |n: i64| match k.mode {
+        Mode::Compute => temen_call(&m, entry, &k.lead_args, n),
+        Mode::HostCall => temen_call_host(&m, entry, &k.lead_args, n),
     };
     let inst = |wasm: &[u8]| match k.mode {
         Mode::Compute => wasm_entry(engine, wasm),
@@ -1637,20 +1637,20 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32, optimize: bool) -> Raw {
     // memory-latency `cache` kernel) has ~tens-of-ns iterations over a large span, so each call is
     // milliseconds — far fewer repeats still stabilise (and best-of-`reps` tightens it further),
     // and the high default counts would make a pass take many seconds.
-    let (pc_svm, pc_wasm, pc_native, pc_interp) = if k.n_span.is_some() {
+    let (pc_temen, pc_wasm, pc_native, pc_interp) = if k.n_span.is_some() {
         (6u32, 10u32, 10u32, 4u32)
     } else {
         (25u32, 100u32, 200u32, 8u32)
     };
 
     // Cross-check every engine agrees before timing (never benchmark a miscompile).
-    let ours = svm(n_small);
+    let ours = temen(n_small);
     {
         let (mut s32, run32) = inst(&wasm32);
         assert_eq!(
             ours,
             run32.call(&mut s32, n_small).unwrap(),
-            "kernel `{}`: svm vs wasm32 disagree",
+            "kernel `{}`: temen vs wasm32 disagree",
             k.name
         );
         if let Some(w) = &wasm64 {
@@ -1658,7 +1658,7 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32, optimize: bool) -> Raw {
             assert_eq!(
                 ours,
                 run64.call(&mut s64, n_small).unwrap(),
-                "kernel `{}`: svm vs wasm64 disagree",
+                "kernel `{}`: temen vs wasm64 disagree",
                 k.name
             );
         }
@@ -1670,7 +1670,7 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32, optimize: bool) -> Raw {
         assert_eq!(
             ours,
             interp_call(&m, entry, &k.lead_args, n_small),
-            "kernel `{}`: svm vs interp disagree",
+            "kernel `{}`: temen vs interp disagree",
             k.name
         );
     }
@@ -1678,31 +1678,31 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32, optimize: bool) -> Raw {
         assert_eq!(
             ours,
             nat(n_small),
-            "kernel `{}`: svm vs native disagree",
+            "kernel `{}`: temen vs native disagree",
             k.name
         );
     }
 
     let mut raw = Raw {
-        svm_ns: f64::INFINITY,
+        temen_ns: f64::INFINITY,
         w32_ns: f64::INFINITY,
         w64_ns: wasm64.as_ref().map(|_| f64::INFINITY),
         interp_ns: interp.map(|_| f64::INFINITY),
         native_ns: k.native.map(|_| f64::INFINITY),
-        svm_cold: f64::INFINITY,
+        temen_cold: f64::INFINITY,
         wmt_cold: f64::INFINITY,
     };
     for _ in 0..reps.max(1) {
         // --- per-iteration time (subtraction isolates the loop body / the host call) ---
-        let svm_big = per_call(pc_svm, || {
-            black_box(svm(n_big));
+        let temen_big = per_call(pc_temen, || {
+            black_box(temen(n_big));
         });
-        let svm_small = per_call(pc_svm, || {
-            black_box(svm(n_small));
+        let temen_small = per_call(pc_temen, || {
+            black_box(temen(n_small));
         });
-        raw.svm_ns = raw
-            .svm_ns
-            .min((svm_big - svm_small) * 1e9 / (n_big - n_small) as f64);
+        raw.temen_ns = raw
+            .temen_ns
+            .min((temen_big - temen_small) * 1e9 / (n_big - n_small) as f64);
 
         let (mut s32, run32) = inst(&wasm32);
         raw.w32_ns = raw
@@ -1741,10 +1741,10 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32, optimize: bool) -> Raw {
         }
 
         // --- cold start: source bytes → first result for a trivial (n=0) program (wasm32) ---
-        let svm_cold = per_call(60, || {
-            black_box(svm(0));
+        let temen_cold = per_call(60, || {
+            black_box(temen(0));
         }) * 1e3;
-        raw.svm_cold = raw.svm_cold.min(svm_cold);
+        raw.temen_cold = raw.temen_cold.min(temen_cold);
         let wmt_cold = per_call(60, || {
             let (mut s, f) = inst(&wasm32);
             black_box(f.call(&mut s, 0).unwrap());
@@ -1765,9 +1765,9 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
 /// form, or no interp/native lane). The header documents what the numbers are + how to regenerate.
 fn save_baseline(path: &str, results: &[(Resolved, Raw)]) {
     let mut out = String::from(
-        "# svm-bench baseline — the tracked signal is the RATIO (svm / wasm), which is far more\n\
+        "# temen-bench baseline — the tracked signal is the RATIO (temen / wasm), which is far more\n\
          # portable across machines than the absolute ns. `--check` flags any ratio that grew\n\
-         # past the tolerance (svm got relatively slower). Regenerate after an intended change:\n\
+         # past the tolerance (temen got relatively slower). Regenerate after an intended change:\n\
          #   cargo run --release -- --save-baseline baseline.txt\n\
          # columns: kernel,compute_vs_wasm32,compute_vs_wasm64,cold_vs_wasmtime,interp_vs_jit,jit_vs_native\n",
     );
@@ -1834,7 +1834,7 @@ fn load_baseline(path: &str) -> std::collections::HashMap<String, BaseRow> {
 fn check_baseline(path: &str, results: &[(Resolved, Raw)], tol: f64) -> bool {
     let base = load_baseline(path);
     println!(
-        "regression check vs {path}  (tol {:.0}%, ratio = svm/wasm, lower is better)\n",
+        "regression check vs {path}  (tol {:.0}%, ratio = temen/wasm, lower is better)\n",
         tol * 100.0
     );
     println!(
@@ -1856,7 +1856,7 @@ fn check_baseline(path: &str, results: &[(Resolved, Raw)], tol: f64) -> bool {
         // and wasmtime-version drift, not by our codegen — the 2026-07 CI audit (ISSUES.md I17)
         // found that row past any sane tolerance on 24 of 25 red nightlies (drifting +40→108%
         // over a month) while every compute ratio stayed put, making the lane red-by-construction
-        // and therefore signal-free. The same-run svm/wasm ratios remain the gate.
+        // and therefore signal-free. The same-run temen/wasm ratios remain the gate.
         let mut row = |metric: &str, baseline: f64, current: f64, gating: bool| {
             let delta = current / baseline - 1.0;
             let over = delta > tol;
@@ -1894,7 +1894,7 @@ fn check_baseline(path: &str, results: &[(Resolved, Raw)], tol: f64) -> bool {
         println!("\nOK - no ratio regressed past {:.0}%.", tol * 100.0);
     } else {
         println!(
-            "\nREGRESSION - a ratio grew past {:.0}% (svm got relatively slower). If intended,\n\
+            "\nREGRESSION - a ratio grew past {:.0}% (temen got relatively slower). If intended,\n\
              re-baseline with `--save-baseline {path}`.",
             tol * 100.0
         );
@@ -1904,17 +1904,17 @@ fn check_baseline(path: &str, results: &[(Resolved, Raw)], tol: f64) -> bool {
 
 fn print_table(results: &[(Resolved, Raw)]) {
     println!(
-        "Four lanes — same algorithm as native (Rust), jit (svm-jit), interp (svm-interp, same IR),\n\
-         and wasm (Wasmtime); all but native via Cranelift.  ratio = svm / wasm  (<1 = svm faster).\n\
+        "Four lanes — same algorithm as native (Rust), jit (temen-jit), interp (temen-interp, same IR),\n\
+         and wasm (Wasmtime); all but native via Cranelift.  ratio = temen / wasm  (<1 = temen faster).\n\
          `i/jit` = interp ÷ jit (the interpreter's slowdown); `jit/nat` = jit ÷ native (how many×\n\
          the JIT runs over the bare-metal ceiling — ≈1× ⇒ near-native).\n\
-         Expect: alu compute ≈1× vs wasm; cold-start <1×.  Memory: wasm32 < svm always (guard\n\
-         pages are free); svm < wasm64 once addresses *vary* (scatter) so Wasmtime can't\n\
+         Expect: alu compute ≈1× vs wasm; cold-start <1×.  Memory: wasm32 < temen always (guard\n\
+         pages are free); temen < wasm64 once addresses *vary* (scatter) so Wasmtime can't\n\
          CSE the bounds check — memsum (same addr) lets it, so wasm64 looks ~tied there.\n\
-         Interface (host calls, §1a): `hostcall` (scalar cap.call vs a wasm import) is svm-\n\
+         Interface (host calls, §1a): `hostcall` (scalar cap.call vs a wasm import) is temen-\n\
          slower today — cap.call is a generic arg-packing thunk; devirtualization (D45) is\n\
          deferred. `hostbuf` (a zero-copy (ptr,len) borrow buffer the host reads in place)\n\
-         is svm-faster even vs a cached-memory wasm import — the §7 win. Host kernels have no\n\
+         is temen-faster even vs a cached-memory wasm import — the §7 win. Host kernels have no\n\
          interp/native lane (`—`); their ns/ratio are per *host call* (N_big={N_HOST_BIG}).\n\
          N_big={N_BIG} N_small={N_SMALL}\n"
     );
@@ -1930,7 +1930,7 @@ fn print_table(results: &[(Resolved, Raw)]) {
         "ratio",
         "wasm64",
         "ratio",
-        "svm",
+        "temen",
         "wasm32",
         "ratio"
     );
@@ -1950,7 +1950,7 @@ fn print_table(results: &[(Resolved, Raw)]) {
             "{:<11} | {:>8} {:>8.3} {:>8} {:>6} {:>7} | {:>8.3} {:>5.2}× | {:>8} {:>6} | {:>8.4} {:>8.4} {:>5.2}×",
             k.name,
             fmt_ns(raw.native_ns),
-            raw.svm_ns,
+            raw.temen_ns,
             fmt_ns(raw.interp_ns),
             fmt_ratio(r.interp_vs_jit),
             fmt_ratio(r.jit_vs_native),
@@ -1958,7 +1958,7 @@ fn print_table(results: &[(Resolved, Raw)]) {
             r.compute32,
             w64s,
             r64,
-            raw.svm_cold,
+            raw.temen_cold,
             raw.wmt_cold,
             r.cold,
         );
@@ -1973,14 +1973,14 @@ fn print_csv(results: &[(Resolved, Raw)]) {
             (Some(v), Some(rr)) => (format!("{v:.3}"), format!("{rr:.3}")),
             _ => ("NA".into(), "NA".into()),
         };
-        // kernel, svm, wasm32, c32, wasm64, r64, svm_cold, wmt_cold, cold, interp, native, i/jit, jit/native
+        // kernel, temen, wasm32, c32, wasm64, r64, temen_cold, wmt_cold, cold, interp, native, i/jit, jit/native
         println!(
             "{},{:.3},{:.3},{:.3},{w64s},{r64},{:.4},{:.4},{:.3},{},{},{},{}",
             k.name,
-            raw.svm_ns,
+            raw.temen_ns,
             raw.w32_ns,
             r.compute32,
-            raw.svm_cold,
+            raw.temen_cold,
             raw.wmt_cold,
             r.cold,
             na(raw.interp_ns),
@@ -1994,12 +1994,12 @@ fn print_csv(results: &[(Resolved, Raw)]) {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let csv = args.iter().any(|a| a == "--csv");
-    // `--from-wasm`: get each compute kernel's SVM IR by transpiling its WAT (the same bytes Wasmtime
+    // `--from-wasm`: get each compute kernel's Temen IR by transpiling its WAT (the same bytes Wasmtime
     // runs) instead of using the hand-written IR — the apples-to-apples comparison.
     let from_wasm = args.iter().any(|a| a == "--from-wasm");
-    // `--optimize`: run the svm-opt AOT optimizer over each kernel's SVM IR before the SVM lanes
+    // `--optimize`: run the temen-opt AOT optimizer over each kernel's Temen IR before the Temen lanes
     // (jit + interp), so the Wasmtime-relative ratios reflect the optimizer. Pairs with `--from-wasm`
-    // for the cleanest apples-to-apples: the same wasm bytes → transpiled IR → svm-opt → JIT vs Wasmtime.
+    // for the cleanest apples-to-apples: the same wasm bytes → transpiled IR → temen-opt → JIT vs Wasmtime.
     let optimize = args.iter().any(|a| a == "--optimize");
     // `--fast-cap`: route HostCall kernels through the §9/D45 devirtualized fast path (vs the generic
     // thunk) so the two can be compared head-to-head.
@@ -2028,7 +2028,7 @@ fn main() {
     config.shared_memory(true);
     let engine = Engine::new(&config).expect("engine");
 
-    // `--threads`: the concurrency comparison (SVM native thread.spawn vs Wasmtime+wasi-threads on the
+    // `--threads`: the concurrency comparison (Temen native thread.spawn vs Wasmtime+wasi-threads on the
     // same bytes) instead of the per-kernel compute table.
     if args.iter().any(|a| a == "--threads") {
         threads::run(&engine, if reps > 1 { reps as usize } else { 5 });

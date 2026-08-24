@@ -1,6 +1,6 @@
 //! Source-level debugging of a chibicc-compiled C program (the playground's Debug button, end to end
-//! in Rust): compile a compute-only C source **with `-g`** through `chibicc.svmb`, then drive the
-//! `svm-dap` server (the bytecode backend the playground runs) over the emitted IR — set a breakpoint on
+//! in Rust): compile a compute-only C source **with `-g`** through `chibicc.temen`, then drive the
+//! `temen-dap` server (the bytecode backend the playground runs) over the emitted IR — set a breakpoint on
 //! a **C source line**, run to it, and read the paused frame's **C locals by name**. This proves the
 //! debug-info path the browser Debug button wires: chibicc's `-g` `debug.file`/`debug.loc`/`debug.var`
 //! waist lets the DAP bind breakpoints to C lines and name C variables, on the compiled program.
@@ -10,24 +10,24 @@
 //! `powerbox: "onramp"`), which runs it instead of `CapFault`ing, captures its output as DAP `output`
 //! events, and — via the CapTape replay — **rewinds that output on reverse debugging**.
 //!
-//! Fail-soft on a missing `chibicc.svmb` (a fresh tree without the build), like `chibicc_printf.rs`.
+//! Fail-soft on a missing `chibicc.temen` (a fresh tree without the build), like `chibicc_printf.rs`.
 
-use svm_browser::{onramp_fs_exec, playground_include_files, STATUS_EXIT, STATUS_OK};
-use svm_dap::{DapServer, Json};
+use temen_browser::{onramp_fs_exec, playground_include_files, STATUS_EXIT, STATUS_OK};
+use temen_dap::{DapServer, Json};
 
-fn chibicc_svmb() -> Option<Vec<u8>> {
+fn chibicc_temen() -> Option<Vec<u8>> {
     std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/web/assets/chibicc.svmb"
+        "/web/assets/chibicc.temen"
     ))
     .ok()
 }
 
-/// Compile `src` with `-g` (debug info on) via the shipped compiler, returning the emitted SVM-IR text.
-fn compile_g(chibicc: &svm_ir::Module, src: &str) -> String {
+/// Compile `src` with `-g` (debug info on) via the shipped compiler, returning the emitted TEMEN-IR text.
+fn compile_g(chibicc: &temen_ir::Module, src: &str) -> String {
     let mut files = playground_include_files();
     files.push(("in.c".to_string(), src.as_bytes().to_vec()));
-    let image = svm_fs::encode_image(&files, &["include".to_string()]);
+    let image = temen_fs::encode_image(&files, &["include".to_string()]);
     let out = onramp_fs_exec(
         chibicc,
         &image,
@@ -89,11 +89,11 @@ const BP_LINE: i64 = 5; // the `acc += i;` line
 
 #[test]
 fn debug_a_chibicc_compiled_program_at_c_source_level() {
-    let Some(bytes) = chibicc_svmb() else {
-        eprintln!("SKIP: browser/web/assets/chibicc.svmb absent (run build-onramp-assets.mjs)");
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: browser/web/assets/chibicc.temen absent (run build-onramp-assets.mjs)");
         return;
     };
-    let chibicc = svm_encode::decode_module(&bytes).expect("decode chibicc.svmb");
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode chibicc.temen");
     let ir = compile_g(&chibicc, SRC);
     // The emitted IR carries chibicc's -g waist naming the C source and its locals.
     assert!(
@@ -290,11 +290,11 @@ fn launch_printf(s: &mut DapServer, ir: &str) {
 /// CapTape/replay makes a `reverseContinue` reproduce the exact earlier stdout.
 #[test]
 fn debug_a_printf_program_with_captured_output_and_reverse() {
-    let Some(bytes) = chibicc_svmb() else {
-        eprintln!("SKIP: chibicc.svmb absent");
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
         return;
     };
-    let chibicc = svm_encode::decode_module(&bytes).expect("decode");
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode");
     let ir = compile_g(&chibicc, PRINTF_SRC);
 
     let mut s = DapServer::new();
@@ -350,11 +350,11 @@ fn debug_a_printf_program_with_captured_output_and_reverse() {
 /// descended into the callee's last op instead of the caller's previous op.
 #[test]
 fn step_back_stays_in_the_users_frame_across_a_printf() {
-    let Some(bytes) = chibicc_svmb() else {
-        eprintln!("SKIP: chibicc.svmb absent");
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
         return;
     };
-    let chibicc = svm_encode::decode_module(&bytes).expect("decode");
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode");
     let ir = compile_g(&chibicc, PRINTF_SRC);
 
     let mut s = DapServer::new();
@@ -479,11 +479,11 @@ int main(void) {
 /// descending into the libc call. This is the forward counterpart the earlier tests lacked.
 #[test]
 fn forward_next_walks_source_lines_capturing_output() {
-    let Some(bytes) = chibicc_svmb() else {
-        eprintln!("SKIP: chibicc.svmb absent");
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
         return;
     };
-    let chibicc = svm_encode::decode_module(&bytes).expect("decode");
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode");
     let ir = compile_g(&chibicc, NEXT_SRC);
     let mut s = DapServer::new();
     launch_at(&mut s, &ir, 3, true); // breakpoint on the first printf (line 3)
@@ -545,11 +545,11 @@ int main(void) {
 /// name (`a` = 2); stepping out lands back in `main` on the line after the call.
 #[test]
 fn step_in_and_out_across_a_helper() {
-    let Some(bytes) = chibicc_svmb() else {
-        eprintln!("SKIP: chibicc.svmb absent");
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
         return;
     };
-    let chibicc = svm_encode::decode_module(&bytes).expect("decode");
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode");
     let ir = compile_g(&chibicc, HELPER_SRC);
     let mut s = DapServer::new();
     launch_at(&mut s, &ir, 5, false); // breakpoint on `int x = add(2, 3);` (line 5), no powerbox needed
@@ -637,11 +637,11 @@ fn step_in_and_out_across_a_helper() {
 /// violated. Then a `next` moves forward again.
 #[test]
 fn forward_then_back_oscillation_is_monotone_and_stays_in_main() {
-    let Some(bytes) = chibicc_svmb() else {
-        eprintln!("SKIP: chibicc.svmb absent");
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
         return;
     };
-    let chibicc = svm_encode::decode_module(&bytes).expect("decode");
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode");
     let ir = compile_g(&chibicc, NEXT_SRC);
     let mut s = DapServer::new();
     launch_at(&mut s, &ir, 3, true);
@@ -836,11 +836,11 @@ fn eval_in_frame(s: &mut DapServer, seq: i64, expr: &str) -> Option<String> {
 /// index/arrow paths, including the promoted-SSA pointer chibicc emits for `struct Point *pp = &p;`.
 #[test]
 fn inspect_struct_array_and_pointer_locals() {
-    let Some(bytes) = chibicc_svmb() else {
-        eprintln!("SKIP: chibicc.svmb absent");
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
         return;
     };
-    let chibicc = svm_encode::decode_module(&bytes).expect("decode");
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode");
     let ir = compile_g(&chibicc, RICH_SRC);
     // The -g IR carries the aggregate/array/pointer type info and fields.
     assert!(
@@ -916,11 +916,11 @@ fn inspect_struct_array_and_pointer_locals() {
 /// line with a real op (line 8) still binds. Regression test for the terminator-only-line binding fix.
 #[test]
 fn breakpoint_on_bare_return_line_is_unverified() {
-    let Some(bytes) = chibicc_svmb() else {
-        eprintln!("SKIP: chibicc.svmb absent");
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
         return;
     };
-    let chibicc = svm_encode::decode_module(&bytes).expect("decode");
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode");
     let ir = compile_g(&chibicc, RICH_SRC);
 
     let mut s = DapServer::new();
@@ -1045,11 +1045,11 @@ fn launch_echo(s: &mut DapServer, ir: &str, block_stdin: bool) {
 /// reverse replay reproduces the provided inputs with no new suspensions** — the W4 acceptance.
 #[test]
 fn blocking_stdin_round_trips_and_replays() {
-    let Some(bytes) = chibicc_svmb() else {
-        eprintln!("SKIP: chibicc.svmb absent");
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
         return;
     };
-    let chibicc = svm_encode::decode_module(&bytes).expect("decode");
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode");
     let ir = compile_g(&chibicc, ECHO_SRC);
 
     let mut s = DapServer::new();
@@ -1144,11 +1144,11 @@ fn blocking_stdin_round_trips_and_replays() {
 /// exhausted reads return 0 and the run completes with no stop. The mode is armed, never ambient.
 #[test]
 fn without_block_stdin_exhausted_reads_stay_eof() {
-    let Some(bytes) = chibicc_svmb() else {
-        eprintln!("SKIP: chibicc.svmb absent");
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
         return;
     };
-    let chibicc = svm_encode::decode_module(&bytes).expect("decode");
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode");
     let ir = compile_g(&chibicc, ECHO_SRC);
 
     let mut s = DapServer::new();

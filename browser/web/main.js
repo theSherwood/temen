@@ -1,6 +1,6 @@
 // THREADS/BROWSER step 4c-wasm in a REAL browser — the page-side orchestrator. Proves two things run
 // in an actual browser (Chromium via Playwright), not just Node:
-//   1. the **powerbox** (`svm_run_pb`) — a guest writes to stdout, single-threaded on the page;
+//   1. the **powerbox** (`temen_run_pb`) — a guest writes to stdout, single-threaded on the page;
 //   2. genuine **parallelism** — one guest's `thread.spawn`ed vCPUs run on separate Web Workers over a
 //      shared `WebAssembly.Memory` (only available because the server sent COOP/COEP), synchronising
 //      via `Atomics` → the 8-vCPU counter kernel returns 4000.
@@ -36,13 +36,13 @@ async function main() {
 
   // --- 1) powerbox smoke (single-threaded, on the page) -------------------------------------------
   try {
-    const pb = await fetchBytes('/corpus/pb_hello.svmbc');
-    const p = ex.svm_alloc(pb.length);
+    const pb = await fetchBytes('/corpus/pb_hello.temenc');
+    const p = ex.temen_alloc(pb.length);
     u8().set(pb, p);
-    ex.svm_run_pb(p, pb.length, 0, 0);
-    const status = ex.svm_status();
+    ex.temen_run_pb(p, pb.length, 0, 0);
+    const status = ex.temen_status();
     // `slice` (not `subarray`) copies out of the SharedArrayBuffer — TextDecoder rejects shared views.
-    const out = new TextDecoder().decode(u8().slice(ex.svm_stdout_ptr(), ex.svm_stdout_ptr() + ex.svm_stdout_len()));
+    const out = new TextDecoder().decode(u8().slice(ex.temen_stdout_ptr(), ex.temen_stdout_ptr() + ex.temen_stdout_len()));
     const ok = status === 0 && out === 'hello, powerbox!\n';
     set('powerbox', ok ? 'pass' : 'fail', `powerbox: status=${status} stdout=${JSON.stringify(out)} ${ok ? 'PASS' : 'FAIL'}`);
     log(`powerbox → ${JSON.stringify(out)}`);
@@ -63,7 +63,7 @@ async function main() {
   // --- 2) one guest's vCPUs across real Web Workers ----------------------------------------------
   try {
     const t0 = performance.now();
-    const { value, started } = await runPath('/corpus/threads.svmbc');
+    const { value, started } = await runPath('/corpus/threads.temenc');
     const ms = (performance.now() - t0).toFixed(0);
     const ok = value === 4000n;
     set('threads', ok ? 'pass' : 'fail',
@@ -76,10 +76,10 @@ async function main() {
   // --- 3) §22 guest-JIT across real Web Workers (THREADS.md 4c-domain C2) -------------------------
   // Each worker vCPU `install`s a host-compiled unit into the **shared** Domain and `call_indirect`s
   // its own raced slot — `service(6,7) = 142`, folded to 8 × 142 = 1136. The powerbox is Rust-side
-  // (a leaked `Host` in shared memory); JIT is serviced inside `svm_par_run`, so no new page glue.
+  // (a leaked `Host` in shared memory); JIT is serviced inside `temen_par_run`, so no new page glue.
   try {
     const t0 = performance.now();
-    const { value, started } = await runPath('/corpus/threads_jit_install.svmbc', { jit: true });
+    const { value, started } = await runPath('/corpus/threads_jit_install.temenc', { jit: true });
     const ms = (performance.now() - t0).toFixed(0);
     const ok = value === 1136n;
     set('jit', ok ? 'pass' : 'fail',
@@ -99,10 +99,10 @@ async function main() {
   try {
     const opt = { inst: true, winSize: 1 << 20 };
     const t0 = performance.now();
-    const a = await runPath('/corpus/threads_inst.svmbc', opt);
-    const b = await runPath('/corpus/threads_inst_nested.svmbc', opt);
-    const c = await runPath('/corpus/threads_inst_mod.svmbc',
-      { ...opt, unitPath: '/corpus/threads_inst_unit.svmbc' });
+    const a = await runPath('/corpus/threads_inst.temenc', opt);
+    const b = await runPath('/corpus/threads_inst_nested.temenc', opt);
+    const c = await runPath('/corpus/threads_inst_mod.temenc',
+      { ...opt, unitPath: '/corpus/threads_inst_unit.temenc' });
     const ms = (performance.now() - t0).toFixed(0);
     const ok = a.value === 40n && b.value === 72n && c.value === 600n;
     set('inst', ok ? 'pass' : 'fail',
@@ -119,7 +119,7 @@ async function main() {
   // Result 8 and stdout "tick\n"×8 are schedule-independent; the page reads stdout back afterward.
   try {
     const t0 = performance.now();
-    const { value, started } = await runPath('/corpus/threads_io.svmbc', { io: true });
+    const { value, started } = await runPath('/corpus/threads_io.temenc', { io: true });
     const ms = (performance.now() - t0).toFixed(0);
     const out = readParStdout(eng);
     const ok = value === 8n && out === 'tick\n'.repeat(8);
@@ -131,31 +131,31 @@ async function main() {
     set('capio', 'fail', `capio: error ${e}`);
   }
 
-  // --- 6) wasm-JIT tier: SVM IR compiled to wasm, run in-browser (BROWSER.md wasm-JIT slice 2/3c) --
-  // The `alu` compute kernel is emitted to a wasm module by the cdylib (`svm_wasmjit_compile`),
+  // --- 6) wasm-JIT tier: Temen IR compiled to wasm, run in-browser (BROWSER.md wasm-JIT slice 2/3c) --
+  // The `alu` compute kernel is emitted to a wasm module by the cdylib (`temen_wasmjit_compile`),
   // instantiated against the page's OWN linear memory, and its `f0` called directly on the page
-  // (compute-only → no Atomics.wait, so the main thread is fine). Assert it equals the `svm_run`
+  // (compute-only → no Atomics.wait, so the main thread is fine). Assert it equals the `temen_run`
   // interpreter over an arg sweep, then time a heavy run to show the JIT's win over interp-in-wasm.
   // Then a **mixed-tier** guest (3c): a JITted integer caller whose SIMD leaf runs on the
   // interpreter via `env.call_interp` — same result as the whole-guest interpreter.
   const interpBytes = (bytes, arg) => {
-    const p = ex.svm_alloc(bytes.length);
+    const p = ex.temen_alloc(bytes.length);
     u8().set(bytes, p);
-    const r = ex.svm_run(p, bytes.length, BigInt(arg));
-    const st = ex.svm_status();
-    ex.svm_dealloc(p, bytes.length);
-    if (st !== 0) throw new Error(`svm_run status ${st}`);
+    const r = ex.temen_run(p, bytes.length, BigInt(arg));
+    const st = ex.temen_status();
+    ex.temen_dealloc(p, bytes.length);
+    if (st !== 0) throw new Error(`temen_run status ${st}`);
     return BigInt.asIntN(64, r);
   };
-  // Compile SVM text → encoded module via the cdylib's front end (svm_parse), like the playground.
+  // Compile Temen text → encoded module via the cdylib's front end (temen_parse), like the playground.
   const encode = (src) => {
     const s = new TextEncoder().encode(src);
-    const p = ex.svm_alloc(s.length);
+    const p = ex.temen_alloc(s.length);
     u8().set(s, p);
-    const ok = ex.svm_parse(p, s.length);
-    ex.svm_dealloc(p, s.length);
-    const optr = ex.svm_parse_ptr();
-    const out = u8().slice(optr, optr + ex.svm_parse_len());
+    const ok = ex.temen_parse(p, s.length);
+    ex.temen_dealloc(p, s.length);
+    const optr = ex.temen_parse_ptr();
+    const out = u8().slice(optr, optr + ex.temen_parse_len());
     if (ok !== 1) throw new Error(`parse: ${new TextDecoder().decode(out)}`);
     return out;
   };
@@ -259,9 +259,9 @@ block 0 (v0: i64) {
   }
 }`;
   try {
-    const bytes = await fetchBytes('/corpus/alu.svmbc');
+    const bytes = await fetchBytes('/corpus/alu.temenc');
     const jit = await compileJit(ex, bytes, { memory });
-    if (!jit) throw new Error('svm_wasmjit_compile refused an in-subset module');
+    if (!jit) throw new Error('temen_wasmjit_compile refused an in-subset module');
     let eq = true;
     for (const arg of [0n, 1n, 2n, 5n, 1000n, -1n, 100000n]) {
       if (jit.call([arg]).value !== interpBytes(bytes, arg)) { eq = false; break; }
@@ -319,7 +319,7 @@ block 0 (v0: i64) {
   // and the tier-up run must actually fire the seam (counter > 0) — a result match alone couldn't
   // distinguish tiered-up from silently-interpreted.
   try {
-    const guest = await fetchBytes('/corpus/threads_tierup.svmbc');
+    const guest = await fetchBytes('/corpus/threads_tierup.temenc');
     const t0 = performance.now();
     const plain = await run(guest);
     const tiered = await run(guest, { tierup: true });
@@ -335,7 +335,7 @@ block 0 (v0: i64) {
 
   // --- 8) §22 guest-JIT **real codegen** across real Web Workers (BROWSER.md § "wasm-JIT tier", slice 5) --
   // The guest holds a `Jit` cap + a host-compiled unit and `cap.call`s invoke; each worker runs the
-  // submitted unit on EMITTED WASM on its own Worker (`svm_par_powerbox_jit_codegen` emits it at setup)
+  // submitted unit on EMITTED WASM on its own Worker (`temen_par_powerbox_jit_codegen` emits it at setup)
   // instead of the interpreter. Runs the **same i32 kernel the interp `jit` item runs** (the unit
   // `service` is `(i32,i32)->(i32)` — the Worker marshals args by type, this slice's generalization),
   // so codegen → 1136 = interp; the counter proves the emitted unit ran. `install`/`call_indirect`
@@ -343,9 +343,9 @@ block 0 (v0: i64) {
   try {
     const t0 = performance.now();
     // i32 unit sig — the same kernel the interp #jit item runs.
-    const i32 = await run(await fetchBytes('/corpus/threads_jit_invoke.svmbc'), { jitCodegen: true, jitService: 0 });
+    const i32 = await run(await fetchBytes('/corpus/threads_jit_invoke.temenc'), { jitCodegen: true, jitService: 0 });
     // f64 unit sig — args' slot bits ↔ JS Numbers, result ↔ bits (the float ABI path).
-    const f64 = await run(await fetchBytes('/corpus/threads_jit_invoke_f64.svmbc'), { jitCodegen: true, jitService: 1 });
+    const f64 = await run(await fetchBytes('/corpus/threads_jit_invoke_f64.temenc'), { jitCodegen: true, jitService: 1 });
     const ms = (performance.now() - t0).toFixed(0);
     // Ground truth 1136 (= the interpreter, differential-checked in the Node twin threads-spawn.mjs);
     // here we also require the seam actually fired (units ran on wasm) for each sig.
@@ -365,8 +365,8 @@ block 0 (v0: i64) {
   // carve → 8 × 75 = 600. Run it BOTH ways: interp (`inst`) and codegen (`instCodegen`); both 600, and
   // codegen must actually run children on wasm. Cap-using unit entries (nested instantiate) stay interp.
   try {
-    const guest = await fetchBytes('/corpus/threads_inst_mod.svmbc');
-    const unit = await fetchBytes('/corpus/threads_inst_unit.svmbc');
+    const guest = await fetchBytes('/corpus/threads_inst_mod.temenc');
+    const unit = await fetchBytes('/corpus/threads_inst_unit.temenc');
     const opt = { unit, winSize: 1 << 20 };
     const t0 = performance.now();
     const interp = await run(guest, { ...opt, inst: true });
@@ -390,8 +390,8 @@ block 0 (v0: i64) {
   // their own Workers (17 total). Both tiers must agree, and codegen must actually emit (tierups —
   // children AND their emitted grandchildren bump it).
   try {
-    const guest = await fetchBytes('/corpus/threads_inst_mod.svmbc');
-    const unit = await fetchBytes('/corpus/threads_inst_nested_unit.svmbc');
+    const guest = await fetchBytes('/corpus/threads_inst_mod.temenc');
+    const unit = await fetchBytes('/corpus/threads_inst_nested_unit.temenc');
     const opt = { unit, winSize: 1 << 20 };
     const t0 = performance.now();
     const interp = await run(guest, { ...opt, inst: true });
@@ -413,8 +413,8 @@ block 0 (v0: i64) {
   // wasm per-Worker (tierups counts them). The browser twin of
   // bytecode_parallel_jit.rs::parallel_runtime_compile_invoke_is_sound.
   try {
-    const guest = await fetchBytes('/corpus/jit_rt.svmbc');
-    const unit = await fetchBytes('/corpus/jit_rt_unit.svmbc');
+    const guest = await fetchBytes('/corpus/jit_rt.temenc');
+    const unit = await fetchBytes('/corpus/jit_rt_unit.temenc');
     const opt = { jitRuntime: true, jitBlobs: [{ off: 0x2000, bytes: unit }] };
     const t0 = performance.now();
     const interp = await run(guest, opt);
@@ -437,9 +437,9 @@ block 0 (v0: i64) {
   // WebAssembly.Table mirror of the shared slot→unit map (worker.js syncs before each invoke). Both
   // → 56. The browser twin of b2_install.rs + parallel_install_call_indirect_matches_oracle.
   try {
-    const guest = await fetchBytes('/corpus/jit_b2.svmbc');
-    const leaf = await fetchBytes('/corpus/jit_rt_unit.svmbc');
-    const disp = await fetchBytes('/corpus/jit_b2_unit.svmbc');
+    const guest = await fetchBytes('/corpus/jit_b2.temenc');
+    const leaf = await fetchBytes('/corpus/jit_rt_unit.temenc');
+    const disp = await fetchBytes('/corpus/jit_b2_unit.temenc');
     const opt = { jitRuntime: true, jitBlobs: [{ off: 0x2000, bytes: leaf }, { off: 0x3000, bytes: disp }] };
     const t0 = performance.now();
     const interp = await run(guest, opt);
@@ -461,8 +461,8 @@ block 0 (v0: i64) {
   // EMITTED WASM, its thread/futex ops arriving as env.thread_spawn/join + env.mem_wait imports —
   // serviced through the same completion-slot protocol. Both tiers must agree.
   try {
-    const guest = await fetchBytes('/corpus/threads_inst_mod.svmbc');
-    const unit = await fetchBytes('/corpus/threads_inst_threads_unit.svmbc');
+    const guest = await fetchBytes('/corpus/threads_inst_mod.temenc');
+    const unit = await fetchBytes('/corpus/threads_inst_threads_unit.temenc');
     const opt = { unit, winSize: 1 << 20 };
     const t0 = performance.now();
     const interp = await run(guest, { ...opt, inst: true });

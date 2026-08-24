@@ -1,11 +1,11 @@
-//! The **`svm-posix` shell** running in the browser (`posix_shell_exec` / the wasm `svm_run_shell`
+//! The **`temen-posix` shell** running in the browser (`posix_shell_exec` / the wasm `temen_run_shell`
 //! export) — STAGE1.md "real posix shell in the playground". The committed fixture
-//! `fixtures/shell.svmb` is the **full** shell: the same `shim.c + ring.c + shell_main.c` the
-//! differential `crates/svm/tests/c_shell.rs` compiles, *including* external-command spawn (op 13) and
+//! `fixtures/shell.temen` is the **full** shell: the same `shim.c + ring.c + shell_main.c` the
+//! differential `crates/temen/tests/c_shell.rs` compiles, *including* external-command spawn (op 13) and
 //! concurrent ring pipelines (op 11 + `SharedRegion` + futex). Those cap.calls now run on the browser's
 //! bytecode cooperative engine (the slices that lowered ops 13/11 + region + futex, plus op-13
 //! child-manifest binding). Regenerate both fixtures with
-//! `cargo test -p svm --test c_shell -- --ignored --exact gen_browser_shell_fixture`.
+//! `cargo test -p temen --test c_shell -- --ignored --exact gen_browser_shell_fixture`.
 //!
 //! The shell reads its script from the personality's stdin and loops to EOF; its `write(1, …)` lands
 //! in the personality's captured stdout. Run on the **bytecode** engine — the single-threaded,
@@ -14,11 +14,11 @@
 //!   pipelines, external commands, if, vars, globbing) is byte-checked against the tree-walk oracle by
 //!   `c_shell`'s three-way interp==JIT==bytecode differential.
 
-use svm_browser::{posix_shell_exec, posix_shell_exec_with, STATUS_OK};
+use temen_browser::{posix_shell_exec, posix_shell_exec_with, STATUS_OK};
 
 fn run(script: &str) -> String {
-    let bytes = include_bytes!("fixtures/shell.svmb");
-    let m = svm_encode::decode_module(bytes).expect("decode shell.svmb");
+    let bytes = include_bytes!("fixtures/shell.temen");
+    let m = temen_encode::decode_module(bytes).expect("decode shell.temen");
     let out = posix_shell_exec(&m, script.as_bytes());
     assert_eq!(
         out.status, STATUS_OK,
@@ -30,16 +30,16 @@ fn run(script: &str) -> String {
 /// As [`run`], with the full playground PATH registered: the `__stage` ring-filter runner (so
 /// pipelines take the concurrent ring path — op 11 + `SharedRegion` + futex — instead of sequential
 /// memfs staging) and the `primes` external command (an op-13 §14 child). Exactly what the browser's
-/// `svm_run_shell` grants, so these tests mirror the real playground registry.
+/// `temen_run_shell` grants, so these tests mirror the real playground registry.
 fn run_with_stage(script: &str) -> String {
-    let bytes = include_bytes!("fixtures/shell.svmb");
-    let m = svm_encode::decode_module(bytes).expect("decode shell.svmb");
-    let rbytes = include_bytes!("fixtures/stage_runner.svmb");
-    let runner = svm_encode::decode_module(rbytes).expect("decode stage_runner.svmb");
-    let pbytes = include_bytes!("fixtures/primes.svmb");
-    let primes = svm_encode::decode_module(pbytes).expect("decode primes.svmb");
-    let ubytes = include_bytes!("fixtures/upper.svmb");
-    let upper = svm_encode::decode_module(ubytes).expect("decode upper.svmb");
+    let bytes = include_bytes!("fixtures/shell.temen");
+    let m = temen_encode::decode_module(bytes).expect("decode shell.temen");
+    let rbytes = include_bytes!("fixtures/stage_runner.temen");
+    let runner = temen_encode::decode_module(rbytes).expect("decode stage_runner.temen");
+    let pbytes = include_bytes!("fixtures/primes.temen");
+    let primes = temen_encode::decode_module(pbytes).expect("decode primes.temen");
+    let ubytes = include_bytes!("fixtures/upper.temen");
+    let upper = temen_encode::decode_module(ubytes).expect("decode upper.temen");
     let out = posix_shell_exec_with(
         &m,
         script.as_bytes(),
