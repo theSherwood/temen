@@ -299,3 +299,12 @@ block2(v7: i32):
   return v7                   ; sum of 1..=N
 }
 ```
+
+---
+
+**A note on authorship.** This project is largely written by LLM agents — the code,
+the tests, the design docs, and this README included — working under human direction
+and review. That context matters when weighing the claims above: the confidence here
+comes from the differential tests, fuzzers, and native-build byte-comparisons that
+gate CI, not from expert eyeballs, and the security posture is a *target* until the
+validation plan in `DESIGN.md` §18 is executed. Read accordingly.
