@@ -914,7 +914,7 @@ proc greet(name: string): string =
   "hello, " & name & "\\n"
 
 write(stdout, greet("Nim"))
-write(stdout, greet("the SVM"))
+write(stdout, greet("the Temen"))
 `,
   },
   'temen-leng: translate real nimony Leng → Temen IR (self-host)': {

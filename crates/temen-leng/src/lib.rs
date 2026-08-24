@@ -679,6 +679,23 @@ fn compute_leaf_index(name: &str) -> Option<u32> {
 /// thing re-linked. Re-verify the result like any linked output (the caller runs `run_powerbox`, which
 /// verifies).
 pub fn link_nim_powerbox(units: &[WholeModule]) -> Result<Module, LengError> {
+    // #1051: link the `system` unit **first**. It defines the `LongString` type and string runtime
+    // that other units' heap-string constants reference — every string literal ≥ 8 bytes (past
+    // hexer's small-string optimization) lowers to a `LongString` const bound to `…sysv…`. The linker
+    // resolves those cross-unit references correctly only when `system` precedes its referents; a
+    // `main`-first unit order (which the browser `nimc` card, `nim_e2e_chain`, and `nim_selfdrive`
+    // pass) corrupts them — the const's length field reads huge and `write` dumps stray bytes. The
+    // `_start` entry is func 0 via the synthesized start unit, not unit position, so reordering is
+    // safe. Stable-partition so `sysv…` units come first and the rest keep their given order.
+    let mut reordered: Vec<WholeModule> = units
+        .iter()
+        .map(|u| WholeModule {
+            stem: u.stem,
+            src: u.src,
+        })
+        .collect();
+    reordered.sort_by_key(|u| !u.stem.starts_with("sysv"));
+    let units: &[WholeModule] = &reordered;
     // The compute shim must know which leaf names to export; discover them from the `system` unit's
     // own compiled imports (every pure-compute leaf originates there — a self-contained module that
     // compiles standalone, unlike a program unit that references a sibling's aggregate type).
