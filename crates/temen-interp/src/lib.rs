@@ -5637,6 +5637,13 @@ fn reap_status(result: &Result<Vec<Value>, Trap>) -> i64 {
             Some(Value::I32(x)) => *x as i64,
             _ => 0,
         },
+        // #1057 — `Trap::Exit(code)` is a **clean** guest `exit(code)`, not a crash ("not an
+        // error — the domain asked to terminate"); the root path already maps it to
+        // `Outcome::Exited(code)`. A fork twin that terminates via `exit()` rather than
+        // returning — every forked bash pipeline stage / subshell that reaches `exit_shell()` —
+        // must reap with that code, else its `$?` (and any `wait`) comes back as the crash
+        // status. Only genuine traps (unreachable, memory faults, cap faults, …) reap as 128.
+        Err(Trap::Exit(code)) => *code as i64 & 0xff,
         Err(_) => REAP_CRASH_STATUS,
     }
 }
