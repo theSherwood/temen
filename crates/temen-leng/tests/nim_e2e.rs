@@ -468,9 +468,9 @@ fn real_write_program_prints_to_stdout() {
     };
     let mods = compile_to_leng(
         &path,
-        "import std/syncio\nwrite(stdout, \"hello, temen\\n\")\n",
+        "import std/syncio\nwrite(stdout, \"hello, svm\\n\")\n",
     );
-    assert_eq!(run_io_program(&mods), b"hello, temen\n", "captured stdout");
+    assert_eq!(run_io_program(&mods), b"hello, svm\n", "captured stdout");
 }
 
 /// **The browser-shape I/O path.** Same real `std/syncio` program, but linked via
@@ -489,7 +489,7 @@ fn nim_write_runs_under_the_powerbox() {
     };
     let mods = compile_to_leng(
         &path,
-        "import std/syncio\nwrite(stdout, \"hello, temen\\n\")\n",
+        "import std/syncio\nwrite(stdout, \"hello, svm\\n\")\n",
     );
     let units: Vec<temen_leng::WholeModule> = mods
         .iter()
@@ -498,7 +498,7 @@ fn nim_write_runs_under_the_powerbox() {
     let m = temen_leng::link_nim_powerbox(&units).unwrap_or_else(|e| panic!("bridge link: {e}"));
     let run = temen_run::run_powerbox(&m, &[]).unwrap_or_else(|e| panic!("run_powerbox: {e}"));
     assert_eq!(
-        run.stdout, b"hello, temen\n",
+        run.stdout, b"hello, svm\n",
         "real Nim printed via the standard powerbox"
     );
 }

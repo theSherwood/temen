@@ -1,2 +1,2 @@
 import std/syncio
-write(stdout, "hello, temen\n")
+write(stdout, "hello, svm\n")

@@ -26,7 +26,11 @@ while IFS= read -r f; do
 done < /tmp/temen_files.txt
 rm -f /tmp/temen_files.txt
 
-# Drop now-empty directories left behind by the moves (never touch .git).
-find . -type d -empty -not -path './.git/*' -delete 2>/dev/null || true
+# Drop now-empty directories left behind by the crate/file moves. Scope this to
+# `crates/` — that is where every rename that empties a directory lives. Crucially,
+# do NOT sweep the whole tree: git submodule dirs (nimony, nativenif) live at the
+# repo root and are empty when uninitialized, and deleting them drops the gitlink
+# (which broke the nim-e2e CI provisioning once already).
+find crates -type d -empty -delete 2>/dev/null || true
 
 echo ">> done"

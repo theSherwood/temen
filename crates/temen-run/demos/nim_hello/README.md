@@ -1,6 +1,6 @@
 # nim_hello — a real Nim program compiled to a runnable Temen powerbox module
 
-`hello.nim` (`write(stdout, "hello, temen\n")`) compiled all the way to a
+`hello.nim` (`write(stdout, "hello, svm\n")`) compiled all the way to a
 browser-loadable `.temen` that **runs and prints for real** — the "run real Nim"
 playground card, and the analog of the `chibicc.temen` / `temen-leng.temen` asset
 lanes but for a *compiled Nim program that runs* rather than a compiler.
@@ -34,6 +34,6 @@ NIMONY_BIN=<abs>/nimony/bin NIM_BIN=<dir of nim> \
 The committed asset lives at `browser/web/assets/nim_hello.temen` (the playground
 loads it; `nim_hello` play.js card). **Code-coupled:** `crates/temen-run/tests/
 nim_hello_asset.rs` decodes, re-verifies, and runs the committed bytes under
-`run_powerbox`, asserting `hello, temen` — no toolchain, so it gates every PR. If
+`run_powerbox`, asserting `hello, svm` — no toolchain, so it gates every PR. If
 an IR/ABI/encoder or bridge change makes it drift, that test fails: regenerate
 the asset with the command above and commit it.

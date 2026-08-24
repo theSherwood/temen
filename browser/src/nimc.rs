@@ -470,7 +470,7 @@ mod tests {
         let r = compile_nim(&nifler, &nimsem, &hexer, files, "prog.nim");
         assert_eq!(
             r.as_deref(),
-            Ok("hello, Nim\nhello, the Temen\n"),
+            Ok("hello, Nim\nhello, the SVM\n"),
             "in-browser compile+run of a proc + string-concat program"
         );
     }

@@ -419,11 +419,7 @@ fn run_link(files: &[String], out_path: Option<String>, emit_text: bool) -> Resu
         .map_err(|e| format!("verification of linked module failed (fail-closed): {e:?}"))?;
     match out_path {
         Some(p) => {
-            if p.ends_with(".temt")
-                || p.ends_with(".temt")
-                || p.ends_with(".ir")
-                || p.ends_with(".txt")
-            {
+            if p.ends_with(".temt") || p.ends_with(".ir") || p.ends_with(".txt") {
                 fs::write(&p, temen_text::print_module(&linked))
                     .map_err(|e| format!("write `{p}`: {e}"))?;
             } else {
@@ -442,12 +438,12 @@ fn run_link(files: &[String], out_path: Option<String>, emit_text: bool) -> Resu
 }
 
 /// Is this extension the text-IR form, and warn once per file on the deprecated spelling.
-/// `.temt` is canonical (the text member of the `.temt`/`.temen`/`.temeno` triple); `.temt` and the
-/// older `.ir`/`.txt` still load but steer users to `.temt`.
+/// `.temt` is canonical (the text member of the `.temt`/`.temen`/`.temeno` triple); the older
+/// `.ir`/`.txt` spellings still load but steer users to `.temt`.
 fn is_text_ext(ext: &str, path: &Path) -> bool {
     match ext {
         "temt" => true,
-        "temen" | "ir" | "txt" => {
+        "ir" | "txt" => {
             eprintln!(
                 "temen-run: note: `.{ext}` is deprecated for text IR — rename {} to `.temt`",
                 path.display()

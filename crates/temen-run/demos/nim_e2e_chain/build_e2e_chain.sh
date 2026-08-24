@@ -112,9 +112,9 @@ run_fixture usermod useit 13 4
 # guest's `write(fd,buf,len)` reaches the STREAM `write` cap — real **stdout**, checked against the
 # expected string (`\n` decoded). (`echo` is not yet an identifier nimony resolves — a frontend gap.)
 write_main iohello 'import std/syncio
-write(stdout, "hello, temen\n")
+write(stdout, "hello, svm\n")
 '
-run_fixture iohello '<io>' 'hello, temen\n'
+run_fixture iohello '<io>' 'hello, svm\n'
 
 echo "=== [3/3] the same, with NO native bootstrap (nim_selfdrive — the in-browser card's core) ==="
 # `nim_e2e_chain` above leans on native `nimony c` to lay out the nimcache (stems + .build.nif plan).
@@ -132,6 +132,6 @@ selfdrive() { # <name> <main.nim-relative-in-$w> <export> <expected> [args...]
 }
 selfdrive addtwo prog.nim addTwo 5 2 3
 selfdrive usermod prog.nim useit 13 4
-selfdrive iohello prog.nim '<io>' 'hello, temen\n'
+selfdrive iohello prog.nim '<io>' 'hello, svm\n'
 
 echo "ALL FIXTURES RAN — the full nimony compiler runs on the Temen (single- and multi-module, with and without a native bootstrap), and its compiled output runs too"

@@ -41,7 +41,7 @@ main) that compiles and runs on the Temen.
   bridge** (`temen_leng::link_nim_powerbox`, the same bridge the `nim_hello` card ships) and run `_start`
   under the powerbox, so the guest's `write(fd,buf,len)` reaches the STREAM `write` cap. The captured
   **stdout** is checked against the expected string. The `iohello` fixture (`import std/syncio;
-  write(stdout, "hello, temen\n")`) is a four-unit compile that **prints for real** — a Nim program
+  write(stdout, "hello, svm\n")`) is a four-unit compile that **prints for real** — a Nim program
   compiled entirely by the Temen, producing output. (`echo` isn't an identifier nimony resolves yet — a
   frontend gap, not ours.)
 
@@ -66,7 +66,7 @@ module stems, and the `.build.nif` plan). **The browser has no native nimony**, 
 
 Nothing native is in the loop but the guest `.temen` build. This is the **exact logic the browser cdylib
 will run** for #958 — proven here headless (`build_e2e_chain.sh` step 3 runs the same fixtures with no
-bootstrap: `addTwo`→5, `useit`→13, `iohello`→`hello, temen\n`).
+bootstrap: `addTwo`→5, `useit`→13, `iohello`→`hello, svm\n`).
 
 ## Run it
 

@@ -20,7 +20,7 @@ patched*.wasm
 /web/assets/*.wad
 /web/assets/*.img
 !/web/assets/hello_c.temen
-# nim_hello.temen — a real Nim program (`write(stdout, "hello, temen")`) compiled through nimony →
+# nim_hello.temen — a real Nim program (`write(stdout, "hello, svm")`) compiled through nimony →
 # temen-leng → the nim→powerbox bridge to a runnable module, committed like `hello_c` so the "run real
 # Nim" playground card works out of the box. Regenerate with `cargo run -p temen-run --example
 # build_nim_hello_temen` (needs the nimony toolchain); gated by `crates/temen-run/tests/nim_hello_asset.rs`.

@@ -131,8 +131,8 @@ fn link_temeno_units_into_runnable_temen() {
 
 /// `--assemble`: the tiny text→binary-object step for text-emitting frontends. A text unit
 /// carrying link forms assembles to a `.temeno` that decodes as the identical module and links.
-/// `.temt` is the canonical text extension (no note); the deprecated `.temt` still works but
-/// steers the user to `.temt` on stderr.
+/// `.temt` is the canonical text extension (no note); the deprecated `.ir`/`.txt` spellings still
+/// work but steer the user to `.temt` on stderr.
 #[test]
 fn assemble_text_unit_to_temeno() {
     let bin = env!("CARGO_BIN_EXE_temen-run");
@@ -162,8 +162,8 @@ fn assemble_text_unit_to_temeno() {
     let decoded = temen_encode::decode_unit(&std::fs::read(&obj_path).unwrap()).expect("decode");
     assert_eq!(decoded, unit, "assembled object differs from the text unit");
 
-    // Deprecated spelling: `.temt` still assembles identically but notes the rename.
-    let old_path = dir.join("b.temt");
+    // Deprecated spelling: `.ir` still assembles identically but notes the rename.
+    let old_path = dir.join("b.ir");
     std::fs::write(&old_path, temen_text::print_module(&unit)).unwrap();
     let obj2 = dir.join("b2.temeno");
     let asm2 = Command::new(bin)
@@ -176,12 +176,12 @@ fn assemble_text_unit_to_temeno() {
     assert!(asm2.status.success());
     assert!(
         String::from_utf8_lossy(&asm2.stderr).contains("deprecated"),
-        "deprecated .temt should note the rename to .temt"
+        "deprecated .ir should note the rename to .temt"
     );
     assert_eq!(
         std::fs::read(&obj_path).unwrap(),
         std::fs::read(&obj2).unwrap(),
-        ".temt and .temt inputs assemble to identical objects"
+        ".temt and .ir inputs assemble to identical objects"
     );
 
     std::fs::remove_dir_all(&dir).ok();
