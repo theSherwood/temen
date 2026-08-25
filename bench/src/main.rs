@@ -118,14 +118,16 @@ const ALU: Kernel = Kernel {
     name: "alu",
     ir: "\
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i64.const 6364136223846793005
   v11 = i64.mul v8 v10
   v12 = i64.const 1442695040888963407
@@ -133,9 +135,11 @@ block2(v7: i64, v8: i64, v9: i64):
   v14 = i64.add v13 v9
   v15 = i64.const 1
   v16 = i64.add v9 v15
-  br block1(v7, v14, v16)
-block3(v17: i64):
+  br 1(v7, v14, v16)
+}
+block 3 (v17: i64) {
   return v17
+}
 }
 ",
     wat32: r#"
@@ -205,14 +209,16 @@ const SIMD: Kernel = Kernel {
     name: "simd",
     ir: "\
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = v128.const 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
-  br block1(v0, v1, v2)
-block1(v0: i64, v1: i64, v2: v128):
+  br 1(v0, v1, v2)
+}
+block 1 (v0: i64, v1: i64, v2: v128) {
   v3 = i64.ge_s v1 v0
-  br_if v3 block2(v0, v1, v2) block3(v0, v1, v2)
-block2(v0: i64, v1: i64, v2: v128):
+  br_if v3 2(v0, v1, v2) 3(v0, v1, v2)
+}
+block 2 (v0: i64, v1: i64, v2: v128) {
   v3 = i32x4.extract_lane 0 v2
   v4 = i32x4.extract_lane 1 v2
   v5 = i32.add v3 v4
@@ -222,12 +228,14 @@ block2(v0: i64, v1: i64, v2: v128):
   v9 = i32.add v5 v8
   v10 = i64.extend_i32_u v9
   return v10
-block3(v0: i64, v1: i64, v2: v128):
+}
+block 3 (v0: i64, v1: i64, v2: v128) {
   v3 = v128.const 1 0 0 0 2 0 0 0 3 0 0 0 4 0 0 0
   v4 = i32x4.add v2 v3
   v5 = i64.const 1
   v6 = i64.add v1 v5
-  br block1(v0, v6, v4)
+  br 1(v0, v6, v4)
+}
 }
 
 ",
@@ -285,14 +293,16 @@ const MEMSUM: Kernel = Kernel {
     ir: "\
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i64.const 1023
   v11 = i64.and v9 v10
   v12 = i64.const 8
@@ -302,9 +312,11 @@ block2(v7: i64, v8: i64, v9: i64):
   v15 = i64.add v8 v14
   v16 = i64.const 1
   v17 = i64.add v9 v16
-  br block1(v7, v15, v17)
-block3(v18: i64):
+  br 1(v7, v15, v17)
+}
+block 3 (v18: i64) {
   return v18
+}
 }
 ",
     wat32: r#"
@@ -357,14 +369,16 @@ const SCATTER: Kernel = Kernel {
     ir: "\
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i64.const 2654435761
   v11 = i64.mul v9 v10
   v12 = i64.const 1023
@@ -380,9 +394,11 @@ block2(v7: i64, v8: i64, v9: i64):
   v21 = i64.add v8 v20
   v22 = i64.const 1
   v23 = i64.add v9 v22
-  br block1(v7, v21, v23)
-block3(v24: i64):
+  br 1(v7, v21, v23)
+}
+block 3 (v24: i64) {
   return v24
+}
 }
 ",
     wat32: r#"
@@ -442,14 +458,16 @@ const FLOAT: Kernel = Kernel {
     name: "float",
     ir: "\
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = f64.const 0.0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: f64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: f64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: f64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: f64, v9: i64) {
   v10 = i64.const 1023
   v11 = i64.and v9 v10
   v12 = f64.convert_i64_s v11
@@ -458,10 +476,12 @@ block2(v7: i64, v8: f64, v9: i64):
   v15 = f64.add v14 v12
   v16 = i64.const 1
   v17 = i64.add v9 v16
-  br block1(v7, v15, v17)
-block3(v18: f64):
+  br 1(v7, v15, v17)
+}
+block 3 (v18: f64) {
   v19 = i64.reinterpret_f64 v18
   return v19
+}
 }
 ",
     wat32: r#"
@@ -511,28 +531,33 @@ const CALLI: Kernel = Kernel {
     name: "calli",
     ir: "\
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i32.const 1
   v11 = call_indirect (i64) -> (i64) v10 (v9)
   v12 = i64.add v8 v11
   v13 = i64.const 1
   v14 = i64.add v9 v13
-  br block1(v7, v12, v14)
-block3(v15: i64):
+  br 1(v7, v12, v14)
+}
+block 3 (v15: i64) {
   return v15
 }
+}
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 1
   v2 = i64.add v0 v1
   return v2
+}
 }
 ",
     wat32: r#"
@@ -599,14 +624,16 @@ const CACHE: Kernel = Kernel {
     ir: "\
 memory 20
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i64.const 2654435761
   v11 = i64.mul v9 v10
   v12 = i64.const 131071
@@ -622,9 +649,11 @@ block2(v7: i64, v8: i64, v9: i64):
   v21 = i64.add v8 v20
   v22 = i64.const 1
   v23 = i64.add v9 v22
-  br block1(v7, v21, v23)
-block3(v24: i64):
+  br 1(v7, v21, v23)
+}
+block 3 (v24: i64) {
   return v24
+}
 }
 ",
     wat32: r#"
@@ -1107,22 +1136,26 @@ fn hostcall_kernel() -> Resolved {
         ir: "\
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i32.const 0
   v11 = cap.call 0 0 (i64) -> (i64) v10(v9)
   v12 = i64.add v8 v11
   v13 = i64.const 1
   v14 = i64.add v9 v13
-  br block1(v7, v12, v14)
-block3(v15: i64):
+  br 1(v7, v12, v14)
+}
+block 3 (v15: i64) {
   return v15
+}
 }
 "
         .into(),
@@ -1163,14 +1196,16 @@ fn hostbuf_kernel() -> Resolved {
         ir: "\
 memory 16
 func (i64) -> (i64) {
-block0(v0: i64):
+block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = i64.const 0
-  br block1(v0, v1, v2)
-block1(v3: i64, v4: i64, v5: i64):
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
   v6 = i64.lt_s v5 v3
-  br_if v6 block2(v3, v4, v5) block3(v4)
-block2(v7: i64, v8: i64, v9: i64):
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i32.const 0
   v11 = i64.const 0
   v12 = i64.const 64
@@ -1178,9 +1213,11 @@ block2(v7: i64, v8: i64, v9: i64):
   v14 = i64.add v8 v13
   v15 = i64.const 1
   v16 = i64.add v9 v15
-  br block1(v7, v14, v16)
-block3(v17: i64):
+  br 1(v7, v14, v16)
+}
+block 3 (v17: i64) {
   return v17
+}
 }
 "
         .into(),
