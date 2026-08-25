@@ -152,7 +152,7 @@ block 0 (v0: i64) {
   }
 }`;
 
-// call_indirect (slice: next): a loop dispatches to f(i)=2i or f(i)=i+100 by index parity through
+// call.dyn (slice: next): a loop dispatches to f(i)=2i or f(i)=i+100 by index parity through
 // the emitted funcref table — proving the masked-index + wasm signature-check dispatch matches the
 // interpreter's identity table. All-in-subset (three integer funcs), so it JITs whole-module.
 const DISPATCH = `
@@ -172,7 +172,7 @@ block 2 (v7: i64, v8: i64, v9: i64) {
   v12 = i64.const 1
   v13 = i64.add v11 v12
   v14 = i32.wrap_i64 v13
-  v15 = call_indirect (i64) -> (i64) v14 (v9)
+  v15 = call.dyn (i64) -> (i64) v14 (v9)
   v16 = i64.add v8 v15
   v17 = i64.const 1
   v18 = i64.add v9 v17
