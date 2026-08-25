@@ -110,6 +110,90 @@ block 0 (v0: i64) {
 }
 "#;
 
+/// #1081 — bulk-memory straddle guests (paged per-page walk). `(as, off, len, probe)`: `unmap`
+/// `[off, off+len)`, then the leaf **`mem.fill`s** `[probe, probe+16)` — a write span the harness places
+/// straddling from the page before into the unmapped page, so the per-page walk must trap on both tiers.
+const UNMAP_FILL: &str = r#"memory 17
+func (i32, i64, i64, i64) -> (i64) {
+block 0 (vas: i32, voff: i64, vlen: i64, vprobe: i64) {
+  vr = cap.call 5 1 (i64, i64) -> (i64) vas (voff, vlen)
+  v1 = call 1 (vprobe)
+  return v1
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vval = i32.const 0
+  vn = i64.const 16
+  mem.fill v0 vval vn
+  return v0
+  }
+}
+"#;
+
+/// `(as, off, len, probe)`: `protect` `[off, off+len)` read-only, then the leaf **`mem.fill`s**
+/// `[probe, probe+16)` — a write straddling into the `Ro` page must trap on both tiers.
+const PROTECT_FILL: &str = r#"memory 17
+func (i32, i64, i64, i64) -> (i64) {
+block 0 (vas: i32, voff: i64, vlen: i64, vprobe: i64) {
+  vp = i32.const 1
+  vr = cap.call 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vp)
+  v1 = call 1 (vprobe)
+  return v1
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vval = i32.const 0
+  vn = i64.const 16
+  mem.fill v0 vval vn
+  return v0
+  }
+}
+"#;
+
+/// `(as, off, len, probe)`: `unmap` `[off, off+len)`, then the leaf **`mem.copy`s** *from* the source
+/// span `[probe, probe+16)` (straddling the unmapped page) to the plain-`Rw` dest `[1024, 1040)` — the
+/// read side of the walk must trap on both tiers.
+const UNMAP_COPY: &str = r#"memory 17
+func (i32, i64, i64, i64) -> (i64) {
+block 0 (vas: i32, voff: i64, vlen: i64, vprobe: i64) {
+  vr = cap.call 5 1 (i64, i64) -> (i64) vas (voff, vlen)
+  v1 = call 1 (vprobe)
+  return v1
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vdst = i64.const 1024
+  vn = i64.const 16
+  mem.copy vdst v0 vn
+  return v0
+  }
+}
+"#;
+
+/// As [`UNMAP_COPY`] but `protect` (`Ro`): a **read** whose source straddles the `Ro` page must
+/// **succeed** on both tiers — the walk admits a load of an `Ro` page (only `Unmapped` traps a read).
+const PROTECT_COPY: &str = r#"memory 17
+func (i32, i64, i64, i64) -> (i64) {
+block 0 (vas: i32, voff: i64, vlen: i64, vprobe: i64) {
+  vp = i32.const 1
+  vr = cap.call 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vp)
+  v1 = call 1 (vprobe)
+  return v1
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vdst = i64.const 1024
+  vn = i64.const 16
+  mem.copy vdst v0 vn
+  return v0
+  }
+}
+"#;
+
 #[derive(Debug, PartialEq, Clone)]
 enum Outcome {
     Vals(Vec<i64>),
@@ -417,6 +501,96 @@ fn straddling_store_traps_at_the_page_edge() {
     let (got, tierups) = run_guest(UNMAP_STORE, off, len, inside, Mode::PagedSynced);
     assert_eq!(tierups, 1);
     assert_eq!(want, got, "paged tier diverged just inside the edge");
+}
+
+#[test]
+fn paged_bulk_fill_straddling_unmapped_traps_on_both_tiers() {
+    // #1081: the paged per-page walk for bulk memory. A `mem.fill [off-8, off+8)` straddles from the
+    // Rw neighbor into the unmapped last page — a first-page-only check would admit the write; the walk
+    // (like the oracle's `check_prot_span`) traps on the unmapped page. Both tiers must trap.
+    let (off, len) = last_page(UNMAP_FILL);
+    let straddle = (off - 8) as i64;
+    let (want, _) = run_guest(UNMAP_FILL, off, len, straddle, Mode::Interp);
+    assert_eq!(
+        want,
+        Outcome::Trap(TrapKind::MemoryFault),
+        "oracle sanity: a fill straddling the unmapped page faults"
+    );
+    let (got, tierups) = run_guest(UNMAP_FILL, off, len, straddle, Mode::PagedSynced);
+    assert_eq!(
+        tierups, 1,
+        "the bulk-mem leaf must tier up (no longer excluded from the paged subset)"
+    );
+    assert_eq!(
+        want, got,
+        "paged bulk walk diverged on a fill straddling an unmapped page"
+    );
+
+    // Control: the same fill fully inside the Rw neighbor round-trips on both tiers (no over-trap).
+    let inside = (off - 64) as i64;
+    let (want, _) = run_guest(UNMAP_FILL, off, len, inside, Mode::Interp);
+    assert_eq!(
+        want,
+        Outcome::Vals(vec![inside]),
+        "oracle sanity: an in-Rw fill succeeds"
+    );
+    let (got, _) = run_guest(UNMAP_FILL, off, len, inside, Mode::PagedSynced);
+    assert_eq!(want, got, "paged bulk walk over-trapped an in-Rw fill");
+}
+
+#[test]
+fn paged_bulk_fill_straddling_ro_traps_on_both_tiers() {
+    // A write straddling into an `Ro` page faults on both tiers (a store admits only `Rw`).
+    let (off, len) = last_page(PROTECT_FILL);
+    let straddle = (off - 8) as i64;
+    let (want, _) = run_guest(PROTECT_FILL, off, len, straddle, Mode::Interp);
+    assert_eq!(
+        want,
+        Outcome::Trap(TrapKind::MemoryFault),
+        "oracle sanity: a fill straddling an Ro page faults"
+    );
+    let (got, tierups) = run_guest(PROTECT_FILL, off, len, straddle, Mode::PagedSynced);
+    assert_eq!(tierups, 1);
+    assert_eq!(
+        want, got,
+        "paged bulk walk diverged on a fill straddling an Ro page"
+    );
+}
+
+#[test]
+fn paged_bulk_copy_read_ro_succeeds_unmapped_traps() {
+    // The read side of the walk: a `mem.copy` whose SOURCE straddles the managed page. A load of an
+    // `Ro` page is fine (succeeds on both tiers — the walk must NOT over-trap reads); a load of an
+    // `Unmapped` page faults on both. This pins that the walk distinguishes read from write.
+    let (off, len) = last_page(PROTECT_COPY);
+    let straddle = (off - 8) as i64;
+    let (want, _) = run_guest(PROTECT_COPY, off, len, straddle, Mode::Interp);
+    assert_eq!(
+        want,
+        Outcome::Vals(vec![straddle]),
+        "oracle sanity: a read whose source straddles an Ro page succeeds"
+    );
+    let (got, tierups) = run_guest(PROTECT_COPY, off, len, straddle, Mode::PagedSynced);
+    assert_eq!(tierups, 1);
+    assert_eq!(
+        want, got,
+        "paged bulk walk over-trapped a read straddling an Ro page"
+    );
+
+    let (off, len) = last_page(UNMAP_COPY);
+    let straddle = (off - 8) as i64;
+    let (want, _) = run_guest(UNMAP_COPY, off, len, straddle, Mode::Interp);
+    assert_eq!(
+        want,
+        Outcome::Trap(TrapKind::MemoryFault),
+        "oracle sanity: a read whose source straddles an unmapped page faults"
+    );
+    let (got, tierups) = run_guest(UNMAP_COPY, off, len, straddle, Mode::PagedSynced);
+    assert_eq!(tierups, 1);
+    assert_eq!(
+        want, got,
+        "paged bulk walk diverged on a read straddling an unmapped page"
+    );
 }
 
 #[test]

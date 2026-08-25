@@ -30,6 +30,8 @@ const readStdout = () => dec.decode(u8().slice(
 // Event counters, observed from outside: one TIERUP service reads temen_coop_func once; a
 // JIT_INVOKE reads temen_coop_jit_wasm_ptr once; every cross-tier bounce goes through
 // temen_coop_call_interp (#1026: the coop driver is the one fallback tier; the pump is gone).
+// #1026 slice 4: the production leaf tier-up size floor (temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES).
+const DEFAULT_FLOOR = 4096;
 let forcePump = false;
 const counts = { tierups: 0, invokes: 0, bounces: 0, path: 'interp' };
 const resetCounts = () => { counts.tierups = 0; counts.invokes = 0; counts.bounces = 0; counts.path = 'interp'; };
@@ -116,23 +118,30 @@ for (const [name, rel, workload] of cards) {
     `${name}: bytecode best ${bBest.toFixed(1)}ms | auto cold ${cold.ms.toFixed(1)}ms, warm best ${warmBest.toFixed(1)}ms ` +
     `(${(bBest / warmBest).toFixed(2)}x) | path ${warm.path} | tierups ${warm.tierups} invokes ${warm.invokes} bounces ${warm.bounces} | ${parity}`,
   );
-  // The #839 column proper: the coop fallback tier forced (what a guest gets when the
-  // whole-program emit refuses), same workload.
+  // The #839 column proper: the coop fallback tier forced (what a guest gets when the whole-program
+  // emit refuses), same workload. #1026 slice 4 A/B: sweep the leaf tier-up size floor — `0` = the
+  // old "leaves on" (every emittable leaf tiers up), the production default = "leaves off" for
+  // dispatch leaves. Both must stay parity=OK (the floor changes which tier runs, never the result).
   forcePump = true;
-  try {
-    const pcold = await pumpRun(modBytes, stdin, `bench#${name}#coop`);
-    let pBest = Infinity, pw;
-    for (let i = 0; i < N; i++) {
-      const r = await pumpRun(modBytes, stdin, `bench#${name}#coop`);
-      if (r.ms < pBest) { pBest = r.ms; pw = r; }
+  for (const [label, floor] of [['leaves-on', 0], ['default', DEFAULT_FLOOR], ['leaves-off', 1 << 30]]) {
+    try {
+      ex.temen_coop_set_tierup_floor(floor);
+      const pcold = await pumpRun(modBytes, stdin, `bench#${name}#coop#${label}`);
+      let pBest = Infinity, pw;
+      for (let i = 0; i < N; i++) {
+        ex.temen_coop_set_tierup_floor(floor);
+        const r = await pumpRun(modBytes, stdin, `bench#${name}#coop#${label}`);
+        if (r.ms < pBest) { pBest = r.ms; pw = r; }
+      }
+      const pparity = pw.out === b[0].out && pw.st === b[0].st ? 'parity=OK' : 'parity=MISMATCH';
+      console.log(
+        `${name}: coop-forced [${label} floor=${floor}] cold ${pcold.ms.toFixed(1)}ms, warm best ${pBest.toFixed(1)}ms ` +
+        `(${(bBest / pBest).toFixed(2)}x) | path ${pw.path} | tierups ${pw.tierups} invokes ${pw.invokes} bounces ${pw.bounces} | ${pparity}`,
+      );
+    } catch (e) {
+      console.log(`${name}: coop-forced [${label}] REFUSED/failed (${e.message})`);
     }
-    const pparity = pw.out === b[0].out && pw.st === b[0].st ? 'parity=OK' : 'parity=MISMATCH';
-    console.log(
-      `${name}: coop-forced cold ${pcold.ms.toFixed(1)}ms, warm best ${pBest.toFixed(1)}ms ` +
-      `(${(bBest / pBest).toFixed(2)}x) | path ${pw.path} | tierups ${pw.tierups} invokes ${pw.invokes} bounces ${pw.bounces} | ${pparity}`,
-    );
-  } catch (e) {
-    console.log(`${name}: coop-forced REFUSED/failed (${e.message})`);
   }
+  ex.temen_coop_set_tierup_floor(DEFAULT_FLOOR);
   forcePump = false;
 }

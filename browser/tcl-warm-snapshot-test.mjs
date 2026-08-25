@@ -91,10 +91,18 @@ if (!isolated) { console.log(`  run1: ${JSON.stringify(r1.out)}`); console.log(`
 // whose Tcl_Init re-run trapped) — a regression to `f0` reintroduces the trap this asserts against.
 {
   const opened = ex.temen_warm_jit_open(1);
+  // A setjmp-rooted guest routes `eval_run` to InterpDriven (#1081) and declines here with
+  // STATUS_UNSUPPORTED (2); production then evaluates on the warm interpreter. That's a benign decline,
+  // not the f0 regression this block guards — so treat it as a skip, not a failure.
+  const declined = opened !== 0 && ex.temen_status() === 2;
   const entry = ex.temen_warm_jit_entry_func();
   const jitOk = opened === 0 && entry !== 0;
-  allOk = allOk && jitOk;
-  console.log(`\nwarm+JIT open: status ${opened} (0=OK), entry export f${entry} — ${jitOk ? 'OK — drives eval_run, not the cold _start (f0)' : 'FAIL — eval_run not emittable or entry is f0'}`);
+  if (!declined) allOk = allOk && jitOk;
+  if (declined) {
+    console.log(`\nwarm+JIT open: declined (status 2, eval_run routed to InterpDriven, #1081) — warm+JIT skipped, warm interpreter carries this guest (as in production)`);
+  } else {
+    console.log(`\nwarm+JIT open: status ${opened} (0=OK), entry export f${entry} — ${jitOk ? 'OK — drives eval_run, not the cold _start (f0)' : 'FAIL — eval_run not emittable or entry is f0'}`);
+  }
   if (jitOk) {
     console.log(`\n${'program'.padEnd(12)}${'JIT≡interp'.padStart(11)}`);
     for (const [name, js] of programs) {

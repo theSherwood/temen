@@ -2798,6 +2798,15 @@ async function proveModuleParity(c) {
         await runWarmJit(eng.ex, eng.memory, stdinBytes, `${ex.url}#eval`);
         warmJitOut = readModuleStdout();
       } catch (e) {
+        // A setjmp-rooted guest (e.g. Lua's `lua_pcall`) routes `eval_run` to InterpDriven (#1081), so
+        // `temen_warm_jit_open` declines with STATUS_UNSUPPORTED (2) and this guest has only one warm
+        // tier — the warm interpreter, which already ran above. That's the documented fallback, not a
+        // failure: report the single-tier result rather than erroring the card.
+        if (eng.ex.temen_status() === 2) {
+          setState(c, 'done', `✓ warm-interp only — warm+JIT declined for this guest (setjmp-rooted, ${interpOut.length}B stdout)`);
+          logTo(c, `parity: warm+JIT declined (eval_run → InterpDriven, #1081); warm interpreter carries this guest`);
+          return;
+        }
         setState(c, 'error', `✗ warm+JIT unavailable: ${e.message}`);
         logTo(c, `parity: warm-JIT emit failed: ${e.message}`);
         return;
