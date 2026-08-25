@@ -460,8 +460,8 @@ impl Translator {
     /// The window offset the globals region starts at. A **link unit** (a powerbox program, linked
     /// with the runtime) bases its globals one 16 KiB NULL guard **plus** a scratch page up — at
     /// [`temen_ir::POWERBOX_NULL_GUARD`] + [`temen_ir::POWERBOX_STACK_PAGE`] (32768, #964/#1059/#1091).
-    /// `[0, POWERBOX_NULL_GUARD)` is reserved empty so a NULL deref traps (the module carries the
-    /// `__null_guard` marker — see [`synth_start_unit`]); the guard's scratch page
+    /// `[0, POWERBOX_NULL_GUARD)` is reserved empty so a NULL deref traps (the guard is unconditional —
+    /// #1094, the one canonical layout; see [`synth_start_unit`]); the guard's scratch page
     /// `[POWERBOX_NULL_GUARD, +POWERBOX_STACK_PAGE)` holds the shifted heap-brk words
     /// (`guard + POWERBOX_HEAP_BRK`/`TOP`) and, for an argv program, the args buffer. The data stack
     /// (`$sp` = `powerbox_entry_sp`, above the globals) and heap (above the stack reserve) never

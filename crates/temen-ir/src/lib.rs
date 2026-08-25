@@ -3356,33 +3356,27 @@ pub fn write_args_blob(args: &[&[u8]], env: &[&[u8]]) -> Vec<u8> {
 /// by exactly one guard — and its globals/stack base sits at or above `2 * POWERBOX_NULL_GUARD`.
 pub const POWERBOX_NULL_GUARD: u64 = 16384;
 
-/// The **guard marker**: a function export with this name (aliasing `_start`'s funcidx) declares
-/// that the module was built with the guarded layout — its low scratch lives above
-/// [`POWERBOX_NULL_GUARD`], so a host may seed `[0, POWERBOX_NULL_GUARD)` unmapped and must place
-/// the args blob at the shifted base. A module **without** the marker uses the legacy layout
-/// (scratch from 0, args at [`POWERBOX_ARGS_BASE`]) and is never guarded — old artifacts keep
-/// running unchanged. The marker is **semantics, not observability**: hosts resolve it, so it is
-/// never stripped/demoted (`temen-strip` keeps it like `_start`).
-pub const NULL_GUARD_EXPORT: &str = "__null_guard";
-
-/// The NULL-guard extent of `m`, from its [`NULL_GUARD_EXPORT`] marker: `Some(POWERBOX_NULL_GUARD)`
-/// for a guard-marked module (seed `[0, guard)` unmapped; args at `guard + POWERBOX_ARGS_BASE`),
-/// `None` for a legacy module (no guard; args at [`POWERBOX_ARGS_BASE`]).
-pub fn module_null_guard(m: &Module) -> Option<u64> {
-    m.resolve_export(NULL_GUARD_EXPORT)
-        .map(|_| POWERBOX_NULL_GUARD)
+/// The NULL-guard extent of `m`: always `Some(POWERBOX_NULL_GUARD)` (#1094). The guard is
+/// **unconditional** now — every module reserves `[0, POWERBOX_NULL_GUARD)` so a NULL dereference
+/// traps on every one, the one canonical layout (INVARIANTS #13). (A host still no-ops the seed for a
+/// window smaller than the guard — see `Mem::seed_null_guard` — so tiny sub-windows are unaffected.)
+/// This is the single chokepoint every tier reads the extent from; `_m` is unused (the retired
+/// `__null_guard` marker export it once resolved is gone — #1094), and the `Option` return is kept
+/// only so the many `…unwrap_or(0)` call sites and the wasm-JIT's `Option<u64>` plumbing stay stable.
+pub fn module_null_guard(_m: &Module) -> Option<u64> {
+    Some(POWERBOX_NULL_GUARD)
 }
 
-/// Where a host seeds the args blob for `m` (and where its `_start` reads it): the guarded base for
-/// a [`NULL_GUARD_EXPORT`]-marked module, the legacy [`POWERBOX_ARGS_BASE`] otherwise.
-pub fn module_args_base(m: &Module) -> u64 {
-    module_null_guard(m).map_or(POWERBOX_ARGS_BASE, |g| g + POWERBOX_ARGS_BASE)
+/// Where a host seeds the args blob for `m` (and where its `_start` reads it): the guarded base,
+/// `POWERBOX_NULL_GUARD + POWERBOX_ARGS_BASE`, unconditionally (#1094).
+pub fn module_args_base(_m: &Module) -> u64 {
+    POWERBOX_NULL_GUARD + POWERBOX_ARGS_BASE
 }
 
-/// The exclusive end of `m`'s args region — the bound a host must reject a blob at (the guarded
-/// layout's region is the legacy one shifted up by the guard, same span).
-pub fn module_args_end(m: &Module) -> u64 {
-    module_null_guard(m).map_or(POWERBOX_ARGS_END, |g| g + POWERBOX_ARGS_END)
+/// The exclusive end of `m`'s args region — the bound a host must reject a blob at: the guarded
+/// `POWERBOX_NULL_GUARD + POWERBOX_ARGS_END`, unconditionally (#1094).
+pub fn module_args_end(_m: &Module) -> u64 {
+    POWERBOX_NULL_GUARD + POWERBOX_ARGS_END
 }
 /// The alignment of the powerbox **data-stack base** ([`powerbox_entry_sp`]). It must be **≥ the
 /// largest host page any artifact may run on** — 64 KiB (the wasm linear-memory page) — because the

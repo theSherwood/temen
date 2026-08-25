@@ -30,7 +30,7 @@ block 2 (v4: i64) {
   v6 = thread.spawn 1 v5 v5
   v7 = i64.const 4
   v8 = i64.mul v4 v7
-  v9 = i64.const 16
+  v9 = i64.const 16400
   v10 = i64.add v9 v8
   i32.store v10 v6
   v11 = i64.const 1
@@ -49,7 +49,7 @@ block 4 (v14: i64) {
 block 5 (v17: i64) {
   v18 = i64.const 4
   v19 = i64.mul v17 v18
-  v20 = i64.const 16
+  v20 = i64.const 16400
   v21 = i64.add v20 v19
   v22 = i32.load v21
   v23 = thread.join v22
@@ -58,7 +58,7 @@ block 5 (v17: i64) {
   br 4(v25)
 }
 block 6 () {
-  v26 = i64.const 0
+  v26 = i64.const 16384
   v27 = i64.atomic.load v26
   return v27
   }
@@ -73,7 +73,7 @@ block 1 (v1: i64) {
   br_if v3 3() 2(v1)
 }
 block 2 (v4: i64) {
-  v5 = i64.const 0
+  v5 = i64.const 16384
   v6 = i64.const 1
   v7 = i64.atomic.rmw.add v5 v6
   v8 = i64.const -1
@@ -91,15 +91,15 @@ block 3 () {
 const FUTEX: &str = r#"memory 16
 func () -> (i64) {
 block 0 () {
-  v0 = i64.const 8
+  v0 = i64.const 16392
   v1 = i64.const 987654
   i64.atomic.store v0 v1
   v2 = i64.const 0
   v3 = thread.spawn 1 v2 v2
-  v4 = i64.const 0
+  v4 = i64.const 16384
   v5 = i32.const 1
   i32.atomic.store v4 v5
-  v6 = i64.const 0
+  v6 = i64.const 16384
   v7 = i32.const 1
   v8 = atomic.notify v6 v7
   v9 = thread.join v3
@@ -108,11 +108,11 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, v0: i64) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   v2 = i32.const 0
   v3 = i64.const 1000000000
   v4 = i32.atomic.wait v1 v2 v3
-  v5 = i64.const 8
+  v5 = i64.const 16392
   v6 = i64.atomic.load v5
   return v6
   }
@@ -152,7 +152,7 @@ fn parallel_futex_race_free_under_miri() {
 // 2 worker vCPUs each write "hi\n" to stdout via `cap.call` (handle threaded through block args) + bump
 // a shared counter — exercises the shared `Mutex<Host>` and per-cap.call locking across real threads.
 const CAPS: &str = r#"memory 16
-data 0 "hi\n"
+data 16384 "hi\n"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   vh0 = i64.extend_i32_u v0
@@ -169,7 +169,7 @@ block 2 (vi2: i64, vhh2: i64) {
   vt = thread.spawn 1 vsp vhh2
   v4 = i64.const 4
   v5 = i64.mul vi2 v4
-  v6 = i64.const 16
+  v6 = i64.const 16400
   v7 = i64.add v6 v5
   i32.store v7 vt
   v8 = i64.const 1
@@ -188,7 +188,7 @@ block 4 (vj: i64) {
 block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
-  v15 = i64.const 16
+  v15 = i64.const 16400
   v16 = i64.add v15 v14
   v17 = i32.load v16
   v18 = thread.join v17
@@ -197,7 +197,7 @@ block 5 (vj2: i64) {
   br 4(v20)
 }
 block 6 () {
-  v21 = i64.const 8
+  v21 = i64.const 16392
   v22 = i64.atomic.load v21
   return v22
   }
@@ -205,10 +205,10 @@ block 6 () {
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, vh: i64) {
   vhandle = i32.wrap_i64 vh
-  vptr = i64.const 0
+  vptr = i64.const 16384
   vlen = i64.const 3
   vw = cap.call 0 1 (i64, i64) -> (i64) vhandle(vptr, vlen)
-  v1 = i64.const 8
+  v1 = i64.const 16392
   v2 = i64.const 1
   v3 = i64.atomic.rmw.add v1 v2
   v4 = i64.const 0

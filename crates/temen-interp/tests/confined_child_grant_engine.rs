@@ -20,9 +20,9 @@ const CHILD: &str = r#"memory 16
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vname = i64.const 29542
-  vzero = i64.const 0
+  vzero = i64.const 16384
   i64.store vzero vname
-  vp0 = i64.const 0
+  vp0 = i64.const 16384
   vl2 = i64.const 2
   vh = cap.self.resolve vp0 vl2
   vr = cap.call 13 0 (i64) -> (i64) vh (vp0)
@@ -32,25 +32,25 @@ block 0 (v0: i64) {
 "#;
 
 // The parent (module 0). Entry args: `v0` = Instantiator, `v1` = the granted child `Module` handle,
-// `v2` = the `"fs"` cap handle in the parent's powerbox. It seeds the name `"fs"` at window offset 2048,
-// builds one 16-byte grant record at offset 1024 (`{name_off:u32=2048, name_len:u32=2, handle:i32=v2,
-// flags:u32=0}`), then issues `instantiate_module_named` (op 13) — module `v1`, grant list at
-// `(1024, 1)`, entry 0, carve `off=65536 size_log2=16 quota=0` — and joins the child (op 1), returning
+// `v2` = the `"fs"` cap handle in the parent's powerbox. It seeds the name `"fs"` at window offset 18432
+// (above the #1094 NULL guard), builds one 16-byte grant record at offset 17408 (`{name_off:u32=18432,
+// name_len:u32=2, handle:i32=v2, flags:u32=0}`), then issues `instantiate_module_named` (op 13) —
+// module `v1`, grant list at `(17408, 1)`, entry 0, carve `off=65536 size_log2=16 quota=0` — and joins the child (op 1), returning
 // its result. A correct run returns the granted counter's `1`.
 const PARENT: &str = r#"memory 17
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
   vname = i64.const 29542
-  vnoff = i64.const 2048
+  vnoff = i64.const 18432
   i64.store vnoff vname
-  vrec0 = i64.const 8589936640
-  vrecoff = i64.const 1024
+  vrec0 = i64.const 8589953024
+  vrecoff = i64.const 17408
   i64.store vrecoff vrec0
   vfsh = i64.extend_i32_u v2
-  vrec1off = i64.const 1032
+  vrec1off = i64.const 17416
   i64.store vrec1off vfsh
   vmh = i64.extend_i32_u v1
-  vgptr = i64.const 1024
+  vgptr = i64.const 17408
   vgn = i64.const 1
   ventry = i64.const 0
   voff = i64.const 65536

@@ -2253,10 +2253,10 @@ pub struct CompiledModule {
     win_reserved: usize,
     win_size: usize,
     mem_size_log2: Option<u8>,
-    /// #964: the module's NULL guard (`0` = unguarded). Captured at compile from the
-    /// `__null_guard` marker export; each run `mprotect`s `[0, guard)` inaccessible after the
-    /// window is seeded, so a NULL dereference faults into the §5 guard exactly where the
-    /// interpreter's `Unmapped`-seeded page map traps. Always `0` for a §14 sub-window compile
+    /// #964/#1094: the module's NULL guard (`0` = unguarded). Captured at compile from
+    /// [`temen_ir::module_null_guard`] (unconditional now — #1094); each run `mprotect`s `[0, guard)`
+    /// inaccessible after the window is seeded, so a NULL dereference faults into the §5 guard exactly
+    /// where the interpreter's `Unmapped`-seeded page map traps. Always `0` for a §14 sub-window compile
     /// (a carve child mirrors the interpreter's unguarded sub-window).
     null_guard: u64,
     /// Initialized data segments, owned so a run can seed a fresh window (the module may

@@ -258,17 +258,6 @@ pub struct TranslateOptions {
     /// data stack (which would fault under D40). Must be a power of two `≥` [`temen_ir::POWERBOX_ARGS_END`].
     /// Defaults to [`DEFAULT_STACK_PAGE`] (native). See [`DEFAULT_STACK_PAGE`] for why.
     pub stack_page: u64,
-    /// **Trap-on-NULL layout** (#964): lay the powerbox low scratch (handle stash, heap words,
-    /// format buffer, args blob) out **one guard above zero** — shifted up by
-    /// [`temen_ir::POWERBOX_NULL_GUARD`] — and mark the module with the
-    /// [`temen_ir::NULL_GUARD_EXPORT`] function export, so a host may seed `[0, guard)` unmapped and
-    /// every NULL dereference traps like native platforms. `stack_page` is raised to at least
-    /// `guard + POWERBOX_ARGS_END` (32 KiB) so the globals base clears the shifted args region.
-    /// **On by default** (#1094) — every temen-llvm producer emits the guarded layout, the one
-    /// canonical form (INVARIANTS #13). The `--null-guard` CLI flag is now redundant (it only sets
-    /// this to the value it already has); setting `null_guard: false` still yields the legacy layout,
-    /// migration scaffolding retained only until the legacy path is deleted (#1094 step 3).
-    pub null_guard: bool,
     /// **§14 child-entry mode** (#1011 slice 3c): synthesize the powerbox entry (`_start`, function 0)
     /// with the `instantiate_module` child ABI — `(i64 starter) -> (i64 status)` — instead of the
     /// paramless top-level powerbox entry, so a guest-orchestrated driver can `instantiate_module`
@@ -288,7 +277,6 @@ impl Default for TranslateOptions {
         Self {
             stub_unresolved_externs: false,
             stack_page: DEFAULT_STACK_PAGE,
-            null_guard: true, // #1094: guarded layout is the default (the one canonical form)
             child_entry: false,
         }
     }
@@ -507,13 +495,10 @@ fn translate_impl(
     // The RO/writable page-isolation granularity is a per-target knob (native 16 KiB, wasm 64 KiB).
     // Fail closed on a nonsensical value: it must be a power of two and leave room for the §3e args
     // buffer below the globals base (`globals_base == stack_page` for a powerbox program).
-    // #964 guarded layout: the low scratch shifts up by one NULL guard; `scratch` offsets every
-    // low-window address the synthesized code touches (0 = the legacy layout, byte-identical).
-    let scratch = if opts.null_guard {
-        temen_ir::POWERBOX_NULL_GUARD
-    } else {
-        0
-    };
+    // #964/#1094 guarded layout: the low scratch always shifts up by one NULL guard (the one
+    // canonical form — INVARIANTS #13); `scratch` offsets every low-window address the synthesized
+    // code touches, keeping `[0, POWERBOX_NULL_GUARD)` empty so a host seeds it unmapped.
+    let scratch = temen_ir::POWERBOX_NULL_GUARD;
     // Under the guard the globals base must clear the *shifted* args region — raise a too-small
     // (e.g. defaulted) stack_page to the guarded minimum rather than failing (the knob's documented
     // behavior); an explicit larger value (the browser's 65536) is untouched.
@@ -1323,22 +1308,10 @@ fn translate_impl(
                         },
                     );
                 }
-                // #964/#1094 guarded layout: the `__null_guard` marker export declares that
-                // `[0, guard)` is empty (the shifted low scratch / globals base), so a host seeds it
-                // unmapped and a NULL dereference traps. It rides `_start`'s funcidx for a powerbox
-                // program and the **first defined function** for an entry-less kernel (funcidx 0 either
-                // way — `base == synth as u32`), so reactor kernels stop being a legacy carve-out. The
-                // funcidx value is immaterial: `module_null_guard` only checks the export resolves.
-                // Semantics, not observability — hosts resolve it; `temen-strip` never demotes it.
-                if scratch > 0 {
-                    ex.insert(
-                        synth as usize,
-                        temen_ir::Export {
-                            name: temen_ir::NULL_GUARD_EXPORT.to_string(),
-                            func: 0,
-                        },
-                    );
-                }
+                // #964/#1094: the low scratch / globals base sits one guard up (`[0, guard)` empty) so a
+                // host seeds it unmapped and a NULL dereference traps — unconditionally, for a powerbox
+                // program and an entry-less reactor kernel alike. The `__null_guard` marker export is
+                // retired (#1094): the guard is the one canonical layout now, no opt-in signal needed.
                 ex
             },
             // §6 debug-info waist: the source-line half, mapped from each LLVM `!DILocation` (the

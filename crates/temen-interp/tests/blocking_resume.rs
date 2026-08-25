@@ -28,7 +28,7 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vexp = i32.const 0
   vto = i64.const 10000000
   vst = i32.atomic.wait vaddr vexp vto
@@ -62,11 +62,11 @@ fn block_resume_idles_on_a_timed_wait_then_completes() {
 }
 
 /// The **cross-vCPU wake**: the root spawns a worker (vCPU 1), creates a fiber that futex-waits
-/// (untimed) on cell 8, and `cont.resume.block`s it — idling vCPU 0 with no timer at all. The
-/// worker stores 7 into cell 8 and `notify`s it; the fiber's wake (`wake_blocked` + `svc_wake`)
-/// re-admits the idle resumer, which resumes the fiber to completion. Nothing here has a
-/// deadline, so only the wake path can make progress: completing at all proves it. The fiber
-/// returns `WAIT_WOKEN(0)*100 + mem[8]`; the root returns `status*10 + that` after joining.
+/// (untimed) on cell 16392 (above the #1094 NULL guard), and `cont.resume.block`s it — idling vCPU 0
+/// with no timer at all. The worker stores 7 into that cell and `notify`s it; the fiber's wake
+/// (`wake_blocked` + `svc_wake`) re-admits the idle resumer, which resumes the fiber to completion.
+/// Nothing here has a deadline, so only the wake path can make progress: completing at all proves it.
+/// The fiber returns `WAIT_WOKEN(0)*100 + mem[16392]`; the root returns `status*10 + that` after joining.
 /// Composite: RETURNED(1)*10 + (0 + 7) = 17.
 const BLOCK_ON_NOTIFY: &str = r#"
 memory 16
@@ -87,14 +87,14 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 8
+  vaddr = i64.const 16392
   vexp = i32.const 0
   vto = i64.const -1
   vst = i32.atomic.wait vaddr vexp vto
   vst64 = i64.extend_i32_s vst
   vk = i64.const 100
   vsx = i64.mul vst64 vk
-  vm8a = i64.const 8
+  vm8a = i64.const 16392
   vm8 = i64.load vm8a
   vsum = i64.add vsx vm8
   return vsum
@@ -102,10 +102,10 @@ block 0 (vsp: i64, varg: i64) {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vm8a = i64.const 8
+  vm8a = i64.const 16392
   vseven = i64.const 7
   i64.store vm8a vseven
-  vaddr = i64.const 8
+  vaddr = i64.const 16392
   vcnt = i32.const 1
   vw = atomic.notify vaddr vcnt
   vz = i64.const 0
@@ -155,7 +155,7 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vexp = i32.const 0
   vto = i64.const -1
   vst = i32.atomic.wait vaddr vexp vto

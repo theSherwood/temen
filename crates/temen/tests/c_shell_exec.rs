@@ -219,8 +219,8 @@ fn run(
     // Link the shell's imports to their interfaces; the guest discovers the handles by reflection.
     let m = temen_ir::resolve_imports_with(shell, link_shim).expect("resolve");
     verify_module(&m).expect("verify shell");
-    // Seed the shell's own args buffer where its guard-shifted `_start` reads it (#1059:
-    // `module_args_base` = guard + POWERBOX_ARGS_BASE for the `__null_guard`-marked shell).
+    // Seed the shell's own args buffer where its guard-shifted `_start` reads it (#1059/#1094:
+    // `module_args_base` = guard + POWERBOX_ARGS_BASE, the unconditional guarded layout).
     let mut init = vec![0u8; win];
     let blob = args_blob(argv);
     let args_base = temen_ir::module_args_base(&m) as usize;

@@ -19,18 +19,18 @@ memory 16
 func (i32) -> () {
 block 0 (vout: i32) {
   v0 = i64.const 64
-  v1 = i64.const 0
+  v1 = i64.const 16384
   i64.store v1 v0
   return
   }
 }
 func (i32) -> () {
 block 0 (vout: i32) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vc = i64.load vaddr
   vc2 = call 2 (vc)
   i64.store vaddr vc2
-  vptr = i64.const 0
+  vptr = i64.const 16384
   vlen = i64.const 1
   vw = cap.call 0 1 (i64, i64) -> (i64) vout(vptr, vlen)
   return

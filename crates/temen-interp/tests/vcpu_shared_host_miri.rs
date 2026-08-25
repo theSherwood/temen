@@ -15,7 +15,7 @@ use temen_text::parse_module;
 // 2 worker vCPUs each write "hi\n" to stdout via `cap.call` (handle threaded through block args) +
 // bump a shared counter — real concurrent `cap.call` on the one `Mutex<Host>` across threads.
 const CAPS: &str = r#"memory 16
-data 0 "hi\n"
+data 16384 "hi\n"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   vh0 = i64.extend_i32_u v0
@@ -32,7 +32,7 @@ block 2 (vi2: i64, vhh2: i64) {
   vt = thread.spawn 1 vsp vhh2
   v4 = i64.const 4
   v5 = i64.mul vi2 v4
-  v6 = i64.const 16
+  v6 = i64.const 16400
   v7 = i64.add v6 v5
   i32.store v7 vt
   v8 = i64.const 1
@@ -51,7 +51,7 @@ block 4 (vj: i64) {
 block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
-  v15 = i64.const 16
+  v15 = i64.const 16400
   v16 = i64.add v15 v14
   v17 = i32.load v16
   v18 = thread.join v17
@@ -60,7 +60,7 @@ block 5 (vj2: i64) {
   br 4(v20)
 }
 block 6 () {
-  v21 = i64.const 8
+  v21 = i64.const 16392
   v22 = i64.atomic.load v21
   return v22
   }
@@ -68,10 +68,10 @@ block 6 () {
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, vh: i64) {
   vhandle = i32.wrap_i64 vh
-  vptr = i64.const 0
+  vptr = i64.const 16384
   vlen = i64.const 3
   vw = cap.call 0 1 (i64, i64) -> (i64) vhandle(vptr, vlen)
-  v1 = i64.const 8
+  v1 = i64.const 16392
   v2 = i64.const 1
   v3 = i64.atomic.rmw.add v1 v2
   v4 = i64.const 0

@@ -1,14 +1,13 @@
 //! **#964/#1094 — the NULL guard reaches entry-less kernels too.** A reactor kernel (a `tick`-only
 //! module: no `main`, so temen-llvm synthesizes no powerbox `_start`) used to be a legacy carve-out:
-//! the `__null_guard` marker rode the synthesized `_start`, and an entry-less module's globals sat at
-//! `DATA_BASE` (16) — *inside* the would-be guard region — so it could never be seeded `Unmapped`.
+//! an entry-less module's globals sat at `DATA_BASE` (16) — *inside* the would-be guard region — so it
+//! could never be seeded `Unmapped`.
 //!
-//! This pins the fix: under the guard an entry-less module (a) bases its globals one guard up
-//! (`scratch + DATA_BASE`), leaving `[0, guard)` empty, and (b) exports the `__null_guard` marker
-//! (aliasing its first function), so a marker-aware host seeds the reserved region `Unmapped` and a
-//! NULL dereference traps — exactly like the `_start` path. Legacy (flag off) stays byte-identical, and
-//! the guarded kernel computes the same result as the legacy one. No clang: the fixture is inline
-//! textual LLVM IR, so this runs in every job.
+//! This pins the fix: an entry-less module bases its globals one guard up (`scratch + DATA_BASE`),
+//! leaving `[0, guard)` empty, so a host seeds the reserved region `Unmapped` and a NULL dereference
+//! traps — exactly like the `_start` path, and **unconditionally** (#1094 — the one canonical layout;
+//! no `__null_guard` marker export needed). No clang: the fixture is inline textual LLVM IR, so this
+//! runs in every job.
 
 use temen_interp::Value;
 
@@ -27,54 +26,50 @@ entry:
 
 /// Translate the kernel, returning the module and the data-stack base (`$sp`) temen-llvm prepends to
 /// every on-ramp function — the leading argument `tick` expects.
-fn translate(null_guard: bool) -> (temen_ir::Module, i64) {
-    let opts = temen_llvm::TranslateOptions {
-        null_guard,
-        ..Default::default()
-    };
-    let t = temen_llvm::translate_ll_str_with_options(KERNEL, opts).expect("translate kernel");
+fn translate() -> (temen_ir::Module, i64) {
+    let t = temen_llvm::translate_ll_str_with_options(
+        KERNEL,
+        temen_llvm::TranslateOptions::default(),
+    )
+    .expect("translate kernel");
     temen_verify::verify_module(&t.module).expect("verify kernel");
     (t.module, t.entry_sp as i64)
 }
 
-/// Guarded entry-less kernel: marked, globals shifted above the guard so `[0, guard)` is empty; legacy
-/// stays unmarked with globals at `DATA_BASE`. Both compute `tick(x) = 100 + x` identically.
+/// The guarded entry-less kernel: globals shifted above the guard so `[0, guard)` is empty, still
+/// entry-less (no synthesized `_start`), and `tick(x) = 100 + x`.
 #[test]
 fn entryless_kernel_is_guarded_and_keeps_the_null_region_empty() {
     let guard = temen_ir::POWERBOX_NULL_GUARD;
-    let (legacy, legacy_sp) = translate(false);
-    let (guarded, guarded_sp) = translate(true);
+    let (kernel, sp) = translate();
 
-    // The marker: absent on legacy, present on the guarded kernel even though it has no `_start`.
+    // The guard is unconditional (#1094) even though the kernel has no `_start`.
     assert_eq!(
-        temen_ir::module_null_guard(&legacy),
-        None,
-        "legacy: no marker"
-    );
-    assert_eq!(
-        temen_ir::module_null_guard(&guarded),
+        temen_ir::module_null_guard(&kernel),
         Some(guard),
-        "guarded entry-less kernel carries the `__null_guard` marker"
+        "the guard is unconditional for an entry-less kernel too"
     );
     assert!(
-        !temen_run::is_named_powerbox_entry(&guarded),
-        "still entry-less — the marker does not turn it into a powerbox `_start`"
+        !temen_run::is_named_powerbox_entry(&kernel),
+        "still entry-less — no synthesized powerbox `_start`"
+    );
+    // No stale marker export is emitted any more.
+    assert_eq!(
+        kernel.resolve_export("__null_guard"),
+        None,
+        "the retired `__null_guard` marker export is not emitted (#1094)"
     );
 
     // The reserved NULL region is empty: every data segment (the global `g`) starts at or above the
-    // guard on the guarded kernel, and below it on legacy (globals at `DATA_BASE`).
+    // guard, so a host can seed `[0, guard)` `Unmapped` without clobbering a live byte.
     assert!(
-        guarded.data.iter().all(|d| d.offset >= guard),
-        "guarded: no data segment intrudes on [0, {guard})"
-    );
-    assert!(
-        legacy.data.iter().any(|d| d.offset < guard),
-        "legacy: globals sit low (at DATA_BASE), the carve-out this fixes"
+        kernel.data.iter().all(|d| d.offset >= guard),
+        "no data segment intrudes on [0, {guard})"
     );
 
-    // Behavior parity: the shift is pure relocation — `tick(x) = g + x = 100 + x` on both. The
-    // interpreter sets up the module's own window and applies its baked data (the `g = 100`
-    // initializer); `tick` takes the prepended `$sp` then `x`.
+    // Behavior: the shift is pure relocation — `tick(x) = g + x = 100 + x`. The interpreter sets up
+    // the module's own window and applies its baked data (the `g = 100` initializer); `tick` takes the
+    // prepended `$sp` then `x`.
     let tick = |m: &temen_ir::Module, sp: i64, x: i64| -> i64 {
         let idx = m
             .exports
@@ -92,11 +87,10 @@ fn entryless_kernel_is_guarded_and_keeps_the_null_region_empty() {
         }
     };
     for x in [0i64, 5, 42] {
-        assert_eq!(tick(&legacy, legacy_sp, x), 100 + x, "legacy tick({x})");
         assert_eq!(
-            tick(&guarded, guarded_sp, x),
+            tick(&kernel, sp, x),
             100 + x,
-            "guarded tick({x}) — same value, shifted layout"
+            "guarded tick({x}) — shifted layout, same value"
         );
     }
 }

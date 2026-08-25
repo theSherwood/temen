@@ -15,10 +15,11 @@ fn module(text: &str) -> Arc<temen_ir::Module> {
     Arc::new(m)
 }
 
-/// Two dispatches: `park` (op 0) futex-waits on cell 0 (forever) — parking its HANDLER, not
-/// the domain — and `wake` (op 1), served *while `park` is parked*, stores 5 at cell 8 and
-/// notifies cell 0. The woken `park` handler then resumes, reads cell 8, and returns
-/// `status*100 + mem[8]` = 0*100 + 5 — proving it continued past its park AFTER `wake`'s
+/// Two dispatches: `park` (op 0) futex-waits on cell 16384 (forever) — parking its HANDLER, not
+/// the domain — and `wake` (op 1), served *while `park` is parked*, stores 5 at cell 16392 and
+/// notifies cell 16384. The woken `park` handler then resumes, reads cell 16392, and returns
+/// `status*100 + mem[16392]` = 0*100 + 5 — proving it continued past its park AFTER `wake`'s
+/// (cells above the #1094 NULL guard)
 /// store (one world, ordered). `svc.poll` completes both: main returns 2.
 const PARK_THEN_WAKE: &str = r#"
 memory 16
@@ -36,14 +37,14 @@ block 0 () {
 
 func () -> (i64) {
 block 0 () {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vexp = i32.const 0
   vto = i64.const -1
   vst = i32.atomic.wait vaddr vexp vto
   vst64 = i64.extend_i32_s vst
   vk = i64.const 100
   va = i64.mul vst64 vk
-  vm8a = i64.const 8
+  vm8a = i64.const 16392
   vm8 = i64.load vm8a
   vr = i64.add va vm8
   return vr
@@ -52,10 +53,10 @@ block 0 () {
 
 func () -> (i64) {
 block 0 () {
-  vm8a = i64.const 8
+  vm8a = i64.const 16392
   vfive = i64.const 5
   i64.store vm8a vfive
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vcnt = i32.const 1
   vw = atomic.notify vaddr vcnt
   vw64 = i64.extend_i32_s vw
@@ -104,7 +105,7 @@ block 0 () {
 func (i64) -> (i64) {
 block 0 (varg: i64) {
   vh = i32.wrap_i64 varg
-  vbuf = i64.const 8
+  vbuf = i64.const 16392
   vcap = i64.const 4
   vr = cap.call 0 0 (i64, i64) -> (i64) vh (vbuf, vcap)
   return vr
@@ -161,7 +162,7 @@ block 0 () {
 
 func () -> (i64) {
 block 0 () {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vexp = i32.const 0
   vto = i64.const 50000000
   vst = i32.atomic.wait vaddr vexp vto

@@ -371,8 +371,9 @@ fn coop_tierup_fiber_scheduler_matches_pure_interp() {
 }
 
 // #926 differential (the issue's "Differentials" list): a **single-threaded, cooperative live futex**
-// wake cell whose compute leaf tiers up. The root creates a fiber that untimed-`atomic.wait`s on cell 0
-// (parking the FIBER, not the vCPU — the root keeps running), `atomic.notify`s the cell to wake it, runs
+// wake cell whose compute leaf tiers up. The root creates a fiber that untimed-`atomic.wait`s on cell
+// 16384 (above the #1094 NULL guard) (parking the FIBER, not the vCPU — the root keeps running),
+// `atomic.notify`s the cell to wake it, runs
 // it to completion, then calls the eligible compute leaf (`f(x) = 3x + 7`). The whole run — the live
 // futex park/wake handshake AND the tier-up — must match the pure-interp cooperative oracle. No
 // `thread.spawn`: the wake is delivered within the one vCPU, the `uses_futex` shape #845 gates on.
@@ -386,7 +387,7 @@ block 0 () {
   vz = i64.const 0
   vs1, vv1 = cont.resume vk vz
   vs2, vv2 = cont.resume vk vz
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vcnt = i32.const 1
   vw = atomic.notify vaddr vcnt
   vs3, vv3 = cont.resume vk vz
@@ -398,7 +399,7 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vexp = i32.const 0
   vto = i64.const -1
   vst = i32.atomic.wait vaddr vexp vto

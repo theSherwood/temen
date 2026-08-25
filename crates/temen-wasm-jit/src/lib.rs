@@ -1379,9 +1379,9 @@ pub fn analyze_from(m: &Module, entry: u32) -> Analysis {
         .iter()
         .map(|f| func_in_subset(m, f, atomics_ok))
         .collect();
-    // #1004: a `__null_guard`-marked module's bulk-memory span check now carries the guard low bound
-    // ([`emit_span_check`]), so bulk-mem functions stay in-subset and emit — the #964 exclusion is
-    // retired. (Unmarked modules were never affected: their span check emits byte-identically.)
+    // #1004: the bulk-memory span check carries the guard low bound ([`emit_span_check`]), so bulk-mem
+    // functions stay in-subset and emit — the #964 exclusion is retired. (#1094: the guard is
+    // unconditional now, so every module's span check carries it.)
     // The size valve then keeps a rare over-limit body (the SQLite VDBE dispatcher) off the wasm
     // tier so the whole-module emit clears the engine's per-function limit.
     cap_oversized(m, &mut in_subset);
@@ -1510,7 +1510,7 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
         None,
         false,
         None,
-        temen_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
+        temen_ir::module_null_guard(m), // #964/#1094: the guard is unconditional on every entry
     )
 }
 
@@ -1695,7 +1695,7 @@ pub fn compile_module_b2(
         Some(table_log2),
         false,
         None,
-        temen_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
+        temen_ir::module_null_guard(m), // #964/#1094: the guard is unconditional on every entry
     )
 }
 
@@ -2035,7 +2035,7 @@ pub fn compile_module_reactor_budgeted(
             None,
             false,
             None,
-            temen_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
+            temen_ir::module_null_guard(m), // #964/#1094: the guard is unconditional on every entry
         )?;
         // Measure the emitted bodies and pull any over-large *marshallable* one out for a re-emit as a
         // cross-tier leaf. An over-large body that can't be crossed (non-marshallable sig) has nowhere
@@ -2123,7 +2123,7 @@ pub fn compile_module_reactor_keep(
         None,
         false,
         None,
-        temen_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
+        temen_ir::module_null_guard(m), // #964/#1094: the guard is unconditional on every entry
     )?;
     Ok((wasm, emitted_bitmap))
 }
@@ -2298,10 +2298,10 @@ pub fn compile_module_tierup_paged(
 /// interpreted (the span check has no low bound), same limit as paged mode.
 ///
 /// Since the #964 ABI landed this is the **measurement/override** entry: production compiles derive
-/// the guard from the module's `__null_guard` marker on every standard entry (see
-/// [`compile_module_tierup_inner`]), so a marked module needs no special entry. This one forces an
-/// arbitrary `guard` on an *unmarked* module — what `paged_bench_emit` / `bench_paged.mjs` emit +
-/// time as a third variant.
+/// the guard from [`temen_ir::module_null_guard`] on every standard entry (see
+/// [`compile_module_tierup_inner`]) — unconditional since #1094 — so no module needs a special entry.
+/// This one forces an arbitrary `guard` (or `0` to measure unguarded) — what `paged_bench_emit` /
+/// `bench_paged.mjs` emit + time as a third variant.
 pub fn compile_module_tierup_nullguard(
     m: &Module,
     shared_memory: bool,
@@ -2328,10 +2328,10 @@ fn compile_module_tierup_inner(
     null_guard: Option<u64>,
     module_budget: usize,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
-    // #964: a `__null_guard`-marked module opts every tier into the NULL guard — derive it from the
-    // marker whenever the caller didn't force one (the measurement entry still can), so the plain
-    // tier-up entries stay trap-parity with the interpreter oracle, which seeds `[0, guard)`
-    // `Unmapped` for marked modules. Unmarked modules keep `None` (byte-identical emit).
+    // #964/#1094: every module opts into the NULL guard — derive it from `module_null_guard`
+    // (unconditional now) whenever the caller didn't force one (the measurement entry still can), so
+    // the plain tier-up entries stay trap-parity with the interpreter oracle, which seeds
+    // `[0, guard)` `Unmapped` for every module.
     let null_guard = null_guard.or_else(|| temen_ir::module_null_guard(m));
     let n = m.funcs.len();
     // Track 3 (c)+(a): a page-op module (`map`/`unmap`/`protect`) can't be accelerated on the

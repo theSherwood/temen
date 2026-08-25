@@ -1225,8 +1225,8 @@ impl Debuggee for BytecodeBackend {
             (
                 "stack",
                 Json::obj(vec![
-                    // #964: a `__null_guard`-marked module's args blob (and low scratch) sits one
-                    // guard up — report where THIS module actually reads it.
+                    // #964/#1094: a module's args blob (and low scratch) sits one guard up (the
+                    // unconditional guarded layout) — report where THIS module actually reads it.
                     (
                         "argsBase",
                         Json::i(temen_ir::module_args_base(&self.module) as i64),

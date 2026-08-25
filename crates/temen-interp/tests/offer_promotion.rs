@@ -26,7 +26,7 @@ fn timed_wait_provider() -> temen_ir::Module {
         "memory 16\n\
          func () -> (i64) {\n\
          block 0 () {\n\
-           vaddr = i64.const 0\n\
+           vaddr = i64.const 16384\n\
            vexp = i32.const 0\n\
            vto = i64.const 2000000\n\
            vst = i32.atomic.wait vaddr vexp vto\n\
@@ -108,7 +108,7 @@ fn forever_wait_provider() -> temen_ir::Module {
         "memory 16\n\
          func () -> (i64) {\n\
          block 0 () {\n\
-           vaddr = i64.const 0\n\
+           vaddr = i64.const 16384\n\
            vexp = i32.const 0\n\
            vto = i64.const -1\n\
            vst = i32.atomic.wait vaddr vexp vto\n\
@@ -141,7 +141,7 @@ fn teardown_abandons_a_promoted_daemon() {
          block 0 () {{\n\
            v0 = i64.const 0\n\
            v1 = thread.spawn 1 v0 v0\n\
-           v2 = i64.const 8\n\
+           v2 = i64.const 16392\n\
            v3 = i32.const 0\n\
            v4 = i64.const 5000000\n\
            v5 = i32.atomic.wait v2 v3 v4\n\
@@ -192,10 +192,10 @@ fn const_provider(value: i64) -> temen_ir::Module {
 fn outer_provider(inner_tid: u32) -> temen_ir::Module {
     module(&format!(
         "memory 16\n\
-         data 0 \"inner\"\n\
+         data 16384 \"inner\"\n\
          func () -> (i64) {{\n\
          block 0 () {{\n\
-           vp = i64.const 0\n\
+           vp = i64.const 16384\n\
            vn = i64.const 5\n\
            vh = cap.self.resolve vp vn\n\
            vr = cap.call {inner_tid} 0 () -> (i64) vh ()\n\
@@ -273,7 +273,7 @@ fn a_nested_inner_handler_promotes_under_its_caller_handlers_animation() {
 fn self_recursive_provider(tid: u32) -> temen_ir::Module {
     module(&format!(
         "memory 16\n\
-         data 0 \"me\"\n\
+         data 16384 \"me\"\n\
          func (i64) -> (i64) {{\n\
          block 0 (vd: i64) {{\n\
            vzero = i64.const 0\n\
@@ -283,7 +283,7 @@ fn self_recursive_provider(tid: u32) -> temen_ir::Module {
          block 1 (vd: i64) {{\n\
            vone = i64.const 1\n\
            vd1 = i64.sub vd vone\n\
-           vp = i64.const 0\n\
+           vp = i64.const 16384\n\
            vn = i64.const 2\n\
            vh = cap.self.resolve vp vn\n\
            vr = cap.call {tid} 0 (i64) -> (i64) vh (vd1)\n\

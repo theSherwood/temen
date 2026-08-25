@@ -1,10 +1,9 @@
-//! **#964 oracle enforcement** — the NULL guard on the interpreter tiers. A `__null_guard`-marked
-//! module's window seeds `[0, POWERBOX_NULL_GUARD)` `Unmapped` at init, so a NULL dereference traps
-//! `MemoryFault` on the tree-walker AND the bytecode engine (the tier differential), while an
-//! unmarked twin of the same code keeps the legacy behavior (low loads read zeros, low stores
-//! land). The reserved region is also **refused** to the page ops (`unmap` below the guard returns
-//! a negative errno — the `mmap_min_addr` analogue that keeps the JIT tiers' baked guard constant
-//! sound), and legal page ops above the guard still work.
+//! **#964 / #1094 oracle enforcement** — the NULL guard on the interpreter tiers. Every module's
+//! window seeds `[0, POWERBOX_NULL_GUARD)` `Unmapped` at init (the guard is **unconditional** now —
+//! #1094, the one canonical layout), so a NULL dereference traps `MemoryFault` on the tree-walker
+//! AND the bytecode engine (the tier differential). The reserved region is also **refused** to the
+//! page ops (`unmap` below the guard returns a negative errno — the `mmap_min_addr` analogue that
+//! keeps the JIT tiers' baked guard constant sound), and legal page ops above the guard still work.
 
 use std::sync::Arc;
 
@@ -35,13 +34,9 @@ block 0 (vas: i32, voff: i64, vlen: i64) {
 }
 "#;
 
-fn module(marked: bool) -> temen_ir::Module {
-    let marker = if marked {
-        "export 1 func \"__null_guard\" 0\n"
-    } else {
-        ""
-    };
-    let src = format!("memory 17\nexport 0 func \"_start\" 0\n{marker}{BODY}");
+/// A plain powerbox module — no marker needed (#1094: the guard is unconditional).
+fn module() -> temen_ir::Module {
+    let src = format!("memory 17\nexport 0 func \"_start\" 0\n{BODY}");
     let m = temen_text::parse_module(&src).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     m
@@ -65,42 +60,35 @@ fn byte(m: &temen_ir::Module, func: u32, arg: i64) -> Result<i64, Trap> {
         })
 }
 
-/// NULL loads and stores trap on a marked module — on both engines — and stay legal on the
-/// unmarked twin; the first mapped address above the guard works on both.
+/// NULL loads and stores trap on every module — on both engines — while the first mapped address
+/// above the guard works on both. #1094: no marker, the guard is unconditional.
 #[test]
-fn marked_null_access_traps_on_both_engines() {
-    let marked = module(true);
-    let legacy = module(false);
+fn null_access_traps_on_both_engines() {
+    let m = module();
     for (func, what) in [(0u32, "load"), (1u32, "store")] {
         for probe in [0i64, 8, GUARD - 8, GUARD - 1] {
             assert_eq!(
-                tree(&marked, func, probe),
+                tree(&m, func, probe),
                 Err(Trap::MemoryFault),
                 "tree-walk {what}({probe}) must trap under the guard"
             );
             assert_eq!(
-                byte(&marked, func, probe),
+                byte(&m, func, probe),
                 Err(Trap::MemoryFault),
                 "bytecode {what}({probe}) must trap under the guard"
             );
-            assert!(
-                tree(&legacy, func, probe).is_ok() && byte(&legacy, func, probe).is_ok(),
-                "unmarked twin keeps the legacy behavior at {probe}"
-            );
         }
-        // At and above the guard: legal on every tier, marked or not.
+        // At and above the guard: legal on every tier.
         for probe in [GUARD, (1 << 17) - 8] {
-            for m in [&marked, &legacy] {
-                assert!(tree(m, func, probe).is_ok(), "tree {what}({probe}) admits");
-                assert!(byte(m, func, probe).is_ok(), "byte {what}({probe}) admits");
-            }
+            assert!(tree(&m, func, probe).is_ok(), "tree {what}({probe}) admits");
+            assert!(byte(&m, func, probe).is_ok(), "byte {what}({probe}) admits");
         }
     }
 }
 
 /// The reserved region is refused to the page ops: `unmap` below the guard returns a negative
-/// errno on a marked module (and is unchanged on the unmarked twin); an `unmap` above the guard
-/// stays legal on both. Runs on the bytecode powerbox harness (the cap needs a granted handle).
+/// errno; an `unmap` at/above the guard stays legal. Runs on the bytecode powerbox harness (the cap
+/// needs a granted handle).
 #[test]
 fn page_ops_below_the_guard_are_refused() {
     let win = 1usize << 17;
@@ -137,25 +125,19 @@ fn page_ops_below_the_guard_are_refused() {
         r
     };
 
-    let marked = module(true);
-    let legacy = module(false);
+    let m = module();
     let page = temen_interp::host_page_size() as i64;
     assert!(
-        unmap(&marked, 0, GUARD) < 0,
+        unmap(&m, 0, GUARD) < 0,
         "unmap of the reserved NULL region is refused"
     );
     assert!(
-        unmap(&marked, GUARD - page, page) < 0,
+        unmap(&m, GUARD - page, page) < 0,
         "unmap of the guard's last page is refused"
     );
     assert_eq!(
-        unmap(&marked, GUARD, page),
+        unmap(&m, GUARD, page),
         0,
         "unmap at the guard boundary is legal"
-    );
-    assert_eq!(
-        unmap(&legacy, 0, page),
-        0,
-        "the unmarked twin keeps legacy page-op behavior"
     );
 }

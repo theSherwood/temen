@@ -27,7 +27,7 @@ func (i32) -> (i64) {
 block 0 (v0: i32) {
   vh64 = i64.extend_i32_u v0
   vt = thread.spawn 1 vh64 vh64
-  vbuf = i64.const 8
+  vbuf = i64.const 16392
   vcap = i64.const 4
   vr = cap.call 0 0 (i64, i64) -> (i64) v0 (vbuf, vcap)
   vj = thread.join vt
@@ -36,7 +36,7 @@ block 0 (v0: i32) {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, vharg: i64) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vexp = i32.const 0
   vto = i64.const 100000000
   vw = i32.atomic.wait vaddr vexp vto
@@ -71,7 +71,7 @@ memory 16
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   vc = cap.call 0 2 () -> (i64) v0 ()
-  vbuf = i64.const 8
+  vbuf = i64.const 16392
   vcap = i64.const 4
   vr = cap.call 0 0 (i64, i64) -> (i64) v0 (vbuf, vcap)
   return vr
@@ -105,7 +105,7 @@ func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
   vh64 = i64.extend_i32_u v1
   vt = thread.spawn 1 vh64 vh64
-  vbuf = i64.const 8
+  vbuf = i64.const 16392
   vcap = i64.const 4
   vr = cap.call 0 0 (i64, i64) -> (i64) v0 (vbuf, vcap)
   vj = thread.join vt
@@ -114,7 +114,7 @@ block 0 (v0: i32, v1: i32) {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, vharg: i64) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vexp = i32.const 0
   vto = i64.const 100000000
   vw = i32.atomic.wait vaddr vexp vto

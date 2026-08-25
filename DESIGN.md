@@ -1044,21 +1044,21 @@ NUL-terminated UTF-8 strings packed in order. The C entry wrapper scans it to
 build `argv[]`/`envp[]` on the data stack, calls `main(argc, argv)`, then exits
 through its `exit` import (§3d).
 
-**Trap-on-NULL (the guarded layout, #964):** a module carrying the
-`__null_guard` function export declares the **guarded** powerbox layout — its
-low scratch (heap words, format buffer, args blob) sits one
-`POWERBOX_NULL_GUARD` (16 KiB, the max host page) higher, and every tier
-reserves `[0, POWERBOX_NULL_GUARD)`: the interpreter seeds those pages
-`Unmapped` (a guard fault is fatal, never the §14 recoverable kind), the native
-JIT `mprotect`s them inaccessible, and the wasm tier emits a one-compare
+**Trap-on-NULL (the guarded layout, #964/#1094):** every module uses the
+**guarded** powerbox layout — its low scratch (heap words, format buffer, args
+blob) sits one `POWERBOX_NULL_GUARD` (16 KiB, the max host page) higher, and
+every tier reserves `[0, POWERBOX_NULL_GUARD)`: the interpreter seeds those
+pages `Unmapped` (a guard fault is fatal, never the §14 recoverable kind), the
+native JIT `mprotect`s them inaccessible, and the wasm tier emits a one-compare
 first-byte guard (measured free). The reservation is **permanent** — page ops
 and `instantiate` carves below the guard are refused (the `mmap_min_addr`
-analogue), which is what keeps the baked per-tier guard constants sound.
-Unmarked modules keep the legacy layout byte-for-byte (the marker gates
-everything), so old artifacts — chibicc's generated programs, the nim assets,
-the shell fixtures — coexist with guarded ones. `temen-llvm-translate
---null-guard` emits the guarded layout; the host seeds args marker-aware
-(`temen_ir::module_args_base`).
+analogue), which is what keeps the baked per-tier guard constants sound. The
+guard is **unconditional** (#1094 — the one canonical layout): every producer
+(temen-llvm, temen-leng, chibicc) shifts its scratch up, and the host seeds
+`[0, guard)` for every module, so old artifacts and new coexist under the same
+NULL semantics. The `__null_guard` marker export that once gated the layout is
+**retired** (#1094), and `temen-llvm-translate --null-guard` is a redundant
+no-op. The host seeds args at `temen_ir::module_args_base` (`guard + 128`).
 
 ### Deferred
 `File`/`Directory`/`openAt`, `Connector`/networking (§7), async submit/complete

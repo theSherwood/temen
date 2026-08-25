@@ -101,19 +101,19 @@ block 0 (v0: i32) {
   q0v2 = i64.const -4294967284
   q0v3 = i64.const 4294967295
   q0v4 = i64.const 0
-  q0a0 = i64.const 1152
+  q0a0 = i64.const 17536
   i64.store q0a0 q0v0
-  q0a1 = i64.const 1160
+  q0a1 = i64.const 17544
   i64.store q0a1 q0v1
-  q0a2 = i64.const 1168
+  q0a2 = i64.const 17552
   i64.store q0a2 q0v2
-  q0a3 = i64.const 1176
+  q0a3 = i64.const 17560
   i64.store q0a3 q0v3
-  q0a4 = i64.const 1184
+  q0a4 = i64.const 17568
   i64.store q0a4 q0v4
-  q0a5 = i64.const 1192
+  q0a5 = i64.const 17576
   i64.store q0a5 q0v4
-  q0a6 = i64.const 1200
+  q0a6 = i64.const 17584
   i64.store q0a6 q0v4
   vc = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
   vexp = i64.const 0
@@ -247,8 +247,8 @@ memory 18
 type 0 func (i64) -> (i64)
 type 1 interface { fork: 0, wait: 0 }
 export 0 interface "svc" 1 { fork: 2, wait: 3 }
-data 300 "svc"
-data 310 "o"
+data 16684 "svc"
+data 16694 "o"
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, vout: i32) {
   vlog = i64.const 12
@@ -259,38 +259,38 @@ block 0 (v0: i32, vout: i32) {
   q1v2 = i64.const -4294967284
   q1v3 = i64.const 4294967295
   q1v4 = i64.const 0
-  q1a0 = i64.const 1216
+  q1a0 = i64.const 17600
   i64.store q1a0 q1v0
-  q1a1 = i64.const 1224
+  q1a1 = i64.const 17608
   i64.store q1a1 q1v1
-  q1a2 = i64.const 1232
+  q1a2 = i64.const 17616
   i64.store q1a2 q1v2
-  q1a3 = i64.const 1240
+  q1a3 = i64.const 17624
   i64.store q1a3 q1v3
-  q1a4 = i64.const 1248
+  q1a4 = i64.const 17632
   i64.store q1a4 q1v4
-  q1a5 = i64.const 1256
+  q1a5 = i64.const 17640
   i64.store q1a5 q1v4
-  q1a6 = i64.const 1264
+  q1a6 = i64.const 17648
   i64.store q1a6 q1v4
   vs = cap.call 6 17 (i64) -> (i32) v0 (q1a0)
   vz0 = i64.const 0
   vcap = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
-  va0 = i64.const 256
-  vnp = i32.const 300
+  va0 = i64.const 16640
+  vnp = i32.const 16684
   i32.store va0 vnp
-  va1 = i64.const 260
+  va1 = i64.const 16644
   vnl = i32.const 3
   i32.store va1 vnl
-  va2 = i64.const 264
+  va2 = i64.const 16648
   i32.store va2 vcap
-  va3 = i64.const 272
-  vnp2 = i32.const 310
+  va3 = i64.const 16656
+  vnp2 = i32.const 16694
   i32.store va3 vnp2
-  va4 = i64.const 276
+  va4 = i64.const 16660
   vnl2 = i32.const 1
   i32.store va4 vnl2
-  va5 = i64.const 280
+  va5 = i64.const 16664
   i32.store va5 vout
   ; spawn via record (op 17): entry=4 off=135168 sl=12 quota=0
   q2v0 = i64.const 17179869184
@@ -298,21 +298,21 @@ block 0 (v0: i32, vout: i32) {
   q2v2 = i64.const -4294967284
   q2v3 = i64.const 4294967295
   q2v4 = i64.const 0
-  q2v5 = i64.const 256
+  q2v5 = i64.const 16640
   q2v6 = i64.const 2
-  q2a0 = i64.const 1280
+  q2a0 = i64.const 17664
   i64.store q2a0 q2v0
-  q2a1 = i64.const 1288
+  q2a1 = i64.const 17672
   i64.store q2a1 q2v1
-  q2a2 = i64.const 1296
+  q2a2 = i64.const 17680
   i64.store q2a2 q2v2
-  q2a3 = i64.const 1304
+  q2a3 = i64.const 17688
   i64.store q2a3 q2v3
-  q2a4 = i64.const 1312
+  q2a4 = i64.const 17696
   i64.store q2a4 q2v4
-  q2a5 = i64.const 1320
+  q2a5 = i64.const 17704
   i64.store q2a5 q2v5
-  q2a6 = i64.const 1328
+  q2a6 = i64.const 17712
   i64.store q2a6 q2v6
   vc = cap.call 6 17 (i64) -> (i32) v0 (q2a0)
   vjc = cap.call 6 1 (i32) -> (i64) v0 (vc)
@@ -522,8 +522,8 @@ memory 18
 type 0 func (i64) -> (i64)
 type 1 interface { fork: 0, wait: 0 }
 export 0 interface "svc" 1 { fork: 2, wait: 3 }
-data 300 "svc"
-data 310 "o"
+data 16684 "svc"
+data 16694 "o"
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, vout: i32) {
   vlog = i64.const 12
@@ -534,38 +534,38 @@ block 0 (v0: i32, vout: i32) {
   q3v2 = i64.const -4294967284
   q3v3 = i64.const 4294967295
   q3v4 = i64.const 0
-  q3a0 = i64.const 1344
+  q3a0 = i64.const 17728
   i64.store q3a0 q3v0
-  q3a1 = i64.const 1352
+  q3a1 = i64.const 17736
   i64.store q3a1 q3v1
-  q3a2 = i64.const 1360
+  q3a2 = i64.const 17744
   i64.store q3a2 q3v2
-  q3a3 = i64.const 1368
+  q3a3 = i64.const 17752
   i64.store q3a3 q3v3
-  q3a4 = i64.const 1376
+  q3a4 = i64.const 17760
   i64.store q3a4 q3v4
-  q3a5 = i64.const 1384
+  q3a5 = i64.const 17768
   i64.store q3a5 q3v4
-  q3a6 = i64.const 1392
+  q3a6 = i64.const 17776
   i64.store q3a6 q3v4
   vs = cap.call 6 17 (i64) -> (i32) v0 (q3a0)
   vz0 = i64.const 0
   vcap = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
-  va0 = i64.const 256
-  vnp = i32.const 300
+  va0 = i64.const 16640
+  vnp = i32.const 16684
   i32.store va0 vnp
-  va1 = i64.const 260
+  va1 = i64.const 16644
   vnl = i32.const 3
   i32.store va1 vnl
-  va2 = i64.const 264
+  va2 = i64.const 16648
   i32.store va2 vcap
-  va3 = i64.const 272
-  vnp2 = i32.const 310
+  va3 = i64.const 16656
+  vnp2 = i32.const 16694
   i32.store va3 vnp2
-  va4 = i64.const 276
+  va4 = i64.const 16660
   vnl2 = i32.const 1
   i32.store va4 vnl2
-  va5 = i64.const 280
+  va5 = i64.const 16664
   i32.store va5 vout
   ; spawn via record (op 17): entry=4 off=135168 sl=12 quota=0
   q4v0 = i64.const 17179869184
@@ -573,21 +573,21 @@ block 0 (v0: i32, vout: i32) {
   q4v2 = i64.const -4294967284
   q4v3 = i64.const 4294967295
   q4v4 = i64.const 0
-  q4v5 = i64.const 256
+  q4v5 = i64.const 16640
   q4v6 = i64.const 2
-  q4a0 = i64.const 1408
+  q4a0 = i64.const 17792
   i64.store q4a0 q4v0
-  q4a1 = i64.const 1416
+  q4a1 = i64.const 17800
   i64.store q4a1 q4v1
-  q4a2 = i64.const 1424
+  q4a2 = i64.const 17808
   i64.store q4a2 q4v2
-  q4a3 = i64.const 1432
+  q4a3 = i64.const 17816
   i64.store q4a3 q4v3
-  q4a4 = i64.const 1440
+  q4a4 = i64.const 17824
   i64.store q4a4 q4v4
-  q4a5 = i64.const 1448
+  q4a5 = i64.const 17832
   i64.store q4a5 q4v5
-  q4a6 = i64.const 1456
+  q4a6 = i64.const 17840
   i64.store q4a6 q4v6
   vc = cap.call 6 17 (i64) -> (i32) v0 (q4a0)
   vjc = cap.call 6 1 (i32) -> (i64) v0 (vc)
@@ -726,8 +726,8 @@ memory 18
 type 0 func (i64) -> (i64)
 type 1 interface { fork: 0, wait: 0 }
 export 0 interface "svc" 1 { fork: 2, wait: 3 }
-data 300 "svc"
-data 310 "o"
+data 16684 "svc"
+data 16694 "o"
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, vout: i32) {
   vlog = i64.const 12
@@ -738,38 +738,38 @@ block 0 (v0: i32, vout: i32) {
   q5v2 = i64.const -4294967284
   q5v3 = i64.const 4294967295
   q5v4 = i64.const 0
-  q5a0 = i64.const 1472
+  q5a0 = i64.const 17856
   i64.store q5a0 q5v0
-  q5a1 = i64.const 1480
+  q5a1 = i64.const 17864
   i64.store q5a1 q5v1
-  q5a2 = i64.const 1488
+  q5a2 = i64.const 17872
   i64.store q5a2 q5v2
-  q5a3 = i64.const 1496
+  q5a3 = i64.const 17880
   i64.store q5a3 q5v3
-  q5a4 = i64.const 1504
+  q5a4 = i64.const 17888
   i64.store q5a4 q5v4
-  q5a5 = i64.const 1512
+  q5a5 = i64.const 17896
   i64.store q5a5 q5v4
-  q5a6 = i64.const 1520
+  q5a6 = i64.const 17904
   i64.store q5a6 q5v4
   vs = cap.call 6 17 (i64) -> (i32) v0 (q5a0)
   vz0 = i64.const 0
   vcap = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
-  va0 = i64.const 256
-  vnp = i32.const 300
+  va0 = i64.const 16640
+  vnp = i32.const 16684
   i32.store va0 vnp
-  va1 = i64.const 260
+  va1 = i64.const 16644
   vnl = i32.const 3
   i32.store va1 vnl
-  va2 = i64.const 264
+  va2 = i64.const 16648
   i32.store va2 vcap
-  va3 = i64.const 272
-  vnp2 = i32.const 310
+  va3 = i64.const 16656
+  vnp2 = i32.const 16694
   i32.store va3 vnp2
-  va4 = i64.const 276
+  va4 = i64.const 16660
   vnl2 = i32.const 1
   i32.store va4 vnl2
-  va5 = i64.const 280
+  va5 = i64.const 16664
   i32.store va5 vout
   ; spawn via record (op 17): entry=4 off=135168 sl=12 quota=0
   q6v0 = i64.const 17179869184
@@ -777,21 +777,21 @@ block 0 (v0: i32, vout: i32) {
   q6v2 = i64.const -4294967284
   q6v3 = i64.const 4294967295
   q6v4 = i64.const 0
-  q6v5 = i64.const 256
+  q6v5 = i64.const 16640
   q6v6 = i64.const 2
-  q6a0 = i64.const 1536
+  q6a0 = i64.const 17920
   i64.store q6a0 q6v0
-  q6a1 = i64.const 1544
+  q6a1 = i64.const 17928
   i64.store q6a1 q6v1
-  q6a2 = i64.const 1552
+  q6a2 = i64.const 17936
   i64.store q6a2 q6v2
-  q6a3 = i64.const 1560
+  q6a3 = i64.const 17944
   i64.store q6a3 q6v3
-  q6a4 = i64.const 1568
+  q6a4 = i64.const 17952
   i64.store q6a4 q6v4
-  q6a5 = i64.const 1576
+  q6a5 = i64.const 17960
   i64.store q6a5 q6v5
-  q6a6 = i64.const 1584
+  q6a6 = i64.const 17968
   i64.store q6a6 q6v6
   vc = cap.call 6 17 (i64) -> (i32) v0 (q6a0)
   vjc = cap.call 6 1 (i32) -> (i64) v0 (vc)
@@ -922,8 +922,8 @@ type 0 func (i64) -> (i64)
 type 1 interface { fork: 0, wait: 2 }
 type 2 func (i64, i64) -> (i64)
 export 0 interface "svc" 1 { fork: 2, wait: 3 }
-data 300 "svc"
-data 310 "o"
+data 16684 "svc"
+data 16694 "o"
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, vout: i32) {
   vlog = i64.const 12
@@ -933,59 +933,59 @@ block 0 (v0: i32, vout: i32) {
   q5v2 = i64.const -4294967284
   q5v3 = i64.const 4294967295
   q5v4 = i64.const 0
-  q5a0 = i64.const 1472
+  q5a0 = i64.const 17856
   i64.store q5a0 q5v0
-  q5a1 = i64.const 1480
+  q5a1 = i64.const 17864
   i64.store q5a1 q5v1
-  q5a2 = i64.const 1488
+  q5a2 = i64.const 17872
   i64.store q5a2 q5v2
-  q5a3 = i64.const 1496
+  q5a3 = i64.const 17880
   i64.store q5a3 q5v3
-  q5a4 = i64.const 1504
+  q5a4 = i64.const 17888
   i64.store q5a4 q5v4
-  q5a5 = i64.const 1512
+  q5a5 = i64.const 17896
   i64.store q5a5 q5v4
-  q5a6 = i64.const 1520
+  q5a6 = i64.const 17904
   i64.store q5a6 q5v4
   vs = cap.call 6 17 (i64) -> (i32) v0 (q5a0)
   vz0 = i64.const 0
   vcap = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
-  va0 = i64.const 256
-  vnp = i32.const 300
+  va0 = i64.const 16640
+  vnp = i32.const 16684
   i32.store va0 vnp
-  va1 = i64.const 260
+  va1 = i64.const 16644
   vnl = i32.const 3
   i32.store va1 vnl
-  va2 = i64.const 264
+  va2 = i64.const 16648
   i32.store va2 vcap
-  va3 = i64.const 272
-  vnp2 = i32.const 310
+  va3 = i64.const 16656
+  vnp2 = i32.const 16694
   i32.store va3 vnp2
-  va4 = i64.const 276
+  va4 = i64.const 16660
   vnl2 = i32.const 1
   i32.store va4 vnl2
-  va5 = i64.const 280
+  va5 = i64.const 16664
   i32.store va5 vout
   q6v0 = i64.const 17179869184
   q6v1 = i64.const 135168
   q6v2 = i64.const -4294967284
   q6v3 = i64.const 4294967295
   q6v4 = i64.const 0
-  q6v5 = i64.const 256
+  q6v5 = i64.const 16640
   q6v6 = i64.const 2
-  q6a0 = i64.const 1536
+  q6a0 = i64.const 17920
   i64.store q6a0 q6v0
-  q6a1 = i64.const 1544
+  q6a1 = i64.const 17928
   i64.store q6a1 q6v1
-  q6a2 = i64.const 1552
+  q6a2 = i64.const 17936
   i64.store q6a2 q6v2
-  q6a3 = i64.const 1560
+  q6a3 = i64.const 17944
   i64.store q6a3 q6v3
-  q6a4 = i64.const 1568
+  q6a4 = i64.const 17952
   i64.store q6a4 q6v4
-  q6a5 = i64.const 1576
+  q6a5 = i64.const 17960
   i64.store q6a5 q6v5
-  q6a6 = i64.const 1584
+  q6a6 = i64.const 17968
   i64.store q6a6 q6v6
   vc = cap.call 6 17 (i64) -> (i32) v0 (q6a0)
   vjc = cap.call 6 1 (i32) -> (i64) v0 (vc)

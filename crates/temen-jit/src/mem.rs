@@ -164,9 +164,9 @@ impl GuestWindow {
         unsafe { pal::protect(self.base.add(start), end - start, Prot::None) };
     }
 
-    /// #964: reserve `[0, guard)` inaccessible — the NULL guard of a `__null_guard`-marked
-    /// module: a NULL dereference faults into the guard handler (hardware enforcement at zero
-    /// per-access cost), matching the interpreter oracle's `[0, guard)` `Unmapped` seeding.
+    /// #964/#1094: reserve `[0, guard)` inaccessible — the unconditional NULL guard: a NULL
+    /// dereference faults into the guard handler (hardware enforcement at zero per-access cost),
+    /// matching the interpreter oracle's `[0, guard)` `Unmapped` seeding.
     /// Page-granular, so it engages only when `guard` is host-page-exact (4 KiB / 16 KiB hosts;
     /// on a larger-page host protecting would swallow live scratch above the guard, so it skips —
     /// and the interpreter skips identically, keeping the tiers trap-parity per platform).

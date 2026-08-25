@@ -3440,9 +3440,10 @@ pub use temen_ir::is_named_powerbox_entry;
 /// guest can resolve any child export by name through the Module capability, so a linking or
 /// child-module artifact must keep everything it publishes.
 pub fn demote_exports(module: &mut Module, keep: &[&str]) -> usize {
-    // `_start` (the powerbox-entry marker) and the #964 NULL-guard marker are semantics a host
-    // resolves — always kept, never demotable to a diagnostic name.
-    let semantic = |name: &str| name == "_start" || name == temen_ir::NULL_GUARD_EXPORT;
+    // `_start` (the powerbox-entry marker) is a semantic the host resolves — always kept, never
+    // demotable to a diagnostic name. (#1094: the `__null_guard` marker is retired; the NULL guard is
+    // unconditional now, so no export needs preserving for it — a stale one in an old asset is inert.)
+    let semantic = |name: &str| name == "_start";
     let kept: Vec<temen_ir::Export> = module
         .exports
         .iter()

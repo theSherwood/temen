@@ -1,10 +1,10 @@
-//! **#964 on the native JIT**, differentially vs. the interpreter oracle. A `__null_guard`-marked
-//! module's window `mprotect`s `[0, POWERBOX_NULL_GUARD)` inaccessible, so a NULL dereference
-//! faults into the §5 guard and reports `MemoryFault` exactly where the interpreter's
-//! `Unmapped`-seeded page map traps — while the unmarked twin keeps the legacy behavior on both
-//! backends. The reserved region is likewise **refused** to the Memory cap's page ops
-//! (`MprotectWindow::prot_pages`, the `mmap_min_addr` analogue) and to `instantiate` carves (the
-//! host seeds/copies a carve outside the guarded call, so a guarded carve would fault the host).
+//! **#964/#1094 on the native JIT**, differentially vs. the interpreter oracle. Every module's window
+//! `mprotect`s `[0, POWERBOX_NULL_GUARD)` inaccessible (the guard is **unconditional** now — #1094, the
+//! one canonical layout; no `__null_guard` marker), so a NULL dereference faults into the §5 guard and
+//! reports `MemoryFault` exactly where the interpreter's `Unmapped`-seeded page map traps. The reserved
+//! region is likewise **refused** to the Memory cap's page ops (`MprotectWindow::prot_pages`, the
+//! `mmap_min_addr` analogue) and to `instantiate` carves (the host seeds/copies a carve outside the
+//! guarded call, so a guarded carve would fault the host).
 //!
 //! Hardware enforcement is host-page-granular: on a host whose page doesn't divide the guard
 //! (e.g. 64 KiB aarch64) both backends skip the guard identically, and so does this test.
@@ -46,13 +46,8 @@ block 0 (vas: i32, voff: i64, vlen: i64) {
 }
 "#;
 
-fn module(marked: bool) -> temen_ir::Module {
-    let marker = if marked {
-        "export 1 func \"__null_guard\" 0\n"
-    } else {
-        ""
-    };
-    let src = format!("memory 17\nexport 0 func \"_start\" 0\n{marker}{BODY}");
+fn module() -> temen_ir::Module {
+    let src = format!("memory 17\nexport 0 func \"_start\" 0\n{BODY}");
     let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");
     m
@@ -104,19 +99,18 @@ fn both(m: &temen_ir::Module, func: u32, args: &[i64]) -> (Result<Vec<Value>, Tr
     (ir, jo)
 }
 
-/// NULL loads and stores trap `MemoryFault` on the native JIT for a marked module — in lockstep
-/// with the interpreter — and stay legal on the unmarked twin; the guard boundary and the window
-/// top admit on both.
+/// NULL loads and stores trap `MemoryFault` on the native JIT for every module — in lockstep with the
+/// interpreter (#1094: the guard is unconditional); the guard boundary and the window top admit on
+/// both backends.
 #[test]
-fn marked_null_access_traps_on_native_jit() {
+fn null_access_traps_on_native_jit() {
     if !guard_active() {
         return;
     }
-    let marked = module(true);
-    let legacy = module(false);
+    let m = module();
     for (func, what) in [(0u32, "load"), (1u32, "store")] {
         for probe in [0i64, 8, GUARD - 8, GUARD - 1] {
-            let (ir, jo) = both(&marked, func, &[probe]);
+            let (ir, jo) = both(&m, func, &[probe]);
             assert_eq!(
                 ir,
                 Err(Trap::MemoryFault),
@@ -126,29 +120,22 @@ fn marked_null_access_traps_on_native_jit() {
                 matches!(jo, JitOutcome::Trapped(TrapKind::MemoryFault)),
                 "jit {what}({probe}) must trap under the guard, got {jo:?}"
             );
-            let (ir, jo) = both(&legacy, func, &[probe]);
-            assert!(
-                ir.is_ok() && matches!(jo, JitOutcome::Returned(_)),
-                "unmarked twin keeps the legacy behavior at {probe} ({jo:?})"
-            );
         }
-        // At and above the guard: legal on both backends, marked or not.
+        // At and above the guard: legal on both backends.
         for probe in [GUARD, (1 << 17) - 8] {
-            for m in [&marked, &legacy] {
-                let (ir, jo) = both(m, func, &[probe]);
-                assert!(ir.is_ok(), "interp {what}({probe}) admits");
-                assert!(
-                    matches!(jo, JitOutcome::Returned(_)),
-                    "jit {what}({probe}) admits, got {jo:?}"
-                );
-            }
+            let (ir, jo) = both(&m, func, &[probe]);
+            assert!(ir.is_ok(), "interp {what}({probe}) admits");
+            assert!(
+                matches!(jo, JitOutcome::Returned(_)),
+                "jit {what}({probe}) admits, got {jo:?}"
+            );
         }
     }
 }
 
 /// The reserved region is refused to the Memory cap's page ops on the native backend
 /// (`MprotectWindow::prot_pages`) exactly as on the interpreter: `unmap` below the guard returns a
-/// negative errno on a marked module, stays legal above it, and is unchanged on the unmarked twin.
+/// negative errno, and stays legal at/above it (#1094: unconditional).
 #[test]
 fn page_ops_below_guard_refused_on_native_jit() {
     if !guard_active() {
@@ -168,44 +155,32 @@ fn page_ops_below_guard_refused_on_native_jit() {
         (iv, jv)
     };
 
-    let marked = module(true);
-    let legacy = module(false);
+    let m = module();
     for (off, len, below) in [
         (0, GUARD, true),
         (GUARD - page, page, true),
         (GUARD, page, false),
     ] {
-        let (iv, jv) = unmap(&marked, off, len);
+        let (iv, jv) = unmap(&m, off, len);
         assert_eq!(iv, jv, "backends agree on unmap({off}, {len})");
-        assert_eq!(
-            jv < 0,
-            below,
-            "unmap({off}, {len}) refusal (marked): got {jv}"
-        );
+        assert_eq!(jv < 0, below, "unmap({off}, {len}) refusal: got {jv}");
     }
-    let (iv, jv) = unmap(&legacy, 0, page);
-    assert_eq!((iv, jv), (0, 0), "the unmarked twin keeps legacy page ops");
 }
 
-/// A §14 `instantiate` carve overlapping `[0, guard)` is refused `-EINVAL` on both backends for a
-/// marked module (the host seeds/copies the carve outside the guarded call); a carve above the
-/// guard nests fine, and the unmarked twin still carves anywhere.
+/// A §14 `instantiate` carve overlapping `[0, guard)` is refused `-EINVAL` on both backends (the host
+/// seeds/copies the carve outside the guarded call); a carve above the guard nests fine. #1094: the
+/// guard is unconditional, so this holds for every module.
 #[test]
 fn carve_below_guard_refused_on_native_jit() {
     if !guard_active() || !temen_jit::fiber_supported() {
         return;
     }
     // Parent (f0): instantiate f3 in a 4 KiB window at `off` and return the raw handle/errno —
-    // no join, so a refused spawn is observable as the negative errno itself. f1/f2 keep the
-    // probe indices of `BODY` stable for the marker export; f3 is the trivial child.
-    let nest = |marked: bool, off: u64| -> String {
-        let marker: &str = if marked {
-            "export 1 func \"__null_guard\" 0\n"
-        } else {
-            ""
-        };
+    // no join, so a refused spawn is observable as the negative errno itself. f1/f2 keep f3 (the
+    // trivial child) at func index 3.
+    let nest = |off: u64| -> String {
         format!(
-            "memory 17\nexport 0 func \"_start\" 0\n{marker}\
+            "memory 17\nexport 0 func \"_start\" 0\n\
              func (i32) -> (i64) {{\n\
              block 0 (v0: i32) {{\n\
              \x20 v1 = i64.const 3\n\
@@ -227,8 +202,8 @@ fn carve_below_guard_refused_on_native_jit() {
              }}\n"
         )
     };
-    let run = |marked: bool, off: u64| -> (i64, i64) {
-        let m = parse_module(&nest(marked, off)).expect("parse");
+    let run = |off: u64| -> (i64, i64) {
+        let m = parse_module(&nest(off)).expect("parse");
         verify_module(&m).expect("verify");
         let am = Arc::new(m.clone());
         let init = vec![0u8; 1 << 17];
@@ -263,18 +238,9 @@ fn carve_below_guard_refused_on_native_jit() {
         (iv, jv)
     };
 
-    // Marked: a carve at 0 (inside the guard) is refused on both; one above the guard spawns.
-    let (iv, jv) = run(true, 0);
-    assert!(iv < 0 && jv < 0, "carve at 0 refused (marked): {iv}/{jv}");
-    let (iv, jv) = run(true, 64 << 10);
-    assert!(
-        iv >= 0 && jv >= 0,
-        "carve above the guard spawns (marked): {iv}/{jv}"
-    );
-    // Unmarked twin: a carve at 0 still spawns on both backends.
-    let (iv, jv) = run(false, 0);
-    assert!(
-        iv >= 0 && jv >= 0,
-        "unmarked twin carves at 0 as ever: {iv}/{jv}"
-    );
+    // A carve at 0 (inside the guard) is refused on both backends; one above the guard spawns.
+    let (iv, jv) = run(0);
+    assert!(iv < 0 && jv < 0, "carve at 0 refused: {iv}/{jv}");
+    let (iv, jv) = run(64 << 10);
+    assert!(iv >= 0 && jv >= 0, "carve above the guard spawns: {iv}/{jv}");
 }

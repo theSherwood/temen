@@ -189,9 +189,9 @@ fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) ->
         host.set_import_bindings(bindings);
     }
     // Seed argv at the module's args base (the on-ramp `_start` parses argc/argv from it). #964/#1094:
-    // a `__null_guard`-marked phase guest reads its args one guard up, at `module_args_base` (guard +
-    // POWERBOX_ARGS_BASE); an unmarked guest keeps the legacy 128 — so key off the module, not the
-    // constant, or the guarded nifler/nimsem/hexer read empty argv and fail.
+    // a phase guest reads its args one guard up, at `module_args_base` (guard + POWERBOX_ARGS_BASE) —
+    // the unconditional guarded layout; key off `module_args_base`, not a bare constant, so
+    // nifler/nimsem/hexer find argv where their `_start` looks.
     let blob = pg_args_blob(&argv.iter().map(|s| s.as_bytes()).collect::<Vec<_>>());
     let base = temen_ir::module_args_base(m) as usize;
     let mut init_mem = vec![0u8; base + blob.len()];
