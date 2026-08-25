@@ -4860,11 +4860,25 @@ fn offset_type_indices(m: &mut Module, offset: u32) {
         for b in &mut f.blocks {
             for inst in &mut b.insts {
                 match inst {
-                    Inst::CallImportDyn { ty, .. }
-                    | Inst::CapSelfTypeId { ty }
-                    | Inst::CapSelfCovers { ty, .. } => *ty += offset,
+                    Inst::CapSelfTypeId { ty }
+                    | Inst::CapSelfCovers { ty, .. }
+                    // FuncType interning (#922): a call variant's `sig`/`ty` names an entry in the
+                    // unit's own type section, which the linker concatenates at `offset` — reindex
+                    // it alongside the interface refs so it resolves in the merged type section.
+                    | Inst::CallIndirect { ty, .. } => *ty += offset,
+                    Inst::CapCall { sig, .. }
+                    | Inst::CallImport { sig, .. }
+                    | Inst::CallSym { sig, .. } => *sig += offset,
+                    // `call.import.dyn` carries both an interface ref (`ty`) and the interned sig.
+                    Inst::CallImportDyn { ty, sig, .. } => {
+                        *ty += offset;
+                        *sig += offset;
+                    }
                     _ => {}
                 }
+            }
+            if let Terminator::ReturnCallIndirect { ty, .. } = &mut b.term {
+                *ty += offset;
             }
         }
     }
