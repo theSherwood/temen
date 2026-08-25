@@ -143,7 +143,9 @@ fn on_ramp_child_reads_argv_paths_and_copies_a_file_over_a_regranted_memfs() {
     // then op-13-spawns the child into the carve and op-1-joins it. The carve aliases these seeded
     // bytes, so the child sees both the argv and (by name) the memfs.
     let carve_off: u64 = 1u64 << sl;
-    let argv_off = carve_off + temen_ir::POWERBOX_ARGS_BASE;
+    // #964/#1094: a guarded child reads argv one guard up — key off `module_args_base` (the grant
+    // records/cap-names below stay in the parent window, read by the op-13 handler, never by the child).
+    let argv_off = carve_off + temen_ir::module_args_base(&child);
     let word0: u64 = 2048 | (2u64 << 32);
     // `\x03\x00\x00\x00` = argc 3, `\x00\x00\x00\x00` = envc 0, then the NUL-separated args.
     let argv_data = "\\x03\\x00\\x00\\x00\\x00\\x00\\x00\\x00prog\\x00/in.nim\\x00/out.nif\\x00";
