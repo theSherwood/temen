@@ -4,15 +4,16 @@
 //! granted-spawn hooks (`GrantChildHooks` + `module_resolver`, the shape `rust_guest_op13` established).
 //! nifler runs as a confined §14 op-13 child on emitted code and its `.p.nif` is byte-identical to native.
 //!
-//! **BRING-UP TARGET (currently `#[ignore]`d — CapFaults).** The tree-walker/bytecode op-13 phase path
-//! is proven (`nifler_child_asset`, byte-exact), and the JIT granted-spawn works for a *toy* child
-//! (`rust_guest_op13`, both engines). But a **real phase child** — nifler's manifest imports
-//! (`exit`/`read`/`write`/`vm_map`), its `malloc`/`vm_map` heap growth, and its cross-tier `fs` calls —
-//! traps `CapFault` on the JIT (an interp/JIT divergence in the granted-spawn dispatch: `spawn_named_child`
-//! passes `can_regrant`, and `child_bind_imports` calls the same `bind_child_manifest`, so the fault is
-//! likely a child-side cap dispatch on emitted code — the AddressSpace `vm_map` or the re-granted Stream).
-//! Remove the `#[ignore]` to reproduce. This is the enabler for the browser wasm-JIT compile card, so it
-//! is captured here as the next focused temen-jit slice.
+//! **The bring-up (landed).** The root cause of the earlier `CapFault` was an interp/JIT divergence in
+//! the op-13 `mod_ok` gate: the JIT required a separate-module child's carve to *exactly equal* its
+//! declared window, while the interpreter had already been relaxed (FORK.md §8.6 / #773) to `declared
+//! <= carve`. A malloc child *needs* the larger carve — the synthesized bump allocator's `heap_base`
+//! is `1<<declared` and it grows the heap up into `[1<<declared, carve)` — so the strict-equal JIT
+//! rejected the spawn `-EINVAL`, and the parent's `join` on that forged handle surfaced as the
+//! `CapFault` (the child never ran). Relaxing the JIT gate to `declared <= carve`
+//! (`instantiator_rt::instantiate_module_named`) brings it into lockstep with the interpreter; the
+//! `child_entry_io_jit` minimal repro (a `malloc`-then-`vm_map` child) is the unit that pins it. This
+//! is the enabler for the browser wasm-JIT compile card (which bounces op-13 to the same host path).
 
 #![cfg(target_os = "linux")]
 
@@ -115,7 +116,9 @@ fn grant_hooks() -> GrantChildHooks {
 }
 
 #[test]
-#[ignore = "JIT op-13 phase spawn CapFaults for a real phase child — temen-jit granted-spawn bring-up"]
+#[ignore = "PASSES — on-demand gate: Cranelift-compiling nifler's 100+ funcs takes ~250s in debug, too \
+            slow for the default run. The fast `child_entry_io_jit` malloc repro guards the same fix; \
+            run `--ignored` to exercise the full real-phase child on the JIT."]
 fn nifler_child_runs_on_the_jit_byte_identical() {
     let Some(temen) = inflate() else {
         eprintln!("SKIP: gzip unavailable");

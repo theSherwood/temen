@@ -1262,8 +1262,15 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
             && (f.params.len() == 1 || f.params.len() == 2)
             && f.params.iter().all(|p| *p == ValType::I64)
     });
-    // A module child's carve must equal its declared memory (§14 transparency), as in op 5.
-    let mod_ok = mod_mem.is_none_or(|ml| ml == size_log2 as i32);
+    // A separate-module child's carve must be **at least** its declared memory (FORK.md §8.6 /
+    // #773 — the interpreter twin at `instantiate_rec`'s `mod_ok`): a larger window is a safe
+    // superset (confinement, invariant 2, still masks every access to the actual carve), and a
+    // malloc child *needs* it — its synthesized bump allocator's `heap_base` is `1<<declared` and
+    // grows the heap up into `[1<<declared, carve)`, so a carve equal to the declared window leaves
+    // no heap room. The child is compiled fully-mapped over the whole carve (`compile_child` /
+    // `run_child_code_then`), so those heap pages are already committed and the allocator's `vm_map`
+    // commits are no-ops — matching the interp's `nested_view` (mapped == carve).
+    let mod_ok = mod_mem.is_none_or(|ml| ml <= size_log2 as i32);
     let fits = child_size != 0
         && child_size <= size
         && off & (child_size - 1) == 0
