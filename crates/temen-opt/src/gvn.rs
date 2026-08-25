@@ -35,9 +35,9 @@ use crate::{map_operands, map_term_operands};
 /// `has_memory` its memory presence — both only for `func_value_types` (call result types / memory
 /// op validity). Semantics-preserving; meant to be followed by the ordinary cleanup, which removes
 /// the dead duplicate definitions and any parameter this pass leaves unused.
-pub fn gvn(f: &Func, funcs: &[Func], has_memory: bool) -> Func {
+pub fn gvn(f: &Func, funcs: &[Func], types: &[temen_ir::TypeEntry], has_memory: bool) -> Func {
     let fn_results: Vec<usize> = funcs.iter().map(|fu| fu.results.len()).collect();
-    let mut s = to_ssa(f, &fn_results);
+    let mut s = to_ssa(f, &fn_results, types);
     let nblocks = s.blocks.len();
     let nvals = s.num_values as usize;
     if nblocks == 0 || nvals == 0 {
@@ -45,7 +45,7 @@ pub fn gvn(f: &Func, funcs: &[Func], has_memory: bool) -> Func {
     }
 
     // Per-value types, in the same block-local order as `values`, from the verifier's own typing.
-    let types_local = func_value_types(f, funcs, has_memory);
+    let types_local = func_value_types(f, funcs, types, has_memory);
     let mut gtype = vec![ValType::I32; nvals];
     for (vals, tys) in s.values.iter().zip(types_local.iter()) {
         for (&g, &ty) in vals.iter().zip(tys.iter()) {
@@ -70,7 +70,7 @@ pub fn gvn(f: &Func, funcs: &[Func], has_memory: bool) -> Func {
         let mut per_inst = Vec::with_capacity(blk.insts.len());
         let mut slot = blk.params.len();
         for inst in &blk.insts {
-            let rc = inst.result_count(&fn_results);
+            let rc = inst.result_count(&fn_results, types);
             per_inst.push(s.values[b][slot..slot + rc].to_vec());
             slot += rc;
         }
@@ -79,14 +79,14 @@ pub fn gvn(f: &Func, funcs: &[Func], has_memory: bool) -> Func {
 
     // Value-number congruence (shared with LICM): congruent values share a number, which is what makes
     // a join recomputation match the original even though its operands are fresh block parameters.
-    let vn = crate::vn::value_numbers(&s, &cfg, &fn_results);
+    let vn = crate::vn::value_numbers(&s, &cfg, &fn_results, types);
 
     // Values produced by a constant instruction — never threaded as CSE representatives (below).
     let mut const_valued = vec![false; nvals];
     for (b, blk) in s.blocks.iter().enumerate() {
         let mut slot = blk.params.len();
         for inst in &blk.insts {
-            let rc = inst.result_count(&fn_results);
+            let rc = inst.result_count(&fn_results, types);
             if rc == 1 && crate::const_value(inst).is_some() {
                 const_valued[s.values[b][slot] as usize] = true;
             }

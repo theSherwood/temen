@@ -7,7 +7,7 @@
 //! known-gap test (both still trap).
 
 use temen_interp::{Trap, Value};
-use temen_ir::{BinOp, Block, Func, FuncType, Inst, IntTy, Module, Terminator, ValType};
+use temen_ir::{BinOp, Block, Func, FuncType, Inst, IntTy, Module, Terminator, TypeEntry, ValType};
 use temen_peval::{lower_indirect_dispatch, specialize_with_config, SpecArg, SpecConfig};
 use temen_verify::verify_module;
 
@@ -54,7 +54,7 @@ fn dispatch_module() -> Module {
             params: vec![I32, I64],
             insts: vec![
                 Inst::CallIndirect {
-                    ty,
+                    ty: 0,         // #922: interned at type-section index 0
                     idx: 0,        // sel
                     args: vec![1], // x
                 },
@@ -83,7 +83,7 @@ fn dispatch_module() -> Module {
         data_ptrs: vec![],
         data_funcrefs: vec![],
         impl_exports: vec![],
-        types: vec![],
+        types: vec![TypeEntry::Func(ty)], // #922: call_indirect sig, index 0
         debug_info: None,
     }
 }
@@ -207,7 +207,7 @@ fn branchy_module() -> Module {
                 params: vec![I32, I64], // sel=0, x=1
                 insts: vec![
                     Inst::CallIndirect {
-                        ty,
+                        ty: 0, // #922: interned at type-section index 0
                         idx: 0,
                         args: vec![1],
                     }, // r = v2
@@ -264,7 +264,7 @@ fn branchy_module() -> Module {
         data_ptrs: vec![],
         data_funcrefs: vec![],
         impl_exports: vec![],
-        types: vec![],
+        types: vec![TypeEntry::Func(ty)], // #922: call_indirect sig, index 0
         debug_info: None,
     }
 }
@@ -313,7 +313,7 @@ fn wide_span_uses_chain_fallback_and_stays_faithful() {
         blocks: vec![Block {
             params: vec![I32, I64],
             insts: vec![Inst::CallIndirect {
-                ty: hty,
+                ty: 0, // #922: interned at type-section index 0
                 idx: 0,
                 args: vec![1, 1],
             }],
@@ -335,7 +335,7 @@ fn wide_span_uses_chain_fallback_and_stays_faithful() {
         data_ptrs: vec![],
         data_funcrefs: vec![],
         impl_exports: vec![],
-        types: vec![],
+        types: vec![TypeEntry::Func(hty)], // #922: call_indirect sig, index 0
         debug_info: None,
     };
     verify_module(&m).expect("source verifies");
@@ -386,7 +386,7 @@ fn high_index_cluster_uses_offset_table() {
         blocks: vec![Block {
             params: vec![I32, I64],
             insts: vec![Inst::CallIndirect {
-                ty: hty,
+                ty: 0, // #922: interned at type-section index 0
                 idx: 0,
                 args: vec![1, 1],
             }],
@@ -409,7 +409,7 @@ fn high_index_cluster_uses_offset_table() {
         data_ptrs: vec![],
         data_funcrefs: vec![],
         impl_exports: vec![],
-        types: vec![],
+        types: vec![TypeEntry::Func(hty)], // #922: call_indirect sig, index 0
         debug_info: None,
     };
     verify_module(&m).expect("source verifies");
@@ -434,7 +434,7 @@ fn large_tail_uses_shared_continuation() {
         results: vec![I64],
     };
     let mut insts = vec![Inst::CallIndirect {
-        ty,
+        ty: 0, // #922: interned at type-section index 0
         idx: 0,
         args: vec![1],
     }]; // r = v2
@@ -472,7 +472,7 @@ fn large_tail_uses_shared_continuation() {
         data_ptrs: vec![],
         data_funcrefs: vec![],
         impl_exports: vec![],
-        types: vec![],
+        types: vec![TypeEntry::Func(ty)], // #922: call_indirect sig, index 0
         debug_info: None,
     };
     verify_module(&m).expect("source verifies");

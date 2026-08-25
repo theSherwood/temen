@@ -223,17 +223,26 @@ pub fn struct_rows() -> Vec<StructRow> {
             vec![callee_void.clone()],
         ),
     });
-    rows.push(inst_row(
-        "call_indirect",
-        Enc::Byte(0x74),
-        vec![i32t],
-        Inst::CallIndirect {
-            ty: ft_void.clone(),
-            idx: 0,
-            args: vec![],
-        },
-        false,
-    ));
+    rows.push({
+        let mut m = inst_module(
+            vec![i32t],
+            Inst::CallIndirect {
+                ty: 0, // #922: interned type index into the module type section
+                idx: 0,
+                args: vec![],
+            },
+            false,
+            vec![],
+        );
+        m.types = vec![temen_ir::TypeEntry::Func(ft_void.clone())];
+        StructRow {
+            id: "call_indirect".into(),
+            encoding: Enc::Byte(0x74),
+            verifies: true,
+            is_term: false,
+            module: m,
+        }
+    });
     rows.push(StructRow {
         id: "ref.func".into(),
         encoding: Enc::Byte(0x75),
@@ -243,60 +252,77 @@ pub fn struct_rows() -> Vec<StructRow> {
     });
 
     // ----- host: cap.call, cap.self.*, and the unresolved call_import (§7) -----
-    rows.push(inst_row(
-        "cap.call",
-        Enc::Byte(0x79),
-        vec![i32t],
-        Inst::CapCall {
-            type_id: 0,
-            op: 0,
-            sig: ft_void.clone(),
-            handle: 0,
-            args: vec![],
-        },
-        false,
-    ));
-    // `cap.self.count`/`get`/`resolve`/`label`/`attest` are no longer distinct wire ops (opcodes
-    // 0x7F/0xBE are retired gaps) — they encode as `cap.call CAP_SELF op N`, pinned by
-    // the `cap.call` row above.
-    // The pre-resolution import form: no valid module contains it (verifier rejects an
-    // unresolved import), so `verifies: false` — round-trip + byte pin only.
-    rows.push(StructRow {
-        id: "call_import".into(),
-        encoding: Enc::Byte(0x7C),
-        verifies: false,
-        is_term: false,
-        module: inst_module(
+    rows.push({
+        let mut m = inst_module(
             vec![i32t],
-            Inst::CallImport {
-                import: 0,
+            Inst::CapCall {
+                type_id: 0,
                 op: 0,
-                sig: ft_void.clone(),
-                args: vec![],
-            },
-            false,
-            vec![],
-        ),
-    });
-
-    // v8 §7/§22 link-form symbolic call: the loader-ABI placeholder. Never verifies by
-    // design (a surviving `call.sym` is an unresolved symbol) — round-trip + byte pin only.
-    rows.push(StructRow {
-        id: "call_sym".into(),
-        encoding: Enc::Byte(0x7B),
-        verifies: false,
-        is_term: false,
-        module: inst_module(
-            vec![i32t],
-            Inst::CallSym {
-                import: 0,
-                sig: ft_void.clone(),
+                sig: 0, // #922: interned type index into the module type section
                 handle: 0,
                 args: vec![],
             },
             false,
             vec![],
-        ),
+        );
+        m.types = vec![temen_ir::TypeEntry::Func(ft_void.clone())];
+        StructRow {
+            id: "cap.call".into(),
+            encoding: Enc::Byte(0x79),
+            verifies: true,
+            is_term: false,
+            module: m,
+        }
+    });
+    // `cap.self.count`/`get`/`resolve`/`label`/`attest` are no longer distinct wire ops (opcodes
+    // 0x7F/0xBE are retired gaps) — they encode as `cap.call CAP_SELF op N`, pinned by
+    // the `cap.call` row above.
+    // The pre-resolution import form: no valid module contains it (verifier rejects an
+    // unresolved import), so `verifies: false` — round-trip + byte pin only.
+    rows.push({
+        let mut m = inst_module(
+            vec![i32t],
+            Inst::CallImport {
+                import: 0,
+                op: 0,
+                sig: 0, // #922: interned type index into the module type section
+                args: vec![],
+            },
+            false,
+            vec![],
+        );
+        m.types = vec![temen_ir::TypeEntry::Func(ft_void.clone())];
+        StructRow {
+            id: "call_import".into(),
+            encoding: Enc::Byte(0x7C),
+            verifies: false,
+            is_term: false,
+            module: m,
+        }
+    });
+
+    // v8 §7/§22 link-form symbolic call: the loader-ABI placeholder. Never verifies by
+    // design (a surviving `call.sym` is an unresolved symbol) — round-trip + byte pin only.
+    rows.push({
+        let mut m = inst_module(
+            vec![i32t],
+            Inst::CallSym {
+                import: 0,
+                sig: 0, // #922: interned type index into the module type section
+                handle: 0,
+                args: vec![],
+            },
+            false,
+            vec![],
+        );
+        m.types = vec![temen_ir::TypeEntry::Func(ft_void.clone())];
+        StructRow {
+            id: "call_sym".into(),
+            encoding: Enc::Byte(0x7B),
+            verifies: false,
+            is_term: false,
+            module: m,
+        }
     });
 
     // v9 link-form data addresses (D-LINK): **object-dialect only** on the wire — the
@@ -571,22 +597,26 @@ pub fn struct_rows() -> Vec<StructRow> {
             vec![callee_void2],
         ),
     });
-    rows.push(StructRow {
-        id: "return_call_indirect".into(),
-        encoding: Enc::Byte(0x86),
-        verifies: true,
-        is_term: true,
-        module: term_module(
+    rows.push({
+        let mut m = term_module(
             vec![i32t],
             vec![],
             Terminator::ReturnCallIndirect {
-                ty: ft_void,
+                ty: 0, // #922: interned type index into the module type section
                 idx: 0,
                 args: vec![],
             },
             vec![],
             vec![],
-        ),
+        );
+        m.types = vec![temen_ir::TypeEntry::Func(ft_void)];
+        StructRow {
+            id: "return_call_indirect".into(),
+            encoding: Enc::Byte(0x86),
+            verifies: true,
+            is_term: true,
+            module: m,
+        }
     });
     rows.push(StructRow {
         id: "unreachable".into(),

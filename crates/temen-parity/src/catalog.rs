@@ -980,7 +980,7 @@ fn control_and_calls(ops: &mut Vec<Op>) {
     });
     // call_indirect through the function table (idx is an i32; targets funcs[idx]).
     let ci = Inst::CallIndirect {
-        ty: FuncType::default(),
+        ty: 0, /* #922: interned type index */
         idx: 0,
         args: vec![],
     };
@@ -996,6 +996,8 @@ fn control_and_calls(ops: &mut Vec<Op>) {
         focus: Focus::Inst(ci),
         module: Module {
             funcs: vec![ci_caller, nop],
+            // #922: the interned type section — `call_indirect`'s `ty: 0` resolves here.
+            types: vec![TypeEntry::Func(FuncType::default())],
             ..Module::default()
         },
         entry: 0,
@@ -1010,7 +1012,7 @@ fn caps_and_reflection(ops: &mut Vec<Op>) {
     let cc = Inst::CapCall {
         type_id: 1,
         op: 0,
-        sig: FuncType::default(),
+        sig: 0, /* #922: interned type index */
         handle: 1,
         args: vec![],
     };
@@ -1019,15 +1021,20 @@ fn caps_and_reflection(ops: &mut Vec<Op>) {
         "cap.call".into(),
         FAM,
         cc.clone(),
-        module1(
-            func(
-                vec![],
-                vec![],
-                vec![Inst::ConstI32(0), cc],
-                Terminator::Return(vec![]),
-            ),
-            false,
-        ),
+        {
+            let mut m = module1(
+                func(
+                    vec![],
+                    vec![],
+                    vec![Inst::ConstI32(0), cc],
+                    Terminator::Return(vec![]),
+                ),
+                false,
+            );
+            // #922: the interned type section — `cap.call`'s `sig: 0` resolves here.
+            m.types = vec![TypeEntry::Func(FuncType::default())];
+            m
+        },
         skip,
     );
     // Reflection intrinsics. `cap.self.count`/`get`/`resolve`/`label`/`attest` are no longer distinct
@@ -1064,7 +1071,7 @@ fn caps_and_reflection(ops: &mut Vec<Op>) {
             Inst::CallImport {
                 import: 0,
                 op: 0,
-                sig: FuncType::default(),
+                sig: 0, /* #922: interned type index */
                 args: vec![],
             },
         ),
@@ -1073,7 +1080,7 @@ fn caps_and_reflection(ops: &mut Vec<Op>) {
             Inst::CallImportDyn {
                 ty: 0,
                 op: 0,
-                sig: FuncType::default(),
+                sig: 0, /* #922: interned type index */
                 handle: 0,
                 args: vec![],
             },
@@ -1082,7 +1089,7 @@ fn caps_and_reflection(ops: &mut Vec<Op>) {
             "call.sym",
             Inst::CallSym {
                 import: 0,
-                sig: FuncType::default(),
+                sig: 0, /* #922: interned type index */
                 handle: 0,
                 args: vec![],
             },
@@ -1109,7 +1116,7 @@ fn process(ops: &mut Vec<Op>) {
     let capcall = |type_id: u32, op: u32| Inst::CapCall {
         type_id,
         op,
-        sig: FuncType::default(),
+        sig: 0, /* #922: interned type index */
         handle: 0,
         args: vec![],
     };
@@ -1364,7 +1371,7 @@ fn terminators(ops: &mut Vec<Op>) {
             params: vec![],
             insts: vec![Inst::ConstI32(1)],
             term: Terminator::ReturnCallIndirect {
-                ty: FuncType::default(),
+                ty: 0, /* #922: interned type index */
                 idx: 0,
                 args: vec![],
             },
@@ -1374,12 +1381,14 @@ fn terminators(ops: &mut Vec<Op>) {
         mnemonic: "return_call_indirect".into(),
         family: FAM,
         focus: Focus::Term(Terminator::ReturnCallIndirect {
-            ty: FuncType::default(),
+            ty: 0, /* #922: interned type index */
             idx: 0,
             args: vec![],
         }),
         module: Module {
             funcs: vec![rci_caller, rc_target],
+            // #922: the interned type section — `return_call_indirect`'s `ty: 0` resolves here.
+            types: vec![TypeEntry::Func(FuncType::default())],
             ..Module::default()
         },
         entry: 0,

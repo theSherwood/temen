@@ -110,11 +110,15 @@ fn find_site(f: &Func, module: &Module, cap: usize) -> Option<Site> {
     for (bi, b) in f.blocks.iter().enumerate() {
         for (k, inst) in b.insts.iter().enumerate() {
             if let Inst::CallIndirect { ty, .. } = inst {
-                if let Some(cands) = candidates(module, ty, cap) {
+                // FuncType interning (#922): resolve the interned index to its signature.
+                let Some(temen_ir::TypeEntry::Func(ftype)) = module.types.get(*ty as usize) else {
+                    continue;
+                };
+                if let Some(cands) = candidates(module, ftype, cap) {
                     return Some(Site {
                         block: bi,
                         k,
-                        ty: ty.clone(),
+                        ty: ftype.clone(),
                         cands,
                     });
                 }
@@ -148,7 +152,22 @@ fn carry_funcs(module: &Module, funcs: Vec<Func>) -> Module {
         data_exports: Vec::new(),
         data_funcrefs: Vec::new(),
         impl_exports: Vec::new(),
-        types: Vec::new(),
+        // FuncType interning (#922): the residual's `call_indirect`/`cap.call` carry an interned
+        // `types` index, so the type section must survive — but **string-free** (this crate can't
+        // clone a `String`). `Func` entries are pure `ValType` vecs (no strings) and clone as-is;
+        // `Interface` entries carry op-name strings, so they collapse to an empty placeholder `Func`
+        // at the same index — sound because the residual drops imports, so no `call.import.dyn`
+        // (the only interface-referencing op) can survive to read one.
+        types: module
+            .types
+            .iter()
+            .map(|t| match t {
+                temen_ir::TypeEntry::Func(ft) => temen_ir::TypeEntry::Func(ft.clone()),
+                temen_ir::TypeEntry::Interface(_) => {
+                    temen_ir::TypeEntry::Func(temen_ir::FuncType::default())
+                }
+            })
+            .collect(),
         debug_info: None,
     }
 }
@@ -170,8 +189,8 @@ pub fn lower_indirect_dispatch(module: &Module, cap: usize) -> Module {
         // Rewrite one eligible site per pass, re-typing the (growing) function each time; a lowered
         // site becomes direct calls and is never re-found, so this drains in finitely many passes.
         while let Some(site) = find_site(f, module, cap) {
-            let types = func_value_types(f, &module.funcs, has_memory);
-            split_site(f, site, &types, mask, &fn_results);
+            let types = func_value_types(f, &module.funcs, &module.types, has_memory);
+            split_site(f, site, &types, &module.types, mask, &fn_results);
         }
     }
     carry_funcs(module, funcs)
@@ -181,7 +200,14 @@ pub fn lower_indirect_dispatch(module: &Module, cap: usize) -> Module {
 /// direct-call arm per candidate, an `unreachable` default, and a continuation carrying the
 /// original block tail. Live values crossing the split are threaded as block parameters (dead ones
 /// are removed by the optimizer). `types` is the pre-split value typing of the function.
-fn split_site(f: &mut Func, site: Site, types: &[Vec<ValType>], mask: i32, fn_results: &[usize]) {
+fn split_site(
+    f: &mut Func,
+    site: Site,
+    types: &[Vec<ValType>],
+    type_section: &[temen_ir::TypeEntry],
+    mask: i32,
+    fn_results: &[usize],
+) {
     let Site {
         block: bi,
         k,
@@ -207,7 +233,7 @@ fn split_site(f: &mut Func, site: Site, types: &[Vec<ValType>], mask: i32, fn_re
     // occupy [head_count, head_count + r), and the tail's own values follow.
     let mut head_count = b_params.len();
     for inst in &head_insts_src {
-        head_count += inst.result_count(fn_results);
+        head_count += inst.result_count(fn_results, type_section);
     }
     let head_count = head_count as u32;
 

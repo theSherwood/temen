@@ -293,6 +293,7 @@ pub fn optimize_module_with(m: &Module, cfg: &OptConfig) -> Module {
     };
     let m = &inlined;
     let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
+    let types = &m.types;
     let has_memory = m.memory.is_some();
     let optimized = Module {
         data_ptrs: Vec::new(),
@@ -306,14 +307,14 @@ pub fn optimize_module_with(m: &Module, cfg: &OptConfig) -> Module {
                 // through block params), then `optimize_func` (SCCP + fixpoint) DCEs the dead
                 // duplicates and drops any parameter left unused.
                 let g = if cfg.gvn {
-                    gvn::gvn(f, &m.funcs, has_memory)
+                    gvn::gvn(f, &m.funcs, &m.types, has_memory)
                 } else {
                     f.clone()
                 };
                 // Loop-invariant code motion (OPT.md Phase 2): hoist pure, non-trapping invariants
                 // out of loops; the fixpoint below DCEs the emptied-out originals.
                 let g = if cfg.licm {
-                    licm::licm(&g, &m.funcs, has_memory)
+                    licm::licm(&g, &m.funcs, &m.types, has_memory)
                 } else {
                     g
                 };
@@ -321,11 +322,11 @@ pub fn optimize_module_with(m: &Module, cfg: &OptConfig) -> Module {
                 // a dominating access already established with no write between, threading that value
                 // in — the memory analogue of GVN. Runs after GVN so addresses are already congruent.
                 let g = if cfg.load_elim {
-                    load_elim::load_elim(&g, &m.funcs, has_memory)
+                    load_elim::load_elim(&g, &m.funcs, &m.types, has_memory)
                 } else {
                     g
                 };
-                optimize_func_with(&g, &fn_results, cfg)
+                optimize_func_with(&g, &fn_results, types, cfg)
             })
             .collect(),
         memory: m.memory,
@@ -348,64 +349,85 @@ pub fn optimize_module_with(m: &Module, cfg: &OptConfig) -> Module {
 }
 
 /// Optimize a single function with the full pipeline (see [`optimize_func_with`]).
-pub fn optimize_func(f: &Func, fn_results: &[usize]) -> Func {
-    optimize_func_with(f, fn_results, &OptConfig::all())
+pub fn optimize_func(f: &Func, fn_results: &[usize], types: &[temen_ir::TypeEntry]) -> Func {
+    optimize_func_with(f, fn_results, types, &OptConfig::all())
 }
 
 /// Optimize a single function to a fixpoint, running only the passes enabled in `cfg`: fold + resolve
 /// branches, prune dead blocks, merge straight-line chains, drop dead block parameters, and drop dead
 /// values — repeating until nothing changes. Every pass only simplifies, so this terminates; the cap
 /// guards pathologies.
-pub fn optimize_func_with(f: &Func, fn_results: &[usize], cfg: &OptConfig) -> Func {
+pub fn optimize_func_with(
+    f: &Func,
+    fn_results: &[usize],
+    types: &[temen_ir::TypeEntry],
+    cfg: &OptConfig,
+) -> Func {
     // SCCP (OPT.md Phase 2) runs first: it propagates constants *globally* — through block
     // parameters and around loops, with conditional reachability — folding what the per-block passes
     // below cannot see. It materializes constants and resolves constant branches; the fixpoint then
     // prunes the newly-unreachable blocks, DCEs the dead selector code, merges, and re-folds.
     let f = if cfg.sccp {
-        sccp::sccp(f, fn_results)
+        sccp::sccp(f, fn_results, types)
     } else {
         f.clone()
     };
     // Constant reassociation (OPT.md Phase 2): fold `(x OP c1) OP c2` chains so the fixpoint below
     // then folds the combined constants and DCEs the dead inner ops.
     let f = if cfg.reassociate {
-        reassociate::reassociate(&f, fn_results)
+        reassociate::reassociate(&f, fn_results, types)
     } else {
         f
     };
-    let mut blocks: Vec<Block> = f.blocks.iter().map(|b| fold_block(b, fn_results)).collect();
+    let mut blocks: Vec<Block> = f
+        .blocks
+        .iter()
+        .map(|b| fold_block(b, fn_results, types))
+        .collect();
     for _ in 0..1000 {
         let before = blocks.clone();
         blocks = prune_unreachable(blocks);
-        blocks = merge_blocks(blocks, fn_results);
-        blocks = drop_dead_params(blocks, fn_results);
+        blocks = merge_blocks(blocks, fn_results, types);
+        blocks = drop_dead_params(blocks, fn_results, types);
         // Copy propagation + identity forwarding: rewrite uses of a value that is a copy of an
         // earlier one (a constant-condition `select`, or an algebraic identity like `x+0`/`x*1`)
         // to that earlier value, so the copy instruction becomes dead for the DCE pass below.
         blocks = blocks
             .iter()
-            .map(|b| copy_propagate(b, fn_results))
+            .map(|b| copy_propagate(b, fn_results, types))
             .collect();
         // Common-subexpression elimination: dedup redundant *pure* computations within a block, so
         // the duplicates become dead for the DCE below.
         if cfg.local_cse {
-            blocks = blocks.iter().map(|b| local_cse(b, fn_results)).collect();
+            blocks = blocks
+                .iter()
+                .map(|b| local_cse(b, fn_results, types))
+                .collect();
         }
         // Memory forwarding (OPT.md Phase 4): within a block, drop a load made redundant by an earlier
         // identical load or a matching store (store-to-load forwarding), forwarding its result. Runs
         // after CSE so recomputed addresses share one value (making the address keys match).
         if cfg.mem {
-            blocks = blocks.iter().map(|b| mem_forward(b, fn_results)).collect();
+            blocks = blocks
+                .iter()
+                .map(|b| mem_forward(b, fn_results, types))
+                .collect();
         }
-        blocks = blocks.iter().map(|b| dce_block(b, fn_results)).collect();
+        blocks = blocks
+            .iter()
+            .map(|b| dce_block(b, fn_results, types))
+            .collect();
         // Re-fold: merging brings a constant's definition into the same block as its use, and
         // dropping params can expose new constants — both newly foldable here.
-        blocks = blocks.iter().map(|b| fold_block(b, fn_results)).collect();
+        blocks = blocks
+            .iter()
+            .map(|b| fold_block(b, fn_results, types))
+            .collect();
         // Jump threading: redirect an edge that reaches an empty conditional forwarder with a
         // constant selector straight to the resolved target (correlated branches). The next
         // iteration's prune/merge cleans up any forwarder left with no predecessors.
         if cfg.jump_thread {
-            blocks = jump_thread(&blocks, fn_results);
+            blocks = jump_thread(&blocks, fn_results, types);
         }
         if blocks == before {
             break;
@@ -420,14 +442,14 @@ pub fn optimize_func_with(f: &Func, fn_results: &[usize], cfg: &OptConfig) -> Fu
 
 /// Forward pass over one block: replace foldable instructions with constants in place, then
 /// resolve the terminator against the constants discovered. No value indices move.
-fn fold_block(b: &Block, fn_results: &[usize]) -> Block {
+fn fold_block(b: &Block, fn_results: &[usize], types: &[temen_ir::TypeEntry]) -> Block {
     // `known[i]` is the constant value (if any) of block-local value index `i`. Seed with the
     // block params (always unknown), then extend by each instruction's result arity in order.
     let mut known: Vec<Option<Known>> = vec![None; b.params.len()];
     let mut insts = b.insts.clone();
 
     for inst in insts.iter_mut() {
-        let rc = inst.result_count(fn_results);
+        let rc = inst.result_count(fn_results, types);
         if rc == 1 {
             if let Some(k) = try_fold(inst, &known) {
                 *inst = k.to_const_inst();
@@ -1770,7 +1792,7 @@ fn forward_to_operand(inst: &Inst, known: &[Option<Known>]) -> Option<ValIdx> {
 /// (see [`forward_to_operand`]) to that earlier value; the now-unused copy instruction is removed by
 /// the following DCE pass. Index-stable (no instruction is removed here). Sound because an operand
 /// only references an earlier value in the same block, which dominates the use.
-fn copy_propagate(b: &Block, fn_results: &[usize]) -> Block {
+fn copy_propagate(b: &Block, fn_results: &[usize], types: &[temen_ir::TypeEntry]) -> Block {
     let mut known: Vec<Option<Known>> = vec![None; b.params.len()];
     // `repl[v]` is the value `v` forwards to (its root); params and non-copies map to themselves.
     let mut repl: Vec<ValIdx> = (0..b.params.len() as u32).collect();
@@ -1779,7 +1801,7 @@ fn copy_propagate(b: &Block, fn_results: &[usize]) -> Block {
     for inst in insts.iter_mut() {
         // Compose with prior forwarding first, so an operand always names its root.
         map_operands(inst, &mut |o| repl[o as usize]);
-        let rc = inst.result_count(fn_results);
+        let rc = inst.result_count(fn_results, types);
         if rc == 1 {
             let root = match forward_to_operand(inst, &known) {
                 Some(src) => repl[src as usize],
@@ -1817,7 +1839,7 @@ fn copy_propagate(b: &Block, fn_results: &[usize]) -> Block {
 /// may change between them, they may trap or have effects) is never a CSE candidate — the effects
 /// table draws that line. Restricted to a single block, so the earlier definition trivially dominates
 /// the use and no block-parameter threading is needed (that is the job of the later global GVN).
-fn local_cse(b: &Block, fn_results: &[usize]) -> Block {
+fn local_cse(b: &Block, fn_results: &[usize], types: &[temen_ir::TypeEntry]) -> Block {
     // `repl[v]` is the value `v` forwards to (its CSE root); params and non-redundant ops map to self.
     let mut repl: Vec<ValIdx> = (0..b.params.len() as u32).collect();
     let mut insts = b.insts.clone();
@@ -1827,7 +1849,7 @@ fn local_cse(b: &Block, fn_results: &[usize]) -> Block {
     for inst in insts.iter_mut() {
         // Compose with prior forwarding first, so operands name their roots before we compare.
         map_operands(inst, &mut |o| repl[o as usize]);
-        let rc = inst.result_count(fn_results);
+        let rc = inst.result_count(fn_results, types);
         if rc == 1 {
             let root = if inst.effects().is_pure() {
                 match seen.iter().find(|(prev, _)| *prev == *inst) {
@@ -1928,13 +1950,13 @@ pub(crate) fn ranges_disjoint(o1: u64, w1: u64, o2: u64, w2: u64) -> bool {
 /// because the earlier same-address, same-width access already proved the address in-bounds (loads are
 /// confined/masked, so bounds is the only fault and `align` is a hint). The pass removes the load
 /// itself — general DCE keeps loads (possible traps), so this pass carries the safety argument.
-fn mem_forward(b: &Block, fn_results: &[usize]) -> Block {
+fn mem_forward(b: &Block, fn_results: &[usize], types: &[temen_ir::TypeEntry]) -> Block {
     let nparams = b.params.len() as u32;
     let mut result_start = Vec::with_capacity(b.insts.len());
     let mut total = nparams;
     for inst in &b.insts {
         result_start.push(total);
-        total += inst.result_count(fn_results) as u32;
+        total += inst.result_count(fn_results, types) as u32;
     }
 
     // old block-local value → new value (a removed load's result maps to the forwarded value).
@@ -2028,7 +2050,7 @@ fn mem_forward(b: &Block, fn_results: &[usize]) -> Block {
                 let mut ni = other.clone();
                 map_operands(&mut ni, &mut |o| map[o as usize]);
                 insts.push(ni);
-                let rc = other.result_count(fn_results) as u32;
+                let rc = other.result_count(fn_results, types) as u32;
                 for r in 0..rc {
                     map[(result_start[i] + r) as usize] = next;
                     next += 1;
@@ -2231,7 +2253,7 @@ pub(crate) fn each_operand(inst: &Inst, mut visit: impl FnMut(ValIdx)) {
 /// Remove dead values from one block: a backward liveness sweep marks every value used by a
 /// kept instruction or the terminator, removable instructions whose results are all dead are
 /// dropped, and the survivors are renumbered with every operand rewritten through the new map.
-fn dce_block(b: &Block, fn_results: &[usize]) -> Block {
+fn dce_block(b: &Block, fn_results: &[usize], types: &[temen_ir::TypeEntry]) -> Block {
     let nparams = b.params.len() as u32;
 
     // The first result index of each instruction, and the total value count of the block.
@@ -2239,7 +2261,7 @@ fn dce_block(b: &Block, fn_results: &[usize]) -> Block {
     let mut next = nparams;
     for inst in &b.insts {
         result_start.push(next);
-        next += inst.result_count(fn_results) as u32;
+        next += inst.result_count(fn_results, types) as u32;
     }
     let total = next as usize;
 
@@ -2256,7 +2278,7 @@ fn dce_block(b: &Block, fn_results: &[usize]) -> Block {
     let mut keep = vec![false; b.insts.len()];
     for i in (0..b.insts.len()).rev() {
         let inst = &b.insts[i];
-        let rc = inst.result_count(fn_results) as u32;
+        let rc = inst.result_count(fn_results, types) as u32;
         let start = result_start[i];
         let any_live = (0..rc).any(|k| live[(start + k) as usize]);
         if any_live || !is_removable_if_dead(inst) {
@@ -2273,7 +2295,7 @@ fn dce_block(b: &Block, fn_results: &[usize]) -> Block {
     }
     let mut new_next = nparams;
     for (i, &start) in result_start.iter().enumerate() {
-        let rc = b.insts[i].result_count(fn_results) as u32;
+        let rc = b.insts[i].result_count(fn_results, types) as u32;
         if keep[i] {
             for k in 0..rc {
                 map[(start + k) as usize] = Some(new_next);
@@ -2307,10 +2329,10 @@ fn dce_block(b: &Block, fn_results: &[usize]) -> Block {
 // ---------------------------------------------------------------------------------------
 
 /// Total number of SSA values a block defines: its parameters plus every instruction result.
-fn val_count(b: &Block, fn_results: &[usize]) -> u32 {
+fn val_count(b: &Block, fn_results: &[usize], types: &[temen_ir::TypeEntry]) -> u32 {
     let mut n = b.params.len() as u32;
     for inst in &b.insts {
-        n += inst.result_count(fn_results) as u32;
+        n += inst.result_count(fn_results, types) as u32;
     }
     n
 }
@@ -2331,7 +2353,11 @@ fn pred_counts(blocks: &[Block]) -> Vec<u32> {
 /// into that predecessor, to a fixpoint. The successor's parameters bind to the branch arguments
 /// and its body/terminator are appended (operands renumbered). The entry block is never merged
 /// away. This collapses the `br`-chains the specializer emits into straight-line code.
-fn merge_blocks(mut blocks: Vec<Block>, fn_results: &[usize]) -> Vec<Block> {
+fn merge_blocks(
+    mut blocks: Vec<Block>,
+    fn_results: &[usize],
+    types: &[temen_ir::TypeEntry],
+) -> Vec<Block> {
     loop {
         let preds = pred_counts(&blocks);
         // Find a predecessor `a` whose terminator is an unconditional `br` to a mergeable `b`.
@@ -2355,7 +2381,7 @@ fn merge_blocks(mut blocks: Vec<Block>, fn_results: &[usize]) -> Vec<Block> {
             Terminator::Br { args, .. } => args.clone(),
             _ => unreachable!("selected block must end in `br`"),
         };
-        let base = val_count(&blocks[a], fn_results);
+        let base = val_count(&blocks[a], fn_results, types);
         let nparams_b = blocks[b].params.len() as u32;
         let b_insts = blocks[b].insts.clone();
         let b_term = blocks[b].term.clone();
@@ -2399,12 +2425,16 @@ fn remove_block(blocks: &mut Vec<Block>, b: usize) {
 /// Drop block parameters that are never referenced within their block, and the matching argument
 /// in every predecessor edge. One pass over all blocks (cascades are caught by the outer fixpoint).
 /// The entry block's parameters are the function signature and are never dropped.
-fn drop_dead_params(blocks: Vec<Block>, fn_results: &[usize]) -> Vec<Block> {
+fn drop_dead_params(
+    blocks: Vec<Block>,
+    fn_results: &[usize],
+    types: &[temen_ir::TypeEntry],
+) -> Vec<Block> {
     let n = blocks.len();
     // Dead parameter positions per block (entry excluded).
     let mut dropped: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (b, blk) in blocks.iter().enumerate().skip(1) {
-        let used = used_values(blk, fn_results);
+        let used = used_values(blk, fn_results, types);
         for (p, &u) in used.iter().take(blk.params.len()).enumerate() {
             if !u {
                 dropped[b].push(p);
@@ -2434,8 +2464,8 @@ fn drop_dead_params(blocks: Vec<Block>, fn_results: &[usize]) -> Vec<Block> {
 }
 
 /// Which SSA values a block references (as an instruction or terminator operand).
-fn used_values(b: &Block, fn_results: &[usize]) -> Vec<bool> {
-    let mut used = vec![false; val_count(b, fn_results) as usize];
+fn used_values(b: &Block, fn_results: &[usize], types: &[temen_ir::TypeEntry]) -> Vec<bool> {
+    let mut used = vec![false; val_count(b, fn_results, types) as usize];
     for inst in &b.insts {
         each_operand(inst, |v| used[v as usize] = true);
     }
@@ -2501,10 +2531,14 @@ fn remove_params(b: &Block, dropped: &[usize]) -> Block {
 /// single-result instruction contributes its literal value (after folding, every folded op has
 /// become a `const`). This is the same seeding as [`fold_block`], minus the folding — it runs after
 /// `fold_block` in the fixpoint, so operands are already materialized where they can be.
-pub(crate) fn block_consts(b: &Block, fn_results: &[usize]) -> Vec<Option<Known>> {
+pub(crate) fn block_consts(
+    b: &Block,
+    fn_results: &[usize],
+    types: &[temen_ir::TypeEntry],
+) -> Vec<Option<Known>> {
     let mut known: Vec<Option<Known>> = vec![None; b.params.len()];
     for inst in &b.insts {
-        let rc = inst.result_count(fn_results);
+        let rc = inst.result_count(fn_results, types);
         if rc == 1 {
             known.push(const_value(inst));
         } else {
@@ -2637,9 +2671,15 @@ fn redirect_edges(term: &Terminator, blocks: &[Block], q_consts: &[Option<Known>
 /// constant on each incoming edge (so its meet is not constant). Analysis reads the original blocks;
 /// the surrounding fixpoint's prune/merge then cleans up any forwarder left with no predecessors, and
 /// re-runs threading so multi-hop chains collapse a hop per iteration.
-fn jump_thread(blocks: &[Block], fn_results: &[usize]) -> Vec<Block> {
-    let consts: Vec<Vec<Option<Known>>> =
-        blocks.iter().map(|b| block_consts(b, fn_results)).collect();
+fn jump_thread(
+    blocks: &[Block],
+    fn_results: &[usize],
+    types: &[temen_ir::TypeEntry],
+) -> Vec<Block> {
+    let consts: Vec<Vec<Option<Known>>> = blocks
+        .iter()
+        .map(|b| block_consts(b, fn_results, types))
+        .collect();
     blocks
         .iter()
         .enumerate()

@@ -150,13 +150,23 @@ fn verify_func(
                 &fn_results,
             )?;
         }
-        check_term(&b.term, &types, f, funcs)?;
+        check_term(&b.term, &types, f, funcs, tsec)?;
     }
     Ok(())
 }
 
 /// Resolve interface entry `t`'s op-`op` signature through the type section, or `None` when
 /// `t` is not a well-formed interface reference or `op` is out of range (§3.5).
+/// Resolve an interned call type index (#922) to its `FuncType` — the index a call variant
+/// (`call_indirect`, `cap.call`, `call.import`, …) carries in place of an inline signature. `None`
+/// if `t` is out of range or names an `Interface` rather than a `Func` (the verifier rejects it).
+fn func_sig(tsec: &[temen_ir::TypeEntry], t: u32) -> Option<&temen_ir::FuncType> {
+    match tsec.get(t as usize)? {
+        temen_ir::TypeEntry::Func(ft) => Some(ft),
+        temen_ir::TypeEntry::Interface(_) => None,
+    }
+}
+
 fn iface_op_sig(tsec: &[temen_ir::TypeEntry], t: u32, op: u32) -> Option<&temen_ir::FuncType> {
     match tsec.get(t as usize)? {
         temen_ir::TypeEntry::Interface(elems) => {
@@ -397,8 +407,10 @@ fn check_inst(
         }
         Inst::CallIndirect { ty, idx, args } => {
             w(*idx, V::I32)?;
-            check_args(types, args, &ty.params)?;
-            ty.results.clone()
+            let sig = func_sig(tsec, *ty)
+                .ok_or_else(|| format!("call_indirect type {ty} is not a func type"))?;
+            check_args(types, args, &sig.params)?;
+            sig.results.clone()
         }
         Inst::RefFunc { func } => {
             if *func as usize >= funcs.len() {
@@ -410,6 +422,8 @@ fn check_inst(
             sig, handle, args, ..
         } => {
             w(*handle, V::I32)?; // forgeable index; safety is the runtime check (D37)
+            let sig = func_sig(tsec, *sig)
+                .ok_or_else(|| format!("cap.call type {sig} is not a func type"))?;
             check_args(types, args, &sig.params)?;
             sig.results.clone()
         }
@@ -438,6 +452,8 @@ fn check_inst(
             let Some(want_sig) = want_sig else {
                 return Err(format!("import {import} op 0 out of range for its shape"));
             };
+            let sig = func_sig(tsec, *sig)
+                .ok_or_else(|| format!("call.sym {import} type is not a func type"))?;
             if want_sig != sig {
                 return Err(format!("import {import} signature mismatch with manifest"));
             }
@@ -475,6 +491,8 @@ fn check_inst(
                     "import {import} op {op} out of range for its shape"
                 ));
             };
+            let sig = func_sig(tsec, *sig)
+                .ok_or_else(|| format!("call.import {import} type is not a func type"))?;
             if want_sig != sig {
                 return Err(format!("import {import} signature mismatch with manifest"));
             }
@@ -495,6 +513,8 @@ fn check_inst(
                     "call.import.dyn type {ty} op {op} is not a well-formed interface op"
                 ));
             };
+            let sig = func_sig(tsec, *sig)
+                .ok_or_else(|| format!("call.import.dyn type {ty} sig is not a func type"))?;
             if want_sig != sig {
                 return Err(format!("call.import.dyn type {ty} signature mismatch"));
             }
@@ -606,7 +626,7 @@ fn check_inst(
             for v in [heap_lo, heap_hi, mask, buf, cap] {
                 w(*v, V::I64)?;
             }
-            if let Some(m) = const_i64(block, fn_results, *mask) {
+            if let Some(m) = const_i64(block, fn_results, tsec, *mask) {
                 if (m as u64) | 0xFF00_0000_0000_0000 != u64::MAX {
                     return Err(format!("gc.roots constant mask {m:#x} clears low bits"));
                 }
@@ -797,7 +817,13 @@ fn check_args(types: &[ValType], args: &[ValIdx], params: &[ValType]) -> R {
 
 /// §3b rule 4 + terminator typing: exactly-one-terminator is structural in `temen-ir`
 /// (`Block::term`), so what remains is edge/return/tail-call checking.
-fn check_term(term: &Terminator, types: &[ValType], f: &Func, funcs: &[Func]) -> R {
+fn check_term(
+    term: &Terminator,
+    types: &[ValType],
+    f: &Func,
+    funcs: &[Func],
+    tsec: &[temen_ir::TypeEntry],
+) -> R {
     use ValType as V;
     let edge = |target: BlockIdx, args: &[ValIdx]| -> R {
         let tb = f
@@ -867,8 +893,10 @@ fn check_term(term: &Terminator, types: &[ValType], f: &Func, funcs: &[Func]) ->
         }
         Terminator::ReturnCallIndirect { ty, idx, args } => {
             want(types, *idx, V::I32)?;
-            check_args(types, args, &ty.params)?;
-            if ty.results != f.results {
+            let sig = func_sig(tsec, *ty)
+                .ok_or_else(|| format!("return_call_indirect type {ty} is not a func type"))?;
+            check_args(types, args, &sig.params)?;
+            if sig.results != f.results {
                 return Err("tail-callee results != function results".into());
             }
             Ok(())
@@ -880,10 +908,15 @@ fn check_term(term: &Terminator, types: &[ValType], f: &Func, funcs: &[Func]) ->
 /// The constant an operand resolves to when its defining instruction is an earlier
 /// `i64.const` in this block (params and non-consts give `None`). Value numbering:
 /// params take `0..params.len()`, then each instruction its `result_count` indices.
-fn const_i64(b: &Block, fn_results: &[usize], v: ValIdx) -> Option<i64> {
+fn const_i64(
+    b: &Block,
+    fn_results: &[usize],
+    tsec: &[temen_ir::TypeEntry],
+    v: ValIdx,
+) -> Option<i64> {
     let mut idx = b.params.len() as u32;
     for inst in &b.insts {
-        let n = inst.result_count(fn_results) as u32;
+        let n = inst.result_count(fn_results, tsec) as u32;
         if v >= idx && v < idx + n {
             return match inst {
                 Inst::ConstI64(c) => Some(*c),

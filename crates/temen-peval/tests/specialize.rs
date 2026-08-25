@@ -9,8 +9,8 @@
 use temen_interp::{Trap, Value};
 use temen_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
-    FuncType, IToF, Inst, IntTy, LoadOp, Memory, Module, StoreOp, Terminator, VBitBinOp, VCvtOp,
-    VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp,
+    FuncType, IToF, Inst, IntTy, LoadOp, Memory, Module, StoreOp, Terminator, TypeEntry, VBitBinOp,
+    VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp,
     VSatBinOp, VShape, VShiftOp, VWidenOp, ValType,
 };
 use temen_peval::{
@@ -2479,7 +2479,7 @@ fn const_indirect_call_via_ref_func_inlines() {
                     insts: vec![
                         Inst::RefFunc { func: 1 }, // 1: funcref double (folds to const 1)
                         Inst::CallIndirect {
-                            ty: i64_to_i64(),
+                            ty: 0,
                             idx: 1,
                             args: vec![0],
                         }, // 2
@@ -2489,6 +2489,7 @@ fn const_indirect_call_via_ref_func_inlines() {
             },
             double_func(),
         ],
+        types: vec![TypeEntry::Func(i64_to_i64())], // #922: call_indirect sig, index 0
         ..Default::default()
     };
     verify_module(&m).expect("verifies");
@@ -2531,7 +2532,7 @@ fn indirect_call_through_constant_memory_table_inlines() {
                             offset: 0,
                         }, // 2: funcref (folds to 1)
                         Inst::CallIndirect {
-                            ty: i64_to_i64(),
+                            ty: 0,
                             idx: 2,
                             args: vec![0],
                         }, // 3
@@ -2547,6 +2548,7 @@ fn indirect_call_through_constant_memory_table_inlines() {
             readonly: true,
             bytes: 1i32.to_le_bytes().to_vec(), // the table holds func index 1 (double)
         }],
+        types: vec![TypeEntry::Func(i64_to_i64())], // #922: call_indirect sig, index 0
         ..Default::default()
     };
     verify_module(&m).expect("verifies");
@@ -2582,7 +2584,7 @@ fn const_indirect_tail_call_inlines() {
                     params: vec![ValType::I64],             // 0: x
                     insts: vec![Inst::RefFunc { func: 1 }], // 1
                     term: Terminator::ReturnCallIndirect {
-                        ty: i64_to_i64(),
+                        ty: 0,
                         idx: 1,
                         args: vec![0],
                     },
@@ -2590,6 +2592,7 @@ fn const_indirect_tail_call_inlines() {
             },
             double_func(),
         ],
+        types: vec![TypeEntry::Func(i64_to_i64())], // #922: call_indirect sig, index 0
         ..Default::default()
     };
     verify_module(&m).expect("verifies");
@@ -2621,7 +2624,7 @@ fn indirect_call_to_dynamic_cf_callee_inlines_as_cfg() {
                     insts: vec![
                         Inst::RefFunc { func: 1 },
                         Inst::CallIndirect {
-                            ty: i64_to_i64(),
+                            ty: 0,
                             idx: 1,
                             args: vec![0],
                         },
@@ -2673,6 +2676,7 @@ fn indirect_call_to_dynamic_cf_callee_inlines_as_cfg() {
                 ],
             },
         ],
+        types: vec![TypeEntry::Func(i64_to_i64())], // #922: call_indirect sig, index 0
         ..Default::default()
     };
     verify_module(&m).expect("verifies");
@@ -2709,7 +2713,7 @@ fn unresolvable_indirect_calls_are_unsupported() {
                 blocks: vec![Block {
                     params: vec![ValType::I64, ValType::I32],
                     insts: vec![Inst::CallIndirect {
-                        ty: i64_to_i64(),
+                        ty: 0,
                         idx: 1,
                         args: vec![0],
                     }],
@@ -2718,6 +2722,7 @@ fn unresolvable_indirect_calls_are_unsupported() {
             },
             double_func(),
         ],
+        types: vec![TypeEntry::Func(i64_to_i64())], // #922: call_indirect sig, index 0
         ..Default::default()
     };
     verify_module(&dynamic_idx).expect("verifies");
@@ -2738,7 +2743,7 @@ fn unresolvable_indirect_calls_are_unsupported() {
                     insts: vec![
                         Inst::RefFunc { func: 1 }, // points at a (i64,i64)->i64 function
                         Inst::CallIndirect {
-                            ty: i64_to_i64(), // but the call signature is (i64)->i64
+                            ty: 0, // but the call signature is (i64)->i64
                             idx: 1,
                             args: vec![0],
                         },
@@ -2761,6 +2766,7 @@ fn unresolvable_indirect_calls_are_unsupported() {
                 }],
             },
         ],
+        types: vec![TypeEntry::Func(i64_to_i64())], // #922: call_indirect sig, index 0
         ..Default::default()
     };
     verify_module(&bad_sig).expect("verifies");

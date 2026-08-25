@@ -227,7 +227,7 @@ fn keeps_all_functions_when_indirect_dispatch_present() {
             insts: vec![
                 Inst::RefFunc { func: 2 }, // v1 = funcref(2)
                 Inst::CallIndirect {
-                    ty: sig,
+                    ty: 0, // #922: sig interned at type-section index 0
                     idx: 1,
                     args: vec![0],
                 }, // v2 = (*funcref)(a)
@@ -241,6 +241,7 @@ fn keeps_all_functions_when_indirect_dispatch_present() {
             add_const(999), // 1 (uncalled, but must be kept — indirect dispatch present)
             add_const(1),   // 2 (indirect target)
         ],
+        types: vec![temen_ir::TypeEntry::Func(sig.clone())], // #922
         ..Default::default()
     };
     verify_module(&m).expect("input verifies");
@@ -681,7 +682,7 @@ fn devirtualizes_constant_funcref_then_inlines_and_dfes() {
             insts: vec![
                 Inst::RefFunc { func: 1 }, // v1 = funcref(1)
                 Inst::CallIndirect {
-                    ty: sig.clone(),
+                    ty: 0, // #922: sig interned at type-section index 0
                     idx: 1,
                     args: vec![0],
                 }, // v2
@@ -691,6 +692,7 @@ fn devirtualizes_constant_funcref_then_inlines_and_dfes() {
     };
     let m = Module {
         funcs: vec![entry, add_const(1), add_const(100)],
+        types: vec![temen_ir::TypeEntry::Func(sig.clone())], // #922
         ..Default::default()
     };
     verify_module(&m).expect("input verifies");
@@ -745,7 +747,7 @@ fn does_not_devirtualize_on_signature_mismatch() {
             insts: vec![
                 Inst::RefFunc { func: 1 }, // funcref to the 2-arg function
                 Inst::CallIndirect {
-                    ty: sig,
+                    ty: 0, // #922: sig interned at type-section index 0
                     idx: 1,
                     args: vec![0],
                 },
@@ -764,6 +766,7 @@ fn does_not_devirtualize_on_signature_mismatch() {
     };
     let m = Module {
         funcs: vec![entry, two_arg],
+        types: vec![temen_ir::TypeEntry::Func(sig.clone())], // #922
         ..Default::default()
     };
     verify_module(&m).expect("input verifies");
@@ -1000,7 +1003,7 @@ fn const_prop_bails_on_an_unresolvable_indirect_index() {
                     args: vec![2, 1],
                 }, // sel(1, x) — a direct call passing a constant flag
                 Inst::CallIndirect {
-                    ty: sig,
+                    ty: 0, // #922: sig interned at type-section index 0
                     idx: 0,
                     args: vec![2, 1],
                 }, // (*fp)(1, x) — fp is unknown, so the pass can't see who this calls
@@ -1011,6 +1014,7 @@ fn const_prop_bails_on_an_unresolvable_indirect_index() {
     };
     let m = Module {
         funcs: vec![entry, sel_helper()],
+        types: vec![temen_ir::TypeEntry::Func(sig.clone())], // #922
         ..Default::default()
     };
     verify_module(&m).expect("input verifies");
@@ -1056,7 +1060,7 @@ fn const_funcref_argument_devirtualizes_through_the_callee() {
         blocks: vec![Block {
             params: vec![ValType::I32, ValType::I32],
             insts: vec![Inst::CallIndirect {
-                ty: sig,
+                ty: 0, // #922: sig interned at type-section index 0
                 idx: 0,
                 args: vec![1],
             }], // (*fp)(a)
@@ -1074,6 +1078,7 @@ fn const_funcref_argument_devirtualizes_through_the_callee() {
     };
     let m = Module {
         funcs: vec![entry, apply, g],
+        types: vec![temen_ir::TypeEntry::Func(sig.clone())], // #922
         ..Default::default()
     };
     verify_module(&m).expect("input verifies");
@@ -1111,7 +1116,7 @@ fn a_non_uniform_funcref_argument_is_not_devirtualized() {
         blocks: vec![Block {
             params: vec![ValType::I32, ValType::I32],
             insts: vec![Inst::CallIndirect {
-                ty: sig.clone(),
+                ty: 0, // #922: sig interned at type-section index 0
                 idx: 0,
                 args: vec![1],
             }],
@@ -1178,6 +1183,7 @@ fn a_non_uniform_funcref_argument_is_not_devirtualized() {
     };
     let m = Module {
         funcs: vec![entry, apply, plus1, times2],
+        types: vec![temen_ir::TypeEntry::Func(sig.clone())], // #922
         ..Default::default()
     };
     verify_module(&m).expect("input verifies");
@@ -1248,7 +1254,7 @@ fn an_indirect_call_with_a_runtime_arg_blocks_specialization() {
                 }, // g(1) -> v2
                 Inst::ConstI32(1), // funcref g (funcidx 1)
                 Inst::CallIndirect {
-                    ty: sig,
+                    ty: 0, // #922: sig interned at type-section index 0
                     idx: 3,
                     args: vec![0],
                 }, // g(r) -> v4
@@ -1259,6 +1265,7 @@ fn an_indirect_call_with_a_runtime_arg_blocks_specialization() {
     };
     let m = Module {
         funcs: vec![entry, g],
+        types: vec![temen_ir::TypeEntry::Func(sig.clone())], // #922
         ..Default::default()
     };
     verify_module(&m).expect("input verifies");

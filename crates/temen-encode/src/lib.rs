@@ -35,7 +35,7 @@ use alloc::vec::Vec;
 use temen_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DataExport, DataPtr, DataPtrTarget,
     DebugInfo, Edge, Encoding, Export, FBinOp, FCmpOp, FToI, FUnOp, Field, FloatTy, Func, FuncIdx,
-    FuncName, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Loc, Memory, Module, Ordering,
+    FuncName, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Loc, Memory, Module, Ordering,
     ProducerBlob, SsaLoc, StoreOp, Terminator, TypeDef, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp,
     VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp,
     VWidenOp, ValIdx, ValType, VarInfo, VarLoc,
@@ -110,15 +110,15 @@ mod op {
     // The scattered call/cap/import single-ops (formerly at 0x0A..=0x0E and 0x63) were pulled
     // into this one coherent family, reusing the opcode gaps the earlier cuts freed.
     pub const CALL: u8 = 0x73; // direct call: uleb funcidx, then arg idx-list
-    pub const CALL_INDIRECT: u8 = 0x74; // sig (params,results), idx, arg idx-list
+    pub const CALL_INDIRECT: u8 = 0x74; // sig type-idx (interned), idx, arg idx-list
     pub const REF_FUNC: u8 = 0x75; // uleb funcidx -> i32 funcref
-    pub const CALL_IMPORT_DYN: u8 = 0x76; // v7 §3.5: type idx, op, sig, handle operand, arg idx-list
+    pub const CALL_IMPORT_DYN: u8 = 0x76; // v7 §3.5: iface type idx, op, sig type-idx, handle operand, arg idx-list
     pub const EXPORT_HANDLE: u8 = 0x77; // v7 §3.5: impl-export idx -> i32 handle
     pub const CAP_SELF_TYPE_ID: u8 = 0x78; // v7 §3.5: type idx -> i32 runtime type_id
-    pub const CAP_CALL: u8 = 0x79; // type_id, op, sig, handle, arg idx-list
+    pub const CAP_CALL: u8 = 0x79; // type_id, op, sig type-idx, handle, arg idx-list
     pub const CAP_SELF_COVERS: u8 = 0x7A; // v7 §3.5: handle operand, type idx -> i32 covers
-    pub const CALL_SYM: u8 = 0x7B; // v8 §7/§22 link-form symbolic call: import idx, sig, handle, arg idx-list
-    pub const CALL_IMPORT: u8 = 0x7C; // manifest capability call (v8): import idx, op, sig, arg idx-list
+    pub const CALL_SYM: u8 = 0x7B; // v8 §7/§22 link-form symbolic call: import idx, sig type-idx, handle, arg idx-list
+    pub const CALL_IMPORT: u8 = 0x7C; // manifest capability call (v8): import idx, op, sig type-idx, arg idx-list
     pub const FMA: u8 = 0x7D; // scalar fused multiply-add: ty byte (0=f32,1=f64), a, b, c
     pub const IMPORT_ATTACH: u8 = 0x7E; // v4: import idx, handle operand idx -> i32 status
                                         // 0x7F (was CAP_SELF_LABEL), 0xBE (was CAP_SELF_ATTEST): retired in the wire rev
@@ -237,7 +237,7 @@ mod op {
     pub const BR_TABLE: u8 = 0x82;
     pub const RETURN: u8 = 0x83;
     pub const RETURN_CALL: u8 = 0x85; // uleb funcidx, arg idx-list
-    pub const RETURN_CALL_INDIRECT: u8 = 0x86; // sig (params,results), idx, arg idx-list
+    pub const RETURN_CALL_INDIRECT: u8 = 0x86; // sig type-idx (interned), idx, arg idx-list
     pub const UNREACHABLE: u8 = 0x8F;
 }
 
@@ -709,8 +709,8 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             // The consumer-local op immediate (0 for flat imports). No handle operand (v8):
             // the slot binding identifies the capability.
             write_uleb(out, *op as u64);
-            write_types(out, &sig.params);
-            write_types(out, &sig.results);
+            // Interned signature: a single `types` index (FuncType interning, #922).
+            write_uleb(out, *sig as u64);
             write_idxs(out, args);
         }
         // v8 §7/§22 link-form symbolic call: the loader-ABI placeholder (never verifies;
@@ -723,8 +723,7 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
         } => {
             out.push(self::op::CALL_SYM);
             write_uleb(out, *import as u64);
-            write_types(out, &sig.params);
-            write_types(out, &sig.results);
+            write_uleb(out, *sig as u64);
             write_uleb(out, *handle as u64);
             write_idxs(out, args);
         }
@@ -769,8 +768,7 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             out.push(self::op::CALL_IMPORT_DYN);
             write_uleb(out, *ty as u64);
             write_uleb(out, *op as u64);
-            write_types(out, &sig.params);
-            write_types(out, &sig.results);
+            write_uleb(out, *sig as u64);
             write_uleb(out, *handle as u64);
             write_idxs(out, args);
         }
@@ -991,8 +989,8 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
         }
         Inst::CallIndirect { ty, idx, args } => {
             out.push(op::CALL_INDIRECT);
-            write_types(out, &ty.params);
-            write_types(out, &ty.results);
+            // Interned signature: a single `types` index (FuncType interning, #922).
+            write_uleb(out, *ty as u64);
             write_uleb(out, *idx as u64);
             write_idxs(out, args);
         }
@@ -1006,8 +1004,8 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             out.push(op::CAP_CALL);
             write_uleb(out, *type_id as u64);
             write_uleb(out, *op as u64);
-            write_types(out, &sig.params);
-            write_types(out, &sig.results);
+            // Interned signature: a single `types` index (FuncType interning, #922).
+            write_uleb(out, *sig as u64);
             write_uleb(out, *handle as u64);
             write_idxs(out, args);
         }
@@ -1642,8 +1640,8 @@ fn encode_term(out: &mut Vec<u8>, t: &Terminator) {
         }
         Terminator::ReturnCallIndirect { ty, idx, args } => {
             out.push(op::RETURN_CALL_INDIRECT);
-            write_types(out, &ty.params);
-            write_types(out, &ty.results);
+            // Interned signature: a single `types` index (FuncType interning, #922).
+            write_uleb(out, *ty as u64);
             write_uleb(out, *idx as u64);
             write_idxs(out, args);
         }
@@ -2218,38 +2216,27 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
             a: c.idx()?,
         },
         op::CALL_INDIRECT => Inst::CallIndirect {
-            ty: FuncType {
-                params: decode_types(c)?,
-                results: decode_types(c)?,
-            },
+            // Interned signature: a single `types` index (FuncType interning, #922).
+            ty: c.idx()?,
             idx: c.idx()?,
             args: decode_idxs(c)?,
         },
         op::CAP_CALL => Inst::CapCall {
             type_id: c.idx()?,
             op: c.idx()?,
-            sig: FuncType {
-                params: decode_types(c)?,
-                results: decode_types(c)?,
-            },
+            sig: c.idx()?,
             handle: c.idx()?,
             args: decode_idxs(c)?,
         },
         op::CALL_IMPORT => Inst::CallImport {
             import: c.idx()?,
             op: c.idx()?,
-            sig: FuncType {
-                params: decode_types(c)?,
-                results: decode_types(c)?,
-            },
+            sig: c.idx()?,
             args: decode_idxs(c)?,
         },
         op::CALL_SYM => Inst::CallSym {
             import: c.idx()?,
-            sig: FuncType {
-                params: decode_types(c)?,
-                results: decode_types(c)?,
-            },
+            sig: c.idx()?,
             handle: c.idx()?,
             args: decode_idxs(c)?,
         },
@@ -2268,10 +2255,7 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
         op::CALL_IMPORT_DYN => Inst::CallImportDyn {
             ty: c.idx()?,
             op: c.idx()?,
-            sig: FuncType {
-                params: decode_types(c)?,
-                results: decode_types(c)?,
-            },
+            sig: c.idx()?,
             handle: c.idx()?,
             args: decode_idxs(c)?,
         },
@@ -2511,10 +2495,8 @@ fn decode_term(c: &mut Cursor) -> Result<Terminator, DecodeError> {
             args: decode_idxs(c)?,
         },
         op::RETURN_CALL_INDIRECT => Terminator::ReturnCallIndirect {
-            ty: FuncType {
-                params: decode_types(c)?,
-                results: decode_types(c)?,
-            },
+            // Interned signature: a single `types` index (FuncType interning, #922).
+            ty: c.idx()?,
             idx: c.idx()?,
             args: decode_idxs(c)?,
         },

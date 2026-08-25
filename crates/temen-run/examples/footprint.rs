@@ -78,7 +78,9 @@ fn main() {
         let _hold: Box<dyn std::any::Any> = match args[2].as_str() {
             "none" => Box::new(()), // load-only baseline (module decoded, nothing built)
             "tree-walk" => Box::new(m), // the module itself is the tree-walker's whole footprint
-            "bytecode" => Box::new(bytecode::compile_module(&m.funcs).expect("bc compile")),
+            "bytecode" => {
+                Box::new(bytecode::compile_module(&m.funcs, &m.types).expect("bc compile"))
+            }
             "jit" => Box::new(jit_compile(&m).0),
             other => panic!("unknown engine {other}"),
         };
@@ -105,7 +107,7 @@ fn main() {
         .map(|b| b.insts.len())
         .sum();
     let n_funcs = m.funcs.len();
-    let bc_ops = bytecode::compile_module(&m.funcs)
+    let bc_ops = bytecode::compile_module(&m.funcs, &m.types)
         .expect("bc compile")
         .op_count();
     let (_cm, jit_bytes) = jit_compile(&m);

@@ -62,7 +62,7 @@ pub struct SsaFunc {
 /// Convert a block-local function into the internal global-SSA form. `fn_results` gives every
 /// function's result arity (a `Call` appends its callee's results), exactly as [`crate::optimize_func`]
 /// takes it. Pure renaming — no instruction is added, removed, or reordered.
-pub fn to_ssa(f: &Func, fn_results: &[usize]) -> SsaFunc {
+pub fn to_ssa(f: &Func, fn_results: &[usize], types: &[temen_ir::TypeEntry]) -> SsaFunc {
     // First pass: hand each local slot of each block a fresh global id, recording its def site.
     let mut values: Vec<Vec<Value>> = Vec::with_capacity(f.blocks.len());
     let mut defs: Vec<Def> = Vec::new();
@@ -78,7 +78,7 @@ pub fn to_ssa(f: &Func, fn_results: &[usize]) -> SsaFunc {
             next += 1;
         }
         for (ii, inst) in blk.insts.iter().enumerate() {
-            for r in 0..inst.result_count(fn_results) {
+            for r in 0..inst.result_count(fn_results, types) {
                 local.push(next);
                 defs.push(Def::Result {
                     block: b as u32,

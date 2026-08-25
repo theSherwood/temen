@@ -24,8 +24,19 @@ use temen_durable::{
 };
 use temen_interp::{run_capture_reserved_with_host, run_with_host, Host, Value};
 use temen_ir::{
-    BinOp, Block, CmpOp, Func, FuncType, Inst, IntTy, Memory, Module, Terminator, ValType,
+    BinOp, Block, CmpOp, Func, FuncType, Inst, IntTy, Memory, Module, Terminator, TypeEntry,
+    ValType,
 };
+
+/// The one call signature every generated durable suspend site uses: `(i32) -> (i64)` (the clock
+/// arg in, the accumulated i64 out). #922 interns it as the module type section's single entry, so
+/// each `cap.call`/`call_indirect` carries the type index 0.
+fn durgen_type_section() -> Vec<TypeEntry> {
+    vec![TypeEntry::Func(FuncType {
+        params: vec![ValType::I32],
+        results: vec![ValType::I64],
+    })]
+}
 
 // 128 KiB: the durable region needs `DURABLE_RESERVE` (64 KiB), and a smaller window keeps the
 // per-run commit footprint modest — the JIT commits a window per compile, and on a memory-tight
@@ -179,10 +190,7 @@ fn emit_suspend_body(
                 insts.push(Inst::CapCall {
                     type_id: CLOCK_TYPE_ID,
                     op: CLOCK_OP,
-                    sig: FuncType {
-                        params: vec![ValType::I32],
-                        results: vec![ValType::I64],
-                    },
+                    sig: 0, // #922: interned (i32)->(i64) at type-section index 0
                     handle: 0,
                     args: vec![arg],
                 });
@@ -227,10 +235,7 @@ fn emit_suspend_body(
             let idx = *next;
             *next += 1;
             insts.push(Inst::CallIndirect {
-                ty: FuncType {
-                    params: vec![ValType::I32],
-                    results: vec![ValType::I64],
-                },
+                ty: 0, // #922: interned (i32)->(i64) at type-section index 0
                 idx,
                 args: vec![0], // pass the handle down
             });
@@ -356,7 +361,7 @@ pub fn gen_module(g: &mut Gen) -> Module {
         exports: Vec::new(),
         data_exports: Vec::new(),
         impl_exports: Vec::new(),
-        types: Vec::new(),
+        types: durgen_type_section(),
         debug_info: None,
     }
 }
@@ -432,10 +437,7 @@ pub fn gen_loop_module(g: &mut Gen) -> Module {
             Inst::CapCall {
                 type_id: CLOCK_TYPE_ID,
                 op: CLOCK_OP,
-                sig: FuncType {
-                    params: vec![ValType::I32],
-                    results: vec![ValType::I64],
-                },
+                sig: 0,    // #922: interned (i32)->(i64) at type-section index 0
                 handle: 0, // v0
                 args: vec![2],
             }, // v3 = clock
@@ -465,7 +467,7 @@ pub fn gen_loop_module(g: &mut Gen) -> Module {
         exports: Vec::new(),
         data_exports: Vec::new(),
         impl_exports: Vec::new(),
-        types: Vec::new(),
+        types: durgen_type_section(),
         debug_info: None,
     }
 }

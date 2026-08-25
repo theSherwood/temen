@@ -143,7 +143,7 @@ fn scenario(
 fn bytecode_serve_loop_matches_the_tree_walker() {
     let m = module(SERVER);
     assert!(
-        bytecode::compile_module(&m.funcs).is_some(),
+        bytecode::compile_module(&m.funcs, &m.types).is_some(),
         "the pure serving module must be admitted natively — otherwise this differential \
          only re-tests the fallback"
     );
@@ -199,7 +199,7 @@ fn bytecode_serves_a_full_queue() {
 fn a_park_seam_vetoes_the_native_serve_and_falls_back() {
     let m = module(SERVER_WITH_PARK_SEAM);
     assert!(
-        bytecode::compile_module(&m.funcs).is_none(),
+        bytecode::compile_module(&m.funcs, &m.types).is_none(),
         "a serving module with a futex wait must decline (module-wide veto)"
     );
     let dispatches: &[(u32, u32, Vec<i64>)] = &[(0, 0, vec![5]), (0, 0, vec![30])];
@@ -270,11 +270,11 @@ fn a_native_caller_parks_on_a_native_serving_child_and_wakes_with_the_reply() {
     let b = temen_text::parse_module(SEP_SERVER).expect("parse server");
     temen_verify::verify_module(&b).expect("verify server");
     assert!(
-        bytecode::compile_module(&a.funcs).is_some(),
+        bytecode::compile_module(&a.funcs, &a.types).is_some(),
         "the caller (op 5 + op 14 + a live call) must be admitted natively"
     );
     assert!(
-        bytecode::compile_module(&b.funcs).is_some(),
+        bytecode::compile_module(&b.funcs, &b.types).is_some(),
         "the serving child (svc.wait + a pure handler) must be admitted natively"
     );
     let run = |entry: Entry| {
@@ -313,7 +313,7 @@ fn a_native_svc_wait_with_queued_work_serves_and_returns() {
     );
     let m = module(&src);
     assert!(
-        bytecode::compile_module(&m.funcs).is_some(),
+        bytecode::compile_module(&m.funcs, &m.types).is_some(),
         "the svc.wait server must be admitted natively"
     );
     let dispatches: &[(u32, u32, Vec<i64>)] = &[(0, 0, vec![5]), (0, 0, vec![30])];

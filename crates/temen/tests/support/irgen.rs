@@ -34,6 +34,25 @@ pub struct Gen {
     /// modules (`Unsupported`), and a shared generator that peppered them everywhere would make almost
     /// every memory module unemittable — starving the escape-oracle. Off ⇒ arms 18/19 re-roll.
     emit_caps: bool,
+    /// #922: the current module's interned type section, built as call sites are generated
+    /// (`intern_sig`). Reset at the top of [`gen_module`]; drained into `Module::types`.
+    cur_types: Vec<TypeEntry>,
+}
+
+impl Gen {
+    /// Intern `ft` into the current module's type section (#922), returning its index. Idempotent,
+    /// so id-equality coincides with structural equality — what a call variant's type index needs.
+    fn intern_sig(&mut self, ft: FuncType) -> u32 {
+        if let Some(i) = self
+            .cur_types
+            .iter()
+            .position(|e| matches!(e, TypeEntry::Func(f) if *f == ft))
+        {
+            return i as u32;
+        }
+        self.cur_types.push(TypeEntry::Func(ft));
+        (self.cur_types.len() - 1) as u32
+    }
 }
 
 impl Gen {
@@ -47,6 +66,7 @@ impl Gen {
             pos: 0,
             rng: seed | 1,
             emit_caps: true,
+            cur_types: Vec::new(),
         }
     }
     pub fn from_seed(seed: u64) -> Gen {
@@ -55,6 +75,7 @@ impl Gen {
             pos: 0,
             rng: seed | 1,
             emit_caps: true,
+            cur_types: Vec::new(),
         }
     }
     /// Suppress `cap.call` generation (for the wasm-JIT differential — see the field's note).
@@ -395,6 +416,7 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                     let idx = bb.push(Inst::ConstI32(j as i32), ValType::I32);
                     let args: Vec<ValIdx> = ty.params.iter().map(|&t| bb.want(t)).collect();
                     let results = ty.results.clone();
+                    let ty = bb.g.intern_sig(ty); // #922: interned type index
                     bb.push_multi(Inst::CallIndirect { ty, idx, args }, &results);
                 } else {
                     // (b) inert: a 4-param signature no generated function has (they take
@@ -407,6 +429,7 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                     };
                     let idx = bb.want(ValType::I32);
                     let args: Vec<ValIdx> = (0..4).map(|_| bb.want(ValType::I32)).collect();
+                    let ty = bb.g.intern_sig(ty); // #922: interned type index
                     bb.push0(Inst::CallIndirect { ty, idx, args });
                 }
             }
@@ -428,10 +451,10 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                 let handle = bb.want(ValType::I32);
                 let args: Vec<ValIdx> = params.iter().map(|&t| bb.want(t)).collect();
                 let (type_id, op) = (bb.g.below(256), bb.g.below(256));
-                let sig = FuncType {
+                let sig = bb.g.intern_sig(FuncType {
                     params,
                     results: results.clone(),
-                };
+                }); // #922: interned type index
                 bb.push_multi(
                     Inst::CapCall {
                         type_id,
@@ -464,10 +487,10 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                     // page_size() -> i64: a pure query — no args, no window effect — so both
                     // backends report the same host page and it always agrees. Exercises the
                     // 0-arg / 1-result cap.call marshalling for the whole-window AddressSpace cap.
-                    let sig = FuncType {
+                    let sig = bb.g.intern_sig(FuncType {
                         params: vec![],
                         results: results.clone(),
-                    };
+                    }); // #922: interned type index
                     bb.push_multi(
                         Inst::CapCall {
                             type_id: 5,
@@ -479,10 +502,10 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                         &results,
                     );
                 } else if op == 1 {
-                    let sig = FuncType {
+                    let sig = bb.g.intern_sig(FuncType {
                         params: vec![ValType::I64, ValType::I64],
                         results: results.clone(),
-                    };
+                    }); // #922: interned type index
                     bb.push_multi(
                         Inst::CapCall {
                             type_id: 5,
@@ -497,10 +520,10 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                     // map / protect take a prot arg; READ-only (1) or READ|WRITE (3).
                     let prot_val = if bb.g.boolean() { 3 } else { 1 };
                     let prot = bb.push(Inst::ConstI32(prot_val), ValType::I32);
-                    let sig = FuncType {
+                    let sig = bb.g.intern_sig(FuncType {
                         params: vec![ValType::I64, ValType::I64, ValType::I32],
                         results: results.clone(),
-                    };
+                    }); // #922: interned type index
                     bb.push_multi(
                         Inst::CapCall {
                             type_id: 5,
@@ -1065,6 +1088,7 @@ fn gen_func(g: &mut Gen, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
 
 /// Generate a complete, verifier-valid module.
 pub fn gen_module(g: &mut Gen) -> Module {
+    g.cur_types.clear(); // #922: start this module's interned type section fresh
     let nfuncs = 1 + g.below(3) as usize;
     let sigs: Vec<(Vec<ValType>, Vec<ValType>)> = (0..nfuncs)
         .map(|_| {
@@ -1093,7 +1117,7 @@ pub fn gen_module(g: &mut Gen) -> Module {
         exports: Vec::new(),
         data_exports: Vec::new(),
         impl_exports: Vec::new(),
-        types: Vec::new(),
+        types: std::mem::take(&mut g.cur_types), // #922: the interned call-site type section
         debug_info: None,
     }
 }

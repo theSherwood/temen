@@ -18,7 +18,7 @@
 
 use core::cell::Cell;
 use core::ffi::c_void;
-use temen_ir::{Func, DEFAULT_RESERVED_LOG2};
+use temen_ir::{Func, TypeEntry, DEFAULT_RESERVED_LOG2};
 use temen_jit::{CompiledModule, JitOutcome, Quota, TrapKind};
 use temen_text::parse_module;
 use temen_verify::verify_module;
@@ -33,6 +33,8 @@ const PARENT: &str = "memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v
 struct TestCtx {
     cm: Cell<*mut CompiledModule>,
     funcs: Vec<Func>,
+    /// #922: the unit's type section, for `define_extra` to resolve interned call sigs.
+    types: Vec<TypeEntry>,
     /// Cached trampoline from the first mid-run `define_extra` (later calls reuse it).
     code: Cell<*const u8>,
 }
@@ -58,7 +60,9 @@ unsafe extern "C" fn reentry_thunk(
     if tc.code.get().is_null() {
         // Re-entrant incremental compile: the guest is suspended on this thread; the parent's
         // code is on the stack below us while finalize_definitions mprotects the new pages.
-        let ptrs = (*cm).define_extra(&tc.funcs).expect("define_extra mid-run");
+        let ptrs = (*cm)
+            .define_extra(&tc.funcs, &tc.types)
+            .expect("define_extra mid-run");
         tc.code.set(ptrs[0].tramp);
     }
     let args = std::slice::from_raw_parts(args, n_args as usize);
@@ -77,6 +81,7 @@ fn setup(extra_src: &str) -> (Box<TestCtx>, Box<CompiledModule>) {
     let ctx = Box::new(TestCtx {
         cm: Cell::new(core::ptr::null_mut()),
         funcs: extra.funcs,
+        types: extra.types,
         code: Cell::new(core::ptr::null()),
     });
     let cm = CompiledModule::compile(
@@ -167,7 +172,10 @@ fn memory_fault_in_invoked_code_is_caught_and_terminal() {
 fn invoke_outside_a_run_is_rejected() {
     let extra_src = "memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.add v0 v1\n  return v2\n  }\n}\n";
     let (ctx, mut cm) = setup(extra_src);
-    let code = cm.define_extra(&ctx.funcs).expect("define outside run")[0].tramp;
+    let code = cm
+        .define_extra(&ctx.funcs, &ctx.types)
+        .expect("define outside run")[0]
+        .tramp;
     let mut results = [0i64; 1];
     let mut trap = 0i64;
     let err = unsafe {

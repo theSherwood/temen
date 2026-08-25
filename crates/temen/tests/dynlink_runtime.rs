@@ -72,7 +72,7 @@ fn plugin_calls_host_program_by_resolved_slot() {
     // through the shared table to the host's F: F(10,3) = 23 (a direct call to its own funcs[0] would
     // be impossible — the plugin has no F of its own).
     let ptrs = cm
-        .define_extra(&linked.funcs)
+        .define_extra(&linked.funcs, &linked.types)
         .expect("define_extra (compile the plugin)");
     let (out, _) =
         unsafe { cm.run_extra(ptrs[0].tramp, 2, 1, &[10, 3], None) }.expect("run plugin");
@@ -123,7 +123,9 @@ fn loaded_client_links_to_a_newly_installed_service_by_name() {
     )
     .unwrap();
     verify_module(&service).unwrap();
-    let svc = cm.define_extra(&service.funcs).expect("compile service");
+    let svc = cm
+        .define_extra(&service.funcs, &service.types)
+        .expect("compile service");
     let slot = cm
         .install(svc[0].code, svc[0].type_id)
         .expect("install service");
@@ -145,7 +147,9 @@ fn loaded_client_links_to_a_newly_installed_service_by_name() {
     })
     .expect("resolve client → install slot");
     verify_module(&linked).expect("verify client");
-    let cli = cm.define_extra(&linked.funcs).expect("compile client");
+    let cli = cm
+        .define_extra(&linked.funcs, &linked.types)
+        .expect("compile client");
     let (out, _) = unsafe { cm.run_extra(cli[0].tramp, 2, 1, &[5, 2], None) }.expect("run client");
     assert!(
         matches!(out, JitOutcome::Returned(ref s) if s == &[27]),

@@ -17,7 +17,7 @@ use crate::{mem, CapThunk, TrapKind};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
-use temen_ir::{Data, Func, FuncIdx, SpawnRec, ValType};
+use temen_ir::{Data, Func, FuncIdx, SpawnRec, TypeEntry, ValType};
 
 /// PROCESS.md S1: per-carve compile-cache key for a **non-durable** child — the identity the compiled
 /// [`crate::ChildCode`] depends on. `funcs_ptr`/`n_funcs` name the module's function slice (stable
@@ -245,6 +245,10 @@ pub(crate) struct Nursery {
     /// `m.impl_exports` at construction.
     pub(crate) serve_handlers: Box<[u32]>,
     funcs: std::sync::Arc<[Func]>,
+    /// #922 — the parent module's type section, threaded into every same-module child compile so
+    /// the child's interned `call_indirect` type indices resolve (a separate-module child resolves
+    /// against its own resolved type section instead — see [`Nursery::resolve_child`]).
+    types: std::sync::Arc<[TypeEntry]>,
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
     /// §14 separate-module children: the host callback resolving a guest's `Module` handle to the
@@ -357,6 +361,7 @@ impl Nursery {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         funcs: std::sync::Arc<[Func]>,
+        types: std::sync::Arc<[TypeEntry]>,
         cap_thunk: CapThunk,
         cap_ctx: *mut core::ffi::c_void,
         resolve_module: Option<crate::ModuleResolver>,
@@ -370,6 +375,7 @@ impl Nursery {
     ) -> Nursery {
         Nursery {
             funcs,
+            types,
             serve_handlers,
             cap_thunk,
             cap_ctx,
@@ -514,6 +520,11 @@ impl Nursery {
         std::sync::Arc::clone(&self.funcs)
     }
 
+    /// The module's type section (#922 — resolves a re-run same-module child's interned call types).
+    pub(crate) fn types(&self) -> std::sync::Arc<[TypeEntry]> {
+        std::sync::Arc::clone(&self.types)
+    }
+
     /// The parent run's §5 kill-path interrupt cell (a re-attached thaw child polls the same cell).
     pub(crate) fn epoch_addr(&self) -> usize {
         self.epoch_addr
@@ -580,13 +591,14 @@ impl Nursery {
     /// # Safety
     /// `trap_out` is the live trap cell. The returned slices borrow host-owned storage valid for the
     /// run (the [`ModuleResolver`](crate::ModuleResolver) contract).
+    #[allow(clippy::type_complexity)]
     unsafe fn resolve_child(
         &self,
         module: i64,
         trap_out: *mut i64,
-    ) -> Option<(&[Func], Option<i32>, &[Data])> {
+    ) -> Option<(&[Func], &[TypeEntry], Option<i32>, &[Data])> {
         if module < 0 {
-            return Some((&self.funcs, None, &[]));
+            return Some((&self.funcs, &self.types, None, &[]));
         }
         let Some(resolver) = self.resolve_module else {
             *trap_out = TrapKind::CapFault as i64;
@@ -603,7 +615,13 @@ impl Nursery {
         } else {
             std::slice::from_raw_parts(rm.data, rm.n_data)
         };
-        Some((funcs, Some(rm.memory_log2), data))
+        // #922: the child's type section (empty ⇒ a module with no interned call sites).
+        let types = if rm.n_types == 0 {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(rm.types, rm.n_types)
+        };
+        Some((funcs, types, Some(rm.memory_log2), data))
     }
 
     /// Resolve `handle` as this domain's `Instantiator` via the run's `cap.call` thunk, returning its
@@ -691,7 +709,8 @@ pub(crate) unsafe extern "C" fn instantiate(
     let Some((base, size)) = rt.resolve(mem_base, handle, trap_out) else {
         return 0; // `*trap_out` already holds the CapFault
     };
-    let Some((child_funcs, mod_mem, child_data)) = rt.resolve_child(module, trap_out) else {
+    let Some((child_funcs, child_types, mod_mem, child_data)) = rt.resolve_child(module, trap_out)
+    else {
         return 0; // forged Module handle / no resolver — CapFault set
     };
     // §4 (DURABILITY.md, "JIT parity" slice 1): a durable run may now nest a **same-module** child.
@@ -756,6 +775,7 @@ pub(crate) unsafe extern "C" fn instantiate(
         let child_task = rt.next_child_task();
         let (result, trap, unwound) = match crate::compile_child_and_run(
             child_funcs,
+            child_types,
             entry as FuncIdx,
             base + off,
             size_log2 as u8,
@@ -813,6 +833,7 @@ pub(crate) unsafe extern "C" fn instantiate(
     let compile_fresh = || {
         crate::compile_nondurable_child(
             child_funcs,
+            child_types,
             entry as FuncIdx,
             size_log2 as u8,
             rt.epoch_addr, // §5: the child polls the parent's kill-path cell (one interrupt kills both)
@@ -926,6 +947,7 @@ pub(crate) unsafe extern "C" fn instantiate_named(
         return 0; // `*trap_out` already holds the CapFault
     };
     let child_funcs = &rt.funcs;
+    let child_types = &rt.types; // #922: same-module named child resolves against the parent types
     let entry = entry as u64;
     let child_size = if (0..64).contains(&size_log2) {
         1u64 << size_log2
@@ -979,6 +1001,7 @@ pub(crate) unsafe extern "C" fn instantiate_named(
     let child_fuel_addr = rt.arm_child_fuel(fuel); // §5 fuel: clamp to parent-remaining (0 ⇒ un-metered)
     let compiled = crate::compile_child(
         child_funcs,
+        child_types,
         entry as FuncIdx,
         size_log2 as u8,
         child_thunk,
@@ -1218,7 +1241,8 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
         return 0; // `*trap_out` already holds the CapFault
     };
     // Resolve the granted separate module (op 5): its funcs, declared memory, and data segments.
-    let Some((child_funcs, mod_mem, child_data)) = rt.resolve_child(module, trap_out) else {
+    let Some((child_funcs, child_types, mod_mem, child_data)) = rt.resolve_child(module, trap_out)
+    else {
         return 0; // forged Module handle / no resolver — CapFault set
     };
     let entry = entry as u64;
@@ -1296,6 +1320,7 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
     let child_fuel_addr = rt.arm_child_fuel(fuel); // §5 fuel: clamp to parent-remaining (0 ⇒ un-metered)
     let compiled = crate::compile_child(
         child_funcs,
+        child_types,
         entry as FuncIdx,
         size_log2 as u8,
         child_thunk,

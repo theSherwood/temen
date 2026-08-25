@@ -698,7 +698,7 @@ pub fn specialize_with_config(
     let value_types: Vec<Vec<Vec<ValType>>> = module
         .funcs
         .iter()
-        .map(|f| func_value_types(f, &module.funcs, has_memory))
+        .map(|f| func_value_types(f, &module.funcs, &module.types, has_memory))
         .collect();
 
     // When outlining, the renamed region's live abstract cells are threaded across each residual call
@@ -793,7 +793,16 @@ pub fn specialize_with_config(
             exports: Vec::new(),
             data_exports: Vec::new(),
             impl_exports: Vec::new(),
-            types: Vec::new(),
+            types: module
+                .types
+                .iter()
+                .map(|t| match t {
+                    temen_ir::TypeEntry::Func(ft) => temen_ir::TypeEntry::Func(ft.clone()),
+                    temen_ir::TypeEntry::Interface(_) => {
+                        temen_ir::TypeEntry::Func(temen_ir::FuncType::default())
+                    }
+                })
+                .collect(),
             debug_info: None,
         });
     }
@@ -2007,7 +2016,7 @@ impl Spec<'_> {
             }
             Inst::CallIndirect { ty, idx, args } => {
                 let callee = self
-                    .resolve_indirect(ty, env[*idx as usize])
+                    .resolve_indirect(*ty, env[*idx as usize])
                     .ok_or_else(|| {
                         trace_unsup!(
                             "call_indirect unresolved ty={:?} idx_const={:?}",
@@ -2032,14 +2041,18 @@ impl Spec<'_> {
     /// on every backend. A dynamic index, an out-of-range index, or a signature mismatch returns
     /// `None` (the call can't be specialized — the runtime would dispatch or trap through a table the
     /// residual doesn't carry).
-    fn resolve_indirect(&self, ty: &temen_ir::FuncType, idx: Abs) -> Option<u32> {
+    fn resolve_indirect(&self, ty: u32, idx: Abs) -> Option<u32> {
+        // FuncType interning (#922): resolve the interned index to its signature.
+        let temen_ir::TypeEntry::Func(ft) = self.module.types.get(ty as usize)? else {
+            return None;
+        };
         let i = match idx {
             Abs::Const(k) => k.as_i32()?,
             Abs::Dyn(_) => return None,
         };
         let u = i as u32 as usize;
         let f = self.module.funcs.get(u)?;
-        (f.params == ty.params && f.results == ty.results).then_some(u as u32)
+        (f.params == ft.params && f.results == ft.results).then_some(u as u32)
     }
 
     /// Attempt to inline a direct call as straight-line code into the current residual block. On
@@ -2162,7 +2175,7 @@ impl Spec<'_> {
                 // An indirect tail call whose index resolves to a constant callee is itself inlined.
                 Terminator::ReturnCallIndirect { ty, idx, args } => {
                     let callee = self
-                        .resolve_indirect(ty, genv[*idx as usize])
+                        .resolve_indirect(*ty, genv[*idx as usize])
                         .ok_or(InlineErr::Spec(SpecError::Unsupported))?;
                     let a: Vec<Abs> = args.iter().map(|&x| genv[x as usize]).collect();
                     return self.inline_call(callee, &a, mem, out, rnext, fuel);
@@ -2851,7 +2864,7 @@ impl Spec<'_> {
             // An indirect tail call whose index resolves to a constant callee.
             Terminator::ReturnCallIndirect { ty, idx, args } => {
                 let callee = self
-                    .resolve_indirect(ty, env[*idx as usize])
+                    .resolve_indirect(*ty, env[*idx as usize])
                     .ok_or(SpecError::Unsupported)?;
                 let args_abs: Vec<Abs> = args.iter().map(|&a| env[a as usize]).collect();
                 self.tail_call(
