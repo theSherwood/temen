@@ -221,7 +221,7 @@ int main() {
   __vm_jit_release(code);
 
   // --- Path 2: old→new via install. Emit the SAME hot loop with the guest ABI (a leading
-  // data-SP param), install it into the call_indirect table, and call it like an ordinary C
+  // data-SP param), install it into the call.dyn table, and call it like an ordinary C
   // function pointer — old code dispatching freshly-JITed code at native speed.
   long n2 = emit_unit(prog, buf, 1); // guest ABI (i64 sp, i64, i64) -> (i64)
   long code2 = __vm_jit_compile(buf, n2);
@@ -239,7 +239,7 @@ int main() {
         bad++;
   puts1("installed hot(5, 9) = ");
   put_i64(hot(5, 9));
-  puts1(" via call_indirect slot ");
+  puts1(" via call.dyn slot ");
   put_i64(slot);
   puts1("\n");
   __vm_jit_release(code2);
@@ -250,7 +250,7 @@ int main() {
     puts1("\n");
     return 1;
   }
-  puts1("98 inputs agree (invoke + installed call_indirect): "
+  puts1("98 inputs agree (invoke + installed call.dyn): "
         "guest-emitted, host-verified, Cranelift-compiled\n");
   return 0;
 }

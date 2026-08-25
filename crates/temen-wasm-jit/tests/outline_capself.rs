@@ -2,7 +2,7 @@
 //! `call.cap CAP_SELF op 2` it now is) — the transform that lets the on-ramp `_start` synth emit. The
 //! powerbox entry is otherwise pure compute + stores, but resolves each granted capability **by name**
 //! (`self.resolve`, a host-boundary reflection op outside the compute subset), so one such call
-//! kept func 0 — and, under the whole-module `call_indirect` rule, the *entire* guest — off the wasm
+//! kept func 0 — and, under the whole-module `call.dyn` rule, the *entire* guest — off the wasm
 //! tier. Outlining each `self.resolve` into an integer-signature cross-tier wrapper makes the entry
 //! pure compute + a `Call`, so it emits (see `outline_capcalls.rs` for the `call.cap` sibling).
 //!

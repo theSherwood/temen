@@ -664,7 +664,7 @@ block 0 (v0: i64) {
 
 #[test]
 fn b2_paged_composes_the_shared_table_import_with_the_pagestate_global() {
-    // #1009 pump shape: a rodata-bearing guest whose dispatch leaf `call_indirect`s. The composed
+    // #1009 pump shape: a rodata-bearing guest whose dispatch leaf `call.dyn`s. The composed
     // entry must emit a module that BOTH imports the B2 shared table (so indirect dispatch routes
     // through the host-populated table) AND exports the `"pagestate"` global (so the paged driver can
     // point the emitted page check at the live table) — the two features are orthogonal.
@@ -674,7 +674,7 @@ data ro 0 "readonlybytes"
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vs = i32.wrap_i64 v0
-  vr = call_indirect (i64) -> (i64) vs (v0)
+  vr = call.dyn (i64) -> (i64) vs (v0)
   return vr
   }
 }
