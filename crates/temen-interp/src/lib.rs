@@ -707,6 +707,12 @@ struct SeekInit {
     ///
     /// [`attach_scheduled_seeded`]: Inspector::attach_scheduled_seeded
     seed: Option<u64>,
+    /// The module's NULL-guard extent (#964/#1059): `POWERBOX_NULL_GUARD` for a `__null_guard`-marked
+    /// module, `0` for a legacy one. Captured from the module at attach so `seek`'s freshly-rebuilt
+    /// `Mem` re-seeds `[0, guard)` `Unmapped` — a NULL deref traps identically on a debugger attach and
+    /// its replay, not only on a direct run (the bare funcs/data the harness rebuilds from carry no
+    /// marker of their own).
+    null_guard: u64,
 }
 
 /// Scheduled (multithreaded) execution state owned by an [`Inspector`] across pumps (Milestone B).
@@ -896,6 +902,7 @@ impl Inspector {
         host.record_caps(); // W1: tape the cap inputs so `seek` can re-execute faithfully
         let host = Arc::new(Mutex::new(host));
         let shared = Arc::new(Mutex::new(DebugShared::new()));
+        let null_guard = temen_ir::module_null_guard(m).unwrap_or(0); // #964/#1059
         let root = Self::fresh_single_root(
             Arc::clone(&funcs),
             Arc::clone(&types),
@@ -907,6 +914,7 @@ impl Inspector {
             Arc::clone(&host),
             Arc::clone(&shared),
             None,
+            null_guard,
         );
         Inspector {
             v: Some(root),
@@ -925,6 +933,7 @@ impl Inspector {
                 data,
                 schedule: None,
                 seed: None,
+                null_guard,
             }),
             finished: None,
             checkpoints: Vec::new(),
@@ -948,12 +957,15 @@ impl Inspector {
         host: Arc<Mutex<Host>>,
         shared: Arc<Mutex<DebugShared>>,
         seek_target: Option<u64>,
+        null_guard: u64,
     ) -> Box<VCpu> {
         let mem = memory.map(|mc| {
             let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
             mm.init_data(data);
-            // No NULL-guard seeding (#964): this harness gets bare funcs/data, never the module,
-            // so the `__null_guard` marker is out of reach — debugger attaches run unguarded.
+            // #964/#1059: this harness gets bare funcs/data, never the module, so the caller threads
+            // the module's `__null_guard` extent in — `[0, guard)` seeds `Unmapped` and a NULL deref
+            // traps on a debugger attach/seek exactly as on a direct run (`0` = legacy, unguarded).
+            mm.seed_null_guard(null_guard);
             mm
         });
         let quota = Quota::default();
@@ -1035,6 +1047,7 @@ impl Inspector {
         host0.record_caps(); // W1: tape cap inputs so scheduled `seek` re-executes faithfully
         let host = Arc::new(Mutex::new(host0));
         let shared = Arc::new(Mutex::new(DebugShared::new()));
+        let null_guard = temen_ir::module_null_guard(m).unwrap_or(0); // #964/#1059
         let sched = Self::fresh_scheduled(
             Arc::clone(&funcs),
             Arc::clone(&types),
@@ -1048,6 +1061,7 @@ impl Inspector {
             &schedule,
             seed,
             None,
+            null_guard,
         );
         Inspector {
             v: None,
@@ -1066,6 +1080,7 @@ impl Inspector {
                 data,
                 schedule: Some(schedule),
                 seed,
+                null_guard,
             }),
             finished: None,
             // Scheduled (multithreaded) seek targets the global turn coordinate and is not
@@ -1093,12 +1108,14 @@ impl Inspector {
         schedule: &[u64],
         seed: Option<u64>,
         turn_limit: Option<u64>,
+        null_guard: u64,
     ) -> SchedState {
         let mem = memory.map(|mc| {
             let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
             mm.init_data(data);
-            // No NULL-guard seeding (#964): bare funcs/data, no module marker in reach (see
-            // `fresh_single_root`).
+            // #964/#1059: bare funcs/data, no module marker in reach — the caller threads the extent
+            // in so a scheduled attach/seek guards `[0, guard)` too (see `fresh_single_root`).
+            mm.seed_null_guard(null_guard);
             mm
         });
         let det = Arc::new(DetSched::new(0, MAX_VCPUS));
@@ -1184,6 +1201,7 @@ impl Inspector {
                     schedule,
                     init.seed,
                     Some(t),
+                    init.null_guard,
                 );
                 self.shared().suppress_stops = true; // fast-forward past breakpoints
                 let (focus, finished, pc) = {
@@ -1250,6 +1268,7 @@ impl Inspector {
             Arc::clone(&host),
             Arc::clone(&self.shared),
             None, // the seek target is set per chunk by the drive loop below
+            init.null_guard,
         );
         if let Some(cp) = start {
             root.restore_continuation(cp.frames.clone(), cp.fuel, cp.mem.as_deref(), cp.clock);
