@@ -316,6 +316,17 @@ stays the JIT's job).
   `fuse`-flag + incremental-`src` machinery is what const-fold and future superinstructions build
   on), not as a headline win.
 
+  **Re-measured 2026-08 (post-fuel-unification, #923). The prediction above held.** With
+  safepoint-anchored fuel landed — `BrIfCmp` no longer double-charges — a fresh `loopc` A/B
+  (`compile_module` vs `compile_module_unfused`, same box, min-of-25 over 3+3 runs) is **fused
+  24.9 ns vs unfused 29.8 ns, ~16–20%** (was the capped ~2–3%). Cross-build noise gauge: the
+  no-fuse kernels (`alu`/`call`/`fma`, which have no compare to fuse and so compile identically
+  either way) move ≤2% between the two builds, so `loopc`'s ~20% is well clear of the floor and the
+  fused/unfused ranges don't overlap. **Conclusion flips:** with the fuel cap gone the fusion is a
+  real ~1.2× on the canonical `for (i<n)` loop, so `BrIfCmp` and the `fuse`-flag +
+  `compile_module_unfused` dual-compile seam **earn their keep and stay** (the #923 "delete if still
+  ≈noise" branch does not fire).
+
 - **Slice 5a-2 — `Const`+binop → immediate operand (`SubImm`/`AddImm`).** Deletes the `Const`
   op; the *slot-freeing* benefit needs slot-reclaim (renumbering), without which it's just another
   predicted-branch dispatch drop (≈free by the 5a evidence). Deferred as low-ROID until slot-reclaim
@@ -384,8 +395,11 @@ stays the JIT's job).
   a small gain — revisit only if 5a–5c land and the profile still justifies it.
 
 **Target — revised by the 5a measurement.** The optimistic "~1.3–1.5× combined" rested on op-count
-reduction paying ~15–20%; 5a's A/B shows each fusion is ~2–3% (predicted-branch-bound), so the safe
-levers stack to *low single digits each*, not a 1.3–1.5×. The real interpreter-vs-frontier residual
+reduction paying ~15–20%; 5a's *initial* A/B showed each fusion at ~2–3% (predicted-branch-bound),
+so the safe levers stack to *low single digits each*, not a 1.3–1.5×. (Nuance added later: that
+~2–3% was fuel-capped; once 5b unified fuel to safepoints, `BrIfCmp` re-measures at ~16–20% on
+`loopc` — see Slice 5a. The lever-count thesis still broadly holds, but dispatch fusion is worth
+more than this paragraph's original figure once the doubled charge is gone.) The real interpreter-vs-frontier residual
 is **edge-copy scatter/gather + per-op fuel/budget + software memory confinement**, not dispatch —
 so the highest-leverage *safe* work is probably **5b (fuel→safepoints, which also unlocks 5a's capped
 saving)** and reducing edge-copy cost, ahead of more superinstructions. This is the benchmark
@@ -884,9 +898,9 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
 - [~] **Phase 5** — op-count reduction, all safe (`forbid-unsafe` intact).
   - [x] Prereq — fix the bit-rotted `megabench` kernels (I45); fresh 9-kernel baseline + `loopc`.
   - [x] **5a** — `IntCmp`+`BrIf` → `BrIfCmp` fusion (fuse-flag; unfused debug/trace; incremental
-        `src`). All oracle gates green. **Measured ~2–3% on `loopc` (within noise)** — corrects the
-        ~15–20% estimate, confirms Phase 3 (dispatch is predicted-branch-bound). Landed as
-        correct/foundational, not a headline win.
+        `src`). All oracle gates green. First A/B **~2–3% on `loopc`**, but capped by `BrIfCmp`'s
+        doubled fuel charge. **Re-measured post-fuel-unification (#923): fused 24.9 vs unfused
+        29.8 ns — ~16–20%**, cap removed exactly as predicted; kept (dual-compile seam stays).
   - [ ] **5a-2** — `Const`+binop→immediate (`SubImm`/`AddImm`). Next.
   - [ ] **5b** — two-mode resume / fuel→safepoints (also unlocks 5a's fuel-capped saving).
   - [ ] **5c** — split register banks (profile-gated).
