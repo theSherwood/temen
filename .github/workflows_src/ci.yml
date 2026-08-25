@@ -651,6 +651,26 @@ jobs:
           cargo build --release --lib --target wasm32-unknown-unknown
           node corpus.mjs target/wasm32-unknown-unknown/release/temen_browser.wasm
 
+  browser-jit-host-gates:
+    # The browser crate's Rust **host** tests (built for the runner, not wasm) run a real compiler
+    # phase on the **wasm-JIT** via `wasmi` — playing the browser's JS host — and assert the emitted
+    # output is byte-identical to the interpreter oracle: the compiler-tier JIT correctness contract.
+    # These were previously only local/dev gates (no `cargo test` ran them in CI). `nifler_jit` uses the
+    # committed `nifler.temen.gz` and needs no staging; `chibicc_jit`/`jit_module` SKIP fail-soft when
+    # their built assets are absent (those are staged only in the `browser-real` job), so this job gates
+    # the nimony-front-end tier immediately and picks the others up wherever their assets are present.
+    name: browser wasm-JIT host gates (compiler tier)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}" }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with: { workspaces: browser }
+      - name: nifler / chibicc / jit_module on the wasm-JIT (differential)
+        working-directory: browser
+        run: cargo test --test nifler_jit --test chibicc_jit --test jit_module -- --test-threads=1 --nocapture
+
   wasm64-differential:
     name: wasm64 differential (Wasmtime embedding)
     runs-on: ubuntu-latest
