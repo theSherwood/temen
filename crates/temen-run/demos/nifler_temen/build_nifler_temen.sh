@@ -101,12 +101,16 @@ for src in "$HERE"/inputs/*.nim; do
   name="$(basename "$src")"
   rm -rf "$CACHE/nat_ce"; mkdir -p "$CACHE/nat_ce"; cp "$src" "$CACHE/nat_ce/in.nim"
   ( cd "$CACHE/nat_ce" && "$NIFLER_BIN" p in.nim out.nif >/dev/null 2>&1 )
+  # The op-13 driver seeds a fixture dir into the memfs and dumps produced files: stage the source as
+  # `in.nim`, run `nifler p /in.nim /out.nif`, collect `out.nif`.
+  fix="$CACHE/ce_fix_$name"; ceout="$CACHE/ce_out_$name"; rm -rf "$fix" "$ceout"; mkdir -p "$fix"
+  cp "$src" "$fix/in.nim"
   set +e
   cargo run -q --release -p temen-run --example spawn_child_fs -- \
-    "$CACHE/nifler_ce_raw.temen" "$src" "/out.nif" > "$CACHE/ce_${name}.nif" 2>"$CACHE/ce_${name}.err"; rc=$?
+    "$CACHE/nifler_ce_raw.temen" "$fix" "$ceout" -- nifler p /in.nim /out.nif 2>"$CACHE/ce_${name}.err"; rc=$?
   set -e
-  if [ "$rc" = 0 ] && diff -q "$CACHE/nat_ce/out.nif" "$CACHE/ce_${name}.nif" >/dev/null; then
-    echo "  $name [child-entry op-13]: OK (byte-identical, $(stat -c%s "$CACHE/ce_${name}.nif") bytes)"
+  if [ "$rc" = 0 ] && diff -q "$CACHE/nat_ce/out.nif" "$ceout/out.nif" >/dev/null; then
+    echo "  $name [child-entry op-13]: OK (byte-identical, $(stat -c%s "$ceout/out.nif") bytes)"
   else
     echo "  $name [child-entry op-13]: MISMATCH (exit=$rc)"; head -c 300 "$CACHE/ce_${name}.err" | sed 's/^/    /'; fail=1
   fi
