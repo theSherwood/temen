@@ -27,7 +27,9 @@
 
 use std::sync::Arc;
 
-use temen_interp::{run_with_host, ForkedProc, Host, HostProc, HostProcFork, Value};
+use temen_interp::{
+    bytecode, run_with_host, ForkedProc, Host, HostProc, HostProcFork, Region, Trap, Value,
+};
 use temen_ir::Module;
 use temen_run::fs::MemFsHandle;
 use temen_text::parse_module;
@@ -215,5 +217,126 @@ fn child_entry_copies_a_parent_seeded_file_through_a_regranted_memfs() {
         input,
         "the child read the parent-seeded `in.bin` and wrote it to `out.bin` through the re-granted \
          memfs — the full read→write a spawned nifler does over its `<in>`/`<out>`"
+    );
+}
+
+// --- The same hand-off on the *resumable* (tier-up / JIT-capable) engine --------------------------
+//
+// The tests above run on `run_with_host` — the tree-walker oracle. But a real nim phase JITs, and only
+// the **resumable** engine tiers up: its op-13 path re-grants caps into `take_granted_host` and runs
+// the child over `new_confined_child_over_host`. `child_entry_io_resumable.rs` proved that path binds a
+// re-granted `stdout` **Stream**; this proves it also carries a **forkable memfs host proc** — the fs
+// re-grant nifler's emit rides — so the child resolves `"fs"` and writes a file the parent reads back,
+// on the engine that matters for performance. Surfaces any carve/regrant divergence from the oracle
+// now, on a text-IR child, rather than during the real-nifler integration.
+
+/// A raw window base carrying derived provenance (offset into the one live allocation).
+#[derive(Clone, Copy)]
+struct WinPtr(*mut u8);
+
+/// The resumable-engine drive loop (mirrors `child_entry_io_resumable`): on `Instantiate`, take the
+/// op-13 re-granted powerbox (`take_granted_host`) and run the child over it
+/// (`new_confined_child_over_host`, which binds the child manifest against that powerbox); `Join`
+/// delivers the child's result. The re-granted `"fs"` lives in that taken powerbox, so the child's
+/// `cap.self.resolve "fs"` finds it.
+fn drive(
+    prog: &bytecode::VcpuProgram,
+    base: WinPtr,
+    mut vcpu: bytecode::Vcpu<'_>,
+) -> Result<Vec<Value>, Trap> {
+    let mut children: Vec<Result<Vec<Value>, Trap>> = Vec::new();
+    loop {
+        match vcpu.run() {
+            bytecode::VcpuEvent::Done(v) => return Ok(v),
+            bytecode::VcpuEvent::Trapped(t) => return Err(t),
+            bytecode::VcpuEvent::Instantiate {
+                module,
+                entry,
+                carve,
+                size_log2,
+                fuel,
+            } => {
+                let granted = vcpu.take_granted_host();
+                // SAFETY: the engine validated the carve within this vCPU's window (which outlives the
+                // child); the child's region aliases that sub-window — the §14 shared data plane.
+                let child_base = WinPtr(unsafe { base.0.add(carve as usize) });
+                // SAFETY: `2^size_log2` valid bytes at the validated carve.
+                let back = Arc::new(unsafe { Region::shared(child_base.0, 1u64 << size_log2) });
+                let child = match granted {
+                    Some(host) => bytecode::Vcpu::new_confined_child_over_host(
+                        prog, module, entry, back, size_log2, fuel, host,
+                    ),
+                    None => bytecode::Vcpu::new_confined_child(
+                        prog, module, entry, back, size_log2, fuel,
+                    ),
+                }
+                .expect("confined child builds");
+                let r = drive(prog, child_base, child);
+                let handle = children.len() as i32;
+                children.push(r);
+                vcpu.deliver_handle(handle);
+            }
+            bytecode::VcpuEvent::Join { handle } => {
+                vcpu.deliver_join(children[handle as usize].clone());
+            }
+            _ => panic!("unexpected event"),
+        }
+    }
+}
+
+#[test]
+fn child_entry_writes_a_file_through_a_regranted_memfs_on_the_resumable_engine() {
+    let child = parse_module(WRITER).expect("parse writer");
+    temen_verify::verify_module(&child).expect("child verifies");
+    assert_eq!(child.memory.expect("child window").size_log2, 16);
+    let parent = parse_module(PARENT).expect("parse parent");
+    temen_verify::verify_module(&parent).expect("parent verifies");
+    let prog = bytecode::VcpuProgram::compile(&parent).expect("compile parent");
+
+    let (factory, handle) = temen_run::fs::mem_fs_shared_factory(vec![], vec![]);
+    let factory = Arc::new(factory);
+    let mut host = Host::new();
+    let init: HostProc = (*factory)();
+    let fork: HostProcFork = {
+        let factory = Arc::clone(&factory);
+        Arc::new(move |_pid| ForkedProc::shared((*factory)()))
+    };
+    let fs_h = host.grant_host_proc_forkable(init, fork);
+    let win = 1u64 << 17;
+    let inst = host.grant_instantiator(0, win);
+    let modh = host.grant_module(&child);
+
+    let size = win as usize;
+    let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
+    // SAFETY: non-zero layout; `size` valid 8-aligned bytes owned here until freed below.
+    let base = unsafe { std::alloc::alloc_zeroed(layout) };
+    assert!(!base.is_null());
+    // SAFETY: `base` addresses `size` valid bytes, exclusively this run's, freed only after the vCPUs.
+    let back = Arc::new(unsafe { Region::shared(base, win) });
+
+    let root = bytecode::Vcpu::new_root_with_powerbox(
+        &prog,
+        0,
+        &[Value::I32(inst), Value::I32(modh), Value::I32(fs_h)],
+        Arc::clone(&back),
+        &[],
+        host,
+    )
+    .expect("root vcpu");
+    let r = drive(&prog, WinPtr(base), root);
+
+    drop(back);
+    // SAFETY: same layout; every vCPU and region view is dropped, so no borrow outlives this.
+    unsafe { std::alloc::dealloc(base, layout) };
+
+    assert!(
+        matches!(&r, Ok(v) if matches!(v.as_slice(), [Value::I64(9)] | [Value::I32(9)])),
+        "child wrote 9 bytes, status joined back on the resumable engine: {r:?}"
+    );
+    assert_eq!(
+        read_back(&handle, "out.bin"),
+        b"hello.nif",
+        "the child-entry guest wrote its payload through the re-granted memfs on the resumable \
+         (tier-up) engine — the fs hand-back a JIT'd nifler rides"
     );
 }
