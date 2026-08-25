@@ -93,7 +93,7 @@ done
 # translate it `--child-entry` (func 0 becomes the starter->i64-status child ABI) and drive it through
 # `instantiate_module` (op 13) — argv `nifler p /in.nim /out.nif` seeded into the child's carve, a shared
 # `mem_fs` re-granted as `fs`, `stdout`/`exit` for its imports — then read the emitted `.nif` back out of
-# the shared store. This is the exact hand-off the Rust-on-SVM driver guest uses to fan phases out; here
+# the shared store. This is the exact hand-off the Rust-on-Temen driver guest uses to fan phases out; here
 # it proves a real phase produces byte-identical NIF as an op-13 child (`examples/spawn_child_fs.rs`).
 echo "=== [5b] translate --child-entry + op-13-spawn over memfs, diff vs native ==="
 "$TR" "$CACHE/nifler.linked.bc" -o "$CACHE/nifler_ce_raw.temen" --binary --host-page 65536 --stub-externs --child-entry

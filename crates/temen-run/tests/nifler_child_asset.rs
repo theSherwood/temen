@@ -1,6 +1,6 @@
 //! **The committed child-entry `nifler_ce.temen.gz`, run as a confined op-13 §14 child** (NIM.md §3c,
 //! W5 — the compiler-driver shape). Where `nifler_asset.rs` runs `nifler` as a *top-level* powerbox
-//! program, this runs the **child-entry** build the Rust-on-SVM driver guest fans out: `nifler`
+//! program, this runs the **child-entry** build the Rust-on-Temen driver guest fans out: `nifler`
 //! translated `--child-entry` (func 0 is the `starter -> i64 status` §14 child ABI), `instantiate_module`
 //! (op 13)'d into a carve with argv `nifler p /in.nim /out.nif` seeded at `POWERBOX_ARGS_BASE`, a shared
 //! `mem_fs` re-granted as `"fs"`, and `stdout`/`exit` for its `write`/`read`/`exit` imports (`vm_map`
