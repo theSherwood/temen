@@ -76,7 +76,7 @@ if UNEXPECTED=$(grep -Ev "$ONRAMP" "$CACHE/undefined.txt"); then
   UNRESOLVED=1
 fi
 
-echo "=== [3/4] translate (temen-llvm-translate --binary --host-page 65536 --stub-externs) ==="
+echo "=== [3/4] translate (temen-llvm-translate --binary --host-page 65536 --null-guard --stub-externs) ==="
 TR="$REPO/crates/temen-llvm/target/release/temen-llvm-translate"
 if [ ! -x "$TR" ]; then
   echo "building temen-llvm-translate…"
@@ -94,8 +94,11 @@ else
   echo "(no libc gaps — translating WITHOUT --stub-externs: every call resolves)"
   STUB=
 fi
+# --null-guard (#964/#1094): chibicc-the-guest runs guarded like every other producer — the
+# powerbox low scratch shifts one 16 KiB guard up and the module is marked, so a host seeds
+# [0, guard) unmapped and a NULL deref in the compiler traps instead of reading zeros.
 "$TR" "$CACHE/chibicc.linked.bc" -o "$CACHE/chibicc_raw.temen" \
-  --binary --host-page 65536 $STUB
+  --binary --host-page 65536 --null-guard $STUB
 echo "raw temen: $(stat -c%s "$CACHE/chibicc_raw.temen") bytes"
 
 echo "=== [4/4] prep_temen (decode → verify → bytecode-compile gate) ==="

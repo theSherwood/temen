@@ -241,7 +241,8 @@ fn with_program(source: &str, check: impl FnOnce(&Module)) {
 }
 
 /// Run exported proc `export_substr` with `args` on both engines over the caller-provided `seed`
-/// (which sets the bump-allocator cursor, the `POWERBOX_HEAP_BRK` word at window offset 32);
+/// (which sets the bump-allocator cursor, the `POWERBOX_HEAP_BRK` word — under the #964 guard the
+/// shim reads it at `POWERBOX_NULL_GUARD + POWERBOX_HEAP_BRK`, the guard's scratch page);
 /// returns the i64 result and the interp's final window (so a follow-up call can continue from the
 /// advanced cursor).
 fn run_export_seeded(m: &Module, export_substr: &str, args: &[i64], seed: &[u8]) -> (i64, Vec<u8>) {
@@ -297,12 +298,13 @@ fn nim_arithmetic_and_control_flow_runs_on_temen() {
 fn real_allocator_runs_end_to_end() {
     // The `system` module linked into any program is the real one, so its allocator is exercisable.
     // `osAllocPages` is the raw page source — it calls the bound `mmap`, which the shim serves from
-    // the `POWERBOX_HEAP_BRK` bump cursor (window offset 32). Two calls must return the seeded heap
-    // start and then one page past it — real stdlib allocation running on both engines, with the
-    // `system` module sourced from the toolchain (no committed artifact).
+    // the `POWERBOX_HEAP_BRK` bump cursor. Under the #964 NULL guard the shim reads that cursor one
+    // guard up, at `POWERBOX_NULL_GUARD + POWERBOX_HEAP_BRK` (the guard's scratch page, #1091), so
+    // seed it there. Two calls must return the seeded heap start and then one page past it — real
+    // stdlib allocation running on both engines, with the `system` module sourced from the toolchain.
     with_program("proc noop() = discard\nnoop()\n", |m| {
         let mut window = vec![0u8; 1 << 20];
-        let brk = temen_ir::POWERBOX_HEAP_BRK as usize;
+        let brk = (temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_HEAP_BRK) as usize;
         window[brk..brk + 8].copy_from_slice(&(1i64 << 19).to_le_bytes());
         // `osAllocPages` is frame-needing under the funcref ABI — it can reach the OOM/abort path,
         // whose handler is an indirect call — so its signature is `($sp, size)`. Give it a data-stack
@@ -337,12 +339,13 @@ fn run_main_read_global(m: &Module, global_substr: &str) -> i64 {
     // Powerbox layout (the model temen-llvm's C on-ramp runs under): the data stack is based at
     // `powerbox_entry_sp` (page-aligned, above all globals), and the heap lives above the 1 MiB
     // stack reserve — so globals / data stack / heap are disjoint by construction and the allocator
-    // can never stomp a live frame or the seq it's growing. The heap-brk word (`POWERBOX_HEAP_BRK`,
-    // window offset 32) is the shim bump allocator's cursor; seed it to the heap base.
+    // can never stomp a live frame or the seq it's growing. The heap-brk word is the shim bump
+    // allocator's cursor; under the #964 guard the shim reads it at `POWERBOX_NULL_GUARD +
+    // POWERBOX_HEAP_BRK` (the guard's scratch page, #1091), so seed it there to the heap base.
     let entry_sp = temen_ir::powerbox_entry_sp(m) as i64;
     let heap_base = entry_sp + temen_ir::POWERBOX_STACK_RESERVE as i64;
     let mut seed = vec![0u8; 1 << 20];
-    let brk = temen_ir::POWERBOX_HEAP_BRK as usize;
+    let brk = (temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_HEAP_BRK) as usize;
     seed[brk..brk + 8].copy_from_slice(&heap_base.to_le_bytes());
     // C `main(argc, argv, envp)` with the leading frame `$sp` = the data-stack base; argc/argv/envp
     // are zero for a no-arg program.
@@ -599,8 +602,12 @@ fn nim_powerbox_seeds_heap_words_to_window_top() {
     };
 
     let win = 1u64 << m.memory.expect("powerbox module has a window").size_log2;
-    let brk = read_word(temen_ir::POWERBOX_HEAP_BRK);
-    let top = read_word(temen_ir::POWERBOX_HEAP_TOP);
+    // #964/#1091: the link emits the `__null_guard` marker and bakes the heap words one guard up, in
+    // the guard's scratch page — read them at `scratch + POWERBOX_HEAP_BRK`/`TOP` (the DAP convention).
+    let scratch =
+        temen_ir::module_null_guard(&m).expect("nim powerbox link carries the guard marker");
+    let brk = read_word(scratch + temen_ir::POWERBOX_HEAP_BRK);
+    let top = read_word(scratch + temen_ir::POWERBOX_HEAP_TOP);
     let entry_sp = temen_ir::powerbox_entry_sp(&m);
 
     assert_eq!(
