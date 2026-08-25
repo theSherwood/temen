@@ -7971,7 +7971,7 @@ pub fn compile_and_run_sliced(
 /// not leak; waking any pipe that thereby reached EOF is the tree-walker's job (the cooperative engine
 /// has no CorePipe park — pipe-through-exec is a later rung), and is a no-op for a command that
 /// inherited none.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn exec_image_build(
     cur_host: &mut Host,
     cur_mem: Option<&Mem>,
