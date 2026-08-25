@@ -173,5 +173,15 @@ test = false
 doc = false
 bench = false
 
+# #1081 paged bulk-memory per-page walk (`emit_span_page_check`) vs the interpreter's `check_prot_span`
+# — the fourth confinement lowering, which `wasm_diff` can't reach (it suppresses cap.call/page-op
+# modules). The stable `paged_walk` test drives the same `fuzz_one` from seeds.
+[[bin]]
+name = "paged_walk"
+path = "fuzz_targets/paged_walk.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1

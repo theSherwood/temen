@@ -5,12 +5,18 @@
 //! bash is **GPLv3 and never vendored** (`demos/bash/build_bitcode.sh` fetches it from ftp.gnu.org),
 //! so there is no committed `bash.temen` fixture the way `shell.temen` is committed — it is a
 //! build-at-deploy asset. These tests therefore **gate on the locally-built asset**: point
-//! `TEMEN_BASH_TEMEN` at a `bash.temen` (default `/tmp/temen_bash_cache/bash.temen`, where
-//! `bash_asset` writes it), or the test skips-loud like the #802 capstone does offline. Build it with:
-//!   (cd crates/temen-run/demos/bash && ./build_bitcode.sh)
-//!   (cd crates/temen-llvm && cargo build --release --example bash_asset \
-//!      && ./target/release/examples/bash_asset /tmp/temen_bash_cache/bash_linked.ll \
-//!         /tmp/temen_bash_cache/bash.temen)
+//! `TEMEN_BASH_TEMEN` at a `bash.temen` (default `/tmp/temen_bash_cache/bash.temen`), or the test
+//! skips-loud like the #802 capstone does offline. Build it with the on-ramp translator (the same
+//! `temen-llvm-translate` binary the browser Postgres asset uses), matching the browser host:
+//!   (cd crates/temen-run/demos/bash && ./build_bitcode.sh)        # → bash_linked.ll
+//!   (cd crates/temen-llvm && cargo build --release --bin temen-llvm-translate \
+//!      && ./target/release/temen-llvm-translate /tmp/temen_bash_cache/bash_linked.ll \
+//!         -o /tmp/temen_bash_cache/bash.temen --host-page 65536 --stub-externs --null-guard)
+//! `--null-guard` is **required**, not optional: the coreutils in `/bin` (chibicc `--child-entry`)
+//! are guarded, so their args base is `guard+128`; bash's `execve` must write the child argv to the
+//! same place, which it only does when bash is guarded too. A guard-0 bash writes argv at 128 and the
+//! guarded `seq`/`echo` read an empty region at 16512 (external commands run argv-less). `--host-page
+//! 65536` matches the wasm host's 64 KiB pages (D40), as for every browser-target asset.
 
 use temen_browser::{bash_exec, bash_exec_with, STATUS_EXIT};
 
@@ -144,20 +150,16 @@ fn bash_dash_c_external_seq_last() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n2\n3\n");
 }
 
-/// #1080 slice 2 — a **fork-twin exec**: a non-final external command forces bash to fork → execve
-/// (rather than exec-the-last-command). `bash -c 'seq 2; echo done'` should fork a twin for `seq 2`,
-/// the twin image-replaces with `/bin/seq` (the `env: Some` exec arm + personality carry, both landed
-/// here), bash reaps it, then runs the builtin `echo done` and exits.
+/// #1080 — a **fork-twin exec**: a non-final external command forces bash to fork → execve (rather
+/// than exec-the-last-command). `bash -c 'seq 2; echo done'` forks a twin for `seq 2`, the twin
+/// image-replaces with `/bin/seq`, bash reaps it, then runs the builtin `echo done` and exits.
 ///
-/// `#[ignore]`d: this surfaced that **bash's own `fork()` on the pure bytecode cooperative engine**
-/// returns an error ("bash: fork: Unknown error") — bash reaches fork through the personality's
-/// host-proc fork dispatch, a path never exercised on the bytecode engine before (bash previously ran
-/// only on the tree-walker, whose exec decline folded it there; the bespoke `temen-posix` shell spawns
-/// externals via op-13 `instantiate_module`, not `fork()`). That bytecode fork-dispatch gap is a
-/// distinct follow-up rung from exec_module; the `env: Some` exec arm itself is ready for it. Single
-/// external commands (exec-the-last-command → a *root* exec) already work — see the test above.
+/// The whole fork-twin-exec argv path composes on the bytecode engine: the twin `execve`s `/bin/seq`
+/// carrying bash's fd 1, bash reaps it, then the builtin `echo done` runs. Gates on the deploy-built
+/// `bash.temen` (skips-loud when absent). NB: the asset must be built with `--null-guard` so bash's
+/// args base (`guard+128`) matches the guarded coreutils' — a guard-mismatched bash writes the child
+/// argv where the coreutil never reads it (an earlier stale-`bash_linked.ll` symptom; see header doc).
 #[test]
-#[ignore = "bash's personality fork() on the bytecode cooperative engine is a separate follow-up (see doc); exec_module itself is done"]
 fn bash_dash_c_external_seq_forked() {
     let Some(bash) = load_bash() else {
         eprintln!("note: skipping bash_dash_c_external_seq_forked — no bash.temen");
@@ -188,4 +190,73 @@ fn bash_dash_c_external_seq_forked() {
         out.value,
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// #1080 — a **two-stage pipeline of external commands** in the browser: `echo hi | cat`. bash forks
+/// both stages, wires a CorePipe between them, each twin `execve`s its coreutil (`/bin/echo`,
+/// `/bin/cat`), the reader blocks on the pipe until the writer's bytes arrive, then EOFs when it exits.
+///
+/// `#[ignore]`d — a CONFIRMED real deadlock (a distinct follow-up rung), reproduced with a freshly-built
+/// `--null-guard` `bash.temen`, so it is not the stale-asset artifact that masked the fork/exec/wait
+/// tests above. The stuck configuration: the root bash parks in `waitpid(-1)`, the writer twin (`echo`)
+/// reaches `Done`, but the reader twin (`cat`, the exec'd `/bin/cat`) spins **Runnable** forever — it
+/// neither reads-to-EOF nor parks (`BlockedPipeRead`). So the cooperative pipe park/wake does not engage
+/// for an exec'd *reader* twin the way it does for the synthetic guests in the native `c_posix` pipeline
+/// differentials (`seq | head | wc`, `sort | uniq`), which all pass on the bytecode engine. Un-ignore
+/// once the exec'd-reader pipe park is fixed.
+#[test]
+#[ignore = "confirmed real deadlock (fresh --null-guard asset): the exec'd reader twin spins Runnable instead of pipe-read-parking/EOFing — a distinct pipeline-through-exec follow-up rung"]
+fn bash_dash_c_pipeline_echo_cat() {
+    let Some(bash) = load_bash() else {
+        eprintln!("note: skipping bash_dash_c_pipeline_echo_cat — no bash.temen");
+        return;
+    };
+    let bins = load_coreutils();
+    let bin_refs: Vec<(&str, &temen_ir::Module, u8)> =
+        bins.iter().map(|(p, m, wl)| (*p, m, *wl)).collect();
+    let out = bash_exec_with(&bash, &[b"bash", b"-c", b"echo hi | cat"], b"", &bin_refs);
+    assert_eq!(
+        out.status,
+        STATUS_EXIT,
+        "status={} stdout={:?} stderr={:?}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\n");
+}
+
+/// #1080 — a **three-stage coreutil pipeline** in the browser: `seq 5 | head -n 3 | wc -l` → `3`. Three
+/// forks, three `execve`d coreutils, two CorePipes, every read park + carried pipe end + EOF + reap
+/// composing under real bash on the bytecode engine — the milestone capstone.
+///
+/// `#[ignore]`d for the same confirmed exec'd-reader-twin spin as `bash_dash_c_pipeline_echo_cat` above
+/// (a distinct follow-up; the native 3-stage `seq | head | wc` differential passes on both engines).
+#[test]
+#[ignore = "same confirmed exec'd-reader-twin pipeline deadlock as bash_dash_c_pipeline_echo_cat (see doc) — a distinct follow-up"]
+fn bash_dash_c_pipeline_seq_head_wc() {
+    let Some(bash) = load_bash() else {
+        eprintln!("note: skipping bash_dash_c_pipeline_seq_head_wc — no bash.temen");
+        return;
+    };
+    let bins = load_coreutils();
+    let bin_refs: Vec<(&str, &temen_ir::Module, u8)> =
+        bins.iter().map(|(p, m, wl)| (*p, m, *wl)).collect();
+    let out = bash_exec_with(
+        &bash,
+        &[b"bash", b"-c", b"seq 5 | head -n 3 | wc -l"],
+        b"",
+        &bin_refs,
+    );
+    assert_eq!(
+        out.status,
+        STATUS_EXIT,
+        "status={} stdout={:?} stderr={:?}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    // wc -l prints the line count (3), typically right-padded/whitespace-formatted; assert it contains 3.
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.trim() == "3", "expected line count 3, got {s:?}");
 }

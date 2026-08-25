@@ -24,6 +24,28 @@ identical until the next agent edit.
   fail-soft without their built assets. (Until copied over, the `workflows-in-sync` guard stays red —
   the expected mirror-edit friction; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
 
+- **`paged_walk` added to the nightly `fuzz` matrix** (issue #1081) — one entry added to the `fuzz`
+  job's `target: [...]` list (after `coverage_walk`), plus the descriptive comment above it. It is the
+  new libFuzzer target `fuzz/fuzz_targets/paged_walk.rs`: the generative interp⇄**wasm-JIT** differential
+  for the **paged bulk-memory per-page walk** (`emit_span_page_check` vs the interpreter's
+  `check_prot_span`) — the tree's *fourth* confinement lowering, which `wasm_diff` can't reach (it
+  suppresses cap.call/page-op modules). Runs like every other target (`cargo fuzz run paged_walk --
+  -max_total_time=300`). The `fuzz-matrix-in-sync` guard ("fuzz targets wired") **reds the run until this
+  is copied over** — the new `fuzz_targets/paged_walk.rs` + `fuzz/Cargo.toml [[bin]]` have no matching
+  matrix row in the live `ci.yml` until the copy lands. The stable `crates/temen/tests/paged_walk.rs`
+  gates it per-PR from deterministic seeds (485 trapping / 1015 passing spans on 1500 seeds, verified
+  locally). (Until copied over, both `workflows-in-sync` and `fuzz targets wired` stay red — the expected
+  mirror-edit friction; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
+
+- **`full-depth-lua`: shard per (suite × tier) (`ci.yml`, #1074 follow-up)** — the split landed with a
+  `{bytecode, tree_walker}` matrix, each tier running all three Lua suites in one job under
+  `timeout-minutes: 75`. Validation run #3536 showed the **tree_walker tier alone exceeds 75 min**
+  (bytecode-tier ~35 min; tree_walker-tier hit the 75-min cap and was cancelled). The matrix is now
+  `suite: [lua_tlib, lua_all, lua_sweep] × tier: [bytecode, tree_walker]` = 6 shards, each running one
+  `cargo test --test <suite> -- --ignored <tier>`, so the longest single shard is well under the cap.
+  Same tests/coverage, finer fan-out. (Until copied over, the `workflows-in-sync` guard stays red —
+  the expected mirror-edit friction; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
+
 - **`excluded-crates-compile` per-PR job (`ci.yml`)** — a new lightweight always-on job that
   `cargo check`s the two workspace-EXCLUDED crates, `bench/` (pinned stable) and `fuzz/` (pinned
   `nightly-2026-07-01`, matching the `fuzz` job). Because the always-on `check` job builds only the
