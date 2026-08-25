@@ -21454,6 +21454,28 @@ impl Host {
     ///
     /// Shared by the tree-walker's `Step::Exec` dispatch and the bytecode engine's exec pump arm so
     /// this TCB-sensitive carry lives in exactly one place (the tree-walker is the differential oracle).
+    /// #799/#1080 — install the **park-request door**: the pure, lock-free closure a personality's
+    /// `fork`/`waitpid` op fires (`SignalSource::set_park_request`) to encode a [`ParkEvent`] into this
+    /// Host's `park_request` cell, where [`Self::take_park_request`] reads it. The tree-walker's `run`
+    /// inlines this alongside the scheduler-backed wake/stop/kill doors; the bytecode cooperative
+    /// `drive` has no scheduler, so it wires ONLY this closure (no re-lock — the store is on a
+    /// pre-cloned `Arc`, and the op fires it under this Host's own lock). Idempotent (re-installs).
+    pub(crate) fn wire_park_door(&self) {
+        let park_cell = self.park_request.clone();
+        if let Some((_, source)) = self.signal_poll() {
+            source.set_park_request(Arc::new(move |ev| {
+                park_cell.store(
+                    match ev {
+                        ParkEvent::TaskExit(id) => id,
+                        ParkEvent::TaskExitAny => u64::MAX - 1,
+                        ParkEvent::ForkSelf => u64::MAX,
+                    },
+                    Ordering::SeqCst,
+                );
+            }));
+        }
+    }
+
     pub(crate) fn exec_carry(
         &mut self,
         child: &mut Host,

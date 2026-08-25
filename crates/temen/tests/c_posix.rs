@@ -228,6 +228,46 @@ fn run_interp_only(src: &str, prep: impl Fn(&Posix)) -> Effects {
     }
 }
 
+/// The **bytecode-engine** twin of [`run_interp_only`]: the same guest + personality wiring, driven by
+/// the cooperative `drive` (the tier the browser playground runs on). Used to differential the
+/// personality `fork()`/`waitpid()` park engine (#1080 rung 3) against the tree-walker oracle.
+fn run_bytecode_only(src: &str, prep: impl Fn(&Posix)) -> Effects {
+    run_bytecode_setup(src, |_host, posix| prep(posix))
+}
+
+/// [`run_bytecode_only`] with a `|host, posix|` setup callback (e.g. `stage_executable` to register a
+/// `/bin` command before the run) — the bytecode-engine twin of [`run_interp_setup`]. Differentials the
+/// whole external-command flow (fork → execve → waitpid) on the cooperative driver (#1080 rungs 2+3).
+fn run_bytecode_setup(src: &str, extra: impl Fn(&mut Host, &Posix)) -> Effects {
+    let ir = c_to_ir(src);
+    let raw = parse_module_raw(&ir)
+        .unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
+    let win = 1u64
+        << raw
+            .memory
+            .expect("the frontend declares a window")
+            .size_log2;
+    let mut ih = Host::new();
+    let (iposix, ipx) = setup(&mut ih, win);
+    extra(&mut ih, &iposix);
+    verify_module(&raw).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
+    bind_shim(&raw, &mut ih, ipx);
+    let mut fuel = 200_000_000u64;
+    let ran = temen_interp::bytecode::compile_and_run_with_host(&raw, 0, &[], &mut fuel, &mut ih)
+        .expect("the bytecode engine compiles this module (no declining op)");
+    let (result, exited) = match ran {
+        Ok(v) => (v, None),
+        Err(Trap::Exit(c)) => (Vec::new(), Some(c)),
+        Err(e) => panic!("bytecode trapped: {e:?}\n--- IR ---\n{ir}"),
+    };
+    Effects {
+        result,
+        exited,
+        stdout: iposix.stdout(),
+        file_f: iposix.read_file("f"),
+    }
+}
+
 /// #796 L2 — **async delivery to a running loop**: a signal raised while the guest is compute-bound is
 /// delivered to its handler at a safepoint, with **no `sigcheck` poll** in the loop. The handler sets a
 /// global; the loop (which never polls) observes it and exits. This is the headline "async" win — the
@@ -966,6 +1006,90 @@ int main(void) {
         vec![Value::I32(42)],
         "a personality-only guest forked (return-twice) and blocked in waitpid until the twin's \
          real exit — the capability fork engine reached through named imports alone"
+    );
+}
+
+/// #1080 rung 3 — the **same fork + blocking-waitpid witness on the bytecode engine** (the playground
+/// tier). Exercises the ported personality-fork park engine end to end: `fork()` (`ParkEvent::ForkSelf`
+/// → the cooperative driver self-forks a twin), the twin's slow spin, its exit firing the personality
+/// exit hooks (Live → Zombie), and the parent's blocking `waitpid` (`ParkEvent::TaskExit` → park →
+/// re-execute) reading the retired twin's `WEXITSTATUS`. Must agree with the tree-walker oracle above.
+#[test]
+fn c_a_personality_fork_and_waitpid_on_bytecode() {
+    let src = r#"
+long __px_fork(int cap, long a);
+long __px_waitpid(int cap, long pid, long status, long opts);
+long __px_getpid(int cap, long a);
+long __px_getppid(int cap, long a);
+static int status;
+static volatile long acc;
+static long me;
+static long pid;
+static long h;
+int main(void) {
+  me = __px_getpid(0, 0);
+  pid = __px_fork(0, 0);
+  if (pid < 0) return 1;
+  if (pid == 0) {
+    if (__px_getppid(0, 0) != me) return 9;
+    for (long i = 0; i < 30000; i = i + 1) acc = acc + 1;
+    return 7;
+  }
+  if (pid == me) return 2;
+  h = __px_waitpid(0, pid, (long)&status, 0);
+  if (h != pid) return 3;
+  if ((status & 0x7f) != 0) return 4;
+  if (((status >> 8) & 0xff) != 7) return 5;
+  return 42;
+}
+"#;
+    let e = run_bytecode_only(src, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "the bytecode engine forked, blocked in waitpid, and read the twin's exit 7 — matching the \
+         tree-walker (#1080 rung 3: fork/reap park + exit-hook firing on the cooperative driver)"
+    );
+}
+
+/// #1080 rung 3 — the **any-child** blocking wait (`waitpid(-1)` → `ParkEvent::TaskExitAny` → the
+/// driver's `BlockedReapPersonality { child: None }` park) on the bytecode engine. The parent forks a
+/// slow twin and blocks in `waitpid(-1)`; the settle scan wakes it when ANY forked child completes, and
+/// the re-executed wait returns the twin's pid + `WEXITSTATUS`. Differentialled against the tree-walker
+/// (both engines must return 42) — covers the wildcard reap path job control uses.
+#[test]
+fn c_a_personality_fork_and_waitpid_any_child_differential() {
+    let src = r#"
+long __px_fork(int cap, long a);
+long __px_waitpid(int cap, long pid, long status, long opts);
+static int status;
+static volatile long acc;
+static long pid;
+int main(void) {
+  pid = __px_fork(0, 0);
+  if (pid < 0) return 1;
+  if (pid == 0) {
+    for (long i = 0; i < 30000; i = i + 1) acc = acc + 1;  /* slow: the parent must BLOCK */
+    return 7;
+  }
+  long h = __px_waitpid(0, -1, (long)&status, 0);          /* ANY child, blocking */
+  if (h != pid) return 3;                                   /* reaped the twin, got its pid */
+  if ((status & 0x7f) != 0) return 4;                       /* clean exit, not a signal death */
+  if (((status >> 8) & 0xff) != 7) return 5;                /* WEXITSTATUS = the twin's 7 */
+  return 42;
+}
+"#;
+    let interp = run_interp_only(src, |_| {});
+    assert_eq!(
+        interp.result,
+        vec![Value::I32(42)],
+        "tree-walker any-child reap"
+    );
+    let byte = run_bytecode_only(src, |_| {});
+    assert_eq!(
+        byte.result,
+        vec![Value::I32(42)],
+        "bytecode any-child (waitpid(-1)) reap matched the oracle"
     );
 }
 
@@ -2996,6 +3120,46 @@ int main(void) {{\n\
         e.result,
         vec![Value::I32(42)],
         "argv survives a second twin's execve"
+    );
+}
+
+/// #1080 rungs 2+3 combined on the **bytecode engine** — the whole external-command flow: `fork()` (a
+/// twin, rung 3's fork park), the twin `execve`s a staged `/bin` command (rung 2's `env: Some`
+/// image-replace + personality carry — the path only the ignored browser test covered until now), and
+/// the parent `waitpid`s for its exit (rung 3's reap park). This is the native, disk-cheap proof that
+/// bash's fork→exec→wait runs on the playground tier, differentialled against the tree-walker oracle.
+#[test]
+fn c_fork_execve_waitpid_on_bytecode() {
+    const CMD: &str = r#"
+int main(int argc, char **argv) {
+  if (argc != 2) return 80 + argc;
+  if (argv[1][0] != 'x') return 79;
+  return 7;
+}
+"#;
+    let src = format!(
+        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+static char *av[] = {{ \"c\", \"x\", 0 }};\n\
+static int st;\n\
+int main(void) {{\n\
+  long pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 1;\n\
+  if (pid == 0) {{ execve(\"/bin/c\", av, 0); return 99; }}\n\
+  if (__px_waitpid(0, pid, (long)&st, 0) != pid) return 2;\n\
+  if (((st >> 8) & 0xff) != 7) return 3;\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_bytecode_setup(&src, |host, posix| {
+        stage_executable(host, posix, "/bin/c", CMD);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "the bytecode engine forked, the twin execve'd /bin/c (env:Some image-replace), and the parent \
+         reaped its exit 7 — rungs 2+3 combined, matching the tree-walker"
     );
 }
 
