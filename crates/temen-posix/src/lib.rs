@@ -810,6 +810,11 @@ enum ProcEntry {
         /// #799 — the pgid at exit, retained so `waitpid(-pgid)` can group-reap a zombie whose
         /// `Proc` (the live pgid's home) is already gone.
         pgid: i32,
+        /// #1080 pipeline rung — the ppid at exit, retained so `waitpid(-1)`/`waitpid(-pgid)` reap
+        /// only the CALLER's OWN children (POSIX), never a sibling's zombie. Without it a bash
+        /// pipeline stage's `waitpid(-1)` steals the reap the shell is blocked waiting for, wedging
+        /// `echo | cat`. The root's pid is `1`, so a root child carries `ppid == 1`.
+        ppid: i32,
     },
 }
 
@@ -1894,6 +1899,7 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
                 ProcEntry::Zombie {
                     status: encoded,
                     pgid,
+                    ppid,
                 },
             );
             // #802 rung 3 — the exit is a child transition: pend SIGCHLD in the parent, ARM
@@ -3135,7 +3141,8 @@ impl Ctx<'_> {
             pid,
             ProcEntry::Zombie {
                 status: (res.status & 0xff) << 8,
-                pgid: pid, // a spawn clone is its own group leader (never setpgid'd)
+                pgid: pid,        // a spawn clone is its own group leader (never setpgid'd)
+                ppid: self.p.pid, // the spawner owns this child (reap-ownership, #1080)
             },
         );
         pid as i64
@@ -3155,14 +3162,20 @@ impl Ctx<'_> {
         // — a guest polls, or parks in the core's servicer reap, the wait offer, which serves the
         // same twin independently; use one channel per child).
         let is_zombie = |e: Option<&ProcEntry>| matches!(e, Some(ProcEntry::Zombie { .. }));
+        // #1080 pipeline rung — reap ownership: `waitpid` reaps only the caller's OWN children (POSIX).
+        // The zombie carries the `ppid` it exited with; a wildcard/`-pgid` reap that ignored it would let
+        // a bash pipeline stage steal the reap the shell is blocked waiting for (the `echo | cat` wedge).
+        let self_pid = self.p.pid;
         let reaped = if pid == -1 {
             self.w
                 .procs
                 .iter()
-                .filter_map(|(p, e)| matches!(e, ProcEntry::Zombie { .. }).then_some(*p))
+                .filter_map(|(p, e)| {
+                    matches!(e, ProcEntry::Zombie { ppid, .. } if *ppid == self_pid).then_some(*p)
+                })
                 .min()
         } else if pid < -1 {
-            // #799 — `waitpid(-pgid)`: group-reap the lowest zombie whose pgid (retained on the
+            // #799 — `waitpid(-pgid)`: group-reap the lowest OWN zombie whose pgid (retained on the
             // zombie entry) matches. Non-blocking like `-1` — the park door benches only
             // specific-pid waits this rung.
             let g = (-pid) as i32;
@@ -3170,7 +3183,8 @@ impl Ctx<'_> {
                 .procs
                 .iter()
                 .filter_map(|(p, e)| {
-                    matches!(e, ProcEntry::Zombie { pgid, .. } if *pgid == g).then_some(*p)
+                    matches!(e, ProcEntry::Zombie { pgid, ppid, .. } if *pgid == g && *ppid == self_pid)
+                        .then_some(*p)
                 })
                 .min()
         } else if is_zombie(self.w.procs.get(&(pid as i32))) {

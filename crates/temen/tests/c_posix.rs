@@ -1148,6 +1148,58 @@ int main(void) {
     );
 }
 
+/// #1080 pipeline rung — **reap ownership**: `waitpid(-1)` must reap only the CALLER's own children,
+/// never a sibling's. The root forks two twins; twinA exits (a zombie owned by the root), and twinB —
+/// which has no children — calls `waitpid(-1)`. POSIX: twinB gets `-ECHILD` and does NOT steal twinA's
+/// zombie, so the root still reaps twinA itself. This is the shape behind the browser `echo | cat`
+/// deadlock: a pipeline stage's stray `waitpid(-1)` stealing a sibling stage's reap from the shell.
+#[test]
+fn c_a_waitpid_any_child_does_not_steal_a_siblings_reap_differential() {
+    let src = r#"
+long __px_fork(int cap, long a);
+long __px_waitpid(int cap, long pid, long status, long opts);
+static int stA;
+static int stB;
+static volatile long acc;
+static long pa;
+static long pb;
+int main(void) {
+  pa = __px_fork(0, 0);
+  if (pa < 0) return 1;
+  if (pa == 0) return 7;                        /* twinA: exit 7 -> a zombie owned by the ROOT */
+  pb = __px_fork(0, 0);
+  if (pb < 0) return 2;
+  if (pb == 0) {
+    for (long i = 0; i < 20000; i = i + 1) acc = acc + 1;  /* let twinA retire to a zombie first */
+    long h = __px_waitpid(0, -1, (long)&stB, 0);           /* twinB has NO children */
+    if (h > 0) return 20 + (int)h;                          /* BUG: twinB stole a sibling's zombie */
+    return 11;                                              /* h < 0 (-ECHILD): correct */
+  }
+  long hb = __px_waitpid(0, pb, (long)&stB, 0);   /* root blocks on twinB FIRST: twinA becomes a
+                                                     zombie while twinB spins, so twinB's waitpid(-1)
+                                                     below has a stealable sibling zombie present */
+  if (hb != pb) return 5;
+  if (((stB >> 8) & 0xff) != 11) return 6;        /* twinB returned 11 (did not steal twinA) */
+  long ha = __px_waitpid(0, pa, (long)&stA, 0);   /* root reaps twinA — still there iff not stolen */
+  if (ha != pa) return 3;
+  if (((stA >> 8) & 0xff) != 7) return 4;
+  return 42;
+}
+"#;
+    let interp = run_interp_only(src, |_| {});
+    assert_eq!(
+        interp.result,
+        vec![Value::I32(42)],
+        "tree-walker: waitpid(-1) in a childless sibling does not steal the root's zombie"
+    );
+    let byte = run_bytecode_only(src, |_| {});
+    assert_eq!(
+        byte.result,
+        vec![Value::I32(42)],
+        "bytecode: waitpid(-1) must be scoped to the caller's own children (no sibling reap-stealing)"
+    );
+}
+
 /// #799 — **fork × default-actions × blocking-waitpid, personality-only**: the parent forks a
 /// runaway twin (spins forever, no handlers), kills it with an unhandled `SIGTERM` (#796's
 /// default-terminate through the kill door — the twin's doors minted at fork), and the blocking
