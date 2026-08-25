@@ -371,6 +371,29 @@ enum Op {
         dst: u32,
         has_result: bool,
     },
+    /// FORK.md §8.6 — `exec_module` (self-op 14): **`execve` image-replace** (#1080). The running vCPU
+    /// replaces its own image with a granted *separate command module*, in place, keeping its task id
+    /// and fuel. The rebuild needs the driver's task/env set + `dom.source`, so the op resolves its
+    /// register operands here and surfaces to the cooperative driver ([`Outcome::Exec`]); the driver
+    /// compiles the command, builds its powerbox from the by-name grant list, materializes its data
+    /// into the caller's window, and swaps the task's activation. On any refusal the driver writes a
+    /// probeable `-EINVAL` to `dst` and the caller keeps running (POSIX: `execve` returns only on
+    /// failure). Cooperative-driver-only (like [`Op::CloneCaller`]); other drivers `ThreadFault`.
+    ExecModule {
+        /// The command `Module` handle register.
+        module: u32,
+        /// The by-name grant list `(ptr, count)` register pair (16-byte `{name_off, name_len, handle,
+        /// flags}` records, the same layout op-13 `instantiate_module_named` reads).
+        grants_ptr: u32,
+        grants_n: u32,
+        /// The command entry-function index register.
+        entry: u32,
+        /// The advisory `size_log2` register (the real bound is the caller's window).
+        size_log2: u32,
+        /// The `cap.call` result slot — receives `-EINVAL` on a refused exec (a successful exec never
+        /// returns to this activation).
+        dst: u32,
+    },
     /// §3.6 (I36 slice 2) — `Instantiator.child_offer` (op 14): mint a live-callee offer over a
     /// running child's impl-export into the wirer's table. The authority check (the Instantiator
     /// handle) runs in the op exec; the mint itself needs the child's env/host, so it surfaces to
@@ -1740,11 +1763,23 @@ fn compile_inst(
                 // decline the module so it falls back to the tree-walker, which services op 13
                 // directly. (The JIT does lower it inline — it owns the fuel cell's address.)
                 (temen_ir::CAP_SELF_TYPE_ID, 13) => return None,
-                // FORK.md §8.6 — `exec_module` (`execve` image-replace, op 14) is eval-loop-only:
-                // the tree-walker folds it to `Step::Exec` before any host dispatch, so a fast tier
-                // that ran the generic `cap.call` thunk would answer `-EINVAL` where the oracle
-                // image-replaces — a silent divergence (INVARIANTS.md #9). Decline the module so it
-                // folds to the oracle (fail-closed), as op 13 does. (OPS_PARITY.md `exec`.)
+                // FORK.md §8.6 — `exec_module` (`execve` image-replace, op 14, #1080): the cooperative
+                // driver owns the task/env set + `dom.source`, so the op resolves its five register
+                // operands `(module, grants_ptr, grants_n, entry, size_log2)` here and surfaces the
+                // image-replace to the driver ([`Outcome::Exec`]). The `dst` result slot receives the
+                // `-EINVAL` of a refused exec (a successful exec never returns to this activation).
+                // (The tree-walker folds this to `Step::Exec`; this tier does the replace natively so
+                // an exec-bearing module — bash — runs on the browser's bytecode engine.)
+                (temen_ir::CAP_SELF_TYPE_ID, 14) if args.len() >= 5 => Op::ExecModule {
+                    module: g(args[0]),
+                    grants_ptr: g(args[1]),
+                    grants_n: g(args[2]),
+                    entry: g(args[3]),
+                    size_log2: g(args[4]),
+                    dst,
+                },
+                // A malformed `exec_module` (< 5 args) is outside the ABI — decline the module so it
+                // folds to the tree-walker rather than mis-lowering.
                 (temen_ir::CAP_SELF_TYPE_ID, 14) => return None,
                 // Generic synchronous powerbox dispatch (Stream/Clock/Memory/host-fn/JIT compile/…).
                 _ => Op::CapCall {
@@ -3328,6 +3363,9 @@ impl<'p> Vcpu<'p> {
                 | Ok(VcpuStop::ChildOffer { .. })
                 | Ok(VcpuStop::CloneCaller { .. })
                 | Ok(VcpuStop::Reap { .. })
+                // `exec_module` image-replace needs the cooperative driver's task/env set; this
+                // single-vCPU path can't rebuild the activation, so fail closed like its neighbours.
+                | Ok(VcpuStop::Exec { .. })
                 // I48: `BlockOnFiber` is a cooperative-driver idle (this path passes
                 // `cooperative: false`, so it never arises here); fail closed like its neighbours.
                 | Ok(VcpuStop::BlockOnFiber { .. }) => return VcpuEvent::Trapped(Trap::ThreadFault),
@@ -8039,6 +8077,19 @@ enum Outcome {
         dst: u32,
         has_result: bool,
     },
+    /// FORK.md §8.6 — `exec_module` (`execve` image-replace, #1080): the running vCPU asks the driver
+    /// to replace its image with command module `mh`, granting the by-name cap list at `(grants_ptr,
+    /// grants_n)` into the command's fresh powerbox, entering `entry`. `size_log2` is advisory (the
+    /// real window is the caller's). On refusal the driver writes `-EINVAL` to `dst`; on success the
+    /// task's activation is swapped and it never returns to the caller.
+    Exec {
+        mh: i32,
+        grants_ptr: u64,
+        grants_n: u64,
+        entry: u64,
+        size_log2: i64,
+        dst: u32,
+    },
     /// §14 `Instantiator.instantiate`: the authority `(ibase, isize)` is resolved; the driver builds a
     /// **confined executor child** running entry `entry` over `[ibase+off, +2^size_log2)` with its own
     /// attenuated powerbox and `quota` fuel, registers it (handle = thread slot), and writes the handle
@@ -8756,6 +8807,17 @@ enum VcpuStop {
         dst: u32,
         has_result: bool,
     },
+    /// FORK.md §8.6 — `exec_module` image-replace (#1080): surfaced to the cooperative driver, which
+    /// owns the task/env set + `dom.source`. Cooperative-driver-only (like [`VcpuStop::CloneCaller`]);
+    /// other drivers `ThreadFault`.
+    Exec {
+        mh: i32,
+        grants_ptr: u64,
+        grants_n: u64,
+        entry: u64,
+        size_log2: i64,
+        dst: u32,
+    },
     Done(Vec<Value>),
     /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): run the emitted `f{func}` region on the
     /// host, delivering its `n_results` results to absolute slot `dst` via `deliver_tierup`.
@@ -9212,6 +9274,23 @@ fn step_vcpu(
                     pid,
                     dst,
                     has_result,
+                })
+            }
+            Outcome::Exec {
+                mh,
+                grants_ptr,
+                grants_n,
+                entry,
+                size_log2,
+                dst,
+            } => {
+                return Ok(VcpuStop::Exec {
+                    mh,
+                    grants_ptr,
+                    grants_n,
+                    entry,
+                    size_log2,
+                    dst,
                 })
             }
             Outcome::Instantiate {
@@ -10279,6 +10358,153 @@ impl CoopSched {
                     if has_result {
                         tasks[ti].vt.active.set(dst, Reg::from_i64(result));
                     }
+                }
+                Ok(VcpuStop::Exec {
+                    mh,
+                    grants_ptr,
+                    grants_n,
+                    entry,
+                    size_log2,
+                    dst,
+                }) => {
+                    // FORK.md §8.6 — `execve` image-replace (#1080). Every refusal writes a probeable
+                    // `-EINVAL` to `dst` and lets the caller run on (POSIX: `execve` returns only on
+                    // failure); a success swaps this task's activation to the command and never returns.
+                    macro_rules! refuse {
+                        () => {{
+                            tasks[ti]
+                                .vt
+                                .active
+                                .set(dst, Reg::from_i32(super::EINVAL as i32));
+                            continue;
+                        }};
+                    }
+                    // Rung 1 (#1080) supports a **root-context** exec (`env: None`) — the shell/`bash -c`
+                    // program replacing itself. A fork-twin exec (`env: Some`) additionally needs the
+                    // personality carry (fds/signals/exit hooks) and lands in a later rung; refuse it
+                    // cleanly for now rather than image-replace without that carry.
+                    let clean_root = tasks[ti].env.is_none()
+                        && tasks[ti].vt.active.serve_ticket.is_none()
+                        && tasks[ti].vt.active_id == ROOT_FIBER
+                        && !host.is_durable();
+                    if !clean_root {
+                        refuse!();
+                    }
+                    // Resolve + compile the command module from the caller's (root) powerbox. A forged
+                    // handle or a module using an op the engine can't lower refuses cleanly.
+                    let (cfuncs, cmem_log2, cdata, cmodule) = match host.resolve_module(mh) {
+                        Ok(g) => (
+                            g.funcs.clone(),
+                            g.memory_log2,
+                            g.data.clone(),
+                            std::sync::Arc::clone(&g.module),
+                        ),
+                        Err(_) => refuse!(),
+                    };
+                    let child_compiled = match compile_module(&cfuncs, &cmodule.types) {
+                        Some(c) => c,
+                        None => refuse!(),
+                    };
+                    // Entry sig + window fit: `want_as` = the child entry takes (Instantiator,
+                    // AddressSpace) vs just (Instantiator); the command reuses the caller's window, so
+                    // its declared memory must be `<=` the caller's backed-prefix window (a larger
+                    // window is a safe superset, still masked to the real carve by §2).
+                    let want_as = child_compiled
+                        .sigs
+                        .get(entry as usize)
+                        .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
+                    let ok_entry = child_compiled
+                        .sigs
+                        .get(entry as usize)
+                        .is_some_and(|(p, r)| child_entry_ok(p, r));
+                    let win_bytes = mem.as_ref().map_or(0, |m| m.window.mapped());
+                    let win_log2 = win_bytes
+                        .is_power_of_two()
+                        .then(|| win_bytes.trailing_zeros() as u8);
+                    let size_ok = (0..64).contains(&size_log2);
+                    let mod_ok = win_log2.zip(cmem_log2).is_some_and(|(wl, ml)| ml <= wl);
+                    if !ok_entry || !size_ok || !mod_ok {
+                        refuse!();
+                    }
+                    let child_size =
+                        1u64 << win_log2.expect("mod_ok implies a power-of-two window");
+                    // Read + authority-check the by-name grant list (16-byte `{name_off, name_len,
+                    // handle, flags}` records) from the caller window — the same layout op-13 reads.
+                    let grants: Result<Vec<(String, i32)>, ()> = (|| {
+                        let m = mem.as_ref().ok_or(())?;
+                        let mut list: Vec<(String, i32)> = Vec::new();
+                        for i in 0..grants_n {
+                            let rec = m.read_window(grants_ptr + i * 16, 16).map_err(|_| ())?;
+                            let name_off =
+                                u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
+                            let name_len =
+                                u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
+                            let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+                            let name_bytes = m.read_window(name_off, name_len).map_err(|_| ())?;
+                            let name = String::from_utf8(name_bytes).map_err(|_| ())?;
+                            if !host.can_regrant(handle) {
+                                return Err(());
+                            }
+                            list.push((name, handle));
+                        }
+                        Ok(list)
+                    })();
+                    let grants = match grants {
+                        Ok(g) => g,
+                        Err(()) => refuse!(),
+                    };
+                    // Build the command's fresh powerbox from the by-name regrants + bind its manifest.
+                    let (mut child_host, cinst, cas) =
+                        match host.spawn_named_child(&grants, child_size) {
+                            Some(triple) => triple,
+                            None => refuse!(),
+                        };
+                    child_host.set_self_module(&cmodule);
+                    if child_host
+                        .bind_child_manifest(&cmodule.imports, &cmodule.types)
+                        .is_err()
+                    {
+                        refuse!();
+                    }
+                    let child_args = if want_as {
+                        vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
+                    } else {
+                        vec![Value::I64(cinst as i64)]
+                    };
+                    // Materialize the command's image into the caller's window in place: zero the fresh
+                    // image extent (the C `.bss` guarantee — stale caller bytes must not leak in), then
+                    // write its data segments (bounded to the window, as the verifier bounded them).
+                    if let Some(m) = mem.as_ref() {
+                        let base = m.window.base();
+                        m.commit_fresh_image((1u64 << cmem_log2.expect("mod_ok")).min(child_size));
+                        for d in cdata.iter() {
+                            if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
+                                for (k, &b) in d.bytes.iter().enumerate() {
+                                    m.set_byte(base + d.offset + k as u64, b);
+                                }
+                            }
+                        }
+                    }
+                    // Commit the image-replace: push the command as a new domain unit, build its natural
+                    // table, and swap THIS task's activation to it — keeping the task id + the reused
+                    // window + fuel. The root migrates into a confined env holding the command powerbox
+                    // and the command-module table (the shared `dom.table` maps module 0, not the command).
+                    let progs_len = child_compiled.progs.len();
+                    let cm = dom.source.push(child_compiled);
+                    let child_table = build_table_for(progs_len, 0, cm as u32);
+                    let cunit = dom.source.get(cm).ok_or(Trap::Malformed)?;
+                    let mut new_vt = VTask::new(&cunit, entry as usize, &child_args)?;
+                    new_vt.active.module = cm;
+                    new_vt.active.home = cm;
+                    tasks[ti].vt = new_vt;
+                    let eidx = extra_envs.len();
+                    extra_envs.push(ChildEnv {
+                        mem: mem.take(),
+                        host: std::sync::Arc::new(std::sync::Mutex::new(child_host)),
+                        table: child_table,
+                        fuel: *fuel,
+                    });
+                    tasks[ti].env = Some(eidx);
                 }
                 Ok(VcpuStop::Spawn {
                     func,
@@ -11766,6 +11992,8 @@ fn run_vcpu_parallel<'scope, 'env>(
             | Ok(VcpuStop::ChildOffer { .. })
             | Ok(VcpuStop::CloneCaller { .. })
             | Ok(VcpuStop::Reap { .. })
+            // `exec_module` image-replace is cooperative-driver-only (needs the task/env set).
+            | Ok(VcpuStop::Exec { .. })
             | Ok(VcpuStop::BlockOnFiber { .. }) => return (Err(Trap::ThreadFault), mem),
             Err(trap) => return (Err(trap), mem),
             Ok(VcpuStop::Done(vals)) => return (Ok(vals), mem),
@@ -13503,6 +13731,36 @@ impl Vm {
                         pid,
                         dst,
                         has_result,
+                    });
+                }
+                // FORK.md §8.6 — `exec_module` (#1080): resolve the five register operands and surface
+                // the image-replace to the driver. The cursor is saved (pc+1) so a *refused* exec
+                // (driver writes `-EINVAL` to `dst`) resumes at the next op — the caller survives, POSIX.
+                Op::ExecModule {
+                    module: module_reg,
+                    grants_ptr,
+                    grants_n,
+                    entry,
+                    size_log2,
+                    dst,
+                } => {
+                    let mh = r!(*module_reg).i64() as i32;
+                    let grants_ptr = r!(*grants_ptr).i64() as u64;
+                    let grants_n = r!(*grants_n).i64() as u64;
+                    let entry = r!(*entry).i64() as u64;
+                    let size_log2 = r!(*size_log2).i64();
+                    let dst = *dst;
+                    self.module = module;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(Outcome::Exec {
+                        mh,
+                        grants_ptr,
+                        grants_n,
+                        entry,
+                        size_log2,
+                        dst,
                     });
                 }
                 Op::Instantiate {
