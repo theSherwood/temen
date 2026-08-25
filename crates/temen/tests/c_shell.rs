@@ -1224,3 +1224,81 @@ fn gen_browser_shell_fixture() {
         eprintln!("wrote {} ({} bytes)", cout.display(), cbytes.len());
     }
 }
+
+/// #1080 slice 2 — the **`/bin` coreutils for browser bash**: compile each #801 coreutil
+/// (`demos/posix_utils/`, the chibicc world) to a 64 KiB-page `.temen` command module and encode it to
+/// `browser/tests/fixtures/bin_<name>.temen`. `browser/tests/bash.rs` grants these to `bash_exec_with`
+/// so bash runs them as external commands (fork → execve → the bytecode engine's #1080 image-replace).
+/// These are **repo-owned** C (unlike GPLv3 bash), so — like `primes`/`upper` above — they ARE
+/// committed. `--child-entry` (the command ABI `exec_module` admits) + `--data-page 65536` (the
+/// playground's wasm page) match how the shell fixture is built. Regenerate with:
+///   cargo test -p temen --test c_shell -- --ignored --exact gen_browser_bash_coreutils
+#[test]
+#[ignore = "writes browser/tests/fixtures/bin_*.temen; run explicitly to regenerate"]
+fn gen_browser_bash_coreutils() {
+    let util = include_str!("../../temen-run/demos/posix_utils/util.c");
+    let regex = include_str!("../../temen-run/demos/posix_libc/regex.c");
+    let dir = repo_root().join("browser/tests/fixtures");
+    std::fs::create_dir_all(&dir).expect("create fixtures dir");
+    // The #801 coreutil set staged for bash's /bin (matches `demos/bash/stage_bin.sh`). `grep` also
+    // links the #800 `regex.c`; every tool prepends `util.c` (the shared command runtime).
+    let utils: &[(&str, &str)] = &[
+        (
+            "true",
+            include_str!("../../temen-run/demos/posix_utils/true.c"),
+        ),
+        (
+            "false",
+            include_str!("../../temen-run/demos/posix_utils/false.c"),
+        ),
+        (
+            "echo",
+            include_str!("../../temen-run/demos/posix_utils/echo.c"),
+        ),
+        (
+            "cat",
+            include_str!("../../temen-run/demos/posix_utils/cat.c"),
+        ),
+        (
+            "seq",
+            include_str!("../../temen-run/demos/posix_utils/seq.c"),
+        ),
+        (
+            "head",
+            include_str!("../../temen-run/demos/posix_utils/head.c"),
+        ),
+        ("wc", include_str!("../../temen-run/demos/posix_utils/wc.c")),
+        (
+            "sort",
+            include_str!("../../temen-run/demos/posix_utils/sort.c"),
+        ),
+        (
+            "uniq",
+            include_str!("../../temen-run/demos/posix_utils/uniq.c"),
+        ),
+        ("ls", include_str!("../../temen-run/demos/posix_utils/ls.c")),
+        (
+            "pwd",
+            include_str!("../../temen-run/demos/posix_utils/pwd.c"),
+        ),
+        (
+            "grep",
+            include_str!("../../temen-run/demos/posix_utils/grep.c"),
+        ),
+        ("tr", include_str!("../../temen-run/demos/posix_utils/tr.c")),
+    ];
+    for (name, src) in utils {
+        let full = if *name == "grep" {
+            format!("{util}\n{regex}\n{src}")
+        } else {
+            format!("{util}\n{src}")
+        };
+        let cir = c_to_ir_child_with(&full, &["--data-page", "65536"]);
+        let craw = parse_module_raw(&cir).unwrap_or_else(|e| panic!("parse {name} IR: {e:?}"));
+        verify_module(&craw).unwrap_or_else(|e| panic!("verify {name}: {e:?}"));
+        let cbytes = temen_encode::encode_module(&craw);
+        let cout = dir.join(format!("bin_{name}.temen"));
+        std::fs::write(&cout, &cbytes).unwrap_or_else(|e| panic!("write bin_{name}.temen: {e:?}"));
+        eprintln!("wrote {} ({} bytes)", cout.display(), cbytes.len());
+    }
+}

@@ -12,7 +12,36 @@
 //!      && ./target/release/examples/bash_asset /tmp/temen_bash_cache/bash_linked.ll \
 //!         /tmp/temen_bash_cache/bash.temen)
 
-use temen_browser::{bash_exec, STATUS_EXIT};
+use temen_browser::{bash_exec, bash_exec_with, STATUS_EXIT};
+
+/// The committed `/bin` coreutils (repo-owned C — unlike GPLv3 bash, these ARE vendored). Decode each
+/// and return `(path, module, window_log2)` for `bash_exec_with` to register as filesystem
+/// executables, so bash resolves an external command (`seq` → `/bin/seq`) and fork → execve's it.
+/// Regenerate the fixtures with the `gen_browser_bash_coreutils` ignored test (see c_shell.rs).
+fn load_coreutils() -> Vec<(&'static str, temen_ir::Module, u8)> {
+    let raw: &[(&str, &[u8])] = &[
+        ("/bin/true", include_bytes!("fixtures/bin_true.temen")),
+        ("/bin/false", include_bytes!("fixtures/bin_false.temen")),
+        ("/bin/echo", include_bytes!("fixtures/bin_echo.temen")),
+        ("/bin/cat", include_bytes!("fixtures/bin_cat.temen")),
+        ("/bin/seq", include_bytes!("fixtures/bin_seq.temen")),
+        ("/bin/head", include_bytes!("fixtures/bin_head.temen")),
+        ("/bin/wc", include_bytes!("fixtures/bin_wc.temen")),
+        ("/bin/sort", include_bytes!("fixtures/bin_sort.temen")),
+        ("/bin/uniq", include_bytes!("fixtures/bin_uniq.temen")),
+        ("/bin/ls", include_bytes!("fixtures/bin_ls.temen")),
+        ("/bin/pwd", include_bytes!("fixtures/bin_pwd.temen")),
+        ("/bin/grep", include_bytes!("fixtures/bin_grep.temen")),
+        ("/bin/tr", include_bytes!("fixtures/bin_tr.temen")),
+    ];
+    raw.iter()
+        .map(|(path, bytes)| {
+            let m = temen_encode::decode_module(bytes).expect("decode coreutil");
+            let wl = m.memory.map_or(0, |mc| mc.size_log2);
+            (*path, m, wl)
+        })
+        .collect()
+}
 
 /// Load the deploy-built bash module, or `None` (with a loud note) when it is absent — the CI/offline
 /// skip, since the GPLv3 asset is never in the tree.
@@ -84,4 +113,79 @@ fn bash_dash_c_exit_code() {
         "the real exit code, not the fork-twin crash status"
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "before\n");
+}
+
+/// #1080 slice 2 — an **external command as the last of `-c`**: bash's process-saving optimization
+/// `execve`s the final simple command directly on its own (root) task instead of fork+exec+wait. So
+/// `bash -c 'seq 3'` image-replaces the root bash with `/bin/seq` (carrying bash's personality — its
+/// fd 1 — via the shared `exec_carry`), and `seq` returns its exit code (0). The coreutil's stdout is
+/// the run's output.
+#[test]
+fn bash_dash_c_external_seq_last() {
+    let Some(bash) = load_bash() else {
+        eprintln!("note: skipping bash_dash_c_external_seq_last — no bash.temen");
+        return;
+    };
+    let bins = load_coreutils();
+    let bin_refs: Vec<(&str, &temen_ir::Module, u8)> =
+        bins.iter().map(|(p, m, wl)| (*p, m, *wl)).collect();
+    let out = bash_exec_with(&bash, &[b"bash", b"-c", b"seq 3"], b"", &bin_refs);
+    // The last command is exec'd on the root, so `seq` *returns* its status (STATUS_OK, value 0) —
+    // it did not go through bash's own `exit_shell` (which would be STATUS_EXIT).
+    assert_eq!(
+        out.status,
+        temen_browser::STATUS_OK,
+        "seq exec'd on the root returns its status (status={} stdout={:?} stderr={:?})",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(out.value, 0, "seq's exit status");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n2\n3\n");
+}
+
+/// #1080 slice 2 — a **fork-twin exec**: a non-final external command forces bash to fork → execve
+/// (rather than exec-the-last-command). `bash -c 'seq 2; echo done'` should fork a twin for `seq 2`,
+/// the twin image-replaces with `/bin/seq` (the `env: Some` exec arm + personality carry, both landed
+/// here), bash reaps it, then runs the builtin `echo done` and exits.
+///
+/// `#[ignore]`d: this surfaced that **bash's own `fork()` on the pure bytecode cooperative engine**
+/// returns an error ("bash: fork: Unknown error") — bash reaches fork through the personality's
+/// host-proc fork dispatch, a path never exercised on the bytecode engine before (bash previously ran
+/// only on the tree-walker, whose exec decline folded it there; the bespoke `temen-posix` shell spawns
+/// externals via op-13 `instantiate_module`, not `fork()`). That bytecode fork-dispatch gap is a
+/// distinct follow-up rung from exec_module; the `env: Some` exec arm itself is ready for it. Single
+/// external commands (exec-the-last-command → a *root* exec) already work — see the test above.
+#[test]
+#[ignore = "bash's personality fork() on the bytecode cooperative engine is a separate follow-up (see doc); exec_module itself is done"]
+fn bash_dash_c_external_seq_forked() {
+    let Some(bash) = load_bash() else {
+        eprintln!("note: skipping bash_dash_c_external_seq_forked — no bash.temen");
+        return;
+    };
+    let bins = load_coreutils();
+    let bin_refs: Vec<(&str, &temen_ir::Module, u8)> =
+        bins.iter().map(|(p, m, wl)| (*p, m, *wl)).collect();
+    let out = bash_exec_with(
+        &bash,
+        &[b"bash", b"-c", b"seq 2; echo done"],
+        b"",
+        &bin_refs,
+    );
+    assert_eq!(
+        out.status,
+        STATUS_EXIT,
+        "bash exits after reaping the forked seq (status={} stdout={:?} stderr={:?})",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1\n2\ndone\n",
+        "exit={} value={} stderr={:?}",
+        out.exit_code,
+        out.value,
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

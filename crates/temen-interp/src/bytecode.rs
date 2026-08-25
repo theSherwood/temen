@@ -7959,6 +7959,120 @@ pub fn compile_and_run_sliced(
     ))
 }
 
+/// FORK.md §8.6 (#1080) — build the `execve` image-replace for the bytecode engine's exec pump arm,
+/// given the exec'ing task's current `cur_host` (the old powerbox, drained here) and `cur_mem` (its
+/// window, reused in place). Resolves + compiles the command, admits it (entry sig, command window
+/// `<=` the caller's), builds the command powerbox (`spawn_named_child` + [`Host::exec_carry`] — the
+/// same personality carry the tree-walker uses), materializes the command image into `cur_mem`, and
+/// pushes the compiled command as a new domain unit. Returns `(child_host, child_table, new_vt)` for
+/// the caller to install where the task's `env` points; `Err(())` on any admissibility failure (the
+/// caller then writes a probeable `-EINVAL` and lets the task run on — POSIX: execve returns only on
+/// failure). The old image's pipe ends are released here (`drop_all_pipe_*`) so the shared counts do
+/// not leak; waking any pipe that thereby reached EOF is the tree-walker's job (the cooperative engine
+/// has no CorePipe park — pipe-through-exec is a later rung), and is a no-op for a command that
+/// inherited none.
+#[allow(clippy::type_complexity)]
+fn exec_image_build(
+    cur_host: &mut Host,
+    cur_mem: Option<&Mem>,
+    dom: &Domain,
+    mh: i32,
+    grants_ptr: u64,
+    grants_n: u64,
+    entry: u64,
+    size_log2: i64,
+) -> Result<(Host, SharedSlots, VTask), ()> {
+    // Resolve + compile the command module from the caller's powerbox.
+    let (cfuncs, cmem_log2, cdata, cmodule) = match cur_host.resolve_module(mh) {
+        Ok(g) => (
+            g.funcs.clone(),
+            g.memory_log2,
+            g.data.clone(),
+            std::sync::Arc::clone(&g.module),
+        ),
+        Err(_) => return Err(()),
+    };
+    let child_compiled = compile_module(&cfuncs, &cmodule.types).ok_or(())?;
+    // Entry sig + window fit: the command reuses the caller's window in place, so its declared memory
+    // must be `<=` the caller's backed-prefix window (a larger window is a safe §2-masked superset).
+    let want_as = child_compiled
+        .sigs
+        .get(entry as usize)
+        .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
+    let ok_entry = child_compiled
+        .sigs
+        .get(entry as usize)
+        .is_some_and(|(p, r)| child_entry_ok(p, r));
+    let win_bytes = cur_mem.map_or(0, |m| m.window.mapped());
+    let win_log2 = win_bytes
+        .is_power_of_two()
+        .then(|| win_bytes.trailing_zeros() as u8);
+    let size_ok = (0..64).contains(&size_log2);
+    let mod_ok = win_log2.zip(cmem_log2).is_some_and(|(wl, ml)| ml <= wl);
+    if !ok_entry || !size_ok || !mod_ok {
+        return Err(());
+    }
+    let child_size = 1u64 << win_log2.expect("mod_ok implies a power-of-two window");
+    // Read + authority-check the by-name grant list (16-byte `{name_off, name_len, handle, flags}`
+    // records, the op-13 layout) from the caller window.
+    let grants: Result<Vec<(String, i32)>, ()> = (|| {
+        let m = cur_mem.ok_or(())?;
+        let mut list: Vec<(String, i32)> = Vec::new();
+        for i in 0..grants_n {
+            let rec = m.read_window(grants_ptr + i * 16, 16).map_err(|_| ())?;
+            let name_off = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
+            let name_len = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
+            let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+            let name = String::from_utf8(m.read_window(name_off, name_len).map_err(|_| ())?)
+                .map_err(|_| ())?;
+            if !cur_host.can_regrant(handle) {
+                return Err(());
+            }
+            list.push((name, handle));
+        }
+        Ok(list)
+    })();
+    let grants = grants?;
+    // Build the command's fresh powerbox, then carry the process state (personality/fds/signals) into
+    // it via the shared `exec_carry` (unwinds + `Err` on a manifest-bind failure → the caller refuses).
+    let (mut child_host, cinst, cas) = cur_host.spawn_named_child(&grants, child_size).ok_or(())?;
+    cur_host.exec_carry(&mut child_host, &cmodule, &cmodule.imports, &cmodule.types)?;
+    let child_args = if want_as {
+        vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
+    } else {
+        vec![Value::I64(cinst as i64)]
+    };
+    // Materialize the command image into the caller's window in place: zero the fresh image extent (the
+    // C `.bss` guarantee), then write its data segments (bounded to the window by the verifier).
+    if let Some(m) = cur_mem {
+        let base = m.window.base();
+        m.commit_fresh_image((1u64 << cmem_log2.expect("mod_ok")).min(child_size));
+        for d in cdata.iter() {
+            if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
+                for (k, &b) in d.bytes.iter().enumerate() {
+                    m.set_byte(base + d.offset + k as u64, b);
+                }
+            }
+        }
+    }
+    // Release the old image's own pipe ends (the fork-inherited ones the exec did not carry). Empty for
+    // a command that inherited no CorePipe ends (the rung-1/2a case); non-empty ends need the pipe-EOF
+    // wake the cooperative engine does not yet drive — a later rung.
+    let _ = (
+        cur_host.drop_all_pipe_writers(),
+        cur_host.drop_all_pipe_readers(),
+    );
+    // Push the command as a new domain unit + build its natural table + activation.
+    let progs_len = child_compiled.progs.len();
+    let cm = dom.source.push(child_compiled);
+    let child_table = build_table_for(progs_len, 0, cm as u32);
+    let cunit = dom.source.get(cm).ok_or(())?;
+    let mut new_vt = VTask::new(&cunit, entry as usize, &child_args).map_err(|_| ())?;
+    new_vt.active.module = cm;
+    new_vt.active.home = cm;
+    Ok((child_host, child_table, new_vt))
+}
+
 fn run(
     dom: Domain,
     entry: FuncIdx,
@@ -10379,132 +10493,81 @@ impl CoopSched {
                             continue;
                         }};
                     }
-                    // Rung 1 (#1080) supports a **root-context** exec (`env: None`) — the shell/`bash -c`
-                    // program replacing itself. A fork-twin exec (`env: Some`) additionally needs the
-                    // personality carry (fds/signals/exit hooks) and lands in a later rung; refuse it
-                    // cleanly for now rather than image-replace without that carry.
-                    let clean_root = tasks[ti].env.is_none()
-                        && tasks[ti].vt.active.serve_ticket.is_none()
+                    // Admissible from a clean root computation only (no serve handler, root fiber, a
+                    // non-durable domain) — the tree-walker's `clean_root`. Both a **root-context** exec
+                    // (`env: None` — the shell / `bash -c` replacing itself) and a **fork-twin** exec
+                    // (`env: Some` — bash forking then exec'ing an external command) are serviced; they
+                    // differ only in where the rebuilt activation's window/host/table live.
+                    let clean = tasks[ti].vt.active.serve_ticket.is_none()
                         && tasks[ti].vt.active_id == ROOT_FIBER
                         && !host.is_durable();
-                    if !clean_root {
+                    if !clean {
                         refuse!();
                     }
-                    // Resolve + compile the command module from the caller's (root) powerbox. A forged
-                    // handle or a module using an op the engine can't lower refuses cleanly.
-                    let (cfuncs, cmem_log2, cdata, cmodule) = match host.resolve_module(mh) {
-                        Ok(g) => (
-                            g.funcs.clone(),
-                            g.memory_log2,
-                            g.data.clone(),
-                            std::sync::Arc::clone(&g.module),
-                        ),
-                        Err(_) => refuse!(),
-                    };
-                    let child_compiled = match compile_module(&cfuncs, &cmodule.types) {
-                        Some(c) => c,
-                        None => refuse!(),
-                    };
-                    // Entry sig + window fit: `want_as` = the child entry takes (Instantiator,
-                    // AddressSpace) vs just (Instantiator); the command reuses the caller's window, so
-                    // its declared memory must be `<=` the caller's backed-prefix window (a larger
-                    // window is a safe superset, still masked to the real carve by §2).
-                    let want_as = child_compiled
-                        .sigs
-                        .get(entry as usize)
-                        .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
-                    let ok_entry = child_compiled
-                        .sigs
-                        .get(entry as usize)
-                        .is_some_and(|(p, r)| child_entry_ok(p, r));
-                    let win_bytes = mem.as_ref().map_or(0, |m| m.window.mapped());
-                    let win_log2 = win_bytes
-                        .is_power_of_two()
-                        .then(|| win_bytes.trailing_zeros() as u8);
-                    let size_ok = (0..64).contains(&size_log2);
-                    let mod_ok = win_log2.zip(cmem_log2).is_some_and(|(wl, ml)| ml <= wl);
-                    if !ok_entry || !size_ok || !mod_ok {
-                        refuse!();
-                    }
-                    let child_size =
-                        1u64 << win_log2.expect("mod_ok implies a power-of-two window");
-                    // Read + authority-check the by-name grant list (16-byte `{name_off, name_len,
-                    // handle, flags}` records) from the caller window — the same layout op-13 reads.
-                    let grants: Result<Vec<(String, i32)>, ()> = (|| {
-                        let m = mem.as_ref().ok_or(())?;
-                        let mut list: Vec<(String, i32)> = Vec::new();
-                        for i in 0..grants_n {
-                            let rec = m.read_window(grants_ptr + i * 16, 16).map_err(|_| ())?;
-                            let name_off =
-                                u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
-                            let name_len =
-                                u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
-                            let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-                            let name_bytes = m.read_window(name_off, name_len).map_err(|_| ())?;
-                            let name = String::from_utf8(name_bytes).map_err(|_| ())?;
-                            if !host.can_regrant(handle) {
-                                return Err(());
+                    // The build (resolve + compile + admit + powerbox + personality carry + image
+                    // materialize) runs against the exec'ing task's own window + powerbox, then the
+                    // rebuilt activation is installed where its `env` points.
+                    match tasks[ti].env {
+                        None => {
+                            // Root: build against the driver window/host, then migrate the task into a
+                            // confined env holding the command powerbox + its module table (the shared
+                            // `dom.table` maps module 0, not the pushed command).
+                            let built = exec_image_build(
+                                host,
+                                mem.as_ref(),
+                                dom,
+                                mh,
+                                grants_ptr,
+                                grants_n,
+                                entry,
+                                size_log2,
+                            );
+                            match built {
+                                Err(()) => refuse!(),
+                                Ok((child_host, child_table, new_vt)) => {
+                                    tasks[ti].vt = new_vt;
+                                    let eidx = extra_envs.len();
+                                    extra_envs.push(ChildEnv {
+                                        mem: mem.take(),
+                                        host: std::sync::Arc::new(std::sync::Mutex::new(
+                                            child_host,
+                                        )),
+                                        table: child_table,
+                                        fuel: *fuel,
+                                    });
+                                    tasks[ti].env = Some(eidx);
+                                }
                             }
-                            list.push((name, handle));
                         }
-                        Ok(list)
-                    })();
-                    let grants = match grants {
-                        Ok(g) => g,
-                        Err(()) => refuse!(),
-                    };
-                    // Build the command's fresh powerbox from the by-name regrants + bind its manifest.
-                    let (mut child_host, cinst, cas) =
-                        match host.spawn_named_child(&grants, child_size) {
-                            Some(triple) => triple,
-                            None => refuse!(),
-                        };
-                    child_host.set_self_module(&cmodule);
-                    if child_host
-                        .bind_child_manifest(&cmodule.imports, &cmodule.types)
-                        .is_err()
-                    {
-                        refuse!();
-                    }
-                    let child_args = if want_as {
-                        vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
-                    } else {
-                        vec![Value::I64(cinst as i64)]
-                    };
-                    // Materialize the command's image into the caller's window in place: zero the fresh
-                    // image extent (the C `.bss` guarantee — stale caller bytes must not leak in), then
-                    // write its data segments (bounded to the window, as the verifier bounded them).
-                    if let Some(m) = mem.as_ref() {
-                        let base = m.window.base();
-                        m.commit_fresh_image((1u64 << cmem_log2.expect("mod_ok")).min(child_size));
-                        for d in cdata.iter() {
-                            if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
-                                for (k, &b) in d.bytes.iter().enumerate() {
-                                    m.set_byte(base + d.offset + k as u64, b);
+                        Some(k) => {
+                            // Fork twin: build against its confined env (its window is reused in place,
+                            // its powerbox carries the personality), then overwrite the env's host +
+                            // table — the window + fuel + task id are kept.
+                            let host_arc = std::sync::Arc::clone(&extra_envs[k].host);
+                            let built = {
+                                let mut g = host_arc.lock_unpoisoned();
+                                exec_image_build(
+                                    &mut g,
+                                    extra_envs[k].mem.as_ref(),
+                                    dom,
+                                    mh,
+                                    grants_ptr,
+                                    grants_n,
+                                    entry,
+                                    size_log2,
+                                )
+                            };
+                            match built {
+                                Err(()) => refuse!(),
+                                Ok((child_host, child_table, new_vt)) => {
+                                    tasks[ti].vt = new_vt;
+                                    extra_envs[k].host =
+                                        std::sync::Arc::new(std::sync::Mutex::new(child_host));
+                                    extra_envs[k].table = child_table;
                                 }
                             }
                         }
                     }
-                    // Commit the image-replace: push the command as a new domain unit, build its natural
-                    // table, and swap THIS task's activation to it — keeping the task id + the reused
-                    // window + fuel. The root migrates into a confined env holding the command powerbox
-                    // and the command-module table (the shared `dom.table` maps module 0, not the command).
-                    let progs_len = child_compiled.progs.len();
-                    let cm = dom.source.push(child_compiled);
-                    let child_table = build_table_for(progs_len, 0, cm as u32);
-                    let cunit = dom.source.get(cm).ok_or(Trap::Malformed)?;
-                    let mut new_vt = VTask::new(&cunit, entry as usize, &child_args)?;
-                    new_vt.active.module = cm;
-                    new_vt.active.home = cm;
-                    tasks[ti].vt = new_vt;
-                    let eidx = extra_envs.len();
-                    extra_envs.push(ChildEnv {
-                        mem: mem.take(),
-                        host: std::sync::Arc::new(std::sync::Mutex::new(child_host)),
-                        table: child_table,
-                        fuel: *fuel,
-                    });
-                    tasks[ti].env = Some(eidx);
                 }
                 Ok(VcpuStop::Spawn {
                     func,

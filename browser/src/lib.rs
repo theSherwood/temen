@@ -3024,9 +3024,12 @@ pub fn bash_exec_with(
         let ch = host.grant_module(cm);
         posix.register_executable(path, ch, *wl);
     }
-    // Seed `argv` at the module's powerbox args base (`{argc,envc}` LE prefix + packed NUL strings),
-    // where the synthesized `_start` reads it. No environment this slice.
-    let blob = temen_ir::write_args_blob(argv, &[]);
+    // Seed `argv` + a minimal `env` at the module's powerbox args base (`{argc,envc}` LE prefix +
+    // packed NUL strings), where the synthesized `_start` reads it. `PATH=/bin` lets bash resolve an
+    // external command (`seq` → `/bin/seq`, registered above) for fork → execve; `HOME=/` is the
+    // conventional minimum (the `bash_probe` env).
+    let env: &[&[u8]] = &[b"PATH=/bin", b"HOME=/"];
+    let blob = temen_ir::write_args_blob(argv, env);
     let base = temen_ir::module_args_base(m) as usize;
     let mut init_mem = vec![0u8; base + blob.len()];
     init_mem[base..].copy_from_slice(&blob);
