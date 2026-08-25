@@ -4575,9 +4575,8 @@ impl<'a> FuncGen<'a> {
                 Ok(Val { id, ty: *rt })
             }
             None => {
-                self.cur_buf.push_str(&format!(
-                    "  call.dyn ({plist}) -> () v{idx} ({arglist})\n"
-                ));
+                self.cur_buf
+                    .push_str(&format!("  call.dyn ({plist}) -> () v{idx} ({arglist})\n"));
                 Ok(Val {
                     id: u32::MAX,
                     ty: ValType::I32,
@@ -4620,9 +4619,8 @@ impl<'a> FuncGen<'a> {
             .chain(sig.params.iter().map(|t| prefix(*t).to_string()))
             .collect::<Vec<_>>()
             .join(", ");
-        self.cur_buf.push_str(&format!(
-            "  call.dyn ({plist}) -> () v{idx} ({arglist})\n"
-        ));
+        self.cur_buf
+            .push_str(&format!("  call.dyn ({plist}) -> () v{idx} ({arglist})\n"));
         Ok(())
     }
 

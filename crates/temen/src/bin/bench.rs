@@ -50,7 +50,7 @@ fn main() {
     let kernels = [
         ("alu", ALU, 1_000, 201_000),
         ("call", CALL, 1_000, 201_000),
-        ("call.dyn", CALL_INDIRECT, 1_000, 201_000),
+        ("call_indirect", CALL_INDIRECT, 1_000, 201_000),
         ("mem", MEM, 1_000, 201_000),
     ];
     for (name, src, small, large) in kernels {

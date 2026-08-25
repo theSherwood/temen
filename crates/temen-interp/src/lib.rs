@@ -17249,6 +17249,10 @@ pub trait SignalSource: Send + Sync {
     fn set_park_request(&self, _req: Arc<dyn Fn(ParkEvent) + Send + Sync>) {}
 }
 
+/// One interned interface's identity key: its `(op names, op signatures)` pair (#1109 — names
+/// are half the key, so `self.schema` names are canonical). The `Host::iface_intern` element.
+type IfaceKey = (Arc<[String]>, Arc<[FuncType]>);
+
 /// The host: the **host-owned handle table** (the powerbox) plus deterministic mock
 /// capability state (captured stdio, a monotonic clock). Construct with [`Host::new`],
 /// `grant_*` the initial capabilities, then pass to [`run_with_host`]; afterwards read
@@ -17370,7 +17374,7 @@ pub struct Host {
     /// same way binding-time coverage matching is (name-keyed), and `self.schema` reads the
     /// canonical names back off the id. Flat and scanned linearly — offers are few; boring beats
     /// a map.
-    iface_intern: Vec<(Arc<[String]>, Arc<[FuncType]>)>,
+    iface_intern: Vec<IfaceKey>,
     /// §3.5 grouped-import **op remaps**, parallel to `import_bindings`: slot `i`'s entry, when
     /// present, maps consumer-local op indices to provider op indices (frozen at the binding
     /// act by the coverage walk). `None` = flat binding (consumer op must be 0).

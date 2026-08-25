@@ -526,7 +526,7 @@ block 3 (v18: f64) {
 
 /// `(i64 n) -> i64`: a **`call.dyn` dispatch** loop — each iteration calls a leaf `x -> x+1`
 /// through the function table (slot 1 = the leaf), accumulating, so the timing isolates the §3c
-/// table-dispatch cost (mask + type-id check) vs a Wasmtime `call.dyn`. Result = Σ (i+1).
+/// table-dispatch cost (mask + type-id check) vs a Wasmtime `call_indirect`. Result = Σ (i+1).
 const CALLI: Kernel = Kernel {
     name: "calli",
     ir: "\
@@ -573,7 +573,7 @@ block 0 (v0: i64) {
         (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
         (local.set $acc
           (i64.add (local.get $acc)
-            (call.dyn (type $sig) (local.get $i) (i32.const 1))))
+            (call_indirect (type $sig) (local.get $i) (i32.const 1))))
         (local.set $i (i64.add (local.get $i) (i64.const 1)))
         (br $loop)))
     (local.get $acc)))
@@ -594,7 +594,7 @@ block 0 (v0: i64) {
         (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
         (local.set $acc
           (i64.add (local.get $acc)
-            (call.dyn (type $sig) (local.get $i) (i32.const 1))))
+            (call_indirect (type $sig) (local.get $i) (i32.const 1))))
         (local.set $i (i64.add (local.get $i) (i64.const 1)))
         (br $loop)))
     (local.get $acc)))

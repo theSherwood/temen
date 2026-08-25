@@ -173,10 +173,7 @@ fn binary_round_trip() {
     );
     let bytes = temen_encode::encode_module(&m);
     let back = temen_encode::decode_module(&bytes).expect("decode");
-    assert_eq!(
-        back, m,
-        "self.* must round-trip through the binary form"
-    );
+    assert_eq!(back, m, "self.* must round-trip through the binary form");
 }
 
 /// `Host::cap_label` (F9) is the host-side reverse of the name directory: a registered handle resolves

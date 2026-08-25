@@ -21,7 +21,7 @@ fn main() {
     let kernels: [(&str, &str, i32, i32); 10] = [
         ("alu", ALU, 1_000, 201_000),
         ("call", CALL, 1_000, 201_000),
-        ("call.dyn", CALL_INDIRECT, 1_000, 201_000),
+        ("call_indirect", CALL_INDIRECT, 1_000, 201_000),
         ("mem", MEM, 1_000, 201_000),
         ("chase", &chase, 1_000, 201_000),
         ("chase_rand", &chase_rand, 1_000, 201_000),

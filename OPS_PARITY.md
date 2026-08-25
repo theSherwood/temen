@@ -468,7 +468,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 |----|:----:|:----:|:----:|:----:|-------|
 | `ref.func` | ✅ | ✅ | ✅ | ✅ |  |
 | `call` | ✅ | ✅ | ✅ | ✅ |  |
-| `call_indirect` | ✅ | ✅ | ✅ | ✅ |  |
+| `call.dyn` | ✅ | ✅ | ✅ | ✅ |  |
 
 ## capabilities & reflection
 
@@ -525,5 +525,5 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 | `br_if` | ✅ | ✅ | ✅ | ✅ |  |
 | `br_table` | ✅ | ✅ | ✅ | ✅ |  |
 | `return_call` | ✅ | ✅ | ✅ | ✅ |  |
-| `return_call_indirect` | ✅ | ✅ | ✅ | ✅ |  |
+| `return_call.dyn` | ✅ | ✅ | ✅ | ✅ |  |
 

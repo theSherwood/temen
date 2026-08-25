@@ -22,7 +22,7 @@ const KERNELS: &[(&str, &str)] = &[
     ("alu", "alu"), // demonstrator: clang collapses the LCG (M^4); temen-jit doesn't (~8x)
     ("xorshift", "xorshift"), // representative scalar throughput (temen-jit ~= native)
     ("call", "call"),
-    ("call.dyn", "call.dyn"),
+    ("call_indirect", "call_indirect"),
     ("mem", "mem"),
     ("chase", "chase"),
     ("chase_rand", "chase_rand"),

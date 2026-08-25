@@ -1549,10 +1549,7 @@ fn c_function_pointer_signature_mismatch_traps() {
     let src = "int two(int a, int b){ return a + b; } \
                int main(){ int (*w)(void) = (int(*)(void))two; return w(); }";
     let ir = c_to_ir(src);
-    assert!(
-        ir.contains("call.dyn"),
-        "expected an indirect call:\n{ir}"
-    );
+    assert!(ir.contains("call.dyn"), "expected an indirect call:\n{ir}");
     let m = parse_module(&ir).expect("parse");
     verify_module(&m).expect("verify");
 

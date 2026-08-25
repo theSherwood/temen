@@ -128,10 +128,7 @@ fn virtual_dispatch_through_a_vtable() {
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     let text = temen_leng::translate_to_text(leng).unwrap();
-    assert!(
-        text.contains("call.dyn"),
-        "dispatch is indirect:\n{text}"
-    );
+    assert!(text.contains("call.dyn"), "dispatch is indirect:\n{text}");
 
     // getX = func 0, dispatch = func 1. Lay out a vtable and object in the window:
     //   Vtbl @ 256: mt[0] @256 = 0 (getX's function index).

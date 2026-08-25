@@ -28,7 +28,7 @@ const KERNELS: &[(&str, &str)] = &[
     ("alu", "alu"),
     ("xorshift", "xorshift"),
     ("call", "call"),
-    ("call.dyn", "call.dyn"),
+    ("call_indirect", "call_indirect"),
     ("mem", "mem"),
     ("fnv", "fnv"),
     ("fma", "fma_k"),

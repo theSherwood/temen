@@ -102,10 +102,7 @@ fn lowering_verifies_and_matches_on_valid_indices() {
             .any(|i| matches!(i, Inst::CallIndirect { .. }))
             || matches!(b.term, Terminator::ReturnCallIndirect { .. })
     });
-    assert!(
-        !any_indirect,
-        "no call.dyn should remain after lowering"
-    );
+    assert!(!any_indirect, "no call.dyn should remain after lowering");
 
     // Behaviorally identical for every valid (signature-matching) index 1,2,3.
     for sel in 1..=3i32 {
