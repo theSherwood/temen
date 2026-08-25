@@ -19,7 +19,7 @@
 #
 #   Usage:  bash scripts/rebuild-assets.sh              # rebuild everything the toolchain allows
 #           ONLY=leng,nim_hello bash scripts/...        # rebuild a subset (comma-separated step names)
-#   Steps:  leng chibicc onramp shell nifler nim_hello  (lua_snapshot is a separate warm-snapshot chore)
+#   Steps:  leng chibicc onramp shell nifler nim_hello nim_phases lua_snapshot
 #
 # Toolchains, per step: leng needs rustc +1.81 (+rust-src) & llvm-18; chibicc/onramp need clang-18 &
 # llvm-link-18 (onramp also fetches QuickJS/SQLite/Lua sources — skipped offline); shell needs the
@@ -57,6 +57,14 @@ if [ -x "$REPO/nimony/bin/nifler" ]; then
   export PATH="$REPO/nimony/bin:$PATH"
   export NIFLER_BIN="$REPO/nimony/bin/nifler"
   export NIMONY_BIN="$REPO/nimony/bin"
+  [ -x "$REPO/nimony/bin/hexer" ] && export HEXER_BIN="$REPO/nimony/bin/hexer"
+fi
+# The nim C backend #include's `nimbase.h` from the Nim lib. build_e2e_chain.sh falls back to
+# `.nimtool/nim-src/lib` when `nim dump` doesn't print the lib path (some toolchains don't) — point
+# that at the picked Nim's lib so the fallback resolves (what provision-nimony.sh's nim-src clone gives).
+if [ -n "${NIM_BIN:-}" ] && [ -f "$NIM_BIN/../lib/nimbase.h" ] && [ ! -f "$REPO/.nimtool/nim-src/lib/nimbase.h" ]; then
+  mkdir -p "$REPO/.nimtool/nim-src"
+  ln -sfn "$NIM_BIN/../lib" "$REPO/.nimtool/nim-src/lib"
 fi
 
 # --- shared build products --------------------------------------------------------------------------
@@ -113,13 +121,13 @@ if want shell; then
     || note "shell ✗ (in-tree chibicc?)"
 fi
 
-# --- 5) nifler.temen.gz (nimony pipeline; gzips into web/assets) -------------------------------------
+# --- 5) nifler.temen.gz (nimony pipeline; TEMEN_NIFLER_EMIT_ASSET gzips it + the expected fixtures) --
 if want nifler; then
-  echo "=== [nifler] crates/temen-run/demos/nifler_temen/build_nifler_temen.sh ==="
-  if bash crates/temen-run/demos/nifler_temen/build_nifler_temen.sh; then
+  echo "=== [nifler] crates/temen-run/demos/nifler_temen/build_nifler_temen.sh (EMIT_ASSET=1) ==="
+  if TEMEN_NIFLER_EMIT_ASSET=1 bash crates/temen-run/demos/nifler_temen/build_nifler_temen.sh; then
     if gunzip -c browser/web/assets/nifler.temen.gz > /tmp/rebuild_nifler.temen 2>/dev/null \
        && validate /tmp/rebuild_nifler.temen; then
-      note "nifler ✓ (nifler.temen.gz)"
+      note "nifler ✓ (nifler.temen.gz + expected/*.p.nif)"
     else
       note "nifler SKIP (toolchain absent — script SKIPs without rebuilding)"
     fi
@@ -137,6 +145,29 @@ if want nim_hello; then
       && note "nim_hello ✓" || note "nim_hello ✗ (rebuilt but failed re-validate)"
   else
     note "nim_hello SKIP/✗ (NIMONY_BIN/NIM_BIN + nimony/bin/nimony?)"
+  fi
+fi
+
+# --- 6b) nimsem.temen.gz + hexer.temen.gz (the nimc "compile a whole Nim program" card's phase guests;
+# nifler is step 5). build_e2e_chain.sh builds all three phase guests with identical browser flags
+# (--binary --host-page 65536 --stub-externs); we gzip nimsem + hexer into web/assets (nim_stdlib.img.gz
+# is an fs image, not a wire-coupled module, so it never goes stale). --------------------------------
+if want nim_phases; then
+  echo "=== [nim_phases] crates/temen-run/demos/nim_e2e_chain/build_e2e_chain.sh → gzip nimsem+hexer ==="
+  E2E_OUT="${TEMEN_E2E_CACHE:-/tmp/temen_e2e_chain}/temen"
+  if bash crates/temen-run/demos/nim_e2e_chain/build_e2e_chain.sh; then
+    ok=1
+    for p in nimsem hexer; do
+      if [ -f "$E2E_OUT/$p.temen" ] && validate "$E2E_OUT/$p.temen"; then
+        gzip -9 -c "$E2E_OUT/$p.temen" > "browser/web/assets/$p.temen.gz"
+      else
+        ok=0
+      fi
+    done
+    [ "$ok" = 1 ] && note "nim_phases ✓ (nimsem.temen.gz + hexer.temen.gz)" \
+                  || note "nim_phases ✗ (a phase guest missing/failed re-validate)"
+  else
+    note "nim_phases SKIP/✗ (nimony toolchain — nim + nimony/bin/{nimony,hexer} + clang-18/llvm-nm-18?)"
   fi
 fi
 
