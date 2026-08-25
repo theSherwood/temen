@@ -206,6 +206,42 @@ Also en route: root exit now sweeps parked pipe readers/writers and `waitpid` be
   (expansion, quoted-delimiter, `<<-`, here-strings, builtin `read`/loops, exec'd commands);
   six differential scripts now pin them.
 
+## Language differential (DONE) — 50 pure-in-shell constructs vs native, two fixes
+
+A 50-construct sweep (`bash -c` vs the native 5.2.21 oracle: arrays + associative arrays, `case`
+incl. `;;&`, the full parameter-expansion family, brace expansion, arithmetic + C-style `for`,
+`[[ ]]`, `printf`, `read -a`/IFS, `local`/`declare -i`/`-r`/`-n`, `mapfile`, `extglob`, indirect
+expansion) came back **48/50 byte-identical out of the box** — the tree already had the surface.
+Two needed a fix:
+
+- **`BASH_REMATCH`** — `[[ =~ ]]` matched correctly but filled no capture array. The guest
+  `posix_libc/regex.c` defined its OWN `regex_t`/`regmatch_t`, but bash's TUs allocate them from
+  the build host's glibc `<regex.h>` and read `re_nsub` + the `pmatch` offsets across the call.
+  The layouts must match the glibc ABI byte-for-byte (`re_nsub@48` in a 64-byte `regex_t`;
+  `regoff_t` is `int`, so `regmatch_t` is `{int,int}`). The old layout still *matched* (the
+  guest's internal fields are self-consistent) but bash read the offsets from the wrong places →
+  empty `BASH_REMATCH`. Now overlaid on glibc's struct.
+- **Process substitution `<(…)`/`>(…)`** — bash builds with `HAVE_DEV_FD`, so it substitutes
+  `/dev/fd/N` for the pipe end and the peer `open`s it. The personality's `open` now resolves
+  `/dev/fd/N` and `/dev/std{in,out,err}` as a **dup** of that fd (sharing the description — an
+  `Arc` clone of the CorePipe token, so the refcount/last-close EOF stay correct).
+
+Six scripts pin these in the capstone (BASH_REMATCH captures, both process-substitution
+directions, `/dev/stdin`).
+
+## Pipeline `$?` (DONE — #1057)
+
+The last stage of a pipeline that terminates via `exit()` (every forked bash pipeline stage /
+group command reaching `exit_shell`) used to report `$? = 128` — the fork-twin **crash** status —
+instead of its real exit code. Root cause: `reap_status` in temen-interp mapped **every**
+`Err(Trap)` to `REAP_CRASH_STATUS`, but `Trap::Exit(code)` is a *clean* guest `exit(code)` ("not
+an error — the domain asked to terminate"), exactly what the root path already turns into
+`Outcome::Exited(code)`. A fork twin that exits via `exit()` rather than returning must reap with
+that code. One-arm fix (`Err(Trap::Exit(code)) => code & 0xff`); only genuine traps
+(unreachable, memory/cap faults) still reap 128. Surfaced by the language differential, masked in
+every earlier pipe script by a trailing command. Pinned by three pipeline scripts in the
+capstone (`true | { false; }` → `rc=1`, etc.).
+
 ## What remains (the slice ladder from the #802 sketch)
 
 - The `^D`-EOF nuance (the one-shot EOF is writer-count state, so the shell's next read can

@@ -5751,6 +5751,13 @@ fn reap_status(result: &Result<Vec<Value>, Trap>) -> i64 {
             Some(Value::I32(x)) => *x as i64,
             _ => 0,
         },
+        // #1057 — `Trap::Exit(code)` is a **clean** guest `exit(code)`, not a crash ("not an
+        // error — the domain asked to terminate"); the root path already maps it to
+        // `Outcome::Exited(code)`. A fork twin that terminates via `exit()` rather than
+        // returning — every forked bash pipeline stage / subshell that reaches `exit_shell()` —
+        // must reap with that code, else its `$?` (and any `wait`) comes back as the crash
+        // status. Only genuine traps (unreachable, memory faults, cap faults, …) reap as 128.
+        Err(Trap::Exit(code)) => *code as i64 & 0xff,
         Err(_) => REAP_CRASH_STATUS,
     }
 }
@@ -18190,6 +18197,16 @@ impl Host {
             "write" => Some((cap_id::STREAM, 1u32)),
             "read" => Some((cap_id::STREAM, 0u32)),
             "exit" => Some((cap_id::EXIT, 0u32)),
+            // §3e/§4 memory management (`vm_map`/`vm_unmap`/`vm_protect`/`vm_page_size` = ops 0/1/2/3 on
+            // the `AddressSpace` cap — the same map the reference resolver uses, `temen-run` §7). An
+            // allocating §14 child (a real compiler phase's `malloc`) binds these to the child's own
+            // auto-granted `AddressSpace` (`first_of` below), whose range is exactly `[0, child_size)` —
+            // so a child grows its heap only inside its carve (confinement, §2, unchanged), rather than
+            // `CapFault`ing on its first `malloc`.
+            "vm_map" => Some((cap_id::ADDRESS_SPACE, 0u32)),
+            "vm_unmap" => Some((cap_id::ADDRESS_SPACE, 1u32)),
+            "vm_protect" => Some((cap_id::ADDRESS_SPACE, 2u32)),
+            "vm_page_size" => Some((cap_id::ADDRESS_SPACE, 3u32)),
             _ => None,
         };
         let first_of = |h: &Host, tid: u32| -> Option<i32> {

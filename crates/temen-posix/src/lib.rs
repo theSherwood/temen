@@ -328,6 +328,21 @@ const SIGKILL: i32 = 9;
 const SA_RESTART: i64 = 0x10000000;
 /// #796 default actions — the signals whose `SIG_DFL` action is **ignore** (Linux: CHLD/URG/WINCH).
 /// Everything else outside the job-control set above defaults to **terminate**.
+/// #802 — map the `/dev/fd/N` and `/dev/std{in,out,err}` pseudo-paths to the fd they alias, or
+/// `None` for an ordinary path. `open` treats a hit as a `dup` of that fd (bash's `HAVE_DEV_FD`
+/// process-substitution path). Only these exact forms — a `/dev/fd/` with trailing junk is not a
+/// valid fd and falls through to the memfs (→ `ENOENT`), matching Linux.
+fn dev_fd_target(path: &str) -> Option<i64> {
+    match path {
+        "/dev/stdin" => Some(0),
+        "/dev/stdout" => Some(1),
+        "/dev/stderr" => Some(2),
+        _ => path
+            .strip_prefix("/dev/fd/")
+            .and_then(|n| n.parse::<i64>().ok()),
+    }
+}
+
 fn default_ignored(sig: i32) -> bool {
     matches!(
         sig,
@@ -2676,6 +2691,18 @@ impl Ctx<'_> {
         let Ok(path) = String::from_utf8(bytes) else {
             return Ok(vec![EINVAL]);
         };
+        // #802 language differential — `/dev/fd/N` and `/dev/std{in,out,err}` (bash builds with
+        // `HAVE_DEV_FD`): process substitution `<(cmd)`/`>(cmd)` substitutes `/dev/fd/N` for the
+        // pipe end it set up, and the consumer `open`s it. This is a path-driven `dup`: alias the
+        // existing fd (sharing its description — an `Arc` clone of a CorePipe/pipe token, so the
+        // refcount and last-close EOF stay correct). An unopened target is `-EBADF`, as on Linux.
+        if let Some(target) = dev_fd_target(&path) {
+            let dup = match self.fd(target) {
+                Some(entry) => entry.dup_clone(),
+                None => return Ok(vec![EBADF]),
+            };
+            return Ok(vec![self.alloc_fd(dup)]);
+        }
         let exists = self.w.files.contains_key(&path);
         if !exists && flags & O_CREAT == 0 {
             return Ok(vec![ENOENT]);

@@ -3,7 +3,7 @@
 # Sets name + color + description together; idempotent (`--force` updates if it
 # exists). Run once with owner creds:  bash scripts/setup-labels.sh
 set -euo pipefail
-REPO="theSherwood/vm"
+REPO="theSherwood/temen"
 
 label() { gh label create "$1" --color "$2" --description "$3" --repo "$REPO" --force; }
 
