@@ -23265,7 +23265,21 @@ impl Mem {
                 return Ok(Reg::from_value(decode_loaded(rty, width, signed, raw)));
             }
         }
-        Ok(Reg::from_value(self.load(addr, offset, op)?))
+        // Cold path — prot has been mutated (every rodata card sets `prot_dirty` once at init) or the
+        // access reaches the reserved tail. Run the *exact* confine + protection check the oracle
+        // [`Mem::load`] does (identical trap / `last_fault` / demand-fault semantics), but when `back`
+        // is contiguous (no §13 region redirect) still finish with **one** wide non-atomic read rather
+        // than `load`'s per-byte atomic `read_le` — the same cooperative sole-accessor contract as the
+        // fast path above. The profile showed this byte-at-a-time read dominating rodata guests, whose
+        // hot Lua-stack accesses are all to plain `Rw` pages yet took the per-byte path.
+        let base = self.confine_checked(addr, offset, width)?;
+        self.check_prot(base, width, false)?;
+        let raw = if self.has_regions.load(Ordering::Relaxed) {
+            self.read_le(base, width)
+        } else {
+            self.back.read_word(base, width)
+        };
+        Ok(Reg::from_value(decode_loaded(rty, width, signed, raw)))
     }
 
     /// Bytecode-engine scalar store (Phase 2): the fast path of [`Mem::store`], taking the value as
@@ -23281,7 +23295,17 @@ impl Mem {
                 return Ok(());
             }
         }
-        self.store(addr, offset, op, Value::I64(lo as i64))
+        // Cold path, same reasoning as [`Mem::load_scalar`]: the exact confine + protection check the
+        // oracle [`Mem::store`] does, then one wide non-atomic write when `back` is contiguous.
+        let base = self.confine_checked(addr, offset, width)?;
+        self.check_prot(base, width, true)?;
+        if self.has_regions.load(Ordering::Relaxed) {
+            self.write_le(base, width, lo);
+        } else {
+            self.back.write_word(base, width, lo);
+        }
+        self.writes += 1;
+        Ok(())
     }
 
     /// §17 `v128.load`: the **16-byte** bounds-checked access — the sole escape-TCB delta SIMD adds
