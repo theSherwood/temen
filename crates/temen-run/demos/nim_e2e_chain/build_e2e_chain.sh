@@ -50,7 +50,7 @@ build_temen() { # <tool-src> <out.temen> [extra nim defines...]
   for f in "$c"/*.c; do "$CLANG" -O2 -fno-vectorize -fno-slp-vectorize -emit-llvm -c -I"$NIMLIB" "$f" -o "$f.bc"; done
   "$CLANG" -O2 -fno-vectorize -fno-slp-vectorize -DTEMEN_GUEST -emit-llvm -c -I"$NIMLIB" "$SHIM" -o "$c/shim.bc"
   "$LINK" "$c"/*.c.bc "$c/shim.bc" -o "$c/linked.bc"
-  "$TR" "$c/linked.bc" -o "$c/raw.temen" --binary --host-page 65536 --stub-externs
+  "$TR" "$c/linked.bc" -o "$c/raw.temen" --binary --host-page 65536 --stub-externs --null-guard
   cargo run -q --release -p temen-run --example prep_temen -- "$c/raw.temen" "$out" > "$c/prep.log" 2>&1; grep -q funcs "$c/prep.log"
   rm -rf "$c"  # free disk immediately (each nim c cache is ~50-80 MB)
   echo "  $(basename "$out"): $(stat -c%s "$out") B"
