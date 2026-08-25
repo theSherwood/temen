@@ -73,7 +73,7 @@ pub fn print_module(m: &Module) -> String {
                 let _ = writeln!(s, "data.ptr {} self {off}", p.at);
             }
             temen_ir::DataPtrTarget::Sym { name, addend } => {
-                let _ = writeln!(s, "data.ptr {} sym \"{name}\" {addend}", p.at);
+                let _ = writeln!(s, "data.ptr {} sym {} {addend}", p.at, quote_str(name));
             }
         }
     }
@@ -121,21 +121,21 @@ pub fn print_module(m: &Module) -> String {
                 temen_ir::ImportShape::Func(t) => ("func", t),
                 temen_ir::ImportShape::Interface(t) => ("interface", t),
             };
-            let _ = writeln!(s, "import {i} {kind} \"{}\" {t}{mode}", imp.name);
+            let _ = writeln!(s, "import {i} {kind} {} {t}{mode}", quote_str(&imp.name));
         }
         s.push('\n');
     }
     // Function exports (§3.5 surface): `export <idx> func "<name>" <funcidx>`.
     if !m.exports.is_empty() {
         for (i, e) in m.exports.iter().enumerate() {
-            let _ = writeln!(s, "export {i} func \"{}\" {}", e.name, e.func);
+            let _ = writeln!(s, "export {i} func {} {}", quote_str(&e.name), e.func);
         }
         s.push('\n');
     }
     // Data exports (their own dense index sequence): `export <idx> data "<name>" <offset>`.
     if !m.data_exports.is_empty() {
         for (i, e) in m.data_exports.iter().enumerate() {
-            let _ = writeln!(s, "export {i} data \"{}\" {}", e.name, e.offset);
+            let _ = writeln!(s, "export {i} data {} {}", quote_str(&e.name), e.offset);
         }
         s.push('\n');
     }
@@ -154,8 +154,8 @@ pub fn print_module(m: &Module) -> String {
             };
             let _ = writeln!(
                 s,
-                "export {i} interface \"{}\" {}{} {{ {} }}",
-                e.name,
+                "export {i} interface {} {}{} {{ {} }}",
+                quote_str(&e.name),
                 // 7.4 — the provider's declared concurrency policy round-trips.
                 if e.threaded { "threaded " } else { "" },
                 e.interface,
@@ -192,10 +192,10 @@ fn print_debug_info(s: &mut String, m: &Module) {
     }
     s.push('\n');
     for (i, f) in di.files.iter().enumerate() {
-        let _ = writeln!(s, "debug.file {i} \"{f}\"");
+        let _ = writeln!(s, "debug.file {i} {}", quote_str(f));
     }
     for fname in &di.func_names {
-        let _ = writeln!(s, "debug.fname {} \"{}\"", fname.func, fname.name);
+        let _ = writeln!(s, "debug.fname {} {}", fname.func, quote_str(&fname.name));
     }
     for l in &di.locs {
         let _ = writeln!(
@@ -219,26 +219,40 @@ fn print_debug_info(s: &mut String, m: &Module) {
                     Encoding::Float => "float",
                     Encoding::Bool => "bool",
                 };
-                let _ = writeln!(s, "debug.type {id} base \"{name}\" {enc} {size}");
+                let _ = writeln!(s, "debug.type {id} base {} {enc} {size}", quote_str(name));
             }
             TypeDef::Pointer {
                 name,
                 pointee,
                 size,
             } => {
-                let _ = writeln!(s, "debug.type {id} ptr \"{name}\" {pointee} {size}");
+                let _ = writeln!(
+                    s,
+                    "debug.type {id} ptr {} {pointee} {size}",
+                    quote_str(name)
+                );
             }
             TypeDef::Array { name, elem, count } => {
-                let _ = writeln!(s, "debug.type {id} array \"{name}\" {elem} {count}");
+                let _ = writeln!(
+                    s,
+                    "debug.type {id} array {} {elem} {count}",
+                    quote_str(name)
+                );
             }
             TypeDef::Aggregate { name, size, fields } => {
-                let _ = writeln!(s, "debug.type {id} agg \"{name}\" {size}");
+                let _ = writeln!(s, "debug.type {id} agg {} {size}", quote_str(name));
                 for f in fields {
-                    let _ = writeln!(s, "debug.field {id} \"{}\" {} {}", f.name, f.offset, f.ty);
+                    let _ = writeln!(
+                        s,
+                        "debug.field {id} {} {} {}",
+                        quote_str(&f.name),
+                        f.offset,
+                        f.ty
+                    );
                 }
             }
             TypeDef::Opaque { name, size } => {
-                let _ = writeln!(s, "debug.type {id} opaque \"{name}\" {size}");
+                let _ = writeln!(s, "debug.type {id} opaque {} {size}", quote_str(name));
             }
         }
     }
@@ -249,9 +263,9 @@ fn print_debug_info(s: &mut String, m: &Module) {
         // `winvia <n> <b0> <i0> <v0> … <off>` (window via a per-pc base value + offset), or
         // `fixed <addr>` (a global's absolute window address).
         if v.func == temen_ir::GLOBAL_SCOPE {
-            let _ = write!(s, "debug.var global \"{}\" ", v.name);
+            let _ = write!(s, "debug.var global {} ", quote_str(&v.name));
         } else {
-            let _ = write!(s, "debug.var {} \"{}\" ", v.func, v.name);
+            let _ = write!(s, "debug.var {} {} ", v.func, quote_str(&v.name));
         }
         match &v.loc {
             VarLoc::Window { off } => {
@@ -277,7 +291,7 @@ fn print_debug_info(s: &mut String, m: &Module) {
                 let _ = write!(s, "fixed {addr}");
             }
         }
-        let _ = write!(s, " \"{}\"", v.ty);
+        let _ = write!(s, " {}", quote_str(&v.ty));
         if let Some(tid) = v.type_id {
             let _ = write!(s, " {tid}");
         }
@@ -291,8 +305,8 @@ fn print_debug_info(s: &mut String, m: &Module) {
     for b in &di.blobs {
         let _ = writeln!(
             s,
-            "debug.blob \"{}\" \"{}\"",
-            b.producer,
+            "debug.blob {} \"{}\"",
+            quote_str(&b.producer),
             escape_bytes(&b.bytes)
         );
     }
@@ -333,6 +347,15 @@ fn print_op_name(name: &str) -> String {
     } else {
         format!("\"{}\"", escape_bytes(name.as_bytes()))
     }
+}
+
+/// A `"…"` string literal with the contents `escape_bytes`-escaped, for any always-quoted
+/// user-controlled string in the text form (import/export names, debug paths/names/types). These
+/// strings are arbitrary bytes that decode and verify — an unescaped `"`, `\`, or `\0` would break
+/// `parse ∘ print` (the sibling of #1075 in the name/debug printers). The parser reads them back via
+/// `parse_str`, which un-escapes through `lex_string`.
+fn quote_str(s: &str) -> String {
+    format!("\"{}\"", escape_bytes(s.as_bytes()))
 }
 
 fn print_func_at(s: &mut String, f: &Func, fn_results: &[usize], m: &Module, idx: Option<usize>) {
@@ -401,7 +424,7 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
         // Link-form data addresses (resolved to `i64.const` by `link`): `data.sym "<name>" <addend>`
         // for a cross-unit symbol, `data.self <offset>` for this unit's own data.
         Inst::DataSym { name, addend } => {
-            format!("data.sym \"{}\" {addend}", String::from_utf8_lossy(name))
+            format!("data.sym \"{}\" {addend}", escape_bytes(name))
         }
         Inst::DataSelf { offset } => format!("data.self {offset}"),
         Inst::DataTop => "data.top".to_string(),
@@ -3836,6 +3859,46 @@ block 0 (v0: i32) {
                 ty: 0
             }])]
         );
+    }
+
+    #[test]
+    fn quoted_name_and_debug_strings_with_special_bytes_round_trip() {
+        // Sibling of #1075 in the name/debug printers (nightly `roundtrip` fuzz): import/export
+        // names and debug-info strings (file paths, fn/type/var names) are arbitrary bytes that
+        // decode and verify, but were printed inside `"…"` verbatim — a raw `"` closed the literal
+        // early and a raw `\0` was unlexable (`unexpected character '\0'`). They now route through
+        // `quote_str` (escape_bytes), so `parse ∘ print = id` holds. The `debug.file` path with a
+        // `"` and `\0` is the exact fuzz-reproduced case.
+        let nasty = "a\"b\\c\0d e"; // quote, backslash, NUL, space
+        let mut m = temen_ir::Module::default();
+        m.exports.push(temen_ir::Export {
+            name: nasty.into(),
+            func: 0,
+        });
+        m.debug_info = Some(temen_ir::DebugInfo {
+            files: vec![String::new(), "ok/path.c".into(), nasty.into()],
+            locs: vec![temen_ir::Loc {
+                func: 0,
+                block: 0,
+                inst: 0,
+                file: 2,
+                line: 1,
+                col: 1,
+            }],
+            types: vec![],
+            vars: vec![],
+            blobs: vec![],
+            func_names: vec![temen_ir::FuncName {
+                func: 0,
+                name: nasty.into(),
+            }],
+        });
+        let printed = print_module(&m);
+        assert!(
+            !printed.contains('\0'),
+            "printed text must not contain a raw NUL"
+        );
+        assert_eq!(parse_module(&printed).expect("re-parse of printed IR"), m);
     }
 
     #[test]
