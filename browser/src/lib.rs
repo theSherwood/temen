@@ -6263,6 +6263,66 @@ pub extern "C" fn temen_run_shell(
     out.value
 }
 
+/// Decode the module at `[mod_ptr, mod_len)` and run it as **real GNU bash** (see [`bash_exec_with`]) —
+/// the playground's bash card (#1080). `[cmd_ptr, cmd_len)` is the script, run as
+/// `bash -c '<script>'` (multi-line scripts are fine — `-c` takes newlines); `[stdin_ptr, stdin_len)`
+/// seeds the personality's `read(0, …)`. `[bins_ptr, bins_len)`, when non-empty, is the **`/bin`
+/// registry blob** in the same layout [`parse_shell_cmds`] reads (u32 count, then per entry u32
+/// name-length + UTF-8 name + u32 module-length + encoded-module bytes), with full paths as names
+/// (`/bin/echo`, …): each module is granted and registered as a filesystem executable, so bash's
+/// `fork → execve("/bin/echo")` resolves to a separate compiled child (the #1080 image-replace on the
+/// bytecode cooperative engine). Each command's declared window rides in its own module (no per-entry
+/// size field). Same capture/accessor contract as [`temen_run_shell`]: stdout via `temen_stdout_ptr`+
+/// `temen_stdout_len`, stderr via `temen_stderr_*`, the exit code via `temen_exit_code`, the status via
+/// `temen_status` (0 = OK, 5 = clean `exit`). Returns the guest's `i64` result.
+#[no_mangle]
+pub extern "C" fn temen_run_bash(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    cmd_ptr: *const u8,
+    cmd_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+    bins_ptr: *const u8,
+    bins_len: usize,
+) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    let slice = |p: *const u8, n: usize| -> &'static [u8] {
+        if p.is_null() || n == 0 {
+            &[]
+        } else {
+            // SAFETY: the host guarantees the range is a live `temen_alloc`ation it just filled.
+            unsafe { core::slice::from_raw_parts(p, n) }
+        }
+    };
+    let m = match temen_encode::decode_module(slice(mod_ptr, mod_len)) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    let cmd = slice(cmd_ptr, cmd_len);
+    let stdin = slice(stdin_ptr, stdin_len);
+    // The /bin registry. A truncated/undecodable blob is non-fatal (`parse_shell_cmds` drops the bad
+    // entries): bash runs, and an unresolvable command reports `not found` — the same degradation as
+    // the shell card. Each command's window log2 comes from its own decoded module.
+    let owned = parse_shell_cmds(slice(bins_ptr, bins_len));
+    let bins: Vec<(&str, &temen_ir::Module, u8)> = owned
+        .iter()
+        .map(|(n, cm)| (n.as_str(), cm, cm.memory.map_or(0, |mc| mc.size_log2)))
+        .collect();
+    let out = bash_exec_with(&m, &[b"bash", b"-c", cmd], stdin, &bins);
+    set(out.status);
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
+        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
+        EXIT_CODE = out.exit_code;
+    }
+    out.value
+}
+
 /// **In-browser link + run of a frontend-emitted program** (docs/TEMEN_BROWSER_PLAN.md option (b)):
 /// the live-editing path, language-agnostic. Given a **program** unit and a **library** unit —
 /// each either TEMEN-IR **text** or a **binary object** (`.temeno` bytes, the v9 object dialect;

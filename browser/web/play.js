@@ -1177,6 +1177,59 @@ cat fruits | sort | uniq
 if test -f fruits; then echo fruits exists; fi
 `,
   },
+  'bash (real GNU bash 5.2, AOT-compiled)': {
+    kind: 'bash',
+    jit: false, // setjmp/longjmp + fork/exec run on the bytecode cooperative engine
+    editable: true,
+    lang: 'shell',
+    url: './assets/bash.temen',
+    // The /bin registry: the 13 repo-owned coreutils (chibicc-compiled command modules) bash
+    // `fork → execve`s as separate sandboxed programs. Names are full paths — bash resolves
+    // `seq` → `/bin/seq` through PATH=/bin.
+    cmds: [
+      { name: '/bin/true', url: './assets/bin_true.temen' },
+      { name: '/bin/false', url: './assets/bin_false.temen' },
+      { name: '/bin/echo', url: './assets/bin_echo.temen' },
+      { name: '/bin/cat', url: './assets/bin_cat.temen' },
+      { name: '/bin/seq', url: './assets/bin_seq.temen' },
+      { name: '/bin/head', url: './assets/bin_head.temen' },
+      { name: '/bin/wc', url: './assets/bin_wc.temen' },
+      { name: '/bin/sort', url: './assets/bin_sort.temen' },
+      { name: '/bin/uniq', url: './assets/bin_uniq.temen' },
+      { name: '/bin/ls', url: './assets/bin_ls.temen' },
+      { name: '/bin/pwd', url: './assets/bin_pwd.temen' },
+      { name: '/bin/grep', url: './assets/bin_grep.temen' },
+      { name: '/bin/tr', url: './assets/bin_tr.temen' },
+    ],
+    mode: 'io',
+    desc: 'The real GNU bash 5.2 binary — compiled whole-program to LLVM bitcode, translated ' +
+      'through the AOT on-ramp, and running client-side on the bytecode cooperative engine under ' +
+      'the temen-posix personality (#802/#1080). Not a reimplementation: bash’s own parser, ' +
+      'expansion, job control, setjmp/longjmp error paths, fork/exec/wait and pipes, with the ' +
+      '13 coreutils in /bin run as separate compiled programs bash fork→execve’s in the ' +
+      'sandbox. Edit the script and click Run: it executes as `bash -c ‘script’` and the ' +
+      'captured stdout appears below. bash is GPLv3 and never committed — this card’s module ' +
+      'is built at deploy (node build-bash-assets.mjs).',
+    src: `# Real GNU bash, AOT-compiled, running in your browser's sandbox.
+echo hello from bash $BASH_VERSION
+
+# variables + arithmetic — bash's own expansion machinery
+N=world
+echo hi $N
+echo $((6 * 7))
+
+# external commands: each is a separate compiled program bash fork+execve's
+# (seq, head, wc, sort, uniq live in /bin — type 'type seq' to see)
+seq 5 | head -n 3
+
+# pipelines run as real fork'd stages over capability pipes
+printf 'banana\\napple\\nbanana\\n' | sort | uniq
+
+for i in 1 2 3; do echo loop $i; done
+if [ -n "$N" ]; then echo N is set; fi
+type seq
+`,
+  },
   'SQLite (:memory: — write & run SQL)': {
     kind: 'module',
     jit: true, // _start is wasm-JIT-emittable (proven byte-identical by browser-jit-module-test)
@@ -1670,6 +1723,87 @@ async function runShell(c) {
   } else {
     setState(c, 'error', `run failed: status ${status} (1=decode 2=unsupported 3=trap)`);
     logTo(c, `shell run status ${status}`);
+    runEnd(rec, { ok: false, status, result: rv });
+  }
+}
+
+// Run **real GNU bash** single-shot on the bytecode cooperative engine, through the `temen_run_bash`
+// entry (#1080) — it grants the POSIX personality (bash's fd 1/2, signals, fork/exec/wait) and, when
+// `binsBlob` is given, registers each `/bin/<name>` module as a filesystem executable bash can
+// `fork → execve`. The editor text runs as `bash -c '<script>'`. Returns { rv, status, stdout }.
+function bashInterp(bytes, cmdBytes, binsBlob) {
+  const p = eng.ex.temen_alloc(bytes.length);
+  const cmdP = cmdBytes.length ? eng.ex.temen_alloc(cmdBytes.length) : 0;
+  let binsP = 0;
+  const binsLen = binsBlob ? binsBlob.length : 0;
+  if (binsLen) binsP = eng.ex.temen_alloc(binsLen);
+  const view = new Uint8Array(eng.memory.buffer);
+  view.set(bytes, p);
+  if (cmdP) view.set(cmdBytes, cmdP);
+  if (binsP) view.set(binsBlob, binsP);
+  const rv = eng.ex.temen_run_bash(p, bytes.length, cmdP, cmdBytes.length, 0, 0, binsP, binsLen);
+  const status = eng.ex.temen_status();
+  const stdout = readModuleStdout();
+  eng.ex.temen_dealloc(p, bytes.length);
+  if (cmdP) eng.ex.temen_dealloc(cmdP, cmdBytes.length);
+  if (binsP) eng.ex.temen_dealloc(binsP, binsLen);
+  return { rv, status, stdout };
+}
+
+// A card's Run for bash: fetch bash.temen (a deploy-built asset — GPLv3, never committed) + the /bin
+// coreutils, run the editor's script as `bash -c`, show the captured stdout. Bytecode cooperative
+// engine only (setjmp/longjmp + fork/exec are interpreter tiers), so no JIT toggle.
+async function runBash(c) {
+  const ex = c.ex;
+  const rec = runStart(c, { tier: 'interpreter' });
+  setState(c, 'running', 'fetching bash…');
+  c.el.result.textContent = '';
+  c.el.stdout.textContent = '';
+  c.el.canvas.hidden = true;
+  let bytes;
+  try {
+    bytes = await fetchTimed(rec, c, ex.url);
+  } catch (e) {
+    setState(c, 'error', `${e.message} — bash.temen is built at deploy (GPLv3, never committed): run \`node build-bash-assets.mjs\``);
+    logTo(c, `fetch failed: ${e.message}`);
+    runNote(rec, { fetchError: e.message });
+    runEnd(rec, { ok: false });
+    return;
+  }
+  logTo(c, `fetched ${ex.url}: ${bytes.length}B bash`);
+  // The /bin registry — each coreutil is an optional companion asset: a fetch failure drops just
+  // that command (bash then reports `not found` for it), so it is logged, not fatal.
+  const bins = [];
+  for (const cmd of ex.cmds || []) {
+    try {
+      const cb = await fetchTimed(rec, c, cmd.url);
+      bins.push({ name: cmd.name, bytes: cb });
+    } catch (e) {
+      logTo(c, `command '${cmd.name}' unavailable (${e.message})`);
+    }
+  }
+  logTo(c, `fetched /bin: ${bins.map((x) => x.name.slice(5)).join(' ')}`);
+  const binsBlob = buildCmdsBlob(bins);
+  const script = c.editor.getValue();
+  const cmdBytes = new TextEncoder().encode(script);
+  runNote(rec, { bins: bins.length, scriptBytes: cmdBytes.length });
+  setState(c, 'running', 'running…');
+  const t0 = performance.now();
+  const { rv, status, stdout } = bashInterp(bytes, cmdBytes, binsBlob);
+  const ms = runStage(rec, 'run:interpreter', performance.now() - t0).toFixed(0);
+  const exitCode = eng.ex.temen_exit_code();
+  c.el.stdout.textContent = stdout;
+  c.el.result.textContent = `${exitCode}`;
+  runNote(rec, { stdoutBytes: stdout.length, exitCode });
+  // 0 = OK (a final external command exec'd on the root returns directly), 5 = clean Exit
+  // (bash's exit_shell); anything else is a decode error / trap.
+  if (status === 0 || status === 5) {
+    setState(c, 'done', `done · exit ${exitCode} · ${ms}ms`);
+    logTo(c, `bash run → exit ${exitCode} (status ${status}) in ${ms}ms`);
+    runEnd(rec, { ok: true, status, result: rv });
+  } else {
+    setState(c, 'error', `run failed: status ${status} (1=decode 2=unsupported 3=trap)`);
+    logTo(c, `bash run status ${status}`);
     runEnd(rec, { ok: false, status, result: rv });
   }
 }
@@ -3318,6 +3452,7 @@ async function runDemo(c) {
   if (ex.kind === 'nifler') return runNifler(c);
   if (ex.kind === 'nimc') return runNimc(c);
   if (ex.kind === 'shell') return runShell(c);
+  if (ex.kind === 'bash') return runBash(c);
   if (ex.kind === 'module') return runModule(c);
   return runText(c);
 }

@@ -748,7 +748,17 @@ struct World {
     /// non-loopback fails closed.
     net_delegate: Option<Box<dyn NetDelegate>>,
     /// The monotonic-clock base — `clock(1)` reports nanos elapsed since this. Captured at creation.
+    /// wasm32 (the browser playground) has **no std time source** — `Instant::now`/`SystemTime::now`
+    /// PANIC on wasm32-unknown-unknown, and this field's initializer took the whole personality
+    /// `grant` down before the guest ran one op (found by the #1080 bash card, the first wasm test
+    /// to actually exercise the post-#800 grant). There the personality serves a deterministic
+    /// strictly-increasing tick instead — the core `Binding::Clock` shape.
+    #[cfg(not(target_arch = "wasm32"))]
     clock_base: std::time::Instant,
+    /// The wasm32 twin of `clock_base`: the next nanos `clock()` serves, bumped per read so time
+    /// always advances (a guest's `$SECONDS`/timestamps need monotonicity, not wall truth).
+    #[cfg(target_arch = "wasm32")]
+    clock_tick: std::sync::atomic::AtomicI64,
     /// A pinned clock value (`Some(nanos)`) for determinism: when set, `clock(_)` returns it verbatim
     /// so a differential run is reproducible. `None` reads the real host clock.
     clock_fixed: Option<i64>,
@@ -2044,7 +2054,10 @@ fn new_world(stdin: Vec<u8>) -> World {
         net_listeners: HashMap::new(),
         net_next_port: 49152, // the IANA ephemeral range start
         net_delegate: None,
+        #[cfg(not(target_arch = "wasm32"))]
         clock_base: std::time::Instant::now(),
+        #[cfg(target_arch = "wasm32")]
+        clock_tick: std::sync::atomic::AtomicI64::new(0),
         clock_fixed: None,
         commands: Vec::new(),
         executables: HashSet::new(),
@@ -4604,13 +4617,25 @@ impl Ctx<'_> {
         if let Some(fixed) = self.w.clock_fixed {
             return fixed;
         }
-        if *args.first().unwrap_or(&0) == 1 {
-            self.w.clock_base.elapsed().as_nanos() as i64
-        } else {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as i64)
-                .unwrap_or(0)
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if *args.first().unwrap_or(&0) == 1 {
+                self.w.clock_base.elapsed().as_nanos() as i64
+            } else {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as i64)
+                    .unwrap_or(0)
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            // No std time source on wasm32 (`Instant::now`/`SystemTime::now` panic): serve the
+            // deterministic tick, 1 µs per read, for monotonic and realtime alike.
+            let _ = args;
+            self.w
+                .clock_tick
+                .fetch_add(1_000, std::sync::atomic::Ordering::Relaxed)
         }
     }
 
