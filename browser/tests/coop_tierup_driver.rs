@@ -21,11 +21,11 @@ use temen_browser::{
     temen_coop_jit_wasm_ptr, temen_coop_mapped, temen_coop_mapped_now, temen_coop_nfuncs,
     temen_coop_open, temen_coop_paged, temen_coop_pagestate_len, temen_coop_pagestate_ptr,
     temen_coop_run, temen_coop_set_tierup_floor, temen_coop_shim_ptr, temen_coop_shim_wasm,
-    temen_coop_slot_code,
-    temen_coop_table_gen, temen_coop_table_log2, temen_coop_value, temen_coop_wasm_len,
-    temen_coop_wasm_ptr, temen_coop_win_len, temen_coop_win_ptr, temen_run_value, temen_status,
-    temen_stdout_len, temen_stdout_ptr, COOP_RUN_DONE, COOP_RUN_JIT_INVOKE, COOP_RUN_TIERUP,
-    COOP_RUN_TRAP, STATUS_OK, STATUS_TRAP, STATUS_UNSUPPORTED,
+    temen_coop_slot_code, temen_coop_table_gen, temen_coop_table_log2, temen_coop_value,
+    temen_coop_wasm_len, temen_coop_wasm_ptr, temen_coop_win_len, temen_coop_win_ptr,
+    temen_run_value, temen_status, temen_stdout_len, temen_stdout_ptr, COOP_RUN_DONE,
+    COOP_RUN_JIT_INVOKE, COOP_RUN_TIERUP, COOP_RUN_TRAP, STATUS_OK, STATUS_TRAP,
+    STATUS_UNSUPPORTED,
 };
 use temen_interp::{Host, StreamRole};
 use wasmi::{
@@ -595,11 +595,18 @@ fn leaf_tierup_size_floor_gates_tiny_and_admits_heavy() {
                     }
                 }
                 COOP_RUN_DONE => break,
-                ev => panic!("unexpected event {ev} (floor {floor}, status {})", temen_status()),
+                ev => panic!(
+                    "unexpected event {ev} (floor {floor}, status {})",
+                    temen_status()
+                ),
             }
         }
         assert_eq!(temen_status(), want.status, "status parity (floor {floor})");
-        assert_eq!(temen_coop_value(), want.value, "value parity (floor {floor})");
+        assert_eq!(
+            temen_coop_value(),
+            want.value,
+            "value parity (floor {floor})"
+        );
         // SAFETY: DONE-arm capture slots; sole accessor under FFI_LOCK.
         let got_out =
             unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
