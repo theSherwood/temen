@@ -99,7 +99,7 @@ pub fn print_module(m: &Module) -> String {
                 temen_ir::TypeEntry::Interface(elems) => {
                     let ops: Vec<String> = elems
                         .iter()
-                        .map(|e| format!("{}: {}", e.name, e.ty))
+                        .map(|e| format!("{}: {}", print_op_name(&e.name), e.ty))
                         .collect();
                     let _ = writeln!(s, "type {i} interface {{ {} }}", ops.join(", "));
                 }
@@ -148,7 +148,7 @@ pub fn print_module(m: &Module) -> String {
                 Some(temen_ir::TypeEntry::Interface(elems)) if elems.len() == e.ops.len() => elems
                     .iter()
                     .zip(&e.ops)
-                    .map(|(el, f)| format!("{}: {f}", el.name))
+                    .map(|(el, f)| format!("{}: {f}", print_op_name(&el.name)))
                     .collect(),
                 _ => e.ops.iter().map(|f| f.to_string()).collect(),
             };
@@ -313,6 +313,26 @@ fn escape_bytes(bytes: &[u8]) -> String {
         }
     }
     s
+}
+
+/// True when `name` re-lexes as exactly one bare identifier token equal to itself, so it can be
+/// printed unquoted. The `all(is_ident_char)` clause also rejects a leading `%` (which
+/// `is_ident_start` allows but the lexer's ident run does not consume) and the empty string.
+fn is_bare_ident(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty() && is_ident_start(b[0]) && b.iter().all(|&c| is_ident_char(c))
+}
+
+/// Render an interface op name for the text form: bare when it is a valid identifier, otherwise a
+/// quoted, `escape_bytes`-escaped string. Interface op names are arbitrary strings that decode and
+/// verify (empty, whitespace, `\0`, punctuation), but the parser reads a bare name as an `Ident`
+/// token — so a non-identifier name must be quoted or `parse ∘ print` breaks (#1075).
+fn print_op_name(name: &str) -> String {
+    if is_bare_ident(name) {
+        name.to_string()
+    } else {
+        format!("\"{}\"", escape_bytes(name.as_bytes()))
+    }
 }
 
 fn print_func_at(s: &mut String, f: &Func, fn_results: &[usize], m: &Module, idx: Option<usize>) {
@@ -2125,7 +2145,7 @@ impl<'a> Parser<'a> {
         let mut elems = Vec::new();
         if !matches!(self.peek(), Some(Tok::RBrace)) {
             loop {
-                let name = self.parse_ident()?;
+                let name = self.parse_op_name()?;
                 self.expect(&Tok::Colon)?;
                 let ty = self.parse_u32()?;
                 elems.push(temen_ir::IfaceOp { name, ty });
@@ -2151,7 +2171,7 @@ impl<'a> Parser<'a> {
                 match self.peek() {
                     Some(Tok::Int(_)) => positional.push(self.parse_u32()?),
                     _ => {
-                        let name = self.parse_ident()?;
+                        let name = self.parse_op_name()?;
                         self.expect(&Tok::Colon)?;
                         let f = self.parse_u32()?;
                         named.push((name, f));
@@ -3420,6 +3440,18 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse an interface op name: a bare identifier, or a quoted string for names that are not
+    /// valid identifiers (empty, whitespace, `\0`, punctuation). Mirrors [`print_op_name`] so the
+    /// text form round-trips any name the binary form and verifier accept (#1075).
+    fn parse_op_name(&mut self) -> Result<String, ParseError> {
+        if matches!(self.peek(), Some(Tok::Str(_))) {
+            String::from_utf8(self.parse_str()?)
+                .map_err(|_| ParseError("interface op name is not valid UTF-8".into()))
+        } else {
+            self.parse_ident()
+        }
+    }
+
     /// Parse the optional `offset=<int>` / `align=<int>` suffix of a memory op
     /// (either order, both optional; defaults 0).
     /// Parse the optional `offset=` memarg suffix. The `align=` suffix was removed at the wire rev
@@ -3753,6 +3785,57 @@ block 0 (v0: i32) {
         assert_eq!(idxs, vec![0, 0, 1], "repeated write shares index 0");
         // Canonical print → re-parse is identity (printer emits `call.sym` + decls).
         assert_eq!(parse_module(&print_module(&m)).unwrap(), m);
+    }
+
+    #[test]
+    fn interface_op_names_with_non_identifier_bytes_round_trip() {
+        // #1075 (nightly `roundtrip` fuzz): interface op names are arbitrary strings that decode
+        // and verify — empty, whitespace, `\0`, punctuation. They used to print bare, so the
+        // printed text could not re-parse (`unexpected character '\0'`). They now print quoted +
+        // escaped when they are not valid identifiers, so `parse ∘ print = id` holds for any name.
+        let mut m = temen_ir::Module::default();
+        m.types.push(temen_ir::TypeEntry::Interface(vec![
+            temen_ir::IfaceOp {
+                name: "bump".into(),
+                ty: 0,
+            }, // plain ident → stays bare
+            temen_ir::IfaceOp {
+                name: String::new(),
+                ty: 0,
+            }, // empty
+            temen_ir::IfaceOp {
+                name: "a b".into(),
+                ty: 0,
+            }, // whitespace
+            temen_ir::IfaceOp {
+                name: "has\0nul".into(),
+                ty: 0,
+            }, // the crashing byte
+            temen_ir::IfaceOp {
+                name: "a,b:c{}\"\\".into(),
+                ty: 0,
+            }, // grammar metachars + quote/backslash
+            temen_ir::IfaceOp {
+                name: "3leading".into(),
+                ty: 0,
+            }, // digit-leading (not an ident start)
+        ]));
+        let printed = print_module(&m);
+        assert!(
+            !printed.contains('\0'),
+            "printed text must not contain a raw NUL"
+        );
+        assert_eq!(parse_module(&printed).expect("re-parse of printed IR"), m);
+
+        // A hand-written bare op name still parses (back-compat with the existing corpora).
+        let bare = parse_module("type 0 interface { bump: 0 }\n").expect("bare op name parses");
+        assert_eq!(
+            bare.types,
+            vec![temen_ir::TypeEntry::Interface(vec![temen_ir::IfaceOp {
+                name: "bump".into(),
+                ty: 0
+            }])]
+        );
     }
 
     #[test]
