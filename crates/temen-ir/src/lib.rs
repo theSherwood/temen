@@ -3376,6 +3376,16 @@ pub const POWERBOX_STACK_ALIGN: u64 = 65536;
 /// The data-stack reserve a frontend's `_start` layout leaves above the globals when sizing the
 /// window (`temen-llvm`'s `STACK_RESERVE`): a faulting guard region lies beyond the mapped window (§5).
 pub const POWERBOX_STACK_RESERVE: u64 = 1 << 20;
+/// The **guest-heap reserve** the linker leaves above the data stack when sizing a powerbox window
+/// (a program carrying a `data.top` stack). A fixed-window frontend whose allocator bumps in-window —
+/// the nim compute-shim `mmap` (no `vm_map` growth) — needs the merged window to actually hold its
+/// heap; otherwise the heap top depends on whatever `memory N` some runtime unit happened to declare
+/// (the compute shim's `memory 24`), which is incidental, not designed (#1060). Reserving heap here
+/// makes the window sizing explicit: the window always covers `data + stack reserve + heap reserve`,
+/// growing past a runtime unit's declaration when a program's static data is large. This is a
+/// **floor** on heap room, not a cap — the actual heap ceiling a frontend seeds is the full window
+/// top (`1 << size_log2`), which pow2 rounding often lifts above `entry_sp + STACK + HEAP` reserves.
+pub const POWERBOX_HEAP_RESERVE: u64 = 8 << 20;
 /// Hard anti-bomb ceiling on the fibers (`cont.new`) a single run may create (§12/§15). Bounds the
 /// fiber table so a fiber-bomb yields a clean `FiberFault` instead of unbounded host allocation. A
 /// [`Quota`] can only *tighten* below this, never raise it. `1 << 24` (~16.7M) — the ceiling equals the
@@ -4563,9 +4573,10 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
         // The merged window (one shared linear memory) must (a) be at least as large as any unit
         // declared, (b) cover every relocated data segment — the units' data is **stacked** into
         // non-overlapping windows, so the top (`dtotal`) can exceed any single unit's 64 KiB — and
-        // (c) when the program has a `data.top` data stack, reserve [`POWERBOX_STACK_RESERVE`] above
-        // `entry_sp` for it (as [`synth_manifest_start`] does for the on-ramp entry), since the
-        // entry unit sized its own window for a stack that has since been pushed up by the other
+        // (c) when the program has a `data.top` data stack, reserve [`POWERBOX_STACK_RESERVE`] +
+        // [`POWERBOX_HEAP_RESERVE`] above `entry_sp` for the stack and the in-window guest heap (as
+        // [`synth_manifest_start`] does for the on-ramp entry, plus the heap floor #1060 wants), since
+        // the entry unit sized its own window for a stack that has since been pushed up by the other
         // units' data. Grow to the smallest power-of-two window that holds the max of these — never
         // shrinking a unit's request. No unit declaring memory ⇒ no data segments, so `None` stays
         // `None`.
@@ -4576,7 +4587,7 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
             .max()
             .map(|declared| {
                 let cover = if has_data_top {
-                    entry_sp + POWERBOX_STACK_RESERVE
+                    entry_sp + POWERBOX_STACK_RESERVE + POWERBOX_HEAP_RESERVE
                 } else {
                     dtotal
                 };
@@ -5242,6 +5253,64 @@ mod link_layout_tests {
         assert!(
             rw.offset >= page,
             "unit B relocated to a fresh host page above unit A"
+        );
+    }
+
+    /// A link unit with a `data.top` stack and a data segment — enough to make [`link`] take the
+    /// powerbox-window-sizing branch.
+    fn data_top_unit(data_len: usize) -> LinkUnit {
+        LinkUnit {
+            module: Module {
+                data_ptrs: Vec::new(),
+                data_funcrefs: Vec::new(),
+                types: vec![],
+                funcs: vec![Func {
+                    params: vec![],
+                    results: vec![],
+                    blocks: vec![Block {
+                        params: vec![],
+                        insts: vec![Inst::DataTop], // v0 = data.top (dead; marks has_data_top)
+                        term: Terminator::Return(vec![]),
+                    }],
+                }],
+                memory: Some(Memory { size_log2: 16 }), // small declared window (64 KiB)
+                data: vec![Data {
+                    offset: 0,
+                    readonly: false,
+                    bytes: vec![0u8; data_len],
+                }],
+                imports: vec![],
+                exports: vec![],
+                data_exports: vec![],
+                impl_exports: vec![],
+                debug_info: None,
+            },
+            exports: vec![],
+            data_exports: vec![],
+        }
+    }
+
+    /// #1060: a powerbox program's merged window must cover `data + stack reserve + heap reserve`, so
+    /// an in-window bump allocator (the nim compute-shim `mmap`) has guaranteed heap room above the
+    /// data stack — independent of whatever `memory N` a runtime unit declared. Before the fix the
+    /// window only covered `entry_sp + STACK_RESERVE`, so the heap's headroom was incidental.
+    #[test]
+    fn powerbox_window_reserves_heap_above_the_stack() {
+        let linked = link(&[data_top_unit(4096)]).expect("link data.top unit");
+        let mem = linked.memory.expect("has a window");
+        let win = 1u64 << mem.size_log2;
+        let entry_sp = powerbox_entry_sp(&linked);
+        assert!(
+            win >= entry_sp + POWERBOX_STACK_RESERVE + POWERBOX_HEAP_RESERVE,
+            "window {win:#x} must cover entry_sp {entry_sp:#x} + stack {:#x} + heap {:#x} reserves",
+            POWERBOX_STACK_RESERVE,
+            POWERBOX_HEAP_RESERVE,
+        );
+        // And it grew past the unit's small declared window to do so (the reserve is load-bearing).
+        assert!(
+            mem.size_log2 > 16,
+            "window grew past the declared 64 KiB to hold the reserves (got 2^{})",
+            mem.size_log2
         );
     }
 }

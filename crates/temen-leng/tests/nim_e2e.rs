@@ -567,6 +567,54 @@ fn nim_powerbox_link_is_unit_order_independent() {
     }
 }
 
+/// #1060: the guest heap words are baked into the linked powerbox module's data image with the
+/// **break** just above the data stack and the **ceiling** at the real window top (`1 << size_log2`),
+/// so the heap spans the whole remaining window and the compute-shim `mmap` can fail closed past it —
+/// independent of any runtime unit's `memory N` declaration.
+#[test]
+fn nim_powerbox_seeds_heap_words_to_window_top() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP: nimony toolchain not found (set NIMONY_BIN/NIM_BIN or install on PATH)");
+        return;
+    };
+    let mods = compile_to_leng(
+        &path,
+        "import std/syncio\nwrite(stdout, \"the Temen is here\\n\")\n",
+    );
+    let units: Vec<temen_leng::WholeModule> = mods
+        .iter()
+        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+        .collect();
+    let m = temen_leng::link_nim_powerbox(&units).unwrap_or_else(|e| panic!("link: {e}"));
+
+    // Read an 8-byte little-endian word from the linked data image at window offset `off`.
+    let read_word = |off: u64| -> u64 {
+        let seg = m
+            .data
+            .iter()
+            .find(|d| d.offset <= off && off + 8 <= d.offset + d.bytes.len() as u64)
+            .unwrap_or_else(|| panic!("no data segment covers window offset {off:#x}"));
+        let lo = (off - seg.offset) as usize;
+        u64::from_le_bytes(seg.bytes[lo..lo + 8].try_into().unwrap())
+    };
+
+    let win = 1u64 << m.memory.expect("powerbox module has a window").size_log2;
+    let brk = read_word(temen_ir::POWERBOX_HEAP_BRK);
+    let top = read_word(temen_ir::POWERBOX_HEAP_TOP);
+    let entry_sp = temen_ir::powerbox_entry_sp(&m);
+
+    assert_eq!(
+        brk,
+        entry_sp + temen_ir::POWERBOX_STACK_RESERVE,
+        "heap break seeded just above the data stack"
+    );
+    assert_eq!(top, win, "heap ceiling seeded to the mapped window top");
+    assert!(
+        top > brk,
+        "the heap spans a non-empty region [{brk:#x}, {top:#x})"
+    );
+}
+
 /// Manifest-link `mods` (retaining `write`/`read`/`_exit`/… as bindable imports), then run the
 /// `exportc` `main` on **both engines** with `sysWrite` bound to a stdout capture and the other
 /// syscall leaves stubbed, asserting the two capture the same bytes (§9 interp/JIT parity on the

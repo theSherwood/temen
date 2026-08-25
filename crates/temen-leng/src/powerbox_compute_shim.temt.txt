@@ -65,6 +65,19 @@ block 0 (v0: i64, v1: i64, v2: i32, v3: i32, v4: i32, v5: i64) {
   v6 = i64.const 32
   v7 = i64.load v6
   v8 = i64.add v7 v1
+  v9 = i64.const 40
+  v10 = i64.load v9
+  v11 = i64.const 0
+  v12 = i64.ne v10 v11
+  v13 = i64.gt_u v8 v10
+  v14 = i32.and v12 v13
+  br_if v14 1() 2(v6, v7, v8)
+  }
+block 1 () {
+  v15 = i64.const -1
+  return v15
+  }
+block 2 (v6: i64, v7: i64, v8: i64) {
   i64.store v6 v8
   return v7
   }
