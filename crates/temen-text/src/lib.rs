@@ -532,7 +532,7 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
         // non-adjacent value) prints as the raw `call.cap` below, which round-trips unaided.
         Inst::CapCall {
             type_id: temen_ir::CAP_SELF_TYPE_ID,
-            op: op @ 0..=4,
+            op: op @ (0..=4 | 17 | 18),
             sig,
             handle,
             args,
@@ -544,6 +544,8 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
                 4 => "self.attest".to_string(),
                 1 => format!("self.get v{}", args[0]),
                 2 => format!("self.resolve v{} v{}", args[0], args[1]),
+                17 => format!("self.list v{} v{}", args[0], args[1]),
+                18 => format!("self.schema v{} v{} v{}", args[0], args[1], args[2]),
                 _ => format!("self.label v{} v{} v{}", args[0], args[1], args[2]),
             }
         }
@@ -881,6 +883,10 @@ fn cap_self_sig_matches(op: u32, sig: &FuncType, argc: usize) -> bool {
         1 => *sig.params == [I32] && *sig.results == [I32, I32] && argc == 1,
         2 => *sig.params == [I64, I64] && *sig.results == [I32] && argc == 2,
         3 => *sig.params == [I32, I64, I64] && *sig.results == [I32] && argc == 3,
+        // #1109 discoverability: list/schema return an i64 byte length (vs resolve/label's i32),
+        // which is also what keeps them distinct from ops 2/3 here.
+        17 => *sig.params == [I64, I64] && *sig.results == [I64] && argc == 2,
+        18 => *sig.params == [I32, I64, I64] && *sig.results == [I64] && argc == 3,
         _ => false,
     }
 }
@@ -2746,6 +2752,35 @@ impl<'a> Parser<'a> {
                 vec![handle, buf_ptr, buf_cap],
             ));
         }
+        // #1109 runtime discoverability: `self.list v<ptr> v<cap>` (rows of
+        // `{handle, type_id, name}`) and `self.schema v<type_id> v<ptr> v<cap>` (rows of
+        // `{op name, signature}`); both use `self.label`'s buffer contract (full length returned,
+        // written only if it fits).
+        if op == "self.list" {
+            let buf_ptr = self.value(names)?;
+            let buf_cap = self.value(names)?;
+            return Ok(self.cap_self_capcall(
+                17,
+                FuncType {
+                    params: vec![ValType::I64, ValType::I64],
+                    results: vec![ValType::I64],
+                },
+                vec![buf_ptr, buf_cap],
+            ));
+        }
+        if op == "self.schema" {
+            let type_id = self.value(names)?;
+            let buf_ptr = self.value(names)?;
+            let buf_cap = self.value(names)?;
+            return Ok(self.cap_self_capcall(
+                18,
+                FuncType {
+                    params: vec![ValType::I32, ValType::I64, ValType::I64],
+                    results: vec![ValType::I64],
+                },
+                vec![type_id, buf_ptr, buf_cap],
+            ));
+        }
         // §12 per-vCPU TLS register.
         if op == "vcpu.tls.get" {
             return Ok(Inst::VcpuTlsGet);
@@ -4003,5 +4038,53 @@ debug.loc 0 0 0 0 7 5
             m,
             "a func_names-only debug section must round-trip through text"
         );
+    }
+}
+
+#[cfg(test)]
+mod discoverability_sugar_tests {
+    use super::*;
+    use temen_ir::Inst;
+
+    // #1109: `self.list` / `self.schema` are printer/parser sugar over
+    // `call.cap CAP_SELF op 17|18` with the materialized const-0 dispatch handle, exactly like
+    // the other `self.*` reflection mnemonics — `parse ∘ print = id` must hold.
+    #[test]
+    fn self_list_and_schema_round_trip() {
+        let src = "\
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 4096
+  v1 = i64.const 256
+  v2 = self.list v0 v1
+  v3 = i32.const 0
+  v4 = self.schema v3 v0 v1
+  v5 = i64.add v2 v4
+  return v5
+  }
+}
+";
+        let m = parse_module(src).expect("parse self.list/self.schema sugar");
+        let ops: Vec<u32> = m.funcs[0].blocks[0]
+            .insts
+            .iter()
+            .filter_map(|i| match i {
+                Inst::CapCall { type_id, op, .. } if *type_id == temen_ir::CAP_SELF_TYPE_ID => {
+                    Some(*op)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ops, vec![17, 18], "list is CAP_SELF op 17, schema op 18");
+        let printed = print_module(&m);
+        assert!(
+            printed.contains("self.list"),
+            "prints as the sugar: {printed}"
+        );
+        assert!(
+            printed.contains("self.schema"),
+            "prints as the sugar: {printed}"
+        );
+        assert_eq!(parse_module(&printed).expect("re-parse"), m);
     }
 }

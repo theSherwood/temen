@@ -21783,7 +21783,10 @@ impl Host {
         // the rest of `self.*`): op packs `(selfop | idx << 8)` for selfop ≥ 6 —
         // 6 = `type_id` (intern self interface `idx`), 7 = `covers` (probe the handle argument
         // against self interface `idx`), 8 = `export.handle` (reify own offer `idx`).
-        if type_id == temen_ir::CAP_SELF_TYPE_ID && (op & 0xFF) >= 6 {
+        // Ops 17 (`self.list`) / 18 (`self.schema`) are **plain** selfops, not packed (#1109) —
+        // they carry buffer args and are serviced in the mem-capable reflection block below,
+        // beside `resolve`/`label`.
+        if type_id == temen_ir::CAP_SELF_TYPE_ID && (op & 0xFF) >= 6 && !matches!(op, 17 | 18) {
             let idx = op >> 8;
             return match op & 0xFF {
                 6 => Ok(vec![self.self_type_id(idx)? as i32 as i64]),
@@ -21995,6 +21998,88 @@ impl Host {
                         return Ok(vec![EFAULT]);
                     };
                     if mem.write_bytes(ptr, label.as_bytes()).is_none() {
+                        return Ok(vec![EFAULT]);
+                    }
+                }
+                return Ok(vec![len as i64]);
+            }
+            // op 17 = `list(buf_ptr, buf_cap) -> len | -EFAULT` (#1109): enumerate this domain's
+            // **named** grants as packed rows `{ handle: i32 LE, type_id: u32 LE, name_len: u32 LE,
+            // name bytes }` — the discover half of runtime discoverability (self.schema is the
+            // inspect half). The handle rides in the row so discover→call needs no per-row
+            // `self.resolve`. Buffer contract is op 3's (`label`): the full byte length is always
+            // returned; nothing is written unless the whole answer fits (`buf_cap < len` ⇒ size
+            // only — call with cap 0 to size, re-call to fill; no truncated rows). Authority-
+            // neutral reflection (D46): every row is a grant the domain already holds.
+            if op == 17 {
+                let ptr = *args.first().unwrap_or(&0) as u64;
+                let cap = *args.get(1).unwrap_or(&0) as u64;
+                let rows: Vec<(i32, u32, String)> = self
+                    .cap_names
+                    .iter()
+                    .filter_map(|(n, h)| Some((*h, self.type_id_of(*h)?, n.clone())))
+                    .collect();
+                let mut buf = Vec::new();
+                for (h, tid, name) in &rows {
+                    buf.extend_from_slice(&h.to_le_bytes());
+                    buf.extend_from_slice(&tid.to_le_bytes());
+                    buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(name.as_bytes());
+                }
+                let len = buf.len() as u64;
+                if len <= cap {
+                    let Some(mem) = mem else {
+                        return Ok(vec![EFAULT]);
+                    };
+                    if mem.write_bytes(ptr, &buf).is_none() {
+                        return Ok(vec![EFAULT]);
+                    }
+                }
+                return Ok(vec![len as i64]);
+            }
+            // op 18 = `schema(type_id, buf_ptr, buf_cap) -> len | -EINVAL | -EFAULT` (#1109): dump
+            // interface `type_id`'s canonical op names + signatures as packed rows `{ name_len: u32
+            // LE, name bytes, n_params: u32 LE, param type bytes, n_results: u32 LE, result type
+            // bytes }` (type bytes are the wire's: 0=i32 1=i64 2=f32 3=f64 4=v128 5=ref 6=cap).
+            // Names are
+            // canonical because they are half the intern key (#1109) — never first-interned-wins.
+            // `-EINVAL` for an id with no schema (a handle-typed built-in, or unknown). Buffer
+            // contract is op 3's (size with cap 0, re-call to fill; all-or-nothing).
+            if op == 18 {
+                let tid = *args.first().unwrap_or(&0) as u32;
+                let ptr = *args.get(1).unwrap_or(&0) as u64;
+                let cap = *args.get(2).unwrap_or(&0) as u64;
+                let Some(ops) = self.iface_schema(tid) else {
+                    return Ok(vec![EINVAL]);
+                };
+                // The wire's type bytes (temen-encode `op::T_*`), restated: reflection output must
+                // match what an encoder/decoder of the same module would say.
+                fn tb(t: &ValType) -> u8 {
+                    match t {
+                        ValType::I32 => 0,
+                        ValType::I64 => 1,
+                        ValType::F32 => 2,
+                        ValType::F64 => 3,
+                        ValType::V128 => 4,
+                        ValType::Ref => 5,
+                        ValType::Cap => 6,
+                    }
+                }
+                let mut buf = Vec::new();
+                for (name, ft) in &ops {
+                    buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(name.as_bytes());
+                    buf.extend_from_slice(&(ft.params.len() as u32).to_le_bytes());
+                    buf.extend(ft.params.iter().map(tb));
+                    buf.extend_from_slice(&(ft.results.len() as u32).to_le_bytes());
+                    buf.extend(ft.results.iter().map(tb));
+                }
+                let len = buf.len() as u64;
+                if len <= cap {
+                    let Some(mem) = mem else {
+                        return Ok(vec![EFAULT]);
+                    };
+                    if mem.write_bytes(ptr, &buf).is_none() {
                         return Ok(vec![EFAULT]);
                     }
                 }
