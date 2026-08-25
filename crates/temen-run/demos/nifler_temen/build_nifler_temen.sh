@@ -97,7 +97,10 @@ done
 # the shared store. This is the exact hand-off the Rust-on-Temen driver guest uses to fan phases out; here
 # it proves a real phase produces byte-identical NIF as an op-13 child (`examples/spawn_child_fs.rs`).
 echo "=== [5b] translate --child-entry + op-13-spawn over memfs, diff vs native ==="
-"$TR" "$CACHE/nifler.linked.bc" -o "$CACHE/nifler_ce_raw.temen" --binary --host-page 65536 --stub-externs --child-entry
+# --null-guard (#964/#1094): the child-entry nifler runs guarded too. The op-13 driver seeds argv at
+# `carve + module_args_base` (guard-aware); grant records/cap-names stay in the parent window, read by
+# the op-13 handler in the parent's context — so the child's guard never collides with them.
+"$TR" "$CACHE/nifler.linked.bc" -o "$CACHE/nifler_ce_raw.temen" --binary --host-page 65536 --stub-externs --child-entry --null-guard
 for src in "$HERE"/inputs/*.nim; do
   name="$(basename "$src")"
   rm -rf "$CACHE/nat_ce"; mkdir -p "$CACHE/nat_ce"; cp "$src" "$CACHE/nat_ce/in.nim"

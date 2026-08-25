@@ -13,8 +13,10 @@
 //! Like `nimphase_run`, but the phase runs as a **confined op-13 child** (verify_module + spawn) rather
 //! than a top-level powerbox program — so a Rust-on-Temen driver guest can fan phases out the same way.
 //! The child's imports `exit`/`read`/`write`/`vm_map` bind by the reference policy to the re-granted
-//! Exit/Stream and the auto-granted AddressSpace; `fs` resolves by name from the grant list. `scratch =
-//! 0` (assets are built without `--null-guard`), so argv seeds at `carve + POWERBOX_ARGS_BASE`.
+//! Exit/Stream and the auto-granted AddressSpace; `fs` resolves by name from the grant list. #964/#1094:
+//! argv seeds at `carve + module_args_base(child)` — one guard up for a `__null_guard`-marked child (the
+//! guarded nifler_ce), the legacy 128 otherwise; the grant records/cap-names stay in the parent window
+//! (the op-13 handler reads them in the parent's context, so the child's guard never touches them).
 
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -48,10 +50,14 @@ fn seed_dir(dir: &Path) -> Vec<(String, Vec<u8>)> {
 }
 
 /// Build the text-IR op-13 parent that spawns `child` (window `child_sl`, carve at `carve_off`) with the
-/// three-entry grant list `{fs, stdout, exit}` and `argv` seeded at `carve + POWERBOX_ARGS_BASE`.
-fn parent_src(child_sl: u32, carve_off: u64, argv: &[String]) -> String {
+/// three-entry grant list `{fs, stdout, exit}` and `argv` seeded at `carve + args_base`. #964/#1094:
+/// `args_base` is the child's [`temen_ir::module_args_base`] — one guard up for a `__null_guard`-marked
+/// child, the legacy 128 otherwise — since the child's `_start` reads argv there. The grant records and
+/// cap-names stay at their parent-window offsets: the op-13 handler reads those in the *parent's*
+/// context (`m.read_window`), so the child's guard never touches them.
+fn parent_src(child_sl: u32, carve_off: u64, args_base: u64, argv: &[String]) -> String {
     let parent_sl = child_sl + 1;
-    let argv_off = carve_off + temen_ir::POWERBOX_ARGS_BASE;
+    let argv_off = carve_off + args_base;
     let mut blob = Vec::new();
     blob.extend_from_slice(&(argv.len() as u32).to_le_bytes()); // argc
     blob.extend_from_slice(&0u32.to_le_bytes()); // envc
@@ -125,7 +131,13 @@ fn main() {
     let child_sl = (decl + 3).max(24);
     let carve_off = 1u64 << child_sl;
     let parent =
-        temen_text::parse_module(&parent_src(child_sl, carve_off, &argv)).expect("parse parent");
+        temen_text::parse_module(&parent_src(
+            child_sl,
+            carve_off,
+            temen_ir::module_args_base(&child),
+            &argv,
+        ))
+        .expect("parse parent");
     temen_verify::verify_module(&parent).expect("verify parent");
 
     let (factory, handle) = temen_run::fs::mem_fs_shared_factory(seed, vec![]);
