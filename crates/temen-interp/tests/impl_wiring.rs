@@ -80,28 +80,42 @@ fn offer_funcs() -> Arc<[Func]> {
 }
 
 #[test]
-fn intern_is_structural_and_allocates_from_the_base() {
+fn intern_keys_on_names_and_shape_and_allocates_from_the_base() {
     let mut h = Host::new();
+    let names = |ns: &[&str]| ns.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     let a = vec![sig(vec![ValType::I64], vec![ValType::I64])];
     let b = vec![sig(vec![ValType::I64], vec![ValType::I64])];
     let c = vec![sig(vec![ValType::I32], vec![ValType::I64])];
-    let ia = h.intern_interface(&a);
+    let ia = h.intern_interface(&names(&["frob"]), &a);
     assert!(
         ia >= cap_id::GUEST_IMPL_BASE,
         "guest ids allocate above the built-ins"
     );
     assert_eq!(
         ia,
-        h.intern_interface(&b),
-        "structurally identical lists collide to the same id (D59)"
+        h.intern_interface(&names(&["frob"]), &b),
+        "identical (names, shape) lists collide to the same id (#1109)"
     );
     assert_ne!(
         ia,
-        h.intern_interface(&c),
+        h.intern_interface(&names(&["frob"]), &c),
         "structurally distinct lists get distinct ids"
     );
+    // #1109: same shape under a DIFFERENT op name is a distinct interface — names are half the
+    // key, so `self.schema` names are canonical rather than first-interned-wins.
+    assert_ne!(
+        ia,
+        h.intern_interface(&names(&["blit"]), &a),
+        "same shape, different names => distinct ids (names are in the intern key)"
+    );
+    // The anonymous-shape family (a bare fn-list wire) never unifies with a named interface.
+    assert_ne!(
+        ia,
+        h.intern_interface(&[], &a),
+        "an unnamed shape is its own family, distinct from any named interface"
+    );
     // Interning is stable: re-asking never re-allocates.
-    assert_eq!(ia, h.intern_interface(&a));
+    assert_eq!(ia, h.intern_interface(&names(&["frob"]), &a));
 }
 
 #[test]
@@ -111,25 +125,33 @@ fn a_stream_shaped_declaration_interns_to_the_builtin_id() {
     // host-native/guest-impl divide), not a fresh guest id — so a slot requiring that shape
     // accepts a real host handle or a guest impl of it interchangeably.
     let mut h = Host::new();
+    let names = |ns: &[&str]| ns.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     let stream = vec![
         sig(vec![ValType::I64, ValType::I64], vec![ValType::I64]), // read
         sig(vec![ValType::I64, ValType::I64], vec![ValType::I64]), // write
         sig(vec![], vec![]),                                       // close
     ];
     assert_eq!(
-        h.intern_interface(&stream),
+        h.intern_interface(&names(&["read", "write", "close"]), &stream),
         cap_id::STREAM,
-        "the exact stream triple canonicalizes to the built-in Stream id"
+        "the canonical (names, shape) stream triple canonicalizes to the built-in Stream id"
     );
 
-    // A subset (write/close only) is a *different* structural shape — not pre-seeded, so it gets a
+    // #1109 name-strictness: the same shape under different op names is NOT the builtin — you
+    // get Stream's id only by meaning Stream (canonical names and all).
+    assert!(
+        h.intern_interface(&names(&["recv", "send", "drop"]), &stream) >= cap_id::GUEST_IMPL_BASE,
+        "a stream-shaped interface with non-canonical names stays in the guest id space"
+    );
+
+    // A subset (write/close only) is a *different* shape — not pre-seeded, so it gets a
     // fresh guest id above the base. Pre-seeding claims the whole shape, never a prefix of it.
     let subset = vec![
         sig(vec![ValType::I64, ValType::I64], vec![ValType::I64]), // write
         sig(vec![], vec![]),                                       // close
     ];
     assert!(
-        h.intern_interface(&subset) >= cap_id::GUEST_IMPL_BASE,
+        h.intern_interface(&names(&["write", "close"]), &subset) >= cap_id::GUEST_IMPL_BASE,
         "a non-matching shape stays in the guest id space"
     );
 

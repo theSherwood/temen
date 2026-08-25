@@ -11511,11 +11511,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     as u32;
                             let cap = resolve_thread(threads, ch).ok().and_then(|slot| {
                                 let callee = child_hosts.get(&slot).cloned()?;
-                                let sigs = callee.lock_unpoisoned().offer_shape(export)?;
+                                let (names, sigs) = callee.lock_unpoisoned().offer_shape(export)?;
                                 let mut hg = host.lock_unpoisoned();
                                 // §13.4 4d: record the child's join `slot` — the live impl's
                                 // durable structural name, re-linked to the re-created child on thaw.
-                                Some(hg.wire_live_impl_child(&callee, export, &sigs, slot))
+                                Some(hg.wire_live_impl_child(&callee, export, &names, &sigs, slot))
                             });
                             frames[top]
                                 .vals
@@ -15636,12 +15636,21 @@ fn preseeded_iface_shapes() -> [(u32, Vec<(&'static str, FuncType)>); 1] {
     )]
 }
 
-/// The pre-seeded built-in id whose canonical shape structurally equals `sigs`, if any
-/// ([`preseeded_iface_shapes`]). Consulted before allocating a guest id in
-/// [`Host::intern_interface`], so a matching declaration resolves to the built-in.
-fn preseeded_iface_id(sigs: &[FuncType]) -> Option<u32> {
+/// The pre-seeded built-in id whose canonical shape equals `(names, sigs)` — **name-strict**
+/// (#1109): a declaration resolves to the built-in only when its op names match the canonical
+/// ones too, so a same-shaped interface with different names is a distinct guest interface
+/// rather than a silently-unified builtin. Consulted before allocating a guest id in
+/// [`Host::intern_interface`].
+fn preseeded_iface_id(names: &[String], sigs: &[FuncType]) -> Option<u32> {
     preseeded_iface_shapes().into_iter().find_map(|(id, ops)| {
-        (ops.len() == sigs.len() && ops.iter().zip(sigs).all(|((_, s), t)| s == t)).then_some(id)
+        (ops.len() == sigs.len()
+            && ops.len() == names.len()
+            && ops
+                .iter()
+                .zip(sigs)
+                .zip(names)
+                .all(|(((cn, s), t), n)| s == t && cn == n))
+        .then_some(id)
     })
 }
 
@@ -16890,6 +16899,9 @@ pub const CAP_SELF_FUEL_REMAINING: u32 = 13;
 struct LiveImplEntry {
     callee: Arc<Mutex<Host>>,
     export: u32,
+    /// The offer interface's op names (#1109 — half of the intern key beside `sigs`; a child
+    /// re-grant re-interns under the same `(names, sigs)` pair).
+    names: Arc<[String]>,
     sigs: Arc<[FuncType]>,
     /// DURABILITY.md §13.4 slice 4d — the callee's **join slot** in the minting domain (its
     /// structural durable name: `child_hosts`/`threads` are keyed by it). `Some` for a
@@ -17352,11 +17364,13 @@ pub struct Host {
     /// Wired interface offers (IMPORTS.md §3.2), indexed by the id a [`Binding::Offer`]
     /// carries ([`Host::wire_offer_func`]).
     offers: Vec<OfferEntry>,
-    /// The per-`Host` **structural interface intern** (D59 applied to capability interfaces):
-    /// index `i` holds the op-signature list whose interface id is `GUEST_IMPL_BASE + i`, so
-    /// id-equality ≡ structural equality within this table. Flat and scanned linearly — offers
-    /// are few; boring beats a map.
-    iface_intern: Vec<Arc<[FuncType]>>,
+    /// The per-`Host` **interface intern** (D59 applied to capability interfaces, #1109): index
+    /// `i` holds the `(op names, op signatures)` pair whose interface id is `GUEST_IMPL_BASE + i`,
+    /// so id-equality ≡ (names, shape) equality within this table — runtime identity keyed the
+    /// same way binding-time coverage matching is (name-keyed), and `self.schema` reads the
+    /// canonical names back off the id. Flat and scanned linearly — offers are few; boring beats
+    /// a map.
+    iface_intern: Vec<(Arc<[String]>, Arc<[FuncType]>)>,
     /// §3.5 grouped-import **op remaps**, parallel to `import_bindings`: slot `i`'s entry, when
     /// present, maps consumer-local op indices to provider op indices (frozen at the binding
     /// act by the coverage walk). `None` = flat binding (consumer op must be 0).
@@ -19227,6 +19241,7 @@ impl Host {
                     self.live_impls.push(LiveImplEntry {
                         callee: Arc::new(Mutex::new(Host::new())),
                         export,
+                        names: Vec::<String>::new().into(),
                         sigs: Vec::<FuncType>::new().into(),
                         callee_slot: Some(slot as usize),
                     });
@@ -19323,9 +19338,10 @@ impl Host {
     /// structural `type_id` was already reinstated at restore, so the handle keeps resolving).
     /// A missing offer leaves the placeholder (the holder's re-issued call then faults probeably).
     pub fn relink_live_impl(&mut self, idx: u32, callee: Arc<Mutex<Host>>, export: u32) {
-        let sigs = callee.lock_unpoisoned().offer_shape(export);
-        if let (Some(e), Some(sigs)) = (self.live_impls.get_mut(idx as usize), sigs) {
+        let shape = callee.lock_unpoisoned().offer_shape(export);
+        if let (Some(e), Some((names, sigs))) = (self.live_impls.get_mut(idx as usize), shape) {
             e.callee = callee;
+            e.names = names.into();
             e.sigs = sigs.into();
         }
     }
@@ -19657,25 +19673,52 @@ impl Host {
         })
     }
 
-    /// Intern an interface's op-signature list and return its id (IMPORTS.md §3.2): structurally
-    /// identical lists collide to the same id, so **id-equality ≡ structural equality** within
-    /// this `Host` (D59 applied to capability interfaces — a parent-implemented interface is
-    /// typewise indistinguishable from any other structurally-equal one; provenance, not typing,
-    /// is the honest bit, §3.1). Guest ids allocate from [`cap_id::GUEST_IMPL_BASE`] upward — but a
-    /// declaration structurally equal to a **pre-seeded built-in shape** ([`preseeded_iface_shapes`],
-    /// IMPORTS.md §3.5) interns to that built-in's fixed id instead, so a guest that declares (e.g.)
-    /// the `Stream` interface is typewise the same as a real host stream and an import slot requiring
-    /// that shape accepts either. This grants no authority — only a real handle of the matching
+    /// Intern an interface's named op list and return its id (IMPORTS.md §3.2, #1109): identical
+    /// `(names, signatures)` lists collide to the same id, so **id-equality ≡ (names, shape)
+    /// equality** within this `Host` — the same key binding-time coverage matching already uses
+    /// (op names are the binding-time contract), and what makes `self.schema`'s names canonical
+    /// rather than first-interned (owner decision 2026-08-25, #1109; supersedes the shape-only
+    /// D59 reading). Provenance, not typing, stays the honest bit (§3.1). Guest ids allocate from
+    /// [`cap_id::GUEST_IMPL_BASE`] upward — but a declaration equal to a **pre-seeded built-in
+    /// shape** ([`preseeded_iface_shapes`], IMPORTS.md §3.5) *with its canonical op names* interns
+    /// to that built-in's fixed id, so a guest that declares (e.g.) the `Stream` interface —
+    /// names and all — is typewise the same as a real host stream. A same-shaped interface under
+    /// different names is deliberately a **distinct** interface. An empty `names` list is the
+    /// anonymous-shape family (a bare fn-list wire, [`Host::wire_offer_func`]) — it never unifies
+    /// with a named interface. This grants no authority — only a real handle of the matching
     /// [`Binding`] can be called.
-    pub fn intern_interface(&mut self, sigs: &[FuncType]) -> u32 {
-        if let Some(id) = preseeded_iface_id(sigs) {
+    pub fn intern_interface(&mut self, names: &[String], sigs: &[FuncType]) -> u32 {
+        if let Some(id) = preseeded_iface_id(names, sigs) {
             return id;
         }
-        if let Some(i) = self.iface_intern.iter().position(|s| **s == *sigs) {
+        if let Some(i) = self
+            .iface_intern
+            .iter()
+            .position(|(n, s)| **n == *names && **s == *sigs)
+        {
             return cap_id::GUEST_IMPL_BASE + i as u32;
         }
-        self.iface_intern.push(sigs.into());
+        self.iface_intern.push((names.into(), sigs.into()));
         cap_id::GUEST_IMPL_BASE + (self.iface_intern.len() - 1) as u32
+    }
+
+    /// §3.5 `self.schema` backing (#1109): the canonical named op list behind a runtime interface
+    /// id — a pre-seeded built-in's canonical shape, or a guest-interned `(names, sigs)` pair.
+    /// `None` for a handle-typed built-in (no pre-seeded shape) or an unknown id. Read-only,
+    /// authority-neutral reflection (D46: reflection ≠ amplification).
+    pub fn iface_schema(&self, type_id: u32) -> Option<Vec<(String, FuncType)>> {
+        if let Some(ops) = builtin_iface_shape(type_id) {
+            return Some(ops.into_iter().map(|(n, ft)| (n.to_string(), ft)).collect());
+        }
+        let i = type_id.checked_sub(cap_id::GUEST_IMPL_BASE)? as usize;
+        let (names, sigs) = self.iface_intern.get(i)?;
+        Some(
+            names
+                .iter()
+                .cloned()
+                .zip(sigs.iter().cloned())
+                .collect::<Vec<_>>(),
+        )
     }
 
     /// **Wire an interface offer into this domain's table** (IMPORTS.md §3.2) and return the
@@ -19703,7 +19746,8 @@ impl Host {
                 results: funcs[f as usize].results.clone(),
             })
             .collect();
-        let type_id = self.intern_interface(&sigs);
+        // A bare fn-list wire carries no op names — the anonymous-shape family (#1109).
+        let type_id = self.intern_interface(&[], &sigs);
         let idx = self.offers.len() as u32;
         self.offers.push(OfferEntry {
             funcs: Arc::clone(funcs),
@@ -19761,7 +19805,8 @@ impl Host {
             mm.seed_null_guard(temen_ir::module_null_guard(m).unwrap_or(0)); // #964
             mm
         });
-        let type_id = self.intern_interface(&sigs);
+        // A bare fn-list wire carries no op names — the anonymous-shape family (#1109).
+        let type_id = self.intern_interface(&[], &sigs);
         let idx = self.offers.len() as u32;
         self.offers.push(OfferEntry {
             funcs,
@@ -19982,11 +20027,14 @@ impl Host {
     /// so its shape resolves against the callee's own registered module — which, for a
     /// separate-module child, differs from the wirer's. `None` fails the wire closed (no
     /// registered module / malformed export).
-    fn offer_shape(&self, export: u32) -> Option<Vec<FuncType>> {
+    fn offer_shape(&self, export: u32) -> Option<(Vec<String>, Vec<FuncType>)> {
         let m = self.self_module.as_ref()?;
         let e = m.impl_exports.get(export as usize)?;
         let named = m.interface_named_ops(e.interface)?;
-        Some(named.iter().map(|&(_, ft)| ft.clone()).collect())
+        Some((
+            named.iter().map(|(n, _)| n.to_string()).collect(),
+            named.iter().map(|&(_, ft)| ft.clone()).collect(),
+        ))
     }
 
     /// §3.6 slice 3 — mint a **live-callee offer** into this (the wirer's) table: a capability
@@ -20001,10 +20049,11 @@ impl Host {
         &mut self,
         callee: &Arc<Mutex<Host>>,
         export: u32,
+        names: &[String],
         sigs: &[FuncType],
     ) -> Result<i32, Trap> {
         // No §14 child slot behind an embedder wire — non-durable (freeze refuses).
-        Ok(self.install_live_impl(Arc::clone(callee), export, sigs.into(), None))
+        Ok(self.install_live_impl(Arc::clone(callee), export, names.into(), sigs.into(), None))
     }
 
     /// CALLS.md 5c.0 — the `child_offer` (op 14) mint over a **shared** child powerbox, for
@@ -20017,8 +20066,8 @@ impl Host {
     /// `callee_slot: None`: not an interp §14 join slot, so non-durable (freeze refuses, the
     /// [`Host::wire_live_impl`] rule).
     pub fn mint_child_offer(&mut self, callee: &Arc<Mutex<Host>>, export: u32) -> Option<i32> {
-        let sigs = callee.lock_unpoisoned().offer_shape(export)?;
-        Some(self.install_live_impl(Arc::clone(callee), export, sigs.into(), None))
+        let (names, sigs) = callee.lock_unpoisoned().offer_shape(export)?;
+        Some(self.install_live_impl(Arc::clone(callee), export, names.into(), sigs.into(), None))
     }
 
     /// §13.4 slice 4d — `child_offer` (op 14) mint over a §14 child: like [`Self::wire_live_impl`]
@@ -20028,10 +20077,17 @@ impl Host {
         &mut self,
         callee: &Arc<Mutex<Host>>,
         export: u32,
+        names: &[String],
         sigs: &[FuncType],
         callee_slot: usize,
     ) -> i32 {
-        self.install_live_impl(Arc::clone(callee), export, sigs.into(), Some(callee_slot))
+        self.install_live_impl(
+            Arc::clone(callee),
+            export,
+            names.into(),
+            sigs.into(),
+            Some(callee_slot),
+        )
     }
 
     /// Install a live-callee offer entry + grant its handle — shared by the wire
@@ -20041,14 +20097,16 @@ impl Host {
         &mut self,
         callee: Arc<Mutex<Host>>,
         export: u32,
+        names: Arc<[String]>,
         sigs: Arc<[FuncType]>,
         callee_slot: Option<usize>,
     ) -> i32 {
-        let type_id = self.intern_interface(&sigs);
+        let type_id = self.intern_interface(&names, &sigs);
         let idx = self.live_impls.len() as u32;
         self.live_impls.push(LiveImplEntry {
             callee,
             export,
+            names,
             sigs,
             callee_slot,
         });
@@ -20195,8 +20253,8 @@ impl Host {
     /// §3.5 `self.type_id`: intern this domain's declared interface `ty` and return the
     /// runtime id — authority-neutral pure reflection (the shape is the module's own).
     pub fn self_type_id(&mut self, ty: u32) -> Result<u32, Trap> {
-        let (_, sigs) = self.self_iface(ty).ok_or(Trap::CapFault)?;
-        Ok(self.intern_interface(&sigs))
+        let (names, sigs) = self.self_iface(ty).ok_or(Trap::CapFault)?;
+        Ok(self.intern_interface(&names, &sigs))
     }
 
     /// §3.5 `self.covers`: does the live capability behind `handle` **cover** self
@@ -20206,8 +20264,8 @@ impl Host {
         let Some(tid) = self.type_id_of(handle) else {
             return Ok(-9); // EBADF: dead or forged — probeable, never a trap
         };
-        // Exact shape ⇒ covers by construction (same interned id).
-        if tid == self.intern_interface(&sigs) {
+        // Exact (names, shape) ⇒ covers by construction (same interned id, #1109).
+        if tid == self.intern_interface(&names, &sigs) {
             return Ok(1);
         }
         // A wired guest impl may cover a subset requirement — the name-keyed walk.
@@ -20254,7 +20312,7 @@ impl Host {
                 }))
             })
             .clone();
-        let type_id = self.intern_interface(&sigs);
+        let type_id = self.intern_interface(&names, &sigs);
         let idx = self.offers.len() as u32;
         self.offers.push(OfferEntry {
             funcs,
@@ -20323,7 +20381,7 @@ impl Host {
     /// leg of [`Host::regrant_into_child`]): install the entry under **this** host's interned id
     /// for its (unchanged) signature list, one provenance hop deeper, and grant the handle.
     fn adopt_offer(&mut self, entry: OfferEntry) -> i32 {
-        let type_id = self.intern_interface(&entry.sigs);
+        let type_id = self.intern_interface(&entry.names, &entry.sigs);
         let idx = self.offers.len() as u32;
         self.offers.push(OfferEntry {
             type_id,
@@ -21313,11 +21371,16 @@ impl Host {
         // parent introduced. The shape rides the entry (captured at wire), so the child-side
         // intern never touches the callee's lock.
         if let Some(e) = self.resolve_live_impl(handle) {
-            let (callee, export, sigs) = (Arc::clone(&e.callee), e.export, Arc::clone(&e.sigs));
+            let (callee, export, names, sigs) = (
+                Arc::clone(&e.callee),
+                e.export,
+                Arc::clone(&e.names),
+                Arc::clone(&e.sigs),
+            );
             // The callee's join slot is the *parent's* structural name, meaningless in the
             // child's namespace — a re-granted live impl stays non-durable (§13.4 4d follow-up:
             // a re-grant's durable name would be the sibling's provenance path).
-            return Some(child.install_live_impl(callee, export, sigs, None));
+            return Some(child.install_live_impl(callee, export, names, sigs, None));
         }
         // Concurrent stages (STAGE1.md item 6): re-granting a §13 `SharedRegion` aliases the
         // SAME backing into the child's powerbox — the explicit parent↔child / sibling↔sibling
@@ -21861,7 +21924,7 @@ impl Host {
                 let Some(tid) = self.type_id_of(new_handle) else {
                     return Ok(vec![EINVAL]); // dead/forged — probeable, never a trap
                 };
-                let exact = tid == self.intern_interface(req_sigs);
+                let exact = tid == self.intern_interface(req_names, req_sigs);
                 let cover = if exact {
                     Some((0..req_sigs.len() as u32).collect::<Arc<[u32]>>())
                 } else {

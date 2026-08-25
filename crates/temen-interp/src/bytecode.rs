@@ -10437,13 +10437,13 @@ impl CoopSched {
                         .and_then(|cidx| tasks[cidx].env)
                         .map(|k| std::sync::Arc::clone(&extra_envs[k].host));
                     let cap = callee.and_then(|callee: std::sync::Arc<std::sync::Mutex<Host>>| {
-                        let sigs = callee.lock_unpoisoned().offer_shape(export)?;
+                        let (names, sigs) = callee.lock_unpoisoned().offer_shape(export)?;
                         match tasks[ti].env {
-                            None => host.wire_live_impl(&callee, export, &sigs).ok(),
+                            None => host.wire_live_impl(&callee, export, &names, &sigs).ok(),
                             Some(pk) => extra_envs[pk]
                                 .host
                                 .lock_unpoisoned()
-                                .wire_live_impl(&callee, export, &sigs)
+                                .wire_live_impl(&callee, export, &names, &sigs)
                                 .ok(),
                         }
                     });
