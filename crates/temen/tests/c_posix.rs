@@ -232,6 +232,13 @@ fn run_interp_only(src: &str, prep: impl Fn(&Posix)) -> Effects {
 /// the cooperative `drive` (the tier the browser playground runs on). Used to differential the
 /// personality `fork()`/`waitpid()` park engine (#1080 rung 3) against the tree-walker oracle.
 fn run_bytecode_only(src: &str, prep: impl Fn(&Posix)) -> Effects {
+    run_bytecode_setup(src, |_host, posix| prep(posix))
+}
+
+/// [`run_bytecode_only`] with a `|host, posix|` setup callback (e.g. `stage_executable` to register a
+/// `/bin` command before the run) — the bytecode-engine twin of [`run_interp_setup`]. Differentials the
+/// whole external-command flow (fork → execve → waitpid) on the cooperative driver (#1080 rungs 2+3).
+fn run_bytecode_setup(src: &str, extra: impl Fn(&mut Host, &Posix)) -> Effects {
     let ir = c_to_ir(src);
     let raw = parse_module_raw(&ir)
         .unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
@@ -242,7 +249,7 @@ fn run_bytecode_only(src: &str, prep: impl Fn(&Posix)) -> Effects {
             .size_log2;
     let mut ih = Host::new();
     let (iposix, ipx) = setup(&mut ih, win);
-    prep(&iposix);
+    extra(&mut ih, &iposix);
     verify_module(&raw).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
     bind_shim(&raw, &mut ih, ipx);
     let mut fuel = 200_000_000u64;
@@ -3072,6 +3079,46 @@ int main(void) {{\n\
         e.result,
         vec![Value::I32(42)],
         "argv survives a second twin's execve"
+    );
+}
+
+/// #1080 rungs 2+3 combined on the **bytecode engine** — the whole external-command flow: `fork()` (a
+/// twin, rung 3's fork park), the twin `execve`s a staged `/bin` command (rung 2's `env: Some`
+/// image-replace + personality carry — the path only the ignored browser test covered until now), and
+/// the parent `waitpid`s for its exit (rung 3's reap park). This is the native, disk-cheap proof that
+/// bash's fork→exec→wait runs on the playground tier, differentialled against the tree-walker oracle.
+#[test]
+fn c_fork_execve_waitpid_on_bytecode() {
+    const CMD: &str = r#"
+int main(int argc, char **argv) {
+  if (argc != 2) return 80 + argc;
+  if (argv[1][0] != 'x') return 79;
+  return 7;
+}
+"#;
+    let src = format!(
+        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+static char *av[] = {{ \"c\", \"x\", 0 }};\n\
+static int st;\n\
+int main(void) {{\n\
+  long pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 1;\n\
+  if (pid == 0) {{ execve(\"/bin/c\", av, 0); return 99; }}\n\
+  if (__px_waitpid(0, pid, (long)&st, 0) != pid) return 2;\n\
+  if (((st >> 8) & 0xff) != 7) return 3;\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_bytecode_setup(&src, |host, posix| {
+        stage_executable(host, posix, "/bin/c", CMD);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "the bytecode engine forked, the twin execve'd /bin/c (env:Some image-replace), and the parent \
+         reaped its exit 7 — rungs 2+3 combined, matching the tree-walker"
     );
 }
 
