@@ -87,7 +87,7 @@ fn run_temen(wasm: &[u8], reps: usize) -> (i64, Duration) {
     let mut result = 0i64;
     for _ in 0..reps {
         let t0 = Instant::now();
-        let (out, _) = cm.run(&[], None, None, None).expect("temen run");
+        let (out, _) = cm.run(&[], None, None).expect("temen run");
         best = best.min(t0.elapsed());
         result = match out {
             JitOutcome::Returned(v) => v[0],

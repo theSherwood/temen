@@ -79,7 +79,7 @@ fn temen_runner(src: &Path) -> Option<impl FnMut(i64) -> Result<i64, String>> {
         }
     };
     Some(move |n: i64| -> Result<i64, String> {
-        match cm.run(&[sp, n], None, None, None) {
+        match cm.run(&[sp, n], None, None) {
             Ok((temen_jit::JitOutcome::Returned(v), _)) => Ok(v[0]),
             Ok((o, _)) => Err(format!("{o:?}")),
             Err(e) => Err(format!("run err {e:?}")),
