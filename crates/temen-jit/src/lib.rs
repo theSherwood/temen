@@ -172,8 +172,15 @@ pub const fn fiber_supported() -> bool {
 
 /// Largest window the reference JIT will back with a host allocation. Real deployments
 /// reserve a huge guard-paged virtual range (§4); for the differential harness we map
-/// `1 << size_log2` bytes (+ a guard page on unix), so cap it.
-const MAX_JIT_WINDOW_LOG2: u8 = 26; // 64 MiB (the backed `mapped` extent)
+/// `1 << size_log2` bytes (+ a guard page on unix), so cap it. This bounds the harness's
+/// backed allocation only — it is **not** a confinement invariant (the security mask,
+/// `child_size − 1`, holds at any power-of-two size), and the browser wasm-JIT (whose linear
+/// memory grows on demand) has no such cap. Sized (owner-approved 2026-08-25) so the op-13
+/// nimony front-end chain fits: `nimsem`/`hexer` semchecking the system module peak in
+/// (128, 256] MiB, needing a 256 MiB child carve and thus a 512 MiB parent window. `mmap` is
+/// lazy (RSS follows touched pages, not the reservation), so the VA bump is cheap and real fuzz
+/// seeds — far below even the old cap — are unaffected.
+const MAX_JIT_WINDOW_LOG2: u8 = 29; // 512 MiB (the backed `mapped` extent)
 
 /// Largest **reserved** virtual range (the mask domain) the reference JIT will `mmap` per
 /// window. The reservation is `PROT_NONE` + `MAP_NORESERVE`, so this is virtual address space,
