@@ -2645,6 +2645,18 @@ int main(void) {{\n\
         vec![Value::I32(42)],
         "the exec'd command's write flowed through the carried, remapped pipe end; EOF and status reaped"
     );
+    // #1080 rung 4 — the same on the **bytecode engine**: pipe-through-exec (the real `echo … | cmd`
+    // shape). Combines #1086's exec pipe-end carry (the twin `dup2`s + `execve`s, the image-replace
+    // re-installs the write end + fires the exec-remap hook) with the CorePipe read park (the parent
+    // blocks on the empty FIFO) and EOF-on-exit (the exec'd command's teardown releases the end).
+    let eb = run_bytecode_setup(&src, |host, posix| {
+        stage_executable(host, posix, "/bin/wr", WR);
+    });
+    assert_eq!(
+        eb.result,
+        vec![Value::I32(42)],
+        "bytecode: the exec'd command wrote through the carried pipe end, the parent parked + woke, EOF + reap — matching the oracle"
+    );
 }
 
 /// #801 — **`#!` scripts, one level**: `execve` of a memfs file whose first line is
@@ -3030,6 +3042,17 @@ int main(void) {{\n\
         vec![Value::I32(42)],
         "seq | head | wc across three exec boundaries: \"10\\n\", true EOF, three zero statuses"
     );
+    // #1080 rung 4 — the whole three-stage pipeline on the **bytecode engine**: three forks, three
+    // `execve`d coreutils, three CorePipes, all the read parks + carried pipe ends + EOF-on-exit +
+    // reaps composing at once. This is bash's `seq 100 | head -n 10 | wc -l` minus bash itself.
+    let eb = run_bytecode_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["seq", "head", "wc"]);
+    });
+    assert_eq!(
+        eb.result,
+        vec![Value::I32(42)],
+        "bytecode: seq | head | wc — three exec'd stages piped together, \"10\\n\" + true EOF + three reaps, matching the oracle"
+    );
 }
 
 /// #801 coreutils — **parent-fed `sort | uniq -c`**: the parent writes an
@@ -3098,6 +3121,17 @@ int main(void) {{\n\
         e.result,
         vec![Value::I32(42)],
         "parent-fed sort | uniq -c: \"3 a\\n2 b\\n\" and two zero statuses"
+    );
+    // #1080 rung 4 — the same on the **bytecode engine**: the parent feeds the head pipe and closes
+    // it; `sort` (exec'd) blocks reading its whole input until that EOF, then emits — a long read park
+    // resolved by the writer's close — and `uniq -c` collapses it, both across exec boundaries.
+    let eb = run_bytecode_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["sort", "uniq"]);
+    });
+    assert_eq!(
+        eb.result,
+        vec![Value::I32(42)],
+        "bytecode: parent-fed sort | uniq -c parked until the feed closed, then collapsed the run — matching the oracle"
     );
 }
 
