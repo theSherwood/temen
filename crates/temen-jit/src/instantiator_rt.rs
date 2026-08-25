@@ -727,8 +727,11 @@ pub(crate) unsafe extern "C" fn instantiate(
     }
 
     // The carve must be a power-of-two-aligned sub-window within `[0, size)` — a child can only get
-    // what the holder sub-allocates (§14/D19) — and a module child's carve must equal its declared
-    // memory. Bad entry index / size / alignment ⇒ `-EINVAL`.
+    // what the holder sub-allocates (§14/D19) — and a module child's carve must be **at least** its
+    // declared memory (FORK.md §8.6 / #773 — the interp twin funnels op 0/5 through the same shared
+    // `mod_ok`, relaxed to `declared <= carve`). A larger window is a safe superset (confinement,
+    // invariant 2, still masks to the carve) and a malloc child needs the heap room in
+    // `[1<<declared, carve)`. Bad entry index / size / alignment ⇒ `-EINVAL`.
     let entry = entry as u64;
     let child_size = if (0..64).contains(&size_log2) {
         1u64 << size_log2
@@ -736,7 +739,7 @@ pub(crate) unsafe extern "C" fn instantiate(
         0
     };
     let off = off as u64;
-    let mod_ok = mod_mem.is_none_or(|ml| ml == size_log2 as i32);
+    let mod_ok = mod_mem.is_none_or(|ml| ml <= size_log2 as i32);
     let fits = child_size != 0
         && child_size <= size
         && off & (child_size - 1) == 0

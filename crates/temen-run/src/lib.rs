@@ -3552,7 +3552,7 @@ struct JitRun {
 ///
 /// # Safety
 /// `raw_host` (when `locked` is `None`) is a live `*mut Host`; `interrupt` (when `Some`) outlives the
-/// call; the same `cap_thunk`/ctx/resolver contracts as [`run_powerbox_with_deadline_and_quota`].
+/// call; the same `cap_thunk`/ctx/resolver contracts as [`run_powerbox_cfg`].
 #[allow(clippy::too_many_arguments)]
 unsafe fn powerbox_compile_run(
     module: &Module,
@@ -3709,40 +3709,10 @@ unsafe fn powerbox_run_prebuilt(
 /// frontend's `_start` expects, granted in declared order. Returns the outcome and captured
 /// output. `Err` if the (already-verified) module fails to JIT-compile, or if the guest
 /// **traps** (detect-and-kill, §5) — the guest can never corrupt the host. Unbounded execution
-/// (no §5 kill-path); use [`run_powerbox_with_deadline`] to bound a possibly-runaway guest.
+/// (no §5 kill-path); use [`run_powerbox_cfg`] to bound a possibly-runaway guest (deadline/quota) or
+/// to hand it an argv/env.
 pub fn run_powerbox(module: &Module, stdin: &[u8]) -> Result<Run, String> {
-    run_powerbox_with_deadline(module, stdin, None)
-}
-
-/// Like [`run_powerbox`], but arm the §5 fuel/epoch kill-path with `deadline`: a watchdog thread
-/// stops a **runaway** guest (infinite loop / unbounded recursion) `deadline` after it starts,
-/// surfacing as an `Err` (detect-and-kill) instead of hanging the process. `None` ⇒ the ordinary
-/// unbounded run. The watchdog wakes early the moment the run finishes, so a fast program is never
-/// delayed. The `temen-run` CLI reads `TEMEN_DEADLINE_MS` and passes it here; an embedder supplies its
-/// own policy (reading process env vars is the CLI's job, not the library's). Uses the default
-/// (anti-bomb-ceiling) spawn quota — use [`run_powerbox_with_deadline_and_quota`] to tighten it.
-pub fn run_powerbox_with_deadline(
-    module: &Module,
-    stdin: &[u8],
-    deadline: Option<std::time::Duration>,
-) -> Result<Run, String> {
-    run_powerbox_with_deadline_and_quota(module, stdin, deadline, Quota::default())
-}
-
-/// [`run_powerbox_with_deadline`] + a §15 **spawn quota**: cap how many fibers (`cont.new`) and
-/// concurrently-live vCPUs (`thread.spawn`) the guest may create, *below* the fixed anti-bomb
-/// ceilings — DoS *containment* the embedder configures (the deadline bounds runaway *execution*; the
-/// quota bounds runaway *spawning*). The quota binds **both** backends (here, the JIT; the same
-/// [`Quota`] on a [`Host`] would bind the interpreter). Exceeding it detect-and-kills the guest
-/// (`FiberFault`/`ThreadFault`). [`Quota::default`] = the ceilings (unbounded-ish). The `temen-run` CLI
-/// reads `TEMEN_MAX_FIBERS`/`TEMEN_MAX_VCPUS` and passes them here.
-pub fn run_powerbox_with_deadline_and_quota(
-    module: &Module,
-    stdin: &[u8],
-    deadline: Option<std::time::Duration>,
-    quota: Quota,
-) -> Result<Run, String> {
-    run_powerbox_inner(module, stdin, &[], &[], deadline, quota)
+    run_powerbox_cfg(module, stdin, &[], &[], None, Quota::default())
 }
 
 /// Build the §3e powerbox **args buffer** from `args` (the `argv` vector — `args[0]` is the program
@@ -3769,34 +3739,19 @@ fn build_args_blob(args: &[&[u8]], env: &[&[u8]]) -> Result<Vec<u8>, String> {
     Ok(blob)
 }
 
-/// Like [`run_powerbox`], but hand the guest a program-arguments vector (and environment): the
-/// frontend's `_start` for a `main(int, char**)` parses these into `argc`/`argv` (§3e / D44). For a
-/// `main(void)` program the buffer is simply unread. `args[0]` is conventionally the program name;
-/// `env` entries are `KEY=VALUE`. See [`build_args_blob`] for the (bounded) layout.
-pub fn run_powerbox_with_args(
-    module: &Module,
-    stdin: &[u8],
-    args: &[&[u8]],
-    env: &[&[u8]],
-) -> Result<Run, String> {
-    run_powerbox_inner(module, stdin, args, env, None, Quota::default())
-}
-
-/// The full powerbox entry: a program-arguments vector + environment (§3e args buffer) *and* the §5
-/// kill-path `deadline` / §15 spawn `quota`. The `temen-run` CLI uses this to forward its post-`--`
-/// arguments to the guest while still bounding a runaway/spawn-bomb guest.
-pub fn run_powerbox_with_args_and_limits(
-    module: &Module,
-    stdin: &[u8],
-    args: &[&[u8]],
-    env: &[&[u8]],
-    deadline: Option<std::time::Duration>,
-    quota: Quota,
-) -> Result<Run, String> {
-    run_powerbox_inner(module, stdin, args, env, deadline, quota)
-}
-
-fn run_powerbox_inner(
+/// The full powerbox entry — everything [`run_powerbox`]'s simple form fixes to a default, made
+/// explicit: a program-arguments vector `args` + environment `env` (the §3e args buffer — the
+/// frontend's `_start` for `main(int, char**)` parses these into `argc`/`argv`, D44; a `main(void)`
+/// program leaves the buffer unread; `args[0]` is conventionally the program name, `env` entries are
+/// `KEY=VALUE`, see [`build_args_blob`] for the bounded layout), the §5 kill-path `deadline` (a
+/// watchdog thread stops a runaway guest that long after it starts — surfacing as an `Err`, not a
+/// hang — waking early the moment the run finishes; `None` ⇒ unbounded), and the §15 spawn `quota`
+/// (cap fibers/vCPUs below the anti-bomb ceilings; [`Quota::default`] = the ceilings). The `temen-run`
+/// CLI reads `TEMEN_DEADLINE_MS` / `TEMEN_MAX_FIBERS` / `TEMEN_MAX_VCPUS` and forwards its post-`--`
+/// arguments through here; an embedder supplies its own policy (reading process env is the CLI's job,
+/// not the library's). `run_powerbox(m, stdin)` is exactly `run_powerbox_cfg(m, stdin, &[], &[], None,
+/// Quota::default())`.
+pub fn run_powerbox_cfg(
     module: &Module,
     stdin: &[u8],
     args: &[&[u8]],
@@ -3804,8 +3759,8 @@ fn run_powerbox_inner(
     deadline: Option<std::time::Duration>,
     quota: Quota,
 ) -> Result<Run, String> {
-    // Escape gate (fail-closed, §2a): the single chokepoint every public powerbox entry point funnels
-    // through (`run_powerbox*`, `run_powerbox_with_args_and_limits`). Verify here so a library embedder
+    // Escape gate (fail-closed, §2a): the single chokepoint both public powerbox entry points funnel
+    // through (`run_powerbox`, `run_powerbox_cfg`). Verify here so a library embedder
     // calling any of them directly cannot bypass the verifier the CLI (`main.rs`) and guest-driven JIT
     // (`jit_blob_validator`) paths enforce — a verified module is the precondition for escape-freedom.
     // Verification is a single linear pass, negligible beside the JIT compile, so re-checking
@@ -3976,7 +3931,7 @@ impl PowerboxProgram {
         // out), exactly like `run_powerbox`, which passes no args. `run_raw` seeds nothing extra.
         // SAFETY: `self.host` is the same boxed allocation whose address was baked as `cm`'s ctx at
         // compile time; `self.cm` is not moved during the call (we hold `&mut self`). No watchdog is
-        // armed, matching `run_powerbox` (as opposed to `run_powerbox_with_deadline`).
+        // armed, matching `run_powerbox` (as opposed to `run_powerbox_cfg` with a deadline).
         let jr = unsafe { powerbox_run_prebuilt(&mut self.cm, &mut self.host, &[], None) };
         let jr = jr.map_err(|e| format!("JIT run failed: {e:?}"))?;
         // Fold a guest trap into an `Err` with its backtrace + trapping fiber, exactly as `jit_run`.
@@ -4482,7 +4437,7 @@ impl RunConfig {
 
 /// Run `f` with the §5 kill-path armed when `deadline` is `Some`: a watchdog thread sets an interrupt
 /// cell after `deadline` (the JIT polls it at back-edges → detect-and-kill), and wakes early when `f`
-/// returns so a fast run is never delayed. `None` ⇒ no watchdog. Mirrors `run_powerbox_inner`'s arming.
+/// returns so a fast run is never delayed. `None` ⇒ no watchdog. Mirrors `run_powerbox_cfg`'s arming.
 fn with_deadline<T>(
     deadline: Option<std::time::Duration>,
     f: impl FnOnce(Option<&std::sync::Arc<std::sync::atomic::AtomicU64>>) -> T,

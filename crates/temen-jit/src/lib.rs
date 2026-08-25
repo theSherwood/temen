@@ -172,8 +172,15 @@ pub const fn fiber_supported() -> bool {
 
 /// Largest window the reference JIT will back with a host allocation. Real deployments
 /// reserve a huge guard-paged virtual range (§4); for the differential harness we map
-/// `1 << size_log2` bytes (+ a guard page on unix), so cap it.
-const MAX_JIT_WINDOW_LOG2: u8 = 26; // 64 MiB (the backed `mapped` extent)
+/// `1 << size_log2` bytes (+ a guard page on unix), so cap it. This bounds the harness's
+/// backed allocation only — it is **not** a confinement invariant (the security mask,
+/// `child_size − 1`, holds at any power-of-two size), and the browser wasm-JIT (whose linear
+/// memory grows on demand) has no such cap. Sized (owner-approved 2026-08-25) so the op-13
+/// nimony front-end chain fits: `nimsem`/`hexer` semchecking the system module peak in
+/// (128, 256] MiB, needing a 256 MiB child carve and thus a 512 MiB parent window. `mmap` is
+/// lazy (RSS follows touched pages, not the reservation), so the VA bump is cheap and real fuzz
+/// seeds — far below even the old cap — are unaffected.
+const MAX_JIT_WINDOW_LOG2: u8 = 29; // 512 MiB (the backed `mapped` extent)
 
 /// Largest **reserved** virtual range (the mask domain) the reference JIT will `mmap` per
 /// window. The reservation is `PROT_NONE` + `MAP_NORESERVE`, so this is virtual address space,
@@ -949,24 +956,7 @@ pub fn compile_and_run_with_host(
 ) -> Result<JitOutcome, JitError> {
     // Default reservation policy (§4): a large reserved range, only `mapped` backed. Callers
     // wanting a specific reservation use the `_reserved` capture entry.
-    Ok(run_inner(
-        m,
-        func,
-        args,
-        cap_thunk,
-        cap_ctx,
-        None,
-        DEFAULT_RESERVED_LOG2,
-        None,
-        None,
-        None,
-        None,             // no re-granted child powerbox (op 8 → CapFault)
-        None,             // no kill-path armed (use `_interruptible` to arm one)
-        None,             // no fuel budget armed (use `_fuel` to arm one)
-        None,             // no fast cap resolver (use `_fast` to supply one)
-        Quota::default(), // no spawn quota (use a powerbox quota via temen-run)
-    )?
-    .0)
+    Ok(run_inner(m, func, args, cap_thunk, cap_ctx, RunOpts::default())?.0)
 }
 
 /// Like [`compile_and_run_with_host`], but also supply a [`FastCapResolver`] so hot `cap.call`s to
@@ -993,16 +983,11 @@ pub fn compile_and_run_with_host_fast(
         args,
         cap_thunk,
         cap_ctx,
-        None,
-        DEFAULT_RESERVED_LOG2,
-        None,
-        None,
-        None,
-        None, // no re-granted child powerbox (op 8 → CapFault)
-        None, // no kill-path armed
-        None, // no fuel budget armed
-        Some(fast_resolver),
-        quota,
+        RunOpts {
+            fast_resolver: Some(fast_resolver),
+            quota,
+            ..RunOpts::default()
+        },
     )?
     .0)
 }
@@ -1032,16 +1017,10 @@ pub fn compile_and_run_with_host_interruptible(
         args,
         cap_thunk,
         cap_ctx,
-        None,
-        DEFAULT_RESERVED_LOG2,
-        None,
-        None,
-        None,
-        None, // no re-granted child powerbox (op 8 → CapFault)
-        Some(interrupt),
-        None, // no fuel budget armed
-        None, // no fast cap resolver
-        Quota::default(),
+        RunOpts {
+            interrupt: Some(interrupt),
+            ..RunOpts::default()
+        },
     )?
     .0)
 }
@@ -1070,16 +1049,12 @@ pub fn compile_and_run_with_host_interruptible_fast(
         args,
         cap_thunk,
         cap_ctx,
-        None,
-        DEFAULT_RESERVED_LOG2,
-        None,
-        None,
-        None,
-        None, // no re-granted child powerbox (op 8 → CapFault)
-        Some(interrupt),
-        None, // no fuel budget armed
-        Some(fast_resolver),
-        quota,
+        RunOpts {
+            interrupt: Some(interrupt),
+            fast_resolver: Some(fast_resolver),
+            quota,
+            ..RunOpts::default()
+        },
     )?
     .0)
 }
@@ -1110,16 +1085,10 @@ pub fn compile_and_run_with_host_fuel(
         args,
         cap_thunk,
         cap_ctx,
-        None,
-        DEFAULT_RESERVED_LOG2,
-        None,
-        None,
-        None,
-        None, // no re-granted child powerbox (op 8 → CapFault)
-        None, // no async kill-path (the fuel budget bounds the run)
-        Some(fuel),
-        None, // no fast cap resolver
-        Quota::default(),
+        RunOpts {
+            fuel: Some(fuel),
+            ..RunOpts::default()
+        },
     )?
     .0)
 }
@@ -1159,16 +1128,11 @@ pub fn compile_and_run_capture_reserved(
         args,
         empty_cap_thunk,
         core::ptr::null_mut(),
-        Some(init_mem),
-        reserved_log2,
-        None,
-        None,
-        None,
-        None, // no re-granted child powerbox (op 8 → CapFault)
-        None, // no kill-path armed
-        None, // no fuel budget armed
-        None, // no fast cap resolver
-        Quota::default(),
+        RunOpts {
+            init_mem: Some(init_mem),
+            reserved_log2,
+            ..RunOpts::default()
+        },
     )
 }
 
@@ -1195,16 +1159,13 @@ pub fn compile_and_run_capture_sub(
         args,
         empty_cap_thunk,
         core::ptr::null_mut(),
-        Some(init_mem),
-        0, // fully-mapped child (reserved == size); the parent is fully backed
-        None,
-        Some(SubWindow { base, parent_bytes }),
-        None,
-        None, // no re-granted child powerbox (op 8 → CapFault)
-        None, // no kill-path armed
-        None, // no fuel budget armed
-        None, // no fast cap resolver
-        Quota::default(),
+        RunOpts {
+            init_mem: Some(init_mem),
+            // fully-mapped child (reserved == size); the parent is fully backed
+            reserved_log2: 0,
+            sub: Some(SubWindow { base, parent_bytes }),
+            ..RunOpts::default()
+        },
     )
 }
 
@@ -1266,18 +1227,16 @@ pub fn compile_and_run_capture_reserved_with_host_ex(
         args,
         cap_thunk,
         cap_ctx,
-        Some(init_mem),
-        reserved_log2,
-        // Escape-oracle over the §1a growth path: snapshot the low `SNAP_CAP` bytes (not just the
-        // backed prefix) so guest-grown / `unmap`-ed reserved-tail pages are byte-compared too.
-        Some(SNAP_CAP),
-        None,
-        resolve_module,
-        grant_child,
-        None, // no kill-path armed (the differential oracle runs to completion)
-        None, // no fuel budget armed
-        None, // no fast cap resolver
-        Quota::default(),
+        RunOpts {
+            init_mem: Some(init_mem),
+            reserved_log2,
+            // Escape-oracle over the §1a growth path: snapshot the low `SNAP_CAP` bytes (not just the
+            // backed prefix) so guest-grown / `unmap`-ed reserved-tail pages are byte-compared too.
+            snapshot_cap: Some(SNAP_CAP),
+            resolve_module,
+            grant_child,
+            ..RunOpts::default()
+        },
     )
 }
 
@@ -1307,16 +1266,14 @@ pub fn compile_and_run_capture_reserved_with_host_fuel(
         args,
         cap_thunk,
         cap_ctx,
-        Some(init_mem),
-        reserved_log2,
-        Some(SNAP_CAP),
-        None,
-        None,       // no re-granted child powerbox (op 8 → CapFault)
-        None,       // no module resolver (§14 module ops → CapFault)
-        None,       // no kill-path armed
-        Some(fuel), // counted-fuel budget armed — traps OutOfFuel at the shared safepoints
-        None,       // no fast cap resolver
-        Quota::default(),
+        RunOpts {
+            init_mem: Some(init_mem),
+            reserved_log2,
+            snapshot_cap: Some(SNAP_CAP),
+            // counted-fuel budget armed — traps OutOfFuel at the shared safepoints
+            fuel: Some(fuel),
+            ..RunOpts::default()
+        },
     )
 }
 
@@ -1692,23 +1649,72 @@ pub struct SubWindow {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The optional policy knobs [`run_inner`] threads to the lowering + runtime. Every field defaults
+/// to a no-op (the empty-powerbox reservation, no kill-path / fuel / quota / nesting / capture), so a
+/// public entry point sets only the one or two knobs it arms instead of threading ten positional
+/// `None`s. Crate-private — the `compile_and_run*` wrappers are the stable named surface (the
+/// differential harnesses call them by name); this just collapses their shared internal plumbing.
+struct RunOpts<'a> {
+    /// Low bytes to seed the guest window with (and, with `snapshot_cap`, capture back) — escape-oracle.
+    init_mem: Option<&'a [u8]>,
+    /// Reservation policy: mask domain is `[0, 2^reserved_log2)`; `0` ⇒ fully mapped (reserved == size).
+    reserved_log2: u8,
+    /// Bytes of window to snapshot back for the capture (vs. just the backed prefix).
+    snapshot_cap: Option<usize>,
+    /// §14 nested sub-window confinement `[base, base+size)` of a larger parent.
+    sub: Option<SubWindow>,
+    /// §14 module resolver for a guest `instantiate` of a separate-module child.
+    resolve_module: Option<ModuleResolver>,
+    /// op-8 `instantiate_granted` child-powerbox builder/releaser (PROCESS.md S2).
+    grant_child: Option<GrantChildHooks>,
+    /// §5 async kill-path cell, host-written and polled at safepoints.
+    interrupt: Option<*const AtomicU64>,
+    /// Safepoint-anchored counted-fuel budget cell (a deterministic guest budget).
+    fuel: Option<*mut u64>,
+    /// §9/D45 devirtualized fast cap resolver.
+    fast_resolver: Option<FastCapResolver>,
+    /// §15 spawn quota.
+    quota: Quota,
+}
+
+impl Default for RunOpts<'_> {
+    fn default() -> Self {
+        RunOpts {
+            init_mem: None,
+            // The default reservation policy (§4): a large reserved range, only `mapped` backed.
+            reserved_log2: DEFAULT_RESERVED_LOG2,
+            snapshot_cap: None,
+            sub: None,
+            resolve_module: None,
+            grant_child: None,
+            interrupt: None,
+            fuel: None,
+            fast_resolver: None,
+            quota: Quota::default(),
+        }
+    }
+}
+
 fn run_inner(
     m: &IrModule,
     func: FuncIdx,
     args: &[i64],
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
-    init_mem: Option<&[u8]>,
-    reserved_log2: u8,
-    snapshot_cap: Option<usize>,
-    sub: Option<SubWindow>,
-    resolve_module: Option<ModuleResolver>,
-    grant_child: Option<GrantChildHooks>,
-    interrupt: Option<*const AtomicU64>,
-    fuel: Option<*mut u64>,
-    fast_resolver: Option<FastCapResolver>,
-    quota: Quota,
+    opts: RunOpts,
 ) -> Result<(JitOutcome, Vec<u8>), JitError> {
+    let RunOpts {
+        init_mem,
+        reserved_log2,
+        snapshot_cap,
+        sub,
+        resolve_module,
+        grant_child,
+        interrupt,
+        fuel,
+        fast_resolver,
+        quota,
+    } = opts;
     // The historical one-shot lifecycle, now compile → run over the long-lived split
     // (DESIGN.md §22): `CompiledModule` owns the `JITModule` for the whole run and the
     // executable memory is freed when it drops, after `run` returns — behavior-identical

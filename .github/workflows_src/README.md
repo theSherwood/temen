@@ -29,6 +29,16 @@ identical until the next agent edit.
   locally). (Until copied over, both `workflows-in-sync` and `fuzz targets wired` stay red — the expected
   mirror-edit friction; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
 
+- **`excluded-crates-compile` per-PR job (`ci.yml`)** — a new lightweight always-on job that
+  `cargo check`s the two workspace-EXCLUDED crates, `bench/` (pinned stable) and `fuzz/` (pinned
+  `nightly-2026-07-01`, matching the `fuzz` job). Because the always-on `check` job builds only the
+  workspace, an API change in a workspace crate breaks these two silently and reddens only a nightly
+  job — the `align` (E0559) and `CompiledModule::run` 4→3 (E0061) drifts both slipped to nightly this
+  way. This lane catches that class per-PR. `check` only (no link/run) to stay cheap; caches both
+  workspaces via `Swatinem/rust-cache`. Verified locally: `cargo check` is clean for both under
+  `-D warnings`. (Until copied over, the `workflows-in-sync` guard stays red — the expected
+  mirror-edit friction; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
+
 - **I67 apt hardening for the `Install Playwright + Chromium` step (`browser-real` job, #1017)** —
   the one apt consumer the 10-site I67 hardening missed: `npx playwright install --with-deps`
   runs its **own** internal `apt-get update && apt-get install` with the runner's default (azure)

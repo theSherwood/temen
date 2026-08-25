@@ -228,6 +228,46 @@ fn run_interp_only(src: &str, prep: impl Fn(&Posix)) -> Effects {
     }
 }
 
+/// The **bytecode-engine** twin of [`run_interp_only`]: the same guest + personality wiring, driven by
+/// the cooperative `drive` (the tier the browser playground runs on). Used to differential the
+/// personality `fork()`/`waitpid()` park engine (#1080 rung 3) against the tree-walker oracle.
+fn run_bytecode_only(src: &str, prep: impl Fn(&Posix)) -> Effects {
+    run_bytecode_setup(src, |_host, posix| prep(posix))
+}
+
+/// [`run_bytecode_only`] with a `|host, posix|` setup callback (e.g. `stage_executable` to register a
+/// `/bin` command before the run) — the bytecode-engine twin of [`run_interp_setup`]. Differentials the
+/// whole external-command flow (fork → execve → waitpid) on the cooperative driver (#1080 rungs 2+3).
+fn run_bytecode_setup(src: &str, extra: impl Fn(&mut Host, &Posix)) -> Effects {
+    let ir = c_to_ir(src);
+    let raw = parse_module_raw(&ir)
+        .unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
+    let win = 1u64
+        << raw
+            .memory
+            .expect("the frontend declares a window")
+            .size_log2;
+    let mut ih = Host::new();
+    let (iposix, ipx) = setup(&mut ih, win);
+    extra(&mut ih, &iposix);
+    verify_module(&raw).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
+    bind_shim(&raw, &mut ih, ipx);
+    let mut fuel = 200_000_000u64;
+    let ran = temen_interp::bytecode::compile_and_run_with_host(&raw, 0, &[], &mut fuel, &mut ih)
+        .expect("the bytecode engine compiles this module (no declining op)");
+    let (result, exited) = match ran {
+        Ok(v) => (v, None),
+        Err(Trap::Exit(c)) => (Vec::new(), Some(c)),
+        Err(e) => panic!("bytecode trapped: {e:?}\n--- IR ---\n{ir}"),
+    };
+    Effects {
+        result,
+        exited,
+        stdout: iposix.stdout(),
+        file_f: iposix.read_file("f"),
+    }
+}
+
 /// #796 L2 — **async delivery to a running loop**: a signal raised while the guest is compute-bound is
 /// delivered to its handler at a safepoint, with **no `sigcheck` poll** in the loop. The handler sets a
 /// global; the loop (which never polls) observes it and exits. This is the headline "async" win — the
@@ -969,6 +1009,90 @@ int main(void) {
     );
 }
 
+/// #1080 rung 3 — the **same fork + blocking-waitpid witness on the bytecode engine** (the playground
+/// tier). Exercises the ported personality-fork park engine end to end: `fork()` (`ParkEvent::ForkSelf`
+/// → the cooperative driver self-forks a twin), the twin's slow spin, its exit firing the personality
+/// exit hooks (Live → Zombie), and the parent's blocking `waitpid` (`ParkEvent::TaskExit` → park →
+/// re-execute) reading the retired twin's `WEXITSTATUS`. Must agree with the tree-walker oracle above.
+#[test]
+fn c_a_personality_fork_and_waitpid_on_bytecode() {
+    let src = r#"
+long __px_fork(int cap, long a);
+long __px_waitpid(int cap, long pid, long status, long opts);
+long __px_getpid(int cap, long a);
+long __px_getppid(int cap, long a);
+static int status;
+static volatile long acc;
+static long me;
+static long pid;
+static long h;
+int main(void) {
+  me = __px_getpid(0, 0);
+  pid = __px_fork(0, 0);
+  if (pid < 0) return 1;
+  if (pid == 0) {
+    if (__px_getppid(0, 0) != me) return 9;
+    for (long i = 0; i < 30000; i = i + 1) acc = acc + 1;
+    return 7;
+  }
+  if (pid == me) return 2;
+  h = __px_waitpid(0, pid, (long)&status, 0);
+  if (h != pid) return 3;
+  if ((status & 0x7f) != 0) return 4;
+  if (((status >> 8) & 0xff) != 7) return 5;
+  return 42;
+}
+"#;
+    let e = run_bytecode_only(src, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "the bytecode engine forked, blocked in waitpid, and read the twin's exit 7 — matching the \
+         tree-walker (#1080 rung 3: fork/reap park + exit-hook firing on the cooperative driver)"
+    );
+}
+
+/// #1080 rung 3 — the **any-child** blocking wait (`waitpid(-1)` → `ParkEvent::TaskExitAny` → the
+/// driver's `BlockedReapPersonality { child: None }` park) on the bytecode engine. The parent forks a
+/// slow twin and blocks in `waitpid(-1)`; the settle scan wakes it when ANY forked child completes, and
+/// the re-executed wait returns the twin's pid + `WEXITSTATUS`. Differentialled against the tree-walker
+/// (both engines must return 42) — covers the wildcard reap path job control uses.
+#[test]
+fn c_a_personality_fork_and_waitpid_any_child_differential() {
+    let src = r#"
+long __px_fork(int cap, long a);
+long __px_waitpid(int cap, long pid, long status, long opts);
+static int status;
+static volatile long acc;
+static long pid;
+int main(void) {
+  pid = __px_fork(0, 0);
+  if (pid < 0) return 1;
+  if (pid == 0) {
+    for (long i = 0; i < 30000; i = i + 1) acc = acc + 1;  /* slow: the parent must BLOCK */
+    return 7;
+  }
+  long h = __px_waitpid(0, -1, (long)&status, 0);          /* ANY child, blocking */
+  if (h != pid) return 3;                                   /* reaped the twin, got its pid */
+  if ((status & 0x7f) != 0) return 4;                       /* clean exit, not a signal death */
+  if (((status >> 8) & 0xff) != 7) return 5;                /* WEXITSTATUS = the twin's 7 */
+  return 42;
+}
+"#;
+    let interp = run_interp_only(src, |_| {});
+    assert_eq!(
+        interp.result,
+        vec![Value::I32(42)],
+        "tree-walker any-child reap"
+    );
+    let byte = run_bytecode_only(src, |_| {});
+    assert_eq!(
+        byte.result,
+        vec![Value::I32(42)],
+        "bytecode any-child (waitpid(-1)) reap matched the oracle"
+    );
+}
+
 /// #799 — **fork × default-actions × blocking-waitpid, personality-only**: the parent forks a
 /// runaway twin (spins forever, no handlers), kills it with an unhandled `SIGTERM` (#796's
 /// default-terminate through the kill door — the twin's doors minted at fork), and the blocking
@@ -1048,6 +1172,172 @@ int main(void) {
         e.result,
         vec![Value::I32(42)],
         "the fork twin drained the parent's pre-fork pipe bytes through its inherited fd copy"
+    );
+}
+
+/// #1080 rung 4 — a **blocking pipe read across fork on the bytecode engine** (the `echo … | cat`
+/// shape): the parent forks a writer twin and closes its own write copy; the twin spins slow then
+/// writes and exits. The parent's first `read` BLOCKS on the empty FIFO (`Blocked::PipeRead` → the
+/// cooperative driver's `BlockedPipeRead`, woken by the settle-scan readiness poll when the twin's
+/// bytes land); the second `read` BLOCKS then EOFs (0) when the twin's exit drops its write end
+/// (writers → 0). Differentialled against the tree-walker (both engines return 42).
+#[test]
+fn c_a_blocking_pipe_read_across_fork_on_bytecode() {
+    // Uses the #972 CorePipe (`PIPE_SHIM`: `pipe`/`read`/`write`/`close` over `__vm_*` with parking) —
+    // bash's actual pipe path — not the personality `__px_pipe` (no writer-count blocking).
+    let src = format!(
+        "{WIN_PAD_17}{PIPE_SHIM}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+static int fds[2];\n\
+static int status;\n\
+static char b[8];\n\
+static volatile long acc;\n\
+static long pid;\n\
+int main(void) {{\n\
+  if (pipe(fds) != 0) return 1;\n\
+  pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 2;\n\
+  if (pid == 0) {{\n\
+    close(fds[0]);                                       /* twin: drop the read end */\n\
+    for (long i = 0; i < 30000; i = i + 1) acc = acc + 1; /* slow: the parent's read must BLOCK */\n\
+    write(fds[1], \"hi!\", 3);\n\
+    return 7;                                            /* exit closes the twin's write end -> EOF */\n\
+  }}\n\
+  long n = read(fds[0], b, 8);                           /* BLOCKS (parent+twin hold write ends) */\n\
+  if (n != 3) return 300 + (int)n;\n\
+  if (b[0] != 'h' || b[1] != 'i' || b[2] != '!') return 4;\n\
+  close(fds[1]);                                         /* drop the parent's write end; the twin exited */\n\
+  long m = read(fds[0], b, 8);                           /* EOF (0): no writers remain */\n\
+  if (m != 0) return 400 + (int)m;\n\
+  if (__px_waitpid(0, pid, (long)&status, 0) != pid) return 6;\n\
+  if (((status >> 8) & 0xff) != 7) return 8;\n\
+  return 42;\n\
+}}\n"
+    );
+    let interp = run_interp_only(&src, |_| {});
+    assert_eq!(
+        interp.result,
+        vec![Value::I32(42)],
+        "tree-walker blocking pipe read across fork"
+    );
+    let byte = run_bytecode_only(&src, |_| {});
+    assert_eq!(
+        byte.result,
+        vec![Value::I32(42)],
+        "bytecode: blocking pipe read parked + woken by the writer twin, EOF on its exit — matching the oracle"
+    );
+}
+
+/// #1080 rung 4 (backpressure) — a **blocking pipe WRITE across fork on the bytecode engine** (the
+/// `yes | head` shape's backpressure): the writer twin pushes 96 KiB (> `PIPE_CAP` = 64 KiB) into the
+/// FIFO, so once it fills the twin PARKS (`Blocked::PipeWrite` → the cooperative driver's
+/// `BlockedPipeWrite`, re-admitted by the settle poll when the reader opens room); the parent drains
+/// all of it. Both engines return 42 (the full 96 KiB round-tripped only because the write parked +
+/// resumed — a lost wake would deadlock or short the count).
+#[test]
+fn c_a_blocking_pipe_write_backpressure_across_fork_on_bytecode() {
+    let src = format!(
+        "{WIN_PAD_17}{PIPE_SHIM}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+static int fds[2];\n\
+static int status;\n\
+static char buf[4096];\n\
+static char rb[4096];\n\
+static long pid;\n\
+int main(void) {{\n\
+  if (pipe(fds) != 0) return 1;\n\
+  for (int i = 0; i < 4096; i = i + 1) buf[i] = 'x';\n\
+  pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 2;\n\
+  if (pid == 0) {{\n\
+    close(fds[0]);                                       /* twin: writer only */\n\
+    long total = 0;\n\
+    while (total < 98304) {{                             /* 96 KiB > PIPE_CAP -> PARKS when full */\n\
+      long want = 98304 - total; if (want > 4096) want = 4096;\n\
+      long w = write(fds[1], buf, want);                /* partial near-full; parks at full */\n\
+      if (w <= 0) return 50;\n\
+      total = total + w;\n\
+    }}\n\
+    return 7;\n\
+  }}\n\
+  close(fds[1]);                                         /* parent: reader only */\n\
+  long got = 0;\n\
+  for (;;) {{\n\
+    long n = read(fds[0], rb, 4096);\n\
+    if (n <= 0) break;                                  /* EOF when the twin exits */\n\
+    got = got + n;\n\
+  }}\n\
+  if (got != 98304) return 300 + (int)(got >> 12);\n\
+  if (__px_waitpid(0, pid, (long)&status, 0) != pid) return 6;\n\
+  if (((status >> 8) & 0xff) != 7) return 8;\n\
+  return 42;\n\
+}}\n"
+    );
+    let interp = run_interp_only(&src, |_| {});
+    assert_eq!(
+        interp.result,
+        vec![Value::I32(42)],
+        "tree-walker pipe-write backpressure across fork"
+    );
+    let byte = run_bytecode_only(&src, |_| {});
+    assert_eq!(
+        byte.result,
+        vec![Value::I32(42)],
+        "bytecode: the writer twin parked on the full FIFO and resumed as the parent drained — 96 KiB round-tripped"
+    );
+}
+
+/// #1080 rung 4 (EPIPE) — a parked writer **wakes to `-EPIPE` when the reader closes** (the `yes | head`
+/// tail): the writer twin fills the FIFO and PARKS; the parent drains one chunk then closes the read end
+/// (readers → 0). The settle poll re-admits the parked writer via `pipe_write_ready`'s readers-gone arm,
+/// and its re-issued `write` returns `-EPIPE` (the twin ignores SIGPIPE, so it sees the errno, not death)
+/// — the reader-gone wake path the backpressure test does not hit. Differentialled against the oracle.
+#[test]
+fn c_a_parked_writer_epipes_when_the_reader_closes_on_bytecode() {
+    let src = format!(
+        "{WIN_PAD_17}{PIPE_SHIM}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_signal(int cap, long signum, long handler);\n\
+static int fds[2];\n\
+static int status;\n\
+static char buf[4096];\n\
+static char rb[4096];\n\
+static long pid;\n\
+int main(void) {{\n\
+  if (pipe(fds) != 0) return 1;\n\
+  pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 2;\n\
+  if (pid == 0) {{\n\
+    __px_signal(0, 13, 1);                              /* SIG_IGN SIGPIPE: write returns -EPIPE */\n\
+    close(fds[0]);\n\
+    for (;;) {{\n\
+      long w = write(fds[1], buf, 4096);               /* fills -> PARKS; reader-close -> -EPIPE */\n\
+      if (w == -32) return 9;                           /* EPIPE detected -> clean exit 9 */\n\
+      if (w <= 0) return 50;\n\
+    }}\n\
+  }}\n\
+  if (read(fds[0], rb, 4096) <= 0) return 3;            /* drain one chunk (wakes the twin to refill) */\n\
+  close(fds[0]);                                        /* reader gone -> the twin's parked write EPIPEs */\n\
+  close(fds[1]);\n\
+  if (__px_waitpid(0, pid, (long)&status, 0) != pid) return 6;\n\
+  if (((status >> 8) & 0xff) != 9) return 300 + (int)((status >> 8) & 0xff);\n\
+  return 42;\n\
+}}\n"
+    );
+    let interp = run_interp_only(&src, |_| {});
+    assert_eq!(
+        interp.result,
+        vec![Value::I32(42)],
+        "tree-walker parked-writer EPIPE on reader close"
+    );
+    let byte = run_bytecode_only(&src, |_| {});
+    assert_eq!(
+        byte.result,
+        vec![Value::I32(42)],
+        "bytecode: the parked writer woke to -EPIPE when the reader closed — matching the oracle"
     );
 }
 
@@ -2355,6 +2645,18 @@ int main(void) {{\n\
         vec![Value::I32(42)],
         "the exec'd command's write flowed through the carried, remapped pipe end; EOF and status reaped"
     );
+    // #1080 rung 4 — the same on the **bytecode engine**: pipe-through-exec (the real `echo … | cmd`
+    // shape). Combines #1086's exec pipe-end carry (the twin `dup2`s + `execve`s, the image-replace
+    // re-installs the write end + fires the exec-remap hook) with the CorePipe read park (the parent
+    // blocks on the empty FIFO) and EOF-on-exit (the exec'd command's teardown releases the end).
+    let eb = run_bytecode_setup(&src, |host, posix| {
+        stage_executable(host, posix, "/bin/wr", WR);
+    });
+    assert_eq!(
+        eb.result,
+        vec![Value::I32(42)],
+        "bytecode: the exec'd command wrote through the carried pipe end, the parent parked + woke, EOF + reap — matching the oracle"
+    );
 }
 
 /// #801 — **`#!` scripts, one level**: `execve` of a memfs file whose first line is
@@ -2740,6 +3042,17 @@ int main(void) {{\n\
         vec![Value::I32(42)],
         "seq | head | wc across three exec boundaries: \"10\\n\", true EOF, three zero statuses"
     );
+    // #1080 rung 4 — the whole three-stage pipeline on the **bytecode engine**: three forks, three
+    // `execve`d coreutils, three CorePipes, all the read parks + carried pipe ends + EOF-on-exit +
+    // reaps composing at once. This is bash's `seq 100 | head -n 10 | wc -l` minus bash itself.
+    let eb = run_bytecode_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["seq", "head", "wc"]);
+    });
+    assert_eq!(
+        eb.result,
+        vec![Value::I32(42)],
+        "bytecode: seq | head | wc — three exec'd stages piped together, \"10\\n\" + true EOF + three reaps, matching the oracle"
+    );
 }
 
 /// #801 coreutils — **parent-fed `sort | uniq -c`**: the parent writes an
@@ -2808,6 +3121,17 @@ int main(void) {{\n\
         e.result,
         vec![Value::I32(42)],
         "parent-fed sort | uniq -c: \"3 a\\n2 b\\n\" and two zero statuses"
+    );
+    // #1080 rung 4 — the same on the **bytecode engine**: the parent feeds the head pipe and closes
+    // it; `sort` (exec'd) blocks reading its whole input until that EOF, then emits — a long read park
+    // resolved by the writer's close — and `uniq -c` collapses it, both across exec boundaries.
+    let eb = run_bytecode_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["sort", "uniq"]);
+    });
+    assert_eq!(
+        eb.result,
+        vec![Value::I32(42)],
+        "bytecode: parent-fed sort | uniq -c parked until the feed closed, then collapsed the run — matching the oracle"
     );
 }
 
@@ -2996,6 +3320,46 @@ int main(void) {{\n\
         e.result,
         vec![Value::I32(42)],
         "argv survives a second twin's execve"
+    );
+}
+
+/// #1080 rungs 2+3 combined on the **bytecode engine** — the whole external-command flow: `fork()` (a
+/// twin, rung 3's fork park), the twin `execve`s a staged `/bin` command (rung 2's `env: Some`
+/// image-replace + personality carry — the path only the ignored browser test covered until now), and
+/// the parent `waitpid`s for its exit (rung 3's reap park). This is the native, disk-cheap proof that
+/// bash's fork→exec→wait runs on the playground tier, differentialled against the tree-walker oracle.
+#[test]
+fn c_fork_execve_waitpid_on_bytecode() {
+    const CMD: &str = r#"
+int main(int argc, char **argv) {
+  if (argc != 2) return 80 + argc;
+  if (argv[1][0] != 'x') return 79;
+  return 7;
+}
+"#;
+    let src = format!(
+        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+static char *av[] = {{ \"c\", \"x\", 0 }};\n\
+static int st;\n\
+int main(void) {{\n\
+  long pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 1;\n\
+  if (pid == 0) {{ execve(\"/bin/c\", av, 0); return 99; }}\n\
+  if (__px_waitpid(0, pid, (long)&st, 0) != pid) return 2;\n\
+  if (((st >> 8) & 0xff) != 7) return 3;\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_bytecode_setup(&src, |host, posix| {
+        stage_executable(host, posix, "/bin/c", CMD);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "the bytecode engine forked, the twin execve'd /bin/c (env:Some image-replace), and the parent \
+         reaped its exit 7 — rungs 2+3 combined, matching the tree-walker"
     );
 }
 

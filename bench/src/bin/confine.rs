@@ -113,7 +113,7 @@ fn temenjit_runner(cfile: &Path, small: i64) -> Option<(impl FnMut(i64) -> i64, 
     let (module, sp, e) = translate(cfile)?;
     let mut cm = temen_jit::compile(&module, e).ok()?;
     let mut runner = move |n: i64| -> i64 {
-        match cm.run(&[sp, n], None, None, None).expect("temen-jit run") {
+        match cm.run(&[sp, n], None, None).expect("temen-jit run") {
             (temen_jit::JitOutcome::Returned(v), _) => v[0],
             (other, _) => panic!("temen-jit did not return: {other:?}"),
         }

@@ -120,6 +120,22 @@ if [ -x "$HEXER_BIN" ]; then
   else
     echo "FAILED (chain): .x.nif differs"; cmp "$od/$sys.x.nif" "$chainout/nimcache/$sys.x.nif" | head -1; exit 1
   fi
+
+  # ---- [7/7] the SAME chain, but every phase op-13-spawned on the CRANELIFT JIT --------------------
+  # The tier-up-capable engine a browser wasm-JIT compile card uses. The op-13 `mod_ok` relaxation
+  # (`declared <= carve`, matching the interpreter — FORK.md §8.6 / #773) is what lets these
+  # malloc-heavy phases carve heap room on emitted code. Oracle: the SAME native hexer `.x.nif` as
+  # [6/6] (the two nimsems' `.s.nif` differ only in embedded paths, so hexer's lowering is compared).
+  echo "=== [7/7] the front-end chain on the JIT: nimsem -> hexer, both op-13 children on emitted code ==="
+  jchainout="$CACHE/jit_chain_out"; rm -rf "$jchainout"; mkdir -p "$jchainout"
+  cargo run -q --release -p temen-run --example nim_chain_op13_jit -- \
+    "$CACHE/nimsem_ce_raw.temen" "$CACHE/hexer_ce_raw.temen" "$CACHE/nifler.temen" "$BIN/../lib" \
+    "$W/nimcache/$sys.p.nif" "$sys" "$jchainout"
+  if diff -q "$od/$sys.x.nif" "$jchainout/nimcache/$sys.x.nif" >/dev/null; then
+    echo "JIT CHAIN MATCHES NATIVE — nimsem->hexer both op-13 §14 children on the Cranelift JIT; the Leng .x.nif is byte-identical to native hexer. The nimony front-end self-hosts on Temen's JIT as a chain of confined op-13 phases — the enabler for the browser wasm-JIT compile card."
+  else
+    echo "FAILED (JIT chain): .x.nif differs"; cmp "$od/$sys.x.nif" "$jchainout/nimcache/$sys.x.nif" | head -1; exit 1
+  fi
 else
-  echo "SKIP [6/6] chain: native hexer binary absent ($HEXER_BIN)"
+  echo "SKIP [6/6]+[7/7] chain: native hexer binary absent ($HEXER_BIN)"
 fi
