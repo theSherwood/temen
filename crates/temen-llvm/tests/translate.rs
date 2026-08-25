@@ -12602,6 +12602,15 @@ fn demo_bash_translates_and_verifies() {
         "echo $(( -7 % 3 )) $(( 2**10 )) $(( 0xff | 2#1010 ))",
         "declare -A c; for w in a b a c a b; do ((c[$w]++)); done; for k in a b c; do echo \"$k=${c[$k]}\"; done",
         "s=0; for n in 1 2 3 4 5; do s=$((s+n)); done; echo \"sum=$s\"; [[ $s -eq 15 ]] && exit 0 || exit 1",
+        // Round 4 — whole multi-line programs (integration: functions + arrays + recursion +
+        // string ops together), differential-verified against native. Recursive quicksort:
+        "qsort() { local -a a=(\"$@\"); (( ${#a[@]} <= 1 )) && { echo \"${a[@]}\"; return; }; \
+         local p=${a[0]} lo=() hi=() x; for x in \"${a[@]:1}\"; do if (( x < p )); then \
+         lo+=(\"$x\"); else hi+=(\"$x\"); fi; done; \
+         echo \"$(qsort \"${lo[@]}\") $p $(qsort \"${hi[@]}\")\"; }; qsort 5 2 8 1 9 3 7 4 6 0",
+        // A key=value state-machine parse (IFS read into an array + trim + %%/# expansions):
+        "input='name=alice; age=30; city=wonderland'; IFS=';' read -ra ps <<< \"$input\"; \
+         for p in \"${ps[@]}\"; do p=\"${p# }\"; echo \"[${p%%=*}] -> [${p#*=}]\"; done",
     ] {
         let config = temen_run::RunConfig {
             args: vec![b"bash".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()],
@@ -12678,6 +12687,10 @@ fn demo_bash_translates_and_verifies() {
         "echo viaPATH | cat",
         "seq 5 | head -n 2",
         "seq 9 | head -3", // #802 round 3 — the POSIX `-N` shorthand (was unrecognized → all lines)
+        // #802 round 4 — a word-frequency counter over the staged /bin (assoc-array keys piped
+        // through the new `tr` coreutil into `sort`): the integration `tr` was added for.
+        "declare -A f; for w in the cat sat on the mat the cat ran; do (( f[$w]++ )); done; \
+         for k in $(echo \"${!f[@]}\" | tr ' ' '\\n' | sort); do printf '%s:%d\\n' \"$k\" \"${f[$k]}\"; done",
         "seq 100 | wc -l",
         "x=$(seq 3 | wc -l); echo \"n=$x\"",
         "true && echo t; false || echo f",

@@ -270,6 +270,20 @@ taught the demo `/bin/head` the POSIX `-N` shorthand (`head -1`, as `declare -f 
 Pinned by a dozen capstone scripts (the `%()T` formats, the trap/`set -e`/getopts/arith/assoc set, and
 `seq 9 | head -3`).
 
+## Differential round 4 (DONE) — whole real programs
+
+Ran self-contained multi-line bash *programs* end-to-end vs native (the #802 "script suite" goal),
+not one-liners: a recursive quicksort, an RPN calculator, a key=value state-machine parser, memoized
+fibonacci, a retry loop with an EXIT trap, a getopts app, string tools, a recursive case-dispatcher,
+and a word-frequency counter. **They all run correctly** — no new bash/interp bug surfaced, strong
+viability evidence. The only gap was a *missing* coreutil: `tr` wasn't staged, so `tr`-based pipelines
+(word frequency) produced nothing. Added a small chibicc-safe `tr` (`SET1→SET2` translate, `-d`
+delete, `\n`/`\t` escapes, `a-z` ranges) to `posix_utils` + `stage_bin.sh`. (Also noted: deep
+recursion through `$(...)` command-substitution — e.g. un-memoized fib(10) — is *correct* but slow,
+since each call forks a subshell and svm forks are heavier than native; a perf characteristic, not a
+bug.) Pinned by three whole-program capstone scripts (quicksort, the state-machine parse, the
+`tr`+`sort` word-frequency counter).
+
 ## What remains (the slice ladder from the #802 sketch)
 
 - The `^D`-EOF nuance (the one-shot EOF is writer-count state, so the shell's next read can
