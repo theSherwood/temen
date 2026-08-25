@@ -1093,6 +1093,61 @@ int main(void) {
     );
 }
 
+/// #1080 pipeline rung — a **nested fork + blocking wait**: a forked twin ITSELF forks a grandchild
+/// and blocks in `waitpid` for it, then the root reaps the twin. This is exactly the shape a real-bash
+/// pipeline stage takes (the shell forks a subshell per stage; a stage running an external command forks
+/// again and waits), and it is the first differential where a **forked child** — not the root — is the
+/// one that parks in `waitpid`. On the bytecode cooperative engine the reproduction target is the
+/// browser pipeline deadlock (`echo | cat`), where the subshell's `waitpid` busy-loops on `-ECHILD`
+/// instead of parking. Both engines must return 42.
+#[test]
+fn c_a_nested_fork_twin_blocks_on_grandchild_differential() {
+    let src = r#"
+long __px_fork(int cap, long a);
+long __px_waitpid(int cap, long pid, long status, long opts);
+static int st1;
+static int st2;
+static volatile long acc;
+static long p1;
+static long p2;
+int main(void) {
+  p1 = __px_fork(0, 0);                       /* root forks twin1 (the "subshell") */
+  if (p1 < 0) return 1;
+  if (p1 == 0) {
+    p2 = __px_fork(0, 0);                      /* twin1 forks a grandchild (the "command") */
+    if (p2 < 0) return 21;
+    if (p2 == 0) {
+      for (long i = 0; i < 30000; i = i + 1) acc = acc + 1;  /* slow: twin1 must BLOCK */
+      return 7;                                /* grandchild exits 7 */
+    }
+    long h2 = __px_waitpid(0, p2, (long)&st2, 0);  /* twin1 blocks on its grandchild */
+    if (h2 != p2) return 22;
+    if ((st2 & 0x7f) != 0) return 23;
+    if (((st2 >> 8) & 0xff) != 7) return 24;
+    return 11;                                 /* twin1 exits 11 */
+  }
+  long h1 = __px_waitpid(0, p1, (long)&st1, 0);    /* root blocks on twin1 */
+  if (h1 != p1) return 3;
+  if ((st1 & 0x7f) != 0) return 4;
+  if (((st1 >> 8) & 0xff) != 11) return 5;
+  return 42;
+}
+"#;
+    let interp = run_interp_only(src, |_| {});
+    assert_eq!(
+        interp.result,
+        vec![Value::I32(42)],
+        "tree-walker: twin1 forked a grandchild, blocked in waitpid for it, then the root reaped twin1"
+    );
+    let byte = run_bytecode_only(src, |_| {});
+    assert_eq!(
+        byte.result,
+        vec![Value::I32(42)],
+        "bytecode: a forked twin's OWN blocking waitpid on its grandchild must park + reap like the \
+         oracle (the pipeline-subshell shape behind the `echo | cat` browser deadlock)"
+    );
+}
+
 /// #799 — **fork × default-actions × blocking-waitpid, personality-only**: the parent forks a
 /// runaway twin (spins forever, no handlers), kills it with an unhandled `SIGTERM` (#796's
 /// default-terminate through the kill door — the twin's doors minted at fork), and the blocking

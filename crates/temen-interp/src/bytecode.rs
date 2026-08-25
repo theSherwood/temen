@@ -10797,6 +10797,14 @@ impl CoopSched {
                             tasks[ti].vt.active.set(dst, Reg::from_i64(super::EAGAIN));
                         }
                         Some((twin_fuel, twin_mem, twin_host)) => {
+                            // #1080 pipeline rung — wire the twin's OWN park door. `fork_powerbox` mints
+                            // the twin's personality with `park_req: None` (the door "lands at mint");
+                            // the driver must install it, exactly as the tree-walker wires each child's
+                            // door at fork and as the root got it at run start. Without this a forked
+                            // twin's own `fork()`/`waitpid()` finds no park delegate and fails closed
+                            // (`-ENOSYS`/`-ECHILD`) — so a bash pipeline SUBSHELL (itself a twin) cannot
+                            // fork+wait its command, wedging `echo | cat` in a waitpid busy-loop.
+                            twin_host.wire_park_door();
                             // The twin's continuation is the parent's, at the post-fork resume point,
                             // with the return-twice `0` (the parent keeps the twin's pid, set below). A
                             // bare root carries no resume chain / invoke (`Vm` derives `Clone`).
