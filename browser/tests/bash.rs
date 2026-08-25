@@ -5,12 +5,18 @@
 //! bash is **GPLv3 and never vendored** (`demos/bash/build_bitcode.sh` fetches it from ftp.gnu.org),
 //! so there is no committed `bash.temen` fixture the way `shell.temen` is committed — it is a
 //! build-at-deploy asset. These tests therefore **gate on the locally-built asset**: point
-//! `TEMEN_BASH_TEMEN` at a `bash.temen` (default `/tmp/temen_bash_cache/bash.temen`, where
-//! `bash_asset` writes it), or the test skips-loud like the #802 capstone does offline. Build it with:
-//!   (cd crates/temen-run/demos/bash && ./build_bitcode.sh)
-//!   (cd crates/temen-llvm && cargo build --release --example bash_asset \
-//!      && ./target/release/examples/bash_asset /tmp/temen_bash_cache/bash_linked.ll \
-//!         /tmp/temen_bash_cache/bash.temen)
+//! `TEMEN_BASH_TEMEN` at a `bash.temen` (default `/tmp/temen_bash_cache/bash.temen`), or the test
+//! skips-loud like the #802 capstone does offline. Build it with the on-ramp translator (the same
+//! `temen-llvm-translate` binary the browser Postgres asset uses), matching the browser host:
+//!   (cd crates/temen-run/demos/bash && ./build_bitcode.sh)        # → bash_linked.ll
+//!   (cd crates/temen-llvm && cargo build --release --bin temen-llvm-translate \
+//!      && ./target/release/temen-llvm-translate /tmp/temen_bash_cache/bash_linked.ll \
+//!         -o /tmp/temen_bash_cache/bash.temen --host-page 65536 --stub-externs --null-guard)
+//! `--null-guard` is **required**, not optional: the coreutils in `/bin` (chibicc `--child-entry`)
+//! are guarded, so their args base is `guard+128`; bash's `execve` must write the child argv to the
+//! same place, which it only does when bash is guarded too. A guard-0 bash writes argv at 128 and the
+//! guarded `seq`/`echo` read an empty region at 16512 (external commands run argv-less). `--host-page
+//! 65536` matches the wasm host's 64 KiB pages (D40), as for every browser-target asset.
 
 use temen_browser::{bash_exec, bash_exec_with, STATUS_EXIT};
 
@@ -148,15 +154,12 @@ fn bash_dash_c_external_seq_last() {
 /// than exec-the-last-command). `bash -c 'seq 2; echo done'` forks a twin for `seq 2`, the twin
 /// image-replaces with `/bin/seq`, bash reaps it, then runs the builtin `echo done` and exits.
 ///
-/// `#[ignore]`d, and results are NOT yet trustworthy: the browser E2E ran, but the local `bash.temen`
-/// predates the rung-2/3/4 merges (a stale, wire-format-coupled asset), and even the previously-green
-/// root-exec case (`bash -c 'seq 3'`) now fails locally — a strong sign of ASSET DRIFT, not an engine
-/// bug. The observed symptom here was fork worked (no "fork: Unknown error" — rung 3) but `seq`'s stdout
-/// was missing (`"done\n"` only). **Prerequisite before treating any of this as a real bug: rebuild
-/// `bash.temen` against the current toolchain (`scripts/rebuild-assets.sh` / `bash_asset`) and re-run.**
-/// The fork/exec/wait/pipe primitives are all validated by the native differentials regardless.
+/// The whole fork-twin-exec argv path composes on the bytecode engine: the twin `execve`s `/bin/seq`
+/// carrying bash's fd 1, bash reaps it, then the builtin `echo done` runs. Gates on the deploy-built
+/// `bash.temen` (skips-loud when absent). NB: the asset must be built with `--null-guard` so bash's
+/// args base (`guard+128`) matches the guarded coreutils' — a guard-mismatched bash writes the child
+/// argv where the coreutil never reads it (an earlier stale-`bash_linked.ll` symptom; see header doc).
 #[test]
-#[ignore = "unconfirmed pending a fresh bash.temen (local asset is pre-merge/stale — even seq-3 root exec fails locally); rebuild the asset before treating as an engine bug"]
 fn bash_dash_c_external_seq_forked() {
     let Some(bash) = load_bash() else {
         eprintln!("note: skipping bash_dash_c_external_seq_forked — no bash.temen");
@@ -193,13 +196,16 @@ fn bash_dash_c_external_seq_forked() {
 /// both stages, wires a CorePipe between them, each twin `execve`s its coreutil (`/bin/echo`,
 /// `/bin/cat`), the reader blocks on the pipe until the writer's bytes arrive, then EOFs when it exits.
 ///
-/// `#[ignore]`d, unconfirmed pending a fresh `bash.temen` (see `bash_dash_c_external_seq_forked`): the
-/// E2E showed a real-bash pipeline not terminating, but with the stale pre-merge asset that is likely
-/// asset drift, not a real deadlock. The rung-4 CorePipe park/wake passes ALL native fork+pipe
-/// differentials (incl. the 3-stage `seq | head | wc` and `sort | uniq`). Rebuild the asset, then re-run
-/// to see whether this is a genuine pipeline bug or the same stale-`bash.temen` artifact.
+/// `#[ignore]`d — a CONFIRMED real deadlock (a distinct follow-up rung), reproduced with a freshly-built
+/// `--null-guard` `bash.temen`, so it is not the stale-asset artifact that masked the fork/exec/wait
+/// tests above. The stuck configuration: the root bash parks in `waitpid(-1)`, the writer twin (`echo`)
+/// reaches `Done`, but the reader twin (`cat`, the exec'd `/bin/cat`) spins **Runnable** forever — it
+/// neither reads-to-EOF nor parks (`BlockedPipeRead`). So the cooperative pipe park/wake does not engage
+/// for an exec'd *reader* twin the way it does for the synthetic guests in the native `c_posix` pipeline
+/// differentials (`seq | head | wc`, `sort | uniq`), which all pass on the bytecode engine. Un-ignore
+/// once the exec'd-reader pipe park is fixed.
 #[test]
-#[ignore = "unconfirmed pending a fresh bash.temen (stale pre-merge asset); native fork+pipe differentials all pass — rebuild + re-run before treating as a bug"]
+#[ignore = "confirmed real deadlock (fresh --null-guard asset): the exec'd reader twin spins Runnable instead of pipe-read-parking/EOFing — a distinct pipeline-through-exec follow-up rung"]
 fn bash_dash_c_pipeline_echo_cat() {
     let Some(bash) = load_bash() else {
         eprintln!("note: skipping bash_dash_c_pipeline_echo_cat — no bash.temen");
@@ -224,10 +230,10 @@ fn bash_dash_c_pipeline_echo_cat() {
 /// forks, three `execve`d coreutils, two CorePipes, every read park + carried pipe end + EOF + reap
 /// composing under real bash on the bytecode engine — the milestone capstone.
 ///
-/// `#[ignore]`d for the same real-bash pipeline hang as `bash_dash_c_pipeline_echo_cat` above (a
-/// distinct follow-up; the native 3-stage `seq | head | wc` differential passes on both engines).
+/// `#[ignore]`d for the same confirmed exec'd-reader-twin spin as `bash_dash_c_pipeline_echo_cat` above
+/// (a distinct follow-up; the native 3-stage `seq | head | wc` differential passes on both engines).
 #[test]
-#[ignore = "same real-bash pipeline hang as bash_dash_c_pipeline_echo_cat (see doc) — a distinct follow-up"]
+#[ignore = "same confirmed exec'd-reader-twin pipeline deadlock as bash_dash_c_pipeline_echo_cat (see doc) — a distinct follow-up"]
 fn bash_dash_c_pipeline_seq_head_wc() {
     let Some(bash) = load_bash() else {
         eprintln!("note: skipping bash_dash_c_pipeline_seq_head_wc — no bash.temen");
