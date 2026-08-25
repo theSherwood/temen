@@ -407,6 +407,71 @@ fn c_write_to_string_literal_faults() {
     );
 }
 
+/// #1059: the chibicc frontend emits the **guarded layout** — every fixed low region (handle slots,
+/// args buffer, globals, data stack) sits one `POWERBOX_NULL_GUARD` up and the module carries the
+/// `__null_guard` marker — so a NULL dereference **traps** (`MemoryFault`) on both the interpreter and
+/// the JIT, instead of silently reading low scratch. The guest-side differential for #964's "on
+/// everywhere" goal (the c_interpret null-deref consumer). A `volatile` pointer keeps the load in
+/// memory (no SSA-promotion/const-fold) so the dereference actually reaches address 0.
+#[cfg(unix)]
+#[test]
+fn c_null_deref_faults_under_the_guard() {
+    let src = "int main(void){ volatile int *p = 0; return *p; }";
+    let ir = c_to_ir(src);
+    assert!(
+        ir.contains("export 1 func \"__null_guard\" 0"),
+        "the frontend must emit the guard marker:\n{ir}"
+    );
+    let m = parse_module(&ir).expect("parse");
+    verify_module(&m).expect("verify");
+    // Guarded layout: the marker resolves to the guard extent, and the args base is shifted up by it.
+    assert_eq!(
+        temen_ir::module_null_guard(&m),
+        Some(temen_ir::POWERBOX_NULL_GUARD),
+        "module is guard-marked:\n{ir}"
+    );
+    assert_eq!(
+        temen_ir::module_args_base(&m),
+        temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_ARGS_BASE,
+        "args base is one guard up"
+    );
+
+    let mut hi = Host::new();
+    let mut hj = Host::new();
+    let grant = |h: &mut Host| powerbox(h, 1 << 20, std::time::Duration::ZERO);
+    grant(&mut hi);
+    grant(&mut hj);
+    let mut fuel = 50_000_000u64;
+    let interp = run_with_host(&m, 0, &[], &mut fuel, &mut hi);
+    let jit = compile_and_run_with_host(&m, 0, &[], cap_thunk, &mut hj as *mut Host as *mut c_void)
+        .expect("jit compiles");
+    assert_eq!(
+        interp,
+        Err(Trap::MemoryFault),
+        "interp: NULL deref must fault under the guard\n{ir}"
+    );
+    assert!(
+        matches!(jit, JitOutcome::Trapped(TrapKind::MemoryFault)),
+        "jit: NULL deref must detect-and-kill under the guard, got {jit:?}\n{ir}"
+    );
+}
+
+/// The guard is transparent to well-behaved code: a guarded program that touches its relocated
+/// scratch — argv parsing, a heap allocation, a global, stdio — still runs and agrees interp≡JIT
+/// (the layout relocation didn't disturb any legitimate access). Parity guard for the shift.
+#[cfg(unix)]
+#[test]
+fn c_guarded_layout_runs_normal_programs() {
+    // Exercises globals + a stack array (relocated data stack) + a return value.
+    let src = "int g[4] = {1,2,3,4};\n\
+               int main(void){ int s = 0; for (int i=0;i<4;i++) s += g[i]; return s; }";
+    assert_eq!(
+        run_c(src),
+        vec![Value::I32(10)],
+        "guarded program still computes"
+    );
+}
+
 /// The guest **grows its own window** through the Memory capability: `__vm_map` (a frontend
 /// builtin → `cap.call` on the granted Memory handle) commits a page at 256 MiB — deep in the
 /// reserved tail, far above the backed prefix — then a store/load round-trips through it. Proves

@@ -32,7 +32,7 @@ use temen_verify::verify_module;
 
 const WIN: usize = 256 << 10;
 const CARVE: u64 = 128 << 10; // the command's carve (its declared `memory 17` = 128 KiB)
-const ARGS_BASE: u64 = 128; // temen_ir::POWERBOX_ARGS_BASE
+const ARGS_BASE: u64 = 16384 + 128; // guard + POWERBOX_ARGS_BASE (#1059: chibicc reads argv one 16 KiB NULL guard up)
 
 fn chibicc() -> &'static Path {
     static CC: OnceLock<PathBuf> = OnceLock::new();

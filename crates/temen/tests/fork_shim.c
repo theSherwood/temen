@@ -83,10 +83,11 @@ static char __se_name[] = "stderr";
 static struct __grant __grants[3];
 
 /* Pack a NUL-terminated `argv[]` and the current `environ` into the §3e args buffer at
- * POWERBOX_ARGS_BASE (`{argc, envc}` + packed strings) — the marshalling `execvp`/`exec_io` share. */
+ * guard + POWERBOX_ARGS_BASE (#1059: chibicc lays it one 16 KiB NULL guard up, so a marked command
+ * reads argv there) (`{argc, envc}` + packed strings) — the marshalling `execvp`/`exec_io` share. */
 static inline void __pack_args(char **argv) {
-  int *hdr = (int *)128;
-  char *s = (char *)136;
+  int *hdr = (int *)(16384 + 128);
+  char *s = (char *)(16384 + 136);
   long i = 0, argc = 0, envc = 0, k;
   while (argv[argc]) {
     char *a = argv[argc];

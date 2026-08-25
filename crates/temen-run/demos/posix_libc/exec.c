@@ -82,10 +82,16 @@ static int xs_try_script_(char *path, char **argv, char **envp) {
   return r;
 }
 
-/* The args region `[128, 16384)` is not private to exec: a NON-child module's own
-   data legitimately starts right after 128 (only child-entry images reserve the
-   region), and the strings argv points at may themselves live INSIDE it (a command
-   re-execing with argv into its own region). Packing in place therefore tramples
+/* #1059 NULL guard: chibicc lays the powerbox args region one 16 KiB guard up
+   (`temen_ir::module_args_base` == guard + 128), so a `__null_guard`-marked command
+   reads argv from here and the host preserves this shifted range across the exec
+   image-replace (`commit_fresh_image`). */
+#define PX_ARGS_BASE (16384 + 128) /* POWERBOX_NULL_GUARD + POWERBOX_ARGS_BASE */
+
+/* The args region `[PX_ARGS_BASE, PX_ARGS_BASE + 16256)` is not private to exec: a NON-child
+   module's own data legitimately starts right after the reserved low region (only child-entry
+   images reserve the whole args span), and the strings argv points at may themselves live INSIDE
+   it (a command re-execing with argv into its own region). Packing in place therefore tramples
    the very bytes still being read — the original in-place pack survived every
    short-argv witness by byte-count luck and corrupted longer ones mid-loop. So:
    STAGE the pack in private scratch (every source string is read before any region
@@ -118,9 +124,9 @@ int execve(char *path, char **argv, char **envp) {
     s = s + 1;
   }
   /* Save the caller's region bytes, splash header + strings, exec. */
-  char *reg = (char *)128;
+  char *reg = (char *)PX_ARGS_BASE;
   for (i = 0; i < s + 8; i = i + 1) xs_sv_[i] = reg[i];
-  int *hdr = (int *)128;
+  int *hdr = (int *)PX_ARGS_BASE;
   hdr[0] = (int)argc;
   hdr[1] = (int)envc;
   for (i = 0; i < s; i = i + 1) reg[8 + i] = xs_pk_[i];

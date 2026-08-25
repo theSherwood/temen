@@ -3,6 +3,11 @@
 #define O_CREAT  0100
 #define O_TRUNC  01000
 #define O_APPEND 02000
+
+/* #1059 NULL guard: chibicc lays the powerbox args buffer one 16 KiB guard up
+ * (`temen_ir::module_args_base` == guard + 128), so a `__null_guard`-marked command reads its argv
+ * at `carve + guard + 128`. Every command we spawn is chibicc-compiled (guarded), so pack there. */
+#define POWERBOX_NULL_GUARD 16384
 static char cwd[256];
 /* Current stdio for the command in flight: `out_fd` is 1 unless a `>`/`>>` redirect is active,
    `in_fd` is 0 unless a `<` redirect is active. run_line points them at files and restores them. */
@@ -276,8 +281,8 @@ static int spawn_cmd(long mod, int argc, char **argv) {
       gn = 2;
     }
   }
-  /* the command's args buffer at carve+128 (POWERBOX_ARGS_BASE): {argc, envc=0} then packed argv */
-  char *ab = (char *)(carve + 128);
+  /* the command's args buffer at carve + guard + 128 (module_args_base, #1059): {argc, envc=0} then packed argv */
+  char *ab = (char *)(carve + POWERBOX_NULL_GUARD + 128);
   int *hdr = (int *)ab;
   hdr[0] = argc; hdr[1] = 0;
   char *p = ab + 8;
@@ -586,8 +591,8 @@ static long spawn_stage(long mod, char *stage, long carve, int rin, int rout) {
     nm[9]='r'; nm[10]='o'; nm[11]='u'; nm[12]='t';
     gn = 3;
   }
-  /* the runner's args buffer at carve+128 (POWERBOX_ARGS_BASE): {argc, envc=0} + packed argv */
-  char *ab = (char *)(carve + 128);
+  /* the runner's args buffer at carve + guard + 128 (module_args_base, #1059): {argc, envc=0} + packed argv */
+  char *ab = (char *)(carve + POWERBOX_NULL_GUARD + 128);
   int *hdr = (int *)ab;
   hdr[0] = ac; hdr[1] = 0;
   char *p = ab + 8;

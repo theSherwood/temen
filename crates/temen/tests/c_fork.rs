@@ -727,10 +727,10 @@ static long pid, status;
 int main(int argc, char **argv) {
   while ((pid = fork()) < 0);
   if (pid == 0) {
-    int *hdr = (int *)128;      /* POWERBOX_ARGS_BASE */
+    int *hdr = (int *)16512;    /* guard + POWERBOX_ARGS_BASE (#1059: 16384 + 128) */
     hdr[0] = 2;                 /* argc */
     hdr[1] = 0;                 /* envc */
-    char *s = (char *)136;      /* packed strings: base + 8 */
+    char *s = (char *)16520;    /* packed strings: base + 8 */
     s[0] = 'c'; s[1] = 'm'; s[2] = 'd'; s[3] = 0;
     s[4] = '4'; s[5] = '2'; s[6] = 0;
     long cmd = __vm_resolve(cmd_name, 3);
@@ -815,9 +815,9 @@ static long run(const char *name, const char *arg) {
   long pid, st, i, k;
   while ((pid = fork()) < 0);
   if (pid == 0) {
-    int *hdr = (int *)128;
+    int *hdr = (int *)16512;                /* guard + POWERBOX_ARGS_BASE (#1059) */
     hdr[0] = 2; hdr[1] = 0;                 /* argc = 2, envc = 0 */
-    char *s = (char *)136;
+    char *s = (char *)16520;
     i = 0;
     for (k = 0; name[k]; k = k + 1) { s[i] = name[k]; i = i + 1; } s[i] = 0; i = i + 1;
     for (k = 0; arg[k]; k = k + 1) { s[i] = arg[k]; i = i + 1; } s[i] = 0;
@@ -1037,10 +1037,10 @@ static long pid, status;
 int main(int argc, char **argv) {
   while ((pid = fork()) < 0);
   if (pid == 0) {
-    int *hdr = (int *)128;
+    int *hdr = (int *)16512;    /* guard + POWERBOX_ARGS_BASE (#1059) */
     hdr[0] = 1;                 /* argc = 1 */
     hdr[1] = 1;                 /* envc = 1 */
-    char *s = (char *)136;
+    char *s = (char *)16520;
     s[0] = 'c'; s[1] = 0;                        /* argv[0] = "c" */
     s[2] = 'V'; s[3] = '='; s[4] = '7'; s[5] = 0; /* env[0]  = "V=7" */
     long cmd = __vm_resolve(cmd_name, 3);

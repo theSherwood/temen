@@ -146,8 +146,9 @@ int main(void){
   rec[3] = 0;
   char *nm = (char *)(base + 16);
   nm[0]='s'; nm[1]='t'; nm[2]='d'; nm[3]='o'; nm[4]='u'; nm[5]='t';
-  /* the command's args buffer at carve+128: {argc-1, envc=0} then packed argv[1..] */
-  char *ab = (char *)(carve + 128);
+  /* the command's args buffer at carve + guard + 128 (#1059: chibicc reads argv one 16 KiB NULL
+     guard up, module_args_base): {argc-1, envc=0} then packed argv[1..] */
+  char *ab = (char *)(carve + 16384 + 128);
   int *hdr = (int *)ab;
   hdr[0] = n - 1;
   hdr[1] = 0;
