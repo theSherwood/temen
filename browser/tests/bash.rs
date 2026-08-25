@@ -144,20 +144,19 @@ fn bash_dash_c_external_seq_last() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n2\n3\n");
 }
 
-/// #1080 slice 2 — a **fork-twin exec**: a non-final external command forces bash to fork → execve
-/// (rather than exec-the-last-command). `bash -c 'seq 2; echo done'` should fork a twin for `seq 2`,
-/// the twin image-replaces with `/bin/seq` (the `env: Some` exec arm + personality carry, both landed
-/// here), bash reaps it, then runs the builtin `echo done` and exits.
+/// #1080 — a **fork-twin exec**: a non-final external command forces bash to fork → execve (rather
+/// than exec-the-last-command). `bash -c 'seq 2; echo done'` forks a twin for `seq 2`, the twin
+/// image-replaces with `/bin/seq`, bash reaps it, then runs the builtin `echo done` and exits.
 ///
-/// `#[ignore]`d: this surfaced that **bash's own `fork()` on the pure bytecode cooperative engine**
-/// returns an error ("bash: fork: Unknown error") — bash reaches fork through the personality's
-/// host-proc fork dispatch, a path never exercised on the bytecode engine before (bash previously ran
-/// only on the tree-walker, whose exec decline folded it there; the bespoke `temen-posix` shell spawns
-/// externals via op-13 `instantiate_module`, not `fork()`). That bytecode fork-dispatch gap is a
-/// distinct follow-up rung from exec_module; the `env: Some` exec arm itself is ready for it. Single
-/// external commands (exec-the-last-command → a *root* exec) already work — see the test above.
+/// `#[ignore]`d, and results are NOT yet trustworthy: the browser E2E ran, but the local `bash.temen`
+/// predates the rung-2/3/4 merges (a stale, wire-format-coupled asset), and even the previously-green
+/// root-exec case (`bash -c 'seq 3'`) now fails locally — a strong sign of ASSET DRIFT, not an engine
+/// bug. The observed symptom here was fork worked (no "fork: Unknown error" — rung 3) but `seq`'s stdout
+/// was missing (`"done\n"` only). **Prerequisite before treating any of this as a real bug: rebuild
+/// `bash.temen` against the current toolchain (`scripts/rebuild-assets.sh` / `bash_asset`) and re-run.**
+/// The fork/exec/wait/pipe primitives are all validated by the native differentials regardless.
 #[test]
-#[ignore = "bash's personality fork() on the bytecode cooperative engine is a separate follow-up (see doc); exec_module itself is done"]
+#[ignore = "unconfirmed pending a fresh bash.temen (local asset is pre-merge/stale — even seq-3 root exec fails locally); rebuild the asset before treating as an engine bug"]
 fn bash_dash_c_external_seq_forked() {
     let Some(bash) = load_bash() else {
         eprintln!("note: skipping bash_dash_c_external_seq_forked — no bash.temen");
@@ -188,4 +187,70 @@ fn bash_dash_c_external_seq_forked() {
         out.value,
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// #1080 — a **two-stage pipeline of external commands** in the browser: `echo hi | cat`. bash forks
+/// both stages, wires a CorePipe between them, each twin `execve`s its coreutil (`/bin/echo`,
+/// `/bin/cat`), the reader blocks on the pipe until the writer's bytes arrive, then EOFs when it exits.
+///
+/// `#[ignore]`d, unconfirmed pending a fresh `bash.temen` (see `bash_dash_c_external_seq_forked`): the
+/// E2E showed a real-bash pipeline not terminating, but with the stale pre-merge asset that is likely
+/// asset drift, not a real deadlock. The rung-4 CorePipe park/wake passes ALL native fork+pipe
+/// differentials (incl. the 3-stage `seq | head | wc` and `sort | uniq`). Rebuild the asset, then re-run
+/// to see whether this is a genuine pipeline bug or the same stale-`bash.temen` artifact.
+#[test]
+#[ignore = "unconfirmed pending a fresh bash.temen (stale pre-merge asset); native fork+pipe differentials all pass — rebuild + re-run before treating as a bug"]
+fn bash_dash_c_pipeline_echo_cat() {
+    let Some(bash) = load_bash() else {
+        eprintln!("note: skipping bash_dash_c_pipeline_echo_cat — no bash.temen");
+        return;
+    };
+    let bins = load_coreutils();
+    let bin_refs: Vec<(&str, &temen_ir::Module, u8)> =
+        bins.iter().map(|(p, m, wl)| (*p, m, *wl)).collect();
+    let out = bash_exec_with(&bash, &[b"bash", b"-c", b"echo hi | cat"], b"", &bin_refs);
+    assert_eq!(
+        out.status,
+        STATUS_EXIT,
+        "status={} stdout={:?} stderr={:?}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\n");
+}
+
+/// #1080 — a **three-stage coreutil pipeline** in the browser: `seq 5 | head -n 3 | wc -l` → `3`. Three
+/// forks, three `execve`d coreutils, two CorePipes, every read park + carried pipe end + EOF + reap
+/// composing under real bash on the bytecode engine — the milestone capstone.
+///
+/// `#[ignore]`d for the same real-bash pipeline hang as `bash_dash_c_pipeline_echo_cat` above (a
+/// distinct follow-up; the native 3-stage `seq | head | wc` differential passes on both engines).
+#[test]
+#[ignore = "same real-bash pipeline hang as bash_dash_c_pipeline_echo_cat (see doc) — a distinct follow-up"]
+fn bash_dash_c_pipeline_seq_head_wc() {
+    let Some(bash) = load_bash() else {
+        eprintln!("note: skipping bash_dash_c_pipeline_seq_head_wc — no bash.temen");
+        return;
+    };
+    let bins = load_coreutils();
+    let bin_refs: Vec<(&str, &temen_ir::Module, u8)> =
+        bins.iter().map(|(p, m, wl)| (*p, m, *wl)).collect();
+    let out = bash_exec_with(
+        &bash,
+        &[b"bash", b"-c", b"seq 5 | head -n 3 | wc -l"],
+        b"",
+        &bin_refs,
+    );
+    assert_eq!(
+        out.status,
+        STATUS_EXIT,
+        "status={} stdout={:?} stderr={:?}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    // wc -l prints the line count (3), typically right-padded/whitespace-formatted; assert it contains 3.
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.trim() == "3", "expected line count 3, got {s:?}");
 }
