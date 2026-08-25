@@ -8,8 +8,7 @@ use std::time::{Duration, Instant};
 
 use temen_ir::Module;
 use temen_run::{
-    is_named_powerbox_entry, run_kernel, run_powerbox, run_powerbox_with_deadline,
-    run_powerbox_with_deadline_and_quota, Outcome, Quota, Value,
+    is_named_powerbox_entry, run_kernel, run_powerbox, run_powerbox_cfg, Outcome, Quota, Value,
 };
 use temen_text::parse_module;
 use temen_verify::verify_module;
@@ -441,7 +440,7 @@ fn cli_compiles_and_runs_c() {
     assert_eq!(out.stdout, b"hello, sandbox!\n");
 }
 
-// ── §5 kill-path through the embedding entry (`run_powerbox_with_deadline`) ────────────────────
+// ── §5 kill-path through the embedding entry (`run_powerbox_cfg` deadline) ─────────────────────
 
 /// A runaway powerbox guest (ignores its handles, loops forever) is **detect-and-killed** at the
 /// deadline rather than hanging the process — the CLI's `TEMEN_DEADLINE_MS` is this, end to end.
@@ -461,8 +460,15 @@ fn deadline_kills_runaway_powerbox_guest() {
            }\n\
          }\n",
     );
-    let err = run_powerbox_with_deadline(&m, b"", Some(Duration::from_millis(100)))
-        .expect_err("a runaway guest must be killed, not returned");
+    let err = run_powerbox_cfg(
+        &m,
+        b"",
+        &[],
+        &[],
+        Some(Duration::from_millis(100)),
+        Quota::default(),
+    )
+    .expect_err("a runaway guest must be killed, not returned");
     assert!(
         err.contains("OutOfFuel"),
         "expected an OutOfFuel detect-and-kill, got: {err}"
@@ -490,7 +496,8 @@ fn trap_kill_message_carries_a_source_backtrace() {
          debug.fname 0 \"divide\"\n\
          debug.loc 0 0 2 0 7 5\n",
     );
-    let err = run_powerbox_with_deadline(&m, b"", None).expect_err("div-by-zero must be killed");
+    let err = run_powerbox_cfg(&m, b"", &[], &[], None, Quota::default())
+        .expect_err("div-by-zero must be killed");
     assert!(err.contains("DivByZero"), "names the trap kind: {err}");
     assert!(
         err.contains("guest.c:7:5 in divide"),
@@ -521,7 +528,7 @@ fn memfault_kill_message_carries_a_source_backtrace() {
          debug.fname 0 \"store_oob\"\n\
          debug.loc 0 0 2 0 9 5\n",
     );
-    let err = run_powerbox_with_deadline(&m, b"", None)
+    let err = run_powerbox_cfg(&m, b"", &[], &[], None, Quota::default())
         .expect_err("the overrun must be detect-and-killed");
     assert!(err.contains("MemoryFault"), "names the trap kind: {err}");
     assert!(
@@ -551,7 +558,15 @@ fn deadline_does_not_delay_fast_guest() {
          }\n",
     );
     let t0 = Instant::now();
-    let run = run_powerbox_with_deadline(&m, b"", Some(Duration::from_secs(30))).expect("run");
+    let run = run_powerbox_cfg(
+        &m,
+        b"",
+        &[],
+        &[],
+        Some(Duration::from_secs(30)),
+        Quota::default(),
+    )
+    .expect("run");
     let elapsed = t0.elapsed();
     assert_eq!(run.stdout, b"hi\n");
     assert_eq!(run.outcome, Outcome::Returned(vec![Value::I32(7)]));
@@ -741,7 +756,7 @@ fn demo_jit_threads_runs() {
     );
 }
 
-/// §15 the embedder-facing spawn quota (`run_powerbox_with_deadline_and_quota`) is enforced
+/// §15 the embedder-facing spawn quota (`run_powerbox_cfg`) is enforced
 /// end-to-end on the JIT: a powerbox guest that spawns a vCPU is **detect-and-killed** under a
 /// `max_vcpus = 1` quota (the root fills it), and runs under the default. Gated to the targets where
 /// the JIT thread runtime exists (elsewhere `thread.spawn` is `Unsupported`, a different `Err`).
@@ -775,14 +790,14 @@ fn quota_contains_a_powerbox_thread_bomb() {
         max_fibers: 1 << 16,
         max_vcpus: 1,
     };
-    let r = run_powerbox_with_deadline_and_quota(&m, b"", None, tight);
+    let r = run_powerbox_cfg(&m, b"", &[], &[], None, tight);
     assert!(
         r.is_err(),
         "a spawn over the quota must detect-and-kill, got {r:?}"
     );
 
     // The default quota admits the spawn+join.
-    let r = run_powerbox_with_deadline_and_quota(&m, b"", None, Quota::default());
+    let r = run_powerbox_cfg(&m, b"", &[], &[], None, Quota::default());
     assert!(
         r.is_ok(),
         "the default quota must run the program, got {r:?}"
