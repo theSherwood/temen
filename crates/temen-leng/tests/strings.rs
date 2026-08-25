@@ -127,9 +127,10 @@ fn real_long_string_runs_end_to_end() {
 
     // greetLong (func 0) is frame-needing + aggregate-returning: ($sp, $sret) -> (). `sp`/`sret`
     // sit in the low scratch page below the globals; the window must reach past the globals base
-    // (`POWERBOX_STACK_PAGE`, 16384) so the snapshot covers the relocated const blob the test reads.
+    // (`POWERBOX_NULL_GUARD + POWERBOX_STACK_PAGE`, 32768, #1091) so the snapshot covers the
+    // relocated const blob the test reads.
     let (sp, sret) = (2048i64, 512usize);
-    let seed = vec![0u8; 32768];
+    let seed = vec![0u8; 49152];
     let ivals = vec![Value::I64(sp), Value::I64(sret as i64)];
     let mut fuel = u64::MAX;
     let (ir, imem) = temen_interp::run_capture(&linked, 0, &ivals, &mut fuel, &seed);
@@ -214,9 +215,9 @@ fn const_to_const_pointer_relocates() {
     .unwrap_or_else(|e| panic!("link: {e}"));
     temen_verify::verify_module(&linked).unwrap_or_else(|e| panic!("verify: {e:?}"));
 
-    // The window must reach past the globals base (`POWERBOX_STACK_PAGE`, 16384) so the snapshot
-    // covers the relocated const blob the test reads back through `more`.
-    let seed = vec![0u8; 32768];
+    // The window must reach past the globals base (`POWERBOX_NULL_GUARD + POWERBOX_STACK_PAGE`,
+    // 32768, #1091) so the snapshot covers the relocated const blob the test reads back through `more`.
+    let seed = vec![0u8; 49152];
     let mut fuel = u64::MAX;
     let (ir, imem) = temen_interp::run_capture(&linked, 0, &[], &mut fuel, &seed);
     let more = match ir.expect("interp").as_slice() {

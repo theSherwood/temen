@@ -242,7 +242,8 @@ fn run_inner(m: &Module, global_substr: &str) -> Result<i64, Stage> {
     let entry_sp = temen_ir::powerbox_entry_sp(m) as i64;
     let heap_base = entry_sp + temen_ir::POWERBOX_STACK_RESERVE as i64;
     let mut seed = vec![0u8; 1 << 20];
-    let brk = temen_ir::POWERBOX_HEAP_BRK as usize;
+    // #964/#1091: the compute shim reads the bump cursor one guard up, in the guard's scratch page.
+    let brk = (temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_HEAP_BRK) as usize;
     seed[brk..brk + 8].copy_from_slice(&heap_base.to_le_bytes());
     let ivals = [
         Value::I64(entry_sp),

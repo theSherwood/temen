@@ -732,7 +732,17 @@ fn translate_impl(
     // (page 0, below `STACK_PAGE`), so start the globals one page up (`STACK_PAGE`): a *read-only*
     // global (D40, protected page-granularly) must never share a page with the stash, or `_start`'s
     // handle stores would fault on the read-only page (the same page-isolation the data stack gets).
-    let globals_base = if synth { stack_page } else { DATA_BASE };
+    //
+    // #964/#1094: an **entry-less** kernel (no `_start` — a reactor `tick`) has no reserved scratch, so
+    // its globals start at `DATA_BASE`. Under the guard (`scratch > 0`) shift that base up by the guard
+    // too (`scratch + DATA_BASE`), so `[0, guard)` stays empty and a marker-aware host can seed it
+    // unmapped — the same NULL-trap the synthesized-`_start` path already gets. `scratch == 0` leaves
+    // the legacy `DATA_BASE` byte-identical.
+    let globals_base = if synth {
+        stack_page
+    } else {
+        scratch + DATA_BASE
+    };
     let (globals, mut data, mut globals_end, cstrs, gbytes, data_symbols, tls_layout) =
         globals_layout(m, &name2idx, globals_base, ba, stack_page)?;
     // Synthesize the glibc ctype tables (flags + lower/upper case maps) as **read-only data in the
@@ -1310,19 +1320,22 @@ fn translate_impl(
                             func: 0,
                         },
                     );
-                    // #964 guarded layout: the `__null_guard` marker export (aliasing `_start`'s
-                    // funcidx) declares the shifted low scratch, so a host seeds `[0, guard)`
-                    // unmapped and places the args blob at the shifted base. Semantics, not
-                    // observability — hosts resolve it; `temen-strip` never demotes it.
-                    if scratch > 0 {
-                        ex.insert(
-                            1,
-                            temen_ir::Export {
-                                name: temen_ir::NULL_GUARD_EXPORT.to_string(),
-                                func: 0,
-                            },
-                        );
-                    }
+                }
+                // #964/#1094 guarded layout: the `__null_guard` marker export declares that
+                // `[0, guard)` is empty (the shifted low scratch / globals base), so a host seeds it
+                // unmapped and a NULL dereference traps. It rides `_start`'s funcidx for a powerbox
+                // program and the **first defined function** for an entry-less kernel (funcidx 0 either
+                // way — `base == synth as u32`), so reactor kernels stop being a legacy carve-out. The
+                // funcidx value is immaterial: `module_null_guard` only checks the export resolves.
+                // Semantics, not observability — hosts resolve it; `temen-strip` never demotes it.
+                if scratch > 0 {
+                    ex.insert(
+                        synth as usize,
+                        temen_ir::Export {
+                            name: temen_ir::NULL_GUARD_EXPORT.to_string(),
+                            func: 0,
+                        },
+                    );
                 }
                 ex
             },

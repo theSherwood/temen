@@ -169,3 +169,19 @@ the caller's ancestry never disclosed, a new run-global sweep reachable from one
 signal, or a personality handed more visibility than its grant chain carries. (Owner
 decision 2026-08-13; #863; the slice-2 process table deliberately landed in `temen-posix`,
 not the core.)
+
+## 13. One canonical form — migrate forward, delete the old path
+
+Every layout, ABI, encoding, and wire format has exactly one live form. A better form does not
+land *beside* the old one; it **replaces** it — the same change (or a tracked sequence with an
+owner-set deadline) moves every producer, consumer, and committed asset onto it and then
+**deletes** the old path. Old on-disk artifacts are recompiled, not accommodated: the host and
+every reader assume the current semantics everywhere and never branch on which era produced a
+module. A version marker or dual-mode flag is legitimate only as a migration's *own scaffolding* —
+it ships with a scheduled removal, never a standing compatibility contract. Fewer forms is the
+whole point: one form is a stronger assumption, fewer branches, less TCB; carrying legacy multiplies
+incompatible states and erodes what the rest of the tree can assume. *Violated by:* a compat shim,
+format-version branch, or `unwrap_or(legacy)` fallback with no convergence plan; a producer left
+emitting the old layout after the new one exists; or "old artifacts still use it" offered to justify
+keeping a fork. (Owner decision 2026-08-25; sharpens invariant 1 — every retained fork is TCB
+surface and an assumption the tree can no longer make.)
