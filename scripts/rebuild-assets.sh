@@ -140,10 +140,49 @@ if want nim_hello; then
   fi
 fi
 
+# --- 7) lua_snapshot.temen (Lua 5.4.7 core+libs + the two-phase snapshot harness → translate) -------
+# The warm-runtime-snapshot Lua card asset (issue #805). Lua source is fetched-and-cached; skipped
+# offline. Fixtures live in crates/temen-llvm/tests/fixtures/lua; recipe mirrors that dir's README.
+if want lua_snapshot; then
+  echo "=== [lua_snapshot] Lua 5.4.7 core+libs + snapshot harness → temen-llvm-translate ==="
+  LFIX="$REPO/crates/temen-llvm/tests/fixtures/lua"
+  LDEMOS="$REPO/crates/temen-run/demos"
+  TR="$REPO/crates/temen-llvm/target/release/temen-llvm-translate"
+  LCACHE="${TEMEN_LUA_CACHE:-/tmp/temen_lua_snap}"; mkdir -p "$LCACHE"
+  if [ ! -d "$LCACHE/lua-5.4.7/src" ]; then
+    ( cd "$LCACHE" && curl -sSL https://www.lua.org/ftp/lua-5.4.7.tar.gz -o lua.tgz && tar xzf lua.tgz ) \
+      || note "lua_snapshot SKIP (Lua 5.4.7 fetch failed — offline?)"
+  fi
+  if [ -d "$LCACHE/lua-5.4.7/src" ]; then
+    ( set -e; cd "$LCACHE"
+      NV="-fno-vectorize -fno-slp-vectorize"
+      CORE="lapi lcode lctype ldebug ldo ldump lfunc lgc llex lmem lobject lopcodes lparser lstate lstring ltable ltm lundump lvm lzio"
+      LIBS="lbaselib lstrlib ltablib lmathlib lauxlib lcorolib liolib loslib"
+      for f in $CORE $LIBS; do clang -O2 $NV -emit-llvm -S -Ilua-5.4.7/src lua-5.4.7/src/$f.c -o $f.ll; done
+      clang -O2 $NV              -emit-llvm -S -Ilua-5.4.7/src "$LFIX/lua_snapshot_harness.c" -o harness.ll
+      clang -O2 $NV -fno-builtin -emit-llvm -S -Ilua-5.4.7/src "$LFIX/lua_files_stdio.c" -o guest_stdio.ll
+      clang -O2 $NV -fno-builtin -emit-llvm -S -Ilua-5.4.7/src "$LFIX/lua_files_time.c"  -o guest_time.ll
+      clang -O2 $NV -fno-builtin -emit-llvm -S -Ilua-5.4.7/src "$LFIX/lua_files_shim.c"  -o guest_shim.ll
+      clang -O2 $NV -fno-builtin -fno-strict-aliasing -emit-llvm -S "$LFIX/lua_testsuite_trig.c" -o guest_trig.ll
+      clang -O2 $NV -fno-builtin -emit-llvm -S "$LFIX/lua_fmt_snprintf.c" -o guest_snprintf.ll
+      clang -O2 $NV -fno-builtin -emit-llvm -S "$LDEMOS/libm/libm.c"     -o guest_libm.ll
+      clang -O2 $NV -fno-builtin -emit-llvm -S "$LDEMOS/strtod/strtod.c" -o guest_strtod.ll
+      CORELL=""; for f in $CORE $LIBS; do CORELL="$CORELL $f.ll"; done
+      llvm-link -S $CORELL harness.ll guest_stdio.ll guest_time.ll guest_shim.ll guest_trig.ll \
+                guest_snprintf.ll guest_libm.ll guest_strtod.ll -o lua_snapshot.ll
+      "$TR" lua_snapshot.ll -o "$REPO/browser/web/assets/lua_snapshot.temen" --host-page 65536 --null-guard
+    ) && { validate browser/web/assets/lua_snapshot.temen \
+             && note "lua_snapshot ✓" || note "lua_snapshot ✗ (rebuilt but failed re-validate)"; } \
+       || note "lua_snapshot ✗ (clang/llvm-link over the Lua core?)"
+  fi
+fi
+
 echo
 echo "=== rebuild-assets summary ==="
 for r in "${RESULTS[@]}"; do echo "  $r"; done
 echo
-echo "NOTE: lua_snapshot.temen is a separate two-phase warm-runtime-snapshot build"
-echo "      (Lua 5.4.7 + the snapshot driver) — see build-onramp-assets.mjs §Lua; not automated here."
-echo "Then: git add the changed browser/web/assets/*.temen(.gz), the leng/nifler fixtures, and commit."
+echo "Also (non-CI, but tracked) browser/tests/fixtures/*.temen — the display/reactor/onramp Rust-test"
+echo "fixtures — are clang -O2 + temen-llvm-translate --host-page 65536 (+--null-guard for the #964"
+echo "guarded ones: hello_onramp/bounce/life/mandelzoom; plain for gradient/fsread). shell/stage_runner/"
+echo "primes/upper come from the [shell] step above."
+echo "Then: git add the changed browser/web/assets/*.temen(.gz) + fixtures, and commit."
