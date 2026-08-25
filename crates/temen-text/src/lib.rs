@@ -417,6 +417,30 @@ fn sig_of(m: &Module, t: u32) -> FuncType {
     }
 }
 
+/// Print an `f32.const` operand losslessly. `{:?}` round-trips finite values and the
+/// canonical quiet NaN (printed as `NaN`), but collapses every other NaN payload — so a
+/// non-canonical NaN is emitted as `nan:<bits>` (its exact 32-bit pattern in decimal).
+fn fmt_f32_const(bits: u32) -> String {
+    let v = f32::from_bits(bits);
+    if v.is_nan() && bits != f32::NAN.to_bits() {
+        format!("nan:{bits}")
+    } else {
+        format!("{v:?}")
+    }
+}
+
+/// Print an `f64.const` operand losslessly (see `fmt_f32_const`). A non-canonical NaN is
+/// emitted as `nan:<bits>`; the u64 bit pattern may exceed `i64::MAX`, which the lexer and
+/// `parse_u64` reinterpret via two's-complement.
+fn fmt_f64_const(bits: u64) -> String {
+    let v = f64::from_bits(bits);
+    if v.is_nan() && bits != f64::NAN.to_bits() {
+        format!("nan:{bits}")
+    } else {
+        format!("{v:?}")
+    }
+}
+
 fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
     match inst {
         Inst::ConstI32(c) => format!("i32.const {c}"),
@@ -435,9 +459,12 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
         Inst::Convert { op, a } => format!("{} v{a}", op.sig().0),
         Inst::Select { cond, a, b } => format!("select v{cond} v{a} v{b}"),
         // `{:?}` gives the shortest round-tripping form with a decimal point
-        // (e.g. `2.0`, `1.5`, `-3.25`), so it re-tokenizes as a number.
-        Inst::ConstF32(bits) => format!("f32.const {:?}", f32::from_bits(*bits)),
-        Inst::ConstF64(bits) => format!("f64.const {:?}", f64::from_bits(*bits)),
+        // (e.g. `2.0`, `1.5`, `-3.25`), so it re-tokenizes as a number. A NaN whose
+        // payload differs from the canonical quiet NaN cannot survive `{:?}` (which
+        // prints a bare `NaN`), so emit its exact bits as `nan:<bits>` — keeping text
+        // lossless for every const (the `roundtrip` fuzz text-identity property).
+        Inst::ConstF32(bits) => format!("f32.const {}", fmt_f32_const(*bits)),
+        Inst::ConstF64(bits) => format!("f64.const {}", fmt_f64_const(*bits)),
         Inst::FBin { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
         Inst::FUn { ty, op, a } => format!("{}.{} v{a}", ty.prefix(), op.name()),
         Inst::Fma { ty, a, b, c } => format!("{}.fma v{a} v{b} v{c}", ty.prefix()),
@@ -3333,6 +3360,18 @@ impl<'a> Parser<'a> {
         names: &HashMap<String, u32>,
     ) -> Result<Inst, ParseError> {
         if suffix == "const" {
+            // `nan:<bits>` — the printer's lossless spelling for a non-canonical NaN payload.
+            // Reinterpret the decimal bit pattern directly: routing it through an `f64` value
+            // would canonicalize a signaling payload, so it must never touch `parse_float`.
+            if matches!(self.peek(), Some(Tok::Ident(s)) if s == "nan") {
+                self.next()?; // `nan`
+                self.expect(&Tok::Colon)?;
+                let bits = self.parse_u64()?;
+                return Ok(match ty {
+                    FloatTy::F32 => Inst::ConstF32(bits as u32),
+                    FloatTy::F64 => Inst::ConstF64(bits),
+                });
+            }
             let v = self.parse_float()?;
             return Ok(match ty {
                 FloatTy::F32 => Inst::ConstF32((v as f32).to_bits()),
@@ -3976,6 +4015,74 @@ block 0 (v0: i32) {
             panic!("expected Fixed loc")
         };
         assert_eq!(got, addr);
+    }
+
+    fn f64_const_module(bits: u64) -> temen_ir::Module {
+        temen_ir::Module {
+            funcs: vec![temen_ir::Func {
+                params: vec![],
+                results: vec![temen_ir::ValType::F64],
+                blocks: vec![temen_ir::Block {
+                    params: vec![],
+                    insts: vec![temen_ir::Inst::ConstF64(bits)],
+                    term: temen_ir::Terminator::Return(vec![0]),
+                }],
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn f32_const_module(bits: u32) -> temen_ir::Module {
+        temen_ir::Module {
+            funcs: vec![temen_ir::Func {
+                params: vec![],
+                results: vec![temen_ir::ValType::F32],
+                blocks: vec![temen_ir::Block {
+                    params: vec![],
+                    insts: vec![temen_ir::Inst::ConstF32(bits)],
+                    term: temen_ir::Terminator::Return(vec![0]),
+                }],
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn non_canonical_nan_const_round_trips() {
+        // Nightly `roundtrip` fuzz: a float const holding a NaN with a non-canonical payload
+        // printed as a bare `NaN` and re-parsed to the canonical quiet NaN — dropping the
+        // payload, so print → parse was not the identity. The printer now spells any NaN whose
+        // bits differ from the canonical quiet NaN as `nan:<bits>`, and the parser reinterprets
+        // those bits directly (never via an `f64`, which would re-canonicalize a signaling NaN).
+        for &bits in &[
+            0x7ff0_0000_0000_0001u64, // signaling NaN, payload 1
+            0x7ff8_0000_0000_0abcu64, // quiet NaN, non-zero payload
+            0xfff8_0000_0000_0001u64, // sign bit set + payload
+        ] {
+            let m = f64_const_module(bits);
+            let text = print_module(&m);
+            assert!(
+                text.contains("nan:"),
+                "expected `nan:<bits>` spelling, got:\n{text}"
+            );
+            assert_eq!(parse_module(&text).expect("re-parse of NaN const"), m);
+        }
+        // The canonical quiet NaN keeps its readable bare `NaN` spelling and round-trips.
+        let m = f64_const_module(f64::NAN.to_bits());
+        let text = print_module(&m);
+        assert!(
+            text.contains("f64.const NaN"),
+            "canonical NaN should print bare, got:\n{text}"
+        );
+        assert_eq!(parse_module(&text).unwrap(), m);
+        // f32 payloads survive too (a signaling f32 NaN).
+        let m32 = f32_const_module(0x7f80_0001);
+        let text = print_module(&m32);
+        assert!(
+            text.contains("nan:"),
+            "expected `nan:<bits>` for f32, got:\n{text}"
+        );
+        assert_eq!(parse_module(&text).unwrap(), m32);
     }
 
     #[test]

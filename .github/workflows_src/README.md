@@ -16,6 +16,14 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **New `browser-jit-host-gates` job (the compiler-tier wasm-JIT host tests, #1011)** — the browser
+  crate's Rust *host* tests (`nifler_jit`, `chibicc_jit`, `jit_module`) run a real compiler phase on
+  the wasm-JIT via `wasmi` and assert the emitted output is byte-identical to the interpreter oracle,
+  but nothing in `ci.yml` ran them — they were local/dev gates only. The new job runs them on
+  `ubuntu-latest`; `nifler_jit` uses the committed `nifler.temen.gz` (no staging), the others SKIP
+  fail-soft without their built assets. (Until copied over, the `workflows-in-sync` guard stays red —
+  the expected mirror-edit friction; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
+
 - **`paged_walk` added to the nightly `fuzz` matrix** (issue #1081) — one entry added to the `fuzz`
   job's `target: [...]` list (after `coverage_walk`), plus the descriptive comment above it. It is the
   new libFuzzer target `fuzz/fuzz_targets/paged_walk.rs`: the generative interp⇄**wasm-JIT** differential

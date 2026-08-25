@@ -3300,7 +3300,7 @@ pub fn onramp_fs_exec(
 /// returns the bytes at `out_key` (the memfs strips a leading `/`, so pass the slashless key). The
 /// file is `Vec::new()` if the phase never wrote it (a parse error — the caller shows the guest's
 /// stderr instead). The run's own `stdout`/`stderr` still ride the returned [`PbOutcome`].
-fn onramp_fs_exec_readback(
+pub fn onramp_fs_exec_readback(
     m: &temen_ir::Module,
     image: &[u8],
     argv: &[&[u8]],
@@ -4964,6 +4964,47 @@ impl JitOnrampRun {
         )
     }
 
+    /// Like [`open_shared_run_fs`](Self::open_shared_run_fs), but for a phase guest whose output is a
+    /// **file it writes to the memfs** at key `readback` (nifler `p /in.nim /out.p.nif`), not stdout —
+    /// the shared-window (wasmi-drivable) twin of [`open_owned_run_fs_readback`](Self::open_owned_run_fs_readback).
+    /// After the run [`output`](Self::output) returns that file's bytes. Used by the headless
+    /// nifler-on-wasm-JIT differential gate; the shipped card reaches the same path via the FFI `_finish`.
+    ///
+    /// # Safety
+    /// As [`open_shared_run_fs`](Self::open_shared_run_fs): `[win_ptr, win_size)` must be a live region of
+    /// this module's linear memory, used solely as this run's window, valid until the run is dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn open_shared_run_fs_readback(
+        m: &temen_ir::Module,
+        win_ptr: *mut u8,
+        win_size: u64,
+        win_log2: u8,
+        shared_memory: bool,
+        image: &[u8],
+        argv: &[&[u8]],
+        readback: String,
+    ) -> Result<JitOnrampRun, i32> {
+        let win_base = win_ptr as usize;
+        let back = std::sync::Arc::new(temen_interp::Region::shared(win_ptr, win_size));
+        Self::open_over_run(
+            m,
+            back,
+            None,
+            win_ptr,
+            win_size,
+            win_base,
+            win_log2,
+            shared_memory,
+            RunInput::Fs {
+                image: image.to_vec(),
+                argv: argv.iter().map(|a| a.to_vec()).collect(),
+                stdin: Vec::new(),
+                readback: Some(readback),
+            },
+            None,
+        )
+    }
+
     fn open_owned_run_with(
         m: &temen_ir::Module,
         win_log2: u8,
@@ -5279,7 +5320,7 @@ impl JitOnrampRun {
     /// `.p.nif`, [`fs_readback`](Self::fs_readback)), else `stdout`. `temen_onramp_jit_run_finish` hands
     /// this to the card on the stdout slot, so a JIT phase guest surfaces its produced file exactly as the
     /// bytecode `onramp_fs_exec_readback` does.
-    fn output(&self) -> Vec<u8> {
+    pub fn output(&self) -> Vec<u8> {
         match &self.fs_readback {
             Some((fsh, key)) => {
                 let (files, _dirs) = fsh.seed();

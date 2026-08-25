@@ -704,8 +704,31 @@ pub(crate) unsafe extern "C" fn instantiate(
     fuel: i64,
     trap_out: *mut i64,
 ) -> i32 {
+    let rt_ptr = rt;
     let rt = &*rt;
     let durable = rt.durable.load(Ordering::Acquire);
+    // §14 op-5 — a **separate-module** child (`module >= 0`) gets a full attenuated powerbox: an
+    // Instantiator + AddressSpace + its bound import manifest, so it can `vm_map` (malloc heap growth)
+    // and nest — matching the interpreter, which funnels op 0/5/11/13 through one powerbox path. An
+    // op-0 *self* child (`module < 0`, below) instead runs the parent's own funcs compute-only in its
+    // carve (no powerbox — the durable-nesting design relies on a self child `call.cap` fail-closing).
+    // Route op-5 through the op-13 builder with an **empty** grant list — the exact path the
+    // `child_entry_malloc_binds_vm_map_on_the_jit` gate already proves (it spawns with `grants_n = 0`).
+    // `mem_size = 0` is safe: with no grants the builder reads no grant records from the window. A
+    // durable run is rejected inside `instantiate_module_named` just as the `mod_mem.is_some()` guard
+    // below rejects it here.
+    //
+    // Only when the granted-spawn hooks are installed (`grant_build_named != 0`): a run without them
+    // (the plain `jit_separate_module` differential — a *compute* separate-module child that makes no
+    // `call.cap`) keeps the empty-powerbox path below, matching the interpreter for a capless child
+    // (both tiers return the same value). Delegating unconditionally would `CapFault` such a run at the
+    // absent builder.
+    if module >= 0 && rt.grant_build_named.load(Ordering::Acquire) != 0 {
+        return instantiate_module_named(
+            rt_ptr, mem_base, /*mem_size (unused: 0 grants)*/ 0, handle, module,
+            /*grants_ptr*/ 0, /*grants_n*/ 0, entry, off, size_log2, fuel, trap_out,
+        );
+    }
     let Some((base, size)) = rt.resolve(mem_base, handle, trap_out) else {
         return 0; // `*trap_out` already holds the CapFault
     };
@@ -713,25 +736,23 @@ pub(crate) unsafe extern "C" fn instantiate(
     else {
         return 0; // forged Module handle / no resolver — CapFault set
     };
-    // §4 (DURABILITY.md, "JIT parity" slice 1): a durable run may now nest a **same-module** child.
-    // Its funcs are the parent's own instrumented funcs; a runnable same-module child on the JIT is a
-    // pure-compute (non-may-suspend) func — it has no poll sites, so it runs atomically to completion
-    // in its carve with no durable control-word setup needed (a would-be *instrumented* child hits a
-    // `call.cap` against its empty powerbox → `CapFault`, so it never reaches an unwind). Freezing a
-    // *live* nested child on the JIT — which needs the carve's ctx-0 control words + shadow base seeded
-    // to match the interpreter — is the next slice. A durable **separate-module** child (`mod_mem =
-    // Some`) stays fail-closed (host-supplied module identity + freeze residue are a later slice), as
-    // does `coro_spawn`. Guest-reachable errno, like a bad carve.
+    // Only an op-0 **self** child (`module < 0`, so `mod_mem = None`) reaches here — a separate-module
+    // op-5 child was delegated to `instantiate_module_named` above. A self child runs the parent's own
+    // funcs compute-only in its carve (empty powerbox: a `call.cap` fail-closes with `CapFault`).
+    // §4 (DURABILITY.md, "JIT parity" slice 1): a durable run may nest such a same-module child — a
+    // pure-compute (non-may-suspend) func with no poll sites runs atomically to completion, no durable
+    // control-word setup needed; freezing a *live* nested child on the JIT (ctx-0 control words + shadow
+    // base seeded to match the interpreter) is a later slice. The `mod_mem.is_some()` guard is a dead
+    // defensive backstop now (a self child is always `None`), kept for safety.
     if durable && mod_mem.is_some() {
         return EINVAL as i32;
     }
 
-    // The carve must be a power-of-two-aligned sub-window within `[0, size)` — a child can only get
-    // what the holder sub-allocates (§14/D19) — and a module child's carve must be **at least** its
-    // declared memory (FORK.md §8.6 / #773 — the interp twin funnels op 0/5 through the same shared
-    // `mod_ok`, relaxed to `declared <= carve`). A larger window is a safe superset (confinement,
-    // invariant 2, still masks to the carve) and a malloc child needs the heap room in
-    // `[1<<declared, carve)`. Bad entry index / size / alignment ⇒ `-EINVAL`.
+    // The carve must be a power-of-two-aligned sub-window within `[0, size)` — a child can only get what
+    // the holder sub-allocates (§14/D19). `mod_ok` is trivially true here (`mod_mem = None` for a self
+    // child); the op-5 carve-vs-declared-window relaxation (`declared <= carve`, FORK.md §8.6 / #773)
+    // lives in `instantiate_module_named`, which op-5 delegates to. Bad entry index / size / alignment
+    // ⇒ `-EINVAL`.
     let entry = entry as u64;
     let child_size = if (0..64).contains(&size_log2) {
         1u64 << size_log2
