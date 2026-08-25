@@ -8046,7 +8046,10 @@ fn exec_image_build(
     // C `.bss` guarantee), then write its data segments (bounded to the window by the verifier).
     if let Some(m) = cur_mem {
         let base = m.window.base();
-        m.commit_fresh_image((1u64 << cmem_log2.expect("mod_ok")).min(child_size));
+        // #1059: preserve the command's guard-shifted args region across the image-replace (legacy
+        // `[128, 16384)` for an unmarked command); mirrors the tree-walker exec path.
+        let null_guard = temen_ir::module_null_guard(&cmodule).unwrap_or(0);
+        m.commit_fresh_image((1u64 << cmem_log2.expect("mod_ok")).min(child_size), null_guard);
         for d in cdata.iter() {
             if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
                 for (k, &b) in d.bytes.iter().enumerate() {
