@@ -81,10 +81,14 @@ pub extern "C" fn run() -> i64 {
         put_rec(base, 1, base + 66, 6, out);
         put_rec(base, 2, base + 72, 4, ex);
         // The carve: a 16 MiB (2^24) window, its offset **rounded up to a 2^24 boundary** above the low
-        // records (op-13 requires a power-of-two-aligned sub-window). argv seeds at that carve + 128.
+        // records (op-13 requires a power-of-two-aligned sub-window). #964/#1094: nifler_ce is guarded,
+        // so its `_start` reads argv one guard up — seed at `carve + module_args_base` = carve +
+        // POWERBOX_NULL_GUARD(16384) + POWERBOX_ARGS_BASE(128) = carve + 16512. The guest is a standalone
+        // .ll (no temen_ir constants), so the value is spelled out. The grant records/cap-names stay at
+        // `base + …` in the parent window, read by the op-13 handler — never by the guarded child.
         let mask: i64 = (1 << 24) - 1;
         let carve = (base + 128 + mask) & !mask;
-        let argv = (carve + 128) as *mut u8;
+        let argv = (carve + 16512) as *mut u8;
         (argv as *mut u32).add(0).write(4); // argc
         (argv as *mut u32).add(1).write(0); // envc
         let mut p = 8usize;

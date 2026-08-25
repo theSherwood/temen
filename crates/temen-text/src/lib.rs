@@ -1065,8 +1065,13 @@ fn lex_number(bytes: &[u8], start: usize) -> Result<(Tok, usize), ParseError> {
             .map_err(|_| ParseError(format!("invalid float: {s}")))?;
         Ok((Tok::Float(v), i))
     } else {
+        // Accept the full u64 range: a value in `(i64::MAX, u64::MAX]` lexes to its two's-complement
+        // i64 bit pattern, so an unsigned field printed as plain decimal (e.g. a `debug.var fixed
+        // <addr>` u64 above i64::MAX) round-trips; `parse_u64` reinterprets the bits back. Guards the
+        // nightly `roundtrip` fuzz text-identity property for large unsigned values.
         let v: i64 = s
-            .parse()
+            .parse::<i64>()
+            .or_else(|_| s.parse::<u64>().map(|u| u as i64))
             .map_err(|_| ParseError(format!("integer out of range: {s}")))?;
         Ok((Tok::Int(v), i))
     }
@@ -3442,9 +3447,10 @@ impl<'a> Parser<'a> {
 
     /// Parse a non-negative integer as `u64` (a global's fixed window address).
     fn parse_u64(&mut self) -> Result<u64, ParseError> {
-        let v = self.parse_int()?;
-        u64::try_from(v)
-            .map_err(|_| ParseError(format!("expected a non-negative address, found {v}")))
+        // Reinterpret the i64 token's bits as u64: the lexer stores a u64 literal above i64::MAX as
+        // its two's-complement i64, so a large unsigned value (e.g. a `fixed <addr>`) round-trips.
+        // Small non-negative values are unchanged.
+        Ok(self.parse_int()? as u64)
     }
 
     /// Parse a bare identifier token (e.g. a `debug.var` location kind).
@@ -3899,6 +3905,42 @@ block 0 (v0: i32) {
             "printed text must not contain a raw NUL"
         );
         assert_eq!(parse_module(&printed).expect("re-parse of printed IR"), m);
+    }
+
+    #[test]
+    fn u64_address_above_i64_max_round_trips() {
+        // Nightly `roundtrip` fuzz: a `debug.var … fixed <addr>` holds a u64 window address. A value
+        // above i64::MAX printed as plain decimal used to fail re-lexing (`integer out of range`),
+        // because the lexer parsed integer literals strictly as i64. The lexer now bit-casts u64
+        // literals and `parse_u64` reinterprets them, so any u64 round-trips.
+        let addr = 9583659491648339967u64; // > i64::MAX (the exact fuzz value)
+        assert!(addr > i64::MAX as u64);
+        let m = temen_ir::Module {
+            debug_info: Some(temen_ir::DebugInfo {
+                files: vec![],
+                locs: vec![],
+                types: vec![],
+                vars: vec![temen_ir::VarInfo {
+                    func: 0,
+                    name: "g".into(),
+                    ty: String::new(),
+                    loc: temen_ir::VarLoc::Fixed { addr },
+                    type_id: None,
+                    scope: None,
+                }],
+                blobs: vec![],
+                func_names: vec![],
+            }),
+            ..Default::default()
+        };
+        let parsed = parse_module(&print_module(&m)).expect("re-parse of printed IR");
+        assert_eq!(parsed, m);
+        // The stored address survives exactly.
+        let temen_ir::VarLoc::Fixed { addr: got } = parsed.debug_info.as_ref().unwrap().vars[0].loc
+        else {
+            panic!("expected Fixed loc")
+        };
+        assert_eq!(got, addr);
     }
 
     #[test]

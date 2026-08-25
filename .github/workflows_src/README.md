@@ -29,6 +29,15 @@ identical until the next agent edit.
   locally). (Until copied over, both `workflows-in-sync` and `fuzz targets wired` stay red — the expected
   mirror-edit friction; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
 
+- **`full-depth-lua`: shard per (suite × tier) (`ci.yml`, #1074 follow-up)** — the split landed with a
+  `{bytecode, tree_walker}` matrix, each tier running all three Lua suites in one job under
+  `timeout-minutes: 75`. Validation run #3536 showed the **tree_walker tier alone exceeds 75 min**
+  (bytecode-tier ~35 min; tree_walker-tier hit the 75-min cap and was cancelled). The matrix is now
+  `suite: [lua_tlib, lua_all, lua_sweep] × tier: [bytecode, tree_walker]` = 6 shards, each running one
+  `cargo test --test <suite> -- --ignored <tier>`, so the longest single shard is well under the cap.
+  Same tests/coverage, finer fan-out. (Until copied over, the `workflows-in-sync` guard stays red —
+  the expected mirror-edit friction; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
+
 - **`excluded-crates-compile` per-PR job (`ci.yml`)** — a new lightweight always-on job that
   `cargo check`s the two workspace-EXCLUDED crates, `bench/` (pinned stable) and `fuzz/` (pinned
   `nightly-2026-07-01`, matching the `fuzz` job). Because the always-on `check` job builds only the

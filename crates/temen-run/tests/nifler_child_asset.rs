@@ -58,11 +58,13 @@ fn inflate_asset() -> Option<Vec<u8>> {
 }
 
 /// Build the text-IR op-13 parent that spawns `child` (window `child_sl`, at `carve_off`) with a 3-entry
-/// grant list `{fs, stdout, exit}` and argv `nifler p /in.nim /out.nif` seeded at `carve + 128`. Mirrors
-/// `examples/spawn_child_fs.rs`; `scratch = 0` (the asset is built without `--null-guard`).
-fn parent_src(child_sl: u32, carve_off: u64) -> String {
+/// grant list `{fs, stdout, exit}` and argv `nifler p /in.nim /out.nif` seeded at `carve + args_base`.
+/// Mirrors `examples/spawn_child_fs.rs`. #964/#1094: `args_base` is the child's `module_args_base` — one
+/// guard up for the guarded nifler_ce, the legacy 128 otherwise; the grant records/cap-names stay in the
+/// parent window, read by the op-13 handler in the parent's context (never by the guarded child).
+fn parent_src(child_sl: u32, carve_off: u64, args_base: u64) -> String {
     let parent_sl = child_sl + 1;
-    let argv_off = carve_off + temen_ir::POWERBOX_ARGS_BASE;
+    let argv_off = carve_off + args_base;
     let mut argv_blob = Vec::new();
     argv_blob.extend_from_slice(&4u32.to_le_bytes()); // argc
     argv_blob.extend_from_slice(&0u32.to_le_bytes()); // envc
@@ -154,7 +156,12 @@ fn child_entry_asset_parses_nim_byte_identical_to_native_nifler() {
     let decl = child.memory.as_ref().expect("child window").size_log2 as u32;
     let child_sl = (decl + 3).max(24);
     let carve_off = 1u64 << child_sl;
-    let parent = temen_text::parse_module(&parent_src(child_sl, carve_off)).expect("parse parent");
+    let parent = temen_text::parse_module(&parent_src(
+        child_sl,
+        carve_off,
+        temen_ir::module_args_base(&child),
+    ))
+    .expect("parse parent");
     temen_verify::verify_module(&parent).expect("verify parent");
 
     for (src, expected) in CORPUS {

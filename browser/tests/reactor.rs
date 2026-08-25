@@ -5,8 +5,9 @@
 //! loop; the wasm `temen_onramp_{open,frame,key,close}` exports wrap these same methods.
 //!
 //! Two fixtures, both `clang -O2 -emit-llvm` + `temen-llvm-translate --host-page 65536 --null-guard`
-//! (#964 — `life` has a `main`, so it carries the guarded-layout marker; `bounce` is an entry-less
-//! reactor kernel and stays unmarked):
+//! (#964/#1094 — both carry the guarded-layout marker: `life` via its synthesized `_start`, and
+//! `bounce`, an entry-less `tick`-only kernel, via the entry-less marker temen-llvm now emits — the
+//! reactor host seeds `[0, guard)` unmapped for it just the same):
 //! - `fixtures/bounce.temen` (`display/bounce.c`) — the box's motion is a pure function of its initial
 //!   state + injected key events, asserted to the pixel (animation, input steering, state persistence).
 //! - `fixtures/life.temen` (`display/life.c`) — Conway's Game of Life on a **malloc heap above the

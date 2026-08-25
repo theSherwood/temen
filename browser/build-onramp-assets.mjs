@@ -8,11 +8,12 @@
 //
 // Every clang-translated asset also gets **`--null-guard`** (#964): the guarded powerbox layout
 // (`__null_guard`-marked, scratch/args one guard up) so a NULL dereference traps on every tier.
-// The marker rides the synthesized `_start`, so an entry-less reactor kernel (gradient, bounce,
-// mandelzoom, gpu_shader — `tick` only, no `main`) stays unmarked and keeps the legacy behavior.
-// chibicc stays on the legacy layout (its own codegen bakes the legacy ABI for the programs it
-// compiles), as do the committed chibicc-compiled shell fixtures and the unrebuildable nim assets —
-// the marker gates everything, so mixed old/new assets coexist.
+// The marker rides the synthesized `_start` for a `main` program; #1094 extended it to **entry-less
+// reactor kernels** too (gradient, bounce, mandelzoom, gpu_shader — `tick` only, no `main`): under the
+// guard temen-llvm bases their globals one guard up and marks them (aliasing the first function), so
+// they no longer stay a legacy carve-out and a NULL deref in a kernel traps like everywhere else.
+// The remaining un-guarded assets are the ones this toolchain can't rebuild here (the nim assets need
+// nimony); the marker gates the layout, so mixed old/new assets coexist until they are regenerated.
 //
 // Usage:  node build-onramp-assets.mjs           (builds whatever the toolchain + caches allow)
 // Needs `clang`/`llvm-dis` on PATH. SQLite/Lua sources are fetched-and-cached (skipped offline).
