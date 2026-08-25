@@ -18476,6 +18476,34 @@ impl Host {
         self.pipe_wake_writers.take()
     }
 
+    /// #1080 rung 4 — pipe-read readiness for the **bytecode cooperative driver**, which POLLS instead
+    /// of holding scheduler-side `pipe_waiters`: a parked reader re-checks its pipe each settle and
+    /// re-admits (re-executes the rewound read) once ready — bytes buffered, OR every writer closed
+    /// (EOF). A vanished pipe reads ready (the re-run fails closed). `pipe` is the domain-local index
+    /// the read park flag reports. Byte-identical to the tree-walker's `Step::Park(PipeRead)` re-check.
+    pub(crate) fn pipe_read_ready(&self, pipe: u32) -> bool {
+        match self.pipes.get(pipe as usize) {
+            Some((fifo, writers, _, _)) => {
+                !fifo.lock_unpoisoned().is_empty()
+                    || writers.load(std::sync::atomic::Ordering::SeqCst) == 0
+            }
+            None => true,
+        }
+    }
+
+    /// #1080 rung 4 — pipe-write readiness (backpressure) for the bytecode cooperative driver: ready
+    /// when the FIFO has room under `PIPE_CAP`, OR every reader closed (the re-run writes / `-EPIPE`s).
+    /// The write twin of [`Self::pipe_read_ready`].
+    pub(crate) fn pipe_write_ready(&self, pipe: u32) -> bool {
+        match self.pipes.get(pipe as usize) {
+            Some((fifo, _, readers, _)) => {
+                fifo.lock_unpoisoned().len() < PIPE_CAP
+                    || readers.load(std::sync::atomic::Ordering::SeqCst) == 0
+            }
+            None => true,
+        }
+    }
+
     /// #796 L1 — set the transient "a signal interrupted a blocking syscall" flag, so the next re-run of
     /// an interruptible pipe read/write in this domain completes `-EINTR`. Set by the scheduler on a
     /// parked vCPU's host as it re-admits it ([`Scheduler::interrupt_interruptible_parks`]).

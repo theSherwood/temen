@@ -1175,6 +1175,60 @@ int main(void) {
     );
 }
 
+/// #1080 rung 4 — a **blocking pipe read across fork on the bytecode engine** (the `echo … | cat`
+/// shape): the parent forks a writer twin and closes its own write copy; the twin spins slow then
+/// writes and exits. The parent's first `read` BLOCKS on the empty FIFO (`Blocked::PipeRead` → the
+/// cooperative driver's `BlockedPipeRead`, woken by the settle-scan readiness poll when the twin's
+/// bytes land); the second `read` BLOCKS then EOFs (0) when the twin's exit drops its write end
+/// (writers → 0). Differentialled against the tree-walker (both engines return 42).
+#[test]
+fn c_a_blocking_pipe_read_across_fork_on_bytecode() {
+    // Uses the #972 CorePipe (`PIPE_SHIM`: `pipe`/`read`/`write`/`close` over `__vm_*` with parking) —
+    // bash's actual pipe path — not the personality `__px_pipe` (no writer-count blocking).
+    let src = format!(
+        "{WIN_PAD_17}{PIPE_SHIM}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+static int fds[2];\n\
+static int status;\n\
+static char b[8];\n\
+static volatile long acc;\n\
+static long pid;\n\
+int main(void) {{\n\
+  if (pipe(fds) != 0) return 1;\n\
+  pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 2;\n\
+  if (pid == 0) {{\n\
+    close(fds[0]);                                       /* twin: drop the read end */\n\
+    for (long i = 0; i < 30000; i = i + 1) acc = acc + 1; /* slow: the parent's read must BLOCK */\n\
+    write(fds[1], \"hi!\", 3);\n\
+    return 7;                                            /* exit closes the twin's write end -> EOF */\n\
+  }}\n\
+  long n = read(fds[0], b, 8);                           /* BLOCKS (parent+twin hold write ends) */\n\
+  if (n != 3) return 300 + (int)n;\n\
+  if (b[0] != 'h' || b[1] != 'i' || b[2] != '!') return 4;\n\
+  close(fds[1]);                                         /* drop the parent's write end; the twin exited */\n\
+  long m = read(fds[0], b, 8);                           /* EOF (0): no writers remain */\n\
+  if (m != 0) return 400 + (int)m;\n\
+  if (__px_waitpid(0, pid, (long)&status, 0) != pid) return 6;\n\
+  if (((status >> 8) & 0xff) != 7) return 8;\n\
+  return 42;\n\
+}}\n"
+    );
+    let interp = run_interp_only(&src, |_| {});
+    assert_eq!(
+        interp.result,
+        vec![Value::I32(42)],
+        "tree-walker blocking pipe read across fork"
+    );
+    let byte = run_bytecode_only(&src, |_| {});
+    assert_eq!(
+        byte.result,
+        vec![Value::I32(42)],
+        "bytecode: blocking pipe read parked + woken by the writer twin, EOF on its exit — matching the oracle"
+    );
+}
+
 /// #799 — **`waitpid(-pgid)` on the personality table**: two twins `setpgid` into one group led
 /// by the first; both are killed with one `kill(-pgid)`; two `waitpid(-pgid)` calls group-reap
 /// exactly them (the zombie entries retain their pgid), and a third finds the group empty.
