@@ -4,7 +4,7 @@
 //! a page-op region, and a span at fuzzer-chosen offsets/lengths; the leaf tiers up onto emitted wasm
 //! (run under `wasmi`) and must trap `MemoryFault` at exactly the pages the interpreter does. A crash is a
 //! paged-walk confinement miscompile — the fourth confinement lowering, unfuzzed until now (`wasm_diff`
-//! suppresses cap.call/page-op modules). The stable `paged_walk` test drives the *same* `fuzz_one` from
+//! suppresses call.cap/page-op modules). The stable `paged_walk` test drives the *same* `fuzz_one` from
 //! seeds; INVARIANTS #2/#9, AGENTS.md ("fuzz the masking lowering as its own unit").
 //!
 //! Run: `cargo +nightly fuzz run paged_walk`

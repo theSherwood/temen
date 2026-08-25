@@ -157,8 +157,8 @@ fn check(src: &str) {
 const TWO_CLOCK_READS: &str = r#"memory 17
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = cap.call 2 0 () -> (i64) v0 ()
-  v2 = cap.call 2 0 () -> (i64) v0 ()
+  v1 = call.cap 2 0 () -> (i64) v0 ()
+  v2 = call.cap 2 0 () -> (i64) v0 ()
   v3 = i64.add v1 v2
   return v3
   }
@@ -176,12 +176,12 @@ fn single_fiber_clock_freeze_thaw_round_trip() {
 const MULTI_LIVE: &str = r#"memory 17
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = cap.call 2 0 () -> (i64) v0 ()
+  v1 = call.cap 2 0 () -> (i64) v0 ()
   v2 = i64.const 7
   v3 = i64.add v1 v2
   v7 = i64.const 3
   v8 = i64.mul v1 v7
-  v5 = cap.call 2 0 () -> (i64) v0 ()
+  v5 = call.cap 2 0 () -> (i64) v0 ()
   v6 = i64.add v3 v5
   v9 = i64.add v6 v8
   return v9

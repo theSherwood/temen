@@ -122,7 +122,7 @@ mod op {
     pub const FMA: u8 = 0x7D; // scalar fused multiply-add: ty byte (0=f32,1=f64), a, b, c
     pub const IMPORT_ATTACH: u8 = 0x7E; // v4: import idx, handle operand idx -> i32 status
                                         // 0x7F (was CAP_SELF_LABEL), 0xBE (was CAP_SELF_ATTEST): retired in the wire rev
-                                        // (#900) — the `cap.self.*` reflection ops are now `cap.call CAP_SELF op N`. Left as
+                                        // (#900) — the `self.*` reflection ops are now `call.cap CAP_SELF op N`. Left as
                                         // gaps — not renumbered, not reused.
 
     // v9 link-form data addresses (D-LINK), decodable **only in the object dialect** (header
@@ -267,7 +267,7 @@ const MAGIC: [u8; 4] = *b"SVM\x00";
 // type-section **shape reference** (`func <t>` / `interface <t>`) replacing the inline signature —
 // gives interface elements **required op names** (the coverage-binding contract), adds the
 // `call.import` consumer-local `op` immediate, the dynamic-mode `call.import` form (type-section
-// reference + runtime handle), `export.handle`, the `cap.self.type_id`/`covers` reflection ops,
+// reference + runtime handle), `export.handle`, the `self.type_id`/`covers` reflection ops,
 // and reserves the `cap` value type (i32-width handle marker, translation deferred).
 // v6 adds the **interface section** (OQ3: module-level interface declarations — each entry an
 // ordered op-signature list) and the impl-export `iface` reference (an offer declares which
@@ -695,7 +695,7 @@ fn encode_func(out: &mut Vec<u8>, f: &Func, object: bool) {
 
 fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
     match inst {
-        // Manifest capability call, mirroring `cap.call` but carrying an import *index* (into
+        // Manifest capability call, mirroring `call.cap` but carrying an import *index* (into
         // the module's import section) instead of a bound `(type_id, op)`: dispatch goes through
         // the instance's slot binding — the bytes are never rewritten.
         Inst::CallImport {
@@ -784,8 +784,8 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             write_uleb(out, *import as u64);
             write_uleb(out, *handle as u64);
         }
-        // §7 capability reflection: `cap.self.count`/`get`/`resolve`/`label`/`attest` are no longer
-        // distinct wire ops — they encode as their `cap.call CAP_SELF op N` form (the generic
+        // §7 capability reflection: `self.count`/`get`/`resolve`/`label`/`attest` are no longer
+        // distinct wire ops — they encode as their `call.cap CAP_SELF op N` form (the generic
         // `Inst::CapCall` arm above).
         // v7 §3.5 reflection: intern own type entry / probe coverage of a held handle.
         Inst::CapSelfTypeId { ty } => {
@@ -2269,8 +2269,8 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
             import: c.idx()?,
             handle: c.idx()?,
         },
-        // 0x7F/0xBE (the retired `cap.self.*` reflection opcodes) are wire gaps now — the ops
-        // travel as `cap.call CAP_SELF op N` (decoded by the `CAP_CALL` arm).
+        // 0x7F/0xBE (the retired `self.*` reflection opcodes) are wire gaps now — the ops
+        // travel as `call.cap CAP_SELF op N` (decoded by the `CAP_CALL` arm).
         op::VCPU_TLS_GET => Inst::VcpuTlsGet,
         op::VCPU_TLS_SET => Inst::VcpuTlsSet { val: c.idx()? },
         op::DURABLE_SHADOW_BASE => Inst::DurableShadowBase,

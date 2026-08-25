@@ -25,8 +25,8 @@ fn runaway_child_src(quota: i64) -> String {
          \x20 v2 = i64.const 0\n\
          \x20 v3 = i64.const 12\n\
          \x20 v4 = i64.const {quota}\n\
-         \x20 v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)\n\
-         \x20 v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)\n\
+         \x20 v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)\n\
+         \x20 v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)\n\
          \x20 return v6\n\
            }}\n\
          }}\n\

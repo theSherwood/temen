@@ -73,7 +73,7 @@ use temen_ir::{
 };
 
 /// Resolve an interned call type index (#922) to its [`FuncType`] — the index a call variant
-/// (`call_indirect`, `cap.call`, …) carries in place of an inline signature. A miss returns a
+/// (`call_indirect`, `call.cap`, …) carries in place of an inline signature. A miss returns a
 /// static empty signature so callers stay total (the module was already verified, so a well-formed
 /// index always resolves to a `Func`).
 fn sig_of(types: &[TypeEntry], t: u32) -> &FuncType {
@@ -801,12 +801,12 @@ fn is_nested_leaf_cap(type_id: u32, op: u32) -> bool {
     type_id == cap_id::ADDRESS_SPACE && (op == 3 || op == 4)
 }
 
-/// Outline each [`is_nested_leaf_cap`] `cap.call` into an appended int-signature wrapper (exactly
+/// Outline each [`is_nested_leaf_cap`] `call.cap` into an appended int-signature wrapper (exactly
 /// [`outline_cap_calls`]'s rewrite, restricted to that allowlist) so a §14 unit's entry that carves
 /// its window (`sub`) or queries `page_size` becomes emittable: the wrapper stays a cross-tier leaf
 /// [`compile_module_nested`] routes through `env.call_interp`. The host's `call_interp` callback must
 /// carry the run's **powerbox** (the reactor-path contract, not the throwaway-window one), so the
-/// wrapper's `cap.call` resolves against the same live `Host` the oracle uses — `sub`'s minted handle
+/// wrapper's `call.cap` resolves against the same live `Host` the oracle uses — `sub`'s minted handle
 /// then encodes identically on both tiers. INSTANTIATOR ops stay **inline** (the dedicated
 /// `env.instantiate`/`env.join` bounce); all other cap ops are left inline and fail closed.
 pub fn outline_nested_cap_calls(m: &mut Module) {
@@ -1086,7 +1086,7 @@ fn module_atomics_ok(m: &Module) -> bool {
 ///   (`Mem::scalar_extent`) before every emitted call — a grow the scalar can't represent (sparse,
 ///   non-`Rw` prot) makes the driver *decline* tier-up for that call, so the emitted tier never
 ///   over- or under-admits relative to the interpreter. The `map`-containing function itself is
-///   still never emitted (a remapping `cap.call` is not in-subset); only its pure siblings are.
+///   still never emitted (a remapping `call.cap` is not in-subset); only its pure siblings are.
 ///   `page_size` (3) / `sub` (4) are a pure query / attenuation-mint and do **not** count either
 ///   (the emittable [`is_nested_leaf_cap`] set).
 /// - **SHARED_REGION** (iface 4): `map` (0) aliases host backing into window pages (the emitted
@@ -1514,7 +1514,7 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
     )
 }
 
-/// Emit a **§14 VM-in-VM** unit: like [`compile_module_with`], but a `cap.call` to INSTANTIATOR
+/// Emit a **§14 VM-in-VM** unit: like [`compile_module_with`], but a `call.cap` to INSTANTIATOR
 /// `instantiate` (op 0) / `join` (op 1) is lowered to a host-driver bounce (`env.instantiate` /
 /// `env.join`) instead of failing out-of-subset — so a unit whose entry spawns a nested confined VM
 /// runs on the wasm tier, the child spawn/join happening host-side exactly as the interpreter surfaces
@@ -1628,7 +1628,7 @@ pub fn compile_module_nested(m: &Module, shared_memory: bool) -> Result<Vec<u8>,
 /// Both modes emit the **same** nested import set (`env.instantiate`/`join`/`thread_spawn`/…), so a
 /// host driving this artifact provides that one import layout regardless of the chosen mode. This
 /// folds the browser's hand-rolled nested→threaded fallback into the library. Entry is func 0 (the
-/// unit entry the nested emit roots at). Outline §14 ADDRESS_SPACE `cap.call`s
+/// unit entry the nested emit roots at). Outline §14 ADDRESS_SPACE `call.cap`s
 /// ([`outline_nested_cap_calls`]) before calling if the host's `call_interp` carries a powerbox;
 /// otherwise a `sub`/`page_size` entry simply falls to the interpreter-driven mode.
 ///
@@ -1699,12 +1699,12 @@ pub fn compile_module_b2(
     )
 }
 
-/// **Cap-call outlining** — hoist every inline `cap.call` into a synthetic single-block wrapper
+/// **Cap-call outlining** — hoist every inline `call.cap` into a synthetic single-block wrapper
 /// function, rewriting the call site to a plain [`Inst::Call`]. Semantics-preserving (the wrapper
-/// does the *identical* `cap.call`), but it moves the host-boundary op out of otherwise-emittable
+/// does the *identical* `call.cap`), but it moves the host-boundary op out of otherwise-emittable
 /// functions: the wrapper has an all-integer signature (a capability handle is `i32`, its op args/
 /// results are `i64`), so it is a **cross-tier callable** leaf, while the function that used to hold
-/// the `cap.call` becomes pure compute + a `Call` and can now emit. This is the compiler doing, on the
+/// the `call.cap` becomes pure compute + a `Call` and can now emit. This is the compiler doing, on the
 /// IR, what a guest author would do by hand (moving `__vm_host_call` into a `noinline` shim) — so an
 /// **unmodified** reactor whose hot `tick` interleaves compute with a once-per-frame `present`/`poll`
 /// cap call runs its hot path on emitted wasm, bouncing to the interpreter only at the (rare) cap site.
@@ -1712,7 +1712,7 @@ pub fn compile_module_b2(
 /// Existing [`FuncIdx`](temen_ir::FuncIdx)es are unchanged — wrappers are **appended** — so exports,
 /// call sites, the function table, and debug locs (all keyed by the original indices) stay valid. The
 /// rewrite is **1:1** at each call site: a `Call` to a wrapper appends exactly the wrapper's results,
-/// which equal the `cap.call`'s `sig.results`, so block-local value numbering is preserved (no
+/// which equal the `call.cap`'s `sig.results`, so block-local value numbering is preserved (no
 /// renumbering — the same property the linker-only [`temen_ir::resolve_imports_with`] relies on).
 ///
 /// Named manifest imports are **not** rewritten here (or anywhere — the runtime binds each import
@@ -1723,9 +1723,9 @@ pub fn compile_module_b2(
 /// It outlines the host-boundary ops the same way: [`Inst::CapCall`], [`Inst::CallImport`] (an
 /// executable manifest import, IMPORTS.md phase 3 — the wrapper carries the `call.import` to the
 /// import-capable interpreter tier, so an import-bearing guest emits without resolution or rewrite),
-/// and [`Inst::CallSym`]. The §7 runtime by-name capability lookup (`cap.self.resolve`) rides through
-/// the `CapCall` arm now (it is a `cap.call CAP_SELF op 2`): that matters for a `_start` that resolves
-/// names at startup — otherwise pure compute + stores, so hoisting its handful of `cap.self.resolve`s
+/// and [`Inst::CallSym`]. The §7 runtime by-name capability lookup (`self.resolve`) rides through
+/// the `CapCall` arm now (it is a `call.cap CAP_SELF op 2`): that matters for a `_start` that resolves
+/// names at startup — otherwise pure compute + stores, so hoisting its handful of `self.resolve`s
 /// into cross-tier wrappers makes func 0 itself emittable — the last thing keeping a QuickJS-scale
 /// guest (whose hot interpreter loop is all in-subset) off the wasm tier.
 pub fn outline_cap_calls(m: &mut Module) {
@@ -1751,7 +1751,7 @@ pub fn outline_cap_calls(m: &mut Module) {
                     params.push(ValType::I32);
                     params.extend(ft.params.iter().copied());
                     let nparams = params.len() as u32;
-                    // Body: `cap.call` on the wrapper's own params (handle = val 0, args = vals 1..),
+                    // Body: `call.cap` on the wrapper's own params (handle = val 0, args = vals 1..),
                     // then return its results (appended right after the params).
                     let wrapper_args: Vec<u32> = (1..nparams).collect();
                     let ret: Vec<u32> = (nparams..nparams + ft.results.len() as u32).collect();
@@ -4486,7 +4486,7 @@ fn emit_block_body(
                 uleb(code, MEM_NOTIFY_IMPORT_IDX as u64);
                 set_result(cx, code, k, &mut next_val);
             }
-            // §14 VM-in-VM bounce (opt-in `nested_caps`): a `cap.call` to INSTANTIATOR
+            // §14 VM-in-VM bounce (opt-in `nested_caps`): a `call.cap` to INSTANTIATOR
             // `instantiate`/`join` marshals its operands to a host import (`env.instantiate` /
             // `env.join`, the funcref-table-free analog of `env.call_interp`) that spawns/joins the
             // confined child vCPU host-side — exactly as the interpreter surfaces `VcpuStop::Instantiate`

@@ -1,4 +1,4 @@
-//! §13 SharedRegion — end-to-end through the real `cap.call` dispatch (iface 4): a host-granted
+//! §13 SharedRegion — end-to-end through the real `call.cap` dispatch (iface 4): a host-granted
 //! shared region mapped into the window at *two* offsets aliases the same bytes, so a store at one
 //! offset is visible at a load from the other — including the **magic ring buffer** (adjacent
 //! mappings + a single access *straddling the seam*, which wraps tail→head as one contiguous
@@ -23,11 +23,11 @@ fn alias_probe_src() -> String {
         "memory 17\n\
          func (i32) -> (i64) {{\n\
          block 0 (v0: i32) {{\n\
-         \x20 v1 = cap.call 4 3 () -> (i64) v0 ()\n\
+         \x20 v1 = call.cap 4 3 () -> (i64) v0 ()\n\
          \x20 v2 = i64.const 0\n\
          \x20 v3 = i32.const 3\n\
-         \x20 v4 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v0 (v2, v2, v1, v3)\n\
-         \x20 v5 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v0 (v1, v2, v1, v3)\n\
+         \x20 v4 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (v2, v2, v1, v3)\n\
+         \x20 v5 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (v1, v2, v1, v3)\n\
          \x20 v6 = i64.const {MARKER}\n\
          \x20 i64.store v2 v6\n\
          \x20 v7 = i64.load v1\n\
@@ -65,10 +65,10 @@ fn shared_region_without_second_mapping_is_not_aliased() {
         "memory 17\n\
          func (i32) -> (i64) {{\n\
          block 0 (v0: i32) {{\n\
-         \x20 v1 = cap.call 4 3 () -> (i64) v0 ()\n\
+         \x20 v1 = call.cap 4 3 () -> (i64) v0 ()\n\
          \x20 v2 = i64.const 0\n\
          \x20 v3 = i32.const 3\n\
-         \x20 v4 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v0 (v2, v2, v1, v3)\n\
+         \x20 v4 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (v2, v2, v1, v3)\n\
          \x20 v6 = i64.const {MARKER}\n\
          \x20 i64.store v2 v6\n\
          \x20 v7 = i64.load v1\n\
@@ -112,11 +112,11 @@ fn ring_buffer_straddling_access_wraps_differential() {
         "memory 17\n\
          func (i32) -> (i64) {{\n\
          block 0 (v0: i32) {{\n\
-         \x20 v1 = cap.call 4 3 () -> (i64) v0 ()\n\
+         \x20 v1 = call.cap 4 3 () -> (i64) v0 ()\n\
          \x20 v2 = i64.const 0\n\
          \x20 v3 = i32.const 3\n\
-         \x20 v4 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v0 (v2, v2, v1, v3)\n\
-         \x20 v5 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v0 (v1, v2, v1, v3)\n\
+         \x20 v4 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (v2, v2, v1, v3)\n\
+         \x20 v5 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (v1, v2, v1, v3)\n\
          \x20 v6 = i64.const 4\n\
          \x20 v7 = i64.sub v1 v6\n\
          \x20 v8 = i64.const {RING_MARKER}\n\

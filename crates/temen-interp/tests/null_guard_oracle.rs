@@ -29,7 +29,7 @@ block 0 (v0: i64) {
 }
 func (i32, i64, i64) -> (i64) {
 block 0 (vas: i32, voff: i64, vlen: i64) {
-  vr = cap.call 5 1 (i64, i64) -> (i64) vas (voff, vlen)
+  vr = call.cap 5 1 (i64, i64) -> (i64) vas (voff, vlen)
   return vr
   }
 }
@@ -113,7 +113,7 @@ fn page_ops_below_the_guard_are_refused() {
         // SAFETY: `base` is `win` valid bytes owned here; the Region aliases it only for this run.
         let back = Arc::new(unsafe { Region::shared(base, win as u64) });
         let mut host = Host::new();
-        let asl = host.grant_memory(); // the AddressSpace handle the guest's cap.call names
+        let asl = host.grant_memory(); // the AddressSpace handle the guest's call.cap names
         let mut vcpu = bytecode::Vcpu::new_root_with_powerbox(
             &prog,
             2,

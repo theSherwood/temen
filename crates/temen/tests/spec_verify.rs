@@ -793,14 +793,14 @@ fn spec_agreement_on_v7_grouped_surface() {
     reject(&m, "export.handle past the offer table", |e| {
         matches!(e, VerifyError::ExportHandleOutOfRange { .. })
     });
-    // `cap.self.type_id` must reference a well-formed interface entry.
+    // `self.type_id` must reference a well-formed interface entry.
     let m = module(vec![func(
         vec![],
         vec![],
         vec![Inst::CapSelfTypeId { ty: 0 }],
         T::Return(vec![]),
     )]);
-    reject(&m, "cap.self.type_id with no such interface", |e| {
+    reject(&m, "self.type_id with no such interface", |e| {
         matches!(e, VerifyError::DynIfaceInvalid { .. })
     });
     let _ = V::I32;

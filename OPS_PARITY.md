@@ -474,13 +474,13 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 
 | op | temen-tree-walk | temen-bytecode | temen-jit | temen-wasm-jit | notes |
 |----|:----:|:----:|:----:|:----:|-------|
-| `cap.call` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `call.cap` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `vcpu.tls.get` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `vcpu.tls.set` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `export.handle` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `import.attach` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
-| `cap.self.type_id` | ✅ | ✅ | ✅ | ⛔ | host cap/handle op — serviced by the oracle, not emitted |
-| `cap.self.covers` | ✅ | ✅ | ✅ | ⛔ | host cap/handle op — serviced by the oracle, not emitted |
+| `self.type_id` | ✅ | ✅ | ✅ | ⛔ | host cap/handle op — serviced by the oracle, not emitted |
+| `self.covers` | ✅ | ✅ | ✅ | ⛔ | host cap/handle op — serviced by the oracle, not emitted |
 | `call.import` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `call.import.dyn` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `call.sym` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |

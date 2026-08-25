@@ -129,14 +129,14 @@ const FUEL_BC: &str = "declines the module (folds to the oracle) rather than add
 const EXEC_GAP: &str =
     "eval-loop-only image-replace (Step::Exec); the fast tiers decline the module and fold to the oracle (FORK.md §8.6)";
 
-/// Reserved cap-interface ids and self-namespace op numbers that appear **directly** in `cap.call`
+/// Reserved cap-interface ids and self-namespace op numbers that appear **directly** in `call.cap`
 /// IR encoding. These mirror `temen_interp::cap_id` and the `temen_interp::CAP_SELF_*` op constants
 /// (pinned equal by the conformance test `capcall_op_numbers_match_the_interpreter`) — duplicated
 /// here as bare data so the classifier keeps its "no backend dep" property (see `Cargo.toml`).
 pub mod capcall {
     /// `temen_interp::cap_id::INSTANTIATOR` — the §14 VM-in-VM interface.
     pub const INSTANTIATOR: u32 = 6;
-    // The self-namespace ops ride `cap.call CAP_SELF_TYPE_ID <op>` (`temen_ir::CAP_SELF_TYPE_ID`).
+    // The self-namespace ops ride `call.cap CAP_SELF_TYPE_ID <op>` (`temen_ir::CAP_SELF_TYPE_ID`).
     pub const SVC_POLL: u32 = 9;
     pub const SVC_WAIT: u32 = 10;
     pub const CLONE_CALLER: u32 = 11;
@@ -145,10 +145,10 @@ pub mod capcall {
     pub const EXEC: u32 = 14;
 }
 
-/// Classify a `cap.call` sub-op `(type_id, op)` across the four backends. The generic host-cap case
+/// Classify a `call.cap` sub-op `(type_id, op)` across the four backends. The generic host-cap case
 /// lowers on both interpreters and Cranelift and leaf-folds on the wasm-JIT; the process / serve /
 /// fork self-namespace ops carve out their real, narrower parity (the load-bearing honesty fix — a
-/// single `cap.call` row used to hide that the fork ops run only on the oracle).
+/// single `call.cap` row used to hide that the fork ops run only on the oracle).
 fn parity_capcall(type_id: u32, op: u32) -> [Cell; 4] {
     let self_ty = temen_ir::CAP_SELF_TYPE_ID;
     let leaf = cell(Status::Declines, LEAF);
@@ -156,7 +156,7 @@ fn parity_capcall(type_id: u32, op: u32) -> [Cell; 4] {
         // §14 executor children — instantiate (0) / join (1) / instantiate_module (5) /
         // instantiate_module_named (13) / child_offer (14) / instantiate_rec (17): native on both
         // interpreters (`Op::Instantiate`/`InstJoin`/`InstantiateModule`/`ChildOffer`/…) and on
-        // Cranelift (`instantiator_rt`). The wasm-JIT leaf-folds the cap.call to the interp.
+        // Cranelift (`instantiator_rt`). The wasm-JIT leaf-folds the call.cap to the interp.
         (capcall::INSTANTIATOR, 0 | 1 | 5 | 13 | 14 | 17) => [F, F, F, leaf],
 
         // §3.6 service points — `svc.poll` (9) / `svc.wait` (10): both fast backends compile them to
@@ -198,7 +198,7 @@ fn parity_capcall(type_id: u32, op: u32) -> [Cell; 4] {
             leaf,
         ],
 
-        // Generic host `cap.call` (Stream / Clock / Memory / host-fn / JIT-compile / …) and every
+        // Generic host `call.cap` (Stream / Clock / Memory / host-fn / JIT-compile / …) and every
         // other cap sub-op: native on both interpreters and Cranelift's cap-call thunk; wasm leaf.
         _ => [F, F, F, leaf],
     }
@@ -275,9 +275,9 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
 
         // ---- Calls. Direct/indirect calls lower on both JITs. -----------------------------------
         Inst::Call { .. } | Inst::CallIndirect { .. } => row(F, F),
-        // `cap.call` is a **family**, not one op: generic host caps lower on both interpreters and
+        // `call.cap` is a **family**, not one op: generic host caps lower on both interpreters and
         // Cranelift's cap-call thunk, but the process/serve/fork self-namespace ops (encoded as
-        // `cap.call` sub-ops) have their own, narrower parity — the fork substrate runs only on the
+        // `call.cap` sub-ops) have their own, narrower parity — the fork substrate runs only on the
         // tree-walk oracle today. Classify by `(type_id, op)`. (INVARIANTS.md #9; FORK.md §8.5;
         // ISSUES.md I36.)
         Inst::CapCall { type_id, op, .. } => parity_capcall(*type_id, *op),
@@ -292,9 +292,9 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
         | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. } => row(F, cell(Status::Declines, LEAF)),
 
-        // ---- §3.5 capability reflection (`cap.self.type_id`/`covers`): Cranelift services them via a
-        // host thunk; the wasm-JIT leaf folds them to the interpreter. (`cap.self.count`/`get`/
-        // `resolve`/`label`/`attest` are now `cap.call CAP_SELF` — covered by the `CapCall` row.) ----
+        // ---- §3.5 capability reflection (`self.type_id`/`covers`): Cranelift services them via a
+        // host thunk; the wasm-JIT leaf folds them to the interpreter. (`self.count`/`get`/
+        // `resolve`/`label`/`attest` are now `call.cap CAP_SELF` — covered by the `CapCall` row.) ----
         Inst::CapSelfTypeId { .. } | Inst::CapSelfCovers { .. } => {
             row(F, cell(Status::Declines, HOST_OP))
         }

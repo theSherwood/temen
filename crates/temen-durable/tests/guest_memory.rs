@@ -56,7 +56,7 @@ block 0 (v0: i32) {{\n\
   v2 = i64.const 77\n\
   i64.store v1 v2\n\
   v3 = i32.const 0\n\
-  v4 = cap.call 2 0 (i32) -> (i64) v0 (v3)\n\
+  v4 = call.cap 2 0 (i32) -> (i64) v0 (v3)\n\
   v5 = i64.load v1\n\
   v6 = i64.add v4 v5\n\
   return v6\n\
@@ -112,7 +112,7 @@ fn strict_path_rejects_the_same_memory_using_guest() {
 fn window_smaller_than_the_reserve_is_rejected() {
     // A window that cannot even hold the reserved region is too small.
     let mut m = temen_text::parse_module(
-        "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n",
+        "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n",
     )
     .unwrap();
     m.memory = Some(Memory { size_log2: 12 }); // 4 KiB < 64 KiB reserve

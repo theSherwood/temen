@@ -2,7 +2,7 @@
 //! tier ([`compile_module_tierup_paged`]), the escalation past emit-nothing for self-page-managing
 //! guests. Per AGENTS.md this lowering is fuzz/boundary-tested as its own masking-hinge unit.
 //!
-//! A paged guest `unmap`s / `protect`s its own pages (`cap.call 5 1/2` — interp-serviced; such
+//! A paged guest `unmap`s / `protect`s its own pages (`call.cap 5 1/2` — interp-serviced; such
 //! functions are never emitted), then a tiered-up leaf accesses the window on emitted wasm. The
 //! driver contract: before each emitted call, refresh the byte-per-page state table (`0 = Unmapped`,
 //! `1 = Rw`, `2 = Ro`) from the live page map ([`bytecode::Vcpu::mem_map_info`]), write its base to
@@ -39,7 +39,7 @@ const WIN_LOG2: u8 = 17;
 const UNMAP_LOAD: &str = r#"memory 17
 func (i32, i64, i64, i64) -> (i64) {
 block 0 (vas: i32, voff: i64, vlen: i64, vprobe: i64) {
-  vr = cap.call 5 1 (i64, i64) -> (i64) vas (voff, vlen)
+  vr = call.cap 5 1 (i64, i64) -> (i64) vas (voff, vlen)
   v1 = call 1 (vprobe)
   return v1
   }
@@ -57,7 +57,7 @@ block 0 (v0: i64) {
 const UNMAP_STORE: &str = r#"memory 17
 func (i32, i64, i64, i64) -> (i64) {
 block 0 (vas: i32, voff: i64, vlen: i64, vprobe: i64) {
-  vr = cap.call 5 1 (i64, i64) -> (i64) vas (voff, vlen)
+  vr = call.cap 5 1 (i64, i64) -> (i64) vas (voff, vlen)
   v1 = call 1 (vprobe)
   return v1
   }
@@ -78,7 +78,7 @@ func (i32, i64, i64, i64) -> (i64) {
 block 0 (vas: i32, voff: i64, vlen: i64, vprobe: i64) {
   i64.store vprobe vprobe
   vp = i32.const 1
-  vr = cap.call 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vp)
+  vr = call.cap 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vp)
   v1 = call 1 (vprobe)
   return v1
   }
@@ -96,7 +96,7 @@ const PROTECT_STORE: &str = r#"memory 17
 func (i32, i64, i64, i64) -> (i64) {
 block 0 (vas: i32, voff: i64, vlen: i64, vprobe: i64) {
   vp = i32.const 1
-  vr = cap.call 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vp)
+  vr = call.cap 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vp)
   v1 = call 1 (vprobe)
   return v1
   }
@@ -116,7 +116,7 @@ block 0 (v0: i64) {
 const UNMAP_FILL: &str = r#"memory 17
 func (i32, i64, i64, i64) -> (i64) {
 block 0 (vas: i32, voff: i64, vlen: i64, vprobe: i64) {
-  vr = cap.call 5 1 (i64, i64) -> (i64) vas (voff, vlen)
+  vr = call.cap 5 1 (i64, i64) -> (i64) vas (voff, vlen)
   v1 = call 1 (vprobe)
   return v1
   }
@@ -137,7 +137,7 @@ const PROTECT_FILL: &str = r#"memory 17
 func (i32, i64, i64, i64) -> (i64) {
 block 0 (vas: i32, voff: i64, vlen: i64, vprobe: i64) {
   vp = i32.const 1
-  vr = cap.call 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vp)
+  vr = call.cap 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vp)
   v1 = call 1 (vprobe)
   return v1
   }
@@ -158,7 +158,7 @@ block 0 (v0: i64) {
 const UNMAP_COPY: &str = r#"memory 17
 func (i32, i64, i64, i64) -> (i64) {
 block 0 (vas: i32, voff: i64, vlen: i64, vprobe: i64) {
-  vr = cap.call 5 1 (i64, i64) -> (i64) vas (voff, vlen)
+  vr = call.cap 5 1 (i64, i64) -> (i64) vas (voff, vlen)
   v1 = call 1 (vprobe)
   return v1
   }
@@ -179,7 +179,7 @@ const PROTECT_COPY: &str = r#"memory 17
 func (i32, i64, i64, i64) -> (i64) {
 block 0 (vas: i32, voff: i64, vlen: i64, vprobe: i64) {
   vp = i32.const 1
-  vr = cap.call 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vp)
+  vr = call.cap 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vp)
   v1 = call 1 (vprobe)
   return v1
   }
@@ -714,7 +714,7 @@ block 0 (v0: i64) {
 const REACTOR_UNMAP: &str = r#"memory 17
 func (i32, i64, i64) -> () {
 block 0 (vas: i32, voff: i64, vlen: i64) {
-  vr = cap.call 5 1 (i64, i64) -> (i64) vas (voff, vlen)
+  vr = call.cap 5 1 (i64, i64) -> (i64) vas (voff, vlen)
   return
   }
 }
@@ -858,7 +858,7 @@ fn paged_reactor_frame_matches_interpreter() {
 const UNMAP_ATOMIC_LOAD: &str = r#"memory 17
 func (i32, i64, i64, i64) -> (i64) {
 block 0 (vas: i32, voff: i64, vlen: i64, vprobe: i64) {
-  vr = cap.call 5 1 (i64, i64) -> (i64) vas (voff, vlen)
+  vr = call.cap 5 1 (i64, i64) -> (i64) vas (voff, vlen)
   v1 = call 1 (vprobe)
   return v1
   }

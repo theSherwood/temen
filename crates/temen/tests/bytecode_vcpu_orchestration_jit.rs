@@ -3,7 +3,7 @@
 //! `Jit.invoke` surface as [`VcpuEvent`]s; the external host (which holds the powerbox) resolves the
 //! unit's funcs and hands them back via `deliver_jit_*`, and the vCPU installs / invokes against the
 //! **shared** [`Domain`] — so an install on one Worker's vCPU is visible to every other Worker's
-//! `call_indirect` (the interior-mutable table from Increment A).
+//! `call.dyn` (the interior-mutable table from Increment A).
 //!
 //! Here the host is a tiny `std::thread` orchestrator playing exactly the JS/Worker role: it creates
 //! each spawned vCPU on its own OS thread, blocks each join, and services each JIT event against one
@@ -95,7 +95,7 @@ block 0 (vsp: i64, vp: i64) {
   vjit = i32.wrap_i64 vjit64
   vsh = i64.const 32
   vcode = i64.shr_u vp vsh
-  vw = cap.call 11 1 (i64) -> (i32) vjit (vcode)
+  vw = call.cap 11 1 (i64) -> (i32) vjit (vcode)
   vw64 = i64.extend_i32_u vw
   vc8 = i64.const 8
   vold = i64.atomic.rmw.add vc8 vw64
@@ -106,7 +106,7 @@ block 0 (vsp: i64, vp: i64) {
 "#;
 
 /// Same shape, but each worker `Jit.install`s the unit (→ a freshly raced table slot) and
-/// `call_indirect`s **its own** slot — concurrent installs into the shared dispatch table across the
+/// `call.dyn`s **its own** slot — concurrent installs into the shared dispatch table across the
 /// orchestrated vCPUs; each returns 7 ⇒ counter 56.
 const INSTALL: &str = r#"memory 16
 func (i32, i32) -> (i64) {
@@ -169,9 +169,9 @@ block 0 (vsp: i64, vp: i64) {
   vjit = i32.wrap_i64 vjit64
   vsh = i64.const 32
   vcode = i64.shr_u vp vsh
-  vslot = cap.call 11 3 (i64) -> (i64) vjit (vcode)
+  vslot = call.cap 11 3 (i64) -> (i64) vjit (vcode)
   vslot32 = i32.wrap_i64 vslot
-  vr = call_indirect () -> (i32) vslot32 ()
+  vr = call.dyn () -> (i32) vslot32 ()
   vr64 = i64.extend_i32_u vr
   vc8 = i64.const 8
   vold = i64.atomic.rmw.add vc8 vr64
@@ -357,7 +357,7 @@ fn run_orchestrated(src: &str) -> Result<Vec<Value>, Trap> {
     let m = parse_module(src).unwrap();
     verify_module(&m).expect("verify guest");
     let (pb, jit, code) = powerbox_with_unit(&m);
-    // Reserve the same `call_indirect` table the powerbox granted, so guest install lands in-range.
+    // Reserve the same `call.dyn` table the powerbox granted, so guest install lands in-range.
     let prog = bytecode::VcpuProgram::compile_with_jit_table(&m, pb.jit_table_log2()).unwrap();
 
     let size = 1usize << 16;
@@ -417,7 +417,7 @@ fn orchestrated_jit_invoke_matches_oracle() {
     }
 }
 
-/// 8 orchestrated vCPUs each `Jit.install` into the shared dispatch table and `call_indirect` their own
+/// 8 orchestrated vCPUs each `Jit.install` into the shared dispatch table and `call.dyn` their own
 /// raced slot — install on one Worker's vCPU is visible to that vCPU's later dispatch through the
 /// shared domain; the folded counter still matches the oracle.
 #[test]

@@ -1159,9 +1159,9 @@ fn build_heap_interpreter(program: &[(u8, i64)]) -> Module {
 }
 
 // A threaded-code interpreter: the program is a sequence of 1-byte *handler indices*, dispatched via
-// `call_indirect` through the identity function table. A handler index loaded from the readonly
+// `call.dyn` through the identity function table. A handler index loaded from the readonly
 // program is constant, so the indirect call resolves and the handler is outlined — a real Futamura
-// case for `call_indirect`. The `T_DYN` opcode instead computes the index from `acc` (a runtime
+// case for `call.dyn`. The `T_DYN` opcode instead computes the index from `acc` (a runtime
 // value), so the index is dynamic and the engine bails `Unsupported`. Handlers are `(acc, input) ->
 // i64` at func indices 1..=4 (T_HALT = 0 ends; bytes 1..4 dispatch; T_DYN = 5 computes).
 const T_HALT: u8 = 0;
@@ -1238,7 +1238,7 @@ fn build_threaded_interpreter(program: &[(u8, i64)]) -> Module {
         },
     };
     // dyn_dispatch(acc, pc, input): idx = wrap_i64(1 + (acc & 3)) — a dynamic i32 funcref index, so
-    // call_indirect can't resolve it.
+    // call.dyn can't resolve it.
     let dyn_dispatch = Block {
         params: vec![t(), t(), t()], // 0: acc, 1: pc, 2: input
         insts: vec![
@@ -1297,7 +1297,7 @@ fn build_threaded_interpreter(program: &[(u8, i64)]) -> Module {
             readonly: true,
             bytes: program.iter().map(|&(op, _)| op).collect(),
         }],
-        types: vec![TypeEntry::Func(sig())], // #922: the call_indirect handler sig, index 0
+        types: vec![TypeEntry::Func(sig())], // #922: the call.dyn handler sig, index 0
         ..Default::default()
     }
 }
@@ -1843,12 +1843,12 @@ fn run_fuzz(n: usize, seeds: &[u64], verify_bails: bool) {
             },
         ));
     }
-    // (3) Threaded-code interpreter, outlined: dispatch via call_indirect. Constant handler indices
+    // (3) Threaded-code interpreter, outlined: dispatch via call.dyn. Constant handler indices
     // resolve and the handler is outlined; the T_DYN opcode makes the index dynamic ⇒ Unsupported.
     let mut thr = Tally::default();
     for &seed in seeds {
         thr.merge(fuzz_shape(
-            "threaded (call_indirect)",
+            "threaded (call.dyn)",
             n,
             seed ^ 0x7333,
             gen_threaded_program,
@@ -1868,7 +1868,7 @@ fn run_fuzz(n: usize, seeds: &[u64], verify_bails: bool) {
     }
     report_shape("regmachine (plain)", &reg);
     report_shape("stackmachine+helpers (#82)", &stk);
-    report_shape("threaded (call_indirect)", &thr);
+    report_shape("threaded (call.dyn)", &thr);
 
     // Confirm the bails are legitimate, not the engine giving up on tractable programs. A
     // "nonterminating" example must still not finish with 50x the fuel (genuinely an infinite loop,
@@ -1913,10 +1913,10 @@ fn run_fuzz(n: usize, seeds: &[u64], verify_bails: bool) {
     );
     assert!(
         thr.succeeded > 0 && thr.oracle_checks > 0,
-        "threaded (call_indirect) fuzz did no useful work"
+        "threaded (call.dyn) fuzz did no useful work"
     );
     // The thorough run must actually exercise the Unsupported paths: the private rescue (dynamic
-    // heap address) and the dynamic call_indirect index.
+    // heap address) and the dynamic call.dyn index.
     if verify_bails {
         assert!(
             hp_rescues > 0,
@@ -1924,7 +1924,7 @@ fn run_fuzz(n: usize, seeds: &[u64], verify_bails: bool) {
         );
         assert!(
             thr.unsupported > 0,
-            "dynamic call_indirect Unsupported path was not exercised"
+            "dynamic call.dyn Unsupported path was not exercised"
         );
     }
 }

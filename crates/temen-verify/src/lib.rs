@@ -75,7 +75,7 @@ pub enum VerifyError {
     UnlinkedDataPtr { at: u64 },
     /// A `data.funcref` relocation survived into a would-be-runnable module — the funcref twin of
     /// [`UnlinkedDataPtr`](VerifyError::UnlinkedDataPtr). Its placeholder bytes (a would-be function
-    /// index) would be loaded and `call_indirect`'d unpatched, so it is fail-closed here. `link`
+    /// index) would be loaded and `call.dyn`'d unpatched, so it is fail-closed here. `link`
     /// resolves and clears these; a survivor was never linked.
     UnlinkedDataFuncref { at: u64 },
     /// A `call` referenced a function index that does not exist.
@@ -158,8 +158,8 @@ pub enum VerifyError {
         import: u32,
         op: u32,
     },
-    /// A §3.5 instruction's type-section reference (`call.import.dyn`, `cap.self.type_id`,
-    /// `cap.self.covers`) does not name a well-formed interface entry, or its `op` is out of
+    /// A §3.5 instruction's type-section reference (`call.import.dyn`, `self.type_id`,
+    /// `self.covers`) does not name a well-formed interface entry, or its `op` is out of
     /// range / its self-describing `sig` differs from the type-section resolution.
     DynIfaceInvalid { func: u32, block: u32, ty: u32 },
     /// An [`Inst::ExportHandle`]'s index is past the end of [`Module::impl_exports`].
@@ -309,12 +309,12 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
 }
 
 /// Whether `m`'s capability egress is **manifest-complete** (IMPORTS.md §2.2): the module contains
-/// no dynamic-mode capability dispatch (`cap.call` — dispatch on a runtime handle value), so the
+/// no dynamic-mode capability dispatch (`call.cap` — dispatch on a runtime handle value), so the
 /// import manifest is the *complete* list of interfaces the module can ever drive. A statically
 /// checkable per-module property — tooling can report it, and a host policy may require it for
-/// high-assurance slots. Reflection (`cap.self.*`) is authority-neutral and does not affect the
-/// bit: discovering a handle confers nothing without a `cap.call` to drive it, which the bit
-/// catches. That exemption extends to a `cap.call` whose `type_id` **immediate** is the reserved
+/// high-assurance slots. Reflection (`self.*`) is authority-neutral and does not affect the
+/// bit: discovering a handle confers nothing without a `call.cap` to drive it, which the bit
+/// catches. That exemption extends to a `call.cap` whose `type_id` **immediate** is the reserved
 /// [`temen_ir::CAP_SELF_TYPE_ID`] — the self namespace's dispatch-form ops (e.g. §3.1
 /// `provenance`) are the same authority-neutral reflection, statically identifiable from the
 /// immediate, so querying them does not cost the completeness bit. Modules needing open-world
@@ -326,7 +326,7 @@ pub fn manifest_complete(m: &Module) -> bool {
             !b.insts.iter().any(|i| {
                 matches!(i, Inst::CapCall { type_id, .. } if *type_id != temen_ir::CAP_SELF_TYPE_ID)
                     // §3.5: dynamic-mode dispatch by type-section reference is dispatch on a
-                    // runtime handle value — it costs the bit exactly like `cap.call`.
+                    // runtime handle value — it costs the bit exactly like `call.cap`.
                     || matches!(i, Inst::CallImportDyn { .. })
             })
         })
@@ -583,7 +583,7 @@ fn const_i64_in_block(
 
 /// The **one** per-instruction dispatch (#895): check an instruction's operands against the running
 /// SSA type vector and return the result types it appends. Every opcode lives in exactly one arm —
-/// the whole-module-dependent ops (`call`/`call_indirect`/`cap.call`/the import & iface calls,
+/// the whole-module-dependent ops (`call`/`call.dyn`/`call.cap`/the import & iface calls,
 /// `ref.func`, `thread.spawn`, `cont.resume`, the reflection ops) fold in here rather than being
 /// checked in a parallel chain in [`verify_func`], so there is no ordering-sensitive `if let` cascade
 /// and no `unreachable!()` arm. `check` selects the two callers: `verify_func` runs `check = true`
@@ -714,7 +714,7 @@ fn type_inst<'a>(
         Inst::DataSym { .. } | Inst::DataSelf { .. } | Inst::DataTop => ValType::I64,
         // §7 executable named import (IMPORTS.md phase 1): the index must name a declared import
         // and the call's self-describing `sig` must equal the manifest's — the canonical-interface
-        // check `cap.call` cannot have (its sig is self-asserted). No handle operand (v8): the slot
+        // check `call.cap` cannot have (its sig is self-asserted). No handle operand (v8): the slot
         // binding identifies the capability. Appends the interned sig's result row.
         Inst::CallImport {
             import,
@@ -1403,7 +1403,7 @@ fn type_inst<'a>(
             }
             return Ok(InstResults::One(ValType::I32));
         }
-        // `call_indirect`: the interned `sig` (#922) must name a `Func`; `idx` is the `i32` table slot.
+        // `call.dyn`: the interned `sig` (#922) must name a `Func`; `idx` is the `i32` table slot.
         Inst::CallIndirect { ty, idx, args } => {
             if check {
                 let Some(ft) = func_sig(type_section, *ty) else {
@@ -1419,7 +1419,7 @@ fn type_inst<'a>(
             }
             return Ok(row_or_none(func_sig(type_section, *ty)));
         }
-        // `cap.call`: self-asserted signature (no manifest to resolve against), so the interned `sig`
+        // `call.cap`: self-asserted signature (no manifest to resolve against), so the interned `sig`
         // need only name a `Func`; the runtime use-site check (host-owned table type_id/generation)
         // carries safety, not typing. `handle` is a forgeable `i32`.
         Inst::CapCall {
@@ -1570,7 +1570,7 @@ fn check_terminator(
     Ok(())
 }
 
-/// Shared checks for `return_call`/`return_call_indirect`: the args match the
+/// Shared checks for `return_call`/`return_call.dyn`: the args match the
 /// callee's parameters, and the callee's results equal *this* function's results
 /// (a tail call returns the callee's results as our own).
 fn check_tail_call(
@@ -1654,7 +1654,7 @@ impl Cx<'_> {
 
     /// Check a call's arguments: exactly `params.len()` of them, each defined earlier in this
     /// block with `params[i]`'s type. The shared body behind every call-shaped op — `call`,
-    /// `call_indirect`, `cap.call`, `call.sym`, `call.import`, `call.import.dyn`, and the two
+    /// `call.dyn`, `call.cap`, `call.sym`, `call.import`, `call.import.dyn`, and the two
     /// `return_call` forms (via [`check_tail_call`]) — mirroring [`check_edge`] on the terminator
     /// side. (Handle/index operands, where present, are checked by the caller before this.)
     fn check_args(&self, args: &[ValIdx], params: &[ValType]) -> Result<(), VerifyError> {

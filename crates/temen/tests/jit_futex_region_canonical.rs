@@ -35,13 +35,13 @@ const SRC: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (v0: i32) {\n\
   vlen = i64.const 65536\n\
-  vrh = cap.call 5 5 (i64) -> (i64) v0 (vlen)\n\
+  vrh = call.cap 5 5 (i64) -> (i64) v0 (vlen)\n\
   vr = i32.wrap_i64 vrh\n\
-  vps = cap.call 4 3 () -> (i64) vr ()\n\
+  vps = call.cap 4 3 () -> (i64) vr ()\n\
   vz = i64.const 0\n\
   vprot = i32.const 3\n\
-  vm1 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) vr (vz, vz, vlen, vprot)\n\
-  vm2 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) vr (vps, vz, vlen, vprot)\n\
+  vm1 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vr (vz, vz, vlen, vprot)\n\
+  vm2 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vr (vps, vz, vlen, vprot)\n\
   vchild = thread.spawn 1 vz vz\n\
   vexp = i32.const 0\n\
   vto = i64.const 3000000000\n\

@@ -349,7 +349,7 @@ fn all_in_subset_all_eligible() {
 }
 
 /// #888 — the fixpoint cascade. `f1` is pure integer compute (in-subset, tier-up-eligible) whose
-/// *only* disqualifier is a direct `Call` to `f2`, a `cap.call`-ing helper (out of subset). Under
+/// *only* disqualifier is a direct `Call` to `f2`, a `call.cap`-ing helper (out of subset). Under
 /// the **local**-table emit (`compile_module_tierup`) `f2` is not a strict `interp_leaf`
 /// (memory-free/call-free/cap-free), so the fixpoint drops `f1` — it cascades to the interpreter.
 /// Under the **shared reserved table** (`compile_module_tierup_b2`, #888) `f2` is a marshallable
@@ -363,7 +363,7 @@ block 0 () {
   vh = i32.const 0
   vp = i64.const 0
   vl = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vh (vp, vl)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vh (vp, vl)
   vx = i64.const 3
   vr = call 1 (vx)
   return vr
@@ -382,7 +382,7 @@ block 0 (v0: i64) {
   vh = i32.const 0
   vp = i64.const 0
   vl = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vh (vp, vl)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vh (vp, vl)
   return v0
   }
 }

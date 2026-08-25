@@ -1,5 +1,5 @@
 //! FORK.md §8.5 slice 2 — the fork offer bound to a **separate-module child's named `fork` import** by
-//! the child-manifest binder, rather than discovered with `cap.self.resolve`. This is the binding half a
+//! the child-manifest binder, rather than discovered with `self.resolve`. This is the binding half a
 //! compiled-C `fork()` needs: chibicc emits a `call.import "fork"` in a *separate* module (its own
 //! program), and the nested spawn's `bind_child_manifest` must route that slot to the live fork offer.
 //! The capstone (`fork_manager.rs`) proved the *substrate*; this proves the *binding*, so swapping the
@@ -14,7 +14,7 @@
 //!   (`Binding::LiveImpl` — a call parks the caller on the server's serve loop), which `resolve_offer`
 //!   does not return, so a named `fork` import could not bind to it. The binder now also matches a
 //!   LiveImpl offer by signature (it is name-less at that layer) and binds the slot; `call.import` then
-//!   rides the same caller-parking path `cap.self.resolve` + `cap.call` did.
+//!   rides the same caller-parking path `self.resolve` + `call.cap` did.
 //!
 //! Topology (manager root = 0, server = 1, guest = 2, twin = 3): the manager (its own module) spawns the
 //! server (a same-module `svc.wait` loop whose handler runs pid-mode `clone_caller`), mints a
@@ -32,7 +32,7 @@ use temen_interp::{run_with_host, Host, Value};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
-/// `"libc"` as a little-endian `i64`, staged by the guest for `cap.self.resolve` (fork is an import, so
+/// `"libc"` as a little-endian `i64`, staged by the guest for `self.resolve` (fork is an import, so
 /// only libc is discovered dynamically).
 const LIBC_LE: i64 = 0x6362_696c; // b"libc"
 
@@ -70,9 +70,9 @@ block 0 (v0: i32, vlibc: i32, vgmod: i64) {
   i64.store q0a5 q0v4
   q0a6 = i64.const 1200
   i64.store q0a6 q0v4
-  vs = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
+  vs = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   vz0 = i64.const 0
-  vforkoff = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  vforkoff = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
   va0 = i64.const 256
   vnp0 = i32.const 300
   i32.store va0 vnp0
@@ -92,8 +92,8 @@ block 0 (v0: i32, vlibc: i32, vgmod: i64) {
   vgn = i64.const 2
   ve0 = i64.const 0
   voffg = i64.const 266240
-  vg = cap.call 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgmod, vgp, vgn, ve0, voffg, vlog, vq)
-  vjg = cap.call 6 1 (i32) -> (i64) v0 (vg)
+  vg = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgmod, vgp, vgn, ve0, voffg, vlog, vq)
+  vjg = call.cap 6 1 (i32) -> (i64) v0 (vg)
   return vjg
   }
 }
@@ -103,7 +103,7 @@ block 0 (v0: i64) {
   }
 block 1 () {
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   br 1()
   }
 }
@@ -111,7 +111,7 @@ func (i64) -> (i64) {
 block 0 (vx: i64) {
   vz = i32.const 0
   vzero = i64.const 0
-  vt = cap.call 4294967295 11 (i64) -> (i64) vz (vzero)
+  vt = call.cap 4294967295 11 (i64) -> (i64) vz (vzero)
   return vt
   }
 }
@@ -131,7 +131,7 @@ block 0 (v0: i64) {
   i64.store vz0 vln
   vp0 = i64.const 0
   vl4 = i64.const 4
-  vlibc = cap.self.resolve vp0 vl4
+  vlibc = self.resolve vp0 vl4
   br 1(vlibc)
   }
 block 1 (vlibc: i32) {
@@ -146,7 +146,7 @@ block 2 (vlibc: i32, vr: i64) {
   i64.store vp16 vr
   vfd1 = i64.const 1
   veight = i64.const 8
-  vw = cap.call 13 0 (i64, i64, i64) -> (i64) vlibc (vfd1, vp16, veight)
+  vw = call.cap 13 0 (i64, i64, i64) -> (i64) vlibc (vfd1, vp16, veight)
   return vr
   }
 }

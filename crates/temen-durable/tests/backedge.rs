@@ -1,6 +1,6 @@
 //! Phase-4 Slice A — **back-edge polls**: a freeze lands inside a poll-free compute loop.
 //!
-//! Before this slice a freeze could only land at a *may-suspend* safepoint (`cap.call` /
+//! Before this slice a freeze could only land at a *may-suspend* safepoint (`call.cap` /
 //! `cont.resume` / `suspend`), so a vCPU in a tight compute loop with no such op never reached one
 //! and the freeze hung until the loop exited (DURABILITY.md, the R6 latency caveat). The transform
 //! now prepends a **state-word poll to every loop header** (a block reached by a back-edge), which
@@ -8,14 +8,14 @@
 //!
 //! The guest below reads the clock **once, before the loop**, then runs a poll-free accumulator
 //! loop. We arm the deterministic *back-edge* countdown (`arm_freeze_after_backedges`) so the run
-//! makes progress past the `cap.call` and into the loop, then freezes mid-iteration at a header
+//! makes progress past the `call.cap` and into the loop, then freezes mid-iteration at a header
 //! poll. The property is the usual one (§12.6):
 //!
 //! > freeze → serialize → restore → thaw → run-to-end  ≡  uninterrupted run
 //!
 //! The clock seed (42) is baked into the loop-carried accumulator that the header poll spills, so a
 //! thaw on a **fresh** host (clock 0) must still reproduce the oracle — proving the loop state was
-//! reloaded, not recomputed, and that the pre-loop `cap.call` is not re-issued.
+//! reloaded, not recomputed, and that the pre-loop `call.cap` is not re-issued.
 
 use temen_durable::{
     arm_freeze_after_backedges, begin_thaw, init_durable_window, read_state, transform_module,
@@ -34,7 +34,7 @@ const SRC: &str = r#"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 0
   br 1(v3, v2)
 }
@@ -89,7 +89,7 @@ fn freeze_inside_a_poll_free_loop_round_trips() {
     assert_eq!(baseline, Ok(vec![Value::I64(47)]), "uninterrupted: 42 + 5");
 
     // ---- Freeze: arm the back-edge countdown so the freeze lands *mid-loop* (not at the ----
-    // pre-loop cap.call). The 3rd branch terminator promotes the word to UNWINDING; the next
+    // pre-loop call.cap). The 3rd branch terminator promotes the word to UNWINDING; the next
     // header poll then unwinds, spilling the loop-carried (counter, accumulator).
     let mut win = init_durable_window(WINDOW);
     arm_freeze_after_backedges(&mut win, 3);
@@ -106,7 +106,7 @@ fn freeze_inside_a_poll_free_loop_round_trips() {
     );
 
     // ---- Restore + thaw on a FRESH host (clock now 0). If the loop state were recomputed ----
-    // instead of reloaded — or the pre-loop cap.call re-issued — the seed would be 0 and the
+    // instead of reloaded — or the pre-loop call.cap re-issued — the seed would be 0 and the
     // result would differ. It must reproduce the oracle.
     let mut win = snapshot.clone();
     begin_thaw(&mut win, 0);

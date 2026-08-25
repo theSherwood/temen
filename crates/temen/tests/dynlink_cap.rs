@@ -30,7 +30,7 @@ fn unresolved_blob(src: &str) -> Vec<u8> {
 }
 
 /// Run `guest_src`'s func 0 on both backends over the prepared `init` window image (handle = arg 0,
-/// then `user_args`), reserving a `2^table_log2`-slot `call_indirect` table identically on each;
+/// then `user_args`), reserving a `2^table_log2`-slot `call.dyn` table identically on each;
 /// assert the outcomes + final memory agree and return the JIT's `(outcome, final_mem)`.
 fn diff(guest_src: &str, init: &[u8], user_args: &[i64], table_log2: u8) -> (JitOutcome, Vec<u8>) {
     let m = parse_module(guest_src).expect("parse guest");
@@ -121,8 +121,8 @@ fn install_link_invoke_guest(svc_len: usize, unit_len: usize) -> String {
     format!(
         "memory 16\nfunc (i32, i32, i32) -> (i32) {{\nblock 0 (v0: i32, v1: i32, v2: i32) {{\n\
          \x20 v3 = i64.const {svc_off}\n  v4 = i64.const {svc_len}\n\
-         \x20 v5 = cap.call 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n\
-         \x20 v6 = cap.call 11 3 (i64) -> (i64) v0 (v5)\n\
+         \x20 v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n\
+         \x20 v6 = call.cap 11 3 (i64) -> (i64) v0 (v5)\n\
          \x20 v7 = i64.const {st}\n  v8 = i32.const 1\n  i32.store8 v7 v8\n\
          \x20 v9 = i64.const {st1}\n  i32.store8 v9 v8\n\
          \x20 v10 = i64.const {st2}\n  v11 = i32.const 70\n  i32.store8 v10 v11\n\
@@ -130,8 +130,8 @@ fn install_link_invoke_guest(svc_len: usize, unit_len: usize) -> String {
          \x20 v14 = i64.const {st4}\n  v15 = i32.wrap_i64 v6\n  i32.store8 v14 v15\n\
          \x20 v16 = i64.const {unit_off}\n  v17 = i64.const {unit_len}\n\
          \x20 v18 = i64.const {st}\n  v19 = i64.const 5\n\
-         \x20 v20 = cap.call 11 5 (i64, i64, i64, i64) -> (i64) v0 (v16, v17, v18, v19)\n\
-         \x20 v21 = cap.call 11 1 (i64, i32, i32) -> (i32) v0 (v20, v1, v2)\n\
+         \x20 v20 = call.cap 11 5 (i64, i64, i64, i64) -> (i64) v0 (v16, v17, v18, v19)\n\
+         \x20 v21 = call.cap 11 1 (i64, i32, i32) -> (i32) v0 (v20, v1, v2)\n\
          \x20 return v21\n  }}\n}}\n",
         svc_off = SVC_OFF,
         unit_off = UNIT_OFF,
@@ -166,8 +166,8 @@ fn guest_compiles_links_and_invokes_by_name_across_backends() {
 /// The security edge: linking a symbol to a slot holding a **wrong-typed** function does not produce
 /// a type-confused call — it **traps** at the call site. Here the same guest installs a *one*-arg
 /// service `(i32)->(i32)` and binds `"F"` (which the unit imports as `(i32,i32)->(i32)`) to it. The
-/// link succeeds (resolution only rewrites the import to `call_indirect <slot>` and re-verifies — a
-/// `call_indirect` is well-typed IR), but at invoke the slot's `type_id` doesn't match the call's, so
+/// link succeeds (resolution only rewrites the import to `call.dyn <slot>` and re-verifies — a
+/// `call.dyn` is well-typed IR), but at invoke the slot's `type_id` doesn't match the call's, so
 /// the masked dispatch faults `IndirectCallType`, identically on both backends. The loader cannot be
 /// tricked into an out-of-type dispatch — the §3c table check carries the safety, exactly as for any
 /// slot the guest already controls.
@@ -193,7 +193,7 @@ fn compile_linked_only(unit_len: usize, symtab_len: usize) -> String {
         "memory 16\nfunc (i32) -> (i64) {{\nblock 0 (v0: i32) {{\n\
          \x20 v1 = i64.const {unit_off}\n  v2 = i64.const {unit_len}\n\
          \x20 v3 = i64.const {st}\n  v4 = i64.const {symtab_len}\n\
-         \x20 v5 = cap.call 11 5 (i64, i64, i64, i64) -> (i64) v0 (v1, v2, v3, v4)\n\
+         \x20 v5 = call.cap 11 5 (i64, i64, i64, i64) -> (i64) v0 (v1, v2, v3, v4)\n\
          \x20 return v5\n  }}\n}}\n",
         unit_off = UNIT_OFF,
         st = SYMTAB_OFF,
@@ -243,7 +243,7 @@ fn compile_linked_malformed_symtab_fails_closed() {
 
 /// A static symbol table (built host-side) resolves the same way as the guest-built one: binding
 /// `F → Slot(1)` lets `compile_linked` succeed (a real handle, ≥ 0) even before the slot is filled —
-/// resolution bakes the slot into a `call_indirect`; a still-empty slot only traps at *invoke* time.
+/// resolution bakes the slot into a `call.dyn`; a still-empty slot only traps at *invoke* time.
 #[test]
 fn compile_linked_with_a_resolvable_table_returns_a_handle() {
     let unit = unresolved_blob(UNIT);

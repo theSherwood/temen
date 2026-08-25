@@ -113,14 +113,14 @@ fn direct_call_to_many_result_fn() {
 }
 
 /// **Indirect call to a many-result callee**: the sret decision is pinned by the call site's type,
-/// so `call_indirect` allocates + threads the return-area exactly like a direct call.
+/// so `call.dyn` allocates + threads the return-area exactly like a direct call.
 #[test]
 fn indirect_call_to_many_result_fn() {
     diff(&format!(
         "func () -> (i64, i64, i64, i64, i64, i64) {{\n\
          block 0 () {{\n\
          \x20 v0 = ref.func 1\n\
-         \x20 v1, v2, v3, v4, v5, v6 = call_indirect () -> (i64, i64, i64, i64, i64, i64) v0()\n\
+         \x20 v1, v2, v3, v4, v5, v6 = call.dyn () -> (i64, i64, i64, i64, i64, i64) v0()\n\
          \x20 return v1 v2 v3 v4 v5 v6\n\
            }}\n\
          }}\n{SIX_RESULT_CALLEE}"

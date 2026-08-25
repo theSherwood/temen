@@ -62,7 +62,7 @@ func 0 () -> () {{
 block 0 () {{
   vp = i64.const 0
   vl = i64.const 2
-  vh = cap.self.resolve vp vl
+  vh = self.resolve vp vl
   vs0 = i64.const 0
   vacc0 = i64.const 0
   br 1(vh, vs0, vacc0)
@@ -88,7 +88,7 @@ block 1 (vh1: i32, vs: i64, vacc: i64) {{
   i64.store rra5 rrvz
   rra6 = i64.const 1200
   i64.store rra6 rrvz
-  vch = cap.call 6 17 (i64) -> (i32) vh1 (rra0)
+  vch = call.cap 6 17 (i64) -> (i32) vh1 (rra0)
   vsrv0 = i64.const 0
   br 2(vh1, vs, vacc, vch, vsrv0)
 }}
@@ -101,7 +101,7 @@ block 2 (vh2: i32, vs2: i64, vacc2: i64, vch2: i32, vsrv: i64) {{
   br_if vcmp 2(vh2, vs2, vacc2, vch2, vsrv2) 3(vh2, vs2, vacc2, vch2, vsrv2)
 }}
 block 3 (vh3: i32, vs3: i64, vacc3: i64, vch3: i32, vsrvf: i64) {{
-  vj = cap.call 6 1 (i32) -> (i64) vh3 (vch3)
+  vj = call.cap 6 1 (i32) -> (i64) vh3 (vch3)
   vmk = i64.const {mark}
   vm = i64.mul vsrvf vmk
   vacc4 = i64.add vacc3 vj

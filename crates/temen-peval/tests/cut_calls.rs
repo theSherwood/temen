@@ -357,7 +357,7 @@ block 0 (v0: i64) {
 
 #[test]
 fn cut_set_rejects_unsupportable_configs() {
-    // (1) A cut callee that dispatches through a `call_indirect` can't be carried: its runtime target
+    // (1) A cut callee that dispatches through a `call.dyn` can't be carried: its runtime target
     // index refers to the *source* function numbering, which the residual renumbers — so carrying it
     // would silently misdispatch. Rejected rather than miscompiled.
     let indirect = r#"
@@ -371,7 +371,7 @@ block 0 (v0: i64) {
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vsel = i32.const 2
-  vr = call_indirect (i64) -> (i64) vsel (v0)
+  vr = call.dyn (i64) -> (i64) vsel (v0)
   return vr
 }
 }
@@ -386,7 +386,7 @@ block 0 (v0: i64) {
     assert_eq!(
         specialize_with_config(&m, 0, &[SpecArg::Dynamic], &cut(vec![1])),
         Err(SpecError::Unsupported),
-        "a cut callee using call_indirect is rejected"
+        "a cut callee using call.dyn is rejected"
     );
 
     // (2) Cut + outlining is rejected: the outline driver numbers residual functions differently than

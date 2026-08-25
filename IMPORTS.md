@@ -1,7 +1,7 @@
 # Imports, exports & the powerbox — the binding redesign
 
 Status: **PROPOSED** (design review). Amends `DESIGN.md` §3a/§3b/§7 and builds on
-`PROCESS.md` §6 (`cap.self.attest`). Nothing here changes the escape-TCB posture:
+`PROCESS.md` §6 (`self.attest`). Nothing here changes the escape-TCB posture:
 the confinement masking (§4) and the handle-table use-site checks (§3c) are
 untouched; every change below is authority-TCB or below.
 
@@ -25,9 +25,9 @@ This document has three maturity levels, deliberately kept distinct:
 3. **The numeric convention** — a wasm import `("42", "7")` meaning
    `type_id 42, op 7`, bound at transpile time.
 4. **Named imports rewritten at instantiation** — `resolve_imports` lowers
-   `call.import` → `cap.call`, in two flavors (`Resolved::Cap` keeps the handle
+   `call.import` → `call.cap`, in two flavors (`Resolved::Cap` keeps the handle
    a call-site operand; `Resolved::CapBound` patches a `ConstI32` placeholder).
-5. **Runtime name lookup** — `register_cap_name` + `cap.self.resolve` (F7).
+5. **Runtime name lookup** — `register_cap_name` + `self.resolve` (F7).
 
 Each grew for a real reason (chibicc threading, wasm benchmarking, POSIX
 personality, linking, discovery), but the redundancy is accidental complexity,
@@ -144,7 +144,7 @@ end state.
 
 ### 2.2 One call convention, two addressing modes
 
-`cap.call` disappears as a guest-facing concept. All capability invocation is
+`call.cap` disappears as a guest-facing concept. All capability invocation is
 `call.import`, with the same static/dynamic split as `call`/`call_indirect`:
 
 ```
@@ -159,13 +159,13 @@ end state.
 
 Both modes dispatch through the same host-owned table with the same masked,
 type_id- and generation-checked resolve (§3c) — the security hinge does not
-move. The `cap.call` *encoding* remains as the dynamic mode's wire form (or is
+move. The `call.cap` *encoding* remains as the dynamic mode's wire form (or is
 kept as an alias during migration); what is retired is the concept of a
 separate convention.
 
 Properties:
 
-- **Static mode is statically checked** — stronger than today, where `cap.call`
+- **Static mode is statically checked** — stronger than today, where `call.cap`
   carries a self-asserted `sig` and an unbounded `op`. The verifier checks the
   op index and signature against the canonical interface in the manifest (the
   §13-deferred "module-level interface section" check, landed for free).
@@ -193,7 +193,7 @@ Properties:
   interface, fail-closed. Authority-neutral: it aliases an entry the domain
   already holds into a named position — no new grant-graph edge (the D37
   argument). This is the "negotiate then use" pattern: reflect
-  (`cap.self.count/get/resolve` — already built), decide, attach once, then
+  (`self.count/get/resolve` — already built), decide, attach once, then
   uniform static-mode calls.
 - **Objects are arguments, interfaces are dispatch.** The dominant pattern for
   runtime-minted objects (fds, regions, children, pipe ends) is already
@@ -229,7 +229,7 @@ slot-addressed imports):
 - **The synthesized bootstrap prologues**: the `synth_powerbox_start` /
   `synth_powerbox_start_for_imports` / `synth_powerbox_start_with_names`
   family (temen-ir lib.rs:2700-2741) — generated `_start` wrappers that stash
-  positional handles or `cap.self.resolve` names at startup. A manifest
+  positional handles or `self.resolve` names at startup. A manifest
   module needs no synthesized prologue: its slots are bound before entry.
 - **`powerbox_resolver` and `temen-posix::resolve_bound`** — the
   `CapBound`-producing resolver wrappers (the "general-form powerbox"
@@ -253,7 +253,7 @@ slot-addressed imports):
   DESIGN.md §7/§3a text, POWERBOX.md F7/S15, FRONTEND.md entry-convention
   claims updated in phase 4.
 
-Deliberately **kept** (not obviated): `cap.self.count/get/resolve` and
+Deliberately **kept** (not obviated): `self.count/get/resolve` and
 `register_cap_name` (discovery tier 3 and the name directory — §3.4);
 `grant_host_fn`/`grant_host_fn_region` (host-side capability definition);
 the handle table and every §3c use-site check (the mechanism everything
@@ -390,10 +390,10 @@ notes:*
   rejected **statically** by the verifier (`AttachNotRebindable`). Dispatched
   through a second reserved pseudo-type_id (`CAP_IMPORT_ATTACH_TYPE_ID`), so
   all three backends share one host implementation, like phase 1.*
-- *`temen_verify::manifest_complete(m)` is the completeness bit: no `cap.call`
+- *`temen_verify::manifest_complete(m)` is the completeness bit: no `call.cap`
   anywhere ⇒ the manifest is the complete egress surface. Reflection does not
   affect the bit (discovery confers nothing without a dispatch).*
-- ***OQ5 resolved:** `cap.call` keeps its mnemonic and wire form — it simply
+- ***OQ5 resolved:** `call.cap` keeps its mnemonic and wire form — it simply
   *is* the dynamic addressing mode. No rename, no migration churn.*
 - ***OQ4 resolved:** attach is serialized by the Host lock like every
   capability dispatch; a concurrent `call.import` on the same slot observes
@@ -422,7 +422,7 @@ rule (§2.1).
 *Phase-3 status:*
 
 - *`temen-wasm-jit` — **landed.** `outline_cap_calls` outlines `CallImport`
-  into the same cross-tier wrapper as `cap.call` (import index baked as an
+  into the same cross-tier wrapper as `call.cap` (import index baked as an
   immediate); `emit_module` permits the manifest and rejects only an import
   op surviving in an emitted function (`tests/outline_callimport.rs`).*
 - *`temen-wasm` — **landed.** Every wasm function import (numeric convention
@@ -440,13 +440,13 @@ rule (§2.1).
 - *`temen-llvm` — **landed.** `_start` synths dropped the by-name resolve
   prologue and the `[0,32)` handle stash (paramless entry, zero prologue
   instructions); every call site's vestigial handle operand is a dummy
-  const; `__vm_cap(i)` enumerates via `cap.self.get`;
+  const; `__vm_cap(i)` enumerates via `self.get`;
   `__vm_blocking_handle` resolves its name at the call site (the one true
   handle-value read). The SharedRegion `map`/`unmap`/`page_size` builtins
-  moved to **dynamic mode** (`cap.call` on the live region handle, §2.2) —
+  moved to **dynamic mode** (`call.cap` on the live region handle, §2.2) —
   only fixed-interface names remain manifest imports.*
 - *chibicc — **landed.** Same shape: no resolve prologue, no stash,
-  `dummy_handle()` operands, `__vm_cap` via `cap.self.get`, region ops in
+  `dummy_handle()` operands, `__vm_cap` via `self.get`, region ops in
   dynamic mode, `__vm_blocking_handle` by-name at the call site.*
 - *Runtime/instantiation — **landed.** `temen_run::instantiate`, the CLI, and
   `run_powerbox` keep the manifest for a named powerbox entry and bind each
@@ -506,14 +506,14 @@ leaving the tree with five conventions instead of four.
 
 ## 3. Designed now, build on demand  [§3.1/§3.3 landed; §3.2 superseded (DESIGN §12a); §3.4 built; §3.5 built (wire v7); §3.6 superseded — built via CALLS, settled as DESIGN §12a]
 
-### 3.1 Binding provenance in `cap.self.attest`
+### 3.1 Binding provenance in `self.attest`
 
-*Status: **landed** (2026-07-20) as `cap.self.provenance(handle) -> i32` — self-namespace
+*Status: **landed** (2026-07-20) as `self.provenance(handle) -> i32` — self-namespace
 op 5, reached via dynamic dispatch on the reserved `cap.self` id (no new instruction, no
 wire change): `0` = platform-terminated, `d ≥ 1` = ancestor-terminated `d` domain
 boundaries up (1 where the offer was wired, +1 per §3.3 re-grant hop). A forged/closed
 handle is an inert `CapFault`. PROCESS.md §6's growth-criterion list updated to name it.
-`manifest_complete()` exempts `cap.call`s on the reserved self-namespace immediate:
+`manifest_complete()` exempts `call.cap`s on the reserved self-namespace immediate:
 completeness measures capability **egress**, and the self namespace is authority-neutral
 reflection — a manifest-complete module may query provenance without losing the bit.*
 
@@ -585,7 +585,7 @@ Three tiers of guest access, all over one table:
 1. **Declared-required** — manifest slots, fail-closed, immutable, fastest.
 2. **Declared-rebindable** — reflect → `import.attach` → static-mode calls.
 3. **Undeclared grants** — the parent may grant beyond the manifest;
-   `cap.self.count/get/resolve` (+ D46 op-schema reflection) discover them;
+   `self.count/get/resolve` (+ D46 op-schema reflection) discover them;
    dynamic-mode calls drive them. Reflection stays authority-neutral: only
    what this domain already holds is visible.
 
@@ -703,12 +703,12 @@ index) and freezes it; call sites use the consumer's own numbering.
 - The dynamic form (`call.import [v] interface k . op`) keeps the **exact-id
   fast path**: `entry.type_id == intern(types[k])` plus generation at the use
   site — the same §3c check, now *expressible for interned interfaces*. This
-  closes the recorded encoding gap: `cap.call` needs a compile-time `type_id`
+  closes the recorded encoding gap: `call.cap` needs a compile-time `type_id`
   immediate, which a guest cannot know for a wired offer; a type-section
   reference is resolvable at instantiation. To drive a
   covering-but-not-equal capability discovered at runtime, attach it to a
   rebindable slot — the coverage walk happens once, there — then use static
-  calls. `cap.call` stays as the escape hatch for undeclared grants and the
+  calls. `call.cap` stays as the escape hatch for undeclared grants and the
   reserved self namespace.
 - **Intern pre-seeding.** *(Built 2026-07-22.)* Built-in interfaces publish canonical
   shapes, pre-seeded into the per-host intern, so a structurally equal guest
@@ -722,9 +722,9 @@ index) and freezes it; call sites use the consumer's own numbering.
   (trusted) embedder asserting the shape it implements. Interning to a built-in id
   confers no authority: a call still needs a real granted handle of the matching
   binding.
-- **Reflection gains two authority-neutral ops:** `cap.self.type_id k` —
+- **Reflection gains two authority-neutral ops:** `self.type_id k` —
   intern *this module's* `types[k]`, return the runtime id (exact-shape
-  discovery: iterate `cap.self.get`, compare ids) — and `cap.self.covers
+  discovery: iterate `self.get`, compare ids) — and `self.covers
   vh, k` — "does the capability behind this handle cover my `types[k]`?"
   (subset discovery; a failed `import.attach` works as the probe even
   without it). `import.attach` on a grouped slot runs the coverage walk in
@@ -1017,7 +1017,7 @@ landed — coverage binding with bind-time remaps (child manifests + host wiring
 name-less legacy wires fall back to first-signature-position matching), the settled
 declaration surface (indices, kinds, required op names, `{ name: idx }` maps, legacy
 sugar kept where free), the `op` immediate, `call.import.dyn`, `export.handle`
-(memoized; one shared service state per domain), `cap.self.type_id`/`covers`, and
+(memoized; one shared service state per domain), `self.type_id`/`covers`, and
 `ValType::Cap` as an i32-width reservation — verified by both verifiers, executed by
 all three backends through the one generic dispatch (the import dispatch packs
 `slot | op << 16`; dyn packs `ty | op << 16` under a reserved id; the self extensions
@@ -1046,7 +1046,7 @@ with its reason recorded:
   i32 handle operand) and **executes as ordinary slot dispatch when the instance binds
   the name** (operand ignored) — the chibicc emission stream instantiates unchanged —
   while remaining the **linker's rewrite target** when `resolve_imports_with` runs
-  first (Cap → `cap.call` on the live operand; Slot → `call_indirect` via the
+  first (Cap → `call.cap` on the live operand; Slot → `call_indirect` via the
   operand's patched `ConstI32`; Func → direct call). One spelling, two binding times:
   a symbolic call binds by name at whichever binding act comes first. Emitters that
   never link (temen-llvm, temen-wasm, the printer's canonical output) produce the clean
@@ -1269,8 +1269,8 @@ dynamic mode, reflection) cover discovery of *granted* capabilities only.
    lock-acquisition order, and there is no fairness guarantee beyond the
    lock's. This is the guarantee the shared dispatch entry has mechanically
    provided since phase 2; it is now pinned as spec rather than accident.
-5. ~~`cap.call` mnemonic at a format bump~~ — **RESOLVED (phase 2, restated):
-   `cap.call` keeps its mnemonic and wire form** — it simply *is* dynamic
+5. ~~`call.cap` mnemonic at a format bump~~ — **RESOLVED (phase 2, restated):
+   `call.cap` keeps its mnemonic and wire form** — it simply *is* dynamic
    mode (dispatch on a live handle value); two bumps (v5, v6) have since
    shipped without renaming it, confirming the decision.
 6. ~~Snapshot digest wiring~~ — **RESOLVED (doc note, as designed):**

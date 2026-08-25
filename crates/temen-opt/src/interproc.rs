@@ -9,7 +9,7 @@
 //! **budgeted direct-call inliner** (splice a small callee — straight-line in place, or multi-block by
 //! splicing its CFG in and threading values across the call), and **dead-function elimination** (drop
 //! functions no reachable code can call). They compose into the end-to-end interprocedural story:
-//! devirtualization turns a constant `call_indirect` into a direct `call`, const_prop feeds constants
+//! devirtualization turns a constant `call.dyn` into a direct `call`, const_prop feeds constants
 //! (including funcrefs, which a re-run of devirt then resolves) into callees, the inliner splices a
 //! small callee in, and DFE sweeps the now-uncalled leaf — and, because devirtualization removes the
 //! indirect dispatch, DFE's conservative gate lifts too.
@@ -24,11 +24,11 @@ use crate::{each_operand, get, map_operands, map_term_operands, Known};
 
 /// Visit every **static function index** a function references: a direct `call`, a `ref.func`, a
 /// `thread.spawn` entry, and the `return_call` terminator. This mirrors `temen_ir::offset_func_indices`
-/// (the merged-module reindexer) exactly — `call_indirect` / `cont.*` dispatch on runtime funcref
+/// (the merged-module reindexer) exactly — `call.dyn` / `cont.*` dispatch on runtime funcref
 /// *values* (an `i32` that equals the function index; the identity table), and `call.import` carries
 /// an import index, so none of those name a *static* callee. A `ref.func` **does**: it materializes a
 /// callable funcref, so a function whose reference is taken by reachable code must be kept — it may be
-/// reached by a later `call_indirect`. Counting `ref.func` as a call edge is the sound over-
+/// reached by a later `call.dyn`. Counting `ref.func` as a call edge is the sound over-
 /// approximation that keeps such functions live.
 fn referenced_funcs(f: &Func, mut visit: impl FnMut(FuncIdx)) {
     for b in &f.blocks {
@@ -46,8 +46,8 @@ fn referenced_funcs(f: &Func, mut visit: impl FnMut(FuncIdx)) {
     }
 }
 
-/// Whether the module dispatches on a runtime **funcref value** — `call_indirect`,
-/// `return_call_indirect`, or `cont.new` (whose `func` operand is a funcref value, not a static
+/// Whether the module dispatches on a runtime **funcref value** — `call.dyn`,
+/// `return_call.dyn`, or `cont.new` (whose `func` operand is a funcref value, not a static
 /// index). Because a funcref equals its function index (the identity table) and can be a plain
 /// `ConstI32` indistinguishable from ordinary data, an indirect dispatch could reach *any* in-range
 /// function, so removing or renumbering functions is unsound without funcref value-flow analysis.
@@ -97,8 +97,8 @@ fn remap_func_indices(f: &mut Func, map: &[u32]) {
 /// **Dead-function elimination.** Drop every function unreachable in the call graph from the roots —
 /// the conventional entry (`func 0`, what `run(m, 0, …)` invokes) and every named export — following
 /// `call` / `return_call` / `thread.spawn` edges and, conservatively, `ref.func` (a materialized
-/// funcref can be reached by a later `call_indirect`). Surviving functions are renumbered densely and
-/// every static funcidx reference (and each export) is remapped; `call_indirect` is untouched because
+/// funcref can be reached by a later `call.dyn`). Surviving functions are renumbered densely and
+/// every static funcidx reference (and each export) is remapped; `call.dyn` is untouched because
 /// it dispatches on the funcref value, which equals the function index and so rides the same map only
 /// where a `ref.func` produced it (already remapped above).
 ///
@@ -119,7 +119,7 @@ pub fn dead_func_elim(m: &Module) -> Module {
     }
     // Also unsound while any `ref.func` is live: its result **is the function index as a plain i32**
     // (the identity table), so a program can return/store/compare that integer — its value is
-    // directly observable, not only a `call_indirect` dispatch target. Renumbering rewrites the
+    // directly observable, not only a `call.dyn` dispatch target. Renumbering rewrites the
     // `ref.func` operand to preserve *dispatch*, but that silently changes the observed integer
     // (nightly `opt_sccp`, input `[0xfc]`: `ref.func 2` returned as the entry's i32 result folded to
     // `ref.func 1` after func 1 was dropped, so the result went `2 → 1`). A dead `ref.func` is cleared
@@ -347,7 +347,7 @@ fn callee_total_insts(callee: &Func) -> usize {
 /// instructions total, every block exits only by an internal branch (`br`/`br_if`/`br_table` — targets
 /// stay inside the callee), a value `return`, or `unreachable`, and at least one block actually
 /// `return`s (so the spliced-in continuation has a predecessor). Tail-call exits
-/// (`return_call`/`return_call_indirect`) are excluded — turning a callee tail call into a caller
+/// (`return_call`/`return_call.dyn`) are excluded — turning a callee tail call into a caller
 /// non-tail call is a separate transform. A single-block `return` callee takes the in-place fast path
 /// ([`inline_single_block_call`]); anything else with internal control flow takes the CFG-splicing path
 /// ([`inline_multi_block_call`]).
@@ -731,7 +731,7 @@ impl Cp {
 
 /// Per block-local value, the constant it statically holds here — like [`crate::block_consts`] but a
 /// `ref.func` counts as its funcidx (a funcref **is** its index; the identity table), so a constant
-/// funcref flows through the analysis as an `i32` and can resolve a `call_indirect`.
+/// funcref flows through the analysis as an `i32` and can resolve a `call.dyn`.
 fn block_knowns(
     b: &Block,
     fn_results: &[usize],
@@ -758,12 +758,12 @@ fn block_knowns(
 /// join of the value passed at every call that can reach it; a parameter that resolves to a single
 /// constant is substituted in the entry block ([`substitute_params`]). The per-function passes then fold
 /// through it (branch resolution, arithmetic), and — because a **constant funcref** propagated into a
-/// dispatcher's parameter makes its `call_indirect` index constant — the devirtualization that runs
+/// dispatcher's parameter makes its `call.dyn` index constant — the devirtualization that runs
 /// after this pass resolves that indirect call to a direct one. Signatures are unchanged (a substituted
 /// parameter is left dead, callers keep passing it), so all funcidxs stay valid.
 ///
 /// **Soundness** rests on seeing *every* call that can reach a parameter. A direct `call`/`return_call`
-/// feeds its callee; an indirect `call_indirect`/`return_call_indirect` whose index resolves to a
+/// feeds its callee; an indirect `call.dyn`/`return_call.dyn` whose index resolves to a
 /// constant funcref feeds exactly that (signature-matching) target — a mismatched or out-of-range index
 /// traps and reaches no one. Values we cannot see are seeded `Top` and never substituted: the entry
 /// (`func 0`), exports, `ref.func`-taken and `thread.spawn` functions (reachable via a path the fixpoint
@@ -1025,7 +1025,7 @@ fn resolve_devirt(
     (f.params == ft.params && f.results == ft.results).then_some(k)
 }
 
-/// **Constant-funcref devirtualization.** Rewrite a `call_indirect` / `return_call_indirect` whose
+/// **Constant-funcref devirtualization.** Rewrite a `call.dyn` / `return_call.dyn` whose
 /// index is a compile-time-constant funcref (a `ref.func` or an in-range `ConstI32`) into the
 /// equivalent direct `call` / `return_call`, when the target's signature matches the call's `ty`.
 /// Because the signatures match, the result arity is identical, so the rewrite is **in place** — no
@@ -1033,7 +1033,7 @@ fn resolve_devirt(
 /// direct call becomes an inlining candidate, and — with the indirect dispatch gone — dead-function
 /// elimination's conservative gate lifts.
 ///
-/// Sound because a `call_indirect` on a constant, in-range, signature-matching funcref deterministically
+/// Sound because a `call.dyn` on a constant, in-range, signature-matching funcref deterministically
 /// calls `funcs[idx]` (the identity table; cf. the interpreter's `table_lookup`), which is exactly what
 /// the direct call does. A mismatched or out-of-range index is left as an indirect call so it still
 /// traps identically. Debug info is dropped on any rewrite (an instruction changed).

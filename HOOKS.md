@@ -18,7 +18,7 @@ posture (small trustworthy core; the confinement paths are the most sensitive co
 
 A hooked run executes a **rewritten module**: an IR-to-IR pass
 (`temen_opt::instrument::instrument_mem_hooks`) inserts, ahead of every guest memory op, a
-`cap.call` to an embedder-bound hook capability carrying the event kind and access coordinates.
+`call.cap` to an embedder-bound hook capability carrying the event kind and access coordinates.
 The engines are untouched — an instrumented module is an ordinary module.
 
 Why this shape won over the alternatives:
@@ -52,7 +52,7 @@ below tracing).
 Hooks fire **pre-access, pre-confinement-check**: the final event of a faulting run is the
 *attempted* faulting access, and the trace prefix is backend-identical.
 
-Event kinds (the `op` immediate of the inserted `cap.call`; constants in
+Event kinds (the `op` immediate of the inserted `call.cap`; constants in
 `temen_opt::instrument::mem_hook_op`, decoded to `temen_run::MemEvent`):
 
 | kind | op | args |
@@ -77,7 +77,7 @@ Event kinds (the `op` immediate of the inserted `cap.call`; constants in
 
 **Deliberately not reported** (runtime-internal or host-side traffic, not guest data ops): futex
 `atomic.wait`/`notify` word touches; `setjmp`/`longjmp` jmp_buf traffic; `gc.roots` scans;
-`cap.self.resolve`/`label` name/label buffers; host-side `GuestMem` access from other capability
+`self.resolve`/`label` name/label buffers; host-side `GuestMem` access from other capability
 handlers; and accesses a frontend's SSA promotion removed before the IR existed (§3d — the trace
 is of the post-promotion module; a consumer wanting source-faithful traces disables promotion in
 the frontend, the §19 trade).
@@ -103,7 +103,7 @@ the pristine module (`MemHookStats::inserted_insts` lets an embedder scale `Limi
   size }` (the `TEMEN_MEM_*` kinds) and returns non-zero to veto. Trampolines into
   `Instance::with_mem_hooks` exactly as `temen_imports_provide_host_fn` does for host-fns. Declared
   in `include/temen.h`.
-- **Handle binding**: `cap.call` needs a handle constant at instrument time. Grants are
+- **Handle binding**: `call.cap` needs a handle constant at instrument time. Grants are
   deterministic, so `with_mem_hooks` discovers the value with a scratch first-grant on a fresh
   `Host`, bakes it, and `grant_caps` grants the hook **first** on every run's fresh host
   (asserted fail-closed). Covers `run`/`run_with_caps`/`run_diff`/`call("_start")`/`Session`.

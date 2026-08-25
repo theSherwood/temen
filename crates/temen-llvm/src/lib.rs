@@ -37,7 +37,7 @@
 //!   inline. (Ordered/unordered fcmp collapse — the NaN corner is a documented fidelity gap.)
 //! - **G — indirect calls.** Taking a function's address yields its §3c funcref index (widened to
 //!   the `i64` pointer rep); an indirect `call` truncates the function-pointer value to the `i32`
-//!   funcref and lowers to `call_indirect <sig>` (the runtime masks + type-id-checks it). The
+//!   funcref and lowers to `call.dyn <sig>` (the runtime masks + type-id-checks it). The
 //!   signature is the callee's function type plus the prepended data-SP, matching the IR signature.
 //! - **H — aggregates (struct memory).** Struct layout (x86-64-SysV: natural field alignment +
 //!   tail padding; named structs resolved); **struct GEP** (a constant field index → the field's
@@ -869,7 +869,7 @@ fn translate_impl(
     // target's real signature the site cannot know) and mint one static-dispatch function per
     // distinct site shape, indexed after the helpers. Sites route through the dispatcher, which
     // direct-calls each address-taken candidate with its definition's own signature and falls back
-    // to the strict `call_indirect` for everything else (see `synth_dispatcher`). Bodies are built
+    // to the strict `call.dyn` for everything else (see `synth_dispatcher`). Bodies are built
     // after translation, once the address-taken set is complete.
     let dispatch_shapes = collect_dispatch_shapes(m, &m.types);
     let mut dispatch_map: HashMap<DispatchKey, u32> = HashMap::new();
@@ -884,7 +884,7 @@ fn translate_impl(
     // emits (recorded at the lowering itself).
     let taken: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
     // #922: the module type section, accumulated across the whole translation. Every call site
-    // (`call_indirect`/`cap.call`/`call.import`) interns its `FuncType` here and stores the returned
+    // (`call.dyn`/`call.cap`/`call.import`) interns its `FuncType` here and stores the returned
     // index; the import shapes intern into the same table at finalize (below), so a `call.import`'s
     // sig dedups to its import's declared entry. Threaded like `taken` into each function's lowering.
     let sig_types: RefCell<Vec<temen_ir::TypeEntry>> = RefCell::new(Vec::new());
@@ -3317,7 +3317,7 @@ struct DispatchKey {
 }
 
 impl DispatchKey {
-    /// The §3c runtime type the site's `call_indirect` checks: `(sp, fixed…) -> results`.
+    /// The §3c runtime type the site's `call.dyn` checks: `(sp, fixed…) -> results`.
     fn site_type(&self) -> temen_ir::FuncType {
         let mut params = vec![ValType::I64];
         params.extend_from_slice(&self.fixed);
@@ -3445,7 +3445,7 @@ struct DispatchArm {
 /// Filter the recorded address-taken set down to this shape's arms: non-variadic **defined**
 /// functions with int-class params/results the site's argument list can feed (params a
 /// width-coercible prefix of the args). A function whose lowered type **equals** the site type is
-/// excluded — the strict `call_indirect` default already serves it. Sorted by index so the
+/// excluded — the strict `call.dyn` default already serves it. Sorted by index so the
 /// emitted module is deterministic.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_arms(
@@ -3486,7 +3486,7 @@ fn dispatch_arms(
             results: f.results.clone(),
         };
         if full == site {
-            continue; // exact type: the default `call_indirect` serves it unchanged
+            continue; // exact type: the default `call.dyn` serves it unchanged
         }
         arms.push(DispatchArm {
             func: t,
@@ -3501,7 +3501,7 @@ fn dispatch_arms(
 /// `(sp, fref, args…) -> results`. A chain of funcref-equality tests routes each address-taken
 /// candidate to a **direct call with its own definition's signature** (args width-coerced, a
 /// missing result padded with 0, an extra result dropped) — the indirect twin of the `def_sigs`
-/// direct-call rule. The default arm is the strict varargs `call_indirect` (extras deposited into
+/// direct-call rule. The default arm is the strict varargs `call.dyn` (extras deposited into
 /// this frame's scratch, the va-area pointer at the callee's frame slot 0), so exact-typed and
 /// genuinely-variadic targets behave exactly as before and anything unknown still fail-closes
 /// with `IndirectCallType`. CFI is never widened: every arm is a direct call to a
@@ -3545,7 +3545,7 @@ fn synth_dispatcher(key: &DispatchKey, arms: &[DispatchArm], site_ty: u32) -> Fu
             },
         });
     }
-    // Default: the strict varargs `call_indirect` — deposit extras at own scratch (sp+0…), store
+    // Default: the strict varargs `call.dyn` — deposit extras at own scratch (sp+0…), store
     // the area pointer at the target's frame slot 0, coerce the fixed args to the site type.
     {
         let mut insts: Vec<Inst> = Vec::new();
@@ -3905,7 +3905,7 @@ fn cap_import_name(name: &str) -> Option<&'static str> {
 
 /// #922: intern a `FuncType` into the module's type section, returning its `TypeEntry::Func` index
 /// (deduping — a matching entry is reused, an absent one appended). The call instructions
-/// (`call_indirect`/`cap.call`/`call.import`/…) now carry this `u32` index in place of an inline
+/// (`call.dyn`/`call.cap`/`call.import`/…) now carry this `u32` index in place of an inline
 /// signature; the verifier resolves it back to the `Func` entry. One shared accumulator threads the
 /// whole translation (mirrors `taken`), so an import's sig and a `call.import` on it dedup to the
 /// same index — the structural equality the verifier's `ImportSigMismatch` check wants.
@@ -3936,7 +3936,7 @@ fn import_sig(import: &str) -> temen_ir::FuncType {
         "vm_protect" => ft(vec![I64, I64, I32], vec![I64]),
         "vm_page_size" => ft(vec![], vec![I64]),
         // §22 guest-driven JIT (`Jit`): submit serialized IR → code handle (op 0) / call a compiled
-        // `(i64,i64)->(i64)` unit (op 1) / release (op 2) / install into the call_indirect table (op 3)
+        // `(i64,i64)->(i64)` unit (op 1) / release (op 2) / install into the call.dyn table (op 3)
         // / uninstall a slot (op 4) / compile against a guest symbol table (op 5). All return an `i64`.
         "vm_jit_compile" => ft(vec![I64, I64], vec![I64]),
         "vm_jit_invoke2" => ft(vec![I64, I64, I64], vec![I64]),
@@ -4151,7 +4151,7 @@ fn vm_region_builtin_import(name: &str) -> Option<&'static str> {
     Some(match name {
         "__vm_region_create" => "vm_region_create",
         // map/unmap/page_size dispatch on a runtime-minted region handle — the dynamic mode
-        // (`cap.call`), so they declare no manifest import.
+        // (`call.cap`), so they declare no manifest import.
         "__vm_region_map" => "vm_region_map",
         "__vm_region_unmap" => "vm_region_unmap",
         "__vm_region_page_size" => "vm_region_page_size",
@@ -4160,7 +4160,7 @@ fn vm_region_builtin_import(name: &str) -> Option<&'static str> {
 }
 
 /// The subset of [`vm_region_builtin_import`] names that are *manifest imports* (fixed-interface
-/// dispatch); the rest are dynamic-mode `cap.call`s on a live region handle.
+/// dispatch); the rest are dynamic-mode `call.cap`s on a live region handle.
 fn vm_region_manifest_import(name: &str) -> Option<&'static str> {
     (name == "__vm_region_create").then_some("vm_region_create")
 }
@@ -12202,7 +12202,7 @@ fn vm_arg(c: &crate::ll::ast::Call, i: usize) -> Result<&Operand, Error> {
 /// `suspend`); §GC conservative **roots** (`__vm_gc_roots` → `gc.roots`); §12 **threads**
 /// (`__vm_thread_spawn`/`join`) and **atomics** (`__vm_atomic_*` → the `iN.atomic.*` ops); the §12
 /// **futex** (`__vm_wait32`/`__vm_notify`); and §7 capability **reflection** (`__vm_cap` reads the
-/// handle stash; `__vm_cap_count`/`__vm_cap_at` → `cap.self.count`/`cap.self.get`). Each mirrors the
+/// handle stash; `__vm_cap_count`/`__vm_cap_at` → `self.count`/`self.get`). Each mirrors the
 /// chibicc lowering exactly, so a program built through either frontend produces equivalent IR.
 fn lower_vm_builtin(
     ctx: &mut BlockCtx,
@@ -12262,7 +12262,7 @@ fn lower_vm_builtin(
             ctx.bind_dest(&c.dest, len32);
             Ok(true)
         }
-        // ---- §3e/§4 Memory capability: `cap.call` on the stashed Memory handle (slot 12) ----
+        // ---- §3e/§4 Memory capability: `call.cap` on the stashed Memory handle (slot 12) ----
         "__vm_map" | "__vm_unmap" | "__vm_protect" => {
             let import = vm_memory_builtin_import(name).expect("memory builtin");
             let imp = ctx.import_of(import)?;
@@ -12295,9 +12295,9 @@ fn lower_vm_builtin(
             Ok(true)
         }
         // `__vm_blocking_handle()` returns the Blocking capability handle — the `i32` a guest
-        // names in a direct `Blocking.work` cap.call (the §12 parking exerciser). This is the one
+        // names in a direct `Blocking.work` call.cap (the §12 parking exerciser). This is the one
         // place a *handle value* (not a dispatch) is needed, so resolve it by its canonical name
-        // (`cap.self.resolve` — the discovery tier IMPORTS.md deliberately keeps): the name bytes
+        // (`self.resolve` — the discovery tier IMPORTS.md deliberately keeps): the name bytes
         // are staged in the low reserved region, which the retired handle stash freed.
         "__vm_blocking_handle" => {
             use temen_ir::StoreOp;
@@ -12322,7 +12322,7 @@ fn lower_vm_builtin(
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
-        // ---- §22 guest-driven JIT: `cap.call` on the stashed Jit handle (slot 7) ----
+        // ---- §22 guest-driven JIT: `call.cap` on the stashed Jit handle (slot 7) ----
         // Each builtin marshals its `i64` args (a blob/symtab pointer+len, a code/slot handle, two
         // invoke args) and lowers to `CallImport` on the `Jit` handle. The host verifies the submitted
         // IR and compiles it into THIS domain (verification, not isolation, is the boundary — §2a).
@@ -12352,7 +12352,7 @@ fn lower_vm_builtin(
         // ---- §13/§14 SharedRegion: mint from AddressSpace, then alias via the region handle ----
         // `create(len)` calls `AddressSpace.create_region` on the stashed AddressSpace handle (slot 4)
         // and returns a region handle. `map`/`unmap`/`page_size` take that region handle as their first
-        // C arg (`int region`) and `cap.call` *it* — the handle is the capability, not a stash slot.
+        // C arg (`int region`) and `call.cap` *it* — the handle is the capability, not a stash slot.
         "__vm_region_create" => {
             let imp = ctx.import_of("vm_region_create")?;
             let len = ctx.operand_i64(vm_arg(c, 0)?)?;
@@ -12383,7 +12383,7 @@ fn lower_vm_builtin(
                 _ => vec![], // page_size
             };
             // The region handle is a runtime-minted *object*, so this is the dynamic addressing
-            // mode (IMPORTS.md §2.2 — `cap.call` on the live handle, §3c-checked at use); the
+            // mode (IMPORTS.md §2.2 — `call.cap` on the live handle, §3c-checked at use); the
             // static manifest carries only the fixed-interface imports.
             let op = match import {
                 "vm_region_map" => 0,
@@ -12577,7 +12577,7 @@ fn lower_vm_builtin(
         // ---- §7 capability reflection ----
         "__vm_cap" => {
             // The i-th powerbox handle. The stash is retired (IMPORTS.md phase 3), so enumerate the
-            // held table instead: `cap.self.get i` — the fixed powerbox grants in `VM_CAP_*` order,
+            // held table instead: `self.get i` — the fixed powerbox grants in `VM_CAP_*` order,
             // so index i is the same capability the stash slot held (the discovery tier is the one
             // by-index surface deliberately kept).
             let i = ctx.operand_i32(vm_arg(c, 0)?)?;
@@ -12615,7 +12615,7 @@ fn lower_vm_builtin(
             ctx.bind_dest(&c.dest, rs[0]); // the capability handle
             Ok(true)
         }
-        // §7 `cap.self.resolve`: `int __vm_cap_resolve(const char *name, long len)` resolves a
+        // §7 `self.resolve`: `int __vm_cap_resolve(const char *name, long len)` resolves a
         // capability **name** (registered by the host, e.g. an `Imports`-provided or extra-granted
         // cap) to its handle — the runtime complement of the fixed stash for capabilities granted
         // *outside* the 8-slot §3e prefix. Negative on unknown name / out-of-window buffer.
@@ -12631,7 +12631,7 @@ fn lower_vm_builtin(
             Ok(true)
         }
         // §7 host-defined capability call: `long __vm_host_call(int handle, int op, long a, long b,
-        // long c, long d)` → `cap.call HOST_PROC op handle (a,b,c,d)`. The generic bridge to an
+        // long c, long d)` → `call.cap HOST_PROC op handle (a,b,c,d)`. The generic bridge to an
         // **embedder-registered** capability (`Host::grant_host_proc` — the wasm-import analogue): the
         // handler's semantics live entirely in the host closure, the translator stays pure mechanism.
         // `op` selects the operation and must be a compile-time constant (it is nominal in the IR,
@@ -12755,7 +12755,7 @@ fn lower_vm_builtin(
             Ok(true)
         }
         // §13/§4b `SharedRegion` call: `long __vm_region_call(int handle, int op, long a, long b,
-        // long c, long d)` → `cap.call SHARED_REGION op handle (a,b,c,d)`. The bridge a guest uses to
+        // long c, long d)` → `call.cap SHARED_REGION op handle (a,b,c,d)`. The bridge a guest uses to
         // `map`/`unmap` a file-backed region an mmap-capable fs minted (`FS_MAP_REGION`) — same fixed
         // `(i64×4) -> i64` shape as `__vm_host_call`, but the §13 interface id. `op` is a nominal
         // compile-time constant (0 = map, 1 = unmap).
@@ -12790,7 +12790,7 @@ fn lower_vm_builtin(
         }
         // §14 VM-in-VM spawn: `long __vm_instantiate(int inst, long module, long grants_ptr,
         // long grants_n, long entry, long off, long size_log2, long quota)` →
-        // `cap.call INSTANTIATOR 13 inst (module, grants_ptr, grants_n, entry, off, size_log2, quota)`
+        // `call.cap INSTANTIATOR 13 inst (module, grants_ptr, grants_n, entry, off, size_log2, quota)`
         // — the `instantiate_module_named` (op 13) primitive that runs a host-granted separate `Module`
         // AND re-grants a named grant list into the child's powerbox (the guest-orchestrated shell/driver
         // primitive: a compiled phase child resolves an inherited `"fs"` by name and does real I/O).
@@ -12817,7 +12817,7 @@ fn lower_vm_builtin(
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
-        // §14 join: `long __vm_join(int inst, long child)` → `cap.call INSTANTIATOR 1 inst (child)` — the
+        // §14 join: `long __vm_join(int inst, long child)` → `call.cap INSTANTIATOR 1 inst (child)` — the
         // happens-before that publishes the child's window writes and returns its result. `inst` is the
         // Instantiator handle, `child` the handle `__vm_instantiate` returned.
         "__vm_join" => {
@@ -16718,7 +16718,7 @@ impl<'a> BlockCtx<'a> {
         self.push(Inst::ConstI64(v))
     }
 
-    /// Build a `cap.self.*` reflection op as its canonical `cap.call CAP_SELF op N` form. The typed
+    /// Build a `self.*` reflection op as its canonical `call.cap CAP_SELF op N` form. The typed
     /// `Inst::CapSelf*` fronts were retired at the wire rev — the wire/IR carry only the generic
     /// `CapCall`, and the runtime CAP_SELF handler dispatches on `op`. `handle` is a freshly
     /// materialized const-0 i32 the handler ignores. Returns the op's `n` result values.
@@ -18619,7 +18619,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // `va_arg` reads), and a pointer to that scratch is deposited at the callee's reserved frame
         // slot (`callee_sp + 0`) for its `va_start`. The indirect callee (a defined `(...)` function
         // reached through a pointer) reads `va_start` from the same frame-0 slot, so the marshaling is
-        // identical — only the call inst differs (`call_indirect` vs `call`), decided below.
+        // identical — only the call inst differs (`call.dyn` vs `call`), decided below.
         // §varargs / old-C drift: a DIRECT call to a DEFINED function follows the definition's
         // signature, not the call-site type — old-C empty-parens prototypes let each site invent
         // its own (bash types `add_unwind_protect(fn, 0)` as `(ptr, i32, ...)` against a plain
@@ -18630,11 +18630,11 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // §varargs / old-C **indirect** drift (#802): a `(...)` call through a function POINTER can
         // name a non-variadic definition whose type the site cannot know (bash's `typedef int
         // Function ()` cleanup tables: `(*cleanup)(arg)` against `void pop_stream(void)`). The
-        // native ABI papers over the drift; the typed `call_indirect` would fail-closed
+        // native ABI papers over the drift; the typed `call.dyn` would fail-closed
         // (`IndirectCallType`). Route such a site through the module's pre-minted static dispatcher
         // for its shape — the indirect twin of the `def_sigs` direct-call rule (see
         // `synth_dispatcher`): the deposit is skipped here because the dispatcher owns ALL
-        // marshaling (its default arm reproduces the strict varargs `call_indirect` exactly).
+        // marshaling (its default arm reproduces the strict varargs `call.dyn` exactly).
         let dispatcher = dispatch_key_for(c, types).and_then(|k| ctx.dispatch_map.get(&k).copied());
         let (fixed, coerce_to): (Option<usize>, Option<Vec<ValType>>) = if dispatcher.is_some() {
             (None, None)
@@ -18705,7 +18705,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             }
         }
         // A direct call (named, defined function) lowers to `call <idx>`; an indirect call (through
-        // a function-pointer value) lowers to `call_indirect <sig>` (§3c: mask + type-id check).
+        // a function-pointer value) lowers to `call.dyn <sig>` (§3c: mask + type-id check).
         let inst = match callee_name(c) {
             Some(name) => {
                 // Reaching here means every recognizer/synthesizer/capability declined `name` — it is a
@@ -18737,7 +18737,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 match dispatcher {
                     // #802 old-C indirect drift: a dispatched site calls the static dispatcher
                     // directly — `(sp, fref, raw args…)`; it owns the coercions, the va deposit
-                    // (default arm), and the strict `call_indirect` fallback.
+                    // (default arm), and the strict `call.dyn` fallback.
                     Some(d) => {
                         args.insert(1, fref64);
                         Inst::Call { func: d, args }

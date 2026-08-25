@@ -380,9 +380,9 @@ fn print_func_at(s: &mut String, f: &Func, fn_results: &[usize], m: &Module, idx
 
         let mut next = b.params.len() as u32; // next value index in this block
                                               // The value index of the immediately-preceding instruction when it is an `i32.const 0` — the
-                                              // ignored dispatch handle a `cap.self.*` sugar CapCall points at. Lets the printer spell the
+                                              // ignored dispatch handle a `self.*` sugar CapCall points at. Lets the printer spell the
                                               // sugar only when its handle is that adjacent const (so parse re-pairs them exactly); any
-                                              // other CapCall CAP_SELF prints as the raw `cap.call`, which round-trips on its own.
+                                              // other CapCall CAP_SELF prints as the raw `call.cap`, which round-trips on its own.
         let mut prev_const0: Option<u32> = None;
         for inst in &b.insts {
             let n = inst.result_count(fn_results, &m.types);
@@ -502,14 +502,14 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
         Inst::CallIndirect { ty, idx, args } => {
             let s = sig_of(m, *ty);
             format!(
-                "call_indirect ({}) -> ({}) v{idx}{}",
+                "call.dyn ({}) -> ({}) v{idx}{}",
                 types(&s.params),
                 types(&s.results),
                 arglist(args)
             )
         }
         // §3.6 sugar: the service points print as `svc.poll`/`svc.wait` (greppable, per the
-        // design) — pure spelling over `cap.call CAP_SELF_TYPE_ID 9|10`; the ignored handle
+        // design) — pure spelling over `call.cap CAP_SELF_TYPE_ID 9|10`; the ignored handle
         // operand rides along so the round-trip is exact.
         Inst::CapCall {
             type_id: temen_ir::CAP_SELF_TYPE_ID,
@@ -525,11 +525,11 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
             let name = if *op == 9 { "svc.poll" } else { "svc.wait" };
             format!("{name} v{handle}")
         }
-        // Wire-rev sugar: the `cap.self.*` reflection ops (their typed `Inst::CapSelf*` fronts were
-        // retired to the generic `cap.call CAP_SELF op N`) print as their mnemonics. The ignored
+        // Wire-rev sugar: the `self.*` reflection ops (their typed `Inst::CapSelf*` fronts were
+        // retired to the generic `call.cap CAP_SELF op N`) print as their mnemonics. The ignored
         // const-0 dispatch handle is not spelled — but only when it is the immediately-preceding
         // `i32.const 0`, so the parser re-pairs the two exactly; any other handle (a shared or
-        // non-adjacent value) prints as the raw `cap.call` below, which round-trips unaided.
+        // non-adjacent value) prints as the raw `call.cap` below, which round-trips unaided.
         Inst::CapCall {
             type_id: temen_ir::CAP_SELF_TYPE_ID,
             op: op @ 0..=4,
@@ -540,11 +540,11 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
             && Some(*handle) == prev_const0 =>
         {
             match op {
-                0 => "cap.self.count".to_string(),
-                4 => "cap.self.attest".to_string(),
-                1 => format!("cap.self.get v{}", args[0]),
-                2 => format!("cap.self.resolve v{} v{}", args[0], args[1]),
-                _ => format!("cap.self.label v{} v{} v{}", args[0], args[1], args[2]),
+                0 => "self.count".to_string(),
+                4 => "self.attest".to_string(),
+                1 => format!("self.get v{}", args[0]),
+                2 => format!("self.resolve v{} v{}", args[0], args[1]),
+                _ => format!("self.label v{} v{} v{}", args[0], args[1], args[2]),
             }
         }
         Inst::CapCall {
@@ -556,7 +556,7 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
         } => {
             let s = sig_of(m, *sig);
             format!(
-                "cap.call {type_id} {op} ({}) -> ({}) v{handle}{}",
+                "call.cap {type_id} {op} ({}) -> ({}) v{handle}{}",
                 types(&s.params),
                 types(&s.results),
                 arglist(args)
@@ -625,9 +625,9 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
         // Phase-2 `import.attach <idx> v<handle>`: rebind a rebindable slot to a held capability.
         Inst::ImportAttach { import, handle } => format!("import.attach {import} v{handle}"),
         // §7 capability reflection intrinsics that carry a type-section index (not expressible as a
-        // plain `cap.call` immediate) — kept as typed ops.
-        Inst::CapSelfTypeId { ty } => format!("cap.self.type_id {ty}"),
-        Inst::CapSelfCovers { handle, ty } => format!("cap.self.covers v{handle} {ty}"),
+        // plain `call.cap` immediate) — kept as typed ops.
+        Inst::CapSelfTypeId { ty } => format!("self.type_id {ty}"),
+        Inst::CapSelfCovers { handle, ty } => format!("self.covers v{handle} {ty}"),
         Inst::VcpuTlsGet => "vcpu.tls.get".to_string(),
         Inst::DurableShadowBase => "durable.shadow_base".to_string(),
         Inst::VcpuTlsSet { val } => format!("vcpu.tls.set v{val}"),
@@ -851,7 +851,7 @@ fn print_term(t: &Terminator, m: &Module) -> String {
         Terminator::ReturnCallIndirect { ty, idx, args } => {
             let s = sig_of(m, *ty);
             format!(
-                "return_call_indirect ({}) -> ({}) v{idx}{}",
+                "return_call.dyn ({}) -> ({}) v{idx}{}",
                 types(&s.params),
                 types(&s.results),
                 arglist(args)
@@ -871,9 +871,9 @@ fn types(ts: &[ValType]) -> String {
     v.join(", ")
 }
 
-/// Does a `cap.call CAP_SELF_TYPE_ID op` carry the exact signature/arity of a `cap.self.*` reflection
+/// Does a `call.cap CAP_SELF_TYPE_ID op` carry the exact signature/arity of a `self.*` reflection
 /// mnemonic (op 0 count, 1 get, 2 resolve, 3 label, 4 attest)? Guards the sugar print so only a
-/// canonical reflection call spells as `cap.self.*`; any other CapCall prints as raw `cap.call`.
+/// canonical reflection call spells as `self.*`; any other CapCall prints as raw `call.cap`.
 fn cap_self_sig_matches(op: u32, sig: &FuncType, argc: usize) -> bool {
     use temen_ir::ValType::{I32, I64};
     match op {
@@ -1869,9 +1869,9 @@ struct Parser<'a> {
     auto_debug: bool,
     auto_locs: Vec<Loc>,
     auto_vars: Vec<VarInfo>,
-    /// Set by [`Self::parse_inst`] when it parses a `cap.self.*` sugar mnemonic — the wire-rev form
+    /// Set by [`Self::parse_inst`] when it parses a `self.*` sugar mnemonic — the wire-rev form
     /// carries no dispatch-handle operand in text, so [`Self::parse_block`] materializes an ignored
-    /// `i32.const 0` just ahead of the emitted `cap.call CAP_SELF` and points its handle at it.
+    /// `i32.const 0` just ahead of the emitted `call.cap CAP_SELF` and points its handle at it.
     pending_self_handle: bool,
 }
 
@@ -2322,7 +2322,7 @@ impl<'a> Parser<'a> {
                     | "br_table"
                     | "return"
                     | "return_call"
-                    | "return_call_indirect"
+                    | "return_call.dyn"
                     | "unreachable"
             ) {
                 let term = self.parse_term(&names)?;
@@ -2342,8 +2342,8 @@ impl<'a> Parser<'a> {
             // The binding LHS (idents/commas ending in `=`) is what tells them apart.
             let lhs = self.try_binding_lhs();
             let mut inst = self.parse_inst(&names)?;
-            // A `cap.self.*` sugar mnemonic carries no dispatch handle in text. Point the emitted
-            // `cap.call CAP_SELF`'s handle at an ignored `i32.const 0`: reuse the immediately-preceding
+            // A `self.*` sugar mnemonic carries no dispatch handle in text. Point the emitted
+            // `call.cap CAP_SELF`'s handle at an ignored `i32.const 0`: reuse the immediately-preceding
             // one when present — this is the printed sugar's own const-0 handle, so print∘parse is
             // exact — otherwise materialize a fresh one (one text line then emits two instructions).
             if self.pending_self_handle {
@@ -2506,7 +2506,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Build a `cap.self.*` reflection op as its `cap.call CAP_SELF op N` form. Flags
+    /// Build a `self.*` reflection op as its `call.cap CAP_SELF op N` form. Flags
     /// [`Self::pending_self_handle`] so [`Self::parse_block`] materializes the ignored const-0
     /// dispatch handle (the sugar text carries none); the placeholder handle here is overwritten there.
     fn cap_self_capcall(&mut self, op: u32, sig: FuncType, args: Vec<u32>) -> Inst {
@@ -2646,11 +2646,11 @@ impl<'a> Parser<'a> {
             let export = self.parse_u32()?;
             return Ok(Inst::ExportHandle { export });
         }
-        if op == "cap.self.type_id" {
+        if op == "self.type_id" {
             let ty = self.parse_u32()?;
             return Ok(Inst::CapSelfTypeId { ty });
         }
-        if op == "cap.self.covers" {
+        if op == "self.covers" {
             let handle = self.value(names)?;
             let ty = self.parse_u32()?;
             return Ok(Inst::CapSelfCovers { handle, ty });
@@ -2686,11 +2686,11 @@ impl<'a> Parser<'a> {
             let handle = self.value(names)?;
             return Ok(Inst::ImportAttach { import, handle });
         }
-        // §7 capability reflection intrinsics — sugar over `cap.call CAP_SELF op N`. The sugar text
+        // §7 capability reflection intrinsics — sugar over `call.cap CAP_SELF op N`. The sugar text
         // carries no dispatch handle; `cap_self_capcall` flags `parse_block` to materialize the
-        // ignored const-0 handle. (`cap.self.type_id`/`covers` carry a type-section index and stay
+        // ignored const-0 handle. (`self.type_id`/`covers` carry a type-section index and stay
         // typed ops — handled above.)
-        if op == "cap.self.count" {
+        if op == "self.count" {
             return Ok(self.cap_self_capcall(
                 0,
                 FuncType {
@@ -2700,7 +2700,7 @@ impl<'a> Parser<'a> {
                 vec![],
             ));
         }
-        if op == "cap.self.attest" {
+        if op == "self.attest" {
             return Ok(self.cap_self_capcall(
                 4,
                 FuncType {
@@ -2710,7 +2710,7 @@ impl<'a> Parser<'a> {
                 vec![],
             ));
         }
-        if op == "cap.self.get" {
+        if op == "self.get" {
             let idx = self.value(names)?;
             return Ok(self.cap_self_capcall(
                 1,
@@ -2721,7 +2721,7 @@ impl<'a> Parser<'a> {
                 vec![idx],
             ));
         }
-        if op == "cap.self.resolve" {
+        if op == "self.resolve" {
             let name_ptr = self.value(names)?;
             let name_len = self.value(names)?;
             return Ok(self.cap_self_capcall(
@@ -2733,7 +2733,7 @@ impl<'a> Parser<'a> {
                 vec![name_ptr, name_len],
             ));
         }
-        if op == "cap.self.label" {
+        if op == "self.label" {
             let handle = self.value(names)?;
             let buf_ptr = self.value(names)?;
             let buf_cap = self.value(names)?;
@@ -2757,7 +2757,7 @@ impl<'a> Parser<'a> {
             let val = self.value(names)?;
             return Ok(Inst::VcpuTlsSet { val });
         }
-        if op == "call_indirect" {
+        if op == "call.dyn" {
             let params = self.parse_type_list()?;
             self.expect(&Tok::Arrow)?;
             let results = self.parse_type_list()?;
@@ -2767,7 +2767,7 @@ impl<'a> Parser<'a> {
             return Ok(Inst::CallIndirect { ty, idx, args });
         }
         if op == "svc.poll" || op == "svc.wait" {
-            // §3.6 sugar over `cap.call CAP_SELF_TYPE_ID 9|10 () -> (i64) v<h> ()` — the
+            // §3.6 sugar over `call.cap CAP_SELF_TYPE_ID 9|10 () -> (i64) v<h> ()` — the
             // service points, spelled greppably. The handle operand is carried but ignored.
             let handle = self.value(names)?;
             let sig = self.intern_func_type(temen_ir::FuncType {
@@ -2782,11 +2782,11 @@ impl<'a> Parser<'a> {
                 args: vec![],
             });
         }
-        if op == "cap.call" {
+        if op == "call.cap" {
             let type_id = u32::try_from(self.parse_int()?)
-                .map_err(|_| ParseError("cap.call type_id out of range".into()))?;
+                .map_err(|_| ParseError("call.cap type_id out of range".into()))?;
             let op_index = u32::try_from(self.parse_int()?)
-                .map_err(|_| ParseError("cap.call op index out of range".into()))?;
+                .map_err(|_| ParseError("call.cap op index out of range".into()))?;
             let params = self.parse_type_list()?;
             self.expect(&Tok::Arrow)?;
             let results = self.parse_type_list()?;
@@ -3366,7 +3366,7 @@ impl<'a> Parser<'a> {
                 let args = self.parse_value_list(names)?;
                 PTerm::ReturnCall { func, args }
             }
-            "return_call_indirect" => {
+            "return_call.dyn" => {
                 let params = self.parse_type_list()?;
                 self.expect(&Tok::Arrow)?;
                 let results = self.parse_type_list()?;
@@ -3763,7 +3763,7 @@ block 0 (v0: i32) {
         assert!(r.imports.is_empty());
         let insts = &r.funcs[0].blocks[0].insts;
         assert!(!insts.iter().any(|i| matches!(i, Inst::CallSym { .. })));
-        // write → cap.call 0 1, exit → cap.call 1 0.
+        // write → call.cap 0 1, exit → call.cap 1 0.
         let caps: Vec<_> = insts
             .iter()
             .filter_map(|i| match i {

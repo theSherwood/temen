@@ -1,9 +1,9 @@
 //! Multi-frame call-chain freeze/thaw on the real interpreter (DURABILITY.md §12.7, R8).
 //!
-//! A call chain `A → B → … → leaf cap.call` stacks one shadow frame per suspended
+//! A call chain `A → B → … → leaf call.cap` stacks one shadow frame per suspended
 //! activation. On thaw the chain rewinds outside-in: each non-deepest frame reloads its
 //! pre-call live set and **re-issues its call** (leaving the state word `REWINDING`), and
-//! only the innermost leaf reloads the host-produced `cap.call` result and flips the
+//! only the innermost leaf reloads the host-produced `call.cap` result and flips the
 //! state back to `NORMAL`. The property is the same as the single-frame case — thaw on a
 //! *fresh* host equals the uninterrupted run — but it now exercises the "re-issue vs.
 //! continue" branch that the single-frame transform never hit.
@@ -68,7 +68,7 @@ fn assert_roundtrips(inst: &Module) -> Vec<Value> {
         "artifact is still UNWINDING (the whole chain unwound, none completed)"
     );
 
-    // Thaw on a fresh host (clock now 0): reload, do not re-issue the cap.call.
+    // Thaw on a fresh host (clock now 0): reload, do not re-issue the call.cap.
     let mut win = snapshot.clone();
     begin_thaw(&mut win, 0); // §12.8 stage 1: thaw the root (ctx 0) per-context
     let (thawed, final_win) = run(inst, 0, &win);
@@ -85,7 +85,7 @@ fn assert_roundtrips(inst: &Module) -> Vec<Value> {
     baseline
 }
 
-// Dead values across a `cap.call`: `v2`/`v3` are computed before the call but never used
+// Dead values across a `call.cap`: `v2`/`v3` are computed before the call but never used
 // after it, while `v1` is. The minimal live-set must spill only `v1` (+ the call result)
 // and drop `v2`/`v3`, yet the thaw must still reproduce the run. Baseline: 42 + 10 = 52.
 const DEAD_VALUES: &str = r#"
@@ -95,7 +95,7 @@ block 0 (v0: i32) {
   v2 = i64.const 20
   v3 = i64.const 30
   v4 = i32.const 0
-  v5 = cap.call 2 0 (i32) -> (i64) v0 (v4)
+  v5 = call.cap 2 0 (i32) -> (i64) v0 (v4)
   v6 = i64.add v5 v1
   return v6
   }
@@ -125,7 +125,7 @@ block 0 (v0: i32) {
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 100
   v4 = i64.add v2 v3
   return v4
@@ -165,7 +165,7 @@ block 0 (v0: i32) {
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 1
   v4 = i64.add v2 v3
   return v4
@@ -199,7 +199,7 @@ block 0 (v0: i32) {
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 5
   v4 = i64.add v2 v3
   return v4

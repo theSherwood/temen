@@ -236,9 +236,9 @@ block 0 (v0: i32, vout: i32) {
   i64.store q1a5 q1v4
   q1a6 = i64.const 1264
   i64.store q1a6 q1v4
-  vs = cap.call 6 17 (i64) -> (i32) v0 (q1a0)
+  vs = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
   vz0 = i64.const 0
-  vcap = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
   va0 = i64.const 256
   vnp = i32.const 300
   i32.store va0 vnp
@@ -276,8 +276,8 @@ block 0 (v0: i32, vout: i32) {
   i64.store q2a5 q2v5
   q2a6 = i64.const 1328
   i64.store q2a6 q2v6
-  vc = cap.call 6 17 (i64) -> (i32) v0 (q2a0)
-  vjc = cap.call 6 1 (i32) -> (i64) v0 (vc)
+  vc = call.cap 6 17 (i64) -> (i32) v0 (q2a0)
+  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
   return vjc
   }
 }
@@ -287,7 +287,7 @@ block 0 (v0: i64) {
   }
 block 1 () {
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   br 1()
   }
 }
@@ -296,14 +296,14 @@ block 0 (vx: i64) {
   vz = i32.const 0
   vro = i64.const 100
   vrt = i64.const 200
-  vt = cap.call 4294967295 11 (i64, i64) -> (i64) vz (vro, vrt)
+  vt = call.cap 4294967295 11 (i64, i64) -> (i64) vz (vro, vrt)
   return vt
   }
 }
 func (i64) -> (i64) {
 block 0 (vpid: i64) {
   vz = i32.const 0
-  vt = cap.call 4294967295 12 (i64) -> (i64) vz (vpid)
+  vt = call.cap 4294967295 12 (i64) -> (i64) vz (vpid)
   return vt
   }
 }
@@ -317,22 +317,22 @@ block 0 (v0: i64) {
   i64.store va8 voname
   vp0 = i64.const 0
   vl3 = i64.const 3
-  vhsvc = cap.self.resolve vp0 vl3
+  vhsvc = self.resolve vp0 vl3
   vp8 = i64.const 8
   vl1 = i64.const 1
-  vho = cap.self.resolve vp8 vl1
+  vho = self.resolve vp8 vl1
   br 1(vhsvc, vho)
   }
 block 1 (vhsvc: i32, vho: i32) {
   varg = i64.const 7
-  vr = cap.call 268435456 0 (i64) -> (i64) vhsvc (varg)
+  vr = call.cap 268435456 0 (i64) -> (i64) vhsvc (varg)
   v200 = i64.const 200
   vistwin = i64.eq vr v200
   br_if vistwin 4(vr, vho) 2(vr, vhsvc, vho)
   }
 block 2 (vr: i64, vhsvc: i32, vho: i32) {
   vpid3 = i64.const 3
-  vstatus = cap.call 268435456 1 (i64) -> (i64) vhsvc (vpid3)
+  vstatus = call.cap 268435456 1 (i64) -> (i64) vhsvc (vpid3)
   veagain = i64.const -11
   viseagain = i64.eq vstatus veagain
   br_if viseagain 2(vr, vhsvc, vho) 3(vr, vstatus, vhsvc, vho)
@@ -346,7 +346,7 @@ block 4 (vr: i64, vho: i32) {
   vp16 = i64.const 16
   i64.store vp16 vr
   vlen = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
   return vr
   }
 }
@@ -1084,7 +1084,7 @@ const ONRAMP_JIT_TABLE_LOG2: u8 = 10;
 /// size the interpreter's dispatch table takes (`bytecode::SharedSlots`: `max(1 << log2,
 /// n.next_power_of_two())`). A **fixed** `1 << ONRAMP_JIT_TABLE_LOG2` under-sized the emitted table
 /// for a guest with more than 1024 functions (QuickJS 1185, SQLite 1445, Tcl 2669), so a high-index
-/// `call_indirect` masked `idx & 1023` in the emitted leaf but `idx & (2*n-1)` on the interpreter —
+/// `call.dyn` masked `idx & 1023` in the emitted leaf but `idx & (2*n-1)` on the interpreter —
 /// a wrong slot (→ "null function / signature mismatch", or a wrong-but-typed function). Threaded
 /// through the emit, the engine table, the slot mirror, the unit emitter, and the driver accessor so
 /// all four agree on `1 << log2`.
@@ -1370,7 +1370,7 @@ fn par_inst() -> Option<&'static ParInstCfg> {
 // wasm** on its own Worker (the module "compiles on push") instead of the bytecode interpreter — the
 // child fills the same completion slot the parent `join`s, so no engine change is needed. The granted
 // module is emitted once per instance (each Worker computes its own copy from the shared recipe, like
-// the tier-up bitmap); a child entry that uses a `cap.call` (a nested `instantiate`, an address-space
+// the tier-up bitmap); a child entry that uses a `call.cap` (a nested `instantiate`, an address-space
 // op) is **not** in-subset, so it stays on the interpreter (fail-closed).
 
 /// The emitted wasm of the run's granted §14 unit (per-instance stash; `(null, 0)` ⇒ none).
@@ -1403,7 +1403,7 @@ pub extern "C" fn temen_par_enable_inst_codegen() -> i32 {
         };
         // §14 VM-in-VM codegen via the library's single nested front door ([`compile_nested`]): it
         // picks the drive mode from the IR and always yields a runnable artifact. A cap-using entry
-        // (`cap.call 6 0/1` instantiate/join, or a `thread.spawn`) emits, its bounce arriving at the
+        // (`call.cap 6 0/1` instantiate/join, or a `thread.spawn`) emits, its bounce arriving at the
         // Worker via the `env.instantiate`/`env.join`/`env.thread_*` imports (serviced through the same
         // confined-child completion-slot protocol as the interpreter path); a fiber-bearing unit falls
         // to an interpreter-driven tier-up. Either way `emitted[i]` is the sound "safe to call `f{i}`
@@ -1468,7 +1468,7 @@ pub extern "C" fn temen_par_inst_nparams(entry: u32) -> usize {
 // ---- 4d: host I/O across Workers — the run's shared powerbox ------------------------------------
 // THREADS.md 4d: one `Mutex<Host>`, leaked into the shared linear memory (the same cross-Worker
 // sharing as `PAR_PB`/`PAR_INST`), attached to **every** vCPU of the run
-// ([`bytecode::Vcpu::with_shared_host`]) — so a worker vCPU's `cap.call` (host I/O) dispatches
+// ([`bytecode::Vcpu::with_shared_host`]) — so a worker vCPU's `call.cap` (host I/O) dispatches
 // in-engine under the lock, `drive_parallel`'s 4c-host model, with no JS in the loop at all: the
 // `Host` is fully virtual (stdout is an in-memory buffer the page reads back after the run).
 
@@ -1484,7 +1484,7 @@ struct ParIoCfg {
 static PAR_IO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Publish the run's **shared I/O powerbox**: a fresh `Host` granted a `Stream(Out)`, wrapped in the
-/// `Mutex` every vCPU will dispatch `cap.call` through. The root is seeded with `[out_handle]`
+/// `Mutex` every vCPU will dispatch `call.cap` through. The root is seeded with `[out_handle]`
 /// (`temen_par_root`); read the accumulated stdout back after the run via [`temen_par_stdout_len`] +
 /// [`temen_par_stdout_ptr`]. Call once (on the main thread) before the run; last-published run recipe
 /// wins (the §22/§14 recipes are cleared, and vice versa).
@@ -1530,7 +1530,7 @@ fn par_io() -> Option<&'static ParIoCfg> {
 // Unlike `ParPowerbox` (a *fixed* unit host-compiled at setup, its code handle handed to the guest),
 // this powerbox lets the guest build an IR blob **at runtime**, `compile` it — minting a unit **and
 // emitting its wasm** in this host, because the `Jit` grant carries the browser validator + emitter and
-// the vCPU dispatches its `cap.call`s through this shared `Mutex<Host>` (`with_shared_host`) — then
+// the vCPU dispatches its `call.cap`s through this shared `Mutex<Host>` (`with_shared_host`) — then
 // `invoke` it on that emitted wasm. The shared `Mutex` is also the seam threaded compile will serialize
 // on (DESIGN.md §22), so this is the single-Worker step of the same design, not a throwaway.
 
@@ -1547,7 +1547,7 @@ static PAR_JIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize:
 
 /// Publish the runtime-`Jit.compile` powerbox: a fresh `Host` granted `Jit` (memory-match precondition
 /// from the guest's declared memory) with [`browser_jit_validator`] + [`browser_jit_wasm_emitter`]
-/// installed, wrapped in the shared `Mutex` the vCPU dispatches `cap.call` through. The root is seeded
+/// installed, wrapped in the shared `Mutex` the vCPU dispatches `call.cap` through. The root is seeded
 /// `[jit]` ([`temen_par_root`]); the guest builds an IR blob, `compile`s it (emitting wasm), and
 /// `invoke`s it on the emitted region. Codegen on by default (flip with [`temen_par_jit_set_codegen`] to
 /// run the interpreter path for a differential). Call once (on the main thread) before the run; the
@@ -1636,7 +1636,7 @@ fn par_jit_slot_clear(slot: usize) {
 }
 
 /// When on, the runtime-`Jit.compile` emitter emits **Model B2** units (importing the shared reserved
-/// funcref table) instead of local-table units — so an installed unit's `call_indirect` dispatches to
+/// funcref table) instead of local-table units — so an installed unit's `call.dyn` dispatches to
 /// other installed units through the per-Worker table mirror. Off by default (the emitted-unit shape
 /// changes, so the JS host must provide `env.__indirect_function_table`).
 static PAR_JIT_B2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1653,7 +1653,7 @@ pub extern "C" fn temen_par_jit_set_b2(on: i32) {
 }
 
 /// The §22 `Jit` dispatch-table reservation (`log2` of the slot count) — the size the JS host makes
-/// each per-Worker `WebAssembly.Table`, matching the emitted `call_indirect` mask `idx & (2^n - 1)`.
+/// each per-Worker `WebAssembly.Table`, matching the emitted `call.dyn` mask `idx & (2^n - 1)`.
 #[no_mangle]
 pub extern "C" fn temen_par_jit_table_log2() -> u32 {
     PAR_JIT_TABLE_LOG2 as u32
@@ -1785,7 +1785,7 @@ pub extern "C" fn temen_par_root(
         };
     }
     // A §22 **runtime-compile** run: the guest's `Jit` authority + validator + emitter live in the
-    // shared `Mutex<Host>` it dispatches `cap.call`s through (`with_shared_host`), so its runtime
+    // shared `Mutex<Host>` it dispatches `call.cap`s through (`with_shared_host`), so its runtime
     // `compile` mints + emits into that host. Seed `[jit]` only — the guest compiles its own unit.
     if let Some(cfg) = par_jit_rt() {
         // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
@@ -1866,7 +1866,7 @@ pub extern "C" fn temen_par_child(
             if let Some(cfg) = par_jit_rt() {
                 return par_box(inner.with_shared_host(&cfg.host));
             }
-            // A 4d I/O run shares one powerbox across every vCPU (worker `cap.call` = host I/O).
+            // A 4d I/O run shares one powerbox across every vCPU (worker `call.cap` = host I/O).
             let inner = match par_io() {
                 Some(io) => inner.with_shared_host(&io.host),
                 None => inner,
@@ -2457,7 +2457,7 @@ pub struct PbOutcome {
 }
 
 /// The canonical names of the browser powerbox's capabilities, in grant order — the vocabulary a
-/// powerbox guest resolves against via `cap.self.resolve` (F7) / labels via `cap.self.label` (F9). The
+/// powerbox guest resolves against via `self.resolve` (F7) / labels via `self.label` (F9). The
 /// browser ABI grants `(stdout, stdin, exit, stderr, clock)` by arity (its set differs from `temen-run`'s
 /// fixed §3e prefix after slot 3, since the capabilities differ), so the names follow that order.
 const POWERBOX_CAP_NAMES: [&str; 5] = ["stdout", "stdin", "exit", "stderr", "clock"];
@@ -2467,7 +2467,7 @@ const POWERBOX_CAP_NAMES: [&str; 5] = ["stdout", "stdin", "exit", "stderr", "clo
 /// Capabilities are granted by the entry's **arity** (so `hello.temt`'s 3-handle `(out, in, exit)`
 /// shape works unchanged), in this order — the browser embedder's ABI:
 ///
-/// | param # | capability        | `cap.call` type_id |
+/// | param # | capability        | `call.cap` type_id |
 /// |---------|-------------------|--------------------|
 /// | 1       | `Stream(Out)`     | 0 (op 1 = write)   |
 /// | 2       | `Stream(In)`      | 0 (op 0 = read)    |
@@ -2498,7 +2498,7 @@ pub fn powerbox_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
         slots.push(Value::I32(host.grant_clock()));
     }
     // §7 register each granted capability under its canonical name (F7/F9, PR #118) so a guest can
-    // `cap.self.resolve` / `cap.self.label` it at runtime — mirroring `temen-run`'s powerbox so the
+    // `self.resolve` / `self.label` it at runtime — mirroring `temen-run`'s powerbox so the
     // browser stays a faithful twin. Names parallel the grant order above; only the `arity` actually
     // granted are registered.
     for (name, slot) in POWERBOX_CAP_NAMES.iter().zip(&slots) {
@@ -2537,7 +2537,7 @@ const ONRAMP_CAP_NAMES: [&str; 5] = ["stdout", "stdin", "exit", "memory", "addrs
 
 /// The reference host's §7 capability-import name policy — a browser-side twin of `temen-run`'s
 /// `default_cap_resolver`. The on-ramp emits `call.sym "<name>"` for each libc→capability shim
-/// (`write`/`read`/`exit`/`vm_map`/…); this lowers each name to the `(type_id, op)` its `cap.call`
+/// (`write`/`read`/`exit`/`vm_map`/…); this lowers each name to the `(type_id, op)` its `call.cap`
 /// runs, so the resolved module verifies and runs. The **handle** (which stream/region) is supplied
 /// by the powerbox stash, not this map — `write`/`read` share `Stream`, differing only by handle.
 pub(crate) fn onramp_cap_resolver(name: &str) -> Option<temen_ir::ResolvedCap> {
@@ -2574,7 +2574,7 @@ pub(crate) fn onramp_cap_resolver(name: &str) -> Option<temen_ir::ResolvedCap> {
 /// import-bearing module without that shape **fails closed** (the pre-manifest `resolve_imports`
 /// rewrite died with phase 4). An import-free module passes as-is: its entry runs with no args
 /// (missing params zero-seed, the `Session` convention) and reaches capabilities only by name via
-/// `cap.self.resolve`.
+/// `self.resolve`.
 pub(crate) fn onramp_check(m: &temen_ir::Module) -> Result<(), ()> {
     // An import-free module passes as-is; an import-bearing one must carry the shared powerbox
     // entry shape (#912) so its manifest slots can bind.
@@ -2593,14 +2593,14 @@ pub(crate) fn onramp_check(m: &temen_ir::Module) -> Result<(), ()> {
 type KeyQueue = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i32>>>;
 
 /// Grant the **on-ramp powerbox** onto `host` for module `m`: the §3e prefix
-/// (`stdout, stdin, exit, memory, addrspace`), each registered under its `cap.self.resolve` name,
+/// (`stdout, stdin, exit, memory, addrspace`), each registered under its `self.resolve` name,
 /// plus the two by-name graphical `HostProc` capabilities every on-ramp run carries — `display` (op 0 =
 /// `present(ptr, w, h)`, copies `w*h*4` RGBA bytes out of the window into the returned frame cell) and
 /// `keyboard` (op 0 = `poll()`, dequeues one packed event from the returned queue, or `-1`).
 ///
 /// The on-ramp entry is the phase-4 powerbox shape (mirroring `temen-run`'s `grant_caps`): a
 /// **paramless** `_start` whose manifest imports bind to slot bindings at instantiation, and which
-/// resolves any further capability by name via `cap.self.resolve`. The whole prefix is granted and
+/// resolves any further capability by name via `self.resolve`. The whole prefix is granted and
 /// registered under its canonical names; a guest resolves only the names it uses, so registering
 /// the full prefix is a harmless superset — one that resolves neither graphical cap is unaffected
 /// (the queue stays empty, the frame cell `None`). The entry receives **no** handle arguments (the
@@ -2813,7 +2813,7 @@ fn grant_onramp_caps(
 /// the twin of [`powerbox_exec`] with the fixed §3e `VM_CAP_*` grant prefix instead of the browser
 /// corpus's `(…, stderr, clock)` set: [`grant_onramp_caps`] grants `stdout, stdin, exit, memory,
 /// addrspace` (mirroring `temen-run`'s `grant_powerbox_prefix`) and registers each under its name, and
-/// the by-name `_start` resolves what it needs via `cap.self.resolve`.
+/// the by-name `_start` resolves what it needs via `self.resolve`.
 ///
 /// The entry is the phase-4 powerbox shape ([`onramp_check`]): a paramless `_start` whose manifest
 /// imports bind at instantiation, taking **no** handle arguments — the positional (slot-order
@@ -2841,7 +2841,7 @@ pub fn onramp_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
     let mut fuel = u64::MAX;
     // The bytecode engine services a `vm_jit_*`-importing guest (the JACL self-hosted compiler) too:
     // it lowers the guest's `call.import` §22 ops to the driver's `Op::JitInvoke`/`install`/`uninstall`
-    // just like a static `cap.call (JIT, op)`, and multiplexes the guest's scheduler cooperatively
+    // just like a static `call.cap (JIT, op)`, and multiplexes the guest's scheduler cooperatively
     // (no OS threads — so this runs on the wasm32 cdylib, unlike the tree-walker's thread pool). A
     // C guest that grows a large heap with sub-64-KiB `vm_map`s runs unchanged now that the interp's
     // software page size is 4 KiB on wasm (see `host_page_size`) — no per-guest window bump needed.
@@ -3070,7 +3070,7 @@ pub fn bash_exec_with(
 /// Runs on the **bytecode** engine ([`bytecode::compile_and_run_with_host`]) — the browser's
 /// single-threaded, wasm-safe interpreter tier. (The tree-walk `drive` uses OS worker threads + a wall
 /// clock, neither of which exists under `wasm32-unknown-unknown`, so it can't run in the browser.) The
-/// shell *statically* carries `Instantiator`/`SharedRegion` cap.calls (its external-command / ring
+/// shell *statically* carries `Instantiator`/`SharedRegion` call.cap calls (its external-command / ring
 /// paths), but the sequential Stage-0 surface never **executes** them — with no commands registered,
 /// `exec_lookup` misses and pipelines fall back to the in-window memfs — so the module runs cleanly;
 /// only the *reserved-window* bytecode entry statically refuses such modules, and this plain entry does
@@ -3171,7 +3171,7 @@ fn pg_setup(
     onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
     let mut host = Host::new();
     // Grant the on-ramp powerbox prefix — stdout, stdin, exit, memory (the heap-growth cap `malloc`
-    // uses) — and register each **by name** (`cap.self.resolve`). Granted directly — not via
+    // uses) — and register each **by name** (`self.resolve`). Granted directly — not via
     // `grant_onramp_caps`, whose graphical `display`/`keyboard`/`webgpu` caps would add a host
     // import a headless Postgres neither needs nor can satisfy.
     let out = host.grant_stream(StreamRole::Out);
@@ -3230,7 +3230,7 @@ fn pg_setup(
 /// heap through the `memory` cap into the reserved tail). `stdin` is the SQL script; the backend's
 /// output comes back on the captured `stdout`. The one entry that boots a *real database* in the
 /// browser — and the direct in-wasm measurement of the guest boot (BOOTSPEED.md). The `stdout, stdin,
-/// exit, memory, fs` caps are reached by name (`cap.self.resolve`) or through the module's manifest
+/// exit, memory, fs` caps are reached by name (`self.resolve`) or through the module's manifest
 /// slot bindings — the paramless `_start` takes no handle args (IMPORTS.md phase 4).
 pub fn pg_exec(m: &temen_ir::Module, image: &[u8], stdin: &[u8]) -> PbOutcome {
     onramp_fs_exec(m, image, &PG_SINGLE_ARGV, stdin)
@@ -4605,7 +4605,7 @@ impl JitOnrampReactor {
     ) -> Result<JitOnrampReactor, i32> {
         onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
         let mut module = m.clone();
-        // Hoist inline `cap.call`s into cross-tier wrapper functions so a hot `tick` that interleaves
+        // Hoist inline `call.cap`s into cross-tier wrapper functions so a hot `tick` that interleaves
         // compute with a once-per-frame present/poll cap call still emits (its hot path runs on wasm;
         // only the cap wrapper bounces to the interpreter). Mutates the module BOTH tiers use: the
         // emitter reads it below, and `run_cross_tier` runs the wrappers on the interpreter.
@@ -4623,7 +4623,7 @@ impl JitOnrampReactor {
         // Compile the module **once** — reused for the entry and every per-frame cross-tier bounce.
         let program = bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?;
         // Run the entry (func 0) once over the shared window with no args (phase 4: the manifest
-        // slot bindings deliver the capabilities), servicing `cap.call`s (Doom's WAD read) inline
+        // slot bindings deliver the capabilities), servicing `call.cap`s (Doom's WAD read) inline
         // against the powerbox. The window then persists in `back` for every frame.
         let mut fuel = u64::MAX;
         match program.run_over(0, &[], &mut fuel, back.clone(), &mut host, true) {
@@ -4691,7 +4691,7 @@ impl JitOnrampReactor {
 
     /// **Cross-tier bounce.** Run non-emitted `func(args)` on the interpreter over the shared window
     /// with the powerbox — the callback the emitted `tick`'s `env.call_interp` drives. Memory effects
-    /// land in the shared window (the bytes the emitted code reads); `cap.call`s resolve against the
+    /// land in the shared window (the bytes the emitted code reads); `call.cap`s resolve against the
     /// persistent host (so a `display.present` populates the frame cell, `keyboard.poll` drains input).
     /// `Err(Trap::Exit)` is the guest's `Exit`; any other `Err` is a trap.
     pub fn run_cross_tier(&mut self, func: u32, args: &[Value]) -> Result<Vec<Value>, Trap> {
@@ -4741,7 +4741,7 @@ impl JitOnrampReactor {
 /// A **single-shot** wasm-JIT run of an on-ramp module — the run-to-completion twin of
 /// [`JitOnrampReactor`] (which drives an exported `tick` per frame). Here the whole program *is* func 0
 /// (`_start`), so we emit **that** and run it once: the paramless `_start` reads its capabilities
-/// through the manifest slot bindings / `cap.self.resolve` (phase 4 — no handle params), seeds the
+/// through the manifest slot bindings / `self.resolve` (phase 4 — no handle params), seeds the
 /// heap, and calls `main(sp)` — all on emitted wasm, with the 47/103 cross-tier helpers (Lua/SQLite)
 /// bouncing to the interpreter through `env.call_interp` over the same window (so
 /// `write`/`read`/`exit` resolve against the powerbox). Unlike the reactor, `_start` is **not**
@@ -6617,7 +6617,7 @@ mod xcall_slot_tests {
 
     /// #1009 Mechanism 1: the emitted B2 dispatch table's size (`1 << tierup_table_log2(n)`) must
     /// equal the interpreter's `bytecode::SharedSlots` size (`max(1 << ONRAMP_JIT_TABLE_LOG2,
-    /// n.next_power_of_two())`) for **every** guest — the two tiers mask `call_indirect` against the
+    /// n.next_power_of_two())`) for **every** guest — the two tiers mask `call.dyn` against the
     /// same slot count, so a high-index dispatch reaches the same function on both. A fixed
     /// `1 << ONRAMP_JIT_TABLE_LOG2` under-sized the emitted table for the >1024-function cards
     /// (QuickJS 1185, SQLite 1445, Tcl 2669), so the emitted leaf wrapped a wrong slot.
@@ -7682,7 +7682,7 @@ pub extern "C" fn temen_wasmjit_compile_full(
 /// `env.__indirect_function_table` (sized `1 << table_log2` = the `Jit` grant's reservation) instead
 /// of declaring a private one, and populates no slots — the JS host owns the shared
 /// `WebAssembly.Table`, writing each unit's `f0` funcref into its slot on `install` (`table.set`) and
-/// nulling it on `uninstall`. So an installed unit is a funcref another instance's `call_indirect`
+/// nulling it on `uninstall`. So an installed unit is a funcref another instance's `call.dyn`
 /// reaches through the one shared table (`temen_wasm_jit::compile_module_b2`; the native differential is
 /// `crates/temen-wasm-jit/tests/b2_install.rs`). Emitted bytes are stashed exactly like
 /// [`temen_wasmjit_compile`] (read via [`temen_wasmjit_ptr`]/[`temen_wasmjit_len`]); `0` if the module is
@@ -7805,7 +7805,7 @@ pub extern "C" fn temen_wasmjit_call_interp(func: u32, args_ptr: *mut u8) -> i32
 
 /// Run `m`'s function 0 under a deterministic **3-cap powerbox** — `Stream(Out)` (type 0), `Exit`
 /// (type 1), and a host-fn (type 13), granted in that order — so the §7 reflection ops
-/// `cap.self.count` / `cap.self.get` see a fixed, known capability table. Passes `arg` only if the
+/// `self.count` / `self.get` see a fixed, known capability table. Passes `arg` only if the
 /// entry takes one. Returns `(status, i64-widened value)`. Shared by [`temen_run_reflect`] and
 /// `gencorpus`.
 pub fn reflect_exec(m: &temen_ir::Module, arg: i64) -> (i32, i64) {
@@ -7833,7 +7833,7 @@ pub fn reflect_exec(m: &temen_ir::Module, arg: i64) -> (i32, i64) {
 
 // The **canonical** §22 `compile_linked` symbol-table wire form (mirrors `temen-run::decode_symbol_table`,
 // DESIGN.md §22): a LEB128 stream `count`, then per entry `name` (uleb len + UTF-8 bytes), a `kind`
-// byte, and its payload — `0` = `Slot(uleb)` (a shared `call_indirect` table slot: the *dynamic*-link
+// byte, and its payload — `0` = `Slot(uleb)` (a shared `call.dyn` table slot: the *dynamic*-link
 // case a guest loader uses to bind a submitted unit's imports to functions of the host program it runs
 // inside — e.g. the JACL self-hosted compiler-guest binding a staged macro's `call.sym` imports to its
 // own `jaclrt` runtime funcs), `1` = `Cap(uleb type_id, uleb op)` (a host capability). Empty bytes ⇒
@@ -7964,7 +7964,7 @@ fn browser_jit_validator(
     let Ok(m) = temen_encode::decode_module(bytes) else {
         return Err(EINVAL);
     };
-    // Bind named imports via the table (a Slot → `call_indirect`, a Cap → `cap.call`); an unresolved
+    // Bind named imports via the table (a Slot → `call.dyn`, a Cap → `call.cap`); an unresolved
     // import ⇒ fail closed (the module is re-verified after the rewrite).
     let resolve = |name: &str| table.iter().find(|(n, _)| n == name).map(|(_, r)| *r);
     let Ok(m) = temen_ir::resolve_imports_with(&m, resolve) else {
@@ -7995,7 +7995,7 @@ fn browser_jit_wasm_emitter(blob: &[u8]) -> Option<Vec<u8>> {
     let m = temen_encode::decode_module(blob).ok()?;
     if par_jit_b2() {
         // §22 Model B2 cross-Worker: emit a unit that imports the shared reserved funcref table, so its
-        // `call_indirect` dispatches (at native wasm speed) to units installed in the per-Worker table
+        // `call.dyn` dispatches (at native wasm speed) to units installed in the per-Worker table
         // mirror. Whole-module in-subset only; otherwise fail-closed to the interpreter (`.ok()`).
         return temen_wasm_jit::compile_module_b2(&m, true, PAR_JIT_TABLE_LOG2 as u32).ok();
     }
@@ -8025,7 +8025,7 @@ block 0 (v0: i32, v1: i32) {
 
 /// Run `m`'s function 0 with a **`Jit`** cap (iface 11) and a host-compiled [`JIT_SERVICE`] unit:
 /// the guest receives `(jit_handle, code_handle, a, b)`, `install`s the unit into its dispatch table
-/// (op 3), then `call_indirect`s it — guest-driven code loading, **interpreted** (the bytecode engine
+/// (op 3), then `call.dyn`s it — guest-driven code loading, **interpreted** (the bytecode engine
 /// lowers the submitted unit to bytecode; no native backend). `a=6, b=7`. Returns `(status, value)`.
 pub fn jit_exec(m: &temen_ir::Module) -> (i32, i64) {
     let service = match temen_text::parse_module(JIT_SERVICE) {
@@ -8075,7 +8075,7 @@ block 0 (v0: i32) {
 /// Run `m`'s function 0 with a `Jit` cap, a `Clock` cap, and a host-`compile_linked` [`DL_UNIT`]:
 /// **dynamic linking** — the unit's named import `"clock"` is bound (via the symbol table) to the
 /// `Clock` capability `(type_id 2, op 0)` before verify, lowering `call.sym "clock"` to a real
-/// `cap.call 2 0`. The guest receives `(jit, code, clock)`, installs the unit and `call_indirect`s it
+/// `call.cap 2 0`. The guest receives `(jit, code, clock)`, installs the unit and `call.dyn`s it
 /// passing the clock handle → `777`. With `link == false` the symbol table is empty, so the import is
 /// unresolved and `compile_linked` fails closed (`STATUS_TRAP`). Returns `(status, value)`.
 pub fn dynlink_exec(m: &temen_ir::Module, link: bool) -> (i32, i64) {
@@ -8260,7 +8260,7 @@ pub extern "C" fn temen_run_region(mod_ptr: *const u8, mod_len: usize) -> i64 {
 }
 
 /// Decode the module at `[mod_ptr, mod_len)` and run function 0 under a fixed 3-cap powerbox, so §7
-/// reflection (`cap.self.count`/`get`) is deterministic (see [`reflect_exec`]). Returns the guest's
+/// reflection (`self.count`/`get`) is deterministic (see [`reflect_exec`]). Returns the guest's
 /// `i64` result; sets [`LAST_STATUS`].
 #[no_mangle]
 pub extern "C" fn temen_run_reflect(mod_ptr: *const u8, mod_len: usize, arg: i64) -> i64 {
@@ -8313,7 +8313,7 @@ func (i32, i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32, v2: i32) {
   v3 = i64.const 0
   v4 = i64.const 17
-  v5 = cap.call 0 1 (i64, i64) -> (i64) v0(v3, v4)
+  v5 = call.cap 0 1 (i64, i64) -> (i64) v0(v3, v4)
   v6 = i32.const 0
   return v6
   }
@@ -8323,7 +8323,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 func (i32, i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32, v2: i32) {
   v3 = i32.const 42
-  cap.call 1 0 (i32) -> () v2(v3)
+  call.cap 1 0 (i32) -> () v2(v3)
   v4 = i32.const 0
   return v4
   }
@@ -8409,8 +8409,8 @@ block 0 (v0: i32) {
   v2 = i64.const 65536
   v3 = i64.const 12
   v4 = i64.const 0
-  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
-  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
   v7 = i64.const 65543
   v8 = i32.load8_u v7
   v9 = i64.extend_i32_u v8
@@ -8475,8 +8475,8 @@ pub extern "C" fn run_durable() -> i64 {
     const SRC: &str = r#"memory 17
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = cap.call 2 0 () -> (i64) v0 ()
-  v2 = cap.call 2 0 () -> (i64) v0 ()
+  v1 = call.cap 2 0 () -> (i64) v0 ()
+  v2 = call.cap 2 0 () -> (i64) v0 ()
   v3 = i64.add v1 v2
   return v3
   }
@@ -8505,9 +8505,9 @@ pub extern "C" fn run_dynlink() -> i64 {
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
   v3 = i64.extend_i32_u v1
-  v4 = cap.call 11 3 (i64) -> (i64) v0 (v3)
+  v4 = call.cap 11 3 (i64) -> (i64) v0 (v3)
   v5 = i32.wrap_i64 v4
-  v6 = call_indirect (i32) -> (i64) v5 (v2)
+  v6 = call.dyn (i32) -> (i64) v5 (v2)
   return v6
   }
 }
@@ -8522,7 +8522,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 }
 
 /// Self-contained guest-JIT probe (`wasmtime --invoke run_jit`): a guest installs a host-compiled
-/// unit (`a*b+100`) into its dispatch table and `call_indirect`s it with `(6, 7)` → `142`. Proves
+/// unit (`a*b+100`) into its dispatch table and `call.dyn`s it with `(6, 7)` → `142`. Proves
 /// guest-driven code loading (validated + interpreted, no native backend) works. `-1` on mismatch.
 #[no_mangle]
 pub extern "C" fn run_jit() -> i64 {
@@ -8530,9 +8530,9 @@ pub extern "C" fn run_jit() -> i64 {
 func (i32, i32, i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   v4 = i64.extend_i32_u v1
-  v5 = cap.call 11 3 (i64) -> (i64) v0 (v4)
+  v5 = call.cap 11 3 (i64) -> (i64) v0 (v4)
   v6 = i32.wrap_i64 v5
-  v7 = call_indirect (i32, i32) -> (i32) v6 (v2, v3)
+  v7 = call.dyn (i32, i32) -> (i32) v6 (v2, v3)
   return v7
   }
 }
@@ -8554,11 +8554,11 @@ pub extern "C" fn run_region() -> i64 {
     const R: &str = r#"memory 17
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = cap.call 4 3 () -> (i64) v0 ()
+  v1 = call.cap 4 3 () -> (i64) v0 ()
   v2 = i64.const 0
   v3 = i32.const 3
-  v4 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v0 (v2, v2, v1, v3)
-  v5 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v0 (v1, v2, v1, v3)
+  v4 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (v2, v2, v1, v3)
+  v5 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (v1, v2, v1, v3)
   v6 = i64.const 81985529216486895
   i64.store v2 v6
   v7 = i64.load v1
@@ -8576,13 +8576,13 @@ block 0 (v0: i32) {
 }
 
 /// Self-contained reflection probe (`wasmtime --invoke run_reflect`): under the fixed 3-cap powerbox,
-/// `cap.self.count` reports `3`. Returns `-1` on any mismatch.
+/// `self.count` reports `3`. Returns `-1` on any mismatch.
 #[no_mangle]
 pub extern "C" fn run_reflect() -> i64 {
     const R: &str = r#"
 func () -> (i32) {
 block 0 () {
-  v0 = cap.self.count
+  v0 = self.count
   return v0
   }
 }
@@ -8719,13 +8719,13 @@ block 0 (v0: i32) {
   v2 = i64.const 65536
   v3 = i64.const 16
   v4 = i64.const 0
-  v5 = cap.call 6 2 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v5 = call.cap 6 2 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   v6 = i64.const 0
-  v7, v8 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v5, v6)
+  v7, v8 = call.cap 6 3 (i32, i64) -> (i32, i64) v0 (v5, v6)
   v9 = i64.const 10
-  v10, v11 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v5, v9)
+  v10, v11 = call.cap 6 3 (i32, i64) -> (i32, i64) v0 (v5, v9)
   v12 = i64.const 20
-  v13, v14 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v5, v12)
+  v13, v14 = call.cap 6 3 (i32, i64) -> (i32, i64) v0 (v5, v12)
   v15 = i64.add v8 v11
   v16 = i64.add v15 v14
   v17 = i64.extend_i32_s v13
@@ -8742,10 +8742,10 @@ block 0 (v0: i64) {
   v3 = i32.const 7
   i32.store8 v2 v3
   v4 = i64.const 100
-  v5 = cap.call 7 0 (i64) -> (i64) v1 (v4)
+  v5 = call.cap 7 0 (i64) -> (i64) v1 (v4)
   v6 = i64.const 200
   v7 = i64.add v6 v5
-  v8 = cap.call 7 0 (i64) -> (i64) v1 (v7)
+  v8 = call.cap 7 0 (i64) -> (i64) v1 (v7)
   v9 = i64.const 999
   v10 = i64.add v9 v8
   return v10
@@ -8821,8 +8821,8 @@ pub mod live {
 
     /// Decode the module at `[mod_ptr, mod_len)` and run function 0 with a **host-backed** powerbox:
     /// `(console, clock)` capabilities (both iface `HOST_PROC` = 13) bridged to the imports above.
-    /// The guest calls `cap.call 13 1 (i64,i64,i64) -> (i64) v<console>(stream, ptr, len)` to write
-    /// live, and `cap.call 13 0 () -> (i64) v<clock>()` to read the host clock. Returns the guest's
+    /// The guest calls `call.cap 13 1 (i64,i64,i64) -> (i64) v<console>(stream, ptr, len)` to write
+    /// live, and `call.cap 13 0 () -> (i64) v<clock>()` to read the host clock. Returns the guest's
     /// `i64` result; sets [`LAST_STATUS`].
     #[no_mangle]
     pub extern "C" fn temen_run_live(mod_ptr: *const u8, mod_len: usize) -> i64 {
@@ -8874,7 +8874,7 @@ pub mod live {
             slots.push(Value::I32(host.grant_host_proc(clock)));
         }
         // §7 register the live caps under canonical names (F7/F9, PR #118) so the guest can
-        // `cap.self.resolve`/`label` them at runtime, matching the fixed-powerbox path.
+        // `self.resolve`/`label` them at runtime, matching the fixed-powerbox path.
         for (name, slot) in ["console", "clock"].iter().zip(&slots) {
             if let Value::I32(handle) = slot {
                 host.register_cap_name(name, *handle);
@@ -8927,7 +8927,7 @@ static TIERUP_UNIT_SHARED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static TIERUP_UNIT_WIN_LOG2: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 /// #1009 M1: the run's effective B2 dispatch-table log2 ([`tierup_table_log2`] of the guest's
-/// function count) — a unit and the main module must mask `call_indirect` against the **same**
+/// function count) — a unit and the main module must mask `call.dyn` against the **same**
 /// shared table, so the unit emitter uses the guest's size, not its own.
 static TIERUP_UNIT_TABLE_LOG2: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(ONRAMP_JIT_TABLE_LOG2);
@@ -8944,7 +8944,7 @@ static COOP_TIERUP_FLOOR: std::sync::atomic::AtomicUsize =
 
 /// The wasm emitter the tier-up driver installs for a `vm_jit_*`-importing guest (#835/#846):
 /// emit a validated unit whole-module in **Model B2** shape (`compile_module_b2` — its
-/// `call_indirect` dispatches through the driver's shared funcref table, so a **linked** unit's
+/// `call.dyn` dispatches through the driver's shared funcref table, so a **linked** unit's
 /// Slot callbacks reach installed units / eligible program `f{i}`s natively and everything else
 /// through a live-state bounce trampoline), or `None` if any function is outside the integer
 /// subset — then the invoke runs on the interpreter, fail-closed. The unit's mask is bumped to the
@@ -9085,7 +9085,7 @@ pub extern "C" fn temen_coop_open(
         set(STATUS_UNSUPPORTED);
         return -STATUS_UNSUPPORTED;
     }
-    // #889: hoist inline `cap.call`/`call.import`/`cap.self.resolve` sites into appended cross-tier
+    // #889: hoist inline `call.cap`/`call.import`/`self.resolve` sites into appended cross-tier
     // wrapper functions — the host-boundary *op* is fundamental, the compute around it isn't. The
     // containing function becomes in-subset compute + a plain `Call`, so a hot loop with an inline
     // cap write emits and tiers up, its cap sites bouncing to the wrappers instead of pinning the
@@ -9106,7 +9106,7 @@ pub extern "C" fn temen_coop_open(
     }
     // #926 slice 2f — B2 vs non-B2 emit (#880's parity gate for the shared-table world).
     // A guest whose every function has a shimmable signature (scalar operands, arity ≤ the env
-    // scratch's slot count) emits over the **shared reserved table** (Model B2): `call_indirect`-bearing
+    // scratch's slot count) emits over the **shared reserved table** (Model B2): `call.dyn`-bearing
     // functions tier up (the language-runtime dispatch-loop shape), their indirect calls reaching
     // installed §22 units natively (old→new) and interpreter-resident targets through the live bounce.
     // A non-shimmable guest (v128 / over-arity) emits in the old local-table mode, where a null
@@ -9206,7 +9206,7 @@ pub extern "C" fn temen_coop_open(
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
     };
     let (frame, _keys) = grant_onramp_caps(&mut host, &m, None);
-    // #926 slice 2f: a B2 main module masks `call_indirect` against `1 << table_log2` (#1009 M1: the
+    // #926 slice 2f: a B2 main module masks `call.dyn` against `1 << table_log2` (#1009 M1: the
     // guest's effective size), so the engine's dispatch table must be the same size — a natural-size
     // table would number install slots and wrap wild indices differently (#846/#880). `CoopRun` builds
     // the domain with `host.jit_table_log2()`, so force it here (a `vm_jit_*` importer's
@@ -9218,7 +9218,7 @@ pub extern "C" fn temen_coop_open(
     // #926 slice 2e/2f: arm the §22 unit wasm-emitter for a `vm_jit_*` importer so its runtime-compiled
     // units run emitted (the pump then surfaces a `CoopEvent::JitInvoke` when a unit has emitted wasm;
     // an interpreter-only unit falls back to the inline service). Gated on `all_shimmable` like the
-    // shared-table emit — a unit emits B2 (`onramp_tierup_unit_emitter`), so its `call_indirect`
+    // shared-table emit — a unit emits B2 (`onramp_tierup_unit_emitter`), so its `call.dyn`
     // dispatch depends on the driver table covering every interpreter-resident slot with a shim; a
     // non-shimmable guest's units run interpreted instead (fail-closed, matching the single-shot pump).
     // Reuses the single-vCPU emitter and its shared parameters — only one driver runs at a time.
@@ -9589,7 +9589,7 @@ pub extern "C" fn temen_coop_mapped_now() -> i64 {
 // `WebAssembly.Table` from at each event boundary. ----
 
 /// The dispatch-table size (log2) the coop run's shared table is built with — the JS host sizes its
-/// `WebAssembly.Table` to `1 << this` (the emitted `call_indirect` mask). `0` (a 1-slot table) for a
+/// `WebAssembly.Table` to `1 << this` (the emitted `call.dyn` mask). `0` (a 1-slot table) for a
 /// non-shimmable guest, which emits in local-table mode and never dispatches through the shared table.
 #[no_mangle]
 pub extern "C" fn temen_coop_table_log2() -> u32 {
@@ -9643,7 +9643,7 @@ pub extern "C" fn temen_coop_jit_wasm_by_handle_ptr() -> *const u8 {
 /// Generate the **bounce-shim module** for dispatch-table `slot` — a standalone one-function wasm
 /// module (`export "t"`, [`temen_wasm_jit::emit_slot_trampoline`]) with the slot occupant's env-prepended
 /// signature, whose body bounces to [`temen_coop_call_interp`] with `slot` baked in. The JS host
-/// `table.set`s its instance's `"t"` into the slot, so an emitted `call_indirect` to an
+/// `table.set`s its instance's `"t"` into the slot, so an emitted `call.dyn` to an
 /// interpreter-resident target lands on the live-state bounce. Returns the module's byte length
 /// (`0` = no shim: empty slot, or a signature the transport can't carry — the open-time `all_shimmable`
 /// gate makes the latter unreachable for a run whose units emit). Bytes via [`temen_coop_shim_ptr`],

@@ -84,7 +84,7 @@ fn bind_imports(h: &mut Host, m: &temen_ir::Module, handles: &[Value; 7]) {
 /// grants it; this harness does, because the blocking tests exercise the offload pool / §12
 /// parking through it) — granted in a fixed order so the handle values are deterministic (and
 /// identical across two hosts), and **registered under their canonical names** (S15 (c2)): the
-/// paramless `_start` resolves each by name (`cap.self.resolve`), so callers run function 0 with
+/// paramless `_start` resolves each by name (`self.resolve`), so callers run function 0 with
 /// `&[]`, not these as positional args. Every guest gets the same set (one `_start` shape); one that
 /// never touches the ring or the JIT just leaves those handles stashed and unused. `block_for` is the
 /// mock Blocking op's duration — `ZERO` for ordinary programs, non-zero for an async demo that wants
@@ -103,7 +103,7 @@ fn powerbox(h: &mut Host, win: u64, block_for: std::time::Duration) -> [Value; 7
         h.grant_jit(mem_log2),
     ];
     // Register the fixed powerbox under its canonical names (the order matches temen-run's
-    // `POWERBOX_CAP_NAMES` / the `VM_CAP_*` order) so a guest can `cap.self.resolve` them at
+    // `POWERBOX_CAP_NAMES` / the `VM_CAP_*` order) so a guest can `self.resolve` them at
     // runtime. The frontend `_start` is paramless — its manifest imports bind to capability slots
     // at instantiation (IMPORTS.md phase 4), and callers run function 0 with `&[]` — but the
     // returned handles are still handy for tests that name a specific one.
@@ -473,7 +473,7 @@ fn c_guarded_layout_runs_normal_programs() {
 }
 
 /// The guest **grows its own window** through the Memory capability: `__vm_map` (a frontend
-/// builtin → `cap.call` on the granted Memory handle) commits a page at 256 MiB — deep in the
+/// builtin → `call.cap` on the granted Memory handle) commits a page at 256 MiB — deep in the
 /// reserved tail, far above the backed prefix — then a store/load round-trips through it. Proves
 /// the Memory cap is granted to compiled C programs and the builtin lowers correctly, on both
 /// backends (interp page map + JIT real `mprotect`). The §1a sparse-address-space path from C.
@@ -1550,7 +1550,7 @@ fn c_function_pointer_signature_mismatch_traps() {
                int main(){ int (*w)(void) = (int(*)(void))two; return w(); }";
     let ir = c_to_ir(src);
     assert!(
-        ir.contains("call_indirect"),
+        ir.contains("call.dyn"),
         "expected an indirect call:\n{ir}"
     );
     let m = parse_module(&ir).expect("parse");
@@ -2292,9 +2292,9 @@ fn c_threads_atomic_counter_jit() {
     }
 }
 
-/// A spawned thread does **I/O** (`write` → a stream `cap.call`). This exercises the per-thread
+/// A spawned thread does **I/O** (`write` → a stream `call.cap`). This exercises the per-thread
 /// powerbox: the worker shares the domain's capabilities, so its `write` reaches the same stdout.
-/// Before that fix the interpreter gave each vCPU an *empty* powerbox, so the worker's `cap.call`
+/// Before that fix the interpreter gave each vCPU an *empty* powerbox, so the worker's `call.cap`
 /// CapFaulted while the JIT (shared ctx) succeeded — a latent divergence `run_c_full` now pins
 /// (interp == JIT, both print the line). Deterministic: `main` joins the worker before doing anything,
 /// so only the worker writes.
@@ -2315,7 +2315,7 @@ fn c_thread_shares_powerbox_for_io() {
 #[test]
 fn c_threads_deterministic_sweep() {
     // Same compiled C run through the seeded explorer (§18): every interleaving yields 2000, and each
-    // is reproducible from its seed. The program makes no powerbox cap.calls (the paramless `_start`'s
+    // is reproducible from its seed. The program makes no powerbox call.cap calls (the paramless `_start`'s
     // by-name resolves just stash `-errno` against the explorer's empty host and are never loaded), so
     // no entry args and no granted powerbox are needed.
     let ir = c_to_ir(C_ATOMIC_COUNTER);
@@ -2566,7 +2566,7 @@ fn c_ring_buffer_via_minted_region() {
 
 // The `__vm_region_unmap` builtin (`<temen.h>`, op 1) — the one region builtin the ring-buffer test
 // doesn't exercise. Mint a region, map it, write through it, then unmap that window range: the
-// builtin must lower (`cap.call 4 1`) and the unmap succeed (return 0), identically on both backends.
+// builtin must lower (`call.cap 4 1`) and the unmap succeed (return 0), identically on both backends.
 const C_REGION_UNMAP: &str = "\
 #include <temen.h>\n\
 static char pad[200 * 1024];\n\
@@ -2590,7 +2590,7 @@ fn c_region_unmap_builtin() {
 /// §7/§4 — a cap-buffer borrow of a **guest-grown** heap page. The program `malloc`s 128 KiB (past
 /// the 64 KiB initial window, so `malloc` grows the heap into the reserved tail via the Memory cap),
 /// fills it, and `write()`s **that grown buffer** across the §7 trampoline. The interpreter's `Mem`
-/// persists its page map across cap.calls, so it borrows the grown pages fine; the JIT's `cap_thunk`
+/// persists its page map across call.cap calls, so it borrows the grown pages fine; the JIT's `cap_thunk`
 /// must persist its page map too (else the borrow fail-closes and the write drops). `run_c_full`
 /// enforces interp == JIT, so this fails if the JIT can't see the growth — the regression guard for
 /// the cap-path page-map persistence.
@@ -2648,10 +2648,10 @@ fn c_guest_jit_demo() {
     let out = String::from_utf8_lossy(&run.stdout);
     assert!(
         out.ends_with(
-            "98 inputs agree (invoke + installed call_indirect): \
+            "98 inputs agree (invoke + installed call.dyn): \
              guest-emitted, host-verified, Cranelift-compiled\n"
         ),
-        "the guest's interpreter, its invoked JIT code, and its installed call_indirect slot \
+        "the guest's interpreter, its invoked JIT code, and its installed call.dyn slot \
          must all agree on both backends:\n{out}"
     );
 }
@@ -2909,8 +2909,8 @@ fn generic_extern_capability_import_equals_builtin() {
 }
 
 /// §7 reflection from C: a guest enumerates the capabilities its host granted and introspects each
-/// one's interface type_id — `__vm_cap_count` / `__vm_cap_at` (`cap.self.count`/`cap.self.get`).
-/// Interp-only (the JIT bails `Unsupported` on `cap.self.*`, like fibers). The c_frontend powerbox
+/// one's interface type_id — `__vm_cap_count` / `__vm_cap_at` (`self.count`/`self.get`).
+/// Interp-only (the JIT bails `Unsupported` on `self.*`, like fibers). The c_frontend powerbox
 /// grants 7 capabilities with exactly one Exit (type_id 1), so `n*100 + exits == 701`.
 #[test]
 fn reflection_enumerates_granted_capabilities() {

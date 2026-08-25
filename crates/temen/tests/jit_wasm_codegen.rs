@@ -4,7 +4,7 @@
 //! Today the browser only runs a *fixed* §22 unit host-compiled at setup on emitted wasm. The dynamic
 //! loop is: a guest builds an IR blob **at runtime**, `Jit.compile`s it, and a later `Jit.invoke` runs
 //! that guest's own unit on emitted wasm. This test proves that loop end-to-end **without a browser**:
-//! a resumable [`Vcpu`] guest issues `cap.call 11 0` (compile) then `cap.call 11 1` (invoke); compile
+//! a resumable [`Vcpu`] guest issues `call.cap 11 0` (compile) then `call.cap 11 1` (invoke); compile
 //! runs the real [`Host::jit_compile`] gate (decode → verify → memory-match precondition) and the
 //! host-injected wasm emitter ([`Host::set_jit_wasm_emitter`]) stashes the unit's wasm; the invoke is
 //! serviced by running that emitted `f0(win, env, args…)` under `wasmi` and delivering the result
@@ -91,7 +91,7 @@ block 0 (vx: i64) {
 "#;
 
 /// A guest that `compile`s the blob staged at `(off, len)` then `invoke`s the resulting unit. `RET` is
-/// the unit's result type spelling (`i64`/`i32`); `sig` the invoke cap.call signature after the leading
+/// the unit's result type spelling (`i64`/`i32`); `sig` the invoke call.cap signature after the leading
 /// code handle; `args` the invoke argument instructions + operand names.
 fn guest_src(ret: &str, sig: &str, arg_setup: &str, arg_ops: &str, off: u64, len: u64) -> String {
     format!(
@@ -100,9 +100,9 @@ func (i32) -> ({ret}) {{
 block 0 (vjit: i32) {{
   vptr = i64.const {off}
   vlen = i64.const {len}
-  vcode = cap.call 11 0 (i64, i64) -> (i64) vjit (vptr, vlen)
+  vcode = call.cap 11 0 (i64, i64) -> (i64) vjit (vptr, vlen)
 {arg_setup}
-  vr = cap.call 11 1 ({sig}) -> ({ret}) vjit (vcode, {arg_ops})
+  vr = call.cap 11 1 ({sig}) -> ({ret}) vjit (vcode, {arg_ops})
   return vr
   }}
 }}
@@ -337,7 +337,7 @@ fn tyname(t: ValType) -> &'static str {
 }
 
 /// Build the invoke-site pieces for a unit whose entry takes `params`: the const instructions that
-/// materialize the arguments (`va = 4`, `vb = 5`, …), the operand list, and the cap.call signature
+/// materialize the arguments (`va = 4`, `vb = 5`, …), the operand list, and the call.cap signature
 /// (a leading `i64` code handle, then the unit's params). Fixed sample arguments 4, 5, 6, … per param.
 fn invoke_shape(params: &[ValType]) -> (String, String, String) {
     let mut setup = String::new();
@@ -456,7 +456,7 @@ fn runtime_compile_invoke_trap_parity() {
 
 // ---- the shared-`Mutex<Host>` runtime-compile flow (the browser's `ParJitCfg` path) --------------
 // The browser's runtime-`Jit.compile` powerbox grants `Jit` (+ validator + emitter) on a shared
-// `Mutex<Host>` that the root vCPU dispatches its `cap.call`s through (`with_shared_host`) — so the
+// `Mutex<Host>` that the root vCPU dispatches its `call.cap`s through (`with_shared_host`) — so the
 // guest's runtime `compile` mints + emits into that shared host and a later `invoke` resolves the same
 // host. `run_guest` above uses the vCPU's *own* host; this exercises the shared-host dispatch the
 // browser actually uses (also the seam threaded compile will serialize on, DESIGN.md §22).
@@ -496,7 +496,7 @@ fn run_guest_shared(unit_src: &str, mode: Mode) -> Result<Vec<Value>, Trap> {
 
     let prog = bytecode::VcpuProgram::compile_with_jit_table(&guest_m, 4).unwrap();
     let back = window();
-    // `new_root` builds an empty *own* host; the shared host services generic `cap.call`s — including
+    // `new_root` builds an empty *own* host; the shared host services generic `call.cap`s — including
     // the guest's runtime `compile` (op 0), which mints + emits into it.
     let mut vcpu = bytecode::Vcpu::new_root(&prog, 0, &[Value::I32(jit)], back, &init_mem)
         .expect("root")

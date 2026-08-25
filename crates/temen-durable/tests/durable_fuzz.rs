@@ -18,7 +18,7 @@ fn freeze_thaw_equivalence_over_generated_modules() {
 
 #[test]
 fn loop_freeze_thaw_equivalence_over_generated_modules() {
-    // Phase-4 Slice A: poll-free-loop modules (a back-edge-target loop header ahead of the cap.call)
+    // Phase-4 Slice A: poll-free-loop modules (a back-edge-target loop header ahead of the call.cap)
     // exercise the loop-header back-edge poll across random trip counts, seeds, binops, and a
     // mixed-type (i32 handle + i64 acc/counter) loop-carried spill. Freeze-from-start lands on the
     // header poll; thaw re-enters the loop body and runs to the uninterrupted result.

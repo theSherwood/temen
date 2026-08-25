@@ -17,16 +17,16 @@
 //!
 //! **Install-durability** (`durable_jit_install_slot_survives_freeze_thaw`(`_native`)): a unit's B2
 //! `install` occupancy rides the artifact (Section 5 / v17) and is re-applied on thaw, so a
-//! `call_indirect` through an installed slot resolves after a freeze/thaw on both backends.
+//! `call.dyn` through an installed slot resolves after a freeze/thaw on both backends.
 //!
 //! **In-flight continuation** (`durable_jit_install_call_indirect_freezes_in_flight_continuation`):
 //! `invoke` is a seam-free atomic leaf (never interrupted mid-flight), so the freezable path for
-//! suspendable unit code is `install` + `call_indirect` — the unit runs in the caller's durable
+//! suspendable unit code is `install` + `call.dyn` — the unit runs in the caller's durable
 //! frames, so a continuation suspended inside it freezes/thaws with the caller's shadow stack.
 //!
 //! **Install fence** (`durable_jit_compile_fences_suspending_untainted_unit`): the by-signature-taint
 //! gap (R8) — a durable domain rejects a *suspendable* unit whose entry signature the program does not
-//! taint at `compile`, so it can never be installed and reached by an un-instrumented `call_indirect`.
+//! taint at `compile`, so it can never be installed and reached by an un-instrumented `call.dyn`.
 
 use temen_durable::{
     begin_thaw, init_durable_window, transform_module, write_state, STATE_NORMAL, STATE_UNWINDING,
@@ -99,7 +99,7 @@ fn durable_grant_admits_submitted_unit() {
 }
 
 /// A unit outside the **strict** transform's scope fails closed on a durable grant, exactly like any
-/// other rejected blob. Here a **may-suspend** function (it does a `cap.call`) that also touches guest
+/// other rejected blob. Here a **may-suspend** function (it does a `call.cap`) that also touches guest
 /// memory hits `GuestUsesMemory` — the strict path won't instrument a memory-using suspend point (it
 /// could alias the reserved durable slice). (Admitting confined memory use via
 /// `transform_module_assume_confined` is a later refinement.)
@@ -108,7 +108,7 @@ fn durable_grant_rejects_memory_touching_unit() {
     let unit = blob(
         "memory 17\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  \
          vaddr = i64.const 65536\n  v1 = i64.load vaddr\n  \
-         v2 = cap.call 2 0 () -> (i64) v0 ()\n  v3 = i64.add v1 v2\n  return v3\n  }\n}\n",
+         v2 = call.cap 2 0 () -> (i64) v0 ()\n  v3 = i64.add v1 v2\n  return v3\n  }\n}\n",
     );
     let guest = dummy_guest();
     let mut h = Host::new();
@@ -122,7 +122,7 @@ fn durable_grant_rejects_memory_touching_unit() {
 
 /// **End-to-end, NORMAL state.** A durable guest `compile`s + `invoke`s a unit; the instrumented unit
 /// runs over the durable window (state NORMAL) and returns 42 — the same value a non-durable run of the
-/// same guest yields. The guest is itself durable-instrumented (a single block with two `cap.call`s,
+/// same guest yields. The guest is itself durable-instrumented (a single block with two `call.cap`s,
 /// the shape the durable tests use); the submitted unit is instrumented by the durable validator.
 #[test]
 fn durable_run_compiles_and_invokes_agrees() {
@@ -132,12 +132,12 @@ fn durable_run_compiles_and_invokes_agrees() {
     );
 
     // Guest `(jit) -> i64`: compile the unit staged at BLOB_OFF, then invoke it. Single block, two
-    // cap.calls, return — in the durable transform's shape. The blob ptr is above DURABLE_RESERVE.
+    // call.cap calls, return — in the durable transform's shape. The blob ptr is above DURABLE_RESERVE.
     let guest_src = format!(
         "memory 17\nfunc (i32) -> (i64) {{\nblock 0 (v0: i32) {{\n  \
          v1 = i64.const {off}\n  v2 = i64.const {len}\n  \
-         v3 = cap.call 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  \
-         v4 = cap.call 11 1 (i64) -> (i64) v0 (v3)\n  return v4\n  }}\n}}\n",
+         v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  \
+         v4 = call.cap 11 1 (i64) -> (i64) v0 (v3)\n  return v4\n  }}\n}}\n",
         off = BLOB_OFF,
         len = unit.len(),
     );
@@ -207,9 +207,9 @@ fn durable_jit_domain_survives_freeze_and_invokes() {
 
     // The gate module holding the `Jit` cap — an **invoker** `(jit_domain, code_handle) -> i64` that
     // calls `Jit.invoke` (iface 11 op 1) on the domain handle, passing the compiled-code handle. Its
-    // single-block/one-cap.call shape is in the durable transform scope.
+    // single-block/one-call.cap shape is in the durable transform scope.
     let invoker_src = "memory 17\nfunc (i32, i64) -> (i64) {\nblock 0 (v0: i32, v1: i64) {\n  \
-         v2 = cap.call 11 1 (i64) -> (i64) v0 (v1)\n  return v2\n  }\n}\n";
+         v2 = call.cap 11 1 (i64) -> (i64) v0 (v1)\n  return v2\n  }\n}\n";
     let invoker = parse_module(invoker_src).expect("parse invoker");
     verify_module(&invoker).expect("verify invoker");
     let inst = transform_module(&invoker).expect("invoker in transform scope");
@@ -269,7 +269,7 @@ fn durable_jit_domain_reconstructs_and_invokes_native() {
         "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 42\n  return v0\n  }\n}\n",
     );
     let invoker_src = "memory 17\nfunc (i32, i64) -> (i64) {\nblock 0 (v0: i32, v1: i64) {\n  \
-         v2 = cap.call 11 1 (i64) -> (i64) v0 (v1)\n  return v2\n  }\n}\n";
+         v2 = call.cap 11 1 (i64) -> (i64) v0 (v1)\n  return v2\n  }\n}\n";
     let invoker = parse_module(invoker_src).expect("parse invoker");
     verify_module(&invoker).expect("verify invoker");
 
@@ -316,25 +316,25 @@ fn durable_jit_domain_reconstructs_and_invokes_native() {
 }
 
 /// A durable program with two entries: **func 0** compiles + B2-`install`s a unit and returns its
-/// table slot; **func 1** `call_indirect`s that slot. Shared by the interp + native install-slot
+/// table slot; **func 1** `call.dyn`s that slot. Shared by the interp + native install-slot
 /// durability tests. The unit is `() -> i64` returning 42; the module declares memory 17 to match.
 const INSTALLER_CALLER: &str = "memory 17\n\
     func (i32, i64, i64) -> (i64) {\nblock 0 (v0: i32, v1: i64, v2: i64) {\n  \
-      v3 = cap.call 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  \
-      v4 = cap.call 11 3 (i64) -> (i64) v0 (v3)\n  return v4\n  }\n}\n\
+      v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  \
+      v4 = call.cap 11 3 (i64) -> (i64) v0 (v3)\n  return v4\n  }\n}\n\
     func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  \
-      v1 = call_indirect () -> (i64) v0 ()\n  return v1\n  }\n}\n";
+      v1 = call.dyn () -> (i64) v0 ()\n  return v1\n  }\n}\n";
 
 /// The unit blob the installer compiles + installs.
 fn install_unit() -> Vec<u8> {
     blob("memory 17\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 42\n  return v0\n  }\n}\n")
 }
 
-/// A `call_indirect` table reservation with room for the installer's padding slots.
+/// A `call.dyn` table reservation with room for the installer's padding slots.
 const TABLE_LOG2: u8 = 4;
 
-/// **Install-durability, interpreter.** A guest compiles + `install`s a unit into a `call_indirect`
-/// slot, the domain is frozen + restored, and a second entry `call_indirect`s that slot → 42. The
+/// **Install-durability, interpreter.** A guest compiles + `install`s a unit into a `call.dyn`
+/// slot, the domain is frozen + restored, and a second entry `call.dyn`s that slot → 42. The
 /// dispatch table is a per-run transient (§12.4), so the occupancy is recorded on the domain, rides
 /// the artifact (Section 5, v17), and is **re-applied** when the thaw run builds its table.
 #[test]
@@ -383,7 +383,7 @@ fn durable_jit_install_slot_survives_freeze_thaw() {
         "re-serialize of a restored install-bearing domain is byte-identical"
     );
 
-    // Entry 1 over the thawed host: call_indirect through the restored slot resolves to the unit.
+    // Entry 1 over the thawed host: call.dyn through the restored slot resolves to the unit.
     let mut fuel2 = 5_000_000u64;
     let (r_call, _) = run_capture_reserved_with_host(
         &m,
@@ -397,13 +397,13 @@ fn durable_jit_install_slot_survives_freeze_thaw() {
     assert_eq!(
         r_call.expect("call ok"),
         vec![Value::I64(42)],
-        "call_indirect through the restored install slot → 42"
+        "call.dyn through the restored install slot → 42"
     );
 }
 
 /// **Install-durability, native.** The same install → freeze → restore, but both entries run on the
-/// Cranelift backend: `jit_cap_run` reconstructs the unit and reproduces its `call_indirect` table
-/// slot (`reconstruct_jit_units` → `CompiledModule::install_at`), so the thawed `call_indirect`
+/// Cranelift backend: `jit_cap_run` reconstructs the unit and reproduces its `call.dyn` table
+/// slot (`reconstruct_jit_units` → `CompiledModule::install_at`), so the thawed `call.dyn`
 /// dispatches to the unit's own native code → 42.
 #[test]
 fn durable_jit_install_slot_survives_freeze_thaw_native() {
@@ -442,7 +442,7 @@ fn durable_jit_install_slot_survives_freeze_thaw_native() {
         "install round-trips"
     );
 
-    // Entry 1 (native) over the thawed host: reconstruct reproduces the slot; call_indirect → 42.
+    // Entry 1 (native) over the thawed host: reconstruct reproduces the slot; call.dyn → 42.
     let (out2, _) = jit_cap_run(
         &m,
         1,
@@ -457,7 +457,7 @@ fn durable_jit_install_slot_survives_freeze_thaw_native() {
         JitOutcome::Returned(slots) => assert_eq!(
             slots,
             vec![42],
-            "native call_indirect through the reproduced install slot → 42"
+            "native call.dyn through the reproduced install slot → 42"
         ),
         other => panic!("expected Returned(42), got {other:?}"),
     }
@@ -467,35 +467,35 @@ fn durable_jit_install_slot_survives_freeze_thaw_native() {
 /// *seam-free atomic leaf* by design (DESIGN.md §22 / CONSOLIDATION.md §11 — anything but a plain
 /// return is a CapFault, the fuzzed hinge), so it is never interrupted mid-flight: a freeze lands at
 /// the parent's poll *after* the invoke returns. The **freezable** way to run suspendable guest-JIT
-/// code is `install` + `call_indirect`, which executes the installed unit in the **caller's own
+/// code is `install` + `call.dyn`, which executes the installed unit in the **caller's own
 /// durable frames** — so an in-flight continuation *inside* an installed unit rides the caller's
 /// shadow stack like any other frame and freezes/thaws with it.
 ///
 /// This pins that end-to-end: an instrumented program installs an instrumented unit whose entry
-/// suspends on a `cap.call` (Clock), then a run that `call_indirect`s the unit **under UNWINDING**
+/// suspends on a `call.cap` (Clock), then a run that `call.dyn`s the unit **under UNWINDING**
 /// freezes the continuation *inside* the unit. After restore + REWINDING the caller re-issues the
-/// `call_indirect` (the install slot survived — install-durability) and the unit rewinds, **reloading
+/// `call.dyn` (the install slot survived — install-durability) and the unit rewinds, **reloading
 /// the saved clock (42) rather than re-issuing it (0)** → 142, matching an uninterrupted run.
 #[test]
 fn durable_jit_install_call_indirect_freezes_in_flight_continuation() {
-    // The submitted unit: `(clk) -> i64` = Clock.now + 100 — a `cap.call` suspend point.
+    // The submitted unit: `(clk) -> i64` = Clock.now + 100 — a `call.cap` suspend point.
     let unit = blob(
         "memory 17\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  \
-         v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  \
+         v1 = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  \
          v3 = i64.const 100\n  v4 = i64.add v2 v3\n  return v4\n  }\n}\n",
     );
-    // The program: func 0 = installer (compile+install → slot); func 1 = caller (call_indirect the
+    // The program: func 0 = installer (compile+install → slot); func 1 = caller (call.dyn the
     // slot, passing the Clock handle); func 2 = a `(i32)->(i64)` may-suspend function so the taint
-    // analysis marks the caller's `call_indirect` of that signature may-suspend (PropagatedIndirect),
+    // analysis marks the caller's `call.dyn` of that signature may-suspend (PropagatedIndirect),
     // the fork-critical case — else the site would be under-instrumented and the freeze miss it.
     let m_src = "memory 17\n\
         func (i32, i64, i64) -> (i64) {\nblock 0 (v0: i32, v1: i64, v2: i64) {\n  \
-          v3 = cap.call 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  \
-          v4 = cap.call 11 3 (i64) -> (i64) v0 (v3)\n  return v4\n  }\n}\n\
+          v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  \
+          v4 = call.cap 11 3 (i64) -> (i64) v0 (v3)\n  return v4\n  }\n}\n\
         func (i32, i32) -> (i64) {\nblock 0 (v0: i32, v1: i32) {\n  \
-          v2 = call_indirect (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n\
+          v2 = call.dyn (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n\
         func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  \
-          v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n";
+          v1 = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n";
     let m = parse_module(m_src).expect("parse program");
     verify_module(&m).expect("verify program");
     let inst = transform_module(&m).expect("program in transform scope");
@@ -527,7 +527,7 @@ fn durable_jit_install_call_indirect_freezes_in_flight_continuation() {
         }
     };
 
-    // --- Baseline: install, then a NORMAL call_indirect into the unit → Clock(42) + 100 = 142.
+    // --- Baseline: install, then a NORMAL call.dyn into the unit → Clock(42) + 100 = 142.
     let mut hb = Host::new();
     hb.clock_ns = 42;
     let clk_b = hb.grant_clock();
@@ -551,7 +551,7 @@ fn durable_jit_install_call_indirect_freezes_in_flight_continuation() {
         "uninterrupted: Clock(42) + 100"
     );
 
-    // --- Freeze run: install, then call_indirect the unit UNDER UNWINDING. The unit's `cap.call`
+    // --- Freeze run: install, then call.dyn the unit UNDER UNWINDING. The unit's `call.cap`
     // unwinds the continuation into the shadow stack (inside the installed unit's frame).
     let mut hf = Host::new();
     hf.clock_ns = 42;
@@ -579,7 +579,7 @@ fn durable_jit_install_call_indirect_freezes_in_flight_continuation() {
     th.clock_ns = 0;
     let mut window = restore(&artifact, &inst, &mut th).expect("restore");
 
-    // Thaw: REWINDING → the caller re-issues the call_indirect (install slot survived), the unit
+    // Thaw: REWINDING → the caller re-issues the call.dyn (install slot survived), the unit
     // rewinds and reloads the saved clock (42), not the fresh 0.
     begin_thaw(&mut window, 0);
     let mut fuel = 5_000_000u64;
@@ -600,7 +600,7 @@ fn durable_jit_install_call_indirect_freezes_in_flight_continuation() {
 }
 
 /// **Durable install fence (DURABILITY.md §12.5, R8 fork-critical case).** A durable domain must not
-/// admit a *suspendable* unit whose entry signature the program does not taint: a `call_indirect`
+/// admit a *suspendable* unit whose entry signature the program does not taint: a `call.dyn`
 /// reaching such an installed unit would be at an un-instrumented site, silently losing the unit's
 /// continuation on thaw (confirmed corruption). The gate fails it closed at `compile`. Three branches:
 /// suspendable + untainted → **rejected**; suspendable + tainted → admitted; non-suspendable → admitted
@@ -608,10 +608,10 @@ fn durable_jit_install_call_indirect_freezes_in_flight_continuation() {
 #[test]
 fn durable_jit_compile_fences_suspending_untainted_unit() {
     // Program taints only `(i32)->(i64)` — a may-suspend function of that signature (never called;
-    // it establishes the `call_indirect` seam the taint analysis keys on).
+    // it establishes the `call.dyn` seam the taint analysis keys on).
     let prog = parse_module(
         "memory 17\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  \
-         v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n",
+         v1 = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n",
     )
     .expect("parse program");
     verify_module(&prog).expect("verify program");
@@ -623,18 +623,18 @@ fn durable_jit_compile_fences_suspending_untainted_unit() {
     // (A) suspendable, signature `(i32)->(i64)` — TAINTED by the program → admitted.
     let unit_a = blob(
         "memory 17\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  \
-         v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  \
+         v1 = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  \
          v3 = i64.const 100\n  v4 = i64.add v2 v3\n  return v4\n  }\n}\n",
     );
     assert!(
         matches!(h.jit_compile(jit, &unit_a), Ok(Ok(_))),
-        "suspendable unit of a TAINTED signature is admitted (the call_indirect seam exists)"
+        "suspendable unit of a TAINTED signature is admitted (the call.dyn seam exists)"
     );
 
     // (B) suspendable, signature `(i64)->(i64)` — NOT tainted → fenced closed.
     let unit_b = blob(
         "memory 17\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  \
-         vh = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) vh (vh)\n  return v2\n  }\n}\n",
+         vh = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) vh (vh)\n  return v2\n  }\n}\n",
     );
     assert!(
         matches!(h.jit_compile(jit, &unit_b), Ok(Err(-22))),

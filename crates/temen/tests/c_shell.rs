@@ -118,7 +118,7 @@ fn c_to_ir_child_with(src: &str, extra: &[&str]) -> String {
 /// Link the shim's import names to their interfaces — link-time symbol resolution (the phase-4
 /// linker-only `resolve_imports_with`; IMPORTS.md §2.5): `__px_*` names strip the prefix and map
 /// through [`temen_posix::resolve`] to `(HOST_PROC, op)`; `__spawn`/`__join` are the shell's own
-/// `Instantiator` ops (13 / 1, STAGE1.md §5). No handle is baked at link: each lowered `cap.call`
+/// `Instantiator` ops (13 / 1, STAGE1.md §5). No handle is baked at link: each lowered `call.cap`
 /// dispatches on the guest's own handle operand, discovered at run time via
 /// `__vm_cap_count`/`__vm_cap_at` reflection (§3c protection at the boundary, IMPORTS.md §2.3
 /// dynamic mode).
@@ -207,7 +207,7 @@ fn run_shell_ex(
         .map(|&(name, csrc)| {
             // Phase 3: keep the manifest — the op-13 spawn binds the child's slots. (The `__stage`
             // ring runner needs no special linking: its region ops are chibicc `__vm_region_*`
-            // builtins, inline `cap.call`s dispatched on the runtime-minted region handles.)
+            // builtins, inline `call.cap`s dispatched on the runtime-minted region handles.)
             let m = parse_module_raw(&c_to_ir_child(csrc)).expect("parse cmd");
             verify_module(&m).expect("verify cmd");
             // The shell spawns `__stage` children with `size_log2 = 18` (a carve must equal the
@@ -1159,7 +1159,7 @@ fn stage0_shell_hash_comments() {
 #[ignore = "writes browser/tests/fixtures/{shell,stage_runner}.temen; run explicitly to regenerate"]
 fn gen_browser_shell_fixture() {
     // The **full** shell — external-command spawn (op 13) and concurrent ring pipelines (op 11 +
-    // `SharedRegion` + futex), `RING` included. These `Instantiator`/`SharedRegion` cap.calls now
+    // `SharedRegion` + futex), `RING` included. These `Instantiator`/`SharedRegion` call.cap calls now
     // compile on the browser's bytecode cooperative engine (the slices that lowered ops 13/11 + region
     // + futex, plus op-13 child-manifest binding); the differential above proves the module runs there
     // byte-identically to the tree-walk/JIT oracle. `posix_shell_exec` grants the `__stage` runner

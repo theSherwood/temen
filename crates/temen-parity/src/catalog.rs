@@ -978,7 +978,7 @@ fn control_and_calls(ops: &mut Vec<Op>) {
         entry: 0,
         conf_skip: None,
     });
-    // call_indirect through the function table (idx is an i32; targets funcs[idx]).
+    // call.dyn through the function table (idx is an i32; targets funcs[idx]).
     let ci = Inst::CallIndirect {
         ty: 0, /* #922: interned type index */
         idx: 0,
@@ -991,12 +991,12 @@ fn control_and_calls(ops: &mut Vec<Op>) {
         Terminator::Return(vec![]),
     );
     ops.push(Op {
-        mnemonic: "call_indirect".into(),
+        mnemonic: "call.dyn".into(),
         family: FAM,
         focus: Focus::Inst(ci),
         module: Module {
             funcs: vec![ci_caller, nop],
-            // #922: the interned type section — `call_indirect`'s `ty: 0` resolves here.
+            // #922: the interned type section — `call.dyn`'s `ty: 0` resolves here.
             types: vec![TypeEntry::Func(FuncType::default())],
             ..Module::default()
         },
@@ -1018,7 +1018,7 @@ fn caps_and_reflection(ops: &mut Vec<Op>) {
     };
     push_skip(
         ops,
-        "cap.call".into(),
+        "call.cap".into(),
         FAM,
         cc.clone(),
         {
@@ -1031,14 +1031,14 @@ fn caps_and_reflection(ops: &mut Vec<Op>) {
                 ),
                 false,
             );
-            // #922: the interned type section — `cap.call`'s `sig: 0` resolves here.
+            // #922: the interned type section — `call.cap`'s `sig: 0` resolves here.
             m.types = vec![TypeEntry::Func(FuncType::default())];
             m
         },
         skip,
     );
-    // Reflection intrinsics. `cap.self.count`/`get`/`resolve`/`label`/`attest` are no longer distinct
-    // ops — they are `cap.call CAP_SELF op N`, covered by the generic `cap.call` parity row.
+    // Reflection intrinsics. `self.count`/`get`/`resolve`/`label`/`attest` are no longer distinct
+    // ops — they are `call.cap CAP_SELF op N`, covered by the generic `call.cap` parity row.
     let tls_get = Inst::VcpuTlsGet;
     push(
         ops,
@@ -1064,8 +1064,8 @@ fn caps_and_reflection(ops: &mut Vec<Op>) {
                 handle: 0,
             },
         ),
-        ("cap.self.type_id", Inst::CapSelfTypeId { ty: 0 }),
-        ("cap.self.covers", Inst::CapSelfCovers { handle: 0, ty: 0 }),
+        ("self.type_id", Inst::CapSelfTypeId { ty: 0 }),
+        ("self.covers", Inst::CapSelfCovers { handle: 0, ty: 0 }),
         (
             "call.import",
             Inst::CallImport {
@@ -1103,11 +1103,11 @@ fn caps_and_reflection(ops: &mut Vec<Op>) {
 
 fn process(ops: &mut Vec<Op>) {
     const FAM: &str = "process, serve & fork";
-    // Every op here is a `cap.call` sub-op that needs scheduler + host wiring (a live child, a serve
-    // point, a parked caller) to run — so the end-to-end pin is skipped, exactly like the `cap.call`
+    // Every op here is a `call.cap` sub-op that needs scheduler + host wiring (a live child, a serve
+    // point, a parked caller) to run — so the end-to-end pin is skipped, exactly like the `call.cap`
     // and import/export rows. Their support is instead exercised by the fork/serve differential
     // harnesses (`clone_caller.rs`, `svc_serve_loop.rs`, `c_fork.rs`, `fork_manager.rs`); this
-    // section makes their **classification** visible in the matrix, where a single `cap.call` row
+    // section makes their **classification** visible in the matrix, where a single `call.cap` row
     // used to hide the fork gap. `parity()` classifies each by `(type_id, op)`.
     let skip = "process/serve substrate — scheduler + host wiring; exercised by the fork/serve \
                 differential harnesses, not auto-synth";
@@ -1363,7 +1363,7 @@ fn terminators(ops: &mut Vec<Op>) {
         entry: 0,
         conf_skip: None,
     });
-    // return_call_indirect
+    // return_call.dyn
     let rci_caller = Func {
         params: vec![],
         results: vec![],
@@ -1378,7 +1378,7 @@ fn terminators(ops: &mut Vec<Op>) {
         }],
     };
     ops.push(Op {
-        mnemonic: "return_call_indirect".into(),
+        mnemonic: "return_call.dyn".into(),
         family: FAM,
         focus: Focus::Term(Terminator::ReturnCallIndirect {
             ty: 0, /* #922: interned type index */
@@ -1387,7 +1387,7 @@ fn terminators(ops: &mut Vec<Op>) {
         }),
         module: Module {
             funcs: vec![rci_caller, rc_target],
-            // #922: the interned type section — `return_call_indirect`'s `ty: 0` resolves here.
+            // #922: the interned type section — `return_call.dyn`'s `ty: 0` resolves here.
             types: vec![TypeEntry::Func(FuncType::default())],
             ..Module::default()
         },

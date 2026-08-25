@@ -65,9 +65,9 @@ block 0 (v0: i32, vlibc: i32) {
   i64.store q0a5 q0v4
   q0a6 = i64.const 1200
   i64.store q0a6 q0v4
-  vs = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
+  vs = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   vz0 = i64.const 0
-  vforkoff = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  vforkoff = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
   va0 = i64.const 256
   vnp0 = i32.const 300
   i32.store va0 vnp0
@@ -105,8 +105,8 @@ block 0 (v0: i32, vlibc: i32) {
   i64.store q1a5 q1v5
   q1a6 = i64.const 1264
   i64.store q1a6 q1v6
-  vg = cap.call 6 17 (i64) -> (i32) v0 (q1a0)
-  vjg = cap.call 6 1 (i32) -> (i64) v0 (vg)
+  vg = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
+  vjg = call.cap 6 1 (i32) -> (i64) v0 (vg)
   return vjg
   }
 }
@@ -116,7 +116,7 @@ block 0 (v0: i64) {
   }
 block 1 () {
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   br 1()
   }
 }
@@ -124,7 +124,7 @@ func (i64) -> (i64) {
 block 0 (vx: i64) {
   vz = i32.const 0
   vzero = i64.const 0
-  vt = cap.call 4294967295 11 (i64) -> (i64) vz (vzero)
+  vt = call.cap 4294967295 11 (i64) -> (i64) vz (vzero)
   return vt
   }
 }
@@ -135,17 +135,17 @@ block 0 (v0: i64) {
   i64.store vz0 vln
   vp0 = i64.const 0
   vl4 = i64.const 4
-  vlibc = cap.self.resolve vp0 vl4
+  vlibc = self.resolve vp0 vl4
   vfn = i64.const 1802661734
   vz8 = i64.const 8
   i64.store vz8 vfn
   vp8 = i64.const 8
-  vfork = cap.self.resolve vp8 vl4
+  vfork = self.resolve vp8 vl4
   br 1(vlibc, vfork)
 }
 block 1 (vlibc: i32, vfork: i32) {
   varg = i64.const 0
-  vr = cap.call 268435456 0 (i64) -> (i64) vfork (varg)
+  vr = call.cap 268435456 0 (i64) -> (i64) vfork (varg)
   vzero = i64.const 0
   vforkfail = i64.lt_s vr vzero
   br_if vforkfail 1(vlibc, vfork) 2(vlibc, vr)
@@ -155,7 +155,7 @@ block 2 (vlibc: i32, vr: i64) {
   i64.store vp16 vr
   vfd1 = i64.const 1
   veight = i64.const 8
-  vw = cap.call 13 0 (i64, i64, i64) -> (i64) vlibc (vfd1, vp16, veight)
+  vw = call.cap 13 0 (i64, i64, i64) -> (i64) vlibc (vfd1, vp16, veight)
   return vr
   }
 }

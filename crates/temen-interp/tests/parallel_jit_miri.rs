@@ -2,7 +2,7 @@
 //! differential test in `temen/tests/bytecode_parallel_jit.rs` proves the parallel JIT path agrees with
 //! the cooperative oracle; this proves the genuinely-new shared-`Domain` machinery — the
 //! `Mutex<Vec<Arc<Compiled>>>` module source (concurrent `install`/`push`) and the `Box<[AtomicU64]>`
-//! dispatch table (Release store on install, Acquire load on `call_indirect`) — is **free of data
+//! dispatch table (Release store on install, Acquire load on `call.dyn`) — is **free of data
 //! races / UB / provenance errors** when real vCPU threads install + dispatch over one shared backing.
 //! Miri's checker, not the iteration count, is the point, so the kernels (2 workers) and repeats are
 //! small.
@@ -103,7 +103,7 @@ block 0 (vsp: i64, vp: i64) {
   vjit = i32.wrap_i64 vjit64
   vsh = i64.const 32
   vcode = i64.shr_u vp vsh
-  vw = cap.call 11 1 (i64) -> (i32) vjit (vcode)
+  vw = call.cap 11 1 (i64) -> (i32) vjit (vcode)
   vw64 = i64.extend_i32_u vw
   vc8 = i64.const 8
   vold = i64.atomic.rmw.add vc8 vw64
@@ -113,7 +113,7 @@ block 0 (vsp: i64, vp: i64) {
 }
 "#;
 
-/// Same shape, but each worker `Jit.install`s the unit and `call_indirect`s its own raced slot —
+/// Same shape, but each worker `Jit.install`s the unit and `call.dyn`s its own raced slot —
 /// concurrent installs into the shared dispatch table (the machinery Miri scrutinizes here).
 const INSTALL: &str = r#"memory 16
 func (i32, i32) -> (i64) {
@@ -176,9 +176,9 @@ block 0 (vsp: i64, vp: i64) {
   vjit = i32.wrap_i64 vjit64
   vsh = i64.const 32
   vcode = i64.shr_u vp vsh
-  vslot = cap.call 11 3 (i64) -> (i64) vjit (vcode)
+  vslot = call.cap 11 3 (i64) -> (i64) vjit (vcode)
   vslot32 = i32.wrap_i64 vslot
-  vr = call_indirect () -> (i32) vslot32 ()
+  vr = call.dyn () -> (i32) vslot32 ()
   vr64 = i64.extend_i32_u vr
   vc8 = i64.const 8
   vold = i64.atomic.rmw.add vc8 vr64

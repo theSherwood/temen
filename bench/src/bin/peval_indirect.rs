@@ -1,8 +1,8 @@
-//! Approach-A (bounded-target dynamic `call_indirect`) ROI across **all four backends**:
+//! Approach-A (bounded-target dynamic `call.dyn`) ROI across **all four backends**:
 //! tree-walk interpreter, bytecode interpreter, Cranelift `temen-jit`, and `temen-wasm-jit` (its emitted
 //! wasm run on Wasmtime — same Cranelift engine family as temen-jit).
 //!
-//! A loop dispatches, each iteration, through a data-dependent `call_indirect` to one of four
+//! A loop dispatches, each iteration, through a data-dependent `call.dyn` to one of four
 //! handlers — the shape A targets. Without A the specializer declines the whole function
 //! (`Unsupported`); with A the dispatch folds into an inlined switch and the loop specializes. Each
 //! backend runs the un-specialized interpreter module (the "blocked today" baseline) vs the
@@ -48,7 +48,7 @@ fn handler(op: BinOp, imm: i64) -> Func {
 }
 
 /// `run(n)`: seed `acc = cnt = n` (both dynamic), then loop `cnt` times doing
-/// `acc = handler[acc & 3](acc, acc)` through a dynamic-index `call_indirect`.
+/// `acc = handler[acc & 3](acc, acc)` through a dynamic-index `call.dyn`.
 fn dispatch_loop_module() -> Module {
     let hty = FuncType {
         params: vec![I64, I64],
@@ -147,7 +147,7 @@ fn dispatch_loop_module() -> Module {
         data_ptrs: vec![],
         data_funcrefs: vec![],
         impl_exports: vec![],
-        types: vec![TypeEntry::Func(hty)], // #922: the call_indirect handler sig, index 0
+        types: vec![TypeEntry::Func(hty)], // #922: the call.dyn handler sig, index 0
         debug_info: None,
     }
 }
@@ -271,7 +271,7 @@ fn main() {
 
     assert!(
         specialize_with_config(&m, 0, &[SpecArg::Dynamic], &SpecConfig::default()).is_err(),
-        "dynamic call_indirect blocks specialization without approach A"
+        "dynamic call.dyn blocks specialization without approach A"
     );
     let cfg = SpecConfig {
         indirect_targets_cap: Some(4),

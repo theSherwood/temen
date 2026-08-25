@@ -63,7 +63,7 @@ const SLOT: i64 = 2048;
 
 /// The on-ramp powerbox's stdout handle, replicated from `grant_onramp_caps`'s grant order (stdout,
 /// stdin, exit, memory, addrspace, …) against a fresh `Host` — deterministic per session, so the
-/// import-free guest text can `cap.call` it directly.
+/// import-free guest text can `call.cap` it directly.
 fn onramp_out_handle() -> i32 {
     let mut h = Host::new();
     let out = h.grant_stream(StreamRole::Out);
@@ -94,7 +94,7 @@ block 0 () {{
   i64.store vsl vsum
   vout = i32.const {out_h}
   vlen8 = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
   return vsum
   }}
 }}
@@ -148,7 +148,7 @@ fn service_coop_on_wasmi(n_results: usize) -> Option<Vec<i64>> {
 
     let mut linker: Linker<i32> = Linker::new(&engine);
     linker.define("env", "memory", memory).unwrap();
-    // A closed leaf never `call_indirect`s; an all-null table satisfies the B2 import (unused here).
+    // A closed leaf never `call.dyn`s; an all-null table satisfies the B2 import (unused here).
     let table = wasmi::Table::new(
         &mut store,
         wasmi::TableType::new(wasmi::core::ValType::FuncRef, 1 << 10, Some(1 << 10)),
@@ -286,7 +286,7 @@ block 0 () {{
   voff = i64.const 65536
   vlen = i64.const 16384
   vprot = i32.const 3
-  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vr = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
 {stores}  vbp = i64.const {BLOB_BASE}
   vbl = i64.const {blob_len}
   vcode = call.import 0 (vbp, vbl)
@@ -298,7 +298,7 @@ block 0 () {{
   i64.store vsl vsum
   vout = i32.const {out_h}
   vlen8 = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
   return vsum
   }}
 }}
@@ -639,10 +639,10 @@ fn leaf_tierup_size_floor_gates_tiny_and_admits_heavy() {
 }
 
 // ============================================================================================
-// #926 slice 2f: the B2 driver-table half — `call_indirect` tiers up on the cooperative path.
+// #926 slice 2f: the B2 driver-table half — `call.dyn` tiers up on the cooperative path.
 // A persistent driver (the Rust twin of `driveCoopTierupRun`) with **one shared funcref table**
 // resynced from the engine's slot mirror (`temen_coop_nfuncs`/`temen_coop_slot_code`/…) at each event, so
-// an emitted `call_indirect` dispatches natively (to a program `f{i}` or an installed unit's `f0`) or
+// an emitted `call.dyn` dispatches natively (to a program `f{i}` or an installed unit's `f0`) or
 // through a bounce shim, exactly as the browser would. The single-shot analogue is `tierup_driver.rs`.
 // ============================================================================================
 
@@ -676,7 +676,7 @@ struct CoopB2Driver {
 
 impl CoopB2Driver {
     /// Build the driver for the freshly opened coop session: memory sized for the mirrored window, the
-    /// shared table (sized to the engine's `call_indirect` mask), and the main emitted module.
+    /// shared table (sized to the engine's `call.dyn` mask), and the main emitted module.
     fn new() -> CoopB2Driver {
         let engine = Engine::default();
         let mut store: Store<DriverData> = Store::new(&engine, DriverData::default());
@@ -918,7 +918,7 @@ impl CoopB2Driver {
     }
 
     /// Service the pending TIERUP through the shared table (#880): sync window/table/globals, run the
-    /// main module's `f{func}` (whose `call_indirect` now dispatches through the table), deliver.
+    /// main module's `f{func}` (whose `call.dyn` now dispatches through the table), deliver.
     fn service_tierup(&mut self, n_results: usize) {
         self.sync_table();
         self.prime(temen_coop_mapped());
@@ -952,7 +952,7 @@ impl CoopB2Driver {
     }
 
     /// Service the pending JIT_INVOKE: sync window/table/globals, run the invoked unit's `f0` (whose
-    /// `call_indirect` dispatches through the shared table), deliver results or the trap.
+    /// `call.dyn` dispatches through the shared table), deliver results or the trap.
     fn service_jit_invoke(&mut self) {
         self.sync_table();
         self.prime(temen_coop_mapped());
@@ -1122,7 +1122,7 @@ fn coop_rodata_and_midinvoke_grow_match_the_oracle() {
     // A page grown mid-invoke through a bounce round-trips (the pagestate is refreshed in the bounce).
     const X: i64 = 4321;
     let src = format!(
-        "memory 16\ndata ro 32768 \"temen-coop-rodata-flip!!\"\nfunc () -> (i64) {{\nblock 0 () {{\n  vx = i64.const {X}\n  vr = call 1 (vx)\n  return vr\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  vg = call 2 (v0)\n  va = i64.const 65552\n  i64.store va v0\n  vl = i64.load va\n  return vl\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  vas = i32.const {mem_h}\n  voff = i64.const 65536\n  vlen = i64.const 16384\n  vprot = i32.const 3\n  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)\n  return v0\n  }}\n}}\nexport 0 func \"_start\" 0\n"
+        "memory 16\ndata ro 32768 \"temen-coop-rodata-flip!!\"\nfunc () -> (i64) {{\nblock 0 () {{\n  vx = i64.const {X}\n  vr = call 1 (vx)\n  return vr\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  vg = call 2 (v0)\n  va = i64.const 65552\n  i64.store va v0\n  vl = i64.load va\n  return vl\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  vas = i32.const {mem_h}\n  voff = i64.const 65536\n  vlen = i64.const 16384\n  vprot = i32.const 3\n  vr = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)\n  return v0\n  }}\n}}\nexport 0 func \"_start\" 0\n"
     );
     let m = temen_text::parse_module(&src).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
@@ -1153,7 +1153,7 @@ fn coop_rodata_and_midinvoke_grow_match_the_oracle() {
     temen_coop_close();
 }
 
-/// The paged-flip gap: a guest that `protect`s its own pages (`cap.call 5 2`) but carries **no**
+/// The paged-flip gap: a guest that `protect`s its own pages (`call.cap 5 2`) but carries **no**
 /// `readonly` data segment. Keyed on rodata alone, `temen_coop_open` emitted it non-paged, the
 /// emitter's window-remapping gate module-gated it to emit-nothing, and the open **declined** —
 /// interpreter-only for a guest paged mode carries fine. Now the flip also keys on
@@ -1172,9 +1172,9 @@ fn coop_unmap_protect_guest_without_rodata_opens_paged() {
             "  vl = i64.load v0\n  return vl\n"
         };
         // `_start` seeds the page while it is still Rw, `protect`s [64 KiB, 80 KiB) read-only
-        // (interp-serviced — a cap.call-bearing function never emits), then calls the leaf.
+        // (interp-serviced — a call.cap-bearing function never emits), then calls the leaf.
         let src = format!(
-            "memory 17\nfunc () -> (i64) {{\nblock 0 () {{\n  vp = i64.const 65536\n  i64.store vp vp\n  vas = i32.const {mem_h}\n  voff = i64.const 65536\n  vlen = i64.const 16384\n  vprot = i32.const 1\n  vr = cap.call 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)\n  vres = call 1 (vp)\n  return vres\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n{body}  }}\n}}\nexport 0 func \"_start\" 0\n"
+            "memory 17\nfunc () -> (i64) {{\nblock 0 () {{\n  vp = i64.const 65536\n  i64.store vp vp\n  vas = i32.const {mem_h}\n  voff = i64.const 65536\n  vlen = i64.const 16384\n  vprot = i32.const 1\n  vr = call.cap 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)\n  vres = call 1 (vp)\n  return vres\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n{body}  }}\n}}\nexport 0 func \"_start\" 0\n"
         );
         let m = temen_text::parse_module(&src).expect("parse");
         temen_verify::verify_module(&m).expect("verify");
@@ -1210,15 +1210,15 @@ fn coop_unmap_protect_guest_without_rodata_opens_paged() {
     }
 }
 
-/// The added constant of the `call_indirect`-reached leaf (`f2`), distinct from the unit's `UNIT_K`.
+/// The added constant of the `call.dyn`-reached leaf (`f2`), distinct from the unit's `UNIT_K`.
 const LEAF_K: i64 = 424242;
 
-/// A **threaded** guest whose tiered-up leaf `call_indirect`s another **emitted** leaf (#880, the
+/// A **threaded** guest whose tiered-up leaf `call.dyn`s another **emitted** leaf (#880, the
 /// native edge, on the cooperative path). `_start` (the root vCPU) spawns a worker (`f3`, returns 0),
-/// `vm_map`-grows `[64 KiB, 80 KiB)`, calls `f1` (which tiers up and `call_indirect`s `f2` at table
+/// `vm_map`-grows `[64 KiB, 80 KiB)`, calls `f1` (which tiers up and `call.dyn`s `f2` at table
 /// slot 2 — dispatched natively through the synced shared table), joins the worker, sums, streams, and
 /// returns. `f2` stores into the grown page, so the tier-up's `"mapped"` bound must admit the growth.
-/// The `thread.spawn` routes it to the cooperative driver; the `call_indirect` is the B2 edge.
+/// The `thread.spawn` routes it to the cooperative driver; the `call.dyn` is the B2 edge.
 fn coop_indirect_guest_text() -> String {
     let (out_h, mem_h) = onramp_out_mem_handles();
     format!(
@@ -1231,7 +1231,7 @@ block 0 () {{
   voff = i64.const 65536
   vlen = i64.const 16384
   vprot = i32.const 3
-  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vr = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
   vprobe = i64.const {PROBE}
   vres = call 1 (vprobe)
   vj = thread.join vt
@@ -1240,14 +1240,14 @@ block 0 () {{
   i64.store vsl vsum
   vout = i32.const {out_h}
   vlen8 = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
   return vsum
   }}
 }}
 func (i64) -> (i64) {{
 block 0 (v0: i64) {{
   vs2 = i32.const 2
-  vr = call_indirect (i64) -> (i64) vs2 (v0)
+  vr = call.dyn (i64) -> (i64) vs2 (v0)
   vone = i64.const 1
   vsum = i64.add vr vone
   return vsum
@@ -1295,15 +1295,15 @@ fn coop_indirect_leaf_tiers_up_natively() {
     assert_eq!(
         opened,
         0,
-        "open must admit the threaded call_indirect guest (status {})",
+        "open must admit the threaded call.dyn guest (status {})",
         temen_status()
     );
 
     let (d, tierups, invokes) = drive_coop_b2_session(&m);
-    // Non-vacuity: the `call_indirect`-bearing leaf `f1` tiered up (#880), and the indirect edge to
+    // Non-vacuity: the `call.dyn`-bearing leaf `f1` tiered up (#880), and the indirect edge to
     // the emitted `f2` was **native** — never a bounce (an empty bounce log proves the shared-table
     // dispatch, not the interpreter, serviced it).
-    assert!(tierups >= 1, "the call_indirect leaf must tier up (#880)");
+    assert!(tierups >= 1, "the call.dyn leaf must tier up (#880)");
     assert_eq!(invokes, 0, "no vm_jit units in this guest");
     assert!(
         d.bounces().is_empty(),
@@ -1336,10 +1336,10 @@ fn onramp_out_jit_handles() -> (i32, i32) {
     (out, jit)
 }
 
-/// A **threaded** `vm_jit_*` guest whose tiered-up leaf `call_indirect`s an **installed unit's**
+/// A **threaded** `vm_jit_*` guest whose tiered-up leaf `call.dyn`s an **installed unit's**
 /// emitted `f0` (#880 old→new native, on the cooperative path). `_start` (the root vCPU) spawns a
 /// worker (`f2`, returns 0), `vm_jit_compile`s `f(x)=x+7`, installs it (getting a runtime slot past the
-/// program's `f{i}` prefix), calls `f1(slot, X)` — which tiers up and `call_indirect`s the install slot
+/// program's `f{i}` prefix), calls `f1(slot, X)` — which tiers up and `call.dyn`s the install slot
 /// — joins the worker, sums, streams, returns. The install-slot edge exercises the coop `slot_code`
 /// mirror + the by-handle unit wasm the driver syncs into the shared table.
 fn coop_installed_unit_guest_text() -> String {
@@ -1381,7 +1381,7 @@ block 0 () {{
   vbl = i64.const {blob_len}
   vcode = call.import 0 (vbp, vbl)
   vjit = i32.const {jit_h}
-  vslot = cap.call 11 3 (i64) -> (i64) vjit (vcode)
+  vslot = call.cap 11 3 (i64) -> (i64) vjit (vcode)
   vx = i64.const {X}
   vres = call 1 (vslot, vx)
   vj = thread.join vt
@@ -1390,14 +1390,14 @@ block 0 () {{
   i64.store vsl vfin
   vout = i32.const {out_h}
   vlen8 = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
   return vfin
   }}
 }}
 func (i64, i64) -> (i64) {{
 block 0 (vslot: i64, vx: i64) {{
   vs = i32.wrap_i64 vslot
-  vr = call_indirect (i64) -> (i64) vs (vx)
+  vr = call.dyn (i64) -> (i64) vs (vx)
   vk = i64.const 100
   vsum = i64.add vr vk
   return vsum
@@ -1473,10 +1473,10 @@ const MID_GROW_PROBE: i64 = 81920 + 8;
 /// A **threaded** `vm_jit_*` guest whose surfaced `Jit.invoke` unit **bounces** cross-tier (#926 slice
 /// 2g — the invoke-confined registry path; the #846 `linked_unit_bounces` shape, on the cooperative
 /// driver). `_start` (root vCPU) spawns a worker (`f3`, returns 0), `vm_map`-grows `[64 KiB, 80 KiB)`,
-/// compiles + `invoke2`s a unit whose emitted `f0`: (1) `call_indirect`s slot 1 → the program's
+/// compiles + `invoke2`s a unit whose emitted `f0`: (1) `call.dyn`s slot 1 → the program's
 /// cap-calling helper `f1` — interpreter-resident, so the edge **bounces** via `env.call_interp` (the
 /// callback grows `[80 KiB, 96 KiB)` and streams); (2) stores into that just-grown page (correct only
-/// if the post-bounce `"mapped"` fan-out admits the growth); (3) `call_indirect`s slot 2 → the pure leaf
+/// if the post-bounce `"mapped"` fan-out admits the growth); (3) `call.dyn`s slot 2 → the pure leaf
 /// `f2` — emitted, **native**. The bounce runs through the invoke-confined fiber registry (`Vcpu`
 /// parity), and must match the interpreted oracle bit-for-bit.
 fn coop_invoke_bounce_guest_text() -> String {
@@ -1486,13 +1486,13 @@ fn coop_invoke_bounce_guest_text() -> String {
 func (i64) -> (i64) {{
 block 0 (v0: i64) {{
   vs1 = i32.const 1
-  va = call_indirect (i64) -> (i64) vs1 (v0)
+  va = call.dyn (i64) -> (i64) vs1 (v0)
   vsum = i64.add v0 va
   vaddr = i64.const {MID_GROW_PROBE}
   i64.store vaddr vsum
   vld = i64.load vaddr
   vs2 = i32.const 2
-  vc = call_indirect (i64) -> (i64) vs2 (vld)
+  vc = call.dyn (i64) -> (i64) vs2 (vld)
   return vc
   }}
 }}
@@ -1524,7 +1524,7 @@ block 0 () {{
   voff = i64.const 65536
   vlen = i64.const 16384
   vprot = i32.const 3
-  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vr = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
 {stores}  vbp = i64.const {BLOB_BASE}
   vbl = i64.const {blob_len}
   vcode = call.import 0 (vbp, vbl)
@@ -1536,7 +1536,7 @@ block 0 () {{
   i64.store vsl vsum
   vout = i32.const {out_h}
   vlen8 = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
   return vsum
   }}
 }}
@@ -1546,11 +1546,11 @@ block 0 (v0: i64) {{
   voff = i64.const 81920
   vlen = i64.const 16384
   vprot = i32.const 3
-  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vr = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
   vout = i32.const {out_h}
   vzero = i64.const 0
   vlen8 = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vzero, vlen8)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vzero, vlen8)
   vk = i64.const {BOUNCE_K}
   vsum = i64.add v0 vk
   return vsum
@@ -1691,7 +1691,7 @@ block 0 () {{
   voff = i64.const 65536
   vlen = i64.const 16384
   vprot = i32.const 3
-  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vr = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
 {stores}  vbp = i64.const {BLOB_BASE}
   vbl = i64.const {blob_len}
   vcode = call.import 0 (vbp, vbl)
@@ -1701,7 +1701,7 @@ block 0 () {{
   i64.store vsl vres
   vout = i32.const {out_h}
   vlen8 = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
   return vres
   }}
 }}
@@ -1912,7 +1912,7 @@ export 0 func "_start" 0
 }
 
 /// Pump port (#846, unit→**unit** native): the guest compiles + `install`s pure unit A, then
-/// compiles unit B whose `call_indirect` reaches A's install slot — both emitted, the edge
+/// compiles unit B whose `call.dyn` reaches A's install slot — both emitted, the edge
 /// dispatches natively (zero bounces), matching the oracle.
 #[test]
 fn coop_installed_unit_edge_dispatches_natively() {
@@ -1931,7 +1931,7 @@ block 0 (v0: i64) {
 func (i64, i64) -> (i64) {
 block 0 (vslot: i64, vx: i64) {
   vs = i32.wrap_i64 vslot
-  vr = call_indirect (i64) -> (i64) vs (vx)
+  vr = call.dyn (i64) -> (i64) vs (vx)
   vk = i64.const 100
   vsum = i64.add vr vk
   return vsum
@@ -1966,7 +1966,7 @@ block 0 () {{
   val = i64.const {la}
   vca = call.import 0 (vap, val)
   vjit = i32.const {jit_h}
-  vslot = cap.call 11 3 (i64) -> (i64) vjit (vca)
+  vslot = call.cap 11 3 (i64) -> (i64) vjit (vca)
   vbp = i64.const {B_BASE}
   vbl = i64.const {lb}
   vcb = call.import 0 (vbp, vbl)
@@ -1976,7 +1976,7 @@ block 0 () {{
   i64.store vsl vres
   vout = i32.const {out_h}
   vlen8 = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
   return vres
   }}
 }}
@@ -2010,7 +2010,7 @@ export 0 func "_start" 0
 }
 
 /// Pump port (#1009 Mechanism 1): a guest with **more than 1024 functions** whose tier-up-eligible
-/// dispatch leaf `call_indirect`s a slot beyond the 1024-slot floor — the emitted table and the
+/// dispatch leaf `call.dyn`s a slot beyond the 1024-slot floor — the emitted table and the
 /// interpreter's `SharedSlots` must both size to `next_power_of_two(n_funcs)` so the two tiers mask
 /// identically (a fixed-1024 mask silently reached a wrong, identically-typed function).
 #[test]
@@ -2034,7 +2034,7 @@ block 0 () {{
   i64.store vsl vres
   vout = i32.const {out_h}
   vlen8 = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
   return vres
   }}
 }}
@@ -2044,7 +2044,7 @@ block 0 () {{
         r#"func (i64) -> (i64) {{
 block 0 (v0: i64) {{
   vs = i32.const {TARGET}
-  vr = call_indirect (i64) -> (i64) vs (v0)
+  vr = call.dyn (i64) -> (i64) vs (v0)
   return vr
   }}
 }}
@@ -2101,7 +2101,7 @@ block 0 (v0: i64) {{
     temen_coop_close();
 }
 
-/// Pump port (#880, TIERUP-region bounce + growth): a tiered-up leaf's `call_indirect` lands on a
+/// Pump port (#880, TIERUP-region bounce + growth): a tiered-up leaf's `call.dyn` lands on a
 /// **shim** (the target hosts a fiber, so it stays interpreter-resident), whose callback grows the
 /// window and streams — the leaf then stores into the just-grown page, correct only through the
 /// post-bounce `"mapped"` fan-out; the bounce's stdout interleaves exactly as interpreted.
@@ -2120,14 +2120,14 @@ block 0 () {{
   i64.store vsl vres
   vout = i32.const {out_h}
   vlen8 = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
   return vres
   }}
 }}
 func (i64) -> (i64) {{
 block 0 (v0: i64) {{
   vs2 = i32.const 2
-  va = call_indirect (i64) -> (i64) vs2 (v0)
+  va = call.dyn (i64) -> (i64) vs2 (v0)
   vsum = i64.add v0 va
   vaddr = i64.const 65552
   i64.store vaddr vsum
@@ -2141,11 +2141,11 @@ block 0 (v0: i64) {{
   voff = i64.const 65536
   vlen = i64.const 16384
   vprot = i32.const 3
-  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vr = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
   vout = i32.const {out_h}
   vzero = i64.const 0
   vlen8 = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vzero, vlen8)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vzero, vlen8)
   vf = i32.const 3
   vk2 = cont.new vf vzero
   vs1, vv1 = cont.resume vk2 vzero
@@ -2216,14 +2216,14 @@ block 0 () {{
   i64.store vsl vres
   vout = i32.const {out_h}
   vlen8 = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
   return vres
   }}
 }}
 func (i64) -> (i64) {{
 block 0 (v0: i64) {{
   vs2 = i32.const 2
-  vr = call_indirect (i64) -> (i64) vs2 (v0)
+  vr = call.dyn (i64) -> (i64) vs2 (v0)
   return vr
   }}
 }}
@@ -2299,7 +2299,7 @@ block 0 () {{
   i64.store vsl vres
   vout = i32.const {out_h}
   vlen8 = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
   return vres
   }}
 }}
@@ -2320,11 +2320,11 @@ block 0 (v0: i64) {{
   voff = i64.const 65536
   vlen = i64.const 16384
   vprot = i32.const 3
-  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vr = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
   vout = i32.const {out_h}
   vzero = i64.const 0
   vlen8 = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vzero, vlen8)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vzero, vlen8)
   vk = i64.const {XT_K}
   vsum = i64.add v0 vk
   return vsum
@@ -2386,14 +2386,14 @@ block 0 () {{
   voff = i64.const 65536
   vlen = i64.const 16384
   vprot = i32.const 3
-  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vr = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
   vprobe = i64.const {PROBE}
   vres = call 1 (vprobe)
   vsl = i64.const {SLOT}
   i64.store vsl vres
   vout = i32.const {out_h}
   vlen8 = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
   return vres
   }}
 }}
@@ -2468,7 +2468,7 @@ block 0 () {{
   i64.store vsl vres
   vout = i32.const {out_h}
   vlen8 = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
   vaddr = i64.const 0
   vcnt = i32.const 1
   vn = atomic.notify vaddr vcnt
@@ -2509,7 +2509,7 @@ export 0 func "_start" 0
     temen_coop_close();
 }
 
-/// Pump port (#889, the card shape): a hot loop with **one inline stdout `cap.call` per iteration**
+/// Pump port (#889, the card shape): a hot loop with **one inline stdout `call.cap` per iteration**
 /// — the site outlines, the loop emits and tiers up, and each iteration's cap write bounces to the
 /// outlined wrapper (index 3), interleaving stdout exactly as interpreted.
 #[test]
@@ -2526,7 +2526,7 @@ block 0 () {{
   i64.store vsl vres
   vout = i32.const {out_h}
   vlen8 = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
   return vres
   }}
 }}
@@ -2543,7 +2543,7 @@ block 1 (vi: i64, vacc: i64) {{
   i64.store vsl2 vacc2
   vout = i32.const {out_h}
   vlen8 = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl2, vlen8)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl2, vlen8)
   vone = i64.const -1
   vnext = i64.add vi vone
   vz = i64.const 0

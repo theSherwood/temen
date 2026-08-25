@@ -28,7 +28,7 @@ export 0 interface "counter" 1 { bump: 1 }
 func () -> (i64) {
 block 0 () {
   vz = i32.const 0
-  vn = cap.call 4294967295 9 () -> (i64) vz ()
+  vn = call.cap 4294967295 9 () -> (i64) vz ()
   return vn
   }
 }
@@ -127,7 +127,7 @@ export 0 interface "counter" 1 { bump: 1 }
 func () -> (i64) {
 block 0 () {
   vz = i32.const 0
-  vn = cap.call 4294967295 9 () -> (i64) vz ()
+  vn = call.cap 4294967295 9 () -> (i64) vz ()
   vc = i64.const 65600
   vafter = i64.load vc
   vk = i64.const 1000
@@ -240,7 +240,7 @@ export 0 interface "counter" 1 { bump: 1 }
 func () -> (i64) {
 block 0 () {
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   vc = i64.const 65600
   vafter = i64.load vc
   vk = i64.const 1000
@@ -355,16 +355,16 @@ block 0 (v0: i32) {
   i64.store q0a5 q0v4
   q0a6 = i64.const 1200
   i64.store q0a6 q0v4
-  v5 = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   return vn
   }
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   return vn
   }
 }
@@ -500,9 +500,9 @@ block 0 (v0: i32) {
   i64.store q1a5 q1v4
   q1a6 = i64.const 1264
   i64.store q1a6 q1v4
-  vc1 = cap.call 6 17 (i64) -> (i32) v0 (q1a0)
+  vc1 = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   return vn
   }
 }
@@ -531,16 +531,16 @@ block 0 (v0: i64) {
   i64.store q2a5 q2v4
   q2a6 = i64.const 1328
   i64.store q2a6 q2v4
-  vc2 = cap.call 6 17 (i64) -> (i32) vh (q2a0)
+  vc2 = call.cap 6 17 (i64) -> (i32) vh (q2a0)
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   return vn
   }
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   return vn
   }
 }
@@ -700,13 +700,13 @@ block 0 (v0: i32) {
   i64.store q3a5 q3v4
   q3a6 = i64.const 1392
   i64.store q3a6 q3v4
-  vc1 = cap.call 6 17 (i64) -> (i32) v0 (q3a0)
+  vc1 = call.cap 6 17 (i64) -> (i32) v0 (q3a0)
   vexp = i64.const 1
-  vh1 = cap.call 6 14 (i32, i64) -> (i32) v0 (vc1, vexp)
+  vh1 = call.cap 6 14 (i32, i64) -> (i32) v0 (vc1, vexp)
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   varg = i64.const 7
-  vr = cap.call 268435456 0 (i64) -> (i64) vh1 (varg)
+  vr = call.cap 268435456 0 (i64) -> (i64) vh1 (varg)
   return vr
   }
 }
@@ -742,13 +742,13 @@ block 0 (v0: i64) {
   i64.store q4a5 q4v4
   q4a6 = i64.const 1456
   i64.store q4a6 q4v4
-  vc2 = cap.call 6 17 (i64) -> (i32) vh (q4a0)
+  vc2 = call.cap 6 17 (i64) -> (i32) vh (q4a0)
   vexp = i64.const 0
-  vh2 = cap.call 6 14 (i32, i64) -> (i32) vh (vc2, vexp)
+  vh2 = call.cap 6 14 (i32, i64) -> (i32) vh (vc2, vexp)
   vk2 = i64.const 65608
   i32.store vk2 vh2
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   return vn
   }
 }
@@ -756,14 +756,14 @@ func (i64) -> (i64) {
 block 0 (vx: i64) {
   vk2 = i64.const 65608
   vh2 = i32.load vk2
-  vr = cap.call 268435456 0 (i64) -> (i64) vh2 (vx)
+  vr = call.cap 268435456 0 (i64) -> (i64) vh2 (vx)
   return vr
   }
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   return vn
   }
 }

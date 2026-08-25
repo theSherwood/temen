@@ -79,9 +79,9 @@ block 0 (v0: i32) {\n\
   i64.store q0a5 q0v1\n\
   q0a6 = i64.const 4144\n\
   i64.store q0a6 q0v1\n\
-  vch = cap.call 6 17 (i64) -> (i32) v0 (q0a0)\n\
-  vk = cap.call 6 12 (i32) -> (i32) v0 (vch)\n\
-  vd = cap.call 6 10 (i32) -> (i32) v0 (vch)\n\
+  vch = call.cap 6 17 (i64) -> (i32) v0 (q0a0)\n\
+  vk = call.cap 6 12 (i32) -> (i32) v0 (vch)\n\
+  vd = call.cap 6 10 (i32) -> (i32) v0 (vch)\n\
   vten = i32.const 10\n\
   vkm = i32.mul vk vten\n\
   vsum = i32.add vkm vd\n\
@@ -122,11 +122,11 @@ block 0 (v0: i32) {\n\
   i64.store q1a5 q1v1\n\
   q1a6 = i64.const 4208\n\
   i64.store q1a6 q1v1\n\
-  vch = cap.call 6 17 (i64) -> (i32) v0 (q1a0)\n\
+  vch = call.cap 6 17 (i64) -> (i32) v0 (q1a0)\n\
   br 1(v0, vch)\n\
 }\n\
 block 1 (bv0: i32, bvch: i32) {\n\
-  vp = cap.call 6 9 (i32) -> (i32) bv0 (bvch)\n\
+  vp = call.cap 6 9 (i32) -> (i32) bv0 (bvch)\n\
   vzero = i32.const 0\n\
   vrun = i32.eq vp vzero\n\
   br_if vrun 1(bv0, bvch) 2(vp)\n\
@@ -194,12 +194,12 @@ block 0 (v0: i32) {\n\
   i64.store q2a5 q2v1\n\
   q2a6 = i64.const 4272\n\
   i64.store q2a6 q2v1\n\
-  vch = cap.call 6 17 (i64) -> (i32) v0 (q2a0)\n\
-  vfirst = cap.call 6 9 (i32) -> (i32) v0 (vch)\n\
+  vch = call.cap 6 17 (i64) -> (i32) v0 (q2a0)\n\
+  vfirst = call.cap 6 9 (i32) -> (i32) v0 (vch)\n\
   br 1(v0, vch, vfirst)\n\
 }\n\
 block 1 (bv0: i32, bvch: i32, bfirst: i32) {\n\
-  vp = cap.call 6 9 (i32) -> (i32) bv0 (bvch)\n\
+  vp = call.cap 6 9 (i32) -> (i32) bv0 (bvch)\n\
   vzero = i32.const 0\n\
   vrun = i32.eq vp vzero\n\
   br_if vrun 1(bv0, bvch, bfirst) 2(bfirst, vp)\n\

@@ -1,6 +1,6 @@
-//! ROI micro-benchmark for approach A (bounded-target dynamic `call_indirect`).
+//! ROI micro-benchmark for approach A (bounded-target dynamic `call.dyn`).
 //!
-//! A loop dispatches, each iteration, through a **data-dependent** `call_indirect` to one of four
+//! A loop dispatches, each iteration, through a **data-dependent** `call.dyn` to one of four
 //! handlers — the shape A targets (a closure / first-class-function call whose target is a runtime
 //! value, not derivable from the constant program). Without A the specializer declines the whole
 //! function (`Unsupported`); with A the dispatch becomes an inlined 4-way switch and the loop
@@ -88,7 +88,7 @@ fn dispatch_loop_module() -> Module {
                     else_args: vec![0],
                 },
             },
-            // b2(acc, cnt): acc' = call_indirect[acc&3](acc,acc); cnt' = cnt - 1
+            // b2(acc, cnt): acc' = call.dyn[acc&3](acc,acc); cnt' = cnt - 1
             Block {
                 params: vec![I64, I64],
                 insts: vec![
@@ -214,7 +214,7 @@ fn indirect_dispatch_roi() {
     // Baseline: the specializer cannot get past the dynamic dispatch.
     assert!(
         specialize_with_config(&m, 0, &[SpecArg::Dynamic], &SpecConfig::default()).is_err(),
-        "dynamic call_indirect blocks specialization without approach A"
+        "dynamic call.dyn blocks specialization without approach A"
     );
 
     // Approach A: fold the dispatch into an inlined switch; the loop specializes.

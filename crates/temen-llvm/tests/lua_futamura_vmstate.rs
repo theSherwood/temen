@@ -10,7 +10,7 @@
 //! (no grow needed), the setjmp arm is pruned, and the dispatch collapses.
 //!
 //! **Result:** `luaV_execute` projects fully. The residual carries **no `br_table`** (the 83-way
-//! dispatch is gone), **no `call_indirect`** (the cold error/alloc/hook paths are pruned), and **no
+//! dispatch is gone), **no `call.dyn`** (the cold error/alloc/hook paths are pruned), and **no
 //! loads** (every VM-state field folded) — the whole interpreter reduces to a constant computation
 //! that spills the final VM state and returns, and the loop result `x = 0 + 3*50 = 150` appears among
 //! the constants it computed. Because the program has no runtime input it unrolls completely, so the

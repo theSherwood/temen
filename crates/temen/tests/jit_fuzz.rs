@@ -17,13 +17,13 @@ use irgen::{fuzz_one, Gen};
 /// silently return. Each drives the *same* `fuzz_one` the libFuzzer target does (via
 /// `Gen::from_bytes`), so a divergence here is the original miscompile resurfacing.
 ///
-/// - `[0xad, 0xa9, 0xac]`: a `cap.call` to the Jit interface (type_id 11) with an out-of-range
+/// - `[0xad, 0xa9, 0xac]`: a `call.cap` to the Jit interface (type_id 11) with an out-of-range
 ///   op-index (207). The interpreter faults (`CapFault`, the generic-dispatch path), but
 ///   `temen-run`'s `jit_native_op` catch-all used to return `-EINVAL` as a value and clear the
-///   trap cell, so the JIT *returned* — an interp↔JIT divergence on the cap.call trap path.
+///   trap cell, so the JIT *returned* — an interp↔JIT divergence on the call.cap trap path.
 ///   Fixed by faulting on an unknown Jit op (§3c: an out-of-range op-index traps).
 /// - `[0xe8, 0x01, 0xde, 0xcd]`, `[0x2a, 0x93, 0x00]`, `[0x00, 0x71, 0x04, 0x1c]` (ISSUES.md I16;
-///   nightlies Jun 19 / Jul 2 / Jul 4): a `cap.call` to the Instantiator interface (type_id 6,
+///   nightlies Jun 19 / Jul 2 / Jul 4): a `call.cap` to the Instantiator interface (type_id 6,
 ///   ops 5/6/7) whose declared sig has fewer args than the op's contract. The static
 ///   `lower_instantiator` dispatch indexed the missing args and failed the whole compile with
 ///   `JitError::Malformed` — a compile-time rejection of a verifier-valid module (the interpreter
@@ -127,7 +127,7 @@ fn jit_matches_interp_under_tight_fuel() {
     );
 }
 
-/// Guard that the generator actually covers loops (back-edges), indirect calls, and cap.calls —
+/// Guard that the generator actually covers loops (back-edges), indirect calls, and call.cap calls —
 /// so the differential above is exercising them, not silently regressing to forward-only DAGs.
 #[test]
 fn generator_covers_loops_indirect_and_cap_calls() {
@@ -169,7 +169,7 @@ fn generator_covers_loops_indirect_and_cap_calls() {
                     .filter(|i| matches!(i, Inst::CapCall { .. }))
                     .count() as u32;
                 // type_id 5 = the AddressSpace interface (the whole-window grant): a *valid*
-                // (granted-handle) cap.call, exercising the success path, vs the forged-handle
+                // (granted-handle) call.cap, exercising the success path, vs the forged-handle
                 // (CapFault) ones the other arm emits.
                 mem_cap += blk
                     .insts
@@ -206,11 +206,11 @@ fn generator_covers_loops_indirect_and_cap_calls() {
     assert!(fences > 0, "generator produced no fences");
     assert!(reffuncs > 0, "generator produced no ref.func");
     assert!(loops > 0, "generator produced no loop back-edges");
-    assert!(indirect > 0, "generator produced no call_indirect");
-    assert!(cap > 0, "generator produced no cap.call");
+    assert!(indirect > 0, "generator produced no call.dyn");
+    assert!(cap > 0, "generator produced no call.cap");
     assert!(
         mem_cap > 0,
-        "generator produced no valid Memory cap.call (success path)"
+        "generator produced no valid Memory call.cap (success path)"
     );
     assert!(data > 0, "generator produced no (non-empty) data segments");
     assert!(data_ro > 0, "generator produced no read-only data segments");

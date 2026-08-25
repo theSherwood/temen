@@ -1,9 +1,9 @@
 //! Equality harness for the bytecode engine's **§22 cross-module dispatch** (INTERP_PERF.md Slice
-//! 1c-5e): `Jit.install` of a unit, then a module-0 `call_indirect` into it. The unit is
+//! 1c-5e): `Jit.install` of a unit, then a module-0 `call.dyn` into it. The unit is
 //! host-pre-compiled (so no in-guest blob seeding is needed — the bytecode entry builds memory from
 //! the module, not an init image), and its code handle is passed to the guest as an argument.
 //!
-//! The guest installs the unit (→ a table slot) and `call_indirect`s that slot; on the bytecode
+//! The guest installs the unit (→ a table slot) and `call.dyn`s that slot; on the bytecode
 //! engine this exercises the runtime dispatch table + a cross-module activation. Compared against the
 //! tree-walker `run_with_host`; `.expect(Some)` gates that bytecode drove it (didn't fall back).
 
@@ -18,9 +18,9 @@ const GUEST: &str = r#"memory 16
 func (i32, i32, i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   v4 = i64.extend_i32_u v1
-  v5 = cap.call 11 3 (i64) -> (i64) v0 (v4)
+  v5 = call.cap 11 3 (i64) -> (i64) v0 (v4)
   v6 = i32.wrap_i64 v5
-  v7 = call_indirect (i32, i32) -> (i32) v6 (v2, v3)
+  v7 = call.dyn (i32, i32) -> (i32) v6 (v2, v3)
   return v7
   }
 }
@@ -57,16 +57,16 @@ fn host_with_unit(guest: &temen_ir::Module) -> (Host, i32, i32) {
     (host, jit, code)
 }
 
-/// Install, then `uninstall` the slot, then `call_indirect` it — the freed slot traps
+/// Install, then `uninstall` the slot, then `call.dyn` it — the freed slot traps
 /// (`IndirectCallType`) identically on both engines.
 const GUEST_UNINSTALL: &str = r#"memory 16
 func (i32, i32, i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   v4 = i64.extend_i32_u v1
-  v5 = cap.call 11 3 (i64) -> (i64) v0 (v4)
-  v6 = cap.call 11 4 (i64) -> (i64) v0 (v5)
+  v5 = call.cap 11 3 (i64) -> (i64) v0 (v4)
+  v6 = call.cap 11 4 (i64) -> (i64) v0 (v5)
   v7 = i32.wrap_i64 v5
-  v8 = call_indirect (i32, i32) -> (i32) v7 (v2, v3)
+  v8 = call.dyn (i32, i32) -> (i32) v7 (v2, v3)
   return v8
   }
 }
@@ -108,7 +108,7 @@ fn uninstall_then_call_indirect_traps_identically() {
     )
     .expect("bytecode supports install/uninstall (Slice 1c-5e)");
 
-    assert_eq!(tw, bc, "uninstall+call_indirect: tree-walker != bytecode");
+    assert_eq!(tw, bc, "uninstall+call.dyn: tree-walker != bytecode");
     assert!(
         matches!(bc, Err(temen_interp::Trap::IndirectCallType)),
         "{bc:?}"
@@ -135,12 +135,12 @@ block 0 (v0: i32, v1: i32) {
 }
 "#;
 
-/// Unit B (invoked): `call_indirect[slot 1](a, b) + 1` — reaches the installed A.
+/// Unit B (invoked): `call.dyn[slot 1](a, b) + 1` — reaches the installed A.
 const UNIT_B: &str = r#"memory 16
 func (i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32) {
   v2 = i32.const 1
-  v3 = call_indirect (i32, i32) -> (i32) v2 (v0, v1)
+  v3 = call.dyn (i32, i32) -> (i32) v2 (v0, v1)
   v4 = i32.const 1
   v5 = i32.add v3 v4
   return v5
@@ -148,15 +148,15 @@ block 0 (v0: i32, v1: i32) {
 }
 "#;
 
-/// `Jit.invoke` of a unit that itself `call_indirect`s an *installed* unit (DESIGN.md §22 new→new):
+/// `Jit.invoke` of a unit that itself `call.dyn`s an *installed* unit (DESIGN.md §22 new→new):
 /// install A at slot 1, then invoke B which calls A; `B(6,7) = A(6,7) + 1 = 14`.
 const GUEST_INVOKE: &str = r#"memory 16
 func (i32, i32, i32, i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
   v5 = i64.extend_i32_u v1
-  v6 = cap.call 11 3 (i64) -> (i64) v0 (v5)
+  v6 = call.cap 11 3 (i64) -> (i64) v0 (v5)
   v7 = i64.extend_i32_u v2
-  v8 = cap.call 11 1 (i64, i32, i32) -> (i32) v0 (v7, v3, v4)
+  v8 = call.cap 11 1 (i64, i32, i32) -> (i32) v0 (v7, v3, v4)
   return v8
   }
 }
@@ -236,9 +236,9 @@ fn install_then_cross_module_call_indirect_agrees() {
         &mut f_bc,
         &mut h_bc,
     )
-    .expect("bytecode engine must support install + cross-module call_indirect (Slice 1c-5e)");
+    .expect("bytecode engine must support install + cross-module call.dyn (Slice 1c-5e)");
 
-    assert_eq!(tw, bc, "install/call_indirect: tree-walker != bytecode");
+    assert_eq!(tw, bc, "install/call.dyn: tree-walker != bytecode");
     assert_eq!(
         bc,
         Ok(vec![Value::I32(142)]),

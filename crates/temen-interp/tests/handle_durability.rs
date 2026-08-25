@@ -140,7 +140,7 @@ fn drain_non_durable_makes_a_domain_snapshottable() {
     assert_eq!(captured[0].binding, DurableBinding::Clock);
 }
 
-/// A drained handle's value is a dead generation: a `cap.call` on it answers the probeable
+/// A drained handle's value is a dead generation: a `call.cap` on it answers the probeable
 /// revocation errno (I41 — the drain IS a revocation of a once-valid handle), never authority
 /// into the freed slot. The durable handles the drain left alone still resolve.
 #[test]

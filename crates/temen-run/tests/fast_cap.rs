@@ -13,8 +13,8 @@ use temen_run::{cap_thunk, fast_cap_resolver};
 const SRC: &str = r#"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = cap.call 2 0 () -> (i64) v0 ()
-  v2 = cap.call 2 0 () -> (i64) v0 ()
+  v1 = call.cap 2 0 () -> (i64) v0 ()
+  v2 = call.cap 2 0 () -> (i64) v0 ()
   v3 = i64.sub v2 v1
   return v3
   }

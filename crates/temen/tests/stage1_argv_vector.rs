@@ -107,8 +107,8 @@ block 0 (vinst: i32, vout: i32) {{
   i64.store rra5 rrvz
   rra6 = i64.const 1200
   i64.store rra6 rrv1n
-  vch = cap.call 6 17 (i64) -> (i32) vinst (rra0)
-  r = cap.call 6 1 (i32) -> (i64) vinst (vch)
+  vch = call.cap 6 17 (i64) -> (i32) vinst (rra0)
+  r = call.cap 6 1 (i32) -> (i64) vinst (vch)
   return r
   }}
 }}
@@ -132,12 +132,12 @@ block 0 (vci: i64) {{
   a205 = i64.const 205
   i32.store8 a205 ct
   len6 = i64.const 6
-  hout = cap.self.resolve a200 len6
+  hout = self.resolve a200 len6
   a8 = i64.const 8
   p1 = i32.load a8
   p1x = i64.extend_i32_u p1
   len2 = i64.const 2
-  w = cap.call 0 1 (i64, i64) -> (i64) hout (p1x, len2)
+  w = call.cap 0 1 (i64, i64) -> (i64) hout (p1x, len2)
   a0 = i64.const 0
   argc = i32.load a0
   argcx = i64.extend_i32_u argc

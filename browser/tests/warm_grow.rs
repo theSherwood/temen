@@ -17,7 +17,7 @@ const SCRATCH_ADDR: u64 = 65560;
 
 /// The memory (whole-window AddressSpace) handle `grant_onramp_caps` mints — replicated from its
 /// grant order (stdout, stdin, exit, memory, …) against a fresh `Host`, so the guest text can
-/// `cap.call` it directly (the on-ramp powerbox mints deterministic handles per session).
+/// `call.cap` it directly (the on-ramp powerbox mints deterministic handles per session).
 fn memory_handle() -> i32 {
     let mut h = Host::new();
     let _ = h.grant_stream(StreamRole::Out);
@@ -42,7 +42,7 @@ block 0 (vsp: i64) {{
   voff = i64.const 65536
   vlen = i64.const 16384
   vprot = i32.const 3
-  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vr = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
   vaddr = i64.const {MARKER_ADDR}
   vmark = i64.const {MARKER}
   i64.store vaddr vmark

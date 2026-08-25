@@ -149,8 +149,8 @@ fn parallel_futex_race_free_under_miri() {
     assert_eq!(run_parallel(FUTEX), Ok(vec![Value::I64(987654)]));
 }
 
-// 2 worker vCPUs each write "hi\n" to stdout via `cap.call` (handle threaded through block args) + bump
-// a shared counter — exercises the shared `Mutex<Host>` and per-cap.call locking across real threads.
+// 2 worker vCPUs each write "hi\n" to stdout via `call.cap` (handle threaded through block args) + bump
+// a shared counter — exercises the shared `Mutex<Host>` and per-call.cap locking across real threads.
 const CAPS: &str = r#"memory 16
 data 0 "hi\n"
 func (i32) -> (i64) {
@@ -207,7 +207,7 @@ block 0 (vsp: i64, vh: i64) {
   vhandle = i32.wrap_i64 vh
   vptr = i64.const 0
   vlen = i64.const 3
-  vw = cap.call 0 1 (i64, i64) -> (i64) vhandle(vptr, vlen)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vhandle(vptr, vlen)
   v1 = i64.const 8
   v2 = i64.const 1
   v3 = i64.atomic.rmw.add v1 v2

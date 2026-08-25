@@ -23,10 +23,10 @@
 //!     trick (so it wins), while wasm64 must emit an explicit bounds check per access (so a
 //!     mask beats it). The memory kernel is therefore timed against *both* wasm memory types.
 //!   - **interface / host calls → the "around-compute" axis** (§1a, the strongest claimed
-//!     win). `hostcall` times a scalar `cap.call` round-trip vs a Wasmtime imported function;
+//!     win). `hostcall` times a scalar `call.cap` round-trip vs a Wasmtime imported function;
 //!     `hostbuf` times a zero-copy `(ptr,len)` **borrow buffer** the host reads in place (§7)
 //!     vs a (cached-memory) wasm import doing the same read. Honest current state: scalar
-//!     cap.call is *slower* (a generic arg-packing thunk; the devirtualize-to-direct-call
+//!     call.cap is *slower* (a generic arg-packing thunk; the devirtualize-to-direct-call
 //!     win, D45, is deferred), while the zero-copy buffer path is *faster* (the host gets the
 //!     window base for free). The larger §1a claim — vs the component model's lift/lower
 //!     marshalling, and async rings — is a heavier comparison, not attempted here.
@@ -524,9 +524,9 @@ block 3 (v18: f64) {
     n_span: None,
 };
 
-/// `(i64 n) -> i64`: a **`call_indirect` dispatch** loop — each iteration calls a leaf `x -> x+1`
+/// `(i64 n) -> i64`: a **`call.dyn` dispatch** loop — each iteration calls a leaf `x -> x+1`
 /// through the function table (slot 1 = the leaf), accumulating, so the timing isolates the §3c
-/// table-dispatch cost (mask + type-id check) vs a Wasmtime `call_indirect`. Result = Σ (i+1).
+/// table-dispatch cost (mask + type-id check) vs a Wasmtime `call.dyn`. Result = Σ (i+1).
 const CALLI: Kernel = Kernel {
     name: "calli",
     ir: "\
@@ -542,7 +542,7 @@ block 1 (v3: i64, v4: i64, v5: i64) {
 }
 block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i32.const 1
-  v11 = call_indirect (i64) -> (i64) v10 (v9)
+  v11 = call.dyn (i64) -> (i64) v10 (v9)
   v12 = i64.add v8 v11
   v13 = i64.const 1
   v14 = i64.add v9 v13
@@ -573,7 +573,7 @@ block 0 (v0: i64) {
         (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
         (local.set $acc
           (i64.add (local.get $acc)
-            (call_indirect (type $sig) (local.get $i) (i32.const 1))))
+            (call.dyn (type $sig) (local.get $i) (i32.const 1))))
         (local.set $i (i64.add (local.get $i) (i64.const 1)))
         (br $loop)))
     (local.get $acc)))
@@ -594,7 +594,7 @@ block 0 (v0: i64) {
         (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
         (local.set $acc
           (i64.add (local.get $acc)
-            (call_indirect (type $sig) (local.get $i) (i32.const 1))))
+            (call.dyn (type $sig) (local.get $i) (i32.const 1))))
         (local.set $i (i64.add (local.get $i) (i64.const 1)))
         (br $loop)))
     (local.get $acc)))
@@ -797,7 +797,7 @@ fn native_float(n: i64) -> i64 {
 }
 
 /// Native twin of `CALLI`: call a leaf through a `black_box`'d function pointer each iteration
-/// (so the compiler can't devirtualize/inline it — a real indirect call, like `call_indirect`).
+/// (so the compiler can't devirtualize/inline it — a real indirect call, like `call.dyn`).
 fn native_calli(n: i64) -> i64 {
     fn leaf(x: i64) -> i64 {
         x.wrapping_add(1)
@@ -900,7 +900,7 @@ unsafe extern "C" fn bench_thunk(
     // A transpiled kernel dispatches as `call.import` (IMPORTS.md phase 3): the thunk sees the
     // `CAP_IMPORT_TYPE_ID` sentinel with the manifest slot as `op`. Each `HostCall` kernel imports
     // exactly one op and the two bench ops have distinct arities, so pick by arity there; the
-    // hand-written IR's inline `cap.call 0 <op>` still selects by `op` directly.
+    // hand-written IR's inline `call.cap 0 <op>` still selects by `op` directly.
     let op = if type_id == temen_ir::CAP_IMPORT_TYPE_ID {
         if n_args == 2 {
             1
@@ -980,7 +980,7 @@ unsafe extern "C" fn bench_fast_resolver(
     }
 }
 
-/// Like [`temen_call`] but drives the cap.call trampoline ([`bench_thunk`]) — for `HostCall`
+/// Like [`temen_call`] but drives the call.cap trampoline ([`bench_thunk`]) — for `HostCall`
 /// kernels. The context pointer is unused (the thunk is stateless), so it is null. With `--fast-cap`
 /// the call instead takes the §9/D45 devirtualized fast path via [`bench_fast_resolver`].
 fn temen_call_host(m: &temen_ir::Module, entry: u32, lead: &[i64], n: i64) -> i64 {
@@ -1007,7 +1007,7 @@ fn temen_call_host(m: &temen_ir::Module, entry: u32, lead: &[i64], n: i64) -> i6
 
 /// What a kernel measures. `Compute` kernels run an import-less wasm module and the no-cap
 /// Temen JIT (per-iteration *compute*). `HostCall` kernels instead make one host crossing per
-/// iteration — Temen `cap.call` through a trampoline thunk vs a Wasmtime **imported host
+/// iteration — Temen `call.cap` through a trampoline thunk vs a Wasmtime **imported host
 /// function** — so the subtraction isolates the *per-host-call* cost (§1a interface axis).
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -1042,7 +1042,7 @@ struct Resolved {
 /// (the same bytes Wasmtime runs) — the genuine apples-to-apples comparison. This now covers the
 /// **`hostcall` / `hostbuf`** interface kernels too: their `host.op` / `host.sum` imports use the
 /// host-ABI convention (`module` = capability type_id, `name` = op), so they transpile to the same
-/// `cap.call` the hand-written IR used. Kernels the transpiler can't handle keep their hand-written
+/// `call.cap` the hand-written IR used. Kernels the transpiler can't handle keep their hand-written
 /// IR, with a note saying why.
 ///
 /// **temen-wasm doesn't transpile (so these keep their hand-written IR under `--from-wasm`):**
@@ -1125,9 +1125,9 @@ fn transpile_wasm_to_ir(wasm: &[u8]) -> Result<(String, u32), String> {
 }
 
 /// Interface benchmark — **scalar host round-trip.** Each iteration makes one guest→host→guest
-/// crossing: Temen `cap.call` (op 0) through the trampoline thunk vs a Wasmtime imported function
+/// crossing: Temen `call.cap` (op 0) through the trampoline thunk vs a Wasmtime imported function
 /// `host.op`, both `x -> x+1`. The subtraction isolates the per-call boundary cost. (Today Temen's
-/// `cap.call` lowers to a *generic* indirect thunk that packs args into an array — the
+/// `call.cap` lowers to a *generic* indirect thunk that packs args into an array — the
 /// devirtualize-to-direct-call optimization, D45, is deferred — so this is the honest baseline a
 /// future inlining win will move.)
 fn hostcall_kernel() -> Resolved {
@@ -1147,7 +1147,7 @@ block 1 (v3: i64, v4: i64, v5: i64) {
 }
 block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i32.const 0
-  v11 = cap.call 0 0 (i64) -> (i64) v10(v9)
+  v11 = call.cap 0 0 (i64) -> (i64) v10(v9)
   v12 = i64.add v8 v11
   v13 = i64.const 1
   v14 = i64.add v9 v13
@@ -1185,7 +1185,7 @@ block 3 (v15: i64) {
 
 /// Interface benchmark — **zero-copy borrow buffer (the strongest §1a claim).** Each iteration
 /// hands the host a `(ptr, len)` buffer the host reads **in place** from the window (§7) and
-/// sums — no marshalling, no copy-out. Temen `cap.call` (op 1) passes the window base to the thunk
+/// sums — no marshalling, no copy-out. Temen `call.cap` (op 1) passes the window base to the thunk
 /// directly; the Wasmtime import `host.sum` must fetch the exported `memory` and slice it. Both
 /// are zero-copy in a *core* embedding (the larger §1a win is vs the component model's lift/lower,
 /// not measured here), so this isolates the per-call buffer-access overhead. Buffer is 64 B of
@@ -1209,7 +1209,7 @@ block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i32.const 0
   v11 = i64.const 0
   v12 = i64.const 64
-  v13 = cap.call 0 1 (i64, i64) -> (i64) v10(v11, v12)
+  v13 = call.cap 0 1 (i64, i64) -> (i64) v10(v11, v12)
   v14 = i64.add v8 v13
   v15 = i64.const 1
   v16 = i64.add v9 v15
@@ -1501,7 +1501,7 @@ fn wasm_entry_host(engine: &Engine, wasm: &[u8]) -> (Store<HostState>, TypedFunc
     let module = Module::new(engine, wasm).expect("wasmtime compile");
     let mut linker: Linker<HostState> = Linker::new(engine);
     // Imports use the temen-wasm host-ABI convention (module = capability type_id, name = op) so the
-    // *same WAT* transpiles to `cap.call <type_id> <op>` under `--from-wasm`: "0"/"0" → op 0 (scalar
+    // *same WAT* transpiles to `call.cap <type_id> <op>` under `--from-wasm`: "0"/"0" → op 0 (scalar
     // x+1), "0"/"1" → op 1 (sum a borrow buffer), matching `bench_thunk`'s op dispatch.
     linker
         .func_wrap("0", "0", |x: i64| -> i64 { x.wrapping_add(1) })
@@ -1948,8 +1948,8 @@ fn print_table(results: &[(Resolved, Raw)]) {
          Expect: alu compute ≈1× vs wasm; cold-start <1×.  Memory: wasm32 < temen always (guard\n\
          pages are free); temen < wasm64 once addresses *vary* (scatter) so Wasmtime can't\n\
          CSE the bounds check — memsum (same addr) lets it, so wasm64 looks ~tied there.\n\
-         Interface (host calls, §1a): `hostcall` (scalar cap.call vs a wasm import) is temen-\n\
-         slower today — cap.call is a generic arg-packing thunk; devirtualization (D45) is\n\
+         Interface (host calls, §1a): `hostcall` (scalar call.cap vs a wasm import) is temen-\n\
+         slower today — call.cap is a generic arg-packing thunk; devirtualization (D45) is\n\
          deferred. `hostbuf` (a zero-copy (ptr,len) borrow buffer the host reads in place)\n\
          is temen-faster even vs a cached-memory wasm import — the §7 win. Host kernels have no\n\
          interp/native lane (`—`); their ns/ratio are per *host call* (N_big={N_HOST_BIG}).\n\

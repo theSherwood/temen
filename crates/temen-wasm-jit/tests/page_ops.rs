@@ -35,7 +35,7 @@ block 0 (v0: i64) {
   voff = i64.const 0
   vlen = i64.const 4096
   vprot = i32.const 1
-  vr = cap.call 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vr = call.cap 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
   return vr
   }
 }
@@ -73,7 +73,7 @@ block 0 (v0: i64) {
   vro = i64.const 0
   vlen = i64.const 4096
   vprot = i32.const 3
-  vr = cap.call 4 0 (i64, i64, i64, i32) -> (i64) vh (vwo, vro, vlen, vprot)
+  vr = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vh (vwo, vro, vlen, vprot)
   return vr
   }
 }
@@ -117,7 +117,7 @@ block 0 (v0: i64) {
   voff = i64.const 0
   vlen = i64.const 4096
   vprot = i32.const 1
-  vr = cap.call 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vr = call.cap 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
   v1 = call 1 (vr)
   return v1
   }
@@ -167,7 +167,7 @@ fn tierup_page_op_module_emits_nothing() {
 
 // The grow split (#717): the same orchestrator+leaf shape but with `map` (op 0) instead of
 // `protect` — a guest growing its heap. The map-containing func 0 stays on the interpreter (a
-// remapping cap.call is not in-subset), but the pure leaf must now be eligible: growth is carried
+// remapping call.cap is not in-subset), but the pure leaf must now be eligible: growth is carried
 // to the emitted bounds check by the live `"mapped"` global, synced per call by the driver.
 const MAP_WITH_LEAF: &str = r#"memory 16
 func (i64) -> (i64) {
@@ -176,7 +176,7 @@ block 0 (v0: i64) {
   voff = i64.const 0
   vlen = i64.const 4096
   vprot = i32.const 3
-  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vr = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
   v1 = call 1 (vr)
   return v1
   }

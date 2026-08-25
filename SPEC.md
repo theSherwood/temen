@@ -127,7 +127,7 @@ verifier and the encoding.
   (AGENTS.md prime directive). The spec *cross-examines* them in CI; it does not
   *produce* them. Generating the verifier from the spec would also destroy the
   point — two independent statements must agree.
-- **No semantics for host / concurrency ops.** `cap.call`, `cont.*`,
+- **No semantics for host / concurrency ops.** `call.cap`, `cont.*`,
   `thread.*`, `wait`/`notify`, `GcRoots`, `SetJmp`/`LongJmp` etc. get typing +
   encoding rows only. Their semantics are host- and interleaving-dependent and
   already have better-suited harnesses (`explore_all`, dpor, loom, the
@@ -159,7 +159,7 @@ e.g. `IntBin{I32, DivS}` is one row, roughly 200 scalar + 80 SIMD rows total):
 | field | contents |
 |---|---|
 | `id` | mnemonic, matching `temen-text` exactly (e.g. `i32.div_s`) |
-| `typing` | operand `ValType`s → result `ValType`s, as data; ops whose rule isn't a fixed signature (`select`'s polymorphism, calls, `br_table`, `cap.call`) are flagged `Bespoke` and handled by the reference verifier in code |
+| `typing` | operand `ValType`s → result `ValType`s, as data; ops whose rule isn't a fixed signature (`select`'s polymorphism, calls, `br_table`, `call.cap`) are flagged `Bespoke` and handled by the reference verifier in code |
 | `encoding` | expected opcode byte(s), re-stating `temen-encode`'s `mod op` map (family base + `index()`) as checked data |
 | `class` | `Pure` / `Trapping` / `Memory` / `Control` / `Host` / `Concurrency` |
 | `eval` | for `Pure`/`Trapping` scalar+SIMD rows: `fn(&[Val]) -> Result<Val, TrapKind>` — the reference semantics |

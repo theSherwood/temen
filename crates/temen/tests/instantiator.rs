@@ -28,8 +28,8 @@ fn nest_src(off: u64, size_log2: u64) -> String {
          \x20 v2 = i64.const {off}\n\
          \x20 v3 = i64.const {size_log2}\n\
          \x20 v4 = i64.const 0\n\
-         \x20 v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)\n\
-         \x20 v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)\n\
+         \x20 v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)\n\
+         \x20 v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)\n\
          \x20 return v6\n\
            }}\n\
          }}\n\
@@ -133,8 +133,8 @@ fn nesting_composes_to_depth_two() {
          \x20 i64.store q0a5 q0v4\n\
          \x20 q0a6 = i64.const 1200\n\
          \x20 i64.store q0a6 q0v4\n\
-         \x20 v5 = cap.call 6 17 (i64) -> (i32) v0 (q0a0)\n\
-         \x20 v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)\n\
+         \x20 v5 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)\n\
+         \x20 v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)\n\
          \x20 return v6\n\
            }\n\
          }\n\
@@ -164,8 +164,8 @@ fn nesting_composes_to_depth_two() {
          \x20 i64.store q1a5 q1v4\n\
          \x20 q1a6 = i64.const 1264\n\
          \x20 i64.store q1a6 q1v4\n\
-         \x20 v8 = cap.call 6 17 (i64) -> (i32) v1 (q1a0)\n\
-         \x20 v9 = cap.call 6 1 (i32) -> (i64) v1 (v8)\n\
+         \x20 v8 = call.cap 6 17 (i64) -> (i32) v1 (q1a0)\n\
+         \x20 v9 = call.cap 6 1 (i32) -> (i64) v1 (v8)\n\
          \x20 return v9\n\
            }\n\
          }\n\
@@ -246,8 +246,8 @@ fn child_manages_its_own_pages_via_address_space() {
          \x20 i64.store q2a5 q2v4\n\
          \x20 q2a6 = i64.const 1328\n\
          \x20 i64.store q2a6 q2v4\n\
-         \x20 v5 = cap.call 6 17 (i64) -> (i32) v0 (q2a0)\n\
-         \x20 v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)\n\
+         \x20 v5 = call.cap 6 17 (i64) -> (i32) v0 (q2a0)\n\
+         \x20 v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)\n\
          \x20 return v6\n\
            }\n\
          }\n\
@@ -256,7 +256,7 @@ fn child_manages_its_own_pages_via_address_space() {
          \x20 v2 = i32.wrap_i64 v1\n\
          \x20 v3 = i64.const 0\n\
          \x20 v4 = i64.const 16384\n\
-         \x20 v5 = cap.call 5 1 (i64, i64) -> (i64) v2 (v3, v4)\n\
+         \x20 v5 = call.cap 5 1 (i64, i64) -> (i64) v2 (v3, v4)\n\
          \x20 return v5\n\
            }\n\
          }\n";
@@ -313,7 +313,7 @@ fn instantiate_rejects_out_of_range_carve() {
          \x20 i64.store q3a5 q3v4\n\
          \x20 q3a6 = i64.const 1392\n\
          \x20 i64.store q3a6 q3v4\n\
-         \x20 v5 = cap.call 6 17 (i64) -> (i32) v0 (q3a0)\n\
+         \x20 v5 = call.cap 6 17 (i64) -> (i32) v0 (q3a0)\n\
          \x20 v6 = i64.extend_i32_s v5\n\
          \x20 return v6\n\
            }\n\
@@ -357,8 +357,8 @@ fn child_trap_propagates_on_join() {
          \x20 i64.store q4a5 q4v1\n\
          \x20 q4a6 = i64.const 4400\n\
          \x20 i64.store q4a6 q4v1\n\
-         \x20 v5 = cap.call 6 17 (i64) -> (i32) v0 (q4a0)\n\
-         \x20 v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)\n\
+         \x20 v5 = call.cap 6 17 (i64) -> (i32) v0 (q4a0)\n\
+         \x20 v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)\n\
          \x20 return v6\n\
            }\n\
          }\n\

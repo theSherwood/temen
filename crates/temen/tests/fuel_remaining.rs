@@ -15,7 +15,7 @@ const FUEL_READBACK: &str = "\
 func () -> (i64) {
 block 0 () {
   vz = i32.const 0
-  vr = cap.call 4294967295 13 () -> (i64) vz ()
+  vr = call.cap 4294967295 13 () -> (i64) vz ()
   return vr
   }
 }
@@ -28,7 +28,7 @@ const FUEL_METER: &str = "\
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   vz = i32.const 0
-  vbefore = cap.call 4294967295 13 () -> (i64) vz ()
+  vbefore = call.cap 4294967295 13 () -> (i64) vz ()
   br 1(v0, vbefore)
 }
 block 1 (v1: i32, vb: i64) {
@@ -38,7 +38,7 @@ block 1 (v1: i32, vb: i64) {
 }
 block 2 (vb2: i64) {
   vzz = i32.const 0
-  vafter = cap.call 4294967295 13 () -> (i64) vzz ()
+  vafter = call.cap 4294967295 13 () -> (i64) vzz ()
   vcost = i64.sub vb2 vafter
   return vcost
   }

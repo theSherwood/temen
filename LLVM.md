@@ -205,7 +205,7 @@ The MVP target is the subset the chibicc demos already exercise. Mapping sketch 
 - `phi` → **block parameters** (§1; the headline simplification).
 - `select` → `select` (branchless, §3b).
 - host calls: LLVM has no capability notion — the C-runtime entry (`write`/`exit`/`malloc`
-  over `cap.call`, §3b/§3d) is the same powerbox wiring chibicc uses; the translator binds
+  over `call.cap`, §3b/§3d) is the same powerbox wiring chibicc uses; the translator binds
   the libc surface to capabilities, it does not invent imports.
 
 **Intrinsics (MVP):** `llvm.memcpy`/`memset`/`memmove` → the loop/bulk lowering (cf.
@@ -703,8 +703,8 @@ Chromium/V8:** the tab evaluates JS and prints correct output (incl. shortest fl
 emitter changes closed the gap (all in `temen-wasm-jit`): (1) **§12 atomics** — lowered to a
 single-threaded load/(rmw)/store sequence + alignment trap (a JIT-tier guest is concurrency-free, so
 this is observably identical to a hardware atomic *and* stays differential-testable on `wasmi`, which
-has no threads); (2) **`cap.self.resolve` outlining** — the powerbox `_start` synth's only
-out-of-subset op, hoisted into a cross-tier wrapper like `cap.call`, so func 0 itself becomes
+has no threads); (2) **`self.resolve` outlining** — the powerbox `_start` synth's only
+out-of-subset op, hoisted into a cross-tier wrapper like `call.cap`, so func 0 itself becomes
 emittable; (3) **per-type pooled locals** — the emitter reused block-value locals across blocks, so
 `JS_CallInternal` dropped from 373646 locals (past V8's per-function cap) to 356. The single-shot
 module JIT path (`temen_onramp_jit_run_*` → `compile_module_reactor` rooted at `_start`) emits **1176 of
@@ -726,7 +726,7 @@ contaminate any path that calls them (e.g. `-7 % 3` → `fmod`); the committed d
 link real openlibm, so CI is clean.
 
 **wasm-JIT tier — QuickJS's `_start` now emits and runs ~6× the interpreter, byte-identical** (see
-the "wasm-JIT tier — ★ DONE" note above for the three emitter changes: §12 atomics, `cap.self.resolve`
+the "wasm-JIT tier — ★ DONE" note above for the three emitter changes: §12 atomics, `self.resolve`
 outlining, per-type pooled locals). The playground JS tab's "wasm-JIT" toggle runs the whole engine on
 emitted wasm; "Prove interp ≡ JIT" confirms identical stdout.
 
@@ -738,7 +738,7 @@ playground tab~~ **done** (interp tier, real Chromium/V8); (g) ~~regex / `try`/`
 **done** (`demo_quickjs_breadth_vs_native`); ~~the open breadth item is **BigInt**~~ **done** (ISSUES.md
 I25 — an i128-large-constant translator bug, now fixed; the full JS surface runs byte-identical); (h)
 ~~the **`temen-wasm-jit` emitter gap** so the JIT tier lights up (speed)~~ **done** — QuickJS emits and
-runs ~6× the interpreter, byte-identical (atomics + `cap.self.resolve` outlining + pooled locals; see
+runs ~6× the interpreter, byte-identical (atomics + `self.resolve` outlining + pooled locals; see
 the "wasm-JIT tier — ★ DONE" note); (i) the `run-test262.c` harness over an embedded slice — the
 self-validating suite, QuickJS's analog of SQLite's sqllogictest.
 
@@ -1305,7 +1305,7 @@ which is a *separate* wide-vector-type gap) whose inputs `0x0N000000` byte-swap 
 **★ Milestone:** this was the *last translate gap*. The whole Postgres backend — **832 modules /
 14 985 functions** — now translates through the on-ramp with `--stub-externs`, no fail-closed. The
 remaining step to a *verified* module: after `temen_ir::resolve_imports` binds the 4 powerbox caps
-(`read`/`write`/`exit`/`vm_map` → `cap.call`), `temen-verify` reports one **`TypeMismatch`** (an `i32` fed
+(`read`/`write`/`exit`/`vm_map` → `call.cap`), `temen-verify` reports one **`TypeMismatch`** (an `i32` fed
 where `i64` is expected) in `ExecRenameStmt` — a translator correctness bug, the next slice. (Before
 that resolve step a raw `CallImport` is expected and correctly rejected by the verifier §7.) Then the
 **runtime** (initdb data dir + `fs` cap, storage manager, WAL, single-process shmem, catalog bootstrap).
@@ -1770,7 +1770,7 @@ mirrors the chibicc lowering exactly:
 - **§GC** — `__vm_gc_roots(lo, hi, mask, buf, cap)` → `gc.roots` (conservative root enumeration; `mask`
   is the §GC tagged-pointer payload mask, top-byte-strip only — pass `~0UL` for untagged).
 - **§7 reflection** — `__vm_cap(i)` reads the handle stash (`i32.load` at `i*4`); `__vm_cap_count`/
-  `__vm_cap_at` → `cap.self.count`/`cap.self.get`.
+  `__vm_cap_at` → `self.count`/`self.get`.
 Tests (`translate.rs`): `vm_memory_map_and_page_size` (map a page at 256 MiB + page-size, end-to-end
 on the JIT powerbox), `vm_fibers_generator`, `vm_atomics_single_threaded` (both backends),
 `vm_futex_wait_notify`, `vm_threads_atomic_counter` (4×500 = 2000 on the M:N executor),
@@ -1822,7 +1822,7 @@ its validator + call_indirect table). The host verifies + Cranelift-compiles the
 **Slice AF (DONE) — SharedRegion (§13/§14); completes the `<temen.h>` surface.** Guest-minted shareable
 memory now lowers on the on-ramp: `__vm_region_create(len)` mints a region from the stashed
 `AddressSpace` handle (slot 4; import `vm_region_create` → `AddressSpace` op 5) and returns a **region
-handle**; `__vm_region_map`/`unmap`/`page_size` then `cap.call` *that* region handle (their first C
+handle**; `__vm_region_map`/`unmap`/`page_size` then `call.cap` *that* region handle (their first C
 arg — not a stash slot; imports → `SharedRegion` ops 0/1/3) to alias the region's bytes into the
 window. A region-minting program is granted the **5-handle powerbox** (`synth_start`'s prefix reaches
 AddressSpace). This is the magic-ring-buffer / zero-copy parent↔child data plane (DESIGN §13/§14).
@@ -2286,9 +2286,9 @@ The unmodified official `testes/files.lua` runs green on all three engines
 importantly, the general mechanism they ride on:
 
 - **Host-defined capabilities from C** (two new on-ramp builtins, both generic): `__vm_cap_resolve`
-  (§7 `cap.self.resolve` — resolve an embedder-granted capability by *name* at runtime, the
+  (§7 `self.resolve` — resolve an embedder-granted capability by *name* at runtime, the
   complement of the fixed 8-slot stash for capabilities granted outside the §3e prefix) and
-  `__vm_host_call` (`cap.call HOST_FN op handle(a,b,c,d)` — the bridge to an **embedder-registered**
+  `__vm_host_call` (`call.cap HOST_FN op handle(a,b,c,d)` — the bridge to an **embedder-registered**
   `HostFn`, the wasm-import analogue). The translator stays pure mechanism: no fs semantics live in
   it, and *any* embedder capability is now reachable from C. No stash/ABI change.
 - **A configurable Fs capability** (`temen_run::fs`, *not* part of the default powerbox): a 7-op
@@ -2773,7 +2773,7 @@ Cranelift code runs on the real native control stack, so `longjmp` must restore 
 and `Inst::LongJmp` to `rt_setjmp_lookup` (find, or write the `SetjmpFault` trap cell on a miss — a
 fail-closed §3b totality check) then an inline `call _longjmp`. The libc `_setjmp`/`_longjmp` addresses
 are baked **directly** as the call targets (not via a Rust thunk, whose frame would be gone by
-`longjmp` time), mirroring the `cap.call`/fiber-thunk "call-to-baked-host-address" template. Gated to
+`longjmp` time), mirroring the `call.cap`/fiber-thunk "call-to-baked-host-address" template. Gated to
 the `setjmp_rt` cfg (= `fiber_rt && unix`; built in `build.rs`) — Windows `setjmp` is SEH-coupled, a
 follow-on, and there the JIT keeps declining and the interpreters cover it. A §14 JIT child using
 `setjmp`, and any module mixing `setjmp` with fibers/threads, are **fail-closed-declined** (no per-child
@@ -2815,9 +2815,9 @@ differential (all three engines == native, incl. value-live-across-setjmp + nest
    rt_setjmp_slot(ctx, operand(buf))`, then **inline** `r = call _setjmp(slot)`, bind `r` (i32) as the
    result. `Inst::LongJmp { buf, val }` → `slot = call rt_setjmp_lookup(ctx, operand(buf))`, then `call
    _longjmp(slot, operand(val))` (noreturn; the trailing `unreachable` is dead). Bake `&_setjmp`/`&_longjmp`
-   as call-target constants (declare them `extern "C"`), exactly as `cap.call` bakes `cap_thunk as usize as
+   as call-target constants (declare them `extern "C"`), exactly as `call.cap` bakes `cap_thunk as usize as
    i64` and the fiber thunks bake their addresses — the **call-to-baked-host-address template** is the
-   `cap.call` / `cont.*` lowering already in the crate.
+   `call.cap` / `cont.*` lowering already in the crate.
 3. **Un-bail + gate.** Remove `SetJmp`/`LongJmp` from the JIT's `_ => Err(JitError::Unsupported)` path (the
    supportedness check ~`crates/temen-jit/src/lib.rs:3640`, the `if cfg!(fiber_rt)` block just above lists
    the ops needing the runtime). Gate to the Unix targets first (like `fiber_rt`); the interpreters cover
@@ -3471,8 +3471,8 @@ with *unpatched* std — modern std's leaf modules (`sys/{alloc,thread_local,ran
 a handful of `temen` leaf-arms + one allocator `imp`.
 
 **The seam — how `std` reaches temen-posix.** Two mechanisms:
-1. **Generic host-call bridge (primary).** `__vm_cap_resolve("posix")` → a handle (§7 `cap.self.resolve`);
-   `__vm_host_call(handle, op, a, b, c, d)` → `cap.call HOST_PROC`. The PAL declares these two `extern "C"`
+1. **Generic host-call bridge (primary).** `__vm_cap_resolve("posix")` → a handle (§7 `self.resolve`);
+   `__vm_host_call(handle, op, a, b, c, d)` → `call.cap HOST_PROC`. The PAL declares these two `extern "C"`
    symbols and speaks the `POSIX.md` §5 op table directly — **no allowlist growth, no per-name plumbing**.
    Constraints the PAL respects: `op` must be a **compile-time constant** at the LLVM call site (each op
    gets its own `#[inline(always)]` wrapper with a literal op — never a shared `fn call(op)`); the payload

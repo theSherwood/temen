@@ -3,7 +3,7 @@
 //! via `instantiate_module_named` (op 13) over a shared `fs`, instead of the native exec cap — so the
 //! phase children run on the tier-up-capable engine (slice 3a) rather than the tree-walker. This is the
 //! enabling first light: the on-ramp now lowers `__vm_instantiate`/`__vm_join` (§14 Instantiator ops 13
-//! and 1) to a `cap.call` on a name-resolved handle, so a real Rust guest — not a hand-written shell —
+//! and 1) to a `call.cap` on a name-resolved handle, so a real Rust guest — not a hand-written shell —
 //! can issue the spawn. The C precedent is `temen/tests/c_shell_exec.rs`; this is its Rust counterpart via
 //! the new builtins (the Rust on-ramp can't do chibicc's named-import passthrough, hence the builtins).
 //!
@@ -12,7 +12,7 @@
 //! child into a 128 KiB carve, and joins it. The child (a separate module) resolves `fs` by name and
 //! calls it — a granted counter returning `1`. So a correct run returns `1` and the shared counter
 //! ticks once. Window confinement (§2) is untouched: the `fs` grant is authority (§3), a cross-tier
-//! `cap.call`, not a window access.
+//! `call.cap`, not a window access.
 //!
 //! Gated to Linux + a present `rustc` (like the other on-ramp guest tests); skips cleanly otherwise.
 
@@ -34,8 +34,8 @@ block 0 (v0: i64) {
   i64.store vzero vname
   vp0 = i64.const 0
   vl2 = i64.const 2
-  vh = cap.self.resolve vp0 vl2
-  vr = cap.call 13 0 (i64) -> (i64) vh (vp0)
+  vh = self.resolve vp0 vl2
+  vr = call.cap 13 0 (i64) -> (i64) vh (vp0)
   return vr
   }
 }

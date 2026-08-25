@@ -7,7 +7,7 @@
 //! `new_confined_child_over_host` — the exact seam a JIT-tier nim phase child (a shared `fs`) uses. A
 //! grant-less child would run with the plain `new_confined_child`; the driver picks by whether a stash
 //! is present. Window confinement (§2) is untouched: the grant is authority (§3), a cross-tier
-//! `cap.call`, not a window access.
+//! `call.cap`, not a window access.
 
 use std::sync::{Arc, Mutex};
 use temen_interp::{bytecode, ForkedProc, Host, HostProc, Region, Trap, Value};
@@ -24,8 +24,8 @@ block 0 (v0: i64) {
   i64.store vzero vname
   vp0 = i64.const 0
   vl2 = i64.const 2
-  vh = cap.self.resolve vp0 vl2
-  vr = cap.call 13 0 (i64) -> (i64) vh (vp0)
+  vh = self.resolve vp0 vl2
+  vr = call.cap 13 0 (i64) -> (i64) vh (vp0)
   return vr
   }
 }
@@ -56,8 +56,8 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   voff = i64.const 65536
   vsl = i64.const 16
   vq = i64.const 0
-  vh = cap.call 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
-  vr = cap.call 6 1 (i32) -> (i64) v0 (vh)
+  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
+  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
   return vr
   }
 }

@@ -308,7 +308,7 @@ fn watchpoint_outside_the_accessed_range_does_not_fire() {
     assert_eq!(finished_ok(insp.run_until_stop()), vec![Value::I32(0)]);
 }
 
-// Writes "Hi" into the window then `cap.call 0 1` (Stream::write) of 2 bytes to a stdout handle
+// Writes "Hi" into the window then `call.cap 0 1` (Stream::write) of 2 bytes to a stdout handle
 // passed as v0 — the standard capability-using shape (§3c/§3e).
 const CAP_WRITE: &str = r#"
 memory 16
@@ -322,7 +322,7 @@ block 0 (v0: i32) {
   i32.store8 v3 v4
   v5 = i64.const 0
   v6 = i64.const 2
-  v7 = cap.call 0 1 (i64, i64) -> (i64) v0 (v5, v6)
+  v7 = call.cap 0 1 (i64, i64) -> (i64) v0 (v5, v6)
   return v7
   }
 }
@@ -356,7 +356,7 @@ fn cap_call_stop_pauses_at_the_host_boundary_before_the_effect() {
         } => {
             assert_eq!((type_id, op), (0, 1));
         }
-        other => panic!("expected cap.call stop, got {other:?}"),
+        other => panic!("expected call.cap stop, got {other:?}"),
     }
     assert_eq!(insp.read_ir_value(0, 0), Some(Value::I32(stdout)));
     assert!(
@@ -372,7 +372,7 @@ fn cap_call_stop_pauses_at_the_host_boundary_before_the_effect() {
 
 #[test]
 fn cap_call_stops_off_by_default() {
-    // Without the toggle, a cap.call is just another op — no pause.
+    // Without the toggle, a call.cap is just another op — no pause.
     let m = parse_module(CAP_WRITE).expect("parse");
     let mut host = Host::new();
     let stdout = host.grant_stream(StreamRole::Out);
@@ -715,8 +715,8 @@ fn seek_past_the_end_finishes() {
 const CLOCK_SUM: &str = r#"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = cap.call 2 0 () -> (i64) v0 ()
-  v2 = cap.call 2 0 () -> (i64) v0 ()
+  v1 = call.cap 2 0 () -> (i64) v0 ()
+  v2 = call.cap 2 0 () -> (i64) v0 ()
   v3 = i64.add v1 v2
   return v3
   }
@@ -766,7 +766,7 @@ func (i32) -> (i32) {
 block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = i64.const 2
-  v3 = cap.call 0 0 (i64, i64) -> (i64) v0 (v1, v2)
+  v3 = call.cap 0 0 (i64, i64) -> (i64) v0 (v1, v2)
   v4 = i64.const 0
   v5 = i32.load8_u v4
   return v5
@@ -813,8 +813,8 @@ fn captape_replays_stdin_read_into_the_buffer_for_faithful_seek() {
 const HOSTFN_SUM: &str = r#"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = cap.call 13 0 () -> (i64) v0 ()
-  v2 = cap.call 13 0 () -> (i64) v0 ()
+  v1 = call.cap 13 0 () -> (i64) v0 ()
+  v2 = call.cap 13 0 () -> (i64) v0 ()
   v3 = i64.add v1 v2
   return v3
   }
