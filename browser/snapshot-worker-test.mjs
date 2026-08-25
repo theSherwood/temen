@@ -31,7 +31,12 @@ const CARDS = [
     leakClean: (out) => out.includes('clean') && !out.includes('4242'),
   },
   {
-    name: 'Lua (5.4.7 — write & run)', asset: 'lua_snapshot.temen',
+    // Lua reaches lua_pcall's setjmp, so its `eval_run` routes to InterpDriven (#1081) and warm+JIT
+    // declines — the card runs on the warm interpreter instead (the documented fallback; also a
+    // correctness guard, since an emitted `luaV_execute` on a Lua-error longjmp path couldn't unwind).
+    // `jitDeclines` still ticks the JIT toggle and runs on the worker, but expects the warm-snapshot
+    // tier and no JIT compile, rather than an emitted warm+JIT tier.
+    name: 'Lua (5.4.7 — write & run)', asset: 'lua_snapshot.temen', jitDeclines: true,
     plain: ['print("hi", 6 * 7)\n', 'hi\t42'],
     heavy: ['local s=0; for i=1,200000 do s=s+i end; print("sum", s)\n', 'sum\t20000100000'],
     leakSet: 'leaked = 4242; print("set", leaked)\n',
@@ -92,9 +97,17 @@ try {
       if (st && st.ok && st.jitPrimed) break;
       await new Promise((r) => setTimeout(r, 250));
     }
-    st && st.ok && st.jitPrimed && st.compiles === 1 && st.hits === 0
-      ? ok(`${tag}: prewarm pre-compiled warm+JIT (compiles=1, hits=0 before any Run → first JIT Run is a cache hit)`)
-      : fail(`${tag}: prewarm did NOT prime the JIT compile: ${JSON.stringify(st)}`);
+    if (c.jitDeclines) {
+      // warm+JIT declines (setjmp-rooted eval_run → InterpDriven, #1081): the prime ran but found
+      // nothing wasm-drivable to compile, so compiles stays 0 and every Run uses the warm interpreter.
+      st && st.ok && st.jitPrimed && st.compiles === 0
+        ? ok(`${tag}: warm+JIT declines (setjmp, #1081) — prewarm compiled nothing (compiles=0); runs on warm-interp`)
+        : fail(`${tag}: expected a warm+JIT decline (jitPrimed, compiles=0): ${JSON.stringify(st)}`);
+    } else {
+      st && st.ok && st.jitPrimed && st.compiles === 1 && st.hits === 0
+        ? ok(`${tag}: prewarm pre-compiled warm+JIT (compiles=1, hits=0 before any Run → first JIT Run is a cache hit)`)
+        : fail(`${tag}: prewarm did NOT prime the JIT compile: ${JSON.stringify(st)}`);
+    }
   }
 
   for (const c of CARDS) {
@@ -115,9 +128,12 @@ try {
       await setSrc(c, c.heavy[0]);
       before = await workerRuns();
       r = await run(c);
-      if (r.state === 'done' && r.stdout.includes(c.heavy[1]) && r.label.includes('warm+JIT')) ok(`${tag}: warm+JIT on the worker → ${JSON.stringify(r.stdout.trim())}`);
+      // A JIT-declining card ticks the toggle but falls back to the warm-snapshot (warm-interp) tier;
+      // it must still run correctly on the worker, just labeled warm-snapshot rather than warm+JIT.
+      const wantTier = c.jitDeclines ? 'warm-snapshot' : 'warm+JIT';
+      if (r.state === 'done' && r.stdout.includes(c.heavy[1]) && r.label.includes(wantTier)) ok(`${tag}: ${c.jitDeclines ? 'warm+JIT toggle → warm-interp fallback' : 'warm+JIT'} on the worker → ${JSON.stringify(r.stdout.trim())}`);
       else fail(`${tag} warm+JIT: state=${r.state} label=${r.label} stdout=${JSON.stringify(r.stdout)}`);
-      (await workerRuns()) > before ? ok(`${tag}: warm+JIT ran on the worker (counter +1)`) : fail(`${tag}: warm+JIT did NOT run on the worker`);
+      (await workerRuns()) > before ? ok(`${tag}: ${c.jitDeclines ? 'warm+JIT toggle Run' : 'warm+JIT'} ran on the worker (counter +1)`) : fail(`${tag}: warm+JIT did NOT run on the worker`);
     }
 
     // fresh-per-Run isolation: a global in one Run must not leak into the next (snapshot restored each Run).
@@ -137,6 +153,10 @@ try {
     const st = await statsOf(c);
     if (c.noJit) {
       st && st.ok && st.compiles === 0 ? ok(`${tag}: warm-snapshot-only — no JIT compiled (compiles=0)`) : fail(`${tag}: unexpected JIT compile: ${JSON.stringify(st)}`);
+    } else if (c.jitDeclines) {
+      st && st.ok && st.compiles === 0
+        ? ok(`${tag}: warm+JIT declines (setjmp, #1081) — no JIT compiled (compiles=0), warm-interp carried every Run`)
+        : fail(`${tag}: expected no JIT compile for a declining card: ${JSON.stringify(st)}`);
     } else {
       st && st.ok && st.compiles === 1 && st.hits >= 1
         ? ok(`${tag}: warm+JIT Run reused the pre-compiled instance (compiles=1, hits=${st.hits})`)
