@@ -1052,6 +1052,47 @@ int main(void) {
     );
 }
 
+/// #1080 rung 3 — the **any-child** blocking wait (`waitpid(-1)` → `ParkEvent::TaskExitAny` → the
+/// driver's `BlockedReapPersonality { child: None }` park) on the bytecode engine. The parent forks a
+/// slow twin and blocks in `waitpid(-1)`; the settle scan wakes it when ANY forked child completes, and
+/// the re-executed wait returns the twin's pid + `WEXITSTATUS`. Differentialled against the tree-walker
+/// (both engines must return 42) — covers the wildcard reap path job control uses.
+#[test]
+fn c_a_personality_fork_and_waitpid_any_child_differential() {
+    let src = r#"
+long __px_fork(int cap, long a);
+long __px_waitpid(int cap, long pid, long status, long opts);
+static int status;
+static volatile long acc;
+static long pid;
+int main(void) {
+  pid = __px_fork(0, 0);
+  if (pid < 0) return 1;
+  if (pid == 0) {
+    for (long i = 0; i < 30000; i = i + 1) acc = acc + 1;  /* slow: the parent must BLOCK */
+    return 7;
+  }
+  long h = __px_waitpid(0, -1, (long)&status, 0);          /* ANY child, blocking */
+  if (h != pid) return 3;                                   /* reaped the twin, got its pid */
+  if ((status & 0x7f) != 0) return 4;                       /* clean exit, not a signal death */
+  if (((status >> 8) & 0xff) != 7) return 5;                /* WEXITSTATUS = the twin's 7 */
+  return 42;
+}
+"#;
+    let interp = run_interp_only(src, |_| {});
+    assert_eq!(
+        interp.result,
+        vec![Value::I32(42)],
+        "tree-walker any-child reap"
+    );
+    let byte = run_bytecode_only(src, |_| {});
+    assert_eq!(
+        byte.result,
+        vec![Value::I32(42)],
+        "bytecode any-child (waitpid(-1)) reap matched the oracle"
+    );
+}
+
 /// #799 — **fork × default-actions × blocking-waitpid, personality-only**: the parent forks a
 /// runaway twin (spins forever, no handlers), kills it with an unhandled `SIGTERM` (#796's
 /// default-terminate through the kill door — the twin's doors minted at fork), and the blocking
