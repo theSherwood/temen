@@ -7602,10 +7602,10 @@ long __vm_jit_uninstall(long slot);\n";
         .memory
         .expect("powerbox program declares a window")
         .size_log2;
-    let src = src0.replace("eb(buf, 16);", &format!("eb(buf, {s});"));
+    let src = src0.replace("eb(buf, 17);", &format!("eb(buf, {s});"));
     assert_ne!(
         src, src0,
-        "expected to patch the blob memory descriptor `eb(buf, 16);`"
+        "expected to patch the blob memory descriptor `eb(buf, 17);`"
     );
 
     let Some(bc) = compile_to_ll("jit_demo", &src) else {
@@ -7651,10 +7651,10 @@ fn vm_jit_threads_demo() {
         .memory
         .expect("powerbox program declares a window")
         .size_log2;
-    let src = src0.replace("eb(&e, 16);", &format!("eb(&e, {s});"));
+    let src = src0.replace("eb(&e, 17);", &format!("eb(&e, {s});"));
     assert_ne!(
         src, src0,
-        "expected to patch the blob memory descriptor `eb(&e, 16);`"
+        "expected to patch the blob memory descriptor `eb(&e, 17);`"
     );
 
     let Some(bc) = compile_libc_src_to_ll("jit_threads", &src) else {
