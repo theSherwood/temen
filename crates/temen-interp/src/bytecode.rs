@@ -3374,6 +3374,8 @@ impl<'p> Vcpu<'p> {
                 // single-vCPU path has none, so fail closed like `Exec`/`CloneCaller`.
                 | Ok(VcpuStop::ForkSelf { .. })
                 | Ok(VcpuStop::ReapWait { .. })
+                | Ok(VcpuStop::PipeRead { .. })
+                | Ok(VcpuStop::PipeWrite { .. })
                 // I48: `BlockOnFiber` is a cooperative-driver idle (this path passes
                 // `cooperative: false`, so it never arises here); fail closed like its neighbours.
                 | Ok(VcpuStop::BlockOnFiber { .. }) => return VcpuEvent::Trapped(Trap::ThreadFault),
@@ -8235,6 +8237,17 @@ enum Outcome {
     ReapWait {
         child: Option<usize>,
     },
+    /// #1080 rung 4 — a personality blocking pipe **read** on an empty FIFO with writers still open: the
+    /// op was rewound, the driver parks the task on the pipe (`pipe` = the domain-local index) and the
+    /// settle scan re-admits it when the FIFO has bytes or every writer closed (EOF). Cooperative-only.
+    PipeRead {
+        pipe: u32,
+    },
+    /// #1080 rung 4 (backpressure) — a personality blocking pipe **write** to a full FIFO with readers
+    /// still open: rewound + parked, re-admitted when the FIFO has room or every reader closed (`-EPIPE`).
+    PipeWrite {
+        pipe: u32,
+    },
     /// §14 `Instantiator.instantiate`: the authority `(ibase, isize)` is resolved; the driver builds a
     /// **confined executor child** running entry `entry` over `[ibase+off, +2^size_log2)` with its own
     /// attenuated powerbox and `quota` fuel, registers it (handle = thread slot), and writes the handle
@@ -8973,6 +8986,14 @@ enum VcpuStop {
     ReapWait {
         child: Option<usize>,
     },
+    /// #1080 rung 4 — a personality blocking pipe read/write surfaced to the cooperative driver
+    /// ([`Outcome::PipeRead`]/[`Outcome::PipeWrite`]). `pipe` is the parker's domain-local pipe index.
+    PipeRead {
+        pipe: u32,
+    },
+    PipeWrite {
+        pipe: u32,
+    },
     Done(Vec<Value>),
     /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): run the emitted `f{func}` region on the
     /// host, delivering its `n_results` results to absolute slot `dst` via `deliver_tierup`.
@@ -9449,6 +9470,8 @@ fn step_vcpu(
                 })
             }
             Outcome::ForkSelf { dst } => return Ok(VcpuStop::ForkSelf { dst }),
+            Outcome::PipeRead { pipe } => return Ok(VcpuStop::PipeRead { pipe }),
+            Outcome::PipeWrite { pipe } => return Ok(VcpuStop::PipeWrite { pipe }),
             Outcome::ReapWait { child } => return Ok(VcpuStop::ReapWait { child }),
             Outcome::Instantiate {
                 ibase,
@@ -9662,6 +9685,20 @@ enum TaskState {
     /// the pid) against the twin it has by then retired (Live → Zombie via the fired exit hooks).
     BlockedReapPersonality {
         child: Option<usize>,
+    },
+    /// #1080 rung 4 — parked in a blocking personality pipe **read** on an empty FIFO (writers open). The
+    /// read op was rewound; the settle scan polls the shared FIFO via `pipe_read_ready(pipe)` (`pipe` =
+    /// this task's domain-local index into its env host's pipe table) and re-admits when bytes arrive or
+    /// every writer closed (EOF), so the re-executed read completes / EOFs. The cooperative analogue of
+    /// the tree-walker's `Blocked::PipeRead` — polled, not held in a `pipe_waiters` map.
+    BlockedPipeRead {
+        pipe: u32,
+    },
+    /// #1080 rung 4 (backpressure) — parked in a blocking personality pipe **write** to a full FIFO
+    /// (readers open); re-admitted by `pipe_write_ready(pipe)` (room under `PIPE_CAP`, or all readers gone
+    /// → the re-run `-EPIPE`s). The write twin of [`Self::BlockedPipeRead`].
+    BlockedPipeWrite {
+        pipe: u32,
     },
     /// I48 — parked in a blocking `cont.resume.block` on fiber `fiber` (event-parked, not yet woken).
     /// The resumer's cursor was rewound to the resume op; when `fiber` is woken (idle-timer, notify,
@@ -10028,7 +10065,14 @@ impl CoopSched {
                 })
                 .collect();
             for (ti2, status, k) in to_hook {
-                let hooks = extra_envs[k].host.lock_unpoisoned().exit_hooks.clone();
+                let hooks = {
+                    let g = extra_envs[k].host.lock_unpoisoned();
+                    // #1080 rung 4 — release this task's pipe ends at exit (the tree-walker's exit-time
+                    // `drop_all_pipe_*`) so a peer reader sees EOF / a peer writer `-EPIPE`: its settle
+                    // poll then re-admits. Polling needs no explicit wake, so the zeroed ids are dropped.
+                    let _ = (g.drop_all_pipe_writers(), g.drop_all_pipe_readers());
+                    g.exit_hooks.clone()
+                };
                 for h in hooks {
                     h(status);
                 }
@@ -10081,6 +10125,31 @@ impl CoopSched {
                 })
                 .collect();
             for ci in reap_p_wakes {
+                tasks[ci].state = TaskState::Runnable;
+            }
+            // #1080 rung 4 — pipe wakes: the cooperative driver has no scheduler-side `pipe_waiters`, so
+            // it POLLS each parked reader/writer's shared FIFO here and re-admits (the rewound read/write
+            // re-executes) once ready. A reader/writer is usually a forked command (`env: Some`); a root
+            // task (`env: None`, a bash builtin over a pipe) checks the driver host.
+            let pipe_wakes: Vec<usize> = tasks
+                .iter()
+                .enumerate()
+                .filter_map(|(ci, t)| {
+                    let ready = match &t.state {
+                        TaskState::BlockedPipeRead { pipe } => match t.env {
+                            Some(k) => extra_envs[k].host.lock_unpoisoned().pipe_read_ready(*pipe),
+                            None => host.pipe_read_ready(*pipe),
+                        },
+                        TaskState::BlockedPipeWrite { pipe } => match t.env {
+                            Some(k) => extra_envs[k].host.lock_unpoisoned().pipe_write_ready(*pipe),
+                            None => host.pipe_write_ready(*pipe),
+                        },
+                        _ => return None,
+                    };
+                    ready.then_some(ci)
+                })
+                .collect();
+            for ci in pipe_wakes {
                 tasks[ci].state = TaskState::Runnable;
             }
             // I48 — wake blocking-resume idlers: a `TaskState::BlockedOnFiber { fiber }` becomes
@@ -10770,6 +10839,14 @@ impl CoopSched {
                     // wake). Park until the named child completes; the settle scan re-admits it after
                     // firing the twin's exit hooks, so the re-executed op finds the twin retired.
                     tasks[ti].state = TaskState::BlockedReapPersonality { child };
+                }
+                Ok(VcpuStop::PipeRead { pipe }) => {
+                    // #1080 rung 4 — park this task on a blocking pipe read; the settle scan polls
+                    // `pipe_read_ready` and re-admits (the rewound read re-executes) when ready.
+                    tasks[ti].state = TaskState::BlockedPipeRead { pipe };
+                }
+                Ok(VcpuStop::PipeWrite { pipe }) => {
+                    tasks[ti].state = TaskState::BlockedPipeWrite { pipe };
                 }
                 Ok(VcpuStop::Spawn {
                     func,
@@ -12259,9 +12336,11 @@ fn run_vcpu_parallel<'scope, 'env>(
             | Ok(VcpuStop::Reap { .. })
             // `exec_module` image-replace is cooperative-driver-only (needs the task/env set).
             | Ok(VcpuStop::Exec { .. })
-            // #1080 rung 3 — personality `fork()`/`waitpid()` parks are cooperative-driver-only.
+            // #1080 rung 3/4 — personality `fork()`/`waitpid()`/pipe parks are cooperative-driver-only.
             | Ok(VcpuStop::ForkSelf { .. })
             | Ok(VcpuStop::ReapWait { .. })
+            | Ok(VcpuStop::PipeRead { .. })
+            | Ok(VcpuStop::PipeWrite { .. })
             | Ok(VcpuStop::BlockOnFiber { .. }) => return (Err(Trap::ThreadFault), mem),
             Err(trap) => return (Err(trap), mem),
             Ok(VcpuStop::Done(vals)) => return (Ok(vals), mem),
@@ -13628,6 +13707,38 @@ impl Vm {
                     for a in args.iter() {
                         argv.push(r!(*a).i64());
                     }
+                    // FORK.md §8.6 / #1080 rung 4 — `pipe(fds)` (CAP_SELF op 16): mint a host-served pipe
+                    // into this domain's powerbox and write `fds[0]` = read end, `fds[1]` = write end
+                    // (POSIX order) as two i32s at the guest pointer. The tree-walker handles this in its
+                    // eval loop (not `cap_dispatch_slots`), so the bytecode engine services it here rather
+                    // than in the generic dispatch below. `-EMFILE` on a full table, `-EFAULT` on a bad ptr.
+                    if *type_id == temen_ir::CAP_SELF_TYPE_ID && *op == super::CAP_SELF_PIPE {
+                        let fds_ptr = argv.first().copied().unwrap_or(0) as u64;
+                        let minted = host.with(|p| p.try_grant_pipe());
+                        let r = match minted {
+                            None => super::EMFILE,
+                            Some((w, rd)) => match mem.as_ref() {
+                                // Validate the 8-byte `int fds[2]` is in-window (else `-EFAULT`), then
+                                // write `fds[0]` = read end, `fds[1]` = write end at absolute addresses.
+                                Some(m) if m.read_window(fds_ptr, 8).is_ok() => {
+                                    let base = m.window.base();
+                                    for (k, &b) in rd.to_le_bytes().iter().enumerate() {
+                                        m.set_byte(base + fds_ptr + k as u64, b);
+                                    }
+                                    for (k, &b) in w.to_le_bytes().iter().enumerate() {
+                                        m.set_byte(base + fds_ptr + 4 + k as u64, b);
+                                    }
+                                    0
+                                }
+                                _ => super::EFAULT,
+                            },
+                        };
+                        if !results.is_empty() {
+                            self.regs[base + *dst as usize] = Reg::from_i64(r);
+                        }
+                        pc += 1;
+                        continue;
+                    }
                     // §22: an **import-bound** `Jit` driver op (`invoke`/`install`/`uninstall`) can't be
                     // serviced by the generic `cap_dispatch_slots` — it needs the scheduler-owning
                     // driver, exactly like a *static* `cap.call (JIT, op)` (which lowers straight to
@@ -13792,6 +13903,29 @@ impl Vm {
                                 return Ok(Outcome::ReapWait { child: None });
                             }
                         }
+                    }
+                    // #1080 rung 4 — a personality blocking pipe read/write rides this dispatch (a
+                    // command's `read`/`write` are `call.sym` imports bound to pipe ends). DRAIN all four
+                    // pipe flags (so none leaks); a read on an empty FIFO with writers open, or a write to
+                    // a full FIFO with readers open, REWINDS the op and parks the task on the pipe — the
+                    // settle scan re-admits it when ready. The wake flags a write/close set need no action
+                    // here: the cooperative driver POLLS pipe readiness at the settle (no `pipe_waiters`).
+                    let pipe_read_park = host.with(|p| p.take_pipe_read_parked());
+                    let pipe_write_park = host.with(|p| p.take_pipe_write_parked());
+                    let _ = host.with(|p| (p.take_pipe_wake(), p.take_pipe_wake_writers()));
+                    if let Some(pipe) = pipe_read_park {
+                        self.module = module;
+                        self.cur = cur;
+                        self.base = base;
+                        self.pc = pc; // rewind: the read re-executes on wake
+                        return Ok(Outcome::PipeRead { pipe });
+                    }
+                    if let Some(pipe) = pipe_write_park {
+                        self.module = module;
+                        self.cur = cur;
+                        self.base = base;
+                        self.pc = pc; // rewind: the write re-executes on wake
+                        return Ok(Outcome::PipeWrite { pipe });
                     }
                     for (i, (s, ty)) in res.iter().zip(results.iter()).enumerate() {
                         self.regs[base + *dst as usize + i] = Reg::from_value(slot_to_val(*ty, *s));
