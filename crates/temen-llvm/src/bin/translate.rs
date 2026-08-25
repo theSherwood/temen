@@ -44,7 +44,8 @@ fn try_main() -> Result<(), String> {
              \n  failing translation (large-program bring-up, e.g. Postgres).\n\
              \n  --null-guard (#964) lays the powerbox low scratch out one 16 KiB guard above zero\n\
              \n  and marks the module (`__null_guard` export) so a host seeds [0, 16384) unmapped\n\
-             \n  and NULL dereferences trap. Off by default (legacy layout, byte-identical)."
+             \n  and NULL dereferences trap. On by default (#1094 — the one canonical layout); the\n\
+             \n  flag is now redundant, kept only for compatibility."
         );
         return Err("no input file".into());
     }
@@ -54,7 +55,7 @@ fn try_main() -> Result<(), String> {
     let mut binary = false;
     let mut host_page: u64 = temen_ir::POWERBOX_STACK_PAGE;
     let mut stub_externs = false;
-    let mut null_guard = false;
+    let mut null_guard = true; // #1094: guarded layout is the default (the one canonical form)
     let mut child_entry = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -72,7 +73,8 @@ fn try_main() -> Result<(), String> {
             // large-program bring-up (Postgres) where most externals are dead on the exercised path.
             "--stub-externs" => stub_externs = true,
             // #964 trap-on-NULL: the guarded layout (low scratch shifted one guard up + the
-            // `__null_guard` marker export), so a host may seed `[0, 16384)` unmapped.
+            // `__null_guard` marker export). #1094: on by default now, so this flag is a redundant
+            // no-op kept for compatibility with build scripts that still pass it.
             "--null-guard" => null_guard = true,
             // §14 child-entry mode (#1011 slice 3c): synthesize the powerbox entry with the
             // `instantiate_module` child ABI, so a guest driver can spawn this module as a phase child.

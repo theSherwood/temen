@@ -264,8 +264,10 @@ pub struct TranslateOptions {
     /// [`temen_ir::NULL_GUARD_EXPORT`] function export, so a host may seed `[0, guard)` unmapped and
     /// every NULL dereference traps like native platforms. `stack_page` is raised to at least
     /// `guard + POWERBOX_ARGS_END` (32 KiB) so the globals base clears the shifted args region.
-    /// **Off by default** — the legacy layout is byte-identical to before this knob existed, and an
-    /// unmarked module is never guarded (old artifacts keep running unchanged).
+    /// **On by default** (#1094) — every temen-llvm producer emits the guarded layout, the one
+    /// canonical form (INVARIANTS #13). The `--null-guard` CLI flag is now redundant (it only sets
+    /// this to the value it already has); setting `null_guard: false` still yields the legacy layout,
+    /// migration scaffolding retained only until the legacy path is deleted (#1094 step 3).
     pub null_guard: bool,
     /// **§14 child-entry mode** (#1011 slice 3c): synthesize the powerbox entry (`_start`, function 0)
     /// with the `instantiate_module` child ABI — `(i64 starter) -> (i64 status)` — instead of the
@@ -286,7 +288,7 @@ impl Default for TranslateOptions {
         Self {
             stub_unresolved_externs: false,
             stack_page: DEFAULT_STACK_PAGE,
-            null_guard: false,
+            null_guard: true, // #1094: guarded layout is the default (the one canonical form)
             child_entry: false,
         }
     }
