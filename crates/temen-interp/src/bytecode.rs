@@ -12282,6 +12282,16 @@ fn teardown_domains(
 /// [`Vm::resume`]'s loop at suspension points (preemption budget, blocking op, debug stop), persists
 /// the cursor back into `self`, and hands this struct to the caller to park / hash / resume — exactly
 /// what `park_suspended(frames)` does for the tree-walker today.
+/// #1062 — the monotonic **`setjmp` token** source for the bytecode engine (its own counter; a run
+/// uses one engine tier, and `setjmp_points` is per-`Vm`, so it never collides with the tree-walk
+/// counter). Each `setjmp` writes a fresh token into the guest `jmp_buf`'s opaque first 8 bytes and
+/// keys its checkpoint by that token, so a guest that *copies* the `jmp_buf` (bash's `COPY_PROCENV`
+/// memcpy of `top_level`, on every `bash -c`) carries the checkpoint identity with the bytes —
+/// address-keying could not, and mis-resolved a restored copy into an infinite `longjmp` loop. The
+/// value is opaque: never guest-observable, so only token *equality* (write `T`, read it back)
+/// matters — the exact value and any cross-thread interleaving of this counter cannot affect a run.
+static BYTE_SETJMP_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// A `<setjmp.h>` checkpoint (see [`Vm::setjmp_points`]): everything needed to re-enter a `setjmp`
 /// activation. `longjmp` truncates [`Vm::stack`] to `depth` (the intervening activations discarded —
 /// C has no cleanups), restores the `(module, cur, base, pc)` cursor, and sets the `dst` register to
@@ -12321,10 +12331,14 @@ struct Vm {
     pc: usize,
     /// Edge-copy staging buffer (parallel-copy safety); kept here so it is reused across resumes.
     scratch: Vec<Reg>,
-    /// `<setjmp.h>` checkpoints — `setjmp` records its activation's resume point here keyed by the
-    /// guest `jmp_buf` address; `longjmp` looks it up. No register snapshot is needed (unlike the
-    /// tree-walker): the flat per-function register layout gives each block its own slots, so the
-    /// `setjmp` block's values survive a deeper call in place. Keyed by address (re-`setjmp` overwrites).
+    /// `<setjmp.h>` checkpoints — `setjmp` records its activation's resume point here, keyed by a
+    /// per-`setjmp` **token** it writes into the guest `jmp_buf`'s opaque first 8 bytes (#1062);
+    /// `longjmp` reads the token back from the (possibly-copied) buffer and looks it up. No register
+    /// snapshot is needed (unlike the tree-walker): the flat per-function register layout gives each
+    /// block its own slots, so the `setjmp` block's values survive a deeper call in place.
+    /// Token-keying (vs the old address key) is what lets a guest *copy* a `jmp_buf` — bash's
+    /// `COPY_PROCENV` memcpy of `top_level` — carry the checkpoint identity with the bytes; bounded
+    /// by pruning checkpoints whose `setjmp` activation has returned (`SetJmp` op).
     setjmp_points: std::collections::BTreeMap<u64, ByteSetJmp>,
     /// §12.8 4A.5: the window offset of this context's shadow-SP **word** — the base of its own region
     /// (`shadow_region_base`), which `durable.shadow_base` returns so the instrumented IR addresses its
@@ -12767,9 +12781,28 @@ impl Vm {
                 // activation) keyed by the guest `jmp_buf` address, and return 0. The register window
                 // survives in place (per-block slots are distinct), so no snapshot is taken.
                 Op::SetJmp { buf, dst } => {
-                    let key = r!(*buf).i64() as u64;
+                    // #1062 — key the checkpoint by a fresh TOKEN written into the guest `jmp_buf`'s
+                    // opaque first 8 bytes (not the buffer address), so a guest that memcpy-copies
+                    // the buffer (bash's `COPY_PROCENV`) carries the identity with the bytes. The
+                    // write goes through the confinement mask like any guest store; a `jmp_buf` is
+                    // always a committed object the guest just passed, so a fault is a broken guest.
+                    let buf_addr = r!(*buf).i64() as u64;
+                    let token =
+                        BYTE_SETJMP_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    mem.as_mut().ok_or(Trap::Malformed)?.store_scalar(
+                        buf_addr,
+                        0,
+                        StoreOp::I64,
+                        token,
+                    )?;
+                    // Bound the token map (address-keying was bounded by overwrite; tokens are not):
+                    // drop checkpoints whose `setjmp` activation has returned — a `longjmp` to one
+                    // would trap regardless. A copied-but-live checkpoint sits at a still-live
+                    // activation (`depth <= stack.len()`) and is retained.
+                    let live = self.stack.len();
+                    self.setjmp_points.retain(|_, p| p.depth <= live);
                     self.setjmp_points.insert(
-                        key,
+                        token,
                         ByteSetJmp {
                             depth: self.stack.len(),
                             module,
@@ -12787,10 +12820,16 @@ impl Vm {
                 // `setjmp` result set to `val` (a `0` becomes `1`, per C). A missing checkpoint or one
                 // whose activation already returned traps in-sandbox (§3b totality).
                 Op::LongJmp { buf, val } => {
-                    let key = r!(*buf).i64() as u64;
+                    // #1062 — read the token back from the (possibly-copied) `jmp_buf` and look it up.
+                    let buf_addr = r!(*buf).i64() as u64;
                     let v = r!(*val).i32();
                     let resume = if v == 0 { 1 } else { v };
-                    let point = *self.setjmp_points.get(&key).ok_or(Trap::Malformed)?;
+                    let token = mem
+                        .as_ref()
+                        .ok_or(Trap::Malformed)?
+                        .load_scalar(buf_addr, 0, LoadOp::I64)?
+                        .i64() as u64;
+                    let point = *self.setjmp_points.get(&token).ok_or(Trap::Malformed)?;
                     if point.depth > self.stack.len() {
                         return Err(Trap::Malformed); // the setjmp activation already returned
                     }

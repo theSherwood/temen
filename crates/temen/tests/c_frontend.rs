@@ -333,6 +333,33 @@ fn run_c_interp(src: &str) -> CRun {
     }
 }
 
+/// Like [`run_c_interp`] but on the **bytecode cooperative engine** — the browser's wasm-safe tier
+/// ([`temen_interp::bytecode::compile_and_run_with_host`], the entry `posix_shell_exec` drives in the
+/// playground). Used to pin engine-specific lowerings (e.g. the #1062 setjmp token keying) on the
+/// tier the browser actually runs.
+fn run_c_bytecode(src: &str) -> CRun {
+    let ir = c_to_ir(src);
+    let m =
+        parse_module(&ir).unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
+    verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
+    let mut h = Host::new();
+    let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    let handles = powerbox(&mut h, win, std::time::Duration::ZERO);
+    bind_imports(&mut h, &m, &handles);
+    let mut fuel = 50_000_000u64;
+    let outcome =
+        match temen_interp::bytecode::compile_and_run_with_host(&m, 0, &[], &mut fuel, &mut h) {
+            Some(Ok(v)) => Outcome::Returned(v),
+            Some(Err(Trap::Exit(c))) => Outcome::Exited(c),
+            Some(Err(e)) => panic!("bytecode trapped: {e:?}\n{src}\n{ir}"),
+            None => panic!("the bytecode engine declined to compile the module\n{ir}"),
+        };
+    CRun {
+        outcome,
+        stdout: h.stdout,
+    }
+}
+
 /// Run a normally-returning fiber program (interpreter-only) and return its single i32.
 fn fiber_i32(src: &str) -> i32 {
     match run_c_interp(src).outcome {
@@ -551,9 +578,18 @@ int main(void) {
   return r;                                /* 55 */
 }
 "#;
+    // Both engines must resolve the copied buffer (the tree-walk fix landed with #1062; the
+    // bytecode engine — the browser's wasm-safe tier — carries the same address→token change,
+    // so `bash -c 'exit N'` no longer busy-loops in the playground).
     assert_eq!(
         run_c_interp(src).outcome,
-        Outcome::Returned(vec![Value::I32(55)])
+        Outcome::Returned(vec![Value::I32(55)]),
+        "tree-walk: longjmp through a copied jmp_buf"
+    );
+    assert_eq!(
+        run_c_bytecode(src).outcome,
+        Outcome::Returned(vec![Value::I32(55)]),
+        "bytecode (browser engine): longjmp through a copied jmp_buf"
     );
 }
 

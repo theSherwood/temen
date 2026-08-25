@@ -284,6 +284,23 @@ since each call forks a subshell and svm forks are heavier than native; a perf c
 bug.) Pinned by three whole-program capstone scripts (quicksort, the state-machine parse, the
 `tr`+`sort` word-frequency counter).
 
+## bash on the bytecode engine (the browser tier)
+
+All the differential work above runs on the **tree-walk** interp. The playground runs on the
+**bytecode cooperative engine** — the single-threaded, wasm-safe tier (`bytecode::compile_and_run…`,
+what `posix_shell_exec` drives in-browser). bash runs there too: `bash -c` on the bytecode backend
+(`BASH_PROBE_BACKEND=bytecode`) is **byte-for-byte with native across the whole round-1 language set
+(50/50)**, plus fork/pipes (`echo | cat`), command substitution, pipelines, `exit`/`set -e`, traps,
+associative arrays, `[[ =~ ]]`, `printf '%()T'`, and a recursive quicksort. The one engine-specific
+gap was the same #1062 setjmp keying — `bytecode.rs`'s `SetJmp`/`LongJmp` were still address-keyed, so
+`bash -c 'exit'` would have busy-looped in the playground; the token-in-`jmp_buf` fix is now ported to
+the bytecode engine too (pinned by `c_longjmp_through_a_copied_jmp_buf`, which asserts on both tiers).
+
+This resolves most of the "does bash run in the browser" risk: the language + real-program surface is
+at parity on the wasm-safe tier. What remains for the *playground* is integration wiring — an AOT
+`bash.temen` module + a `temen_run_shell`-style entry, the coreutils as browser fixtures, and the
+#797 terminal for interactive `-i` — not core execution gaps.
+
 ## What remains (the slice ladder from the #802 sketch)
 
 - The `^D`-EOF nuance (the one-shot EOF is writer-count state, so the shell's next read can
