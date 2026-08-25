@@ -26,7 +26,7 @@ fuzz_target!(|data: &[u8]| {
     // Round-trip every function through the internal SSA form; the lowering must be lossless.
     let mut rt = m.clone();
     for f in &mut rt.funcs {
-        let back = from_ssa(&to_ssa(f, &fr));
+        let back = from_ssa(&to_ssa(f, &fr, &m.types));
         assert_eq!(&back, f, "SSA round-trip must be the identity");
         *f = back;
     }

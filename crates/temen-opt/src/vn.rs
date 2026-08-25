@@ -38,7 +38,12 @@ fn edges(term: &Terminator) -> Vec<(u32, &Vec<Value>)> {
 
 /// Compute a value number for every value of `s` (indexed by [`Value`]). Congruent values share a
 /// number; see the module docs.
-pub fn value_numbers(s: &SsaFunc, cfg: &Cfg, fn_results: &[usize]) -> Vec<u32> {
+pub fn value_numbers(
+    s: &SsaFunc,
+    cfg: &Cfg,
+    fn_results: &[usize],
+    types: &[temen_ir::TypeEntry],
+) -> Vec<u32> {
     let nblocks = s.blocks.len();
     let nvals = s.num_values as usize;
     let rpo = cfg.rpo();
@@ -49,7 +54,7 @@ pub fn value_numbers(s: &SsaFunc, cfg: &Cfg, fn_results: &[usize]) -> Vec<u32> {
         let mut per = Vec::with_capacity(blk.insts.len());
         let mut slot = blk.params.len();
         for inst in &blk.insts {
-            let rc = inst.result_count(fn_results);
+            let rc = inst.result_count(fn_results, types);
             per.push(s.values[b][slot..slot + rc].to_vec());
             slot += rc;
         }

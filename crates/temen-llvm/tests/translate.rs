@@ -12554,6 +12554,63 @@ fn demo_bash_translates_and_verifies() {
         // because the slice-4 README listed them as a remaining gap).
         "read a b <<< \"x y\"; echo \"read:$a/$b\"",
         "while read -r l; do echo \"loop:$l\"; done <<EOF\nl1\nl2\nEOF",
+        // Language differential — the pure-in-shell surface a 50-construct probe found working
+        // byte-identical to native (arrays, parameter expansion, brace expansion, arithmetic,
+        // [[ ]], printf, namerefs, extglob… all already exercised across the suite); these two
+        // pin the constructs that needed a FIX to reach parity:
+        //   • BASH_REMATCH — `[[ =~ ]]` filled no capture array until the guest regex_t/regmatch_t
+        //     ABI was matched to the host glibc <regex.h> (re_nsub@48, regoff_t=int); the match
+        //     itself always worked, so only the captures are the regression witness.
+        //   • process substitution `<(…)`/`>(…)` — bash's HAVE_DEV_FD path opens `/dev/fd/N`,
+        //     which the personality now resolves as a dup of that fd (a builtin producer/consumer
+        //     keeps it off the /bin path so it runs in this no-/bin block).
+        "[[ 2026-08-24 =~ ([0-9]+)-([0-9]+)-([0-9]+) ]]; \
+         echo \"${BASH_REMATCH[0]}|${BASH_REMATCH[1]}|${BASH_REMATCH[3]}|${#BASH_REMATCH[@]}\"",
+        "while read l; do echo \"ps:$l\"; done < <(printf 'x\\ny\\n')",
+        "echo hi > >(while read l; do echo \"up:$l\"; done); wait",
+        "read x < /dev/stdin <<< \"hi\"; echo \"got:$x\"",
+        "exec 3< <(printf 'a\\nb\\n'); read x < /dev/fd/3; echo \"fd3:$x\"",
+        // #1057 — the last stage of a pipeline that terminates via `exit()` (every forked bash
+        // pipeline stage / group command reaching `exit_shell`) must reap with its real code,
+        // not the fork-twin crash status (128). Pre-fix these all reported `rc=128`; the status
+        // was masked in every earlier pipe script by a trailing command.
+        "true | { false; }; echo \"rc=$?\"",
+        "false | { true; }; echo \"rc=$?\"",
+        "echo hi | { read x; echo \"got:$x\"; }; echo \"after=$?\"",
+        // #1062 — an explicit top-level `exit` in `-c` mode: bash's `parse_and_execute`
+        // save/restores `top_level` with `COPY_PROCENV` (a `jmp_buf` memcpy), so the `EXITPROG`
+        // longjmp only resolves correctly when the checkpoint identity rides in the buffer bytes
+        // (the #1062 token). Before the fix these busy-looped forever (the exit status is the
+        // pipeline/script's, so a trailing command couldn't mask it). `set -e`/`set -u` reach
+        // the same terminate path on error.
+        "echo a; exit 7",
+        "set -e; false; echo unreached",
+        "set -u; echo \"${undef}\"; echo unreached",
+        // Round 3 — deeper builtin surface (no /bin), differential-verified against native.
+        // `printf %()T`: the shim's real `strftime`/`localtime` (was a stub that ignored the
+        // format and always printed 1970-01-01).
+        "printf '%(%Y-%m-%d %H:%M:%S)T\\n' 1700000000",
+        "printf '%(%A %B %d %p %j)T\\n' 0",
+        // trap ERR / RETURN / EXIT-with-status; set -e in a function / subshell / pipefail.
+        "trap 'echo ERR' ERR; false; echo after",
+        "f() { trap 'echo ret' RETURN; echo in; }; f; echo out",
+        "trap 'echo bye=$?' EXIT; (exit 5)",
+        "set -e; f(){ false; echo no; }; f; echo no2",
+        "set -eo pipefail; false | true; echo no",
+        // getopts, arithmetic edge cases, real-script control flow.
+        "set -- -v -o out file; v=0; o=; while getopts 'vo:' c; do case $c in v) v=1;; o) o=$OPTARG;; esac; done; shift $((OPTIND-1)); echo \"v=$v o=$o rest=$*\"",
+        "echo $(( -7 % 3 )) $(( 2**10 )) $(( 0xff | 2#1010 ))",
+        "declare -A c; for w in a b a c a b; do ((c[$w]++)); done; for k in a b c; do echo \"$k=${c[$k]}\"; done",
+        "s=0; for n in 1 2 3 4 5; do s=$((s+n)); done; echo \"sum=$s\"; [[ $s -eq 15 ]] && exit 0 || exit 1",
+        // Round 4 — whole multi-line programs (integration: functions + arrays + recursion +
+        // string ops together), differential-verified against native. Recursive quicksort:
+        "qsort() { local -a a=(\"$@\"); (( ${#a[@]} <= 1 )) && { echo \"${a[@]}\"; return; }; \
+         local p=${a[0]} lo=() hi=() x; for x in \"${a[@]:1}\"; do if (( x < p )); then \
+         lo+=(\"$x\"); else hi+=(\"$x\"); fi; done; \
+         echo \"$(qsort \"${lo[@]}\") $p $(qsort \"${hi[@]}\")\"; }; qsort 5 2 8 1 9 3 7 4 6 0",
+        // A key=value state-machine parse (IFS read into an array + trim + %%/# expansions):
+        "input='name=alice; age=30; city=wonderland'; IFS=';' read -ra ps <<< \"$input\"; \
+         for p in \"${ps[@]}\"; do p=\"${p# }\"; echo \"[${p%%=*}] -> [${p#*=}]\"; done",
     ] {
         let config = temen_run::RunConfig {
             args: vec![b"bash".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()],
@@ -12629,6 +12686,11 @@ fn demo_bash_translates_and_verifies() {
         "/bin/echo external",
         "echo viaPATH | cat",
         "seq 5 | head -n 2",
+        "seq 9 | head -3", // #802 round 3 — the POSIX `-N` shorthand (was unrecognized → all lines)
+        // #802 round 4 — a word-frequency counter over the staged /bin (assoc-array keys piped
+        // through the new `tr` coreutil into `sort`): the integration `tr` was added for.
+        "declare -A f; for w in the cat sat on the mat the cat ran; do (( f[$w]++ )); done; \
+         for k in $(echo \"${!f[@]}\" | tr ' ' '\\n' | sort); do printf '%s:%d\\n' \"$k\" \"${f[$k]}\"; done",
         "seq 100 | wc -l",
         "x=$(seq 3 | wc -l); echo \"n=$x\"",
         "true && echo t; false || echo f",

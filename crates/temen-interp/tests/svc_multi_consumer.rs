@@ -65,7 +65,7 @@ block 0 (vsp: i64, varg: i64) {
 fn two_pollers_split_one_queue_and_their_counts_sum() {
     let m = module(TWO_POLLERS);
     assert!(
-        bytecode::compile_module(&m.funcs).is_none(),
+        bytecode::compile_module(&m.funcs, &m.types).is_none(),
         "svc + threads must keep declining on the fast backends (the serve veto) — the oracle \
          is the only backend that runs multi-consumer shapes"
     );
@@ -123,7 +123,7 @@ fn a_timed_svc_wait_with_no_work_returns_zero() {
         !bytecode::serve_qualifies(&m.funcs),
         "the timed form is oracle-only (deadline machinery lives in the scheduler)"
     );
-    assert!(bytecode::compile_module(&m.funcs).is_none());
+    assert!(bytecode::compile_module(&m.funcs, &m.types).is_none());
     let mut host = Host::new();
     host.set_self_module(&m);
     let mut fuel = u64::MAX;

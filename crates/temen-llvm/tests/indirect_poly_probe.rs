@@ -18,6 +18,15 @@ fn sig_key(params: &[temen_ir::ValType], results: &[temen_ir::ValType]) -> Strin
     format!("{params:?}->{results:?}")
 }
 
+/// #922: a call site's `ty`/`sig` is now a `u32` index into the module type section, not an inline
+/// `FuncType`. Resolve it back to its signature key through `m.types`.
+fn site_sig_key(m: &Module, ty: u32) -> String {
+    match &m.types[ty as usize] {
+        temen_ir::TypeEntry::Func(f) => sig_key(&f.params, &f.results),
+        other => panic!("call_indirect ty {ty} names a non-Func type entry: {other:?}"),
+    }
+}
+
 fn func_sig_key(f: &Func) -> String {
     sig_key(&f.params, &f.results)
 }
@@ -39,11 +48,11 @@ fn indirect_site_sigs(m: &Module) -> Vec<String> {
         for b in &f.blocks {
             for inst in &b.insts {
                 if let Inst::CallIndirect { ty, .. } = inst {
-                    sites.push(sig_key(&ty.params, &ty.results));
+                    sites.push(site_sig_key(m, *ty));
                 }
             }
             if let Terminator::ReturnCallIndirect { ty, .. } = &b.term {
-                sites.push(sig_key(&ty.params, &ty.results));
+                sites.push(site_sig_key(m, *ty));
             }
         }
     }
@@ -125,7 +134,7 @@ fn candidate_spans(m: &Module, cap: usize) -> Vec<usize> {
         for b in &f.blocks {
             for inst in &b.insts {
                 if let Inst::CallIndirect { ty, .. } = inst {
-                    let key = sig_key(&ty.params, &ty.results);
+                    let key = site_sig_key(m, *ty);
                     if let Some(idxs) = by_sig.get(&key) {
                         if (1..=cap).contains(&idxs.len()) {
                             spans.push(idxs.last().unwrap() - idxs.first().unwrap());
@@ -149,10 +158,7 @@ fn functions_with_eligible_site(m: &Module, cap: usize) -> (usize, usize) {
         for b in &f.blocks {
             for inst in &b.insts {
                 if let Inst::CallIndirect { ty, .. } = inst {
-                    let n = pop
-                        .get(&sig_key(&ty.params, &ty.results))
-                        .copied()
-                        .unwrap_or(0);
+                    let n = pop.get(&site_sig_key(m, *ty)).copied().unwrap_or(0);
                     if (1..=cap).contains(&n) {
                         sites_hit += 1;
                         hit = true;

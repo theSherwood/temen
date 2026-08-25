@@ -871,6 +871,11 @@ fn translate_impl(
     // (function-pointer tables in data) now, plus every `RefFunc` the per-function translation
     // emits (recorded at the lowering itself).
     let taken: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
+    // #922: the module type section, accumulated across the whole translation. Every call site
+    // (`call_indirect`/`cap.call`/`call.import`) interns its `FuncType` here and stores the returned
+    // index; the import shapes intern into the same table at finalize (below), so a `call.import`'s
+    // sig dedups to its import's declared entry. Threaded like `taken` into each function's lowering.
+    let sig_types: RefCell<Vec<temen_ir::TypeEntry>> = RefCell::new(Vec::new());
     if !dispatch_plans.is_empty() {
         let mut t = taken.borrow_mut();
         for g in &m.global_vars {
@@ -934,6 +939,7 @@ fn translate_impl(
             stubs.as_ref(),
             &dispatch_map,
             &taken,
+            &sig_types,
         )
         // Name the function in the error — a bare "value N not available" is opaque in a
         // whole-program module of thousands of functions (the Postgres bring-up).
@@ -1028,15 +1034,9 @@ fn translate_impl(
         // funcrefs resolve through `name2idx`, now built).
         let ctors = collect_global_ctors(m, &name2idx)?;
         // Both entries share `StartBuilder`; `synth_start_argv` adds the §3e args-buffer → `argv[]`
-        // parsing for a `main(int, char**)`, `synth_start` is the plain `main(void)` entry.
-        // §14 child-entry mode (#1011 slice 3c): an argv-taking `main` under child-entry is not yet
-        // supported (the argv `_start`'s multi-block return would also need the i64-status widening);
-        // refuse it as a clean translate-time error rather than silently emit a non-child entry.
-        if opts.child_entry && wants_argv {
-            return Err(Error::Unsupported(
-                "child_entry: an argv-taking main is not yet supported".into(),
-            ));
-        }
+        // parsing for a `main(int, char**)`, `synth_start` is the plain `main(void)` entry. Both honor
+        // §14 child-entry mode (#1011 slice 3c) — the starter param + i64-status return — so a
+        // `main(argc, argv)` phase (e.g. `nifler p <in> <out>`) is `instantiate_module`-able too.
         let build_start: StartBuilder = if wants_argv {
             synth_start_argv
         } else {
@@ -1062,7 +1062,8 @@ fn translate_impl(
         funcs.push(synth_memcpy());
     }
     if need_malloc {
-        funcs.push(synth_malloc(caps["vm_map"], stack_page, scratch));
+        let map_sig = intern_sig(&sig_types, import_sig("vm_map")); // #922
+        funcs.push(synth_malloc(caps["vm_map"], stack_page, scratch, map_sig));
     }
     if need_printf || need_snprintf {
         funcs.push(synth_utoa());
@@ -1129,7 +1130,15 @@ fn translate_impl(
     // `__temen_eh_destroy` (after `__temen_memchr` — matches the `take` order). Self-contained: it reads
     // only its arguments and indirect-calls the passed destructor funcref.
     if need_eh_destroy {
-        funcs.push(synth_eh_destroy());
+        // #922: the destructor funcref's `(i64 dtor_sp, i64 this) -> ()` shape.
+        let dtor_sig = intern_sig(
+            &sig_types,
+            temen_ir::FuncType {
+                params: vec![ValType::I64, ValType::I64],
+                results: vec![],
+            },
+        );
+        funcs.push(synth_eh_destroy(dtor_sig));
     }
     // `__temen_eh_unwind` (after `__temen_eh_destroy` — matches the `take` order). Self-contained: it
     // touches only the EH region addressed off the passed `base` and the handler checkpoints.
@@ -1220,7 +1229,8 @@ fn translate_impl(
         for (k, (key, idx)) in dispatch_plans.iter().enumerate() {
             debug_assert_eq!(funcs.len() as u32, *idx, "dispatcher index drift");
             let arms = dispatch_arms(key, &t, &funcs, base, defined.len(), &variadic_idx);
-            funcs.push(synth_dispatcher(key, &arms));
+            let site_ty = intern_sig(&sig_types, key.site_type()); // #922
+            funcs.push(synth_dispatcher(key, &arms, site_ty));
             dbg.func_names.push(FuncName {
                 func: *idx,
                 name: format!("__temen_indirect_dispatch{k}"),
@@ -1254,19 +1264,15 @@ fn translate_impl(
         }
     }
     // §3.5: import signatures live in the type section — intern each import's sig (a pure
-    // function of its name, `import_sig`) and point its shape reference at the entry.
-    let mut types: Vec<temen_ir::TypeEntry> = Vec::new();
+    // function of its name, `import_sig`) and point its shape reference at the entry. #922: this
+    // interns into the same shared `sig_types` accumulator the call sites used, so a `call.import`
+    // on an import dedups to that import's declared `Func` entry (the structural equality the
+    // verifier's `ImportSigMismatch` check requires).
     for imp in &mut imports {
-        let sig = import_sig(&imp.name);
-        let t = types
-            .iter()
-            .position(|e| matches!(e, temen_ir::TypeEntry::Func(f) if *f == sig))
-            .unwrap_or_else(|| {
-                types.push(temen_ir::TypeEntry::Func(sig.clone()));
-                types.len() - 1
-            }) as u32;
+        let t = intern_sig(&sig_types, import_sig(&imp.name));
         imp.shape = temen_ir::ImportShape::Func(t);
     }
+    let types = sig_types.into_inner();
     Ok(Translated {
         module: Module {
             types,
@@ -2704,6 +2710,7 @@ fn translate_func(
     stubs: Option<&RefCell<StubTable>>,
     dispatch_map: &HashMap<DispatchKey, u32>,
     taken: &RefCell<HashSet<u32>>,
+    sig_types: &RefCell<Vec<temen_ir::TypeEntry>>,
 ) -> Result<(Func, u64), Error> {
     // A `(...)`-defined function (`f.is_var_arg`) lowers like any other: its IR signature is
     // `(sp, fixed-params…)` — the variadic arguments are not IR parameters but are read by `va_start`
@@ -2814,6 +2821,7 @@ fn translate_func(
             stubs,
             dispatch_map,
             taken,
+            sig_types,
         )?);
     }
     blocks.extend(aux_blocks);
@@ -3483,7 +3491,7 @@ fn dispatch_arms(
 /// genuinely-variadic targets behave exactly as before and anything unknown still fail-closes
 /// with `IndirectCallType`. CFI is never widened: every arm is a direct call to a
 /// statically-named function.
-fn synth_dispatcher(key: &DispatchKey, arms: &[DispatchArm]) -> Func {
+fn synth_dispatcher(key: &DispatchKey, arms: &[DispatchArm], site_ty: u32) -> Func {
     use temen_ir::StoreOp;
     let n = key.args.len();
     let nf = key.fixed.len();
@@ -3587,7 +3595,7 @@ fn synth_dispatcher(key: &DispatchKey, arms: &[DispatchArm]) -> Func {
             }
         }
         insts.push(Inst::CallIndirect {
-            ty: key.site_type(),
+            ty: site_ty, // #922: the site signature, pre-interned by the caller
             idx: idx32,
             args: cargs,
         });
@@ -3878,6 +3886,24 @@ fn cap_import_name(name: &str) -> Option<&'static str> {
         "exit" | "_exit" | "_Exit" => "exit",
         _ => return None,
     })
+}
+
+/// #922: intern a `FuncType` into the module's type section, returning its `TypeEntry::Func` index
+/// (deduping — a matching entry is reused, an absent one appended). The call instructions
+/// (`call_indirect`/`cap.call`/`call.import`/…) now carry this `u32` index in place of an inline
+/// signature; the verifier resolves it back to the `Func` entry. One shared accumulator threads the
+/// whole translation (mirrors `taken`), so an import's sig and a `call.import` on it dedup to the
+/// same index — the structural equality the verifier's `ImportSigMismatch` check wants.
+fn intern_sig(types: &RefCell<Vec<temen_ir::TypeEntry>>, ft: temen_ir::FuncType) -> u32 {
+    let mut t = types.borrow_mut();
+    if let Some(i) = t
+        .iter()
+        .position(|e| matches!(e, temen_ir::TypeEntry::Func(f) if *f == ft))
+    {
+        return i as u32;
+    }
+    t.push(temen_ir::TypeEntry::Func(ft));
+    (t.len() - 1) as u32
 }
 
 /// The capability op signature for an import name (`default_cap_resolver`'s ABI): `Stream`
@@ -4365,10 +4391,12 @@ fn synth_start_argv(
     // #964 guarded layout: every low-scratch address (heap words, the args blob) shifts up by this
     // (0 = legacy).
     scratch: u64,
-    // §14 child-entry mode: shares [`StartBuilder`] with [`synth_start`]. An argv-taking child entry is
-    // not yet supported (deferred to a later slice-3c increment); the caller refuses the combination, so
-    // this is always `false` here.
-    _child_entry: bool,
+    // §14 child-entry mode (#1011 slice 3c): the entry takes a starter capability (`v0`, ignored — the
+    // child reaches its caps through re-granted named imports) and returns `main`'s result widened to the
+    // `i64` status the parent reads via `join`, matching the `instantiate_module` child ABI. The argv
+    // parsing itself is identical (a child reads its parent-seeded args buffer at `POWERBOX_ARGS_BASE`
+    // exactly as a top-level run does).
+    child_entry: bool,
 ) -> Func {
     use temen_ir::{LoadOp, StoreOp};
     let args_base = (scratch + temen_ir::POWERBOX_ARGS_BASE) as i64;
@@ -4401,10 +4429,15 @@ fn synth_start_argv(
     // ---- block 0: entry — resolve handles by name, seed the heap, load argc, jump into the argv loop.
     // A **paramless** `_start` (S15 c): the granted handles are resolved by name into the stash (the
     // name bytes staged transiently at `entry_sp`, above the argv array the loop below writes), not
-    // received as positional args.
-    let params: Vec<ValType> = Vec::new();
+    // received as positional args. Under §14 child-entry the entry instead takes the starter capability
+    // as `v0` (ignored); block 0's own values renumber above it (they are `next`-based).
+    let params: Vec<ValType> = if child_entry {
+        vec![ValType::I64]
+    } else {
+        Vec::new()
+    };
     let mut insts: Vec<Inst> = Vec::new();
-    let mut next: ValIdx = 0;
+    let mut next: ValIdx = params.len() as ValIdx;
     if let Some(hb) = heap_base {
         for off in [scratch + HEAP_BRK, scratch + HEAP_TOP] {
             insts.push(Inst::ConstI64(off as i64));
@@ -4565,10 +4598,28 @@ fn synth_start_argv(
             func: main_idx,
             args: vec![13, 14, 1],
         });
-        let term = if main_results.is_empty() {
+        // main's result is v15 (params 1 + 14 value insts before the call). A top-level entry returns
+        // it verbatim (or `()` for a void main); a §14 child entry returns the i64 status the parent
+        // joins — `0` for void, else `main`'s result widened to i64.
+        let term = if child_entry {
+            match main_results.first() {
+                None => {
+                    d.push(Inst::ConstI64(0)); // void main → status 0, at v15
+                    Terminator::Return(vec![15])
+                }
+                Some(ValType::I64) => Terminator::Return(vec![15]),
+                Some(_) => {
+                    d.push(Inst::Convert {
+                        op: ConvOp::ExtendI32U,
+                        a: 15,
+                    }); // widen i32 status → v16
+                    Terminator::Return(vec![16])
+                }
+            }
+        } else if main_results.is_empty() {
             Terminator::Return(vec![])
         } else {
-            Terminator::Return(vec![15]) // main's result (params 1 + 14 value insts before the call)
+            Terminator::Return(vec![15])
         };
         let b5 = Block {
             params: vec![ValType::I64],
@@ -4576,7 +4627,12 @@ fn synth_start_argv(
             term,
         };
         return Func {
-            results: main_results.to_vec(),
+            // A §14 child entry always returns the i64 join status; a top-level entry returns main's.
+            results: if child_entry {
+                vec![ValType::I64]
+            } else {
+                main_results.to_vec()
+            },
             blocks: vec![b0, b1, b2, b3, b4, b5],
             params: params.clone(),
         };
@@ -4732,10 +4788,27 @@ fn synth_start_argv(
         func: main_idx,
         args: vec![13, 15, 16, 1],
     });
-    let term = if main_results.is_empty() {
+    // main's result is v17 (params 2 + 15 value insts before the call); §14 child entry returns the i64
+    // status (0 for void, else widened), a top-level entry returns main's value verbatim. See block 5.
+    let term = if child_entry {
+        match main_results.first() {
+            None => {
+                e.push(Inst::ConstI64(0)); // void main → status 0, at v17
+                Terminator::Return(vec![17])
+            }
+            Some(ValType::I64) => Terminator::Return(vec![17]),
+            Some(_) => {
+                e.push(Inst::Convert {
+                    op: ConvOp::ExtendI32U,
+                    a: 17,
+                }); // widen i32 status → v18
+                Terminator::Return(vec![18])
+            }
+        }
+    } else if main_results.is_empty() {
         Terminator::Return(vec![])
     } else {
-        Terminator::Return(vec![17]) // main's result (params 2 + 15 value insts before the call)
+        Terminator::Return(vec![17])
     };
     let b10 = Block {
         params: vec![ValType::I64, ValType::I64],
@@ -4744,7 +4817,12 @@ fn synth_start_argv(
     };
 
     Func {
-        results: main_results.to_vec(),
+        // A §14 child entry always returns the i64 join status; a top-level entry returns main's result.
+        results: if child_entry {
+            vec![ValType::I64]
+        } else {
+            main_results.to_vec()
+        },
         blocks: vec![b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10],
         params: params.clone(),
     }
@@ -4770,7 +4848,7 @@ fn synth_start_argv(
 /// ```
 /// The header is written in `commit` (not `block0`) because on the first `malloc` `brk` is an
 /// *uncommitted* reserved page — only `grow` (or the prior commit) maps it.
-fn synth_malloc(vm_map_import: u32, stack_page: u64, scratch: u64) -> Func {
+fn synth_malloc(vm_map_import: u32, stack_page: u64, scratch: u64, map_sig: u32) -> Func {
     use temen_ir::{LoadOp, StoreOp};
     let i64add = |a: ValIdx, b: ValIdx| Inst::IntBin {
         ty: IntTy::I64,
@@ -4849,7 +4927,7 @@ fn synth_malloc(vm_map_import: u32, stack_page: u64, scratch: u64) -> Func {
             Inst::CallImport {
                 import: vm_map_import,
                 op: 0,
-                sig: import_sig("vm_map"),
+                sig: map_sig, // #922: `vm_map`'s sig, pre-interned by the caller
                 args: vec![3, 10, 11],
             }, // v12 = map result (ignored)
             Inst::ConstI64((scratch + HEAP_TOP) as i64), // v13
@@ -5307,7 +5385,7 @@ fn synth_realloc(malloc_idx: u32, memcpy_idx: u32) -> Func {
 /// destructor sits directly above `__cxa_end_catch`'s). The null case returns immediately. This is
 /// the guard `__cxa_end_catch` cannot express inline — it lowers in effect position, where it has no
 /// way to branch — so the conditional indirect call is pushed into this helper instead.
-fn synth_eh_destroy() -> Func {
+fn synth_eh_destroy(dtor_sig: u32) -> Func {
     let params = vec![ValType::I64, ValType::I64, ValType::I64];
     // block0(sp=0, exn=1, dtor=2): have = dtor != 0; br_if have call(sp,exn,dtor) done()
     let entry = Block {
@@ -5339,10 +5417,7 @@ fn synth_eh_destroy() -> Func {
                 a: 2,
             }, // v3 = funcref idx
             Inst::CallIndirect {
-                ty: temen_ir::FuncType {
-                    params: vec![ValType::I64, ValType::I64],
-                    results: vec![],
-                },
+                ty: dtor_sig, // #922: `(i64 dtor_sp, i64 this) -> ()`, pre-interned by the caller
                 idx: 3,
                 args: vec![0, 1], // (dtor_sp = sp, this = exn)
             }, // void
@@ -12182,10 +12257,11 @@ fn lower_vm_builtin(
             if name != "__vm_unmap" {
                 args.push(ctx.operand_i32(vm_arg(c, 2)?)?); // prot
             }
+            let sig = ctx.intern_sig(import_sig(import)); // #922
             let r = ctx.push(Inst::CallImport {
                 import: imp,
                 op: 0,
-                sig: import_sig(import),
+                sig,
                 args,
             });
             ctx.bind_dest(&c.dest, r);
@@ -12193,10 +12269,11 @@ fn lower_vm_builtin(
         }
         "__vm_page_size" => {
             let imp = ctx.import_of("vm_page_size")?;
+            let sig = ctx.intern_sig(import_sig("vm_page_size")); // #922
             let r = ctx.push(Inst::CallImport {
                 import: imp,
                 op: 0,
-                sig: import_sig("vm_page_size"),
+                sig,
                 args: vec![],
             });
             ctx.bind_dest(&c.dest, r);
@@ -12247,10 +12324,11 @@ fn lower_vm_builtin(
             for i in 0..argc {
                 args.push(ctx.operand_i64(vm_arg(c, i)?)?);
             }
+            let sig = ctx.intern_sig(import_sig(import)); // #922
             let r = ctx.push(Inst::CallImport {
                 import: imp,
                 op: 0,
-                sig: import_sig(import),
+                sig,
                 args,
             });
             ctx.bind_dest(&c.dest, r);
@@ -12263,10 +12341,11 @@ fn lower_vm_builtin(
         "__vm_region_create" => {
             let imp = ctx.import_of("vm_region_create")?;
             let len = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let sig = ctx.intern_sig(import_sig("vm_region_create")); // #922
             let r = ctx.push(Inst::CallImport {
                 import: imp,
                 op: 0,
-                sig: import_sig("vm_region_create"),
+                sig,
                 args: vec![len],
             });
             ctx.bind_dest(&c.dest, r);
@@ -12296,10 +12375,11 @@ fn lower_vm_builtin(
                 "vm_region_unmap" => 1,
                 _ => 3, // vm_region_page_size
             };
+            let sig = ctx.intern_sig(import_sig(import)); // #922
             let r = ctx.push(Inst::CapCall {
                 type_id: SHARED_REGION_TYPE_ID,
                 op,
-                sig: import_sig(import),
+                sig,
                 handle,
                 args,
             });
@@ -12560,6 +12640,7 @@ fn lower_vm_builtin(
                 params: vec![ValType::I64; 4],
                 results: vec![ValType::I64],
             };
+            let sig = ctx.intern_sig(sig); // #922
             let r = ctx.push(Inst::CapCall {
                 type_id: HOST_PROC_TYPE_ID,
                 op: op_const,
@@ -12582,6 +12663,7 @@ fn lower_vm_builtin(
                 params: vec![ValType::I64],
                 results: vec![ValType::I64],
             };
+            let sig = ctx.intern_sig(sig); // #922
             let r = ctx.push(Inst::CapCall {
                 type_id: temen_ir::CAP_SELF_TYPE_ID,
                 op: 16, // CAP_SELF_PIPE
@@ -12605,6 +12687,7 @@ fn lower_vm_builtin(
                 params: vec![ValType::I64; 5],
                 results: vec![ValType::I64],
             };
+            let sig = ctx.intern_sig(sig); // #922
             let r = ctx.push(Inst::CapCall {
                 type_id: temen_ir::CAP_SELF_TYPE_ID,
                 op: 14, // CAP_SELF_EXEC
@@ -12628,6 +12711,7 @@ fn lower_vm_builtin(
                 params: vec![ValType::I64, ValType::I64],
                 results: vec![ValType::I64],
             };
+            let sig = ctx.intern_sig(sig); // #922
             let r = ctx.push(Inst::CapCall {
                 type_id: temen_ir::cap_id::STREAM,
                 op: if name == "__vm_read" { 0 } else { 1 },
@@ -12644,6 +12728,7 @@ fn lower_vm_builtin(
                 params: vec![],
                 results: vec![ValType::I64],
             };
+            let sig = ctx.intern_sig(sig); // #922
             let r = ctx.push(Inst::CapCall {
                 type_id: temen_ir::cap_id::STREAM,
                 op: 2,
@@ -12677,6 +12762,7 @@ fn lower_vm_builtin(
                 params: vec![ValType::I64; 4],
                 results: vec![ValType::I64],
             };
+            let sig = ctx.intern_sig(sig); // #922
             let r = ctx.push(Inst::CapCall {
                 type_id: SHARED_REGION_TYPE_ID,
                 op: op_const,
@@ -12705,6 +12791,7 @@ fn lower_vm_builtin(
                 params: vec![ValType::I64; 7],
                 results: vec![ValType::I64],
             };
+            let sig = ctx.intern_sig(sig); // #922
             let r = ctx.push(Inst::CapCall {
                 type_id: INSTANTIATOR_TYPE_ID,
                 op: 13,
@@ -12725,6 +12812,7 @@ fn lower_vm_builtin(
                 params: vec![ValType::I64],
                 results: vec![ValType::I64],
             };
+            let sig = ctx.intern_sig(sig); // #922
             let r = ctx.push(Inst::CapCall {
                 type_id: INSTANTIATOR_TYPE_ID,
                 op: 1,
@@ -12777,10 +12865,11 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
         for (a, _attrs) in c.arguments.iter().skip(spec.drop_args) {
             args.push(ctx.operand(a)?);
         }
+        let sig = ctx.intern_sig(spec.sig); // #922
         let inst = Inst::CallImport {
             import,
             op: 0,
-            sig: spec.sig,
+            sig,
             args,
         };
         // A non-void result (write/read) is a value to bind; `exit` is void (`push_effect`).
@@ -16177,6 +16266,9 @@ struct BlockCtx<'a> {
     /// The address-taken function set the dispatcher arms draw from — every `RefFunc` this
     /// translation emits is recorded here (the data-image side comes from the initializer walk).
     taken: &'a RefCell<HashSet<u32>>,
+    /// #922: the shared module type section — call sites intern their `FuncType` here (via
+    /// [`BlockCtx::intern_sig`]) and store the returned index on the emitted call instruction.
+    sig_types: &'a RefCell<Vec<temen_ir::TypeEntry>>,
     insts: Vec<Inst>,
     idx_of: HashMap<ValueId, ValIdx>,
     /// Aggregate SSA values (a small by-value struct), tracked field-wise: value-id → its scalar
@@ -16230,6 +16322,12 @@ impl<'a> BlockCtx<'a> {
         let start = self.next_val;
         self.next_val += n as ValIdx;
         (start..self.next_val).collect()
+    }
+
+    /// #922: intern a call's `FuncType` into the shared module type section and return its `Func`
+    /// entry index — the `u32` the call instruction now carries in place of an inline signature.
+    fn intern_sig(&self, ft: temen_ir::FuncType) -> u32 {
+        intern_sig(self.sig_types, ft)
     }
 
     /// The field indices of an aggregate-typed operand (a value built by a multi-result `call` or
@@ -16456,10 +16554,11 @@ impl<'a> BlockCtx<'a> {
             return Ok(new_off);
         }
         let import = self.import_of("write")?;
+        let sig = self.intern_sig(import_sig("write")); // #922
         Ok(self.push(Inst::CallImport {
             import,
             op: 0,
-            sig: import_sig("write"),
+            sig,
             args: vec![buf, len],
         }))
     }
@@ -16615,6 +16714,7 @@ impl<'a> BlockCtx<'a> {
         args: Vec<ValIdx>,
         n: usize,
     ) -> Vec<ValIdx> {
+        let sig = self.intern_sig(sig); // #922
         let handle = self.push(Inst::ConstI32(0));
         self.push_multi(
             Inst::CapCall {
@@ -17092,6 +17192,7 @@ fn translate_block(
     stubs: Option<&RefCell<StubTable>>,
     dispatch_map: &HashMap<DispatchKey, u32>,
     taken: &RefCell<HashSet<u32>>,
+    sig_types: &RefCell<Vec<temen_ir::TypeEntry>>,
 ) -> Result<Block, Error> {
     let param_ids = &block_params[bi];
     // Materialize the block parameters. A scalar value (incl. the data-SP, which types as `i64`) is
@@ -17144,6 +17245,7 @@ fn translate_block(
         stubs,
         dispatch_map,
         taken,
+        sig_types,
         insts: Vec::new(),
         idx_of: HashMap::new(),
         agg: HashMap::new(),
@@ -18630,7 +18732,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                             op: ConvOp::WrapI64,
                             a: fref64,
                         }); // → i32 funcref index
-                        let ty = indirect_sig(c, types)?;
+                        let ty = ctx.intern_sig(indirect_sig(c, types)?); // #922
                         Inst::CallIndirect { ty, idx, args }
                     }
                 }

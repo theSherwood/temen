@@ -534,7 +534,7 @@ pub extern "C" fn temen_prep_bench(ptr: *const u8, len: usize) -> i64 {
         set(STATUS_VERIFY_ERR);
         return 0;
     }
-    if bytecode::compile_module(&m.funcs).is_none() {
+    if bytecode::compile_module(&m.funcs, &m.types).is_none() {
         set(STATUS_UNSUPPORTED);
         return 0;
     }
@@ -1286,17 +1286,28 @@ fn par_pb() -> Option<&'static ParPowerbox> {
 
 /// Resolve a code-handle's unit funcs under authority `handle` against the powerbox (the `install` /
 /// `invoke` service): a forged / cross-domain / wrong-type handle is an inert `CapFault` → trap.
+#[allow(clippy::type_complexity)]
 fn par_resolve_unit(
     pb: &ParPowerbox,
     handle: i32,
     code: i32,
-) -> Result<std::sync::Arc<[temen_ir::Func]>, Trap> {
+) -> Result<
+    (
+        std::sync::Arc<[temen_ir::Func]>,
+        std::sync::Arc<[temen_ir::TypeEntry]>,
+    ),
+    Trap,
+> {
     let domain = pb.host.resolve_jit_domain(handle)?;
     let (cd, cu) = pb.host.resolve_jit_code(code)?;
     if cd != domain {
         return Err(Trap::CapFault);
     }
-    pb.host.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
+    // FuncType interning (#922): the unit's type section rides alongside its funcs so the
+    // interpreter's `deliver_jit_*` can resolve the interned call sig indices.
+    let funcs = pb.host.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?;
+    let types = pb.host.jit_unit_types(cd, cu).ok_or(Trap::CapFault)?;
+    Ok((funcs, types))
 }
 
 // ---- §14 instantiate across Workers (THREADS.md 4c-domain §14-D2) -------------------------------
@@ -1582,6 +1593,7 @@ fn par_resolve_unit_rt(
 ) -> Result<
     (
         std::sync::Arc<[temen_ir::Func]>,
+        std::sync::Arc<[temen_ir::TypeEntry]>,
         Option<std::sync::Arc<[u8]>>,
     ),
     Trap,
@@ -1591,8 +1603,10 @@ fn par_resolve_unit_rt(
     if cd != domain {
         return Err(Trap::CapFault);
     }
+    // FuncType interning (#922): carry the unit's type section beside its funcs and emitted wasm.
     let funcs = h.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?;
-    Ok((funcs, h.jit_unit_wasm(cd, cu)))
+    let types = h.jit_unit_types(cd, cu).ok_or(Trap::CapFault)?;
+    Ok((funcs, types, h.jit_unit_wasm(cd, cu)))
 }
 
 /// §22 **Model B2 cross-Worker** mirror registry: `slot → the code handle installed there` (or `-1`
@@ -2071,11 +2085,16 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                     par_resolve_unit(pb, handle, code)
                 } else if let Some(cfg) = par_jit_rt() {
                     let g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
-                    par_resolve_unit_rt(&g, handle, code).map(|(f, _)| f)
+                    par_resolve_unit_rt(&g, handle, code).map(|(f, t, _)| (f, t))
                 } else {
                     return PAR_TRAP;
                 };
-                if let Some(slot) = v.inner.deliver_jit_install(resolved) {
+                // #922: split the resolved `(funcs, types)` — a trap delivers empty types (unused).
+                let (funcs, types) = match resolved {
+                    Ok((f, t)) => (Ok(f), t),
+                    Err(t) => (Err(t), std::sync::Arc::from(Vec::new())),
+                };
+                if let Some(slot) = v.inner.deliver_jit_install(funcs, types) {
                     par_jit_slot_record(slot, code);
                 }
             }
@@ -2126,8 +2145,10 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                         par_resolve_unit_rt(&g, handle, code)
                     };
                     match resolved {
-                        Err(t) => v.inner.deliver_jit_invoke(Err(t)),
-                        Ok((funcs, wasm)) => {
+                        Err(t) => v
+                            .inner
+                            .deliver_jit_invoke(Err(t), std::sync::Arc::from(Vec::new())),
+                        Ok((funcs, types, wasm)) => {
                             let codegen = par_jit_codegen()
                                 && wasm.is_some()
                                 && ptypes.is_some()
@@ -2141,7 +2162,8 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                                 v.jit_wasm = wasm;
                                 return PAR_JIT_INVOKE;
                             }
-                            v.inner.deliver_jit_invoke(Ok(funcs));
+                            // #922: deliver the unit's type section so its interned call sigs resolve.
+                            v.inner.deliver_jit_invoke(Ok(funcs), types);
                         }
                     }
                 } else {
@@ -2165,11 +2187,20 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                                         v.jit_result_types = rtypes.unwrap();
                                         return PAR_JIT_INVOKE;
                                     }
-                                    Err(t) => v.inner.deliver_jit_invoke(Err(t)),
+                                    Err(t) => v
+                                        .inner
+                                        .deliver_jit_invoke(Err(t), std::sync::Arc::from(Vec::new())),
                                 }
                             } else {
-                                v.inner
-                                    .deliver_jit_invoke(par_resolve_unit(pb, handle, code));
+                                // #922: split the resolved `(funcs, types)` for delivery.
+                                match par_resolve_unit(pb, handle, code) {
+                                    Ok((funcs, types)) => {
+                                        v.inner.deliver_jit_invoke(Ok(funcs), types)
+                                    }
+                                    Err(t) => v
+                                        .inner
+                                        .deliver_jit_invoke(Err(t), std::sync::Arc::from(Vec::new())),
+                                }
                             }
                         }
                     }

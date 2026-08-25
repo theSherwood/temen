@@ -305,7 +305,10 @@ fn run_guest(unit_src: &str, mode: Mode) -> Result<Vec<Value>, Trap> {
                 assert_eq!(mapped, Some(1u64 << 16), "fully-mapped guest window extent");
                 let resolved = resolve(vcpu.host_mut(), handle, code);
                 match mode {
-                    Mode::Interp => vcpu.deliver_jit_invoke(resolved.map(|(f, _)| f)),
+                    Mode::Interp => vcpu.deliver_jit_invoke(
+                        resolved.map(|(f, _)| f),
+                        Arc::from(unit_m.types.clone()), // #922: invoked unit's type section
+                    ),
                     Mode::Wasm => match resolved {
                         Err(t) => vcpu.deliver_jit_invoke_trap(t),
                         Ok((_funcs, wasm)) => {
@@ -522,7 +525,10 @@ fn run_guest_shared(unit_src: &str, mode: Mode) -> Result<Vec<Value>, Trap> {
                     resolve(&g, handle, code)
                 };
                 match mode {
-                    Mode::Interp => vcpu.deliver_jit_invoke(resolved.map(|(f, _)| f)),
+                    Mode::Interp => vcpu.deliver_jit_invoke(
+                        resolved.map(|(f, _)| f),
+                        Arc::from(unit_m.types.clone()), // #922: invoked unit's type section
+                    ),
                     Mode::Wasm => match resolved {
                         Err(t) => vcpu.deliver_jit_invoke_trap(t),
                         Ok((_funcs, wasm)) => {

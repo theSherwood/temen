@@ -381,17 +381,15 @@ fn directed_rule_rejects() {
         matches!(e, VerifyError::BadSimdShape { .. })
     });
 
-    // §7: an unresolved named import must be rejected fail-closed.
+    // §7: an unresolved named import must be rejected fail-closed. The import-existence check runs
+    // before the sig resolves (#922), so the type index is irrelevant here — index 0 with no manifest.
     let f = func(
         vec![],
         vec![],
         vec![Inst::CallImport {
             import: 0,
             op: 0,
-            sig: FuncType {
-                params: vec![],
-                results: vec![],
-            },
+            sig: 0,
             args: vec![],
         }],
         T::Return(vec![]),
@@ -403,8 +401,13 @@ fn directed_rule_rejects() {
     // §7 / IMPORTS.md phase 1 — the manifest-bearing legs. A `call.import` whose index names a
     // declared import with a matching sig is VALID (executable, no rewrite); a sig disagreement
     // and a duplicate manifest name are each rejected, by both verifiers.
-    let import_call = |sig: FuncType| {
-        func(
+    // Build a one-func module whose `call.import` carries `call_sig` as an interned type index
+    // (#922), then declare "ping" with `manifest_sig`. When the two agree the call verifies; when
+    // they disagree it is the ImportSigMismatch case.
+    let import_call_module = |call_sig: FuncType, manifest_sig: FuncType| -> Module {
+        let mut m = module(vec![]);
+        let sig = m.intern_func_type(call_sig);
+        m.funcs.push(func(
             vec![],
             vec![],
             vec![Inst::CallImport {
@@ -414,27 +417,32 @@ fn directed_rule_rejects() {
                 args: vec![],
             }],
             T::Return(vec![]),
-        )
+        ));
+        m.add_func_import("ping", manifest_sig, temen_ir::ImportMode::Required);
+        m
     };
     let unit_sig = FuncType {
         params: vec![],
         results: vec![],
     };
-    let mut m = module(vec![import_call(unit_sig.clone())]);
-    m.add_func_import("ping", unit_sig.clone(), temen_ir::ImportMode::Required);
-    accept(&m, "manifest-bearing call.import");
+    accept(
+        &import_call_module(unit_sig.clone(), unit_sig.clone()),
+        "manifest-bearing call.import",
+    );
     // Same module, call-site sig disagrees with the manifest's declaration.
-    let mut m = module(vec![import_call(FuncType {
-        params: vec![],
-        results: vec![V::I32],
-    })]);
-    m.add_func_import("ping", unit_sig.clone(), temen_ir::ImportMode::Required);
-    reject(&m, "import sig mismatch", |e| {
-        matches!(e, VerifyError::ImportSigMismatch { .. })
-    });
+    reject(
+        &import_call_module(
+            FuncType {
+                params: vec![],
+                results: vec![V::I32],
+            },
+            unit_sig.clone(),
+        ),
+        "import sig mismatch",
+        |e| matches!(e, VerifyError::ImportSigMismatch { .. }),
+    );
     // Two manifest entries sharing a name.
-    let mut m = module(vec![import_call(unit_sig.clone())]);
-    m.add_func_import("ping", unit_sig.clone(), temen_ir::ImportMode::Required);
+    let mut m = import_call_module(unit_sig.clone(), unit_sig.clone());
     m.add_func_import("ping", unit_sig, temen_ir::ImportMode::Required);
     reject(&m, "duplicate import name", |e| {
         matches!(e, VerifyError::DuplicateImport { .. })
@@ -739,7 +747,7 @@ fn spec_agreement_on_v7_grouped_surface() {
                 Inst::CallImport {
                     import: 0,
                     op,
-                    sig: i64_sig.clone(),
+                    sig: 0, // #922: i64_sig is interned at type-section index 0 (below)
                     args: vec![1],
                 },
             ],

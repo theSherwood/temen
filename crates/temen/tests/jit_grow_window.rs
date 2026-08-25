@@ -271,6 +271,18 @@ fn run_guest(guest_src: &str, probe: i64, mode: Mode) -> (Result<Vec<Value>, Tra
                         h.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
                     })
                 };
+                // #922: the invoked unit's type section, resolved through the same authority.
+                let resolved_types = {
+                    let h = vcpu.host_mut();
+                    h.resolve_jit_domain(handle)
+                        .ok()
+                        .and_then(|d| {
+                            let (cd, cu) = h.resolve_jit_code(code).ok()?;
+                            (cd == d).then_some(())?;
+                            h.jit_unit_types(cd, cu)
+                        })
+                        .unwrap_or_else(|| std::sync::Arc::from(Vec::new()))
+                };
                 let sync = match mode {
                     Mode::Interp => None,
                     // The browser flattening's `codegen` gate: an unrepresentable extent declines
@@ -283,7 +295,7 @@ fn run_guest(guest_src: &str, probe: i64, mode: Mode) -> (Result<Vec<Value>, Tra
                         if mode != Mode::Interp {
                             declined += 1;
                         }
-                        vcpu.deliver_jit_invoke(resolved);
+                        vcpu.deliver_jit_invoke(resolved, resolved_types);
                     }
                     (_, Some(s)) => match resolved {
                         Err(t) => vcpu.deliver_jit_invoke_trap(t),

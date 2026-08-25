@@ -83,11 +83,14 @@ fn host_assisted_resolve_links_a_serialized_plugin_by_name() {
     // → re-verify → funcs. No `resolve_imports_with` in the harness; the host did the rewrite.
     let funcs = jit_resolve_and_validate(&blob, None, |n| (n == "F").then_some(Resolved::Slot(0)))
         .expect("host resolves the plugin's import by name");
+    // #922: resolution is source-to-source and preserves the type section, so the plugin's decoded
+    // types resolve the interned call sigs in the resolved funcs.
+    let types = decode_module(&blob).expect("decode plugin").types;
 
     // Compile the resolved unit at runtime against the host's live table, then call it: it dispatches
     // through the shared table to the host's F — F(10,3) = 23.
     let ptrs = cm
-        .define_extra(&funcs)
+        .define_extra(&funcs, &types)
         .expect("define_extra (compile the plugin)");
     let (out, _) =
         unsafe { cm.run_extra(ptrs[0].tramp, 2, 1, &[10, 3], None) }.expect("run plugin");

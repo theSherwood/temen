@@ -99,7 +99,7 @@ pub fn print_module(m: &Module) -> String {
                 temen_ir::TypeEntry::Interface(elems) => {
                     let ops: Vec<String> = elems
                         .iter()
-                        .map(|e| format!("{}: {}", e.name, e.ty))
+                        .map(|e| format!("{}: {}", print_op_name(&e.name), e.ty))
                         .collect();
                     let _ = writeln!(s, "type {i} interface {{ {} }}", ops.join(", "));
                 }
@@ -148,7 +148,7 @@ pub fn print_module(m: &Module) -> String {
                 Some(temen_ir::TypeEntry::Interface(elems)) if elems.len() == e.ops.len() => elems
                     .iter()
                     .zip(&e.ops)
-                    .map(|(el, f)| format!("{}: {f}", el.name))
+                    .map(|(el, f)| format!("{}: {f}", print_op_name(&el.name)))
                     .collect(),
                 _ => e.ops.iter().map(|f| f.to_string()).collect(),
             };
@@ -315,6 +315,26 @@ fn escape_bytes(bytes: &[u8]) -> String {
     s
 }
 
+/// True when `name` re-lexes as exactly one bare identifier token equal to itself, so it can be
+/// printed unquoted. The `all(is_ident_char)` clause also rejects a leading `%` (which
+/// `is_ident_start` allows but the lexer's ident run does not consume) and the empty string.
+fn is_bare_ident(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty() && is_ident_start(b[0]) && b.iter().all(|&c| is_ident_char(c))
+}
+
+/// Render an interface op name for the text form: bare when it is a valid identifier, otherwise a
+/// quoted, `escape_bytes`-escaped string. Interface op names are arbitrary strings that decode and
+/// verify (empty, whitespace, `\0`, punctuation), but the parser reads a bare name as an `Ident`
+/// token — so a non-identifier name must be quoted or `parse ∘ print` breaks (#1075).
+fn print_op_name(name: &str) -> String {
+    if is_bare_ident(name) {
+        name.to_string()
+    } else {
+        format!("\"{}\"", escape_bytes(name.as_bytes()))
+    }
+}
+
 fn print_func_at(s: &mut String, f: &Func, fn_results: &[usize], m: &Module, idx: Option<usize>) {
     // §3.5 settled surface: every definition carries its checked positional label, and one
     // brace construct groups everything — `func N (…) -> (…) { block N (…) { … } }`.
@@ -342,7 +362,7 @@ fn print_func_at(s: &mut String, f: &Func, fn_results: &[usize], m: &Module, idx
                                               // other CapCall CAP_SELF prints as the raw `cap.call`, which round-trips on its own.
         let mut prev_const0: Option<u32> = None;
         for inst in &b.insts {
-            let n = inst.result_count(fn_results);
+            let n = inst.result_count(fn_results, &m.types);
             if n == 0 {
                 // No-result instruction (`store`, void `call`): no `vN =` binding.
                 let _ = writeln!(s, "    {}", print_inst(inst, m, prev_const0));
@@ -358,10 +378,20 @@ fn print_func_at(s: &mut String, f: &Func, fn_results: &[usize], m: &Module, idx
             prev_const0 = matches!(inst, Inst::ConstI32(0)).then_some(next);
             next += n as u32;
         }
-        let _ = writeln!(s, "    {}", print_term(&b.term));
+        let _ = writeln!(s, "    {}", print_term(&b.term, m));
         s.push_str("  }\n");
     }
     s.push_str("}\n");
+}
+
+/// Resolve an interned signature index (FuncType interning, #922) to its `FuncType` for
+/// printing the inline `(params) -> (results)` text. A malformed index/kind yields an empty
+/// signature — the verifier is what rejects it; the printer stays total.
+fn sig_of(m: &Module, t: u32) -> FuncType {
+    match m.types.get(t as usize) {
+        Some(temen_ir::TypeEntry::Func(ft)) => ft.clone(),
+        _ => FuncType::default(),
+    }
 }
 
 fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
@@ -446,12 +476,15 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
         ),
         Inst::Call { func, args } => format!("call {func}{}", arglist(args)),
         Inst::RefFunc { func } => format!("ref.func {func}"),
-        Inst::CallIndirect { ty, idx, args } => format!(
-            "call_indirect ({}) -> ({}) v{idx}{}",
-            types(&ty.params),
-            types(&ty.results),
-            arglist(args)
-        ),
+        Inst::CallIndirect { ty, idx, args } => {
+            let s = sig_of(m, *ty);
+            format!(
+                "call_indirect ({}) -> ({}) v{idx}{}",
+                types(&s.params),
+                types(&s.results),
+                arglist(args)
+            )
+        }
         // §3.6 sugar: the service points print as `svc.poll`/`svc.wait` (greppable, per the
         // design) — pure spelling over `cap.call CAP_SELF_TYPE_ID 9|10`; the ignored handle
         // operand rides along so the round-trip is exact.
@@ -461,7 +494,11 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
             sig,
             handle,
             args,
-        } if sig.params.is_empty() && *sig.results == [ValType::I64] && args.is_empty() => {
+        } if {
+            let s = sig_of(m, *sig);
+            s.params.is_empty() && s.results == [ValType::I64]
+        } && args.is_empty() =>
+        {
             let name = if *op == 9 { "svc.poll" } else { "svc.wait" };
             format!("{name} v{handle}")
         }
@@ -476,26 +513,32 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
             sig,
             handle,
             args,
-        } if cap_self_sig_matches(*op, sig, args.len()) && Some(*handle) == prev_const0 => match op
+        } if cap_self_sig_matches(*op, &sig_of(m, *sig), args.len())
+            && Some(*handle) == prev_const0 =>
         {
-            0 => "cap.self.count".to_string(),
-            4 => "cap.self.attest".to_string(),
-            1 => format!("cap.self.get v{}", args[0]),
-            2 => format!("cap.self.resolve v{} v{}", args[0], args[1]),
-            _ => format!("cap.self.label v{} v{} v{}", args[0], args[1], args[2]),
-        },
+            match op {
+                0 => "cap.self.count".to_string(),
+                4 => "cap.self.attest".to_string(),
+                1 => format!("cap.self.get v{}", args[0]),
+                2 => format!("cap.self.resolve v{} v{}", args[0], args[1]),
+                _ => format!("cap.self.label v{} v{} v{}", args[0], args[1], args[2]),
+            }
+        }
         Inst::CapCall {
             type_id,
             op,
             sig,
             handle,
             args,
-        } => format!(
-            "cap.call {type_id} {op} ({}) -> ({}) v{handle}{}",
-            types(&sig.params),
-            types(&sig.results),
-            arglist(args)
-        ),
+        } => {
+            let s = sig_of(m, *sig);
+            format!(
+                "cap.call {type_id} {op} ({}) -> ({}) v{handle}{}",
+                types(&s.params),
+                types(&s.results),
+                arglist(args)
+            )
+        }
         // Manifest capability call (§3.5, v8): `call.import <idx>[.<opname> | op <n>] (args)`.
         // The op signature is recovered from the declaration through the type section on
         // re-parse; the op prints by name when the grouped import's interface resolves,
@@ -743,7 +786,7 @@ fn memarg(offset: u64) -> String {
     s
 }
 
-fn print_term(t: &Terminator) -> String {
+fn print_term(t: &Terminator, m: &Module) -> String {
     match t {
         Terminator::Br { target, args } => format!("br {target}{}", arglist(args)),
         Terminator::BrIf {
@@ -782,12 +825,15 @@ fn print_term(t: &Terminator) -> String {
             }
         }
         Terminator::ReturnCall { func, args } => format!("return_call {func}{}", arglist(args)),
-        Terminator::ReturnCallIndirect { ty, idx, args } => format!(
-            "return_call_indirect ({}) -> ({}) v{idx}{}",
-            types(&ty.params),
-            types(&ty.results),
-            arglist(args)
-        ),
+        Terminator::ReturnCallIndirect { ty, idx, args } => {
+            let s = sig_of(m, *ty);
+            format!(
+                "return_call_indirect ({}) -> ({}) v{idx}{}",
+                types(&s.params),
+                types(&s.results),
+                arglist(args)
+            )
+        }
         Terminator::Unreachable => "unreachable".to_string(),
     }
 }
@@ -1993,6 +2039,8 @@ impl<'a> Parser<'a> {
                 PTerm::Return(v) => Terminator::Return(v),
                 PTerm::ReturnCall { func, args } => Terminator::ReturnCall { func, args },
                 PTerm::ReturnCallIndirect { ty, idx, args } => {
+                    // FuncType interning (#922): intern the inline sig to a `types` index.
+                    let ty = self.intern_func_type(ty);
                     Terminator::ReturnCallIndirect { ty, idx, args }
                 }
                 PTerm::Unreachable => Terminator::Unreachable,
@@ -2097,7 +2145,7 @@ impl<'a> Parser<'a> {
         let mut elems = Vec::new();
         if !matches!(self.peek(), Some(Tok::RBrace)) {
             loop {
-                let name = self.parse_ident()?;
+                let name = self.parse_op_name()?;
                 self.expect(&Tok::Colon)?;
                 let ty = self.parse_u32()?;
                 elems.push(temen_ir::IfaceOp { name, ty });
@@ -2123,7 +2171,7 @@ impl<'a> Parser<'a> {
                 match self.peek() {
                     Some(Tok::Int(_)) => positional.push(self.parse_u32()?),
                     _ => {
-                        let name = self.parse_ident()?;
+                        let name = self.parse_op_name()?;
                         self.expect(&Tok::Colon)?;
                         let f = self.parse_u32()?;
                         named.push((name, f));
@@ -2287,7 +2335,7 @@ impl<'a> Parser<'a> {
                     *handle = handle_idx;
                 }
             }
-            let n = inst.result_count(&self.fn_results);
+            let n = inst.result_count(&self.fn_results, &self.types);
             if self.auto_debug {
                 dbg.inst_lines.push(cur);
             }
@@ -2438,7 +2486,7 @@ impl<'a> Parser<'a> {
         Inst::CapCall {
             type_id: temen_ir::CAP_SELF_TYPE_ID,
             op,
-            sig,
+            sig: self.intern_func_type(sig), // FuncType interning (#922)
             handle: u32::MAX, // placeholder; parse_block points it at the injected i32.const 0
             args,
         }
@@ -2499,7 +2547,7 @@ impl<'a> Parser<'a> {
                 let args = self.parse_value_list(names)?;
                 return Ok(Inst::CallSym {
                     import: idx as u32,
-                    sig,
+                    sig: t, // interned index (FuncType interning, #922) — same as the import shape's
                     handle,
                     args,
                 });
@@ -2507,6 +2555,7 @@ impl<'a> Parser<'a> {
             if op == "call.sym" {
                 let import = self.parse_u32()?;
                 let sig = self.import_op_sig(import, 0)?;
+                let sig = self.intern_func_type(sig); // FuncType interning (#922)
                 let handle = self.value(names)?;
                 let args = self.parse_value_list(names)?;
                 return Ok(Inst::CallSym {
@@ -2530,6 +2579,7 @@ impl<'a> Parser<'a> {
                 0
             };
             let sig = self.import_op_sig(import, opidx)?;
+            let sig = self.intern_func_type(sig); // FuncType interning (#922)
             let args = self.parse_value_list(names)?;
             return Ok(Inst::CallImport {
                 import,
@@ -2553,6 +2603,7 @@ impl<'a> Parser<'a> {
                 0
             };
             let sig = self.iface_op_sig(ty, opidx)?;
+            let sig = self.intern_func_type(sig); // FuncType interning (#922)
             let handle = self.value(names)?;
             let args = self.parse_value_list(names)?;
             return Ok(Inst::CallImportDyn {
@@ -2684,23 +2735,21 @@ impl<'a> Parser<'a> {
             let results = self.parse_type_list()?;
             let idx = self.value(names)?;
             let args = self.parse_value_list(names)?;
-            return Ok(Inst::CallIndirect {
-                ty: FuncType { params, results },
-                idx,
-                args,
-            });
+            let ty = self.intern_func_type(FuncType { params, results }); // FuncType interning (#922)
+            return Ok(Inst::CallIndirect { ty, idx, args });
         }
         if op == "svc.poll" || op == "svc.wait" {
             // §3.6 sugar over `cap.call CAP_SELF_TYPE_ID 9|10 () -> (i64) v<h> ()` — the
             // service points, spelled greppably. The handle operand is carried but ignored.
             let handle = self.value(names)?;
+            let sig = self.intern_func_type(temen_ir::FuncType {
+                params: vec![],
+                results: vec![ValType::I64],
+            }); // FuncType interning (#922)
             return Ok(Inst::CapCall {
                 type_id: temen_ir::CAP_SELF_TYPE_ID,
                 op: if op == "svc.poll" { 9 } else { 10 },
-                sig: temen_ir::FuncType {
-                    params: vec![],
-                    results: vec![ValType::I64],
-                },
+                sig,
                 handle,
                 args: vec![],
             });
@@ -2715,10 +2764,11 @@ impl<'a> Parser<'a> {
             let results = self.parse_type_list()?;
             let handle = self.value(names)?;
             let args = self.parse_value_list(names)?;
+            let sig = self.intern_func_type(FuncType { params, results }); // FuncType interning (#922)
             return Ok(Inst::CapCall {
                 type_id,
                 op: op_index,
-                sig: FuncType { params, results },
+                sig,
                 handle,
                 args,
             });
@@ -3390,6 +3440,18 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse an interface op name: a bare identifier, or a quoted string for names that are not
+    /// valid identifiers (empty, whitespace, `\0`, punctuation). Mirrors [`print_op_name`] so the
+    /// text form round-trips any name the binary form and verifier accept (#1075).
+    fn parse_op_name(&mut self) -> Result<String, ParseError> {
+        if matches!(self.peek(), Some(Tok::Str(_))) {
+            String::from_utf8(self.parse_str()?)
+                .map_err(|_| ParseError("interface op name is not valid UTF-8".into()))
+        } else {
+            self.parse_ident()
+        }
+    }
+
     /// Parse the optional `offset=<int>` / `align=<int>` suffix of a memory op
     /// (either order, both optional; defaults 0).
     /// Parse the optional `offset=` memarg suffix. The `align=` suffix was removed at the wire rev
@@ -3723,6 +3785,57 @@ block 0 (v0: i32) {
         assert_eq!(idxs, vec![0, 0, 1], "repeated write shares index 0");
         // Canonical print → re-parse is identity (printer emits `call.sym` + decls).
         assert_eq!(parse_module(&print_module(&m)).unwrap(), m);
+    }
+
+    #[test]
+    fn interface_op_names_with_non_identifier_bytes_round_trip() {
+        // #1075 (nightly `roundtrip` fuzz): interface op names are arbitrary strings that decode
+        // and verify — empty, whitespace, `\0`, punctuation. They used to print bare, so the
+        // printed text could not re-parse (`unexpected character '\0'`). They now print quoted +
+        // escaped when they are not valid identifiers, so `parse ∘ print = id` holds for any name.
+        let mut m = temen_ir::Module::default();
+        m.types.push(temen_ir::TypeEntry::Interface(vec![
+            temen_ir::IfaceOp {
+                name: "bump".into(),
+                ty: 0,
+            }, // plain ident → stays bare
+            temen_ir::IfaceOp {
+                name: String::new(),
+                ty: 0,
+            }, // empty
+            temen_ir::IfaceOp {
+                name: "a b".into(),
+                ty: 0,
+            }, // whitespace
+            temen_ir::IfaceOp {
+                name: "has\0nul".into(),
+                ty: 0,
+            }, // the crashing byte
+            temen_ir::IfaceOp {
+                name: "a,b:c{}\"\\".into(),
+                ty: 0,
+            }, // grammar metachars + quote/backslash
+            temen_ir::IfaceOp {
+                name: "3leading".into(),
+                ty: 0,
+            }, // digit-leading (not an ident start)
+        ]));
+        let printed = print_module(&m);
+        assert!(
+            !printed.contains('\0'),
+            "printed text must not contain a raw NUL"
+        );
+        assert_eq!(parse_module(&printed).expect("re-parse of printed IR"), m);
+
+        // A hand-written bare op name still parses (back-compat with the existing corpora).
+        let bare = parse_module("type 0 interface { bump: 0 }\n").expect("bare op name parses");
+        assert_eq!(
+            bare.types,
+            vec![temen_ir::TypeEntry::Interface(vec![temen_ir::IfaceOp {
+                name: "bump".into(),
+                ty: 0
+            }])]
+        );
     }
 
     #[test]

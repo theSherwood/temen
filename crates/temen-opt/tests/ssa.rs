@@ -17,7 +17,7 @@ fn fn_results(m: &Module) -> Vec<usize> {
 fn assert_roundtrip(m: &Module) {
     let fr = fn_results(m);
     for f in &m.funcs {
-        let back = from_ssa(&to_ssa(f, &fr));
+        let back = from_ssa(&to_ssa(f, &fr, &m.types));
         assert_eq!(&back, f, "round-trip must be the identity");
     }
 }
@@ -192,7 +192,7 @@ fn multi_result_call_identity_and_defs() {
     assert_roundtrip(&m);
 
     // The Call's single result is a global value defined at (block 0, inst 0, result 0).
-    let ssa = to_ssa(&m.funcs[0], &fn_results(&m));
+    let ssa = to_ssa(&m.funcs[0], &fn_results(&m), &m.types);
     let call_result = ssa.values[0][1]; // slot 1 = first inst result (slot 0 is the param)
     assert_eq!(
         ssa.defs[call_result as usize],
@@ -247,7 +247,7 @@ fn roundtrip_preserves_behavior_through_interp() {
     };
     let m = one_func_module(f);
     let fr = fn_results(&m);
-    let back = from_ssa(&to_ssa(&m.funcs[0], &fr));
+    let back = from_ssa(&to_ssa(&m.funcs[0], &fr, &m.types));
     let m2 = one_func_module(back);
     for a in [0i32, 1, -5, 1000, i32::MIN] {
         assert_eq!(run(&m, &[IValue::I32(a)]), run(&m2, &[IValue::I32(a)]));
@@ -348,7 +348,7 @@ fn randomized_structural_roundtrip_is_identity() {
     let mut rng = Lcg(0x1234_5678_9abc_def0);
     for _ in 0..5000 {
         let f = random_func(&mut rng);
-        let back = from_ssa(&to_ssa(&f, &[]));
+        let back = from_ssa(&to_ssa(&f, &[], &[]));
         assert_eq!(back, f, "randomized round-trip diverged");
     }
 }

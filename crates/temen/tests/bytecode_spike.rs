@@ -108,7 +108,7 @@ fn compile(f: &Func, arities: &[usize]) -> Program {
         base.push(nslots);
         nslots += b.params.len() as u32;
         for inst in &b.insts {
-            nslots += inst.result_count(arities) as u32;
+            nslots += inst.result_count(arities, &[]) as u32;
         }
     }
     // First op index of each block (its entry pc), for branch targets.
@@ -120,7 +120,7 @@ fn compile(f: &Func, arities: &[usize]) -> Program {
         let g = |local_idx: u32| base[bi] + local_idx; // operand: block-local -> global slot
         for inst in &b.insts {
             let dst = base[bi] + local;
-            local += inst.result_count(arities) as u32;
+            local += inst.result_count(arities, &[]) as u32;
             match inst {
                 Inst::ConstI64(c) => ops.push(Op::Const { dst, c: *c }),
                 Inst::Call { func, args } => ops.push(Op::Call {

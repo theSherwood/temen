@@ -1986,7 +1986,9 @@ pub enum Inst {
     /// runtime-check the selected function's signature against `ty`, then call.
     /// `idx` is an `i32` table index; results are `ty.results`.
     CallIndirect {
-        ty: FuncType,
+        /// Index into [`Module::types`] naming the [`TypeEntry::Func`] signature to
+        /// runtime-check the selected function against (FuncType interning, #922).
+        ty: u32,
         idx: ValIdx,
         args: Vec<ValIdx>,
     },
@@ -2007,7 +2009,9 @@ pub enum Inst {
     CapCall {
         type_id: u32,
         op: u32,
-        sig: FuncType,
+        /// Index into [`Module::types`] naming the operation's [`TypeEntry::Func`]
+        /// signature (FuncType interning, #922); its results are appended.
+        sig: u32,
         handle: ValIdx,
         args: Vec<ValIdx>,
     },
@@ -2025,7 +2029,10 @@ pub enum Inst {
     CallImport {
         import: u32,
         op: u32,
-        sig: FuncType,
+        /// Index into [`Module::types`] naming the op's [`TypeEntry::Func`] signature
+        /// (FuncType interning, #922). The verifier resolves the op's signature through
+        /// the import's declared interface and checks `types[sig]` equals it.
+        sig: u32,
         args: Vec<ValIdx>,
     },
     /// §7/§22 **link-form symbolic call** — the loader ABI's placeholder, never executable.
@@ -2045,7 +2052,9 @@ pub enum Inst {
     /// the **next wire rev** (whenever one happens for its own reasons); no rev is spent on it.
     CallSym {
         import: u32,
-        sig: FuncType,
+        /// Index into [`Module::types`] naming the call's [`TypeEntry::Func`] signature
+        /// (FuncType interning, #922).
+        sig: u32,
         handle: ValIdx,
         args: Vec<ValIdx>,
     },
@@ -2097,7 +2106,10 @@ pub enum Inst {
     CallImportDyn {
         ty: u32,
         op: u32,
-        sig: FuncType,
+        /// Index into [`Module::types`] naming the op's [`TypeEntry::Func`] signature
+        /// (FuncType interning, #922); the verifier checks `types[sig]` equals the
+        /// op-`op` signature of the interface `types[ty]`.
+        sig: u32,
         handle: ValIdx,
         args: Vec<ValIdx>,
     },
@@ -2951,8 +2963,16 @@ impl Inst {
     ///
     /// Most instructions append exactly one; `Store` appends none; a `Call` appends
     /// its callee's result count, so it needs the per-function result arities
-    /// (indexed by [`FuncIdx`]) to answer; `CallIndirect` carries its own signature.
-    pub fn result_count(&self, fn_results: &[usize]) -> usize {
+    /// (indexed by [`FuncIdx`]) to answer; the call variants name their signature by a
+    /// `types` index (FuncType interning, #922), so `types` is needed to resolve the arity.
+    pub fn result_count(&self, fn_results: &[usize], types: &[TypeEntry]) -> usize {
+        // Resolve the result arity of an interned signature (a `types` index naming a
+        // `TypeEntry::Func`). A malformed index/kind reports 0 — the verifier is what
+        // rejects it; this stays total (used to trace SSA slot layout, `gc.roots` masks).
+        let sig_results = |t: u32| match types.get(t as usize) {
+            Some(TypeEntry::Func(ft)) => ft.results.len(),
+            _ => 0,
+        };
         match self {
             Inst::Store { .. }
             | Inst::MemCopy { .. }
@@ -2973,11 +2993,11 @@ impl Inst {
                 1
             }
             Inst::Call { func, .. } => fn_results.get(*func as usize).copied().unwrap_or(0),
-            Inst::CallIndirect { ty, .. } => ty.results.len(),
-            Inst::CapCall { sig, .. } => sig.results.len(),
-            Inst::CallImport { sig, .. } => sig.results.len(),
-            Inst::CallImportDyn { sig, .. } => sig.results.len(),
-            Inst::CallSym { sig, .. } => sig.results.len(),
+            Inst::CallIndirect { ty, .. } => sig_results(*ty),
+            Inst::CapCall { sig, .. } => sig_results(*sig),
+            Inst::CallImport { sig, .. } => sig_results(*sig),
+            Inst::CallImportDyn { sig, .. } => sig_results(*sig),
+            Inst::CallSym { sig, .. } => sig_results(*sig),
             _ => 1,
         }
     }
@@ -3022,7 +3042,9 @@ pub enum Terminator {
     /// Indirect tail call (`return_call_indirect`): like [`Terminator::ReturnCall`]
     /// but dispatched through the function table (masked + signature-checked, §3c).
     ReturnCallIndirect {
-        ty: FuncType,
+        /// Index into [`Module::types`] naming the [`TypeEntry::Func`] signature to
+        /// runtime-check the selected function against (FuncType interning, #922).
+        ty: u32,
         idx: ValIdx,
         args: Vec<ValIdx>,
     },
@@ -3376,6 +3398,16 @@ pub const POWERBOX_STACK_ALIGN: u64 = 65536;
 /// The data-stack reserve a frontend's `_start` layout leaves above the globals when sizing the
 /// window (`temen-llvm`'s `STACK_RESERVE`): a faulting guard region lies beyond the mapped window (§5).
 pub const POWERBOX_STACK_RESERVE: u64 = 1 << 20;
+/// The **guest-heap reserve** the linker leaves above the data stack when sizing a powerbox window
+/// (a program carrying a `data.top` stack). A fixed-window frontend whose allocator bumps in-window —
+/// the nim compute-shim `mmap` (no `vm_map` growth) — needs the merged window to actually hold its
+/// heap; otherwise the heap top depends on whatever `memory N` some runtime unit happened to declare
+/// (the compute shim's `memory 24`), which is incidental, not designed (#1060). Reserving heap here
+/// makes the window sizing explicit: the window always covers `data + stack reserve + heap reserve`,
+/// growing past a runtime unit's declaration when a program's static data is large. This is a
+/// **floor** on heap room, not a cap — the actual heap ceiling a frontend seeds is the full window
+/// top (`1 << size_log2`), which pow2 rounding often lifts above `entry_sp + STACK + HEAP` reserves.
+pub const POWERBOX_HEAP_RESERVE: u64 = 8 << 20;
 /// Hard anti-bomb ceiling on the fibers (`cont.new`) a single run may create (§12/§15). Bounds the
 /// fiber table so a fiber-bomb yields a clean `FiberFault` instead of unbounded host allocation. A
 /// [`Quota`] can only *tighten* below this, never raise it. `1 << 24` (~16.7M) — the ceiling equals the
@@ -4190,6 +4222,9 @@ pub fn resolve_imports_with(
         .collect::<Result<_, _>>()?;
     let mut out = module.clone();
     let fn_results: Vec<usize> = out.funcs.iter().map(|f| f.results.len()).collect();
+    // The call variants name their signature by a `types` index now (#922); snapshot the type
+    // section so `result_count` can resolve arities while `out.funcs` is mutably borrowed below.
+    let types = out.types.clone();
     for f in &mut out.funcs {
         for b in &mut f.blocks {
             // Map each value index to its defining instruction (block params → `None`) — a `Slot`
@@ -4197,7 +4232,7 @@ pub fn resolve_imports_with(
             // a *different* instruction than the `CallSym` we're rewriting.
             let mut def_of: Vec<Option<usize>> = vec![None; b.params.len()];
             for (p, inst) in b.insts.iter().enumerate() {
-                for _ in 0..inst.result_count(&fn_results) {
+                for _ in 0..inst.result_count(&fn_results, &types) {
                     def_of.push(Some(p));
                 }
             }
@@ -4211,9 +4246,9 @@ pub fn resolve_imports_with(
                     .ok_or(ImportError::BadImportIndex(import))?;
                 // Pull the call's pieces out of the placeholder so we can rebuild it.
                 let (sig, args) = match &mut b.insts[i] {
-                    Inst::CallSym { sig, args, .. } => {
-                        (core::mem::take(sig), core::mem::take(args))
-                    }
+                    // `sig` is now an interned `types` index (Copy); the rewritten call reuses
+                    // the same index for `CapCall.sig` / `CallIndirect.ty` (FuncType interning, #922).
+                    Inst::CallSym { sig, args, .. } => (*sig, core::mem::take(args)),
                     _ => unreachable!(),
                 };
                 b.insts[i] = match bind {
@@ -4563,9 +4598,10 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
         // The merged window (one shared linear memory) must (a) be at least as large as any unit
         // declared, (b) cover every relocated data segment — the units' data is **stacked** into
         // non-overlapping windows, so the top (`dtotal`) can exceed any single unit's 64 KiB — and
-        // (c) when the program has a `data.top` data stack, reserve [`POWERBOX_STACK_RESERVE`] above
-        // `entry_sp` for it (as [`synth_manifest_start`] does for the on-ramp entry), since the
-        // entry unit sized its own window for a stack that has since been pushed up by the other
+        // (c) when the program has a `data.top` data stack, reserve [`POWERBOX_STACK_RESERVE`] +
+        // [`POWERBOX_HEAP_RESERVE`] above `entry_sp` for the stack and the in-window guest heap (as
+        // [`synth_manifest_start`] does for the on-ramp entry, plus the heap floor #1060 wants), since
+        // the entry unit sized its own window for a stack that has since been pushed up by the other
         // units' data. Grow to the smallest power-of-two window that holds the max of these — never
         // shrinking a unit's request. No unit declaring memory ⇒ no data segments, so `None` stays
         // `None`.
@@ -4576,7 +4612,7 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
             .max()
             .map(|declared| {
                 let cover = if has_data_top {
-                    entry_sp + POWERBOX_STACK_RESERVE
+                    entry_sp + POWERBOX_STACK_RESERVE + POWERBOX_HEAP_RESERVE
                 } else {
                     dtotal
                 };
@@ -4835,11 +4871,25 @@ fn offset_type_indices(m: &mut Module, offset: u32) {
         for b in &mut f.blocks {
             for inst in &mut b.insts {
                 match inst {
-                    Inst::CallImportDyn { ty, .. }
-                    | Inst::CapSelfTypeId { ty }
-                    | Inst::CapSelfCovers { ty, .. } => *ty += offset,
+                    Inst::CapSelfTypeId { ty }
+                    | Inst::CapSelfCovers { ty, .. }
+                    // FuncType interning (#922): a call variant's `sig`/`ty` names an entry in the
+                    // unit's own type section, which the linker concatenates at `offset` — reindex
+                    // it alongside the interface refs so it resolves in the merged type section.
+                    | Inst::CallIndirect { ty, .. } => *ty += offset,
+                    Inst::CapCall { sig, .. }
+                    | Inst::CallImport { sig, .. }
+                    | Inst::CallSym { sig, .. } => *sig += offset,
+                    // `call.import.dyn` carries both an interface ref (`ty`) and the interned sig.
+                    Inst::CallImportDyn { ty, sig, .. } => {
+                        *ty += offset;
+                        *sig += offset;
+                    }
                     _ => {}
                 }
+            }
+            if let Terminator::ReturnCallIndirect { ty, .. } = &mut b.term {
+                *ty += offset;
             }
         }
     }
@@ -5048,7 +5098,7 @@ mod import_tests {
                 Inst::CallSym {
                     // v3 = write(handle=v0, v1, v2)
                     import: 0,
-                    sig: sig_write.clone(),
+                    sig: 0, // #922: sig_write, interned by add_func_import at type index 0
                     handle: 0,
                     args: vec![1, 2],
                 },
@@ -5056,7 +5106,7 @@ mod import_tests {
                 Inst::CallSym {
                     // exit(handle=v0, v4)
                     import: 1,
-                    sig: sig_exit.clone(),
+                    sig: 1, // #922: sig_exit, interned by add_func_import at type index 1
                     handle: 0,
                     args: vec![4],
                 },
@@ -5117,7 +5167,11 @@ mod import_tests {
             } => {
                 assert_eq!((*type_id, *op, *handle), (0, 1, 0));
                 assert_eq!(args, &vec![1, 2]);
-                assert_eq!(sig.results.len(), 1);
+                // #922: the resolved cap.call carries an interned type index into `r.types`.
+                let TypeEntry::Func(ft) = &r.types[*sig as usize] else {
+                    panic!("cap.call sig must name a func type");
+                };
+                assert_eq!(ft.results.len(), 1);
             }
             other => panic!("expected CapCall, got {other:?}"),
         }
@@ -5244,18 +5298,69 @@ mod link_layout_tests {
             "unit B relocated to a fresh host page above unit A"
         );
     }
+
+    /// A link unit with a `data.top` stack and a data segment — enough to make [`link`] take the
+    /// powerbox-window-sizing branch.
+    fn data_top_unit(data_len: usize) -> LinkUnit {
+        LinkUnit {
+            module: Module {
+                data_ptrs: Vec::new(),
+                data_funcrefs: Vec::new(),
+                types: vec![],
+                funcs: vec![Func {
+                    params: vec![],
+                    results: vec![],
+                    blocks: vec![Block {
+                        params: vec![],
+                        insts: vec![Inst::DataTop], // v0 = data.top (dead; marks has_data_top)
+                        term: Terminator::Return(vec![]),
+                    }],
+                }],
+                memory: Some(Memory { size_log2: 16 }), // small declared window (64 KiB)
+                data: vec![Data {
+                    offset: 0,
+                    readonly: false,
+                    bytes: vec![0u8; data_len],
+                }],
+                imports: vec![],
+                exports: vec![],
+                data_exports: vec![],
+                impl_exports: vec![],
+                debug_info: None,
+            },
+            exports: vec![],
+            data_exports: vec![],
+        }
+    }
+
+    /// #1060: a powerbox program's merged window must cover `data + stack reserve + heap reserve`, so
+    /// an in-window bump allocator (the nim compute-shim `mmap`) has guaranteed heap room above the
+    /// data stack — independent of whatever `memory N` a runtime unit declared. Before the fix the
+    /// window only covered `entry_sp + STACK_RESERVE`, so the heap's headroom was incidental.
+    #[test]
+    fn powerbox_window_reserves_heap_above_the_stack() {
+        let linked = link(&[data_top_unit(4096)]).expect("link data.top unit");
+        let mem = linked.memory.expect("has a window");
+        let win = 1u64 << mem.size_log2;
+        let entry_sp = powerbox_entry_sp(&linked);
+        assert!(
+            win >= entry_sp + POWERBOX_STACK_RESERVE + POWERBOX_HEAP_RESERVE,
+            "window {win:#x} must cover entry_sp {entry_sp:#x} + stack {:#x} + heap {:#x} reserves",
+            POWERBOX_STACK_RESERVE,
+            POWERBOX_HEAP_RESERVE,
+        );
+        // And it grew past the unit's small declared window to do so (the reserve is load-bearing).
+        assert!(
+            mem.size_log2 > 16,
+            "window grew past the declared 64 KiB to hold the reserves (got 2^{})",
+            mem.size_log2
+        );
+    }
 }
 
 #[cfg(test)]
 mod effects_tests {
     use super::*;
-
-    fn sig() -> FuncType {
-        FuncType {
-            params: vec![],
-            results: vec![ValType::I64],
-        }
-    }
 
     #[test]
     fn pure_ops_have_no_effects_and_are_removable() {
@@ -5375,14 +5480,14 @@ mod effects_tests {
                 args: vec![],
             },
             Inst::CallIndirect {
-                ty: sig(),
+                ty: 0, // #922: only effects() is tested here; the sig is never resolved
                 idx: 0,
                 args: vec![],
             },
             Inst::CapCall {
                 type_id: 0,
                 op: 0,
-                sig: sig(),
+                sig: 0, // #922: only effects() is tested here; the sig is never resolved
                 handle: 0,
                 args: vec![],
             },

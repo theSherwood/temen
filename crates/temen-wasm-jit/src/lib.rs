@@ -69,8 +69,23 @@ use temen_ir::bounds::{in_window, ub_at, ub_of, UB_TOP};
 use temen_ir::cap_id;
 use temen_ir::{
     AtomicRmwOp, BinOp, Block, CmpOp, ConvOp, Func, FuncType, Inst, IntTy, IntUnOp, LoadOp, Module,
-    StoreOp, Terminator, ValIdx, ValType, DEFAULT_RESERVED_LOG2,
+    StoreOp, Terminator, TypeEntry, ValIdx, ValType, DEFAULT_RESERVED_LOG2,
 };
+
+/// Resolve an interned call type index (#922) to its [`FuncType`] — the index a call variant
+/// (`call_indirect`, `cap.call`, …) carries in place of an inline signature. A miss returns a
+/// static empty signature so callers stay total (the module was already verified, so a well-formed
+/// index always resolves to a `Func`).
+fn sig_of(types: &[TypeEntry], t: u32) -> &FuncType {
+    static EMPTY: FuncType = FuncType {
+        params: Vec::new(),
+        results: Vec::new(),
+    };
+    match types.get(t as usize) {
+        Some(TypeEntry::Func(ft)) => ft,
+        _ => &EMPTY,
+    }
+}
 
 /// Trap code delivered through `env.trap` when the per-dispatch fuel counter goes negative.
 pub const TRAP_OUT_OF_FUEL: i32 = 1;
@@ -797,6 +812,8 @@ fn is_nested_leaf_cap(type_id: u32, op: u32) -> bool {
 pub fn outline_nested_cap_calls(m: &mut Module) {
     let base = m.funcs.len() as u32;
     let mut wrappers: Vec<Func> = Vec::new();
+    // #922: snapshot the type section so interned call sigs resolve while `m.funcs` is borrowed mut.
+    let types = m.types.clone();
     for f in &mut m.funcs {
         for b in &mut f.blocks {
             for inst in &mut b.insts {
@@ -812,19 +829,21 @@ pub fn outline_nested_cap_calls(m: &mut Module) {
                         continue;
                     }
                     let g = base + wrappers.len() as u32;
-                    // Wrapper signature: (handle: i32, ...sig.params) -> sig.results.
-                    let mut params = Vec::with_capacity(1 + sig.params.len());
+                    let ft = sig_of(&types, *sig); // #922: resolve interned call type index
+                                                   // Wrapper signature: (handle: i32, ...sig.params) -> sig.results.
+                    let mut params = Vec::with_capacity(1 + ft.params.len());
                     params.push(ValType::I32);
-                    params.extend(sig.params.iter().copied());
+                    params.extend(ft.params.iter().copied());
                     let nparams = params.len() as u32;
                     let wrapper_args: Vec<u32> = (1..nparams).collect();
-                    let ret: Vec<u32> = (nparams..nparams + sig.results.len() as u32).collect();
+                    let ret: Vec<u32> = (nparams..nparams + ft.results.len() as u32).collect();
+                    let results = ft.results.clone();
                     let block = Block {
                         params: params.clone(),
                         insts: vec![Inst::CapCall {
                             type_id: *type_id,
                             op: *op,
-                            sig: sig.clone(),
+                            sig: *sig,
                             handle: 0,
                             args: wrapper_args,
                         }],
@@ -832,7 +851,7 @@ pub fn outline_nested_cap_calls(m: &mut Module) {
                     };
                     wrappers.push(Func {
                         params,
-                        results: sig.results.clone(),
+                        results,
                         blocks: vec![block],
                     });
                     let mut call_args = Vec::with_capacity(1 + args.len());
@@ -857,7 +876,7 @@ fn block_value_types(m: &Module, b: &Block, nested_caps: bool) -> Result<Vec<Val
             // that spawns a nested VM is in-subset. Gated to the lowerable ops; any other cap-call
             // still hits the catch-all below (out-of-subset).
             Inst::CapCall { type_id, op, sig, .. } if nested_caps && is_nested_cap(*type_id, *op) => {
-                for r in &sig.results {
+                for r in &sig_of(&m.types, *sig).results {
                     tys.push(*r);
                 }
             }
@@ -914,8 +933,10 @@ fn block_value_types(m: &Module, b: &Block, nested_caps: bool) -> Result<Vec<Val
             }
             // A funcref is a plain `i32` (the function index, §3c) — a bare `i32.const`.
             Inst::RefFunc { .. } => tys.push(ValType::I32),
-            // Indirect call: results come from the call site's own signature immediate.
-            Inst::CallIndirect { ty, .. } => tys.extend(ty.results.iter().copied()),
+            // Indirect call: results come from the call site's interned signature (#922).
+            Inst::CallIndirect { ty, .. } => {
+                tys.extend(sig_of(&m.types, *ty).results.iter().copied())
+            }
             // ---- §17 SIMD (v128): the in-subset core lane ops (see the opcode helpers above). Each
             // yields a `v128`, except lane-extract (the shape's scalar) and the reductions
             // any/all_true/bitmask (`i32`). The verifier already
@@ -1710,6 +1731,8 @@ pub fn compile_module_b2(
 pub fn outline_cap_calls(m: &mut Module) {
     let base = m.funcs.len() as u32;
     let mut wrappers: Vec<Func> = Vec::new();
+    // #922: snapshot the type section so interned call sigs resolve while `m.funcs` is borrowed mut.
+    let types = m.types.clone();
     for f in &mut m.funcs {
         for b in &mut f.blocks {
             for inst in &mut b.insts {
@@ -1722,21 +1745,23 @@ pub fn outline_cap_calls(m: &mut Module) {
                 } = inst
                 {
                     let g = base + wrappers.len() as u32;
-                    // Wrapper signature: (handle: i32, ...sig.params) -> sig.results.
-                    let mut params = Vec::with_capacity(1 + sig.params.len());
+                    let ft = sig_of(&types, *sig); // #922: resolve interned call type index
+                                                   // Wrapper signature: (handle: i32, ...sig.params) -> sig.results.
+                    let mut params = Vec::with_capacity(1 + ft.params.len());
                     params.push(ValType::I32);
-                    params.extend(sig.params.iter().copied());
+                    params.extend(ft.params.iter().copied());
                     let nparams = params.len() as u32;
                     // Body: `cap.call` on the wrapper's own params (handle = val 0, args = vals 1..),
                     // then return its results (appended right after the params).
                     let wrapper_args: Vec<u32> = (1..nparams).collect();
-                    let ret: Vec<u32> = (nparams..nparams + sig.results.len() as u32).collect();
+                    let ret: Vec<u32> = (nparams..nparams + ft.results.len() as u32).collect();
+                    let results = ft.results.clone();
                     let block = Block {
                         params: params.clone(),
                         insts: vec![Inst::CapCall {
                             type_id: *type_id,
                             op: *op,
-                            sig: sig.clone(),
+                            sig: *sig,
                             handle: 0,
                             args: wrapper_args,
                         }],
@@ -1744,7 +1769,7 @@ pub fn outline_cap_calls(m: &mut Module) {
                     };
                     wrappers.push(Func {
                         params,
-                        results: sig.results.clone(),
+                        results,
                         blocks: vec![block],
                     });
                     // Rewrite the call site to invoke the wrapper: prepend the handle to the op args.
@@ -1763,25 +1788,27 @@ pub fn outline_cap_calls(m: &mut Module) {
                 } = inst
                 {
                     let g = base + wrappers.len() as u32;
-                    // Wrapper shape (v8): (...sig.params) -> sig.results — no handle operand;
-                    // the import index is an immediate, so it stays baked into the wrapper body.
-                    let params = sig.params.clone();
+                    let ft = sig_of(&types, *sig); // #922: resolve interned call type index
+                                                   // Wrapper shape (v8): (...sig.params) -> sig.results — no handle operand;
+                                                   // the import index is an immediate, so it stays baked into the wrapper body.
+                    let params = ft.params.clone();
                     let nparams = params.len() as u32;
                     let wrapper_args: Vec<u32> = (0..nparams).collect();
-                    let ret: Vec<u32> = (nparams..nparams + sig.results.len() as u32).collect();
+                    let ret: Vec<u32> = (nparams..nparams + ft.results.len() as u32).collect();
+                    let results = ft.results.clone();
                     let block = Block {
                         params: params.clone(),
                         insts: vec![Inst::CallImport {
                             import: *import,
                             op: *op,
-                            sig: sig.clone(),
+                            sig: *sig,
                             args: wrapper_args,
                         }],
                         term: Terminator::Return(ret),
                     };
                     wrappers.push(Func {
                         params,
-                        results: sig.results.clone(),
+                        results,
                         blocks: vec![block],
                     });
                     let call_args = args.clone();
@@ -1797,20 +1824,22 @@ pub fn outline_cap_calls(m: &mut Module) {
                 } = inst
                 {
                     let g = base + wrappers.len() as u32;
-                    // §7/§22 symbolic call: same shape as the old handle-carrying form —
-                    // (handle: i32, ...sig.params) -> sig.results; the dispatch ignores the
-                    // handle, but it is a live call-site register to thread through.
-                    let mut params = Vec::with_capacity(1 + sig.params.len());
+                    let ft = sig_of(&types, *sig); // #922: resolve interned call type index
+                                                   // §7/§22 symbolic call: same shape as the old handle-carrying form —
+                                                   // (handle: i32, ...sig.params) -> sig.results; the dispatch ignores the
+                                                   // handle, but it is a live call-site register to thread through.
+                    let mut params = Vec::with_capacity(1 + ft.params.len());
                     params.push(ValType::I32);
-                    params.extend(sig.params.iter().copied());
+                    params.extend(ft.params.iter().copied());
                     let nparams = params.len() as u32;
                     let wrapper_args: Vec<u32> = (1..nparams).collect();
-                    let ret: Vec<u32> = (nparams..nparams + sig.results.len() as u32).collect();
+                    let ret: Vec<u32> = (nparams..nparams + ft.results.len() as u32).collect();
+                    let results = ft.results.clone();
                     let block = Block {
                         params: params.clone(),
                         insts: vec![Inst::CallSym {
                             import: *import,
-                            sig: sig.clone(),
+                            sig: *sig,
                             handle: 0,
                             args: wrapper_args,
                         }],
@@ -1818,7 +1847,7 @@ pub fn outline_cap_calls(m: &mut Module) {
                     };
                     wrappers.push(Func {
                         params,
-                        results: sig.results.clone(),
+                        results,
                         blocks: vec![block],
                     });
                     let mut call_args = Vec::with_capacity(1 + args.len());
@@ -2722,7 +2751,7 @@ fn emit_module(
                 });
             for ty in indirect_ty {
                 needs_table = true;
-                let key = indirect_type_bytes(ty)?;
+                let key = indirect_type_bytes(sig_of(&m.types, *ty))?; // #922: resolve interned index
                 if !types.contains(&key) {
                     types.push(key);
                 }
@@ -4470,7 +4499,7 @@ fn emit_block_body(
                 handle,
                 args,
             } if nested_caps && is_nested_cap(*type_id, *op) => {
-                let n_results = sig.results.len();
+                let n_results = sig_of(&m.types, *sig).results.len(); // #922: interned index
                 if *op == 0 {
                     // env.instantiate(win, inst, entry, off, size_log2, quota) -> i32 child handle
                     code.push(OP_LOCAL_GET);
@@ -4592,7 +4621,8 @@ fn emit_block_body(
             // check (a mismatch traps `IndirectCallType`); a null padding slot traps too (an empty
             // interpreter slot). No fuel debit here — the callee debits on entry to its own loop.
             Inst::CallIndirect { ty, idx, args } => {
-                let n_results = ty.results.len();
+                let ft = sig_of(&m.types, *ty); // #922: resolve interned call type index
+                let n_results = ft.results.len();
                 code.push(OP_LOCAL_GET);
                 uleb(code, 0); // win
                 code.push(OP_LOCAL_GET);
@@ -4605,7 +4635,7 @@ fn emit_block_body(
                 sleb32(code, (table_size - 1) as i32);
                 code.push(0x71); // i32.and → mask into the table
                 code.push(0x11); // call_indirect
-                uleb(code, indirect_type_index(types, ty)? as u64);
+                uleb(code, indirect_type_index(types, ft)? as u64);
                 uleb(code, 0); // table index 0
                 for i in (0..n_results).rev() {
                     code.push(OP_LOCAL_SET);
@@ -5040,7 +5070,10 @@ fn emit_block_body(
             sleb32(code, (table_size - 1) as i32);
             code.push(0x71); // i32.and → mask into the table
             code.push(OP_RETURN_CALL_INDIRECT);
-            uleb(code, indirect_type_index(types, ty)? as u64);
+            uleb(
+                code,
+                indirect_type_index(types, sig_of(&m.types, *ty))? as u64, // #922: interned index
+            );
             uleb(code, 0); // table index 0
         }
     }

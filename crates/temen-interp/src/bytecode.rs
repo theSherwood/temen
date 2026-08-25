@@ -635,6 +635,14 @@ pub struct Compiled {
     /// `len - 1` of the natural table (`next_power_of_two(n_funcs)`), used to mask a `ref.func`/fiber
     /// funcref to a module-local slot (the fiber/coroutine dispatch is module-0-natural).
     table_mask: usize,
+    /// The module's §7 import manifest + type section, retained **only for a §14 separate-module
+    /// child** (op 5 / op 13) so [`Vcpu::new_confined_child_core`] can bind each import slot against the
+    /// child's granted powerbox ([`Host::bind_child_manifest`] — the same call the tree-walker's op-13
+    /// arm makes), letting a compiled phase child reach its re-granted `fs`/`stdout` through `call.import`
+    /// rather than `CapFault`ing. Empty for the root program and same-module (op-0) children — their
+    /// imports are bound by the run harness, not here — so binding is a no-op for every legacy path.
+    imports: std::sync::Arc<[temen_ir::Import]>,
+    types: std::sync::Arc<[temen_ir::TypeEntry]>,
 }
 
 impl Compiled {
@@ -1032,7 +1040,7 @@ fn compile_module_for(m: &Module) -> Option<Compiled> {
     if uses_rec && !m.impl_exports.is_empty() && !scan_seams(&m.funcs).bytecode_serves_fork() {
         return None;
     }
-    compile_module(&m.funcs)
+    compile_module(&m.funcs, &m.types)
 }
 
 /// §3d — validate + **drain** a spawn record's `Budget` at a driver's commit site, returning the
@@ -1107,20 +1115,24 @@ pub(crate) fn child_entry_ok(params: &[ValType], results: &[ValType]) -> bool {
         && (params == [ValType::I64] || params == [ValType::I64, ValType::I64])
 }
 
-pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
-    compile_module_with(funcs, true)
+pub fn compile_module(funcs: &[Func], types: &[temen_ir::TypeEntry]) -> Option<Compiled> {
+    compile_module_with(funcs, types, true)
 }
 
 /// Unfused lowering — one op per source instruction, so the step/location trace stays
 /// tree-walker-identical. The debug/trace entries (`ir_trace`, `ir_window_trace`, `ir_value_trace`,
 /// `debug_advance_fiber`, `dbg_pick_runnable`) use this; results and traps are identical to the fused
 /// form (fusion only merges a pure compare into its sole-consumer branch).
-pub fn compile_module_unfused(funcs: &[Func]) -> Option<Compiled> {
-    compile_module_with(funcs, false)
+pub fn compile_module_unfused(funcs: &[Func], types: &[temen_ir::TypeEntry]) -> Option<Compiled> {
+    compile_module_with(funcs, types, false)
 }
 
 /// Lower every function, or `None` if any uses an op outside this slice's subset.
-fn compile_module_with(funcs: &[Func], fuse: bool) -> Option<Compiled> {
+fn compile_module_with(
+    funcs: &[Func],
+    types: &[temen_ir::TypeEntry],
+    fuse: bool,
+) -> Option<Compiled> {
     // Coroutines (§14, `spawn_coroutine`/`resume`/`yield`) are driven **inline** as single-vCPU
     // children with a Yielder-only powerbox. A coroutine module that *also* uses fibers or threads
     // would need the child to participate in those seams (a coroutine child can use `cont.*`/`thread.*`
@@ -1163,7 +1175,7 @@ fn compile_module_with(funcs: &[Func], fuse: bool) -> Option<Compiled> {
     let arities: Vec<usize> = funcs.iter().map(|f| f.results.len()).collect();
     let mut progs = Vec::with_capacity(funcs.len());
     for f in funcs {
-        progs.push(compile_func(f, &arities, fuse)?);
+        progs.push(compile_func(f, &arities, types, fuse)?);
     }
     let table_mask = funcs.len().next_power_of_two().max(1) - 1;
     Some(Compiled {
@@ -1174,10 +1186,35 @@ fn compile_module_with(funcs: &[Func], fuse: bool) -> Option<Compiled> {
             .map(|f| (f.params.clone(), f.results.clone()))
             .collect(),
         table_mask,
+        // The manifest is attached only by the §14 separate-module spawn path (`with_manifest`); a
+        // plain compile (root program, same-module child) carries none, so child-spawn binding is a
+        // no-op for it.
+        imports: std::sync::Arc::from(Vec::new()),
+        types: std::sync::Arc::from(Vec::new()),
     })
 }
 
-fn compile_func(f: &Func, arities: &[usize], fuse: bool) -> Option<Program> {
+impl Compiled {
+    /// Attach a §14 child's import manifest + type section (from its [`ModuleGrant`]) so
+    /// [`Vcpu::new_confined_child_core`] can bind it against the child's granted powerbox. Used only on
+    /// the `instantiate_module` (op 5 / op 13) commit path.
+    fn with_manifest(
+        mut self,
+        imports: std::sync::Arc<[temen_ir::Import]>,
+        types: std::sync::Arc<[temen_ir::TypeEntry]>,
+    ) -> Compiled {
+        self.imports = imports;
+        self.types = types;
+        self
+    }
+}
+
+fn compile_func(
+    f: &Func,
+    arities: &[usize],
+    types: &[temen_ir::TypeEntry],
+    fuse: bool,
+) -> Option<Program> {
     // Global slot per value: each block's params then its value-producing insts, in order.
     let mut base = Vec::with_capacity(f.blocks.len());
     let mut nslots = 0u32;
@@ -1185,7 +1222,7 @@ fn compile_func(f: &Func, arities: &[usize], fuse: bool) -> Option<Program> {
         base.push(nslots);
         nslots += b.params.len() as u32;
         for inst in &b.insts {
-            nslots += inst.result_count(arities) as u32;
+            nslots += inst.result_count(arities, types) as u32;
         }
     }
     let mut block_pc = vec![0u32; f.blocks.len()];
@@ -1204,8 +1241,8 @@ fn compile_func(f: &Func, arities: &[usize], fuse: bool) -> Option<Program> {
         let mut local = b.params.len() as u32;
         for (i, inst) in b.insts.iter().enumerate() {
             let dst = base[bi] + local;
-            local += inst.result_count(arities) as u32;
-            ops.push(compile_inst(inst, dst, base[bi], &g)?);
+            local += inst.result_count(arities, types) as u32;
+            ops.push(compile_inst(inst, dst, base[bi], types, &g)?);
             src.push(Some((bi as u32, i as u32)));
         }
         // Terminator -> edge copies (block-local src in this block -> first slots of target) + jump.
@@ -1312,8 +1349,8 @@ fn compile_func(f: &Func, arities: &[usize], fuse: bool) -> Option<Program> {
             Terminator::ReturnCallIndirect { ty, idx, args } => ops.push(Op::TailCallIndirect {
                 idx: g(*idx),
                 args: args.iter().map(|a| g(*a)).collect(),
-                want_params: ty.params.clone().into(),
-                want_results: ty.results.clone().into(),
+                want_params: super::call_sig(types, *ty).params.clone().into(),
+                want_results: super::call_sig(types, *ty).results.clone().into(),
             }),
         }
         // Exactly one terminator op was pushed above (fused `BrIfCmp` or a plain terminator); pair it
@@ -1359,7 +1396,13 @@ fn compile_func(f: &Func, arities: &[usize], fuse: bool) -> Option<Program> {
     })
 }
 
-fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32) -> Option<Op> {
+fn compile_inst(
+    inst: &Inst,
+    dst: u32,
+    block_base: u32,
+    types: &[temen_ir::TypeEntry],
+    g: &impl Fn(u32) -> u32,
+) -> Option<Op> {
     Some(match inst {
         Inst::ConstI32(c) => Op::Const {
             dst,
@@ -1551,8 +1594,8 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             idx: g(*idx),
             args: args.iter().map(|a| g(*a)).collect(),
             dst,
-            want_params: ty.params.clone().into(),
-            want_results: ty.results.clone().into(),
+            want_params: super::call_sig(types, *ty).params.clone().into(),
+            want_results: super::call_sig(types, *ty).results.clone().into(),
         },
         // Synchronous capability call: the generic powerbox path (guest suspended, host computes,
         // same activation continues) is driven here via `host.cap_dispatch_slots`. The
@@ -1649,9 +1692,14 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                     args: args[1..].iter().map(|a| g(*a)).collect(),
                     dst,
                     // The cap.call sig is `(i64 code, params…) -> (results…)`; the unit entry's
-                    // params are sig.params without the leading code-handle.
-                    params: sig.params.get(1..).unwrap_or(&[]).to_vec().into(),
-                    results: sig.results.clone().into(),
+                    // params are super::call_sig(types, *sig).params without the leading code-handle.
+                    params: super::call_sig(types, *sig)
+                        .params
+                        .get(1..)
+                        .unwrap_or(&[])
+                        .to_vec()
+                        .into(),
+                    results: super::call_sig(types, *sig).results.clone().into(),
                 },
                 (cap_id::INSTANTIATOR, _) => return None,
                 (cap_id::SHARED_REGION, 4) => return None,
@@ -1666,7 +1714,7 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                 // (The timed `svc.wait` form — op 10 with the optional timeout arg — is
                 // oracle-only and declines below; `serve_qualifies` already vetoed the module.)
                 (temen_ir::CAP_SELF_TYPE_ID, op @ (9 | 10))
-                    if sig.results.len() == 1 && args.is_empty() =>
+                    if super::call_sig(types, *sig).results.len() == 1 && args.is_empty() =>
                 {
                     Op::SvcPoll {
                         dst,
@@ -1680,12 +1728,12 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                 (temen_ir::CAP_SELF_TYPE_ID, 11) => Op::CloneCaller {
                     args: args.iter().map(|a| g(*a)).collect(),
                     dst,
-                    has_result: !sig.results.is_empty(),
+                    has_result: !super::call_sig(types, *sig).results.is_empty(),
                 },
                 (temen_ir::CAP_SELF_TYPE_ID, 12) => Op::Reap {
                     pid: args.first().map(|a| g(*a)),
                     dst,
-                    has_result: !sig.results.is_empty(),
+                    has_result: !super::call_sig(types, *sig).results.is_empty(),
                 },
                 // CALLS.md §10.6 — `fuel.remaining` (op 13) reads the vCPU's live fuel counter, which
                 // the host-side `cap_dispatch_slots` can't see; rather than add a native bytecode op,
@@ -1703,10 +1751,10 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                     type_id: *type_id,
                     op: *op,
                     handle: g(*handle),
-                    params: sig.params.clone().into(),
+                    params: super::call_sig(types, *sig).params.clone().into(),
                     args: args.iter().map(|a| g(*a)).collect(),
                     dst,
-                    results: sig.results.clone().into(),
+                    results: super::call_sig(types, *sig).results.clone().into(),
                 },
             }
         }
@@ -1809,10 +1857,10 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             // §3.5: the reserved import dispatch packs `(slot | consumer_op << 16)`.
             op: *import | (*op << 16),
             handle: u32::MAX, // no operand (v8); the exec passes 0, the dispatch ignores it
-            params: sig.params.clone().into(),
+            params: super::call_sig(types, *sig).params.clone().into(),
             args: args.iter().map(|a| g(*a)).collect(),
             dst,
-            results: sig.results.clone().into(),
+            results: super::call_sig(types, *sig).results.clone().into(),
         },
         // §7/§22 symbolic call: when bound at instantiation it is a flat import dispatch
         // (op 0); the legacy handle operand is a live register the dispatch ignores.
@@ -1822,10 +1870,10 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             type_id: temen_ir::CAP_IMPORT_TYPE_ID,
             op: *import,
             handle: u32::MAX,
-            params: sig.params.clone().into(),
+            params: super::call_sig(types, *sig).params.clone().into(),
             args: args.iter().map(|a| g(*a)).collect(),
             dst,
-            results: sig.results.clone().into(),
+            results: super::call_sig(types, *sig).results.clone().into(),
         },
         // §3.5 dynamic-mode dispatch by type-section reference: the reserved dyn entry packs
         // `(type_idx | op << 16)`; the handle register is live.
@@ -1839,10 +1887,10 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             type_id: temen_ir::CAP_DYN_TYPE_ID,
             op: *ty | (*op << 16),
             handle: g(*handle),
-            params: sig.params.clone().into(),
+            params: super::call_sig(types, *sig).params.clone().into(),
             args: args.iter().map(|a| g(*a)).collect(),
             dst,
-            results: sig.results.clone().into(),
+            results: super::call_sig(types, *sig).results.clone().into(),
         },
         // §3.5 self-namespace extensions (see `Op::CapSelfExt`).
         Inst::ExportHandle { export } => Op::CapSelfExt {
@@ -3105,6 +3153,15 @@ impl<'p> Vcpu<'p> {
         // Install any re-granted caps (op-13 grant list) into the child powerbox under their names. The
         // starter entry args stay `[Instantiator, AddressSpace]`; re-granted caps are name-resolved.
         install_grants(&mut host);
+        // IMPORTS.md phase 3 / §3.3 — bind the child module's import manifest against its powerbox, so a
+        // §14 separate-module phase child's generic imports (`write`/`read`/`exit`, and any named grant
+        // like `fs`) reach their re-granted caps through `call.import` rather than `CapFault`ing on first
+        // use — the resumable-engine counterpart of the tree-walker op-13 arm's `bind_child_manifest`.
+        // Empty (root program / same-module child) → `Ok`, so every legacy path is unchanged; a `required`
+        // slot with nothing to bind fails the spawn closed (`Malformed`), matching the tree-walker's
+        // fail-closed refusal.
+        host.bind_child_manifest(&cunit.imports, &cunit.types)
+            .map_err(|_| Trap::Malformed)?;
         let args = if want_as {
             vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
         } else {
@@ -3571,19 +3628,34 @@ impl<'p> Vcpu<'p> {
         budget: i32,
         dst: u32,
     ) -> Result<Option<VcpuEvent>, Trap> {
-        // Resolve the granted module from the run's powerbox (the shared one when attached).
-        let (cfuncs, cmem_log2, cdata) = match self.shared_host {
+        // Resolve the granted module from the run's powerbox (the shared one when attached). Its
+        // import manifest + type section come along so the child's `call.import`s bind at spawn.
+        let (cfuncs, cmem_log2, cdata, cimports, ctypes) = match self.shared_host {
             Some(m) => {
                 let g = m.lock_unpoisoned();
                 let g = g.resolve_module(mh)?;
-                (g.funcs.clone(), g.memory_log2, g.data.clone())
+                (
+                    g.funcs.clone(),
+                    g.memory_log2,
+                    g.data.clone(),
+                    g.imports.clone(),
+                    g.types.clone(),
+                )
             }
             None => {
                 let g = self.host.resolve_module(mh)?;
-                (g.funcs.clone(), g.memory_log2, g.data.clone())
+                (
+                    g.funcs.clone(),
+                    g.memory_log2,
+                    g.data.clone(),
+                    g.imports.clone(),
+                    g.types.clone(),
+                )
             }
         };
-        let child_compiled = compile_module(&cfuncs).ok_or(Trap::Malformed)?;
+        let child_compiled = compile_module(&cfuncs, &ctypes)
+            .ok_or(Trap::Malformed)?
+            .with_manifest(cimports, ctypes);
         let ok_entry = child_compiled
             .sigs
             .get(entry as usize)
@@ -3601,7 +3673,11 @@ impl<'p> Vcpu<'p> {
             ibase,
             self.mem.as_ref().map_or(0, |m| m.null_guard),
         );
-        let mod_ok = cmem_log2 == Some(size_log2 as u8);
+        // A separate-module child's carve must be **at least** its declared memory (FORK.md §8.6 / #773
+        // — a larger window is a safe superset: confinement (§2) still masks every access to the actual
+        // carve, and the span above the declared memory is the heap room an allocating phase grows into
+        // via `vm_map`). `<=`, matching the cooperative/parallel drive arms.
+        let mod_ok = cmem_log2.is_some_and(|ml| ml <= size_log2 as u8);
         if !ok_entry || !fits || !mod_ok {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
             return Ok(None);
@@ -3769,6 +3845,7 @@ impl<'p> Vcpu<'p> {
     pub fn deliver_jit_install(
         &mut self,
         funcs: Result<std::sync::Arc<[Func]>, Trap>,
+        types: std::sync::Arc<[temen_ir::TypeEntry]>,
     ) -> Option<usize> {
         let Some(PendingJit::Install { dst }) = self.pending_jit.take() else {
             panic!("deliver_jit_install with no pending install");
@@ -3780,7 +3857,7 @@ impl<'p> Vcpu<'p> {
                 return None;
             }
         };
-        let (res, slot) = match compile_module(&funcs) {
+        let (res, slot) = match compile_module(&funcs, &types) {
             // Install into THIS vCPU's domain (== the shared one for a root; a §14 confined child —
             // which can't hold a Jit cap anyway — would only ever fill its own table).
             Some(unit) => match self
@@ -3829,7 +3906,11 @@ impl<'p> Vcpu<'p> {
     /// synchronously over this vCPU's window — its results marshalled to the awaiting dst. The invoked
     /// unit runs over this vCPU's (deny-all) powerbox, so a unit that itself makes a `cap.call` faults;
     /// a powerbox-backed unit is the orchestrator's responsibility (see [`Vcpu`]).
-    pub fn deliver_jit_invoke(&mut self, funcs: Result<std::sync::Arc<[Func]>, Trap>) {
+    pub fn deliver_jit_invoke(
+        &mut self,
+        funcs: Result<std::sync::Arc<[Func]>, Trap>,
+        types: std::sync::Arc<[temen_ir::TypeEntry]>,
+    ) {
         let Some(PendingJit::Invoke {
             argv,
             params,
@@ -3846,7 +3927,7 @@ impl<'p> Vcpu<'p> {
                 return;
             }
         };
-        let unit = match compile_module(&funcs) {
+        let unit = match compile_module(&funcs, &types) {
             Some(u) => u,
             None => {
                 self.trap = Some(Trap::Malformed);
@@ -4144,7 +4225,7 @@ pub type ValueTrace = (Vec<(super::IrPc, Vec<Value>)>, Result<Vec<Value>, Trap>)
 /// reports tree-walker-identical locations, so breakpoints/stepping at [`crate::IrPc`] granularity
 /// land at the same program points on both backends.
 pub fn ir_trace(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Option<IrTrace> {
-    let c = compile_module_unfused(&m.funcs)?; // unfused: one step per source inst (Slice 5a)
+    let c = compile_module_unfused(&m.funcs, &m.types)?; // unfused: one step per source inst (Slice 5a)
     if func as usize >= c.progs.len() {
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
@@ -4193,7 +4274,7 @@ pub fn ir_window_trace(
     addr: u64,
     len: usize,
 ) -> Option<WindowTrace> {
-    let c = compile_module_unfused(&m.funcs)?; // unfused: one step per source inst (Slice 5a)
+    let c = compile_module_unfused(&m.funcs, &m.types)?; // unfused: one step per source inst (Slice 5a)
     if func as usize >= c.progs.len() {
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
@@ -4251,12 +4332,16 @@ pub fn ir_value_trace(
     if m.funcs.get(func as usize)?.blocks.len() != 1 {
         return None;
     }
-    let types0 =
-        temen_verify::func_value_types(&m.funcs[func as usize], &m.funcs, m.memory.is_some())
-            .into_iter()
-            .next()
-            .unwrap_or_default();
-    let c = compile_module_unfused(&m.funcs)?; // unfused: one step per source inst (Slice 5a)
+    let types0 = temen_verify::func_value_types(
+        &m.funcs[func as usize],
+        &m.funcs,
+        &m.types,
+        m.memory.is_some(),
+    )
+    .into_iter()
+    .next()
+    .unwrap_or_default();
+    let c = compile_module_unfused(&m.funcs, &m.types)?; // unfused: one step per source inst (Slice 5a)
     if func as usize >= c.progs.len() {
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
@@ -4326,13 +4411,14 @@ impl ModuleDebug {
                 base.push(n);
                 n += b.params.len() as u32;
                 for inst in &b.insts {
-                    n += inst.result_count(&arities) as u32;
+                    n += inst.result_count(&arities, &m.types) as u32;
                 }
             }
             fn_block_base.push(base);
             fn_block_types.push(temen_verify::func_value_types(
                 g,
                 &m.funcs,
+                &m.types,
                 m.memory.is_some(),
             ));
         }
@@ -5203,7 +5289,7 @@ impl DebugRun {
             fn_block_types,
             ..
         } = ModuleDebug::build(m, 0);
-        let c = compile_module_unfused(&m.funcs)?; // unfused: debug stepping (Slice 5a)
+        let c = compile_module_unfused(&m.funcs, &m.types)?; // unfused: debug stepping (Slice 5a)
         let dom = Domain::new(c, host.jit_table_log2());
         let mem = build_mem(m);
         let mut vt = VTask::new(&dom.source.primary(), func as usize, args).ok()?;
@@ -6561,11 +6647,16 @@ fn dbg_instantiate_module(
 ) -> Result<(), Trap> {
     // Resolve + clone the granted module from the powerbox (mirrors production: the module handle is
     // resolved against the shared host). A forged/closed/wrong-type handle is an inert CapFault.
-    let (cfuncs, cmem_log2, cdata) = {
+    let (cfuncs, cmem_log2, cdata, ctypes) = {
         let g = host.resolve_module(mh)?;
-        (g.funcs.clone(), g.memory_log2, g.data.clone())
+        (
+            g.funcs.clone(),
+            g.memory_log2,
+            g.data.clone(),
+            g.types.clone(),
+        )
     };
-    let child_compiled = match compile_module(&cfuncs) {
+    let child_compiled = match compile_module(&cfuncs, &ctypes) {
         Some(c) => c,
         None => return Err(Trap::Malformed),
     };
@@ -6587,7 +6678,9 @@ fn dbg_instantiate_module(
         ibase,
         shared_mem.as_ref().map_or(0, |m| m.null_guard),
     );
-    let mod_ok = cmem_log2 == Some(size_log2 as u8);
+    // A larger carve than the child's declared memory is a safe superset (§2 masks to the actual
+    // carve); the extra span is heap room for an allocating phase's `vm_map`. `<=`, matching the arms.
+    let mod_ok = cmem_log2.is_some_and(|ml| ml <= size_log2 as u8);
     if !ok_entry || !fits || !mod_ok {
         tasks[ti]
             .vt
@@ -6716,14 +6809,20 @@ fn dbg_jit_install(
     code: i32,
     dst: u32,
 ) -> Result<(), Trap> {
-    let funcs = host.resolve_jit_domain(h).and_then(|domain| {
+    let (funcs, types) = host.resolve_jit_domain(h).and_then(|domain| {
         let (cd, cu) = host.resolve_jit_code(code)?;
         if cd != domain {
             return Err(Trap::CapFault);
         }
-        host.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
+        host.jit_unit_funcs(cd, cu)
+            .ok_or(Trap::CapFault)
+            .and_then(|f| {
+                host.jit_unit_types(cd, cu)
+                    .ok_or(Trap::CapFault)
+                    .map(|t| (f, t))
+            })
     })?;
-    let res = match compile_module(&funcs) {
+    let res = match compile_module(&funcs, &types) {
         Some(unit) => match jit_install_into(source, table, unit) {
             Some(slot) => slot as i64,
             None => super::ENOSPC,
@@ -6770,14 +6869,20 @@ fn dbg_jit_invoke_unit(
     params: &[ValType],
     results: &[ValType],
 ) -> Result<(Compiled, Vec<Value>), Trap> {
-    let funcs = host.resolve_jit_domain(h).and_then(|domain| {
+    let (funcs, types) = host.resolve_jit_domain(h).and_then(|domain| {
         let (cd, cu) = host.resolve_jit_code(code)?;
         if cd != domain {
             return Err(Trap::CapFault);
         }
-        host.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
+        host.jit_unit_funcs(cd, cu)
+            .ok_or(Trap::CapFault)
+            .and_then(|f| {
+                host.jit_unit_types(cd, cu)
+                    .ok_or(Trap::CapFault)
+                    .map(|t| (f, t))
+            })
     })?;
-    let unit = compile_module(&funcs).ok_or(Trap::Malformed)?;
+    let unit = compile_module(&funcs, &types).ok_or(Trap::Malformed)?;
     let arity_ok = unit
         .sigs
         .first()
@@ -7077,7 +7182,7 @@ impl ScheduledDebugRun {
             fn_block_types,
             ..
         } = ModuleDebug::build(m, 0);
-        let c = compile_module_unfused(&m.funcs)?; // unfused: debug stepping (Slice 5a)
+        let c = compile_module_unfused(&m.funcs, &m.types)?; // unfused: debug stepping (Slice 5a)
         let dom = Domain::new(c, host.jit_table_log2());
         let mem = build_mem(m);
         let vt = VTask::new(&dom.source.primary(), func as usize, args).ok()?;
@@ -10444,7 +10549,7 @@ impl CoopSched {
                     // Compile the granted module to bytecode. A module using an op the engine can't lower
                     // is the one place a guest-provided program outruns coverage (no tree-walker fallback
                     // mid-run) — a `Malformed` trap, exactly as for `Jit.install`.
-                    let child_compiled = match compile_module(&cfuncs) {
+                    let child_compiled = match compile_module(&cfuncs, &cmodule.types) {
                         Some(c) => c,
                         None => {
                             complete(tasks, ti, Err(Trap::Malformed));
@@ -10475,7 +10580,11 @@ impl CoopSched {
                         ibase,
                         mem.as_ref().map_or(0, |m| m.null_guard),
                     );
-                    let mod_ok = cmem_log2 == Some(size_log2 as u8);
+                    // A separate-module child's carve must be **at least** its declared memory (FORK.md §8.6 / #773
+                    // — a larger window is a safe superset: confinement (§2) still masks every access to the actual
+                    // carve, and the span above the declared memory is the heap room an allocating phase grows into
+                    // via `vm_map`). `<=`, matching the cooperative/parallel drive arms.
+                    let mod_ok = cmem_log2.is_some_and(|ml| ml <= size_log2 as u8);
                     if !ok_entry || !fits || !mod_ok {
                         tasks[ti]
                             .vt
@@ -10819,12 +10928,18 @@ impl CoopSched {
                     // an inert CapFault → trap), compile the unit to bytecode, and install it. Compiling
                     // the unit can fail only if it uses an op the bytecode engine doesn't lower yet — the
                     // one place a guest-provided unit can outrun coverage (no tree-walker fallback mid-run).
-                    let funcs = match host.resolve_jit_domain(h).and_then(|domain| {
+                    let (funcs, types) = match host.resolve_jit_domain(h).and_then(|domain| {
                         let (cd, cu) = host.resolve_jit_code(code)?;
                         if cd != domain {
                             return Err(Trap::CapFault);
                         }
-                        host.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
+                        host.jit_unit_funcs(cd, cu)
+                            .ok_or(Trap::CapFault)
+                            .and_then(|f| {
+                                host.jit_unit_types(cd, cu)
+                                    .ok_or(Trap::CapFault)
+                                    .map(|t| (f, t))
+                            })
                     }) {
                         Ok(f) => f,
                         Err(t) => {
@@ -10832,7 +10947,7 @@ impl CoopSched {
                             continue;
                         }
                     };
-                    let res = match compile_module(&funcs) {
+                    let res = match compile_module(&funcs, &types) {
                         Some(unit) => match dom.install(unit) {
                             Some(slot) => {
                                 // #926 slice 2f: mirror `slot → code` so the browser B2 driver can
@@ -10923,12 +11038,18 @@ impl CoopSched {
                         });
                     }
                     // Resolve unit funcs (authority + cross-domain) and compile, as for install.
-                    let funcs = match host.resolve_jit_domain(h).and_then(|domain| {
+                    let (funcs, types) = match host.resolve_jit_domain(h).and_then(|domain| {
                         let (cd, cu) = host.resolve_jit_code(code)?;
                         if cd != domain {
                             return Err(Trap::CapFault);
                         }
-                        host.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
+                        host.jit_unit_funcs(cd, cu)
+                            .ok_or(Trap::CapFault)
+                            .and_then(|f| {
+                                host.jit_unit_types(cd, cu)
+                                    .ok_or(Trap::CapFault)
+                                    .map(|t| (f, t))
+                            })
                     }) {
                         Ok(f) => f,
                         Err(t) => {
@@ -10936,7 +11057,7 @@ impl CoopSched {
                             continue;
                         }
                     };
-                    let unit = match compile_module(&funcs) {
+                    let unit = match compile_module(&funcs, &types) {
                         Some(u) => u,
                         None => {
                             complete(tasks, ti, Err(Trap::Malformed));
@@ -11753,20 +11874,26 @@ fn run_vcpu_parallel<'scope, 'env>(
                 // handle is an inert CapFault → trap), then compile + install. Compiling can fail only
                 // if the unit uses an op the engine doesn't lower yet (the one place a guest unit can
                 // outrun coverage — no tree-walker fallback mid-run).
-                let funcs = {
+                let (funcs, types) = {
                     let g = host.lock_unpoisoned();
                     match g.resolve_jit_domain(h).and_then(|domain| {
                         let (cd, cu) = g.resolve_jit_code(code)?;
                         if cd != domain {
                             return Err(Trap::CapFault);
                         }
-                        g.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
+                        g.jit_unit_funcs(cd, cu)
+                            .ok_or(Trap::CapFault)
+                            .and_then(|f| {
+                                g.jit_unit_types(cd, cu)
+                                    .ok_or(Trap::CapFault)
+                                    .map(|t| (f, t))
+                            })
                     }) {
                         Ok(f) => f,
                         Err(t) => return (Err(t), mem),
                     }
                 };
-                let res = match compile_module(&funcs) {
+                let res = match compile_module(&funcs, &types) {
                     Some(unit) => match dom.install(unit) {
                         Some(slot) => slot as i64,
                         None => super::ENOSPC,
@@ -11799,20 +11926,26 @@ fn run_vcpu_parallel<'scope, 'env>(
                 results,
             }) => {
                 // Resolve unit funcs (authority + cross-domain) and compile, as for install.
-                let funcs = {
+                let (funcs, types) = {
                     let g = host.lock_unpoisoned();
                     match g.resolve_jit_domain(h).and_then(|domain| {
                         let (cd, cu) = g.resolve_jit_code(code)?;
                         if cd != domain {
                             return Err(Trap::CapFault);
                         }
-                        g.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
+                        g.jit_unit_funcs(cd, cu)
+                            .ok_or(Trap::CapFault)
+                            .and_then(|f| {
+                                g.jit_unit_types(cd, cu)
+                                    .ok_or(Trap::CapFault)
+                                    .map(|t| (f, t))
+                            })
                     }) {
                         Ok(f) => f,
                         Err(t) => return (Err(t), mem),
                     }
                 };
-                let unit = match compile_module(&funcs) {
+                let unit = match compile_module(&funcs, &types) {
                     Some(u) => u,
                     None => return (Err(Trap::Malformed), mem),
                 };
@@ -11992,16 +12125,21 @@ fn run_vcpu_parallel<'scope, 'env>(
                 }
                 // Resolve + clone the granted module under the host lock (a forged/closed/wrong-type
                 // handle is an inert CapFault → trap).
-                let (cfuncs, cmem_log2, cdata) = {
+                let (cfuncs, cmem_log2, cdata, ctypes) = {
                     let g = host.lock_unpoisoned();
                     match g.resolve_module(mh) {
-                        Ok(grant) => (grant.funcs.clone(), grant.memory_log2, grant.data.clone()),
+                        Ok(grant) => (
+                            grant.funcs.clone(),
+                            grant.memory_log2,
+                            grant.data.clone(),
+                            grant.types.clone(),
+                        ),
                         Err(t) => return (Err(t), mem),
                     }
                 };
                 // Compile to bytecode — a module using an op the engine can't lower is the one place a
                 // guest-provided program outruns coverage (a `Malformed` trap, as for `Jit.install`).
-                let child_compiled = match compile_module(&cfuncs) {
+                let child_compiled = match compile_module(&cfuncs, &ctypes) {
                     Some(c) => c,
                     None => return (Err(Trap::Malformed), mem),
                 };
@@ -12028,7 +12166,11 @@ fn run_vcpu_parallel<'scope, 'env>(
                     ibase,
                     mem.as_ref().map_or(0, |m| m.null_guard),
                 );
-                let mod_ok = cmem_log2 == Some(size_log2 as u8);
+                // A separate-module child's carve must be **at least** its declared memory (FORK.md §8.6 / #773
+                // — a larger window is a safe superset: confinement (§2) still masks every access to the actual
+                // carve, and the span above the declared memory is the heap room an allocating phase grows into
+                // via `vm_map`). `<=`, matching the cooperative/parallel drive arms.
+                let mod_ok = cmem_log2.is_some_and(|ml| ml <= size_log2 as u8);
                 if !ok_entry || !fits || !mod_ok {
                     vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
                     continue;
@@ -12216,6 +12358,16 @@ fn teardown_domains(
 /// [`Vm::resume`]'s loop at suspension points (preemption budget, blocking op, debug stop), persists
 /// the cursor back into `self`, and hands this struct to the caller to park / hash / resume — exactly
 /// what `park_suspended(frames)` does for the tree-walker today.
+/// #1062 — the monotonic **`setjmp` token** source for the bytecode engine (its own counter; a run
+/// uses one engine tier, and `setjmp_points` is per-`Vm`, so it never collides with the tree-walk
+/// counter). Each `setjmp` writes a fresh token into the guest `jmp_buf`'s opaque first 8 bytes and
+/// keys its checkpoint by that token, so a guest that *copies* the `jmp_buf` (bash's `COPY_PROCENV`
+/// memcpy of `top_level`, on every `bash -c`) carries the checkpoint identity with the bytes —
+/// address-keying could not, and mis-resolved a restored copy into an infinite `longjmp` loop. The
+/// value is opaque: never guest-observable, so only token *equality* (write `T`, read it back)
+/// matters — the exact value and any cross-thread interleaving of this counter cannot affect a run.
+static BYTE_SETJMP_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// A `<setjmp.h>` checkpoint (see [`Vm::setjmp_points`]): everything needed to re-enter a `setjmp`
 /// activation. `longjmp` truncates [`Vm::stack`] to `depth` (the intervening activations discarded —
 /// C has no cleanups), restores the `(module, cur, base, pc)` cursor, and sets the `dst` register to
@@ -12255,10 +12407,14 @@ struct Vm {
     pc: usize,
     /// Edge-copy staging buffer (parallel-copy safety); kept here so it is reused across resumes.
     scratch: Vec<Reg>,
-    /// `<setjmp.h>` checkpoints — `setjmp` records its activation's resume point here keyed by the
-    /// guest `jmp_buf` address; `longjmp` looks it up. No register snapshot is needed (unlike the
-    /// tree-walker): the flat per-function register layout gives each block its own slots, so the
-    /// `setjmp` block's values survive a deeper call in place. Keyed by address (re-`setjmp` overwrites).
+    /// `<setjmp.h>` checkpoints — `setjmp` records its activation's resume point here, keyed by a
+    /// per-`setjmp` **token** it writes into the guest `jmp_buf`'s opaque first 8 bytes (#1062);
+    /// `longjmp` reads the token back from the (possibly-copied) buffer and looks it up. No register
+    /// snapshot is needed (unlike the tree-walker): the flat per-function register layout gives each
+    /// block its own slots, so the `setjmp` block's values survive a deeper call in place.
+    /// Token-keying (vs the old address key) is what lets a guest *copy* a `jmp_buf` — bash's
+    /// `COPY_PROCENV` memcpy of `top_level` — carry the checkpoint identity with the bytes; bounded
+    /// by pruning checkpoints whose `setjmp` activation has returned (`SetJmp` op).
     setjmp_points: std::collections::BTreeMap<u64, ByteSetJmp>,
     /// §12.8 4A.5: the window offset of this context's shadow-SP **word** — the base of its own region
     /// (`shadow_region_base`), which `durable.shadow_base` returns so the instrumented IR addresses its
@@ -12701,9 +12857,28 @@ impl Vm {
                 // activation) keyed by the guest `jmp_buf` address, and return 0. The register window
                 // survives in place (per-block slots are distinct), so no snapshot is taken.
                 Op::SetJmp { buf, dst } => {
-                    let key = r!(*buf).i64() as u64;
+                    // #1062 — key the checkpoint by a fresh TOKEN written into the guest `jmp_buf`'s
+                    // opaque first 8 bytes (not the buffer address), so a guest that memcpy-copies
+                    // the buffer (bash's `COPY_PROCENV`) carries the identity with the bytes. The
+                    // write goes through the confinement mask like any guest store; a `jmp_buf` is
+                    // always a committed object the guest just passed, so a fault is a broken guest.
+                    let buf_addr = r!(*buf).i64() as u64;
+                    let token =
+                        BYTE_SETJMP_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    mem.as_mut().ok_or(Trap::Malformed)?.store_scalar(
+                        buf_addr,
+                        0,
+                        StoreOp::I64,
+                        token,
+                    )?;
+                    // Bound the token map (address-keying was bounded by overwrite; tokens are not):
+                    // drop checkpoints whose `setjmp` activation has returned — a `longjmp` to one
+                    // would trap regardless. A copied-but-live checkpoint sits at a still-live
+                    // activation (`depth <= stack.len()`) and is retained.
+                    let live = self.stack.len();
+                    self.setjmp_points.retain(|_, p| p.depth <= live);
                     self.setjmp_points.insert(
-                        key,
+                        token,
                         ByteSetJmp {
                             depth: self.stack.len(),
                             module,
@@ -12721,10 +12896,16 @@ impl Vm {
                 // `setjmp` result set to `val` (a `0` becomes `1`, per C). A missing checkpoint or one
                 // whose activation already returned traps in-sandbox (§3b totality).
                 Op::LongJmp { buf, val } => {
-                    let key = r!(*buf).i64() as u64;
+                    // #1062 — read the token back from the (possibly-copied) `jmp_buf` and look it up.
+                    let buf_addr = r!(*buf).i64() as u64;
                     let v = r!(*val).i32();
                     let resume = if v == 0 { 1 } else { v };
-                    let point = *self.setjmp_points.get(&key).ok_or(Trap::Malformed)?;
+                    let token = mem
+                        .as_ref()
+                        .ok_or(Trap::Malformed)?
+                        .load_scalar(buf_addr, 0, LoadOp::I64)?
+                        .i64() as u64;
+                    let point = *self.setjmp_points.get(&token).ok_or(Trap::Malformed)?;
                     if point.depth > self.stack.len() {
                         return Err(Trap::Malformed); // the setjmp activation already returned
                     }

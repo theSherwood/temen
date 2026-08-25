@@ -149,7 +149,7 @@ static long emit_poly(char *buf) {
   sleb(buf, 0);
   eb(buf, 0x7B); // v3 = call.sym "mul" (import 0) (a, a) — v8 link-form placeholder
   uleb(buf, 0);
-  emit_i64_pair_sig(buf);
+  uleb(buf, 0);  // sig: interned type-section index 0 (#922) — (i64, i64) -> (i64)
   uleb(buf, 2); // handle = v2
   eb(buf, 2);   // 2 args
   uleb(buf, 0);
@@ -158,7 +158,7 @@ static long emit_poly(char *buf) {
   sleb(buf, 0);
   eb(buf, 0x7B); // v5 = call.sym "add" (import 1) (v3, b) — v8 link-form placeholder
   uleb(buf, 1);
-  emit_i64_pair_sig(buf);
+  uleb(buf, 0);  // sig: interned type-section index 0 (#922) — (i64, i64) -> (i64)
   uleb(buf, 4); // handle = v4
   eb(buf, 2);   // 2 args
   uleb(buf, 3);

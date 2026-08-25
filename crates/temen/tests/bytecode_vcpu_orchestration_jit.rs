@@ -230,6 +230,22 @@ impl Orch {
         }
         g.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
     }
+    /// #922: the resolved unit's type section (empty on any resolution failure — the funcs
+    /// resolution above surfaces the trap, so this only feeds the interned-sig lookup).
+    fn resolve_unit_types(&self, handle: i32, code: i32) -> Arc<[temen_ir::TypeEntry]> {
+        let g = self.pb.lock().unwrap();
+        let Ok(domain) = g.resolve_jit_domain(handle) else {
+            return Arc::from(Vec::new());
+        };
+        let Ok((cd, cu)) = g.resolve_jit_code(code) else {
+            return Arc::from(Vec::new());
+        };
+        if cd != domain {
+            return Arc::from(Vec::new());
+        }
+        g.jit_unit_types(cd, cu)
+            .unwrap_or_else(|| Arc::from(Vec::new()))
+    }
     /// Authority check for `uninstall`: a forged/wrong-type domain handle traps.
     fn check_authority(&self, handle: i32) -> Result<(), Trap> {
         self.pb
@@ -284,7 +300,10 @@ fn drive<'s, 'e>(
                 vcpu.deliver_join(orch.join(id));
             }
             bytecode::VcpuEvent::JitInstall { handle, code } => {
-                vcpu.deliver_jit_install(orch.resolve_unit(handle, code));
+                vcpu.deliver_jit_install(
+                    orch.resolve_unit(handle, code),
+                    orch.resolve_unit_types(handle, code),
+                );
             }
             bytecode::VcpuEvent::JitUninstall { handle, slot: _ } => {
                 vcpu.deliver_jit_uninstall(orch.check_authority(handle));
@@ -297,7 +316,10 @@ fn drive<'s, 'e>(
                 results: _,
                 mapped: _, // interpreted delivery below — the codegen sync value is unused
             } => {
-                vcpu.deliver_jit_invoke(orch.resolve_unit(handle, code));
+                vcpu.deliver_jit_invoke(
+                    orch.resolve_unit(handle, code),
+                    orch.resolve_unit_types(handle, code),
+                );
             }
             // These kernels use only spawn/join + JIT; wait/notify/§14 never arise here.
             bytecode::VcpuEvent::Wait { .. }

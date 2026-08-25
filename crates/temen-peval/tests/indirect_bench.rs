@@ -13,7 +13,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use temen_ir::{
-    BinOp, Block, ConvOp, Func, FuncType, Inst, IntTy, Module, Terminator, ValType,
+    BinOp, Block, ConvOp, Func, FuncType, Inst, IntTy, Module, Terminator, TypeEntry, ValType,
     DEFAULT_RESERVED_LOG2,
 };
 use temen_jit::{CompiledModule, JitOutcome, Quota, INERT_CAP_THUNK};
@@ -111,7 +111,7 @@ fn dispatch_loop_module() -> Module {
                         b: 4,
                     }, // 6: idx = 1 + sel
                     Inst::CallIndirect {
-                        ty: hty,
+                        ty: 0, // #922: hty interned at type-section index 0
                         idx: 6,
                         args: vec![0, 0],
                     }, // 7: acc'
@@ -152,7 +152,7 @@ fn dispatch_loop_module() -> Module {
         data_ptrs: vec![],
         data_funcrefs: vec![],
         impl_exports: vec![],
-        types: vec![],
+        types: vec![TypeEntry::Func(hty)],
         debug_info: None,
     }
 }

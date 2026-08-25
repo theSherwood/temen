@@ -157,7 +157,7 @@ static long emit_client(char *buf) {
   sleb(buf, 0);
   eb(buf, 0x7B);          // v3 = call.sym "F" ... (v8 link-form placeholder)
   uleb(buf, 0);           //   import index 0
-  emit_i64_pair_sig(buf); //   self-describing sig (i64, i64) -> (i64)
+  uleb(buf, 0);           //   sig: interned type-section index 0 (#922) — (i64, i64) -> (i64)
   uleb(buf, 2);           //   handle operand = v2
   eb(buf, 2);             //   2 args
   uleb(buf, 0);           //     v0

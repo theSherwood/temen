@@ -123,7 +123,13 @@ fn run_and_print(
     cap: temen_run::HostCap,
     posix: temen_posix::Posix,
 ) {
-    match inst.run_with_caps(temen_run::Backend::TreeWalk, config, &[("posix", cap)]) {
+    // BASH_PROBE_BACKEND=bytecode runs on the wasm-safe bytecode tier (the browser engine);
+    // default is the tree-walk interp.
+    let backend = match std::env::var("BASH_PROBE_BACKEND").as_deref() {
+        Ok("bytecode") => temen_run::Backend::Bytecode,
+        _ => temen_run::Backend::TreeWalk,
+    };
+    match inst.run_with_caps(backend, config, &[("posix", cap)]) {
         Ok(r) => {
             println!("outcome: {:?}", r.outcome);
             println!(

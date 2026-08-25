@@ -1976,7 +1976,7 @@ fn revoked_host() -> (Host, i32, i32) {
 fn a_revoked_handle_completes_with_an_errno_on_all_backends() {
     let m = rev_module(CALLER);
     assert!(
-        bytecode::compile_module(&m.funcs).is_some(),
+        bytecode::compile_module(&m.funcs, &m.types).is_some(),
         "the caller must run natively on the bytecode engine (a real 3-way differential)"
     );
     let expect = vec![Value::I64(-9 * 1000 + -9)];
@@ -2019,7 +2019,7 @@ fn a_revoked_handle_completes_with_an_errno_on_all_backends() {
 #[test]
 fn a_forged_handle_still_traps_on_all_backends() {
     let m = rev_module(FORGER);
-    assert!(bytecode::compile_module(&m.funcs).is_some());
+    assert!(bytecode::compile_module(&m.funcs, &m.types).is_some());
 
     let mut hi = Host::new();
     hi.grant_stream(StreamRole::Out);

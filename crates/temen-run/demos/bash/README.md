@@ -206,6 +206,101 @@ Also en route: root exit now sweeps parked pipe readers/writers and `waitpid` be
   (expansion, quoted-delimiter, `<<-`, here-strings, builtin `read`/loops, exec'd commands);
   six differential scripts now pin them.
 
+## Language differential (DONE) — 50 pure-in-shell constructs vs native, two fixes
+
+A 50-construct sweep (`bash -c` vs the native 5.2.21 oracle: arrays + associative arrays, `case`
+incl. `;;&`, the full parameter-expansion family, brace expansion, arithmetic + C-style `for`,
+`[[ ]]`, `printf`, `read -a`/IFS, `local`/`declare -i`/`-r`/`-n`, `mapfile`, `extglob`, indirect
+expansion) came back **48/50 byte-identical out of the box** — the tree already had the surface.
+Two needed a fix:
+
+- **`BASH_REMATCH`** — `[[ =~ ]]` matched correctly but filled no capture array. The guest
+  `posix_libc/regex.c` defined its OWN `regex_t`/`regmatch_t`, but bash's TUs allocate them from
+  the build host's glibc `<regex.h>` and read `re_nsub` + the `pmatch` offsets across the call.
+  The layouts must match the glibc ABI byte-for-byte (`re_nsub@48` in a 64-byte `regex_t`;
+  `regoff_t` is `int`, so `regmatch_t` is `{int,int}`). The old layout still *matched* (the
+  guest's internal fields are self-consistent) but bash read the offsets from the wrong places →
+  empty `BASH_REMATCH`. Now overlaid on glibc's struct.
+- **Process substitution `<(…)`/`>(…)`** — bash builds with `HAVE_DEV_FD`, so it substitutes
+  `/dev/fd/N` for the pipe end and the peer `open`s it. The personality's `open` now resolves
+  `/dev/fd/N` and `/dev/std{in,out,err}` as a **dup** of that fd (sharing the description — an
+  `Arc` clone of the CorePipe token, so the refcount/last-close EOF stay correct).
+
+Six scripts pin these in the capstone (BASH_REMATCH captures, both process-substitution
+directions, `/dev/stdin`).
+
+## Pipeline `$?` (DONE — #1057)
+
+The last stage of a pipeline that terminates via `exit()` (every forked bash pipeline stage /
+group command reaching `exit_shell`) used to report `$? = 128` — the fork-twin **crash** status —
+instead of its real exit code. Root cause: `reap_status` in temen-interp mapped **every**
+`Err(Trap)` to `REAP_CRASH_STATUS`, but `Trap::Exit(code)` is a *clean* guest `exit(code)` ("not
+an error — the domain asked to terminate"), exactly what the root path already turns into
+`Outcome::Exited(code)`. A fork twin that exits via `exit()` rather than returning must reap with
+that code. One-arm fix (`Err(Trap::Exit(code)) => code & 0xff`); only genuine traps
+(unreachable, memory/cap faults) still reap 128. Surfaced by the language differential, masked in
+every earlier pipe script by a trailing command. Pinned by three pipeline scripts in the
+capstone (`true | { false; }` → `rc=1`, etc.).
+
+## Explicit `exit` in `-c` mode (DONE — #1062)
+
+`bash -c 'exit N'` (and `set -e`/`set -u` on error, which reach the same terminate path) used to
+**busy-loop forever** — `run_unwind_frame` ↔ `jump_to_top_level` — never reaching the exit. Root
+cause was in the setjmp/longjmp core (#795), not bash: the interp keyed each `setjmp` checkpoint by
+the guest **jmp_buf address** and wrote nothing into the buffer, but bash's `parse_and_execute`
+save/restores `top_level` with `COPY_PROCENV` (a plain `jmp_buf` **memcpy**). After the restore
+memcpy the interp's address-keyed map still pointed at the *inner* checkpoint, so the `EXITPROG`
+re-throw `longjmp(top_level)` resolved to `parse_and_execute`'s own handler again → infinite loop.
+Interactive `exit`, implicit end-of-script exit, and subshell exit all worked (they don't hit that
+copy-then-re-throw path). Fix: `setjmp` now mints a token, **writes it into the jmp_buf's opaque
+first 8 bytes**, and keys the checkpoint by the token; `longjmp` reads the token back from the
+(possibly-copied) buffer — so the identity rides the memcpy. Bounded by pruning checkpoints whose
+frame has returned. Pinned by a `COPY_PROCENV`-shaped C witness (`c_longjmp_through_a_copied_jmp_buf`)
+and three capstone scripts (`exit 7`, `set -e; false`, `set -u`).
+
+## Differential round 3 (DONE) — deeper surface + `strftime`
+
+A second differential pass over deeper constructs (trap ERR/RETURN, `set -e` in functions/subshells/
+`pipefail`, getopts, arithmetic edge cases, associative-array counting, real-script control flow)
+came back clean **except** `printf '%(fmt)T'`: the bash shim's `strftime`/`localtime` were stubs that
+ignored the format and always printed `1970-01-01`. Ported the real UTC calendar math + format engine
+from the postgres `time_shim.c` (gap #11e, glibc-exact) into `bash_shim.c` — `%Y %m %d %H %M %S %j %A
+%a %B %b %p %y %C %I %e %u %w` all match native now, across epochs (incl. pre-1970 negatives). Also
+taught the demo `/bin/head` the POSIX `-N` shorthand (`head -1`, as `declare -f f | head -1` uses).
+Pinned by a dozen capstone scripts (the `%()T` formats, the trap/`set -e`/getopts/arith/assoc set, and
+`seq 9 | head -3`).
+
+## Differential round 4 (DONE) — whole real programs
+
+Ran self-contained multi-line bash *programs* end-to-end vs native (the #802 "script suite" goal),
+not one-liners: a recursive quicksort, an RPN calculator, a key=value state-machine parser, memoized
+fibonacci, a retry loop with an EXIT trap, a getopts app, string tools, a recursive case-dispatcher,
+and a word-frequency counter. **They all run correctly** — no new bash/interp bug surfaced, strong
+viability evidence. The only gap was a *missing* coreutil: `tr` wasn't staged, so `tr`-based pipelines
+(word frequency) produced nothing. Added a small chibicc-safe `tr` (`SET1→SET2` translate, `-d`
+delete, `\n`/`\t` escapes, `a-z` ranges) to `posix_utils` + `stage_bin.sh`. (Also noted: deep
+recursion through `$(...)` command-substitution — e.g. un-memoized fib(10) — is *correct* but slow,
+since each call forks a subshell and svm forks are heavier than native; a perf characteristic, not a
+bug.) Pinned by three whole-program capstone scripts (quicksort, the state-machine parse, the
+`tr`+`sort` word-frequency counter).
+
+## bash on the bytecode engine (the browser tier)
+
+All the differential work above runs on the **tree-walk** interp. The playground runs on the
+**bytecode cooperative engine** — the single-threaded, wasm-safe tier (`bytecode::compile_and_run…`,
+what `posix_shell_exec` drives in-browser). bash runs there too: `bash -c` on the bytecode backend
+(`BASH_PROBE_BACKEND=bytecode`) is **byte-for-byte with native across the whole round-1 language set
+(50/50)**, plus fork/pipes (`echo | cat`), command substitution, pipelines, `exit`/`set -e`, traps,
+associative arrays, `[[ =~ ]]`, `printf '%()T'`, and a recursive quicksort. The one engine-specific
+gap was the same #1062 setjmp keying — `bytecode.rs`'s `SetJmp`/`LongJmp` were still address-keyed, so
+`bash -c 'exit'` would have busy-looped in the playground; the token-in-`jmp_buf` fix is now ported to
+the bytecode engine too (pinned by `c_longjmp_through_a_copied_jmp_buf`, which asserts on both tiers).
+
+This resolves most of the "does bash run in the browser" risk: the language + real-program surface is
+at parity on the wasm-safe tier. What remains for the *playground* is integration wiring — an AOT
+`bash.temen` module + a `temen_run_shell`-style entry, the coreutils as browser fixtures, and the
+#797 terminal for interactive `-i` — not core execution gaps.
+
 ## What remains (the slice ladder from the #802 sketch)
 
 - The `^D`-EOF nuance (the one-shot EOF is writer-count state, so the shell's next read can

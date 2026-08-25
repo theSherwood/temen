@@ -335,8 +335,13 @@ fn link_selected(units: &[(&str, &str, Select)]) -> Result<Module, LengError> {
 /// (`call.import "main"` → a direct `call` once merged). Injecting the entry **as a unit** (linked
 /// first, so it is function 0) — rather than [`temen_ir::synth_manifest_start`]-prepending it after
 /// the link — is what keeps the program's `data.funcref` initializers valid: the linker numbers
-/// `_start` first and bakes every funcref at its final merged index in one pass, so nothing needs
-/// a post-hoc +1 shift (which the discarded relocation metadata could no longer drive).
+/// `_start` first and bakes every funcref at its final merged index in one pass, so nothing needs a
+/// post-hoc +1 shift (which the discarded relocation metadata could no longer drive).
+///
+/// The guest heap bump-pointer words ([`temen_ir::POWERBOX_HEAP_BRK`]/[`POWERBOX_HEAP_TOP`]) are
+/// **not** seeded here — this unit is built before the merged window size is known, and the heap
+/// ceiling *is* that window top. [`seed_powerbox_heap`] bakes both words into the linked module's
+/// data image (post-link, where the window is known); see it for the #1051/#1054/#1060 rationale.
 fn synth_start_unit(entry: &str) -> Result<temen_ir::LinkUnit, LengError> {
     let text = format!(
         "import 0 \"{entry}\" (i64, i32, i64, i64) -> (i32)\n\
@@ -525,7 +530,48 @@ fn link_selected_with_extra(
     } else {
         temen_ir::link(&link_units)
     };
-    linked.map_err(|e| LengError::Malformed(format!("link failed: {e:?}")))
+    let mut linked = linked.map_err(|e| LengError::Malformed(format!("link failed: {e:?}")))?;
+    // A synth-`_start` module is a powerbox entry whose guest allocator bumps in-window; seed its
+    // heap bump-pointer words now that the merged window is known (see [`seed_powerbox_heap`]).
+    if synth_start {
+        seed_powerbox_heap(&mut linked);
+    }
+    Ok(linked)
+}
+
+/// Seed the guest **heap bump-pointer words** into a linked powerbox module's data image:
+/// [`temen_ir::POWERBOX_HEAP_BRK`] ← the heap base (just above the data stack), and
+/// [`temen_ir::POWERBOX_HEAP_TOP`] ← the mapped-window top (`1 << size_log2`), the heap ceiling.
+///
+/// **Why (#1051 / #1054 / #1060).** The nim compute-shim `mmap` ([`POWERBOX_COMPUTE_SHIM`]) serves
+/// the allocator by handing out `[brk, brk+len)` and advancing `POWERBOX_HEAP_BRK`. If that word is
+/// left 0 the arena starts at address 0 and overlaps the placed static data — a heap allocation can
+/// reuse a program's `LongString` const and `add`/realloc scribbles it (the #1051 corruption, whose
+/// order-sensitivity was #1054). Seeding the base to `data.top + POWERBOX_STACK_RESERVE` puts the
+/// heap above **all** placed data for any link order. Seeding the ceiling to the real window top
+/// makes the heap use the whole remaining window (no capacity cliff) and lets the shim `mmap`
+/// fail closed when the guest would bump past it (#1060) — the confinement mask already prevents an
+/// out-of-window access from escaping, so this turns a self-corrupting wrap into a clean allocation
+/// failure. The window itself is sized to hold `data + stack + heap` reserves by
+/// [`temen_ir::link`] ([`temen_ir::POWERBOX_HEAP_RESERVE`]), independent of any runtime unit's
+/// `memory N` declaration.
+///
+/// Baked as a 16-byte writable data segment (not `_start` stores) because it must run **before**
+/// `main`, and because [`synth_start_unit`] is built before the window size is known. The two words
+/// live in the reserved scratch page 0 (`< POWERBOX_STACK_PAGE`), which no unit's data covers.
+fn seed_powerbox_heap(m: &mut Module) {
+    let Some(mem) = m.memory else { return };
+    let win = 1u64 << mem.size_log2;
+    let brk = temen_ir::powerbox_entry_sp(m) + temen_ir::POWERBOX_STACK_RESERVE;
+    // `POWERBOX_HEAP_TOP` sits 8 bytes above `POWERBOX_HEAP_BRK`; write both in one contiguous segment.
+    debug_assert_eq!(temen_ir::POWERBOX_HEAP_TOP, temen_ir::POWERBOX_HEAP_BRK + 8);
+    let mut bytes = brk.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&win.to_le_bytes());
+    m.data.push(temen_ir::Data {
+        offset: temen_ir::POWERBOX_HEAP_BRK,
+        bytes,
+        readonly: false,
+    });
 }
 
 /// **Link several nimony modules into one temen-ir [`Module`]** (NIM.md W2), each contributing a
@@ -679,6 +725,37 @@ fn compute_leaf_index(name: &str) -> Option<u32> {
 /// thing re-linked. Re-verify the result like any linked output (the caller runs `run_powerbox`, which
 /// verifies).
 pub fn link_nim_powerbox(units: &[WholeModule]) -> Result<Module, LengError> {
+    // #1051/#1054: link the `system` unit **first**, as belt-and-suspenders. The real fix for #1051
+    // is the heap seed in [`synth_start_unit`] — without it the guest heap arena started at 0 and
+    // overlapped placed static data, so a heap allocation could reuse a program's `LongString` const
+    // and `add`/realloc would scribble its length (`write` then dumps stray bytes). That corruption
+    // surfaced only for some link orders (whichever placed a referenced const where an allocation
+    // landed), which looked like `temen_ir::link` was order-sensitive — it is not; its address
+    // arithmetic is order-independent (#1054). With the heap seed the output is correct for **every**
+    // order; this reorder is kept as defense in depth (and to pin a deterministic layout). The
+    // `_start` entry is func 0 via the synthesized start unit, not unit position, so reordering is
+    // safe. Stable-partition so `sysv…` units come first and the rest keep their given order.
+    let mut reordered: Vec<WholeModule> = units
+        .iter()
+        .map(|u| WholeModule {
+            stem: u.stem,
+            src: u.src,
+        })
+        .collect();
+    reordered.sort_by_key(|u| !u.stem.starts_with("sysv"));
+    let units: &[WholeModule] = &reordered;
+    let runtime = nim_powerbox_runtime(units)?;
+    // Pass 2: link with the compute shim + the adapter. Only the powerbox `write` cap is left.
+    link_whole_powerbox_manifest(units, runtime)
+}
+
+/// Build the **nim→powerbox runtime link units** ([compute shim, syscall adapter]) that
+/// [`link_nim_powerbox`] links a program against — split out so a caller (or the #1054
+/// order-independence test) can link whole units against the same runtime via
+/// [`link_whole_powerbox_manifest`] directly. The result is independent of the units' order (it
+/// depends only on which bottom-edge leaves and raw syscalls the program references), so one build
+/// serves every permutation.
+pub fn nim_powerbox_runtime(units: &[WholeModule]) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
     // The compute shim must know which leaf names to export; discover them from the `system` unit's
     // own compiled imports (every pure-compute leaf originates there — a self-contained module that
     // compiles standalone, unlike a program unit that references a sibling's aggregate type).
@@ -735,8 +812,7 @@ pub fn link_nim_powerbox(units: &[WholeModule]) -> Result<Module, LengError> {
         ..Default::default()
     };
 
-    // Pass 2: link with the compute shim + the adapter. Only the powerbox `write` cap is left.
-    link_whole_powerbox_manifest(units, vec![compute_unit(compute_exports)?, adapter])
+    Ok(vec![compute_unit(compute_exports)?, adapter])
 }
 
 /// **Link several nimony modules in Tier-2 TLS mode** (NIM.md §3d) together with a runtime that
