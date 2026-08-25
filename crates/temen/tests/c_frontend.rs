@@ -333,6 +333,33 @@ fn run_c_interp(src: &str) -> CRun {
     }
 }
 
+/// Like [`run_c_interp`] but on the **bytecode cooperative engine** — the browser's wasm-safe tier
+/// ([`temen_interp::bytecode::compile_and_run_with_host`], the entry `posix_shell_exec` drives in the
+/// playground). Used to pin engine-specific lowerings (e.g. the #1062 setjmp token keying) on the
+/// tier the browser actually runs.
+fn run_c_bytecode(src: &str) -> CRun {
+    let ir = c_to_ir(src);
+    let m =
+        parse_module(&ir).unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
+    verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
+    let mut h = Host::new();
+    let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    let handles = powerbox(&mut h, win, std::time::Duration::ZERO);
+    bind_imports(&mut h, &m, &handles);
+    let mut fuel = 50_000_000u64;
+    let outcome =
+        match temen_interp::bytecode::compile_and_run_with_host(&m, 0, &[], &mut fuel, &mut h) {
+            Some(Ok(v)) => Outcome::Returned(v),
+            Some(Err(Trap::Exit(c))) => Outcome::Exited(c),
+            Some(Err(e)) => panic!("bytecode trapped: {e:?}\n{src}\n{ir}"),
+            None => panic!("the bytecode engine declined to compile the module\n{ir}"),
+        };
+    CRun {
+        outcome,
+        stdout: h.stdout,
+    }
+}
+
 /// Run a normally-returning fiber program (interpreter-only) and return its single i32.
 fn fiber_i32(src: &str) -> i32 {
     match run_c_interp(src).outcome {
@@ -535,9 +562,11 @@ int main(void) {
 /// Address-keying could not — the copy's address had no checkpoint — which busy-looped `bash -c`'s
 /// explicit `exit` forever (a stale-then-re-thrown `top_level`). Here the longjmp goes through a
 /// hand-copied buffer; without the token it traps (no checkpoint at `b`), so this fails clean.
-#[test]
-fn c_longjmp_through_a_copied_jmp_buf() {
-    let src = r#"
+/// The #1062 witness in C: `setjmp(a)`, memcpy `a`→`b`, `longjmp(b, 55)` — the copied-buffer path
+/// bash's `COPY_PROCENV` takes on every `bash -c`. Returns 55 with the token fix, traps without it.
+/// Shared by [`c_longjmp_through_a_copied_jmp_buf`] and [`gen_browser_setjmp_fixture`] so the in-crate
+/// assertion and the browser-tier regression pin run the same program.
+const SETJMP_COPY_WITNESS: &str = r#"
 typedef long jmp_buf[16];
 int setjmp(jmp_buf env);
 void longjmp(jmp_buf env, int val);
@@ -551,10 +580,67 @@ int main(void) {
   return r;                                /* 55 */
 }
 "#;
+
+#[test]
+fn c_longjmp_through_a_copied_jmp_buf() {
+    let src = SETJMP_COPY_WITNESS;
+    // Both engines must resolve the copied buffer (the tree-walk fix landed with #1062; the
+    // bytecode engine — the browser's wasm-safe tier — carries the same address→token change,
+    // so `bash -c 'exit N'` no longer busy-loops in the playground).
     assert_eq!(
         run_c_interp(src).outcome,
-        Outcome::Returned(vec![Value::I32(55)])
+        Outcome::Returned(vec![Value::I32(55)]),
+        "tree-walk: longjmp through a copied jmp_buf"
     );
+    assert_eq!(
+        run_c_bytecode(src).outcome,
+        Outcome::Returned(vec![Value::I32(55)]),
+        "bytecode (browser engine): longjmp through a copied jmp_buf"
+    );
+}
+
+/// Compile the [`SETJMP_COPY_WITNESS`] to `browser/tests/fixtures/setjmp_copy.temen` — the module the
+/// browser crate's `setjmp` test runs through `onramp_posix_exec` (the playground's POSIX-personality
+/// bytecode entry), so the #1062 fix is pinned on the *browser's own public path*, not just this
+/// crate's in-process `run_c_bytecode`. `--data-page 65536`: the playground runs on a 64 KiB wasm host
+/// page (matches how `gen_browser_shell_fixture` builds `shell.temen`). Import-free, so it needs no
+/// shim link and `onramp_check` passes it as-is. `#[ignore]`d because it writes into the tree and needs
+/// the chibicc build; regenerate with:
+///   cargo test -p temen --test c_frontend -- --ignored --exact gen_browser_setjmp_fixture
+#[test]
+#[ignore = "writes browser/tests/fixtures/setjmp_copy.temen; run explicitly to regenerate"]
+fn gen_browser_setjmp_fixture() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let id = N.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!("temen_setjmp_fix_{}_{id}", std::process::id()));
+    let cfile = base.with_extension("c");
+    let irfile = base.with_extension("temen");
+    std::fs::write(&cfile, SETJMP_COPY_WITNESS).expect("write witness C");
+    let status = Command::new(chibicc())
+        .args([
+            "-cc1",
+            "--emit-ir",
+            "--data-page",
+            "65536",
+            "-cc1-input",
+            cfile.to_str().unwrap(),
+            "-cc1-output",
+            irfile.to_str().unwrap(),
+            cfile.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run chibicc");
+    assert!(status.success(), "chibicc failed on the setjmp witness");
+    let ir = std::fs::read_to_string(&irfile).expect("read witness IR");
+    let m = parse_module(&ir).expect("parse witness IR");
+    verify_module(&m).expect("verify witness");
+    let bytes = temen_encode::encode_module(&m);
+    let dir = repo_root().join("browser/tests/fixtures");
+    std::fs::create_dir_all(&dir).expect("create fixtures dir");
+    let out = dir.join("setjmp_copy.temen");
+    std::fs::write(&out, &bytes).expect("write setjmp_copy.temen");
+    eprintln!("wrote {} ({} bytes)", out.display(), bytes.len());
 }
 
 /// The shipped `<stdlib.h>` is a real guest libc: `malloc`/`calloc`/`realloc`/`free` that **grow
