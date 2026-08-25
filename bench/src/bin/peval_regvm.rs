@@ -189,7 +189,7 @@ fn jit_compile(m: &Module, entry: u32) -> CompiledModule {
 }
 
 fn jit_call(cm: &mut CompiledModule, args: &[i64]) -> i64 {
-    match cm.run(args, None, None, None) {
+    match cm.run(args, None, None) {
         Ok((JitOutcome::Returned(v), _)) => v[0],
         o => panic!("jit outcome {o:?}"),
     }
