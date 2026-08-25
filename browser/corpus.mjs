@@ -119,7 +119,7 @@ const runCaptureLike = (list, kind) => {
 runCaptureLike(corpus.capture ?? [], 'capture');
 runCaptureLike(corpus.gcroots ?? [], 'gc');
 
-// ---- reflection corpus: temen_run_reflect (§7 cap.self.* over a fixed 3-cap powerbox) ---------
+// ---- reflection corpus: temen_run_reflect (§7 self.* over a fixed 3-cap powerbox) ---------
 for (const { name, file, cases } of corpus.reflect ?? []) {
   let bad = 0;
   for (const { arg, status, value } of cases) {

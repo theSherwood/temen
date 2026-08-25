@@ -1,7 +1,7 @@
 #ifndef VM_DL_H
 #define VM_DL_H
 // In-guest dynamic-linking loader — `vm_dlopen`/`vm_dlsym`/`vm_dlclose` over the `Jit` capability
-// (DESIGN.md §22). A "shared object" is serialized Temen IR; a symbol is an installed `call_indirect`
+// (DESIGN.md §22). A "shared object" is serialized Temen IR; a symbol is an installed `call.dyn`
 // slot (an **unforgeable funcref**, §3c-checked at the call). This header is the ergonomic layer over
 // the raw `__vm_jit_compile_linked` / `__vm_jit_install` primitives: it keeps a `name → slot` registry
 // and marshals it into the symbol-table buffer the host resolves against, so a loaded unit can
@@ -24,7 +24,7 @@
 typedef struct {
   char name[VM_DL_NAMEMAX];
   int used;
-  long slot; // the installed call_indirect slot (the funcref other units link to)
+  long slot; // the installed call.dyn slot (the funcref other units link to)
   long code; // the Jit code handle (for invoking the symbol directly, via __vm_jit_invoke2)
 } VmDlSym;
 
@@ -76,7 +76,7 @@ static long vm_dl_build_symtab(char *buf) {
   return pos;
 }
 
-// `vm_dlsym(name)` → the symbol's installed slot (a funcref another unit can `call_indirect`), or
+// `vm_dlsym(name)` → the symbol's installed slot (a funcref another unit can `call.dyn`), or
 // `-1` if it is not loaded.
 static long vm_dlsym(const char *name) {
   for (int i = 0; i < VM_DL_MAX; i++)
@@ -141,7 +141,7 @@ static long vm_dlcall2(const char *name, long a, long b) {
   return -1;
 }
 
-// `vm_dlclose(name)`: uninstall the symbol's slot (a stale `call_indirect` of it then traps) and
+// `vm_dlclose(name)`: uninstall the symbol's slot (a stale `call.dyn` of it then traps) and
 // drop it from the registry. Returns 0, or `-1` if the name is not loaded. (The code memory itself
 // is not reclaimed — the JIT arena has no per-function free; this frees the *slot* + the name.)
 static int vm_dlclose(const char *name) {

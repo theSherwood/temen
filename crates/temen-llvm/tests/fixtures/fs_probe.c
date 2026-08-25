@@ -1,5 +1,5 @@
 /* Probe for the **configurable Fs capability** (temen-run's `fs::mem_fs`/`fs::host_fs`): resolve the
- * embedder-granted capability by name (`__vm_cap_resolve`, §7 cap.self.resolve) and drive the whole
+ * embedder-granted capability by name (`__vm_cap_resolve`, §7 self.resolve) and drive the whole
  * op protocol through `__vm_host_call` (§7 host-defined capability, the wasm-import analogue) —
  * open/write/close, reopen/seek/read-back, rename, append, remove, truncate (shrink-discard /
  * grow-zero-fill / read-only refusal), sync, and the attenuation refusals (`..`/absolute paths).

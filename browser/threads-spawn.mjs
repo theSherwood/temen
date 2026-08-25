@@ -379,7 +379,7 @@ async function main() {
   const win = ex.temen_par_alloc(winSize);
 
   // 4d I/O mode (TEMEN_IO=1): publish the run's shared powerbox — a `Mutex<Host>` in shared linear
-  // memory every vCPU dispatches `cap.call` through, so worker vCPUs do host I/O with no JS in the
+  // memory every vCPU dispatches `call.cap` through, so worker vCPUs do host I/O with no JS in the
   // loop. Stdout accumulates in the powerbox; main reads it back after the run.
   if (process.env.TEMEN_IO === '1' && ex.temen_par_powerbox_io() !== 1) {
     console.log('FAIL: temen_par_powerbox_io returned 0'); process.exit(1);
