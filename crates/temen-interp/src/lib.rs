@@ -3756,6 +3756,16 @@ struct SetJmpPoint {
     result_idx: usize,
 }
 
+/// #1062 — the monotonic **`setjmp` token** source. Each `setjmp` writes a fresh token into the
+/// guest `jmp_buf` (its opaque first 8 bytes) and keys its checkpoint by that token, so a guest
+/// that *copies* the `jmp_buf` (bash's `COPY_PROCENV` memcpy of `top_level`) carries the checkpoint
+/// identity with the bytes — address-keying could not (a copy left the map pointing at a stale
+/// checkpoint → an infinite `longjmp` loop). The value is an opaque handle: never guest-observable
+/// (it lives only in the opaque `jmp_buf` and the interp map, never in a result/output), so its
+/// exact value — and any cross-thread interleaving of this counter — cannot affect a run's
+/// behavior; only token *equality* (write `T`, read the same `T` back from the buffer) matters.
+static SETJMP_TOKEN: AtomicU64 = AtomicU64::new(1);
+
 /// One slot of a vCPU's **`call_indirect` dispatch table** — the explicit, module-aware
 /// generalization of "mask the index into `funcs`". Each slot names which module's function it
 /// holds, so the table can mix the parent's functions (Model A: populated from module 0) with
@@ -8810,11 +8820,14 @@ struct VCpu {
     /// seeded to this vCPU's dense id at construction (root = 0), guest-overwritable. Read at the
     /// op's execution point — so a fiber that migrated here reads *this* vCPU's word.
     tls: i64,
-    /// `<setjmp.h>` checkpoints — `setjmp` records this vCPU's resume point here keyed by the guest
-    /// `jmp_buf` window address; `longjmp` looks it up. Per-vCPU (a checkpoint references *this* frame
-    /// stack; cross-thread `longjmp` is UB in C and simply misses). Keyed by buffer address (not a
-    /// growing token table) so a re-`setjmp` to the same buffer overwrites and a `pcall`-in-a-loop
-    /// stays bounded; the trade-off is that a *copied* `jmp_buf` (rare/UB-adjacent) misses → traps.
+    /// `<setjmp.h>` checkpoints — `setjmp` records this vCPU's resume point here, keyed by a
+    /// per-`setjmp` **token** it writes into the guest `jmp_buf`'s opaque first 8 bytes (#1062);
+    /// `longjmp` reads the token back from the (possibly-copied) buffer and looks it up. Per-vCPU
+    /// (a checkpoint references *this* frame stack; cross-thread `longjmp` is UB in C and simply
+    /// misses). Token-keying (vs the old buffer-address key) is what lets a guest *copy* a `jmp_buf`
+    /// — bash's `COPY_PROCENV` memcpy of `top_level`, which address-keying mis-resolved into an
+    /// infinite `longjmp` loop — carry the checkpoint identity with the bytes. Bounded by pruning
+    /// checkpoints whose `setjmp` frame has returned (`SetJmp` arm), so it does not grow without end.
     setjmp_points: BTreeMap<u64, SetJmpPoint>,
     /// Set when resuming from a park: how to finish the blocked op (see [`Pending`]).
     pending: Option<Pending>,
@@ -13378,12 +13391,32 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // returning 0. `frames[top].inst` is already advanced past the `setjmp` (line above), so
                 // it is exactly the re-entry point. A re-`setjmp` to the same buffer overwrites.
                 Inst::SetJmp { buf } => {
-                    let key = get_i64(&frames[top].vals, *buf)? as u64;
+                    let buf_addr = get_i64(&frames[top].vals, *buf)? as u64;
+                    // #1062 — mint a fresh token and write it into the guest `jmp_buf`'s opaque
+                    // first 8 bytes, keying the checkpoint by the token (not the buffer address).
+                    // A guest that memcpy-copies the buffer (bash's `COPY_PROCENV`) then carries
+                    // the identity with the bytes, so a later `longjmp` on the copy resolves to
+                    // the right checkpoint. The write goes through the confinement mask like any
+                    // guest store; a `jmp_buf` is always a committed object the guest just passed,
+                    // so a fault here is a broken guest (fail closed).
+                    let token = SETJMP_TOKEN.fetch_add(1, Ordering::Relaxed);
+                    mem.as_mut().ok_or(Trap::Malformed)?.store(
+                        buf_addr,
+                        0,
+                        StoreOp::I64,
+                        Value::I64(token as i64),
+                    )?;
+                    // Bound the token map (address-keying was bounded by overwrite; tokens are not):
+                    // drop checkpoints whose `setjmp` frame has already returned — a `longjmp` to one
+                    // would trap regardless. A copied-but-live checkpoint sits at a still-live frame
+                    // (`depth <= live`) and is retained.
+                    let live = frames.len();
+                    setjmp_points.retain(|_, p| p.depth <= live);
                     let result_idx = frames[top].vals.len();
                     let mut snap = frames[top].vals.clone();
                     snap.push(Reg::from_i32(0)); // the result slot (overwritten by longjmp)
                     setjmp_points.insert(
-                        key,
+                        token,
                         SetJmpPoint {
                             depth: frames.len(),
                             block: frames[top].block,
@@ -13394,16 +13427,26 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     );
                     frames[top].vals.push(Reg::from_i32(0)); // the direct call returns 0
                 }
-                // `longjmp`: look up the checkpoint by `jmp_buf` address, unwind the call stack to it
-                // (the intervening frames discarded — C has no cleanups), restore the `setjmp` frame's
-                // (block, inst, vals) with the result slot set to `val` (a `0` `val` becomes `1`, per C),
-                // and resume there. A missing checkpoint, or one whose frame already returned (its
-                // `depth` now exceeds the live stack), traps in-sandbox (§3b totality).
+                // `longjmp`: read the #1062 token back from the (possibly-copied) `jmp_buf`, look up
+                // the checkpoint by token, unwind the call stack to it (the intervening frames
+                // discarded — C has no cleanups), restore the `setjmp` frame's (block, inst, vals)
+                // with the result slot set to `val` (a `0` `val` becomes `1`, per C), and resume
+                // there. A token that names no live checkpoint (never `setjmp`'d, or its frame
+                // already returned — `depth` now exceeds the live stack) traps in-sandbox (§3b).
                 Inst::LongJmp { buf, val } => {
-                    let key = get_i64(&frames[top].vals, *buf)? as u64;
+                    let buf_addr = get_i64(&frames[top].vals, *buf)? as u64;
                     let v = get_i32(&frames[top].vals, *val)?;
                     let resume = if v == 0 { 1 } else { v };
-                    let point = setjmp_points.get(&key).cloned().ok_or(Trap::Malformed)?;
+                    let token =
+                        match mem
+                            .as_ref()
+                            .ok_or(Trap::Malformed)?
+                            .load(buf_addr, 0, LoadOp::I64)?
+                        {
+                            Value::I64(t) => t as u64,
+                            _ => return Err(Trap::Malformed),
+                        };
+                    let point = setjmp_points.get(&token).cloned().ok_or(Trap::Malformed)?;
                     if point.depth == 0 || point.depth > frames.len() {
                         return Err(Trap::Malformed); // the setjmp frame has already returned
                     }

@@ -12577,6 +12577,15 @@ fn demo_bash_translates_and_verifies() {
         "true | { false; }; echo \"rc=$?\"",
         "false | { true; }; echo \"rc=$?\"",
         "echo hi | { read x; echo \"got:$x\"; }; echo \"after=$?\"",
+        // #1062 — an explicit top-level `exit` in `-c` mode: bash's `parse_and_execute`
+        // save/restores `top_level` with `COPY_PROCENV` (a `jmp_buf` memcpy), so the `EXITPROG`
+        // longjmp only resolves correctly when the checkpoint identity rides in the buffer bytes
+        // (the #1062 token). Before the fix these busy-looped forever (the exit status is the
+        // pipeline/script's, so a trailing command couldn't mask it). `set -e`/`set -u` reach
+        // the same terminate path on error.
+        "echo a; exit 7",
+        "set -e; false; echo unreached",
+        "set -u; echo \"${undef}\"; echo unreached",
     ] {
         let config = temen_run::RunConfig {
             args: vec![b"bash".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()],

@@ -528,6 +528,35 @@ int main(void) {
     );
 }
 
+/// #1062 — a program may **copy** a `jmp_buf` (bash's `COPY_PROCENV` memcpy of `top_level` in
+/// `parse_and_execute`, on every `bash -c`), then `longjmp` through the copy. The checkpoint
+/// identity must ride in the buffer bytes: `setjmp` writes a token into the `jmp_buf` and keys its
+/// checkpoint by it, so a copied buffer carries the token and resolves to the original checkpoint.
+/// Address-keying could not — the copy's address had no checkpoint — which busy-looped `bash -c`'s
+/// explicit `exit` forever (a stale-then-re-thrown `top_level`). Here the longjmp goes through a
+/// hand-copied buffer; without the token it traps (no checkpoint at `b`), so this fails clean.
+#[test]
+fn c_longjmp_through_a_copied_jmp_buf() {
+    let src = r#"
+typedef long jmp_buf[16];
+int setjmp(jmp_buf env);
+void longjmp(jmp_buf env, int val);
+static jmp_buf a, b;
+int main(void) {
+  int r = setjmp(a);                       /* checkpoint identity lives in a's bytes */
+  if (r == 0) {
+    for (int i = 0; i < 16; i++) b[i] = a[i];  /* COPY_PROCENV: memcpy the whole jmp_buf */
+    longjmp(b, 55);                        /* jump through the COPY — must find a's checkpoint */
+  }
+  return r;                                /* 55 */
+}
+"#;
+    assert_eq!(
+        run_c_interp(src).outcome,
+        Outcome::Returned(vec![Value::I32(55)])
+    );
+}
+
 /// The shipped `<stdlib.h>` is a real guest libc: `malloc`/`calloc`/`realloc`/`free` that **grow
 /// the window via the Memory cap** — available to any program that just `#include <stdlib.h>`, no
 /// prelude. Allocates 400 KiB (well past the 64 KiB initial window, forcing growth), checks
