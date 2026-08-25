@@ -9821,6 +9821,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // resumed handler continues draining the caller's fuel from where it parked.
                 *fuel = parked.remaining_budget;
                 let saved_invoked = invoked.replace(parked.entry_funcs.clone());
+                // #922: reinstall the provider's type section for the resumed handler.
+                let saved_invoked_types = invoked_types.replace(parked.entry_types.clone());
                 // CALLS.md 6a — reinstall the unit-own funcref remap for the resumed handler.
                 // Cache-hit by construction: the promoted handler's first switch-in installed it
                 // on this vCPU (the caller's own vCPU is the resumer, 4b.1). A miss is a
@@ -9844,9 +9846,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     saved_mem,
                     saved_host,
                     saved_invoked,
+                    saved_invoked_types,
                     saved_ref_slots: saved_ref,
                     results: parked.results,
                     entry_funcs: parked.entry_funcs,
+                    entry_types: parked.entry_types,
                     threaded: parked.threaded,
                 });
                 // Park the caller frames (currently on this vCPU) as the handler's resumer and
@@ -10232,6 +10236,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     let saved_host_ = std::mem::replace(host, ph_);
                                     *fuel = budget_ - 1;
                                     let saved_invoked_ = invoked.replace(entry_.funcs.clone());
+                                    // #922: install the provider's type section as `invoked_types`
+                                    // so the animated handler's interned call sigs resolve.
+                                    let saved_invoked_types_ =
+                                        invoked_types.replace(entry_.types.clone());
                                     let saved_ref_ =
                                         std::mem::replace(invoked_ref_slots, ref_slots_);
                                     let hvals_: Vec<Reg> = osig_
@@ -10249,9 +10257,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         saved_mem: saved_mem_,
                                         saved_host: saved_host_,
                                         saved_invoked: saved_invoked_,
+                                        saved_invoked_types: saved_invoked_types_,
                                         saved_ref_slots: saved_ref_,
                                         results: Arc::from(osig_.results.clone()),
                                         entry_funcs: entry_.funcs.clone(),
+                                        entry_types: entry_.types.clone(),
                                         threaded: threaded_,
                                     });
                                     // Park the caller frames as this handler's resumer and switch
@@ -10488,6 +10498,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         let prov_mem = std::mem::replace(mem, anim.saved_mem);
                         let prov_host_arc = std::mem::replace(host, anim.saved_host);
                         *invoked = anim.saved_invoked;
+                        *invoked_types = anim.saved_invoked_types; // #922: restore caller type section
                         *invoked_ref_slots = anim.saved_ref_slots;
                         // A handler that leaked the provider-host `Arc` (spawned a fiber holding it)
                         // can't hand the world back cleanly: fail closed, terminal for this run (a
@@ -10531,6 +10542,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             handler_slot: leaving,
                             results: anim.results,
                             entry_funcs: anim.entry_funcs,
+                            entry_types: anim.entry_types,
                             remaining_budget: remaining,
                             resume_key,
                             threaded: anim.threaded,
@@ -14195,6 +14207,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // place by the handler — leave it (do NOT restore `anim.saved_fuel`), so the
                         // caller has paid for what its call ran. The provider reserve is untouched.
                         *invoked = anim.saved_invoked;
+                        *invoked_types = anim.saved_invoked_types; // #922: restore caller type section
                         *invoked_ref_slots = anim.saved_ref_slots;
                         let prov_mem = std::mem::replace(mem, anim.saved_mem);
                         let prov_host_arc = std::mem::replace(host, anim.saved_host);
@@ -16980,6 +16993,9 @@ struct OfferAnim {
     /// The caller's `invoked` unit (the transient [`INVOKE_MODULE`] code table), parked while the
     /// provider's `entry.funcs` is installed as the animated handler's code.
     saved_invoked: Option<Arc<[Func]>>,
+    /// FuncType interning (#922): the caller's `invoked_types` (the [`INVOKE_MODULE`] type section),
+    /// parked alongside `saved_invoked` and restored when the animation settles/promotes.
+    saved_invoked_types: Option<Arc<[temen_ir::TypeEntry]>>,
     /// The caller's `invoked_ref_slots`, parked alongside `saved_invoked`.
     saved_ref_slots: Option<Vec<u32>>,
     /// The offer op's result types — the result `cap`-slot translation edge (provider→caller) and
@@ -16989,6 +17005,9 @@ struct OfferAnim {
     /// re-install the provider code (`invoked = entry_funcs`) when its parked animation resumes on
     /// this (or any) vCPU. On the run-to-completion 4a path it is simply carried and dropped.
     entry_funcs: Arc<[Func]>,
+    /// FuncType interning (#922): the provider's type section, re-installed as `invoked_types`
+    /// alongside `entry_funcs` so a resumed/animated handler's interned call sigs resolve.
+    entry_types: Arc<[temen_ir::TypeEntry]>,
     /// CALLS.md increment 7 — `true` iff this animation was admitted under [`OfferPolicy::Threaded`]:
     /// the installed window is a `fork_for_thread` view (never taken from the instance) and `busy`
     /// was never set, so the settle drops the fork instead of handing a world back — no leak guard,
@@ -17016,6 +17035,9 @@ struct OfferParked {
     results: Arc<[ValType]>,
     /// The provider's `entry.funcs`, re-installed as the handler's code on resume.
     entry_funcs: Arc<[Func]>,
+    /// FuncType interning (#922): the provider's type section, re-installed as `invoked_types`
+    /// alongside `entry_funcs` on resume so the handler's interned call sigs resolve.
+    entry_types: Arc<[temen_ir::TypeEntry]>,
     /// The reserve left when the handler parked — the resumed segment's fuel budget (see
     /// [`OfferAnim::budget`]).
     remaining_budget: u64,
@@ -17827,11 +17849,7 @@ fn module_digest(m: &Module) -> [u8; 32] {
 /// `decode_module` + `verify_module` reconstruct them losslessly on thaw. Debug info is dropped
 /// (untrusted, backend-ignored). `encode_module` is canonical, so `decode`→`encode` round-trips
 /// byte-identically, which is what keeps the §12.6 re-serialize invariant a plain `==`.
-fn encode_jit_unit(
-    funcs: &[Func],
-    types: &[temen_ir::TypeEntry],
-    mem_log2: Option<u8>,
-) -> Vec<u8> {
+fn encode_jit_unit(funcs: &[Func], types: &[temen_ir::TypeEntry], mem_log2: Option<u8>) -> Vec<u8> {
     let m = Module {
         funcs: funcs.to_vec(),
         // FuncType interning (#922): the unit's type section must ride `unit_ir` so a restore's
