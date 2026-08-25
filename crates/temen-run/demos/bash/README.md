@@ -258,6 +258,18 @@ first 8 bytes**, and keys the checkpoint by the token; `longjmp` reads the token
 frame has returned. Pinned by a `COPY_PROCENV`-shaped C witness (`c_longjmp_through_a_copied_jmp_buf`)
 and three capstone scripts (`exit 7`, `set -e; false`, `set -u`).
 
+## Differential round 3 (DONE) — deeper surface + `strftime`
+
+A second differential pass over deeper constructs (trap ERR/RETURN, `set -e` in functions/subshells/
+`pipefail`, getopts, arithmetic edge cases, associative-array counting, real-script control flow)
+came back clean **except** `printf '%(fmt)T'`: the bash shim's `strftime`/`localtime` were stubs that
+ignored the format and always printed `1970-01-01`. Ported the real UTC calendar math + format engine
+from the postgres `time_shim.c` (gap #11e, glibc-exact) into `bash_shim.c` — `%Y %m %d %H %M %S %j %A
+%a %B %b %p %y %C %I %e %u %w` all match native now, across epochs (incl. pre-1970 negatives). Also
+taught the demo `/bin/head` the POSIX `-N` shorthand (`head -1`, as `declare -f f | head -1` uses).
+Pinned by a dozen capstone scripts (the `%()T` formats, the trap/`set -e`/getopts/arith/assoc set, and
+`seq 9 | head -3`).
+
 ## What remains (the slice ladder from the #802 sketch)
 
 - The `^D`-EOF nuance (the one-shot EOF is writer-count state, so the shell's next read can
