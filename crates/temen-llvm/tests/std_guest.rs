@@ -753,7 +753,7 @@ fn std_fs_round_trips() {
     assert_eq!(
         String::from_utf8_lossy(&stdout),
         "read_to_string=\"hello temen fs\"\n\
-         is_file=true len=12\n\
+         is_file=true len=14\n\
          after_seek=\"temen fs\"\n\
          read_dir=[\"hello.txt\", \"seed.txt\"]\n\
          missing_kind=NotFound\n\

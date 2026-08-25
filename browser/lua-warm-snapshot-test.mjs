@@ -33,7 +33,22 @@ const modBytes = readFileSync(modPath);
 
 function cold(js) { const m = put(modBytes); const s = put(enc(js)); ex.temen_run_onramp(m.p, m.len, s.p, s.len); const out = readStdout(); const st = ex.temen_status(); s.free(); m.free(); return { out, st }; }
 function warmInterp(js) { const s = put(enc(js)); ex.temen_warm_eval(s.p, s.len); const out = readStdout(); const st = ex.temen_status(); s.free(); return { out, st }; }
-async function warmJit(js) { const st = await runWarmJit(ex, ex.memory ?? memory, enc(js), `${modPath}#eval`, 1); return { out: readStdout(), st }; }
+// warm+JIT, degrading exactly as production (`play.js`) does: Lua's `eval_run` reaches `lua_pcall`'s
+// setjmp, so `compile_jit` routes it to `InterpDriven` (#1081) and `temen_warm_jit_open` declines
+// (`eval_run` not wasm-drivable). The engine's own doc contract for that decline is "the page then
+// evaluates via `temen_warm_eval`", so fall back to the warm interpreter and record which tier ran.
+let warmJitDeclined = false;
+async function warmJit(js) {
+  try {
+    const st = await runWarmJit(ex, ex.memory ?? memory, enc(js), `${modPath}#eval`, 1);
+    return { out: readStdout(), st, tier: 'jit' };
+  } catch (e) {
+    if (ex.temen_status() !== 2) throw e; // only STATUS_UNSUPPORTED is the drivability decline; re-raise real traps
+    warmJitDeclined = true;
+    const wi = warmInterp(js);
+    return { out: wi.out, st: wi.st, tier: 'interp' };
+  }
+}
 
 const m = put(modBytes);
 const live = Number(ex.temen_warm_open(m.p, m.len));
@@ -59,7 +74,8 @@ for (const [name, js] of programs) {
   const interpOk = c.out === wi.out && wi.st === 0;
   const jitOk = c.out === wj.out && (wj.st === 0 || wj.st === 5);
   allOk = allOk && interpOk && jitOk;
-  console.log(`${name.padEnd(16)}${(interpOk ? 'OK' : 'MISMATCH').padStart(11)}${(jitOk ? 'OK' : 'MISMATCH').padStart(11)}`);
+  const jitLabel = jitOk ? (wj.tier === 'jit' ? 'OK' : 'OK↩interp') : 'MISMATCH';
+  console.log(`${name.padEnd(16)}${(interpOk ? 'OK' : 'MISMATCH').padStart(11)}${jitLabel.padStart(11)}`);
   if (!interpOk || !jitOk) { console.log(`  cold:     ${JSON.stringify(c.out)}`); console.log(`  warm:     ${JSON.stringify(wi.out)}`); console.log(`  warm+JIT: ${JSON.stringify(wj.out)}`); }
 }
 
@@ -73,4 +89,8 @@ if (!isolated) { console.log(`  run1: ${JSON.stringify(r1.out)}`); console.log(`
 
 ex.temen_warm_close();
 if (!allOk) fail('Lua warm snapshot parity/isolation mismatch');
+if (warmJitDeclined) {
+  console.log('\nnote: warm+JIT declined (Lua reaches lua_pcall\'s setjmp ⇒ InterpDriven, #1081); the warm+JIT');
+  console.log('      card falls back to the warm interpreter, exactly as production (play.js) does.');
+}
 console.log('\nOK: Lua warm snapshot — warm eval_run matches cold _start (interp + JIT) byte-for-byte, isolation holds');

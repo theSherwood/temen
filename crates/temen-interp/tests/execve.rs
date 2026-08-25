@@ -112,11 +112,55 @@ fn exec_module_replaces_the_image_with_a_separate_command_module() {
     );
 }
 
-/// OPS_PARITY.md (`exec_module`) — `exec_module` is eval-loop-only, so the fast tiers must **fold**
-/// the module to the oracle, never run a generic `cap.call` thunk that answers `-EINVAL` where the
-/// oracle image-replaces (a silent divergence, INVARIANTS.md #9). Pin the fail-closed fold: the same
-/// guest run via `run_with_host_fast` (which tries the bytecode engine first) declines and folds, so
-/// it image-replaces and returns the command's `42` — identical to the oracle run above.
+/// #1080 — the **bytecode engine image-replaces natively** (no tree-walker fallback), the path the
+/// browser playground runs on (`bash_exec` → `compile_and_run_capture_reserved_with_host`). Run the
+/// same GUEST through the plain bytecode entry `compile_and_run_with_host`; it must resolve the
+/// command, regrant `stdout`, materialize the command's image into the caller's window, swap the
+/// activation, and return the command's `42` with `"EXEC"` in the sink — identical to the oracle.
+/// (Before #1080 the engine *declined* an exec-bearing module, which is why bash — statically
+/// carrying `exec_module` — could not run on the browser's bytecode tier.)
+#[test]
+fn exec_module_image_replaces_on_the_bytecode_engine() {
+    let guest = module(GUEST);
+    let cmd = module(CMD);
+
+    let mut host = Host::new();
+    host.set_self_module(&guest);
+    let sink = host.shared_stdout();
+    let inst = host.grant_instantiator(0, 1u64 << 12);
+    let stream = host.grant_stream(StreamRole::Out);
+    let cmd_h = host.grant_module(&cmd);
+
+    let mut fuel = 40_000_000u64;
+    let r = temen_interp::bytecode::compile_and_run_with_host(
+        &guest,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I64(cmd_h as i64),
+            Value::I32(stream),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("the bytecode engine compiles the exec-bearing module (no decline)")
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "the bytecode engine image-replaced and returned the command's 42, not the guest's 99"
+    );
+    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(
+        &bytes, b"EXEC",
+        "the exec'd command wrote through the inherited stdout on the bytecode engine"
+    );
+}
+
+/// #1080 — `run_with_host_fast` tries the bytecode engine first; now that the engine image-replaces
+/// natively (above), the same GUEST runs there directly (no fold to the oracle) and returns the
+/// command's `42`. This keeps the fast-path outcome identical to the oracle run.
 #[test]
 fn exec_module_folds_to_the_oracle_on_the_fast_path() {
     let guest = module(GUEST);
@@ -185,6 +229,45 @@ fn a_failed_exec_module_returns_einval_and_leaves_the_caller_running() {
         r,
         vec![Value::I64(99)],
         "a refused exec returns to the caller, which falls through to its sentinel (99)"
+    );
+    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert!(
+        bytes.is_empty(),
+        "a refused exec ran no command, so nothing was written"
+    );
+}
+
+/// #1080 (TCB) — the refuse path on the **bytecode engine**: a bogus command handle must leave the
+/// caller running (write `-EINVAL` to the result slot, fall through to `return 99`), never image-
+/// replace or trap. The exec arm's every admissibility failure (bad handle, oversized command,
+/// unregrantable grant, non-clean-root) takes this same path, so pinning the handle case pins the
+/// contract that a refused exec is a survivable, probeable error on the tier the browser runs.
+#[test]
+fn a_failed_exec_module_on_the_bytecode_engine_leaves_the_caller_running() {
+    let guest = module(GUEST);
+
+    let mut host = Host::new();
+    host.set_self_module(&guest);
+    let sink = host.shared_stdout();
+    let inst = host.grant_instantiator(0, 1u64 << 12);
+    let stream = host.grant_stream(StreamRole::Out);
+    let bogus_cmd: i64 = 999;
+
+    let mut fuel = 40_000_000u64;
+    let r = temen_interp::bytecode::compile_and_run_with_host(
+        &guest,
+        0,
+        &[Value::I32(inst), Value::I64(bogus_cmd), Value::I32(stream)],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("the exec-bearing module compiles")
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(99)],
+        "a refused exec on the bytecode engine returns to the caller's sentinel (99)"
     );
     let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert!(

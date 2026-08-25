@@ -53,6 +53,9 @@ TR="$REPO/crates/temen-llvm/target/release/temen-llvm-translate"
 [ -x "$TR" ] || cargo build --release --bin temen-llvm-translate --manifest-path "$REPO/crates/temen-llvm/Cargo.toml"
 "$TR" "$CACHE/hexer.linked.bc" -o "$CACHE/hexer_raw.temen" --binary --host-page 65536 --stub-externs
 cargo run -q --release -p temen-run --example prep_temen -- "$CACHE/hexer_raw.temen" "$CACHE/hexer.temen" | grep -E "funcs|wrote"
+# The child-entry variant (NIM.md §3c, W5): func 0 is the starter->i64-status §14 child ABI, so a
+# Rust-on-Temen driver guest can op-13-spawn hexer over a shared memfs (examples/spawn_child_fs.rs).
+"$TR" "$CACHE/hexer.linked.bc" -o "$CACHE/hexer_ce_raw.temen" --binary --host-page 65536 --stub-externs --child-entry
 
 echo "=== [4/6] generate hexer's input: nimony c fills a nimcache, extract the .s.nif set ==="
 fail=0
@@ -86,5 +89,21 @@ for src in "$HERE"/../nifler_temen/inputs/*.nim; do
       echo "  $name [$eng]: MISMATCH (exit=$rc)"; head -c 200 "$out/err.txt" | sed 's/^/    /'; fail=1
     fi
   done
+
+  # [child-entry] the same lowering as a confined op-13 §14 child (the driver-guest fan-out shape): the
+  # driver seeds the fixture dir into a shared memfs, op-13-spawns hexer with argv `hexer c <main>.s.nif`,
+  # and dumps produced files — diffed against native, same oracle.
+  ceout="$CACHE/ce_out_$name"; rm -rf "$ceout"; mkdir -p "$ceout"
+  set +e
+  cargo run -q --release -p temen-run --example spawn_child_fs -- \
+    "$CACHE/hexer_ce_raw.temen" "$fixture" "$ceout" -- hexer c "$main.s.nif" >/dev/null 2>"$ceout/err.txt"; rc=$?
+  set -e
+  ok=1; [ "$rc" = 0 ] || ok=0
+  for f in $produced; do diff -q "$nat/$f" "$ceout/$f" >/dev/null 2>&1 || ok=0; done
+  if [ "$ok" = 1 ]; then
+    echo "  $name [child-entry op-13]: OK ($(echo $produced | wc -w) files byte-identical, incl $main.x.nif)"
+  else
+    echo "  $name [child-entry op-13]: MISMATCH (exit=$rc)"; head -c 200 "$ceout/err.txt" | sed 's/^/    /'; fail=1
+  fi
 done
 [ "$fail" = 0 ] && echo "ALL MATCH NATIVE — real hexer lowers semchecked NIF to Leng on the Temen, byte-exact" || { echo "FAILED"; exit 1; }

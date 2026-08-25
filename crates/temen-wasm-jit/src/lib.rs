@@ -1178,25 +1178,24 @@ pub fn module_uses_unmap_protect(m: &Module) -> bool {
     })
 }
 
-/// Whether `f` uses a D62 bulk-memory op — excluded from the #750 paged subset (the emitted span
-/// check has no per-page walk; such functions stay on the interpreter).
-fn func_uses_bulk_mem(f: &Func) -> bool {
-    f.blocks.iter().any(|b| {
-        b.insts.iter().any(|i| {
-            matches!(
-                i,
-                Inst::MemCopy { .. } | Inst::MemMove { .. } | Inst::MemFill { .. }
-            )
-        })
-    })
-}
-
 /// Cap on the **estimated** emitted body size of a single function (bytes). wasm engines reject a
 /// function body over a hard limit (V8: 7,654,321 bytes), which fails `WebAssembly.compile` for the
 /// *whole* module. Set well under that so the conservative estimate below (which over-estimates on
 /// the shipped guests) leaves margin. The one shipped case is the SQLite VDBE dispatcher, whose
 /// bulk-memory body (~7.75 MB) rejoins the subset under #1004 — kept on the interpreter here.
 const MAX_EST_EMITTED_FN_BYTES: usize = 6_500_000;
+
+/// #1026 slice 4 — the **lower** companion to [`MAX_EST_EMITTED_FN_BYTES`], for the *tier-up*
+/// eligibility decision only (not the emit subset). A leaf whose estimated emitted body is below
+/// this floor is not worth **tiering up** in the interpreter-drives-emitted-leaves model: the fixed
+/// interp↔wasm crossing per call (marshal argv, call the export, deliver results — measured ~2 µs on
+/// tcl's dispatch leaves, #1026) exceeds what so small an emitted body saves over interpreting it
+/// inline. The cooperative fallback driver (`temen_coop_open`, which consults [`est_emitted_size`]
+/// against this) keeps such leaves on the interpreter; a genuinely heavy leaf
+/// (real work per call) clears the floor and still tiers up. Whole-program emit is unaffected — it
+/// runs the whole module as one emitted unit, with no per-leaf crossing to amortize — as is the
+/// `Jit.invoke` unit path (a separate mechanism). Calibrated with `browser/bench_tierup_cards.mjs`.
+pub const MIN_TIERUP_EMITTED_FN_BYTES: usize = 4_096;
 
 /// A conservative upper-bound estimate of `f`'s emitted wasm body size. Memory ops carry the fat
 /// confine + NULL-guard sequence; every block is a `br_table` dispatch target whose edges shuffle
@@ -1205,7 +1204,7 @@ const MAX_EST_EMITTED_FN_BYTES: usize = 6_500_000;
 /// with margin. Fail-safe both ways: an under-estimate merely lets an over-limit function through to
 /// a graceful `WebAssembly.compile` fallback (as before #1004), an over-estimate keeps an emittable
 /// function on the interpreter (a cross-tier leaf) — never an escape (§4 confinement is unaffected).
-fn est_emitted_size(f: &Func) -> usize {
+pub fn est_emitted_size(f: &Func) -> usize {
     let pcount = |t: u32| f.blocks.get(t as usize).map_or(0, |b| b.params.len());
     f.blocks
         .iter()
@@ -2371,18 +2370,10 @@ fn compile_module_tierup_inner(
         .iter()
         .map(|f| func_in_subset_caps(m, f, atomics_ok, nested_caps))
         .collect();
-    if paged.is_some() {
-        // Paged-mode limit (#750): bulk-memory ops have no per-page walk in the emitted span check,
-        // so their functions stay on the interpreter (which honors the full page map). Fail-closed:
-        // dropping them from the subset can only route more code to the oracle. (The NULL guard no
-        // longer shares this limit — #1004 gave the span check its guard low bound; a marked module
-        // that is *also* paged still excludes them here, the per-page walk being the open problem.)
-        for (i, f) in m.funcs.iter().enumerate() {
-            if func_uses_bulk_mem(f) {
-                in_subset[i] = false;
-            }
-        }
-    }
+    // #1081: paged mode now emits a per-page walk for bulk-memory spans ([`emit_span_page_check`]), so
+    // bulk-mem functions (Lua's `luaV_execute` among them) tier up under paged instead of staying on the
+    // interpreter. The former blanket exclusion here is gone — the walk traps `MemoryFault` exactly
+    // where the interpreter's `check_prot_span` does (Unmapped anywhere; non-Rw for a write).
     // #1004 size valve (see `cap_oversized`): a body over the engine's per-function limit stays on
     // the interpreter — a cross-tier leaf here, since the tier-up `leaf` set below admits any
     // `marshallable_sig` non-subset function.
@@ -2543,6 +2534,17 @@ fn reachable_concurrency(m: &Module, entry: u32) -> bool {
     (0..m.funcs.len()).any(|i| a.reachable[i] && m.funcs[i].uses_concurrency())
 }
 
+/// Whether any function reachable from `entry` uses `setjmp`/`longjmp` ([`Func::uses_setjmp`]). Such a
+/// guest must **not** be wasm-driven: a `setjmp` at the root of the call chain (C `pcall`-style
+/// protected calls — Lua's `lua_pcall`) declines to the interpreter, and under `WasmDriven` the
+/// interpreter can't tier back up, so the whole hot path (even a fully-emitted `luaV_execute`) runs
+/// interpreted. Interpreter-driven tier-up runs setjmp on the interpreter (called once, cheap) while
+/// the hot functions tier up onto emitted wasm — the strictly better strategy here (#1081).
+fn reachable_setjmp(m: &Module, entry: u32) -> bool {
+    let a = analyze_from(m, entry);
+    (0..m.funcs.len()).any(|i| a.reachable[i] && m.funcs[i].uses_setjmp())
+}
+
 /// Whether any function reachable from `entry` uses a **fiber** op (`cont.*`/`suspend`) — the one §12
 /// family the nested emitter cannot lower (a wasm frame can't unwind for a stack switch), unlike
 /// thread/futex ops, which the nested tier *does* emit as host bounces. This is the [`compile_nested`]
@@ -2614,11 +2616,13 @@ pub fn compile_jit(m: &Module, shape: Shape, shared_memory: bool) -> Result<Arti
         // No single top-level frame the host can own → the interpreter drives, hot regions tier up.
         Shape::Threaded => interp_driven(m),
         Shape::Batch { entry } | Shape::Reactor { entry } => {
-            // Wasm-drivable iff rooted-eligible AND nothing reachable can suspend across a wasm frame.
-            // The concurrency check makes this selection strictly more conservative than the raw
-            // `compile_module_reactor` entry (which would emit a suspending cross-tier callee it can't
-            // safely unwind) — closing that latent sharp edge.
-            if !reachable_concurrency(m, entry) {
+            // Wasm-drivable iff rooted-eligible AND nothing reachable can suspend across a wasm frame
+            // AND nothing reachable uses setjmp/longjmp (#1081: a root `setjmp` bounces the whole hot
+            // path to the interpreter, which under `WasmDriven` never tiers back up — interpreter-driven
+            // tier-up is strictly better there). The concurrency check makes this selection strictly
+            // more conservative than the raw `compile_module_reactor` entry (which would emit a
+            // suspending cross-tier callee it can't safely unwind) — closing that latent sharp edge.
+            if !reachable_concurrency(m, entry) && !reachable_setjmp(m, entry) {
                 if let Ok((wasm, emitted)) = compile_module_reactor(m, entry, shared_memory) {
                     return Ok(Artifact {
                         wasm,
@@ -3382,6 +3386,12 @@ struct FnCtx {
     /// i32 scratch holding a confined atomic address so a read-modify-write / compare-exchange can
     /// reuse it for both the load and the store without recomputing (and re-confining) it.
     atomic_addr_l: u32,
+    /// i64 scratch pair for the #1081 paged **bulk-memory per-page walk** ([`emit_span_page_check`]):
+    /// `span_page_l` is the loop counter (current window-relative page), `span_last_page_l` the last
+    /// page of the span. Only touched under paged mode for a `MemCopy`/`MemMove`/`MemFill`; two unused
+    /// i64 locals otherwise (TurboFan drops them).
+    span_page_l: u32,
+    span_last_page_l: u32,
     /// Open label count inside the body; the dispatcher `loop` is the first label opened, so a
     /// branch back to it from depth `d` is `br (d - 1)`.
     depth: u32,
@@ -3516,6 +3526,10 @@ fn emit_func(
     local_types.push(ValType::I64);
     let atomic_addr_l = n_params + local_types.len() as u32;
     local_types.push(ValType::I32);
+    let span_page_l = n_params + local_types.len() as u32;
+    local_types.push(ValType::I64);
+    let span_last_page_l = n_params + local_types.len() as u32;
+    local_types.push(ValType::I64);
 
     let mut cx = FnCtx {
         local_of,
@@ -3523,6 +3537,8 @@ fn emit_func(
         ea_l,
         fuel_l,
         atomic_addr_l,
+        span_page_l,
+        span_last_page_l,
         depth: 0,
         mapped_global_idx: MAPPED_GLOBAL_IDX,
         // The pagestate global (paged mode only) sits immediately after `mapped`.
@@ -3927,6 +3943,110 @@ fn emit_span_check(cx: &mut FnCtx, code: &mut Vec<u8>, base_local: u32, len_loca
     }
 }
 
+/// #1081 — the **paged bulk-memory per-page walk**: the span analogue of [`emit_page_check_one`]. For a
+/// span `[base, base+len)` that has already passed [`emit_span_check`] (so it lies within `[0, mapped)`
+/// and every page has a live `"pagestate"` entry), walk each window-relative page it touches and trap
+/// `MemoryFault` where the interpreter's [`check_prot_span`](../temen_interp) would: an `Unmapped` page
+/// anywhere in the span (read or write), or a non-`Rw` page for a write. This is what lets a
+/// bulk-memory function tier up under paged mode (it was excluded before — the per-page walk being the
+/// missing piece). No-op when `page_check` is `None` (unpaged: byte-identical to before). The masking
+/// is unchanged and unconditional; a wrong page table is a trap-parity divergence the coop differential
+/// catches (INVARIANTS #9), never a confinement escape (#2 — the bytes stay inside the masked window).
+fn emit_span_page_check(
+    cx: &mut FnCtx,
+    code: &mut Vec<u8>,
+    base_local: u32,
+    len_local: u32,
+    write: bool,
+) {
+    let Some((page_log2, ps_gidx)) = cx.page_check else {
+        return;
+    };
+    let (page_l, last_l) = (cx.span_page_l, cx.span_last_page_l);
+    // page_l = (base & MASK) >> page_log2  — the span's first window-relative page.
+    code.push(OP_LOCAL_GET);
+    uleb(code, base_local as u64);
+    code.push(OP_I64_CONST);
+    sleb64(code, MASK as i64);
+    code.push(0x83); // i64.and (clamp; a no-op past emit_span_check, defensive like the scalar path)
+    code.push(OP_I64_CONST);
+    sleb64(code, page_log2 as i64);
+    code.push(0x88); // i64.shr_u
+    code.push(OP_LOCAL_SET);
+    uleb(code, page_l as u64);
+    // last_l = ((base + len - 1) & MASK) >> page_log2  — the span's last page (len >= 1 in the guard).
+    code.push(OP_LOCAL_GET);
+    uleb(code, base_local as u64);
+    code.push(OP_LOCAL_GET);
+    uleb(code, len_local as u64);
+    code.push(0x7c); // i64.add
+    code.push(OP_I64_CONST);
+    sleb64(code, 1);
+    code.push(0x7d); // i64.sub → base + len - 1
+    code.push(OP_I64_CONST);
+    sleb64(code, MASK as i64);
+    code.push(0x83); // i64.and
+    code.push(OP_I64_CONST);
+    sleb64(code, page_log2 as i64);
+    code.push(0x88); // i64.shr_u
+    code.push(OP_LOCAL_SET);
+    uleb(code, last_l as u64);
+    // block { loop { if page_l > last_l: break; check(page_l); page_l += 1; continue } }
+    code.push(OP_BLOCK);
+    code.push(BLOCKTYPE_VOID);
+    cx.depth += 1;
+    code.push(OP_LOOP);
+    code.push(BLOCKTYPE_VOID);
+    cx.depth += 1;
+    // if page_l > last_l → br out of the block (relative depth 1 from inside the loop).
+    code.push(OP_LOCAL_GET);
+    uleb(code, page_l as u64);
+    code.push(OP_LOCAL_GET);
+    uleb(code, last_l as u64);
+    code.push(0x56); // i64.gt_u
+    code.push(0x0d); // br_if
+    uleb(code, 1);
+    // state = pagestate[page_l]  (table base in the pagestate global; window-relative page index).
+    code.push(0x23); // global.get pagestate
+    uleb(code, ps_gidx as u64);
+    code.push(OP_LOCAL_GET);
+    uleb(code, page_l as u64);
+    code.push(0xa7); // i32.wrap_i64
+    code.push(0x6a); // i32.add
+    code.push(0x2d); // i32.load8_u
+    uleb(code, 0); // align
+    uleb(code, 0); // offset
+    if write {
+        // A store is admitted only on an `Rw` (1) page.
+        code.push(OP_I32_CONST);
+        sleb64(code, 1);
+        code.push(0x47); // i32.ne
+    } else {
+        // A load is admitted on anything committed (`Rw`/`Ro`) — only `Unmapped` (0) traps.
+        code.push(0x45); // i32.eqz
+    }
+    code.push(OP_IF);
+    code.push(BLOCKTYPE_VOID);
+    cx.depth += 1;
+    emit_trap(code, TRAP_MEMORY_FAULT);
+    code.push(OP_END);
+    cx.depth -= 1;
+    // page_l += 1; continue the loop.
+    code.push(OP_LOCAL_GET);
+    uleb(code, page_l as u64);
+    code.push(OP_I64_CONST);
+    sleb64(code, 1);
+    code.push(0x7c); // i64.add
+    code.push(OP_LOCAL_SET);
+    uleb(code, page_l as u64);
+    code.push(OP_BR);
+    uleb(code, 0); // → loop header
+    code.push(OP_END); // end loop
+    cx.depth -= 1;
+    code.push(OP_END); // end block
+    cx.depth -= 1;
+}
+
 /// Push the confined linear-memory address `win + (base & MASK)` (an `i32`) for a bulk-op span whose
 /// `base` local has already passed [`emit_span_check`] (so `base < mapped ≤ 2^32` and the `& MASK` is a
 /// no-op clamp, mirroring the scalar path's defense-in-depth). `mapped ≤ 2^32` on wasm32, so the later
@@ -4240,6 +4360,7 @@ fn emit_block_body(
                 let ll = cx.local_of[k][*len as usize];
                 emit_bulk_guard_open(cx, code, ll);
                 emit_span_check(cx, code, dl, ll);
+                emit_span_page_check(cx, code, dl, ll, true); // #1081: paged per-page walk (write)
                 emit_win_addr(code, dl); // dest addr (i32)
                 get(code, cx, *val); // fill byte (already i32)
                 get(code, cx, *len);
@@ -4257,6 +4378,8 @@ fn emit_block_body(
                 emit_bulk_guard_open(cx, code, ll);
                 emit_span_check(cx, code, dl, ll);
                 emit_span_check(cx, code, sl, ll);
+                emit_span_page_check(cx, code, sl, ll, false); // #1081: paged per-page walk (read src)
+                emit_span_page_check(cx, code, dl, ll, true); //  #1081: paged per-page walk (write dst)
                 emit_win_addr(code, dl); // dest addr (i32)
                 emit_win_addr(code, sl); // src addr (i32)
                 get(code, cx, *len);

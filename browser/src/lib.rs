@@ -2187,9 +2187,10 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                                         v.jit_result_types = rtypes.unwrap();
                                         return PAR_JIT_INVOKE;
                                     }
-                                    Err(t) => v
-                                        .inner
-                                        .deliver_jit_invoke(Err(t), std::sync::Arc::from(Vec::new())),
+                                    Err(t) => v.inner.deliver_jit_invoke(
+                                        Err(t),
+                                        std::sync::Arc::from(Vec::new()),
+                                    ),
                                 }
                             } else {
                                 // #922: split the resolved `(funcs, types)` for delivery.
@@ -2197,9 +2198,10 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                                     Ok((funcs, types)) => {
                                         v.inner.deliver_jit_invoke(Ok(funcs), types)
                                     }
-                                    Err(t) => v
-                                        .inner
-                                        .deliver_jit_invoke(Err(t), std::sync::Arc::from(Vec::new())),
+                                    Err(t) => v.inner.deliver_jit_invoke(
+                                        Err(t),
+                                        std::sync::Arc::from(Vec::new()),
+                                    ),
                                 }
                             }
                         }
@@ -2933,6 +2935,131 @@ pub fn onramp_posix_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
         stdout: posix.stdout(),
         stderr: posix.stderr(),
         framebuffer: None, // the personality grants no `display` cap
+    }
+}
+
+/// Run the **real GNU bash** binary (#802 / #1080) in the browser: the whole-program bash module the
+/// `demos/bash` on-ramp produces, on the bytecode engine, under the POSIX personality — the playground
+/// twin of `demos/bash`'s native `bash_probe`/capstone. `argv` is the command line (e.g. `["bash",
+/// "-c", "echo hi"]`); `stdin` seeds the personality's `read(0, …)`.
+///
+/// bash is unlike the bespoke `temen-posix` shell ([`onramp_posix_exec`]) in three ways this entry
+/// handles:
+///   1. **argv, not stdin.** bash's synthesized `_start` parses `argc`/`argv` from the powerbox args
+///      buffer — so the `{argc,envc}`-prefixed blob is seeded at [`temen_ir::module_args_base`] via
+///      `init_mem` (the browser twin of `temen-run`'s `build_args_blob`; the `pg_setup` shape).
+///   2. **bash brings its own `malloc`.** Its single manifest import is `vm_map` (`AddressSpace` op 0);
+///      the personality is granted heap `0,0` (serves *no* heap — the `bash_probe` "heap 0,0"), and
+///      `vm_map` binds to a growable [`Host::grant_memory`] cap so `malloc` grows into the reserved
+///      tail. Hence the **reserved-window** engine ([`bytecode::compile_and_run_capture_reserved_with_host`]).
+///   3. **the personality is reached by name.** bash has no POSIX manifest imports — its shim band 0
+///      resolves the personality through `__vm_cap_resolve("posix")`, so the grant is registered under
+///      the name `"posix"` (the `run_with_caps(&[("posix", …)])` name), and it owns bash's fd 1/2 —
+///      its captured stdout/stderr is the run's output.
+///
+/// The `.temen` module itself is a **build-at-deploy asset** (GPLv3 — never vendored; see #1080), so
+/// this entry takes the decoded module the caller loaded; there is no committed bash fixture.
+pub fn bash_exec(m: &temen_ir::Module, argv: &[&[u8]], stdin: &[u8]) -> PbOutcome {
+    bash_exec_with(m, argv, stdin, &[])
+}
+
+/// As [`bash_exec`], plus a **`/bin` registry** of external commands `(path, module)` — each granted as
+/// a `Module` and registered as a filesystem executable so `fork → execve("/bin/<cmd>")` resolves to a
+/// separate compiled child (the `bash_probe` `BASH_PROBE_BIN` shape; coreutils staging is #1080 slice
+/// 2). With none registered, an external command reports `not found` and the shell keeps going.
+pub fn bash_exec_with(
+    m: &temen_ir::Module,
+    argv: &[&[u8]],
+    stdin: &[u8],
+    bins: &[(&str, &temen_ir::Module, u8)],
+) -> PbOutcome {
+    let unsupported = |status: i32| PbOutcome {
+        status,
+        value: 0,
+        exit_code: 0,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        framebuffer: None,
+    };
+    // The on-ramp shape gate: a `vm_map`-importing bash module is a named-powerbox entry (paramless
+    // `_start`), so `onramp_check` passes it; a non-bash module falls closed here.
+    if onramp_check(m).is_err() {
+        return unsupported(STATUS_UNSUPPORTED);
+    }
+    use temen_interp::cap_id;
+    let mut host = Host::new();
+    // The personality — the full forkable POSIX surface (fork, signals, exec-remap, fd/process ops),
+    // `grant` wiring exactly what `bash_probe`'s native `cap` does. Heap `0,0`: bash brings its own
+    // `malloc` (below), so the personality serves no heap. It owns stdin (`read(0)`) and stdout/stderr.
+    let (px_h, posix) = temen_posix::grant(&mut host, 0, 0, stdin.to_vec());
+    // Reached by name: bash's shim resolves the personality via `__vm_cap_resolve("posix")`.
+    host.register_cap_name("posix", px_h);
+    // bash's single manifest import `vm_map` (`AddressSpace` op 0) is its `malloc`'s page-commit op —
+    // bind it to a growable memory cap (`base 0, size u64::MAX`) so the heap grows into the reserved
+    // tail. Other AddressSpace ops (`vm_unmap`/`vm_protect`/`vm_page_size`) share the same handle.
+    let mem_h = host.grant_memory();
+    let bindings = m
+        .imports
+        .iter()
+        .map(|im| match im.name.as_str() {
+            "vm_map" | "vm_unmap" | "vm_protect" | "vm_page_size" | "vm_region_create" => {
+                let op = match im.name.as_str() {
+                    "vm_map" => 0,
+                    "vm_unmap" => 1,
+                    "vm_protect" => 2,
+                    "vm_page_size" => 3,
+                    _ => 5,
+                };
+                temen_interp::BoundImport::required(cap_id::ADDRESS_SPACE, op, mem_h)
+            }
+            // A bash module should import only the AddressSpace ops; anything else is unexpected —
+            // leave the slot unbound so it fails closed at dispatch rather than mis-binding.
+            _ => temen_interp::BoundImport::rebindable(0, 0, None),
+        })
+        .collect();
+    host.set_import_bindings(bindings);
+    // Optional /bin: register each command module as a filesystem executable so `execve("/bin/<cmd>")`
+    // spawns it (op 13). `register_executable` is the personality's exec-bit registry.
+    for (path, cm, wl) in bins {
+        let ch = host.grant_module(cm);
+        posix.register_executable(path, ch, *wl);
+    }
+    // Seed `argv` + a minimal `env` at the module's powerbox args base (`{argc,envc}` LE prefix +
+    // packed NUL strings), where the synthesized `_start` reads it. `PATH=/bin` lets bash resolve an
+    // external command (`seq` → `/bin/seq`, registered above) for fork → execve; `HOME=/` is the
+    // conventional minimum (the `bash_probe` env).
+    let env: &[&[u8]] = &[b"PATH=/bin", b"HOME=/"];
+    let blob = temen_ir::write_args_blob(argv, env);
+    let base = temen_ir::module_args_base(m) as usize;
+    let mut init_mem = vec![0u8; base + blob.len()];
+    init_mem[base..].copy_from_slice(&blob);
+    let mut fuel = u64::MAX;
+    let (status, value, exit_code) = match bytecode::compile_and_run_capture_reserved_with_host(
+        m,
+        0,
+        &[],
+        &mut fuel,
+        &init_mem,
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        &mut host,
+    ) {
+        None => (STATUS_UNSUPPORTED, 0, 0),
+        Some((Err(Trap::Exit(code)), _)) => (STATUS_EXIT, 0, code),
+        Some((Err(_), _)) => (STATUS_TRAP, 0, 0),
+        Some((Ok(vals), _)) => match vals.first() {
+            Some(Value::I64(x)) => (STATUS_OK, *x, 0),
+            Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
+            _ => (STATUS_OK, 0, 0), // bash's `main` may return void through `_start`
+        },
+    };
+    // The personality owns bash's fd 1/2 — its captured streams are the run's output.
+    PbOutcome {
+        status,
+        value,
+        exit_code,
+        stdout: posix.stdout(),
+        stderr: posix.stderr(),
+        framebuffer: None,
     }
 }
 
@@ -8805,6 +8932,16 @@ static TIERUP_UNIT_WIN_LOG2: std::sync::atomic::AtomicU8 = std::sync::atomic::At
 static TIERUP_UNIT_TABLE_LOG2: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(ONRAMP_JIT_TABLE_LOG2);
 
+/// #1026 slice 4 — the **leaf tier-up size floor** (estimated emitted bytes): a leaf below it stays
+/// on the interpreter rather than tiering up, because the interp↔wasm crossing per call outweighs
+/// what so small an emitted body saves (measured net loss on every dispatch-heavy card, #1026). The
+/// production default is [`temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES`]; [`temen_coop_open`] reads
+/// this when building its eligibility bitmap. Overridable via [`temen_coop_set_tierup_floor`] so the
+/// differential harness can exercise the emitted **mechanism** with tiny guests (floor 0) separately
+/// from this size **policy**, and `bench_tierup_cards.mjs` can sweep the floor in one build.
+static COOP_TIERUP_FLOOR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES);
+
 /// The wasm emitter the tier-up driver installs for a `vm_jit_*`-importing guest (#835/#846):
 /// emit a validated unit whole-module in **Model B2** shape (`compile_module_b2` — its
 /// `call_indirect` dispatches through the driver's shared funcref table, so a **linked** unit's
@@ -8914,6 +9051,16 @@ impl CoopTierupRun {
 
 static mut COOP_RUN: Option<CoopTierupRun> = None;
 
+/// #1026 slice 4 — override the leaf tier-up size floor (estimated emitted bytes) for subsequent
+/// [`temen_coop_open`]s; takes effect at the next open. `bytes == 0` disables the floor entirely (any
+/// emittable leaf tiers up), which the differential harness uses to exercise the emitted **mechanism**
+/// with its tiny synthetic guests; `bench_tierup_cards.mjs` sweeps it to calibrate the default. The
+/// production default ([`temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES`]) applies until this is called.
+#[no_mangle]
+pub extern "C" fn temen_coop_set_tierup_floor(bytes: usize) {
+    COOP_TIERUP_FLOOR.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Open a cooperative tier-up run over the guest module `[mod_ptr, mod_len)` (stdin optional,
 /// `shared` = SharedArrayBuffer memory). Returns `0`/`STATUS_OK` on success, a negative `STATUS_*`
 /// on refusal (decode error, an op outside the engine subset, or nothing for the emitted tier to
@@ -9012,20 +9159,37 @@ pub extern "C" fn temen_coop_open(
             return -STATUS_UNSUPPORTED;
         }
     };
-    // A function tiers up iff the emitter emitted it and its signature is all-i64 (the i64-slot
-    // transport the host marshals by) — exactly the single-vCPU gate.
+    // A function is an **emittable leaf** iff the emitter emitted it with an all-i64 signature (the
+    // i64-slot transport the host marshals by) — exactly the single-vCPU gate. It actually **tiers
+    // up** only if it *also* clears the #1026 leaf tier-up size floor: below it, the interp↔wasm
+    // crossing per call costs more than so small an emitted body saves over interpreting it inline —
+    // a net loss on every dispatch-heavy card. A sub-floor leaf stays *emitted* (an emitted sibling
+    // still calls it natively, no crossing) — only the interpreter's decision to tier *up* into it is
+    // suppressed. Whole-program (no per-leaf crossing) and the `vm_jit_*` unit path (`jit_importer`
+    // below) are untouched.
     let all_i64 = |ts: &[temen_ir::ValType]| ts.iter().all(|t| *t == temen_ir::ValType::I64);
-    let eligible: Vec<bool> = m
+    let floor = COOP_TIERUP_FLOOR.load(std::sync::atomic::Ordering::Relaxed);
+    let emittable_leaf: Vec<bool> = m
         .funcs
         .iter()
         .enumerate()
         .map(|(i, f)| emit[i] && all_i64(&f.params) && all_i64(&f.results))
         .collect();
-    // #835/#926: a `vm_jit_*` importer stays eligible even with no emittable leaf — its win is the
-    // runtime-compiled §22 units running emitted (the JACL macro-staging shape). A guest with neither
-    // an eligible leaf nor a jit importer has nothing for the emitted tier to ever run → decline.
+    let eligible: Vec<bool> = m
+        .funcs
+        .iter()
+        .zip(&emittable_leaf)
+        .map(|(f, &leaf)| leaf && temen_wasm_jit::est_emitted_size(f) >= floor)
+        .collect();
+    // #835/#926: a `vm_jit_*` importer stays worth opening even with no emittable leaf — its win is
+    // the runtime-compiled §22 units running emitted (the JACL macro-staging shape). A guest with
+    // neither an emittable leaf nor a jit importer has nothing for the emitted tier to ever run →
+    // decline (the plain interpreter serves it), exactly as before #1026 slice 4. A guest *with* an
+    // emittable leaf that the size floor gated still opens: coop runs it on its cooperative
+    // interpreter (measured faster than the plain fallback) with zero tier-ups — the "leaves off,
+    // same open" the #1026 bench compares, not a decline to the slower plain path.
     let jit_importer = m.imports.iter().any(|im| im.name.starts_with("vm_jit_"));
-    if !eligible.iter().any(|&e| e) && !jit_importer {
+    if !emittable_leaf.iter().any(|&e| e) && !jit_importer {
         set(STATUS_UNSUPPORTED);
         return -STATUS_UNSUPPORTED;
     }

@@ -411,317 +411,12 @@ fn verify_func(
         let mut types: Vec<ValType> = b.params.clone();
 
         for inst in &b.insts {
-            // Ops that need whole-module context (signatures, the import manifest, the type
-            // section) or append multiple results have their operands checked here rather than in
-            // `check_inst`. These arms **check only** — mutually exclusive by opcode, and the result
-            // types every op appends come from the single shared definition below (`inst_result_types`,
-            // else `check_inst`). Ops with no operands to check (`cap.self.count`/`cap.self.attest`)
-            // aren't listed; they fall straight through to the append.
-            if let Inst::Call { func, args } = inst {
-                // `Call` needs the whole-module signatures and appends 0..N results.
-                let callee = funcs
-                    .get(*func as usize)
-                    .ok_or(VerifyError::CallFuncOutOfRange {
-                        func: fi,
-                        block: bi,
-                        callee: *func,
-                    })?;
-                Cx {
-                    fi,
-                    bi,
-                    types: &types,
-                }
-                .check_args(args, &callee.params)?;
-            } else if let Inst::RefFunc { func } = inst {
-                if *func as usize >= funcs.len() {
-                    return Err(VerifyError::CallFuncOutOfRange {
-                        func: fi,
-                        block: bi,
-                        callee: *func,
-                    });
-                }
-            } else if let Inst::CallIndirect { ty, idx, args } = inst {
-                // Interned signature (#922): the `types` index must name a `Func` entry.
-                let Some(ftype) = func_sig(type_section, *ty) else {
-                    return Err(VerifyError::CallSigInvalid {
-                        func: fi,
-                        block: bi,
-                        sig: *ty,
-                    });
-                };
-                let cx = Cx {
-                    fi,
-                    bi,
-                    types: &types,
-                };
-                cx.expect(*idx, ValType::I32)?;
-                cx.check_args(args, &ftype.params)?;
-            } else if let Inst::CapCall {
-                sig, handle, args, ..
-            } = inst
-            {
-                // Interned signature (#922): self-asserted (no manifest to resolve against), so
-                // the `types` index need only name a `Func` entry; the runtime use-site check
-                // (host-owned table type_id/generation) is what carries safety, not typing.
-                let Some(ftype) = func_sig(type_section, *sig) else {
-                    return Err(VerifyError::CallSigInvalid {
-                        func: fi,
-                        block: bi,
-                        sig: *sig,
-                    });
-                };
-                let cx = Cx {
-                    fi,
-                    bi,
-                    types: &types,
-                };
-                cx.expect(*handle, ValType::I32)?;
-                cx.check_args(args, &ftype.params)?;
-            } else if let Inst::CallSym {
-                import,
-                sig,
-                handle,
-                args,
-            } = inst
-            {
-                // §7/§22 symbolic call (v8): `call.sym` verifies exactly like a *flat* manifest
-                // import call (op 0), plus its legacy handle operand (i32, ignored by manifest
-                // dispatch — it is live only to the linker: the Cap symbol's runtime handle and
-                // the `Slot` patch target). Executable when the instance binds the name; the
-                // linker's rewrite target when resolved first. One rule, both consumers.
-                if imports.get(*import as usize).is_none() {
-                    return Err(VerifyError::UnresolvedImport {
-                        func: fi,
-                        block: bi,
-                        import: *import,
-                    });
-                }
-                let Some(want) = import_op_sig(imports, type_section, *import, 0) else {
-                    return Err(VerifyError::ImportOpOutOfRange {
-                        func: fi,
-                        block: bi,
-                        import: *import,
-                        op: 0,
-                    });
-                };
-                // Interned signature (#922): the carried `types` index must name a `Func` entry,
-                // and — since it feeds arg/result typing and SSA-slot layout — it must agree with
-                // the import's manifest-resolved signature (the §7 structural check, preserved with
-                // `sig` now shared through the type section rather than an inline copy).
-                let Some(sig_ft) = func_sig(type_section, *sig) else {
-                    return Err(VerifyError::CallSigInvalid {
-                        func: fi,
-                        block: bi,
-                        sig: *sig,
-                    });
-                };
-                if want != sig_ft {
-                    return Err(VerifyError::ImportSigMismatch {
-                        func: fi,
-                        block: bi,
-                        import: *import,
-                    });
-                }
-                let cx = Cx {
-                    fi,
-                    bi,
-                    types: &types,
-                };
-                cx.expect(*handle, ValType::I32)?;
-                cx.check_args(args, &sig_ft.params)?;
-            } else if let Inst::CallImport {
-                import,
-                op,
-                sig,
-                args,
-            } = inst
-            {
-                // §7 executable named import (IMPORTS.md phase 1): the index must name a declared
-                // import and the call's self-describing `sig` must equal the manifest's — the
-                // canonical-interface check `cap.call` cannot have (its sig is self-asserted).
-                // No handle operand (v8): the slot binding identifies the capability. Arg/result
-                // typing mirrors `cap.call`.
-                if imports.get(*import as usize).is_none() {
-                    return Err(VerifyError::UnresolvedImport {
-                        func: fi,
-                        block: bi,
-                        import: *import,
-                    });
-                }
-                // §3.5: resolve the consumer-local op through the import's declared shape and
-                // the type section — op range + exact signature, at load.
-                let Some(want) = import_op_sig(imports, type_section, *import, *op) else {
-                    return Err(VerifyError::ImportOpOutOfRange {
-                        func: fi,
-                        block: bi,
-                        import: *import,
-                        op: *op,
-                    });
-                };
-                // Interned signature (#922): resolve the carried index and require it to agree with
-                // the manifest resolution (structural check preserved; sig now shared via `types`).
-                let Some(sig_ft) = func_sig(type_section, *sig) else {
-                    return Err(VerifyError::CallSigInvalid {
-                        func: fi,
-                        block: bi,
-                        sig: *sig,
-                    });
-                };
-                if want != sig_ft {
-                    return Err(VerifyError::ImportSigMismatch {
-                        func: fi,
-                        block: bi,
-                        import: *import,
-                    });
-                }
-                Cx {
-                    fi,
-                    bi,
-                    types: &types,
-                }
-                .check_args(args, &sig_ft.params)?;
-            } else if let Inst::ImportAttach { import, handle } = inst {
-                // Phase-2 `import.attach` (IMPORTS.md): the index must name a declared **rebindable**
-                // import (attaching to a `required` slot would break its immutability-per-instance);
-                // the handle operand is an ordinary forgeable `i32` (validity is the runtime's §3c
-                // check at attach). Appends the `i32` status.
-                if imports.get(*import as usize).is_none() {
-                    return Err(VerifyError::UnresolvedImport {
-                        func: fi,
-                        block: bi,
-                        import: *import,
-                    });
-                }
-                if imports[*import as usize].mode != temen_ir::ImportMode::Rebindable {
-                    return Err(VerifyError::AttachNotRebindable {
-                        func: fi,
-                        block: bi,
-                        import: *import,
-                    });
-                }
-                Cx {
-                    fi,
-                    bi,
-                    types: &types,
-                }
-                .expect(*handle, ValType::I32)?;
-            } else if let Inst::ContResume { k, arg, block: _ } = inst {
-                // §12 `cont.resume` (in both its I48 blocking and non-blocking forms) appends two
-                // results `(status: i32, value: i64)`. The `block` flag does not affect typing.
-                let cx = Cx {
-                    fi,
-                    bi,
-                    types: &types,
-                };
-                cx.expect(*k, ValType::I64)?; // forgeable fiber handle (i64: 16-bit slot + 48-bit generation)
-                cx.expect(*arg, ValType::I64)?;
-            } else if let Inst::CallImportDyn {
-                ty,
-                op,
-                sig,
-                handle,
-                args,
-            } = inst
-            {
-                // §3.5 dynamic-mode dispatch by type-section reference: `ty` must name a
-                // well-formed interface, `op` in range, and the self-describing `sig` must equal
-                // the resolution — the same canonical-interface check as static mode, at load.
-                let Some(want) = iface_op_sig(type_section, *ty, *op) else {
-                    return Err(VerifyError::DynIfaceInvalid {
-                        func: fi,
-                        block: bi,
-                        ty: *ty,
-                    });
-                };
-                // Interned signature (#922): resolve the carried index and require it to agree with
-                // the interface op's resolution (structural check preserved; sig shared via `types`).
-                let Some(sig_ft) = func_sig(type_section, *sig) else {
-                    return Err(VerifyError::CallSigInvalid {
-                        func: fi,
-                        block: bi,
-                        sig: *sig,
-                    });
-                };
-                if want != sig_ft {
-                    return Err(VerifyError::DynIfaceInvalid {
-                        func: fi,
-                        block: bi,
-                        ty: *ty,
-                    });
-                }
-                let cx = Cx {
-                    fi,
-                    bi,
-                    types: &types,
-                };
-                cx.expect(*handle, ValType::I32)?;
-                cx.check_args(args, &sig_ft.params)?;
-            } else if let Inst::ExportHandle { export } = inst {
-                // §3.5 `export.handle`: the index must name a declared impl export. Appends the
-                // reified handle (`i32`).
-                if *export as usize >= n_impl_exports {
-                    return Err(VerifyError::ExportHandleOutOfRange {
-                        func: fi,
-                        block: bi,
-                        export: *export,
-                    });
-                }
-            } else if let Inst::CapSelfTypeId { ty } = inst {
-                // §3.5 reflection: references a well-formed interface entry of *this* module's type
-                // section; appends an `i32`.
-                if !iface_well_formed(type_section, *ty) {
-                    return Err(VerifyError::DynIfaceInvalid {
-                        func: fi,
-                        block: bi,
-                        ty: *ty,
-                    });
-                }
-            } else if let Inst::CapSelfCovers { handle, ty } = inst {
-                // §3.5 reflection: well-formed interface entry + a forgeable `i32` handle; appends `i32`.
-                if !iface_well_formed(type_section, *ty) {
-                    return Err(VerifyError::DynIfaceInvalid {
-                        func: fi,
-                        block: bi,
-                        ty: *ty,
-                    });
-                }
-                Cx {
-                    fi,
-                    bi,
-                    types: &types,
-                }
-                .expect(*handle, ValType::I32)?;
-            } else if let Inst::ThreadSpawn { func, sp, arg } = inst {
-                // §12 `thread.spawn` resolves a static `funcidx` whose signature must be the fixed
-                // thread-entry type `(i64 sp, i64 arg) -> i64`, so — like `call` — it needs whole-module
-                // info.
-                let callee = funcs
-                    .get(*func as usize)
-                    .ok_or(VerifyError::CallFuncOutOfRange {
-                        func: fi,
-                        block: bi,
-                        callee: *func,
-                    })?;
-                if callee.params != [ValType::I64, ValType::I64] || callee.results != [ValType::I64]
-                {
-                    return Err(VerifyError::ThreadEntrySignature {
-                        func: fi,
-                        block: bi,
-                        callee: *func,
-                    });
-                }
-                let cx = Cx {
-                    fi,
-                    bi,
-                    types: &types,
-                };
-                cx.expect(*sp, ValType::I64)?;
-                cx.expect(*arg, ValType::I64)?;
-            } else if let Inst::GcRoots { mask, .. } = inst {
-                // Security: a `gc.roots` payload mask may only clear the top byte. When the mask is a
-                // constant we can reject a fold-down mask statically (a non-constant mask is enforced at
-                // runtime on both backends). `mask | 0xFF00_..._0000 == !0` ⇔ the low 56 bits are all 1.
-                // (`gc.roots` is *not* special-cased below — its single result comes from `check_inst`.)
+            // §GC security: a constant `gc.roots` payload mask may only clear the top byte — a
+            // fold-down mask is rejected statically here (a non-constant mask is enforced at runtime
+            // on both backends). This is the one check that needs *block* context (tracing the mask
+            // operand to its defining `i64.const`), so it stays out of `type_inst`. `mask | 0xFF00..
+            // == !0` ⇔ the low 56 bits are all 1.
+            if let Inst::GcRoots { mask, .. } = inst {
                 if let Some(m) = const_i64_in_block(b, &fn_results, type_section, *mask) {
                     if (m as u64) | 0xFF00_0000_0000_0000 != u64::MAX {
                         return Err(VerifyError::GcRootsMaskUnsafe {
@@ -733,15 +428,30 @@ fn verify_func(
                 }
             }
 
-            // Append result types from the single shared definition: the special-cased ops above via
-            // `inst_result_types`, every other value-producing op's single result via `check_inst`
-            // (`Store` yields nothing).
-            if inst_result_types(inst, funcs, &fn_results, type_section, &mut types) {
-                continue;
-            }
-            if let Some(result) = check_inst(fi, bi, inst, &types, has_memory)? {
-                types.push(result);
-            }
+            // The single per-instruction dispatch (#895): check operands + append result types.
+            let before = types.len();
+            type_inst(
+                fi,
+                bi,
+                inst,
+                &types,
+                has_memory,
+                funcs,
+                imports,
+                type_section,
+                n_impl_exports,
+                true,
+            )?
+            .append_to(&mut types);
+            // The appended arity is the value-numbering contract `const_i64_in_block` reads back
+            // through `result_count`; a drift would mis-trace the `gc.roots` constant mask. One
+            // dispatch now feeds both, so this asserts they agree (debug builds; the fuzz gates the
+            // release contract).
+            debug_assert_eq!(
+                types.len() - before,
+                inst.result_count(&fn_results, type_section),
+                "type_inst arity disagrees with Inst::result_count"
+            );
         }
 
         check_terminator(fi, bi, &b.term, &types, type_section, nblocks, f, funcs)?;
@@ -753,10 +463,11 @@ fn verify_func(
 /// instruction's result type(s) — exactly the assignment [`verify_func`] performs while checking.
 /// Indexing `func_value_types(..)[block][value_idx]` gives the type of block-local value
 /// `value_idx`, which the interpreter's debugger uses to reconstruct a typed value from its
-/// (untyped) storage slot. Assumes `f` is **verified** (it shares the single-result type rules via
-/// [`check_inst`] and re-lists only the few multi-result appends `verify_func` special-cases — keep
-/// the two in sync); on an unverified function it degrades gracefully (a value whose type can't be
-/// derived is simply absent from the vector) rather than erroring.
+/// (untyped) storage slot. Assumes `f` is **verified**: it derives every value's type from the
+/// *same* [`type_inst`] dispatch `verify_func` uses (run with `check = false`), so the two cannot
+/// drift — the "keep in sync" hazard the `gc.roots` mask-trace once depended on is gone. On an
+/// unverified function it degrades gracefully (a value whose type can't be derived is simply absent
+/// from the vector) rather than erroring.
 pub fn func_value_types(
     f: &Func,
     funcs: &[Func],
@@ -777,95 +488,69 @@ fn block_value_types(
     type_section: &[temen_ir::TypeEntry],
     has_memory: bool,
 ) -> Vec<ValType> {
+    let _ = fn_results;
     let mut types: Vec<ValType> = b.params.clone();
     for inst in &b.insts {
-        // Special-cased ops (multi-result / whole-module-dependent) append via the one shared
-        // definition; everything else takes its single result from the shared `check_inst` rules.
-        if inst_result_types(inst, funcs, fn_results, type_section, &mut types) {
-            continue;
-        }
-        if let Ok(Some(t)) = check_inst(0, 0, inst, &types, has_memory) {
-            types.push(t);
+        // The typing-only walk shares the one [`type_inst`] dispatch with `check = false`: operand
+        // and structural checks short-circuit, so it derives result types from an unverified function
+        // without rejecting it (`imports`/`n_impl_exports` are only read on the checked paths, so the
+        // empties here are never consulted). An op whose type can't be derived contributes nothing.
+        if let Ok(res) = type_inst(
+            0,
+            0,
+            inst,
+            &types,
+            has_memory,
+            funcs,
+            &[],
+            type_section,
+            0,
+            false,
+        ) {
+            res.append_to(&mut types);
         }
     }
     types
 }
 
-/// Append the result types of a **special-cased** instruction to `out`, returning `true`; return
-/// `false` (appending nothing) for an op whose single result is `check_inst`'s to compute.
-///
-/// These are the multi-result and whole-module-dependent ops that [`verify_func`] checks inline
-/// rather than through [`check_inst`]. This is the **one** definition of their appended types,
-/// consumed by both the checking walk ([`verify_func`]) and the typing-only walk
-/// ([`block_value_types`]) so the two cannot drift — the value numbering the `gc.roots` constant-mask
-/// trace relies on (`const_i64_in_block` → [`Inst::result_count`]) then has a single source. The
-/// appended arity is `debug_assert`ed equal to `result_count` for the same op.
-fn inst_result_types(
-    inst: &Inst,
-    funcs: &[Func],
-    fn_results: &[usize],
-    types: &[temen_ir::TypeEntry],
-    out: &mut Vec<ValType>,
-) -> bool {
-    let before = out.len();
-    let handled = match inst {
-        // Calls append the callee/interface result row. A dangling `call` funcidx appends nothing
-        // (`verify_func` rejects it; `result_count` reports 0 there too).
-        Inst::Call { func, .. } => {
-            if let Some(callee) = funcs.get(*func as usize) {
-                out.extend_from_slice(&callee.results);
+/// The result types one instruction appends to the running SSA type vector — the return of the
+/// single [`type_inst`] dispatch. Alloc-free for the common 0/1/2-result cases; a call's variable
+/// result row is a borrow of the callee/signature it resolved (`funcs`/`types` outlive the walk).
+enum InstResults<'a> {
+    /// No value (`store`, the bulk-memory ops, `longjmp`, `set`, a bare fence).
+    None,
+    /// One result — the vast majority of ops.
+    One(ValType),
+    /// `cont.resume`'s `(status: i32, value: i64)` pair.
+    Two(ValType, ValType),
+    /// A call's result row (`callee.results` / `types[sig].results`).
+    Row(&'a [ValType]),
+}
+
+impl InstResults<'_> {
+    /// Append these results to the running type vector, in order.
+    fn append_to(&self, out: &mut Vec<ValType>) {
+        match self {
+            InstResults::None => {}
+            InstResults::One(t) => out.push(*t),
+            InstResults::Two(a, b) => {
+                out.push(*a);
+                out.push(*b);
             }
-            true
+            InstResults::Row(r) => out.extend_from_slice(r),
         }
-        Inst::CallIndirect { ty, .. } => {
-            if let Some(ft) = func_sig(types, *ty) {
-                out.extend_from_slice(&ft.results);
-            }
-            true
-        }
-        // The interned `sig` (a `types` index, #922) is authoritative here — `verify_func` checked
-        // it (`func_sig` in range + `Func` kind, and against the manifest/type-section for the
-        // import/iface calls). (`call.sym` is a link-form placeholder `verify_func` rejects, but
-        // this collector stays total.)
-        Inst::CapCall { sig, .. }
-        | Inst::CallImport { sig, .. }
-        | Inst::CallImportDyn { sig, .. }
-        | Inst::CallSym { sig, .. } => {
-            if let Some(ft) = func_sig(types, *sig) {
-                out.extend_from_slice(&ft.results);
-            }
-            true
-        }
-        // `cont.resume` (in both its blocking and non-blocking forms): `(status: i32, value: i64)`.
-        Inst::ContResume { .. } => {
-            out.push(ValType::I32);
-            out.push(ValType::I64);
-            true
-        }
-        // Single-`i32` appends: §3.5 reflection / phase-2 attach / §3.5 reify, plus the `thread.spawn`
-        // handle and the `ref.func` index. (`cap.self.count`/`get`/`resolve`/`label`/`attest` are now
-        // `cap.call CAP_SELF`, handled by the `sig`-driven `CapCall` arm below.)
-        Inst::CapSelfTypeId { .. }
-        | Inst::CapSelfCovers { .. }
-        | Inst::ExportHandle { .. }
-        | Inst::ImportAttach { .. }
-        | Inst::ThreadSpawn { .. }
-        | Inst::RefFunc { .. } => {
-            out.push(ValType::I32);
-            true
-        }
-        _ => false,
-    };
-    // The appended arity is the value-numbering contract `const_i64_in_block` reads back through
-    // `result_count`; a drift would mis-trace the `gc.roots` constant mask. Only the special ops
-    // are asserted — the rest append their single result through `check_inst`.
-    debug_assert!(
-        !handled || out.len() - before == inst.result_count(fn_results, types),
-        "inst_result_types arity disagrees with Inst::result_count"
-    );
-    #[cfg(not(debug_assertions))]
-    let _ = fn_results;
-    handled
+    }
+}
+
+/// A resolved signature's result row, or nothing when it didn't resolve — the typing-only
+/// (`check = false`) shape for the call-import ops: [`block_value_types`] derives result types from
+/// the interned `sig` when it resolves and simply omits the value otherwise (graceful degradation on
+/// an unverified function), never rejecting.
+fn row_or_none(ft: Option<&temen_ir::FuncType>) -> InstResults<'_> {
+    match ft {
+        Some(ft) => InstResults::Row(&ft.results),
+        None => InstResults::None,
+    }
 }
 
 /// Check one instruction's operands against the running type vector and return the
@@ -896,14 +581,35 @@ fn const_i64_in_block(
     None
 }
 
-fn check_inst(
+/// The **one** per-instruction dispatch (#895): check an instruction's operands against the running
+/// SSA type vector and return the result types it appends. Every opcode lives in exactly one arm —
+/// the whole-module-dependent ops (`call`/`call_indirect`/`cap.call`/the import & iface calls,
+/// `ref.func`, `thread.spawn`, `cont.resume`, the reflection ops) fold in here rather than being
+/// checked in a parallel chain in [`verify_func`], so there is no ordering-sensitive `if let` cascade
+/// and no `unreachable!()` arm. `check` selects the two callers: `verify_func` runs `check = true`
+/// (operands + structural rules enforced); [`block_value_types`] runs `check = false`, where the
+/// checks short-circuit and the same dispatch derives result types from an unverified function
+/// (`Cx::check`). Operands must reference strictly-earlier indices. `Store` and the other no-result
+/// ops return [`InstResults::None`].
+#[allow(clippy::too_many_arguments)]
+fn type_inst<'a>(
     fi: u32,
     bi: u32,
     inst: &Inst,
     types: &[ValType],
     has_memory: bool,
-) -> Result<Option<ValType>, VerifyError> {
-    let cx = Cx { fi, bi, types };
+    funcs: &'a [Func],
+    imports: &[temen_ir::Import],
+    type_section: &'a [temen_ir::TypeEntry],
+    n_impl_exports: usize,
+    check: bool,
+) -> Result<InstResults<'a>, VerifyError> {
+    let cx = Cx {
+        fi,
+        bi,
+        types,
+        check,
+    };
     // `Store` is the only instruction that yields no value; handle it up front so the
     // main match can produce a single result type.
     if let Inst::Store {
@@ -918,7 +624,7 @@ fn check_inst(
         }
         cx.expect(*addr, ValType::I64)?;
         cx.expect(*value, op.info().1)?;
-        return Ok(None);
+        return Ok(InstResults::None);
     }
     // Bulk-memory ops (from `llvm.memcpy`/`memmove`/`memset`) — no-result, whole-span confined.
     // `dst`/`src`/`len` are `i64`; `MemFill`'s `val` is the `i32` fill byte.
@@ -932,7 +638,7 @@ fn check_inst(
         cx.expect(*dst, ValType::I64)?;
         cx.expect(*src, ValType::I64)?;
         cx.expect(*len, ValType::I64)?;
-        return Ok(None);
+        return Ok(InstResults::None);
     }
     if let Inst::MemFill { dst, val, len } = inst {
         if !has_memory {
@@ -944,7 +650,7 @@ fn check_inst(
         cx.expect(*dst, ValType::I64)?;
         cx.expect(*val, ValType::I32)?;
         cx.expect(*len, ValType::I64)?;
-        return Ok(None);
+        return Ok(InstResults::None);
     }
     // §12 atomic store — the other no-result memory op.
     if let Inst::AtomicStore {
@@ -959,7 +665,7 @@ fn check_inst(
         }
         cx.expect(*addr, ValType::I64)?;
         cx.expect(*value, ty.val())?;
-        return Ok(None);
+        return Ok(InstResults::None);
     }
     // §17 `v128.store` — the third no-result memory op (a 16-byte masked access).
     if let Inst::V128Store { addr, value, .. } = inst {
@@ -971,7 +677,7 @@ fn check_inst(
         }
         cx.expect(*addr, ValType::I64)?;
         cx.expect(*value, ValType::V128)?;
-        return Ok(None);
+        return Ok(InstResults::None);
     }
     // `setjmp`/`longjmp` (the non-local jump): both touch the guest `jmp_buf` token in window memory,
     // so both require a declared window. `setjmp` takes an `i64` buffer address, yields `i32` (0 on the
@@ -985,7 +691,7 @@ fn check_inst(
             });
         }
         cx.expect(*buf, ValType::I64)?;
-        return Ok(Some(ValType::I32));
+        return Ok(InstResults::One(ValType::I32));
     }
     if let Inst::LongJmp { buf, val } = inst {
         if !has_memory {
@@ -996,7 +702,7 @@ fn check_inst(
         }
         cx.expect(*buf, ValType::I64)?;
         cx.expect(*val, ValType::I32)?;
-        return Ok(None);
+        return Ok(InstResults::None);
     }
     let ty = match inst {
         Inst::ConstI32(_) => ValType::I32,
@@ -1006,22 +712,193 @@ fn check_inst(
         // before anything runs; if one ever survives into an executed module the backends fail
         // closed (they never reach a legitimate execution path).
         Inst::DataSym { .. } | Inst::DataSelf { .. } | Inst::DataTop => ValType::I64,
-        // §7 executable named imports + phase-2 attach append their results in the
-        // multi-result/call section of `verify_func` (manifest-checked there); unreachable here.
-        Inst::CallImport { .. }
-        | Inst::CallImportDyn { .. }
-        | Inst::CallSym { .. }
-        | Inst::ImportAttach { .. } => {
-            unreachable!(
-                "CallImport/CallImportDyn/CallSym/ImportAttach handled before check_inst's value match"
-            )
+        // §7 executable named import (IMPORTS.md phase 1): the index must name a declared import
+        // and the call's self-describing `sig` must equal the manifest's — the canonical-interface
+        // check `cap.call` cannot have (its sig is self-asserted). No handle operand (v8): the slot
+        // binding identifies the capability. Appends the interned sig's result row.
+        Inst::CallImport {
+            import,
+            op,
+            sig,
+            args,
+        } => {
+            if check {
+                if imports.get(*import as usize).is_none() {
+                    return Err(VerifyError::UnresolvedImport {
+                        func: fi,
+                        block: bi,
+                        import: *import,
+                    });
+                }
+                // §3.5: resolve the consumer-local op through the import's declared shape + the type
+                // section (op range + exact signature), then require the interned `sig` to agree.
+                let Some(want) = import_op_sig(imports, type_section, *import, *op) else {
+                    return Err(VerifyError::ImportOpOutOfRange {
+                        func: fi,
+                        block: bi,
+                        import: *import,
+                        op: *op,
+                    });
+                };
+                let Some(sig_ft) = func_sig(type_section, *sig) else {
+                    return Err(VerifyError::CallSigInvalid {
+                        func: fi,
+                        block: bi,
+                        sig: *sig,
+                    });
+                };
+                if want != sig_ft {
+                    return Err(VerifyError::ImportSigMismatch {
+                        func: fi,
+                        block: bi,
+                        import: *import,
+                    });
+                }
+                cx.check_args(args, &sig_ft.params)?;
+                return Ok(InstResults::Row(&sig_ft.results));
+            }
+            return Ok(row_or_none(func_sig(type_section, *sig)));
         }
-        // §3.5 reflection ops append their results in the multi-result section above; unreachable
-        // here. (`cap.self.count`/`get`/`resolve`/`label`/`attest` are now `cap.call CAP_SELF`.)
-        Inst::CapSelfTypeId { .. } | Inst::CapSelfCovers { .. } | Inst::ExportHandle { .. } => {
-            unreachable!(
-                "cap.self.type_id/covers/export.handle handled before check_inst's value match"
-            )
+        // §3.5 dynamic-mode dispatch by type-section reference: `ty` names a well-formed interface,
+        // `op` in range, and the self-describing `sig` equals the resolution — the same
+        // canonical-interface check as static mode, at load.
+        Inst::CallImportDyn {
+            ty,
+            op,
+            sig,
+            handle,
+            args,
+        } => {
+            if check {
+                let Some(want) = iface_op_sig(type_section, *ty, *op) else {
+                    return Err(VerifyError::DynIfaceInvalid {
+                        func: fi,
+                        block: bi,
+                        ty: *ty,
+                    });
+                };
+                let Some(sig_ft) = func_sig(type_section, *sig) else {
+                    return Err(VerifyError::CallSigInvalid {
+                        func: fi,
+                        block: bi,
+                        sig: *sig,
+                    });
+                };
+                if want != sig_ft {
+                    return Err(VerifyError::DynIfaceInvalid {
+                        func: fi,
+                        block: bi,
+                        ty: *ty,
+                    });
+                }
+                cx.expect(*handle, ValType::I32)?;
+                cx.check_args(args, &sig_ft.params)?;
+                return Ok(InstResults::Row(&sig_ft.results));
+            }
+            return Ok(row_or_none(func_sig(type_section, *sig)));
+        }
+        // §7/§22 symbolic call (v8): `call.sym` verifies exactly like a *flat* manifest import call
+        // (op 0), plus its legacy handle operand (i32, ignored by manifest dispatch — live only to
+        // the linker). Executable when the instance binds the name; the linker's rewrite target when
+        // resolved first. One rule, both consumers.
+        Inst::CallSym {
+            import,
+            sig,
+            handle,
+            args,
+        } => {
+            if check {
+                if imports.get(*import as usize).is_none() {
+                    return Err(VerifyError::UnresolvedImport {
+                        func: fi,
+                        block: bi,
+                        import: *import,
+                    });
+                }
+                let Some(want) = import_op_sig(imports, type_section, *import, 0) else {
+                    return Err(VerifyError::ImportOpOutOfRange {
+                        func: fi,
+                        block: bi,
+                        import: *import,
+                        op: 0,
+                    });
+                };
+                let Some(sig_ft) = func_sig(type_section, *sig) else {
+                    return Err(VerifyError::CallSigInvalid {
+                        func: fi,
+                        block: bi,
+                        sig: *sig,
+                    });
+                };
+                if want != sig_ft {
+                    return Err(VerifyError::ImportSigMismatch {
+                        func: fi,
+                        block: bi,
+                        import: *import,
+                    });
+                }
+                cx.expect(*handle, ValType::I32)?;
+                cx.check_args(args, &sig_ft.params)?;
+                return Ok(InstResults::Row(&sig_ft.results));
+            }
+            return Ok(row_or_none(func_sig(type_section, *sig)));
+        }
+        // Phase-2 `import.attach`: the index must name a declared **rebindable** import (attaching to
+        // a `required` slot would break its immutability-per-instance); the handle is an ordinary
+        // forgeable `i32` (validity is the runtime's §3c check at attach). Appends the `i32` status.
+        Inst::ImportAttach { import, handle } => {
+            if check {
+                if imports.get(*import as usize).is_none() {
+                    return Err(VerifyError::UnresolvedImport {
+                        func: fi,
+                        block: bi,
+                        import: *import,
+                    });
+                }
+                if imports[*import as usize].mode != temen_ir::ImportMode::Rebindable {
+                    return Err(VerifyError::AttachNotRebindable {
+                        func: fi,
+                        block: bi,
+                        import: *import,
+                    });
+                }
+                cx.expect(*handle, ValType::I32)?;
+            }
+            return Ok(InstResults::One(ValType::I32));
+        }
+        // §3.5 `export.handle`: the index must name a declared impl export; appends the reified `i32`.
+        Inst::ExportHandle { export } => {
+            if check && *export as usize >= n_impl_exports {
+                return Err(VerifyError::ExportHandleOutOfRange {
+                    func: fi,
+                    block: bi,
+                    export: *export,
+                });
+            }
+            return Ok(InstResults::One(ValType::I32));
+        }
+        // §3.5 reflection: reference a well-formed interface entry of *this* module's type section;
+        // `covers` also takes a forgeable `i32` handle. Each appends an `i32`.
+        Inst::CapSelfTypeId { ty } => {
+            if check && !iface_well_formed(type_section, *ty) {
+                return Err(VerifyError::DynIfaceInvalid {
+                    func: fi,
+                    block: bi,
+                    ty: *ty,
+                });
+            }
+            return Ok(InstResults::One(ValType::I32));
+        }
+        Inst::CapSelfCovers { handle, ty } => {
+            if check && !iface_well_formed(type_section, *ty) {
+                return Err(VerifyError::DynIfaceInvalid {
+                    func: fi,
+                    block: bi,
+                    ty: *ty,
+                });
+            }
+            cx.expect(*handle, ValType::I32)?;
+            return Ok(InstResults::One(ValType::I32));
         }
         // §12 per-vCPU TLS register: ambient, no memory/module dependency. `get` yields an i64;
         // `set` consumes an i64 and yields nothing (handled like `store`).
@@ -1030,7 +907,7 @@ fn check_inst(
         Inst::DurableShadowBase => ValType::I64,
         Inst::VcpuTlsSet { val } => {
             cx.expect(*val, ValType::I64)?;
-            return Ok(None);
+            return Ok(InstResults::None);
         }
         Inst::IntBin { ty, a, b, .. } => {
             let t = ty.val();
@@ -1231,7 +1108,7 @@ fn check_inst(
         }
         // A standalone fence produces no value and needs no memory or operands (any ordering is
         // valid for a fence) — accept it directly.
-        Inst::AtomicFence { .. } => return Ok(None),
+        Inst::AtomicFence { .. } => return Ok(InstResults::None),
 
         // ----- §17 SIMD (D58): total lane-typing rules -----
         Inst::ConstV128(_) => ValType::V128,
@@ -1494,23 +1371,118 @@ fn check_inst(
             ValType::V128
         }
 
-        // Handled before/around the match; listed for exhaustiveness (no panic).
+        // ----- whole-module-dependent calls (results are a callee/signature row) -----
+        // `call` needs the callee's signature; a dangling funcidx is rejected (and appends nothing
+        // in the typing-only walk, where `result_count` also reports 0).
+        Inst::Call { func, args } => {
+            let callee = match funcs.get(*func as usize) {
+                Some(c) => c,
+                None => {
+                    return if check {
+                        Err(VerifyError::CallFuncOutOfRange {
+                            func: fi,
+                            block: bi,
+                            callee: *func,
+                        })
+                    } else {
+                        Ok(InstResults::None)
+                    };
+                }
+            };
+            cx.check_args(args, &callee.params)?;
+            return Ok(InstResults::Row(&callee.results));
+        }
+        // `ref.func` materializes a function reference (`i32`); the index must name a function.
+        Inst::RefFunc { func } => {
+            if check && *func as usize >= funcs.len() {
+                return Err(VerifyError::CallFuncOutOfRange {
+                    func: fi,
+                    block: bi,
+                    callee: *func,
+                });
+            }
+            return Ok(InstResults::One(ValType::I32));
+        }
+        // `call_indirect`: the interned `sig` (#922) must name a `Func`; `idx` is the `i32` table slot.
+        Inst::CallIndirect { ty, idx, args } => {
+            if check {
+                let Some(ft) = func_sig(type_section, *ty) else {
+                    return Err(VerifyError::CallSigInvalid {
+                        func: fi,
+                        block: bi,
+                        sig: *ty,
+                    });
+                };
+                cx.expect(*idx, ValType::I32)?;
+                cx.check_args(args, &ft.params)?;
+                return Ok(InstResults::Row(&ft.results));
+            }
+            return Ok(row_or_none(func_sig(type_section, *ty)));
+        }
+        // `cap.call`: self-asserted signature (no manifest to resolve against), so the interned `sig`
+        // need only name a `Func`; the runtime use-site check (host-owned table type_id/generation)
+        // carries safety, not typing. `handle` is a forgeable `i32`.
+        Inst::CapCall {
+            sig, handle, args, ..
+        } => {
+            if check {
+                let Some(ft) = func_sig(type_section, *sig) else {
+                    return Err(VerifyError::CallSigInvalid {
+                        func: fi,
+                        block: bi,
+                        sig: *sig,
+                    });
+                };
+                cx.expect(*handle, ValType::I32)?;
+                cx.check_args(args, &ft.params)?;
+                return Ok(InstResults::Row(&ft.results));
+            }
+            return Ok(row_or_none(func_sig(type_section, *sig)));
+        }
+        // §12 `cont.resume` (blocking and non-blocking) appends `(status: i32, value: i64)`; the
+        // `block` flag does not affect typing. `k` is a forgeable i64 fiber handle, `arg` an i64.
+        Inst::ContResume { k, arg, block: _ } => {
+            cx.expect(*k, ValType::I64)?;
+            cx.expect(*arg, ValType::I64)?;
+            return Ok(InstResults::Two(ValType::I32, ValType::I64));
+        }
+        // §12 `thread.spawn` resolves a static funcidx whose signature must be the fixed thread-entry
+        // type `(i64 sp, i64 arg) -> i64`; appends the spawned vCPU handle (`i32`).
+        Inst::ThreadSpawn { func, sp, arg } => {
+            if check {
+                let callee = funcs
+                    .get(*func as usize)
+                    .ok_or(VerifyError::CallFuncOutOfRange {
+                        func: fi,
+                        block: bi,
+                        callee: *func,
+                    })?;
+                if callee.params != [ValType::I64, ValType::I64] || callee.results != [ValType::I64]
+                {
+                    return Err(VerifyError::ThreadEntrySignature {
+                        func: fi,
+                        block: bi,
+                        callee: *func,
+                    });
+                }
+                cx.expect(*sp, ValType::I64)?;
+                cx.expect(*arg, ValType::I64)?;
+            }
+            return Ok(InstResults::One(ValType::I32));
+        }
+
+        // Handled by the no-result pre-match guards above; listed for exhaustiveness (never reached —
+        // each `return`s before the match — so a new op forces a decision here, no `_` catch-all).
         Inst::Store { .. }
         | Inst::MemCopy { .. }
         | Inst::MemMove { .. }
         | Inst::MemFill { .. }
         | Inst::AtomicStore { .. }
         | Inst::V128Store { .. }
-        | Inst::Call { .. }
-        | Inst::RefFunc { .. }
-        | Inst::CallIndirect { .. }
-        | Inst::CapCall { .. }
-        | Inst::ContResume { .. }
         | Inst::SetJmp { .. }
-        | Inst::LongJmp { .. }
-        | Inst::ThreadSpawn { .. } => return Ok(None),
+        | Inst::LongJmp { .. } => return Ok(InstResults::None),
     };
-    Ok(Some(ty))
+    Ok(InstResults::One(ty))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1524,7 +1496,12 @@ fn check_terminator(
     f: &Func,
     funcs: &[Func],
 ) -> Result<(), VerifyError> {
-    let cx = Cx { fi, bi, types };
+    let cx = Cx {
+        fi,
+        bi,
+        types,
+        check: true,
+    };
     match term {
         Terminator::Br { target, args } => {
             check_edge(&cx, *target, args, nblocks, f)?;
@@ -1647,11 +1624,18 @@ fn check_edge(
     Ok(())
 }
 
-/// Bundles the location + running type vector for concise operand checks.
+/// Bundles the location + running type vector for concise operand checks. `check` distinguishes the
+/// two callers of [`type_inst`]: `verify_func` runs with `check = true` (operand checks enforced);
+/// the typing-only walk [`block_value_types`] runs with `check = false`, where `expect`/`check_args`
+/// short-circuit to `Ok` so the walk derives result types from the *same* dispatch without rejecting
+/// an unverified function — the leniency `func_value_types`' consumers (the debugger, `temen-opt`)
+/// rely on. Structural checks that aren't operand-typing (import range, sig/iface resolution, SIMD
+/// shape) are likewise gated on `check` at their sites.
 struct Cx<'a> {
     fi: u32,
     bi: u32,
     types: &'a [ValType],
+    check: bool,
 }
 
 impl Cx<'_> {
@@ -1674,6 +1658,9 @@ impl Cx<'_> {
     /// `return_call` forms (via [`check_tail_call`]) — mirroring [`check_edge`] on the terminator
     /// side. (Handle/index operands, where present, are checked by the caller before this.)
     fn check_args(&self, args: &[ValIdx], params: &[ValType]) -> Result<(), VerifyError> {
+        if !self.check {
+            return Ok(());
+        }
         if args.len() != params.len() {
             return Err(VerifyError::CallArgCountMismatch {
                 func: self.fi,
@@ -1690,6 +1677,9 @@ impl Cx<'_> {
 
     /// An operand must be defined earlier in this block and have exactly `want`'s type.
     fn expect(&self, v: ValIdx, want: ValType) -> Result<(), VerifyError> {
+        if !self.check {
+            return Ok(());
+        }
         let found = self.type_of(v)?;
         // `cap` is `i32`-width data in guest code (IMPORTS.md §3.5): the two are value-compatible
         // everywhere operands flow — a `cap` is usable as a handle (`i32`), and an `i32` fills a

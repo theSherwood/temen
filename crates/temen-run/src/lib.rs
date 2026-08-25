@@ -4737,6 +4737,18 @@ struct OfferBinding {
 }
 
 impl HostCap {
+    /// **Install this host-native capability into `host`** and return its handle — the same grant
+    /// [`Instance::run_with_caps`] applies for an `extra_caps` entry, exposed so a caller wiring a §14
+    /// op-13 spawn by hand can hold an embedder cap's handle (to re-grant it into a child via the spawn's
+    /// grant list — e.g. handing a phase child the `exec` cap it needs to spawn its own grandchildren).
+    /// `win` is the granting domain's window size (used by window-relative grants). Only meaningful for
+    /// caps that actually grant a host handle — an `offer`/`template`/`iface` cap binds at
+    /// [`instantiate_with_imports`], not here, so `install` on one returns whatever its (unused) `grant`
+    /// yields; use it for `stdout`/`exit`/`host_proc`/`domain_exec`-shaped caps.
+    pub fn install(&self, host: &mut Host, win: u64) -> i32 {
+        (self.grant)(host, win)
+    }
+
     /// A `Stream` write endpoint (stdout): `write(buf, len)` is op 1.
     pub fn stdout() -> HostCap {
         HostCap {
