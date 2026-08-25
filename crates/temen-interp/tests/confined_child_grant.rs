@@ -5,7 +5,7 @@
 //! `.nif` files; that is the op-13 grant list, which today only the *interpreter's* inline child run
 //! honors. This proves the enabling primitive: `new_confined_child_granted` lets the caller install
 //! named caps into the child's powerbox, and the confined child resolves one by name
-//! (`cap.self.resolve`) and calls it — the shape a JIT'd phase child will use, its `cap.call` a
+//! (`self.resolve`) and calls it — the shape a JIT'd phase child will use, its `call.cap` a
 //! cross-tier bounce to the granted handler (window confinement, §2, is untouched — the grant is
 //! authority, §3, not a window access).
 
@@ -25,8 +25,8 @@ block 0 (v0: i64) {
   i64.store vzero vname
   vp0 = i64.const 0
   vl2 = i64.const 2
-  vh = cap.self.resolve vp0 vl2
-  vr = cap.call 13 0 (i64) -> (i64) vh (vp0)
+  vh = self.resolve vp0 vl2
+  vr = call.cap 13 0 (i64) -> (i64) vh (vp0)
   return vr
   }
 }

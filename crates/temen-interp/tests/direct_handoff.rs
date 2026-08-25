@@ -43,15 +43,15 @@ block 0 (v0: i32) {
   i64.store q0a5 q0v4
   q0a6 = i64.const 1200
   i64.store q0a6 q0v4
-  v5 = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   v6 = i64.const 0
-  v7 = cap.call 6 14 (i32, i64) -> (i32) v0 (v5, v6)
+  v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)
   va = i64.const 40
   vb = i64.const 2
-  vr1 = cap.call 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
+  vr1 = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
   vc = i64.const 10
   vd = i64.const 3
-  vr2 = cap.call 268435456 0 (i64, i64) -> (i64) v7 (vc, vd)
+  vr2 = call.cap 268435456 0 (i64, i64) -> (i64) v7 (vc, vd)
   vs = i64.add vr1 vr2
   return vs
   }
@@ -109,15 +109,15 @@ block 0 (v0: i32) {
   i64.store q1a5 q1v4
   q1a6 = i64.const 1264
   i64.store q1a6 q1v4
-  v5 = cap.call 6 17 (i64) -> (i32) v0 (q1a0)
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
   v6 = i64.const 0
-  v7 = cap.call 6 14 (i32, i64) -> (i32) v0 (v5, v6)
+  v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)
   va = i64.const 40
   vb = i64.const 2
-  vr1 = cap.call 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
+  vr1 = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
   vc = i64.const 10
   vd = i64.const 3
-  vr2 = cap.call 268435456 0 (i64, i64) -> (i64) v7 (vc, vd)
+  vr2 = call.cap 268435456 0 (i64, i64) -> (i64) v7 (vc, vd)
   vs = i64.add vr1 vr2
   return vs
   }

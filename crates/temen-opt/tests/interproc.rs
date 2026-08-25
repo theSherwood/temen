@@ -2,7 +2,7 @@
 //! (1) drop functions no reachable code can call, (2) renumber survivors and remap every static
 //! funcidx reference + export target, (3) keep the reachable functions behaving identically on the
 //! reference interpreter, and (4) conservatively leave a module untouched while indirect funcref
-//! dispatch (`call_indirect`) is present, since a funcref equals its funcidx (identity table).
+//! dispatch (`call.dyn`) is present, since a funcref equals its funcidx (identity table).
 
 use temen_interp::{Trap, Value};
 use temen_ir::{
@@ -250,7 +250,7 @@ fn keeps_all_functions_when_indirect_dispatch_present() {
     assert_eq!(
         opt.funcs.len(),
         3,
-        "DFE must be a no-op while call_indirect is present (funcref == funcidx)"
+        "DFE must be a no-op while call.dyn is present (funcref == funcidx)"
     );
     // And it is behavior-preserving (trivially — identity).
     for a in [0i32, 3, 42] {
@@ -266,10 +266,10 @@ fn keeps_all_functions_when_indirect_dispatch_present() {
 #[test]
 fn keeps_functions_when_a_ref_func_value_is_observable() {
     // Regression (nightly `opt_sccp`, input `[0xfc]`): a `ref.func` result **is the function index as
-    // an observable i32**, not only a `call_indirect` dispatch target. Here the entry returns
+    // an observable i32**, not only a `call.dyn` dispatch target. Here the entry returns
     // `ref.func 2` directly, and func 1 is dead. DFE used to drop func 1 and renumber func 2 → 1,
     // rewriting the `ref.func` operand to keep *dispatch* correct — but that silently changed the
-    // returned integer from 2 to 1, an observable-behavior break. With no `call_indirect` in the
+    // returned integer from 2 to 1, an observable-behavior break. With no `call.dyn` in the
     // module the old dispatch-only guard did not trip; DFE must bail on the live `ref.func` too.
     let entry = Func {
         params: vec![ValType::I32],
@@ -781,7 +781,7 @@ fn does_not_devirtualize_on_signature_mismatch() {
     for a in [0i32, 5] {
         let r0 = run(&m, 0, &[Value::I32(a)]);
         let r1 = run(&dv, 0, &[Value::I32(a)]);
-        assert!(r0.is_err(), "mismatched call_indirect should trap");
+        assert!(r0.is_err(), "mismatched call.dyn should trap");
         assert_eq!(r0, r1, "trap preserved at a={a}");
     }
 }
@@ -984,7 +984,7 @@ fn an_exported_function_is_not_specialized() {
 
 #[test]
 fn const_prop_bails_on_an_unresolvable_indirect_index() {
-    // A `call_indirect` on a **runtime** funcref (here the entry's own parameter `fp`) could reach any
+    // A `call.dyn` on a **runtime** funcref (here the entry's own parameter `fp`) could reach any
     // function with arguments const_prop can't see, so the whole pass must bail — `sel`, whose one
     // direct caller passes flag=1, keeps its branch (an indirect call could pass flag=0).
     let sig = FuncType {
@@ -1030,10 +1030,10 @@ fn const_prop_bails_on_an_unresolvable_indirect_index() {
 
 #[test]
 fn const_funcref_argument_devirtualizes_through_the_callee() {
-    // entry(x): apply(g, x)  where `apply(fp, a) = call_indirect fp (a)` and `g` (func 2) is `a+1`.
+    // entry(x): apply(g, x)  where `apply(fp, a) = call.dyn fp (a)` and `g` (func 2) is `a+1`.
     // The funcref is a constant `ConstI32(2)` (funcref == funcidx), so const_prop's fixpoint resolves
     // `apply`'s dispatch to `g`: it propagates the constant into `fp`, the re-run of devirt turns the
-    // now-constant `call_indirect` into a direct call to `g`, which inlines — leaving the entry
+    // now-constant `call.dyn` into a direct call to `g`, which inlines — leaving the entry
     // computing a+1 with no indirect (and ultimately no) call.
     let sig = FuncType {
         params: vec![ValType::I32],

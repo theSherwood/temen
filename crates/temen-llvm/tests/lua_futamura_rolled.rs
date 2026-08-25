@@ -13,7 +13,7 @@
 //!
 //! The result is a rolled, dispatch-free residual of the *real* `luaV_execute`: 841 blocks collapse
 //! to ~53, with **no `br_table`** (the 83-way dispatch folded), **no loads** (all VM state folded to
-//! SSA), and **no calls / `call_indirect`** — it takes the loop's three live-in cells (the accumulator
+//! SSA), and **no calls / `call.dyn`** — it takes the loop's three live-in cells (the accumulator
 //! `x`, the loop variable `i`, the trip counter) as dynamic parameters and rolls. Correctness: the
 //! residual writes the final accumulator back into the window, so a small appended wrapper reads it
 //! out; for the captured inputs it reproduces the real Lua answer (`x = 3*50 = 150`, the value
@@ -319,7 +319,7 @@ fn dynamic_counter_rolls_the_real_luav_execute_loop() {
     // takes the loop's three live-in cells (x, i, trip counter) as dynamic parameters.
     assert!(!has_br_table(f), "the dispatch must fold");
     assert_eq!(f.params.len(), 3, "residual takes (x0, i0, counter0)");
-    assert_eq!(indirect, 0, "no residual call_indirect (cold paths pruned)");
+    assert_eq!(indirect, 0, "no residual call.dyn (cold paths pruned)");
     assert!(
         f.blocks.len() <= 120,
         "the loop rolled (got {} blocks)",

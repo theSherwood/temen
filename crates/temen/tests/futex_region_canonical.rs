@@ -29,11 +29,11 @@ use temen_verify::verify_module;
 const SRC: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (v0: i32) {\n\
-  vps = cap.call 4 3 () -> (i64) v0 ()\n\
+  vps = call.cap 4 3 () -> (i64) v0 ()\n\
   vz = i64.const 0\n\
   vprot = i32.const 3\n\
-  vm1 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v0 (vz, vz, vps, vprot)\n\
-  vm2 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v0 (vps, vz, vps, vprot)\n\
+  vm1 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (vz, vz, vps, vprot)\n\
+  vm2 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (vps, vz, vps, vprot)\n\
   vchild = thread.spawn 1 vz vz\n\
   vexp = i32.const 0\n\
   vto = i64.const -1\n\

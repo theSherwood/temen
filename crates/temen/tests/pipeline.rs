@@ -1211,7 +1211,7 @@ fn run1at(src: &str, func: u32, args: &[Value]) -> Result<Vec<Value>, Trap> {
 // ---- indirect calls (function table, §3c) ----
 
 // func0/func1 are (i32,i32)->(i32) implementations; func2 dispatches to one of
-// them via call_indirect on a funcref built with ref.func.
+// them via call.dyn on a funcref built with ref.func.
 const INDIRECT: &str = r#"
 func (i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32) {
@@ -1229,7 +1229,7 @@ block 0 (v0: i32, v1: i32) {
 
 func (i32, i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  v3 = call_indirect (i32, i32) -> (i32) v0 (v1, v2)
+  v3 = call.dyn (i32, i32) -> (i32) v0 (v1, v2)
   return v3
   }
 }
@@ -1270,7 +1270,7 @@ block 0 () {
 func (i32) -> (i32) {
 block 0 (v0: i32) {
   v1 = i32.const 5
-  v2 = call_indirect (i32, i32) -> (i32) v0 (v1, v1)
+  v2 = call.dyn (i32, i32) -> (i32) v0 (v1, v1)
   return v2
   }
 }
@@ -1317,7 +1317,7 @@ block 0 (v0: i32) {
 func (i32) -> (i32) {
 block 0 (v0: i32) {
   v1 = ref.func 0
-  v2 = call_indirect (i32) -> (i32) v1 (v0)
+  v2 = call.dyn (i32) -> (i32) v1 (v0)
   return v2
   }
 }
@@ -1427,7 +1427,7 @@ block 2 () {
     assert_eq!(run1at(src, 0, &[Value::I32(0)]), Ok(vec![Value::I32(7)]));
 }
 
-// ---- tail calls (return_call / return_call_indirect) ----
+// ---- tail calls (return_call / return_call.dyn) ----
 
 // Tail-recursive sum: sum(n, acc) = n==0 ? acc : sum(n-1, acc+n), via return_call.
 // Values flow between blocks only through block parameters (block-local SSA).
@@ -1502,7 +1502,7 @@ block 2 (v4: i32, v5: i32) {
   v7 = i32.add v4 v6
   v8 = i32.add v5 v4
   v9 = i32.const 0
-  return_call_indirect (i32, i32) -> (i32) v9 (v7, v8)
+  return_call.dyn (i32, i32) -> (i32) v9 (v7, v8)
   }
 }
 "#;
@@ -1626,13 +1626,13 @@ block 0 (v0: f32) {
 #[test]
 fn verifier_rejects_newer_op_violations() {
     let cases: &[(&str, &str)] = &[
-        // call_indirect index operand must be i32, not i64.
+        // call.dyn index operand must be i32, not i64.
         (
             "indirect index not i32",
             r#"
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v1 = call_indirect (i64) -> (i64) v0 (v0)
+  v1 = call.dyn (i64) -> (i64) v0 (v0)
   return v1
   }
 }
@@ -1695,7 +1695,7 @@ fn verifier_rejects_ref_func_out_of_range() {
     ));
 }
 
-// ---- capabilities: cap.call, the host-owned handle table, the mock powerbox (§3c/§3e) ----
+// ---- capabilities: call.cap, the host-owned handle table, the mock powerbox (§3c/§3e) ----
 
 // Store "Hi" into the window, then write(ptr=0, len=2) to the Stream handle (v0).
 const CAP_WRITE: &str = r#"
@@ -1711,7 +1711,7 @@ block 0 (v0: i32) {
   i32.store8 v3 v4
   v5 = i64.const 0
   v6 = i64.const 2
-  v7 = cap.call 0 1 (i64, i64) -> (i64) v0 (v5, v6)
+  v7 = call.cap 0 1 (i64, i64) -> (i64) v0 (v5, v6)
   return v7
   }
 }
@@ -1721,7 +1721,7 @@ block 0 (v0: i32) {
 fn cap_stream_write_captures_output() {
     let m = parse_module(CAP_WRITE).expect("parse");
     verify_module(&m).expect("verify");
-    // cap.call round-trips through both formats.
+    // call.cap round-trips through both formats.
     assert_eq!(m, decode_module(&encode_module(&m)).unwrap(), "binary");
     assert_eq!(m, parse_module(&print_module(&m)).unwrap(), "text");
 
@@ -1741,7 +1741,7 @@ func (i32) -> (i32) {
 block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = i64.const 4
-  v3 = cap.call 0 0 (i64, i64) -> (i64) v0 (v1, v2)
+  v3 = call.cap 0 0 (i64, i64) -> (i64) v0 (v1, v2)
   v4 = i32.load8_u v1
   return v4
   }
@@ -1769,7 +1769,7 @@ const CAP_EXIT: &str = r#"
 func (i32) -> () {
 block 0 (v0: i32) {
   v1 = i32.const 7
-  cap.call 1 0 (i32) -> () v0 (v1)
+  call.cap 1 0 (i32) -> () v0 (v1)
   unreachable
   }
 }
@@ -1790,7 +1790,7 @@ const CAP_CLOCK: &str = r#"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   return v2
   }
 }
@@ -1878,7 +1878,7 @@ func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = i64.const 100000
-  v3 = cap.call 0 1 (i64, i64) -> (i64) v0 (v1, v2)
+  v3 = call.cap 0 1 (i64, i64) -> (i64) v0 (v1, v2)
   return v3
   }
 }
@@ -1900,7 +1900,7 @@ fn cap_buffer_out_of_range_is_efault_not_trap() {
 fn verifier_rejects_cap_call_non_i32_handle() {
     // The handle operand must be the i32 index; an i64 handle is rejected.
     let m = parse_module(
-        "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = cap.call 2 0 () -> (i64) v0 ()\n  return v1\n  }\n}\n",
+        "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = call.cap 2 0 () -> (i64) v0 ()\n  return v1\n  }\n}\n",
     )
     .unwrap();
     assert!(matches!(
@@ -1911,7 +1911,7 @@ fn verifier_rejects_cap_call_non_i32_handle() {
 
 // ---------------------------------------------------------------------------
 // ISSUES.md I41 — **graceful revocation** (formerly `revocation_errno.rs`; merged here so the
-// branch adds no extra heavy-link test binary — ISSUES.md I30): a `cap.call` through a handle
+// branch adds no extra heavy-link test binary — ISSUES.md I30): a `call.cap` through a handle
 // that was once granted and has since been revoked completes with the probeable `-EBADF` errno
 // the §3.6 revocation-unpark already delivers. The D37 trap stays reserved for a **forgery**
 // (a generation the slot never issued) and type-confusion on a **live** handle. No tombstone
@@ -1929,8 +1929,8 @@ func (i32, i32) -> (i64) {
 block 0 (vs: i32, vc: i32) {
   vp = i64.const 0
   vl = i64.const 0
-  vw = cap.call 0 1 (i64, i64) -> (i64) vs (vp, vl)
-  vn = cap.call 2 0 () -> (i64) vc ()
+  vw = call.cap 0 1 (i64, i64) -> (i64) vs (vp, vl)
+  vn = call.cap 2 0 () -> (i64) vc ()
   vk = i64.const 1000
   vm = i64.mul vw vk
   vr = i64.add vm vn
@@ -1949,7 +1949,7 @@ block 0 () {
   vh = i32.const 1480
   vp = i64.const 0
   vl = i64.const 0
-  vw = cap.call 0 1 (i64, i64) -> (i64) vh (vp, vl)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vh (vp, vl)
   return vw
   }
 }

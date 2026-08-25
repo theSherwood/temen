@@ -1,5 +1,5 @@
 // <temen.h> — the Temen capability surface for C: the low-level `__vm_*` builtins the frontend
-// lowers directly to `cap.call`, exposed as a documented, discoverable header.
+// lowers directly to `call.cap`, exposed as a documented, discoverable header.
 //
 // DESIGN §13/§14: a guest holding an **AddressSpace** capability (the 5th powerbox handle the
 // runtime grants `_start`) can **mint its own shareable regions** and `map` them anywhere in its
@@ -101,7 +101,7 @@ long __vm_jit_invoke2(long code, long a, long b);
 // is forged/already released (non-fatal).
 long __vm_jit_release(long code);
 
-// Install a compiled unit into the `call_indirect` table (Model B2), returning its slot index
+// Install a compiled unit into the `call.dyn` table (Model B2), returning its slot index
 // — a funcref old code (or another unit) can call indirectly at native speed (old→new). Cast
 // the slot to a function pointer and call it like any C function. Returns -28 (ENOSPC) if the
 // table is full (the embedder sizes the reservation; the CLI reserves 1024 slots).

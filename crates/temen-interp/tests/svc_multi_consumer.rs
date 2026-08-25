@@ -55,7 +55,7 @@ block 0 (vx: i64) {
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
   vz = i32.const 0
-  vn = cap.call 4294967295 9 () -> (i64) vz ()
+  vn = call.cap 4294967295 9 () -> (i64) vz ()
   return vn
   }
 }
@@ -104,7 +104,7 @@ func () -> (i64) {
 block 0 () {
   vz = i32.const 0
   vt = i64.const 10000000
-  vn = cap.call 4294967295 10 (i64) -> (i64) vz (vt)
+  vn = call.cap 4294967295 10 (i64) -> (i64) vz (vt)
   return vn
   }
 }
@@ -160,17 +160,17 @@ block 0 (v0: i32, v1: i32) {
   voff = i64.const 65536
   vlog = i64.const 12
   vq = i64.const 0
-  v5 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (vmh, ventry, voff, vlog, vq)
+  v5 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (vmh, ventry, voff, vlog, vq)
   v6 = i64.const 0
-  v7 = cap.call 6 14 (i32, i64) -> (i32) v0 (v5, v6)
+  v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)
   va = i64.const 40
   vb = i64.const 2
-  vr1 = cap.call 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
+  vr1 = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
   vc = i64.const 1
   vd = i64.const 2
-  vr2 = cap.call 268435456 0 (i64, i64) -> (i64) v7 (vc, vd)
-  vr3 = cap.call 268435456 1 () -> (i64) v7 ()
-  vj = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  vr2 = call.cap 268435456 0 (i64, i64) -> (i64) v7 (vc, vd)
+  vr3 = call.cap 268435456 1 () -> (i64) v7 ()
+  vj = call.cap 6 1 (i32) -> (i64) v0 (v5)
   vk = i64.const 100
   vm = i64.mul vj vk
   vs1 = i64.add vr1 vr2
@@ -216,7 +216,7 @@ block 0 (vsp: i64, varg: i64) {
 block 1 (vtotal: i64) {
   vz = i32.const 0
   vt = i64.const 100000000
-  vn = cap.call 4294967295 10 (i64) -> (i64) vz (vt)
+  vn = call.cap 4294967295 10 (i64) -> (i64) vz (vt)
   vtot = i64.add vtotal vn
   vfa = i64.const 8
   vf = i64.load vfa

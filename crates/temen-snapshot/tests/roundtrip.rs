@@ -19,7 +19,7 @@ const SRC: &str = r#"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 100
   v4 = i64.add v2 v3
   return v4
@@ -32,7 +32,7 @@ const SRC_OTHER: &str = r#"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 200
   v4 = i64.add v2 v3
   return v4
@@ -295,7 +295,7 @@ block 0 (v0: i32) {
   v3 = i64.const 0
   v4 = thread.spawn 1 v2 v3
   v5 = i32.const 0
-  v6 = cap.call 2 0 (i32) -> (i64) v0 (v5)
+  v6 = call.cap 2 0 (i32) -> (i64) v0 (v5)
   v7 = thread.join v4
   v8 = i64.add v6 v7
   return v8
@@ -306,7 +306,7 @@ block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65536
   v3 = i32.load v2
   v4 = i32.const 0
-  v5 = cap.call 2 0 (i32) -> (i64) v3 (v4)
+  v5 = call.cap 2 0 (i32) -> (i64) v3 (v4)
   v6 = i64.const 10
   v7 = i64.add v5 v6
   return v7
@@ -445,7 +445,7 @@ block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65536
   v3 = i32.load v2
   v4 = i32.const 0
-  v5 = cap.call 2 0 (i32) -> (i64) v3 (v4)
+  v5 = call.cap 2 0 (i32) -> (i64) v3 (v4)
   v6 = i64.const 10
   v7 = i64.add v5 v6
   return v7
@@ -731,7 +731,7 @@ block 0 (v0: i32) {
   v3 = i64.const 0
   v4 = thread.spawn 1 v2 v3
   v5 = i32.const 0
-  v6 = cap.call 2 0 (i32) -> (i64) v0 (v5)
+  v6 = call.cap 2 0 (i32) -> (i64) v0 (v5)
   v7 = thread.join v4
   v8 = i64.add v6 v7
   return v8
@@ -745,7 +745,7 @@ block 0 (v0: i64, v1: i64) {
   v5 = i64.const 0
   v6 = thread.spawn 2 v4 v5
   v7 = i32.const 0
-  v8 = cap.call 2 0 (i32) -> (i64) v3 (v7)
+  v8 = call.cap 2 0 (i32) -> (i64) v3 (v7)
   v9 = thread.join v6
   v10 = i64.add v8 v9
   return v10
@@ -756,7 +756,7 @@ block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65536
   v3 = i32.load v2
   v4 = i32.const 0
-  v5 = cap.call 2 0 (i32) -> (i64) v3 (v4)
+  v5 = call.cap 2 0 (i32) -> (i64) v3 (v4)
   return v5
   }
 }
@@ -979,7 +979,7 @@ export 0 interface "counter" 1 { bump: 1 }
 func () -> (i64) {
 block 0 () {
   vz = i32.const 0
-  vn = cap.call 4294967295 9 () -> (i64) vz ()
+  vn = call.cap 4294967295 9 () -> (i64) vz ()
   vc = i64.const 65600
   vafter = i64.load vc
   vk = i64.const 1000
@@ -1060,7 +1060,7 @@ block 0 (vx: i64) {
 /// `svc.wait`, so the server serves before the run can quiesce, and freeze-on-quiesce drains only
 /// `svc_waiters`, never `ticket_waiters`; a `CapReply` fiber park still fails the freeze closed.
 /// When a future trigger admits it, the decided policy is the same O10 re-issue — the caller's
-/// rewound frame re-issues the `cap.call` on thaw — so this guard is the semantics it will inherit.)
+/// rewound frame re-issues the `call.cap` on thaw — so this guard is the semantics it will inherit.)
 #[test]
 fn a_completed_cross_cut_dispatch_is_not_resurrected_on_refreeze() {
     const SRC_SERVE: &str = r#"
@@ -1072,7 +1072,7 @@ export 0 interface "counter" 1 { bump: 1 }
 func () -> (i64) {
 block 0 () {
   vz = i32.const 0
-  vn = cap.call 4294967295 9 () -> (i64) vz ()
+  vn = call.cap 4294967295 9 () -> (i64) vz ()
   vc = i64.const 65600
   vafter = i64.load vc
   vk = i64.const 1000
@@ -1200,13 +1200,13 @@ block 0 (v0: i32) {
   i64.store q0a5 q0v4
   q0a6 = i64.const 1200
   i64.store q0a6 q0v4
-  v5 = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   v6 = i64.const 0
-  v7 = cap.call 6 14 (i32, i64) -> (i32) v0 (v5, v6)
+  v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   va = i64.const 7
-  vr = cap.call 268435456 0 (i64) -> (i64) v7 (va)
+  vr = call.cap 268435456 0 (i64) -> (i64) v7 (va)
   return vr
   }
 }
@@ -1220,7 +1220,7 @@ block 0 (vx: i64) {
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   return vn
   }
 }

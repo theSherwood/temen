@@ -27,7 +27,7 @@ use std::sync::Mutex;
 extern "C" {
     /// libc `_setjmp`/`_longjmp` — the **non**-signal-mask variants (no `sigprocmask` save/restore),
     /// matching the interpreters' semantics. Real exported symbols in glibc/musl. Their addresses are
-    /// baked into the `SetJmp`/`LongJmp` sites and called by `call_indirect` *inline in the guest
+    /// baked into the `SetJmp`/`LongJmp` sites and called by `call.dyn` *inline in the guest
     /// frame* (so `_setjmp` saves that frame's SP and `_longjmp` returns into it).
     fn _setjmp(env: *mut c_void) -> c_int;
     fn _longjmp(env: *mut c_void, val: c_int) -> !;

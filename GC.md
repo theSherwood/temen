@@ -247,7 +247,7 @@ into a runtime stack-walk; on wasm even a thunk cannot see JITted locals).
    STW stalls (temen offers no async escape hatch, by design). Piggyback the `gc_epoch`
    poll on the same sites used for temen's epoch/kill-path check (§5) — one poll, not two.
 2. **Blocking host ops use async-form capabilities** (which park the fiber → scannable).
-   A fiber must never sit in a long synchronous host `cap.call` during STW.
+   A fiber must never sit in a long synchronous host `call.cap` during STW.
 3. **No reentrant guest execution while stopped** (a host capability that calls back
    into guest code, §12 reentrancy, must not run a mutator during STW).
 4. The guest scans its own **data stack + heap**; it relies on temen only for

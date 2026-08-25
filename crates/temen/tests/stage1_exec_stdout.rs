@@ -103,7 +103,7 @@ fn args_blob(argv: &[&[u8]]) -> Vec<u8> {
 ///
 /// `wide` selects the declared width of op 13's child-handle result (and the matching `join` arg): the
 /// canonical contract shape is i32, but a chibicc-style frontend widens every scalar to an i64 slot, so
-/// both backends must accept an i64-declared `cap.call 6 13`/`6 1` and coerce. `wide == true` exercises
+/// both backends must accept an i64-declared `call.cap 6 13`/`6 1` and coerce. `wide == true` exercises
 /// that path with hand-IR (no chibicc toolchain needed), guarding the JIT's `slot_i32`/`result_as`
 /// coercions against the interpreter's slot-width tolerance.
 fn parent_src(argv: &[&[u8]], wide: bool) -> String {
@@ -157,8 +157,8 @@ block 0 (vinst: i32, vmod: i32, vout: i32) {{
   off = i64.const {CARVE}
   sl = i64.const 17
   qz = i64.const 0
-  ch = cap.call 6 13 (i64, i64, i64, i64, i64, i64, i64) -> ({chty}) vinst (me, gp, gn, ent, off, sl, qz)
-  r = cap.call 6 1 ({jarg}) -> (i64) vinst (ch)
+  ch = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> ({chty}) vinst (me, gp, gn, ent, off, sl, qz)
+  r = call.cap 6 1 ({jarg}) -> (i64) vinst (ch)
   return r
   }}
 }}

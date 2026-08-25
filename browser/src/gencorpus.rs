@@ -329,7 +329,7 @@ func (i32, i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32, v2: i32) {
   v3 = i64.const 0
   v4 = i64.const 17
-  v5 = cap.call 0 1 (i64, i64) -> (i64) v0(v3, v4)
+  v5 = call.cap 0 1 (i64, i64) -> (i64) v0(v3, v4)
   v6 = i32.const 0
   return v6
   }
@@ -344,8 +344,8 @@ func (i32, i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32, v2: i32) {
   v3 = i64.const 0
   v4 = i64.const 256
-  v5 = cap.call 0 0 (i64, i64) -> (i64) v1(v3, v4)
-  v6 = cap.call 0 1 (i64, i64) -> (i64) v0(v3, v5)
+  v5 = call.cap 0 0 (i64, i64) -> (i64) v1(v3, v4)
+  v6 = call.cap 0 1 (i64, i64) -> (i64) v0(v3, v5)
   v7 = i32.const 0
   return v7
   }
@@ -358,8 +358,8 @@ const PB_CLOCK: &str = r#"
 func (i32, i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
   v5 = i32.const 0
-  v6 = cap.call 2 0 (i32) -> (i64) v4(v5)
-  v7 = cap.call 2 0 (i32) -> (i64) v4(v5)
+  v6 = call.cap 2 0 (i32) -> (i64) v4(v5)
+  v7 = call.cap 2 0 (i32) -> (i64) v4(v5)
   v8 = i64.sub v7 v6
   return v8
   }
@@ -372,7 +372,7 @@ const PB_EXIT: &str = r#"
 func (i32, i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32, v2: i32) {
   v3 = i32.const 42
-  cap.call 1 0 (i32) -> () v2(v3)
+  call.cap 1 0 (i32) -> () v2(v3)
   v4 = i32.const 0
   return v4
   }
@@ -388,14 +388,14 @@ func (i32, i32, i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   v4 = i64.const 0
   v5 = i64.const 9
-  v6 = cap.call 0 1 (i64, i64) -> (i64) v3(v4, v5)
+  v6 = call.cap 0 1 (i64, i64) -> (i64) v3(v4, v5)
   v7 = i32.const 0
   return v7
   }
 }
 "#;
 
-// `(out, in, exit)`: F7 name→handle resolution through the powerbox — `cap.self.resolve "stdout"`
+// `(out, in, exit)`: F7 name→handle resolution through the powerbox — `self.resolve "stdout"`
 // re-finds the stdout handle **at runtime** (never reading the param slot), then writes through it.
 // Works only because the powerbox registers its caps under canonical names (PR #118); a regression in
 // either build diverges on stdout. The name "stdout" lives at offset 4096, the payload at 0.
@@ -407,10 +407,10 @@ func (i32, i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32, v2: i32) {
   v3 = i64.const 4096
   v4 = i64.const 6
-  v5 = cap.self.resolve v3 v4
+  v5 = self.resolve v3 v4
   v6 = i64.const 0
   v7 = i64.const 12
-  v8 = cap.call 0 1 (i64, i64) -> (i64) v5(v6, v7)
+  v8 = call.cap 0 1 (i64, i64) -> (i64) v5(v6, v7)
   v9 = i32.const 0
   return v9
   }
@@ -429,8 +429,8 @@ block 0 (v0: i32, v1: i32) {
   v2 = i64.const 0
   v3 = i64.const 0
   v4 = i64.const 16
-  v5 = cap.call 13 1 (i64, i64, i64) -> (i64) v0(v2, v3, v4)
-  v6 = cap.call 13 0 () -> (i64) v1()
+  v5 = call.cap 13 1 (i64, i64, i64) -> (i64) v0(v2, v3, v4)
+  v6 = call.cap 13 0 () -> (i64) v1()
   return v6
   }
 }
@@ -445,8 +445,8 @@ func (i32, i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32, v2: i32) {
   v3 = i64.const 0
   v4 = i64.const 4194304
-  v5 = cap.call 0 0 (i64, i64) -> (i64) v1(v3, v4)
-  v6 = cap.call 0 1 (i64, i64) -> (i64) v0(v3, v5)
+  v5 = call.cap 0 0 (i64, i64) -> (i64) v1(v3, v4)
+  v6 = call.cap 0 1 (i64, i64) -> (i64) v0(v3, v5)
   v7 = i32.const 0
   return v7
   }
@@ -487,7 +487,7 @@ block 3 () {
 // ---- §14 nested child guests (confined sub-window domains) -------------------------------------
 // All lifted verbatim from `crates/temen/tests/bytecode_instantiate.rs` (known parseable + engine-
 // supported, checked bit-identical to the tree-walker there). Func 0 receives an `Instantiator`
-// (iface 6) over `[0, 128 KiB)`; `instantiate` is `cap.call 6 0`, `join` is `cap.call 6 1`.
+// (iface 6) over `[0, 128 KiB)`; `instantiate` is `call.cap 6 0`, `join` is `call.cap 6 1`.
 
 // Parent instantiates a child in a 4 KiB window at 64 KiB, the child writes 123 at its own offset 7
 // (→ shared backing 64 KiB + 7) and returns 42; the parent joins, reads the marker back, returns
@@ -499,8 +499,8 @@ block 0 (v0: i32) {
   v2 = i64.const 65536
   v3 = i64.const 12
   v4 = i64.const 0
-  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
-  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
   v7 = i64.const 65543
   v8 = i32.load8_u v7
   v9 = i64.extend_i32_u v8
@@ -530,8 +530,8 @@ block 0 (v0: i32) {
   v2 = i64.const 65536
   v3 = i64.const 12
   v4 = i64.const 0
-  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
-  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
   return v6
   }
 }
@@ -545,8 +545,8 @@ block 0 (v0: i64) {
   v5 = i64.const 2048
   v6 = i64.const 10
   v7 = i64.const 0
-  v8 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v1 (v4, v5, v6, v7)
-  v9 = cap.call 6 1 (i32) -> (i64) v1 (v8)
+  v8 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v1 (v4, v5, v6, v7)
+  v9 = call.cap 6 1 (i32) -> (i64) v1 (v8)
   return v9
   }
 }
@@ -571,8 +571,8 @@ block 0 (v0: i32) {
   v2 = i64.const 65536
   v3 = i64.const 16
   v4 = i64.const 0
-  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
-  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
   return v6
   }
 }
@@ -581,7 +581,7 @@ block 0 (v0: i64, v1: i64) {
   v2 = i32.wrap_i64 v1
   v3 = i64.const 0
   v4 = i64.const 16384
-  v5 = cap.call 5 1 (i64, i64) -> (i64) v2 (v3, v4)
+  v5 = call.cap 5 1 (i64, i64) -> (i64) v2 (v3, v4)
   return v5
   }
 }
@@ -596,7 +596,7 @@ block 0 (v0: i32) {
   v2 = i64.const 131072
   v3 = i64.const 12
   v4 = i64.const 0
-  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   v6 = i64.extend_i32_s v5
   return v6
   }
@@ -617,8 +617,8 @@ block 0 (v0: i32) {
   v2 = i64.const 0
   v3 = i64.const 12
   v4 = i64.const 0
-  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
-  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
   return v6
   }
 }
@@ -747,13 +747,13 @@ block 0 (v0: i32) {
   v2 = i64.const 65536
   v3 = i64.const 16
   v4 = i64.const 0
-  v5 = cap.call 6 2 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v5 = call.cap 6 2 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   v6 = i64.const 0
-  v7, v8 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v5, v6)
+  v7, v8 = call.cap 6 3 (i32, i64) -> (i32, i64) v0 (v5, v6)
   v9 = i64.const 10
-  v10, v11 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v5, v9)
+  v10, v11 = call.cap 6 3 (i32, i64) -> (i32, i64) v0 (v5, v9)
   v12 = i64.const 20
-  v13, v14 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v5, v12)
+  v13, v14 = call.cap 6 3 (i32, i64) -> (i32, i64) v0 (v5, v12)
   v15 = i64.add v8 v11
   v16 = i64.add v15 v14
   v17 = i64.extend_i32_s v13
@@ -770,10 +770,10 @@ block 0 (v0: i64) {
   v3 = i32.const 7
   i32.store8 v2 v3
   v4 = i64.const 100
-  v5 = cap.call 7 0 (i64) -> (i64) v1 (v4)
+  v5 = call.cap 7 0 (i64) -> (i64) v1 (v4)
   v6 = i64.const 200
   v7 = i64.add v6 v5
-  v8 = cap.call 7 0 (i64) -> (i64) v1 (v7)
+  v8 = call.cap 7 0 (i64) -> (i64) v1 (v7)
   v9 = i64.const 999
   v10 = i64.add v9 v8
   return v10
@@ -787,38 +787,38 @@ func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 9
   v2 = i64.const 0
-  v3, v4 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v1, v2)
+  v3, v4 = call.cap 6 3 (i32, i64) -> (i32, i64) v0 (v1, v2)
   return v4
   }
 }
 "#;
 
-// ---- §22 guest-JIT (Jit.install + cross-module call_indirect, interpreted) ----------------------
+// ---- §22 guest-JIT (Jit.install + cross-module call.dyn, interpreted) ----------------------
 // From `crates/temen/tests/bytecode_dynlink.rs`. The unit (jit_exec's JIT_SERVICE = a*b+100) is
 // host-compiled; the guest gets (jit, code, a=6, b=7). iface 11: op 3 install, op 4 uninstall.
 
-// Install the unit (→ table slot), then call_indirect it: 6*7 + 100 = 142.
+// Install the unit (→ table slot), then call.dyn it: 6*7 + 100 = 142.
 const JIT_INSTALL: &str = r#"memory 16
 func (i32, i32, i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   v4 = i64.extend_i32_u v1
-  v5 = cap.call 11 3 (i64) -> (i64) v0 (v4)
+  v5 = call.cap 11 3 (i64) -> (i64) v0 (v4)
   v6 = i32.wrap_i64 v5
-  v7 = call_indirect (i32, i32) -> (i32) v6 (v2, v3)
+  v7 = call.dyn (i32, i32) -> (i32) v6 (v2, v3)
   return v7
   }
 }
 "#;
 
-// Install, then uninstall the slot, then call_indirect it → IndirectCall trap (the freed slot).
+// Install, then uninstall the slot, then call.dyn it → IndirectCall trap (the freed slot).
 const JIT_UNINSTALL: &str = r#"memory 16
 func (i32, i32, i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   v4 = i64.extend_i32_u v1
-  v5 = cap.call 11 3 (i64) -> (i64) v0 (v4)
-  v6 = cap.call 11 4 (i64) -> (i64) v0 (v5)
+  v5 = call.cap 11 3 (i64) -> (i64) v0 (v4)
+  v6 = call.cap 11 4 (i64) -> (i64) v0 (v5)
   v7 = i32.wrap_i64 v5
-  v8 = call_indirect (i32, i32) -> (i32) v7 (v2, v3)
+  v8 = call.dyn (i32, i32) -> (i32) v7 (v2, v3)
   return v8
   }
 }
@@ -832,7 +832,7 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
 // so the counter matches the cooperative oracle regardless of how the Workers interleave. `THREADS_JIT`
 // macro-expands to the shared root + a worker body; the two kernels differ only in the worker.
 
-// Worker `invoke`s the unit: `cap.call 11 1` (op 1) runs `service(6,7)` over the shared window → 142.
+// Worker `invoke`s the unit: `call.cap 11 1` (op 1) runs `service(6,7)` over the shared window → 142.
 const THREADS_JIT_INVOKE: &str = r#"memory 16
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
@@ -896,7 +896,7 @@ block 0 (vsp: i64, vp: i64) {
   vcode = i64.shr_u vp vsh
   va = i32.const 6
   vb = i32.const 7
-  vr = cap.call 11 1 (i64, i32, i32) -> (i32) vjit (vcode, va, vb)
+  vr = call.cap 11 1 (i64, i32, i32) -> (i32) vjit (vcode, va, vb)
   vr64 = i64.extend_i32_u vr
   vc8 = i64.const 8
   vold = i64.atomic.rmw.add vc8 vr64
@@ -974,7 +974,7 @@ block 0 (vsp: i64, vp: i64) {
   vcode = i64.shr_u vp vsh
   va = f64.const 6.0
   vb = f64.const 7.0
-  vr = cap.call 11 1 (i64, f64, f64) -> (f64) vjit (vcode, va, vb)
+  vr = call.cap 11 1 (i64, f64, f64) -> (f64) vjit (vcode, va, vb)
   vr64 = i64.trunc_f64_s vr
   vc8 = i64.const 8
   vold = i64.atomic.rmw.add vc8 vr64
@@ -985,7 +985,7 @@ block 0 (vsp: i64, vp: i64) {
 "#;
 
 // Worker `install`s the unit into the **shared** dispatch table (op 3 → a freshly raced slot) and
-// `call_indirect`s its own slot — genuine concurrent installs visible across Workers via the shared
+// `call.dyn`s its own slot — genuine concurrent installs visible across Workers via the shared
 // `Domain`; `service(6,7) = 142`.
 const THREADS_JIT_INSTALL: &str = r#"memory 16
 func (i32, i32) -> (i64) {
@@ -1048,11 +1048,11 @@ block 0 (vsp: i64, vp: i64) {
   vjit = i32.wrap_i64 vjit64
   vsh = i64.const 32
   vcode = i64.shr_u vp vsh
-  vslot = cap.call 11 3 (i64) -> (i64) vjit (vcode)
+  vslot = call.cap 11 3 (i64) -> (i64) vjit (vcode)
   vslot32 = i32.wrap_i64 vslot
   va = i32.const 6
   vb = i32.const 7
-  vr = call_indirect (i32, i32) -> (i32) vslot32 (va, vb)
+  vr = call.dyn (i32, i32) -> (i32) vslot32 (va, vb)
   vr64 = i64.extend_i32_u vr
   vc8 = i64.const 8
   vold = i64.atomic.rmw.add vc8 vr64
@@ -1087,7 +1087,7 @@ block 2 (vi2: i64, vinst2: i32) {
   ventry = i64.const 1
   vslog = i64.const 16
   vquota = i64.const 0
-  vh = cap.call 6 0 (i64, i64, i64, i64) -> (i32) vinst2 (ventry, voff, vslog, vquota)
+  vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst2 (ventry, voff, vslog, vquota)
   v4 = i64.const 4
   vholo = i64.mul vi2 v4
   v16 = i64.const 16
@@ -1112,7 +1112,7 @@ block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v16b = i64.const 16
   vjoff = i64.add v16b vjlo
   vhh = i32.load vjoff
-  vr = cap.call 6 1 (i32) -> (i64) vinst5 (vhh)
+  vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)
   vsn = i64.add vs2 vr
   v1b = i64.const 1
   vjn = i64.add vj2 v1b
@@ -1152,7 +1152,7 @@ block 2 (vi2: i64, vinst2: i32) {
   ventry = i64.const 1
   vslog = i64.const 16
   vquota = i64.const 0
-  vh = cap.call 6 0 (i64, i64, i64, i64) -> (i32) vinst2 (ventry, voff, vslog, vquota)
+  vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst2 (ventry, voff, vslog, vquota)
   v4 = i64.const 4
   vholo = i64.mul vi2 v4
   v16 = i64.const 16
@@ -1177,7 +1177,7 @@ block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v16b = i64.const 16
   vjoff = i64.add v16b vjlo
   vhh = i32.load vjoff
-  vr = cap.call 6 1 (i32) -> (i64) vinst5 (vhh)
+  vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)
   vsn = i64.add vs2 vr
   v1b = i64.const 1
   vjn = i64.add vj2 v1b
@@ -1194,8 +1194,8 @@ block 0 (v0: i64) {
   voff = i64.const 0
   vslog = i64.const 16
   vquota = i64.const 0
-  vgh = cap.call 6 0 (i64, i64, i64, i64) -> (i32) vinst (ventry, voff, vslog, vquota)
-  vgr = cap.call 6 1 (i32) -> (i64) vinst (vgh)
+  vgh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst (ventry, voff, vslog, vquota)
+  vgr = call.cap 6 1 (i32) -> (i64) vinst (vgh)
   return vgr
   }
 }
@@ -1225,7 +1225,7 @@ block 0 (v0: i64) {
 // `Instantiator` — it reads its own data byte ("K" = 75), `instantiate`s func 1 (a pure grandchild →
 // 9) into a **narrowed** 1 KiB sub-carve of its own window, `join`s it, and returns 75 + 9 = 84. With
 // the same [`THREADS_INST_MOD`] root: 8 × 84 = 672. On the codegen tier the entry emits via
-// `compile_module_nested` — its `cap.call 6 0/1` become `env.instantiate`/`env.join` serviced by the
+// `compile_module_nested` — its `call.cap 6 0/1` become `env.instantiate`/`env.join` serviced by the
 // Worker through the confined-child completion-slot protocol (grandchildren spawn on their own
 // Workers), differential against the interpreter's driver servicing the same ops.
 const THREADS_INST_NESTED_UNIT: &str = r#"memory 16
@@ -1240,8 +1240,8 @@ block 0 (v0: i64) {
   voff = i64.const 0
   vslog = i64.const 10
   vquota = i64.const 0
-  vch = cap.call 6 0 (i64, i64, i64, i64) -> (i32) vinst (ventry, voff, vslog, vquota)
-  vg = cap.call 6 1 (i32) -> (i64) vinst (vch)
+  vch = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst (ventry, voff, vslog, vquota)
+  vg = call.cap 6 1 (i32) -> (i64) vinst (vch)
   vr = i64.add vk vg
   return vr
   }
@@ -1255,7 +1255,7 @@ block 0 (v0: i64) {
 "#;
 
 // §22 runtime-compile unit for the multi-Worker twins: `() -> (i32)` returning 7 — each worker vCPU
-// compiles it AT RUNTIME (`cap.call 11 0`) from the blob the harness stages in the window.
+// compiles it AT RUNTIME (`call.cap 11 0`) from the blob the harness stages in the window.
 const JIT_RT_UNIT: &str = r#"memory 16
 func () -> (i32) {
 block 0 () {
@@ -1265,14 +1265,14 @@ block 0 () {
 }
 "#;
 
-// §22 Model-B2 dispatcher unit: `(i64 slot) -> (i32)` — `call_indirect`s the given shared-table slot.
+// §22 Model-B2 dispatcher unit: `(i64 slot) -> (i32)` — `call.dyn`s the given shared-table slot.
 // Emitted in B2 mode it imports the shared reserved funcref table; each Worker's mirror routes the
 // slot to whatever unit is installed there (cross-Worker install → dispatch).
 const JIT_B2_UNIT: &str = r#"memory 16
 func (i64) -> (i32) {
 block 0 (vs: i64) {
   vs32 = i32.wrap_i64 vs
-  vr = call_indirect () -> (i32) vs32 ()
+  vr = call.dyn () -> (i32) vs32 ()
   return vr
   }
 }
@@ -1288,8 +1288,8 @@ block 0 (vsp: i64, vp: i64) {{
   vjit = i32.wrap_i64 vp
   vptr = i64.const {off}
   vlen = i64.const {blob_len}
-  vcode = cap.call 11 0 (i64, i64) -> (i64) vjit (vptr, vlen)
-  vw = cap.call 11 1 (i64) -> (i32) vjit (vcode)
+  vcode = call.cap 11 0 (i64, i64) -> (i64) vjit (vptr, vlen)
+  vw = call.cap 11 1 (i64) -> (i32) vjit (vcode)
   vw64 = i64.extend_i32_u vw
   vc8 = i64.const 8
   vold = i64.atomic.rmw.add vc8 vw64
@@ -1304,7 +1304,7 @@ block 0 (vsp: i64, vp: i64) {{
 /// Root `(jit) -> counter`: spawn 8 workers, each runtime-compiles the leaf [`JIT_RT_UNIT`] (at
 /// `offa`), **`install`s** it into the shared dispatch table (a raced slot), runtime-compiles the
 /// [`JIT_B2_UNIT`] dispatcher (at `offb`), and `invoke`s it passing its slot — the dispatcher's
-/// `call_indirect` lands in the installed leaf (→ 7); fold → 56. On the codegen tier the dispatcher
+/// `call.dyn` lands in the installed leaf (→ 7); fold → 56. On the codegen tier the dispatcher
 /// runs on B2-emitted wasm, dispatching through the per-Worker table mirror (cross-Worker §22 B2).
 fn jit_b2_guest(offa: usize, len_a: usize, offb: usize, len_b: usize) -> String {
     format!(
@@ -1313,12 +1313,12 @@ block 0 (vsp: i64, vp: i64) {{
   vjit = i32.wrap_i64 vp
   vpa = i64.const {offa}
   vla = i64.const {len_a}
-  vca = cap.call 11 0 (i64, i64) -> (i64) vjit (vpa, vla)
-  vslot = cap.call 11 3 (i64) -> (i64) vjit (vca)
+  vca = call.cap 11 0 (i64, i64) -> (i64) vjit (vpa, vla)
+  vslot = call.cap 11 3 (i64) -> (i64) vjit (vca)
   vpb = i64.const {offb}
   vlb = i64.const {len_b}
-  vcb = cap.call 11 0 (i64, i64) -> (i64) vjit (vpb, vlb)
-  vr = cap.call 11 1 (i64, i64) -> (i32) vjit (vcb, vslot)
+  vcb = call.cap 11 0 (i64, i64) -> (i64) vjit (vpb, vlb)
+  vr = call.cap 11 1 (i64, i64) -> (i32) vjit (vcb, vslot)
   vr64 = i64.extend_i32_u vr
   vc8 = i64.const 8
   vold = i64.atomic.rmw.add vc8 vr64
@@ -1437,7 +1437,7 @@ block 2 (vi2: i64, vinst2: i32, vmod2: i64) {
   ventry = i64.const 0
   vslog = i64.const 16
   vquota = i64.const 0
-  vh = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) vinst2 (vmod2, ventry, voff, vslog, vquota)
+  vh = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) vinst2 (vmod2, ventry, voff, vslog, vquota)
   v4 = i64.const 4
   vholo = i64.mul vi2 v4
   v16 = i64.const 16
@@ -1462,7 +1462,7 @@ block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v16b = i64.const 16
   vjoff = i64.add v16b vjlo
   vhh = i32.load vjoff
-  vr = cap.call 6 1 (i32) -> (i64) vinst5 (vhh)
+  vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)
   vsn = i64.add vs2 vr
   v1b = i64.const 1
   vjn = i64.add vj2 v1b
@@ -1476,7 +1476,7 @@ block 6 (vs3: i64) {
 
 // ---- 4d: host I/O across Workers (the shared powerbox) ------------------------------------------
 // The proven schedule-independent 4c-host kernel: root (param = stdout handle) spawns 8 workers, each
-// `cap.call`-writes the SAME 5-byte line and bumps a shared counter — so result (8) AND stdout
+// `call.cap`-writes the SAME 5-byte line and bumps a shared counter — so result (8) AND stdout
 // ("tick\n" × 8) are schedule-independent. Ground truth asserted in the JS host.
 const THREADS_IO: &str = r#"memory 16
 data 0 "tick\n"
@@ -1534,7 +1534,7 @@ block 0 (vsp: i64, vh: i64) {
   vhandle = i32.wrap_i64 vh
   vptr = i64.const 0
   vlen = i64.const 5
-  vw = cap.call 0 1 (i64, i64) -> (i64) vhandle(vptr, vlen)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vhandle(vptr, vlen)
   v1 = i64.const 8
   v2 = i64.const 1
   v3 = i64.atomic.rmw.add v1 v2
@@ -1552,8 +1552,8 @@ block 0 (vsp: i64, vh: i64) {
 const DURABLE_SRC: &str = r#"memory 17
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = cap.call 2 0 () -> (i64) v0 ()
-  v2 = cap.call 2 0 () -> (i64) v0 ()
+  v1 = call.cap 2 0 () -> (i64) v0 ()
+  v2 = call.cap 2 0 () -> (i64) v0 ()
   v3 = i64.add v1 v2
   return v3
   }
@@ -1568,9 +1568,9 @@ const DL_GUEST: &str = r#"memory 16
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
   v3 = i64.extend_i32_u v1
-  v4 = cap.call 11 3 (i64) -> (i64) v0 (v3)
+  v4 = call.cap 11 3 (i64) -> (i64) v0 (v3)
   v5 = i32.wrap_i64 v4
-  v6 = call_indirect (i32) -> (i64) v5 (v2)
+  v6 = call.dyn (i32) -> (i64) v5 (v2)
   return v6
   }
 }
@@ -1585,11 +1585,11 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 const REGION_ALIAS: &str = r#"memory 17
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = cap.call 4 3 () -> (i64) v0 ()
+  v1 = call.cap 4 3 () -> (i64) v0 ()
   v2 = i64.const 0
   v3 = i32.const 3
-  v4 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v0 (v2, v2, v1, v3)
-  v5 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v0 (v1, v2, v1, v3)
+  v4 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (v2, v2, v1, v3)
+  v5 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (v1, v2, v1, v3)
   v6 = i64.const 81985529216486895
   i64.store v2 v6
   v7 = i64.load v1
@@ -1602,37 +1602,37 @@ block 0 (v0: i32) {
 const REGION_LEN: &str = r#"memory 17
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = cap.call 4 2 () -> (i64) v0 ()
+  v1 = call.cap 4 2 () -> (i64) v0 ()
   return v1
   }
 }
 "#;
 
-// ---- §7 reflection (cap.self.count / cap.self.get) over a fixed 3-cap powerbox -----------------
+// ---- §7 reflection (self.count / self.get) over a fixed 3-cap powerbox -----------------
 // Lifted from `crates/temen/tests/bytecode_caps.rs`. Powerbox = Stream(Out) t0, Exit t1, host-fn t13.
 
 // Number of caps the domain holds → 3.
 const SELF_COUNT: &str = r#"
 func () -> (i32) {
 block 0 () {
-  v0 = cap.self.count
+  v0 = self.count
   return v0
   }
 }
 "#;
 
-// cap.self.get(idx) → (handle, type_id); sum them so the result depends on both.
+// self.get(idx) → (handle, type_id); sum them so the result depends on both.
 const SELF_GET: &str = r#"
 func (i32) -> (i32) {
 block 0 (v0: i32) {
-  v1, v2 = cap.self.get v0
+  v1, v2 = self.get v0
   v3 = i32.add v1 v2
   return v3
   }
 }
 "#;
 
-// ---- tail calls (`return_call` / `return_call_indirect`, O(1) window reuse) --------------------
+// ---- tail calls (`return_call` / `return_call.dyn`, O(1) window reuse) --------------------
 // Adapted from `crates/temen/tests/bytecode_tailcall.rs` to the single-i64-arg compute shape.
 
 // Tail-recursive factorial accumulator f(n, acc) = n<1 ? acc : f(n-1, acc*n) via `return_call`; entry
@@ -1663,14 +1663,14 @@ block 2 (v5: i64, v6: i64) {
 }
 "#;
 
-// `return_call_indirect` through the natural table with x=5: idx 1 = +10 (→15), idx 2 = *2 (→10);
+// `return_call.dyn` through the natural table with x=5: idx 1 = +10 (→15), idx 2 = *2 (→10);
 // other indices select func 0 (recurses once then) / out-of-range → IndirectCall trap — all
 // identical on both engines.
 const TAIL_INDIRECT: &str = r#"
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   v1 = i64.const 5
-  return_call_indirect (i64) -> (i64) v0 (v1)
+  return_call.dyn (i64) -> (i64) v0 (v1)
   }
 }
 func (i64) -> (i64) {
@@ -1884,7 +1884,7 @@ const FLOAT_ARGS: &[i64] = &[
 ];
 
 // Fail-closed UNSUPPORTED path: a module the bytecode engine rejects (`compile_module → None`) —
-// `cont.new` (fiber) **and** a coroutine `cap.call 6 2` in one module is an unsupported combination,
+// `cont.new` (fiber) **and** a coroutine `call.cap 6 2` in one module is an unsupported combination,
 // so `temen_run` must return STATUS_UNSUPPORTED, matching native. (Forged handle never runs.)
 const UNSUP: &str = r#"
 func () -> (i64) {
@@ -1897,7 +1897,7 @@ block 0 () {
   v5 = i64.const 0
   v6 = i64.const 12
   v7 = i64.const 0
-  v8 = cap.call 6 2 (i64, i64, i64, i64) -> (i32) v3 (v4, v5, v6, v7)
+  v8 = call.cap 6 2 (i64, i64, i64, i64) -> (i32) v3 (v4, v5, v6, v7)
   v9 = i64.const 0
   return v9
   }
@@ -2122,7 +2122,7 @@ fn main() {
         ],
         FLOAT_ARGS,
     );
-    // Reflection corpus — §7 cap.self.* over the fixed 3-cap powerbox (run via temen_run_reflect).
+    // Reflection corpus — §7 self.* over the fixed 3-cap powerbox (run via temen_run_reflect).
     // SELF_COUNT takes no arg (→ 3); SELF_GET sweeps cap indices (0,1,2 valid; 3 out of range).
     let reflect: &[(&str, &str, &[i64])] = &[
         ("self_count", SELF_COUNT, &[0]),
@@ -2148,7 +2148,7 @@ fn main() {
             "]},\n"
         });
     }
-    // Guest-JIT corpus — §22 install + cross-module call_indirect (interpreted); temen_run_jit.
+    // Guest-JIT corpus — §22 install + cross-module call.dyn (interpreted); temen_run_jit.
     let jit = [
         ("jit_install", JIT_INSTALL),
         ("jit_uninstall", JIT_UNINSTALL),

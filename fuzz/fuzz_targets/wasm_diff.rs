@@ -15,7 +15,7 @@ use libfuzzer_sys::fuzz_target;
 mod wasmdiff;
 
 fuzz_target!(|data: &[u8]| {
-    // `without_caps`: the wasm tier refuses `cap.call`/page-op modules, so suppressing them keeps the
+    // `without_caps`: the wasm tier refuses `call.cap`/page-op modules, so suppressing them keeps the
     // coverage-guided search on modules the emitter actually accepts (memory ops are the hinge).
     let mut g = wasmdiff::Gen::from_bytes(data).without_caps();
     wasmdiff::fuzz_one_wasm(&mut g);

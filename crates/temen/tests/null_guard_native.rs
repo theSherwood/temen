@@ -40,7 +40,7 @@ block 0 (v0: i64) {
 }
 func (i32, i64, i64) -> (i64) {
 block 0 (vas: i32, voff: i64, vlen: i64) {
-  vr = cap.call 5 1 (i64, i64) -> (i64) vas (voff, vlen)
+  vr = call.cap 5 1 (i64, i64) -> (i64) vas (voff, vlen)
   return vr
   }
 }
@@ -212,7 +212,7 @@ fn carve_below_guard_refused_on_native_jit() {
              \x20 v2 = i64.const {off}\n\
              \x20 v3 = i64.const 12\n\
              \x20 v4 = i64.const 0\n\
-             \x20 v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)\n\
+             \x20 v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)\n\
              \x20 v6 = i64.extend_i32_s v5\n\
              \x20 return v6\n\
                }}\n\

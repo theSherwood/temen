@@ -160,7 +160,7 @@ self.onmessage = async (e) => {
   // entry is eligible runs it on EMITTED WASM here and fills the completion slot the parent joins — no
   // vCPU. The unit's data segments were materialized into the carve by the parent before this event,
   // so `f{entry}(win=carveBase, env, …cap-handle args a pure unit ignores)` reads them. With the
-  // nested emit (`compile_module_nested`) a cap-using entry is ALSO eligible: its `cap.call 6 0/1`
+  // nested emit (`compile_module_nested`) a cap-using entry is ALSO eligible: its `call.cap 6 0/1`
   // (instantiate/join) arrives here as the `env.instantiate`/`env.join` imports, serviced through the
   // SAME confined-child completion-slot protocol as the interpreter's INSTANTIATE/JOIN arms below —
   // the grandchild spawns on its own Worker (page relay), and `env.join` blocks on its slot with

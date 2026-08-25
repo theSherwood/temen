@@ -1,13 +1,13 @@
-//! THREADS.md 4c-host — spawned vCPUs of the **parallel** driver share the powerbox, so `cap.call`
+//! THREADS.md 4c-host — spawned vCPUs of the **parallel** driver share the powerbox, so `call.cap`
 //! (host I/O) works from worker vCPUs, serialized per call by the shared-host lock while
 //! compute/atomics stay parallel. Differential-tested against the **cooperative** oracle (which already
 //! shares one host across its vCPUs, deterministically).
 //!
-//! The kernel has 8 worker vCPUs each (a) write the **same** 5-byte line to stdout via `cap.call` and
-//! (b) `atomic.rmw.add` a shared counter. Because every write is identical and each `cap.call` is
+//! The kernel has 8 worker vCPUs each (a) write the **same** 5-byte line to stdout via `call.cap` and
+//! (b) `atomic.rmw.add` a shared counter. Because every write is identical and each `call.cap` is
 //! atomic under the lock, the stdout bytes are **schedule-independent** (`"tick\n"` × 8) — so even this
 //! stateful capability is byte-identical to the oracle, while genuinely exercising concurrent
-//! `cap.call` on the shared host. (Order-sensitive caps like distinct writes / `Clock.now` would race —
+//! `call.cap` on the shared host. (Order-sensitive caps like distinct writes / `Clock.now` would race —
 //! that is the documented opt-in non-determinism of the parallel mode.)
 //!
 //! The `unsafe` (borrowing host memory via `Region::shared`) lives in this embedder/test.
@@ -74,7 +74,7 @@ block 0 (vsp: i64, vh: i64) {
   vhandle = i32.wrap_i64 vh
   vptr = i64.const 0
   vlen = i64.const 5
-  vw = cap.call 0 1 (i64, i64) -> (i64) vhandle(vptr, vlen)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vhandle(vptr, vlen)
   v1 = i64.const 8
   v2 = i64.const 1
   v3 = i64.atomic.rmw.add v1 v2
@@ -130,7 +130,7 @@ fn run_parallel() -> (Result<Vec<Value>, temen_interp::Trap>, Vec<u8>) {
     (r, host.stdout)
 }
 
-/// 8 worker vCPUs do host I/O (`cap.call` stdout write) + atomics on the **shared** powerbox, in
+/// 8 worker vCPUs do host I/O (`call.cap` stdout write) + atomics on the **shared** powerbox, in
 /// genuine parallel — result and the (identical-line, schedule-independent) stdout match the oracle.
 #[test]
 fn parallel_shared_host_capcall_matches_oracle() {

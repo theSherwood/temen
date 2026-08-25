@@ -36,7 +36,7 @@ fn run_killed(src: &str, delay_ms: u64) -> JitOutcome {
         std::thread::sleep(Duration::from_millis(delay_ms));
         wd.store(1, Ordering::SeqCst); // request the domain kill
     });
-    // The guest makes no `cap.call`, so the thunk is never invoked (null ctx never read).
+    // The guest makes no `call.cap`, so the thunk is never invoked (null ctx never read).
     let outcome = compile_and_run_with_host_interruptible(
         &m,
         0,

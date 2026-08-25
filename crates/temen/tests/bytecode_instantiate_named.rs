@@ -83,8 +83,8 @@ block 0 (vinst: i32, vmod: i32, vout: i32) {
   off = i64.const 131072
   sl = i64.const 17
   qz = i64.const 0
-  ch = cap.call 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (me, gp, gn, ent, off, sl, qz)
-  r = cap.call 6 1 (i32) -> (i64) vinst (ch)
+  ch = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (me, gp, gn, ent, off, sl, qz)
+  r = call.cap 6 1 (i32) -> (i64) vinst (ch)
   return r
   }
 }

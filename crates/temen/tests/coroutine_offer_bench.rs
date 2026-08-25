@@ -42,7 +42,7 @@ func 0 () -> () {{
 block 0 () {{
   vp = i64.const 0
   vl = i64.const 2
-  vh = cap.self.resolve vp vl
+  vh = self.resolve vp vl
   ; spawn via record (op 17): entry=1 off=65536 sl=12 quota=0
   q0v0 = i64.const 4294967296
   q0v1 = i64.const 65536
@@ -63,16 +63,16 @@ block 0 () {{
   i64.store q0a5 q0v4
   q0a6 = i64.const 1200
   i64.store q0a6 q0v4
-  vch = cap.call 6 17 (i64) -> (i32) vh (q0a0)
+  vch = call.cap 6 17 (i64) -> (i32) vh (q0a0)
   vexp = i64.const 0
-  voffer = cap.call 6 14 (i32, i64) -> (i32) vh (vch, vexp)
+  voffer = call.cap 6 14 (i32, i64) -> (i32) vh (vch, vexp)
   vi0 = i64.const 0
   vacc0 = i64.const 0
   br 1(vh, vch, voffer, vi0, vacc0)
 }}
 block 1 (vh1: i32, vch1: i32, voffer1: i32, vi: i64, vacc: i64) {{
   vone = i64.const 1
-  vr = cap.call 268435456 0 (i64, i64) -> (i64) voffer1 (vi, vone)
+  vr = call.cap 268435456 0 (i64, i64) -> (i64) voffer1 (vi, vone)
   vacc2 = i64.add vacc vr
   vi2 = i64.add vi vone
   vn = i64.const {n}
@@ -80,7 +80,7 @@ block 1 (vh1: i32, vch1: i32, voffer1: i32, vi: i64, vacc: i64) {{
   br_if vcmp 1(vh1, vch1, voffer1, vi2, vacc2) 2(vh1, vch1, vacc2)
 }}
 block 2 (vh2: i32, vch2: i32, vaccf: i64) {{
-  vj = cap.call 6 1 (i32) -> (i64) vh2 (vch2)
+  vj = call.cap 6 1 (i32) -> (i64) vh2 (vch2)
   vc = i32.wrap_i64 vaccf
   call.import 0 (vc)
   unreachable
@@ -148,7 +148,7 @@ fn run(backend: Backend, src: &str) -> i32 {
 const BACKENDS: [Backend; 3] = [Backend::TreeWalk, Backend::Bytecode, Backend::Jit];
 
 /// Correctness pin (runs in CI): n offer serve rounds compute the expected checksum on every
-/// backend — the §2 collapse statement (`resume` = `cap.call`, `yield` = the handler replying)
+/// backend — the §2 collapse statement (`resume` = `call.cap`, `yield` = the handler replying)
 /// with the offer transport as the only transport.
 #[test]
 fn offer_rounds_agree_across_backends() {

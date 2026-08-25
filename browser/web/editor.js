@@ -12,7 +12,7 @@ const CM = window.CodeMirror;
 // A minimal highlighting mode for **Temen text** (the CLIF/LLVM-flavored IR form; grammar in the
 // `temen-text` crate). Rule order matters — first match wins:
 //   - `;` line comments and `"…"` strings first;
-//   - dotted opcodes (`i64.const`, `cap.call`, `thread.spawn`, `mem.fill`, `atomic.rmw.add`) before
+//   - dotted opcodes (`i64.const`, `call.cap`, `thread.spawn`, `mem.fill`, `atomic.rmw.add`) before
 //     the bare-type rule, so `i64.const` isn't split at `i64`;
 //   - structural keywords / terminators, scalar+vector types, `blockN` labels, `vN` SSA values,
 //     numbers (decimal + hex), and the `->` signature arrow.
@@ -21,7 +21,7 @@ CM.defineSimpleMode('temen', {
     { regex: /;.*/, token: 'comment' },
     { regex: /"(?:[^\\"]|\\.)*"/, token: 'string' },
     { regex: /[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+/, token: 'builtin' },
-    { regex: /\b(?:memory|data|func|export|type|return_call_indirect|return_call|return|br_if|br|unreachable|call)\b/, token: 'keyword' },
+    { regex: /\b(?:memory|data|func|export|type|return_call\.dyn|return_call|return|br_if|br|unreachable|call)\b/, token: 'keyword' },
     { regex: /\b(?:i32|i64|f32|f64|v128)\b/, token: 'type' },
     { regex: /\bblock\d+\b/, token: 'def' },
     { regex: /\bv\d+\b/, token: 'variable-2' },

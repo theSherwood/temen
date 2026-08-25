@@ -8,7 +8,7 @@
 //! a same-module confined child) plus a by-name grant list re-granted into the child's powerbox —
 //! the same-module counterpart of op 13 (`instantiate_module_named`, slice 1). Everything else was
 //! already in place: the SharedRegion `map`/`page_size` and AddressSpace `create_region` ops ride
-//! the generic `cap.call` dispatch on the bytecode engine (they service from `(Host, Mem)` alone),
+//! the generic `call.cap` dispatch on the bytecode engine (they service from `(Host, Mem)` alone),
 //! and the cooperative `drive` scheduler already parks a task on `memory.wait` and wakes it on
 //! `notify` — so two op-11 children moving four items through a **one-slot bounded ring** (flag at
 //! region byte 0, datum at byte 8) interleave correctly. This is the shape sequential spawn/wait
@@ -41,7 +41,7 @@ data 200 "ring"
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
   vlen = i64.const 65536
-  vrh64 = cap.call 5 5 (i64) -> (i64) v1 (vlen)
+  vrh64 = call.cap 5 5 (i64) -> (i64) v1 (vlen)
   vrh = i32.wrap_i64 vrh64
   va1 = i64.const 256
   vv1 = i32.const 200
@@ -77,7 +77,7 @@ block 0 (v0: i32, v1: i32) {
   i64.store q0a5 q0v5
   q0a6 = i64.const 1200
   i64.store q0a6 q0v6
-  vp = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
+  vp = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   ; spawn via record (op 17): entry=2 off=262144 sl=17 quota=0
   q1v0 = i64.const 8589934592
   q1v1 = i64.const 262144
@@ -100,9 +100,9 @@ block 0 (v0: i32, v1: i32) {
   i64.store q1a5 q1v5
   q1a6 = i64.const 1264
   i64.store q1a6 q1v6
-  vc = cap.call 6 17 (i64) -> (i32) v0 (q1a0)
-  vjp = cap.call 6 1 (i32) -> (i64) v0 (vp)
-  vjc = cap.call 6 1 (i32) -> (i64) v0 (vc)
+  vc = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
+  vjp = call.cap 6 1 (i32) -> (i64) v0 (vp)
+  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
   vk = i64.const 100
   vm = i64.mul vjp vk
   vs = i64.add vm vjc
@@ -117,11 +117,11 @@ block 0 (v0: i64) {
   i64.store vz vnm
   vp = i64.const 0
   vl = i64.const 4
-  vh = cap.self.resolve vp vl
-  vg = cap.call 4 3 () -> (i64) vh ()
+  vh = self.resolve vp vl
+  vg = call.cap 4 3 () -> (i64) vh ()
   vroff = i64.const 0
   vprot = i32.const 3
-  vm = cap.call 4 0 (i64, i64, i64, i32) -> (i64) vh (vroff, vroff, vg, vprot)
+  vm = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vh (vroff, vroff, vg, vprot)
   vone = i64.const 1
   br 1(vone, vroff)
   }
@@ -176,11 +176,11 @@ block 0 (v0: i64) {
   i64.store vz vnm
   vp = i64.const 0
   vl = i64.const 4
-  vh = cap.self.resolve vp vl
-  vg = cap.call 4 3 () -> (i64) vh ()
+  vh = self.resolve vp vl
+  vg = call.cap 4 3 () -> (i64) vh ()
   vroff = i64.const 0
   vprot = i32.const 3
-  vm = cap.call 4 0 (i64, i64, i64, i32) -> (i64) vh (vroff, vroff, vg, vprot)
+  vm = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vh (vroff, vroff, vg, vprot)
   vone = i64.const 1
   br 1(vone, vroff, vroff)
   }

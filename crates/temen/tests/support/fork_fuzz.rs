@@ -50,9 +50,9 @@ block 0 (v0: i32, vout: i32) {
   i64.store q1a5 q1v4
   q1a6 = i64.const 1264
   i64.store q1a6 q1v4
-  vs = cap.call 6 17 (i64) -> (i32) v0 (q1a0)
+  vs = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
   vz0 = i64.const 0
-  vcap = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
   va0 = i64.const 256
   vnp = i32.const 300
   i32.store va0 vnp
@@ -90,8 +90,8 @@ block 0 (v0: i32, vout: i32) {
   i64.store q2a5 q2v5
   q2a6 = i64.const 1328
   i64.store q2a6 q2v6
-  vc = cap.call 6 17 (i64) -> (i32) v0 (q2a0)
-  vjc = cap.call 6 1 (i32) -> (i64) v0 (vc)
+  vc = call.cap 6 17 (i64) -> (i32) v0 (q2a0)
+  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
   return vjc
   }
 }
@@ -101,7 +101,7 @@ block 0 (v0: i64) {
   }
 block 1 () {
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   br 1()
   }
 }
@@ -110,14 +110,14 @@ block 0 (vx: i64) {
   vz = i32.const 0
   vro = i64.const __RO__
   vrt = i64.const __RT__
-  vt = cap.call 4294967295 11 (i64, i64) -> (i64) vz (vro, vrt)
+  vt = call.cap 4294967295 11 (i64, i64) -> (i64) vz (vro, vrt)
   return vt
   }
 }
 func (i64) -> (i64) {
 block 0 (vpid: i64) {
   vz = i32.const 0
-  vt = cap.call 4294967295 12 (i64) -> (i64) vz (vpid)
+  vt = call.cap 4294967295 12 (i64) -> (i64) vz (vpid)
   return vt
   }
 }
@@ -131,22 +131,22 @@ block 0 (v0: i64) {
   i64.store va8 voname
   vp0 = i64.const 0
   vl3 = i64.const 3
-  vhsvc = cap.self.resolve vp0 vl3
+  vhsvc = self.resolve vp0 vl3
   vp8 = i64.const 8
   vl1 = i64.const 1
-  vho = cap.self.resolve vp8 vl1
+  vho = self.resolve vp8 vl1
   br 1(vhsvc, vho)
   }
 block 1 (vhsvc: i32, vho: i32) {
   varg = i64.const 7
-  vr = cap.call 268435456 0 (i64) -> (i64) vhsvc (varg)
+  vr = call.cap 268435456 0 (i64) -> (i64) vhsvc (varg)
   v200 = i64.const __RT__
   vistwin = i64.eq vr v200
   br_if vistwin 4(vr, vho) 2(vr, vhsvc, vho)
   }
 block 2 (vr: i64, vhsvc: i32, vho: i32) {
   vpid3 = i64.const 3
-  vstatus = cap.call 268435456 1 (i64) -> (i64) vhsvc (vpid3)
+  vstatus = call.cap 268435456 1 (i64) -> (i64) vhsvc (vpid3)
   veagain = i64.const -11
   viseagain = i64.eq vstatus veagain
   br_if viseagain 2(vr, vhsvc, vho) 3(vr, vstatus, vhsvc, vho)
@@ -160,7 +160,7 @@ block 4 (vr: i64, vho: i32) {
   vp16 = i64.const 16
   i64.store vp16 vr
   vlen = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
   return vr
   }
 }

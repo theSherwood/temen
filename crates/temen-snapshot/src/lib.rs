@@ -125,9 +125,9 @@ const MAGIC: &[u8; 4] = b"SVMD";
 /// the version differs); one holding a JIT cap couldn't have been produced by v15 (freeze refused
 /// it), so there's no v15 mis-parse to guard.
 /// v17 (§12.5 install-durability): Section 5 (`TAG_JIT`) gains a leading `table_log2` header (the
-/// domain's `call_indirect` table reservation, restored so a thaw's dispatch table has the padding
+/// domain's `call.dyn` table reservation, restored so a thaw's dispatch table has the padding
 /// the installs land in) and a per-domain **install occupancy** list — `(slot, unit)` pairs, in
-/// install order — re-applied to the thaw run's table so a `call_indirect` through an installed slot
+/// install order — re-applied to the thaw run's table so a `call.dyn` through an installed slot
 /// resolves. A v16 JIT section had neither, so it mis-parses under v17; a JIT-free artifact is
 /// unaffected (Section 5 stays elided).
 const FORMAT_VERSION: u16 = 17;
@@ -493,7 +493,7 @@ pub fn freeze_with_prots(
 /// then domains and units in index order (capture already yields them so), install occupancy in
 /// install order — all minimal LEB128.
 fn write_jit(b: &mut Vec<u8>, table_log2: u8, jit: &[DurableJitDomain]) {
-    b.push(table_log2); // v17: the run's call_indirect table reservation
+    b.push(table_log2); // v17: the run's call.dyn table reservation
     write_uleb(b, jit.len() as u64);
     for d in jit {
         match d.mem_log2 {
@@ -675,7 +675,7 @@ pub fn restore_with_prots(
     }
     host.restore_durable_jit(&jit)
         .map_err(|_| RestoreError::JitReconstruct)?;
-    // v17: restore the call_indirect table reservation so the thaw run's dispatch table has the
+    // v17: restore the call.dyn table reservation so the thaw run's dispatch table has the
     // padding the re-applied installs land in (a fresh host defaults to 0).
     host.set_jit_table_log2(jit_table_log2);
     host.restore_durable_handles(&handles);

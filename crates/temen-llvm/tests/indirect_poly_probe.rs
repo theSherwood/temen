@@ -1,7 +1,7 @@
-//! Probe: how polymorphic are the `call_indirect` sites in real interpreters?
+//! Probe: how polymorphic are the `call.dyn` sites in real interpreters?
 //!
 //! This gates temen-peval "approach A" (bounded-target residualization of a *dynamic*-index
-//! `call_indirect`): enumerate the signature-matching target functions, branch among them, fold
+//! `call.dyn`): enumerate the signature-matching target functions, branch among them, fold
 //! each arm. It only pays if the dispatch signatures are **low-polymorphism** — a handful of
 //! matching functions, not hundreds. This test measures that on the lua on-ramp module (and
 //! quickjs if the toolchain/network is present) and prints a histogram. Read-only; no specializer
@@ -23,7 +23,7 @@ fn sig_key(params: &[temen_ir::ValType], results: &[temen_ir::ValType]) -> Strin
 fn site_sig_key(m: &Module, ty: u32) -> String {
     match &m.types[ty as usize] {
         temen_ir::TypeEntry::Func(f) => sig_key(&f.params, &f.results),
-        other => panic!("call_indirect ty {ty} names a non-Func type entry: {other:?}"),
+        other => panic!("call.dyn ty {ty} names a non-Func type entry: {other:?}"),
     }
 }
 
@@ -40,7 +40,7 @@ fn signature_population(m: &Module) -> BTreeMap<String, usize> {
     pop
 }
 
-/// Every `call_indirect` / `return_call_indirect` site's demanded signature key. One entry per
+/// Every `call.dyn` / `return_call.dyn` site's demanded signature key. One entry per
 /// site (duplicates kept, so a hot signature used at many sites shows its true site count).
 fn indirect_site_sigs(m: &Module) -> Vec<String> {
     let mut sites = Vec::new();
@@ -77,7 +77,7 @@ fn report(name: &str, m: &Module) {
     println!("\n================ {name} ================");
     println!("functions: {n_funcs}");
     println!("distinct signatures: {}", pop.len());
-    println!("call_indirect sites: {}", sites.len());
+    println!("call.dyn sites: {}", sites.len());
     println!("  (sites whose signature matches NO function: {unmatched})");
 
     println!("\nsite fan-out histogram (targets per site -> #sites):");
@@ -147,7 +147,7 @@ fn candidate_spans(m: &Module, cap: usize) -> Vec<usize> {
     spans
 }
 
-/// How many functions contain at least one dynamic-index `call_indirect` site whose signature
+/// How many functions contain at least one dynamic-index `call.dyn` site whose signature
 /// fan-out is within `cap` (i.e. approach A would rewrite it).
 fn functions_with_eligible_site(m: &Module, cap: usize) -> (usize, usize) {
     let pop = signature_population(m);
@@ -174,7 +174,7 @@ fn functions_with_eligible_site(m: &Module, cap: usize) -> (usize, usize) {
 }
 
 /// Approach A on the *real* Lua module: at several caps, rewrite every eligible dynamic
-/// `call_indirect`, re-verify, and report how many sites fire and the code-size cost. This measures
+/// `call.dyn`, re-verify, and report how many sites fire and the code-size cost. This measures
 /// feasibility + blowup on real on-ramp code (the full Futamura *speedup* additionally needs a
 /// program-as-constant harness, which does not exist yet).
 #[test]

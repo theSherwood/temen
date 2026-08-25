@@ -174,9 +174,9 @@ block 0 () {
     assert_eq!(run.outcome, Outcome::Returned(vec![Value::I32(0)]));
 }
 
-// --- F7: runtime name → handle resolution (the guest's `cap.self.resolve`) ------------------------
+// --- F7: runtime name → handle resolution (the guest's `self.resolve`) ------------------------
 //
-// `cap.self.resolve <name_ptr> <name_len> -> i32` resolves a capability **name** to the handle it was
+// `self.resolve <name_ptr> <name_len> -> i32` resolves a capability **name** to the handle it was
 // granted (`-errno` on miss). It confers no authority — it only re-finds a handle the guest already
 // holds — and routes through the generic capability seam (op 2 over the reserved `CAP_SELF_TYPE_ID`),
 // so it works identically on the tree-walker, bytecode engine, and JIT.
@@ -194,7 +194,7 @@ func () -> (i32) {
 block 0 () {
   v0 = i64.const 17000
   v1 = i64.const 5
-  v2 = cap.self.resolve v0 v1
+  v2 = self.resolve v0 v1
   v3 = i64.const 16384
   v4 = i64.const 12
   v5 = call.sym \"write\" (i64, i64) -> (i64) v2 (v3, v4)
@@ -231,7 +231,7 @@ func () -> (i32) {
 block 0 () {
   v0 = i64.const 17000
   v1 = i64.const 4
-  v2 = cap.self.resolve v0 v1
+  v2 = self.resolve v0 v1
   return v2
   }
 }
@@ -250,7 +250,7 @@ fn resolve_unknown_name_is_fail_closed() {
 }
 
 /// The fixed §3e powerbox registers **canonical** names (no named imports needed): the guest
-/// resolves `"exit"` at runtime and invokes the resolved handle through the generic `cap.call`
+/// resolves `"exit"` at runtime and invokes the resolved handle through the generic `call.cap`
 /// seam — proving canonical registration and that resolve returns the real, working capability.
 const CANON_SRC: &str = "\
 memory 15
@@ -260,9 +260,9 @@ func () -> (i32) {
 block 0 () {
   v0 = i64.const 16384
   v1 = i64.const 4
-  v2 = cap.self.resolve v0 v1
+  v2 = self.resolve v0 v1
   v3 = i32.const 7
-  cap.call 1 0 (i32) -> () v2(v3)
+  call.cap 1 0 (i32) -> () v2(v3)
   unreachable
   }
 }
@@ -280,16 +280,16 @@ fn canonical_powerbox_names_resolve_to_working_handles() {
     );
 }
 
-// --- F9: capability labels (the guest's `cap.self.label`, reverse of resolve) ----------------------
+// --- F9: capability labels (the guest's `self.label`, reverse of resolve) ----------------------
 //
-// `cap.self.label <handle> <buf_ptr> <buf_cap> -> i32` writes the handle's human-readable label into
+// `self.label <handle> <buf_ptr> <buf_cap> -> i32` writes the handle's human-readable label into
 // the window and returns its full length (0 if unlabeled). A guest enumerating its handles
-// (`cap.self.count`/`get`) can name each one — for diagnostics / discovery. Cosmetic and
+// (`self.count`/`get`) can name each one — for diagnostics / discovery. Cosmetic and
 // authority-neutral; routes through the generic seam (op 3 over `CAP_SELF_TYPE_ID`), so all three
 // backends agree.
 
 /// The guest resolves its `write` import's handle by name, reads its label (`"write"`, the import
-/// name) into a scratch buffer, and streams it back out — proving `cap.self.label` returns the
+/// name) into a scratch buffer, and streams it back out — proving `self.label` returns the
 /// registered name and the byte-write lands, on the tree-walker, bytecode engine, and JIT.
 const LABEL_SRC: &str = "\
 memory 15
@@ -299,10 +299,10 @@ func () -> (i32) {
 block 0 () {
   v0 = i64.const 16384
   v1 = i64.const 5
-  v2 = cap.self.resolve v0 v1
+  v2 = self.resolve v0 v1
   v3 = i64.const 2048
   v4 = i64.const 64
-  v5 = cap.self.label v2 v3 v4
+  v5 = self.label v2 v3 v4
   v6 = i64.extend_i32_s v5
   v7 = call.sym \"write\" (i64, i64) -> (i64) v2 (v3, v6)
   v8 = i32.const 0
@@ -322,12 +322,12 @@ fn label_a_handle_to_its_registered_name() {
             .unwrap_or_else(|e| panic!("run on {backend:?}: {e}"));
         assert_eq!(
             run.stdout, b"write",
-            "cap.self.label wrote the handle's registered name on {backend:?}"
+            "self.label wrote the handle's registered name on {backend:?}"
         );
     }
 }
 
-/// When the label doesn't fit, `cap.self.label` writes nothing and returns the **full** length, so the
+/// When the label doesn't fit, `self.label` writes nothing and returns the **full** length, so the
 /// guest can retry with a buffer that size. Here `buf_cap = 2 < len(\"write\") = 5`, so the entry
 /// returns 5 (and stdout stays empty — nothing was written).
 const LABEL_SMALL_SRC: &str = "\
@@ -338,10 +338,10 @@ func () -> (i32) {
 block 0 () {
   v0 = i64.const 16384
   v1 = i64.const 5
-  v2 = cap.self.resolve v0 v1
+  v2 = self.resolve v0 v1
   v3 = i64.const 2048
   v4 = i64.const 2
-  v5 = cap.self.label v2 v3 v4
+  v5 = self.label v2 v3 v4
   v6 = i64.const 0
   v7 = call.sym \"write\" (i64, i64) -> (i64) v2 (v3, v6)
   return v5

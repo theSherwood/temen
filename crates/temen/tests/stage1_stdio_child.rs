@@ -8,7 +8,7 @@
 //! "another `argv[0]`". The parent lays a single grant record `{name_off,name_len,handle,flags}`
 //! naming its `stdout` handle, seeds the token into the child's carve, `instantiate_named`s the applet
 //! granting that stdout, `join`s, and returns the applet's status. The applet resolves `"stdout"` by
-//! name (`cap.self.resolve`) and writes the seeded bytes to it. Differential interp==JIT; the output
+//! name (`self.resolve`) and writes the seeded bytes to it. Differential interp==JIT; the output
 //! varies with the seed, proving argv delivery, and both backends write into the same shared sink.
 //!
 //! Gated `#![cfg(unix)]` like the other JIT differential suites (temen-jit's guard page is unix-only).
@@ -92,8 +92,8 @@ block 0 (vinst: i32, vout: i32) {{
   i64.store rra5 rrvz
   rra6 = i64.const 1200
   i64.store rra6 rrv1n
-  vch = cap.call 6 17 (i64) -> (i32) vinst (rra0)
-  r = cap.call 6 1 (i32) -> (i64) vinst (vch)
+  vch = call.cap 6 17 (i64) -> (i32) vinst (rra0)
+  r = call.cap 6 1 (i32) -> (i64) vinst (vch)
   return r
   }}
 }}
@@ -117,10 +117,10 @@ block 0 (vci: i64) {{
   a205 = i64.const 205
   i32.store8 a205 ct
   len6 = i64.const 6
-  hout = cap.self.resolve a200 len6
+  hout = self.resolve a200 len6
   a0 = i64.const 0
   len3 = i64.const 3
-  w = cap.call 0 1 (i64, i64) -> (i64) hout (a0, len3)
+  w = call.cap 0 1 (i64, i64) -> (i64) hout (a0, len3)
   return w
   }}
 }}

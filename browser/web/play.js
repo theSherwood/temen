@@ -21,7 +21,7 @@ const $ = (id) => document.getElementById(id);
 const EXAMPLES = {
   hello: {
     mode: 'io',
-    desc: 'One vCPU cap.call-writes a greeting through the host-I/O powerbox and returns the byte ' +
+    desc: 'One vCPU call.cap-writes a greeting through the host-I/O powerbox and returns the byte ' +
       'count (14). stdout comes back onto the page after the run.',
     src: `memory 16
 data 0 "hello, world!\\n"
@@ -29,7 +29,7 @@ func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = i64.const 14
-  v3 = cap.call 0 1 (i64, i64) -> (i64) v0(v1, v2)
+  v3 = call.cap 0 1 (i64, i64) -> (i64) v0(v1, v2)
   return v3
   }
 }
@@ -115,7 +115,7 @@ block 3 () {
   },
   io: {
     mode: 'io',
-    desc: '8 worker vCPUs (one Web Worker each) all cap.call-write "tick\\n" through the run\'s ONE ' +
+    desc: '8 worker vCPUs (one Web Worker each) all call.cap-write "tick\\n" through the run\'s ONE ' +
       'shared powerbox and bump a shared counter — result 8, stdout "tick\\n" × 8, on every schedule.',
     src: `memory 16
 data 0 "tick\\n"
@@ -173,7 +173,7 @@ block 0 (vsp: i64, vh: i64) {
   vhandle = i32.wrap_i64 vh
   vptr = i64.const 0
   vlen = i64.const 5
-  vw = cap.call 0 1 (i64, i64) -> (i64) vhandle(vptr, vlen)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vhandle(vptr, vlen)
   v1 = i64.const 8
   v2 = i64.const 1
   v3 = i64.atomic.rmw.add v1 v2
@@ -248,11 +248,11 @@ block 0 (vsp: i64, vp: i64) {
   vjit = i32.wrap_i64 vjit64
   vsh = i64.const 32
   vcode = i64.shr_u vp vsh
-  vslot = cap.call 11 3 (i64) -> (i64) vjit (vcode)
+  vslot = call.cap 11 3 (i64) -> (i64) vjit (vcode)
   vslot32 = i32.wrap_i64 vslot
   va = i32.const 6
   vb = i32.const 7
-  vr = call_indirect (i32, i32) -> (i32) vslot32 (va, vb)
+  vr = call.dyn (i32, i32) -> (i32) vslot32 (va, vb)
   vr64 = i64.extend_i32_u vr
   vc8 = i64.const 8
   vold = i64.atomic.rmw.add vc8 vr64
@@ -286,7 +286,7 @@ block 2 (vi2: i64, vinst2: i32) {
   ventry = i64.const 1
   vslog = i64.const 16
   vquota = i64.const 0
-  vh = cap.call 6 0 (i64, i64, i64, i64) -> (i32) vinst2 (ventry, voff, vslog, vquota)
+  vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst2 (ventry, voff, vslog, vquota)
   v4 = i64.const 4
   vholo = i64.mul vi2 v4
   v16 = i64.const 16
@@ -311,7 +311,7 @@ block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v16b = i64.const 16
   vjoff = i64.add v16b vjlo
   vhh = i32.load vjoff
-  vr = cap.call 6 1 (i32) -> (i64) vinst5 (vhh)
+  vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)
   vsn = i64.add vs2 vr
   v1b = i64.const 1
   vjn = i64.add vj2 v1b
@@ -1128,7 +1128,7 @@ write(stdout, greet("the Temen"))
   },
   'Shell (temen-posix — write & run a script)': {
     kind: 'shell',
-    jit: false, // the shell carries Instantiator/SharedRegion cap.calls → bytecode cooperative engine
+    jit: false, // the shell carries Instantiator/SharedRegion call.caps → bytecode cooperative engine
     editable: true,
     lang: 'shell',
     url: './assets/shell.temen',
@@ -1613,10 +1613,10 @@ function shellInterp(bytes, stdinBytes, cmdsBlob) {
 // A card's Run for the shell: fetch the module (+ its PATH registry — the __stage ring runner and any
 // external commands), feed the editor's script as stdin, run it, show the captured stdout. The shell
 // runs on the bytecode cooperative engine (the wasm-safe interpreter tier that lowers its
-// Instantiator/SharedRegion cap.calls), so there is no JIT toggle.
+// Instantiator/SharedRegion call.caps), so there is no JIT toggle.
 async function runShell(c) {
   const ex = c.ex;
-  // The shell carries Instantiator/SharedRegion cap.calls, so it runs on the bytecode cooperative engine
+  // The shell carries Instantiator/SharedRegion call.caps, so it runs on the bytecode cooperative engine
   // (no wasm-JIT tier); the recorder still logs its fetch/run split + cache to the console.
   const rec = runStart(c, { tier: 'interpreter' });
   setState(c, 'running', 'fetching shell…');

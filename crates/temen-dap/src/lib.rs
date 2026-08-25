@@ -1401,7 +1401,7 @@ impl DapServer {
             }
             // Honor conditional breakpoints, like forward `continue`: a breakpoint whose condition is
             // false is not a real stop, so don't treat it as the previous breakpoint. Other stop
-            // reasons (watchpoints, cap.call) always count.
+            // reasons (watchpoints, call.cap) always count.
             let fires = !matches!(reason, StopReason::Breakpoint) || session.condition_holds(pc);
             if fires {
                 prev = Some(t);

@@ -5,7 +5,7 @@
 //! **What it measures and why.** The IoRing retirement (DESIGN.md §12) recorded one known loss:
 //! `submit_async`/`reap` was the only *single-vCPU* compute/host overlap. Fiber-park promotion
 //! (the FIBER_PARK arc) is its replacement: one vCPU resumes `n` fibers, each punting one
-//! blocking `cap.call` (block = 2 ms) — every punt's pool job is dispatched at park time, so all
+//! blocking `call.cap` (block = 2 ms) — every punt's pool job is dispatched at park time, so all
 //! `n` co-reside on the K=4 offload pool and the batch completes in ~ceil(n/K)·2 ms instead of
 //! the serialized n·2 ms. The **root lane** (the same `n` punts made sequentially from the root,
 //! each vCPU-parking alone) is the in-file serialized baseline; the retirement record's anchors
@@ -112,7 +112,7 @@ block 0 (vsp: i64, varg: i64) {{
   vhi = i32.wrap_i64 vh
   vsh = i64.const 16
   vi = i64.shr_u varg vsh
-  vr = cap.call 10 0 (i64) -> (i64) vhi (vi)
+  vr = call.cap 10 0 (i64) -> (i64) vhi (vi)
   return vr
   }}
 }}
@@ -136,7 +136,7 @@ block 1 (vh: i32, vi: i64, vsum: i64) {{
   br_if vlt 2(vh, vi, vsum) 3(vsum)
 }}
 block 2 (vh2: i32, vi2: i64, vsum2: i64) {{
-  vr = cap.call 10 0 (i64) -> (i64) vh2 (vi2)
+  vr = call.cap 10 0 (i64) -> (i64) vh2 (vi2)
   vsum3 = i64.add vsum2 vr
   vone = i64.const 1
   vnext = i64.add vi2 vone

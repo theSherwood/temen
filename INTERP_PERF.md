@@ -642,7 +642,7 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
               `compile_and_run_with_host` is what `run_with_host_fast` now calls. The executor/fiber
               capability variants (`Instantiator`/`Yielder`/`JIT`/`SharedRegion` op 4) are rejected by
               the compiler → tree-walker fallback. Also covers the synchronous §7 reflection ops
-              `cap.self.count` / `cap.self.get` (reuse `host.self_dispatch`). New TDD harness
+              `self.count` / `self.get` (reuse `host.self_dispatch`). New TDD harness
               `bytecode_caps.rs` (hand-authored host-fn modules: sum-args, op-selector, chained,
               in-loop, forged-handle-traps, self-count, self-get) — all bit-identical to
               `run_with_host`; `.expect(Some)` gates that bytecode actually drove it (didn't fall back).

@@ -77,20 +77,20 @@ func 0 () -> () {
 block 0 () {
   vp = i64.const 0
   vl = i64.const 4
-  vh = cap.self.resolve vp vl
+  vh = self.resolve vp vl
   vp1 = i64.const 8
   vp1l = i64.const 2
   vsp = i64.const 16
   vsl = i64.const 1
-  vjob1 = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh (vp1, vp1l, vsp, vsl)
+  vjob1 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vp1, vp1l, vsp, vsl)
   vbuf1 = i64.const 32
   vcap = i64.const 16
-  vn1 = cap.call 13 1 (i64, i64, i64) -> (i64) vh (vjob1, vbuf1, vcap)
+  vn1 = call.cap 13 1 (i64, i64, i64) -> (i64) vh (vjob1, vbuf1, vcap)
   vp2 = i64.const 12
   vp2l = i64.const 2
-  vjob2 = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh (vp2, vp2l, vbuf1, vn1)
+  vjob2 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vp2, vp2l, vbuf1, vn1)
   vbuf2 = i64.const 64
-  vn2 = cap.call 13 1 (i64, i64, i64) -> (i64) vh (vjob2, vbuf2, vcap)
+  vn2 = call.cap 13 1 (i64, i64, i64) -> (i64) vh (vjob2, vbuf2, vcap)
   vw = call.import 0 (vbuf2, vn2)
   vcode = i32.wrap_i64 vn2
   call.import 1 (vcode)
@@ -223,61 +223,61 @@ func 0 () -> () {
 block 0 () {
   vp0 = i64.const 0
   vl0 = i64.const 4
-  vh0 = cap.self.resolve vp0 vl0
+  vh0 = self.resolve vp0 vl0
   va0 = i64.const 8
   vln0 = i64.const 2
   vsp0 = i64.const 24
   vsl0 = i64.const 1
-  vj0 = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh0 (va0, vln0, vsp0, vsl0)
+  vj0 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh0 (va0, vln0, vsp0, vsl0)
   vb0 = i64.const 64
   vc0 = i64.const 32
-  vn0 = cap.call 13 1 (i64, i64, i64) -> (i64) vh0 (vj0, vb0, vc0)
-  vs0 = cap.call 13 3 (i64) -> (i64) vh0 (vj0)
+  vn0 = call.cap 13 1 (i64, i64, i64) -> (i64) vh0 (vj0, vb0, vc0)
+  vs0 = call.cap 13 3 (i64) -> (i64) vh0 (vj0)
   vs0w = i32.wrap_i64 vs0
   br_if vs0w 5(vs0) 1(vn0)
 }
 block 1 (q1: i64) {
   vp1 = i64.const 0
   vl1 = i64.const 4
-  vh1 = cap.self.resolve vp1 vl1
+  vh1 = self.resolve vp1 vl1
   va1 = i64.const 12
   vln1 = i64.const 2
   vsp1 = i64.const 64
-  vj1 = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh1 (va1, vln1, vsp1, q1)
+  vj1 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh1 (va1, vln1, vsp1, q1)
   vb1 = i64.const 128
   vc1 = i64.const 32
-  vn1 = cap.call 13 1 (i64, i64, i64) -> (i64) vh1 (vj1, vb1, vc1)
-  vs1 = cap.call 13 3 (i64) -> (i64) vh1 (vj1)
+  vn1 = call.cap 13 1 (i64, i64, i64) -> (i64) vh1 (vj1, vb1, vc1)
+  vs1 = call.cap 13 3 (i64) -> (i64) vh1 (vj1)
   vs1w = i32.wrap_i64 vs1
   br_if vs1w 5(vs1) 2(vn1)
 }
 block 2 (q2: i64) {
   vp2 = i64.const 0
   vl2 = i64.const 4
-  vh2 = cap.self.resolve vp2 vl2
+  vh2 = self.resolve vp2 vl2
   va2 = i64.const 16
   vln2 = i64.const 2
   vsp2 = i64.const 128
-  vj2 = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh2 (va2, vln2, vsp2, q2)
+  vj2 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh2 (va2, vln2, vsp2, q2)
   vb2 = i64.const 192
   vc2 = i64.const 32
-  vn2 = cap.call 13 1 (i64, i64, i64) -> (i64) vh2 (vj2, vb2, vc2)
-  vs2 = cap.call 13 3 (i64) -> (i64) vh2 (vj2)
+  vn2 = call.cap 13 1 (i64, i64, i64) -> (i64) vh2 (vj2, vb2, vc2)
+  vs2 = call.cap 13 3 (i64) -> (i64) vh2 (vj2)
   vs2w = i32.wrap_i64 vs2
   br_if vs2w 5(vs2) 3(vn2)
 }
 block 3 (q3: i64) {
   vp3 = i64.const 0
   vl3 = i64.const 4
-  vh3 = cap.self.resolve vp3 vl3
+  vh3 = self.resolve vp3 vl3
   va3 = i64.const 20
   vln3 = i64.const 2
   vsp3 = i64.const 192
-  vj3 = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh3 (va3, vln3, vsp3, q3)
+  vj3 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh3 (va3, vln3, vsp3, q3)
   vb3 = i64.const 256
   vc3 = i64.const 32
-  vn3 = cap.call 13 1 (i64, i64, i64) -> (i64) vh3 (vj3, vb3, vc3)
-  vs3 = cap.call 13 3 (i64) -> (i64) vh3 (vj3)
+  vn3 = call.cap 13 1 (i64, i64, i64) -> (i64) vh3 (vj3, vb3, vc3)
+  vs3 = call.cap 13 3 (i64) -> (i64) vh3 (vj3)
   vs3w = i32.wrap_i64 vs3
   br_if vs3w 5(vs3) 4(vn3)
 }
@@ -410,12 +410,12 @@ func 0 () -> () {
 block 0 () {
   vep = i64.const 0
   vel = i64.const 4
-  vh = cap.self.resolve vep vel
+  vh = self.resolve vep vel
   vname = i64.const 8
   vnamelen = i64.const 7
   vzero = i64.const 0
-  vjob = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh (vname, vnamelen, vzero, vzero)
-  vstatus = cap.call 13 3 (i64) -> (i64) vh (vjob)
+  vjob = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vname, vnamelen, vzero, vzero)
+  vstatus = call.cap 13 3 (i64) -> (i64) vh (vjob)
   vcode = i32.wrap_i64 vstatus
   call.import 0 (vcode)
   unreachable
@@ -482,15 +482,15 @@ func 0 () -> (i64) {
 block 0 () {
   vfp = i64.const 0
   vfl = i64.const 2
-  vfs = cap.self.resolve vfp vfl
+  vfs = self.resolve vfp vfl
   vpath = i64.const 4
   vplen = i64.const 3
   vflags = i64.const 18
-  vfd = cap.call 13 0 (i64, i64, i64) -> (i64) vfs (vpath, vplen, vflags)
+  vfd = call.cap 13 0 (i64, i64, i64) -> (i64) vfs (vpath, vplen, vflags)
   vbuf = i64.const 8
   vblen = i64.const 2
-  vn = cap.call 13 2 (i64, i64, i64) -> (i64) vfs (vfd, vbuf, vblen)
-  vcl = cap.call 13 4 (i64) -> (i64) vfs (vfd)
+  vn = call.cap 13 2 (i64, i64, i64) -> (i64) vfs (vfd, vbuf, vblen)
+  vcl = call.cap 13 4 (i64) -> (i64) vfs (vfd)
   vz = i64.const 0
   return vz
   }
@@ -508,16 +508,16 @@ func 0 () -> (i64) {
 block 0 () {
   vfp = i64.const 0
   vfl = i64.const 2
-  vfs = cap.self.resolve vfp vfl
+  vfs = self.resolve vfp vfl
   vpath = i64.const 4
   vplen = i64.const 3
   vflags = i64.const 1
-  vfd = cap.call 13 0 (i64, i64, i64) -> (i64) vfs (vpath, vplen, vflags)
+  vfd = call.cap 13 0 (i64, i64, i64) -> (i64) vfs (vpath, vplen, vflags)
   vbuf = i64.const 64
   vcap = i64.const 32
-  vn = cap.call 13 1 (i64, i64, i64) -> (i64) vfs (vfd, vbuf, vcap)
+  vn = call.cap 13 1 (i64, i64, i64) -> (i64) vfs (vfd, vbuf, vcap)
   vw = call.import 0 (vbuf, vn)
-  vcl = cap.call 13 4 (i64) -> (i64) vfs (vfd)
+  vcl = call.cap 13 4 (i64) -> (i64) vfs (vfd)
   return vn
   }
 }
@@ -536,20 +536,20 @@ func 0 () -> () {
 block 0 () {
   vep = i64.const 0
   vel = i64.const 4
-  vh = cap.self.resolve vep vel
+  vh = self.resolve vep vel
   vgen = i64.const 8
   vgenl = i64.const 3
   vzero = i64.const 0
-  vjg = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh (vgen, vgenl, vzero, vzero)
-  vsg = cap.call 13 3 (i64) -> (i64) vh (vjg)
+  vjg = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vgen, vgenl, vzero, vzero)
+  vsg = call.cap 13 3 (i64) -> (i64) vh (vjg)
   vuse = i64.const 12
   vusel = i64.const 3
-  vju = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh (vuse, vusel, vzero, vzero)
+  vju = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vuse, vusel, vzero, vzero)
   vbuf = i64.const 64
   vcap = i64.const 32
-  vnu = cap.call 13 1 (i64, i64, i64) -> (i64) vh (vju, vbuf, vcap)
+  vnu = call.cap 13 1 (i64, i64, i64) -> (i64) vh (vju, vbuf, vcap)
   vw = call.import 0 (vbuf, vnu)
-  vsu = cap.call 13 3 (i64) -> (i64) vh (vju)
+  vsu = call.cap 13 3 (i64) -> (i64) vh (vju)
   vcode = i32.wrap_i64 vsu
   call.import 1 (vcode)
   unreachable
@@ -592,7 +592,7 @@ fn driver_hands_off_a_file_between_phases_through_a_shared_memfs() {
     }
 }
 
-/// Confinement probe: resolve `"fs"` and return whether it was granted (1) or not (0). `cap.self.resolve`
+/// Confinement probe: resolve `"fs"` and return whether it was granted (1) or not (0). `self.resolve`
 /// yields an i32 handle ≥ 0 on success, negative `-errno` when the name isn't granted.
 const PROBE_PHASE: &str = "\
 memory 16
@@ -601,7 +601,7 @@ func 0 () -> (i32) {
 block 0 () {
   vfp = i64.const 0
   vfl = i64.const 2
-  vfs = cap.self.resolve vfp vfl
+  vfs = self.resolve vfp vfl
   vzero = i32.const 0
   vok = i32.ge_s vfs vzero
   return vok
@@ -620,12 +620,12 @@ func 0 () -> () {
 block 0 () {
   vep = i64.const 0
   vel = i64.const 4
-  vh = cap.self.resolve vep vel
+  vh = self.resolve vep vel
   vname = i64.const 8
   vnamel = i64.const 5
   vzero = i64.const 0
-  vj = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh (vname, vnamel, vzero, vzero)
-  vs = cap.call 13 3 (i64) -> (i64) vh (vj)
+  vj = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vname, vnamel, vzero, vzero)
+  vs = call.cap 13 3 (i64) -> (i64) vh (vj)
   vcode = i32.wrap_i64 vs
   call.import 0 (vcode)
   unreachable

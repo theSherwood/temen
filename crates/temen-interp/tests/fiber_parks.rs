@@ -87,7 +87,7 @@ block 0 (v0: i32) {
   vk = cont.new vf vsp
   vh64 = i64.extend_i32_u v0
   vs1, vv1 = cont.resume vk vh64
-  vc = cap.call 0 2 () -> (i64) v0 ()
+  vc = call.cap 0 2 () -> (i64) v0 ()
   vs2, vv2 = cont.resume vk vh64
   vk1 = i64.const 10000
   vs1e = i64.extend_i32_s vs1
@@ -107,7 +107,7 @@ block 0 (vsp: i64, varg: i64) {
   vh = i32.wrap_i64 varg
   vbuf = i64.const 8
   vcap = i64.const 4
-  vr = cap.call 0 0 (i64, i64) -> (i64) vh (vbuf, vcap)
+  vr = call.cap 0 0 (i64, i64) -> (i64) vh (vbuf, vcap)
   return vr
   }
 }
@@ -303,7 +303,7 @@ fn mix(arg: i64) -> i64 {
 
 /// A punted offloadable dispatch inside a fiber unwinds `FIBER_PARKED` to the resumer (the
 /// slice-5a contract, extended to `Pending`), the pool completion wakes the fiber, and the next
-/// resume delivers the scalar. The fiber calls `cap.call 13 0` (HOST_PROC) with arg 5 on a
+/// resume delivers the scalar. The fiber calls `call.cap 13 0` (HOST_PROC) with arg 5 on a
 /// handler that always punts `arg + 100`; the root records the first resume status (must be the
 /// park, 3) then polls to completion. Composite: s1*10_000 + value = 3*10_000 + 105 = 30_105.
 const PUNT_IN_FIBER: &str = r#"
@@ -335,7 +335,7 @@ func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
   vh = i32.wrap_i64 varg
   vfive = i64.const 5
-  vr = cap.call 13 0 (i64) -> (i64) vh (vfive)
+  vr = call.cap 13 0 (i64) -> (i64) vh (vfive)
   return vr
   }
 }
@@ -365,7 +365,7 @@ fn a_punted_host_call_parks_the_fiber_not_the_vcpu() {
 }
 
 /// **The single-vCPU overlap the IoRing retirement recorded as its known loss** — pinned by
-/// rendezvous, never timing. ONE vCPU, two fibers, each punting one `cap.call 10 0` on a
+/// rendezvous, never timing. ONE vCPU, two fibers, each punting one `call.cap 10 0` on a
 /// rendezvous-2 `Blocking` handle: fiber A's pool job waits at the width-2 barrier until fiber
 /// B's job arrives, which can only happen if A's park freed the vCPU (the pool job is dispatched
 /// at punt time, before the park). Under the pre-F1 degenerate wait, resuming A deadlocks the
@@ -413,7 +413,7 @@ func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
   vh = i32.wrap_i64 varg
   va = i64.const 0
-  vr = cap.call 10 0 (i64) -> (i64) vh (va)
+  vr = call.cap 10 0 (i64) -> (i64) vh (va)
   return vr
   }
 }
@@ -421,7 +421,7 @@ func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
   vh = i32.wrap_i64 varg
   va = i64.const 1
-  vr = cap.call 10 0 (i64) -> (i64) vh (va)
+  vr = call.cap 10 0 (i64) -> (i64) vh (va)
   return vr
   }
 }
@@ -492,7 +492,7 @@ block 2 (ka2: i64, kb2: i64, h2: i64, cnt2: i64, vi2: i64) {
 block 3 (ka4: i64, kb4: i64, h4: i64, cnt4: i64) {
   vh = i32.wrap_i64 h4
   vz4 = i64.const 0
-  vrel = cap.call 13 1 (i64) -> (i64) vh (vz4)
+  vrel = call.cap 13 1 (i64) -> (i64) vh (vz4)
   br 4(ka4, kb4, h4, cnt4)
 }
 block 4 (ka5: i64, kb5: i64, h5: i64, cnt5: i64) {
@@ -521,7 +521,7 @@ func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
   vh = i32.wrap_i64 varg
   va = i64.const 0
-  vr = cap.call 13 0 (i64) -> (i64) vh (va)
+  vr = call.cap 13 0 (i64) -> (i64) vh (va)
   return vr
   }
 }
@@ -529,7 +529,7 @@ func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
   vh = i32.wrap_i64 varg
   va = i64.const 1
-  vr = cap.call 13 0 (i64) -> (i64) vh (va)
+  vr = call.cap 13 0 (i64) -> (i64) vh (va)
   return vr
   }
 }
@@ -559,7 +559,7 @@ func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
   vh = i32.wrap_i64 varg
   vfive = i64.const 5
-  vr = cap.call 13 0 (i64) -> (i64) vh (vfive)
+  vr = call.cap 13 0 (i64) -> (i64) vh (vfive)
   return vr
   }
 }

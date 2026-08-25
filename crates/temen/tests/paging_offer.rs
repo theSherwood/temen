@@ -34,7 +34,7 @@ func 0 () -> () {{
 block 0 () {{
   vp = i64.const 0
   vl = i64.const 2
-  vh = cap.self.resolve vp vl
+  vh = self.resolve vp vl
   ; spawn a demand child via record (op 17): pager = impl export 0 (f16 hi), entry 1
   rrv0 = i64.const 4294967296
   rrv1 = i64.const {carve_off}
@@ -55,7 +55,7 @@ block 0 () {{
   i64.store rra5 rrvz
   rra6 = i64.const 1200
   i64.store rra6 rrvz
-  vch = cap.call 6 17 (i64) -> (i32) vh (rra0)
+  vch = call.cap 6 17 (i64) -> (i32) vh (rra0)
   vs0 = i64.const 0
   br 1(vh, vch, vs0)
 }}
@@ -68,7 +68,7 @@ block 1 (vh1: i32, vch1: i32, vsrv: i64) {{
   br_if vcmp 1(vh1, vch1, vsrv2) 2(vh1, vch1, vsrv2)
 }}
 block 2 (vh2: i32, vch2: i32, vsrvf: i64) {{
-  vj = cap.call 6 1 (i32) -> (i64) vh2 (vch2)
+  vj = call.cap 6 1 (i32) -> (i64) vh2 (vch2)
   vk = i64.const 1000
   vm = i64.mul vsrvf vk
   vt = i64.add vj vm

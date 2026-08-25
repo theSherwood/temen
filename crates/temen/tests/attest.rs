@@ -1,22 +1,22 @@
-//! PROCESS.md §6 — `cap.self.attest`: the non-interposable **trust anchor**. A domain reads its own
+//! PROCESS.md §6 — `self.attest`: the non-interposable **trust anchor**. A domain reads its own
 //! platform-vouched provenance (isolation tier + whether an ancestor can read/snapshot it) as a packed
 //! `i32` — `tier | (window_exposed << 8) | (freeze_exposed << 9)`. Being a D46 `cap.self` intrinsic
 //! (runtime-resolved, never a handle), no nested host can interpose and forge it.
 //!
-//! `attest` routes through the same `Host::self_dispatch` on every backend (like `cap.self.count`), so
+//! `attest` routes through the same `Host::self_dispatch` on every backend (like `self.count`), so
 //! the **root** report is a cross-backend differential. A §14 nested child's report (window-exposed)
-//! is interpreter-first: a plain JIT child has an empty powerbox, so `cap.self.*` there is a follow-up.
+//! is interpreter-first: a plain JIT child has an empty powerbox, so `self.*` there is a follow-up.
 
 use temen_interp::{run_capture_reserved_with_host, Attestation, Host, Value};
 use temen_jit::{compile_and_run_capture_reserved_with_host, JitOutcome};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
-/// func 0 `(i32) -> (i64)` (arg ignored): return `cap.self.attest` zero-extended to `i64`.
+/// func 0 `(i32) -> (i64)` (arg ignored): return `self.attest` zero-extended to `i64`.
 const ATTEST_SELF: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (v0: i32) {\n\
-  va = cap.self.attest\n\
+  va = self.attest\n\
   vr = i64.extend_i32_u va\n\
   return vr\n\
   }\n\
@@ -129,9 +129,9 @@ block 0 (vinst: i32) {\n\
   i64.store q0a5 q0v1\n\
   q0a6 = i64.const 4144\n\
   i64.store q0a6 q0v1\n\
-  vch = cap.call 6 17 (i64) -> (i32) vinst (q0a0)\n\
-  vcr = cap.call 6 1 (i32) -> (i64) vinst (vch)\n\
-  vpa = cap.self.attest\n\
+  vch = call.cap 6 17 (i64) -> (i32) vinst (q0a0)\n\
+  vcr = call.cap 6 1 (i32) -> (i64) vinst (vch)\n\
+  vpa = self.attest\n\
   vpa64 = i64.extend_i32_u vpa\n\
   vk = i64.const 1000\n\
   vt = i64.mul vcr vk\n\
@@ -141,7 +141,7 @@ block 0 (vinst: i32) {\n\
 }\n\
 func (i64) -> (i64) {\n\
 block 0 (vci: i64) {\n\
-  va = cap.self.attest\n\
+  va = self.attest\n\
   vr = i64.extend_i32_u va\n\
   return vr\n\
   }\n\

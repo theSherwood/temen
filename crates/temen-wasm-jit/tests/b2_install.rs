@@ -1,5 +1,5 @@
 //! **§22 Model B2 on the wasm-JIT tier** — an `install`ed unit becomes a funcref that *another*
-//! instance's `call_indirect` reaches, through one **shared reserved funcref table** (`DESIGN.md`
+//! instance's `call.dyn` reaches, through one **shared reserved funcref table** (`DESIGN.md`
 //! §22, BROWSER.md "wasm-JIT tier"). This is the old→new cross-instance direction the local
 //! per-module table cannot express.
 //!
@@ -7,7 +7,7 @@
 //! `env.__indirect_function_table` (sized to the domain reservation `1<<log2`) instead of declaring
 //! its own, and populates nothing — the **host** writes every slot via `table.set`, exactly as the
 //! interpreter's `DomainTable` is host-populated (`DomainTable::new` + `install`). So here the host
-//! plays the domain: it emits a *caller* (whose `call_indirect` masks into the shared table) and a
+//! plays the domain: it emits a *caller* (whose `call.dyn` masks into the shared table) and a
 //! *callee unit*, `table.set`s the callee's exported func into a reserved slot, then invokes the
 //! caller — whose indirect call must land in the callee.
 //!
@@ -37,7 +37,7 @@ fn parse(src: &str) -> temen_ir::Module {
 }
 
 /// The installed unit: `() -> (i32)` returning a constant. Its emitted `f0` has the env-prepended
-/// wasm signature `(win:i32, env:i32) -> (i32)` — identical to what the caller's `call_indirect`
+/// wasm signature `(win:i32, env:i32) -> (i32)` — identical to what the caller's `call.dyn`
 /// `() -> (i32)` declares, so wasm's signature check (= the §3c type-id check) accepts it.
 const CALLEE_I32: &str = r#"memory 16
 func () -> (i32) {
@@ -58,32 +58,32 @@ block 0 () {
 }
 "#;
 
-/// The caller (old code): takes a slot index and `call_indirect`s it with the callee's `() -> (i32)`
+/// The caller (old code): takes a slot index and `call.dyn`s it with the callee's `() -> (i32)`
 /// signature. The emitter masks the index `& (1<<LOG2 - 1)` into the shared table.
 const CALLER: &str = r#"memory 16
 func (i32) -> (i32) {
 block 0 (vslot: i32) {
-  vr = call_indirect () -> (i32) vslot ()
+  vr = call.dyn () -> (i32) vslot ()
   return vr
   }
 }
 "#;
 
-/// A **middle** installed unit that is *itself* a `call_indirect` caller: `() -> (i32)` that dispatches
+/// A **middle** installed unit that is *itself* a `call.dyn` caller: `() -> (i32)` that dispatches
 /// the constant inner slot 5. Installed at another slot, it proves a new→new chain — an installed unit
 /// reaching a second installed unit through the same shared table. It imports the shared table (B2).
 const MIDDLE_TO_SLOT5: &str = r#"memory 16
 func () -> (i32) {
 block 0 () {
   vinner = i32.const 5
-  vr = call_indirect () -> (i32) vinner ()
+  vr = call.dyn () -> (i32) vinner ()
   return vr
   }
 }
 "#;
 
 /// One unit the host installs into the shared table before the top-level dispatch: its source and the
-/// reserved slot it goes into. A unit with its own `call_indirect` must be emitted in B2 mode (so it
+/// reserved slot it goes into. A unit with its own `call.dyn` must be emitted in B2 mode (so it
 /// imports the shared table); a leaf (no indirect call) is a plain whole-module emit.
 struct Install<'a> {
     src: &'a str,
@@ -157,7 +157,7 @@ fn b2_run(installs: &[Install], clear: &[u32], slot_arg: i32) -> Result<i32, ()>
     }
 
     // `uninstall`: the host nulls the slot back to trapping padding (a later `install` may reuse it;
-    // a stale `call_indirect` to it now traps — DESIGN.md §22).
+    // a stale `call.dyn` to it now traps — DESIGN.md §22).
     for &slot in clear {
         table
             .set(&mut store, slot as u64, Val::FuncRef(FuncRef::null()))
@@ -185,7 +185,7 @@ fn b2_run(installs: &[Install], clear: &[u32], slot_arg: i32) -> Result<i32, ()>
 
 /// Install one leaf unit at `slot` and dispatch `slot_arg` through the top caller.
 fn b2_dispatch(callee_src: &str, slot: u32, slot_arg: i32) -> Result<i32, ()> {
-    // A leaf callee (no `call_indirect`) needs no table import.
+    // A leaf callee (no `call.dyn`) needs no table import.
     b2_run(
         &[Install {
             src: callee_src,
@@ -210,7 +210,7 @@ fn oracle_i32(src: &str) -> i32 {
     }
 }
 
-/// old→new: a `call_indirect` from one instance dispatches to an `install`ed unit in the shared
+/// old→new: a `call.dyn` from one instance dispatches to an `install`ed unit in the shared
 /// table, returning exactly what the interpreter returns for that unit.
 #[test]
 fn b2_dispatch_matches_interp() {
@@ -242,7 +242,7 @@ fn b2_dispatch_masks_to_reserved_size() {
     );
 }
 
-/// new→new: an installed unit `call_indirect`s a *second* installed unit through the same shared
+/// new→new: an installed unit `call.dyn`s a *second* installed unit through the same shared
 /// table (a 2-hop chain top → middle@6 → callee@5), landing at the interpreter's value. This is the
 /// transitivity B2 rests on — every hop dispatches through one host-populated table.
 #[test]
@@ -268,7 +268,7 @@ fn b2_chained_install_dispatch_matches_interp() {
     );
 }
 
-/// Fail-closed: a `call_indirect` to an empty (never-installed) reserved slot traps, as
+/// Fail-closed: a `call.dyn` to an empty (never-installed) reserved slot traps, as
 /// `dispatch_indirect` traps on `TABLE_EMPTY`.
 #[test]
 fn b2_empty_slot_traps() {
@@ -281,7 +281,7 @@ fn b2_empty_slot_traps() {
 }
 
 /// Fail-closed: dispatching a slot whose installed unit has the *wrong* signature traps — wasm's
-/// call_indirect signature check is the §3c type-id check.
+/// call.dyn signature check is the §3c type-id check.
 #[test]
 fn b2_type_mismatch_traps() {
     // Install an `() -> (i64)` unit at slot 5; the caller declares `() -> (i32)`.
@@ -293,7 +293,7 @@ fn b2_type_mismatch_traps() {
 }
 
 /// `uninstall`: after a unit is installed and dispatchable, nulling its slot makes a stale
-/// `call_indirect` to it trap (DESIGN.md §22 — "clear an installed slot; stale calls trap"), while a
+/// `call.dyn` to it trap (DESIGN.md §22 — "clear an installed slot; stale calls trap"), while a
 /// *different* still-installed slot keeps dispatching. Proves the slot is reusable/clearable, not
 /// merely append-only.
 #[test]
@@ -320,7 +320,7 @@ fn b2_uninstall_makes_stale_call_trap() {
 
 /// **The confinement mask as its own unit** (INVARIANTS.md §4). Install a distinct unit in *every*
 /// reserved slot — each returns its own slot index — then sweep indices across (and past) the table:
-/// a `call_indirect idx` must land in slot `idx & (size - 1)` for every index, i.e. the emitted mask
+/// a `call.dyn idx` must land in slot `idx & (size - 1)` for every index, i.e. the emitted mask
 /// is exactly `dispatch_indirect`'s and can never address outside `[0, size)`. Over-range indices
 /// (`idx ≥ size`, up to `4·size`) prove the wrap; this is the security hinge the whole tier rests on.
 #[test]
@@ -343,7 +343,7 @@ fn b2_mask_confines_every_index_to_reserved_table() {
         assert_eq!(
             b2_run(&installs, &[], idx as i32),
             Ok(want),
-            "call_indirect {idx} must land in slot {want} (mask idx & {})",
+            "call.dyn {idx} must land in slot {want} (mask idx & {})",
             size - 1
         );
     }

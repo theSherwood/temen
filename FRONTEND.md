@@ -169,7 +169,7 @@ real SSA value threaded as a block parameter of every block, exactly like the da
   dispatches through the module's **import manifest** (`call.import` with a dummy handle
   operand; the slot binding installed at instantiation carries the granted handle), so the
   usual `_start` has no capability prologue. Only a program on the `cap_mask` reflection
-  surface (`__vm_cap` etc.) still gets a `cap.self.resolve` prologue caching handles in the
+  surface (`__vm_cap` etc.) still gets a `self.resolve` prologue caching handles in the
   reserved low window bytes — a private guest cache, not a guest/host contract. `_start` then
   calls `main` with the initial data-SP baked to `data_end` (the end of globals/BSS), so
   `&local` (= `sp + offset`) is never `NULL`.

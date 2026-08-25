@@ -78,7 +78,7 @@ const WINDOW: usize = 1 << WINDOW_LOG2;
 fn jit_durable_fiber_switch_routes_shadow_sp_per_context() {
     // Same module as the interpreter's `durable_fiber_switch_routes_shadow_sp_per_context`: root
     // (v0 = host-fn handle) probes, creates+resumes fiber A, creates+resumes fiber B, probes again.
-    // Each fiber probes via a cap.call whose handle arrives (as i64) in the resume arg.
+    // Each fiber probes via a call.cap whose handle arrives (as i64) in the resume arg.
     // §12.8 4A.5: each probe passes `durable.shadow_base` (the active context's own region base, from
     // the runtime-private register) to the host fn, which records it — directly exercising per-context
     // routing (vs. the legacy single swapped `SHADOW_SP_OFF` word, now retired).
@@ -86,7 +86,7 @@ fn jit_durable_fiber_switch_routes_shadow_sp_per_context() {
         func (i32) -> (i64) {\n\
         block 0 (v0: i32) {\n\
         \x20 v1 = durable.shadow_base\n\
-        \x20 v2 = cap.call 13 0 (i64) -> (i64) v0 (v1)\n\
+        \x20 v2 = call.cap 13 0 (i64) -> (i64) v0 (v1)\n\
         \x20 v3 = ref.func 1\n\
         \x20 v4 = i64.const 4096\n\
         \x20 v5 = cont.new v3 v4\n\
@@ -96,7 +96,7 @@ fn jit_durable_fiber_switch_routes_shadow_sp_per_context() {
         \x20 v10 = cont.new v3 v9\n\
         \x20 v11, v12 = cont.resume v10 v6\n\
         \x20 v13 = durable.shadow_base\n\
-        \x20 v14 = cap.call 13 0 (i64) -> (i64) v0 (v13)\n\
+        \x20 v14 = call.cap 13 0 (i64) -> (i64) v0 (v13)\n\
         \x20 return v2\n\
           }\n\
         }\n\
@@ -104,7 +104,7 @@ fn jit_durable_fiber_switch_routes_shadow_sp_per_context() {
         block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = i32.wrap_i64 v1\n\
         \x20 v3 = durable.shadow_base\n\
-        \x20 v4 = cap.call 13 0 (i64) -> (i64) v2 (v3)\n\
+        \x20 v4 = call.cap 13 0 (i64) -> (i64) v2 (v3)\n\
         \x20 v5 = suspend v4\n\
         \x20 return v5\n\
           }\n\
@@ -379,7 +379,7 @@ fn interp_frozen_fiber_artifact_thaws_on_the_jit() {
 }
 
 /// Phase-3 slice 3.2 (active-resume-chain, cross-backend): an **interpreter-frozen** fiber that was
-/// *running* (mid-`cap.call`), not idle, at freeze — restored through the §12 codec and **thawed on
+/// *running* (mid-`call.cap`), not idle, at freeze — restored through the §12 codec and **thawed on
 /// the JIT**. The JIT must re-seed the active-chain fiber and re-enter it so it rewinds at its leaf
 /// point and runs *forward*, **reloading** the saved clock value (47) rather than re-issuing the
 /// clock against the JIT thaw host's advanced clock. The clock handle reaches the fiber via guest
@@ -404,7 +404,7 @@ fn interp_frozen_active_chain_fiber_thaws_on_the_jit() {
         \x20 v2 = i64.const 65536\n\
         \x20 v3 = i32.load v2\n\
         \x20 v4 = i32.const 0\n\
-        \x20 v5 = cap.call 2 0 (i32) -> (i64) v3 (v4)\n\
+        \x20 v5 = call.cap 2 0 (i32) -> (i64) v3 (v4)\n\
         \x20 v6 = i64.const 5\n\
         \x20 v7 = i64.add v5 v6\n\
         \x20 return v7\n\

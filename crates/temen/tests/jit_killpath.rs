@@ -90,7 +90,7 @@ fn jit_with_watchdog(src: &str, delay: Duration) -> JitOutcome {
         wd.store(1, Ordering::SeqCst); // request the kill
     });
 
-    // The guest makes no `cap.call`, so the thunk is never invoked — a null ctx is never read.
+    // The guest makes no `call.cap`, so the thunk is never invoked — a null ctx is never read.
     let outcome = compile_and_run_with_host_interruptible(
         &m,
         0,
@@ -218,8 +218,8 @@ block 0 (v0: i32) {
   i64.store q0a5 q0v1
   q0a6 = i64.const 65584
   i64.store q0a6 q0v1
-  v5 = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
-  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
   return v6
   }
 }

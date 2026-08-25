@@ -106,7 +106,7 @@ block 0 (varg: i64) {
   vh = i32.wrap_i64 varg
   vbuf = i64.const 8
   vcap = i64.const 4
-  vr = cap.call 0 0 (i64, i64) -> (i64) vh (vbuf, vcap)
+  vr = call.cap 0 0 (i64, i64) -> (i64) vh (vbuf, vcap)
   return vr
   }
 }
@@ -114,7 +114,7 @@ block 0 (varg: i64) {
 func (i64) -> (i64) {
 block 0 (varg: i64) {
   vh = i32.wrap_i64 varg
-  vc = cap.call 0 2 () -> (i64) vh ()
+  vc = call.cap 0 2 () -> (i64) vh ()
   return vc
   }
 }
@@ -304,7 +304,7 @@ func (i64) -> (i64) {
 block 0 (varg: i64) {
   vh = i32.wrap_i64 varg
   vz = i64.const 0
-  vr = cap.call 13 0 (i64) -> (i64) vh (vz)
+  vr = call.cap 13 0 (i64) -> (i64) vh (vz)
   return vr
   }
 }
@@ -320,7 +320,7 @@ func (i64) -> (i64) {
 block 0 (varg: i64) {
   vh = i32.wrap_i64 varg
   vz = i64.const 0
-  vr = cap.call 13 1 (i64) -> (i64) vh (vz)
+  vr = call.cap 13 1 (i64) -> (i64) vh (vz)
   return vr
   }
 }

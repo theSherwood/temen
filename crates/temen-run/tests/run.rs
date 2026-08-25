@@ -412,7 +412,7 @@ fn demo_regex_matches_native() {
 /// that grows the window into the reserved tail via `__vm_map` on demand. Allocates 1 MiB (~16× the
 /// initial window) in eight blocks, sums them, and prints the totals — byte-identical to a native
 /// `cc` build (which uses the real `malloc`). Exercises the powerbox Memory grant → `__vm_map`
-/// builtin → `cap.call` → `mprotect` growth → masked tail access, the §1a sparse-address-space win.
+/// builtin → `call.cap` → `mprotect` growth → masked tail access, the §1a sparse-address-space win.
 #[test]
 fn demo_heapgrow_matches_native() {
     assert_demo_matches_cc("heapgrow/heapgrow.c");
@@ -582,7 +582,7 @@ fn deadline_does_not_delay_fast_guest() {
 /// `AddressSpace` slot, §14), maps it at two window offsets, and aliases through it — pinning that
 /// `run_powerbox` binds the AddressSpace *and* installs the OS-shared-memory factory so a stock
 /// embedded guest can build the zero-copy data plane (the same capability `<temen.h>` exposes to C).
-/// The region handle `create` returns is a **real** runtime-minted handle the `cap.call`s use
+/// The region handle `create` returns is a **real** runtime-minted handle the `call.cap`s use
 /// (§2.3: SharedRegion is dynamic-mode, never a manifest slot). Host-granularity-agnostic: it
 /// queries `region_page_size` (op 3) and works in whole granules.
 #[test]
@@ -596,11 +596,11 @@ fn powerbox_region_minting_round_trips() {
          \x20 v1 = i64.const 65536\n\
          \x20 v2 = call.sym \"vm_region_create\" (i64) -> (i64) v0(v1)\n\
          \x20 v3 = i32.wrap_i64 v2\n\
-         \x20 v4 = cap.call 4 3 () -> (i64) v3()\n\
+         \x20 v4 = call.cap 4 3 () -> (i64) v3()\n\
          \x20 v5 = i64.const 0\n\
          \x20 v6 = i32.const 3\n\
-         \x20 v7 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v3(v5, v5, v4, v6)\n\
-         \x20 v8 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v3(v4, v5, v4, v6)\n\
+         \x20 v7 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v3(v5, v5, v4, v6)\n\
+         \x20 v8 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v3(v4, v5, v4, v6)\n\
          \x20 v9 = i32.const 123\n\
          \x20 i32.store8 v5 v9\n\
          \x20 v10 = i32.load8_u v4\n\
@@ -812,7 +812,7 @@ fn quota_contains_a_powerbox_thread_bomb() {
 
 #[test]
 fn manifest_imports_run_like_inline_capcalls() {
-    // The same effects as an inline-`cap.call` program, but the capabilities are reached by NAME
+    // The same effects as an inline-`call.cap` program, but the capabilities are reached by NAME
     // (`write`, `exit`) through the manifest: a paramless `_start` (func 0, exported — the phase-4
     // powerbox-entry marker) whose `call.import`s dispatch through slots bound at instantiation
     // under the reference policy (`default_cap_resolver`). The handle operands are vestigial
@@ -840,9 +840,9 @@ fn manifest_imports_run_like_inline_capcalls() {
         "paramless exported `_start` is the powerbox-entry shape"
     );
 
-    // Its inline-`cap.call` twin: the same paramless `_start`, reaching stdout/exit through
-    // handles resolved from the fixed powerbox's canonical name directory (`cap.self.resolve`)
-    // and invoked with inline `cap.call 0 1` / `1 0` instead of manifest slots.
+    // Its inline-`call.cap` twin: the same paramless `_start`, reaching stdout/exit through
+    // handles resolved from the fixed powerbox's canonical name directory (`self.resolve`)
+    // and invoked with inline `call.cap 0 1` / `1 0` instead of manifest slots.
     let inline = load(
         "memory 16\n\
         data 16 \"hi\\n\"\n\
@@ -853,22 +853,22 @@ fn manifest_imports_run_like_inline_capcalls() {
         block 0 () {\n\
         \x20 v0 = i64.const 32\n\
         \x20 v1 = i64.const 6\n\
-        \x20 v2 = cap.self.resolve v0 v1\n\
+        \x20 v2 = self.resolve v0 v1\n\
         \x20 v3 = i64.const 16\n\
         \x20 v4 = i64.const 3\n\
-        \x20 v5 = cap.call 0 1 (i64, i64) -> (i64) v2(v3, v4)\n\
+        \x20 v5 = call.cap 0 1 (i64, i64) -> (i64) v2(v3, v4)\n\
         \x20 v6 = i64.const 40\n\
         \x20 v7 = i64.const 4\n\
-        \x20 v8 = cap.self.resolve v6 v7\n\
+        \x20 v8 = self.resolve v6 v7\n\
         \x20 v9 = i32.const 0\n\
-        \x20 cap.call 1 0 (i32) -> () v8(v9)\n\
+        \x20 call.cap 1 0 (i32) -> () v8(v9)\n\
         \x20 unreachable\n\
           }\n\
         }\n",
     );
 
     // Both run through `run_powerbox` and agree exactly — the manifest slot binding IS the same
-    // dispatch the inline cap.calls perform.
+    // dispatch the inline call.cap calls perform.
     let named_run = run_powerbox(&m, b"").expect("run manifest module");
     let inline_run = run_powerbox(&inline, b"").expect("run inline twin");
     assert_eq!(named_run.stdout, b"hi\n", "write import produced stdout");

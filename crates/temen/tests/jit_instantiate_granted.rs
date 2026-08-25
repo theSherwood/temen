@@ -65,8 +65,8 @@ block 0 (vinst: i32, vstream: i32) {\n\
   i64.store rra5 rrgp\n\
   rra6 = i64.const 4208\n\
   i64.store rra6 rrgn\n\
-  vch = cap.call 6 17 (i64) -> (i32) vinst (rra0)\n\
-  vres = cap.call 6 1 (i32) -> (i64) vinst (vch)\n\
+  vch = call.cap 6 17 (i64) -> (i32) vinst (rra0)\n\
+  vres = call.cap 6 1 (i32) -> (i64) vinst (vch)\n\
   return vres\n\
   }\n\
 }\n\
@@ -85,10 +85,10 @@ block 0 (vcinst: i64, vcas: i64) {\n\
   vnp = i64.const 512\n\
   i32.store8 vnp vg\n\
   vnl = i64.const 1\n\
-  vsh = cap.self.resolve vnp vnl\n\
+  vsh = self.resolve vnp vnl\n\
   vptr = i64.const 0\n\
   vlen = i64.const 3\n\
-  vw = cap.call 0 1 (i64, i64) -> (i64) vsh (vptr, vlen)\n\
+  vw = call.cap 0 1 (i64, i64) -> (i64) vsh (vptr, vlen)\n\
   v7 = i64.const 7\n\
   return v7\n\
   }\n\

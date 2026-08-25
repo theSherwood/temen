@@ -65,7 +65,7 @@ func 0 () -> () {{
 block 0 () {{
   vp = i64.const 0
   vl = i64.const 2
-  vh = cap.self.resolve vp vl
+  vh = self.resolve vp vl
   vf0 = i64.const {f0}
   vf8 = i64.const 65536
   vf16 = i64.const {f16}
@@ -75,8 +75,8 @@ block 0 () {{
   vf48 = i64.const 0
 {stores}
   vrp = i64.const 1024
-  vch = cap.call 6 17 (i64) -> (i32) vh (vrp)
-  vj = cap.call 6 1 (i32) -> (i64) vh (vch)
+  vch = call.cap 6 17 (i64) -> (i32) vh (vrp)
+  vj = call.cap 6 1 (i32) -> (i64) vh (vch)
   vc = i32.wrap_i64 vj
   call.import 0 (vc)
   unreachable
@@ -107,13 +107,13 @@ func 0 () -> () {
 block 0 () {
   vp = i64.const 0
   vl = i64.const 2
-  vh = cap.self.resolve vp vl
+  vh = self.resolve vp vl
   ventry = i64.const 1
   voff = i64.const 65536
   vsl = i64.const 16
   vq = i64.const 0
-  vch = cap.call 6 0 (i64, i64, i64, i64) -> (i32) vh (ventry, voff, vsl, vq)
-  vj = cap.call 6 1 (i32) -> (i64) vh (vch)
+  vch = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vh (ventry, voff, vsl, vq)
+  vj = call.cap 6 1 (i32) -> (i64) vh (vch)
   vc = i32.wrap_i64 vj
   call.import 0 (vc)
   unreachable
@@ -147,7 +147,7 @@ func 0 () -> () {{
 block 0 () {{
   vp = i64.const 0
   vl = i64.const 2
-  vh = cap.self.resolve vp vl
+  vh = self.resolve vp vl
   vf0 = i64.const {f0}
   vf8 = i64.const 65536
   vf16 = i64.const {f16}
@@ -157,10 +157,10 @@ block 0 () {{
   vf48 = i64.const 0
 {stores}
   vrp = i64.const 1024
-  vch = cap.call 6 17 (i64) -> (i32) vh (vrp)
+  vch = call.cap 6 17 (i64) -> (i32) vh (vrp)
   vz = i32.const 0
   vs = svc.wait vz
-  vj = cap.call 6 1 (i32) -> (i64) vh (vch)
+  vj = call.cap 6 1 (i32) -> (i64) vh (vch)
   vk = i64.const 1000
   vm2 = i64.mul vs vk
   vt = i64.add vj vm2
@@ -292,8 +292,8 @@ block 0 (vh: i32, vmod: i32) {{
   vf48 = i64.const 0
 {stores}
   vrp = i64.const 1024
-  vch = cap.call 6 17 (i64) -> (i32) vh (vrp)
-  vj = cap.call 6 1 (i32) -> (i64) vh (vch)
+  vch = call.cap 6 17 (i64) -> (i32) vh (vrp)
+  vj = call.cap 6 1 (i32) -> (i64) vh (vch)
   return vj
   }}
 }}
@@ -312,8 +312,8 @@ block 0 (vh: i32, vmod: i32) {
   voff = i64.const 65536
   vsl = i64.const 16
   vq = i64.const 0
-  vch = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) vh (vm64, ventry, voff, vsl, vq)
-  vj = cap.call 6 1 (i32) -> (i64) vh (vch)
+  vch = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) vh (vm64, ventry, voff, vsl, vq)
+  vj = call.cap 6 1 (i32) -> (i64) vh (vch)
   return vj
   }
 }
@@ -418,8 +418,8 @@ block 0 (vinst: i32, vout: i32, verr: i32) {{
   vf48 = i64.const 2
 {stores}
   vrp = i64.const 1024
-  vch = cap.call 6 17 (i64) -> (i32) vinst (vrp)
-  r = cap.call 6 1 (i32) -> (i64) vinst (vch)
+  vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  r = call.cap 6 1 (i32) -> (i64) vinst (vch)
   return r
   }}
 }}
@@ -445,12 +445,12 @@ block 0 (v0: i64) {{
   a5 = i64.const 5
   i32.store8 a5 ct
   len6 = i64.const 6
-  hout = cap.self.resolve a0 len6
+  hout = self.resolve a0 len6
   a16 = i64.const 16
   cO = i32.const 79
   i32.store8 a16 cO
   one = i64.const 1
-  wo = cap.call 0 1 (i64, i64) -> (i64) hout (a16, one)
+  wo = call.cap 0 1 (i64, i64) -> (i64) hout (a16, one)
   a32 = i64.const 32
   i32.store8 a32 cs
   a33 = i64.const 33
@@ -463,11 +463,11 @@ block 0 (v0: i64) {{
   i32.store8 a36 cr
   a37 = i64.const 37
   i32.store8 a37 cr
-  herr = cap.self.resolve a32 len6
+  herr = self.resolve a32 len6
   a40 = i64.const 40
   cE = i32.const 69
   i32.store8 a40 cE
-  we = cap.call 0 1 (i64, i64) -> (i64) herr (a40, one)
+  we = call.cap 0 1 (i64, i64) -> (i64) herr (a40, one)
   v7 = i64.const 7
   return v7
   }}
@@ -530,17 +530,17 @@ block 0 (vinst: i32, vbud: i32) {{
   vf48 = i64.const 0
 {stores}
   vrp = i64.const 1024
-  vch = cap.call 6 17 (i64) -> (i32) vinst (vrp)
+  vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
   vzero = i32.const 0
   visneg = i32.lt_s vch vzero
   br_if visneg 2(vbud) 1(vinst, vbud, vch)
 }}
 block 1 (vinst1: i32, vbud1: i32, vch1: i32) {{
-  vj = cap.call 6 1 (i32) -> (i64) vinst1 (vch1)
+  vj = call.cap 6 1 (i32) -> (i64) vinst1 (vch1)
   fld0 = i64.const 0
   fld1 = i64.const 1
-  vfr = cap.call 14 1 (i64) -> (i64) vbud1 (fld0)
-  vmr = cap.call 14 1 (i64) -> (i64) vbud1 (fld1)
+  vfr = call.cap 14 1 (i64) -> (i64) vbud1 (fld0)
+  vmr = call.cap 14 1 (i64) -> (i64) vbud1 (fld1)
   k = i64.const 1000
   t0 = i64.mul vj k
   t1 = i64.add t0 vfr
@@ -550,8 +550,8 @@ block 1 (vinst1: i32, vbud1: i32, vch1: i32) {{
 block 2 (vbud2: i32) {{
   fld0 = i64.const 0
   fld1 = i64.const 1
-  vfr = cap.call 14 1 (i64) -> (i64) vbud2 (fld0)
-  vmr = cap.call 14 1 (i64) -> (i64) vbud2 (fld1)
+  vfr = call.cap 14 1 (i64) -> (i64) vbud2 (fld0)
+  vmr = call.cap 14 1 (i64) -> (i64) vbud2 (fld1)
   k = i64.const 100000
   t0 = i64.mul vfr k
   t1 = i64.add t0 vmr
@@ -660,10 +660,10 @@ func 0 () -> () {{
 block 0 () {{
   vp = i64.const 0
   vl = i64.const 2
-  vh = cap.self.resolve vp vl
+  vh = self.resolve vp vl
   vbp = i64.const 8
   vbl = i64.const 3
-  vbud = cap.self.resolve vbp vbl
+  vbud = self.resolve vbp vbl
   vf0 = i64.const {f0}
   vf8 = i64.const 65536
   vf16 = i64.const {f16}
@@ -679,13 +679,13 @@ block 0 () {{
   vf48 = i64.const 0
 {stores}
   vrp = i64.const 1024
-  vch = cap.call 6 17 (i64) -> (i32) vh (vrp)
+  vch = call.cap 6 17 (i64) -> (i32) vh (vrp)
   vzero = i32.const 0
   visneg = i32.lt_s vch vzero
   br_if visneg 2(vch) 1(vh, vch)
 }}
 block 1 (vh1: i32, vch1: i32) {{
-  vj = cap.call 6 1 (i32) -> (i64) vh1 (vch1)
+  vj = call.cap 6 1 (i32) -> (i64) vh1 (vch1)
   vc = i32.wrap_i64 vj
   call.import 0 (vc)
   unreachable

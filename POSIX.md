@@ -40,7 +40,7 @@ The WASI shim (the `wasi_named_imports` test) is the working template (a 2-op WA
    any unresolved symbol).
 2. At **load**, `temen_ir::resolve_imports` (driven by `temen_run::resolve_capability_imports`)
    binds each name to a `(type_id, op)` on a capability handle and lowers `CallImport` →
-   `cap.call`. `temen_posix::resolve(name)` supplies the name → `(HOST_FN, op)` map.
+   `call.cap`. `temen_posix::resolve(name)` supplies the name → `(HOST_FN, op)` map.
 3. A `HostFn` handler implements each op **host-side**, reading/writing the guest window
    through the masked `GuestMem`. All names share **one** `HOST_FN` handle; the op number
    distinguishes the call (temen-wasm/chibicc thread a single capability handle).
@@ -222,7 +222,7 @@ UDP (`sendto`/`recvfrom` on the memnet) is a follow-up slice on the same cap.
    differential interp↔JIT (`temen-posix` tests). Proves the arena-in-window + host-bookkeeping
    model and the cross-backend parity.
 2. **Named-import binding (done):** a real C `main` (via chibicc) links its libc calls to the
-   personality through named imports — the real linking path, not hand-written cap.calls
+   personality through named imports — the real linking path, not hand-written call.caps
    (`crates/temen/tests/c_posix.rs`). Bound in the §7 **general form**: `resolve_bound` supplies
    the handle at resolve (`Resolved::CapBound`), so the guest libc has real C signatures and
    no powerbox slot (§4 above; the fixed-`_start` retirement is PROCESS.md S15).
@@ -237,4 +237,4 @@ UDP (`sendto`/`recvfrom` on the memnet) is a follow-up slice on the same cap.
 
 Testing follows the repo standard: every op is an interp ↔ bytecode ↔ JIT differential
 (errno paths included), because a `HostFn` dispatches through the same `cap_dispatch_slots`
-the JIT's `cap.call` thunk calls — parity for free.
+the JIT's `call.cap` thunk calls — parity for free.

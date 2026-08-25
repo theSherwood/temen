@@ -156,18 +156,18 @@ property, so in practice:
 
 #### Remaining follow-ons (each its own project)
 
-- [x] **4c-host — a shared `Host` for `cap.call` under parallelism.** Done by **mirroring the
+- [x] **4c-host — a shared `Host` for `call.cap` under parallelism.** Done by **mirroring the
   tree-walker**, which already shares one `Arc<Mutex<Host>>` across a run's vCPUs and locks it *per
-  `cap.call`* (compute between calls is lock-free). The bytecode engine assumed exclusive `&mut Host`;
+  `call.cap`* (compute between calls is lock-free). The bytecode engine assumed exclusive `&mut Host`;
   a small `HostCell { Excl(&mut Host) | Shared(&Mutex<Host>) }` with one `with(|h| …)` accessor now
   threads through `resume`/`RunCtx`/every caller (commit A, zero behavior change — the full suite stays
   green). The parallel driver then shares one `Mutex<Host>` across its vCPU threads (`HostCell::Shared`,
-  commit B), so a spawned vCPU's `cap.call` dispatches on the **same** powerbox, taking the lock only
+  commit B), so a spawned vCPU's `call.cap` dispatches on the **same** powerbox, taking the lock only
   for its own dispatch — host I/O from workers works while compute/atomics/futex stay parallel. New
   entry `compile_and_run_capture_over_parallel_with_host`. **Determinism is preserved as a mode choice,
   not lost:** cooperative (the default) stays the deterministic oracle (it already shares one host, in
   fixed order); parallel is the opt-in whose order-sensitive stateful-cap interleaving races, as real
-  threads do. Differential-tested (`bytecode_parallel_caps.rs`): 8 worker vCPUs each `cap.call`-write
+  threads do. Differential-tested (`bytecode_parallel_caps.rs`): 8 worker vCPUs each `call.cap`-write
   the same line + bump a shared counter → result + (schedule-independent) stdout byte-identical to the
   oracle across 50 real-race repeats; Miri (`parallel_miri.rs`) confirms the shared-host access is
   race/UB-free. (Scope: caps `cap_dispatch_slots` handles — streams/clock/exit/reflection — over the
@@ -214,7 +214,7 @@ property, so in practice:
     back; the vCPU acts on the shared `Domain`). `VcpuProgram::compile_with_jit_table` reserves the
     granted dispatch table. Proven by `bytecode_vcpu_orchestration_jit.rs` (a `std::thread` host —
     the native model of the JS/Worker host — drives 8 vCPUs invoking / installing on the shared domain
-    to the oracle's result). Invoked units run over the vCPU's deny-all powerbox (a `cap.call`ing unit
+    to the oracle's result). Invoked units run over the vCPU's deny-all powerbox (a `call.cap`ing unit
     is out of scope, like every host capability on this path).
   - [x] **C2 — the browser glue (Rust-side powerbox)**: a guest now JITs **across real Web Workers**.
     The powerbox (a `Host` with the `Jit` cap + the host-compiled unit) is built once and **leaked**
@@ -229,7 +229,7 @@ property, so in practice:
     install/invoke kernels on **9 Workers** → 1136 (8 × `service(6,7)=142`), and `browser-test.mjs`
     asserts the same in **real Chromium** (the `#jit` work item). Validates std `Mutex<Vec<Arc<…>>>`
     (the `Domain`'s `ModuleSource`) working cross-Worker on wasm atomics. (Invoked units still run over
-    the vCPU's deny-all powerbox — a `cap.call`ing unit is out of scope, the C1 limitation.)
+    the vCPU's deny-all powerbox — a `call.cap`ing unit is out of scope, the C1 limitation.)
   - **§14 `instantiate` in parallel** — a confined executor child runs as a **nested confined
     parallel run**: its own `nested_view` sub-window (own page-prot map over the shared backing), its
     own attenuated powerbox (`Instantiator` + `AddressSpace`), its own natural dispatch table
@@ -296,20 +296,20 @@ property, so in practice:
         a new Worker whose `win`/`winSize` are the carve. Also fixed a latent JS-host bug D2 exposed:
         cached `Int32Array`/`BigInt64Array` views go stale when the shared `WebAssembly.Memory` grows
         mid-run (e.g. a module compile+push) — the hosts now refresh views before Atomics access.
-- [x] **4d — host I/O (`cap.call`) from every vCPU, resumable + browser.** The last driver-capability
+- [x] **4d — host I/O (`call.cap`) from every vCPU, resumable + browser.** The last driver-capability
   cell: natively `drive_parallel` had the 4c-host shared `Mutex<Host>`, but a resumable/browser vCPU
-  carried a deny-all host, so a worker vCPU's I/O `cap.call` was an inert `CapFault` — a parallel
+  carried a deny-all host, so a worker vCPU's I/O `call.cap` was an inert `CapFault` — a parallel
   browser guest couldn't even print. Now [`Vcpu::with_shared_host`]`(&Mutex<Host>)` attaches the run's
-  shared powerbox to any vCPU: every host access (`cap.call` dispatch, §14 module/authority
+  shared powerbox to any vCPU: every host access (`call.cap` dispatch, §14 module/authority
   resolution, an invoked §22 unit's calls) goes through the lock — per-call serialization, lock-free
   compute/atomics between calls, the exact 4c-host model. **No JS in the loop**: the `Host` is fully
   virtual (stdout is an in-memory buffer), so dispatch is in-engine; the browser publishes one leaked
   `Mutex<Host>` (`temen_par_powerbox_io`, the same shared-linear-memory sharing as the §22/§14 recipes;
   last-published recipe wins), roots get `[out_handle]` seeded, and the page reads stdout back after
   the run (`temen_par_stdout_len`/`_ptr`). Proven: `bytecode_vcpu_orchestration_caps.rs` (the proven
-  schedule-independent 4c-host kernel — 8 workers each `cap.call`-write "tick\n" + atomic add —
+  schedule-independent 4c-host kernel — 8 workers each `call.cap`-write "tick\n" + atomic add —
   result AND stdout byte-identical to the cooperative oracle), `vcpu_shared_host_miri.rs` (concurrent
-  `cap.call` on one `Mutex<Host>` race/UB-clean under Miri), Node `threads-spawn.mjs` `TEMEN_IO=1`, and
+  `call.cap` on one `Mutex<Host>` race/UB-clean under Miri), Node `threads-spawn.mjs` `TEMEN_IO=1`, and
   **real Chromium** (the `#capio` work item: 9 Workers → counter 8, stdout `"tick\n"×8`). Also adds
   the browser vCPU-bomb **backstop**: a shared live-vCPU counter in the `temen_par_*` constructors
   (admit/retire around `temen_par_free`), capped at 256 — cruder than the native drivers' spawner
@@ -346,7 +346,7 @@ property, so in practice:
     **9 Workers** (1 root + 8 spawned) → **4000**, and the futex kernel on **2 Workers** → **987654**,
     stable across repeats.
 
-  The `4c-host` / `4c-domain` follow-ons this left open (`cap.call` under a shared `Host`; §14/§22
+  The `4c-host` / `4c-domain` follow-ons this left open (`call.cap` under a shared `Host`; §14/§22
   domain-mutating events) have since landed — see their checked entries above.
 
 ### Known wrinkles — all resolved in `4c-wasm`
@@ -378,7 +378,7 @@ rustup toolchain install nightly -c rust-src
 cargo test -p temen-mem shared                          # Region::Shared cross-thread atomics + fuzz
 cargo test -p temen --test bytecode_shared_window       # engine over a caller-owned shared window
 cargo test -p temen --test bytecode_parallel            # 4c: native parallel driver vs oracle
-cargo test -p temen --test bytecode_parallel_caps       # 4c-host: shared-powerbox cap.call vs oracle
+cargo test -p temen --test bytecode_parallel_caps       # 4c-host: shared-powerbox call.cap vs oracle
 cargo test -p temen --test bytecode_vcpu_orchestration  # 4c-wasm: resumable Vcpu API, host-orchestrated
 cargo test -p temen --test bytecode_parallel_jit            # 4c-domain B: §22 JIT in drive_parallel vs oracle
 cargo test -p temen --test bytecode_vcpu_orchestration_jit  # 4c-domain C1: §22 JIT via resumable Vcpu vs oracle
@@ -388,8 +388,8 @@ cargo +nightly miri test -p temen-interp --test parallel_miri       # 4c: parall
 cargo +nightly miri test -p temen-interp --test parallel_jit_miri   # 4c-domain B: §22 JIT shared-Domain race-free
 cargo +nightly miri test -p temen-interp --test parallel_instantiate_miri  # 4c-domain §14-A: confined child race-free
 cargo +nightly miri test -p temen-interp --test vcpu_instantiate_miri      # 4c-domain §14-D2: carve-region views race-free
-cargo test -p temen --test bytecode_vcpu_orchestration_caps         # 4d: shared-powerbox cap.call via resumable Vcpu vs oracle
-cargo +nightly miri test -p temen-interp --test vcpu_shared_host_miri      # 4d: shared Mutex<Host> cap.call race-free
+cargo test -p temen --test bytecode_vcpu_orchestration_caps         # 4d: shared-powerbox call.cap via resumable Vcpu vs oracle
+cargo +nightly miri test -p temen-interp --test vcpu_shared_host_miri      # 4d: shared Mutex<Host> call.cap race-free
 
 # Step 1-futex / 4c-wasm — the cross-Worker blocking futex (`browser/threads-spike/threads-futex.mjs`)
 # was retired with the spike above; its result is recorded above and the code remains in git history.

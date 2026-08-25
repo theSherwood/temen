@@ -334,7 +334,7 @@ libc, or a standard DAP verb.
   configurable cache/coherence model, a first-touch shadow-set fault counter) live **host-side in
   the cdylib** either way; what differs is where the access stream comes from:
   - **Under a debug session: the debugger's own access decode, *not* the hook pass.** The W3 pass
-    *rewrites the module* (inserted hook `cap.call`s — `mem_hook_stats` reports `inserted_insts`),
+    *rewrites the module* (inserted hook `call.cap`s — `mem_hook_stats` reports `inserted_insts`),
     so instrumenting a debugged guest would surface synthetic ops in the machine view, shift SSA
     slots, and skew the op-clock that `seek` indexes — turning a profiling panel on must not
     change what the debugger shows. The debug tier already observes accesses without any rewrite:

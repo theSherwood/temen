@@ -266,7 +266,7 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
     return unit;
   };
   // Rebuild the shared table from the engine's slot mirror at each event boundary (installs only
-  // happen between events — a unit with a `cap.call` never emits). A slot in the natural prefix holds
+  // happen between events — a unit with a `call.cap` never emits). A slot in the natural prefix holds
   // the emitted program `f{slot}` (or a bounce shim if that function stayed interpreted); a slot past
   // it holds an installed unit's `f0` (via its by-handle wasm) or a shim for an interpreter-resident
   // target. Exactly `driveTierupRun`'s `syncTable`, over the `temen_coop_*` accessors.

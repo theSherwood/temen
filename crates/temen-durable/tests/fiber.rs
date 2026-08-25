@@ -313,11 +313,11 @@ block 0 (v0: i64, v1: i64) {
     );
 }
 
-/// Phase-3 slice 3.2 (active-resume-chain): a fiber that's **running** (mid-`cap.call`), not idle,
+/// Phase-3 slice 3.2 (active-resume-chain): a fiber that's **running** (mid-`call.cap`), not idle,
 /// when freeze lands. Unlike a parked fiber (flattened by the driver), this one unwinds *in place*
 /// during the root's run — its base-frame return happens under UNWINDING — and must be captured as
 /// `Frozen` + residue (not `Done`), so a thaw re-seeds it and it rewinds at its leaf point and runs
-/// **forward** (the active analogue of an idle fiber's re-park). The fiber does a clock `cap.call`
+/// **forward** (the active analogue of an idle fiber's re-park). The fiber does a clock `call.cap`
 /// then returns; freezing mid-call must **reload** the saved clock value on thaw, not re-issue it.
 ///
 /// The clock handle reaches the fiber through guest memory (`transform_module_assume_confined`),
@@ -345,7 +345,7 @@ block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65536
   v3 = i32.load v2
   v4 = i32.const 0
-  v5 = cap.call 2 0 (i32) -> (i64) v3 (v4)
+  v5 = call.cap 2 0 (i32) -> (i64) v3 (v4)
   v6 = i64.const 5
   v7 = i64.add v5 v6
   return v7
@@ -380,7 +380,7 @@ block 0 (v0: i64, v1: i64) {
     };
     assert_eq!(want, vec![Value::I64(47)], "uninterrupted: clock 42 + 5");
 
-    // Freeze: UNWINDING from the start — F runs the cap.call, then its poll unwinds it *in place*
+    // Freeze: UNWINDING from the start — F runs the call.cap, then its poll unwinds it *in place*
     // (it never reaches its real return). Capture the window + the active-chain fiber's residue.
     let (frozen, snap, clock_after) = {
         let mut h = Host::new();
@@ -405,7 +405,7 @@ block 0 (v0: i64, v1: i64) {
     assert_eq!(
         frozen.len(),
         1,
-        "the active (mid-cap.call) fiber was captured as Frozen, not dropped as Done"
+        "the active (mid-call.cap) fiber was captured as Frozen, not dropped as Done"
     );
     assert!(
         clock_after > 42,
@@ -775,7 +775,7 @@ fn a_woken_event_parked_fiber_freezes_without_a_placeholder() {
 
 // ---------------------------------------------------------------------------
 // §13.4 step 2, the fail-closed gate: an **unwoken capability park** cannot freeze — a
-// `Leaf` (cap.call) point spills its results *including* the call's, so a placeholder would
+// `Leaf` (call.cap) point spills its results *including* the call's, so a placeholder would
 // be reloaded on thaw as if it were the call's real result (reload-not-reissue). The driver
 // probes the park's kind by which scheduler map holds the waiter; a cap park is not in
 // `wait_waiters`, so the freeze refuses with `FiberFault`. The fiber parks in a blocking
@@ -803,7 +803,7 @@ block 0 (va: i64, vb: i64) {
   v3 = i32.load v2
   v4 = i64.const 65600
   v5 = i64.const 4
-  v6 = cap.call 0 0 (i64, i64) -> (i64) v3 (v4, v5)
+  v6 = call.cap 0 0 (i64, i64) -> (i64) v3 (v4, v5)
   return v6
   }
 }

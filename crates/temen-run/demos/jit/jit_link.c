@@ -4,7 +4,7 @@
 //
 // The guest emits two serialized Temen IR units byte-by-byte (the binary `temen-encode` v2 format):
 //   * `service(a, b) = a*a + b`            — self-contained; compiled then **installed** into the
-//                                            shared call_indirect table, yielding a slot.
+//                                            shared call.dyn table, yielding a slot.
 //   * `client(a, b) = F(a, b) + 100`       — carries an **unresolved import** `F`; it knows the
 //                                            service only by the name "F".
 // The guest then builds a tiny **symbol table** binding "F" -> the service's slot and hands the
@@ -130,7 +130,7 @@ static long emit_service(char *buf) {
 
 // `client(a, b) = F(a, b) + 100`, where `F` is an **unresolved symbol** the loader binds by name.
 // Opcodes: 0x10 = i32.const (the symbol's handle placeholder — patched to the resolved slot and
-// reused as the call_indirect index), 0x7B = call.sym (v8 link form), 0x11 = i64.const,
+// reused as the call.dyn index), 0x7B = call.sym (v8 link form), 0x11 = i64.const,
 // 0x40 = i64.add. Values: v0,v1 = params; v2 = handle const; v3 = F(a,b); v4 = 100; v5 = v3+v4.
 static long emit_client(char *buf) {
   emit_header(buf);
@@ -178,7 +178,7 @@ int main() {
   static char cli_buf[128];
   static char symtab[16];
 
-  // 1) Compile + install the service → its call_indirect table slot.
+  // 1) Compile + install the service → its call.dyn table slot.
   long svc_len = emit_service(svc_buf);
   long svc = __vm_jit_compile(svc_buf, svc_len);
   if (svc < 0) {

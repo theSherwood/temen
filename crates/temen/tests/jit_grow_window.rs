@@ -4,7 +4,7 @@
 //!
 //! The tier-up arm of the same contract is `temen-wasm-jit/tests/tierup_grow_window.rs`; this test
 //! covers the other seam that runs emitted code over the guest window: the guest grows a
-//! **reserved-tail** window through `ADDRESS_SPACE.map` (`cap.call 5 0`), then `Jit.invoke`s a
+//! **reserved-tail** window through `ADDRESS_SPACE.map` (`call.cap 5 0`), then `Jit.invoke`s a
 //! memory-touching unit. The codegen host (the browser Worker's JIT_INVOKE, stood in for by wasmi
 //! here) must be observably identical to the interpreted invoke (INVARIANTS.md #9):
 //!  - a probe **inside** the grown region round-trips on both tiers (the synced global admits it);
@@ -51,9 +51,9 @@ block 0 (vjit: i32, vcode: i32, vas: i32, vprobe: i64) {
   voff = i64.const 65536
   vlen = i64.const 16384
   vprot = i32.const 3
-  vg = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vg = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
   vc = i64.extend_i32_u vcode
-  vr = cap.call 11 1 (i64, i64) -> (i64) vjit (vc, vprobe)
+  vr = call.cap 11 1 (i64, i64) -> (i64) vjit (vc, vprobe)
   return vr
   }
 }
@@ -67,9 +67,9 @@ block 0 (vjit: i32, vcode: i32, vas: i32, vprobe: i64) {
   voff = i64.const 98304
   vlen = i64.const 16384
   vprot = i32.const 3
-  vg = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vg = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
   vc = i64.extend_i32_u vcode
-  vr = cap.call 11 1 (i64, i64) -> (i64) vjit (vc, vprobe)
+  vr = call.cap 11 1 (i64, i64) -> (i64) vjit (vc, vprobe)
   return vr
   }
 }

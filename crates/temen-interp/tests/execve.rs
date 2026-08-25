@@ -41,7 +41,7 @@ block 0 (vinst: i32, vcmd: i64, vstream: i32) {
   vgn = i64.const 1
   ventry = i64.const 0
   vsl = i64.const 12
-  vr = cap.call 4294967295 14 (i64, i64, i64, i64, i64) -> (i64) vz (vcmd, vgp, vgn, ventry, vsl)
+  vr = call.cap 4294967295 14 (i64, i64, i64, i64, i64) -> (i64) vz (vcmd, vgp, vgn, ventry, vsl)
   v99 = i64.const 99
   return v99
   }
@@ -59,10 +59,10 @@ func (i64) -> (i64) {
 block 0 (vinst: i64) {
   vp = i64.const 200
   vl = i64.const 6
-  vh = cap.self.resolve vp vl
+  vh = self.resolve vp vl
   vwp = i64.const 100
   vwl = i64.const 4
-  vw = cap.call 0 1 (i64, i64) -> (i64) vh (vwp, vwl)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vh (vwp, vwl)
   v42 = i64.const 42
   return v42
   }

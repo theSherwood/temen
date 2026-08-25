@@ -1,8 +1,8 @@
-//! Approach-A differential spec: bounded-target lowering of a dynamic-index `call_indirect`.
+//! Approach-A differential spec: bounded-target lowering of a dynamic-index `call.dyn`.
 //!
 //! `lower_indirect_dispatch` must (1) re-verify, (2) be behaviorally identical to the source on the
 //! reference interpreter for every *valid* dispatch index, and (3) let the specializer fold through
-//! a dynamic-index `call_indirect` that it otherwise declines. The one documented divergence — an
+//! a dynamic-index `call.dyn` that it otherwise declines. The one documented divergence — an
 //! out-of-signature index traps `Unreachable` instead of `IndirectCallType` — is pinned as a
 //! known-gap test (both still trap).
 
@@ -40,7 +40,7 @@ fn unary(op: BinOp, imm: i64) -> Func {
     }
 }
 
-/// Entry `dispatch(sel: i32, x: i64) -> i64 = call_indirect[I64->I64](sel)(x) + x`.
+/// Entry `dispatch(sel: i32, x: i64) -> i64 = call.dyn[I64->I64](sel)(x) + x`.
 /// The trailing `+ x` forces the continuation to thread both the call result and a live input.
 fn dispatch_module() -> Module {
     let ty = FuncType {
@@ -83,7 +83,7 @@ fn dispatch_module() -> Module {
         data_ptrs: vec![],
         data_funcrefs: vec![],
         impl_exports: vec![],
-        types: vec![TypeEntry::Func(ty)], // #922: call_indirect sig, index 0
+        types: vec![TypeEntry::Func(ty)], // #922: call.dyn sig, index 0
         debug_info: None,
     }
 }
@@ -95,17 +95,14 @@ fn lowering_verifies_and_matches_on_valid_indices() {
     let low = lower_indirect_dispatch(&m, 8);
     verify_module(&low).expect("lowered residual verifies");
 
-    // No `call_indirect` survives; the candidate calls are now direct.
+    // No `call.dyn` survives; the candidate calls are now direct.
     let any_indirect = low.funcs.iter().flat_map(|f| &f.blocks).any(|b| {
         b.insts
             .iter()
             .any(|i| matches!(i, Inst::CallIndirect { .. }))
             || matches!(b.term, Terminator::ReturnCallIndirect { .. })
     });
-    assert!(
-        !any_indirect,
-        "no call_indirect should remain after lowering"
-    );
+    assert!(!any_indirect, "no call.dyn should remain after lowering");
 
     // Behaviorally identical for every valid (signature-matching) index 1,2,3.
     for sel in 1..=3i32 {
@@ -130,13 +127,13 @@ fn out_of_signature_index_still_traps_known_gap() {
 
 #[test]
 fn specializer_folds_through_dynamic_dispatch() {
-    // Without the cap the specializer declines a dynamic-index call_indirect; with it, the residual
+    // Without the cap the specializer declines a dynamic-index call.dyn; with it, the residual
     // is produced and matches the interpreter with `sel` dynamic.
     let m = dispatch_module();
     let plain = SpecConfig::default();
     assert!(
         specialize_with_config(&m, 0, &[SpecArg::Dynamic, SpecArg::Dynamic], &plain).is_err(),
-        "dynamic call_indirect is Unsupported without the cap"
+        "dynamic call.dyn is Unsupported without the cap"
     );
 
     let cfg = SpecConfig {
@@ -264,7 +261,7 @@ fn branchy_module() -> Module {
         data_ptrs: vec![],
         data_funcrefs: vec![],
         impl_exports: vec![],
-        types: vec![TypeEntry::Func(ty)], // #922: call_indirect sig, index 0
+        types: vec![TypeEntry::Func(ty)], // #922: call.dyn sig, index 0
         debug_info: None,
     }
 }
@@ -306,7 +303,7 @@ fn wide_span_uses_chain_fallback_and_stays_faithful() {
         params: vec![I64, I64],
         results: vec![I64],
     };
-    // entry(idx: i32, x: i64) = call_indirect[I64,I64->I64](idx)(x, x)
+    // entry(idx: i32, x: i64) = call.dyn[I64,I64->I64](idx)(x, x)
     let entry = Func {
         params: vec![I32, I64],
         results: vec![I64],
@@ -335,7 +332,7 @@ fn wide_span_uses_chain_fallback_and_stays_faithful() {
         data_ptrs: vec![],
         data_funcrefs: vec![],
         impl_exports: vec![],
-        types: vec![TypeEntry::Func(hty)], // #922: call_indirect sig, index 0
+        types: vec![TypeEntry::Func(hty)], // #922: call.dyn sig, index 0
         debug_info: None,
     };
     verify_module(&m).expect("source verifies");
@@ -409,7 +406,7 @@ fn high_index_cluster_uses_offset_table() {
         data_ptrs: vec![],
         data_funcrefs: vec![],
         impl_exports: vec![],
-        types: vec![TypeEntry::Func(hty)], // #922: call_indirect sig, index 0
+        types: vec![TypeEntry::Func(hty)], // #922: call.dyn sig, index 0
         debug_info: None,
     };
     verify_module(&m).expect("source verifies");
@@ -472,7 +469,7 @@ fn large_tail_uses_shared_continuation() {
         data_ptrs: vec![],
         data_funcrefs: vec![],
         impl_exports: vec![],
-        types: vec![TypeEntry::Func(ty)], // #922: call_indirect sig, index 0
+        types: vec![TypeEntry::Func(ty)], // #922: call.dyn sig, index 0
         debug_info: None,
     };
     verify_module(&m).expect("source verifies");

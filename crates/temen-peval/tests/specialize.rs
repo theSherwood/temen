@@ -2440,7 +2440,7 @@ fn optimizer_folds_float_constants() {
 }
 
 // ===========================================================================================
-// Indirect-call specialization: a `call_indirect` / `return_call_indirect` (or `ref.func`) whose
+// Indirect-call specialization: a `call.dyn` / `return_call.dyn` (or `ref.func`) whose
 // table index resolves to a constant, in-range, signature-matching function is resolved to that
 // callee and inlined like a direct call. A dynamic / out-of-range / mismatched index can't be
 // specialized (the single-function residual carries no table) and returns Unsupported.
@@ -2468,7 +2468,7 @@ fn double_func() -> Func {
 
 #[test]
 fn const_indirect_call_via_ref_func_inlines() {
-    // main(x) = (ref.func double)(x) through call_indirect -> x * 2.
+    // main(x) = (ref.func double)(x) through call.dyn -> x * 2.
     let m = Module {
         funcs: vec![
             Func {
@@ -2489,7 +2489,7 @@ fn const_indirect_call_via_ref_func_inlines() {
             },
             double_func(),
         ],
-        types: vec![TypeEntry::Func(i64_to_i64())], // #922: call_indirect sig, index 0
+        types: vec![TypeEntry::Func(i64_to_i64())], // #922: call.dyn sig, index 0
         ..Default::default()
     };
     verify_module(&m).expect("verifies");
@@ -2516,7 +2516,7 @@ fn const_indirect_call_via_ref_func_inlines() {
 #[test]
 fn indirect_call_through_constant_memory_table_inlines() {
     // A handler-table interpreter shape: the function index lives in a readonly data segment; loading
-    // it folds to a constant funcref, so the call_indirect resolves and the dispatch disappears.
+    // it folds to a constant funcref, so the call.dyn resolves and the dispatch disappears.
     let m = Module {
         funcs: vec![
             Func {
@@ -2548,7 +2548,7 @@ fn indirect_call_through_constant_memory_table_inlines() {
             readonly: true,
             bytes: 1i32.to_le_bytes().to_vec(), // the table holds func index 1 (double)
         }],
-        types: vec![TypeEntry::Func(i64_to_i64())], // #922: call_indirect sig, index 0
+        types: vec![TypeEntry::Func(i64_to_i64())], // #922: call.dyn sig, index 0
         ..Default::default()
     };
     verify_module(&m).expect("verifies");
@@ -2574,7 +2574,7 @@ fn indirect_call_through_constant_memory_table_inlines() {
 
 #[test]
 fn const_indirect_tail_call_inlines() {
-    // main(x) = return_call_indirect (ref.func double)(x).
+    // main(x) = return_call.dyn (ref.func double)(x).
     let m = Module {
         funcs: vec![
             Func {
@@ -2592,7 +2592,7 @@ fn const_indirect_tail_call_inlines() {
             },
             double_func(),
         ],
-        types: vec![TypeEntry::Func(i64_to_i64())], // #922: call_indirect sig, index 0
+        types: vec![TypeEntry::Func(i64_to_i64())], // #922: call.dyn sig, index 0
         ..Default::default()
     };
     verify_module(&m).expect("verifies");
@@ -2676,7 +2676,7 @@ fn indirect_call_to_dynamic_cf_callee_inlines_as_cfg() {
                 ],
             },
         ],
-        types: vec![TypeEntry::Func(i64_to_i64())], // #922: call_indirect sig, index 0
+        types: vec![TypeEntry::Func(i64_to_i64())], // #922: call.dyn sig, index 0
         ..Default::default()
     };
     verify_module(&m).expect("verifies");
@@ -2722,7 +2722,7 @@ fn unresolvable_indirect_calls_are_unsupported() {
             },
             double_func(),
         ],
-        types: vec![TypeEntry::Func(i64_to_i64())], // #922: call_indirect sig, index 0
+        types: vec![TypeEntry::Func(i64_to_i64())], // #922: call.dyn sig, index 0
         ..Default::default()
     };
     verify_module(&dynamic_idx).expect("verifies");
@@ -2766,7 +2766,7 @@ fn unresolvable_indirect_calls_are_unsupported() {
                 }],
             },
         ],
-        types: vec![TypeEntry::Func(i64_to_i64())], // #922: call_indirect sig, index 0
+        types: vec![TypeEntry::Func(i64_to_i64())], // #922: call.dyn sig, index 0
         ..Default::default()
     };
     verify_module(&bad_sig).expect("verifies");

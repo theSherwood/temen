@@ -24,7 +24,7 @@
 //! Each program runs `_start` (function 0) on **both** the interpreter and the JIT under an identical
 //! host, asserting they agree on the result *and* the observable personality state (captured stdout,
 //! the memfs) — so it doubles as a cross-backend differential, capability effects included. The
-//! personality's `HostProc` dispatches through the same `cap_dispatch_slots` the JIT's `cap.call` thunk
+//! personality's `HostProc` dispatches through the same `cap_dispatch_slots` the JIT's `call.cap` thunk
 //! calls, so parity comes for free. Requires a unix C toolchain (`make` + `cc`) to build the chibicc
 //! fork, so the suite is gated to `#![cfg(unix)]` (like `c_frontend.rs`).
 #![cfg(unix)]
@@ -554,7 +554,7 @@ int main() {{\n\
 /// temen-posix **personality** (memfs/stdio via `__px_*` named imports — World A) AND drives the
 /// **capability** path (`__vm_pipe`/`__vm_read`/`__vm_write`, the `cap.self`/Stream builtins — World B) in
 /// one run. The worlds use **disjoint** host state (a HOST_PROC handle + import bindings vs. the Stream
-/// powerbox slots) and **disjoint** guest dispatch (named imports vs. `cap.call` builtins), so they
+/// powerbox slots) and **disjoint** guest dispatch (named imports vs. `call.cap` builtins), so they
 /// compose on one `Host` with no conflict — `temen_posix::grant` claims nothing the capability grants touch,
 /// and the `__vm_*` builtins generate no import entries, so the manifest is pure `__px_*`. This is the
 /// bridge #799 is built on: a personality-linked program (eventually bash) that also holds capability
@@ -576,9 +576,9 @@ int main(void) {
      One fiber, so the write lands before the read drains it — no park needed for the coexistence proof. */
   int fds[2];
   __vm_pipe(fds);                     /* CAP_SELF_PIPE mints two Stream handles into the powerbox */
-  __vm_write(fds[1], a, ra);          /* STREAM cap.call write */
+  __vm_write(fds[1], a, ra);          /* STREAM call.cap write */
   char b[8];
-  long rb = __vm_read(fds[0], b, ra); /* STREAM cap.call read -> ra bytes */
+  long rb = __vm_read(fds[0], b, ra); /* STREAM call.cap read -> ra bytes */
   return (int)(fd + rb);              /* 3 + 3 = 6 : both worlds ran on one Host */
 }
 "#;

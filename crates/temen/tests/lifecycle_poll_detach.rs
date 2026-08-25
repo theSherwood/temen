@@ -59,9 +59,9 @@ block 0 (v0: i32) {\n\
   i64.store q0a5 q0v1\n\
   q0a6 = i64.const 4144\n\
   i64.store q0a6 q0v1\n\
-  vch = cap.call 6 17 (i64) -> (i32) v0 (q0a0)\n\
-  vp = cap.call 6 9 (i32) -> (i32) v0 (vch)\n\
-  vd = cap.call 6 10 (i32) -> (i32) v0 (vch)\n\
+  vch = call.cap 6 17 (i64) -> (i32) v0 (q0a0)\n\
+  vp = call.cap 6 9 (i32) -> (i32) v0 (vch)\n\
+  vd = call.cap 6 10 (i32) -> (i32) v0 (vch)\n\
   vz = i64.const 0\n\
   vone = i32.const 1\n\
   i32.store8 vz vone\n\
@@ -112,11 +112,11 @@ block 0 (v0: i32) {\n\
   i64.store q1a5 q1v1\n\
   q1a6 = i64.const 4208\n\
   i64.store q1a6 q1v1\n\
-  vch = cap.call 6 17 (i64) -> (i32) v0 (q1a0)\n\
+  vch = call.cap 6 17 (i64) -> (i32) v0 (q1a0)\n\
   br 1(v0, vch)\n\
 }\n\
 block 1 (v0a: i32, vcha: i32) {\n\
-  vp = cap.call 6 9 (i32) -> (i32) v0a (vcha)\n\
+  vp = call.cap 6 9 (i32) -> (i32) v0a (vcha)\n\
   vz32 = i32.const 0\n\
   vne = i32.ne vp vz32\n\
   br_if vne 3(v0a, vcha, vp) 2(v0a, vcha)\n\
@@ -129,7 +129,7 @@ block 2 (v0b: i32, vchb: i32) {\n\
   br 1(v0b, vchb)\n\
 }\n\
 block 3 (v0c: i32, vchc: i32, vpf: i32) {\n\
-  vjr = cap.call 6 1 (i32) -> (i64) v0c (vchc)\n\
+  vjr = call.cap 6 1 (i32) -> (i64) v0c (vchc)\n\
   vpf64 = i64.extend_i32_u vpf\n\
   return vpf64\n\
   }\n\

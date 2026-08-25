@@ -66,7 +66,7 @@ consequences are the legality rules every pass must obey:
 3. **Dead-store elimination is illegal** under "same final memory window." If wanted, it needs an
    opt-in caller contract ("this region is scratch"), the same shape as `SpecConfig`'s
    constant-memory / rename-region promises: a false promise is a miscompile, never an escape.
-4. **Threads/fibers (§12 C/C++11 model):** any atomic, fence, `call`, `cap.call`, or fiber/thread
+4. **Threads/fibers (§12 C/C++11 model):** any atomic, fence, `call`, `call.cap`, or fiber/thread
    op is a full clobber for memory-value tracking; non-atomic load caching is sound only between
    clobbers.
 5. **Function indices are addressable** (`ref.func`, `call_indirect` over the identity table):
