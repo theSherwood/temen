@@ -465,7 +465,11 @@ fn c_guarded_layout_runs_normal_programs() {
     // Exercises globals + a stack array (relocated data stack) + a return value.
     let src = "int g[4] = {1,2,3,4};\n\
                int main(void){ int s = 0; for (int i=0;i<4;i++) s += g[i]; return s; }";
-    assert_eq!(run_c(src), vec![Value::I32(10)], "guarded program still computes");
+    assert_eq!(
+        run_c(src),
+        vec![Value::I32(10)],
+        "guarded program still computes"
+    );
 }
 
 /// The guest **grows its own window** through the Memory capability: `__vm_map` (a frontend
