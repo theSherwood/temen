@@ -10797,6 +10797,14 @@ impl CoopSched {
                             tasks[ti].vt.active.set(dst, Reg::from_i64(super::EAGAIN));
                         }
                         Some((twin_fuel, twin_mem, twin_host)) => {
+                            // #1080 pipeline rung — wire the twin's OWN park door. `fork_powerbox` mints
+                            // the twin's personality with `park_req: None` (the door "lands at mint");
+                            // the driver must install it, exactly as the tree-walker wires each child's
+                            // door at fork and as the root got it at run start. Without this a forked
+                            // twin's own `fork()`/`waitpid()` finds no park delegate and fails closed
+                            // (`-ENOSYS`/`-ECHILD`) — so a bash pipeline SUBSHELL (itself a twin) cannot
+                            // fork+wait its command, wedging `echo | cat` in a waitpid busy-loop.
+                            twin_host.wire_park_door();
                             // The twin's continuation is the parent's, at the post-fork resume point,
                             // with the return-twice `0` (the parent keeps the twin's pid, set below). A
                             // bare root carries no resume chain / invoke (`Vm` derives `Clone`).
@@ -10838,6 +10846,25 @@ impl CoopSched {
                     // #799 — personality blocking `waitpid()`: the op was rewound (it re-executes on
                     // wake). Park until the named child completes; the settle scan re-admits it after
                     // firing the twin's exit hooks, so the re-executed op finds the twin retired.
+                    //
+                    // #1080 pipeline rung — an ANY-child parker (`child: None`) that re-parks has just
+                    // re-run its `waitpid(-1)` and found nothing reapable, so every already-hooked Done
+                    // twin's exit has been CONSUMED (reaped by this parker, or owned by another parent
+                    // who reaps straight from the personality table without an engine wake). Such twins
+                    // must stop satisfying the any-child wake criterion, or the settle re-wakes this
+                    // parker forever on the same stale Done twin — a livelock in which the woken parker
+                    // (lowest task index, e.g. root bash) is picked every pump iteration and a Runnable
+                    // later task (the pipeline's exec stage) is NEVER scheduled: the `echo | cat` wedge
+                    // (root re-parked ~2M times while `cat`'s twin starved). A Done-but-NOT-yet-hooked
+                    // twin is kept: its exit hooks (and so its reapable zombie) fire at the next settle,
+                    // and this parker must wake for it. `Some(pid)` parks are prune-immune (their wake
+                    // keys on `tasks[pid-1]` directly) and self-limiting (the woken re-run reaps + returns).
+                    if child.is_none() {
+                        forked_twins.retain(|&j| {
+                            !(hooked_twins.contains(&j)
+                                && matches!(tasks[j].state, TaskState::Done(_)))
+                        });
+                    }
                     tasks[ti].state = TaskState::BlockedReapPersonality { child };
                 }
                 Ok(VcpuStop::PipeRead { pipe }) => {

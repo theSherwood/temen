@@ -196,16 +196,14 @@ fn bash_dash_c_external_seq_forked() {
 /// both stages, wires a CorePipe between them, each twin `execve`s its coreutil (`/bin/echo`,
 /// `/bin/cat`), the reader blocks on the pipe until the writer's bytes arrive, then EOFs when it exits.
 ///
-/// `#[ignore]`d — a CONFIRMED real deadlock (a distinct follow-up rung), reproduced with a freshly-built
-/// `--null-guard` `bash.temen`, so it is not the stale-asset artifact that masked the fork/exec/wait
-/// tests above. The stuck configuration: the root bash parks in `waitpid(-1)`, the writer twin (`echo`)
-/// reaches `Done`, but the reader twin (`cat`, the exec'd `/bin/cat`) spins **Runnable** forever — it
-/// neither reads-to-EOF nor parks (`BlockedPipeRead`). So the cooperative pipe park/wake does not engage
-/// for an exec'd *reader* twin the way it does for the synthetic guests in the native `c_posix` pipeline
-/// differentials (`seq | head | wc`, `sort | uniq`), which all pass on the bytecode engine. Un-ignore
-/// once the exec'd-reader pipe park is fixed.
+/// Root-caused and fixed: the wedge was an engine LIVELOCK, not a pipe bug — the root bash's
+/// `waitpid(-1)` park (`BlockedReapPersonality(None)`) was re-woken forever by the already-reaped
+/// `echo` twin (a stale `Done` entry in the any-child wake set), and the endlessly re-woken root
+/// (lowest task index) starved the `cat` twin, which never got scheduled at all. The fix prunes
+/// consumed Done twins from the wake set when an any-child parker re-parks (bytecode.rs ReapWait arm).
+/// Diagnosed natively via `bash_probe` (`BASH_PROBE_BACKEND=bytecode`) — same asset, same personality,
+/// reliable builds — where the pick counts showed root:~2M, echo:1, cat:0.
 #[test]
-#[ignore = "confirmed real deadlock (fresh --null-guard asset): the exec'd reader twin spins Runnable instead of pipe-read-parking/EOFing — a distinct pipeline-through-exec follow-up rung"]
 fn bash_dash_c_pipeline_echo_cat() {
     let Some(bash) = load_bash() else {
         eprintln!("note: skipping bash_dash_c_pipeline_echo_cat — no bash.temen");
@@ -230,10 +228,10 @@ fn bash_dash_c_pipeline_echo_cat() {
 /// forks, three `execve`d coreutils, two CorePipes, every read park + carried pipe end + EOF + reap
 /// composing under real bash on the bytecode engine — the milestone capstone.
 ///
-/// `#[ignore]`d for the same confirmed exec'd-reader-twin spin as `bash_dash_c_pipeline_echo_cat` above
-/// (a distinct follow-up; the native 3-stage `seq | head | wc` differential passes on both engines).
+/// Fixed by the same any-child-wake prune as `bash_dash_c_pipeline_echo_cat` above (see its doc) —
+/// three forks, three exec'd coreutils, two CorePipes, read parks + EOF + reaps composing under real
+/// bash on the bytecode engine.
 #[test]
-#[ignore = "same confirmed exec'd-reader-twin pipeline deadlock as bash_dash_c_pipeline_echo_cat (see doc) — a distinct follow-up"]
 fn bash_dash_c_pipeline_seq_head_wc() {
     let Some(bash) = load_bash() else {
         eprintln!("note: skipping bash_dash_c_pipeline_seq_head_wc — no bash.temen");
