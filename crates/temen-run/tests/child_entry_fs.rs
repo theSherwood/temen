@@ -18,7 +18,7 @@
 //!   4. the parent reads the emitted file back out of its shared handle and sees the child's bytes.
 //!
 //! That is exactly the hand-off a JIT'd `nifler` uses: it reads its `<in>.nim` and emits its `<out>.nif`
-//! into a memfs its parent (the Rust-on-SVM driver guest) seeded and then reads. Proven here with
+//! into a memfs its parent (the Rust-on-Temen driver guest) seeded and then reads. Proven here with
 //! hand-written text-IR children so it needs no toolchain and pins the plumbing, not the phase. Window
 //! confinement (invariant 2) is untouched: the children's `open`/`read`/`write` name *window-relative*
 //! buffers, masked to their carve; the shared authority is the granted cap (§3), not any carve address.
