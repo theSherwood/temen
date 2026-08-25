@@ -717,7 +717,13 @@ pub(crate) unsafe extern "C" fn instantiate(
     // `mem_size = 0` is safe: with no grants the builder reads no grant records from the window. A
     // durable run is rejected inside `instantiate_module_named` just as the `mod_mem.is_some()` guard
     // below rejects it here.
-    if module >= 0 {
+    //
+    // Only when the granted-spawn hooks are installed (`grant_build_named != 0`): a run without them
+    // (the plain `jit_separate_module` differential — a *compute* separate-module child that makes no
+    // `cap.call`) keeps the empty-powerbox path below, matching the interpreter for a capless child
+    // (both tiers return the same value). Delegating unconditionally would `CapFault` such a run at the
+    // absent builder.
+    if module >= 0 && rt.grant_build_named.load(Ordering::Acquire) != 0 {
         return instantiate_module_named(
             rt_ptr, mem_base, /*mem_size (unused: 0 grants)*/ 0, handle, module,
             /*grants_ptr*/ 0, /*grants_n*/ 0, entry, off, size_log2, fuel, trap_out,
