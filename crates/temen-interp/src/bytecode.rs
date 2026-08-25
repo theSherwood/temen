@@ -10846,6 +10846,25 @@ impl CoopSched {
                     // #799 — personality blocking `waitpid()`: the op was rewound (it re-executes on
                     // wake). Park until the named child completes; the settle scan re-admits it after
                     // firing the twin's exit hooks, so the re-executed op finds the twin retired.
+                    //
+                    // #1080 pipeline rung — an ANY-child parker (`child: None`) that re-parks has just
+                    // re-run its `waitpid(-1)` and found nothing reapable, so every already-hooked Done
+                    // twin's exit has been CONSUMED (reaped by this parker, or owned by another parent
+                    // who reaps straight from the personality table without an engine wake). Such twins
+                    // must stop satisfying the any-child wake criterion, or the settle re-wakes this
+                    // parker forever on the same stale Done twin — a livelock in which the woken parker
+                    // (lowest task index, e.g. root bash) is picked every pump iteration and a Runnable
+                    // later task (the pipeline's exec stage) is NEVER scheduled: the `echo | cat` wedge
+                    // (root re-parked ~2M times while `cat`'s twin starved). A Done-but-NOT-yet-hooked
+                    // twin is kept: its exit hooks (and so its reapable zombie) fire at the next settle,
+                    // and this parker must wake for it. `Some(pid)` parks are prune-immune (their wake
+                    // keys on `tasks[pid-1]` directly) and self-limiting (the woken re-run reaps + returns).
+                    if child.is_none() {
+                        forked_twins.retain(|&j| {
+                            !(hooked_twins.contains(&j)
+                                && matches!(tasks[j].state, TaskState::Done(_)))
+                        });
+                    }
                     tasks[ti].state = TaskState::BlockedReapPersonality { child };
                 }
                 Ok(VcpuStop::PipeRead { pipe }) => {
