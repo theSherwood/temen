@@ -64,7 +64,8 @@ echo "  residual undefs all accounted for ($(wc -l < "$CACHE/undef.txt"))"
 echo "=== [4/5] translate (--stub-externs) + prep_temen (verify) ==="
 TR="$REPO/crates/temen-llvm/target/release/temen-llvm-translate"
 [ -x "$TR" ] || cargo build --release --bin temen-llvm-translate --manifest-path "$REPO/crates/temen-llvm/Cargo.toml"
-"$TR" "$CACHE/nifler.linked.bc" -o "$CACHE/nifler_raw.temen" --binary --host-page 65536 --stub-externs
+# --null-guard (#964/#1094): the nifler phase guest runs guarded like every other producer.
+"$TR" "$CACHE/nifler.linked.bc" -o "$CACHE/nifler_raw.temen" --binary --host-page 65536 --stub-externs --null-guard
 cargo run -q --release -p temen-run --example prep_temen -- "$CACHE/nifler_raw.temen" "$CACHE/nifler.temen" | grep -E "funcs|wrote"
 
 echo "=== [5/5] run nifler-on-Temen over each input, diff vs native (treewalk, bytecode, jit) ==="
