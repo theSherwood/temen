@@ -130,14 +130,13 @@ fn main() {
     let decl = child.memory.as_ref().expect("child window").size_log2 as u32;
     let child_sl = (decl + 3).max(24);
     let carve_off = 1u64 << child_sl;
-    let parent =
-        temen_text::parse_module(&parent_src(
-            child_sl,
-            carve_off,
-            temen_ir::module_args_base(&child),
-            &argv,
-        ))
-        .expect("parse parent");
+    let parent = temen_text::parse_module(&parent_src(
+        child_sl,
+        carve_off,
+        temen_ir::module_args_base(&child),
+        &argv,
+    ))
+    .expect("parse parent");
     temen_verify::verify_module(&parent).expect("verify parent");
 
     let (factory, handle) = temen_run::fs::mem_fs_shared_factory(seed, vec![]);
