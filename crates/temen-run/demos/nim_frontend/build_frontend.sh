@@ -97,3 +97,29 @@ if diff -q <(norm "$CACHE/native.s.nif") <(norm "$ceout/nimcache/$sys.s.nif") >/
 else
   echo "FAILED (child-entry): residual diff:"; diff <(norm "$CACHE/native.s.nif") <(norm "$ceout/nimcache/$sys.s.nif") | head -20; exit 1
 fi
+
+# ---- [6/6] the front-end CHAIN, both phases op-13 children over ONE shared memfs (nimsem -> hexer) ---
+# The compiler driver on Temen: a native conductor op-13-spawns nimsem then hexer, handing the `.s.nif`
+# between them through one shared memfs (nifler runs as nimsem's exec grandchildren). Oracle: native
+# hexer on the SAME `.s.nif` the op-13 nimsem produced, so only hexer's lowering is compared (the two
+# nimsems' outputs differ only in embedded paths). `nim_chain_op13` is the driver.
+HEXER_BIN="${HEXER_BIN:-$BIN/hexer}"
+if [ -x "$HEXER_BIN" ]; then
+  echo "=== [6/6] the front-end chain: nimsem -> hexer, both op-13 children over one memfs ==="
+  build_temen "$REPO/nimony/src/hexer/hexer.nim" "$CACHE/hexer.temen"
+  "$TR" "$CACHE/c_hexer/linked.bc" -o "$CACHE/hexer_ce_raw.temen" --binary --host-page 65536 --stub-externs --child-entry
+  chainout="$CACHE/chain_out"; rm -rf "$chainout"; mkdir -p "$chainout"
+  cargo run -q --release -p temen-run --example nim_chain_op13 -- \
+    "$CACHE/nimsem_ce_raw.temen" "$CACHE/hexer_ce_raw.temen" "$CACHE/nifler.temen" "$BIN/../lib" \
+    "$W/nimcache/$sys.p.nif" "$sys" "$chainout"
+  od="$CACHE/nat_onchain"; rm -rf "$od"; mkdir -p "$od"
+  cp "$chainout/nimcache/$sys.s.nif" "$chainout/nimcache/$sys.s.idx.nif" "$od/" 2>/dev/null
+  ( cd "$od" && "$HEXER_BIN" c "$sys.s.nif" >/dev/null 2>&1 )
+  if diff -q "$od/$sys.x.nif" "$chainout/nimcache/$sys.x.nif" >/dev/null; then
+    echo "CHAIN MATCHES NATIVE — nimsem->hexer both op-13 §14 children over one memfs; the Leng .x.nif is byte-identical to native hexer on the same semchecked input. The nimony front-end runs on Temen as a chain of confined op-13 phases."
+  else
+    echo "FAILED (chain): .x.nif differs"; cmp "$od/$sys.x.nif" "$chainout/nimcache/$sys.x.nif" | head -1; exit 1
+  fi
+else
+  echo "SKIP [6/6] chain: native hexer binary absent ($HEXER_BIN)"
+fi
