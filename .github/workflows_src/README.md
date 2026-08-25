@@ -16,6 +16,25 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **Split the nightly `full-depth-gates` job into parallel jobs (#1074, `ci.yml`)** — the single
+  `full-depth-gates` job ran the Lua suites on BOTH interpreter tiers *and* the whole-language
+  capstones sequentially under `timeout-minutes: 90`. The Lua step alone is ~85 min (bytecode +
+  tree-walker), so the capstones step was cancelled at the 90-min cap every run (tests were passing —
+  it was a wall-clock starvation, not a failure). The job is replaced by:
+  - **`full-depth-lua`** — a `{bytecode, tree-walker}` matrix (`strategy.fail-fast: false`,
+    `timeout-minutes: 75`), each tier its own runner; the suite runs pass the tier as the libtest name
+    filter (`cargo test --test lua_tlib -- --ignored ${{ matrix.tier }}`, etc.).
+  - **`full-depth-capstones`** — the `translate --ignored` capstones (Tcl + full sqlite sweep),
+    `timeout-minutes: 60`, its own runner.
+
+  Same tests, same coverage — just fanned out, so no step starves another and nightly wall-clock drops
+  to ~max(single tier, capstones) instead of the sum. Costs two extra concurrent runners on the nightly
+  cron only. The old job's `install LLVM/clang 18` step is duplicated into both (the Lua job drops
+  `make`/`curl`, which only the capstone fetchers need). A stale `full-depth-gates` mention in the
+  `rust-temen std lane` comment was updated to `full-depth-lua`. (Until copied over, the
+  `workflows-in-sync` guard stays red — the expected mirror-edit friction; `cp
+  .github/workflows_src/*.yml .github/workflows/` drains it.)
+
 - **I67 apt hardening for the `Install Playwright + Chromium` step (`browser-real` job, #1017)** —
   the one apt consumer the 10-site I67 hardening missed: `npx playwright install --with-deps`
   runs its **own** internal `apt-get update && apt-get install` with the runner's default (azure)
