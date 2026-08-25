@@ -2014,6 +2014,9 @@ pub fn compile_and_run_with_host(
     if func as usize >= c.progs.len() {
         return Some(Err(Trap::Malformed));
     }
+    // #799/#1080 — install the personality fork/waitpid park-request door (the cooperative driver
+    // services `ParkEvent::ForkSelf`/`TaskExit` after a `cap.call`); without it the op answers `-ENOSYS`.
+    host.wire_park_door();
     // Size the dispatch table to the granted `Jit` table reservation (matching the tree-walker's
     // `DomainTable::new(funcs, jit_table_log2)`), so guest-driven `install` returns the same slots.
     let dom = Domain::new(c, host.jit_table_log2());
@@ -3366,6 +3369,11 @@ impl<'p> Vcpu<'p> {
                 // `exec_module` image-replace needs the cooperative driver's task/env set; this
                 // single-vCPU path can't rebuild the activation, so fail closed like its neighbours.
                 | Ok(VcpuStop::Exec { .. })
+                // #1080 rung 3 — the personality `fork()`/`waitpid()` caller-request parks need the
+                // cooperative driver's task set (self-fork a twin, park until a child exits); a
+                // single-vCPU path has none, so fail closed like `Exec`/`CloneCaller`.
+                | Ok(VcpuStop::ForkSelf { .. })
+                | Ok(VcpuStop::ReapWait { .. })
                 // I48: `BlockOnFiber` is a cooperative-driver idle (this path passes
                 // `cooperative: false`, so it never arises here); fail closed like its neighbours.
                 | Ok(VcpuStop::BlockOnFiber { .. }) => return VcpuEvent::Trapped(Trap::ThreadFault),
@@ -4225,6 +4233,8 @@ pub fn compile_and_run_capture_reserved_with_host(
     if func as usize >= c.progs.len() {
         return Some((Err(Trap::Malformed), Vec::new()));
     }
+    // #799/#1080 — install the personality fork/waitpid park-request door (see `compile_and_run_with_host`).
+    host.wire_park_door();
     let dom = Domain::new(c, host.jit_table_log2());
     let mut mem = m.memory.map(|mc| {
         let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
@@ -8204,6 +8214,21 @@ enum Outcome {
         size_log2: i64,
         dst: u32,
     },
+    /// #799/#1080 — a personality **`fork()`** caller-request (`ParkEvent::ForkSelf`): the running vCPU
+    /// asks the driver to duplicate it (private window copy + forked powerbox) into a twin task. The
+    /// parent's `dst` receives the twin's pid; the twin resumes at the same op with `0`. On a failed
+    /// fork the parent's `dst` gets `-EAGAIN` (never a hang). Cooperative-driver-only (other drivers
+    /// `ThreadFault`) — the port of the tree-walker's `Blocked::ForkSelf` → `fork_vcpu` engine.
+    ForkSelf {
+        dst: u32,
+    },
+    /// #799 — a personality blocking **`waitpid()`** caller-request (`ParkEvent::TaskExit`/`TaskExitAny`):
+    /// the running vCPU's op was rewound (it re-executes on wake). The driver parks it until the named
+    /// child (`Some(pid)` = a specific twin task, `None` = any child) completes, then re-admits it so the
+    /// re-executed `waitpid` finds the twin retired (its exit hooks fired) and serves the exit status.
+    ReapWait {
+        child: Option<usize>,
+    },
     /// §14 `Instantiator.instantiate`: the authority `(ibase, isize)` is resolved; the driver builds a
     /// **confined executor child** running entry `entry` over `[ibase+off, +2^size_log2)` with its own
     /// attenuated powerbox and `quota` fuel, registers it (handle = thread slot), and writes the handle
@@ -8932,6 +8957,16 @@ enum VcpuStop {
         size_log2: i64,
         dst: u32,
     },
+    /// #799/#1080 — personality `fork()` caller-request surfaced to the cooperative driver (which owns
+    /// the task/env set). Cooperative-driver-only ([`Outcome::ForkSelf`]).
+    ForkSelf {
+        dst: u32,
+    },
+    /// #799 — personality blocking `waitpid()` caller-request surfaced to the cooperative driver
+    /// ([`Outcome::ReapWait`]). `None` = any child.
+    ReapWait {
+        child: Option<usize>,
+    },
     Done(Vec<Value>),
     /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): run the emitted `f{func}` region on the
     /// host, delivering its `n_results` results to absolute slot `dst` via `deliver_tierup`.
@@ -9407,6 +9442,8 @@ fn step_vcpu(
                     dst,
                 })
             }
+            Outcome::ForkSelf { dst } => return Ok(VcpuStop::ForkSelf { dst }),
+            Outcome::ReapWait { child } => return Ok(VcpuStop::ReapWait { child }),
             Outcome::Instantiate {
                 ibase,
                 isize: isz,
@@ -9611,6 +9648,15 @@ enum TaskState {
         pid: usize,
         dst: u32,
     },
+    /// #799/#1080 — parked in a personality **`waitpid()`** (`ParkEvent::TaskExit`/`TaskExitAny`, the
+    /// bytecode port). Unlike [`Self::BlockedReap`] (the serve-handler `reap` that injects a status into
+    /// `dst`), this rewound the guest's `waitpid` op: on `child` completing (`Some(pid)` = a specific
+    /// twin, `None` = any child), the settle scan makes this task `Runnable` and the op **re-executes**,
+    /// so the personality's own `waitpid` serves the exit status (writing it to guest memory, returning
+    /// the pid) against the twin it has by then retired (Live → Zombie via the fired exit hooks).
+    BlockedReapPersonality {
+        child: Option<usize>,
+    },
     /// I48 — parked in a blocking `cont.resume.block` on fiber `fiber` (event-parked, not yet woken).
     /// The resumer's cursor was rewound to the resume op; when `fiber` is woken (idle-timer, notify,
     /// or the cap-completion drain) this task is marked `Runnable` and re-executes the resume, which
@@ -9706,6 +9752,10 @@ struct CoopSched {
     dead_envs: std::collections::BTreeSet<usize>,
     /// FORK.md §9.2 — fork twins minted this run (task index = the pid a `clone_caller` returned).
     forked_twins: std::collections::BTreeSet<usize>,
+    /// #799/#1080 — fork twins whose personality **exit hooks have already fired** (Live → Zombie at
+    /// their completion). Fired once, in the settle scan, before a personality `waitpid` re-execution
+    /// reads the retired status (the bytecode port of the tree-walker's exit-hook-at-death step).
+    hooked_twins: std::collections::BTreeSet<usize>,
     /// The scheduler's logical clock (advanced only when no task is runnable, to the earliest due
     /// `wait` deadline).
     clock: u64,
@@ -9842,6 +9892,7 @@ impl CoopSched {
         // servicer-side `reap` (`wait`) acts only on ids in this allow-set (a foreign/bogus pid is
         // `-ECHILD`, never a park that hangs); an id is retired when reaped.
         let forked_twins: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        let hooked_twins: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
 
         Ok(CoopSched {
             tasks,
@@ -9851,6 +9902,7 @@ impl CoopSched {
             fiber_meta,
             dead_envs,
             forked_twins,
+            hooked_twins,
             clock,
             eligible,
             page_checked,
@@ -9887,6 +9939,7 @@ impl CoopSched {
             fiber_meta,
             dead_envs,
             forked_twins,
+            hooked_twins,
             clock,
             eligible,
             page_checked,
@@ -9951,6 +10004,30 @@ impl CoopSched {
                     t.state = TaskState::Runnable;
                 }
             }
+            // #799/#1080 — a **fork twin** finishing fires its personality exit hooks ONCE (Live →
+            // Zombie in the process table), the bytecode port of the tree-walker's death-hook step. It
+            // runs BEFORE the reap wakes below so a personality `waitpid` re-execution finds the twin
+            // already retired. Gated on the twin registry + a not-yet-hooked marker; a twin is always
+            // its own env, so its host is `extra_envs[k]`. Two-phase (gather host + status, then fire).
+            let to_hook: Vec<(usize, i64, usize)> = tasks
+                .iter()
+                .enumerate()
+                .filter_map(|(ti2, t)| match (&t.state, t.env) {
+                    (TaskState::Done(res), Some(k))
+                        if forked_twins.contains(&ti2) && !hooked_twins.contains(&ti2) =>
+                    {
+                        Some((ti2, super::reap_status(res), k))
+                    }
+                    _ => None,
+                })
+                .collect();
+            for (ti2, status, k) in to_hook {
+                let hooks = extra_envs[k].host.lock_unpoisoned().exit_hooks.clone();
+                for h in hooks {
+                    h(status);
+                }
+                hooked_twins.insert(ti2);
+            }
             // FORK.md §9.2 — reap wakes: a caller parked in `wait(pid)` wakes when fork twin `pid`
             // finishes, with the twin's exit status ([`super::reap_status`]; a trapped twin reaps as a
             // crash status, never a propagated trap — reap ≠ join). Two-phase (read the twin's outcome,
@@ -9970,6 +10047,35 @@ impl CoopSched {
                 tasks[ci].vt.active.set(dst, Reg::from_i64(status));
                 tasks[ci].state = TaskState::Runnable;
                 forked_twins.remove(&pid);
+            }
+            // #799/#1080 — personality `waitpid` wakes: a task parked in [`TaskState::BlockedReapPersonality`]
+            // re-admits (its rewound `waitpid` re-executes) once the named child completes — `Some(pid)`
+            // that specific twin, `None` any forked child. No status is delivered here: the re-executed op
+            // asks the personality, which serves the exit of the twin its exit hooks (fired above) retired.
+            let reap_p_wakes: Vec<usize> = tasks
+                .iter()
+                .enumerate()
+                .filter_map(|(ci, t)| match &t.state {
+                    TaskState::BlockedReapPersonality { child } => {
+                        let done = match child {
+                            // Personality pid → task index is `pid - 1` (the fork convention above).
+                            Some(pid) => matches!(
+                                pid.checked_sub(1)
+                                    .and_then(|i| tasks.get(i))
+                                    .map(|c| &c.state),
+                                Some(TaskState::Done(_))
+                            ),
+                            None => tasks.iter().enumerate().any(|(j, c)| {
+                                forked_twins.contains(&j) && matches!(c.state, TaskState::Done(_))
+                            }),
+                        };
+                        done.then_some(ci)
+                    }
+                    _ => None,
+                })
+                .collect();
+            for ci in reap_p_wakes {
+                tasks[ci].state = TaskState::Runnable;
             }
             // I48 — wake blocking-resume idlers: a `TaskState::BlockedOnFiber { fiber }` becomes
             // runnable once its fiber is woken (the idle-timer's `WAIT_TIMED_OUT`, a `notify`'s
@@ -10568,6 +10674,96 @@ impl CoopSched {
                             }
                         }
                     }
+                }
+                Ok(VcpuStop::ForkSelf { dst }) => {
+                    // #799/#1080 — personality `fork()`: duplicate THIS task into a twin (private window
+                    // copy + forked powerbox). The parent (`ti`) keeps running with the twin's pid; the
+                    // twin resumes at the same op (pc already advanced) with `0`. A non-bare or
+                    // non-forkable caller fails closed to `-EAGAIN` (a value, never a hang — invariant 5).
+                    // The bytecode port of the tree-walker's `Blocked::ForkSelf` → `fork_vcpu` engine.
+                    // The twin's **personality pid** is its task index + 1: the process table's root is
+                    // pid 1 (grant) at task index 0, so `pid = index + 1` aligns the two spaces (twins
+                    // get 2, 3, … — never colliding with the root's 1), and a `waitpid(pid)` maps back to
+                    // task index `pid - 1` (the reap settle below). `twin_ti` stays the raw task index.
+                    let twin_ti = tasks.len();
+                    let twin_pid = twin_ti as u64 + 1;
+                    let bare = tasks[ti].threads.iter().all(|t| t.is_none())
+                        && tasks[ti].vt.active_id == ROOT_FIBER
+                        && tasks[ti].vt.chain.is_empty();
+                    // The window + powerbox to duplicate: a confined child from its `extra_env`, or a
+                    // **root** caller (`env: None`, e.g. `bash -c` forking) from the driver window/host.
+                    let forked: Option<(u64, Option<Mem>, Host)> = if bare {
+                        (|| match tasks[ti].env {
+                            Some(k) => {
+                                let tm = match &extra_envs[k].mem {
+                                    Some(m) => Some(m.fork_private()?),
+                                    None => None,
+                                };
+                                let th = extra_envs[k]
+                                    .host
+                                    .lock_unpoisoned()
+                                    .fork_powerbox(twin_pid)?;
+                                Some((extra_envs[k].fuel, tm, th))
+                            }
+                            None => {
+                                let tm = match mem.as_ref() {
+                                    Some(m) => Some(m.fork_private()?),
+                                    None => None,
+                                };
+                                let th = host.fork_powerbox(twin_pid)?;
+                                Some((*fuel, tm, th))
+                            }
+                        })()
+                    } else {
+                        None
+                    };
+                    match forked {
+                        None => {
+                            tasks[ti].vt.active.set(dst, Reg::from_i64(super::EAGAIN));
+                        }
+                        Some((twin_fuel, twin_mem, twin_host)) => {
+                            // The twin's continuation is the parent's, at the post-fork resume point,
+                            // with the return-twice `0` (the parent keeps the twin's pid, set below). A
+                            // bare root carries no resume chain / invoke (`Vm` derives `Clone`).
+                            let mut twin_active = tasks[ti].vt.active.clone();
+                            twin_active.set(dst, Reg::from_i64(0));
+                            let twin_vt = VTask {
+                                active: twin_active,
+                                active_id: ROOT_FIBER,
+                                chain: Vec::new(),
+                                root_shadow_sp: super::SHADOW_BASE,
+                                active_invoke: None,
+                                invoke_step_into: false,
+                            };
+                            let twin_table = build_table(dom.source.primary().progs.len(), 0);
+                            let twin_eidx = extra_envs.len();
+                            extra_envs.push(ChildEnv {
+                                mem: twin_mem,
+                                host: std::sync::Arc::new(std::sync::Mutex::new(twin_host)),
+                                table: twin_table,
+                                fuel: twin_fuel,
+                            });
+                            debug_assert_eq!(
+                                tasks.len(),
+                                twin_ti,
+                                "twin lands at its pre-read index"
+                            );
+                            tasks.push(TaskSlot {
+                                vt: twin_vt,
+                                threads: Vec::new(),
+                                env: Some(twin_eidx),
+                                state: TaskState::Runnable,
+                            });
+                            forked_twins.insert(twin_ti);
+                            tasks[ti].vt.active.set(dst, Reg::from_i64(twin_pid as i64));
+                        }
+                    }
+                }
+                Ok(VcpuStop::ReapWait { child }) => {
+                    // #799 — personality blocking `waitpid()`: the op was rewound (it re-executes on
+                    // wake). Park until the named child completes; the settle scan re-admits it after
+                    // firing the twin's exit hooks, so the re-executed op finds the twin retired.
+                    tasks[ti].state = TaskState::BlockedReapPersonality { child };
                 }
                 Ok(VcpuStop::Spawn {
                     func,
@@ -12057,6 +12253,9 @@ fn run_vcpu_parallel<'scope, 'env>(
             | Ok(VcpuStop::Reap { .. })
             // `exec_module` image-replace is cooperative-driver-only (needs the task/env set).
             | Ok(VcpuStop::Exec { .. })
+            // #1080 rung 3 — personality `fork()`/`waitpid()` parks are cooperative-driver-only.
+            | Ok(VcpuStop::ForkSelf { .. })
+            | Ok(VcpuStop::ReapWait { .. })
             | Ok(VcpuStop::BlockOnFiber { .. }) => return (Err(Trap::ThreadFault), mem),
             Err(trap) => return (Err(trap), mem),
             Ok(VcpuStop::Done(vals)) => return (Ok(vals), mem),
@@ -13553,6 +13752,40 @@ impl Vm {
                         self.base = base;
                         self.pc = pc;
                         return Ok(Outcome::StdinPark);
+                    }
+                    // #799/#1080 — a personality caller-request (`fork` / blocking `waitpid`) rides this
+                    // dispatch: bash's `fork`/`waitpid` are host-proc ops that set a park request during
+                    // their own dispatch. Always DRAIN it (so it never leaks into the next op); act on it
+                    // only from the ROOT fiber (a serve handler / coroutine keeps the placeholder answer,
+                    // as the tree-walker keeps it off the Real scheduler / root fiber). `fork` advances
+                    // past the op — the driver writes both return-twice replies; `waitpid` REWINDS it, so
+                    // it re-executes on wake after the driver parks the task. The cooperative driver owns
+                    // both ([`Outcome::ForkSelf`]/[`Outcome::ReapWait`]); other drivers `ThreadFault`.
+                    if let Some(ev) = host.with(|p| p.take_park_request()) {
+                        self.module = module;
+                        self.cur = cur;
+                        self.base = base;
+                        match ev {
+                            // `fork` advances past the op; the driver writes both return-twice replies
+                            // (a non-root/non-bare caller degrades to `-EAGAIN` at the driver's `bare`
+                            // gate — never the wrong image). `waitpid` REWINDS the op so it re-executes
+                            // on wake after the driver parks the task. Cooperative-driver-only; a
+                            // non-cooperative driver `ThreadFault`s these (like `Exec`).
+                            super::ParkEvent::ForkSelf => {
+                                self.pc = pc + 1;
+                                return Ok(Outcome::ForkSelf { dst: *dst });
+                            }
+                            super::ParkEvent::TaskExit(id) => {
+                                self.pc = pc;
+                                return Ok(Outcome::ReapWait {
+                                    child: Some(id as usize),
+                                });
+                            }
+                            super::ParkEvent::TaskExitAny => {
+                                self.pc = pc;
+                                return Ok(Outcome::ReapWait { child: None });
+                            }
+                        }
                     }
                     for (i, (s, ty)) in res.iter().zip(results.iter()).enumerate() {
                         self.regs[base + *dst as usize + i] = Reg::from_value(slot_to_val(*ty, *s));
