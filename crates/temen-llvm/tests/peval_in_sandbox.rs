@@ -83,10 +83,13 @@ fn peval_specialize_runs_in_sandbox_and_matches_host() {
     let module = t.module;
     temen_verify::verify_module(&module).expect("verify the translated specializer");
 
-    let run = temen_run::run_powerbox_with_deadline(
+    let run = temen_run::run_powerbox_cfg(
         &module,
         b"",
+        &[],
+        &[],
         Some(std::time::Duration::from_secs(120)),
+        temen_run::Quota::default(),
     )
     .expect("run the in-sandbox specializer");
 

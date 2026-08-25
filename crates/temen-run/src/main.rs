@@ -25,8 +25,8 @@ use std::{env, fs, process};
 
 use temen_ir::Module;
 use temen_run::{
-    is_named_powerbox_entry, run_kernel, run_powerbox_with_args_and_limits, specialize_module,
-    Outcome, Quota, SpecArg, SpecializeOpts, Value,
+    is_named_powerbox_entry, run_kernel, run_powerbox_cfg, specialize_module, Outcome, Quota,
+    SpecArg, SpecializeOpts, Value,
 };
 use temen_verify::verify_module;
 
@@ -211,7 +211,7 @@ fn try_main() -> Result<(), String> {
                 .chain(guest_args.iter().map(|s| s.as_bytes()))
                 .collect()
         };
-        let run = run_powerbox_with_args_and_limits(&module, &stdin, &argv, &[], deadline, quota)?;
+        let run = run_powerbox_cfg(&module, &stdin, &argv, &[], deadline, quota)?;
         // Flush captured output to the real streams (process::exit skips destructors, so flush
         // explicitly), then terminate with the guest's exit code.
         let mut out = std::io::stdout().lock();

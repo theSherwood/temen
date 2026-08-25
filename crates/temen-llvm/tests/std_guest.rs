@@ -373,7 +373,9 @@ fn temen_run_std_with_args(name: &str, src: &str, argv: &[&[u8]]) -> Option<(Vec
     let t =
         temen_llvm::translate_ll_path(&ll).expect("on-ramp translates the std binary's LLVM IR");
     temen_verify::verify_module(&t.module).expect("the translated std binary verifies");
-    let run = temen_run::run_powerbox_with_args(&t.module, b"", argv, &[]).expect("powerbox run");
+    let run =
+        temen_run::run_powerbox_cfg(&t.module, b"", argv, &[], None, temen_run::Quota::default())
+            .expect("powerbox run");
     let exit = match run.outcome {
         temen_run::Outcome::Exited(c) => c as u8,
         temen_run::Outcome::Returned(ref v) => match v.first() {

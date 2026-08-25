@@ -44,7 +44,7 @@ fn peval_guest_specializes_and_jits_in_sandbox() {
 
     let win_arg = win_log2.to_string();
     let argv: [&[u8]; 2] = [b"peval-jit", win_arg.as_bytes()];
-    let run = temen_run::run_powerbox_with_args_and_limits(
+    let run = temen_run::run_powerbox_cfg(
         &module,
         b"",
         &argv,

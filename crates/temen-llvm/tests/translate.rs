@@ -1603,7 +1603,7 @@ fn check_powerbox_vs_native(name: &str, src: &str, stdin: &[u8]) {
 
 /// The argv differential: build/run the native binary with a **controlled `argv`** (`args[0]` as the
 /// process name, via `arg0`, so it matches the Temen blob) and a cleared+seeded environment, then run
-/// the Temen translation with the same vectors through [`temen_run::run_powerbox_with_args`], asserting
+/// the Temen translation with the same vectors through [`temen_run::run_powerbox_cfg`], asserting
 /// stdout + exit code match. This is the only way to compare a `main(int, char**)` program: native
 /// `argv[0]` is otherwise the temp path, which the guest can't (and shouldn't) reproduce.
 fn check_powerbox_vs_native_args(name: &str, src: &str, args: &[&str], env: &[&str]) {
@@ -1635,8 +1635,15 @@ fn check_powerbox_vs_native_args(name: &str, src: &str, args: &[&str], env: &[&s
     temen_verify::verify_module(&module).expect("verify translated IR");
     let argv: Vec<&[u8]> = args.iter().map(|s| s.as_bytes()).collect();
     let envv: Vec<&[u8]> = env.iter().map(|s| s.as_bytes()).collect();
-    let run =
-        temen_run::run_powerbox_with_args(&module, b"", &argv, &envv).expect("powerbox run (args)");
+    let run = temen_run::run_powerbox_cfg(
+        &module,
+        b"",
+        &argv,
+        &envv,
+        None,
+        temen_run::Quota::default(),
+    )
+    .expect("powerbox run (args)");
 
     assert_eq!(
         run.stdout, native.stdout,
@@ -5448,10 +5455,13 @@ fn check_guest_concurrency_demo(name: &str, rel: &str, expect: &[u8]) {
     );
     let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
     temen_verify::verify_module(&module).expect("verify translated IR");
-    let run = temen_run::run_powerbox_with_deadline(
+    let run = temen_run::run_powerbox_cfg(
         &module,
         b"",
+        &[],
+        &[],
         Some(std::time::Duration::from_secs(60)),
+        temen_run::Quota::default(),
     )
     .expect("powerbox run");
     assert_eq!(
@@ -7679,10 +7689,13 @@ fn vm_jit_threads_demo() {
     );
     let module = t.module; // phase 3: the manifest binds at instantiation - no rewrite
     temen_verify::verify_module(&module).expect("verify resolved IR");
-    let run = temen_run::run_powerbox_with_deadline(
+    let run = temen_run::run_powerbox_cfg(
         &module,
         b"",
+        &[],
+        &[],
         Some(std::time::Duration::from_secs(60)),
+        temen_run::Quota::default(),
     )
     .expect("powerbox run");
     assert_eq!(

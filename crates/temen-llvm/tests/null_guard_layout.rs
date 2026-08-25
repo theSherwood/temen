@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use temen_run::run_powerbox_with_args;
+use temen_run::run_powerbox_cfg;
 
 /// A program exercising every relocated scratch consumer: argv/envp parsing (the args blob),
 /// `getenv` (the independent blob reader), `malloc`/`realloc` (the heap words), and `printf` with
@@ -97,8 +97,17 @@ fn guarded_layout_matches_legacy_end_to_end() {
 
     let args: [&[u8]; 4] = [b"prog", b"alpha", b"be", b"c"];
     let env: [&[u8]; 1] = [b"GUEST_HOME=/warm"];
-    let a = run_powerbox_with_args(&legacy, b"", &args, &env).expect("legacy runs");
-    let b = run_powerbox_with_args(&guarded, b"", &args, &env).expect("guarded runs");
+    let a = run_powerbox_cfg(&legacy, b"", &args, &env, None, temen_run::Quota::default())
+        .expect("legacy runs");
+    let b = run_powerbox_cfg(
+        &guarded,
+        b"",
+        &args,
+        &env,
+        None,
+        temen_run::Quota::default(),
+    )
+    .expect("guarded runs");
     assert_eq!(
         String::from_utf8_lossy(&a.stdout),
         "argc=4 sum=8 acc=672 home=/warm\n"
