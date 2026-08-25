@@ -242,6 +242,22 @@ that code. One-arm fix (`Err(Trap::Exit(code)) => code & 0xff`); only genuine tr
 every earlier pipe script by a trailing command. Pinned by three pipeline scripts in the
 capstone (`true | { false; }` → `rc=1`, etc.).
 
+## Explicit `exit` in `-c` mode (DONE — #1062)
+
+`bash -c 'exit N'` (and `set -e`/`set -u` on error, which reach the same terminate path) used to
+**busy-loop forever** — `run_unwind_frame` ↔ `jump_to_top_level` — never reaching the exit. Root
+cause was in the setjmp/longjmp core (#795), not bash: the interp keyed each `setjmp` checkpoint by
+the guest **jmp_buf address** and wrote nothing into the buffer, but bash's `parse_and_execute`
+save/restores `top_level` with `COPY_PROCENV` (a plain `jmp_buf` **memcpy**). After the restore
+memcpy the interp's address-keyed map still pointed at the *inner* checkpoint, so the `EXITPROG`
+re-throw `longjmp(top_level)` resolved to `parse_and_execute`'s own handler again → infinite loop.
+Interactive `exit`, implicit end-of-script exit, and subshell exit all worked (they don't hit that
+copy-then-re-throw path). Fix: `setjmp` now mints a token, **writes it into the jmp_buf's opaque
+first 8 bytes**, and keys the checkpoint by the token; `longjmp` reads the token back from the
+(possibly-copied) buffer — so the identity rides the memcpy. Bounded by pruning checkpoints whose
+frame has returned. Pinned by a `COPY_PROCENV`-shaped C witness (`c_longjmp_through_a_copied_jmp_buf`)
+and three capstone scripts (`exit 7`, `set -e; false`, `set -u`).
+
 ## What remains (the slice ladder from the #802 sketch)
 
 - The `^D`-EOF nuance (the one-shot EOF is writer-count state, so the shell's next read can
