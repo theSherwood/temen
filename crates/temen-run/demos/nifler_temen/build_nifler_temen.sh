@@ -88,6 +88,31 @@ for src in "$HERE"/inputs/*.nim; do
 done
 [ "$fail" = 0 ] && echo "ALL MATCH NATIVE — a real nimony phase (nifler) parses Nim on the Temen, byte-exact" || { echo "FAILED"; exit 1; }
 
+# --- [5b] child-entry: op-13-spawn nifler as a confined §14 child over a shared memfs -----------------
+# The compiler-driver shape (NIM.md §3c, W5): instead of running nifler as a top-level powerbox program,
+# translate it `--child-entry` (func 0 becomes the starter->i64-status child ABI) and drive it through
+# `instantiate_module` (op 13) — argv `nifler p /in.nim /out.nif` seeded into the child's carve, a shared
+# `mem_fs` re-granted as `fs`, `stdout`/`exit` for its imports — then read the emitted `.nif` back out of
+# the shared store. This is the exact hand-off the Rust-on-SVM driver guest uses to fan phases out; here
+# it proves a real phase produces byte-identical NIF as an op-13 child (`examples/spawn_child_fs.rs`).
+echo "=== [5b] translate --child-entry + op-13-spawn over memfs, diff vs native ==="
+"$TR" "$CACHE/nifler.linked.bc" -o "$CACHE/nifler_ce_raw.temen" --binary --host-page 65536 --stub-externs --child-entry
+for src in "$HERE"/inputs/*.nim; do
+  name="$(basename "$src")"
+  rm -rf "$CACHE/nat_ce"; mkdir -p "$CACHE/nat_ce"; cp "$src" "$CACHE/nat_ce/in.nim"
+  ( cd "$CACHE/nat_ce" && "$NIFLER_BIN" p in.nim out.nif >/dev/null 2>&1 )
+  set +e
+  cargo run -q --release -p temen-run --example spawn_child_fs -- \
+    "$CACHE/nifler_ce_raw.temen" "$src" "/out.nif" > "$CACHE/ce_${name}.nif" 2>"$CACHE/ce_${name}.err"; rc=$?
+  set -e
+  if [ "$rc" = 0 ] && diff -q "$CACHE/nat_ce/out.nif" "$CACHE/ce_${name}.nif" >/dev/null; then
+    echo "  $name [child-entry op-13]: OK (byte-identical, $(stat -c%s "$CACHE/ce_${name}.nif") bytes)"
+  else
+    echo "  $name [child-entry op-13]: MISMATCH (exit=$rc)"; head -c 300 "$CACHE/ce_${name}.err" | sed 's/^/    /'; fail=1
+  fi
+done
+[ "$fail" = 0 ] && echo "CHILD-ENTRY MATCHES NATIVE — nifler runs as a confined op-13 §14 child, byte-exact" || { echo "FAILED"; exit 1; }
+
 # --- [6/6] regenerate the committed slice-4 browser asset + gate fixtures (opt-in) -------------------
 # The playground card (`browser/web/play.js`, kind 'nifler') loads `nifler.temen` **gzipped** (~3.8 MB
 # vs ~17.7 MB raw; inflated client-side), and the toolchain-free gate `crates/temen-run/tests/nifler_asset.rs`
@@ -97,6 +122,9 @@ if [ "${TEMEN_NIFLER_EMIT_ASSET:-0}" = 1 ]; then
   echo "=== [6/6] emit committed asset + fixtures (TEMEN_NIFLER_EMIT_ASSET=1) ==="
   gzip -9 -c "$CACHE/nifler.temen" > "$REPO/browser/web/assets/nifler.temen.gz"
   echo "  browser/web/assets/nifler.temen.gz $(stat -c%s "$REPO/browser/web/assets/nifler.temen.gz") B (from $(stat -c%s "$CACHE/nifler.temen") B raw)"
+  # The child-entry variant, for the op-13 toolchain-free gate (`tests/nifler_child_asset.rs`, if present).
+  gzip -9 -c "$CACHE/nifler_ce_raw.temen" > "$HERE/nifler_ce.temen.gz"
+  echo "  nifler_ce.temen.gz $(stat -c%s "$HERE/nifler_ce.temen.gz") B (from $(stat -c%s "$CACHE/nifler_ce_raw.temen") B raw)"
   mkdir -p "$HERE/expected"
   for src in "$HERE"/inputs/*.nim; do
     name="$(basename "$src" .nim)"
