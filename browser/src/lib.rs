@@ -8774,6 +8774,16 @@ static TIERUP_UNIT_WIN_LOG2: std::sync::atomic::AtomicU8 = std::sync::atomic::At
 static TIERUP_UNIT_TABLE_LOG2: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(ONRAMP_JIT_TABLE_LOG2);
 
+/// #1026 slice 4 — the **leaf tier-up size floor** (estimated emitted bytes): a leaf below it stays
+/// on the interpreter rather than tiering up, because the interp↔wasm crossing per call outweighs
+/// what so small an emitted body saves (measured net loss on every dispatch-heavy card, #1026). The
+/// production default is [`temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES`]; [`temen_coop_open`] reads
+/// this when building its eligibility bitmap. Overridable via [`temen_coop_set_tierup_floor`] so the
+/// differential harness can exercise the emitted **mechanism** with tiny guests (floor 0) separately
+/// from this size **policy**, and `bench_tierup_cards.mjs` can sweep the floor in one build.
+static COOP_TIERUP_FLOOR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES);
+
 /// The wasm emitter the tier-up driver installs for a `vm_jit_*`-importing guest (#835/#846):
 /// emit a validated unit whole-module in **Model B2** shape (`compile_module_b2` — its
 /// `call_indirect` dispatches through the driver's shared funcref table, so a **linked** unit's
@@ -8883,6 +8893,16 @@ impl CoopTierupRun {
 
 static mut COOP_RUN: Option<CoopTierupRun> = None;
 
+/// #1026 slice 4 — override the leaf tier-up size floor (estimated emitted bytes) for subsequent
+/// [`temen_coop_open`]s; takes effect at the next open. `bytes == 0` disables the floor entirely (any
+/// emittable leaf tiers up), which the differential harness uses to exercise the emitted **mechanism**
+/// with its tiny synthetic guests; `bench_tierup_cards.mjs` sweeps it to calibrate the default. The
+/// production default ([`temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES`]) applies until this is called.
+#[no_mangle]
+pub extern "C" fn temen_coop_set_tierup_floor(bytes: usize) {
+    COOP_TIERUP_FLOOR.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Open a cooperative tier-up run over the guest module `[mod_ptr, mod_len)` (stdin optional,
 /// `shared` = SharedArrayBuffer memory). Returns `0`/`STATUS_OK` on success, a negative `STATUS_*`
 /// on refusal (decode error, an op outside the engine subset, or nothing for the emitted tier to
@@ -8981,20 +9001,37 @@ pub extern "C" fn temen_coop_open(
             return -STATUS_UNSUPPORTED;
         }
     };
-    // A function tiers up iff the emitter emitted it and its signature is all-i64 (the i64-slot
-    // transport the host marshals by) — exactly the single-vCPU gate.
+    // A function is an **emittable leaf** iff the emitter emitted it with an all-i64 signature (the
+    // i64-slot transport the host marshals by) — exactly the single-vCPU gate. It actually **tiers
+    // up** only if it *also* clears the #1026 leaf tier-up size floor: below it, the interp↔wasm
+    // crossing per call costs more than so small an emitted body saves over interpreting it inline —
+    // a net loss on every dispatch-heavy card. A sub-floor leaf stays *emitted* (an emitted sibling
+    // still calls it natively, no crossing) — only the interpreter's decision to tier *up* into it is
+    // suppressed. Whole-program (no per-leaf crossing) and the `vm_jit_*` unit path (`jit_importer`
+    // below) are untouched.
     let all_i64 = |ts: &[temen_ir::ValType]| ts.iter().all(|t| *t == temen_ir::ValType::I64);
-    let eligible: Vec<bool> = m
+    let floor = COOP_TIERUP_FLOOR.load(std::sync::atomic::Ordering::Relaxed);
+    let emittable_leaf: Vec<bool> = m
         .funcs
         .iter()
         .enumerate()
         .map(|(i, f)| emit[i] && all_i64(&f.params) && all_i64(&f.results))
         .collect();
-    // #835/#926: a `vm_jit_*` importer stays eligible even with no emittable leaf — its win is the
-    // runtime-compiled §22 units running emitted (the JACL macro-staging shape). A guest with neither
-    // an eligible leaf nor a jit importer has nothing for the emitted tier to ever run → decline.
+    let eligible: Vec<bool> = m
+        .funcs
+        .iter()
+        .zip(&emittable_leaf)
+        .map(|(f, &leaf)| leaf && temen_wasm_jit::est_emitted_size(f) >= floor)
+        .collect();
+    // #835/#926: a `vm_jit_*` importer stays worth opening even with no emittable leaf — its win is
+    // the runtime-compiled §22 units running emitted (the JACL macro-staging shape). A guest with
+    // neither an emittable leaf nor a jit importer has nothing for the emitted tier to ever run →
+    // decline (the plain interpreter serves it), exactly as before #1026 slice 4. A guest *with* an
+    // emittable leaf that the size floor gated still opens: coop runs it on its cooperative
+    // interpreter (measured faster than the plain fallback) with zero tier-ups — the "leaves off,
+    // same open" the #1026 bench compares, not a decline to the slower plain path.
     let jit_importer = m.imports.iter().any(|im| im.name.starts_with("vm_jit_"));
-    if !eligible.iter().any(|&e| e) && !jit_importer {
+    if !emittable_leaf.iter().any(|&e| e) && !jit_importer {
         set(STATUS_UNSUPPORTED);
         return -STATUS_UNSUPPORTED;
     }

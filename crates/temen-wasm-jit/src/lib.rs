@@ -1177,6 +1177,18 @@ fn func_uses_bulk_mem(f: &Func) -> bool {
 /// bulk-memory body (~7.75 MB) rejoins the subset under #1004 — kept on the interpreter here.
 const MAX_EST_EMITTED_FN_BYTES: usize = 6_500_000;
 
+/// #1026 slice 4 — the **lower** companion to [`MAX_EST_EMITTED_FN_BYTES`], for the *tier-up*
+/// eligibility decision only (not the emit subset). A leaf whose estimated emitted body is below
+/// this floor is not worth **tiering up** in the interpreter-drives-emitted-leaves model: the fixed
+/// interp↔wasm crossing per call (marshal argv, call the export, deliver results — measured ~2 µs on
+/// tcl's dispatch leaves, #1026) exceeds what so small an emitted body saves over interpreting it
+/// inline. The cooperative fallback driver (`temen_coop_open`, which consults [`est_emitted_size`]
+/// against this) keeps such leaves on the interpreter; a genuinely heavy leaf
+/// (real work per call) clears the floor and still tiers up. Whole-program emit is unaffected — it
+/// runs the whole module as one emitted unit, with no per-leaf crossing to amortize — as is the
+/// `Jit.invoke` unit path (a separate mechanism). Calibrated with `browser/bench_tierup_cards.mjs`.
+pub const MIN_TIERUP_EMITTED_FN_BYTES: usize = 4_096;
+
 /// A conservative upper-bound estimate of `f`'s emitted wasm body size. Memory ops carry the fat
 /// confine + NULL-guard sequence; every block is a `br_table` dispatch target whose edges shuffle
 /// the target block's params ([`emit_edge`]). Calibrated to over-estimate on the shipped cards
@@ -1184,7 +1196,7 @@ const MAX_EST_EMITTED_FN_BYTES: usize = 6_500_000;
 /// with margin. Fail-safe both ways: an under-estimate merely lets an over-limit function through to
 /// a graceful `WebAssembly.compile` fallback (as before #1004), an over-estimate keeps an emittable
 /// function on the interpreter (a cross-tier leaf) — never an escape (§4 confinement is unaffected).
-fn est_emitted_size(f: &Func) -> usize {
+pub fn est_emitted_size(f: &Func) -> usize {
     let pcount = |t: u32| f.blocks.get(t as usize).map_or(0, |b| b.params.len());
     f.blocks
         .iter()

@@ -20,7 +20,8 @@ use temen_browser::{
     temen_coop_jit_wasm_by_handle_len, temen_coop_jit_wasm_by_handle_ptr, temen_coop_jit_wasm_len,
     temen_coop_jit_wasm_ptr, temen_coop_mapped, temen_coop_mapped_now, temen_coop_nfuncs,
     temen_coop_open, temen_coop_paged, temen_coop_pagestate_len, temen_coop_pagestate_ptr,
-    temen_coop_run, temen_coop_shim_ptr, temen_coop_shim_wasm, temen_coop_slot_code,
+    temen_coop_run, temen_coop_set_tierup_floor, temen_coop_shim_ptr, temen_coop_shim_wasm,
+    temen_coop_slot_code,
     temen_coop_table_gen, temen_coop_table_log2, temen_coop_value, temen_coop_wasm_len,
     temen_coop_wasm_ptr, temen_coop_win_len, temen_coop_win_ptr, temen_run_value, temen_status,
     temen_stdout_len, temen_stdout_ptr, COOP_RUN_DONE, COOP_RUN_JIT_INVOKE, COOP_RUN_TIERUP,
@@ -35,6 +36,24 @@ use wasmi::{
 /// The coop session statics are process-global (single-threaded wasm by design) — serialize the tests
 /// in this binary across them.
 static FFI_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire [`FFI_LOCK`] and disable the #1026 leaf tier-up **size floor** for this test. These
+/// differentials exercise the emitted-tier **mechanism** with deliberately tiny synthetic leaves; the
+/// size **policy** (a leaf below the floor stays on the interpreter) is pinned separately in
+/// [`leaf_tierup_size_floor_gates_tiny_and_admits_heavy`]. Floor 0 ⇒ any emittable leaf tiers up, the
+/// behavior these tests were written against. The guard resets to production default on drop so a
+/// test that does *not* call this (the policy test) sees the real default even after one that did.
+fn ffi_guard() -> FloorGuard {
+    let g = FFI_LOCK.lock().unwrap();
+    temen_coop_set_tierup_floor(0);
+    FloorGuard(g)
+}
+struct FloorGuard(std::sync::MutexGuard<'static, ()>);
+impl Drop for FloorGuard {
+    fn drop(&mut self) {
+        temen_coop_set_tierup_floor(temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES);
+    }
+}
 
 /// Where the wasmi harness places the mirrored window / env cell in the emitted module's memory.
 const WIN_BASE: u32 = 0x4_0000;
@@ -390,7 +409,7 @@ fn service_coop_jit_on_wasmi(n_results: usize) -> Option<Vec<i64>> {
 
 #[test]
 fn coop_jit_invoke_pump_matches_the_bytecode_oracle() {
-    let _g = FFI_LOCK.lock().unwrap();
+    let _g = ffi_guard();
     let m = temen_text::parse_module(&coop_jit_guest_text(&unit_blob())).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let bytes = temen_encode::encode_module(&m);
@@ -458,7 +477,7 @@ fn coop_jit_invoke_pump_matches_the_bytecode_oracle() {
 
 #[test]
 fn coop_tierup_pump_matches_the_bytecode_oracle() {
-    let _g = FFI_LOCK.lock().unwrap();
+    let _g = ffi_guard();
     let m = temen_text::parse_module(&coop_guest_text()).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let bytes = temen_encode::encode_module(&m);
@@ -524,6 +543,92 @@ fn coop_tierup_pump_matches_the_bytecode_oracle() {
         unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
     assert_eq!(got_out, want.stdout, "stdout parity with the oracle");
     temen_coop_close();
+}
+
+/// #1026 slice 4 — the leaf tier-up **size floor** gates strictly by [`temen_wasm_jit::est_emitted_size`]:
+/// the same guest tiers up when the floor is at-or-below its leaf's estimated body and stays on the
+/// interpreter when the floor is one byte above — with **identical** guest-observable results either
+/// way (INVARIANTS.md #9: the gate changes which tier runs, never the semantics). Pins that a
+/// dispatch-heavy card's tiny leaves (far below the production default) will not tier up, while a
+/// genuinely heavy leaf still does — the "decision in one place" #1026 asks for.
+#[test]
+fn leaf_tierup_size_floor_gates_tiny_and_admits_heavy() {
+    let _g = ffi_guard(); // resets the floor to the production default on drop
+    let m = temen_text::parse_module(&coop_guest_text()).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+    // The floor is compared against the *outlined* module the open builds its eligibility from
+    // (`outline_cap_calls` runs first), so compute the leaf's estimate on the same shape.
+    let leaf_sz = {
+        let mut outlined = m.clone();
+        temen_wasm_jit::outline_cap_calls(&mut outlined);
+        temen_wasm_jit::est_emitted_size(&outlined.funcs[2])
+    };
+    assert!(
+        leaf_sz < temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES,
+        "the synthetic leaf ({leaf_sz}B) must sit below the production default \
+         ({}B) — so the default gates it, as it gates every dispatch-heavy card's leaves",
+        temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES
+    );
+
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(want.value, 38, "oracle: f(3) + f(5) = 16 + 22 = 38");
+
+    // Drive the guest to completion at a given floor, returning the tier-up count. Parity with the
+    // oracle is asserted on every arm — the gate must never change the result.
+    let drive_at_floor = |floor: usize| -> u32 {
+        temen_coop_set_tierup_floor(floor);
+        let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+        assert_eq!(opened, 0, "open (floor {floor}) status {}", temen_status());
+        let n_results = m.funcs[2].results.len();
+        let mut tierups = 0u32;
+        loop {
+            match temen_coop_run() {
+                COOP_RUN_TIERUP => {
+                    tierups += 1;
+                    assert!(tierups < 50, "runaway tier-ups");
+                    assert_eq!(temen_coop_func(), 2, "only the leaf (func 2) can tier up");
+                    match service_coop_on_wasmi(n_results) {
+                        Some(res) => temen_coop_deliver(res.as_ptr(), res.len()),
+                        None => temen_coop_deliver_trap(),
+                    }
+                }
+                COOP_RUN_DONE => break,
+                ev => panic!("unexpected event {ev} (floor {floor}, status {})", temen_status()),
+            }
+        }
+        assert_eq!(temen_status(), want.status, "status parity (floor {floor})");
+        assert_eq!(temen_coop_value(), want.value, "value parity (floor {floor})");
+        // SAFETY: DONE-arm capture slots; sole accessor under FFI_LOCK.
+        let got_out =
+            unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
+        assert_eq!(got_out, want.stdout, "stdout parity (floor {floor})");
+        temen_coop_close();
+        tierups
+    };
+
+    // A floor comfortably below the leaf's estimate ⇒ eligible (the predicate is `>=`) ⇒ both the
+    // root's and the worker's `call 2` tier up. (Floors are held off the exact estimate to stay
+    // robust to a byte or two of encode/outline drift between here and the open.)
+    assert_eq!(
+        drive_at_floor(leaf_sz / 2),
+        2,
+        "a floor below the leaf est size admits it (root + worker tier up)"
+    );
+    // A floor a few times the leaf ⇒ gated ⇒ the interpreter runs the leaf inline, zero crossings,
+    // same result — the size comparison, not an on/off switch.
+    assert_eq!(
+        drive_at_floor(leaf_sz * 4),
+        0,
+        "a floor above the leaf est size suppresses its tier-up"
+    );
+    // And the production default (well above any dispatch leaf) gates it too.
+    assert_eq!(
+        drive_at_floor(temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES),
+        0,
+        "the production default gates this dispatch-leaf-sized function"
+    );
 }
 
 // ============================================================================================
@@ -961,7 +1066,7 @@ fn drive_coop_b2_session_allow_trap(m: &temen_ir::Module) -> (CoopB2Driver, u32)
 /// driver's `"pagestate"` wiring + mid-invoke refresh.
 #[test]
 fn coop_rodata_and_midinvoke_grow_match_the_oracle() {
-    let _g = FFI_LOCK.lock().unwrap();
+    let _g = ffi_guard();
     let (_out_h, mem_h) = onramp_out_mem_handles();
 
     // Ro load succeeds; Ro store traps — through the paged coop tier.
@@ -1050,7 +1155,7 @@ fn coop_rodata_and_midinvoke_grow_match_the_oracle() {
 /// `sync_pagestate` refresh.
 #[test]
 fn coop_unmap_protect_guest_without_rodata_opens_paged() {
-    let _g = FFI_LOCK.lock().unwrap();
+    let _g = ffi_guard();
     let (_out_h, mem_h) = onramp_out_mem_handles();
 
     for (store, want_trap) in [(false, false), (true, true)] {
@@ -1165,7 +1270,7 @@ export 0 func "_start" 0
 
 #[test]
 fn coop_indirect_leaf_tiers_up_natively() {
-    let _g = FFI_LOCK.lock().unwrap();
+    let _g = ffi_guard();
     let m = temen_text::parse_module(&coop_indirect_guest_text()).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let bytes = temen_encode::encode_module(&m);
@@ -1304,7 +1409,7 @@ export 0 func "_start" 0
 
 #[test]
 fn coop_leaf_reaches_installed_unit_natively() {
-    let _g = FFI_LOCK.lock().unwrap();
+    let _g = ffi_guard();
     let m = temen_text::parse_module(&coop_installed_unit_guest_text()).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let bytes = temen_encode::encode_module(&m);
@@ -1464,7 +1569,7 @@ export 0 func "_start" 0
 
 #[test]
 fn coop_invoked_unit_bounces_and_native_edges_match_the_oracle() {
-    let _g = FFI_LOCK.lock().unwrap();
+    let _g = ffi_guard();
     let m = temen_text::parse_module(&coop_invoke_bounce_guest_text()).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let bytes = temen_encode::encode_module(&m);
@@ -1603,7 +1708,7 @@ block 0 () {{
 /// up — parity with the oracle.
 #[test]
 fn coop_fiber_guest_is_admitted_and_matches_the_oracle() {
-    let _g = FFI_LOCK.lock().unwrap();
+    let _g = ffi_guard();
     let src = r#"memory 16
 func () -> (i64) {
 block 0 () {
@@ -1674,7 +1779,7 @@ export 0 func "_start" 0
 /// driver surfaces **zero** JIT_INVOKE events (emitting one would run fiber ops on a wasm frame).
 #[test]
 fn coop_fiber_hosting_unit_is_admitted_and_matches_the_oracle() {
-    let _g = FFI_LOCK.lock().unwrap();
+    let _g = ffi_guard();
     let fiber_unit_blob = {
         let src = r#"memory 16
 func (i64) -> (i64) {
@@ -1741,7 +1846,7 @@ block 0 (vsp: i64, varg: i64) {{
 /// bogus code handle traps — pinned on the oracle (both drivers inherit it).
 #[test]
 fn coop_futex_unit_is_still_refused() {
-    let _g = FFI_LOCK.lock().unwrap();
+    let _g = ffi_guard();
     let unit_src = r#"memory 16
 func (i64) -> (i64) {
 block 0 (v0: i64) {
@@ -1768,7 +1873,7 @@ block 0 (v0: i64) {
 /// open (`STATUS_UNSUPPORTED`) so the page runs the plain bytecode path — same fail-closed gate.
 #[test]
 fn coop_open_fails_closed_without_an_eligible_leaf() {
-    let _g = FFI_LOCK.lock().unwrap();
+    let _g = ffi_guard();
     let src = r#"memory 16
 func () -> (i64) {
 block 0 () {
@@ -1804,7 +1909,7 @@ export 0 func "_start" 0
 /// dispatches natively (zero bounces), matching the oracle.
 #[test]
 fn coop_installed_unit_edge_dispatches_natively() {
-    let _g = FFI_LOCK.lock().unwrap();
+    let _g = ffi_guard();
     let (out_h, jit_h) = onramp_out_jit_handles();
     let unit_a_src = r#"memory 16
 func (i64) -> (i64) {
@@ -1903,7 +2008,7 @@ export 0 func "_start" 0
 /// identically (a fixed-1024 mask silently reached a wrong, identically-typed function).
 #[test]
 fn coop_high_index_dispatch_beyond_the_table_floor_matches_the_oracle() {
-    let _g = FFI_LOCK.lock().unwrap();
+    let _g = ffi_guard();
     let out_h = onramp_out_handle();
     const TARGET: usize = 1050;
     const INPUT: i64 = 12345;
@@ -1995,7 +2100,7 @@ block 0 (v0: i64) {{
 /// post-bounce `"mapped"` fan-out; the bounce's stdout interleaves exactly as interpreted.
 #[test]
 fn coop_tierup_region_bounce_grows_and_streams() {
-    let _g = FFI_LOCK.lock().unwrap();
+    let _g = ffi_guard();
     let (out_h, mem_h) = onramp_out_mem_handles();
     const X: i64 = 1234;
     let src = format!(
@@ -2086,7 +2191,7 @@ export 0 func "_start" 0
 /// pins the context split in the driver's bounce.
 #[test]
 fn coop_fiber_from_tierup_bounce_persists() {
-    let _g = FFI_LOCK.lock().unwrap();
+    let _g = ffi_guard();
     let (out_h, _mem_h) = onramp_out_mem_handles();
     const X: i64 = 500;
     let src = format!(
@@ -2175,7 +2280,7 @@ export 0 func "_start" 0
 /// storing into the just-grown page after the bounce.
 #[test]
 fn coop_direct_cross_tier_call_bounces_over_the_live_window() {
-    let _g = FFI_LOCK.lock().unwrap();
+    let _g = ffi_guard();
     let (out_h, mem_h) = onramp_out_mem_handles();
     let src = format!(
         r#"memory 16
@@ -2264,7 +2369,7 @@ export 0 func "_start" 0
 /// admitted, its dead op never reached, and its pure leaf tiers up — parity with the oracle.
 #[test]
 fn coop_dead_concurrency_op_is_admitted_and_tiers_up() {
-    let _g = FFI_LOCK.lock().unwrap();
+    let _g = ffi_guard();
     let (out_h, mem_h) = onramp_out_mem_handles();
     let src = format!(
         r#"memory 16
@@ -2344,7 +2449,7 @@ export 0 func "_start" 0
 /// DONE with full parity, its leaf having tiered up first.
 #[test]
 fn coop_reachable_concurrency_op_is_serviced_and_matches_the_oracle() {
-    let _g = FFI_LOCK.lock().unwrap();
+    let _g = ffi_guard();
     let out_h = onramp_out_handle();
     let src = format!(
         r#"memory 16
@@ -2402,7 +2507,7 @@ export 0 func "_start" 0
 /// outlined wrapper (index 3), interleaving stdout exactly as interpreted.
 #[test]
 fn coop_hot_loop_with_inline_cap_write_emits_and_bounces_per_iteration() {
-    let _g = FFI_LOCK.lock().unwrap();
+    let _g = ffi_guard();
     let out_h = onramp_out_handle();
     let src = format!(
         r#"memory 16
@@ -2485,7 +2590,7 @@ export 0 func "_start" 0
 /// oracle, emitted events serviced by the full B2 driver as they surface. Absent asset ⇒ SKIP.
 #[test]
 fn coop_jacl_compiler_runs_through_the_driver() {
-    let _g = FFI_LOCK.lock().unwrap();
+    let _g = ffi_guard();
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../../codegen/selfhost/build/jacl_compiler.temen"
