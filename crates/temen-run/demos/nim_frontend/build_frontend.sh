@@ -81,3 +81,19 @@ if diff -q <(norm "$CACHE/native.s.nif") <(norm /tmp/temen_sys.s.nif) >/dev/null
 else
   echo "FAILED: residual semantic differences after path normalization:"; diff <(norm "$CACHE/native.s.nif") <(norm /tmp/temen_sys.s.nif) | head -20; exit 1
 fi
+
+# ---- [5/5] the same front-end as a confined §14 op-13 child (the Rust-on-Temen driver-guest shape) ---
+# nimsem is itself a driver (it `system("nifler …")`s to parse stdlib), so running it as an op-13 child
+# needs the `exec` cap **re-granted into the child** — the op-13 grant list carries {fs, stdout, exit,
+# exec}, and nimsem-the-child spawns nifler grandchildren via that re-granted exec over the same memfs.
+# `nimsem_child_driver` proves it: byte-identical (path-normalized) to native, the same oracle.
+echo "=== [5/5] child-entry: nimsem as an op-13 child, exec re-granted (drives nifler grandchildren) ==="
+"$TR" "$CACHE/c_nimsem/linked.bc" -o "$CACHE/nimsem_ce_raw.temen" --binary --host-page 65536 --stub-externs --child-entry
+ceout="$CACHE/ce_out"; rm -rf "$ceout"; mkdir -p "$ceout"
+cargo run -q --release -p temen-run --example nimsem_child_driver -- \
+  "$CACHE/nimsem_ce_raw.temen" "$CACHE/nifler.temen" "$BIN/../lib" "$W/nimcache/$sys.p.nif" "$sys" "$ceout"
+if diff -q <(norm "$CACHE/native.s.nif") <(norm "$ceout/nimcache/$sys.s.nif") >/dev/null; then
+  echo "CHILD-ENTRY MATCHES NATIVE — nimsem runs as a confined op-13 §14 child, spawning nifler grandchildren via the re-granted exec cap, byte-exact (path-normalized)"
+else
+  echo "FAILED (child-entry): residual diff:"; diff <(norm "$CACHE/native.s.nif") <(norm "$ceout/nimcache/$sys.s.nif") | head -20; exit 1
+fi
