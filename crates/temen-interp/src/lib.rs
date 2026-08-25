@@ -12366,102 +12366,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         let mut hg = host.lock_unpoisoned();
                         hg.spawn_named_child(grants, child_size)
                             .and_then(|(mut ch, ci, ca)| {
-                                ch.self_module = Some(Arc::clone(&cm.module));
-                                // #801 — the image-replace keeps the TaskId, so it must keep the
-                                // domain's task-lifecycle wiring too: the **exit hooks** (a
-                                // personality fork twin's retire-to-Zombie — without the carry an
-                                // exec'd twin's exit never retires and the parent's blocking
-                                // `waitpid` hangs, breaking §8.6's "wait reaps the command's
-                                // exit") and the **signal source + armed flag** (the twin stays
-                                // kill/stop-addressable after exec — the #796 doors reach the
-                                // domain, not an image). Dispositions resetting to default on
-                                // exec is personality policy, not this carry's concern.
-                                ch.exit_hooks = hg.exit_hooks.clone();
-                                if let Some(src) = hg.sig_source.as_ref() {
-                                    ch.set_signal_source(
-                                        Arc::clone(src),
-                                        Arc::clone(&hg.sig_armed),
-                                    );
-                                }
-                                // #802 interactive — the door's stop/kill/park-request closures
-                                // (minted at the twin's fork wiring) store into THESE cells; the
-                                // exec'd vCPU polls its new host's. Share the cells across the
-                                // image-replace, or a post-exec ^Z/kill sets a flag nothing reads
-                                // (observed: an exec'd `cat` ignored SIGTSTP — the fg job could
-                                // never stop).
-                                ch.stop_flag = Arc::clone(&hg.stop_flag);
-                                ch.term_flag = Arc::clone(&hg.term_flag);
-                                ch.park_request = Arc::clone(&hg.park_request);
-                                // #801 — exec is the SAME PROCESS, so the host-served personality
-                                // moves verbatim (same handler over the same Proc — fds, pid,
-                                // env survive exec, POSIX), never through the spawn re-grant
-                                // (which fork-clones a fresh anonymous process). Each carried
-                                // entry re-grants a handle in the new powerbox, and a published
-                                // vtable registers its op names in the new image's directory so
-                                // a `__px_`-linked manifest binds below. Restored on a bind
-                                // refusal: a failed exec leaves the caller running with its
-                                // personality intact (POSIX: execve returns only on failure).
-                                let moved = std::mem::take(&mut hg.host_procs);
-                                let nmoved = moved.len();
-                                for e in moved {
-                                    let vt = e.vtable.clone();
-                                    let idx = ch.host_procs.len() as u32;
-                                    ch.host_procs.push(e);
-                                    let nh = ch.grant(cap_id::HOST_PROC, Binding::HostProc(idx));
-                                    if let Some(vt) = vt {
-                                        for name in vt.0.iter() {
-                                            ch.register_cap_name(name, nh);
-                                        }
-                                    }
-                                }
-                                // #972 — exec keeps the process's **pipe ends** (POSIX keeps
-                                // fds): every PipeEnd binding re-installs into the new powerbox
-                                // (count bumps BEFORE the commit's old-powerbox release, so the
-                                // shared counts never dip), and the personality's exec-remap
-                                // hooks receive the (old, new) handle pairs to re-point its fd
-                                // table — the exit-hook lifecycle family: the core reports
-                                // renumbering of ends the process already held, policy stays
-                                // with the provider.
-                                // Gated on a provider having DECLARED fd-preservation (an
-                                // exec-remap hook registered): the personality's fd table means
-                                // POSIX keeps-fds; a capability-path guest manages its ends
-                                // explicitly through the grant list, and its established exec
-                                // contract is drop-by-default — auto-carrying would inflate its
-                                // counts and break last-close EOF/EPIPE (`yes | head`).
-                                let mut remap: Vec<(i32, i32)> = Vec::new();
-                                let keep_fds = !hg.exec_remap_hooks.is_empty();
-                                for slot in 0..(if keep_fds { hg.table.len() } else { 0 }) {
-                                    let st = &hg.table[slot];
-                                    if st.entry.is_none() {
-                                        continue;
-                                    }
-                                    let old_h = ((st.generation & GEN_MASK) << CAP_LOG2
-                                        | slot as u32)
-                                        as i32;
-                                    if let Some((is_w, backing)) = hg.resolve_pipe_end(old_h) {
-                                        let nh = ch.install_pipe_end(is_w, backing);
-                                        remap.push((old_h, nh));
-                                    }
-                                }
-                                match ch.bind_child_manifest(&cm.imports, &cm.types) {
-                                    Ok(()) => {
-                                        for hook in hg.exec_remap_hooks.iter() {
-                                            hook(&remap);
-                                        }
-                                        ch.exec_remap_hooks = hg.exec_remap_hooks.clone();
-                                        Some((ch, ci, ca, child_size))
-                                    }
-                                    Err(_) => {
-                                        // Give the entries back and release the pre-bumped pipe
-                                        // ends (a dead never-run child Host has no teardown):
-                                        // the exec refuses cleanly, the caller keeps running.
-                                        ch.drop_all_pipe_writers();
-                                        ch.drop_all_pipe_readers();
-                                        let n = ch.host_procs.len();
-                                        hg.host_procs = ch.host_procs.drain(n - nmoved..).collect();
-                                        None
-                                    }
-                                }
+                                // #1080 — the personality carry (self_module, exit/signal/stop/park
+                                // cells, host_procs, pipe-end re-install + exec-remap) is shared with
+                                // the bytecode engine's exec arm via `Host::exec_carry`, so this
+                                // TCB-sensitive logic lives once. On a manifest-bind failure it unwinds
+                                // and returns `Err` → the exec refuses cleanly (caller keeps running).
+                                hg.exec_carry(&mut ch, &cm.module, &cm.imports, &cm.types)
+                                    .ok()
+                                    .map(|_remap| (ch, ci, ca, child_size))
                             })
                     } else {
                         None
@@ -21500,6 +21412,99 @@ impl Host {
             ch.register_cap_name(name, cg);
         }
         Some((ch, cinst, cas))
+    }
+
+    /// FORK.md §8.6 (#1080) — carry an `execve` **image-replace**'s process-surviving state from `self`
+    /// (the old powerbox, about to be dropped) into `child` (the command's fresh powerbox from
+    /// [`Self::spawn_named_child`]). Same-process semantics: the personality (`host_procs`) moves
+    /// verbatim (fds/pid/env survive exec, POSIX), the exit-hook + signal + stop/term/park cells are
+    /// shared so the exec'd image stays kill/stop/wait-addressable, and the process's pipe **ends** are
+    /// re-installed into the new powerbox (returned as `(old, new)` remap pairs) with the exec-remap
+    /// hooks fired so the personality re-points its fd table. Then binds the command's import manifest.
+    ///
+    /// Returns the pipe-end remap on success. On a manifest-bind failure everything is unwound (the
+    /// child's pre-bumped pipe ends released, the moved `host_procs` returned to `self`) and `Err(())`
+    /// is returned — the caller keeps running (POSIX: `execve` returns only on failure). The caller
+    /// still owns the parent-side pipe-end drop + scheduler wake of the OLD image (engine-specific).
+    ///
+    /// Shared by the tree-walker's `Step::Exec` dispatch and the bytecode engine's exec pump arm so
+    /// this TCB-sensitive carry lives in exactly one place (the tree-walker is the differential oracle).
+    pub(crate) fn exec_carry(
+        &mut self,
+        child: &mut Host,
+        cmodule: &Arc<temen_ir::Module>,
+        imports: &[temen_ir::Import],
+        types: &[temen_ir::TypeEntry],
+    ) -> Result<Vec<(i32, i32)>, ()> {
+        // The command serves its OWN offers / resolves `cap.self` against its module.
+        child.self_module = Some(Arc::clone(cmodule));
+        // The task-lifecycle wiring: exit hooks (a personality fork twin's retire-to-Zombie — without
+        // it an exec'd twin's exit never retires and a blocking `waitpid` hangs) and the signal
+        // source + armed flag (the twin stays kill/stop-addressable after exec — the doors reach the
+        // domain, not an image).
+        child.exit_hooks = self.exit_hooks.clone();
+        if let Some(src) = self.sig_source.as_ref() {
+            child.set_signal_source(Arc::clone(src), Arc::clone(&self.sig_armed));
+        }
+        // The stop/kill/park-request cells the doors store into: share them across the image-replace,
+        // or a post-exec ^Z/kill sets a flag nothing reads.
+        child.stop_flag = Arc::clone(&self.stop_flag);
+        child.term_flag = Arc::clone(&self.term_flag);
+        child.park_request = Arc::clone(&self.park_request);
+        // The host-served personality moves VERBATIM (same handler over the same Proc — fds, pid, env
+        // survive exec), never through a fresh fork-clone. Each carried entry re-grants a handle in the
+        // new powerbox, and its published vtable registers its op names in the new image's directory so
+        // a `__px_`-linked manifest binds below.
+        let moved = std::mem::take(&mut self.host_procs);
+        let nmoved = moved.len();
+        for e in moved {
+            let vt = e.vtable.clone();
+            let idx = child.host_procs.len() as u32;
+            child.host_procs.push(e);
+            let nh = child.grant(cap_id::HOST_PROC, Binding::HostProc(idx));
+            if let Some(vt) = vt {
+                for name in vt.0.iter() {
+                    child.register_cap_name(name, nh);
+                }
+            }
+        }
+        // The process's pipe ends re-install into the new powerbox (POSIX keeps fds), gated on a
+        // provider having DECLARED fd-preservation (an exec-remap hook registered) — a capability-path
+        // guest manages its ends explicitly and its exec contract is drop-by-default. The count bumps
+        // (`install_pipe_end`) happen BEFORE the driver's old-image release, so the shared counts never
+        // dip through the image-replace.
+        let mut remap: Vec<(i32, i32)> = Vec::new();
+        let keep_fds = !self.exec_remap_hooks.is_empty();
+        for slot in 0..(if keep_fds { self.table.len() } else { 0 }) {
+            let st = &self.table[slot];
+            if st.entry.is_none() {
+                continue;
+            }
+            let old_h = ((st.generation & GEN_MASK) << CAP_LOG2 | slot as u32) as i32;
+            if let Some((is_w, backing)) = self.resolve_pipe_end(old_h) {
+                let nh = child.install_pipe_end(is_w, backing);
+                remap.push((old_h, nh));
+            }
+        }
+        match child.bind_child_manifest(imports, types) {
+            Ok(()) => {
+                for hook in self.exec_remap_hooks.iter() {
+                    hook(&remap);
+                }
+                child.exec_remap_hooks = self.exec_remap_hooks.clone();
+                Ok(remap)
+            }
+            Err(_) => {
+                // A failed exec leaves the caller running with its personality intact: release the
+                // child's pre-bumped ends (a never-run child Host has no teardown) and move the carried
+                // `host_procs` back to `self` (they sit at the tail of the child's vec).
+                child.drop_all_pipe_writers();
+                child.drop_all_pipe_readers();
+                let n = child.host_procs.len();
+                self.host_procs = child.host_procs.drain(n - nmoved..).collect();
+                Err(())
+            }
+        }
     }
 
     /// **D45 allocation-free fast path for `Clock.now()`** (ISSUES.md I12). The generic

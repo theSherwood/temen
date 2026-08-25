@@ -2187,9 +2187,10 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                                         v.jit_result_types = rtypes.unwrap();
                                         return PAR_JIT_INVOKE;
                                     }
-                                    Err(t) => v
-                                        .inner
-                                        .deliver_jit_invoke(Err(t), std::sync::Arc::from(Vec::new())),
+                                    Err(t) => v.inner.deliver_jit_invoke(
+                                        Err(t),
+                                        std::sync::Arc::from(Vec::new()),
+                                    ),
                                 }
                             } else {
                                 // #922: split the resolved `(funcs, types)` for delivery.
@@ -2197,9 +2198,10 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                                     Ok((funcs, types)) => {
                                         v.inner.deliver_jit_invoke(Ok(funcs), types)
                                     }
-                                    Err(t) => v
-                                        .inner
-                                        .deliver_jit_invoke(Err(t), std::sync::Arc::from(Vec::new())),
+                                    Err(t) => v.inner.deliver_jit_invoke(
+                                        Err(t),
+                                        std::sync::Arc::from(Vec::new()),
+                                    ),
                                 }
                             }
                         }
@@ -2933,6 +2935,131 @@ pub fn onramp_posix_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
         stdout: posix.stdout(),
         stderr: posix.stderr(),
         framebuffer: None, // the personality grants no `display` cap
+    }
+}
+
+/// Run the **real GNU bash** binary (#802 / #1080) in the browser: the whole-program bash module the
+/// `demos/bash` on-ramp produces, on the bytecode engine, under the POSIX personality — the playground
+/// twin of `demos/bash`'s native `bash_probe`/capstone. `argv` is the command line (e.g. `["bash",
+/// "-c", "echo hi"]`); `stdin` seeds the personality's `read(0, …)`.
+///
+/// bash is unlike the bespoke `temen-posix` shell ([`onramp_posix_exec`]) in three ways this entry
+/// handles:
+///   1. **argv, not stdin.** bash's synthesized `_start` parses `argc`/`argv` from the powerbox args
+///      buffer — so the `{argc,envc}`-prefixed blob is seeded at [`temen_ir::module_args_base`] via
+///      `init_mem` (the browser twin of `temen-run`'s `build_args_blob`; the `pg_setup` shape).
+///   2. **bash brings its own `malloc`.** Its single manifest import is `vm_map` (`AddressSpace` op 0);
+///      the personality is granted heap `0,0` (serves *no* heap — the `bash_probe` "heap 0,0"), and
+///      `vm_map` binds to a growable [`Host::grant_memory`] cap so `malloc` grows into the reserved
+///      tail. Hence the **reserved-window** engine ([`bytecode::compile_and_run_capture_reserved_with_host`]).
+///   3. **the personality is reached by name.** bash has no POSIX manifest imports — its shim band 0
+///      resolves the personality through `__vm_cap_resolve("posix")`, so the grant is registered under
+///      the name `"posix"` (the `run_with_caps(&[("posix", …)])` name), and it owns bash's fd 1/2 —
+///      its captured stdout/stderr is the run's output.
+///
+/// The `.temen` module itself is a **build-at-deploy asset** (GPLv3 — never vendored; see #1080), so
+/// this entry takes the decoded module the caller loaded; there is no committed bash fixture.
+pub fn bash_exec(m: &temen_ir::Module, argv: &[&[u8]], stdin: &[u8]) -> PbOutcome {
+    bash_exec_with(m, argv, stdin, &[])
+}
+
+/// As [`bash_exec`], plus a **`/bin` registry** of external commands `(path, module)` — each granted as
+/// a `Module` and registered as a filesystem executable so `fork → execve("/bin/<cmd>")` resolves to a
+/// separate compiled child (the `bash_probe` `BASH_PROBE_BIN` shape; coreutils staging is #1080 slice
+/// 2). With none registered, an external command reports `not found` and the shell keeps going.
+pub fn bash_exec_with(
+    m: &temen_ir::Module,
+    argv: &[&[u8]],
+    stdin: &[u8],
+    bins: &[(&str, &temen_ir::Module, u8)],
+) -> PbOutcome {
+    let unsupported = |status: i32| PbOutcome {
+        status,
+        value: 0,
+        exit_code: 0,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        framebuffer: None,
+    };
+    // The on-ramp shape gate: a `vm_map`-importing bash module is a named-powerbox entry (paramless
+    // `_start`), so `onramp_check` passes it; a non-bash module falls closed here.
+    if onramp_check(m).is_err() {
+        return unsupported(STATUS_UNSUPPORTED);
+    }
+    use temen_interp::cap_id;
+    let mut host = Host::new();
+    // The personality — the full forkable POSIX surface (fork, signals, exec-remap, fd/process ops),
+    // `grant` wiring exactly what `bash_probe`'s native `cap` does. Heap `0,0`: bash brings its own
+    // `malloc` (below), so the personality serves no heap. It owns stdin (`read(0)`) and stdout/stderr.
+    let (px_h, posix) = temen_posix::grant(&mut host, 0, 0, stdin.to_vec());
+    // Reached by name: bash's shim resolves the personality via `__vm_cap_resolve("posix")`.
+    host.register_cap_name("posix", px_h);
+    // bash's single manifest import `vm_map` (`AddressSpace` op 0) is its `malloc`'s page-commit op —
+    // bind it to a growable memory cap (`base 0, size u64::MAX`) so the heap grows into the reserved
+    // tail. Other AddressSpace ops (`vm_unmap`/`vm_protect`/`vm_page_size`) share the same handle.
+    let mem_h = host.grant_memory();
+    let bindings = m
+        .imports
+        .iter()
+        .map(|im| match im.name.as_str() {
+            "vm_map" | "vm_unmap" | "vm_protect" | "vm_page_size" | "vm_region_create" => {
+                let op = match im.name.as_str() {
+                    "vm_map" => 0,
+                    "vm_unmap" => 1,
+                    "vm_protect" => 2,
+                    "vm_page_size" => 3,
+                    _ => 5,
+                };
+                temen_interp::BoundImport::required(cap_id::ADDRESS_SPACE, op, mem_h)
+            }
+            // A bash module should import only the AddressSpace ops; anything else is unexpected —
+            // leave the slot unbound so it fails closed at dispatch rather than mis-binding.
+            _ => temen_interp::BoundImport::rebindable(0, 0, None),
+        })
+        .collect();
+    host.set_import_bindings(bindings);
+    // Optional /bin: register each command module as a filesystem executable so `execve("/bin/<cmd>")`
+    // spawns it (op 13). `register_executable` is the personality's exec-bit registry.
+    for (path, cm, wl) in bins {
+        let ch = host.grant_module(cm);
+        posix.register_executable(path, ch, *wl);
+    }
+    // Seed `argv` + a minimal `env` at the module's powerbox args base (`{argc,envc}` LE prefix +
+    // packed NUL strings), where the synthesized `_start` reads it. `PATH=/bin` lets bash resolve an
+    // external command (`seq` → `/bin/seq`, registered above) for fork → execve; `HOME=/` is the
+    // conventional minimum (the `bash_probe` env).
+    let env: &[&[u8]] = &[b"PATH=/bin", b"HOME=/"];
+    let blob = temen_ir::write_args_blob(argv, env);
+    let base = temen_ir::module_args_base(m) as usize;
+    let mut init_mem = vec![0u8; base + blob.len()];
+    init_mem[base..].copy_from_slice(&blob);
+    let mut fuel = u64::MAX;
+    let (status, value, exit_code) = match bytecode::compile_and_run_capture_reserved_with_host(
+        m,
+        0,
+        &[],
+        &mut fuel,
+        &init_mem,
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        &mut host,
+    ) {
+        None => (STATUS_UNSUPPORTED, 0, 0),
+        Some((Err(Trap::Exit(code)), _)) => (STATUS_EXIT, 0, code),
+        Some((Err(_), _)) => (STATUS_TRAP, 0, 0),
+        Some((Ok(vals), _)) => match vals.first() {
+            Some(Value::I64(x)) => (STATUS_OK, *x, 0),
+            Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
+            _ => (STATUS_OK, 0, 0), // bash's `main` may return void through `_start`
+        },
+    };
+    // The personality owns bash's fd 1/2 — its captured streams are the run's output.
+    PbOutcome {
+        status,
+        value,
+        exit_code,
+        stdout: posix.stdout(),
+        stderr: posix.stderr(),
+        framebuffer: None,
     }
 }
 
