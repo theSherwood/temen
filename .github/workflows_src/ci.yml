@@ -251,8 +251,9 @@ jobs:
       # spec_verify) plus the differential/miscompile finders: diff (interp⇄JIT), fork_diff
       # (oracle⇄bytecode fork), wasm_diff (interp⇄wasm-JIT, the third confinement lowering), onramp_diff
       # (LLVM on-ramp source oracle), wasm_transpile, spec_ops, roundtrip (format identity), opt_*
-      # (SSA round-trip / SCCP), coverage_walk, and the durable freeze/thaw family (interp + JIT). Keep
-      # this list in lockstep with fuzz/fuzz_targets/*.rs.
+      # (SSA round-trip / SCCP), coverage_walk, paged_walk (interp⇄wasm-JIT paged bulk-mem per-page walk,
+      # #1081 — the fourth confinement lowering, which wasm_diff can't reach), and the durable freeze/thaw
+      # family (interp + JIT). Keep this list in lockstep with fuzz/fuzz_targets/*.rs.
       matrix:
         target:
           [
@@ -269,6 +270,7 @@ jobs:
             opt_sccp,
             opt_ssa_roundtrip,
             coverage_walk,
+            paged_walk,
             durable,
             durable_fiber,
             durable_jit,
