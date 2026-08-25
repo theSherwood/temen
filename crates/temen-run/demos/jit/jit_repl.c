@@ -96,10 +96,10 @@ static long emit_unit(char *buf) {
   eb(buf, 0);
   eb(buf, 10); // format v10 (v9 + the impl-export policy byte, CALLS.md 7.4)
   eb(buf, 0); // flags: runnable dialect (bit 0 = object/link unit; reserved bits fail closed)
-  // Memory descriptor: present, size_log2 16 — must match this module's window (the validator's
+  // Memory descriptor: present, size_log2 17 — must match this module's window (the validator's
   // memory-match precondition), which chibicc keeps at the 64 KiB default for a small program.
   eb(buf, 1);
-  eb(buf, 16);
+  eb(buf, 17);
   eb(buf, 0); // no data segments
   eb(buf, 0); // no imports — self-contained unit (v2 import section)
   eb(buf, 0); // no exports — invoked by handle, not by name (v3 export section)

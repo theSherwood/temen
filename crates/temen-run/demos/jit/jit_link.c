@@ -88,7 +88,7 @@ static void emit_header(char *buf) {
   eb(buf, 10); // format v10 (v9 + the impl-export policy byte, CALLS.md 7.4)
   eb(buf, 0);  // flags: runnable dialect (bit 0 = object/link unit; reserved bits fail closed)
   eb(buf, 1);  // memory present
-  eb(buf, 16); // size_log2 = 16 (must match this module's 64 KiB window)
+  eb(buf, 17); // size_log2 = 17 (must match this module's 128 KiB window, #1059 NULL guard)
   eb(buf, 0);  // no data segments
 }
 

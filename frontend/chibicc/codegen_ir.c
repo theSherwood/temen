@@ -303,6 +303,16 @@ static int start_off; // 1 if a `_start` occupies function index 0, else 0
 #define POWERBOX_ARGS_BASE 128
 #define POWERBOX_ARGS_END 16384
 
+// **Trap-on-NULL** (#964/#1059): every fixed powerbox low-memory region — the handle-stash slots, the
+// §3e args buffer, and the globals/data-stack base — lives one 16 KiB guard **above** 0, so
+// `[0, POWERBOX_NULL_GUARD)` holds nothing. We mark the module with the `__null_guard` export (aliasing
+// `_start`, see `emit_start`) so a marker-aware host seeds that region `Unmapped` and places the args
+// blob at the shifted base (`temen_ir::module_args_base`) — a NULL dereference then traps like native
+// on every tier, instead of silently touching low scratch. This mirrors `temen-llvm`'s `--null-guard`
+// layout; the guard is added to every absolute low address below. Must equal `temen_ir::POWERBOX_NULL_GUARD`
+// (16 KiB = the max host page, keeping the three enforcement mechanisms aligned — see that constant's docs).
+#define POWERBOX_NULL_GUARD 16384
+
 // True when `main` takes `argc`/`argv` (>= 2 params), so the entry parses the args buffer and the
 // globals shift past it. Computed once in `codegen_ir` before `layout_globals`.
 static bool needs_argv;
@@ -312,11 +322,13 @@ static bool needs_argv;
 // argument. Implies `needs_argv`. Computed alongside it in `codegen_ir`.
 static bool needs_envp;
 
-// Globals + string literals live at fixed window offsets in the data region [RESERVED_BYTES,
-// data_end); the data stack starts at data_end (main's initial data-SP, baked into `_start`).
-// The low RESERVED_BYTES are the runtime-reserved region holding the powerbox capability handles
-// (so no global/local address is 0 = C NULL either).
-static int data_end = RESERVED_BYTES;
+// Globals + string literals live at fixed window offsets in the data region
+// [POWERBOX_NULL_GUARD + RESERVED_BYTES, data_end); the data stack starts at data_end (main's initial
+// data-SP, baked into `_start`). The RESERVED_BYTES just above the guard hold the powerbox capability
+// handles; the guard below them means no global/local/handle address is in `[0, guard)` — a NULL
+// dereference traps (#964/#1059). Overwritten by `layout_globals`; this default covers the no-globals
+// path.
+static int data_end = POWERBOX_NULL_GUARD + RESERVED_BYTES;
 
 static int func_index(Obj *fn) {
   for (int i = 0; i < nfuncs; i++)
@@ -2878,9 +2890,12 @@ static bool is_rodata(Obj *g) {
 static bool layout_globals(Obj *prog) {
   // A `main(int, char**)` program shifts its writable globals past the §3e args buffer at
   // `[POWERBOX_ARGS_BASE, POWERBOX_ARGS_END)`, so seeded argv/env never collides with a global.
-  int off = needs_argv ? POWERBOX_ARGS_END : RESERVED_BYTES;
+  // Everything sits one `POWERBOX_NULL_GUARD` up so `[0, guard)` stays empty for the NULL trap
+  // (#964/#1059): the args buffer is at `guard + POWERBOX_ARGS_BASE` (= `temen_ir::module_args_base`).
+  int off = POWERBOX_NULL_GUARD + (needs_argv ? POWERBOX_ARGS_END : RESERVED_BYTES);
   bool any = false;
-  // Pass 1: writable globals (and BSS) packed from `RESERVED_BYTES`.
+  // Pass 1: writable globals (and BSS) packed from `off` (guard + the reserved handle region, or
+  // guard + the args buffer for an argv program).
   for (Obj *g = prog; g; g = g->next) {
     if (g->is_function || is_rodata(g))
       continue;
@@ -3117,6 +3132,12 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
   int slots[NHANDLES] = {STDOUT_SLOT,    STDIN_SLOT,  EXIT_SLOT,     MEMORY_SLOT,
                          ADDRSPACE_SLOT, IORING_SLOT, BLOCKING_SLOT, JIT_SLOT};
   cg("export 0 func \"_start\" 0\n");
+  // #964/#1059 guarded-layout marker: a `__null_guard` func export (aliasing `_start`'s funcidx 0,
+  // per the marker contract) declares the shifted low scratch, so a marker-aware host seeds
+  // `[0, POWERBOX_NULL_GUARD)` `Unmapped`, reserves it from the page ops, and places the args blob at
+  // the shifted base. Semantics, not observability — `temen-strip` keeps it like `_start`. Export
+  // index 1 (dense, right after `_start`); the emit-object symbol exports below continue past it.
+  cg("export 1 func \"__null_guard\" 0\n");
   // A `--child-entry` module is spawned via `instantiate_module`, whose child ABI is
   // `(i64 starter) -> (i64 status)`; the top-level powerbox entry is paramless `() -> (main's ret)`.
   // The starter is ignored here (a no-capability command); `main`'s result is widened to the i64 the
@@ -3166,7 +3187,9 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
     int vh = nv++;
     cg("  v%d = cap.self.resolve v%d v%d\n", vh, vptr, vlen);
     int vslot = nv++;
-    cg("  v%d = i64.const %d\n", vslot, slots[i]);
+    // The handle-stash slots ride one guard up with everything else (#964/#1059) — a store into
+    // `[0, guard)` would itself trap now that the region is reserved.
+    cg("  v%d = i64.const %d\n", vslot, POWERBOX_NULL_GUARD + slots[i]);
     cg("  i32.store v%d v%d\n", vslot, vh);
   }
 #undef NHANDLES
@@ -3180,13 +3203,14 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
   if (needs_argv) {
     int mi = func_index(main_fn);
     int vab = nv++;
-    cg("  v%d = i64.const %d\n", vab, POWERBOX_ARGS_BASE);
+    // The §3e args buffer is seeded at the guard-shifted base (`temen_ir::module_args_base`, #1059).
+    cg("  v%d = i64.const %d\n", vab, POWERBOX_NULL_GUARD + POWERBOX_ARGS_BASE);
     int vac32 = nv++;
     cg("  v%d = i32.load v%d\n", vac32, vab); // argc (u32)
     int vac = nv++;
     cg("  v%d = i64.extend_i32_u v%d\n", vac, vac32);
     int vp0 = nv++;
-    cg("  v%d = i64.const %d\n", vp0, POWERBOX_ARGS_BASE + 8); // first string
+    cg("  v%d = i64.const %d\n", vp0, POWERBOX_NULL_GUARD + POWERBOX_ARGS_BASE + 8); // first string
     int vi0 = nv++;
     cg("  v%d = i64.const 0\n", vi0);
     cg("  br 1(v%d, v%d, v%d)\n", vac, vi0, vp0);
@@ -3267,7 +3291,7 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
     cg("  v5 = i64.add v2 v4\n");
     cg("  v6 = i64.const 0\n");
     cg("  i64.store v5 v6\n"); // argv[argc] = NULL
-    cg("  v7 = i64.const %d\n", POWERBOX_ARGS_BASE + 4);
+    cg("  v7 = i64.const %d\n", POWERBOX_NULL_GUARD + POWERBOX_ARGS_BASE + 4);
     cg("  v8 = i32.load v7\n"); // envc (u32)
     cg("  v9 = i64.extend_i32_u v8\n");
     cg("  v10 = i64.const 1\n");
@@ -3667,13 +3691,26 @@ void codegen_ir(Obj *prog, FILE *out) {
   // JIT only backs `mapped = 2^log2` and reserves a huge VA above it (§4), so a larger
   // window costs only the backed prefix.
   if (need_mem) {
-    // Reserve stack/heap headroom: a generous flat 48 KiB for small programs (so they stay
-    // at 64 KiB), or an amount equal to the globals for large ones (proportional stack).
-    long reserve = data_end < (16 << 10) ? (48 << 10) : data_end;
+    // Reserve stack/heap headroom sized to the *footprint above the guard* (`data_end` minus the
+    // reserved `[0, POWERBOX_NULL_GUARD)` region, #1059) — not the raw `data_end`, which the guard
+    // shift never lets fall below the small-program threshold: a generous flat 48 KiB for small
+    // programs, or an amount equal to the globals for large ones (proportional stack).
+    long footprint = data_end - POWERBOX_NULL_GUARD;
+    long reserve = footprint < (16 << 10) ? (48 << 10) : footprint;
     // A `main(int, char**)` entry parks `argv[]` at `data_end` and relocates `main`'s frame a full
     // page (`POWERBOX_ARGS_END`) above it, so add that page (plus the argv-array slack) as headroom.
     if (needs_argv)
       reserve += (long)POWERBOX_ARGS_END + (16 << 10);
+    // #1059: the NULL guard is 16 KiB of low window the program can no longer use, so `data_end`
+    // (which already includes the guard) plus the reserve grows the window to keep the same stack/heap
+    // headroom above the data — a non-argv program that just fit in 64 KiB becomes 128 KiB (the regex
+    // differential genuinely needs that page). An **argv** program already carries 32 KiB of frame-
+    // relocation slack above; let the guard's page come out of that slack (still 16 KiB of headroom)
+    // so it does NOT jump a second power of two — that keeps a `main(argc, argv)` guest inside the
+    // fork/exec managers' fixed `sl` carve (they size it for the pre-guard window), so no host-side
+    // carve has to change. `reserve` stays ≥ 0: the argv branch added ≥ 2·guard just above.
+    if (needs_argv)
+      reserve -= POWERBOX_NULL_GUARD;
     long need = (long)data_end + reserve;
     int wlog2 = 16;
     while (((long)1 << wlog2) < need)
@@ -3695,7 +3732,9 @@ void codegen_ir(Obj *prog, FILE *out) {
   // same name in different TUs never collide. `emit_start` already exported `_start` as export 0
   // when this unit defines `main`, so the numbering continues past it.
   if (opt_emit_object) {
-    int k = has_main ? 1 : 0; // export 0 is `_start` in the entry unit
+    // In the entry unit, exports 0/1 are `_start` and its `__null_guard` marker (#1059), so the
+    // symbol exports continue at 2; a non-entry unit starts at 0.
+    int k = has_main ? 2 : 0;
     for (int i = 0; i < nfuncs; i++) {
       if (funcs[i]->is_static || !funcs[i]->name)
         continue;

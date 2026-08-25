@@ -130,11 +130,11 @@ static long emit_unit(Ins *prog, char *buf, int abi_sp) {
   eb(buf, 0);
   eb(buf, 10); // format v10 (v9 + the impl-export policy byte, CALLS.md 7.4)
   eb(buf, 0); // flags: runnable dialect (bit 0 = object/link unit; reserved bits fail closed)
-  // Memory descriptor: present, size_log2 16. The validator's memory-match precondition
+  // Memory descriptor: present, size_log2 17. The validator's memory-match precondition
   // requires the blob to declare the SAME window as this module — chibicc keeps a small
   // program like this one at the 64 KiB default (a mismatch is a clean -22, not an escape).
   eb(buf, 1);
-  eb(buf, 16);
+  eb(buf, 17);
   eb(buf, 0); // no data segments (the validator rejects them anyway)
   eb(buf, 0); // no imports — this unit is self-contained (v2 import section)
   eb(buf, 0); // no exports — invoked by handle, not by name (v3 export section)

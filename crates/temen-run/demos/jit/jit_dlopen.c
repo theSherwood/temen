@@ -81,7 +81,7 @@ static void emit_header(char *buf) {
   eb(buf, 10); // format v10 (v9 + the impl-export policy byte, CALLS.md 7.4)
   eb(buf, 0); // flags: runnable dialect (bit 0 = object/link unit; reserved bits fail closed)
   eb(buf, 1);
-  eb(buf, 16);
+  eb(buf, 17);
   eb(buf, 0);
 }
 // A `(i64, i64) -> (i64)` signature.

@@ -17,8 +17,12 @@ long __vm_region_page_size(int r);
 
 /* Pin the declared window up to `TEMEN_STAGE_WIN` (chibicc sizes it to the next power of two ≥ 2·data_end)
    under the 16 KiB page, where the runner's static region is otherwise too small. Harmless under the
-   64 KiB page (the section alignment already reaches the next size); the harness asserts the result. */
-static char window_pin_[50000];
+   64 KiB page (the section alignment already reaches the next size); the harness asserts the result.
+   #1059: the NULL guard shifts every datum up one 16 KiB guard, so the pad is one guard smaller than
+   the pre-guard 50000 — otherwise `data_end` lands *at* the half-window ring-map offset
+   (`TEMEN_STAGE_WIN/2`) and the data stack collides with the mapped ring. The reduced pad still forces
+   window 18 (2·data_end > 128 KiB) while leaving the stack clear of the ring. */
+static char window_pin_[33616];
 
 static long slen(char *s) { long n = 0; while (s[n]) n = n + 1; return n; }
 static int streq(char *a, char *b) { int i = 0; while (a[i] && a[i] == b[i]) i++; return a[i] == 0 && b[i] == 0; }

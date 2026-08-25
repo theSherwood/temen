@@ -4486,6 +4486,10 @@ struct ExecReq {
     /// Entry args in the fresh powerbox: the granted `Instantiator`, then `AddressSpace` iff the
     /// command's entry takes two params (§14 child-entry ABI).
     entry_args: Vec<Value>,
+    /// The command module's NULL-guard extent (#1059): `POWERBOX_NULL_GUARD` for a `__null_guard`-marked
+    /// command, `0` for a legacy one. The preserved exec args region rides it (`commit_fresh_image`), so
+    /// a guarded command's `_start` finds argv where it reads it (`module_args_base` = `guard + 128`).
+    null_guard: u64,
 }
 
 /// CONSOLIDATION.md §2.2: a demand process child's pager binding — the provider (parent) host
@@ -7112,6 +7116,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     image_len,
                     host,
                     entry_args,
+                    null_guard,
                 } = *req;
                 let (fuel, depth, id, sched_ref, quota, dt) = (
                     v.fuel,
@@ -7129,7 +7134,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // fresh image. Then the segments write over the zeroed ground.
                 let mem = v.mem.take();
                 if let Some(m) = mem.as_ref() {
-                    m.commit_fresh_image(image_len.min(child_size));
+                    m.commit_fresh_image(image_len.min(child_size), null_guard);
                     let base = m.window.base();
                     for d in data.iter() {
                         if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
@@ -12510,6 +12515,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 sched.wake_pipe_writers(pipe);
                             }
                             return Ok(Inner::Exec(Box::new(ExecReq {
+                                null_guard: temen_ir::module_null_guard(&cm.module).unwrap_or(0),
                                 funcs: cm.funcs,
                                 types: cm.types,
                                 data: cm.data,
@@ -23368,11 +23374,14 @@ impl Mem {
     /// bounded the command's declared memory by this window, so `len` never exceeds `reserved()`.
     /// Data segments materialize after this (Step::Exec), exactly like a fresh instantiation.
     ///
-    /// One carve-out: the **args region** `[EXEC_ARGS_BASE, EXEC_ARGS_END)` is *preserved*, not
-    /// zeroed — the caller packed `{argc, envc}` + NUL-packed argv/envp strings there right
-    /// before `exec_module`, and the command's child-entry runtime reads them from the same
-    /// window (the #801 exec ABI: "argv arrives through the preserved args region").
-    fn commit_fresh_image(&self, len: u64) {
+    /// One carve-out: the **args region** `[null_guard + EXEC_ARGS_BASE, null_guard + EXEC_ARGS_END)`
+    /// is *preserved*, not zeroed — the caller packed `{argc, envc}` + NUL-packed argv/envp strings
+    /// there right before `exec_module`, and the command's child-entry runtime reads them from the same
+    /// window (the #801 exec ABI: "argv arrives through the preserved args region"). Under the #1059
+    /// NULL guard the whole region rides one guard up (a guard-marked command reads argv at
+    /// `module_args_base = guard + EXEC_ARGS_BASE`), so the preserved window shifts with it; `null_guard`
+    /// is `0` for a legacy command, leaving the classic `[EXEC_ARGS_BASE, EXEC_ARGS_END)` carve-out.
+    fn commit_fresh_image(&self, len: u64, null_guard: u64) {
         let pages = len.div_ceil(self.page).max(1);
         {
             let mut space = self.space_write();
@@ -23385,10 +23394,12 @@ impl Mem {
             }
         }
         let base = self.window.base();
-        for off in 0..len.min(EXEC_ARGS_BASE) {
+        let args_base = null_guard + EXEC_ARGS_BASE;
+        let args_end = null_guard + EXEC_ARGS_END;
+        for off in 0..len.min(args_base) {
             self.set_byte(base + off, 0);
         }
-        for off in EXEC_ARGS_END.min(len)..len {
+        for off in args_end.min(len)..len {
             self.set_byte(base + off, 0);
         }
     }

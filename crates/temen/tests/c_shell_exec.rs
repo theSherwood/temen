@@ -137,8 +137,9 @@ int main(int argc, char **argv){
   rec[3] = 0;
   char *nm = (char *)(base + 16);
   nm[0]='s'; nm[1]='t'; nm[2]='d'; nm[3]='o'; nm[4]='u'; nm[5]='t';
-  /* the command's args buffer at carve+128: {argc-1, envc=0} then packed argv[1..] */
-  char *ab = (char *)(carve + 128);
+  /* the command's args buffer at carve + guard + 128 (#1059: chibicc reads argv one 16 KiB NULL
+     guard up, module_args_base): {argc-1, envc=0} then packed argv[1..] */
+  char *ab = (char *)(carve + 16384 + 128);
   int *hdr = (int *)ab;
   hdr[0] = argc - 1;
   hdr[1] = 0;
@@ -218,11 +219,12 @@ fn run(
     // Link the shell's imports to their interfaces; the guest discovers the handles by reflection.
     let m = temen_ir::resolve_imports_with(shell, link_shim).expect("resolve");
     verify_module(&m).expect("verify shell");
-    // Seed the shell's own args buffer at POWERBOX_ARGS_BASE.
+    // Seed the shell's own args buffer where its guard-shifted `_start` reads it (#1059:
+    // `module_args_base` = guard + POWERBOX_ARGS_BASE for the `__null_guard`-marked shell).
     let mut init = vec![0u8; win];
     let blob = args_blob(argv);
-    init[temen_ir::POWERBOX_ARGS_BASE as usize..temen_ir::POWERBOX_ARGS_BASE as usize + blob.len()]
-        .copy_from_slice(&blob);
+    let args_base = temen_ir::module_args_base(&m) as usize;
+    init[args_base..args_base + blob.len()].copy_from_slice(&blob);
 
     if jit {
         let (jo, _) = compile_and_run_capture_reserved_with_host_ex(
