@@ -16,6 +16,19 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **`paged_walk` added to the nightly `fuzz` matrix** (issue #1081) — one entry added to the `fuzz`
+  job's `target: [...]` list (after `coverage_walk`), plus the descriptive comment above it. It is the
+  new libFuzzer target `fuzz/fuzz_targets/paged_walk.rs`: the generative interp⇄**wasm-JIT** differential
+  for the **paged bulk-memory per-page walk** (`emit_span_page_check` vs the interpreter's
+  `check_prot_span`) — the tree's *fourth* confinement lowering, which `wasm_diff` can't reach (it
+  suppresses cap.call/page-op modules). Runs like every other target (`cargo fuzz run paged_walk --
+  -max_total_time=300`). The `fuzz-matrix-in-sync` guard ("fuzz targets wired") **reds the run until this
+  is copied over** — the new `fuzz_targets/paged_walk.rs` + `fuzz/Cargo.toml [[bin]]` have no matching
+  matrix row in the live `ci.yml` until the copy lands. The stable `crates/temen/tests/paged_walk.rs`
+  gates it per-PR from deterministic seeds (485 trapping / 1015 passing spans on 1500 seeds, verified
+  locally). (Until copied over, both `workflows-in-sync` and `fuzz targets wired` stay red — the expected
+  mirror-edit friction; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
+
 - **I67 apt hardening for the `Install Playwright + Chromium` step (`browser-real` job, #1017)** —
   the one apt consumer the 10-site I67 hardening missed: `npx playwright install --with-deps`
   runs its **own** internal `apt-get update && apt-get install` with the runner's default (azure)
