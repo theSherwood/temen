@@ -360,7 +360,15 @@ fn synth_start_unit(entry: &str) -> Result<temen_ir::LinkUnit, LengError> {
         .map_err(|e| LengError::Malformed(format!("synth `_start` unit: {e:?}")))?;
     Ok(temen_ir::LinkUnit {
         module,
-        exports: vec![("_start".to_string(), 0)],
+        // #964/#1091 guarded layout: the `__null_guard` marker (aliasing `_start`'s funcidx 0)
+        // declares that `[0, POWERBOX_NULL_GUARD)` is empty — a marker-aware host seeds it `Unmapped`
+        // so a NULL deref traps. Leng bases its globals + scratch one guard up (`translate::globals_base`,
+        // `seed_powerbox_heap`) to keep that region clear. Semantics, not observability; `temen-strip`
+        // keeps it like `_start`.
+        exports: vec![
+            ("_start".to_string(), 0),
+            (temen_ir::NULL_GUARD_EXPORT.to_string(), 0),
+        ],
         ..Default::default()
     })
 }
@@ -558,7 +566,12 @@ fn link_selected_with_extra(
 ///
 /// Baked as a 16-byte writable data segment (not `_start` stores) because it must run **before**
 /// `main`, and because [`synth_start_unit`] is built before the window size is known. The two words
-/// live in the reserved scratch page 0 (`< POWERBOX_STACK_PAGE`), which no unit's data covers.
+/// live in the guard's **scratch page** at `guard + POWERBOX_HEAP_BRK`/`TOP` (#1091): the #964 NULL
+/// guard reserves `[0, POWERBOX_NULL_GUARD)` empty, so the pre-guard offsets 32/40 would be seeded
+/// `Unmapped` and the compute-shim's `mmap` would fault reading them. The compute shim reads/advances
+/// them at the same shifted offsets, and the DAP heap view already keys off `scratch + POWERBOX_HEAP_BRK`
+/// (`scratch == module_null_guard`). No unit's globals cover this page (they base at
+/// `guard + POWERBOX_STACK_PAGE`, one page above — see `translate::globals_base`).
 fn seed_powerbox_heap(m: &mut Module) {
     let Some(mem) = m.memory else { return };
     let win = 1u64 << mem.size_log2;
@@ -568,7 +581,7 @@ fn seed_powerbox_heap(m: &mut Module) {
     let mut bytes = brk.to_le_bytes().to_vec();
     bytes.extend_from_slice(&win.to_le_bytes());
     m.data.push(temen_ir::Data {
-        offset: temen_ir::POWERBOX_HEAP_BRK,
+        offset: temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_HEAP_BRK,
         bytes,
         readonly: false,
     });
