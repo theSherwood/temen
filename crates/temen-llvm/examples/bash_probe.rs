@@ -124,12 +124,14 @@ fn run_and_print(
     posix: temen_posix::Posix,
 ) {
     // BASH_PROBE_BACKEND=bytecode runs on the wasm-safe bytecode tier (the browser engine);
-    // default is the tree-walk interp.
-    let backend = match std::env::var("BASH_PROBE_BACKEND").as_deref() {
-        Ok("bytecode") => temen_run::Backend::Bytecode,
-        _ => temen_run::Backend::TreeWalk,
+    // =parallel runs the same bytecode over `drive_parallel` (#748 — every fork twin a real OS
+    // thread, blocking waitpid/pipes real condvar/poll blocks); default is the tree-walk interp.
+    let run = match std::env::var("BASH_PROBE_BACKEND").as_deref() {
+        Ok("parallel") => inst.run_with_caps_parallel(config, &[("posix", cap)]),
+        Ok("bytecode") => inst.run_with_caps(temen_run::Backend::Bytecode, config, &[("posix", cap)]),
+        _ => inst.run_with_caps(temen_run::Backend::TreeWalk, config, &[("posix", cap)]),
     };
-    match inst.run_with_caps(backend, config, &[("posix", cap)]) {
+    match run {
         Ok(r) => {
             println!("outcome: {:?}", r.outcome);
             println!(
