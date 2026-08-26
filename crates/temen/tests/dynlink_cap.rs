@@ -89,10 +89,10 @@ fn diff(guest_src: &str, init: &[u8], user_args: &[i64], table_log2: u8) -> (Jit
     (jout, jmem)
 }
 
-// Window layout shared by the guests below.
-const SVC_OFF: usize = 4096;
-const UNIT_OFF: usize = 6144;
-const SYMTAB_OFF: usize = 8192;
+// Window layout shared by the guests below (all above the #1094 NULL guard at 16384).
+const SVC_OFF: usize = 20480;
+const UNIT_OFF: usize = 22528;
+const SYMTAB_OFF: usize = 24576;
 
 /// `service(a, b) = a*a + b` — a self-contained unit the guest installs into the table.
 const SERVICE: &str = "memory 16\nfunc (i32, i32) -> (i32) {\n\
