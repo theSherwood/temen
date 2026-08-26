@@ -18893,6 +18893,7 @@ impl Host {
         data: &[Data],
         mapped: u64,
         npages: usize,
+        null_guard: u64,
     ) -> Vec<CapturedProt> {
         // Default: Rw in the backed prefix, Unmapped in the reserved tail.
         let mut out: Vec<CapturedProt> = (0..npages as u64)
@@ -18904,11 +18905,22 @@ impl Host {
                 }
             })
             .collect();
+        let host = host_page_size();
+        // #1094: the NULL guard seeds `[0, null_guard)` `Unmapped` at window construction
+        // (`seed_null_guard`) — outside `cap_pages`, so reconstruct it here (mirroring the same
+        // host-page-alignment / `guard <= mapped` gate) or this capture would report the guard pages
+        // `Rw` and diverge from the interpreter's `snapshot_prots` (and un-seed the guard on thaw).
+        // Runtime `map`/`protect` below still overrides, matching the live seed→init→runtime order.
+        if null_guard > 0 && null_guard.is_multiple_of(host) && null_guard <= mapped {
+            let guard_pages = (null_guard / DURABLE_SNAPSHOT_PAGE).min(npages as u64);
+            for p in 0..guard_pages {
+                out[p as usize] = CapturedProt::Unmapped;
+            }
+        }
         // `readonly` data segments → Ro. Protection is **host-page** granular (the runtime's
         // `protect_ro` and the interpreter's `init_data` protect the whole host page), so a
         // segment marks every codec page of the host page(s) it touches — this is what makes the
         // result match `snapshot_prots` on a host whose page is larger than a codec page.
-        let host = host_page_size();
         for d in data {
             if !d.readonly || d.bytes.is_empty() {
                 continue;
