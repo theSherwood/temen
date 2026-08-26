@@ -21,11 +21,12 @@ use temen_browser::{
     temen_coop_jit_wasm_ptr, temen_coop_mapped, temen_coop_mapped_now, temen_coop_nfuncs,
     temen_coop_open, temen_coop_paged, temen_coop_pagestate_len, temen_coop_pagestate_ptr,
     temen_coop_run, temen_coop_set_tierup_floor, temen_coop_shim_ptr, temen_coop_shim_wasm,
-    temen_coop_slot_code, temen_coop_table_gen, temen_coop_table_log2, temen_coop_value,
-    temen_coop_wasm_len, temen_coop_wasm_ptr, temen_coop_win_len, temen_coop_win_ptr,
-    temen_run_value, temen_status, temen_stdout_len, temen_stdout_ptr, COOP_RUN_DONE,
-    COOP_RUN_JIT_INVOKE, COOP_RUN_TIERUP, COOP_RUN_TRAP, STATUS_OK, STATUS_TRAP,
-    STATUS_UNSUPPORTED,
+    temen_coop_slot_code, temen_coop_table_gen, temen_coop_table_log2, temen_coop_tierup_win_len,
+    temen_coop_tierup_win_ptr, temen_coop_value, temen_coop_wasm_len, temen_coop_wasm_ptr,
+    temen_coop_win_len, temen_coop_win_ptr, temen_onramp_set_grant_instantiator, temen_run_value,
+    temen_status, temen_stdout_len, temen_stdout_ptr, temen_warm_close, temen_warm_coop_open,
+    temen_warm_coop_prepare, temen_warm_eval, temen_warm_open, COOP_RUN_DONE, COOP_RUN_JIT_INVOKE,
+    COOP_RUN_TIERUP, COOP_RUN_TRAP, STATUS_OK, STATUS_TRAP, STATUS_UNSUPPORTED,
 };
 use temen_interp::{Host, StreamRole};
 use wasmi::{
@@ -130,8 +131,10 @@ fn service_coop_on_wasmi(n_results: usize) -> Option<Vec<i64>> {
     let wasm = unsafe { std::slice::from_raw_parts(temen_coop_wasm_ptr(), temen_coop_wasm_len()) };
     let func = temen_coop_func();
     let argv = unsafe { std::slice::from_raw_parts(temen_coop_argv_ptr(), temen_coop_argv_len()) };
-    let win_len = temen_coop_win_len();
-    let win_ptr = temen_coop_win_ptr() as *mut u8;
+    // #816 env-routed tier-up: the PENDING task's window (base + span) — the browser JS driver's
+    // per-event `win`. A §14 confined child's event mirrors just its carve.
+    let win_len = temen_coop_tierup_win_len();
+    let win_ptr = temen_coop_tierup_win_ptr() as *mut u8;
     let mapped = temen_coop_mapped();
 
     let engine = Engine::default();
@@ -323,8 +326,9 @@ fn run_emitted_coop(
     mapped: i64,
     n_results: usize,
 ) -> Option<Vec<i64>> {
-    let win_len = temen_coop_win_len();
-    let win_ptr = temen_coop_win_ptr() as *mut u8;
+    // #816: the pending task's window, per event (see `service_coop_on_wasmi`).
+    let win_len = temen_coop_tierup_win_len();
+    let win_ptr = temen_coop_tierup_win_ptr() as *mut u8;
     let engine = Engine::default();
     let module = WModule::new(&engine, wasm).expect("emitted wasm must validate");
     let mut store: Store<i32> = Store::new(&engine, 0);
@@ -2651,4 +2655,338 @@ fn coop_jacl_compiler_runs_through_the_driver() {
         unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
     assert_eq!(got_out, want.stdout, "stdout parity with the oracle");
     temen_coop_close();
+}
+
+// ---- #816 env-routed tier-up: a §14 confined child served over REAL emitted wasm ----------------
+
+/// #816: opt the on-ramp powerbox into the `"instantiator"` grant for this test, resetting on drop
+/// (panic-safe) so no other test's guest inherits spawn authority. Composes with [`ffi_guard`]
+/// (holds the FFI lock + zeroes the tier-up floor first).
+struct InstantiatorGuard(FloorGuard);
+fn instantiator_guard() -> InstantiatorGuard {
+    let g = ffi_guard();
+    temen_onramp_set_grant_instantiator(1);
+    InstantiatorGuard(g)
+}
+impl Drop for InstantiatorGuard {
+    fn drop(&mut self) {
+        temen_onramp_set_grant_instantiator(0);
+    }
+}
+
+/// The #816 guest: `_start` resolves its (knob-granted) `"instantiator"` by name, spawns a
+/// same-module confined child (f1, 4 KiB carve at 64 KiB), joins it, calls the eligible leaf f2
+/// itself, then reads back the marker byte each leaf run stored at *its own* window's offset 8 —
+/// the root's at absolute 8, the child's at absolute 65536+8 (visible through the parent window,
+/// shared backing). A mis-routed per-event `win` (root base for the child's event) would land the
+/// child's marker at 8 (clobbering nothing observable but leaving 65544 zero) and fail the sum.
+/// f2 stores marker 21 at [8] and returns x*3 + 7. Sum = child f(5)=22 + root f(3)=16 + 21 + 21 = 80.
+fn coop_child_guest_text() -> String {
+    let out_h = onramp_out_handle();
+    let name = b"instantiator";
+    let mut w0 = [0u8; 8];
+    w0.copy_from_slice(&name[0..8]);
+    let mut w1 = [0u8; 8];
+    w1[..4].copy_from_slice(&name[8..12]);
+    let (w0, w1) = (i64::from_le_bytes(w0), i64::from_le_bytes(w1));
+    format!(
+        r#"memory 17
+func () -> (i64) {{
+block 0 () {{
+  vw0 = i64.const {w0}
+  va0 = i64.const 1024
+  i64.store va0 vw0
+  vw1 = i64.const {w1}
+  va1 = i64.const 1032
+  i64.store va1 vw1
+  vnl = i64.const 12
+  vh = self.resolve va0 vnl
+  ve = i64.const 1
+  voff = i64.const 65536
+  vsl = i64.const 12
+  vq = i64.const 0
+  vch = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vh (ve, voff, vsl, vq)
+  vj = call.cap 6 1 (i32) -> (i64) vh (vch)
+  v3 = i64.const 3
+  vlocal = call 2 (v3)
+  vma = i64.const 8
+  vm0 = i32.load8_u vma
+  vm0e = i64.extend_i32_u vm0
+  vca = i64.const 65544
+  vm1 = i32.load8_u vca
+  vm1e = i64.extend_i32_u vm1
+  vs1 = i64.add vj vlocal
+  vs2 = i64.add vs1 vm0e
+  vs3 = i64.add vs2 vm1e
+  vslot = i64.const {SLOT}
+  i64.store vslot vs3
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vwr = call.cap 0 1 (i64, i64) -> (i64) vout (vslot, vlen8)
+  return vs3
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  v5 = i64.const 5
+  vr = call 2 (v5)
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vx: i64) {{
+  v21 = i32.const 21
+  va = i64.const 8
+  i32.store8 va v21
+  v3 = i64.const 3
+  vm = i64.mul vx v3
+  v7 = i64.const 7
+  vad = i64.add vm v7
+  return vad
+  }}
+}}
+export 0 func "_start" 0
+"#
+    )
+}
+
+#[test]
+fn coop_tierup_serves_a_confined_child_over_its_own_carve() {
+    let _g = instantiator_guard();
+    let m = temen_text::parse_module(&coop_child_guest_text()).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+
+    // Oracle: the plain bytecode path with the identical (knob-granted) powerbox.
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(
+        want.value, 80,
+        "oracle: 22 + 16 + 21 + 21 (both markers landed)"
+    );
+
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(
+        opened,
+        0,
+        "open must accept the instantiating eligible-leaf guest (status {})",
+        temen_status()
+    );
+
+    let n_results = m.funcs[2].results.len();
+    let mut tierups = 0u32;
+    // Per-event (win_len, mapped): the child's event serves its 4 KiB carve with its own extent;
+    // the root's serves the full run window with the root's committed extent.
+    let mut spans: Vec<(usize, i64)> = Vec::new();
+    loop {
+        match temen_coop_run() {
+            COOP_RUN_TIERUP => {
+                tierups += 1;
+                assert!(tierups < 50, "runaway tier-ups");
+                assert_eq!(temen_coop_func(), 2, "only the leaf (func 2) tiers up");
+                spans.push((temen_coop_tierup_win_len(), temen_coop_mapped()));
+                match service_coop_on_wasmi(n_results) {
+                    Some(res) => temen_coop_deliver(res.as_ptr(), res.len()),
+                    None => temen_coop_deliver_trap(),
+                }
+            }
+            COOP_RUN_DONE => break,
+            ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
+        }
+    }
+    // The child's event first (the root is parked on the join), then the root's own leaf call —
+    // each served over ITS task's window (#1117's env routing, here over real emitted wasm).
+    assert_eq!(
+        spans,
+        vec![(4096, 4096), (1 << 25, 131072)],
+        "per-event window span + mapped must be the child carve then the root window"
+    );
+    assert_eq!(
+        tierups, 2,
+        "expected 2 tier-ups (child + root), got {tierups}"
+    );
+
+    assert_eq!(temen_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        temen_coop_value(),
+        want.value,
+        "value parity with the oracle (both markers landed in the right windows)"
+    );
+    // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
+    let got_out =
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
+    assert_eq!(got_out, want.stdout, "stdout parity with the oracle");
+    temen_coop_close();
+}
+
+// ============================================================================================
+// #816 item 4: the **warm-coop** tier — a page-managing warm session evaluates on the
+// cooperative tier-up drive. `temen_warm_jit_open` requires a WasmDriven `eval_run`; a
+// page-managing eval (the QuickJS shape: the warmup `vm_map`-grows the heap AND `protect`s
+// rodata) is InterpDriven and used to fall back to the pure interpreter warm path. Now
+// `temen_warm_coop_open` emits the module's leaves once (cached in the session) and each Run's
+// `temen_warm_coop_prepare` restores the warm image + re-establishes the captured page map +
+// arms `eval_run` on the coop scheduler, after which the standard event pump (this harness's
+// `CoopB2Driver`, wasmi playing `driveCoopTierupRun`) services the eligible leaf on emitted wasm.
+// ============================================================================================
+
+/// The page-managing two-phase guest (the QuickJS shape in miniature). `warmup(sp)`: plant a
+/// rodata constant at 8200 then `protect` its page `[8 KiB, 12 KiB)` read-only, `vm_map`-grow
+/// `[64 KiB, 80 KiB)` and plant a marker at 65552, and advance the on-ramp brk so the image
+/// capture covers the growth. `eval_run(sp)`: read the marker (grown page) + the rodata constant
+/// (`Ro` page) + the scratch at 65560 (fresh-per-Run: must be 0), call the eligible leaf f2 with
+/// 3, dirty the scratch, stage the sum at 2048 and stream it to stdout, return the sum.
+/// Sum = 424242 + 777 + 0 + f(3)=16 = 425035.
+fn warm_coop_guest_text() -> String {
+    let (out_h, mem_h) = onramp_out_mem_handles();
+    let brk = temen_ir::POWERBOX_HEAP_BRK;
+    format!(
+        r#"memory 16
+func (i64) -> (i64) {{
+block 0 (vsp: i64) {{
+  vroaddr = i64.const 8200
+  vroval = i64.const 777
+  i64.store vroaddr vroval
+  vas = i32.const {mem_h}
+  vrooff = i64.const 8192
+  vrolen = i64.const 4096
+  vro = i32.const 1
+  vp = call.cap 5 2 (i64, i64, i32) -> (i64) vas (vrooff, vrolen, vro)
+  voff = i64.const 65536
+  vlen = i64.const 16384
+  vrw = i32.const 3
+  vm = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vrw)
+  vmaddr = i64.const 65552
+  vmark = i64.const 424242
+  i64.store vmaddr vmark
+  vbrkaddr = i64.const {brk}
+  vbrk = i64.const 81920
+  i64.store vbrkaddr vbrk
+  vr = i64.add vp vm
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vsp: i64) {{
+  vmaddr = i64.const 65552
+  vmark = i64.load vmaddr
+  vroaddr = i64.const 8200
+  vroval = i64.load vroaddr
+  vsaddr = i64.const 65560
+  vs = i64.load vsaddr
+  v3 = i64.const 3
+  vleaf = call 2 (v3)
+  vseven = i64.const 7
+  i64.store vsaddr vseven
+  vs1 = i64.add vmark vroval
+  vs2 = i64.add vs1 vs
+  vsum = i64.add vs2 vleaf
+  vsl = i64.const 2048
+  i64.store vsl vsum
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vsum
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vx: i64) {{
+  v3 = i64.const 3
+  vm = i64.mul vx v3
+  v7 = i64.const 7
+  va = i64.add vm v7
+  return va
+  }}
+}}
+export 0 func "warmup" 0
+export 1 func "eval_run" 1
+"#
+    )
+}
+
+/// #816 item 4 — the warm-coop differential: value/stdout parity with the interpreter warm path
+/// across repeated Runs, a non-vacuous leaf tier-up per Run, the paged coop tier armed (the guest
+/// both grows and protects), and fresh-per-Run isolation (the scratch an eval dirties never leaks
+/// into the next — in the grown page, exactly the state the restored page map governs).
+#[test]
+fn warm_coop_evals_a_page_managing_guest_with_leaf_tierup() {
+    let _g = ffi_guard();
+    let m = temen_text::parse_module(&warm_coop_guest_text()).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+
+    let live = temen_warm_open(bytes.as_ptr(), bytes.len());
+    assert!(
+        live > 0,
+        "warm open must succeed for the page-managing guest (status {})",
+        temen_status()
+    );
+
+    // Oracle: the interpreter warm path (marker + rodata + fresh scratch + leaf = 425035).
+    let v_interp = temen_warm_eval(core::ptr::null(), 0);
+    assert_eq!(temen_status(), STATUS_OK, "interp warm eval status");
+    assert_eq!(v_interp, 425035, "interp warm eval value");
+    // SAFETY: capture slots staged by the eval; this thread is the only accessor (FFI_LOCK).
+    let out_interp =
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
+    assert_eq!(out_interp, 425035i64.to_le_bytes(), "interp warm stdout");
+
+    // Arm the warm-coop tier (idempotent: the second call reuses the cached emit).
+    assert_eq!(
+        temen_warm_coop_open(0),
+        0,
+        "warm-coop open (status {})",
+        temen_status()
+    );
+    assert_eq!(temen_warm_coop_open(0), 0, "idempotent re-open");
+
+    // Two coop Runs: parity + tier-up + isolation (round 2 must see the same fresh state).
+    for round in 0..2 {
+        assert_eq!(
+            temen_warm_coop_prepare(core::ptr::null(), 0),
+            0,
+            "warm-coop prepare (round {round}, status {})",
+            temen_status()
+        );
+        assert_ne!(
+            temen_coop_paged(),
+            0,
+            "the grow+protect guest arms the PAGED coop tier (round {round})"
+        );
+        let (_d, tierups, invokes) = drive_coop_b2_session(&m);
+        assert_eq!(invokes, 0, "no §22 units in this guest");
+        assert_eq!(
+            temen_status(),
+            STATUS_OK,
+            "warm-coop run status (round {round})"
+        );
+        assert_eq!(
+            temen_coop_value(),
+            v_interp,
+            "warm-coop value parity with the interpreter warm path (round {round})"
+        );
+        assert!(
+            tierups >= 1,
+            "the eligible leaf must tier up (round {round})"
+        );
+        // SAFETY: capture slots staged by the DONE arm; sole accessor (FFI_LOCK).
+        let out =
+            unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
+        assert_eq!(out, out_interp, "warm-coop stdout parity (round {round})");
+    }
+
+    // The interpreter warm path still evaluates identically after the coop Runs — the session's
+    // image/prots are shared state the coop tier must not perturb.
+    let v_again = temen_warm_eval(core::ptr::null(), 0);
+    assert_eq!(temen_status(), STATUS_OK, "post-coop interp eval status");
+    assert_eq!(v_again, v_interp, "post-coop interp eval parity");
+
+    // `temen_warm_close` tears down the session AND the armed warm-coop run (its window borrows
+    // the session buffer); a subsequent prepare must refuse cleanly.
+    temen_warm_close();
+    assert_ne!(
+        temen_warm_coop_prepare(core::ptr::null(), 0),
+        0,
+        "prepare after close must refuse"
+    );
 }

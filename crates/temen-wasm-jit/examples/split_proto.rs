@@ -22,7 +22,10 @@
 
 use std::path::{Path, PathBuf};
 use temen_ir::{BinOp, Block, CmpOp, Func, Inst, IntTy, Memory, Module, Terminator, ValType};
-use temen_wasm_jit::{compile_module_b2, compile_module_split, est_emitted_size};
+use temen_wasm_jit::{
+    compile_module_b2, compile_module_split, compile_module_with, compile_split_fn,
+    est_emitted_size,
+};
 
 fn i64f() -> Func {
     Func {
@@ -146,6 +149,94 @@ fn hot_loop(hot_blocks: usize, hot_block_len: usize) -> Func {
     f
 }
 
+/// A **call-free** hot loop `f0(n)`, same shape as [`hot_loop`] but the per-iteration body folds inline
+/// (no helper call), so the whole hot path is one self-contained function — the input to `compile_split_fn`
+/// (the real intra-function splitter), which requires a call-free function.
+fn callfree_loop(hot_blocks: usize, hot_block_len: usize) -> Func {
+    let k_chain = hot_blocks.max(1);
+    let ops = [BinOp::Add, BinOp::Xor, BinOp::Mul, BinOp::Sub, BinOp::Or];
+    let mut f = i64f();
+    f.blocks.push(Block {
+        params: vec![ValType::I64],
+        insts: vec![Inst::ConstI64(0)],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1],
+        },
+    });
+    f.blocks.push(Block {
+        params: vec![ValType::I64, ValType::I64],
+        insts: vec![
+            Inst::ConstI64(0),
+            Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::Eq,
+                a: 0,
+                b: 2,
+            },
+        ],
+        term: Terminator::BrIf {
+            cond: 3,
+            then_blk: 2,
+            then_args: vec![1],
+            else_blk: 3,
+            else_args: vec![0, 1],
+        },
+    });
+    f.blocks.push(Block {
+        params: vec![ValType::I64],
+        insts: vec![],
+        term: Terminator::Return(vec![0]),
+    });
+    for j in 0..k_chain {
+        let this_blk = 3 + j;
+        let mut insts = Vec::new();
+        let mut acc: u32 = 1;
+        let mut next: u32 = 2;
+        for s in 0..hot_block_len {
+            let c = ((this_blk * 131 + s) as i64 * 2654435761).rem_euclid(0xffff) + 1;
+            insts.push(Inst::ConstI64(c));
+            let cval = next;
+            next += 1;
+            insts.push(Inst::IntBin {
+                ty: IntTy::I64,
+                op: ops[(this_blk + s) % ops.len()],
+                a: acc,
+                b: cval,
+            });
+            acc = next;
+            next += 1;
+        }
+        let term = if j + 1 < k_chain {
+            Terminator::Br {
+                target: (this_blk + 1) as u32,
+                args: vec![0, acc],
+            }
+        } else {
+            insts.push(Inst::ConstI64(1));
+            let one = next;
+            next += 1;
+            insts.push(Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Sub,
+                a: 0,
+                b: one,
+            });
+            let dec = next;
+            Terminator::Br {
+                target: 1,
+                args: vec![dec, acc],
+            }
+        };
+        f.blocks.push(Block {
+            params: vec![ValType::I64, ValType::I64],
+            insts,
+            term,
+        });
+    }
+    f
+}
+
 /// `helper(x) = 3*x + 1`.
 fn helper() -> Func {
     let mut f = i64f();
@@ -217,6 +308,148 @@ fn build(n_filler: usize, filler_len: usize, hot_blocks: usize, hot_block_len: u
     }
 }
 
+/// A **handler** `(i64)->(i64)`: `blocks` chained blocks of `block_len` folds over the running value —
+/// the same body shape as a chunk of `hot_loop`, but as its own function. `blocks/block_len` are sized so
+/// K handlers together equal one monolithic `hot_loop` body: this is the *outlined* form of the hot path.
+fn chain(blocks: usize, block_len: usize, seed: u64) -> Func {
+    let b = blocks.max(1);
+    let ops = [BinOp::Add, BinOp::Xor, BinOp::Mul, BinOp::Sub, BinOp::Or];
+    let mut f = i64f();
+    for j in 0..b {
+        let mut insts = Vec::new();
+        let mut acc: u32 = 0; // v0 = incoming value
+        let mut next: u32 = 1;
+        for s in 0..block_len {
+            let c = ((seed as usize * 131 + j * 17 + s) as i64 * 2654435761).rem_euclid(0xffff) + 1;
+            insts.push(Inst::ConstI64(c));
+            let cval = next;
+            next += 1;
+            insts.push(Inst::IntBin {
+                ty: IntTy::I64,
+                op: ops[(j + s) % ops.len()],
+                a: acc,
+                b: cval,
+            });
+            acc = next;
+            next += 1;
+        }
+        let term = if j + 1 < b {
+            Terminator::Br {
+                target: (j + 1) as u32,
+                args: vec![acc],
+            }
+        } else {
+            Terminator::Return(vec![acc])
+        };
+        f.blocks.push(Block {
+            params: vec![ValType::I64],
+            insts,
+            term,
+        });
+    }
+    f
+}
+
+/// The **outlined** hot path: a small dispatcher `f0(n)` whose per-iteration body calls each of `k`
+/// handler functions (`h_1..h_k`) in sequence, threading `acc` through. The k handlers hold the bulk of
+/// the compute — each ≈ `total_blocks/k` blocks — so the hot code is spread across k smaller functions
+/// instead of one giant `f0`. This is the transform under evaluation: does V8 tier the (now smaller)
+/// hot functions up sooner in aggregate than the one monolithic function of the same total size?
+fn build_outlined(
+    n_filler: usize,
+    filler_len: usize,
+    total_blocks: usize,
+    block_len: usize,
+    k: usize,
+) -> Module {
+    let k = k.max(2);
+    let per = total_blocks.div_ceil(k);
+    // func 0 = dispatcher; funcs 1..=k = handlers; then filler.
+    let mut funcs = vec![outlined_dispatcher(k)];
+    for j in 0..k {
+        funcs.push(chain(per, block_len, j as u64 + 1));
+    }
+    for i in 0..n_filler {
+        funcs.push(filler(filler_len, i as u64 + 1));
+    }
+    Module {
+        funcs,
+        memory: Some(Memory { size_log2: 16 }),
+        ..Default::default()
+    }
+}
+
+/// `f0(n)` dispatcher: `acc=0; for i=n; i!=0; i-=1 { acc = h_k(...h_2(h_1(acc))...) }; return acc`.
+fn outlined_dispatcher(k: usize) -> Func {
+    let mut f = i64f();
+    // block 0 (v0=n): acc=0; br 1(n, 0)
+    f.blocks.push(Block {
+        params: vec![ValType::I64],
+        insts: vec![Inst::ConstI64(0)],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1],
+        },
+    });
+    // block 1 (v0=i, v1=acc): i==0 ? return acc : body
+    f.blocks.push(Block {
+        params: vec![ValType::I64, ValType::I64],
+        insts: vec![
+            Inst::ConstI64(0),
+            Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::Eq,
+                a: 0,
+                b: 2,
+            },
+        ],
+        term: Terminator::BrIf {
+            cond: 3,
+            then_blk: 2,
+            then_args: vec![1],
+            else_blk: 3,
+            else_args: vec![0, 1],
+        },
+    });
+    // block 2 (v0=r): return r
+    f.blocks.push(Block {
+        params: vec![ValType::I64],
+        insts: vec![],
+        term: Terminator::Return(vec![0]),
+    });
+    // block 3 (v0=i, v1=acc): acc = h_k(...h_1(acc)...); i-=1; br 1(i-1, acc)
+    let mut insts = Vec::new();
+    let mut acc: u32 = 1; // start from incoming acc (v1)
+    let mut next: u32 = 2;
+    for j in 0..k {
+        insts.push(Inst::Call {
+            func: (1 + j) as u32, // handler h_{j+1}
+            args: vec![acc],
+        });
+        acc = next;
+        next += 1;
+    }
+    insts.push(Inst::ConstI64(1));
+    let one = next;
+    next += 1;
+    insts.push(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Sub,
+        a: 0,
+        b: one,
+    });
+    let dec = next;
+    f.blocks.push(Block {
+        params: vec![ValType::I64, ValType::I64],
+        insts,
+        term: Terminator::Br {
+            target: 1,
+            args: vec![dec, acc],
+        },
+    });
+    f
+}
+
 fn table_log2_for(n: usize) -> u32 {
     let mut log2 = 1u32;
     while (1usize << log2) < n {
@@ -238,7 +471,98 @@ fn main() {
     let filler_len: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(1500);
     let hot_blocks: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(1);
     let hot_block_len: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let outline: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let splitfn: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     std::fs::create_dir_all(&out_dir).unwrap();
+
+    // splitfn mode (`splitfn >= 2`): the REAL intra-function splitter. Build ONE call-free hot-loop
+    // function, emit it monolithic (`single`) and split into `splitfn` block-groups (`splitfn`), and
+    // measure both under V8 — confirming `compile_split_fn` inherits the tier-up win.
+    if splitfn >= 2 {
+        let f = callfree_loop(hot_blocks, hot_block_len);
+        let m = Module {
+            funcs: vec![f],
+            memory: Some(Memory { size_log2: 16 }),
+            ..Default::default()
+        };
+        let mono = compile_module_with(&m, false).expect("monolithic emits");
+        let split = compile_split_fn(&m, 0, splitfn, false).expect("split-fn emits");
+        eprintln!(
+            "splitfn guest: 1 call-free function, {hot_blocks} blocks × {hot_block_len} ops; \
+             monolithic {} B, split into {splitfn} groups {} B",
+            mono.len(),
+            split.len()
+        );
+        write(&out_dir, "single.wasm", &mono);
+        write(&out_dir, "splitfn.wasm", &split);
+        let manifest = concat!(
+            "{\n  \"table_log2\": 1,\n  \"n_funcs\": 1,\n  \"entry\": 0,\n  \"configs\": {\n",
+            "    \"single\":  [{\"wasm\": \"single.wasm\",  \"funcs\": [0]}],\n",
+            "    \"splitfn\": [{\"wasm\": \"splitfn.wasm\", \"funcs\": [0]}]\n",
+            "  }\n}\n"
+        );
+        write(&out_dir, "manifest.json", manifest.as_bytes());
+        eprintln!("done → {}", out_dir.display());
+        return;
+    }
+
+    // Outlined mode (`outline >= 2`): emit just the `single` config, but with the hot path spread across
+    // `outline` handler functions instead of one monolithic `f0` — the function-outlining experiment.
+    // Compare its tier-up run (via the harness `single` config) against a monolithic run of the same
+    // total hot size. Same manifest shape, one config.
+    if outline >= 2 {
+        let m = build_outlined(n_filler, filler_len, hot_blocks, hot_block_len, outline);
+        let n = m.funcs.len();
+        let log2 = table_log2_for(n);
+        let est: usize = m.funcs.iter().map(est_emitted_size).sum();
+        let per_handler = est_emitted_size(&m.funcs[1]);
+        eprintln!(
+            "outlined guest: dispatcher + {outline} handlers ({} blocks each) + {n_filler} filler; per-handler est {:.2} MB, est_emitted {:.2} MB, table_log2 {log2}",
+            hot_blocks.div_ceil(outline),
+            per_handler as f64 / (1 << 20) as f64,
+            est as f64 / (1 << 20) as f64
+        );
+        // `single` (direct): dispatcher + handlers in one module — TurboFan can inline the handler calls.
+        let single = compile_module_b2(&m, false, log2).expect("outlined single emits");
+        write(&out_dir, "single.wasm", &single);
+        // `indirect`: dispatcher alone | all handlers | filler. The dispatcher→handler calls become
+        // cross-module `call_indirect` through the shared table — the real per-opcode dispatch shape,
+        // which TurboFan cannot inline. Isolates the indirect-dispatch tax vs `single` (Slice 0).
+        let disp_mask: Vec<bool> = (0..n).map(|i| i == 0).collect(); // {dispatcher}
+        let hand_mask: Vec<bool> = (0..n).map(|i| i >= 1 && i <= outline).collect(); // {h_1..h_K}
+        let cold_mask: Vec<bool> = (0..n).map(|i| i > outline).collect(); // {filler}
+        let disp = compile_module_split(&m, false, log2, &disp_mask).expect("disp emits");
+        let hand = compile_module_split(&m, false, log2, &hand_mask).expect("handlers emit");
+        let cold = compile_module_split(&m, false, log2, &cold_mask).expect("cold emits");
+        write(&out_dir, "disp.wasm", &disp);
+        write(&out_dir, "handlers.wasm", &hand);
+        write(&out_dir, "ocold.wasm", &cold);
+        let idxs = |mask: &[bool]| -> String {
+            (0..n)
+                .filter(|&i| mask[i])
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let all: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+        let manifest = format!(
+            concat!(
+                "{{\n  \"table_log2\": {log2},\n  \"n_funcs\": {n},\n  \"entry\": 0,\n  \"configs\": {{\n",
+                "    \"single\":   [{{\"wasm\": \"single.wasm\", \"funcs\": [{all}]}}],\n",
+                "    \"indirect\": [{{\"wasm\": \"disp.wasm\", \"funcs\": [{d}]}}, {{\"wasm\": \"handlers.wasm\", \"funcs\": [{h}]}}, {{\"wasm\": \"ocold.wasm\", \"funcs\": [{c}]}}]\n",
+                "  }}\n}}\n"
+            ),
+            log2 = log2,
+            n = n,
+            all = all.join(","),
+            d = idxs(&disp_mask),
+            h = idxs(&hand_mask),
+            c = idxs(&cold_mask),
+        );
+        write(&out_dir, "manifest.json", manifest.as_bytes());
+        eprintln!("done → {}", out_dir.display());
+        return;
+    }
 
     let m = build(n_filler, filler_len, hot_blocks, hot_block_len);
     let n = m.funcs.len();

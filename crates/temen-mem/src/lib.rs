@@ -35,6 +35,11 @@
 //!   execution runs on.
 //! - **`Paged`** (non-unix, or a reservation too large to `mmap`): a `BTreeMap` of zeroed pages
 //!   behind a `Mutex`. Correct but serialized — the portable fallback, not the parallel substrate.
+//!
+//! Plus two flat wrappers around the same raw accessor bodies: **`Shared`** (borrowed,
+//! embedder-owned memory — the browser's window-in-linear-memory shape) and **`Owned`** (an
+//! eagerly-allocated heap buffer — the portable flat backing a fork twin's private window needs
+//! where `Paged` would apply, #816).
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -62,6 +67,13 @@ pub enum Region {
     /// `Drop`). The parallel-wasm path — every instance's `Region::Shared` over the same shared-memory
     /// address is one shared cell. Built via the `unsafe` [`Region::shared`].
     Shared(Shared),
+    /// An **owned, eagerly-allocated** flat heap buffer: the same raw-pointer hardware atomics as
+    /// `Shared`, with the backing's lifecycle owned here (like `Mapped`, but plain `alloc`, so it
+    /// exists on every target). Flat-addressable where [`Region::new`]'s non-unix fallback is
+    /// `Paged` — the #816 twin-backing seam: a fork twin's private window must be a single
+    /// contiguous span for emitted `win + addr` code to serve it. Built via
+    /// [`Region::owned_zeroed`]; eager allocation is the cost, so callers bound the size.
+    Owned(Owned),
     /// Portable fallback: zeroed pages in a `Mutex`-guarded map (serialized, not the parallel path).
     Paged(Paged),
 }
@@ -98,6 +110,23 @@ impl Region {
         Region::Shared(Shared::new(base, size))
     }
 
+    /// The portable `Paged` fallback, **forced** — what [`Region::new`] returns on non-unix
+    /// targets (or an un-`mmap`-able reservation), constructible directly so a unix host can
+    /// exercise the non-flat arm of a backing decision (e.g. the #816 fork-twin seam's tests).
+    pub fn paged(size: u64, page: u64) -> Region {
+        Region::Paged(Paged::new(size, page))
+    }
+
+    /// A region addressing `[0, size)` over an **owned, zero-initialized flat buffer** — flat-
+    /// addressable ([`Region::raw_base`]) on every target, where [`Region::new`] falls back to the
+    /// non-flat `Paged` on non-unix. The buffer is allocated **eagerly** (a `new` reservation is
+    /// lazy), so callers bound `size` — the #816 fork-twin seam bounds it by the parent backing's
+    /// length (the run window size). `None` when `size` is 0 or the allocation fails, so callers
+    /// fall back (`Region::new`) rather than abort.
+    pub fn owned_zeroed(size: u64, page: u64) -> Option<Region> {
+        Owned::new(size, page).map(Region::Owned)
+    }
+
     /// The raw-backed variants (`Mapped`, `Shared`) both dispatch to the one accessor body in
     /// [`Shared`] — `Mapped` *is* a `Shared` plus an owned `mmap` — so a single `Ok(&Shared)` arm
     /// serves both; `Paged` (the safe reference) is the `Err` arm. This collapses every accessor's
@@ -108,6 +137,7 @@ impl Region {
             #[cfg(unix)]
             Region::Mapped(m) => Ok(&m.raw),
             Region::Shared(s) => Ok(s),
+            Region::Owned(o) => Ok(&o.raw),
             Region::Paged(p) => Err(p),
         }
     }
@@ -118,6 +148,31 @@ impl Region {
             Ok(s) => s.size,
             Err(p) => p.size,
         }
+    }
+
+    /// #816: the raw base address of a **flat** (raw-backed `Shared`/`Mapped`) region — the pointer
+    /// `[0, len)` maps to contiguously, for an embedder that must hand emitted code a
+    /// `base + offset` view of a window (the browser tier-up driver's per-event `win`). `None` for
+    /// the `Paged` fallback, which has no single flat address — callers treat that as
+    /// "not flat-addressable" and fail closed (the window then runs on the interpreter only).
+    /// Reading or writing through the returned pointer is subject to the same safety contract as
+    /// the region's construction; bounds are the caller's to keep.
+    pub fn raw_base(&self) -> Option<*mut u8> {
+        self.backing().ok().map(|s| s.base_ptr())
+    }
+
+    /// #816: the raw address of flat offset `off` — [`raw_base`](Region::raw_base)` + off`,
+    /// bounds-checked to the region (`off <= len`; the offset itself, not an access through it).
+    /// `None` for `Paged` or an out-of-region offset. Lives here (not in the `unsafe`-free callers)
+    /// because the in-allocation pointer add is `unsafe`; the bound makes it sound.
+    pub fn raw_base_at(&self, off: u64) -> Option<*mut u8> {
+        let s = self.backing().ok()?;
+        if off > s.size {
+            return None;
+        }
+        // SAFETY: `off <= size`, so the result stays within (or one past) the allocation the
+        // region's construction contract covers.
+        Some(unsafe { s.base_ptr().add(off as usize) })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -335,10 +390,8 @@ mod shared {
         }
 
         /// The raw base pointer — for the owner (`Mapped`) to `munmap` exactly the reservation it
-        /// wrapped. Not for access (that goes through the bounds-checked accessors below). Only the
-        /// unix `Mapped` owner needs it; elsewhere `Shared` is non-owning, so gate it to avoid a
-        /// dead-code error under `-D warnings`.
-        #[cfg(unix)]
+        /// wrapped, and for [`Region::raw_base`] (#816: the browser tier-up driver's flat `win`
+        /// view). Not for byte access (that goes through the bounds-checked accessors below).
         pub(super) fn base_ptr(&self) -> *mut u8 {
             self.base
         }
@@ -592,6 +645,61 @@ mod mapped {
     }
 }
 
+pub use owned::Owned;
+
+mod owned {
+    use super::Shared;
+
+    /// An eagerly-allocated, zero-initialized flat heap buffer of `[0, size)`, owned here — the
+    /// portable flat backing ([`Region::owned_zeroed`](super::Region::owned_zeroed)). A **thin
+    /// owner** exactly like `Mapped`: every accessor body lives once in [`Shared`]; `Owned` adds
+    /// only the buffer's lifecycle (`alloc_zeroed` in `new`, `dealloc` in `Drop`). 8-aligned so a
+    /// naturally-aligned 4/8-byte access is hardware-atomic-able. `Send`/`Sync` are automatic —
+    /// a `Shared` plus a `usize`.
+    pub struct Owned {
+        pub(super) raw: Shared,
+        alloc_len: usize,
+    }
+
+    impl Owned {
+        pub(super) fn new(size: u64, page: u64) -> Option<Owned> {
+            let page = (page as usize).max(1);
+            let alloc_len = usize::try_from(size)
+                .ok()
+                .filter(|&s| s > 0)?
+                .checked_next_multiple_of(page)?;
+            // 8-aligned for the widest (`U64`) atomic; `alloc_len > 0` so the layout is non-zero.
+            // Freed with the same layout in `Drop`. A failed allocation is `None` — the caller
+            // falls back to a lazy/paged backing instead of aborting.
+            let layout = std::alloc::Layout::from_size_align(alloc_len, 8).ok()?;
+            // SAFETY: non-zero layout.
+            let base = unsafe { std::alloc::alloc_zeroed(layout) };
+            if base.is_null() {
+                return None;
+            }
+            Some(Owned {
+                raw: Shared::new(base, size),
+                alloc_len,
+            })
+        }
+    }
+
+    // The buffer outlives every use of the inner `Shared`: nothing hands out the base pointer
+    // except through `&self` accessors, and this `Drop` runs once, after those end (structural
+    // via ownership).
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            // SAFETY: the exact layout `new` allocated (8-aligned, `alloc_len` bytes).
+            unsafe {
+                std::alloc::dealloc(
+                    self.raw.base_ptr(),
+                    std::alloc::Layout::from_size_align_unchecked(self.alloc_len, 8),
+                );
+            }
+        }
+    }
+}
+
 // ========================= portable fallback: paged, Mutex-serialized =========================
 
 /// The portable backing: zeroed `page`-sized chunks in a `BTreeMap`, committed on first write, all
@@ -770,6 +878,21 @@ mod tests {
     fn each_region(size: u64, page: u64, mut f: impl FnMut(Region)) {
         f(Region::new(size, page)); // platform default (mmap on unix)
         f(Region::Paged(Paged::new(size, page))); // force the portable path
+        f(Region::owned_zeroed(size, page).expect("test sizes allocate")); // the owned flat buffer
+    }
+
+    /// #816 item 3 — the owned flat backing's contract: flat-addressable (`raw_base`) on every
+    /// target with an 8-aligned base (valid naturally-aligned atomics), zero-initialized, sized
+    /// as asked; a zero-size ask is `None` (fail-soft), not a zero-size allocation.
+    #[test]
+    fn owned_region_is_flat_aligned_zeroed() {
+        let r = Region::owned_zeroed(1 << 16, 4096).expect("64 KiB allocates");
+        let base = r.raw_base().expect("an owned region is flat-addressable");
+        assert_eq!(base as usize % 8, 0, "8-aligned for the widest atomic");
+        assert_eq!(r.len(), 1 << 16);
+        assert_eq!(r.byte(0), 0, "zero-initialized");
+        assert_eq!(r.byte((1 << 16) - 1), 0, "to the last byte");
+        assert!(Region::owned_zeroed(0, 4096).is_none(), "zero-size is None");
     }
 
     #[test]

@@ -1430,8 +1430,11 @@ pub(crate) unsafe extern "C" fn gc_roots(args: *const GcRootsArgs) -> i64 {
     let total = roots.len();
     let nwrite = total.min(cap.max(0) as usize);
     if nwrite > 0 {
-        // Confine the buffer offset exactly like the JIT's `mask_addr`: the writable region is the
-        // *backed* window `[0, mapped)` (child-relative), physically at `mem_base + sub_base + off`.
+        // Confine the buffer offset exactly like the JIT's `mask_addr`: the window `[0, bound)`
+        // (child-relative), physically at `mem_base + sub_base + off`. #826: `bound` (the `mapped`
+        // slot) carries the **reserved** span, so a roots buffer in a `map`-grown tail page is
+        // admitted where the interpreter's live page map admits it; a write into an uncommitted or
+        // `Ro` page faults through the SIGSEGV guard (`MemoryFault`), exactly like a guest store.
         let masked = buf & mask;
         let nbytes = (nwrite as u64) * 8;
         if masked.checked_add(nbytes).is_none_or(|end| end > mapped) {

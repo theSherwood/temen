@@ -2299,3 +2299,207 @@ fn min_max_canonicalize_nan_bit_exactly() {
         assert_eq!(ibits, CANON32, "f32x4.{op} must canonicalize the NaN lane");
     }
 }
+
+/// #826 — the §14 record read admits a **grown tail page**: the parent `map`-grows a reserved-tail
+/// page, writes the op-17 spawn record there, and spawns/joins a child from it. Pre-#826 the JIT's
+/// record read was bounded by the compile-time `mapped`, so the read was rejected (`MemoryFault`)
+/// where the interpreter's live page map admits it — a tier-parity divergence for a §14 guest that
+/// heap-grows before instantiating. Record fields: f0 = version 0 | entry(1)<<32; f8 = carve off
+/// 4096; f16 = size_log2 12 | pager MAX<<32; f24 = module -1 (self); f32..f48 = 0. The child stores
+/// marker 21 at its offset 0 (absolute 4096) and returns 5; the parent returns join*100 + marker.
+#[cfg(any(unix, windows))]
+#[test]
+fn jit_instantiate_rec_reads_the_record_from_a_grown_tail_page() {
+    use core::ffi::c_void;
+    use temen_interp::{run_capture_reserved_with_host, Host};
+    use temen_jit::compile_and_run_capture_reserved_with_host;
+    if !temen_jit::fiber_supported() {
+        return; // the JIT nesting runtime needs a stack-switch-capable target
+    }
+
+    const REC: u64 = 80 * 1024; // 5 * 16 KiB — in the reserved tail (prefix 64 KiB), page-aligned
+    let f0 = 1u64 << 32; // version 0, entry 1
+    let f16 = (12u64 | (0xFFFF_FFFFu64 << 32)) as i64;
+    let f24 = 0xFFFF_FFFFu64 as i64; // module -1 (self child), budget 0
+    let src = format!(
+        "memory 16\n\
+         func (i32, i32) -> (i64) {{\n\
+         block 0 (v0: i32, v1: i32) {{\n\
+         \x20 vg0 = i64.const {REC}\n\
+         \x20 vg1 = i64.const 4096\n\
+         \x20 vg2 = i32.const 3\n\
+         \x20 vg3 = call.cap 5 0 (i64, i64, i32) -> (i64) v0 (vg0, vg1, vg2)\n\
+         \x20 vf0 = i64.const {f0}\n\
+         \x20 vf8 = i64.const 4096\n\
+         \x20 vf16 = i64.const {f16}\n\
+         \x20 vf24 = i64.const {f24}\n\
+         \x20 vz = i64.const 0\n\
+         \x20 vra = i64.const {REC}\n\
+         \x20 i64.store vra vf0\n\
+         \x20 vra1 = i64.const {a1}\n\
+         \x20 i64.store vra1 vf8\n\
+         \x20 vra2 = i64.const {a2}\n\
+         \x20 i64.store vra2 vf16\n\
+         \x20 vra3 = i64.const {a3}\n\
+         \x20 i64.store vra3 vf24\n\
+         \x20 vra4 = i64.const {a4}\n\
+         \x20 i64.store vra4 vz\n\
+         \x20 vra5 = i64.const {a5}\n\
+         \x20 i64.store vra5 vz\n\
+         \x20 vra6 = i64.const {a6}\n\
+         \x20 i64.store vra6 vz\n\
+         \x20 vch = call.cap 6 17 (i64) -> (i32) v1 (vra)\n\
+         \x20 vj = call.cap 6 1 (i32) -> (i64) v1 (vch)\n\
+         \x20 vma = i64.const 4096\n\
+         \x20 vm = i32.load8_u vma\n\
+         \x20 vme = i64.extend_i32_u vm\n\
+         \x20 vh = i64.const 100\n\
+         \x20 vjm = i64.mul vj vh\n\
+         \x20 vr = i64.add vjm vme\n\
+         \x20 return vr\n\
+           }}\n\
+         }}\n\
+         func (i64) -> (i64) {{\n\
+         block 0 (v0: i64) {{\n\
+         \x20 vz = i64.const 0\n\
+         \x20 v21 = i32.const 21\n\
+         \x20 i32.store8 vz v21\n\
+         \x20 v5 = i64.const 5\n\
+         \x20 return v5\n\
+           }}\n\
+         }}\n",
+        a1 = REC + 8,
+        a2 = REC + 16,
+        a3 = REC + 24,
+        a4 = REC + 32,
+        a5 = REC + 40,
+        a6 = REC + 48,
+    );
+    let m = parse_module(&src).expect("parse");
+    verify_module(&m).expect("verify");
+
+    let mut hi = Host::new();
+    let mut hj = Host::new();
+    let (mi, ii) = (hi.grant_memory(), hi.grant_instantiator(0, 1 << 16));
+    let (mj, ij) = (hj.grant_memory(), hj.grant_instantiator(0, 1 << 16));
+    assert_eq!((mi, ii), (mj, ij), "grants are deterministic");
+    let init = vec![0u8; 1 << 16];
+    let mut fuel = 5_000_000u64;
+    let (interp, imem) = run_capture_reserved_with_host(
+        &m,
+        0,
+        &[Value::I32(mi), Value::I32(ii)],
+        &mut fuel,
+        &init,
+        18,
+        &mut hi,
+    );
+    let (jit, jmem) = compile_and_run_capture_reserved_with_host(
+        &m,
+        0,
+        &[mj as i64, ij as i64],
+        &init,
+        18,
+        temen_run::cap_thunk,
+        &mut hj as *mut Host as *mut c_void,
+    )
+    .expect("jit compiles");
+
+    // join 5 * 100 + marker 21 = 521, both tiers — the record was read from the grown page.
+    assert_eq!(
+        interp.expect("interp run"),
+        vec![Value::I64(521)],
+        "interp must spawn from the grown-tail record"
+    );
+    assert!(
+        matches!(jit, JitOutcome::Returned(ref s) if s == &[521]),
+        "jit must spawn from the grown-tail record (#826): {jit:?}"
+    );
+    assert_eq!(imem, jmem, "final windows must agree");
+}
+
+/// #826 — `gc.roots` writes its buffer into a **grown tail page**: the guest `map`-grows a
+/// reserved-tail page and points the roots buffer there. Pre-#826 the JIT confined the buffer with
+/// the compile-time `mapped`, rejecting it (`MemoryFault`) where the interpreter's live-map write
+/// path admits it. The one-word heap range `[0x7050, 0x7051)` makes the enumerated set exactly
+/// `{0x7050}` on both tiers (the fiber keeps the pointer live across its suspend), so the buffer's
+/// first word — loaded back through the guest — pins that the write landed in the grown page.
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
+#[test]
+fn jit_gc_roots_writes_the_buffer_into_a_grown_tail_page() {
+    use core::ffi::c_void;
+    use temen_interp::{run_capture_reserved_with_host, Host};
+    use temen_jit::compile_and_run_capture_reserved_with_host;
+    if !temen_jit::fiber_supported() {
+        return;
+    }
+
+    const BUF: u64 = 80 * 1024; // reserved tail, page-aligned
+    let src = format!(
+        "memory 16\n\
+         func (i32) -> (i64, i64) {{\n\
+         block 0 (v0: i32) {{\n\
+         \x20 vg0 = i64.const {BUF}\n\
+         \x20 vg1 = i64.const 4096\n\
+         \x20 vg2 = i32.const 3\n\
+         \x20 vg3 = call.cap 5 0 (i64, i64, i32) -> (i64) v0 (vg0, vg1, vg2)\n\
+         \x20 vr0 = ref.func 1\n\
+         \x20 vsz = i64.const 4096\n\
+         \x20 vc = cont.new vr0 vsz\n\
+         \x20 varg = i64.const 28752\n\
+         \x20 va, vb = cont.resume vc varg\n\
+         \x20 vlo = i64.const 28752\n\
+         \x20 vhi = i64.const 28753\n\
+         \x20 vmask = i64.const -1\n\
+         \x20 vbuf = i64.const {BUF}\n\
+         \x20 vcap = i64.const 8\n\
+         \x20 vcnt = gc.roots vlo vhi vmask vbuf vcap\n\
+         \x20 vw = i64.load vbuf\n\
+         \x20 return vcnt vw\n\
+           }}\n\
+         }}\n\
+         func (i64, i64) -> (i64) {{\n\
+         block 0 (v0: i64, v1: i64) {{\n\
+         \x20 vz = i64.const 0\n\
+         \x20 vs = suspend vz\n\
+         \x20 return v1\n\
+           }}\n\
+         }}\n"
+    );
+    let m = parse_module(&src).expect("parse");
+    verify_module(&m).expect("verify");
+
+    let mut hi = Host::new();
+    let mut hj = Host::new();
+    let (mi, mj) = (hi.grant_memory(), hj.grant_memory());
+    assert_eq!(mi, mj, "grants are deterministic");
+    let init = vec![0u8; 1 << 16];
+    let mut fuel = 5_000_000u64;
+    let (interp, _imem) =
+        run_capture_reserved_with_host(&m, 0, &[Value::I32(mi)], &mut fuel, &init, 18, &mut hi);
+    let (jit, _jmem) = compile_and_run_capture_reserved_with_host(
+        &m,
+        0,
+        &[mj as i64],
+        &init,
+        18,
+        temen_run::cap_thunk,
+        &mut hj as *mut Host as *mut c_void,
+    )
+    .expect("jit compiles");
+
+    // Both tiers: exactly the one in-range root, written into the grown page and read back.
+    assert_eq!(
+        interp.expect("interp run"),
+        vec![Value::I64(1), Value::I64(0x7050)],
+        "interp must write the roots buffer into the grown tail page"
+    );
+    assert!(
+        matches!(jit, JitOutcome::Returned(ref s) if s == &[1, 0x7050]),
+        "jit must write the roots buffer into the grown tail page (#826): {jit:?}"
+    );
+}

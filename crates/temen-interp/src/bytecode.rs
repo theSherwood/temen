@@ -2361,6 +2361,53 @@ impl SharedProgram {
         };
         (out, pages)
     }
+
+    /// #816 item 4 — a **cooperative tier-up run** over the shared compiled source, for a restorable
+    /// warm session: the resumable [`CoopRun`] twin of [`run_over_grown`](Self::run_over_grown), so a
+    /// page-managing warm guest's `eval_run` can tier its eligible leaves up onto emitted wasm
+    /// instead of evaluating interpreter-only. No recompile — the run's `Domain` is a cheap `Arc`
+    /// clone of the shared source plus a fresh dispatch table (sized by `host.jit_table_log2()`,
+    /// the B2 convention [`CoopRun::new_over`] follows) — so a per-eval run is build-window +
+    /// schedule, like `run_over_grown`. The window is **not** data-seeded (the caller already
+    /// restored the warm image's bytes into `back`), the reservation is caller-chosen (clamp it to
+    /// the backing, as everywhere), and the captured page-state `prots` are re-established without
+    /// zeroing ([`Mem::seed_pages`]) — the same restore contract as `run_over_grown`. Read the
+    /// post-run page map off the finished run via [`CoopRun::mem_map_info`]. `Err` if `entry` is
+    /// out of range or scheduling traps.
+    #[allow(clippy::too_many_arguments)] // the warm-restore seam inherently threads more inputs
+    pub fn coop_run_over_grown(
+        &self,
+        entry: FuncIdx,
+        args: &[Value],
+        mut fuel: u64,
+        mut host: Host,
+        tierup: Option<TierUpConfig>,
+        back: std::sync::Arc<super::Region>,
+        reserved_log2: u8,
+        prots: &[(u64, u8)],
+    ) -> Result<CoopRun, Trap> {
+        if entry as usize >= self.n_funcs {
+            return Err(Trap::Malformed);
+        }
+        let dom = Domain::child(
+            self.source.clone(),
+            build_table(self.n_funcs, host.jit_table_log2()),
+        );
+        let mut mem = self.mem_size_log2.map(|sl| {
+            let mut mm = Mem::with_reservation_over(reserved_log2, sl, back);
+            mm.seed_null_guard(self.null_guard); // #964
+            mm.seed_pages(prots);
+            mm
+        });
+        let sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
+        Ok(CoopRun {
+            dom,
+            mem,
+            host,
+            fuel,
+            sched,
+        })
+    }
 }
 
 /// THREADS.md step 4c — the **parallel** sibling of [`compile_and_run_capture_over`]: run the guest's
@@ -2414,6 +2461,10 @@ pub fn compile_and_run_capture_over_parallel_with_host(
         return Some((Err(Trap::Malformed), Vec::new()));
     }
     let dom = Domain::new(c, host.jit_table_log2());
+    // #748 — the root's park-request door: a personality's `fork()`/blocking `waitpid` fires
+    // `ParkEvent`s through it (the same wiring the cooperative entries install); without it the ops
+    // degrade to `-ENOSYS`/the ECHILD poll and the `ForkSelf`/`ReapWait` arms below never surface.
+    host.wire_park_door();
     let mem = m.memory.map(|mc| {
         let mut mm = Mem::with_reservation_over(
             DEFAULT_RESERVED_LOG2,
@@ -10544,6 +10595,15 @@ impl CoopSched {
                         // chain / invoke) — with `reply_twin` injected at the caller's reply slot.
                         let mut twin_active = tasks[caller_ti].vt.active.clone();
                         twin_active.set(caller_dst, Reg::from_i64(reply_twin));
+                        // #816 env-routed tier-up: same rule as the `ForkSelf` twin — the clone may
+                        // keep an inherited bitmap only if its private `fork_private` window is
+                        // servable (flat; the owned-flat twin backing makes the tier-up shapes so
+                        // on every target); a `Paged` twin window strips it and interprets,
+                        // fail-closed.
+                        if !tierup_servable(twin_mem.as_ref(), mem.as_ref()) {
+                            twin_active.jit_eligible = None;
+                            twin_active.jit_page_checked = false;
+                        }
                         let twin_vt = VTask {
                             active: twin_active,
                             active_id: ROOT_FIBER,
@@ -10810,6 +10870,18 @@ impl CoopSched {
                             // bare root carries no resume chain / invoke (`Vm` derives `Clone`).
                             let mut twin_active = tasks[ti].vt.active.clone();
                             twin_active.set(dst, Reg::from_i64(0));
+                            // #816 env-routed tier-up: the clone carries the parent's bitmap; the twin
+                            // may keep it only if its OWN private window (`fork_private`, pushed into
+                            // `extra_envs` below) is servable — the driver then answers each of the
+                            // twin's events over that window via the pending-env routing. The
+                            // owned-flat twin backing (#816 item 3) makes the tier-up shapes servable
+                            // on every target; a twin still on the `Paged` fallback (unbounded
+                            // reservation, allocation failure) is not: strip the bitmap so it
+                            // interprets, fail-closed.
+                            if !tierup_servable(twin_mem.as_ref(), mem.as_ref()) {
+                                twin_active.jit_eligible = None;
+                                twin_active.jit_page_checked = false;
+                            }
                             let twin_vt = VTask {
                                 active: twin_active,
                                 active_id: ROOT_FIBER,
@@ -10909,7 +10981,23 @@ impl CoopSched {
                     // root and its same-module threads). A child spawned in another module (a confined
                     // §22 unit spawning its own function) runs a different module, where the module-0
                     // bitmap does not apply — leave it interpreting.
-                    if module == 0 {
+                    //
+                    // #816 env-routed tier-up: the thread shares its spawner's env (below), so it may
+                    // inherit the bitmap exactly when that env's window is tier-up-servable — the
+                    // driver answers every per-event read (`win` base, mapped extent, page state) for
+                    // the pending task's env ([`CoopRun::pending_win`] and friends), so a §14
+                    // confined child's thread now tiers up over its own carve. A window the driver
+                    // cannot flatly address (a fork twin's `Paged` private copy on wasm) fails
+                    // closed to the interpreter, which is always right.
+                    if module == 0
+                        && tierup_servable(
+                            match tasks[ti].env {
+                                None => mem.as_ref(),
+                                Some(k) => extra_envs[k].mem.as_ref(),
+                            },
+                            mem.as_ref(),
+                        )
+                    {
                         if let Some(e) = eligible.as_ref() {
                             child.active.jit_eligible = Some(std::sync::Arc::clone(e));
                             child.active.jit_page_checked = *page_checked;
@@ -11101,7 +11189,21 @@ impl CoopSched {
                     // to installed §22 units — matching the tree-walker's `DomainTable::new(&cfuncs, 0)`).
                     let c0 = dom.source.primary();
                     let child_table = build_table(c0.progs.len(), 0);
-                    let child_vt = VTask::new(&c0, entry as usize, &child_args)?;
+                    let mut child_vt = VTask::new(&c0, entry as usize, &child_args)?;
+                    // #816 env-routed tier-up: a same-module confined child runs module 0, so the
+                    // run's bitmap applies to it too — inherit it when the child's window is
+                    // servable (`nested_view` shares the parent backing, so a root-lineage carve
+                    // always is; a fork twin's descendant is gated by its backing like the twin).
+                    // The driver serves each of the child's tier-ups over its own carve via the
+                    // pending-env routing (`CoopRun::pending_win`/`mem_map_info`); the emitted
+                    // module's per-access live bound (elision off for instantiator-bearing modules,
+                    // temen-wasm-jit `elide_bound`) confines them to the carve.
+                    if tierup_servable(child_mem.as_ref(), mem.as_ref()) {
+                        if let Some(e) = eligible.as_ref() {
+                            child_vt.active.jit_eligible = Some(std::sync::Arc::clone(e));
+                            child_vt.active.jit_page_checked = *page_checked;
+                        }
+                    }
                     let eidx = extra_envs.len();
                     extra_envs.push(ChildEnv {
                         mem: child_mem,
@@ -11904,13 +12006,60 @@ impl CoopRun {
         }))
     }
 
-    /// The run's window committed **scalar extent** right now — the #717 value the cdylib re-syncs to
-    /// every emitted instance's `"mapped"` global after a [`bounce`](Self::bounce) (a bounced callback
-    /// may have grown the window). `0` when there is no window or its state is not representable by one
-    /// bound. Reads the shared root window (a confined child's own-window growth is a later refinement).
-    pub fn window_scalar_extent(&self) -> u64 {
-        self.mem
+    /// #816 env-routed tier-up: the task index of the outstanding tier-up / `Jit.invoke` round-trip
+    /// (the one the driver is currently serving), if any. The same resolution [`bounce`](Self::bounce)
+    /// performs — at most one round-trip is outstanding, so this names *the* task every per-event
+    /// driver read (`win`, mapped extent, page state) must be answered for.
+    fn pending_ti(&self) -> Option<usize> {
+        self.sched
+            .pending_tierup
             .as_ref()
+            .map(|(ti, ..)| *ti)
+            .or_else(|| self.sched.pending_jit.as_ref().map(|(ti, ..)| *ti))
+    }
+
+    /// #816: the window the outstanding round-trip's task runs over — `extra_envs[k].mem` for an
+    /// env-carrying task (a §14 confined child or one of its threads), the root window otherwise
+    /// (including when no round-trip is pending — the pre-open / post-done reads). Mirrors
+    /// [`bounce`](Self::bounce)'s env dispatch, so the driver's reads and the bounced cap calls
+    /// always agree on which window is live.
+    fn pending_mem(&self) -> Option<&Mem> {
+        match self.pending_ti().and_then(|ti| self.sched.tasks[ti].env) {
+            Some(k) => self.sched.extra_envs[k].mem.as_ref(),
+            None => self.mem.as_ref(),
+        }
+    }
+
+    /// #816: the pending round-trip task's env identity — `-1` for the root env, the `extra_envs`
+    /// index for a confined child. Part of the driver's page-state cache key: env windows have their
+    /// **own** `map_version` counters (a fresh Arc per `nested_view`), so a version compare is only
+    /// meaningful within one env — the driver rebuilds whenever (env, version) changes.
+    pub fn pending_env(&self) -> i64 {
+        self.pending_ti()
+            .and_then(|ti| self.sched.tasks[ti].env)
+            .map_or(-1, |k| k as i64)
+    }
+
+    /// #816: the pending task's **flat window view** for the emitted call — `(base ptr, reserved
+    /// len)`. For the root this is the run backing itself; for a §14 child it is the backing plus
+    /// the carve offset, so the emitted `win + addr` accesses land exactly where the interpreter's
+    /// confined accesses do. `None` when the pending window has no flat address (a `Paged`-backed
+    /// window, e.g. a fork twin's private copy on wasm) — such tasks never carry the tier-up bitmap
+    /// (the eligibility gates check [`Mem::flat_win_base`] at task creation), so a pending tier-up
+    /// always resolves `Some`; the `None` arm is the fail-closed default for defensive callers.
+    pub fn pending_win(&self) -> Option<(*const u8, u64)> {
+        let m = self.pending_mem()?;
+        Some((m.flat_win_base()?, m.win_reserved()))
+    }
+
+    /// The pending task's window committed **scalar extent** right now — the #717 value the cdylib
+    /// re-syncs to every emitted instance's `"mapped"` global after a [`bounce`](Self::bounce) (a
+    /// bounced callback may have grown the window). `0` when there is no window or its state is not
+    /// representable by one bound. #816: routed to the pending round-trip's task env, so a confined
+    /// child's own extent (its fully-mapped carve) bounds its emitted accesses — the confinement
+    /// bound — rather than the root's.
+    pub fn window_scalar_extent(&self) -> u64 {
+        self.pending_mem()
             .and_then(|m| m.scalar_extent())
             .unwrap_or(0)
     }
@@ -11941,17 +12090,22 @@ impl CoopRun {
         self.sched.table_gen
     }
 
-    /// #1009 paged tier-up: the root window's memory-map introspection ([`MemMapInfo`]) — a paged
-    /// coop driver rebuilds its page-state table from this. `None` for a memory-less run.
+    /// #1009 paged tier-up: the pending task's window memory-map introspection ([`MemMapInfo`]) — a
+    /// paged coop driver rebuilds its page-state table from this. `None` for a memory-less run.
+    /// #816: routed to the pending round-trip's task env, so a confined child's own page map (its
+    /// carve geometry, its `protect`/`unmap` state) is what the emitted page check enforces —
+    /// window-relative on both sides, no translation needed.
     pub fn mem_map_info(&self) -> Option<MemMapInfo> {
-        self.mem.as_ref().map(|m| m.map_info())
+        self.pending_mem().map(|m| m.map_info())
     }
 
-    /// #1009 paged tier-up: the root window's page-map version (bumped on every `map`/`unmap`/
-    /// `protect`) — the cheap `O(1)` counter a paged coop driver compares to skip an unchanged
-    /// page-state rebuild. `0` for a memory-less run.
+    /// #1009 paged tier-up: the pending task's window page-map version (bumped on every `map`/
+    /// `unmap`/`protect`) — the cheap `O(1)` counter a paged coop driver compares to skip an
+    /// unchanged page-state rebuild. `0` for a memory-less run. #816: env windows carry their own
+    /// counters, so the driver's cache key is ([`pending_env`](Self::pending_env), this) — a bare
+    /// version compare across different envs would alias.
     pub fn mem_map_version(&self) -> u64 {
-        self.mem.as_ref().map_or(0, |m| m.map_version())
+        self.pending_mem().map_or(0, |m| m.map_version())
     }
 
     /// Pump the schedule to its next pause: [`CoopEvent::Done`]/[`CoopEvent::Trapped`] end the run,
@@ -12095,6 +12249,28 @@ impl CoopRun {
                 )
             }
         }
+    }
+}
+
+/// #816 env-routed tier-up: may a task running over `cand` carry the tier-up bitmap? Either arm
+/// keeps the driver contract satisfiable — [`CoopRun::pending_win`] must resolve a flat view of the
+/// pending window:
+/// - a window sharing the **root backing** (a root-env thread, a §14 child carve via `nested_view`)
+///   is servable wherever the root is (the per-event `win` is the backing base plus the window's
+///   carve offset);
+/// - any other window (a fork twin's private `fork_private` copy) qualifies only if its own region
+///   is flat-addressable ([`Mem::flat_win_base`]). `fork_private` now picks an owned flat buffer
+///   for a bounded twin of a flat parent (#816 item 3), so tier-up-shaped twins qualify on every
+///   target; a twin that still lands on the `Paged` fallback (unbounded reservation, allocation
+///   failure) stays interpreted, fail-closed.
+///
+/// A memory-less run has no window to serve — no bitmap.
+fn tierup_servable(cand: Option<&Mem>, root: Option<&Mem>) -> bool {
+    match (cand, root) {
+        (Some(c), Some(r)) => {
+            std::sync::Arc::ptr_eq(&c.back, &r.back) || c.flat_win_base().is_some()
+        }
+        _ => false,
     }
 }
 
@@ -12248,6 +12424,19 @@ struct ThreadRegistry {
     next_id: std::sync::atomic::AtomicU64,
     live: std::sync::atomic::AtomicUsize,
     futex: Futex,
+    /// #748 — the personality **fork-twin table** for the parallel driver's `ForkSelf`/`ReapWait`
+    /// arms: `(exited pids, generation)`. Exited pids are permanent (never removed — pids are
+    /// per-run unique), so a `waitpid(pid)` waiter can never miss its wake. The generation bumps
+    /// once per twin exit so an **any-child** waiter waits for "an exit newer than the ones my
+    /// re-issued waitpid already consumed" — the condvar analogue of the cooperative driver's
+    /// consumed-Done-twin prune: a stale exit can neither re-wake forever nor be lost (an exit
+    /// before the op's table check left a zombie the re-issue reaps; one after bumps past the
+    /// waiter's recorded generation).
+    fork_exits: std::sync::Mutex<(std::collections::HashSet<i64>, u64)>,
+    fork_woken: std::sync::Condvar,
+    /// The next personality twin pid. Starts at 2: the root personality is pid 1 (the same
+    /// no-collision shape as the cooperative driver's `task index + 1`).
+    next_fork_pid: std::sync::atomic::AtomicI64,
 }
 
 impl ThreadRegistry {
@@ -12258,6 +12447,36 @@ impl ThreadRegistry {
             next_id: std::sync::atomic::AtomicU64::new(0),
             live: std::sync::atomic::AtomicUsize::new(0),
             futex: Futex::default(),
+            fork_exits: std::sync::Mutex::new((std::collections::HashSet::new(), 0)),
+            fork_woken: std::sync::Condvar::new(),
+            next_fork_pid: std::sync::atomic::AtomicI64::new(2),
+        }
+    }
+
+    /// #748 — a fork twin's OS thread finished (its exit hooks have already fired, so the
+    /// personality table shows the zombie): record the exit and wake every reap waiter.
+    fn publish_fork_exit(&self, pid: i64) {
+        let mut g = self.fork_exits.lock().unwrap_or_else(|e| e.into_inner());
+        g.0.insert(pid);
+        g.1 += 1;
+        self.fork_woken.notify_all();
+    }
+
+    /// #748 — block this vCPU's OS thread until `child` (`Some(pid)`) has published its exit, or
+    /// (`None`, the any-child wait) until the exit generation exceeds `last_gen`. Returns the
+    /// current generation for the caller to carry into its next wait; either way the caller's
+    /// rewound `waitpid` re-executes against the updated personality table.
+    fn wait_fork_exit(&self, child: Option<i64>, last_gen: u64) -> u64 {
+        let mut g = self.fork_exits.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let ready = match child {
+                Some(pid) => g.0.contains(&pid),
+                None => g.1 > last_gen,
+            };
+            if ready {
+                return g.1;
+            }
+            g = self.fork_woken.wait(g).unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -12304,13 +12523,28 @@ fn drive_parallel(
     };
     let reg = ThreadRegistry::new();
     // Share the caller's powerbox across every vCPU thread, then hand it back (so the caller reads its
-    // stdout / final state). `scope` joins all vCPUs before returning, so the borrow is sound and the
-    // `Mutex` is uncontended at unwrap.
-    let shared = std::sync::Mutex::new(std::mem::take(host));
+    // stdout / final state). `Arc` (not a scope-borrowed `&Mutex`) because a personality fork twin
+    // (#748) carries its OWN host cell minted at runtime — per-process powerboxes, the parallel twin
+    // of the cooperative driver's `extra_envs`. `scope` joins all vCPUs before returning, so every
+    // clone is dropped and the unwrap below is the sole owner.
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(std::mem::take(host)));
     let out = std::thread::scope(|scope| {
-        run_vcpu_parallel(scope, &dom, &reg, &shared, root_vt, mem, fuel)
+        run_vcpu_parallel(
+            scope,
+            &dom,
+            &reg,
+            std::sync::Arc::clone(&shared),
+            None,
+            root_vt,
+            mem,
+            fuel,
+        )
     });
-    *host = shared.into_inner().unwrap_or_else(|e| e.into_inner());
+    *host = match std::sync::Arc::try_unwrap(shared) {
+        Ok(m) => m.into_inner().unwrap_or_else(|e| e.into_inner()),
+        // Unreachable in practice (the scope joined every holder), but never lose the powerbox.
+        Err(a) => std::mem::take(&mut *a.lock().unwrap_or_else(|e| e.into_inner())),
+    };
     out
 }
 
@@ -12319,11 +12553,20 @@ fn drive_parallel(
 /// blocking each `thread.join` on the [`ThreadRegistry`]. Mirrors the cooperative `drive`'s `Spawn` /
 /// `Join` / `Done` arms, one vCPU at a time. Returns this vCPU's result and the `Mem` it owned (the
 /// root's is the one captured; a child's is dropped, its bytes already live in the shared backing).
+#[allow(clippy::too_many_arguments)] // an internal driver entry: the args ARE the vCPU's identity
 fn run_vcpu_parallel<'scope, 'env>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
     dom: &'env Domain,
     reg: &'env ThreadRegistry,
-    host: &'env std::sync::Mutex<Host>,
+    // This vCPU's powerbox cell: the run's shared host for the root and its `thread.spawn` siblings
+    // (4c-host), or a fork twin's OWN forked powerbox (#748) — its own spawned threads then share
+    // *that*. Owned `Arc` so a twin's runtime-minted cell moves into its scoped thread cleanly.
+    host: std::sync::Arc<std::sync::Mutex<Host>>,
+    // This vCPU's dispatch table when it is not the domain's shared `dom.table`: an `exec_module`
+    // image-replace (#748 rung 2) installs the command's natural table here, and a fork twin (same
+    // image as its parent) or `thread.spawn` child (same image as its spawner) inherits its
+    // parent's. `Arc` so inheritance is a clone, not a rebuild.
+    mut tbl: Option<std::sync::Arc<SharedSlots>>,
     mut vt: VTask,
     mut mem: Option<Mem>,
     mut fuel: u64,
@@ -12333,15 +12576,18 @@ fn run_vcpu_parallel<'scope, 'env>(
     let mut fiber_meta: Vec<(i32, i64)> = Vec::new();
     // handle (index) → global vCPU id of a `thread.spawn` child (shares the cooperative handle scheme).
     let mut threads: Vec<Option<u64>> = Vec::new();
+    // #748 — the exit generation this vCPU's any-child `waitpid` has consumed up to (see
+    // [`ThreadRegistry::wait_fork_exit`]).
+    let mut fork_gen: u64 = 0;
     loop {
         let mut ctx = RunCtx {
-            table: &dom.table,
+            table: tbl.as_deref().unwrap_or(&dom.table),
             fuel: &mut fuel,
             mem: &mut mem,
             durable: false,
             // The powerbox is **shared** by every vCPU of the run (4c-host): `call.cap` takes the lock
             // only for its own dispatch, so compute/atomics/futex between calls stay lock-free.
-            host: HostCell::Shared(host),
+            host: HostCell::Shared(&host),
         };
         // NLL ends `ctx`'s borrows of `mem`/`fuel` at this call, so the arms below may touch them.
         let stop = step_vcpu(
@@ -12365,13 +12611,6 @@ fn run_vcpu_parallel<'scope, 'env>(
             | Ok(VcpuStop::ChildOffer { .. })
             | Ok(VcpuStop::CloneCaller { .. })
             | Ok(VcpuStop::Reap { .. })
-            // `exec_module` image-replace is cooperative-driver-only (needs the task/env set).
-            | Ok(VcpuStop::Exec { .. })
-            // #1080 rung 3/4 — personality `fork()`/`waitpid()`/pipe parks are cooperative-driver-only.
-            | Ok(VcpuStop::ForkSelf { .. })
-            | Ok(VcpuStop::ReapWait { .. })
-            | Ok(VcpuStop::PipeRead { .. })
-            | Ok(VcpuStop::PipeWrite { .. })
             | Ok(VcpuStop::BlockOnFiber { .. }) => return (Err(Trap::ThreadFault), mem),
             Err(trap) => return (Err(trap), mem),
             Ok(VcpuStop::Done(vals)) => return (Ok(vals), mem),
@@ -12414,11 +12653,15 @@ fn run_vcpu_parallel<'scope, 'env>(
                         }
                         Err(t) => return (Err(t), mem),
                     };
-                // The child runs over its own `Mem` view of the **same** shared backing (real atomics).
+                // The child runs over its own `Mem` view of the **same** shared backing (real atomics)
+                // and SHARES this vCPU's powerbox cell (a thread, not a process — cf. `ForkSelf`).
                 let child_mem = mem.as_ref().map(|m| m.fork_for_thread());
+                let child_host = std::sync::Arc::clone(&host);
+                let child_tbl = tbl.clone();
                 scope.spawn(move || {
-                    let (r, _m) =
-                        run_vcpu_parallel(scope, dom, reg, host, child_vt, child_mem, fuel);
+                    let (r, _m) = run_vcpu_parallel(
+                        scope, dom, reg, child_host, child_tbl, child_vt, child_mem, fuel,
+                    );
                     reg.publish(id, r);
                 });
                 let handle = threads.len() as i32;
@@ -12440,6 +12683,165 @@ fn run_vcpu_parallel<'scope, 'env>(
                     }
                     // A child trap propagates: the joiner completes with the same trap.
                     Err(t) => return (Err(t), mem),
+                }
+            }
+            Ok(VcpuStop::ForkSelf { dst }) => {
+                // #748 rung 0 — personality `fork()` on the parallel driver: duplicate THIS vCPU
+                // into a twin **OS thread** over a PRIVATE window copy with its OWN forked powerbox
+                // — a process, not a 4c thread (cf. `Spawn`'s `fork_for_thread` shared view). The
+                // parent keeps running with the twin's pid; the twin resumes at the same op (pc
+                // already advanced) with the return-twice `0`. Bare gate + `-EAGAIN` refusal mirror
+                // the cooperative arm (invariant 5: a value, never a hang).
+                let bare = threads.iter().all(|t| t.is_none())
+                    && vt.active_id == ROOT_FIBER
+                    && vt.chain.is_empty();
+                // Cross-thread anti-bomb gate (the `Spawn` arm's), released on any refusal.
+                let admitted = bare
+                    && reg.live.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        < super::MAX_VCPUS;
+                if bare && !admitted {
+                    reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                let forked: Option<(Option<Mem>, Host, i64)> = if admitted {
+                    let twin_pid = reg
+                        .next_fork_pid
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let built = (|| {
+                        let tm = match mem.as_ref() {
+                            Some(m) => Some(m.fork_private()?),
+                            None => None,
+                        };
+                        let th = host.lock_unpoisoned().fork_powerbox(twin_pid as u64)?;
+                        Some((tm, th, twin_pid))
+                    })();
+                    if built.is_none() {
+                        reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    built
+                } else {
+                    None
+                };
+                match forked {
+                    None => vt.active.set(dst, Reg::from_i64(super::EAGAIN)),
+                    Some((twin_mem, twin_host, twin_pid)) => {
+                        // The twin's OWN park door (the #1112 lesson): `fork_powerbox` mints its
+                        // personality with no park delegate, and without one the twin's own
+                        // `fork()`/`waitpid()` cannot park (`-ENOSYS`/the ECHILD poll).
+                        twin_host.wire_park_door();
+                        let mut twin_active = vt.active.clone();
+                        twin_active.set(dst, Reg::from_i64(0));
+                        let twin_vt = VTask {
+                            active: twin_active,
+                            active_id: ROOT_FIBER,
+                            chain: Vec::new(),
+                            root_shadow_sp: super::SHADOW_BASE,
+                            active_invoke: None,
+                            invoke_step_into: false,
+                        };
+                        let twin_host = std::sync::Arc::new(std::sync::Mutex::new(twin_host));
+                        let hooks_host = std::sync::Arc::clone(&twin_host);
+                        // The twin continues the SAME image as its parent, so it dispatches over the
+                        // same table (post-exec parents included — cf. the coop arm's fresh primary
+                        // table, which a bare pre-exec caller also resolves to).
+                        let twin_tbl = tbl.clone();
+                        scope.spawn(move || {
+                            let (r, _m) = run_vcpu_parallel(
+                                scope, dom, reg, twin_host, twin_tbl, twin_vt, twin_mem, fuel,
+                            );
+                            // The twin retired: fire ITS exit hooks once with the reap-encoded
+                            // status (Live → Zombie in the personality table) and release its
+                            // pipe ends (EOF/-EPIPE for peers), THEN publish — a woken waiter's
+                            // re-issued `waitpid` must find the zombie already there.
+                            let status = super::reap_status(&r);
+                            let hooks = {
+                                let g = hooks_host.lock_unpoisoned();
+                                let _ = (g.drop_all_pipe_writers(), g.drop_all_pipe_readers());
+                                g.exit_hooks.clone()
+                            };
+                            for h in hooks {
+                                h(status);
+                            }
+                            reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            reg.publish_fork_exit(twin_pid);
+                        });
+                        vt.active.set(dst, Reg::from_i64(twin_pid));
+                    }
+                }
+            }
+            Ok(VcpuStop::ReapWait { child }) => {
+                // #748 rung 1 — blocking personality `waitpid` on the parallel driver: the op was
+                // REWOUND, so after this (real, condvar) block the loop re-executes it against the
+                // now-updated personality table. `Some(pid)` waits on that twin's permanent exit
+                // record; `None` (any-child) waits for an exit generation newer than the last one
+                // this vCPU consumed — see [`ThreadRegistry::wait_fork_exit`] for why neither can
+                // livelock on a stale exit nor lose a wake.
+                fork_gen = reg.wait_fork_exit(child.map(|p| p as i64), fork_gen);
+            }
+            Ok(VcpuStop::Exec {
+                mh,
+                grants_ptr,
+                grants_n,
+                entry,
+                size_log2,
+                dst,
+            }) => {
+                // #748 rung 2 — FORK.md §8.6 `execve` image-replace on the parallel driver. Every
+                // refusal writes a probeable `-EINVAL` to `dst` and lets the caller run on (POSIX:
+                // `execve` returns only on failure). Admissible from a clean root computation only
+                // (no serve handler, root fiber, a non-durable domain) — the cooperative arm's
+                // gate. Root and fork-twin execs take the SAME path here: each vCPU already owns
+                // its window/host cell, so the cooperative arm's env split does not arise.
+                let clean = vt.active.serve_ticket.is_none()
+                    && vt.active_id == ROOT_FIBER
+                    && !host.lock_unpoisoned().is_durable();
+                let built = if clean {
+                    let mut g = host.lock_unpoisoned();
+                    exec_image_build(
+                        &mut g,
+                        mem.as_ref(),
+                        dom,
+                        mh,
+                        grants_ptr,
+                        grants_n,
+                        entry,
+                        size_log2,
+                    )
+                } else {
+                    Err(())
+                };
+                match built {
+                    Err(()) => vt.active.set(dst, Reg::from_i32(super::EINVAL as i32)),
+                    Ok((child_host, child_table, new_vt)) => {
+                        // Replace the powerbox INSIDE this vCPU's cell, not the `Arc` itself: a
+                        // fork twin's exit-hook holder kept a clone of the cell at spawn, so the
+                        // post-exec exit must find the CARRIED hooks (`exec_carry`) behind the
+                        // same cell — the parallel analogue of the cooperative arm overwriting
+                        // `extra_envs[k].host`. The window is already the command's image
+                        // (materialized in place by the build); the command's natural table
+                        // replaces this vCPU's dispatch table.
+                        *host.lock_unpoisoned() = child_host;
+                        tbl = Some(std::sync::Arc::new(child_table));
+                        vt = new_vt;
+                    }
+                }
+            }
+            Ok(VcpuStop::PipeRead { pipe }) => {
+                // #748 rung 3 (#1080 rung 4) — blocking CorePipe read: the op was rewound, so
+                // block this OS thread until level-triggered readiness (bytes buffered, or every
+                // writer closed) and let the loop re-execute it (a read, or EOF). A short-sleep
+                // poll rather than a condvar door: the peer end lives on another powerbox (a fork
+                // twin's, or even another driver's engine) with no cross-thread doorbell into this
+                // cell yet, and a level-triggered poll cannot lose a wake. Condvar doors on the
+                // shared pipe backing are the follow-up.
+                while !host.lock_unpoisoned().pipe_read_ready(pipe) {
+                    std::thread::sleep(std::time::Duration::from_micros(50));
+                }
+            }
+            Ok(VcpuStop::PipeWrite { pipe }) => {
+                // The write twin: ready when the FIFO has room under `PIPE_CAP` (backpressure
+                // drained) or every reader closed (the re-run completes `-EPIPE`).
+                while !host.lock_unpoisoned().pipe_write_ready(pipe) {
+                    std::thread::sleep(std::time::Duration::from_micros(50));
                 }
             }
             Ok(VcpuStop::CapPending { id, dst }) => {
@@ -12578,7 +12980,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                     &child_args,
                     &mut fuel,
                     &mut mem,
-                    &mut HostCell::Shared(host),
+                    &mut HostCell::Shared(&host),
                 ) {
                     Ok(vals) => {
                         for (i, (v, ty)) in vals.iter().zip(results.iter()).enumerate() {
@@ -12686,13 +13088,14 @@ fn run_vcpu_parallel<'scope, 'env>(
                     // and its **own** thread registry (for threads/instantiates *it* spawns). Its
                     // result is published to the **parent's** `reg` so the parent's `join` finds it.
                     let child_reg = ThreadRegistry::new();
-                    let child_host = std::sync::Mutex::new(child_host);
+                    let child_host = std::sync::Arc::new(std::sync::Mutex::new(child_host));
                     let (r, _m) = std::thread::scope(|cscope| {
                         run_vcpu_parallel(
                             cscope,
                             &child_dom,
                             &child_reg,
-                            &child_host,
+                            std::sync::Arc::clone(&child_host),
+                            None,
                             child_vt,
                             child_mem,
                             child_fuel,
@@ -12838,13 +13241,14 @@ fn run_vcpu_parallel<'scope, 'env>(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 scope.spawn(move || {
                     let child_reg = ThreadRegistry::new();
-                    let child_host = std::sync::Mutex::new(child_host);
+                    let child_host = std::sync::Arc::new(std::sync::Mutex::new(child_host));
                     let (r, _m) = std::thread::scope(|cscope| {
                         run_vcpu_parallel(
                             cscope,
                             &child_dom,
                             &child_reg,
-                            &child_host,
+                            std::sync::Arc::clone(&child_host),
+                            None,
                             child_vt,
                             child_mem,
                             child_fuel,

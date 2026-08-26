@@ -181,7 +181,10 @@ const tierupJitRes = (ret, tc) => tc === 0 || tc === 1 ? BigInt(ret)
 async function driveCoopTierupRun(ex, memory, cacheKey) {
   const u8 = () => new Uint8Array(memory.buffer);
   const i64 = () => new BigInt64Array(memory.buffer);
-  const win = Number(ex.temen_coop_win_ptr());
+  // #816 env-routed tier-up: `win` is PER EVENT — the pending task's window base (root backing for
+  // a root-env task, backing + carve offset for a §14 confined child). Read inside each event arm
+  // via temen_coop_tierup_win_ptr(); never cache it across events.
+  const eventWin = () => Number(ex.temen_coop_tierup_win_ptr());
 
   const mappedGlobals = []; // every live instance's "mapped" — the post-bounce fan-out set (#717)
   const fuelGlobals = [];
@@ -317,7 +320,7 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
         for (const g of fuelGlobals) g.value = 1n << 61n;
         new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
         try {
-          const ret = unit['f0'](win, envCell, ...args);
+          const ret = unit['f0'](eventWin(), envCell, ...args);
           const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
           const rn = ex.temen_coop_jit_result_types_len();
           const rtypes = new Uint8Array(memory.buffer, Number(ex.temen_coop_jit_result_types_ptr()), rn);
@@ -353,7 +356,7 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
       }
       new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
       try {
-        const ret = emitted['f' + func](win, envCell, ...args);
+        const ret = emitted['f' + func](eventWin(), envCell, ...args);
         const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
         const rlen = Math.max(1, rets.length) * 8;
         const rptr = Number(ex.temen_alloc(rlen));
@@ -482,6 +485,34 @@ export async function runWarmJit(ex, memory, stdinBytes, cacheKey, shared = 1) {
   const status = ex.temen_warm_jit_finish();
   if (status === 3 /* STATUS_TRAP */) throw warmJitTrapError(trapError);
   return status;
+}
+
+// Run the warm session's `eval_run` on the **warm-coop** tier (#816 item 4): the cooperative
+// tier-up drive over the restored warm image, for a page-managing / InterpDriven eval the
+// WasmDriven `runWarmJit` declines (its open throws). The engine emits the module's leaves + cap
+// wrappers once (cached in the warm session, like the warm+JIT emit; the compiled
+// `WebAssembly.Module` is cached across Runs under `cacheKey#coop`); each Run is prepare (restore
+// image + re-establish the captured page map + arm `eval_run` on the coop scheduler) + the standard
+// `driveCoopTierupRun` event loop — the interpreter owns the eval, eligible pure leaves run on
+// emitted wasm with the per-event `mapped`/page-state sync carrying the warm image's grown heap and
+// protected rodata. Assumes `temen_warm_open` already succeeded. Returns the run status; throws if
+// the module has nothing for the emitted tier or the run traps (the caller falls back to
+// `temen_warm_eval`, the interpreter warm path).
+export async function runWarmCoop(ex, memory, stdinBytes, cacheKey, shared = 1) {
+  const u8 = () => new Uint8Array(memory.buffer);
+  if (ex.temen_warm_coop_open(shared) !== 0) {
+    throw new Error(`warm-coop open failed: status ${ex.temen_status()} (2 = nothing emittable)`);
+  }
+  let stdinP = 0;
+  const stdinLen = stdinBytes ? stdinBytes.length : 0;
+  if (stdinLen) {
+    stdinP = Number(ex.temen_alloc(stdinLen));
+    u8().set(stdinBytes, stdinP);
+  }
+  const prepared = ex.temen_warm_coop_prepare(stdinP, stdinLen);
+  if (stdinP) ex.temen_dealloc(stdinP, stdinLen);
+  if (prepared !== 0) throw new Error(`warm-coop prepare failed: status ${ex.temen_status()}`);
+  return driveCoopTierupRun(ex, memory, cacheKey);
 }
 
 // The last warm+JIT trap, captured for diagnosis (issue #865) — `{ kind, frames }` where `frames` are the

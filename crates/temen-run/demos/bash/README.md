@@ -301,6 +301,19 @@ at parity on the wasm-safe tier. What remains for the *playground* is integratio
 `bash.temen` module + a `temen_run_shell`-style entry, the coreutils as browser fixtures, and the
 #797 terminal for interactive `-i` — not core execution gaps.
 
+## bash on the parallel driver (#748 — real OS threads)
+
+The same bytecode also runs over **`drive_parallel`** (`BASH_PROBE_BACKEND=parallel`, routed through
+`Instance::run_with_caps_parallel`): every bash `fork()` twin is a real OS thread over a private
+window copy with its own powerbox, `waitpid` a real condvar block, pipes level-triggered polls, and
+`execve` an in-place host/table swap on the exec'ing thread. Builtin pipelines, command/process
+substitution, subshells, and the exec'd-coreutil pipelines (`seq | head`, `seq 100 | wc -l`,
+`sort | uniq`, redirections) all match the cooperative tier. The bash capstone gate
+(`demo_bash_translates_and_verifies`) pins this as the **dual-driver differential**: every script in
+the main list runs on both bytecode drivers and they must agree with each other (the kill-based trap
+scripts print less than native on BOTH, coherently — async delivery into a running C handler is an
+interp-only tier, #796 L2), and the external-command list must additionally match native on both.
+
 ## What remains (the slice ladder from the #802 sketch)
 
 - The `^D`-EOF nuance (the one-shot EOF is writer-count state, so the shell's next read can

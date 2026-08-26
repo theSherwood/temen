@@ -758,13 +758,15 @@ fn vextadd_sub(shape: VShape, signed: bool) -> Option<u32> {
 /// Only the v1 subset is typed; anything else is `Unsupported` (fail-closed — the module was
 /// verified, so no `unwrap` here can be reached by a malformed operand index).
 /// The §14 capability ops the wasm tier lowers to a **host-driver bounce** (instead of failing
-/// out-of-subset): INSTANTIATOR (iface 6) `instantiate` (op 0) and `join` (op 1) — the VM-in-VM
-/// primitive (`DESIGN.md` §14; `temen_ir::cap_id::INSTANTIATOR`). The child
-/// vCPU spawn/join happens host-side (as the interpreter surfaces `VcpuStop::Instantiate`), so the
-/// emitted code just marshals the args to an `env.instantiate`/`env.join` import. Other §14 ops
-/// (address-space, coroutines) are not lowered yet — they stay out-of-subset (fail-closed).
+/// out-of-subset): INSTANTIATOR (iface 6) `instantiate` (op 0), `join` (op 1), the separate-module
+/// `instantiate_module_named` (op 13, #1123), and the config-record `instantiate_rec` (op 17) — the
+/// VM-in-VM primitive (`DESIGN.md` §14; `temen_ir::cap_id::INSTANTIATOR`). The child vCPU spawn/join
+/// happens host-side (as the interpreter surfaces `VcpuStop::Instantiate`), so the emitted code just
+/// marshals the args to an `env.instantiate`/`env.instantiate_module`/`env.instantiate_rec`/`env.join`
+/// import. Other §14 ops (address-space, coroutines) are not lowered yet — they stay out-of-subset
+/// (fail-closed).
 fn is_nested_cap(type_id: u32, op: u32) -> bool {
-    type_id == cap_id::INSTANTIATOR && (op == 0 || op == 1 || op == 17)
+    type_id == cap_id::INSTANTIATOR && (op == 0 || op == 1 || op == 13 || op == 17)
 }
 
 /// CONSOLIDATION.md §3c.3 — does the module use the config-record spawn (`Instantiator` op 17)?
@@ -781,6 +783,53 @@ fn module_uses_rec(m: &Module) -> bool {
                     Inst::CapCall {
                         type_id: cap_id::INSTANTIATOR,
                         op: 17,
+                        ..
+                    }
+                )
+            })
+        })
+    })
+}
+
+/// #1123 — does the module use the **separate-module** spawn (`Instantiator` op 13,
+/// `instantiate_module_named`)? When it does (and only then), nested mode appends the
+/// `env.instantiate_module` import **after** `env.instantiate_rec` (func import `8 + uses_rec`),
+/// shifting the emitted-function base by one for that module alone. Like the op-17 append, existing
+/// modules keep their exact import set — no driver changes until it loads an op-13 module. This is the
+/// wasm-tier analogue of the interpreter/Cranelift `instantiate_module_named`: the parent runs
+/// **emitted** and the separate child spawn/join happen host-side (the servicer resolves the module
+/// handle + grant list, then emits + runs the child — the #1123 slice-1 `env.instantiate` mechanism).
+fn module_uses_instantiate_module(m: &Module) -> bool {
+    m.funcs.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            b.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    Inst::CapCall {
+                        type_id: cap_id::INSTANTIATOR,
+                        op: 13,
+                        ..
+                    }
+                )
+            })
+        })
+    })
+}
+
+/// #816: can this module ever run as (or spawn) a **same-module §14 child** — a task whose window
+/// is a carve *smaller* than the emit-time window? Any `Instantiator` `call.cap` qualifies
+/// (conservative: ops 0/11/17 spawn same-module children directly; the rest are kept in the
+/// predicate so a new spawn op fails closed rather than eliding). When true, [`emit_module`] turns
+/// bound-check **elision** off, because an elision proof against the emit-time window is no floor
+/// for a child carve — see `elide_bound` there.
+fn module_can_spawn_same_module(m: &Module) -> bool {
+    m.funcs.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            b.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    Inst::CapCall {
+                        type_id: cap_id::INSTANTIATOR,
                         ..
                     }
                 )
@@ -1468,6 +1517,11 @@ const NESTED_IMPORTED_FUNCS: u32 = 8;
 /// §3c.3 — `env.instantiate_rec` (the config-record spawn bounce), emitted **conditionally** as
 /// func import 8 only when [`module_uses_rec`]; the emitted-function base is then 9.
 const INSTANTIATE_REC_IMPORT_IDX: u32 = 8;
+/// #1123 — `env.instantiate_module` (the separate-module spawn bounce, op 13), emitted
+/// **conditionally** *after* `env.instantiate_rec` (func import `8 + uses_rec`) only when
+/// [`module_uses_instantiate_module`]. Its index is computed at the lowering/import site (not a const)
+/// precisely because it depends on whether the module also uses op-17; the two conditional imports
+/// compose deterministically and shift the emitted-function base by their sum.
 /// `env.call_interp` scratch: the cross-tier call marshals its arg/result slots starting at
 /// this byte offset in the `env` cell (past the `i64` fuel counter at 0). The host must allocate the
 /// `env` cell at least [`ENV_CELL_BYTES`] large.
@@ -1560,8 +1614,12 @@ pub fn compile_module_nested_with_eligibility(
     let mut emitted: Vec<usize> = Vec::new();
     for (i, f) in m.funcs.iter().enumerate() {
         if nested_ok(f) {
-            wasm_of[i] =
-                Some(NESTED_IMPORTED_FUNCS + module_uses_rec(m) as u32 + emitted.len() as u32);
+            wasm_of[i] = Some(
+                NESTED_IMPORTED_FUNCS
+                    + module_uses_rec(m) as u32
+                    + module_uses_instantiate_module(m) as u32
+                    + emitted.len() as u32,
+            );
             emitted.push(i);
         } else if f.uses_fibers() {
             // A fiber (`cont.*`/`suspend`) can't be emitted (no wasm frame unwind) and must not become
@@ -2492,7 +2550,7 @@ fn compile_module_tierup_inner(
     let all_in_subset = in_subset.iter().all(|&s| s);
     // Emitted functions follow the import block; the nested layout adds the §14/§11 bounce imports.
     let base = if nested_caps {
-        NESTED_IMPORTED_FUNCS + module_uses_rec(m) as u32
+        NESTED_IMPORTED_FUNCS + module_uses_rec(m) as u32 + module_uses_instantiate_module(m) as u32
     } else {
         IMPORTED_FUNCS
     };
@@ -2756,6 +2814,21 @@ fn emit_module(
         Some(mc) => 1u64 << mc.size_log2,
         None => 0,
     };
+    // #816 env-routed tier-up: the bound-check **elision** budget. Elision proves an access within
+    // the emit-time window (`mapped` above) and skips the live-`"mapped"`-global trap branch — sound
+    // only while every window this emitted code may serve is at least that large ("the window only
+    // grows"). A module that can spawn **same-module §14 children** breaks that floor: a child task
+    // tiers up into these same functions over a *carve* smaller than the emit window, where an
+    // elided access could land past the carve (and, with the per-event `win` base, past the run
+    // backing). For such modules emit every access with the full live-bound check (`elide_bound =
+    // 0` makes every `in_window` proof fail, fail-closed); the live `"mapped"` sync then carries
+    // each event's own window bound — root, child carve, or fork twin alike. Pure perf cost,
+    // confinement-neutral for modules that never instantiate.
+    let elide_bound: u64 = if module_can_spawn_same_module(m) {
+        0
+    } else {
+        mapped
+    };
 
     // Types: 0 = env.trap `(i32) -> ()`, 1 = env.call_interp `(i32 func, i32 args_ptr) -> ()`, then
     // one per emitted function (dedup'd).
@@ -2765,7 +2838,9 @@ fn emit_module(
     //   env.join:        (i32 inst, i32 child) -> i64
     let (mut instantiate_ty, mut join_ty) = (0u32, 0u32);
     let uses_rec = nested_caps && module_uses_rec(m);
+    let uses_module = nested_caps && module_uses_instantiate_module(m);
     let mut instantiate_rec_ty = 0u32;
+    let mut instantiate_module_ty = 0u32;
     let (mut thread_spawn_ty, mut thread_join_ty, mut mem_wait_ty, mut mem_notify_ty) =
         (0u32, 0u32, 0u32, 0u32);
     if nested_caps {
@@ -2777,6 +2852,17 @@ fn emit_module(
             // §3c.3 env.instantiate_rec: (i32 win, i32 inst, i64 record_ptr) -> i32 child handle
             instantiate_rec_ty = types.len() as u32;
             types.push((vec![0x7f, 0x7f, 0x7e], vec![0x7f]));
+        }
+        if uses_module {
+            // #1123 env.instantiate_module (op 13): (i32 win, i32 inst, i64 module, i64 grants_ptr,
+            // i64 grants_n, i64 entry, i64 off, i64 size_log2, i64 quota) -> i32 child handle. The
+            // servicer resolves the module handle + reads the grant records at win + grants_ptr, then
+            // spawns the separate child into the carve — the parent-emitted twin of the op-0 bounce.
+            instantiate_module_ty = types.len() as u32;
+            types.push((
+                vec![0x7f, 0x7f, 0x7e, 0x7e, 0x7e, 0x7e, 0x7e, 0x7e, 0x7e],
+                vec![0x7f],
+            ));
         }
         // §11 thread/futex bounces:
         //   env.thread_spawn: (i32 func, i64 sp, i64 arg) -> i32 handle
@@ -2911,7 +2997,7 @@ fn emit_module(
         // interpreter would have dispatched. (Fixed a hang/trap ~frame 174 of Doom, when the first
         // monster thinker fires an `A_*` action loaded from `states[]`.)
         let mut next_widx = if nested_caps {
-            NESTED_IMPORTED_FUNCS + uses_rec as u32
+            NESTED_IMPORTED_FUNCS + uses_rec as u32 + uses_module as u32
         } else {
             IMPORTED_FUNCS
         } + emitted.len() as u32;
@@ -2958,7 +3044,7 @@ fn emit_module(
         bodies.push(emit_func(
             m,
             &m.funcs[fi],
-            mapped,
+            elide_bound,
             wasm_of,
             interp_leaf,
             &types,
@@ -2992,7 +3078,8 @@ fn emit_module(
     let n_imports = 3
         + reserved_table_log2.is_some() as u64
         + if nested_caps { 6 } else { 0 }
-        + uses_rec as u64;
+        + uses_rec as u64
+        + uses_module as u64;
     uleb(&mut sec, n_imports);
     import_name(&mut sec, "env", "memory");
     sec.push(0x02); // memory
@@ -3035,10 +3122,17 @@ fn emit_module(
         sec.push(0x00); // func
         uleb(&mut sec, mem_notify_ty as u64);
         if uses_rec {
-            // §3c.3 — appended last (func import 8), so no existing import index shifts.
+            // §3c.3 — appended after the fixed eight (func import 8), so no existing import shifts.
             import_name(&mut sec, "env", "instantiate_rec");
             sec.push(0x00); // func
             uleb(&mut sec, instantiate_rec_ty as u64);
+        }
+        if uses_module {
+            // #1123 — appended after instantiate_rec (func import `8 + uses_rec`), so no existing
+            // import shifts and the two conditional imports compose deterministically.
+            import_name(&mut sec, "env", "instantiate_module");
+            sec.push(0x00); // func
+            uleb(&mut sec, instantiate_module_ty as u64);
         }
     }
     if reserved_table_log2.is_some() {
@@ -3711,6 +3805,7 @@ fn emit_func(
             table_size,
             nested_caps,
             cross_module,
+            None, // monolithic emit: no block-group split
         )?;
     }
     code.push(OP_END); // close the loop
@@ -3735,6 +3830,591 @@ fn emit_func(
     }
     body.extend_from_slice(&code);
     Ok(body)
+}
+
+/// #1120 Slice 1 — emit **one block-group** of a split function as a wasm function body. Signature
+/// `(win: i32, env: i32, entry: i32) -> f.results`: `entry` selects which of the group's inter-group
+/// **entry** blocks to resume at; that block's params arrive in the env scratch. The body is an
+/// **entry dispatch** (load the chosen entry block's params from scratch, set `$next`) followed by the
+/// ordinary block-dispatch `loop` over *this group's* blocks (global block indices preserved). Same-group
+/// edges branch through `$next`; inter-group edges are `return_call`s emitted by [`emit_block_body`] via
+/// the `SplitCtx`. No function-entry fuel charge here — only the entry wrapper charges it once (the group
+/// functions are reached by frame-reusing tail calls, which the oracle does not re-charge).
+#[allow(clippy::too_many_arguments)]
+fn emit_split_group(
+    m: &Module,
+    f: &Func,
+    split: &SplitCtx,
+    group_blocks: &[usize],
+    entry_blocks: &[usize],
+    mapped: u64,
+    wasm_of: &[Option<u32>],
+    interp_leaf: &[bool],
+    types: &[(Vec<u8>, Vec<u8>)],
+    table_size: u32,
+    nested_caps: bool,
+    paged: Option<u8>,
+    null_guard: Option<u64>,
+) -> Result<Vec<u8>, Error> {
+    let n_params = 3u32; // win, env, entry
+    let nblocks = f.blocks.len();
+    let per_block_types: Vec<Vec<ValType>> = f
+        .blocks
+        .iter()
+        .map(|b| block_value_types(m, b, nested_caps))
+        .collect::<Result<_, _>>()?;
+    const NTYPES: usize = 7;
+    let type_slot = |t: ValType| -> usize {
+        match t {
+            ValType::I32 => 0,
+            ValType::I64 => 1,
+            ValType::F32 => 2,
+            ValType::F64 => 3,
+            ValType::V128 => 4,
+            ValType::Ref => 5,
+            ValType::Cap => 6,
+        }
+    };
+    // Pool per type = max count in any of THIS group's blocks (a group is smaller than the whole func).
+    let mut pool: [u32; NTYPES] = [0; NTYPES];
+    for &gb in group_blocks {
+        let mut per_block = [0u32; NTYPES];
+        for t in &per_block_types[gb] {
+            per_block[type_slot(*t)] += 1;
+        }
+        for i in 0..NTYPES {
+            pool[i] = pool[i].max(per_block[i]);
+        }
+    }
+    let mut base = [0u32; NTYPES];
+    let mut acc = 0u32;
+    for i in 0..NTYPES {
+        base[i] = acc;
+        acc += pool[i];
+    }
+    let mut local_types: Vec<ValType> = Vec::with_capacity(acc as usize + 6);
+    for (i, &t) in [
+        ValType::I32,
+        ValType::I64,
+        ValType::F32,
+        ValType::F64,
+        ValType::V128,
+        ValType::Ref,
+    ]
+    .iter()
+    .enumerate()
+    {
+        for _ in 0..pool[i] {
+            local_types.push(t);
+        }
+    }
+    // local_of is indexed by GLOBAL block index; only this group's blocks get slot maps (others empty,
+    // never referenced here — inter-group edges read the *source* group's locals, all in-group).
+    let local_of: Vec<Vec<u32>> = (0..nblocks)
+        .map(|bi| {
+            if split.block_group[bi] != split.block_group[group_blocks[0]] {
+                return Vec::new();
+            }
+            let mut used = [0u32; NTYPES];
+            per_block_types[bi]
+                .iter()
+                .map(|t| {
+                    let s = type_slot(*t);
+                    let idx = n_params + base[s] + used[s];
+                    used[s] += 1;
+                    idx
+                })
+                .collect()
+        })
+        .collect();
+    let next_l = n_params + local_types.len() as u32;
+    local_types.push(ValType::I32);
+    let ea_l = n_params + local_types.len() as u32;
+    local_types.push(ValType::I64);
+    let fuel_l = n_params + local_types.len() as u32;
+    local_types.push(ValType::I64);
+    let atomic_addr_l = n_params + local_types.len() as u32;
+    local_types.push(ValType::I32);
+    let span_page_l = n_params + local_types.len() as u32;
+    local_types.push(ValType::I64);
+    let span_last_page_l = n_params + local_types.len() as u32;
+    local_types.push(ValType::I64);
+
+    let mut cx = FnCtx {
+        local_of,
+        next_l,
+        ea_l,
+        fuel_l,
+        atomic_addr_l,
+        span_page_l,
+        span_last_page_l,
+        depth: 0,
+        mapped_global_idx: MAPPED_GLOBAL_IDX,
+        page_check: paged.map(|pl| (pl, MAPPED_GLOBAL_IDX + 1)),
+        null_guard,
+    };
+
+    let mut code = Vec::new();
+    // ---- entry dispatch: pick the entry block from `entry` (param 2), load its params from scratch,
+    // set `$next`, then fall into the main loop. `$sel` encloses the whole nest so each arm brs out of
+    // selection into the loop below. Structure mirrors the block-dispatcher (innermost `end` first).
+    let e = entry_blocks.len();
+    code.push(OP_BLOCK);
+    code.push(BLOCKTYPE_VOID); // $sel
+    for _ in 0..(e + 1) {
+        code.push(OP_BLOCK);
+        code.push(BLOCKTYPE_VOID); // e entry arms + 1 trap default
+    }
+    code.push(OP_LOCAL_GET);
+    uleb(&mut code, 2); // entry ordinal
+    code.push(OP_BR_TABLE);
+    uleb(&mut code, e as u64);
+    for j in 0..e {
+        uleb(&mut code, j as u64);
+    }
+    uleb(&mut code, e as u64); // default → the trap arm
+                               // `open` counts frames still open below `$sel`'s parent; $sel is the outermost, so a br to it is
+                               // `br (open - 1)`. After opening $sel + (e+1) blocks, open = e + 2.
+    let mut open = e + 2;
+    for &eb in entry_blocks {
+        code.push(OP_END); // close this arm's block
+        open -= 1;
+        let params = &f.blocks[eb].params;
+        for (i, pty) in params.iter().enumerate() {
+            code.push(OP_LOCAL_GET);
+            uleb(&mut code, 1); // env
+            code.push(OP_I32_CONST);
+            sleb32(&mut code, (ENV_SCRATCH_OFF + slot_off(params, i)) as i32);
+            code.push(0x6a); // i32.add
+            emit_slot_load(&mut code, *pty);
+            code.push(OP_LOCAL_SET);
+            uleb(&mut code, cx.local_of[eb][i] as u64);
+        }
+        code.push(OP_I32_CONST);
+        sleb32(&mut code, eb as i32);
+        code.push(OP_LOCAL_SET);
+        uleb(&mut code, cx.next_l as u64); // $next = this entry block (global index)
+        code.push(OP_BR);
+        uleb(&mut code, (open - 1) as u64); // br $sel
+    }
+    code.push(OP_END); // close the trap default block
+    code.push(OP_UNREACHABLE); // invalid entry ordinal — never reached (host/emit always pass a valid one)
+    code.push(OP_END); // close $sel — control resumes here (main loop below)
+
+    // ---- main dispatch loop over THIS group's blocks. `$next` holds a GLOBAL block index; the br_table
+    // maps it to this group's arm (or the trap default for a stray value, which cannot occur).
+    let g = group_blocks.len();
+    // arm_of[global] = position in group_blocks, else `g` (the trap default arm).
+    let mut arm_of = vec![g as u64; nblocks];
+    for (p, &gb) in group_blocks.iter().enumerate() {
+        arm_of[gb] = p as u64;
+    }
+    cx.depth = 0;
+    code.push(OP_LOOP);
+    code.push(BLOCKTYPE_VOID);
+    cx.depth += 1;
+    for _ in 0..(g + 1) {
+        code.push(OP_BLOCK);
+        code.push(BLOCKTYPE_VOID); // g arms + 1 trap default
+        cx.depth += 1;
+    }
+    code.push(OP_LOCAL_GET);
+    uleb(&mut code, cx.next_l as u64);
+    code.push(OP_BR_TABLE);
+    uleb(&mut code, nblocks as u64);
+    for &a in &arm_of {
+        uleb(&mut code, a);
+    }
+    uleb(&mut code, g as u64); // default → trap arm
+    for &gb in group_blocks {
+        code.push(OP_END);
+        cx.depth -= 1;
+        emit_block_body(
+            m,
+            f,
+            &mut cx,
+            &mut code,
+            gb,
+            &f.blocks[gb],
+            &per_block_types[gb],
+            mapped,
+            wasm_of,
+            interp_leaf,
+            types,
+            table_size,
+            nested_caps,
+            &[],
+            Some(split),
+        )?;
+    }
+    code.push(OP_END); // close the trap default arm
+    cx.depth -= 1;
+    code.push(OP_UNREACHABLE); // $next never names a non-group block
+    code.push(OP_END); // close the loop
+    cx.depth -= 1;
+    code.push(OP_UNREACHABLE);
+    code.push(OP_END); // function body end
+
+    // Prepend the locals vector (grouped runs of one type).
+    let mut body = Vec::new();
+    let mut groups: Vec<(u32, u8)> = Vec::new();
+    for t in &local_types {
+        let byte = valtype_byte(*t)?;
+        match groups.last_mut() {
+            Some((count, b)) if *b == byte => *count += 1,
+            _ => groups.push((1, byte)),
+        }
+    }
+    uleb(&mut body, groups.len() as u64);
+    for (count, byte) in groups {
+        uleb(&mut body, count as u64);
+        body.push(byte);
+    }
+    body.extend_from_slice(&code);
+    Ok(body)
+}
+
+/// #1120 Slice 1 — the tiny **entry wrapper** for a split function: it keeps the real exported
+/// signature `(win, env, ...params) -> results`, charges the one function-entry fuel unit (as the
+/// monolithic emit does), marshals the function's params into the env scratch as block 0's params, then
+/// frame-reuses into the first group with a `return_call`. Everything after runs on the group functions.
+fn emit_split_wrapper(f: &Func, entry_ord0: u32, group0_widx: u32) -> Result<Vec<u8>, Error> {
+    let n_params = 2 + f.params.len() as u32;
+    let fuel_l = n_params; // one i64 fuel local
+    let mut cx = FnCtx {
+        local_of: Vec::new(),
+        next_l: 0,
+        ea_l: 0,
+        fuel_l,
+        atomic_addr_l: 0,
+        span_page_l: 0,
+        span_last_page_l: 0,
+        depth: 0,
+        mapped_global_idx: MAPPED_GLOBAL_IDX,
+        page_check: None,
+        null_guard: None,
+    };
+    let mut code = Vec::new();
+    emit_fuel_check(&mut cx, &mut code); // the single function-entry safepoint
+    for (i, pty) in f.params.iter().enumerate() {
+        code.push(OP_LOCAL_GET);
+        uleb(&mut code, 1); // env
+        code.push(OP_I32_CONST);
+        sleb32(&mut code, (ENV_SCRATCH_OFF + slot_off(&f.params, i)) as i32);
+        code.push(0x6a); // i32.add
+        code.push(OP_LOCAL_GET);
+        uleb(&mut code, 2 + i as u64); // the i-th Temen param
+        emit_slot_store(&mut code, *pty);
+    }
+    code.push(OP_LOCAL_GET);
+    uleb(&mut code, 0); // win
+    code.push(OP_LOCAL_GET);
+    uleb(&mut code, 1); // env
+    code.push(OP_I32_CONST);
+    sleb32(&mut code, entry_ord0 as i32);
+    code.push(OP_RETURN_CALL);
+    uleb(&mut code, group0_widx as u64);
+    code.push(OP_END);
+    let mut body = Vec::new();
+    uleb(&mut body, 1); // one local group
+    uleb(&mut body, 1); // count 1
+    body.push(0x7e); // i64 (fuel)
+    body.extend_from_slice(&code);
+    Ok(body)
+}
+
+/// The block targets of a terminator (successor block indices) — for the split's cross-group edge scan.
+fn term_targets(t: &Terminator) -> Vec<u32> {
+    match t {
+        Terminator::Br { target, .. } => vec![*target],
+        Terminator::BrIf {
+            then_blk, else_blk, ..
+        } => vec![*then_blk, *else_blk],
+        Terminator::BrTable {
+            targets, default, ..
+        } => targets
+            .iter()
+            .map(|(t, _)| *t)
+            .chain(core::iter::once(default.0))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// #1120 Slice 1/2a — emit a **standalone whole-program module** in which the one function `m.funcs[fidx]`
+/// is split into `group_count` block-group wasm functions (plus an entry wrapper), while **every other
+/// function emits monolithically**. Cross-function `Call`s work in both directions: a call *into* the split
+/// function targets its wrapper (a direct wasm call at the function's normal index), and a call *out of*
+/// its group bodies is an ordinary direct wasm call — the split changes only the intra-function edges.
+///
+/// The correctness vehicle for the split ABI: a differential test runs it against the interpreter oracle
+/// (INVARIANTS.md #9). Restricted to direct calls only — no `call_indirect`/import/cap/tail calls (those
+/// need the shared table / cross-tier servicing this standalone assembler doesn't wire) and no page ops.
+/// Imports `env.memory`/`env.trap`/`env.call_interp` (the last unused); exports every `f{j}` and `fuel`.
+pub fn compile_split_fn(
+    m: &Module,
+    fidx: usize,
+    group_count: usize,
+    shared_memory: bool,
+) -> Result<Vec<u8>, Error> {
+    let f = &m.funcs[fidx];
+    let a = analyze(m);
+    if !a.in_subset.iter().all(|&s| s) {
+        return Err(Error::Unsupported(
+            "a function is outside the integer subset",
+        ));
+    }
+    // Restrict to direct-call compute: no indirect/import/cap/tail calls (no table / cross-tier here),
+    // no page ops. Plain `Call`, memory, and all control flow are fine — in every function.
+    for func in &m.funcs {
+        for b in &func.blocks {
+            for inst in &b.insts {
+                if matches!(
+                    inst,
+                    Inst::CallIndirect { .. }
+                        | Inst::CallImport { .. }
+                        | Inst::CapCall { .. }
+                        | Inst::CallSym { .. }
+                        | Inst::RefFunc { .. }
+                ) {
+                    return Err(Error::Unsupported("split-fn: only direct calls"));
+                }
+            }
+            if matches!(
+                b.term,
+                Terminator::ReturnCall { .. } | Terminator::ReturnCallIndirect { .. }
+            ) {
+                return Err(Error::Unsupported("split-fn: no tail calls"));
+            }
+        }
+    }
+    if module_uses_page_ops(m) {
+        return Err(Error::Unsupported("split-fn: no page ops"));
+    }
+    let n = f.blocks.len();
+    let k = group_count.clamp(1, n);
+    // Contiguous, count-balanced groups: block i → group `i * k / n`.
+    let block_group: Vec<usize> = (0..n).map(|i| i * k / n).collect();
+    let mut group_blocks: Vec<Vec<usize>> = vec![Vec::new(); k];
+    for (i, &g) in block_group.iter().enumerate() {
+        group_blocks[g].push(i);
+    }
+    if group_blocks.iter().any(|g| g.is_empty()) {
+        return Err(Error::Unsupported("split produced an empty group"));
+    }
+    // Entry blocks: block 0 (the function entry) plus every cross-group edge target.
+    let mut is_entry = vec![false; n];
+    is_entry[0] = true;
+    for b in 0..n {
+        for t in term_targets(&f.blocks[b].term) {
+            if block_group[t as usize] != block_group[b] {
+                is_entry[t as usize] = true;
+            }
+        }
+    }
+    let mut entry_ordinal = vec![0u32; n];
+    let mut entry_blocks: Vec<Vec<usize>> = vec![Vec::new(); k];
+    for (b, &entry) in is_entry.iter().enumerate() {
+        if entry {
+            let g = block_group[b];
+            entry_ordinal[b] = entry_blocks[g].len() as u32;
+            entry_blocks[g].push(b);
+            // Every entry block's params ride the env scratch — decline if any exceeds its capacity.
+            if slot_count(&f.blocks[b].params) > XCALL_MAX_SLOTS as u64 {
+                return Err(Error::Unsupported(
+                    "entry block params exceed the env scratch",
+                ));
+            }
+        }
+    }
+    // wasm func indices: env.trap=0, env.call_interp=1, functions f{j}=2+j, group functions=2+n_funcs..
+    let n_funcs = m.funcs.len();
+    let wasm_of: Vec<Option<u32>> = (0..n_funcs).map(|j| Some(2 + j as u32)).collect();
+    let group_base = 2 + n_funcs as u32;
+    let group_widx: Vec<u32> = (0..k).map(|g| group_base + g as u32).collect();
+    let split = SplitCtx {
+        block_group: &block_group,
+        group_widx: &group_widx,
+        entry_ordinal: &entry_ordinal,
+    };
+
+    let mapped: u64 = match &m.memory {
+        Some(mc) => 1u64 << mc.size_log2,
+        None => 0,
+    };
+    let interp_leaf = vec![false; n_funcs];
+    let dummy_types: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // no indirect calls → never indexed
+    let null_guard = temen_ir::module_null_guard(m);
+
+    // Bodies in wasm-index order: one per function (`fidx` is its wrapper), then the k group functions.
+    let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(n_funcs + k);
+    for (j, func) in m.funcs.iter().enumerate() {
+        if j == fidx {
+            bodies.push(emit_split_wrapper(
+                f,
+                entry_ordinal[0],
+                group_widx[block_group[0]],
+            )?);
+        } else {
+            bodies.push(emit_func(
+                m,
+                func,
+                mapped,
+                &wasm_of,
+                &interp_leaf,
+                &dummy_types,
+                1,
+                false,
+                None,
+                null_guard,
+                &[],
+            )?);
+        }
+    }
+    for g in 0..k {
+        bodies.push(emit_split_group(
+            m,
+            f,
+            &split,
+            &group_blocks[g],
+            &entry_blocks[g],
+            mapped,
+            &wasm_of,
+            &interp_leaf,
+            &dummy_types,
+            1,
+            false,
+            None,
+            null_guard,
+        )?);
+    }
+
+    // Types: t0 trap (i32)->(), t1 call_interp (i32,i32)->(), then each function's env-prepended sig
+    // (deduped), then the group sig `(win,env,entry) -> f.results`.
+    let mut types: Vec<(Vec<u8>, Vec<u8>)> = vec![(vec![0x7f], vec![]), (vec![0x7f, 0x7f], vec![])];
+    let mut fn_type_idx: Vec<u32> = Vec::with_capacity(n_funcs);
+    for func in &m.funcs {
+        let mut params = vec![0x7f, 0x7f];
+        for p in &func.params {
+            params.push(valtype_byte(*p)?);
+        }
+        let mut res = Vec::new();
+        for r in &func.results {
+            res.push(valtype_byte(*r)?);
+        }
+        let key = (params, res);
+        let idx = match types.iter().position(|t| *t == key) {
+            Some(i) => i as u32,
+            None => {
+                types.push(key);
+                (types.len() - 1) as u32
+            }
+        };
+        fn_type_idx.push(idx);
+    }
+    let mut gres = Vec::new();
+    for r in &f.results {
+        gres.push(valtype_byte(*r)?);
+    }
+    let gkey = (vec![0x7f, 0x7f, 0x7f], gres);
+    let group_type = match types.iter().position(|t| *t == gkey) {
+        Some(i) => i as u32,
+        None => {
+            types.push(gkey);
+            (types.len() - 1) as u32
+        }
+    };
+
+    // ---- assemble the module ----
+    let mut out = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+
+    // Type section (1).
+    let mut sec = Vec::new();
+    uleb(&mut sec, types.len() as u64);
+    for (params, res) in &types {
+        sec.push(0x60);
+        uleb(&mut sec, params.len() as u64);
+        sec.extend_from_slice(params);
+        uleb(&mut sec, res.len() as u64);
+        sec.extend_from_slice(res);
+    }
+    section(&mut out, 1, &sec);
+
+    // Import section (2): env.memory, env.trap (t0), env.call_interp (t1).
+    let mut sec = Vec::new();
+    uleb(&mut sec, 3);
+    import_name(&mut sec, "env", "memory");
+    sec.push(0x02); // memory
+    if shared_memory {
+        sec.push(0x03);
+        uleb(&mut sec, 0);
+        uleb(&mut sec, 65536);
+    } else {
+        sec.push(0x00);
+        uleb(&mut sec, 0);
+    }
+    import_name(&mut sec, "env", "trap");
+    sec.push(0x00);
+    uleb(&mut sec, 0);
+    import_name(&mut sec, "env", "call_interp");
+    sec.push(0x00);
+    uleb(&mut sec, 1);
+    section(&mut out, 2, &sec);
+
+    // Function section (3): each function's type, then the k group functions (all the group sig).
+    let mut sec = Vec::new();
+    uleb(&mut sec, (n_funcs + k) as u64);
+    for &ti in &fn_type_idx {
+        uleb(&mut sec, ti as u64);
+    }
+    for _ in 0..k {
+        uleb(&mut sec, group_type as u64);
+    }
+    section(&mut out, 3, &sec);
+
+    // Global section (6): fuel (0), mapped (1).
+    let mut sec = Vec::new();
+    uleb(&mut sec, 2);
+    sec.push(0x7e);
+    sec.push(0x01);
+    sec.push(OP_I64_CONST);
+    sleb64(&mut sec, FUEL_DEFAULT);
+    sec.push(OP_END);
+    sec.push(0x7e);
+    sec.push(0x01);
+    sec.push(OP_I64_CONST);
+    sleb64(&mut sec, mapped as i64);
+    sec.push(OP_END);
+    section(&mut out, 6, &sec);
+
+    // Export section (7): every `f{j}` (the split function's is its wrapper), plus the `fuel` global so a
+    // host/test can seed a budget and verify OutOfFuel trap-point parity with the oracle (INVARIANTS #9).
+    let mut sec = Vec::new();
+    uleb(&mut sec, (n_funcs + 1) as u64);
+    for (j, w) in wasm_of.iter().enumerate() {
+        let name = format!("f{j}");
+        uleb(&mut sec, name.len() as u64);
+        sec.extend_from_slice(name.as_bytes());
+        sec.push(0x00);
+        uleb(&mut sec, w.unwrap() as u64);
+    }
+    let name = "fuel";
+    uleb(&mut sec, name.len() as u64);
+    sec.extend_from_slice(name.as_bytes());
+    sec.push(0x03); // global export kind
+    uleb(&mut sec, FUEL_GLOBAL_IDX as u64);
+    section(&mut out, 7, &sec);
+
+    // Code section (10).
+    let mut sec = Vec::new();
+    uleb(&mut sec, bodies.len() as u64);
+    for b in &bodies {
+        uleb(&mut sec, b.len() as u64);
+        sec.extend_from_slice(b);
+    }
+    section(&mut out, 10, &sec);
+
+    Ok(out)
 }
 
 /// Debit one fuel unit from the fuel counter global and trap `TRAP_OUT_OF_FUEL` when it goes negative.
@@ -4176,6 +4856,88 @@ fn emit_win_addr(code: &mut Vec<u8>, base_local: u32) {
 
 /// Push branch args onto the operand stack, then pop them into the target block's param locals in
 /// reverse — stack copies make a param-permuting self-branch safe.
+/// #1120 Slice 1 — the plan for emitting **one** Temen function as K wasm functions (block groups). A
+/// group carries a subset of the function's blocks; every block keeps its **global** index (so `$next`,
+/// `local_of`, and the oracle's back-edge fuel rule are all unchanged within a group). A control-flow
+/// edge to a block in a *sibling* group can't use `$next` (different wasm function), so it is a
+/// frame-reusing **`return_call`** to that group's wasm function, passing the target's block params
+/// through the env scratch (the existing cross-tier marshal ABI) and its entry ordinal as the `entry`
+/// arg. `Return`/`ReturnCall`/`CallIndirect` terminators are unaffected (they already leave the frame).
+///
+/// The split is invisible to the interpreter oracle (it runs the original one function) and to the
+/// confinement lowering (each block emits the identical masked accesses), so correctness is exactly the
+/// existing interpreter-vs-emitted differential (INVARIANTS.md #9), and the mask stays constant (I2).
+struct SplitCtx<'a> {
+    /// Temen block index → its group id.
+    block_group: &'a [usize],
+    /// Group id → that group's wasm function index (the `return_call` target for inter-group edges).
+    group_widx: &'a [u32],
+    /// Temen block index → its ordinal among its group's inter-group **entry** blocks (the `entry` arg
+    /// a `return_call` passes, which the callee group's entry dispatch turns back into a `$next`).
+    entry_ordinal: &'a [u32],
+}
+
+/// Emit an inter-group control-flow edge: marshal the target block's params into the env scratch, then
+/// `return_call` the target's group function `(win, env, entry_ordinal)`. Mirrors [`emit_edge`]'s
+/// back-edge fuel charge (same oracle rule, same global indices) so fuel parity holds across the cut.
+fn emit_xgroup_edge(
+    f: &Func,
+    cx: &mut FnCtx,
+    code: &mut Vec<u8>,
+    split: &SplitCtx,
+    from_block: usize,
+    target: u32,
+    args: &[temen_ir::ValIdx],
+) {
+    if (target as usize) <= from_block {
+        emit_fuel_check(cx, code);
+    }
+    let tparams = &f.blocks[target as usize].params;
+    for (i, a) in args.iter().enumerate() {
+        code.push(OP_LOCAL_GET);
+        uleb(code, 1); // env
+        code.push(OP_I32_CONST);
+        sleb32(code, (ENV_SCRATCH_OFF + slot_off(tparams, i)) as i32);
+        code.push(0x6a); // i32.add → scratch slot addr
+        code.push(OP_LOCAL_GET);
+        uleb(code, cx.local_of[from_block][*a as usize] as u64);
+        emit_slot_store(code, tparams[i]);
+    }
+    code.push(OP_LOCAL_GET);
+    uleb(code, 0); // win
+    code.push(OP_LOCAL_GET);
+    uleb(code, 1); // env
+    code.push(OP_I32_CONST);
+    sleb32(code, split.entry_ordinal[target as usize] as i32);
+    code.push(OP_RETURN_CALL);
+    uleb(
+        code,
+        split.group_widx[split.block_group[target as usize]] as u64,
+    );
+}
+
+/// Whether `target` leaves `from_block`'s group. Emits the inter-group edge when so and returns `true`
+/// (the caller must **not** add the `$next`/`br_dispatch` — the `return_call` already left the frame);
+/// otherwise emits the ordinary same-group [`emit_edge`] and returns `false`.
+fn emit_edge_maybe_xgroup(
+    f: &Func,
+    cx: &mut FnCtx,
+    code: &mut Vec<u8>,
+    split: Option<&SplitCtx>,
+    from_block: usize,
+    target: u32,
+    args: &[temen_ir::ValIdx],
+) -> bool {
+    if let Some(sp) = split {
+        if sp.block_group[target as usize] != sp.block_group[from_block] {
+            emit_xgroup_edge(f, cx, code, sp, from_block, target, args);
+            return true;
+        }
+    }
+    emit_edge(cx, code, from_block, target, args);
+    false
+}
+
 fn emit_edge(
     cx: &mut FnCtx,
     code: &mut Vec<u8>,
@@ -4221,6 +4983,7 @@ fn emit_block_body(
     table_size: u32,
     nested_caps: bool,
     cross_module: &[bool],
+    split: Option<&SplitCtx>,
 ) -> Result<(), Error> {
     let is_xmod = |i: usize| cross_module.get(i).copied().unwrap_or(false);
     let mut next_val = b.params.len(); // where the next instruction's results land
@@ -4635,6 +5398,22 @@ fn emit_block_body(
                     }
                     code.push(OP_CALL);
                     uleb(code, INSTANTIATE_REC_IMPORT_IDX as u64);
+                } else if *op == 13 {
+                    // #1123 env.instantiate_module(win, inst, module, grants_ptr, grants_n, entry,
+                    // off, size_log2, quota) -> i32 child handle — the separate-module spawn. The
+                    // servicer resolves the module handle and reads the grant records at win +
+                    // grants_ptr, then emits + runs the child over the carve (slice-1 mechanism). Its
+                    // import index follows env.instantiate_rec (`8 + uses_rec`); computed here because
+                    // it is conditional on whether this module also uses op-17.
+                    let idx = NESTED_IMPORTED_FUNCS + module_uses_rec(m) as u32;
+                    code.push(OP_LOCAL_GET);
+                    uleb(code, 0); // win
+                    get(code, cx, *handle); // the Instantiator handle (i32)
+                    for a in args {
+                        get(code, cx, *a); // module, grants_ptr, grants_n, entry, off, size_log2, quota
+                    }
+                    code.push(OP_CALL);
+                    uleb(code, idx as u64);
                 } else {
                     // env.join(inst, child) -> i64 result
                     get(code, cx, *handle); // the Instantiator handle
@@ -5068,8 +5847,11 @@ fn emit_block_body(
 
     match &b.term {
         Terminator::Br { target, args } => {
-            emit_edge(cx, code, k, *target, args);
-            cx.br_dispatch(code);
+            // Inter-group (split) targets leave via `return_call` (no `$next`/dispatch); same-group
+            // targets set `$next` and branch to the dispatch loop as before.
+            if !emit_edge_maybe_xgroup(f, cx, code, split, k, *target, args) {
+                cx.br_dispatch(code);
+            }
         }
         Terminator::BrIf {
             cond,
@@ -5082,9 +5864,11 @@ fn emit_block_body(
             code.push(OP_IF);
             code.push(BLOCKTYPE_VOID);
             cx.depth += 1;
-            emit_edge(cx, code, k, *then_blk, then_args);
+            // An inter-group arm ends in `return_call` (leaves the frame); a same-group arm sets `$next`
+            // and falls through to the shared `br_dispatch` after `end` (unreachable if both arms left).
+            emit_edge_maybe_xgroup(f, cx, code, split, k, *then_blk, then_args);
             code.push(OP_ELSE);
-            emit_edge(cx, code, k, *else_blk, else_args);
+            emit_edge_maybe_xgroup(f, cx, code, split, k, *else_blk, else_args);
             code.push(OP_END);
             cx.depth -= 1;
             cx.br_dispatch(code);
@@ -5112,9 +5896,10 @@ fn emit_block_body(
             for (j, (target, args)) in arms.iter().enumerate() {
                 code.push(OP_END);
                 cx.depth -= 1;
-                emit_edge(cx, code, k, *target, args);
-                cx.br_dispatch(code);
-                // The br above leaves this position unreachable; the next `end` (or code) follows.
+                if !emit_edge_maybe_xgroup(f, cx, code, split, k, *target, args) {
+                    cx.br_dispatch(code);
+                }
+                // The br/return_call above leaves this position unreachable; the next `end` follows.
                 let _ = j;
             }
         }

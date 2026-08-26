@@ -440,3 +440,608 @@ fn coop_tierup_live_futex_matches_pure_interp() {
         "expected exactly one tier-up (the root's compute leaf), got {tierups}"
     );
 }
+
+// #816 env-routed tier-up — a task whose window lives in `extra_envs` (a §14 confined child, or a
+// thread it spawns) now TIERS UP over its own carve: the engine routes the driver's per-event reads
+// (`pending_win`, `window_scalar_extent`, `mem_map_info`/`mem_map_version`) to the pending
+// round-trip's task env, and the eligibility gates (`tierup_servable`) admit any window sharing the
+// root backing. This test pins the inheritance: the child entry's and the child-env worker's calls
+// to the eligible leaf both surface, and the run still matches the pure-interp oracle.
+//
+// func 0 (root; arg = its Instantiator handle): instantiates a same-module confined child at f1
+// (4 KiB carve at 64 KiB), joins it, calls the eligible leaf f3 itself, and sums. func 1 (child
+// entry): calls the leaf directly (the instantiate-arm inheritance), thread.spawns f2 INSIDE the
+// child env (the spawn-arm inheritance) and joins it. func 2 (child-env worker): calls the leaf.
+// func 3: the pure all-i64 leaf f(x) = x*3 + 7.
+const SRC_CHILD_ENV: &str = r#"
+memory 17
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  ve = i64.const 1
+  voff = i64.const 65536
+  vsl = i64.const 12
+  vq = i64.const 0
+  vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (ve, voff, vsl, vq)
+  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  v3 = i64.const 3
+  vlocal = call 3 (v3)
+  vr = i64.add vj vlocal
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i64.const 0
+  vt = thread.spawn 2 vz vz
+  v7 = i64.const 7
+  vlocal = call 3 (v7)
+  vw = thread.join vt
+  vr = i64.add vw vlocal
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  v5 = i64.const 5
+  vr = call 3 (v5)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  v3 = i64.const 3
+  vm = i64.mul vx v3
+  v7 = i64.const 7
+  va = i64.add vm v7
+  return va
+  }
+}
+"#;
+
+#[test]
+fn coop_tierup_child_env_tasks_tier_up() {
+    let m = parse_module(SRC_CHILD_ENV).unwrap();
+    temen_verify::verify_module(&m).expect("verify");
+    // Drive with an Instantiator granted over the root window (the §14 spawn authority); the
+    // shared `coop_tierup_run` harness has no grant seam, so inline its loop here.
+    let run_with = |tierup: Option<TierUpConfig>| -> (Result<Vec<Value>, Trap>, u32) {
+        let mut host = Host::new();
+        let inst = host.grant_instantiator(0, 128 << 10);
+        let args = [Value::I32(inst)];
+        let mut run = bytecode::CoopRun::new(&m, 0, &args, FUEL, host, tierup)
+            .expect("supported")
+            .expect("entry in range");
+        let mut tierups = 0u32;
+        loop {
+            match run.run() {
+                bytecode::CoopEvent::Done(vals) => return (Ok(vals), tierups),
+                bytecode::CoopEvent::Trapped(t) => return (Err(t), tierups),
+                bytecode::CoopEvent::JitInvoke { .. } => {
+                    panic!("unexpected JitInvoke (no vm_jit guest here)")
+                }
+                bytecode::CoopEvent::TierUp { func, argv, .. } => {
+                    tierups += 1;
+                    assert!(
+                        tierups < 50,
+                        "runaway tier-ups (last func={func}, argv={argv:?})"
+                    );
+                    let targs: Vec<Value> = argv.iter().map(|&s| Value::I64(s)).collect();
+                    let mut fuel = FUEL;
+                    match bytecode::compile_and_run(&m, func, &targs, &mut fuel).expect("supported")
+                    {
+                        Ok(vals) => {
+                            let slots: Vec<i64> = vals
+                                .iter()
+                                .map(|v| match v {
+                                    Value::I64(x) => *x,
+                                    Value::I32(x) => *x as i64,
+                                    _ => panic!("non-integer tier-up result"),
+                                })
+                                .collect();
+                            run.deliver_tierup(&slots);
+                        }
+                        Err(t) => run.deliver_tierup_trap(t),
+                    }
+                }
+            }
+        }
+    };
+
+    // Oracle: pure-interp cooperative run. Worker f(5)=22 + child entry f(7)=28 → child 50;
+    // root f(3)=16 → 66.
+    let (want, oracle_tierups) = run_with(None);
+    assert_eq!(want, Ok(vec![Value::I64(66)]), "oracle value");
+    assert_eq!(oracle_tierups, 0, "the oracle never tiers up");
+
+    let eligible: std::sync::Arc<[bool]> = std::sync::Arc::from(vec![false, false, false, true]);
+    let (got, tierups) = run_with(Some(TierUpConfig {
+        eligible,
+        page_checked: false,
+    }));
+    assert_eq!(
+        got, want,
+        "cooperative tier-up run with a confined child diverged from the pure-interp oracle"
+    );
+    // #816 env routing: all three eligible calls surface — the root's, the confined child entry's
+    // (instantiate-arm inheritance), and the child-env worker's (spawn-arm inheritance).
+    assert_eq!(
+        tierups, 3,
+        "root + child entry + child worker must all tier up (#816), got {tierups}"
+    );
+}
+
+/// #816 — the routed **flat window view**: while a confined child's tier-up is pending,
+/// [`CoopRun::pending_win`] must hand the driver the CHILD's carve (base = root backing + carve
+/// offset, len = carve size), and a write through it must land where the parent reads it in its own
+/// window (the shared backing). Emulates the browser host: each event writes a marker byte at the
+/// pending window's offset 8 (what an emitted store would do), then delivers the leaf's value. The
+/// guest sums the leaf results with the markers read back through the parent window — so a
+/// mis-routed pointer (root base for a child event) or a mis-sized span fails the value assert.
+/// Unix-only: the native test backing must be flat (`Region::Mapped`) for the raw view; on the
+/// browser the backing is always flat (`Region::shared` over the cdylib buffer).
+#[cfg(unix)]
+#[test]
+fn coop_tierup_pending_win_routes_to_the_child_carve() {
+    // func 0 (root): instantiate child at 65536 (4 KiB), join → child result; call leaf(3) itself;
+    // read marker bytes at [8] (root's own event) and [65536+8] (the child's event, visible through
+    // the parent window — shared backing); return child + local + markers.
+    // func 1 (child entry): call leaf(5), return it. func 2: the leaf f(x) = x*3 + 7.
+    const SRC: &str = r#"
+memory 17
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  ve = i64.const 1
+  voff = i64.const 65536
+  vsl = i64.const 12
+  vq = i64.const 0
+  vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (ve, voff, vsl, vq)
+  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  v3 = i64.const 3
+  vlocal = call 2 (v3)
+  vma = i64.const 8
+  vm0 = i32.load8_u vma
+  vm0e = i64.extend_i32_u vm0
+  vca = i64.const 65544
+  vm1 = i32.load8_u vca
+  vm1e = i64.extend_i32_u vm1
+  vs1 = i64.add vj vlocal
+  vs2 = i64.add vs1 vm0e
+  vs3 = i64.add vs2 vm1e
+  return vs3
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v5 = i64.const 5
+  vr = call 2 (v5)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  v3 = i64.const 3
+  vm = i64.mul vx v3
+  v7 = i64.const 7
+  va = i64.add vm v7
+  return va
+  }
+}
+"#;
+    let m = parse_module(SRC).unwrap();
+    temen_verify::verify_module(&m).expect("verify");
+    let mut host = Host::new();
+    let inst = host.grant_instantiator(0, 128 << 10);
+    let args = [Value::I32(inst)];
+    let eligible: std::sync::Arc<[bool]> = std::sync::Arc::from(vec![false, false, true]);
+    // The browser shape: the window lives over a caller-provided flat backing with the reservation
+    // clamped to it, so `pending_win` resolves and spans exactly the run window / child carve.
+    let back = std::sync::Arc::new(temen_interp::Region::new(1 << 17, 4096));
+    let mut run = bytecode::CoopRun::new_over(
+        &m,
+        0,
+        &args,
+        FUEL,
+        host,
+        Some(TierUpConfig {
+            eligible,
+            page_checked: false,
+        }),
+        &[],
+        17,
+        back,
+    )
+    .expect("supported")
+    .expect("entry in range");
+    // Expected per-event windows: the root's event spans the full 2^17 window at the backing base;
+    // the child's spans its 4 KiB carve at base + 65536.
+    let mut spans: Vec<u64> = Vec::new();
+    let result = loop {
+        match run.run() {
+            bytecode::CoopEvent::Done(vals) => break Ok(vals),
+            bytecode::CoopEvent::Trapped(t) => break Err(t),
+            bytecode::CoopEvent::JitInvoke { .. } => panic!("unexpected JitInvoke"),
+            bytecode::CoopEvent::TierUp { func, argv, .. } => {
+                assert_eq!(func, 2, "only the leaf is eligible");
+                let (ptr, len) = run
+                    .pending_win()
+                    .expect("a flat native backing resolves the pending window");
+                spans.push(len);
+                // The emitted region's effect, emulated over the routed window: store the marker
+                // at window-relative offset 8 (in-carve for the child, in-window for the root).
+                // SAFETY: the paused task is parked inside the event; `ptr` spans `len >= 16`
+                // bytes of the run backing, exclusively ours until deliver (single-threaded pump).
+                unsafe { std::ptr::write(ptr.cast_mut().add(8), 21u8) };
+                let x = argv[0];
+                run.deliver_tierup(&[x * 3 + 7]);
+            }
+        }
+    };
+    // Child event first (the scheduler runs the child to completion inside the join), then root's.
+    assert_eq!(
+        spans,
+        vec![4096, 1 << 17],
+        "pending_win must span the child carve for the child's event and the run window for the root's"
+    );
+    // child leaf f(5)=22 + root leaf f(3)=16 + root marker 21 + child marker 21 = 80.
+    assert_eq!(
+        result,
+        Ok(vec![Value::I64(80)]),
+        "markers must land in each task's own window"
+    );
+}
+
+// #816 item 3 — a **fork twin** tiers up over its own private flat window. The guest topology is
+// the proven browser fork probe (`FORK_TWIN`, FORK.md §9): a manager (f0) spawns a server (f1,
+// handlers f2 = `clone_caller`, f3 = `reap`) and a guest (f4) as §14 children; the guest calls
+// `svc.fork`, the servicer duplicates it (`Mem::fork_private` + `Host::fork_powerbox`), and BOTH
+// copies — the original (reply 100) and the twin (reply 200) — call the eligible leaf f5 on their
+// reply before writing the result to the shared stdout; the original then `svc.wait`s the twin.
+// With the flat twin-backing seam, the twin's private window is an owned flat buffer, so its leaf
+// call TIERS UP (previously: interpreted fail-closed on wasm) — and its event's `pending_win` must
+// resolve OUTSIDE the root backing (the twin's own allocation), while the original's resolves
+// inside it (its §14 carve). Differential against the same run with no bitmap.
+const SRC_FORK_TWIN: &str = r#"
+memory 18
+type 0 func (i64) -> (i64)
+type 1 interface { fork: 0, wait: 0 }
+export 0 interface "svc" 1 { fork: 2, wait: 3 }
+data 300 "svc"
+data 310 "o"
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, vout: i32) {
+  vlog = i64.const 12
+  vq = i64.const 0
+  q1v0 = i64.const 4294967296
+  q1v1 = i64.const 131072
+  q1v2 = i64.const -4294967284
+  q1v3 = i64.const 4294967295
+  q1v4 = i64.const 0
+  q1a0 = i64.const 1216
+  i64.store q1a0 q1v0
+  q1a1 = i64.const 1224
+  i64.store q1a1 q1v1
+  q1a2 = i64.const 1232
+  i64.store q1a2 q1v2
+  q1a3 = i64.const 1240
+  i64.store q1a3 q1v3
+  q1a4 = i64.const 1248
+  i64.store q1a4 q1v4
+  q1a5 = i64.const 1256
+  i64.store q1a5 q1v4
+  q1a6 = i64.const 1264
+  i64.store q1a6 q1v4
+  vs = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
+  vz0 = i64.const 0
+  vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  va0 = i64.const 256
+  vnp = i32.const 300
+  i32.store va0 vnp
+  va1 = i64.const 260
+  vnl = i32.const 3
+  i32.store va1 vnl
+  va2 = i64.const 264
+  i32.store va2 vcap
+  va3 = i64.const 272
+  vnp2 = i32.const 310
+  i32.store va3 vnp2
+  va4 = i64.const 276
+  vnl2 = i32.const 1
+  i32.store va4 vnl2
+  va5 = i64.const 280
+  i32.store va5 vout
+  q2v0 = i64.const 17179869184
+  q2v1 = i64.const 135168
+  q2v2 = i64.const -4294967284
+  q2v3 = i64.const 4294967295
+  q2v4 = i64.const 0
+  q2v5 = i64.const 256
+  q2v6 = i64.const 2
+  q2a0 = i64.const 1280
+  i64.store q2a0 q2v0
+  q2a1 = i64.const 1288
+  i64.store q2a1 q2v1
+  q2a2 = i64.const 1296
+  i64.store q2a2 q2v2
+  q2a3 = i64.const 1304
+  i64.store q2a3 q2v3
+  q2a4 = i64.const 1312
+  i64.store q2a4 q2v4
+  q2a5 = i64.const 1320
+  i64.store q2a5 q2v5
+  q2a6 = i64.const 1328
+  i64.store q2a6 q2v6
+  vc = call.cap 6 17 (i64) -> (i32) v0 (q2a0)
+  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  return vjc
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  br 1()
+  }
+block 1 () {
+  vz = i32.const 0
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
+  br 1()
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vz = i32.const 0
+  vro = i64.const 100
+  vrt = i64.const 200
+  vt = call.cap 4294967295 11 (i64, i64) -> (i64) vz (vro, vrt)
+  return vt
+  }
+}
+func (i64) -> (i64) {
+block 0 (vpid: i64) {
+  vz = i32.const 0
+  vt = call.cap 4294967295 12 (i64) -> (i64) vz (vpid)
+  return vt
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vsvc = i64.const 6518387
+  vzero = i64.const 0
+  i64.store vzero vsvc
+  voname = i64.const 111
+  va8 = i64.const 8
+  i64.store va8 voname
+  vp0 = i64.const 0
+  vl3 = i64.const 3
+  vhsvc = self.resolve vp0 vl3
+  vp8 = i64.const 8
+  vl1 = i64.const 1
+  vho = self.resolve vp8 vl1
+  br 1(vhsvc, vho)
+  }
+block 1 (vhsvc: i32, vho: i32) {
+  varg = i64.const 7
+  vr = call.cap 268435456 0 (i64) -> (i64) vhsvc (varg)
+  v200 = i64.const 200
+  vistwin = i64.eq vr v200
+  br_if vistwin 4(vr, vho) 2(vr, vhsvc, vho)
+  }
+block 2 (vr: i64, vhsvc: i32, vho: i32) {
+  vpid3 = i64.const 3
+  vstatus = call.cap 268435456 1 (i64) -> (i64) vhsvc (vpid3)
+  veagain = i64.const -11
+  viseagain = i64.eq vstatus veagain
+  br_if viseagain 2(vr, vhsvc, vho) 3(vr, vstatus, vhsvc, vho)
+  }
+block 3 (vr: i64, vstatus: i64, vhsvc: i32, vho: i32) {
+  vechild = i64.const -10
+  visechild = i64.eq vstatus vechild
+  br_if visechild 1(vhsvc, vho) 4(vr, vho)
+  }
+block 4 (vr: i64, vho: i32) {
+  vleaf = call 5 (vr)
+  vp16 = i64.const 16
+  i64.store vp16 vleaf
+  vlen = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  v3 = i64.const 3
+  vm = i64.mul vx v3
+  v7 = i64.const 7
+  va = i64.add vm v7
+  return va
+  }
+}
+"#;
+
+/// Every target (unlike the unix-only pending-win test): the run backing is an **owned flat**
+/// buffer (`Region::owned_zeroed` — the same shape as the browser's `Region::shared` window), so
+/// the raw window views resolve even where `Region::new` would fall back to `Paged` (Windows),
+/// and the twin-backing seam's non-unix arm gets real end-to-end CI coverage there.
+#[test]
+fn coop_tierup_fork_twin_tiers_up_over_its_private_flat_window() {
+    const FORK_FUEL: u64 = 40_000_000;
+    let m = std::sync::Arc::new(parse_module(SRC_FORK_TWIN).unwrap());
+    temen_verify::verify_module(&m).expect("verify");
+    // (ptr-in-root-backing?, len) per tier-up event, plus the whole-run result and stdout.
+    #[allow(clippy::type_complexity)]
+    let run_with =
+        |tierup: Option<TierUpConfig>| -> (Result<Vec<Value>, Trap>, Vec<i64>, Vec<(bool, u64)>) {
+            let mut host = Host::new();
+            host.set_self_module(&m);
+            let inst = host.grant_instantiator(0, 1u64 << 18);
+            let sink = host.shared_stdout();
+            let out_h = host.grant_stream(temen_interp::StreamRole::Out);
+            let args = [Value::I32(inst), Value::I32(out_h)];
+            let back = std::sync::Arc::new(
+                temen_interp::Region::owned_zeroed(1 << 18, 4096).expect("256 KiB allocates"),
+            );
+            let root_base = back.raw_base().expect("flat backing") as usize;
+            let mut run = bytecode::CoopRun::new_over(
+                &m,
+                0,
+                &args,
+                FORK_FUEL,
+                host,
+                tierup,
+                &[],
+                18,
+                std::sync::Arc::clone(&back),
+            )
+            .expect("supported")
+            .expect("entry in range");
+            let mut events: Vec<(bool, u64)> = Vec::new();
+            let result = loop {
+                match run.run() {
+                    bytecode::CoopEvent::Done(vals) => break Ok(vals),
+                    bytecode::CoopEvent::Trapped(t) => break Err(t),
+                    bytecode::CoopEvent::JitInvoke { .. } => panic!("unexpected JitInvoke"),
+                    bytecode::CoopEvent::TierUp { func, argv, .. } => {
+                        assert_eq!(func, 5, "only the leaf is eligible");
+                        assert!(events.len() < 10, "runaway tier-ups");
+                        let (ptr, len) = run
+                            .pending_win()
+                            .expect("every tiering task's window must resolve a flat view");
+                        let in_root =
+                            (ptr as usize) >= root_base && (ptr as usize) < root_base + (1 << 18);
+                        events.push((in_root, len));
+                        let x = argv[0];
+                        run.deliver_tierup(&[x * 3 + 7]);
+                    }
+                }
+            };
+            let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let mut out: Vec<i64> = bytes
+                .chunks_exact(8)
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            out.sort_unstable();
+            (result, out, events)
+        };
+
+    // Oracle: pure-interp cooperative run. The original resumes with 100 and the twin with 200;
+    // both write leaf(reply) to the shared stdout: leaf(100) = 307, leaf(200) = 607.
+    let (want, want_out, oracle_events) = run_with(None);
+    assert_eq!(want, Ok(vec![Value::I64(100)]), "oracle value");
+    assert_eq!(
+        want_out,
+        vec![307, 607],
+        "both copies ran and wrote (oracle)"
+    );
+    assert!(oracle_events.is_empty(), "the oracle never tiers up");
+
+    let eligible: std::sync::Arc<[bool]> =
+        std::sync::Arc::from(vec![false, false, false, false, false, true]);
+    let (got, got_out, events) = run_with(Some(TierUpConfig {
+        eligible,
+        page_checked: false,
+    }));
+    assert_eq!(got, want, "fork-twin tier-up run diverged from the oracle");
+    assert_eq!(got_out, want_out, "stdout parity");
+    // Both leaf calls tier up: the original guest's (a §14 child — its carve window lies INSIDE
+    // the root backing) and the fork twin's (its private `fork_private` window is its OWN flat
+    // allocation, outside the root backing). Both windows span the 4 KiB carve geometry.
+    let mut sorted = events.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        sorted,
+        vec![(false, 4096), (true, 4096)],
+        "one in-root-carve event (the original) + one private-window event (the twin), got {events:?}"
+    );
+}
+
+// #816 item 4 — `SharedProgram::coop_run_over_grown`, the warm session's cooperative constructor:
+// a captured page-state map is re-established (`seed_pages`, no zeroing) over a caller-restored
+// backing, and the run's eligible leaf tiers up — so a page-managing warm image evaluates on the
+// coop drive instead of interpreter-only. The entry reads a marker in a "restored" `vm_map`-grown
+// page (bytes planted directly in the backing, as the warm memcpy does) and calls the leaf; the
+// negative arm proves the seeding is load-bearing: the same run without the seeded entries faults
+// on the grown-page load (fail-closed, the `run_over_grown` contract).
+#[test]
+fn coop_run_over_grown_restores_the_page_map_and_tiers_up() {
+    // func 0 (entry): load the marker at 65552 (inside the grown page [64 KiB, 68 KiB)), call the
+    // eligible leaf f1 with 3, return marker + leaf. func 1: the pure all-i64 leaf f(x) = x*3 + 7.
+    const SRC: &str = r#"
+memory 16
+func () -> (i64) {
+block 0 () {
+  vaddr = i64.const 65552
+  vm = i64.load vaddr
+  v3 = i64.const 3
+  vleaf = call 1 (v3)
+  vr = i64.add vm vleaf
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  v3 = i64.const 3
+  vm = i64.mul vx v3
+  v7 = i64.const 7
+  va = i64.add vm v7
+  return va
+  }
+}
+"#;
+    const MARKER: i64 = 424242;
+    let m = parse_module(SRC).unwrap();
+    temen_verify::verify_module(&m).expect("verify");
+    let prog = bytecode::SharedProgram::compile(&m).expect("in subset");
+    let eligible: std::sync::Arc<[bool]> = std::sync::Arc::from(vec![false, true]);
+    let run_with = |prots: &[(u64, u8)]| -> (Result<Vec<Value>, Trap>, u32) {
+        let back = std::sync::Arc::new(temen_interp::Region::new(1 << 17, 4096));
+        // "Restore the warm image": plant the marker bytes directly in the backing, exactly what
+        // the warm session's memcpy restore does before arming the run.
+        for (i, b) in MARKER.to_le_bytes().iter().enumerate() {
+            back.set_byte(65552 + i as u64, *b);
+        }
+        let mut run = prog
+            .coop_run_over_grown(
+                0,
+                &[],
+                FUEL,
+                Host::new(),
+                Some(TierUpConfig {
+                    eligible: std::sync::Arc::clone(&eligible),
+                    page_checked: false,
+                }),
+                back,
+                17,
+                prots,
+            )
+            .expect("entry in range");
+        let mut tierups = 0u32;
+        loop {
+            match run.run() {
+                bytecode::CoopEvent::Done(vals) => return (Ok(vals), tierups),
+                bytecode::CoopEvent::Trapped(t) => return (Err(t), tierups),
+                bytecode::CoopEvent::JitInvoke { .. } => panic!("unexpected JitInvoke"),
+                bytecode::CoopEvent::TierUp { func, argv, .. } => {
+                    tierups += 1;
+                    assert!(tierups < 10, "runaway tier-ups");
+                    assert_eq!(func, 1, "only the leaf is eligible");
+                    run.deliver_tierup(&[argv[0] * 3 + 7]);
+                }
+            }
+        }
+    };
+
+    // Seeded (one Rw entry for the grown page): the marker reads back and the leaf tiers up.
+    let (got, tierups) = run_with(&[(65536, 1)]);
+    assert_eq!(
+        got,
+        Ok(vec![Value::I64(MARKER + 16)]),
+        "the restored grown page must be readable and the leaf serviced"
+    );
+    assert_eq!(tierups, 1, "the eligible leaf tiers up exactly once");
+
+    // Unseeded: the same bytes are in the backing, but with no page-state entry the grown-page
+    // load faults — the restore is the page MAP, not just the bytes (fail-closed).
+    let (got, _) = run_with(&[]);
+    assert!(
+        got.is_err(),
+        "an unseeded run must fault on the grown-page load, got {got:?}"
+    );
+}

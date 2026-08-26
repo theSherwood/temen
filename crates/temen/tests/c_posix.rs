@@ -268,6 +268,69 @@ fn run_bytecode_setup(src: &str, extra: impl Fn(&mut Host, &Posix)) -> Effects {
     }
 }
 
+/// The **parallel-driver** twin of [`run_bytecode_only`] (#748): the same guest + personality wiring,
+/// driven by `drive_parallel` — every fork twin a real OS thread over a private window copy, blocking
+/// `waitpid` a real condvar wait. The cooperative engine and the tree-walker are its oracles: on these
+/// deterministic-output guests the results must be identical (the dual-driver principle — every
+/// fork/wait-using program runs correctly under both coop and parallel, though scheduling interleaves
+/// differ).
+fn run_bytecode_parallel_only(src: &str, prep: impl Fn(&Posix)) -> Effects {
+    run_bytecode_parallel_setup(src, |_host, posix| prep(posix))
+}
+
+/// [`run_bytecode_parallel_only`] with a `|host, posix|` setup callback (e.g. `stage_executable`) —
+/// the parallel-driver twin of [`run_bytecode_setup`], for the fork → execve → waitpid and
+/// pipe-through-exec differentials (#748 rungs 2+3).
+fn run_bytecode_parallel_setup(src: &str, extra: impl Fn(&mut Host, &Posix)) -> Effects {
+    let ir = c_to_ir(src);
+    let raw = parse_module_raw(&ir)
+        .unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
+    let win = 1u64
+        << raw
+            .memory
+            .expect("the frontend declares a window")
+            .size_log2;
+    let mut ih = Host::new();
+    let (iposix, ipx) = setup(&mut ih, win);
+    extra(&mut ih, &iposix);
+    verify_module(&raw).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
+    bind_shim(&raw, &mut ih, ipx);
+    // An 8-aligned zeroed buffer + a `Region::shared` over it (the bytecode_parallel.rs harness
+    // shape): the root runs over this shared backing; each fork twin copies off it (`fork_private`).
+    let layout = std::alloc::Layout::from_size_align(win as usize, 8).unwrap();
+    // SAFETY: non-zero layout; the buffer is `win` valid 8-aligned bytes owned here, used only as
+    // this run's window until freed below, after the region (and every vCPU borrow) is dropped.
+    let base = unsafe { std::alloc::alloc_zeroed(layout) };
+    assert!(!base.is_null());
+    // SAFETY: `base` is `win` valid 8-aligned bytes, exclusively this window's, freed only after.
+    let back = std::sync::Arc::new(unsafe { temen_interp::Region::shared(base, win) });
+    let mut fuel = 200_000_000u64;
+    let ran = temen_interp::bytecode::compile_and_run_capture_over_parallel_with_host(
+        &raw,
+        0,
+        &[],
+        &mut fuel,
+        &[],
+        std::sync::Arc::clone(&back),
+        &mut ih,
+    )
+    .expect("the bytecode engine compiles this module (no declining op)");
+    drop(back);
+    // SAFETY: same layout; the region and all borrows of `base` are gone (the scope joined all vCPUs).
+    unsafe { std::alloc::dealloc(base, layout) };
+    let (result, exited) = match ran.0 {
+        Ok(v) => (v, None),
+        Err(Trap::Exit(c)) => (Vec::new(), Some(c)),
+        Err(e) => panic!("bytecode-parallel trapped: {e:?}\n--- IR ---\n{ir}"),
+    };
+    Effects {
+        result,
+        exited,
+        stdout: iposix.stdout(),
+        file_f: iposix.read_file("f"),
+    }
+}
+
 /// #796 L2 — **async delivery to a running loop**: a signal raised while the guest is compute-bound is
 /// delivered to its handler at a safepoint, with **no `sigcheck` poll** in the loop. The handler sets a
 /// global; the loop (which never polls) observes it and exits. This is the headline "async" win — the
@@ -1148,6 +1211,128 @@ int main(void) {
     );
 }
 
+/// #748 rung 0+1 — personality `fork()` + blocking `waitpid(pid)` on the **parallel** bytecode
+/// driver: the twin runs on a real OS thread over a private window copy; the parent's `waitpid`
+/// either finds the zombie directly (the twin raced ahead) or blocks on the fork-exit condvar and
+/// re-issues on the wake. Same guest, same 42, as the cooperative and tree-walker oracles.
+#[test]
+fn c_a_personality_fork_and_waitpid_on_parallel_driver() {
+    let src = r#"
+long __px_fork(int cap, long a);
+long __px_waitpid(int cap, long pid, long status, long opts);
+long __px_getpid(int cap, long a);
+long __px_getppid(int cap, long a);
+static int status;
+static volatile long acc;
+static long me;
+static long pid;
+static long h;
+int main(void) {
+  me = __px_getpid(0, 0);
+  pid = __px_fork(0, 0);
+  if (pid < 0) return 1;
+  if (pid == 0) {
+    if (__px_getppid(0, 0) != me) return 9;
+    for (long i = 0; i < 30000; i = i + 1) acc = acc + 1;
+    return 7;
+  }
+  if (pid == me) return 2;
+  h = __px_waitpid(0, pid, (long)&status, 0);
+  if (h != pid) return 3;
+  if ((status & 0x7f) != 0) return 4;
+  if (((status >> 8) & 0xff) != 7) return 5;
+  return 42;
+}
+"#;
+    let e = run_bytecode_parallel_only(src, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "the parallel driver forked a real-OS-thread twin, blocked in waitpid, and read the twin's \
+         exit 7 — matching the cooperative + tree-walker oracles (#748 rung 0+1)"
+    );
+}
+
+/// #748 rung 1 — the **any-child** blocking wait (`waitpid(-1)`) on the parallel driver: the wake is
+/// the exit-generation condvar ([`ThreadRegistry::wait_fork_exit`]), whose newer-than-consumed
+/// protocol is the condvar analogue of the cooperative driver's consumed-Done-twin prune (the #1112
+/// livelock class must not re-appear here). Both engines return 42.
+#[test]
+fn c_a_personality_fork_and_waitpid_any_child_on_parallel_driver() {
+    let src = r#"
+long __px_fork(int cap, long a);
+long __px_waitpid(int cap, long pid, long status, long opts);
+static int status;
+static volatile long acc;
+static long pid;
+int main(void) {
+  pid = __px_fork(0, 0);
+  if (pid < 0) return 1;
+  if (pid == 0) {
+    for (long i = 0; i < 30000; i = i + 1) acc = acc + 1;  /* slow: the parent usually BLOCKS */
+    return 7;
+  }
+  long h = __px_waitpid(0, -1, (long)&status, 0);          /* ANY child, blocking */
+  if (h != pid) return 3;
+  if ((status & 0x7f) != 0) return 4;
+  if (((status >> 8) & 0xff) != 7) return 5;
+  return 42;
+}
+"#;
+    let e = run_bytecode_parallel_only(src, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "parallel-driver any-child (waitpid(-1)) reap matched the oracles"
+    );
+}
+
+/// #748 rung 0+1 × nested fork — a forked twin ITSELF forks a grandchild and blocks in `waitpid` for
+/// it (the bash pipeline-subshell shape), all on real OS threads: the twin's own park door
+/// (`wire_park_door` at fork, the #1112 lesson) and its own powerbox cell make the grandchild fork +
+/// nested wait work exactly as on the cooperative driver. Both engines return 42.
+#[test]
+fn c_a_nested_fork_twin_blocks_on_grandchild_on_parallel_driver() {
+    let src = r#"
+long __px_fork(int cap, long a);
+long __px_waitpid(int cap, long pid, long status, long opts);
+static int st1;
+static int st2;
+static volatile long acc;
+static long p1;
+static long p2;
+int main(void) {
+  p1 = __px_fork(0, 0);                       /* root forks twin1 (the "subshell") */
+  if (p1 < 0) return 1;
+  if (p1 == 0) {
+    p2 = __px_fork(0, 0);                      /* twin1 forks a grandchild (the "command") */
+    if (p2 < 0) return 21;
+    if (p2 == 0) {
+      for (long i = 0; i < 30000; i = i + 1) acc = acc + 1;
+      return 7;                                /* grandchild exits 7 */
+    }
+    long h2 = __px_waitpid(0, p2, (long)&st2, 0);  /* twin1 blocks on its grandchild */
+    if (h2 != p2) return 22;
+    if ((st2 & 0x7f) != 0) return 23;
+    if (((st2 >> 8) & 0xff) != 7) return 24;
+    return 11;                                 /* twin1 exits 11 */
+  }
+  long h1 = __px_waitpid(0, p1, (long)&st1, 0);    /* root blocks on twin1 */
+  if (h1 != p1) return 3;
+  if ((st1 & 0x7f) != 0) return 4;
+  if (((st1 >> 8) & 0xff) != 11) return 5;
+  return 42;
+}
+"#;
+    let e = run_bytecode_parallel_only(src, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "parallel driver: a forked twin's OWN blocking waitpid on its grandchild parked + reaped \
+         like the cooperative + tree-walker oracles"
+    );
+}
+
 /// #1080 pipeline rung — **reap ownership**: `waitpid(-1)` must reap only the CALLER's own children,
 /// never a sibling's. The root forks two twins; twinA exits (a zombie owned by the root), and twinB —
 /// which has no children — calls `waitpid(-1)`. POSIX: twinB gets `-ECHILD` and does NOT steal twinA's
@@ -1334,6 +1519,15 @@ int main(void) {{\n\
         vec![Value::I32(42)],
         "bytecode: blocking pipe read parked + woken by the writer twin, EOF on its exit — matching the oracle"
     );
+    // #748 rung 3 — the same on the **parallel driver**: the parent's read blocks its own OS thread
+    // (the level-triggered readiness poll) until the twin thread's bytes land, then EOFs when the
+    // twin's exit releases its write end.
+    let par = run_bytecode_parallel_only(&src, |_| {});
+    assert_eq!(
+        par.result,
+        vec![Value::I32(42)],
+        "parallel driver: blocking pipe read across a real fork thread + EOF on twin exit, matching both oracles"
+    );
 }
 
 /// #1080 rung 4 (backpressure) — a **blocking pipe WRITE across fork on the bytecode engine** (the
@@ -1394,6 +1588,14 @@ int main(void) {{\n\
         vec![Value::I32(42)],
         "bytecode: the writer twin parked on the full FIFO and resumed as the parent drained — 96 KiB round-tripped"
     );
+    // #748 rung 3 — backpressure on the **parallel driver**: the writer twin's OS thread blocks on
+    // the full FIFO while the parent drains concurrently; a lost wake would deadlock the run.
+    let par = run_bytecode_parallel_only(&src, |_| {});
+    assert_eq!(
+        par.result,
+        vec![Value::I32(42)],
+        "parallel driver: the writer thread parked at PIPE_CAP and resumed as the parent drained — 96 KiB round-tripped"
+    );
 }
 
 /// #1080 rung 4 (EPIPE) — a parked writer **wakes to `-EPIPE` when the reader closes** (the `yes | head`
@@ -1445,6 +1647,14 @@ int main(void) {{\n\
         byte.result,
         vec![Value::I32(42)],
         "bytecode: the parked writer woke to -EPIPE when the reader closed — matching the oracle"
+    );
+    // #748 rung 3 — the reader-gone wake on the **parallel driver**: `pipe_write_ready`'s
+    // readers==0 arm trips the blocked writer thread's poll and its re-issued write `-EPIPE`s.
+    let par = run_bytecode_parallel_only(&src, |_| {});
+    assert_eq!(
+        par.result,
+        vec![Value::I32(42)],
+        "parallel driver: the parked writer thread woke to -EPIPE when the reader closed, matching both oracles"
     );
 }
 
@@ -2764,6 +2974,17 @@ int main(void) {{\n\
         vec![Value::I32(42)],
         "bytecode: the exec'd command wrote through the carried pipe end, the parent parked + woke, EOF + reap — matching the oracle"
     );
+    // #748 rungs 2+3 composed on the **parallel driver**: the twin thread dup2s + execs (pipe-end
+    // carry + exec-remap across the in-place host swap), the parent thread blocks reading, EOFs
+    // when the command's teardown releases the carried end, and condvar-reaps the status.
+    let ep = run_bytecode_parallel_setup(&src, |host, posix| {
+        stage_executable(host, posix, "/bin/wr", WR);
+    });
+    assert_eq!(
+        ep.result,
+        vec![Value::I32(42)],
+        "parallel driver: the pipeline crossed the exec boundary — carried end, blocking read, EOF, reap — matching both oracles"
+    );
 }
 
 /// #801 — **`#!` scripts, one level**: `execve` of a memfs file whose first line is
@@ -3160,6 +3381,17 @@ int main(void) {{\n\
         vec![Value::I32(42)],
         "bytecode: seq | head | wc — three exec'd stages piped together, \"10\\n\" + true EOF + three reaps, matching the oracle"
     );
+    // #748 — the full pipeline on the **parallel driver**: three fork threads each exec'ing a
+    // coreutil, three CorePipes with real cross-thread blocking at every stage, three reaps. The
+    // heaviest composition the dual-driver principle demands of rungs 0-3.
+    let ep = run_bytecode_parallel_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["seq", "head", "wc"]);
+    });
+    assert_eq!(
+        ep.result,
+        vec![Value::I32(42)],
+        "parallel driver: seq | head | wc across three exec'd OS-thread stages, matching both oracles"
+    );
 }
 
 /// #801 coreutils — **parent-fed `sort | uniq -c`**: the parent writes an
@@ -3239,6 +3471,16 @@ int main(void) {{\n\
         eb.result,
         vec![Value::I32(42)],
         "bytecode: parent-fed sort | uniq -c parked until the feed closed, then collapsed the run — matching the oracle"
+    );
+    // #748 — the same on the **parallel driver**: `sort`'s whole-input read blocks its OS thread
+    // until the parent's close flips `pipe_read_ready`'s writers-gone arm.
+    let ep = run_bytecode_parallel_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["sort", "uniq"]);
+    });
+    assert_eq!(
+        ep.result,
+        vec![Value::I32(42)],
+        "parallel driver: parent-fed sort | uniq -c across exec'd threads, matching both oracles"
     );
 }
 
@@ -3467,6 +3709,17 @@ int main(void) {{\n\
         vec![Value::I32(42)],
         "the bytecode engine forked, the twin execve'd /bin/c (env:Some image-replace), and the parent \
          reaped its exit 7 — rungs 2+3 combined, matching the tree-walker"
+    );
+    // #748 rung 2 — the same flow on the **parallel driver**: the fork twin is a real OS thread
+    // that `execve`s in place (its host cell's contents swap to the command powerbox, its dispatch
+    // table to the command's), exits 7, and the parent's condvar `waitpid` reaps it.
+    let ep = run_bytecode_parallel_setup(&src, |host, posix| {
+        stage_executable(host, posix, "/bin/c", CMD);
+    });
+    assert_eq!(
+        ep.result,
+        vec![Value::I32(42)],
+        "parallel driver: fork → execve → waitpid across a real OS thread, matching both oracles"
     );
 }
 
