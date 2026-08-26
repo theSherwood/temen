@@ -9130,21 +9130,29 @@ struct CoopTierupRun {
     paged: bool,
     pagestate: Vec<u8>,
     pagestate_version: u64,
+    /// #816: the env identity the cached page-state table was built for
+    /// ([`bytecode::CoopRun::pending_env`]) — env windows carry their **own** `map_version`
+    /// counters, so the cache key is (env, version), never version alone.
+    pagestate_env: i64,
     pagestate_cover: u64,
 }
 
 impl CoopTierupRun {
-    /// #1009 paged tier-up: refresh the page-state table iff the window's page map changed
-    /// ([`bytecode::CoopRun::mem_map_version`]), then stage its coverage for `"mapped"` — the
-    /// [`TierupRun::sync_pagestate`] twin over the cooperative run.
+    /// #1009 paged tier-up: refresh the page-state table iff the pending window's page map changed
+    /// — the [`TierupRun::sync_pagestate`] twin over the cooperative run — then stage its coverage
+    /// for `"mapped"`. #816: the engine routes `mem_map_info`/`mem_map_version` to the pending
+    /// round-trip's task env (a §14 confined child serves over its own carve), so the cache is
+    /// keyed (env, version) and the staged coverage is the pending window's own bound.
     fn sync_pagestate(&mut self) {
+        let env = self.run.pending_env();
         let ver = self.run.mem_map_version();
-        if ver != self.pagestate_version {
+        if ver != self.pagestate_version || env != self.pagestate_env {
             let info = self.run.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
             let (table, cover) = bytecode::build_pagestate_table(&info);
             self.pagestate = table;
             self.pagestate_cover = cover;
             self.pagestate_version = ver;
+            self.pagestate_env = env;
         }
         self.mapped = self.pagestate_cover;
     }
@@ -9384,6 +9392,7 @@ pub extern "C" fn temen_coop_open(
             paged,
             pagestate: Vec::new(),
             pagestate_version: u64::MAX,
+            pagestate_env: i64::MIN,
             pagestate_cover: 0,
         });
     }
@@ -9548,6 +9557,32 @@ pub extern "C" fn temen_coop_win_ptr() -> *const u8 {
 #[no_mangle]
 pub extern "C" fn temen_coop_win_len() -> usize {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.backing.len())
+}
+
+/// #816 env-routed tier-up: the **pending event's** window base — the emitted `f{i}`s' `win` arg
+/// for the tier-up / JIT_INVOKE currently being serviced. For a root-env task this equals
+/// [`temen_coop_win_ptr`]; for a §14 confined child it is the backing plus the child's carve
+/// offset, so the emitted accesses land exactly where the interpreter's confined accesses do.
+/// Read it **per event** (the JS driver's per-call `win`), never cached across events. Falls back
+/// to the root window if no round-trip is pending (defensive; the driver only reads it inside one).
+#[no_mangle]
+pub extern "C" fn temen_coop_tierup_win_ptr() -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(core::ptr::null(), |s| {
+        s.run
+            .pending_win()
+            .map_or(s.backing.as_ptr(), |(ptr, _)| ptr)
+    })
+}
+
+/// #816: the pending event's window byte length (the span [`temen_coop_tierup_win_ptr`] addresses —
+/// the child carve size for a confined child's event, the run window otherwise).
+#[no_mangle]
+pub extern "C" fn temen_coop_tierup_win_len() -> usize {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| {
+        s.run
+            .pending_win()
+            .map_or(s.backing.len(), |(_, len)| len as usize)
+    })
 }
 
 /// The guest's top-level result once [`COOP_RUN_DONE`] is reached.

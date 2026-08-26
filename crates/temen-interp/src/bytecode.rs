@@ -10544,6 +10544,14 @@ impl CoopSched {
                         // chain / invoke) — with `reply_twin` injected at the caller's reply slot.
                         let mut twin_active = tasks[caller_ti].vt.active.clone();
                         twin_active.set(caller_dst, Reg::from_i64(reply_twin));
+                        // #816 env-routed tier-up: same rule as the `ForkSelf` twin — the clone may
+                        // keep an inherited bitmap only if its private `fork_private` window is
+                        // servable (flat); a `Paged` twin window strips it and interprets,
+                        // fail-closed.
+                        if !tierup_servable(twin_mem.as_ref(), mem.as_ref()) {
+                            twin_active.jit_eligible = None;
+                            twin_active.jit_page_checked = false;
+                        }
                         let twin_vt = VTask {
                             active: twin_active,
                             active_id: ROOT_FIBER,
@@ -10810,6 +10818,17 @@ impl CoopSched {
                             // bare root carries no resume chain / invoke (`Vm` derives `Clone`).
                             let mut twin_active = tasks[ti].vt.active.clone();
                             twin_active.set(dst, Reg::from_i64(0));
+                            // #816 env-routed tier-up: the clone carries the parent's bitmap; the twin
+                            // may keep it only if its OWN private window (`fork_private`, pushed into
+                            // `extra_envs` below) is servable — the driver then answers each of the
+                            // twin's events over that window via the pending-env routing. A `Paged`
+                            // twin window (the wasm fallback — no flat address) is not servable:
+                            // strip the bitmap so the twin interprets, fail-closed, until a flat
+                            // twin-backing seam exists.
+                            if !tierup_servable(twin_mem.as_ref(), mem.as_ref()) {
+                                twin_active.jit_eligible = None;
+                                twin_active.jit_page_checked = false;
+                            }
                             let twin_vt = VTask {
                                 active: twin_active,
                                 active_id: ROOT_FIBER,
@@ -10909,7 +10928,23 @@ impl CoopSched {
                     // root and its same-module threads). A child spawned in another module (a confined
                     // §22 unit spawning its own function) runs a different module, where the module-0
                     // bitmap does not apply — leave it interpreting.
-                    if module == 0 {
+                    //
+                    // #816 env-routed tier-up: the thread shares its spawner's env (below), so it may
+                    // inherit the bitmap exactly when that env's window is tier-up-servable — the
+                    // driver answers every per-event read (`win` base, mapped extent, page state) for
+                    // the pending task's env ([`CoopRun::pending_win`] and friends), so a §14
+                    // confined child's thread now tiers up over its own carve. A window the driver
+                    // cannot flatly address (a fork twin's `Paged` private copy on wasm) fails
+                    // closed to the interpreter, which is always right.
+                    if module == 0
+                        && tierup_servable(
+                            match tasks[ti].env {
+                                None => mem.as_ref(),
+                                Some(k) => extra_envs[k].mem.as_ref(),
+                            },
+                            mem.as_ref(),
+                        )
+                    {
                         if let Some(e) = eligible.as_ref() {
                             child.active.jit_eligible = Some(std::sync::Arc::clone(e));
                             child.active.jit_page_checked = *page_checked;
@@ -11097,7 +11132,21 @@ impl CoopSched {
                     // to installed §22 units — matching the tree-walker's `DomainTable::new(&cfuncs, 0)`).
                     let c0 = dom.source.primary();
                     let child_table = build_table(c0.progs.len(), 0);
-                    let child_vt = VTask::new(&c0, entry as usize, &child_args)?;
+                    let mut child_vt = VTask::new(&c0, entry as usize, &child_args)?;
+                    // #816 env-routed tier-up: a same-module confined child runs module 0, so the
+                    // run's bitmap applies to it too — inherit it when the child's window is
+                    // servable (`nested_view` shares the parent backing, so a root-lineage carve
+                    // always is; a fork twin's descendant is gated by its backing like the twin).
+                    // The driver serves each of the child's tier-ups over its own carve via the
+                    // pending-env routing (`CoopRun::pending_win`/`mem_map_info`); the emitted
+                    // module's per-access live bound (elision off for instantiator-bearing modules,
+                    // temen-wasm-jit `elide_bound`) confines them to the carve.
+                    if tierup_servable(child_mem.as_ref(), mem.as_ref()) {
+                        if let Some(e) = eligible.as_ref() {
+                            child_vt.active.jit_eligible = Some(std::sync::Arc::clone(e));
+                            child_vt.active.jit_page_checked = *page_checked;
+                        }
+                    }
                     let eidx = extra_envs.len();
                     extra_envs.push(ChildEnv {
                         mem: child_mem,
@@ -11900,13 +11949,60 @@ impl CoopRun {
         }))
     }
 
-    /// The run's window committed **scalar extent** right now — the #717 value the cdylib re-syncs to
-    /// every emitted instance's `"mapped"` global after a [`bounce`](Self::bounce) (a bounced callback
-    /// may have grown the window). `0` when there is no window or its state is not representable by one
-    /// bound. Reads the shared root window (a confined child's own-window growth is a later refinement).
-    pub fn window_scalar_extent(&self) -> u64 {
-        self.mem
+    /// #816 env-routed tier-up: the task index of the outstanding tier-up / `Jit.invoke` round-trip
+    /// (the one the driver is currently serving), if any. The same resolution [`bounce`](Self::bounce)
+    /// performs — at most one round-trip is outstanding, so this names *the* task every per-event
+    /// driver read (`win`, mapped extent, page state) must be answered for.
+    fn pending_ti(&self) -> Option<usize> {
+        self.sched
+            .pending_tierup
             .as_ref()
+            .map(|(ti, ..)| *ti)
+            .or_else(|| self.sched.pending_jit.as_ref().map(|(ti, ..)| *ti))
+    }
+
+    /// #816: the window the outstanding round-trip's task runs over — `extra_envs[k].mem` for an
+    /// env-carrying task (a §14 confined child or one of its threads), the root window otherwise
+    /// (including when no round-trip is pending — the pre-open / post-done reads). Mirrors
+    /// [`bounce`](Self::bounce)'s env dispatch, so the driver's reads and the bounced cap calls
+    /// always agree on which window is live.
+    fn pending_mem(&self) -> Option<&Mem> {
+        match self.pending_ti().and_then(|ti| self.sched.tasks[ti].env) {
+            Some(k) => self.sched.extra_envs[k].mem.as_ref(),
+            None => self.mem.as_ref(),
+        }
+    }
+
+    /// #816: the pending round-trip task's env identity — `-1` for the root env, the `extra_envs`
+    /// index for a confined child. Part of the driver's page-state cache key: env windows have their
+    /// **own** `map_version` counters (a fresh Arc per `nested_view`), so a version compare is only
+    /// meaningful within one env — the driver rebuilds whenever (env, version) changes.
+    pub fn pending_env(&self) -> i64 {
+        self.pending_ti()
+            .and_then(|ti| self.sched.tasks[ti].env)
+            .map_or(-1, |k| k as i64)
+    }
+
+    /// #816: the pending task's **flat window view** for the emitted call — `(base ptr, reserved
+    /// len)`. For the root this is the run backing itself; for a §14 child it is the backing plus
+    /// the carve offset, so the emitted `win + addr` accesses land exactly where the interpreter's
+    /// confined accesses do. `None` when the pending window has no flat address (a `Paged`-backed
+    /// window, e.g. a fork twin's private copy on wasm) — such tasks never carry the tier-up bitmap
+    /// (the eligibility gates check [`Mem::flat_win_base`] at task creation), so a pending tier-up
+    /// always resolves `Some`; the `None` arm is the fail-closed default for defensive callers.
+    pub fn pending_win(&self) -> Option<(*const u8, u64)> {
+        let m = self.pending_mem()?;
+        Some((m.flat_win_base()?, m.win_reserved()))
+    }
+
+    /// The pending task's window committed **scalar extent** right now — the #717 value the cdylib
+    /// re-syncs to every emitted instance's `"mapped"` global after a [`bounce`](Self::bounce) (a
+    /// bounced callback may have grown the window). `0` when there is no window or its state is not
+    /// representable by one bound. #816: routed to the pending round-trip's task env, so a confined
+    /// child's own extent (its fully-mapped carve) bounds its emitted accesses — the confinement
+    /// bound — rather than the root's.
+    pub fn window_scalar_extent(&self) -> u64 {
+        self.pending_mem()
             .and_then(|m| m.scalar_extent())
             .unwrap_or(0)
     }
@@ -11937,17 +12033,22 @@ impl CoopRun {
         self.sched.table_gen
     }
 
-    /// #1009 paged tier-up: the root window's memory-map introspection ([`MemMapInfo`]) — a paged
-    /// coop driver rebuilds its page-state table from this. `None` for a memory-less run.
+    /// #1009 paged tier-up: the pending task's window memory-map introspection ([`MemMapInfo`]) — a
+    /// paged coop driver rebuilds its page-state table from this. `None` for a memory-less run.
+    /// #816: routed to the pending round-trip's task env, so a confined child's own page map (its
+    /// carve geometry, its `protect`/`unmap` state) is what the emitted page check enforces —
+    /// window-relative on both sides, no translation needed.
     pub fn mem_map_info(&self) -> Option<MemMapInfo> {
-        self.mem.as_ref().map(|m| m.map_info())
+        self.pending_mem().map(|m| m.map_info())
     }
 
-    /// #1009 paged tier-up: the root window's page-map version (bumped on every `map`/`unmap`/
-    /// `protect`) — the cheap `O(1)` counter a paged coop driver compares to skip an unchanged
-    /// page-state rebuild. `0` for a memory-less run.
+    /// #1009 paged tier-up: the pending task's window page-map version (bumped on every `map`/
+    /// `unmap`/`protect`) — the cheap `O(1)` counter a paged coop driver compares to skip an
+    /// unchanged page-state rebuild. `0` for a memory-less run. #816: env windows carry their own
+    /// counters, so the driver's cache key is ([`pending_env`](Self::pending_env), this) — a bare
+    /// version compare across different envs would alias.
     pub fn mem_map_version(&self) -> u64 {
-        self.mem.as_ref().map_or(0, |m| m.map_version())
+        self.pending_mem().map_or(0, |m| m.map_version())
     }
 
     /// Pump the schedule to its next pause: [`CoopEvent::Done`]/[`CoopEvent::Trapped`] end the run,
@@ -12091,6 +12192,26 @@ impl CoopRun {
                 )
             }
         }
+    }
+}
+
+/// #816 env-routed tier-up: may a task running over `cand` carry the tier-up bitmap? Either arm
+/// keeps the driver contract satisfiable — [`CoopRun::pending_win`] must resolve a flat view of the
+/// pending window:
+/// - a window sharing the **root backing** (a root-env thread, a §14 child carve via `nested_view`)
+///   is servable wherever the root is (the per-event `win` is the backing base plus the window's
+///   carve offset);
+/// - any other window (a fork twin's private `fork_private` copy) qualifies only if its own region
+///   is flat-addressable ([`Mem::flat_win_base`]). The wasm `Paged` fallback is not — so browser
+///   fork twins stay interpreted, fail-closed, until a flat twin-backing seam exists.
+///
+/// A memory-less run has no window to serve — no bitmap.
+fn tierup_servable(cand: Option<&Mem>, root: Option<&Mem>) -> bool {
+    match (cand, root) {
+        (Some(c), Some(r)) => {
+            std::sync::Arc::ptr_eq(&c.back, &r.back) || c.flat_win_base().is_some()
+        }
+        _ => false,
     }
 }
 

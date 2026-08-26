@@ -21,8 +21,9 @@ use temen_browser::{
     temen_coop_jit_wasm_ptr, temen_coop_mapped, temen_coop_mapped_now, temen_coop_nfuncs,
     temen_coop_open, temen_coop_paged, temen_coop_pagestate_len, temen_coop_pagestate_ptr,
     temen_coop_run, temen_coop_set_tierup_floor, temen_coop_shim_ptr, temen_coop_shim_wasm,
-    temen_coop_slot_code, temen_coop_table_gen, temen_coop_table_log2, temen_coop_value,
-    temen_coop_wasm_len, temen_coop_wasm_ptr, temen_coop_win_len, temen_coop_win_ptr,
+    temen_coop_slot_code, temen_coop_table_gen, temen_coop_table_log2, temen_coop_tierup_win_len,
+    temen_coop_tierup_win_ptr, temen_coop_value, temen_coop_wasm_len, temen_coop_wasm_ptr,
+    temen_coop_win_len, temen_coop_win_ptr,
     temen_run_value, temen_status, temen_stdout_len, temen_stdout_ptr, COOP_RUN_DONE,
     COOP_RUN_JIT_INVOKE, COOP_RUN_TIERUP, COOP_RUN_TRAP, STATUS_OK, STATUS_TRAP,
     STATUS_UNSUPPORTED,
@@ -130,8 +131,10 @@ fn service_coop_on_wasmi(n_results: usize) -> Option<Vec<i64>> {
     let wasm = unsafe { std::slice::from_raw_parts(temen_coop_wasm_ptr(), temen_coop_wasm_len()) };
     let func = temen_coop_func();
     let argv = unsafe { std::slice::from_raw_parts(temen_coop_argv_ptr(), temen_coop_argv_len()) };
-    let win_len = temen_coop_win_len();
-    let win_ptr = temen_coop_win_ptr() as *mut u8;
+    // #816 env-routed tier-up: the PENDING task's window (base + span) — the browser JS driver's
+    // per-event `win`. A §14 confined child's event mirrors just its carve.
+    let win_len = temen_coop_tierup_win_len();
+    let win_ptr = temen_coop_tierup_win_ptr() as *mut u8;
     let mapped = temen_coop_mapped();
 
     let engine = Engine::default();
@@ -323,8 +326,9 @@ fn run_emitted_coop(
     mapped: i64,
     n_results: usize,
 ) -> Option<Vec<i64>> {
-    let win_len = temen_coop_win_len();
-    let win_ptr = temen_coop_win_ptr() as *mut u8;
+    // #816: the pending task's window, per event (see `service_coop_on_wasmi`).
+    let win_len = temen_coop_tierup_win_len();
+    let win_ptr = temen_coop_tierup_win_ptr() as *mut u8;
     let engine = Engine::default();
     let module = WModule::new(&engine, wasm).expect("emitted wasm must validate");
     let mut store: Store<i32> = Store::new(&engine, 0);
