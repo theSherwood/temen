@@ -2805,7 +2805,35 @@ fn grant_onramp_caps(
         }));
         host.register_cap_name("fs", handle);
     }
+    // #816: an **opt-in** §14 `Instantiator` over the guest's own window, named `"instantiator"` —
+    // OFF by default (the playground never sets the knob), so the default on-ramp powerbox keeps
+    // exactly the reference-parity grant set above; neither it nor `temen-run`'s reference powerbox
+    // grants spawn authority ambiently, and widening that default is an owner-level policy decision
+    // (least authority, INVARIANTS). The knob exists for the differential harness — the
+    // env-routed child tier-up (#1117) needs a guest that can `instantiate` to be exercised
+    // end-to-end over real emitted wasm — and for an embedder that deliberately opts a session in.
+    // Spawn authority is a strict subset of the guest's own reach (children are window sub-carves
+    // with attenuated fuel), granted last so every other handle keeps its value.
+    if ONRAMP_GRANT_INSTANTIATOR.load(std::sync::atomic::Ordering::Relaxed) {
+        let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+        let handle = host.grant_instantiator(0, win);
+        host.register_cap_name("instantiator", handle);
+    }
     (frame, keys)
+}
+
+/// #816: whether [`grant_onramp_caps`] additionally grants the opt-in `"instantiator"` capability.
+/// Default `false`; see the knob's rationale at the grant site. Set via
+/// [`temen_onramp_set_grant_instantiator`].
+static ONRAMP_GRANT_INSTANTIATOR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// #816: opt subsequent on-ramp opens (plain, coop, JIT alike — every path through
+/// [`grant_onramp_caps`]) in or out of the `"instantiator"` grant. A test/embedder knob, exactly
+/// like [`temen_coop_set_tierup_floor`]; the playground never calls it.
+#[no_mangle]
+pub extern "C" fn temen_onramp_set_grant_instantiator(on: i32) {
+    ONRAMP_GRANT_INSTANTIATOR.store(on != 0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Run `m`'s function 0 under the **on-ramp powerbox** — the ABI `temen-llvm`'s synthesized `_start`
