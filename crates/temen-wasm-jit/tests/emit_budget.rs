@@ -98,11 +98,11 @@ fn over_budget_unit_emit_declines() {
 #[test]
 fn reactor_budget_boundary() {
     let m = wide_module(3, 100); // ~12.8 KiB per leaf
-    let err = temen_wasm_jit::compile_module_reactor_budgeted(&m, 0, false, usize::MAX, 20_000)
+    let err = temen_wasm_jit::compile_module_reactor_budgeted(&m, 0, false, usize::MAX, 20_000, None)
         .expect_err("over the explicit budget declines");
     assert!(format!("{err:?}").contains("memory budget"));
     let (wasm, emitted) =
-        temen_wasm_jit::compile_module_reactor_budgeted(&m, 0, false, usize::MAX, usize::MAX)
+        temen_wasm_jit::compile_module_reactor_budgeted(&m, 0, false, usize::MAX, usize::MAX, None)
             .expect("no budget: emits");
     assert!(emitted.iter().all(|&e| e), "everything emits unbudgeted");
     wasmi::Module::new(&wasmi::Engine::default(), &wasm[..]).expect("emitted wasm validates");

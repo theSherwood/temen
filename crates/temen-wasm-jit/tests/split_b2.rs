@@ -9,7 +9,10 @@
 //! every K must equal both the interpreter oracle (INVARIANTS.md #9) and the unsplit `compile_module_b2`.
 
 use temen_interp::{run, Value};
-use temen_wasm_jit::{compile_module_b2, compile_module_b2_split};
+use temen_wasm_jit::{
+    compile_module_b2, compile_module_b2_split, compile_module_reactor_split,
+    compile_module_with_split,
+};
 use wasmi::core::ValType;
 use wasmi::{
     Engine, FuncRef, Linker, Memory, MemoryType, Module as WModule, Store, Table, TableType, Val,
@@ -136,6 +139,73 @@ block 0 (vx: i64) {
 }
 }
 "#;
+
+/// Instantiate a **local-table** module (declares + fills its own funcref table, so no table import —
+/// the warm+JIT path's exact instantiation shape: env is just memory/trap/call_interp) and call
+/// `f0(WIN, ENV, arg)`. Its `call.dyn` dispatches through the module's own element-segment-populated table.
+fn run_local(wasm: &[u8], arg: i64) -> i64 {
+    let engine = Engine::default();
+    let mut store: Store<i32> = Store::new(&engine, 0);
+    let memory = Memory::new(&mut store, MemoryType::new(4, None)).unwrap();
+    memory
+        .write(&mut store, ENV_PTR as usize, &i64::MAX.to_le_bytes())
+        .unwrap();
+    let mut linker: Linker<i32> = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    linker
+        .func_wrap("env", "trap", |mut c: wasmi::Caller<'_, i32>, code: i32| {
+            *c.data_mut() = code;
+        })
+        .unwrap();
+    linker
+        .func_wrap::<_, ()>(
+            "env",
+            "call_interp",
+            |_: wasmi::Caller<'_, i32>, _f: i32, _a: i32| unreachable!("no interp leaves here"),
+        )
+        .unwrap();
+    // No `__indirect_function_table` import: the module owns its table (local mode).
+    let module = WModule::new(&engine, wasm).unwrap_or_else(|e| panic!("local wasm: {e}"));
+    let inst = linker
+        .instantiate(&mut store, &module)
+        .unwrap()
+        .start(&mut store)
+        .unwrap();
+    let f0 = inst.get_func(&store, "f0").expect("f0 export");
+    let params = [Val::I32(WIN_BASE), Val::I32(ENV_PTR), Val::I64(arg)];
+    let mut results = [Val::I64(0)];
+    f0.call(&mut store, &params, &mut results).expect("f0 call");
+    results[0].i64().expect("i64 result")
+}
+
+/// #1120 Slice 2c — split in **local-table** mode (what the warm+JIT path uses). The module owns its
+/// funcref table; splitting the `call.dyn`-bearing hot function at every K must match the interpreter.
+/// This is the mode `compile_jit`/`compile_module_reactor` emit, so it de-risks the warm-path wiring.
+#[test]
+fn local_split_dispatch_loop_matches_interp() {
+    let m = parse(DISPATCH_LOOP);
+    let nblocks = m.funcs[0].blocks.len();
+    for &n in &[0i64, 1, 2, 3, 7, 20, 100] {
+        let want = oracle(&m, n);
+        for k in 2..=nblocks {
+            let split = compile_module_with_split(&m, false, 0, k).expect("local split emits");
+            assert_eq!(run_local(&split, n), want, "local split k={k} != interp (n={n})");
+        }
+    }
+}
+
+/// #1120 Slice 2c — the **reactor** emit path (what warm+JIT uses) with the where-to-cut heuristic:
+/// `compile_module_reactor_split` auto-picks the largest reachable function (here func 0, the hot loop)
+/// and splits it. `min_bytes=0` + a tiny `target_group_bytes` force a maximal split; the result must
+/// still match the interpreter, exercising the production reactor path end to end (local table + call.dyn).
+#[test]
+fn reactor_split_dispatch_loop_matches_interp() {
+    let m = parse(DISPATCH_LOOP);
+    let (wasm, _emitted) = compile_module_reactor_split(&m, 0, false, 0, 1).expect("reactor split");
+    for &n in &[0i64, 1, 2, 3, 7, 20, 100] {
+        assert_eq!(run_local(&wasm, n), oracle(&m, n), "reactor split != interp (n={n})");
+    }
+}
 
 #[test]
 fn b2_split_dispatch_loop_matches_interp() {

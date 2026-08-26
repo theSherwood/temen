@@ -1570,6 +1570,52 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
     )
 }
 
+/// #1120 Slice 2c — like [`compile_module_with`] (a **local-table** whole-module emit: the module
+/// declares and fills its own funcref table, so instantiation needs only `env.memory`/`env.trap`/
+/// `env.call_interp` — the warm+JIT path's shape) but the one function `fidx` is emitted **split** into
+/// `group_count` block-group wasm functions. The split's group functions are direct-called (not in the
+/// table), so the local element segment still maps slot `fidx` → the wrapper; a `call.dyn` to `fidx`
+/// lands in the wrapper, which marshals params and tail-calls the groups. If the split can't be
+/// represented, the function emits whole. Correctness is the interp-vs-emitted differential (INVARIANTS #9).
+pub fn compile_module_with_split(
+    m: &Module,
+    shared_memory: bool,
+    fidx: usize,
+    group_count: usize,
+) -> Result<Vec<u8>, Error> {
+    let a = analyze(m);
+    if !a.in_subset.iter().all(|&s| s) {
+        return Err(Error::Unsupported(
+            "a function is outside the integer subset",
+        ));
+    }
+    let n = m.funcs.len();
+    if fidx >= n {
+        return Err(Error::Unsupported("split function index out of range"));
+    }
+    let emitted: Vec<usize> = (0..n).collect();
+    let wasm_of: Vec<Option<u32>> = (0..n).map(|i| Some(IMPORTED_FUNCS + i as u32)).collect();
+    let mut split_plan: Vec<Option<Vec<usize>>> = vec![None; n];
+    let nb = m.funcs[fidx].blocks.len();
+    let k = group_count.clamp(1, nb.max(1));
+    if nb >= 2 && k >= 2 {
+        split_plan[fidx] = Some((0..nb).map(|i| i * k / nb).collect());
+    }
+    emit_module(
+        m,
+        shared_memory,
+        &emitted,
+        &wasm_of,
+        &a.interp_leaf,
+        None,
+        false,
+        None,
+        temen_ir::module_null_guard(m),
+        &[],
+        &split_plan,
+    )
+}
+
 /// Emit a **§14 VM-in-VM** unit: like [`compile_module_with`], but a `call.cap` to INSTANTIATOR
 /// `instantiate` (op 0) / `join` (op 1) is lowered to a host-driver bounce (`env.instantiate` /
 /// `env.join`) instead of failing out-of-subset — so a unit whose entry spawns a nested confined VM
@@ -2140,6 +2186,58 @@ pub fn compile_module_reactor(
     compile_module_reactor_capped(m, entry, shared_memory, MAX_EMITTED_FUNC_BYTES)
 }
 
+/// #1120 Slice 2c — the **where-to-cut heuristic**: pick the single hot function whose outlining pays
+/// off most, and how many groups to cut it into. Choose the largest reachable, in-subset function by
+/// [`est_emitted_size`] (a static estimate — the biggest estimate is the biggest emitted body); only if
+/// it clears `min_bytes` (small functions already TurboFan on run 1, so splitting them is pure overhead).
+/// K targets ~`target_group_bytes` per group. Returns `None` when no function is worth splitting.
+pub fn pick_split_target(
+    m: &Module,
+    entry: u32,
+    min_bytes: usize,
+    target_group_bytes: usize,
+) -> Option<(usize, usize)> {
+    let a = analyze_from(m, entry);
+    let mut best: Option<(usize, usize)> = None; // (fidx, est)
+    for i in 0..m.funcs.len() {
+        if a.reachable[i] && a.in_subset[i] {
+            let est = est_emitted_size(&m.funcs[i]);
+            if best.is_none_or(|(_, b)| est > b) {
+                best = Some((i, est));
+            }
+        }
+    }
+    let (fidx, est) = best?;
+    if est < min_bytes || m.funcs[fidx].blocks.len() < 2 {
+        return None;
+    }
+    let k = est.div_ceil(target_group_bytes.max(1)).max(2);
+    Some((fidx, k))
+}
+
+/// #1120 Slice 2c — [`compile_module_reactor`], but the hottest large function (per [`pick_split_target`])
+/// is emitted **split** into block-group wasm functions so V8 TurboFans the hot path on the first Run
+/// instead of after several. `min_bytes`/`target_group_bytes` tune the heuristic. When nothing is worth
+/// splitting, this is exactly `compile_module_reactor` (byte-identical). Correctness is unchanged — the
+/// split is invisible to the interpreter oracle and the confinement lowering (INVARIANTS #9, I2).
+pub fn compile_module_reactor_split(
+    m: &Module,
+    entry: u32,
+    shared_memory: bool,
+    min_bytes: usize,
+    target_group_bytes: usize,
+) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    let target = pick_split_target(m, entry, min_bytes, target_group_bytes);
+    compile_module_reactor_budgeted(
+        m,
+        entry,
+        shared_memory,
+        MAX_EMITTED_FUNC_BYTES,
+        MAX_EST_EMITTED_MODULE_BYTES,
+        target,
+    )
+}
+
 /// [`compile_module_reactor`] with an explicit emitted-body byte cap. The public wrapper passes V8's
 /// [`MAX_EMITTED_FUNC_BYTES`]; the parameter exists so the exclusion loop can be differential-tested
 /// with a small cap (and a small module) instead of a genuine multi-megabyte function. `usize::MAX`
@@ -2151,19 +2249,25 @@ pub fn compile_module_reactor_capped(
     shared_memory: bool,
     cap: usize,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
-    compile_module_reactor_budgeted(m, entry, shared_memory, cap, MAX_EST_EMITTED_MODULE_BYTES)
+    compile_module_reactor_budgeted(m, entry, shared_memory, cap, MAX_EST_EMITTED_MODULE_BYTES, None)
 }
 
 /// [`compile_module_reactor_capped`] with an explicit **module-total** emit budget (#1038 — see
 /// [`MAX_EST_EMITTED_MODULE_BYTES`], which the public entries pass). The parameter exists so the
 /// budget decline can be tested with a small module instead of a genuine 104 MiB one.
+///
+/// `split_target = Some((fidx, k))` (#1120 Slice 2c) additionally emits function `fidx` **split** into
+/// `k` block-group wasm functions when it lands in the emitted set — so the giant hot function TurboFans
+/// on the first Run. `None` is byte-identical to before.
 #[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
 pub fn compile_module_reactor_budgeted(
     m: &Module,
     entry: u32,
     shared_memory: bool,
     cap: usize,
     module_budget: usize,
+    split_target: Option<(usize, usize)>,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
     let n = m.funcs.len();
     let a = analyze_from(m, entry);
@@ -2213,6 +2317,19 @@ pub fn compile_module_reactor_budgeted(
                 "estimated emitted module exceeds the engine memory budget",
             ));
         }
+        // #1120 Slice 2c: split the designated hot function into K block-group wasm functions — but only
+        // when it's actually in the emitted set (not pulled cross-tier for size) and has ≥2 blocks.
+        let mut split_plan: Vec<Option<Vec<usize>>> = Vec::new();
+        if let Some((fidx, k)) = split_target {
+            if fidx < n && wasm_of[fidx].is_some() {
+                let nb = m.funcs[fidx].blocks.len();
+                let kk = k.clamp(1, nb.max(1));
+                if nb >= 2 && kk >= 2 {
+                    split_plan = vec![None; n];
+                    split_plan[fidx] = Some((0..nb).map(|i| i * kk / nb).collect());
+                }
+            }
+        }
         let wasm = emit_module(
             m,
             shared_memory,
@@ -2224,7 +2341,7 @@ pub fn compile_module_reactor_budgeted(
             None,
             temen_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
             &[],
-            &[],
+            &split_plan,
         )?;
         // Measure the emitted bodies and pull any over-large *marshallable* one out for a re-emit as a
         // cross-tier leaf. An over-large body that can't be crossed (non-marshallable sig) has nowhere

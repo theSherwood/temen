@@ -5254,7 +5254,23 @@ impl JitOnrampRun {
         let temen_wasm_jit::DriveMode::WasmDriven { .. } = artifact.drive else {
             return Err(STATUS_UNSUPPORTED);
         };
-        let (emitted_wasm, emitted) = (artifact.wasm, artifact.emitted);
+        let (mut emitted_wasm, emitted) = (artifact.wasm, artifact.emitted);
+        // #1120 Slice 2c (opt-in, default off): re-emit with the hottest large function **outlined** into
+        // block-group wasm functions, so V8 TurboFans the hot path on the first Run instead of after
+        // several. The emit is WasmDriven-rooted at `eval_run`, exactly like the `compile_jit` above; the
+        // split changes only that one function's internal shape, so the `emitted` bitmap is unchanged and
+        // the interpreter oracle / confinement are untouched. Falls back to the unsplit emit on any error.
+        if WARM_JIT_SPLIT.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Ok((split_wasm, _)) = temen_wasm_jit::compile_module_reactor_split(
+                &module,
+                eval_fn,
+                shared_memory,
+                WARM_JIT_SPLIT_MIN_BYTES,
+                WARM_JIT_SPLIT_GROUP_BYTES,
+            ) {
+                emitted_wasm = split_wasm;
+            }
+        }
         Ok(JitOnrampRun {
             module: std::sync::Arc::new(module),
             program,
@@ -5970,6 +5986,24 @@ fn warm_jit_ref() -> Option<&'static JitOnrampRun> {
 /// memory (the cross-origin-isolated threads build), matching the memory the host instantiates it against.
 /// Returns `0`, else a negative `STATUS_*` (also in [`LAST_STATUS`]): [`STATUS_UNSUPPORTED`] if no warm
 /// session is open or `eval_run` isn't wasm-drivable (the page then evaluates via [`temen_warm_eval`]).
+/// #1120 Slice 2c — opt-in hot-function outlining for the warm+JIT emit. Default off (shipping warm
+/// cards are byte-identical). When on, [`temen_warm_jit_open`] re-emits `eval_run` with the hottest large
+/// function split into block-group wasm functions (see [`temen_wasm_jit::compile_module_reactor_split`]).
+static WARM_JIT_SPLIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Only outline a function whose estimated emitted body clears this — small functions already TurboFan on
+/// run 1, so splitting them is pure overhead.
+const WARM_JIT_SPLIT_MIN_BYTES: usize = 512 * 1024;
+/// Target emitted bytes per outlined group (K ≈ est_body / this) — each group tiers up quickly.
+const WARM_JIT_SPLIT_GROUP_BYTES: usize = 384 * 1024;
+
+/// Toggle the warm+JIT hot-function outlining (#1120 Slice 2c). `on != 0` enables it for the **next**
+/// [`temen_warm_jit_open`] (call before pre-warm / the first Run); `0` restores the default (off). Lets
+/// the playground A/B the first-Run tier-up win on the real card without a rebuild.
+#[no_mangle]
+pub extern "C" fn temen_warm_jit_set_split(on: i32) {
+    WARM_JIT_SPLIT.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[no_mangle]
 pub extern "C" fn temen_warm_jit_open(shared: i32) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
