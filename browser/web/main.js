@@ -246,7 +246,7 @@ block 0 (v0: i64) {
   v4 = i32x4.splat v3
   v5 = i32x4.add v2 v4
   v6 = i32x4.mul v5 v4
-  v7 = i64.const 32
+  v7 = i64.const 16416
   v128.store v7 v6
   v8 = v128.load v7
   v9 = i32x4.max_s v8 v2
