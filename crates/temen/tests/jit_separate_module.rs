@@ -163,10 +163,10 @@ fn jit_module_child_by_export_name_matches_interp() {
     // The parent resolves "beta" (func 1) via Module op 0 — routed through `cap_thunk` →
     // `cap_dispatch_slots` on the JIT, same as the interpreter — then instantiate_module's it → join.
     let parent = "memory 17
-data 200 \"beta\"
+data 16584 \"beta\"
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
-  v2 = i64.const 200
+  v2 = i64.const 16584
   v3 = i64.const 4
   v4 = call.cap 8 0 (i64, i64) -> (i64) v1 (v2, v3)
   v5 = i64.extend_i32_s v1
