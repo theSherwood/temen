@@ -203,12 +203,12 @@ fn host_cap_label_round_trips_and_misses() {
 #[test]
 fn discover_then_use_a_granted_capability() {
     let src = "memory 16\n\
-               data 0 \"hi\"\n\
+               data 16384 \"hi\"\n\
                func (i32, i32, i32) -> (i32) {\n\
                block 0 (v0: i32, v1: i32, v2: i32) {\n\
                \x20 v3 = i32.const 0\n\
                \x20 v4, v5 = self.get v3\n\
-               \x20 v6 = i64.const 0\n\
+               \x20 v6 = i64.const 16384\n\
                \x20 v7 = i64.const 2\n\
                \x20 v8 = call.cap 0 1 (i64, i64) -> (i64) v4(v6, v7)\n\
                \x20 return v5\n\
