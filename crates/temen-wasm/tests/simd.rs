@@ -79,12 +79,12 @@ fn dot4_f32() {
     let wat = r#"
     (module
       (memory 1)
-      (data (i32.const 0)  "\00\00\80\3f\00\00\00\40\00\00\40\40\00\00\80\40")
-      (data (i32.const 16) "\00\00\80\40\00\00\40\40\00\00\00\40\00\00\80\3f")
+      (data (i32.const 16384) "\00\00\80\3f\00\00\00\40\00\00\40\40\00\00\80\40")
+      (data (i32.const 16400) "\00\00\80\40\00\00\40\40\00\00\00\40\00\00\80\3f")
       (func (export "dot") (result f32)
         (local $p v128)
         (local.set $p
-          (f32x4.mul (v128.load (i32.const 0)) (v128.load (i32.const 16))))
+          (f32x4.mul (v128.load (i32.const 16384)) (v128.load (i32.const 16400))))
         (f32.add
           (f32.add (f32x4.extract_lane 0 (local.get $p)) (f32x4.extract_lane 1 (local.get $p)))
           (f32.add (f32x4.extract_lane 2 (local.get $p)) (f32x4.extract_lane 3 (local.get $p))))))
@@ -100,14 +100,14 @@ fn saxpy_f32x4() {
     let wat = r#"
     (module
       (memory 1)
-      (data (i32.const 0)  "\00\00\80\3f\00\00\00\40\00\00\40\40\00\00\80\40")
-      (data (i32.const 16) "\00\00\80\40\00\00\40\40\00\00\00\40\00\00\80\3f")
+      (data (i32.const 16384) "\00\00\80\3f\00\00\00\40\00\00\40\40\00\00\80\40")
+      (data (i32.const 16400) "\00\00\80\40\00\00\40\40\00\00\00\40\00\00\80\3f")
       (func (export "saxpy") (param $a f32) (param $lane i32) (result f32)
-        (v128.store (i32.const 32)
+        (v128.store (i32.const 16416)
           (f32x4.add
-            (f32x4.mul (f32x4.splat (local.get $a)) (v128.load (i32.const 0)))
-            (v128.load (i32.const 16))))
-        (f32.load (i32.add (i32.const 32) (i32.mul (local.get $lane) (i32.const 4))))))
+            (f32x4.mul (f32x4.splat (local.get $a)) (v128.load (i32.const 16384)))
+            (v128.load (i32.const 16400))))
+        (f32.load (i32.add (i32.const 16416) (i32.mul (local.get $lane) (i32.const 4))))))
     "#;
     let expect = [14.0f32, 23.0, 32.0, 41.0];
     for (lane, &want) in expect.iter().enumerate() {
@@ -472,49 +472,49 @@ fn relaxed_simd_i8_dot() {
 #[test]
 fn simd_memory_variants() {
     // load32_splat: broadcast a scalar to every lane (read lane 3 to prove it reached the top).
-    let splat = r#"(module (memory 1) (data (i32.const 0) "\78\56\34\12")
+    let splat = r#"(module (memory 1) (data (i32.const 16384) "\78\56\34\12")
       (func (export "f") (result i32)
-        (i32x4.extract_lane 3 (v128.load32_splat (i32.const 0)))))"#;
+        (i32x4.extract_lane 3 (v128.load32_splat (i32.const 16384)))))"#;
     assert_eq!(eval(splat, "f", &[]), Value::I32(0x12345678u32 as i32));
 
     // load8_splat: broadcast a byte; lane 9 = the byte.
-    let bsplat = r#"(module (memory 1) (data (i32.const 0) "\2a")
+    let bsplat = r#"(module (memory 1) (data (i32.const 16384) "\2a")
       (func (export "f") (result i32)
-        (i8x16.extract_lane_u 9 (v128.load8_splat (i32.const 0)))))"#;
+        (i8x16.extract_lane_u 9 (v128.load8_splat (i32.const 16384)))))"#;
     assert_eq!(eval(bsplat, "f", &[]), Value::I32(42));
 
     // load32_zero: lane 0 = scalar (-1), lane 1 = 0 ⇒ sum −1.
-    let zero = r#"(module (memory 1) (data (i32.const 0) "\ff\ff\ff\ff")
+    let zero = r#"(module (memory 1) (data (i32.const 16384) "\ff\ff\ff\ff")
       (func (export "f") (result i32)
         (i32.add
-          (i32x4.extract_lane 0 (v128.load32_zero (i32.const 0)))
-          (i32x4.extract_lane 1 (v128.load32_zero (i32.const 0))))))"#;
+          (i32x4.extract_lane 0 (v128.load32_zero (i32.const 16384)))
+          (i32x4.extract_lane 1 (v128.load32_zero (i32.const 16384))))))"#;
     assert_eq!(eval(zero, "f", &[]), Value::I32(-1));
 
     // load8x8_u: load 8 bytes [10,20,30,…], zero-extend to i16x8; lane 2 = 30.
-    let ext = r#"(module (memory 1) (data (i32.const 0) "\0a\14\1e\28\32\3c\46\50")
+    let ext = r#"(module (memory 1) (data (i32.const 16384) "\0a\14\1e\28\32\3c\46\50")
       (func (export "f") (result i32)
-        (i16x8.extract_lane_u 2 (v128.load8x8_u (i32.const 0)))))"#;
+        (i16x8.extract_lane_u 2 (v128.load8x8_u (i32.const 16384)))))"#;
     assert_eq!(eval(ext, "f", &[]), Value::I32(30));
 
     // load16x4_s: load 4 i16 incl. a negative one, sign-extend to i32x4; lane 0 = -1.
-    let exts = r#"(module (memory 1) (data (i32.const 0) "\ff\ff\01\00\02\00\03\00")
+    let exts = r#"(module (memory 1) (data (i32.const 16384) "\ff\ff\01\00\02\00\03\00")
       (func (export "f") (result i32)
-        (i32x4.extract_lane 0 (v128.load16x4_s (i32.const 0)))))"#;
+        (i32x4.extract_lane 0 (v128.load16x4_s (i32.const 16384)))))"#;
     assert_eq!(eval(exts, "f", &[]), Value::I32(-1));
 
     // load32_lane: splice a loaded scalar into lane 2 of a splatted vector.
-    let llane = r#"(module (memory 1) (data (i32.const 0) "\ad\de\00\00")
+    let llane = r#"(module (memory 1) (data (i32.const 16384) "\ad\de\00\00")
       (func (export "f") (result i32)
         (i32x4.extract_lane 2
-          (v128.load32_lane 2 (i32.const 0) (i32x4.splat (i32.const 7))))))"#;
+          (v128.load32_lane 2 (i32.const 16384) (i32x4.splat (i32.const 7))))))"#;
     assert_eq!(eval(llane, "f", &[]), Value::I32(0xdead));
 
     // store32_lane: extract lane 1 of a const vector, store it, load it back.
     let slane = r#"(module (memory 1)
       (func (export "f") (result i32)
-        (v128.store32_lane 1 (i32.const 16) (v128.const i32x4 100 200 300 400))
-        (i32.load (i32.const 16))))"#;
+        (v128.store32_lane 1 (i32.const 16400) (v128.const i32x4 100 200 300 400))
+        (i32.load (i32.const 16400))))"#;
     assert_eq!(eval(slane, "f", &[]), Value::I32(200));
 }
 
@@ -588,12 +588,12 @@ fn i32x4_dot_i16x8_s() {
     let wat = r#"
     (module
       (memory 1)
-      (data (i32.const 0)  "\01\00\02\00\03\00\04\00\05\00\06\00\07\00\08\00")
-      (data (i32.const 16) "\08\00\07\00\06\00\05\00\04\00\03\00\02\00\01\00")
+      (data (i32.const 16384) "\01\00\02\00\03\00\04\00\05\00\06\00\07\00\08\00")
+      (data (i32.const 16400) "\08\00\07\00\06\00\05\00\04\00\03\00\02\00\01\00")
       (func (export "dot") (result i32)
         (local $p v128)
         (local.set $p
-          (i32x4.dot_i16x8_s (v128.load (i32.const 0)) (v128.load (i32.const 16))))
+          (i32x4.dot_i16x8_s (v128.load (i32.const 16384)) (v128.load (i32.const 16400))))
         (i32.add
           (i32.add (i32x4.extract_lane 0 (local.get $p)) (i32x4.extract_lane 1 (local.get $p)))
           (i32.add (i32x4.extract_lane 2 (local.get $p)) (i32x4.extract_lane 3 (local.get $p))))))
