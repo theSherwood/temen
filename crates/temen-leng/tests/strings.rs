@@ -68,7 +68,9 @@ fn long_string_const_materializes() {
     want[0] = 5; // fullLen@0
     want.extend_from_slice(b"hello"); // data@24
 
-    let seed = vec![0u8; 4096];
+    // The const blob lands in the globals region, now based above the unconditional NULL guard
+    // (#1094, `translate::globals_base`); the snapshot window must reach it.
+    let seed = vec![0u8; 32768];
     let mut fuel = u64::MAX;
     let (ir, imem) = temen_interp::run_capture(&m, 0, &[], &mut fuel, &seed);
     let addr = match ir.expect("interp").as_slice() {
