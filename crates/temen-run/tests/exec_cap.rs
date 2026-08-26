@@ -13,26 +13,26 @@ use temen_run::{
 use temen_text::parse_module;
 
 /// The consumer: resolves `"exec"`, runs `echo hi` (argv `"echo\0hi"` — the separator byte at
-/// 12 is fresh-memory zero), reads the output into 32.., echoes it to the granted `out` stream
-/// (the cross-backend byte observable), and exits with `status * 100 + nread` — 3 iff the run
-/// produced `hi\n` and exit 0.
+/// 16396 is fresh-memory zero), reads the output into 16416.., echoes it to the granted `out`
+/// stream (the cross-backend byte observable), and exits with `status * 100 + nread` — 3 iff the
+/// run produced `hi\n` and exit 0. All window addresses sit above the #1094 NULL guard (16384).
 const EXEC_CONSUMER: &str = "\
 memory 16
-data 0 \"exec\"
-data 8 \"echo\"
-data 13 \"hi\"
+data 16384 \"exec\"
+data 16392 \"echo\"
+data 16397 \"hi\"
 import 0 \"out\" (i64, i64) -> (i64)
 import 1 \"exit\" (i32) -> ()
 func 0 () -> () {
 block 0 () {
-  vp = i64.const 0
+  vp = i64.const 16384
   vl = i64.const 4
   vh = cap.self.resolve vp vl
-  vap = i64.const 8
+  vap = i64.const 16392
   val = i64.const 7
   vz = i64.const 0
   vjob = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh (vap, val, vz, vz)
-  vbuf = i64.const 32
+  vbuf = i64.const 16416
   vcap = i64.const 16
   vn = cap.call 13 1 (i64, i64, i64) -> (i64) vh (vjob, vbuf, vcap)
   vs = cap.call 13 3 (i64) -> (i64) vh (vjob)
@@ -111,11 +111,11 @@ fn host_exec_matches_scripted_byte_for_byte() {
 /// own stdout and returns — no OS process anywhere. Its captured output becomes the job's.
 const ECHO_DOMAIN: &str = "\
 memory 16
-data 0 \"hi\\n\"
+data 16384 \"hi\\n\"
 import 0 \"write\" (i64, i64) -> (i64)
 func 0 () -> () {
 block 0 () {
-  vp = i64.const 0
+  vp = i64.const 16384
   vl = i64.const 3
   vw = call.import 0 (vp, vl)
   return
@@ -170,7 +170,7 @@ import 0 \"read\" (i64, i64) -> (i64)
 import 1 \"write\" (i64, i64) -> (i64)
 func 0 () -> () {
 block 0 () {
-  vp = i64.const 64
+  vp = i64.const 16448
   vc = i64.const 32
   vn = call.import 0 (vp, vc)
   vw = call.import 1 (vp, vn)
@@ -180,26 +180,27 @@ block 0 () {
 export 0 func \"_start\" 0
 ";
 
-/// The consumer for the cat test: runs `cat` with stdin `yo` (argv at 8, the payload at 16),
-/// reads the job's output, and echoes it to the granted `out` stream; exits status*100 + n.
+/// The consumer for the cat test: runs `cat` with stdin `yo` (argv at 16392, the payload at
+/// 16400), reads the job's output, and echoes it to the granted `out` stream; exits status*100 + n.
+/// All window addresses sit above the #1094 NULL guard (16384).
 const CAT_CONSUMER: &str = "\
 memory 16
-data 0 \"exec\"
-data 8 \"cat\"
-data 16 \"yo\"
+data 16384 \"exec\"
+data 16392 \"cat\"
+data 16400 \"yo\"
 import 0 \"out\" (i64, i64) -> (i64)
 import 1 \"exit\" (i32) -> ()
 func 0 () -> () {
 block 0 () {
-  vp = i64.const 0
+  vp = i64.const 16384
   vl = i64.const 4
   vh = cap.self.resolve vp vl
-  vap = i64.const 8
+  vap = i64.const 16392
   val = i64.const 3
-  vsp = i64.const 16
+  vsp = i64.const 16400
   vsl = i64.const 2
   vjob = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh (vap, val, vsp, vsl)
-  vbuf = i64.const 32
+  vbuf = i64.const 16416
   vcap = i64.const 16
   vn = cap.call 13 1 (i64, i64, i64) -> (i64) vh (vjob, vbuf, vcap)
   vs = cap.call 13 3 (i64) -> (i64) vh (vjob)
@@ -269,15 +270,15 @@ fn a_trapping_domain_program_is_a_failed_run_not_a_trap() {
     // with a `boom` entry instead: probe that running `boom`'s trap comes back negative.
     let m = parse_module(
         "memory 16\n\
-         data 0 \"exec\"\n\
-         data 8 \"boom\"\n\
+         data 16384 \"exec\"\n\
+         data 16392 \"boom\"\n\
          import 0 \"exit\" (i32) -> ()\n\
          func 0 () -> () {\n\
          block 0 () {\n\
-           vp = i64.const 0\n\
+           vp = i64.const 16384\n\
            vl = i64.const 4\n\
            vh = cap.self.resolve vp vl\n\
-           vap = i64.const 8\n\
+           vap = i64.const 16392\n\
            val = i64.const 4\n\
            vz = i64.const 0\n\
            vjob = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh (vap, val, vz, vz)\n\
@@ -315,11 +316,11 @@ fn a_trapping_domain_program_is_a_failed_run_not_a_trap() {
 fn ungranted_exec_resolves_negative_and_the_fallback_runs() {
     let m = parse_module(
         "memory 16\n\
-         data 0 \"exec\"\n\
+         data 16384 \"exec\"\n\
          import 0 \"exit\" (i32) -> ()\n\
          func 0 () -> () {\n\
          block 0 () {\n\
-           vp = i64.const 0\n\
+           vp = i64.const 16384\n\
            vl = i64.const 4\n\
            vh = cap.self.resolve vp vl\n\
            vz = i32.const 0\n\
@@ -352,19 +353,20 @@ fn ungranted_exec_resolves_negative_and_the_fallback_runs() {
 /// table with no `cat` entry, so the refusal shape does not reveal the backend either.
 #[test]
 fn a_program_outside_the_allowlist_is_refused_not_trapped() {
-    // argv "cat\0hi": "cat" at 8..10, fresh-zero separator at 11, "hi" at 12..13, len 6.
+    // argv "cat\0hi": "cat" at 16392..16394, fresh-zero separator at 16395, "hi" at 16396..16397,
+    // len 6 — all above the #1094 NULL guard (16384).
     let m = parse_module(
         "memory 16\n\
-         data 0 \"exec\"\n\
-         data 8 \"cat\"\n\
-         data 12 \"hi\"\n\
+         data 16384 \"exec\"\n\
+         data 16392 \"cat\"\n\
+         data 16396 \"hi\"\n\
          import 0 \"exit\" (i32) -> ()\n\
          func 0 () -> () {\n\
          block 0 () {\n\
-           vp = i64.const 0\n\
+           vp = i64.const 16384\n\
            vl = i64.const 4\n\
            vh = cap.self.resolve vp vl\n\
-           vap = i64.const 8\n\
+           vap = i64.const 16392\n\
            val = i64.const 6\n\
            vz = i64.const 0\n\
            vjob = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh (vap, val, vz, vz)\n\

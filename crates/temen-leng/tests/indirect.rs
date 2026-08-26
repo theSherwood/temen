@@ -47,18 +47,20 @@ fn store_funcref_then_call_through_field() {
         text.contains("call_indirect"),
         "run dispatches indirectly:\n{text}"
     );
-    // dbl = func 0, run = func 1. Box at offset 128: fn@0 (overwritten by the store), v@8 = 21.
-    // run(128) stores ref.func dbl into b.fn, then b.fn(b.v) = dbl(21) = 21*21 = 441.
+    // dbl = func 0, run = func 1. Box at offset 16512: fn@0 (overwritten by the store), v@8 = 21.
+    // run(16512) stores ref.func dbl into b.fn, then b.fn(b.v) = dbl(21) = 21*21 = 441.
     // `run` makes an indirect call, so under the funcref ABI it is frame-needing: it takes a leading
-    // `$sp` (2048 — well above the Box, never dereferenced since neither proc uses its frame).
-    let b = 128usize;
-    assert_eq!(run_with_seed(&m, 1, &[2048, b as i64], b + 8, 21), 441);
+    // `$sp` (18432 — well above the Box, never dereferenced since neither proc uses its frame).
+    // #1094: the NULL guard is unconditional, so the Box + `$sp` clear `[0, POWERBOX_NULL_GUARD)`.
+    let b = 16512usize;
+    assert_eq!(run_with_seed(&m, 1, &[18432, b as i64], b + 8, 21), 441);
 }
 
 /// Like `run`, but pre-seed an i64 at `off` in the window before running (both engines, parity).
 fn run_with_seed(m: &temen_ir::Module, idx: u32, args: &[i64], off: usize, val: i64) -> i64 {
     temen_verify::verify_module(m).unwrap_or_else(|e| panic!("verify: {e:?}"));
-    let mut seed = vec![0u8; 4096];
+    // #1094: the NULL guard is unconditional, so seeds must clear `[0, POWERBOX_NULL_GUARD)`.
+    let mut seed = vec![0u8; 20480];
     seed[off..off + 8].copy_from_slice(&val.to_le_bytes());
     let ivals: Vec<Value> = args.iter().map(|&n| Value::I64(n)).collect();
     let mut fuel = u64::MAX;
@@ -98,9 +100,9 @@ fn call_through_funcref_param() {
         "apply dispatches indirectly:\n{text}"
     );
     // apply = func 1; f is the i32 funcref index of dbl (func 0), x = 7 → 49. `apply` makes an
-    // indirect call, so it is frame-needing under the funcref ABI: a leading `$sp` (2048) precedes
-    // the visible params (f, x).
-    assert_eq!(run(&m, 1, &[2048, 0, 7]), 49);
+    // indirect call, so it is frame-needing under the funcref ABI: a leading `$sp` (18432) precedes
+    // the visible params (f, x). #1094: `$sp` clears the unconditional `[0, POWERBOX_NULL_GUARD)`.
+    assert_eq!(run(&m, 1, &[18432, 0, 7]), 49);
 }
 
 #[test]
@@ -134,20 +136,21 @@ fn virtual_dispatch_through_a_vtable() {
     );
 
     // getX = func 0, dispatch = func 1. Lay out a vtable and object in the window:
-    //   Vtbl @ 256: mt[0] @256 = 0 (getX's function index).
-    //   Obj  @ 320: vt @320 = 256, x @328 = 42.
-    let (vt, obj) = (256usize, 320usize);
-    let mut seed = vec![0u8; 4096];
+    //   Vtbl @ 16640: mt[0] @16640 = 0 (getX's function index).
+    //   Obj  @ 16704: vt @16704 = 16640, x @16712 = 42.
+    // #1094: the NULL guard is unconditional, so the vtable + object clear `[0, POWERBOX_NULL_GUARD)`.
+    let (vt, obj) = (16640usize, 16704usize);
+    let mut seed = vec![0u8; 20480];
     seed[vt..vt + 8].copy_from_slice(&0u64.to_le_bytes()); // mt[0] = getX (func 0)
     seed[obj..obj + 8].copy_from_slice(&(vt as u64).to_le_bytes()); // o.vt = &Vtbl
     seed[obj + 8..obj + 16].copy_from_slice(&42u64.to_le_bytes()); // o.x = 42
 
-    // `dispatch` makes an indirect call → frame-needing under the funcref ABI: leading `$sp` (2048).
+    // `dispatch` makes an indirect call → frame-needing under the funcref ABI: leading `$sp` (18432).
     let mut fuel = u64::MAX;
     let (ir, _) = temen_interp::run_capture(
         &m,
         1,
-        &[Value::I64(2048), Value::I64(obj as i64)],
+        &[Value::I64(18432), Value::I64(obj as i64)],
         &mut fuel,
         &seed,
     );
@@ -156,7 +159,7 @@ fn virtual_dispatch_through_a_vtable() {
         o => panic!("unexpected {o:?}"),
     };
     let (jout, _) =
-        temen_jit::compile_and_run_capture(&m, 1, &[2048, obj as i64], &seed).expect("jit");
+        temen_jit::compile_and_run_capture(&m, 1, &[18432, obj as i64], &seed).expect("jit");
     let jword = match jout {
         temen_jit::JitOutcome::Returned(v) => v,
         o => panic!("jit: {o:?}"),
@@ -211,16 +214,17 @@ fn dispatch_through_a_materialized_const_vtable() {
         .expect("dispatch export")
         .func;
 
-    // Object at 320: vt@320 (set by dispatch), x@328 = 42.
-    let obj = 320usize;
-    let mut seed = vec![0u8; 4096];
+    // Object at 16704: vt@16704 (set by dispatch), x@16712 = 42.
+    // #1094: the NULL guard is unconditional, so the object + `$sp` clear `[0, POWERBOX_NULL_GUARD)`.
+    let obj = 16704usize;
+    let mut seed = vec![0u8; 20480];
     seed[obj + 8..obj + 16].copy_from_slice(&42u64.to_le_bytes());
-    // `dispatch` makes an indirect call → frame-needing under the funcref ABI: leading `$sp` (2048).
+    // `dispatch` makes an indirect call → frame-needing under the funcref ABI: leading `$sp` (18432).
     let mut fuel = u64::MAX;
     let (ir, _) = temen_interp::run_capture(
         &m,
         dispatch,
-        &[Value::I64(2048), Value::I64(obj as i64)],
+        &[Value::I64(18432), Value::I64(obj as i64)],
         &mut fuel,
         &seed,
     );
@@ -229,7 +233,7 @@ fn dispatch_through_a_materialized_const_vtable() {
         o => panic!("unexpected {o:?}"),
     };
     let (jout, _) =
-        temen_jit::compile_and_run_capture(&m, dispatch, &[2048, obj as i64], &seed).expect("jit");
+        temen_jit::compile_and_run_capture(&m, dispatch, &[18432, obj as i64], &seed).expect("jit");
     let jword = match jout {
         temen_jit::JitOutcome::Returned(v) => v,
         o => panic!("jit: {o:?}"),
@@ -255,9 +259,10 @@ fn baseobj_upcasts_to_the_base_subobject() {
    (ret (dot (baseobj Base.0. 1 (deref d.0)) tag.0 0)))))";
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
-    // Derived @ 128: tag (base, offset 0) = 7.
-    let d = 128usize;
-    let mut seed = vec![0u8; 4096];
+    // Derived @ 16512: tag (base, offset 0) = 7.
+    // #1094: the NULL guard is unconditional, so the object clears `[0, POWERBOX_NULL_GUARD)`.
+    let d = 16512usize;
+    let mut seed = vec![0u8; 20480];
     seed[d..d + 8].copy_from_slice(&7u64.to_le_bytes());
     let mut fuel = u64::MAX;
     let (ir, _) = temen_interp::run_capture(&m, 0, &[Value::I64(d as i64)], &mut fuel, &seed);

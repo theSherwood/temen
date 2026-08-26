@@ -50,9 +50,10 @@ fn seq_value_sum_over_buffer() {
    (ret acc.0))))";
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
     // Build a seq {len:3, data:->[10,20,30]} in the window and call sumSeq with its address.
-    let seq_addr = 64usize;
-    let data_addr = 128usize;
-    let mut seed = vec![0u8; 4096];
+    // #1094: the NULL guard is unconditional, so the seq + data must clear `[0, POWERBOX_NULL_GUARD)`.
+    let seq_addr = 16448usize;
+    let data_addr = 16512usize;
+    let mut seed = vec![0u8; 20480];
     seed[seq_addr..seq_addr + 8].copy_from_slice(&3i64.to_le_bytes());
     seed[seq_addr + 8..seq_addr + 16].copy_from_slice(&(data_addr as i64).to_le_bytes());
     for (i, v) in [10i64, 20, 30].iter().enumerate() {

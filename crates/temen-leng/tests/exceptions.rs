@@ -60,7 +60,8 @@ const HANDWRITTEN: &str = "\
 #[test]
 fn error_flag_happy_and_error_paths() {
     let m = temen_leng::translate(HANDWRITTEN).unwrap_or_else(|e| panic!("translate: {e}"));
-    let sp = 8192;
+    // #1094: the NULL guard is unconditional, so the frame must clear `[0, POWERBOX_NULL_GUARD)`.
+    let sp = 24576;
     // guarded is func 1 and needs a frame (canRaise is an aggregate var).
     assert_eq!(run(&m, 1, &[sp, 5]), 10, "no raise → 5*2");
     assert_eq!(run(&m, 1, &[sp, 21]), 42, "no raise → 21*2");
@@ -83,8 +84,9 @@ fn aggregate_returning_call_of_raiser_directly() {
    (ret (call mayFail.0 x.0)))))";
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
     // propagate returns the tuple by sret: (i64 $sret, i64 x) -> ().  Run it and read code/val back.
-    let seed = vec![0u8; 8192];
-    let dst = 4096usize;
+    // #1094: the NULL guard is unconditional, so the sret buffer must clear `[0, POWERBOX_NULL_GUARD)`.
+    let seed = vec![0u8; 24576];
+    let dst = 20480usize;
     let mut fuel = u64::MAX;
     let (ir, imem) = temen_interp::run_capture(
         &m,
@@ -107,7 +109,8 @@ fn real_nimony_try_except() {
     const REAL: &str = include_str!("fixtures/real_exception.leng.nif");
     let m = temen_leng::translate_procs(REAL, &["mayFail.0.", "guarded.0."])
         .unwrap_or_else(|e| panic!("translate real mayFail/guarded: {e}"));
-    let sp = 8192;
+    // #1094: the NULL guard is unconditional, so the frame must clear `[0, POWERBOX_NULL_GUARD)`.
+    let sp = 24576;
     // guarded is func 1 (needs a frame for its `canRaise` tuple).
     assert_eq!(run(&m, 1, &[sp, 5]), 10, "no raise → 5*2");
     assert_eq!(run(&m, 1, &[sp, 7]), 14, "no raise → 7*2");

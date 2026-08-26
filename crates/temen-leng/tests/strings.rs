@@ -41,7 +41,7 @@ fn sso_string_construct_and_read() {
    (var :s.0 . Str.0. (oconstr Str.0. (kv bytes.0 478560413032u) (kv more.0 (nil))))
    (ret (dot s.0 bytes.0 0)))))";
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
-    let sp = 4096;
+    let sp = 20480; // 4096 + 16384, clearing the unconditional NULL guard (#1094)
     assert_eq!(
         run(&m, 0, &[sp]),
         478560413032,
@@ -129,7 +129,7 @@ fn real_long_string_runs_end_to_end() {
     // sit in the low scratch page below the globals; the window must reach past the globals base
     // (`POWERBOX_NULL_GUARD + POWERBOX_STACK_PAGE`, 32768, #1091) so the snapshot covers the
     // relocated const blob the test reads.
-    let (sp, sret) = (2048i64, 512usize);
+    let (sp, sret) = (18432i64, 16896usize); // both +16384 above the unconditional NULL guard (#1094)
     let seed = vec![0u8; 49152];
     let ivals = vec![Value::I64(sp), Value::I64(sret as i64)];
     let mut fuel = u64::MAX;
@@ -171,8 +171,9 @@ fn computed_deref_flexarray_chain() {
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
 
-    let (s, b) = (256usize, 512usize);
-    let mut seed = vec![0u8; 4096];
+    // Pointer targets raised +16384 above the unconditional NULL guard (#1094).
+    let (s, b) = (16640usize, 16896usize);
+    let mut seed = vec![0u8; 32768];
     seed[s + 8..s + 16].copy_from_slice(&(b as u64).to_le_bytes()); // string.more → blob
     seed[b + 24..b + 24 + 3].copy_from_slice(b"hey"); // blob.data@24
     let read = |i: i64| -> i64 {
@@ -262,8 +263,8 @@ fn flexarray_data_indexing() {
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
 
-    let b = 256usize;
-    let mut seed = vec![0u8; 4096];
+    let b = 16640usize; // 256 + 16384, above the unconditional NULL guard (#1094)
+    let mut seed = vec![0u8; 32768];
     seed[b + 24..b + 24 + 5].copy_from_slice(b"hello"); // data@24
     let read = |i: i64| -> i64 {
         let mut fuel = u64::MAX;
