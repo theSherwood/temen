@@ -22495,7 +22495,11 @@ mod bigint_tests {
     use super::*;
     use temen_interp::Value;
 
-    const WIN_LOG2: u8 = 16; // 64 KiB scratch window
+    // 8 KiB scratch window — deliberately **below** `POWERBOX_NULL_GUARD` (16 KiB) so the #1094
+    // unconditional guard no-ops (`seed_null_guard` only engages when `guard <= window`): these are
+    // isolated primitive unit tests that place their operands at low offsets (256/512) and don't
+    // exercise NULL semantics, so a sub-guard scratch window keeps them running as before.
+    const WIN_LOG2: u8 = 13;
 
     fn run(func: Func, args: &[i64], mem: &[(usize, &[u32])]) -> (Vec<Value>, Vec<u8>) {
         let mut init = vec![0u8; 1 << WIN_LOG2];
