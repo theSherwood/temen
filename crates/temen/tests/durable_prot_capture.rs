@@ -15,8 +15,8 @@ use temen_snapshot::{freeze_with_prots, restore_with_prots, PageProt, PAGE};
 const SIZE_LOG2: u8 = 17;
 const WINDOW: usize = 1 << SIZE_LOG2;
 const RO_OFF: usize = 5 * PAGE; // a read-only data segment lands on page 5
-// The "ordinary committed page" reference: page 4 (offset 16384), the first Rw page ABOVE the
-// #1094 NULL guard `[0, 16384)` — pages 0..3 are now seeded Unmapped, so page 0 is no longer Rw.
+                                // The "ordinary committed page" reference: page 4 (offset 16384), the first Rw page ABOVE the
+                                // #1094 NULL guard `[0, 16384)` — pages 0..3 are now seeded Unmapped, so page 0 is no longer Rw.
 const RW_OFF: usize = 4 * PAGE;
 
 // A read-only data segment + a trivial entry (it doesn't touch memory; the segment alone marks
