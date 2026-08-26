@@ -40,7 +40,7 @@ func () -> () {
 block 0 () {
   v0 = i64.const 0
   v1 = thread.spawn 1 v0 v0
-  v2 = i64.const 8
+  v2 = i64.const 16400
   v3 = i32.const 0
   v4 = i64.const 10000000
   v5 = i32.atomic.wait v2 v3 v4
@@ -54,7 +54,7 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, v0: i64) {
-  v1 = i64.const 0
+  v1 = i64.const 16392
   v2 = i32.const 0
   v3 = i64.const -1
   v4 = i32.atomic.wait v1 v2 v3
@@ -94,7 +94,7 @@ func () -> (i64) {
 block 0 () {
   v0 = i64.const 0
   v1 = thread.spawn 1 v0 v0
-  v2 = i64.const 8
+  v2 = i64.const 16400
   v3 = i32.const 0
   v4 = i64.const 10000000
   v5 = i32.atomic.wait v2 v3 v4
@@ -104,7 +104,7 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, v0: i64) {
-  v1 = i64.const 0
+  v1 = i64.const 16392
   v2 = i32.const 0
   v3 = i64.const -1
   v4 = i32.atomic.wait v1 v2 v3
@@ -145,7 +145,7 @@ func () -> (i64) {
 block 0 () {
   v0 = i64.const 0
   v1 = thread.spawn 1 v0 v0
-  v2 = i64.const 8
+  v2 = i64.const 16400
   v3 = i32.const 0
   v4 = i64.const 8000000000
   v5 = i32.atomic.wait v2 v3 v4
@@ -204,7 +204,7 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  v5 = i64.const 0
+  v5 = i64.const 16392
   v6 = i32.const 0
   v7 = i64.const -1
   v8 = i32.atomic.wait v5 v6 v7
