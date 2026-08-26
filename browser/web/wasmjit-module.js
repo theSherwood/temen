@@ -487,6 +487,34 @@ export async function runWarmJit(ex, memory, stdinBytes, cacheKey, shared = 1) {
   return status;
 }
 
+// Run the warm session's `eval_run` on the **warm-coop** tier (#816 item 4): the cooperative
+// tier-up drive over the restored warm image, for a page-managing / InterpDriven eval the
+// WasmDriven `runWarmJit` declines (its open throws). The engine emits the module's leaves + cap
+// wrappers once (cached in the warm session, like the warm+JIT emit; the compiled
+// `WebAssembly.Module` is cached across Runs under `cacheKey#coop`); each Run is prepare (restore
+// image + re-establish the captured page map + arm `eval_run` on the coop scheduler) + the standard
+// `driveCoopTierupRun` event loop — the interpreter owns the eval, eligible pure leaves run on
+// emitted wasm with the per-event `mapped`/page-state sync carrying the warm image's grown heap and
+// protected rodata. Assumes `temen_warm_open` already succeeded. Returns the run status; throws if
+// the module has nothing for the emitted tier or the run traps (the caller falls back to
+// `temen_warm_eval`, the interpreter warm path).
+export async function runWarmCoop(ex, memory, stdinBytes, cacheKey, shared = 1) {
+  const u8 = () => new Uint8Array(memory.buffer);
+  if (ex.temen_warm_coop_open(shared) !== 0) {
+    throw new Error(`warm-coop open failed: status ${ex.temen_status()} (2 = nothing emittable)`);
+  }
+  let stdinP = 0;
+  const stdinLen = stdinBytes ? stdinBytes.length : 0;
+  if (stdinLen) {
+    stdinP = Number(ex.temen_alloc(stdinLen));
+    u8().set(stdinBytes, stdinP);
+  }
+  const prepared = ex.temen_warm_coop_prepare(stdinP, stdinLen);
+  if (stdinP) ex.temen_dealloc(stdinP, stdinLen);
+  if (prepared !== 0) throw new Error(`warm-coop prepare failed: status ${ex.temen_status()}`);
+  return driveCoopTierupRun(ex, memory, cacheKey);
+}
+
 // The last warm+JIT trap, captured for diagnosis (issue #865) — `{ kind, frames }` where `frames` are the
 // emitted wasm frames `fN@0xoff` (innermost first), or `null` if the last run didn't trap. Test/telemetry
 // hook: a decline used to be a bare "trapped" with no location; this exposes the trap KIND (the V8

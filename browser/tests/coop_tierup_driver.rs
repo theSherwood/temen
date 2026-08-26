@@ -24,7 +24,8 @@ use temen_browser::{
     temen_coop_slot_code, temen_coop_table_gen, temen_coop_table_log2, temen_coop_tierup_win_len,
     temen_coop_tierup_win_ptr, temen_coop_value, temen_coop_wasm_len, temen_coop_wasm_ptr,
     temen_coop_win_len, temen_coop_win_ptr, temen_onramp_set_grant_instantiator, temen_run_value,
-    temen_status, temen_stdout_len, temen_stdout_ptr, COOP_RUN_DONE, COOP_RUN_JIT_INVOKE,
+    temen_status, temen_stdout_len, temen_stdout_ptr, temen_warm_close, temen_warm_coop_open,
+    temen_warm_coop_prepare, temen_warm_eval, temen_warm_open, COOP_RUN_DONE, COOP_RUN_JIT_INVOKE,
     COOP_RUN_TIERUP, COOP_RUN_TRAP, STATUS_OK, STATUS_TRAP, STATUS_UNSUPPORTED,
 };
 use temen_interp::{Host, StreamRole};
@@ -2816,4 +2817,176 @@ fn coop_tierup_serves_a_confined_child_over_its_own_carve() {
         unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
     assert_eq!(got_out, want.stdout, "stdout parity with the oracle");
     temen_coop_close();
+}
+
+// ============================================================================================
+// #816 item 4: the **warm-coop** tier — a page-managing warm session evaluates on the
+// cooperative tier-up drive. `temen_warm_jit_open` requires a WasmDriven `eval_run`; a
+// page-managing eval (the QuickJS shape: the warmup `vm_map`-grows the heap AND `protect`s
+// rodata) is InterpDriven and used to fall back to the pure interpreter warm path. Now
+// `temen_warm_coop_open` emits the module's leaves once (cached in the session) and each Run's
+// `temen_warm_coop_prepare` restores the warm image + re-establishes the captured page map +
+// arms `eval_run` on the coop scheduler, after which the standard event pump (this harness's
+// `CoopB2Driver`, wasmi playing `driveCoopTierupRun`) services the eligible leaf on emitted wasm.
+// ============================================================================================
+
+/// The page-managing two-phase guest (the QuickJS shape in miniature). `warmup(sp)`: plant a
+/// rodata constant at 8200 then `protect` its page `[8 KiB, 12 KiB)` read-only, `vm_map`-grow
+/// `[64 KiB, 80 KiB)` and plant a marker at 65552, and advance the on-ramp brk so the image
+/// capture covers the growth. `eval_run(sp)`: read the marker (grown page) + the rodata constant
+/// (`Ro` page) + the scratch at 65560 (fresh-per-Run: must be 0), call the eligible leaf f2 with
+/// 3, dirty the scratch, stage the sum at 2048 and stream it to stdout, return the sum.
+/// Sum = 424242 + 777 + 0 + f(3)=16 = 425035.
+fn warm_coop_guest_text() -> String {
+    let (out_h, mem_h) = onramp_out_mem_handles();
+    let brk = temen_ir::POWERBOX_HEAP_BRK;
+    format!(
+        r#"memory 16
+func (i64) -> (i64) {{
+block 0 (vsp: i64) {{
+  vroaddr = i64.const 8200
+  vroval = i64.const 777
+  i64.store vroaddr vroval
+  vas = i32.const {mem_h}
+  vrooff = i64.const 8192
+  vrolen = i64.const 4096
+  vro = i32.const 1
+  vp = call.cap 5 2 (i64, i64, i32) -> (i64) vas (vrooff, vrolen, vro)
+  voff = i64.const 65536
+  vlen = i64.const 16384
+  vrw = i32.const 3
+  vm = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vrw)
+  vmaddr = i64.const 65552
+  vmark = i64.const 424242
+  i64.store vmaddr vmark
+  vbrkaddr = i64.const {brk}
+  vbrk = i64.const 81920
+  i64.store vbrkaddr vbrk
+  vr = i64.add vp vm
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vsp: i64) {{
+  vmaddr = i64.const 65552
+  vmark = i64.load vmaddr
+  vroaddr = i64.const 8200
+  vroval = i64.load vroaddr
+  vsaddr = i64.const 65560
+  vs = i64.load vsaddr
+  v3 = i64.const 3
+  vleaf = call 2 (v3)
+  vseven = i64.const 7
+  i64.store vsaddr vseven
+  vs1 = i64.add vmark vroval
+  vs2 = i64.add vs1 vs
+  vsum = i64.add vs2 vleaf
+  vsl = i64.const 2048
+  i64.store vsl vsum
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vsum
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vx: i64) {{
+  v3 = i64.const 3
+  vm = i64.mul vx v3
+  v7 = i64.const 7
+  va = i64.add vm v7
+  return va
+  }}
+}}
+export 0 func "warmup" 0
+export 1 func "eval_run" 1
+"#
+    )
+}
+
+/// #816 item 4 — the warm-coop differential: value/stdout parity with the interpreter warm path
+/// across repeated Runs, a non-vacuous leaf tier-up per Run, the paged coop tier armed (the guest
+/// both grows and protects), and fresh-per-Run isolation (the scratch an eval dirties never leaks
+/// into the next — in the grown page, exactly the state the restored page map governs).
+#[test]
+fn warm_coop_evals_a_page_managing_guest_with_leaf_tierup() {
+    let _g = ffi_guard();
+    let m = temen_text::parse_module(&warm_coop_guest_text()).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+
+    let live = temen_warm_open(bytes.as_ptr(), bytes.len());
+    assert!(
+        live > 0,
+        "warm open must succeed for the page-managing guest (status {})",
+        temen_status()
+    );
+
+    // Oracle: the interpreter warm path (marker + rodata + fresh scratch + leaf = 425035).
+    let v_interp = temen_warm_eval(core::ptr::null(), 0);
+    assert_eq!(temen_status(), STATUS_OK, "interp warm eval status");
+    assert_eq!(v_interp, 425035, "interp warm eval value");
+    // SAFETY: capture slots staged by the eval; this thread is the only accessor (FFI_LOCK).
+    let out_interp =
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
+    assert_eq!(out_interp, 425035i64.to_le_bytes(), "interp warm stdout");
+
+    // Arm the warm-coop tier (idempotent: the second call reuses the cached emit).
+    assert_eq!(
+        temen_warm_coop_open(0),
+        0,
+        "warm-coop open (status {})",
+        temen_status()
+    );
+    assert_eq!(temen_warm_coop_open(0), 0, "idempotent re-open");
+
+    // Two coop Runs: parity + tier-up + isolation (round 2 must see the same fresh state).
+    for round in 0..2 {
+        assert_eq!(
+            temen_warm_coop_prepare(core::ptr::null(), 0),
+            0,
+            "warm-coop prepare (round {round}, status {})",
+            temen_status()
+        );
+        assert_ne!(
+            temen_coop_paged(),
+            0,
+            "the grow+protect guest arms the PAGED coop tier (round {round})"
+        );
+        let (_d, tierups, invokes) = drive_coop_b2_session(&m);
+        assert_eq!(invokes, 0, "no §22 units in this guest");
+        assert_eq!(
+            temen_status(),
+            STATUS_OK,
+            "warm-coop run status (round {round})"
+        );
+        assert_eq!(
+            temen_coop_value(),
+            v_interp,
+            "warm-coop value parity with the interpreter warm path (round {round})"
+        );
+        assert!(
+            tierups >= 1,
+            "the eligible leaf must tier up (round {round})"
+        );
+        // SAFETY: capture slots staged by the DONE arm; sole accessor (FFI_LOCK).
+        let out =
+            unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
+        assert_eq!(out, out_interp, "warm-coop stdout parity (round {round})");
+    }
+
+    // The interpreter warm path still evaluates identically after the coop Runs — the session's
+    // image/prots are shared state the coop tier must not perturb.
+    let v_again = temen_warm_eval(core::ptr::null(), 0);
+    assert_eq!(temen_status(), STATUS_OK, "post-coop interp eval status");
+    assert_eq!(v_again, v_interp, "post-coop interp eval parity");
+
+    // `temen_warm_close` tears down the session AND the armed warm-coop run (its window borrows
+    // the session buffer); a subsequent prepare must refuse cleanly.
+    temen_warm_close();
+    assert_ne!(
+        temen_warm_coop_prepare(core::ptr::null(), 0),
+        0,
+        "prepare after close must refuse"
+    );
 }

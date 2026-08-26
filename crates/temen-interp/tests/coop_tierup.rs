@@ -950,3 +950,97 @@ fn coop_tierup_fork_twin_tiers_up_over_its_private_flat_window() {
         "one in-root-carve event (the original) + one private-window event (the twin), got {events:?}"
     );
 }
+
+// #816 item 4 — `SharedProgram::coop_run_over_grown`, the warm session's cooperative constructor:
+// a captured page-state map is re-established (`seed_pages`, no zeroing) over a caller-restored
+// backing, and the run's eligible leaf tiers up — so a page-managing warm image evaluates on the
+// coop drive instead of interpreter-only. The entry reads a marker in a "restored" `vm_map`-grown
+// page (bytes planted directly in the backing, as the warm memcpy does) and calls the leaf; the
+// negative arm proves the seeding is load-bearing: the same run without the seeded entries faults
+// on the grown-page load (fail-closed, the `run_over_grown` contract).
+#[test]
+fn coop_run_over_grown_restores_the_page_map_and_tiers_up() {
+    // func 0 (entry): load the marker at 65552 (inside the grown page [64 KiB, 68 KiB)), call the
+    // eligible leaf f1 with 3, return marker + leaf. func 1: the pure all-i64 leaf f(x) = x*3 + 7.
+    const SRC: &str = r#"
+memory 16
+func () -> (i64) {
+block 0 () {
+  vaddr = i64.const 65552
+  vm = i64.load vaddr
+  v3 = i64.const 3
+  vleaf = call 1 (v3)
+  vr = i64.add vm vleaf
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  v3 = i64.const 3
+  vm = i64.mul vx v3
+  v7 = i64.const 7
+  va = i64.add vm v7
+  return va
+  }
+}
+"#;
+    const MARKER: i64 = 424242;
+    let m = parse_module(SRC).unwrap();
+    temen_verify::verify_module(&m).expect("verify");
+    let prog = bytecode::SharedProgram::compile(&m).expect("in subset");
+    let eligible: std::sync::Arc<[bool]> = std::sync::Arc::from(vec![false, true]);
+    let run_with = |prots: &[(u64, u8)]| -> (Result<Vec<Value>, Trap>, u32) {
+        let back = std::sync::Arc::new(temen_interp::Region::new(1 << 17, 4096));
+        // "Restore the warm image": plant the marker bytes directly in the backing, exactly what
+        // the warm session's memcpy restore does before arming the run.
+        for (i, b) in MARKER.to_le_bytes().iter().enumerate() {
+            back.set_byte(65552 + i as u64, *b);
+        }
+        let mut run = prog
+            .coop_run_over_grown(
+                0,
+                &[],
+                FUEL,
+                Host::new(),
+                Some(TierUpConfig {
+                    eligible: std::sync::Arc::clone(&eligible),
+                    page_checked: false,
+                }),
+                back,
+                17,
+                prots,
+            )
+            .expect("entry in range");
+        let mut tierups = 0u32;
+        loop {
+            match run.run() {
+                bytecode::CoopEvent::Done(vals) => return (Ok(vals), tierups),
+                bytecode::CoopEvent::Trapped(t) => return (Err(t), tierups),
+                bytecode::CoopEvent::JitInvoke { .. } => panic!("unexpected JitInvoke"),
+                bytecode::CoopEvent::TierUp { func, argv, .. } => {
+                    tierups += 1;
+                    assert!(tierups < 10, "runaway tier-ups");
+                    assert_eq!(func, 1, "only the leaf is eligible");
+                    run.deliver_tierup(&[argv[0] * 3 + 7]);
+                }
+            }
+        }
+    };
+
+    // Seeded (one Rw entry for the grown page): the marker reads back and the leaf tiers up.
+    let (got, tierups) = run_with(&[(65536, 1)]);
+    assert_eq!(
+        got,
+        Ok(vec![Value::I64(MARKER + 16)]),
+        "the restored grown page must be readable and the leaf serviced"
+    );
+    assert_eq!(tierups, 1, "the eligible leaf tiers up exactly once");
+
+    // Unseeded: the same bytes are in the backing, but with no page-state entry the grown-page
+    // load faults — the restore is the page MAP, not just the bytes (fail-closed).
+    let (got, _) = run_with(&[]);
+    assert!(
+        got.is_err(),
+        "an unseeded run must fault on the grown-page load, got {got:?}"
+    );
+}
