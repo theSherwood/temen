@@ -251,23 +251,30 @@ pub mod durable_abi {
     /// Window byte offset of the `i32` **freeze state** word (`NORMAL`/`UNWINDING`/`REWINDING`/
     /// `ARMED`). A freeze is stop-the-world, so this single global word is the broadcast every poll
     /// reads (per-context thaw uses [`STATE_IN_REGION_OFF`] instead).
-    pub const STATE_OFF: u64 = 0;
-    /// Window byte offset of the `i64` shadow-stack pointer (itself a window byte offset).
-    pub const SHADOW_SP_OFF: u64 = 8;
+    ///
+    /// #1094: the whole durable control region is based one [`super::POWERBOX_NULL_GUARD`] up — the
+    /// unconditional NULL guard unmaps `[0, guard)`, so the state word, shadow-SP, arm countdowns and
+    /// shadow stack live in `[guard, DURABLE_RESERVE)` (below guest memory, which stays at
+    /// `DURABLE_RESERVE`). `[0, guard)` is the reserved NULL region.
+    pub const STATE_OFF: u64 = super::POWERBOX_NULL_GUARD;
+    /// Window byte offset of the `i64` shadow-stack pointer (itself a window byte offset). One guard up
+    /// (#1094 — see [`STATE_OFF`]).
+    pub const SHADOW_SP_OFF: u64 = super::POWERBOX_NULL_GUARD + 8;
     /// Byte length of the in-region shadow-SP word (before the per-context thaw state word).
     pub const SHADOW_SP_WORD_LEN: u64 = 8;
     /// Window byte offset of the `i64` **fiber-safepoint arm countdown** — safepoints
     /// (`cont.resume`/`suspend`) still to pass before an `ARMED` run promotes to `UNWINDING`. Inert
-    /// unless armed; lives in the reserve's `[16, 64)` gap, so an unarmed run is byte-identical.
-    pub const ARM_COUNTDOWN_OFF: u64 = 16;
+    /// unless armed; lives in the reserve's `[guard+16, guard+64)` gap, so an unarmed run is
+    /// byte-identical.
+    pub const ARM_COUNTDOWN_OFF: u64 = super::POWERBOX_NULL_GUARD + 16;
     /// Window byte offset of the `i64` **back-edge arm countdown** — loop back-edges still to pass
     /// before an `ARMED` run promotes to `UNWINDING` (the Phase-4 Slice A back-edge-poll trigger,
-    /// separate from [`ARM_COUNTDOWN_OFF`]). Reserve's `[24, 64)` gap.
-    pub const ARM_BACKEDGE_OFF: u64 = 24;
+    /// separate from [`ARM_COUNTDOWN_OFF`]). Reserve's `[guard+24, guard+64)` gap.
+    pub const ARM_BACKEDGE_OFF: u64 = super::POWERBOX_NULL_GUARD + 24;
     /// Window byte offset of the `i8` **freeze-on-quiesce** flag: non-zero arms the runtime to freeze
     /// when the run would otherwise block only on `svc.wait`-parked consumers (an idle server no
-    /// countdown can reach). Reserve's `[32, 64)` gap.
-    pub const ARM_QUIESCE_OFF: u64 = 32;
+    /// countdown can reach). Reserve's `[guard+32, guard+64)` gap.
+    pub const ARM_QUIESCE_OFF: u64 = super::POWERBOX_NULL_GUARD + 32;
     /// §12.8 concurrent-thaw: byte offset of a context's **per-context thaw state** word
     /// (`REWINDING`/`NORMAL`) within its region — just past the [`SHADOW_SP_WORD_LEN`]-byte in-region
     /// SP word. Each frozen vCPU rewinds against its own word, so thaw can run them as concurrent
@@ -277,11 +284,13 @@ pub mod durable_abi {
     /// the thaw state word at [`STATE_IN_REGION_OFF`], padded to 8 to keep frames 8-aligned.
     pub const REGION_HEADER_LEN: u64 = 16;
     /// Window byte offset where the shadow stack begins (grows upward, bounded by [`DURABLE_RESERVE`]).
-    pub const SHADOW_BASE: u64 = 64;
+    /// One guard up (#1094 — see [`STATE_OFF`]); the shadow stack occupies `[guard+64, DURABLE_RESERVE)`.
+    pub const SHADOW_BASE: u64 = super::POWERBOX_NULL_GUARD + 64;
     /// Per-context shadow-region stride: context `i` owns `[SHADOW_BASE + i*SHADOW_STRIDE, +stride)`.
     pub const SHADOW_STRIDE: u64 = 1 << 12;
-    /// Size of the reserved low region (one 64 KiB wasm page): `[0, DURABLE_RESERVE)` holds the state
-    /// word, shadow-SP, and shadow stack; the guest's memory is `[DURABLE_RESERVE, window)`.
+    /// Size of the reserved low region (one 64 KiB wasm page): `[0, DURABLE_RESERVE)` holds the NULL
+    /// guard `[0, POWERBOX_NULL_GUARD)` (#1094) then the state word, shadow-SP, and shadow stack in
+    /// `[POWERBOX_NULL_GUARD, DURABLE_RESERVE)`; the guest's memory is `[DURABLE_RESERVE, window)`.
     pub const DURABLE_RESERVE: u64 = 1 << 16;
 
     /// Freeze/thaw **state-word values** ([`STATE_OFF`] / [`STATE_IN_REGION_OFF`]).
