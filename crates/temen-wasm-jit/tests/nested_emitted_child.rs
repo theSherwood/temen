@@ -245,15 +245,19 @@ fn wire_nested_imports(linker: &mut Linker<HostState>, memory: Memory) {
         .unwrap();
 }
 
-#[test]
-fn nested_child_runs_on_the_emitted_tier() {
-    let parent = parse(PARENT);
-    let child = parse(CHILD);
-    let want = oracle_child(&child);
-    assert_eq!(want, 84, "child oracle: (42 stored, loaded) * 2");
-
-    let parent_wasm =
-        compile_module_nested(&parent, false).expect("parent §14 entry emits (nested)");
+/// Build `parent_src` + `child_src` (both `compile_module_nested`), run the parent's `f0(params)` on
+/// wasmi with the child pre-emitted as its own instance over the carve, and return
+/// `(parent_result, [i64@addr for addr in reads], saw_module)`. Asserts the instantiate bounce fired.
+/// Both instances share the one linear memory, so the carve is a real sub-window of the parent window.
+fn run_parent_over_child(
+    parent_src: &str,
+    child_src: &str,
+    params: &[Val],
+    reads: &[usize],
+) -> (i64, Vec<i64>, bool) {
+    let parent = parse(parent_src);
+    let child = parse(child_src);
+    let parent_wasm = compile_module_nested(&parent, false).expect("parent emits (nested)");
     let child_wasm = compile_module_nested(&child, false).expect("child module emits (nested)");
 
     let engine = Engine::default();
@@ -281,9 +285,8 @@ fn nested_child_runs_on_the_emitted_tier() {
     let mut linker: Linker<HostState> = Linker::new(&engine);
     wire_nested_imports(&mut linker, memory);
 
-    // Pre-build the child as its own wasmi instance over the shared memory, and stash its emitted entry
-    // so `env.instantiate` can run it. Both instances share the one linear memory ⇒ the carve is a real
-    // sub-window of the parent's window.
+    // Pre-build the child as its own wasmi instance over the shared memory; stash its emitted entry so
+    // the `env.instantiate`/`env.instantiate_module` servicer can run it over the carve.
     let child_instance = linker
         .instantiate(&mut store, &child_module)
         .unwrap()
@@ -303,54 +306,110 @@ fn nested_child_runs_on_the_emitted_tier() {
         .get_func(&store, "f0")
         .expect("parent f0 export");
 
-    let params = [Val::I32(WIN_BASE), Val::I32(ENV_PTR), Val::I64(7)]; // arg0 = instantiator handle
     let mut results = [Val::I64(0)];
-    f0.call(&mut store, &params, &mut results)
+    f0.call(&mut store, params, &mut results)
         .expect("parent f0 runs");
 
     assert!(
         store.data().saw_emit,
-        "entry never bounced to env.instantiate (silent fallback)"
+        "parent never bounced to the instantiate host import (silent fallback)"
+    );
+    let out = reads
+        .iter()
+        .map(|&a| {
+            let mut b = [0u8; 8];
+            memory.read(&store, a, &mut b).unwrap();
+            i64::from_le_bytes(b)
+        })
+        .collect();
+    (
+        results[0].i64().expect("parent returns i64"),
+        out,
+        store.data().saw_module,
+    )
+}
+
+#[test]
+fn nested_child_runs_on_the_emitted_tier() {
+    let want = oracle_child(&parse(CHILD));
+    assert_eq!(want, 84, "child oracle: (42 stored, loaded) * 2");
+
+    // op-0 transport: `f0(win, env, instantiator_handle)`.
+    let params = [Val::I32(WIN_BASE), Val::I32(ENV_PTR), Val::I64(7)];
+    let (r, reads, _) = run_parent_over_child(
+        PARENT,
+        CHILD,
+        &params,
+        &[(WIN_BASE as i64 + CARVE_OFF) as usize],
     );
     assert_eq!(
-        results[0].i64(),
-        Some(want),
+        r, want,
         "emitted §14 child (instantiate→join) != interpreter child result"
     );
-
-    // The emitted child ran over its carve: its sentinel store landed at `WIN_BASE + CARVE_OFF`.
-    let mut sentinel = [0u8; 8];
-    memory
-        .read(
-            &store,
-            (WIN_BASE as i64 + CARVE_OFF) as usize,
-            &mut sentinel,
-        )
-        .unwrap();
     assert_eq!(
-        i64::from_le_bytes(sentinel),
-        42,
+        reads[0], 42,
         "the emitted child wrote its sentinel into its carve (proof it ran over `win+off`)"
     );
 }
 
 #[test]
 fn op13_separate_module_parent_emits_and_spawns_child() {
-    let parent = parse(PARENT_OP13);
-    let child = parse(CHILD);
-    let want = oracle_child(&child);
+    let want = oracle_child(&parse(CHILD));
     assert_eq!(want, 84, "child oracle: (42 stored, loaded) * 2");
 
     // The point of this slice: the op-13 parent is itself **emittable** now (its separate-module spawn
     // lowers to the conditional `env.instantiate_module` import). Before, op 13 was out-of-subset.
-    let parent_wasm =
-        compile_module_nested(&parent, false).expect("op-13 parent emits (nested, this slice)");
-    let child_wasm = compile_module_nested(&child, false).expect("child module emits (nested)");
+    // `f0(win, env, inst_handle, module_handle)` — the servicer resolves the module to the pre-built child.
+    let params = [
+        Val::I32(WIN_BASE),
+        Val::I32(ENV_PTR),
+        Val::I32(7),
+        Val::I32(99),
+    ];
+    let (r, reads, saw_module) = run_parent_over_child(
+        PARENT_OP13,
+        CHILD,
+        &params,
+        &[(WIN_BASE as i64 + CARVE_OFF) as usize],
+    );
+    assert!(
+        saw_module,
+        "op-13 parent never bounced to env.instantiate_module (op 13 not lowered?)"
+    );
+    assert_eq!(
+        r, want,
+        "emitted op-13 parent (instantiate_module→join) != interpreter child result"
+    );
+    assert_eq!(
+        reads[0], 42,
+        "the emitted op-13 child wrote its sentinel into its carve"
+    );
+}
+
+/// A child that stores **out of its `memory 10` window** — at byte 1040 (> 1024). The wasm tier's
+/// confinement (§4, D38) is the trap-confinement check `if eff > mapped - width { trap(MemoryFault) }`
+/// with `mapped = 1 << size_log2 = 1024`, so the store `eff = 1040 > 1016` **faults** before touching
+/// memory. Run over the carve at `win + off`, the fault means the child cannot reach `carve + 1040`
+/// (past its 1-KiB carve, into the parent's window) — the confinement hinge for a nested child.
+const CHILD_ESCAPE: &str = r#"memory 10
+func () -> (i64) {
+block 0 () {
+  vaddr = i64.const 1040
+  vval = i64.const 77
+  i64.store vaddr vval
+  vr = i64.const 0
+  return vr
+  }
+}
+"#;
+
+#[test]
+fn emitted_child_out_of_window_access_faults_and_stays_confined() {
+    let child = parse(CHILD_ESCAPE);
+    let child_wasm = compile_module_nested(&child, false).expect("escape child emits (nested)");
 
     let engine = Engine::default();
-    let parent_module = WModule::new(&engine, &parent_wasm).expect("op-13 parent wasm validates");
     let child_module = WModule::new(&engine, &child_wasm).expect("child wasm validates");
-
     let mut store: Store<HostState> = Store::new(
         &engine,
         HostState {
@@ -362,66 +421,47 @@ fn op13_separate_module_parent_emits_and_spawns_child() {
     );
     let memory = Memory::new(&mut store, MemoryType::new(2, None)).unwrap();
     memory
-        .write(&mut store, ENV_PTR as usize, &i64::MAX.to_le_bytes())
-        .unwrap();
-    memory
         .write(&mut store, CHILD_ENV_PTR as usize, &i64::MAX.to_le_bytes())
         .unwrap();
-
     let mut linker: Linker<HostState> = Linker::new(&engine);
     wire_nested_imports(&mut linker, memory);
-
     let child_instance = linker
         .instantiate(&mut store, &child_module)
         .unwrap()
         .start(&mut store)
         .unwrap();
-    let child_entry = child_instance
+    let f0 = child_instance
         .get_func(&store, "f0")
         .expect("child emitted f0 export");
-    store.data_mut().child_entry = Some(child_entry);
 
-    let parent_instance = linker
-        .instantiate(&mut store, &parent_module)
-        .unwrap()
-        .start(&mut store)
-        .unwrap();
-    let f0 = parent_instance
-        .get_func(&store, "f0")
-        .expect("parent f0 export");
-
-    // f0(win, env, inst_handle, module_handle) — the two extra params are the parent's (v0, v1).
-    let params = [
-        Val::I32(WIN_BASE),
-        Val::I32(ENV_PTR),
-        Val::I32(7),  // inst handle
-        Val::I32(99), // module handle (the servicer resolves it to the pre-built child)
-    ];
-    let mut results = [Val::I64(0)];
-    f0.call(&mut store, &params, &mut results)
-        .expect("op-13 parent f0 runs");
-
+    // Run the child over the carve at `WIN_BASE + CARVE_OFF`. Its out-of-window store must fault
+    // (trap-confinement), not silently land past the carve.
+    let carve = WIN_BASE as i64 + CARVE_OFF;
+    let mut r = [Val::I64(0)];
+    let call = f0.call(
+        &mut store,
+        &[Val::I32(carve as i32), Val::I32(CHILD_ENV_PTR)],
+        &mut r,
+    );
     assert!(
-        store.data().saw_module,
-        "op-13 parent never bounced to env.instantiate_module (op 13 not lowered?)"
-    );
-    assert_eq!(
-        results[0].i64(),
-        Some(want),
-        "emitted op-13 parent (instantiate_module→join) != interpreter child result"
+        call.is_err(),
+        "confinement (§4): an out-of-window child access must fault, not proceed"
     );
 
-    let mut sentinel = [0u8; 8];
-    memory
-        .read(
-            &store,
-            (WIN_BASE as i64 + CARVE_OFF) as usize,
-            &mut sentinel,
-        )
-        .unwrap();
+    // Nothing was written outside (or inside) the carve: the faulting store never reached memory.
+    let read = |addr: i64| -> i64 {
+        let mut b = [0u8; 8];
+        memory.read(&store, addr as usize, &mut b).unwrap();
+        i64::from_le_bytes(b)
+    };
     assert_eq!(
-        i64::from_le_bytes(sentinel),
-        42,
-        "the emitted op-13 child wrote its sentinel into its carve"
+        read(carve + 1040),
+        0,
+        "confinement: the child wrote nothing past its carve (into the parent window)"
+    );
+    assert_eq!(
+        read(carve + 16),
+        0,
+        "the faulting store never executed (no masked write either)"
     );
 }
