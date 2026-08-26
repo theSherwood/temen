@@ -415,7 +415,7 @@ block 0 (v0: i64) {
   try {
     const guest = await fetchBytes('/corpus/jit_rt.temenc');
     const unit = await fetchBytes('/corpus/jit_rt_unit.temenc');
-    const opt = { jitRuntime: true, jitBlobs: [{ off: 0x2000, bytes: unit }] };
+    const opt = { jitRuntime: true, jitBlobs: [{ off: 0x6000, bytes: unit }] };
     const t0 = performance.now();
     const interp = await run(guest, opt);
     const codegen = await run(guest, { ...opt, jitRuntimeCodegen: true });
@@ -440,7 +440,7 @@ block 0 (v0: i64) {
     const guest = await fetchBytes('/corpus/jit_b2.temenc');
     const leaf = await fetchBytes('/corpus/jit_rt_unit.temenc');
     const disp = await fetchBytes('/corpus/jit_b2_unit.temenc');
-    const opt = { jitRuntime: true, jitBlobs: [{ off: 0x2000, bytes: leaf }, { off: 0x3000, bytes: disp }] };
+    const opt = { jitRuntime: true, jitBlobs: [{ off: 0x6000, bytes: leaf }, { off: 0x7000, bytes: disp }] };
     const t0 = performance.now();
     const interp = await run(guest, opt);
     const codegen = await run(guest, { ...opt, jitRuntimeCodegen: true, jitB2: true });
