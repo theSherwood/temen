@@ -27,11 +27,9 @@ entry:
 /// Translate the kernel, returning the module and the data-stack base (`$sp`) temen-llvm prepends to
 /// every on-ramp function — the leading argument `tick` expects.
 fn translate() -> (temen_ir::Module, i64) {
-    let t = temen_llvm::translate_ll_str_with_options(
-        KERNEL,
-        temen_llvm::TranslateOptions::default(),
-    )
-    .expect("translate kernel");
+    let t =
+        temen_llvm::translate_ll_str_with_options(KERNEL, temen_llvm::TranslateOptions::default())
+            .expect("translate kernel");
     temen_verify::verify_module(&t.module).expect("verify kernel");
     (t.module, t.entry_sp as i64)
 }

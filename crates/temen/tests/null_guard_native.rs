@@ -242,5 +242,8 @@ fn carve_below_guard_refused_on_native_jit() {
     let (iv, jv) = run(0);
     assert!(iv < 0 && jv < 0, "carve at 0 refused: {iv}/{jv}");
     let (iv, jv) = run(64 << 10);
-    assert!(iv >= 0 && jv >= 0, "carve above the guard spawns: {iv}/{jv}");
+    assert!(
+        iv >= 0 && jv >= 0,
+        "carve above the guard spawns: {iv}/{jv}"
+    );
 }

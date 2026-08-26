@@ -320,7 +320,7 @@ fn dap_set_variable_and_write_memory_round_trip() {
         "writeMemory",
         Json::obj(vec![
             ("memoryReference", Json::s("0x4008")), // cell 8 above the #1094 NULL guard (16392)
-            ("data", Json::s("KgAAAAAAAAA=")), // 42u64 little-endian
+            ("data", Json::s("KgAAAAAAAAA=")),      // 42u64 little-endian
         ]),
     ));
     let resp = response(&out);
