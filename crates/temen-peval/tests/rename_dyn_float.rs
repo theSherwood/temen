@@ -11,7 +11,7 @@ use temen_peval::{specialize_with_config, SpecArg, SpecConfig};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
-const AT: u64 = 128;
+const AT: u64 = 16512; // above the #1094 NULL guard
 
 fn cfg() -> SpecConfig {
     SpecConfig {
@@ -55,7 +55,7 @@ fn dynamic_f64_round_trips_through_a_rename_cell() {
 memory 16
 func (f64) -> (f64) {
 block 0 (v0: f64) {
-  va = i64.const 128
+  va = i64.const 16512
   f64.store va v0
   vr = f64.load va
   return vr
@@ -78,7 +78,7 @@ fn f64_store_then_i64_load_reinterprets_the_bits() {
 memory 16
 func (f64) -> (i64) {
 block 0 (v0: f64) {
-  va = i64.const 128
+  va = i64.const 16512
   f64.store va v0
   vr = i64.load va
   return vr
@@ -101,7 +101,7 @@ fn i64_store_then_f64_load_reinterprets_the_bits() {
 memory 16
 func (i64) -> (f64) {
 block 0 (v0: i64) {
-  va = i64.const 128
+  va = i64.const 16512
   i64.store va v0
   vr = f64.load va
   return vr

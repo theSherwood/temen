@@ -31,7 +31,8 @@ use temen_peval::{specialize_with_config, SpecArg, SpecConfig};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
-// savedpc @0 (rename cell, 4 bytes), counter @8 (plain), out @16 (plain). Opcode pc values:
+// Cells one guard up (above the #1094 NULL guard): savedpc @16384 (rename cell, 4 bytes),
+// counter @16392 (plain), out @16400 (plain). Opcode pc values:
 //   0 LOADIN (counter=input; pc=1)   1 LOOPCHK (counter==0 ? pc=5 : pc=2)   2 EMIT (out+=counter; pc=3)
 //   3 GUARD  (counter==5 ? cold : ok; pc=4)   4 DEC (counter-=1; pc=1)   5.. HALT (return out)
 // interp is func 1; block 10 is the GUARD cold branch (the deopt target). `run` (func 0) and `resume`
@@ -40,7 +41,7 @@ const VM: &str = r#"
 memory 17
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  vsp = i64.const 0
+  vsp = i64.const 16384
   vpc0 = i32.const 0
   i32.store vsp vpc0
   return_call 1 (v0)
@@ -51,80 +52,80 @@ block 0 (v0: i64) {
   br 1(v0)
 }
 block 1 (vin: i64) {
-  vsp = i64.const 0
+  vsp = i64.const 16384
   vpc = i32.load vsp
   br_table vpc [ 2(vin), 3(vin), 4(vin), 5(vin), 6(vin) ] 7(vin)
 }
 block 2 (vin: i64) {
-  v8 = i64.const 8
+  v8 = i64.const 16392
   i64.store v8 vin
-  vsp = i64.const 0
+  vsp = i64.const 16384
   v1 = i32.const 1
   i32.store vsp v1
   br 1(vin)
 }
 block 3 (vin: i64) {
-  v8 = i64.const 8
+  v8 = i64.const 16392
   vc = i64.load v8
   vz = i64.const 0
   visz = i64.eq vc vz
   br_if visz 8(vin) 9(vin)
 }
 block 4 (vin: i64) {
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vout = i64.load v16
-  v8 = i64.const 8
+  v8 = i64.const 16392
   vc = i64.load v8
   vo2 = i64.add vout vc
   i64.store v16 vo2
-  vsp = i64.const 0
+  vsp = i64.const 16384
   v3 = i32.const 3
   i32.store vsp v3
   br 1(vin)
 }
 block 5 (vin: i64) {
-  v8 = i64.const 8
+  v8 = i64.const 16392
   vc = i64.load v8
   v5 = i64.const 5
   visg = i64.eq vc v5
   br_if visg 10(vin) 11(vin)
 }
 block 6 (vin: i64) {
-  v8 = i64.const 8
+  v8 = i64.const 16392
   vc = i64.load v8
   v1 = i64.const 1
   vc2 = i64.sub vc v1
   i64.store v8 vc2
-  vsp = i64.const 0
+  vsp = i64.const 16384
   v1p = i32.const 1
   i32.store vsp v1p
   br 1(vin)
 }
 block 7 (vin: i64) {
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vr = i64.load v16
   return vr
 }
 block 8 (vin: i64) {
-  vsp = i64.const 0
+  vsp = i64.const 16384
   v5 = i32.const 5
   i32.store vsp v5
   br 1(vin)
 }
 block 9 (vin: i64) {
-  vsp = i64.const 0
+  vsp = i64.const 16384
   v2 = i32.const 2
   i32.store vsp v2
   br 1(vin)
 }
 block 10 (vin: i64) {
-  vsp = i64.const 0
+  vsp = i64.const 16384
   v4 = i32.const 4
   i32.store vsp v4
   br 1(vin)
 }
 block 11 (vin: i64) {
-  vsp = i64.const 0
+  vsp = i64.const 16384
   v4 = i32.const 4
   i32.store vsp v4
   br 1(vin)
@@ -172,7 +173,7 @@ fn deopt_resumes_the_loop_from_the_saved_pc() {
     }
 
     let cfg = SpecConfig {
-        rename: Some((0, 4)),
+        rename: Some((16384, 16388)),
         rename_is_private: true,
         deopt_targets: vec![(1, 10)], // interp's GUARD cold branch
         deopt_handler: Some(2),       // resume: (i64) -> i64, shares run's signature

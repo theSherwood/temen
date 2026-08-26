@@ -50,7 +50,7 @@ fn n_stores(m: &Module) -> usize {
 }
 
 const SEED: i64 = 0x1234_5678;
-const AT: u64 = 128;
+const AT: u64 = 16512; // above the #1094 NULL guard
 
 #[test]
 fn untouched_seeded_cell_reads_the_image_not_zero() {
@@ -60,7 +60,7 @@ fn untouched_seeded_cell_reads_the_image_not_zero() {
 memory 16
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  va = i64.const 128
+  va = i64.const 16512
   vs = i64.load va
   vr = i64.add vs v0
   return vr
@@ -126,7 +126,7 @@ fn a_write_shadows_the_seed() {
 memory 16
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  va = i64.const 128
+  va = i64.const 16512
   vw = i64.const 999
   i64.store va vw
   vs = i64.load va
@@ -175,7 +175,7 @@ fn write_back_makes_post_call_memory_correct() {
 memory 16
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  va = i64.const 128
+  va = i64.const 16512
   i64.store va v0
   vc = i64.const 7
   return vc
@@ -243,15 +243,15 @@ block 0 (v0: i64) {
 
 #[test]
 fn two_disjoint_seeded_regions_fold_and_write_back() {
-    // Disjoint regions A@128 and B@256 (as a lua_State / stack / CallInfo would be), both seeded and
+    // Disjoint regions A@16512 and B@16640 (as a lua_State / stack / CallInfo would be), both seeded and
     // both mutated: f(x) = { a=*A; b=*B; *A=b; *B=a; return a+b+x } — a swap. Reads fold to the two
     // seeds, and the swapped values must be written back to their windows.
     let src = "\
 memory 16
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  va = i64.const 128
-  vb = i64.const 256
+  va = i64.const 16512
+  vb = i64.const 16640
   a = i64.load va
   b = i64.load vb
   i64.store va b
@@ -265,23 +265,23 @@ block 0 (v0: i64) {
     let (a0, b0) = (100i64, 200i64);
     let mut m = parse_module(src).expect("parse");
     m.data.push(Data {
-        offset: 128,
+        offset: 16512, // above the #1094 NULL guard
         readonly: false,
         bytes: a0.to_le_bytes().to_vec(),
     });
     m.data.push(Data {
-        offset: 256,
+        offset: 16640, // above the #1094 NULL guard
         readonly: false,
         bytes: b0.to_le_bytes().to_vec(),
     });
     verify_module(&m).expect("source verifies");
 
     let cfg = SpecConfig {
-        rename: Some((128, 136)),
-        rename_extra: vec![(256, 264)],
+        rename: Some((16512, 16520)),
+        rename_extra: vec![(16640, 16648)],
         rename_is_private: true,
         rename_seed_from_image: true,
-        const_regions: vec![(128, 136), (256, 264)],
+        const_regions: vec![(16512, 16520), (16640, 16648)],
         ..SpecConfig::default()
     };
     let residual = specialize_with_config(&m, 0, &[SpecArg::Dynamic], &cfg).expect("specializes");
@@ -289,7 +289,7 @@ block 0 (v0: i64) {
     assert_eq!(n_loads(&residual), 0, "both seeded reads fold");
     assert_eq!(n_stores(&residual), 2, "both swapped cells write back");
 
-    let init = vec![0u8; 264];
+    let init = vec![0u8; 16648];
     for x in [0i64, 7, -3] {
         let mut f1 = 1_000_000u64;
         let (r_ref, w_ref) = temen_interp::run_capture(&m, 0, &[Value::I64(x)], &mut f1, &init);
@@ -299,7 +299,7 @@ block 0 (v0: i64) {
         assert_eq!(r_res, r_ref, "result diverged at x={x}");
         assert_eq!(w_res, w_ref, "post-call window diverged at x={x}");
         assert_eq!(r_res, Ok(vec![Value::I64(a0 + b0 + x)]));
-        assert_eq!(&w_res[128..136], &b0.to_le_bytes(), "A holds the swapped B");
-        assert_eq!(&w_res[256..264], &a0.to_le_bytes(), "B holds the swapped A");
+        assert_eq!(&w_res[16512..16520], &b0.to_le_bytes(), "A holds the swapped B");
+        assert_eq!(&w_res[16640..16648], &a0.to_le_bytes(), "B holds the swapped A");
     }
 }
