@@ -197,8 +197,8 @@ The MVP target is the subset the chibicc demos already exercise. Mapping sketch 
   (the access width drives narrow handling, §3b). `align`/`volatile`: alignment is a hint
   (§3b); `volatile` keeps the access in memory (no promotion — moot post-`mem2reg`).
 - `alloca` → bump the data-SP (a data-stack slot), §3d / HANDOFF §3.
-- `call` → `call` (direct) / `call_indirect` (function pointer, §3c funcref-index dispatch).
-  `musttail`/`tail` → `return_call`/`return_call_indirect` (D6, both backends do true tail
+- `call` → `call` (direct) / `call.dyn` (function pointer, §3c funcref-index dispatch).
+  `musttail`/`tail` → `return_call`/`return_call.dyn` (D6, both backends do true tail
   calls — cf. `temen-wasm` `tests/tailcall.rs`).
 - `br`/`switch`/`ret`/`unreachable` → `br`/`br_if`/`br_table`/`return`/`trap` terminators.
   `switch` → `br_table` (dense) or a compare chain (sparse), mirroring chibicc `gen_switch`.
@@ -379,10 +379,10 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
 **Slice G (DONE) — indirect calls (funcref §3c).**
 - [x] Taking a function's address → its funcref index (`ref.func`, the function-table index)
       widened to the `i64` pointer rep. An indirect `call` (callee is a function-pointer value)
-      truncates it back to the `i32` funcref and lowers to `call_indirect <sig>` — the runtime masks
+      truncates it back to the `i32` funcref and lowers to `call.dyn <sig>` — the runtime masks
       the index and checks the type-id (§3c). The signature is the callee's function type plus the
       prepended data-SP, so it matches the callee's IR signature. Tested on a `noinline` pointer-
-      returning `pick` whose result `run` calls indirectly (a genuine `-O2` `call_indirect`).
+      returning `pick` whose result `run` calls indirectly (a genuine `-O2` `call.dyn`).
 
 **Slice H (DONE) — aggregates (struct memory).**
 - [x] Struct layout (x86-64-SysV: natural field alignment + tail padding to the struct's alignment;
@@ -1267,10 +1267,10 @@ byte-for-byte the same, only the call instruction differs:
   for an indirect callee too.
 - **`indirect_sig`** stopped rejecting `is_var_arg`: a `(...)` callee's Temen signature is
   `(sp, fixed-params…)` — `param_types` are exactly the fixed params — which is the *same* shape a
-  defined `(...)` function lowers to (§varargs), so the `call_indirect` §3c type-id check matches.
+  defined `(...)` function lowers to (§varargs), so the `call.dyn` §3c type-id check matches.
 - Found as the Postgres `manifest_process_version` gap. Test `varargs_indirect_call`: a `(...)` helper
   reached through a `volatile`-indexed function pointer (so clang can't devirtualize) — byte-identical
-  to native on interp + bytecode + JIT, and clang emits it `tail`, exercising `return_call_indirect`
+  to native on interp + bytecode + JIT, and clang emits it `tail`, exercising `return_call.dyn`
   too.
 
 Two **i128 op lowerings** landed in the same slice (the next two gaps, both the *same* root cause).
@@ -1775,7 +1775,7 @@ Tests (`translate.rs`): `vm_memory_map_and_page_size` (map a page at 256 MiB + p
 on the JIT powerbox), `vm_fibers_generator`, `vm_atomics_single_threaded` (both backends),
 `vm_futex_wait_notify`, `vm_threads_atomic_counter` (4×500 = 2000 on the M:N executor),
 `vm_gc_roots_smoke`, and `vm_cap_reflection` (8 granted caps) — interpreter-only where the JIT bails
-`Unsupported` on fibers/`cap.self` (mirrors the chibicc test split).
+`Unsupported` on fibers/`self.*` (mirrors the chibicc test split).
 - **Stash layout locked to 8 handles (done — follow-up).** The handle stash is now the fixed region
   `[0, HANDLE_REGION_END) = [0, 32)` — one `i32` slot per `VM_CAP_*` index — with the allocator's
   heap state, the `putc` scratch, and the `printf` format buffer all relocated **above** it
@@ -1810,12 +1810,12 @@ reaches it from LLVM bitcode: `__vm_jit_compile`/`invoke2`/`release`/`install`/`
 `compile_linked` → `CallImport` on the stashed `Jit` handle (slot 7; imports `vm_jit_*` → `Jit` ops
 0/1/2/3/4/5). A JIT-using program is granted the **full 8-handle powerbox** (`Jit` is the last
 `VM_CAP_*` index; `synth_start`'s contiguous prefix now reaches 8, so `run_powerbox` grants `Jit` with
-its validator + call_indirect table). The host verifies + Cranelift-compiles the submitted blob into
+its validator + call.dyn table). The host verifies + Cranelift-compiles the submitted blob into
 *this* domain — same window, same powerbox; verification, not isolation, is the boundary (§2a).
 - Tests: `vm_jit_builtins_lower_and_grant_full_powerbox` (structural — every builtin → its `Jit`
   `CallImport`, 8-handle entry); `vm_jit_guest_self_jit_demo` runs the real `demos/jit/jit_demo.c`
   through Lane C on the JIT powerbox — the guest emits IR byte-by-byte, `compile`s + `invoke2`s a raw
-  unit **and** an `install`ed unit reached via a C function pointer (`call_indirect`), agreeing with
+  unit **and** an `install`ed unit reached via a C function pointer (`call.dyn`), agreeing with
   its own bytecode interpreter on a 49-input grid. The validator's memory-match is exact, so the test
   probes temen-llvm's parent `size_log2` and patches the demo's blob descriptor to it (no magic
   constant). 88 translate tests green, fmt + clippy clean.
@@ -1839,7 +1839,7 @@ translator change beyond what the C corpus proved.
 **Slice AG (DONE) — C++ first light (the breadth proof begins).** A freestanding C++ TU compiled
 `clang++ -O2 -fno-exceptions -fno-rtti` runs **byte-identical to native `clang++`** through the on-ramp
 — the first non-C language. Mostly **free** (the C corpus already covers it): classes, inheritance,
-**virtual dispatch** (vtables are function-pointer global initializers, slice K → loaded + `call_indirect`,
+**virtual dispatch** (vtables are function-pointer global initializers, slice K → loaded + `call.dyn`,
 slice G), the `this` pointer, mangled names, **templates** (monomorphize to ordinary functions), and
 heap **`new`/`delete`** (the program defines `operator new`/`delete` over the guest `malloc`/`free`),
 including **virtual destructors** (the deleting-dtor chain through the vtable). The one real gap closed:
@@ -1897,7 +1897,7 @@ field access, and signed `/`/`%`. The one real gap closed:
   now trap, taking the non-panic path to match native). 96 translate tests green, fmt + clippy clean.
 
 **Slice AJ (DONE) — Rust trait objects, slices, `unwrap`.** More idiomatic Rust, byte-identical to
-native: **`&dyn Trait` dynamic dispatch** (a vtable load + `call_indirect` per call — the Rust analog
+native: **`&dyn Trait` dynamic dispatch** (a vtable load + `call.dyn` per call — the Rust analog
 of the C++ vtable path, slice AG: fat pointers + per-type vtable globals + funcref dispatch, all
 already covered), **`&[T]` slice arguments** ({ptr,len} across an `#[inline(never)]` call + a
 sub-slice), and **`Option::unwrap`** (its panic path traps via slice AI's recognizer). The one gap:
@@ -2040,10 +2040,10 @@ and the **five concurrency demos** — with **no translator change** (the `__vm_
 surface from slices AC–AF already lowers them):
 - **`calc` / `rational`** (`demos/calc.c`, `demos/rational.c`) — added to the native differential
   (`check_demo_vs_native`, byte-identical to `cc`). `calc` is a recursive-descent calculator over a
-  **global function-pointer dispatch table** (relocations + `call_indirect`, slices K/G) with
+  **global function-pointer dispatch table** (relocations + `call.dyn`, slices K/G) with
   recursion; `rational` hammers the **by-value-aggregate sret ABI** (D39/slice J) — every op passes
   *and* returns a `struct Rat` by value, including an **indirect struct-returning call** through a
-  dispatch table (sret + funcref relocation + struct-valued `call_indirect`, all at once).
+  dispatch table (sret + funcref relocation + struct-valued `call.dyn`, all at once).
 - **The concurrency demos** (`work_stealing`, `mn_sched`, `steal_fibers`, `malloc_threads`,
   `async_work_stealing`) — these `#include <pthread.h>`, which is **chibicc's bundled guest libc** (a
   1:1 threading layer over `thread.spawn`/`join` + the futex + atomics). clang compiles them with the

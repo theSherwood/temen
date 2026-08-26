@@ -5,7 +5,7 @@ on the tree-walk oracle** (PRs 1–5 + track 2; §5/§8 below are the as-built r
 transport fork rides is settled as DESIGN.md §12a (was CALLS.md); this file keeps the fork
 *semantics* — reply-injection (§3), the child handle model (§4), the clone spec (§6), invariants
 (§7), and the fork+wait contract (§8.6) — plus the build log the code comments cite. R8 closure
-(durable `call_indirect` to may-suspend targets) was the prereq and is done.
+(durable `call.dyn` to may-suspend targets) was the prereq and is done.
 
 **Backend parity: fork runs on 2 of 4 backends** (the tree-walk oracle **and** the bytecode
 interpreter). `OPS_PARITY.md` shows `clone_caller`/`reap` as ✅ on tree-walk + bytecode, 🚧 on

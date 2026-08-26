@@ -14,7 +14,7 @@ The system is four ideas wearing many names:
 2. **Two call paths.** Every call is either *capability-addressed* (through the
    host-owned handle table, use-site checked: `call.import`, dispatch-form `call.cap`,
    `Jit.invoke`) or *funcref-addressed* (through the domain's function table:
-   `call_indirect`, installed units). Invoke/install are not new concepts — they are
+   `call.dyn`, installed units). Invoke/install are not new concepts — they are
    compiled code entering these two existing paths.
 3. **Two binding times.** Authority is connected either at *spawn/wiring time* (the
    embedder registry, a parent binding a child's manifest, accepting an offer) or at
@@ -117,7 +117,7 @@ The system is four ideas wearing many names:
   sig + the legacy handle operand only it still carries. Binds by name at whichever
   binding act comes first — instantiation (executes as ordinary slot dispatch, operand
   ignored) or the linker (`resolve_imports_with` rewrites it: Cap → `call.cap` on the
-  live operand, Slot → `call_indirect`, Func → direct call).
+  live operand, Slot → `call.dyn`, Func → direct call).
 - **`import.attach`** — fill (or refill) a `rebindable` slot with a capability the
   domain already holds, type-checked fail-closed. The "reflect, decide, attach once,
   then ordinary calls" pattern.
@@ -217,7 +217,7 @@ The system is four ideas wearing many names:
   argument: a nested, signature-checked run over the caller's own world. No shared-table
   entry; the mask never moves.
 - **install** (Model B2) — put a unit into the pre-sized shared function table as a
-  **funcref**; existing code then reaches it via ordinary `call_indirect` at native
+  **funcref**; existing code then reaches it via ordinary `call.dyn` at native
   speed. The funcref is plain guest data.
 - **funcref** — an `i32` equal to a function's index in the domain's table; the currency
   of indirect calls. Type-checked at dispatch via the interned signature id.

@@ -52,7 +52,7 @@ and path 4 — the rewrite — has costs that have grown teeth:
 The fix is not new machinery. The design below is built almost entirely from
 pieces already in the tree: the powerbox prefix ("instantiation fills the first
 N entries", §3b), the host-owned handle table with type/generation checks
-(§3c), `cap.self` reflection incl. by-name resolve (D46/F7), and the
+(§3c), `self.*` reflection incl. by-name resolve (D46/F7), and the
 `spawn_named_child` grant flow.
 
 ### The bake/parameterize rule (context)
@@ -145,14 +145,14 @@ end state.
 ### 2.2 One call convention, two addressing modes
 
 `call.cap` disappears as a guest-facing concept. All capability invocation is
-`call.import`, with the same static/dynamic split as `call`/`call_indirect`:
+`call.import`, with the same static/dynamic split as `call`/`call.dyn`:
 
 ```
 ; static mode: slot is an immediate. Signature comes from the manifest.
 ; Verifier checks slot < n_imports and op/sig against the declaration, at load.
   v5 = call.import 0.read v1 v2
 
-; dynamic mode: slot from a value, signature carried inline (like call_indirect's ty).
+; dynamic mode: slot from a value, signature carried inline (like call.dyn's ty).
 ; Runtime check against the entry's type_id + generation — the §3c use-site check.
   v6 = call.import [v7].read (i64,i64)->(i64) v1 v2
 ```
@@ -491,7 +491,7 @@ is checked, not asserted. *Status: **landed**, notes:*
   a non-slot-dispatchable interface with a pointer at dynamic mode (§2.2).*
 - *The c_shell/c_shell_exec/stage1_posix_spawn suites link their compiled-C
   shims with `Resolved::Cap` (handle-free, link-time symbol resolution) and
-  the guests discover their own handles via `cap.self` reflection — §2.3's
+  the guests discover their own handles via `self.*` reflection — §2.3's
   dynamic mode for the `Instantiator` ops, exercised end to end.*
 - *The vestigial `CallImport` handle operand was **kept** until the next
   wire-format bump, exactly as §2.5 scheduled it — and retired there: at v8
@@ -509,7 +509,7 @@ leaving the tree with five conventions instead of four.
 ### 3.1 Binding provenance in `self.attest`
 
 *Status: **landed** (2026-07-20) as `self.provenance(handle) -> i32` — self-namespace
-op 5, reached via dynamic dispatch on the reserved `cap.self` id (no new instruction, no
+op 5, reached via dynamic dispatch on the reserved `self.*` id (no new instruction, no
 wire change): `0` = platform-terminated, `d ≥ 1` = ancestor-terminated `d` domain
 boundaries up (1 where the offer was wired, +1 per §3.3 re-grant hop). A forged/closed
 handle is an inert `CapFault`. PROCESS.md §6's growth-criterion list updated to name it.
@@ -1046,7 +1046,7 @@ with its reason recorded:
   i32 handle operand) and **executes as ordinary slot dispatch when the instance binds
   the name** (operand ignored) — the chibicc emission stream instantiates unchanged —
   while remaining the **linker's rewrite target** when `resolve_imports_with` runs
-  first (Cap → `call.cap` on the live operand; Slot → `call_indirect` via the
+  first (Cap → `call.cap` on the live operand; Slot → `call.dyn` via the
   operand's patched `ConstI32`; Func → direct call). One spelling, two binding times:
   a symbolic call binds by name at whichever binding act comes first. Emitters that
   never link (temen-llvm, temen-wasm, the printer's canonical output) produce the clean
@@ -1138,7 +1138,7 @@ transport rather than dissolving into serve-loop-driven domains — `OFFER_TRANS
   inertness, reflection neutrality, structural type intern).
 - **D19 / §14**: authority conservation generalized; the §14 "no am-I-nested
   query" amendment is inherited from PROCESS.md §6, not expanded here.
-- **§22 / B2**: `call_indirect` pre-sizing untouched; `Resolved::Func`/`Slot`
+- **§22 / B2**: `call.dyn` pre-sizing untouched; `Resolved::Func`/`Slot`
   stay as the linker's business. The trampoline machinery is reused by §3.2,
   not duplicated.
 - **PROCESS.md S1/O3**: this design is what makes the child compile cache's

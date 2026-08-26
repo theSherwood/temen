@@ -207,7 +207,7 @@ property, so in practice:
   - [x] **B — un-fail-close `JitInstall`/`JitUninstall`/`JitInvoke` in `drive_parallel`**, dispatching
     to the shared `Domain` (`install`/`uninstall`/`push` interior-mutable; an invoked unit runs over
     the shared powerbox). Proven by `bytecode_parallel_jit.rs` (8 vCPUs concurrently invoke a pure
-    unit, and concurrently `install` + `call_indirect` their own raced slot → counter byte-identical
+    unit, and concurrently `install` + `call.dyn` their own raced slot → counter byte-identical
     to the cooperative oracle, 50 runs) and `parallel_jit_miri.rs` (race/UB/provenance-clean under Miri).
   - [x] **C1 — un-fail-close the resumable `Vcpu`**: `Jit.install`/`uninstall`/`invoke` surface as
     host-serviced `VcpuEvent`s (the host resolves the unit from the powerbox, `deliver_jit_*` hands it

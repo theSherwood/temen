@@ -109,7 +109,7 @@ structs/unions (`.`/`->`, indexing, initializers); globals + string literals (in
 initializers / relocations); the full operator set incl. short-circuit `&&`/`||`/`?:`;
 `if`/`else`/`while`/`for`/`do`/`switch` with `break`/`continue` and **general `goto`/labels**;
 functions, parameters, **recursion**, **function pointers** (indirect calls via
-`call_indirect`, dispatch tables, callbacks, fn-ptr struct members), **by-value structs/unions**
+`call.dyn`, dispatch tables, callbacks, fn-ptr struct members), **by-value structs/unions**
 (passed/returned by value, whole-aggregate assignment), **varargs**; **`printf`** and `exit`
 over the powerbox; **`malloc`/`free`/`calloc`/`realloc`** (guest allocator, heap grows via the
 Memory cap). All verify and run identically on interp + JIT, and match native `cc`.
@@ -239,7 +239,7 @@ addend}`). `emit_data_segments` resolves each at compile time — every global's
 (`layout_globals`) and function's funcref index (`funcs[]`) is already assigned — and patches the
 8-byte little-endian value (`symbol_value(target) + addend`) into the data image, emitted as an
 ordinary `data`/`data ro` segment. A function-pointer target resolves to its funcref index (§3c),
-so global dispatch tables compose with `call_indirect`. No runtime relocation step; nothing
+so global dispatch tables compose with `call.dyn`. No runtime relocation step; nothing
 relocation-specific reaches the IR/verifier/JIT (it's just bytes). Tests: interp↔JIT differential
 + native-`cc` oracle (pointer-to-global, array-element addend, pointer-to-pointer,
 struct-with-pointer-member, global fn-ptr tables, string-literal `char*`, array-of-`char*`).
@@ -247,7 +247,7 @@ struct-with-pointer-member, global fn-ptr tables, string-literal `char*`, array-
 ### Indirect calls (function pointers)
 A function designator decays to its `ref.func` index (an i32 funcref, §3c) widened to the 8-byte
 C pointer rep (`irty(TY_FUNC)`=i64, `by_address` true so a "load" is a no-op returning the
-funcref). A call through a value lowers to `call_indirect (i64 sp, params…[, i64 va]) -> (ret)
+funcref). A call through a value lowers to `call.dyn (i64 sp, params…[, i64 va]) -> (ret)
 <i32-wrapped idx>(csp, args…)`; the signature **must include the leading data-SP `i64`** so the
 runtime type-id check (`table_lookup`) matches the target. A type-confused/forged index is inert —
 it traps `IndirectCallType` on both backends (I2; see
