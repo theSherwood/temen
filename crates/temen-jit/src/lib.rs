@@ -4643,16 +4643,18 @@ pub(crate) unsafe fn compile_child_and_run(
     // §4: a durable child runs its (possibly instrumented) funcs in the carve as **context 0** of its
     // own window. Seed the ctx-0 durable control words exactly as the interpreter does at the child's
     // first dispatch (`temen-interp` `durable_store_dstate(0, NORMAL)` + `durable_set_sp`): the global
-    // state word (`STATE_OFF` = 0) and the ctx-0 thaw word to `NORMAL`, and the ctx-0 shadow-SP word
-    // (at `shadow_region_base(0)` = `DURABLE_SHADOW_BASE`) to the empty frame base `shadow_frame_base(0)`.
-    // So an instrumented child's prologue sees `NORMAL` and its shadow stack starts empty at the right
-    // offset. A valid durable child's window is ≥ `DURABLE_RESERVE` (64 KiB), so these low offsets fit;
-    // the size guard keeps a malformed (too-small) guest-requested carve from panicking the host here —
-    // such a child instead traps at runtime when its instrumented code reaches past its window.
-    const CTX0_SP_OFF: usize = DURABLE_SHADOW_BASE as usize; // shadow_region_base(0) = 64
-    const CTX0_THAW_OFF: usize = DURABLE_SHADOW_BASE as usize + 8; // thaw_state_off(0) = 72
+    // state word (at `STATE_OFF`, relocated above the #1094 NULL guard) and the ctx-0 thaw word to
+    // `NORMAL`, and the ctx-0 shadow-SP word (at `shadow_region_base(0)` = `DURABLE_SHADOW_BASE`) to the
+    // empty frame base `shadow_frame_base(0)`. So an instrumented child's prologue sees `NORMAL` and its
+    // shadow stack starts empty at the right offset. A valid durable child's window is ≥ `DURABLE_RESERVE`
+    // (64 KiB), so these offsets fit; the size guard keeps a malformed (too-small) guest-requested carve
+    // from panicking the host here — such a child instead traps at runtime when its instrumented code
+    // reaches past its window.
+    const STATE_OFF: usize = temen_ir::durable_abi::STATE_OFF as usize; // global durable state word
+    const CTX0_SP_OFF: usize = DURABLE_SHADOW_BASE as usize; // shadow_region_base(0)
+    const CTX0_THAW_OFF: usize = DURABLE_SHADOW_BASE as usize + 8; // thaw_state_off(0)
     if durable && (child_size as usize) >= CTX0_THAW_OFF + 4 {
-        const CTX0_FRAME_BASE: u64 = DURABLE_SHADOW_BASE + 16; // shadow_frame_base(0) = 80
+        const CTX0_FRAME_BASE: u64 = DURABLE_SHADOW_BASE + 16; // shadow_frame_base(0)
         const STATE_REWINDING: i32 = 2;
         let w = child_window.rw_mut();
         if thaw {
@@ -4661,18 +4663,18 @@ pub(crate) unsafe fn compile_child_and_run(
             // **rewind** exactly as `temen-durable::begin_thaw` does for a context: global state word →
             // `NORMAL`, ctx-0 thaw word → `REWINDING`, and **preserve** the SP word + shadow stack (the
             // continuation the rewind replays). The child then dispatches on the thaw word and reloads.
-            w[0..4].copy_from_slice(&0i32.to_le_bytes()); // global state word = NORMAL
+            w[STATE_OFF..STATE_OFF + 4].copy_from_slice(&0i32.to_le_bytes()); // global state word = NORMAL
             w[CTX0_THAW_OFF..CTX0_THAW_OFF + 4].copy_from_slice(&STATE_REWINDING.to_le_bytes());
         } else {
             // §4 freeze/normal: the child inherits the **parent's** durable phase (the interp seeds
             // `child.dstate = parent.durable_state()`). Under a freeze the parent window is `UNWINDING`,
             // so an instrumented child is born unwinding and unwinds at its first poll; under `NORMAL`
-            // it runs to completion. Read the parent window's ctx-0 state word (`STATE_OFF` = 0).
+            // it runs to completion. Read the parent window's ctx-0 state word (at `STATE_OFF`).
             let parent_phase = {
-                let p = std::slice::from_raw_parts(parent_mem_base, 4);
+                let p = std::slice::from_raw_parts(parent_mem_base.add(STATE_OFF), 4);
                 i32::from_le_bytes([p[0], p[1], p[2], p[3]])
             };
-            w[0..4].copy_from_slice(&parent_phase.to_le_bytes()); // global state word = parent's phase
+            w[STATE_OFF..STATE_OFF + 4].copy_from_slice(&parent_phase.to_le_bytes()); // global state = parent's phase
             w[CTX0_THAW_OFF..CTX0_THAW_OFF + 4].copy_from_slice(&0i32.to_le_bytes()); // ctx-0 thaw = NORMAL
             w[CTX0_SP_OFF..CTX0_SP_OFF + 8].copy_from_slice(&CTX0_FRAME_BASE.to_le_bytes());
             // ctx-0 SP
