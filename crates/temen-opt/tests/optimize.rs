@@ -516,7 +516,7 @@ fn keeps_dead_load_but_drops_dead_arithmetic() {
             blocks: vec![Block {
                 params: vec![],
                 insts: vec![
-                    Inst::ConstI64(0), // 0 : addr
+                    Inst::ConstI64(16384), // 0 : addr (above the #1094 NULL guard)
                     Inst::Load {
                         op: LoadOp::I32,
                         addr: 0,
@@ -568,7 +568,7 @@ fn keeps_store_effect_across_renumbering() {
             blocks: vec![Block {
                 params: vec![],
                 insts: vec![
-                    Inst::ConstI64(8),  // 0 : addr
+                    Inst::ConstI64(16392), // 0 : addr (above the #1094 NULL guard)
                     Inst::ConstI32(42), // 1 : value
                     Inst::ConstI32(5),  // 2 (dead)
                     Inst::ConstI32(6),  // 3 (dead)

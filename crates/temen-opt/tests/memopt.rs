@@ -111,7 +111,8 @@ fn store_then_two_loads_forward_to_the_stored_value() {
         }],
     };
     let m = module(f);
-    let args: Vec<Vec<Value>> = [0i64, 8, 1024, 65000]
+    // Addresses above the #1094 NULL guard (65000 is already above it, so it stays in-bounds).
+    let args: Vec<Vec<Value>> = [16384i64, 16392, 17408, 65000]
         .iter()
         .map(|&a| vec![Value::I64(a)])
         .collect();
@@ -123,7 +124,7 @@ fn store_then_two_loads_forward_to_the_stored_value() {
         1,
         "the store itself stays (it has an effect)"
     );
-    for a in [0i64, 8, 1024] {
+    for a in [16384i64, 16392, 17408] {
         assert_eq!(run(&opt, &[Value::I64(a)]), Ok(vec![Value::I64(14)]));
     }
 }
@@ -148,7 +149,7 @@ fn redundant_load_survives_a_pure_op_between() {
         }],
     };
     let m = module(f);
-    let args: Vec<Vec<Value>> = [0i64, 16, 4096]
+    let args: Vec<Vec<Value>> = [16384i64, 16400, 20480]
         .iter()
         .map(|&a| vec![Value::I64(a)])
         .collect();
@@ -180,10 +181,10 @@ fn store_to_an_unknown_address_blocks_forwarding() {
     let m = module(f);
     // Include aliasing (a == b) and non-aliasing (a != b) tuples.
     let args = vec![
-        vec![Value::I64(0), Value::I64(0)], // a == b: store overwrites mem[a]
-        vec![Value::I64(0), Value::I64(16)], // a != b
-        vec![Value::I64(64), Value::I64(64)], // a == b again
-        vec![Value::I64(8), Value::I64(4096)],
+        vec![Value::I64(16384), Value::I64(16384)], // a == b: store overwrites mem[a]
+        vec![Value::I64(16384), Value::I64(16400)], // a != b
+        vec![Value::I64(16448), Value::I64(16448)], // a == b again
+        vec![Value::I64(16392), Value::I64(20480)],
     ];
     let opt = check(&m, &args);
     assert_eq!(
@@ -191,9 +192,9 @@ fn store_to_an_unknown_address_blocks_forwarding() {
         2,
         "a store to an unprovably-disjoint address must block load forwarding"
     );
-    // Spot-check the aliasing case explicitly: x=0 (init), then mem[0]=99, so y=99 → 99.
+    // Spot-check the aliasing case explicitly: x=0 (init), then mem[16384]=99, so y=99 → 99.
     assert_eq!(
-        run(&opt, &[Value::I64(0), Value::I64(0)]),
+        run(&opt, &[Value::I64(16384), Value::I64(16384)]),
         Ok(vec![Value::I64(99)])
     );
 }
@@ -219,7 +220,7 @@ fn disjoint_offset_store_does_not_block_forwarding() {
         }],
     };
     let m = module(f);
-    let args: Vec<Vec<Value>> = [0i64, 96, 4096]
+    let args: Vec<Vec<Value>> = [16384i64, 16480, 20480]
         .iter()
         .map(|&b| vec![Value::I64(b)])
         .collect();
@@ -252,7 +253,7 @@ fn overlapping_offset_store_blocks_forwarding() {
         }],
     };
     let m = module(f);
-    let opt = check(&m, &[vec![Value::I64(0)], vec![Value::I64(4096)]]);
+    let opt = check(&m, &[vec![Value::I64(16384)], vec![Value::I64(20480)]]);
     assert_eq!(
         n_loads(&opt),
         2,
@@ -289,7 +290,7 @@ fn v128_store_forwards_to_loads() {
         }],
     };
     let m = module(f);
-    let args: Vec<Vec<Value>> = [0i64, 64, 4096]
+    let args: Vec<Vec<Value>> = [16384i64, 16448, 20480]
         .iter()
         .map(|&b| vec![Value::I64(b)])
         .collect();
@@ -299,5 +300,5 @@ fn v128_store_forwards_to_loads() {
         0,
         "both v128 loads forward to the stored value"
     );
-    assert_eq!(run(&opt, &[Value::I64(0)]), Ok(vec![Value::V128(c)]));
+    assert_eq!(run(&opt, &[Value::I64(16384)]), Ok(vec![Value::V128(c)]));
 }

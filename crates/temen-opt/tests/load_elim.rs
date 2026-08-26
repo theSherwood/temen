@@ -12,14 +12,15 @@ use temen_ir::{
 use temen_opt::{optimize_module, optimize_module_with, OptConfig};
 use temen_verify::verify_module;
 
-/// A module with linear memory pre-initialized so `mem[0..8]` holds `v` (little-endian i64), so a load
-/// from address 0 reads a known nonzero value without needing a store.
+/// A module with linear memory pre-initialized so `mem[16384..16392]` holds `v` (little-endian i64),
+/// so a load from address 16384 (above the #1094 NULL guard) reads a known nonzero value without
+/// needing a store.
 fn module(f: Func, v: i64) -> Module {
     Module {
         funcs: vec![f],
         memory: Some(Memory { size_log2: 16 }),
         data: vec![Data {
-            offset: 0,
+            offset: 16384,
             readonly: false,
             bytes: v.to_le_bytes().to_vec(),
         }],
@@ -130,11 +131,11 @@ fn sequential_reload_is_forwarded() {
         ],
     };
     let m = module(f, 42);
-    check(&m, &[vec![Value::I64(0)]]);
+    check(&m, &[vec![Value::I64(16384)]]);
     // Isolated: b1's reload is gone (b0's load remains, since intra-block forwarding is off here).
     let iso = optimize_module_with(&m, &only_load_elim());
     assert_eq!(n_loads(&iso), 1, "the dominated reload is eliminated");
-    assert_eq!(run(&iso, &[Value::I64(0)]), Ok(vec![Value::I64(84)]));
+    assert_eq!(run(&iso, &[Value::I64(16384)]), Ok(vec![Value::I64(84)]));
 }
 
 #[test]
@@ -177,7 +178,7 @@ fn diamond_join_reload_is_forwarded() {
     let m = module(f, 7);
     let args: Vec<Vec<Value>> = [0i32, 1]
         .iter()
-        .map(|&s| vec![Value::I64(0), Value::I32(s)])
+        .map(|&s| vec![Value::I64(16384), Value::I32(s)])
         .collect();
     check(&m, &args);
     let iso = optimize_module_with(&m, &only_load_elim());
@@ -187,7 +188,7 @@ fn diamond_join_reload_is_forwarded() {
         "the join reload is eliminated across the diamond"
     );
     assert_eq!(
-        run(&iso, &[Value::I64(0), Value::I32(1)]),
+        run(&iso, &[Value::I64(16384), Value::I32(1)]),
         Ok(vec![Value::I64(14)])
     );
 }
@@ -227,8 +228,8 @@ fn a_store_between_blocks_forwarding() {
     let m = module(f, 42);
     // Aliasing (addr == other) is the case that would miscompile if the store were ignored.
     let args = vec![
-        vec![Value::I64(0), Value::I64(0)], // alias: y reads 99, so 42 + 99 = 141
-        vec![Value::I64(0), Value::I64(64)], // disjoint: y reads 42, so 84
+        vec![Value::I64(16384), Value::I64(16384)], // alias: y reads 99, so 42 + 99 = 141
+        vec![Value::I64(16384), Value::I64(16448)], // disjoint: y reads 42, so 84
     ];
     check(&m, &args);
     let iso = optimize_module_with(&m, &only_load_elim());
@@ -238,7 +239,7 @@ fn a_store_between_blocks_forwarding() {
         "a store between the accesses must block cross-block forwarding"
     );
     assert_eq!(
-        run(&iso, &[Value::I64(0), Value::I64(0)]),
+        run(&iso, &[Value::I64(16384), Value::I64(16384)]),
         Ok(vec![Value::I64(141)])
     );
 }
@@ -293,10 +294,10 @@ fn load_in_a_loop_with_a_store_is_not_forwarded() {
         ],
     };
     let m = module(f, 42);
-    // addr = 0 (the initialized cell); a few trip counts.
+    // addr = 16384 (the initialized cell, above the #1094 NULL guard); a few trip counts.
     let args: Vec<Vec<Value>> = [1i64, 2, 5]
         .iter()
-        .map(|&n| vec![Value::I64(n), Value::I64(0)])
+        .map(|&n| vec![Value::I64(n), Value::I64(16384)])
         .collect();
     check(&m, &args);
     let iso = optimize_module_with(&m, &only_load_elim());
@@ -368,7 +369,7 @@ fn disjoint_offset_store_in_an_arm_does_not_block_forwarding() {
     let m = diamond_with_arm_store(StoreOp::I64, 8);
     let args: Vec<Vec<Value>> = [0i32, 1]
         .iter()
-        .map(|&s| vec![Value::I64(0), Value::I32(s)])
+        .map(|&s| vec![Value::I64(16384), Value::I32(s)])
         .collect();
     check(&m, &args);
     let iso = optimize_module_with(&m, &only_load_elim());
@@ -387,7 +388,7 @@ fn overlapping_store_in_an_arm_blocks_forwarding() {
     let m = diamond_with_arm_store(StoreOp::I32, 4);
     let args: Vec<Vec<Value>> = [0i32, 1]
         .iter()
-        .map(|&s| vec![Value::I64(0), Value::I32(s)])
+        .map(|&s| vec![Value::I64(16384), Value::I32(s)])
         .collect();
     check(&m, &args);
     let iso = optimize_module_with(&m, &only_load_elim());

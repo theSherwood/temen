@@ -130,23 +130,23 @@ fn loads_across_a_may_alias_store_are_not_merged() {
         blocks: vec![Block {
             params: vec![ValType::I32, ValType::I64],
             insts: vec![
-                Inst::ConstI64(0), // v2 = load address (const 0)
+                Inst::ConstI64(16384), // v2 = load address (const 16384, above the #1094 NULL guard)
                 Inst::Load {
                     op: LoadOp::I32,
                     addr: 2,
                     offset: 0,
-                }, // v3 = mem[0]  (x)
+                }, // v3 = mem[16384]  (x)
                 Inst::Store {
                     op: StoreOp::I32,
                     addr: 1,
                     value: 0,
                     offset: 0,
-                }, // mem[b] = value — may alias mem[0]
+                }, // mem[b] = value — may alias mem[16384]
                 Inst::Load {
                     op: LoadOp::I32,
                     addr: 2,
                     offset: 0,
-                }, // v4 = mem[0]  (y) — must NOT merge with x
+                }, // v4 = mem[16384]  (y) — must NOT merge with x
                 add(3, 4),         // v5 = x + y
             ],
             term: Terminator::Return(vec![5]),
@@ -156,9 +156,9 @@ fn loads_across_a_may_alias_store_are_not_merged() {
     let opt = check_equiv(
         &m,
         &[
-            vec![Value::I32(5), Value::I64(0)], // b == 0: store overwrites mem[0]
-            vec![Value::I32(5), Value::I64(8)], // b != 0: disjoint
-            vec![Value::I32(7), Value::I64(0)],
+            vec![Value::I32(5), Value::I64(16384)], // b == 16384: store overwrites mem[16384]
+            vec![Value::I32(5), Value::I64(16392)], // b != 16384: disjoint
+            vec![Value::I32(7), Value::I64(16384)],
         ],
     );
     assert_eq!(
@@ -166,9 +166,9 @@ fn loads_across_a_may_alias_store_are_not_merged() {
         2,
         "a may-alias store between identical loads must block merging them"
     );
-    // Aliasing case: x = 0 (init), then mem[0] = 5, so y = 5 → 5.
+    // Aliasing case: x = 0 (init), then mem[16384] = 5, so y = 5 → 5.
     assert_eq!(
-        run(&opt, &[Value::I32(5), Value::I64(0)]),
+        run(&opt, &[Value::I32(5), Value::I64(16384)]),
         Ok(vec![Value::I32(5)])
     );
 }
