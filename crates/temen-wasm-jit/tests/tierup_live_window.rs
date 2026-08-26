@@ -225,11 +225,12 @@ fn as_i64(v: &Value) -> i64 {
 
 /// Mainline func 0 (`_start`, interpreted driver) calls the eligible leaf func 1, which **reads a
 /// data segment** and adds `arg`. This is the minimal "mainline tier-up over a live window with a
-/// data segment" shape. The data (`0x0102030405060708` at offset 0) is materialized by the
-/// interpreter at `open`; the tiered-up `f1` must see it over the same window.
+/// data segment" shape. The data (`0x0102030405060708` at offset 16384, above the #1094 NULL guard
+/// `[0, 16384)`) is materialized by the interpreter at `open`; the tiered-up `f1` must see it over the
+/// same window.
 const DATA_LEAF: &str = r#"
 memory 16
-data 0 "\08\07\06\05\04\03\02\01"
+data 16384 "\08\07\06\05\04\03\02\01"
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   v1 = call 1 (v0)
@@ -238,7 +239,7 @@ block 0 (v0: i64) {
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   v2 = i64.load v1
   v3 = i64.add v2 v0
   return v3
@@ -267,7 +268,7 @@ fn mainline_tierup_reads_data_segment_over_live_window() {
 /// the mirrored-window round-trip (emitted writes are visible) matches the interpreter.
 const DATA_RW_LEAF: &str = r#"
 memory 16
-data 0 "\08\07\06\05\04\03\02\01"
+data 16384 "\08\07\06\05\04\03\02\01"
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   v1 = call 1 (v0)
@@ -276,10 +277,10 @@ block 0 (v0: i64) {
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v1 = i64.const 4096
+  v1 = i64.const 20480
   i64.store v1 v0
   v2 = i64.load v1
-  v3 = i64.const 0
+  v3 = i64.const 16384
   v4 = i64.load v3
   v5 = i64.add v2 v4
   return v5

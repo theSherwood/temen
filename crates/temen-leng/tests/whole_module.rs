@@ -189,7 +189,7 @@ fn variant_object_union_fields_resolve() {
    (asgn (dot (deref p.0) y.0 1) 42)
    (ret (add (i +64) (dot (deref p.0) k.0 0) (dot (deref p.0) y.0 1))))))";
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
-    assert_eq!(run(&m, 0, &[4096]), 43, "k(1) + y(42) via variant fields");
+    assert_eq!(run(&m, 0, &[20480]), 43, "k(1) + y(42) via variant fields");
 }
 
 #[test]
@@ -210,7 +210,7 @@ fn global_pointer_deref() {
    (asgn x.0. (addr o.0))
    (ret (dot (deref x.0.) data.0 0)))))";
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
-    assert_eq!(run(&m, 0, &[4096]), 42, "(deref global x).data = 42");
+    assert_eq!(run(&m, 0, &[20480]), 42, "(deref global x).data = 42");
 }
 
 #[test]
@@ -228,9 +228,10 @@ fn store_aggregate_through_lvalue() {
    (asgn (deref p.0) (oconstr Inner.0. (kv v.0 42)))
    (ret (dot (deref p.0) v.0 0)))))";
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
-    // A frame is needed for the constructor temp, so slot 0 = $sp; p points into the window at 2048.
+    // A frame is needed for the constructor temp, so slot 0 = $sp; p points into the window at 18432.
+    // Both are raised +16384 above the unconditional NULL guard (#1094).
     assert_eq!(
-        run(&m, 0, &[4096, 2048]),
+        run(&m, 0, &[20480, 18432]),
         42,
         "(*p).v after aggregate store = 42"
     );

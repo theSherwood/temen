@@ -253,7 +253,7 @@ fn cross_module_value_type_resolves() {
     ])
     .unwrap_or_else(|e| panic!("link: {e}"));
     // mk is frame-needing (aggregate local): ($sp, v) -> i64.
-    assert_eq!(run(&linked, 0, &[4096, 35]), 42, "p.x + p.y = 35 + 7");
+    assert_eq!(run(&linked, 0, &[20480, 35]), 42, "p.x + p.y = 35 + 7");
     // Compiled *standalone*, the same unit fail-closes — the external layout exists only across
     // the link. No silent scalar-guess for a value of an unknown aggregate type.
     assert!(
@@ -298,14 +298,15 @@ fn cross_module_pointer_field_pointee_resolves() {
     ])
     .unwrap_or_else(|e| panic!("link: {e}"));
     temen_verify::verify_module(&linked).unwrap();
-    // Rec at 512 with p → Inner at 256; Inner.val = 42. readThrough(&Rec) chases both pointers.
-    let mut seed = vec![0u8; 4096];
-    seed[512..520].copy_from_slice(&256i64.to_le_bytes()); // Rec.p = &Inner
-    seed[256..264].copy_from_slice(&42i64.to_le_bytes()); // Inner.val
+    // Rec at 16896 with p → Inner at 16640; Inner.val = 42. readThrough(&Rec) chases both pointers.
+    // (Both addresses are raised +16384 above the unconditional NULL guard, #1094.)
+    let mut seed = vec![0u8; 20480];
+    seed[16896..16904].copy_from_slice(&16640i64.to_le_bytes()); // Rec.p = &Inner
+    seed[16640..16648].copy_from_slice(&42i64.to_le_bytes()); // Inner.val
     let mut fuel = u64::MAX;
-    let (ir, _) = temen_interp::run_capture(&linked, 0, &[Value::I64(512)], &mut fuel, &seed);
+    let (ir, _) = temen_interp::run_capture(&linked, 0, &[Value::I64(16896)], &mut fuel, &seed);
     assert_eq!(ir.expect("interp").as_slice(), &[Value::I64(42)]);
-    let (jout, _) = temen_jit::compile_and_run_capture(&linked, 0, &[512], &seed).expect("jit");
+    let (jout, _) = temen_jit::compile_and_run_capture(&linked, 0, &[16896], &seed).expect("jit");
     match jout {
         temen_jit::JitOutcome::Returned(v) => assert_eq!(v, vec![42], "§9 parity"),
         o => panic!("jit: {o:?}"),
@@ -348,7 +349,7 @@ fn cross_module_inheritance_inlines_base() {
     .unwrap_or_else(|e| panic!("link: {e}"));
     // mk is frame-needing (aggregate local): ($sp, v) -> i64.
     assert_eq!(
-        run(&linked, 0, &[4096, 35]),
+        run(&linked, 0, &[20480, 35]),
         42,
         "inherited area(35) + own r(7)"
     );
@@ -385,7 +386,7 @@ fn nested_cross_module_types_resolve() {
     ])
     .unwrap_or_else(|e| panic!("link: {e}"));
     assert_eq!(
-        run(&linked, 0, &[4096, 33]),
+        run(&linked, 0, &[20480, 33]),
         42,
         "9 + 33 through the nested field"
     );
@@ -427,7 +428,7 @@ fn cross_module_sret_call_with_oconstr_arg() {
     ])
     .unwrap_or_else(|e| panic!("link: {e}"));
     // caller() = id((5,7)).x + .y = 12, on both engines (`run` asserts §9 parity).
-    assert_eq!(run(&linked, 0, &[4096]), 12, "id((5,7)).x + .y");
+    assert_eq!(run(&linked, 0, &[20480]), 12, "id((5,7)).x + .y");
 }
 
 #[test]
@@ -501,8 +502,8 @@ fn cross_module_sret_call_in_argument_position() {
     ])
     .unwrap_or_else(|e| panic!("link: {e}"));
     // go is func 1 (readv=0, go=1); it is frame-needing (holds mk's result temp): ($sp, n).
-    assert_eq!(run(&linked, 1, &[4096, 5]), 5, "readv(mk(5)).v = 5");
-    assert_eq!(run(&linked, 1, &[4096, 42]), 42);
+    assert_eq!(run(&linked, 1, &[20480, 5]), 5, "readv(mk(5)).v = 5");
+    assert_eq!(run(&linked, 1, &[20480, 42]), 42);
 }
 
 #[test]
@@ -539,7 +540,7 @@ fn cross_module_sret_and_frame_needing_call() {
     ])
     .unwrap_or_else(|e| panic!("link: {e}"));
     assert_eq!(
-        run(&linked, 1, &[4096, 9]),
+        run(&linked, 1, &[20480, 9]),
         9,
         "readv(mk(9)).v = 9 (mk is sret + framed)"
     );
@@ -575,7 +576,7 @@ fn cross_module_sret_call_discarded() {
         },
     ])
     .unwrap_or_else(|e| panic!("link: {e}"));
-    assert_eq!(run(&linked, 0, &[4096, 7]), 7, "discarded mk, returns n");
+    assert_eq!(run(&linked, 0, &[20480, 7]), 7, "discarded mk, returns n");
 }
 
 #[test]
@@ -633,8 +634,9 @@ fn real_string_type_resolves_across_link() {
     .unwrap_or_else(|e| panic!("link: {e}"));
     temen_verify::verify_module(&linked).unwrap_or_else(|e| panic!("verify: {e:?}"));
     // greet (func 0) is frame-needing and aggregate-returning: ($sp, $sret) -> ().
-    let (sp, sret) = (1024i64, 512usize);
-    let seed = vec![0u8; 4096];
+    // Both the frame $sp and the $sret buffer are raised +16384 above the NULL guard (#1094).
+    let (sp, sret) = (17408i64, 16896usize);
+    let seed = vec![0u8; 20480];
     let ivals = vec![Value::I64(sp), Value::I64(sret as i64)];
     let mut fuel = u64::MAX;
     let (ir, imem) = temen_interp::run_capture(&linked, 0, &ivals, &mut fuel, &seed);
@@ -717,13 +719,13 @@ fn cross_module_funcref_global_call() {
     ])
     .unwrap_or_else(|e| panic!("link: {e}"));
     // drive = module w's first proc → func 0. It makes an indirect call (through `hook`), so under
-    // the funcref ABI it is frame-needing: a leading `$sp` (2048) precedes the visible arg.
+    // the funcref ABI it is frame-needing: a leading `$sp` (18432) precedes the visible arg.
     assert_eq!(
-        run(&linked, 0, &[2048, 21]),
+        run(&linked, 0, &[18432, 21]),
         42,
         "drive sets hook=dbl, calls hook(21)"
     );
-    assert_eq!(run(&linked, 0, &[2048, -5]), -10);
+    assert_eq!(run(&linked, 0, &[18432, -5]), -10);
 }
 
 /// A cross-module call to a **frame-needing proc**. Module `s`'s `count` takes `(addr i)` of a local,
@@ -768,7 +770,7 @@ fn cross_module_frame_needing_call() {
         "drive should be lowered as (sp, n) -> (i64)"
     );
     // Pass a window offset as drive's own frame `$sp`; it hands a fresh sub-frame to count.
-    let sp = 8192;
+    let sp = 24576;
     for n in [0, 1, 5, 50] {
         assert_eq!(
             run(&linked, 0, &[sp, n]),
@@ -813,11 +815,11 @@ fn funcref_global_static_initializer() {
     ])
     .unwrap_or_else(|e| panic!("link: {e}"));
     // No setter runs — `hook` holds `dbl`'s index purely from the materialized initializer.
-    // `drive` makes an indirect call → frame-needing under the funcref ABI: leading `$sp` (2048).
+    // `drive` makes an indirect call → frame-needing under the funcref ABI: leading `$sp` (18432).
     assert_eq!(
-        run(&linked, 0, &[2048, 21]),
+        run(&linked, 0, &[18432, 21]),
         42,
         "drive calls the materialized hook = dbl"
     );
-    assert_eq!(run(&linked, 0, &[2048, -5]), -10);
+    assert_eq!(run(&linked, 0, &[18432, -5]), -10);
 }
