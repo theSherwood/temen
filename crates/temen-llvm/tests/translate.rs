@@ -12915,6 +12915,67 @@ fn demo_bash_translates_and_verifies() {
         );
     }
 
+    // ▶ #748/#1122 route (b) — the same interactive session on the **parallel driver**: the
+    // terminal read is a CorePipe block (a level-triggered poll on the parallel driver), so the
+    // feeder's keystrokes land with no dedicated wake, while every bash fork twin would be a real
+    // OS thread. The `^C` is fed but its ONLY assertable effect is the swallow: async delivery
+    // into the parked read is an interpreter-only tier (#796 L2), so the interrupt is absorbed at
+    // the feed-time line discipline and `$?` stays 0 — pinned as `rc=0` (when async delivery
+    // lands on the bytecode tier, this flips to `rc=130` and the pin should move to match the
+    // tree-walker session above). The session must still fully work around it: prompt loop, the
+    // typed command runs, `^D` exits with the farewell. (The cooperative driver cannot run this
+    // session at all yet — the #1122 route (a) suspend/resume gap — so only parallel is pinned.)
+    {
+        let (cap, posix) = temen_run::posix::posix_cap_terminal(0, 0);
+        let feeder = {
+            let px = posix.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                for keys in ["echo hi\n", "\x03", "echo rc=$?\n", "\x04"] {
+                    px.feed_terminal(keys.as_bytes());
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            })
+        };
+        let config = temen_run::RunConfig {
+            args: vec![b"bash".to_vec(), b"-i".to_vec()],
+            env: vec![
+                b"PATH=/bin".to_vec(),
+                b"HOME=/".to_vec(),
+                b"PS1=$ ".to_vec(),
+            ],
+            ..Default::default()
+        };
+        let run = inst
+            .run_with_caps_parallel(&config, &[("posix", cap)])
+            .expect("bash -i session (parallel)");
+        feeder.join().expect("feeder thread");
+        assert_eq!(
+            run.outcome,
+            temen_run::Outcome::Exited(0),
+            "bash -i (parallel): the ^D exit carries the last command's status"
+        );
+        let out = String::from_utf8_lossy(&posix.stdout()).into_owned();
+        let err = String::from_utf8_lossy(&posix.stderr()).into_owned();
+        assert!(
+            out.contains("echo hi\nhi\n"),
+            "bash -i (parallel): the typed command echoed and ran (stdout: {out:?})"
+        );
+        assert!(
+            out.contains("rc=0"),
+            "bash -i (parallel): the fed ^C is absorbed without async delivery (the pinned \
+             bytecode-tier gap — see the comment above) (stdout: {out:?})"
+        );
+        assert!(
+            err.matches("$ ").count() >= 2,
+            "bash -i (parallel): the PS1 prompt re-printed between commands (stderr: {err:?})"
+        );
+        assert!(
+            err.contains("exit"),
+            "bash -i (parallel): ^D printed bash's `exit` farewell (stderr: {err:?})"
+        );
+    }
+
     // ▶ Interactive rung 2 (#802): **job control** — `^Z` stops the foreground external command,
     // `jobs` lists it, `fg` resumes it WITH the terminal, and the resumed job reads keystrokes
     // again. This session pins the whole chain: the exec'd child's terminal-backed `read(0)`
