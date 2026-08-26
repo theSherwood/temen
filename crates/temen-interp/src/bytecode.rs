@@ -12479,6 +12479,7 @@ fn drive_parallel(
             &dom,
             &reg,
             std::sync::Arc::clone(&shared),
+            None,
             root_vt,
             mem,
             fuel,
@@ -12497,6 +12498,7 @@ fn drive_parallel(
 /// blocking each `thread.join` on the [`ThreadRegistry`]. Mirrors the cooperative `drive`'s `Spawn` /
 /// `Join` / `Done` arms, one vCPU at a time. Returns this vCPU's result and the `Mem` it owned (the
 /// root's is the one captured; a child's is dropped, its bytes already live in the shared backing).
+#[allow(clippy::too_many_arguments)] // an internal driver entry: the args ARE the vCPU's identity
 fn run_vcpu_parallel<'scope, 'env>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
     dom: &'env Domain,
@@ -12505,6 +12507,11 @@ fn run_vcpu_parallel<'scope, 'env>(
     // (4c-host), or a fork twin's OWN forked powerbox (#748) — its own spawned threads then share
     // *that*. Owned `Arc` so a twin's runtime-minted cell moves into its scoped thread cleanly.
     host: std::sync::Arc<std::sync::Mutex<Host>>,
+    // This vCPU's dispatch table when it is not the domain's shared `dom.table`: an `exec_module`
+    // image-replace (#748 rung 2) installs the command's natural table here, and a fork twin (same
+    // image as its parent) or `thread.spawn` child (same image as its spawner) inherits its
+    // parent's. `Arc` so inheritance is a clone, not a rebuild.
+    mut tbl: Option<std::sync::Arc<SharedSlots>>,
     mut vt: VTask,
     mut mem: Option<Mem>,
     mut fuel: u64,
@@ -12519,7 +12526,7 @@ fn run_vcpu_parallel<'scope, 'env>(
     let mut fork_gen: u64 = 0;
     loop {
         let mut ctx = RunCtx {
-            table: &dom.table,
+            table: tbl.as_deref().unwrap_or(&dom.table),
             fuel: &mut fuel,
             mem: &mut mem,
             durable: false,
@@ -12549,11 +12556,6 @@ fn run_vcpu_parallel<'scope, 'env>(
             | Ok(VcpuStop::ChildOffer { .. })
             | Ok(VcpuStop::CloneCaller { .. })
             | Ok(VcpuStop::Reap { .. })
-            // `exec_module` image-replace is a #748 follow-up rung (in-place vt/host/table swap).
-            | Ok(VcpuStop::Exec { .. })
-            // #1080 rung 4 — blocking CorePipe parks are the #748 pipe rung (condvar doors).
-            | Ok(VcpuStop::PipeRead { .. })
-            | Ok(VcpuStop::PipeWrite { .. })
             | Ok(VcpuStop::BlockOnFiber { .. }) => return (Err(Trap::ThreadFault), mem),
             Err(trap) => return (Err(trap), mem),
             Ok(VcpuStop::Done(vals)) => return (Ok(vals), mem),
@@ -12600,9 +12602,11 @@ fn run_vcpu_parallel<'scope, 'env>(
                 // and SHARES this vCPU's powerbox cell (a thread, not a process — cf. `ForkSelf`).
                 let child_mem = mem.as_ref().map(|m| m.fork_for_thread());
                 let child_host = std::sync::Arc::clone(&host);
+                let child_tbl = tbl.clone();
                 scope.spawn(move || {
-                    let (r, _m) =
-                        run_vcpu_parallel(scope, dom, reg, child_host, child_vt, child_mem, fuel);
+                    let (r, _m) = run_vcpu_parallel(
+                        scope, dom, reg, child_host, child_tbl, child_vt, child_mem, fuel,
+                    );
                     reg.publish(id, r);
                 });
                 let handle = threads.len() as i32;
@@ -12681,9 +12685,13 @@ fn run_vcpu_parallel<'scope, 'env>(
                         };
                         let twin_host = std::sync::Arc::new(std::sync::Mutex::new(twin_host));
                         let hooks_host = std::sync::Arc::clone(&twin_host);
+                        // The twin continues the SAME image as its parent, so it dispatches over the
+                        // same table (post-exec parents included — cf. the coop arm's fresh primary
+                        // table, which a bare pre-exec caller also resolves to).
+                        let twin_tbl = tbl.clone();
                         scope.spawn(move || {
                             let (r, _m) = run_vcpu_parallel(
-                                scope, dom, reg, twin_host, twin_vt, twin_mem, fuel,
+                                scope, dom, reg, twin_host, twin_tbl, twin_vt, twin_mem, fuel,
                             );
                             // The twin retired: fire ITS exit hooks once with the reap-encoded
                             // status (Live → Zombie in the personality table) and release its
@@ -12713,6 +12721,73 @@ fn run_vcpu_parallel<'scope, 'env>(
                 // this vCPU consumed — see [`ThreadRegistry::wait_fork_exit`] for why neither can
                 // livelock on a stale exit nor lose a wake.
                 fork_gen = reg.wait_fork_exit(child.map(|p| p as i64), fork_gen);
+            }
+            Ok(VcpuStop::Exec {
+                mh,
+                grants_ptr,
+                grants_n,
+                entry,
+                size_log2,
+                dst,
+            }) => {
+                // #748 rung 2 — FORK.md §8.6 `execve` image-replace on the parallel driver. Every
+                // refusal writes a probeable `-EINVAL` to `dst` and lets the caller run on (POSIX:
+                // `execve` returns only on failure). Admissible from a clean root computation only
+                // (no serve handler, root fiber, a non-durable domain) — the cooperative arm's
+                // gate. Root and fork-twin execs take the SAME path here: each vCPU already owns
+                // its window/host cell, so the cooperative arm's env split does not arise.
+                let clean = vt.active.serve_ticket.is_none()
+                    && vt.active_id == ROOT_FIBER
+                    && !host.lock_unpoisoned().is_durable();
+                let built = if clean {
+                    let mut g = host.lock_unpoisoned();
+                    exec_image_build(
+                        &mut g,
+                        mem.as_ref(),
+                        dom,
+                        mh,
+                        grants_ptr,
+                        grants_n,
+                        entry,
+                        size_log2,
+                    )
+                } else {
+                    Err(())
+                };
+                match built {
+                    Err(()) => vt.active.set(dst, Reg::from_i32(super::EINVAL as i32)),
+                    Ok((child_host, child_table, new_vt)) => {
+                        // Replace the powerbox INSIDE this vCPU's cell, not the `Arc` itself: a
+                        // fork twin's exit-hook holder kept a clone of the cell at spawn, so the
+                        // post-exec exit must find the CARRIED hooks (`exec_carry`) behind the
+                        // same cell — the parallel analogue of the cooperative arm overwriting
+                        // `extra_envs[k].host`. The window is already the command's image
+                        // (materialized in place by the build); the command's natural table
+                        // replaces this vCPU's dispatch table.
+                        *host.lock_unpoisoned() = child_host;
+                        tbl = Some(std::sync::Arc::new(child_table));
+                        vt = new_vt;
+                    }
+                }
+            }
+            Ok(VcpuStop::PipeRead { pipe }) => {
+                // #748 rung 3 (#1080 rung 4) — blocking CorePipe read: the op was rewound, so
+                // block this OS thread until level-triggered readiness (bytes buffered, or every
+                // writer closed) and let the loop re-execute it (a read, or EOF). A short-sleep
+                // poll rather than a condvar door: the peer end lives on another powerbox (a fork
+                // twin's, or even another driver's engine) with no cross-thread doorbell into this
+                // cell yet, and a level-triggered poll cannot lose a wake. Condvar doors on the
+                // shared pipe backing are the follow-up.
+                while !host.lock_unpoisoned().pipe_read_ready(pipe) {
+                    std::thread::sleep(std::time::Duration::from_micros(50));
+                }
+            }
+            Ok(VcpuStop::PipeWrite { pipe }) => {
+                // The write twin: ready when the FIFO has room under `PIPE_CAP` (backpressure
+                // drained) or every reader closed (the re-run completes `-EPIPE`).
+                while !host.lock_unpoisoned().pipe_write_ready(pipe) {
+                    std::thread::sleep(std::time::Duration::from_micros(50));
+                }
             }
             Ok(VcpuStop::CapPending { id, dst }) => {
                 // F2: the parallel driver keeps the inline completion wait — it blocks only
@@ -12965,6 +13040,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                             &child_dom,
                             &child_reg,
                             std::sync::Arc::clone(&child_host),
+                            None,
                             child_vt,
                             child_mem,
                             child_fuel,
@@ -13117,6 +13193,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                             &child_dom,
                             &child_reg,
                             std::sync::Arc::clone(&child_host),
+                            None,
                             child_vt,
                             child_mem,
                             child_fuel,
