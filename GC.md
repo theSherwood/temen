@@ -131,7 +131,7 @@ byte** (`mask | 0xFF00_0000_0000_0000 == ~0`); see property 1.
 ### 3.0. Why ambient, not a capability (decision)
 
 The earlier draft proposed a capability-gated handle. We chose an **ambient IR op** instead —
-the same family as `cont.*`/`suspend`, and authority-neutral like `cap.self` reflection:
+the same family as `cont.*`/`suspend`, and authority-neutral like `self.*` reflection:
 
 - **It conveys ~no authority.** Every word it returns is an in-window value the guest's own
   heap already encodes; out-of-window words (host return addresses, frame pointers, host
@@ -145,7 +145,7 @@ the same family as `cont.*`/`suspend`, and authority-neutral like `cap.self` ref
   loop either way (a generic `HostFn` capability handler cannot see fibers), so a real
   capability would add `Binding`/grant/handle-validation plumbing for no security gain.
 
-The one honest caveat: unlike `cap.self`, `gc.roots` does read *control-stack* words the guest
+The one honest caveat: unlike `self.*`, `gc.roots` does read *control-stack* words the guest
 cannot otherwise name — but filtered to the guest's own heap range (and the payload `mask` is
 top-byte-only so it cannot fold a host word into that range — property 1), so no host/ASLR leak
 and no cross-principal boundary is crossed.

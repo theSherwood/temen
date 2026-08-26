@@ -381,12 +381,12 @@ index.** The split is defined by what a forged value can do:
   (§7). You populate the table only by grant, attenuation, or capability-call
   result — there is no opcode that *adds an entry* from plain data — but the
   *index* itself is ordinary forgeable data. The `handle<I>`/`funcref<Sig>` type is
-  what the verifier tracks so `call.cap`/`call_indirect` are statically typed; it
+  what the verifier tracks so `call.cap`/`call.dyn` are statically typed; it
   is **not** a claim that the value is unforgeable. (This supersedes earlier
   "sealed class / no forge opcode" language: the security comes from the table
   holding only granted authority, so we do **not** rely on sealing the index.)
   - **C function pointers** lower to exactly this: an integer index into the
-    function table, dispatched by `call_indirect` with a runtime type check.
+    function table, dispatched by `call.dyn` with a runtime type check.
     Forging confines to your own table (cannot reach host code). The standard wasm
     limitations follow — funcptr↔dataptr casts and funcptr arithmetic don't carry
     meaning across the boundary — and are accepted (§3b lowering notes).
@@ -535,14 +535,14 @@ security — UB in a sandbox IR would void the escape guarantee.
   exchange cmpxchg` at orderings; `fence`; `wait`/`notify` (futex). *(**Implemented**
   (Phase-4 concurrency, ahead of the original plan): in the IR, interpreter, and JIT,
   alongside the `cont.*` fiber and `thread.spawn`/`thread.join` primitives — see §12, D56.)*
-- **Calls** (produce results): `call <func>`, `call_indirect <funcref>` (typed;
+- **Calls** (produce results): `call <func>`, `call.dyn <funcref>` (typed;
   static check, runtime check only for dynamic dispatch), `call.cap <handle>
   <op-index>` (handle type + op-index → signature; async/sync per the operation).
 - **Select:** `select <cond> <a> <b>` (branchless, same-typed).
 - **Terminators** (exactly one per block): `br <blk>(args)`, `br_if <cond>
   <then>(args) <else>(args)` (two-target, no implicit fallthrough), `br_table
   <idx>[<blk>(args)…]<default>(args)`, `return(vals)`, `return_call` /
-  `return_call_indirect` (tail calls), `trap` / `unreachable`.
+  `return_call.dyn` (tail calls), `trap` / `unreachable`.
 - **Deferred to their sections:** SIMD vector ops (§17), stack-switch terminators
   for fibers/continuations (§12 — MVP is single-fiber, so stubbed).
 
@@ -608,10 +608,10 @@ Single fused decode+verify forward pass, O(module size):
    (no implicit coercion); result type(s) appended per opcode.
 4. **Branches:** target in range; branch-arg count + types = target block's declared
    parameter types, exactly.
-5. **Calls:** arg count/types = callee signature; `call_indirect` funcref type
+5. **Calls:** arg count/types = callee signature; `call.dyn` funcref type
    matches; `call.cap` op-index in range and arg types = the operation signature.
 6. **Capability typing (not sealing):** `handle<I>`/`funcref<Sig>` are tracked as
-   *types* so `call.cap`/`call_indirect`/attenuation ops are statically checked, but
+   *types* so `call.cap`/`call.dyn`/attenuation ops are statically checked, but
    the *value* is an ordinary forgeable table index (D37). The verifier does **not**
    try to prove indices unforgeable — it checks index-carrying opcodes are
    well-typed and that static indices are in range; runtime bounds- + type-checks
@@ -653,7 +653,7 @@ at *use* or by *out-of-band storage*:
 | Escape vector | Confined by |
 |---|---|
 | memory access | bounds check of final effective address, trap out-of-window (§4) — use-site |
-| indirect call `call_indirect` | function-table bounds + type check — use-site |
+| indirect call `call.dyn` | function-table bounds + type check — use-site |
 | capability call `call.cap` | handle-table bounds + type + liveness, **host-owned table** — use-site |
 | direct call / branch | static targets, verifier-checked — no runtime value |
 | **return** | out-of-band control stack (§5) — not guest-addressable at all |
@@ -670,7 +670,7 @@ use-site checks, not value sealing.
 ### Function table
 **Contents:** exactly the domain's own functions (domain-global indices across all
 linked modules, §13/§14, assigned at instantiation/link). There are **no imported
-host functions** (§7: all host access is `call.cap`), so `call_indirect` cannot
+host functions** (§7: all host access is `call.cap`), so `call.dyn` cannot
 leave guest code and carries **zero host authority** — pure intra-guest control flow.
 
 **Representation** — flat, power-of-two-padded, **AoS** (the two fields are always
@@ -682,7 +682,7 @@ fn_table: [FnEntry; pow2]                           // indexed by function index
 - `funcref<Sig>` value = a function index (a plain integer).
 - `ref.func <funcidx>` → `funcref<Sig_funcidx>` (the index; direct, no check).
 - `call <funcidx>(args)` → fully static direct call (verifier checks funcidx + types).
-- `call_indirect <Sig>(fref, args)` — **always runtime-checks** (D38, wasm parity;
+- `call.dyn <Sig>(fref, args)` — **always runtime-checks** (D38, wasm parity;
   JIT devirtualization is a later optimization, not MVP):
   ```
   i = fref & (len-1)                  // mask, not branch → Spectre-v1 safe table load
@@ -696,7 +696,7 @@ ordinary integer ops in guest memory — **no `table.set/get/grow` needed** (a m
 array of function pointers is just an array of indices in guest memory). Accepted
 casualties (standard wasm): function-pointer *arithmetic*, and casting a *data*
 pointer into a callable funcref (a guest-internal JIT) — the latter simply traps at
-`call_indirect`, which is correct for a sandbox. **Deferred:** mutable/growable
+`call.dyn`, which is correct for a sandbox. **Deferred:** mutable/growable
 function tables and `table.*` opcodes — add only if a language demands them.
 
 ### Handle table (the powerbox)
@@ -727,15 +727,15 @@ Consequences:
   are both `handle<Stream>` yet dispatch to different host code), and §14 *requires*
   this: a capability may be **pass-through** or **parent-virtualized**, and the child
   can't tell which. So the general `call.cap` is an **indirect** call through the
-  entry's vtable (retpoline / eIBRS, like `call_indirect`, §9). The JIT
+  entry's vtable (retpoline / eIBRS, like `call.dyn`, §9). The JIT
   **devirtualizes** it to a direct, inline-able call (§9's "inline-able to ~free")
   when it can prove the binding — e.g. a powerbox import never reassigned — exactly
-  the optimization deferred for `call_indirect`. Cross-domain / slow capabilities are
+  the optimization deferred for `call.dyn`. Cross-domain / slow capabilities are
   just a vtable whose entries are trampoline stubs (marshal to supervisor / ring
   submit, §9).
   - **Devirtualization is deferred, and the cost of doing it is the reason (not just
     laziness).** Today `call.cap` lowers to one fixed generic host thunk: marshal args
-    into an `i64` slot array, `call_indirect` the thunk, and the **host** does the
+    into an `i64` slot array, `call.dyn` the thunk, and the **host** does the
     mask + `type_id` + `generation` resolve — the JIT does *no* authority work, so its
     role carries no authority-TCB. Devirtualizing pulls binding-resolution and
     check-elision *into* the escape/authority-TCB codegen, where a miscompile is an
@@ -786,7 +786,7 @@ against the window before the host borrows it in place (§9's "arg bounds-check"
 
 ### Verifier delta
 - `ref.func f`: `f` in range → result `funcref<Sig_f>`.
-- `call_indirect Sig`: operand `funcref`; args match `Sig` params; results = `Sig` results.
+- `call.dyn Sig`: operand `funcref`; args match `Sig` params; results = `Sig` results.
 - `call.cap op_index`: operand `handle<I>`; `op_index < I.op_count` (static, type
   section); args/results match `I.ops[op_index]` (results may be handle/funcref-typed).
 - int↔funcref and int↔handle conversions allowed (plain-data-like) — use-site checks
@@ -803,7 +803,7 @@ tag at a *fixed* offset, index at the bottom, an optional generation between:
 | Kind | carried width | generation | index/payload | tag cost |
 |---|---|---|---|---|
 | **data pointer** | i64 | — | window offset (≤ `reserved_log2` < 56) | none — masking already strips high bits (the `gc.roots` top-byte mask, §21) |
-| **funcref** | i64 | — | function-table index | none — no generation; `call_indirect` masks `& (len-1)` |
+| **funcref** | i64 | — | function-table index | none — no generation; `call.dyn` masks `& (len-1)` |
 | **import/cap handle** | **i32** | 24 bits | 8-bit slot (`CAP_LOG2`) | none — the handle lives in the low 32 bits of a 64-bit tagged cell; `call.cap` truncates to `i32`, dropping the top byte |
 | **fiber/thread handle** | i64 | **32 bits** (was 40) | 24-bit slot (`MAX_FIBERS=1<<24`) | generation trimmed 40→32 to vacate the top byte |
 
@@ -1384,7 +1384,7 @@ domain's egress = the transitive closure of its granted capabilities).
   backends already emit — so C/Rust/non-OO toolchains target it with no
   impedance mismatch.
 
-### Host-defined capabilities & discoverability  [SETTLED] (late binding + `cap.self` reflection SETTLED; runtime `Resolver` = host-layer)
+### Host-defined capabilities & discoverability  [SETTLED] (late binding + `self.*` reflection SETTLED; runtime `Resolver` = host-layer)
 The set of capabilities is **open and host-extensible by construction** — the VM,
 verifier, and TCB enumerate *no* fixed list. The §3e MVP four are ordinary
 instances of this mechanism. A capability interface is just **data + host code**:
@@ -1428,10 +1428,10 @@ something new is a capability**:
   (fixed once instantiation completes), so the §9 egress closure is unaffected — only the
   *binding* moved from compile-time to instantiation-time. The **same named-import mechanism
   generalizes to cross-unit linking** — a name may bind to another function (a direct `call`) or a
-  table slot (`call_indirect`), not only a capability — which is how in-window dynamic linking
+  table slot (`call.dyn`), not only a capability — which is how in-window dynamic linking
   (`vm_dlopen`) works; see §22.
 
-- **Reflection = an always-available intrinsic** (`cap.self`), read-only over the domain's
+- **Reflection = an always-available intrinsic** (`self.*`), read-only over the domain's
   **own** handle table: it returns the count and, per live entry, the `type_id` + op-schema
   of the capabilities **this domain has actually been granted**. This is *not* ambient
   authority and does **not** void §9: reflecting the held set confers nothing (the guest
@@ -1446,11 +1446,11 @@ something new is a capability**:
   leak. The boundary is sharp: enumerating **your own** granted set is fine; there is still
   **no "list everything the host could offer" call** — *that* would be ambient authority.
 
-  *Naming the two `cap.self` families* (CONSOLIDATION §7): the op space today holds
+  *Naming the two `self.*` families* (CONSOLIDATION §7): the op space today holds
   **reflection** (`count`/`get`/`resolve`/`label`/`attest`/`provenance`/`type_id`/`covers` —
   the read-only, authority-neutral intrinsic this section defines) and the **domain-runtime
   verbs** (`svc.*`, `clone_caller`, `fuel.remaining` — operations *on the current domain's
-  runtime*, not reads of its grant table). The verbs live under `cap.self` only because it
+  runtime*, not reads of its grant table). The verbs live under `self.*` only because it
   was the op space needing no wire change when they landed, not because they are reflection.
   Keep the families distinct in prose and docs; an actual op-space split is deliberately
   deferred to a wire rev that happens anyway (same policy as `call.sym`'s vestigial handle
@@ -1704,7 +1704,7 @@ requirement.
   self-describing format; designed later, above the VM layer.
 - **Runtime acquisition `Resolver`** (§7, host-layer — not built): optional
   `lookup(name) -> handle` registry; host-layer, outside the TCB; not ambient
-  authority. (Late binding at instantiation and the always-available `cap.self`
+  authority. (Late binding at instantiation and the always-available `self.*`
   *reflection* intrinsic are now SETTLED in §7 — only runtime *acquisition* of a
   not-yet-held capability remains a deferred host-layer feature.)
 - **MTE** (§10): optional probabilistic intra-guest detection in the §5 hardened
@@ -2171,7 +2171,7 @@ The child cannot tell whether a capability is real or parent-emulated — the
 interface is identical. There is no "am I nested?" query by default — a
 virtualized capability stays indistinguishable from the real one. A domain may,
 however, **opt in** to one platform-vouched provenance report via
-`self.attest` (§6 of `PROCESS.md`): a `cap.self` intrinsic is a D46
+`self.attest` (§6 of `PROCESS.md`): a `self.*` intrinsic is a D46
 runtime-resolved primitive, never a handle, so no nested host can interpose or
 forge it — the one report a hostile parent cannot fake. This is the deliberate,
 narrow exception to "no nesting query": self-protection from a hostile nested
@@ -2728,7 +2728,7 @@ for free** (weval's value proposition for SpiderMonkey, applied here).
     stays dynamic has its **CFG inlined as residual blocks** — the context's call stack carries the
     caller's live values through the callee (dead ones cleaned by the optimizer) and each `return`
     becomes a branch to the continuation. Loops and `unreachable` in the callee work; one residual
-    function still comes out. A constant-index `call_indirect`/`ref.func` resolves through the
+    function still comes out. A constant-index `call.dyn`/`ref.func` resolves through the
     identity table and inlines too. (Indirect-dynamic/host calls are not inlined.)
   - **Outlining (residual-call mode, opt-in).** Instead of inlining, each `(callee, arg pattern)`
     can be specialized to its own residual function (memoized/shared) and called — a multi-function
@@ -2763,7 +2763,7 @@ for free** (weval's value proposition for SpiderMonkey, applied here).
   only in range and is otherwise kept so it still traps); static + dynamic branches; any-width
   constant-memory reads; renamed stack/locals (word **and** narrow `i8`/`i16` cells, with a dynamic
   heap alongside); cross-function `call` inlining — direct **and** constant-index
-  `call_indirect`/`return_call_indirect`/`ref.func` (resolved through the identity module-0 table) —
+  `call.dyn`/`return_call.dyn`/`ref.func` (resolved through the identity module-0 table) —
   with static + dynamic control flow, recursion, and loops; and opt-in **outlining** (specialize a
   callee to a shared residual function, for dynamic-depth recursion / bounded size); **and the
   guest-side, in-sandbox engine** (above). **Remaining enhancement (not a gap):** the **exotic SIMD
@@ -2925,7 +2925,7 @@ for compile-then-sandbox.
 | 0 `compile` | `(ptr, len) -> code \| -errno` | borrow blob, decode+verify+precondition gate, compile into the domain, mint a `CompiledCode` handle. Fail-closed. |
 | 1 `invoke` | `(code, args…) -> results` | run the unit's entry over the live window (raw i64-slot ABI); a trap is **terminal for the domain** (§5). |
 | 2 `release` | `(code) -> 0 \| -errno` | revoke the handle (generation bump). Code/slots not freed (see reclaim). |
-| 3 `install` | `(code) -> slot \| -errno` | write the unit into the `call_indirect` table's next reserved slot; returns a funcref index (`-ENOSPC` if full). |
+| 3 `install` | `(code) -> slot \| -errno` | write the unit into the `call.dyn` table's next reserved slot; returns a funcref index (`-ENOSPC` if full). |
 | 4 `uninstall` | `(slot) -> 0 \| -errno` | clear an installed slot (reusable; stale calls trap). |
 | 5 `compile_linked` | `(ir, ir_len, symtab, symtab_len) -> code \| -errno` | like `compile`, but the unit may carry **unresolved §7 imports** bound by name against the guest-provided symbol table before verify — the dynamic-linking entry (below). Fail-closed. |
 
@@ -2938,7 +2938,7 @@ auto-compacting REPL driven by `JitSession`; `jit_link.c`/`jit_dlopen.c`/`jit_ho
 ### The one structural obstacle — the baked function-table mask
 
 Dropping the module at end-of-run is *policy*; the real obstacle to incremental compilation is that the
-**function-table mask is baked as a compile-time `iconst` at every `call_indirect` site** (the
+**function-table mask is baked as a compile-time `iconst` at every `call.dyn` site** (the
 Spectre-safe `slot = band(idx, fn_table_mask)` + `type_id` check, invariant I2 — the touchiest
 escape-TCB lowering). Add a function that crosses a power-of-two boundary and every already-compiled
 site holds the stale mask. Two models design *around* it, not through it:
@@ -2952,7 +2952,7 @@ site holds the stale mask. Two models design *around* it, not through it:
 - **Model B2 (shipped, `install`) — neutralize the mask by pre-sizing.** Reserve a fixed power-of-two
   table up front (`table_reserve_log2` / `grant_jit_with_table`, identical on both backends), so the mask
   is constant from `t=0`; only *population* is dynamic (empty slots are `PADDING_TYPE_ID` and trap until
-  filled). An installed unit *is* a funcref — old code `call_indirect`s it at native speed, with no
+  filled). An installed unit *is* a funcref — old code `call.dyn`s it at native speed, with no
   boundary crossing. (B1, a *growable* table that moves base+mask, is rejected — it would edit the
   Spectre-safe dispatch for nothing B2 lacks.)
 
@@ -2961,7 +2961,7 @@ differentially pinned. The reference interpreter matches the JIT's code-pointer 
 **module-aware frames** (`Frame.module`: 0 = the program, ≥1 = an installed unit) dispatching through a
 shared, live `DomainTable`.
 
-**Type identity = an append-only intern, not a linking subsystem.** Cross-unit `call_indirect` is sound
+**Type identity = an append-only intern, not a linking subsystem.** Cross-unit `call.dyn` is sound
 because a single `CompiledModule` owns the domain's entire id space: the map `FuncType → type_id` is an
 **injection, append-only (an id never remaps), and total over participants** (every signature is interned
 before code referencing it is lowered). Given that, id-equality coincides *exactly* with the interpreter's
@@ -2997,7 +2997,7 @@ precondition, and the data-segment rejection are unchanged. Mechanics: the paren
 runtime even when it uses no fibers itself (`grant_jit_fibers` → `CompiledModule::enable_fiber_hosting`,
 which builds the table/runtime/`cont.*` thunk env post-compile so a submitted unit's `cont.*` resolve
 `CURRENT_RT`); the shared `jit_resolve_and_validate` admits `cont.*` and rejects only threads/futex on both
-backends; a unit names a fiber entry by table slot (`cont.new <slot>`, new→old like `call_indirect`), and
+backends; a unit names a fiber entry by table slot (`cont.new <slot>`, new→old like `call.dyn`), and
 the reference interpreter resolves it through the module-0 dispatch table in lockstep with the JIT's shared
 `fn_table`. Pinned by `jit_cap::submitted_unit_hosts_a_fiber_agrees` (differential) +
 `submitted_unit_threads_compile_split_by_tier`. On the **wasm-JIT tier** the same fiber allowance holds
@@ -3008,7 +3008,7 @@ by a different mechanism — fibers stay on the interpreter and the emitted regi
 compile-time threads/futex veto above is lifted: the hazard it guarded — a spawned vCPU outliving the
 synchronous `call.cap` — is *invoke*-shaped, and is enforced where it is real: `invoke` of a unit that
 spawns/parks still fails at runtime (the nested run is seam-free — anything but a plain return is an
-inert `CapFault`). The supported path is **`install` + `call_indirect`**: installed code executes in
+inert `CapFault`). The supported path is **`install` + `call.dyn`**: installed code executes in
 the calling vCPU's own frames, where `thread.spawn` is an ordinary **module-aware** spawn — the func
 index resolves in the spawning frame's module and the spawned vCPU's root frame starts there
 (`VcpuEvent::Spawn` carries the module; every driver constructs the child from
@@ -3124,13 +3124,13 @@ missing symbol) is caught by re-verification, never trusted. Two flavors, both b
   `&g + 4` works) — no new IR instruction, just a constant edit. Duplicate / cross-namespace symbol
   collisions, bad exports, and unresolved/non-const relocations all fail closed.
 - **Dynamic** (`Resolved::Slot` + `compile_linked`, like `dlopen`) — a **separately-compiled** unit
-  reaches a function it does not share an index space with through the **shared `call_indirect` table**
+  reaches a function it does not share an index space with through the **shared `call.dyn` table**
   at a runtime-assigned slot. Both directions work: plugin→host and old/loaded→newly-installed.
 
 **The lowering primitive** is `temen_ir::resolve_imports_with`: each `CallSym` (the v8 symbolic-call
 spelling; a bound `call.sym` also executes directly as flat import dispatch) rewrites **1:1** (no
 value renumbering) to `Cap(ResolvedCap)`→`call.cap` (the §7 case), `Func(FuncIdx)`→a direct `call`
-(static), or `Slot(u32)`→`call_indirect <slot>` (dynamic; the symbol's handle operand must be a
+(static), or `Slot(u32)`→`call.dyn <slot>` (dynamic; the symbol's handle operand must be a
 `ConstI32` placeholder, patched to the slot and reused as the index). Unresolved/ill-typed → fail-closed.
 
 **Serializable imports (codec v2).** So a unit can be shipped as a `.so` with *undefined references*,
@@ -3150,7 +3150,7 @@ untrusted-input surface). The `JitValidator` seam carries the symtab bytes so re
 **Security argument.** Resolution is rewrite-**then**-verify, so a missing name, a wrong import
 signature, or a non-const slot handle fails verification — nothing reaches Cranelift. The symbol
 table's *values* are **guest-chosen by design and confer no authority**: a resolved `Slot` lowers to a
-`call_indirect`, which is masked + `type_id`-checked at the call exactly like any index the guest
+`call.dyn`, which is masked + `type_id`-checked at the call exactly like any index the guest
 already controls in its own code — binding to a **wrong-typed** slot **traps `IndirectCallType`**, never
 a type-confused dispatch; binding to a forged slot is no worse than a forged index the §3c table check
 already handles. So host-assisted linking adds **no escape-TCB surface** on top of §22 — it is the
@@ -3337,7 +3337,7 @@ every bound checked); `temen-mask` `confine` (in-window for all inputs incl. `u6
 `Window::sub` can't wrap past its sub-range); the `temen-mem` unsafe contracts; JIT mask
 elision (`ub_of`/`in_window` upper-bound-sound, saturating, width-accounted); the call.cap
 ABI (buffers sized from the compile-time verified sig); trap propagation (re-checked after
-every call/thunk); `call_indirect` (Spectre-safe masked dispatch + type-id check); the
+every call/thunk); `call.dyn` (Spectre-safe masked dispatch + type-id check); the
 `temen-fiber` switches (register/alignment-complete on all three ABIs; body panic → abort);
 the decoder (every count bounded, LEB128 overflow-guarded); the §5 kill-path (epoch-cell
 lifetime via `join_all`; parked vCPUs re-check); capability forgery resistance (generation
@@ -3529,7 +3529,7 @@ as open-ended, not a byproduct of the build.
 | D43 | MVP capability set = `Stream` (stdio via 3 handles), `Exit`, `Clock`, `Memory`; stdio reuses one `Stream` interface (not a bespoke Console) so files/sockets compose later | Settled | First concrete handle-table interfaces (§3c) + C-runtime targets (§3d); orthogonal, one interface to verify (§3e) |
 | D44 | Powerbox = `entry(stdin, stdout, stderr, exit, clock, memory, args_buffer)`; args buffer = `{argc,envc}` + packed NUL-terminated strings | Settled | Concrete instantiation grant + C `main` wrapper contract (§3b/§3d/§3e) |
 | D45 | `call.cap` dispatch is **per-entry** (vtable in the `HandleEntry`), not per-type — generally an indirect call (retpoline/eIBRS), devirtualized to direct/inline when the binding is statically known. **Devirtualization is deferred — cost recorded in §3c** (authority-TCB in codegen, fights compile⊥instantiate, sound only for stable handles, only half the measured cost; scalar `call.cap` ~1.24× wasm but the zero-copy buffer win needs none of it) | Settled (devirt deferred) | Corrects §3c over-claim; one interface type has many implementations per handle, and §14 virtualization (pass-through vs parent-emulated) needs per-handle dispatch; forgery checks unchanged. Deferral is a recorded trade, not an oversight — don't relitigate without a measured workload |
-| D46 | Capability set is **open/host-extensible** (interface signature in the module type section + host-registered vtable, bound by named import at instantiation, signature-validated fail-closed); **binding may be late** (names resolved at instantiation; the general form of the powerbox), **reflection over the domain's *own* granted set is an always-available `cap.self` intrinsic** (read-only; authority-neutral), and runtime *acquisition* of a not-yet-held cap is a granted `Resolver` registry deferred to a host layer | Settled | The §3e four are just instances; late binding keeps the per-instance grant set statically bounded; `cap.self` confers nothing (reflection ≠ amplification) so the §9 egress-closure analysis stays intact; only acquisition (`Resolver`) widens the grant graph, and it stays a gated host-layer cap outside the TCB |
+| D46 | Capability set is **open/host-extensible** (interface signature in the module type section + host-registered vtable, bound by named import at instantiation, signature-validated fail-closed); **binding may be late** (names resolved at instantiation; the general form of the powerbox), **reflection over the domain's *own* granted set is an always-available `self.*` intrinsic** (read-only; authority-neutral), and runtime *acquisition* of a not-yet-held cap is a granted `Resolver` registry deferred to a host layer | Settled | The §3e four are just instances; late binding keeps the per-instance grant set statically bounded; `self.*` confers nothing (reflection ≠ amplification) so the §9 egress-closure analysis stays intact; only acquisition (`Resolver`) widens the grant graph, and it stays a gated host-layer cap outside the TCB |
 | D47 | Escape-freedom is the **conjunction** `Verified ∧ Correct(JIT) ∧ Correct(runtime) ∧ Correct(host/HW)`, not "verified ⇒ safe"; TCB split into **escape-TCB vs authority-TCB**; decomposed into invariants **I1–I5** (owner + validation each); written as a **structured-prose contract**, not a proof | Settled | Puts risk where it lives (JIT dominates, not the verifier); makes host-extensible caps safe (authority-TCB ≠ escape-TCB); anchors the security work; matches the "as secure as wasm" bar (§2a) |
 | D48 | **Availability / DoS is a non-goal** — bounded by metering (fuel/quota/preemption) + the kill path, contained not prevented (incl. §17 GPU); hardware fault injection below the trust line; trust boundary is **verified IR**, frontend untrusted for escape (eBPF model) | Settled | Honest scope; avoids claims the metering/preemption story (and GPU) can't back; verifier makes the frontend untrusted for escape (§2a) |
 | D49 | Host (escape-TCB) in **Rust**; frontend in **C**; backend **Cranelift** | Settled | Backend is Rust-native (coupled to D36); Rust gives memory-safe TCB + best fuzzing (`arbitrary`) + compiler safety net for an expert-less agent build; frontend's language is safety-irrelevant (§2a), so C/chibicc is free; compile-time tax accepted |

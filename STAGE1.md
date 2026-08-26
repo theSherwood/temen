@@ -275,7 +275,7 @@ keystone of self-similarity. It is **not built**. Until it lands:
    (head/tail/done/reader-closed words + data), parking on real futexes with
    the loud 5 s-timeout bail; `head`'s early exit sets reader-closed so its
    producer stops (SIGPIPE-lite) instead of wedging. The `__stage` runner is
-   an ordinary `--child-entry` C program — grants discovered by `cap.self`
+   an ordinary `--child-entry` C program — grants discovered by `self.*`
    reflection, rings mapped with the `__vm_region_*` builtins into its own
    256 KiB window, filters (`cat`/`grep [-v -c]`/`wc`/`head`/`tail`/`sort`/
    `uniq`) byte-matching the shell's builtins — and holds no memfs capability
@@ -392,7 +392,7 @@ signals ladder). In dependency order:
    *Medium/mechanical.* Gets bash to *link and start*.
 3. **`fork` (the gate)** — the substrate has **no fork-returns-twice**. The plan (§7 / Stage 3 / S11)
    implements it at the **personality** level over durable freeze → clone-window → thaw, with two hard
-   prereqs: **R8 closure** (durable `call_indirect` to may-suspend targets — bash dispatches builtins
+   prereqs: **R8 closure** (durable `call.dyn` to may-suspend targets — bash dispatches builtins
    through function-pointer tables, so R8 is squarely on fork's critical path) and a
    durable-instrumented build + full window copy (CoW later). *Large; the single biggest item.* Until
    it lands, bash runs only a fork-free subset — effectively no real script (`ls | wc` already forks).

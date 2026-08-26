@@ -159,7 +159,7 @@ unify into one (in `temen-ir` or `temen-interp`) consumed by both backends.
       `crates/temen/tests/powerbox_imports.rs` (arbitrary-named host-fn caps, unbound fail-closed,
       standard names as a preset), interp == jit.
 - [x] A runtime name→handle directory (F7): the guest resolves a capability name to its handle at
-      runtime via `cap.self` op 2 (dlopen-style), over the `Host` `cap_names` directory populated at
+      runtime via `self.*` op 2 (dlopen-style), over the `Host` `cap_names` directory populated at
       grant. Compile-time name binding remains the default; this adds dynamic in-guest discovery.
 - [ ] (Deferred) full dynamic stash sizing (heap base above an arbitrary-N stash) to lift the
       ≤8-with-heap / ≤32-without cap; not needed until a frontend wants >8 named caps *and* a heap.
@@ -454,7 +454,7 @@ sequence. Plus a C-ABI mirror (`temen_session_*`).
 - **F8 — full dynamic stash sizing** (Phase 2 deferral): lift the ≤8-with-heap / ≤32-without cap by
   placing the heap base above an arbitrary-N stash.
 - **F9 — cosmetic capability labels.** *Landed.* The reverse of F7: a human-readable **label** for a
-  granted capability, surfaced for diagnostics and `cap.self` discovery. It reuses F7's `cap_names`
+  granted capability, surfaced for diagnostics and `self.*` discovery. It reuses F7's `cap_names`
   directory (a label *is* the registered name), exposed two ways: (1) host-side `Host::cap_label(handle)
   -> Option<&str>` for embedder diagnostics; (2) guest-side first-class instruction **`self.label
   <handle> <buf_ptr> <buf_cap> -> i32`** (opcode `0x7F`; full text/binary/verify support) that writes
@@ -567,7 +567,7 @@ sequence. Plus a C-ABI mirror (`temen_session_*`).
 
 - Phase 2: do we want the **runtime** name→handle directory (true dynamic lookup the *guest* can
   query), or is compile-time name binding at `instantiate` enough? **Resolved: both.** Compile-time
-  name binding stays the default (wasm parity); the runtime directory shipped as **F7** (`cap.self`
+  name binding stays the default (wasm parity); the runtime directory shipped as **F7** (`self.*`
   op 2) for in-guest dlopen-style discovery.
 - Phase 5: which C consumers drive the priority — JACL's runtime, or external embedders? That
   decides whether the C ABI leads or trails the Rust facade.

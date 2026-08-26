@@ -104,7 +104,7 @@ predicate, silent divergence documented as a quirk, or naming that hides which e
 serve-qualification veto.)
 
 **Fuel is a checked cross-engine quantity, not an excluded difference.** Fuel is charged at
-**IR-anchored safepoints** — one per taken back-edge, per function entry (`call`/`call_indirect`/
+**IR-anchored safepoints** — one per taken back-edge, per function entry (`call`/`call.dyn`/
 `return_call*` and the *top-level* entry), and per `cont.resume` — so the tree-walk oracle, the
 bytecode interpreter, and the Cranelift JIT all charge off the *same* IR structure and a run either
 completes on all three or traps `OutOfFuel` at the *identical* safepoint. The differential harnesses

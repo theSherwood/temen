@@ -126,7 +126,7 @@ cover every deployment shape, layered by how far "inside" the loop runs:
 2. **In-guest compile-and-run — already built: the §22 `Jit` capability + `vm_dlopen`.** A guest
    can hand serialized Temen IR from its own window to the host, which runs the fail-closed
    **rewrite-then-verify** gate (`jit_resolve_and_validate`: `decode_module` →
-   `resolve_imports` → `verify_module` → install) and returns callable `call_indirect` slots.
+   `resolve_imports` → `verify_module` → install) and returns callable `call.dyn` slots.
    The C-level loader (`<vm_dl.h>`: `vm_dlopen`/`vm_dlsym`/`vm_dlclose`) is **built and
    differentially tested** (DESIGN.md §22, "In-window dynamic linking — SETTLED"). So
    *compile → load → call, entirely in-guest,* is a composition of existing pieces. The one

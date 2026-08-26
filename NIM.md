@@ -531,8 +531,8 @@ plumbing. Five workstreams, roughly independent:
     stdlib `gvar` whose type is a `proctype` (the allocator's `oomHandler`, `gExitFlush`,
     `scheduler`) is a function-*pointer* **data** symbol, not a proc — so a sibling module's
     `(call oomHandler.0.<sys> …)` must lower to a `data.sym` load of the `i32` funcref +
-    `call_indirect`, not a proc import (which fail-closes at link as `Unresolved`, since the owning
-    module exports the name as *data*). Like aggregate **types**, the `call_indirect` signature is
+    `call.dyn`, not a proc import (which fail-closes at link as `Unresolved`, since the owning
+    module exports the name as *data*). Like aggregate **types**, the `call.dyn` signature is
     needed at *translate* time, so `link_selected` now also pools every unit's funcref gvars
     (`Translator::export_funcrefs`, name+stem → `FnPtrSig`) and pre-registers them
     (`import_funcrefs`); `lvalue_type`/`lvalue_addr` then treat a pooled name as an `FnPtr` global
@@ -628,7 +628,7 @@ plumbing. Five workstreams, roughly independent:
     procs to lower closed a run of translator gaps, each with a synthetic both-engines test
     (`tests/indirect.rs`): the **char-literal lexer** (a space char `' '` no longer splits, fixing
     the phantom `[]=` arity), **named pointer-alias types** (`ref` types like `RootRef = (ptr …)`),
-    **indirect calls through function pointers** (`ref.func` + `call_indirect`, scalar and sret —
+    **indirect calls through function pointers** (`ref.func` + `call.dyn`, scalar and sret —
     coroutine scheduling: `trivialTick`/`advance`/`setScheduler`), **RTTI virtual dispatch** (the
     `o.vt.mt[i]` method-table walk, via cast-deref static typing + `i64` slot → `i32` funcref), and
     `baseobj` base-subobject upcasts. Linking the whole object end-to-end now needs only the 25
@@ -661,7 +661,7 @@ plumbing. Five workstreams, roughly independent:
     continueAfterOutOfMem`, `var gExitFlush = nimNoopFlush` are funcref gvars whose value is a
     **static initializer** (a proc pointer). We used to zero-reserve the slot on the assumption the
     system `ini` writes it — but `ini` is minimal (it only resets an exception global); the
-    initializer *is* the value, and nothing wrote it, so the first `call_indirect` through the gvar
+    initializer *is* the value, and nothing wrote it, so the first `call.dyn` through the gvar
     trapped (`IndirectCallType` through func 0 — surfacing deep in `cAbort`'s flush). Fixed with a
     **`data.funcref` relocation** (the funcref twin of `data.ptr`, temen_ir D-LINK): `temen-leng`'s
     `collect_globals` records a proctype gvar's proc initializer, `translate_object_module` emits a
