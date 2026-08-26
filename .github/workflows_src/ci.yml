@@ -847,6 +847,20 @@ jobs:
         # copy-over can't break CI parsing.
         run: |
           node -e "try{require('child_process').execFileSync('bash',['../crates/temen-run/demos/chibicc_selfhost/build_chibicc_temen.sh'],{stdio:'inherit'});require('fs').copyFileSync('/tmp/temen_chibicc_cache/chibicc.temen','web/assets/chibicc.temen');console.log('staged chibicc.temen')}catch(e){console.log('chibicc asset skipped: '+e.message)}"
+      # Stage the GNU bash card's assets (#1080) so browser-bash-test.mjs RUNS instead of SKIPping —
+      # the drift guard for real-bash pipelines on the bytecode engine (fork/exec/wait/CorePipe through
+      # the wasm FFI). The cached input (bash_linked.ll) is code-independent (keyed on the bash demo
+      # sources — shim/build script/version); the translate half regenerates from current code every
+      # run, exactly like the Postgres split. Fail-soft: an ftp.gnu.org outage degrades to a SKIP
+      # (bash.temen is GPLv3 — fetched-and-built, never committed), never a red gate.
+      - name: cache bash build inputs
+        uses: actions/cache@v4
+        with:
+          path: /tmp/temen_bash_cache/bash_linked.ll
+          key: bash-inputs-v1-${{ hashFiles('crates/temen-run/demos/bash/**') }}
+      - name: build + stage bash artifacts
+        working-directory: browser
+        run: node build-bash-assets.mjs || echo "bash assets skipped (fetch/toolchain hiccup — browser-bash-test will SKIP)"
       # The self-host closure image (chibicc_selfhost.img) for the "chibicc compiles its own source" card:
       # chibicc's own cc1 TU sources + the glibc header closure, seeded so browser-play-editor-test.mjs can
       # run chibicc.temen --emit-object over them and diff the object against native chibicc (which this step
@@ -914,8 +928,19 @@ jobs:
           # The temen-posix shell card (STAGE1.md): stage the committed shell fixture into web/assets,
           # then drive `temen_run_shell` in real Chromium and assert the script's stdout. The test
           # skips cleanly if the asset is absent, so the copy is what makes it actually run.
-          cp tests/fixtures/shell.temen web/assets/shell.temen
+          # ALL FOUR of the test's gate assets — it SKIPs (exit 0) when any is absent, and copying
+          # only shell.temen left it silently skipping on every PR (stage_runner/primes/upper are
+          # otherwise staged by build-onramp-assets.mjs, which runs later and only on a main push).
+          # That silent skip is how the wasm32 personality-clock panic (Instant::now in
+          # temen_posix::grant) went unnoticed until the #1080 bash card hit it.
+          cp tests/fixtures/shell.temen tests/fixtures/stage_runner.temen \
+             tests/fixtures/primes.temen tests/fixtures/upper.temen web/assets/
           node browser-shell-test.mjs
+          # The real-GNU-bash card (#1080): drive `temen_run_bash` in Chromium — fork per pipeline
+          # stage, execve image-replace per /bin coreutil, CorePipe parks, blocking waitpid — and
+          # assert the script's stdout. SKIPs cleanly when the deploy-built bash.temen is absent
+          # (the fail-soft staging step above), so it reds only on a real engine/card regression.
+          node browser-bash-test.mjs
           # DAP-over-bytecode debugger through the wasm FFI: drive a full initialize→launch→breakpoint→
           # variables→terminate conversation in Chromium on the bytecode engine (DEBUGGING.md).
           node browser-dap-test.mjs
