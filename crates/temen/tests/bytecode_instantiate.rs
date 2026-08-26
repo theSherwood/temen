@@ -302,4 +302,3 @@ block 0 (v0: i64) {
 fn child_trap_propagates_through_join() {
     check(CHILD_TRAP, Err(()));
 }
-
