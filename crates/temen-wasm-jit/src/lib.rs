@@ -790,7 +790,7 @@ fn module_uses_rec(m: &Module) -> bool {
 }
 
 /// #816: can this module ever run as (or spawn) a **same-module §14 child** — a task whose window
-/// is a carve *smaller* than the emit-time window? Any `Instantiator` cap.call qualifies
+/// is a carve *smaller* than the emit-time window? Any `Instantiator` `call.cap` qualifies
 /// (conservative: ops 0/11/17 spawn same-module children directly; the rest are kept in the
 /// predicate so a new spawn op fails closed rather than eliding). When true, [`emit_module`] turns
 /// bound-check **elision** off, because an elision proof against the emit-time window is no floor

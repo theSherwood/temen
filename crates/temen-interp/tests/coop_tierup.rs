@@ -460,8 +460,8 @@ block 0 (v0: i32) {
   voff = i64.const 65536
   vsl = i64.const 12
   vq = i64.const 0
-  vh = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (ve, voff, vsl, vq)
-  vj = cap.call 6 1 (i32) -> (i64) v0 (vh)
+  vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (ve, voff, vsl, vq)
+  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
   v3 = i64.const 3
   vlocal = call 3 (v3)
   vr = i64.add vj vlocal
@@ -593,8 +593,8 @@ block 0 (v0: i32) {
   voff = i64.const 65536
   vsl = i64.const 12
   vq = i64.const 0
-  vh = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (ve, voff, vsl, vq)
-  vj = cap.call 6 1 (i32) -> (i64) v0 (vh)
+  vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (ve, voff, vsl, vq)
+  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
   v3 = i64.const 3
   vlocal = call 2 (v3)
   vma = i64.const 8
