@@ -2,7 +2,7 @@
 //! export) — STAGE1.md "real posix shell in the playground". The committed fixture
 //! `fixtures/shell.temen` is the **full** shell: the same `shim.c + ring.c + shell_main.c` the
 //! differential `crates/temen/tests/c_shell.rs` compiles, *including* external-command spawn (op 13) and
-//! concurrent ring pipelines (op 11 + `SharedRegion` + futex). Those cap.calls now run on the browser's
+//! concurrent ring pipelines (op 11 + `SharedRegion` + futex). Those call.cap calls now run on the browser's
 //! bytecode cooperative engine (the slices that lowered ops 13/11 + region + futex, plus op-13
 //! child-manifest binding). Regenerate both fixtures with
 //! `cargo test -p temen --test c_shell -- --ignored --exact gen_browser_shell_fixture`.

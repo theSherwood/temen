@@ -574,7 +574,7 @@ try {
     val: document.querySelector(`${s} .CodeMirror`).CodeMirror.getValue(),
     stored: localStorage.getItem('temen-play:src:hello'),
   }), sel);
-  (afterReset.val !== 'PERSIST_SENTINEL' && afterReset.val.includes('cap.call') && afterReset.stored === null)
+  (afterReset.val !== 'PERSIST_SENTINEL' && afterReset.val.includes('call.cap') && afterReset.stored === null)
     ? ok('Reset restores the default source and clears storage')
     : fail(`reset: ${JSON.stringify({ v: afterReset.val.slice(0, 30), s: afterReset.stored })}`);
 

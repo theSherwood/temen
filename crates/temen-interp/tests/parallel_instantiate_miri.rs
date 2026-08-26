@@ -43,7 +43,7 @@ block 0 (v0: i32) {
   i64.store q0a5 q0v4
   q0a6 = i64.const 1200
   i64.store q0a6 q0v4
-  vh0 = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
+  vh0 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   ; spawn via record (op 17): entry=1 off=69632 sl=12 quota=0
   q1v0 = i64.const 4294967296
   q1v1 = i64.const 69632
@@ -64,9 +64,9 @@ block 0 (v0: i32) {
   i64.store q1a5 q1v4
   q1a6 = i64.const 1264
   i64.store q1a6 q1v4
-  vh1 = cap.call 6 17 (i64) -> (i32) v0 (q1a0)
-  vr0 = cap.call 6 1 (i32) -> (i64) v0 (vh0)
-  vr1 = cap.call 6 1 (i32) -> (i64) v0 (vh1)
+  vh1 = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
+  vr0 = call.cap 6 1 (i32) -> (i64) v0 (vh0)
+  vr1 = call.cap 6 1 (i32) -> (i64) v0 (vh1)
   vm0a = i64.const 65536
   vm0 = i32.load8_u vm0a
   vm0e = i64.extend_i32_u vm0
@@ -151,11 +151,11 @@ block 0 (vinst: i32, vmod: i32) {
   vsl = i64.const 12
   vq = i64.const 0
   vo0 = i64.const 65536
-  vh0 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) vinst (vmod64, ve, vo0, vsl, vq)
+  vh0 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) vinst (vmod64, ve, vo0, vsl, vq)
   vo1 = i64.const 69632
-  vh1 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) vinst (vmod64, ve, vo1, vsl, vq)
-  vr0 = cap.call 6 1 (i32) -> (i64) vinst (vh0)
-  vr1 = cap.call 6 1 (i32) -> (i64) vinst (vh1)
+  vh1 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) vinst (vmod64, ve, vo1, vsl, vq)
+  vr0 = call.cap 6 1 (i32) -> (i64) vinst (vh0)
+  vr1 = call.cap 6 1 (i32) -> (i64) vinst (vh1)
   va0 = i64.const 65537
   vm0 = i32.load8_u va0
   vm0e = i64.extend_i32_u vm0

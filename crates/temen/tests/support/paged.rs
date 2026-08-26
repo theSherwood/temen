@@ -243,7 +243,7 @@ fn run_guest_argv(guest_src: &str, tail: &[i64], mode: Mode) -> Outcome {
 const FILL_UNMAP: &str = r#"memory 17
 func (i32, i64, i64, i64, i64) -> (i64) {
 block 0 (vas: i32, voff: i64, vlen: i64, vbase: i64, vspan: i64) {
-  vr = cap.call 5 1 (i64, i64) -> (i64) vas (voff, vlen)
+  vr = call.cap 5 1 (i64, i64) -> (i64) vas (voff, vlen)
   v1 = call 1 (vbase, vspan)
   return v1
   }
@@ -262,7 +262,7 @@ const FILL_PROTECT: &str = r#"memory 17
 func (i32, i64, i64, i64, i64) -> (i64) {
 block 0 (vas: i32, voff: i64, vlen: i64, vbase: i64, vspan: i64) {
   vp = i32.const 1
-  vr = cap.call 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vp)
+  vr = call.cap 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vp)
   v1 = call 1 (vbase, vspan)
   return v1
   }
@@ -280,7 +280,7 @@ block 0 (v0: i64, vn: i64) {
 const COPY_UNMAP: &str = r#"memory 17
 func (i32, i64, i64, i64, i64) -> (i64) {
 block 0 (vas: i32, voff: i64, vlen: i64, vbase: i64, vspan: i64) {
-  vr = cap.call 5 1 (i64, i64) -> (i64) vas (voff, vlen)
+  vr = call.cap 5 1 (i64, i64) -> (i64) vas (voff, vlen)
   v1 = call 1 (vbase, vspan)
   return v1
   }
@@ -300,7 +300,7 @@ const COPY_PROTECT: &str = r#"memory 17
 func (i32, i64, i64, i64, i64) -> (i64) {
 block 0 (vas: i32, voff: i64, vlen: i64, vbase: i64, vspan: i64) {
   vp = i32.const 1
-  vr = cap.call 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vp)
+  vr = call.cap 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vp)
   v1 = call 1 (vbase, vspan)
   return v1
   }
@@ -400,7 +400,7 @@ pub fn fuzz_one(data: &[u8]) -> Cat {
 
     let guest = GUESTS[(b[0] as usize) % GUESTS.len()];
     // The unmap/protect region: page-aligned start + a whole number of pages, so it carves clean
-    // Unmapped/Ro page ranges the span can cross (the cap.call is interp-serviced on both tiers).
+    // Unmapped/Ro page ranges the span can cross (the call.cap is interp-serviced on both tiers).
     let rstart = ((b[1] as u64) % (npages + 1)) * page;
     let rpages = (b[2] as u64) % (npages + 1);
     let rlen = rpages * page;

@@ -103,14 +103,14 @@ fn jit_domain_survives_freeze_serialize_restore() {
     );
 }
 
-/// Install-durability (v17): a domain's B2 `install` occupancy + the `call_indirect` table
+/// Install-durability (v17): a domain's B2 `install` occupancy + the `call.dyn` table
 /// reservation ride Section 5 and re-grant on restore, byte-identically.
 #[test]
 fn jit_install_occupancy_round_trips() {
     let module = gate_module();
     let mut host = Host::new();
     host.set_jit_validator(validator);
-    let dom = host.grant_jit_with_table(Some(SIZE_LOG2), 4); // reserve call_indirect padding
+    let dom = host.grant_jit_with_table(Some(SIZE_LOG2), 4); // reserve call.dyn padding
     let c0 = host.jit_compile(dom, &unit_blob(42)).unwrap().unwrap();
     // Record an install of the unit at a padding slot (what the eval-loop / native install arm does).
     host.jit_record_install(c0.domain, 3, c0.unit);
@@ -128,7 +128,7 @@ fn jit_install_occupancy_round_trips() {
     assert_eq!(
         thost.jit_table_log2(),
         4,
-        "the call_indirect table reservation is restored"
+        "the call.dyn table reservation is restored"
     );
     assert_eq!(
         freeze(&module, &restored, &thost).expect("re-freeze"),

@@ -1,6 +1,6 @@
 //! Indirect calls through function pointers (`proctype`) — the nimony backend's dynamic-dispatch
 //! path. A `proctype` value is an `i32` **function index** (`ref.func`); calling through it lowers to
-//! `call_indirect`, whose masked table dispatch + runtime signature check (§3c) is the security
+//! `call.dyn`, whose masked table dispatch + runtime signature check (§3c) is the security
 //! hinge — the verifier and engine carry it, temen-leng only emits the op. Both engines, §9 parity.
 
 use temen_interp::Value;
@@ -26,7 +26,7 @@ fn run(module: &temen_ir::Module, idx: u32, args: &[i64]) -> i64 {
 #[test]
 fn store_funcref_then_call_through_field() {
     // A `Box{fn: proc(int):int, v: int}`. `run(b)` stores `ref.func dbl` into `b.fn`, then calls
-    // `b.fn(b.v)`. dbl doubles, so run over v=21 → 42 — proving ref.func + call_indirect round-trip.
+    // `b.fn(b.v)`. dbl doubles, so run over v=21 → 42 — proving ref.func + call.dyn round-trip.
     let leng = "\
 (stmts
  (type :IntFn.0. . (proctype . (params (param :x.0 . (i +64))) (i +64) (pragmas (nimcall))))
@@ -44,7 +44,7 @@ fn store_funcref_then_call_through_field() {
         "run stores ref.func dbl:\n{text}"
     );
     assert!(
-        text.contains("call_indirect"),
+        text.contains("call.dyn"),
         "run dispatches indirectly:\n{text}"
     );
     // dbl = func 0, run = func 1. Box at offset 128: fn@0 (overwritten by the store), v@8 = 21.
@@ -94,7 +94,7 @@ fn call_through_funcref_param() {
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
     let text = temen_leng::translate_to_text(leng).unwrap();
     assert!(
-        text.contains("call_indirect"),
+        text.contains("call.dyn"),
         "apply dispatches indirectly:\n{text}"
     );
     // apply = func 1; f is the i32 funcref index of dbl (func 0), x = 7 → 49. `apply` makes an
@@ -128,10 +128,7 @@ fn virtual_dispatch_through_a_vtable() {
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     let text = temen_leng::translate_to_text(leng).unwrap();
-    assert!(
-        text.contains("call_indirect"),
-        "dispatch is indirect:\n{text}"
-    );
+    assert!(text.contains("call.dyn"), "dispatch is indirect:\n{text}");
 
     // getX = func 0, dispatch = func 1. Lay out a vtable and object in the window:
     //   Vtbl @ 256: mt[0] @256 = 0 (getX's function index).

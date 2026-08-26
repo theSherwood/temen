@@ -7,7 +7,7 @@
 //! in-flight* call is deferred (R2).
 //!
 //! The gate lives in the **shared** capability dispatch (`Host::cap_dispatch_slots`) that *both*
-//! backends funnel a `cap.call` through (the JIT via `temen-run`'s `cap_thunk`), so exercising it on the
+//! backends funnel a `call.cap` through (the JIT via `temen-run`'s `cap_thunk`), so exercising it on the
 //! interpreter covers the JIT's blocking path too — and deterministically, without racing an async
 //! controller against a real OS thread.
 
@@ -35,7 +35,7 @@ fn set_state(mem: &mut VecMem, state: i32) {
         .expect("state word fits the window");
 }
 
-/// A direct `Blocking.work` cap.call fails **closed** the moment an async freeze has landed, and runs
+/// A direct `Blocking.work` call.cap fails **closed** the moment an async freeze has landed, and runs
 /// normally once the window is back to `NORMAL` — the §12.8 4A.7 fail-closed, deterministically.
 #[test]
 fn blocking_call_fails_closed_once_a_freeze_has_landed() {

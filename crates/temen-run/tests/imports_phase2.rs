@@ -2,7 +2,7 @@
 //! reflect-then-attach discovery pattern over executable imports, with one call convention.
 //!
 //! A guest declares a typed-but-empty slot (`rebindable` + a template-only registry binding),
-//! discovers a granted capability at runtime (`cap.self.resolve`), attaches it into the slot,
+//! discovers a granted capability at runtime (`self.resolve`), attaches it into the slot,
 //! and drives it through the same static-mode `call.import` as any required import — on all
 //! three backends, with no module rewriting anywhere.
 
@@ -44,7 +44,7 @@ block 0 () {\n\
   i32.store8 va7 vc7\n\
   vp = i64.const 0\n\
   vl = i64.const 6\n\
-  vh = cap.self.resolve vp vl\n\
+  vh = self.resolve vp vl\n\
   vst = import.attach 0 vh\n\
   vbuf = i64.const 32\n\
   vn = i64.const 2\n\
@@ -118,7 +118,7 @@ block 0 () {\n\
   i32.store8 va3 vc3\n\
   vp = i64.const 0\n\
   vl = i64.const 4\n\
-  vh = cap.self.resolve vp vl\n\
+  vh = self.resolve vp vl\n\
   vst = import.attach 0 vh\n\
   call.import 1 (vst)\n\
   unreachable\n\
@@ -223,7 +223,7 @@ block 0 () {\n\
 }
 
 /// The manifest-completeness bit (IMPORTS.md §2.2): true for a module whose only capability
-/// dispatch is `call.import`; false the moment a dynamic-mode `cap.call` appears.
+/// dispatch is `call.import`; false the moment a dynamic-mode `call.cap` appears.
 #[test]
 fn manifest_completeness_bit() {
     let m = parse_module(ATTACH_START).expect("parse");
@@ -235,7 +235,7 @@ fn manifest_completeness_bit() {
         "func (i32) -> () {\n\
 block 0 (v0: i32) {\n\
   v1 = i64.const 0\n\
-  v2 = cap.call 0 1 (i64, i64) -> (i64) v0 (v1, v1)\n\
+  v2 = call.cap 0 1 (i64, i64) -> (i64) v0 (v1, v1)\n\
   return\n\
   }\n\
 }\n",
@@ -243,7 +243,7 @@ block 0 (v0: i32) {\n\
     .expect("parse");
     assert!(
         !temen_verify::manifest_complete(&dynamic),
-        "a cap.call makes the module open-world"
+        "a call.cap makes the module open-world"
     );
     // The reserved self namespace is exempt (§3.1): its dispatch-form ops (e.g. provenance)
     // are authority-neutral reflection, statically identifiable from the type_id immediate —
@@ -252,7 +252,7 @@ block 0 (v0: i32) {\n\
         "func (i32) -> (i32) {\n\
 block 0 (v0: i32) {\n\
   v1 = i64.const 0\n\
-  v2 = cap.call 4294967295 5 (i64) -> (i32) v0 (v1)\n\
+  v2 = call.cap 4294967295 5 (i64) -> (i32) v0 (v1)\n\
   return v2\n\
   }\n\
 }\n",

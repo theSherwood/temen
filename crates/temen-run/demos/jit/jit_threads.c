@@ -17,7 +17,7 @@
 //
 // Each worker keeps its IR in its **own** stack buffer (distinct window addresses across the pthread
 // stacks) and threads the emit cursor explicitly, so there is no shared-mutable-state race in the
-// guest emitter either — the only concurrency the VM mediates is the cap.call into the host.
+// guest emitter either — the only concurrency the VM mediates is the call.cap into the host.
 //
 // The program prints the number of input mismatches across every worker — **0** when each worker's
 // concurrently-JITed unit agrees with the C reference. Run it sandboxed:

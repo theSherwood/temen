@@ -2,7 +2,7 @@
 //! `(fuel, mem, spawn)`. §15's principle — "every meterable resource is already a capability with a
 //! quota" — promoted to an object a domain can `split` (attenuate a sub-budget) and `read` (monitor).
 //!
-//! `Budget` is an ordinary capability (it dispatches through the generic `cap.call` path, not the
+//! `Budget` is an ordinary capability (it dispatches through the generic `call.cap` path, not the
 //! eval-loop-serviced `Instantiator`), so the interpreter and the JIT service it through the **same**
 //! `Host::cap_dispatch_slots` — these tests run each program on both backends and assert identical
 //! results (parity for free, like `Stream`/`Clock`). Charging a domain's live consumption against its
@@ -56,14 +56,14 @@ block 0 (vb: i32) {\n\
   f300 = i64.const 300\n\
   m200 = i64.const 200\n\
   s3 = i64.const 3\n\
-  vsub = cap.call 14 0 (i64, i64, i64) -> (i32) vb (f300, m200, s3)\n\
+  vsub = call.cap 14 0 (i64, i64, i64) -> (i32) vb (f300, m200, s3)\n\
   fld0 = i64.const 0\n\
   fld1 = i64.const 1\n\
   fld2 = i64.const 2\n\
-  vpf = cap.call 14 1 (i64) -> (i64) vb (fld0)\n\
-  vcf = cap.call 14 1 (i64) -> (i64) vsub (fld0)\n\
-  vcm = cap.call 14 1 (i64) -> (i64) vsub (fld1)\n\
-  vcs = cap.call 14 1 (i64) -> (i64) vsub (fld2)\n\
+  vpf = call.cap 14 1 (i64) -> (i64) vb (fld0)\n\
+  vcf = call.cap 14 1 (i64) -> (i64) vsub (fld0)\n\
+  vcm = call.cap 14 1 (i64) -> (i64) vsub (fld1)\n\
+  vcs = call.cap 14 1 (i64) -> (i64) vsub (fld2)\n\
   k1000 = i64.const 1000\n\
   t0 = i64.mul vpf k1000\n\
   t1 = i64.add t0 vcf\n\
@@ -82,7 +82,7 @@ func (i32) -> (i64) {\n\
 block 0 (vb: i32) {\n\
   big = i64.const 2000\n\
   z = i64.const 0\n\
-  vsub = cap.call 14 0 (i64, i64, i64) -> (i32) vb (big, z, z)\n\
+  vsub = call.cap 14 0 (i64, i64, i64) -> (i32) vb (big, z, z)\n\
   vr = i64.extend_i32_s vsub\n\
   return vr\n\
   }\n\
@@ -95,12 +95,12 @@ const SPLIT_ALL: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (vb: i32) {\n\
   all = i64.const -1\n\
-  vsub = cap.call 14 0 (i64, i64, i64) -> (i32) vb (all, all, all)\n\
+  vsub = call.cap 14 0 (i64, i64, i64) -> (i32) vb (all, all, all)\n\
   fld0 = i64.const 0\n\
   fld2 = i64.const 2\n\
-  vcf = cap.call 14 1 (i64) -> (i64) vsub (fld0)\n\
-  vpf = cap.call 14 1 (i64) -> (i64) vb (fld0)\n\
-  vps = cap.call 14 1 (i64) -> (i64) vb (fld2)\n\
+  vcf = call.cap 14 1 (i64) -> (i64) vsub (fld0)\n\
+  vpf = call.cap 14 1 (i64) -> (i64) vb (fld0)\n\
+  vps = call.cap 14 1 (i64) -> (i64) vb (fld2)\n\
   k1000 = i64.const 1000\n\
   t0 = i64.mul vcf k1000\n\
   t1 = i64.add t0 vpf\n\

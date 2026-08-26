@@ -56,7 +56,7 @@ func (i32, i32) -> (i64) {{
 block 0 (v0: i32, v1: i32) {{
   vc64 = i64.extend_i32_u v1
   vx = i64.const {X}
-  vr = cap.call 11 1 (i64, i64) -> (i64) v0 (vc64, vx)
+  vr = call.cap 11 1 (i64, i64) -> (i64) v0 (vc64, vx)
   return vr
   }}
 }}

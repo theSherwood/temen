@@ -24,6 +24,22 @@ identical until the next agent edit.
   fail-soft without their built assets. (Until copied over, the `workflows-in-sync` guard stays red —
   the expected mirror-edit friction; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
 
+- **bash playground assets + Chromium E2E + the shell test's silent skip (`ci.yml`, #1080)** — three
+  additions to the `browser-real` job:
+  (1) after the chibicc staging step, a `cache bash build inputs` step (caches
+  `/tmp/temen_bash_cache/bash_linked.ll`, keyed on `crates/temen-run/demos/bash/**`) and a fail-soft
+  `build + stage bash artifacts` step (`node build-bash-assets.mjs || echo skipped` — bash is GPLv3,
+  fetched from ftp.gnu.org and built at deploy, never committed); (2) `node browser-bash-test.mjs`
+  after `browser-shell-test.mjs` in the real-browser test block — it drives the new `temen_run_bash`
+  entry (real GNU bash: fork per pipeline stage, execve per /bin coreutil, CorePipe parks, blocking
+  waitpid) in Chromium and SKIPs cleanly when the staged asset is absent, so an ftp.gnu.org outage
+  degrades to a SKIP, never a red gate; (3) the `browser-shell-test.mjs` staging cp now copies ALL
+  FOUR of that test's gate assets (`shell`,`stage_runner`,`primes`,`upper`) — copying only
+  `shell.temen` left the shell test silently SKIPping (exit 0) on every PR, which is how the wasm32
+  personality-clock panic (`Instant::now` in `temen_posix::grant`, fixed in this PR) went unnoticed.
+  (Until copied over, `workflows-in-sync` stays red — the expected mirror-edit friction;
+  `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
+
 - **`paged_walk` added to the nightly `fuzz` matrix** (issue #1081) — one entry added to the `fuzz`
   job's `target: [...]` list (after `coverage_walk`), plus the descriptive comment above it. It is the
   new libFuzzer target `fuzz/fuzz_targets/paged_walk.rs`: the generative interp⇄**wasm-JIT** differential

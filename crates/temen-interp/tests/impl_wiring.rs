@@ -80,28 +80,42 @@ fn offer_funcs() -> Arc<[Func]> {
 }
 
 #[test]
-fn intern_is_structural_and_allocates_from_the_base() {
+fn intern_keys_on_names_and_shape_and_allocates_from_the_base() {
     let mut h = Host::new();
+    let names = |ns: &[&str]| ns.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     let a = vec![sig(vec![ValType::I64], vec![ValType::I64])];
     let b = vec![sig(vec![ValType::I64], vec![ValType::I64])];
     let c = vec![sig(vec![ValType::I32], vec![ValType::I64])];
-    let ia = h.intern_interface(&a);
+    let ia = h.intern_interface(&names(&["frob"]), &a);
     assert!(
         ia >= cap_id::GUEST_IMPL_BASE,
         "guest ids allocate above the built-ins"
     );
     assert_eq!(
         ia,
-        h.intern_interface(&b),
-        "structurally identical lists collide to the same id (D59)"
+        h.intern_interface(&names(&["frob"]), &b),
+        "identical (names, shape) lists collide to the same id (#1109)"
     );
     assert_ne!(
         ia,
-        h.intern_interface(&c),
+        h.intern_interface(&names(&["frob"]), &c),
         "structurally distinct lists get distinct ids"
     );
+    // #1109: same shape under a DIFFERENT op name is a distinct interface — names are half the
+    // key, so `self.schema` names are canonical rather than first-interned-wins.
+    assert_ne!(
+        ia,
+        h.intern_interface(&names(&["blit"]), &a),
+        "same shape, different names => distinct ids (names are in the intern key)"
+    );
+    // The anonymous-shape family (a bare fn-list wire) never unifies with a named interface.
+    assert_ne!(
+        ia,
+        h.intern_interface(&[], &a),
+        "an unnamed shape is its own family, distinct from any named interface"
+    );
     // Interning is stable: re-asking never re-allocates.
-    assert_eq!(ia, h.intern_interface(&a));
+    assert_eq!(ia, h.intern_interface(&names(&["frob"]), &a));
 }
 
 #[test]
@@ -111,25 +125,33 @@ fn a_stream_shaped_declaration_interns_to_the_builtin_id() {
     // host-native/guest-impl divide), not a fresh guest id — so a slot requiring that shape
     // accepts a real host handle or a guest impl of it interchangeably.
     let mut h = Host::new();
+    let names = |ns: &[&str]| ns.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     let stream = vec![
         sig(vec![ValType::I64, ValType::I64], vec![ValType::I64]), // read
         sig(vec![ValType::I64, ValType::I64], vec![ValType::I64]), // write
         sig(vec![], vec![]),                                       // close
     ];
     assert_eq!(
-        h.intern_interface(&stream),
+        h.intern_interface(&names(&["read", "write", "close"]), &stream),
         cap_id::STREAM,
-        "the exact stream triple canonicalizes to the built-in Stream id"
+        "the canonical (names, shape) stream triple canonicalizes to the built-in Stream id"
     );
 
-    // A subset (write/close only) is a *different* structural shape — not pre-seeded, so it gets a
+    // #1109 name-strictness: the same shape under different op names is NOT the builtin — you
+    // get Stream's id only by meaning Stream (canonical names and all).
+    assert!(
+        h.intern_interface(&names(&["recv", "send", "drop"]), &stream) >= cap_id::GUEST_IMPL_BASE,
+        "a stream-shaped interface with non-canonical names stays in the guest id space"
+    );
+
+    // A subset (write/close only) is a *different* shape — not pre-seeded, so it gets a
     // fresh guest id above the base. Pre-seeding claims the whole shape, never a prefix of it.
     let subset = vec![
         sig(vec![ValType::I64, ValType::I64], vec![ValType::I64]), // write
         sig(vec![], vec![]),                                       // close
     ];
     assert!(
-        h.intern_interface(&subset) >= cap_id::GUEST_IMPL_BASE,
+        h.intern_interface(&names(&["write", "close"]), &subset) >= cap_id::GUEST_IMPL_BASE,
         "a non-matching shape stays in the guest id space"
     );
 
@@ -428,7 +450,7 @@ fn child_manifest_binds_named_offers_and_withholds_fail_closed() {
 
 #[test]
 fn provenance_reports_platform_vs_ancestor_terminated() {
-    // §3.1: `cap.self.provenance(handle)` (self-namespace op 5) — 0 for a platform-native
+    // §3.1: `self.provenance(handle)` (self-namespace op 5) — 0 for a platform-native
     // binding, depth d for a wired guest impl, +1 per re-grant hop; forged handles are inert.
     let mut parent = Host::new();
     let clock = parent.grant_clock();
@@ -511,10 +533,10 @@ fn an_instanced_offer_keeps_exporter_domain_state_across_calls() {
 
 #[test]
 fn an_instanced_offer_dispatches_via_capcall_through_the_eval_loop() {
-    // CALLS.md increment 3, slice 1 — exercise the narrowed **`cap.call`** arm END TO END
-    // (`imports_impl` covers the `call.import` form; the direct-handle `cap.call` arm, and thus
+    // CALLS.md increment 3, slice 1 — exercise the narrowed **`call.cap`** arm END TO END
+    // (`imports_impl` covers the `call.import` form; the direct-handle `call.cap` arm, and thus
     // `Host::instanced_offer_of`, is otherwise unexercised through the eval loop). A consumer guest
-    // `cap.call`s the wired instanced offer three times; the provider window counter persists across
+    // `call.cap`s the wired instanced offer three times; the provider window counter persists across
     // the narrowed-lock sub-runs, so it returns 3.
     let provider = counter_provider();
     temen_verify::verify_module(&provider).expect("provider verifies");
@@ -523,15 +545,15 @@ fn an_instanced_offer_dispatches_via_capcall_through_the_eval_loop() {
     let tid = h.resolve_offer(offer).unwrap().type_id;
 
     // The offer handle + interned type_id are runtime values; embed them as the consumer's
-    // dynamic-mode `cap.call` operands (the escape-hatch form for an undeclared grant).
+    // dynamic-mode `call.cap` operands (the escape-hatch form for an undeclared grant).
     let consumer_src = format!(
         "memory 16\n\
          func () -> (i64) {{\n\
          block 0 () {{\n\
            vh = i32.const {offer}\n\
-           v1 = cap.call {tid} 0 () -> (i64) vh ()\n\
-           v2 = cap.call {tid} 0 () -> (i64) vh ()\n\
-           v3 = cap.call {tid} 0 () -> (i64) vh ()\n\
+           v1 = call.cap {tid} 0 () -> (i64) vh ()\n\
+           v2 = call.cap {tid} 0 () -> (i64) vh ()\n\
+           v3 = call.cap {tid} 0 () -> (i64) vh ()\n\
            return v3\n\
            }}\n\
          }}\n"
@@ -542,7 +564,7 @@ fn an_instanced_offer_dispatches_via_capcall_through_the_eval_loop() {
     assert_eq!(
         r,
         Ok(vec![Value::I64(3)]),
-        "the cap.call arm drives the instanced offer; provider state persists across the three calls"
+        "the call.cap arm drives the instanced offer; provider state persists across the three calls"
     );
 }
 
@@ -578,7 +600,7 @@ fn a_regranted_instanced_offer_shares_one_service_instance() {
 }
 
 /// A provider whose op takes a `cap` (expected to be a `Clock`) and calls **through** it —
-/// `cap.call CLOCK.now`. The `cap` param is used as an `i32` handle in the body (cap is
+/// `call.cap CLOCK.now`. The `cap` param is used as an `i32` handle in the body (cap is
 /// i32-width data in guest code, §3.5); the offer's declared `cap` param is what fires the
 /// boundary translation at dispatch.
 fn clock_forward_provider() -> temen_ir::Module {
@@ -586,7 +608,7 @@ fn clock_forward_provider() -> temen_ir::Module {
         "memory 16\n\
          func (cap) -> (i64) {\n\
          block 0 (v0: cap) {\n\
-           v1 = cap.call 2 0 () -> (i64) v0 ()\n\
+           v1 = call.cap 2 0 () -> (i64) v0 ()\n\
            return v1\n\
            }\n\
          }\n",
@@ -599,7 +621,7 @@ fn a_cap_argument_is_translated_across_the_offer_boundary() {
     // §3.5 `cap` boundary translation: the caller passes a handle to a capability it holds as a
     // `cap`-typed argument; the host re-grants that capability into the provider's own table and
     // substitutes the provider-local handle, so the provider can call **through** it. Without
-    // translation the provider's `cap.call` would resolve a caller-table handle in its own table
+    // translation the provider's `call.cap` would resolve a caller-table handle in its own table
     // and fail closed.
     let provider = clock_forward_provider();
     temen_verify::verify_module(&provider).expect("provider verifies");
@@ -686,10 +708,10 @@ fn a_wrap_holds_and_forwards_a_real_capability() {
          block 0 () {\n\
            vp = i64.const 8\n\
            vn = i64.const 3\n\
-           vh = cap.self.resolve vp vn\n\
+           vh = self.resolve vp vn\n\
            vbuf = i64.const 0\n\
            vlen = i64.const 2\n\
-           vw = cap.call 0 1 (i64, i64) -> (i64) vh (vbuf, vlen)\n\
+           vw = call.cap 0 1 (i64, i64) -> (i64) vh (vbuf, vlen)\n\
            return vw\n\
            }\n\
          }\n",
@@ -779,8 +801,8 @@ fn a_cyclic_offer_call_is_a_probeable_eagain_not_a_deadlock() {
          block 0 () {\n\
            vp = i64.const 0\n\
            vn = i64.const 2\n\
-           vh = cap.self.resolve vp vn\n\
-           vr = cap.call 268435456 0 () -> (i64) vh ()\n\
+           vh = self.resolve vp vn\n\
+           vr = call.cap 268435456 0 () -> (i64) vh ()\n\
            return vr\n\
            }\n\
          }\n",
@@ -892,8 +914,8 @@ fn grouped_import_coverage_binds_a_subset_with_a_remap() {
 
 #[test]
 fn reflection_and_dyn_dispatch_run_over_the_registered_self_module() {
-    // One module exercises the §3.5 self surface end to end: `cap.self.type_id` interns its
-    // own declared shape, `export.handle` reifies its own offer (memoized), `cap.self.covers`
+    // One module exercises the §3.5 self surface end to end: `self.type_id` interns its
+    // own declared shape, `export.handle` reifies its own offer (memoized), `self.covers`
     // confirms the reified capability covers the shape, and `call.import.dyn` drives it by
     // type-section reference — identically on both engines.
     let src = "type 0 func (i64, i64) -> (i64)\n\
@@ -914,9 +936,9 @@ fn reflection_and_dyn_dispatch_run_over_the_registered_self_module() {
          }\n\n\
          func (i64, i64) -> (i64) {\n\
          block 0 (va: i64, vb: i64) {\n\
-           vt = cap.self.type_id 2\n\
+           vt = self.type_id 2\n\
            vh = export.handle 0\n\
-           vc = cap.self.covers vh 2\n\
+           vc = self.covers vh 2\n\
            vr = call.import.dyn 2.add vh (va, vb)\n\
            vcov = i64.extend_i32_u vc\n\
            vsum = i64.add vr vcov\n\
@@ -925,7 +947,7 @@ fn reflection_and_dyn_dispatch_run_over_the_registered_self_module() {
          }\n";
     let m = Arc::new(temen_text::parse_module(src).expect("parses"));
     temen_verify::verify_module(&m).expect("verifies");
-    // Dynamic-mode dispatch costs the manifest-completeness bit, like cap.call.
+    // Dynamic-mode dispatch costs the manifest-completeness bit, like call.cap.
     assert!(
         !temen_verify::manifest_complete(&m),
         "dyn mode costs the bit"

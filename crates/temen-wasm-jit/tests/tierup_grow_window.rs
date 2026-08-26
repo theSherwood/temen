@@ -4,7 +4,7 @@
 //!
 //! `live_mapped.rs` proves the emitted *check* reads the global (set by hand); `page_ops.rs` proves
 //! a pure-grow module now keeps its leaves eligible. This test closes the loop end-to-end: the
-//! interpreter services a real `ADDRESS_SPACE.map` (`cap.call 5 0`) growing a **reserved-tail**
+//! interpreter services a real `ADDRESS_SPACE.map` (`call.cap 5 0`) growing a **reserved-tail**
 //! window, then tiers a leaf up onto emitted wasm over that same live window — and the tiered frame
 //! must be observably identical to the interpreter-only frame (INVARIANTS.md #9), in **both**
 //! directions:
@@ -43,7 +43,7 @@ block 0 (v0: i64, v1: i64) {
   voff = i64.const 65536
   vlen = i64.const 16384
   vprot = i32.const 3
-  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vr = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
   v2 = call 1 (v1)
   return v2
   }
@@ -337,7 +337,7 @@ block 0 (v0: i64, v1: i64) {
   voff = i64.const 98304
   vlen = i64.const 16384
   vprot = i32.const 3
-  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vr = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
   v2 = call 1 (v1)
   return v2
   }

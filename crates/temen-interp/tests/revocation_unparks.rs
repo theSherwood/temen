@@ -29,7 +29,7 @@ block 0 (v0: i32) {
   vt = thread.spawn 1 vh64 vh64
   vbuf = i64.const 8
   vcap = i64.const 4
-  vr = cap.call 0 0 (i64, i64) -> (i64) v0 (vbuf, vcap)
+  vr = call.cap 0 0 (i64, i64) -> (i64) v0 (vbuf, vcap)
   vj = thread.join vt
   return vr
   }
@@ -41,7 +41,7 @@ block 0 (vsp: i64, vharg: i64) {
   vto = i64.const 100000000
   vw = i32.atomic.wait vaddr vexp vto
   vh = i32.wrap_i64 vharg
-  vc = cap.call 0 2 () -> (i64) vh ()
+  vc = call.cap 0 2 () -> (i64) vh ()
   return vc
   }
 }
@@ -70,10 +70,10 @@ const CLOSE_THEN_USE: &str = r#"
 memory 16
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  vc = cap.call 0 2 () -> (i64) v0 ()
+  vc = call.cap 0 2 () -> (i64) v0 ()
   vbuf = i64.const 8
   vcap = i64.const 4
-  vr = cap.call 0 0 (i64, i64) -> (i64) v0 (vbuf, vcap)
+  vr = call.cap 0 0 (i64, i64) -> (i64) v0 (vbuf, vcap)
   return vr
   }
 }
@@ -107,7 +107,7 @@ block 0 (v0: i32, v1: i32) {
   vt = thread.spawn 1 vh64 vh64
   vbuf = i64.const 8
   vcap = i64.const 4
-  vr = cap.call 0 0 (i64, i64) -> (i64) v0 (vbuf, vcap)
+  vr = call.cap 0 0 (i64, i64) -> (i64) v0 (vbuf, vcap)
   vj = thread.join vt
   return vr
   }
@@ -167,8 +167,8 @@ fn close_of_a_closed_handle_errnos_rather_than_dangling() {
 memory 16
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  vc = cap.call 0 2 () -> (i64) v0 ()
-  vd = cap.call 0 2 () -> (i64) v0 ()
+  vc = call.cap 0 2 () -> (i64) v0 ()
+  vd = call.cap 0 2 () -> (i64) v0 ()
   return vd
   }
 }

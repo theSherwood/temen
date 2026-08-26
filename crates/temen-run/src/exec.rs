@@ -6,7 +6,7 @@
 //! directory. The deterministic [`scripted_exec`] backend and the shared wire protocol live in
 //! the wasm-safe `temen-exec` crate, re-exported here so `temen_run::exec::*` is one surface.
 //!
-//! No subprocess authority exists un-granted: without a grant, `cap.self.resolve("exec")` is
+//! No subprocess authority exists un-granted: without a grant, `self.resolve("exec")` is
 //! negative and the guest's fallback runs. An allowlist miss is a refused op (`-EPERM`), never
 //! a trap — the same failure shape as a `scripted_exec` table miss, so a guest cannot tell the
 //! backends apart by how they refuse (interposition invisibility, per EXEC.md).

@@ -5,7 +5,7 @@
 //! generators, each emitting **in-scope** durable modules so the properties exercise a real
 //! input space instead of the arbitrary-IR generator (which the transform would reject):
 //!
-//!   * [`gen_module`] / [`fuzz_one`] — call-chain modules (leaf `cap.call` / propagated `Call`,
+//!   * [`gen_module`] / [`fuzz_one`] — call-chain modules (leaf `call.cap` / propagated `Call`,
 //!     1..=4 frames, multi-point, multi-block);
 //!   * [`gen_fiber_module`] / [`fuzz_fiber_one`] — root+fiber modules (§12.8 Phase 3.1): a root
 //!     resuming one fiber that `suspend`s 1..=3 times, values live across each suspend.
@@ -14,7 +14,7 @@
 //!   1. **inert in NORMAL** — the instrumented module run in `NORMAL` state produces
 //!      the same result as the original, un-instrumented module;
 //!   2. **round-trip** — freeze → thaw equals the uninterrupted run on a *fresh* host (a buggy
-//!      re-issue of the `cap.call` / `cont.resume` instead of reloading/redelivering would diverge).
+//!      re-issue of the `call.cap` / `cont.resume` instead of reloading/redelivering would diverge).
 
 #![allow(dead_code)] // not every helper is used by both includers
 
@@ -30,7 +30,7 @@ use temen_ir::{
 
 /// The one call signature every generated durable suspend site uses: `(i32) -> (i64)` (the clock
 /// arg in, the accumulated i64 out). #922 interns it as the module type section's single entry, so
-/// each `cap.call`/`call_indirect` carries the type index 0.
+/// each `call.cap`/`call.dyn` carries the type index 0.
 fn durgen_type_section() -> Vec<TypeEntry> {
     vec![TypeEntry::Func(FuncType {
         params: vec![ValType::I32],
@@ -127,12 +127,12 @@ fn total_binop(g: &mut Gen) -> BinOp {
 
 /// What a generated function suspends on.
 enum Suspend {
-    /// Leaf: `npoints` sequential `cap.call`s to the clock (the deepest frame). `npoints`
+    /// Leaf: `npoints` sequential `call.cap`s to the clock (the deepest frame). `npoints`
     /// > 1 gives a single function multiple resume points (multi-arm `br_table`).
     Cap { npoints: u32 },
     /// Propagated: a single `call` to function `callee` (a deeper may-suspend function).
     Call(u32),
-    /// Propagated **indirect** (R8): a `call_indirect` to `callee` through the natural table
+    /// Propagated **indirect** (R8): a `call.dyn` to `callee` through the natural table
     /// (slot i = func i). Every generated function is `(i32) -> (i64)`, so the signature-taint
     /// rule marks the site may-suspend, and the reloaded index re-selects the same instrumented
     /// callee on thaw. Exercises the indirect re-issue path (interp + cross-backend).
@@ -259,7 +259,7 @@ fn emit_suspend_body(
 }
 
 /// Build one `func (i32) -> (i64)`. The single param `v0` is the clock handle, threaded as
-/// the call/`cap.call` argument. When `split`, the prefix lands in the entry block and the
+/// the call/`call.cap` argument. When `split`, the prefix lands in the entry block and the
 /// suspend body in a *non-entry* block (reached by an unconditional branch carrying the
 /// handle + accumulator as block params) — exercising the multi-block transform: the live
 /// values cross as branch args and must be spilled/reloaded, not recovered from the entry.
@@ -324,7 +324,7 @@ fn gen_func(g: &mut Gen, suspend: Suspend, split: bool) -> Func {
 
 /// Build an in-scope durable module: a call chain `func0 → func1 → … → leaf`, of a
 /// randomized depth `1..=4`. Every wrapper propagates the suspend through a `call`; only
-/// the deepest function holds the `cap.call`(s) — `1..=3` of them, so the leaf exercises
+/// the deepest function holds the `call.cap`(s) — `1..=3` of them, so the leaf exercises
 /// multiple resume points. At depth 1 / one point this is the original single-frame shape.
 pub fn gen_module(g: &mut Gen) -> Module {
     let depth = 1 + g.below(4); // 1..=4 stacked frames
@@ -366,10 +366,10 @@ pub fn gen_module(g: &mut Gen) -> Module {
     }
 }
 
-/// Build an in-scope module with a **poll-free loop ahead of the `cap.call`** — exercising the
+/// Build an in-scope module with a **poll-free loop ahead of the `call.cap`** — exercising the
 /// Phase-4 Slice A loop-header back-edge poll (`SuspendKind::LoopHeader`). `block1` is a loop header
 /// (a back-edge target) whose body is pure compute (consts + total binops + an `i+1 < trip`
-/// counter), so the only freeze site inside it is the inserted header poll; the `cap.call` lands in
+/// counter), so the only freeze site inside it is the inserted header poll; the `call.cap` lands in
 /// `block2` *after* the loop, so a freeze-from-start lands on the header poll first. The handle is a
 /// loop-carried block param (an `i32` spilled/reloaded across the header), so this also covers
 /// mixed-type header-param spilling. Oracle: `seed (op step)×trip`, then folded with the clock.
@@ -429,7 +429,7 @@ pub fn gen_loop_module(g: &mut Gen) -> Module {
         },
     };
 
-    // block2(v0: i32 handle, v1: i64 acc): the `cap.call` after the loop, folded into the result.
+    // block2(v0: i32 handle, v1: i64 acc): the `call.cap` after the loop, folded into the result.
     let b2 = Block {
         params: vec![ValType::I32, ValType::I64],
         insts: vec![

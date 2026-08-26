@@ -2,10 +2,10 @@
 //! resume, and suspend stackful fibers via [`temen_fiber`].
 //!
 //! The JIT lowers `cont.new`/`cont.resume`/`suspend` to indirect calls to the three thunks here
-//! (passing `mem_base`/`fn_table_base`/`trap_out` from the threaded context, exactly like `cap.call`).
+//! (passing `mem_base`/`fn_table_base`/`trap_out` from the threaded context, exactly like `call.cap`).
 //! A fiber's body runs **JITted guest code** on its own native control stack: because Rust cannot call
 //! the guest `Tail` calling convention directly, the body goes through a small generated CLIF
-//! *call-trampoline* ([`FiberCallTramp`]) that `call_indirect`s the guest entry. A `suspend` from deep
+//! *call-trampoline* ([`FiberCallTramp`]) that `call.dyn`s the guest entry. A `suspend` from deep
 //! within that guest code switches the whole native stack back to the resumer — the §3d two-stack
 //! model in action.
 //!
@@ -282,7 +282,7 @@ pub(crate) unsafe fn window_is_unwinding(mem_base: u64) -> bool {
 }
 
 /// The generated CLIF call-trampoline: `extern "C"` on the outside (callable from Rust), it
-/// `call_indirect`s a guest fiber entry (`Tail` ABI `(mem_base, fn_table_base, trap_out, sp, arg) ->
+/// `call.dyn`s a guest fiber entry (`Tail` ABI `(mem_base, fn_table_base, trap_out, sp, arg) ->
 /// i64`). One trampoline serves every fiber since all fiber entries share that signature (§12).
 /// The entry ABI carries a `stack_limit` param right after `trap_out` (§2b path B — the always-on
 /// software stack guard), so this fn-pointer type does too — kept in exact lockstep with `sig_from` /
@@ -506,7 +506,7 @@ impl SharedFiberTable {
     }
 
     /// Resolve a (forgeable) handle: **masked** into the power-of-two-padded table (Spectre-safe,
-    /// like `call_indirect` — and the same shape as the interp registry, so a forged handle now
+    /// like `call.dyn` — and the same shape as the interp registry, so a forged handle now
     /// resolves over the same domain-wide namespace on both backends). Returns the **slot index** (for
     /// the per-context region + recycling) and the slot. Out of range ⇒ `None`.
     fn resolve(&self, handle: i64) -> Option<(usize, Arc<FiberSlot>)> {
@@ -1263,7 +1263,7 @@ unsafe fn scan_words(
 ///
 /// # Safety
 /// `mem_base`/`mask`/`mapped`/`sub_base`/`trap_out` are the threaded guest-window context (as for
-/// `cap.call`). `payload_mask` is the §GC tagged-pointer mask (distinct from the window-confinement
+/// `call.cap`). `payload_mask` is the §GC tagged-pointer mask (distinct from the window-confinement
 /// `mask`). The running vCPU's fiber runtime is read from [`CURRENT_RT`]; a null runtime, an
 /// out-of-window `buf`, a non-STW call (a fiber running on another vCPU), or a `payload_mask` that
 /// clears more than the top byte faults (`FiberFault`).

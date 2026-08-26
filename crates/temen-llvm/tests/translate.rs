@@ -1422,7 +1422,7 @@ fn float_intrinsics_abs_floor() {
 #[test]
 fn indirect_call_via_function_pointer() {
     // `pick` (noinline) returns a function pointer; `run` calls it indirectly — `-O2` keeps it a
-    // real `call_indirect`. Exercises taking a function's address (funcref), threading it as an
+    // real `call.dyn`. Exercises taking a function's address (funcref), threading it as an
     // i64 pointer through a `select`/return, and the §3c masked + type-checked indirect dispatch.
     let src = "int inc(int); int dec(int); typedef int(*fp)(int); fp pick(int); \
                int run(int sel, int x){ return pick(sel)(x); } \
@@ -2922,10 +2922,10 @@ fn varargs_many_and_copy() {
 fn varargs_indirect_call() {
     // A `(...)` function invoked through a **function pointer** (not a named callee). The variadic
     // args must marshal into the caller's overflow scratch exactly as for a direct varargs call — the
-    // only difference is the call lowers to `call_indirect` (with an §3c type-id check against the
+    // only difference is the call lowers to `call.dyn` (with an §3c type-id check against the
     // `(sp, fixed-params…)` callee signature) rather than `call`. The pointer is chosen by a
     // `volatile` index so clang can't devirtualize it back to a direct call, and clang emits it as a
-    // `tail call`, which also exercises the `return_call_indirect` tail path. Found as the Postgres
+    // `tail call`, which also exercises the `return_call.dyn` tail path. Found as the Postgres
     // `manifest_process_version` gap. `run(1)`: index 1 → `vmul(4, 2,3,4,5)` = 120, +1 = 121.
     let src = "#include <stdarg.h>\n\
         typedef long long (*vfn)(int, ...);\n\
@@ -5360,7 +5360,7 @@ fn demo_calc_vs_native() {
     // The chibicc `calc` demo (a recursive-descent arithmetic calculator) through the LLVM on-ramp.
     // Exercises a **global array of string pointers** + a **global struct array holding function
     // pointers** (both relocations, slice K), **indirect calls** through that dispatch table (slice G
-    // → `call_indirect`), and **recursion** (expr → term → factor). It drives itself from a global
+    // → `call.dyn`), and **recursion** (expr → term → factor). It drives itself from a global
     // expression table and writes `"<expr> = <result>"` rows — byte-identical to native `cc`. The
     // first of the two non-corpus chibicc demos the on-ramp now covers (LLVM is the main frontend).
     check_demo_vs_native("calc", "calc.c", b"");
@@ -5373,7 +5373,7 @@ fn demo_rational_vs_native() {
     // J): every op takes two `struct Rat` *by value* and returns one *by value* (the hidden-`sret`
     // path), composed with recursion (Euclid's `gcd`) and an **indirect call that both passes and
     // returns a struct by value** through a global dispatch table — sret + a function-pointer
-    // relocation + a struct-valued `call_indirect`, all at once. Byte-identical to native `cc`.
+    // relocation + a struct-valued `call.dyn`, all at once. Byte-identical to native `cc`.
     check_demo_vs_native("rational", "rational.c", b"");
 }
 
@@ -7314,10 +7314,10 @@ long twice(long x) { return x + x; }
     let _ = std::fs::remove_file(&outb);
 }
 
-// ---- §7 capability reflection: `__vm_cap_count` / `__vm_cap_at` → `cap.self.count` / `.get` -----
+// ---- §7 capability reflection: `__vm_cap_count` / `__vm_cap_at` → `self.count` / `.get` -----
 
 /// Capability **reflection**: a domain discovers what its host granted it. Run on the interpreter
-/// under a full 7-handle test powerbox host (the grants live in the host-owned table `cap.self.*`
+/// under a full 7-handle test powerbox host (the grants live in the host-owned table `self.*`
 /// reads, independent of the call's params), so `__vm_cap_count()` returns 7 and `__vm_cap_at(0, &t)`
 /// yields a valid (non-negative) interface type_id. Returns count*10 + (t >= 0) = 71.
 /// Interpreter-only (the JIT bails `Unsupported` on `cap.self`, like fibers).
@@ -7338,7 +7338,7 @@ int f(void) {
     let Some((m, entry_sp)) = translate_verified("vm_cap", src) else {
         return;
     };
-    // Structural: the reflection ops are present, now as `cap.call CAP_SELF op 0/1`.
+    // Structural: the reflection ops are present, now as `call.cap CAP_SELF op 0/1`.
     assert!(
         module_has_inst(&m, |i| matches!(
             i,
@@ -7355,7 +7355,7 @@ int f(void) {
                 ..
             }
         )),
-        "expected cap.self.count + cap.self.get (as cap.call CAP_SELF 0/1)"
+        "expected self.count + self.get (as call.cap CAP_SELF 0/1)"
     );
     // Run on the interpreter with a granted powerbox: 8 capabilities held → count 8.
     let mut h = Host::new();
@@ -7406,7 +7406,7 @@ fn grant_powerbox(
         h.grant_blocking(block, None),
         h.grant_jit(mem_log2),
     ];
-    // Register each granted cap under its canonical name (`cap.self.resolve` — the discovery tier;
+    // Register each granted cap under its canonical name (`self.resolve` — the discovery tier;
     // `__vm_blocking_handle` and `__vm_cap_resolve` use it). The entry runs with `&[]`. This is the
     // *test* powerbox: the product's six names (`temen_ir::POWERBOX_CAP_NAMES`) plus the test-only
     // `Blocking` mock (§5a — the blocking tests exercise the offload pool / §12 parking through
@@ -7479,7 +7479,7 @@ int main(void) { return (__vm_cap(5) == __vm_blocking_handle()) ? 7 : 0; }
         return;
     };
     // Phase 3: no resolve prologue — `__vm_blocking_handle` resolves at its call site, so exactly
-    // one `cap.self.resolve` appears in the whole module (in `main`, not `_start`).
+    // one `self.resolve` appears in the whole module (in `main`, not `_start`).
     assert_eq!(
         m.funcs[0].blocks[0]
             .insts
@@ -7580,7 +7580,7 @@ int main(void) {
 /// End-to-end: the **guest that JITs itself** (`demos/jit/jit_demo.c`) through the LLVM on-ramp. The
 /// guest emits serialized Temen IR byte-by-byte into its window, `__vm_jit_compile`s it, and checks
 /// `__vm_jit_invoke2` (raw unit) **and** an `__vm_jit_install`ed unit reached via a C function pointer
-/// (`call_indirect`) against its own bytecode interpreter on a 49-input grid — guest-emitted,
+/// (`call.dyn`) against its own bytecode interpreter on a 49-input grid — guest-emitted,
 /// host-verified, Cranelift-compiled, on the real JIT powerbox.
 ///
 /// The blob's memory descriptor must declare the **same** `size_log2` as the parent (the validator's
@@ -7629,8 +7629,8 @@ long __vm_jit_uninstall(long slot);\n";
     let run = temen_run::run_powerbox(&module, b"").expect("powerbox run");
     let out = String::from_utf8_lossy(&run.stdout);
     assert!(
-        out.contains("98 inputs agree (invoke + installed call_indirect)"),
-        "guest self-JIT (invoke + installed call_indirect) must agree on every input:\n{out}"
+        out.contains("98 inputs agree (invoke + installed call.dyn)"),
+        "guest self-JIT (invoke + installed call.dyn) must agree on every input:\n{out}"
     );
 }
 
@@ -7751,7 +7751,7 @@ int main(void) {
         .module;
     // Structural (phase 3): `vm_region_create` (fixed AddressSpace interface) is a manifest
     // import; map/unmap/page_size dispatch on the runtime-minted region handle — the *dynamic*
-    // addressing mode (`cap.call`), so they declare no import. And `_start` has no resolve
+    // addressing mode (`call.cap`), so they declare no import. And `_start` has no resolve
     // prologue: the manifest binds at instantiation.
     let imports: Vec<&str> = m.imports.iter().map(|i| i.name.as_str()).collect();
     assert!(
@@ -7761,7 +7761,7 @@ int main(void) {
     for gone in ["vm_region_map", "vm_region_unmap", "vm_region_page_size"] {
         assert!(
             !imports.contains(&gone),
-            "{gone} is dynamic-mode (cap.call) — it must not be a manifest import: {imports:?}"
+            "{gone} is dynamic-mode (call.cap) — it must not be a manifest import: {imports:?}"
         );
     }
     assert_eq!(
@@ -7793,7 +7793,7 @@ int main(void) {
 // ============================================================================================
 // Milestone 2 — beyond chibicc's C subset: the D54 **breadth proof**. The on-ramp consumes any
 // LLVM frontend's bitcode, so a freestanding C++ TU (`-fno-exceptions -fno-rtti`) — classes,
-// virtual dispatch (vtables → `call_indirect`), templates, mangled names — must run byte-identical
+// virtual dispatch (vtables → `call.dyn`), templates, mangled names — must run byte-identical
 // to native `clang++`, with no translator change beyond what the C corpus already proved. (The Rust
 // lane runs further down, on the default `rustc` via textual `.ll` — no toolchain pin.)
 // ============================================================================================
@@ -8292,8 +8292,8 @@ int main() {
 
 /// **C++ first light** — classes + virtual dispatch through the on-ramp. Two shapes derive a common
 /// polymorphic base; a loop sums their areas through a base pointer (a virtual call per element →
-/// a vtable load + `call_indirect`), and the total is printed. Exercises vtables (function-pointer
-/// global initializers, slice K), the `this` pointer, mangled names, and `call_indirect` (slice G) —
+/// a vtable load + `call.dyn`), and the total is printed. Exercises vtables (function-pointer
+/// global initializers, slice K), the `this` pointer, mangled names, and `call.dyn` (slice G) —
 /// byte-identical to native `clang++`.
 #[test]
 fn cpp_virtual_dispatch_first_light() {
@@ -9485,7 +9485,7 @@ pub extern "C" fn run(n: i32) -> i32 {
 
 /// **Rust trait objects** — `&dyn Trait` dynamic dispatch through the on-ramp. Two types implement a
 /// trait; an array of `&dyn Shape` (each a `{data, vtable}` fat pointer) is iterated and the method is
-/// called dynamically — a vtable load + `call_indirect` per element, the Rust analog of the C++ vtable
+/// called dynamically — a vtable load + `call.dyn` per element, the Rust analog of the C++ vtable
 /// path (slice AG). Exercises Rust vtable globals (function-pointer initializers, slice K), fat-pointer
 /// aggregates, and dynamic dispatch — byte-identical to native `rustc`.
 #[test]
@@ -12294,11 +12294,11 @@ entry:
 /// **Old-C INDIRECT call-site drift** (#802 slice 3 — the function-pointer twin of the direct-call
 /// rule above): bash's `typedef int Function ()` tables call cleanups through `(ptr, ...)` sites
 /// whose runtime target is a plain `void ()` / `void (ptr)` definition. The native ABI hides the
-/// drift; the strict typed `call_indirect` would trap `IndirectCallType`. The translator routes a
+/// drift; the strict typed `call.dyn` would trap `IndirectCallType`. The translator routes a
 /// varargs indirect site through a synthesized **static dispatcher**: each address-taken candidate
 /// gets a funcref-equality arm making the DIRECT call with the definition's own signature (args
 /// width-coerced, a missing result padded 0), and everything else — here the exact-typed second
-/// target — falls to the strict `call_indirect` unchanged.
+/// target — falls to the strict `call.dyn` unchanged.
 #[test]
 fn old_c_indirect_call_drift_dispatches_to_the_definition() {
     let src = "\

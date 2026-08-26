@@ -147,7 +147,7 @@ fn thaw(
 
 // Root (v0 = clock, v1 = host-fn): stash the clock for the children, spawn two children as concurrent
 // OS threads, **signal** they're spawned, then run a K-loop, **join both children**, and store its
-// total. The host-fn `cap.call` makes the root may-suspend so its loop is instrumented (the freeze
+// total. The host-fn `call.cap` makes the root may-suspend so its loop is instrumented (the freeze
 // safepoint). Each child loops K and stores its total to its own slot; the clock read after the loop
 // just makes the child may-suspend too.
 //
@@ -166,7 +166,7 @@ block 0 (v0: i32, v1: i32) {
   v5 = i64.const 65552
   v6 = thread.spawn 1 v5 v5
   v7 = i32.const 0
-  v8 = cap.call 13 0 (i32) -> (i64) v1 (v7)
+  v8 = call.cap 13 0 (i32) -> (i64) v1 (v7)
   v9 = i64.const 0
   br 1(v4, v6, v9)
 }
@@ -201,7 +201,7 @@ block 1 (v5: i64, v6: i32, v7: i64) {
 }
 block 2 (v12: i64, v13: i32, v14: i64) {
   v15 = i32.const 0
-  v16 = cap.call 2 0 (i32) -> (i64) v13 (v15)
+  v16 = call.cap 2 0 (i32) -> (i64) v13 (v15)
   i64.store v12 v14
   return v14
   }
@@ -251,7 +251,7 @@ block 0 (v0: i32, v1: i32) {
   v2 = i64.const 7
   v3 = thread.spawn 1 v2 v2
   v4 = i32.const 0
-  v5 = cap.call 13 0 (i32) -> (i64) v1 (v4)
+  v5 = call.cap 13 0 (i32) -> (i64) v1 (v4)
   v6 = i64.const 0
   br 1(v3, v6)
 }
@@ -340,7 +340,7 @@ block 1 (v6: i32, v7: i32, v8: i64) {
 }
 block 2 (v13: i32, v14: i32, v15: i64) {
   v16 = i32.const 0
-  v17 = cap.call 2 0 (i32) -> (i64) v13 (v16)
+  v17 = call.cap 2 0 (i32) -> (i64) v13 (v16)
   v18 = thread.join v14
   v19 = i64.const 65536
   i64.store v19 v15
@@ -357,7 +357,7 @@ block 0 (v0: i64, v1: i64) {
   v8 = i64.const 65568
   v9 = i32.load v8
   v10 = i32.const 0
-  v11 = cap.call 13 0 (i32) -> (i64) v9 (v10)
+  v11 = call.cap 13 0 (i32) -> (i64) v9 (v10)
   v12 = i64.const 0
   br 1(v7, v12)
 }
@@ -451,7 +451,7 @@ block 1 (v6: i32, v7: i32, v8: i64) {
 }
 block 2 (v13: i32, v14: i32, v15: i64) {
   v16 = i32.const 0
-  v17 = cap.call 2 0 (i32) -> (i64) v13 (v16)
+  v17 = call.cap 2 0 (i32) -> (i64) v13 (v16)
   v18 = thread.join v14
   v19 = i64.const 65536
   i64.store v19 v15
@@ -487,7 +487,7 @@ block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65568
   v3 = i32.load v2
   v4 = i32.const 0
-  v5 = cap.call 13 0 (i32) -> (i64) v3 (v4)
+  v5 = call.cap 13 0 (i32) -> (i64) v3 (v4)
   v6 = i64.const 0
   br 1(v6)
 }
@@ -563,7 +563,7 @@ block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65560
   v3 = i32.load v2
   v4 = i32.const 0
-  v5 = cap.call 13 0 (i32) -> (i64) v3 (v4)
+  v5 = call.cap 13 0 (i32) -> (i64) v3 (v4)
   v6 = i64.const 0
   br 1(v6)
 }
@@ -733,7 +733,7 @@ block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65560
   v3 = i32.load v2
   v4 = i32.const 0
-  v5 = cap.call 13 0 (i32) -> (i64) v3 (v4)
+  v5 = call.cap 13 0 (i32) -> (i64) v3 (v4)
   v6 = i64.const 0
   br 1(v6)
 }
@@ -836,7 +836,7 @@ block 2 (v8: i64) {
   v11 = i64.const 65560
   v12 = i32.load v11
   v13 = i32.const 0
-  v14 = cap.call 13 0 (i32) -> (i64) v12 (v13)
+  v14 = call.cap 13 0 (i32) -> (i64) v12 (v13)
   v15 = i64.const 65544
   i64.store v15 v8
   return v8
@@ -917,7 +917,7 @@ block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65560
   v3 = i32.load v2
   v4 = i32.const 0
-  v5 = cap.call 13 0 (i32) -> (i64) v3 (v4)
+  v5 = call.cap 13 0 (i32) -> (i64) v3 (v4)
   v6 = i64.const 0
   br 1(v6)
 }
@@ -994,7 +994,7 @@ block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65560
   v3 = i32.load v2
   v4 = i32.const 0
-  v5 = cap.call 13 0 (i32) -> (i64) v3 (v4)
+  v5 = call.cap 13 0 (i32) -> (i64) v3 (v4)
   v6 = i64.const 0
   br 1(v6)
 }
@@ -1277,7 +1277,7 @@ block 0 (v0: i32, v1: i32) {
   v6 = i64.const 65544
   v7 = thread.spawn 2 v6 v6
   v8 = i32.const 0
-  v9 = cap.call 13 0 (i32) -> (i64) v1 (v8)
+  v9 = call.cap 13 0 (i32) -> (i64) v1 (v8)
   v10 = i64.const 0
   br 1(v5, v7, v10)
 }
@@ -1319,7 +1319,7 @@ block 1 (v5: i64, v6: i32, v7: i64) {
 }
 block 2 (v12: i64, v13: i32, v14: i64) {
   v15 = i32.const 0
-  v16 = cap.call 2 0 (i32) -> (i64) v13 (v15)
+  v16 = call.cap 2 0 (i32) -> (i64) v13 (v15)
   i64.store v12 v14
   return v14
   }

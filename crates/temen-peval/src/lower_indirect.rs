@@ -1,6 +1,6 @@
-//! **Approach A** — bounded-target lowering of a *dynamic-index* `call_indirect`.
+//! **Approach A** — bounded-target lowering of a *dynamic-index* `call.dyn`.
 //!
-//! The specializer inlines a `call_indirect` only when its table index folds to a **constant**
+//! The specializer inlines a `call.dyn` only when its table index folds to a **constant**
 //! (see [`crate::specialize`]'s `resolve_indirect`); a genuinely runtime index returns
 //! [`crate::SpecError::Unsupported`], because the single-function residual carries no table to
 //! dispatch through. That blocks specialization past the dispatch point in exactly the interpreters
@@ -11,13 +11,13 @@
 //! `S = { i : funcs[i] : ty }`, rewrite
 //!
 //! ```text
-//!     v = call_indirect ty idx args
+//!     v = call.dyn ty idx args
 //! ```
 //!
 //! into an explicit, in-IR dispatch over the (masked) index:
 //!
 //! ```text
-//!     m = idx & MASK                 // MASK = next_pow2(nfuncs) - 1, the call_indirect table mask
+//!     m = idx & MASK                 // MASK = next_pow2(nfuncs) - 1, the call.dyn table mask
 //!     if m == s0 { v = call s0 args } // s0 .. s_{k-1} = the signature-matching functions
 //!     elif m == s1 { v = call s1 args }
 //!     ...
@@ -74,7 +74,7 @@ use temen_verify::func_value_types;
 
 use crate::{map_operands, map_term_operands};
 
-/// The mask a `call_indirect` applies to its index: `next_power_of_two(nfuncs) - 1` (the natural
+/// The mask a `call.dyn` applies to its index: `next_power_of_two(nfuncs) - 1` (the natural
 /// module-0 table is padded to a power of two; real functions occupy `[0, nfuncs)`).
 fn table_mask(nfuncs: usize) -> i32 {
     (nfuncs.max(1).next_power_of_two() - 1) as u32 as i32
@@ -95,7 +95,7 @@ fn candidates(module: &Module, ty: &FuncType, cap: usize) -> Option<Vec<u32>> {
     (!s.is_empty()).then_some(s)
 }
 
-/// One eligible dynamic `call_indirect`: its position and resolved target set.
+/// One eligible dynamic `call.dyn`: its position and resolved target set.
 struct Site {
     block: usize,
     k: usize,
@@ -103,7 +103,7 @@ struct Site {
     cands: Vec<u32>,
 }
 
-/// Find the first body `call_indirect` with a small, non-empty signature-matching target set.
+/// Find the first body `call.dyn` with a small, non-empty signature-matching target set.
 /// (Over-cap / unmatched sites are skipped, not returned, so the driver loop terminates once every
 /// eligible site has been rewritten into direct calls.)
 fn find_site(f: &Func, module: &Module, cap: usize) -> Option<Site> {
@@ -152,7 +152,7 @@ fn carry_funcs(module: &Module, funcs: Vec<Func>) -> Module {
         data_exports: Vec::new(),
         data_funcrefs: Vec::new(),
         impl_exports: Vec::new(),
-        // FuncType interning (#922): the residual's `call_indirect`/`cap.call` carry an interned
+        // FuncType interning (#922): the residual's `call.dyn`/`call.cap` carry an interned
         // `types` index, so the type section must survive — but **string-free** (this crate can't
         // clone a `String`). `Func` entries are pure `ValType` vecs (no strings) and clone as-is;
         // `Interface` entries carry op-name strings, so they collapse to an empty placeholder `Func`
@@ -172,9 +172,9 @@ fn carry_funcs(module: &Module, funcs: Vec<Func>) -> Module {
     }
 }
 
-/// Rewrite a module so every eligible dynamic-index body `call_indirect` becomes an explicit
+/// Rewrite a module so every eligible dynamic-index body `call.dyn` becomes an explicit
 /// bounded dispatch (see the module docs). `cap` bounds the target fan-out a site may have to be
-/// lowered. `cap == 0` is a no-op. Function *signatures* are unchanged, so `call_indirect` target
+/// lowered. `cap == 0` is a no-op. Function *signatures* are unchanged, so `call.dyn` target
 /// indices — and every other reference — stay valid. Name-bearing link metadata is dropped (see
 /// [`carry_funcs`]); the residual is addressed by index, like the specializer's own output.
 pub fn lower_indirect_dispatch(module: &Module, cap: usize) -> Module {
@@ -196,7 +196,7 @@ pub fn lower_indirect_dispatch(module: &Module, cap: usize) -> Module {
     carry_funcs(module, funcs)
 }
 
-/// Split block `site.block` at the `call_indirect` (inst `site.k`) into a masked dispatch, one
+/// Split block `site.block` at the `call.dyn` (inst `site.k`) into a masked dispatch, one
 /// direct-call arm per candidate, an `unreachable` default, and a continuation carrying the
 /// original block tail. Live values crossing the split are threaded as block parameters (dead ones
 /// are removed by the optimizer). `types` is the pre-split value typing of the function.

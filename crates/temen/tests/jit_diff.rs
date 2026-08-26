@@ -1016,7 +1016,7 @@ block 0 (v0: i64, v1: i64) {
 const INDIRECT: &str = r#"
 func (i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32) {
-  v2 = call_indirect (i32) -> (i32) v0 (v1)
+  v2 = call.dyn (i32) -> (i32) v0 (v1)
   return v2
   }
 }
@@ -1060,7 +1060,7 @@ fn jit_matches_interp_ref_func_indirect() {
 func (i32) -> (i32) {
 block 0 (v0: i32) {
   v1 = ref.func 2
-  v2 = call_indirect (i32) -> (i32) v1 (v0)
+  v2 = call.dyn (i32) -> (i32) v1 (v0)
   return v2
   }
 }
@@ -1089,7 +1089,7 @@ fn jit_matches_interp_return_call_indirect() {
     let src = r#"
 func (i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32) {
-  return_call_indirect (i32) -> (i32) v0 (v1)
+  return_call.dyn (i32) -> (i32) v0 (v1)
   }
 }
 
@@ -1193,7 +1193,7 @@ fn jit_cap_memory_escape_oracle_grown_tail() {
          \x20 v1 = i64.const {OFF}\n\
          \x20 v2 = i64.const 4096\n\
          \x20 v3 = i32.const 3\n\
-         \x20 v4 = cap.call 5 0 (i64, i64, i32) -> (i64) v0 (v1, v2, v3)\n\
+         \x20 v4 = call.cap 5 0 (i64, i64, i32) -> (i64) v0 (v1, v2, v3)\n\
          \x20 v5 = i64.const {OFF}\n\
          \x20 v6 = i64.const {MARKER}\n\
          \x20 i64.store v5 v6\n\
@@ -1276,11 +1276,11 @@ fn jit_cap_shared_region_aliases_differential() {
         "memory 17\n\
          func (i32) -> (i64) {{\n\
          block 0 (v0: i32) {{\n\
-         \x20 v1 = cap.call 4 3 () -> (i64) v0 ()\n\
+         \x20 v1 = call.cap 4 3 () -> (i64) v0 ()\n\
          \x20 v2 = i64.const 0\n\
          \x20 v3 = i32.const 3\n\
-         \x20 v4 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v0 (v2, v2, v1, v3)\n\
-         \x20 v5 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v0 (v1, v2, v1, v3)\n\
+         \x20 v4 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (v2, v2, v1, v3)\n\
+         \x20 v5 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (v1, v2, v1, v3)\n\
          \x20 v6 = i64.const {MARKER}\n\
          \x20 i64.store v2 v6\n\
          \x20 v7 = i64.load v1\n\
@@ -1331,7 +1331,7 @@ fn jit_cap_shared_region_aliases_differential() {
     );
 }
 
-// ---- cap.call: the JIT dispatches through a host thunk to the interpreter's Host ----
+// ---- call.cap: the JIT dispatches through a host thunk to the interpreter's Host ----
 //
 // This module's broad Memory-cap differential is still unix-gated; the cross-platform `_with_host`
 // capture path (incl. the windows `VirtualProtect` Memory cap) is covered by `jit_fuzz` and by
@@ -1432,7 +1432,7 @@ mod cap {
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   return v2
   }
 }
@@ -1462,7 +1462,7 @@ block 0 (v0: i32) {
   i32.store8 v3 v4
   v5 = i64.const 0
   v6 = i64.const 2
-  v7 = cap.call 0 1 (i64, i64) -> (i64) v0 (v5, v6)
+  v7 = call.cap 0 1 (i64, i64) -> (i64) v0 (v5, v6)
   return v7
   }
 }
@@ -1482,7 +1482,7 @@ block 0 (v0: i32) {
 func (i32) -> () {
 block 0 (v0: i32) {
   v1 = i32.const 7
-  cap.call 1 0 (i32) -> () v0 (v1)
+  call.cap 1 0 (i32) -> () v0 (v1)
   unreachable
   }
 }
@@ -1509,7 +1509,7 @@ block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = i64.const 4096
   v3 = i32.const 1
-  v4 = cap.call 5 2 (i64, i64, i32) -> (i64) v0 (v1, v2, v3)
+  v4 = call.cap 5 2 (i64, i64, i32) -> (i64) v0 (v1, v2, v3)
   v5 = i64.const 0
   v6 = i32.const 123
   i32.store8 v5 v6
@@ -1540,9 +1540,9 @@ block 0 (v0: i32) {
     }
 
     /// Regression (trap propagation across calls): a trap raised in a **callee** must unwind the
-    /// whole guest stack, not just the callee's own frame. A helper here `cap.call`s with a wrong
+    /// whole guest stack, not just the callee's own frame. A helper here `call.cap`s with a wrong
     /// `type_id` on the granted Memory handle (→ `CapFault`); the entry then makes a *successful*
-    /// `page_size` `cap.call`, which resets the host trap cell. Before the JIT re-checked the cell
+    /// `page_size` `call.cap`, which resets the host trap cell. Before the JIT re-checked the cell
     /// after a `call`, the callee's trap merely returned zeros, the entry ran on, `page_size` reset
     /// the cell, and the JIT **returned** where the interpreter (correctly) stays trapped — which
     /// would let a guest neutralize *any* trap (even `exit`) by wrapping it in a function call. Both
@@ -1556,14 +1556,14 @@ memory 16
 func (i32) -> (i32) {
 block 0 (v0: i32) {
   v1 = call 1(v0)
-  v2 = cap.call 5 3 () -> (i64) v0 ()
+  v2 = call.cap 5 3 () -> (i64) v0 ()
   return v1
   }
 }
 
 func (i32) -> (i32) {
 block 0 (v0: i32) {
-  v1 = cap.call 99 0 () -> (i64) v0 ()
+  v1 = call.cap 99 0 () -> (i64) v0 ()
   v2 = i32.wrap_i64 v1
   return v2
   }
@@ -1632,7 +1632,7 @@ block 0 (v0: i32) {
                     let pr = fresh(&mut body, format!("i32.const {prot}"));
                     fresh(
                         &mut body,
-                        format!("cap.call 5 2 (i64, i64, i32) -> (i64) v0 (v{off}, v{len}, v{pr})"),
+                        format!("call.cap 5 2 (i64, i64, i32) -> (i64) v0 (v{off}, v{len}, v{pr})"),
                     );
                 }
                 2 => {
@@ -1642,7 +1642,7 @@ block 0 (v0: i32) {
                     let len = fresh(&mut body, "i64.const 4096".into());
                     fresh(
                         &mut body,
-                        format!("cap.call 5 1 (i64, i64) -> (i64) v0 (v{off}, v{len})"),
+                        format!("call.cap 5 1 (i64, i64) -> (i64) v0 (v{off}, v{len})"),
                     );
                 }
                 3 => {
@@ -1654,7 +1654,7 @@ block 0 (v0: i32) {
                     let pr = fresh(&mut body, format!("i32.const {prot}"));
                     fresh(
                         &mut body,
-                        format!("cap.call 5 0 (i64, i64, i32) -> (i64) v0 (v{off}, v{len}, v{pr})"),
+                        format!("call.cap 5 0 (i64, i64, i32) -> (i64) v0 (v{off}, v{len}, v{pr})"),
                     );
                 }
                 4 => {
@@ -1717,7 +1717,7 @@ block 0 (v0: i32) {
   v1 = i64.const 1048576
   v2 = i64.const 4096
   v3 = i32.const 3
-  v4 = cap.call 5 0 (i64, i64, i32) -> (i64) v0 (v1, v2, v3)
+  v4 = call.cap 5 0 (i64, i64, i32) -> (i64) v0 (v1, v2, v3)
   v5 = i64.const 1048576
   v6 = i64.const 43981
   i64.store v5 v6
@@ -1752,8 +1752,8 @@ block 0 (v0: i32) {
   v1 = i64.const 1048576
   v2 = i64.const 4096
   v3 = i32.const 3
-  v4 = cap.call 5 0 (i64, i64, i32) -> (i64) v0 (v1, v2, v3)
-  v5 = cap.call 5 1 (i64, i64) -> (i64) v0 (v1, v2)
+  v4 = call.cap 5 0 (i64, i64, i32) -> (i64) v0 (v1, v2, v3)
+  v5 = call.cap 5 1 (i64, i64) -> (i64) v0 (v1, v2)
   v6 = i64.load v1
   return v6
   }
@@ -1829,7 +1829,7 @@ block 0 (v0: i32) {
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   return v2
   }
 }
@@ -1849,7 +1849,7 @@ block 0 (v0: i32) {
     }
 }
 
-/// §9 / D45 — the **devirtualized `cap.call` fast path**. A `cap.call` to a `(type_id, op)` the
+/// §9 / D45 — the **devirtualized `call.cap` fast path**. A `call.cap` to a `(type_id, op)` the
 /// embedder's `FastCapResolver` claims is lowered to a register-to-register direct call to a
 /// specialized host fn (no stack marshalling, no runtime dispatch). These pin that the fast path is
 /// *behaviourally identical* to the generic thunk (same result, same fallback when unclaimed).
@@ -1946,7 +1946,7 @@ mod fast_cap {
 memory 16
 func (i32, i64) -> (i64) {
 block 0 (v0: i32, v1: i64) {
-  v2 = cap.call 42 0 (i64) -> (i64) v0(v1)
+  v2 = call.cap 42 0 (i64) -> (i64) v0(v1)
   return v2
   }
 }
@@ -1964,7 +1964,7 @@ block 0 (v0: i32, v1: i64) {
 memory 16
 func (i32, i64) -> (i64) {
 block 0 (v0: i32, v1: i64) {
-  v2 = cap.call 42 1 (i64) -> (i64) v0(v1)
+  v2 = call.cap 42 1 (i64) -> (i64) v0(v1)
   return v2
   }
 }
@@ -2059,7 +2059,7 @@ block 1 (v3: i32, v4: i64, v5: i64) {
   br_if v7 2(v3, v4, v5) 3(v4)
 }
 block 2 (v8: i32, v9: i64, v10: i64) {
-  v11 = cap.call 2 0 () -> (i64) v8()
+  v11 = call.cap 2 0 () -> (i64) v8()
   v12 = i64.add v9 v11
   v13 = i64.const 1
   v14 = i64.add v10 v13
@@ -2094,7 +2094,7 @@ block 1 (v3: i32, v4: i64, v5: i64) {
   br_if v7 2(v3, v4, v5) 3(v4)
 }
 block 2 (v8: i32, v9: i64, v10: i64) {
-  v11 = cap.call 10 0 (i64) -> (i64) v8(v10)
+  v11 = call.cap 10 0 (i64) -> (i64) v8(v10)
   v12 = i64.add v9 v11
   v13 = i64.const 1
   v14 = i64.add v10 v13
@@ -2116,16 +2116,16 @@ block 3 (v15: i64) {
         assert_eq!(got, want);
     }
 
-    /// **I2 safety on the fast path:** a `cap.call` with a *forged* handle (nothing granted) must be an
+    /// **I2 safety on the fast path:** a `call.cap` with a *forged* handle (nothing granted) must be an
     /// inert `CapFault` trap on the fast path exactly as on the generic thunk — the specialized fn
     /// delegates to `Host::cap_dispatch_slots`, whose `resolve` rejects an ungranted handle.
     #[test]
     fn forged_handle_is_inert_on_fast_path() {
-        // A Clock cap.call through a handle the host never granted (empty powerbox).
+        // A Clock call.cap through a handle the host never granted (empty powerbox).
         let ir = "\
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = cap.call 2 0 () -> (i64) v0()
+  v1 = call.cap 2 0 () -> (i64) v0()
   return v1
   }
 }

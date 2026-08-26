@@ -1,7 +1,7 @@
 //! §3.6 slice 2 — the **serve-loop core**: a domain's offers served as handlers over its
 //! **one world** (IMPORTS.md §3.6). Dispatches queue on the domain's bounded inbound queue
 //! (embedder-enqueued this slice; the cross-domain caller is the caller-parking slice) and are
-//! admitted at the guest's `svc.poll` service point (`cap.call CAP_SELF_TYPE_ID 9` — riding
+//! admitted at the guest's `svc.poll` service point (`call.cap CAP_SELF_TYPE_ID 9` — riding
 //! the reserved self-namespace dispatch, no wire change). A handler runs over the SAME live
 //! window and powerbox as `main` — what `main` writes, handlers read, and vice versa. There
 //! is no second state: the passive instance's two-world split is what §3.6 dissolves.
@@ -26,7 +26,7 @@ block 0 () {
   vseed = i64.const 7
   i64.store va vseed
   vz = i32.const 0
-  vn = cap.call 4294967295 9 () -> (i64) vz ()
+  vn = call.cap 4294967295 9 () -> (i64) vz ()
   vafter = i64.load va
   vk = i64.const 1000
   vm = i64.mul vn vk
@@ -198,13 +198,13 @@ block 0 (v0: i32) {
   i64.store q0a5 q0v4
   q0a6 = i64.const 1200
   i64.store q0a6 q0v4
-  v5 = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   v6 = i64.const 0
-  v7 = cap.call 6 14 (i32, i64) -> (i32) v0 (v5, v6)
+  v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)
   va = i64.const 40
   vb = i64.const 2
-  vr = cap.call 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
-  vj = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  vr = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
+  vj = call.cap 6 1 (i32) -> (i64) v0 (v5)
   vk = i64.const 100
   vm = i64.mul vj vk
   vs = i64.add vm vr
@@ -215,7 +215,7 @@ block 0 (v0: i32) {
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   return vn
   }
 }
@@ -260,14 +260,14 @@ block 0 (v0: i32) {
   i64.store q1a5 q1v4
   q1a6 = i64.const 1264
   i64.store q1a6 q1v4
-  v5 = cap.call 6 17 (i64) -> (i32) v0 (q1a0)
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
   v6 = i64.const 0
-  v7 = cap.call 6 14 (i32, i64) -> (i32) v0 (v5, v6)
+  v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)
   vst = import.attach 0 v7
   va = i64.const 40
   vb = i64.const 2
   vr = call.import 0 (va, vb)
-  vj = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  vj = call.cap 6 1 (i32) -> (i64) v0 (v5)
   vk = i64.const 100
   vm = i64.mul vj vk
   vs = i64.add vm vr
@@ -354,13 +354,13 @@ block 0 (v0: i32, v1: i32) {
   voff = i64.const 65536
   vlog = i64.const 12
   vq = i64.const 0
-  v5 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (vmh, ventry, voff, vlog, vq)
+  v5 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (vmh, ventry, voff, vlog, vq)
   v6 = i64.const 0
-  v7 = cap.call 6 14 (i32, i64) -> (i32) v0 (v5, v6)
+  v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)
   va = i64.const 40
   vb = i64.const 2
-  vr = cap.call 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
-  vj = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  vr = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
+  vj = call.cap 6 1 (i32) -> (i64) v0 (v5)
   vk = i64.const 100
   vm = i64.mul vj vk
   vs = i64.add vm vr
@@ -438,10 +438,10 @@ block 0 (v0: i32, v1: i32) {
   voff = i64.const 65536
   vlog = i64.const 12
   vq = i64.const 0
-  v5 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (vmh, ventry, voff, vlog, vq)
+  v5 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (vmh, ventry, voff, vlog, vq)
   v6 = i64.const 9
-  v7 = cap.call 6 14 (i32, i64) -> (i32) v0 (v5, v6)
-  vj = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)
+  vj = call.cap 6 1 (i32) -> (i64) v0 (v5)
   vr = i64.extend_i32_s v7
   vs = i64.add vr vj
   return vs
@@ -501,7 +501,7 @@ fn a_bad_export_on_a_separate_module_child_refuses_probeably() {
 /// §3.6 — **sibling-as-service**: the parent spawns serving child A, takes a live offer over
 /// it (`child_offer`), and re-grants that cap into child B at spawn (`instantiate_named`,
 /// op 11 — the grant record's handle field is stored at runtime). B discovers it by
-/// `cap.self.resolve("adder")` in its OWN powerbox (the re-grant interned the shape there —
+/// `self.resolve("adder")` in its OWN powerbox (the re-grant interned the shape there —
 /// B's first guest intern, `GUEST_IMPL_BASE`) and calls through it: the call enqueues on A,
 /// parks B's vCPU, A's `svc.wait` serves `add(40, 2)`, and the reply wakes B — two siblings
 /// coordinating through a live peer their parent introduced, no shared memory, no parent
@@ -537,9 +537,9 @@ block 0 (v0: i32) {
   i64.store q2a5 q2v4
   q2a6 = i64.const 1328
   i64.store q2a6 q2v4
-  vA = cap.call 6 17 (i64) -> (i32) v0 (q2a0)
+  vA = call.cap 6 17 (i64) -> (i32) v0 (q2a0)
   vz = i64.const 0
-  vcap = cap.call 6 14 (i32, i64) -> (i32) v0 (vA, vz)
+  vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vA, vz)
   va1 = i64.const 256
   vv1 = i32.const 200
   i32.store va1 vv1
@@ -570,9 +570,9 @@ block 0 (v0: i32) {
   i64.store q3a5 q3v5
   q3a6 = i64.const 1392
   i64.store q3a6 q3v6
-  vB = cap.call 6 17 (i64) -> (i32) v0 (q3a0)
-  vjB = cap.call 6 1 (i32) -> (i64) v0 (vB)
-  vjA = cap.call 6 1 (i32) -> (i64) v0 (vA)
+  vB = call.cap 6 17 (i64) -> (i32) v0 (q3a0)
+  vjB = call.cap 6 1 (i32) -> (i64) v0 (vB)
+  vjA = call.cap 6 1 (i32) -> (i64) v0 (vA)
   vk = i64.const 100
   vm = i64.mul vjA vk
   vs = i64.add vm vjB
@@ -595,10 +595,10 @@ block 0 (v0: i64) {
   i64.store vza vnm
   vp = i64.const 0
   vl = i64.const 5
-  vh = cap.self.resolve vp vl
+  vh = self.resolve vp vl
   va = i64.const 40
   vb = i64.const 2
-  vr = cap.call 268435456 0 (i64, i64) -> (i64) vh (va, vb)
+  vr = call.cap 268435456 0 (i64, i64) -> (i64) vh (va, vb)
   return vr
   }
 }

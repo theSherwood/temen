@@ -561,7 +561,7 @@ fn mem_case() -> Module {
     }
 }
 
-/// An interprocedural shape: the entry `call_indirect`s a constant funcref, so **devirt** turns it
+/// An interprocedural shape: the entry `call.dyn`s a constant funcref, so **devirt** turns it
 /// into a direct call, **inline** splices the small leaf in, and **dfe** then removes both the leaf
 /// and an unused third function.
 ///   f0(a,b): call_indirect(ref.func(1), [a,b])       // -> devirt -> inline
@@ -628,7 +628,7 @@ fn interproc_case() -> Module {
     };
     Module {
         funcs: vec![entry, leaf, dead],
-        types: vec![temen_ir::TypeEntry::Func(sig)], // #922: call_indirect sig, index 0
+        types: vec![temen_ir::TypeEntry::Func(sig)], // #922: call.dyn sig, index 0
         ..Default::default()
     }
 }

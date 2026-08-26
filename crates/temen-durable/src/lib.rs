@@ -5,7 +5,7 @@
 //! surface. An embedder running pre-instrumented modules links none of it.
 //!
 //! This is the **Phase 1** slice of the plan (DURABILITY.md §9): it instruments a
-//! function so an in-flight may-suspend op (a `cap.call`, or a `Call` into a suspended
+//! function so an in-flight may-suspend op (a `call.cap`, or a `Call` into a suspended
 //! chain) can be *unwound* into guest-resident shadow state and later *rewound* back into
 //! execution, byte-for-byte. The codec is exactly the §2 mechanism:
 //!
@@ -21,10 +21,10 @@
 //! The transform handles an arbitrary-CFG function (branches, loops, joins) with any
 //! number of may-suspend operations, each either:
 //!
-//! * a **leaf** `cap.call` — the host performs the operation; on thaw the deepest frame
+//! * a **leaf** `call.cap` — the host performs the operation; on thaw the deepest frame
 //!   reloads the saved result and flips the state word back to `NORMAL`; or
 //! * a **propagated** `Call` to a may-suspend callee (a function that transitively
-//!   reaches a `cap.call`) — frames stack up across the call chain. On thaw a non-deepest
+//!   reaches a `call.cap`) — frames stack up across the call chain. On thaw a non-deepest
 //!   frame reloads its pre-call live set and **re-issues the call** (leaving the state
 //!   `REWINDING` so the callee rewinds in turn); only the innermost leaf flips to
 //!   `NORMAL`. This is the DURABILITY.md §12.7 "re-issue vs. continue" branch (R8).
@@ -32,7 +32,7 @@
 //! Each original block is split at its suspend ops into forward segments; branch targets
 //! are remapped to the target block's first segment; a `br_table` in the prologue dispatch
 //! routes a thaw to the resume point that was in flight (one arm per point). A function is
-//! **may-suspend** iff it contains a `cap.call` or (transitively) a `Call` to a may-suspend
+//! **may-suspend** iff it contains a `call.cap` or (transitively) a `Call` to a may-suspend
 //! function; only may-suspend functions are instrumented. Covered end-to-end on the real
 //! interpreter (`tests/roundtrip.rs`, `chain.rs`, `multipoint.rs`, `multiblock.rs`) and
 //! across the interp/JIT differential (`crates/temen/tests/durable_jit.rs`).
@@ -42,9 +42,9 @@
 //! own operands. An unmodelled instruction in the tail falls back to spilling the whole
 //! range, so the analysis never under-spills.
 //!
-//! A **`call_indirect`** to a may-suspend target is instrumented too (R8, the fork-critical
+//! A **`call.dyn`** to a may-suspend target is instrumented too (R8, the fork-critical
 //! case): the target is a runtime table index, so the analysis taints *by signature* (a
-//! `call_indirect` of type `T` suspends iff some function of type `T` does — the natural table
+//! `call.dyn` of type `T` suspends iff some function of type `T` does — the natural table
 //! admits any signature match), and the site re-issues the call on thaw with the reloaded index
 //! (`SuspendKind::PropagatedIndirect`), so the re-selected — and, by the taint rule, instrumented
 //! — callee rewinds in turn. Out of scope (rejected — the frame is replaced, so there is no poll to
@@ -95,7 +95,7 @@ pub use temen_ir::durable_abi::SVC_WAIT_OP;
 /// the freeze-before-start harness cannot; it also models an async controller flipping `UNWINDING` from
 /// another thread, which the existing mechanism already picks up at the next poll. Both backends count
 /// the same set (the fiber ops, routed through runtime thunks), so an armed freeze lands at the same
-/// safepoint on each — `cap.call` is not counted (no cross-backend choke; its freeze is already
+/// safepoint on each — `call.cap` is not counted (no cross-backend choke; its freeze is already
 /// reachable at the first safepoint).
 pub use temen_ir::durable_abi::STATE_ARMED;
 /// Normal forward execution; polls and prologues fall straight through.
@@ -188,13 +188,13 @@ pub use temen_ir::durable_abi::SHADOW_STRIDE;
 /// Reasons the Phase-1 transform declines a module.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum TransformError {
-    /// A function uses `cap.call` but the module declares no memory window — the
+    /// A function uses `call.cap` but the module declares no memory window — the
     /// shadow stack and state word have nowhere to live.
     NoMemory,
     /// The declared window is too small to hold the durable region + a shadow frame.
     MemoryTooSmall,
-    /// A `cap.call`-bearing function is outside the Phase-1 shape (not a single block,
-    /// not exactly one `cap.call`, or not a `return` terminator).
+    /// A `call.cap`-bearing function is outside the Phase-1 shape (not a single block,
+    /// not exactly one `call.cap`, or not a `return` terminator).
     UnsupportedShape,
     /// A prefix instruction's result type isn't modelled by the Phase-1 transform
     /// (e.g. SIMD, conversions, concurrency ops before the call).
@@ -240,7 +240,7 @@ fn transform_module_inner(m: &Module, enforce_r9: bool) -> Result<Module, Transf
     // R9 enforcement: the durable region shares the window with guest memory at fixed low
     // addresses, with nothing confining the guest away from it. Rather than risk silent
     // mutual corruption, refuse to instrument a module any of whose functions touch linear
-    // memory. (The generated/tested durable guests are pure SSA + `cap.call`, so they pass;
+    // memory. (The generated/tested durable guests are pure SSA + `call.cap`, so they pass;
     // the relocation that would lift this restriction is §12.7 future work.)
     if enforce_r9
         && any_instrumented
@@ -408,14 +408,14 @@ fn term_targets(t: &Terminator) -> Vec<BlockIdx> {
     }
 }
 
-/// Mark each function that can suspend: it contains a `cap.call` (or fiber/thread/futex
-/// safepoint), or (transitively) a **direct** `Call`, or an **indirect** `call_indirect`
+/// Mark each function that can suspend: it contains a `call.cap` (or fiber/thread/futex
+/// safepoint), or (transitively) a **direct** `Call`, or an **indirect** `call.dyn`
 /// whose target could suspend. A least-fixed-point over the call graph.
 ///
-/// **R8 — `call_indirect`.** The target is a runtime table index, so the transform can't
+/// **R8 — `call.dyn`.** The target is a runtime table index, so the transform can't
 /// name the callee statically. But dispatch is signature-checked and the natural table
 /// maps *every* function into a slot (and `Jit.install` can add more at run time), so the
-/// only sound static rule is by **signature**: a `call_indirect` of type `T` can reach any
+/// only sound static rule is by **signature**: a `call.dyn` of type `T` can reach any
 /// function whose signature equals `T`, hence it suspends iff **some may-suspend function
 /// shares its signature**. This is the ceiling of static precision here — there is no
 /// element/table section in the IR to narrow it (DURABILITY.md §6; the breadth cost is R7).
@@ -428,7 +428,7 @@ fn compute_may_suspend(funcs: &[Func], types: &[TypeEntry]) -> Vec<bool> {
     for (i, f) in funcs.iter().enumerate() {
         if f.blocks.iter().any(|b| {
             b.insts.iter().any(|x| {
-                // `cap.call` suspends to the host; a fiber `cont.resume`/`suspend` switches
+                // `call.cap` suspends to the host; a fiber `cont.resume`/`suspend` switches
                 // stacks and is a freeze safepoint too (`cont.new` alone merely allocates).
                 matches!(
                     x,
@@ -444,7 +444,7 @@ fn compute_may_suspend(funcs: &[Func], types: &[TypeEntry]) -> Vec<bool> {
         }
     }
     loop {
-        // A `call_indirect` of type `ty` reaches a may-suspend target iff some already-may-suspend
+        // A `call.dyn` of type `ty` reaches a may-suspend target iff some already-may-suspend
         // function has that exact signature. Re-derived each round from the live `ms`. Collect the
         // newly-tainted functions first (read-only over `ms`), then apply — so the taint predicate's
         // borrow of `ms` doesn't clash with the mutation.
@@ -489,7 +489,7 @@ fn compute_may_suspend(funcs: &[Func], types: &[TypeEntry]) -> Vec<bool> {
     ms
 }
 
-/// The distinct signatures of the may-suspend functions — the tainted set a `call_indirect`
+/// The distinct signatures of the may-suspend functions — the tainted set a `call.dyn`
 /// checks its type against (see [`compute_may_suspend`]). Computed once from the final `ms`
 /// and threaded into `transform_func` so it recognizes indirect suspend sites the same way.
 fn tainted_signatures(funcs: &[Func], ms: &[bool]) -> Vec<temen_ir::FuncType> {
@@ -508,7 +508,7 @@ fn tainted_signatures(funcs: &[Func], ms: &[bool]) -> Vec<temen_ir::FuncType> {
     sigs
 }
 
-/// The distinct signatures a *program* instruments for suspension — i.e. every `call_indirect`
+/// The distinct signatures a *program* instruments for suspension — i.e. every `call.dyn`
 /// of one of these types has a poll/unwind seam. Computed on the program's (pre-transform)
 /// functions, this is the set a durable host stashes so it can gate later `Jit.compile`s
 /// ([`unit_suspends_untainted`]). Exposed for the durable-JIT install fence (DURABILITY.md §12.5).
@@ -518,14 +518,14 @@ pub fn tainted_signatures_of(funcs: &[Func], types: &[TypeEntry]) -> Vec<temen_i
 }
 
 /// The durable-JIT install fence (DURABILITY.md §12.5, R8 fork-critical case). Returns `true`
-/// — *reject this unit* — when the unit's entry (func 0, the `invoke`/`call_indirect` target)
+/// — *reject this unit* — when the unit's entry (func 0, the `invoke`/`call.dyn` target)
 /// transitively **suspends** yet its signature is **not** in `program_tainted` (the caller
-/// program's [`tainted_signatures_of`]). In that case a program `call_indirect` reaching the
+/// program's [`tainted_signatures_of`]). In that case a program `call.dyn` reaching the
 /// installed unit would be at an *un-instrumented* site (the taint is by-signature), so a freeze
 /// mid-unit would silently lose the continuation on thaw. Fences fail-closed at compile so the
 /// unit can never be installed. A non-suspending unit, or one whose signature the program taints
 /// (the seam exists), returns `false` — admitted. Runs on the already-instrumented unit funcs;
-/// the entry's `cap.call`/`cont.*` survive instrumentation, so `ms[0]` is unchanged, and the
+/// the entry's `call.cap`/`cont.*` survive instrumentation, so `ms[0]` is unchanged, and the
 /// transform preserves signatures. Injected into the durable `Host` as its taint gate.
 pub fn unit_suspends_untainted(
     unit_funcs: &[Func],
@@ -548,11 +548,11 @@ pub fn unit_suspends_untainted(
 
 /// The single may-suspend operation in an instrumented block.
 enum SuspendKind {
-    /// `cap.call`: the host performs the op; the deepest frame reloads its result.
+    /// `call.cap`: the host performs the op; the deepest frame reloads its result.
     Leaf,
     /// `Call` to a may-suspend callee: re-issued on thaw so the callee rewinds in turn.
     Propagated { callee: FuncIdx, args: Vec<ValIdx> },
-    /// `call_indirect` to a (by-signature, conservatively) may-suspend target (R8): the indirect
+    /// `call.dyn` to a (by-signature, conservatively) may-suspend target (R8): the indirect
     /// analog of `Propagated`. Re-issued on thaw with the **reloaded table index** — the runtime
     /// re-selects the same slot, and because the taint rule instruments *every* function of that
     /// signature, whatever the `idx` resolves to has a `REWINDING`-aware prologue and rewinds in
@@ -594,7 +594,7 @@ enum SuspendKind {
     /// frozen frame) and re-executes `suspend` so control returns to the resumer awaiting a future
     /// `cont.resume` (slice 3.1.3). `value` is the suspended value's block-local index.
     Yield { value: ValIdx },
-    /// A **serve op** (`cap.call CAP_SELF svc.poll/svc.wait` — DURABILITY.md §13.4 slice 4b): a
+    /// A **serve op** (`call.cap CAP_SELF svc.poll/svc.wait` — DURABILITY.md §13.4 slice 4b): a
     /// serving domain frozen at (or parked in) its serve point is a freeze safepoint — the serve
     /// arm delivers an inert sentinel on observing `UNWINDING` (no drain, no park; the queue
     /// stays untouched for the snapshot's serve section), the trailing poll unwinds, and the op
@@ -657,9 +657,9 @@ impl SuspendKind {
     }
 
     /// Whether thaw flips the shadow thaw-state word back to `NORMAL` in **this** op's arm — true for
-    /// the globally-deepest frozen frame (a leaf `cap.call`, a loop-header poll, or a re-parked
+    /// the globally-deepest frozen frame (a leaf `call.cap`, a loop-header poll, or a re-parked
     /// `suspend` / `thread.join` / `atomic.wait` / serve op, whose blocking peer is a separate vCPU).
-    /// A propagated `call` / `call_indirect` / `cont.resume` does **not** flip — the callee it
+    /// A propagated `call` / `call.dyn` / `cont.resume` does **not** flip — the callee it
     /// re-issues owns the flip at its own deepest leaf (#915).
     fn flips_thaw_word(&self) -> bool {
         matches!(
@@ -676,7 +676,7 @@ impl SuspendKind {
 
 /// One resume point's metadata across the whole function (global id by vector order).
 struct PointPlan {
-    kind: SuspendKind,        // leaf cap.call or propagated call
+    kind: SuspendKind,        // leaf call.cap or propagated call
     nres: usize,              // result count of the suspend op
     out: usize,               // value count after the op (= continuation param count)
     save_end: usize,          // spillable range `[0, save_end)` (excludes a call's results)
@@ -712,7 +712,7 @@ fn transform_func(
     tainted_sigs: &[temen_ir::FuncType],
     type_section: &[TypeEntry],
 ) -> Result<(Func, u64), TransformError> {
-    // Whether a `call_indirect` of this signature could reach a may-suspend target (R8) — the same
+    // Whether a `call.dyn` of this signature could reach a may-suspend target (R8) — the same
     // by-signature rule `compute_may_suspend` used to mark this function may-suspend in the first
     // place. Kept identical to that rule so the instrumentation set == the taint set (re-issue
     // soundness: every possible indirect target is instrumented, so the reloaded `idx` can only
@@ -987,7 +987,7 @@ fn transform_func(
                         timeout: *timeout,
                     },
                     _ => unreachable!(
-                        "suspend position is a cap.call / call / fiber / thread.join / atomic.wait op"
+                        "suspend position is a call.cap / call / fiber / thread.join / atomic.wait op"
                     ),
                 };
                 let nres = match (&kind, &blk.insts[pos]) {
@@ -1191,8 +1191,8 @@ fn transform_func(
         // For a propagated call, re-issue it (its operands were all spilled). For a leaf, the state
         // word was flipped above.
         let op_results: Vec<ValIdx> = match &pt.kind {
-            // A leaf cap.call and a loop-header poll are both the globally-deepest frozen frame with
-            // no op to re-issue: the leaf then reloads its cap.call result; the header reloads its
+            // A leaf call.cap and a loop-header poll are both the globally-deepest frozen frame with
+            // no op to re-issue: the leaf then reloads its call.cap result; the header reloads its
             // block params and re-enters the body (`cont_seg`). Neither produces an `op_results` value.
             SuspendKind::Leaf | SuspendKind::LoopHeader => vec![],
             SuspendKind::Propagated { callee, args } => {
@@ -1208,15 +1208,15 @@ fn transform_func(
                     pt.nres,
                 )
             }
-            // `call_indirect` re-issue (R8): reload the (spilled) table index + args and re-execute
+            // `call.dyn` re-issue (R8): reload the (spilled) table index + args and re-execute
             // the indirect call. The reloaded `idx` re-selects the same slot, whose (instrumented)
             // callee rewinds in turn — the indirect twin of `Propagated`; no state-word flip (the
             // resolved callee is the frame that flips at its own deepest leaf).
             SuspendKind::PropagatedIndirect { ty, idx, args } => {
-                let ridx = reloaded[spill_slot(*idx as usize).expect("call_indirect idx spilled")];
+                let ridx = reloaded[spill_slot(*idx as usize).expect("call.dyn idx spilled")];
                 let mapped: Vec<ValIdx> = args
                     .iter()
-                    .map(|&a| reloaded[spill_slot(a as usize).expect("call_indirect arg spilled")])
+                    .map(|&a| reloaded[spill_slot(a as usize).expect("call.dyn arg spilled")])
                     .collect();
                 ab.many(
                     Inst::CallIndirect {
@@ -1248,7 +1248,7 @@ fn transform_func(
             // frozen frame, so flip the state word to NORMAL, then re-execute `suspend` — which
             // parks this fiber and hands `value` back to the resumer (in NORMAL). Its result, the
             // value the *next* resume delivers, threads into the continuation exactly as a leaf's
-            // reloaded cap.call result does.
+            // reloaded call.cap result does.
             SuspendKind::Yield { value } => {
                 let v = reloaded[spill_slot(*value as usize).expect("suspend value spilled")];
                 ab.many(Inst::Suspend { value: v }, pt.nres)
@@ -1675,13 +1675,13 @@ mod tests {
             12,
         );
         let out = transform_module(&m).expect("transform");
-        assert_eq!(out.funcs, m.funcs, "function without cap.call is untouched");
+        assert_eq!(out.funcs, m.funcs, "function without call.cap is untouched");
     }
 
     #[test]
     fn instrumented_function_verifies() {
         let m = parse_with_mem(
-            "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  v3 = i64.const 100\n  v4 = i64.add v2 v3\n  return v4\n  }\n}\n",
+            "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  v3 = i64.const 100\n  v4 = i64.add v2 v3\n  return v4\n  }\n}\n",
             18,
         );
         let out = transform_module(&m).expect("transform");
@@ -1697,7 +1697,7 @@ mod tests {
     fn two_cap_calls_become_two_resume_points() {
         // Two suspend points in one block ⇒ two br_table arms ⇒ 3·2 + 4 = 10 blocks.
         let m = parse_with_mem(
-            "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  v3 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  v4 = i64.add v2 v3\n  return v4\n  }\n}\n",
+            "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  v3 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  v4 = i64.add v2 v3\n  return v4\n  }\n}\n",
             18,
         );
         let out = transform_module(&m).expect("two resume points are in scope");
@@ -1712,9 +1712,9 @@ mod tests {
     #[test]
     fn propagated_chain_instruments_each_frame() {
         // A two-level chain: the caller suspends on its `call` to the leaf, the leaf on
-        // its `cap.call`. Both are may-suspend, so both get the 7-block instrumentation.
+        // its `call.cap`. Both are may-suspend, so both get the 7-block instrumentation.
         let m = parse_with_mem(
-            "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = call 1 (v0)\n  return v1\n  }\n}\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n",
+            "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = call 1 (v0)\n  return v1\n  }\n}\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n",
             18,
         );
         let out = transform_module(&m).expect("transform");
@@ -1729,11 +1729,11 @@ mod tests {
 
     #[test]
     fn non_suspending_callee_is_left_unchanged() {
-        // func 0 (leaf cap.call) calls func 1 (a pure helper) as a *prefix* op. The helper
+        // func 0 (leaf call.cap) calls func 1 (a pure helper) as a *prefix* op. The helper
         // never suspends, so it is not instrumented and func 0's only suspend point is its
-        // own cap.call; the helper's result is spilled/reloaded, never re-issued.
+        // own call.cap; the helper's result is spilled/reloaded, never re-issued.
         let m = parse_with_mem(
-            "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = call 1 (v0)\n  v2 = i32.const 0\n  v3 = cap.call 2 0 (i32) -> (i64) v0 (v2)\n  v4 = i64.add v1 v3\n  return v4\n  }\n}\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i64.const 5\n  return v1\n  }\n}\n",
+            "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = call 1 (v0)\n  v2 = i32.const 0\n  v3 = call.cap 2 0 (i32) -> (i64) v0 (v2)\n  v4 = i64.add v1 v3\n  return v4\n  }\n}\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i64.const 5\n  return v1\n  }\n}\n",
             18,
         );
         let helper_before = m.funcs[1].clone();
@@ -1750,7 +1750,7 @@ mod tests {
     fn instrumented_module_with_guest_memory_op_is_rejected() {
         // A guest store could alias the durable region at `[0, SHADOW_BASE)` → R9 fails closed.
         let m = parse_with_mem(
-            "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  v3 = i64.const 7\n  i64.store v1 v3\n  return v2\n  }\n}\n",
+            "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  v3 = i64.const 7\n  i64.store v1 v3\n  return v2\n  }\n}\n",
             18,
         );
         assert_eq!(transform_module(&m), Err(TransformError::GuestUsesMemory));
@@ -1758,7 +1758,7 @@ mod tests {
 
     #[test]
     fn guest_memory_op_in_uninstrumented_module_is_fine() {
-        // No `cap.call` anywhere ⇒ nothing is instrumented ⇒ no durable region ⇒ the
+        // No `call.cap` anywhere ⇒ nothing is instrumented ⇒ no durable region ⇒ the
         // guest's own memory use is left untouched.
         let m = parse_with_mem(
             "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i64.const 7\n  i64.store v0 v1\n  v2 = i64.load v0\n  return v2\n  }\n}\n",
@@ -1771,7 +1771,7 @@ mod tests {
     #[test]
     fn cap_call_without_memory_is_rejected() {
         let mut m = temen_text::parse_module(
-            "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n",
+            "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n",
         )
         .unwrap();
         m.memory = None;

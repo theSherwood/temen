@@ -3,7 +3,7 @@
 //! Three slices, in order:
 //! * **run** (`jit_durable_same_module_child_matches_interp`): a durable same-module child runs on the
 //!   JIT (was fail-closed `-EINVAL`); a runnable one is pure-compute (an instrumented child hits a
-//!   `cap.call` against its empty powerbox → `CapFault`);
+//!   `call.cap` against its empty powerbox → `CapFault`);
 //! * **powerbox** (`jit_durable_depth2_grandchild_matches_interp`): a durable child gets a
 //!   one-capability `Instantiator` powerbox and nests a grandchild (depth-2, `NORMAL`);
 //! * **freeze export** (`jit_freeze_captures_live_nested_child_matching_interp`): a freeze catches a
@@ -24,7 +24,7 @@
 
 //!
 //! **§3d note (2026-08-06):** these parents stay on the scalar spawn ops **deliberately**: an
-//! R9-instrumented guest is pure SSA + `cap.call` (`transform_module` refuses any guest memory
+//! R9-instrumented guest is pure SSA + `call.cap` (`transform_module` refuses any guest memory
 //! op — `GuestUsesMemory`), so a durable parent cannot build the op-17 record in its window.
 //! The record migration (CONSOLIDATION.md §3d) therefore gates the op-0/5 arm deletion on the
 //! §12.7 relocation work that lifts that restriction — do not migrate this file until then.
@@ -47,7 +47,7 @@ const WINDOW: usize = 1 << SIZE_LOG2;
 
 /// A durable **same-module** parent: `instantiate`s its own func 1 (op 0) confined to a 128 KiB
 /// sub-window, `join`s it, and returns the child's result. Func 1 sums 0..100 = 4950 — pure compute
-/// (no `cap.call`), so it is not may-suspend and runs atomically in the carve. (Identical in shape to
+/// (no `call.cap`), so it is not may-suspend and runs atomically in the carve. (Identical in shape to
 /// `durable_nesting.rs::PARENT_SELF_LOOP`.)
 const PARENT_SELF_LOOP: &str = "memory 18
 func (i32) -> (i64) {
@@ -56,8 +56,8 @@ block 0 (v0: i32) {
   v2 = i64.const 131072
   v3 = i64.const 17
   v4 = i64.const 0
-  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
-  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
   return v6
   }
 }
@@ -150,7 +150,7 @@ const D2_WINDOW: usize = 1 << D2_SIZE_LOG2;
 
 /// A durable **same-module depth-2** chain: root (func 0) instantiates a child (func 1) which itself
 /// instantiates a grandchild (func 2, the 0..100 = 4950 loop) and joins it. The child is *instrumented*
-/// (it does a `cap.call`), so this exercises the child's **Instantiator powerbox** (it resolves its own
+/// (it does a `call.cap`), so this exercises the child's **Instantiator powerbox** (it resolves its own
 /// window and carves the grandchild) and the carve control-word seeding. All `NORMAL` (no freeze).
 /// (Identical in shape to `durable_nesting.rs::PARENT_DEPTH2`.)
 const PARENT_DEPTH2: &str = "memory 19
@@ -160,8 +160,8 @@ block 0 (v0: i32) {
   v2 = i64.const 262144
   v3 = i64.const 18
   v4 = i64.const 0
-  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
-  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
   return v6
   }
 }
@@ -172,8 +172,8 @@ block 0 (v0: i64) {
   v3 = i64.const 131072
   v4 = i64.const 17
   v5 = i64.const 0
-  v6 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v1 (v2, v3, v4, v5)
-  v7 = cap.call 6 1 (i32) -> (i64) v1 (v6)
+  v6 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v1 (v2, v3, v4, v5)
+  v7 = call.cap 6 1 (i32) -> (i64) v1 (v6)
   return v7
   }
 }
@@ -254,7 +254,7 @@ fn jit_durable_depth2_grandchild_matches_interp() {
 }
 
 /// A durable parent that instantiates + joins an **instrumented** child (func 1). Func 1 is a
-/// may-suspend loop that sums 0..100 = 4950: its `block4` holds a `cap.call` on a **statically-present
+/// may-suspend loop that sums 0..100 = 4950: its `block4` holds a `call.cap` on a **statically-present
 /// but never-taken** branch (`br_if 0`), so the transform makes it may-suspend and prepends a
 /// **loop-header poll** at `block1`, yet the op never executes at runtime. So the child (a) can be
 /// **frozen** — born `UNWINDING` it spills at that first poll (loop not yet entered), the live child a
@@ -268,8 +268,8 @@ block 0 (v0: i32) {
   v2 = i64.const 131072
   v3 = i64.const 17
   v4 = i64.const 0
-  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
-  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
   return v6
   }
 }
@@ -294,7 +294,7 @@ block 3 (v13: i64, v14: i32) {
   br_if v15 4(v14) 5(v13)
 }
 block 4 (v16: i32) {
-  v17 = cap.call 6 1 (i32) -> (i64) v16 (v16)
+  v17 = call.cap 6 1 (i32) -> (i64) v16 (v16)
   return v17
 }
 block 5 (v18: i64) {
@@ -400,7 +400,7 @@ fn jit_nested_freeze_thaw_round_trips() {
     }
     let inst = instrument(FREEZE_PARENT);
 
-    // (0) Uninterrupted baseline: the dead `cap.call` branch is never taken, so the chain returns 4950.
+    // (0) Uninterrupted baseline: the dead `call.cap` branch is never taken, so the chain returns 4950.
     let mut h0 = Host::new();
     h0.set_durable(true);
     let ih0 = h0.grant_instantiator(0, WINDOW as u64);
@@ -483,8 +483,8 @@ block 0 (v0: i32) {
   v2 = i64.const 262144
   v3 = i64.const 18
   v4 = i64.const 0
-  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
-  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
   return v6
   }
 }
@@ -495,8 +495,8 @@ block 0 (v0: i64) {
   v3 = i64.const 131072
   v4 = i64.const 17
   v5 = i64.const 0
-  v6 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v1 (v2, v3, v4, v5)
-  v7 = cap.call 6 1 (i32) -> (i64) v1 (v6)
+  v6 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v1 (v2, v3, v4, v5)
+  v7 = call.cap 6 1 (i32) -> (i64) v1 (v6)
   return v7
   }
 }
@@ -522,7 +522,7 @@ block 3 (v11: i64) {
 }
 block 4 (v13: i64) {
   v14 = i32.const 256
-  v15 = cap.call 6 1 (i32) -> (i64) v14 (v14)
+  v15 = call.cap 6 1 (i32) -> (i64) v14 (v14)
   return v15
 }
 block 5 (v16: i64) {

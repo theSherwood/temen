@@ -28,7 +28,7 @@ glue, not new substrate**:
   compiled **at instantiate** — §14's "nesting cost paid at setup".
 - **Grants into children** — `instantiate_granted` (op 8) / `instantiate_named`
   (op 11) re-grant the parent's own capabilities (stdout/stderr/stdin) into the
-  child, discovered by name via `cap.self.resolve` (`instantiate_granted.rs`,
+  child, discovered by name via `self.resolve` (`instantiate_granted.rs`,
   `instantiate_named.rs`). This is stdio inheritance.
 - **argv delivery** — a child runs over the **parent's shared window backing**;
   the carve is not zeroed, so the parent seeds `argv` bytes into the child's
@@ -98,7 +98,7 @@ map** the personality holds; command lookup is a map lookup; `exec` is spawn.
      op 8 — the handle is the child's 3rd arg) and writes through it, rather than
      resolving by name. This is the shape a **chibicc-compiled** applet must take:
      the frontend's generic capability import passes the handle as the *first C
-     argument at runtime* (`codegen_ir.c` §7) and cannot emit `cap.self.resolve`,
+     argument at runtime* (`codegen_ir.c` §7) and cannot emit `self.resolve`,
      so `applet(inst, addrspace, stdout_h)` writing through `stdout_h` is the
      natural form. Proven with a seeded-argv echo, differential interp==JIT.
 4. **exec a compiled-C command (pure status)** *(done —
@@ -164,7 +164,7 @@ It does **not** cover the shell *intercepting* a command's output — `cmd > fil
 forward the real `stdout` but **serve** the child's stdout with its own code
 (capturing bytes, feeding a pipe). That is capability-model **Power 2**: a guest
 minting a capability whose implementation *is* its own code, so a child's
-`cap.call` on it parks and wakes the parent (§14 "the parent's own handler /
+`call.cap` on it parks and wakes the parent (§14 "the parent's own handler /
 pay-for-what-you-virtualize"). The primitive is the **`Endpoint`** (PROCESS.md
 §4, `[PROPOSED]`; S9 on the roadmap): `mint(sig) -> (serve_end, client_template)`,
 `serve`/`reply`. A guest-served endpoint is what makes a parent a **personality /
@@ -247,7 +247,7 @@ keystone of self-similarity. It is **not built**. Until it lands:
    built*: `MprotectWindow::map_region` does real aliasing (memfd
    `mmap(MAP_SHARED|MAP_FIXED)` on unix, placeholder + `MapViewOfFile3` on
    windows) against any `GuestWindow`, the child powerbox host is already the
-   child's baked `cap.call` ctx (so `map` reaches its regranted region), and
+   child's baked `call.cap` ctx (so `map` reaches its regranted region), and
    the region-canon hook self-installs per child window at the child's first
    thunk call. What was actually missing: (1) **granted children ran
    synchronously** — ops 8/11/13 now take the S1c OS-thread path (uncached
@@ -275,7 +275,7 @@ keystone of self-similarity. It is **not built**. Until it lands:
    (head/tail/done/reader-closed words + data), parking on real futexes with
    the loud 5 s-timeout bail; `head`'s early exit sets reader-closed so its
    producer stops (SIGPIPE-lite) instead of wedging. The `__stage` runner is
-   an ordinary `--child-entry` C program — grants discovered by `cap.self`
+   an ordinary `--child-entry` C program — grants discovered by `self.*`
    reflection, rings mapped with the `__vm_region_*` builtins into its own
    256 KiB window, filters (`cat`/`grep [-v -c]`/`wc`/`head`/`tail`/`sort`/
    `uniq`) byte-matching the shell's builtins — and holds no memfs capability
@@ -334,7 +334,7 @@ differential-tests; the browser plumbing lives in the detached `temen-browser` c
   editor text as stdin and the personality's captured stdout as output.
 
 - **Sequential subset only.** The browser's bytecode compiler rejects `Instantiator`/`SharedRegion`
-  cap.calls, so the browser fixture is built with `-DTEMEN_SHELL_SEQUENTIAL`: `#ifndef` guards in
+  call.caps, so the browser fixture is built with `-DTEMEN_SHELL_SEQUENTIAL`: `#ifndef` guards in
   `shell_main.c` drop the **external-command spawn** (slice 5, above) and the **concurrent ring
   pipelines** (slice 6). What ships is the full Stage-0 surface — builtins, redirection, in-window
   memfs pipelines, `;`/`&&`/`||` lists, `if`, variables, globbing, and `#` comments. External
@@ -392,7 +392,7 @@ signals ladder). In dependency order:
    *Medium/mechanical.* Gets bash to *link and start*.
 3. **`fork` (the gate)** — the substrate has **no fork-returns-twice**. The plan (§7 / Stage 3 / S11)
    implements it at the **personality** level over durable freeze → clone-window → thaw, with two hard
-   prereqs: **R8 closure** (durable `call_indirect` to may-suspend targets — bash dispatches builtins
+   prereqs: **R8 closure** (durable `call.dyn` to may-suspend targets — bash dispatches builtins
    through function-pointer tables, so R8 is squarely on fork's critical path) and a
    durable-instrumented build + full window copy (CoW later). *Large; the single biggest item.* Until
    it lands, bash runs only a fork-free subset — effectively no real script (`ls | wc` already forks).
@@ -455,7 +455,7 @@ What the browser bytecode engine still **declines** (the real remaining gaps, in
    `bytecode_concurrent_stages.rs`)* — the full concurrent ring pipeline (the tree-walk oracle's
    `concurrent_stages.rs`, same 410) now runs on the cooperative bytecode driver. The gap turned out
    **narrower than "lower the region ops"**: `SharedRegion.map`/`page_size` (ops 0/3) and
-   `AddressSpace.create_region` (op 5) already ride the generic `cap.call` dispatch (they service from
+   `AddressSpace.create_region` (op 5) already ride the generic `call.cap` dispatch (they service from
    `(Host, Mem)` alone — only `SharedRegion.grant` op 4 needs a child-powerbox seam, and the ring path
    doesn't use it), and the production `drive` scheduler was **already** a cooperative multi-vCPU
    scheduler that parks a task on `memory.wait` and wakes it on `notify` (so item 3 below was already

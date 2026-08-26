@@ -15,7 +15,7 @@
 //!   code intact and runnable — exercised by interleaving `define_extra` calls with runs
 //!   of both the parent entry and earlier units.
 //! - **Mask invariance** (DESIGN.md §22 "the baked function-table mask"): extra units are never
-//!   installed in the function table, so `call_indirect` from an extra unit dispatches
+//!   installed in the function table, so `call.dyn` from an extra unit dispatches
 //!   through the parent's table with the parent's mask — byte-identical dispatch, even
 //!   when the cumulative function count crosses a power-of-two boundary.
 
@@ -159,7 +159,7 @@ fn incremental_finalize_keeps_earlier_code_runnable() {
 /// Mask invariance (DESIGN.md §22 "the baked function-table mask"): the parent declares ONE
 /// function (table mask = 0); the extra unit holds FOUR functions, so the *cumulative*
 /// count crosses a power-of-two boundary — but extra functions are thunk-reachable only
-/// and never enter the table, so a `call_indirect` from extra code dispatches through the
+/// and never enter the table, so a `call.dyn` from extra code dispatches through the
 /// parent's 1-entry table with the parent's mask. Index 0 hits the parent function; index 3
 /// wraps (`3 & 0 = 0`) to the same slot — exactly what parent code itself would do.
 #[test]
@@ -167,10 +167,10 @@ fn define_extra_call_indirect_uses_parent_table_and_mask() {
     // Parent: func 0 (i32, i32) -> (i32) is the add — also the entry.
     let mut cm = compile(ADD);
     let extra_src = concat!(
-        // f0: call_indirect slot 0 with the parent's signature.
-        "func (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.const 0\n  v3 = call_indirect (i32, i32) -> (i32) v2 (v0, v1)\n  return v3\n  }\n}\n",
-        // f1: call_indirect slot 3 — masked by the parent's mask 0, wraps to slot 0.
-        "func (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.const 3\n  v3 = call_indirect (i32, i32) -> (i32) v2 (v0, v1)\n  return v3\n  }\n}\n",
+        // f0: call.dyn slot 0 with the parent's signature.
+        "func (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.const 0\n  v3 = call.dyn (i32, i32) -> (i32) v2 (v0, v1)\n  return v3\n  }\n}\n",
+        // f1: call.dyn slot 3 — masked by the parent's mask 0, wraps to slot 0.
+        "func (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.const 3\n  v3 = call.dyn (i32, i32) -> (i32) v2 (v0, v1)\n  return v3\n  }\n}\n",
         // f2, f3: padding so the unit pushes the cumulative function count past a
         // power-of-two boundary (1 parent + 4 extra = 5 > 4).
         "func () -> (i32) {\nblock 0 () {\n  v0 = i32.const 0\n  return v0\n  }\n}\n",
@@ -198,7 +198,7 @@ fn define_extra_call_indirect_uses_parent_table_and_mask() {
 
 /// The complement of mask invariance: **extra code is invisible to guest dispatch** (DESIGN.md §22
 /// Model A — parent→extra calls do not exist; the only entry into extra code is the host
-/// trampoline). The parent dispatches `call_indirect` over every index a guest could name;
+/// trampoline). The parent dispatches `call.dyn` over every index a guest could name;
 /// then an extra function with the *same signature* as the table's functions is defined; the
 /// sweep must be outcome-identical — no index reaches the new code, including the padding
 /// slots and wrapped indices. (A guest array mixing old and new procedures therefore cannot
@@ -210,7 +210,7 @@ fn parent_call_indirect_cannot_reach_extra_code() {
     // Parent: f0 = the dispatching entry, f1 = +10, f2 = *2 (both (i32) -> (i32)).
     // Table is padded to 4 slots; slot 3 is padding (traps), idx ≥ 4 wraps (mask 3).
     let parent_src = concat!(
-        "func (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = call_indirect (i32) -> (i32) v0 (v1)\n  return v2\n  }\n}\n",
+        "func (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = call.dyn (i32) -> (i32) v0 (v1)\n  return v2\n  }\n}\n",
         "func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  v1 = i32.const 10\n  v2 = i32.add v0 v1\n  return v2\n  }\n}\n",
         "func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  v1 = i32.const 2\n  v2 = i32.mul v0 v1\n  return v2\n  }\n}\n",
     );
@@ -250,14 +250,14 @@ fn parent_call_indirect_cannot_reach_extra_code() {
     );
 }
 
-/// Fail-closed type ids: a `call_indirect` in an extra unit whose signature no table entry
+/// Fail-closed type ids: a `call.dyn` in an extra unit whose signature no table entry
 /// carries traps `IndirectCallType` (it must NOT silently call anything). The signature gets
 /// a real interned id — stable for a future install — but until something with that
 /// signature sits in the table, every dispatch with it is inert.
 #[test]
 fn define_extra_unknown_signature_traps_fail_closed() {
     let mut cm = compile(ADD); // parent declares only (i32, i32) -> (i32)
-    let extra_src = "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = i32.const 0\n  v2 = call_indirect (i64) -> (i64) v1 (v0)\n  return v2\n  }\n}\n";
+    let extra_src = "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = i32.const 0\n  v2 = call.dyn (i64) -> (i64) v1 (v0)\n  return v2\n  }\n}\n";
     let extra = parse_module(extra_src).expect("parse");
     verify_module(&extra).expect("verify");
     let ptrs = cm
@@ -352,7 +352,7 @@ fn type_ids_are_interned_append_only_across_units() {
     let id = cm.interned_type_id(&novel).expect("interned by unit A");
 
     // Unit B mentions the same signature only at a call site — same id, nothing remapped.
-    let unit_b_src = "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = i32.const 0\n  v2 = call_indirect (i64) -> (i64) v1 (v0)\n  return v2\n  }\n}\n";
+    let unit_b_src = "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = i32.const 0\n  v2 = call.dyn (i64) -> (i64) v1 (v0)\n  return v2\n  }\n}\n";
     let unit_b = parse_module(unit_b_src).expect("parse");
     verify_module(&unit_b).expect("verify");
     let ptrs = cm
@@ -381,13 +381,13 @@ fn define_extra_empty_unit() {
 }
 
 /// B2 `install` (JIT level, DESIGN.md §22 slice #4): a `define_extra` unit installed into a
-/// **pre-reserved** table slot becomes `call_indirect`-able — old→new. The parent entry is
-/// `(slot, a, b) -> call_indirect[slot](a, b)`; with a reserved table the unit lands in the
+/// **pre-reserved** table slot becomes `call.dyn`-able — old→new. The parent entry is
+/// `(slot, a, b) -> call.dyn[slot](a, b)`; with a reserved table the unit lands in the
 /// first padding slot, and dispatching that slot runs the unit over the live window. An
 /// un-installed slot still traps `IndirectCallType` fail-closed.
 #[test]
 fn install_makes_unit_call_indirectable() {
-    let parent_src = "func (i32, i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32, v2: i32) {\n  v3 = call_indirect (i32, i32) -> (i32) v0 (v1, v2)\n  return v3\n  }\n}\n";
+    let parent_src = "func (i32, i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32, v2: i32) {\n  v3 = call.dyn (i32, i32) -> (i32) v0 (v1, v2)\n  return v3\n  }\n}\n";
     let m = parse_module(parent_src).expect("parse");
     verify_module(&m).expect("verify");
     // Reserve a 16-slot table (log2 = 4) so there is padding for install (parent has 1 func).
@@ -419,7 +419,7 @@ fn install_makes_unit_call_indirectable() {
         "first padding slot is just past the parent's 1 function"
     );
 
-    // old→new: parent `call_indirect` of the installed slot reaches the unit.
+    // old→new: parent `call.dyn` of the installed slot reaches the unit.
     let (out, _) = cm.run(&[slot as i64, 6, 7], None, None).expect("run");
     assert!(
         matches!(out, JitOutcome::Returned(ref s) if s == &[142]),

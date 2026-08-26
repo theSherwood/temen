@@ -5,17 +5,17 @@ on the tree-walk oracle** (PRs 1–5 + track 2; §5/§8 below are the as-built r
 transport fork rides is settled as DESIGN.md §12a (was CALLS.md); this file keeps the fork
 *semantics* — reply-injection (§3), the child handle model (§4), the clone spec (§6), invariants
 (§7), and the fork+wait contract (§8.6) — plus the build log the code comments cite. R8 closure
-(durable `call_indirect` to may-suspend targets) was the prereq and is done.
+(durable `call.dyn` to may-suspend targets) was the prereq and is done.
 
 **Backend parity: fork runs on 2 of 4 backends** (the tree-walk oracle **and** the bytecode
 interpreter). `OPS_PARITY.md` shows `clone_caller`/`reap` as ✅ on tree-walk + bytecode, 🚧 on
-Cranelift (the next slice), ⛔ on the wasm-JIT (leaf) — no longer hidden inside a single `cap.call`
+Cranelift (the next slice), ⛔ on the wasm-JIT (leaf) — no longer hidden inside a single `call.cap`
 row. The bytecode slice is **done** (§9.2); Cranelift is **§9's remaining track**. See §9.
 
 ## 1. The mechanism (PROCESS.md §7, verbatim intent)
 
 `fork()` is **personality sugar over durable freeze → clone-window → thaw-both**. "Fork-returns-twice
-is a *reply value*, not a substrate concept": one `fork()` `cap.call` parks the caller; a **servicer**
+is a *reply value*, not a substrate concept": one `fork()` `call.cap` parks the caller; a **servicer**
 clones the parked caller into a second window and holds **two reply tokens** — replying `pid` to one
 copy and `0` to the other. Both copies resume from the same park, each with its own reply value.
 
@@ -25,7 +25,7 @@ party appears only as the **callee/servicer** the caller is parked on.
 ## 2. The wall — open question O10 (confirmed in code)
 
 `freeze_drive` (`crates/temen-interp/src/lib.rs:6984`) **refuses** to freeze a fiber parked on an
-un-replied `cap.call` (`Blocked::CapReply`) — exactly fork's park point:
+un-replied `call.cap` (`Blocked::CapReply`) — exactly fork's park point:
 
 > "An unwoken CAP park would spill the freeze placeholder into a `Leaf` frame (reloaded as the call's
 > result — unsound), so it fails the whole freeze closed." (`:6981-6983`)
@@ -107,8 +107,8 @@ handler knows the caller by its dispatch **ticket** (the `(callee, ticket)` repl
 it `clone_caller() -> twin_child_handle` (self-namespace, servicer-side) or `clone(child_handle)` — does:
 
 1. **Capture the caller's continuation.** The caller is parked on `Blocked::CapReply { ticket, callee }`
-   with its live frame *inside* the pending `cap.call`. Spill that fiber's live set into its window,
-   positioned at the `cap.call`'s **post-call resume point** (the ordinary `Leaf`-style reload) with a
+   with its live frame *inside* the pending `call.cap`. Spill that fiber's live set into its window,
+   positioned at the `call.cap`'s **post-call resume point** (the ordinary `Leaf`-style reload) with a
    **reply slot** — the reply-injection capture, not a placeholder and not a re-issue arm.
 2. **Twin it.** Copy the caller's carve (window slice) into a fresh child domain (via the
    `spawn_named_child` path), re-grant its pass-through handles, and re-seed a `CapReply` park for the
@@ -127,7 +127,7 @@ can **capture a parked caller's continuation at the reply-slot resume point and 
 That isolates the O10 lift (`flatten_fiber_for_freeze` + `freeze_drive`, `:6984`/`:6997`) — the load-
 bearing soundness change — from the twin-instantiation. Only then add the copy + second ticket.
 
-**Load-bearing risk.** A parked `cap.call`'s live set lives in the interp's native frame Vec, not the
+**Load-bearing risk.** A parked `call.cap`'s live set lives in the interp's native frame Vec, not the
 window — lost unless capture spills it, positioned at the post-call point with the reply slot,
 interp==JIT byte-identical. A subtle error yields a *wrong-but-passing* result — the reason to isolate
 the capture step first, TDD-first.
@@ -158,7 +158,7 @@ So the op — `clone_caller() -> twin_child_handle | -errno`, self-namespace, se
 1. In the handler, read `serve_run.ticket` + the callee domain id; look up the caller's
    `Waiter::Fiber { reg, slot }` in `ticket_waiters`. `-EINVAL` if not called from a handler / no waiter.
 2. **Capture** that specific fiber's continuation: `flatten_fiber_for_freeze`-style spill of `(reg, slot)`
-   at the caller's `cap.call` **post-call resume point** with a **reply slot** — the targeted,
+   at the caller's `call.cap` **post-call resume point** with a **reply slot** — the targeted,
    single-fiber freeze (the load-bearing new primitive; the whole-run `freeze_drive` is not involved).
 3. **Twin**: copy the caller's carve into a fresh child (`spawn_named_child` path), re-grant pass-through
    handles, re-seed a `CapReply` park for the twin under a second `(callee, ticket')`.
@@ -187,7 +187,7 @@ the freeze/flatten soundness change from the instantiation, interp==JIT, TDD-fir
 - **Increment 3 — the twin. DONE (PR #531 = primitives; this PR = wiring).** `clone_caller(reply_orig,
   reply_twin)` duplicates the parked caller vCPU into a fresh domain (`VCpu::fork_twin` over
   `Mem::fork_private` + `Host::fork_powerbox`) and delivers each its reply via
-  `Scheduler::fork_parked_caller`. Both resume past the same fork `cap.call` — return-twice, one live
+  `Scheduler::fork_parked_caller`. Both resume past the same fork `call.cap` — return-twice, one live
   run. **No second ticket** in the end: the twin's reply is known at clone time, so it is enqueued
   `runnable` with `pending = CapResult(reply_twin)` rather than parked. Only a **bare** root park (no
   children/fibers) forks; otherwise it degrades to a single reply (never hangs). `fork_powerbox` shares
@@ -241,7 +241,7 @@ The remaining slices turn that into a *compiled-C* program with *real libc*:
   step resolved only wired `offer_func`s (`Binding::Offer`); the fork offer minted by `child_offer` is a
   **live-callee** offer (`Binding::LiveImpl` — a call parks the caller on the server's serve loop), which
   `resolve_offer` never returns, so a named `fork` import could not bind to it (that is *why* the
-  hand-written guest used `cap.self.resolve`). The binder now also matches a LiveImpl offer by signature
+  hand-written guest used `self.resolve`). The binder now also matches a LiveImpl offer by signature
   (name-less at that layer) and binds the slot; `call.import` then rides the same caller-parking path.
   Proven by `fork_import.rs` (a separate-module guest whose `fork` **import** forks-returns-twice).
 - **Slice 3 — libc into a nested child** (blocker D / the real gap). A §14 child spawned by
@@ -274,7 +274,7 @@ resolving caps by name, which is what lets it sidestep the `__px_` import binder
 one extra interp gate: `can_regrant`/`forkable_host_proc` — op-11's grant-list admission must accept a
 forkable `HostProc` as a re-grantable handle (previously only pipes/regions/offers/copyables passed).
 **Update (slice 2 done) — the fork *binding* is proven; only the chibicc *frontend* remains.**
-`crates/temen/tests/fork_import.rs` swaps the capstone's `cap.self.resolve` fork discovery for a **named
+`crates/temen/tests/fork_import.rs` swaps the capstone's `self.resolve` fork discovery for a **named
 `fork` import** on a **separate guest module** spawned via op 13, bound to the live fork offer by
 `bind_child_manifest`. This is the exact runtime path a compiled-C `fork()` takes — the guest is now
 hand-written IR only because chibicc hasn't emitted it yet, not because any runtime piece is missing. The
@@ -299,9 +299,9 @@ op 13 compiled-C exec (`c_shell_exec.rs`), `regrant_into_child` (temen-interp).
 
 ### 8.2 Increment 2 — the derived mechanism (two findings that settle it)
 
-**Finding A — the durable transform already lowers `cap.call` as `SuspendKind::Leaf`**
+**Finding A — the durable transform already lowers `call.cap` as `SuspendKind::Leaf`**
 (`temen-durable/src/lib.rs:855`): "the host performs the op; the deepest frame reloads its result." A caller
-parked on a durable-transformed `cap.call` therefore has *exactly* the Leaf continuation shape, whose thaw
+parked on a durable-transformed `call.cap` therefore has *exactly* the Leaf continuation shape, whose thaw
 reloads the call's result at the **post-call resume point**. **Fork's reply-injection is nothing more than
 supplying that reloaded Leaf result** (§3) — the freeze/flatten path already positions the spill there. So
 the caller's domain (and only it) must be durable-transformed; `clone_caller`'s capture reuses the
@@ -311,7 +311,7 @@ the caller's domain (and only it) must be durable-transformed; `clone_caller`'s 
 `ticket_waiters[(callee_id, ticket)]` in **two** forms (`temen-interp` `Step::Park(CapReply)` at `:4879` and
 the generic-arm fiber park at `:8929`):
   - a **root** caller → `Waiter::VCpu(v)` — the *entire* parked vCPU, holding its **own** `v.mem` (window),
-    `v.frames` (the continuation sitting inside the pending `cap.call`), and durable state;
+    `v.frames` (the continuation sitting inside the pending `call.cap`), and durable state;
   - a **non-root fiber** caller → `Waiter::Fiber { reg, slot }` — frames in a registry whose vCPU is still
     live running other fibers (no bundled window).
 
@@ -326,7 +326,7 @@ parent root parks on the child's offer → `Waiter::VCpu`). So increment 2's res
      clone supplies the real reply, which is what dissolves O10, §3). `v`'s continuation spills into `v`'s
      own window as a durable **image**; record its `FrozenFiber`/root-SP residue.
   3. **Restore in place:** thaw `v` under `REWINDING` — it rebuilds from the image, the Leaf reload hands
-     back the injected reply, and `v` resumes **past** the `cap.call`. Push `v` to `sched.runnable`.
+     back the injected reply, and `v` resumes **past** the `call.cap`. Push `v` to `sched.runnable`.
 
 For the pure no-op this is *visibly* identical to `v.pending = CapResult(injected); runnable.push(v)` — but
 it must genuinely round-trip through the **window image** (discard `v.frames`, rebuild from the flattened
@@ -489,7 +489,7 @@ holds exactly `"EXEC"` (a *different program* did that I/O as the child's task) 
 Three enablers made it work, each a small correctness fix in its own right:
 
 - **chibicc builtins** `__vm_exec_module` (lowers to the `CAP_SELF_EXEC` self-op) and `__vm_resolve`
-  (`cap.self.resolve`) — the C-level `execve` primitive and the named-cap-handle reader.
+  (`self.resolve`) — the C-level `execve` primitive and the named-cap-handle reader.
 - **Modules are re-grantable into a child** (`can_regrant`/`regrant_into_child` + `ModuleGrant: Clone`):
   a shell hands a command module to a child it will `execve`. And **`fork_powerbox` carries modules**
   (was fail-closed on a non-empty module table) — a shell that holds command modules can now fork.
@@ -660,9 +660,9 @@ follow-up (a shim, not a substrate concern).
   the reader: it loops a **handle-specific** blocking read on the pipe read end and forwards each chunk to
   a memfs file through the granted `vm_fs` cap (`FS_WRITE`), until the read EOFs (which arrives when `cmd`
   exits and the writer refcount hits 0). Two new frontend builtins back the pump: `__vm_read(h,buf,len)` /
-  `__vm_write(h,buf,len)` (`cap.call 0 0|1`) read/write a *specific* Stream handle — the plain `read`/
+  `__vm_write(h,buf,len)` (`call.cap 0 0|1`) read/write a *specific* Stream handle — the plain `read`/
   `write` builtins always hit the ambient stdin/stdout, so a shell holding a pipe fd needs these to drain
-  it. The shim exposes them as `read_fd`/`write_fd`. Because `__vm_read` is a **direct `cap.call`** (not a
+  it. The shim exposes them as `read_fd`/`write_fd`. Because `__vm_read` is a **direct `call.cap`** (not a
   `call.sym` offer), the pipe-read park was added to the direct-`CapCall` eval arm too (it had only been on
   the `CallSym` route). Proven by `c_fork.rs::a_shell_redirects_a_command_output_to_a_file`: `cmd` writes
   `"redirected!"` to its stdout, the shell pumps all 11 bytes into `out.txt`, and the shared memfs snapshot
@@ -707,9 +707,9 @@ cap op by design. This section is the convergence plan and the as-built record.
 
 - **Honest matrix.** The process/serve/fork ops are their own `OPS_PARITY.md` family
   (`process, serve & fork`), classified per-backend by `temen-parity`'s `parity_capcall` — instead of
-  hiding inside the one `cap.call` row that (wrongly) read ✅✅✅. `clone_caller`/`reap` show ✅ on
+  hiding inside the one `call.cap` row that (wrongly) read ✅✅✅. `clone_caller`/`reap` show ✅ on
   tree-walk + bytecode, 🚧 on Cranelift, ⛔ on the wasm-JIT (leaf accelerator — it folds *every* cap
-  op by design, so fork stays ⛔ there like `cap.call`). `svc.poll`/`svc.wait` are ✅ on the fast
+  op by design, so fork stays ⛔ there like `call.cap`). `svc.poll`/`svc.wait` are ✅ on the fast
   backends (native serve loop when serve-qualified); the Instantiator spawn/join ops are ✅ too.
 - **Native bytecode fork — DONE.** `clone_caller` + `reap` run natively on the bytecode cooperative
   serve driver. `clone_caller`/`reap` are a `has_fork` seam that `svc_park_veto` keeps (so temen-run's
@@ -749,14 +749,14 @@ the bytecode structures, not a reuse of the oracle's scheduler methods:
 
 - **Parked caller.** A live-offer call parks the caller as a cooperative-driver task in
   `TaskState::BlockedTicket { ticket, callee, dst }` (`bytecode.rs` `drive`); its continuation is the
-  task's `VTask.active: Vm`, positioned past the `cap.call`, with `dst` the reply slot. The settle
+  task's `VTask.active: Vm`, positioned past the `call.cap`, with `dst` the reply slot. The settle
   scan wakes it by `svc_results[ticket]` → `active.set(dst, reply)` → `Runnable`.
 - **Serve linkage.** The serve driver already carries `serve_ticket` (the `ServeRun.ticket` analog)
   while a handler runs. That is the handler→caller linkage, already present.
 
 The slices, **all landed for the cooperative driver** (each pinned against the oracle):
 
-1. **`Op::CloneCaller`/`Op::Reap` + driver surface. DONE.** `cap.call CAP_SELF 11/12` compile to
+1. **`Op::CloneCaller`/`Op::Reap` + driver surface. DONE.** `call.cap CAP_SELF 11/12` compile to
    native ops that surface to the cooperative `drive` via `Outcome`/`VcpuStop::CloneCaller`/`Reap`
    carrying the reply/pid args + dst — the `LiveCall`/`SvcWait` shape. The driver reads the running
    handler's `serve_ticket` (on the task's `Vm`) to name the parked caller.
@@ -784,36 +784,36 @@ The slices, **all landed for the cooperative driver** (each pinned against the o
 
 Cranelift fork does **not** "follow the same arc" as bytecode — that earlier framing was wrong. The
 bytecode twin works because a parked caller is a **reified `Vm` (Clone-derived)** at its post-call
-resume point. On the JIT there is **no reified continuation to clone**: `cap.call` is a synchronous
+resume point. On the JIT there is **no reified continuation to clone**: `call.cap` is a synchronous
 host thunk, so a caller mid-call is a **live native OS-thread stack** — either running the handler
 inline (handoff) or thread-blocked on the `live_impl_call` Condvar (`temen-run/src/lib.rs:2270`). The
 JIT's durable machinery reifies a continuation into shadow-stack bytes **only at a poll safepoint,
-which is always *past* a completed `cap.call`** (a `SuspendKind::Leaf` spills + reloads the
+which is always *past* a completed `call.cap`** (a `SuspendKind::Leaf` spills + reloads the
 *already-returned* result; `temen-durable/src/lib.rs:888,929`). There is no `Blocked::CapReply` state
 on the JIT at all (`temen-jit/src/fiber_registry.rs` has no cap-park concept), and `freeze_drive`
 (`temen-jit/src/fiber_rt.rs:1121`) walks only voluntarily-suspended `RUNNABLE` fibers, whole-run.
 
 So the capstone is **not** DURABILITY §10 "clone at a quiescent point" (cheap snapshot/restore) — a
-forking caller is *not* quiescent. It is: **make a JIT `cap.call` a suspendable, pre-result durable
+forking caller is *not* quiescent. It is: **make a JIT `call.cap` a suspendable, pre-result durable
 safepoint**, so a forking caller unwinds to a reified continuation (shadow-stack bytes in the window)
 instead of thread-blocking. The snapshot format is already engine-agnostic and cloneable
 (`temen-snapshot`, magic `SVMD`), and the interp's live `fork_parked_caller` is the semantic oracle —
 so the real work is turning the JIT call into a reifiable park. The four items, in dependency order:
 
 1. **The inject-vs-reload distinction is *runtime*, not a new compile-time `SuspendKind`** (refined
-   2026-08-07). A `cap.call` compiles once; the transform cannot know at compile time whether a given
+   2026-08-07). A `call.cap` compiles once; the transform cannot know at compile time whether a given
    call will be a normal return (reload the host's result) or a fork (inject a per-copy reply). So do
    **not** add a `LeafInject` kind. Instead the existing `Leaf` reload stays the mechanism — it reloads
    the result from the spill slot — and **fork writes the injected reply into that slot before thaw**.
    The gap is therefore not "a new suspend kind" but item 2: getting the caller to reach a *reified,
    pre-result* park at the fork call so the slot exists to write. (The interp does the runtime version
    of exactly this — `pending = CapResult(reply)` on the live vCPU.)
-2. **Suspendable `cap.call` on the JIT — the load-bearing re-architecture** (`temen-jit` lowering +
+2. **Suspendable `call.cap` on the JIT — the load-bearing re-architecture** (`temen-jit` lowering +
    `temen-run` serve path). *Why it is unavoidable:* in **both** live-offer transports the caller's
    continuation is a **native Rust frame**, unreifiable — the enqueue path thread-blocks the caller on
    the `live_impl_call` Condvar (`temen-run:2270`), and the handoff path runs the handler on the caller's
    own thread with the caller's guest continuation suspended *below* it on the native C stack. A servicer
-   in another frame/thread cannot reify either. The fix: a live-offer `cap.call` from a durable guest,
+   in another frame/thread cannot reify either. The fix: a live-offer `call.cap` from a durable guest,
    when the reply is withheld, must **durable-unwind the caller's shadow stack (pre-result) back to the
    window and return control** — parking the guest as a reified cap-reply-pending continuation — instead
    of ever entering the native thread-block. This is caller-side parking on the JIT (the I36 slice never
@@ -826,13 +826,13 @@ so the real work is turning the JIT call into a reifiable park. The four items, 
    thaw two copies injecting `reply_orig`/`reply_twin` (the snapshot format already carries the
    per-copy residue). This is the JIT analogue of `fork_parked_caller`, layered on 1–3.
 
-**Scope honesty:** item 2 re-architects a core JIT execution path (cross-domain `cap.call` becomes a
+**Scope honesty:** item 2 re-architects a core JIT execution path (cross-domain `call.cap` becomes a
 durable-suspendable, caller-parking op), so this is a multi-PR capstone touching the durable transform
 (the R8 fork-critical instrumentation) and the confinement-adjacent serve path — built TDD-first,
 differential-pinned against the interp, one increment per PR. It is **not** a bounded slice with a
 safe independently-testable first primitive: items 3–4 are only exercisable once item 2 gives a
 reified mid-call continuation, and item 2 itself is the from-scratch execution-mode change. Until the
 capstone lands, `serve_qualifies` correctly folds fork for Cranelift — no divergence, a forking module
-runs on a reifiable tier. The first PR is item 2's foundation: a durable guest's live-offer `cap.call`
+runs on a reifiable tier. The first PR is item 2's foundation: a durable guest's live-offer `call.cap`
 that unwinds pre-result to a window-resident continuation instead of thread-blocking, pinned by a
 freeze/thaw round-trip that resumes past the call with an injected reply.

@@ -8,7 +8,7 @@
 //! the tree-walker oracle + the production bytecode engine.
 //!
 //! `invoke` runs the submitted unit to completion as a **seam-free leaf** (stepping *over* it, matching
-//! production `run_invoke`); `install` + `call_indirect` steps op-by-op like any module-≥1 frame.
+//! production `run_invoke`); `install` + `call.dyn` steps op-by-op like any module-≥1 frame.
 
 use temen_encode::encode_module;
 use temen_interp::bytecode::{DebugRun, SchedStop, ScheduledDebugRun};
@@ -72,7 +72,7 @@ fn sched_to_end(run: &mut ScheduledDebugRun, fuel: &mut u64) -> Result<Vec<Value
 }
 
 /// **old→new via `install`, under the debugger.** Guest `(jit, a, b)`: compile a unit, `install` it,
-/// `call_indirect` the returned slot with `(a, b)`. The unit is `(a,b) -> a*b + 100`, so `(6,7) → 142`.
+/// `call.dyn` the returned slot with `(a, b)`. The unit is `(a,b) -> a*b + 100`, so `(6,7) → 142`.
 /// Both debug engines must run it to completion (no decline) and agree with the tree-walker oracle;
 /// a breakpoint set *after* the `install` op must fire (proving the install was serviced, not declined).
 #[test]
@@ -81,14 +81,14 @@ fn debug_install_then_call_indirect_agrees() {
         "memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  \
          v2 = i32.mul v0 v1\n  v3 = i32.const 100\n  v4 = i32.add v2 v3\n  return v4\n  }\n}\n",
     );
-    // inst 0: const 4096 · 1: const BLOBLEN · 2: compile · 3: install · 4: wrap · 5: call_indirect.
+    // inst 0: const 4096 · 1: const BLOBLEN · 2: compile · 3: install · 4: wrap · 5: call.dyn.
     let guest_src =
         "memory 16\nfunc (i32, i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32, v2: i32) {\n  \
          v3 = i64.const 4096\n  v4 = i64.const BLOBLEN\n  \
-         v5 = cap.call 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  \
-         v6 = cap.call 11 3 (i64) -> (i64) v0 (v5)\n  \
+         v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  \
+         v6 = call.cap 11 3 (i64) -> (i64) v0 (v5)\n  \
          v7 = i32.wrap_i64 v6\n  \
-         v8 = call_indirect (i32, i32) -> (i32) v7 (v1, v2)\n  return v8\n  }\n}\n";
+         v8 = call.dyn (i32, i32) -> (i32) v7 (v1, v2)\n  return v8\n  }\n}\n";
     let m = guest_module(guest_src, &b);
     // Reserve a 16-slot table (log2=4): the parent has 1 func, so the unit installs at slot 1.
     let (host, jit) = jit_host(&m, 4);
@@ -159,8 +159,8 @@ fn debug_invoke_leaf_agrees() {
     let guest_src =
         "memory 16\nfunc (i32, i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32, v2: i32) {\n  \
          v3 = i64.const 4096\n  v4 = i64.const BLOBLEN\n  \
-         v5 = cap.call 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  \
-         v6 = cap.call 11 1 (i64, i32, i32) -> (i32) v0 (v5, v1, v2)\n  return v6\n  }\n}\n";
+         v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  \
+         v6 = call.cap 11 1 (i64, i32, i32) -> (i32) v0 (v5, v1, v2)\n  return v6\n  }\n}\n";
     let m = guest_module(guest_src, &b);
     let (host, jit) = jit_host(&m, 0); // invoke needs no install table
     let args = [Value::I32(jit), Value::I32(6), Value::I32(7)];
@@ -203,8 +203,8 @@ fn debug_invoke_step_into_breakpoint() {
     let guest_src =
         "memory 16\nfunc (i32, i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32, v2: i32) {\n  \
          v3 = i64.const 4096\n  v4 = i64.const BLOBLEN\n  \
-         v5 = cap.call 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  \
-         v6 = cap.call 11 1 (i64, i32, i32) -> (i32) v0 (v5, v1, v2)\n  return v6\n  }\n}\n";
+         v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  \
+         v6 = call.cap 11 1 (i64, i32, i32) -> (i32) v0 (v5, v1, v2)\n  return v6\n  }\n}\n";
     let m = guest_module(guest_src, &b);
     let (host, jit) = jit_host(&m, 0);
     let args = [Value::I32(jit), Value::I32(6), Value::I32(7)];
@@ -254,13 +254,13 @@ fn debug_forged_handle_traps_identically() {
         "memory 16\nfunc () -> (i32) {\nblock 0 () {\n  v0 = i32.const 1\n  return v0\n  }\n}\n",
     );
 
-    // `(jit) -> i32`: install a bogus code handle (7777) — the cap.call traps; the run never returns.
+    // `(jit) -> i32`: install a bogus code handle (7777) — the call.cap traps; the run never returns.
     let install_src = "memory 16\nfunc (i32) -> (i32) {\nblock 0 (v0: i32) {\n  \
-         v1 = i64.const 7777\n  v2 = cap.call 11 3 (i64) -> (i64) v0 (v1)\n  \
+         v1 = i64.const 7777\n  v2 = call.cap 11 3 (i64) -> (i64) v0 (v1)\n  \
          v3 = i32.wrap_i64 v2\n  return v3\n  }\n}\n";
     // …and the same for invoke (op 1).
     let invoke_src = "memory 16\nfunc (i32) -> (i32) {\nblock 0 (v0: i32) {\n  \
-         v1 = i64.const 7777\n  v2 = cap.call 11 1 (i64) -> (i32) v0 (v1)\n  return v2\n  }\n}\n";
+         v1 = i64.const 7777\n  v2 = call.cap 11 1 (i64) -> (i32) v0 (v1)\n  return v2\n  }\n}\n";
 
     for src in [install_src, invoke_src] {
         let m = guest_module(src, &b);

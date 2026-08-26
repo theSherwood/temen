@@ -1,7 +1,7 @@
 //! THREADS/BROWSER parity (PR #118, F7/F9): the wasm **powerbox** must register its granted
 //! capabilities under their canonical names in the `cap_names` directory, so a guest can resolve them
-//! at runtime with `cap.self.resolve` — exactly as `temen-run`'s powerbox does. Without the registration,
-//! `cap.self.resolve("stdout")` would `-EINVAL` and the guest couldn't re-find its own handles, a
+//! at runtime with `self.resolve` — exactly as `temen-run`'s powerbox does. Without the registration,
+//! `self.resolve("stdout")` would `-EINVAL` and the guest couldn't re-find its own handles, a
 //! silent divergence from the native powerbox ground truth `powerbox_exec` is meant to mirror verbatim.
 
 use temen_browser::{powerbox_exec, STATUS_OK};
@@ -17,10 +17,10 @@ func (i32, i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32, v2: i32) {
   v3 = i64.const 17000
   v4 = i64.const 6
-  v5 = cap.self.resolve v3 v4
+  v5 = self.resolve v3 v4
   v6 = i64.const 0
   v7 = i64.const 16
-  v8 = cap.call 0 1 (i64, i64) -> (i64) v5(v6, v7)
+  v8 = call.cap 0 1 (i64, i64) -> (i64) v5(v6, v7)
   v9 = i32.const 0
   return v9
   }

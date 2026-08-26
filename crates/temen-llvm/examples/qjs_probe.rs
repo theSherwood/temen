@@ -115,7 +115,7 @@ fn main() {
     println!(
         "  br_table terminators: {brtabs}  (max targets = {max_targets})  <- the opcode dispatch"
     );
-    println!("  loads={loads} stores={stores} calls={calls} call_indirect={indirect}");
+    println!("  loads={loads} stores={stores} calls={calls} call.dyn={indirect}");
     println!(
         "  {} functions in its direct-call closure",
         closure_size(m, jci)

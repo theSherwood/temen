@@ -12,9 +12,9 @@ The system is four ideas wearing many names:
    own window and powerbox it is a *domain*; grafted into an existing domain (guest-JIT
    submission) it is a *unit*. Same bytes, same verifier, different role.
 2. **Two call paths.** Every call is either *capability-addressed* (through the
-   host-owned handle table, use-site checked: `call.import`, dispatch-form `cap.call`,
+   host-owned handle table, use-site checked: `call.import`, dispatch-form `call.cap`,
    `Jit.invoke`) or *funcref-addressed* (through the domain's function table:
-   `call_indirect`, installed units). Invoke/install are not new concepts — they are
+   `call.dyn`, installed units). Invoke/install are not new concepts — they are
    compiled code entering these two existing paths.
 3. **Two binding times.** Authority is connected either at *spawn/wiring time* (the
    embedder registry, a parent binding a child's manifest, accepting an offer) or at
@@ -116,8 +116,8 @@ The system is four ideas wearing many names:
 - **`call.sym`** — the §7/§22 *symbolic* call (v8): flat name reference + self-describing
   sig + the legacy handle operand only it still carries. Binds by name at whichever
   binding act comes first — instantiation (executes as ordinary slot dispatch, operand
-  ignored) or the linker (`resolve_imports_with` rewrites it: Cap → `cap.call` on the
-  live operand, Slot → `call_indirect`, Func → direct call).
+  ignored) or the linker (`resolve_imports_with` rewrites it: Cap → `call.cap` on the
+  live operand, Slot → `call.dyn`, Func → direct call).
 - **`import.attach`** — fill (or refill) a `rebindable` slot with a capability the
   domain already holds, type-checked fail-closed. The "reflect, decide, attach once,
   then ordinary calls" pattern.
@@ -137,14 +137,14 @@ The system is four ideas wearing many names:
   handle's native op order), which a consumer's grouped import binds against by the same
   coverage walk (subset allowed, remap-dispatched). The host-side mirror of a guest offer
   — `impl_service` wires a guest module as provider, `iface` wires a host handle.
-- **`cap.call`** — the wire form of dynamic-mode dispatch: `(type_id, op, sig)`
+- **`call.cap`** — the wire form of dynamic-mode dispatch: `(type_id, op, sig)`
   immediates plus a runtime handle. Retired as a *concept* (it's just dynamic mode);
   kept as the encoding and the escape hatch for undeclared grants.
 - **manifest-complete** — a verifier-computed per-module bit: no dynamic-mode dispatch
   anywhere, so the manifest is the complete list of interfaces the module can ever
-  drive. Reflection (`cap.self.*`, including its reserved-id dispatch form) is exempt —
+  drive. Reflection (`self.*`, including its reserved-id dispatch form) is exempt —
   it confers nothing.
-- **discovery / reflection (`cap.self.*`)** — authority-neutral ops reporting what this
+- **discovery / reflection (`self.*`)** — authority-neutral ops reporting what this
   domain already holds: count, get `(handle, type_id)`, resolve-by-name, attest,
   provenance. Never a grant.
 
@@ -217,7 +217,7 @@ The system is four ideas wearing many names:
   argument: a nested, signature-checked run over the caller's own world. No shared-table
   entry; the mask never moves.
 - **install** (Model B2) — put a unit into the pre-sized shared function table as a
-  **funcref**; existing code then reaches it via ordinary `call_indirect` at native
+  **funcref**; existing code then reaches it via ordinary `call.dyn` at native
   speed. The funcref is plain guest data.
 - **funcref** — an `i32` equal to a function's index in the domain's table; the currency
   of indirect calls. Type-checked at dispatch via the interned signature id.
@@ -227,10 +227,10 @@ The system is four ideas wearing many names:
 
 ## Trust & identity
 
-- **attest (`cap.self.attest`)** — the one non-interposable report: platform-vouched
+- **attest (`self.attest`)** — the one non-interposable report: platform-vouched
   facts about *this domain's* exposure (isolation tier, window-exposed, freeze-exposed).
   The trust anchor no parent can fake.
-- **provenance (`cap.self.provenance`)** — the per-*binding* honest bit:
+- **provenance (`self.provenance`)** — the per-*binding* honest bit:
   `0` = **platform-terminated** (host-native implementation), `d ≥ 1` =
   **ancestor-terminated** (a wired guest implementation, `d` re-grant hops up). A parent
   can interpose anything but cannot hide that it did.

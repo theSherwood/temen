@@ -3,7 +3,7 @@
 //!   cargo test -p temen --test durable_bench -- --ignored --nocapture
 //!
 //! Reports instrumented-IR size, JIT compile+run time, and interp freeze+thaw time, on a
-//! "dead-heavy" guest — a prefix chain whose intermediates are dead across the `cap.call`
+//! "dead-heavy" guest — a prefix chain whose intermediates are dead across the `call.cap`
 //! — so the current over-capture (spill *every* value visible at the op) vs. a future
 //! minimal live-set (spill only values used after the op) shows its largest delta. Capture
 //! the numbers here before/after the live-set change to see the effect on JIT/compile time.
@@ -20,7 +20,7 @@ const SIZE_LOG2: u8 = 18;
 const WINDOW: usize = 1 << SIZE_LOG2;
 
 /// `k` i64 values chained so each feeds only the next (intermediates die before the call),
-/// then a `cap.call`, then a tail using just the last chain value + the call result. Over-
+/// then a `call.cap`, then a tail using just the last chain value + the call result. Over-
 /// capture spills all `k`+; minimal spills ~2.
 fn dead_heavy_src(k: usize) -> String {
     let mut s = String::from("func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i64.const 1\n");
@@ -31,7 +31,7 @@ fn dead_heavy_src(k: usize) -> String {
     let cap = k + 2;
     let res = k + 3;
     s += &format!("  v{arg} = i32.const 0\n");
-    s += &format!("  v{cap} = cap.call 2 0 (i32) -> (i64) v0 (v{arg})\n");
+    s += &format!("  v{cap} = call.cap 2 0 (i32) -> (i64) v0 (v{arg})\n");
     s += &format!("  v{res} = i64.add v{k} v{cap}\n");
     s += &format!("  return v{res}\n  }}\n}}\n");
     s

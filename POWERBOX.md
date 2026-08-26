@@ -45,7 +45,7 @@ A non-C frontend (e.g. JACL's codegen) that emits TEMEN-IR and links it itself s
    through `iface::HOST_FN` (13), distinguished by handle + op. Recommendation: keep that as the
    mechanism, but let a host **tag** each registered interface with a nominal id drawn from an open
    range `[HOST_IFACE_BASE, u32::MAX)` (e.g. `HOST_IFACE_BASE = 1 << 16`), carried for diagnostics
-   and `cap.self.*` discovery and dispatched through the same generic seam. The fixed builtins
+   and `self.*` discovery and dispatched through the same generic seam. The fixed builtins
    (0–13) keep their ids. This is a refinement, not a blocker — lowest priority of the three.
 
 ---
@@ -66,7 +66,7 @@ Grounded in the current code, so the plan builds on reality:
 - **Arbitrary named imports.** `Module.imports: Vec<Import{name, sig}>` (unbounded) +
   `Inst::CallImport{import, sig, handle, args}` + `temen_ir::resolve_imports_with` (any name →
   `Resolved::Cap{type_id, op}` / `Func` / `Slot`). The number/name/signature are already free.
-- **Runtime discoverability.** `cap.self.count` / `cap.self.get` (`CapSelfCount`/`CapSelfGet`) let a
+- **Runtime discoverability.** `self.count` / `self.get` (`CapSelfCount`/`CapSelfGet`) let a
   guest enumerate its own handles at runtime — an alternative/complement to a fixed-offset stash.
 - **Parameterizable memory reservation.** `reserved_log2` is already threadable on the
   `*_reserved` entries (`compile_and_run_capture_reserved_with_host`, interp `run_capture_reserved`)
@@ -159,7 +159,7 @@ unify into one (in `temen-ir` or `temen-interp`) consumed by both backends.
       `crates/temen/tests/powerbox_imports.rs` (arbitrary-named host-fn caps, unbound fail-closed,
       standard names as a preset), interp == jit.
 - [x] A runtime name→handle directory (F7): the guest resolves a capability name to its handle at
-      runtime via `cap.self` op 2 (dlopen-style), over the `Host` `cap_names` directory populated at
+      runtime via `self.*` op 2 (dlopen-style), over the `Host` `cap_names` directory populated at
       grant. Compile-time name binding remains the default; this adds dynamic in-guest discovery.
 - [ ] (Deferred) full dynamic stash sizing (heap base above an arbitrary-N stash) to lift the
       ≤8-with-heap / ≤32-without cap; not needed until a frontend wants >8 named caps *and* a heap.
@@ -187,9 +187,9 @@ Decision #3 settled: keep `HOST_FN` + handle as the mechanism. The handle is alr
 more-expressive disambiguator than a nominal type_id, and an open host-assignable type_id range would
 weaken the §3c type-check's closed-enum audit surface for only a diagnostics gain.
 - [x] (Optional, cosmetic) carry an optional human-readable **interface label** alongside a `HostFn`
-      grant — untrusted, verifier-ignored, for diagnostics / `cap.self.*` only. Not a type_id.
+      grant — untrusted, verifier-ignored, for diagnostics / `self.*` only. Not a type_id.
       *Landed as F9* (below): the label is the F7 registered name, surfaced host-side via
-      `Host::cap_label(handle)` and guest-side via `cap.self.label` (opcode `0x7F`).
+      `Host::cap_label(handle)` and guest-side via `self.label` (opcode `0x7F`).
 
 ### Phase 5 — C bindings — done
 - [x] `temen-capi` crate (`rlib` + `cdylib` + `staticlib`) + hand-written `include/temen.h` over the whole
@@ -426,8 +426,8 @@ sequence. Plus a C-ABI mirror (`temen_session_*`).
   notes / `jit_run`). Values + clamping unchanged (both ceilings `1<<16`).
 - **F7 — runtime name→handle directory.** *Landed.* A guest can resolve a capability **by name to its
   handle at runtime** — dlopen-style discovery, the dynamic counterpart to load-time name binding — via
-  a first-class IR instruction **`cap.self.resolve <name_ptr> <name_len> -> i32`** (a clean
-  counterpart to `cap.self.count`/`get`; opcode `0x7E`, full text + binary + verify support). The
+  a first-class IR instruction **`self.resolve <name_ptr> <name_len> -> i32`** (a clean
+  counterpart to `self.count`/`get`; opcode `0x7E`, full text + binary + verify support). The
   `Host` keeps a `cap_names` directory (name → handle), populated by the powerbox layer at grant time:
   a name-bound guest (`instantiate_with_imports`) resolves its own import names; a fixed §3e powerbox
   guest resolves the canonical names (`stdout`/`stdin`/`exit`/`memory`/`addrspace`/
@@ -438,7 +438,7 @@ sequence. Plus a C-ABI mirror (`temen_session_*`).
   bad UTF-8 / unknown). Tests: `powerbox_imports.rs` (runtime resolve + use on all three backends;
   unknown-name `-EINVAL`; canonical names match the stashed handles) and `cap_self.rs` (text + binary
   round-trip). *Update (PROCESS.md S15, c1–c4):* the resolve path is now the powerbox's **only**
-  bootstrap — every synthesized `_start` is paramless and stashes its handles via `cap.self.resolve`
+  bootstrap — every synthesized `_start` is paramless and stashes its handles via `self.resolve`
   over a name list (`temen_ir::POWERBOX_CAP_NAMES[..n]` for the fixed set;
   `synth_powerbox_start_with_names` / `_for_imports` for a module's own import names), with the
   runner binding name → implementation **+ handle** (`Resolved::CapBound`, `temen_run::powerbox_resolver`,
@@ -450,20 +450,20 @@ sequence. Plus a C-ABI mirror (`temen_session_*`).
   synthesized `_start` prologue, the stash, `Resolved::CapBound`, `powerbox_resolver`, the
   `synth_powerbox_start*` family, and the runner's positional-entry powerbox path are all
   **deleted** (the §2.5 grep-clean gate, `crates/temen/tests/imports_gate.rs`, checks they stay
-  gone). `cap.self.resolve`/`count`/`get` remain as the guest-side discovery tier.
+  gone). `self.resolve`/`count`/`get` remain as the guest-side discovery tier.
 - **F8 — full dynamic stash sizing** (Phase 2 deferral): lift the ≤8-with-heap / ≤32-without cap by
   placing the heap base above an arbitrary-N stash.
 - **F9 — cosmetic capability labels.** *Landed.* The reverse of F7: a human-readable **label** for a
-  granted capability, surfaced for diagnostics and `cap.self` discovery. It reuses F7's `cap_names`
+  granted capability, surfaced for diagnostics and `self.*` discovery. It reuses F7's `cap_names`
   directory (a label *is* the registered name), exposed two ways: (1) host-side `Host::cap_label(handle)
-  -> Option<&str>` for embedder diagnostics; (2) guest-side first-class instruction **`cap.self.label
+  -> Option<&str>` for embedder diagnostics; (2) guest-side first-class instruction **`self.label
   <handle> <buf_ptr> <buf_cap> -> i32`** (opcode `0x7F`; full text/binary/verify support) that writes
   the handle's label into the window and returns its full length (`0` if unlabeled; writes nothing and
   returns the needed length if it doesn't fit; `-EFAULT` on an out-of-window buffer). Lowered to op 3
   over the reserved `CAP_SELF_TYPE_ID` in the generic `cap_dispatch_slots` seam, so **all three
   backends** share one implementation. Cosmetic and authority-neutral — a label is *not* a nominal
-  type_id and the verifier ignores it. So a guest can `cap.self.count`/`get` to enumerate its handles
-  and `cap.self.label` to name each. Tests: `powerbox_imports.rs` (label→name emit on all three
+  type_id and the verifier ignores it. So a guest can `self.count`/`get` to enumerate its handles
+  and `self.label` to name each. Tests: `powerbox_imports.rs` (label→name emit on all three
   backends; undersized-buffer returns full length, writes nothing) and `cap_self.rs` (text + binary
   round-trip; `Host::cap_label` round-trip + misses).
 - **F10 — pin bytecode parity *in the powerbox layer*.** The bytecode engine is held to exact
@@ -485,7 +485,7 @@ sequence. Plus a C-ABI mirror (`temen_session_*`).
   built-ins (`AddressSpace.create_region`, the §14 `Instantiator`'s child powerboxes). The seam is
   already borrow-clean: dispatch takes the closure *out* of `host_fns` before running it, so a `HostFn`
   variant receiving a host context (`mint(HostFn) -> handle`, `register_cap_name`) can be threaded
-  without aliasing. Because the F7 directory is **live** (`cap.self.resolve` reads it at call time),
+  without aliasing. Because the F7 directory is **live** (`self.resolve` reads it at call time),
   anything minted + named mid-run becomes guest-resolvable immediately — dynamic *discovery* of new
   capabilities falls out for free. Keeps the object-capability idiom: authority appears because a held
   capability minted it, never by ambient mutation. *First slice landed:*
@@ -505,16 +505,16 @@ sequence. Plus a C-ABI mirror (`temen_session_*`).
   workable *today* with zero VM changes (an outside thread can even revoke while the guest runs). The
   open decision is which semantics a first-class revoke commits to, and whether names unregister with
   their handle.
-- **F14 — op-level discovery stays a convention, not a VM surface.** `cap.self.*` reflection is
+- **F14 — op-level discovery stays a convention, not a VM surface.** `self.*` reflection is
   deliberately **handle-level** (`count`/`get`/`resolve`/`label`); ops are numbers in the interface
-  contract (`cap.call type_id op`), like syscall numbers. Two idiomatic routes already cover op-by-name
+  contract (`call.cap type_id op`), like syscall numbers. Two idiomatic routes already cover op-by-name
   without teaching the VM an IDL: (1) **statically**, import names pin ops — a wasm-style
   `"module.field"` import resolves to `(type_id, op)` at link time (`Imports::provide_module` groups a
   module's fields over one shared provider instance, matching wasm's one-instance-per-imported-module
   semantics); (2) **dynamically**, an interface can reserve a *describe op* that writes its own op
   directory (names, arg shapes, a version) into a guest buffer — pure embedder convention, expressible
   today via `__vm_host_call`. If demand emerges across many capabilities, the principled extension is
-  one more reflection op (`cap.self.ops(handle)` populated at grant time like F7/F9) — logged here so
+  one more reflection op (`self.ops(handle)` populated at grant time like F7/F9) — logged here so
   the choice is deliberate; the default is to keep op vocabularies wholly between embedder and guest
   (§2a: the VM stays mechanism, never semantics).
 - **F15 — a process substrate (the execution half; temen as a base for shells and OSes).** *Now
@@ -567,7 +567,7 @@ sequence. Plus a C-ABI mirror (`temen_session_*`).
 
 - Phase 2: do we want the **runtime** name→handle directory (true dynamic lookup the *guest* can
   query), or is compile-time name binding at `instantiate` enough? **Resolved: both.** Compile-time
-  name binding stays the default (wasm parity); the runtime directory shipped as **F7** (`cap.self`
+  name binding stays the default (wasm parity); the runtime directory shipped as **F7** (`self.*`
   op 2) for in-guest dlopen-style discovery.
 - Phase 5: which C consumers drive the priority — JACL's runtime, or external embedders? That
   decides whether the C ABI leads or trails the Rust facade.

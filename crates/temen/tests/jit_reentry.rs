@@ -3,15 +3,15 @@
 //! custom cap thunk standing in for the Phase-2b/2c host plumbing.
 //!
 //! What is established here:
-//! - A `cap.call` handler can `define_extra` **while the guest is executing** (suspended in
-//!   its synchronous cap.call): the incremental `finalize_definitions` runs with parent code
+//! - A `call.cap` handler can `define_extra` **while the guest is executing** (suspended in
+//!   its synchronous call.cap): the incremental `finalize_definitions` runs with parent code
 //!   live on the stack below the handler and that code returns into correctly — the mid-run
 //!   form of the Phase-1 W^X spike, the strongest one.
 //! - The handler can `invoke_extra` the new code **over the live window**: the invoked code
 //!   reads/writes the guest's own memory in place (observed in the run's final snapshot) and
-//!   its results marshal back through the cap.call result slots.
+//!   its results marshal back through the call.cap result slots.
 //! - Trap semantics are **terminal for the domain**: an IR trap in invoked code propagates
-//!   through the guest's trap cell (the guest's cap.call propagation check unwinds), and a
+//!   through the guest's trap cell (the guest's call.cap propagation check unwinds), and a
 //!   memory fault in invoked code is caught by the **nested** detect-and-kill recovery,
 //!   reported as `MemoryFault` — and the host survives both (the module stays reusable).
 //! - `invoke_extra` outside an in-flight run is rejected fail-closed.
@@ -23,9 +23,9 @@ use temen_jit::{CompiledModule, JitOutcome, Quota, TrapKind};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
-/// The parent guest: entry `(a, b)` forwards both args through `cap.call` (iface 100, op 0)
+/// The parent guest: entry `(a, b)` forwards both args through `call.cap` (iface 100, op 0)
 /// and returns the capability's result. Declares the 64 KiB window the invoked code shares.
-const PARENT: &str = "memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.const 0\n  v3 = cap.call 100 0 (i32, i32) -> (i32) v2 (v0, v1)\n  return v3\n  }\n}\n";
+const PARENT: &str = "memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.const 0\n  v3 = call.cap 100 0 (i32, i32) -> (i32) v2 (v0, v1)\n  return v3\n  }\n}\n";
 
 /// Test-side stand-in for the Phase-2 `Jit` binding: the thunk context carrying the live
 /// module pointer (set after `compile`, same provenance as the `run_raw` pointer) and the
@@ -40,7 +40,7 @@ struct TestCtx {
 }
 
 /// The stand-in handler: on first call, `define_extra` the unit **mid-run**; then
-/// `invoke_extra` it over the live window, marshalling the guest's cap.call args/results.
+/// `invoke_extra` it over the live window, marshalling the guest's call.cap args/results.
 unsafe extern "C" fn reentry_thunk(
     ctx: *mut c_void,
     mem_base: *mut u8,
@@ -104,8 +104,8 @@ fn setup(extra_src: &str) -> (Box<TestCtx>, Box<CompiledModule>) {
     (ctx, cm)
 }
 
-/// The full Model A loop below the capability layer: guest cap.calls → handler defines the
-/// unit mid-run → invokes it over the live window → result returns through the cap.call.
+/// The full Model A loop below the capability layer: guest call.cap calls → handler defines the
+/// unit mid-run → invokes it over the live window → result returns through the call.cap.
 /// The invoked code's store lands in the guest's own window (visible in the run snapshot).
 #[test]
 fn mid_run_define_and_invoke_over_live_window() {
@@ -132,7 +132,7 @@ fn mid_run_define_and_invoke_over_live_window() {
 }
 
 /// An IR trap inside invoked code is **terminal for the domain**: the trampoline writes the
-/// guest's trap cell, the handler returns, and the guest's cap.call propagation check unwinds
+/// guest's trap cell, the handler returns, and the guest's call.cap propagation check unwinds
 /// the whole run as `Unreachable`. The host survives.
 #[test]
 fn trap_in_invoked_code_kills_the_domain() {

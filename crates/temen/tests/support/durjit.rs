@@ -13,7 +13,7 @@
 //!      §12.6 **canonical** invariant (restore → re-serialize reproduces the artifact);
 //!   3. **thaw portability** — the artifact frozen by the **interpreter** is *restored through
 //!      the codec* and resumed on the **JIT** under a *different* host clock, still reproducing
-//!      the uninterrupted result (so the JIT reloads the saved `cap.call` value, it does not
+//!      the uninterrupted result (so the JIT reloads the saved `call.cap` value, it does not
 //!      re-issue the call) and flipping the state word back to `NORMAL`. This crosses both the
 //!      backend boundary and the serialize/restore one.
 //!

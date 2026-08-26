@@ -124,7 +124,7 @@ writes to it reduce to guest-harms-guest, already conceded by the §2a threat mo
 | Corrupt saved values | Garbage in well-typed slots — a wild store could already do this. |
 | Forge the state word | Spurious self-unwind / broken self-rewind — self-DoS. |
 
-This is the `call_indirect` story exactly: the guest already keeps control-adjacent
+This is the `call.dyn` story exactly: the guest already keeps control-adjacent
 state (function-table indices, the in-window data stack) in its window, and the answer
 is **masked, verified dispatch** — not memory integrity.
 
@@ -195,38 +195,38 @@ cross-backend contract). Pinned by
 `durable_guest_jit.rs::durable_jit_domain_reconstructs_and_invokes_native` (freeze → restore →
 `jit_cap_run` reconstructs + invokes natively ≡ 42). **B2 `install` table-slot durability now lands
 too:** the dispatch table is a per-run transient (§12.4), so a unit's `install` occupancy — `(slot,
-unit)` + the `call_indirect` table reservation — is recorded on the domain (on `install`, dropped on
+unit)` + the `call.dyn` table reservation — is recorded on the domain (on `install`, dropped on
 `uninstall`, on both backends' install ops), rides Section 5 (codec v17), and is **re-applied** when
 the thaw run builds its table (interp `DomainTable::install_at` at run entry; native via
 `reconstruct_jit_units` → `CompiledModule::install_at`, which also carries an installed unit whose
-`CompiledCode` handle was released). So a `call_indirect` through an installed slot resolves after a
+`CompiledCode` handle was released). So a `call.dyn` through an installed slot resolves after a
 freeze/thaw. Pinned by `durable_guest_jit.rs::durable_jit_install_slot_survives_freeze_thaw`(`_native`)
-(install → freeze → restore → `call_indirect` ≡ 42, both backends) and
+(install → freeze → restore → `call.dyn` ≡ 42, both backends) and
 `jit_roundtrip.rs::jit_install_occupancy_round_trips` (byte-identical re-serialize).
 
-**In-flight guest-JIT continuations freeze via `install` + `call_indirect` (the design's freezable
+**In-flight guest-JIT continuations freeze via `install` + `call.dyn` (the design's freezable
 path).** `Jit.invoke` is a **seam-free atomic leaf** by design (DESIGN.md §22 / CONSOLIDATION.md §11 —
 the nested run refuses anything but a plain return, the fuzzed hinge), so it is *never interrupted
 mid-flight*: a freeze lands at the parent's poll after the invoke returns (a bounded invoke completes;
 an unbounded one is fuel-bounded, not a hang). The **freezable** way to run suspendable guest-JIT code
-is `install` + `call_indirect`, which executes the installed unit in the **caller's own durable
+is `install` + `call.dyn`, which executes the installed unit in the **caller's own durable
 frames** — so a continuation suspended *inside* an installed (instrumented) unit rides the caller's
-per-context shadow stack (SP-based, so it composes across the `call_indirect` into the unit's own
+per-context shadow stack (SP-based, so it composes across the `call.dyn` into the unit's own
 module frame with no offset collision) and freezes/thaws with it. On thaw the caller's
-`PropagatedIndirect` site re-issues the `call_indirect` (R8) and the install slot survived
+`PropagatedIndirect` site re-issues the `call.dyn` (R8) and the install slot survived
 (install-durability), so it re-selects the unit, which rewinds. Pinned by
-`durable_guest_jit.rs::durable_jit_install_call_indirect_freezes_in_flight_continuation` (freeze
-UNWINDING mid-`call_indirect` inside an installed Clock-suspending unit → thaw reloads the saved clock,
+`durable_guest_jit.rs::durable_jit_install_call.dyn_freezes_in_flight_continuation` (freeze
+UNWINDING mid-`call.dyn` inside an installed Clock-suspending unit → thaw reloads the saved clock,
 ≡ the uninterrupted run).
 
-**Install fence (the by-signature-taint gap, closed fail-closed).** The `call_indirect` taint is **by
-signature** (§6, R8): a program that `call_indirect`s an installed unit whose signature *no program
+**Install fence (the by-signature-taint gap, closed fail-closed).** The `call.dyn` taint is **by
+signature** (§6, R8): a program that `call.dyn`s an installed unit whose signature *no program
 function taints* would reach it at an **un-instrumented** site — a freeze mid-unit then silently loses
 the unit's continuation on thaw (a demonstrated wrong answer, not a trap:
-`durable_guest_jit.rs`'s untamed double-`call_indirect` returned 243 vs. the correct 285, R9's
+`durable_guest_jit.rs`'s untamed double-`call.dyn` returned 243 vs. the correct 285, R9's
 module-wide guest-memory rejection notwithstanding — the vector uses neither memory nor globals). Since
 "the unit suspends" is only known at install/compile time (not at the program transform, which is why a
-blunt transform-level reject would wrongly kill the tested new→old unit `call_indirect` and durable
+blunt transform-level reject would wrongly kill the tested new→old unit `call.dyn` and durable
 non-suspending dispatch), the fence lives at **`Jit.compile`**: a durable domain **rejects a
 *suspendable* unit whose entry signature the program does not taint** (`temen_durable::
 unit_suspends_untainted`, injected as the `Host` taint gate by `grant_jit_durable` alongside the
@@ -236,7 +236,7 @@ calls the injected predicate (no `temen-durable` dependency in the TCB). A non-s
 suspending unit whose signature the program *does* taint (the seam exists — the in-flight test's case),
 is admitted. Pinned by `durable_guest_jit.rs::durable_jit_compile_fences_suspending_untainted_unit`
 (all three branches). *Remaining lift (not a soundness gap):* **widening** the taint so such programs are
-*admitted* — instrument *every* `call_indirect` as may-suspend once a `Jit` cap is granted — trades an
+*admitted* — instrument *every* `call.dyn` as may-suspend once a `Jit` cap is granted — trades an
 always-on poll on all durable indirect calls (+ shadow-frame budget pressure) for accepting the
 run-time-installable-targets case; deferred until a workload needs it.
 The **JIT**'s native §14 nursery fails `instantiate`/`coro_spawn`
@@ -255,7 +255,7 @@ join table (the latter legitimately ride the artifact as `FrozenVCpu` residue an
 A freeze landing **after** the child is joined mints a valid artifact whose thaw **reloads** the
 join result — the child is never re-run (`durable_nesting.rs::freeze_after_nested_child_joined_…`).
 *(Aside: the deterministic `arm_freeze_after` trigger deliberately ticks only on
-`cont.resume`/`suspend` — cap.call is not counted — so the freeze-after-join test drives a fiber
+`cont.resume`/`suspend` — call.cap is not counted — so the freeze-after-join test drives a fiber
 after the join to place the trigger.)* The **bytecode** engine's durable-capture entry now
 **declines** §14 modules (falling back to the tree-walker, which owns the durable nesting rules —
 temen-run's bytecode backend already falls back on decline), exactly as it declines `thread.*`: its
@@ -360,7 +360,7 @@ the all-or-nothing oracle (D-notes, §18):
    own (already-instrumented) funcs, so no separate transform is needed. A *runnable* same-module child
    on the JIT is a pure-compute (non-may-suspend) func — no poll sites, so it runs atomically to
    completion in its carve with no durable control-word setup (a would-be *instrumented* child hits a
-   `cap.call` against its empty powerbox → `CapFault`, never reaching an unwind, so it is unreachable
+   `call.cap` against its empty powerbox → `CapFault`, never reaching an unwind, so it is unreachable
    here, not unsound). Only the `instantiate` guard changed: `durable && mod_mem.is_some()` still fails
    closed (separate-module), everything else runs. The carve-seeding + child powerbox arrive with the
    freeze slice, where an instrumented child actually reads them (see **Freeze model** below). Next is
@@ -398,7 +398,7 @@ needed.
 
 **Refinement (from the freeze-export investigation): only an *instrumented* child is JIT-freezable, and
 the child shape must be chosen to match the interpreter.** The interpreter freezes a depth-1 *pure-
-compute* child (e.g. `PARENT_SELF_LOOP`'s func 1, a loop with no `cap.call` → not may-suspend → **no
+compute* child (e.g. `PARENT_SELF_LOOP`'s func 1, a loop with no `call.cap` → not may-suspend → **no
 poll sites**) by *never scheduling it*: the parent, already `UNWINDING`, executes `instantiate` (which
 only enqueues the child) then spills at its trailing poll before the child's vCPU ever runs; the child
 rides as `FrozenNested { completed_result: None }` and is re-run from entry on thaw (interp map,
@@ -419,11 +419,11 @@ falls back to a freeze→thaw→result round-trip rather than a byte-identical c
   unwinds too — the subtree STW propagates up the synchronous call chain. `instantiate`'s current
   `(result, trap)` contract gains this third arm.
 - **Powerbox prerequisite.** A child that can be *live* (mid-computation) is instrumented ⇒ it reached
-  a `cap.call` ⇒ it needs a non-empty powerbox (today it gets `empty_cap_thunk` — inert, `CapFault`).
+  a `call.cap` ⇒ it needs a non-empty powerbox (today it gets `empty_cap_thunk` — inert, `CapFault`).
   Mint an **attenuated child powerbox**: its own `Instantiator` (over its carve, so it can nest
   grandchildren) + `AddressSpace`, wired exactly as the coroutine child's `coro_cap_thunk`/`CoroShared`
   already routes a child's single `Yielder` cap — a `cap_thunk` + boxed ctx that routes the child's
-  `cap.call`s to a nested nursery. There is a proven in-tree pattern; this is the one real new
+  `call.cap`s to a nested nursery. There is a proven in-tree pattern; this is the one real new
   mechanism the freeze slice needs.
 - **Carve seeding.** Seed the child carve's ctx-0 control words to the parent's durable phase before
   the run (the `temen-interp` layout from the slice-1 map: state word `@0`, ctx-0 thaw word `@72`, ctx-0
@@ -503,7 +503,7 @@ module digest for a host-supplied re-grant at thaw) are the remaining §14 gap.
 forms (S2 `instantiate_granted` / `instantiate_named`, Stage-1 `instantiate_module_named`) **fail
 closed (`-EINVAL`) under a durable JIT run** — a granted child's separate powerbox host has no freeze
 story yet, the same exclusion as the separate-module child (`temen-jit/src/instantiator_rt.rs`). And
-`cap.self.attest` (S6) stamps a nested child `freeze_exposed = durable`, adding one follow-up here: a
+`self.attest` (S6) stamps a nested child `freeze_exposed = durable`, adding one follow-up here: a
 durable freeze/thaw must capture + restore the child's `Attestation` — the thaw re-attach currently
 defaults it (PROCESS.md O14).)*
 
@@ -521,7 +521,7 @@ Two states can't be translated and are **drained**, not decoded:
 
 - **Fault-suspended fiber** (parked at an arbitrary PC, demand-paged coroutine):
   supply the page, let it run to the next poll site, then it unwinds.
-- **vCPU inside a host `cap.call`:** let the call return, then unwind.
+- **vCPU inside a host `call.cap`:** let the call return, then unwind.
 
 So freeze = cooperative STW: request unwind, wait for quiescence-at-safepoints (the
 Go/JVM shape). The drain protocol is **host-side and identical on both backends** — no
@@ -547,8 +547,8 @@ No always-on safepoint infra, no global regalloc constraint, no metadata section
 | Spill/reload | only on actual unwind | snapshot frequency, not exec frequency |
 
 **Key mitigation — may-suspend analysis:** only calls that transitively reach a
-`cap.call` (conservatively: any indirect call) get polls; only functions on such paths
-get instrumented. *(Phase-1 status: only **directly** `cap.call`-bearing functions are
+`call.cap` (conservatively: any indirect call) get polls; only functions on such paths
+get instrumented. *(Phase-1 status: only **directly** `call.cap`-bearing functions are
 instrumented — the transitive analysis arrives with call-chain propagation.)*
 
 **Cost unit is the state-word load, not the branch.** In `NORMAL` state the poll
@@ -576,7 +576,7 @@ boundaries, not deep inside long-running loops.** The serialized image is the fu
 reserved window (here 256 KiB); the live loop-carried spill is a small prefix.
 
 **Caveat on "pure compute untouched":** the conservative rule treats *any indirect
-call* as may-suspend, and `call_indirect` is the normal lowering for C function
+call* as may-suspend, and `call.dyn` is the normal lowering for C function
 pointers / vtables. So "untouched" holds for **direct-call** compute (sha256/perlin/
 xxhash shapes); function-pointer-heavy C still gets instrumented. The 10–30% worst
 case may be more common than "compute is free" implies. *Validate by running the pass
@@ -647,7 +647,7 @@ elsewhere. Net ~1.5–3k lines.
   accounting: +0 TCB for the codec, +small escape-TCB for the restore path (covered
   by the oracle).
 
-**Sizing:** ~4–8 weeks to a v1 (cap.call-boundary snapshots, MVP-powerbox handles,
+**Sizing:** ~4–8 weeks to a v1 (call.cap-boundary snapshots, MVP-powerbox handles,
 restore-on-either-backend). Variance concentrates almost entirely in **phase 3**
 (concurrency/quiesce vs. the D57 migratable-fiber ownership protocol) and in fuzz
 findings; the transform itself is the *most* predictable piece. Phase 1's
@@ -668,11 +668,11 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   freeze→serialize→restore→thaw round-trip works on the real interpreter
   (`crates/temen-durable`, `tests/roundtrip.rs`): an in-window shadow stack + state
   word + `br_table` rewind reconstructs a frozen single-vCPU domain bytewise, and the
-  thawed run reloads the saved `cap.call` result rather than re-issuing it.
+  thawed run reloads the saved `call.cap` result rather than re-issuing it.
   - **Landed:** the `temen-durable` tooling-tier crate (+0 TCB, depends only on
     `temen-ir`); the IR→IR transform — now covering **arbitrary single-/multi-block CFGs**
     (branches, loops, joins) with **any number of resume points** across **call chains**
-    (leaf `cap.call` reload vs. propagated `Call` re-issue, R8); the §12.7 frame layout;
+    (leaf `call.cap` reload vs. propagated `Call` re-issue, R8); the §12.7 frame layout;
     round-trip + inert-instrumentation + verifier tests (`tests/roundtrip.rs`,
     `chain.rs`, `multipoint.rs`, `multiblock.rs`), plus the interp (`durable_fuzz`) and
     cross-backend interp-vs-JIT (`durable_jit`) generative properties over a generator
@@ -681,7 +681,7 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
     multiple resume points, multi-block CFGs) plus the **minimal live-set** spill
     (block-local liveness; ~28–40% smaller instrumented IR and up to ~57% less JIT
     compile time on spill-heavy guests, `tests/durable_bench.rs`) are **done**. Out of
-    scope and rejected/ignored: `call_indirect` (and indirect tail calls) to may-suspend
+    scope and rejected/ignored: `call.dyn` (and indirect tail calls) to may-suspend
     targets; direct tail calls into may-suspend callees; guest linear-memory use (R9).
   - **Hazards introduced by the as-built transform: R8–R11 (§11).** R9 is **placement,
     not isolation**: the durable region is a budget-accounted reserved slice `[0,
@@ -761,7 +761,7 @@ than miscompiling, so these are latent/extension hazards, not silent-miscompile 
 
 | # | Risk / question | Where | Status |
 | --- | --- | --- | --- |
-| R8 | **Call-chain propagation landed; deepest-frame assumption resolved.** The transform now instruments any may-suspend function (transitive `cap.call` closure over the direct-call graph) whose single block suspends on one op: a leaf `cap.call` (reload result + flip `NORMAL`) **or** a propagated `Call` (reload pre-call live set + **re-issue the call**, leaving the state `REWINDING` so the callee rewinds). Real multi-frame stacks; only the innermost leaf flips to `NORMAL`. Covered by `tests/chain.rs` (2-/3-level chains, live-value-across-call) and the generator now emits depth-`1..=4` chains, so the interp (`durable_fuzz`) and cross-backend (`durable_jit`) properties exercise it. **Multiple resume points** and **multi-block CFGs** (branches, loops, joins) now land too — each block is split at its suspend ops, branch targets are remapped, and a global `br_table` dispatch routes the thaw (`tests/multipoint.rs`, `tests/multiblock.rs`; the generator emits multi-frame/multi-point/multi-block modules). **`call_indirect` to a may-suspend target now lands (the fork-critical case — bash dispatches builtins through function-pointer tables).** The target is a runtime table index, so the analysis taints **by signature** (§6): a `call_indirect` of type `T` is may-suspend iff some function of type `T` is — the ceiling of static precision (the natural table maps every function into a slot; there is no element/table section to narrow it, and `Jit.install` can add targets at run time). The site instruments as a `PropagatedIndirect` suspend kind — the indirect twin of a propagated `Call`: spill the live set **including the reloaded table index**, and on thaw **re-issue the `call_indirect`**; because the taint rule instruments *every* function of the signature, the reloaded index can only re-select a `REWINDING`-aware callee, which rewinds in turn. This also **flips R8 from fail-open to sound** — a suspend-only-through-`call_indirect` module was previously accepted and silently under-instrumented; it is now instrumented (or, for indirect **tail** calls where there is no poll to unwind at, rejected fail-closed like direct tail calls). Covered by `tests/indirect.rs` (round-trip, live-across-indirect, mixed direct/indirect chain, tail-call rejection); the generator mixes direct and indirect chain links, so `durable_fuzz` (interp) and `durable_jit` (cross-backend, plus a deterministic `indirect_call_freeze_thaw_cross_backend`) exercise it automatically. The by-signature rule's breadth cost is R7. A chain deeper than the reserve holds traps cleanly on freeze (R9 overflow guard), rather than overflowing. | §2, §6, §12.7, `temen-durable` | addressed |
+| R8 | **Call-chain propagation landed; deepest-frame assumption resolved.** The transform now instruments any may-suspend function (transitive `call.cap` closure over the direct-call graph) whose single block suspends on one op: a leaf `call.cap` (reload result + flip `NORMAL`) **or** a propagated `Call` (reload pre-call live set + **re-issue the call**, leaving the state `REWINDING` so the callee rewinds). Real multi-frame stacks; only the innermost leaf flips to `NORMAL`. Covered by `tests/chain.rs` (2-/3-level chains, live-value-across-call) and the generator now emits depth-`1..=4` chains, so the interp (`durable_fuzz`) and cross-backend (`durable_jit`) properties exercise it. **Multiple resume points** and **multi-block CFGs** (branches, loops, joins) now land too — each block is split at its suspend ops, branch targets are remapped, and a global `br_table` dispatch routes the thaw (`tests/multipoint.rs`, `tests/multiblock.rs`; the generator emits multi-frame/multi-point/multi-block modules). **`call.dyn` to a may-suspend target now lands (the fork-critical case — bash dispatches builtins through function-pointer tables).** The target is a runtime table index, so the analysis taints **by signature** (§6): a `call.dyn` of type `T` is may-suspend iff some function of type `T` is — the ceiling of static precision (the natural table maps every function into a slot; there is no element/table section to narrow it, and `Jit.install` can add targets at run time). The site instruments as a `PropagatedIndirect` suspend kind — the indirect twin of a propagated `Call`: spill the live set **including the reloaded table index**, and on thaw **re-issue the `call.dyn`**; because the taint rule instruments *every* function of the signature, the reloaded index can only re-select a `REWINDING`-aware callee, which rewinds in turn. This also **flips R8 from fail-open to sound** — a suspend-only-through-`call.dyn` module was previously accepted and silently under-instrumented; it is now instrumented (or, for indirect **tail** calls where there is no poll to unwind at, rejected fail-closed like direct tail calls). Covered by `tests/indirect.rs` (round-trip, live-across-indirect, mixed direct/indirect chain, tail-call rejection); the generator mixes direct and indirect chain links, so `durable_fuzz` (interp) and `durable_jit` (cross-backend, plus a deterministic `indirect_call_freeze_thaw_cross_backend`) exercise it automatically. The by-signature rule's breadth cost is R7. A chain deeper than the reserve holds traps cleanly on freeze (R9 overflow guard), rather than overflowing. | §2, §6, §12.7, `temen-durable` | addressed |
 | R9 | **Placement, not an isolation boundary — cheap for MVP.** The control state + shadow stack are a reserved low slice `[0, DURABLE_RESERVE)` (one 64 KiB page) of the domain's *own* window; guest memory is `[DURABLE_RESERVE, window)`, part of the same budget-accounted allotment (the wasm shadow-stack / `__heap_base` convention). Because the window is per-domain and runtime-masked, a guest that writes the reserve corrupts only **its own** durability — never another domain or the host — and it **fails safe**: a forged resume id hits the `br_table` default → `Unreachable`; a wild shadow-SP stays masked in-window; the host validates the artifact (module hash) on restore. **MVP path:** `transform_module_assume_confined` instruments memory-using guests on the cooperating-toolchain contract that the guest's data/heap is based at `DURABLE_RESERVE` (`tests/guest_memory.rs` shows guest memory round-tripping). Strict `transform_module` still fails closed (`GuestUsesMemory`) for untrusted modules. **Optional defense-in-depth (not MVP):** hard isolation against an *adversarial* guest — guard-paged per-fiber placement (§12.7) or per-access confinement. The shadow stack now **traps on overflow**: the freeze-path `UNWIND` check refuses a push whose top would cross `DURABLE_RESERVE`, so a too-deep call chain fails safe (a clean trap) instead of growing into guest memory (`tests/overflow.rs`). See **[DECISION D-shadow-overflow]** below for why this lives in the transform rather than a unified backend recursion ceiling. | §12.7, `temen-durable` | mitigated (placement + fail-safe + overflow trap; hard isolation optional) |
 | R10 | **No concurrency protection on the in-window control state** (state word, shadow-SP). Fine at single-vCPU; a hazard once fibers/multi-vCPU arrive (relates to R1, but specifically about the control words racing). *Mitigated for slice 3.2.1:* a freeze/thaw run (state ≠ `NORMAL`) is forced **single-worker**, and the runtime swaps both control words per-vCPU per dispatch — so the words are never touched concurrently. A lock-free parallel STW for the shadow-SP is **planned via per-context SP** (4A.5 — each context keeps its SP in its own region, addressed through a runtime-private per-context register, so the shared word and its lock both disappear; `FORMAT_VERSION` 4→5). The state word stays per-context-swapped (only flipped, not accumulated, so it needs no lock). | §3, §12.7 | mitigated (single-worker STW); 4A.5 = lock-free SP |
 | R11 | **Equivalence now fuzzed (Phase-1 scope), both single-backend and cross-backend.** The §7/§12.6 property runs over a generator of **in-scope** durable modules: (a) interpreter-only — *inert in `NORMAL`* (instrumented == un-instrumented) and *round-trip* (freeze→serialize→restore→thaw ≡ uninterrupted, reload-not-reissue) — `crates/temen-durable/tests/durable_fuzz.rs` + libFuzzer `fuzz/fuzz_targets/durable.rs`; (b) cross-backend — interp vs Cranelift JIT agree on the NORMAL result, leave a **byte-identical freeze artifact**, and a JIT thaw of the **interpreter-frozen** artifact under a different host clock reproduces the result — `crates/temen/tests/durable_jit.rs` + libFuzzer `fuzz/fuzz_targets/durable_jit.rs`. Both stable drivers run in CI without nightly. Coverage broadens automatically as the transform generalizes (R8). | §7, §12.6 | addressed (Phase-1 scope) |
@@ -787,7 +787,7 @@ resident value has been spilled to a shadow frame (in-window). What remains
 *host-side* and must be captured separately is small:
 
 1. the **set** of vCPUs and fibers and their relationships (not their stacks),
-2. the §3c **dispatch table** (`DomainTable`, `call_indirect` slots),
+2. the §3c **dispatch table** (`DomainTable`, `call.dyn` slots),
 3. the **handle table** (`Host::table` — authority, not the resources it names).
 
 **[DECISION D-scope — RESOLVED: guest + authority only.]** A v1 snapshot does *not*
@@ -862,7 +862,7 @@ construction. What's stored:
   recorded on the domain (`JitDomainState.installed`, not the per-run table), rides Section 5 beside
   the units, and is **re-applied** when a run builds its table (`DomainTable::install_at` at run
   entry; the native tier via `temen_run::reconstruct_jit_units` → `CompiledModule::install_at`), so a
-  `call_indirect` through an installed slot resolves after a freeze/thaw. The identity slots stay a
+  `call.dyn` through an installed slot resolves after a freeze/thaw. The identity slots stay a
   pure function of the module (not stored).
 
 ### 12.5 Section 3 — Handle table (durability classification)
@@ -913,7 +913,7 @@ slot — freeze is all-or-nothing), `restore_durable_handles` + the `grant_at` p
 set `capture_durable_handles` refuses on) and returns them in ascending slot order for the embedder to
 audit the relinquished authority, leaving the durable handles untouched. Each close frees the slot but
 **retains its generation** (D37), so a guest's stale handle value becomes a dead generation — any later
-`cap.call` on it is an inert `CapFault`, never authority into the recycled slot. After a drain, `capture`
+`call.cap` on it is an inert `CapFault`, never authority into the recycled slot. After a drain, `capture`
 succeeds, so a subtree that held non-durable authority becomes **snapshottable** — the actionable form of
 "freeze refuses unless the non-durable handles are closed/drained first". The freeze is host-driven (STW),
 so the embedder calls this at a freeze safepoint (the STW quiesce + §12.8 4A.7 guarantee no vCPU is
@@ -923,7 +923,7 @@ drained handle faults at its use site; an all-durable drain is a no-op) and
 `temen-snapshot/tests/roundtrip.rs::freeze_succeeds_after_draining_a_non_durable_handle` (the freeze
 *refusal* becomes a successful serialize after the drain). *In-flight residue* draining for a busy
 `Blocking` (vs. an idle handle) rides the §5 run-end pool quiesce / the deferred `Blocking`
-cancellation (R2); the guest-facing first-class `cap.self.close` op (vs. this host primitive) is a possible
+cancellation (R2); the guest-facing first-class `self.close` op (vs. this host primitive) is a possible
 ergonomics follow-up.
 
 ### 12.6 Round-trip / equivalence contract
@@ -1068,7 +1068,7 @@ the domain's vCPUs (one write is domain-wide; the poll reads it), and the JIT's
 **`interrupt`/epoch cell** (`os_thread_rt`, polled at back-edges + function entries,
 re-checked every 20 ms by parked threads) is the *promptness* nudge that drives running
 OS threads to a safepoint. The §5 residues drain by **running to the next safepoint**:
-a vCPU inside a host `cap.call` finishes the call then polls; a fault-suspended fiber
+a vCPU inside a host `call.cap` finishes the call then polls; a fault-suspended fiber
 gets its page, runs to its next poll. Both are semantically invisible (a poll site is a
 point the program already passes through).
 
@@ -1159,7 +1159,7 @@ So a fiber'd durable domain now freezes, serializes, restores, and thaws **on ei
 either direction**.
 
 The **active-resume-chain** gap is now **closed (slice 3.2, both backends)**: a fiber that's
-*running* (mid-`cap.call` / mid-propagated-call / mid-nested-resume), not idle-parked, at the freeze
+*running* (mid-`call.cap` / mid-propagated-call / mid-nested-resume), not idle-parked, at the freeze
 instant unwinds *in place* during the root's run — its base-frame return (interp) / `Complete`
 (JIT) happens under `UNWINDING`. Previously such a fiber was marked `Done` and dropped from the
 residue (so it couldn't thaw); now, when it actually unwound (its shadow region is non-empty —
@@ -1167,7 +1167,7 @@ residue (so it couldn't thaw); now, when it actually unwound (its shadow region 
 non-instrumented fiber), it is captured as residue (`Frozen` on the interp) and re-seeded on thaw,
 where it rewinds at its in-flight (leaf/propagated/resume) point and runs **forward** — the active
 analogue of an idle fiber's re-park. Tested both backends incl. **reload-not-reissue** of the
-in-flight `cap.call` (`temen-durable/tests/fiber.rs::active_resume_chain_fiber_freezes_and_thaws`,
+in-flight `call.cap` (`temen-durable/tests/fiber.rs::active_resume_chain_fiber_freezes_and_thaws`,
 `durable_fibers_jit.rs::interp_frozen_active_chain_fiber_thaws_on_the_jit`).
 
 **[~] Slice 3.2.1 — first multi-vCPU freeze/thaw (interp; no live fibers).** A domain whose root
@@ -1282,10 +1282,10 @@ host call"). The cut: once an async freeze has **landed** (the global freeze wor
 vCPU **refuses to enter** a new blocking host call — `cap_dispatch_slots` fails closed with `Trap::ThreadFault`
 (mirroring the `thread.wait` deadlock fail-closed) instead of starting an un-checkpointable offload. So snapshot
 latency excludes *new* host calls once a freeze is requested (narrowing R6); cancelling an *already in-flight*
-call is the full offload-cancellation story, still deferred (R2). The **direct** `Blocking.work` cap.call is gated (it parks a vCPU with
+call is the full offload-cancellation story, still deferred (R2). The **direct** `Blocking.work` call.cap is gated (it parks a vCPU with
 no poll site); the batched `io_ring.submit` variant of this gate left with the ring's §12
 retirement (2026-08-07). The refusal lives in the **shared** capability
-dispatch that *both* backends funnel a `cap.call` through (the JIT via `temen-run`'s `cap_thunk`), so it is
+dispatch that *both* backends funnel a `call.cap` through (the JIT via `temen-run`'s `cap_thunk`), so it is
 backend-agnostic. It is gated on `Host::is_durable` (a non-durable guest's byte at window offset 0 is ordinary
 data, not a freeze word): durability is now declared on the *Host* for durable runs on **both** backends — the
 interpreter already required it, and the JIT's `concurrent_freeze` harness now sets it too (the JIT otherwise
@@ -1413,7 +1413,7 @@ the deterministic single-worker paths (freeze-from-start and `arm_freeze_after` 
 ##### Phase 4 Slice A — back-edge polls + bounded-latency async STW freeze (design)
 
 Closes the R6 latency caveat and the R10 control-word concurrency seam: today a freeze only lands at
-*may-suspend* safepoints (`cap.call`/`cont.resume`/`suspend`), so a vCPU in a **poll-free compute loop**
+*may-suspend* safepoints (`call.cap`/`cont.resume`/`suspend`), so a vCPU in a **poll-free compute loop**
 never reaches a safepoint and the freeze hangs; and the freeze run is only safe because it is forced
 **single-worker**. This slice adds polls a compute loop can't skip, plus the multi-worker→single-worker
 quiesce handshake for a true async stop-the-world.
@@ -1886,8 +1886,8 @@ touches the countdown (byte-identical to before). The interpreter ticks at its p
 ticks in the `fiber_resume`/`fiber_suspend` thunks (`window_tick_arm`, gated on `FiberRuntime::durable`).
 **Both backends count the same set — the fiber ops, routed through runtime thunks** — so an armed freeze
 lands at the same safepoint on each (cross-backend parity, which the recycled round-trip test pins).
-`cap.call` is deliberately **not** counted: the JIT's cap.call thunk is host-supplied (no cross-backend
-choke), a cap.call freeze is already reachable at the first safepoint, and the production async trigger
+`call.cap` is deliberately **not** counted: the JIT's call.cap thunk is host-supplied (no cross-backend
+choke), a call.cap freeze is already reachable at the first safepoint, and the production async trigger
 covers general mid-run freeze. This also models that production path (an async controller flipping
 `UNWINDING` from another OS thread, picked up at the next poll — the existing mechanism already handles
 that; what was missing was a *deterministic single-threaded* way to test it). Constants are cross-checked
@@ -1981,7 +1981,7 @@ each a small reviewable commit on the interpreter only:
    reloads the fiber's frame, pops, **flips the state word to `NORMAL`**, and **re-executes
    `suspend`** — which parks the fiber back (its current rebuilt frames) and hands `value` to
    the resumer, *not* continue forward; the re-executed suspend's result (the next resume's
-   value) threads into the continuation exactly as a leaf's reloaded cap.call result does. The
+   value) threads into the continuation exactly as a leaf's reloaded call.cap result does. The
    deepest-frame "flip to NORMAL" lives here (a parked fiber's `suspend` is the globally-deepest
    frozen frame), **not** in the resumer's `Resume` arm — so the resumer regains control already
    in NORMAL. *Turned out transform-only:* the interp's existing `Suspend` handler re-parks via
@@ -2106,13 +2106,13 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
    re-issue ("at least" semantics, as for timed `svc.wait`).
    **Scope correction (2026-07-24, from the spill-plan code):** the trailing-poll route is
    sound only where the point's `SuspendKind` **re-issues** — `MemoryWait`/`ThreadJoin` spill
-   `out − nres` and re-execute the op at thaw, but a **`Leaf` cap.call spills its results**
+   `out − nres` and re-execute the op at thaw, but a **`Leaf` call.cap spills its results**
    (reload-not-reissue), so an *unwoken* cap-parked fiber (blocking read / live call) would
    spill the freeze placeholder and thaw would reload it as the call's result — unsound.
    Step 2's implementable set is therefore: **woken-but-unclaimed parks of any kind** (the
    real result is already in the frames; `Leaf` reload is then correct) and **unwoken
    futex parks** (the `MemoryWait` re-issue arm). Unwoken **cap parks stay fail-closed**,
-   with two recorded follow-up options: promote park-capable cap.calls to a re-issue
+   with two recorded follow-up options: promote park-capable call.caps to a re-issue
    `SuspendKind` (costs re-issue-vs-reload discrimination for *completed* calls — the R8
    tension), or a per-point spill-frame validity marker (`result-valid | re-issue`) the thaw
    arm branches on. The park kind is probed at freeze time from which scheduler map holds
@@ -2163,7 +2163,7 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
    **Slice 4b BUILT 2026-07-24 (serve-point freeze + re-issue thaw):** the serve arm delivers
    an inert sentinel on observing `UNWINDING` (no drain, no park — the queue survives
    untouched for the v13 serve section) so its trailing poll unwinds with zero forward
-   progress, and the transform classifies `cap.call CAP_SELF svc.poll/svc.wait` as a new
+   progress, and the transform classifies `call.cap CAP_SELF svc.poll/svc.wait` as a new
    **re-issue** `SuspendKind::SvcServe` (spill `out − nres`; the sentinel is never captured —
    a `Leaf` reload would have masqueraded it as the served count). The thaw arm flips
    `NORMAL` (the mid-handler gate guarantees the serve point is the deepest frozen frame),
@@ -2330,7 +2330,7 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
    classification at `freeze_drive`; a cap park's `Leaf` spill would reload the placeholder as
    the call's result, unsound). Admitting it is a *future trigger slice* — a "freeze drains
    cap-parked callers" step parallel to 4c-bis's `svc_waiters` drain — at which point the
-   caller's rewound frame re-issues the `cap.call` on thaw under the decided policy (a), the
+   caller's rewound frame re-issues the `call.cap` on thaw under the decided policy (a), the
    same O10 the guard above already fixes as the boundary semantics. Recorded as the entry so
    the invariant-9 divergence is enumerated rather than silently normalized.
 

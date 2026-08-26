@@ -1,5 +1,5 @@
 // Single-vCPU §22 guest-JIT **real-codegen** validation (BROWSER.md § "wasm-JIT tier", slice 5) — no
-// Workers, no page. A guest holds a `Jit` cap + a host-compiled unit and `cap.call`s invoke; with
+// Workers, no page. A guest holds a `Jit` cap + a host-compiled unit and `call.cap`s invoke; with
 // codegen on, the host runs the unit on EMITTED WASM (`f{entry}(win, env, …args)`) instead of the
 // interpreter, then delivers the result back. Runs each guest both ways and asserts identical results
 // — the emitted region must match the interpreter (ground truth `service(6,7) = 142`), the same
@@ -23,7 +23,7 @@ block 0 (vjit: i32, vcode: i32) {
   vc = i64.extend_i32_u vcode
   va = i32.const 6
   vb = i32.const 7
-  vr = cap.call 11 1 (i64, i32, i32) -> (i32) vjit (vc, va, vb)
+  vr = call.cap 11 1 (i64, i32, i32) -> (i32) vjit (vc, va, vb)
   vr64 = i64.extend_i32_u vr
   return vr64
   }
@@ -39,7 +39,7 @@ block 0 (vjit: i32, vcode: i32) {
   vc = i64.extend_i32_u vcode
   va = f64.const 6.0
   vb = f64.const 7.0
-  vr = cap.call 11 1 (i64, f64, f64) -> (f64) vjit (vc, va, vb)
+  vr = call.cap 11 1 (i64, f64, f64) -> (f64) vjit (vc, va, vb)
   vi = i64.trunc_f64_s vr
   return vi
   }

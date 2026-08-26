@@ -8,9 +8,9 @@
 //! superset), under the caller's already-installed detect-and-kill guard.
 //!
 //! Authority lives in the host capability table (the same `Host` the interpreter uses): `instantiate`
-//! resolves its `Instantiator` handle through the run's `cap.call` thunk (op 0 → the carve range
+//! resolves its `Instantiator` handle through the run's `call.cap` thunk (op 0 → the carve range
 //! `[base, base+size)`), so a forged/wrong handle is an inert `CapFault` exactly as for any cap. The
-//! child gets an **empty powerbox** for now (an inert `cap.call`); attenuated child caps + recursion +
+//! child gets an **empty powerbox** for now (an inert `call.cap`); attenuated child caps + recursion +
 //! "park only the calling fiber" (vs. today's synchronous run-at-`instantiate`) are follow-ups.
 
 use crate::{mem, CapThunk, TrapKind};
@@ -232,8 +232,8 @@ unsafe fn spawn_granted_child(
     slot as i32
 }
 
-/// The per-run §14 nesting runtime, baked into the module's `Instantiator` `cap.call` sites. Holds
-/// what compiling + running a child needs: the module's functions, the run's `cap.call` thunk/ctx
+/// The per-run §14 nesting runtime, baked into the module's `Instantiator` `call.cap` sites. Holds
+/// what compiling + running a child needs: the module's functions, the run's `call.cap` thunk/ctx
 /// (to resolve an `Instantiator` handle's authority), and — supplied post-finalize via [`set_env`] —
 /// the live window's detect-and-kill fault range. Non-durable children (plain and granted) run
 /// **asynchronously** on their own OS threads; outcomes land in per-child completion cells `join`
@@ -246,14 +246,14 @@ pub(crate) struct Nursery {
     pub(crate) serve_handlers: Box<[u32]>,
     funcs: std::sync::Arc<[Func]>,
     /// #922 — the parent module's type section, threaded into every same-module child compile so
-    /// the child's interned `call_indirect` type indices resolve (a separate-module child resolves
+    /// the child's interned `call.dyn` type indices resolve (a separate-module child resolves
     /// against its own resolved type section instead — see [`Nursery::resolve_child`]).
     types: std::sync::Arc<[TypeEntry]>,
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
     /// §14 separate-module children: the host callback resolving a guest's `Module` handle to the
     /// granted module's code/data (`None` ⇒ module ops are an inert `CapFault`). Kept apart from the
-    /// `cap.call` thunk so the host pointers it yields are never guest-reachable.
+    /// `call.cap` thunk so the host pointers it yields are never guest-reachable.
     resolve_module: Option<crate::ModuleResolver>,
     /// Address of the parent run's §5 kill-path interrupt cell (`0` ⇒ no kill-path armed). A nested
     /// JIT child is compiled to poll the **same** cell, so one host interrupt stops the parent *and*
@@ -624,7 +624,7 @@ impl Nursery {
         Some((funcs, types, Some(rm.memory_log2), data))
     }
 
-    /// Resolve `handle` as this domain's `Instantiator` via the run's `cap.call` thunk, returning its
+    /// Resolve `handle` as this domain's `Instantiator` via the run's `call.cap` thunk, returning its
     /// carve range `[base, base+size)`. `None` (and `*trap_out` set) for a forged/closed/wrong handle.
     unsafe fn resolve(&self, mem_base: u64, handle: i32, trap_out: *mut i64) -> Option<(u64, u64)> {
         let mut out = [0i64; 2];
@@ -711,7 +711,7 @@ pub(crate) unsafe extern "C" fn instantiate(
     // Instantiator + AddressSpace + its bound import manifest, so it can `vm_map` (malloc heap growth)
     // and nest — matching the interpreter, which funnels op 0/5/11/13 through one powerbox path. An
     // op-0 *self* child (`module < 0`, below) instead runs the parent's own funcs compute-only in its
-    // carve (no powerbox — the durable-nesting design relies on a self child `cap.call` fail-closing).
+    // carve (no powerbox — the durable-nesting design relies on a self child `call.cap` fail-closing).
     // Route op-5 through the op-13 builder with an **empty** grant list — the exact path the
     // `child_entry_malloc_binds_vm_map_on_the_jit` gate already proves (it spawns with `grants_n = 0`).
     // `mem_size = 0` is safe: with no grants the builder reads no grant records from the window. A
@@ -720,7 +720,7 @@ pub(crate) unsafe extern "C" fn instantiate(
     //
     // Only when the granted-spawn hooks are installed (`grant_build_named != 0`): a run without them
     // (the plain `jit_separate_module` differential — a *compute* separate-module child that makes no
-    // `cap.call`) keeps the empty-powerbox path below, matching the interpreter for a capless child
+    // `call.cap`) keeps the empty-powerbox path below, matching the interpreter for a capless child
     // (both tiers return the same value). Delegating unconditionally would `CapFault` such a run at the
     // absent builder.
     if module >= 0 && rt.grant_build_named.load(Ordering::Acquire) != 0 {
@@ -738,7 +738,7 @@ pub(crate) unsafe extern "C" fn instantiate(
     };
     // Only an op-0 **self** child (`module < 0`, so `mod_mem = None`) reaches here — a separate-module
     // op-5 child was delegated to `instantiate_module_named` above. A self child runs the parent's own
-    // funcs compute-only in its carve (empty powerbox: a `cap.call` fail-closes with `CapFault`).
+    // funcs compute-only in its carve (empty powerbox: a `call.cap` fail-closes with `CapFault`).
     // §4 (DURABILITY.md, "JIT parity" slice 1): a durable run may nest such a same-module child — a
     // pure-compute (non-may-suspend) func with no poll sites runs atomically to completion, no durable
     // control-word setup needed; freezing a *live* nested child on the JIT (ctx-0 control words + shadow
@@ -922,7 +922,7 @@ pub(crate) unsafe extern "C" fn instantiate(
 /// (Instantiator op 11): the multi-cap, by-name form of [`instantiate_granted`]. The child powerbox is
 /// built host-side by [`Nursery::grant_build_named`], which reads `grants_n` 16-byte grant records from
 /// the **parent** window (`[mem_base, mem_base+mem_size)`) and re-grants each copyable handle under its
-/// name; the child finds them by `cap.self.resolve` (lowered to the run's `cap.call` thunk with the
+/// name; the child finds them by `self.resolve` (lowered to the run's `call.cap` thunk with the
 /// child host as ctx, so name resolution "just works"). The child entry is the 1- or 2-arg form
 /// (`Instantiator` [, `AddressSpace`]) — no positional grant arg. Same non-durable / uncached /
 /// non-nesting shape as [`instantiate_granted`]; a bad record/name is a `MemoryFault`, a non-copyable
@@ -958,7 +958,7 @@ pub(crate) unsafe extern "C" fn instantiate_named(
     let build: crate::GrantNamedChildBuilder = core::mem::transmute(build_addr);
     let release: crate::GrantChildReleaser = core::mem::transmute(release_addr);
     // 5c.0 — a builder that shares the child `Host` supplies the lock-taking thunk; granted-child
-    // code must synchronize its cap.calls once the parent can reach the same powerbox. Fall back
+    // code must synchronize its call.cap calls once the parent can reach the same powerbox. Fall back
     // to the run's thunk only for a legacy non-sharing builder.
     let thunk_addr = rt.grant_thunk.load(Ordering::Acquire);
     let child_thunk: crate::CapThunk = if thunk_addr != 0 {
@@ -1252,7 +1252,7 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
     let build: crate::GrantNamedChildBuilder = core::mem::transmute(build_addr);
     let release: crate::GrantChildReleaser = core::mem::transmute(release_addr);
     // 5c.0 — a builder that shares the child `Host` supplies the lock-taking thunk; granted-child
-    // code must synchronize its cap.calls once the parent can reach the same powerbox. Fall back
+    // code must synchronize its call.cap calls once the parent can reach the same powerbox. Fall back
     // to the run's thunk only for a legacy non-sharing builder.
     let thunk_addr = rt.grant_thunk.load(Ordering::Acquire);
     let child_thunk: crate::CapThunk = if thunk_addr != 0 {
@@ -1347,7 +1347,7 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
     }
 
     // Compile the foreign module's entry confined to the carve, with the child powerbox ctx so its
-    // `cap.self.resolve(name)` routes to the granted caps. Per-spawn ctx ⇒ uncached (like op 11).
+    // `self.resolve(name)` routes to the granted caps. Per-spawn ctx ⇒ uncached (like op 11).
     let child_fuel_addr = rt.arm_child_fuel(fuel); // §5 fuel: clamp to parent-remaining (0 ⇒ un-metered)
     let compiled = crate::compile_child(
         child_funcs,
@@ -1579,7 +1579,7 @@ fn epoch_fired(addr: usize) -> bool {
         && unsafe { (*(addr as *const std::sync::atomic::AtomicU64)).load(Ordering::Relaxed) != 0 }
 }
 
-/// A durable §14 child's baked `cap.call` thunk (DURABILITY.md §4, "JIT parity"): its powerbox holds
+/// A durable §14 child's baked `call.cap` thunk (DURABILITY.md §4, "JIT parity"): its powerbox holds
 /// exactly one capability — an `Instantiator` over the child's **own full window** `[0, child_size)`,
 /// so the child can carve and run a grandchild of its own. `Nursery::resolve` calls this with iface-6
 /// op-0 to read the holder's `[base, size]`; the child is confined to its window by the masking
@@ -1589,7 +1589,7 @@ fn epoch_fired(addr: usize) -> bool {
 ///
 /// # Safety
 /// `ctx` points at a live `u64` (the child's window size) for the call; `results`/`trap_out` are the
-/// call-site slot buffers (`Nursery::resolve` / the `cap.call` lowering guarantee them).
+/// call-site slot buffers (`Nursery::resolve` / the `call.cap` lowering guarantee them).
 pub(crate) unsafe extern "C" fn child_instantiator_thunk(
     ctx: *mut core::ffi::c_void,
     _mem_base: *mut u8,

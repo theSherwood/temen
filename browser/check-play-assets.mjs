@@ -48,6 +48,11 @@ const BUILT_AT_DEPLOY = new Set([
   'postgres_resolved.temen', // build-pg-assets.mjs
   'pgdata.img',           // build-pg-assets.mjs
   'chibicc_selfhost.img', // build-selfhost-assets.mjs (chibicc's own TU sources + their glibc header closure)
+  'bash.temen',           // build-bash-assets.mjs (GPLv3 — fetched-and-built, never committed; #1080)
+  // The bash card's /bin coreutils — build-bash-assets.mjs copies the committed tests/fixtures/bin_*.temen.
+  'bin_true.temen', 'bin_false.temen', 'bin_echo.temen', 'bin_cat.temen', 'bin_seq.temen',
+  'bin_head.temen', 'bin_wc.temen', 'bin_sort.temen', 'bin_uniq.temen', 'bin_ls.temen',
+  'bin_pwd.temen', 'bin_grep.temen', 'bin_tr.temen',
 ]);
 
 // The subset of deploy-built assets allowed to be absent even in the assembled site. Only doom.temen:
@@ -59,6 +64,14 @@ const MAY_BE_ABSENT = new Set([
   'doom.temen',
   'tcl_snapshot.temen', // build fetches Tcl (SourceForge) + openlibm (GitHub) + needs clang/llvm-link — the warm Tcl card degrades to a hint if absent
   'chibicc_selfhost.img', // build-selfhost-assets.mjs needs a native chibicc + the glibc header tree
+  // The bash card degrades to a build hint when its module is absent: bash.temen needs the
+  // ftp.gnu.org fetch + clang/llvm-18 (GPLv3 — can never ship committed). The bin_*.temen coreutils
+  // ride the same build script (a copy of committed fixtures, so they only miss when the script
+  // didn't run at all — the same absence).
+  'bash.temen',
+  'bin_true.temen', 'bin_false.temen', 'bin_echo.temen', 'bin_cat.temen', 'bin_seq.temen',
+  'bin_head.temen', 'bin_wc.temen', 'bin_sort.temen', 'bin_uniq.temen', 'bin_ls.temen',
+  'bin_pwd.temen', 'bin_grep.temen', 'bin_tr.temen',
 ]);
 
 function referencedAssets() {

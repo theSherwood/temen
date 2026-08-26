@@ -15,7 +15,7 @@ const KERNELS: &[&str] = &[
     "alu",
     "xorshift",
     "call",
-    "call_indirect",
+    "call.dyn",
     "mem",
     "chase",
     "chase_rand",

@@ -19,7 +19,7 @@ use temen_jit::{compile_and_run_with_host_fast, JitOutcome, Quota, TrapKind};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
-/// A no-op cap thunk (these programs make no `cap.call`s; it's only needed by the `_fast` entry).
+/// A no-op cap thunk (these programs make no `call.cap`s; it's only needed by the `_fast` entry).
 unsafe extern "C" fn noop_thunk(
     _ctx: *mut c_void,
     _mem_base: *mut u8,
@@ -36,7 +36,7 @@ unsafe extern "C" fn noop_thunk(
 ) {
     *trap_out = 0;
 }
-/// A resolver that claims nothing (so every `cap.call` would use the generic thunk).
+/// A resolver that claims nothing (so every `call.cap` would use the generic thunk).
 unsafe extern "C" fn no_resolver(_t: u32, _o: u32, _na: u32, _nr: u32) -> *const c_void {
     core::ptr::null()
 }

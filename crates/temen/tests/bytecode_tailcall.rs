@@ -1,5 +1,5 @@
 //! Equality harness for the bytecode engine's **tail calls** (INTERP_PERF.md Slice 1c-5e/3):
-//! `return_call` / `return_call_indirect`. The generator never emits them, so these are hand-authored
+//! `return_call` / `return_call.dyn`. The generator never emits them, so these are hand-authored
 //! (adapted from `jit_diff`'s tail-call cases) and checked bit-identical to the tree-walker `run`.
 //! Tail calls reuse the current activation window, so deep tail recursion must not grow state.
 
@@ -41,12 +41,12 @@ block 2 (v4: i32, v5: i32) {
 }
 "#;
 
-/// `return_call_indirect` through the natural table: `f(idx, x)` tail-calls func `idx`. idx 1 = `+10`,
+/// `return_call.dyn` through the natural table: `f(idx, x)` tail-calls func `idx`. idx 1 = `+10`,
 /// idx 2 = `*2`; idx 0 selects func 0 (the wrong signature) → `IndirectCallType` trap.
 const TAIL_INDIRECT: &str = r#"
 func (i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32) {
-  return_call_indirect (i32) -> (i32) v0 (v1)
+  return_call.dyn (i32) -> (i32) v0 (v1)
   }
 }
 func (i32) -> (i32) {

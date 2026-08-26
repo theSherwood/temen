@@ -167,7 +167,7 @@ int main(void){
 /// Link the shim's import names to their interfaces — link-time symbol resolution (the phase-4
 /// linker-only `resolve_imports_with`; IMPORTS.md §2.5): `__px_*` names strip the prefix and map
 /// through [`temen_posix::resolve`] to `(HOST_PROC, op)`; `__spawn`/`__join` are the shell's own
-/// `Instantiator` ops (13 / 1). No handle is baked at link: each lowered `cap.call` dispatches on
+/// `Instantiator` ops (13 / 1). No handle is baked at link: each lowered `call.cap` dispatches on
 /// the guest's own handle operand, discovered at run time via `__vm_cap_count`/`__vm_cap_at`
 /// reflection (§3c protection at the boundary, IMPORTS.md §2.3 dynamic mode).
 fn link_shim(name: &str) -> Option<Resolved> {

@@ -35,9 +35,9 @@ void DG_Init(void) {
   g_kbd = __vm_cap_resolve("keyboard", 8);
 }
 
-/* Present the finished frame through the `display` capability. This is the one cap.call on the
- * per-frame path, and a cap.call is out of the wasm-JIT subset — so keep it in its own `noinline`
- * function. Inlined, the cap.call would poison the enclosing DG_DrawFrame (the per-pixel swizzle loop)
+/* Present the finished frame through the `display` capability. This is the one call.cap on the
+ * per-frame path, and a call.cap is out of the wasm-JIT subset — so keep it in its own `noinline`
+ * function. Inlined, the call.cap would poison the enclosing DG_DrawFrame (the per-pixel swizzle loop)
  * out of the subset, dragging it onto the interpreter; isolated, only this O(1) call bounces
  * cross-tier and the swizzle stays emitted. (Independent of the return_call emitter fix, which is what
  * keeps I_FinishUpdate — the caller's scale loop — emittable.) */

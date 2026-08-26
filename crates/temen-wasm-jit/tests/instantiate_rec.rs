@@ -45,8 +45,8 @@ block 0 (v0: i64) {
   va6 = i64.const 2096
   i64.store va6 vz
   vrp = i64.const 2048
-  vch = cap.call 6 17 (i64) -> (i32) vinst (vrp)
-  vr = cap.call 6 1 (i32) -> (i64) vinst (vch)
+  vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  vr = call.cap 6 1 (i32) -> (i64) vinst (vch)
   return vr
   }
 }

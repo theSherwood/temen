@@ -1,7 +1,7 @@
 // Single-vCPU §22 **runtime** `Jit.compile` on the wasm tier (BROWSER.md § "wasm-JIT tier" — the
 // dynamic-loop slice). Unlike jitcodegen.mjs (a *fixed* unit host-compiled at setup), here the guest
-// builds an IR blob AT RUNTIME, `cap.call 11 0` compiles it — minting a unit AND emitting its wasm in
-// the shared host — then `cap.call 11 1` invokes it. With codegen on, the JS host instantiates that
+// builds an IR blob AT RUNTIME, `call.cap 11 0` compiles it — minting a unit AND emitting its wasm in
+// the shared host — then `call.cap 11 1` invokes it. With codegen on, the JS host instantiates that
 // per-unit emitted wasm (keyed by the returned code handle) and runs `f0(win, env, …args)`; with
 // codegen off, the interpreter services the invoke. Both must yield the same result (ground truth
 // service(6,7) = 6*7+100 = 142) — the MISCOMPILE-grade differential the tier holds.
@@ -37,10 +37,10 @@ func (i32) -> (i64) {
 block 0 (vjit: i32) {
   vptr = i64.const ${BLOB_OFF}
   vlen = i64.const ${blobLen}
-  vcode = cap.call 11 0 (i64, i64) -> (i64) vjit (vptr, vlen)
+  vcode = call.cap 11 0 (i64, i64) -> (i64) vjit (vptr, vlen)
   va = i32.const 6
   vb = i32.const 7
-  vr = cap.call 11 1 (i64, i32, i32) -> (i32) vjit (vcode, va, vb)
+  vr = call.cap 11 1 (i64, i32, i32) -> (i32) vjit (vcode, va, vb)
   vr64 = i64.extend_i32_u vr
   return vr64
   }

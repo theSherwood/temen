@@ -61,8 +61,8 @@ fn nest_src(off: u64) -> String {
          \x20 v2 = i64.const {off}\n\
          \x20 v3 = i64.const 12\n\
          \x20 v4 = i64.const 0\n\
-         \x20 v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)\n\
-         \x20 v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)\n\
+         \x20 v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)\n\
+         \x20 v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)\n\
          \x20 return v6\n\
            }}\n\
          }}\n\
@@ -156,7 +156,7 @@ fn jit_instantiator_rejects_out_of_range_carve() {
          \x20 i64.store q0a5 q0v4\n\
          \x20 q0a6 = i64.const 1200\n\
          \x20 i64.store q0a6 q0v4\n\
-         \x20 v5 = cap.call 6 17 (i64) -> (i32) v0 (q0a0)\n\
+         \x20 v5 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)\n\
          \x20 v6 = i64.extend_i32_s v5\n\
          \x20 return v6\n\
            }\n\
@@ -214,8 +214,8 @@ fn jit_instantiator_child_trap_propagates() {
              \x20 i64.store q1a5 q1v4\n\
              \x20 q1a6 = i64.const 1264\n\
              \x20 i64.store q1a6 q1v4\n\
-             \x20 v5 = cap.call 6 17 (i64) -> (i32) v0 (q1a0)\n\
-             \x20 v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)\n\
+             \x20 v5 = call.cap 6 17 (i64) -> (i32) v0 (q1a0)\n\
+             \x20 v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)\n\
              \x20 return v6\n\
                }}\n\
              }}\n\
@@ -263,7 +263,7 @@ fn jit_child_offer_refuses_probeably_and_matches_interp() {
          block 0 (v0: i32) {\n\
          \x20 vbad = i32.const 99\n\
          \x20 vz = i64.const 0\n\
-         \x20 vc = cap.call 6 14 (i32, i64) -> (i32) v0 (vbad, vz)\n\
+         \x20 vc = call.cap 6 14 (i32, i64) -> (i32) v0 (vbad, vz)\n\
          \x20 vr = i64.extend_i32_s vc\n\
          \x20 return vr\n\
            }\n\

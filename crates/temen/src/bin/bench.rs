@@ -115,7 +115,7 @@ block 0 (v0: i32) {
 }
 "#;
 
-/// Each iteration dispatches through the `call_indirect` table — mask + slot read + type-check.
+/// Each iteration dispatches through the `call.dyn` table — mask + slot read + type-check.
 const CALL_INDIRECT: &str = r#"
 func (i32) -> (i32) {
 block 0 (v0: i32) {
@@ -124,7 +124,7 @@ block 0 (v0: i32) {
 }
 block 1 (v2: i32, v3: i32) {
   v4 = i32.const 1
-  v5 = call_indirect (i32) -> (i32) v4 (v3)
+  v5 = call.dyn (i32) -> (i32) v4 (v3)
   v6 = i32.const 1
   v7 = i32.sub v2 v6
   br_if v7 1(v7, v5) 2(v5)

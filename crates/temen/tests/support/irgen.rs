@@ -11,7 +11,7 @@
 //!   CFG edges; the exception is [`gen_loop_func`], which emits one **counted loop** whose
 //!   `i32` counter strictly increments to a small bound — so every generated module still
 //!   **halts by construction** (a bounded number of iterations, no JIT fuel needed).
-//!   `call_indirect` likewise only ever dispatches *forward* (or type-mismatch-traps).
+//!   `call.dyn` likewise only ever dispatches *forward* (or type-mismatch-traps).
 //!
 //! Therefore any interpreter-vs-JIT divergence on a generated module is a real backend
 //! bug, not malformed input. Constant values are biased toward boundary cases (0, ±1,
@@ -28,9 +28,9 @@ pub struct Gen {
     data: Vec<u8>,
     pos: usize,
     rng: u64,
-    /// Whether to synthesize `cap.call`s (arms 18/19). The Cranelift differential grants a Memory
+    /// Whether to synthesize `call.cap`s (arms 18/19). The Cranelift differential grants a Memory
     /// capability and exercises the success/CapFault paths, so it leaves this `true`; the **wasm-JIT**
-    /// differential disables it ([`Gen::without_caps`]) because that tier refuses `cap.call`/page-op
+    /// differential disables it ([`Gen::without_caps`]) because that tier refuses `call.cap`/page-op
     /// modules (`Unsupported`), and a shared generator that peppered them everywhere would make almost
     /// every memory module unemittable — starving the escape-oracle. Off ⇒ arms 18/19 re-roll.
     emit_caps: bool,
@@ -78,7 +78,7 @@ impl Gen {
             cur_types: Vec::new(),
         }
     }
-    /// Suppress `cap.call` generation (for the wasm-JIT differential — see the field's note).
+    /// Suppress `call.cap` generation (for the wasm-JIT differential — see the field's note).
     pub fn without_caps(mut self) -> Gen {
         self.emit_caps = false;
         self
@@ -404,7 +404,7 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                 );
             }
             17 => {
-                // call_indirect — two terminating flavors:
+                // call.dyn — two terminating flavors:
                 if can_call && bb.g.boolean() {
                     // (a) success: a const index into a *forward* function with its exact
                     // signature ⇒ the type check passes and a forward (DAG) call runs.
@@ -434,12 +434,12 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                 }
             }
             18 if bb.g.emit_caps => {
-                // cap.call with an *ungranted* handle. The fuzzer grants no capabilities, so
+                // call.cap with an *ungranted* handle. The fuzzer grants no capabilities, so
                 // the handle resolves to nothing in the host-owned table and the call is
                 // **inert** — it traps `CapFault` on both backends (interp: empty `Host`; JIT:
                 // `empty_cap_thunk`), so they agree under the both-trap rule. This is the I2
                 // check for capabilities (§3c: "a forged handle is inert — never host memory or
-                // arbitrary code") and the first *generative* exercise of the JIT's cap.call
+                // arbitrary code") and the first *generative* exercise of the JIT's call.cap
                 // lowering (handle marshalling + thunk ABI + trap plumbing). The signature is
                 // int-typed so the (dead, post-trap) result values keep the pool float-free.
                 // NB: only the fault path is covered — the *success* path needs a deterministic
@@ -467,9 +467,9 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                 );
             }
             19 if has_mem && bb.g.emit_caps => {
-                // A *valid* Memory `cap.call` (§3e) on the granted handle: `map`/`unmap`/`protect`
+                // A *valid* Memory `call.cap` (§3e) on the granted handle: `map`/`unmap`/`protect`
                 // one whole page, page-aligned, so it takes the **success** path on both backends
-                // (interp page-map + JIT real `mprotect`/`VirtualProtect`) — exercising cap.call
+                // (interp page-map + JIT real `mprotect`/`VirtualProtect`) — exercising call.cap
                 // result marshalling and the cap's window effects interleaved with the generated CFG,
                 // under the escape-oracle. The page index spans **0..47** (up to 192 KiB): in the
                 // fully-mapped pass only 0..15 are in-range (the 64 KiB prefix; 16.. ⇒ EINVAL on both),
@@ -486,7 +486,7 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                 if op == 3 {
                     // page_size() -> i64: a pure query — no args, no window effect — so both
                     // backends report the same host page and it always agrees. Exercises the
-                    // 0-arg / 1-result cap.call marshalling for the whole-window AddressSpace cap.
+                    // 0-arg / 1-result call.cap marshalling for the whole-window AddressSpace cap.
                     let sig = bb.g.intern_sig(FuncType {
                         params: vec![],
                         results: results.clone(),
@@ -598,7 +598,7 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                 // `ref.func k` — a funcref (an i32 function index, §3c) for *any* function. Both
                 // backends lower it to the same constant (`iconst.i32 k`), so it pins RefFunc on the
                 // JIT, which once had a lowering gap that surfaced only via the C tests, not this
-                // fuzzer (HANDOFF §2). The result flows as a plain i32 value; `call_indirect` mints
+                // fuzzer (HANDOFF §2). The result flows as a plain i32 value; `call.dyn` mints
                 // its **own** forward `ConstI32` index (arm 17) and never reads the pool, so a
                 // RefFunc value can't become a backward call target — the halting-by-construction
                 // forward-only call DAG is untouched.
@@ -1179,7 +1179,7 @@ use temen_verify::verify_module;
 
 /// The handle value of the **first** `grant_memory` on a fresh `Host`: the encoding is
 /// `(generation << CAP_LOG2) | slot` with the generation bumped to 1 on the first grant and slot
-/// 0, i.e. `1 << 8`. The generator emits valid Memory `cap.call`s against this constant, and the
+/// 0, i.e. `1 << 8`. The generator emits valid Memory `call.cap`s against this constant, and the
 /// harness asserts the grant actually yields it (so a change to the encoding fails loudly here).
 const MEMORY_HANDLE: i32 = 1 << 8;
 
@@ -1374,10 +1374,10 @@ fn differential_pass(m: &Module, args: &[Value], init: &[u8], mem_oracle: bool, 
     let results = m.funcs[0].results.clone();
     let mut fuel = 5_000_000u64;
     // Grant a Memory capability identically to both backends (handle `MEMORY_HANDLE`), so the
-    // generator's valid Memory `cap.call`s (arm 19) take their *success* path through the
+    // generator's valid Memory `call.cap`s (arm 19) take their *success* path through the
     // production thunk — the cap's `map`/`unmap`/`protect` window effects then ride the
-    // escape-oracle. A forged-handle cap.call (arm 18) still resolves to nothing ⇒ CapFault on
-    // both. The thunk is dormant for modules with no cap.call, so non-cap seeds are unaffected.
+    // escape-oracle. A forged-handle call.cap (arm 18) still resolves to nothing ⇒ CapFault on
+    // both. The thunk is dormant for modules with no call.cap, so non-cap seeds are unaffected.
     // Granted on both unix and windows now that `temen_run::cap_thunk`'s `MprotectWindow` is ported to
     // both (`mprotect` / `VirtualProtect`), so the success path is exercised on every CI runner.
     let mut hi = Host::new();
@@ -1418,7 +1418,7 @@ fn differential_pass(m: &Module, args: &[Value], init: &[u8], mem_oracle: bool, 
 }
 
 /// One differential pass over a §14 **nested sub-window**: run the entry confined to a child window
-/// at offset `base = size` inside a `2·size` parent on both backends (no powerbox — a `cap.call`
+/// at offset `base = size` inside a `2·size` parent on both backends (no powerbox — a `call.cap`
 /// CapFaults identically), and assert they agree on the result/trap and — on a clean completion —
 /// on the **whole parent** window (the sub-window escape-oracle: the JIT's new `+ base` masking term
 /// must confine every access to `[base, base+size)`, byte-for-byte with the interpreter). Skipped

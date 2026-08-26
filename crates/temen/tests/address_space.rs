@@ -1,5 +1,5 @@
 //! §14 `AddressSpace` capability + **attenuation** (iface 5), end-to-end through the real
-//! `cap.call` dispatch on **both** backends. An `AddressSpace` is the memory half of the
+//! `call.cap` dispatch on **both** backends. An `AddressSpace` is the memory half of the
 //! `Instantiator`: a power-of-two window sub-range whose `map`/`unmap`/`protect` are confined to
 //! it, and whose `sub` op mints a *further-attenuated* child range (a parent can only sub-allocate
 //! what it holds). These tests pin two properties: the attenuated ops take effect (and agree
@@ -75,10 +75,10 @@ func (i32) -> (i64) {
 block 0 (v0: i32) {
   v2 = i64.const 65536
   v3 = i64.const 16
-  v4 = cap.call 5 4 (i64, i64) -> (i32) v0 (v2, v3)
+  v4 = call.cap 5 4 (i64, i64) -> (i32) v0 (v2, v3)
   v5 = i64.const 0
   v7 = i64.const 16384
-  v6 = cap.call 5 1 (i64, i64) -> (i64) v4 (v5, v7)
+  v6 = call.cap 5 1 (i64, i64) -> (i64) v4 (v5, v7)
   return v6
   }
 }
@@ -120,10 +120,10 @@ func (i32) -> (i64) {
 block 0 (v0: i32) {
   v2 = i64.const 0
   v3 = i64.const 12
-  v4 = cap.call 5 4 (i64, i64) -> (i32) v0 (v2, v3)
+  v4 = call.cap 5 4 (i64, i64) -> (i32) v0 (v2, v3)
   v5 = i64.const 4096
   v7 = i64.const 16384
-  v6 = cap.call 5 1 (i64, i64) -> (i64) v4 (v5, v7)
+  v6 = call.cap 5 1 (i64, i64) -> (i64) v4 (v5, v7)
   return v6
   }
 }
@@ -193,7 +193,7 @@ fn sub_rejects_ranges_outside_the_holder() {
 /// Audit #1 — a guest must not be able to crash the host by exhausting the 256-slot handle table.
 /// `AddressSpace.sub` mints a handle each call; this loops it 300 times (past `CAP = 256`). Once the
 /// table fills, `sub` must return **-EMFILE** (-24), and the run must complete normally on **both**
-/// backends — in particular the JIT path routes `cap.call` through the `extern "C"` thunk, where a
+/// backends — in particular the JIT path routes `call.cap` through the `extern "C"` thunk, where a
 /// panic (the pre-fix `.expect("handle table full")`) would unwind across the FFI boundary and
 /// **abort the host process**. Reaching `block2` with -24 proves the table-full path is a clean
 /// errno, not a crash.
@@ -211,7 +211,7 @@ block 0 (v0: i32) {
 block 1 (v3: i32, v4: i64, v5: i64) {
   v6 = i64.const 0
   v7 = i64.const 12
-  v8 = cap.call 5 4 (i64, i64) -> (i32) v3 (v6, v7)
+  v8 = call.cap 5 4 (i64, i64) -> (i32) v3 (v6, v7)
   v9 = i64.extend_i32_s v8
   v10 = i64.const -1
   v11 = i64.add v4 v10

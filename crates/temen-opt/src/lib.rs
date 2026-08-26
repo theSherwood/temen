@@ -262,7 +262,7 @@ pub fn optimize_module(m: &Module) -> Module {
 /// is this with [`OptConfig::all`]; the benchmark harness varies `cfg` to measure each pass.
 pub fn optimize_module_with(m: &Module, cfg: &OptConfig) -> Module {
     // Interprocedural pre-passes (OPT.md Phase 3), at module scope. Devirtualization turns a constant
-    // `call_indirect` into a direct `call`; interprocedural constant propagation substitutes a
+    // `call.dyn` into a direct `call`; interprocedural constant propagation substitutes a
     // parameter that is the same constant at every call site into the callee (so the per-function passes
     // fold through it); inlining splices small callees into their callers so those passes fold through
     // the inlined bodies; and dead-function elimination at the end sweeps the now-uncalled leaves (its
@@ -279,7 +279,7 @@ pub fn optimize_module_with(m: &Module, cfg: &OptConfig) -> Module {
         devirt
     };
     // Re-devirtualize: a constant funcref that const_prop propagated into a dispatcher's parameter now
-    // makes its `call_indirect` index constant, so devirt can resolve it to a direct call. Idempotent
+    // makes its `call.dyn` index constant, so devirt can resolve it to a direct call. Idempotent
     // when const_prop changed nothing, so it is a no-op with const_prop off.
     let cp = if cfg.devirt && cfg.const_prop {
         interproc::devirtualize(&cp)
@@ -2208,7 +2208,7 @@ fn prune_unreachable(blocks: Vec<Block>) -> Vec<Block> {
 /// Whether a dead instruction (no live results) is safe to **remove**. True only for the
 /// ops that are *pure* or a pure *read* and *cannot trap* and have *no side effect*, so deleting one
 /// changes nothing observable. Everything else — anything that can fault (loads, atomics, trapping
-/// float→int, `cap.self.get`), writes memory or state (stores, `gc.roots`), transfers control /
+/// float→int, `self.get`), writes memory or state (stores, `gc.roots`), transfers control /
 /// spawns / blocks (calls, `cap`/`cont`/`thread`/`memory.wait` ops, fences) — is **kept**. The safe
 /// default falls out of the classification: a spurious effect only forgoes a removal, never changes
 /// behavior.

@@ -33,7 +33,7 @@ pub(crate) fn seed(base: u64) {
 }
 
 /// `durable.shadow_base` thunk — the current context's shadow-region base. A pure thread-local read;
-/// it cannot fault, so it takes no window/trap context (unlike the `cap.call`/`gc.roots` thunks).
+/// it cannot fault, so it takes no window/trap context (unlike the `call.cap`/`gc.roots` thunks).
 pub(crate) extern "C" fn get() -> u64 {
     DURABLE_SHADOW_BASE.with(|c| c.get())
 }

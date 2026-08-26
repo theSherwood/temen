@@ -2,7 +2,7 @@
 // sandboxed:  temen-run crates/temen-run/demos/hello.c
 //
 // `write` is a powerbox builtin (the Stream capability, §3e); the frontend lowers it to a
-// `cap.call` on the granted stdout handle.
+// `call.cap` on the granted stdout handle.
 
 int write(int fd, char *buf, long n);
 

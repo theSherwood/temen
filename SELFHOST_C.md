@@ -126,7 +126,7 @@ cover every deployment shape, layered by how far "inside" the loop runs:
 2. **In-guest compile-and-run — already built: the §22 `Jit` capability + `vm_dlopen`.** A guest
    can hand serialized Temen IR from its own window to the host, which runs the fail-closed
    **rewrite-then-verify** gate (`jit_resolve_and_validate`: `decode_module` →
-   `resolve_imports` → `verify_module` → install) and returns callable `call_indirect` slots.
+   `resolve_imports` → `verify_module` → install) and returns callable `call.dyn` slots.
    The C-level loader (`<vm_dl.h>`: `vm_dlopen`/`vm_dlsym`/`vm_dlclose`) is **built and
    differentially tested** (DESIGN.md §22, "In-window dynamic linking — SETTLED"). So
    *compile → load → call, entirely in-guest,* is a composition of existing pieces. The one
@@ -250,7 +250,7 @@ compiler bug is a clean error, never an escape.
    **→ wasm-JIT tier DONE 2026-07-28 — chibicc compiles on emitted wasm.** The card's compile pass (the
    slow half) now takes the **"wasm-JIT" toggle** (default on): chibicc's whole `_start` emits to wasm
    via `compile_module_reactor(&m, /*entry*/ 0, …)` — **333/402 functions run on emitted wasm**, and the
-   ~69 reachable non-subset helpers (the `cap.call`/`call.import` wrappers `outline_cap_calls` hoists, all
+   ~69 reachable non-subset helpers (the `call.cap`/`call.import` wrappers `outline_cap_calls` hoists, all
    integer-signature) **bounce cross-tier to the interpreter** over the shared window through
    `env.call_interp`, so `fopen`/`read`/`write`/`exit` resolve against the powerbox and the seeded memfs.
    This settles the old "chibicc uses floats → can't JIT" worry for good: `_start` **is** in-subset (floats

@@ -46,9 +46,9 @@ fn caller_pays_for_the_handlers_work() {
          block 0 () {{\n\
            vz = i32.const 0\n\
            vh = i32.const {offer}\n\
-           vbefore = cap.call 4294967295 13 () -> (i64) vz ()\n\
-           vign = cap.call {tid} 0 () -> (i64) vh ()\n\
-           vafter = cap.call 4294967295 13 () -> (i64) vz ()\n\
+           vbefore = call.cap 4294967295 13 () -> (i64) vz ()\n\
+           vign = call.cap {tid} 0 () -> (i64) vh ()\n\
+           vafter = call.cap 4294967295 13 () -> (i64) vz ()\n\
            vcost = i64.sub vbefore vafter\n\
            return vcost\n\
            }}\n\

@@ -54,7 +54,7 @@ fn interp_compile(compiler: &temen_ir::Module, src: &str) -> String {
 /// compiler drives the §22 `Jit` cap **through imports** (temen-llvm lowers `extern __vm_jit_*` to
 /// `call.import`), so `onramp_exec` runs it on the tree-walker (which routes import-bound `invoke`/
 /// `install`/`uninstall` to the driver; the bytecode engine only handles statically-resolved
-/// `cap.call (JIT, op)`). The symbol table is the canonical `Slot`/`Cap` wire form and the `Jit`
+/// `call.cap (JIT, op)`). The symbol table is the canonical `Slot`/`Cap` wire form and the `Jit`
 /// grant mirrors temen-run's powerbox (1024-slot table + fiber hosting) so the staged macro — which
 /// runs on the compiler's scheduler root — resolves.
 #[test]

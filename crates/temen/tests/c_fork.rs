@@ -130,9 +130,9 @@ block 0 (v0: i32, vstream: i32, vgmod: i64) {
   i64.store q0a5 q0v4
   q0a6 = i64.const 1200
   i64.store q0a6 q0v4
-  vs = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
+  vs = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   vz0 = i64.const 0
-  vforkoff = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  vforkoff = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
   va0 = i64.const 256
   vnp0 = i32.const 310
   i32.store va0 vnp0
@@ -153,8 +153,8 @@ block 0 (v0: i32, vstream: i32, vgmod: i64) {
   ve0 = i64.const 0
   voffg = i64.const 131072
   vsl = i64.const 17
-  vg = cap.call 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgmod, vgp, vgn, ve0, voffg, vsl, vq)
-  vjg = cap.call 6 1 (i32) -> (i64) v0 (vg)
+  vg = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgmod, vgp, vgn, ve0, voffg, vsl, vq)
+  vjg = call.cap 6 1 (i32) -> (i64) v0 (vg)
   return vjg
   }
 }
@@ -164,7 +164,7 @@ block 0 (v0: i64) {
   }
 block 1 () {
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   br 1()
   }
 }
@@ -172,7 +172,7 @@ func (i64) -> (i64) {
 block 0 (vx: i64) {
   vz = i32.const 0
   vzero = i64.const 0
-  vt = cap.call 4294967295 11 (i64) -> (i64) vz (vzero)
+  vt = call.cap 4294967295 11 (i64) -> (i64) vz (vzero)
   return vt
   }
 }
@@ -253,11 +253,11 @@ block 0 (v0: i32, vstream: i32, vgmod: i64) {
   i64.store q0a5 q0v4
   q0a6 = i64.const 1200
   i64.store q0a6 q0v4
-  vs = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
+  vs = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   vz0 = i64.const 0
-  vforkoff = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  vforkoff = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
   v1c = i64.const 1
-  vwaitoff = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, v1c)
+  vwaitoff = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, v1c)
   va0 = i64.const 256
   vnp0 = i32.const 310
   i32.store va0 vnp0
@@ -285,8 +285,8 @@ block 0 (v0: i32, vstream: i32, vgmod: i64) {
   ve0 = i64.const 0
   voffg = i64.const 131072
   vsl = i64.const 17
-  vg = cap.call 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgmod, vgp, vgn, ve0, voffg, vsl, vq)
-  vjg = cap.call 6 1 (i32) -> (i64) v0 (vg)
+  vg = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgmod, vgp, vgn, ve0, voffg, vsl, vq)
+  vjg = call.cap 6 1 (i32) -> (i64) v0 (vg)
   return vjg
   }
 }
@@ -296,7 +296,7 @@ block 0 (v0: i64) {
   }
 block 1 () {
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   br 1()
   }
 }
@@ -304,14 +304,14 @@ func (i64) -> (i64) {
 block 0 (vx: i64) {
   vz = i32.const 0
   vzero = i64.const 0
-  vt = cap.call 4294967295 11 (i64) -> (i64) vz (vzero)
+  vt = call.cap 4294967295 11 (i64) -> (i64) vz (vzero)
   return vt
   }
 }
 func (i64) -> (i64) {
 block 0 (vpid: i64) {
   vz = i32.const 0
-  vt = cap.call 4294967295 12 (i64) -> (i64) vz (vpid)
+  vt = call.cap 4294967295 12 (i64) -> (i64) vz (vpid)
   return vt
   }
 }
@@ -888,11 +888,11 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vmod1: i64, vmod2: i64) {
   i64.store q0a5 q0v4
   q0a6 = i64.const 1200
   i64.store q0a6 q0v4
-  vs = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
+  vs = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   vz0 = i64.const 0
-  vforkoff = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  vforkoff = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
   v1c = i64.const 1
-  vwaitoff = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, v1c)
+  vwaitoff = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, v1c)
   vmod1_32 = i32.wrap_i64 vmod1
   vmod2_32 = i32.wrap_i64 vmod2
   va0 = i64.const 256
@@ -937,8 +937,8 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vmod1: i64, vmod2: i64) {
   ve0 = i64.const 0
   voffg = i64.const 131072
   vsl = i64.const 17
-  vg = cap.call 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgmod, vgp, vgn, ve0, voffg, vsl, vq)
-  vjg = cap.call 6 1 (i32) -> (i64) v0 (vg)
+  vg = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgmod, vgp, vgn, ve0, voffg, vsl, vq)
+  vjg = call.cap 6 1 (i32) -> (i64) v0 (vg)
   return vjg
   }
 }
@@ -948,7 +948,7 @@ block 0 (v0: i64) {
   }
 block 1 () {
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   br 1()
   }
 }
@@ -956,14 +956,14 @@ func (i64) -> (i64) {
 block 0 (vx: i64) {
   vz = i32.const 0
   vzero = i64.const 0
-  vt = cap.call 4294967295 11 (i64) -> (i64) vz (vzero)
+  vt = call.cap 4294967295 11 (i64) -> (i64) vz (vzero)
   return vt
   }
 }
 func (i64) -> (i64) {
 block 0 (vpid: i64) {
   vz = i32.const 0
-  vt = cap.call 4294967295 12 (i64) -> (i64) vz (vpid)
+  vt = call.cap 4294967295 12 (i64) -> (i64) vz (vpid)
   return vt
   }
 }
@@ -1558,7 +1558,7 @@ fn a_producer_gets_epipe_when_its_consumer_exits() {
 /// copies of the pipe ends (leaving `cmd` the sole writer), then loops `read_fd(pipe_read)` and forwards
 /// each chunk to a memfs file through the granted `vm_fs` cap (`FS_WRITE`), until the read returns EOF
 /// (0) — which arrives when `cmd` exits and its write end closes (the writer count hits 0, waking the
-/// blocking read). The read drains through the **direct `cap.call`** route (`__vm_read`), so this also
+/// blocking read). The read drains through the **direct `call.cap`** route (`__vm_read`), so this also
 /// exercises the pipe-read park on that arm. `cmd` writes `"redirected!"`; the file ends up holding it.
 const REDIRECT_CMD_SRC: &str = r#"
 long write(long fd, void *buf, long n);
@@ -2127,8 +2127,8 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64) {
   ve0 = i64.const 0
   voffg = i64.const 131072
   vsl = i64.const 17
-  vg = cap.call 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgmod, vgp, vgn, ve0, voffg, vsl, vq)
-  vjg = cap.call 6 1 (i32) -> (i64) v0 (vg)
+  vg = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgmod, vgp, vgn, ve0, voffg, vsl, vq)
+  vjg = call.cap 6 1 (i32) -> (i64) v0 (vg)
   return vjg
   }
 }
@@ -2271,8 +2271,8 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64, vfs: i32) {
   ve0 = i64.const 0
   voffg = i64.const 131072
   vsl = i64.const 17
-  vg = cap.call 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgmod, vgp, vgn, ve0, voffg, vsl, vq)
-  vjg = cap.call 6 1 (i32) -> (i64) v0 (vg)
+  vg = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgmod, vgp, vgn, ve0, voffg, vsl, vq)
+  vjg = call.cap 6 1 (i32) -> (i64) v0 (vg)
   return vjg
   }
 }
@@ -2434,11 +2434,11 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64) {
   i64.store q0a5 q0v4
   q0a6 = i64.const 1200
   i64.store q0a6 q0v4
-  vs = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
+  vs = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   vz0 = i64.const 0
-  vforkoff = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  vforkoff = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
   v1c = i64.const 1
-  vwaitoff = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, v1c)
+  vwaitoff = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, v1c)
   vcmod32 = i32.wrap_i64 vcmod
   va0 = i64.const 256
   vnp0 = i32.const 410
@@ -2475,8 +2475,8 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64) {
   ve0 = i64.const 0
   voffg = i64.const 131072
   vsl = i64.const 17
-  vg = cap.call 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgmod, vgp, vgn, ve0, voffg, vsl, vq)
-  vjg = cap.call 6 1 (i32) -> (i64) v0 (vg)
+  vg = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgmod, vgp, vgn, ve0, voffg, vsl, vq)
+  vjg = call.cap 6 1 (i32) -> (i64) v0 (vg)
   return vjg
   }
 }
@@ -2486,7 +2486,7 @@ block 0 (v0: i64) {
   }
 block 1 () {
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   br 1()
   }
 }
@@ -2494,14 +2494,14 @@ func (i64) -> (i64) {
 block 0 (vx: i64) {
   vz = i32.const 0
   vzero = i64.const 0
-  vt = cap.call 4294967295 11 (i64) -> (i64) vz (vzero)
+  vt = call.cap 4294967295 11 (i64) -> (i64) vz (vzero)
   return vt
   }
 }
 func (i64) -> (i64) {
 block 0 (vpid: i64) {
   vz = i32.const 0
-  vt = cap.call 4294967295 12 (i64) -> (i64) vz (vpid)
+  vt = call.cap 4294967295 12 (i64) -> (i64) vz (vpid)
   return vt
   }
 }
@@ -2634,11 +2634,11 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64, vfs: i32) {
   i64.store q0a5 q0v4
   q0a6 = i64.const 1200
   i64.store q0a6 q0v4
-  vs = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
+  vs = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   vz0 = i64.const 0
-  vforkoff = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  vforkoff = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
   v1c = i64.const 1
-  vwaitoff = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, v1c)
+  vwaitoff = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, v1c)
   vcmod32 = i32.wrap_i64 vcmod
   va0 = i64.const 256
   vnp0 = i32.const 410
@@ -2683,8 +2683,8 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64, vfs: i32) {
   ve0 = i64.const 0
   voffg = i64.const 131072
   vsl = i64.const 17
-  vg = cap.call 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgmod, vgp, vgn, ve0, voffg, vsl, vq)
-  vjg = cap.call 6 1 (i32) -> (i64) v0 (vg)
+  vg = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgmod, vgp, vgn, ve0, voffg, vsl, vq)
+  vjg = call.cap 6 1 (i32) -> (i64) v0 (vg)
   return vjg
   }
 }
@@ -2694,7 +2694,7 @@ block 0 (v0: i64) {
   }
 block 1 () {
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   br 1()
   }
 }
@@ -2702,14 +2702,14 @@ func (i64) -> (i64) {
 block 0 (vx: i64) {
   vz = i32.const 0
   vzero = i64.const 0
-  vt = cap.call 4294967295 11 (i64) -> (i64) vz (vzero)
+  vt = call.cap 4294967295 11 (i64) -> (i64) vz (vzero)
   return vt
   }
 }
 func (i64) -> (i64) {
 block 0 (vpid: i64) {
   vz = i32.const 0
-  vt = cap.call 4294967295 12 (i64) -> (i64) vz (vpid)
+  vt = call.cap 4294967295 12 (i64) -> (i64) vz (vpid)
   return vt
   }
 }

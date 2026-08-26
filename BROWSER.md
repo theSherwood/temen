@@ -129,9 +129,9 @@ wasmtime run --invoke run_coroutine -W memory64=y "$W"   # 1001329 (spawn_corout
 wasmtime run --invoke run_tailcall  -W memory64=y "$W"   # 120 (return_call tail recursion, O(1) state)
 wasmtime run --invoke run_simd      -W memory64=y "$W"   # 42 (i64x2 splat/add/extract_lane)
 wasmtime run --invoke run_gcroots  -W memory64=y "$W"   # 2 (gc.roots conservative root scan)
-wasmtime run --invoke run_reflect   -W memory64=y "$W"   # 3 (cap.self.count over a 3-cap powerbox)
+wasmtime run --invoke run_reflect   -W memory64=y "$W"   # 3 (self.count over a 3-cap powerbox)
 wasmtime run --invoke run_region    -W memory64=y "$W"   # ...cdef (SharedRegion two-offset alias)
-wasmtime run --invoke run_jit       -W memory64=y "$W"   # 142 (guest installs + call_indirects a JIT unit)
+wasmtime run --invoke run_jit       -W memory64=y "$W"   # 142 (guest installs + call.dyn-calls a JIT unit)
 wasmtime run --invoke run_dynlink   -W memory64=y "$W"   # 777 (compile_linked resolves a named import)
 wasmtime run --invoke run_durable   -W memory64=y "$W"   # 2001 (durable NORMAL run; freeze/thaw differ in corpus)
 wasmtime run --invoke run_float     -W memory64=y "$W"   # 4611686018427387904 (sqrt(4.0)=2.0, bit-exact)
@@ -171,7 +171,7 @@ as an interactive playground card:
   under wasm — the same reason the whole browser path is bytecode-only (see "Why the bytecode engine"
   above).
 
-- **Sequential subset.** `compile_inst` rejects `Instantiator`/`SharedRegion` cap.calls, which the
+- **Sequential subset.** `compile_inst` rejects `Instantiator`/`SharedRegion` call.caps, which the
   full shell carries (external commands + concurrent ring pipelines). So the browser fixture is built
   with `-DTEMEN_SHELL_SEQUENTIAL`: `#ifndef` guards in `shell_main.c` drop those paths, leaving a
   bytecode-compilable module. **The browser gets Stage-0** (builtins, redirects, in-window memfs
@@ -218,7 +218,7 @@ no RO data is unaffected.
   differential. `temen_abi_is64()` tells a host whether the pointer/length ABI is `i32` or `i64`.
 - **Live capabilities → a feature-gated variant.** Real host imports are mandatory at instantiation
   for *every* entry, so binding a capability to the live host (`temen_run_live`, bridging guest
-  `cap.call`s to `temen_host.host_write`/`host_now_ns` via `grant_host_fn`) lives behind
+  `call.cap`s to `temen_host.host_write`/`host_now_ns` via `grant_host_fn`) lives behind
   `--features live` — the default build stays import-free for the compute/powerbox path, and the
   live build adds exactly the two `temen_host` imports.
 
@@ -323,7 +323,7 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   suspend faults (`STATUS_TRAP`). *Coroutines* (`spawn_coroutine`/`resume` + `Yielder.yield`, on the
   `temen_run_nested` Instantiator path): a 3-resume yield round-trip (`1001329`) and a forged-resume
   fault. All 7 match native; wasm64 `run_fiber() == 107`, `run_coroutine() == 1001329`.
-- [x] **Tail calls** (`return_call`/`return_call_indirect`, O(1) window reuse). Plain compute path:
+- [x] **Tail calls** (`return_call`/`return_call.dyn`, O(1) window reuse). Plain compute path:
   tail-recursive factorial (sweep) + indirect dispatch through the natural table (incl. out-of-range →
   `IndirectCall` trap). wasm64 `run_tailcall() == 120`.
 - [x] **§17 SIMD / v128.** The bytecode engine delegates the v128 long tail to the reference; observed
@@ -333,14 +333,14 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   activation for in-range words, writes them to a buffer, returns the count; snapshot+count compared
   byte-identically (same engine wasm vs native). `gc_baseline`/`gc_tagged` (tag-masked) → 2 roots each.
   wasm64 `run_gcroots() == 2`.
-- [x] **§7 reflection** (`cap.self.count`/`cap.self.get`). Over a fixed 3-cap powerbox (Stream(Out)
+- [x] **§7 reflection** (`self.count`/`self.get`). Over a fixed 3-cap powerbox (Stream(Out)
   t0, Exit t1, host-fn t13): count → 3, and `get(i)` → (handle, type_id) for i=0..2, out-of-range →
   trap. wasm64 `run_reflect() == 3`.
 - [x] **§13 SharedRegion** (host-backed memory aliased into the window). A 64 KiB region mapped at
   two window offsets aliases the same backing — a store through one mapping reads back through the
   other (the magic-ring-buffer primitive); plus `len` (→ 65536). wasm64 `run_region() == 0x0123…cdef`.
 - [x] **§22 guest-JIT** (interpreted — no native backend). The guest holds a `Jit` cap (iface 11),
-  `install`s a host-compiled unit (`a*b+100`) into its dispatch table and `call_indirect`s it (→ 142);
+  `install`s a host-compiled unit (`a*b+100`) into its dispatch table and `call.dyn`s it (→ 142);
   `uninstall` then call → freed-slot trap. The **security validator** (`decode_module` → `verify_module`
   → memory-match / no-data / no-threads-futex preconditions) is a pure-Rust replica of temen-run's, so it
   runs in wasm with no Cranelift. Fibers in a unit are **admitted** (#845 — the §22 renegotiated
@@ -351,7 +351,7 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   `run_jit() == 142`.
 - [x] **§22 dynamic linking** (`compile_linked`). A separately-compiled unit's **named import**
   (`call.import "clock"`) is resolved by a guest-provided symbol table to a host capability (Clock,
-  iface 2) *before* verify — lowering it to a real `cap.call 2 0` — so a plugin reaches a host service
+  iface 2) *before* verify — lowering it to a real `call.cap 2 0` — so a plugin reaches a host service
   by name → 777; an empty table leaves the import unresolved and `compile_linked` fails closed. The
   symtab codec + resolution run in wasm (own minimal wire form). wasm64 `run_dynlink() == 777`.
 - [x] **Durability** (freeze / thaw, single-fiber, IR-driven). The `temen-durable` transform instruments
@@ -456,14 +456,14 @@ in session discussion; collected here so the next slice has a home to be picked 
   near-natively in the browser. Was the largest remaining browser project; **landed through all
   eight slices** of the plan below (§ "wasm-JIT tier"): emitter core, browser linking, mixed
   tiering, per-Worker threads tier-up, §22/§14 codegen, the long tail (scalar floats,
-  `call_indirect`, non-relaxed SIMD), the DOOM reactor with cap-call outlining, and single-shot
+  `call.dyn`, non-relaxed SIMD), the DOOM reactor with cap-call outlining, and single-shot
   module runs (Lua/SQLite). **The `temen-wasmjit` cross-engine bench row measures it** (next to
   `temen-bytecode-wasm`, same driver, same MISCOMPILE cross-check): **~16–112× over interp-in-wasm**,
   landing at or below native Cranelift `temen-jit` — the projected number, confirmed and cross-checked
   (`bench/cross-engine/README.md` § "TEMEN-in-wasm, the JIT tier"). The remaining loose ends are
-  itemized in the slice notes: cross-tier `call_indirect` (the trampoline), relaxed SIMD + scalar
+  itemized in the slice notes: cross-tier `call.dyn` (the trampoline), relaxed SIMD + scalar
   `Fma`, §22 Model B2 (`install` + shared-table funcrefs), guest-*compiled* units crossing Workers,
-  nested VM-in-VM on the emitted tier, and deopt (a genuine no-op until `cap.call` joins the
+  nested VM-in-VM on the emitted tier, and deopt (a genuine no-op until `call.cap` joins the
   emitted subset).
 
 ## wasm-JIT tier — design & implementation plan
@@ -488,7 +488,7 @@ The upper bound is that last row. Emitted-by-us wasm (dispatcher control flow, i
 checks) will plausibly sit 2–4× off clang quality at first, netting **~5–20× on hot compute** over
 today's interp-in-wasm, **~2–5× on pointer-chasing** (the TEMEN-mask + wasm-bounds double indirection
 is structural — every engine pays the memory hierarchy on `chase_rand`), and **~1× on
-`cap.call`/schedule-bound guests** (never in the interpreter's hot loop to begin with). Break-even
+`call.cap`/schedule-bound guests** (never in the interpreter's hot loop to begin with). Break-even
 logic carries over from the native tiers (JIT repays compile past ~10⁵–10⁶ iterations; bytecode cold
 is ~30 µs): the interp stays the always-there floor, the JIT is the opt-in tier at explicit compile
 points. Payoff is proportional to how compute-hot browser guests are — today's demos are
@@ -500,7 +500,7 @@ v86 JITs discovered x86 *machine code*: decode, self-modifying-code invalidation
 discovery. Temen has none of that. Code arrives as **complete, verified, immutable IR units at exactly
 three explicit points** — module load (`temen_par_compile`), §22 `jit_compile`/`install` (already
 literally the API for "compile this unit"), §14 `instantiate_module` — and uninstall is drop, never
-patch. And Temen IR is deliberately wasm-flavored (`i64.mul`, `br_if`, `call_indirect`, `v128`, typed
+patch. And Temen IR is deliberately wasm-flavored (`i64.mul`, `br_if`, `v128`, typed
 SSA blocks): the compute long tail translates ~1:1. What's left of v86's architecture is the easy
 80%: codegen at unit granularity, dispatch through a real funcref table, state in linear memory at
 suspension boundaries.
@@ -531,7 +531,7 @@ suspension boundaries.
   both.
 - **Suspension points end the compiled region.** wasm has no shipped stack switching, so
   `thread.join`/`memory.wait`/spawn/instantiate return to the vCPU event loop (state spilled at the
-  boundary), exactly v86's dispatch-loop shape. Note `cap.call` host I/O on the browser path is
+  boundary), exactly v86's dispatch-loop shape. Note `call.cap` host I/O on the browser path is
   **synchronous in-Rust** (the 4d shared powerbox) — it does *not* force a fallback, just a call.
 - **CSP footnote**: runtime wasm compilation needs `wasm-unsafe-eval` (or a permissive default) on
   the embedding page. Our pages are fine; document for embedders.
@@ -541,14 +541,14 @@ suspension boundaries.
 Three classes, all with existing precedent in this repo:
 
 1. **Control-plane ops are host calls — no analog needed.** `AddressSpace.map/unmap/protect`,
-   `SharedRegion.*`, `Instantiator.*`, freeze/thaw are `cap.call`s; JITted code hits the identical
+   `SharedRegion.*`, `Instantiator.*`, freeze/thaw are `call.cap`s; JITted code hits the identical
    host boundary the interp does. (`temen-mem`'s `Region` has no protection machinery at all — `unmap`
    is *re-zero*; there is no OS anywhere on the wasm path already.)
-2. **Data plane: the software MMU + deopt-on-`cap.call`.** The reference `Mem` already models §13
+2. **Data plane: the software MMU + deopt-on-`call.cap`.** The reference `Mem` already models §13
    aliasing/protection in software: `map_region` inserts `PageProt::Backed` page entries and flips
    `has_regions`; only from then on does the per-byte path consult the address space. Natively the
    Cranelift JIT uses hardware instead (`MprotectWindow`); wasm has none — but it has something
-   better: **every op that can break the flat-memory assumption is a `cap.call`, so the engine is
+   better: **every op that can break the flat-memory assumption is a `call.cap`, so the engine is
    standing at the host boundary at the exact moment it breaks**. The JIT tier compiles the pure
    fast path (mask+base, no page checks) and *deoptimizes that domain* (back to interp, or
    recompile with the checked slow path) when the guest maps a region or changes protection. v86
@@ -569,7 +569,7 @@ Three classes, all with existing precedent in this repo:
 |---|---|---|
 | masking / bounds | inline `and` + `add` | ~2 ops |
 | `AddressSpace` / `SharedRegion` / `Instantiator` ops | host call (already are) | none |
-| §13 aliasing, page protection | fast path + deopt on the `cap.call` that creates it | zero until used |
+| §13 aliasing, page protection | fast path + deopt on the `call.cap` that creates it | zero until used |
 | atomics orderings | wasm seq-cst (safe over-approx) | negligible |
 | fibers / suspend / durable unwind | interp fallback (`Unsupported`, temen-jit precedent) | n/a |
 | `gc.roots` | interp fallback (locals unscannable) | n/a |
@@ -647,7 +647,7 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    cell is sized by `temen_wasmjit_env_bytes` (fuel + cross-tier scratch). Proven in **Chromium** (the
    `#wasmjit` item now also runs a mixed guest: a JITted integer caller summing a float leaf,
    matching the interpreter) and by the Node `wasmjit.mjs` mixed case. **Deopt is a genuine no-op
-   until a later slice** brings `cap.call` into the JIT subset — an eligible guest can't call a
+   until a later slice** brings `call.cap` into the JIT subset — an eligible guest can't call a
    domain-mutating cap today (it's out-of-subset → the guest isn't eligible → it stays on the
    interpreter), so there is nothing to deopt yet; the analysis/fallback substrate is what landed.
 4. **[landed] Threads — per-Worker JIT tier-up.** A guest keeps running on the resumable
@@ -665,7 +665,7 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    (rooted at one entry, so it can't emit a leaf reachable only through `thread.spawn`), it emits
    **every** in-subset function whose calls all route — a monotone fixpoint starting from "every
    in-subset function", dropping any whose emitted body would carry an unroutable `Call` (a callee
-   that is neither emitted nor a cross-tier interp leaf), and dropping `call_indirect` users unless
+   that is neither emitted nor a cross-tier interp leaf), and dropping `call.dyn` users unless
    the whole module is in-subset. So the 4000 kernel's worker compute leaf (reachable only via
    spawn, its caller using atomics) still emits + tier-ups, while the concurrency orchestrator stays
    on the interpreter. Eligibility for the browser ABI additionally requires an **all-i64** signature
@@ -703,7 +703,7 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    `DataView` does the bit-cast); results marshal back the same way — so a unit need not be all-i64.
    The `#jitcodegen` proof runs **both** the i32 `service(a,b)=a*b+100` kernel the interpreter `#jit`
    item runs **and** an f64 `fservice(6.0,7.0)=142.0` kernel, each → 1136. **This
-   is Model A** (the unit is reached through the host, never installed in the shared `call_indirect`
+   is Model A** (the unit is reached through the host, never installed in the shared `call.dyn`
    table, so the Spectre-safe table mask never moves — DESIGN.md §22). Authority still resolves
    through the powerbox before the invoke surfaces (a forged/cross-domain handle traps identically).
    Proofs: `crates/temen/tests/vcpu_jit_codegen.rs` (the external-result seam on the resumable `Vcpu`,
@@ -722,7 +722,7 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    the happens-before), so the emitted code reads them. Each Worker emits its own copy of the granted
    unit from the shared recipe (`temen_par_enable_inst_codegen`, via `compile_module_tierup` — the
    per-instance-stash pattern), and only an entry whose function is in the emitter subset is eligible
-   (`temen_par_inst_eligible`); a child entry that uses a `cap.call` — a **nested** `instantiate`, an
+   (`temen_par_inst_eligible`); a child entry that uses a `call.cap` — a **nested** `instantiate`, an
    address-space op — is not in-subset, so it stays on the interpreter (fail-closed). Proofs: the Node
    twin `threads-spawn.mjs TEMEN_INST_CODEGEN=1` (8 confined children each run their unit —
    `mem[0] = "K" = 75` read from the carve — on emitted wasm → 600, = interp, non-vacuity-counted)
@@ -743,13 +743,13 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    emitted yet (interpreter-only invoke).
    **[landed — the browser wiring, single-Worker *and* cross-Worker]** A `Jit` grant (+ validator +
    emitter) lives in a shared `Mutex<Host>` (`ParJitCfg` / `temen_par_powerbox_jit_runtime`) that the root
-   vCPU dispatches its `cap.call`s through (`Vcpu::with_shared_host`), so the guest's runtime
-   `cap.call 11 0` mints **and** emits into that host and a later `invoke` resolves it; the JS host reads
+   vCPU dispatches its `call.cap`s through (`Vcpu::with_shared_host`), so the guest's runtime
+   `call.cap 11 0` mints **and** emits into that host and a later `invoke` resolves it; the JS host reads
    each unit's bytes (`temen_par_jit_code_wasm_ptr`/`_len`) and instantiates it once, keyed by the code
    handle. **That shared `Mutex<Host>` *is* the cross-Worker registry:** `temen_par_child` shares the same
    host, so a unit compiled on any Worker is invokable on another, its emitted bytes (in the shared
    host's heap = shared linear memory) read locally and instantiated per-Worker; concurrent runtime
-   `compile`s serialise on the `Mutex` (the same lock-per-`cap.call` the native parallel driver's
+   `compile`s serialise on the `Mutex` (the same lock-per-`call.cap` the native parallel driver's
    `HostCell::Shared` uses, DESIGN.md §22). Pinned natively by
    `bytecode_parallel_jit.rs::parallel_runtime_compile_invoke_is_sound` (8 worker vCPUs each
    runtime-compile their own unit on the shared host → schedule-independent 56 over 50 runs) +
@@ -795,15 +795,15 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    `b2_install.rs::b2_per_worker_mirror_is_consistent` (8 threads each build an independent domain from
    the same install map, all agreeing with the interpreter oracle). **End-to-end verified:** the CI-gated `jitb2` work item
    (`browser-test.mjs`) drives the whole story in real Chromium — 8 workers each runtime-compile a
-   leaf, `install` it into the shared table (raced slots), runtime-compile a `call_indirect`
+   leaf, `install` it into the shared table (raced slots), runtime-compile a `call.dyn`
    dispatcher, and invoke it: on the B2 tier the dispatch goes through each Worker's own table mirror
    (synced before every invoke) — interp ≡ B2 codegen ≡ 56 across 9 Workers. par.js's `jitRuntime`
    branch supplies the once-missing runtime-powerbox setup (publish + blob staging + recipe
    self-cleaning: `powerbox_none` first, the sticky B2 flag set explicitly both ways).
    **[landed — §14 VM-in-VM emitter mechanism + native differential]** A unit whose entry *uses* its
    `Instantiator` cap (spawns a nested confined VM + `join`s it) now emits, where before **any**
-   `cap.call` forced the whole entry onto the interpreter (`block_value_types` rejected it).
-   [`temen_wasm_jit::compile_module_nested`] lowers `cap.call 6` INSTANTIATOR `instantiate` (op 0) /
+   `call.cap` forced the whole entry onto the interpreter (`block_value_types` rejected it).
+   [`temen_wasm_jit::compile_module_nested`] lowers `call.cap 6` INSTANTIATOR `instantiate` (op 0) /
    `join` (op 1) to a host-driver bounce — `env.instantiate` / `env.join` imports, the
    funcref-table-free analog of `env.call_interp` — so the child vCPU spawn + join happen host-side,
    exactly as the interpreter surfaces `VcpuStop::Instantiate` to its driver; the emitted parent does
@@ -814,7 +814,7 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    actually fired).
    **[landed — §14 ADDRESS_SPACE `sub`/`page_size` via the one existing transport]** An entry that
    *carves its own window* (`sub`, iface 5 op 4) or queries `page_size` (op 3) also emits:
-   [`temen_wasm_jit::outline_nested_cap_calls`] hoists each such `cap.call` into an int-signature
+   [`temen_wasm_jit::outline_nested_cap_calls`] hoists each such `call.cap` into an int-signature
    wrapper leaf and `compile_module_nested` routes it through **`env.call_interp`** — no new imports
    or transport (the CONSOLIDATION.md §0 yardstick); the callback must carry the run's **powerbox**
    (the reactor-path contract), so `sub`'s minted handle encodes identically on both tiers. Pinned by
@@ -857,9 +857,9 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    differential kernels (arith/unary/compare, conversions, trapping trunc) over ±0/±1/±inf/NaN/
    subnormal bit patterns, compared **exactly** (NaN payloads + rounding) vs the bytecode oracle; and
    the cross-engine `fma` kernel now JITs (the frontend lowers it to mul+add) at ~2.7 ns, near native.
-   **`call_indirect` now in-subset:** the emitter lays an identity **funcref table** (slot `s` =
+   **`call.dyn` now in-subset:** the emitter lays an identity **funcref table** (slot `s` =
    function `s`, power-of-two length, trapping null padding — the interpreter's `DomainTable`) via a
-   wasm table + active element segment, and lowers `call_indirect` to a masked index (`idx &
+   wasm table + active element segment, and lowers `call.dyn` to a masked index (`idx &
    (table_size − 1)`, exactly `dispatch_indirect`'s `idx & (len − 1)`) + wasm's native
    `call_indirect`, whose built-in signature check **is** the §3c type-id check (a mismatch, or a
    null padding slot, traps `IndirectCallType` on both tiers). `ref.func` lowers to its `i32` index.
@@ -892,9 +892,9 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    (`play.js`, playground Phase 3) — so nothing remains for this slice.
 7. **[landed] Reactor (whole-`tick`-on-wasm) — DOOM in the playground.** The Doom demo runs its entire
    per-frame `tick()` on the emitted wasm tier (`temen_onramp_jit_*` FFI + `web/wasmjit-reactor.js`),
-   over the cdylib's shared window, with the ~24 genuine I/O helpers (`cap.call` display/timer,
-   `cap.self_resolve`) relaying through `env.call_interp` to the interpreter. Two increments closed the
-   last gaps: **(a)** `call_indirect` routes to *all* cross-tier functions, not just `ref.func`-taken
+   over the cdylib's shared window, with the ~24 genuine I/O helpers (`call.cap` display/timer,
+   `self.resolve`) relaying through `env.call_interp` to the interpreter. Two increments closed the
+   last gaps: **(a)** `call.dyn` routes to *all* cross-tier functions, not just `ref.func`-taken
    ones (DOOM's `states[]`/`mobjinfo[]` action pointers live in data segments — PR #314 / I-note),
    fixing a `~frame-174` trap; **(b)** the **bulk-memory lowering** (`memcpy`/`memset`/`memmove` →
    `memory.copy`/`memory.fill`, PR #314) dropped DOOM's reachable cross-tier functions **105 → 24**
@@ -902,19 +902,19 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    **Measured** (`bench_doom_throughput.mjs`, Chromium, warm): the emitted tick runs at **~370 ticks/s
    (mean ~2.7 ms/frame, p99 ~4 ms, <0.05% of frames over 16.7 ms)** — **4–6× above the 60 fps rAF
    cap**, so DOOM is **display/vsync-capped, not compute-bound**. Of a warm frame, ~2 cross-tier I/O
-   bounces cost ~1.2 ms (the display/timer `cap.call`s); the `present` blit itself is negligible
+   bounces cost ~1.2 ms (the display/timer `call.cap`s); the `present` blit itself is negligible
    (~1 µs). So the only remaining per-frame cost is the genuine host I/O — pure headroom while
    display-capped; trimming it (cached cap resolution) is a *future* lever, not a smoothness fix.
    Remaining for the slice: a playground toggle **(already present — the "wasm-JIT" checkbox in
    `play.js`; cap-call outlining below extends it to bounce/life/mandelzoom)**.
-   **Cap-call outlining — emit hot reactor ticks that make inline `cap.call`s.** DOOM emitted because
+   **Cap-call outlining — emit hot reactor ticks that make inline `call.cap`s.** DOOM emitted because
    its cap calls already live in helper functions; a simpler reactor whose `tick` makes an inline
-   `cap.call` did not. A `cap.call` is the
+   `call.cap` did not. A `call.cap` is the
    guest→host boundary (it dispatches into the powerbox, host-side), outside the emitter's compute
    subset, and emittability is decided per **whole function** — so a reactor whose `tick` interleaves
    compute with a once-per-frame `display.present` / `keyboard.poll` kept the *entire* function (its
    hot loop included) on the interpreter. **`temen_wasm_jit::outline_cap_calls`** (a JIT pre-pass run after `resolve_imports`,
-   before analyze/emit) hoists each inline `cap.call` into a synthetic single-block wrapper function
+   before analyze/emit) hoists each inline `call.cap` into a synthetic single-block wrapper function
    and rewrites the call site to a plain `Call`. The wrapper has an all-integer signature (a capability
    handle is `i32`, its op args/results `i64`), so it is a **cross-tier leaf** reached through the
    *existing* `env.call_interp` bridge — the function that held the cap call becomes pure compute + a
@@ -932,7 +932,7 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    by `crates/temen-wasm-jit/tests/outline_capcalls.rs` (the transform flips emittability and preserves
    interpreter semantics, and the rewritten module verifies) and the committed
    `browser/browser-jit-reactor-test.mjs` (each reactor guest renders byte-identically on both tiers in
-   real Chromium). *(This does **not** bring `cap.call` into the emitted subset — the note at slice 3's
+   real Chromium). *(This does **not** bring `call.cap` into the emitted subset — the note at slice 3's
    deopt still holds; it makes cap-call-bearing **functions** emittable by outlining the cap op.)*
 8. **[landed — capability] Single-shot module wasm-JIT (Lua/SQLite run-to-completion).** The
    run-to-completion twin of the reactor: a `.temen` module's whole program *is* func 0 (`_start`), so
@@ -1029,10 +1029,10 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    admit/parity pin, and the asset-gated real `jacl_compiler.temen` pump run.
 
    **#846 — linked units: the driver table + the live-state bounce.** Units now emit whole-module
-   in **Model B2** shape (`compile_module_b2`): their `call_indirect` dispatches through **one
+   in **Model B2** shape (`compile_module_b2`): their `call.dyn` dispatches through **one
    shared `WebAssembly.Table`** the driver populates from the engine's slot mirror at each event
    boundary — an installed unit's emitted `f0` (unit→unit, native), an eligible program function's
-   `f{i}` from the main emitted module (unit→program, native; `call_indirect`-bearing leaves are
+   `f{i}` from the main emitted module (unit→program, native; `call.dyn`-bearing leaves are
    excluded from TIERUP eligibility for the same table-consistency reason), and, for every
    interpreter-resident target, an engine-generated **bounce shim** (`emit_slot_trampoline` — the
    emitter's cross-tier trampoline packaged as a standalone module with the slot baked in). The
@@ -1051,8 +1051,8 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    never-bounced), and unit→unit through an install slot (pinned zero-bounce) — all observably
    identical to `onramp_exec`.
 
-   **#880 — `call_indirect` tiers up (the B2 main module).** The mixed-tier emit had *never*
-   admitted a `call_indirect`-bearing function (the local identity table is only safe when the
+   **#880 — `call.dyn` tiers up (the B2 main module).** The mixed-tier emit had *never*
+   admitted a `call.dyn`-bearing function (the local identity table is only safe when the
    whole module is in-subset — and a real `_start` never is), pinning every dispatch-loop function
    to the interpreter and running installed units' *bytecode* on the program→unit edge. The main
    module now emits over the **shared reserved table** too (`compile_module_tierup_b2` — the
@@ -1064,7 +1064,7 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    invoke-confined during a JIT_INVOKE (`run_invoke` parity), the **run-level** registry (parallel
    arrays mirrored) during a TIERUP region, so a fiber created inside a bounced callback persists
    for the run to resume later, exactly as the same call inline would. Differentials: a
-   `call_indirect`-bearing leaf tiering up with the indirect edge native; a leaf reaching an
+   `call.dyn`-bearing leaf tiering up with the indirect edge native; a leaf reaching an
    **install slot** natively (old→new emitted at last); a TIERUP-region bounce growing the window
    mid-region with stdout-ordering parity; and a fiber created inside a TIERUP bounce resumed
    later by `_start` (the run-registry persistence pin).
@@ -1080,7 +1080,7 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    `compile_module_reactor`'s Doom-perf contract — so `compile_module_tierup_b2` widens the
    cross-tier set from strict `interp_leaf` to the reactor's `cross` (any `marshallable_sig`
    non-in-subset function). An in-subset function that calls a memory/cap helper now stays emitted;
-   the helper bounces. Serving needed **no** change — direct (`Call`) and indirect (`call_indirect`)
+   the helper bounces. Serving needed **no** change — direct (`Call`) and indirect (`call.dyn`)
    cross-tier both emit `env.call_interp` and route to the same live bounce, already built by
    #846/#880. Measured jump (`compile_module_tierup_b2`, per-card emitted fraction): chibicc
    30%→**91%**, Lua 26%→**97%**, QuickJS 22%→**99%**, temen-leng 55%→**100%**. Local-mode and paged

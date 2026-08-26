@@ -103,7 +103,7 @@ const WASM_PAGE: u64 = 1 << 16;
 /// The standard **wasi-threads** spawn import — `(import "wasi" "thread-spawn" (func (param i32)
 /// (result i32)))` — which the host implements by starting a new thread over the shared memory and
 /// calling the `wasi_thread_start` export. Temen lowers it to the native `thread.spawn` (§12) instead of
-/// a `cap.call`: concurrency lives *in* the VM, not bolted onto the host (DESIGN §1a). Matches what
+/// a `call.cap`: concurrency lives *in* the VM, not bolted onto the host (DESIGN §1a). Matches what
 /// `wasmtime-wasi-threads` expects, so the same bytes run on both engines.
 const WASI_THREAD_MODULE: &str = "wasi";
 const WASI_THREAD_SPAWN_NAME: &str = "thread-spawn";
@@ -154,7 +154,7 @@ fn val_type(w: W) -> Result<ValType, Error> {
 
 /// The null reference sentinel (both `funcref` and `externref`). Matches the `0xFFFF_FFFF` the
 /// function table already uses for an empty slot, so a null `funcref` fed to `call_indirect` fails
-/// the §3c index/type check (≈ wasm's null-funcref trap), and a null `externref` fed to `cap.call`
+/// the §3c index/type check (≈ wasm's null-funcref trap), and a null `externref` fed to `call.cap`
 /// indexes no granted capability (a cap fault). `ref.is_null` is a compare against this.
 const REF_NULL: i32 = -1;
 
@@ -260,7 +260,7 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     // §3.5: manifest signatures live in the type section; intern each import's sig once.
     let mut manifest_types: Vec<temen_ir::TypeEntry> = Vec::new();
     // §12 wasm threads: the wasm function index of the `wasi:thread/spawn` import, if present. Its
-    // `call` lowers to `thread.spawn` (not a cap.call); see the spawn-shim synthesis.
+    // `call` lowers to `thread.spawn` (not a call.cap); see the spawn-shim synthesis.
     let mut spawn_import: Option<u32> = None;
     // The `(start $f)` function index, if the module has a start section: it runs once at
     // instantiation, before any export. Temen has no instantiation hook (a run calls one entry over a
@@ -324,7 +324,7 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                     };
                     // §12 wasm threads (wasi-threads): the `wasi:thread/spawn` import is special — it
                     // lowers to the native `thread.spawn` (a new vCPU over the shared window), **not** a
-                    // `cap.call`. It occupies a function-index slot like any import (so a placeholder
+                    // `call.cap`. It occupies a function-index slot like any import (so a placeholder
                     // keeps later indices aligned), but it is excluded from the capability-handle logic
                     // and the one-interface check below. See the spawn-shim synthesis after lowering.
                     if imp.module == WASI_THREAD_MODULE && imp.name == WASI_THREAD_SPAWN_NAME {
@@ -2378,14 +2378,14 @@ fn call_indirect_op(lo: &mut Lower, type_index: u32, table_index: u32) -> Result
 /// `return_call $f` (the tail-call proposal): a **block-terminating** direct call — the callee
 /// replaces the current frame and its results become this function's results. A defined `$f` lowers
 /// to the IR `Terminator::ReturnCall` (a true tail call, no stack growth). A capability import can't
-/// be a terminator, so a tail call to one degrades to `cap.call` + `return` (correct, not
+/// be a terminator, so a tail call to one degrades to `call.cap` + `return` (correct, not
 /// tail-optimized); a tail call to `wasi:thread/spawn` is nonsensical and rejected.
 fn return_call_op(lo: &mut Lower, func: u32, fn_results: &[ValType]) -> Result<(), Error> {
     if lo.threads.spawn_import == Some(func) {
         return unsup("return_call to wasi:thread/spawn");
     }
     if (func as usize) < lo.n_imp {
-        // Tail call to a capability import: do the cap.call, then return its results.
+        // Tail call to a capability import: do the call.cap, then return its results.
         call_op(lo, func)?;
         let n = fn_results.len();
         let args: Vec<ValIdx> = lo.stack[lo.stack.len() - n..]
@@ -3612,7 +3612,7 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
             lo.push(v, ValType::I32);
         }
         // `ref.func $f` → the function's §3c index (the IR function index). A funcref to an *import*
-        // has no IR index (imports lower to `cap.call`, not a defined function), so it is rejected —
+        // has no IR index (imports lower to `call.cap`, not a defined function), so it is rejected —
         // the same limit as a funcref element segment.
         O::RefFunc { function_index } => {
             let ir = function_index

@@ -18,7 +18,7 @@ use wasmdiff::{fuzz_one_wasm, Gen};
 
 /// The seed transform: distinct from `jit_fuzz`'s so the two generators explore different modules.
 fn seed_gen(seed: u64) -> Gen {
-    // `without_caps`: the wasm tier refuses `cap.call`/page-op modules (`Unsupported`), so suppressing
+    // `without_caps`: the wasm tier refuses `call.cap`/page-op modules (`Unsupported`), so suppressing
     // them (the Cranelift path grants a Memory cap and covers them) roughly doubles the fraction of
     // modules that actually reach the emitter instead of being skipped.
     Gen::from_seed(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x2A5D_C0DE_BEEF).without_caps()

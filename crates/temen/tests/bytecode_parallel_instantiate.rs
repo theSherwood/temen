@@ -40,7 +40,7 @@ block 2 (vi2: i64, vinst2: i32) {
   ventry = i64.const 1
   vslog = i64.const 12
   vquota = i64.const 0
-  vh = cap.call 6 0 (i64, i64, i64, i64) -> (i32) vinst2 (ventry, voff, vslog, vquota)
+  vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst2 (ventry, voff, vslog, vquota)
   v4 = i64.const 4
   vholo = i64.mul vi2 v4
   v16 = i64.const 16
@@ -66,7 +66,7 @@ block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v16b = i64.const 16
   vjoff = i64.add v16b vjlo
   vhh = i32.load vjoff
-  vr = cap.call 6 1 (i32) -> (i64) vinst5 (vhh)
+  vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)
   vsn = i64.add vs2 vr
   v1b = i64.const 1
   vjn = i64.add vj2 v1b
@@ -106,7 +106,7 @@ block 2 (vi2: i64, vinst2: i32) {
   ventry = i64.const 1
   vslog = i64.const 12
   vquota = i64.const 0
-  vh = cap.call 6 0 (i64, i64, i64, i64) -> (i32) vinst2 (ventry, voff, vslog, vquota)
+  vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst2 (ventry, voff, vslog, vquota)
   v4 = i64.const 4
   vholo = i64.mul vi2 v4
   v16 = i64.const 16
@@ -132,7 +132,7 @@ block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v16b = i64.const 16
   vjoff = i64.add v16b vjlo
   vhh = i32.load vjoff
-  vr = cap.call 6 1 (i32) -> (i64) vinst5 (vhh)
+  vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)
   vsn = i64.add vs2 vr
   v1b = i64.const 1
   vjn = i64.add vj2 v1b
@@ -164,8 +164,8 @@ block 0 (v0: i64) {
   i64.store q0a5 q0v1
   q0a6 = i64.const 1200
   i64.store q0a6 q0v1
-  vgh = cap.call 6 17 (i64) -> (i32) vinst (q0a0)
-  vgr = cap.call 6 1 (i32) -> (i64) vinst (vgh)
+  vgh = call.cap 6 17 (i64) -> (i32) vinst (q0a0)
+  vgr = call.cap 6 1 (i32) -> (i64) vinst (vgh)
   return vgr
   }
 }
@@ -296,7 +296,7 @@ block 2 (vi2: i64, vinst2: i32, vmod2: i64) {
   ventry = i64.const 0
   vslog = i64.const 12
   vquota = i64.const 0
-  vh = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) vinst2 (vmod2, ventry, voff, vslog, vquota)
+  vh = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) vinst2 (vmod2, ventry, voff, vslog, vquota)
   v4 = i64.const 4
   vholo = i64.mul vi2 v4
   v16 = i64.const 16
@@ -322,7 +322,7 @@ block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v16b = i64.const 16
   vjoff = i64.add v16b vjlo
   vhh = i32.load vjoff
-  vr = cap.call 6 1 (i32) -> (i64) vinst5 (vhh)
+  vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)
   vsn = i64.add vs2 vr
   v1b = i64.const 1
   vjn = i64.add vj2 v1b

@@ -1,5 +1,5 @@
 /* Probe for the **POSIX personality reached from the LLVM on-ramp** (temen-run's `posix::posix_cap`):
- * resolve the embedder-granted personality by name (`__vm_cap_resolve("posix")`, §7 cap.self.resolve)
+ * resolve the embedder-granted personality by name (`__vm_cap_resolve("posix")`, §7 self.resolve)
  * and drive the process/fd ABI through `__vm_host_call` (§7 host-defined capability) — the same idiom
  * `fs_probe.c` uses for the `fs` cap. Exercises the ops added for a real shell: `pipe`/`dup2` (the fd
  * surface), `posix_spawn`/`waitpid` (the fork-free process model, with fd inheritance), and `write`.

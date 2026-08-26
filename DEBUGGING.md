@@ -45,11 +45,11 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Interp↔JIT differential testing of concurrency | **Built** | `jit_fuzz.rs`, `concurrent_fuzz.rs`, `fiber_fuzz.rs` |
 | SSA promotion (the inspectability-tension source) | **Built** | §3d, frontend promote pass |
 | Fuel/quota metering *properties* | **Built** | `Host::set_quota`/`quota`, §15 |
-| `cap.call` I/O record log (`CapTape`) — input caps `Clock` + stdin `read` + **any host-fn** (slots **and** buffer writes); replayed for faithful `seek` | **Built — W1 slices 2, 5** | `temen-interp` `Host::record_caps` / `CapTape` / `RecordingMem` |
+| `call.cap` I/O record log (`CapTape`) — input caps `Clock` + stdin `read` + **any host-fn** (slots **and** buffer writes); replayed for faithful `seek` | **Built — W1 slices 2, 5** | `temen-interp` `Host::record_caps` / `CapTape` / `RecordingMem` |
 | Schedule record log (`SchedTape`) — capture a live interleaving as a replayable plan; seeded schedule fuzzing | **Built — W1 slice 4** (interp; SC ⇒ schedule *is* memory order) | `temen-interp` `Inspector::sched_tape` / `attach_scheduled_seeded` |
 | W7 model-check → replayable witness (find a failing interleaving, reproduce it) | **Built — slice 1** | `temen-interp` `find_schedule` / `replay_schedule` / `Witness` |
 | W1 time-travel — `seek(t)` / `step_back`: single-threaded (op `clock`) **and** multithreaded (global `turn`); faithful via `CapTape` | **Built — slices 1–3** | `temen-interp` `Inspector::seek` / `turn` / `step_back` |
-| Interpreter stepping / breakpoint / watchpoint / cap.call stop / backtrace / value+window read | **Built — slices 1–3** | `temen-interp` `Inspector` (single-threaded) |
+| Interpreter stepping / breakpoint / watchpoint / call.cap stop / backtrace / value+window read | **Built — slices 1–3** | `temen-interp` `Inspector` (single-threaded) |
 | Multithreaded debugging — fixed-schedule `thread.spawn` guest, per-thread breakpoints, replay a failing interleaving, inspect any thread (`select_task`), time-travel to a global turn | **Built — Milestone B slices 1–3** | `temen-interp` `Inspector::attach_scheduled` / `SchedDriver` |
 | Source-level debugging — chibicc `-g` → `debug.var` + `debug.loc` → named locals & `file:line` (interpreter `source_loc` nearest-preceding) | **Built — W4 slices 5–6** | `codegen_ir.c`, `temen-text`, `temen-interp` |
 | Backtrace *materialization* (unwind tables → frames) | **Built** — gdb-facing DWARF CFI (`.debug_frame`) + a host-side fiber-rooted walk of a *suspended* fiber (W5 JIT/DWARF Stage 4), **and** the always-on **trap-time** backtrace: a JIT trap (memory fault *or* explicit check) symbolizes its stack into `last_trap_backtrace()`, folded into the host kill message (W3 Stages 0–3, unix) | §5, `temen-jit` `trap_backtrace`/`fiber_backtrace`/`dwarf` |
@@ -640,7 +640,7 @@ so a failure — including a multithreaded one — can be re-run identically and
 
 **Current substrate.** Two halves of replay already exist and are tested:
 - *Capability boundary.* No ambient authority (§7): in single-vCPU/deterministic mode all
-  nondeterminism enters through `cap.call`. Logging those inputs/outputs is the whole recording
+  nondeterminism enters through `call.cap`. Logging those inputs/outputs is the whole recording
   surface for the sequential case — the boundary already exists; only the log does not.
 - *Schedule + memory order.* For true multicore, race outcomes bypass the cap boundary. But the
   DPOR explorer **already reifies exactly the choices replay needs** — `explore_all` runs each
@@ -651,7 +651,7 @@ so a failure — including a multithreaded one — can be re-run identically and
 
 **Design sketch.**
 1. **`CapTape`** — an append-only log of `(handle, iface, op, args-bytes, result-bytes,
-   logical-time)` records, written by the `cap.call` trampoline behind a host flag. Buffer args
+   logical-time)` records, written by the `call.cap` trampoline behind a host flag. Buffer args
    are borrow-only `(ptr,len)` today (D42); the tape snapshots the *bytes that crossed*, in both
    directions, so replay needs no live host. Strictly host-side ⇒ untrusted-for-escape (§2a).
 2. **`SchedTape`** — for concurrent runs, the ordered sequence of scheduling decisions at each
@@ -696,7 +696,7 @@ state (pc + live SSA values) so `backtrace`/`read_*` show the guest as it was; `
 args, fuel, memory, data) are kept as cheap-to-clone `Arc`s in a `SeekInit`, and a `seek_target`
 on `DebugCtx` fast-forwards a fresh re-run past breakpoints to `t`. This is **exact for a
 deterministic guest** (the common algorithmic-debugging case); the re-run uses a fresh empty
-powerbox, so a guest whose `cap.call`s carry real side effects or nondeterminism needs the
+powerbox, so a guest whose `call.cap`s carry real side effects or nondeterminism needs the
 `CapTape` (next slice) to seek faithfully. Tests (`debug.rs`): out-of-order `seek` restores the
 exact frame state recorded while stepping forward; `step_back` decrements the clock; `seek(0)` then
 resume reproduces the result; seek-past-end finishes.
@@ -1877,14 +1877,14 @@ Because the window is one contiguous buffer, a watch catches every code path wit
 instrumentation. Four more tests: stop-before-store then step-applies, read/write kind filtering,
 clear, and non-overlapping range. Workspace green, clippy clean.
 
-**Slice 3 — capability-using guests + the cap.call boundary stop.** `Inspector::attach_with_host`
+**Slice 3 — capability-using guests + the call.cap boundary stop.** `Inspector::attach_with_host`
 takes a caller-prepared `Host` (the powerbox): `grant_*` the capabilities, pass their handles in
 `args`, and debug a real capability-using guest (§3c/§3e). `host()` locks the (uncontended-while-
 paused) powerbox to read effects — captured stdout, clock, grants. `set_cap_call_stops(true)`
-pauses *before* every `cap.call` with `StopReason::CapCall { type_id, op }` (the handle/args are
+pauses *before* every `call.cap` with `StopReason::CapCall { type_id, op }` (the handle/args are
 live; `step` to perform it) — the §7 host boundary and the future W1 record/replay hook (S5). The
 module must be import-resolved (`temen_run::resolve_capability_imports`) per the new named-import
-model on `main`; the interpreter runs only concrete `cap.call`s. Three tests: end-to-end stdout
+model on `main`; the interpreter runs only concrete `call.cap`s. Three tests: end-to-end stdout
 capture, a boundary stop with the effect deferred until `step`, and the toggle defaulting off.
 
 **Slice 4 — W4 debug-info waist, neutral core (text).** The frontend-neutral waist (D-DBG-7/§6)

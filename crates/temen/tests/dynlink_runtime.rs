@@ -1,5 +1,5 @@
 //! Dynamic linking, end to end: a **plugin compiled at runtime** calls into the **host program**
-//! through the shared `call_indirect` table, with the callee resolved by **name** to its table slot.
+//! through the shared `call.dyn` table, with the callee resolved by **name** to its table slot.
 //!
 //! This is the genuinely *dynamic* case (vs. the static linker in `dynlink.rs`): the host is already
 //! compiled and running; the plugin is a *separately compiled* unit (the guest-JIT incremental path,
@@ -62,7 +62,7 @@ fn plugin_calls_host_program_by_resolved_slot() {
     assert_eq!(plugin.imports.len(), 1, "the plugin imports F by name");
 
     // The link step: the loader knows F lives at the host's table slot 0 and binds the plugin's
-    // import to it — `call.sym "F"` → `call_indirect 0`.
+    // import to it — `call.sym "F"` → `call.dyn 0`.
     let linked =
         temen_ir::resolve_imports_with(&plugin, |n| (n == "F").then_some(Resolved::Slot(0)))
             .expect("resolve plugin import to the host's slot");
@@ -83,7 +83,7 @@ fn plugin_calls_host_program_by_resolved_slot() {
 }
 
 /// The symbol-resolved companion to `jit_incremental::install_makes_unit_call_indirectable` (which
-/// proves the install *mechanism* — old code `call_indirect`s a runtime slot value into newly-
+/// proves the install *mechanism* — old code `call.dyn`s a runtime slot value into newly-
 /// installed code). Here a separately-compiled **client** references a **newly-installed service**
 /// purely **by name**: the loader installs the service (getting its table slot), resolves the
 /// client's import to that slot (`Resolved::Slot`), and the client — compiled afterwards — reaches
@@ -131,7 +131,7 @@ fn loaded_client_links_to_a_newly_installed_service_by_name() {
         .expect("install service");
 
     // The client references "service" by name; the loader binds it to the install slot, then compiles
-    // the client — which now `call_indirect`s the slot into the installed service.
+    // the client — which now `call.dyn`s the slot into the installed service.
     let client = parse_module(
         "func (i32, i32) -> (i32) {\n\
          block 0 (v0: i32, v1: i32) {\n\

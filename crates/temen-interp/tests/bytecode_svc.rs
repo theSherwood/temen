@@ -28,7 +28,7 @@ block 0 () {
   vseed = i64.const 7
   i64.store va vseed
   vz = i32.const 0
-  vn = cap.call 4294967295 9 () -> (i64) vz ()
+  vn = call.cap 4294967295 9 () -> (i64) vz ()
   vafter = i64.load va
   vk = i64.const 1000
   vm = i64.mul vn vk
@@ -62,7 +62,7 @@ block 0 () {
   vseed = i64.const 7
   i64.store va vseed
   vz = i32.const 0
-  vn = cap.call 4294967295 9 () -> (i64) vz ()
+  vn = call.cap 4294967295 9 () -> (i64) vz ()
   vafter = i64.load va
   vk = i64.const 1000
   vm = i64.mul vn vk
@@ -223,13 +223,13 @@ block 0 (v0: i32, v1: i32) {
   voff = i64.const 65536
   vlog = i64.const 12
   vq = i64.const 0
-  v5 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (vmh, ventry, voff, vlog, vq)
+  v5 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (vmh, ventry, voff, vlog, vq)
   v6 = i64.const 0
-  v7 = cap.call 6 14 (i32, i64) -> (i32) v0 (v5, v6)
+  v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)
   va = i64.const 40
   vb = i64.const 2
-  vr = cap.call 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
-  vj = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  vr = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
+  vj = call.cap 6 1 (i32) -> (i64) v0 (v5)
   vk = i64.const 100
   vm = i64.mul vj vk
   vs = i64.add vm vr
@@ -308,8 +308,8 @@ fn a_native_caller_parks_on_a_native_serving_child_and_wakes_with_the_reply() {
 #[test]
 fn a_native_svc_wait_with_queued_work_serves_and_returns() {
     let src = SERVER.replace(
-        "vn = cap.call 4294967295 9 () -> (i64) vz ()",
-        "vn = cap.call 4294967295 10 () -> (i64) vz ()",
+        "vn = call.cap 4294967295 9 () -> (i64) vz ()",
+        "vn = call.cap 4294967295 10 () -> (i64) vz ()",
     );
     let m = module(&src);
     assert!(

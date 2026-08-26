@@ -9,7 +9,7 @@
 //! dispatch/layout.
 //!
 //! Scope so far: scalar + memory + SIMD/`v128` + fences + direct & indirect calls; the synchronous
-//! capability seam (generic `cap.call` + `cap.self.*`, via `host.cap_dispatch_slots`); §12 **fibers**
+//! capability seam (generic `call.cap` + `self.*`, via `host.cap_dispatch_slots`); §12 **fibers**
 //! (`cont.*`/`suspend`, cooperative single-vCPU switching in [`step_vcpu`]); and §12 **threads**
 //! (`thread.spawn`/`join` + `memory.wait`/`notify`) on a cooperative single-threaded scheduler
 //! ([`drive`]) over one shared `Mem`; and §14 **coroutines** (`Instantiator.spawn_coroutine`/`resume`
@@ -19,12 +19,12 @@
 //! a confined child env with an attenuated `Instantiator`+`AddressSpace` powerbox and a `quota`
 //! sub-budget) — §14 is fully covered (ops 0–7). Faithful for the
 //! interleaving-invariant programs the oracle uses; and §22 **guest-driven JIT units**
-//! (`Jit.install`/`uninstall`/`invoke` + cross-module `call_indirect` into an installed unit) over a
+//! (`Jit.install`/`uninstall`/`invoke` + cross-module `call.dyn` into an installed unit) over a
 //! multi-module [`Domain`] (a runtime dispatch table spanning `mods`; `invoke` runs a unit nested
 //! over the shared window/table). Hot scalar/memory ops dispatch inline; the SIMD/`v128`/fence long
 //! tail is delegated to the reference [`super::eval_inst`]. Threads and fibers compose (the fiber
 //! registry is run-shared, so fibers migrate across vCPUs); and **tail calls** (`return_call`/
-//! `return_call_indirect`, reusing the current window — O(1) deep tail recursion); §GC **`gc.roots`**
+//! `return_call.dyn`, reusing the current window — O(1) deep tail recursion); §GC **`gc.roots`**
 //! (conservative root enumeration over the whole vCPU continuation — sound, not bit-identical, per
 //! GC.md §3.2); and **durability** freeze/thaw for single-fiber vCPUs (IR-driven by the `temen-durable`
 //! transform — the engine just runs the transformed module over a seeded window, via
@@ -300,7 +300,7 @@ enum Op {
         args: Box<[u32]>,
         dst: u32,
     },
-    /// `call_indirect` through module 0's natural function table (slot `i` ⇒ func `i`; padding to a
+    /// `call.dyn` through module 0's natural function table (slot `i` ⇒ func `i`; padding to a
     /// power of two traps). Resolved at run time from `idx` masked to the table length, then the
     /// resolved function's signature is checked against `want_params`/`want_results` (a forged or
     /// mistyped slot is an inert [`Trap::IndirectCallType`], matching [`super::dispatch_indirect`]).
@@ -326,11 +326,11 @@ enum Op {
         dst: u32,
         /// The call's `sig.params` — carried so an **import-bound** call that resolves to a §22 `Jit`
         /// driver op (`invoke`/`install`/`uninstall`) can be marshalled to the driver like a static
-        /// `cap.call (JIT, op)` (which lowers straight to [`Op::JitInvoke`]). Empty when unused.
+        /// `call.cap (JIT, op)` (which lowers straight to [`Op::JitInvoke`]). Empty when unused.
         params: Box<[ValType]>,
         results: Box<[ValType]>,
     },
-    /// §3.6 serve-loop core (ISSUES.md I36 slice 1): `svc.poll` (`cap.call CAP_SELF 9`) — drain
+    /// §3.6 serve-loop core (ISSUES.md I36 slice 1): `svc.poll` (`call.cap CAP_SELF 9`) — drain
     /// the domain's inbound queue, running each servable dispatch as a handler activation over
     /// the one world. Rewind-driven like the tree-walk serve arm: an admitted handler's return
     /// linkage re-enters THIS op (pc un-advanced) with its result in `dst` (the linkage's result
@@ -357,7 +357,7 @@ enum Op {
         /// The reply-value arg registers (0, 1, or 2), resolved to i64s in the driver.
         args: Box<[u32]>,
         dst: u32,
-        /// Whether the `cap.call` has a result slot (the twin handle / errno lands here).
+        /// Whether the `call.cap` has a result slot (the twin handle / errno lands here).
         has_result: bool,
     },
     /// FORK.md §9.2 — `reap` (self-op 12): the servicer side of `wait(pid)`. From within a serve
@@ -390,7 +390,7 @@ enum Op {
         entry: u32,
         /// The advisory `size_log2` register (the real bound is the caller's window).
         size_log2: u32,
-        /// The `cap.call` result slot — receives `-EINVAL` on a refused exec (a successful exec never
+        /// The `call.cap` result slot — receives `-EINVAL` on a refused exec (a successful exec never
         /// returns to this activation).
         dst: u32,
     },
@@ -404,11 +404,11 @@ enum Op {
         export: u32,
         dst: u32,
     },
-    // §7/§6 capability reflection `cap.self.count`/`get`/`resolve`/`label`/`attest` are no longer
-    // dedicated bytecode ops — they arrive as `cap.call CAP_SELF op 0/1/2/3/4` and compile to the
+    // §7/§6 capability reflection `self.count`/`get`/`resolve`/`label`/`attest` are no longer
+    // dedicated bytecode ops — they arrive as `call.cap CAP_SELF op 0/1/2/3/4` and compile to the
     // generic `Op::CapCall` (host `cap_dispatch_slots`), the same path the JIT thunk takes.
     /// §3.5 self-namespace extensions through the shared dispatch entry: `op` packs
-    /// `(selfop | idx << 8)` (6 = `cap.self.type_id`, 7 = `cap.self.covers`, 8 =
+    /// `(selfop | idx << 8)` (6 = `self.type_id`, 7 = `self.covers`, 8 =
     /// `export.handle`); `handle` is the optional live handle-register (covers only). One
     /// `i32` result.
     CapSelfExt {
@@ -554,7 +554,7 @@ enum Op {
     },
     /// §22 `Jit.invoke(code, args…)` (op 1): run the unit named by `code` synchronously over the
     /// shared window/powerbox; its results land at `dst…`. `params`/`results` are the unit entry's
-    /// expected signature (the `cap.call` sig minus the leading code-handle param), used to marshal
+    /// expected signature (the `call.cap` sig minus the leading code-handle param), used to marshal
     /// args/results through the i64-slot ABI.
     JitInvoke {
         handle: u32,
@@ -587,7 +587,7 @@ enum Op {
         callee: u32,
         args: Box<[u32]>,
     },
-    /// `return_call_indirect`: an indirect tail call — resolve through the runtime dispatch table
+    /// `return_call.dyn`: an indirect tail call — resolve through the runtime dispatch table
     /// (possibly cross-module), then reuse the current window like [`Op::TailCall`].
     TailCallIndirect {
         idx: u32,
@@ -629,7 +629,7 @@ enum Op {
 /// Marks a [`Program::src`] entry as a **terminator** op's location (OR-ed into the `inst` field).
 /// Two readers need terminators distinguished from instructions: [`Vm::cur_ir_pc`] (debug stepping)
 /// skips them, while [`vm_trap_bt`] (trap backtrace) *reports* them — a trap at a terminator
-/// (`unreachable`, `return_call_indirect`) is real and the tree-walker names it. The flag is the high
+/// (`unreachable`, `return_call.dyn`) is real and the tree-walker names it. The flag is the high
 /// bit, never set by a real block/inst count, so masking it off recovers the stored index.
 const SRC_TERM: u32 = 1 << 31;
 
@@ -652,7 +652,7 @@ struct Program {
 pub struct Compiled {
     progs: Vec<Program>,
     result_types: Vec<Vec<ValType>>,
-    /// Per-function `(params, results)` for `call_indirect` type-checking — the natural module-0
+    /// Per-function `(params, results)` for `call.dyn` type-checking — the natural module-0
     /// function table indexes these directly (slot `i` ⇒ func `i`).
     sigs: Vec<(Vec<ValType>, Vec<ValType>)>,
     /// `len - 1` of the natural table (`next_power_of_two(n_funcs)`), used to mask a `ref.func`/fiber
@@ -678,7 +678,7 @@ impl Compiled {
     }
 }
 
-/// THREADS.md 4c-domain — a domain's `call_indirect` dispatch table, **shareable + installable across
+/// THREADS.md 4c-domain — a domain's `call.dyn` dispatch table, **shareable + installable across
 /// parallel vCPUs** (mirrors the tree-walker's [`crate::DomainTable`]). Each slot packs `(module, func)`
 /// (`module<<32 | func`, [`super::pack_slot`]); `module == TABLE_EMPTY` is trapping padding. Dispatch is
 /// one `Acquire` load; `install` does a `Release` store, so a vCPU that observes a filled slot also
@@ -787,7 +787,7 @@ fn build_table(n_funcs: usize, table_log2: u8) -> SharedSlots {
 }
 
 /// A running domain (THREADS.md 4c-domain): its shared [`ModuleSource`] (`mods[0]` = primary, `k≥1` =
-/// installed §22 units / §14 child modules) plus its own [`SharedSlots`] `call_indirect` dispatch table.
+/// installed §22 units / §14 child modules) plus its own [`SharedSlots`] `call.dyn` dispatch table.
 /// Both parts are interior-mutable + thread-safe, so a **parallel** driver can share `&Domain` across
 /// vCPU threads and still `install`; the cooperative path is single-threaded (uncontended atomics/lock,
 /// so dispatch order — hence determinism — is unchanged). A §14 child / coroutine shares the root's
@@ -1610,7 +1610,7 @@ fn compile_inst(
             args: args.iter().map(|a| g(*a)).collect(),
             dst,
         },
-        // `call_indirect` through module 0's natural table — self-contained (no install/invoke),
+        // `call.dyn` through module 0's natural table — self-contained (no install/invoke),
         // so the compile-time signature table resolves it. Cross-module units (install/invoke) are
         // still a later slice; here every reachable slot is a module-0 function.
         Inst::CallIndirect { ty, idx, args } => Op::CallIndirect {
@@ -1714,7 +1714,7 @@ fn compile_inst(
                     code: g(args[0]),
                     args: args[1..].iter().map(|a| g(*a)).collect(),
                     dst,
-                    // The cap.call sig is `(i64 code, params…) -> (results…)`; the unit entry's
+                    // The call.cap sig is `(i64 code, params…) -> (results…)`; the unit entry's
                     // params are super::call_sig(types, *sig).params without the leading code-handle.
                     params: super::call_sig(types, *sig)
                         .params
@@ -1793,8 +1793,8 @@ fn compile_inst(
                 },
             }
         }
-        // §7/§6 reflection `cap.self.count`/`get`/`resolve`/`label`/`attest` reach here as their
-        // `cap.call CAP_SELF op 0/1/2/3/4` form and compile via the generic `Op::CapCall` fallthrough
+        // §7/§6 reflection `self.count`/`get`/`resolve`/`label`/`attest` reach here as their
+        // `call.cap CAP_SELF op 0/1/2/3/4` form and compile via the generic `Op::CapCall` fallthrough
         // in the `Inst::CapCall` arm above.
         // §12 fibers — cooperative continuation switching, driven by the bytecode driver (no M:N
         // pool, no DPOR; single-vCPU). `cont.new` registers a pending fiber, `cont.resume` switches
@@ -1860,7 +1860,7 @@ fn compile_inst(
         },
         // Cross-module / GC ops this slice doesn't drive (dispatch table / root scan) — fall back.
         // §GC conservative root enumeration — driven by the scheduler (it scans the whole vCPU
-        // continuation). `call.import` must already be resolved to a `cap.call`, so it never reaches
+        // continuation). `call.import` must already be resolved to a `call.cap`, so it never reaches
         // a backend (a leftover is a fall-back).
         Inst::GcRoots {
             heap_lo,
@@ -1993,14 +1993,14 @@ pub fn compile_and_run(
     args: &[Value],
     fuel: &mut u64,
 ) -> Option<Result<Vec<Value>, Trap>> {
-    // No capabilities granted: an empty powerbox (any `cap.call` is inert → `CapFault`), exactly
+    // No capabilities granted: an empty powerbox (any `call.cap` is inert → `CapFault`), exactly
     // like [`crate::run`], so this stays a faithful mirror for the equality harness.
     let mut host = Host::new();
     compile_and_run_with_host(m, func, args, fuel, &mut host)
 }
 
 /// Host-carrying [`compile_and_run`]: the powerbox is live, so synchronous capability calls
-/// (`cap.call` through the generic dispatch) execute against it. `None` if the module uses an op
+/// (`call.cap` through the generic dispatch) execute against it. `None` if the module uses an op
 /// outside this slice's subset (including the executor/fiber capability variants) — the caller
 /// (`crate::run_with_host_fast`) then falls back to the tree-walker.
 pub fn compile_and_run_with_host(
@@ -2015,7 +2015,7 @@ pub fn compile_and_run_with_host(
         return Some(Err(Trap::Malformed));
     }
     // #799/#1080 — install the personality fork/waitpid park-request door (the cooperative driver
-    // services `ParkEvent::ForkSelf`/`TaskExit` after a `cap.call`); without it the op answers `-ENOSYS`.
+    // services `ParkEvent::ForkSelf`/`TaskExit` after a `call.cap`); without it the op answers `-ENOSYS`.
     host.wire_park_door();
     // Size the dispatch table to the granted `Jit` table reservation (matching the tree-walker's
     // `DomainTable::new(funcs, jit_table_log2)`), so guest-driven `install` returns the same slots.
@@ -2105,7 +2105,7 @@ fn vm_trap_bt(vm: &Vm, source: &ModuleSource, trap: &Trap) -> Vec<super::IrPc> {
     if let Some((block, inst)) = c.progs[vm.cur].src.get(vm.pc).copied().flatten() {
         // An instruction's recorded `inst` advances past the op exactly when the tree-walker's did
         // (it does `inst += 1` before evaluating, so every trap but `OutOfFuel` lands one past); a
-        // terminator (`unreachable`, `return_call_indirect`) is already stored as `insts.len()`, the
+        // terminator (`unreachable`, `return_call.dyn`) is already stored as `insts.len()`, the
         // exact `inst` the tree-walker's frame carries there, and gets no bump.
         let inst = if inst & SRC_TERM != 0 {
             (inst & !SRC_TERM) as usize
@@ -2218,7 +2218,7 @@ pub fn compile_and_run_capture_over(
 
 /// Run `func(args)` over the caller-provided shared window `back` against a caller-prepared `host`,
 /// returning the typed results (`None` if the module is outside the engine's subset). Unlike
-/// [`compile_and_run_capture_over`] this carries a live `host` (so `cap.call`s execute) and — when
+/// [`compile_and_run_capture_over`] this carries a live `host` (so `call.cap`s execute) and — when
 /// `seed_data` is `false` — it does **not** re-seed or re-apply the module's data segments: the window
 /// in `back` is already live, so re-initialising would clobber the guest's globals/heap.
 ///
@@ -2394,7 +2394,7 @@ pub fn compile_and_run_capture_over_parallel(
 }
 
 /// Like [`compile_and_run_capture_over_parallel`], but runs over a **caller-prepared `host`** (the
-/// powerbox) shared by every parallel vCPU (THREADS.md 4c-host). A spawned vCPU's `cap.call` dispatches
+/// powerbox) shared by every parallel vCPU (THREADS.md 4c-host). A spawned vCPU's `call.cap` dispatches
 /// on the **same** host as the root, serialized per call by an internal lock — so host I/O from worker
 /// vCPUs works, with compute/atomics/futex still fully parallel. Determinism note: this is the **opt-in
 /// parallel** mode, so stateful-cap interleaving (e.g. `Clock.now` values, the order of distinct
@@ -2465,7 +2465,7 @@ impl VcpuProgram {
         Self::compile_with_jit_table(m, 0)
     }
 
-    /// Like [`compile`](VcpuProgram::compile), but reserve a `call_indirect` table of `2^table_log2`
+    /// Like [`compile`](VcpuProgram::compile), but reserve a `call.dyn` table of `2^table_log2`
     /// slots for §22 `Jit.install` — pass the **same** value the embedder gave `grant_jit_with_table`
     /// (the powerbox's [`Host::jit_table_log2`]), so guest-driven install lands at the same slots the
     /// cooperative oracle uses. `0` ⇒ natural size (no install room).
@@ -2553,7 +2553,7 @@ impl Reactor {
 /// The window lives in the caller-provided `back` [`Region`] (a `Region::shared` over the host's
 /// linear memory in the browser; a leaked buffer natively), sized to hold the guest's grown heap. The
 /// `Host` is shared (a `Mutex<Host>`) so its capabilities — `display`/`keyboard`/`fs`, stdout —
-/// persist across frames and are serviced inline during each frame's `cap.call`s.
+/// persist across frames and are serviced inline during each frame's `call.cap`s.
 pub struct VcpuReactor {
     prog: VcpuProgram,
     /// The live window, carried across per-frame vCPUs via [`Vcpu::take_mem`]. `None` only for a
@@ -2571,7 +2571,7 @@ pub struct VcpuReactor {
 impl VcpuReactor {
     /// Open over the persistent window `back`: compile `m`, then run `_start` (func 0) once over a
     /// freshly seeded + data-initialised window to bootstrap the guest, keeping the window live for
-    /// the per-frame [`frame`](VcpuReactor::frame) calls. `cap.call`s in `_start` (e.g. Doom's WAD
+    /// the per-frame [`frame`](VcpuReactor::frame) calls. `call.cap`s in `_start` (e.g. Doom's WAD
     /// read through `fs`) are serviced inline against `host`. `Err` if `m` is outside the engine's
     /// subset (`Malformed`) or `_start` traps.
     pub fn open(
@@ -2584,7 +2584,7 @@ impl VcpuReactor {
         let mem;
         {
             let mut vcpu = Vcpu::new_root(&prog, 0, start_args, back, &[])?.with_shared_host(host);
-            // `_start` runs to completion in one `run`: `cap.call`s are serviced inline (shared host),
+            // `_start` runs to completion in one `run`: `call.cap`s are serviced inline (shared host),
             // and a reactor is single-vCPU with no tier-up during open — so no spawn/join/wait/JIT/
             // tier-up event can occur (a `thread.spawn`ing guest is out of scope).
             match vcpu.run() {
@@ -2811,8 +2811,8 @@ enum PendingJit {
 /// [`Domain`], and — for a vCPU carrying a powerbox — the §14 domain ops (`spawn_coroutine_module`
 /// serviced internally; `instantiate`/`instantiate_module` surfacing [`VcpuEvent::Instantiate`], the
 /// child a [`Vcpu::new_confined_child`] on its own Worker). By default carries a deny-all `Host` (an
-/// I/O `cap.call` is an inert `CapFault`); attach the run's shared powerbox with
-/// [`with_shared_host`](Vcpu::with_shared_host) (THREADS.md 4d) and `cap.call` host I/O works from
+/// I/O `call.cap` is an inert `CapFault`); attach the run's shared powerbox with
+/// [`with_shared_host`](Vcpu::with_shared_host) (THREADS.md 4d) and `call.cap` host I/O works from
 /// every vCPU sharing it, serialized per call — `drive_parallel`'s 4c-host model.
 pub struct Vcpu<'p> {
     prog: &'p VcpuProgram,
@@ -2824,9 +2824,9 @@ pub struct Vcpu<'p> {
     fuel: u64,
     host: Host,
     /// The run's **shared powerbox** (THREADS.md 4d): when set (see
-    /// [`with_shared_host`](Vcpu::with_shared_host)), every host access — `cap.call` dispatch, §14
+    /// [`with_shared_host`](Vcpu::with_shared_host)), every host access — `call.cap` dispatch, §14
     /// module/authority resolution, an invoked §22 unit's calls — goes through this `Mutex<Host>`
-    /// instead of the owned `host`, exactly [`drive_parallel`]'s 4c-host model: each `cap.call` locks
+    /// instead of the owned `host`, exactly [`drive_parallel`]'s 4c-host model: each `call.cap` locks
     /// only for its own dispatch, so compute/atomics between calls stay lock-free, and host I/O
     /// (stream writes, clock) works from every vCPU of the run. `None` ⇒ the owned (default deny-all)
     /// host, as before.
@@ -2864,7 +2864,7 @@ pub struct Vcpu<'p> {
     /// slots — the caller's window base is the one the spill persisted).
     pending_tierup: Option<(usize, Box<[ValType]>)>,
     /// #1011 slice 3a: a **pre-built granted child powerbox** the resumable engine's op-13 arm hands to
-    /// the driver. When a `cap.call INSTANTIATOR 13` (with a grant list) surfaces [`VcpuEvent::Instantiate`],
+    /// the driver. When a `call.cap INSTANTIATOR 13` (with a grant list) surfaces [`VcpuEvent::Instantiate`],
     /// the engine has already re-granted the child's named caps (a shared `fs`) from *this* vCPU's own
     /// powerbox into a fresh `Host` (approach A, interpreter-side) and stashes it here; the driver takes
     /// it via [`take_granted_host`](Self::take_granted_host) and runs the child with
@@ -2899,7 +2899,7 @@ impl<'p> Vcpu<'p> {
     /// authority **in-Vm** during `resume`, so the grant must live in this vCPU's own host; with it,
     /// `spawn_coroutine_module` is then serviced entirely inside [`run`](Vcpu::run) (no host event).
     /// Grant only the non-I/O caps (`Instantiator`/`Module`) — the resumable path still has no host
-    /// I/O, so an I/O `cap.call` remains an inert `CapFault`.
+    /// I/O, so an I/O `call.cap` remains an inert `CapFault`.
     pub fn new_root_with_powerbox(
         prog: &'p VcpuProgram,
         func: u32,
@@ -3100,13 +3100,13 @@ impl<'p> Vcpu<'p> {
 
     /// Like [`new_confined_child`](Self::new_confined_child), but the caller may install **re-granted
     /// caps** into the child's powerbox before it runs — the §14 op-13 grant list (a shared `fs`, an
-    /// inherited `stdout`), reached by the child through `cap.self.resolve` (#1011 slice 3a). The
+    /// inherited `stdout`), reached by the child through `self.resolve` (#1011 slice 3a). The
     /// `install_grants` closure receives the freshly-built child `Host` (with its `Instantiator`+
     /// `AddressSpace` already granted) and, for each grant, calls the parent's
     /// [`Host::regrant_into_child`] + [`Host::register_cap_name`] — so the grant *policy* (which handles
     /// are `can_regrant`-eligible) stays with the caller (the interpreter's cap dispatch), and this
     /// constructor stays pure mechanism (INVARIANTS §4). A confined child so built still masks every
-    /// window access to its own carve (§2 unchanged) — a re-granted cap is a cross-tier `cap.call`, not
+    /// window access to its own carve (§2 unchanged) — a re-granted cap is a cross-tier `call.cap`, not
     /// a window access.
     pub fn new_confined_child_granted(
         prog: &'p VcpuProgram,
@@ -3240,7 +3240,7 @@ impl<'p> Vcpu<'p> {
     }
 
     /// Attach the run's **shared powerbox** (THREADS.md 4d — builder-style, on any constructor's
-    /// result): every host access of this vCPU then goes through `host` under its lock, so `cap.call`
+    /// result): every host access of this vCPU then goes through `host` under its lock, so `call.cap`
     /// (host I/O), §14 module/authority resolution, and invoked §22 units work from every vCPU of the
     /// run sharing it — the resumable counterpart of [`drive_parallel`]'s 4c-host shared `Mutex<Host>`.
     /// The embedder grants into the `Host` *before* the run (handle order is deterministic) and reads
@@ -3274,7 +3274,7 @@ impl<'p> Vcpu<'p> {
 
     /// The run's window memory-map introspection ([`MemMapInfo`]) — what a #750 page-checked
     /// driver rebuilds its byte-per-page state table from before each emitted call (page state is
-    /// frozen while emitted code runs: page ops are `cap.call`s, which are never emitted and never
+    /// frozen while emitted code runs: page ops are `call.cap`s, which are never emitted and never
     /// reachable through a cross-tier leaf). `None` for a memory-less module.
     pub fn mem_map_info(&self) -> Option<MemMapInfo> {
         self.mem.as_ref().map(|m| m.map_info())
@@ -3814,7 +3814,7 @@ impl<'p> Vcpu<'p> {
     /// `(name, handle)` (already `can_regrant`-gated by [`read_grant_list`](Self::read_grant_list)),
     /// call this vCPU's [`Host::regrant_into_child`] and install the child-side handle under its name
     /// (`register_cap_name`) — so the confined child resolves an inherited `fs`/`stdout` by name
-    /// (`cap.self.resolve`) with the same authority the tree-walker grants. Run **only after the spawn
+    /// (`self.resolve`) with the same authority the tree-walker grants. Run **only after the spawn
     /// commits** (the cooperative arm's ordering — a refused spawn mutates no host). The starter
     /// `Instantiator`+`AddressSpace` are added on top in
     /// [`new_confined_child_over_host`](Self::new_confined_child_over_host); this host carries only the
@@ -3881,7 +3881,7 @@ impl<'p> Vcpu<'p> {
 
     /// Deliver the resolved unit funcs for a `JitInstall` (the host resolved authority + code-handle):
     /// `Err` (forged / cross-domain / wrong-type handle) propagates as a trap; `Ok(funcs)` is compiled
-    /// and installed into the **shared** [`Domain`] (so every vCPU/Worker can `call_indirect` it), the
+    /// and installed into the **shared** [`Domain`] (so every vCPU/Worker can `call.dyn` it), the
     /// slot — or `-ENOSPC` if the table is full / `Malformed` if the unit is outside engine coverage —
     /// written to the awaiting dst.
     ///
@@ -3931,7 +3931,7 @@ impl<'p> Vcpu<'p> {
     ///
     /// Returns `Some(slot)` iff a slot was actually cleared, so a wasm-tier host can null the matching
     /// per-Worker `WebAssembly.Table` slot (the `deliver_jit_install` counterpart) — keeping each
-    /// Worker's mirror exact so a stale `call_indirect` traps.
+    /// Worker's mirror exact so a stale `call.dyn` traps.
     pub fn deliver_jit_uninstall(&mut self, authorized: Result<(), Trap>) -> Option<usize> {
         let Some(PendingJit::Uninstall { slot, dst }) = self.pending_jit.take() else {
             panic!("deliver_jit_uninstall with no pending uninstall");
@@ -3952,7 +3952,7 @@ impl<'p> Vcpu<'p> {
     /// Deliver the resolved unit funcs for a `JitInvoke`: `Err` propagates as a trap; `Ok(funcs)` is
     /// compiled, arity-checked against the call signature (`CapFault` on mismatch), then run
     /// synchronously over this vCPU's window — its results marshalled to the awaiting dst. The invoked
-    /// unit runs over this vCPU's (deny-all) powerbox, so a unit that itself makes a `cap.call` faults;
+    /// unit runs over this vCPU's (deny-all) powerbox, so a unit that itself makes a `call.cap` faults;
     /// a powerbox-backed unit is the orchestrator's responsibility (see [`Vcpu`]).
     pub fn deliver_jit_invoke(
         &mut self,
@@ -4000,7 +4000,7 @@ impl<'p> Vcpu<'p> {
         let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
         let umod = dom.source.push(unit);
         // The invoked unit runs over the run's powerbox — the shared one when attached (its
-        // `cap.call`s then serialize per-call like every other vCPU's, matching `drive_parallel`),
+        // `call.cap`s then serialize per-call like every other vCPU's, matching `drive_parallel`),
         // else this vCPU's owned (default deny-all) host.
         let mut cell = match self.shared_host {
             Some(m) => HostCell::Shared(m),
@@ -4051,7 +4051,7 @@ impl<'p> Vcpu<'p> {
     /// #846 slice 1 — service **one cross-tier bounce** out of an emitted §22 unit: the codegen host
     /// is mid-way through running a [`VcpuEvent::JitInvoke`] on emitted wasm (this vCPU is parked on
     /// the pending invoke), and the unit reached a call the emit routed to `env.call_interp` — a
-    /// trampoline'd `call_indirect` target or a cross-tier direct call. `target` resolves through
+    /// trampoline'd `call.dyn` target or a cross-tier direct call. `target` resolves through
     /// the **shared dispatch table** exactly as [`Op::CallIndirect`] does (the natural prefix maps a
     /// program function's index to itself; an installed unit sits at its install slot; empty padding
     /// is an `IndirectCallType` trap), and the resolved function runs on a nested interpretation
@@ -4212,7 +4212,7 @@ pub fn compile_and_run_capture_reserved_with_host(
     // Multi-vCPU durability (`thread.*`) is out of scope: a durable thread spawn needs the
     // multi-worker freeze the engine doesn't drive, so always refuse it (the caller falls back to the
     // tree-walker), lest it write a silently-wrong artifact. §14 **nesting** (`Instantiator`
-    // cap.calls) is likewise out of scope (DURABILITY.md §4): the tree-walker owns the durable
+    // call.cap calls) is likewise out of scope (DURABILITY.md §4): the tree-walker owns the durable
     // nesting rules — the freezable-module admission check, child durability inheritance, and the
     // fail-closed refusal of a freeze over a live-or-unjoined §14 child; this engine's own
     // instantiate arm has none of them, so driving a durable §14 module here would both skip the
@@ -5321,7 +5321,7 @@ impl DebugRun {
         DebugRun::new_with_host(m, func, args, Host::new())
     }
 
-    /// [`DebugRun::new`] carrying a live powerbox `host`, so synchronous `cap.call`s execute against it
+    /// [`DebugRun::new`] carrying a live powerbox `host`, so synchronous `call.cap`s execute against it
     /// — e.g. a §14 `Instantiator` grant (`host.grant_instantiator(..)`) reaching the guest as an
     /// argument, which makes `spawn_coroutine`/`resume`/`yield` debuggable. `None` if the module is
     /// outside the engine's subset.
@@ -7018,7 +7018,7 @@ fn dbg_jit_invoke_step_into(
 
 /// Advance the **active §22 invoked unit** (`vt.active_invoke`) by exactly one op — the op-by-op,
 /// debugger-facing counterpart of [`run_invoke`]'s loop. The unit runs over the caller's shared
-/// `mem`/`host`/`source`/`table` (a seam-free leaf), so its `call_indirect` reaches installed units and
+/// `mem`/`host`/`source`/`table` (a seam-free leaf), so its `call.dyn` reaches installed units and
 /// any spawn/park/yield/re-invoke is an inert `CapFault` — exactly `run_invoke`'s `_ => CapFault`, only
 /// surfaced one op at a time so a breakpoint can fire inside the unit. On the unit's return the caller's
 /// `dst…` slots are filled through the i64-slot ABI and control returns to the caller.
@@ -8171,7 +8171,7 @@ enum Outcome {
         handle: i32,
         dst: u32,
     },
-    /// §3.6 (I36 slice 2) — a caller's `cap.call` through a live-callee offer. The dispatch is
+    /// §3.6 (I36 slice 2) — a caller's `call.cap` through a live-callee offer. The dispatch is
     /// already enqueued on the callee (the op exec holds the callee `Arc`); the driver parks this
     /// task on `ticket` until the callee's serve loop settles the completion cell, then delivers
     /// the reply to `dst`. The cursor is persisted PAST the op (the reply is the call's result).
@@ -8435,7 +8435,7 @@ enum FiberState {
     /// cap parks remain — a pool completion is pending work, never a deadlock).
     CapParked {
         vm: Vm,
-        /// The `cap.call`'s result register in `vm`; the waking resume writes the scalar here.
+        /// The `call.cap`'s result register in `vm`; the waking resume writes the scalar here.
         dst: u32,
         /// The completion id this fiber waits on (ids are minted monotonically — submission
         /// order — so "smallest outstanding" is the delivery order).
@@ -8739,7 +8739,7 @@ fn gc_write(
 }
 
 /// Run an invoked §22 unit (`Jit.invoke`) synchronously: a fresh `Vm` for `module`'s entry (func 0)
-/// over the shared window/powerbox and the **shared** dispatch table (so the unit's `call_indirect`
+/// over the shared window/powerbox and the **shared** dispatch table (so the unit's `call.dyn`
 /// reaches installed units), to completion. An invoked unit is threads-/seam-free — spawning,
 /// event-parking, or re-installing `CapFault`s — but it **may host fibers** (DESIGN.md §22
 /// "Concurrency", renegotiated 2026-07-30): `cont.*`/`suspend` are serviced here against an
@@ -9091,7 +9091,7 @@ enum VcpuStop {
 
 /// How the eval loop reaches the powerbox (THREADS.md 4c-host). The cooperative `drive` owns the host
 /// exclusively (`&mut Host`); the **parallel** driver shares one `Arc<Mutex<Host>>` across vCPU threads
-/// and takes the lock only for the duration of a single `cap.call` — so compute/atomics/futex between
+/// and takes the lock only for the duration of a single `call.cap` — so compute/atomics/futex between
 /// calls stay lock-free (genuine parallelism), exactly the tree-walker's model. Determinism is *not*
 /// lost: cooperative is uncontended and dispatches in the same fixed order as before (the oracle);
 /// parallel is the opt-in mode whose stateful-cap interleaving races, as real threads do.
@@ -9313,7 +9313,7 @@ fn step_vcpu(
                     }
                     // F2 — a cap-parked fiber (blocked on its punt completion). Claimed by
                     // the drain above (`woken`), the resume delivers the scalar into the
-                    // `cap.call`'s result register and continues it (the resume `arg` is
+                    // `call.cap`'s result register and continues it (the resume `arg` is
                     // deliberately NOT delivered — the oracle's `LiveWoken`); still in
                     // flight, the resumer gets `(FIBER_PARKED, 0)` without a switch.
                     Some(slot @ FiberState::CapParked { .. }) => {
@@ -10437,13 +10437,13 @@ impl CoopSched {
                         .and_then(|cidx| tasks[cidx].env)
                         .map(|k| std::sync::Arc::clone(&extra_envs[k].host));
                     let cap = callee.and_then(|callee: std::sync::Arc<std::sync::Mutex<Host>>| {
-                        let sigs = callee.lock_unpoisoned().offer_shape(export)?;
+                        let (names, sigs) = callee.lock_unpoisoned().offer_shape(export)?;
                         match tasks[ti].env {
-                            None => host.wire_live_impl(&callee, export, &sigs).ok(),
+                            None => host.wire_live_impl(&callee, export, &names, &sigs).ok(),
                             Some(pk) => extra_envs[pk]
                                 .host
                                 .lock_unpoisoned()
-                                .wire_live_impl(&callee, export, &sigs)
+                                .wire_live_impl(&callee, export, &names, &sigs)
                                 .ok(),
                         }
                     });
@@ -10462,7 +10462,7 @@ impl CoopSched {
                     // parked on this handler's dispatch into a live **twin** (private window +
                     // duplicated powerbox, its own env), deliver `reply_twin` to the twin and
                     // `reply_orig` (pid mode: the twin's task id) to the original; both resume past the
-                    // same fork `cap.call`. Fail-closed to a single reply on any shape the driver can't
+                    // same fork `call.cap`. Fail-closed to a single reply on any shape the driver can't
                     // duplicate — never a hang, mirroring the oracle's degrade (temen-interp
                     // `fork_parked_caller`). `reap` (fork+wait) is a later slice — such modules fold.
                     let result: i64 = 'fork: {
@@ -11596,7 +11596,7 @@ impl CoopSched {
                             Some(slot) => {
                                 // #926 slice 2f: mirror `slot → code` so the browser B2 driver can
                                 // rebuild its `WebAssembly.Table` at the next event boundary (installs
-                                // only ever happen between host events — a unit with a `cap.call` never
+                                // only ever happen between host events — a unit with a `call.cap` never
                                 // emits, so the install itself always runs interpreted). Twin of the
                                 // single-shot pump's `slot_codes` recording; inert on the native drive.
                                 if let Some(e) = slot_codes.get_mut(slot) {
@@ -12456,7 +12456,7 @@ fn run_vcpu_parallel<'scope, 'env>(
             fuel: &mut fuel,
             mem: &mut mem,
             durable: false,
-            // The powerbox is **shared** by every vCPU of the run (4c-host): `cap.call` takes the lock
+            // The powerbox is **shared** by every vCPU of the run (4c-host): `call.cap` takes the lock
             // only for its own dispatch, so compute/atomics/futex between calls stay lock-free.
             host: HostCell::Shared(host),
         };
@@ -12681,7 +12681,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                     return (Err(Trap::CapFault), mem);
                 }
                 // Marshal args via the slot ABI, push the unit as a transient module, run it over the
-                // **shared** powerbox (its `cap.call`s serialize per-call, like every other vCPU's).
+                // **shared** powerbox (its `call.cap`s serialize per-call, like every other vCPU's).
                 let child_args: Vec<Value> = params
                     .iter()
                     .zip(argv.iter())
@@ -13119,7 +13119,7 @@ struct Vm {
     /// nslots)` per activation). Grows on demand as calls open deeper windows.
     regs: Vec<Reg>,
     /// Suspended caller activations: `(module, prog, base, resume pc, absolute first result slot)`.
-    /// `module` is carried so a cross-module `call_indirect` (into an installed §22 unit) returns to
+    /// `module` is carried so a cross-module `call.dyn` (into an installed §22 unit) returns to
     /// the caller's module.
     stack: Vec<(usize, usize, usize, usize, usize)>,
     /// The running activation's module (index into `Domain::mods`; 0 = primary), function index,
@@ -13889,7 +13889,7 @@ impl Vm {
                     }
                     // §22: an **import-bound** `Jit` driver op (`invoke`/`install`/`uninstall`) can't be
                     // serviced by the generic `cap_dispatch_slots` — it needs the scheduler-owning
-                    // driver, exactly like a *static* `cap.call (JIT, op)` (which lowers straight to
+                    // driver, exactly like a *static* `call.cap (JIT, op)` (which lowers straight to
                     // `Op::JitInvoke`). Resolve the binding and surface the same driver `Outcome`, so a
                     // self-hosted guest whose `__vm_jit_*` are lowered to `call.import` (temen-llvm) drives
                     // the Jit cap on the bytecode engine too (the pure-host `compile`/`compile_linked`
@@ -13997,10 +13997,10 @@ impl Vm {
                     // under `Host::set_stdin_blocking` yields here instead of completing. Do NOT write
                     // results or advance `pc`: persist state at *this* instruction so the driver, after
                     // pushing more input, re-issues the read on resume. Gated on the stream-read op so
-                    // no other cap.call pays the flag check.
+                    // no other call.cap pays the flag check.
                     // A `call.import` dispatch carries the `CAP_IMPORT_TYPE_ID` sentinel — read
                     // its bound `(type_id, op)` so an imported stdin `read` parks exactly like the
-                    // resolved `cap.call` form (IMPORTS.md phase 3).
+                    // resolved `call.cap` form (IMPORTS.md phase 3).
                     let (eff_tid, eff_op) = if *type_id == temen_ir::CAP_IMPORT_TYPE_ID {
                         host.with(|p| p.import_binding(*op))
                             .map(|b| (b.type_id, b.op))

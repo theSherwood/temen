@@ -34,7 +34,7 @@ fn durable_fiber_switch_routes_shadow_sp_per_context() {
         func (i32) -> (i64) {\n\
         block 0 (v0: i32) {\n\
         \x20 v1 = durable.shadow_base\n\
-        \x20 v2 = cap.call 13 0 (i64) -> (i64) v0 (v1)\n\
+        \x20 v2 = call.cap 13 0 (i64) -> (i64) v0 (v1)\n\
         \x20 v3 = ref.func 1\n\
         \x20 v4 = i64.const 4096\n\
         \x20 v5 = cont.new v3 v4\n\
@@ -44,7 +44,7 @@ fn durable_fiber_switch_routes_shadow_sp_per_context() {
         \x20 v10 = cont.new v3 v9\n\
         \x20 v11, v12 = cont.resume v10 v6\n\
         \x20 v13 = durable.shadow_base\n\
-        \x20 v14 = cap.call 13 0 (i64) -> (i64) v0 (v13)\n\
+        \x20 v14 = call.cap 13 0 (i64) -> (i64) v0 (v13)\n\
         \x20 return v2\n\
           }\n\
         }\n\
@@ -52,7 +52,7 @@ fn durable_fiber_switch_routes_shadow_sp_per_context() {
         block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = i32.wrap_i64 v1\n\
         \x20 v3 = durable.shadow_base\n\
-        \x20 v4 = cap.call 13 0 (i64) -> (i64) v2 (v3)\n\
+        \x20 v4 = call.cap 13 0 (i64) -> (i64) v2 (v3)\n\
         \x20 v5 = suspend v4\n\
         \x20 return v5\n\
           }\n\

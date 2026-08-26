@@ -94,20 +94,20 @@ fn assert_resume_at_point(oracle: &str, freezable: &str, expected: i64) {
     );
 }
 
-// Two leaf cap.calls. Oracle: v2 = clock(42), v3 = clock(43), v4 = v2 + v3 = 85.
+// Two leaf call.cap calls. Oracle: v2 = clock(42), v3 = clock(43), v4 = v2 + v3 = 85.
 const ORACLE_2: &str = r#"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
-  v3 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
+  v3 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v4 = i64.add v2 v3
   return v4
   }
 }
 "#;
 
-// Freeze at point 0: flip UNWINDING before the *first* cap.call. (`v_a`/`v_u` are the
+// Freeze at point 0: flip UNWINDING before the *first* call.cap. (`v_a`/`v_u` are the
 // state-word address and the UNWINDING constant.)
 const FREEZE_AT_0: &str = r#"
 func (i32) -> (i64) {
@@ -116,24 +116,24 @@ block 0 (v0: i32) {
   v_a = i64.const 0
   v_u = i32.const 1
   i32.store v_a v_u
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
-  v3 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
+  v3 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v4 = i64.add v2 v3
   return v4
   }
 }
 "#;
 
-// Freeze at point 1: the first cap.call runs NORMAL, then flip UNWINDING before the second.
+// Freeze at point 1: the first call.cap runs NORMAL, then flip UNWINDING before the second.
 const FREEZE_AT_1: &str = r#"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v_a = i64.const 0
   v_u = i32.const 1
   i32.store v_a v_u
-  v3 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v3 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v4 = i64.add v2 v3
   return v4
   }
@@ -153,15 +153,15 @@ fn resume_at_second_of_two_points() {
     assert_resume_at_point(ORACLE_2, FREEZE_AT_1, 85);
 }
 
-// Three leaf cap.calls, distinct weights so a misrouted arm shifts the total.
+// Three leaf call.cap calls, distinct weights so a misrouted arm shifts the total.
 // Oracle: clock 42,43,44 → 42 + 43*10 + 44*100 = 4872.
 const ORACLE_3: &str = r#"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
-  v3 = cap.call 2 0 (i32) -> (i64) v0 (v1)
-  v4 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
+  v3 = call.cap 2 0 (i32) -> (i64) v0 (v1)
+  v4 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v5 = i64.const 10
   v6 = i64.const 100
   v7 = i64.mul v3 v5
@@ -173,17 +173,17 @@ block 0 (v0: i32) {
 }
 "#;
 
-// Freeze at point 2 (the third cap.call): resume id 3, ARM_2.
+// Freeze at point 2 (the third call.cap): resume id 3, ARM_2.
 const FREEZE_AT_2: &str = r#"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
-  v3 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
+  v3 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v_a = i64.const 0
   v_u = i32.const 1
   i32.store v_a v_u
-  v4 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v4 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v5 = i64.const 10
   v6 = i64.const 100
   v7 = i64.mul v3 v5
@@ -216,7 +216,7 @@ block 0 (v0: i32) {
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 1000
   v4 = i64.add v2 v3
   return v4
@@ -225,7 +225,7 @@ block 0 (v0: i32) {
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 1
   v4 = i64.add v2 v3
   return v4
@@ -249,7 +249,7 @@ block 0 (v0: i32) {
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 1000
   v4 = i64.add v2 v3
   return v4
@@ -258,7 +258,7 @@ block 0 (v0: i32) {
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 1
   v4 = i64.add v2 v3
   return v4

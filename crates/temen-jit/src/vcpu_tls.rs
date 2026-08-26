@@ -22,7 +22,7 @@ pub(crate) fn seed(v: i64) {
 }
 
 /// `vcpu.tls.get` thunk — the current vCPU's TLS word. A pure thread-local read; it cannot fault, so
-/// it takes no window/trap context (unlike the `cap.call`/`gc.roots` thunks).
+/// it takes no window/trap context (unlike the `call.cap`/`gc.roots` thunks).
 pub(crate) extern "C" fn get() -> i64 {
     VCPU_TLS.with(|c| c.get())
 }
