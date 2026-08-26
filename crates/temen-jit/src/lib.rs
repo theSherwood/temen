@@ -473,10 +473,10 @@ pub struct FrozenNested {
 pub const DURABLE_SNAPSHOT_PAGE: usize = 4096;
 
 /// Window offset of durable shadow **context 0** (the root vCPU's region base) — an *empty* shadow-SP
-/// extent. Must match `temen-interp`'s / `fiber_rt`'s `SHADOW_BASE`; duplicated here (not under
-/// `cfg(fiber_rt)`) for the durable run-state defaults. The cross-backend artifact-equality property
-/// catches any drift.
-const DURABLE_SHADOW_BASE: u64 = 64;
+/// extent. Derived from `temen_ir::durable_abi::SHADOW_BASE` (the shared durable-runtime ABI, relocated
+/// above the #1094 NULL guard) so this never drifts from `temen-interp`/`fiber_rt`. The cross-backend
+/// artifact-equality property also catches drift.
+const DURABLE_SHADOW_BASE: u64 = temen_ir::durable_abi::SHADOW_BASE;
 
 /// The trap kinds the JIT can raise (a subset of the interpreter's `Trap`), numbered to
 /// match the codes the lowered checks / the host thunk store into the trap cell.
@@ -1352,12 +1352,16 @@ impl FreezeController {
                 0 => std::hint::spin_loop(), // window not mapped yet
                 usize::MAX => return,        // run ended before the request landed
                 base => {
-                    // STATE_OFF = 0, STATE_UNWINDING = 1 (must match `temen-interp`/`temen-durable`). An
-                    // aligned atomic i32 store the guest's back-edge poll loads (defined under §12
-                    // races); release-ordered after the run's acquire-published base.
-                    // SAFETY: per the lifetime contract the window at `base` is mapped here (the run
-                    // is blocked in its non-terminating loop until this store lands).
-                    unsafe { (*(base as *const AtomicI32)).store(1, Ordering::Release) };
+                    // The durable state word lives at `base + STATE_OFF` (STATE_OFF relocated above the
+                    // #1094 NULL guard — `base` is the window base, and `[0, guard)` is now unmapped, so a
+                    // store at `base + 0` would fault). STATE_UNWINDING = 1 (must match
+                    // `temen-interp`/`temen-durable`). An aligned atomic i32 store the guest's back-edge
+                    // poll loads (defined under §12 races); release-ordered after the acquire-published base.
+                    // SAFETY: per the lifetime contract the window at `base` is mapped here (the run is
+                    // blocked in its non-terminating loop until this store lands), and `base + STATE_OFF`
+                    // is in the committed RW durable control region.
+                    let state = base + temen_ir::durable_abi::STATE_OFF as usize;
+                    unsafe { (*(state as *const AtomicI32)).store(1, Ordering::Release) };
                     return;
                 }
             }
