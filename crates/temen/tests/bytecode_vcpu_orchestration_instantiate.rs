@@ -47,7 +47,7 @@ block 2 (vi2: i64, vinst2: i32) {
   vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst2 (ventry, voff, vslog, vquota)
   v4 = i64.const 4
   vholo = i64.mul vi2 v4
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vhoff = i64.add v16 vholo
   i32.store vhoff vh
   v1 = i64.const 1
@@ -67,7 +67,7 @@ block 4 (vj: i64, vs: i64, vinst4: i32) {
 block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v4b = i64.const 4
   vjlo = i64.mul vj2 v4b
-  v16b = i64.const 16
+  v16b = i64.const 16400
   vjoff = i64.add v16b vjlo
   vhh = i32.load vjoff
   vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)
@@ -89,8 +89,12 @@ block 0 (v0: i64) {
 "#;
 
 /// Same fan-out, but each child (handed its own `Instantiator`) itself instantiates a grandchild
-/// (func 2) in a 1 KiB sub-window of its own window — the host services the child's `Instantiate`
-/// event with the same arm, its carve relative to the child's window. 8 × grandchild(9) = 72.
+/// (func 2) in a 1 KiB sub-window at child offset 16384 (above the #1094 NULL guard) — the host
+/// services the child's `Instantiate` event with the same arm, its carve relative to the child's
+/// window. #1094: the cooperative driver validates a nested carve's base against the root guard, so a
+/// grandchild carve must clear it; each child is a 32 KiB window (room for a grandchild above the
+/// guard), and three such children fit the 128 KiB root → 3 × grandchild(24) = 72 (the value the
+/// 8 × grandchild(9) layout produced).
 const NESTED: &str = r#"memory 17
 func (i32) -> (i64) {
 block 0 (v0: i32) {
@@ -98,22 +102,22 @@ block 0 (v0: i32) {
   br 1(vi0, v0)
 }
 block 1 (vi: i64, vinst: i32) {
-  vn = i64.const 8
+  vn = i64.const 3
   vlt = i64.lt_u vi vn
   br_if vlt 2(vi, vinst) 3(vinst)
 }
 block 2 (vi2: i64, vinst2: i32) {
-  v4096 = i64.const 4096
+  v4096 = i64.const 32768
   vofflo = i64.mul vi2 v4096
-  v64k = i64.const 65536
+  v64k = i64.const 32768
   voff = i64.add v64k vofflo
   ventry = i64.const 1
-  vslog = i64.const 12
+  vslog = i64.const 15
   vquota = i64.const 0
   vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst2 (ventry, voff, vslog, vquota)
   v4 = i64.const 4
   vholo = i64.mul vi2 v4
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vhoff = i64.add v16 vholo
   i32.store vhoff vh
   v1 = i64.const 1
@@ -126,14 +130,14 @@ block 3 (vinst3: i32) {
   br 4(vj0, vs0, vinst3)
 }
 block 4 (vj: i64, vs: i64, vinst4: i32) {
-  vn2 = i64.const 8
+  vn2 = i64.const 3
   vlt2 = i64.lt_u vj vn2
   br_if vlt2 5(vj, vs, vinst4) 6(vs)
 }
 block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v4b = i64.const 4
   vjlo = i64.mul vj2 v4b
-  v16b = i64.const 16
+  v16b = i64.const 16400
   vjoff = i64.add v16b vjlo
   vhh = i32.load vjoff
   vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)
@@ -149,15 +153,16 @@ block 6 (vs3: i64) {
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vinst = i32.wrap_i64 v0
-  ; spawn via record (op 17): entry=2 off=0 sl=10 quota=0
+  ; spawn via record (op 17): entry=2 off=16384 sl=10 quota=0
   q0v0 = i64.const 8589934592
   q0v1 = i64.const 0
+  q0voff = i64.const 16384
   q0v2 = i64.const -4294967286
   q0v3 = i64.const 4294967295
   q0a0 = i64.const 1152
   i64.store q0a0 q0v0
   q0a1 = i64.const 1160
-  i64.store q0a1 q0v1
+  i64.store q0a1 q0voff
   q0a2 = i64.const 1168
   i64.store q0a2 q0v2
   q0a3 = i64.const 1176
@@ -175,7 +180,7 @@ block 0 (v0: i64) {
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v1 = i64.const 9
+  v1 = i64.const 24
   return v1
   }
 }
@@ -220,7 +225,7 @@ block 2 (vi2: i64, vinst2: i32, vmod2: i64) {
   vh = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) vinst2 (vmod2, ventry, voff, vslog, vquota)
   v4 = i64.const 4
   vholo = i64.mul vi2 v4
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vhoff = i64.add v16 vholo
   i32.store vhoff vh
   v1 = i64.const 1
@@ -240,7 +245,7 @@ block 4 (vj: i64, vs: i64, vinst4: i32) {
 block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v4b = i64.const 4
   vjlo = i64.mul vj2 v4b
-  v16b = i64.const 16
+  v16b = i64.const 16400
   vjoff = i64.add v16b vjlo
   vhh = i32.load vjoff
   vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)
@@ -424,7 +429,7 @@ fn orchestrated_instantiate_nested_matches_oracle() {
     assert_eq!(
         want,
         Ok(vec![Value::I64(72)]),
-        "oracle: 8 × grandchild(9) = 72"
+        "oracle: 3 × grandchild(24) = 72"
     );
     for i in 0..25 {
         assert_eq!(

@@ -51,19 +51,19 @@ block 0 (v0: i32) {
   q0v2 = i64.const -4294967284
   q0v3 = i64.const 4294967295
   q0v4 = i64.const 0
-  q0a0 = i64.const 1152
+  q0a0 = i64.const 17536
   i64.store q0a0 q0v0
-  q0a1 = i64.const 1160
+  q0a1 = i64.const 17544
   i64.store q0a1 q0v1
-  q0a2 = i64.const 1168
+  q0a2 = i64.const 17552
   i64.store q0a2 q0v2
-  q0a3 = i64.const 1176
+  q0a3 = i64.const 17560
   i64.store q0a3 q0v3
-  q0a4 = i64.const 1184
+  q0a4 = i64.const 17568
   i64.store q0a4 q0v4
-  q0a5 = i64.const 1192
+  q0a5 = i64.const 17576
   i64.store q0a5 q0v4
-  q0a6 = i64.const 1200
+  q0a6 = i64.const 17584
   i64.store q0a6 q0v4
   v5 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
@@ -94,29 +94,31 @@ fn instantiate_join_shares_backing() {
 
 /// Depth-2 VM-in-VM (from `instantiator.rs`): the child, handed an `Instantiator` over *its* window,
 /// itself instantiates a grandchild — confinement composes. The grandchild returns 77, propagated up
-/// through two joins.
+/// through two joins. #1094: the child is a 32 KiB window and the grandchild carves at child offset
+/// 16384 (above the NULL guard) — the cooperative driver checks a nested carve's base against the
+/// root guard, so a grandchild carve must clear it.
 const DEPTH_TWO: &str = r#"memory 17
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  ; spawn via record (op 17): entry=1 off=65536 sl=12 quota=0
+  ; spawn via record (op 17): entry=1 off=65536 sl=15 quota=0
   q1v0 = i64.const 4294967296
   q1v1 = i64.const 65536
-  q1v2 = i64.const -4294967284
+  q1v2 = i64.const -4294967281
   q1v3 = i64.const 4294967295
   q1v4 = i64.const 0
-  q1a0 = i64.const 1216
+  q1a0 = i64.const 17600
   i64.store q1a0 q1v0
-  q1a1 = i64.const 1224
+  q1a1 = i64.const 17608
   i64.store q1a1 q1v1
-  q1a2 = i64.const 1232
+  q1a2 = i64.const 17616
   i64.store q1a2 q1v2
-  q1a3 = i64.const 1240
+  q1a3 = i64.const 17624
   i64.store q1a3 q1v3
-  q1a4 = i64.const 1248
+  q1a4 = i64.const 17632
   i64.store q1a4 q1v4
-  q1a5 = i64.const 1256
+  q1a5 = i64.const 17640
   i64.store q1a5 q1v4
-  q1a6 = i64.const 1264
+  q1a6 = i64.const 17648
   i64.store q1a6 q1v4
   v5 = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
   v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
@@ -129,9 +131,9 @@ block 0 (v0: i64) {
   v2 = i64.const 0
   v3 = i32.const 171
   i32.store8 v2 v3
-  ; spawn via record (op 17): entry=2 off=2048 sl=10 quota=0
+  ; spawn via record (op 17): entry=2 off=16384 sl=10 quota=0
   q2v0 = i64.const 8589934592
-  q2v1 = i64.const 2048
+  q2v1 = i64.const 16384
   q2v2 = i64.const -4294967286
   q2v3 = i64.const 4294967295
   q2v4 = i64.const 0
@@ -182,19 +184,19 @@ block 0 (v0: i32) {
   q3v2 = i64.const -4294967280
   q3v3 = i64.const 4294967295
   q3v4 = i64.const 0
-  q3a0 = i64.const 1344
+  q3a0 = i64.const 17728
   i64.store q3a0 q3v0
-  q3a1 = i64.const 1352
+  q3a1 = i64.const 17736
   i64.store q3a1 q3v1
-  q3a2 = i64.const 1360
+  q3a2 = i64.const 17744
   i64.store q3a2 q3v2
-  q3a3 = i64.const 1368
+  q3a3 = i64.const 17752
   i64.store q3a3 q3v3
-  q3a4 = i64.const 1376
+  q3a4 = i64.const 17760
   i64.store q3a4 q3v4
-  q3a5 = i64.const 1384
+  q3a5 = i64.const 17768
   i64.store q3a5 q3v4
-  q3a6 = i64.const 1392
+  q3a6 = i64.const 17776
   i64.store q3a6 q3v4
   v5 = call.cap 6 17 (i64) -> (i32) v0 (q3a0)
   v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
@@ -228,19 +230,19 @@ block 0 (v0: i32) {
   q4v2 = i64.const -4294967284
   q4v3 = i64.const 4294967295
   q4v4 = i64.const 0
-  q4a0 = i64.const 1408
+  q4a0 = i64.const 17792
   i64.store q4a0 q4v0
-  q4a1 = i64.const 1416
+  q4a1 = i64.const 17800
   i64.store q4a1 q4v1
-  q4a2 = i64.const 1424
+  q4a2 = i64.const 17808
   i64.store q4a2 q4v2
-  q4a3 = i64.const 1432
+  q4a3 = i64.const 17816
   i64.store q4a3 q4v3
-  q4a4 = i64.const 1440
+  q4a4 = i64.const 17824
   i64.store q4a4 q4v4
-  q4a5 = i64.const 1448
+  q4a5 = i64.const 17832
   i64.store q4a5 q4v4
-  q4a6 = i64.const 1456
+  q4a6 = i64.const 17840
   i64.store q4a6 q4v4
   v5 = call.cap 6 17 (i64) -> (i32) v0 (q4a0)
   v6 = i64.extend_i32_s v5
@@ -270,19 +272,19 @@ block 0 (v0: i32) {
   q5v1 = i64.const 0
   q5v2 = i64.const -4294967284
   q5v3 = i64.const 4294967295
-  q5a0 = i64.const 4416
+  q5a0 = i64.const 20800
   i64.store q5a0 q5v0
-  q5a1 = i64.const 4424
+  q5a1 = i64.const 20808
   i64.store q5a1 q5v1
-  q5a2 = i64.const 4432
+  q5a2 = i64.const 20816
   i64.store q5a2 q5v2
-  q5a3 = i64.const 4440
+  q5a3 = i64.const 20824
   i64.store q5a3 q5v3
-  q5a4 = i64.const 4448
+  q5a4 = i64.const 20832
   i64.store q5a4 q5v1
-  q5a5 = i64.const 4456
+  q5a5 = i64.const 20840
   i64.store q5a5 q5v1
-  q5a6 = i64.const 4464
+  q5a6 = i64.const 20848
   i64.store q5a6 q5v1
   v5 = call.cap 6 17 (i64) -> (i32) v0 (q5a0)
   v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
@@ -300,3 +302,4 @@ block 0 (v0: i64) {
 fn child_trap_propagates_through_join() {
     check(CHILD_TRAP, Err(()));
 }
+
