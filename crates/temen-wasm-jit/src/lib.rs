@@ -758,13 +758,15 @@ fn vextadd_sub(shape: VShape, signed: bool) -> Option<u32> {
 /// Only the v1 subset is typed; anything else is `Unsupported` (fail-closed — the module was
 /// verified, so no `unwrap` here can be reached by a malformed operand index).
 /// The §14 capability ops the wasm tier lowers to a **host-driver bounce** (instead of failing
-/// out-of-subset): INSTANTIATOR (iface 6) `instantiate` (op 0) and `join` (op 1) — the VM-in-VM
-/// primitive (`DESIGN.md` §14; `temen_ir::cap_id::INSTANTIATOR`). The child
-/// vCPU spawn/join happens host-side (as the interpreter surfaces `VcpuStop::Instantiate`), so the
-/// emitted code just marshals the args to an `env.instantiate`/`env.join` import. Other §14 ops
-/// (address-space, coroutines) are not lowered yet — they stay out-of-subset (fail-closed).
+/// out-of-subset): INSTANTIATOR (iface 6) `instantiate` (op 0), `join` (op 1), the separate-module
+/// `instantiate_module_named` (op 13, #1123), and the config-record `instantiate_rec` (op 17) — the
+/// VM-in-VM primitive (`DESIGN.md` §14; `temen_ir::cap_id::INSTANTIATOR`). The child vCPU spawn/join
+/// happens host-side (as the interpreter surfaces `VcpuStop::Instantiate`), so the emitted code just
+/// marshals the args to an `env.instantiate`/`env.instantiate_module`/`env.instantiate_rec`/`env.join`
+/// import. Other §14 ops (address-space, coroutines) are not lowered yet — they stay out-of-subset
+/// (fail-closed).
 fn is_nested_cap(type_id: u32, op: u32) -> bool {
-    type_id == cap_id::INSTANTIATOR && (op == 0 || op == 1 || op == 17)
+    type_id == cap_id::INSTANTIATOR && (op == 0 || op == 1 || op == 13 || op == 17)
 }
 
 /// CONSOLIDATION.md §3c.3 — does the module use the config-record spawn (`Instantiator` op 17)?
@@ -781,6 +783,31 @@ fn module_uses_rec(m: &Module) -> bool {
                     Inst::CapCall {
                         type_id: cap_id::INSTANTIATOR,
                         op: 17,
+                        ..
+                    }
+                )
+            })
+        })
+    })
+}
+
+/// #1123 — does the module use the **separate-module** spawn (`Instantiator` op 13,
+/// `instantiate_module_named`)? When it does (and only then), nested mode appends the
+/// `env.instantiate_module` import **after** `env.instantiate_rec` (func import `8 + uses_rec`),
+/// shifting the emitted-function base by one for that module alone. Like the op-17 append, existing
+/// modules keep their exact import set — no driver changes until it loads an op-13 module. This is the
+/// wasm-tier analogue of the interpreter/Cranelift `instantiate_module_named`: the parent runs
+/// **emitted** and the separate child spawn/join happen host-side (the servicer resolves the module
+/// handle + grant list, then emits + runs the child — the #1123 slice-1 `env.instantiate` mechanism).
+fn module_uses_instantiate_module(m: &Module) -> bool {
+    m.funcs.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            b.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    Inst::CapCall {
+                        type_id: cap_id::INSTANTIATOR,
+                        op: 13,
                         ..
                     }
                 )
@@ -1490,6 +1517,11 @@ const NESTED_IMPORTED_FUNCS: u32 = 8;
 /// §3c.3 — `env.instantiate_rec` (the config-record spawn bounce), emitted **conditionally** as
 /// func import 8 only when [`module_uses_rec`]; the emitted-function base is then 9.
 const INSTANTIATE_REC_IMPORT_IDX: u32 = 8;
+/// #1123 — `env.instantiate_module` (the separate-module spawn bounce, op 13), emitted
+/// **conditionally** *after* `env.instantiate_rec` (func import `8 + uses_rec`) only when
+/// [`module_uses_instantiate_module`]. Its index is computed at the lowering/import site (not a const)
+/// precisely because it depends on whether the module also uses op-17; the two conditional imports
+/// compose deterministically and shift the emitted-function base by their sum.
 /// `env.call_interp` scratch: the cross-tier call marshals its arg/result slots starting at
 /// this byte offset in the `env` cell (past the `i64` fuel counter at 0). The host must allocate the
 /// `env` cell at least [`ENV_CELL_BYTES`] large.
@@ -1582,8 +1614,12 @@ pub fn compile_module_nested_with_eligibility(
     let mut emitted: Vec<usize> = Vec::new();
     for (i, f) in m.funcs.iter().enumerate() {
         if nested_ok(f) {
-            wasm_of[i] =
-                Some(NESTED_IMPORTED_FUNCS + module_uses_rec(m) as u32 + emitted.len() as u32);
+            wasm_of[i] = Some(
+                NESTED_IMPORTED_FUNCS
+                    + module_uses_rec(m) as u32
+                    + module_uses_instantiate_module(m) as u32
+                    + emitted.len() as u32,
+            );
             emitted.push(i);
         } else if f.uses_fibers() {
             // A fiber (`cont.*`/`suspend`) can't be emitted (no wasm frame unwind) and must not become
@@ -2514,7 +2550,7 @@ fn compile_module_tierup_inner(
     let all_in_subset = in_subset.iter().all(|&s| s);
     // Emitted functions follow the import block; the nested layout adds the §14/§11 bounce imports.
     let base = if nested_caps {
-        NESTED_IMPORTED_FUNCS + module_uses_rec(m) as u32
+        NESTED_IMPORTED_FUNCS + module_uses_rec(m) as u32 + module_uses_instantiate_module(m) as u32
     } else {
         IMPORTED_FUNCS
     };
@@ -2802,7 +2838,9 @@ fn emit_module(
     //   env.join:        (i32 inst, i32 child) -> i64
     let (mut instantiate_ty, mut join_ty) = (0u32, 0u32);
     let uses_rec = nested_caps && module_uses_rec(m);
+    let uses_module = nested_caps && module_uses_instantiate_module(m);
     let mut instantiate_rec_ty = 0u32;
+    let mut instantiate_module_ty = 0u32;
     let (mut thread_spawn_ty, mut thread_join_ty, mut mem_wait_ty, mut mem_notify_ty) =
         (0u32, 0u32, 0u32, 0u32);
     if nested_caps {
@@ -2814,6 +2852,17 @@ fn emit_module(
             // §3c.3 env.instantiate_rec: (i32 win, i32 inst, i64 record_ptr) -> i32 child handle
             instantiate_rec_ty = types.len() as u32;
             types.push((vec![0x7f, 0x7f, 0x7e], vec![0x7f]));
+        }
+        if uses_module {
+            // #1123 env.instantiate_module (op 13): (i32 win, i32 inst, i64 module, i64 grants_ptr,
+            // i64 grants_n, i64 entry, i64 off, i64 size_log2, i64 quota) -> i32 child handle. The
+            // servicer resolves the module handle + reads the grant records at win + grants_ptr, then
+            // spawns the separate child into the carve — the parent-emitted twin of the op-0 bounce.
+            instantiate_module_ty = types.len() as u32;
+            types.push((
+                vec![0x7f, 0x7f, 0x7e, 0x7e, 0x7e, 0x7e, 0x7e, 0x7e, 0x7e],
+                vec![0x7f],
+            ));
         }
         // §11 thread/futex bounces:
         //   env.thread_spawn: (i32 func, i64 sp, i64 arg) -> i32 handle
@@ -2948,7 +2997,7 @@ fn emit_module(
         // interpreter would have dispatched. (Fixed a hang/trap ~frame 174 of Doom, when the first
         // monster thinker fires an `A_*` action loaded from `states[]`.)
         let mut next_widx = if nested_caps {
-            NESTED_IMPORTED_FUNCS + uses_rec as u32
+            NESTED_IMPORTED_FUNCS + uses_rec as u32 + uses_module as u32
         } else {
             IMPORTED_FUNCS
         } + emitted.len() as u32;
@@ -3029,7 +3078,8 @@ fn emit_module(
     let n_imports = 3
         + reserved_table_log2.is_some() as u64
         + if nested_caps { 6 } else { 0 }
-        + uses_rec as u64;
+        + uses_rec as u64
+        + uses_module as u64;
     uleb(&mut sec, n_imports);
     import_name(&mut sec, "env", "memory");
     sec.push(0x02); // memory
@@ -3072,10 +3122,17 @@ fn emit_module(
         sec.push(0x00); // func
         uleb(&mut sec, mem_notify_ty as u64);
         if uses_rec {
-            // §3c.3 — appended last (func import 8), so no existing import index shifts.
+            // §3c.3 — appended after the fixed eight (func import 8), so no existing import shifts.
             import_name(&mut sec, "env", "instantiate_rec");
             sec.push(0x00); // func
             uleb(&mut sec, instantiate_rec_ty as u64);
+        }
+        if uses_module {
+            // #1123 — appended after instantiate_rec (func import `8 + uses_rec`), so no existing
+            // import shifts and the two conditional imports compose deterministically.
+            import_name(&mut sec, "env", "instantiate_module");
+            sec.push(0x00); // func
+            uleb(&mut sec, instantiate_module_ty as u64);
         }
     }
     if reserved_table_log2.is_some() {
@@ -5341,6 +5398,22 @@ fn emit_block_body(
                     }
                     code.push(OP_CALL);
                     uleb(code, INSTANTIATE_REC_IMPORT_IDX as u64);
+                } else if *op == 13 {
+                    // #1123 env.instantiate_module(win, inst, module, grants_ptr, grants_n, entry,
+                    // off, size_log2, quota) -> i32 child handle — the separate-module spawn. The
+                    // servicer resolves the module handle and reads the grant records at win +
+                    // grants_ptr, then emits + runs the child over the carve (slice-1 mechanism). Its
+                    // import index follows env.instantiate_rec (`8 + uses_rec`); computed here because
+                    // it is conditional on whether this module also uses op-17.
+                    let idx = NESTED_IMPORTED_FUNCS + module_uses_rec(m) as u32;
+                    code.push(OP_LOCAL_GET);
+                    uleb(code, 0); // win
+                    get(code, cx, *handle); // the Instantiator handle (i32)
+                    for a in args {
+                        get(code, cx, *a); // module, grants_ptr, grants_n, entry, off, size_log2, quota
+                    }
+                    code.push(OP_CALL);
+                    uleb(code, idx as u64);
                 } else {
                     // env.join(inst, child) -> i64 result
                     get(code, cx, *handle); // the Instantiator handle
