@@ -21,12 +21,14 @@ use temen_verify::verify_module;
 /// func 0 (parent): query the region granule `G` (op 3), map the region at window offset `16384`
 /// (alias A, above the #1094 NULL guard) and again at `16384 + G` (alias B) — both covering region
 /// byte 0 — spawn the notifier child, then `atomic.wait` on **alias B** (window `16384 + G`, region
-/// byte 0), expected `0`, no timeout. Returns the wait status: `0` iff a `notify` woke it.
+/// byte 0), expected `0`, no timeout. Returns the wait status: `0` iff a `notify` woke it. The window
+/// is `memory 18` (256 KiB) so both aliases fit above the guard even at a 64 KiB granule (Windows):
+/// alias B ends at `16384 + 2*G` = 147456 &lt; 262144.
 ///
 /// func 1 (child): spin-`notify` **alias A** (window `16384`, region byte 0) until it reports a waiter
 /// woken, then return `7`. Unbounded on purpose — if the keys don't match this never succeeds and the
 /// child fuel-traps, which fails the test loudly instead of hanging.
-const SRC: &str = "memory 17\n\
+const SRC: &str = "memory 18\n\
 func (i32) -> (i64) {\n\
 block 0 (v0: i32) {\n\
   vps = call.cap 4 3 () -> (i64) v0 ()\n\

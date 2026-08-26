@@ -2305,8 +2305,10 @@ fn min_max_canonicalize_nan_bit_exactly() {
 /// record read was bounded by the compile-time `mapped`, so the read was rejected (`MemoryFault`)
 /// where the interpreter's live page map admits it — a tier-parity divergence for a §14 guest that
 /// heap-grows before instantiating. Record fields: f0 = version 0 | entry(1)<<32; f8 = carve off
-/// 4096; f16 = size_log2 12 | pager MAX<<32; f24 = module -1 (self); f32..f48 = 0. The child stores
-/// marker 21 at its offset 0 (absolute 4096) and returns 5; the parent returns join*100 + marker.
+/// 16384 (#1094: one NULL guard up, so the child window clears the parent's `[0,16384)` guard and is
+/// child-size-aligned); f16 = size_log2 12 | pager MAX<<32; f24 = module -1 (self); f32..f48 = 0. The
+/// child stores marker 21 at its offset 0 (absolute 16384) and returns 5; the parent returns
+/// join*100 + marker.
 #[cfg(any(unix, windows))]
 #[test]
 fn jit_instantiate_rec_reads_the_record_from_a_grown_tail_page() {
@@ -2330,7 +2332,7 @@ fn jit_instantiate_rec_reads_the_record_from_a_grown_tail_page() {
          \x20 vg2 = i32.const 3\n\
          \x20 vg3 = call.cap 5 0 (i64, i64, i32) -> (i64) v0 (vg0, vg1, vg2)\n\
          \x20 vf0 = i64.const {f0}\n\
-         \x20 vf8 = i64.const 4096\n\
+         \x20 vf8 = i64.const 16384\n\
          \x20 vf16 = i64.const {f16}\n\
          \x20 vf24 = i64.const {f24}\n\
          \x20 vz = i64.const 0\n\
@@ -2350,7 +2352,7 @@ fn jit_instantiate_rec_reads_the_record_from_a_grown_tail_page() {
          \x20 i64.store vra6 vz\n\
          \x20 vch = call.cap 6 17 (i64) -> (i32) v1 (vra)\n\
          \x20 vj = call.cap 6 1 (i32) -> (i64) v1 (vch)\n\
-         \x20 vma = i64.const 4096\n\
+         \x20 vma = i64.const 16384\n\
          \x20 vm = i32.load8_u vma\n\
          \x20 vme = i64.extend_i32_u vm\n\
          \x20 vh = i64.const 100\n\

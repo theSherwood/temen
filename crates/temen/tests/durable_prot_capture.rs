@@ -15,9 +15,12 @@ use temen_snapshot::{freeze_with_prots, restore_with_prots, PageProt, PAGE};
 const SIZE_LOG2: u8 = 17;
 const WINDOW: usize = 1 << SIZE_LOG2;
 const RO_OFF: usize = 5 * PAGE; // a read-only data segment lands on page 5
-                                // The "ordinary committed page" reference: page 4 (offset 16384), the first Rw page ABOVE the
-                                // #1094 NULL guard `[0, 16384)` — pages 0..3 are now seeded Unmapped, so page 0 is no longer Rw.
-const RW_OFF: usize = 4 * PAGE;
+                                // The "ordinary committed page" reference: page 8 (offset 32768). It must be Rw ABOVE the
+                                // #1094 NULL guard `[0, 16384)` (pages 0..3, now seeded Unmapped) *and* live in a different
+                                // host page from `RO_OFF` — protection is host-page granular, so on a 16 KiB-page host
+                                // (macOS) page 4 shares host page 1 with the page-5 RO segment and captures Ro; page 8 is a
+                                // clean host page above it.
+const RW_OFF: usize = 8 * PAGE;
 
 // A read-only data segment + a trivial entry (it doesn't touch memory; the segment alone marks
 // its page `Ro` at instantiation, D40).
