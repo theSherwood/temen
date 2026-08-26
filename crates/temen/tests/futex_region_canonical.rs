@@ -18,14 +18,16 @@ use temen_interp::{run_capture_reserved_with_host, Host, Value};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
-/// func 0 (parent): query the region granule `G` (op 3), map the region at window offset `16384`
-/// (alias A, above the #1094 NULL guard) and again at `16384 + G` (alias B) — both covering region
-/// byte 0 — spawn the notifier child, then `atomic.wait` on **alias B** (window `16384 + G`, region
+/// func 0 (parent): query the region granule `G` (op 3), map the region at window offset `65536`
+/// (alias A — #1094: above the NULL guard AND aligned to every real granule including the Windows
+/// 64 KiB allocation granularity, matching the `region_page_size` alignment contract the JIT's
+/// `MapViewOfFile3` path enforces) and again at `65536 + G` (alias B) — both covering region
+/// byte 0 — spawn the notifier child, then `atomic.wait` on **alias B** (window `65536 + G`, region
 /// byte 0), expected `0`, no timeout. Returns the wait status: `0` iff a `notify` woke it. The window
 /// is `memory 18` (256 KiB) so both aliases fit above the guard even at a 64 KiB granule (Windows):
-/// alias B ends at `16384 + 2*G` = 147456 &lt; 262144.
+/// alias B ends at `65536 + 2*G` = 196608 &lt; 262144.
 ///
-/// func 1 (child): spin-`notify` **alias A** (window `16384`, region byte 0) until it reports a waiter
+/// func 1 (child): spin-`notify` **alias A** (window `65536`, region byte 0) until it reports a waiter
 /// woken, then return `7`. Unbounded on purpose — if the keys don't match this never succeeds and the
 /// child fuel-traps, which fails the test loudly instead of hanging.
 const SRC: &str = "memory 18\n\
@@ -33,7 +35,7 @@ func (i32) -> (i64) {\n\
 block 0 (v0: i32) {\n\
   vps = call.cap 4 3 () -> (i64) v0 ()\n\
   vz = i64.const 0\n\
-  vguard = i64.const 16384\n\
+  vguard = i64.const 65536\n\
   vbo = i64.add vguard vps\n\
   vprot = i32.const 3\n\
   vm1 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (vguard, vz, vps, vprot)\n\
@@ -52,7 +54,7 @@ block 0 (vsp: i64, varg: i64) {\n\
   br 1()\n\
 }\n\
 block 1 () {\n\
-  v0 = i64.const 16384\n\
+  v0 = i64.const 65536\n\
   v1 = i32.const 1\n\
   vw = atomic.notify v0 v1\n\
   vzero = i32.const 0\n\

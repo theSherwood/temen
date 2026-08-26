@@ -587,8 +587,12 @@ fn deadline_does_not_delay_fast_guest() {
 /// queries `region_page_size` (op 3) and works in whole granules.
 #[test]
 fn powerbox_region_minting_round_trips() {
+    // `memory 18` (256 KiB): the two aliases sit at granule-aligned offsets `65536` and `65536 + g`
+    // (#1094: above the NULL guard AND aligned to the 64 KiB Windows allocation granularity, which
+    // `MapViewOfFile3` requires for the placement address — 16384 would EINVAL there), so the second
+    // alias ends at 65536 + 2g = 196608 < 262144 even at the largest granule.
     let m = load(
-        "memory 17\n\
+        "memory 18\n\
          export 0 func \"_start\" 0\n\
          func () -> (i32) {\n\
          block 0 () {\n\
@@ -599,7 +603,7 @@ fn powerbox_region_minting_round_trips() {
          \x20 v4 = call.cap 4 3 () -> (i64) v3()\n\
          \x20 v5 = i64.const 0\n\
          \x20 v6 = i32.const 3\n\
-         \x20 vg = i64.const 16384\n\
+         \x20 vg = i64.const 65536\n\
          \x20 vg2 = i64.add vg v4\n\
          \x20 v7 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v3(vg, v5, v4, v6)\n\
          \x20 v8 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v3(vg2, v5, v4, v6)\n\

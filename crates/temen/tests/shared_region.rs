@@ -18,10 +18,11 @@ const MARKER: i64 = 0x0123_4567_89ab_cdef;
 /// mappings alias the same backing.
 fn alias_probe_src() -> String {
     format!(
-        // `memory 18` (256 KiB) so two whole granules fit at window offsets `16384` and
-        // `16384 + page_size` — on Windows that granule is the 64 KiB allocation granularity, so the
-        // second alias lands at 16384 + 64 KiB. #1094: the mappings sit above the `[0, 16384)` NULL
-        // guard, so every access lands in mapped region (Region-map pattern: window_off = 16384,
+        // `memory 18` (256 KiB) so two whole granules fit at window offsets `65536` and
+        // `65536 + page_size` — on Windows that granule is the 64 KiB allocation granularity, which
+        // `MapViewOfFile3` requires the placement address to align to, so the base must be a multiple
+        // of 64 KiB (16384 would EINVAL there). #1094: the mappings also sit above the `[0, 16384)`
+        // NULL guard (Region-map pattern: window_off = 65536 — granule-aligned and guard-clearing,
         // region_off = 0).
         "memory 18\n\
          func (i32) -> (i64) {{\n\
@@ -29,7 +30,7 @@ fn alias_probe_src() -> String {
          \x20 v1 = call.cap 4 3 () -> (i64) v0 ()\n\
          \x20 v2 = i64.const 0\n\
          \x20 v3 = i32.const 3\n\
-         \x20 vg = i64.const 16384\n\
+         \x20 vg = i64.const 65536\n\
          \x20 vg2 = i64.add vg v1\n\
          \x20 v4 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (vg, v2, v1, v3)\n\
          \x20 v5 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (vg2, v2, v1, v3)\n\
@@ -73,7 +74,7 @@ fn shared_region_without_second_mapping_is_not_aliased() {
          \x20 v1 = call.cap 4 3 () -> (i64) v0 ()\n\
          \x20 v2 = i64.const 0\n\
          \x20 v3 = i32.const 3\n\
-         \x20 vg = i64.const 16384\n\
+         \x20 vg = i64.const 65536\n\
          \x20 vg2 = i64.add vg v1\n\
          \x20 v4 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (vg, v2, v1, v3)\n\
          \x20 v6 = i64.const {MARKER}\n\
@@ -116,17 +117,19 @@ fn ring_buffer_straddling_access_wraps_differential() {
 
     const RING_MARKER: i64 = 0x1122_3344_5566_7788;
     let src = format!(
-        // #1094: the two adjacent ring mappings sit above the `[0, 16384)` NULL guard — window
-        // offsets `[16384, 16384+g)` and `[16384+g, 16384+2g)`, both aliasing region `[0, g)`
-        // (Region-map pattern: window_off = 16384, region_off = 0). The straddling store lands at
-        // `16384 + g - 4`, its views at the head `16384` and the tail `16384 + 2g - 4`.
+        // #1094: the two adjacent ring mappings sit above the `[0, 16384)` NULL guard at
+        // granule-aligned window offsets `[65536, 65536+g)` and `[65536+g, 65536+2g)` (the Windows
+        // 64 KiB allocation granularity requires the aligned base; 16384 would EINVAL there), both
+        // aliasing region `[0, g)` (Region-map pattern: window_off = 65536, region_off = 0). The
+        // straddling store lands at `65536 + g - 4`, its views at the head `65536` and the tail
+        // `65536 + 2g - 4`.
         "memory 18\n\
          func (i32) -> (i64) {{\n\
          block 0 (v0: i32) {{\n\
          \x20 v1 = call.cap 4 3 () -> (i64) v0 ()\n\
          \x20 v2 = i64.const 0\n\
          \x20 v3 = i32.const 3\n\
-         \x20 vg = i64.const 16384\n\
+         \x20 vg = i64.const 65536\n\
          \x20 vg1 = i64.add vg v1\n\
          \x20 v4 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (vg, v2, v1, v3)\n\
          \x20 v5 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (vg1, v2, v1, v3)\n\

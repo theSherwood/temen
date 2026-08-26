@@ -115,7 +115,7 @@ block 0 (v0: i64) {
   vh = self.resolve vp vl
   vg = call.cap 4 3 () -> (i64) vh ()
   vroff = i64.const 0
-  vwoff = i64.const 16384
+  vwoff = i64.const 65536
   vprot = i32.const 3
   vm = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vh (vwoff, vroff, vg, vprot)
   vone = i64.const 1
@@ -127,12 +127,12 @@ block 1 (vi: i64, vtos: i64) {
   br_if vdone 5(vtos) 2(vi, vtos)
   }
 block 2 (vi: i64, vtos: i64) {
-  vfa = i64.const 16384
+  vfa = i64.const 65536
   vf = i32.load vfa
   br_if vf 3(vi, vtos) 4(vi, vtos)
   }
 block 3 (vi: i64, vtos: i64) {
-  vfa = i64.const 16384
+  vfa = i64.const 65536
   vexp = i32.const 1
   vto = i64.const 5000000000
   vst = i32.atomic.wait vfa vexp vto
@@ -145,9 +145,9 @@ block 3 (vi: i64, vtos: i64) {
   br_if vbail 5(vtos2) 2(vi, vtos2)
   }
 block 4 (vi: i64, vtos: i64) {
-  vda = i64.const 16392
+  vda = i64.const 65544
   i64.store vda vi
-  vfa = i64.const 16384
+  vfa = i64.const 65536
   vfull = i32.const 1
   i32.store vfa vfull
   vcnt = i32.const 1
@@ -175,7 +175,7 @@ block 0 (v0: i64) {
   vh = self.resolve vp vl
   vg = call.cap 4 3 () -> (i64) vh ()
   vroff = i64.const 0
-  vwoff = i64.const 16384
+  vwoff = i64.const 65536
   vprot = i32.const 3
   vm = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vh (vwoff, vroff, vg, vprot)
   vone = i64.const 1
@@ -187,12 +187,12 @@ block 1 (vn: i64, vsum: i64, vtos: i64) {
   br_if vdone 5(vsum, vtos) 2(vn, vsum, vtos)
   }
 block 2 (vn: i64, vsum: i64, vtos: i64) {
-  vfa = i64.const 16384
+  vfa = i64.const 65536
   vf = i32.load vfa
   br_if vf 4(vn, vsum, vtos) 3(vn, vsum, vtos)
   }
 block 3 (vn: i64, vsum: i64, vtos: i64) {
-  vfa = i64.const 16384
+  vfa = i64.const 65536
   vexp = i32.const 0
   vto = i64.const 5000000000
   vst = i32.atomic.wait vfa vexp vto
@@ -205,10 +205,10 @@ block 3 (vn: i64, vsum: i64, vtos: i64) {
   br_if vbail 5(vsum, vtos2) 2(vn, vsum, vtos2)
   }
 block 4 (vn: i64, vsum: i64, vtos: i64) {
-  vda = i64.const 16392
+  vda = i64.const 65544
   vd = i64.load vda
   vsum2 = i64.add vsum vd
-  vfa = i64.const 16384
+  vfa = i64.const 65536
   vempty = i32.const 0
   i32.store vfa vempty
   vcnt = i32.const 1
@@ -243,7 +243,7 @@ block 0 (v0: i64) {
   vh = self.resolve vp vl
   vg = call.cap 4 3 () -> (i64) vh ()
   vroff = i64.const 0
-  vwoff = i64.const 16384
+  vwoff = i64.const 65536
   vprot = i32.const 3
   vm = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vh (vwoff, vroff, vg, vprot)
   vone = i64.const 1
@@ -255,12 +255,12 @@ block 1 (vi: i64, vtos: i64) {
   br_if vdone 5(vtos) 2(vi, vtos)
   }
 block 2 (vi: i64, vtos: i64) {
-  vfa = i64.const 16384
+  vfa = i64.const 65536
   vf = i32.load vfa
   br_if vf 3(vi, vtos) 4(vi, vtos)
   }
 block 3 (vi: i64, vtos: i64) {
-  vfa = i64.const 16384
+  vfa = i64.const 65536
   vexp = i32.const 1
   vto = i64.const 5000000000
   vst = i32.atomic.wait vfa vexp vto
@@ -273,9 +273,9 @@ block 3 (vi: i64, vtos: i64) {
   br_if vbail 5(vtos2) 2(vi, vtos2)
   }
 block 4 (vi: i64, vtos: i64) {
-  vda = i64.const 16392
+  vda = i64.const 65544
   i64.store vda vi
-  vfa = i64.const 16384
+  vfa = i64.const 65536
   vfull = i32.const 1
   i32.store vfa vfull
   vcnt = i32.const 1
@@ -300,7 +300,7 @@ block 0 (v0: i64) {
   vh = self.resolve vp vl
   vg = call.cap 4 3 () -> (i64) vh ()
   vroff = i64.const 0
-  vwoff = i64.const 16384
+  vwoff = i64.const 65536
   vprot = i32.const 3
   vm = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vh (vwoff, vroff, vg, vprot)
   vone = i64.const 1
@@ -312,12 +312,12 @@ block 1 (vn: i64, vsum: i64, vtos: i64) {
   br_if vdone 5(vsum, vtos) 2(vn, vsum, vtos)
   }
 block 2 (vn: i64, vsum: i64, vtos: i64) {
-  vfa = i64.const 16384
+  vfa = i64.const 65536
   vf = i32.load vfa
   br_if vf 4(vn, vsum, vtos) 3(vn, vsum, vtos)
   }
 block 3 (vn: i64, vsum: i64, vtos: i64) {
-  vfa = i64.const 16384
+  vfa = i64.const 65536
   vexp = i32.const 0
   vto = i64.const 5000000000
   vst = i32.atomic.wait vfa vexp vto
@@ -330,10 +330,10 @@ block 3 (vn: i64, vsum: i64, vtos: i64) {
   br_if vbail 5(vsum, vtos2) 2(vn, vsum, vtos2)
   }
 block 4 (vn: i64, vsum: i64, vtos: i64) {
-  vda = i64.const 16392
+  vda = i64.const 65544
   vd = i64.load vda
   vsum2 = i64.add vsum vd
-  vfa = i64.const 16384
+  vfa = i64.const 65536
   vempty = i32.const 0
   i32.store vfa vempty
   vcnt = i32.const 1

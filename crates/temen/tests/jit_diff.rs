@@ -1278,7 +1278,7 @@ fn jit_cap_shared_region_aliases_differential() {
          block 0 (v0: i32) {{\n\
          \x20 v1 = call.cap 4 3 () -> (i64) v0 ()\n\
          \x20 v2 = i64.const 0\n\
-         \x20 vwa = i64.const 16384\n\
+         \x20 vwa = i64.const 65536\n\
          \x20 vwb = i64.add vwa v1\n\
          \x20 v3 = i32.const 3\n\
          \x20 v4 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (vwa, v2, v1, v3)\n\
@@ -1327,9 +1327,9 @@ fn jit_cap_shared_region_aliases_differential() {
     );
     assert_eq!(imem, jmem, "interp/JIT shared-region windows diverge");
     assert_eq!(
-        &imem[16384..16392],
+        &imem[65536..65544],
         &MARKER.to_le_bytes(),
-        "the marker must be present at window offset 16384 (non-vacuous)"
+        "the marker must be present at window offset 65536 (non-vacuous)"
     );
 }
 

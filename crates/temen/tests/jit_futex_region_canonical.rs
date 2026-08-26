@@ -21,13 +21,15 @@ use temen_text::parse_module;
 use temen_verify::verify_module;
 
 /// func 0 (parent): `create_region` a 64 KiB region via the `AddressSpace` (arg `v0`), query its
-/// granule `G` (op 3), map it at window offset `0` (alias A) and again at `G` (alias B) — both covering
-/// region byte 0 — spawn the notifier child, then `atomic.wait` on **alias B** (window `G`), expected
+/// granule `G` (op 3), map it at window offset `65536` (alias A — #1094: above the NULL guard and
+/// aligned to the Windows 64 KiB allocation granularity `MapViewOfFile3` requires; an unaligned
+/// 16384 EINVALs there) and again at `65536 + G` (alias B) — both covering
+/// region byte 0 — spawn the notifier child, then `atomic.wait` on **alias B**, expected
 /// `0`. A generous 3 s timeout keeps a *regression* (missed wakeup, keys not canonical) a clean
 /// timed-out status (`2`) instead of a hang — on success the `notify` wakes it in microseconds and the
 /// timeout never elapses. Returns the wait status: `0` iff a `notify` woke it.
 ///
-/// func 1 (child): spin-`notify` **alias A** (window `0`, region byte 0) until it reports a waiter woken
+/// func 1 (child): spin-`notify` **alias A** (window `65536`, region byte 0) until it reports a waiter woken
 /// (return `7`), bounded to `LIM` iterations so it self-terminates on a regression (return `-1`) rather
 /// than spinning forever — the JIT has no fuel bound. `LIM` is far more than the microseconds the parent
 /// needs to park, so a real wakeup is never missed on success.
@@ -39,7 +41,7 @@ block 0 (v0: i32) {\n\
   vr = i32.wrap_i64 vrh\n\
   vps = call.cap 4 3 () -> (i64) vr ()\n\
   vz = i64.const 0\n\
-  vwa = i64.const 16384\n\
+  vwa = i64.const 65536\n\
   vwb = i64.add vwa vps\n\
   vprot = i32.const 3\n\
   vm1 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vr (vwa, vz, vlen, vprot)\n\
@@ -64,7 +66,7 @@ block 1 (cnt: i64) {\n\
   br_if vlt 2(cnt) 3()\n\
 }\n\
 block 2 (cnt2: i64) {\n\
-  va = i64.const 16384\n\
+  va = i64.const 65536\n\
   vone = i32.const 1\n\
   vw = atomic.notify va vone\n\
   vzero = i32.const 0\n\
