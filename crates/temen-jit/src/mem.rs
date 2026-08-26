@@ -636,9 +636,23 @@ mod pal {
                     MEM_PRESERVE_PLACEHOLDER,
                 );
                 VirtualFree(region_base as *mut c_void, 0, MEM_RELEASE);
-            } else if mbi.State == MEM_COMMIT || mbi.State == MEM_RESERVE {
-                // A committed-private region or a leftover placeholder: free the whole fragment.
-                VirtualFree(mbi.AllocationBase, 0, MEM_RELEASE);
+            } else if mbi.State == MEM_COMMIT {
+                // A committed-private fragment. Free by its **exact queried range**, never by
+                // `mbi.AllocationBase`: after §13 interior view maps split the original commit, the
+                // committed remainders can still report the window base as their allocation base —
+                // a range this walk already released, which a concurrent thread may have reused, so
+                // a `VirtualFree(AllocationBase, 0, MEM_RELEASE)` here frees *another thread's live
+                // allocation* (the parallel-test STATUS_ACCESS_VIOLATION). Shrink the fragment to a
+                // placeholder (exact bounds), then release that placeholder.
+                VirtualFree(
+                    region_base as *mut c_void,
+                    mbi.RegionSize,
+                    MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+                );
+                VirtualFree(region_base as *mut c_void, 0, MEM_RELEASE);
+            } else if mbi.State == MEM_RESERVE {
+                // A leftover placeholder fragment: its region base is its allocation base; release it.
+                VirtualFree(region_base as *mut c_void, 0, MEM_RELEASE);
             }
             addr = if next > addr {
                 next
