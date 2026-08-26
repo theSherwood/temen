@@ -44,22 +44,43 @@ block 0 () {
 /// sink over the *pristine* module must match it exactly.
 fn expected_events() -> Vec<MemEvent> {
     vec![
-        MemEvent::Store { addr: 16456, width: 8 },
-        MemEvent::Fill { dst: 16448, len: 32 },
+        MemEvent::Store {
+            addr: 16456,
+            width: 8,
+        },
+        MemEvent::Fill {
+            dst: 16448,
+            len: 32,
+        },
         MemEvent::Copy {
             dst: 16576,
             src: 16448,
             len: 32,
         },
-        MemEvent::AtomicStore { addr: 16448, width: 4 },
-        MemEvent::AtomicLoad { addr: 16448, width: 4 },
-        MemEvent::AtomicRmw { addr: 16448, width: 4 },
-        MemEvent::AtomicCmpxchg { addr: 16448, width: 4 },
+        MemEvent::AtomicStore {
+            addr: 16448,
+            width: 4,
+        },
+        MemEvent::AtomicLoad {
+            addr: 16448,
+            width: 4,
+        },
+        MemEvent::AtomicRmw {
+            addr: 16448,
+            width: 4,
+        },
+        MemEvent::AtomicCmpxchg {
+            addr: 16448,
+            width: 4,
+        },
         MemEvent::Load {
             addr: 16448,
             width: 16,
         },
-        MemEvent::Load { addr: 16456, width: 8 },
+        MemEvent::Load {
+            addr: 16456,
+            width: 8,
+        },
     ]
 }
 

@@ -381,7 +381,10 @@ fn mem_hooks_observe_every_access_via_c_abi() {
             // Effective address is 16448 + 8; store then load, each width 8.
             assert_eq!(
                 rec.events,
-                vec![(TEMEN_MEM_STORE, 16456, 0, 8), (TEMEN_MEM_LOAD, 16456, 0, 8),],
+                vec![
+                    (TEMEN_MEM_STORE, 16456, 0, 8),
+                    (TEMEN_MEM_LOAD, 16456, 0, 8),
+                ],
                 "C hook saw the store then the load (backend {backend})"
             );
             temen_run_free(run);

@@ -26,7 +26,7 @@ fn tvalue_copy_module() -> Module {
             insts: vec![
                 Inst::ConstI64(16448), // v1: S (above the #1094 NULL guard)
                 Inst::ConstI64(16512), // v2: D
-                Inst::ConstI64(7),   // v3: tag
+                Inst::ConstI64(7),     // v3: tag
                 Inst::Store {
                     op: StoreOp::I64,
                     addr: 1,
@@ -39,7 +39,7 @@ fn tvalue_copy_module() -> Module {
                     value: 3,
                     offset: 8,
                 }, // S.tag = 7
-                Inst::ConstI64(16),  // v4: len
+                Inst::ConstI64(16),    // v4: len
                 Inst::MemCopy {
                     dst: 2,
                     src: 1,

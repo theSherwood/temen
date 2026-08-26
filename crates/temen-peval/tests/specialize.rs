@@ -68,10 +68,10 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
     let header = Block {
         params: vec![i64t(), i64t(), i64t()], // 0: acc, 1: pc, 2: input
         insts: vec![
-            Inst::ConstI64(16384),      // 3: program base (offset 16384, above the #1094 NULL guard)
-            add(3, 1),                  // 4: addr = base + pc
+            Inst::ConstI64(16384), // 3: program base (offset 16384, above the #1094 NULL guard)
+            add(3, 1),             // 4: addr = base + pc
             load(LoadOp::I32_8U, 4, 0), // 5: op   (i32)
-            load(LoadOp::I64, 4, 1),    // 6: imm  (i64)
+            load(LoadOp::I64, 4, 1), // 6: imm  (i64)
         ],
         term: Terminator::BrTable {
             idx: 5,
@@ -740,7 +740,7 @@ fn build_float_interpreter(program: &[(u8, i64)]) -> Module {
         params: vec![f64t(), i64t(), f64t()], // 0: facc, 1: pc, 2: finput
         insts: vec![
             Inst::ConstI64(16384), // 3: base (above the #1094 NULL guard)
-            iadd(3, 1),        // 4: addr = base + pc
+            iadd(3, 1),            // 4: addr = base + pc
             Inst::Load {
                 op: LoadOp::I32_8U,
                 addr: 4,

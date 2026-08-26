@@ -147,7 +147,7 @@ fn loads_across_a_may_alias_store_are_not_merged() {
                     addr: 2,
                     offset: 0,
                 }, // v4 = mem[16384]  (y) — must NOT merge with x
-                add(3, 4),         // v5 = x + y
+                add(3, 4),             // v5 = x + y
             ],
             term: Terminator::Return(vec![5]),
         }],

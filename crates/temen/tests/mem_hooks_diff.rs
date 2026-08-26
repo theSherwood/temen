@@ -44,22 +44,43 @@ block 0 () {
 /// The event stream `SRC` must produce, on every backend.
 fn expected_events() -> Vec<MemEvent> {
     vec![
-        MemEvent::Store { addr: 16456, width: 8 },
-        MemEvent::Fill { dst: 16448, len: 32 },
+        MemEvent::Store {
+            addr: 16456,
+            width: 8,
+        },
+        MemEvent::Fill {
+            dst: 16448,
+            len: 32,
+        },
         MemEvent::Copy {
             dst: 16576,
             src: 16448,
             len: 32,
         },
-        MemEvent::AtomicStore { addr: 16448, width: 4 },
-        MemEvent::AtomicLoad { addr: 16448, width: 4 },
-        MemEvent::AtomicRmw { addr: 16448, width: 4 },
-        MemEvent::AtomicCmpxchg { addr: 16448, width: 4 },
+        MemEvent::AtomicStore {
+            addr: 16448,
+            width: 4,
+        },
+        MemEvent::AtomicLoad {
+            addr: 16448,
+            width: 4,
+        },
+        MemEvent::AtomicRmw {
+            addr: 16448,
+            width: 4,
+        },
+        MemEvent::AtomicCmpxchg {
+            addr: 16448,
+            width: 4,
+        },
         MemEvent::Load {
             addr: 16448,
             width: 16,
         },
-        MemEvent::Load { addr: 16456, width: 8 },
+        MemEvent::Load {
+            addr: 16456,
+            width: 8,
+        },
     ]
 }
 
@@ -135,7 +156,10 @@ fn faulting_run_reports_the_attempted_access_last() {
     // First store above the #1094 NULL guard (in-window); the second still straddles the window end
     // (65532 + 8 > 65536), the intended OOB fault.
     let expected = vec![
-        MemEvent::Store { addr: 16416, width: 8 },
+        MemEvent::Store {
+            addr: 16416,
+            width: 8,
+        },
         MemEvent::Store {
             addr: 65532,
             width: 8,
@@ -227,8 +251,14 @@ fn multi_vcpu_guest_is_observed_without_crashing() {
         assert_eq!(
             trace,
             vec![
-                MemEvent::AtomicStore { addr: 16384, width: 8 },
-                MemEvent::AtomicLoad { addr: 16384, width: 8 },
+                MemEvent::AtomicStore {
+                    addr: 16384,
+                    width: 8
+                },
+                MemEvent::AtomicLoad {
+                    addr: 16384,
+                    width: 8
+                },
             ],
             "both vCPUs' accesses reach the hook ({backend:?})"
         );

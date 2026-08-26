@@ -522,15 +522,15 @@ fn keeps_dead_load_but_drops_dead_arithmetic() {
                         addr: 0,
                         offset: 0,
                     }, // 1 : dead result, but kept (can fault)
-                    Inst::ConstI32(3), // 2
-                    Inst::ConstI32(4), // 3
+                    Inst::ConstI32(3),     // 2
+                    Inst::ConstI32(4),     // 3
                     Inst::IntBin {
                         ty: IntTy::I32,
                         op: BinOp::Add,
                         a: 2,
                         b: 3,
                     }, // 4 = 7 (dead)
-                    Inst::ConstI32(7), // 5
+                    Inst::ConstI32(7),     // 5
                 ],
                 term: Terminator::Return(vec![5]),
             }],
@@ -569,9 +569,9 @@ fn keeps_store_effect_across_renumbering() {
                 params: vec![],
                 insts: vec![
                     Inst::ConstI64(16392), // 0 : addr (above the #1094 NULL guard)
-                    Inst::ConstI32(42), // 1 : value
-                    Inst::ConstI32(5),  // 2 (dead)
-                    Inst::ConstI32(6),  // 3 (dead)
+                    Inst::ConstI32(42),    // 1 : value
+                    Inst::ConstI32(5),     // 2 (dead)
+                    Inst::ConstI32(6),     // 3 (dead)
                     Inst::IntBin {
                         ty: IntTy::I32,
                         op: BinOp::Mul,
@@ -584,7 +584,7 @@ fn keeps_store_effect_across_renumbering() {
                         value: 1,
                         offset: 0,
                     }, // (no result)
-                    Inst::ConstI32(0),  // 5
+                    Inst::ConstI32(0),     // 5
                 ],
                 term: Terminator::Return(vec![5]),
             }],

@@ -299,7 +299,15 @@ block 0 (v0: i64) {
         assert_eq!(r_res, r_ref, "result diverged at x={x}");
         assert_eq!(w_res, w_ref, "post-call window diverged at x={x}");
         assert_eq!(r_res, Ok(vec![Value::I64(a0 + b0 + x)]));
-        assert_eq!(&w_res[16512..16520], &b0.to_le_bytes(), "A holds the swapped B");
-        assert_eq!(&w_res[16640..16648], &a0.to_le_bytes(), "B holds the swapped A");
+        assert_eq!(
+            &w_res[16512..16520],
+            &b0.to_le_bytes(),
+            "A holds the swapped B"
+        );
+        assert_eq!(
+            &w_res[16640..16648],
+            &a0.to_le_bytes(),
+            "B holds the swapped A"
+        );
     }
 }
