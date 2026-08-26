@@ -12,14 +12,15 @@
 use temen_interp::{bytecode, Host, Value};
 use temen_wasm_jit::{compile_module_reactor, outline_cap_calls};
 
-// The entry resolves the capability name "exit" — four bytes in a data segment at window offset 0 — to
-// the handle it was granted under, and returns it. Pure compute apart from the one `cap.self.resolve`.
+// The entry resolves the capability name "exit" — four bytes in a data segment at window offset 16384
+// (above the #1094 NULL guard) — to the handle it was granted under, and returns it. Pure compute apart
+// from the one `cap.self.resolve`.
 const SRC: &str = r#"
 memory 16
-data 0 "exit"
+data 16384 "exit"
 func () -> (i32) {
 block 0 () {
-  v0 = i64.const 0
+  v0 = i64.const 16384
   v1 = i64.const 4
   v2 = cap.self.resolve v0 v1
   return v2

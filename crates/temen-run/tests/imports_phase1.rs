@@ -24,13 +24,13 @@ const NAMED_START: &str = "memory 17\n\
 func () -> () {\n\
 block 0 () {\n\
   vo = i32.const 111\n\
-  va = i64.const 16\n\
+  va = i64.const 16400\n\
   i32.store8 va vo\n\
   vk = i32.const 107\n\
-  vb = i64.const 17\n\
+  vb = i64.const 16401\n\
   i32.store8 vb vk\n\
   vph = i32.const 0\n\
-  vbuf = i64.const 16\n\
+  vbuf = i64.const 16400\n\
   vlen = i64.const 2\n\
   vn = call.sym \"write\" (i64, i64) -> (i64) vph (vbuf, vlen)\n\
   vph2 = i32.const 0\n\

@@ -19,32 +19,33 @@ use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store
 const WIN_BASE: i32 = 0x1_0000;
 const ENV_PTR: i32 = 1024;
 
-/// Parent (func 0, `(i64 inst) -> (i64)`): build the record at window offset 2048 — version 0,
-/// entry 1, off 0, size_log2 10, pager `u32::MAX`, module -1, budget 0, quota 0, no grants —
+/// Parent (func 0, `(i64 inst) -> (i64)`): build the record at window offset 18432 (above the #1094
+/// NULL guard) — version 0, entry 1, off 0, size_log2 10, pager `u32::MAX`, module -1, budget 0, quota
+/// 0, no grants —
 /// `instantiate_rec`, `join`, return. Child (func 1): pure compute, returns 9.
 const REC_PARENT: &str = r#"memory 16
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vinst = i32.wrap_i64 v0
-  va0 = i64.const 2048
+  va0 = i64.const 18432
   vf0 = i64.const 4294967296
   i64.store va0 vf0
-  va1 = i64.const 2056
+  va1 = i64.const 18440
   vz = i64.const 0
   i64.store va1 vz
-  va2 = i64.const 2064
+  va2 = i64.const 18448
   vf16 = i64.const -4294967286
   i64.store va2 vf16
-  va3 = i64.const 2072
+  va3 = i64.const 18456
   vf24 = i64.const 4294967295
   i64.store va3 vf24
-  va4 = i64.const 2080
+  va4 = i64.const 18464
   i64.store va4 vz
-  va5 = i64.const 2088
+  va5 = i64.const 18472
   i64.store va5 vz
-  va6 = i64.const 2096
+  va6 = i64.const 18480
   i64.store va6 vz
-  vrp = i64.const 2048
+  vrp = i64.const 18432
   vch = cap.call 6 17 (i64) -> (i32) vinst (vrp)
   vr = cap.call 6 1 (i32) -> (i64) vinst (vch)
   return vr
