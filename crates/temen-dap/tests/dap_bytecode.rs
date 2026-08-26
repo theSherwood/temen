@@ -408,13 +408,14 @@ fn dap_over_bytecode_reverse_matches_the_tree_walker() {
     );
 }
 
-// A program that stores 8 bytes to window address 0 (line 6), for the watchpoint test. Auto debug
+// A program that stores 8 bytes to window address 16384 (above the #1094 NULL guard; line 6), for
+// the watchpoint test. Auto debug
 // info makes line 5 (before the store) breakpointable.
 const MEM_STORE: &str = r#"
 memory 16
 func () -> (i64) {
 block 0 () {
-  a = i64.const 0
+  a = i64.const 16384
   v = i64.const 42
   i64.store a v
   r = i64.load a
@@ -425,7 +426,7 @@ block 0 () {
 
 #[test]
 fn dap_over_bytecode_watchpoint_matches_the_tree_walker() {
-    // Arm a write data breakpoint on window [0, 8) and Continue: the debugger stops *before* the store
+    // Arm a write data breakpoint on window [16384, 16392) and Continue: the debugger stops *before* the store
     // that touches it (line 6) with reason "data breakpoint" — identically on both engines.
     fn script(engine: Option<&str>) -> (bool, String, i64) {
         let mut s = DapServer::new();
@@ -451,14 +452,14 @@ fn dap_over_bytecode_watchpoint_matches_the_tree_walker() {
             ]),
         ));
         s.handle(&req(4, "configurationDone", Json::obj(vec![])));
-        // Arm a write watchpoint on window [0, 8) directly (dataId = "addr:len").
+        // Arm a write watchpoint on window [16384, 16392) directly (dataId = "addr:len").
         let arm = s.handle(&req(
             5,
             "setDataBreakpoints",
             Json::obj(vec![(
                 "breakpoints",
                 Json::Arr(vec![Json::obj(vec![
-                    ("dataId", Json::s("0:8")),
+                    ("dataId", Json::s("16384:8")),
                     ("accessType", Json::s("write")),
                 ])]),
             )]),
@@ -475,7 +476,7 @@ fn dap_over_bytecode_watchpoint_matches_the_tree_walker() {
                     .cloned()
             })
             == Some(Json::Bool(true));
-        // Continue → stop before the store's write to [0, 8).
+        // Continue → stop before the store's write to [16384, 16392).
         let cont = s.handle(&req(6, "continue", Json::obj(vec![])));
         let reason = event(&cont, "stopped")
             .and_then(|e| e.get("body")?.get("reason")?.as_str().map(str::to_owned))
@@ -524,13 +525,13 @@ const WATCH_COUNTER_DBG: &str = r#"; A counter lives at a fixed window address. 
 memory 16
 func () -> (i64) {
 block 0 () {
-  a0 = i64.const 0
+  a0 = i64.const 16384
   z = i64.const 0
   i64.store a0 z
   br 1(z)
 }
 block 1 (i: i64) {
-  a1 = i64.const 0
+  a1 = i64.const 16384
   one = i64.const 1
   n = i64.add i one
   i64.store a1 n
@@ -539,7 +540,7 @@ block 1 (i: i64) {
   br_if done 2(n) 1(n)
 }
 block 2 (r: i64) {
-  a2 = i64.const 0
+  a2 = i64.const 16384
   out = i64.load a2
   return out
   }
@@ -559,7 +560,7 @@ debug.loc 0 1 5 0 17 3
 debug.loc 0 2 0 0 20 3
 debug.loc 0 2 1 0 21 3
 debug.type 0 base "long" signed 8
-debug.var 0 "count" fixed 0 "long" 0
+debug.var 0 "count" fixed 16384 "long" 0
 "#;
 
 #[test]
@@ -690,8 +691,8 @@ fn dap_over_bytecode_named_watchpoint_matches_the_tree_walker() {
     );
     assert_eq!(bytecode.1, "data breakpoint", "stops for the watchpoint");
     assert_eq!(
-        bytecode.3, "0:8",
-        "`count` resolves to a fixed window range [0, 8)"
+        bytecode.3, "16384:8",
+        "`count` resolves to a fixed window range [16384, 16392)"
     );
     assert_eq!(
         bytecode.2, 15,
@@ -833,7 +834,7 @@ fn dap_over_bytecode_step_back_after_forward_progress_matches_the_tree_walker() 
     );
 }
 
-// A `thread.spawn` guest (two workers each load/add/store mem[0]; root spawns + joins). Auto debug
+// A `thread.spawn` guest (two workers each load/add/store mem[16384], one guard up; root spawns + joins). Auto debug
 // info makes the worker's `vc = i64.load vaddr` breakpointable — it's on line 18 (leading newline is
 // line 1). Drives the multithreaded scheduled bytecode engine over DAP.
 const RACY_COUNTER: &str = r#"
@@ -846,14 +847,14 @@ block 0 () {
   vh1 = thread.spawn 1 vsp va
   vj0 = thread.join vh0
   vj1 = thread.join vh1
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vr = i64.load vaddr
   return vr
   }
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vc = i64.load vaddr
   vn = i64.add vc varg
   i64.store vaddr vn
@@ -1146,7 +1147,7 @@ fn dap_over_bytecode_multithreaded_reverse_continue() {
 
 #[test]
 fn dap_over_bytecode_multithreaded_cross_thread_watchpoint() {
-    // A data breakpoint on the raced window range [0, 8) fires in whichever worker's store touches it,
+    // A data breakpoint on the raced window range [16384, 16392) fires in whichever worker's store touches it,
     // over DAP — the cross-thread watch reaching a DAP client on the scheduled bytecode engine.
     let mut s = DapServer::new();
     s.handle(&req(1, "initialize", Json::obj(vec![])));
@@ -1159,7 +1160,7 @@ fn dap_over_bytecode_multithreaded_cross_thread_watchpoint() {
             ("engine", Json::s("bytecode")),
         ]),
     ));
-    // Arm a write watch on [0, 8) directly (dataId = "addr:len") *before* configurationDone runs the
+    // Arm a write watch on [16384, 16392) directly (dataId = "addr:len") *before* configurationDone runs the
     // guest; the server reports it verified.
     let arm = s.handle(&req(
         3,
@@ -1167,7 +1168,7 @@ fn dap_over_bytecode_multithreaded_cross_thread_watchpoint() {
         Json::obj(vec![(
             "breakpoints",
             Json::Arr(vec![Json::obj(vec![
-                ("dataId", Json::s("0:8")),
+                ("dataId", Json::s("16384:8")),
                 ("accessType", Json::s("write")),
             ])]),
         )]),
@@ -1184,7 +1185,7 @@ fn dap_over_bytecode_multithreaded_cross_thread_watchpoint() {
         Some(Json::Bool(true)),
         "the cross-thread data breakpoint arms on the scheduled engine"
     );
-    // Run → a worker's store to [0, 8) trips it, reason "data breakpoint", in a spawned worker.
+    // Run → a worker's store to [16384, 16392) trips it, reason "data breakpoint", in a spawned worker.
     let cont = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
     let stop = event(&cont, "stopped").expect("the store trips the watch");
     assert_eq!(
@@ -1203,22 +1204,23 @@ fn dap_over_bytecode_multithreaded_cross_thread_watchpoint() {
     );
 }
 
-// A futex handoff: the root seeds mem[8], spawns a worker, sets a flag + `atomic.notify`s mem[0], joins;
-// the worker `atomic.wait`s on mem[0] then reads mem[8] (→ 987654). The worker's read-after-wait is
+// A futex handoff: the root seeds mem[16392], spawns a worker, sets a flag + `atomic.notify`s mem[16384],
+// joins; the worker `atomic.wait`s on mem[16384] then reads mem[16392] (→ 987654) — the window addresses
+// are one guard up (above the #1094 NULL guard). The worker's read-after-wait is
 // line 26 (leading newline = line 1). Drives `memory.wait`/`notify` on the scheduled engine over DAP.
 const FUTEX_HANDOFF: &str = r#"
 memory 16
 func () -> (i64) {
 block 0 () {
-  v0 = i64.const 8
+  v0 = i64.const 16392
   v1 = i64.const 987654
   i64.atomic.store v0 v1
   v2 = i64.const 0
   v3 = thread.spawn 1 v2 v2
-  v4 = i64.const 0
+  v4 = i64.const 16384
   v5 = i32.const 1
   i32.atomic.store v4 v5
-  v6 = i64.const 0
+  v6 = i64.const 16384
   v7 = i32.const 1
   v8 = atomic.notify v6 v7
   v9 = thread.join v3
@@ -1227,11 +1229,11 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, v0: i64) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   v2 = i32.const 0
   v3 = i64.const 1000000000
   v4 = i32.atomic.wait v1 v2 v3
-  v5 = i64.const 8
+  v5 = i64.const 16392
   v6 = i64.atomic.load v5
   return v6
   }
@@ -1384,7 +1386,7 @@ fn dap_over_bytecode_breakpoint_inside_a_fiber() {
 }
 
 // A fibers-on-threads guest: two spawned workers each run a §12 fiber (`cont.new`/`resume`×2), then
-// atomically add the fiber's return (25) into mem[0] → 50. The fiber body's add is on line 32; the
+// atomically add the fiber's return (25) into mem[16384] (one guard up) → 50. The fiber body's add is on line 32; the
 // module spawns threads, so DAP routes it to the scheduled `ScheduledDebugRun`.
 const FIBER_WORKERS: &str = r#"
 memory 16
@@ -1396,7 +1398,7 @@ block 0 () {
   vh1 = thread.spawn 1 vsp va
   vj0 = thread.join vh0
   vj1 = thread.join vh1
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vr = i64.atomic.load vaddr
   return vr
   }
@@ -1410,7 +1412,7 @@ block 0 (vsp: i64, varg: i64) {
   vs1, vr1 = cont.resume vk vc1
   vc2 = i64.const 20
   vs2, vr2 = cont.resume vk vc2
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vrmw = i64.atomic.rmw.add vaddr vr2
   vz = i64.const 0
   return vz
