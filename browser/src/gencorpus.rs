@@ -440,10 +440,10 @@ block 0 (v0: i32, v1: i32) {
 // window, reads up to 4 MiB of stdin and echoes it to stdout — used to push **megabytes** through
 // `temen_alloc`ed buffers, well past the old fixed 1 MiB scratch cap.
 const BIG_ECHO: &str = r#"
-memory 22
+memory 23
 func (i32, i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  v3 = i64.const 0
+  v3 = i64.const 16384
   v4 = i64.const 4194304
   v5 = call.cap 0 0 (i64, i64) -> (i64) v1(v3, v4)
   v6 = call.cap 0 1 (i64, i64) -> (i64) v0(v3, v5)
