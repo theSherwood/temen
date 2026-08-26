@@ -2361,6 +2361,53 @@ impl SharedProgram {
         };
         (out, pages)
     }
+
+    /// #816 item 4 — a **cooperative tier-up run** over the shared compiled source, for a restorable
+    /// warm session: the resumable [`CoopRun`] twin of [`run_over_grown`](Self::run_over_grown), so a
+    /// page-managing warm guest's `eval_run` can tier its eligible leaves up onto emitted wasm
+    /// instead of evaluating interpreter-only. No recompile — the run's `Domain` is a cheap `Arc`
+    /// clone of the shared source plus a fresh dispatch table (sized by `host.jit_table_log2()`,
+    /// the B2 convention [`CoopRun::new_over`] follows) — so a per-eval run is build-window +
+    /// schedule, like `run_over_grown`. The window is **not** data-seeded (the caller already
+    /// restored the warm image's bytes into `back`), the reservation is caller-chosen (clamp it to
+    /// the backing, as everywhere), and the captured page-state `prots` are re-established without
+    /// zeroing ([`Mem::seed_pages`]) — the same restore contract as `run_over_grown`. Read the
+    /// post-run page map off the finished run via [`CoopRun::mem_map_info`]. `Err` if `entry` is
+    /// out of range or scheduling traps.
+    #[allow(clippy::too_many_arguments)] // the warm-restore seam inherently threads more inputs
+    pub fn coop_run_over_grown(
+        &self,
+        entry: FuncIdx,
+        args: &[Value],
+        mut fuel: u64,
+        mut host: Host,
+        tierup: Option<TierUpConfig>,
+        back: std::sync::Arc<super::Region>,
+        reserved_log2: u8,
+        prots: &[(u64, u8)],
+    ) -> Result<CoopRun, Trap> {
+        if entry as usize >= self.n_funcs {
+            return Err(Trap::Malformed);
+        }
+        let dom = Domain::child(
+            self.source.clone(),
+            build_table(self.n_funcs, host.jit_table_log2()),
+        );
+        let mut mem = self.mem_size_log2.map(|sl| {
+            let mut mm = Mem::with_reservation_over(reserved_log2, sl, back);
+            mm.seed_null_guard(self.null_guard); // #964
+            mm.seed_pages(prots);
+            mm
+        });
+        let sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
+        Ok(CoopRun {
+            dom,
+            mem,
+            host,
+            fuel,
+            sched,
+        })
+    }
 }
 
 /// THREADS.md step 4c — the **parallel** sibling of [`compile_and_run_capture_over`]: run the guest's
