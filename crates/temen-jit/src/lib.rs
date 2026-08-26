@@ -1965,10 +1965,11 @@ mod domain_teardown_tests {
     const PROMPT: Duration = Duration::from_secs(15);
 
     /// Func 1 in every fixture: a daemon vCPU that parks forever on `i32.atomic.wait` (timeout −1)
-    /// at address 0, whose word never changes and which nothing ever notifies.
+    /// at address 16384 (one guard up — #1094's unconditional NULL guard unmaps `[0, 16384)`, so the
+    /// futex word must sit above it), whose word never changes and which nothing ever notifies.
     const PARKED_DAEMON: &str = "func (i64, i64) -> (i64) {\n\
         block 0 (vsp: i64, v0: i64) {\n\
-        \x20 v1 = i64.const 0\n\
+        \x20 v1 = i64.const 16384\n\
         \x20 v2 = i32.const 0\n\
         \x20 v3 = i64.const -1\n\
         \x20 v4 = i32.atomic.wait v1 v2 v3\n\
@@ -2002,7 +2003,7 @@ mod domain_teardown_tests {
              block 0 () {{\n\
              \x20 v0 = i64.const 0\n\
              \x20 v1 = thread.spawn 1 v0 v0\n\
-             \x20 v2 = i64.const 8\n\
+             \x20 v2 = i64.const 16392\n\
              \x20 v3 = i32.const 0\n\
              \x20 v4 = i64.const 10000000\n\
              \x20 v5 = i32.atomic.wait v2 v3 v4\n\
@@ -2049,7 +2050,7 @@ mod domain_teardown_tests {
              block 0 () {{\n\
              \x20 v0 = i64.const 0\n\
              \x20 v1 = thread.spawn 1 v0 v0\n\
-             \x20 v2 = i64.const 8\n\
+             \x20 v2 = i64.const 16392\n\
              \x20 v3 = i32.const 0\n\
              \x20 v4 = i64.const 10000000\n\
              \x20 v5 = i32.atomic.wait v2 v3 v4\n\
@@ -2087,7 +2088,7 @@ mod domain_teardown_tests {
              block 0 () {{\n\
              \x20 v0 = i64.const 0\n\
              \x20 v1 = thread.spawn 1 v0 v0\n\
-             \x20 v2 = i64.const 8\n\
+             \x20 v2 = i64.const 16392\n\
              \x20 v3 = i32.const 0\n\
              \x20 v4 = i64.const 10000000\n\
              \x20 v5 = i32.atomic.wait v2 v3 v4\n\
@@ -2114,7 +2115,7 @@ mod domain_teardown_tests {
              \x20 v0 = i64.const 0\n\
              \x20 v1 = thread.spawn 1 v0 v0\n\
              \x20 v2 = thread.spawn 2 v0 v0\n\
-             \x20 v3 = i64.const 8\n\
+             \x20 v3 = i64.const 16392\n\
              \x20 v4 = i32.const 0\n\
              \x20 v5 = i64.const 10000000\n\
              \x20 v6 = i32.atomic.wait v3 v4 v5\n\
