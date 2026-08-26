@@ -786,9 +786,17 @@ fn par_box(inner: bytecode::Vcpu<'static>) -> *mut ParVcpu {
     }))
 }
 
-/// Attach the tier-up bitmap (if published) — only the **plain compute paths** (root / `thread.spawn`
-/// child over the primary module + window) tier up; §14/§22 orchestration roots and confined children
-/// run different modules/windows, so they stay on the interpreter.
+/// Attach the tier-up bitmap (if published). #816 item 5 — every vCPU of the run carries it: the
+/// plain compute paths (root / `thread.spawn` child), the §14/§22 orchestration roots, and §14
+/// **confined children** alike. The routing is structurally per-vCPU on this driver (the coop
+/// driver needed explicit per-event routing; here each Worker holds its own window): a
+/// [`PAR_TIERUP`]'s `mapped`/page-state come from **that vCPU's own `Mem`** (a confined child's
+/// fully-mapped carve — its confinement bound), and the Worker calls the emitted `f{func}` with
+/// **its own** `win` (the carve base for a confined child's Worker). The engine's `module == 0`
+/// dispatch gate keeps the bitmap inert on a separate-module child (its direct `Call`s resolve in
+/// its own module, never the primary's emitted set), and `emit_module` turns bound-check elision
+/// off for any instantiator-bearing module, so an emitted access always checks the live per-event
+/// bound — a carve smaller than the emit-time window can never be overrun (#1117's floor rule).
 fn with_tierup(inner: bytecode::Vcpu<'static>) -> bytecode::Vcpu<'static> {
     match par_jit_eligible() {
         Some(e) => {
@@ -1777,7 +1785,9 @@ pub extern "C" fn temen_par_root(
             &[],
             host,
         ) {
-            Ok(inner) => par_box(inner),
+            // #816 item 5: a §14 orchestration root's compute leaves tier up too (module-0 root
+            // over the full run window — the same shape as the plain root below).
+            Ok(inner) => par_box(with_tierup(inner)),
             Err(_) => {
                 par_vcpu_retire();
                 core::ptr::null_mut()
@@ -1796,7 +1806,9 @@ pub extern "C" fn temen_par_root(
             back,
             &[],
         ) {
-            Ok(inner) => par_box(inner.with_shared_host(&cfg.host)),
+            // #816 item 5: the §22 runtime-compile root's compute leaves tier up too (the JACL
+            // shape — its `Jit.compile`d units already ran emitted; now so do its own hot leaves).
+            Ok(inner) => par_box(with_tierup(inner.with_shared_host(&cfg.host))),
             Err(_) => {
                 par_vcpu_retire();
                 core::ptr::null_mut()
@@ -1914,7 +1926,11 @@ pub extern "C" fn temen_par_child_confined(
         size_log2 as u8,
         fuel as u64,
     ) {
-        Ok(inner) => par_box(inner),
+        // #816 item 5: a same-module confined child's compute leaves tier up over its OWN carve —
+        // its Worker's `win` is the carve base and each event's `mapped`/page-state come from the
+        // child's own `Mem` (the carve-sized confinement bound). A separate-module child carries
+        // the bitmap inertly (the engine's module-0 dispatch gate). See [`with_tierup`].
+        Ok(inner) => par_box(with_tierup(inner)),
         Err(_) => {
             par_vcpu_retire();
             core::ptr::null_mut()
