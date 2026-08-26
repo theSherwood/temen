@@ -8496,6 +8496,13 @@ impl FiberRegistry {
         // a freed (cleared) bit is the recycling that lifts the lifetime cap to peak-concurrent.
         let floor = t.fibers.len();
         let mut c = MAX_SHADOW_CTX;
+        // #1094: `SHADOW_BASE` moved one guard up, so the top `MAX_SHADOW_CTX` regions no longer all fit
+        // under `DURABLE_RESERVE` — skip the non-fitting top contexts before searching, exactly as the
+        // fiber path gates `cont.new` with [`shadow_region_fits`]. (Before the guard relocation every
+        // context fit, so this loop was a no-op.)
+        while c > floor && !shadow_region_fits(c) {
+            c -= 1;
+        }
         while c > floor {
             if t.vcpu_mask & (1 << c) == 0 {
                 t.vcpu_mask |= 1 << c;
