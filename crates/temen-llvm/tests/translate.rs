@@ -12501,6 +12501,19 @@ fn bash_demo_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../temen-run/demos/bash")
 }
 
+/// Exit code of a bash run's outcome — `Exited(c)` from the guest's `exit()`, or the `i32`/`i64`
+/// its `main` returned.
+fn bash_exit_code(o: &temen_run::Outcome) -> i32 {
+    match o {
+        temen_run::Outcome::Exited(c) => *c,
+        temen_run::Outcome::Returned(v) => match v.first() {
+            Some(temen_run::Value::I32(c)) => *c,
+            Some(temen_run::Value::I64(c)) => *c as i32,
+            _ => -1,
+        },
+    }
+}
+
 /// **▶ GNU bash translates + verifies** (#802 slice 2 — the whole-shell gate). Runs the faithful
 /// `demos/bash/build_bitcode.sh` (fetch bash 5.2.21 → configure the bring-up config → native
 /// oracle → 152 per-TU bitcodes with each Makefile's own flags → llvm-link + shim + waist) and
@@ -12660,6 +12673,34 @@ fn demo_bash_translates_and_verifies() {
             String::from_utf8_lossy(&native.stdout),
             "bash -c {script:?}: stdout differs from the oracle"
         );
+
+        // ▶ #748 — the **dual-driver pin**: the same script on the cooperative bytecode tier and
+        // on `drive_parallel` (every bash fork twin a real OS thread, waitpid a condvar block,
+        // pipes level-triggered polls) must agree WITH EACH OTHER on status + stdout. The two
+        // drivers are each other's oracle here, not native: async signal delivery into a running
+        // C handler is an interpreter-only tier (#796 L2), so the kill-based trap scripts print
+        // less on the bytecode tier under BOTH drivers, coherently.
+        let (cap_c, posix_c) = temen_run::posix::posix_cap(0, 0, Vec::new());
+        let coop = inst
+            .run_with_caps(temen_run::Backend::Bytecode, &config, &[("posix", cap_c)])
+            .unwrap_or_else(|e| panic!("bash -c {script:?} (coop bytecode) failed: {e}"));
+        let (cap_p, posix_p) = temen_run::posix::posix_cap(0, 0, Vec::new());
+        let par = inst
+            .run_with_caps_parallel(&config, &[("posix", cap_p)])
+            .unwrap_or_else(|e| panic!("bash -c {script:?} (parallel) failed: {e}"));
+        assert_eq!(
+            bash_exit_code(&coop.outcome),
+            bash_exit_code(&par.outcome),
+            "bash -c {script:?}: coop and parallel drivers disagree on the exit status \
+             (coop {:?}, parallel {:?})",
+            coop.outcome,
+            par.outcome
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&posix_c.stdout()),
+            String::from_utf8_lossy(&posix_p.stdout()),
+            "bash -c {script:?}: coop and parallel drivers disagree on stdout"
+        );
     }
 
     // ▶ Slice 4 tail — **external commands**: stage the #801 /bin (the chibicc-world coreutils,
@@ -12723,24 +12764,30 @@ fn demo_bash_translates_and_verifies() {
             ..Default::default()
         };
         // posix_cap plus the /bin registration, which must happen inside the grant (module
-        // handles live in the run's Host) — the `stage_executable` shape from c_posix.rs.
-        let (posix, make) = temen_posix::cap(0, 0, Vec::new());
-        let fork = temen_posix::cap_fork_factory(&posix);
-        let p = posix.clone();
-        let bins_for_grant = std::sync::Arc::clone(&bins);
-        let cap = temen_run::HostCap::custom(temen_interp::cap_id::HOST_PROC, 0, move |h, _win| {
-            let handle = h.grant_host_proc_forkable(make(), std::sync::Arc::clone(&fork));
-            let (door, armed) = temen_posix::cap_signal_source(&p);
-            h.set_signal_source(door, armed);
-            h.push_exec_remap_hook(temen_posix::cap_exec_remap_hook(&p));
-            let (names, sigs) = temen_posix::cap_vtable();
-            h.set_host_proc_vtable(handle, names, sigs);
-            for (path, m, wl) in bins_for_grant.iter() {
-                let mh = h.grant_module(m);
-                p.register_executable(path, mh, *wl);
-            }
-            handle
-        });
+        // handles live in the run's Host) — the `stage_executable` shape from c_posix.rs. A
+        // fresh grant per driver below: each run owns its personality world + module handles.
+        let mk_cap = || {
+            let (posix, make) = temen_posix::cap(0, 0, Vec::new());
+            let fork = temen_posix::cap_fork_factory(&posix);
+            let p = posix.clone();
+            let bins_for_grant = std::sync::Arc::clone(&bins);
+            let cap =
+                temen_run::HostCap::custom(temen_interp::cap_id::HOST_PROC, 0, move |h, _win| {
+                    let handle = h.grant_host_proc_forkable(make(), std::sync::Arc::clone(&fork));
+                    let (door, armed) = temen_posix::cap_signal_source(&p);
+                    h.set_signal_source(door, armed);
+                    h.push_exec_remap_hook(temen_posix::cap_exec_remap_hook(&p));
+                    let (names, sigs) = temen_posix::cap_vtable();
+                    h.set_host_proc_vtable(handle, names, sigs);
+                    for (path, m, wl) in bins_for_grant.iter() {
+                        let mh = h.grant_module(m);
+                        p.register_executable(path, mh, *wl);
+                    }
+                    handle
+                });
+            (cap, posix)
+        };
+        let (cap, posix) = mk_cap();
         let run = inst
             .run_with_caps(temen_run::Backend::TreeWalk, &config, &[("posix", cap)])
             .unwrap_or_else(|e| panic!("bash -c {script:?} (external) failed: {e}"));
@@ -12771,6 +12818,44 @@ fn demo_bash_translates_and_verifies() {
             String::from_utf8_lossy(&native.stdout),
             "bash -c {script:?} (external): stdout differs from the oracle"
         );
+
+        // ▶ #748 dual-driver pin over the EXEC surface: the same exec'd pipeline on both bytecode
+        // drivers — on `drive_parallel` every stage is a real OS thread exec'ing its coreutil
+        // (the in-place host/table swap), piped through level-triggered CorePipe blocks. No
+        // signal scripts in this list, so both drivers must also match the native oracle — pin
+        // stdout against NATIVE for each, which implies coop ≡ parallel too.
+        for (label, run_r, posix_r) in [
+            {
+                let (cap, px) = mk_cap();
+                (
+                    "coop bytecode",
+                    inst.run_with_caps(temen_run::Backend::Bytecode, &config, &[("posix", cap)]),
+                    px,
+                )
+            },
+            {
+                let (cap, px) = mk_cap();
+                (
+                    "parallel",
+                    inst.run_with_caps_parallel(&config, &[("posix", cap)]),
+                    px,
+                )
+            },
+        ] {
+            let r = run_r
+                .unwrap_or_else(|e| panic!("bash -c {script:?} ({label}) failed: {e}"));
+            assert_eq!(
+                bash_exit_code(&r.outcome),
+                native.status.code().unwrap_or(-1),
+                "bash -c {script:?} ({label}): exit status differs from the oracle (outcome {:?})",
+                r.outcome
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&posix_r.stdout()),
+                String::from_utf8_lossy(&native.stdout),
+                "bash -c {script:?} ({label}): stdout differs from the oracle"
+            );
+        }
     }
 
     // ▶ Interactive rung 1 (#802 interactive slice): `bash -i` on the **#797 controlling
@@ -12827,6 +12912,67 @@ fn demo_bash_translates_and_verifies() {
         assert!(
             err.contains("exit"),
             "bash -i: ^D printed bash's `exit` farewell (stderr: {err:?})"
+        );
+    }
+
+    // ▶ #748/#1122 route (b) — the same interactive session on the **parallel driver**: the
+    // terminal read is a CorePipe block (a level-triggered poll on the parallel driver), so the
+    // feeder's keystrokes land with no dedicated wake, while every bash fork twin would be a real
+    // OS thread. The `^C` is fed but its ONLY assertable effect is the swallow: async delivery
+    // into the parked read is an interpreter-only tier (#796 L2), so the interrupt is absorbed at
+    // the feed-time line discipline and `$?` stays 0 — pinned as `rc=0` (when async delivery
+    // lands on the bytecode tier, this flips to `rc=130` and the pin should move to match the
+    // tree-walker session above). The session must still fully work around it: prompt loop, the
+    // typed command runs, `^D` exits with the farewell. (The cooperative driver cannot run this
+    // session at all yet — the #1122 route (a) suspend/resume gap — so only parallel is pinned.)
+    {
+        let (cap, posix) = temen_run::posix::posix_cap_terminal(0, 0);
+        let feeder = {
+            let px = posix.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                for keys in ["echo hi\n", "\x03", "echo rc=$?\n", "\x04"] {
+                    px.feed_terminal(keys.as_bytes());
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            })
+        };
+        let config = temen_run::RunConfig {
+            args: vec![b"bash".to_vec(), b"-i".to_vec()],
+            env: vec![
+                b"PATH=/bin".to_vec(),
+                b"HOME=/".to_vec(),
+                b"PS1=$ ".to_vec(),
+            ],
+            ..Default::default()
+        };
+        let run = inst
+            .run_with_caps_parallel(&config, &[("posix", cap)])
+            .expect("bash -i session (parallel)");
+        feeder.join().expect("feeder thread");
+        assert_eq!(
+            run.outcome,
+            temen_run::Outcome::Exited(0),
+            "bash -i (parallel): the ^D exit carries the last command's status"
+        );
+        let out = String::from_utf8_lossy(&posix.stdout()).into_owned();
+        let err = String::from_utf8_lossy(&posix.stderr()).into_owned();
+        assert!(
+            out.contains("echo hi\nhi\n"),
+            "bash -i (parallel): the typed command echoed and ran (stdout: {out:?})"
+        );
+        assert!(
+            out.contains("rc=0"),
+            "bash -i (parallel): the fed ^C is absorbed without async delivery (the pinned \
+             bytecode-tier gap — see the comment above) (stdout: {out:?})"
+        );
+        assert!(
+            err.matches("$ ").count() >= 2,
+            "bash -i (parallel): the PS1 prompt re-printed between commands (stderr: {err:?})"
+        );
+        assert!(
+            err.contains("exit"),
+            "bash -i (parallel): ^D printed bash's `exit` farewell (stderr: {err:?})"
         );
     }
 
