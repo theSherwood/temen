@@ -1511,6 +1511,7 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
         false,
         None,
         temen_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
+        &[],
     )
 }
 
@@ -1602,6 +1603,7 @@ pub fn compile_module_nested_with_eligibility(
         true,
         None,
         null_guard,
+        &[],
     )?;
     Ok((wasm, eligible))
 }
@@ -1696,6 +1698,74 @@ pub fn compile_module_b2(
         false,
         None,
         temen_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
+        &[],
+    )
+}
+
+/// **#1110 emit-split prototype.** Emit ONE partition of a whole-program split: this module emits the
+/// functions where `in_module[i]`, and shares the reserved funcref table `env.__indirect_function_table`
+/// (sized `1 << table_log2`) with its sibling partition(s). A `Call`/`ReturnCall` to a function emitted
+/// by a *sibling* (in-subset but not in this partition) lowers to a `call_indirect` through that table
+/// at the callee's index; a function neither in this partition nor in-subset stays a cross-tier interp
+/// leaf (`env.call_interp`), exactly as in the single-module emit.
+///
+/// The host links the partitions by instantiating each against one shared memory + the one shared table
+/// and writing every slot `i` with the emitting instance's `f{i}` funcref (`table.set(i, inst.exports['f'+i])`)
+/// — the same host-populates-every-slot contract as Model B2 ([`compile_module_b2`]). Callers pass the
+/// **same** `m` and `table_log2` to every partition and complementary `in_module` masks; a slot's owner
+/// is whichever partition has `in_module[i]`. The mask stays the compile-time constant `1<<table_log2`
+/// (invariant I2), so confinement is identical to the single-module tier.
+///
+/// This is a measurement vehicle for whether a smaller emitted module lets V8 tier the hot path up to
+/// TurboFan on the first Run (and at what cross-module-call cost); it is not yet wired into `compile_jit`.
+pub fn compile_module_split(
+    m: &Module,
+    shared_memory: bool,
+    table_log2: u32,
+    in_module: &[bool],
+) -> Result<Vec<u8>, Error> {
+    let a = analyze(m);
+    if !a.in_subset.iter().all(|&s| s) {
+        return Err(Error::Unsupported(
+            "a function is outside the integer subset",
+        ));
+    }
+    let n = m.funcs.len();
+    if in_module.len() != n {
+        return Err(Error::Unsupported("split partition mask length mismatch"));
+    }
+    // #1038 budget guard on THIS partition's estimated emitted size — the split's whole point is smaller
+    // modules, but decline (don't OOM) if a pathological partition still exceeds the engine budget.
+    let est: usize = (0..n)
+        .filter(|&i| in_module[i])
+        .map(|i| est_emitted_size(&m.funcs[i]))
+        .sum();
+    if est > MAX_EST_EMITTED_MODULE_BYTES {
+        return Err(Error::Unsupported(
+            "estimated emitted partition exceeds the engine memory budget",
+        ));
+    }
+    let emitted: Vec<usize> = (0..n).filter(|&i| in_module[i]).collect();
+    // Each emitted func's wasm index = IMPORTED_FUNCS + its position among *this* partition's emitted
+    // set (not its Temen index — the partition is a subset), matching the export/name-section layout.
+    let mut wasm_of: Vec<Option<u32>> = vec![None; n];
+    for (bi, &fi) in emitted.iter().enumerate() {
+        wasm_of[fi] = Some(IMPORTED_FUNCS + bi as u32);
+    }
+    // A sibling-emitted callee (in-subset, not in this partition) is reached cross-module; an interp
+    // leaf (`!in_subset`) is not cross_module and keeps its `env.call_interp` lowering.
+    let cross_module: Vec<bool> = (0..n).map(|i| !in_module[i] && a.in_subset[i]).collect();
+    emit_module(
+        m,
+        shared_memory,
+        &emitted,
+        &wasm_of,
+        &a.interp_leaf,
+        Some(table_log2),
+        false,
+        None,
+        temen_ir::module_null_guard(m),
+        &cross_module,
     )
 }
 
@@ -2036,6 +2106,7 @@ pub fn compile_module_reactor_budgeted(
             false,
             None,
             temen_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
+            &[],
         )?;
         // Measure the emitted bodies and pull any over-large *marshallable* one out for a re-emit as a
         // cross-tier leaf. An over-large body that can't be crossed (non-marshallable sig) has nowhere
@@ -2124,6 +2195,7 @@ pub fn compile_module_reactor_keep(
         false,
         None,
         temen_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
+        &[],
     )?;
     Ok((wasm, emitted_bitmap))
 }
@@ -2361,6 +2433,7 @@ fn compile_module_tierup_inner(
             nested_caps,
             paged,
             null_guard,
+            &[],
         )?;
         return Ok((wasm, vec![false; n]));
     }
@@ -2479,6 +2552,7 @@ fn compile_module_tierup_inner(
         nested_caps,
         paged,
         null_guard,
+        &[],
     )?;
     Ok((wasm, emit))
 }
@@ -2578,6 +2652,7 @@ fn compile_interp_only(
         nested_caps,
         None,
         temen_ir::module_null_guard(m), // #964 (vacuous here — no bodies — but kept uniform)
+        &[],
     )?;
     Ok(Artifact {
         wasm,
@@ -2650,7 +2725,15 @@ fn emit_module(
     nested_caps: bool,
     paged: Option<u8>,
     null_guard: Option<u64>,
+    cross_module: &[bool],
 ) -> Result<Vec<u8>, Error> {
+    // #1110 emit-split prototype: `cross_module[g]` ⇒ function `g` is emitted by a *sibling* module of
+    // this partition, reached through the shared reserved funcref table (`env.__indirect_function_table`)
+    // by a `call_indirect` on `g`'s env-prepended signature at table slot `g` — the host populates every
+    // slot at link time (§22 Model B2), so the mask stays the compile-time constant `1<<table_log2`
+    // (invariant I2). Empty ⇒ single-module emit (every `Call` target is in this module or an interp
+    // leaf), the behavior of every non-split caller. Only meaningful in shared-reserved mode.
+    let is_xmod = |i: usize| cross_module.get(i).copied().unwrap_or(false);
     // An import *manifest* is fine (IMPORTS.md phase 3): executable `call.import`s dispatch on the
     // import-capable interpreter tier, reached through outlined wrappers / cross-tier calls. What
     // must not happen is an import op surviving in a function this emitter actually lowers — the
@@ -2752,6 +2835,31 @@ fn emit_module(
             for ty in indirect_ty {
                 needs_table = true;
                 let key = indirect_type_bytes(sig_of(&m.types, *ty))?; // #922: resolve interned index
+                if !types.contains(&key) {
+                    types.push(key);
+                }
+            }
+            // #1110: a `Call`/`ReturnCall` to a sibling-emitted function lowers to a `call_indirect`
+            // through the shared table, so its env-prepended signature must be declared too (exactly as
+            // an explicit indirect target's is above). The mask uses `table_size`, so `needs_table` in
+            // reserved mode is moot (the table is always imported), but declare the type either way.
+            let xmod_target = b
+                .insts
+                .iter()
+                .filter_map(|inst| match inst {
+                    Inst::Call { func, .. } if is_xmod(*func as usize) => Some(*func),
+                    _ => None,
+                })
+                .chain(match &b.term {
+                    Terminator::ReturnCall { func, .. } if is_xmod(*func as usize) => Some(*func),
+                    _ => None,
+                });
+            for g in xmod_target {
+                let callee = &m.funcs[g as usize];
+                let key = indirect_type_bytes(&FuncType {
+                    params: callee.params.clone(),
+                    results: callee.results.clone(),
+                })?;
                 if !types.contains(&key) {
                     types.push(key);
                 }
@@ -2858,6 +2966,7 @@ fn emit_module(
             nested_caps,
             paged,
             null_guard,
+            cross_module,
         )?);
     }
     bodies.extend(extra_bodies);
@@ -3433,6 +3542,7 @@ fn emit_func(
     nested_caps: bool,
     paged: Option<u8>,
     null_guard: Option<u64>,
+    cross_module: &[bool],
 ) -> Result<Vec<u8>, Error> {
     let n_params = 2 + f.params.len() as u32; // win, env, then the Temen params
 
@@ -3600,6 +3710,7 @@ fn emit_func(
             types,
             table_size,
             nested_caps,
+            cross_module,
         )?;
     }
     code.push(OP_END); // close the loop
@@ -4109,7 +4220,9 @@ fn emit_block_body(
     types: &[(Vec<u8>, Vec<u8>)],
     table_size: u32,
     nested_caps: bool,
+    cross_module: &[bool],
 ) -> Result<(), Error> {
+    let is_xmod = |i: usize| cross_module.get(i).copied().unwrap_or(false);
     let mut next_val = b.params.len(); // where the next instruction's results land
                                        // Slice-3 confinement-check elision: a block-local **upper-bound** map over SSA values, in
                                        // lockstep with the value numbering `next_val` drives (block params carry no bound → `UB_TOP`;
@@ -4553,6 +4666,37 @@ fn emit_block_body(
                         code.push(OP_CALL);
                         uleb(code, widx as u64);
                         // Results pushed in order; pop into destination locals in reverse.
+                        for i in (0..n_results).rev() {
+                            code.push(OP_LOCAL_SET);
+                            uleb(code, cx.local_of[k][next_val + i] as u64);
+                        }
+                    }
+                    // #1110 cross-module (emit-split): `func` is emitted by a *sibling* partition.
+                    // Reach it at native speed through the shared reserved table — push win/env/args,
+                    // then the callee's Temen index masked into the table, and `call_indirect` on its
+                    // env-prepended signature (wasm's signature check = the §3c type-id check). The host
+                    // populates slot `func` with the sibling's `f{func}` funcref at link time, so this is
+                    // an ordinary indirect dispatch with a compile-time-constant index.
+                    None if is_xmod(*func as usize) => {
+                        let ft = FuncType {
+                            params: callee.params.clone(),
+                            results: callee.results.clone(),
+                        };
+                        code.push(OP_LOCAL_GET);
+                        uleb(code, 0); // win
+                        code.push(OP_LOCAL_GET);
+                        uleb(code, 1); // env
+                        for a in args {
+                            get(code, cx, *a);
+                        }
+                        code.push(OP_I32_CONST);
+                        sleb32(code, *func as i32);
+                        code.push(OP_I32_CONST);
+                        sleb32(code, (table_size - 1) as i32);
+                        code.push(0x71); // i32.and → mask into the table (invariant I2 constant)
+                        code.push(0x11); // call_indirect
+                        uleb(code, indirect_type_index(types, &ft)? as u64);
+                        uleb(code, 0); // table index 0
                         for i in (0..n_results).rev() {
                             code.push(OP_LOCAL_SET);
                             uleb(code, cx.local_of[k][next_val + i] as u64);
@@ -5006,6 +5150,29 @@ fn emit_block_body(
                     }
                     code.push(OP_RETURN_CALL);
                     uleb(code, widx as u64);
+                }
+                // #1110 cross-module tail call (emit-split): `func` is sibling-emitted — a native
+                // `return_call_indirect` through the shared table (frame-reusing, like the direct form).
+                None if is_xmod(*func as usize) => {
+                    let ft = FuncType {
+                        params: callee.params.clone(),
+                        results: callee.results.clone(),
+                    };
+                    code.push(OP_LOCAL_GET);
+                    uleb(code, 0); // win
+                    code.push(OP_LOCAL_GET);
+                    uleb(code, 1); // env
+                    for a in args {
+                        get(code, cx, *a);
+                    }
+                    code.push(OP_I32_CONST);
+                    sleb32(code, *func as i32);
+                    code.push(OP_I32_CONST);
+                    sleb32(code, (table_size - 1) as i32);
+                    code.push(0x71); // i32.and → mask into the table (invariant I2 constant)
+                    code.push(OP_RETURN_CALL_INDIRECT);
+                    uleb(code, indirect_type_index(types, &ft)? as u64);
+                    uleb(code, 0); // table index 0
                 }
                 // Cross-tier: marshal args into the env scratch, `env.call_interp`, load results back
                 // onto the stack, then return (the tail-call form of the mid-block cross-tier sequence).
