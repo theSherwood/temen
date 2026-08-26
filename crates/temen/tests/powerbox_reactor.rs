@@ -10,8 +10,9 @@
 use temen_run::{instantiate, Backend, RunConfig, Value};
 
 /// A reactor program with no capabilities: the paramless `_start` (func 0, run once by
-/// [`Instance::start`]) zeroes an accumulator in a BSS window slot (offset 1024, page 0, no data
-/// segment → persisted, not reset by `init_data`); `add(sp, x)` adds `x` to it and returns the
+/// [`Instance::start`]) zeroes an accumulator in a BSS window slot (offset 17408, above the #1094
+/// NULL guard, no data segment → persisted, not reset by `init_data`); `add(sp, x)` adds `x` to it
+/// and returns the
 /// running total. Non-`_start` exports keep the `(i64 sp, …)` reactor calling convention
 /// (`call_export` supplies `sp`); only func 0 / `_start` is paramless (IMPORTS.md phase 4).
 const COUNTER: &str = "\
@@ -20,7 +21,7 @@ export 0 func \"_start\" 0
 export 1 func \"add\" 1
 func () -> (i32) {
 block 0 () {
-  v0 = i64.const 1024
+  v0 = i64.const 17408
   v1 = i64.const 0
   i64.store v0 v1
   v2 = i32.const 0
@@ -29,7 +30,7 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (v0: i64, v1: i64) {
-  v2 = i64.const 1024
+  v2 = i64.const 17408
   v3 = i64.load v2
   v4 = i64.add v3 v1
   i64.store v2 v4
