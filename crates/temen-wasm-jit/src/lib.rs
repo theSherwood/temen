@@ -2249,7 +2249,14 @@ pub fn compile_module_reactor_capped(
     shared_memory: bool,
     cap: usize,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
-    compile_module_reactor_budgeted(m, entry, shared_memory, cap, MAX_EST_EMITTED_MODULE_BYTES, None)
+    compile_module_reactor_budgeted(
+        m,
+        entry,
+        shared_memory,
+        cap,
+        MAX_EST_EMITTED_MODULE_BYTES,
+        None,
+    )
 }
 
 /// [`compile_module_reactor_capped`] with an explicit **module-total** emit budget (#1038 — see

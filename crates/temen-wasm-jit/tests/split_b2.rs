@@ -189,7 +189,11 @@ fn local_split_dispatch_loop_matches_interp() {
         let want = oracle(&m, n);
         for k in 2..=nblocks {
             let split = compile_module_with_split(&m, false, 0, k).expect("local split emits");
-            assert_eq!(run_local(&split, n), want, "local split k={k} != interp (n={n})");
+            assert_eq!(
+                run_local(&split, n),
+                want,
+                "local split k={k} != interp (n={n})"
+            );
         }
     }
 }
@@ -203,7 +207,11 @@ fn reactor_split_dispatch_loop_matches_interp() {
     let m = parse(DISPATCH_LOOP);
     let (wasm, _emitted) = compile_module_reactor_split(&m, 0, false, 0, 1).expect("reactor split");
     for &n in &[0i64, 1, 2, 3, 7, 20, 100] {
-        assert_eq!(run_local(&wasm, n), oracle(&m, n), "reactor split != interp (n={n})");
+        assert_eq!(
+            run_local(&wasm, n),
+            oracle(&m, n),
+            "reactor split != interp (n={n})"
+        );
     }
 }
 
