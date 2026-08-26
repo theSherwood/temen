@@ -4084,12 +4084,16 @@ fn term_targets(t: &Terminator) -> Vec<u32> {
     }
 }
 
-/// #1120 Slice 1 — emit a **standalone module** in which the single function `m.funcs[fidx]` is split
-/// into `group_count` block-group wasm functions (plus the entry wrapper). Self-contained: the function
-/// must be in-subset and make no calls / indirect calls / page ops (a call would target a function this
-/// module doesn't contain). This is the correctness vehicle for the split ABI — a differential test runs
-/// it against the interpreter oracle (INVARIANTS.md #9). Imports `env.memory`/`env.trap`/`env.call_interp`
-/// (the last unused); exports the wrapper as `"f0"`.
+/// #1120 Slice 1/2a — emit a **standalone whole-program module** in which the one function `m.funcs[fidx]`
+/// is split into `group_count` block-group wasm functions (plus an entry wrapper), while **every other
+/// function emits monolithically**. Cross-function `Call`s work in both directions: a call *into* the split
+/// function targets its wrapper (a direct wasm call at the function's normal index), and a call *out of*
+/// its group bodies is an ordinary direct wasm call — the split changes only the intra-function edges.
+///
+/// The correctness vehicle for the split ABI: a differential test runs it against the interpreter oracle
+/// (INVARIANTS.md #9). Restricted to direct calls only — no `call_indirect`/import/cap/tail calls (those
+/// need the shared table / cross-tier servicing this standalone assembler doesn't wire) and no page ops.
+/// Imports `env.memory`/`env.trap`/`env.call_interp` (the last unused); exports every `f{j}` and `fuel`.
 pub fn compile_split_fn(
     m: &Module,
     fidx: usize,
@@ -4098,34 +4102,37 @@ pub fn compile_split_fn(
 ) -> Result<Vec<u8>, Error> {
     let f = &m.funcs[fidx];
     let a = analyze(m);
-    if !a.in_subset[fidx] {
-        return Err(Error::Unsupported("function is outside the integer subset"));
+    if !a.in_subset.iter().all(|&s| s) {
+        return Err(Error::Unsupported(
+            "a function is outside the integer subset",
+        ));
     }
-    // Restrict to self-contained compute: no cross-function calls (their callees aren't in this module),
-    // no page ops. Memory loads/stores and all control flow are fine.
-    for b in &f.blocks {
-        for inst in &b.insts {
-            if matches!(
-                inst,
-                Inst::Call { .. }
-                    | Inst::CallIndirect { .. }
-                    | Inst::CallImport { .. }
-                    | Inst::CapCall { .. }
-                    | Inst::CallSym { .. }
-                    | Inst::RefFunc { .. }
-            ) {
-                return Err(Error::Unsupported("split-fn prototype: no calls"));
+    // Restrict to direct-call compute: no indirect/import/cap/tail calls (no table / cross-tier here),
+    // no page ops. Plain `Call`, memory, and all control flow are fine — in every function.
+    for func in &m.funcs {
+        for b in &func.blocks {
+            for inst in &b.insts {
+                if matches!(
+                    inst,
+                    Inst::CallIndirect { .. }
+                        | Inst::CallImport { .. }
+                        | Inst::CapCall { .. }
+                        | Inst::CallSym { .. }
+                        | Inst::RefFunc { .. }
+                ) {
+                    return Err(Error::Unsupported("split-fn: only direct calls"));
+                }
             }
-        }
-        if matches!(
-            b.term,
-            Terminator::ReturnCall { .. } | Terminator::ReturnCallIndirect { .. }
-        ) {
-            return Err(Error::Unsupported("split-fn prototype: no tail calls"));
+            if matches!(
+                b.term,
+                Terminator::ReturnCall { .. } | Terminator::ReturnCallIndirect { .. }
+            ) {
+                return Err(Error::Unsupported("split-fn: no tail calls"));
+            }
         }
     }
     if module_uses_page_ops(m) {
-        return Err(Error::Unsupported("split-fn prototype: no page ops"));
+        return Err(Error::Unsupported("split-fn: no page ops"));
     }
     let n = f.blocks.len();
     let k = group_count.clamp(1, n);
@@ -4163,8 +4170,11 @@ pub fn compile_split_fn(
             }
         }
     }
-    // wasm func indices: env.trap=0, env.call_interp=1, wrapper=2, groups=3..3+k.
-    let group_widx: Vec<u32> = (0..k).map(|g| 3 + g as u32).collect();
+    // wasm func indices: env.trap=0, env.call_interp=1, functions f{j}=2+j, group functions=2+n_funcs..
+    let n_funcs = m.funcs.len();
+    let wasm_of: Vec<Option<u32>> = (0..n_funcs).map(|j| Some(2 + j as u32)).collect();
+    let group_base = 2 + n_funcs as u32;
+    let group_widx: Vec<u32> = (0..k).map(|g| group_base + g as u32).collect();
     let split = SplitCtx {
         block_group: &block_group,
         group_widx: &group_widx,
@@ -4175,13 +4185,35 @@ pub fn compile_split_fn(
         Some(mc) => 1u64 << mc.size_log2,
         None => 0,
     };
-    let no_wasm = vec![None; m.funcs.len()];
-    let no_leaf = vec![false; m.funcs.len()];
+    let interp_leaf = vec![false; n_funcs];
     let dummy_types: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // no indirect calls → never indexed
     let null_guard = temen_ir::module_null_guard(m);
 
-    let wrapper = emit_split_wrapper(f, entry_ordinal[0], group_widx[block_group[0]])?;
-    let mut bodies = vec![wrapper];
+    // Bodies in wasm-index order: one per function (`fidx` is its wrapper), then the k group functions.
+    let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(n_funcs + k);
+    for (j, func) in m.funcs.iter().enumerate() {
+        if j == fidx {
+            bodies.push(emit_split_wrapper(
+                f,
+                entry_ordinal[0],
+                group_widx[block_group[0]],
+            )?);
+        } else {
+            bodies.push(emit_func(
+                m,
+                func,
+                mapped,
+                &wasm_of,
+                &interp_leaf,
+                &dummy_types,
+                1,
+                false,
+                None,
+                null_guard,
+                &[],
+            )?);
+        }
+    }
     for g in 0..k {
         bodies.push(emit_split_group(
             m,
@@ -4190,8 +4222,8 @@ pub fn compile_split_fn(
             &group_blocks[g],
             &entry_blocks[g],
             mapped,
-            &no_wasm,
-            &no_leaf,
+            &wasm_of,
+            &interp_leaf,
             &dummy_types,
             1,
             false,
@@ -4200,28 +4232,49 @@ pub fn compile_split_fn(
         )?);
     }
 
+    // Types: t0 trap (i32)->(), t1 call_interp (i32,i32)->(), then each function's env-prepended sig
+    // (deduped), then the group sig `(win,env,entry) -> f.results`.
+    let mut types: Vec<(Vec<u8>, Vec<u8>)> = vec![(vec![0x7f], vec![]), (vec![0x7f, 0x7f], vec![])];
+    let mut fn_type_idx: Vec<u32> = Vec::with_capacity(n_funcs);
+    for func in &m.funcs {
+        let mut params = vec![0x7f, 0x7f];
+        for p in &func.params {
+            params.push(valtype_byte(*p)?);
+        }
+        let mut res = Vec::new();
+        for r in &func.results {
+            res.push(valtype_byte(*r)?);
+        }
+        let key = (params, res);
+        let idx = match types.iter().position(|t| *t == key) {
+            Some(i) => i as u32,
+            None => {
+                types.push(key);
+                (types.len() - 1) as u32
+            }
+        };
+        fn_type_idx.push(idx);
+    }
+    let mut gres = Vec::new();
+    for r in &f.results {
+        gres.push(valtype_byte(*r)?);
+    }
+    let gkey = (vec![0x7f, 0x7f, 0x7f], gres);
+    let group_type = match types.iter().position(|t| *t == gkey) {
+        Some(i) => i as u32,
+        None => {
+            types.push(gkey);
+            (types.len() - 1) as u32
+        }
+    };
+
     // ---- assemble the module ----
     let mut out = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
 
-    // Type section (1): t0 trap (i32)->(), t1 call_interp (i32,i32)->(), t2 wrapper, t3 group.
-    let mut wrap_params = vec![0x7f, 0x7f];
-    for p in &f.params {
-        wrap_params.push(valtype_byte(*p)?);
-    }
-    let mut results = Vec::with_capacity(f.results.len());
-    for r in &f.results {
-        results.push(valtype_byte(*r)?);
-    }
-    let group_params = vec![0x7f, 0x7f, 0x7f];
-    let type_list: [(Vec<u8>, Vec<u8>); 4] = [
-        (vec![0x7f], vec![]),
-        (vec![0x7f, 0x7f], vec![]),
-        (wrap_params, results.clone()),
-        (group_params, results.clone()),
-    ];
+    // Type section (1).
     let mut sec = Vec::new();
-    uleb(&mut sec, type_list.len() as u64);
-    for (params, res) in &type_list {
+    uleb(&mut sec, types.len() as u64);
+    for (params, res) in &types {
         sec.push(0x60);
         uleb(&mut sec, params.len() as u64);
         sec.extend_from_slice(params);
@@ -4251,12 +4304,14 @@ pub fn compile_split_fn(
     uleb(&mut sec, 1);
     section(&mut out, 2, &sec);
 
-    // Function section (3): wrapper (t2) then k groups (t3).
+    // Function section (3): each function's type, then the k group functions (all the group sig).
     let mut sec = Vec::new();
-    uleb(&mut sec, 1 + k as u64);
-    uleb(&mut sec, 2); // wrapper → type 2
+    uleb(&mut sec, (n_funcs + k) as u64);
+    for &ti in &fn_type_idx {
+        uleb(&mut sec, ti as u64);
+    }
     for _ in 0..k {
-        uleb(&mut sec, 3); // group → type 3
+        uleb(&mut sec, group_type as u64);
     }
     section(&mut out, 3, &sec);
 
@@ -4275,15 +4330,17 @@ pub fn compile_split_fn(
     sec.push(OP_END);
     section(&mut out, 6, &sec);
 
-    // Export section (7): the wrapper as "f0", plus the "fuel" global (index 0) so a host/test can seed
-    // a budget and verify OutOfFuel trap-point parity with the oracle (INVARIANTS.md #9).
+    // Export section (7): every `f{j}` (the split function's is its wrapper), plus the `fuel` global so a
+    // host/test can seed a budget and verify OutOfFuel trap-point parity with the oracle (INVARIANTS #9).
     let mut sec = Vec::new();
-    uleb(&mut sec, 2);
-    let name = "f0";
-    uleb(&mut sec, name.len() as u64);
-    sec.extend_from_slice(name.as_bytes());
-    sec.push(0x00);
-    uleb(&mut sec, 2); // wrapper widx
+    uleb(&mut sec, (n_funcs + 1) as u64);
+    for (j, w) in wasm_of.iter().enumerate() {
+        let name = format!("f{j}");
+        uleb(&mut sec, name.len() as u64);
+        sec.extend_from_slice(name.as_bytes());
+        sec.push(0x00);
+        uleb(&mut sec, w.unwrap() as u64);
+    }
     let name = "fuel";
     uleb(&mut sec, name.len() as u64);
     sec.extend_from_slice(name.as_bytes());

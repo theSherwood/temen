@@ -35,9 +35,10 @@ fn oracle(m: &temen_ir::Module, args: &[i64]) -> i64 {
     }
 }
 
-/// Emit `m`'s func 0 split into `k` groups, instantiate over a private memory, and call `f0`.
-fn run_split(m: &temen_ir::Module, k: usize, args: &[i64]) -> i64 {
-    let wasm = compile_split_fn(m, 0, k, false).expect("split emits");
+/// Emit `m` with function `fidx` split into `k` groups (every other function monolithic), instantiate
+/// over a private memory, and call the entry `f0` (the interpreter's entry — func 0).
+fn run_split_fn(m: &temen_ir::Module, fidx: usize, k: usize, args: &[i64]) -> i64 {
+    let wasm = compile_split_fn(m, fidx, k, false).expect("split emits");
     let engine = Engine::default();
     let mut store: Store<i32> = Store::new(&engine, 0);
     let memory = Memory::new(&mut store, MemoryType::new(4, None)).unwrap();
@@ -80,20 +81,26 @@ fn run_split(m: &temen_ir::Module, k: usize, args: &[i64]) -> i64 {
     results[0].i64().expect("i64 result")
 }
 
-/// Split `m`'s func 0 at every K from 1..=block_count and assert parity with the oracle over `inputs`.
-fn assert_split_parity(src: &str, inputs: &[&[i64]]) {
+/// Split `m`'s function `fidx` at every K from 1..=its block count and assert parity with the oracle
+/// (entry = func 0) over `inputs`.
+fn assert_split_parity_fn(src: &str, fidx: usize, inputs: &[&[i64]]) {
     let m = parse(src);
-    let nblocks = m.funcs[0].blocks.len();
+    let nblocks = m.funcs[fidx].blocks.len();
     for args in inputs {
         let want = oracle(&m, args);
         for k in 1..=nblocks {
-            let got = run_split(&m, k, args);
+            let got = run_split_fn(&m, fidx, k, args);
             assert_eq!(
                 got, want,
-                "split k={k} args={args:?}: got {got} != oracle {want}"
+                "split fidx={fidx} k={k} args={args:?}: got {got} != oracle {want}"
             );
         }
     }
+}
+
+/// Split func 0 (the interpreter entry) — the common case.
+fn assert_split_parity(src: &str, inputs: &[&[i64]]) {
+    assert_split_parity_fn(src, 0, inputs);
 }
 
 /// A self-contained countdown-sum loop: `f0(n) = n + (n-1) + ... + 1`. Four blocks, a `br_if`, and a
@@ -236,6 +243,73 @@ fn split_fuel_trap_parity_with_monolithic() {
             }
         }
     }
+}
+
+/// #1120 Slice 2a — a **multi-function** guest: func 0 loops calling helper func 1 each iteration; the
+/// helper is itself multi-block (a branch). Splitting either function must stay correct, proving
+/// cross-function `Call`s work in both directions (a call *out of* a split function's group body, and a
+/// call *into* a split function via its wrapper).
+const CALLER_AND_HELPER: &str = r#"memory 16
+func (i64) -> (i64) {
+block 0 (vn: i64) {
+  vacc = i64.const 0
+  br 1(vn, vacc)
+}
+block 1 (vi: i64, vacc: i64) {
+  vz = i64.const 0
+  vcmp = i64.eq vi vz
+  br_if vcmp 2(vacc) 3(vi, vacc)
+}
+block 2 (vr: i64) {
+  return vr
+}
+block 3 (vi3: i64, vacc3: i64) {
+  vd = call 1 (vi3)
+  vsum = i64.add vacc3 vd
+  vone = i64.const 1
+  vim1 = i64.sub vi3 vone
+  br 1(vim1, vsum)
+}
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vten = i64.const 10
+  vgt = i64.gt_s vx vten
+  br_if vgt 1(vx) 2(vx)
+}
+block 1 (va: i64) {
+  vtwo = i64.const 2
+  vr = i64.mul va vtwo
+  return vr
+}
+block 2 (vb: i64) {
+  vc = i64.const 100
+  vr = i64.add vb vc
+  return vr
+}
+}
+"#;
+
+/// Split the **caller** (func 0, whose group body holds the `call 1`): the cross-function call emits as a
+/// direct wasm call to the monolithic helper.
+#[test]
+fn split_caller_of_helper_matches_interp() {
+    assert_split_parity_fn(
+        CALLER_AND_HELPER,
+        0,
+        &[&[0], &[1], &[2], &[5], &[12], &[100]],
+    );
+}
+
+/// Split the **callee** (func 1, the helper): func 0 calls it via its wrapper, which marshals params and
+/// tail-calls the helper's groups.
+#[test]
+fn split_helper_callee_matches_interp() {
+    assert_split_parity_fn(
+        CALLER_AND_HELPER,
+        1,
+        &[&[0], &[1], &[2], &[5], &[12], &[100]],
+    );
 }
 
 #[test]
