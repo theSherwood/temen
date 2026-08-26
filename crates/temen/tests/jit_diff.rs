@@ -1273,17 +1273,19 @@ fn jit_cap_shared_region_aliases_differential() {
 
     const MARKER: i64 = 0x0123_4567_89ab_cdefu64 as i64;
     let src = format!(
-        "memory 17\n\
+        "memory 18\n\
          func (i32) -> (i64) {{\n\
          block 0 (v0: i32) {{\n\
          \x20 v1 = call.cap 4 3 () -> (i64) v0 ()\n\
          \x20 v2 = i64.const 0\n\
+         \x20 vwa = i64.const 16384\n\
+         \x20 vwb = i64.add vwa v1\n\
          \x20 v3 = i32.const 3\n\
-         \x20 v4 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (v2, v2, v1, v3)\n\
-         \x20 v5 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (v1, v2, v1, v3)\n\
+         \x20 v4 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (vwa, v2, v1, v3)\n\
+         \x20 v5 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (vwb, v2, v1, v3)\n\
          \x20 v6 = i64.const {MARKER}\n\
-         \x20 i64.store v2 v6\n\
-         \x20 v7 = i64.load v1\n\
+         \x20 i64.store vwa v6\n\
+         \x20 v7 = i64.load vwb\n\
          \x20 return v7\n\
            }}\n\
          }}\n"
@@ -1299,7 +1301,7 @@ fn jit_cap_shared_region_aliases_differential() {
     let rj = hj.grant_shared_region_backed(temen_run::new_shared_region(region_len)); // JIT: OS section
     assert_eq!(ri, rj, "grants are deterministic");
 
-    let init = vec![0u8; 1 << 17];
+    let init = vec![0u8; 1 << 18];
     let mut fuel = 1_000_000u64;
     let (interp, imem) =
         run_capture_reserved_with_host(&m, 0, &[Value::I32(ri)], &mut fuel, &init, 0, &mut hi);
@@ -1325,9 +1327,9 @@ fn jit_cap_shared_region_aliases_differential() {
     );
     assert_eq!(imem, jmem, "interp/JIT shared-region windows diverge");
     assert_eq!(
-        &imem[0..8],
+        &imem[16384..16392],
         &MARKER.to_le_bytes(),
-        "the marker must be present at window offset 0 (non-vacuous)"
+        "the marker must be present at window offset 16384 (non-vacuous)"
     );
 }
 
@@ -1454,13 +1456,13 @@ memory 16
 
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   v2 = i32.const 72
   i32.store8 v1 v2
-  v3 = i64.const 1
+  v3 = i64.const 16385
   v4 = i32.const 105
   i32.store8 v3 v4
-  v5 = i64.const 0
+  v5 = i64.const 16384
   v6 = i64.const 2
   v7 = call.cap 0 1 (i64, i64) -> (i64) v0 (v5, v6)
   return v7
@@ -1618,6 +1620,10 @@ block 0 (v0: i32) {
         // only after a `map` grows into them. Addresses span both so the tail's fault/grow path runs.
         const PAGES: u64 = 32;
         const SPAN: u64 = PAGES * 4096;
+        // Pages 0..GUARD_PAGES are the unconditional NULL guard ([0,16384)); the guest never
+        // touches them so the two backends agree over the whole window (#1094).
+        const GUARD_PAGES: u64 = 4;
+        const GUARD: u64 = GUARD_PAGES * 4096;
         let acc0 = fresh(&mut body, "i64.const 0".into()); // running sum of loads
         let mut acc = acc0;
         let nops = 3 + next() % 8; // 3..=10 ops
@@ -1625,7 +1631,7 @@ block 0 (v0: i32) {
             match next() % 5 {
                 0 | 1 => {
                     // protect(page, prot) — prot 0 (none/unmapped), 1 (RO), 3 (RW)
-                    let page = next() % PAGES;
+                    let page = GUARD_PAGES + next() % (PAGES - GUARD_PAGES);
                     let prot = [0i32, 1, 3][(next() % 3) as usize];
                     let off = fresh(&mut body, format!("i64.const {}", page * 4096));
                     let len = fresh(&mut body, "i64.const 4096".into());
@@ -1637,7 +1643,7 @@ block 0 (v0: i32) {
                 }
                 2 => {
                     // unmap(page)
-                    let page = next() % PAGES;
+                    let page = GUARD_PAGES + next() % (PAGES - GUARD_PAGES);
                     let off = fresh(&mut body, format!("i64.const {}", page * 4096));
                     let len = fresh(&mut body, "i64.const 4096".into());
                     fresh(
@@ -1647,7 +1653,7 @@ block 0 (v0: i32) {
                 }
                 3 => {
                     // map(page, prot) — (re)commit readable (RO or RW); grows the tail when page ≥ 16
-                    let page = next() % PAGES;
+                    let page = GUARD_PAGES + next() % (PAGES - GUARD_PAGES);
                     let prot = [1i32, 3][(next() % 2) as usize];
                     let off = fresh(&mut body, format!("i64.const {}", page * 4096));
                     let len = fresh(&mut body, "i64.const 4096".into());
@@ -1659,7 +1665,7 @@ block 0 (v0: i32) {
                 }
                 4 => {
                     // store an 8-byte value at an aligned address (may land in the unmapped tail)
-                    let addr = (next() % SPAN) & !7;
+                    let addr = (GUARD + next() % (SPAN - GUARD)) & !7;
                     let val = next() as i64;
                     let a = fresh(&mut body, format!("i64.const {addr}"));
                     let v = fresh(&mut body, format!("i64.const {val}"));
@@ -1667,7 +1673,7 @@ block 0 (v0: i32) {
                 }
                 _ => {
                     // load + accumulate
-                    let addr = (next() % SPAN) & !7;
+                    let addr = (GUARD + next() % (SPAN - GUARD)) & !7;
                     let a = fresh(&mut body, format!("i64.const {addr}"));
                     let ld = fresh(&mut body, format!("i64.load v{a}"));
                     acc = fresh(&mut body, format!("i64.add v{acc} v{ld}"));

@@ -18,19 +18,24 @@ const MARKER: i64 = 0x0123_4567_89ab_cdef;
 /// mappings alias the same backing.
 fn alias_probe_src() -> String {
     format!(
-        // `memory 17` (128 KiB) so two whole granules fit at offsets 0 and `page_size` — on Windows
-        // that granule is the 64 KiB allocation granularity, so the second alias lands at 64 KiB.
-        "memory 17\n\
+        // `memory 18` (256 KiB) so two whole granules fit at window offsets `16384` and
+        // `16384 + page_size` — on Windows that granule is the 64 KiB allocation granularity, so the
+        // second alias lands at 16384 + 64 KiB. #1094: the mappings sit above the `[0, 16384)` NULL
+        // guard, so every access lands in mapped region (Region-map pattern: window_off = 16384,
+        // region_off = 0).
+        "memory 18\n\
          func (i32) -> (i64) {{\n\
          block 0 (v0: i32) {{\n\
          \x20 v1 = call.cap 4 3 () -> (i64) v0 ()\n\
          \x20 v2 = i64.const 0\n\
          \x20 v3 = i32.const 3\n\
-         \x20 v4 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (v2, v2, v1, v3)\n\
-         \x20 v5 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (v1, v2, v1, v3)\n\
+         \x20 vg = i64.const 16384\n\
+         \x20 vg2 = i64.add vg v1\n\
+         \x20 v4 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (vg, v2, v1, v3)\n\
+         \x20 v5 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (vg2, v2, v1, v3)\n\
          \x20 v6 = i64.const {MARKER}\n\
-         \x20 i64.store v2 v6\n\
-         \x20 v7 = i64.load v1\n\
+         \x20 i64.store vg v6\n\
+         \x20 v7 = i64.load vg2\n\
          \x20 return v7\n\
            }}\n\
          }}\n"
@@ -62,16 +67,18 @@ fn shared_region_without_second_mapping_is_not_aliased() {
     // Control: map the region only at offset 0, store MARKER there, and read at page_size — which is
     // an ordinary (unmapped/zero) window page, *not* aliased. Proves the positive test is non-vacuous.
     let src = format!(
-        "memory 17\n\
+        "memory 18\n\
          func (i32) -> (i64) {{\n\
          block 0 (v0: i32) {{\n\
          \x20 v1 = call.cap 4 3 () -> (i64) v0 ()\n\
          \x20 v2 = i64.const 0\n\
          \x20 v3 = i32.const 3\n\
-         \x20 v4 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (v2, v2, v1, v3)\n\
+         \x20 vg = i64.const 16384\n\
+         \x20 vg2 = i64.add vg v1\n\
+         \x20 v4 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (vg, v2, v1, v3)\n\
          \x20 v6 = i64.const {MARKER}\n\
-         \x20 i64.store v2 v6\n\
-         \x20 v7 = i64.load v1\n\
+         \x20 i64.store vg v6\n\
+         \x20 v7 = i64.load vg2\n\
          \x20 return v7\n\
            }}\n\
          }}\n"
@@ -109,23 +116,30 @@ fn ring_buffer_straddling_access_wraps_differential() {
 
     const RING_MARKER: i64 = 0x1122_3344_5566_7788;
     let src = format!(
-        "memory 17\n\
+        // #1094: the two adjacent ring mappings sit above the `[0, 16384)` NULL guard — window
+        // offsets `[16384, 16384+g)` and `[16384+g, 16384+2g)`, both aliasing region `[0, g)`
+        // (Region-map pattern: window_off = 16384, region_off = 0). The straddling store lands at
+        // `16384 + g - 4`, its views at the head `16384` and the tail `16384 + 2g - 4`.
+        "memory 18\n\
          func (i32) -> (i64) {{\n\
          block 0 (v0: i32) {{\n\
          \x20 v1 = call.cap 4 3 () -> (i64) v0 ()\n\
          \x20 v2 = i64.const 0\n\
          \x20 v3 = i32.const 3\n\
-         \x20 v4 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (v2, v2, v1, v3)\n\
-         \x20 v5 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (v1, v2, v1, v3)\n\
+         \x20 vg = i64.const 16384\n\
+         \x20 vg1 = i64.add vg v1\n\
+         \x20 v4 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (vg, v2, v1, v3)\n\
+         \x20 v5 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (vg1, v2, v1, v3)\n\
          \x20 v6 = i64.const 4\n\
-         \x20 v7 = i64.sub v1 v6\n\
+         \x20 v7 = i64.sub vg1 v6\n\
          \x20 v8 = i64.const {RING_MARKER}\n\
          \x20 i64.store v7 v8\n\
          \x20 v9 = i64.load v7\n\
-         \x20 v10 = i32.load v2\n\
+         \x20 v10 = i32.load vg\n\
          \x20 v11 = i64.const 2\n\
          \x20 v12 = i64.mul v1 v11\n\
-         \x20 v13 = i64.sub v12 v6\n\
+         \x20 v12b = i64.add vg v12\n\
+         \x20 v13 = i64.sub v12b v6\n\
          \x20 v14 = i32.load v13\n\
          \x20 v15 = i64.extend_i32_u v10\n\
          \x20 v16 = i64.const 4294967296\n\

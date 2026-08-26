@@ -200,8 +200,8 @@ fn init_window() -> Vec<u8> {
 fn v128_mem_lattice() -> Vec<(u64, u64)> {
     let mut cases = Vec::new();
     for addr in [
-        0,
-        8,
+        16384,
+        16392,
         MEM_SIZE - 16,
         MEM_SIZE - 15,
         MEM_SIZE - 1,

@@ -128,15 +128,15 @@ const HELLO_WAT: &str = r#"
     (import "wasi_snapshot_preview1" "fd_write"
       (func $fd_write (param i32 i32 i32 i32) (result i32)))
     (memory 1)
-    (data (i32.const 16) "hello\n")
+    (data (i32.const 16400) "hello\n")
     (func (export "_start")
-      (i32.store (i32.const 0) (i32.const 16))   ;; iov.buf      = 16
-      (i32.store (i32.const 4) (i32.const 6))    ;; iov.buf_len  = 6
+      (i32.store (i32.const 16384) (i32.const 16400)) ;; iov.buf      = 16400 (above the #1094 NULL guard)
+      (i32.store (i32.const 16388) (i32.const 6))     ;; iov.buf_len  = 6
       (drop (call $fd_write
-        (i32.const 1)        ;; fd          = stdout
-        (i32.const 0)        ;; iovs        = &iov
-        (i32.const 1)        ;; iovs_len    = 1
-        (i32.const 8)))))    ;; nwritten    -> mem[8]
+        (i32.const 1)            ;; fd          = stdout
+        (i32.const 16384)        ;; iovs        = &iov
+        (i32.const 1)            ;; iovs_len    = 1
+        (i32.const 16392)))))    ;; nwritten    -> mem[16392]
 "#;
 
 #[test]

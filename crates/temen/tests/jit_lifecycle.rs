@@ -60,24 +60,25 @@ fn run_jit(src: &str) -> JitOutcome {
 const KILL_DETACH: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (v0: i32) {\n\
-  ; spawn via record (op 17): entry=1 off=0 sl=12 quota=0\n\
+  ; spawn via record (op 17): entry=1 off=16384 sl=12 quota=0\n\
   q0v0 = i64.const 4294967296\n\
   q0v1 = i64.const 0\n\
   q0v2 = i64.const -4294967284\n\
   q0v3 = i64.const 4294967295\n\
-  q0a0 = i64.const 4096\n\
+  q0a0 = i64.const 20480\n\
   i64.store q0a0 q0v0\n\
-  q0a1 = i64.const 4104\n\
-  i64.store q0a1 q0v1\n\
-  q0a2 = i64.const 4112\n\
+  q0off = i64.const 16384\n\
+  q0a1 = i64.const 20488\n\
+  i64.store q0a1 q0off\n\
+  q0a2 = i64.const 20496\n\
   i64.store q0a2 q0v2\n\
-  q0a3 = i64.const 4120\n\
+  q0a3 = i64.const 20504\n\
   i64.store q0a3 q0v3\n\
-  q0a4 = i64.const 4128\n\
+  q0a4 = i64.const 20512\n\
   i64.store q0a4 q0v1\n\
-  q0a5 = i64.const 4136\n\
+  q0a5 = i64.const 20520\n\
   i64.store q0a5 q0v1\n\
-  q0a6 = i64.const 4144\n\
+  q0a6 = i64.const 20528\n\
   i64.store q0a6 q0v1\n\
   vch = call.cap 6 17 (i64) -> (i32) v0 (q0a0)\n\
   vk = call.cap 6 12 (i32) -> (i32) v0 (vch)\n\
@@ -103,24 +104,25 @@ block 0 (vci: i64) {\n\
 const POLL_DONE: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (v0: i32) {\n\
-  ; spawn via record (op 17): entry=1 off=0 sl=12 quota=0\n\
+  ; spawn via record (op 17): entry=1 off=16384 sl=12 quota=0\n\
   q1v0 = i64.const 4294967296\n\
   q1v1 = i64.const 0\n\
   q1v2 = i64.const -4294967284\n\
   q1v3 = i64.const 4294967295\n\
-  q1a0 = i64.const 4160\n\
+  q1a0 = i64.const 20480\n\
   i64.store q1a0 q1v0\n\
-  q1a1 = i64.const 4168\n\
-  i64.store q1a1 q1v1\n\
-  q1a2 = i64.const 4176\n\
+  q1off = i64.const 16384\n\
+  q1a1 = i64.const 20488\n\
+  i64.store q1a1 q1off\n\
+  q1a2 = i64.const 20496\n\
   i64.store q1a2 q1v2\n\
-  q1a3 = i64.const 4184\n\
+  q1a3 = i64.const 20504\n\
   i64.store q1a3 q1v3\n\
-  q1a4 = i64.const 4192\n\
+  q1a4 = i64.const 20512\n\
   i64.store q1a4 q1v1\n\
-  q1a5 = i64.const 4200\n\
+  q1a5 = i64.const 20520\n\
   i64.store q1a5 q1v1\n\
-  q1a6 = i64.const 4208\n\
+  q1a6 = i64.const 20528\n\
   i64.store q1a6 q1v1\n\
   vch = call.cap 6 17 (i64) -> (i32) v0 (q1a0)\n\
   br 1(v0, vch)\n\
@@ -175,24 +177,25 @@ fn jit_poll_reports_child_done() {
 const POLL_RUNNING: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (v0: i32) {\n\
-  ; spawn via record (op 17): entry=1 off=0 sl=12 quota=0\n\
+  ; spawn via record (op 17): entry=1 off=16384 sl=12 quota=0\n\
   q2v0 = i64.const 4294967296\n\
   q2v1 = i64.const 0\n\
   q2v2 = i64.const -4294967284\n\
   q2v3 = i64.const 4294967295\n\
-  q2a0 = i64.const 4224\n\
+  q2a0 = i64.const 20480\n\
   i64.store q2a0 q2v0\n\
-  q2a1 = i64.const 4232\n\
-  i64.store q2a1 q2v1\n\
-  q2a2 = i64.const 4240\n\
+  q2off = i64.const 16384\n\
+  q2a1 = i64.const 20488\n\
+  i64.store q2a1 q2off\n\
+  q2a2 = i64.const 20496\n\
   i64.store q2a2 q2v2\n\
-  q2a3 = i64.const 4248\n\
+  q2a3 = i64.const 20504\n\
   i64.store q2a3 q2v3\n\
-  q2a4 = i64.const 4256\n\
+  q2a4 = i64.const 20512\n\
   i64.store q2a4 q2v1\n\
-  q2a5 = i64.const 4264\n\
+  q2a5 = i64.const 20520\n\
   i64.store q2a5 q2v1\n\
-  q2a6 = i64.const 4272\n\
+  q2a6 = i64.const 20528\n\
   i64.store q2a6 q2v1\n\
   vch = call.cap 6 17 (i64) -> (i32) v0 (q2a0)\n\
   vfirst = call.cap 6 9 (i32) -> (i32) v0 (vch)\n\
