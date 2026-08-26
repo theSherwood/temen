@@ -855,9 +855,10 @@ block 0 (vx: i64) {
 }
 "#;
 
-/// Unix-only like the pending-win test: the native run backing must be flat for the raw window
-/// views (on the browser the backing is always flat — `Region::shared` over the cdylib buffer).
-#[cfg(unix)]
+/// Every target (unlike the unix-only pending-win test): the run backing is an **owned flat**
+/// buffer (`Region::owned_zeroed` — the same shape as the browser's `Region::shared` window), so
+/// the raw window views resolve even where `Region::new` would fall back to `Paged` (Windows),
+/// and the twin-backing seam's non-unix arm gets real end-to-end CI coverage there.
 #[test]
 fn coop_tierup_fork_twin_tiers_up_over_its_private_flat_window() {
     const FORK_FUEL: u64 = 40_000_000;
@@ -873,8 +874,10 @@ fn coop_tierup_fork_twin_tiers_up_over_its_private_flat_window() {
             let sink = host.shared_stdout();
             let out_h = host.grant_stream(temen_interp::StreamRole::Out);
             let args = [Value::I32(inst), Value::I32(out_h)];
-            let back = std::sync::Arc::new(temen_interp::Region::new(1 << 18, 4096));
-            let root_base = back.raw_base().expect("flat native backing") as usize;
+            let back = std::sync::Arc::new(
+                temen_interp::Region::owned_zeroed(1 << 18, 4096).expect("256 KiB allocates"),
+            );
+            let root_base = back.raw_base().expect("flat backing") as usize;
             let mut run = bytecode::CoopRun::new_over(
                 &m,
                 0,

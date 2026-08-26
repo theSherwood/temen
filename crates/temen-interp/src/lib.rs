@@ -25564,10 +25564,14 @@ mod mem_fork_tests {
     /// `Paged` default (the twin stays interpreted, fail-closed).
     #[test]
     fn twin_backing_goes_owned_flat_only_for_a_bounded_twin_of_a_flat_parent() {
-        // Flat parent (unix `Mapped`), reservation == backing length: the `Paged` default is
-        // replaced with an owned flat buffer.
-        let m = Mem::with_reservation(16, 16);
-        let page = m.page;
+        // Flat parent on every target (an owned flat backing — the browser's shared-window shape),
+        // reservation == backing length: the `Paged` default is replaced with an owned flat buffer.
+        let page = host_page_size();
+        let m = Mem::with_reservation_over(
+            16,
+            16,
+            Arc::new(Region::owned_zeroed(1 << 16, page).expect("64 KiB allocates")),
+        );
         let b = m.twin_backing_from(Region::paged(1 << 16, page), 1 << 16);
         assert!(
             b.raw_base().is_some(),
@@ -25582,9 +25586,12 @@ mod mem_fork_tests {
             "an out-of-bound reservation must keep the (non-flat) default"
         );
 
-        // A flat default (the unix arm) is kept as-is — lazy beats an eager copy.
-        let b = m.twin_backing_from(Region::new(1 << 16, page), 1 << 16);
-        assert!(b.raw_base().is_some());
+        // A flat default (the unix `mmap` arm) is kept as-is — lazy beats an eager copy.
+        #[cfg(unix)]
+        {
+            let b = m.twin_backing_from(Region::new(1 << 16, page), 1 << 16);
+            assert!(b.raw_base().is_some());
+        }
 
         // Non-flat parent (forced `Paged` backing): never upgrade — the tier-up world only ever
         // forks from flat windows, and an eager buffer for a pure-interp parent is waste.
@@ -25603,7 +25610,14 @@ mod mem_fork_tests {
     /// admits it and the fork twin's leaf calls tier up over its private window.
     #[test]
     fn fork_private_twin_of_a_clamped_flat_parent_is_flat_addressable() {
-        let m = Mem::with_reservation(16, 16); // flat (unix), reserved == backing len
+        // Flat parent on every target, reserved == backing len (the browser coop-run shape). On a
+        // non-unix host this exercises the seam's real arm end-to-end: the twin's `Paged` default
+        // is upgraded to the owned flat buffer.
+        let m = Mem::with_reservation_over(
+            16,
+            16,
+            Arc::new(Region::owned_zeroed(1 << 16, host_page_size()).expect("64 KiB allocates")),
+        );
         m.set_byte(8, 0x2A);
         let twin = m.fork_private().expect("a simple window forks");
         assert!(
