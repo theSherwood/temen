@@ -32,7 +32,7 @@ fn checksum(n: u64) -> i64 {
     (0..n as i64).map(mix).fold(0i64, |a, b| a.wrapping_add(b))
 }
 
-/// `(i32 handle) -> (i64)`: `n` direct `cap.call 13 0` (HOST_PROC) in a loop, summing the results
+/// `(i32 handle) -> (i64)`: `n` direct `call.cap 13 0` (HOST_PROC) in a loop, summing the results
 /// (the `io_ring_bench` seq lane shape, pointed at the offloadable registration).
 fn seq_src(n: u64) -> String {
     format!(
@@ -48,7 +48,7 @@ block 1 (v3: i32, v4: i64, v5: i64) {{
   br_if v7 2(v3, v4, v5) 3(v4)
 }}
 block 2 (v8: i32, v9: i64, v10: i64) {{
-  v11 = cap.call 13 0 (i64) -> (i64) v8(v10)
+  v11 = call.cap 13 0 (i64) -> (i64) v8(v10)
   v12 = i64.add v9 v11
   v13 = i64.const 1
   v14 = i64.add v10 v13
@@ -208,7 +208,7 @@ fn sync_ops_never_touch_parking_machinery() {
     assert_eq!(comps.minted(), 0, "plain host proc minted a completion id");
 
     // A `block_for = 0` Blocking call is the offloadable fast case — inline, nothing minted.
-    let bsrc = seq_src(n).replace("cap.call 13 0", "cap.call 10 0");
+    let bsrc = seq_src(n).replace("call.cap 13 0", "call.cap 10 0");
     let bm = parse(&bsrc);
     let mut host = Host::new();
     let bh = host.grant_blocking(Duration::ZERO, None);
@@ -222,7 +222,7 @@ fn sync_ops_never_touch_parking_machinery() {
 // ----- shared-host parallel tier: punted blocking ops genuinely overlap -----------------------
 
 /// Main `(i32 blocking) -> (i64)`: spawn `n` workers, join, return the shared accumulator at
-/// window offset 8. Worker: ONE `cap.call 10 0`, `atomic.rmw.add` the result into the cell (the
+/// window offset 8. Worker: ONE `call.cap 10 0`, `atomic.rmw.add` the result into the cell (the
 /// `io_ring_bench` threaded lane shape).
 fn threaded_src(n: u64) -> String {
     format!(
@@ -278,7 +278,7 @@ block 6 () {{
 func (i64, i64) -> (i64) {{
 block 0 (vsp: i64, vharg: i64) {{
   vhandle = i32.wrap_i64 vharg
-  vr = cap.call 10 0 (i64) -> (i64) vhandle(vsp)
+  vr = call.cap 10 0 (i64) -> (i64) vhandle(vsp)
   vaddr = i64.const 8
   vold = i64.atomic.rmw.add vaddr vr
   vz = i64.const 0
@@ -373,7 +373,7 @@ fn drive<'s, 'e>(
 }
 
 /// **The §5b serialization fix, pinned without timing.** Two parallel vCPUs each make one
-/// blocking `cap.call` on a rendezvous-2 `Blocking` handle: each punts to the offload pool and
+/// blocking `call.cap` on a rendezvous-2 `Blocking` handle: each punts to the offload pool and
 /// waits *outside* the shared host lock, so both jobs co-reside on the pool and meet the width-2
 /// barrier. Under the old hold-the-lock-across-dispatch regime this deadlocks (the first caller
 /// blocks on the barrier inside the lock; the second can never dispatch), so completing at all —

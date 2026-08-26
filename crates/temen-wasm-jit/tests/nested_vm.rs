@@ -1,8 +1,8 @@
 //! **§14 VM-in-VM on the wasm-JIT tier** — a unit whose entry *uses* its `Instantiator` capability
-//! (spawns a nested confined VM and `join`s it) now runs on emitted wasm, where before any `cap.call`
+//! (spawns a nested confined VM and `join`s it) now runs on emitted wasm, where before any `call.cap`
 //! forced the whole entry onto the interpreter (`DESIGN.md` §14, BROWSER.md "wasm-JIT tier").
 //!
-//! The mechanism under test is [`temen_wasm_jit::compile_module_nested`]: a `cap.call` to INSTANTIATOR
+//! The mechanism under test is [`temen_wasm_jit::compile_module_nested`]: a `call.cap` to INSTANTIATOR
 //! `instantiate` (op 0) / `join` (op 1) lowers to a host-driver bounce — `env.instantiate` /
 //! `env.join` imports, the funcref-table-free analog of `env.call_interp` — so the child vCPU spawn +
 //! join happen host-side, exactly as the interpreter surfaces `VcpuStop::Instantiate` to its driver.
@@ -33,8 +33,8 @@ block 0 (v0: i64) {
   voff = i64.const 0
   vslog = i64.const 10
   vquota = i64.const 0
-  vch = cap.call 6 0 (i64, i64, i64, i64) -> (i32) vinst (ventry, voff, vslog, vquota)
-  vr = cap.call 6 1 (i32) -> (i64) vinst (vch)
+  vch = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst (ventry, voff, vslog, vquota)
+  vr = call.cap 6 1 (i32) -> (i64) vinst (vch)
   return vr
   }
 }
@@ -410,8 +410,8 @@ block 0 (v0: i64) {
   voff = i64.const 0
   vslog = i64.const 10
   vquota = i64.const 0
-  vch = cap.call 6 0 (i64, i64, i64, i64) -> (i32) vinst (ventry, voff, vslog, vquota)
-  vr = cap.call 6 1 (i32) -> (i64) vinst (vch)
+  vch = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst (ventry, voff, vslog, vquota)
+  vr = call.cap 6 1 (i32) -> (i64) vinst (vch)
   vf = f64.convert_i64_s vr
   vg = call 2 (vf)
   vi = i64.trunc_sat_f64_s vg

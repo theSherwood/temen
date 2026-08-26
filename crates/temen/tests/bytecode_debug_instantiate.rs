@@ -40,8 +40,8 @@ block 0 (v0: i32) {
   i64.store q0a5 q0v4
   q0a6 = i64.const 1200
   i64.store q0a6 q0v4
-  v5 = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
-  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
   v7 = i64.const 65543
   v8 = i32.load8_u v7
   v9 = i64.extend_i32_u v8
@@ -234,8 +234,8 @@ block 0 (v0: i32) {
   i64.store q1a5 q1v4
   q1a6 = i64.const 1264
   i64.store q1a6 q1v4
-  v5 = cap.call 6 17 (i64) -> (i32) v0 (q1a0)
-  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
   return v6
   }
 }
@@ -265,8 +265,8 @@ block 0 (v0: i64) {
   i64.store q2a5 q2v4
   q2a6 = i64.const 1328
   i64.store q2a6 q2v4
-  v8 = cap.call 6 17 (i64) -> (i32) v1 (q2a0)
-  v9 = cap.call 6 1 (i32) -> (i64) v1 (v8)
+  v8 = call.cap 6 17 (i64) -> (i32) v1 (q2a0)
+  v9 = call.cap 6 1 (i32) -> (i64) v1 (v8)
   return v9
   }
 }

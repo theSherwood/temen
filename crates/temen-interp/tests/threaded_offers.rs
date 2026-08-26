@@ -31,7 +31,7 @@ block 0 (vo: cap, vs: cap, vn: i64) {
 block 1 (vo: cap, vs: cap, vn: i64) {
   vone = i64.const 1
   vn1 = i64.sub vn vone
-  vr = cap.call 268435456 0 (cap, cap, i64) -> (i64) vo (vs, vo, vn1)
+  vr = call.cap 268435456 0 (cap, cap, i64) -> (i64) vo (vs, vo, vn1)
   vrr = i64.add vr vone
   return vrr
 }
@@ -49,7 +49,7 @@ fn buried_cycle_consumer(x: i32, y: i32, tid: u32) -> temen_ir::Module {
            vhx = i32.const {x}\n\
            vhy = i32.const {y}\n\
            vn = i64.const 2\n\
-           vr = cap.call {tid} 0 (cap, cap, i64) -> (i64) vhx (vhy, vhx, vn)\n\
+           vr = call.cap {tid} 0 (cap, cap, i64) -> (i64) vhx (vhy, vhx, vn)\n\
            return vr\n\
            }}\n\
          }}\n"
@@ -156,9 +156,9 @@ fn concurrent_callers_share_one_threaded_instance() {
            vj1 = thread.join vt1\n\
            vh = i32.const {offer}\n\
            vc0 = i64.const 16400\n\
-           vr0 = cap.call {tid} 1 (i64) -> (i64) vh (vc0)\n\
+           vr0 = call.cap {tid} 1 (i64) -> (i64) vh (vc0)\n\
            vc1 = i64.const 16408\n\
-           vr1 = cap.call {tid} 1 (i64) -> (i64) vh (vc1)\n\
+           vr1 = call.cap {tid} 1 (i64) -> (i64) vh (vc1)\n\
            vsum = i64.add vr0 vr1\n\
            return vsum\n\
            }}\n\
@@ -172,7 +172,7 @@ fn concurrent_callers_share_one_threaded_instance() {
            vbase = i64.const 16400\n\
            vaddr = i64.add vbase voff\n\
            vh = i32.const {offer}\n\
-           vr = cap.call {tid} 0 (i64, i64) -> (i64) vh (vaddr, vval)\n\
+           vr = call.cap {tid} 0 (i64, i64) -> (i64) vh (vaddr, vval)\n\
            return vr\n\
            }}\n\
          }}\n"
@@ -225,7 +225,7 @@ fn concurrent_callers_never_lose_an_admission() {
             let addr = 16400 + 8 * i;
             let next = i + 1;
             body.push_str(&format!(
-                "               vc{i} = i64.const {addr}\n               vr{i} = cap.call {tid} 1 (i64) -> (i64) vh (vc{i})\n               vacc{next} = i64.add vacc{i} vr{i}\n"
+                "               vc{i} = i64.const {addr}\n               vr{i} = call.cap {tid} 1 (i64) -> (i64) vh (vc{i})\n               vacc{next} = i64.add vacc{i} vr{i}\n"
             ));
         }
         body.push_str(&format!("               return vacc{N}\n"));
@@ -243,7 +243,7 @@ fn concurrent_callers_never_lose_an_admission() {
         );
         body.push_str(&format!(
             "               vh = i32.const {offer}\n\
-               vr = cap.call {tid} 0 (i64, i64) -> (i64) vh (vaddr, vval)\n\
+               vr = call.cap {tid} 0 (i64, i64) -> (i64) vh (vaddr, vval)\n\
                return vr\n\
                }}\n\
              }}\n"
@@ -288,8 +288,8 @@ fn a_threaded_instance_keeps_state_across_calls() {
            vh = i32.const {offer}\n\
            vaddr = i64.const 16416\n\
            vval = i64.const 41\n\
-           vs = cap.call {tid} 0 (i64, i64) -> (i64) vh (vaddr, vval)\n\
-           vr = cap.call {tid} 1 (i64) -> (i64) vh (vaddr)\n\
+           vs = call.cap {tid} 0 (i64, i64) -> (i64) vh (vaddr, vval)\n\
+           vr = call.cap {tid} 1 (i64) -> (i64) vh (vaddr)\n\
            vone = i64.const 1\n\
            vrr = i64.add vr vone\n\
            return vrr\n\

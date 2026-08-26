@@ -62,7 +62,7 @@ try {
   // The gate is smoothly playable: the emitted tick clears 30 fps and far outruns the interpreter.
   // The whole tick emits once the emitter lowers tail calls (I25) — without which Doom's hottest
   // functions (e.g. I_FinishUpdate) fall to the interpreter along with their subtrees; the display
-  // cap.call is isolated behind a noinline present_frame so the pixel swizzle stays emitted too.
+  // call.cap is isolated behind a noinline present_frame so the pixel swizzle stays emitted too.
   const ok = interp > 0 && jitted > interp * 3 && jitted > 30;
   console.log(ok ? '  RESULT: wasm-JIT smoothly playable (emitted tick far outruns the interpreter)'
     : '  RESULT: not yet playable (investigate)');

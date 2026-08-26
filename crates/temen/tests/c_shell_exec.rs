@@ -7,7 +7,7 @@
 //! Both the shell and the command are ordinary C. Capability wiring: `stdout` is a re-grantable
 //! `Stream` (shared sink, so the command's output and any shell output unify); `exec_stdout`/
 //! `exec_lookup` are a tiny host fn (the embedder's PATH → `Module` map); `__spawn`/`__join` link to
-//! `cap.call 6 13`/`6 1` (`Resolved::Cap`, link-time symbol resolution) and dispatch on the
+//! `call.cap 6 13`/`6 1` (`Resolved::Cap`, link-time symbol resolution) and dispatch on the
 //! `Instantiator`/host-fn handles the guest discovers itself via `cap.self` reflection. Differential
 //! interp==JIT — the JIT is given the module resolver *and* the named-grant hooks op 13 needs.
 //!
@@ -88,12 +88,12 @@ int main(int argc, char **argv){
 /// from the guest's own cap.self reflection.
 const SHELL: &str = r#"
 /* Natural C prototypes: the child handle is a plain `long`, as a shell author would write it. chibicc
- * widens every scalar to an i64 slot, so `cap.call 6 13` is declared `(i64…) -> (i64)` even though the
+ * widens every scalar to an i64 slot, so `call.cap 6 13` is declared `(i64…) -> (i64)` even though the
  * Instantiator contract's canonical child handle is i32. Both backends reconcile that width: the interp
  * reads args as i64 slots and coerces the result to the declared type; the JIT's `lower_instantiator`
  * does the matching `slot_i64`/`slot_i32`/`result_as` coercions. (Before that fix the JIT CapFaulted on
  * the i64 result — no compiled-C program could drive the Instantiator on the JIT.) The handle operand
- * (`inst`) stays `int`: the lowered `cap.call` dispatches on it, and the shell passes the handle it
+ * (`inst`) stays `int`: the lowered `call.cap` dispatches on it, and the shell passes the handle it
  * discovers via cap.self reflection (`__inst()`/`__hf()`). */
 long __spawn(int inst, long module, long gp, long gn, long entry, long off, long sl, long q);
 long __join(int inst, long child);
@@ -174,7 +174,7 @@ fn exec_host(out_h: i32, echo_h: i32) -> temen_interp::HostProc {
 /// Link the shell's import names to their interfaces — link-time symbol resolution (the phase-4
 /// linker-only `resolve_imports_with`; IMPORTS.md §2.5): `__spawn`/`__join` are `Instantiator` ops
 /// (13 / 1); `exec_stdout`/`exec_lookup` are the embedder host fn's ops (0 / 1); `stream_write` is
-/// `Stream.write`. No handle is baked at link: each lowered `cap.call` dispatches on the guest's own
+/// `Stream.write`. No handle is baked at link: each lowered `call.cap` dispatches on the guest's own
 /// handle operand — `stream_write`'s comes from `exec_stdout`, the rest are discovered at run time
 /// via `__vm_cap_count`/`__vm_cap_at` reflection (§3c protection at the boundary, IMPORTS.md §2.3
 /// dynamic mode).

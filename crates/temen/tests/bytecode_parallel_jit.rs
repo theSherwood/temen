@@ -1,4 +1,4 @@
-//! THREADS.md 4c-domain — §22 guest-JIT (`Jit.install` / `Jit.invoke` + cross-module `call_indirect`)
+//! THREADS.md 4c-domain — §22 guest-JIT (`Jit.install` / `Jit.invoke` + cross-module `call.dyn`)
 //! under the **parallel** driver. The shared [`Domain`] (its module source + dispatch table) is
 //! interior-mutable and thread-safe, so worker vCPUs running on real OS threads can install / invoke
 //! against it concurrently while compute/atomics on the other vCPUs stay lock-free.
@@ -96,7 +96,7 @@ block 0 (vsp: i64, vp: i64) {
   vjit = i32.wrap_i64 vjit64
   vsh = i64.const 32
   vcode = i64.shr_u vp vsh
-  vw = cap.call 11 1 (i64) -> (i32) vjit (vcode)
+  vw = call.cap 11 1 (i64) -> (i32) vjit (vcode)
   vw64 = i64.extend_i32_u vw
   vc8 = i64.const 8
   vold = i64.atomic.rmw.add vc8 vw64
@@ -107,7 +107,7 @@ block 0 (vsp: i64, vp: i64) {
 "#;
 
 /// Same root/worker shape, but each worker `Jit.install`s the unit (→ a freshly raced table slot) and
-/// `call_indirect`s **its own** slot — genuine concurrent installs into the shared dispatch table.
+/// `call.dyn`s **its own** slot — genuine concurrent installs into the shared dispatch table.
 /// 8 distinct installs fit the 16-slot table (slot 0 = primary func); each returns 7 ⇒ counter 56.
 const INSTALL: &str = r#"memory 16
 func (i32, i32) -> (i64) {
@@ -170,9 +170,9 @@ block 0 (vsp: i64, vp: i64) {
   vjit = i32.wrap_i64 vjit64
   vsh = i64.const 32
   vcode = i64.shr_u vp vsh
-  vslot = cap.call 11 3 (i64) -> (i64) vjit (vcode)
+  vslot = call.cap 11 3 (i64) -> (i64) vjit (vcode)
   vslot32 = i32.wrap_i64 vslot
-  vr = call_indirect () -> (i32) vslot32 ()
+  vr = call.dyn () -> (i32) vslot32 ()
   vr64 = i64.extend_i32_u vr
   vc8 = i64.const 8
   vold = i64.atomic.rmw.add vc8 vr64
@@ -196,7 +196,7 @@ fn shared_window(size: usize) -> (Arc<Region>, *mut u8, std::alloc::Layout) {
 /// A **spawning** installed unit (CONSOLIDATION.md §11 — installed units join the caller's
 /// concurrency model): `f0() -> i32` `thread.spawn`s the unit's OWN `f1` (module-aware — before the
 /// fix this resolved func 1 in module 0, the guest's worker, and mis-ran), joins it, and returns its
-/// value (7). Dispatched via `call_indirect` from the [`INSTALL`] guest's workers: 8 × 7 = 56, with
+/// value (7). Dispatched via `call.dyn` from the [`INSTALL`] guest's workers: 8 × 7 = 56, with
 /// every worker's dispatch spawning a further vCPU whose root frame lives in the unit's module.
 const SERVICE_SPAWN: &str = r#"memory 16
 func () -> (i32) {
@@ -299,7 +299,7 @@ fn parallel_invoke_matches_oracle() {
     }
 }
 
-/// 8 worker vCPUs concurrently `Jit.install` into the shared dispatch table and `call_indirect` their
+/// 8 worker vCPUs concurrently `Jit.install` into the shared dispatch table and `call.dyn` their
 /// own raced slot — real contention on the table; the folded counter still matches the oracle.
 #[test]
 fn parallel_install_call_indirect_matches_oracle() {
@@ -313,14 +313,14 @@ fn parallel_install_call_indirect_matches_oracle() {
         assert_eq!(
             run_parallel(INSTALL),
             want,
-            "parallel install/call_indirect != oracle (run {i})"
+            "parallel install/call.dyn != oracle (run {i})"
         );
     }
 }
 
 /// **Module-aware spawn** (CONSOLIDATION.md §11): the installed unit itself `thread.spawn`s — its
 /// `func 1` must resolve in the UNIT's module, and the spawned vCPU's root frame must start there.
-/// Same [`INSTALL`] guest, [`SERVICE_SPAWN`] unit: each of the 8 workers' `call_indirect` dispatches
+/// Same [`INSTALL`] guest, [`SERVICE_SPAWN`] unit: each of the 8 workers' `call.dyn` dispatches
 /// into the unit, whose `f0` spawns the unit's own `f1` (→ 7) and joins it — 8 dispatches, 8 nested
 /// spawns, folded to 56 on BOTH drivers. Before the fix, `VcpuEvent::Spawn` carried no module and
 /// every driver resolved `func` against `primary()` — the unit's spawn ran the *guest's* func 1
@@ -361,7 +361,7 @@ fn invoked_spawning_unit_stays_capfault() {
 
 // ---- concurrent **runtime** compile (the browser's cross-Worker slice) ---------------------------
 // The parallel driver shares one `Mutex<Host>` across every vCPU thread and takes the lock per
-// `cap.call` (`drive_parallel`) — byte-for-byte the browser's `Vcpu::with_shared_host(&Mutex<Host>)`.
+// `call.cap` (`drive_parallel`) — byte-for-byte the browser's `Vcpu::with_shared_host(&Mutex<Host>)`.
 // The browser's cross-Worker runtime JIT (`temen_par_child` now shares the `ParJitCfg` host) therefore
 // rests on exactly this: worker vCPUs on real threads each `compile` a unit **at runtime** into the
 // shared host — the `Mutex` serialising the mutating `jit_compile`s — then `invoke` it. Above, the
@@ -434,8 +434,8 @@ block 0 (vsp: i64, vp: i64) {{
   vjit = i32.wrap_i64 vp
   vptr = i64.const {off}
   vlen = i64.const {blob_len}
-  vcode = cap.call 11 0 (i64, i64) -> (i64) vjit (vptr, vlen)
-  vw = cap.call 11 1 (i64) -> (i32) vjit (vcode)
+  vcode = call.cap 11 0 (i64, i64) -> (i64) vjit (vptr, vlen)
+  vw = call.cap 11 1 (i64) -> (i32) vjit (vcode)
   vw64 = i64.extend_i32_u vw
   vc8 = i64.const 8
   vold = i64.atomic.rmw.add vc8 vw64

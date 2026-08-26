@@ -36,7 +36,7 @@ data 16584 "ring"
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
   vlen = i64.const 65536
-  vrh64 = cap.call 5 5 (i64) -> (i64) v1 (vlen)
+  vrh64 = call.cap 5 5 (i64) -> (i64) v1 (vlen)
   vrh = i32.wrap_i64 vrh64
   va1 = i64.const 16640
   vv1 = i32.const 16584
@@ -72,7 +72,7 @@ block 0 (v0: i32, v1: i32) {
   i64.store q0a5 q0v5
   q0a6 = i64.const 17584
   i64.store q0a6 q0v6
-  vp = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
+  vp = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   ; spawn via record (op 17): entry=2 off=262144 sl=17 quota=0
   q1v0 = i64.const 8589934592
   q1v1 = i64.const 262144
@@ -95,9 +95,9 @@ block 0 (v0: i32, v1: i32) {
   i64.store q1a5 q1v5
   q1a6 = i64.const 17648
   i64.store q1a6 q1v6
-  vc = cap.call 6 17 (i64) -> (i32) v0 (q1a0)
-  vjp = cap.call 6 1 (i32) -> (i64) v0 (vp)
-  vjc = cap.call 6 1 (i32) -> (i64) v0 (vc)
+  vc = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
+  vjp = call.cap 6 1 (i32) -> (i64) v0 (vp)
+  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
   vk = i64.const 100
   vm = i64.mul vjp vk
   vs = i64.add vm vjc
@@ -112,12 +112,12 @@ block 0 (v0: i64) {
   i64.store vz vnm
   vp = i64.const 16384
   vl = i64.const 4
-  vh = cap.self.resolve vp vl
-  vg = cap.call 4 3 () -> (i64) vh ()
+  vh = self.resolve vp vl
+  vg = call.cap 4 3 () -> (i64) vh ()
   vroff = i64.const 0
   vwoff = i64.const 16384
   vprot = i32.const 3
-  vm = cap.call 4 0 (i64, i64, i64, i32) -> (i64) vh (vwoff, vroff, vg, vprot)
+  vm = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vh (vwoff, vroff, vg, vprot)
   vone = i64.const 1
   br 1(vone, vroff)
   }
@@ -172,12 +172,12 @@ block 0 (v0: i64) {
   i64.store vz vnm
   vp = i64.const 16384
   vl = i64.const 4
-  vh = cap.self.resolve vp vl
-  vg = cap.call 4 3 () -> (i64) vh ()
+  vh = self.resolve vp vl
+  vg = call.cap 4 3 () -> (i64) vh ()
   vroff = i64.const 0
   vwoff = i64.const 16384
   vprot = i32.const 3
-  vm = cap.call 4 0 (i64, i64, i64, i32) -> (i64) vh (vwoff, vroff, vg, vprot)
+  vm = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vh (vwoff, vroff, vg, vprot)
   vone = i64.const 1
   br 1(vone, vroff, vroff)
   }
@@ -240,12 +240,12 @@ func (i64) -> (i64) {
 block 0 (v0: i64) {
   vp = i64.const 16384
   vl = i64.const 4
-  vh = cap.self.resolve vp vl
-  vg = cap.call 4 3 () -> (i64) vh ()
+  vh = self.resolve vp vl
+  vg = call.cap 4 3 () -> (i64) vh ()
   vroff = i64.const 0
   vwoff = i64.const 16384
   vprot = i32.const 3
-  vm = cap.call 4 0 (i64, i64, i64, i32) -> (i64) vh (vwoff, vroff, vg, vprot)
+  vm = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vh (vwoff, vroff, vg, vprot)
   vone = i64.const 1
   br 1(vone, vroff)
   }
@@ -297,12 +297,12 @@ func (i64) -> (i64) {
 block 0 (v0: i64) {
   vp = i64.const 16384
   vl = i64.const 4
-  vh = cap.self.resolve vp vl
-  vg = cap.call 4 3 () -> (i64) vh ()
+  vh = self.resolve vp vl
+  vg = call.cap 4 3 () -> (i64) vh ()
   vroff = i64.const 0
   vwoff = i64.const 16384
   vprot = i32.const 3
-  vm = cap.call 4 0 (i64, i64, i64, i32) -> (i64) vh (vwoff, vroff, vg, vprot)
+  vm = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vh (vwoff, vroff, vg, vprot)
   vone = i64.const 1
   br 1(vone, vroff, vroff)
   }
@@ -360,7 +360,7 @@ data 16584 "ring"
 func (i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   vlen = i64.const 65536
-  vrh64 = cap.call 5 5 (i64) -> (i64) v1 (vlen)
+  vrh64 = call.cap 5 5 (i64) -> (i64) v1 (vlen)
   vrh = i32.wrap_i64 vrh64
   va1 = i64.const 16640
   vv1 = i32.const 16584
@@ -378,10 +378,10 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   ve1 = i64.const 1
   vlog = i64.const 17
   vq = i64.const 0
-  vp = cap.call 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vgp, vgn, ve0, vlog, vq)
-  vc = cap.call 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vgp, vgn, ve1, vlog, vq)
-  vjp = cap.call 6 1 (i32) -> (i64) v0 (vp)
-  vjc = cap.call 6 1 (i32) -> (i64) v0 (vc)
+  vp = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vgp, vgn, ve0, vlog, vq)
+  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vgp, vgn, ve1, vlog, vq)
+  vjp = call.cap 6 1 (i32) -> (i64) v0 (vp)
+  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
   vk = i64.const 100
   vm = i64.mul vjp vk
   vs = i64.add vm vjc

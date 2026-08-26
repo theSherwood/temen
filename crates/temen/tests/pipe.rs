@@ -3,7 +3,7 @@
 //! write end are drained, FIFO order, by the read end. The personality's intra-domain byte IPC (a shell
 //! wiring `cmd1 | cmd2` hands each side one end).
 //!
-//! A pipe end dispatches through the same generic `cap.call` → `Host` path as any `Stream`, so the
+//! A pipe end dispatches through the same generic `call.cap` → `Host` path as any `Stream`, so the
 //! interpreter and JIT service it identically — these run each program on both backends and assert
 //! equal results (parity for free, like `Budget`/`Clock`).
 
@@ -72,9 +72,9 @@ block 0 (vw: i32, vr: i32) {\n\
   ci = i32.const 105\n\
   i32.store8 a1 ci\n\
   vlen = i64.const 2\n\
-  vn = cap.call 0 1 (i64, i64) -> (i64) vw (a0, vlen)\n\
+  vn = call.cap 0 1 (i64, i64) -> (i64) vw (a0, vlen)\n\
   a16 = i64.const 16\n\
-  vread = cap.call 0 0 (i64, i64) -> (i64) vr (a16, vlen)\n\
+  vread = call.cap 0 0 (i64, i64) -> (i64) vr (a16, vlen)\n\
   vb0 = i32.load8_u a16\n\
   a17 = i64.const 17\n\
   vb1 = i32.load8_u a17\n\
@@ -98,11 +98,11 @@ block 0 (vw: i32, vr: i32) {\n\
 const EMPTY_AND_WRONG_DIRECTION: &str = "memory 17\n\
 func (i32, i32) -> (i64) {\n\
 block 0 (vw: i32, vr: i32) {\n\
-  vcl = cap.call 0 2 () -> (i64) vw ()\n\
+  vcl = call.cap 0 2 () -> (i64) vw ()\n\
   a0 = i64.const 0\n\
   vlen = i64.const 4\n\
-  vempty = cap.call 0 0 (i64, i64) -> (i64) vr (a0, vlen)\n\
-  vbad = cap.call 0 1 (i64, i64) -> (i64) vr (a0, vlen)\n\
+  vempty = call.cap 0 0 (i64, i64) -> (i64) vr (a0, vlen)\n\
+  vbad = call.cap 0 1 (i64, i64) -> (i64) vr (a0, vlen)\n\
   vzero = i64.const 0\n\
   vd = i64.sub vzero vbad\n\
   k1000 = i64.const 1000\n\

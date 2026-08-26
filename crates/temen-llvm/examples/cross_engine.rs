@@ -239,7 +239,7 @@ fn main() {
                         println!("temen-wasmjit,{disp},{ns:.4}");
                     }
                 }
-                // Exit 4 = kernel outside the JIT's integer subset (float / SIMD / call_indirect): no
+                // Exit 4 = kernel outside the JIT's integer subset (float / SIMD / call.dyn): no
                 // row, no note. Any other failure gets a note.
                 Ok(out) if out.status.code() == Some(4) => {}
                 Ok(out) => eprintln!(

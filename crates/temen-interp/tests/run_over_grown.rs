@@ -22,7 +22,7 @@ func (i32, i64) -> (i64) {
 block 0 (vas: i32, vlen: i64) {
   voff = i64.const 65536
   vprot = i32.const 3
-  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vr = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
   vaddr = i64.const 65552
   vmark = i64.const 424242
   i64.store vaddr vmark
@@ -40,7 +40,7 @@ func (i32, i64) -> (i64) {
 block 0 (vas: i32, vlen: i64) {
   voff = i64.const 65536
   vprot = i32.const 3
-  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vr = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
   return vr
   }
 }
@@ -170,7 +170,7 @@ block 0 (vas: i32) {
   voff = i64.const 16384
   vlen = i64.const 16384
   vprot = i32.const 1
-  vr = cap.call 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vr = call.cap 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
   return vr
   }
 }

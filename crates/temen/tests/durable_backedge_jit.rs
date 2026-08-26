@@ -6,13 +6,13 @@
 //!
 //! Two complementary claims (DURABILITY.md §7/§12.6):
 //!
-//!   1. **freeze parity** — a freeze-from-start whose *first* poll is a loop header (`cap.call`
+//!   1. **freeze parity** — a freeze-from-start whose *first* poll is a loop header (`call.cap`
 //!      after the loop) leaves a **byte-identical** durable reserve on both backends, and the
 //!      interp artifact thaws on the JIT to the uninterrupted result.
-//!   2. **mid-loop thaw portability** — a `cap.call`-before-loop module frozen **mid-iteration** on
+//!   2. **mid-loop thaw portability** — a `call.cap`-before-loop module frozen **mid-iteration** on
 //!      the interpreter (via the deterministic back-edge countdown) thaws on the **JIT** under a
 //!      *fresh* host, reproducing the oracle — so the JIT correctly rewinds a `LoopHeader` resume
-//!      point with real loop state and reloads the saved `cap.call` value rather than re-issuing it.
+//!      point with real loop state and reloads the saved `call.cap` value rather than re-issuing it.
 
 use core::ffi::c_void;
 use std::sync::Arc;
@@ -95,7 +95,7 @@ fn jit_i64(out: &JitOutcome) -> i64 {
     }
 }
 
-// Loop FIRST (the header is the first poll site), `cap.call` after it. Loop adds 1 five times,
+// Loop FIRST (the header is the first poll site), `call.cap` after it. Loop adds 1 five times,
 // then reads the clock and adds it: oracle = 5 + clock.
 const LOOP_FIRST: &str = r#"
 func (i32) -> (i64) {
@@ -112,20 +112,20 @@ block 1 (v2: i32, v3: i64) {
 }
 block 2 (v8: i32, v9: i64) {
   v10 = i32.const 0
-  v11 = cap.call 2 0 (i32) -> (i64) v8 (v10)
+  v11 = call.cap 2 0 (i32) -> (i64) v8 (v10)
   v12 = i64.add v9 v11
   return v12
   }
 }
 "#;
 
-// `cap.call` FIRST (clock seeds the accumulator), then a poll-free loop adds 1 five times:
+// `call.cap` FIRST (clock seeds the accumulator), then a poll-free loop adds 1 five times:
 // oracle = clock + 5. Freezing mid-loop bakes the clock into the spilled accumulator.
 const CAP_FIRST: &str = r#"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 0
   br 1(v3, v2)
 }
@@ -153,7 +153,7 @@ fn freeze_from_start_at_a_loop_header_is_byte_identical_across_backends() {
     assert_eq!(base, vec![Value::I64(47)], "5 + clock(42)");
 
     // Both backends freeze-from-start at the header poll (acc = 0, the first entry), before the
-    // post-loop cap.call. The durable reserves must be byte-identical.
+    // post-loop call.cap. The durable reserves must be byte-identical.
     let (fi, snap_i) = interp(&inst, clock, &window_with(STATE_UNWINDING), false);
     assert_eq!(fi, vec![Value::I64(0)], "interp froze (placeholder)");
     assert_eq!(read_state(&snap_i), STATE_UNWINDING);
@@ -207,7 +207,7 @@ block 1 (v2: i32, v3: i64) {
 }
 block 2 (v8: i32, v9: i64) {
   v10 = i32.const 0
-  v11 = cap.call 2 0 (i32) -> (i64) v8 (v10)
+  v11 = call.cap 2 0 (i32) -> (i64) v8 (v10)
   v12 = i64.add v9 v11
   return v12
   }
@@ -284,7 +284,7 @@ fn async_controller_freezes_a_running_compute_loop_on_the_jit() {
 
     if read_state(&snap) == STATE_UNWINDING {
         // Froze mid-loop (the expected path). The window holds the unwound loop-header continuation;
-        // a thaw must reproduce the oracle — the loop state was reloaded and the post-loop cap.call
+        // a thaw must reproduce the oracle — the loop state was reloaded and the post-loop call.cap
         // runs once on thaw. (The clock is folded in only after the loop, so use the baseline clock.)
         assert!(
             matches!(out, JitOutcome::Returned(_)),
@@ -329,7 +329,7 @@ fn interp_mid_loop_freeze_thaws_on_the_jit() {
     assert_eq!(read_state(&snap), STATE_UNWINDING);
 
     // Thaw on the JIT under a FRESH host (clock 0). The JIT must rewind the LoopHeader point with
-    // the real mid-loop accumulator and reload the baked-in clock — not re-issue the cap.call
+    // the real mid-loop accumulator and reload the baked-in clock — not re-issue the call.cap
     // (which would now read 0 and give the wrong total).
     let mut thaw = snap.clone();
     begin_thaw(&mut thaw, 0);

@@ -34,7 +34,7 @@ block 0 (v0: i32) {
   v3 = i64.const 0
   v4 = thread.spawn 1 v2 v3
   v5 = i32.const 0
-  v6 = cap.call 2 0 (i32) -> (i64) v0 (v5)
+  v6 = call.cap 2 0 (i32) -> (i64) v0 (v5)
   v7 = thread.join v4
   v8 = i64.add v6 v7
   return v8
@@ -45,7 +45,7 @@ block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65536
   v3 = i32.load v2
   v4 = i32.const 0
-  v5 = cap.call 2 0 (i32) -> (i64) v3 (v4)
+  v5 = call.cap 2 0 (i32) -> (i64) v3 (v4)
   v6 = i64.const 10
   v7 = i64.add v5 v6
   return v7
@@ -188,7 +188,7 @@ block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65536
   v3 = i32.load v2
   v4 = i32.const 0
-  v5 = cap.call 2 0 (i32) -> (i64) v3 (v4)
+  v5 = call.cap 2 0 (i32) -> (i64) v3 (v4)
   v6 = i64.const 10
   v7 = i64.add v5 v6
   return v7
@@ -325,7 +325,7 @@ block 0 (v0: i32) {
   v2 = i64.const 0
   v3 = thread.spawn 1 v1 v2
   v4 = i32.const 0
-  v5 = cap.call 2 0 (i32) -> (i64) v0 (v4)
+  v5 = call.cap 2 0 (i32) -> (i64) v0 (v4)
   v6 = thread.join v3
   v7 = i64.add v5 v6
   return v7
@@ -452,7 +452,7 @@ fn child_owns_fiber_through_freeze_thaw() {
 
 // Slice 3.4 — **nested spawns**: root → child → grandchild. Each level stashes nothing new; the root
 // stashes the clock handle, the child + grandchild reload it. `thread.spawn` (not a may-suspend op)
-// runs before each level's `cap.call` unwind point, so every level spawns its child *before* it
+// runs before each level's `call.cap` unwind point, so every level spawns its child *before* it
 // unwinds — the whole tree exists at the freeze. Thaw must rebuild the **per-parent** join tables
 // (the grandchild's handle lives in the *child's* table, not the root's), which needs the v4
 // `parent_task` residue field + the parent-first re-attach.
@@ -465,7 +465,7 @@ block 0 (v0: i32) {
   v3 = i64.const 0
   v4 = thread.spawn 1 v2 v3
   v5 = i32.const 0
-  v6 = cap.call 2 0 (i32) -> (i64) v0 (v5)
+  v6 = call.cap 2 0 (i32) -> (i64) v0 (v5)
   v7 = thread.join v4
   v8 = i64.add v6 v7
   return v8
@@ -479,7 +479,7 @@ block 0 (v0: i64, v1: i64) {
   v5 = i64.const 0
   v6 = thread.spawn 2 v4 v5
   v7 = i32.const 0
-  v8 = cap.call 2 0 (i32) -> (i64) v3 (v7)
+  v8 = call.cap 2 0 (i32) -> (i64) v3 (v7)
   v9 = thread.join v6
   v10 = i64.add v8 v9
   return v10
@@ -490,7 +490,7 @@ block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65536
   v3 = i32.load v2
   v4 = i32.const 0
-  v5 = cap.call 2 0 (i32) -> (i64) v3 (v4)
+  v5 = call.cap 2 0 (i32) -> (i64) v3 (v4)
   return v5
   }
 }

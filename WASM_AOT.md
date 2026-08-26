@@ -19,7 +19,7 @@ once the slices land (repo convention).
   `temen_par_compile`", BROWSER.md) is a compile-point choice, not a new backend.
 
 What a new backend *cannot* fix is the leaf-accelerator wall: a wasm frame can't unwind for a stack
-switch, so fibers, `thread.spawn`/`join`, `memory.wait`, page ops, and every `cap.call` must bounce
+switch, so fibers, `thread.spawn`/`join`, `memory.wait`, page ops, and every `call.cap` must bounce
 to the bytecode interpreter (`env.call_interp`), with the interpreter owning the top frame
 (DESIGN §3; NESTED_JIT.md Tracks 2–3; OPS_PARITY.md ⛔ column). A truly standalone "pure wasm"
 artifact therefore exists only for **pure-compute guests** — no I/O, no caps, no threads — which is

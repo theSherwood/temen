@@ -1,8 +1,8 @@
-//! §7 capability **reflection** (`cap.self.count` / `cap.self.get`): an always-available, read-only
+//! §7 capability **reflection** (`self.count` / `self.get`): an always-available, read-only
 //! intrinsic by which a guest discovers the capabilities its host granted *this* domain — the live
 //! handle-table entries as `(handle, type_id)`. It confers no authority (the guest already holds
 //! every handle it sees), so it is ambient and safe (DESIGN.md §7). These run on **both** backends:
-//! the interpreter services `cap.self.*` directly, the JIT lowers them to a `cap.call` thunk with the
+//! the interpreter services `self.*` directly, the JIT lowers them to a `call.cap` thunk with the
 //! reserved `CAP_SELF_TYPE_ID`, and both share one host `self_dispatch` — so they agree.
 
 use core::ffi::c_void;
@@ -40,7 +40,7 @@ fn run(src: &str) -> Vec<Value> {
     assert_eq!(
         parse_module(&temen_text::print_module(&m)).expect("reparse"),
         m,
-        "cap.self.* must round-trip through the text form"
+        "self.* must round-trip through the text form"
     );
 
     let mut hi = Host::new();
@@ -60,7 +60,7 @@ fn run(src: &str) -> Vec<Value> {
     assert_eq!(
         interp.iter().map(as_i64).collect::<Vec<_>>(),
         jit,
-        "interp and JIT must agree on cap.self.*"
+        "interp and JIT must agree on self.*"
     );
     interp
 }
@@ -69,33 +69,33 @@ fn host_ptr(h: &mut Host) -> *mut c_void {
     h as *mut Host as *mut c_void
 }
 
-/// `cap.self.count` reports exactly the number of capabilities the host granted this domain.
+/// `self.count` reports exactly the number of capabilities the host granted this domain.
 #[test]
 fn count_reflects_the_granted_powerbox() {
     let src = "func (i32, i32, i32) -> (i32) {\n\
                block 0 (v0: i32, v1: i32, v2: i32) {\n\
-               \x20 v3 = cap.self.count\n\
+               \x20 v3 = self.count\n\
                \x20 return v3\n\
                  }\n\
                }\n";
     assert_eq!(run(src), vec![Value::I32(3)], "three handles were granted");
 }
 
-/// `cap.self.get(i)` yields the i-th held capability's `(handle, type_id)`. Entry 2 (the 3rd grant)
+/// `self.get(i)` yields the i-th held capability's `(handle, type_id)`. Entry 2 (the 3rd grant)
 /// is Exit, so its `type_id` is `cap_id::EXIT == 1`.
 #[test]
 fn get_reports_the_interface_type_id() {
     let src = "func (i32, i32, i32) -> (i32) {\n\
                block 0 (v0: i32, v1: i32, v2: i32) {\n\
                \x20 v3 = i32.const 2\n\
-               \x20 v4, v5 = cap.self.get v3\n\
+               \x20 v4, v5 = self.get v3\n\
                \x20 return v5\n\
                  }\n\
                }\n";
     assert_eq!(run(src), vec![Value::I32(1)], "entry 2 is Exit (type_id 1)");
 }
 
-/// The *handle* `cap.self.get` returns is the very handle the host granted — so a guest can use what
+/// The *handle* `self.get` returns is the very handle the host granted — so a guest can use what
 /// it discovers. Entry 2's handle must equal `v2` (the exit handle); the program returns their
 /// difference, so a passing run is `0`.
 #[test]
@@ -103,7 +103,7 @@ fn get_returns_the_usable_granted_handle() {
     let src = "func (i32, i32, i32) -> (i32) {\n\
                block 0 (v0: i32, v1: i32, v2: i32) {\n\
                \x20 v3 = i32.const 2\n\
-               \x20 v4, v5 = cap.self.get v3\n\
+               \x20 v4, v5 = self.get v3\n\
                \x20 v6 = i32.sub v4 v2\n\
                \x20 return v6\n\
                  }\n\
@@ -121,7 +121,7 @@ fn get_out_of_range_traps() {
     let src = "func (i32, i32, i32) -> (i32) {\n\
                block 0 (v0: i32, v1: i32, v2: i32) {\n\
                \x20 v3 = i32.const 99\n\
-               \x20 v4, v5 = cap.self.get v3\n\
+               \x20 v4, v5 = self.get v3\n\
                \x20 return v5\n\
                  }\n\
                }\n";
@@ -133,7 +133,7 @@ fn get_out_of_range_traps() {
     let mut fuel = 10_000_000u64;
     assert!(
         run_with_host(&m, 0, &iargs, &mut fuel, &mut hi).is_err(),
-        "out-of-range cap.self.get must fail closed (interp)"
+        "out-of-range self.get must fail closed (interp)"
     );
 
     let mut hj = Host::new();
@@ -143,7 +143,7 @@ fn get_out_of_range_traps() {
             .expect("jit compile");
     assert!(
         matches!(outcome, JitOutcome::Trapped(_)),
-        "out-of-range cap.self.get must trap on the JIT too, got {outcome:?}"
+        "out-of-range self.get must trap on the JIT too, got {outcome:?}"
     );
 }
 
@@ -154,29 +154,26 @@ fn binary_round_trip() {
     let src = "memory 15\n\
                func (i32) -> (i32) {\n\
                block 0 (v0: i32) {\n\
-               \x20 v1 = cap.self.count\n\
+               \x20 v1 = self.count\n\
                \x20 v2 = i32.const 0\n\
-               \x20 v3, v4 = cap.self.get v2\n\
+               \x20 v3, v4 = self.get v2\n\
                \x20 v5 = i64.const 0\n\
                \x20 v6 = i64.const 4\n\
-               \x20 v7 = cap.self.resolve v5 v6\n\
-               \x20 v8 = cap.self.label v3 v5 v6\n\
+               \x20 v7 = self.resolve v5 v6\n\
+               \x20 v8 = self.label v3 v5 v6\n\
                \x20 return v1\n\
                  }\n\
                }\n";
     let m = parse_module(src).expect("parse");
-    // Text print → re-parse is identity (covers `cap.self.resolve`'s grammar).
+    // Text print → re-parse is identity (covers `self.resolve`'s grammar).
     assert_eq!(
         parse_module(&temen_text::print_module(&m)).expect("reparse"),
         m,
-        "cap.self.* must round-trip through the text form"
+        "self.* must round-trip through the text form"
     );
     let bytes = temen_encode::encode_module(&m);
     let back = temen_encode::decode_module(&bytes).expect("decode");
-    assert_eq!(
-        back, m,
-        "cap.self.* must round-trip through the binary form"
-    );
+    assert_eq!(back, m, "self.* must round-trip through the binary form");
 }
 
 /// `Host::cap_label` (F9) is the host-side reverse of the name directory: a registered handle resolves
@@ -210,10 +207,10 @@ fn discover_then_use_a_granted_capability() {
                func (i32, i32, i32) -> (i32) {\n\
                block 0 (v0: i32, v1: i32, v2: i32) {\n\
                \x20 v3 = i32.const 0\n\
-               \x20 v4, v5 = cap.self.get v3\n\
+               \x20 v4, v5 = self.get v3\n\
                \x20 v6 = i64.const 0\n\
                \x20 v7 = i64.const 2\n\
-               \x20 v8 = cap.call 0 1 (i64, i64) -> (i64) v4(v6, v7)\n\
+               \x20 v8 = call.cap 0 1 (i64, i64) -> (i64) v4(v6, v7)\n\
                \x20 return v5\n\
                  }\n\
                }\n";

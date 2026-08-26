@@ -27,15 +27,15 @@ func 0 () -> () {
 block 0 () {
   vp = i64.const 16384
   vl = i64.const 4
-  vh = cap.self.resolve vp vl
+  vh = self.resolve vp vl
   vap = i64.const 16392
   val = i64.const 7
   vz = i64.const 0
-  vjob = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh (vap, val, vz, vz)
+  vjob = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vap, val, vz, vz)
   vbuf = i64.const 16416
   vcap = i64.const 16
-  vn = cap.call 13 1 (i64, i64, i64) -> (i64) vh (vjob, vbuf, vcap)
-  vs = cap.call 13 3 (i64) -> (i64) vh (vjob)
+  vn = call.cap 13 1 (i64, i64, i64) -> (i64) vh (vjob, vbuf, vcap)
+  vs = call.cap 13 3 (i64) -> (i64) vh (vjob)
   vw = call.import 0 (vbuf, vn)
   vhund = i64.const 100
   vmul = i64.mul vs vhund
@@ -194,16 +194,16 @@ func 0 () -> () {
 block 0 () {
   vp = i64.const 16384
   vl = i64.const 4
-  vh = cap.self.resolve vp vl
+  vh = self.resolve vp vl
   vap = i64.const 16392
   val = i64.const 3
   vsp = i64.const 16400
   vsl = i64.const 2
-  vjob = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh (vap, val, vsp, vsl)
+  vjob = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vap, val, vsp, vsl)
   vbuf = i64.const 16416
   vcap = i64.const 16
-  vn = cap.call 13 1 (i64, i64, i64) -> (i64) vh (vjob, vbuf, vcap)
-  vs = cap.call 13 3 (i64) -> (i64) vh (vjob)
+  vn = call.cap 13 1 (i64, i64, i64) -> (i64) vh (vjob, vbuf, vcap)
+  vs = call.cap 13 3 (i64) -> (i64) vh (vjob)
   vw = call.import 0 (vbuf, vn)
   vhund = i64.const 100
   vmul = i64.mul vs vhund
@@ -277,11 +277,11 @@ fn a_trapping_domain_program_is_a_failed_run_not_a_trap() {
          block 0 () {\n\
            vp = i64.const 16384\n\
            vl = i64.const 4\n\
-           vh = cap.self.resolve vp vl\n\
+           vh = self.resolve vp vl\n\
            vap = i64.const 16392\n\
            val = i64.const 4\n\
            vz = i64.const 0\n\
-           vjob = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh (vap, val, vz, vz)\n\
+           vjob = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vap, val, vz, vz)\n\
            vzero = i64.const 0\n\
            vfailed = i64.lt_s vjob vzero\n\
            call.import 0 (vfailed)\n\
@@ -309,7 +309,7 @@ fn a_trapping_domain_program_is_a_failed_run_not_a_trap() {
     }
 }
 
-/// Un-granted, `cap.self.resolve("exec")` stays negative and the guest's fallback runs (EXEC.md:
+/// Un-granted, `self.resolve("exec")` stays negative and the guest's fallback runs (EXEC.md:
 /// a subprocess is pure authority; without a grant the honest behavior is an error, not
 /// emulation). The guest exits 42 iff the resolve came back negative.
 #[test]
@@ -322,7 +322,7 @@ fn ungranted_exec_resolves_negative_and_the_fallback_runs() {
          block 0 () {\n\
            vp = i64.const 16384\n\
            vl = i64.const 4\n\
-           vh = cap.self.resolve vp vl\n\
+           vh = self.resolve vp vl\n\
            vz = i32.const 0\n\
            vneg = i32.lt_s vh vz\n\
            vft = i32.const 42\n\
@@ -365,11 +365,11 @@ fn a_program_outside_the_allowlist_is_refused_not_trapped() {
          block 0 () {\n\
            vp = i64.const 16384\n\
            vl = i64.const 4\n\
-           vh = cap.self.resolve vp vl\n\
+           vh = self.resolve vp vl\n\
            vap = i64.const 16392\n\
            val = i64.const 6\n\
            vz = i64.const 0\n\
-           vjob = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh (vap, val, vz, vz)\n\
+           vjob = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vap, val, vz, vz)\n\
            vzero = i64.const 0\n\
            vrefused = i64.lt_s vjob vzero\n\
            call.import 0 (vrefused)\n\

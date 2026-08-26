@@ -190,7 +190,7 @@ struct Sig {
 }
 
 /// The Temen signature of a **function pointer** (nimony `proctype`), as an indirect call needs it:
-/// the `call_indirect` `FuncType`. An aggregate-returning proctype is sret-lowered here — a leading
+/// the `call.dyn` `FuncType`. An aggregate-returning proctype is sret-lowered here — a leading
 /// `i64` `$sret` pointer param and no result — exactly as a direct aggregate-returning proc is, so
 /// the two ABIs match and a proc can be called either directly or through a pointer.
 #[derive(Clone, Debug, PartialEq)]
@@ -225,7 +225,7 @@ pub(crate) enum TyDesc {
     /// never load the whole thing.
     FlexArray(Box<TyDesc>),
     /// A **function pointer** (`proctype`) — a callable value. Its machine representation is an `i32`
-    /// **function index** (`ref.func`'s result; `call_indirect`'s masked table index, §3c), but its
+    /// **function index** (`ref.func`'s result; `call.dyn`'s masked table index, §3c), but its
     /// storage slot is a full 8-byte pointer word in nimony's layout, so `sizeof` is 8 while
     /// load/store use `i32`. Carries the signature an indirect call through it needs.
     FnPtr(Box<FnPtrSig>),
@@ -295,7 +295,7 @@ pub(crate) struct Translator {
     ty_aliases: HashMap<String, TyDesc>,
     /// Named `proctype` declarations → their function-pointer signature. Populated before object
     /// layouts resolve, so a field/param typed by a proctype name (or a `(ptr proctype)` alias)
-    /// resolves to `TyDesc::FnPtr` and an indirect call through it recovers the `call_indirect` sig.
+    /// resolves to `TyDesc::FnPtr` and an indirect call through it recovers the `call.dyn` sig.
     proctypes: HashMap<String, FnPtrSig>,
     /// Mutable module globals (`gvar`) → (fixed window offset, type). Zero-initialized (the window
     /// starts zeroed); non-zero initializers are a later slice.
@@ -338,7 +338,7 @@ pub(crate) struct Translator {
     /// stem-suffixed name this module references it by ([`export_funcrefs`]). A cross-module
     /// `(call oomHandler.0.<sys> …)` targets a function-*pointer* data symbol, not a proc: with the
     /// pooled signature here, `lvalue_type`/`lvalue_addr` treat it as an `FnPtr` global (address via
-    /// `data.sym`), so `indirect_callee` lowers it to a `data.sym` load + `call_indirect`. Empty
+    /// `data.sym`), so `indirect_callee` lowers it to a `data.sym` load + `call.dyn`. Empty
     /// unless the linker pooled sibling units' funcref gvars.
     ext_funcrefs: HashMap<String, FnPtrSig>,
     /// **External frame-needing procs** — sibling units' procs whose emitted signature has a leading
@@ -366,7 +366,7 @@ pub(crate) struct Translator {
     /// frame — the extra `$sp` slot is harmless for a frameless one, and a *missing* one is an ABI
     /// mismatch. Populated per module before proc signatures are fixed, and pooled across the link
     /// (a proc funcref'd in a sibling unit must still carry `$sp`). See [`funcref_value`] /
-    /// [`emit_call_indirect`].
+    /// [`emit_call.dyn`].
     funcref_targets: HashSet<String>,
     /// **Tier-2 TLS mode** (NIM.md §3d). When set, a `tvar` (thread-var) is lowered to the per-vCPU
     /// TLS block instead of a plain window global: each `tvar` gets an offset in [`tls_vars`] and its
@@ -1307,7 +1307,7 @@ impl Translator {
         t.tag() == Some("proctype") || t.as_atom().is_some_and(|n| self.proctypes.contains_key(n))
     }
 
-    /// The `call_indirect` signature of a `proctype` — a named one (looked up) or an inline
+    /// The `call.dyn` signature of a `proctype` — a named one (looked up) or an inline
     /// `(proctype <base> (params …) <rettype> (pragmas …))`. An aggregate return is sret-lowered
     /// (leading `i64` `$sret` pointer param, no result), matching a direct aggregate-returning proc.
     fn proctype_sig(&self, node: &Node) -> Result<FnPtrSig, LengError> {
@@ -1600,7 +1600,7 @@ impl Translator {
     /// `proctype`, under the stem-suffixed names this module references them by
     /// ([`export_funcrefs`]). See the [`ext_funcrefs`](Self::ext_funcrefs) field: this is what turns
     /// a cross-module `(call <funcref-gvar> …)` from a (wrong) proc import into a `data.sym` load +
-    /// `call_indirect`.
+    /// `call.dyn`.
     pub fn import_funcrefs(&mut self, ext: &[(String, FnPtrSig)]) {
         for (name, sig) in ext {
             self.ext_funcrefs.insert(name.clone(), sig.clone());
@@ -1660,7 +1660,7 @@ impl Translator {
     /// Collect a module's **funcref globals** under their stem-suffixed global names — the form
     /// *other* modules reference them by. A `gvar`/`tvar` whose type is a `proctype` (e.g. the
     /// stdlib's `oomHandler`) is a function-*pointer* data symbol; a sibling unit that calls through
-    /// it needs the `call_indirect` signature at translate time (the funcref value itself, an `i32`
+    /// it needs the `call.dyn` signature at translate time (the funcref value itself, an `i32`
     /// index, resolves at link time via `data.sym`). This is the funcref counterpart of
     /// [`export_types_pooled`]; [`link_selected`] pools these across its units before translating any.
     pub fn export_funcrefs(root: &Node, stem: &str) -> Result<Vec<(String, FnPtrSig)>, LengError> {
@@ -2855,7 +2855,7 @@ impl<'a> FuncGen<'a> {
                 }
                 // A cross-module **funcref global** (a sibling unit's proctype `gvar`): its address
                 // is a `data.sym`, and its `FnPtr` desc lets `load_lvalue` read the `i32` funcref
-                // and `indirect_callee` recover the `call_indirect` signature.
+                // and `indirect_callee` recover the `call.dyn` signature.
                 if let Some(sig) = self.t.ext_funcrefs.get(name).cloned() {
                     let addr = self.emit_data_sym(name, 0);
                     return Ok((addr, TyDesc::FnPtr(Box::new(sig))));
@@ -4532,7 +4532,7 @@ impl<'a> FuncGen<'a> {
         Ok(Some((id, sig)))
     }
 
-    /// Emit a scalar/void **`call_indirect`** through funcref `idx` with signature `sig` and the given
+    /// Emit a scalar/void **`call.dyn`** through funcref `idx` with signature `sig` and the given
     /// Leng argument nodes. Args are lowered exactly as a direct call's (aggregates by-address).
     fn emit_call_indirect(
         &mut self,
@@ -4548,7 +4548,7 @@ impl<'a> FuncGen<'a> {
             )));
         }
         // Funcref ABI: every funcref target carries a leading `$sp`, so the indirect call passes
-        // `sp + frame_size` as arg 0 and the call_indirect signature gains a leading `i64`.
+        // `sp + frame_size` as arg 0 and the call.dyn signature gains a leading `i64`.
         let sp = self.emit_indirect_sp()?;
         let mut argvals = vec![sp];
         for (arg, want) in args.iter().zip(&sig.params) {
@@ -4573,14 +4573,13 @@ impl<'a> FuncGen<'a> {
             Some(rt) => {
                 let id = self.fresh();
                 self.cur_buf.push_str(&format!(
-                    "  v{id} = call_indirect ({plist}) -> ({rlist}) v{idx} ({arglist})\n"
+                    "  v{id} = call.dyn ({plist}) -> ({rlist}) v{idx} ({arglist})\n"
                 ));
                 Ok(Val { id, ty: *rt })
             }
             None => {
-                self.cur_buf.push_str(&format!(
-                    "  call_indirect ({plist}) -> () v{idx} ({arglist})\n"
-                ));
+                self.cur_buf
+                    .push_str(&format!("  call.dyn ({plist}) -> () v{idx} ({arglist})\n"));
                 Ok(Val {
                     id: u32::MAX,
                     ty: ValType::I32,
@@ -4589,7 +4588,7 @@ impl<'a> FuncGen<'a> {
         }
     }
 
-    /// Emit an aggregate-returning **`call_indirect`** through funcref `idx`: the `sret` pointer
+    /// Emit an aggregate-returning **`call.dyn`** through funcref `idx`: the `sret` pointer
     /// `dest_addr` rides as the first arg (matching `sig.params[0]`, the lowered sret slot), then the
     /// Leng args. `sig.params[1..]` are the visible param types.
     fn emit_call_indirect_sret(
@@ -4608,7 +4607,7 @@ impl<'a> FuncGen<'a> {
             )));
         }
         // Funcref ABI: prepend `$sp` (slot order `[$sp] [$sret] [visible]`), matching the frame-needing
-        // sret target's signature and the leading `i64` added to the call_indirect type.
+        // sret target's signature and the leading `i64` added to the call.dyn type.
         let sp = self.emit_indirect_sp()?;
         let mut argvals = vec![sp, dest_addr];
         for (arg, want) in args.iter().zip(visible) {
@@ -4623,9 +4622,8 @@ impl<'a> FuncGen<'a> {
             .chain(sig.params.iter().map(|t| prefix(*t).to_string()))
             .collect::<Vec<_>>()
             .join(", ");
-        self.cur_buf.push_str(&format!(
-            "  call_indirect ({plist}) -> () v{idx} ({arglist})\n"
-        ));
+        self.cur_buf
+            .push_str(&format!("  call.dyn ({plist}) -> () v{idx} ({arglist})\n"));
         Ok(())
     }
 

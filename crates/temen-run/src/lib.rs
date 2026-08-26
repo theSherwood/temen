@@ -1,7 +1,7 @@
 //! `temen-run` — the **embedding runtime**: instantiate a verified module with the MVP powerbox
 //! (§3e) and run it on the Cranelift JIT, returning its outcome and the bytes it wrote.
 //!
-//! This is the single, reusable host glue — the `cap.call` trampoline ([`cap_thunk`]) plus the
+//! This is the single, reusable host glue — the `call.cap` trampoline ([`cap_thunk`]) plus the
 //! powerbox grant ([`run_powerbox`]) — that was previously copy-pasted across the JIT test
 //! harnesses (`c_frontend.rs`, `jit_diff.rs`). The `temen-run` **CLI** is a thin wrapper over it.
 //!
@@ -146,7 +146,7 @@ pub fn specialize_module(module: &Module, opts: &SpecializeOpts) -> Result<Modul
     Ok(opt)
 }
 
-/// Default `call_indirect` table reservation for the CLI powerbox (`2^10` = 1024 slots) so a
+/// Default `call.dyn` table reservation for the CLI powerbox (`2^10` = 1024 slots) so a
 /// guest using the `Jit` capability can `install` units (DESIGN.md §22). Embedders pick their
 /// own via [`grant_jit`] + the compile `table_reserve_log2`.
 const CLI_JIT_TABLE_LOG2: u8 = 10;
@@ -300,7 +300,7 @@ unsafe fn cap_thunk_impl(
     // registry (`temen_jit::region_canon_record`) and `unmap` must forget them. The `Host` dispatch owns
     // the backing (hence its `os_fd`), but only *this* trampoline knows the window's `mem_base`; install
     // the recorder here, once, over this run's base (the interp needs none — it canonicalizes via its own
-    // `PageProt::Backed`). Idempotent + on the root thread's first `cap.call` (before any `map`/spawn),
+    // `PageProt::Backed`). Idempotent + on the root thread's first `call.cap` (before any `map`/spawn),
     // so no vCPU races the install. A no-op on non-JIT hosts that never `map` a region.
     if !mem_base.is_null() && !host.has_region_hook() {
         let base = mem_base as u64;
@@ -333,7 +333,7 @@ unsafe fn cap_thunk_impl(
     // incl. growth into the reserved tail): `mprotect` on unix, `VirtualProtect`/`VirtualAlloc` on
     // windows — the same software-page-map model, only the syscalls differ. The page map is the
     // **per-run** one from the `Host` (keyed by window base), so growth committed in an earlier
-    // `cap.call` is still seen committed here — a borrow of a guest-grown page doesn't fail-closed.
+    // `call.cap` is still seen committed here — a borrow of a guest-grown page doesn't fail-closed.
     #[cfg(any(unix, windows))]
     let pages = host.cap_window_pages(mem_base as usize);
     #[cfg(any(unix, windows))]
@@ -377,7 +377,7 @@ unsafe fn cap_thunk_impl(
     // `svc.wait` (op 10 with the optional timeout arg) is oracle-only — the veto folds such
     // modules; a stray dispatch falls through to the generic Host answer (probeable `-EINVAL`),
     // never a bogus untimed serve. The `host` borrow above is dead on this path —
-    // `serve_native` re-derives from `ctx` in short scopes, because a handler's own `cap.call`s
+    // `serve_native` re-derives from `ctx` in short scopes, because a handler's own `call.cap`s
     // re-enter this thunk mid-serve.
     if type_id == temen_ir::CAP_SELF_TYPE_ID && (op == 9 || (op == 10 && n_args == 0)) {
         serve_native(
@@ -402,7 +402,7 @@ unsafe fn cap_thunk_impl(
         );
         return;
     }
-    // CALLS.md 5c.1b — the caller side of the JIT parked transport (§10.2 arm 5): a `cap.call`
+    // CALLS.md 5c.1b — the caller side of the JIT parked transport (§10.2 arm 5): a `call.cap`
     // whose handle resolves to a minted live-impl enqueues on the callee child's shared cell and
     // **thread-blocks** on the reply, instead of falling to the generic dispatch (whose LiveImpl
     // arm answers `-EINVAL`). The `host` borrow above is dead on this path; `live_impl_call`
@@ -435,15 +435,15 @@ unsafe fn cap_thunk_impl(
     }
 }
 
-/// **Multi-threaded `cap.call` thunk** (DESIGN.md §22 threaded *compile*): the same dispatch as
+/// **Multi-threaded `call.cap` thunk** (DESIGN.md §22 threaded *compile*): the same dispatch as
 /// [`cap_thunk`], but serialized through a per-domain [`Mutex<Host>`] so a guest whose worker
-/// threads make concurrent `cap.call`s (notably `Jit.compile`, which mutates the `Host` unit
+/// threads make concurrent `call.cap`s (notably `Jit.compile`, which mutates the `Host` unit
 /// registry and the live `CompiledModule`) does not data-race. `ctx` is `*const Mutex<Host>`
 /// (vs `cap_thunk`'s raw `*mut Host`), so single-threaded guests keep the unlocked `cap_thunk`
 /// and pay nothing; only a concurrent guest's run bakes *this* thunk (see [`jit_cap_run`]).
 ///
 /// **Re-entrancy** (the "running units compile more" case): `Jit.invoke` runs guest code that may
-/// itself `cap.call` (e.g. compile more) on the same thread, so the lock must **not** be held
+/// itself `call.cap` (e.g. compile more) on the same thread, so the lock must **not** be held
 /// across it — invoke reads the unit under the lock, *releases*, then trampolines. Every other op
 /// is host-side only (the §14 Instantiator / fibers re-enter via their own runtimes, never through
 /// here), so holding the lock across a plain delegate to [`cap_thunk`] is deadlock-free.
@@ -545,7 +545,7 @@ pub unsafe extern "C" fn cap_thunk_locked(
         Some(&mut pending_id),
     );
     // §12 parking-on-blocking: a punted offloadable dispatch — release the domain lock **before**
-    // waiting, so sibling vCPU threads' cap.calls proceed while the offload pool does the work
+    // waiting, so sibling vCPU threads' call.cap calls proceed while the offload pool does the work
     // (the §5b serialization fix on the JIT threaded tier). The impl wrote no results on the punt;
     // the completion's scalar is the call's single result slot (invariant 8 — a wider declared
     // signature fails closed).
@@ -578,7 +578,7 @@ pub unsafe extern "C" fn cap_thunk_locked(
 
 /// `Jit.invoke` for the [`cap_thunk_locked`] path: resolve the unit **under the lock**, then
 /// **release** before running its trampoline (`invoke_extra`), so the invoked unit may itself
-/// `cap.call` (e.g. compile more) on this thread without self-deadlocking and other threads keep
+/// `call.cap` (e.g. compile more) on this thread without self-deadlocking and other threads keep
 /// making progress while it runs. Mirrors [`jit_native_op`]'s op-1 arm exactly, minus the lock
 /// scope.
 ///
@@ -632,7 +632,7 @@ unsafe fn jit_invoke_locked(
         std::slice::from_raw_parts_mut(results, n_results as usize)
     };
     // SAFETY: lock released; `cm` is the in-flight run's CompiledModule, `code` its unit's
-    // finalized trampoline; arity checked above; a nested `cap.call` (e.g. compile) from the
+    // finalized trampoline; arity checked above; a nested `call.cap` (e.g. compile) from the
     // invoked code re-acquires the lock on this thread.
     if CompiledModule::invoke_extra(
         cm as *mut CompiledModule,
@@ -668,7 +668,7 @@ unsafe fn jit_invoke_locked(
 ///
 /// # Safety
 /// `host_ptr` is the run's live `*mut Host` with **no `&mut Host` held by the caller across this
-/// call** (a handler's own `cap.call`s re-enter the thunk, re-deriving from the same pointer);
+/// call** (a handler's own `call.cap`s re-enter the thunk, re-deriving from the same pointer);
 /// `mem_base` is the live run's window base and `results`/`n_results`/`trap_out` honor the
 /// [`temen_jit::CapThunk`] contract.
 unsafe fn serve_native(
@@ -713,7 +713,7 @@ unsafe fn serve_native(
         }
         let mut res = vec![0i64; n_res];
         // SAFETY: `cm` is the in-flight run's CompiledModule (the guest is suspended in this
-        // synchronous `cap.call` on this thread); `code` is its finalized handler trampoline;
+        // synchronous `call.cap` on this thread); `code` is its finalized handler trampoline;
         // arity checked above; no `&mut Host` is live (the scoped pops/settles above ended).
         if CompiledModule::invoke_extra(cm, code, &args, &mut res, mem_base, trap_out).is_err() {
             *trap_out = TrapKind::CapFault as i64; // not in-flight — unreachable from a real run
@@ -799,12 +799,12 @@ unsafe fn jit_native_op(
                 .jit_unit_types(compiled.domain, compiled.unit)
                 .expect("unit was just stored");
             // SAFETY: `cm` is the in-flight run's CompiledModule (jit_cap_run registered it);
-            // the guest is suspended in this synchronous cap.call, so this transient re-entry
+            // the guest is suspended in this synchronous call.cap, so this transient re-entry
             // aliases no live reference (run_raw's contract).
             match (*cm).define_extra(&funcs, &types) {
                 Ok(defs) => {
                     // The unit entry (func 0): trampoline for `invoke`, natural code + type_id
-                    // for B2 `install` into the call_indirect table.
+                    // for B2 `install` into the call.dyn table.
                     let d = defs[0];
                     host.set_jit_unit_native(
                         compiled.domain,
@@ -847,7 +847,7 @@ unsafe fn jit_native_op(
                 return cap_fault(trap_out);
             }
             // Strict arity vs the unit's entry (parity with the interp eval arm): the invoke
-            // args are the cap.call args minus the code handle; results must match exactly.
+            // args are the call.cap args minus the code handle; results must match exactly.
             let entry = &funcs[0];
             if args.len() - 1 != entry.params.len() || n_results as usize != entry.results.len() {
                 return cap_fault(trap_out);
@@ -867,7 +867,7 @@ unsafe fn jit_native_op(
             } else {
                 std::slice::from_raw_parts_mut(results, n_results as usize)
             };
-            // SAFETY: an in-flight run on this thread (we are inside its cap.call); `code` is
+            // SAFETY: an in-flight run on this thread (we are inside its call.cap); `code` is
             // the unit's finalized trampoline; arity checked above; `mem_base`/`trap_out` are
             // the live run's window base and trap cell. On a clean return the cell stays 0; on
             // a trap the trampoline / nested guard wrote it — either way it holds the truth.
@@ -919,7 +919,7 @@ unsafe fn jit_native_op(
                 return cap_fault(trap_out);
             }
             // SAFETY: `cm` is the in-flight run's CompiledModule (guest suspended in this
-            // synchronous cap.call); `code` is a natural-ABI entry the JIT registered for this
+            // synchronous call.cap); `code` is a natural-ABI entry the JIT registered for this
             // unit. The slot write does not move the table base (pre-reserved at compile).
             let v = match (*cm).install(code as *const u8, type_id) {
                 Some(slot) => {
@@ -934,7 +934,7 @@ unsafe fn jit_native_op(
         }
         4 => {
             // uninstall(slot) -> 0 | -EINVAL (DESIGN.md §22 reclaim): clear an installed slot
-            // so the index is reusable and a stale call_indirect of it traps.
+            // so the index is reusable and a stale call.dyn of it traps.
             let Ok(domain) = host.resolve_jit_domain(handle) else {
                 return cap_fault(trap_out);
             };
@@ -987,7 +987,7 @@ unsafe fn jit_native_op(
                 .jit_unit_types(compiled.domain, compiled.unit)
                 .expect("unit was just stored");
             // SAFETY: identical contract to op 0 — `cm` is the in-flight run's CompiledModule and
-            // the guest is suspended in this synchronous cap.call, so the re-entry aliases nothing.
+            // the guest is suspended in this synchronous call.cap, so the re-entry aliases nothing.
             match (*cm).define_extra(&funcs, &types) {
                 Ok(defs) => {
                     let d = defs[0];
@@ -1056,7 +1056,7 @@ pub fn jit_blob_validator_durable(
 /// Decode the guest-provided **symbol table** for `compile_linked` (DESIGN.md §22): a `name →
 /// [`Resolved`]` map the loader binds a unit's §7 imports against. Untrusted-input-facing and
 /// fail-closed (`None` on any malformation) — but note the *values* are guest-chosen by design:
-/// a forged slot confers no authority (the resolved `call_indirect` is masked + `type_id`-checked
+/// a forged slot confers no authority (the resolved `call.dyn` is masked + `type_id`-checked
 /// at the call, exactly like a slot the guest already controls in its own code), and the whole
 /// unit is re-verified after the rewrite. Wire form (LEB128, mirroring `temen-encode`):
 /// `count`, then per entry `name` (uleb len + UTF-8 bytes), a `kind` byte, and its payload —
@@ -1159,7 +1159,7 @@ impl SymCursor<'_> {
 /// Host-assisted dynamic-link resolve — the host-assisted half of in-window dynamic linking
 /// (DESIGN.md §22). Decode
 /// a serialized unit that may carry **unresolved §7 imports** (the v2 wire form), bind each import
-/// name through `resolve` (a *guest-controlled* symbol table: name → a `call_indirect` table slot,
+/// name through `resolve` (a *guest-controlled* symbol table: name → a `call.dyn` table slot,
 /// or a host capability), then run the **same** fail-closed gate as [`jit_blob_validator`]. Crucially
 /// the resolve is a source-to-source rewrite that runs *before* `verify_module`, so a mis-link — an
 /// unknown name, a wrong import signature, a non-const slot handle — is caught by re-verification and
@@ -1189,7 +1189,7 @@ fn jit_resolve_and_validate_impl(
     let Ok(m) = temen_encode::decode_module(bytes) else {
         return Err(EINVAL);
     };
-    // Bind every named import to a concrete `call`/`call_indirect`/`cap.call` (fail-closed on an
+    // Bind every named import to a concrete `call`/`call.dyn`/`call.cap` (fail-closed on an
     // unresolved or ill-typed binding), yielding an import-free module the verifier accepts unchanged.
     let Ok(m) = temen_ir::resolve_imports_with(&m, resolve) else {
         return Err(EINVAL);
@@ -1215,12 +1215,12 @@ fn jit_resolve_and_validate_impl(
     }
     // A submitted unit MAY host §12 **fibers** (`cont.*`) — they switch stacks within the domain on
     // the caller's thread, so a unit running its own scheduler to completion never parks across the
-    // synchronous `cap.call` it runs inside; the parent domain stands up the fiber runtime (see
+    // synchronous `call.cap` it runs inside; the parent domain stands up the fiber runtime (see
     // `CompiledModule::enable_fiber_hosting`, and the interpreter's `INVOKE_MODULE` fiber support).
     // **Threads** (`thread.spawn`/`join`) and the **futex** (`wait`/`notify`) are admitted too
     // (renegotiated 2026-08-04, owner-directed — CONSOLIDATION.md §11; was: rejected here since
     // 2026-07-30). The old compile-time veto guarded an *invoke*-shaped hazard — a spawned vCPU
-    // outliving the synchronous `cap.call` — and that hazard is enforced where it is real:
+    // outliving the synchronous `call.cap` — and that hazard is enforced where it is real:
     // `invoke` of a unit that spawns/parks still fails at runtime (the nested `run_invoke` is
     // seam-free, CapFault). The supported path for a threaded unit is **install** + dispatch:
     // installed code runs in the calling vCPU's own frames, where a spawn is an ordinary
@@ -1228,7 +1228,7 @@ fn jit_resolve_and_validate_impl(
     if m.funcs.is_empty() {
         return Err(EINVAL);
     }
-    // A submitted unit's `call_indirect` (the new→old path) is now allowed: on the JIT it
+    // A submitted unit's `call.dyn` (the new→old path) is now allowed: on the JIT it
     // dispatches through the parent `fn_table`; the reference interpreter mirrors this with its
     // module-aware dispatch table (a unit runs as a module ≥ 1 whose indirect calls resolve into
     // module 0). Both backends therefore reach the original program's functions identically
@@ -1240,7 +1240,7 @@ fn jit_resolve_and_validate_impl(
 /// [`jit_blob_validator`] and mint the domain handle bound to `m`'s declared memory (the
 /// memory-match precondition). Works for both backends — the interpreter services the iface
 /// in its eval loop/dispatch; the JIT needs the module registered too (see [`jit_cap_run`]).
-/// `table_log2` reserves the `call_indirect` table for B2 `install` (pass the **same** value as
+/// `table_log2` reserves the `call.dyn` table for B2 `install` (pass the **same** value as
 /// the JIT compile's `table_reserve_log2`); `0` ⇒ no install room.
 pub fn grant_jit(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
     host.set_jit_validator(jit_blob_validator);
@@ -1263,9 +1263,9 @@ pub fn grant_jit_fibers(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
 /// the **futex** (`memory.wait`/`notify`) in an **installed** submitted unit (CONSOLIDATION.md §11 —
 /// installed units join the caller's concurrency model). [`jit_cap_run`] stands up the parent's
 /// thread scheduler (`CompiledModule::enable_thread_hosting`) and runs the serialized cap path so
-/// spawned vCPUs' concurrent `cap.call`s don't race; the interpreter drives `thread.*` in its own
+/// spawned vCPUs' concurrent `call.cap`s don't race; the interpreter drives `thread.*` in its own
 /// scheduler, so the backends stay in differential lockstep. `invoke` of a threaded unit still
-/// refuses (seam-free leaf); `install` + `call_indirect` runs it. Table room (`table_log2 > 0`) is
+/// refuses (seam-free leaf); `install` + `call.dyn` runs it. Table room (`table_log2 > 0`) is
 /// required for `install`. Same handle value + memory-match precondition as [`grant_jit`].
 pub fn grant_jit_threads(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
     host.set_jit_hosts_threads(true);
@@ -1284,7 +1284,7 @@ pub fn grant_jit_durable(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
     host.set_jit_validator(jit_blob_validator_durable);
     // Install fence (DURABILITY.md §12.5, R8 fork-critical case): stash the program's tainted
     // signatures + the gate predicate so a later `Jit.compile` of a *suspendable* unit whose entry
-    // signature the program does not taint fails closed (an un-instrumented `call_indirect` could
+    // signature the program does not taint fails closed (an un-instrumented `call.dyn` could
     // otherwise reach the installed unit and lose its continuation on thaw). The analysis lives here
     // in `temen-durable`; the TCB `Host` only stores the data and calls the predicate.
     host.set_jit_durable_gate(
@@ -1297,7 +1297,7 @@ pub fn grant_jit_durable(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
 /// Run `m` on the **JIT** with the `Jit` capability live: the long-lived compile→run split
 /// ([`CompiledModule`]), with the module pointer registered in `host` so [`cap_thunk`]'s
 /// native `Jit` ops can re-enter it mid-run (`define_extra` / `invoke_extra` while the guest
-/// is suspended in its synchronous `cap.call`). The interpreter counterpart is the plain
+/// is suspended in its synchronous `call.cap`). The interpreter counterpart is the plain
 /// `run_capture_reserved_with_host` over the same `Host` setup ([`grant_jit`]) — drive both
 /// with identical inputs for the differential.
 #[allow(clippy::too_many_arguments)]
@@ -1315,11 +1315,11 @@ pub fn jit_cap_run(
     let hosts_fibers = host.jit_hosts_fibers();
     // Thread-hosting grant (`grant_jit_threads`, CONSOLIDATION.md §11): the parent stands up its
     // thread scheduler so an installed unit's `thread.*` / futex resolve. A hosted unit spawns real
-    // vCPU threads that make **concurrent** `cap.call`s, so — like a top-level concurrent module — it
+    // vCPU threads that make **concurrent** `call.cap`s, so — like a top-level concurrent module — it
     // must run the serialized (locked-`Host`) thunk, even if the top-level module itself uses no
     // concurrency op. Read before any `mem::take`.
     let hosts_threads = host.jit_hosts_threads();
-    // A guest whose workers make concurrent `cap.call`s (threaded `Jit.compile`, DESIGN.md §22) runs
+    // A guest whose workers make concurrent `call.cap`s (threaded `Jit.compile`, DESIGN.md §22) runs
     // the **serialized** thunk over a per-domain `Mutex<Host>`; a single-threaded guest keeps the
     // unlocked `cap_thunk` + raw `Host` path verbatim (zero lock cost). The guest-facing iface is
     // identical either way — the serialization is an internal detail that can be made finer-grained
@@ -1359,7 +1359,7 @@ pub fn jit_cap_run(
             reconstruct_jit_units(&mut cm, &mut hg)?;
         }
         // SAFETY: `&mut cm` is the only pointer the thunk's handlers re-enter through (registered
-        // above); all of the run's vCPU threads serialize their `cap.call`s through `host_mutex`.
+        // above); all of the run's vCPU threads serialize their `call.cap`s through `host_mutex`.
         let r = unsafe { CompiledModule::run_raw(&mut cm, args, Some(init_mem), Some(1 << 18)) };
         host_mutex
             .lock()
@@ -1411,11 +1411,11 @@ pub fn jit_cap_run(
 /// module stays valid until the caller drops it.
 ///
 /// **Quiescent-only.** The guest is suspended *inside* the module being compacted during any
-/// `cap.call`, so this is **embedder-facing** — call it between runs (a REPL between prompts),
-/// never from a `cap.call` handler. Asserts `!old.is_running()`.
+/// `call.cap`, so this is **embedder-facing** — call it between runs (a REPL between prompts),
+/// never from a `call.cap` handler. Asserts `!old.is_running()`.
 ///
 /// **What is carried, and why it is transparent.** Every unit that is still reachable — either
-/// occupying a `call_indirect` table slot ([`CompiledModule::installed_slots`]) or held through a
+/// occupying a `call.dyn` table slot ([`CompiledModule::installed_slots`]) or held through a
 /// live `CompiledCode` handle ([`Host::jit_live_units`]) — is re-`define_extra`'d into the fresh
 /// module, its `Host` unit→native pointers are remapped (so existing `CompiledCode` handles, which
 /// name a `(domain, unit)` not a code address, keep invoking the right code), and any slot it
@@ -1464,7 +1464,7 @@ pub fn recompact_jit(
 
 /// Rebuild the domain's **live unit set** into an already-compiled `fresh` module: carry every unit
 /// still reachable (held through a live `CompiledCode` handle, [`Host::jit_live_units`], **or**
-/// occupying a `call_indirect` slot of `old`), re-`define_extra` it, remap the `Host` unit→native
+/// occupying a `call.dyn` slot of `old`), re-`define_extra` it, remap the `Host` unit→native
 /// record (so existing handles keep resolving), and reproduce occupied slots at their **exact**
 /// index. The thunk/ctx baked into `fresh` (locked vs raw) is the caller's choice — this is the
 /// thunk-agnostic half of compaction, shared by [`recompact_jit`] (raw) and [`JitSession`] (locked,
@@ -1533,8 +1533,8 @@ pub fn recompact_into(
 /// just-granted domain holds no live `CompiledCode` handle.
 ///
 /// **Scope.** The `invoke` path (live `CompiledCode` handles) **and** the B2 `install` path: a
-/// unit occupying a `call_indirect` table slot ([`Host::jit_installs`]) is compiled and its slot
-/// reproduced at the exact index ([`CompiledModule::install_at`]), so a `call_indirect` through an
+/// unit occupying a `call.dyn` table slot ([`Host::jit_installs`]) is compiled and its slot
+/// reproduced at the exact index ([`CompiledModule::install_at`]), so a `call.dyn` through an
 /// installed slot resolves after a thaw (DURABILITY.md §12.5 install-durability) — the interpreter
 /// re-applies the same occupancy when it builds the run's dispatch table. An installed unit whose
 /// `CompiledCode` handle was already released is still carried (union of live + installed), like
@@ -1595,15 +1595,15 @@ pub fn reconstruct_jit_units(
 /// see `recompact_jit`), the guest never observes it.
 ///
 /// **Concurrency.** The session **owns** the `Host` behind a boxed `Mutex` (stable address) and bakes
-/// [`cap_thunk_locked`], so a **multi-threaded** guest's worker `cap.call`s (incl. threaded
+/// [`cap_thunk_locked`], so a **multi-threaded** guest's worker `call.cap`s (incl. threaded
 /// `Jit.compile`, DESIGN.md §22) serialize correctly — and compaction (a quiescent, between-prompts
 /// operation) rebuilds the module with the **same** locked thunk, so the next multi-threaded prompt
-/// stays sound. A single-threaded guest pays only an uncontended lock per `cap.call`, negligible for
+/// stays sound. A single-threaded guest pays only an uncontended lock per `call.cap`, negligible for
 /// an interactive REPL driver (the perf-critical single-run path is [`jit_cap_run`], which stays
 /// unlocked). Retrieve the host with [`Self::into_host`].
 ///
 /// # Lifetime contract
-/// The boxed `Mutex<Host>`'s heap address is baked into the compiled code as the `cap.call` ctx (at
+/// The boxed `Mutex<Host>`'s heap address is baked into the compiled code as the `call.cap` ctx (at
 /// construction and at every recompaction); the `Box` keeps it stable across `JitSession` moves.
 pub struct JitSession {
     base: Module,
@@ -1617,8 +1617,8 @@ pub struct JitSession {
     /// [`Self::compact`] by hand).
     watermark: usize,
     cm: CompiledModule,
-    /// The session-owned powerbox, boxed so its address is stable (baked as the `cap.call` ctx) and
-    /// behind a `Mutex` so a multi-threaded guest's concurrent `cap.call`s serialize.
+    /// The session-owned powerbox, boxed so its address is stable (baked as the `call.cap` ctx) and
+    /// behind a `Mutex` so a multi-threaded guest's concurrent `call.cap`s serialize.
     host: Box<Mutex<Host>>,
     /// The carried guest window (low `SNAP` bytes), seeding each prompt and updated from its result.
     window: Vec<u8>,
@@ -1680,7 +1680,7 @@ impl JitSession {
     /// Run the guest entry on `args` over the carried window, then auto-compact if the watermark is
     /// reached. Returns the prompt's [`JitOutcome`]; the window snapshot is retained for the next
     /// prompt (read it via [`Self::window`]). `args` is the raw i64-slot ABI (e.g. the `Jit` handle
-    /// followed by the guest's own arguments). The guest may spawn threads (its worker `cap.call`s
+    /// followed by the guest's own arguments). The guest may spawn threads (its worker `call.cap`s
     /// serialize through the session's `Mutex<Host>`).
     pub fn run_prompt(&mut self, args: &[i64]) -> Result<JitOutcome, temen_jit::JitError> {
         let cm_ptr: *mut CompiledModule = &mut self.cm;
@@ -1689,7 +1689,7 @@ impl JitSession {
             .unwrap_or_else(|e| e.into_inner())
             .set_jit_native_ctx(cm_ptr as usize);
         // SAFETY: `cm_ptr` is the only pointer used for this run and the one the thunk's handlers
-        // re-enter through (registered above); the run's vCPU threads serialize their `cap.call`s
+        // re-enter through (registered above); the run's vCPU threads serialize their `call.cap`s
         // through the session's `Mutex<Host>`; `self.cm` is not moved during the call (we hold
         // `&mut self`, and `run_raw` keeps no live reference across the guarded call).
         let r = unsafe {
@@ -1746,7 +1746,7 @@ impl JitSession {
     }
 
     /// Seed `bytes` into the carried guest window at `off` before the next prompt — e.g. a
-    /// submitted-IR blob the guest `cap.call compile`s, or argv/env/data a REPL hands the first
+    /// submitted-IR blob the guest `call.cap compile`s, or argv/env/data a REPL hands the first
     /// prompt. Persists like any window state (each prompt seeds from, and writes back to, the
     /// carried window). Out-of-range writes are clamped to the window.
     pub fn seed_window(&mut self, off: usize, bytes: &[u8]) {
@@ -1773,7 +1773,7 @@ impl JitSession {
     }
 }
 
-/// The §9/D45 **devirtualized `cap.call` fast-path resolver** for the production powerbox. It claims
+/// The §9/D45 **devirtualized `call.cap` fast-path resolver** for the production powerbox. It claims
 /// only the **window-independent, authority-checked** hot op — `Clock.now` — so
 /// it takes the register-to-register fast path; every other op (all *window-touching* ones —
 /// `Memory`/`Stream`/`SharedRegion`/`IoRing` — and any multi-result or arity-mismatched op) returns
@@ -1785,7 +1785,7 @@ impl JitSession {
 /// `CapFault` — and the op semantics are byte-identical to the generic path. The win is only the
 /// leaner JIT→host boundary (args/result in registers, no stack marshalling, no runtime `(type_id,
 /// op)` dispatch). The arity gate (`n_args`/`n_res`) prevents a C-ABI mismatch if a frontend emits a
-/// `cap.call` to one of these ops with an unexpected signature.
+/// `call.cap` to one of these ops with an unexpected signature.
 ///
 /// Pass it to [`temen_jit::compile_and_run_with_host_fast`] /
 /// [`temen_jit::compile_and_run_with_host_interruptible_fast`]; [`run_powerbox`] uses it automatically.
@@ -1881,7 +1881,7 @@ unsafe fn fast_dispatch(
 /// (granted by [`Host::grant_module`]) to the module's code/data so the runtime can compile and spawn
 /// a **separate-module child** (`instantiate_module` & friends). Pass it (with the same `Host` ctx as
 /// [`cap_thunk`]) to `compile_and_run_capture_reserved_with_host_ex`. Deliberately not routed through
-/// `cap.call` dispatch: it yields host pointers, which must never be guest-reachable.
+/// `call.cap` dispatch: it yields host pointers, which must never be guest-reachable.
 ///
 /// # Safety
 /// `ctx` is the live `*mut Host` (the same as the cap thunk's); `out` is a writable
@@ -2054,7 +2054,7 @@ unsafe fn blocked_wait_interrupted(epoch_cell: usize, trap_out: *mut i64) -> boo
 /// `svc.poll`/`svc.wait`, serviced on the child's own thread over its shared powerbox cell. Pops
 /// and serves queued dispatches through the child's registered serve context
 /// ([`temen_jit::child_handler_tramp`] / [`temen_jit::child_invoke_handler`] — the guard is **dropped**
-/// around every handler invoke, so the handler's own `cap.call`s relock freely and an enqueuing
+/// around every handler invoke, so the handler's own `call.cap`s relock freely and an enqueuing
 /// caller is never blocked out); each settle notifies the cell's Condvar (waking a thread-blocked
 /// caller). An empty-queue `svc.wait` **block-waits** on the same Condvar (the arm 5 park),
 /// bounded by 20ms re-checks of the epoch/trap cells — where the pre-5c.1 stub answered `-EINVAL`
@@ -2129,7 +2129,7 @@ unsafe fn serve_locked_child(
                 continue;
             }
             let mut res = vec![0i64; n_res];
-            // Run the handler with the cell UNLOCKED (its own cap.calls relock; an enqueuer
+            // Run the handler with the cell UNLOCKED (its own call.cap calls relock; an enqueuer
             // never blocks behind a running handler). SAFETY: `serve_ctx` is the live
             // `ChildCode` (cleared only at release, which runs after the child's guest code —
             // including this serve — has returned); `[mem_base, +mem_size)` is this child's
@@ -2197,7 +2197,7 @@ fn crossing_depth_ok() -> bool {
     CROSSING_DEPTH.with(|d| d.get() < CROSSING_DEPTH_MAX)
 }
 
-/// CALLS.md 5c.1b — the **caller side** of the JIT parked transport: a cross-domain `cap.call`
+/// CALLS.md 5c.1b — the **caller side** of the JIT parked transport: a cross-domain `call.cap`
 /// through a minted live-impl. Enqueue on the callee child's shared cell (ticket `t`), then
 /// **thread-block** on the cell's Condvar until the child's serve loop settles `t` — the §10.2
 /// arm-5 transport, caller half. Fail-closed edges: full callee queue ⇒ `-EAGAIN` (probeable
@@ -2369,7 +2369,7 @@ pub unsafe extern "C" fn child_offer_mint(
 /// window-relative `grants_ptr`, re-grant each record's copyable handle into a fresh child powerbox
 /// `Host` **under its name** (via the shared [`Host::spawn_named_child`]), and return the child host +
 /// its `Instantiator`/`AddressSpace` handles (`grant_handle` unused — named grants are found by
-/// `cap.self.resolve`, not passed as an arg). The multi-cap, by-name analog of [`grant_child_build`].
+/// `self.resolve`, not passed as an arg). The multi-cap, by-name analog of [`grant_child_build`].
 ///
 /// Fails the whole spawn closed, exactly like the interpreter's op-11 path: an out-of-window record or
 /// name is a `MemoryFault`; a non-UTF-8 name or a forged / non-copyable handle is a `CapFault`. Returns
@@ -2511,7 +2511,7 @@ pub struct MprotectWindow {
     /// Page index ⇒ explicit state code (1=Rw, 2=Ro, 3=Unmapped); absent ⇒ region default (rw in
     /// `[0, mapped)`, unmapped in the reserved tail). Mirrors `temen_interp`'s page map so the two
     /// backends agree page-for-page. **Shared** ([`Arc<Mutex<…>>`]) so it persists across the run's
-    /// `cap.call`s (the JIT rebuilds the window view per call): guest-grown pages stay borrowable. The
+    /// `call.cap`s (the JIT rebuilds the window view per call): guest-grown pages stay borrowable. The
     /// persistent home is the `Host` ([`Host::cap_window_pages`]); a one-off [`MprotectWindow::new`]
     /// gets a private fresh map.
     prot: CapPageMap,
@@ -2554,7 +2554,7 @@ impl PageState {
 impl MprotectWindow {
     /// Wrap the JIT window `[base, base+mapped)` (backed) inside a `reserved` mask domain with a
     /// **private** fresh page map — for a one-off view. Most callers want [`MprotectWindow::new_shared`]
-    /// (the `cap_thunk` path) so growth persists across the run's cap.calls.
+    /// (the `cap_thunk` path) so growth persists across the run's call.cap calls.
     pub fn new(base: *mut u8, mapped: u64, reserved: u64) -> MprotectWindow {
         Self::new_shared(
             base,
@@ -2565,7 +2565,7 @@ impl MprotectWindow {
     }
 
     /// Like [`MprotectWindow::new`], but with a **shared** page map (typically the per-run one from
-    /// [`Host::cap_window_pages`]) so a guest-grown page committed in one `cap.call` is still seen
+    /// [`Host::cap_window_pages`]) so a guest-grown page committed in one `call.cap` is still seen
     /// committed by a later one — the cap-buffer borrow of grown heap memory no longer fail-closes.
     pub fn new_shared(
         base: *mut u8,
@@ -2867,7 +2867,7 @@ impl GuestMem for MprotectWindow {
     /// `mmap(MAP_SHARED | MAP_FIXED)` of the region's `os_fd` over `[win_off, win_off+len)`, so two
     /// mappings of the same region (here, or in another window) name the *same* physical pages: true
     /// hardware aliasing with zero per-access overhead (§13). The mapping persists in the window's
-    /// reservation across `cap.call`s — this `MprotectWindow` is rebuilt per call, but the OS mapping
+    /// reservation across `call.cap`s — this `MprotectWindow` is rebuilt per call, but the OS mapping
     /// and the region fd (owned by the `Host`'s backing) are not. Validation mirrors the interpreter's
     /// `Mem::map_region`. Wired on Linux (`memfd`); macOS/windows are a follow-up (→ `-EINVAL`).
     fn map_region(
@@ -2941,7 +2941,7 @@ impl GuestMem for MprotectWindow {
         // — whether it is currently committed (the backed prefix) or an untouched placeholder tail —
         // then replace it with a view of the section (`MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)`). Two
         // mappings of the same section then name the same physical pages: true hardware aliasing,
-        // zero per-access overhead, persisting across `cap.call`s (the OS view + the section handle
+        // zero per-access overhead, persisting across `call.cap`s (the OS view + the section handle
         // held by the `Host` backing outlive this per-call `MprotectWindow`). Mirrors the unix path,
         // but at **allocation-granularity** (64 KiB) — what `MapViewOfFile3` requires for the
         // placement address and the section offset (the guest aligns to `region_page_size`, which
@@ -3546,7 +3546,7 @@ struct JitRun {
 /// and run it over `slots` under the §5 kill-path armed by `interrupt`, seeded with `init_mem` and
 /// (when `snapshot_cap` is `Some`) snapshotting the low `snapshot_cap` window bytes. A **concurrent**
 /// guest (`locked` is `Some`) runs the serialized [`cap_thunk_locked`] over a per-domain `Mutex<Host>`
-/// — so worker threads can `cap.call` (incl. threaded `Jit.compile`) without racing — and forgoes the
+/// — so worker threads can `call.cap` (incl. threaded `Jit.compile`) without racing — and forgoes the
 /// single-threaded-only D45 fast path; a single-threaded guest keeps the unlocked [`cap_thunk`] + raw
 /// `*mut Host` + [`fast_cap_resolver`] exactly as before (zero lock cost). Exactly one of `locked` /
 /// `raw_host` is used. The single low-level JIT entry, shared by [`jit_run`].
@@ -3594,7 +3594,7 @@ unsafe fn powerbox_compile_run(
         }
         // Thread-hosting grant (`set_jit_hosts_threads`, CONSOLIDATION.md §11): stand up the thread
         // scheduler so an installed unit's `thread.*` / futex resolve. Only the **locked** powerbox
-        // path hosts threads — a hosted unit's spawned vCPUs are concurrent `cap.call`ers, so the
+        // path hosts threads — a hosted unit's spawned vCPUs are concurrent `call.cap`ers, so the
         // serialized `Host` is required. Idempotent when the top-level already built the scheduler.
         if m.lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3677,7 +3677,7 @@ unsafe fn powerbox_compile_run(
 /// [`PowerboxProgram::compile`] time), so there is no `locked`/fiber/thread-hosting arm.
 ///
 /// # Safety
-/// `host` **must** be the same `Host` allocation whose address was baked as the `cap.call` ctx (and
+/// `host` **must** be the same `Host` allocation whose address was baked as the `call.cap` ctx (and
 /// read by [`fast_cap_resolver`]) when `cm` was compiled — [`PowerboxProgram`] keeps it boxed so the
 /// address is stable and only resets its *contents* between runs. `cm` is not moved during the call.
 unsafe fn powerbox_run_prebuilt(
@@ -3778,7 +3778,7 @@ pub fn run_powerbox_cfg(
     // ([`run_jit`]) now live in exactly one place, shared with the frontend-independent embedding
     // API. The `Instance` is built directly (not via [`instantiate`]) so this path does **not**
     // re-resolve named imports — preserving its behaviour for already-validated frontend output
-    // (chibicc / temen-llvm), which emits inline `cap.call`s and a func-0 `_start` and runs JIT-only.
+    // (chibicc / temen-llvm), which emits inline `call.cap`s and a func-0 `_start` and runs JIT-only.
     let inst = Instance {
         module: module.clone(),
         binding: None,
@@ -3827,7 +3827,7 @@ pub struct PowerboxProgram {
     /// Guest window size in bytes (0 when the module declares no memory), for window-scoped grants.
     win: u64,
     /// The powerbox host, **boxed so its heap address is stable**: that address was baked as the
-    /// `cap.call` ctx (and is read by [`fast_cap_resolver`]) when `cm` was compiled, so it must not
+    /// `call.cap` ctx (and is read by [`fast_cap_resolver`]) when `cm` was compiled, so it must not
     /// move. Only its *contents* are reset between runs.
     host: Box<Host>,
     /// The module compiled once against `&*host`. Boxed so its address (registered as the native
@@ -3873,7 +3873,7 @@ impl PowerboxProgram {
             binding: None,
             hooks: None,
         };
-        // The powerbox host, boxed for a stable address = the baked `cap.call` ctx (also read by
+        // The powerbox host, boxed for a stable address = the baked `call.cap` ctx (also read by
         // `fast_cap_resolver`). Granted here so the host is in the same shape the one-shot path
         // compiles against, and so `jit_hosts_fibers()` is known below. `run` resets these contents
         // (fresh caps re-granted deterministically) each call, but the box — hence the address — stays.
@@ -4115,7 +4115,7 @@ fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 7] {
     // program body on a scheduler root fiber. `powerbox_compile_run` reads this to `enable_fiber_hosting`
     // on the top-level module so a submitted unit's `cont.*` resolve even when the top-level program
     // uses no fibers of its own. Threads/futex in a submitted unit stay rejected (they would outlive
-    // the synchronous `cap.call`). In-domain stack switches, not an escape vector.
+    // the synchronous `call.cap`). In-domain stack switches, not an escape vector.
     h.set_jit_hosts_fibers(true);
     let mem_log2 = (win != 0).then(|| win.trailing_zeros() as u8);
     let v = [
@@ -4124,7 +4124,7 @@ fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 7] {
         h.grant_exit(),
         h.grant_memory(),
         h.grant_address_space(0, win),
-        // Reserve the `call_indirect` install table at `CLI_JIT_TABLE_LOG2` — the **same** value the
+        // Reserve the `call.dyn` install table at `CLI_JIT_TABLE_LOG2` — the **same** value the
         // JIT compile uses (see [`powerbox_compile_run`]) — so a `Jit.install` guest has room.
         h.grant_jit_with_table(mem_log2, CLI_JIT_TABLE_LOG2),
         // stderr — a second write-only `Stream` (`StreamRole::Err` → `host.stderr`), appended last so
@@ -4195,7 +4195,7 @@ fn diff_outcome(
 /// the fiber-park machinery). Runtime-granted live caps on a JIT run (an embedder wiring
 /// `wire_live_impl` into a compiled module) remain the embedder's choice and still answer
 /// `-EINVAL` — the static scan covers everything a guest can express in its bytes.
-/// CALLS.md 5c.1c — does the module spawn §14 children (any `Instantiator` `cap.call`)? A
+/// CALLS.md 5c.1c — does the module spawn §14 children (any `Instantiator` `call.cap`)? A
 /// serving module that also **nests** is the child-serving shape the JIT now runs natively (the
 /// 5c.1 parked transport: the serve points live in granted children, not the root), so the
 /// serve fold below must not send it to the oracle. A top-level-serving non-nesting module still
@@ -4394,7 +4394,7 @@ pub struct RunConfig {
     pub args: Vec<Vec<u8>>,
     /// The guest's environment vector (`envp`), each entry `KEY=VALUE`. See [`RunConfig::args`].
     pub env: Vec<Vec<u8>>,
-    /// CALLS.md 4d/§10.2 **direct handoff**: a `cap.call` into a provider parked at an empty-queue
+    /// CALLS.md 4d/§10.2 **direct handoff**: a `call.cap` into a provider parked at an empty-queue
     /// `svc.wait` runs the handler inline on the caller's thread instead of queueing through the
     /// scheduler (measured ~3.4x on the serving round-trip; CONSOLIDATION.md §2.1b). On by default —
     /// semantics are pinned handoff-on ≡ handoff-off by the `direct_handoff` differential tests; turn
@@ -5016,7 +5016,7 @@ impl Imports {
     /// capability-name directory (F7); its siblings resolve that name instead of granting anew, so
     /// all members share one handle — and one state — per run. (Without this, N `provide` calls of
     /// N `HostCap::host_proc`s would mint N independent closures — N filesystems.) Bonus symmetry:
-    /// the guest can also `cap.self.resolve("{module}")` for the shared handle at runtime.
+    /// the guest can also `self.resolve("{module}")` for the shared handle at runtime.
     pub fn provide_module(mut self, module: &str, cap: HostCap, fields: &[(&str, u32)]) -> Imports {
         for &(field, op) in fields {
             let provider = cap.clone();
@@ -5091,7 +5091,7 @@ struct MemHooks {
     stats: MemHookStats,
 }
 
-/// Decode a hook `cap.call` (`op` = event kind, `args` per `temen_opt::instrument::mem_hook_op`)
+/// Decode a hook `call.cap` (`op` = event kind, `args` per `temen_opt::instrument::mem_hook_op`)
 /// into its [`MemEvent`]. `None` is malformed — unreachable from a module the pass produced.
 fn decode_mem_event(op: u32, args: &[i64]) -> Option<MemEvent> {
     use temen_opt::instrument::mem_hook_op as k;
@@ -5157,7 +5157,7 @@ fn validate_powerbox_manifest(module: &Module) -> Result<(), String> {
         );
         if !bindable {
             return Err(format!(
-                "capability import `{}` names a dynamic-only interface (use `cap.call` on a live \
+                "capability import `{}` names a dynamic-only interface (use `call.cap` on a live \
                  handle)",
                 im.name
             ));
@@ -5204,7 +5204,7 @@ pub fn instantiate(module: Module) -> Result<Instance, String> {
 /// powerbox ([`instantiate`]) just one preset over the same machinery.
 ///
 /// Fails closed if an imported name has no binding in `imports`, an import names an interface the
-/// slot dispatch cannot serve (use dynamic mode — `cap.call` on a live handle, IMPORTS.md §2.2),
+/// slot dispatch cannot serve (use dynamic mode — `call.cap` on a live handle, IMPORTS.md §2.2),
 /// or the module fails verification.
 pub fn instantiate_with_imports(module: Module, imports: Imports) -> Result<Instance, String> {
     // Capture the import order. Slot i ↔ import i (the powerbox-prefix layout, IMPORTS.md §2.1).
@@ -5239,7 +5239,7 @@ pub fn instantiate_with_imports(module: Module, imports: Imports) -> Result<Inst
     }) {
         return Err(format!(
             "capability import `{name}` names an interface the slot dispatch cannot serve — use \
-             dynamic mode (`cap.call` on a live handle, IMPORTS.md §2.2)"
+             dynamic mode (`call.cap` on a live handle, IMPORTS.md §2.2)"
         ));
     }
     // §3.5 grouped host-native providers: the consumer's grouped requirement must be **covered**
@@ -5326,7 +5326,7 @@ impl Instance {
     /// hosts, so shared consumer state belongs behind an `Arc` inside the closure. The handler
     /// observes and may veto (`Err(Trap)` aborts the run with that trap).
     ///
-    /// Costs, for the opted-in run only: one `cap.call` (plus a couple of consts) per memory op —
+    /// Costs, for the opted-in run only: one `call.cap` (plus a couple of consts) per memory op —
     /// so more fuel than the pristine module (scale [`Limits::fuel`]) — and the module's
     /// `debug_info` is dropped (its per-inst positions would be stale after insertion). Not
     /// reported: host-side `GuestMem` accesses from other capability handlers, futex word touches,
@@ -5348,7 +5348,7 @@ impl Instance {
         }
         // Discover the handle the hook grant will mint: grants are deterministic and `grant_caps`
         // grants the hook first on each run's fresh Host, so a scratch first-grant yields exactly
-        // the value the instrumented code must bake in as its `cap.call` handle constant.
+        // the value the instrumented code must bake in as its `call.cap` handle constant.
         let handle = {
             let mut scratch = Host::new();
             scratch.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![])))
@@ -5380,7 +5380,7 @@ impl Instance {
 
     /// Grant the mem-hook capability, when this instance carries one. **Must be the first grant on
     /// `h`** — the instrumented module baked the handle a fresh host's first grant mints; asserted
-    /// fail-closed (a mismatch would make every hook `cap.call` an inert `CapFault`).
+    /// fail-closed (a mismatch would make every hook `call.cap` an inert `CapFault`).
     fn grant_mem_hooks(&self, h: &mut Host) {
         let Some(hooks) = &self.hooks else { return };
         let mut hook = (hooks.make)();
@@ -5452,7 +5452,7 @@ impl Instance {
     /// wasm-style configurable-import path for capabilities *outside* the fixed §3e prefix (e.g. a
     /// [`fs`](crate::fs) backend). Each `(name, cap)` is granted on the host and registered in the
     /// §7 capability-name directory (F7); the guest reaches it at runtime via
-    /// `cap.self.resolve(name)` (`__vm_cap_resolve` from C) + `cap.call` (`__vm_host_call`) — no
+    /// `self.resolve(name)` (`__vm_cap_resolve` from C) + `call.cap` (`__vm_host_call`) — no
     /// stash slot, no ABI change, no authority unless the embedder injects it.
     pub fn run_with_caps(
         &self,
@@ -5668,7 +5668,7 @@ impl Instance {
 
     fn grant_caps(&self, h: &mut Host, win: u64) {
         // §3.5: register the module's self-referential surface so `call.import.dyn`,
-        // `cap.self.type_id`/`covers`, and `export.handle` resolve host-side.
+        // `self.type_id`/`covers`, and `export.handle` resolve host-side.
         h.set_self_module(&Arc::new(self.module.clone()));
         // Hooks first: the instrumented module bakes the handle of a fresh host's first grant.
         self.grant_mem_hooks(h);
@@ -6377,7 +6377,7 @@ export 0 interface "pager" 1 { page: 1 }
 func 0 (i32) -> (i32) {
 block 0 (vh: i32) {
   vrp = i64.const 1024
-  vch = cap.call 6 17 (i64) -> (i32) vh (vrp)
+  vch = call.cap 6 17 (i64) -> (i32) vh (vrp)
   return vch
   }
 }

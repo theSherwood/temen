@@ -29,7 +29,7 @@ func 0 () -> () {
 block 0 () {
   vp = i64.const 16384
   vl = i64.const 2
-  vh = cap.self.resolve vp vl
+  vh = self.resolve vp vl
   ; spawn via record (op 17) at 17536 (above the #1094 NULL guard): entry=1 off=65536 sl=12 quota=0
   q0v0 = i64.const 4294967296
   q0v1 = i64.const 65536
@@ -50,13 +50,13 @@ block 0 () {
   i64.store q0a5 q0v4
   q0a6 = i64.const 17584
   i64.store q0a6 q0v4
-  v5 = cap.call 6 17 (i64) -> (i32) vh (q0a0)
+  v5 = call.cap 6 17 (i64) -> (i32) vh (q0a0)
   v6 = i64.const 0
-  v7 = cap.call 6 14 (i32, i64) -> (i32) vh (v5, v6)
+  v7 = call.cap 6 14 (i32, i64) -> (i32) vh (v5, v6)
   va = i64.const 40
   vb = i64.const 2
-  vr = cap.call 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
-  vj = cap.call 6 1 (i32) -> (i64) vh (v5)
+  vr = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
+  vj = call.cap 6 1 (i32) -> (i64) vh (v5)
   vc = i32.wrap_i64 vr
   call.import 0 (vc)
   unreachable

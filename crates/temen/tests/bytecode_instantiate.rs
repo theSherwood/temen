@@ -8,7 +8,7 @@
 //! Adapted from `crates/temen/tests/instantiator.rs`. Each case is checked **bit-identical** to the
 //! tree-walker `run_with_host`; `.expect(Some)` gates that the bytecode engine drove the module
 //! (didn't fall back). The host grants the `Instantiator` capability (iface 6); the handle reaches
-//! the guest as func 0's argument. `instantiate` is `cap.call 6 0`, `join` is `cap.call 6 1`.
+//! the guest as func 0's argument. `instantiate` is `call.cap 6 0`, `join` is `call.cap 6 1`.
 
 use temen_interp::{bytecode, run_with_host, Host, Value};
 use temen_text::parse_module;
@@ -65,8 +65,8 @@ block 0 (v0: i32) {
   i64.store q0a5 q0v4
   q0a6 = i64.const 1200
   i64.store q0a6 q0v4
-  v5 = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
-  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
   v7 = i64.const 65543
   v8 = i32.load8_u v7
   v9 = i64.extend_i32_u v8
@@ -118,8 +118,8 @@ block 0 (v0: i32) {
   i64.store q1a5 q1v4
   q1a6 = i64.const 1264
   i64.store q1a6 q1v4
-  v5 = cap.call 6 17 (i64) -> (i32) v0 (q1a0)
-  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
   return v6
   }
 }
@@ -149,8 +149,8 @@ block 0 (v0: i64) {
   i64.store q2a5 q2v4
   q2a6 = i64.const 1328
   i64.store q2a6 q2v4
-  v8 = cap.call 6 17 (i64) -> (i32) v1 (q2a0)
-  v9 = cap.call 6 1 (i32) -> (i64) v1 (v8)
+  v8 = call.cap 6 17 (i64) -> (i32) v1 (q2a0)
+  v9 = call.cap 6 1 (i32) -> (i64) v1 (v8)
   return v9
   }
 }
@@ -196,8 +196,8 @@ block 0 (v0: i32) {
   i64.store q3a5 q3v4
   q3a6 = i64.const 1392
   i64.store q3a6 q3v4
-  v5 = cap.call 6 17 (i64) -> (i32) v0 (q3a0)
-  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (q3a0)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
   return v6
   }
 }
@@ -206,7 +206,7 @@ block 0 (v0: i64, v1: i64) {
   v2 = i32.wrap_i64 v1
   v3 = i64.const 0
   v4 = i64.const 16384
-  v5 = cap.call 5 1 (i64, i64) -> (i64) v2 (v3, v4)
+  v5 = call.cap 5 1 (i64, i64) -> (i64) v2 (v3, v4)
   return v5
   }
 }
@@ -242,7 +242,7 @@ block 0 (v0: i32) {
   i64.store q4a5 q4v4
   q4a6 = i64.const 1456
   i64.store q4a6 q4v4
-  v5 = cap.call 6 17 (i64) -> (i32) v0 (q4a0)
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (q4a0)
   v6 = i64.extend_i32_s v5
   return v6
   }
@@ -284,8 +284,8 @@ block 0 (v0: i32) {
   i64.store q5a5 q5v1
   q5a6 = i64.const 4464
   i64.store q5a6 q5v1
-  v5 = cap.call 6 17 (i64) -> (i32) v0 (q5a0)
-  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (q5a0)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
   return v6
   }
 }

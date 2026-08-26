@@ -23,7 +23,7 @@
 // `exit` is a powerbox builtin (§3e), intercepted by name; declaring it here is enough.
 void exit(int code);
 
-// The Memory-capability builtins (§3e/§4), lowered to `cap.call` on the granted Memory handle.
+// The Memory-capability builtins (§3e/§4), lowered to `call.cap` on the granted Memory handle.
 // `__vm_map` commits `[off, off+len)` with `prot` (READ|WRITE = 3), returning 0 or a negative errno.
 // `__vm_page_size` returns the host MMU page granularity the window is managed in (the unit `map`
 // rounds to), so the guest can align to the *real* page instead of assuming a fixed size.

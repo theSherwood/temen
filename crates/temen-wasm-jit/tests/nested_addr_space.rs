@@ -1,6 +1,6 @@
 //! **§14 ADDRESS_SPACE on the wasm-JIT tier** — a nested unit's entry that *carves its own window*
 //! (`sub`, iface 5 op 4) or queries `page_size` (op 3) now emits, riding the **one existing**
-//! cross-tier transport: [`temen_wasm_jit::outline_nested_cap_calls`] hoists each such `cap.call` into
+//! cross-tier transport: [`temen_wasm_jit::outline_nested_cap_calls`] hoists each such `call.cap` into
 //! an int-signature wrapper leaf and [`temen_wasm_jit::compile_module_nested`] routes it through
 //! `env.call_interp`, whose callback here carries the run's **powerbox** (the reactor-path contract).
 //! No new imports — the CONSOLIDATION.md §0 yardstick.
@@ -27,11 +27,11 @@ const WIN: u64 = 1 << 17; // `memory 17`
 const AS_ONLY: &str = r#"memory 17
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  vps = cap.call 5 3 () -> (i64) v0 ()
+  vps = call.cap 5 3 () -> (i64) v0 ()
   voff = i64.const 65536
   vslog = i64.const 16
-  vsub = cap.call 5 4 (i64, i64) -> (i32) v0 (voff, vslog)
-  vps2 = cap.call 5 3 () -> (i64) vsub ()
+  vsub = call.cap 5 4 (i64, i64) -> (i32) v0 (voff, vslog)
+  vps2 = call.cap 5 3 () -> (i64) vsub ()
   v3 = i64.const 3
   vt = i64.mul vps2 v3
   vr = i64.add vps vt
@@ -47,17 +47,17 @@ block 0 (v0: i32) {
 const COMPOSED: &str = r#"memory 17
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
-  vps = cap.call 5 3 () -> (i64) v0 ()
+  vps = call.cap 5 3 () -> (i64) v0 ()
   voff = i64.const 65536
   vslog = i64.const 16
-  vsub = cap.call 5 4 (i64, i64) -> (i32) v0 (voff, vslog)
-  vps2 = cap.call 5 3 () -> (i64) vsub ()
+  vsub = call.cap 5 4 (i64, i64) -> (i32) v0 (voff, vslog)
+  vps2 = call.cap 5 3 () -> (i64) vsub ()
   ventry = i64.const 1
   vzoff = i64.const 16384
   vzslog = i64.const 10
   vquota = i64.const 0
-  vch = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v1 (ventry, vzoff, vzslog, vquota)
-  vjr = cap.call 6 1 (i32) -> (i64) v1 (vch)
+  vch = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v1 (ventry, vzoff, vzslog, vquota)
+  vjr = call.cap 6 1 (i32) -> (i64) v1 (vch)
   vk = i64.const 100000
   vjs = i64.mul vjr vk
   v3 = i64.const 3
@@ -336,7 +336,7 @@ func (i32) -> (i64) {
 block 0 (v0: i32) {
   voff = i64.const 0
   vlen = i64.const 16384
-  vr = cap.call 5 1 (i64, i64) -> (i64) v0 (voff, vlen)
+  vr = call.cap 5 1 (i64, i64) -> (i64) v0 (voff, vlen)
   return vr
   }
 }

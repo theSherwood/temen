@@ -6,7 +6,7 @@
 //! This proves the wiring: `new_confined_child_core` now calls `bind_child_manifest`, so the same
 //! child-entry `write` guest, `instantiate_module_named` (op 13)'d over the **resumable drive loop**
 //! with `stdout` re-granted, reaches the shared sink. Window confinement (§2) is untouched: the grant
-//! is authority (§3), a cross-tier `cap.call`, not a window access.
+//! is authority (§3), a cross-tier `call.cap`, not a window access.
 
 #![cfg(target_os = "linux")]
 
@@ -154,8 +154,8 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
   voff = i64.const {carve_off}
   vsl = i64.const {sl}
   vq = i64.const 0
-  vh = cap.call 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
-  vr = cap.call 6 1 (i32) -> (i64) v0 (vh)
+  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
+  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
   return vr
   }}
 }}

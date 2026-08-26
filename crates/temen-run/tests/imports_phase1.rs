@@ -4,7 +4,7 @@
 //! 1. `instantiate_with_imports` keeps the manifest and the `call.import` instructions intact —
 //!    the instantiated module is byte-identical to the verified one (content-addressable across
 //!    instantiations; contrast the legacy `resolve_imports` rewrite, which lowered every
-//!    `call.import` to `cap.call` and cleared the import section).
+//!    `call.import` to `call.cap` and cleared the import section).
 //! 2. The module runs **identically on all three backends** (tree-walker, bytecode engine, JIT)
 //!    through the one shared `CAP_IMPORT_TYPE_ID` dispatch translation.
 //! 3. The verifier's manifest checks are fail-closed (out-of-range index, sig mismatch,
@@ -48,7 +48,7 @@ fn registry() -> Imports {
 }
 
 /// The headline: instantiation does NOT rewrite. The manifest survives, every `call.import`
-/// survives, and no `cap.call` is manufactured.
+/// survives, and no `call.cap` is manufactured.
 #[test]
 fn no_rewrite_manifest_and_call_imports_survive_instantiation() {
     let m = parse_module(NAMED_START).expect("parse");
@@ -68,7 +68,7 @@ fn no_rewrite_manifest_and_call_imports_survive_instantiation() {
     );
     assert!(
         !insts.iter().any(|i| matches!(i, Inst::CapCall { .. })),
-        "no cap.call was manufactured"
+        "no call.cap was manufactured"
     );
 }
 

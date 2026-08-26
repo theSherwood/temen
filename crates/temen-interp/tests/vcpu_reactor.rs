@@ -1,7 +1,7 @@
 //! The **`VcpuReactor`** — the resumable-`Vcpu`-driven reactor the browser wasm-JIT tier-up rides.
 //!
 //! It must be a faithful substitute for the one-shot [`bytecode::Reactor`]: the same persistent
-//! window (a counter in guest memory survives frame-to-frame) and the same inline `cap.call` host I/O
+//! window (a counter in guest memory survives frame-to-frame) and the same inline `call.cap` host I/O
 //! (each frame writes the counter's low byte through a `Stream(Out)` capability). This test drives an
 //! identical guest through both and asserts byte-identical stdout — the differential that lets the
 //! reactor switch engines. It also exercises the **tier-up seam**: with func 2 (a pure `x+1`) marked
@@ -32,7 +32,7 @@ block 0 (vout: i32) {
   i64.store vaddr vc2
   vptr = i64.const 16384
   vlen = i64.const 1
-  vw = cap.call 0 1 (i64, i64) -> (i64) vout(vptr, vlen)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout(vptr, vlen)
   return
   }
 }

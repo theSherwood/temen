@@ -49,7 +49,7 @@ What we're chasing:
   speed budget is spent *around* compute, and this is where a lot of it lives:
     - **Zero-copy host calls / I/O** — borrow buffers are read in place through the
       page table, so a guest region can go straight to a device or GPU with no
-      copy-out (vs wasm's mandatory linear-memory→host hop), and `cap.call` is a
+      copy-out (vs wasm's mandatory linear-memory→host hop), and `call.cap` is a
       devirtualized register-to-register call, not component-model marshalling.
     - **A clean 64-bit address space** — a real 64-bit window, no 32-bit index type,
       so large or sparse programs are a first-class target instead of a fight.
@@ -234,7 +234,7 @@ where it stands.
 
 Embedders can call the same path directly — `temen_run::run_powerbox(&module, stdin)`
 returns the outcome plus captured output. It's the one reusable piece of host glue
-(the `cap.call` trampoline + powerbox grant), and it is *not* escape-TCB: the
+(the `call.cap` trampoline + powerbox grant), and it is *not* escape-TCB: the
 verifier, run first, is what makes a module safe.
 
 ## Fuzzing

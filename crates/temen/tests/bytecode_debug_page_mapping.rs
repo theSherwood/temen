@@ -38,7 +38,7 @@ block 0 (v0: i32) {
   v3 = i64.const 131072
   v4 = i64.const 16384
   v5 = i64.const 3
-  v6 = cap.call 5 0 (i64, i64, i64) -> (i64) v0 (v3, v4, v5)
+  v6 = call.cap 5 0 (i64, i64, i64) -> (i64) v0 (v3, v4, v5)
   v7 = i32.const 22
   i32.store8 v3 v7
   v8 = i64.const 16384
@@ -46,12 +46,12 @@ block 0 (v0: i32) {
   i32.store8 v8 v9
   v10 = i64.const 16384
   v11 = i64.const 1
-  v12 = cap.call 5 2 (i64, i64, i64) -> (i64) v0 (v8, v10, v11)
+  v12 = call.cap 5 2 (i64, i64, i64) -> (i64) v0 (v8, v10, v11)
   v13 = i64.const 114688
   v14 = i32.const 44
   i32.store8 v13 v14
   v15 = i64.const 16384
-  v16 = cap.call 5 1 (i64, i64) -> (i64) v0 (v13, v15)
+  v16 = call.cap 5 1 (i64, i64) -> (i64) v0 (v13, v15)
   v17 = i32.load8_u v1
   v18 = i32.load8_u v3
   v19 = i32.load8_u v8
@@ -200,7 +200,7 @@ block 0 (v0: i32) {
   vg = i64.const 131072
   vgl = i64.const 16384
   vrw = i64.const 3
-  vgr = cap.call 5 0 (i64, i64, i64) -> (i64) v0 (vg, vgl, vrw)
+  vgr = call.cap 5 0 (i64, i64, i64) -> (i64) v0 (vg, vgl, vrw)
   vm22 = i32.const 22
   i32.store8 vg vm22
   vro = i64.const 16384
@@ -208,12 +208,12 @@ block 0 (v0: i32) {
   i32.store8 vro vm33
   vrol = i64.const 16384
   vrop = i64.const 1
-  vpr = cap.call 5 2 (i64, i64, i64) -> (i64) v0 (vro, vrol, vrop)
+  vpr = call.cap 5 2 (i64, i64, i64) -> (i64) v0 (vro, vrol, vrop)
   vuo = i64.const 114688
   vm44 = i32.const 44
   i32.store8 vuo vm44
   vul = i64.const 16384
-  vur = cap.call 5 1 (i64, i64) -> (i64) v0 (vuo, vul)
+  vur = call.cap 5 1 (i64, i64) -> (i64) v0 (vuo, vul)
   vl1 = i32.load8_u vg
   vl2 = i32.load8_u vro
   vl3 = i32.load8_u vuo

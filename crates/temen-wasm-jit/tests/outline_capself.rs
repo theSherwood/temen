@@ -1,20 +1,20 @@
-//! **`cap.self.resolve` outlining** ([`temen_wasm_jit::outline_cap_calls`] hoists it as the
-//! `cap.call CAP_SELF op 2` it now is) — the transform that lets the on-ramp `_start` synth emit. The
+//! **`self.resolve` outlining** ([`temen_wasm_jit::outline_cap_calls`] hoists it as the
+//! `call.cap CAP_SELF op 2` it now is) — the transform that lets the on-ramp `_start` synth emit. The
 //! powerbox entry is otherwise pure compute + stores, but resolves each granted capability **by name**
-//! (`cap.self.resolve`, a host-boundary reflection op outside the compute subset), so one such call
-//! kept func 0 — and, under the whole-module `call_indirect` rule, the *entire* guest — off the wasm
-//! tier. Outlining each `cap.self.resolve` into an integer-signature cross-tier wrapper makes the entry
-//! pure compute + a `Call`, so it emits (see `outline_capcalls.rs` for the `cap.call` sibling).
+//! (`self.resolve`, a host-boundary reflection op outside the compute subset), so one such call
+//! kept func 0 — and, under the whole-module `call.dyn` rule, the *entire* guest — off the wasm
+//! tier. Outlining each `self.resolve` into an integer-signature cross-tier wrapper makes the entry
+//! pure compute + a `Call`, so it emits (see `outline_capcalls.rs` for the `call.cap` sibling).
 //!
 //! Proves the same two contracts at the interpreter level: outlining (1) **flips emittability** of a
-//! `cap.self.resolve`-bearing entry, and (2) **preserves semantics** (same host, same resolved handle).
+//! `self.resolve`-bearing entry, and (2) **preserves semantics** (same host, same resolved handle).
 
 use temen_interp::{bytecode, Host, Value};
 use temen_wasm_jit::{compile_module_reactor, outline_cap_calls};
 
 // The entry resolves the capability name "exit" — four bytes in a data segment at window offset 16384
 // (above the #1094 NULL guard) — to the handle it was granted under, and returns it. Pure compute apart
-// from the one `cap.self.resolve`.
+// from the one `self.resolve`.
 const SRC: &str = r#"
 memory 16
 data 16384 "exit"
@@ -22,7 +22,7 @@ func () -> (i32) {
 block 0 () {
   v0 = i64.const 16384
   v1 = i64.const 4
-  v2 = cap.self.resolve v0 v1
+  v2 = self.resolve v0 v1
   return v2
   }
 }
@@ -35,7 +35,7 @@ fn parse(src: &str) -> temen_ir::Module {
 }
 
 /// Run `f0` on the bytecode interpreter with an `exit` capability registered under that name, so
-/// `cap.self.resolve("exit")` returns its handle. Services the resolve identically whether it is inline
+/// `self.resolve("exit")` returns its handle. Services the resolve identically whether it is inline
 /// (before outlining) or in the wrapper (after).
 fn run(m: &temen_ir::Module) -> Vec<Value> {
     let mut host = Host::new();
@@ -56,20 +56,20 @@ fn run(m: &temen_ir::Module) -> Vec<Value> {
 fn outlining_capself_resolve_flips_emittability_and_preserves_semantics() {
     let mut m = parse(SRC);
 
-    // Before: the entry's inline `cap.self.resolve` puts it outside the compute subset, so the reactor
+    // Before: the entry's inline `self.resolve` puts it outside the compute subset, so the reactor
     // emit fails (the entry must be in-subset).
     assert!(
         compile_module_reactor(&m, 0, false).is_err(),
-        "an inline cap.self.resolve in the entry blocks emit",
+        "an inline self.resolve in the entry blocks emit",
     );
     let before = run(&m);
 
-    // Outline the `cap.self.resolve` into a wrapper function.
+    // Outline the `self.resolve` into a wrapper function.
     outline_cap_calls(&mut m);
     assert_eq!(
         m.funcs.len(),
         2,
-        "exactly one cap.self.resolve wrapper is appended"
+        "exactly one self.resolve wrapper is appended"
     );
     temen_verify::verify_module(&m).expect("the outlined module verifies");
 
@@ -79,7 +79,7 @@ fn outlining_capself_resolve_flips_emittability_and_preserves_semantics() {
     assert_eq!(
         emitted,
         vec![true, false],
-        "the entry emits to wasm; the cap.self.resolve wrapper stays cross-tier",
+        "the entry emits to wasm; the self.resolve wrapper stays cross-tier",
     );
 
     // Semantics-preserving: same host, same resolved handle.

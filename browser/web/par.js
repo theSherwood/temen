@@ -51,7 +51,7 @@ export async function loadEngine() {
 //   `inst`    ⇒ publish the §14 recipe (root `Instantiator` over the window + the optional granted
 //               `unit` module bytes) — the root vCPU builds its powerbox from it;
 //   `io`      ⇒ publish the 4d shared I/O powerbox (a `Mutex<Host>` in shared memory every vCPU
-//               dispatches `cap.call` through; read stdout back via `temen_par_stdout_*` after);
+//               dispatches `call.cap` through; read stdout back via `temen_par_stdout_*` after);
 //   none      ⇒ the recipes are explicitly cleared (`temen_par_powerbox_none`) so a plain compute run
 //               isn't seeded by a previous run's recipe;
 //   `winSize` sizes the shared window; `signal` (an `AbortSignal`) stops the run: every Worker is
@@ -77,7 +77,7 @@ export function makeRunner({ module, memory, ex }) {
     // CI-gated `jitb2` work item — see BROWSER.md § "wasm-JIT tier".
     if (jitB2) ex.temen_par_jit_set_b2(1);
     // §22 runtime-`Jit.compile` across Workers: publish the shared Mutex<Host> powerbox every vCPU
-    // dispatches its cap.calls through (the guest compiles its OWN units at runtime); with
+    // dispatches its call.caps through (the guest compiles its OWN units at runtime); with
     // `jitRuntimeCodegen` each compiled unit's emitted wasm services `Jit.invoke` per-Worker
     // (worker.js instantiates per code handle). `jitBlobs` stages the unit blobs into the window
     // where the guest's `compile (ptr, len)` reads them.

@@ -237,11 +237,11 @@ fn cross_tier_shares_the_window() {
     }
 }
 
-// Same shared-window round trip, but f0 reaches f1 through a **`call_indirect`** rather than a direct
-// call: `ref.func 1` forms the funcref, then `call_indirect (i64)->(i64)` dispatches through the
+// Same shared-window round trip, but f0 reaches f1 through a **`call.dyn`** rather than a direct
+// call: `ref.func 1` forms the funcref, then `call.dyn (i64)->(i64)` dispatches through the
 // identity table. f1 is cross-tier (a `v128` op keeps it out of subset), so its table slot holds a
 // **trampoline** that bounces to `env.call_interp` — proving indirect calls reach the interpreter over
-// the same window. Using `call_indirect` also forces `has_indirect`, so the reactor path only stays
+// the same window. Using `call.dyn` also forces `has_indirect`, so the reactor path only stays
 // emittable because the trampoline routes the cross-tier target (it would otherwise fall back whole).
 const SRC_INDIRECT: &str = r#"
 memory 16
@@ -252,7 +252,7 @@ block 0 (v0: i64) {
   va8 = i64.const 16392
   i64.store va8 vpre
   vf = ref.func 1
-  vr1 = call_indirect (i64) -> (i64) vf (v0)
+  vr1 = call.dyn (i64) -> (i64) vf (v0)
   vaddr = i64.const 16484
   vr = i64.load vaddr
   return vr
@@ -343,7 +343,7 @@ fn cross_tier_tail_call() {
 // the target function index (1) into the window and loads it back — exactly how the frontend bakes a
 // static function-pointer table (Doom's `states[]` action functions) into data, with no `RefFunc`
 // instruction. So the emitter must trampoline f1 anyway: an identity-table slot filled from a `RefFunc`
-// scan alone would leave f1's slot a trap stub and this `call_indirect` would trap ("null function or
+// scan alone would leave f1's slot a trap stub and this `call.dyn` would trap ("null function or
 // function signature mismatch") where the interpreter dispatches fine. (Regression: this trapped Doom
 // ~frame 174, when the first monster thinker fires an `A_*` action loaded from `states[]`.)
 const SRC_INDIRECT_DATA_PTR: &str = r#"
@@ -359,7 +359,7 @@ block 0 (v0: i64) {
   i64.store vidxaddr vone
   vidx64 = i64.load vidxaddr
   vidx = i32.wrap_i64 vidx64
-  vr1 = call_indirect (i64) -> (i64) vidx (v0)
+  vr1 = call.dyn (i64) -> (i64) vidx (v0)
   vaddr = i64.const 16484
   vr = i64.load vaddr
   return vr
@@ -392,7 +392,7 @@ fn cross_tier_indirect_data_pointer() {
         assert_eq!(
             got,
             arg + 7,
-            "a call_indirect to a non-RefFunc'd cross-tier target must still route (arg {arg})"
+            "a call.dyn to a non-RefFunc'd cross-tier target must still route (arg {arg})"
         );
     }
 }

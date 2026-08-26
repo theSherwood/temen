@@ -43,8 +43,8 @@ block 0 (v0: i32, v1: i32) {
   v3 = i64.const 0
   v4 = i64.const 65536
   v5 = i64.const 16
-  v6 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
-  v7 = cap.call 6 1 (i32) -> (i64) v0 (v6)
+  v6 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
+  v7 = call.cap 6 1 (i32) -> (i64) v0 (v6)
   return v7
   }
 }

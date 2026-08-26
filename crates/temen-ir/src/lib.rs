@@ -27,16 +27,16 @@ pub type BlockIdx = u32;
 /// Index of a function within a module.
 pub type FuncIdx = u32;
 
-/// Reserved pseudo-`type_id` for §7 capability **reflection** (`cap.self.*`). It is not a real
-/// capability (no handle ever carries it): both backends lower `cap.self.count`/`cap.self.get` to a
-/// host `cap.call` with this `type_id` (op 0 = count, op 1 = get), which the host's dispatch services
+/// Reserved pseudo-`type_id` for §7 capability **reflection** (`self.*`). It is not a real
+/// capability (no handle ever carries it): both backends lower `self.count`/`self.get` to a
+/// host `call.cap` with this `type_id` (op 0 = count, op 1 = get), which the host's dispatch services
 /// directly — read-only over the calling domain's own table — instead of resolving a handle. Sharing
 /// one host entry point keeps the interpreter and JIT in lockstep. (Equivalent to issuing the
 /// intrinsic, since reflection is ambient/authority-neutral; `u32::MAX` collides with no interface.)
 pub const CAP_SELF_TYPE_ID: u32 = u32::MAX;
 
 /// Reserved pseudo-`type_id` for **executable named imports** (IMPORTS.md phase 1). A verified
-/// [`Inst::CallImport`] dispatches as a host `cap.call` with this `type_id` and the **import index**
+/// [`Inst::CallImport`] dispatches as a host `call.cap` with this `type_id` and the **import index**
 /// as the `op`; the host translates it through the domain's instantiation-time import-binding table
 /// (import `i` → the bound `(type_id, op)` + granted handle — the powerbox-prefix slot) and
 /// re-dispatches. Like [`CAP_SELF_TYPE_ID`], sharing one host entry point keeps the interpreter,
@@ -62,7 +62,7 @@ pub const CAP_IMPORT_ATTACH_TYPE_ID: u32 = u32::MAX - 3;
 /// shared entry keeps the three backends in lockstep, like [`CAP_IMPORT_TYPE_ID`].
 pub const CAP_DYN_TYPE_ID: u32 = u32::MAX - 4;
 
-/// Built-in capability **interface ids** — the `type_id` a `cap.call` names (§3c/§3e). One
+/// Built-in capability **interface ids** — the `type_id` a `call.cap` names (§3c/§3e). One
 /// definition, in the wire-IR crate, so every backend (the interpreter's dispatch, both JITs'
 /// gate predicates) agrees without copying raw integers; `temen_interp::cap_id` re-exports this
 /// (moved here from temen-interp, 2026-08-18, #902). Doc links to host-crate types are rendered as
@@ -115,7 +115,7 @@ pub mod cap_id {
     /// `instantiate_module` / `spawn_coroutine_module` / `spawn_demand_coroutine_module`), which
     /// spawn a child domain running *that* module's code confined to a carve of the holder's window
     /// — the "plugin-in-plugin" story: a guest can only instantiate modules it was given (no ambient
-    /// authority). It has no directly callable ops (`cap.call` on it is an inert `CapFault`).
+    /// authority). It has no directly callable ops (`call.cap` on it is an inert `CapFault`).
     pub const MODULE: u32 = 8;
     // id 9 was `IoRing` (the submit/complete ring), retired 2026-08-07 by the §12
     // parking-on-blocking re-measure: batching measured 13× negative, overlap subsumed by
@@ -123,7 +123,7 @@ pub mod cap_id {
     /// §12 `Blocking` — a *mock* synchronous-only / blocking host capability (DNS-/FS-blocking-shaped)
     /// whose op 0 `work(arg) -> mix(arg)` is **window-independent and `&mut Host`-free**, so a
     /// punting dispatch hands it to the offload pool instead of the guest's vCPU thread. Op 0 is
-    /// also a perfectly ordinary synchronous `cap.call` (it then blocks the caller — the degenerate path).
+    /// also a perfectly ordinary synchronous `call.cap` (it then blocks the caller — the degenerate path).
     ///
     /// **Test-only since CONSOLIDATION §5a:** no product powerbox grants it — it is the
     /// offload-pool / §12 parking exerciser (an offloadable dispatch that always punts when it
@@ -141,18 +141,18 @@ pub mod cap_id {
     /// the unit's native trampoline); traps in invoked code are **terminal for the domain**; op 2
     /// `release(code_handle) -> 0 | -errno` revokes the handle (no code reclaim yet — DESIGN.md §22
     /// "Code reclaim"); op 3 `install(code_handle) -> slot_index | -errno` (Model B2) installs the
-    /// unit into the `call_indirect` table's next reserved slot so old code (or another unit) can
+    /// unit into the `call.dyn` table's next reserved slot so old code (or another unit) can
     /// dispatch it at native speed (old→new), `-ENOSPC` if the table is full; op 4
     /// `uninstall(slot) -> 0 | -errno` clears an installed slot so the index is reusable and a
-    /// stale `call_indirect` of it traps (slot reclaim — the code memory itself is not freed).
+    /// stale `call.dyn` of it traps (slot reclaim — the code memory itself is not freed).
     pub const JIT: u32 = 11;
     /// `CompiledCode` — a unit minted by `Jit.compile`. Like `Module`, it has no directly callable
-    /// ops (`cap.call` on it is an inert `CapFault`); it confers only the authority to be named in
+    /// ops (`call.cap` on it is an inert `CapFault`); it confers only the authority to be named in
     /// `Jit.invoke`/`release` on the domain handle that compiled it.
     pub const JIT_CODE: u32 = 12;
     /// `HostProc` — an **embedder-registered** capability (§7 "host-defined capabilities"): the host
     /// installs a handler closure with `grant_host_proc` and the guest reaches it like
-    /// any capability (`cap.call HOST_PROC op …`). The interface's *semantics* live entirely in the
+    /// any capability (`call.cap HOST_PROC op …`). The interface's *semantics* live entirely in the
     /// embedder's closure (e.g. a WASI shim), **outside** this crate's TCB match — so a host
     /// can add capabilities without touching the VM. The handler reads/writes the guest window
     /// through the same masked `GuestMem` the built-in ops use (authority-TCB, not escape-TCB).
@@ -2001,7 +2001,7 @@ pub enum Inst {
     /// code (§3c). `sig` is the operation's static signature; its results are appended.
     ///
     /// Phase-1 simplification: `type_id`/`op`/`sig` are inlined immediates (mirroring
-    /// `call_indirect`'s inlined `FuncType`). A module-level interface/type section —
+    /// `call.dyn`'s inlined `FuncType`). A module-level interface/type section —
     /// which would let the verifier also bound `op` and cross-check `sig` against the
     /// canonical interface — is deferred to §13 linking. Safety does **not** depend on
     /// it: the host-owned table's use-site checks carry it, and the host handler
@@ -2020,7 +2020,7 @@ pub enum Inst {
     /// the **consumer-local op index** into the import's declared interface (always `0` for a
     /// flat [`ImportShape::Func`] import) — dispatch remaps it to the provider's op through
     /// the slot's bind-time remap; `args` are the op arguments; `sig` is a self-describing
-    /// copy of the op's signature (mirroring `cap.call`/`call_indirect`, so result counting
+    /// copy of the op's signature (mirroring `call.cap`/`call.dyn`, so result counting
     /// needs no module context — the verifier checks it equals the type-section resolution).
     /// It deliberately carries **no** `type_id` and **no** handle operand (retired at v8):
     /// bound at instantiation through the domain's import-binding table
@@ -2099,7 +2099,7 @@ pub enum Inst {
     /// [`Module::types`] naming a [`TypeEntry::Interface`]), op `op`. The use-site check is
     /// exact-id: the entry's `type_id` must equal the intern of `types[ty]` (resolved once at
     /// instantiation), plus the §3c generation check. This closes the recorded encoding gap —
-    /// `cap.call` needs a compile-time `type_id` immediate a guest cannot know for a wired
+    /// `call.cap` needs a compile-time `type_id` immediate a guest cannot know for a wired
     /// offer; a type-section reference is resolvable at instantiation. `sig` is the
     /// self-describing copy; the verifier checks it equals `types[ty]`'s op-`op` signature.
     /// Costs the manifest-complete bit, like every dynamic-mode site.
@@ -2124,7 +2124,7 @@ pub enum Inst {
     },
     /// `import.attach` (IMPORTS.md phase 2): (re)bind **rebindable** import slot `import` to the
     /// capability behind `handle` — an `i32` handle value the domain already holds (typically
-    /// discovered via `cap.self.get`/`resolve`). The handle must resolve live under the slot's
+    /// discovered via `self.get`/`resolve`). The handle must resolve live under the slot's
     /// declared interface `type_id` (the §3c mask + type + generation check); on success the slot's
     /// binding swaps and subsequent `call.import <import>` dispatch through it. Authority-neutral
     /// (aliases a held capability into a named slot — no new grant-graph edge). The verifier checks
@@ -2135,21 +2135,21 @@ pub enum Inst {
         import: u32,
         handle: ValIdx,
     },
-    // §7 capability **reflection** — `cap.self.count` / `.get` / `.resolve` / `.label` / `.attest`
-    // are no longer first-class IR ops. Every backend lowered them to `cap.call CAP_SELF_TYPE_ID op N`
+    // §7 capability **reflection** — `self.count` / `.get` / `.resolve` / `.label` / `.attest`
+    // are no longer first-class IR ops. Every backend lowered them to `call.cap CAP_SELF_TYPE_ID op N`
     // (op 0/1/2/3/4), so the wire rev retired the typed fronts to that generic `CapCall` form (temen-llvm
-    // builds it, temen-text spells the `cap.self.*` sugar over it, and the runtime CAP_SELF handler
-    // dispatches on `op`). `cap.self.type_id`/`covers` stay typed ops below: they carry a type-section
-    // index, not expressible as a plain `cap.call` immediate.
-    /// `cap.self.type_id <ty>` (IMPORTS.md §3.5): intern **this module's** type-section entry
+    // builds it, temen-text spells the `self.*` sugar over it, and the runtime CAP_SELF handler
+    // dispatches on `op`). `self.type_id`/`covers` stay typed ops below: they carry a type-section
+    // index, not expressible as a plain `call.cap` immediate.
+    /// `self.type_id <ty>` (IMPORTS.md §3.5): intern **this module's** type-section entry
     /// `ty` (a [`TypeEntry::Interface`]) in the domain's host and return the runtime `type_id`
     /// as `i32`. Authority-neutral pure reflection — the shape is already the module's own
-    /// declaration. Enables shape-indexed discovery: iterate `cap.self.get`, compare ids.
+    /// declaration. Enables shape-indexed discovery: iterate `self.get`, compare ids.
     /// Out-of-range / non-interface `ty` is a verify error, not a runtime probe.
     CapSelfTypeId {
         ty: u32,
     },
-    /// `cap.self.covers v<h>, <ty>` (IMPORTS.md §3.5): does the live capability behind `handle`
+    /// `self.covers v<h>, <ty>` (IMPORTS.md §3.5): does the live capability behind `handle`
     /// **cover** this module's interface `types[ty]` (every required op present by name with an
     /// equal signature)? Result `i32`: `1` covers, `0` does not, `-errno` for a dead/forged
     /// handle. Authority-neutral subset discovery — the probe form of coverage binding (a
@@ -2598,7 +2598,7 @@ pub struct Effects {
     /// Writes guest linear memory (or other in-window state the "same final memory window" invariant
     /// pins).
     pub writes_mem: bool,
-    /// Any **other** effect that bars removal and reordering: a call or host `cap.call` (arbitrary
+    /// Any **other** effect that bars removal and reordering: a call or host `call.cap` (arbitrary
     /// host-visible effect), a stack switch / non-falling-through control transfer
     /// (`cont.*`/`suspend`/`setjmp`/`longjmp`), a thread spawn/join or futex wait/notify, a fence, or
     /// a read/write of mutable runtime state outside linear memory (`vcpu.tls`, `cap.self`,
@@ -2750,7 +2750,7 @@ impl Inst {
             // ---- Ambient runtime-state intrinsics (`vcpu.tls`, durable shadow base). Authority-neutral
             // and read-only over guest memory, but they touch mutable runtime state (the per-vCPU TLS
             // word), so they carry `side_effect` — never CSE'd across a clobber, never removed. The
-            // `cap.self.count`/`get`/`resolve`/`label`/`attest` reflection ops are now `cap.call
+            // `self.count`/`get`/`resolve`/`label`/`attest` reflection ops are now `call.cap
             // CAP_SELF` and take the generic `CapCall` effects. ----
             Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } | Inst::DurableShadowBase => {
                 fx(false, false, false, true)
@@ -2987,8 +2987,8 @@ impl Inst {
             Inst::VcpuTlsGet | Inst::DurableShadowBase => 1,
             // `cont.resume` (in both its blocking and non-blocking forms) is the multi-result non-call op: `(status, value)`.
             Inst::ContResume { .. } => 2,
-            // `cap.self.type_id`/`covers` append one `i32`. (The `cap.self.count`/`get`/`resolve`/
-            // `label`/`attest` reflection ops are now `cap.call CAP_SELF` — counted by their `sig`.)
+            // `self.type_id`/`covers` append one `i32`. (The `self.count`/`get`/`resolve`/
+            // `label`/`attest` reflection ops are now `call.cap CAP_SELF` — counted by their `sig`.)
             Inst::CapSelfTypeId { .. } | Inst::CapSelfCovers { .. } | Inst::ExportHandle { .. } => {
                 1
             }
@@ -3003,7 +3003,7 @@ impl Inst {
     }
 }
 
-/// A function signature — the immediate carried by `call_indirect` and (later) the
+/// A function signature — the immediate carried by `call.dyn` and (later) the
 /// function-table type ids. Equality is structural (the runtime "type_id" check).
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct FuncType {
@@ -3039,7 +3039,7 @@ pub enum Terminator {
     /// Tail call (`return_call`): replace the current frame with a direct callee
     /// whose results are this function's results. Args match the callee's params.
     ReturnCall { func: FuncIdx, args: Vec<ValIdx> },
-    /// Indirect tail call (`return_call_indirect`): like [`Terminator::ReturnCall`]
+    /// Indirect tail call (`return_call.dyn`): like [`Terminator::ReturnCall`]
     /// but dispatched through the function table (masked + signature-checked, §3c).
     ReturnCallIndirect {
         /// Index into [`Module::types`] naming the [`TypeEntry::Func`] signature to
@@ -3158,7 +3158,7 @@ impl Func {
     /// Whether this function contains a **fiber** op (`cont.new`/`cont.resume`/`suspend`) — the
     /// scheduling primitives a guest-submitted `Jit` unit **may** host: they switch stacks *within*
     /// the domain, on the caller's thread, so a unit that runs its own scheduler to completion never
-    /// parks across the synchronous `cap.call` it runs inside (DESIGN.md §22 "Concurrency"). Split
+    /// parks across the synchronous `call.cap` it runs inside (DESIGN.md §22 "Concurrency"). Split
     /// out of [`uses_concurrency`](Func::uses_concurrency) so the submitted-unit gate can admit
     /// fibers while still rejecting threads/futex.
     pub fn uses_fibers(&self) -> bool {
@@ -3285,7 +3285,7 @@ pub const POWERBOX_ARGS_END: u64 = 16384;
 
 /// The canonical **names** of the fixed §3e powerbox capabilities, in `VM_CAP_*` / grant order (the
 /// same order/names `temen_run` grants + registers). A powerbox guest's manifest imports resolve
-/// against this vocabulary (and `cap.self.resolve` re-finds them by name); `[..n]` is the prefix a
+/// against this vocabulary (and `self.resolve` re-finds them by name); `[..n]` is the prefix a
 /// program granted `n` capabilities uses. (`"stderr"` is appended last — a second write-only
 /// `Stream`, distinct from `"stdout"` so `eprintln!`/fd 2 capture separately; grant order keeps the
 /// earlier indices stable.) (`"blocking"` left this vocabulary with CONSOLIDATION §5a
@@ -3604,7 +3604,7 @@ pub struct Module {
     /// through the domain's instantiation-time binding table ([`CAP_IMPORT_TYPE_ID`]) — the
     /// module bytes are never rewritten. The linker ([`resolve_imports_with`]) is the one pass
     /// that lowers `CallImport`s away, resolving names as link-time symbols. Empty for modules
-    /// that inline their capability calls (`cap.call` on a live handle — dynamic mode).
+    /// that inline their capability calls (`call.cap` on a live handle — dynamic mode).
     pub imports: Vec<Import>,
     /// Named function **exports** (name → funcidx): the host-addressable entry points, the
     /// runtime-`Module` analogue of [`LinkUnit::exports`]. Populated by [`link`] from each unit's
@@ -4060,7 +4060,7 @@ pub struct DataPtr {
 /// image at byte offset `at`. Models a function pointer stored in a global's static initializer
 /// (`void (*f)() = g;` — nimony's `var oomHandler = continueAfterOutOfMem`). The value written is the
 /// one `ref.func name` would yield after the merge (module-0 funcref = its funcidx, §22), so loading
-/// the slot and `call_indirect`-ing through it dispatches to `name`. The frontend emits placeholder
+/// the slot and `call.dyn`-ing through it dispatches to `name`. The frontend emits placeholder
 /// bytes in a `data` segment covering `[at, at+4)` and one of these to fix them up; [`link`]
 /// overwrites the 4 bytes and fails closed ([`LinkError::Unresolved`]) if no unit exports `name`.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -4159,16 +4159,16 @@ pub struct ResolvedCap {
 /// lowering to a constant window offset — is a natural follow-up.)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Resolved {
-    /// A host capability: lower to a `cap.call` on the import's handle operand (§7).
+    /// A host capability: lower to a `call.cap` on the import's handle operand (§7).
     Cap(ResolvedCap),
     /// Another function in the **same** linked module (by index): lower to a direct `call`. The
     /// static-linking case — a symbol resolved to a function merged into this module at link time.
     Func(FuncIdx),
-    /// A function reached through the shared `call_indirect` **table slot** (the *dynamic*-linking
-    /// case): lower to `call_indirect <slot>`, so a separately-compiled unit can call a function it
+    /// A function reached through the shared `call.dyn` **table slot** (the *dynamic*-linking
+    /// case): lower to `call.dyn <slot>`, so a separately-compiled unit can call a function it
     /// doesn't share an index space with (e.g. a plugin calling the host program it was loaded into).
     /// The import's handle operand must be a `ConstI32` placeholder — it is patched to `slot` and
-    /// reused as the `call_indirect` index (a 1:1 rewrite, no value renumbering).
+    /// reused as the `call.dyn` index (a 1:1 rewrite, no value renumbering).
     Slot(u32),
 }
 
@@ -4188,16 +4188,16 @@ pub enum ImportError {
     BadImportIndex(u32),
     /// A [`Resolved::Slot`] binding had a handle operand that is **not** a `ConstI32` placeholder
     /// (the frontend must emit one for these imports, since resolution patches it to the
-    /// `call_indirect` slot index).
+    /// `call.dyn` slot index).
     SlotHandleNotConst,
 }
 
 /// The **link-time** §7 symbol-resolution pass (IMPORTS.md §2.5: this survives in the linker
 /// only — [`link`], `compile_linked` — which legitimately produces new module bytes;
 /// instantiation never rewrites). A name may bind to a host capability ([`Resolved::Cap`] →
-/// `cap.call` on the placeholder's handle operand — per-call-site-handle *dynamic* dispatch),
+/// `call.cap` on the placeholder's handle operand — per-call-site-handle *dynamic* dispatch),
 /// another function in the linked module ([`Resolved::Func`] → a direct `call`), or a
-/// `call_indirect` table slot ([`Resolved::Slot`]). `Func` is the compile-time (static)
+/// `call.dyn` table slot ([`Resolved::Slot`]). `Func` is the compile-time (static)
 /// linking step the in-window loader builds on. Each [`Inst::CallSym`] rewrites **1:1** (no
 /// value renumbering) — a `Func` binding drops the unused handle operand. Fails closed on an
 /// unresolved name, so a missing symbol surfaces at link, never as a silent miscompile. The
@@ -4255,7 +4255,7 @@ pub fn resolve_imports_with(
                     },
                     // Static-link a function symbol → a direct call (handle unused; sig re-checked).
                     Resolved::Func(func) => Inst::Call { func, args },
-                    // Dynamic-link a function symbol → a `call_indirect` through the table slot: patch
+                    // Dynamic-link a function symbol → a `call.dyn` through the table slot: patch
                     // the handle's `ConstI32` placeholder to `slot` and reuse it as the index.
                     Resolved::Slot(slot) => {
                         patch_placeholder(&mut b.insts, &def_of, handle, slot as i32)?;
@@ -4439,7 +4439,7 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
         }
     }
     // Per-unit type-section bases (prefix sums), so instruction-level type references
-    // (`call.import` dynamic mode, `cap.self.type_id`/`covers`) reindex alongside funcidxs.
+    // (`call.import` dynamic mode, `self.type_id`/`covers`) reindex alongside funcidxs.
     let tbases: Vec<u32> = units
         .iter()
         .scan(0u32, |acc, u| {
@@ -4850,11 +4850,11 @@ fn apply_unit_data_funcrefs(
 }
 
 /// Add `offset` to every **static function index** in `m` (the merged-module reindex): `call`,
-/// `ref.func`, `thread.spawn`, and the `return_call` terminator. `call_indirect`/`cont.*` dispatch on
+/// `ref.func`, `thread.spawn`, and the `return_call` terminator. `call.dyn`/`cont.*` dispatch on
 /// runtime funcref *values*, not static indices, so they are untouched. `call.import` carries an
 /// import index (not a function index) and is likewise untouched — it is resolved separately.
 /// Add `offset` to every **type-section index** carried by an instruction (`call.import`
-/// dynamic mode, `cap.self.type_id`, `cap.self.covers`) — the merged-module type reindex.
+/// dynamic mode, `self.type_id`, `self.covers`) — the merged-module type reindex.
 /// Section-level references (`ImportShape`, `ImplExport::interface`, interface elements) are
 /// remapped where their sections merge, not here.
 fn offset_type_indices(m: &mut Module, offset: u32) {
@@ -5150,7 +5150,7 @@ mod import_tests {
             !insts.iter().any(|i| matches!(i, Inst::CallSym { .. })),
             "all symbols must be lowered"
         );
-        // "write" became cap.call 0 1 on handle v0 with args [1,2].
+        // "write" became call.cap 0 1 on handle v0 with args [1,2].
         match &insts[2] {
             Inst::CapCall {
                 type_id,
@@ -5161,15 +5161,15 @@ mod import_tests {
             } => {
                 assert_eq!((*type_id, *op, *handle), (0, 1, 0));
                 assert_eq!(args, &vec![1, 2]);
-                // #922: the resolved cap.call carries an interned type index into `r.types`.
+                // #922: the resolved call.cap carries an interned type index into `r.types`.
                 let TypeEntry::Func(ft) = &r.types[*sig as usize] else {
-                    panic!("cap.call sig must name a func type");
+                    panic!("call.cap sig must name a func type");
                 };
                 assert_eq!(ft.results.len(), 1);
             }
             other => panic!("expected CapCall, got {other:?}"),
         }
-        // "exit" became cap.call 1 0.
+        // "exit" became call.cap 1 0.
         match &insts[4] {
             Inst::CapCall {
                 type_id, op, args, ..
@@ -5508,8 +5508,8 @@ mod effects_tests {
 
     #[test]
     fn ambient_intrinsics_carry_a_side_effect_but_no_guest_memory() {
-        // `vcpu.tls`/durable-shadow read or write *runtime* state, not guest memory. (The `cap.self.*`
-        // reflection ops are now `cap.call CAP_SELF` and take the generic full-clobber `CapCall`
+        // `vcpu.tls`/durable-shadow read or write *runtime* state, not guest memory. (The `self.*`
+        // reflection ops are now `call.cap CAP_SELF` and take the generic full-clobber `CapCall`
         // effects.)
         let tls = Inst::VcpuTlsGet.effects();
         assert!(tls.side_effect && !tls.reads_mem && !tls.writes_mem && !tls.can_trap);

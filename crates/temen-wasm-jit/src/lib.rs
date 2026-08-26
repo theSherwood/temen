@@ -73,7 +73,7 @@ use temen_ir::{
 };
 
 /// Resolve an interned call type index (#922) to its [`FuncType`] — the index a call variant
-/// (`call_indirect`, `cap.call`, …) carries in place of an inline signature. A miss returns a
+/// (`call.dyn`, `call.cap`, …) carries in place of an inline signature. A miss returns a
 /// static empty signature so callers stay total (the module was already verified, so a well-formed
 /// index always resolves to a `Func`).
 fn sig_of(types: &[TypeEntry], t: u32) -> &FuncType {
@@ -801,12 +801,12 @@ fn is_nested_leaf_cap(type_id: u32, op: u32) -> bool {
     type_id == cap_id::ADDRESS_SPACE && (op == 3 || op == 4)
 }
 
-/// Outline each [`is_nested_leaf_cap`] `cap.call` into an appended int-signature wrapper (exactly
+/// Outline each [`is_nested_leaf_cap`] `call.cap` into an appended int-signature wrapper (exactly
 /// [`outline_cap_calls`]'s rewrite, restricted to that allowlist) so a §14 unit's entry that carves
 /// its window (`sub`) or queries `page_size` becomes emittable: the wrapper stays a cross-tier leaf
 /// [`compile_module_nested`] routes through `env.call_interp`. The host's `call_interp` callback must
 /// carry the run's **powerbox** (the reactor-path contract, not the throwaway-window one), so the
-/// wrapper's `cap.call` resolves against the same live `Host` the oracle uses — `sub`'s minted handle
+/// wrapper's `call.cap` resolves against the same live `Host` the oracle uses — `sub`'s minted handle
 /// then encodes identically on both tiers. INSTANTIATOR ops stay **inline** (the dedicated
 /// `env.instantiate`/`env.join` bounce); all other cap ops are left inline and fail closed.
 pub fn outline_nested_cap_calls(m: &mut Module) {
@@ -1010,7 +1010,7 @@ pub struct Analysis {
     pub mixed_ok: bool,
 }
 
-/// A block terminator the emitter lowers. Tail calls (`return_call`/`return_call_indirect`) are
+/// A block terminator the emitter lowers. Tail calls (`return_call`/`return_call.dyn`) are
 /// included: they lower to the ordinary call sequence (direct / cross-tier / indirect) leaving the
 /// callee's results on the stack, followed by `return` — semantically identical, without frame reuse.
 /// (`-O2` produces `return_call` for *any* function whose last statement is a call, so accepting them
@@ -1086,7 +1086,7 @@ fn module_atomics_ok(m: &Module) -> bool {
 ///   (`Mem::scalar_extent`) before every emitted call — a grow the scalar can't represent (sparse,
 ///   non-`Rw` prot) makes the driver *decline* tier-up for that call, so the emitted tier never
 ///   over- or under-admits relative to the interpreter. The `map`-containing function itself is
-///   still never emitted (a remapping `cap.call` is not in-subset); only its pure siblings are.
+///   still never emitted (a remapping `call.cap` is not in-subset); only its pure siblings are.
 ///   `page_size` (3) / `sub` (4) are a pure query / attenuation-mint and do **not** count either
 ///   (the emittable [`is_nested_leaf_cap`] set).
 /// - **SHARED_REGION** (iface 4): `map` (0) aliases host backing into window pages (the emitted
@@ -1282,7 +1282,7 @@ fn func_callees(f: &Func) -> Vec<u32> {
     out
 }
 
-/// Whether `f` makes an indirect call (`call_indirect`), which can dispatch to **any** function
+/// Whether `f` makes an indirect call (`call.dyn`), which can dispatch to **any** function
 /// through the identity funcref table — an edge direct-call reachability can't see.
 fn func_uses_indirect(f: &Func) -> bool {
     f.blocks.iter().any(|b| {
@@ -1407,7 +1407,7 @@ pub fn analyze_from(m: &Module, entry: u32) -> Analysis {
         }
     }
 
-    // `call_indirect` dispatches through the identity funcref table and can reach **any** function —
+    // `call.dyn` dispatches through the identity funcref table and can reach **any** function —
     // an edge the direct-call walk above can't follow. If a reachable function makes an indirect
     // call, conservatively treat every function as reachable and require them **all** in-subset: the
     // emitted funcref table populates one slot per function, so an index the interpreter would run
@@ -1511,10 +1511,11 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
         false,
         None,
         temen_ir::module_null_guard(m), // #964/#1094: the guard is unconditional on every entry
+        &[],
     )
 }
 
-/// Emit a **§14 VM-in-VM** unit: like [`compile_module_with`], but a `cap.call` to INSTANTIATOR
+/// Emit a **§14 VM-in-VM** unit: like [`compile_module_with`], but a `call.cap` to INSTANTIATOR
 /// `instantiate` (op 0) / `join` (op 1) is lowered to a host-driver bounce (`env.instantiate` /
 /// `env.join`) instead of failing out-of-subset — so a unit whose entry spawns a nested confined VM
 /// runs on the wasm tier, the child spawn/join happening host-side exactly as the interpreter surfaces
@@ -1602,6 +1603,7 @@ pub fn compile_module_nested_with_eligibility(
         true,
         None,
         null_guard,
+        &[],
     )?;
     Ok((wasm, eligible))
 }
@@ -1628,7 +1630,7 @@ pub fn compile_module_nested(m: &Module, shared_memory: bool) -> Result<Vec<u8>,
 /// Both modes emit the **same** nested import set (`env.instantiate`/`join`/`thread_spawn`/…), so a
 /// host driving this artifact provides that one import layout regardless of the chosen mode. This
 /// folds the browser's hand-rolled nested→threaded fallback into the library. Entry is func 0 (the
-/// unit entry the nested emit roots at). Outline §14 ADDRESS_SPACE `cap.call`s
+/// unit entry the nested emit roots at). Outline §14 ADDRESS_SPACE `call.cap`s
 /// ([`outline_nested_cap_calls`]) before calling if the host's `call_interp` carries a powerbox;
 /// otherwise a `sub`/`page_size` entry simply falls to the interpreter-driven mode.
 ///
@@ -1661,7 +1663,7 @@ pub fn compile_nested(m: &Module, shared_memory: bool) -> Result<Artifact, Error
 /// (`env.__indirect_function_table`, sized `1 << table_log2` = `Host::jit_table_log2`) and populates
 /// nothing — the host writes every slot (own funcs + `install`ed units) via `table.set`, exactly as
 /// the interpreter's `DomainTable` is host-populated. This is what makes an installed unit a funcref
-/// another instance's `call_indirect` can reach (old→new) at native speed. The confinement mask stays
+/// another instance's `call.dyn` can reach (old→new) at native speed. The confinement mask stays
 /// a compile-time constant `1<<table_log2` (invariant I2). `table_log2` must match the reservation the
 /// domain was granted with (`grant_jit_with_table` / `DomainTable::new(_, table_log2)`).
 pub fn compile_module_b2(
@@ -1696,15 +1698,83 @@ pub fn compile_module_b2(
         false,
         None,
         temen_ir::module_null_guard(m), // #964/#1094: the guard is unconditional on every entry
+        &[],
     )
 }
 
-/// **Cap-call outlining** — hoist every inline `cap.call` into a synthetic single-block wrapper
+/// **#1110 emit-split prototype.** Emit ONE partition of a whole-program split: this module emits the
+/// functions where `in_module[i]`, and shares the reserved funcref table `env.__indirect_function_table`
+/// (sized `1 << table_log2`) with its sibling partition(s). A `Call`/`ReturnCall` to a function emitted
+/// by a *sibling* (in-subset but not in this partition) lowers to a `call_indirect` through that table
+/// at the callee's index; a function neither in this partition nor in-subset stays a cross-tier interp
+/// leaf (`env.call_interp`), exactly as in the single-module emit.
+///
+/// The host links the partitions by instantiating each against one shared memory + the one shared table
+/// and writing every slot `i` with the emitting instance's `f{i}` funcref (`table.set(i, inst.exports['f'+i])`)
+/// — the same host-populates-every-slot contract as Model B2 ([`compile_module_b2`]). Callers pass the
+/// **same** `m` and `table_log2` to every partition and complementary `in_module` masks; a slot's owner
+/// is whichever partition has `in_module[i]`. The mask stays the compile-time constant `1<<table_log2`
+/// (invariant I2), so confinement is identical to the single-module tier.
+///
+/// This is a measurement vehicle for whether a smaller emitted module lets V8 tier the hot path up to
+/// TurboFan on the first Run (and at what cross-module-call cost); it is not yet wired into `compile_jit`.
+pub fn compile_module_split(
+    m: &Module,
+    shared_memory: bool,
+    table_log2: u32,
+    in_module: &[bool],
+) -> Result<Vec<u8>, Error> {
+    let a = analyze(m);
+    if !a.in_subset.iter().all(|&s| s) {
+        return Err(Error::Unsupported(
+            "a function is outside the integer subset",
+        ));
+    }
+    let n = m.funcs.len();
+    if in_module.len() != n {
+        return Err(Error::Unsupported("split partition mask length mismatch"));
+    }
+    // #1038 budget guard on THIS partition's estimated emitted size — the split's whole point is smaller
+    // modules, but decline (don't OOM) if a pathological partition still exceeds the engine budget.
+    let est: usize = (0..n)
+        .filter(|&i| in_module[i])
+        .map(|i| est_emitted_size(&m.funcs[i]))
+        .sum();
+    if est > MAX_EST_EMITTED_MODULE_BYTES {
+        return Err(Error::Unsupported(
+            "estimated emitted partition exceeds the engine memory budget",
+        ));
+    }
+    let emitted: Vec<usize> = (0..n).filter(|&i| in_module[i]).collect();
+    // Each emitted func's wasm index = IMPORTED_FUNCS + its position among *this* partition's emitted
+    // set (not its Temen index — the partition is a subset), matching the export/name-section layout.
+    let mut wasm_of: Vec<Option<u32>> = vec![None; n];
+    for (bi, &fi) in emitted.iter().enumerate() {
+        wasm_of[fi] = Some(IMPORTED_FUNCS + bi as u32);
+    }
+    // A sibling-emitted callee (in-subset, not in this partition) is reached cross-module; an interp
+    // leaf (`!in_subset`) is not cross_module and keeps its `env.call_interp` lowering.
+    let cross_module: Vec<bool> = (0..n).map(|i| !in_module[i] && a.in_subset[i]).collect();
+    emit_module(
+        m,
+        shared_memory,
+        &emitted,
+        &wasm_of,
+        &a.interp_leaf,
+        Some(table_log2),
+        false,
+        None,
+        temen_ir::module_null_guard(m),
+        &cross_module,
+    )
+}
+
+/// **Cap-call outlining** — hoist every inline `call.cap` into a synthetic single-block wrapper
 /// function, rewriting the call site to a plain [`Inst::Call`]. Semantics-preserving (the wrapper
-/// does the *identical* `cap.call`), but it moves the host-boundary op out of otherwise-emittable
+/// does the *identical* `call.cap`), but it moves the host-boundary op out of otherwise-emittable
 /// functions: the wrapper has an all-integer signature (a capability handle is `i32`, its op args/
 /// results are `i64`), so it is a **cross-tier callable** leaf, while the function that used to hold
-/// the `cap.call` becomes pure compute + a `Call` and can now emit. This is the compiler doing, on the
+/// the `call.cap` becomes pure compute + a `Call` and can now emit. This is the compiler doing, on the
 /// IR, what a guest author would do by hand (moving `__vm_host_call` into a `noinline` shim) — so an
 /// **unmodified** reactor whose hot `tick` interleaves compute with a once-per-frame `present`/`poll`
 /// cap call runs its hot path on emitted wasm, bouncing to the interpreter only at the (rare) cap site.
@@ -1712,7 +1782,7 @@ pub fn compile_module_b2(
 /// Existing [`FuncIdx`](temen_ir::FuncIdx)es are unchanged — wrappers are **appended** — so exports,
 /// call sites, the function table, and debug locs (all keyed by the original indices) stay valid. The
 /// rewrite is **1:1** at each call site: a `Call` to a wrapper appends exactly the wrapper's results,
-/// which equal the `cap.call`'s `sig.results`, so block-local value numbering is preserved (no
+/// which equal the `call.cap`'s `sig.results`, so block-local value numbering is preserved (no
 /// renumbering — the same property the linker-only [`temen_ir::resolve_imports_with`] relies on).
 ///
 /// Named manifest imports are **not** rewritten here (or anywhere — the runtime binds each import
@@ -1723,9 +1793,9 @@ pub fn compile_module_b2(
 /// It outlines the host-boundary ops the same way: [`Inst::CapCall`], [`Inst::CallImport`] (an
 /// executable manifest import, IMPORTS.md phase 3 — the wrapper carries the `call.import` to the
 /// import-capable interpreter tier, so an import-bearing guest emits without resolution or rewrite),
-/// and [`Inst::CallSym`]. The §7 runtime by-name capability lookup (`cap.self.resolve`) rides through
-/// the `CapCall` arm now (it is a `cap.call CAP_SELF op 2`): that matters for a `_start` that resolves
-/// names at startup — otherwise pure compute + stores, so hoisting its handful of `cap.self.resolve`s
+/// and [`Inst::CallSym`]. The §7 runtime by-name capability lookup (`self.resolve`) rides through
+/// the `CapCall` arm now (it is a `call.cap CAP_SELF op 2`): that matters for a `_start` that resolves
+/// names at startup — otherwise pure compute + stores, so hoisting its handful of `self.resolve`s
 /// into cross-tier wrappers makes func 0 itself emittable — the last thing keeping a QuickJS-scale
 /// guest (whose hot interpreter loop is all in-subset) off the wasm tier.
 pub fn outline_cap_calls(m: &mut Module) {
@@ -1751,7 +1821,7 @@ pub fn outline_cap_calls(m: &mut Module) {
                     params.push(ValType::I32);
                     params.extend(ft.params.iter().copied());
                     let nparams = params.len() as u32;
-                    // Body: `cap.call` on the wrapper's own params (handle = val 0, args = vals 1..),
+                    // Body: `call.cap` on the wrapper's own params (handle = val 0, args = vals 1..),
                     // then return its results (appended right after the params).
                     let wrapper_args: Vec<u32> = (1..nparams).collect();
                     let ret: Vec<u32> = (nparams..nparams + ft.results.len() as u32).collect();
@@ -1926,7 +1996,7 @@ fn code_section_body_sizes(wasm: &[u8]) -> Vec<usize> {
 /// window. This is what lets Doom's hot render path emit while its cold range-check / I/O helpers
 /// (which make capability calls) stay on the interpreter.
 ///
-/// A `call_indirect` may dispatch to a cross-tier target: an address-taken (`RefFunc`) function that
+/// A `call.dyn` may dispatch to a cross-tier target: an address-taken (`RefFunc`) function that
 /// isn't emitted gets an identity-table slot holding a **trampoline** (a wasm function with the call
 /// site's env-prepended signature that bounces to `env.call_interp`), so the indirect call reaches the
 /// interpreter over the shared window just like a direct cross-tier call.
@@ -2036,6 +2106,7 @@ pub fn compile_module_reactor_budgeted(
             false,
             None,
             temen_ir::module_null_guard(m), // #964/#1094: the guard is unconditional on every entry
+            &[],
         )?;
         // Measure the emitted bodies and pull any over-large *marshallable* one out for a re-emit as a
         // cross-tier leaf. An over-large body that can't be crossed (non-marshallable sig) has nowhere
@@ -2124,6 +2195,7 @@ pub fn compile_module_reactor_keep(
         false,
         None,
         temen_ir::module_null_guard(m), // #964/#1094: the guard is unconditional on every entry
+        &[],
     )?;
     Ok((wasm, emitted_bitmap))
 }
@@ -2139,7 +2211,7 @@ pub fn compile_module_reactor_keep(
 /// exported and safe for the host to call. A function is emitted iff it is in-subset, and every
 /// direct callee is itself emitted or a cross-tier interp leaf — a monotone fixpoint (start from
 /// "every in-subset function", drop any whose emitted body would carry an unroutable `Call`). A
-/// function that uses `call_indirect` is emitted only when the **whole** module is in-subset (so
+/// function that uses `call.dyn` is emitted only when the **whole** module is in-subset (so
 /// every identity-table slot resolves to an emitted target); otherwise it is dropped, keeping the
 /// emitted module table-free. [`Error::Unsupported`] only if the assembler itself rejects the set
 /// (it never should, by construction) — an empty eligible set is a success with no `f{i}` exports.
@@ -2175,7 +2247,7 @@ pub fn compile_module_tierup_caps(
 /// #880 — [`compile_module_tierup`] over the **shared reserved table** (§22 Model B2): the emitted
 /// module *imports* `env.__indirect_function_table` (sized `1 << table_log2`, the domain's
 /// reservation) instead of declaring a local identity table, and — the point — the
-/// `all_in_subset || !uses_indirect` candidate restriction is **dropped**: a `call_indirect`-bearing
+/// `all_in_subset || !uses_indirect` candidate restriction is **dropped**: a `call.dyn`-bearing
 /// function tiers up, because under a host-populated table every slot resolves *correctly*
 /// regardless of the emit split — an emitted target is a native funcref (an installed unit's `f0`,
 /// another `f{i}`), an interpreter-resident target is a live-state bounce shim
@@ -2361,6 +2433,7 @@ fn compile_module_tierup_inner(
             nested_caps,
             paged,
             null_guard,
+            &[],
         )?;
         return Ok((wasm, vec![false; n]));
     }
@@ -2393,7 +2466,7 @@ fn compile_module_tierup_inner(
         in_subset[worst] = false;
         est_total -= est[worst];
     }
-    // The cross-tier set — functions an emitted `Call`/`call_indirect` routes to `env.call_interp`.
+    // The cross-tier set — functions an emitted `Call`/`call.dyn` routes to `env.call_interp`.
     // Two widths, by who services the bounce:
     //   * **local table** (`reserved_table_log2 == None`): the strict [`interp_leaf`] set —
     //     memory-free, call-free, cap-free — because the leaf-only drivers run a bounce over a
@@ -2424,7 +2497,7 @@ fn compile_module_tierup_inner(
         IMPORTED_FUNCS
     };
 
-    // Optimistic start: every in-subset function is a candidate. A `call_indirect` can dispatch to
+    // Optimistic start: every in-subset function is a candidate. A `call.dyn` can dispatch to
     // any identity-table slot, so under the **local** table a function that uses one is only safe to
     // emit when every function is in-subset (all slots resolve); under the **shared reserved** table
     // (#880 — `compile_module_tierup_b2`) the restriction lifts: the host populates every slot
@@ -2479,6 +2552,7 @@ fn compile_module_tierup_inner(
         nested_caps,
         paged,
         null_guard,
+        &[],
     )?;
     Ok((wasm, emit))
 }
@@ -2578,6 +2652,7 @@ fn compile_interp_only(
         nested_caps,
         None,
         temen_ir::module_null_guard(m), // #964 (vacuous here — no bodies — but kept uniform)
+        &[],
     )?;
     Ok(Artifact {
         wasm,
@@ -2650,7 +2725,15 @@ fn emit_module(
     nested_caps: bool,
     paged: Option<u8>,
     null_guard: Option<u64>,
+    cross_module: &[bool],
 ) -> Result<Vec<u8>, Error> {
+    // #1110 emit-split prototype: `cross_module[g]` ⇒ function `g` is emitted by a *sibling* module of
+    // this partition, reached through the shared reserved funcref table (`env.__indirect_function_table`)
+    // by a `call_indirect` on `g`'s env-prepended signature at table slot `g` — the host populates every
+    // slot at link time (§22 Model B2), so the mask stays the compile-time constant `1<<table_log2`
+    // (invariant I2). Empty ⇒ single-module emit (every `Call` target is in this module or an interp
+    // leaf), the behavior of every non-split caller. Only meaningful in shared-reserved mode.
+    let is_xmod = |i: usize| cross_module.get(i).copied().unwrap_or(false);
     // An import *manifest* is fine (IMPORTS.md phase 3): executable `call.import`s dispatch on the
     // import-capable interpreter tier, reached through outlined wrappers / cross-tier calls. What
     // must not happen is an import op surviving in a function this emitter actually lowers — the
@@ -2731,12 +2814,12 @@ fn emit_module(
         fn_type_idx.push(idx as u32);
     }
 
-    // `call_indirect` needs its (prepended-env) signature declared in the type section too; add any
+    // `call.dyn` needs its (prepended-env) signature declared in the type section too; add any
     // not already present, and note whether the module needs a funcref table + element segment.
     let mut needs_table = false;
     for &fi in emitted {
         for b in &m.funcs[fi].blocks {
-            // A `call_indirect` type shows up as an instruction; a `return_call_indirect` as the
+            // A `call.dyn` type shows up as an instruction; a `return_call.dyn` as the
             // block terminator — both dispatch through the table and need their signature declared.
             let indirect_ty = b
                 .insts
@@ -2756,6 +2839,31 @@ fn emit_module(
                     types.push(key);
                 }
             }
+            // #1110: a `Call`/`ReturnCall` to a sibling-emitted function lowers to a `call_indirect`
+            // through the shared table, so its env-prepended signature must be declared too (exactly as
+            // an explicit indirect target's is above). The mask uses `table_size`, so `needs_table` in
+            // reserved mode is moot (the table is always imported), but declare the type either way.
+            let xmod_target = b
+                .insts
+                .iter()
+                .filter_map(|inst| match inst {
+                    Inst::Call { func, .. } if is_xmod(*func as usize) => Some(*func),
+                    _ => None,
+                })
+                .chain(match &b.term {
+                    Terminator::ReturnCall { func, .. } if is_xmod(*func as usize) => Some(*func),
+                    _ => None,
+                });
+            for g in xmod_target {
+                let callee = &m.funcs[g as usize];
+                let key = indirect_type_bytes(&FuncType {
+                    params: callee.params.clone(),
+                    results: callee.results.clone(),
+                })?;
+                if !types.contains(&key) {
+                    types.push(key);
+                }
+            }
         }
     }
     // The funcref table (`RefFunc`/`dispatch_indirect` semantics): masking `idx & (table_size - 1)`
@@ -2771,7 +2879,7 @@ fn emit_module(
     //   `Host::jit_table_log2` / `DomainTable::new(_, log2)`), and populates *no* slots itself — the
     //   host writes every slot (its own funcs and any `install`ed unit) via `table.set`, exactly as
     //   `DomainTable` is host-populated. So an `install`ed unit becomes a funcref that another
-    //   instance's `call_indirect` reaches through the one shared table (§22 old→new). The mask is a
+    //   instance's `call.dyn` reaches through the one shared table (§22 old→new). The mask is a
     //   constant `1<<log2` from t=0 (invariant I2), so no compiled site holds a stale mask.
     let table_size = match reserved_table_log2 {
         Some(log2) => 1u32 << log2,
@@ -2781,7 +2889,7 @@ fn emit_module(
     // Cross-tier indirect trampolines. A function whose address is taken (`RefFunc`) but which is
     // *not* emitted still occupies an identity-table slot; an indirect call to it must reach the
     // interpreter. For each such **cross-tier** (`interp_leaf`) address-taken function we emit a
-    // standalone trampoline — a wasm function with the same env-prepended `call_indirect` signature
+    // standalone trampoline — a wasm function with the same env-prepended `call.dyn` signature
     // that does `env.call_interp` (see [`emit_trampoline`]). Every remaining non-emitted slot gets a
     // `()->()` trap stub, so a forged/mistyped index fails closed at the signature check. Trampolines
     // and the trap stub take wasm indices *after* the emitted functions (imports + emitted + these).
@@ -2798,7 +2906,7 @@ fn emit_module(
         // instruction: the frontend bakes static function-pointer tables (e.g. Doom's `states[]` /
         // `mobjinfo[]` action functions) into **data segments** as plain function-index constants,
         // invisible to a RefFunc scan. So the identity table must route *any* index to its function,
-        // exactly as the interpreter's `DomainTable` does — otherwise a `call_indirect` through a
+        // exactly as the interpreter's `DomainTable` does — otherwise a `call.dyn` through a
         // data-segment pointer hits a trap stub ("null function or function signature mismatch") the
         // interpreter would have dispatched. (Fixed a hang/trap ~frame 174 of Doom, when the first
         // monster thinker fires an `A_*` action loaded from `states[]`.)
@@ -2858,6 +2966,7 @@ fn emit_module(
             nested_caps,
             paged,
             null_guard,
+            cross_module,
         )?);
     }
     bodies.extend(extra_bodies);
@@ -3042,7 +3151,7 @@ fn emit_module(
         // Each real slot resolves to the function's wasm index: an emitted function (`wasm_of`), a
         // cross-tier **trampoline** (`tramp_of`, an address-taken interp-leaf), or the `()->()` trap
         // stub (unreachable / non-address-taken cross-tier functions — never a legitimate indirect
-        // target, so their slot fails closed at the call_indirect signature check). Padding slots
+        // target, so their slot fails closed at the call.dyn signature check). Padding slots
         // `[funcs.len(), table_size)` stay null (they trap like the interpreter's `TABLE_EMPTY`).
         let mut segment = Vec::new();
         for fi in 0..m.funcs.len() {
@@ -3228,7 +3337,7 @@ fn emit_trampoline(f: &Func, fi: u32) -> Result<Vec<u8>, Error> {
 /// A `() -> ()` **trap stub** body (`unreachable`). Fills funcref-table slots for functions that are
 /// neither emitted nor a cross-tier trampoline (unreachable / non-address-taken cross-tier functions):
 /// a verified guest only forms a funcref via `RefFunc` (an address-taken function), so such a slot is
-/// never legitimately reached; if a forged/mistyped index hits it, `call_indirect`'s type check traps
+/// never legitimately reached; if a forged/mistyped index hits it, `call.dyn`'s type check traps
 /// (the stub's `()->()` type never matches a real `(win,env,…)` call site) — fail-closed, matching the
 /// interpreter's `IndirectCallType`/`TABLE_EMPTY` trap.
 fn emit_trap_stub() -> Vec<u8> {
@@ -3240,7 +3349,7 @@ fn emit_trap_stub() -> Vec<u8> {
 }
 
 /// #846 — a standalone **cross-tier trampoline module**: one exported function `"t"` with the
-/// env-prepended `call_indirect` signature of `(params) -> (results)`, whose body marshals its
+/// env-prepended `call.dyn` signature of `(params) -> (results)`, whose body marshals its
 /// params into the env scratch, calls `env.call_interp(target, args_ptr)`, and returns the
 /// reloaded result slots — the [`emit_trampoline`] body packaged as its own instantiable module,
 /// so a **host-populated** shared table (§22 Model B2) can route a slot whose occupant has no
@@ -3337,9 +3446,9 @@ pub fn emit_slot_trampoline(
     Ok(out)
 }
 
-/// The wasm function-type of a `call_indirect` signature: the two prepended env params (`win`,
+/// The wasm function-type of a `call.dyn` signature: the two prepended env params (`win`,
 /// `env`) ahead of the Temen param/result types — identical in shape to how [`emit_module`] types the
-/// emitted functions, so wasm's built-in `call_indirect` signature check **is** the §3c type-id
+/// emitted functions, so wasm's built-in `call.dyn` signature check **is** the §3c type-id
 /// check (a mismatch traps, exactly like `dispatch_indirect`'s `IndirectCallType`).
 fn indirect_type_bytes(ty: &FuncType) -> Result<(Vec<u8>, Vec<u8>), Error> {
     let mut params = vec![0x7f, 0x7f]; // win: i32, env: i32
@@ -3353,7 +3462,7 @@ fn indirect_type_bytes(ty: &FuncType) -> Result<(Vec<u8>, Vec<u8>), Error> {
     Ok((params, results))
 }
 
-/// The type-section index of a `call_indirect` signature (pre-added to `types` by [`emit_module`]).
+/// The type-section index of a `call.dyn` signature (pre-added to `types` by [`emit_module`]).
 fn indirect_type_index(types: &[(Vec<u8>, Vec<u8>)], ty: &FuncType) -> Result<u32, Error> {
     let key = indirect_type_bytes(ty)?;
     types
@@ -3433,6 +3542,7 @@ fn emit_func(
     nested_caps: bool,
     paged: Option<u8>,
     null_guard: Option<u64>,
+    cross_module: &[bool],
 ) -> Result<Vec<u8>, Error> {
     let n_params = 2 + f.params.len() as u32; // win, env, then the Temen params
 
@@ -3557,7 +3667,7 @@ fn emit_func(
 
     // Fuel unification (INVARIANTS.md #9): charge one fuel for the **function-entry** safepoint,
     // once, before the dispatcher loop — the oracle's per-entry charge (top-level entry and each
-    // `call`/`call_indirect`/`return_call` into an emitted function, whose body runs this on entry).
+    // `call`/`call.dyn`/`return_call` into an emitted function, whose body runs this on entry).
     // The rest of the budget is charged at taken back-edges inside `emit_edge`; forward branches and
     // `return` are free. This matches the oracle safepoint-for-safepoint (not the old coarser
     // once-per-dispatch-iteration debit), so the emitted wasm traps `OutOfFuel` at the *identical*
@@ -3600,6 +3710,7 @@ fn emit_func(
             types,
             table_size,
             nested_caps,
+            cross_module,
         )?;
     }
     code.push(OP_END); // close the loop
@@ -4109,7 +4220,9 @@ fn emit_block_body(
     types: &[(Vec<u8>, Vec<u8>)],
     table_size: u32,
     nested_caps: bool,
+    cross_module: &[bool],
 ) -> Result<(), Error> {
+    let is_xmod = |i: usize| cross_module.get(i).copied().unwrap_or(false);
     let mut next_val = b.params.len(); // where the next instruction's results land
                                        // Slice-3 confinement-check elision: a block-local **upper-bound** map over SSA values, in
                                        // lockstep with the value numbering `next_val` drives (block params carry no bound → `UB_TOP`;
@@ -4486,7 +4599,7 @@ fn emit_block_body(
                 uleb(code, MEM_NOTIFY_IMPORT_IDX as u64);
                 set_result(cx, code, k, &mut next_val);
             }
-            // §14 VM-in-VM bounce (opt-in `nested_caps`): a `cap.call` to INSTANTIATOR
+            // §14 VM-in-VM bounce (opt-in `nested_caps`): a `call.cap` to INSTANTIATOR
             // `instantiate`/`join` marshals its operands to a host import (`env.instantiate` /
             // `env.join`, the funcref-table-free analog of `env.call_interp`) that spawns/joins the
             // confined child vCPU host-side — exactly as the interpreter surfaces `VcpuStop::Instantiate`
@@ -4558,6 +4671,37 @@ fn emit_block_body(
                             uleb(code, cx.local_of[k][next_val + i] as u64);
                         }
                     }
+                    // #1110 cross-module (emit-split): `func` is emitted by a *sibling* partition.
+                    // Reach it at native speed through the shared reserved table — push win/env/args,
+                    // then the callee's Temen index masked into the table, and `call_indirect` on its
+                    // env-prepended signature (wasm's signature check = the §3c type-id check). The host
+                    // populates slot `func` with the sibling's `f{func}` funcref at link time, so this is
+                    // an ordinary indirect dispatch with a compile-time-constant index.
+                    None if is_xmod(*func as usize) => {
+                        let ft = FuncType {
+                            params: callee.params.clone(),
+                            results: callee.results.clone(),
+                        };
+                        code.push(OP_LOCAL_GET);
+                        uleb(code, 0); // win
+                        code.push(OP_LOCAL_GET);
+                        uleb(code, 1); // env
+                        for a in args {
+                            get(code, cx, *a);
+                        }
+                        code.push(OP_I32_CONST);
+                        sleb32(code, *func as i32);
+                        code.push(OP_I32_CONST);
+                        sleb32(code, (table_size - 1) as i32);
+                        code.push(0x71); // i32.and → mask into the table (invariant I2 constant)
+                        code.push(0x11); // call_indirect
+                        uleb(code, indirect_type_index(types, &ft)? as u64);
+                        uleb(code, 0); // table index 0
+                        for i in (0..n_results).rev() {
+                            code.push(OP_LOCAL_SET);
+                            uleb(code, cx.local_of[k][next_val + i] as u64);
+                        }
+                    }
                     // Cross-tier: `func` is an interp leaf. Marshal args into the env scratch
                     // slots, call `env.call_interp(func, args_ptr)` (the engine runs it on the
                     // bytecode interpreter and writes results back to the same slots), then reload.
@@ -4617,7 +4761,7 @@ fn emit_block_body(
             }
             // Indirect call through the funcref table (§3c). Push win/env/args, then the masked table
             // index (`idx & (table_size - 1)` — exactly `dispatch_indirect`'s `idx & (len - 1)`), and
-            // `call_indirect` the declared signature: wasm's built-in signature check is the type-id
+            // `call.dyn` the declared signature: wasm's built-in signature check is the type-id
             // check (a mismatch traps `IndirectCallType`); a null padding slot traps too (an empty
             // interpreter slot). No fuel debit here — the callee debits on entry to its own loop.
             Inst::CallIndirect { ty, idx, args } => {
@@ -4634,7 +4778,7 @@ fn emit_block_body(
                 code.push(OP_I32_CONST);
                 sleb32(code, (table_size - 1) as i32);
                 code.push(0x71); // i32.and → mask into the table
-                code.push(0x11); // call_indirect
+                code.push(0x11); // call.dyn
                 uleb(code, indirect_type_index(types, ft)? as u64);
                 uleb(code, 0); // table index 0
                 for i in (0..n_results).rev() {
@@ -4985,7 +5129,7 @@ fn emit_block_body(
         }
         // Tail calls. A tail call's callee results equal the caller's results (the verifier guarantees
         // it), so the callee's return type matches this emitted function's — the exact condition
-        // `return_call`/`return_call_indirect` validate against. Same-tier (emitted callee) and indirect
+        // `return_call`/`return_call.dyn` validate against. Same-tier (emitted callee) and indirect
         // tail calls lower to those **native tail-call opcodes**, which reuse the caller's frame (O(1)
         // stack) — matching the interpreter's frame-reusing `Op::TailCall`, so an unbounded tail loop
         // runs in constant space on both tiers instead of overflowing the wasm stack. The **cross-tier**
@@ -5006,6 +5150,29 @@ fn emit_block_body(
                     }
                     code.push(OP_RETURN_CALL);
                     uleb(code, widx as u64);
+                }
+                // #1110 cross-module tail call (emit-split): `func` is sibling-emitted — a native
+                // `return_call_indirect` through the shared table (frame-reusing, like the direct form).
+                None if is_xmod(*func as usize) => {
+                    let ft = FuncType {
+                        params: callee.params.clone(),
+                        results: callee.results.clone(),
+                    };
+                    code.push(OP_LOCAL_GET);
+                    uleb(code, 0); // win
+                    code.push(OP_LOCAL_GET);
+                    uleb(code, 1); // env
+                    for a in args {
+                        get(code, cx, *a);
+                    }
+                    code.push(OP_I32_CONST);
+                    sleb32(code, *func as i32);
+                    code.push(OP_I32_CONST);
+                    sleb32(code, (table_size - 1) as i32);
+                    code.push(0x71); // i32.and → mask into the table (invariant I2 constant)
+                    code.push(OP_RETURN_CALL_INDIRECT);
+                    uleb(code, indirect_type_index(types, &ft)? as u64);
+                    uleb(code, 0); // table index 0
                 }
                 // Cross-tier: marshal args into the env scratch, `env.call_interp`, load results back
                 // onto the stack, then return (the tail-call form of the mid-block cross-tier sequence).
@@ -5054,7 +5221,7 @@ fn emit_block_body(
             }
         }
         // Indirect tail call: push win/env/args, mask the index into the identity table, then a native
-        // `return_call_indirect` on the declared signature (wasm's signature check = the §3c type-id
+        // `return_call.dyn` on the declared signature (wasm's signature check = the §3c type-id
         // check) — frame-reusing like the direct form. A cross-tier target resolves to its trampoline
         // slot (which itself bounces to `env.call_interp`); tail-calling the trampoline is still correct.
         Terminator::ReturnCallIndirect { ty, idx, args } => {

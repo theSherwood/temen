@@ -368,7 +368,7 @@ try {
 
 // Shell — the `temen-posix` shell (STAGE1.md, playground-shell). Unlike the clang/on-ramp guests above,
 // the shell is compiled by the in-tree **chibicc** onto the POSIX personality and run on the tree-walk
-// interpreter (it carries Instantiator cap.calls the wasm-JIT/bytecode paths don't take). Its module
+// interpreter (it carries Instantiator call.caps the wasm-JIT/bytecode paths don't take). Its module
 // bytes are the committed fixture `tests/fixtures/shell.temen`, produced from the canonical source
 // (`crates/temen-run/demos/shell/*.c`) by the differential's generator:
 //   cargo test -p temen --test c_shell -- --ignored --exact gen_browser_shell_fixture

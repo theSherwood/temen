@@ -4,7 +4,7 @@
 //! the run make forward progress and promotes the word to `UNWINDING` at the N-th **fiber safepoint**
 //! (`cont.resume`/`suspend`), so the freeze lands *mid-run* — deterministically, in a single-threaded
 //! test. Here the root makes an observable host-fn call before each fiber interaction, so the number
-//! of calls that fired before the freeze pins where it landed. (cap.call is *not* a counted safepoint
+//! of calls that fired before the freeze pins where it landed. (call.cap is *not* a counted safepoint
 //! — only the fiber ops are, so the trigger point is identical on the interpreter and the JIT.)
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,14 +27,14 @@ const SRC: &str = "memory 18\n\
     \x20 v1 = ref.func 1\n\
     \x20 v2 = i64.const 4096\n\
     \x20 v3 = cont.new v1 v2\n\
-    \x20 v4 = cap.call 13 0 () -> (i64) v0 ()\n\
+    \x20 v4 = call.cap 13 0 () -> (i64) v0 ()\n\
     \x20 v5 = i64.const 0\n\
     \x20 v6, v7 = cont.resume v3 v5\n\
-    \x20 v8 = cap.call 13 0 () -> (i64) v0 ()\n\
+    \x20 v8 = call.cap 13 0 () -> (i64) v0 ()\n\
     \x20 v9, v10 = cont.resume v3 v5\n\
-    \x20 v11 = cap.call 13 0 () -> (i64) v0 ()\n\
+    \x20 v11 = call.cap 13 0 () -> (i64) v0 ()\n\
     \x20 v12, v13 = cont.resume v3 v5\n\
-    \x20 v14 = cap.call 13 0 () -> (i64) v0 ()\n\
+    \x20 v14 = call.cap 13 0 () -> (i64) v0 ()\n\
     \x20 return v14\n\
       }\n\
     }\n\

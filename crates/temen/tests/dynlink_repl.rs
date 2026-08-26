@@ -2,7 +2,7 @@
 //! (DESIGN.md §22). Each "prompt" defines a function that may **call earlier definitions by name**; the
 //! REPL keeps a **symbol table** (`name → installed table slot`) that grows with every definition,
 //! resolves each new unit's imports against it, compiles + installs the unit, and registers its name.
-//! Later prompts then reach it through the shared `call_indirect` table.
+//! Later prompts then reach it through the shared `call.dyn` table.
 //!
 //! This is exactly what a guest-side `vm_dlopen`/`vm_dlsym` REPL will do — the symbol table *is* the
 //! dlopen registry, `define` *is* `vm_dlopen` (resolve → verify → compile → install → record), and an
@@ -24,9 +24,9 @@ use temen_run::jit_resolve_and_validate;
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
-/// A live REPL: one long-lived JIT module with a reserved `call_indirect` table (definitions install
+/// A live REPL: one long-lived JIT module with a reserved `call.dyn` table (definitions install
 /// into its padding slots) plus the growing symbol table. `name → (slot, trampoline)`: the slot lets
-/// *other* definitions reach it by `call_indirect`; the trampoline lets the REPL itself `eval` it.
+/// *other* definitions reach it by `call.dyn`; the trampoline lets the REPL itself `eval` it.
 struct Repl {
     cm: CompiledModule,
     symbols: HashMap<String, (u32, *const u8)>,

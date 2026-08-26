@@ -38,8 +38,8 @@ static int fs(void) {
 }
 static long hc(int op, long a, long b, long c, long d) {
   /* No `fs` capability granted (e.g. the playground's Lua editor grants only the powerbox streams):
-   * `cap.self.resolve` returned a negative handle. Fail the op cleanly (fopen -> NULL -> io.open
-   * returns nil) instead of `cap.call`ing a forged handle, which would CapFault-trap the whole run. */
+   * `self.resolve` returned a negative handle. Fail the op cleanly (fopen -> NULL -> io.open
+   * returns nil) instead of `call.cap`ing a forged handle, which would CapFault-trap the whole run. */
   if (fs() < 0) {
     errno_cell = 38; /* ENOSYS */
     return -1;

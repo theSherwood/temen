@@ -35,7 +35,7 @@ use temen_run::fs::MemFsHandle;
 use temen_text::parse_module;
 
 // The parent: `main(inst, module, fs)` lays a one-entry grant record `{name_off:18432, name_len:2}
-// → fs` at window offset 17408, op-13 (`cap.call INSTANTIATOR(=6) 13`) spawns the child module into a
+// → fs` at window offset 17408, op-13 (`call.cap INSTANTIATOR(=6) 13`) spawns the child module into a
 // 64 KiB carve at `[65536, 131072)` (its declared `memory 16`, off = 1<<16), then op-1 joins it. The
 // grant name `"fs"` is a data segment at 18432; the record's second word carries the `fs` handle. The
 // grant record and cap-name buffer live in the parent window above the #1094 NULL guard (16384) — the
@@ -59,8 +59,8 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   voff = i64.const 65536
   vsl = i64.const 16
   vq = i64.const 0
-  vh = cap.call 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
-  vr = cap.call 6 1 (i32) -> (i64) v0 (vh)
+  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
+  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
   return vr
   }
 }
@@ -121,7 +121,7 @@ fn read_back(handle: &MemFsHandle, key: &str) -> Vec<u8> {
 
 // A child-entry guest (its `Instantiator` starter arrives as `v0`, unused): resolve `"fs"` by name,
 // `open("out.bin", O_WRITE|O_CREATE|O_TRUNC = 2|16|8 = 26)`, `write` its 9-byte `"hello.nif"` data
-// segment, `close`, and return the bytes written. Fs ops are `cap.call HOST_PROC(=13) <op>` — op 0
+// segment, `close`, and return the bytes written. Fs ops are `call.cap HOST_PROC(=13) <op>` — op 0
 // open, 2 write, 4 close (fs.rs op protocol). The child carve is 64 KiB (>= the 16384 guard), so it is
 // itself guarded — its scratch sits above the #1094 NULL guard (16384..).
 const WRITER: &str = r#"
@@ -133,16 +133,16 @@ func (i64) -> (i64) {
 block 0 (vstarter: i64) {
   vfp = i64.const 16384
   vfl = i64.const 2
-  vfs = cap.self.resolve vfp vfl
+  vfs = self.resolve vfp vfl
   vpath = i64.const 16392
   vplen = i64.const 7
   vflags = i64.const 26
   vzero = i64.const 0
-  vfd = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vfs (vpath, vplen, vflags, vzero)
+  vfd = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vfs (vpath, vplen, vflags, vzero)
   vbuf = i64.const 16416
   vblen = i64.const 9
-  vn = cap.call 13 2 (i64, i64, i64, i64) -> (i64) vfs (vfd, vbuf, vblen, vzero)
-  vc = cap.call 13 4 (i64, i64, i64, i64) -> (i64) vfs (vfd, vzero, vzero, vzero)
+  vn = call.cap 13 2 (i64, i64, i64, i64) -> (i64) vfs (vfd, vbuf, vblen, vzero)
+  vc = call.cap 13 4 (i64, i64, i64, i64) -> (i64) vfs (vfd, vzero, vzero, vzero)
   return vn
   }
 }
@@ -180,22 +180,22 @@ func (i64) -> (i64) {
 block 0 (vstarter: i64) {
   vfp = i64.const 16384
   vfl = i64.const 2
-  vfs = cap.self.resolve vfp vfl
+  vfs = self.resolve vfp vfl
   vzero = i64.const 0
   vinp = i64.const 16392
   vinl = i64.const 6
   vrd = i64.const 1
-  vfin = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vfs (vinp, vinl, vrd, vzero)
+  vfin = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vfs (vinp, vinl, vrd, vzero)
   vbuf = i64.const 16640
   vcap = i64.const 256
-  vn = cap.call 13 1 (i64, i64, i64, i64) -> (i64) vfs (vfin, vbuf, vcap, vzero)
+  vn = call.cap 13 1 (i64, i64, i64, i64) -> (i64) vfs (vfin, vbuf, vcap, vzero)
   voutp = i64.const 16400
   voutl = i64.const 7
   vwr = i64.const 26
-  vfout = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vfs (voutp, voutl, vwr, vzero)
-  vw = cap.call 13 2 (i64, i64, i64, i64) -> (i64) vfs (vfout, vbuf, vn, vzero)
-  vc1 = cap.call 13 4 (i64, i64, i64, i64) -> (i64) vfs (vfin, vzero, vzero, vzero)
-  vc2 = cap.call 13 4 (i64, i64, i64, i64) -> (i64) vfs (vfout, vzero, vzero, vzero)
+  vfout = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vfs (voutp, voutl, vwr, vzero)
+  vw = call.cap 13 2 (i64, i64, i64, i64) -> (i64) vfs (vfout, vbuf, vn, vzero)
+  vc1 = call.cap 13 4 (i64, i64, i64, i64) -> (i64) vfs (vfin, vzero, vzero, vzero)
+  vc2 = call.cap 13 4 (i64, i64, i64, i64) -> (i64) vfs (vfout, vzero, vzero, vzero)
   return vw
   }
 }
@@ -241,7 +241,7 @@ struct WinPtr(*mut u8);
 /// op-13 re-granted powerbox (`take_granted_host`) and run the child over it
 /// (`new_confined_child_over_host`, which binds the child manifest against that powerbox); `Join`
 /// delivers the child's result. The re-granted `"fs"` lives in that taken powerbox, so the child's
-/// `cap.self.resolve "fs"` finds it.
+/// `self.resolve "fs"` finds it.
 fn drive(
     prog: &bytecode::VcpuProgram,
     base: WinPtr,

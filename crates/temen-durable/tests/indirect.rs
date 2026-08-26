@@ -1,9 +1,9 @@
-//! R8: freeze/thaw across a `call_indirect` to a may-suspend target (DURABILITY.md §6/§11).
+//! R8: freeze/thaw across a `call.dyn` to a may-suspend target (DURABILITY.md §6/§11).
 //!
 //! A function-pointer call whose (signature-tainted) target can suspend is now a real suspend
 //! point — the indirect twin of the propagated direct `Call` (`chain.rs`). On freeze the caller's
 //! frame unwinds like any other; on thaw it reloads its pre-call live set **plus the table index**
-//! and **re-issues the `call_indirect`**, leaving the state `REWINDING` so the resolved callee
+//! and **re-issues the `call.dyn`**, leaving the state `REWINDING` so the resolved callee
 //! rewinds in turn. Because the analysis instruments *every* function of the tainted signature, the
 //! reloaded index can only re-select a `REWINDING`-aware callee. Before this, an indirect call to a
 //! suspending target was silently under-instrumented (fail-open); the round-trip below would diverge.
@@ -93,13 +93,13 @@ fn assert_roundtrips(inst: &Module) -> Vec<Value> {
     baseline
 }
 
-// A →(call_indirect slot 1)→ B(leaf). Natural table: slot i = func i, so `i32.const 1` is the
+// A →(call.dyn slot 1)→ B(leaf). Natural table: slot i = func i, so `i32.const 1` is the
 // funcref for func 1. A adds 1000 to B's result; B adds 100 to the clock. Baseline: 1000+(100+42).
 const TWO_LEVEL_INDIRECT: &str = r#"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 1
-  v2 = call_indirect (i32) -> (i64) v1 (v0)
+  v2 = call.dyn (i32) -> (i64) v1 (v0)
   v3 = i64.const 1000
   v4 = i64.add v2 v3
   return v4
@@ -108,7 +108,7 @@ block 0 (v0: i32) {
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 100
   v4 = i64.add v2 v3
   return v4
@@ -127,7 +127,7 @@ fn two_level_indirect_round_trips() {
     );
 }
 
-// A value live *across* the indirect call: `v1` is computed before the `call_indirect` and used
+// A value live *across* the indirect call: `v1` is computed before the `call.dyn` and used
 // after, so it must be spilled/reloaded alongside the table index — the re-issue must clobber
 // neither. Baseline: leaf = 42+5 = 47; A = 47 + (7+7) = 61.
 const LIVE_ACROSS_INDIRECT: &str = r#"
@@ -135,7 +135,7 @@ func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i64.const 7
   v2 = i32.const 1
-  v3 = call_indirect (i32) -> (i64) v2 (v0)
+  v3 = call.dyn (i32) -> (i64) v2 (v0)
   v4 = i64.add v1 v1
   v5 = i64.add v3 v4
   return v5
@@ -144,7 +144,7 @@ block 0 (v0: i32) {
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 5
   v4 = i64.add v2 v3
   return v4
@@ -162,7 +162,7 @@ fn live_value_across_indirect_call_survives() {
     );
 }
 
-// A mixed chain: A →(direct)→ B →(call_indirect slot 2)→ C(leaf), each adding a distinct constant.
+// A mixed chain: A →(direct)→ B →(call.dyn slot 2)→ C(leaf), each adding a distinct constant.
 // Exercises an indirect frame stacked between two direct frames. Baseline: 42 + 1 + 20 + 300 = 363.
 const MIXED_CHAIN: &str = r#"
 func (i32) -> (i64) {
@@ -176,7 +176,7 @@ block 0 (v0: i32) {
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 2
-  v2 = call_indirect (i32) -> (i64) v1 (v0)
+  v2 = call.dyn (i32) -> (i64) v1 (v0)
   v3 = i64.const 20
   v4 = i64.add v2 v3
   return v4
@@ -185,7 +185,7 @@ block 0 (v0: i32) {
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 1
   v4 = i64.add v2 v3
   return v4
@@ -210,13 +210,13 @@ const INDIRECT_TAIL: &str = r#"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 1
-  return_call_indirect (i32) -> (i64) v1 (v0)
+  return_call.dyn (i32) -> (i64) v1 (v0)
   }
 }
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   return v2
   }
 }

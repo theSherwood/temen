@@ -69,10 +69,10 @@ block 0 (vinst: i32, vmod: i32, vout: i32) {{
   off = i64.const {CARVE}
   sl = i64.const 16
   qz = i64.const 0
-  ch = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) vinst (me, ent, off, sl, qz)
-  n = cap.call 6 1 (i32) -> (i64) vinst (ch)
+  ch = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) vinst (me, ent, off, sl, qz)
+  n = call.cap 6 1 (i32) -> (i64) vinst (ch)
   fp = i64.const {fwd}
-  w = cap.call 0 1 (i64, i64) -> (i64) vout (fp, n)
+  w = call.cap 0 1 (i64, i64) -> (i64) vout (fp, n)
   return w
   }}
 }}

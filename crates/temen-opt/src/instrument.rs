@@ -1,7 +1,7 @@
 //! **Memory-access instrumentation** (hooks): rewrite a module so that every guest linear-memory
 //! access is announced to a host capability *before* it executes.
 //!
-//! The pass inserts, ahead of each memory op, a `cap.call` to an embedder-bound hook capability
+//! The pass inserts, ahead of each memory op, a `call.cap` to an embedder-bound hook capability
 //! carrying the event kind (the cap-call `op`) and the access coordinates (effective address +
 //! width, or span operands for bulk ops). The engines are untouched: an instrumented module is an
 //! ordinary module, so all three backends run it — and, by the §3 parity invariant, produce the
@@ -23,7 +23,7 @@
 //!
 //! Deliberately **not** hooked (runtime-internal or host-side accesses, not guest data ops):
 //! futex `wait`/`notify` word touches, `setjmp`/`longjmp` jmp_buf traffic, `gc.roots` scans,
-//! `cap.self.resolve`/`label` name/label buffers, and host-side `GuestMem` access from other
+//! `self.resolve`/`label` name/label buffers, and host-side `GuestMem` access from other
 //! capability handlers. Accesses removed by a frontend's SSA promotion never reach the IR, so no
 //! hook design can see them; the trace is of the post-promotion module.
 //!
@@ -38,7 +38,7 @@ use alloc::vec::Vec;
 use crate::{map_operands, map_term_operands};
 use temen_ir::{BinOp, Func, FuncType, Inst, IntTy, Module, ValIdx, ValType};
 
-/// The hook capability's event kinds — the `op` immediate of each inserted `cap.call`. An
+/// The hook capability's event kinds — the `op` immediate of each inserted `call.cap`. An
 /// embedder's handler dispatches on these (the first argument of the `HostProc` ABI).
 pub mod mem_hook_op {
     /// `[addr, width]` — plain and v128 loads (v128 is width 16).
@@ -59,7 +59,7 @@ pub mod mem_hook_op {
     pub const FILL: u32 = 7;
 }
 
-/// Where the inserted `cap.call`s point: the hook capability's interface `type_id` (the embedder's
+/// Where the inserted `call.cap`s point: the hook capability's interface `type_id` (the embedder's
 /// host-fn interface) and the concrete `handle` the host will have granted by the time the module
 /// runs. The handle is baked as a constant, so the granting side must mint exactly this value
 /// (grants are deterministic; temen-run grants the hook first on a fresh host and asserts).
@@ -75,11 +75,11 @@ pub struct MemHookSpec {
 pub struct MemHookStats {
     /// Memory ops that got a hook call.
     pub hooked_ops: usize,
-    /// Total instructions inserted (consts + address adds + cap.calls).
+    /// Total instructions inserted (consts + address adds + call.cap calls).
     pub inserted_insts: usize,
 }
 
-/// Instrument every guest memory access of `m` with a pre-access `cap.call` to the hook capability
+/// Instrument every guest memory access of `m` with a pre-access `call.cap` to the hook capability
 /// described by `spec`. Pure `Module -> Module`; the input is untouched. Callers must re-verify
 /// the result before running it (fail-closed, like every pass in this crate).
 pub fn instrument_mem_hooks(m: &Module, spec: MemHookSpec) -> (Module, MemHookStats) {
@@ -88,7 +88,7 @@ pub fn instrument_mem_hooks(m: &Module, spec: MemHookSpec) -> (Module, MemHookSt
     // Positions key on (func, block, inst) — stale after insertion, so drop rather than mislead.
     out.debug_info = None;
     let mut stats = MemHookStats::default();
-    // The inserted hook `cap.call`s need their signatures in the type section (FuncType interning,
+    // The inserted hook `call.cap`s need their signatures in the type section (FuncType interning,
     // #922); intern into a growing copy and write it back (appending never moves existing indices).
     let mut types = m.types.clone();
     for f in &mut out.funcs {
@@ -451,7 +451,7 @@ mod tests {
                     | Inst::LongJmp { .. }
                     | Inst::GcRoots { .. }
                     // Calls clobber conservatively; the callee's own ops carry the hooks.
-                    // (`cap.self.resolve`/`label` are now `cap.call CAP_SELF`, covered by `CapCall`.)
+                    // (`self.resolve`/`label` are now `call.cap CAP_SELF`, covered by `CapCall`.)
                     | Inst::Call { .. }
                     | Inst::CallIndirect { .. }
                     | Inst::CallImport { .. }
@@ -553,7 +553,7 @@ mod tests {
                 buf: 3,
                 cap: 4,
             },
-            // `cap.self.resolve`/`label` (guest-memory-touching reflection) are now `cap.call
+            // `self.resolve`/`label` (guest-memory-touching reflection) are now `call.cap
             // CAP_SELF` — represented by the generic `CapCall` in the excluded list.
             Inst::CapCall {
                 type_id: temen_ir::CAP_SELF_TYPE_ID,

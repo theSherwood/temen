@@ -1,12 +1,12 @@
 //! **#1011 slice 3a — a granted child runs on the wasm-JIT tier (differential).** A §14 phase child
-//! carries a re-granted powerbox (a shared `fs`), and its `cap.call` on that grant must produce the
+//! carries a re-granted powerbox (a shared `fs`), and its `call.cap` on that grant must produce the
 //! same result on the **emitted** tier as on the interpreter oracle (INVARIANTS #9). The child here is
 //! `f0` (emitted integer compute) + `f1` (a cross-tier leaf that resolves the granted cap `"fs"` by
 //! name and calls it): `f0(x) = 40 + f1()`, and `f1()` calls a granted counter (post-increment `1`),
 //! so a correct run returns `41`. On the emitted tier `f0`'s call to `f1` bounces cross-tier
 //! (`env.call_interp`) and runs on the interpreter **over the granted host** — so the grant resolves
 //! there exactly as a JIT'd nim phase child's `fs` call will. Window confinement (§2) is unchanged:
-//! the grant is a `cap.call`, not a window access.
+//! the grant is a `call.cap`, not a window access.
 
 use std::sync::{Arc, Mutex};
 
@@ -18,7 +18,7 @@ const WIN_BASE: u32 = 0x1_0000; // guest window at wasm offset 64 KiB (`memory 1
 const WIN_SIZE: u64 = 1 << 16;
 const ENV_PTR: u32 = 1024;
 
-// f0 (emitted): 40 + f1(v0). f1 (cross-tier: it makes a `cap.call`): seed "fs" (0x7366 LE) into the
+// f0 (emitted): 40 + f1(v0). f1 (cross-tier: it makes a `call.cap`): seed "fs" (0x7366 LE) into the
 // window, resolve it, call the granted HOST_PROC counter, return its result.
 const SRC: &str = r#"
 memory 16
@@ -37,8 +37,8 @@ block 0 (v0: i64) {
   i64.store vzero vname
   vp0 = i64.const 16384
   vl2 = i64.const 2
-  vh = cap.self.resolve vp0 vl2
-  vr = cap.call 13 0 (i64) -> (i64) vh (vp0)
+  vh = self.resolve vp0 vl2
+  vr = call.cap 13 0 (i64) -> (i64) vh (vp0)
   return vr
   }
 }
@@ -75,7 +75,7 @@ fn granted_host() -> (Host, Arc<Mutex<i64>>) {
     (host, counter)
 }
 
-/// Interpreter oracle: run `f0` over a flat window with the granted host — `f1`'s `cap.call` resolves
+/// Interpreter oracle: run `f0` over a flat window with the granted host — `f1`'s `call.cap` resolves
 /// `"fs"` inline. Returns `f0(arg)`.
 fn oracle(m: &temen_ir::Module, arg: i64) -> (i64, i64) {
     let (mut host, counter) = granted_host();
@@ -97,13 +97,13 @@ fn oracle(m: &temen_ir::Module, arg: i64) -> (i64, i64) {
 }
 
 /// JIT run: `f0` on wasmi; `f1` bounces cross-tier and runs on the interpreter **over the granted
-/// host** (the browser cross-tier path), so its `cap.call` resolves `"fs"`. Returns `f0(arg)`.
+/// host** (the browser cross-tier path), so its `call.cap` resolves `"fs"`. Returns `f0(arg)`.
 fn jit_run(m: &temen_ir::Module, arg: i64) -> (i64, i64) {
     let (wasm, emitted) = compile_module_reactor(m, 0, false).expect("reactor emittable");
     assert_eq!(
         emitted,
         vec![true, false],
-        "f0 emits; the cap.call leaf f1 is cross-tier"
+        "f0 emits; the call.cap leaf f1 is cross-tier"
     );
 
     let (host, counter) = granted_host();
@@ -216,7 +216,7 @@ fn granted_child_cap_call_matches_on_both_tiers() {
     let (ji, jc) = jit_run(&m, 0);
     assert_eq!(oi, 41, "interpreter: 40 + granted counter (1)");
     assert_eq!(ji, 41, "wasm-JIT: 40 + the cross-tier granted counter (1)");
-    assert_eq!(oi, ji, "the granted child's cap.call agrees on both tiers");
+    assert_eq!(oi, ji, "the granted child's call.cap agrees on both tiers");
     assert_eq!(
         (oc, jc),
         (1, 1),

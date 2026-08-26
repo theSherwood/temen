@@ -56,7 +56,7 @@
 // desugaring (`tmp = &A, *tmp = *tmp op B`) is un-desugared for plain-variable targets so
 // loop counters/accumulators promote; address-taken locals, narrow types (char/short/
 // _Bool, whose store truncation we keep in memory), aggregates, and `_Atomic` stay in
-// memory. **Indirect calls** (C function pointers) lower to `call_indirect` through the
+// memory. **Indirect calls** (C function pointers) lower to `call.dyn` through the
 // function table (§3c): a function designator decays to its `ref.func` index (widened to
 // the 8-byte pointer rep), and `fp(args)` wraps it back to the i32 table index and
 // dispatches with the callee's static signature (incl. the leading data-SP). **General
@@ -1007,7 +1007,7 @@ static int gen_builtin_stream(Node *node, int slot, int op) {
   int h = dummy_handle();
   int r = nv++;
   // §7: reach the Stream op by *name* (host-resolved to (type_id, op) at load), not an inlined
-  // cap.call. The handle still selects the endpoint (stdout vs stdin).
+  // call.cap. The handle still selects the endpoint (stdout vs stdin).
   const char *name = (op == 1) ? "write" : "read";
   cg("  v%d = call.sym \"%s\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, name, h, buf,
           len);
@@ -1066,7 +1066,7 @@ static int gen_builtin_longjmp(Node *node) {
 }
 
 // Memory capability builtins (§3e/§4): `__vm_map(off,len,prot)` / `__vm_unmap(off,len)` /
-// `__vm_protect(off,len,prot)` lower to `cap.call` on the stashed Memory handle (type 3,
+// `__vm_protect(off,len,prot)` lower to `call.cap` on the stashed Memory handle (type 3,
 // ops 0/1/2). This is how guest libc (`malloc`) commits/decommits window pages and **grows
 // the heap into the reserved tail** (the §1a sparse-address-space path). Each returns the
 // cap's `i64` (0 / negative-errno). The args are simple expressions in our own libc, so they
@@ -1094,7 +1094,7 @@ static int gen_builtin_memory(Node *node, int op, int want) {
 }
 
 // `__vm_page_size()` (§3e/§4): query the host MMU page granularity the window is managed in —
-// `cap.call 3 3 () -> (i64)` on the stashed Memory handle (Memory op 3, no args). The guest libc
+// `call.cap 3 3 () -> (i64)` on the stashed Memory handle (Memory op 3, no args). The guest libc
 // caches it so `malloc` aligns its growth to the *real* host page (4 KiB / 16 KiB / …) instead of
 // assuming a fixed size — the host-page-default surfaced to the guest so it can adapt.
 static int gen_builtin_page_size(Node *node) {
@@ -1154,8 +1154,8 @@ static int gen_builtin_fs(Node *node) {
 }
 
 // `__vm_blocking_handle()` returns the Blocking capability handle (an `i32`) so the guest can
-// name it in a direct `Blocking.work` cap.call (the §12 parking exerciser). This is a real
-// *handle value* (not a dispatch), so resolve it by its canonical name (`cap.self.resolve` — the
+// name it in a direct `Blocking.work` call.cap (the §12 parking exerciser). This is a real
+// *handle value* (not a dispatch), so resolve it by its canonical name (`self.resolve` — the
 // discovery tier IMPORTS.md keeps); the name bytes are staged in the low reserved region that the
 // retired handle stash freed.
 static int gen_builtin_blocking_handle(Node *node) {
@@ -1175,7 +1175,7 @@ static int gen_builtin_blocking_handle(Node *node) {
   int vlen = nv++;
   cg("  v%d = i64.const %d\n", vlen, len);
   int vh = nv++;
-  cg("  v%d = cap.self.resolve v%d v%d\n", vh, vptr, vlen);
+  cg("  v%d = self.resolve v%d v%d\n", vh, vptr, vlen);
   return vh;
 }
 
@@ -1191,7 +1191,7 @@ static int gen_builtin_cap(Node *node) {
   int i = gen_expr(a); // the index (i32)
   int h = nv++;        // result 0: the capability handle
   int t = nv++;        // result 1: its type_id (unused)
-  cg("  v%d, v%d = cap.self.get v%d\n", h, t, i);
+  cg("  v%d, v%d = self.get v%d\n", h, t, i);
   (void)t;
   return h;
 }
@@ -1253,7 +1253,7 @@ static int gen_builtin_import(Node *node) {
 
 // §7 capability **reflection** — a guest discovers what its host granted *this* domain. Read-only
 // and authority-neutral (it only re-surfaces handles the domain already holds). `__vm_cap_count()`
-// is `cap.self.count`; `__vm_cap_at(i, &type_id)` is `cap.self.get` — it returns the i-th held
+// is `self.count`; `__vm_cap_at(i, &type_id)` is `self.get` — it returns the i-th held
 // capability's handle (usable directly as the first arg of a capability call) and writes its
 // interface type_id through the pointer. Together they let runtime code enumerate and use the
 // capabilities it was given.
@@ -1261,7 +1261,7 @@ static int gen_builtin_cap_count(Node *node) {
   if (node->args)
     error_tok(node->tok, "codegen_ir: __vm_cap_count() takes no arguments");
   int r = nv++;
-  cg("  v%d = cap.self.count\n", r);
+  cg("  v%d = self.count\n", r);
   return r;
 }
 
@@ -1273,7 +1273,7 @@ static int gen_builtin_cap_at(Node *node) {
   int p = gen_expr(a->next);  // int *type_id_out (an i64 window pointer)
   int h = nv++;               // result 0: the capability handle
   int t = nv++;               // result 1: its interface type_id
-  cg("  v%d, v%d = cap.self.get v%d\n", h, t, i);
+  cg("  v%d, v%d = self.get v%d\n", h, t, i);
   cg("  i32.store v%d v%d\n", p, t); // *type_id_out = type_id
   return h;
 }
@@ -1348,7 +1348,7 @@ static int gen_builtin_jit_release(Node *node) {
 }
 
 // `__vm_jit_install(code) -> slot` (iface 11 op 3, DESIGN.md §22): install a compiled unit
-// into the `call_indirect` table; the returned slot index is a funcref old code (or another
+// into the `call.dyn` table; the returned slot index is a funcref old code (or another
 // unit) can call indirectly at native speed. Returns -28 (ENOSPC) if the table is full.
 static int gen_builtin_jit_install(Node *node) {
   Node *a = node->args;
@@ -1362,7 +1362,7 @@ static int gen_builtin_jit_install(Node *node) {
 }
 
 // `__vm_jit_uninstall(slot) -> 0 | -errno` (iface 11 op 4, DESIGN.md §22 reclaim): clear an
-// installed call_indirect slot so the index is reusable and a stale call of it traps.
+// installed call.dyn slot so the index is reusable and a stale call of it traps.
 static int gen_builtin_jit_uninstall(Node *node) {
   Node *a = node->args;
   if (!a || a->next)
@@ -1384,10 +1384,10 @@ static int gen_builtin_jit_uninstall(Node *node) {
 //
 // `create` dispatches on the fixed AddressSpace interface — a manifest import. The other three
 // dispatch on the runtime-minted *region handle*, which is the dynamic addressing mode
-// (IMPORTS.md §2.2): an inline `cap.call 4 <op>` on the live handle, no manifest entry.
+// (IMPORTS.md §2.2): an inline `call.cap 4 <op>` on the live handle, no manifest entry.
 //
-// `create` lowers to `cap.call 5 5` on the stashed AddressSpace handle (the memory-management
-// authority mints shareable memory); the others to `cap.call 4 <op>` on the *region* handle the
+// `create` lowers to `call.cap 5 5` on the stashed AddressSpace handle (the memory-management
+// authority mints shareable memory); the others to `call.cap 4 <op>` on the *region* handle the
 // guest holds. Mapping the same region at two adjacent window offsets makes a wrap-around access
 // contiguous — the ring-buffer trick — with the bytes shareable into a child domain (§14 grant).
 static int gen_builtin_region_create(Node *node) {
@@ -1414,7 +1414,7 @@ static int gen_builtin_region_map(Node *node) {
   int len = widen_i64(gen_expr(a->next->next->next), a->next->next->next->ty);
   int prot = gen_expr(a->next->next->next->next);
   int r = nv++;
-  cg("  v%d = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v%d (v%d, v%d, v%d, v%d)\n",
+  cg("  v%d = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v%d (v%d, v%d, v%d, v%d)\n",
           r, rh, win, roff, len, prot);
   return r;
 }
@@ -1430,7 +1430,7 @@ static int gen_builtin_region_unmap(Node *node) {
   int win = widen_i64(gen_expr(a->next), a->next->ty);
   int len = widen_i64(gen_expr(a->next->next), a->next->next->ty);
   int r = nv++;
-  cg("  v%d = cap.call 4 1 (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, rh, win, len);
+  cg("  v%d = call.cap 4 1 (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, rh, win, len);
   return r;
 }
 
@@ -1440,12 +1440,12 @@ static int gen_builtin_region_page_size(Node *node) {
     error_tok(node->tok, "codegen_ir: __vm_region_page_size(r) expects 1 argument");
   int rh = gen_expr(a);
   int r = nv++;
-  cg("  v%d = cap.call 4 3 () -> (i64) v%d ()\n", r, rh);
+  cg("  v%d = call.cap 4 3 () -> (i64) v%d ()\n", r, rh);
   return r;
 }
 
 // FORK.md §8.6 — `__vm_resolve(name_ptr, len) -> handle`: resolve a re-granted powerbox cap by name
-// (`cap.self.resolve`), so the guest can read the raw handle a re-grant registered — a `Stream` handle
+// (`self.resolve`), so the guest can read the raw handle a re-grant registered — a `Stream` handle
 // to place in an `__vm_exec_module` grant list, or the command-module handle to `execve` into. The i32
 // handle is sign-extended to the i64 the C wrapper returns (a negative result is "not found").
 static int gen_builtin_resolve(Node *node) {
@@ -1457,14 +1457,14 @@ static int gen_builtin_resolve(Node *node) {
   p = widen_i64(p, a->ty);
   l = widen_i64(l, a->next->ty);
   int r = nv++;
-  cg("  v%d = cap.self.resolve v%d v%d\n", r, p, l);
+  cg("  v%d = self.resolve v%d v%d\n", r, p, l);
   int w = nv++;
   cg("  v%d = i64.extend_i32_s v%d\n", w, r);
   return w;
 }
 
 // FORK.md §8.6 — `__vm_exec_module(mod, grants_ptr, grants_n, entry, size_log2)`: **true cross-module
-// `execve`** (image-replace). Lowers to the self-namespace op `cap.call 4294967295 14` — the calling
+// `execve`** (image-replace). Lowers to the self-namespace op `call.cap 4294967295 14` — the calling
 // vCPU *becomes* the granted command module in place, keeping its task, so a parent's `wait` reaps the
 // command's exit. Never returns on success (the caller's image is gone); returns `-errno` on failure
 // (POSIX `execve` returns only on failure). All five args are i64. Like the region builtins, the args
@@ -1484,14 +1484,14 @@ static int gen_builtin_exec_module(Node *node) {
   int sl = widen_i64(gen_expr(a->next->next->next->next), a->next->next->next->next->ty);
   int h = dummy_handle();
   int r = nv++;
-  cg("  v%d = cap.call 4294967295 14 (i64, i64, i64, i64, i64) -> (i64) v%d (v%d, v%d, v%d, v%d, "
+  cg("  v%d = call.cap 4294967295 14 (i64, i64, i64, i64, i64) -> (i64) v%d (v%d, v%d, v%d, v%d, "
      "v%d)\n",
      r, h, mod, gp, gn, en, sl);
   return r;
 }
 
 // FORK.md §8.6 — `__vm_setpgid(pid, pgid)`: POSIX process-group assignment for job control. Lowers
-// to the self-namespace op `cap.call 4294967295 15` — the calling vCPU (the parent) sets a forked
+// to the self-namespace op `call.cap 4294967295 15` — the calling vCPU (the parent) sets a forked
 // child's process group directly, so a later `__wait(-pgid)` reaps any child in that group. Both args
 // are i64; returns 0 or -errno (`-ESRCH` if `pid` is not a live child of the caller).
 static int gen_builtin_setpgid(Node *node) {
@@ -1505,12 +1505,12 @@ static int gen_builtin_setpgid(Node *node) {
   int pgid = widen_i64(gen_expr(a->next), a->next->ty);
   int h = dummy_handle();
   int r = nv++;
-  cg("  v%d = cap.call 4294967295 15 (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, h, pid, pgid);
+  cg("  v%d = call.cap 4294967295 15 (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, h, pid, pgid);
   return r;
 }
 
 // FORK.md §8.6 — `__vm_pipe(int *fds)`: POSIX `pipe`. Lowers to the self-namespace op
-// `cap.call 4294967295 16`, which mints a pipe into this domain's powerbox and writes `fds[0]` = read
+// `call.cap 4294967295 16`, which mints a pipe into this domain's powerbox and writes `fds[0]` = read
 // end, `fds[1]` = write end. `fds` is an `int[2]` pointer; returns 0 / -errno (int).
 static int gen_builtin_pipe(Node *node) {
   int argc = 0;
@@ -1521,11 +1521,11 @@ static int gen_builtin_pipe(Node *node) {
   int fds = widen_i64(gen_expr(node->args), node->args->ty);
   int h = dummy_handle();
   int r = nv++;
-  cg("  v%d = cap.call 4294967295 16 (i64) -> (i64) v%d (v%d)\n", r, h, fds);
+  cg("  v%d = call.cap 4294967295 16 (i64) -> (i64) v%d (v%d)\n", r, h, fds);
   return r; // i64 result (0 / -errno); the C `long __vm_pipe` return narrows at the use site
 }
 
-// FORK.md §8.6 — `__vm_close(int handle)`: close a `Stream`/pipe-end handle. Lowers to `cap.call 0 2`
+// FORK.md §8.6 — `__vm_close(int handle)`: close a `Stream`/pipe-end handle. Lowers to `call.cap 0 2`
 // (iface `STREAM` = 0, op 2 = close) on the runtime handle. Revokes the handle; closing a pipe **write**
 // end also drops the pipe's writer count (→ EOF for its reader once all writers close). A shell closes
 // its own copies of a pipe's ends after forking the stages, so the producer becomes the last writer.
@@ -1535,7 +1535,7 @@ static int gen_builtin_close(Node *node) {
     error_tok(node->tok, "codegen_ir: __vm_close(handle) expects 1 argument");
   int h = gen_expr(a); // i32 capability handle
   int r = nv++;
-  cg("  v%d = cap.call 0 2 () -> (i64) v%d ()\n", r, h);
+  cg("  v%d = call.cap 0 2 () -> (i64) v%d ()\n", r, h);
   return r; // i64 result (0); the C `int __vm_close` return narrows at the use site
 }
 
@@ -1543,7 +1543,7 @@ static int gen_builtin_close(Node *node) {
 // read/write a **specific** `Stream`/pipe-end handle (op 0 / 1), unlike the frontend's `read`/`write`
 // builtins which always hit the ambient stdin/stdout streams (they drop the fd). A shell needs these to
 // pump a pipe fd it holds — e.g. draining a stage's output into a redirect file. Lowers to
-// `cap.call 0 <op> (i64, i64) -> (i64) <h> (buf, len)`; returns the byte count / -errno.
+// `call.cap 0 <op> (i64, i64) -> (i64) <h> (buf, len)`; returns the byte count / -errno.
 static int gen_builtin_stream_handle(Node *node, int op, const char *who) {
   Node *a = node->args;
   if (!a || !a->next || !a->next->next || a->next->next->next)
@@ -1552,7 +1552,7 @@ static int gen_builtin_stream_handle(Node *node, int op, const char *who) {
   int buf = widen_i64(gen_expr(a->next), a->next->ty);
   int len = widen_i64(gen_expr(a->next->next), a->next->next->ty);
   int r = nv++;
-  cg("  v%d = cap.call 0 %d (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, op, h, buf, len);
+  cg("  v%d = call.cap 0 %d (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, op, h, buf, len);
   return r; // i64 byte count / -errno
 }
 
@@ -2230,9 +2230,9 @@ static int gen_expr(Node *node) {
       // hidden sret pointer (struct return), the params, and the trailing varargs pointer —
       // or the runtime type-id check traps (a forged or mismatched index is inert).
       if (ir_void)
-        cg("  call_indirect (i64");
+        cg("  call.dyn (i64");
       else
-        cg("  v%d = call_indirect (i64", r);
+        cg("  v%d = call.dyn (i64", r);
       if (agg_ret)
         cg(", i64"); // the hidden sret pointer
       for (Type *pt = node->func_ty->params; pt; pt = pt->next)
@@ -3120,7 +3120,7 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
   bool is_void = mret->kind == TY_VOID;
   // The powerbox is bound **by name**, not positionally (PROCESS.md S15 (c)). `_start` takes **no
   // handle parameters**; instead its prologue resolves each capability by name from the runtime's
-  // §7 name directory (`cap.self.resolve`, which the runner populates when it grants the fixed set)
+  // §7 name directory (`self.resolve`, which the runner populates when it grants the fixed set)
   // and stashes it in the reserved slot — so every builtin below (which still *loads* the stash) is
   // unchanged, and there is no implicit guest/host slot-index agreement: the guest asks for
   // "stdout", the host answers or fails closed. A `export "_start" 0` marks func 0 as the powerbox
@@ -3141,7 +3141,7 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
   // `(i64 starter) -> (i64 status)`; the top-level powerbox entry is paramless `() -> (main's ret)`.
   // The starter is ignored here (a no-capability command); `main`'s result is widened to the i64 the
   // parent reads via `join`. `cap_mask` should be 0 for such a command (it holds no powerbox), so the
-  // resolve loop below is a no-op — `cap.self.resolve` would fail in a destitute child.
+  // resolve loop below is a no-op — `self.resolve` would fail in a destitute child.
   if (opt_child_entry) {
     cg("func (i64) -> (i64) {\n");
     cg("block 0 (v0: i64) {\n");
@@ -3184,7 +3184,7 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
     int vlen = nv++;
     cg("  v%d = i64.const %d\n", vlen, len);
     int vh = nv++;
-    cg("  v%d = cap.self.resolve v%d v%d\n", vh, vptr, vlen);
+    cg("  v%d = self.resolve v%d v%d\n", vh, vptr, vlen);
     int vslot = nv++;
     // The handle-stash slots ride one guard up with everything else (#964/#1059) — a store into
     // `[0, guard)` would itself trap now that the region is reserved.

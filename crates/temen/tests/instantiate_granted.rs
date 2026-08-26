@@ -5,7 +5,7 @@
 //!
 //! §3d: the spelling is the op-17 **record** with a one-entry named-grant list (the old positional
 //! op 8 is deleted): the parent lays the name + 16-byte grant record in its window, the child
-//! resolves the cap **by name** (`cap.self.resolve`) instead of receiving a third entry arg. A
+//! resolves the cap **by name** (`self.resolve`) instead of receiving a third entry arg. A
 //! forged / non-copyable handle (an index-carrying or window-coordinate cap) still fails the whole
 //! spawn closed (`CapFault`) at the record's grant-list validation.
 
@@ -57,8 +57,8 @@ block 0 (vinst: i32, vstream: i32) {\n\
   i64.store rra5 rrgp\n\
   rra6 = i64.const 4208\n\
   i64.store rra6 rrgn\n\
-  vch = cap.call 6 17 (i64) -> (i32) vinst (rra0)\n\
-  vres = cap.call 6 1 (i32) -> (i64) vinst (vch)\n\
+  vch = call.cap 6 17 (i64) -> (i32) vinst (rra0)\n\
+  vres = call.cap 6 1 (i32) -> (i64) vinst (vch)\n\
   return vres\n\
   }\n\
 }\n\
@@ -77,10 +77,10 @@ block 0 (vcinst: i64, vcas: i64) {\n\
   vnp = i64.const 512\n\
   i32.store8 vnp vg\n\
   vnl = i64.const 1\n\
-  vsh = cap.self.resolve vnp vnl\n\
+  vsh = self.resolve vnp vnl\n\
   vptr = i64.const 0\n\
   vlen = i64.const 3\n\
-  vw = cap.call 0 1 (i64, i64) -> (i64) vsh (vptr, vlen)\n\
+  vw = call.cap 0 1 (i64, i64) -> (i64) vsh (vptr, vlen)\n\
   v7 = i64.const 7\n\
   return v7\n\
   }\n\
@@ -124,7 +124,7 @@ fn child_writes_stdout_through_inherited_stream() {
 #[test]
 fn non_copyable_grant_is_capfault() {
     // Passing the Instantiator handle as the grant: a window-coordinate cap is not re-grantable, so
-    // `resolve_copyable` refuses it and the `instantiate_granted` cap.call is a `CapFault`.
+    // `resolve_copyable` refuses it and the `instantiate_granted` call.cap is a `CapFault`.
     let (res, out) = run(true);
     assert_eq!(
         res,

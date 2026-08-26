@@ -24,7 +24,7 @@
 //! Each program runs `_start` (function 0) on **both** the interpreter and the JIT under an identical
 //! host, asserting they agree on the result *and* the observable personality state (captured stdout,
 //! the memfs) — so it doubles as a cross-backend differential, capability effects included. The
-//! personality's `HostProc` dispatches through the same `cap_dispatch_slots` the JIT's `cap.call` thunk
+//! personality's `HostProc` dispatches through the same `cap_dispatch_slots` the JIT's `call.cap` thunk
 //! calls, so parity comes for free. Requires a unix C toolchain (`make` + `cc`) to build the chibicc
 //! fork, so the suite is gated to `#![cfg(unix)]` (like `c_frontend.rs`).
 #![cfg(unix)]
@@ -554,7 +554,7 @@ int main() {{\n\
 /// temen-posix **personality** (memfs/stdio via `__px_*` named imports — World A) AND drives the
 /// **capability** path (`__vm_pipe`/`__vm_read`/`__vm_write`, the `cap.self`/Stream builtins — World B) in
 /// one run. The worlds use **disjoint** host state (a HOST_PROC handle + import bindings vs. the Stream
-/// powerbox slots) and **disjoint** guest dispatch (named imports vs. `cap.call` builtins), so they
+/// powerbox slots) and **disjoint** guest dispatch (named imports vs. `call.cap` builtins), so they
 /// compose on one `Host` with no conflict — `temen_posix::grant` claims nothing the capability grants touch,
 /// and the `__vm_*` builtins generate no import entries, so the manifest is pure `__px_*`. This is the
 /// bridge #799 is built on: a personality-linked program (eventually bash) that also holds capability
@@ -576,9 +576,9 @@ int main(void) {
      One fiber, so the write lands before the read drains it — no park needed for the coexistence proof. */
   int fds[2];
   __vm_pipe(fds);                     /* CAP_SELF_PIPE mints two Stream handles into the powerbox */
-  __vm_write(fds[1], a, ra);          /* STREAM cap.call write */
+  __vm_write(fds[1], a, ra);          /* STREAM call.cap write */
   char b[8];
-  long rb = __vm_read(fds[0], b, ra); /* STREAM cap.call read -> ra bytes */
+  long rb = __vm_read(fds[0], b, ra); /* STREAM call.cap read -> ra bytes */
   return (int)(fd + rb);              /* 3 + 3 = 6 : both worlds ran on one Host */
 }
 "#;
@@ -1090,6 +1090,113 @@ int main(void) {
         byte.result,
         vec![Value::I32(42)],
         "bytecode any-child (waitpid(-1)) reap matched the oracle"
+    );
+}
+
+/// #1080 pipeline rung — a **nested fork + blocking wait**: a forked twin ITSELF forks a grandchild
+/// and blocks in `waitpid` for it, then the root reaps the twin. This is exactly the shape a real-bash
+/// pipeline stage takes (the shell forks a subshell per stage; a stage running an external command forks
+/// again and waits), and it is the first differential where a **forked child** — not the root — is the
+/// one that parks in `waitpid`. On the bytecode cooperative engine the reproduction target is the
+/// browser pipeline deadlock (`echo | cat`), where the subshell's `waitpid` busy-loops on `-ECHILD`
+/// instead of parking. Both engines must return 42.
+#[test]
+fn c_a_nested_fork_twin_blocks_on_grandchild_differential() {
+    let src = r#"
+long __px_fork(int cap, long a);
+long __px_waitpid(int cap, long pid, long status, long opts);
+static int st1;
+static int st2;
+static volatile long acc;
+static long p1;
+static long p2;
+int main(void) {
+  p1 = __px_fork(0, 0);                       /* root forks twin1 (the "subshell") */
+  if (p1 < 0) return 1;
+  if (p1 == 0) {
+    p2 = __px_fork(0, 0);                      /* twin1 forks a grandchild (the "command") */
+    if (p2 < 0) return 21;
+    if (p2 == 0) {
+      for (long i = 0; i < 30000; i = i + 1) acc = acc + 1;  /* slow: twin1 must BLOCK */
+      return 7;                                /* grandchild exits 7 */
+    }
+    long h2 = __px_waitpid(0, p2, (long)&st2, 0);  /* twin1 blocks on its grandchild */
+    if (h2 != p2) return 22;
+    if ((st2 & 0x7f) != 0) return 23;
+    if (((st2 >> 8) & 0xff) != 7) return 24;
+    return 11;                                 /* twin1 exits 11 */
+  }
+  long h1 = __px_waitpid(0, p1, (long)&st1, 0);    /* root blocks on twin1 */
+  if (h1 != p1) return 3;
+  if ((st1 & 0x7f) != 0) return 4;
+  if (((st1 >> 8) & 0xff) != 11) return 5;
+  return 42;
+}
+"#;
+    let interp = run_interp_only(src, |_| {});
+    assert_eq!(
+        interp.result,
+        vec![Value::I32(42)],
+        "tree-walker: twin1 forked a grandchild, blocked in waitpid for it, then the root reaped twin1"
+    );
+    let byte = run_bytecode_only(src, |_| {});
+    assert_eq!(
+        byte.result,
+        vec![Value::I32(42)],
+        "bytecode: a forked twin's OWN blocking waitpid on its grandchild must park + reap like the \
+         oracle (the pipeline-subshell shape behind the `echo | cat` browser deadlock)"
+    );
+}
+
+/// #1080 pipeline rung — **reap ownership**: `waitpid(-1)` must reap only the CALLER's own children,
+/// never a sibling's. The root forks two twins; twinA exits (a zombie owned by the root), and twinB —
+/// which has no children — calls `waitpid(-1)`. POSIX: twinB gets `-ECHILD` and does NOT steal twinA's
+/// zombie, so the root still reaps twinA itself. This is the shape behind the browser `echo | cat`
+/// deadlock: a pipeline stage's stray `waitpid(-1)` stealing a sibling stage's reap from the shell.
+#[test]
+fn c_a_waitpid_any_child_does_not_steal_a_siblings_reap_differential() {
+    let src = r#"
+long __px_fork(int cap, long a);
+long __px_waitpid(int cap, long pid, long status, long opts);
+static int stA;
+static int stB;
+static volatile long acc;
+static long pa;
+static long pb;
+int main(void) {
+  pa = __px_fork(0, 0);
+  if (pa < 0) return 1;
+  if (pa == 0) return 7;                        /* twinA: exit 7 -> a zombie owned by the ROOT */
+  pb = __px_fork(0, 0);
+  if (pb < 0) return 2;
+  if (pb == 0) {
+    for (long i = 0; i < 20000; i = i + 1) acc = acc + 1;  /* let twinA retire to a zombie first */
+    long h = __px_waitpid(0, -1, (long)&stB, 0);           /* twinB has NO children */
+    if (h > 0) return 20 + (int)h;                          /* BUG: twinB stole a sibling's zombie */
+    return 11;                                              /* h < 0 (-ECHILD): correct */
+  }
+  long hb = __px_waitpid(0, pb, (long)&stB, 0);   /* root blocks on twinB FIRST: twinA becomes a
+                                                     zombie while twinB spins, so twinB's waitpid(-1)
+                                                     below has a stealable sibling zombie present */
+  if (hb != pb) return 5;
+  if (((stB >> 8) & 0xff) != 11) return 6;        /* twinB returned 11 (did not steal twinA) */
+  long ha = __px_waitpid(0, pa, (long)&stA, 0);   /* root reaps twinA — still there iff not stolen */
+  if (ha != pa) return 3;
+  if (((stA >> 8) & 0xff) != 7) return 4;
+  return 42;
+}
+"#;
+    let interp = run_interp_only(src, |_| {});
+    assert_eq!(
+        interp.result,
+        vec![Value::I32(42)],
+        "tree-walker: waitpid(-1) in a childless sibling does not steal the root's zombie"
+    );
+    let byte = run_bytecode_only(src, |_| {});
+    assert_eq!(
+        byte.result,
+        vec![Value::I32(42)],
+        "bytecode: waitpid(-1) must be scoped to the caller's own children (no sibling reap-stealing)"
     );
 }
 

@@ -48,8 +48,8 @@ block 0 (v0: i32) {
   i64.store qa5 qv4
   qa6 = i64.const 17584
   i64.store qa6 qv4
-  vch = cap.call 6 17 (i64) -> (i32) v0 (qa0)
-  vr = cap.call 6 1 (i32) -> (i64) v0 (vch)
+  vch = call.cap 6 17 (i64) -> (i32) v0 (qa0)
+  vr = call.cap 6 1 (i32) -> (i64) v0 (vch)
   return vr
   }
 }
@@ -90,8 +90,8 @@ block 0 (v0: i32) {
   i64.store qa5 qv4
   qa6 = i64.const 17584
   i64.store qa6 qv4
-  vch = cap.call 6 17 (i64) -> (i32) v0 (qa0)
-  vr = cap.call 6 1 (i32) -> (i64) v0 (vch)
+  vch = call.cap 6 17 (i64) -> (i32) v0 (qa0)
+  vr = call.cap 6 1 (i32) -> (i64) v0 (vch)
   return vr
   }
 }
@@ -136,7 +136,7 @@ block 0 (v0: i32, v1: i64) {{
   i64.store qa5 qv4
   qa6 = i64.const 17584
   i64.store qa6 qv4
-  vch = cap.call 6 17 (i64) -> (i32) v0 (qa0)
+  vch = call.cap 6 17 (i64) -> (i32) v0 (qa0)
   vz = i32.const 0
   vneg = i32.lt_s vch vz
   br_if vneg 1(vch) 2(v0, vch)
@@ -146,7 +146,7 @@ block 1 (ve: i32) {{
   return vr
 }}
 block 2 (vi2: i32, vch2: i32) {{
-  vr = cap.call 6 1 (i32) -> (i64) vi2 (vch2)
+  vr = call.cap 6 1 (i32) -> (i64) vi2 (vch2)
   return vr
   }}
 }}

@@ -1,5 +1,5 @@
 //! PROCESS.md S2 (JIT parity) — `Instantiator.instantiate_named` (op 11) on the **JIT**: a **multi-cap
-//! grant list** re-granted into a §14 child **by name**, discovered with `cap.self.resolve` (the
+//! grant list** re-granted into a §14 child **by name**, discovered with `self.resolve` (the
 //! general form of op 8's single positional grant). The interpreter has done this since S2
 //! (`instantiate_named.rs`); this pins the JIT to the same observable behavior.
 //!
@@ -7,8 +7,8 @@
 //! `temen_run::grant_named_child_build`: it reads the guest's `grants_n` 16-byte records
 //! `{name_off, name_len, handle, flags}` from the parent window and re-grants each copyable handle
 //! under its name (via the shared `Host::spawn_named_child`), so both backends register the same names
-//! against the same shared sinks. The child then finds each cap by `cap.self.resolve` — which lowers to
-//! the run's `cap.call` thunk with the child host as ctx, so name resolution works unchanged.
+//! against the same shared sinks. The child then finds each cap by `self.resolve` — which lowers to
+//! the run's `call.cap` thunk with the child host as ctx, so name resolution works unchanged.
 
 #[path = "support/grant_hooks.rs"]
 mod grant_hooks_mod;
@@ -101,8 +101,8 @@ block 0 (vinst: i32, vout: i32, verr: i32) {
   i64.store q0a5 q0v4
   q0a6 = i64.const 1200
   i64.store q0a6 q0v5
-  vch = cap.call 6 17 (i64) -> (i32) vinst (q0a0)
-  r = cap.call 6 1 (i32) -> (i64) vinst (vch)
+  vch = call.cap 6 17 (i64) -> (i32) vinst (q0a0)
+  r = call.cap 6 1 (i32) -> (i64) vinst (vch)
   return r
   }
 }
@@ -128,12 +128,12 @@ block 0 (vci: i64) {
   a5 = i64.const 5
   i32.store8 a5 ct
   len6 = i64.const 6
-  hout = cap.self.resolve a0 len6
+  hout = self.resolve a0 len6
   a16 = i64.const 16
   cO = i32.const 79
   i32.store8 a16 cO
   one = i64.const 1
-  wo = cap.call 0 1 (i64, i64) -> (i64) hout (a16, one)
+  wo = call.cap 0 1 (i64, i64) -> (i64) hout (a16, one)
   a32 = i64.const 32
   i32.store8 a32 cs
   a33 = i64.const 33
@@ -146,11 +146,11 @@ block 0 (vci: i64) {
   i32.store8 a36 cr
   a37 = i64.const 37
   i32.store8 a37 cr
-  herr = cap.self.resolve a32 len6
+  herr = self.resolve a32 len6
   a40 = i64.const 40
   cE = i32.const 69
   i32.store8 a40 cE
-  we = cap.call 0 1 (i64, i64) -> (i64) herr (a40, one)
+  we = call.cap 0 1 (i64, i64) -> (i64) herr (a40, one)
   v7 = i64.const 7
   return v7
   }

@@ -40,8 +40,8 @@ block 0 (v0: i32) {
   i64.store q0a5 q0v4
   q0a6 = i64.const 1200
   i64.store q0a6 q0v4
-  vch = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
-  vr = cap.call 6 1 (i32) -> (i64) v0 (vch)
+  vch = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
+  vr = call.cap 6 1 (i32) -> (i64) v0 (vch)
   return vr
   }
 }
@@ -52,7 +52,7 @@ block 0 (v0: i64, v1: i64) {
   i32.store8 va vm
   vuo = i64.const 16384
   vul = i64.const 16384
-  vur = cap.call 5 1 (i64, i64) -> (i64) v1 (vuo, vul)
+  vur = call.cap 5 1 (i64, i64) -> (i64) v1 (vuo, vul)
   vlu = i32.load8_u vuo
   vrv = i64.extend_i32_u vlu
   return vrv

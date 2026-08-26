@@ -168,13 +168,13 @@ func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
   v2 = i64.const 200
   v3 = i64.const 4
-  v4 = cap.call 8 0 (i64, i64) -> (i64) v1 (v2, v3)
+  v4 = call.cap 8 0 (i64, i64) -> (i64) v1 (v2, v3)
   v5 = i64.extend_i32_s v1
   v6 = i64.const 0
   v7 = i64.const 65536
   v8 = i64.const 16
-  v9 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v5, v4, v7, v8, v6)
-  v10 = cap.call 6 1 (i32) -> (i64) v0 (v9)
+  v9 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v5, v4, v7, v8, v6)
+  v10 = call.cap 6 1 (i32) -> (i64) v0 (v9)
   return v10
   }
 }
@@ -202,8 +202,8 @@ block 0 (v0: i32, v1: i32) {
   v3 = i64.const 0
   v4 = i64.const 65536
   v5 = i64.const 16
-  v6 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
-  v7 = cap.call 6 1 (i32) -> (i64) v0 (v6)
+  v6 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
+  v7 = call.cap 6 1 (i32) -> (i64) v0 (v6)
   return v7
   }
 }
@@ -248,7 +248,7 @@ block 0 (v0: i32, v1: i32) {
   v3 = i64.const 0
   v4 = i64.const 65536
   v5 = i64.const 12
-  v6 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
+  v6 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
   v7 = i64.extend_i32_s v6
   return v7
   }
@@ -270,7 +270,7 @@ block 0 (v0: i32, v1: i32) {
   v3 = i64.const 0
   v4 = i64.const 65536
   v5 = i64.const 16
-  v6 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
+  v6 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
   v7 = i64.extend_i32_s v6
   return v7
   }

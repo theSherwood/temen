@@ -217,7 +217,7 @@ the out-of-band stack buy — not "the verifier makes it safe."
   frontend resolves C UB" (§3b) is a correctness concern; **I4 totality is enforced
   by the verifier + IR semantics regardless of frontend intent.**
 - **The adversary controls:** the IR (any verifier-passing module), all window
-  memory (arbitrary reads/writes), the timing/sequencing of `cap.call`s, and
+  memory (arbitrary reads/writes), the timing/sequencing of `call.cap`s, and
   concurrency/data races.
 - **The adversary does *not* control:** the generated machine code, the out-of-band
   control stack, or the handle table (all host-owned).
@@ -381,12 +381,12 @@ index.** The split is defined by what a forged value can do:
   (§7). You populate the table only by grant, attenuation, or capability-call
   result — there is no opcode that *adds an entry* from plain data — but the
   *index* itself is ordinary forgeable data. The `handle<I>`/`funcref<Sig>` type is
-  what the verifier tracks so `cap.call`/`call_indirect` are statically typed; it
+  what the verifier tracks so `call.cap`/`call.dyn` are statically typed; it
   is **not** a claim that the value is unforgeable. (This supersedes earlier
   "sealed class / no forge opcode" language: the security comes from the table
   holding only granted authority, so we do **not** rely on sealing the index.)
   - **C function pointers** lower to exactly this: an integer index into the
-    function table, dispatched by `call_indirect` with a runtime type check.
+    function table, dispatched by `call.dyn` with a runtime type check.
     Forging confines to your own table (cannot reach host code). The standard wasm
     limitations follow — funcptr↔dataptr casts and funcptr arithmetic don't carry
     meaning across the boundary — and are accepted (§3b lowering notes).
@@ -463,7 +463,7 @@ function body is independently verifiable + compilable (lazy/parallel JIT).
 + address operand (masking is implicit semantics, JIT-inserted); C11 atomics (§12);
 control terminators (branch / cond-branch / br_table / return / tail-call / trap /
 stack-switch). **Multi-result instructions** allowed (multi-return calls). Capability
-invocation: `cap.call (handle, op-index, args…)` → handle type + op-index resolve
+invocation: `call.cap (handle, op-index, args…)` → handle type + op-index resolve
 the signature from the type section. Stack-switching = control opcodes over a typed
 continuation value (§12).
 
@@ -535,14 +535,14 @@ security — UB in a sandbox IR would void the escape guarantee.
   exchange cmpxchg` at orderings; `fence`; `wait`/`notify` (futex). *(**Implemented**
   (Phase-4 concurrency, ahead of the original plan): in the IR, interpreter, and JIT,
   alongside the `cont.*` fiber and `thread.spawn`/`thread.join` primitives — see §12, D56.)*
-- **Calls** (produce results): `call <func>`, `call_indirect <funcref>` (typed;
-  static check, runtime check only for dynamic dispatch), `cap.call <handle>
+- **Calls** (produce results): `call <func>`, `call.dyn <funcref>` (typed;
+  static check, runtime check only for dynamic dispatch), `call.cap <handle>
   <op-index>` (handle type + op-index → signature; async/sync per the operation).
 - **Select:** `select <cond> <a> <b>` (branchless, same-typed).
 - **Terminators** (exactly one per block): `br <blk>(args)`, `br_if <cond>
   <then>(args) <else>(args)` (two-target, no implicit fallthrough), `br_table
   <idx>[<blk>(args)…]<default>(args)`, `return(vals)`, `return_call` /
-  `return_call_indirect` (tail calls), `trap` / `unreachable`.
+  `return_call.dyn` (tail calls), `trap` / `unreachable`.
 - **Deferred to their sections:** SIMD vector ops (§17), stack-switch terminators
   for fibers/continuations (§12 — MVP is single-fiber, so stubbed).
 
@@ -608,10 +608,10 @@ Single fused decode+verify forward pass, O(module size):
    (no implicit coercion); result type(s) appended per opcode.
 4. **Branches:** target in range; branch-arg count + types = target block's declared
    parameter types, exactly.
-5. **Calls:** arg count/types = callee signature; `call_indirect` funcref type
-   matches; `cap.call` op-index in range and arg types = the operation signature.
+5. **Calls:** arg count/types = callee signature; `call.dyn` funcref type
+   matches; `call.cap` op-index in range and arg types = the operation signature.
 6. **Capability typing (not sealing):** `handle<I>`/`funcref<Sig>` are tracked as
-   *types* so `cap.call`/`call_indirect`/attenuation ops are statically checked, but
+   *types* so `call.cap`/`call.dyn`/attenuation ops are statically checked, but
    the *value* is an ordinary forgeable table index (D37). The verifier does **not**
    try to prove indices unforgeable — it checks index-carrying opcodes are
    well-typed and that static indices are in range; runtime bounds- + type-checks
@@ -653,8 +653,8 @@ at *use* or by *out-of-band storage*:
 | Escape vector | Confined by |
 |---|---|
 | memory access | bounds check of final effective address, trap out-of-window (§4) — use-site |
-| indirect call `call_indirect` | function-table bounds + type check — use-site |
-| capability call `cap.call` | handle-table bounds + type + liveness, **host-owned table** — use-site |
+| indirect call `call.dyn` | function-table bounds + type check — use-site |
+| capability call `call.cap` | handle-table bounds + type + liveness, **host-owned table** — use-site |
 | direct call / branch | static targets, verifier-checked — no runtime value |
 | **return** | out-of-band control stack (§5) — not guest-addressable at all |
 
@@ -670,7 +670,7 @@ use-site checks, not value sealing.
 ### Function table
 **Contents:** exactly the domain's own functions (domain-global indices across all
 linked modules, §13/§14, assigned at instantiation/link). There are **no imported
-host functions** (§7: all host access is `cap.call`), so `call_indirect` cannot
+host functions** (§7: all host access is `call.cap`), so `call.dyn` cannot
 leave guest code and carries **zero host authority** — pure intra-guest control flow.
 
 **Representation** — flat, power-of-two-padded, **AoS** (the two fields are always
@@ -682,7 +682,7 @@ fn_table: [FnEntry; pow2]                           // indexed by function index
 - `funcref<Sig>` value = a function index (a plain integer).
 - `ref.func <funcidx>` → `funcref<Sig_funcidx>` (the index; direct, no check).
 - `call <funcidx>(args)` → fully static direct call (verifier checks funcidx + types).
-- `call_indirect <Sig>(fref, args)` — **always runtime-checks** (D38, wasm parity;
+- `call.dyn <Sig>(fref, args)` — **always runtime-checks** (D38, wasm parity;
   JIT devirtualization is a later optimization, not MVP):
   ```
   i = fref & (len-1)                  // mask, not branch → Spectre-v1 safe table load
@@ -696,7 +696,7 @@ ordinary integer ops in guest memory — **no `table.set/get/grow` needed** (a m
 array of function pointers is just an array of indices in guest memory). Accepted
 casualties (standard wasm): function-pointer *arithmetic*, and casting a *data*
 pointer into a callable funcref (a guest-internal JIT) — the latter simply traps at
-`call_indirect`, which is correct for a sandbox. **Deferred:** mutable/growable
+`call.dyn`, which is correct for a sandbox. **Deferred:** mutable/growable
 function tables and `table.*` opcodes — add only if a language demands them.
 
 ### Handle table (the powerbox)
@@ -711,7 +711,7 @@ struct HandleEntry {
 }
 handle_table: [HandleEntry; pow2]   // per domain, shared across its threads
 ```
-**`cap.call <op_index>(h, args)`** — `op_index` is an immediate and the handle's
+**`call.cap <op_index>(h, args)`** — `op_index` is an immediate and the handle's
 interface `I` is the static type (so the *signature* is static); the dispatch
 **target is per-entry** (D45):
 ```
@@ -726,16 +726,16 @@ Consequences:
   implementations — one per handle (the powerbox's `stdout` and a plugin's `stdout`
   are both `handle<Stream>` yet dispatch to different host code), and §14 *requires*
   this: a capability may be **pass-through** or **parent-virtualized**, and the child
-  can't tell which. So the general `cap.call` is an **indirect** call through the
-  entry's vtable (retpoline / eIBRS, like `call_indirect`, §9). The JIT
+  can't tell which. So the general `call.cap` is an **indirect** call through the
+  entry's vtable (retpoline / eIBRS, like `call.dyn`, §9). The JIT
   **devirtualizes** it to a direct, inline-able call (§9's "inline-able to ~free")
   when it can prove the binding — e.g. a powerbox import never reassigned — exactly
-  the optimization deferred for `call_indirect`. Cross-domain / slow capabilities are
+  the optimization deferred for `call.dyn`. Cross-domain / slow capabilities are
   just a vtable whose entries are trampoline stubs (marshal to supervisor / ring
   submit, §9).
   - **Devirtualization is deferred, and the cost of doing it is the reason (not just
-    laziness).** Today `cap.call` lowers to one fixed generic host thunk: marshal args
-    into an `i64` slot array, `call_indirect` the thunk, and the **host** does the
+    laziness).** Today `call.cap` lowers to one fixed generic host thunk: marshal args
+    into an `i64` slot array, `call.dyn` the thunk, and the **host** does the
     mask + `type_id` + `generation` resolve — the JIT does *no* authority work, so its
     role carries no authority-TCB. Devirtualizing pulls binding-resolution and
     check-elision *into* the escape/authority-TCB codegen, where a miscompile is an
@@ -750,7 +750,7 @@ Consequences:
     addresses only *half* the measured cost — the generic `i64`-array arg ABI is separate,
     and an arbitrary **Rust** handler can't be inlined into CLIF, so the realistic ceiling
     is "direct call + register args (~parity)," not free. **Measured (`bench/` hostcall):
-    scalar `cap.call` is ~1.24× a wasm import today; the defensible §1a interface win —
+    scalar `call.cap` is ~1.24× a wasm import today; the defensible §1a interface win —
     the zero-copy borrow buffer (`hostbuf`, ~1.8× *faster*) — needs none of this.** Revisit
     only if a real workload makes scalar host-call latency a measured bottleneck (D45).
   - **Update — D45 now implemented (opt-in), and it cleared the TCB concern above.** An optional
@@ -761,7 +761,7 @@ Consequences:
     `Host::cap_dispatch_slots`* the generic thunk uses, so the I2 `resolve` (mask + `type_id` +
     `generation`) is unchanged — devirtualization moves only the *boundary* (register args, no
     runtime `(type_id, op)` dispatch), never the authority check. The resolver is gated on arity
-    (`n_args`/`n_res`) so an odd-signature `cap.call` can't C-ABI-mismatch the fn. The production
+    (`n_args`/`n_res`) so an odd-signature `call.cap` can't C-ABI-mismatch the fn. The production
     powerbox (`temen-run`) fast-paths the window-independent hot op (`Clock.now`; `Blocking.work`
     rode the same path until the mock left the product powerbox — CONSOLIDATION §5a).
     **Measured: hostcall ~1.24×→ ≈0.67× (≈1.5× *faster* than a Wasmtime import)** — the register-ABI
@@ -776,7 +776,7 @@ Consequences:
 **Attenuation needs no new IR.** `subdir`, `readonly`, `Connector`-narrowing, etc.
 are simply **interface operations whose result type is a handle**: the host allocates
 a new, more-restricted entry in the *caller's* handle table and returns its index.
-Since `cap.call` results can already be handle-typed, attenuation and the initial
+Since `call.cap` results can already be handle-typed, attenuation and the initial
 powerbox (instantiation fills the first N entries, §3b) reuse the existing mechanism
 — zero extra surface.
 
@@ -786,8 +786,8 @@ against the window before the host borrows it in place (§9's "arg bounds-check"
 
 ### Verifier delta
 - `ref.func f`: `f` in range → result `funcref<Sig_f>`.
-- `call_indirect Sig`: operand `funcref`; args match `Sig` params; results = `Sig` results.
-- `cap.call op_index`: operand `handle<I>`; `op_index < I.op_count` (static, type
+- `call.dyn Sig`: operand `funcref`; args match `Sig` params; results = `Sig` results.
+- `call.cap op_index`: operand `handle<I>`; `op_index < I.op_count` (static, type
   section); args/results match `I.ops[op_index]` (results may be handle/funcref-typed).
 - int↔funcref and int↔handle conversions allowed (plain-data-like) — use-site checks
   carry safety.
@@ -803,8 +803,8 @@ tag at a *fixed* offset, index at the bottom, an optional generation between:
 | Kind | carried width | generation | index/payload | tag cost |
 |---|---|---|---|---|
 | **data pointer** | i64 | — | window offset (≤ `reserved_log2` < 56) | none — masking already strips high bits (the `gc.roots` top-byte mask, §21) |
-| **funcref** | i64 | — | function-table index | none — no generation; `call_indirect` masks `& (len-1)` |
-| **import/cap handle** | **i32** | 24 bits | 8-bit slot (`CAP_LOG2`) | none — the handle lives in the low 32 bits of a 64-bit tagged cell; `cap.call` truncates to `i32`, dropping the top byte |
+| **funcref** | i64 | — | function-table index | none — no generation; `call.dyn` masks `& (len-1)` |
+| **import/cap handle** | **i32** | 24 bits | 8-bit slot (`CAP_LOG2`) | none — the handle lives in the low 32 bits of a 64-bit tagged cell; `call.cap` truncates to `i32`, dropping the top byte |
 | **fiber/thread handle** | i64 | **32 bits** (was 40) | 24-bit slot (`MAX_FIBERS=1<<24`) | generation trimmed 40→32 to vacate the top byte |
 
 Three properties make this coherent rather than four ad-hoc conventions:
@@ -972,7 +972,7 @@ discoverability") — a host adds new capabilities the same way the runtime prov
 these.
 
 ### Shared conventions
-- **Invocation:** `cap.call <handle> <op-index> args… → results` (§3c); each
+- **Invocation:** `call.cap <handle> <op-index> args… → results` (§3c); each
   interface is a fixed numbered method table; op-index + interface type are static,
   so the handler is a compile-time-constant direct call.
 - **Args (§7 calling convention):** scalars in registers; **buffers as
@@ -1384,7 +1384,7 @@ domain's egress = the transitive closure of its granted capabilities).
   backends already emit — so C/Rust/non-OO toolchains target it with no
   impedance mismatch.
 
-### Host-defined capabilities & discoverability  [SETTLED] (late binding + `cap.self` reflection SETTLED; runtime `Resolver` = host-layer)
+### Host-defined capabilities & discoverability  [SETTLED] (late binding + `self.*` reflection SETTLED; runtime `Resolver` = host-layer)
 The set of capabilities is **open and host-extensible by construction** — the VM,
 verifier, and TCB enumerate *no* fixed list. The §3e MVP four are ordinary
 instances of this mechanism. A capability interface is just **data + host code**:
@@ -1392,7 +1392,7 @@ instances of this mechanism. A capability interface is just **data + host code**
 - **Interface signature** — an ordered list of op signatures (params/results in IR
   types; a result may be `handle<…>`/`funcref<…>` for attenuation). It lives in the
   **guest module's own type section** (§3a), so the verifier statically type-checks
-  every `cap.call` with zero host knowledge — self-contained and verifiable.
+  every `call.cap` with zero host knowledge — self-contained and verifiable.
 - **Implementation** — a method table (vtable, §3c) of handler pointers registered
   **host-side**, entirely outside the guest/verifier/TCB.
 
@@ -1428,10 +1428,10 @@ something new is a capability**:
   (fixed once instantiation completes), so the §9 egress closure is unaffected — only the
   *binding* moved from compile-time to instantiation-time. The **same named-import mechanism
   generalizes to cross-unit linking** — a name may bind to another function (a direct `call`) or a
-  table slot (`call_indirect`), not only a capability — which is how in-window dynamic linking
+  table slot (`call.dyn`), not only a capability — which is how in-window dynamic linking
   (`vm_dlopen`) works; see §22.
 
-- **Reflection = an always-available intrinsic** (`cap.self`), read-only over the domain's
+- **Reflection = an always-available intrinsic** (`self.*`), read-only over the domain's
   **own** handle table: it returns the count and, per live entry, the `type_id` + op-schema
   of the capabilities **this domain has actually been granted**. This is *not* ambient
   authority and does **not** void §9: reflecting the held set confers nothing (the guest
@@ -1446,11 +1446,11 @@ something new is a capability**:
   leak. The boundary is sharp: enumerating **your own** granted set is fine; there is still
   **no "list everything the host could offer" call** — *that* would be ambient authority.
 
-  *Naming the two `cap.self` families* (CONSOLIDATION §7): the op space today holds
+  *Naming the two `self.*` families* (CONSOLIDATION §7): the op space today holds
   **reflection** (`count`/`get`/`resolve`/`label`/`attest`/`provenance`/`type_id`/`covers` —
   the read-only, authority-neutral intrinsic this section defines) and the **domain-runtime
   verbs** (`svc.*`, `clone_caller`, `fuel.remaining` — operations *on the current domain's
-  runtime*, not reads of its grant table). The verbs live under `cap.self` only because it
+  runtime*, not reads of its grant table). The verbs live under `self.*` only because it
   was the op space needing no wire change when they landed, not because they are reflection.
   Keep the families distinct in prose and docs; an actual op-space split is deliberately
   deferred to a wire rev that happens anyway (same policy as `call.sym`'s vestigial handle
@@ -1704,7 +1704,7 @@ requirement.
   self-describing format; designed later, above the VM layer.
 - **Runtime acquisition `Resolver`** (§7, host-layer — not built): optional
   `lookup(name) -> handle` registry; host-layer, outside the TCB; not ambient
-  authority. (Late binding at instantiation and the always-available `cap.self`
+  authority. (Late binding at instantiation and the always-available `self.*`
   *reflection* intrinsic are now SETTLED in §7 — only runtime *acquisition* of a
   not-yet-held capability remains a deferred host-layer feature.)
 - **MTE** (§10): optional probabilistic intra-guest detection in the §5 hardened
@@ -1890,7 +1890,7 @@ io_uring for real file/net caps; a JS event on the browser tier). Batching belon
 stays sync.
 
 **Fiber-park promotion (landed 2026-08-07; the FIBER_PARK arc — slices F1–F4 in git history).**
-A punted host call **inside a fiber** parks the FIBER, not the vCPU: the `cap.call` unwinds
+A punted host call **inside a fiber** parks the FIBER, not the vCPU: the `call.cap` unwinds
 `FIBER_PARKED (3)` to its resumer — the §3.6 slice-5a contract `memory.atomic.wait` already
 follows, extended to `Pending` — the pool completion wakes the fiber, and the next resume
 delivers the scalar. One vCPU, two fibers: submit, park, run the other, resume on completion —
@@ -2027,10 +2027,10 @@ the animated transport for library instances is kept on purpose; see below.
 
 ### The semantics (backend-neutral)
 
-> A `cap.call` through an offer **runs that op's handler over the provider's world** and
+> A `call.cap` through an offer **runs that op's handler over the provider's world** and
 > returns its results to the calling fiber. If the handler blocks, the caller waits.
 
-- **Every call is synchronous from the guest's perspective** — `cap.call` in, results out. No
+- **Every call is synchronous from the guest's perspective** — `call.cap` in, results out. No
   futures, promises, or completion tokens in the guest ABI; "sync vs async" is a *transport*
   distinction, never a semantic one.
 - **Every cross-domain call mints a handler fiber in the callee's world.** Who runs that fiber
@@ -2171,7 +2171,7 @@ The child cannot tell whether a capability is real or parent-emulated — the
 interface is identical. There is no "am I nested?" query by default — a
 virtualized capability stays indistinguishable from the real one. A domain may,
 however, **opt in** to one platform-vouched provenance report via
-`cap.self.attest` (§6 of `PROCESS.md`): a `cap.self` intrinsic is a D46
+`self.attest` (§6 of `PROCESS.md`): a `self.*` intrinsic is a D46
 runtime-resolved primitive, never a handle, so no nested host can interpose or
 forge it — the one report a hostile parent cannot fake. This is the deliberate,
 narrow exception to "no nesting query": self-protection from a hostile nested
@@ -2278,7 +2278,7 @@ writes the unit instance's global before `f0`). A window state the scalar cannot
 sparse grow, a non-RW mapping — **declines** emitted execution for that call and interprets it
 instead (tier-up falls through at the dispatch; an invoke uses the interpreted delivery), so
 emitted code never runs over a state it would mis-admit; the map-containing function itself is
-never emitted either (a remapping `cap.call` is not in-subset). `tierup_grow_window.rs` and
+never emitted either (a remapping `call.cap` is not in-subset). `tierup_grow_window.rs` and
 `jit_grow_window.rs` are the differential proofs, both directions plus the decline arms, with the
 unsynced divergences pinned as negative tests. The **page-state** axis stays fail-closed as above.
 The `& MASK` clamp to `reserved` is unchanged, so a wrong live size is only a trap-parity
@@ -2286,7 +2286,7 @@ divergence, never an escape. The escalation past emit-nothing — a per-access *
 **landed dark** as the strictly opt-in paged entry (#750, `compile_module_tierup_paged`): every
 confined access in a paged module also consults a host-maintained byte-per-page state table
 (`Unmapped`/`Rw`/`Ro`; base in the exported `"pagestate"` global, refreshed per emitted call from
-`Mem::map_info` — page state is frozen while emitted code runs, since page ops are `cap.call`s
+`Mem::map_info` — page state is frozen while emitted code runs, since page ops are `call.cap`s
 that never emit and never hide in a cross-tier leaf), first and last touched page, trapping through
 the existing fault seam exactly where `check_prot` would. The driver writes the table's coverage to
 `"mapped"`, so the bound check traps everything above it — the two checks compose. Paged-mode
@@ -2465,7 +2465,7 @@ IR v128 and cleanly rejects what it can't map (`Unsupported`), its existing stan
   client; AVX10 mid-consolidation), and many vector kernels are memory-bandwidth-bound
   where width buys ~0. **The higher-ROI homes for width-hungry work are elsewhere:**
   *(a)* a **host-provided vectorized capability** (`dot`/`gemm`/`memcpy`/crypto/codec the
-  host implements with its own tuned AVX-512, invoked via `cap.call` + a zero-copy
+  host implements with its own tuned AVX-512, invoked via `call.cap` + a zero-copy
   `(ptr,len)` borrow, §7/§13) — guest stays portable + sandboxed, host owns the
   fast/unsafe SIMD, zero backend cost to us, the project's exact grain; *(b)* the **GPU
   broker** (below) for genuinely throughput-bound dense numerics. **Revisit trigger:
@@ -2525,7 +2525,7 @@ browser — good enough here.
 
 ---
 
-## 19. Debugging & observability  [PARTIALLY BUILT — interpreter stepping + DAP + memory-access hooks shipped; DWARF & cap.call record/replay staged]
+## 19. Debugging & observability  [PARTIALLY BUILT — interpreter stepping + DAP + memory-access hooks shipped; DWARF & call.cap record/replay staged]
 
 > **Work-breakdown & detailed designs:** `DEBUGGING.md` (workstreams W1–W8, sequencing,
 > open decisions). This section stays the canonical *rationale*; that doc is the *plan*.
@@ -2543,13 +2543,13 @@ single-step, backtrace, watchpoints over the masked window) and an **IR debug-in
 (W4) that carries source locations + named locals, consumed by an **interpreter-backed Debug
 Adapter Protocol server** (`temen-dap`, W5 slice 1; `DEBUGGING.md`) — so a client (VS Code) sets a
 source-line breakpoint, it binds, and hitting it shows the source frame with inspectable locals,
-with no DWARF and no JIT in the loop. **Still staged:** the `cap.call` record/replay log (pillar 1)
+with no DWARF and no JIT in the loop. **Still staged:** the `call.cap` record/replay log (pillar 1)
 and source-level **DWARF for JIT-compiled code** (pillar 4's full form). So pillars 2–4 are
 realized in their interpreter-tier form; the DWARF/record-replay work remains.
 
 1. **Record/replay & time-travel — nearly free *in deterministic mode*, a genuine
    differentiator.** With no ambient authority (§7), guest nondeterminism enters through
-   capabilities; logging `cap.call` inputs/outputs and seeding the deterministic mode (§12)
+   capabilities; logging `call.cap` inputs/outputs and seeding the deterministic mode (§12)
    yields a fully **replayable** trace — the capability boundary *is* the recording boundary.
    Time-travel (step backward) follows from deterministic replay to any prior point.
    **Caveat (inherited from §12):** "all nondeterminism via capabilities" holds *only in
@@ -2557,7 +2557,7 @@ realized in their interpreter-tier form; the DWARF/record-replay work remains.
    work-stealing fibers — §12/§23) shared-memory **race outcomes** are a nondeterminism source
    that bypasses the capability boundary, so faithful replay there must also record schedule +
    memory-order choices — exactly what the interpreter's DPOR `explore_all` already reifies (a
-   stronger substrate than plain seed-replay). The `cap.call` I/O log itself is not yet built.
+   stronger substrate than plain seed-replay). The `call.cap` I/O log itself is not yet built.
 2. **Trustworthy backtraces even after corruption — integrity free, materialization cheap.**
    The out-of-band control stack (D5/§5, now built) holds return addresses the guest cannot
    forge or smash, so a corrupted in-window data stack cannot destroy the trace — the inverse
@@ -2595,7 +2595,7 @@ access, and optionally **veto** it (a backend-identical trap). The two motivatin
 **memory-safety validation** and an **educational platform** that estimates cache misses / page
 faults from the access trace to score student programs. The hard constraint is **zero cost for
 programs that don't opt in**, met *structurally*: hooks are an **IR-to-IR instrumentation pass**
-(`temen-opt`) that inserts a `cap.call` before each memory op and re-verifies (fail-closed, §2a) —
+(`temen-opt`) that inserts a `call.cap` before each memory op and re-verifies (fail-closed, §2a) —
 the engines are untouched, so an un-hooked module is byte-identical, and a hooked module runs on
 all three backends with an event stream **identical by the §3 parity invariant** (the JIT
 included, with no change to the §4 masking lowering). Like the `Inspector`, a hook is a host-side
@@ -2728,7 +2728,7 @@ for free** (weval's value proposition for SpiderMonkey, applied here).
     stays dynamic has its **CFG inlined as residual blocks** — the context's call stack carries the
     caller's live values through the callee (dead ones cleaned by the optimizer) and each `return`
     becomes a branch to the continuation. Loops and `unreachable` in the callee work; one residual
-    function still comes out. A constant-index `call_indirect`/`ref.func` resolves through the
+    function still comes out. A constant-index `call.dyn`/`ref.func` resolves through the
     identity table and inlines too. (Indirect-dynamic/host calls are not inlined.)
   - **Outlining (residual-call mode, opt-in).** Instead of inlining, each `(callee, arg pattern)`
     can be specialized to its own residual function (memoized/shared) and called — a multi-function
@@ -2763,7 +2763,7 @@ for free** (weval's value proposition for SpiderMonkey, applied here).
   only in range and is otherwise kept so it still traps); static + dynamic branches; any-width
   constant-memory reads; renamed stack/locals (word **and** narrow `i8`/`i16` cells, with a dynamic
   heap alongside); cross-function `call` inlining — direct **and** constant-index
-  `call_indirect`/`return_call_indirect`/`ref.func` (resolved through the identity module-0 table) —
+  `call.dyn`/`return_call.dyn`/`ref.func` (resolved through the identity module-0 table) —
   with static + dynamic control flow, recursion, and loops; and opt-in **outlining** (specialize a
   callee to a shared residual function, for dynamic-depth recursion / bounded size); **and the
   guest-side, in-sandbox engine** (above). **Remaining enhancement (not a gap):** the **exotic SIMD
@@ -2776,7 +2776,7 @@ for free** (weval's value proposition for SpiderMonkey, applied here).
 Consolidates what §9/§12/§14 imply but never state in one place: **how synchronous the
 host/guest (and guest/guest-as-host) boundary is.**
 
-- **One call shape, and it is synchronous.** `cap.call` produces a result (§3b); the MVP caps
+- **One call shape, and it is synchronous.** `call.cap` produces a result (§3b); the MVP caps
   return a synchronous negative-errno `i64` (D42). There is no separate "async instruction."
   **So host↔guest can be entirely synchronous — that is the default.**
 - **"Async" is a construction *on top*, not a second mechanism.** The §12 async-first ABI
@@ -2790,13 +2790,13 @@ host/guest (and guest/guest-as-host) boundary is.**
 - **Nesting (§14):** a child capability resolves at grant time to a **pass-through** (one hop
   to the ultimate handler, zero added cost at any depth) or the **parent's own handler**
   (parent virtualizing). A virtualized op runs **synchronously on the child's calling
-  fiber** — child `cap.call` → trampoline → parent handler → return — composing to any depth.
+  fiber** — child `call.cap` → trampoline → parent handler → return — composing to any depth.
 
 **The governing principle:**
 
 > **Synchrony is interface-guaranteed; cost is host policy the guest cannot observe.**
 
-`cap.call` is always synchronous in *shape*, and the child "cannot tell whether a capability
+`call.cap` is always synchronous in *shape*, and the child "cannot tell whether a capability
 is real or parent-emulated" (§14). Only the *realized cost* differs, gated by **isolation
 tier**, not by the interface:
 
@@ -2836,14 +2836,14 @@ ASLR (the precise meaning of "survive a recompile" is narrower than it sounds �
 embedder running pre-instrumented modules links neither into the escape-TCB):
 
 - **`temen-durable` — the IR→IR freeze/thaw transform.** It instruments a function so an in-flight
-  may-suspend op (a `cap.call`, or a `Call` into a suspended chain) can be **unwound** into
+  may-suspend op (a `call.cap`, or a `Call` into a suspended chain) can be **unwound** into
   guest-resident shadow state and later **rewound** back into execution, byte-for-byte. The codec is
   pure IR — *no new instruction*: a state word (`NORMAL | UNWINDING | REWINDING`) + a per-fiber
   **shadow stack**, both in the window; unwind spills the live set + a resume id and returns out to
   the host; rewind `br_table`s on the saved resume id in the prologue, reloads the live values, and
   continues. The IR shape pays off here — a continuation block's `params` *are* the resume-point live
   set, so liveness is free and the verifier still does one linear pass. Handles arbitrary single-vCPU
-  CFGs (branches, loops, joins), leaf `cap.call`s, and propagated call chains (re-issue vs. continue).
+  CFGs (branches, loops, joins), leaf `call.cap`s, and propagated call chains (re-issue vs. continue).
 - **`temen-snapshot` — the snapshot artifact codec.** (De)serializes a quiesced durable domain into a
   backend-independent, recompile-survivable artifact and back. A frozen domain is described almost
   entirely by its **window image** (shadow stack, spilled live values, state word are all
@@ -2892,8 +2892,8 @@ cleanly, because the submit-a-blob boundary already exists and **the verifier is
 trust hinge for exactly this**. **Built and merged on both backends, differentially identical**
 (`crates/temen/tests/jit_cap.rs`, `jit_incremental.rs`, `jit_reentry.rs`, `jit_compaction.rs`).
 
-**Shape (everything crosses `cap.call`, D55).** The guest builds a serialized IR blob (the binary
-`temen-encode` format) in its own window, `cap.call`s a granted **`Jit`** capability with a `(ptr, len)`,
+**Shape (everything crosses `call.cap`, D55).** The guest builds a serialized IR blob (the binary
+`temen-encode` format) in its own window, `call.cap`s a granted **`Jit`** capability with a `(ptr, len)`,
 and the host reads the blob, runs `decode_module` → `verify_module` **plus the memory-match
 precondition** (below), and — only if all pass — Cranelift-compiles it into a long-lived `JITModule`,
 returning a `CompiledCode` handle. Adding the capability needed **no verifier/IR/escape-TCB change** —
@@ -2918,14 +2918,14 @@ for compile-then-sandbox.
 
 ### Capability surface (iface 11)
 
-`cap.call 11 <op> …` on a granted `Jit` domain handle (negative-errno `i64` ABI, D42):
+`call.cap 11 <op> …` on a granted `Jit` domain handle (negative-errno `i64` ABI, D42):
 
 | op | signature | meaning |
 | --- | --- | --- |
 | 0 `compile` | `(ptr, len) -> code \| -errno` | borrow blob, decode+verify+precondition gate, compile into the domain, mint a `CompiledCode` handle. Fail-closed. |
 | 1 `invoke` | `(code, args…) -> results` | run the unit's entry over the live window (raw i64-slot ABI); a trap is **terminal for the domain** (§5). |
 | 2 `release` | `(code) -> 0 \| -errno` | revoke the handle (generation bump). Code/slots not freed (see reclaim). |
-| 3 `install` | `(code) -> slot \| -errno` | write the unit into the `call_indirect` table's next reserved slot; returns a funcref index (`-ENOSPC` if full). |
+| 3 `install` | `(code) -> slot \| -errno` | write the unit into the `call.dyn` table's next reserved slot; returns a funcref index (`-ENOSPC` if full). |
 | 4 `uninstall` | `(slot) -> 0 \| -errno` | clear an installed slot (reusable; stale calls trap). |
 | 5 `compile_linked` | `(ir, ir_len, symtab, symtab_len) -> code \| -errno` | like `compile`, but the unit may carry **unresolved §7 imports** bound by name against the guest-provided symbol table before verify — the dynamic-linking entry (below). Fail-closed. |
 
@@ -2938,13 +2938,13 @@ auto-compacting REPL driven by `JitSession`; `jit_link.c`/`jit_dlopen.c`/`jit_ho
 ### The one structural obstacle — the baked function-table mask
 
 Dropping the module at end-of-run is *policy*; the real obstacle to incremental compilation is that the
-**function-table mask is baked as a compile-time `iconst` at every `call_indirect` site** (the
+**function-table mask is baked as a compile-time `iconst` at every `call.dyn` site** (the
 Spectre-safe `slot = band(idx, fn_table_mask)` + `type_id` check, invariant I2 — the touchiest
 escape-TCB lowering). Add a function that crosses a power-of-two boundary and every already-compiled
 site holds the stale mask. Two models design *around* it, not through it:
 
 - **Model A (shipped, the default) — sidestep the mask.** A submitted unit is reached through the host
-  `cap.call` thunk, never installed in the shared table, so the mask never moves; incremental
+  `call.cap` thunk, never installed in the shared table, so the mask never moves; incremental
   define/finalize on a live module is a pure Cranelift capability (`cranelift-jit 0.132`). Cross-unit
   hot calls a REPL would pay per-iteration are absorbed by the guest **re-emitting** the callee's IR
   into the new blob (it owns the IR) — a verified *direct* call at native speed, guest policy, invisible
@@ -2952,7 +2952,7 @@ site holds the stale mask. Two models design *around* it, not through it:
 - **Model B2 (shipped, `install`) — neutralize the mask by pre-sizing.** Reserve a fixed power-of-two
   table up front (`table_reserve_log2` / `grant_jit_with_table`, identical on both backends), so the mask
   is constant from `t=0`; only *population* is dynamic (empty slots are `PADDING_TYPE_ID` and trap until
-  filled). An installed unit *is* a funcref — old code `call_indirect`s it at native speed, with no
+  filled). An installed unit *is* a funcref — old code `call.dyn`s it at native speed, with no
   boundary crossing. (B1, a *growable* table that moves base+mask, is rejected — it would edit the
   Spectre-safe dispatch for nothing B2 lacks.)
 
@@ -2961,11 +2961,11 @@ differentially pinned. The reference interpreter matches the JIT's code-pointer 
 **module-aware frames** (`Frame.module`: 0 = the program, ≥1 = an installed unit) dispatching through a
 shared, live `DomainTable`.
 
-**Type identity = an append-only intern, not a linking subsystem.** Cross-unit `call_indirect` is sound
+**Type identity = an append-only intern, not a linking subsystem.** Cross-unit `call.dyn` is sound
 because a single `CompiledModule` owns the domain's entire id space: the map `FuncType → type_id` is an
 **injection, append-only (an id never remaps), and total over participants** (every signature is interned
 before code referencing it is lowered). Given that, id-equality coincides *exactly* with the interpreter's
-structural equality. The registry is consulted only inside a synchronous `cap.call` and is **never read at
+structural equality. The registry is consulted only inside a synchronous `call.cap` and is **never read at
 runtime** — a ~10-line auditable function, zero runtime-readable state. Interning is *cleaner* than a
 frozen parent-anchored universe: a later `install` can satisfy a site whose signature arrived in a later
 unit, matching structural semantics by construction.
@@ -2989,15 +2989,15 @@ top of the intern.
 ops in a submitted unit ("a JIT'd blob stays single-threaded"). That is now split: a submitted unit may
 host **fibers** (`cont.new`/`cont.resume`/`suspend`) — they switch stacks *within* the domain on the
 caller's thread, so a unit that runs its own scheduler to completion never parks across the synchronous
-`cap.call` it runs inside — while **threads** (`thread.spawn`/`join`) and the **futex** (`wait`/`notify`)
-stay rejected (a spawned vCPU would outlive the `cap.call` and collide with the serialized `Mutex<Host>`
+`call.cap` it runs inside — while **threads** (`thread.spawn`/`join`) and the **futex** (`wait`/`notify`)
+stay rejected (a spawned vCPU would outlive the `call.cap` and collide with the serialized `Mutex<Host>`
 path). Fibers add **no escape-TCB surface**: the runtime is the same domain-shared fiber table the parent
 already uses, reached through the existing `invoke_extra` seam; the fault confinement (I1), the memory-match
 precondition, and the data-segment rejection are unchanged. Mechanics: the parent stands up its fiber
 runtime even when it uses no fibers itself (`grant_jit_fibers` → `CompiledModule::enable_fiber_hosting`,
 which builds the table/runtime/`cont.*` thunk env post-compile so a submitted unit's `cont.*` resolve
 `CURRENT_RT`); the shared `jit_resolve_and_validate` admits `cont.*` and rejects only threads/futex on both
-backends; a unit names a fiber entry by table slot (`cont.new <slot>`, new→old like `call_indirect`), and
+backends; a unit names a fiber entry by table slot (`cont.new <slot>`, new→old like `call.dyn`), and
 the reference interpreter resolves it through the module-0 dispatch table in lockstep with the JIT's shared
 `fn_table`. Pinned by `jit_cap::submitted_unit_hosts_a_fiber_agrees` (differential) +
 `submitted_unit_threads_compile_split_by_tier`. On the **wasm-JIT tier** the same fiber allowance holds
@@ -3006,9 +3006,9 @@ by a different mechanism — fibers stay on the interpreter and the emitted regi
 
 **Threads in a submitted unit (renegotiated 2026-08-04, owner-directed — CONSOLIDATION.md §11).** The
 compile-time threads/futex veto above is lifted: the hazard it guarded — a spawned vCPU outliving the
-synchronous `cap.call` — is *invoke*-shaped, and is enforced where it is real: `invoke` of a unit that
+synchronous `call.cap` — is *invoke*-shaped, and is enforced where it is real: `invoke` of a unit that
 spawns/parks still fails at runtime (the nested run is seam-free — anything but a plain return is an
-inert `CapFault`). The supported path is **`install` + `call_indirect`**: installed code executes in
+inert `CapFault`). The supported path is **`install` + `call.dyn`**: installed code executes in
 the calling vCPU's own frames, where `thread.spawn` is an ordinary **module-aware** spawn — the func
 index resolves in the spawning frame's module and the spawned vCPU's root frame starts there
 (`VcpuEvent::Spawn` carries the module; every driver constructs the child from
@@ -3021,7 +3021,7 @@ module 0 — fixed to the spawning frame's module). All tiers now claim this sup
 - **Native Cranelift.** `define_extra` admits a `thread.*`/futex unit once the domain hosts threads
   (`Jit::enable_thread_hosting`, the twin of `enable_fiber_hosting`, driven by a thread-hosting grant
   — `grant_jit_threads` / `Host::set_jit_hosts_threads`); `jit_cap_run` forces the serialized
-  locked-`Host` path (a hosted unit's spawned vCPUs are concurrent `cap.call`ers). A unit's
+  locked-`Host` path (a hosted unit's spawned vCPUs are concurrent `call.cap`ers). A unit's
   `thread.spawn N` dispatches its entry through the shared `fn_table`, so the unit's own functions are
   auto-installed there (the `ref_slots` remap now covers `ThreadSpawn`) — else it would launch the
   *parent's* slot `N`. The invoke seam is enforced at dispatch (`jit_native_op` op-1 /
@@ -3067,7 +3067,7 @@ codegen** (compaction only replays `compile`/`define_extra`/`install` into a fre
 reinstalls a unit at its *exact* old slot (so a held funcref keeps resolving across the swap, including
 around `uninstall` gaps); `extra_byte_count()` is the **byte-accurate** occupancy a watermark watches
 (it restarts near zero in the fresh module — the visible reclaim); `is_running()` is the quiescence guard
-(the guest is suspended *inside* the module during a `cap.call`, so it can never self-trigger compaction).
+(the guest is suspended *inside* the module during a `call.cap`, so it can never self-trigger compaction).
 The embedder driver `recompact_jit` enumerates live units — installed (`installed_slots`) **or** held
 through a live handle (`Host::jit_live_units`) — re-defines each, remaps the `Host` unit→native record
 (handles name `(domain, unit)`, not a code address, so they keep working), and reproduces occupied slots.
@@ -3086,7 +3086,7 @@ release-ordered atomic `FnEntry` writes (same `#[repr(C)]` layout, so `indirect_
 byte-identical). Install *visibility* rides the **guest's own** acquire/release on its ready flag, so a
 worker observes a completed install even on weakly-ordered targets — no dispatch-side acquire needed; the
 atomic `FnEntry` only guarantees a racy reader never sees a *torn* code pointer. **Threaded `compile`**
-works via `temen_run::cap_thunk_locked`, which serializes `cap.call` through a per-domain `Mutex<Host>` so
+works via `temen_run::cap_thunk_locked`, which serializes `call.cap` through a per-domain `Mutex<Host>` so
 concurrent `Jit.compile`s are sound (`define_extra`'s `&mut` is exclusive) **while execution stays fully
 parallel** — the W^X spike proved `ArenaMemoryProvider::finalize` only re-protects *non-finalized*
 segments (executing code, always on a finalized segment, is never touched → no stop-the-world), and i-cache
@@ -3094,7 +3094,7 @@ coherence is cranelift's `clear_cache` + `pipeline_flush_mt`; cranelift *appends
 cross-modifying-code `isb` is needed. The re-entrant "a running unit compiles more" case is handled by
 releasing the lock around `Jit.invoke`. The locked thunk engages **only for concurrent modules**
 (`Func::uses_concurrency`); single-threaded runs keep the unlocked fast path at zero lock cost, and the
-guest `cap.call 11` iface is unchanged. `JitSession` owns the boxed `Mutex<Host>` and re-bakes the locked
+guest `call.cap 11` iface is unchanged. `JitSession` owns the boxed `Mutex<Host>` and re-bakes the locked
 thunk on every recompaction, so a multi-threaded guest auto-compacts soundly between prompts. Pinned by
 `jit_cap::threaded_{install,compile}_*` + `cross_thread_execute_fresh_code_agrees` + the
 `threaded_session_compacts_transparently` capstone, on every `fiber_rt` target incl. aarch64 macOS.
@@ -3124,13 +3124,13 @@ missing symbol) is caught by re-verification, never trusted. Two flavors, both b
   `&g + 4` works) — no new IR instruction, just a constant edit. Duplicate / cross-namespace symbol
   collisions, bad exports, and unresolved/non-const relocations all fail closed.
 - **Dynamic** (`Resolved::Slot` + `compile_linked`, like `dlopen`) — a **separately-compiled** unit
-  reaches a function it does not share an index space with through the **shared `call_indirect` table**
+  reaches a function it does not share an index space with through the **shared `call.dyn` table**
   at a runtime-assigned slot. Both directions work: plugin→host and old/loaded→newly-installed.
 
 **The lowering primitive** is `temen_ir::resolve_imports_with`: each `CallSym` (the v8 symbolic-call
 spelling; a bound `call.sym` also executes directly as flat import dispatch) rewrites **1:1** (no
-value renumbering) to `Cap(ResolvedCap)`→`cap.call` (the §7 case), `Func(FuncIdx)`→a direct `call`
-(static), or `Slot(u32)`→`call_indirect <slot>` (dynamic; the symbol's handle operand must be a
+value renumbering) to `Cap(ResolvedCap)`→`call.cap` (the §7 case), `Func(FuncIdx)`→a direct `call`
+(static), or `Slot(u32)`→`call.dyn <slot>` (dynamic; the symbol's handle operand must be a
 `ConstI32` placeholder, patched to the slot and reused as the index). Unresolved/ill-typed → fail-closed.
 
 **Serializable imports (codec v2).** So a unit can be shipped as a `.so` with *undefined references*,
@@ -3150,7 +3150,7 @@ untrusted-input surface). The `JitValidator` seam carries the symtab bytes so re
 **Security argument.** Resolution is rewrite-**then**-verify, so a missing name, a wrong import
 signature, or a non-const slot handle fails verification — nothing reaches Cranelift. The symbol
 table's *values* are **guest-chosen by design and confer no authority**: a resolved `Slot` lowers to a
-`call_indirect`, which is masked + `type_id`-checked at the call exactly like any index the guest
+`call.dyn`, which is masked + `type_id`-checked at the call exactly like any index the guest
 already controls in its own code — binding to a **wrong-typed** slot **traps `IndirectCallType`**, never
 a type-confused dispatch; binding to a forged slot is no worse than a forged index the §3c table check
 already handles. So host-assisted linking adds **no escape-TCB surface** on top of §22 — it is the
@@ -3326,7 +3326,7 @@ not confinement — and all eight are fixed:
 | 1 | MED–HIGH | guest could abort the host by exhausting the 256-slot handle table (`grant` panicked across the `extern "C"` thunk) → fallible `try_grant`, guest-minting sites return `-EMFILE`; pinned by `address_space::minting_past_table_capacity_returns_emfile_not_panic` |
 | 2 | MED (on-paper UB) | racy non-atomic Rust writes to the shared `trap_out` cell → `AtomicI64` + `store_trap`/`load_trap` (Relaxed); JIT code keeps its aligned hardware-atomic store |
 | 3 | MED (defensive) | JIT nesting validated child size vs clamped size could diverge → one clamped value for both |
-| 4 | LOW | cap.call result buffer partially uninitialized on host arity mismatch → zero-filled |
+| 4 | LOW | call.cap result buffer partially uninitialized on host arity mismatch → zero-filled |
 | 5 | LOW | `Mapped` atomic width dispatch treated any non-4 width as 8 → `debug_assert!(width == 4 \|\| 8)` |
 | 6 | LOW | `Paged::read_into` debug-overflow on huge `off` → early out-of-range guard (inert, per the `Region` contract) |
 | 7 | LOW | decoder `Vec::with_capacity(ndata)` ~40× allocation amplification → incremental growth |
@@ -3335,9 +3335,9 @@ not confinement — and all eight are fixed:
 **Checked and found sound (no action):** the verifier (fail-closed, `forbid(unsafe_code)`,
 every bound checked); `temen-mask` `confine` (in-window for all inputs incl. `u64::MAX`;
 `Window::sub` can't wrap past its sub-range); the `temen-mem` unsafe contracts; JIT mask
-elision (`ub_of`/`in_window` upper-bound-sound, saturating, width-accounted); the cap.call
+elision (`ub_of`/`in_window` upper-bound-sound, saturating, width-accounted); the call.cap
 ABI (buffers sized from the compile-time verified sig); trap propagation (re-checked after
-every call/thunk); `call_indirect` (Spectre-safe masked dispatch + type-id check); the
+every call/thunk); `call.dyn` (Spectre-safe masked dispatch + type-id check); the
 `temen-fiber` switches (register/alignment-complete on all three ABIs; body panic → abort);
 the decoder (every count bounded, LEB128 overflow-guarded); the §5 kill-path (epoch-cell
 lifetime via `join_all`; parked vCPUs re-check); capability forgery resistance (generation
@@ -3528,21 +3528,21 @@ as open-ended, not a byproduct of the build.
 | D42 | MVP cap ops use a **negative-errno `i64`** result (`≥0` success value, `<0` `-errno`); errors never trap; buffer args are borrow-only `(ptr,len)` validated at the trampoline (`-EFAULT` on overflow) | Settled | Syscall-shaped (§7), 1:1 with the C libc shim; keeps traps reserved for escape/fatal (§3b) |
 | D43 | MVP capability set = `Stream` (stdio via 3 handles), `Exit`, `Clock`, `Memory`; stdio reuses one `Stream` interface (not a bespoke Console) so files/sockets compose later | Settled | First concrete handle-table interfaces (§3c) + C-runtime targets (§3d); orthogonal, one interface to verify (§3e) |
 | D44 | Powerbox = `entry(stdin, stdout, stderr, exit, clock, memory, args_buffer)`; args buffer = `{argc,envc}` + packed NUL-terminated strings | Settled | Concrete instantiation grant + C `main` wrapper contract (§3b/§3d/§3e) |
-| D45 | `cap.call` dispatch is **per-entry** (vtable in the `HandleEntry`), not per-type — generally an indirect call (retpoline/eIBRS), devirtualized to direct/inline when the binding is statically known. **Devirtualization is deferred — cost recorded in §3c** (authority-TCB in codegen, fights compile⊥instantiate, sound only for stable handles, only half the measured cost; scalar `cap.call` ~1.24× wasm but the zero-copy buffer win needs none of it) | Settled (devirt deferred) | Corrects §3c over-claim; one interface type has many implementations per handle, and §14 virtualization (pass-through vs parent-emulated) needs per-handle dispatch; forgery checks unchanged. Deferral is a recorded trade, not an oversight — don't relitigate without a measured workload |
-| D46 | Capability set is **open/host-extensible** (interface signature in the module type section + host-registered vtable, bound by named import at instantiation, signature-validated fail-closed); **binding may be late** (names resolved at instantiation; the general form of the powerbox), **reflection over the domain's *own* granted set is an always-available `cap.self` intrinsic** (read-only; authority-neutral), and runtime *acquisition* of a not-yet-held cap is a granted `Resolver` registry deferred to a host layer | Settled | The §3e four are just instances; late binding keeps the per-instance grant set statically bounded; `cap.self` confers nothing (reflection ≠ amplification) so the §9 egress-closure analysis stays intact; only acquisition (`Resolver`) widens the grant graph, and it stays a gated host-layer cap outside the TCB |
+| D45 | `call.cap` dispatch is **per-entry** (vtable in the `HandleEntry`), not per-type — generally an indirect call (retpoline/eIBRS), devirtualized to direct/inline when the binding is statically known. **Devirtualization is deferred — cost recorded in §3c** (authority-TCB in codegen, fights compile⊥instantiate, sound only for stable handles, only half the measured cost; scalar `call.cap` ~1.24× wasm but the zero-copy buffer win needs none of it) | Settled (devirt deferred) | Corrects §3c over-claim; one interface type has many implementations per handle, and §14 virtualization (pass-through vs parent-emulated) needs per-handle dispatch; forgery checks unchanged. Deferral is a recorded trade, not an oversight — don't relitigate without a measured workload |
+| D46 | Capability set is **open/host-extensible** (interface signature in the module type section + host-registered vtable, bound by named import at instantiation, signature-validated fail-closed); **binding may be late** (names resolved at instantiation; the general form of the powerbox), **reflection over the domain's *own* granted set is an always-available `self.*` intrinsic** (read-only; authority-neutral), and runtime *acquisition* of a not-yet-held cap is a granted `Resolver` registry deferred to a host layer | Settled | The §3e four are just instances; late binding keeps the per-instance grant set statically bounded; `self.*` confers nothing (reflection ≠ amplification) so the §9 egress-closure analysis stays intact; only acquisition (`Resolver`) widens the grant graph, and it stays a gated host-layer cap outside the TCB |
 | D47 | Escape-freedom is the **conjunction** `Verified ∧ Correct(JIT) ∧ Correct(runtime) ∧ Correct(host/HW)`, not "verified ⇒ safe"; TCB split into **escape-TCB vs authority-TCB**; decomposed into invariants **I1–I5** (owner + validation each); written as a **structured-prose contract**, not a proof | Settled | Puts risk where it lives (JIT dominates, not the verifier); makes host-extensible caps safe (authority-TCB ≠ escape-TCB); anchors the security work; matches the "as secure as wasm" bar (§2a) |
 | D48 | **Availability / DoS is a non-goal** — bounded by metering (fuel/quota/preemption) + the kill path, contained not prevented (incl. §17 GPU); hardware fault injection below the trust line; trust boundary is **verified IR**, frontend untrusted for escape (eBPF model) | Settled | Honest scope; avoids claims the metering/preemption story (and GPU) can't back; verifier makes the frontend untrusted for escape (§2a) |
 | D49 | Host (escape-TCB) in **Rust**; frontend in **C**; backend **Cranelift** | Settled | Backend is Rust-native (coupled to D36); Rust gives memory-safe TCB + best fuzzing (`arbitrary`) + compiler safety net for an expert-less agent build; frontend's language is safety-irrelevant (§2a), so C/chibicc is free; compile-time tax accepted |
 | D50 | **Accept the mask cost on unbounded-base accesses; do not pursue 32-bit window addressing.** Mask elision (§4 guard-when-bounded) covers *provably-bounded* addresses; for an unbounded base (the threaded data-SP in C locals) we keep the single AND mask (`locals_c` ~2.26× wasm32, still < wasm64) rather than lower window addresses as 32-bit | Settled | The 64-bit address space is a core goal (D36/§1a); the only sound way to elide an unbounded-base access is the wasm32 trick (32-bit address arithmetic, address `< 2^32` by construction so it matches the interp and elides) — masking the i64 data-SP alone is un-elidable or diverges from the interp (an escape). That trick caps the elided window at 4 GiB and reworks the frontend's pointer model for one benchmark; not worth trading the clean 64-bit model. Revisit only if a real workload makes the data-SP mask a measured bottleneck |
 | D51 | **Portability via a thin non-TCB Platform Abstraction Layer** (VA reserve/commit/protect, guard-fault→trap, futex); confinement stays platform-independent; **Linux/macOS first, Windows (VEH/SEH) next**; tier-1 MPK is Linux-only and degrades elsewhere. Scheduled as **Phase 3.5** (§18): port Windows, then hold Linux/Windows/macOS parity via a gating three-OS CI matrix | Open (staged) | The escape hinge is portable arithmetic; only the safety-net/syscalls differ per-OS; Wasmtime already proves the cross-platform path, so lean on it (D36/§18) |
-| D52 | **Capability-boundary record/replay** as the primary debugging differentiator: in deterministic mode (§12) nondeterminism enters via capabilities (§7), so logging `cap.call` I/O + seeding that mode gives replayable, time-travel debugging; trustworthy backtraces come free from the out-of-band control stack (§5). **Caveat:** under multicore + relaxed atomics (§12/§23) race outcomes bypass the cap boundary, so faithful replay must also record schedule/memory-order choices (the interp's DPOR `explore_all` already reifies these) | Proposed (premises built; surfaces unbuilt) | Debugging ergonomics are a first-class goal; the ocap boundary is the cheap recording boundary *in single-vCPU mode*; the control stack survives heap corruption |
-| D53 | **Debug surfaces = three cheap pillars + staged DWARF:** reference-interpreter stepping/watchpoints, record/replay, and §5 backtraces now; source-level DWARF (frontend→IR debug side-table→Cranelift→DAP/gdb/lldb) staged. Debug info is untrusted tooling (§2a); debug builds **disable §3d promotion or emit value-locations** so locals stay inspectable; debugger is a host-side `Inspector` capability (like §15 `Monitor`). **Status:** premises built (control stack, deterministic interp, SSA promotion); no stepping API, cap.call log, or §3a debug side-table yet — the side-table is step zero for DWARF | Proposed (premises built; surfaces unbuilt) | The cheap pillars fall out of the architecture; DWARF is the real work; promotion-vs-inspectability is a real trade; debugger-as-capability never widens authority |
+| D52 | **Capability-boundary record/replay** as the primary debugging differentiator: in deterministic mode (§12) nondeterminism enters via capabilities (§7), so logging `call.cap` I/O + seeding that mode gives replayable, time-travel debugging; trustworthy backtraces come free from the out-of-band control stack (§5). **Caveat:** under multicore + relaxed atomics (§12/§23) race outcomes bypass the cap boundary, so faithful replay must also record schedule/memory-order choices (the interp's DPOR `explore_all` already reifies these) | Proposed (premises built; surfaces unbuilt) | Debugging ergonomics are a first-class goal; the ocap boundary is the cheap recording boundary *in single-vCPU mode*; the control stack survives heap corruption |
+| D53 | **Debug surfaces = three cheap pillars + staged DWARF:** reference-interpreter stepping/watchpoints, record/replay, and §5 backtraces now; source-level DWARF (frontend→IR debug side-table→Cranelift→DAP/gdb/lldb) staged. Debug info is untrusted tooling (§2a); debug builds **disable §3d promotion or emit value-locations** so locals stay inspectable; debugger is a host-side `Inspector` capability (like §15 `Monitor`). **Status:** premises built (control stack, deterministic interp, SSA promotion); no stepping API, call.cap log, or §3a debug side-table yet — the side-table is step zero for DWARF | Proposed (premises built; surfaces unbuilt) | The cheap pillars fall out of the architecture; DWARF is the real work; promotion-vs-inspectability is a real trade; debugger-as-capability never widens authority |
 | D54 | **Frontends are untrusted IR plugins (verifier re-checks all); multi-language via two on-ramps — LLVM-bitcode→IR translator (breadth, PNaCl-style, pinned subset, `crates/temen-llvm`) and wasm→IR bridge (compat, `temen-wasm`).** Our IR is a *better LLVM target than wasm* (irreducible CFG, 64-bit, multivalue, tail calls) | **Settled + built** (§20a): LLVM on-ramp passes the **exit criterion** — all 8 chibicc corpus libraries run byte-identical to native `clang` on both backends; general-C breadth (varargs `printf`, wider SIMD, libm) ongoing | IR-as-stable-ABI makes language breadth a no-TCB-cost effort (§2a); a bitcode translator beats a TableGen backend for an expert-scarce team (D49); the §1a edges are real LLVM-target advantages |
-| D55 | **One synchronous `cap.call` shape; async is a runtime construction over blocking-capable ops.** Synchrony is **interface-guaranteed**; **cost is tier-policy** the guest cannot observe: same-process nesting (tiers 0/1) is synchronous and ~free to any depth; cross-process (tier 3) keeps the shape but pays IPC and batches via §13 rings | Settled (clarification) | Unifies §9/§12/§14; the IR has only a synchronous call; "async-first" amortizes the *distrust* boundary, not the common case; matches zero-overhead nesting (§14) |
+| D55 | **One synchronous `call.cap` shape; async is a runtime construction over blocking-capable ops.** Synchrony is **interface-guaranteed**; **cost is tier-policy** the guest cannot observe: same-process nesting (tiers 0/1) is synchronous and ~free to any depth; cross-process (tier 3) keeps the shape but pays IPC and batches via §13 rings | Settled (clarification) | Unifies §9/§12/§14; the IR has only a synchronous call; "async-first" amortizes the *distrust* boundary, not the common case; matches zero-overhead nesting (§14) |
 | D56 | **Concurrency primitives only, no scheduler in the VM (honouring D22).** The VM exposes `cont.*` (fibers), `thread.spawn`/`thread.join` (a vCPU = **one real OS thread**, 1:1), and the `wait`/`notify` futex + C11 atomics — implemented in IR/interp/JIT. The guest runtime builds any M:N model over them. **A built-in M:N green-thread executor was implemented and then removed**: it gave deterministic seeded/exhaustive *JIT* scheduling but reintroduced exactly D22's costs (policy lock-in, the double-scheduler pathology, and the project's highest-risk unsafe — fiber migration across OS threads — in the runtime TCB). Verification keeps what mattered without it: the **interpreter** is the deterministic oracle (`run_scheduled`/`explore_all` exhaust interleavings at instruction granularity — a sound model of preemptive 1:1 threads), the real-thread JIT is differential-tested against it, and the futex glue is loom-checked | Settled (course-correction) | Removes the §12/D22 contradiction the executor introduced; shrinks the TCB; keeps the VM **less** opinionated than wasm on threading (threads are a 1:1 primitive, not a baked scheduler); the deterministic-exploration win lived in the interp oracle all along, not in owning the scheduler |
-| D58 | **SIMD = first-class fixed-128 `v128` with real hardware codegen (Cranelift→SSE2/NEON), not scalar expansion; wasm-parity is not a goal.** 128-bit is the guaranteed floor (SSE2/NEON universal), so a `v128` op = one real vector instruction. Op set designed for real hardware SIMD on its own terms and grown **evidence-driven** (an op is added only when a real kernel emits it). Escape-TCB delta is small/isolated: vector arith/lane/shuffle ops add **zero** escape surface (verifier gains total lane-typing only); the lone confinement change is the 16-byte masked `v128.load`/`store` on the final effective address (`temen-mask`+`fuzz/mask` gain 16-byte width, D38). Float lanes are NaN-insensitive in the interp↔JIT differential (NaN bits unpinned across backends → vector-float modules excluded from the byte-exact window oracle, as scalar floats are today). **Wider widths (`v256`/`v512`) feature-detected and DEFERRED — blocked by the backend, not the design.** The design skeleton is right (wider type = total lane-typing only; mask widens to 32/64 B on the width-parametric guard; the differential survives because lane semantics are width-agnostic — interp's exact lanes == JIT's 1×-wide-or-split, and the feature-detect query is per-machine not per-backend). What's missing is in **Cranelift: no YMM/ZMM register class** (`RegClass::Float` = XMM/128-bit; the `avx2`/`avx512` predicates only pick better 128-bit encodings), so a native `vpaddd ymm` needs a new register class + lowering *in the shared backend* = owning codegen, which D36/D49 refuse. The "native" arm is thus empty until Cranelift adds wide vectors upstream; the "split-to-`v128`" arm equals a hand-written `v128` loop. **ROI of guest-emitted wide SIMD is low**: can't capture throughput without forking the backend; **x86-only** (ARM's wide path is scalable SVE, rejected — no NEON-256); AVX-512 fragmented; many kernels memory-bound. **Higher-ROI homes:** a host-provided vectorized capability (host owns tuned AVX-512 behind `cap.call` + zero-copy borrow, §7/§13 — portable guest, zero backend cost) and the GPU broker. **Revisit trigger = Cranelift gaining upstream wide-vector support**, not "a kernel wants it." **Scalable vectors (SVE/RVV) rejected** (runtime-variable width makes the masked-access bounds proof runtime-variable; no backend support; fragmented benefit). | Settled (fixed-128); wider widths deferred | Real hardware SIMD is the goal; wasm was just the lens. Fixed-128 is the portable floor that always lowers to a real instruction with no scalar fallback. Wider widths are deferred not on evidence-discipline grounds but on a hard backend blocker (no Cranelift YMM/ZMM regclass) — owning that codegen contradicts the "as fast/secure as wasm via shared Cranelift" thesis (D36/D49); and width-hungry workloads are better served by a host SIMD capability or the GPU broker. Vector ops are value-only so the security story barely moves — only the masked access widens |
+| D58 | **SIMD = first-class fixed-128 `v128` with real hardware codegen (Cranelift→SSE2/NEON), not scalar expansion; wasm-parity is not a goal.** 128-bit is the guaranteed floor (SSE2/NEON universal), so a `v128` op = one real vector instruction. Op set designed for real hardware SIMD on its own terms and grown **evidence-driven** (an op is added only when a real kernel emits it). Escape-TCB delta is small/isolated: vector arith/lane/shuffle ops add **zero** escape surface (verifier gains total lane-typing only); the lone confinement change is the 16-byte masked `v128.load`/`store` on the final effective address (`temen-mask`+`fuzz/mask` gain 16-byte width, D38). Float lanes are NaN-insensitive in the interp↔JIT differential (NaN bits unpinned across backends → vector-float modules excluded from the byte-exact window oracle, as scalar floats are today). **Wider widths (`v256`/`v512`) feature-detected and DEFERRED — blocked by the backend, not the design.** The design skeleton is right (wider type = total lane-typing only; mask widens to 32/64 B on the width-parametric guard; the differential survives because lane semantics are width-agnostic — interp's exact lanes == JIT's 1×-wide-or-split, and the feature-detect query is per-machine not per-backend). What's missing is in **Cranelift: no YMM/ZMM register class** (`RegClass::Float` = XMM/128-bit; the `avx2`/`avx512` predicates only pick better 128-bit encodings), so a native `vpaddd ymm` needs a new register class + lowering *in the shared backend* = owning codegen, which D36/D49 refuse. The "native" arm is thus empty until Cranelift adds wide vectors upstream; the "split-to-`v128`" arm equals a hand-written `v128` loop. **ROI of guest-emitted wide SIMD is low**: can't capture throughput without forking the backend; **x86-only** (ARM's wide path is scalable SVE, rejected — no NEON-256); AVX-512 fragmented; many kernels memory-bound. **Higher-ROI homes:** a host-provided vectorized capability (host owns tuned AVX-512 behind `call.cap` + zero-copy borrow, §7/§13 — portable guest, zero backend cost) and the GPU broker. **Revisit trigger = Cranelift gaining upstream wide-vector support**, not "a kernel wants it." **Scalable vectors (SVE/RVV) rejected** (runtime-variable width makes the masked-access bounds proof runtime-variable; no backend support; fragmented benefit). | Settled (fixed-128); wider widths deferred | Real hardware SIMD is the goal; wasm was just the lens. Fixed-128 is the portable floor that always lowers to a real instruction with no scalar fallback. Wider widths are deferred not on evidence-discipline grounds but on a hard backend blocker (no Cranelift YMM/ZMM regclass) — owning that codegen contradicts the "as fast/secure as wasm via shared Cranelift" thesis (D36/D49); and width-hungry workloads are better served by a host SIMD capability or the GPU broker. Vector ops are value-only so the security story barely moves — only the masked access widens |
 | D57 | **Two concurrency primitives are the floor; "stackless tasks" add none.** vCPU (`thread.spawn`, 1:1) gives parallelism; fiber (`cont.*`) gives suspension of *native* execution. A **stackless task** (a guest-compiled state machine — struct + resume fn + a `switch` on a state field) is a *guest pattern* needing **zero** primitives: its suspend point is the state-machine transition, built from ordinary loads/stores/branches. So guest-built M:N comes in two flavors **today, with no VM change**: *sharded* M:N over **thread-affine** fibers (tasks pinned to their worker), and **work-stealing** M:N over **stackless** tasks (freely movable — moving a struct is a pointer hand-off, safe by construction; over `thread.spawn`+futex+atomics). Stackless is strictly *less expressive* (function-coloring: it can only suspend at points in a transformed body, not across arbitrary/unmodified frames), so fibers stay — they're the only way to cooperatively suspend **unmodified real code** and they underpin the §14 fault-driven yield (suspend at an arbitrary hardware-fault PC is inherently stackful). **Stackful migration over *migratable* fibers is ADOPTED and landed (slices 3a–3c):** it re-accepts D56's deliberately-removed cross-thread-fiber-migration unsafe, but as a **primitive** (the VM enforces a single-owner *resume-from-any-thread* — the loom-verified `Ownership` claim; the guest owns any stealing policy) rather than a VM scheduler — resolving D56's policy-lock-in / double-scheduler objections while accepting its TCB-risk one *with eyes open*: no expert reviewer is available for the asm/signal seam, so safety rests on the **empirical net** (§23 "verification story" — the randomized-migration interp↔JIT differential, ASan with real fiber-switch annotations in `temen-fiber`, a runtime single-owner assert at the resume seam, guard-paged stacks, concurrent-steal stress). Both backends migrate: the interp's run-shared registry (pure-data hand-off, the oracle) and the JIT's domain-shared table over the *unchanged* `temen-fiber` switch (no thread-bound state in any of the three ABIs; MS-x64 swaps the TEB stack fields per switch). Fault-suspended fibers stay pinned (`pin`, staged); slot recycling is staged behind generation-carrying handles on both backends. | Adopted (extends D56; 3a–3c landed) | Pins the primitive count at two and the "no VM scheduler" rule; records the migratable-fiber path honestly as a re-acceptance of a known high-risk unsafe, not a free win — to be earned, not assumed. Full design + verification story + demo evidence in **§23** |
-| D59 | **Guest-driven JIT = the `Jit` capability (§22): a guest submits verified IR and gets native code in its *own* domain.** Verification, not isolation, is the trust boundary — a JIT'd unit is exactly as powerful as its submitter (same window/handles), with one new authority-TCB precondition (declared memory ≡ parent window; reject data segments + concurrency ops in a unit) keeping "no escape-TCB change" true. Model A (cap.call trampoline, default) sidesteps the baked function-table mask; Model B2 (`install` into a pre-reserved table) neutralizes it by pre-sizing — both ship, all four cross-call directions differentially pinned. Type identity is an append-only intern (id-equality ≡ structural equality), never read at runtime. Code reclaim is whole-module recompaction (no per-function free in cranelift-jit), driven by `recompact_jit`/`JitSession` on a byte watermark. Threaded `install` + threaded `compile` work with full platform parity (atomic `DomainTable`/`FnEntry`; `cap_thunk_locked` serializes compiles while execution stays parallel; no aarch64 `isb` needed). | Settled (built, differentially tested) | The "JIT inside the sandbox" wasm handles poorly; the submit-a-blob boundary + verifier-as-hinge already existed, so it was authority-TCB-mostly. Model A's worst case is perf/ergonomics (announced by a benchmark), B2's is a host-writes-into-live-table primitive — both earned their place; the sharded-module throughput optimization stays deferred until measured. Full design + security argument + reclaim/concurrency in §22 |
+| D59 | **Guest-driven JIT = the `Jit` capability (§22): a guest submits verified IR and gets native code in its *own* domain.** Verification, not isolation, is the trust boundary — a JIT'd unit is exactly as powerful as its submitter (same window/handles), with one new authority-TCB precondition (declared memory ≡ parent window; reject data segments + concurrency ops in a unit) keeping "no escape-TCB change" true. Model A (call.cap trampoline, default) sidesteps the baked function-table mask; Model B2 (`install` into a pre-reserved table) neutralizes it by pre-sizing — both ship, all four cross-call directions differentially pinned. Type identity is an append-only intern (id-equality ≡ structural equality), never read at runtime. Code reclaim is whole-module recompaction (no per-function free in cranelift-jit), driven by `recompact_jit`/`JitSession` on a byte watermark. Threaded `install` + threaded `compile` work with full platform parity (atomic `DomainTable`/`FnEntry`; `cap_thunk_locked` serializes compiles while execution stays parallel; no aarch64 `isb` needed). | Settled (built, differentially tested) | The "JIT inside the sandbox" wasm handles poorly; the submit-a-blob boundary + verifier-as-hinge already existed, so it was authority-TCB-mostly. Model A's worst case is perf/ergonomics (announced by a benchmark), B2's is a host-writes-into-live-table primitive — both earned their place; the sharded-module throughput optimization stays deferred until measured. Full design + security argument + reclaim/concurrency in §22 |
 | D60 | **Durable domains via an IR→IR freeze/thaw transform + a backend-independent snapshot codec (§21).** A domain is quiesced and serialized to `(window image + per-page prots, in-window shadow control state, host-side handle table)` and restored to bytewise-equivalent execution across recompiles/backends/hosts. The freeze/thaw transform (`temen-durable`) is pure IR — *no new instruction* (state word + per-fiber shadow stack in the window; unwind spills the live set, rewind `br_table`s on a resume id); the snapshot codec (`temen-snapshot`) is a canonical versioned-TLV container bound to the instrumented-module digest (restore refuses on mismatch). Both are tooling-tier, **+0 escape-TCB**. | Settled (built — single + multi-vCPU freeze/thaw on both backends, snapshot v4) | Durability falls out of total IR (D34), the out-of-band control stack (D5), and block-local-SSA liveness (D1) with no escape-TCB cost; the artifact's recompile-survival is the durability boundary. Full design + phase tracker in `DURABILITY.md` |
 | D61 | **Guard-relying base-hoist elision to claw back trap-confinement's load-dense-loop cost (§4).** Hoist one check+clamp of a loop-invariant unbounded base into the preheader, then elide the per-access check+clamp for accesses of proven reach `B`. Architecturally sound with the existing guard; the risk is the **speculative overshoot** `base_clamped + off_i ∈ [0, reserved + B)`, which binds the JIT elision analysis to the allocator by the invariant **`trusted_reach ≤ guard_size`** (a wrong bound = *speculative* escape). Blocker found: `mem.rs` reserves only **one** trailing guard page, capping safe reach at 4 KiB (Scope A, zero allocator change — captures the C stack-locals case) unless the guard is enlarged (Scope B — captures `dot`/`matmult`/`cache`, changes escape-TCB allocation). | **Proposed — design only; no escape-TCB code until the invariant is signed off** | The one measured trap-confinement regression is load-dense loops over an unbounded base (§1a `matmult +5%`, `cache +6.7%`); this is the staged wasm32-style guard-relying win (§4), deferred not on value but because its speculative-overshoot correctness turns on a coupled security-hinge invariant with no expert reviewer (§18). Verification: escape oracle (architectural) + a new `trusted_reach ≤ guard_size` fuzz probe (speculative) |
 | D62 | **Bulk-memory IR ops (`mem.copy`/`mem.move`/`mem.fill`) confined once per span, not per byte (§4).** New no-result ops lower `llvm.memcpy`/`memmove`/`memset` to a *single* whole-span range check (`[ptr, ptr+len) ⊆ [0, reserved)`, computed overflow-free via the `len > reserved` sub-check that guards the `reserved − len` subtraction, gated by `len != 0`) plus a base Spectre-clamp, then the platform `memcpy`/`memmove`/`memset` **libcall** (Cranelift `call_memcpy`/…, resolved by the JIT's `default_libcall_names`). Replaces temen-llvm's old lowering — a per-8-byte-chunk *masked* load/store unroll (≤ 4 KiB) or a byte-at-a-time `__temen_memcpy`/`memset`/`memmove` helper (larger/variable) — which paid one confinement check per chunk/byte. The tree-walk interpreter (the differential oracle) mirrors it with a scalar checked span copy/fill (overlap-safe snapshot); the **bytecode interpreter** takes a fast path — the same whole-span confinement + prot scan, then a single bulk `Region::copy_within`/`fill` (`memmove`/`memset` on the backing) instead of the scalar loop, under the same single-threaded-cooperative contract as its `read_word`/`write_word` — leaving the tree-walker as the independent scalar reference. **The wasm on-ramp also lowers `memory.copy`→`MemMove`/`memory.fill`→`MemFill`** (previously a per-chunk masked unroll ≤ 64 KiB / a scalar byte loop), so wasm-sourced bulk ops now take the same fast path as the LLVM on-ramp. **`table.copy` also lowers to `MemMove`** (`count*4` bytes — the table is window memory, so it is a guest span like `memory.copy`); only `memory.init`/`table.init` keep their const-store unroll, because their source is compile-time **host data** (data-segment bytes / element indices), not a guest span a `memmove` could copy. **A per-span guard-read probe (`probe_span`, ISSUES.md I21) closes the `mapped` vs `reserved` gap:** the range check bounds against `reserved`, but the interpreter faults on any byte past the *backed* `mapped` extent — so before each libcall the JIT reads the span's last byte through the guard (faulting up front, honoring guest `grow`, and independent of libc's `dst == src` short-circuit), making the JIT byte-identical to the interpreters on faulting bulk ops too (no partial write, no lost trap). | **Settled (built — temen-ir/verify/interp/bytecode/encode/text/peval/jit/llvm/wasm; bytecode interp + wasm on-ramp on the fast path, tree-walker the scalar oracle; `temen-mem` `Region::fill`/`copy_within` bulk primitives; `memcpy` helper retained only for realloc/snprintf/`__vm_fmt`; JIT `probe_span` per I21)** | Isolated as the dominant array-copy gap to Wasmtime-w64 (`confine` harness: the faithful `matmul_eb` kernel's memcpy was the whole difference from parity `matmul`); the bulk primitive is the `memory.copy`-class lowering Wasmtime uses — same confinement guarantee (whole span proven in-bounds before any access), checked once. Same "as secure as wasm" speculative posture as a bounds-checked `memory.copy` (§1a): the length is checked, the base clamped, the copy a non-speculated libcall — so no per-byte clamp. Measured: `matmul_eb` temen÷wt64 **1.264→1.202** (control `matmul` flat), all 19 embench kernels `verify=1`. Verification: a JIT↔both-interpreters differential (`temen-jit/tests/bulk_mem.rs` — fill/copy, overlapping move, zero-length-wild-pointer no-op, OOB + oversized-length fault) + the span-OOB-formula fuzz probe in `fuzz/mask` (JIT formula vs a `u128` oracle) |

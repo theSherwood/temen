@@ -23,7 +23,7 @@ use temen_text::parse_module;
 
 // The §3.6 slice-2 serving domain, verbatim from `temen-interp/tests/bytecode_svc.rs`: offer "counter"
 // op 0 = func 1 `bump(x) -> old + x` over the LIVE value at mem[0]; `main` (func 0) seeds mem[0] = 7,
-// `svc.poll`s (`cap.call CAP_SELF(=u32::MAX) 9`) draining the embedder-seeded queue, and returns
+// `svc.poll`s (`call.cap CAP_SELF(=u32::MAX) 9`) draining the embedder-seeded queue, and returns
 // `served * 1000 + mem[0]`. Pure handler, no park-capable seam — so it compiles to the native serve
 // loop the debug engine drives op-by-op (stepping *into* each handler body).
 const SERVER: &str = r#"
@@ -38,7 +38,7 @@ block 0 () {
   vseed = i64.const 7
   i64.store va vseed
   vz = i32.const 0
-  vn = cap.call 4294967295 9 () -> (i64) vz ()
+  vn = call.cap 4294967295 9 () -> (i64) vz ()
   vafter = i64.load va
   vk = i64.const 1000
   vm = i64.mul vn vk

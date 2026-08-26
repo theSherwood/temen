@@ -12,7 +12,7 @@
 //! `eqz`/`select`/`clz`/`ctz`/`popcnt`, every conversion (extend/wrap/demote/promote/
 //! reinterpret, int↔float, saturating **and** trapping `trunc`), **loads/stores with
 //! confinement masking** (I1), **indirect calls with function-table dispatch** (I2),
-//! **`cap.call` through a host thunk** (§9, see [`CapThunk`]), and every terminator —
+//! **`call.cap` through a host thunk** (§9, see [`CapThunk`]), and every terminator —
 //! `br`/`br_if`/`br_table`/`return`/`unreachable` plus direct and indirect tail calls.
 //!
 //! ## Traps ([`JitOutcome`])
@@ -49,7 +49,7 @@
 //! (final-memory equality, §18).
 //!
 //! ## Indirect-call dispatch (§3c, invariant I2)
-//! `call_indirect` masks the guest index into a host-owned, power-of-two-padded
+//! `call.dyn` masks the guest index into a host-owned, power-of-two-padded
 //! function table, checks the slot's `type_id` against the call's signature (trap on
 //! mismatch — a forged/wrong-type index is inert), and calls the slot's code pointer.
 //!
@@ -197,11 +197,11 @@ const SNAP_CAP: usize = 1 << 18; // 256 KiB
 
 /// A function-table entry (§3c `FnEntry`): host-owned, guest-unwritable. `type_id`
 /// identifies the signature (distinct-`FuncType` index); `code` is the finalized
-/// function address. `call_indirect` masks the guest index into the table, checks
+/// function address. `call.dyn` masks the guest index into the table, checks
 /// `type_id` (offset 0), then calls `code` (offset 8) — confinement at the use site (invariant I2).
 ///
 /// The fields are **atomic** so a guest-driven `install`/`uninstall` (a host-side write) is sound
-/// against a *concurrent* `call_indirect` from another thread (DESIGN.md §22 threaded install). The
+/// against a *concurrent* `call.dyn` from another thread (DESIGN.md §22 threaded install). The
 /// `#[repr(C)]` layout (`type_id` @0, `code` @8) is exactly what [`indirect_dispatch`] bakes its
 /// loads against, unchanged. Two distinct guarantees, both platform-uniform:
 /// - **Visibility** (a synchronized reader sees a complete install) rides the **guest's own**
@@ -229,7 +229,7 @@ impl FnEntry {
             code: AtomicU64::new(code),
         }
     }
-    /// A trapping padding entry (`call_indirect` here is inert).
+    /// A trapping padding entry (`call.dyn` here is inert).
     pub(crate) fn padding() -> FnEntry {
         FnEntry::new(PADDING_TYPE_ID, 0)
     }
@@ -259,7 +259,7 @@ impl FnEntry {
 /// `type_id` for a table slot that holds no function (the power-of-two padding) — it
 /// matches no call site, so a forged index landing here always traps.
 const PADDING_TYPE_ID: u32 = u32::MAX;
-/// `type_id` a `call_indirect` uses when its signature matches no function in the
+/// `type_id` a `call.dyn` uses when its signature matches no function in the
 /// module: distinct from every real id and from the padding sentinel, so it always
 /// traps (no function could satisfy it).
 const NO_MATCH_TYPE_ID: u32 = u32::MAX - 1;
@@ -305,12 +305,12 @@ fn type_id_of(distinct: &[FuncType], ty: &FuncType) -> u32 {
 }
 
 /// Intern `ty` into the **append-only** type-id registry (DESIGN.md §22: the per-domain id space
-/// made incremental), returning its stable id. Soundness of the `call_indirect` dispatch check
+/// made incremental), returning its stable id. Soundness of the `call.dyn` dispatch check
 /// reduces to this map being an *injection*, *stable over time* (an id never remaps — appends
 /// only), and *total over participants* (every signature that can appear at a call site or in
 /// a table slot is interned before any code referencing it is lowered) — then id-equality
 /// coincides exactly with the interpreter's structural equality. The registry is consulted
-/// only at compile/install time (inside a synchronous `cap.call`, guest suspended); compiled
+/// only at compile/install time (inside a synchronous `call.cap`, guest suspended); compiled
 /// code holds ids as immediates and never reads it at runtime.
 fn intern_type(distinct: &mut Vec<FuncType>, ty: &FuncType) -> Result<u32, JitError> {
     if let Some(i) = distinct.iter().position(|t| t == ty) {
@@ -326,8 +326,8 @@ fn intern_type(distinct: &mut Vec<FuncType>, ty: &FuncType) -> Result<u32, JitEr
 }
 
 /// Intern every signature `funcs` can put into play for table dispatch: each function's own
-/// signature (what a table slot holding it would carry) and every `call_indirect` /
-/// `return_call_indirect` **site** signature (what the check compares against). Site
+/// signature (what a table slot holding it would carry) and every `call.dyn` /
+/// `return_call.dyn` **site** signature (what the check compares against). Site
 /// signatures matter: an id is baked into the call site as an immediate when the unit is
 /// lowered, so a site whose signature is only defined by a *later* unit must already hold the
 /// real id — interning up front keeps id-equality ≡ structural equality across units instead
@@ -557,7 +557,7 @@ impl TrapKind {
     }
 }
 
-/// The host callback the JIT invokes for `cap.call` (§9's trampoline). The caller wires
+/// The host callback the JIT invokes for `call.cap` (§9's trampoline). The caller wires
 /// it to its capability host; the JIT bakes the function + ctx addresses in as constants
 /// and calls it. Scalars cross as `i64` slots (`i32` in the low bits), buffers as the
 /// `(ptr, len)` window borrow. On return, `*trap_out` is `0` for success, a [`TrapKind`]
@@ -584,7 +584,7 @@ pub type CapThunk = unsafe extern "C" fn(
     trap_out: *mut i64,
 );
 
-/// The **devirtualized `cap.call` fast path** (§9 / D45). A `cap.call` to a statically-known
+/// The **devirtualized `call.cap` fast path** (§9 / D45). A `call.cap` to a statically-known
 /// `(type_id, op)` normally goes through the generic [`CapThunk`]: it marshals args through a stack
 /// buffer, passes a 12-wide ABI (incl. `n_args`/`n_res`/`type_id`/`op`), and the host dispatches on
 /// `(type_id, op)` at runtime. A `FastCapResolver` lets an embedder hand the JIT a **specialized**
@@ -593,7 +593,7 @@ pub type CapThunk = unsafe extern "C" fn(
 /// **compile time** (the JIT calls the resolver during codegen and bakes the returned address); a
 /// `null` return falls back to the generic thunk, so an embedder can fast-path only its hot ops.
 ///
-/// The specialized function's ABI is, for a `cap.call` with `n_args` args and **one** result
+/// The specialized function's ABI is, for a `call.cap` with `n_args` args and **one** result
 /// (multi-result ops fall back to the generic thunk):
 /// `unsafe extern "C" fn(ctx, mem_base, mem_size, handle: i32, trap_out: *mut i64, a0: i64, …, aN: i64) -> i64`
 /// — `ctx`/`mem_base`/`mem_size`/`trap_out` are exactly as in [`CapThunk`]; the `handle` is the
@@ -603,8 +603,8 @@ pub type CapThunk = unsafe extern "C" fn(
 /// exactly like the generic thunk.
 ///
 /// **The resolver MUST gate on `(n_args, n_res)`**: the JIT builds the call signature from the IR
-/// `cap.call`'s arity, so a returned fn whose Rust signature has a *different* arity is a C-ABI
-/// mismatch. A frontend may emit a `cap.call` to any `(type_id, op)` with any sig (the verifier checks
+/// `call.cap`'s arity, so a returned fn whose Rust signature has a *different* arity is a C-ABI
+/// mismatch. A frontend may emit a `call.cap` to any `(type_id, op)` with any sig (the verifier checks
 /// only `args.len() == sig.params.len()`, not that it matches the host op), so the resolver must return
 /// a fn **only** when `(n_args, n_res)` equals that fn's own arity — otherwise `null` (the generic
 /// slot-based path handles the odd arity safely). Types never mismatch (every arg is passed as an i64
@@ -630,7 +630,7 @@ pub use temen_ir::Quota;
 /// A resolved §14 **`Module` grant** — raw views into host-owned storage (the powerbox's module
 /// table), filled in by a [`ModuleResolver`]. The pointers must stay valid for the whole run (the
 /// host's table is append-only and the host outlives the run — the same lifetime contract as the
-/// `cap.call` ctx). `memory_log2 < 0` means the module declares no memory.
+/// `call.cap` ctx). `memory_log2 < 0` means the module declares no memory.
 #[repr(C)]
 pub struct ResolvedModule {
     pub funcs: *const Func,
@@ -639,7 +639,7 @@ pub struct ResolvedModule {
     pub data: *const Data,
     pub n_data: usize,
     /// #922 — the module's **type section**, so the §14 nesting runtime can resolve a
-    /// separate-module child's interned `call_indirect` type indices when re-compiling it. Same
+    /// separate-module child's interned `call.dyn` type indices when re-compiling it. Same
     /// outlives-the-run contract as `funcs`/`data`.
     pub types: *const temen_ir::TypeEntry,
     pub n_types: usize,
@@ -649,7 +649,7 @@ pub struct ResolvedModule {
 /// granted module's code/data (so a guest can only instantiate modules it was given). Returns
 /// nonzero and fills `out` on success, `0` for a forged/closed/wrong handle. Deliberately a
 /// *separate* callback from [`CapThunk`]: module resolution yields host pointers, which must never
-/// be reachable from a guest-issued `cap.call` (the generic dispatch on a Module handle is an inert
+/// be reachable from a guest-issued `call.cap` (the generic dispatch on a Module handle is an inert
 /// `CapFault`) — only the host-side nesting runtime calls this.
 ///
 /// # Safety
@@ -686,7 +686,7 @@ pub struct GrantChild {
 /// do I/O instead of being born destitute. Returns nonzero and fills `out` on success, `0` for a
 /// forged / non-copyable handle (an inert `CapFault`). Like [`ModuleResolver`], it is a *separate*
 /// callback from [`CapThunk`]: it yields a host pointer (the child `Host`), which must never be
-/// reachable from a guest-issued `cap.call`.
+/// reachable from a guest-issued `call.cap`.
 ///
 /// # Safety
 /// `ctx` is the run's `cap_ctx` (the parent `Host`); `out` points at a writable [`GrantChild`]. The
@@ -701,7 +701,7 @@ pub type GrantChildBuilder = unsafe extern "C" fn(
 /// The host callback for **`instantiate_named`** (Instantiator op 11): the multi-cap, by-name analog
 /// of [`GrantChildBuilder`]. Reads `grants_n` 16-byte records `{name_off, name_len, handle, flags}` at
 /// window-relative `grants_ptr` (bounded to `[0, mem_size)`), re-grants each record's copyable handle
-/// into a fresh child powerbox **under its name** (the child finds them by `cap.self.resolve`), and
+/// into a fresh child powerbox **under its name** (the child finds them by `self.resolve`), and
 /// fills `out` (`grant_handle` unused). Returns nonzero on success; `0` with `*trap_out` set to a
 /// `MemoryFault` (out-of-window record/name) or `CapFault` (non-UTF-8 name / forged / non-copyable
 /// handle) — the whole spawn fails closed, matching the interpreter's op-11 path.
@@ -776,7 +776,7 @@ pub struct GrantChildHooks {
     pub mint: ChildOfferMint,
     /// CALLS.md 5c.0 — the cap thunk granted-child compiles run against. A shared child `Host`
     /// (non-null `retained_ctx`) is reachable from the parent while the child runs, so its own
-    /// `cap.call`s must synchronize: this is the lock-taking thunk variant (`ctx` = the shared
+    /// `call.cap`s must synchronize: this is the lock-taking thunk variant (`ctx` = the shared
     /// cell), replacing the run's unsynchronized `cap_thunk` for granted children only.
     pub thunk: CapThunk,
     /// CALLS.md 5c.1b — register a spawned granted child's **serve context** on its shared
@@ -813,7 +813,7 @@ pub type ChildManifestBinder = unsafe extern "C" fn(
 ) -> i32;
 
 /// The default thunk for [`compile_and_run`] (no host): an empty powerbox, so every
-/// `cap.call` is inert — a `CapFault` — exactly like the interpreter's `run`.
+/// `call.cap` is inert — a `CapFault` — exactly like the interpreter's `run`.
 unsafe extern "C" fn empty_cap_thunk(
     _ctx: *mut core::ffi::c_void,
     _mem_base: *mut u8,
@@ -831,7 +831,7 @@ unsafe extern "C" fn empty_cap_thunk(
     unsafe { *trap_out = TrapKind::CapFault as i64 };
 }
 
-/// The inert [`CapThunk`] (every `cap.call` is a `CapFault`) for callers with no host — the
+/// The inert [`CapThunk`] (every `call.cap` is a `CapFault`) for callers with no host — the
 /// long-lived [`CompiledModule::compile`] counterpart of [`compile_and_run`]'s empty powerbox.
 /// Pass with a null `cap_ctx`.
 pub const INERT_CAP_THUNK: CapThunk = empty_cap_thunk;
@@ -912,16 +912,16 @@ fn float_clif_ty(t: FloatTy) -> Type {
 /// trap_out, params…) -> (results…)` — so direct/indirect/tail calls are ordinary CLIF
 /// calls; the entry is wrapped in a fixed buffer-ABI trampoline (any arity).
 pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<JitOutcome, JitError> {
-    // No host: an empty powerbox, so any `cap.call` is an inert CapFault (like `run`).
+    // No host: an empty powerbox, so any `call.cap` is an inert CapFault (like `run`).
     compile_and_run_with_host(m, func, args, empty_cap_thunk, core::ptr::null_mut())
 }
 
 /// Compile `func` of `m` to a reusable [`CompiledModule`] with the default no-host policy (an empty
-/// powerbox — any `cap.call` is an inert CapFault, exactly like [`compile_and_run`]), so the caller can
+/// powerbox — any `call.cap` is an inert CapFault, exactly like [`compile_and_run`]), so the caller can
 /// **compile once and [`CompiledModule::run`] many times** (DESIGN.md §22's long-lived split). The
 /// one-shot [`compile_and_run`] recompiles the whole module on *every* call (~ms of Cranelift codegen);
 /// a hot loop or a benchmark isolating per-iteration compute from compile jitter should compile here and
-/// reuse the returned module. For `cap.call` dispatch to a real host, call [`CompiledModule::compile`]
+/// reuse the returned module. For `call.cap` dispatch to a real host, call [`CompiledModule::compile`]
 /// directly with a thunk.
 pub fn compile(m: &IrModule, func: FuncIdx) -> Result<CompiledModule, JitError> {
     CompiledModule::compile(
@@ -940,7 +940,7 @@ pub fn compile(m: &IrModule, func: FuncIdx) -> Result<CompiledModule, JitError> 
     )
 }
 
-/// Like [`compile_and_run`], but `cap.call`s dispatch through `cap_thunk` with the
+/// Like [`compile_and_run`], but `call.cap`s dispatch through `cap_thunk` with the
 /// caller's `cap_ctx` (the powerbox host). The thunk + ctx addresses are baked into the
 /// compiled code as constants — valid because the module is compiled, run once, then
 /// discarded here.
@@ -959,7 +959,7 @@ pub fn compile_and_run_with_host(
     Ok(run_inner(m, func, args, cap_thunk, cap_ctx, RunOpts::default())?.0)
 }
 
-/// Like [`compile_and_run_with_host`], but also supply a [`FastCapResolver`] so hot `cap.call`s to
+/// Like [`compile_and_run_with_host`], but also supply a [`FastCapResolver`] so hot `call.cap`s to
 /// the resolver's known `(type_id, op)` pairs take the **devirtualized fast path** (register-to-
 /// register, no stack marshalling, no runtime dispatch — §9 / D45). Calls the resolver doesn't claim
 /// fall back to `cap_thunk`. This is the entry an embedder uses once it has specialized host functions
@@ -1026,7 +1026,7 @@ pub fn compile_and_run_with_host_interruptible(
 }
 
 /// [`compile_and_run_with_host_interruptible`] + the §9/D45 [`FastCapResolver`]: the production run
-/// path — a guest-undisableable kill-path **and** hot `cap.call`s devirtualized. The resolver's
+/// path — a guest-undisableable kill-path **and** hot `call.cap`s devirtualized. The resolver's
 /// unclaimed ops fall back to `cap_thunk` unchanged.
 ///
 /// # Safety
@@ -1169,7 +1169,7 @@ pub fn compile_and_run_capture_sub(
     )
 }
 
-/// [`compile_and_run_capture_reserved`] + a live powerbox: `cap.call`s dispatch through
+/// [`compile_and_run_capture_reserved`] + a live powerbox: `call.cap`s dispatch through
 /// `cap_thunk`/`cap_ctx` (so a granted handle takes its **success** path) *and* the final window
 /// is captured for the escape-oracle. Pairs with the interpreter's
 /// [`temen_interp::run_capture_reserved_with_host`] to byte-compare the effects of the §3e Memory
@@ -1804,12 +1804,12 @@ impl Drop for OwnedJit {
 /// [`CompiledModule::define_extra`] then declares + defines + finalizes **additional**
 /// functions into the same live module — the enabling primitive for the guest-driven `Jit`
 /// capability (DESIGN.md §22). Extra functions are *thunk-reachable only*: they are **never**
-/// installed in the function table, so the table mask baked into every `call_indirect` site
+/// installed in the function table, so the table mask baked into every `call.dyn` site
 /// (`fn_table_mask`) never changes — the escape-relevant dispatch is byte-identical to the
 /// one-shot path.
 /// One function produced by [`CompiledModule::define_extra`]: its buffer-ABI **trampoline**
 /// (for `invoke` over a fresh/live window, any arity) and its natural-ABI **entry** + interned
-/// **`type_id`** (for B2 [`CompiledModule::install`] into the `call_indirect` table). Pointers
+/// **`type_id`** (for B2 [`CompiledModule::install`] into the `call.dyn` table). Pointers
 /// are valid for the life of the `CompiledModule`.
 #[derive(Clone, Copy)]
 pub struct DefinedFn {
@@ -2024,7 +2024,7 @@ mod domain_teardown_tests {
     /// the exit code sat in the trap cell but the parked daemon was never woken to observe it.
     #[test]
     fn exit_tears_down_parked_daemon() {
-        /// A one-op powerbox: `cap.call 1 0` is `exit(code)` — store `EXIT_CODE | code << 32`
+        /// A one-op powerbox: `call.cap 1 0` is `exit(code)` — store `EXIT_CODE | code << 32`
         /// into the trap cell, exactly as temen-run's host thunk does for `Trap::Exit`.
         unsafe extern "C" fn exit_thunk(
             _ctx: *mut core::ffi::c_void,
@@ -2056,7 +2056,7 @@ mod domain_teardown_tests {
              \x20 v5 = i32.atomic.wait v2 v3 v4\n\
              \x20 v6 = i32.const 0\n\
              \x20 v7 = i32.const 0\n\
-             \x20 v8 = cap.call 1 0 (i32) -> (i64) v6 (v7)\n\
+             \x20 v8 = call.cap 1 0 (i32) -> (i64) v6 (v7)\n\
              \x20 unreachable\n\
                }}\n\
              }}\n\
@@ -2181,7 +2181,7 @@ pub struct VarMachineInfo {
 }
 
 pub struct CompiledModule {
-    /// The padded function table `call_indirect` dispatches through. Its address is threaded as
+    /// The padded function table `call.dyn` dispatches through. Its address is threaded as
     /// a runtime argument (not baked), but running code reads it — boxed so it never moves, and
     /// declared before `module` so drop order matches the old `drop(fn_table); drop(module)`.
     fn_table: Box<[FnEntry]>,
@@ -2217,7 +2217,7 @@ pub struct CompiledModule {
     /// The counted-fuel cell address baked into this module's functions (`0` ⇒ fuel un-armed), so
     /// `define_extra` recompiles new units against the same cell. See [`Lower::fuel_addr`].
     fuel_addr: i64,
-    /// The `call_indirect` index mask fixed at compile time (`next_pow2(n_funcs) - 1`) and baked
+    /// The `call.dyn` index mask fixed at compile time (`next_pow2(n_funcs) - 1`) and baked
     /// into every call site. `define_extra` compiles new units against this same constant.
     fn_table_mask: u64,
     /// Monotonic counter for unique `declare_function` symbol names across `define_extra` calls.
@@ -2315,7 +2315,7 @@ pub struct CompiledModule {
     fiber_rt: Option<Box<fiber_rt::FiberRuntime>>,
     #[cfg(fiber_rt)]
     domain: Option<Box<os_thread_rt::Domain>>,
-    /// Kept alive because its address is baked into the module's `Instantiator` cap.call sites.
+    /// Kept alive because its address is baked into the module's `Instantiator` call.cap sites.
     #[cfg(fiber_rt)]
     _nursery: Option<Box<instantiator_rt::Nursery>>,
     /// Kept alive because its address (`setjmp.rt_addr`) is baked into the module's `SetJmp`/`LongJmp`
@@ -2566,7 +2566,7 @@ impl CompiledModule {
     /// Compile the whole module (the compile half of the old one-shot `compile_and_run*`):
     /// declare + define every function, the entry's buffer-ABI trampoline, finalize once, and
     /// build the function table. Everything *baked into code* — the confinement mask, the
-    /// `cap.call` thunk/ctx, the runtime addresses, the table mask, the §5 interrupt cell — is
+    /// `call.cap` thunk/ctx, the runtime addresses, the table mask, the §5 interrupt cell — is
     /// fixed here; per-run state (the window, the trap cell) is supplied by [`Self::run`].
     ///
     /// # Safety-relevant contract (not `unsafe`, but load-bearing)
@@ -2591,7 +2591,7 @@ impl CompiledModule {
         table_reserve_log2: u8,
     ) -> Result<CompiledModule, JitError> {
         let entry = m.funcs.get(func as usize).ok_or(JitError::Malformed)?;
-        // The `call_indirect` function table is power-of-two padded; `table_reserve_log2`
+        // The `call.dyn` function table is power-of-two padded; `table_reserve_log2`
         // (DESIGN.md §22) reserves a *larger* table than the module needs so `install` can
         // fill the padding slots without moving the Spectre-safe mask constant (which is baked
         // from this length into every call site). `0` ⇒ the natural `next_pow2(funcs.len())`,
@@ -2679,7 +2679,7 @@ impl CompiledModule {
         let ids: Vec<FuncId> = declare_all_funcs(&mut module, &m.funcs)?;
 
         // Distinct signatures give each function (and call site) a structural type id, the
-        // basis for the `call_indirect` type check (matching the interpreter). Function
+        // basis for the `call.dyn` type check (matching the interpreter). Function
         // signatures come first (`distinct_types`, ids identical to the historical one-shot
         // compile — the fn-table and `fiber_type_id` depend on those positions), then every
         // call-site signature is interned after them. Today a site whose signature matches no
@@ -2691,7 +2691,7 @@ impl CompiledModule {
         intern_unit_sigs(&mut distinct, &m.funcs, &m.types)?;
         let distinct = distinct;
 
-        // The host thunk + ctx addresses, baked into `cap.call` sites as constants.
+        // The host thunk + ctx addresses, baked into `call.cap` sites as constants.
         let cap = CapEnv {
             thunk_addr: cap_thunk as usize as i64,
             ctx_addr: cap_ctx as usize as i64,
@@ -2801,7 +2801,7 @@ impl CompiledModule {
         #[cfg(not(fiber_rt))]
         let thread = ThreadEnv::null();
 
-        // §14 nesting: if the module holds an `Instantiator` (a `cap.call` to iface 6), stand up the
+        // §14 nesting: if the module holds an `Instantiator` (a `call.cap` to iface 6), stand up the
         // per-run `Nursery` whose stable address is baked into those sites. `instantiate` re-compiles a
         // child confined to a sub-window and runs it over this window (its detect-and-kill fault range is
         // supplied post-finalize via `set_env`, like the thread `Domain`). A child runs synchronously
@@ -3208,7 +3208,7 @@ impl CompiledModule {
 
         // Build the function table (§3c) now that code addresses are known: power-of-two
         // padded (to `table_len`, possibly B2-reserved beyond the module), AoS, host-owned.
-        // `call_indirect` masks the guest index into this; padding/reserved slots trap until
+        // `call.dyn` masks the guest index into this; padding/reserved slots trap until
         // `install` fills them.
         let fn_table: Box<[FnEntry]> = (0..table_len)
             .map(|slot| match m.funcs.get(slot) {
@@ -3350,7 +3350,7 @@ impl CompiledModule {
     /// [`Self::run`] through a **caller-managed raw pointer** — the entry the Phase-2 `Jit`
     /// capability path uses, because its handlers re-enter this module mid-run: the host gives
     /// the `Jit` binding a copy of `this`, calls `run_raw(this, …)`, and while the guest is
-    /// suspended inside a synchronous `cap.call` the handler may call
+    /// suspended inside a synchronous `call.cap` the handler may call
     /// [`Self::define_extra`] / [`Self::invoke_extra`] through its copy. `run_raw` keeps no
     /// Rust reference into `*this` alive across the guarded call (see `run_code_raw`), so the
     /// handler's transient `&mut *this` aliases nothing.
@@ -3360,7 +3360,7 @@ impl CompiledModule {
     ///   thread, and **the same pointer value** must be the one handlers use (don't re-derive a
     ///   fresh `&mut` elsewhere while the run is in flight).
     /// - Handlers may call `define_extra` / `invoke_extra` through `this` only while the guest
-    ///   is suspended in a synchronous `cap.call` on this thread, and must not call `run` /
+    ///   is suspended in a synchronous `call.cap` on this thread, and must not call `run` /
     ///   `run_raw` re-entrantly.
     pub unsafe fn run_raw(
         this: *mut CompiledModule,
@@ -3441,7 +3441,7 @@ impl CompiledModule {
     }
 
     /// Invoke an extra trampoline **over the live window of an in-flight run** — the engine of
-    /// the `Jit` capability's `invoke` op. Called from inside a `cap.call` handler while the
+    /// the `Jit` capability's `invoke` op. Called from inside a `call.cap` handler while the
     /// guest is suspended; `mem_base`/`trap_out` are the values the cap thunk received (the
     /// run's window base and trap cell), so the invoked code reads/writes the guest's own
     /// memory in place and a trap in it propagates exactly like a guest trap.
@@ -3449,13 +3449,13 @@ impl CompiledModule {
     /// Runs under a **nested** detect-and-kill recovery (`run_guarded_range` is re-entrant —
     /// the same §14 child-fault pattern as `compile_child_and_run`): a memory fault in the
     /// invoked code is caught *here*, written to `trap_out` as `MemoryFault`, and this returns
-    /// normally — the guest's `cap.call` trap-propagation check then unwinds the domain. Traps
+    /// normally — the guest's `call.cap` trap-propagation check then unwinds the domain. Traps
     /// in invoked code are **terminal for the domain** (DESIGN.md §22); a guest wanting
     /// trap isolation uses the `Instantiator`, not `Jit`.
     ///
     /// # Safety
     /// - `this` must be the pointer an in-flight [`Self::run_raw`] on **this thread** is
-    ///   executing on (the guest suspended in its synchronous `cap.call`), and the caller must
+    ///   executing on (the guest suspended in its synchronous `call.cap`), and the caller must
     ///   hold no Rust reference into `*this` across this call.
     /// - `code` must be a trampoline returned by `define_extra` on this module; `args` must
     ///   cover its param count and `results` its result count.
@@ -3490,7 +3490,7 @@ impl CompiledModule {
         );
         if faulted {
             // Detect-and-kill (§5), reported the same way the outer run reports it; the
-            // guest's cap.call propagation check sees the cell and unwinds the domain.
+            // guest's call.cap propagation check sees the cell and unwinds the domain.
             *trap_out = mem::FAULT_TRAP;
         }
         Ok(())
@@ -3501,7 +3501,7 @@ impl CompiledModule {
     ///
     /// Structured for **mid-run re-entry**: every reference into `*this` is derived
     /// transiently and dropped before the guarded call (raw pointers extracted up front), so a
-    /// `cap.call` handler re-entering through its own copy of `this` while the guest is
+    /// `call.cap` handler re-entering through its own copy of `this` while the guest is
     /// suspended aliases no live Rust reference. The fields a re-entrant `define_extra`
     /// mutates (`module`, `distinct`, `next_extra`) are disjoint from everything the in-flight
     /// call reads through raw pointers (`fn_table` is boxed, never grown or moved; the window
@@ -3762,7 +3762,7 @@ impl CompiledModule {
             }
         }
 
-        // Publish the live window's fault range so a mid-run `invoke_extra` (from a cap.call
+        // Publish the live window's fault range so a mid-run `invoke_extra` (from a call.cap
         // handler) can arm its nested recovery against this run's window.
         (*this).live_fault_range = Some(window.fault_range());
 
@@ -3985,19 +3985,19 @@ impl CompiledModule {
     /// Declare + define + finalize **additional functions** into the live module (DESIGN.md §22:
     /// the enabling primitive for the guest-driven `Jit` capability). The slice is a
     /// self-contained unit: its `FuncIdx` space is unit-local, so direct calls resolve within the
-    /// unit only (cross-unit calls go through `call_indirect` against the parent table, or the
+    /// unit only (cross-unit calls go through `call.dyn` against the parent table, or the
     /// guest re-emits the callee — DESIGN.md §22 "Recommendation"). Returns one buffer-ABI trampoline
     /// pointer per function, in order; invoke via [`Self::run_extra`] (or, in the capability
     /// layer, directly over a live run's window).
     ///
     /// **The function table is deliberately untouched**: extra functions are thunk-reachable
-    /// only, so the table mask baked into every existing `call_indirect` site never changes
+    /// only, so the table mask baked into every existing `call.dyn` site never changes
     /// (DESIGN.md §22 — zero new escape-relevant dispatch surface). Extra code is lowered
-    /// against the *parent's* environment: same confinement mask, same `cap.call` thunk, same
+    /// against the *parent's* environment: same confinement mask, same `call.cap` thunk, same
     /// table mask, and the module's shared **append-only type-id registry** (see
     /// [`Self::interned_type_id`]) — the unit's signatures are interned before lowering, so
     /// id-equality coincides with structural equality across every unit this module has
-    /// compiled or will compile. A `call_indirect` whose signature no table entry carries
+    /// compiled or will compile. A `call.dyn` whose signature no table entry carries
     /// still traps, fail-closed — but a signature first introduced here keeps a stable id, so
     /// a future table install of a structurally equal function can satisfy it.
     ///
@@ -4017,7 +4017,7 @@ impl CompiledModule {
             // Threads/futex ARE hosted (CONSOLIDATION.md §11) — but only when the domain stood up a
             // thread scheduler (`enable_thread_hosting`, driven by a thread-hosting `Jit` grant, or a
             // parent that itself uses threads). Without it the thunk addresses are null, so a
-            // thread/futex-using unit fails closed rather than `call_indirect` through null — exactly
+            // thread/futex-using unit fails closed rather than `call.dyn` through null — exactly
             // the fiber gate below.
             if (f.uses_threads() || f.uses_futex()) && self.thread.is_null() {
                 return Err(JitError::Unsupported(
@@ -4027,7 +4027,7 @@ impl CompiledModule {
             // Fibers ARE hosted — but only when the domain stood up a fiber runtime
             // (`enable_fiber_hosting`, driven by a fiber-hosting `Jit` grant). Without it the
             // `cont.*` thunk addresses are null, so a fiber-using unit must fail closed rather than
-            // lower a `call_indirect` through null.
+            // lower a `call.dyn` through null.
             if f.uses_fibers() && self.fiber.is_null() {
                 return Err(JitError::Unsupported(
                     "a submitted unit using fibers requires a fiber-hosting Jit domain",
@@ -4060,7 +4060,7 @@ impl CompiledModule {
         // Reserve one padding slot per unit function up front, so `ref.func N` / `thread.spawn N`
         // lower to `ref_slots[N]` (below); the finalized code is published into these slots after the
         // build. `None` when the unit names no own function — then no slots are consumed. Single
-        // `cap.call`, so the picked padding slots stay free until we `install_at` them (no concurrent
+        // `call.cap`, so the picked padding slots stay free until we `install_at` them (no concurrent
         // install races within a compile).
         let uses_ref_func = funcs.iter().any(|f| {
             f.blocks.iter().any(|b| {
@@ -4080,7 +4080,7 @@ impl CompiledModule {
                 .collect();
             if free.len() < funcs.len() {
                 return Err(JitError::Unsupported(
-                    "not enough reserved call_indirect slots for a submitted unit's own funcrefs \
+                    "not enough reserved call.dyn slots for a submitted unit's own funcrefs \
                      (grant a larger Jit table)",
                 ));
             }
@@ -4152,7 +4152,7 @@ impl CompiledModule {
         // Publish the unit's now-finalized functions into the slots reserved above, so a `ref.func`
         // funcref (remapped to `ref_slots[N]`) resolves to the unit's own function through the
         // ordinary masked dispatch (DESIGN.md §22 "unit-own funcref"). Slots were picked from the
-        // padding pool and are still free (single `cap.call`), so each `install_at` succeeds.
+        // padding pool and are still free (single `call.cap`), so each `install_at` succeeds.
         if let Some(slots) = &ref_slots {
             for ((f, id), &slot) in funcs.iter().zip(&ids).zip(slots) {
                 let code = self.module.get_finalized_function(*id);
@@ -4172,7 +4172,7 @@ impl CompiledModule {
         }
         // Per function: the buffer-ABI trampoline (for `invoke` over a window) **and** the
         // natural-ABI entry + interned `type_id` (for B2 `install` into the function table —
-        // `call_indirect` calls the natural ABI, not the trampoline).
+        // `call.dyn` calls the natural ABI, not the trampoline).
         Ok(funcs
             .iter()
             .zip(&ids)
@@ -4203,7 +4203,7 @@ impl CompiledModule {
     ///
     /// Called by the `Jit` run entries between `compile` and `run` for a **fiber-hosting** grant.
     /// The subsequent `run` publishes `CURRENT_RT` from `self.fiber_rt` (set here), so a submitted
-    /// unit's `cont.*`, running on the caller's stack inside the synchronous `cap.call`, resolve it.
+    /// unit's `cont.*`, running on the caller's stack inside the synchronous `call.cap`, resolve it.
     /// A submitted unit whose own scheduler creates fibers over unit-local entries needs those
     /// entries reachable as funcrefs (§22 install / the shared `fn_table`) — same as any `cont.new`.
     ///
@@ -4375,13 +4375,13 @@ impl CompiledModule {
         Ok(())
     }
 
-    /// **Install** an incrementally-defined function into the live `call_indirect` table (DESIGN.md §22
+    /// **Install** an incrementally-defined function into the live `call.dyn` table (DESIGN.md §22
     /// Model B2): write its natural-ABI `code` + interned `type_id` into the next reserved
     /// padding slot, returning that slot index — a funcref the guest (or another unit) can
-    /// `call_indirect` at native speed (old→new / new→new). `None` if the table is full (every
+    /// `call.dyn` at native speed (old→new / new→new). `None` if the table is full (every
     /// reserved slot taken). The base never moves (the table was pre-reserved at compile, the
     /// mask is a baked constant), so this is just a slot write. The write is **release-ordered and
-    /// atomic** ([`FnEntry::publish`]), so it is sound against a concurrent `call_indirect` from
+    /// atomic** ([`FnEntry::publish`]), so it is sound against a concurrent `call.dyn` from
     /// another thread — the JIT §6 #2 threaded-install path — not only the single-threaded MVP.
     /// Takes `&self`: the running generated code reads the table through raw pointers, so the host
     /// install must not claim a Rust exclusive borrow over it.
@@ -4394,9 +4394,9 @@ impl CompiledModule {
         Some(slot as u32)
     }
 
-    /// **Uninstall** a previously-`install`ed `call_indirect` slot (DESIGN.md §22 reclaim): set
+    /// **Uninstall** a previously-`install`ed `call.dyn` slot (DESIGN.md §22 reclaim): set
     /// it back to a trapping padding slot so the index is reusable by a later `install` and a
-    /// stale `call_indirect` of it fails closed (`IndirectCallType`). Returns `true` on success;
+    /// stale `call.dyn` of it fails closed (`IndirectCallType`). Returns `true` on success;
     /// `false` for an out-of-range slot, a real module-function slot (`< n_real_funcs`), or an
     /// already-empty slot — a guest may only reclaim what it installed. (The code memory itself
     /// is not freed — cranelift-jit has no per-function free; this reclaims the *slot*.)
@@ -4433,7 +4433,7 @@ impl CompiledModule {
         true
     }
 
-    /// The currently-occupied **installable** slots (`≥ n_real_funcs`) of the `call_indirect`
+    /// The currently-occupied **installable** slots (`≥ n_real_funcs`) of the `call.dyn`
     /// table, as `(slot, code, type_id)`. The reclaim driver (DESIGN.md §22) reads this from the
     /// *old* module to learn which units occupy which slots, joins each `code` back to its owning
     /// unit (via the embedder's per-unit install record), and reproduces the exact slot in the
@@ -4496,7 +4496,7 @@ impl CompiledModule {
     }
 }
 
-/// Compile `func` (and the module's other functions, which `call`/`call_indirect` may reach) as a
+/// Compile `func` (and the module's other functions, which `call`/`call.dyn` may reach) as a
 /// **top-level guest over its own fresh `2^child_size_log2`-byte window**, seeded from the parent's
 /// sub-region `[parent_mem_base + sub_base, … + child_size)` and copied back into it on completion.
 /// This is the JIT side of §14 nesting (the `Instantiator`): "nesting cost is paid at setup, not at
@@ -4511,7 +4511,7 @@ impl CompiledModule {
 ///
 /// Returns the child's `(result_slot, trap_cell)` — one `i64` result (the Instantiator child returns
 /// one `i64`); the trap cell is `0`, a `TrapKind`, or an `Exit` encoding. The child gets an **empty
-/// powerbox** (an inert `cap.call`) for now; a child using §12 fibers/threads is rejected
+/// powerbox** (an inert `call.cap`) for now; a child using §12 fibers/threads is rejected
 /// (`Unsupported`) — those need per-child runtimes (a follow-up), and null thunks would be unsound.
 ///
 /// # Safety
@@ -4545,7 +4545,7 @@ pub(crate) unsafe fn compile_child_and_run(
 
     // §4 (DURABILITY.md, "JIT parity"): a **durable** child gets an attenuated `Instantiator` powerbox
     // so it can nest a grandchild of its own — the freeze slice's prerequisite (an instrumented child
-    // that can be *live* mid-computation is one that reached a `cap.call`). Build a child `Nursery`
+    // that can be *live* mid-computation is one that reached a `call.cap`). Build a child `Nursery`
     // over the child's own funcs, boxed here so its stable address (baked into the child code below)
     // outlives the run; its `instantiate` re-enters `compile_child_and_run` for the grandchild
     // (recursion), re-checking the same durable + same-module guard. The child's powerbox holds one
@@ -4605,7 +4605,7 @@ pub(crate) unsafe fn compile_child_and_run(
         },
         None => InstEnv::null(),
     };
-    // The synchronous child's non-nesting powerbox is empty (an inert `cap.call` → `CapFault`); its
+    // The synchronous child's non-nesting powerbox is empty (an inert `call.cap` → `CapFault`); its
     // `Instantiator` (if any) is routed by `child_inst` above.
     let child = compile_child(
         funcs,
@@ -4780,7 +4780,7 @@ pub(crate) unsafe fn compile_child_and_run(
 /// child keeps it alive across suspends (the [`instantiator_rt`] coroutine owns it).
 #[cfg(fiber_rt)]
 pub(crate) struct ChildCode {
-    /// The padded function table `call_indirect` dispatches through; its address is baked into the
+    /// The padded function table `call.dyn` dispatches through; its address is baked into the
     /// running code, so it must not move while the child can run (it is boxed and owned here).
     pub(crate) fn_table: Box<[FnEntry]>,
     /// The entry trampoline (buffer ABI, [`mem::run_guarded`]-compatible).
@@ -4941,7 +4941,7 @@ fn declare_all_funcs(module: &mut JITModule, funcs: &[Func]) -> Result<Vec<FuncI
 }
 
 /// Compile a §14 child module: every function confined (top-level masking) to a fresh
-/// `2^child_size_log2`-byte window, `cap.call`s baked to `cap_thunk`/`cap_ctx`, and the entry
+/// `2^child_size_log2`-byte window, `call.cap`s baked to `cap_thunk`/`cap_ctx`, and the entry
 /// wrapped in a buffer-ABI trampoline. "Nesting cost is paid at setup" (§14): this is the setup.
 /// A child using §12 fibers/threads is rejected (`Unsupported`) — those need per-child runtimes,
 /// and compiling them against null thunks would be unsound.
@@ -4949,7 +4949,7 @@ fn declare_all_funcs(module: &mut JITModule, funcs: &[Func]) -> Result<Vec<FuncI
 #[allow(clippy::too_many_arguments)] // a child compile threads its full cap/kill/futex/nesting context
 fn compile_child(
     funcs: &[Func],
-    // #922 — the child module's type section, so `call_indirect`/`cap.call` interned type indices
+    // #922 — the child module's type section, so `call.dyn`/`call.cap` interned type indices
     // in `funcs` resolve to their `FuncType` during lowering.
     types: &[temen_ir::TypeEntry],
     child_entry: FuncIdx,
@@ -5022,7 +5022,7 @@ fn compile_child(
     let cap = CapEnv {
         thunk_addr: cap_thunk as *const () as i64,
         ctx_addr: cap_ctx as i64,
-        fast_resolver: None, // nested child: `cap.call`s go to the coroutine thunk, not a fast path
+        fast_resolver: None, // nested child: `call.cap`s go to the coroutine thunk, not a fast path
     };
     // Wait/notify-only thread env over the **parent's** futex domain (spawn/join stay rejected
     // above, so their null thunks are never reached); null when no domain was supplied.
@@ -5178,7 +5178,7 @@ pub fn child_compiles() -> u64 {
 }
 
 /// PROCESS.md S1: compile a **non-durable** §14 child — the cacheable case. Its powerbox is empty
-/// (an inert `cap.call` → `CapFault`) and it has no nesting `InstEnv`, so the compiled code depends
+/// (an inert `call.cap` → `CapFault`) and it has no nesting `InstEnv`, so the compiled code depends
 /// only on `(funcs, entry, size_log2, epoch_addr)` — nothing per-spawn — which is what makes it
 /// safe to cache and reuse across carves (the base is a runtime arg to [`run_child_code`], not
 /// baked). The durable / nesting child keeps the per-call [`compile_child_and_run`] path (its baked
@@ -5306,7 +5306,7 @@ pub(crate) unsafe fn run_child_code_then(
 
 /// The natural CLIF signature for an IR function: `(mem_base, fn_table_base, params…)
 /// -> (results…)`. Both context pointers are threaded through every call so loads/
-/// stores reach the window and `call_indirect` reaches the function table.
+/// stores reach the window and `call.dyn` reaches the function table.
 fn natural_sig(module: &mut JITModule, f: &Func) -> cranelift_codegen::ir::Signature {
     sig_from(module, &f.params, &f.results)
 }
@@ -5320,7 +5320,7 @@ fn natural_sig(module: &mut JITModule, f: &Func) -> cranelift_codegen::ir::Signa
 /// thread entry and the multi-result test cases — on the fast register path, while being safely
 /// within the tightest target's budget; only `>4`-result functions take the sret path. The decision
 /// is by result **count**, a property of the function *type*, so it is identical at every call site —
-/// direct, `call_indirect` (its type id pins the same choice), and tail calls.
+/// direct, `call.dyn` (its type id pins the same choice), and tail calls.
 const MAX_REG_RESULTS: usize = 4;
 
 /// Whether a function with these results returns via the memory return-area pointer (sret) rather
@@ -5338,7 +5338,7 @@ fn sret_blocked_by_v128(results: &[ValType]) -> bool {
 }
 
 /// The natural signature for an explicit param/result list (shared by `natural_sig`
-/// and the `call_indirect` signature import).
+/// and the `call.dyn` signature import).
 fn sig_from(
     module: &mut JITModule,
     params: &[ValType],
@@ -5540,13 +5540,13 @@ fn ensure_supported(f: &Func, type_section: &[temen_ir::TypeEntry]) -> Result<()
     Ok(())
 }
 
-/// The host `cap.call` thunk + ctx addresses, baked into each `cap.call` as constants.
+/// The host `call.cap` thunk + ctx addresses, baked into each `call.cap` as constants.
 #[derive(Clone, Copy)]
 struct CapEnv {
     thunk_addr: i64,
     ctx_addr: i64,
     /// The optional D45 devirtualize-to-direct-call resolver (top-level compile only; `None` for
-    /// nested children, whose `cap.call`s go to the coroutine thunk). Invoked at compile time.
+    /// nested children, whose `call.cap`s go to the coroutine thunk). Invoked at compile time.
     fast_resolver: Option<FastCapResolver>,
 }
 
@@ -5579,7 +5579,7 @@ impl FiberEnv {
     }
     /// No fiber runtime is stood up for this module (the `cont.*` thunk addresses are unbaked). A
     /// submitted unit that uses fibers must be rejected in this state — else its `cont.*` would
-    /// `call_indirect` through a null thunk. `enable_fiber_hosting` clears this for a `Jit` domain.
+    /// `call.dyn` through a null thunk. `enable_fiber_hosting` clears this for a `Jit` domain.
     fn is_null(&self) -> bool {
         self.new_thunk == 0
     }
@@ -5609,7 +5609,7 @@ impl ThreadEnv {
     }
     /// No thread scheduler is stood up for this module (the `thread.*`/futex thunk addresses are
     /// unbaked). A submitted unit that uses threads/futex must be rejected in this state — else its
-    /// `thread.spawn` would `call_indirect` through a null thunk. `enable_thread_hosting` clears this
+    /// `thread.spawn` would `call.dyn` through a null thunk. `enable_thread_hosting` clears this
     /// (CONSOLIDATION.md §11) — the twin of [`FiberEnv::is_null`] / `enable_fiber_hosting`.
     fn is_null(&self) -> bool {
         self.sched_addr == 0
@@ -5617,9 +5617,9 @@ impl ThreadEnv {
 }
 
 /// The §14 nesting runtime address + the `instantiate`/`join` thunk addresses, baked into the
-/// module's `Instantiator` `cap.call` sites. All `0` when the module holds no `Instantiator`, or in a
-/// **child** compilation (a JIT child cannot itself nest yet — its `Instantiator` cap.call falls
-/// through to the ordinary `cap.call` path, i.e. an inert `CapFault`).
+/// module's `Instantiator` `call.cap` sites. All `0` when the module holds no `Instantiator`, or in a
+/// **child** compilation (a JIT child cannot itself nest yet — its `Instantiator` call.cap falls
+/// through to the ordinary `call.cap` path, i.e. an inert `CapFault`).
 #[derive(Clone, Copy)]
 struct InstEnv {
     nursery_addr: i64,
@@ -5656,8 +5656,8 @@ impl InstEnv {
             child_offer_thunk: 0,
         }
     }
-    /// True when this compilation may lower `Instantiator` cap.calls to the nesting runtime (the
-    /// parent compile with a live `Nursery`); `false` ⇒ they take the ordinary `cap.call` path.
+    /// True when this compilation may lower `Instantiator` call.cap calls to the nesting runtime (the
+    /// parent compile with a live `Nursery`); `false` ⇒ they take the ordinary `call.cap` path.
     fn is_active(&self) -> bool {
         self.nursery_addr != 0
     }
@@ -5694,7 +5694,7 @@ impl SetjmpEnv {
 struct Lower<'a> {
     /// Holds `mem_base` (the window base) for load/store lowering and call threading.
     mem_var: Variable,
-    /// Holds `fn_table_base` for `call_indirect` dispatch and call threading.
+    /// Holds `fn_table_base` for `call.dyn` dispatch and call threading.
     fn_table_var: Variable,
     /// Holds `trap_out`, the host-owned `*mut i64` trap cell a trap (or the cap thunk)
     /// writes before returning (the host reads it to learn the run trapped, §5).
@@ -5707,7 +5707,7 @@ struct Lower<'a> {
     result_tys: Vec<Type>,
     /// The §4 confinement mask (`reserved - 1`); `0` when the module has no memory.
     mask: u64,
-    /// The backed `mapped` extent in bytes — the guest window length handed to the `cap.call`
+    /// The backed `mapped` extent in bytes — the guest window length handed to the `call.cap`
     /// thunk (`[mem_base, mem_base+mapped)`), so buffer borrows and Memory-cap ops bound against
     /// the *backed* region, not the larger reserved mask domain. `0` when the module has no memory.
     mapped: u64,
@@ -5725,25 +5725,25 @@ struct Lower<'a> {
     /// The target's frontend config (pointer width + default call conv), for the Cranelift
     /// `call_memcpy`/`call_memmove`/`call_memset` helpers that lower the bulk-memory ops (D62).
     frontend_config: cranelift_codegen::isa::TargetFrontendConfig,
-    /// The function-table index mask (`next_pow2(nfuncs) - 1`) for `call_indirect`.
+    /// The function-table index mask (`next_pow2(nfuncs) - 1`) for `call.dyn`.
     fn_table_mask: u64,
     /// **Submitted-unit `ref.func` remap** (DESIGN.md §22 "unit-own funcref"). For a top-level
     /// compile this is `None` and `ref.func N` lowers to the bare index `N` (module-0 slot N). For a
     /// guest-submitted unit that takes its own functions' addresses, `define_extra` auto-installs the
-    /// unit's functions into reserved `call_indirect` slots and passes the map here (indexed by the
+    /// unit's functions into reserved `call.dyn` slots and passes the map here (indexed by the
     /// unit-local function index), so `ref.func N` lowers to `iconst(ref_slots[N])` — the real shared
     /// table slot — instead of `N`, which would resolve against the *parent's* table. This is what
-    /// lets a unit `cont.new`/`thread.spawn`/`call_indirect` over its OWN function; it changes only
+    /// lets a unit `cont.new`/`thread.spawn`/`call.dyn` over its OWN function; it changes only
     /// *which constant* `ref.func` emits, never the masked-dispatch lowering (invariant I2).
     ref_slots: Option<&'a [u32]>,
-    /// The host `cap.call` thunk + ctx (constant addresses).
+    /// The host `call.cap` thunk + ctx (constant addresses).
     cap: CapEnv,
     /// The §12 fiber runtime + thunk addresses for `cont.*` lowering.
     fiber: FiberEnv,
     /// The §12 thread scheduler + thunk addresses for `thread.*` lowering.
     thread: ThreadEnv,
-    /// The §14 nesting runtime + thunk addresses for `Instantiator` `cap.call` lowering (`null` ⇒
-    /// `Instantiator` cap.calls take the ordinary `cap.call` path — an inert `CapFault`).
+    /// The §14 nesting runtime + thunk addresses for `Instantiator` `call.cap` lowering (`null` ⇒
+    /// `Instantiator` call.cap calls take the ordinary `call.cap` path — an inert `CapFault`).
     inst: InstEnv,
     /// The per-run `setjmp` table + libc `_setjmp`/`_longjmp` addresses for `SetJmp`/`LongJmp` lowering
     /// (`null` ⇒ the module has no `setjmp`, or the target lacks the runtime and `ensure_supported`
@@ -5769,12 +5769,12 @@ struct Lower<'a> {
     /// Every function's `FuncId`, so `call`/`return_call` can reference callees.
     ids: &'a [FuncId],
     /// The functions of this compilation unit, indexed like [`Self::ids`], so a **direct** `call`
-    /// can read its callee's result types to decide the sret ABI (see [`uses_sret`]). `call_indirect`
+    /// can read its callee's result types to decide the sret ABI (see [`uses_sret`]). `call.dyn`
     /// uses its own carried type instead.
     funcs: &'a [Func],
-    /// Distinct module signatures, for `call_indirect` type ids.
+    /// Distinct module signatures, for `call.dyn` type ids.
     distinct: &'a [FuncType],
-    /// The unit's **type section** (#922): the call variants (`call_indirect`, `cap.call`, …)
+    /// The unit's **type section** (#922): the call variants (`call.dyn`, `call.cap`, …)
     /// carry a `u32` index into this, which the lowering resolves to the `FuncType` it needs for
     /// the call signature and (via [`type_id_of`]/[`intern_type`]) the dispatch type id.
     type_section: &'a [temen_ir::TypeEntry],
@@ -5822,7 +5822,7 @@ fn trap_capture_addr() -> i64 {
 /// -> (results…)`. The CLIF entry block holds the native params and jumps into IR
 /// block 0 passing the parameters as its block args.
 ///
-/// `fn_table_mask` is the `call_indirect` index mask — `next_pow2(table_len) - 1` for the
+/// `fn_table_mask` is the `call.dyn` index mask — `next_pow2(table_len) - 1` for the
 /// table this function will dispatch through. It is an explicit parameter (not derived from
 /// `ids.len()`) because an **incrementally defined** function (`CompiledModule::define_extra`)
 /// has its own unit-local `ids` for direct calls but dispatches through the *parent's*
@@ -6070,7 +6070,7 @@ fn module_uses_setjmp(m: &IrModule) -> bool {
     m.funcs.iter().any(|f| f.uses_setjmp())
 }
 
-/// Whether `m` holds a §14 `Instantiator` — a `cap.call` to `cap_id::INSTANTIATOR`
+/// Whether `m` holds a §14 `Instantiator` — a `call.cap` to `cap_id::INSTANTIATOR`
 /// — so `run_inner` knows to stand up the nesting [`instantiator_rt::Nursery`].
 #[cfg(fiber_rt)]
 fn module_uses_instantiator(m: &IrModule) -> bool {
@@ -6090,7 +6090,7 @@ fn module_uses_instantiator(m: &IrModule) -> bool {
 }
 
 /// Build the generic fiber **call-trampoline**: `extern "C" fn(code, mem_base, fn_table_base,
-/// trap_out, sp, arg) -> i64` that `call_indirect`s a guest fiber entry under its `Tail` ABI. Rust
+/// trap_out, sp, arg) -> i64` that `call.dyn`s a guest fiber entry under its `Tail` ABI. Rust
 /// cannot call a `Tail`-convention function directly, so the fiber runtime calls this (default C ABI)
 /// instead; one trampoline serves all fibers since every entry is `(i64 sp, i64 arg) -> i64`.
 #[cfg(fiber_rt)]
@@ -6166,7 +6166,7 @@ fn lower_block(
                 b.set_srcloc(SourceLoc::new(loc));
             }
         }
-        // `call`/`call_indirect` append 0..N results — handle before the single-value
+        // `call`/`call.dyn` append 0..N results — handle before the single-value
         // match (which produces exactly one value).
         if let Inst::Call { func, args } = inst {
             let callee_id = *lower.ids.get(*func as usize).ok_or(JitError::Malformed)?;
@@ -6184,7 +6184,7 @@ fn lower_block(
             let call = b.ins().call(callee, &cargs);
             // A trap raised inside the callee leaves the trap cell set and returns zeros; propagate
             // it here so it unwinds immediately (else the caller would run on with bogus results,
-            // and a later successful `cap.call` could reset the cell, masking the trap). On the sret
+            // and a later successful `call.cap` could reset the cell, masking the trap). On the sret
             // path this also returns *before* reading the unwritten return-area slots.
             emit_trap_propagate(b, lower);
             read_call_results(b, call, sret, results, &mut vals);
@@ -6235,7 +6235,7 @@ fn lower_block(
                 continue;
             }
             // FORK.md §8.6 — `exec_module` (`execve` image-replace, op 14) is eval-loop-only: the
-            // tree-walker folds it to `Step::Exec` before any host dispatch. The generic `cap.call`
+            // tree-walker folds it to `Step::Exec` before any host dispatch. The generic `call.cap`
             // thunk here would answer `-EINVAL` where the oracle image-replaces — a silent divergence
             // (INVARIANTS.md #9). Decline so the run folds to a reifiable tier (OPS_PARITY.md `exec`).
             if *type_id == temen_ir::CAP_SELF_TYPE_ID && *op == 14 {
@@ -6244,8 +6244,8 @@ fn lower_block(
                 ));
             }
             // §14 `Instantiator` (iface 6): when this (parent) compile has a live `Nursery`, lower
-            // `instantiate`/`join` to its thunks instead of the generic `cap.call` — spawning a child
-            // needs the host compiler, which the flat `cap.call` thunk can't reach. Otherwise (a child
+            // `instantiate`/`join` to its thunks instead of the generic `call.cap` — spawning a child
+            // needs the host compiler, which the flat `call.cap` thunk can't reach. Otherwise (a child
             // compile, or no nesting runtime) it falls through to the ordinary path (an inert CapFault).
             if *type_id == cap_id::INSTANTIATOR && lower.inst.is_active() {
                 lower_instantiator(module, b, lower, *op, sig, *handle, args, &mut vals)?;
@@ -6259,12 +6259,12 @@ fn lower_block(
             }
             continue;
         }
-        // §7 executable named import (IMPORTS.md phase 1): lower like the `cap.self.*` family — a
-        // `cap.call` thunk with the reserved `CAP_IMPORT_TYPE_ID` and the **import index** as the
+        // §7 executable named import (IMPORTS.md phase 1): lower like the `self.*` family — a
+        // `call.cap` thunk with the reserved `CAP_IMPORT_TYPE_ID` and the **import index** as the
         // op. The host's dispatch translates it through the instantiation-time binding table
         // (import `i` → bound `(type_id, op)` + granted handle) and re-dispatches — one shared
         // implementation with the interpreter and the bytecode engine. The vestigial handle operand
-        // is not read (constant 0, like `cap.self.*`); the module bytes are never rewritten, so the
+        // is not read (constant 0, like `self.*`); the module bytes are never rewritten, so the
         // compiled code is identical across instantiations (the binding is host-side state).
         if let Inst::CallImport {
             import,
@@ -6337,7 +6337,7 @@ fn lower_block(
             continue;
         }
         // §3.5 self-namespace extensions — the shared dispatch entry with `CAP_SELF_TYPE_ID` and
-        // op packed `(selfop | idx << 8)`: 6 = `cap.self.type_id`, 7 = `cap.self.covers`
+        // op packed `(selfop | idx << 8)`: 6 = `self.type_id`, 7 = `self.covers`
         // (handle as the one argument), 8 = `export.handle`. One `i32` result each.
         if matches!(
             inst,
@@ -6397,11 +6397,11 @@ fn lower_block(
             )?;
             continue;
         }
-        // §7/§6 capability reflection (`cap.self.count`/`get`/`resolve`/`label`/`attest`) is no longer
-        // a distinct IR op — the frontend emits its `cap.call CAP_SELF op N` form, lowered by the
+        // §7/§6 capability reflection (`self.count`/`get`/`resolve`/`label`/`attest`) is no longer
+        // a distinct IR op — the frontend emits its `call.cap CAP_SELF op N` form, lowered by the
         // generic `Inst::CapCall` arm above (a `lower_cap_call` thunk the host services directly).
         // §12 fibers: lower `cont.*` to indirect calls to the host fiber thunks (addresses baked into
-        // `lower.fiber`), threading `mem_base`/`fn_table_base`/`trap_out` like `cap.call`. A thunk that
+        // `lower.fiber`), threading `mem_base`/`fn_table_base`/`trap_out` like `call.cap`. A thunk that
         // sets the trap cell (forged handle, bad funcref, fiber-bomb, root suspend) propagates here.
         if let Inst::ContNew { func, sp } = inst {
             // fiber_new(mem_base, fn_table_base, trap_out, funcref:i32, sp:i64) -> i32 handle. The
@@ -6643,7 +6643,7 @@ fn lower_block(
         }
         // §12 threads: lower `thread.spawn`/`thread.join` to indirect calls to the host scheduler
         // thunks (addresses baked into `lower.thread`), threading `mem_base`/`fn_table_base`/`trap_out`
-        // like `cap.call`. A thunk that sets the trap cell (forged handle, thread-bomb) propagates here.
+        // like `call.cap`. A thunk that sets the trap cell (forged handle, thread-bomb) propagates here.
         if let Inst::ThreadSpawn { func, sp, arg } = inst {
             // thread_spawn(sched, mem_base, fn_table_base, trap_out, func_idx:i32, sp:i64, arg:i64) -> i32
             let sched = b.ins().iconst(I64, lower.thread.sched_addr);
@@ -6651,7 +6651,7 @@ fn lower_block(
             let fnt = b.use_var(lower.fn_table_var);
             let trap_out = b.use_var(lower.trap_var);
             // The spawn entry is dispatched through the shared `fn_table` (`os_thread_rt` masks it
-            // into the table like any `call_indirect`). A submitted unit's own functions live in
+            // into the table like any `call.dyn`). A submitted unit's own functions live in
             // auto-installed padding slots, not at their module-relative indices — so remap `func`
             // through `ref_slots` exactly like `ref.func` (DESIGN.md §22 "unit-own funcref"). Without
             // this a unit's `thread.spawn N` would launch the *parent's* function N. Top-level
@@ -7542,7 +7542,7 @@ fn lower_block(
                 )
             }
             // A funcref is just the function index as plain i32 data (§3c) — the same
-            // value the interpreter materializes; `call_indirect` masks it into the table.
+            // value the interpreter materializes; `call.dyn` masks it into the table.
             Inst::RefFunc { func } => {
                 // A submitted unit's own-function address must be a real shared-table slot (the unit
                 // is auto-installed there — DESIGN.md §22 "unit-own funcref"), so it resolves to the
@@ -8046,10 +8046,10 @@ fn indirect_dispatch(b: &mut FunctionBuilder, lower: &Lower, idx: Value, ty: &Fu
 
 /// Emit "if the host trap cell is non-zero, propagate the trap now": branch to an early
 /// `return` of zero-valued results (the trap kind / exit code already sits in the cell, which the
-/// entry trampoline reads to decide `Trapped`/`Exited`). Used after **every** `cap.call` *and*
-/// every `call`/`call_indirect`, so a trap raised deep in a callee unwinds the whole guest stack
+/// entry trampoline reads to decide `Trapped`/`Exited`). Used after **every** `call.cap` *and*
+/// every `call`/`call.dyn`, so a trap raised deep in a callee unwinds the whole guest stack
 /// immediately — before any later op can observe bogus zero results or overwrite the cell (a
-/// *successful* `cap.call` resets it to 0, which would otherwise mask a callee's trap).
+/// *successful* `call.cap` resets it to 0, which would otherwise mask a callee's trap).
 fn emit_trap_propagate(b: &mut FunctionBuilder, lower: &Lower) {
     let trap_out = b.use_var(lower.trap_var);
     let tc = b.ins().load(I64, MemFlags::trusted(), trap_out, 0);
@@ -8064,7 +8064,7 @@ fn emit_trap_propagate(b: &mut FunctionBuilder, lower: &Lower) {
     b.seal_block(cont);
 }
 
-/// Resolve the §9/D45 fast-path target for a `cap.call`, if one applies: there is a [`FastCapResolver`]
+/// Resolve the §9/D45 fast-path target for a `call.cap`, if one applies: there is a [`FastCapResolver`]
 /// (top-level compile), the op has **at most one result** (the register ABI returns a single i64), and
 /// the resolver claims this `(type_id, op)` (returns a non-null specialized fn). Returns the baked
 /// target address. Resolution is a **compile-time** call into the embedder's resolver.
@@ -8076,7 +8076,7 @@ fn fast_cap_target(lower: &Lower, type_id: u32, op: u32, sig: &FuncType) -> Opti
     // SAFETY: `resolver` honours the `FastCapResolver` contract (caller guarantee); it's a pure
     // `(type_id, op, n_args, n_res) -> *const fn` lookup with no side effects, safe to call during
     // codegen. The arity is passed so the resolver only claims an op when its specialized fn's arity
-    // matches the IR `cap.call`'s — else it returns null and the generic slot-based path is used.
+    // matches the IR `call.cap`'s — else it returns null and the generic slot-based path is used.
     let target = unsafe {
         resolver(
             type_id,
@@ -8088,7 +8088,7 @@ fn fast_cap_target(lower: &Lower, type_id: u32, op: u32, sig: &FuncType) -> Opti
     (target != 0).then_some(target)
 }
 
-/// Lower a `cap.call` via the **devirtualized fast path** (§9 / D45): a direct register-to-register
+/// Lower a `call.cap` via the **devirtualized fast path** (§9 / D45): a direct register-to-register
 /// call to the specialized host fn at `target`, passing `ctx`/`mem_base`/`mem_size`/`handle`/`trap_out`
 /// then each argument **in a register** (widened to its i64 slot), and reading the single result back
 /// from a register — no stack-slot marshalling, no `n_args`/`n_res`/`type_id`/`op` dispatch. The trap
@@ -8142,7 +8142,7 @@ fn lower_cap_call_fast(
     Ok(())
 }
 
-/// Lower a `cap.call` (§3c/§9): marshal the arg slots into a stack buffer, call the host
+/// Lower a `call.cap` (§3c/§9): marshal the arg slots into a stack buffer, call the host
 /// thunk (a baked-in constant address) with the cap immediates + the guest window, and
 /// — unless it set the trap cell — read the result slots back. A trap from the thunk
 /// (CapFault / Exit) propagates like any other (return early; the cell is already set).
@@ -8253,11 +8253,11 @@ fn lower_cap_call(
     Ok(())
 }
 
-/// Lower a §14 `Instantiator` `cap.call` (iface 6) to the nesting runtime ([`instantiator_rt`]) — only
+/// Lower a §14 `Instantiator` `call.cap` (iface 6) to the nesting runtime ([`instantiator_rt`]) — only
 /// reached when this (parent) compile has a live `Nursery` (`lower.inst.is_active()`). `op 0`
 /// `instantiate(entry, off, size_log2, fuel) -> child_handle` and `op 1` `join(child_handle) ->
 /// result` call the baked thunks, threading `mem_base` (the live parent window) + `trap_out`; a thunk
-/// that sets the trap cell (forged handle, bad carve, child trap) propagates here like any `cap.call`.
+/// that sets the trap cell (forged handle, bad carve, child trap) propagates here like any `call.cap`.
 #[allow(clippy::too_many_arguments)] // mirrors the CapCall fields + the shared lowering context
 fn lower_instantiator(
     module: &mut JITModule,
@@ -8269,7 +8269,7 @@ fn lower_instantiator(
     args: &[u32],
     vals: &mut Vec<Value>,
 ) -> Result<(), JitError> {
-    // §3c: the verifier checks a `cap.call`'s args against its *declared* `sig` only — it knows
+    // §3c: the verifier checks a `call.cap`'s args against its *declared* `sig` only — it knows
     // nothing about host interfaces, so a verifier-valid module can call iface 6 with any
     // `(op, sig)` shape. The interpreter discovers a mismatch at **runtime** (handle resolution
     // first → `CapFault` on a forged handle; then per-op arg indexing → `Malformed`), but this
@@ -8383,7 +8383,7 @@ fn lower_instantiator(
             vals.push(r);
         }
         1 => {
-            // join(nursery, child_handle:i32, trap_out:i64) -> result:i64. The cap.call's handle
+            // join(nursery, child_handle:i32, trap_out:i64) -> result:i64. The call.cap's handle
             // operand (the Instantiator) is unused here — the child handle is the first arg, and the
             // nursery owns the child table for this run.
             let child = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
@@ -8403,7 +8403,7 @@ fn lower_instantiator(
         }
         9 | 10 | 12 => {
             // S3 lifecycle: poll / detach / kill (nursery, child:i32, trap_out:i64) -> status:i32.
-            // The cap.call's handle operand (the Instantiator) is unused — the child handle is arg 0,
+            // The call.cap's handle operand (the Instantiator) is unused — the child handle is arg 0,
             // and the nursery owns the child table (as for `join`).
             let child = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
             let mut tsig = module.make_signature();
@@ -8518,11 +8518,11 @@ fn get(vals: &[Value], i: u32) -> Result<Value, JitError> {
     vals.get(i as usize).copied().ok_or(JitError::Malformed)
 }
 
-/// Widen a fetched cap.call arg to the `i64` slot an Instantiator thunk param takes — the JIT analogue
+/// Widen a fetched call.cap arg to the `i64` slot an Instantiator thunk param takes — the JIT analogue
 /// of the interpreter reading every arg as `Reg::i64()` off a **sign-extended** slot (`from_i32`). A
 /// chibicc-emitted call already passes i64 (passthrough); a frontend that declares a slot arg `i32`
 /// gets sign-extended, matching the interp exactly. Keeps the two backends in lockstep even though the
-/// verifier only checks a cap.call against its *declared* sig (§3c), not the host op's contract.
+/// verifier only checks a call.cap against its *declared* sig (§3c), not the host op's contract.
 fn slot_i64(b: &mut FunctionBuilder, v: Value) -> Value {
     if b.func.dfg.value_type(v) == I32 {
         b.ins().sextend(I64, v)
@@ -8531,7 +8531,7 @@ fn slot_i64(b: &mut FunctionBuilder, v: Value) -> Value {
     }
 }
 
-/// Narrow a fetched cap.call arg to the `i32` a handle/child thunk param takes. chibicc widens every
+/// Narrow a fetched call.cap arg to the `i32` a handle/child thunk param takes. chibicc widens every
 /// scalar to i64, but handles cross as i32 (the host table masks them); an already-i32 value passes
 /// through. Mirrors the interpreter's `get_i32` on the same slot.
 fn slot_i32(b: &mut FunctionBuilder, v: Value) -> Value {

@@ -20,7 +20,7 @@
 //!    folds to a single edge once the opcode byte is a folded constant.
 //!
 //! **Bounds (the narrow success window).**
-//! 3. **The `call_indirect` / `setjmp` sites are on cold paths.** The closure's 13 `call_indirect`
+//! 3. **The `call.dyn` / `setjmp` sites are on cold paths.** The closure's 13 `call.dyn`
 //!    sites (high signature fan-out) and its `SetJmp`/`LongJmp` live in error handling
 //!    (`luaD_throw`, `luaD_rawrunprotected`), allocation (`luaM_*`), and hooks (`luaD_hook`) — not
 //!    the numeric fast path. With the bytecode constant, a well-behaved integer loop's conditions
@@ -142,7 +142,7 @@ fn cold_path_indirects_are_where_we_expect() {
             .unwrap_or_else(|| format!("<func {f}>"))
     };
 
-    // Which functions in the closure carry a call_indirect.
+    // Which functions in the closure carry a call.dyn.
     let mut carriers: BTreeMap<u32, usize> = BTreeMap::new();
     for &f in &closure {
         for b in &m.funcs[f as usize].blocks {
@@ -154,7 +154,7 @@ fn cold_path_indirects_are_where_we_expect() {
         }
     }
 
-    println!("\ncall_indirect carriers in the luaV_execute closure:");
+    println!("\ncall.dyn carriers in the luaV_execute closure:");
     for (&f, &n) in &carriers {
         println!("  {} ({n} site(s))", name(f));
     }
@@ -177,7 +177,7 @@ fn cold_path_indirects_are_where_we_expect() {
     for n in &names {
         assert!(
             cold.iter().any(|c| n.contains(c)),
-            "unexpected call_indirect carrier {n} — not a known cold (error/alloc/hook) path"
+            "unexpected call.dyn carrier {n} — not a known cold (error/alloc/hook) path"
         );
     }
 }

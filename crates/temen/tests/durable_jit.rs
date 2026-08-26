@@ -17,16 +17,16 @@ fn freeze_thaw_cross_backend_over_generated_modules() {
     }
 }
 
-// R8, deterministic: a `call_indirect` to a may-suspend target must freeze byte-identically and thaw
+// R8, deterministic: a `call.dyn` to a may-suspend target must freeze byte-identically and thaw
 // across the interp/JIT boundary, exactly like a direct propagated `call` — not left to fuzz-seed
-// luck. `A →(call_indirect slot 1)→ B(leaf cap.call)`; the natural table maps slot 1 → func 1.
+// luck. `A →(call.dyn slot 1)→ B(leaf call.cap)`; the natural table maps slot 1 → func 1.
 #[test]
 fn indirect_call_freeze_thaw_cross_backend() {
     let src = r#"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 1
-  v2 = call_indirect (i32) -> (i64) v1 (v0)
+  v2 = call.dyn (i32) -> (i64) v1 (v0)
   v3 = i64.const 1000
   v4 = i64.add v2 v3
   return v4
@@ -35,7 +35,7 @@ block 0 (v0: i32) {
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 100
   v4 = i64.add v2 v3
   return v4

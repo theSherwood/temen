@@ -38,7 +38,7 @@ fn compile_host(src: &str) -> CompiledModule {
 }
 
 /// A plugin authored against host `F` purely **by name** — its import handle is the `ConstI32`
-/// placeholder a slot binding patches into the `call_indirect` index.
+/// placeholder a slot binding patches into the `call.dyn` index.
 const PLUGIN_SRC: &str = "func (i32, i32) -> (i32) {\n\
      block 0 (v0: i32, v1: i32) {\n\
      \x20 v2 = i32.const 0\n\
@@ -120,7 +120,7 @@ fn malformed_blob_fails_closed() {
 
 /// A symbol can resolve to a **host capability**, not only a table slot: the symbol table's `Cap`
 /// kind (the `1` byte) binds a named import to a `(type_id, op)` capability, which the loader lowers
-/// to a `cap.call` — so a loaded unit (a plugin) can reach a *host service* by name (e.g. `"write"`),
+/// to a `call.cap` — so a loaded unit (a plugin) can reach a *host service* by name (e.g. `"write"`),
 /// not just another loaded unit. This drives the symbol table's `Cap` branch through the real
 /// `jit_blob_validator` byte path (the same gate the `compile_linked` op uses), proving the wire
 /// form + lowering are exercised end to end. The unit takes the capability handle as `arg0` (the
@@ -141,7 +141,7 @@ fn symbol_table_resolves_a_capability_import_by_name() {
     let funcs = jit_blob_validator(&blob, None, &symtab)
         .expect("the capability import resolves by name and re-verifies");
 
-    // Resolution lowered `call.sym "write"` to a concrete `cap.call 5 1` (no import survives).
+    // Resolution lowered `call.sym "write"` to a concrete `call.cap 5 1` (no import survives).
     let lowered_to_cap_call = funcs[0].blocks.iter().flat_map(|b| &b.insts).any(|i| {
         matches!(
             i,
@@ -154,6 +154,6 @@ fn symbol_table_resolves_a_capability_import_by_name() {
     });
     assert!(
         lowered_to_cap_call,
-        "the named capability import must lower to `cap.call 5 1`"
+        "the named capability import must lower to `call.cap 5 1`"
     );
 }

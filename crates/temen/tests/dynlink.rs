@@ -5,7 +5,7 @@
 //! into a **direct `call`** — exactly what a static linker does (symbol → concrete call). By the time
 //! the verifier and both backends see the module, it's an ordinary closed module; "linking" was a
 //! source-to-source rewrite, above the TCB, re-verified like everything else. (Dynamic, separately-
-//! compiled linking — `call_indirect` through a `Jit.install` slot — is the next milestone.)
+//! compiled linking — `call.dyn` through a `Jit.install` slot — is the next milestone.)
 
 use temen_interp::Value;
 use temen_ir::{Resolved, ResolvedCap};
@@ -132,7 +132,7 @@ block 0 (v0: i32) {
         Some(Resolved::Cap(ResolvedCap { type_id: 0, op: 1 }))
     })
     .expect("resolve");
-    // The import lowered to a cap.call (not a direct call).
+    // The import lowered to a call.cap (not a direct call).
     assert!(linked.funcs[0].blocks[0].insts.iter().any(|i| matches!(
         i,
         temen_ir::Inst::CapCall {
@@ -590,12 +590,12 @@ fn surviving_data_ptr_fails_verify() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Milestone 3: dynamic linking — resolve a symbol to a call_indirect TABLE SLOT (Resolved::Slot).
+// Milestone 3: dynamic linking — resolve a symbol to a call.dyn TABLE SLOT (Resolved::Slot).
 // A separately-compiled unit reaches a function it doesn't share an index space with, by slot.
 // ---------------------------------------------------------------------------------------------
 
 /// `main` imports `F` by name and the loader resolves it to **table slot 1** — not a direct call but a
-/// `call_indirect` through the shared function table (how a separately-compiled unit reaches another).
+/// `call.dyn` through the shared function table (how a separately-compiled unit reaches another).
 /// `F` (slot 1) is `a*2 + b`; a decoy `G` sits at slot 0. The handle placeholder const (`i32.const 0`)
 /// is patched to `1` and reused as the index, so a passing `F(10,3)=23` (not `G`'s 7) proves the slot.
 #[test]
@@ -629,7 +629,7 @@ block 0 (v0: i32, v1: i32) {
     let linked =
         temen_ir::resolve_imports_with(&m, |n| (n == "F").then_some(temen_ir::Resolved::Slot(1)))
             .expect("resolve to slot");
-    // The import became a `call_indirect`, and the handle const was patched to the slot (1).
+    // The import became a `call.dyn`, and the handle const was patched to the slot (1).
     let insts = &linked.funcs[2].blocks[0].insts;
     assert!(
         matches!(insts[0], temen_ir::Inst::ConstI32(1)),
@@ -637,7 +637,7 @@ block 0 (v0: i32, v1: i32) {
     );
     assert!(
         matches!(insts[1], temen_ir::Inst::CallIndirect { .. }),
-        "import lowered to call_indirect, not a direct call"
+        "import lowered to call.dyn, not a direct call"
     );
     temen_verify::verify_module(&linked).expect("verify");
     // main (entry 2) dispatches to slot 1 = F(a,b) = a*2+b; F(10,3) = 23 (G would give 7).

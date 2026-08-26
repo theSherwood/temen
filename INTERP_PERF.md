@@ -175,7 +175,7 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
   |-----------------|------------:|---------:|------:|
   | alu             | ~32         | ~18.6    | ~1.7× |
   | call            | ~77         | ~33      | ~2.3× |
-  | call_indirect   | ~88         | ~43      | ~2.1× |
+  | call.dyn   | ~88         | ~43      | ~2.1× |
   | mem (load+store)| ~107        | ~82      | **~1.3×** |
 
   The headline: `mem` has by far the **smallest** bytecode advantage (~1.3× vs ~2× elsewhere) — the
@@ -270,7 +270,7 @@ stays the JIT's job).
   |-------------|----------:|---------:|-------:|-------:|------|
   | alu         | 33.3      | 22.2     | 0.45   | ~49×   | JIT strength-reduces |
   | call        | 77.0      | 38.4     | 1.56   | ~25×   | honest structural gap |
-  | call_indirect | 86.9    | 61.4     | 2.51   | ~24×   | |
+  | call.dyn | 86.9    | 61.4     | 2.51   | ~24×   | |
   | mem         | 107.4     | 83.2     | 0.33   | ~249×  | JIT elides store/load |
   | chase       | 92.6      | 70.9     | 2.52   | ~28×   | L1 pointer chase |
   | chase_rand  | 93.8      | 90.0     | 24.1   | **~3.7×** | memory-latency-bound — all engines stall on DRAM, so the interpreter tax is hidden |
@@ -427,7 +427,7 @@ not by shaving predicted branches. The JIT stays the answer for near-native.
 > safepoint metering that test blew `cargo test --workspace` past its CI ceilings: 10.75→44 min on
 > windows-latest (**cancelled at the 45-min ceiling**), 6→26 min on Linux — all in this one test.
 >
-> **Root cause (the gap):** fuel charges at `call` / `call_indirect` / `return_call*` (function entries)
+> **Root cause (the gap):** fuel charges at `call` / `call.dyn` / `return_call*` (function entries)
 > and taken back-edges, but **not at `cont.resume` / `cont.new`**. Resuming a fiber is a control transfer
 > that per-op fuel used to meter (every op in the fiber decremented the counter); under safepoint fuel a
 > long fiber-resume chain runs almost entirely **unmetered** (only the occasional `call` inside it
@@ -475,7 +475,7 @@ speed that justifies it.
 
 **Determinism by construction — anchor safepoints to the shared IR, not each backend's CFG:**
 - a `br` / `br_if` / `br_table` whose target block index ≤ the current block (the IR back-edge), and
-- `call` / `call_indirect` / `return_call` entry.
+- `call` / `call.dyn` / `return_call` entry.
 
 Charge 1 per site. Because both engines count off the *same* IR structure, the counts are identical
 by construction, and the harnesses can **stop skipping `OutOfFuel` and start asserting it** — a
@@ -586,8 +586,8 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
   - [x] **Slice 1c-a** — op coverage: SIMD/`v128`/fence long tail delegated to `eval_inst` (reuse,
         no re-implementation), run against each block's sub-window so no operand remap is needed.
         Harness coverage of the generated corpus rose to ~1114/4000 (28%); the rest is
-        `call_indirect` / host / fiber / thread / cap programs (later slices). Still non-default.
-  - [x] **Slice 1c-b** — `call_indirect` through module 0's natural function table (slot `i` ⇒ func
+        `call.dyn` / host / fiber / thread / cap programs (later slices). Still non-default.
+  - [x] **Slice 1c-b** — `call.dyn` through module 0's natural function table (slot `i` ⇒ func
         `i`, power-of-two padding traps; resolved signature type-checked against the call site, a
         forged/mistyped slot is an inert `IndirectCallType` trap — same semantics as
         `dispatch_indirect`). Self-contained only (no `install`/`invoke` cross-module units — those
@@ -642,7 +642,7 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
               `compile_and_run_with_host` is what `run_with_host_fast` now calls. The executor/fiber
               capability variants (`Instantiator`/`Yielder`/`JIT`/`SharedRegion` op 4) are rejected by
               the compiler → tree-walker fallback. Also covers the synchronous §7 reflection ops
-              `cap.self.count` / `cap.self.get` (reuse `host.self_dispatch`). New TDD harness
+              `self.count` / `self.get` (reuse `host.self_dispatch`). New TDD harness
               `bytecode_caps.rs` (hand-authored host-fn modules: sum-args, op-selector, chained,
               in-loop, forged-handle-traps, self-count, self-get) — all bit-identical to
               `run_with_host`; `.expect(Some)` gates that bytecode actually drove it (didn't fall back).
@@ -690,7 +690,7 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
               oracle-only, bytecode is the real fallback when the JIT backend isn't viable, so a guest
               holding the `Jit` cap must get guest-JIT on bytecode too (no production fall-back path).
             - [x] **5e-1** — multi-module foundation + `install`/`uninstall` + cross-module
-                  `call_indirect`. The engine became multi-module: a `Domain { mods, table }` (module 0
+                  `call.dyn`. The engine became multi-module: a `Domain { mods, table }` (module 0
                   = primary, `mods[k≥1]` = installed units; runtime dispatch table replacing the
                   compile-time natural table). `Vm` activations carry a `module`, re-bound only at
                   cross-module call/return so the per-op hot loop is unchanged. `compile`/
@@ -698,18 +698,18 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
                   `install`/`uninstall` (ops 3/4) escape to `drive` (owns the mutable `Domain`):
                   install compiles the unit to bytecode + fills a padding slot, uninstall clears one.
                   Coroutine children keep their own natural table (no installed units), matching the
-                  tree-walker. New harness `bytecode_dynlink.rs` (install→call_indirect = 142;
-                  uninstall→call_indirect traps `IndirectCallType`) bit-identical to `run_with_host`.
+                  tree-walker. New harness `bytecode_dynlink.rs` (install→call.dyn = 142;
+                  uninstall→call.dyn traps `IndirectCallType`) bit-identical to `run_with_host`.
                   **Known gap:** a unit using an op the bytecode engine can't lower traps `Malformed`
                   (no mid-run fall-back) — same coverage edge as a top-level module.
             - [x] **5e-2** — `Jit.invoke` (op 1): `run_invoke` runs the unit's entry synchronously as
                   a transient module over the shared window/powerbox + shared dispatch table (so the
-                  unit's `call_indirect` reaches installed units), concurrency-free (park/spawn/yield/
+                  unit's `call.dyn` reaches installed units), concurrency-free (park/spawn/yield/
                   re-install → inert `CapFault`, matching the tree-walker); args/results marshal via the
                   i64-slot ABI. New harness case `invoke_unit_that_calls_installed_unit_agrees`
                   (install A, invoke B where B calls A → 14, the §22 new→new path) bit-identical to
                   `run_with_host`. `run_fast` now routes install/invoke guests to bytecode.
-            - [x] **5e-3** — tail calls (`return_call`/`return_call_indirect`): reuse the current
+            - [x] **5e-3** — tail calls (`return_call`/`return_call.dyn`): reuse the current
                   activation window (no stack growth, O(1) deep tail recursion), staying in-module for
                   direct / dispatching the runtime table for indirect. New harness
                   `bytecode_tailcall.rs` (factorial accumulator, 100k-deep recursion, indirect with a

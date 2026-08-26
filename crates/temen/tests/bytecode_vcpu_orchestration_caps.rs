@@ -1,12 +1,12 @@
-//! THREADS.md 4d — **host I/O (`cap.call`) from every vCPU of a host-orchestrated resumable run**,
+//! THREADS.md 4d — **host I/O (`call.cap`) from every vCPU of a host-orchestrated resumable run**,
 //! the way the JS/Worker host will drive it in the browser. Each `Vcpu` attaches the run's shared
-//! powerbox ([`Vcpu::with_shared_host`], a `Mutex<Host>`), so a worker vCPU's `cap.call` dispatches
+//! powerbox ([`Vcpu::with_shared_host`], a `Mutex<Host>`), so a worker vCPU's `call.cap` dispatches
 //! in-engine under the lock — the resumable counterpart of `drive_parallel`'s 4c-host model, with the
 //! same property: each call locks only for its own dispatch, compute/atomics between calls stay
 //! lock-free, and the host never services (or even sees) a capability event.
 //!
 //! The kernel is `bytecode_parallel_caps.rs`'s proven schedule-independent one: 8 worker vCPUs each
-//! (a) write the **same** 5-byte line to stdout via `cap.call` and (b) `atomic.rmw.add` a shared
+//! (a) write the **same** 5-byte line to stdout via `call.cap` and (b) `atomic.rmw.add` a shared
 //! counter — so both the result (8) and the stdout bytes (`"tick\n"` × 8) are byte-identical to the
 //! **cooperative** oracle no matter how the Workers interleave. The `unsafe` (borrowing host memory
 //! via `Region::shared`) lives in this embedder/test.
@@ -74,7 +74,7 @@ block 0 (vsp: i64, vh: i64) {
   vhandle = i32.wrap_i64 vh
   vptr = i64.const 0
   vlen = i64.const 5
-  vw = cap.call 0 1 (i64, i64) -> (i64) vhandle(vptr, vlen)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vhandle(vptr, vlen)
   v1 = i64.const 8
   v2 = i64.const 1
   v3 = i64.atomic.rmw.add v1 v2
@@ -121,7 +121,7 @@ impl Orch {
 }
 
 /// Drive one vCPU to completion — spawn → a scoped thread whose `Vcpu` **shares the powerbox**;
-/// join → the rendezvous. No capability event exists to service: `cap.call` never reaches this loop.
+/// join → the rendezvous. No capability event exists to service: `call.cap` never reaches this loop.
 fn drive<'s, 'e>(
     scope: &'s std::thread::Scope<'s, 'e>,
     prog: &'e bytecode::VcpuProgram,
@@ -209,7 +209,7 @@ fn run_cooperative() -> (Result<Vec<Value>, Trap>, Vec<u8>) {
     (r, host.stdout)
 }
 
-/// 8 worker vCPUs do host I/O (`cap.call` stdout write) + atomics on one **shared** powerbox through
+/// 8 worker vCPUs do host I/O (`call.cap` stdout write) + atomics on one **shared** powerbox through
 /// the resumable API — result and the (identical-line, schedule-independent) stdout match the oracle.
 #[test]
 fn orchestrated_shared_host_capcall_matches_oracle() {

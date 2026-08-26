@@ -89,8 +89,8 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {{
   voff = i64.const {carve_off}
   vsl = i64.const {child_sl}
   vq = i64.const 0
-  vh = cap.call 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
-  vr = cap.call 6 1 (i32) -> (i64) v0 (vh)
+  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
+  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
   return vr
   }}
 }}

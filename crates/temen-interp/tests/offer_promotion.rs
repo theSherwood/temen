@@ -44,14 +44,14 @@ fn an_animated_handler_that_parks_promotes_and_resumes_on_its_timer() {
     let offer = h.wire_offer_proc(&provider, &[0]).expect("instanced offer");
     let tid = h.resolve_offer(offer).unwrap().type_id;
 
-    // A consumer that `cap.call`s the wired instanced offer once. The call animates the handler
+    // A consumer that `call.cap`s the wired instanced offer once. The call animates the handler
     // (4a), the handler parks on its timed wait (promotion), and the 2 ms timer resumes it.
     let consumer_src = format!(
         "memory 16\n\
          func () -> (i64) {{\n\
          block 0 () {{\n\
            vh = i32.const {offer}\n\
-           vr = cap.call {tid} 0 () -> (i64) vh ()\n\
+           vr = call.cap {tid} 0 () -> (i64) vh ()\n\
            return vr\n\
            }}\n\
          }}\n"
@@ -84,8 +84,8 @@ fn a_promoted_dispatch_reopens_admission_for_the_next_call() {
          func () -> (i64) {{\n\
          block 0 () {{\n\
            vh = i32.const {offer}\n\
-           v1 = cap.call {tid} 0 () -> (i64) vh ()\n\
-           v2 = cap.call {tid} 0 () -> (i64) vh ()\n\
+           v1 = call.cap {tid} 0 () -> (i64) vh ()\n\
+           v2 = call.cap {tid} 0 () -> (i64) vh ()\n\
            vsum = i64.add v1 v2\n\
            return vsum\n\
            }}\n\
@@ -134,7 +134,7 @@ fn teardown_abandons_a_promoted_daemon() {
 
     // Root (func 0): spawn the daemon (func 1), briefly wait so it can promote+park, then return
     // 42 — the C rule (`main` returning is `exit`), ending the run with the daemon still parked.
-    // Daemon (func 1): `cap.call` the forever-waiting offer, which animates and promotes.
+    // Daemon (func 1): `call.cap` the forever-waiting offer, which animates and promotes.
     let src = format!(
         "memory 16\n\
          func () -> (i64) {{\n\
@@ -152,7 +152,7 @@ fn teardown_abandons_a_promoted_daemon() {
          func (i64, i64) -> (i64) {{\n\
          block 0 (vsp: i64, varg: i64) {{\n\
            vh = i32.const {offer}\n\
-           vr = cap.call {tid} 0 () -> (i64) vh ()\n\
+           vr = call.cap {tid} 0 () -> (i64) vh ()\n\
            return vr\n\
            }}\n\
          }}\n"
@@ -197,8 +197,8 @@ fn outer_provider(inner_tid: u32) -> temen_ir::Module {
          block 0 () {{\n\
            vp = i64.const 16384\n\
            vn = i64.const 5\n\
-           vh = cap.self.resolve vp vn\n\
-           vr = cap.call {inner_tid} 0 () -> (i64) vh ()\n\
+           vh = self.resolve vp vn\n\
+           vr = call.cap {inner_tid} 0 () -> (i64) vh ()\n\
            v100 = i64.const 100\n\
            vsum = i64.add vr v100\n\
            return vsum\n\
@@ -208,7 +208,7 @@ fn outer_provider(inner_tid: u32) -> temen_ir::Module {
 }
 
 /// Wire `inner` and `outer` as instanced offers, grant `inner` into `outer`'s domain as `inner`,
-/// and drive one consumer `cap.call` into `outer`. Returns the run result.
+/// and drive one consumer `call.cap` into `outer`. Returns the run result.
 fn run_nested(
     inner: &temen_ir::Module,
     outer_of: impl Fn(u32) -> temen_ir::Module,
@@ -227,7 +227,7 @@ fn run_nested(
          func () -> (i64) {{\n\
          block 0 () {{\n\
            vh = i32.const {outer_offer}\n\
-           vr = cap.call {outer_tid} 0 () -> (i64) vh ()\n\
+           vr = call.cap {outer_tid} 0 () -> (i64) vh ()\n\
            return vr\n\
            }}\n\
          }}\n"
@@ -285,8 +285,8 @@ fn self_recursive_provider(tid: u32) -> temen_ir::Module {
            vd1 = i64.sub vd vone\n\
            vp = i64.const 16384\n\
            vn = i64.const 2\n\
-           vh = cap.self.resolve vp vn\n\
-           vr = cap.call {tid} 0 (i64) -> (i64) vh (vd1)\n\
+           vh = self.resolve vp vn\n\
+           vr = call.cap {tid} 0 (i64) -> (i64) vh (vd1)\n\
            vres = i64.add vr vone\n\
            return vres\n\
            }}\n\
@@ -298,7 +298,7 @@ fn self_recursive_provider(tid: u32) -> temen_ir::Module {
     ))
 }
 
-/// **4c.2 — cyclic completion.** A guest `cap.call`s an offer whose handler re-enters its own
+/// **4c.2 — cyclic completion.** A guest `call.cap`s an offer whose handler re-enters its own
 /// instance to a bounded depth. The direct self-call is no longer a `-EAGAIN` deadlock artifact:
 /// it recurses over the provider's own world and completes, returning the depth (3).
 #[test]
@@ -328,7 +328,7 @@ fn a_self_reentrant_offer_completes_instead_of_eagain() {
          block 0 () {{\n\
            vh = i32.const {offer}\n\
            vd = i64.const 3\n\
-           vr = cap.call {tid} 0 (i64) -> (i64) vh (vd)\n\
+           vr = call.cap {tid} 0 (i64) -> (i64) vh (vd)\n\
            return vr\n\
            }}\n\
          }}\n"
@@ -387,7 +387,7 @@ fn concurrent_callers_park_and_retry_instead_of_eagain() {
            v0 = i64.const 0\n\
            vt = thread.spawn 1 v0 v0\n\
            vh = i32.const {offer}\n\
-           vmine = cap.call {tid} 0 () -> (i64) vh ()\n\
+           vmine = call.cap {tid} 0 () -> (i64) vh ()\n\
            vjoined = thread.join vt\n\
            vsum = i64.add vmine vjoined\n\
            return vsum\n\
@@ -396,7 +396,7 @@ fn concurrent_callers_park_and_retry_instead_of_eagain() {
          func (i64, i64) -> (i64) {{\n\
          block 0 (vsp: i64, varg: i64) {{\n\
            vh = i32.const {offer}\n\
-           vr = cap.call {tid} 0 () -> (i64) vh ()\n\
+           vr = call.cap {tid} 0 () -> (i64) vh ()\n\
            return vr\n\
            }}\n\
          }}\n"
@@ -412,14 +412,14 @@ fn concurrent_callers_park_and_retry_instead_of_eagain() {
 }
 
 /// A provider whose handler (func 0) calls its own helper (func 1) **through `ref.func` +
-/// `call_indirect`** — a unit-own-funcref handler. handler(x) = helper(x) + 10 = 2x + 10.
+/// `call.dyn`** — a unit-own-funcref handler. handler(x) = helper(x) + 10 = 2x + 10.
 fn ref_func_provider() -> temen_ir::Module {
     module(
         "memory 16\n\
          func (i64) -> (i64) {\n\
          block 0 (va: i64) {\n\
            vf = ref.func 1\n\
-           vr = call_indirect (i64) -> (i64) vf (va)\n\
+           vr = call.dyn (i64) -> (i64) vf (va)\n\
            vten = i64.const 10\n\
            vs = i64.add vr vten\n\
            return vs\n\
@@ -438,7 +438,7 @@ fn ref_func_provider() -> temen_ir::Module {
 /// CALLS.md 6a — a `ref.func`-taking offer handler **animates** (pre-6a it declined to the now-
 /// retired `drive_arc` sub-run; pure conservatism, pinned by nothing until this test): the
 /// animation installs the unit-own funcref remap (`install_unit_funcs`, cached per vCPU), so the
-/// handler's `call_indirect` through `ref.func 1` resolves to its own helper — never the caller's
+/// handler's `call.dyn` through `ref.func 1` resolves to its own helper — never the caller's
 /// table. Called **twice**: the second call exercises the cache path (installs are run-permanent;
 /// a re-install per call would leak table slots).
 #[test]
@@ -453,8 +453,8 @@ fn a_ref_func_offer_handler_animates_with_the_unit_remap() {
          block 0 () {{\n\
            vh = i32.const {offer}\n\
            va = i64.const 16\n\
-           v1 = cap.call {tid} 0 (i64) -> (i64) vh (va)\n\
-           v2 = cap.call {tid} 0 (i64) -> (i64) vh (va)\n\
+           v1 = call.cap {tid} 0 (i64) -> (i64) vh (va)\n\
+           v2 = call.cap {tid} 0 (i64) -> (i64) vh (va)\n\
            vs = i64.add v1 v2\n\
            return vs\n\
            }}\n\

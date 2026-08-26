@@ -114,7 +114,7 @@ async function main() {
   }
 
   // --- 5) host I/O from worker vCPUs across real Web Workers (THREADS.md 4d) ----------------------
-  // 8 worker vCPUs each `cap.call`-write "tick\n" to the run's ONE shared powerbox (a Mutex<Host> in
+  // 8 worker vCPUs each `call.cap`-write "tick\n" to the run's ONE shared powerbox (a Mutex<Host> in
   // shared memory — dispatch is in-Rust under the lock, no JS in the loop) and bump a shared counter.
   // Result 8 and stdout "tick\n"×8 are schedule-independent; the page reads stdout back afterward.
   try {
@@ -189,7 +189,7 @@ block 0 (v0: i64) {
   return v3
   }
 }`;
-  // call_indirect (wasm-JIT next slice): a loop dispatches to func1 (double) / func2 (+100) by index
+  // call.dyn (wasm-JIT next slice): a loop dispatches to func1 (double) / func2 (+100) by index
   // parity through the emitted funcref table — the same masked index + wasm signature check the
   // interpreter's identity table does. All-in-subset, so it JITs whole-module.
   const DISPATCH_SRC = `
@@ -209,7 +209,7 @@ block 2 (v7: i64, v8: i64, v9: i64) {
   v12 = i64.const 1
   v13 = i64.add v11 v12
   v14 = i32.wrap_i64 v13
-  v15 = call_indirect (i64) -> (i64) v14 (v9)
+  v15 = call.dyn (i64) -> (i64) v14 (v9)
   v16 = i64.add v8 v15
   v17 = i64.const 1
   v18 = i64.add v9 v17
@@ -334,7 +334,7 @@ block 0 (v0: i64) {
   }
 
   // --- 8) §22 guest-JIT **real codegen** across real Web Workers (BROWSER.md § "wasm-JIT tier", slice 5) --
-  // The guest holds a `Jit` cap + a host-compiled unit and `cap.call`s invoke; each worker runs the
+  // The guest holds a `Jit` cap + a host-compiled unit and `call.cap`s invoke; each worker runs the
   // submitted unit on EMITTED WASM on its own Worker (`temen_par_powerbox_jit_codegen` emits it at setup)
   // instead of the interpreter. Runs the **same i32 kernel the interp `jit` item runs** (the unit
   // `service` is `(i32,i32)->(i32)` — the Worker marshals args by type, this slice's generalization),

@@ -16,7 +16,7 @@
 
 //!
 //! **§3d note (2026-08-06):** these parents stay on the scalar spawn ops **deliberately**: an
-//! R9-instrumented guest is pure SSA + `cap.call` (`transform_module` refuses any guest memory
+//! R9-instrumented guest is pure SSA + `call.cap` (`transform_module` refuses any guest memory
 //! op — `GuestUsesMemory`), so a durable parent cannot build the op-17 record in its window.
 //! The record migration (CONSOLIDATION.md §3d) therefore gates the op-0/5 arm deletion on the
 //! §12.7 relocation work that lifts that restriction — do not migrate this file until then.
@@ -113,7 +113,7 @@ block 0 (v0: i32, v1: i64) {
   v2 = i64.const 0
   v3 = i64.const 131072
   v4 = i64.const 17
-  v5 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4, v2)
+  v5 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4, v2)
   return v5
   }
 }
@@ -126,8 +126,8 @@ block 0 (v0: i32, v1: i64) {
   v2 = i64.const 0
   v3 = i64.const 131072
   v4 = i64.const 17
-  v5 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4, v2)
-  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v5 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4, v2)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
   return v6
   }
 }
@@ -141,8 +141,8 @@ block 0 (v0: i32) {
   v2 = i64.const 131072
   v3 = i64.const 17
   v4 = i64.const 0
-  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
-  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
   return v6
   }
 }
@@ -163,8 +163,8 @@ block 0 (v0: i32) {
   v2 = i64.const 131072
   v3 = i64.const 17
   v4 = i64.const 0
-  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
-  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
   return v6
   }
 }
@@ -336,8 +336,8 @@ block 0 (v0: i32) {
   v2 = i64.const 131072
   v3 = i64.const 17
   v4 = i64.const 0
-  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
-  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
   v7 = ref.func 2
   v8 = i64.const 4096
   v9 = cont.new v7 v8
@@ -780,18 +780,18 @@ block 0 (v0: i32) {
   v2 = i64.const 196608
   v3 = i64.const 16
   v4 = i64.const 0
-  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   v6 = i64.const 1
   v7 = i64.const 131072
-  v8 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v6, v7, v3, v4)
-  v9 = cap.call 6 1 (i32) -> (i64) v0 (v8)
+  v8 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v6, v7, v3, v4)
+  v9 = call.cap 6 1 (i32) -> (i64) v0 (v8)
   v10 = ref.func 3
   v11 = i64.const 4096
   v12 = cont.new v10 v11
   v13 = i64.const 0
   v14, v15 = cont.resume v12 v13
   v16, v17 = cont.resume v12 v15
-  v18 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v18 = call.cap 6 1 (i32) -> (i64) v0 (v5)
   v19 = i64.add v9 v18
   v20 = i64.add v19 v17
   return v20
@@ -960,7 +960,7 @@ const D2_WINDOW: usize = 1 << D2_SIZE_LOG2;
 ///     continuation), same body as `PARENT_SELF_LOOP`'s child.
 ///
 /// **Handle ABI note.** A §14 child receives its `Instantiator` as an `i64` entry arg (the
-/// `instantiate` op's slot ABI passes `Value::I64(cinst)`), but a `cap.call` handle **operand** must
+/// `instantiate` op's slot ABI passes `Value::I64(cinst)`), but a `call.cap` handle **operand** must
 /// be `i32` (the verifier's forgeable-index type). The Phase-1 durable transform rejects both scalar
 /// conversions (`i32.wrap_i64` → `UnsupportedInst`) and *any* guest linear-memory op (`GuestUsesMemory`),
 /// so the child cannot truncate its `i64` handle at all. It doesn't need to: a nested child's powerbox
@@ -975,8 +975,8 @@ block 0 (v0: i32) {
   v2 = i64.const 262144
   v3 = i64.const 18
   v4 = i64.const 0
-  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
-  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
   return v6
   }
 }
@@ -987,8 +987,8 @@ block 0 (v0: i64) {
   v3 = i64.const 131072
   v4 = i64.const 17
   v5 = i64.const 0
-  v6 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v1 (v2, v3, v4, v5)
-  v7 = cap.call 6 1 (i32) -> (i64) v1 (v6)
+  v6 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v1 (v2, v3, v4, v5)
+  v7 = call.cap 6 1 (i32) -> (i64) v1 (v6)
   return v7
   }
 }

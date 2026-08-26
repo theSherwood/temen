@@ -1,8 +1,8 @@
-//! **Capability-call (host-boundary) overhead.** `cap.call` is how a guest reaches the host — every
+//! **Capability-call (host-boundary) overhead.** `call.cap` is how a guest reaches the host — every
 //! I/O, clock, spawn, and the durable safepoint story flows through it — yet it's invisible in the
-//! compute benchmarks. This driver measures the per-`cap.call` cost across the three engines by
-//! timing a loop whose body is a single `cap.call` to the cheapest host capability (the clock read),
-//! minus an identical loop with no `cap.call` (so only the host-boundary crossing remains).
+//! compute benchmarks. This driver measures the per-`call.cap` cost across the three engines by
+//! timing a loop whose body is a single `call.cap` to the cheapest host capability (the clock read),
+//! minus an identical loop with no `call.cap` (so only the host-boundary crossing remains).
 //!
 //! The clock cap is serviced the same way each engine reaches the host: the tree-walker and bytecode
 //! engine dispatch through the in-process `Host`; the JIT is timed twice — through the generic
@@ -10,7 +10,7 @@
 //! devirtualized **fast resolver** that `run_powerbox` wires by default for known caps. Comparing the
 //! two isolates what the fast path buys: with `Host::fast_clock_now` (the ISSUES.md I12 allocation-free
 //! inline read) the fast path is ~9× cheaper than generic for `Clock.now()`. (The *whole* win only
-//! shows when the `cap.call` matches the resolver's claimed arity — the clock is **0-arg**, so the
+//! shows when the `call.cap` matches the resolver's claimed arity — the clock is **0-arg**, so the
 //! call below passes no args; a stray arg silently falls back to the generic path.)
 //!
 //! Run: cd crates/temen-llvm && cargo run --release --example cap_call
@@ -33,7 +33,7 @@ block 0 (v0: i32, v1: i32) {
   br 1(v3, v2, v0, v1)
 }
 block 1 (v4: i32, v5: i64, v6: i32, v7: i32) {
-  v8 = cap.call 2 0 () -> (i64) v6 ()
+  v8 = call.cap 2 0 () -> (i64) v6 ()
   v9 = i64.add v5 v8
   v10 = i32.const 1
   v11 = i32.add v4 v10
@@ -46,7 +46,7 @@ block 2 (v13: i64) {
 }
 "#;
 
-// The same loop with the `cap.call` replaced by one loop-carried `i64.add` (acc = acc+acc) — an
+// The same loop with the `call.cap` replaced by one loop-carried `i64.add` (acc = acc+acc) — an
 // equally cheap, fold-resistant body — so subtracting its per-iter leaves just the host-boundary cost.
 const BASELINE_SRC: &str = r#"
 func (i32) -> (i64) {
@@ -127,7 +127,7 @@ fn time_engines(m: &Module, has_cap: bool) -> (f64, f64, f64, f64) {
         black_box(&r);
     });
     let jit = per_iter(|n| {
-        // Generic path: every `cap.call` goes through the runtime `cap_thunk` (marshalling + dispatch).
+        // Generic path: every `call.cap` goes through the runtime `cap_thunk` (marshalling + dispatch).
         let mut host = Host::new();
         let clk = host.grant_clock();
         let ctx = &mut host as *mut Host as *mut c_void;
@@ -169,7 +169,7 @@ fn main() {
 
     println!(
         "{:<14} {:>12} {:>12} {:>14} {:>14}",
-        "engine", "cap loop", "baseline", "cap.call cost", "vs baseline"
+        "engine", "cap loop", "baseline", "call.cap cost", "vs baseline"
     );
     println!(
         "{:<14} {:>12} {:>12} {:>14} {:>14}",
@@ -188,7 +188,7 @@ fn main() {
         );
     }
     println!(
-        "\n(cap.call cost = cap-loop per-iter − a no-cap loop of the same shape, so it isolates the\n \
+        "\n(call.cap cost = cap-loop per-iter − a no-cap loop of the same shape, so it isolates the\n \
          host-boundary crossing. `jit (generic)` routes through the runtime `cap_thunk` (marshalling +\n \
          indirect dispatch); `jit (fast/D45)` uses the devirtualized resolver `run_powerbox` wires by\n \
          default — for `Clock.now()` it hits `Host::fast_clock_now`, an authority-checked allocation-free\n \

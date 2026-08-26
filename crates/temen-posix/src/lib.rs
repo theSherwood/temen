@@ -19,7 +19,7 @@
 //! first-fit free list over a configured window-heap region. A minimal **`exec` surface** (STAGE1.md
 //! §5) lets a shell on this personality launch an external command: `exec_lookup` resolves a name
 //! against a `name → Module` PATH registry and `exec_stdout` hands back the `Stream` to forward — the
-//! spawn itself is the shell's own `Instantiator` `cap.call` (op 13), not a personality op. Still to
+//! spawn itself is the shell's own `Instantiator` `call.cap` (op 13), not a personality op. Still to
 //! come (POSIX.md §6): signals and `fork`/`clone`. Pure computation (`strlen`, `snprintf`, `math`, …)
 //! is **guest code**, not a cap — it needs no authority (POSIX.md §1).
 #![forbid(unsafe_code)]
@@ -63,7 +63,7 @@ pub const OP_ARGV: u32 = 18;
 /// `[ptr, len)` bytes — the shell's current input, e.g. a `< file` redirect it drained — into a
 /// read-only pipe FIFO and returns the read end for the shell to re-grant as `"stdin"`, so the
 /// command's `read(0, …)` drains them (then `0` = EOF). Neither op *is* the spawn — op 13 is a guest
-/// `cap.call` (the compiled shell holds the `Instantiator`); the personality only supplies the registry
+/// `call.cap` (the compiled shell holds the `Instantiator`); the personality only supplies the registry
 /// lookup and the forwardable stdout/stdin handles.
 pub const OP_EXEC_LOOKUP: u32 = 19;
 pub const OP_EXEC_STDOUT: u32 = 20;
@@ -748,7 +748,17 @@ struct World {
     /// non-loopback fails closed.
     net_delegate: Option<Box<dyn NetDelegate>>,
     /// The monotonic-clock base — `clock(1)` reports nanos elapsed since this. Captured at creation.
+    /// wasm32 (the browser playground) has **no std time source** — `Instant::now`/`SystemTime::now`
+    /// PANIC on wasm32-unknown-unknown, and this field's initializer took the whole personality
+    /// `grant` down before the guest ran one op (found by the #1080 bash card, the first wasm test
+    /// to actually exercise the post-#800 grant). There the personality serves a deterministic
+    /// strictly-increasing tick instead — the core `Binding::Clock` shape.
+    #[cfg(not(target_arch = "wasm32"))]
     clock_base: std::time::Instant,
+    /// The wasm32 twin of `clock_base`: the next nanos `clock()` serves, bumped per read so time
+    /// always advances (a guest's `$SECONDS`/timestamps need monotonicity, not wall truth).
+    #[cfg(target_arch = "wasm32")]
+    clock_tick: std::sync::atomic::AtomicI64,
     /// A pinned clock value (`Some(nanos)`) for determinism: when set, `clock(_)` returns it verbatim
     /// so a differential run is reproducible. `None` reads the real host clock.
     clock_fixed: Option<i64>,
@@ -810,6 +820,11 @@ enum ProcEntry {
         /// #799 — the pgid at exit, retained so `waitpid(-pgid)` can group-reap a zombie whose
         /// `Proc` (the live pgid's home) is already gone.
         pgid: i32,
+        /// #1080 pipeline rung — the ppid at exit, retained so `waitpid(-1)`/`waitpid(-pgid)` reap
+        /// only the CALLER's OWN children (POSIX), never a sibling's zombie. Without it a bash
+        /// pipeline stage's `waitpid(-1)` steals the reap the shell is blocked waiting for, wedging
+        /// `echo | cat`. The root's pid is `1`, so a root child carries `ppid == 1`.
+        ppid: i32,
     },
 }
 
@@ -1894,6 +1909,7 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
                 ProcEntry::Zombie {
                     status: encoded,
                     pgid,
+                    ppid,
                 },
             );
             // #802 rung 3 — the exit is a child transition: pend SIGCHLD in the parent, ARM
@@ -2038,7 +2054,10 @@ fn new_world(stdin: Vec<u8>) -> World {
         net_listeners: HashMap::new(),
         net_next_port: 49152, // the IANA ephemeral range start
         net_delegate: None,
+        #[cfg(not(target_arch = "wasm32"))]
         clock_base: std::time::Instant::now(),
+        #[cfg(target_arch = "wasm32")]
+        clock_tick: std::sync::atomic::AtomicI64::new(0),
         clock_fixed: None,
         commands: Vec::new(),
         executables: HashSet::new(),
@@ -3135,7 +3154,8 @@ impl Ctx<'_> {
             pid,
             ProcEntry::Zombie {
                 status: (res.status & 0xff) << 8,
-                pgid: pid, // a spawn clone is its own group leader (never setpgid'd)
+                pgid: pid,        // a spawn clone is its own group leader (never setpgid'd)
+                ppid: self.p.pid, // the spawner owns this child (reap-ownership, #1080)
             },
         );
         pid as i64
@@ -3155,14 +3175,20 @@ impl Ctx<'_> {
         // — a guest polls, or parks in the core's servicer reap, the wait offer, which serves the
         // same twin independently; use one channel per child).
         let is_zombie = |e: Option<&ProcEntry>| matches!(e, Some(ProcEntry::Zombie { .. }));
+        // #1080 pipeline rung — reap ownership: `waitpid` reaps only the caller's OWN children (POSIX).
+        // The zombie carries the `ppid` it exited with; a wildcard/`-pgid` reap that ignored it would let
+        // a bash pipeline stage steal the reap the shell is blocked waiting for (the `echo | cat` wedge).
+        let self_pid = self.p.pid;
         let reaped = if pid == -1 {
             self.w
                 .procs
                 .iter()
-                .filter_map(|(p, e)| matches!(e, ProcEntry::Zombie { .. }).then_some(*p))
+                .filter_map(|(p, e)| {
+                    matches!(e, ProcEntry::Zombie { ppid, .. } if *ppid == self_pid).then_some(*p)
+                })
                 .min()
         } else if pid < -1 {
-            // #799 — `waitpid(-pgid)`: group-reap the lowest zombie whose pgid (retained on the
+            // #799 — `waitpid(-pgid)`: group-reap the lowest OWN zombie whose pgid (retained on the
             // zombie entry) matches. Non-blocking like `-1` — the park door benches only
             // specific-pid waits this rung.
             let g = (-pid) as i32;
@@ -3170,7 +3196,8 @@ impl Ctx<'_> {
                 .procs
                 .iter()
                 .filter_map(|(p, e)| {
-                    matches!(e, ProcEntry::Zombie { pgid, .. } if *pgid == g).then_some(*p)
+                    matches!(e, ProcEntry::Zombie { pgid, ppid, .. } if *pgid == g && *ppid == self_pid)
+                        .then_some(*p)
                 })
                 .min()
         } else if is_zombie(self.w.procs.get(&(pid as i32))) {
@@ -4590,13 +4617,25 @@ impl Ctx<'_> {
         if let Some(fixed) = self.w.clock_fixed {
             return fixed;
         }
-        if *args.first().unwrap_or(&0) == 1 {
-            self.w.clock_base.elapsed().as_nanos() as i64
-        } else {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as i64)
-                .unwrap_or(0)
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if *args.first().unwrap_or(&0) == 1 {
+                self.w.clock_base.elapsed().as_nanos() as i64
+            } else {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as i64)
+                    .unwrap_or(0)
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            // No std time source on wasm32 (`Instant::now`/`SystemTime::now` panic): serve the
+            // deterministic tick, 1 µs per read, for monotonic and realtime alike.
+            let _ = args;
+            self.w
+                .clock_tick
+                .fetch_add(1_000, std::sync::atomic::Ordering::Relaxed)
         }
     }
 
@@ -5467,7 +5506,7 @@ mod tests {
 func (i32) -> (i64) {\n\
 block 0 (vph: i32) {\n\
   vsz = i64.const 2\n\
-  vptr = cap.call 13 2 (i64) -> (i64) vph (vsz)\n\
+  vptr = call.cap 13 2 (i64) -> (i64) vph (vsz)\n\
   vh = i32.const 104\n\
   i32.store8 vptr vh\n\
   vone = i64.const 1\n\
@@ -5475,7 +5514,7 @@ block 0 (vph: i32) {\n\
   vi = i32.const 105\n\
   i32.store8 vp1 vi\n\
   vfd = i64.const 1\n\
-  vn = cap.call 13 0 (i64, i64, i64) -> (i64) vph (vfd, vptr, vsz)\n\
+  vn = call.cap 13 0 (i64, i64, i64) -> (i64) vph (vfd, vptr, vsz)\n\
   vk = i64.const 1000000\n\
   vt = i64.mul vn vk\n\
   vr = i64.add vt vptr\n\
@@ -5527,11 +5566,11 @@ block 0 (vph: i32) {\n\
 func (i32) -> (i64) {\n\
 block 0 (vph: i32) {\n\
   veight = i64.const 8\n\
-  vbuf = cap.call 13 2 (i64) -> (i64) vph (veight)\n\
+  vbuf = call.cap 13 2 (i64) -> (i64) vph (veight)\n\
   vfd0 = i64.const 0\n\
-  vn = cap.call 13 1 (i64, i64, i64) -> (i64) vph (vfd0, vbuf, veight)\n\
+  vn = call.cap 13 1 (i64, i64, i64) -> (i64) vph (vfd0, vbuf, veight)\n\
   vfd1 = i64.const 1\n\
-  vw = cap.call 13 0 (i64, i64, i64) -> (i64) vph (vfd1, vbuf, vn)\n\
+  vw = call.cap 13 0 (i64, i64, i64) -> (i64) vph (vfd1, vbuf, vn)\n\
   return vn\n\
   }\n\
 }\n";
@@ -5541,7 +5580,7 @@ block 0 (vph: i32) {\n\
 func (i32) -> (i64) {\n\
 block 0 (vph: i32) {\n\
   vc = i64.const 42\n\
-  vx = cap.call 13 4 (i64) -> (i64) vph (vc)\n\
+  vx = call.cap 13 4 (i64) -> (i64) vph (vc)\n\
   vz = i64.const 0\n\
   return vz\n\
   }\n\
@@ -5568,10 +5607,10 @@ block 0 (vph: i32) {\n\
 func (i32) -> (i64) {\n\
 block 0 (vph: i32) {\n\
   vsz = i64.const 32\n\
-  va = cap.call 13 2 (i64) -> (i64) vph (vsz)\n\
-  vb = cap.call 13 2 (i64) -> (i64) vph (vsz)\n\
-  vf = cap.call 13 3 (i64) -> (i64) vph (va)\n\
-  vc = cap.call 13 2 (i64) -> (i64) vph (vsz)\n\
+  va = call.cap 13 2 (i64) -> (i64) vph (vsz)\n\
+  vb = call.cap 13 2 (i64) -> (i64) vph (vsz)\n\
+  vf = call.cap 13 3 (i64) -> (i64) vph (va)\n\
+  vc = call.cap 13 2 (i64) -> (i64) vph (vsz)\n\
   vcva = i64.sub vc va\n\
   vbva = i64.sub vb va\n\
   vk = i64.const 1000000\n\
@@ -5669,7 +5708,7 @@ block 0 (vph: i32) {\n\
   i32.store8 vpath vfch\n\
   vplen = i64.const 1\n\
   vflags = i64.const 66\n\
-  vfd = cap.call 13 5 (i64, i64, i64) -> (i64) vph (vpath, vplen, vflags)\n\
+  vfd = call.cap 13 5 (i64, i64, i64) -> (i64) vph (vpath, vplen, vflags)\n\
   a16 = i64.const 16\n\
   cH = i32.const 72\n\
   i32.store8 a16 cH\n\
@@ -5680,14 +5719,14 @@ block 0 (vph: i32) {\n\
   cbang = i32.const 33\n\
   i32.store8 a18 cbang\n\
   vwlen = i64.const 3\n\
-  vw = cap.call 13 0 (i64, i64, i64) -> (i64) vph (vfd, a16, vwlen)\n\
+  vw = call.cap 13 0 (i64, i64, i64) -> (i64) vph (vfd, a16, vwlen)\n\
   vzero = i64.const 0\n\
-  vsk = cap.call 13 7 (i64, i64, i64) -> (i64) vph (vfd, vzero, vzero)\n\
+  vsk = call.cap 13 7 (i64, i64, i64) -> (i64) vph (vfd, vzero, vzero)\n\
   a32 = i64.const 32\n\
   veight = i64.const 8\n\
-  vr = cap.call 13 1 (i64, i64, i64) -> (i64) vph (vfd, a32, veight)\n\
+  vr = call.cap 13 1 (i64, i64, i64) -> (i64) vph (vfd, a32, veight)\n\
   vfd1 = i64.const 1\n\
-  vso = cap.call 13 0 (i64, i64, i64) -> (i64) vph (vfd1, a32, vr)\n\
+  vso = call.cap 13 0 (i64, i64, i64) -> (i64) vph (vfd1, a32, vr)\n\
   vk = i64.const 1000000\n\
   vt = i64.mul vfd vk\n\
   vres = i64.add vt vr\n\
@@ -5765,9 +5804,9 @@ block 0 (vph: i32) {\n\
   vg = i32.const 103\n\
   i32.store8 vpath vg\n\
   vplen = i64.const 1\n\
-  vu = cap.call 13 8 (i64, i64) -> (i64) vph (vpath, vplen)\n\
+  vu = call.cap 13 8 (i64, i64) -> (i64) vph (vpath, vplen)\n\
   vflags = i64.const 0\n\
-  vo = cap.call 13 5 (i64, i64, i64) -> (i64) vph (vpath, vplen, vflags)\n\
+  vo = call.cap 13 5 (i64, i64, i64) -> (i64) vph (vpath, vplen, vflags)\n\
   vzero = i64.const 0\n\
   vneg = i64.sub vzero vo\n\
   vk = i64.const 1000\n\
@@ -5834,17 +5873,17 @@ block 0 (vph: i32) {\n\
   i32.store8 vp vf\n\
   vlen = i64.const 1\n\
   vflags = i64.const 577\n\
-  vfd = cap.call 13 5 (i64, i64, i64) -> (i64) vph (vp, vlen, vflags)\n\
+  vfd = call.cap 13 5 (i64, i64, i64) -> (i64) vph (vp, vlen, vflags)\n\
   vone = i64.const 1\n\
-  vd = cap.call 13 24 (i64, i64) -> (i64) vph (vfd, vone)\n\
+  vd = call.cap 13 24 (i64, i64) -> (i64) vph (vfd, vone)\n\
   vsz = i64.const 2\n\
-  vbuf = cap.call 13 2 (i64) -> (i64) vph (vsz)\n\
+  vbuf = call.cap 13 2 (i64) -> (i64) vph (vsz)\n\
   vY = i32.const 89\n\
   i32.store8 vbuf vY\n\
   vbuf1 = i64.add vbuf vone\n\
   voo = i32.const 111\n\
   i32.store8 vbuf1 voo\n\
-  vn = cap.call 13 0 (i64, i64, i64) -> (i64) vph (vone, vbuf, vsz)\n\
+  vn = call.cap 13 0 (i64, i64, i64) -> (i64) vph (vone, vbuf, vsz)\n\
   return vn\n\
   }\n\
 }\n";
@@ -6132,15 +6171,15 @@ block 0 (vph: i32) {\n\
   vpath = i64.const 110\n\
   vplen = i64.const 3\n\
   vflags = i64.const 577\n\
-  vfd = cap.call 13 5 (i64, i64, i64) -> (i64) vph (vpath, vplen, vflags)\n\
+  vfd = call.cap 13 5 (i64, i64, i64) -> (i64) vph (vpath, vplen, vflags)\n\
   vone = i64.const 1\n\
-  vd = cap.call 13 24 (i64, i64) -> (i64) vph (vfd, vone)\n\
+  vd = call.cap 13 24 (i64, i64) -> (i64) vph (vfd, vone)\n\
   vnm = i64.const 100\n\
   vnl = i64.const 2\n\
   vz = i64.const 0\n\
-  vpid = cap.call 13 27 (i64, i64, i64, i64) -> (i64) vph (vnm, vnl, vz, vz)\n\
+  vpid = call.cap 13 27 (i64, i64, i64, i64) -> (i64) vph (vnm, vnl, vz, vz)\n\
   vsb = i64.const 120\n\
-  vr = cap.call 13 28 (i64, i64, i64) -> (i64) vph (vpid, vsb, vz)\n\
+  vr = call.cap 13 28 (i64, i64, i64) -> (i64) vph (vpid, vsb, vz)\n\
   return vr\n\
   }\n\
 }\n";
@@ -6314,10 +6353,10 @@ func (i32) -> (i64) {\n\
 block 0 (vph: i32) {\n\
   vsig = i64.const 2\n\
   vh = i64.const 999\n\
-  vprev = cap.call 13 30 (i64, i64) -> (i64) vph (vsig, vh)\n\
+  vprev = call.cap 13 30 (i64, i64) -> (i64) vph (vsig, vh)\n\
   vz = i64.const 0\n\
-  vk = cap.call 13 31 (i64, i64) -> (i64) vph (vz, vsig)\n\
-  vc = cap.call 13 32 (i64) -> (i64) vph (vz)\n\
+  vk = call.cap 13 31 (i64, i64) -> (i64) vph (vz, vsig)\n\
+  vc = call.cap 13 32 (i64) -> (i64) vph (vz)\n\
   return vc\n\
   }\n\
 }\n";
@@ -6357,10 +6396,10 @@ block 0 (vph: i32) {\n\
   vH = i32.const 72\n\
   i32.store8 vp3 vH\n\
   vnlen = i64.const 4\n\
-  vptr = cap.call 13 11 (i64, i64) -> (i64) vph (vp, vnlen)\n\
+  vptr = call.cap 13 11 (i64, i64) -> (i64) vph (vp, vnlen)\n\
   vfd1 = i64.const 1\n\
   vfour = i64.const 4\n\
-  vw = cap.call 13 0 (i64, i64, i64) -> (i64) vph (vfd1, vptr, vfour)\n\
+  vw = call.cap 13 0 (i64, i64, i64) -> (i64) vph (vfd1, vptr, vfour)\n\
   return vptr\n\
   }\n\
 }\n";
@@ -6447,12 +6486,12 @@ block 0 (vph: i32) {\n\
   vpath = i64.const 0\n\
   vplen = i64.const 5\n\
   vflags = i64.const 0\n\
-  vfd = cap.call 13 5 (i64, i64, i64) -> (i64) vph (vpath, vplen, vflags)\n\
+  vfd = call.cap 13 5 (i64, i64, i64) -> (i64) vph (vpath, vplen, vflags)\n\
   vbuf = i64.const 32\n\
   vcap = i64.const 3\n\
-  vn = cap.call 13 1 (i64, i64, i64) -> (i64) vph (vfd, vbuf, vcap)\n\
+  vn = call.cap 13 1 (i64, i64, i64) -> (i64) vph (vfd, vbuf, vcap)\n\
   vfd1 = i64.const 1\n\
-  vw = cap.call 13 0 (i64, i64, i64) -> (i64) vph (vfd1, vbuf, vn)\n\
+  vw = call.cap 13 0 (i64, i64, i64) -> (i64) vph (vfd1, vbuf, vn)\n\
   return vn\n\
   }\n\
 }\n";
@@ -6510,13 +6549,13 @@ block 0 (vph: i32) {\n\
   vpc = i32.const 112\n\
   i32.store8 vp3 vpc\n\
   vplen = i64.const 4\n\
-  vcd = cap.call 13 10 (i64, i64) -> (i64) vph (vp, vplen)\n\
+  vcd = call.cap 13 10 (i64, i64) -> (i64) vph (vp, vplen)\n\
   vbuf = i64.const 32\n\
   veight = i64.const 8\n\
-  vgc = cap.call 13 9 (i64, i64) -> (i64) vph (vbuf, veight)\n\
+  vgc = call.cap 13 9 (i64, i64) -> (i64) vph (vbuf, veight)\n\
   vfd1 = i64.const 1\n\
   vfour = i64.const 4\n\
-  vw = cap.call 13 0 (i64, i64, i64) -> (i64) vph (vfd1, vbuf, vfour)\n\
+  vw = call.cap 13 0 (i64, i64, i64) -> (i64) vph (vfd1, vbuf, vfour)\n\
   vk = i64.const 1000000\n\
   vtt = i64.mul vcd vk\n\
   vr = i64.add vtt vgc\n\
@@ -7064,7 +7103,7 @@ block 0 (vph: i32) {\n\
     }
 
     /// The manifest form a chibicc/`temen-llvm` frontend emits for unresolved libc symbols: the
-    /// module *imports* the libc names `malloc`/`write` (never hand-writes a `cap.call`), each
+    /// module *imports* the libc names `malloc`/`write` (never hand-writes a `call.cap`), each
     /// call site carries a dummy `i32.const 0` handle operand (vestigial in static dispatch —
     /// IMPORTS.md §2.5), and the entry takes **no capability parameters at all** — the granted
     /// handle arrives through the slot binding ([`bind`]), never through an entry argument

@@ -1,6 +1,6 @@
 //! THREADS.md 4d — **Miri** verification of the shared powerbox on the **resumable `Vcpu`** path. The
 //! differential test in `temen/tests/bytecode_vcpu_orchestration_caps.rs` proves it agrees with the
-//! cooperative oracle; this proves the machinery — every vCPU thread dispatching `cap.call` through
+//! cooperative oracle; this proves the machinery — every vCPU thread dispatching `call.cap` through
 //! one `Mutex<Host>` ([`Vcpu::with_shared_host`]) while touching the shared window — is **free of
 //! data races / UB / provenance errors**. Miri's checker, not the iteration count, is the point, so
 //! the kernel (2 workers) is small.
@@ -12,8 +12,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use temen_interp::{bytecode, Host, Region, StreamRole, Trap, Value};
 use temen_text::parse_module;
 
-// 2 worker vCPUs each write "hi\n" to stdout via `cap.call` (handle threaded through block args) +
-// bump a shared counter — real concurrent `cap.call` on the one `Mutex<Host>` across threads.
+// 2 worker vCPUs each write "hi\n" to stdout via `call.cap` (handle threaded through block args) +
+// bump a shared counter — real concurrent `call.cap` on the one `Mutex<Host>` across threads.
 const CAPS: &str = r#"memory 16
 data 16384 "hi\n"
 func (i32) -> (i64) {
@@ -70,7 +70,7 @@ block 0 (vsp: i64, vh: i64) {
   vhandle = i32.wrap_i64 vh
   vptr = i64.const 16384
   vlen = i64.const 3
-  vw = cap.call 0 1 (i64, i64) -> (i64) vhandle(vptr, vlen)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vhandle(vptr, vlen)
   v1 = i64.const 16392
   v2 = i64.const 1
   v3 = i64.atomic.rmw.add v1 v2

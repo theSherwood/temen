@@ -39,7 +39,7 @@ memory64). Fold completed sections into `DESIGN.md` / drop this file once the ac
   the full `*.atomic.*` set (full-width i32/i64 map 1:1 onto IR atomics; the narrow 8/16-bit forms
   emulate via a 32-bit word-CAS loop) + `atomic.fence`, `shared`+imported memory, and the
   **wasi-threads** `wasi:thread/spawn` → native `thread.spawn` (a synthesized shim + unique-tid slot).
-- **Host ABI**: function imports → `cap.call` by the numeric `module`=type_id / `name`=op convention.
+- **Host ABI**: function imports → `call.cap` by the numeric `module`=type_id / `name`=op convention.
 
 ---
 
@@ -88,7 +88,7 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   `("wasi_snapshot_preview1", "fd_write")`) now lowers to a §7 `Inst::CallImport "<module>.<name>"`
   (declared in `Module.imports`); the embedder binds the name to a concrete `(type_id, op)` at load via
   `temen_ir::resolve_imports`. The numeric `module`=type_id / `name`=op convention still lowers to an
-  inline `cap.call`. temen-wasm stays pure mechanism — it never interprets host semantics. The
+  inline `call.cap`. temen-wasm stays pure mechanism — it never interprets host semantics. The
   `wasi_named_imports` test is the worked example: a minimal preview1 shim (`fd_write`/`proc_exit`) as
   an embedder `HostFn` capability (`temen_interp::iface::HOST_FN`, registered with `Host::grant_host_fn` —
   WASI semantics live outside both temen-wasm and the interp TCB), plus a `resolve` policy. A real WASI
@@ -98,7 +98,7 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   import interface** (keyed by the wasm `module` string, in first-appearance order) as the leading
   `i32` params of every function — so a module spanning N capability interfaces takes N leading handle
   params (N=0/1 collapse to the no-handle / single-handle cases, byte-identical to before). Each
-  `cap.call`/`CallImport` rides its interface's slot handle; the embedder grants one capability per
+  `call.cap`/`CallImport` rides its interface's slot handle; the embedder grants one capability per
   interface and passes the handles as the entry's leading args, in slot order. The module string is the
   grouping key because it is known at transpile time for both numeric and §7 named imports. Purely an
   temen-wasm (frontend) change — the IR/interp/JIT already take a per-call handle. The `Lower` prefix
@@ -114,7 +114,7 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   `Terminator::ReturnCall`/`ReturnCallIndirect`, which both backends execute as **true** tail calls
   (interp replaces the frame; JIT emits Cranelift `return_call`/`return_call_indirect`). Direct tail
   call to a defined function (true tail call), indirect via the §3c table dispatch, and a capability
-  import degrades to `cap.call` + `return` (correct, not tail-optimized; wasi:thread/spawn rejected).
+  import degrades to `call.cap` + `return` (correct, not tail-optimized; wasi:thread/spawn rejected).
   `tests/tailcall.rs`: 200k-deep tail recursion (would overflow a non-tail call), table dispatch,
   mutual even/odd recursion.
 - [x] **Passive *data* segments + `memory.init`/`data.drop` — DONE.** A passive segment's bytes are
@@ -140,7 +140,7 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   growable table region); passive **element** segments + `elem.drop`; declarative `elem` segments (a
   no-op). OOB indices **mask** into the window (the §1a model, like memory — not a trap); the
   `call_indirect` §3c type-check still guards a forged funcref, and a forged externref faults at
-  `cap.call` (authority lives in the host's grant table, not the handle's bits). `tests/reftypes.rs`
+  `call.cap` (authority lives in the host's grant table, not the handle's bits). `tests/reftypes.rs`
   (a vtable via `ref.func`+`table.set`+`call_indirect`, get/set round-trip, fill, copy, init from a
   passive segment, grow + over-max-fails, typed select, externref pass-through — all interp == JIT).
 - [ ] **Reference types — remaining**: **multiple tables** (`table.get`/`set`/`copy`/etc. on a
@@ -311,7 +311,7 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   `wasi_thread_start` (which carries the N-handle prefix like every defined function). No runtime
   change — the powerbox/host is already shared across vCPUs (interp `Arc<Mutex<Host>>`, JIT baked-in
   `cap_ctx`), so an i32 handle is valid on any thread. Transpiler-only; `n_handles == 0` is
-  byte-identical to the old threads-only shim. `tests/imports.rs`: `n` spawned workers each `cap.call`
+  byte-identical to the old threads-only shim. `tests/imports.rs`: `n` spawned workers each `call.cap`
   `work(start_arg)` and atomically sum the results to `Σ mix(i)` — interleaving-invariant, so interp's
   M:N executor and the JIT's OS threads agree.
 

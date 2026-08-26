@@ -18,14 +18,14 @@ use temen_ir::Memory;
 const SIZE_LOG2: u8 = 18; // 256 KiB window, fully mapped (reserved == mapped)
 const WINDOW: usize = 1 << SIZE_LOG2;
 
-// A guest that calls Clock.now (the may-suspend `cap.call`) and then *uses the result*
+// A guest that calls Clock.now (the may-suspend `call.cap`) and then *uses the result*
 // after the call — so a buggy thaw that re-issued the call instead of reloading the
 // saved value would be observable.
 const SRC: &str = r#"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v3 = i64.const 100
   v4 = i64.add v2 v3
   return v4

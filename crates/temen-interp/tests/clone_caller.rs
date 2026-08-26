@@ -7,7 +7,7 @@
 //!   value, not the handler's return — fork's core insight, "return-twice is a reply value" (FORK.md §3).
 //! - **3 — the twin:** duplicate the parked caller into a second live domain (private window +
 //!   duplicated powerbox), deliver `reply_orig` to the original and `reply_twin` to the twin. Both
-//!   resume past the same fork `cap.call` — return-twice, one live run.
+//!   resume past the same fork `call.cap` — return-twice, one live run.
 
 use std::sync::Arc;
 use temen_interp::{run_with_host, Host, StreamRole, Value};
@@ -115,18 +115,18 @@ block 0 (v0: i32) {
   i64.store q0a5 q0v4
   q0a6 = i64.const 17584
   i64.store q0a6 q0v4
-  vc = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
+  vc = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   vexp = i64.const 0
-  vh = cap.call 6 14 (i32, i64) -> (i32) v0 (vc, vexp)
+  vh = call.cap 6 14 (i32, i64) -> (i32) v0 (vc, vexp)
   varg = i64.const 7
-  vr = cap.call 268435456 0 (i64) -> (i64) vh (varg)
+  vr = call.cap 268435456 0 (i64) -> (i64) vh (varg)
   return vr
   }
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   return vn
   }
 }
@@ -135,7 +135,7 @@ block 0 (vx: i64) {
   vz = i32.const 0
   v999 = i64.const 999
   vzero = i64.const 0
-  vt = cap.call 4294967295 11 (i64, i64) -> (i64) vz (v999, vzero)
+  vt = call.cap 4294967295 11 (i64, i64) -> (i64) vz (v999, vzero)
   v5 = i64.const 5
   return v5
   }
@@ -151,7 +151,7 @@ func () -> (i64) {
 block 0 () {
   vz = i32.const 0
   varg = i64.const 999
-  vt = cap.call 4294967295 11 (i64) -> (i64) vz (varg)
+  vt = call.cap 4294967295 11 (i64) -> (i64) vz (varg)
   return vt
   }
 }
@@ -215,7 +215,7 @@ fn clone_caller_injects_the_callers_reply_out_of_band() {
 
 /// Increment 3 — the **twin**: `clone_caller(reply_orig, reply_twin)` from within the handler
 /// duplicates the parked caller into a second live domain. Both copies resume **past** the fork
-/// `cap.call` from the same call site — the original with `reply_orig`, the twin with `reply_twin` —
+/// `call.cap` from the same call site — the original with `reply_orig`, the twin with `reply_twin` —
 /// each over its own private window + duplicated powerbox, and each writes its reply to the **shared**
 /// stdout sink (fork shares stdout) before returning.
 ///
@@ -273,9 +273,9 @@ block 0 (v0: i32, vout: i32) {
   i64.store q1a5 q1v4
   q1a6 = i64.const 17648
   i64.store q1a6 q1v4
-  vs = cap.call 6 17 (i64) -> (i32) v0 (q1a0)
+  vs = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
   vz0 = i64.const 0
-  vcap = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
   va0 = i64.const 16640
   vnp = i32.const 16684
   i32.store va0 vnp
@@ -314,8 +314,8 @@ block 0 (v0: i32, vout: i32) {
   i64.store q2a5 q2v5
   q2a6 = i64.const 17712
   i64.store q2a6 q2v6
-  vc = cap.call 6 17 (i64) -> (i32) v0 (q2a0)
-  vjc = cap.call 6 1 (i32) -> (i64) v0 (vc)
+  vc = call.cap 6 17 (i64) -> (i32) v0 (q2a0)
+  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
   return vjc
   }
 }
@@ -325,7 +325,7 @@ block 0 (v0: i64) {
   }
 block 1 () {
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   br 1()
   }
 }
@@ -334,14 +334,14 @@ block 0 (vx: i64) {
   vz = i32.const 0
   vro = i64.const 100
   vrt = i64.const 200
-  vt = cap.call 4294967295 11 (i64, i64) -> (i64) vz (vro, vrt)
+  vt = call.cap 4294967295 11 (i64, i64) -> (i64) vz (vro, vrt)
   return vt
   }
 }
 func (i64) -> (i64) {
 block 0 (vpid: i64) {
   vz = i32.const 0
-  vt = cap.call 4294967295 12 (i64) -> (i64) vz (vpid)
+  vt = call.cap 4294967295 12 (i64) -> (i64) vz (vpid)
   return vt
   }
 }
@@ -355,22 +355,22 @@ block 0 (v0: i64) {
   i64.store va8 voname
   vp0 = i64.const 0
   vl3 = i64.const 3
-  vhsvc = cap.self.resolve vp0 vl3
+  vhsvc = self.resolve vp0 vl3
   vp8 = i64.const 8
   vl1 = i64.const 1
-  vho = cap.self.resolve vp8 vl1
+  vho = self.resolve vp8 vl1
   br 1(vhsvc, vho)
   }
 block 1 (vhsvc: i32, vho: i32) {
   varg = i64.const 7
-  vr = cap.call 268435456 0 (i64) -> (i64) vhsvc (varg)
+  vr = call.cap 268435456 0 (i64) -> (i64) vhsvc (varg)
   v200 = i64.const 200
   vistwin = i64.eq vr v200
   br_if vistwin 4(vr, vho) 2(vr, vhsvc, vho)
   }
 block 2 (vr: i64, vhsvc: i32, vho: i32) {
   vpid3 = i64.const 3
-  vstatus = cap.call 268435456 1 (i64) -> (i64) vhsvc (vpid3)
+  vstatus = call.cap 268435456 1 (i64) -> (i64) vhsvc (vpid3)
   veagain = i64.const -11
   viseagain = i64.eq vstatus veagain
   br_if viseagain 2(vr, vhsvc, vho) 3(vr, vstatus, vhsvc, vho)
@@ -384,7 +384,7 @@ block 4 (vr: i64, vho: i32) {
   vp16 = i64.const 16
   i64.store vp16 vr
   vlen = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
   return vr
   }
 }
@@ -548,9 +548,9 @@ block 0 (v0: i32, vout: i32) {
   i64.store q3a5 q3v4
   q3a6 = i64.const 17776
   i64.store q3a6 q3v4
-  vs = cap.call 6 17 (i64) -> (i32) v0 (q3a0)
+  vs = call.cap 6 17 (i64) -> (i32) v0 (q3a0)
   vz0 = i64.const 0
-  vcap = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
   va0 = i64.const 16640
   vnp = i32.const 16684
   i32.store va0 vnp
@@ -589,8 +589,8 @@ block 0 (v0: i32, vout: i32) {
   i64.store q4a5 q4v5
   q4a6 = i64.const 17840
   i64.store q4a6 q4v6
-  vc = cap.call 6 17 (i64) -> (i32) v0 (q4a0)
-  vjc = cap.call 6 1 (i32) -> (i64) v0 (vc)
+  vc = call.cap 6 17 (i64) -> (i32) v0 (q4a0)
+  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
   return vjc
   }
 }
@@ -600,7 +600,7 @@ block 0 (v0: i64) {
   }
 block 1 () {
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   br 1()
   }
 }
@@ -608,14 +608,14 @@ func (i64) -> (i64) {
 block 0 (vx: i64) {
   vz = i32.const 0
   vzero = i64.const 0
-  vt = cap.call 4294967295 11 (i64) -> (i64) vz (vzero)
+  vt = call.cap 4294967295 11 (i64) -> (i64) vz (vzero)
   return vt
   }
 }
 func (i64) -> (i64) {
 block 0 (vpid: i64) {
   vz = i32.const 0
-  vt = cap.call 4294967295 12 (i64) -> (i64) vz (vpid)
+  vt = call.cap 4294967295 12 (i64) -> (i64) vz (vpid)
   return vt
   }
 }
@@ -629,15 +629,15 @@ block 0 (v0: i64) {
   i64.store va8 voname
   vp0 = i64.const 0
   vl3 = i64.const 3
-  vhsvc = cap.self.resolve vp0 vl3
+  vhsvc = self.resolve vp0 vl3
   vp8 = i64.const 8
   vl1 = i64.const 1
-  vho = cap.self.resolve vp8 vl1
+  vho = self.resolve vp8 vl1
   br 1(vhsvc, vho)
   }
 block 1 (vhsvc: i32, vho: i32) {
   vc0 = i64.const 0
-  vpid = cap.call 268435456 0 (i64) -> (i64) vhsvc (vc0)
+  vpid = call.cap 268435456 0 (i64) -> (i64) vhsvc (vc0)
   vz1 = i64.const 0
   vforkfail = i64.lt_s vpid vz1
   br_if vforkfail 1(vhsvc, vho) 2(vpid, vhsvc, vho)
@@ -646,13 +646,13 @@ block 2 (vpid: i64, vhsvc: i32, vho: i32) {
   vp16 = i64.const 16
   i64.store vp16 vpid
   vlen = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
   vz2 = i64.const 0
   vparent = i64.ne vpid vz2
   br_if vparent 3(vpid, vhsvc) 5(vpid)
   }
 block 3 (vpid: i64, vhsvc: i32) {
-  vstatus = cap.call 268435456 1 (i64) -> (i64) vhsvc (vpid)
+  vstatus = call.cap 268435456 1 (i64) -> (i64) vhsvc (vpid)
   vz3 = i64.const 0
   vwaitfail = i64.lt_s vstatus vz3
   br_if vwaitfail 3(vpid, vhsvc) 4(vpid)
@@ -752,9 +752,9 @@ block 0 (v0: i32, vout: i32) {
   i64.store q5a5 q5v4
   q5a6 = i64.const 17904
   i64.store q5a6 q5v4
-  vs = cap.call 6 17 (i64) -> (i32) v0 (q5a0)
+  vs = call.cap 6 17 (i64) -> (i32) v0 (q5a0)
   vz0 = i64.const 0
-  vcap = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
   va0 = i64.const 16640
   vnp = i32.const 16684
   i32.store va0 vnp
@@ -793,8 +793,8 @@ block 0 (v0: i32, vout: i32) {
   i64.store q6a5 q6v5
   q6a6 = i64.const 17968
   i64.store q6a6 q6v6
-  vc = cap.call 6 17 (i64) -> (i32) v0 (q6a0)
-  vjc = cap.call 6 1 (i32) -> (i64) v0 (vc)
+  vc = call.cap 6 17 (i64) -> (i32) v0 (q6a0)
+  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
   return vjc
   }
 }
@@ -804,7 +804,7 @@ block 0 (v0: i64) {
   }
 block 1 () {
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   br 1()
   }
 }
@@ -812,14 +812,14 @@ func (i64) -> (i64) {
 block 0 (vx: i64) {
   vz = i32.const 0
   vzero = i64.const 0
-  vt = cap.call 4294967295 11 (i64) -> (i64) vz (vzero)
+  vt = call.cap 4294967295 11 (i64) -> (i64) vz (vzero)
   return vt
   }
 }
 func (i64) -> (i64) {
 block 0 (vpid: i64) {
   vz = i32.const 0
-  vt = cap.call 4294967295 12 (i64) -> (i64) vz (vpid)
+  vt = call.cap 4294967295 12 (i64) -> (i64) vz (vpid)
   return vt
   }
 }
@@ -836,9 +836,9 @@ block 0 (v0: i64) {
 block 1 () {
   vp0 = i64.const 0
   vl3 = i64.const 3
-  vhsvc = cap.self.resolve vp0 vl3
+  vhsvc = self.resolve vp0 vl3
   vc0 = i64.const 0
-  vpid = cap.call 268435456 0 (i64) -> (i64) vhsvc (vc0)
+  vpid = call.cap 268435456 0 (i64) -> (i64) vhsvc (vc0)
   vz1 = i64.const 0
   vforkfail = i64.lt_s vpid vz1
   br_if vforkfail 1() 2(vpid)
@@ -851,8 +851,8 @@ block 2 (vpid: i64) {
 block 3 (vpid: i64) {
   vp0b = i64.const 0
   vl3b = i64.const 3
-  vhsvc2 = cap.self.resolve vp0b vl3b
-  vstatus = cap.call 268435456 1 (i64) -> (i64) vhsvc2 (vpid)
+  vhsvc2 = self.resolve vp0b vl3b
+  vstatus = call.cap 268435456 1 (i64) -> (i64) vhsvc2 (vpid)
   vz3 = i64.const 0
   vwaitfail = i64.lt_s vstatus vz3
   br_if vwaitfail 3(vpid) 4(vstatus)
@@ -860,11 +860,11 @@ block 3 (vpid: i64) {
 block 4 (vstatus: i64) {
   vp8 = i64.const 8
   vl1 = i64.const 1
-  vho = cap.self.resolve vp8 vl1
+  vho = self.resolve vp8 vl1
   vp16 = i64.const 16
   i64.store vp16 vstatus
   vlen = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
   return vstatus
   }
 block 5 () {
@@ -947,9 +947,9 @@ block 0 (v0: i32, vout: i32) {
   i64.store q5a5 q5v4
   q5a6 = i64.const 17904
   i64.store q5a6 q5v4
-  vs = cap.call 6 17 (i64) -> (i32) v0 (q5a0)
+  vs = call.cap 6 17 (i64) -> (i32) v0 (q5a0)
   vz0 = i64.const 0
-  vcap = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
   va0 = i64.const 16640
   vnp = i32.const 16684
   i32.store va0 vnp
@@ -987,8 +987,8 @@ block 0 (v0: i32, vout: i32) {
   i64.store q6a5 q6v5
   q6a6 = i64.const 17968
   i64.store q6a6 q6v6
-  vc = cap.call 6 17 (i64) -> (i32) v0 (q6a0)
-  vjc = cap.call 6 1 (i32) -> (i64) v0 (vc)
+  vc = call.cap 6 17 (i64) -> (i32) v0 (q6a0)
+  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
   return vjc
   }
 }
@@ -998,7 +998,7 @@ block 0 (v0: i64) {
   }
 block 1 () {
   vz = i32.const 0
-  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
   br 1()
   }
 }
@@ -1006,14 +1006,14 @@ func (i64) -> (i64) {
 block 0 (vx: i64) {
   vz = i32.const 0
   vzero = i64.const 0
-  vt = cap.call 4294967295 11 (i64) -> (i64) vz (vzero)
+  vt = call.cap 4294967295 11 (i64) -> (i64) vz (vzero)
   return vt
   }
 }
 func (i64, i64) -> (i64) {
 block 0 (vpid: i64, vflags: i64) {
   vz = i32.const 0
-  vt = cap.call 4294967295 12 (i64, i64) -> (i64) vz (vpid, vflags)
+  vt = call.cap 4294967295 12 (i64, i64) -> (i64) vz (vpid, vflags)
   return vt
   }
 }
@@ -1030,9 +1030,9 @@ block 0 (v0: i64) {
 block 1 () {
   vp0 = i64.const 0
   vl3 = i64.const 3
-  vhsvc = cap.self.resolve vp0 vl3
+  vhsvc = self.resolve vp0 vl3
   vc0 = i64.const 0
-  vpid = cap.call 268435456 0 (i64) -> (i64) vhsvc (vc0)
+  vpid = call.cap 268435456 0 (i64) -> (i64) vhsvc (vc0)
   vz1 = i64.const 0
   vforkfail = i64.lt_s vpid vz1
   br_if vforkfail 1() 2(vpid)
@@ -1045,9 +1045,9 @@ block 2 (vpid: i64) {
 block 3 (vpid: i64) {
   vp0b = i64.const 0
   vl3b = i64.const 3
-  vhsvc2 = cap.self.resolve vp0b vl3b
+  vhsvc2 = self.resolve vp0b vl3b
   vnohang = i64.const 1
-  vstatus = cap.call 268435456 1 (i64, i64) -> (i64) vhsvc2 (vpid, vnohang)
+  vstatus = call.cap 268435456 1 (i64, i64) -> (i64) vhsvc2 (vpid, vnohang)
   vz3 = i64.const 0
   vraced = i64.lt_s vstatus vz3
   br_if vraced 3(vpid) 4(vstatus)
@@ -1055,11 +1055,11 @@ block 3 (vpid: i64) {
 block 4 (vstatus: i64) {
   vp8 = i64.const 8
   vl1 = i64.const 1
-  vho = cap.self.resolve vp8 vl1
+  vho = self.resolve vp8 vl1
   vp16 = i64.const 16
   i64.store vp16 vstatus
   vlen = i64.const 8
-  vw = cap.call 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
   return vstatus
   }
 block 5 () {

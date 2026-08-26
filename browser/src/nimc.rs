@@ -166,7 +166,7 @@ fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) ->
         host.register_cap_name("exec", eh);
     }
     // Manifest slot bindings for the on-ramp powerbox imports (stdout/stdin/exit/memory) — fs/exec are
-    // reached by name (`cap.self.resolve`) instead, so they're not bound here.
+    // reached by name (`self.resolve`) instead, so they're not bound here.
     if !m.imports.is_empty() {
         use temen_interp::cap_id;
         let bindings = m

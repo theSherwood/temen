@@ -58,7 +58,7 @@ fn io_cap(name: &str) -> Option<(u32, u32)> {
 }
 
 /// Grant the **on-ramp I/O powerbox** on `host` for module `m`: the §3e prefix (stdout/stdin/exit/
-/// memory/addrspace), each registered under its `cap.self.resolve` name, plus the module's manifest
+/// memory/addrspace), each registered under its `self.resolve` name, plus the module's manifest
 /// imports bound to it (IMPORTS.md phase 4 — [`io_cap`] maps each import name to the granted handle).
 /// This is the powerbox a chibicc `_start` expects (minus the browser's graphical caps), so a debugged C
 /// program that `printf`s (→ a `write` cap) runs instead of `CapFault`ing; its output lands in

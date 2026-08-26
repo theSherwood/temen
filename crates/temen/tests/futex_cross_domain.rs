@@ -63,12 +63,12 @@ block 0 (v0: i32) {\n\
   i64.store q0a5 q0v4\n\
   q0a6 = i64.const 1200\n\
   i64.store q0a6 q0v4\n\
-  v5 = cap.call 6 17 (i64) -> (i32) v0 (q0a0)\n\
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)\n\
   v6 = i64.const 69632\n\
   v7 = i32.const 0\n\
   v8 = i64.const -1\n\
   v9 = i32.atomic.wait v6 v7 v8\n\
-  v10 = cap.call 6 1 (i32) -> (i64) v0 (v5)\n\
+  v10 = call.cap 6 1 (i32) -> (i64) v0 (v5)\n\
   v11 = i64.extend_i32_u v9\n\
   v12 = i64.const 100\n\
   v13 = i64.mul v11 v12\n\
@@ -134,12 +134,12 @@ block 0 (v0: i32) {\n\
   i64.store q1a5 q1v4\n\
   q1a6 = i64.const 1264\n\
   i64.store q1a6 q1v4\n\
-  v5 = cap.call 6 17 (i64) -> (i32) v0 (q1a0)\n\
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (q1a0)\n\
   v6 = i64.const 69632\n\
   v7 = i32.const 1\n\
   i32.atomic.store v6 v7\n\
   v8 = atomic.notify v6 v7\n\
-  v9 = cap.call 6 1 (i32) -> (i64) v0 (v5)\n\
+  v9 = call.cap 6 1 (i32) -> (i64) v0 (v5)\n\
   v10 = i64.const 10\n\
   v11 = i64.mul v9 v10\n\
   v12 = i64.extend_i32_u v8\n\

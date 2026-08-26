@@ -5,7 +5,7 @@
 //! resume point is exactly its block's params + the locals before the op — all spilled and
 //! reloaded on thaw, with the segment tail recomputing the rest. The transform splits each
 //! original block at its suspend ops and remaps every branch target to the target block's
-//! first segment. These tests freeze a frozen domain whose in-flight `cap.call` lives in a
+//! first segment. These tests freeze a frozen domain whose in-flight `call.cap` lives in a
 //! *non-entry* block (so the carried block params, not the function params, must survive),
 //! and resume across a conditional join and around a loop back-edge.
 //!
@@ -80,7 +80,7 @@ fn assert_roundtrips(src: &str, expected: i64) {
     );
 }
 
-// A conditional whose taken arm holds the cap.call: the suspend point is in block1, a
+// A conditional whose taken arm holds the call.cap: the suspend point is in block1, a
 // *non-entry* block, so block1's param (the handle, carried as a branch arg) must be
 // spilled and reloaded — it cannot be recovered from the function entry. Baseline: 142.
 const COND: &str = r#"
@@ -91,7 +91,7 @@ block 0 (v0: i32) {
 }
 block 1 (v0: i32) {
   v2 = i32.const 0
-  v3 = cap.call 2 0 (i32) -> (i64) v0 (v2)
+  v3 = call.cap 2 0 (i32) -> (i64) v0 (v2)
   v4 = i64.const 100
   v5 = i64.add v3 v4
   return v5
@@ -108,7 +108,7 @@ fn suspend_in_conditional_branch_round_trips() {
     assert_roundtrips(COND, 142);
 }
 
-// A loop that reads the clock each iteration and accumulates. The cap.call is in the loop
+// A loop that reads the clock each iteration and accumulates. The call.cap is in the loop
 // header (block1), reached via a back-edge; the loop-carried accumulator and counter flow
 // as block params and must survive the freeze. Clock 42,43,44 over three iterations ⇒
 // 42 + 43 + 44 = 129. Freeze lands on iteration 0; the continuation clock makes iterations
@@ -122,7 +122,7 @@ block 0 (v0: i32) {
 }
 block 1 (v0: i32, v1: i64, v2: i64) {
   v3 = i32.const 0
-  v4 = cap.call 2 0 (i32) -> (i64) v0 (v3)
+  v4 = call.cap 2 0 (i32) -> (i64) v0 (v3)
   v5 = i64.add v1 v4
   v6 = i64.const 1
   v7 = i64.add v2 v6

@@ -52,7 +52,7 @@ block 0 (vjit: i32, vcode: i32) {
   vc = i64.extend_i32_u vcode
   va = i64.const 4
   vb = i64.const 5
-  vr = cap.call 11 1 (i64, i64, i64) -> (i64) vjit (vc, va, vb)
+  vr = call.cap 11 1 (i64, i64, i64) -> (i64) vjit (vc, va, vb)
   return vr
   }
 }
@@ -64,7 +64,7 @@ func (i32, i32) -> (i64) {
 block 0 (vjit: i32, vcode: i32) {
   vc = i64.extend_i32_u vcode
   vx = i64.const 7
-  vr = cap.call 11 1 (i64, i64) -> (i64) vjit (vc, vx)
+  vr = call.cap 11 1 (i64, i64) -> (i64) vjit (vc, vx)
   return vr
   }
 }

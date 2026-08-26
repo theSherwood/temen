@@ -53,13 +53,13 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   ve = i64.const 0
   vlog = i64.const 12
   vq = i64.const 0
-  vB = cap.call 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
+  vB = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
   vex = i64.const 0
-  vcap = cap.call 6 14 (i32, i64) -> (i32) v0 (vB, vex)
+  vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vB, vex)
   va = i64.const 40
   vb = i64.const 2
-  vr = cap.call 268435456 0 (i64, i64) -> (i64) vcap (va, vb)
-  vj = cap.call 6 1 (i32) -> (i64) v0 (vB)
+  vr = call.cap 268435456 0 (i64, i64) -> (i64) vcap (va, vb)
+  vj = call.cap 6 1 (i32) -> (i64) v0 (vB)
   vk = i64.const 100
   vm = i64.mul vj vk
   vs = i64.add vm vr
@@ -92,14 +92,14 @@ fn a_detached_child_serves_live_calls_from_a_window_its_parent_cannot_see() {
     );
 }
 
-/// A child that reports its own `cap.self.attest` — the non-interposable trust anchor.
+/// A child that reports its own `self.attest` — the non-interposable trust anchor.
 const ATTEST_MOD: &str = r#"
 memory 12
 
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vz = i32.const 0
-  va = cap.call 4294967295 4 () -> (i64) vz ()
+  va = call.cap 4294967295 4 () -> (i64) vz ()
   return va
   }
 }
@@ -120,11 +120,11 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   voff = i64.const 65536
   vlog = i64.const 12
   vq = i64.const 0
-  vN = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (vmh, ve, voff, vlog, vq)
+  vN = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (vmh, ve, voff, vlog, vq)
   vz = i64.const 0
-  vD = cap.call 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
-  vjN = cap.call 6 1 (i32) -> (i64) v0 (vN)
-  vjD = cap.call 6 1 (i32) -> (i64) v0 (vD)
+  vD = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
+  vjN = call.cap 6 1 (i32) -> (i64) v0 (vN)
+  vjD = call.cap 6 1 (i32) -> (i64) v0 (vD)
   vk = i64.const 1000
   vm = i64.mul vjN vk
   vs = i64.add vm vjD
@@ -172,9 +172,9 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   ve = i64.const 0
   vlog = i64.const 12
   vq = i64.const 0
-  vfst = cap.call 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
-  vsnd = cap.call 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
-  vj = cap.call 6 1 (i32) -> (i64) v0 (vfst)
+  vfst = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
+  vsnd = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
+  vj = call.cap 6 1 (i32) -> (i64) v0 (vfst)
   vzero = i32.const 0
   vf1 = i32.lt_s vfst vzero
   vf2 = i32.lt_s vsnd vzero
@@ -224,7 +224,7 @@ block 0 (v0: i32, v1: i32) {
   ve = i64.const 0
   vlog = i64.const 12
   vq = i64.const 0
-  vs = cap.call 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
+  vs = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
   vr = i64.extend_i32_s vs
   return vr
   }

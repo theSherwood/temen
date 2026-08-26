@@ -16,7 +16,7 @@
 //! - **entry signature ⊆ {i32, i64}** — the guest-arg / result marshalling the harness supports; a
 //!   float/v128 *entry* type is skipped (its body ops are still covered by the Cranelift generator).
 //!   Memory confinement lives in the body (loads/stores/bulk/atomics), independent of the entry types.
-//! - modules the wasm tier **refuses** (`Unsupported`: any out-of-integer-subset op — cap.call, page
+//! - modules the wasm tier **refuses** (`Unsupported`: any out-of-integer-subset op — call.cap, page
 //!   ops, fiber/threads, fma, deferred SIMD) are skipped, exactly as the Cranelift path skips its
 //!   `JitError::Unsupported`.
 //! - a **read-only** data segment is skipped: the wasmi harness has no `PROT_NONE`/RO enforcement, so
@@ -231,7 +231,7 @@ pub fn run_differential_wasm(m: &Module, args: &[Value]) {
     };
 
     // Oracle: tree-walk interpreter, fully-mapped window (`reserved_log2 = 0`), no caps granted (an
-    // accepted module has no cap.call). Returns the result and the final window.
+    // accepted module has no call.cap). Returns the result and the final window.
     let mut fuel = FUEL;
     let mut host = Host::new();
     let (interp, imem) = run_capture_reserved_with_host(m, 0, args, &mut fuel, &init, 0, &mut host);

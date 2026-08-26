@@ -21,7 +21,7 @@ The value is *not* uniform across backends, and that shapes which passes are wor
 
 | Payoff | Why |
 |---|---|
-| **Cross-function transforms** | Cranelift optimizes per function; nothing else in the pipeline inlined, devirtualized constant-index `call_indirect`, or dropped dead functions — landed as Phase 3 (devirt + inline + DFE + const_prop). Highest leverage for the JIT path. |
+| **Cross-function transforms** | Cranelift optimizes per function; nothing else in the pipeline inlined, devirtualized constant-index `call.dyn`, or dropped dead functions — landed as Phase 3 (devirt + inline + DFE + const_prop). Highest leverage for the JIT path. |
 | **Interpreter backends** | The tree-walker and bytecode engine run the IR as-is — every pass pays off directly. The bytecode engine is the *only* execution path in the browser build (§21). |
 | **Compile time** | Smaller IR JITs faster (peval corpus: residuals compile 4–13× faster). Guest-side `Jit.compile` is metered, so shrinking IR before compiling is a real in-sandbox win. |
 | **Peval residual quality** | The specializer leans on the generic optimizer for cleanup; cases like `stack: chained expr` (73% of interpreter bytes kept) show headroom for GVN / load-forwarding. |
@@ -66,10 +66,10 @@ consequences are the legality rules every pass must obey:
 3. **Dead-store elimination is illegal** under "same final memory window." If wanted, it needs an
    opt-in caller contract ("this region is scratch"), the same shape as `SpecConfig`'s
    constant-memory / rename-region promises: a false promise is a miscompile, never an escape.
-4. **Threads/fibers (§12 C/C++11 model):** any atomic, fence, `call`, `cap.call`, or fiber/thread
+4. **Threads/fibers (§12 C/C++11 model):** any atomic, fence, `call`, `call.cap`, or fiber/thread
    op is a full clobber for memory-value tracking; non-atomic load caching is sound only between
    clobbers.
-5. **Function indices are addressable** (`ref.func`, `call_indirect` over the identity table):
+5. **Function indices are addressable** (`ref.func`, `call.dyn` over the identity table):
    dead-function elimination may only drop functions that are unexported *and* provably
    unreferenced by any table-addressable path.
 
@@ -230,7 +230,7 @@ tracked enhancement, not a blocker.
     threading so multi-hop chains collapse a hop per iteration. Tests (`tests/jump_thread.rs`):
     correlated branch threaded + forwarder eliminated, behavior preserved; covered by the `opt_sccp`
     fuzz target (whole pipeline, gen → verify → optimize → re-verify + interp differential).
-- [x] **Phase 3 — interprocedural.** Budgeted inliner; constant-index `call_indirect` /
+- [x] **Phase 3 — interprocedural.** Budgeted inliner; constant-index `call.dyn` /
   `ref.func` devirtualization through the identity table; dead-function elimination
   (export/table-aware, rule 5 above). All landed (below), plus interprocedural constant
   propagation beyond the plan.
@@ -240,7 +240,7 @@ tracked enhancement, not a blocker.
     `temen_ir::offset_func_indices` enumerates); survivors renumbered densely, every funcidx reference +
     export target remapped (names preserved). Because a funcref **equals its funcidx** (identity table)
     and can be a plain `ConstI32`, an indirect dispatch could reach any function, so the pass bails to
-    the identity while `call_indirect`/`return_call_indirect`/`cont.new` is present — devirtualization
+    the identity while `call.dyn`/`return_call.dyn`/`cont.new` is present — devirtualization
     (below) removes those first, then DFE applies. `OptConfig.dfe` toggle (default on), runs once after
     the per-function passes; output re-verified; debug info dropped on any removal. Tests in
     `tests/interproc.rs`; covered by the `opt_sccp` fuzz target (whole pipeline).
@@ -265,7 +265,7 @@ tracked enhancement, not a blocker.
     full-pipeline devirt→inline→DFE), all re-verified; the peval differential suite + `opt_sccp` fuzz
     target now exercise it on real residuals.
   - [x] **Constant-funcref devirtualization** (`temen_opt::interproc::devirtualize`): a
-    `call_indirect`/`return_call_indirect` whose `idx` is a compile-time-constant funcref (a
+    `call.dyn`/`return_call.dyn` whose `idx` is a compile-time-constant funcref (a
     `ref.func k`, or an in-range `ConstI32 k` — a funcref is a plain `i32`, the identity table) and
     `funcs[k]`'s signature matches `ty` → rewritten **in place** to a direct `call`/`return_call`
     (matching signatures ⇒ matching result arity ⇒ no renumbering). The sig check is load-bearing: a
@@ -287,7 +287,7 @@ tracked enhancement, not a blocker.
     (ablation `const_prop` case: **+100 B**, an isolated win no other pass reproduces). The fixpoint also
     resolves the **const-funcref-callback cascade**: a constant funcref (a `ref.func` or in-range
     `ConstI32`, both read as their funcidx) propagated into a dispatcher's parameter makes its
-    `call_indirect` index constant, so the **re-run of devirt** after this pass turns the indirect call
+    `call.dyn` index constant, so the **re-run of devirt** after this pass turns the indirect call
     into a direct one (then inlines). Runs after devirt, before (a second) devirt + inline. **Soundness**
     rests on seeing every call that can reach a parameter: a direct call feeds its callee; an indirect
     call whose index resolves to a signature-matching constant funcref feeds exactly that target (a
@@ -383,7 +383,7 @@ The first ablation surfaced concrete next steps, tracked here so they aren't los
 - [x] **Broaden the ablation corpus + measure the full pass set.** The harness now leaves out **all
   twelve** togglable passes (was six; `const_prop` joined with its Phase 3 entry) and adds two cases so the Phase-3/4 passes have a shape that
   exercises them: a **memory** case (a redundant same-address load for `mem`, a diamond-join reload
-  for `load_elim`) and an **interproc** case (a constant `call_indirect` → `devirt` → `inline` → `dfe`,
+  for `load_elim`) and an **interproc** case (a constant `call.dyn` → `devirt` → `inline` → `dfe`,
   nearly halving the module). The ablation harness re-run; the interprocedural passes turn out to be the
   biggest *size* wins in the corpus. (Still open: more branch/const-prop-heavy shapes to sharpen SCCP.)
 - [ ] **Multi-run statistics in the harness.** Single-run numbers show visible variance (one JIT row

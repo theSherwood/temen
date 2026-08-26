@@ -686,7 +686,7 @@ fn unresolved_cross_module_global_is_fail_closed() {
 /// A cross-module call **through a funcref global** — the funcref counterpart of
 /// `cross_module_global_read_write`. Module `s` defines a `proctype` gvar `hook`, a handler `dbl`,
 /// and a setter that stores `ref.func dbl` into `hook`; module `w` calls `hook.<s>(x)`. A funcref
-/// gvar is a *data* symbol, not a proc, so the call must lower to a `data.sym` load + `call_indirect`
+/// gvar is a *data* symbol, not a proc, so the call must lower to a `data.sym` load + `call.dyn`
 /// (using the pooled proctype signature), not a proc import. `drive` sets the hook, then dispatches
 /// through it: `drive(x) = dbl(x) = 2x`.
 #[test]

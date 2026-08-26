@@ -136,7 +136,7 @@ fn check_vector(
     );
 
     // Bytecode interpreter, same fully-mapped reservation (empty powerbox host —
-    // these modules make no cap.calls).
+    // these modules make no call.cap calls).
     let mut fuel = 10_000u64;
     let mut host = Host::new();
     let (bc, bmem) = bytecode::compile_and_run_capture_reserved_with_host(

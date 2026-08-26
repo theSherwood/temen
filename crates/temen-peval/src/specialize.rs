@@ -63,7 +63,7 @@
 //!   a branch to the caller's continuation. Recursion + dynamic control flow, loops in the callee,
 //!   and `unreachable` callee paths all work; one residual function still comes out.
 //!
-//! An **indirect** call (`call_indirect` / `return_call_indirect`, and `ref.func`) is inlined too
+//! An **indirect** call (`call.dyn` / `return_call.dyn`, and `ref.func`) is inlined too
 //! when its table index resolves to a **constant, in-range, signature-matching** function — the
 //! module-0 table is the identity map, so a folded funcref dispatches deterministically to that
 //! callee, which is then inlined like a direct call. A dynamic / out-of-range / mismatched index
@@ -315,8 +315,8 @@ pub struct SpecConfig {
     /// outlined back-edge) and implies outlining is enabled (no need to also set `outline_calls`). Off
     /// by default.
     pub selective_outline: bool,
-    /// **Bounded-target dynamic `call_indirect` (approach A).** When `Some(cap)`, a pre-pass
-    /// ([`crate::lower_indirect_dispatch`]) rewrites every dynamic-index `call_indirect` whose
+    /// **Bounded-target dynamic `call.dyn` (approach A).** When `Some(cap)`, a pre-pass
+    /// ([`crate::lower_indirect_dispatch`]) rewrites every dynamic-index `call.dyn` whose
     /// demanded signature is matched by at most `cap` module functions into an explicit masked
     /// dispatch over direct calls (one arm per target), so the specializer folds through it instead
     /// of returning [`SpecError::Unsupported`]. Sites with more than `cap` matching targets
@@ -639,7 +639,7 @@ pub fn specialize_with_config(
     args: &[SpecArg],
     config: &SpecConfig,
 ) -> Result<Module, SpecError> {
-    // Approach A: optionally rewrite dynamic-index `call_indirect`s into bounded direct-call
+    // Approach A: optionally rewrite dynamic-index `call.dyn`s into bounded direct-call
     // dispatch before specializing, so the engine folds through them (see `lower_indirect`). The
     // rewrite preserves function signatures/indices, so `func` and `args` still refer to the same
     // entry.
@@ -780,10 +780,10 @@ pub fn specialize_with_config(
         return Ok(Module {
             funcs,
             memory: module.memory,
-            // Keep the data image so any baked data pointers resolve; the `call_indirect` identity
+            // Keep the data image so any baked data pointers resolve; the `call.dyn` identity
             // table needs no side data (a funcref is its own function index, and its runtime value is
             // read from the live heap the caller re-seeds). `imports` / `types` are dropped — every
-            // import-bearing function is stubbed, and `call_indirect` carries its signature inline —
+            // import-bearing function is stubbed, and `call.dyn` carries its signature inline —
             // which also keeps this branch free of the `String`-cloning the LLVM→IR on-ramp can't
             // resolve when temen-peval is itself on-ramped (the `peval_futamura` guest test).
             data: module.data.clone(),
@@ -2019,7 +2019,7 @@ impl Spec<'_> {
                     .resolve_indirect(*ty, env[*idx as usize])
                     .ok_or_else(|| {
                         trace_unsup!(
-                            "call_indirect unresolved ty={:?} idx_const={:?}",
+                            "call.dyn unresolved ty={:?} idx_const={:?}",
                             ty,
                             match env[*idx as usize] {
                                 Abs::Const(k) => Some(k.as_i32()),
@@ -2034,7 +2034,7 @@ impl Spec<'_> {
         })
     }
 
-    /// Resolve a `call_indirect` table index to a concrete function, or `None` if it can't be pinned
+    /// Resolve a `call.dyn` table index to a concrete function, or `None` if it can't be pinned
     /// at specialization time. The module-0 function table is the identity map (slot `i` → func `i`)
     /// padded with empty slots, and for any in-range index the table-size mask is a no-op — so a
     /// **constant, in-range, signature-matching** index dispatches deterministically to `funcs[idx]`
@@ -2227,7 +2227,7 @@ impl Spec<'_> {
             Inst::ConstF64(b) => Abs::Const(Known::F64(b)),
             Inst::ConstV128(b) => Abs::Const(Known::V128(b)),
             // `ref.func` is the function index as a plain `i32` (a funcref is forgeable data, §3c).
-            // Folding it to a constant lets a downstream `call_indirect` resolve its callee.
+            // Folding it to a constant lets a downstream `call.dyn` resolve its callee.
             Inst::RefFunc { func } => Abs::Const(Known::I32(func as i32)),
 
             Inst::IntBin { ty, op, a, b } => {
@@ -3418,7 +3418,7 @@ fn imports_a_boundary(f: &Func) -> bool {
 /// A same-signature stub whose single block just traps — the placeholder for a carried function that
 /// [`carry_whole_module`](SpecConfig::carry_whole_module) can't keep verbatim (see
 /// [`imports_a_boundary`]). Filling the slot keeps every other function's index — and the identity
-/// `call_indirect` table — unchanged; the body is unreachable on the cut closure's execution path.
+/// `call.dyn` table — unchanged; the body is unreachable on the cut closure's execution path.
 fn trap_stub(f: &Func) -> Func {
     Func {
         params: f.params.clone(),

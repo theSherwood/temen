@@ -163,7 +163,7 @@ block 0 (vsp: i64, v0: i64) {
     );
 }
 
-/// A `call_indirect` dispatcher over two in-subset integer targets: the whole module is in-subset,
+/// A `call.dyn` dispatcher over two in-subset integer targets: the whole module is in-subset,
 /// so it's mixed_ok — and because an indirect call can reach *any* function, `has_indirect` forces
 /// every function reachable (the funcref table populates one slot per function).
 #[test]
@@ -173,7 +173,7 @@ func (i64) -> (i64) {
 block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i64.const 7
-  v3 = call_indirect (i64) -> (i64) v1 (v2)
+  v3 = call.dyn (i64) -> (i64) v1 (v2)
   return v3
   }
 }
@@ -196,7 +196,7 @@ block 0 (v0: i64) {
     assert!(a.mixed_ok, "all-in-subset indirect dispatch is mixed_ok");
 }
 
-/// With a `call_indirect` present, an out-of-subset (deferred-SIMD) function anywhere in the module
+/// With a `call.dyn` present, an out-of-subset (deferred-SIMD) function anywhere in the module
 /// blocks mixed_ok — even though no *direct* edge reaches it — because the indirect call could
 /// select it, and its table slot has no emitted target. The conservative first-increment rule (all
 /// indirect targets must be in-subset) fails closed to the interpreter.
@@ -207,7 +207,7 @@ func (i64) -> (i64) {
 block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
   v2 = i64.const 7
-  v3 = call_indirect (i64) -> (i64) v1 (v2)
+  v3 = call.dyn (i64) -> (i64) v1 (v2)
   return v3
   }
 }

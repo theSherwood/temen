@@ -1,5 +1,5 @@
 //! The **configurable Fs capability** end to end: a C guest (`fixtures/fs_probe.c`) resolves the
-//! embedder-granted capability by name (`__vm_cap_resolve` → §7 `cap.self.resolve`) and drives the
+//! embedder-granted capability by name (`__vm_cap_resolve` → §7 `self.resolve`) and drives the
 //! whole op protocol through `__vm_host_call` (§7 host-defined capability — the wasm-import
 //! analogue): open/write/close, reopen/seek/read-back, rename, append, remove, truncate, sync,
 //! EOF, read-only refusal, and the attenuation refusals (`..`/absolute paths). No filesystem authority exists
