@@ -128,7 +128,9 @@ fn run_and_print(
     // thread, blocking waitpid/pipes real condvar/poll blocks); default is the tree-walk interp.
     let run = match std::env::var("BASH_PROBE_BACKEND").as_deref() {
         Ok("parallel") => inst.run_with_caps_parallel(config, &[("posix", cap)]),
-        Ok("bytecode") => inst.run_with_caps(temen_run::Backend::Bytecode, config, &[("posix", cap)]),
+        Ok("bytecode") => {
+            inst.run_with_caps(temen_run::Backend::Bytecode, config, &[("posix", cap)])
+        }
         _ => inst.run_with_caps(temen_run::Backend::TreeWalk, config, &[("posix", cap)]),
     };
     match run {
