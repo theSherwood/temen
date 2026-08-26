@@ -6591,8 +6591,13 @@ fn lower_block(
             // trap_out) -> i64 count. The thunk walks the live fiber stacks (runtime via the
             // thread-local), masks each word with `payload_mask` (§GC tagged pointers; distinct from
             // the window-confinement `mask`), filters the masked value to `[heap_lo, heap_hi)`, and
-            // writes the first `cap` deduped words to guest `buf` — confining/bounds-checking it with
-            // the same `mask`/`mapped`/`sub_base` as `mask_addr`, so a forged buffer faults (below).
+            // writes the first `cap` deduped words to guest `buf` — confining/bounds-checking it
+            // with the same `mask`/bound/`sub_base` as `mask_addr`, so a forged buffer faults
+            // (below). #826: the bound is the **reserved** mask domain (not the compile-time
+            // `mapped`), so a roots buffer in a legitimately `map`-grown tail page is admitted
+            // where the interpreter's live page map admits it; committed-ness and write-protection
+            // are the hardware's to enforce — a write into an uncommitted or `Ro` page faults through
+            // the SIGSEGV shim to `MemoryFault`, exactly like a guest store.
             let lo = get(&vals, *heap_lo)?;
             let hi = get(&vals, *heap_hi)?;
             let payload_mask = get(&vals, *mask)?;
@@ -6600,7 +6605,8 @@ fn lower_block(
             let cap_v = get(&vals, *cap)?;
             let mem_base = b.use_var(lower.mem_var);
             let maskv = b.ins().iconst(I64, lower.mask as i64);
-            let mappedv = b.ins().iconst(I64, lower.mapped as i64);
+            let win_reserved = if lower.mapped == 0 { 0 } else { lower.mask + 1 };
+            let mappedv = b.ins().iconst(I64, win_reserved as i64);
             let subv = b.ins().iconst(I64, lower.sub_base as i64);
             let trap_out = b.use_var(lower.trap_var);
             // Marshal the ten args into one 8-byte-aligned stack slot (matching `GcRootsArgs`'s
@@ -8106,6 +8112,11 @@ fn lower_cap_call_fast(
     let n_res = sig.results.len();
     let ctx = b.ins().iconst(I64, lower.cap.ctx_addr);
     let mem_base = b.use_var(lower.mem_var);
+    // #826: this frozen `lower.mapped` is deliberate — the ABI slot is the window's
+    // default-committed **prefix** (the interpreter's equally-frozen `window.mapped`; growth lives
+    // as explicit page-map entries, never by moving this value). A fast-path fn that needs to
+    // admit grown-tail buffers must consult live page state like the generic thunk's
+    // `MprotectWindow` does, not this bound alone.
     let mem_size = b.ins().iconst(I64, lower.mapped as i64);
     let h = get(vals, handle)?;
     let trap_out = b.use_var(lower.trap_var);
@@ -8206,6 +8217,11 @@ fn lower_cap_call(
     // Assemble the thunk arguments (see `CapThunk`).
     let ctx = b.ins().iconst(I64, lower.cap.ctx_addr);
     let mem_base = b.use_var(lower.mem_var);
+    // #826: this frozen `lower.mapped` is deliberate — it is the window's default-committed
+    // **prefix** (the interpreter's equally-frozen `window.mapped`): the thunk builds its
+    // `MprotectWindow` view as `(mapped default, reserved, live shared page map)`, so grown-tail
+    // borrows are admitted by the page map, not by this value. Do not "fix" it to `reserved` —
+    // that would default-commit the whole tail and admit borrows of never-mapped pages.
     let mem_size = b.ins().iconst(I64, lower.mapped as i64);
     // The reserved mask domain (`mask + 1`) the guest may `map`-grow into; 0 when no memory.
     let reserved = if lower.mapped == 0 { 0 } else { lower.mask + 1 };
@@ -8431,8 +8447,16 @@ fn lower_instantiator(
             //   the op-0/5/11/13 bodies. Pager records CapFault (sound: modules with impl
             //   exports fold to the oracle); budget records are the §3c.2 parity follow-up
             //   (probeable -EINVAL, the durable-nesting precedent).
+            //
+            // #826: the bound is the **reserved** mask domain, not the compile-time `mapped` — a
+            // record in a legitimately `map`-grown tail page must be read where the interpreter's
+            // live page map reads it. Committed-ness is the hardware's to enforce, exactly like an
+            // ordinary guest access: a read into a still-unmapped (PROT_NONE) or guarded page
+            // faults through the SIGSEGV shim to `MemoryFault` (the thunk runs inside the armed
+            // guest call, and the faulting address is in the guarded window range).
             let h = slot_i32(b, get(vals, handle)?);
-            let mem_size = b.ins().iconst(I64, lower.mapped as i64);
+            let win_reserved = if lower.mapped == 0 { 0 } else { lower.mask + 1 };
+            let mem_size = b.ins().iconst(I64, win_reserved as i64);
             let record_ptr = slot_i64(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
             let mut tsig = module.make_signature();
             for t in [I64, I64, I64, I32, I64, I64] {
@@ -8476,8 +8500,12 @@ fn lower_instantiator(
             //   grants_ptr:i64, grants_n:i64, entry:i64, off:i64, size_log2:i64, fuel:i64,
             //   trap_out:i64) -> handle:i32. Op 5's leading `Module` handle then op 11's grant-list
             // args — runs a foreign module with a by-name granted powerbox (the shell "exec").
+            //
+            // #826: reserved-bounded grant-list reads, like op 17 above — a grant record in a
+            // grown tail page is admitted; an uncommitted page faults through the guard.
             let h = slot_i32(b, get(vals, handle)?);
-            let mem_size = b.ins().iconst(I64, lower.mapped as i64);
+            let win_reserved = if lower.mapped == 0 { 0 } else { lower.mask + 1 };
+            let mem_size = b.ins().iconst(I64, win_reserved as i64);
             let modh = slot_i64(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
             let grants_ptr = slot_i64(b, get(vals, *args.get(1).ok_or(JitError::Malformed)?)?);
             let grants_n = slot_i64(b, get(vals, *args.get(2).ok_or(JitError::Malformed)?)?);
