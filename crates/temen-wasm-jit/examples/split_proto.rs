@@ -22,7 +22,10 @@
 
 use std::path::{Path, PathBuf};
 use temen_ir::{BinOp, Block, CmpOp, Func, Inst, IntTy, Memory, Module, Terminator, ValType};
-use temen_wasm_jit::{compile_module_b2, compile_module_split, est_emitted_size};
+use temen_wasm_jit::{
+    compile_module_b2, compile_module_split, compile_module_with, compile_split_fn,
+    est_emitted_size,
+};
 
 fn i64f() -> Func {
     Func {
@@ -122,6 +125,94 @@ fn hot_loop(hot_blocks: usize, hot_block_len: usize) -> Func {
             }
         } else {
             // Last chain block: i' = i - 1; br 1(i', acc').
+            insts.push(Inst::ConstI64(1));
+            let one = next;
+            next += 1;
+            insts.push(Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Sub,
+                a: 0,
+                b: one,
+            });
+            let dec = next;
+            Terminator::Br {
+                target: 1,
+                args: vec![dec, acc],
+            }
+        };
+        f.blocks.push(Block {
+            params: vec![ValType::I64, ValType::I64],
+            insts,
+            term,
+        });
+    }
+    f
+}
+
+/// A **call-free** hot loop `f0(n)`, same shape as [`hot_loop`] but the per-iteration body folds inline
+/// (no helper call), so the whole hot path is one self-contained function — the input to `compile_split_fn`
+/// (the real intra-function splitter), which requires a call-free function.
+fn callfree_loop(hot_blocks: usize, hot_block_len: usize) -> Func {
+    let k_chain = hot_blocks.max(1);
+    let ops = [BinOp::Add, BinOp::Xor, BinOp::Mul, BinOp::Sub, BinOp::Or];
+    let mut f = i64f();
+    f.blocks.push(Block {
+        params: vec![ValType::I64],
+        insts: vec![Inst::ConstI64(0)],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1],
+        },
+    });
+    f.blocks.push(Block {
+        params: vec![ValType::I64, ValType::I64],
+        insts: vec![
+            Inst::ConstI64(0),
+            Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::Eq,
+                a: 0,
+                b: 2,
+            },
+        ],
+        term: Terminator::BrIf {
+            cond: 3,
+            then_blk: 2,
+            then_args: vec![1],
+            else_blk: 3,
+            else_args: vec![0, 1],
+        },
+    });
+    f.blocks.push(Block {
+        params: vec![ValType::I64],
+        insts: vec![],
+        term: Terminator::Return(vec![0]),
+    });
+    for j in 0..k_chain {
+        let this_blk = 3 + j;
+        let mut insts = Vec::new();
+        let mut acc: u32 = 1;
+        let mut next: u32 = 2;
+        for s in 0..hot_block_len {
+            let c = ((this_blk * 131 + s) as i64 * 2654435761).rem_euclid(0xffff) + 1;
+            insts.push(Inst::ConstI64(c));
+            let cval = next;
+            next += 1;
+            insts.push(Inst::IntBin {
+                ty: IntTy::I64,
+                op: ops[(this_blk + s) % ops.len()],
+                a: acc,
+                b: cval,
+            });
+            acc = next;
+            next += 1;
+        }
+        let term = if j + 1 < k_chain {
+            Terminator::Br {
+                target: (this_blk + 1) as u32,
+                args: vec![0, acc],
+            }
+        } else {
             insts.push(Inst::ConstI64(1));
             let one = next;
             next += 1;
@@ -381,7 +472,39 @@ fn main() {
     let hot_blocks: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(1);
     let hot_block_len: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let outline: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let splitfn: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     std::fs::create_dir_all(&out_dir).unwrap();
+
+    // splitfn mode (`splitfn >= 2`): the REAL intra-function splitter. Build ONE call-free hot-loop
+    // function, emit it monolithic (`single`) and split into `splitfn` block-groups (`splitfn`), and
+    // measure both under V8 — confirming `compile_split_fn` inherits the tier-up win.
+    if splitfn >= 2 {
+        let f = callfree_loop(hot_blocks, hot_block_len);
+        let m = Module {
+            funcs: vec![f],
+            memory: Some(Memory { size_log2: 16 }),
+            ..Default::default()
+        };
+        let mono = compile_module_with(&m, false).expect("monolithic emits");
+        let split = compile_split_fn(&m, 0, splitfn, false).expect("split-fn emits");
+        eprintln!(
+            "splitfn guest: 1 call-free function, {hot_blocks} blocks × {hot_block_len} ops; \
+             monolithic {} B, split into {splitfn} groups {} B",
+            mono.len(),
+            split.len()
+        );
+        write(&out_dir, "single.wasm", &mono);
+        write(&out_dir, "splitfn.wasm", &split);
+        let manifest = concat!(
+            "{\n  \"table_log2\": 1,\n  \"n_funcs\": 1,\n  \"entry\": 0,\n  \"configs\": {\n",
+            "    \"single\":  [{\"wasm\": \"single.wasm\",  \"funcs\": [0]}],\n",
+            "    \"splitfn\": [{\"wasm\": \"splitfn.wasm\", \"funcs\": [0]}]\n",
+            "  }\n}\n"
+        );
+        write(&out_dir, "manifest.json", manifest.as_bytes());
+        eprintln!("done → {}", out_dir.display());
+        return;
+    }
 
     // Outlined mode (`outline >= 2`): emit just the `single` config, but with the hot path spread across
     // `outline` handler functions instead of one monolithic `f0` — the function-outlining experiment.
