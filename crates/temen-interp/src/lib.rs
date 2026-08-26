@@ -24314,6 +24314,27 @@ impl Mem {
         !self.has_regions.load(Ordering::Relaxed)
     }
 
+    /// #816 env-routed tier-up: the **flat base address** of this window — the backing region's raw
+    /// base plus the window's absolute base offset — or `None` when the backing is the `Paged`
+    /// fallback (no contiguous address, so the emitted tier cannot serve this window and it stays
+    /// interpreted — the fail-closed arm of the tier-up eligibility gate). For a §14 nested child
+    /// this is the parent backing's base plus the carve offset, so the same pointer arithmetic the
+    /// emitted `win + addr` accesses perform lands exactly where the interpreter's confined
+    /// accesses do.
+    pub(crate) fn flat_win_base(&self) -> Option<*const u8> {
+        // `window.base() + reserved <= back.len()` by construction (`with_reservation*` size the
+        // backing to cover the window; `nested_view` carves are `carve_fits`-checked inside the
+        // parent window); `raw_base_at` re-checks the offset bound regardless.
+        self.back
+            .raw_base_at(self.window.base())
+            .map(|p| p as *const u8)
+    }
+
+    /// #816: the window's reserved span — the length of the flat view [`flat_win_base`] addresses.
+    pub(crate) fn win_reserved(&self) -> u64 {
+        self.window.reserved()
+    }
+
     /// Capture the window's full guest-visible memory state — the committed byte range plus the
     /// page-protection map — for a time-travel checkpoint of a page-mapping window, restored with
     /// [`restore_layout`](Mem::restore_layout). Precondition: [`layout_snapshot_safe`](Mem::layout_snapshot_safe)

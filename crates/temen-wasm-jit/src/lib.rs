@@ -789,6 +789,28 @@ fn module_uses_rec(m: &Module) -> bool {
     })
 }
 
+/// #816: can this module ever run as (or spawn) a **same-module §14 child** — a task whose window
+/// is a carve *smaller* than the emit-time window? Any `Instantiator` cap.call qualifies
+/// (conservative: ops 0/11/17 spawn same-module children directly; the rest are kept in the
+/// predicate so a new spawn op fails closed rather than eliding). When true, [`emit_module`] turns
+/// bound-check **elision** off, because an elision proof against the emit-time window is no floor
+/// for a child carve — see `elide_bound` there.
+fn module_can_spawn_same_module(m: &Module) -> bool {
+    m.funcs.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            b.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    Inst::CapCall {
+                        type_id: cap_id::INSTANTIATOR,
+                        ..
+                    }
+                )
+            })
+        })
+    })
+}
+
 /// The §14 ADDRESS_SPACE (iface 5) ops a nested unit may reach as **outlined cross-tier leaves**
 /// (via the one existing `env.call_interp` transport — no new imports, per the CONSOLIDATION.md §0
 /// yardstick): `page_size` (op 3, a pure query) and `sub` (op 4, attenuation-minting — it carves a
@@ -2673,6 +2695,21 @@ fn emit_module(
         Some(mc) => 1u64 << mc.size_log2,
         None => 0,
     };
+    // #816 env-routed tier-up: the bound-check **elision** budget. Elision proves an access within
+    // the emit-time window (`mapped` above) and skips the live-`"mapped"`-global trap branch — sound
+    // only while every window this emitted code may serve is at least that large ("the window only
+    // grows"). A module that can spawn **same-module §14 children** breaks that floor: a child task
+    // tiers up into these same functions over a *carve* smaller than the emit window, where an
+    // elided access could land past the carve (and, with the per-event `win` base, past the run
+    // backing). For such modules emit every access with the full live-bound check (`elide_bound =
+    // 0` makes every `in_window` proof fail, fail-closed); the live `"mapped"` sync then carries
+    // each event's own window bound — root, child carve, or fork twin alike. Pure perf cost,
+    // confinement-neutral for modules that never instantiate.
+    let elide_bound: u64 = if module_can_spawn_same_module(m) {
+        0
+    } else {
+        mapped
+    };
 
     // Types: 0 = env.trap `(i32) -> ()`, 1 = env.call_interp `(i32 func, i32 args_ptr) -> ()`, then
     // one per emitted function (dedup'd).
@@ -2850,7 +2887,7 @@ fn emit_module(
         bodies.push(emit_func(
             m,
             &m.funcs[fi],
-            mapped,
+            elide_bound,
             wasm_of,
             interp_leaf,
             &types,

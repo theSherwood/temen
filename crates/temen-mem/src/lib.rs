@@ -120,6 +120,31 @@ impl Region {
         }
     }
 
+    /// #816: the raw base address of a **flat** (raw-backed `Shared`/`Mapped`) region — the pointer
+    /// `[0, len)` maps to contiguously, for an embedder that must hand emitted code a
+    /// `base + offset` view of a window (the browser tier-up driver's per-event `win`). `None` for
+    /// the `Paged` fallback, which has no single flat address — callers treat that as
+    /// "not flat-addressable" and fail closed (the window then runs on the interpreter only).
+    /// Reading or writing through the returned pointer is subject to the same safety contract as
+    /// the region's construction; bounds are the caller's to keep.
+    pub fn raw_base(&self) -> Option<*mut u8> {
+        self.backing().ok().map(|s| s.base_ptr())
+    }
+
+    /// #816: the raw address of flat offset `off` — [`raw_base`](Region::raw_base)` + off`,
+    /// bounds-checked to the region (`off <= len`; the offset itself, not an access through it).
+    /// `None` for `Paged` or an out-of-region offset. Lives here (not in the `unsafe`-free callers)
+    /// because the in-allocation pointer add is `unsafe`; the bound makes it sound.
+    pub fn raw_base_at(&self, off: u64) -> Option<*mut u8> {
+        let s = self.backing().ok()?;
+        if off > s.size {
+            return None;
+        }
+        // SAFETY: `off <= size`, so the result stays within (or one past) the allocation the
+        // region's construction contract covers.
+        Some(unsafe { s.base_ptr().add(off as usize) })
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -335,10 +360,8 @@ mod shared {
         }
 
         /// The raw base pointer — for the owner (`Mapped`) to `munmap` exactly the reservation it
-        /// wrapped. Not for access (that goes through the bounds-checked accessors below). Only the
-        /// unix `Mapped` owner needs it; elsewhere `Shared` is non-owning, so gate it to avoid a
-        /// dead-code error under `-D warnings`.
-        #[cfg(unix)]
+        /// wrapped, and for [`Region::raw_base`] (#816: the browser tier-up driver's flat `win`
+        /// view). Not for byte access (that goes through the bounds-checked accessors below).
         pub(super) fn base_ptr(&self) -> *mut u8 {
             self.base
         }

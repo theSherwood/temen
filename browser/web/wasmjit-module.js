@@ -181,7 +181,10 @@ const tierupJitRes = (ret, tc) => tc === 0 || tc === 1 ? BigInt(ret)
 async function driveCoopTierupRun(ex, memory, cacheKey) {
   const u8 = () => new Uint8Array(memory.buffer);
   const i64 = () => new BigInt64Array(memory.buffer);
-  const win = Number(ex.temen_coop_win_ptr());
+  // #816 env-routed tier-up: `win` is PER EVENT — the pending task's window base (root backing for
+  // a root-env task, backing + carve offset for a §14 confined child). Read inside each event arm
+  // via temen_coop_tierup_win_ptr(); never cache it across events.
+  const eventWin = () => Number(ex.temen_coop_tierup_win_ptr());
 
   const mappedGlobals = []; // every live instance's "mapped" — the post-bounce fan-out set (#717)
   const fuelGlobals = [];
@@ -317,7 +320,7 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
         for (const g of fuelGlobals) g.value = 1n << 61n;
         new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
         try {
-          const ret = unit['f0'](win, envCell, ...args);
+          const ret = unit['f0'](eventWin(), envCell, ...args);
           const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
           const rn = ex.temen_coop_jit_result_types_len();
           const rtypes = new Uint8Array(memory.buffer, Number(ex.temen_coop_jit_result_types_ptr()), rn);
@@ -353,7 +356,7 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
       }
       new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
       try {
-        const ret = emitted['f' + func](win, envCell, ...args);
+        const ret = emitted['f' + func](eventWin(), envCell, ...args);
         const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
         const rlen = Math.max(1, rets.length) * 8;
         const rptr = Number(ex.temen_alloc(rlen));

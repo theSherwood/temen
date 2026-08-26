@@ -440,17 +440,17 @@ fn coop_tierup_live_futex_matches_pure_interp() {
     );
 }
 
-// #816 fail-closed — a task whose window lives in `extra_envs` must NOT tier up. The tier-up
-// driver's `win` pointer and its page-state/extent introspection (`mem_map_info`/`mem_map_version`/
-// `window_scalar_extent`) all read the run's ROOT window, so an emitted region for an env-carrying
-// task (a §14 confined child's thread, a fork twin) would address the wrong backing and admit the
-// wrong page map — the #839 JACL trap shape. The gate leaves such tasks interpreting (correct, just
-// unaccelerated) while the root's own eligible call still tiers up.
+// #816 env-routed tier-up — a task whose window lives in `extra_envs` (a §14 confined child, or a
+// thread it spawns) now TIERS UP over its own carve: the engine routes the driver's per-event reads
+// (`pending_win`, `window_scalar_extent`, `mem_map_info`/`mem_map_version`) to the pending
+// round-trip's task env, and the eligibility gates (`tierup_servable`) admit any window sharing the
+// root backing. This test pins the inheritance: the child entry's and the child-env worker's calls
+// to the eligible leaf both surface, and the run still matches the pure-interp oracle.
 //
 // func 0 (root; arg = its Instantiator handle): instantiates a same-module confined child at f1
 // (4 KiB carve at 64 KiB), joins it, calls the eligible leaf f3 itself, and sums. func 1 (child
-// entry): thread.spawns f2 INSIDE the child env and joins it — the one shape that used to inherit
-// the bitmap into an env-carrying task. func 2 (child-env worker): calls the leaf — the gated call.
+// entry): calls the leaf directly (the instantiate-arm inheritance), thread.spawns f2 INSIDE the
+// child env (the spawn-arm inheritance) and joins it. func 2 (child-env worker): calls the leaf.
 // func 3: the pure all-i64 leaf f(x) = x*3 + 7.
 const SRC_CHILD_ENV: &str = r#"
 memory 17
@@ -472,8 +472,11 @@ func (i64) -> (i64) {
 block 0 (v0: i64) {
   vz = i64.const 0
   vt = thread.spawn 2 vz vz
+  v7 = i64.const 7
+  vlocal = call 3 (v7)
   vw = thread.join vt
-  return vw
+  vr = i64.add vw vlocal
+  return vr
   }
 }
 func (i64, i64) -> (i64) {
@@ -495,7 +498,7 @@ block 0 (vx: i64) {
 "#;
 
 #[test]
-fn coop_tierup_child_env_thread_stays_interpreted() {
+fn coop_tierup_child_env_tasks_tier_up() {
     let m = parse_module(SRC_CHILD_ENV).unwrap();
     temen_verify::verify_module(&m).expect("verify");
     // Drive with an Instantiator granted over the root window (the §14 spawn authority); the
@@ -543,9 +546,10 @@ fn coop_tierup_child_env_thread_stays_interpreted() {
         }
     };
 
-    // Oracle: pure-interp cooperative run. Child worker f(5)=22, root f(3)=16 → 38.
+    // Oracle: pure-interp cooperative run. Worker f(5)=22 + child entry f(7)=28 → child 50;
+    // root f(3)=16 → 66.
     let (want, oracle_tierups) = run_with(None);
-    assert_eq!(want, Ok(vec![Value::I64(38)]), "oracle value");
+    assert_eq!(want, Ok(vec![Value::I64(66)]), "oracle value");
     assert_eq!(oracle_tierups, 0, "the oracle never tiers up");
 
     let eligible: std::sync::Arc<[bool]> = std::sync::Arc::from(vec![false, false, false, true]);
@@ -557,10 +561,130 @@ fn coop_tierup_child_env_thread_stays_interpreted() {
         got, want,
         "cooperative tier-up run with a confined child diverged from the pure-interp oracle"
     );
-    // The gate: exactly the root's `call 3` tiers up; the child-env worker's interprets. (Before
-    // #816's gate the worker inherited the bitmap and this was 2.)
+    // #816 env routing: all three eligible calls surface — the root's, the confined child entry's
+    // (instantiate-arm inheritance), and the child-env worker's (spawn-arm inheritance).
     assert_eq!(
-        tierups, 1,
-        "only the root-env call may tier up (#816), got {tierups}"
+        tierups, 3,
+        "root + child entry + child worker must all tier up (#816), got {tierups}"
+    );
+}
+
+/// #816 — the routed **flat window view**: while a confined child's tier-up is pending,
+/// [`CoopRun::pending_win`] must hand the driver the CHILD's carve (base = root backing + carve
+/// offset, len = carve size), and a write through it must land where the parent reads it in its own
+/// window (the shared backing). Emulates the browser host: each event writes a marker byte at the
+/// pending window's offset 8 (what an emitted store would do), then delivers the leaf's value. The
+/// guest sums the leaf results with the markers read back through the parent window — so a
+/// mis-routed pointer (root base for a child event) or a mis-sized span fails the value assert.
+/// Unix-only: the native test backing must be flat (`Region::Mapped`) for the raw view; on the
+/// browser the backing is always flat (`Region::shared` over the cdylib buffer).
+#[cfg(unix)]
+#[test]
+fn coop_tierup_pending_win_routes_to_the_child_carve() {
+    // func 0 (root): instantiate child at 65536 (4 KiB), join → child result; call leaf(3) itself;
+    // read marker bytes at [8] (root's own event) and [65536+8] (the child's event, visible through
+    // the parent window — shared backing); return child + local + markers.
+    // func 1 (child entry): call leaf(5), return it. func 2: the leaf f(x) = x*3 + 7.
+    const SRC: &str = r#"
+memory 17
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  ve = i64.const 1
+  voff = i64.const 65536
+  vsl = i64.const 12
+  vq = i64.const 0
+  vh = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (ve, voff, vsl, vq)
+  vj = cap.call 6 1 (i32) -> (i64) v0 (vh)
+  v3 = i64.const 3
+  vlocal = call 2 (v3)
+  vma = i64.const 8
+  vm0 = i32.load8_u vma
+  vm0e = i64.extend_i32_u vm0
+  vca = i64.const 65544
+  vm1 = i32.load8_u vca
+  vm1e = i64.extend_i32_u vm1
+  vs1 = i64.add vj vlocal
+  vs2 = i64.add vs1 vm0e
+  vs3 = i64.add vs2 vm1e
+  return vs3
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v5 = i64.const 5
+  vr = call 2 (v5)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  v3 = i64.const 3
+  vm = i64.mul vx v3
+  v7 = i64.const 7
+  va = i64.add vm v7
+  return va
+  }
+}
+"#;
+    let m = parse_module(SRC).unwrap();
+    temen_verify::verify_module(&m).expect("verify");
+    let mut host = Host::new();
+    let inst = host.grant_instantiator(0, 128 << 10);
+    let args = [Value::I32(inst)];
+    let eligible: std::sync::Arc<[bool]> = std::sync::Arc::from(vec![false, false, true]);
+    // The browser shape: the window lives over a caller-provided flat backing with the reservation
+    // clamped to it, so `pending_win` resolves and spans exactly the run window / child carve.
+    let back = std::sync::Arc::new(temen_interp::Region::new(1 << 17, 4096));
+    let mut run = bytecode::CoopRun::new_over(
+        &m,
+        0,
+        &args,
+        FUEL,
+        host,
+        Some(TierUpConfig {
+            eligible,
+            page_checked: false,
+        }),
+        &[],
+        17,
+        back,
+    )
+    .expect("supported")
+    .expect("entry in range");
+    // Expected per-event windows: the root's event spans the full 2^17 window at the backing base;
+    // the child's spans its 4 KiB carve at base + 65536.
+    let mut spans: Vec<u64> = Vec::new();
+    let result = loop {
+        match run.run() {
+            bytecode::CoopEvent::Done(vals) => break Ok(vals),
+            bytecode::CoopEvent::Trapped(t) => break Err(t),
+            bytecode::CoopEvent::JitInvoke { .. } => panic!("unexpected JitInvoke"),
+            bytecode::CoopEvent::TierUp { func, argv, .. } => {
+                assert_eq!(func, 2, "only the leaf is eligible");
+                let (ptr, len) = run
+                    .pending_win()
+                    .expect("a flat native backing resolves the pending window");
+                spans.push(len);
+                // The emitted region's effect, emulated over the routed window: store the marker
+                // at window-relative offset 8 (in-carve for the child, in-window for the root).
+                // SAFETY: the paused task is parked inside the event; `ptr` spans `len >= 16`
+                // bytes of the run backing, exclusively ours until deliver (single-threaded pump).
+                unsafe { std::ptr::write(ptr.cast_mut().add(8), 21u8) };
+                let x = argv[0];
+                run.deliver_tierup(&[x * 3 + 7]);
+            }
+        }
+    };
+    // Child event first (the scheduler runs the child to completion inside the join), then root's.
+    assert_eq!(
+        spans,
+        vec![4096, 1 << 17],
+        "pending_win must span the child carve for the child's event and the run window for the root's"
+    );
+    // child leaf f(5)=22 + root leaf f(3)=16 + root marker 21 + child marker 21 = 80.
+    assert_eq!(
+        result,
+        Ok(vec![Value::I64(80)]),
+        "markers must land in each task's own window"
     );
 }
