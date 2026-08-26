@@ -1275,13 +1275,29 @@ pub fn module_for(row: &OpRow, vector: &[SpecVal]) -> Module {
 pub const MEM_LOG2: u8 = 16;
 pub const MEM_SIZE: u64 = 1 << MEM_LOG2;
 
+/// The unconditional NULL guard (#1094): a window `>= POWERBOX_NULL_GUARD` reserves
+/// `[0, POWERBOX_NULL_GUARD)` as unmapped, so any access touching it faults (matching
+/// `Mem::seed_null_guard`, which no-ops the seed only for a sub-guard window). A window smaller
+/// than the guard is never seeded, so its guard extent is 0.
+fn null_guard(mapped: u64) -> u64 {
+    if mapped >= POWERBOX_NULL_GUARD {
+        POWERBOX_NULL_GUARD
+    } else {
+        0
+    }
+}
+
 /// Admit a scalar access, returning the effective address as a window index.
 fn admit(addr: u64, offset: u64, width: u32, mapped: u64) -> Result<usize, SpecTrap> {
     match addr
         .checked_add(offset)
         .and_then(|ea| ea.checked_add(width as u64))
     {
-        Some(end) if end <= mapped => Ok((end - width as u64) as usize),
+        // #1094: the low byte of the access must clear the NULL guard, too — an access reaching
+        // into `[0, null_guard)` faults exactly as it does on the interpreter/JIT.
+        Some(end) if end <= mapped && (end - width as u64) >= null_guard(mapped) => {
+            Ok((end - width as u64) as usize)
+        }
         _ => Err(SpecTrap::MemoryFault),
     }
 }
@@ -1293,7 +1309,8 @@ fn admit_span(ptr: u64, len: u64, mapped: u64) -> Result<(), SpecTrap> {
         return Ok(());
     }
     match ptr.checked_add(len) {
-        Some(end) if end <= mapped => Ok(()),
+        // #1094: a span whose first byte lands in `[0, null_guard)` faults (it touches the guard).
+        Some(end) if end <= mapped && ptr >= null_guard(mapped) => Ok(()),
         _ => Err(SpecTrap::MemoryFault),
     }
 }
@@ -1887,14 +1904,37 @@ mod tests {
             admit(0, MEM_SIZE - 8, 8, MEM_SIZE),
             Ok((MEM_SIZE - 8) as usize)
         );
+        // #1094 NULL guard: an access reaching into `[0, POWERBOX_NULL_GUARD)` faults; the first
+        // fully-clear address is admitted.
+        assert_eq!(admit(0, 0, 4, MEM_SIZE), Err(SpecTrap::MemoryFault));
+        assert_eq!(
+            admit(POWERBOX_NULL_GUARD - 1, 0, 4, MEM_SIZE),
+            Err(SpecTrap::MemoryFault)
+        );
+        assert_eq!(
+            admit(POWERBOX_NULL_GUARD, 0, 4, MEM_SIZE),
+            Ok(POWERBOX_NULL_GUARD as usize)
+        );
         // Wrap-around faults — the mathematical sum is out of range even though the
         // wrapped u64 would land in-window.
         assert_eq!(admit(u64::MAX, 2, 1, MEM_SIZE), Err(SpecTrap::MemoryFault));
         assert_eq!(admit(2, u64::MAX, 1, MEM_SIZE), Err(SpecTrap::MemoryFault));
         assert_eq!(admit(u64::MAX, 0, 8, MEM_SIZE), Err(SpecTrap::MemoryFault));
-        // Bulk spans: zero length is inert anywhere; oversized/overflowing lengths fault.
+        // Bulk spans: zero length is inert anywhere; oversized/overflowing lengths fault; a span
+        // that starts inside the #1094 guard faults, but one starting at the guard is admitted.
         assert_eq!(admit_span(u64::MAX, 0, MEM_SIZE), Ok(()));
-        assert_eq!(admit_span(0, MEM_SIZE, MEM_SIZE), Ok(()));
+        assert_eq!(
+            admit_span(0, MEM_SIZE, MEM_SIZE),
+            Err(SpecTrap::MemoryFault)
+        );
+        assert_eq!(
+            admit_span(
+                POWERBOX_NULL_GUARD,
+                MEM_SIZE - POWERBOX_NULL_GUARD,
+                MEM_SIZE
+            ),
+            Ok(())
+        );
         assert_eq!(
             admit_span(0, MEM_SIZE + 1, MEM_SIZE),
             Err(SpecTrap::MemoryFault)
@@ -1903,16 +1943,24 @@ mod tests {
             admit_span(1, u64::MAX, MEM_SIZE),
             Err(SpecTrap::MemoryFault)
         );
-        // Loads sign/zero-extend per op; stores write the low bytes little-endian.
+        // Loads sign/zero-extend per op; stores write the low bytes little-endian. Addresses sit
+        // above the #1094 NULL guard (a low access would now fault, tested above).
+        let g = POWERBOX_NULL_GUARD;
         let mut win = vec![0u8; MEM_SIZE as usize];
-        win[8] = 0x80;
+        win[(g + 8) as usize] = 0x80;
         assert_eq!(
-            load_eval(LoadOp::I32_8S, 8, 0, &win),
+            load_eval(LoadOp::I32_8S, g + 8, 0, &win),
             Ok(SpecVal::I32(-128))
         );
-        assert_eq!(load_eval(LoadOp::I32_8U, 8, 0, &win), Ok(SpecVal::I32(128)));
-        store_eval(StoreOp::I64_32, 0, 0, SpecVal::I64(-1), &mut win).unwrap();
-        assert_eq!(&win[0..5], &[0xff, 0xff, 0xff, 0xff, 0x00]);
+        assert_eq!(
+            load_eval(LoadOp::I32_8U, g + 8, 0, &win),
+            Ok(SpecVal::I32(128))
+        );
+        store_eval(StoreOp::I64_32, g, 0, SpecVal::I64(-1), &mut win).unwrap();
+        assert_eq!(
+            &win[g as usize..(g + 5) as usize],
+            &[0xff, 0xff, 0xff, 0xff, 0x00]
+        );
         // A faulting store mutates nothing.
         let before = win.clone();
         assert_eq!(
