@@ -52,18 +52,16 @@ whole module's baseline (Liftoff) compilation finishing.
 
 ## Result 2 — tier-up latency is governed by hot-*function* size
 
-Sweeping `f0`'s size (single config, fresh process each):
+A single large hot function stays on Liftoff for several runs and pays a large cold (run 0) cost. Measured
+at **fixed** N (a caveat below), a 1.9 MB `f0`: run 0 ≈ 330–390 ms, full-speed only by run ~2–3, steady
+61 ms. A trivial (tiny) `f0` tiers up at run 0 regardless of the 10 MB of filler around it.
 
-| `f0` emitted size | tier-up run |
-|-------------------|-------------|
-| 0.44 MB           | run 1       |
-| 0.98 MB           | run 3       |
-| 1.9 MB            | run 5       |
-| ~2.7 MB           | run 11      |
-
-Tier-up run grows (super-linearly) with the hot **function's** size — reproducing the real card's "run 6+
-/ run 10" shape from a *single* large function, with no help from module structure. A trivial hot loop
-(tiny `f0`) tiers up at run 0 regardless.
+> **Caveat (correction).** An earlier version of this doc reported a monotonic `size → tier-up run` curve
+> (`0.44MB→run1 … 2.7MB→run11`). That sweep used a *different iteration count per size* (`N = 1.1M/blocks`);
+> V8's tier-up trigger is iteration-budget-based, so fewer iterations ⇒ later observed tier-up. Re-measured
+> at fixed N, the tier-up *run* of a single function is noisy (±2–3 runs) and not cleanly size-monotonic.
+> The robust, controlled statements are Result 1 (identical N ⇒ split makes no difference) and Result 4
+> (identical N + identical total code ⇒ outlining helps).
 
 ## Result 3 — cross-module call cost
 
@@ -73,15 +71,33 @@ The cross-module cost is only visible for a *trivial* hot loop where the call do
 but that regime tiers up at run 0 anyway, so it never matters in practice. So cross-module dispatch is
 cheap where it would be used; it is simply pointed at the wrong problem.
 
+## Result 4 — function outlining *does* help (the constructive lever)
+
+`--outline K` emits the hot path as a small dispatcher loop calling K handler functions (each ≈ body/K)
+instead of one monolithic `f0`, **same total hot code**. Monolithic 1.9 MB `f0` vs 8×0.24 MB handlers,
+fixed N=1100, 3 fresh Node processes each:
+
+| | cold run 0 | full-speed by | steady |
+|---|---|---|---|
+| Monolithic 1.9 MB | 326–391 ms | run 2–3 | 61 ms |
+| Outlined 8×0.24 MB | 122–141 ms | run 1 | 61 ms |
+
+The smaller functions reach TurboFan almost immediately, so even run 0 is ~2.7× cheaper and the hot path
+is full-speed by run 1 — with **no steady-state penalty** (V8 inlines the direct intra-module calls under
+TurboFan). This is the same lever #1068/#1110 were after, applied to *function* size, not *module* size.
+
+Caveat for the follow-up: the synthetic dispatcher uses **direct** calls to the handlers (best case for
+inlining). Outlining a real `JS_CallInternal` br_table dispatcher would select handlers **indirectly** (by
+opcode) and marshal interpreter state (PC/sp/stack) across the cut — both need their own measurement.
+
 ## Conclusion / recommended pivot
 
 Module-splitting is the wrong lever for first-Run latency. The bottleneck is a single giant hot function
-(`JS_CallInternal`) whose TurboFan compile does not finish until ~run 10, and you cannot split a function
-across modules. **The lever that would actually move first-Run latency is reducing hot-function size** —
-i.e. *function outlining*: breaking the giant dispatch function into smaller functions so each reaches
-TurboFan far sooner (the size→tier-up curve above predicts run ~10 → run ~1–3). That is a different, more
-invasive transform (it introduces call boundaries inside the hot path, whose cost must be measured), and
-should be scoped separately.
+(`JS_CallInternal`) whose TurboFan compile takes several runs to finish, and you cannot split a function
+across modules. **The lever that works is reducing hot-function size — function outlining** (Result 4):
+breaking the giant dispatch function into smaller functions so each reaches TurboFan on run 1. It is a
+different, more invasive transform (call boundaries inside the hot path, SSA-state marshaling across the
+cut, indirect dispatch), scoped separately.
 
 The `compile_module_split` capability + its differential test are correct and retained as the reproducible
-evidence for this finding; they are not wired into `compile_jit`.
+evidence for the negative finding; they are not wired into `compile_jit`.
