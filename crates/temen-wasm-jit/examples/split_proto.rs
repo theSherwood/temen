@@ -399,12 +399,42 @@ fn main() {
             per_handler as f64 / (1 << 20) as f64,
             est as f64 / (1 << 20) as f64
         );
+        // `single` (direct): dispatcher + handlers in one module — TurboFan can inline the handler calls.
         let single = compile_module_b2(&m, false, log2).expect("outlined single emits");
         write(&out_dir, "single.wasm", &single);
+        // `indirect`: dispatcher alone | all handlers | filler. The dispatcher→handler calls become
+        // cross-module `call_indirect` through the shared table — the real per-opcode dispatch shape,
+        // which TurboFan cannot inline. Isolates the indirect-dispatch tax vs `single` (Slice 0).
+        let disp_mask: Vec<bool> = (0..n).map(|i| i == 0).collect(); // {dispatcher}
+        let hand_mask: Vec<bool> = (0..n).map(|i| i >= 1 && i <= outline).collect(); // {h_1..h_K}
+        let cold_mask: Vec<bool> = (0..n).map(|i| i > outline).collect(); // {filler}
+        let disp = compile_module_split(&m, false, log2, &disp_mask).expect("disp emits");
+        let hand = compile_module_split(&m, false, log2, &hand_mask).expect("handlers emit");
+        let cold = compile_module_split(&m, false, log2, &cold_mask).expect("cold emits");
+        write(&out_dir, "disp.wasm", &disp);
+        write(&out_dir, "handlers.wasm", &hand);
+        write(&out_dir, "ocold.wasm", &cold);
+        let idxs = |mask: &[bool]| -> String {
+            (0..n)
+                .filter(|&i| mask[i])
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         let all: Vec<String> = (0..n).map(|i| i.to_string()).collect();
         let manifest = format!(
-            "{{\n  \"table_log2\": {log2},\n  \"n_funcs\": {n},\n  \"entry\": 0,\n  \"configs\": {{\n    \"single\": [{{\"wasm\": \"single.wasm\", \"funcs\": [{}]}}]\n  }}\n}}\n",
-            all.join(",")
+            concat!(
+                "{{\n  \"table_log2\": {log2},\n  \"n_funcs\": {n},\n  \"entry\": 0,\n  \"configs\": {{\n",
+                "    \"single\":   [{{\"wasm\": \"single.wasm\", \"funcs\": [{all}]}}],\n",
+                "    \"indirect\": [{{\"wasm\": \"disp.wasm\", \"funcs\": [{d}]}}, {{\"wasm\": \"handlers.wasm\", \"funcs\": [{h}]}}, {{\"wasm\": \"ocold.wasm\", \"funcs\": [{c}]}}]\n",
+                "  }}\n}}\n"
+            ),
+            log2 = log2,
+            n = n,
+            all = all.join(","),
+            d = idxs(&disp_mask),
+            h = idxs(&hand_mask),
+            c = idxs(&cold_mask),
         );
         write(&out_dir, "manifest.json", manifest.as_bytes());
         eprintln!("done → {}", out_dir.display());

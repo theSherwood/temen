@@ -90,6 +90,25 @@ Caveat for the follow-up: the synthetic dispatcher uses **direct** calls to the 
 inlining). Outlining a real `JS_CallInternal` br_table dispatcher would select handlers **indirectly** (by
 opcode) and marshal interpreter state (PC/sp/stack) across the cut — both need their own measurement.
 
+## Result 5 — the indirect-dispatch tax is ~0% (Slice 0, #1120)
+
+The realistic form selects handlers **indirectly** (by opcode), which TurboFan cannot inline. The `indirect`
+config emits the dispatcher and handlers as separate modules, so the dispatcher→handler calls become
+cross-module `call_indirect`. 8 indirect calls/iteration (a conservative worst case vs one-per-opcode),
+fixed N=1100, 4 fresh Node processes each:
+
+| | cold run 0 | full-speed by | steady |
+|---|---|---|---|
+| Monolithic 1.9 MB | 335–390 ms | run 1–3 | 61–63 ms |
+| Outlined **direct** | ~128 ms | run 1 | 61 ms |
+| Outlined **indirect** | 123–137 ms | run 1 | 60–61 ms |
+
+Making the dispatch indirect costs **nothing measurable** at steady state (60–61 ms = monolithic) while
+keeping the full cold-start win (~2.8×, full-speed by run 1). The indirect call is amortized because each
+handler does real work. Caveat: these handlers are uniformly medium (~0.22 MB); a real interpreter has a
+mix including tiny hot opcodes, where a per-call indirect could matter — so the outlining **granularity**
+(group tiny opcodes to keep each handler's work above the call cost) is the real design knob (Slice 2).
+
 ## Conclusion / recommended pivot
 
 Module-splitting is the wrong lever for first-Run latency. The bottleneck is a single giant hot function
