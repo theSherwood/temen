@@ -173,7 +173,7 @@ block 2 (vr: i64) {
   return vr
 }
 block 3 (vi3: i64, vacc3: i64) {
-  vaddr = i64.const 64
+  vaddr = i64.const 16448
   vsum = i64.add vacc3 vi3
   i64.store vaddr vsum
   vld = i64.load vaddr
