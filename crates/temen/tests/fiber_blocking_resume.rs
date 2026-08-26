@@ -64,7 +64,7 @@ block 2 (vr: i64) {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vexp = i32.const 0
   vto = i64.const 10000000
   vst = i32.atomic.wait vaddr vexp vto
@@ -147,7 +147,7 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vexp = i32.const 0
   vto = i64.const 10000000
   vst = i32.atomic.wait vaddr vexp vto
@@ -171,7 +171,7 @@ fn no_loop_blocking_resume_idles_on_all_backends() {
 }
 
 /// I48 parity, the **cross-vCPU notify** wake path (the OS-thread case, not just the timer): the
-/// root spawns a worker (vCPU 1), creates a fiber that does an **untimed** `atomic.wait` on cell 8,
+/// root spawns a worker (vCPU 1), creates a fiber that does an **untimed** `atomic.wait` on cell 16392 (above the #1094 NULL guard),
 /// and `cont.resume.block`s it with **no loop**. The resumer idles (on the JIT, its OS thread parks
 /// on the domain condvar) with no deadline at all — only the worker's `notify` can make progress.
 /// The worker stores 7 into cell 8 and notifies; the broadcast wakes the idle resumer, which
@@ -198,14 +198,14 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 8
+  vaddr = i64.const 16392
   vexp = i32.const 0
   vto = i64.const -1
   vst = i32.atomic.wait vaddr vexp vto
   vst64 = i64.extend_i32_s vst
   vk100 = i64.const 100
   vsx = i64.mul vst64 vk100
-  vm8a = i64.const 8
+  vm8a = i64.const 16392
   vm8 = i64.load vm8a
   vsum = i64.add vsx vm8
   return vsum
@@ -213,10 +213,10 @@ block 0 (vsp: i64, varg: i64) {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vm8a = i64.const 8
+  vm8a = i64.const 16392
   vseven = i64.const 7
   i64.store vm8a vseven
-  vaddr = i64.const 8
+  vaddr = i64.const 16392
   vcnt = i32.const 1
   vw = atomic.notify vaddr vcnt
   vz = i64.const 0

@@ -97,7 +97,7 @@ mod threaded {
     /// backend (the exact ids are an implementation detail — GC.md §3.2 — so we check structure).
     #[test]
     fn vcpu_tls_seed_is_distinct_per_vcpu() {
-        // child(sp, idx): store vcpu.tls.get() at 1024 + idx*8, return 0.
+        // child(sp, idx): store vcpu.tls.get() at 17408 + idx*8 (1024 above the #1094 NULL guard), return 0.
         let src = "memory 16\n\
             func () -> (i64, i64, i64) {\n\
             block 0 () {\n\
@@ -111,11 +111,11 @@ mod threaded {
             \x20 j0 = thread.join h0\n\
             \x20 j1 = thread.join h1\n\
             \x20 j2 = thread.join h2\n\
-            \x20 s0 = i64.const 1024\n\
+            \x20 s0 = i64.const 17408\n\
             \x20 v0 = i64.load s0\n\
-            \x20 s1 = i64.const 1032\n\
+            \x20 s1 = i64.const 17416\n\
             \x20 v1 = i64.load s1\n\
-            \x20 s2 = i64.const 1040\n\
+            \x20 s2 = i64.const 17424\n\
             \x20 v2 = i64.load s2\n\
             \x20 return v0 v1 v2\n\
               }\n\
@@ -125,7 +125,7 @@ mod threaded {
             \x20 id = vcpu.tls.get\n\
             \x20 eight = i64.const 8\n\
             \x20 off = i64.mul p1 eight\n\
-            \x20 base = i64.const 1024\n\
+            \x20 base = i64.const 17408\n\
             \x20 addr = i64.add base off\n\
             \x20 i64.store addr id\n\
             \x20 z = i64.const 0\n\
@@ -169,7 +169,7 @@ mod threaded {
             \x20 bsp = i64.const 8192\n\
             \x20 bh = thread.spawn 1 bsp fh\n\
             \x20 bret = thread.join bh\n\
-            \x20 s1 = i64.const 1024\n\
+            \x20 s1 = i64.const 17408\n\
             \x20 r1 = i64.load s1\n\
             \x20 return r1 bret\n\
               }\n\
@@ -184,7 +184,7 @@ mod threaded {
             func (i64, i64) -> (i64) {\n\
             block 0 (q0: i64, q1: i64) {\n\
             \x20 r1 = vcpu.tls.get\n\
-            \x20 s1 = i64.const 1024\n\
+            \x20 s1 = i64.const 17408\n\
             \x20 i64.store s1 r1\n\
             \x20 z = i64.const 0\n\
             \x20 sv = suspend z\n\
