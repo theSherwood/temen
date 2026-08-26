@@ -3083,6 +3083,91 @@ fn run_interp_terminal(
     }
 }
 
+/// #1122 — the **cooperative bytecode** twin of [`run_interp_terminal`]: the same controlling
+/// terminal + timed feeder thread, driven by the coop `drive` with the external-wake doorbell
+/// armed ([`Host::arm_external_wake`]). Without the doorbell the first parked terminal read is the
+/// pump's all-parked deadlock (`ThreadFault`) — the doorbell block at that point, woken by the
+/// feed-time pipe-wake ring, is exactly what this harness witnesses.
+fn run_bytecode_terminal(src: &str, feeds: Vec<(u64, Vec<u8>)>) -> Effects {
+    let ir = c_to_ir(src);
+    let raw = parse_module_raw(&ir)
+        .unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
+    let win = 1u64
+        << raw
+            .memory
+            .expect("the frontend declares a window")
+            .size_log2;
+    let mut ih = Host::new();
+    let (iposix, ipx) = setup(&mut ih, win);
+    iposix.enable_terminal(&mut ih);
+    ih.arm_external_wake();
+    verify_module(&raw).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
+    bind_shim(&raw, &mut ih, ipx);
+    let feeder = {
+        let px = iposix.clone();
+        std::thread::spawn(move || {
+            for (delay, bytes) in feeds {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+                px.feed_terminal(&bytes);
+            }
+        })
+    };
+    let mut fuel = 200_000_000u64;
+    let ran = temen_interp::bytecode::compile_and_run_with_host(&raw, 0, &[], &mut fuel, &mut ih)
+        .expect("the bytecode engine compiles this module (no declining op)");
+    let (result, exited) = match ran {
+        Ok(v) => (v, None),
+        Err(Trap::Exit(c)) => (Vec::new(), Some(c)),
+        Err(e) => panic!("bytecode trapped: {e:?}\n--- IR ---\n{ir}"),
+    };
+    feeder.join().expect("feeder thread");
+    Effects {
+        result,
+        exited,
+        stdout: iposix.stdout(),
+        file_f: iposix.read_file("f"),
+    }
+}
+
+/// #1122 — **a parked terminal read on the cooperative bytecode driver blocks for the feeder**
+/// instead of faulting: the guest's `read(0)` parks on the empty terminal pipe with every task
+/// parked (pre-doorbell this was the pump's deadlock → `ThreadFault`), the feeder's line lands
+/// 60ms later (deposit + pipe-wake ring → the doorbell block returns → the settle re-polls →
+/// the rewound read drains the line), and a `^D` on an empty line EOFs the second read.
+/// Differentialled against the tree-walker terminal harness on the same guest + feed script.
+#[test]
+fn c_a_terminal_read_blocks_for_the_feeder_on_bytecode() {
+    let src = format!(
+        "{PIPE_SHIM}\n\
+static char b[16];\n\
+int main(void) {{\n\
+  long n = read(0, b, 16);            /* parks: ALL tasks blocked until the feeder types */\n\
+  if (n != 3) return (int)(100 + n);\n\
+  if (b[0] != 'h' || b[1] != 'i' || b[2] != 10) return 2;\n\
+  long m = read(0, b, 16);            /* parks again; ^D on an empty line -> EOF (0) */\n\
+  if (m != 0) return (int)(200 + m);\n\
+  return 42;\n\
+}}\n"
+    );
+    let feeds = || vec![(60, b"hi\n".to_vec()), (60, b"\x04".to_vec())];
+    let interp = run_interp_terminal(&src, feeds(), None);
+    assert_eq!(
+        interp.result,
+        vec![Value::I32(42)],
+        "tree-walker: the parked terminal read drained the fed line, then EOF'd on ^D"
+    );
+    let byte = run_bytecode_terminal(&src, feeds());
+    assert_eq!(
+        byte.result,
+        vec![Value::I32(42)],
+        "coop bytecode: the all-parked pump blocked on the doorbell and the feed woke it — matching the oracle"
+    );
+    assert_eq!(
+        byte.stdout, interp.stdout,
+        "the terminal echo is identical across the two engines"
+    );
+}
+
 /// #797 — **a parked terminal read wakes on a completed canonical line, edited and echoed**: the
 /// guest blocks in `read(0)` (the tag redirect parks on the empty input pipe — a real prompt);
 /// the feeder types `hI`, erases the `I` (`VERASE`), types `i\n` — the guest receives the EDITED

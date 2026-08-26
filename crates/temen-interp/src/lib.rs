@@ -17531,6 +17531,13 @@ pub struct Host {
     /// drop). An `Arc`'d atomic — not a locked field — because the requesting closure runs while
     /// the interp holds this `Host`'s lock (the `stop_flag`/`term_flag` discipline).
     park_request: Arc<AtomicU64>,
+    /// #1122 — the **external-wake doorbell** (opt-in, [`Host::arm_external_wake`]): a generation
+    /// counter + condvar the cooperative bytecode driver blocks on when every task is parked on an
+    /// externally-fed pipe (the interactive terminal's shape) instead of declaring deadlock. The
+    /// driver wires the personality's pipe-wake door to ring it, so an embedder's
+    /// `feed_terminal` — from another OS thread, or another wasm-thread instantiation in the
+    /// browser — unblocks the pump. `None` (the default) leaves deadlock detection untouched.
+    external_wake: Option<Arc<(Mutex<u64>, Condvar)>>,
     /// §4/§7 the **JIT cap-path window page map**, keyed by window base. The JIT's `cap_thunk` rebuilds
     /// its window view per `call.cap`, so without a persistent home a guest-*grown* heap page (committed
     /// via the Memory cap in an earlier call) would read back as unmapped and a cap-buffer borrow of it
@@ -17935,6 +17942,7 @@ impl Host {
             stop_flag: Arc::new(AtomicBool::new(false)),
             term_flag: Arc::new(AtomicBool::new(false)),
             park_request: Arc::new(AtomicU64::new(0)),
+            external_wake: None,
             cap_pages: None,
             null_guard: 0,
             quota: Quota::default(),
@@ -21555,6 +21563,20 @@ impl Host {
     /// inlines this alongside the scheduler-backed wake/stop/kill doors; the bytecode cooperative
     /// `drive` has no scheduler, so it wires ONLY this closure (no re-lock — the store is on a
     /// pre-cloned `Arc`, and the op fires it under this Host's own lock). Idempotent (re-installs).
+    /// #1122 — arm the **external-wake doorbell**: opt this run into blocking-for-input at the
+    /// cooperative driver's would-be deadlock (every task parked on a pipe an embedder feeds from
+    /// outside the run — the interactive terminal session). The driver wires the personality's
+    /// pipe-wake door to ring it at run start. Without this call (the default) an all-parked run
+    /// is a deadlock and faults, exactly as before.
+    pub fn arm_external_wake(&mut self) {
+        self.external_wake = Some(Arc::new((Mutex::new(0), Condvar::new())));
+    }
+
+    /// The armed external-wake doorbell, if any (see [`Host::arm_external_wake`]).
+    pub(crate) fn external_wake(&self) -> Option<Arc<(Mutex<u64>, Condvar)>> {
+        self.external_wake.clone()
+    }
+
     pub(crate) fn wire_park_door(&self) {
         let park_cell = self.park_request.clone();
         if let Some((_, source)) = self.signal_poll() {
