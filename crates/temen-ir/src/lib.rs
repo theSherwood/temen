@@ -3549,8 +3549,11 @@ pub fn synth_manifest_start(
     let mut insts: Vec<Inst> = Vec::new();
     let mut next: ValIdx = 0;
     if let Some(hb) = heap_base {
+        // #1094: the heap bump words live in the guard's scratch page at `guard + BRK`/`TOP`
+        // (the whole page-0 scratch relocated up one NULL guard, as temen-leng/-dap/-llvm read it),
+        // so seed them there — a raw `[32, 40]` store would fault in the unmapped `[0, guard)`.
         for off in [POWERBOX_HEAP_BRK, POWERBOX_HEAP_TOP] {
-            insts.push(Inst::ConstI64(off as i64));
+            insts.push(Inst::ConstI64((POWERBOX_NULL_GUARD + off) as i64));
             let addr = next;
             next += 1;
             insts.push(Inst::ConstI64(hb as i64));
