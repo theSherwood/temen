@@ -8742,14 +8742,20 @@ fn mask_addr(
 /// faulting run diverges from the interpreter's fault-before-any-write. Both are interp↔JIT
 /// divergences (§3 parity), not escapes (every byte stays in `[0, reserved)`).
 ///
-/// The fix is a guarded 1-byte read of the span's **last** byte (`phys + len − 1`, where `phys` is
-/// [`confine_span`]'s confined base). It faults [`TrapKind::MemoryFault`] on the `PROT_NONE` guard
-/// exactly where the interpreter faults — **consulting the live page tables**, so it honors guest
-/// `grow` (unlike the compile-time `Lower::mapped`, which would over-fault a grown window). For the
-/// contiguous backed prefix (the production model + the spec window), last-byte-in-bounds ⟺
-/// whole-span-in-bounds, matching the interpreter's own `last < mapped` fast path. Emitted per span
-/// (`dst` and `src`) before the copy, so no partial write survives. `len == 0` skips the probe
-/// entirely (a branch on `len != 0`), keeping a zero-length op inert even at a wild pointer (D62).
+/// The fix is a guarded 1-byte read of the span's **first** byte (`phys`) and **last** byte
+/// (`phys + len − 1`, where `phys` is [`confine_span`]'s confined base). Each faults
+/// [`TrapKind::MemoryFault`] on a `PROT_NONE` guard page exactly where the interpreter faults —
+/// **consulting the live page tables**, so it honors guest `grow` (unlike the compile-time
+/// `Lower::mapped`, which would over-fault a grown window). The last-byte read catches an overrun
+/// past the backed extent; the first-byte read catches a span starting inside the #1094 NULL guard
+/// `[0, POWERBOX_NULL_GUARD)` — which the last-byte read alone misses when the span *ends* in backed
+/// memory (e.g. a whole-window self-copy from 0: macOS libc `memmove` short-circuits `dst == src`,
+/// so nothing else would ever touch the guard, an interp↔JIT divergence the spec-mem differential
+/// caught on macOS while glibc happened to fault). For the contiguous unmapped-guard + backed-prefix
+/// model (the production window + the spec window), first-and-last-in-bounds ⟺ whole-span-in-bounds.
+/// Emitted per span (`dst` and `src`) before the copy, so no partial write survives. `len == 0`
+/// skips the probe entirely (a branch on `len != 0`), keeping a zero-length op inert even at a wild
+/// pointer (D62).
 ///
 /// Residual (documented, not silently dropped): a bulk op whose span straddles a guest-created
 /// **interior** hole (`unmap`) or a read-only page mid-span is not caught by a last-byte read probe
@@ -8763,11 +8769,13 @@ fn probe_span(b: &mut FunctionBuilder, phys: Value, len: Value) {
 
     b.switch_to_block(do_probe);
     b.seal_block(do_probe);
+    // May-trap loads: each faults `MemoryFault` on a guard page — the first byte on the #1094 NULL
+    // guard, the last byte on an overrun past the backed region. The results are unused, but the
+    // loads are preserved because they can trap (side-effecting).
+    b.ins().load(I8, mem_flags(), phys, 0);
     let one = b.ins().iconst(I64, 1);
     let last_off = b.ins().isub(len, one);
     let last = b.ins().iadd(phys, last_off);
-    // A may-trap load: it faults `MemoryFault` on the guard page if the span overruns the backed
-    // region. The result is unused, but the load is preserved because it can trap (side-effecting).
     b.ins().load(I8, mem_flags(), last, 0);
     b.ins().jump(after, &[]);
 
