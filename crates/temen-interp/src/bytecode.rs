@@ -10544,6 +10544,13 @@ impl CoopSched {
                         // chain / invoke) — with `reply_twin` injected at the caller's reply slot.
                         let mut twin_active = tasks[caller_ti].vt.active.clone();
                         twin_active.set(caller_dst, Reg::from_i64(reply_twin));
+                        // #816 fail-closed: same rationale as the `ForkSelf` twin — the clone runs
+                        // over a private `fork_private` window in `extra_envs` that the tier-up
+                        // driver's `win`/page-state introspection cannot see, so strip any inherited
+                        // bitmap (the env-Some caller shouldn't carry one today; keep the invariant
+                        // explicit rather than implied).
+                        twin_active.jit_eligible = None;
+                        twin_active.jit_page_checked = false;
                         let twin_vt = VTask {
                             active: twin_active,
                             active_id: ROOT_FIBER,
@@ -10810,6 +10817,16 @@ impl CoopSched {
                             // bare root carries no resume chain / invoke (`Vm` derives `Clone`).
                             let mut twin_active = tasks[ti].vt.active.clone();
                             twin_active.set(dst, Reg::from_i64(0));
+                            // #816 fail-closed: the clone carries the parent's tier-up bitmap, but the
+                            // twin runs over its OWN private window (`fork_private` below, pushed into
+                            // `extra_envs`) — a window the tier-up driver cannot see (its `win` pointer
+                            // and page-state/extent introspection read the run's root window). An
+                            // emitted region for the twin would read and write the ROOT window's bytes
+                            // and admit the root's page map, not the twin's. Strip the bitmap so the
+                            // twin interprets — correct, just unaccelerated — until env-carrying
+                            // tier-up routes the driver through the pending task's env.
+                            twin_active.jit_eligible = None;
+                            twin_active.jit_page_checked = false;
                             let twin_vt = VTask {
                                 active: twin_active,
                                 active_id: ROOT_FIBER,
@@ -10909,7 +10926,16 @@ impl CoopSched {
                     // root and its same-module threads). A child spawned in another module (a confined
                     // §22 unit spawning its own function) runs a different module, where the module-0
                     // bitmap does not apply — leave it interpreting.
-                    if module == 0 {
+                    //
+                    // #816: only a thread of the **root env** inherits the bitmap. A thread spawned by
+                    // a §14 confined child (or a fork twin) runs over `extra_envs[k].mem` — a window
+                    // whose base, page map, and map-version the tier-up driver cannot see (its `win`
+                    // pointer and `mem_map_info`/`mem_map_version`/`window_scalar_extent` all read the
+                    // run's root window), so an emitted region for such a task would address the wrong
+                    // backing and check the wrong page state. Fail closed to the interpreter, which is
+                    // always right; env-carrying tier-up is a later refinement (route the driver's
+                    // introspection + `win` through the pending task's env, as `bounce` already does).
+                    if module == 0 && tasks[ti].env.is_none() {
                         if let Some(e) = eligible.as_ref() {
                             child.active.jit_eligible = Some(std::sync::Arc::clone(e));
                             child.active.jit_page_checked = *page_checked;
@@ -11903,7 +11929,11 @@ impl CoopRun {
     /// The run's window committed **scalar extent** right now — the #717 value the cdylib re-syncs to
     /// every emitted instance's `"mapped"` global after a [`bounce`](Self::bounce) (a bounced callback
     /// may have grown the window). `0` when there is no window or its state is not representable by one
-    /// bound. Reads the shared root window (a confined child's own-window growth is a later refinement).
+    /// bound. Reads the shared root window — which is the *right* window by construction: only tasks of
+    /// the root env carry the tier-up bitmap (#816 — `thread.spawn` inheritance is gated on `env: None`,
+    /// and fork twins strip it), so the pending tier-up's memory is always this one. An env-carrying
+    /// task's own-window growth lives in `extra_envs[k].mem`, invisible here — routing this (and the
+    /// driver's `win` pointer) through the pending task's env is the refinement that would lift the gate.
     pub fn window_scalar_extent(&self) -> u64 {
         self.mem
             .as_ref()
@@ -11938,14 +11968,17 @@ impl CoopRun {
     }
 
     /// #1009 paged tier-up: the root window's memory-map introspection ([`MemMapInfo`]) — a paged
-    /// coop driver rebuilds its page-state table from this. `None` for a memory-less run.
+    /// coop driver rebuilds its page-state table from this. `None` for a memory-less run. Root-only
+    /// is sound for the same reason as [`window_scalar_extent`](Self::window_scalar_extent) (#816):
+    /// only root-env tasks tier up, so the pending tier-up's page map is always this window's.
     pub fn mem_map_info(&self) -> Option<MemMapInfo> {
         self.mem.as_ref().map(|m| m.map_info())
     }
 
     /// #1009 paged tier-up: the root window's page-map version (bumped on every `map`/`unmap`/
     /// `protect`) — the cheap `O(1)` counter a paged coop driver compares to skip an unchanged
-    /// page-state rebuild. `0` for a memory-less run.
+    /// page-state rebuild. `0` for a memory-less run. Root-only is sound per
+    /// [`window_scalar_extent`](Self::window_scalar_extent)'s note (#816).
     pub fn mem_map_version(&self) -> u64 {
         self.mem.as_ref().map_or(0, |m| m.map_version())
     }

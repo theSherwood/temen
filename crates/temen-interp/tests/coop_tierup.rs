@@ -439,3 +439,128 @@ fn coop_tierup_live_futex_matches_pure_interp() {
         "expected exactly one tier-up (the root's compute leaf), got {tierups}"
     );
 }
+
+// #816 fail-closed — a task whose window lives in `extra_envs` must NOT tier up. The tier-up
+// driver's `win` pointer and its page-state/extent introspection (`mem_map_info`/`mem_map_version`/
+// `window_scalar_extent`) all read the run's ROOT window, so an emitted region for an env-carrying
+// task (a §14 confined child's thread, a fork twin) would address the wrong backing and admit the
+// wrong page map — the #839 JACL trap shape. The gate leaves such tasks interpreting (correct, just
+// unaccelerated) while the root's own eligible call still tiers up.
+//
+// func 0 (root; arg = its Instantiator handle): instantiates a same-module confined child at f1
+// (4 KiB carve at 64 KiB), joins it, calls the eligible leaf f3 itself, and sums. func 1 (child
+// entry): thread.spawns f2 INSIDE the child env and joins it — the one shape that used to inherit
+// the bitmap into an env-carrying task. func 2 (child-env worker): calls the leaf — the gated call.
+// func 3: the pure all-i64 leaf f(x) = x*3 + 7.
+const SRC_CHILD_ENV: &str = r#"
+memory 17
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  ve = i64.const 1
+  voff = i64.const 65536
+  vsl = i64.const 12
+  vq = i64.const 0
+  vh = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (ve, voff, vsl, vq)
+  vj = cap.call 6 1 (i32) -> (i64) v0 (vh)
+  v3 = i64.const 3
+  vlocal = call 3 (v3)
+  vr = i64.add vj vlocal
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i64.const 0
+  vt = thread.spawn 2 vz vz
+  vw = thread.join vt
+  return vw
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  v5 = i64.const 5
+  vr = call 3 (v5)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  v3 = i64.const 3
+  vm = i64.mul vx v3
+  v7 = i64.const 7
+  va = i64.add vm v7
+  return va
+  }
+}
+"#;
+
+#[test]
+fn coop_tierup_child_env_thread_stays_interpreted() {
+    let m = parse_module(SRC_CHILD_ENV).unwrap();
+    temen_verify::verify_module(&m).expect("verify");
+    // Drive with an Instantiator granted over the root window (the §14 spawn authority); the
+    // shared `coop_tierup_run` harness has no grant seam, so inline its loop here.
+    let run_with = |tierup: Option<TierUpConfig>| -> (Result<Vec<Value>, Trap>, u32) {
+        let mut host = Host::new();
+        let inst = host.grant_instantiator(0, 128 << 10);
+        let args = [Value::I32(inst)];
+        let mut run = bytecode::CoopRun::new(&m, 0, &args, FUEL, host, tierup)
+            .expect("supported")
+            .expect("entry in range");
+        let mut tierups = 0u32;
+        loop {
+            match run.run() {
+                bytecode::CoopEvent::Done(vals) => return (Ok(vals), tierups),
+                bytecode::CoopEvent::Trapped(t) => return (Err(t), tierups),
+                bytecode::CoopEvent::JitInvoke { .. } => {
+                    panic!("unexpected JitInvoke (no vm_jit guest here)")
+                }
+                bytecode::CoopEvent::TierUp { func, argv, .. } => {
+                    tierups += 1;
+                    assert!(
+                        tierups < 50,
+                        "runaway tier-ups (last func={func}, argv={argv:?})"
+                    );
+                    let targs: Vec<Value> = argv.iter().map(|&s| Value::I64(s)).collect();
+                    let mut fuel = FUEL;
+                    match bytecode::compile_and_run(&m, func, &targs, &mut fuel).expect("supported")
+                    {
+                        Ok(vals) => {
+                            let slots: Vec<i64> = vals
+                                .iter()
+                                .map(|v| match v {
+                                    Value::I64(x) => *x,
+                                    Value::I32(x) => *x as i64,
+                                    _ => panic!("non-integer tier-up result"),
+                                })
+                                .collect();
+                            run.deliver_tierup(&slots);
+                        }
+                        Err(t) => run.deliver_tierup_trap(t),
+                    }
+                }
+            }
+        }
+    };
+
+    // Oracle: pure-interp cooperative run. Child worker f(5)=22, root f(3)=16 → 38.
+    let (want, oracle_tierups) = run_with(None);
+    assert_eq!(want, Ok(vec![Value::I64(38)]), "oracle value");
+    assert_eq!(oracle_tierups, 0, "the oracle never tiers up");
+
+    let eligible: std::sync::Arc<[bool]> = std::sync::Arc::from(vec![false, false, false, true]);
+    let (got, tierups) = run_with(Some(TierUpConfig {
+        eligible,
+        page_checked: false,
+    }));
+    assert_eq!(
+        got, want,
+        "cooperative tier-up run with a confined child diverged from the pure-interp oracle"
+    );
+    // The gate: exactly the root's `call 3` tiers up; the child-env worker's interprets. (Before
+    // #816's gate the worker inherited the bitmap and this was 2.)
+    assert_eq!(
+        tierups, 1,
+        "only the root-env call may tier up (#816), got {tierups}"
+    );
+}
