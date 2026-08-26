@@ -198,6 +198,17 @@ fn wire_nested_imports(linker: &mut Linker<HostState>, memory: Memory) {
             },
         )
         .unwrap();
+    // §3c.3 env.instantiate_rec (op 17): defined so a module that *also* uses op-17 instantiates; the
+    // composition test never calls it (its op-17 func is unreachable from the entry).
+    linker
+        .func_wrap(
+            "env",
+            "instantiate_rec",
+            |_: Caller<'_, HostState>, _win: i32, _inst: i32, _record_ptr: i64| -> i32 {
+                unreachable!("op-17 rec spawn not exercised in this suite")
+            },
+        )
+        .unwrap();
     linker
         .func_wrap(
             "env",
@@ -464,4 +475,60 @@ fn emitted_child_out_of_window_access_faults_and_stays_confined() {
         0,
         "the faulting store never executed (no masked write either)"
     );
+}
+
+/// A module that uses **both** op-13 (func 0, the op-13 spawn entry) and op-17 (func 1, unreachable
+/// from the entry — it just forces `module_uses_rec`). Both conditional imports are then present:
+/// `env.instantiate_rec` at func import 8, `env.instantiate_module` at `8 + uses_rec = 9`. Running the
+/// op-13 entry must still bounce to import 9 (not 8) — the guard on the "compose deterministically"
+/// index arithmetic. Func 1 is dead code, so `env.instantiate_rec` never fires.
+const PARENT_OP13_AND_REC: &str = r#"memory 16
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32) {
+  vmh = i64.extend_i32_u v1
+  vgptr = i64.const 0
+  vgn = i64.const 0
+  ventry = i64.const 0
+  voff = i64.const 2048
+  vsl = i64.const 10
+  vq = i64.const 0
+  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
+  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  return vr
+  }
+}
+func (i32) -> (i32) {
+block 0 (v0: i32) {
+  vrec = i64.const 0
+  vch = call.cap 6 17 (i64) -> (i32) v0 (vrec)
+  return vch
+  }
+}
+"#;
+
+#[test]
+fn op13_and_op17_conditional_imports_compose() {
+    let want = oracle_child(&parse(CHILD));
+    // op-13 entry (func 0) is `f0(win, env, inst, module)`; func 1 (op-17) is present but never called.
+    let params = [
+        Val::I32(WIN_BASE),
+        Val::I32(ENV_PTR),
+        Val::I32(7),
+        Val::I32(99),
+    ];
+    let (r, reads, saw_module) = run_parent_over_child(
+        PARENT_OP13_AND_REC,
+        CHILD,
+        &params,
+        &[(WIN_BASE as i64 + CARVE_OFF) as usize],
+    );
+    assert!(
+        saw_module,
+        "op-13 bounce must reach env.instantiate_module (index 9), not env.instantiate_rec (index 8)"
+    );
+    assert_eq!(
+        r, want,
+        "op-13 entry still spawns + joins the child when op-17 is also imported"
+    );
+    assert_eq!(reads[0], 42, "the emitted child ran over its carve");
 }
