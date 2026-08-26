@@ -688,3 +688,262 @@ block 0 (vx: i64) {
         "markers must land in each task's own window"
     );
 }
+
+// #816 item 3 — a **fork twin** tiers up over its own private flat window. The guest topology is
+// the proven browser fork probe (`FORK_TWIN`, FORK.md §9): a manager (f0) spawns a server (f1,
+// handlers f2 = `clone_caller`, f3 = `reap`) and a guest (f4) as §14 children; the guest calls
+// `svc.fork`, the servicer duplicates it (`Mem::fork_private` + `Host::fork_powerbox`), and BOTH
+// copies — the original (reply 100) and the twin (reply 200) — call the eligible leaf f5 on their
+// reply before writing the result to the shared stdout; the original then `svc.wait`s the twin.
+// With the flat twin-backing seam, the twin's private window is an owned flat buffer, so its leaf
+// call TIERS UP (previously: interpreted fail-closed on wasm) — and its event's `pending_win` must
+// resolve OUTSIDE the root backing (the twin's own allocation), while the original's resolves
+// inside it (its §14 carve). Differential against the same run with no bitmap.
+const SRC_FORK_TWIN: &str = r#"
+memory 18
+type 0 func (i64) -> (i64)
+type 1 interface { fork: 0, wait: 0 }
+export 0 interface "svc" 1 { fork: 2, wait: 3 }
+data 300 "svc"
+data 310 "o"
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, vout: i32) {
+  vlog = i64.const 12
+  vq = i64.const 0
+  q1v0 = i64.const 4294967296
+  q1v1 = i64.const 131072
+  q1v2 = i64.const -4294967284
+  q1v3 = i64.const 4294967295
+  q1v4 = i64.const 0
+  q1a0 = i64.const 1216
+  i64.store q1a0 q1v0
+  q1a1 = i64.const 1224
+  i64.store q1a1 q1v1
+  q1a2 = i64.const 1232
+  i64.store q1a2 q1v2
+  q1a3 = i64.const 1240
+  i64.store q1a3 q1v3
+  q1a4 = i64.const 1248
+  i64.store q1a4 q1v4
+  q1a5 = i64.const 1256
+  i64.store q1a5 q1v4
+  q1a6 = i64.const 1264
+  i64.store q1a6 q1v4
+  vs = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
+  vz0 = i64.const 0
+  vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  va0 = i64.const 256
+  vnp = i32.const 300
+  i32.store va0 vnp
+  va1 = i64.const 260
+  vnl = i32.const 3
+  i32.store va1 vnl
+  va2 = i64.const 264
+  i32.store va2 vcap
+  va3 = i64.const 272
+  vnp2 = i32.const 310
+  i32.store va3 vnp2
+  va4 = i64.const 276
+  vnl2 = i32.const 1
+  i32.store va4 vnl2
+  va5 = i64.const 280
+  i32.store va5 vout
+  q2v0 = i64.const 17179869184
+  q2v1 = i64.const 135168
+  q2v2 = i64.const -4294967284
+  q2v3 = i64.const 4294967295
+  q2v4 = i64.const 0
+  q2v5 = i64.const 256
+  q2v6 = i64.const 2
+  q2a0 = i64.const 1280
+  i64.store q2a0 q2v0
+  q2a1 = i64.const 1288
+  i64.store q2a1 q2v1
+  q2a2 = i64.const 1296
+  i64.store q2a2 q2v2
+  q2a3 = i64.const 1304
+  i64.store q2a3 q2v3
+  q2a4 = i64.const 1312
+  i64.store q2a4 q2v4
+  q2a5 = i64.const 1320
+  i64.store q2a5 q2v5
+  q2a6 = i64.const 1328
+  i64.store q2a6 q2v6
+  vc = call.cap 6 17 (i64) -> (i32) v0 (q2a0)
+  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  return vjc
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  br 1()
+  }
+block 1 () {
+  vz = i32.const 0
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
+  br 1()
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vz = i32.const 0
+  vro = i64.const 100
+  vrt = i64.const 200
+  vt = call.cap 4294967295 11 (i64, i64) -> (i64) vz (vro, vrt)
+  return vt
+  }
+}
+func (i64) -> (i64) {
+block 0 (vpid: i64) {
+  vz = i32.const 0
+  vt = call.cap 4294967295 12 (i64) -> (i64) vz (vpid)
+  return vt
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vsvc = i64.const 6518387
+  vzero = i64.const 0
+  i64.store vzero vsvc
+  voname = i64.const 111
+  va8 = i64.const 8
+  i64.store va8 voname
+  vp0 = i64.const 0
+  vl3 = i64.const 3
+  vhsvc = self.resolve vp0 vl3
+  vp8 = i64.const 8
+  vl1 = i64.const 1
+  vho = self.resolve vp8 vl1
+  br 1(vhsvc, vho)
+  }
+block 1 (vhsvc: i32, vho: i32) {
+  varg = i64.const 7
+  vr = call.cap 268435456 0 (i64) -> (i64) vhsvc (varg)
+  v200 = i64.const 200
+  vistwin = i64.eq vr v200
+  br_if vistwin 4(vr, vho) 2(vr, vhsvc, vho)
+  }
+block 2 (vr: i64, vhsvc: i32, vho: i32) {
+  vpid3 = i64.const 3
+  vstatus = call.cap 268435456 1 (i64) -> (i64) vhsvc (vpid3)
+  veagain = i64.const -11
+  viseagain = i64.eq vstatus veagain
+  br_if viseagain 2(vr, vhsvc, vho) 3(vr, vstatus, vhsvc, vho)
+  }
+block 3 (vr: i64, vstatus: i64, vhsvc: i32, vho: i32) {
+  vechild = i64.const -10
+  visechild = i64.eq vstatus vechild
+  br_if visechild 1(vhsvc, vho) 4(vr, vho)
+  }
+block 4 (vr: i64, vho: i32) {
+  vleaf = call 5 (vr)
+  vp16 = i64.const 16
+  i64.store vp16 vleaf
+  vlen = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  v3 = i64.const 3
+  vm = i64.mul vx v3
+  v7 = i64.const 7
+  va = i64.add vm v7
+  return va
+  }
+}
+"#;
+
+/// Unix-only like the pending-win test: the native run backing must be flat for the raw window
+/// views (on the browser the backing is always flat — `Region::shared` over the cdylib buffer).
+#[cfg(unix)]
+#[test]
+fn coop_tierup_fork_twin_tiers_up_over_its_private_flat_window() {
+    const FORK_FUEL: u64 = 40_000_000;
+    let m = std::sync::Arc::new(parse_module(SRC_FORK_TWIN).unwrap());
+    temen_verify::verify_module(&m).expect("verify");
+    // (ptr-in-root-backing?, len) per tier-up event, plus the whole-run result and stdout.
+    #[allow(clippy::type_complexity)]
+    let run_with =
+        |tierup: Option<TierUpConfig>| -> (Result<Vec<Value>, Trap>, Vec<i64>, Vec<(bool, u64)>) {
+            let mut host = Host::new();
+            host.set_self_module(&m);
+            let inst = host.grant_instantiator(0, 1u64 << 18);
+            let sink = host.shared_stdout();
+            let out_h = host.grant_stream(temen_interp::StreamRole::Out);
+            let args = [Value::I32(inst), Value::I32(out_h)];
+            let back = std::sync::Arc::new(temen_interp::Region::new(1 << 18, 4096));
+            let root_base = back.raw_base().expect("flat native backing") as usize;
+            let mut run = bytecode::CoopRun::new_over(
+                &m,
+                0,
+                &args,
+                FORK_FUEL,
+                host,
+                tierup,
+                &[],
+                18,
+                std::sync::Arc::clone(&back),
+            )
+            .expect("supported")
+            .expect("entry in range");
+            let mut events: Vec<(bool, u64)> = Vec::new();
+            let result = loop {
+                match run.run() {
+                    bytecode::CoopEvent::Done(vals) => break Ok(vals),
+                    bytecode::CoopEvent::Trapped(t) => break Err(t),
+                    bytecode::CoopEvent::JitInvoke { .. } => panic!("unexpected JitInvoke"),
+                    bytecode::CoopEvent::TierUp { func, argv, .. } => {
+                        assert_eq!(func, 5, "only the leaf is eligible");
+                        assert!(events.len() < 10, "runaway tier-ups");
+                        let (ptr, len) = run
+                            .pending_win()
+                            .expect("every tiering task's window must resolve a flat view");
+                        let in_root =
+                            (ptr as usize) >= root_base && (ptr as usize) < root_base + (1 << 18);
+                        events.push((in_root, len));
+                        let x = argv[0];
+                        run.deliver_tierup(&[x * 3 + 7]);
+                    }
+                }
+            };
+            let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let mut out: Vec<i64> = bytes
+                .chunks_exact(8)
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            out.sort_unstable();
+            (result, out, events)
+        };
+
+    // Oracle: pure-interp cooperative run. The original resumes with 100 and the twin with 200;
+    // both write leaf(reply) to the shared stdout: leaf(100) = 307, leaf(200) = 607.
+    let (want, want_out, oracle_events) = run_with(None);
+    assert_eq!(want, Ok(vec![Value::I64(100)]), "oracle value");
+    assert_eq!(
+        want_out,
+        vec![307, 607],
+        "both copies ran and wrote (oracle)"
+    );
+    assert!(oracle_events.is_empty(), "the oracle never tiers up");
+
+    let eligible: std::sync::Arc<[bool]> =
+        std::sync::Arc::from(vec![false, false, false, false, false, true]);
+    let (got, got_out, events) = run_with(Some(TierUpConfig {
+        eligible,
+        page_checked: false,
+    }));
+    assert_eq!(got, want, "fork-twin tier-up run diverged from the oracle");
+    assert_eq!(got_out, want_out, "stdout parity");
+    // Both leaf calls tier up: the original guest's (a §14 child — its carve window lies INSIDE
+    // the root backing) and the fork twin's (its private `fork_private` window is its OWN flat
+    // allocation, outside the root backing). Both windows span the 4 KiB carve geometry.
+    let mut sorted = events.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        sorted,
+        vec![(false, 4096), (true, 4096)],
+        "one in-root-carve event (the original) + one private-window event (the twin), got {events:?}"
+    );
+}
