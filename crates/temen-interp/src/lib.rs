@@ -24419,12 +24419,20 @@ impl Mem {
             return true; // never mutated ⇒ the prefix is plain Rw throughout
         }
         let mapped_pages = self.window.mapped() / self.page;
+        // The #1094 NULL guard marks pages `[0, null_guard)` `Unmapped` and dirties the prot map, but
+        // it is a *deterministic* overlay re-seeded on every fresh window (`seed_null_guard`): a
+        // bytes-only `window_snapshot`/`seed` round-trip still reproduces the guest-visible state
+        // exactly — the guard's backing bytes are inert (`check_prot` refuses guest reads there) and
+        // its `Unmapped` protection is reconstructed on restore, not captured. So admit those guard
+        // pages alongside the benign in-prefix `Rw` commits; any other protection (`Ro`/unmap/grow/
+        // `Backed`) still fails this bytes-only check and falls back to replay-from-clock-0.
+        let guard_pages = self.null_guard / self.page;
         let space = self.space.read_unpoisoned();
         space.regions.is_empty()
-            && space
-                .prot
-                .iter()
-                .all(|(&pg, p)| matches!(p, PageProt::Rw) && pg < mapped_pages)
+            && space.prot.iter().all(|(&pg, p)| {
+                (matches!(p, PageProt::Rw) && pg < mapped_pages)
+                    || (matches!(p, PageProt::Unmapped) && pg < guard_pages)
+            })
     }
 
     /// The full mapped window, for a time-travel checkpoint (restored with [`seed`](Mem::seed)).
