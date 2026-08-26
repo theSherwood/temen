@@ -10546,7 +10546,8 @@ impl CoopSched {
                         twin_active.set(caller_dst, Reg::from_i64(reply_twin));
                         // #816 env-routed tier-up: same rule as the `ForkSelf` twin — the clone may
                         // keep an inherited bitmap only if its private `fork_private` window is
-                        // servable (flat); a `Paged` twin window strips it and interprets,
+                        // servable (flat; the owned-flat twin backing makes the tier-up shapes so
+                        // on every target); a `Paged` twin window strips it and interprets,
                         // fail-closed.
                         if !tierup_servable(twin_mem.as_ref(), mem.as_ref()) {
                             twin_active.jit_eligible = None;
@@ -10821,10 +10822,11 @@ impl CoopSched {
                             // #816 env-routed tier-up: the clone carries the parent's bitmap; the twin
                             // may keep it only if its OWN private window (`fork_private`, pushed into
                             // `extra_envs` below) is servable — the driver then answers each of the
-                            // twin's events over that window via the pending-env routing. A `Paged`
-                            // twin window (the wasm fallback — no flat address) is not servable:
-                            // strip the bitmap so the twin interprets, fail-closed, until a flat
-                            // twin-backing seam exists.
+                            // twin's events over that window via the pending-env routing. The
+                            // owned-flat twin backing (#816 item 3) makes the tier-up shapes servable
+                            // on every target; a twin still on the `Paged` fallback (unbounded
+                            // reservation, allocation failure) is not: strip the bitmap so it
+                            // interprets, fail-closed.
                             if !tierup_servable(twin_mem.as_ref(), mem.as_ref()) {
                                 twin_active.jit_eligible = None;
                                 twin_active.jit_page_checked = false;
@@ -12202,8 +12204,10 @@ impl CoopRun {
 ///   is servable wherever the root is (the per-event `win` is the backing base plus the window's
 ///   carve offset);
 /// - any other window (a fork twin's private `fork_private` copy) qualifies only if its own region
-///   is flat-addressable ([`Mem::flat_win_base`]). The wasm `Paged` fallback is not — so browser
-///   fork twins stay interpreted, fail-closed, until a flat twin-backing seam exists.
+///   is flat-addressable ([`Mem::flat_win_base`]). `fork_private` now picks an owned flat buffer
+///   for a bounded twin of a flat parent (#816 item 3), so tier-up-shaped twins qualify on every
+///   target; a twin that still lands on the `Paged` fallback (unbounded reservation, allocation
+///   failure) stays interpreted, fail-closed.
 ///
 /// A memory-less run has no window to serve — no bitmap.
 fn tierup_servable(cand: Option<&Mem>, root: Option<&Mem>) -> bool {

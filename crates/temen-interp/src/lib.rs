@@ -23338,9 +23338,10 @@ impl Mem {
         if reserved == 0 || !reserved.is_power_of_two() || !mapped.is_power_of_two() {
             return None;
         }
-        let mut twin = Mem::with_reservation(
+        let mut twin = Mem::with_reservation_over(
             reserved.trailing_zeros() as u8,
             mapped.trailing_zeros() as u8,
+            Arc::new(self.twin_backing(reserved)),
         );
         twin.seed(&self.window_snapshot());
         if !prot_copy.is_empty() {
@@ -23362,6 +23363,37 @@ impl Mem {
         // and enforced by `prot_pages`' refusal via this field) carries over.
         twin.null_guard = self.null_guard;
         Some(twin)
+    }
+
+    /// #816 item 3 — choose a [`fork_private`](Mem::fork_private) twin's private backing.
+    /// [`Region::new`] is the right default — a lazy `mmap` on unix — but its non-unix fallback is
+    /// `Paged`: no flat address, so emitted `win + addr` code can never serve the twin's window and
+    /// the twin interprets forever (the tier-up `tierup_servable` gate strips its bitmap). So when
+    /// the default comes back non-flat, this (my) window is itself flat-addressable (the tier-up
+    /// shapes: the browser's `Region::shared` window over the cdylib's linear memory), and the
+    /// reservation is bounded by my backing's length — the run window size, the cost cap on the
+    /// eager allocation (a coop run clamps its reservation to the run window; an unclamped
+    /// `DEFAULT_RESERVED_LOG2` engine-owned `Paged` parent is not flat, so it never lands here) —
+    /// the twin gets an **owned flat** buffer and tiers up over its private window on every
+    /// target. Fail-soft: an allocation failure keeps the default (the twin then stays
+    /// interpreted, exactly the pre-seam behavior).
+    fn twin_backing(&self, reserved: u64) -> Region {
+        self.twin_backing_from(Region::new(reserved, self.page), reserved)
+    }
+
+    /// The decision half of [`twin_backing`](Mem::twin_backing), taking the already-built default
+    /// backing — split out so the non-unix (`Paged`-default) arm is unit-testable on a unix host,
+    /// where `Region::new` always comes back flat.
+    fn twin_backing_from(&self, default: Region, reserved: u64) -> Region {
+        if default.raw_base().is_some() {
+            return default; // lazy flat (unix `mmap`) — strictly better than an eager buffer
+        }
+        if self.flat_win_base().is_some() && reserved <= self.back.len() {
+            if let Some(flat) = Region::owned_zeroed(reserved, self.page) {
+                return flat;
+            }
+        }
+        default
     }
 
     /// Build the memory view a **§14 nested child** runs over: it shares this (parent's) `Arc<Region>`
@@ -25523,6 +25555,80 @@ mod mem_fork_tests {
         assert_eq!(twin.byte((1 << 16) + page - 1), 0xA5, "to its last byte");
         twin.set_byte(1 << 16, 0x01);
         assert_eq!(m.byte(1 << 16), 0x5A, "private copy, not aliased");
+    }
+
+    /// #816 item 3 — the flat twin-backing seam, pinned on the non-unix arm (a forced `Paged`
+    /// default, since a unix `Region::new` always comes back flat): a bounded twin of a flat
+    /// parent gets an **owned flat** backing (servable by emitted `win + addr` code — the browser
+    /// fork twin tiers up), while an out-of-bound reservation or a non-flat parent keeps the
+    /// `Paged` default (the twin stays interpreted, fail-closed).
+    #[test]
+    fn twin_backing_goes_owned_flat_only_for_a_bounded_twin_of_a_flat_parent() {
+        // Flat parent on every target (an owned flat backing — the browser's shared-window shape),
+        // reservation == backing length: the `Paged` default is replaced with an owned flat buffer.
+        let page = host_page_size();
+        let m = Mem::with_reservation_over(
+            16,
+            16,
+            Arc::new(Region::owned_zeroed(1 << 16, page).expect("64 KiB allocates")),
+        );
+        let b = m.twin_backing_from(Region::paged(1 << 16, page), 1 << 16);
+        assert!(
+            b.raw_base().is_some(),
+            "a bounded twin of a flat parent must get a flat backing (#816 item 3)"
+        );
+        assert_eq!(b.len(), 1 << 16);
+
+        // Reservation beyond the parent backing's length (the cost cap): keep the default.
+        let b = m.twin_backing_from(Region::paged(1 << 17, page), 1 << 17);
+        assert!(
+            b.raw_base().is_none(),
+            "an out-of-bound reservation must keep the (non-flat) default"
+        );
+
+        // A flat default (the unix `mmap` arm) is kept as-is — lazy beats an eager copy.
+        #[cfg(unix)]
+        {
+            let b = m.twin_backing_from(Region::new(1 << 16, page), 1 << 16);
+            assert!(b.raw_base().is_some());
+        }
+
+        // Non-flat parent (forced `Paged` backing): never upgrade — the tier-up world only ever
+        // forks from flat windows, and an eager buffer for a pure-interp parent is waste.
+        let paged_parent =
+            Mem::with_reservation_over(16, 16, Arc::new(Region::paged(1 << 16, page)));
+        let b = paged_parent.twin_backing_from(Region::paged(1 << 16, page), 1 << 16);
+        assert!(
+            b.raw_base().is_none(),
+            "a non-flat parent's twin keeps the default backing"
+        );
+    }
+
+    /// #816 item 3, end-to-end on the shapes that matter: `fork_private` of a **flat, clamped**
+    /// parent (the browser coop-run window shape — `Region::shared`-like backing, reservation ==
+    /// backing length) yields a twin whose own window is flat-addressable, so `tierup_servable`
+    /// admits it and the fork twin's leaf calls tier up over its private window.
+    #[test]
+    fn fork_private_twin_of_a_clamped_flat_parent_is_flat_addressable() {
+        // Flat parent on every target, reserved == backing len (the browser coop-run shape). On a
+        // non-unix host this exercises the seam's real arm end-to-end: the twin's `Paged` default
+        // is upgraded to the owned flat buffer.
+        let m = Mem::with_reservation_over(
+            16,
+            16,
+            Arc::new(Region::owned_zeroed(1 << 16, host_page_size()).expect("64 KiB allocates")),
+        );
+        m.set_byte(8, 0x2A);
+        let twin = m.fork_private().expect("a simple window forks");
+        assert!(
+            twin.flat_win_base().is_some(),
+            "the twin window must be flat-addressable (servable by emitted code)"
+        );
+        assert_eq!(twin.byte(8), 0x2A, "still a faithful private copy");
+        assert!(
+            !Arc::ptr_eq(&twin.back, &m.back),
+            "flat, but its own backing — never an alias of the parent's"
+        );
     }
 }
 

@@ -930,7 +930,9 @@ pub(crate) unsafe extern "C" fn instantiate(
 ///
 /// # Safety
 /// As [`instantiate`]: `rt`/`mem_base`/`trap_out` are the baked nursery, live parent window base, and
-/// run trap cell, valid for the call; `mem_size` is the parent window's mapped byte count.
+/// run trap cell, valid for the call; `mem_size` is the parent window's **reserved** span (#826 — a
+/// grant record in a `map`-grown tail page is admitted; an uncommitted page faults through the
+/// SIGSEGV guard as `MemoryFault`, exactly like a guest access).
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe extern "C" fn instantiate_named(
     rt: *const Nursery,
@@ -1093,6 +1095,9 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
     trap_out: *mut i64,
 ) -> i32 {
     let rp = record_ptr as u64;
+    // #826: `mem_size` is the reserved span, so a record in a `map`-grown tail page is read where
+    // the interpreter's live page map reads it; a record on a still-uncommitted page faults the
+    // copy below through the SIGSEGV guard (`MemoryFault`), exactly like a guest load.
     if rp.checked_add(56).is_none_or(|e| e > mem_size) {
         *trap_out = TrapKind::MemoryFault as i64;
         return 0;
@@ -1221,7 +1226,8 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
 ///
 /// # Safety
 /// As [`instantiate`]/[`instantiate_named`]: `rt`/`mem_base`/`mem_size`/`trap_out` are the baked
-/// nursery, live parent window base, mapped byte count, and run trap cell, valid for the call.
+/// nursery, live parent window base, **reserved** span (#826, as for `instantiate_named`), and run
+/// trap cell, valid for the call.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe extern "C" fn instantiate_module_named(
     rt: *const Nursery,
