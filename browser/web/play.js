@@ -1975,7 +1975,8 @@ async function runModule(c) {
   // The interpreter tier streams off the main thread by default (a worker + `runStream`); name that as
   // the expected tier so a real fall-through to the synchronous path reads as the fallback, not this.
   const interpTier = !ex.warm && snapshotClient ? 'interpreter (streamed)' : 'interpreter';
-  const rec = runStart(c, { tier: useJit ? 'wasm-JIT' : interpTier });
+  const jitTier = snapshotClient ? 'wasm-JIT (streamed)' : 'wasm-JIT';
+  const rec = runStart(c, { tier: useJit ? jitTier : interpTier });
   let bytes;
   try {
     bytes = await fetchTimed(rec, c, ex.url);
@@ -2042,21 +2043,40 @@ async function runModule(c) {
       status = undefined;
     }
   } else if (status === undefined && useJit) {
-    try {
-      // Emit `_start` and run it on wasm; temen_onramp_jit_run_finish captures stdout/exit/value into the
-      // shared slots (read back via the usual accessors, exactly like the interpreter path). `temen_run_value`
-      // is the guest's returned result — the same value `temen_run_onramp` returns on the interpreter, so the
-      // result matches on both tiers (a trap throws → we fall back to the interpreter below).
-      // Cache the compiled Module across Runs keyed by the module's content-addressed URL — the
-      // emitted `_start` depends only on the module, not the editor `stdinBytes` (slice 1, WASM_AOT.md).
-      status = await runJitModule(eng.ex, eng.memory, bytes, stdinBytes, ex.url);
-      rv = Number(eng.ex.temen_run_value());
-      stdout = readModuleStdout();
-      tier = 'wasm-JIT';
-    } catch (e) {
-      logTo(c, `wasm-JIT module unavailable (${e.message}); falling back to the interpreter`);
-      runNote(rec, { jitFallbackReason: e.message });
-      status = undefined;
+    // Prefer the worker (#1141): emit + run `_start` on the wasm-JIT tier off the main thread, streaming
+    // stdout live. A JIT decline / worker miss falls through to the synchronous main-thread `runJitModule`.
+    if (snapshotClient) {
+      try {
+        c.el.stdout.textContent = '';
+        const jdec = new TextDecoder();
+        const r = await snapshotClient.runJitStream(bytes, stdinBytes, ex.url,
+          (chunk) => { c.el.stdout.textContent += jdec.decode(chunk, { stream: true }); });
+        if (r.ok) {
+          rv = r.value; status = r.status; stdout = r.stdout; tier = 'wasm-JIT (streamed)';
+        } else {
+          logTo(c, `wasm-JIT worker: ${r.error}; falling back`);
+        }
+      } catch (e) {
+        logTo(c, `wasm-JIT worker unavailable (${e.message}); falling back`);
+      }
+    }
+    if (status === undefined) {
+      try {
+        // Emit `_start` and run it on wasm; temen_onramp_jit_run_finish captures stdout/exit/value into the
+        // shared slots (read back via the usual accessors, exactly like the interpreter path). `temen_run_value`
+        // is the guest's returned result — the same value `temen_run_onramp` returns on the interpreter, so the
+        // result matches on both tiers (a trap throws → we fall back to the interpreter below).
+        // Cache the compiled Module across Runs keyed by the module's content-addressed URL — the
+        // emitted `_start` depends only on the module, not the editor `stdinBytes` (slice 1, WASM_AOT.md).
+        status = await runJitModule(eng.ex, eng.memory, bytes, stdinBytes, ex.url);
+        rv = Number(eng.ex.temen_run_value());
+        stdout = readModuleStdout();
+        tier = 'wasm-JIT';
+      } catch (e) {
+        logTo(c, `wasm-JIT module unavailable (${e.message}); falling back to the interpreter`);
+        runNote(rec, { jitFallbackReason: e.message });
+        status = undefined;
+      }
     }
   }
   if (status === undefined && ex.warm) {

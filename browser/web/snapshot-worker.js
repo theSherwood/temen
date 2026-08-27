@@ -8,7 +8,7 @@
 // "rare shared-memory race (a double-free)" in the shared setup. This Worker instantiates the engine over
 // a fresh memory of its own and allocates only there, so its warm session can't race the main thread's
 // allocator. Main ↔ worker communicate only by messages (source string in; stdout/status/value out).
-import { runWarmJit, primeWarmJit, jitCacheStats } from './wasmjit-module.js';
+import { runWarmJit, primeWarmJit, jitCacheStats, runJitModule } from './wasmjit-module.js';
 
 let ex = null; // the worker's own engine exports
 let memory = null; // the worker's own (private) shared WebAssembly.Memory
@@ -188,6 +188,28 @@ self.onmessage = async (e) => {
         { type: 'reply', id: msg.id, ok: true, status, value, stdout: readStdout(), stderr: readStderr(), fb },
         fb ? [fb.rgba.buffer] : [],
       );
+      return;
+    }
+    if (msg.type === 'runJitStream') {
+      // Run a module's `_start` on the **wasm-JIT tier** off the main thread, with **live stdout** (#1141):
+      // `runJitModule` emits `_start`, drives `f0`, and bounces cross-tier `write`s to the interpreter — the
+      // tee on that run's host fires `stdout_chunk`, relayed here as the guest writes. A JIT decline/trap
+      // throws → reply `ok:false` so the page falls back to the interpreter path.
+      const mod = msg.bytes;
+      const stdin = msg.stdin && msg.stdin.length ? msg.stdin : null;
+      chunkSink = (bytes) => self.postMessage({ type: 'stdout-chunk', id: msg.id, bytes }, [bytes.buffer]);
+      let status;
+      try {
+        status = await runJitModule(ex, memory, mod, stdin, msg.cacheKey);
+      } catch (err) {
+        chunkSink = null;
+        self.postMessage({ type: 'reply', id: msg.id, ok: false, error: String((err && err.message) || err) });
+        return;
+      } finally {
+        chunkSink = null;
+      }
+      const value = Number(ex.temen_run_value());
+      self.postMessage({ type: 'reply', id: msg.id, ok: true, status, value, stdout: readStdout(), stderr: readStderr() });
       return;
     }
     if (msg.type === 'nimAssets') {

@@ -119,6 +119,21 @@ export class SnapshotClient {
     });
   }
 
+  // Run a module's `_start` on the **wasm-JIT tier** off the main thread with **live stdout** (#1141);
+  // `onChunk(Uint8Array)` fires per write. Resolves `{ ok, status, value, stdout, stderr }`, or
+  // `{ ok:false, error }` on a JIT decline/trap (the caller then falls back to the interpreter path).
+  // `cacheKey` caches the emitted Module across Runs (same as the main-thread `runJitModule`).
+  async runJitStream(bytes, stdin, cacheKey, onChunk) {
+    const w = this._workerFor(SnapshotClient.STREAM_KEY);
+    await w.ready;
+    const id = ++w.seq;
+    if (onChunk) w.chunks.set(id, onChunk);
+    return new Promise((resolve) => {
+      w.pending.set(id, resolve);
+      w.worker.postMessage({ type: 'runJitStream', id, bytes, stdin: stdin || null, cacheKey });
+    });
+  }
+
   // Compile a whole Nim program off the main thread. `getAssets()` resolves the four phase buffers
   // `{ nifler, nimsem, hexer, stdlib }` (fetched + inflated by the caller); they're posted to the nim
   // worker once and cached there, so subsequent Runs ship only `source`. Resolves `{ ok, status,

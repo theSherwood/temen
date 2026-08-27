@@ -5203,7 +5203,7 @@ impl JitOnrampRun {
         // Build the powerbox + the window-prefix seed (`init_mem`, the argv blob for the `Fs` path)
         // from the input shape. `frame` is only ever populated by a `display.present` — kept for
         // struct parity; a compiler/compute guest never presents.
-        let (host, init_mem, frame, fs_readback): (Host, Vec<u8>, _, _) = match input {
+        let (mut host, init_mem, frame, fs_readback): (Host, Vec<u8>, _, _) = match input {
             RunInput::Stdin(stdin) => {
                 let mut host = Host::new();
                 host.stdin = stdin;
@@ -5231,6 +5231,11 @@ impl JitOnrampRun {
                 (host, init_mem, frame, fs_readback)
             }
         };
+        // Live-stream stdout from the emitted `_start`'s cross-tier `write` bounces (#1141) — a no-op
+        // unless the page has a streaming sink active.
+        if let Some(t) = stream_tee() {
+            host.set_stdout_tee(t);
+        }
         // Materialize the window before the emitted `_start` runs (the interpreter does this at
         // instantiation; the emitted `_start` seeds only the heap + stashes handles): first the argv
         // prefix (`init_mem`, empty for stdin), then `.data`/`.rodata`. Data segments start at the

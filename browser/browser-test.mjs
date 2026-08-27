@@ -195,7 +195,13 @@ try {
 
   // An on-ramp module: a real C guest (`hello.c`) compiled through the LLVM on-ramp and run via
   // `temen_run_onramp` (not the text/`temen_parse` path). Uses the committed `web/assets/hello_c.temen`.
-  check('hello (C → Temen, on-ramp module)', await runPlay('hello (C → Temen)'), '0', 'hello, sandbox!\n');
+  const helloC = await runPlay('hello (C → Temen)');
+  check('hello (C → Temen, on-ramp module)', helloC, '0', 'hello, sandbox!\n');
+  // …and it ran on the **wasm-JIT tier, off the main thread, streaming** (#1141) — the JIT run moved to a
+  // worker so its stdout paints as the emitted `_start` writes it. The status chip names the streamed tier.
+  const jitStreamed = helloC.status.includes('wasm-JIT (streamed)');
+  checks.push(jitStreamed);
+  console.log(`  play/jit-streamed: status=${JSON.stringify(helloC.status)} ${jitStreamed ? 'PASS' : 'FAIL'}`);
 
   // A real **Nim** program (`web/assets/nim_hello.temen`, gated headlessly by `nim_hello_asset.rs`) —
   // the full nimony toolchain → temen-leng → nim→powerbox bridge, run in-browser via `temen_run_onramp`.
