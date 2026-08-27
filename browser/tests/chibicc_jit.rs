@@ -8,6 +8,10 @@
 //! `chibicc_printf.rs`) — the JIT correctness contract for the compiler tier. Then it parses + runs the
 //! emitted IR and checks the program's own stdout, so the whole card pipeline is covered on the JIT.
 //!
+//! A second test covers the **RUN path** (#1153): a chibicc-compiled program whose `malloc` `vm_map`s
+//! its heap arena past the run window must, on the JIT, either match the interpreter or decline (trap →
+//! browser fallback) — never complete with divergent output.
+//!
 //! Fail-soft: `chibicc.temen` is a code-coupled asset CI regenerates; absent, the test SKIPs.
 
 use temen_browser::{
@@ -15,7 +19,7 @@ use temen_browser::{
 };
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
-const WIN_LOG2: u8 = 25; // 32 MiB — chibicc.temen declares size_log2=25; the emitted run can't grow it
+const WIN_LOG2: u8 = 25; // 32 MiB run window (JIT_RUN_WIN_LOG2); chibicc declares size_log2=21 and grows into it
 const WIN_SIZE: u64 = 1 << WIN_LOG2;
 const WIN_BASE: u32 = 0x1_0000; // window starts at 64 KiB (the env cell lives below it)
 const ENV_PTR: u32 = 1024;
@@ -118,6 +122,14 @@ fn jit_compile(chibicc: &temen_ir::Module, src: &str) -> String {
                     .run_cross_tier(func as u32, &args);
                 match outcome {
                     Ok(vals) => {
+                        // #1153: re-sync the emitted `"mapped"` global to the (possibly `vm_map`-grown)
+                        // live extent after each bounce, exactly as `driveJitRun` does in the browser —
+                        // chibicc declares a 2-MiB window and grows its heap past it, so without this the
+                        // emitted store into a grown page traps against the stale declared bound.
+                        let mapped = caller.data().as_ref().unwrap().mapped() as i64;
+                        if let Some(wasmi::Extern::Global(g)) = caller.get_export("mapped") {
+                            g.set(&mut caller, Val::I64(mapped)).ok();
+                        }
                         let data = memory.data_mut(&mut caller);
                         for (i, v) in vals.iter().enumerate() {
                             if i >= results.len() {
@@ -232,5 +244,153 @@ int main(void) {
     assert_eq!(
         String::from_utf8_lossy(&run.stdout),
         "hello, jit! 2 + 40 = 42\nline 1\nline 2\nline 3\n"
+    );
+}
+
+/// #1153 — the **RUN path** (the fn above is the COMPILE path): run a produced on-ramp module's
+/// `_start` on the single-shot JIT (emitted `f0` on `wasmi`, cross-tier on the interpreter with the
+/// `"mapped"` re-sync), returning its stdout and whether it **declined** (trapped without `exit` — an
+/// access past the linear-memory window the browser resolves by falling back to the interpreter).
+fn jit_run_module(m: &temen_ir::Module) -> (Vec<u8>, bool) {
+    let engine = Engine::default();
+    let pages = ((WIN_BASE as u64 + WIN_SIZE) / (64 * 1024)) as u32;
+    let mut store: Store<Option<JitOnrampRun>> = Store::new(&engine, None);
+    let memory = Memory::new(&mut store, MemoryType::new(pages, Some(pages))).unwrap();
+    let win_ptr = unsafe { memory.data_mut(&mut store).as_mut_ptr().add(WIN_BASE as usize) };
+    let run =
+        unsafe { JitOnrampRun::open_shared_run(m, win_ptr, WIN_SIZE, WIN_LOG2, false, Vec::new()) }
+            .expect("emittable");
+    let emitted_wasm = run.emitted_wasm().to_vec();
+    let rtys: Vec<temen_ir::ValType> = run.func_sig(0).1.to_vec();
+    let module = WModule::new(&engine, &emitted_wasm).expect("validate");
+    *store.data_mut() = Some(run);
+    let mut linker: Linker<Option<JitOnrampRun>> = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    linker
+        .func_wrap("env", "trap", |_c: Caller<'_, _>, _code: i32| {})
+        .unwrap();
+    linker
+        .func_wrap(
+            "env",
+            "call_interp",
+            move |mut caller: Caller<'_, Option<JitOnrampRun>>,
+                  func: i32,
+                  args_ptr: i32|
+                  -> Result<(), wasmi::Error> {
+                let (params, results) = {
+                    let r = caller.data().as_ref().unwrap();
+                    let (p, rs) = r.func_sig(func as u32);
+                    (p.to_vec(), rs.to_vec())
+                };
+                let args: Vec<temen_interp::Value> = {
+                    let data = memory.data(&caller);
+                    params
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| {
+                            let o = args_ptr as usize + i * 8;
+                            let raw = u64::from_le_bytes(data[o..o + 8].try_into().unwrap());
+                            match t {
+                                temen_ir::ValType::I32 => temen_interp::Value::I32(raw as i32),
+                                _ => temen_interp::Value::I64(raw as i64),
+                            }
+                        })
+                        .collect()
+                };
+                let outcome = caller
+                    .data_mut()
+                    .as_mut()
+                    .unwrap()
+                    .run_cross_tier(func as u32, &args);
+                match outcome {
+                    Ok(vals) => {
+                        // #1153: re-sync the emitted `"mapped"` bound after each bounce (as `driveJitRun`).
+                        let mapped = caller.data().as_ref().unwrap().mapped() as i64;
+                        if let Some(wasmi::Extern::Global(g)) = caller.get_export("mapped") {
+                            g.set(&mut caller, Val::I64(mapped)).ok();
+                        }
+                        let data = memory.data_mut(&mut caller);
+                        for (i, v) in vals.iter().enumerate() {
+                            if i >= results.len() {
+                                break;
+                            }
+                            let raw = match v {
+                                temen_interp::Value::I32(x) => *x as u32 as u64,
+                                temen_interp::Value::I64(x) => *x as u64,
+                                _ => 0,
+                            };
+                            let o = args_ptr as usize + i * 8;
+                            data[o..o + 8].copy_from_slice(&raw.to_le_bytes());
+                        }
+                        Ok(())
+                    }
+                    Err(t) => {
+                        caller
+                            .data_mut()
+                            .as_mut()
+                            .unwrap()
+                            .set_last_trap(format!("{t:?}"));
+                        Err(wasmi::Error::from(
+                            wasmi::core::TrapCode::UnreachableCodeReached,
+                        ))
+                    }
+                }
+            },
+        )
+        .unwrap();
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .unwrap()
+        .start(&mut store)
+        .unwrap();
+    let f0 = instance.get_func(&store, "f0").unwrap();
+    let args = vec![Val::I32(WIN_BASE as i32), Val::I32(ENV_PTR as i32)];
+    let mut results: Vec<Val> = rtys
+        .iter()
+        .map(|t| match t {
+            temen_ir::ValType::I32 => Val::I32(0),
+            _ => Val::I64(0),
+        })
+        .collect();
+    memory
+        .write(&mut store, ENV_PTR as usize, &(1i64 << 60).to_le_bytes())
+        .unwrap();
+    let call = f0.call(&mut store, &args, &mut results);
+    let run = store.data().as_ref().unwrap();
+    let declined = call.is_err() && !run.exited();
+    (run.stdout().to_vec(), declined)
+}
+
+/// #1153 run-path guard (the `chibicc libc`/`memstream` play cards, `browser-play-editor-test.mjs`):
+/// chibicc compiles a program whose `malloc` `vm_map`s its heap arena at a high address (256 MiB, well
+/// past the 32-MiB run window); running the produced IR on the JIT must either MATCH the interpreter or
+/// DECLINE (trap → the browser falls back), never *complete* with divergent output. The regression this
+/// pins: a cross-tier reservation clamped to the window turned that high `vm_map` into `-EINVAL`, so
+/// `malloc` returned null and the run finished printing `(null)` instead of declining.
+#[test]
+fn chibicc_compiled_malloc_program_matches_or_declines() {
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent (run build-onramp-assets.mjs)");
+        return;
+    };
+    let src = "#include <stdio.h>\n#include <string.h>\n\
+        int main(void){ char*d=strdup(\"libc\"); printf(\"%s\\n\", d); return 0; }\n";
+    let image = card_image(src);
+    let compiled = onramp_fs_exec(&chibicc, &image, &ARGV, b"");
+    assert!(
+        compiled.status == STATUS_OK || compiled.status == STATUS_EXIT,
+        "chibicc compile status {}",
+        compiled.status
+    );
+    let m = temen_text::parse_module(&String::from_utf8(compiled.stdout).expect("ir utf8"))
+        .expect("parse produced IR");
+
+    let interp_out = String::from_utf8_lossy(&onramp_exec(&m, b"").stdout).to_string();
+    assert_eq!(interp_out, "libc\n", "interp oracle prints the strdup'd string");
+    let (jit_bytes, declined) = jit_run_module(&m);
+    let jit_out = String::from_utf8_lossy(&jit_bytes).to_string();
+    assert!(
+        declined || jit_out == interp_out,
+        "JIT run must match the interpreter or decline, not diverge (#1153): got {jit_out:?} declined={declined}"
     );
 }

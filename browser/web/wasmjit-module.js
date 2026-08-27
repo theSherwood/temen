@@ -66,7 +66,7 @@ async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp, entry
   const cached = cacheKey === undefined ? undefined : jitInstanceCache.get(cacheKey);
   if (cached) {
     jitCacheStats.hits++;
-    return pick(cached.instance);
+    return { f0: pick(cached.instance), instance: cached.instance };
   }
   let module = cacheGet(cacheKey);
   if (module === undefined) {
@@ -83,7 +83,7 @@ async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp, entry
     }
     jitInstanceCache.set(cacheKey, { instance });
   }
-  return pick(instance);
+  return { f0: pick(instance), instance };
 }
 
 // Drive an already-opened single-shot JIT run to completion: get the emitted `_start`'s instance (compiled
@@ -108,9 +108,12 @@ async function driveJitRun(ex, memory, cacheKey) {
   // Run. Safe even though this path re-opens a fresh window each Run — `win` is passed to `f0` per Run,
   // and the cross-tier bounce routes to the current cdylib run, so a reused instance runs against current
   // state (the warm path reuses the same way, and the reactor reuses one instance across every frame).
-  let f0;
+  let f0, instance;
+  // #1153: the emitted `"mapped"` bound, re-synced after each `vm_map`-growing bounce so a grown store
+  // admits (parity with the coop tier — the single-shot on-ramp path no longer pre-sizes a fixed window).
+  let mappedGlobal = null;
   try {
-    f0 = await cachedInstanceF0(
+    ({ f0, instance } = await cachedInstanceF0(
       memory,
       cacheKey,
       () => {
@@ -121,12 +124,23 @@ async function driveJitRun(ex, memory, cacheKey) {
       },
       (func, argsPtr) => {
         if (ex.temen_onramp_jit_run_call_interp(func, argsPtr) !== 0) throw new Error('cross-tier stop');
+        // A `vm_map` grow in the bounce advanced the run's committed extent — re-sync the emitted
+        // `"mapped"` (the `driveCoopTierupRun` scalar pattern; on-ramp guests grow scalar, no paged
+        // pagestate). Inert until the global is registered just below (and on a cached instance the
+        // first Run's closure carries it, reading the current run's extent via the FFI each time).
+        if (mappedGlobal) mappedGlobal.value = ex.temen_onramp_jit_run_mapped();
       },
-    );
+    ));
   } catch (e) {
     ex.temen_onramp_jit_run_close();
     throw e;
   }
+  mappedGlobal = instance.exports.mapped ?? null;
+  // #1153: reset the bound to THIS run's committed extent before `f0` runs. A cached instance (issue
+  // #803) carries the prior Run's grown `"mapped"`; each Run re-opens a cold window at the declared
+  // extent, so without this reset an early emitted access (before the Run's first `vm_map` bounce)
+  // could admit against a stale-high bound. `temen_onramp_jit_run_mapped` reads the current run.
+  if (mappedGlobal) mappedGlobal.value = ex.temen_onramp_jit_run_mapped();
 
   const env = Number(ex.temen_alloc(envBytes));
   new DataView(memory.buffer).setBigInt64(env, 1n << 60n, true); // huge dispatcher-fuel budget
@@ -452,7 +466,7 @@ export async function runWarmJit(ex, memory, stdinBytes, cacheKey, shared = 1) {
   // Reuse the instance across Runs (issue #803): a hit skips both the byte copy and instantiate, so a
   // warm Run collapses to `prepare` + the eval. The emit is stable and window-independent (`win`/`sp` are
   // passed per Run), so one instance serves every Run of this warm session.
-  const entry = await cachedInstanceF0(
+  const { f0: entry } = await cachedInstanceF0(
     memory,
     cacheKey,
     () => {
