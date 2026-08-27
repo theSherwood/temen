@@ -55,7 +55,7 @@ jobs:
     steps:
       - id: check
         run: |
-          live=$(curl -fsS https://thesherwood.github.io/vm/DEPLOYED_SHA 2>/dev/null || echo none)
+          live=$(curl -fsS https://thesherwood.github.io/temen/DEPLOYED_SHA 2>/dev/null || echo none)
           echo "published=$live head=$GITHUB_SHA event=${{ github.event_name }}"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$live" != "$GITHUB_SHA" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
