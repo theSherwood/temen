@@ -67,17 +67,17 @@ fn rmw_i32_yields_old_and_updates() {
       (module
         (memory 1 1 shared)
         (func (export "final") (result i32)
-          (i32.atomic.store (i32.const 0) (i32.const 100))
-          (drop (i32.atomic.rmw.add  (i32.const 0) (i32.const 5)))
-          (drop (i32.atomic.rmw.sub  (i32.const 0) (i32.const 3)))
-          (drop (i32.atomic.rmw.xchg (i32.const 0) (i32.const 7)))
-          (drop (i32.atomic.rmw.and  (i32.const 0) (i32.const 6)))
-          (drop (i32.atomic.rmw.or   (i32.const 0) (i32.const 1)))
-          (drop (i32.atomic.rmw.xor  (i32.const 0) (i32.const 5)))
-          (i32.atomic.load (i32.const 0)))
+          (i32.atomic.store (i32.const 16384) (i32.const 100))
+          (drop (i32.atomic.rmw.add  (i32.const 16384) (i32.const 5)))
+          (drop (i32.atomic.rmw.sub  (i32.const 16384) (i32.const 3)))
+          (drop (i32.atomic.rmw.xchg (i32.const 16384) (i32.const 7)))
+          (drop (i32.atomic.rmw.and  (i32.const 16384) (i32.const 6)))
+          (drop (i32.atomic.rmw.or   (i32.const 16384) (i32.const 1)))
+          (drop (i32.atomic.rmw.xor  (i32.const 16384) (i32.const 5)))
+          (i32.atomic.load (i32.const 16384)))
         (func (export "old_add") (result i32)
-          (i32.atomic.store (i32.const 0) (i32.const 100))
-          (i32.atomic.rmw.add (i32.const 0) (i32.const 5)))    ;; old = 100
+          (i32.atomic.store (i32.const 16384) (i32.const 100))
+          (i32.atomic.rmw.add (i32.const 16384) (i32.const 5)))    ;; old = 100
       )"#;
     assert_eq!(run(wat, "final", &[]), 2, "and/or/xor chain → 2");
     assert_eq!(run(wat, "old_add", &[]), 100, "rmw yields the old value");
@@ -90,9 +90,9 @@ fn rmw_i64_full_width() {
       (module
         (memory 1 1 shared)
         (func (export "f") (result i64)
-          (i64.atomic.store (i32.const 8) (i64.const 1000000000000))
-          (drop (i64.atomic.rmw.add (i32.const 8) (i64.const 23)))
-          (i64.atomic.load (i32.const 8))))"#;
+          (i64.atomic.store (i32.const 16392) (i64.const 1000000000000))
+          (drop (i64.atomic.rmw.add (i32.const 16392) (i64.const 23)))
+          (i64.atomic.load (i32.const 16392))))"#;
     assert_eq!(run(wat, "f", &[]), 1_000_000_000_023);
 }
 
@@ -106,18 +106,18 @@ fn cmpxchg_match_and_mismatch() {
         (memory 1 1 shared)
         ;; expected matches → swaps to 77, yields old 42
         (func (export "hit") (result i32)
-          (i32.atomic.store (i32.const 0) (i32.const 42))
-          (drop (i32.atomic.rmw.cmpxchg (i32.const 0) (i32.const 42) (i32.const 77)))
-          (i32.atomic.load (i32.const 0)))                       ;; → 77
+          (i32.atomic.store (i32.const 16384) (i32.const 42))
+          (drop (i32.atomic.rmw.cmpxchg (i32.const 16384) (i32.const 42) (i32.const 77)))
+          (i32.atomic.load (i32.const 16384)))                       ;; → 77
         ;; expected mismatches → no swap, mem stays 42
         (func (export "miss") (result i32)
-          (i32.atomic.store (i32.const 0) (i32.const 42))
-          (drop (i32.atomic.rmw.cmpxchg (i32.const 0) (i32.const 9) (i32.const 77)))
-          (i32.atomic.load (i32.const 0)))                       ;; → 42
+          (i32.atomic.store (i32.const 16384) (i32.const 42))
+          (drop (i32.atomic.rmw.cmpxchg (i32.const 16384) (i32.const 9) (i32.const 77)))
+          (i32.atomic.load (i32.const 16384)))                       ;; → 42
         ;; the yielded old is always the pre-op value
         (func (export "old") (result i32)
-          (i32.atomic.store (i32.const 0) (i32.const 42))
-          (i32.atomic.rmw.cmpxchg (i32.const 0) (i32.const 9) (i32.const 77)))  ;; → 42
+          (i32.atomic.store (i32.const 16384) (i32.const 42))
+          (i32.atomic.rmw.cmpxchg (i32.const 16384) (i32.const 9) (i32.const 77)))  ;; → 42
       )"#;
     assert_eq!(run(wat, "hit", &[]), 77, "matching cmpxchg swaps");
     assert_eq!(
@@ -135,8 +135,8 @@ fn atomic_offset_folding() {
       (module
         (memory 1 1 shared)
         (func (export "f") (result i32)
-          (i32.atomic.store offset=16 (i32.const 0) (i32.const 555))  ;; writes mem[16]
-          (i32.atomic.load (i32.const 16)))                          ;; reads mem[16] directly
+          (i32.atomic.store offset=16 (i32.const 16384) (i32.const 555))  ;; writes mem[16400]
+          (i32.atomic.load (i32.const 16400)))                          ;; reads mem[16400] directly
       )"#;
     assert_eq!(run(wat, "f", &[]), 555);
 }
@@ -150,11 +150,11 @@ fn wait_not_equal_and_notify_zero() {
         (memory 1 1 shared)
         ;; mem[0]=1; wait expecting 0 → value differs → status 1 (no block)
         (func (export "wait_neq") (result i32)
-          (i32.atomic.store (i32.const 0) (i32.const 1))
-          (memory.atomic.wait32 (i32.const 0) (i32.const 0) (i64.const -1)))   ;; → 1
+          (i32.atomic.store (i32.const 16384) (i32.const 1))
+          (memory.atomic.wait32 (i32.const 16384) (i32.const 0) (i64.const -1)))   ;; → 1
         ;; notify 0 waiters → 0 woken
         (func (export "notify0") (result i32)
-          (memory.atomic.notify (i32.const 0) (i32.const 10)))                ;; → 0
+          (memory.atomic.notify (i32.const 16384) (i32.const 10)))                ;; → 0
       )"#;
     assert_eq!(
         run(wat, "wait_neq", &[]),
@@ -172,11 +172,11 @@ fn fence_is_transparent() {
       (module
         (memory 1 1 shared)
         (func (export "f") (result i32)
-          (i32.atomic.store (i32.const 0) (i32.const 7))
+          (i32.atomic.store (i32.const 16384) (i32.const 7))
           (atomic.fence)
-          (drop (i32.atomic.rmw.add (i32.const 0) (i32.const 35)))
+          (drop (i32.atomic.rmw.add (i32.const 16384) (i32.const 35)))
           (atomic.fence)
-          (i32.atomic.load (i32.const 0))))"#;
+          (i32.atomic.load (i32.const 16384))))"#;
     assert_eq!(run(wat, "f", &[]), 42);
 }
 
@@ -194,15 +194,15 @@ fn narrow_load_extracts_subword() {
         format!(
             r#"(module (memory 1 1 shared)
                  (func (export "f") (result i32)
-                   (i32.store (i32.const 4) (i32.const 0xAABBCCDD))
+                   (i32.store (i32.const 16388) (i32.const 0xAABBCCDD))
                    ({op} (i32.const {addr}))))"#
         )
     };
-    assert_eq!(run(&prog("i32.atomic.load8_u", 4), "f", &[]), 0xDD);
-    assert_eq!(run(&prog("i32.atomic.load8_u", 5), "f", &[]), 0xCC);
-    assert_eq!(run(&prog("i32.atomic.load8_u", 7), "f", &[]), 0xAA); // shift 24
-    assert_eq!(run(&prog("i32.atomic.load16_u", 4), "f", &[]), 0xCCDD);
-    assert_eq!(run(&prog("i32.atomic.load16_u", 6), "f", &[]), 0xAABB); // shift 16
+    assert_eq!(run(&prog("i32.atomic.load8_u", 16388), "f", &[]), 0xDD);
+    assert_eq!(run(&prog("i32.atomic.load8_u", 16389), "f", &[]), 0xCC);
+    assert_eq!(run(&prog("i32.atomic.load8_u", 16391), "f", &[]), 0xAA); // shift 24
+    assert_eq!(run(&prog("i32.atomic.load16_u", 16388), "f", &[]), 0xCCDD);
+    assert_eq!(run(&prog("i32.atomic.load16_u", 16390), "f", &[]), 0xAABB); // shift 16
 }
 
 /// A narrow store splices the sub-word in **without disturbing neighbouring bytes** in the word.
@@ -212,17 +212,17 @@ fn narrow_store_preserves_neighbors() {
     let wat = r#"
       (module (memory 1 1 shared)
         (func (export "f") (result i32)
-          (i32.store (i32.const 0) (i32.const 0xAABBCCDD))
-          (i32.atomic.store8 (i32.const 1) (i32.const 0x11))
-          (i32.atomic.load (i32.const 0))))"#;
+          (i32.store (i32.const 16384) (i32.const 0xAABBCCDD))
+          (i32.atomic.store8 (i32.const 16385) (i32.const 0x11))
+          (i32.atomic.load (i32.const 16384))))"#;
     assert_eq!(run(wat, "f", &[]) as u32, 0xAABB11DD);
     // store16 at addr 2 → bytes [DD,CC,99,88] = 0x8899CCDD.
     let wat2 = r#"
       (module (memory 1 1 shared)
         (func (export "f") (result i32)
-          (i32.store (i32.const 0) (i32.const 0xAABBCCDD))
-          (i32.atomic.store16 (i32.const 2) (i32.const 0x8899))
-          (i32.atomic.load (i32.const 0))))"#;
+          (i32.store (i32.const 16384) (i32.const 0xAABBCCDD))
+          (i32.atomic.store16 (i32.const 16386) (i32.const 0x8899))
+          (i32.atomic.load (i32.const 16384))))"#;
     assert_eq!(run(wat2, "f", &[]) as u32, 0x8899CCDD);
 }
 
@@ -233,15 +233,15 @@ fn narrow_rmw8_add_old_value_and_wrap() {
     let wat = r#"
       (module (memory 1 1 shared)
         (func (export "f") (result i32)
-          (i32.store (i32.const 0) (i32.const 0xAABBF0DD))
-          (i32.atomic.rmw8.add_u (i32.const 1) (i32.const 0x25))))"#;
+          (i32.store (i32.const 16384) (i32.const 0xAABBF0DD))
+          (i32.atomic.rmw8.add_u (i32.const 16385) (i32.const 0x25))))"#;
     assert_eq!(run(wat, "f", &[]), 0xF0, "rmw returns the old sub-word");
     let wat_mem = r#"
       (module (memory 1 1 shared)
         (func (export "f") (result i32)
-          (i32.store (i32.const 0) (i32.const 0xAABBF0DD))
-          (drop (i32.atomic.rmw8.add_u (i32.const 1) (i32.const 0x25)))
-          (i32.atomic.load (i32.const 0))))"#;
+          (i32.store (i32.const 16384) (i32.const 0xAABBF0DD))
+          (drop (i32.atomic.rmw8.add_u (i32.const 16385) (i32.const 0x25)))
+          (i32.atomic.load (i32.const 16384))))"#;
     assert_eq!(
         run(wat_mem, "f", &[]) as u32,
         0xAABB15DD,
@@ -256,9 +256,9 @@ fn narrow_rmw16_all_ops() {
         format!(
             r#"(module (memory 1 1 shared)
                  (func (export "f") (result i32)
-                   (i32.store (i32.const 0) (i32.const 0xAABBCCDD))
-                   (drop ({op} (i32.const 0) (i32.const {arg})))
-                   (i32.atomic.load (i32.const 0))))"#
+                   (i32.store (i32.const 16384) (i32.const 0xAABBCCDD))
+                   (drop ({op} (i32.const 16384) (i32.const {arg})))
+                   (i32.atomic.load (i32.const 16384))))"#
         )
     };
     // halfword at addr 0 = 0xCCDD; high half (0xAABB) must survive every op.
@@ -292,23 +292,23 @@ fn narrow_cmpxchg8_success_and_failure() {
     let ok = r#"
       (module (memory 1 1 shared)
         (func (export "f") (result i32)
-          (i32.store (i32.const 0) (i32.const 0x42))
-          (i32.atomic.rmw8.cmpxchg_u (i32.const 0) (i32.const 0x42) (i32.const 0x99))))"#;
+          (i32.store (i32.const 16384) (i32.const 0x42))
+          (i32.atomic.rmw8.cmpxchg_u (i32.const 16384) (i32.const 0x42) (i32.const 0x99))))"#;
     assert_eq!(run(ok, "f", &[]), 0x42, "match returns old");
     let ok_mem = r#"
       (module (memory 1 1 shared)
         (func (export "f") (result i32)
-          (i32.store (i32.const 0) (i32.const 0x42))
-          (drop (i32.atomic.rmw8.cmpxchg_u (i32.const 0) (i32.const 0x42) (i32.const 0x99)))
-          (i32.atomic.load8_u (i32.const 0))))"#;
+          (i32.store (i32.const 16384) (i32.const 0x42))
+          (drop (i32.atomic.rmw8.cmpxchg_u (i32.const 16384) (i32.const 0x42) (i32.const 0x99)))
+          (i32.atomic.load8_u (i32.const 16384))))"#;
     assert_eq!(run(ok_mem, "f", &[]), 0x99, "match swaps");
     // failure: byte 0x42, expect 0x00 → no store, return current 0x42.
     let fail_mem = r#"
       (module (memory 1 1 shared)
         (func (export "f") (result i32)
-          (i32.store (i32.const 0) (i32.const 0x42))
-          (drop (i32.atomic.rmw8.cmpxchg_u (i32.const 0) (i32.const 0x00) (i32.const 0x99)))
-          (i32.atomic.load8_u (i32.const 0))))"#;
+          (i32.store (i32.const 16384) (i32.const 0x42))
+          (drop (i32.atomic.rmw8.cmpxchg_u (i32.const 16384) (i32.const 0x00) (i32.const 0x99)))
+          (i32.atomic.load8_u (i32.const 16384))))"#;
     assert_eq!(run(fail_mem, "f", &[]), 0x42, "mismatch leaves memory");
 }
 
@@ -320,15 +320,15 @@ fn narrow_i64_forms() {
     let load8 = r#"
       (module (memory 1 1 shared)
         (func (export "f") (result i64)
-          (i32.store (i32.const 0) (i32.const 0xAABBCCDD))
-          (i64.atomic.load8_u (i32.const 3))))"#; // byte 3 = 0xAA
+          (i32.store (i32.const 16384) (i32.const 0xAABBCCDD))
+          (i64.atomic.load8_u (i32.const 16387))))"#; // byte 3 = 0xAA
     assert_eq!(run(load8, "f", &[]), 0xAA);
     // i64.atomic.rmw32.add_u: word-sized add, old value zero-extended.
     let rmw32 = r#"
       (module (memory 1 1 shared)
         (func (export "f") (result i64)
-          (i32.store (i32.const 0) (i32.const 0x10000000))
-          (i64.atomic.rmw32.add_u (i32.const 0) (i64.const 0x00000005))))"#;
+          (i32.store (i32.const 16384) (i32.const 0x10000000))
+          (i64.atomic.rmw32.add_u (i32.const 16384) (i64.const 0x00000005))))"#;
     assert_eq!(
         run(rmw32, "f", &[]),
         0x10000000,
@@ -337,8 +337,8 @@ fn narrow_i64_forms() {
     let rmw32_mem = r#"
       (module (memory 1 1 shared)
         (func (export "f") (result i64)
-          (i32.store (i32.const 0) (i32.const 0x10000000))
-          (drop (i64.atomic.rmw32.add_u (i32.const 0) (i64.const 0x00000005)))
-          (i64.atomic.load32_u (i32.const 0))))"#;
+          (i32.store (i32.const 16384) (i32.const 0x10000000))
+          (drop (i64.atomic.rmw32.add_u (i32.const 16384) (i64.const 0x00000005)))
+          (i64.atomic.load32_u (i32.const 16384))))"#;
     assert_eq!(run(rmw32_mem, "f", &[]), 0x10000005);
 }

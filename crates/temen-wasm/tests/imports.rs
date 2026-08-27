@@ -312,25 +312,25 @@ fn spawn_alongside_capability_import() {
   (import "wasi" "thread-spawn" (func $spawn (param i32) (result i32)))
   (memory 1 1 shared)
   (func (export "wasi_thread_start") (param $tid i32) (param $start_arg i32)
-    ;; sum (i64 at mem[8]) += work(start_arg)
-    (drop (i64.atomic.rmw.add (i32.const 8)
+    ;; sum (i64 at mem[16392]) += work(start_arg)
+    (drop (i64.atomic.rmw.add (i32.const 16392)
             (call $work (i64.extend_i32_u (local.get $start_arg)))))
-    (drop (i32.atomic.rmw.sub (i32.const 4) (i32.const 1)))   ;; remaining -= 1
-    (drop (memory.atomic.notify (i32.const 4) (i32.const -1))))
+    (drop (i32.atomic.rmw.sub (i32.const 16388) (i32.const 1)))   ;; remaining -= 1
+    (drop (memory.atomic.notify (i32.const 16388) (i32.const -1))))
   (func (export "run") (param $n i32) (result i64)
     (local $i i32) (local $r i32)
-    (i32.atomic.store (i32.const 4) (local.get $n))           ;; remaining = n
+    (i32.atomic.store (i32.const 16388) (local.get $n))           ;; remaining = n
     (block $spawned (loop $sp
       (br_if $spawned (i32.ge_u (local.get $i) (local.get $n)))
       (drop (call $spawn (local.get $i)))                     ;; start_arg = i
       (local.set $i (i32.add (local.get $i) (i32.const 1)))
       (br $sp)))
     (block $finished (loop $wait
-      (local.set $r (i32.atomic.load (i32.const 4)))
+      (local.set $r (i32.atomic.load (i32.const 16388)))
       (br_if $finished (i32.eqz (local.get $r)))
-      (drop (memory.atomic.wait32 (i32.const 4) (local.get $r) (i64.const 2000000000)))
+      (drop (memory.atomic.wait32 (i32.const 16388) (local.get $r) (i64.const 2000000000)))
       (br $wait)))
-    (i64.atomic.load (i32.const 8))))
+    (i64.atomic.load (i32.const 16392))))
 "#;
     let n = 6i64;
     let got = run_import(wat, "run", bind_blocking, &[Value::I32(n as i32)]);
@@ -346,7 +346,7 @@ fn import_memory_is_supported() {
     let _serial = serial();
     let wasm = wat::parse_str(
         r#"(module (import "env" "memory" (memory 1)) (func (export "f") (result i32)
-             (i32.store (i32.const 0) (i32.const 42)) (i32.load (i32.const 0))))"#,
+             (i32.store (i32.const 16384) (i32.const 42)) (i32.load (i32.const 16384))))"#,
     )
     .expect("assemble wat");
     let t = temen_wasm::transpile(&wasm).expect("imported memory should transpile");

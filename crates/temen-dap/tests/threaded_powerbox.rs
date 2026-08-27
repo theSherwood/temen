@@ -15,7 +15,7 @@ use support::{req, response};
 const THREADED_IO: &str = r#"memory 16
 import 0 "write" (i64, i64) -> (i64)
 import 1 "exit" (i32) -> ()
-data ro 0 "hi\n"
+data ro 16384 "hi\n"
 export 0 func "_start" 0
 
 func () -> () {
@@ -24,7 +24,7 @@ block 0 () {
   va = i64.const 0
   vh = thread.spawn 1 vsp va
   vj = thread.join vh
-  vptr = i64.const 0
+  vptr = i64.const 16384
   vlen = i64.const 3
   vw = call.import 0 (vptr, vlen)
   vcode = i32.const 7
@@ -132,14 +132,15 @@ fn threaded_powerbox_survives_seek() {
 }
 
 /// A spawn-then-work threaded guest with a §6 debug section, so a source-line step lands on
-/// successive lines. The root spawns a worker, both bump `mem[0]`, the root joins and returns it.
+/// successive lines. The root spawns a worker, both bump `mem[16384]` (above the #1094 NULL guard),
+/// the root joins and returns it.
 const SPAWN_STEP: &str = r#"memory 16
 func () -> (i64) {
 block 0 () {
   vsp = i64.const 0
   va = i64.const 0
   vh = thread.spawn 1 vsp va
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vc = i64.load vaddr
   vn = i64.add vc va
   vj = thread.join vh

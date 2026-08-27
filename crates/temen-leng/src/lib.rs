@@ -360,15 +360,12 @@ fn synth_start_unit(entry: &str) -> Result<temen_ir::LinkUnit, LengError> {
         .map_err(|e| LengError::Malformed(format!("synth `_start` unit: {e:?}")))?;
     Ok(temen_ir::LinkUnit {
         module,
-        // #964/#1091 guarded layout: the `__null_guard` marker (aliasing `_start`'s funcidx 0)
-        // declares that `[0, POWERBOX_NULL_GUARD)` is empty — a marker-aware host seeds it `Unmapped`
-        // so a NULL deref traps. Leng bases its globals + scratch one guard up (`translate::globals_base`,
-        // `seed_powerbox_heap`) to keep that region clear. Semantics, not observability; `temen-strip`
-        // keeps it like `_start`.
-        exports: vec![
-            ("_start".to_string(), 0),
-            (temen_ir::NULL_GUARD_EXPORT.to_string(), 0),
-        ],
+        // #964/#1094 guarded layout: `[0, POWERBOX_NULL_GUARD)` is kept empty and a host seeds it
+        // `Unmapped` unconditionally (the one canonical layout), so a NULL deref traps. Leng bases its
+        // globals + scratch one guard up (`translate::globals_base`, `seed_powerbox_heap`) to keep that
+        // region clear. The `__null_guard` marker export is retired (#1094) — the guard no longer needs
+        // an opt-in signal.
+        exports: vec![("_start".to_string(), 0)],
         ..Default::default()
     })
 }

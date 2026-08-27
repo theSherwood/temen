@@ -4,9 +4,9 @@
 #define O_TRUNC  01000
 #define O_APPEND 02000
 
-/* #1059 NULL guard: chibicc lays the powerbox args buffer one 16 KiB guard up
- * (`temen_ir::module_args_base` == guard + 128), so a `__null_guard`-marked command reads its argv
- * at `carve + guard + 128`. Every command we spawn is chibicc-compiled (guarded), so pack there. */
+/* #1059/#1094 NULL guard: chibicc lays the powerbox args buffer one 16 KiB guard up
+ * (`temen_ir::module_args_base` == guard + 128), so a command reads its argv at `carve + guard + 128`
+ * (the unconditional guarded layout). Every command we spawn is chibicc-compiled, so pack there. */
 #define POWERBOX_NULL_GUARD 16384
 static char cwd[256];
 /* Current stdio for the command in flight: `out_fd` is 1 unless a `>`/`>>` redirect is active,

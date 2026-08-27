@@ -105,7 +105,7 @@ block 1 (v2: i64) {
 }
 func (i64, i64) -> (i64) {
 block 0 (v0: i64, v1: i64) {
-  v2 = i64.const 0
+  v2 = i64.const 16384
   v3 = i32.const 0
   v4 = i64.const -1
   v5 = i32.atomic.wait v2 v3 v4

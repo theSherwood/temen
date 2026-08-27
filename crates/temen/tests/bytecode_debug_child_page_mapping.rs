@@ -26,19 +26,19 @@ block 0 (v0: i32) {
   q0v2 = i64.const -4294967280
   q0v3 = i64.const 4294967295
   q0v4 = i64.const 0
-  q0a0 = i64.const 1152
+  q0a0 = i64.const 17536
   i64.store q0a0 q0v0
-  q0a1 = i64.const 1160
+  q0a1 = i64.const 17544
   i64.store q0a1 q0v1
-  q0a2 = i64.const 1168
+  q0a2 = i64.const 17552
   i64.store q0a2 q0v2
-  q0a3 = i64.const 1176
+  q0a3 = i64.const 17560
   i64.store q0a3 q0v3
-  q0a4 = i64.const 1184
+  q0a4 = i64.const 17568
   i64.store q0a4 q0v4
-  q0a5 = i64.const 1192
+  q0a5 = i64.const 17576
   i64.store q0a5 q0v4
-  q0a6 = i64.const 1200
+  q0a6 = i64.const 17584
   i64.store q0a6 q0v4
   vch = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   vr = call.cap 6 1 (i32) -> (i64) v0 (vch)

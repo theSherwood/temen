@@ -22,10 +22,11 @@ use temen_interp::{run_with_host, Host, Value};
 use temen_text::parse_module;
 
 // The §3.6 slice-2 serving domain, verbatim from `temen-interp/tests/bytecode_svc.rs`: offer "counter"
-// op 0 = func 1 `bump(x) -> old + x` over the LIVE value at mem[0]; `main` (func 0) seeds mem[0] = 7,
-// `svc.poll`s (`call.cap CAP_SELF(=u32::MAX) 9`) draining the embedder-seeded queue, and returns
-// `served * 1000 + mem[0]`. Pure handler, no park-capable seam — so it compiles to the native serve
-// loop the debug engine drives op-by-op (stepping *into* each handler body).
+// op 0 = func 1 `bump(x) -> old + x` over the LIVE value at mem[16384] (above the #1094 NULL guard);
+// `main` (func 0) seeds mem[16384] = 7, `svc.poll`s (`call.cap CAP_SELF(=u32::MAX) 9`) draining the
+// embedder-seeded queue, and returns `served * 1000 + mem[16384]`. Pure handler, no park-capable seam —
+// so it compiles to the native serve loop the debug engine drives op-by-op (stepping *into* each handler
+// body).
 const SERVER: &str = r#"
 memory 16
 type 0 func (i64) -> (i64)
@@ -34,7 +35,7 @@ export 0 interface "counter" 1 { bump: 1 }
 
 func () -> (i64) {
 block 0 () {
-  va = i64.const 0
+  va = i64.const 16384
   vseed = i64.const 7
   i64.store va vseed
   vz = i32.const 0
@@ -49,7 +50,7 @@ block 0 () {
 
 func (i64) -> (i64) {
 block 0 (vx: i64) {
-  va = i64.const 0
+  va = i64.const 16384
   vold = i64.load va
   vnew = i64.add vold vx
   i64.store va vnew
@@ -59,7 +60,7 @@ block 0 (vx: i64) {
 "#;
 
 /// Three bumps — enough to exercise multiple handler activations and every between-handler boundary in
-/// the drain. Chosen so each handler leaves a distinct live counter at mem[0]: 7 → 12 → 42 → 142.
+/// the drain. Chosen so each handler leaves a distinct live counter at mem[16384]: 7 → 12 → 42 → 142.
 fn dispatches() -> Vec<(u32, u32, Vec<i64>)> {
     vec![(0, 0, vec![5]), (0, 0, vec![30]), (0, 0, vec![100])]
 }
@@ -91,7 +92,7 @@ fn session() -> DebugRun {
 }
 
 /// The expected result, pinned against the tree-walker oracle over the *same* seeded queue:
-/// `served(3) * 1000 + mem[0](142) = 3142`.
+/// `served(3) * 1000 + mem[16384](142) = 3142`.
 fn oracle_result() -> Vec<Value> {
     let m = module();
     let mut host = seeded_host(&m);
@@ -100,8 +101,8 @@ fn oracle_result() -> Vec<Value> {
 }
 
 /// A per-op observation: the op clock, the call-stack `IrPc`s (which enter the handler body when the
-/// serve loop admits a dispatch — so a mid-handler stop is visible here), and the first 8 window bytes
-/// holding the live counter mem[0] that each handler mutates.
+/// serve loop admits a dispatch — so a mid-handler stop is visible here), and the 8 window bytes at
+/// 16384 holding the live counter mem[16384] (above the #1094 NULL guard) that each handler mutates.
 fn obs(run: &DebugRun) -> (u64, String, Vec<u8>) {
     let clock = run.op_clock();
     let mut frames = Vec::new();
@@ -110,7 +111,7 @@ fn obs(run: &DebugRun) -> (u64, String, Vec<u8>) {
             frames.push(format!("f{}b{}i{}", pc.func, pc.block, pc.inst));
         }
     }
-    let win = run.read_window(0, 8).unwrap_or_default();
+    let win = run.read_window(16384, 8).unwrap_or_default();
     (clock, frames.join(","), win)
 }
 
@@ -185,7 +186,7 @@ fn serve_loop_checkpoint_snapshot_restore_round_trips() {
 
 /// Pin the headline serve semantics so the round-trip above is anchored to concrete values, not just
 /// internal consistency: three bumps over the live counter starting at 7 give cells 7/12/42 and a final
-/// `served(3)*1000 + mem[0](142) = 3142`.
+/// `served(3)*1000 + mem[16384](142) = 3142`.
 #[test]
 fn serve_run_result_is_pinned() {
     assert_eq!(oracle_result(), vec![Value::I64(3142)]);
@@ -203,7 +204,7 @@ fn sched_session() -> ScheduledDebugRun {
 }
 
 fn sched_obs(run: &ScheduledDebugRun) -> (u64, Vec<u8>) {
-    (run.turn(), run.read_window(0, 8).unwrap_or_default())
+    (run.turn(), run.read_window(16384, 8).unwrap_or_default())
 }
 
 #[test]

@@ -10,9 +10,10 @@ use temen_interp::bytecode::{SchedBreak, SchedStop, ScheduledDebugRun};
 use temen_interp::{bytecode, run, Inspector, IrPc, Stop, Trap, Value, WatchKind};
 use temen_text::parse_module;
 
-// Two threads each do a non-atomic load/add/store on mem[0]. func 0 is the root (spawns + joins);
-// func 1 is the worker: block0 inst0 = `vaddr = const 0`; inst1 = `vc = load vaddr`; inst2 = `vn =
-// add vc varg`; inst3 = `store vaddr vn`; inst4 = `vz = const 0`. Same guest as `debug_threads.rs`.
+// Two threads each do a non-atomic load/add/store on mem[16384] (above the #1094 NULL guard). func 0
+// is the root (spawns + joins); func 1 is the worker: block0 inst0 = `vaddr = const 16384`; inst1 =
+// `vc = load vaddr`; inst2 = `vn = add vc varg`; inst3 = `store vaddr vn`; inst4 = `vz = const 0`.
+// Same guest as `debug_threads.rs`.
 const RACY_COUNTER: &str = r#"
 memory 16
 func () -> (i64) {
@@ -23,14 +24,14 @@ block 0 () {
   vh1 = thread.spawn 1 vsp va
   vj0 = thread.join vh0
   vj1 = thread.join vh1
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vr = i64.load vaddr
   return vr
   }
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vc = i64.load vaddr
   vn = i64.add vc varg
   i64.store vaddr vn
@@ -53,14 +54,14 @@ block 0 () {
   vh1 = thread.spawn 1 vsp va
   vj0 = thread.join vh0
   vj1 = thread.join vh1
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vr = i64.atomic.load vaddr
   return vr
   }
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vrmw = i64.atomic.rmw.add vaddr varg
   vz = i64.const 0
   return vz
@@ -246,10 +247,11 @@ fn module_spawns_threads_detects_the_multithreaded_case() {
 fn bytecode_cross_thread_write_watchpoint_fires_per_worker() {
     let m = parse_module(RACY_COUNTER).unwrap();
     let mut sd = ScheduledDebugRun::new(&m, 0, &[]).unwrap();
-    sd.set_watchpoints(vec![(0, 8, WatchKind::Write)]);
+    sd.set_watchpoints(vec![(16384, 8, WatchKind::Write)]);
     let mut fuel = 50_000_000u64;
 
-    // The worker's `i64.store vaddr vn` (func 1, block 0, inst 3) writes [0, 8).
+    // The worker's `i64.store vaddr vn` (func 1, block 0, inst 3) writes [16384, 16392) (above the
+    // #1094 NULL guard).
     let store = IrPc {
         module: 0,
         func: 1,
@@ -264,7 +266,7 @@ fn bytecode_cross_thread_write_watchpoint_fires_per_worker() {
                 assert_eq!(
                     reason,
                     SchedBreak::Watchpoint {
-                        addr: 0,
+                        addr: 16384,
                         write: true
                     },
                     "reports the confined address + write"
@@ -296,14 +298,14 @@ block 0 () {
   one = i64.const 1
   h0 = thread.spawn 1 sp one
   j0 = thread.join h0
-  addr = i64.const 0
+  addr = i64.const 16384
   r = i64.load addr
   return r
   }
 }
 func (i64, i64) -> (i64) {
 block 0 (sp: i64, inc: i64) {
-  addr = i64.const 0
+  addr = i64.const 16384
   cur = i64.load addr
   nxt = call 2(cur, inc)
   i64.store addr nxt
@@ -448,23 +450,23 @@ fn bytecode_scheduled_tick_replays_deterministically() {
     assert_eq!(b.frame_pc(0), pc, "same pc");
 }
 
-// A futex handoff (from `bytecode_threads.rs`): the root seeds mem[8], spawns a worker, sets a flag +
-// `atomic.notify`s mem[0], joins; the worker `atomic.wait`s on mem[0] then reads mem[8] → 987654. The
-// worker parks on the wait until the root's notify wakes it — exercising `memory.wait`/`notify` under
-// the debug scheduler.
+// A futex handoff (from `bytecode_threads.rs`): the root seeds mem[16392], spawns a worker, sets a
+// flag + `atomic.notify`s mem[16384], joins; the worker `atomic.wait`s on mem[16384] then reads
+// mem[16392] → 987654 (all above the #1094 NULL guard). The worker parks on the wait until the root's
+// notify wakes it — exercising `memory.wait`/`notify` under the debug scheduler.
 const FUTEX_HANDOFF: &str = r#"
 memory 16
 func () -> (i64) {
 block 0 () {
-  v0 = i64.const 8
+  v0 = i64.const 16392
   v1 = i64.const 987654
   i64.atomic.store v0 v1
   v2 = i64.const 0
   v3 = thread.spawn 1 v2 v2
-  v4 = i64.const 0
+  v4 = i64.const 16384
   v5 = i32.const 1
   i32.atomic.store v4 v5
-  v6 = i64.const 0
+  v6 = i64.const 16384
   v7 = i32.const 1
   v8 = atomic.notify v6 v7
   v9 = thread.join v3
@@ -473,11 +475,11 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, v0: i64) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   v2 = i32.const 0
   v3 = i64.const 1000000000
   v4 = i32.atomic.wait v1 v2 v3
-  v5 = i64.const 8
+  v5 = i64.const 16392
   v6 = i64.atomic.load v5
   return v6
   }
@@ -540,10 +542,11 @@ fn bytecode_breakpoint_after_a_wait_fires_once_woken() {
 }
 
 // **Fibers composed with threads** (DEBUGGING.md slice 13): each spawned worker runs a §12 fiber. func 0
-// is the root (spawns + joins two workers, reads mem[0]); func 1 is the worker: it `cont.new`s the fiber
-// (func 2), `cont.resume`s it twice (the fiber suspends with 11, then returns 25), and `atomic.rmw.add`s
-// the fiber's return value (25) into mem[0]. func 2 is the fiber (same body as SUSPEND_ROUNDTRIP's). Two
-// workers each add 25 atomically → mem[0] = 50 on every schedule (determinate: the store is atomic).
+// is the root (spawns + joins two workers, reads mem[16384]); func 1 is the worker: it `cont.new`s the
+// fiber (func 2), `cont.resume`s it twice (the fiber suspends with 11, then returns 25), and
+// `atomic.rmw.add`s the fiber's return value (25) into mem[16384] (above the #1094 NULL guard). func 2
+// is the fiber (same body as SUSPEND_ROUNDTRIP's). Two workers each add 25 atomically → mem[16384] = 50
+// on every schedule (determinate: the store is atomic).
 const FIBER_WORKERS: &str = r#"
 memory 16
 func () -> (i64) {
@@ -554,7 +557,7 @@ block 0 () {
   vh1 = thread.spawn 1 vsp va
   vj0 = thread.join vh0
   vj1 = thread.join vh1
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vr = i64.atomic.load vaddr
   return vr
   }
@@ -568,7 +571,7 @@ block 0 (vsp: i64, varg: i64) {
   vs1, vr1 = cont.resume vk vc1
   vc2 = i64.const 20
   vs2, vr2 = cont.resume vk vc2
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vrmw = i64.atomic.rmw.add vaddr vr2
   vz = i64.const 0
   return vz

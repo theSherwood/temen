@@ -16,7 +16,7 @@ block 0 (vin: i32, vout: i32) {
   br 1(vin, vout)
 }
 block 1 (vin1: i32, vout1: i32) {
-  vptr = i64.const 1024
+  vptr = i64.const 17408
   vlen = i64.const 64
   vn = call.cap 0 0 (i64, i64) -> (i64) vin1 (vptr, vlen)
   vw = call.cap 0 1 (i64, i64) -> (i64) vout1 (vptr, vn)
@@ -72,7 +72,7 @@ fn stdin_read_parks_and_resumes() {
 const READ_ONCE: &str = r#"memory 16
 func (i32) -> (i64) {
 block 0 (vin: i32) {
-  vptr = i64.const 1024
+  vptr = i64.const 17408
   vlen = i64.const 64
   vn = call.cap 0 0 (i64, i64) -> (i64) vin (vptr, vlen)
   return vn

@@ -214,12 +214,18 @@ fn seed_heap_seeds_the_heap_words() {
 memory 15
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v1 = i64.const 32
+  v1 = i64.const 16416
   v2 = i64.load v1
   return v2
   }
 }
 ";
+    // #1094: the heap BRK word lives in the guard's scratch page at
+    // POWERBOX_NULL_GUARD + POWERBOX_HEAP_BRK = 16384 + 32 = 16416.
+    assert_eq!(
+        temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_HEAP_BRK,
+        16416
+    );
     let m = temen_text::parse_module(src).expect("parse");
     let module = synth_manifest_start(m, 0, true).expect("synth");
     let size_log2 = module.memory.expect("memory grown").size_log2;

@@ -60,7 +60,8 @@ fn sweep(src: &str, want: i64, seeds: u64) {
 /// **Mutual exclusion.** 8 vCPUs each take a `cmpxchg` spinlock, increment a *non-atomic* counter
 /// 100×, and release — final = 800 **iff** the lock truly serializes the critical section. A broken
 /// lock (or a scheduler that double-runs / drops a vCPU) races the non-atomic read-modify-write and
-/// loses updates. Layout: `mem[0]` i32 lock, `mem[8]` i64 counter, `mem[16+4i]` i32 handle of `i`.
+/// loses updates. Layout (above the #1094 NULL guard): `mem[16384]` i32 lock, `mem[16392]` i64 counter,
+/// `mem[16400+4i]` i32 handle of `i`.
 const SPINLOCK: &str = r#"
 memory 16
 func () -> (i64) {
@@ -78,7 +79,7 @@ block 2 (v4: i64) {
   v6 = thread.spawn 1 v5 v5
   v7 = i64.const 4
   v8 = i64.mul v4 v7
-  v9 = i64.const 16
+  v9 = i64.const 16400
   v10 = i64.add v9 v8
   i32.store v10 v6
   v11 = i64.const 1
@@ -97,7 +98,7 @@ block 4 (v14: i64) {
 block 5 (v17: i64) {
   v18 = i64.const 4
   v19 = i64.mul v17 v18
-  v20 = i64.const 16
+  v20 = i64.const 16400
   v21 = i64.add v20 v19
   v22 = i32.load v21
   v23 = thread.join v22
@@ -106,7 +107,7 @@ block 5 (v17: i64) {
   br 4(v25)
 }
 block 6 () {
-  v26 = i64.const 8
+  v26 = i64.const 16392
   v27 = i64.load v26
   return v27
   }
@@ -121,7 +122,7 @@ block 1 (v1: i64) {
   br_if v3 4() 2(v1)
 }
 block 2 (v4: i64) {
-  v5 = i64.const 0
+  v5 = i64.const 16384
   v6 = i32.const 0
   v7 = i32.const 1
   v8 = i32.atomic.cmpxchg v5 v6 v7
@@ -130,12 +131,12 @@ block 2 (v4: i64) {
   br_if v10 3(v4) 2(v4)
 }
 block 3 (v11: i64) {
-  v12 = i64.const 8
+  v12 = i64.const 16392
   v13 = i64.load v12
   v14 = i64.const 1
   v15 = i64.add v13 v14
   i64.store v12 v15
-  v16 = i64.const 0
+  v16 = i64.const 16384
   v17 = i32.const 0
   i32.atomic.store v16 v17
   v18 = i64.const -1
@@ -168,7 +169,7 @@ block 2 (v4: i64) {
   v6 = thread.spawn 1 v5 v5
   v7 = i64.const 4
   v8 = i64.mul v4 v7
-  v9 = i64.const 16
+  v9 = i64.const 16400
   v10 = i64.add v9 v8
   i32.store v10 v6
   v11 = i64.const 1
@@ -187,7 +188,7 @@ block 4 (v14: i64) {
 block 5 (v17: i64) {
   v18 = i64.const 4
   v19 = i64.mul v17 v18
-  v20 = i64.const 16
+  v20 = i64.const 16400
   v21 = i64.add v20 v19
   v22 = i32.load v21
   v23 = thread.join v22
@@ -196,7 +197,7 @@ block 5 (v17: i64) {
   br 4(v25)
 }
 block 6 () {
-  v26 = i64.const 0
+  v26 = i64.const 16384
   v27 = i64.atomic.load v26
   return v27
   }
@@ -211,7 +212,7 @@ block 1 (v1: i64) {
   br_if v3 3() 2(v1)
 }
 block 2 (v4: i64) {
-  v5 = i64.const 0
+  v5 = i64.const 16384
   v6 = i64.const 1
   v7 = i64.atomic.rmw.add v5 v6
   v8 = i64.const -1
@@ -225,8 +226,8 @@ block 3 () {
 }
 "#;
 
-/// **Futex handoff.** Producer writes a payload to `mem[8]`, spawns a consumer that `atomic.wait`s on
-/// the flag at `mem[0]`, then sets the flag (release) and notifies. The consumer returns the payload
+/// **Futex handoff.** Producer writes a payload to `mem[16392]`, spawns a consumer that `atomic.wait`s on
+/// the flag at `mem[16384]` (both above the #1094 NULL guard), then sets the flag (release) and notifies. The consumer returns the payload
 /// it reads — which is the written value on *every* interleaving: if it parked, the notify wakes it
 /// after the write; if it checked late, `wait` returns not-equal and it reads the (already-written)
 /// payload. Exercises wait/notify + the explorer's logical-clock timeout path.
@@ -234,15 +235,15 @@ const FUTEX_HANDOFF: &str = r#"
 memory 16
 func () -> (i64) {
 block 0 () {
-  v0 = i64.const 8
+  v0 = i64.const 16392
   v1 = i64.const 987654
   i64.atomic.store v0 v1
   v2 = i64.const 0
   v3 = thread.spawn 1 v2 v2
-  v4 = i64.const 0
+  v4 = i64.const 16384
   v5 = i32.const 1
   i32.atomic.store v4 v5
-  v6 = i64.const 0
+  v6 = i64.const 16384
   v7 = i32.const 1
   v8 = atomic.notify v6 v7
   v9 = thread.join v3
@@ -251,11 +252,11 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, v0: i64) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   v2 = i32.const 0
   v3 = i64.const 1000000000
   v4 = i32.atomic.wait v1 v2 v3
-  v5 = i64.const 8
+  v5 = i64.const 16392
   v6 = i64.atomic.load v5
   return v6
   }
@@ -334,7 +335,7 @@ fn prove(src: &str, want: i64, max_schedules: u64) {
     );
 }
 
-/// Two threads each `atomic.rmw.add 1` to `mem[0]`; main returns the total. Exactly 2 on every
+/// Two threads each `atomic.rmw.add 1` to `mem[16384]` (above the #1094 NULL guard); main returns the total. Exactly 2 on every
 /// interleaving — a non-atomic RMW (or a dropped/duplicated vCPU) would let it be 1.
 const TINY_ATOMIC: &str = r#"
 memory 16
@@ -346,14 +347,14 @@ block 0 () {
   vh1 = thread.spawn 1 vsp va
   vj0 = thread.join vh0
   vj1 = thread.join vh1
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vr = i64.atomic.load vaddr
   return vr
   }
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vrmw = i64.atomic.rmw.add vaddr varg
   vz = i64.const 0
   return vz
@@ -362,7 +363,7 @@ block 0 (vsp: i64, varg: i64) {
 "#;
 
 /// **Deliberately racy** counterpart of `TINY_ATOMIC`: each thread does a *non-atomic*
-/// load / add / store on `mem[0]`. The correct serial result is 2, but the interleaving where both
+/// load / add / store on `mem[16384]` (above the #1094 NULL guard). The correct serial result is 2, but the interleaving where both
 /// threads load 0 before either stores loses an update and yields 1. Exhaustive exploration is
 /// guaranteed to find that schedule — so this is the negative test proving the checker has teeth.
 const RACY_COUNTER: &str = r#"
@@ -375,14 +376,14 @@ block 0 () {
   vh1 = thread.spawn 1 vsp va
   vj0 = thread.join vh0
   vj1 = thread.join vh1
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vr = i64.load vaddr
   return vr
   }
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vc = i64.load vaddr
   vn = i64.add vc varg
   i64.store vaddr vn

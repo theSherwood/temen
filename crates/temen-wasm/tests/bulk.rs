@@ -42,9 +42,9 @@ fn memory_init_copies_passive_segment() {
         (memory 1)
         (data "\01\02\03\04")                              ;; passive (no offset)
         (func (export "f") (result i32)
-          (memory.init 0 (i32.const 0) (i32.const 0) (i32.const 4))
+          (memory.init 0 (i32.const 16384) (i32.const 0) (i32.const 4))
           (data.drop 0)
-          (i32.load (i32.const 0))))"#;
+          (i32.load (i32.const 16384))))"#;
     assert_eq!(run(wat, "f"), 0x0403_0201, "0x04030201, little-endian");
 }
 
@@ -57,13 +57,13 @@ fn memory_init_partial_range() {
         (memory 1)
         (data "\10\20\30\40")
         (func (export "f") (result i32)
-          (memory.init 0 (i32.const 0) (i32.const 1) (i32.const 2))
-          (i32.load16_u (i32.const 0))))"#;
+          (memory.init 0 (i32.const 16384) (i32.const 1) (i32.const 2))
+          (i32.load16_u (i32.const 16384))))"#;
     assert_eq!(run(wat, "f"), 0x3020, "bytes 0x20,0x30 → 0x3020");
 }
 
 /// `memory.init` writes to a **runtime** destination address (only the source range must be constant).
-/// Here `dest` is computed (`2 + 3`), so the bytes land at `mem[5]`.
+/// Here `dest` is computed (`16386 + 3`, one #1094 guard up), so the bytes land at `mem[16389]`.
 #[test]
 fn memory_init_to_runtime_dest() {
     let wat = r#"
@@ -71,8 +71,8 @@ fn memory_init_to_runtime_dest() {
         (memory 1)
         (data "\ab")
         (func (export "f") (result i32)
-          (memory.init 0 (i32.add (i32.const 2) (i32.const 3)) (i32.const 0) (i32.const 1))
-          (i32.load8_u (i32.const 5))))"#;
+          (memory.init 0 (i32.add (i32.const 16386) (i32.const 3)) (i32.const 0) (i32.const 1))
+          (i32.load8_u (i32.const 16389))))"#;
     assert_eq!(run(wat, "f"), 0xab);
 }
 
@@ -85,22 +85,23 @@ fn memory_init_selects_the_right_segment() {
         (data "\aa")            ;; segment 0
         (data "\bb")            ;; segment 1
         (func (export "f") (result i32)
-          (memory.init 1 (i32.const 0) (i32.const 0) (i32.const 1))
-          (i32.load8_u (i32.const 0))))"#;
+          (memory.init 1 (i32.const 16384) (i32.const 0) (i32.const 1))
+          (i32.load8_u (i32.const 16384))))"#;
     assert_eq!(run(wat, "f"), 0xbb);
 }
 
 /// An **active** segment's bytes are also reachable by `memory.init` (active segments enter the index
-/// space too). The active copy places `cd` at `mem[8]` at instantiation; the init copies it to `mem[0]`.
+/// space too). The active copy places `cd` at `mem[16392]` at instantiation; the init copies it to
+/// `mem[16384]` (both one #1094 guard up).
 #[test]
 fn memory_init_from_an_active_segment() {
     let wat = r#"
       (module
         (memory 1)
-        (data (i32.const 8) "\cd")
+        (data (i32.const 16392) "\cd")
         (func (export "f") (result i32)
-          (memory.init 0 (i32.const 0) (i32.const 0) (i32.const 1))
-          (i32.load8_u (i32.const 0))))"#;
+          (memory.init 0 (i32.const 16384) (i32.const 0) (i32.const 1))
+          (i32.load8_u (i32.const 16384))))"#;
     assert_eq!(run(wat, "f"), 0xcd);
 }
 

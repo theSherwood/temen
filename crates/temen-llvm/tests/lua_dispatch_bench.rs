@@ -74,14 +74,16 @@ fn dispatch_edges() -> String {
 }
 
 /// The faithful dispatch skeleton, in textual IR. `run() -> i64` interprets the given bytecode and
-/// returns `R[A]` of its RETURN. Registers are 8-byte integer cells at `R[i] = i*8` (no tags).
+/// returns `R[A]` of its RETURN. Registers are 8-byte integer cells at `R[i] = 16384 + i*8` (no tags;
+/// the register file sits just above the #1094 NULL guard so R[0] clears the unmapped `[0,16384)`).
 fn skeleton_src() -> String {
     let edges = dispatch_edges();
     // A three-op operand decode used all over: `<reg>addr = ((instr >> shift) & 0xff) * 8`.
     let reg = |name: &str, shift: u32| {
         format!(
             "  {name}_o = i32.shr_u vinstr vsh{shift}\n  {name}_m = i32.and {name}_o vff\n  \
-             {name}_e = i64.extend_i32_u {name}_m\n  {name}_a = i64.mul {name}_e v8"
+             {name}_e = i64.extend_i32_u {name}_m\n  {name}_p = i64.mul {name}_e v8\n  \
+             {name}_b = i64.const 16384\n  {name}_a = i64.add {name}_p {name}_b"
         )
     };
     format!(

@@ -32,38 +32,39 @@ const SRC: &str = "memory 17\n\
 func (i32, i32) -> (i64) {\n\
 block 0 (vinst: i32, vstream: i32) {\n\
   vg = i32.const 103\n\
-  vnp1 = i64.const 4096\n\
+  vnp1 = i64.const 20480\n\
   i32.store8 vnp1 vg\n\
-  vgr0 = i64.const 4104\n\
-  vno = i32.const 4096\n\
+  vgr0 = i64.const 20488\n\
+  vno = i32.const 20480\n\
   i32.store vgr0 vno\n\
-  vgr1 = i64.const 4108\n\
+  vgr1 = i64.const 20492\n\
   vnl1 = i32.const 1\n\
   i32.store vgr1 vnl1\n\
-  vgr2 = i64.const 4112\n\
+  vgr2 = i64.const 20496\n\
   i32.store vgr2 vstream\n\
-  vgr3 = i64.const 4116\n\
+  vgr3 = i64.const 20500\n\
   vz32 = i32.const 0\n\
   i32.store vgr3 vz32\n\
   rrv0 = i64.const 4294967296\n\
   rrvz = i64.const 0\n\
+  rroff = i64.const 65536\n\
   rrv2 = i64.const -4294967284\n\
   rrv3 = i64.const 4294967295\n\
-  rrgp = i64.const 4104\n\
+  rrgp = i64.const 20488\n\
   rrgn = i64.const 1\n\
-  rra0 = i64.const 4160\n\
+  rra0 = i64.const 20544\n\
   i64.store rra0 rrv0\n\
-  rra1 = i64.const 4168\n\
-  i64.store rra1 rrvz\n\
-  rra2 = i64.const 4176\n\
+  rra1 = i64.const 20552\n\
+  i64.store rra1 rroff\n\
+  rra2 = i64.const 20560\n\
   i64.store rra2 rrv2\n\
-  rra3 = i64.const 4184\n\
+  rra3 = i64.const 20568\n\
   i64.store rra3 rrv3\n\
-  rra4 = i64.const 4192\n\
+  rra4 = i64.const 20576\n\
   i64.store rra4 rrvz\n\
-  rra5 = i64.const 4200\n\
+  rra5 = i64.const 20584\n\
   i64.store rra5 rrgp\n\
-  rra6 = i64.const 4208\n\
+  rra6 = i64.const 20592\n\
   i64.store rra6 rrgn\n\
   vch = call.cap 6 17 (i64) -> (i32) vinst (rra0)\n\
   vres = call.cap 6 1 (i32) -> (i64) vinst (vch)\n\

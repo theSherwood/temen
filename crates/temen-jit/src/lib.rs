@@ -473,10 +473,10 @@ pub struct FrozenNested {
 pub const DURABLE_SNAPSHOT_PAGE: usize = 4096;
 
 /// Window offset of durable shadow **context 0** (the root vCPU's region base) — an *empty* shadow-SP
-/// extent. Must match `temen-interp`'s / `fiber_rt`'s `SHADOW_BASE`; duplicated here (not under
-/// `cfg(fiber_rt)`) for the durable run-state defaults. The cross-backend artifact-equality property
-/// catches any drift.
-const DURABLE_SHADOW_BASE: u64 = 64;
+/// extent. Derived from `temen_ir::durable_abi::SHADOW_BASE` (the shared durable-runtime ABI, relocated
+/// above the #1094 NULL guard) so this never drifts from `temen-interp`/`fiber_rt`. The cross-backend
+/// artifact-equality property also catches drift.
+const DURABLE_SHADOW_BASE: u64 = temen_ir::durable_abi::SHADOW_BASE;
 
 /// The trap kinds the JIT can raise (a subset of the interpreter's `Trap`), numbered to
 /// match the codes the lowered checks / the host thunk store into the trap cell.
@@ -1352,12 +1352,16 @@ impl FreezeController {
                 0 => std::hint::spin_loop(), // window not mapped yet
                 usize::MAX => return,        // run ended before the request landed
                 base => {
-                    // STATE_OFF = 0, STATE_UNWINDING = 1 (must match `temen-interp`/`temen-durable`). An
-                    // aligned atomic i32 store the guest's back-edge poll loads (defined under §12
-                    // races); release-ordered after the run's acquire-published base.
-                    // SAFETY: per the lifetime contract the window at `base` is mapped here (the run
-                    // is blocked in its non-terminating loop until this store lands).
-                    unsafe { (*(base as *const AtomicI32)).store(1, Ordering::Release) };
+                    // The durable state word lives at `base + STATE_OFF` (STATE_OFF relocated above the
+                    // #1094 NULL guard — `base` is the window base, and `[0, guard)` is now unmapped, so a
+                    // store at `base + 0` would fault). STATE_UNWINDING = 1 (must match
+                    // `temen-interp`/`temen-durable`). An aligned atomic i32 store the guest's back-edge
+                    // poll loads (defined under §12 races); release-ordered after the acquire-published base.
+                    // SAFETY: per the lifetime contract the window at `base` is mapped here (the run is
+                    // blocked in its non-terminating loop until this store lands), and `base + STATE_OFF`
+                    // is in the committed RW durable control region.
+                    let state = base + temen_ir::durable_abi::STATE_OFF as usize;
+                    unsafe { (*(state as *const AtomicI32)).store(1, Ordering::Release) };
                     return;
                 }
             }
@@ -1965,10 +1969,11 @@ mod domain_teardown_tests {
     const PROMPT: Duration = Duration::from_secs(15);
 
     /// Func 1 in every fixture: a daemon vCPU that parks forever on `i32.atomic.wait` (timeout −1)
-    /// at address 0, whose word never changes and which nothing ever notifies.
+    /// at address 16384 (one guard up — #1094's unconditional NULL guard unmaps `[0, 16384)`, so the
+    /// futex word must sit above it), whose word never changes and which nothing ever notifies.
     const PARKED_DAEMON: &str = "func (i64, i64) -> (i64) {\n\
         block 0 (vsp: i64, v0: i64) {\n\
-        \x20 v1 = i64.const 0\n\
+        \x20 v1 = i64.const 16384\n\
         \x20 v2 = i32.const 0\n\
         \x20 v3 = i64.const -1\n\
         \x20 v4 = i32.atomic.wait v1 v2 v3\n\
@@ -2002,7 +2007,7 @@ mod domain_teardown_tests {
              block 0 () {{\n\
              \x20 v0 = i64.const 0\n\
              \x20 v1 = thread.spawn 1 v0 v0\n\
-             \x20 v2 = i64.const 8\n\
+             \x20 v2 = i64.const 16392\n\
              \x20 v3 = i32.const 0\n\
              \x20 v4 = i64.const 10000000\n\
              \x20 v5 = i32.atomic.wait v2 v3 v4\n\
@@ -2049,7 +2054,7 @@ mod domain_teardown_tests {
              block 0 () {{\n\
              \x20 v0 = i64.const 0\n\
              \x20 v1 = thread.spawn 1 v0 v0\n\
-             \x20 v2 = i64.const 8\n\
+             \x20 v2 = i64.const 16392\n\
              \x20 v3 = i32.const 0\n\
              \x20 v4 = i64.const 10000000\n\
              \x20 v5 = i32.atomic.wait v2 v3 v4\n\
@@ -2087,7 +2092,7 @@ mod domain_teardown_tests {
              block 0 () {{\n\
              \x20 v0 = i64.const 0\n\
              \x20 v1 = thread.spawn 1 v0 v0\n\
-             \x20 v2 = i64.const 8\n\
+             \x20 v2 = i64.const 16392\n\
              \x20 v3 = i32.const 0\n\
              \x20 v4 = i64.const 10000000\n\
              \x20 v5 = i32.atomic.wait v2 v3 v4\n\
@@ -2114,7 +2119,7 @@ mod domain_teardown_tests {
              \x20 v0 = i64.const 0\n\
              \x20 v1 = thread.spawn 1 v0 v0\n\
              \x20 v2 = thread.spawn 2 v0 v0\n\
-             \x20 v3 = i64.const 8\n\
+             \x20 v3 = i64.const 16392\n\
              \x20 v4 = i32.const 0\n\
              \x20 v5 = i64.const 10000000\n\
              \x20 v6 = i32.atomic.wait v3 v4 v5\n\
@@ -2253,10 +2258,10 @@ pub struct CompiledModule {
     win_reserved: usize,
     win_size: usize,
     mem_size_log2: Option<u8>,
-    /// #964: the module's NULL guard (`0` = unguarded). Captured at compile from the
-    /// `__null_guard` marker export; each run `mprotect`s `[0, guard)` inaccessible after the
-    /// window is seeded, so a NULL dereference faults into the §5 guard exactly where the
-    /// interpreter's `Unmapped`-seeded page map traps. Always `0` for a §14 sub-window compile
+    /// #964/#1094: the module's NULL guard (`0` = unguarded). Captured at compile from
+    /// [`temen_ir::module_null_guard`] (unconditional now — #1094); each run `mprotect`s `[0, guard)`
+    /// inaccessible after the window is seeded, so a NULL dereference faults into the §5 guard exactly
+    /// where the interpreter's `Unmapped`-seeded page map traps. Always `0` for a §14 sub-window compile
     /// (a carve child mirrors the interpreter's unguarded sub-window).
     null_guard: u64,
     /// Initialized data segments, owned so a run can seed a fresh window (the module may
@@ -4638,16 +4643,18 @@ pub(crate) unsafe fn compile_child_and_run(
     // §4: a durable child runs its (possibly instrumented) funcs in the carve as **context 0** of its
     // own window. Seed the ctx-0 durable control words exactly as the interpreter does at the child's
     // first dispatch (`temen-interp` `durable_store_dstate(0, NORMAL)` + `durable_set_sp`): the global
-    // state word (`STATE_OFF` = 0) and the ctx-0 thaw word to `NORMAL`, and the ctx-0 shadow-SP word
-    // (at `shadow_region_base(0)` = `DURABLE_SHADOW_BASE`) to the empty frame base `shadow_frame_base(0)`.
-    // So an instrumented child's prologue sees `NORMAL` and its shadow stack starts empty at the right
-    // offset. A valid durable child's window is ≥ `DURABLE_RESERVE` (64 KiB), so these low offsets fit;
-    // the size guard keeps a malformed (too-small) guest-requested carve from panicking the host here —
-    // such a child instead traps at runtime when its instrumented code reaches past its window.
-    const CTX0_SP_OFF: usize = DURABLE_SHADOW_BASE as usize; // shadow_region_base(0) = 64
-    const CTX0_THAW_OFF: usize = DURABLE_SHADOW_BASE as usize + 8; // thaw_state_off(0) = 72
+    // state word (at `STATE_OFF`, relocated above the #1094 NULL guard) and the ctx-0 thaw word to
+    // `NORMAL`, and the ctx-0 shadow-SP word (at `shadow_region_base(0)` = `DURABLE_SHADOW_BASE`) to the
+    // empty frame base `shadow_frame_base(0)`. So an instrumented child's prologue sees `NORMAL` and its
+    // shadow stack starts empty at the right offset. A valid durable child's window is ≥ `DURABLE_RESERVE`
+    // (64 KiB), so these offsets fit; the size guard keeps a malformed (too-small) guest-requested carve
+    // from panicking the host here — such a child instead traps at runtime when its instrumented code
+    // reaches past its window.
+    const STATE_OFF: usize = temen_ir::durable_abi::STATE_OFF as usize; // global durable state word
+    const CTX0_SP_OFF: usize = DURABLE_SHADOW_BASE as usize; // shadow_region_base(0)
+    const CTX0_THAW_OFF: usize = DURABLE_SHADOW_BASE as usize + 8; // thaw_state_off(0)
     if durable && (child_size as usize) >= CTX0_THAW_OFF + 4 {
-        const CTX0_FRAME_BASE: u64 = DURABLE_SHADOW_BASE + 16; // shadow_frame_base(0) = 80
+        const CTX0_FRAME_BASE: u64 = DURABLE_SHADOW_BASE + 16; // shadow_frame_base(0)
         const STATE_REWINDING: i32 = 2;
         let w = child_window.rw_mut();
         if thaw {
@@ -4656,18 +4663,18 @@ pub(crate) unsafe fn compile_child_and_run(
             // **rewind** exactly as `temen-durable::begin_thaw` does for a context: global state word →
             // `NORMAL`, ctx-0 thaw word → `REWINDING`, and **preserve** the SP word + shadow stack (the
             // continuation the rewind replays). The child then dispatches on the thaw word and reloads.
-            w[0..4].copy_from_slice(&0i32.to_le_bytes()); // global state word = NORMAL
+            w[STATE_OFF..STATE_OFF + 4].copy_from_slice(&0i32.to_le_bytes()); // global state word = NORMAL
             w[CTX0_THAW_OFF..CTX0_THAW_OFF + 4].copy_from_slice(&STATE_REWINDING.to_le_bytes());
         } else {
             // §4 freeze/normal: the child inherits the **parent's** durable phase (the interp seeds
             // `child.dstate = parent.durable_state()`). Under a freeze the parent window is `UNWINDING`,
             // so an instrumented child is born unwinding and unwinds at its first poll; under `NORMAL`
-            // it runs to completion. Read the parent window's ctx-0 state word (`STATE_OFF` = 0).
+            // it runs to completion. Read the parent window's ctx-0 state word (at `STATE_OFF`).
             let parent_phase = {
-                let p = std::slice::from_raw_parts(parent_mem_base, 4);
+                let p = std::slice::from_raw_parts(parent_mem_base.add(STATE_OFF), 4);
                 i32::from_le_bytes([p[0], p[1], p[2], p[3]])
             };
-            w[0..4].copy_from_slice(&parent_phase.to_le_bytes()); // global state word = parent's phase
+            w[STATE_OFF..STATE_OFF + 4].copy_from_slice(&parent_phase.to_le_bytes()); // global state = parent's phase
             w[CTX0_THAW_OFF..CTX0_THAW_OFF + 4].copy_from_slice(&0i32.to_le_bytes()); // ctx-0 thaw = NORMAL
             w[CTX0_SP_OFF..CTX0_SP_OFF + 8].copy_from_slice(&CTX0_FRAME_BASE.to_le_bytes());
             // ctx-0 SP
@@ -8735,14 +8742,20 @@ fn mask_addr(
 /// faulting run diverges from the interpreter's fault-before-any-write. Both are interp↔JIT
 /// divergences (§3 parity), not escapes (every byte stays in `[0, reserved)`).
 ///
-/// The fix is a guarded 1-byte read of the span's **last** byte (`phys + len − 1`, where `phys` is
-/// [`confine_span`]'s confined base). It faults [`TrapKind::MemoryFault`] on the `PROT_NONE` guard
-/// exactly where the interpreter faults — **consulting the live page tables**, so it honors guest
-/// `grow` (unlike the compile-time `Lower::mapped`, which would over-fault a grown window). For the
-/// contiguous backed prefix (the production model + the spec window), last-byte-in-bounds ⟺
-/// whole-span-in-bounds, matching the interpreter's own `last < mapped` fast path. Emitted per span
-/// (`dst` and `src`) before the copy, so no partial write survives. `len == 0` skips the probe
-/// entirely (a branch on `len != 0`), keeping a zero-length op inert even at a wild pointer (D62).
+/// The fix is a guarded 1-byte read of the span's **first** byte (`phys`) and **last** byte
+/// (`phys + len − 1`, where `phys` is [`confine_span`]'s confined base). Each faults
+/// [`TrapKind::MemoryFault`] on a `PROT_NONE` guard page exactly where the interpreter faults —
+/// **consulting the live page tables**, so it honors guest `grow` (unlike the compile-time
+/// `Lower::mapped`, which would over-fault a grown window). The last-byte read catches an overrun
+/// past the backed extent; the first-byte read catches a span starting inside the #1094 NULL guard
+/// `[0, POWERBOX_NULL_GUARD)` — which the last-byte read alone misses when the span *ends* in backed
+/// memory (e.g. a whole-window self-copy from 0: macOS libc `memmove` short-circuits `dst == src`,
+/// so nothing else would ever touch the guard, an interp↔JIT divergence the spec-mem differential
+/// caught on macOS while glibc happened to fault). For the contiguous unmapped-guard + backed-prefix
+/// model (the production window + the spec window), first-and-last-in-bounds ⟺ whole-span-in-bounds.
+/// Emitted per span (`dst` and `src`) before the copy, so no partial write survives. `len == 0`
+/// skips the probe entirely (a branch on `len != 0`), keeping a zero-length op inert even at a wild
+/// pointer (D62).
 ///
 /// Residual (documented, not silently dropped): a bulk op whose span straddles a guest-created
 /// **interior** hole (`unmap`) or a read-only page mid-span is not caught by a last-byte read probe
@@ -8756,11 +8769,13 @@ fn probe_span(b: &mut FunctionBuilder, phys: Value, len: Value) {
 
     b.switch_to_block(do_probe);
     b.seal_block(do_probe);
+    // May-trap loads: each faults `MemoryFault` on a guard page — the first byte on the #1094 NULL
+    // guard, the last byte on an overrun past the backed region. The results are unused, but the
+    // loads are preserved because they can trap (side-effecting).
+    b.ins().load(I8, mem_flags(), phys, 0);
     let one = b.ins().iconst(I64, 1);
     let last_off = b.ins().isub(len, one);
     let last = b.ins().iadd(phys, last_off);
-    // A may-trap load: it faults `MemoryFault` on the guard page if the span overruns the backed
-    // region. The result is unused, but the load is preserved because it can trap (side-effecting).
     b.ins().load(I8, mem_flags(), last, 0);
     b.ins().jump(after, &[]);
 

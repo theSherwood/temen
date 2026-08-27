@@ -292,7 +292,7 @@ fn canonical_powerbox_names_resolve_to_working_handles() {
 /// name) into a scratch buffer, and streams it back out — proving `self.label` returns the
 /// registered name and the byte-write lands, on the tree-walker, bytecode engine, and JIT.
 const LABEL_SRC: &str = "\
-memory 15
+memory 17
 data ro 16384 \"write\"
 export 0 func \"_start\" 0
 func () -> (i32) {
@@ -300,7 +300,7 @@ block 0 () {
   v0 = i64.const 16384
   v1 = i64.const 5
   v2 = self.resolve v0 v1
-  v3 = i64.const 2048
+  v3 = i64.const 65536
   v4 = i64.const 64
   v5 = self.label v2 v3 v4
   v6 = i64.extend_i32_s v5
@@ -331,7 +331,7 @@ fn label_a_handle_to_its_registered_name() {
 /// guest can retry with a buffer that size. Here `buf_cap = 2 < len(\"write\") = 5`, so the entry
 /// returns 5 (and stdout stays empty — nothing was written).
 const LABEL_SMALL_SRC: &str = "\
-memory 15
+memory 17
 data ro 16384 \"write\"
 export 0 func \"_start\" 0
 func () -> (i32) {
@@ -339,7 +339,7 @@ block 0 () {
   v0 = i64.const 16384
   v1 = i64.const 5
   v2 = self.resolve v0 v1
-  v3 = i64.const 2048
+  v3 = i64.const 65536
   v4 = i64.const 2
   v5 = self.label v2 v3 v4
   v6 = i64.const 0

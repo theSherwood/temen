@@ -98,15 +98,16 @@ int main(int argc, char **argv) {
 "#;
 
 /// The manager program: `main(inst, stream, guestmod)` spawns the server, mints the fork offer, builds a
-/// 2-entry grant list {`"stdout"` → stream, `"__fork"` → offer} at window offset 256, spawns the guest
+/// 2-entry grant list {`"stdout"` → stream, `"__fork"` → offer} at window offset 16640 (above the #1094
+/// NULL guard), spawns the guest
 /// module via op 13 into a 128 KiB carve at 131072, and joins it. Server = func 1, handler = func 2.
 const MANAGER: &str = r#"
 memory 19
 type 0 func (i64) -> (i64)
 type 1 interface { op: 0 }
 export 0 interface "fork" 1 { op: 2 }
-data 300 "__fork"
-data 310 "stdout"
+data 16684 "__fork"
+data 16694 "stdout"
 func (i32, i32, i64) -> (i64) {
 block 0 (v0: i32, vstream: i32, vgmod: i64) {
   vq = i64.const 0
@@ -116,39 +117,39 @@ block 0 (v0: i32, vstream: i32, vgmod: i64) {
   q0v2 = i64.const -4294967284
   q0v3 = i64.const 4294967295
   q0v4 = i64.const 0
-  q0a0 = i64.const 1152
+  q0a0 = i64.const 17536
   i64.store q0a0 q0v0
-  q0a1 = i64.const 1160
+  q0a1 = i64.const 17544
   i64.store q0a1 q0v1
-  q0a2 = i64.const 1168
+  q0a2 = i64.const 17552
   i64.store q0a2 q0v2
-  q0a3 = i64.const 1176
+  q0a3 = i64.const 17560
   i64.store q0a3 q0v3
-  q0a4 = i64.const 1184
+  q0a4 = i64.const 17568
   i64.store q0a4 q0v4
-  q0a5 = i64.const 1192
+  q0a5 = i64.const 17576
   i64.store q0a5 q0v4
-  q0a6 = i64.const 1200
+  q0a6 = i64.const 17584
   i64.store q0a6 q0v4
   vs = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   vz0 = i64.const 0
   vforkoff = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
-  va0 = i64.const 256
-  vnp0 = i32.const 310
+  va0 = i64.const 16640
+  vnp0 = i32.const 16694
   i32.store va0 vnp0
-  va1 = i64.const 260
+  va1 = i64.const 16644
   vsix = i32.const 6
   i32.store va1 vsix
-  va2 = i64.const 264
+  va2 = i64.const 16648
   i32.store va2 vstream
-  va3 = i64.const 272
-  vnp1 = i32.const 300
+  va3 = i64.const 16656
+  vnp1 = i32.const 16684
   i32.store va3 vnp1
-  va4 = i64.const 276
+  va4 = i64.const 16660
   i32.store va4 vsix
-  va5 = i64.const 280
+  va5 = i64.const 16664
   i32.store va5 vforkoff
-  vgp = i64.const 256
+  vgp = i64.const 16640
   vgn = i64.const 2
   ve0 = i64.const 0
   voffg = i64.const 131072
@@ -227,9 +228,9 @@ type 0 func (i64) -> (i64)
 type 1 interface { op: 0 }
 export 0 interface "fork" 1 { op: 2 }
 export 1 interface "wait" 1 { op: 3 }
-data 300 "__fork"
-data 310 "stdout"
-data 320 "__wait"
+data 16684 "__fork"
+data 16694 "stdout"
+data 16704 "__wait"
 func (i32, i32, i64) -> (i64) {
 block 0 (v0: i32, vstream: i32, vgmod: i64) {
   vq = i64.const 0
@@ -239,48 +240,48 @@ block 0 (v0: i32, vstream: i32, vgmod: i64) {
   q0v2 = i64.const -4294967284
   q0v3 = i64.const 4294967295
   q0v4 = i64.const 0
-  q0a0 = i64.const 1152
+  q0a0 = i64.const 17536
   i64.store q0a0 q0v0
-  q0a1 = i64.const 1160
+  q0a1 = i64.const 17544
   i64.store q0a1 q0v1
-  q0a2 = i64.const 1168
+  q0a2 = i64.const 17552
   i64.store q0a2 q0v2
-  q0a3 = i64.const 1176
+  q0a3 = i64.const 17560
   i64.store q0a3 q0v3
-  q0a4 = i64.const 1184
+  q0a4 = i64.const 17568
   i64.store q0a4 q0v4
-  q0a5 = i64.const 1192
+  q0a5 = i64.const 17576
   i64.store q0a5 q0v4
-  q0a6 = i64.const 1200
+  q0a6 = i64.const 17584
   i64.store q0a6 q0v4
   vs = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   vz0 = i64.const 0
   vforkoff = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
   v1c = i64.const 1
   vwaitoff = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, v1c)
-  va0 = i64.const 256
-  vnp0 = i32.const 310
+  va0 = i64.const 16640
+  vnp0 = i32.const 16694
   i32.store va0 vnp0
-  va1 = i64.const 260
+  va1 = i64.const 16644
   vsix = i32.const 6
   i32.store va1 vsix
-  va2 = i64.const 264
+  va2 = i64.const 16648
   i32.store va2 vstream
-  va3 = i64.const 272
-  vnp1 = i32.const 300
+  va3 = i64.const 16656
+  vnp1 = i32.const 16684
   i32.store va3 vnp1
-  va4 = i64.const 276
+  va4 = i64.const 16660
   i32.store va4 vsix
-  va5 = i64.const 280
+  va5 = i64.const 16664
   i32.store va5 vforkoff
-  va6 = i64.const 288
-  vnp2 = i32.const 320
+  va6 = i64.const 16672
+  vnp2 = i32.const 16704
   i32.store va6 vnp2
-  va7 = i64.const 292
+  va7 = i64.const 16676
   i32.store va7 vsix
-  va8 = i64.const 296
+  va8 = i64.const 16680
   i32.store va8 vwaitoff
-  vgp = i64.const 256
+  vgp = i64.const 16640
   vgn = i64.const 3
   ve0 = i64.const 0
   voffg = i64.const 131072
@@ -861,11 +862,11 @@ type 0 func (i64) -> (i64)
 type 1 interface { op: 0 }
 export 0 interface "fork" 1 { op: 2 }
 export 1 interface "wait" 1 { op: 3 }
-data 400 "__fork"
-data 410 "stdout"
-data 420 "__wait"
-data 430 "one"
-data 440 "two"
+data 16784 "__fork"
+data 16794 "stdout"
+data 16804 "__wait"
+data 16814 "one"
+data 16824 "two"
 func (i32, i32, i64, i64, i64) -> (i64) {
 block 0 (v0: i32, vstream: i32, vgmod: i64, vmod1: i64, vmod2: i64) {
   vq = i64.const 0
@@ -874,19 +875,19 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vmod1: i64, vmod2: i64) {
   q0v2 = i64.const -4294967284
   q0v3 = i64.const 4294967295
   q0v4 = i64.const 0
-  q0a0 = i64.const 1152
+  q0a0 = i64.const 17536
   i64.store q0a0 q0v0
-  q0a1 = i64.const 1160
+  q0a1 = i64.const 17544
   i64.store q0a1 q0v1
-  q0a2 = i64.const 1168
+  q0a2 = i64.const 17552
   i64.store q0a2 q0v2
-  q0a3 = i64.const 1176
+  q0a3 = i64.const 17560
   i64.store q0a3 q0v3
-  q0a4 = i64.const 1184
+  q0a4 = i64.const 17568
   i64.store q0a4 q0v4
-  q0a5 = i64.const 1192
+  q0a5 = i64.const 17576
   i64.store q0a5 q0v4
-  q0a6 = i64.const 1200
+  q0a6 = i64.const 17584
   i64.store q0a6 q0v4
   vs = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   vz0 = i64.const 0
@@ -895,44 +896,44 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vmod1: i64, vmod2: i64) {
   vwaitoff = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, v1c)
   vmod1_32 = i32.wrap_i64 vmod1
   vmod2_32 = i32.wrap_i64 vmod2
-  va0 = i64.const 256
-  vnp0 = i32.const 410
+  va0 = i64.const 16640
+  vnp0 = i32.const 16794
   i32.store va0 vnp0
-  va1 = i64.const 260
+  va1 = i64.const 16644
   vsix = i32.const 6
   i32.store va1 vsix
-  va2 = i64.const 264
+  va2 = i64.const 16648
   i32.store va2 vstream
-  va3 = i64.const 272
-  vnp1 = i32.const 400
+  va3 = i64.const 16656
+  vnp1 = i32.const 16784
   i32.store va3 vnp1
-  va4 = i64.const 276
+  va4 = i64.const 16660
   i32.store va4 vsix
-  va5 = i64.const 280
+  va5 = i64.const 16664
   i32.store va5 vforkoff
-  va6 = i64.const 288
-  vnp2 = i32.const 420
+  va6 = i64.const 16672
+  vnp2 = i32.const 16804
   i32.store va6 vnp2
-  va7 = i64.const 292
+  va7 = i64.const 16676
   i32.store va7 vsix
-  va8 = i64.const 296
+  va8 = i64.const 16680
   i32.store va8 vwaitoff
-  va9 = i64.const 304
-  vnp3 = i32.const 430
+  va9 = i64.const 16688
+  vnp3 = i32.const 16814
   i32.store va9 vnp3
-  va10 = i64.const 308
+  va10 = i64.const 16692
   vthree = i32.const 3
   i32.store va10 vthree
-  va11 = i64.const 312
+  va11 = i64.const 16696
   i32.store va11 vmod1_32
-  va12 = i64.const 320
-  vnp4 = i32.const 440
+  va12 = i64.const 16704
+  vnp4 = i32.const 16824
   i32.store va12 vnp4
-  va13 = i64.const 324
+  va13 = i64.const 16708
   i32.store va13 vthree
-  va14 = i64.const 328
+  va14 = i64.const 16712
   i32.store va14 vmod2_32
-  vgp = i64.const 256
+  vgp = i64.const 16640
   vgn = i64.const 5
   ve0 = i64.const 0
   voffg = i64.const 131072
@@ -2100,29 +2101,29 @@ int main(int argc, char **argv) {
 
 const NEXEC_MANAGER: &str = r#"
 memory 19
-data 310 "stdout"
-data 330 "cmd"
+data 16694 "stdout"
+data 16714 "cmd"
 func (i32, i32, i64, i64) -> (i64) {
 block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64) {
   vq = i64.const 0
   vcmod32 = i32.wrap_i64 vcmod
-  va0 = i64.const 256
-  vnp0 = i32.const 310
+  va0 = i64.const 16640
+  vnp0 = i32.const 16694
   i32.store va0 vnp0
-  va1 = i64.const 260
+  va1 = i64.const 16644
   vsix = i32.const 6
   i32.store va1 vsix
-  va2 = i64.const 264
+  va2 = i64.const 16648
   i32.store va2 vstream
-  va3 = i64.const 272
-  vnp1 = i32.const 330
+  va3 = i64.const 16656
+  vnp1 = i32.const 16714
   i32.store va3 vnp1
-  va4 = i64.const 276
+  va4 = i64.const 16660
   vthree = i32.const 3
   i32.store va4 vthree
-  va5 = i64.const 280
+  va5 = i64.const 16664
   i32.store va5 vcmod32
-  vgp = i64.const 256
+  vgp = i64.const 16640
   vgn = i64.const 2
   ve0 = i64.const 0
   voffg = i64.const 131072
@@ -2235,38 +2236,38 @@ int main(int argc, char **argv) {
 /// joins the guest. Like `NEXEC_MANAGER` with the fs cap added as a third entry.
 const FS_MANAGER: &str = r#"
 memory 19
-data 310 "stdout"
-data 330 "cmd"
-data 340 "vm_fs"
+data 16694 "stdout"
+data 16714 "cmd"
+data 16724 "vm_fs"
 func (i32, i32, i64, i64, i32) -> (i64) {
 block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64, vfs: i32) {
   vq = i64.const 0
   vcmod32 = i32.wrap_i64 vcmod
-  va0 = i64.const 256
-  vnp0 = i32.const 310
+  va0 = i64.const 16640
+  vnp0 = i32.const 16694
   i32.store va0 vnp0
-  va1 = i64.const 260
+  va1 = i64.const 16644
   vsix = i32.const 6
   i32.store va1 vsix
-  va2 = i64.const 264
+  va2 = i64.const 16648
   i32.store va2 vstream
-  va3 = i64.const 272
-  vnp1 = i32.const 330
+  va3 = i64.const 16656
+  vnp1 = i32.const 16714
   i32.store va3 vnp1
-  va4 = i64.const 276
+  va4 = i64.const 16660
   vthree = i32.const 3
   i32.store va4 vthree
-  va5 = i64.const 280
+  va5 = i64.const 16664
   i32.store va5 vcmod32
-  va6 = i64.const 288
-  vnp2 = i32.const 340
+  va6 = i64.const 16672
+  vnp2 = i32.const 16724
   i32.store va6 vnp2
-  va7 = i64.const 292
+  va7 = i64.const 16676
   vfive = i32.const 5
   i32.store va7 vfive
-  va8 = i64.const 296
+  va8 = i64.const 16680
   i32.store va8 vfs
-  vgp = i64.const 256
+  vgp = i64.const 16640
   vgn = i64.const 3
   ve0 = i64.const 0
   voffg = i64.const 131072
@@ -2408,10 +2409,10 @@ type 0 func (i64) -> (i64)
 type 1 interface { op: 0 }
 export 0 interface "fork" 1 { op: 2 }
 export 1 interface "wait" 1 { op: 3 }
-data 400 "__fork"
-data 410 "stdout"
-data 420 "__wait"
-data 430 "cmd"
+data 16784 "__fork"
+data 16794 "stdout"
+data 16804 "__wait"
+data 16814 "cmd"
 func (i32, i32, i64, i64) -> (i64) {
 block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64) {
   vq = i64.const 0
@@ -2420,19 +2421,19 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64) {
   q0v2 = i64.const -4294967284
   q0v3 = i64.const 4294967295
   q0v4 = i64.const 0
-  q0a0 = i64.const 1152
+  q0a0 = i64.const 17536
   i64.store q0a0 q0v0
-  q0a1 = i64.const 1160
+  q0a1 = i64.const 17544
   i64.store q0a1 q0v1
-  q0a2 = i64.const 1168
+  q0a2 = i64.const 17552
   i64.store q0a2 q0v2
-  q0a3 = i64.const 1176
+  q0a3 = i64.const 17560
   i64.store q0a3 q0v3
-  q0a4 = i64.const 1184
+  q0a4 = i64.const 17568
   i64.store q0a4 q0v4
-  q0a5 = i64.const 1192
+  q0a5 = i64.const 17576
   i64.store q0a5 q0v4
-  q0a6 = i64.const 1200
+  q0a6 = i64.const 17584
   i64.store q0a6 q0v4
   vs = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   vz0 = i64.const 0
@@ -2440,37 +2441,37 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64) {
   v1c = i64.const 1
   vwaitoff = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, v1c)
   vcmod32 = i32.wrap_i64 vcmod
-  va0 = i64.const 256
-  vnp0 = i32.const 410
+  va0 = i64.const 16640
+  vnp0 = i32.const 16794
   i32.store va0 vnp0
-  va1 = i64.const 260
+  va1 = i64.const 16644
   vsix = i32.const 6
   i32.store va1 vsix
-  va2 = i64.const 264
+  va2 = i64.const 16648
   i32.store va2 vstream
-  va3 = i64.const 272
-  vnp1 = i32.const 400
+  va3 = i64.const 16656
+  vnp1 = i32.const 16784
   i32.store va3 vnp1
-  va4 = i64.const 276
+  va4 = i64.const 16660
   i32.store va4 vsix
-  va5 = i64.const 280
+  va5 = i64.const 16664
   i32.store va5 vforkoff
-  va6 = i64.const 288
-  vnp2 = i32.const 420
+  va6 = i64.const 16672
+  vnp2 = i32.const 16804
   i32.store va6 vnp2
-  va7 = i64.const 292
+  va7 = i64.const 16676
   i32.store va7 vsix
-  va8 = i64.const 296
+  va8 = i64.const 16680
   i32.store va8 vwaitoff
-  va9 = i64.const 304
-  vnp3 = i32.const 430
+  va9 = i64.const 16688
+  vnp3 = i32.const 16814
   i32.store va9 vnp3
-  va10 = i64.const 308
+  va10 = i64.const 16692
   vthree = i32.const 3
   i32.store va10 vthree
-  va11 = i64.const 312
+  va11 = i64.const 16696
   i32.store va11 vcmod32
-  vgp = i64.const 256
+  vgp = i64.const 16640
   vgn = i64.const 4
   ve0 = i64.const 0
   voffg = i64.const 131072
@@ -2607,11 +2608,11 @@ type 0 func (i64) -> (i64)
 type 1 interface { op: 0 }
 export 0 interface "fork" 1 { op: 2 }
 export 1 interface "wait" 1 { op: 3 }
-data 400 "__fork"
-data 410 "stdout"
-data 420 "__wait"
-data 430 "cmd"
-data 440 "vm_fs"
+data 16784 "__fork"
+data 16794 "stdout"
+data 16804 "__wait"
+data 16814 "cmd"
+data 16824 "vm_fs"
 func (i32, i32, i64, i64, i32) -> (i64) {
 block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64, vfs: i32) {
   vq = i64.const 0
@@ -2620,19 +2621,19 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64, vfs: i32) {
   q0v2 = i64.const -4294967284
   q0v3 = i64.const 4294967295
   q0v4 = i64.const 0
-  q0a0 = i64.const 1152
+  q0a0 = i64.const 17536
   i64.store q0a0 q0v0
-  q0a1 = i64.const 1160
+  q0a1 = i64.const 17544
   i64.store q0a1 q0v1
-  q0a2 = i64.const 1168
+  q0a2 = i64.const 17552
   i64.store q0a2 q0v2
-  q0a3 = i64.const 1176
+  q0a3 = i64.const 17560
   i64.store q0a3 q0v3
-  q0a4 = i64.const 1184
+  q0a4 = i64.const 17568
   i64.store q0a4 q0v4
-  q0a5 = i64.const 1192
+  q0a5 = i64.const 17576
   i64.store q0a5 q0v4
-  q0a6 = i64.const 1200
+  q0a6 = i64.const 17584
   i64.store q0a6 q0v4
   vs = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   vz0 = i64.const 0
@@ -2640,45 +2641,45 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64, vfs: i32) {
   v1c = i64.const 1
   vwaitoff = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, v1c)
   vcmod32 = i32.wrap_i64 vcmod
-  va0 = i64.const 256
-  vnp0 = i32.const 410
+  va0 = i64.const 16640
+  vnp0 = i32.const 16794
   i32.store va0 vnp0
-  va1 = i64.const 260
+  va1 = i64.const 16644
   vsix = i32.const 6
   i32.store va1 vsix
-  va2 = i64.const 264
+  va2 = i64.const 16648
   i32.store va2 vstream
-  va3 = i64.const 272
-  vnp1 = i32.const 400
+  va3 = i64.const 16656
+  vnp1 = i32.const 16784
   i32.store va3 vnp1
-  va4 = i64.const 276
+  va4 = i64.const 16660
   i32.store va4 vsix
-  va5 = i64.const 280
+  va5 = i64.const 16664
   i32.store va5 vforkoff
-  va6 = i64.const 288
-  vnp2 = i32.const 420
+  va6 = i64.const 16672
+  vnp2 = i32.const 16804
   i32.store va6 vnp2
-  va7 = i64.const 292
+  va7 = i64.const 16676
   i32.store va7 vsix
-  va8 = i64.const 296
+  va8 = i64.const 16680
   i32.store va8 vwaitoff
-  va9 = i64.const 304
-  vnp3 = i32.const 430
+  va9 = i64.const 16688
+  vnp3 = i32.const 16814
   i32.store va9 vnp3
-  va10 = i64.const 308
+  va10 = i64.const 16692
   vthree = i32.const 3
   i32.store va10 vthree
-  va11 = i64.const 312
+  va11 = i64.const 16696
   i32.store va11 vcmod32
-  va12 = i64.const 320
-  vnp4 = i32.const 440
+  va12 = i64.const 16704
+  vnp4 = i32.const 16824
   i32.store va12 vnp4
-  va13 = i64.const 324
+  va13 = i64.const 16708
   vfive = i32.const 5
   i32.store va13 vfive
-  va14 = i64.const 328
+  va14 = i64.const 16712
   i32.store va14 vfs
-  vgp = i64.const 256
+  vgp = i64.const 16640
   vgn = i64.const 5
   ve0 = i64.const 0
   voffg = i64.const 131072

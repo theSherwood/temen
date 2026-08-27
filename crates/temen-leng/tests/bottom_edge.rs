@@ -109,8 +109,9 @@ fn bitcount_and_bswap_leaves_match_native() {
 #[test]
 fn memcpy_and_memset_match_native() {
     let m = runtime();
-    let (dst, src, n) = (256usize, 128usize, 24usize);
-    let mut seed = vec![0u8; 4096];
+    // dst/src raised +16384 above the unconditional NULL guard (#1094).
+    let (dst, src, n) = (16640usize, 16512usize, 24usize);
+    let mut seed = vec![0u8; 32768];
     let payload: Vec<u8> = (0..n)
         .map(|i| (i as u8).wrapping_mul(37).wrapping_add(1))
         .collect();
@@ -181,13 +182,14 @@ block 0 (v0: i64, v1: i64, v2: i64) {
         .expect("run exported")
         .func;
 
-    // run(dst=256, src=128, 8): memcpy 8 bytes 128->256 (returns 256), then clzll(256) = 55.
-    let mut seed = vec![0u8; 4096];
-    seed[128..136].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
-    let (ret, win) = run_both(&linked, entry, &[256, 128, 8], &seed);
-    assert_eq!(ret, [55], "clzll(memcpy(...)=256) = 55");
+    // run(dst=16640, src=16512, 8): memcpy 8 bytes 16512->16640 (returns 16640), then
+    // clzll(16640) = 49. dst/src raised +16384 above the unconditional NULL guard (#1094).
+    let mut seed = vec![0u8; 32768];
+    seed[16512..16520].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    let (ret, win) = run_both(&linked, entry, &[16640, 16512, 8], &seed);
+    assert_eq!(ret, [49], "clzll(memcpy(...)=16640) = 49");
     assert_eq!(
-        &win[256..264],
+        &win[16640..16648],
         &[1, 2, 3, 4, 5, 6, 7, 8],
         "memcpy ran through the link"
     );
@@ -196,9 +198,9 @@ block 0 (v0: i64, v1: i64, v2: i64) {
 #[test]
 fn single_thread_atomics_match_native() {
     let m = runtime();
-    let p = 512usize;
+    let p = 16896usize; // 512 + 16384, above the unconditional NULL guard (#1094)
     let seed = |v: i64| {
-        let mut s = vec![0u8; 4096];
+        let mut s = vec![0u8; 32768];
         s[p..p + 8].copy_from_slice(&v.to_le_bytes());
         s
     };
@@ -228,7 +230,8 @@ fn single_thread_atomics_match_native() {
 #[test]
 fn memcmp_matches_native() {
     let m = runtime();
-    let (a, b, n) = (256usize, 512usize, 16usize);
+    // a/b raised +16384 above the unconditional NULL guard (#1094).
+    let (a, b, n) = (16640usize, 16896usize, 16usize);
     // Oracle: the first differing unsigned byte's `a[i] - b[i]` (signed), else 0.
     let oracle = |x: &[u8], y: &[u8]| -> i64 {
         (0..n)
@@ -251,7 +254,7 @@ fn memcmp_matches_native() {
         (&a_last, &base), // last-byte difference
     ];
     for (x, y) in cases {
-        let mut seed = vec![0u8; 4096];
+        let mut seed = vec![0u8; 32768];
         seed[a..a + n].copy_from_slice(x);
         seed[b..b + n].copy_from_slice(y);
         let (ret, _) = run_both(&m, 12, &[a as i64, b as i64, n as i64], &seed);

@@ -31,22 +31,22 @@ use temen_interp::{run_with_host, Host, Value};
 /// consumer sums them (park while empty) → 10.
 const PIPELINE: &str = r#"
 memory 19
-data 200 "ring"
+data 16584 "ring"
 
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
   vlen = i64.const 65536
   vrh64 = call.cap 5 5 (i64) -> (i64) v1 (vlen)
   vrh = i32.wrap_i64 vrh64
-  va1 = i64.const 256
-  vv1 = i32.const 200
+  va1 = i64.const 16640
+  vv1 = i32.const 16584
   i32.store va1 vv1
-  va2 = i64.const 260
+  va2 = i64.const 16644
   vv2 = i32.const 4
   i32.store va2 vv2
-  va3 = i64.const 264
+  va3 = i64.const 16648
   i32.store va3 vrh
-  vgp = i64.const 256
+  vgp = i64.const 16640
   vgn = i64.const 1
   vlog = i64.const 17
   vq = i64.const 0
@@ -56,21 +56,21 @@ block 0 (v0: i32, v1: i32) {
   q0v2 = i64.const -4294967279
   q0v3 = i64.const 4294967295
   q0v4 = i64.const 0
-  q0v5 = i64.const 256
+  q0v5 = i64.const 16640
   q0v6 = i64.const 1
-  q0a0 = i64.const 1152
+  q0a0 = i64.const 17536
   i64.store q0a0 q0v0
-  q0a1 = i64.const 1160
+  q0a1 = i64.const 17544
   i64.store q0a1 q0v1
-  q0a2 = i64.const 1168
+  q0a2 = i64.const 17552
   i64.store q0a2 q0v2
-  q0a3 = i64.const 1176
+  q0a3 = i64.const 17560
   i64.store q0a3 q0v3
-  q0a4 = i64.const 1184
+  q0a4 = i64.const 17568
   i64.store q0a4 q0v4
-  q0a5 = i64.const 1192
+  q0a5 = i64.const 17576
   i64.store q0a5 q0v5
-  q0a6 = i64.const 1200
+  q0a6 = i64.const 17584
   i64.store q0a6 q0v6
   vp = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   ; spawn via record (op 17): entry=2 off=262144 sl=17 quota=0
@@ -79,21 +79,21 @@ block 0 (v0: i32, v1: i32) {
   q1v2 = i64.const -4294967279
   q1v3 = i64.const 4294967295
   q1v4 = i64.const 0
-  q1v5 = i64.const 256
+  q1v5 = i64.const 16640
   q1v6 = i64.const 1
-  q1a0 = i64.const 1216
+  q1a0 = i64.const 17600
   i64.store q1a0 q1v0
-  q1a1 = i64.const 1224
+  q1a1 = i64.const 17608
   i64.store q1a1 q1v1
-  q1a2 = i64.const 1232
+  q1a2 = i64.const 17616
   i64.store q1a2 q1v2
-  q1a3 = i64.const 1240
+  q1a3 = i64.const 17624
   i64.store q1a3 q1v3
-  q1a4 = i64.const 1248
+  q1a4 = i64.const 17632
   i64.store q1a4 q1v4
-  q1a5 = i64.const 1256
+  q1a5 = i64.const 17640
   i64.store q1a5 q1v5
-  q1a6 = i64.const 1264
+  q1a6 = i64.const 17648
   i64.store q1a6 q1v6
   vc = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
   vjp = call.cap 6 1 (i32) -> (i64) v0 (vp)
@@ -108,15 +108,16 @@ block 0 (v0: i32, v1: i32) {
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vnm = i64.const 1735289202
-  vz = i64.const 0
+  vz = i64.const 16384
   i64.store vz vnm
-  vp = i64.const 0
+  vp = i64.const 16384
   vl = i64.const 4
   vh = self.resolve vp vl
   vg = call.cap 4 3 () -> (i64) vh ()
   vroff = i64.const 0
+  vwoff = i64.const 65536
   vprot = i32.const 3
-  vm = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vh (vroff, vroff, vg, vprot)
+  vm = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vh (vwoff, vroff, vg, vprot)
   vone = i64.const 1
   br 1(vone, vroff)
   }
@@ -126,12 +127,12 @@ block 1 (vi: i64, vtos: i64) {
   br_if vdone 5(vtos) 2(vi, vtos)
   }
 block 2 (vi: i64, vtos: i64) {
-  vfa = i64.const 0
+  vfa = i64.const 65536
   vf = i32.load vfa
   br_if vf 3(vi, vtos) 4(vi, vtos)
   }
 block 3 (vi: i64, vtos: i64) {
-  vfa = i64.const 0
+  vfa = i64.const 65536
   vexp = i32.const 1
   vto = i64.const 5000000000
   vst = i32.atomic.wait vfa vexp vto
@@ -144,9 +145,9 @@ block 3 (vi: i64, vtos: i64) {
   br_if vbail 5(vtos2) 2(vi, vtos2)
   }
 block 4 (vi: i64, vtos: i64) {
-  vda = i64.const 8
+  vda = i64.const 65544
   i64.store vda vi
-  vfa = i64.const 0
+  vfa = i64.const 65536
   vfull = i32.const 1
   i32.store vfa vfull
   vcnt = i32.const 1
@@ -167,15 +168,16 @@ block 5 (vtos: i64) {
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vnm = i64.const 1735289202
-  vz = i64.const 0
+  vz = i64.const 16384
   i64.store vz vnm
-  vp = i64.const 0
+  vp = i64.const 16384
   vl = i64.const 4
   vh = self.resolve vp vl
   vg = call.cap 4 3 () -> (i64) vh ()
   vroff = i64.const 0
+  vwoff = i64.const 65536
   vprot = i32.const 3
-  vm = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vh (vroff, vroff, vg, vprot)
+  vm = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vh (vwoff, vroff, vg, vprot)
   vone = i64.const 1
   br 1(vone, vroff, vroff)
   }
@@ -185,12 +187,12 @@ block 1 (vn: i64, vsum: i64, vtos: i64) {
   br_if vdone 5(vsum, vtos) 2(vn, vsum, vtos)
   }
 block 2 (vn: i64, vsum: i64, vtos: i64) {
-  vfa = i64.const 0
+  vfa = i64.const 65536
   vf = i32.load vfa
   br_if vf 4(vn, vsum, vtos) 3(vn, vsum, vtos)
   }
 block 3 (vn: i64, vsum: i64, vtos: i64) {
-  vfa = i64.const 0
+  vfa = i64.const 65536
   vexp = i32.const 0
   vto = i64.const 5000000000
   vst = i32.atomic.wait vfa vexp vto
@@ -203,10 +205,10 @@ block 3 (vn: i64, vsum: i64, vtos: i64) {
   br_if vbail 5(vsum, vtos2) 2(vn, vsum, vtos2)
   }
 block 4 (vn: i64, vsum: i64, vtos: i64) {
-  vda = i64.const 8
+  vda = i64.const 65544
   vd = i64.load vda
   vsum2 = i64.add vsum vd
-  vfa = i64.const 0
+  vfa = i64.const 65536
   vempty = i32.const 0
   i32.store vfa vempty
   vcnt = i32.const 1
@@ -232,17 +234,18 @@ block 5 (vsum: i64, vtos: i64) {
 /// explicit shared channel compose — exactly the separate-process discipline, in-process.
 const DETACHED_STAGES: &str = r#"
 memory 17
-data 0 "ring"
+data 16384 "ring"
 
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  vp = i64.const 0
+  vp = i64.const 16384
   vl = i64.const 4
   vh = self.resolve vp vl
   vg = call.cap 4 3 () -> (i64) vh ()
   vroff = i64.const 0
+  vwoff = i64.const 65536
   vprot = i32.const 3
-  vm = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vh (vroff, vroff, vg, vprot)
+  vm = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vh (vwoff, vroff, vg, vprot)
   vone = i64.const 1
   br 1(vone, vroff)
   }
@@ -252,12 +255,12 @@ block 1 (vi: i64, vtos: i64) {
   br_if vdone 5(vtos) 2(vi, vtos)
   }
 block 2 (vi: i64, vtos: i64) {
-  vfa = i64.const 0
+  vfa = i64.const 65536
   vf = i32.load vfa
   br_if vf 3(vi, vtos) 4(vi, vtos)
   }
 block 3 (vi: i64, vtos: i64) {
-  vfa = i64.const 0
+  vfa = i64.const 65536
   vexp = i32.const 1
   vto = i64.const 5000000000
   vst = i32.atomic.wait vfa vexp vto
@@ -270,9 +273,9 @@ block 3 (vi: i64, vtos: i64) {
   br_if vbail 5(vtos2) 2(vi, vtos2)
   }
 block 4 (vi: i64, vtos: i64) {
-  vda = i64.const 8
+  vda = i64.const 65544
   i64.store vda vi
-  vfa = i64.const 0
+  vfa = i64.const 65536
   vfull = i32.const 1
   i32.store vfa vfull
   vcnt = i32.const 1
@@ -292,13 +295,14 @@ block 5 (vtos: i64) {
 
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  vp = i64.const 0
+  vp = i64.const 16384
   vl = i64.const 4
   vh = self.resolve vp vl
   vg = call.cap 4 3 () -> (i64) vh ()
   vroff = i64.const 0
+  vwoff = i64.const 65536
   vprot = i32.const 3
-  vm = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vh (vroff, vroff, vg, vprot)
+  vm = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vh (vwoff, vroff, vg, vprot)
   vone = i64.const 1
   br 1(vone, vroff, vroff)
   }
@@ -308,12 +312,12 @@ block 1 (vn: i64, vsum: i64, vtos: i64) {
   br_if vdone 5(vsum, vtos) 2(vn, vsum, vtos)
   }
 block 2 (vn: i64, vsum: i64, vtos: i64) {
-  vfa = i64.const 0
+  vfa = i64.const 65536
   vf = i32.load vfa
   br_if vf 4(vn, vsum, vtos) 3(vn, vsum, vtos)
   }
 block 3 (vn: i64, vsum: i64, vtos: i64) {
-  vfa = i64.const 0
+  vfa = i64.const 65536
   vexp = i32.const 0
   vto = i64.const 5000000000
   vst = i32.atomic.wait vfa vexp vto
@@ -326,10 +330,10 @@ block 3 (vn: i64, vsum: i64, vtos: i64) {
   br_if vbail 5(vsum, vtos2) 2(vn, vsum, vtos2)
   }
 block 4 (vn: i64, vsum: i64, vtos: i64) {
-  vda = i64.const 8
+  vda = i64.const 65544
   vd = i64.load vda
   vsum2 = i64.add vsum vd
-  vfa = i64.const 0
+  vfa = i64.const 65536
   vempty = i32.const 0
   i32.store vfa vempty
   vcnt = i32.const 1
@@ -351,24 +355,24 @@ block 5 (vsum: i64, vtos: i64) {
 /// (entry 0) and consumer (entry 1) DETACHED from the granted module, join both → 410.
 const DETACHED_PIPELINE_PARENT: &str = r#"
 memory 17
-data 200 "ring"
+data 16584 "ring"
 
 func (i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   vlen = i64.const 65536
   vrh64 = call.cap 5 5 (i64) -> (i64) v1 (vlen)
   vrh = i32.wrap_i64 vrh64
-  va1 = i64.const 256
-  vv1 = i32.const 200
+  va1 = i64.const 16640
+  vv1 = i32.const 16584
   i32.store va1 vv1
-  va2 = i64.const 260
+  va2 = i64.const 16644
   vv2 = i32.const 4
   i32.store va2 vv2
-  va3 = i64.const 264
+  va3 = i64.const 16648
   i32.store va3 vrh
   vmh = i64.extend_i32_u v2
   vmin = i64.extend_i32_u v3
-  vgp = i64.const 256
+  vgp = i64.const 16640
   vgn = i64.const 1
   ve0 = i64.const 0
   ve1 = i64.const 1

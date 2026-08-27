@@ -96,7 +96,8 @@ fn gen_program(seed: u64) -> Program {
     }
     main.push_str("  vacc0 = i64.const 0\n");
     for c in 0..cells {
-        let addr = c * 8;
+        // Shared cells live above the #1094 NULL guard: base 16384 + cell*8.
+        let addr = 16384 + c * 8;
         let w = c + 1;
         main.push_str(&format!("  vaddr{c} = i64.const {addr}\n"));
         main.push_str(&format!("  vld{c} = i64.atomic.load vaddr{c}\n"));
@@ -120,7 +121,9 @@ block 0 (vsp: i64, varg: i64) {
   amount = i64.and mid mask
   iters = i64.and varg mask
   eight = i64.const 8
-  off = i64.mul cell eight
+  offc = i64.mul cell eight
+  base = i64.const 16384
+  off = i64.add offc base
   zero = i64.const 0
   br 1(zero, off, amount, iters)
 }

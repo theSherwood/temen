@@ -544,7 +544,16 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     // does), but one landing in this in-window globals/table region does not — the residual confinement
     // difference (wasm would trap it as past-linear-memory; co-locating the regions in one window keeps
     // it reachable). An exact-sized per-region window would remove even that, but is not needed here.
-    let globals_base = after_mem.div_ceil(8) * 8; // 8-byte aligned, just past the linear memory + cell
+    //
+    // #1094: the window unconditionally reserves `[0, POWERBOX_NULL_GUARD)` as an unmapped NULL guard
+    // (the host seeds it for every window >= the guard, and a transpiled window is always >= 64 KiB —
+    // see the `size_log2 >= 16` floor below). Linear memory stays 1:1 at offset 0 (a wasm NULL deref
+    // *should* trap, as on native), but the auto-placed globals/table/tid regions must not land inside
+    // the guard: floor their base at the guard so a module with a small-or-absent linear memory (e.g. a
+    // table-only dispatch module) keeps its table reachable. Any module that declares memory has
+    // `after_mem >= 64 KiB > guard`, so this is byte-identical there.
+    let reserved_floor = after_mem.max(temen_ir::POWERBOX_NULL_GUARD);
+    let globals_base = reserved_floor.div_ceil(8) * 8; // 8-byte aligned, just past the linear memory + cell
     let globals_types: Vec<ValType> = globals.iter().map(|(t, _)| *t).collect();
     for (g, (_, bytes)) in globals.iter().enumerate() {
         data.push(temen_ir::Data {

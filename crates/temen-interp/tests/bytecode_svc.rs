@@ -13,9 +13,9 @@
 use std::sync::Arc;
 use temen_interp::{bytecode, run_with_host, run_with_host_fast, Host, Value, SVC_QUEUE_CAP};
 
-/// The serving domain from the §3.6 slice-2 corpus, verbatim: offer "counter" op 0 = func 1
-/// `bump(x) -> old + x` over the LIVE value at mem[0]; `main` seeds mem[0] = 7, `svc.poll`s, and
-/// returns `served * 1000 + mem[0]`.
+/// The serving domain from the §3.6 slice-2 corpus: offer "counter" op 0 = func 1
+/// `bump(x) -> old + x` over the LIVE value at mem[16384] (above the #1094 NULL guard); `main` seeds
+/// that cell = 7, `svc.poll`s, and returns `served * 1000 + cell`.
 const SERVER: &str = r#"
 memory 16
 type 0 func (i64) -> (i64)
@@ -24,7 +24,7 @@ export 0 interface "counter" 1 { bump: 1 }
 
 func () -> (i64) {
 block 0 () {
-  va = i64.const 0
+  va = i64.const 16384
   vseed = i64.const 7
   i64.store va vseed
   vz = i32.const 0
@@ -39,7 +39,7 @@ block 0 () {
 
 func (i64) -> (i64) {
 block 0 (vx: i64) {
-  va = i64.const 0
+  va = i64.const 16384
   vold = i64.load va
   vnew = i64.add vold vx
   i64.store va vnew
@@ -58,7 +58,7 @@ export 0 interface "counter" 1 { bump: 1 }
 
 func () -> (i64) {
 block 0 () {
-  va = i64.const 0
+  va = i64.const 16384
   vseed = i64.const 7
   i64.store va vseed
   vz = i32.const 0
@@ -73,7 +73,7 @@ block 0 () {
 
 func (i64) -> (i64) {
 block 0 (vx: i64) {
-  va = i64.const 0
+  va = i64.const 16384
   vold = i64.load va
   vnew = i64.add vold vx
   i64.store va vnew
@@ -83,7 +83,7 @@ block 0 (vx: i64) {
 
 func () -> (i32) {
 block 0 () {
-  va = i64.const 8
+  va = i64.const 16392
   vexp = i32.const 0
   vto = i64.const 1000
   vst = i32.atomic.wait va vexp vto

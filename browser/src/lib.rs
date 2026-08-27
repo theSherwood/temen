@@ -3259,8 +3259,8 @@ fn pg_setup(
     let fsh = host.grant_host_proc(fs_hostfn);
     host.register_cap_name("fs", fsh);
     // Seed the caller's `argv` at the powerbox args base (Postgres: a slashed `argv[0]` so
-    // `find_my_exec` resolves; chibicc: `["chibicc", "/in.c"]`). #964: a `__null_guard`-marked
-    // module reads its args one guard higher — place the blob where its `_start` looks.
+    // `find_my_exec` resolves; chibicc: `["chibicc", "/in.c"]`). #964/#1094: a module reads its args
+    // one guard higher (the unconditional guarded layout) — place the blob where its `_start` looks.
     let blob = pg_args_blob(argv);
     let base = temen_ir::module_args_base(m) as usize;
     let mut init_mem = vec![0u8; base + blob.len()];

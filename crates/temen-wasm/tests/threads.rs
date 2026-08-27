@@ -62,14 +62,14 @@ fn parallel_counter_wat(nworkers: i32, steps: i32) -> String {
           (block $done
             (loop $lp
               (br_if $done (i32.ge_u (local.get $j) (i32.const {steps})))
-              (drop (i32.atomic.rmw.add (i32.const 0) (i32.const 1)))
+              (drop (i32.atomic.rmw.add (i32.const 16384) (i32.const 1)))
               (local.set $j (i32.add (local.get $j) (i32.const 1)))
               (br $lp)))
-          (drop (i32.atomic.rmw.sub (i32.const 4) (i32.const 1)))   ;; remaining -= 1
-          (drop (memory.atomic.notify (i32.const 4) (i32.const -1))))  ;; wake the main thread
+          (drop (i32.atomic.rmw.sub (i32.const 16388) (i32.const 1)))   ;; remaining -= 1
+          (drop (memory.atomic.notify (i32.const 16388) (i32.const -1))))  ;; wake the main thread
         (func (export "run") (result i32)
           (local $i i32) (local $r i32)
-          (i32.atomic.store (i32.const 4) (i32.const {nworkers}))    ;; remaining = nworkers
+          (i32.atomic.store (i32.const 16388) (i32.const {nworkers}))    ;; remaining = nworkers
           (block $spawned
             (loop $sp
               (br_if $spawned (i32.ge_u (local.get $i) (i32.const {nworkers})))
@@ -81,11 +81,11 @@ fn parallel_counter_wat(nworkers: i32, steps: i32) -> String {
           ;; rather than blocking on a stale value (a lost wakeup).
           (block $finished
             (loop $wait
-              (local.set $r (i32.atomic.load (i32.const 4)))
+              (local.set $r (i32.atomic.load (i32.const 16388)))
               (br_if $finished (i32.eqz (local.get $r)))
-              (drop (memory.atomic.wait32 (i32.const 4) (local.get $r) (i64.const 2000000000)))
+              (drop (memory.atomic.wait32 (i32.const 16388) (local.get $r) (i64.const 2000000000)))
               (br $wait)))
-          (i32.atomic.load (i32.const 0))))
+          (i32.atomic.load (i32.const 16384))))
       "#
     )
 }
@@ -107,14 +107,14 @@ fn parallel_narrow_counter_wat(nworkers: i32, steps: i32) -> String {
           (block $done
             (loop $lp
               (br_if $done (i32.ge_u (local.get $j) (i32.const {steps})))
-              (drop (i32.atomic.rmw16.add_u (i32.const 0) (i32.const 1)))
+              (drop (i32.atomic.rmw16.add_u (i32.const 16384) (i32.const 1)))
               (local.set $j (i32.add (local.get $j) (i32.const 1)))
               (br $lp)))
-          (drop (i32.atomic.rmw.sub (i32.const 4) (i32.const 1)))     ;; remaining -= 1 (full word)
-          (drop (memory.atomic.notify (i32.const 4) (i32.const -1))))
+          (drop (i32.atomic.rmw.sub (i32.const 16388) (i32.const 1)))     ;; remaining -= 1 (full word)
+          (drop (memory.atomic.notify (i32.const 16388) (i32.const -1))))
         (func (export "run") (result i32)
           (local $i i32) (local $r i32)
-          (i32.atomic.store (i32.const 4) (i32.const {nworkers}))
+          (i32.atomic.store (i32.const 16388) (i32.const {nworkers}))
           (block $spawned
             (loop $sp
               (br_if $spawned (i32.ge_u (local.get $i) (i32.const {nworkers})))
@@ -123,11 +123,11 @@ fn parallel_narrow_counter_wat(nworkers: i32, steps: i32) -> String {
               (br $sp)))
           (block $finished
             (loop $wait
-              (local.set $r (i32.atomic.load (i32.const 4)))
+              (local.set $r (i32.atomic.load (i32.const 16388)))
               (br_if $finished (i32.eqz (local.get $r)))
-              (drop (memory.atomic.wait32 (i32.const 4) (local.get $r) (i64.const 2000000000)))
+              (drop (memory.atomic.wait32 (i32.const 16388) (local.get $r) (i64.const 2000000000)))
               (br $wait)))
-          (i32.atomic.load16_u (i32.const 0))))
+          (i32.atomic.load16_u (i32.const 16384))))
       "#
     )
 }
@@ -164,17 +164,17 @@ fn spawn_returns_positive_tid() {
         (import "wasi" "thread-spawn" (func $spawn (param i32) (result i32)))
         (memory 1 1 shared)
         (func (export "wasi_thread_start") (param $tid i32) (param $start_arg i32)
-          (drop (i32.atomic.rmw.sub (i32.const 4) (i32.const 1)))
-          (drop (memory.atomic.notify (i32.const 4) (i32.const -1))))
+          (drop (i32.atomic.rmw.sub (i32.const 16388) (i32.const 1)))
+          (drop (memory.atomic.notify (i32.const 16388) (i32.const -1))))
         (func (export "run") (result i32)
           (local $tid i32) (local $r i32)
-          (i32.atomic.store (i32.const 4) (i32.const 1))
+          (i32.atomic.store (i32.const 16388) (i32.const 1))
           (local.set $tid (call $spawn (i32.const 0)))               ;; → tid (1)
           (block $finished
             (loop $wait
-              (local.set $r (i32.atomic.load (i32.const 4)))
+              (local.set $r (i32.atomic.load (i32.const 16388)))
               (br_if $finished (i32.eqz (local.get $r)))
-              (drop (memory.atomic.wait32 (i32.const 4) (local.get $r) (i64.const 2000000000)))
+              (drop (memory.atomic.wait32 (i32.const 16388) (local.get $r) (i64.const 2000000000)))
               (br $wait)))
           (local.get $tid)))"#;
     assert_eq!(run(wat, "run", &[]), 1, "first spawned tid is 1");

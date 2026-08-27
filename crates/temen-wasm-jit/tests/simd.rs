@@ -458,7 +458,7 @@ memory 16
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   v1 = i64x2.splat v0
-  v2 = i64.const 16
+  v2 = i64.const 16400
   v128.store v2 v1
   v3 = v128.load v2
   v4 = i64x2.add v3 v1
