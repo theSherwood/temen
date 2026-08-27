@@ -69,8 +69,8 @@ fn sret_proc_writes_into_destination() {
         text.contains("func (i64, i64, i64) -> ()"),
         "sret signature:\n{text}"
     );
-    let dst = 4096usize;
-    let mem = run_void_capture(&m, 0, &[dst as i64, 7, 9], 8192);
+    let dst = 20480usize;
+    let mem = run_void_capture(&m, 0, &[dst as i64, 7, 9], 24576);
     assert_eq!(read_i64(&mem, dst), 7, "x");
     assert_eq!(read_i64(&mem, dst + 8), 9, "y");
 }
@@ -91,7 +91,7 @@ fn caller_threads_destination_as_sret() {
    (var :p.0 . Pt.0. (call mk.0 a.0 b.0))
    (ret (add (i +64) (dot p.0 x.0 0) (dot p.0 y.0 0))))))";
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
-    let sp = 8192;
+    let sp = 24576;
     assert_eq!(run(&m, 1, &[sp, 3, 4]), 7);
     assert_eq!(run(&m, 1, &[sp, 100, -25]), 75);
 }
@@ -114,7 +114,7 @@ fn whole_aggregate_return_by_copy() {
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
     let text = temen_leng::translate_to_text(leng).unwrap();
     assert!(text.contains("mem.copy"), "return-by-copy:\n{text}");
-    let sp = 8192;
+    let sp = 24576;
     assert_eq!(run(&m, 1, &[sp, 5, 6]), 11);
     assert_eq!(run(&m, 1, &[sp, -3, 30]), 27);
 }
@@ -146,12 +146,12 @@ fn real_nimony_sret_direct() {
     // Real `mk` emits `var result: Pt; result = Pt(x,y); ret result` — the `result` aggregate is
     // frame-resident, so mk needs *both* a frame and the sret pointer: `(i64 $sp, i64 $sret, i64 a,
     // i64 b) -> ()`. It builds `result` in the frame, then copies it into the sret pointer. Give it a
-    // frame at 2048 and a destination at 4096, then read the copied Pt back.
+    // frame at 18432 and a destination at 20480, then read the copied Pt back.
     let m = temen_leng::translate_proc(REAL, "mk.0.")
         .unwrap_or_else(|e| panic!("translate real mk: {e}"));
-    let frame = 2048usize;
-    let dst = 4096usize;
-    let mem = run_void_capture(&m, 0, &[frame as i64, dst as i64, 11, 22], 8192);
+    let frame = 18432usize;
+    let dst = 20480usize;
+    let mem = run_void_capture(&m, 0, &[frame as i64, dst as i64, 11, 22], 24576);
     assert_eq!(read_i64(&mem, dst), 11, "x");
     assert_eq!(read_i64(&mem, dst + 8), 22, "y");
 }
@@ -163,7 +163,7 @@ fn real_nimony_sret_caller() {
     // procs lifted out of the module together (func 0 = mk, func 1 = mkSum).
     let m = temen_leng::translate_procs(REAL, &["mk.0.", "mkSum.0."])
         .unwrap_or_else(|e| panic!("translate real mk/mkSum: {e}"));
-    let sp = 8192;
+    let sp = 24576;
     assert_eq!(run(&m, 1, &[sp, 3, 4]), 7);
     assert_eq!(run(&m, 1, &[sp, 100, 200]), 300);
 }

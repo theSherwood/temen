@@ -29,25 +29,25 @@ use temen_verify::verify_module;
 const SRC: &str = r#"memory 17
 func (i32, i32, i32) -> (i64) {
 block 0 (vinst: i32, vout: i32, verr: i32) {
-  a0 = i64.const 0
-  n100 = i32.const 100
+  a0 = i64.const 16384
+  n100 = i32.const 16484
   i32.store a0 n100
-  a4 = i64.const 4
+  a4 = i64.const 16388
   n6 = i32.const 6
   i32.store a4 n6
-  a8 = i64.const 8
+  a8 = i64.const 16392
   i32.store a8 vout
-  a12 = i64.const 12
+  a12 = i64.const 16396
   z0 = i32.const 0
   i32.store a12 z0
-  a16 = i64.const 16
-  n110 = i32.const 110
+  a16 = i64.const 16400
+  n110 = i32.const 16494
   i32.store a16 n110
-  a20 = i64.const 20
+  a20 = i64.const 16404
   i32.store a20 n6
-  a24 = i64.const 24
+  a24 = i64.const 16408
   i32.store a24 verr
-  a28 = i64.const 28
+  a28 = i64.const 16412
   i32.store a28 z0
   cs = i32.const 115
   ct = i32.const 116
@@ -56,29 +56,29 @@ block 0 (vinst: i32, vout: i32, verr: i32) {
   cu = i32.const 117
   ce = i32.const 101
   cr = i32.const 114
-  p100 = i64.const 100
+  p100 = i64.const 16484
   i32.store8 p100 cs
-  p101 = i64.const 101
+  p101 = i64.const 16485
   i32.store8 p101 ct
-  p102 = i64.const 102
+  p102 = i64.const 16486
   i32.store8 p102 cd
-  p103 = i64.const 103
+  p103 = i64.const 16487
   i32.store8 p103 co
-  p104 = i64.const 104
+  p104 = i64.const 16488
   i32.store8 p104 cu
-  p105 = i64.const 105
+  p105 = i64.const 16489
   i32.store8 p105 ct
-  p110 = i64.const 110
+  p110 = i64.const 16494
   i32.store8 p110 cs
-  p111 = i64.const 111
+  p111 = i64.const 16495
   i32.store8 p111 ct
-  p112 = i64.const 112
+  p112 = i64.const 16496
   i32.store8 p112 cd
-  p113 = i64.const 113
+  p113 = i64.const 16497
   i32.store8 p113 ce
-  p114 = i64.const 114
+  p114 = i64.const 16498
   i32.store8 p114 cr
-  p115 = i64.const 115
+  p115 = i64.const 16499
   i32.store8 p115 cr
   ; spawn via record (op 17): entry=1 off=65536 sl=16 quota=0
   q0v0 = i64.const 4294967296
@@ -86,20 +86,21 @@ block 0 (vinst: i32, vout: i32, verr: i32) {
   q0v2 = i64.const -4294967280
   q0v3 = i64.const 4294967295
   q0v4 = i64.const 0
+  q0gp = i64.const 16384
   q0v5 = i64.const 2
-  q0a0 = i64.const 1152
+  q0a0 = i64.const 17536
   i64.store q0a0 q0v0
-  q0a1 = i64.const 1160
+  q0a1 = i64.const 17544
   i64.store q0a1 q0v1
-  q0a2 = i64.const 1168
+  q0a2 = i64.const 17552
   i64.store q0a2 q0v2
-  q0a3 = i64.const 1176
+  q0a3 = i64.const 17560
   i64.store q0a3 q0v3
-  q0a4 = i64.const 1184
+  q0a4 = i64.const 17568
   i64.store q0a4 q0v4
-  q0a5 = i64.const 1192
-  i64.store q0a5 q0v4
-  q0a6 = i64.const 1200
+  q0a5 = i64.const 17576
+  i64.store q0a5 q0gp
+  q0a6 = i64.const 17584
   i64.store q0a6 q0v5
   vch = call.cap 6 17 (i64) -> (i32) vinst (q0a0)
   r = call.cap 6 1 (i32) -> (i64) vinst (vch)

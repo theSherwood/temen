@@ -451,11 +451,12 @@ fn generated_migration_schedules_agree_on_interp_and_jit() {
         arg: i64,
     }
 
-    /// Emit one resume step into a function body. `addr_base + 4*fiber` holds the fiber's handle
-    /// (the root stores each handle right after `cont.new`). Accumulates `1000*status + value`.
+    /// Emit one resume step into a function body. `16400 + 8*fiber` (the handle table, above the
+    /// #1094 NULL guard) holds the fiber's handle (the root stores each handle right after
+    /// `cont.new`). Accumulates `1000*status + value`.
     fn emit_step(src: &mut String, v: &mut u32, step: &Step, acc: u32) -> u32 {
         let a = *v;
-        writeln!(src, "  v{a} = i64.const {}", 16 + 8 * step.fiber).unwrap();
+        writeln!(src, "  v{a} = i64.const {}", 16 + 8 * step.fiber + 16384).unwrap();
         writeln!(src, "  v{} = i64.load v{a}", a + 1).unwrap(); // i64 fiber handle
         writeln!(src, "  v{} = i64.const {}", a + 2, step.arg).unwrap();
         writeln!(
@@ -521,7 +522,7 @@ fn generated_migration_schedules_agree_on_interp_and_jit() {
 
         // ---- Emit the module: func 0 = root, funcs 1..=nw = workers, then the fiber bodies.
         let mut src = String::from("memory 16\n");
-        // Root: create the fibers (handle of fiber f stored at mem[16+8f]), then run its phases,
+        // Root: create the fibers (handle of fiber f stored at mem[16400+8f], above the #1094 NULL guard), then run its phases,
         // spawning + joining each worker in between (strictly sequential).
         src.push_str("func () -> (i64) {\nblock 0 () {\n");
         let mut v: u32 = 0;
@@ -529,7 +530,7 @@ fn generated_migration_schedules_agree_on_interp_and_jit() {
             writeln!(src, "  v{v} = ref.func {}", 1 + nw + f).unwrap();
             writeln!(src, "  v{} = i64.const {}", v + 1, 4096 * (f + 1)).unwrap();
             writeln!(src, "  v{} = cont.new v{v} v{}", v + 2, v + 1).unwrap();
-            writeln!(src, "  v{} = i64.const {}", v + 3, 16 + 8 * f).unwrap();
+            writeln!(src, "  v{} = i64.const {}", v + 3, 16 + 8 * f + 16384).unwrap();
             writeln!(src, "  i64.store v{} v{}", v + 3, v + 2).unwrap();
             v += 4;
         }

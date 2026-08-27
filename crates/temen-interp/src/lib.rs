@@ -707,9 +707,10 @@ struct SeekInit {
     ///
     /// [`attach_scheduled_seeded`]: Inspector::attach_scheduled_seeded
     seed: Option<u64>,
-    /// The module's NULL-guard extent (#964/#1059): `POWERBOX_NULL_GUARD` for a `__null_guard`-marked
-    /// module, `0` for a legacy one. Captured from the module at attach so `seek`'s freshly-rebuilt
-    /// `Mem` re-seeds `[0, guard)` `Unmapped` — a NULL deref traps identically on a debugger attach and
+    /// The module's NULL-guard extent (#964/#1094): `POWERBOX_NULL_GUARD` for every module (the guard
+    /// is unconditional; `0` only for a sub-window smaller than the guard). Captured from the module at
+    /// attach so `seek`'s freshly-rebuilt `Mem` re-seeds `[0, guard)` `Unmapped` — a NULL deref traps
+    /// identically on a debugger attach and
     /// its replay, not only on a direct run (the bare funcs/data the harness rebuilds from carry no
     /// marker of their own).
     null_guard: u64,
@@ -962,9 +963,9 @@ impl Inspector {
         let mem = memory.map(|mc| {
             let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
             mm.init_data(data);
-            // #964/#1059: this harness gets bare funcs/data, never the module, so the caller threads
-            // the module's `__null_guard` extent in — `[0, guard)` seeds `Unmapped` and a NULL deref
-            // traps on a debugger attach/seek exactly as on a direct run (`0` = legacy, unguarded).
+            // #964/#1094: this harness gets bare funcs/data, never the module, so the caller threads
+            // the module's guard extent in — `[0, guard)` seeds `Unmapped` and a NULL deref traps on a
+            // debugger attach/seek exactly as on a direct run (unconditional; `0` only for a sub-window).
             mm.seed_null_guard(null_guard);
             mm
         });
@@ -4486,9 +4487,10 @@ struct ExecReq {
     /// Entry args in the fresh powerbox: the granted `Instantiator`, then `AddressSpace` iff the
     /// command's entry takes two params (§14 child-entry ABI).
     entry_args: Vec<Value>,
-    /// The command module's NULL-guard extent (#1059): `POWERBOX_NULL_GUARD` for a `__null_guard`-marked
-    /// command, `0` for a legacy one. The preserved exec args region rides it (`commit_fresh_image`), so
-    /// a guarded command's `_start` finds argv where it reads it (`module_args_base` = `guard + 128`).
+    /// The command module's NULL-guard extent (#1059/#1094): `POWERBOX_NULL_GUARD` for every command
+    /// (unconditional; `0` only for a sub-window smaller than the guard). The preserved exec args region
+    /// rides it (`commit_fresh_image`), so a command's `_start` finds argv where it reads it
+    /// (`module_args_base` = `guard + 128`).
     null_guard: u64,
 }
 
@@ -8494,6 +8496,13 @@ impl FiberRegistry {
         // a freed (cleared) bit is the recycling that lifts the lifetime cap to peak-concurrent.
         let floor = t.fibers.len();
         let mut c = MAX_SHADOW_CTX;
+        // #1094: `SHADOW_BASE` moved one guard up, so the top `MAX_SHADOW_CTX` regions no longer all fit
+        // under `DURABLE_RESERVE` — skip the non-fitting top contexts before searching, exactly as the
+        // fiber path gates `cont.new` with [`shadow_region_fits`]. (Before the guard relocation every
+        // context fit, so this loop was a no-op.)
+        while c > floor && !shadow_region_fits(c) {
+            c -= 1;
+        }
         while c > floor {
             if t.vcpu_mask & (1 << c) == 0 {
                 t.vcpu_mask |= 1 << c;
@@ -18892,6 +18901,7 @@ impl Host {
         data: &[Data],
         mapped: u64,
         npages: usize,
+        null_guard: u64,
     ) -> Vec<CapturedProt> {
         // Default: Rw in the backed prefix, Unmapped in the reserved tail.
         let mut out: Vec<CapturedProt> = (0..npages as u64)
@@ -18903,11 +18913,22 @@ impl Host {
                 }
             })
             .collect();
+        let host = host_page_size();
+        // #1094: the NULL guard seeds `[0, null_guard)` `Unmapped` at window construction
+        // (`seed_null_guard`) — outside `cap_pages`, so reconstruct it here (mirroring the same
+        // host-page-alignment / `guard <= mapped` gate) or this capture would report the guard pages
+        // `Rw` and diverge from the interpreter's `snapshot_prots` (and un-seed the guard on thaw).
+        // Runtime `map`/`protect` below still overrides, matching the live seed→init→runtime order.
+        if null_guard > 0 && null_guard.is_multiple_of(host) && null_guard <= mapped {
+            let guard_pages = (null_guard / DURABLE_SNAPSHOT_PAGE).min(npages as u64);
+            for p in 0..guard_pages {
+                out[p as usize] = CapturedProt::Unmapped;
+            }
+        }
         // `readonly` data segments → Ro. Protection is **host-page** granular (the runtime's
         // `protect_ro` and the interpreter's `init_data` protect the whole host page), so a
         // segment marks every codec page of the host page(s) it touches — this is what makes the
         // result match `snapshot_prots` on a host whose page is larger than a codec page.
-        let host = host_page_size();
         for d in data {
             if !d.readonly || d.bytes.is_empty() {
                 continue;
@@ -19845,8 +19866,8 @@ impl Host {
     /// `self.type_id`, `self.covers`, and `export.handle` resolve through one host-side
     /// entry on all three backends. Unregistered, those ops fail closed (probeable `CapFault`).
     pub fn set_self_module(&mut self, m: &Arc<Module>) {
-        // #964: a `__null_guard`-marked module's window reserves `[0, guard)`. Recording it here —
-        // the one place every run path registers the running module — lets the native JIT's
+        // #964/#1094: every module's window reserves `[0, guard)` (the unconditional guard). Recording
+        // it here — the one place every run path registers the running module — lets the native JIT's
         // Memory-cap backend (`temen-run`'s `MprotectWindow`, rebuilt per `call.cap` with no module
         // in reach) mirror the interpreter's refusal/unmapped semantics for the reserved region.
         self.null_guard = temen_ir::module_null_guard(m).unwrap_or(0);
@@ -23118,10 +23139,10 @@ struct Mem {
     /// Host page size (`host_page_size()`): protection + storage-chunk granularity. Cached per
     /// `Mem` so every method shares the one host-queried value (matches the JIT's `mprotect`).
     page: u64,
-    /// #964 trap-on-NULL: the reserved NULL extent — `[0, null_guard)` is seeded `Unmapped` for a
-    /// `__null_guard`-marked module ([`Mem::seed_null_guard`]) and **permanently refused** to the
-    /// page ops (`prot_pages` returns `EINVAL` below it, the `mmap_min_addr` analogue — what keeps
-    /// the tiers' baked guard constant sound). `0` = unguarded (every legacy module). A guard fault
+    /// #964/#1094 trap-on-NULL: the reserved NULL extent — `[0, null_guard)` is seeded `Unmapped` for
+    /// every module ([`Mem::seed_null_guard`]) and **permanently refused** to the page ops
+    /// (`prot_pages` returns `EINVAL` below it, the `mmap_min_addr` analogue — what keeps the tiers'
+    /// baked guard constant sound). `0` only for a sub-window smaller than the guard. A guard fault
     /// is **fatal**, never a §14 recoverable page fault (a demand parent could not legally map it).
     null_guard: u64,
     /// The anonymous-page backing: a [`temen_mem::Region`] (`#![forbid(unsafe_code)]`-friendly) sized
@@ -23562,11 +23583,11 @@ impl Mem {
         self.prot_dirty.store(true, Ordering::Release);
     }
 
-    /// #964 trap-on-NULL: seed the reserved NULL region for a `__null_guard`-marked module —
+    /// #964/#1094 trap-on-NULL: seed the reserved NULL region for a module (unconditional guard) —
     /// `[0, guard)` becomes `Unmapped` (a guest access traps exactly like native) and `prot_pages`
     /// permanently refuses the page ops below `guard` (the `mmap_min_addr` analogue, which keeps
-    /// the JIT tiers' baked guard constant sound). `guard = 0` (an unmarked module) is a no-op —
-    /// the legacy fast paths stay lock-free. The guard is a multiple of every supported page size
+    /// the JIT tiers' baked guard constant sound). `guard = 0` (a sub-window smaller than the guard) is
+    /// a no-op — those fast paths stay lock-free. The guard is a multiple of every supported page size
     /// (16 KiB = the max host page; the browser's software page is 4 KiB), asserted here.
     pub(crate) fn seed_null_guard(&mut self, guard: u64) {
         // Page-exact or skip: on a host whose page exceeds the guard (e.g. 64 KiB aarch64), a
@@ -24464,12 +24485,20 @@ impl Mem {
             return true; // never mutated ⇒ the prefix is plain Rw throughout
         }
         let mapped_pages = self.window.mapped() / self.page;
+        // The #1094 NULL guard marks pages `[0, null_guard)` `Unmapped` and dirties the prot map, but
+        // it is a *deterministic* overlay re-seeded on every fresh window (`seed_null_guard`): a
+        // bytes-only `window_snapshot`/`seed` round-trip still reproduces the guest-visible state
+        // exactly — the guard's backing bytes are inert (`check_prot` refuses guest reads there) and
+        // its `Unmapped` protection is reconstructed on restore, not captured. So admit those guard
+        // pages alongside the benign in-prefix `Rw` commits; any other protection (`Ro`/unmap/grow/
+        // `Backed`) still fails this bytes-only check and falls back to replay-from-clock-0.
+        let guard_pages = self.null_guard / self.page;
         let space = self.space.read_unpoisoned();
         space.regions.is_empty()
-            && space
-                .prot
-                .iter()
-                .all(|(&pg, p)| matches!(p, PageProt::Rw) && pg < mapped_pages)
+            && space.prot.iter().all(|(&pg, p)| {
+                (matches!(p, PageProt::Rw) && pg < mapped_pages)
+                    || (matches!(p, PageProt::Unmapped) && pg < guard_pages)
+            })
     }
 
     /// The full mapped window, for a time-travel checkpoint (restored with [`seed`](Mem::seed)).
@@ -26324,12 +26353,15 @@ mod domain_teardown_tests {
     /// Root spawns a daemon that parks on an **indefinite** `i32.atomic.wait`, does a 10 ms timed
     /// wait of its own (nobody notifies — it times out, having let the daemon park), then calls
     /// `Exit(3)`. The parked daemon must be abandoned at the exit, never waited out.
+    // #1094: the NULL guard is unconditional, so `[0, POWERBOX_NULL_GUARD)` is unmapped for every
+    // module — these hand-written test modules keep their futex words above the guard (16384 for the
+    // daemon's, 16392 for the root's) instead of at 0/8, or the `atomic.wait`s fault before they park.
     const EXIT_WITH_PARKED_DAEMON: &str = r#"memory 16
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = thread.spawn 1 v1 v1
-  v3 = i64.const 8
+  v3 = i64.const 16392
   v4 = i32.const 0
   v5 = i64.const 10000000
   v6 = i32.atomic.wait v3 v4 v5
@@ -26340,7 +26372,7 @@ block 0 (v0: i32) {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, v0: i64) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   v2 = i32.const 0
   v3 = i64.const -1
   v4 = i32.atomic.wait v1 v2 v3
@@ -26357,7 +26389,7 @@ func () -> (i64) {
 block 0 () {
   v0 = i64.const 0
   v1 = thread.spawn 1 v0 v0
-  v2 = i64.const 8
+  v2 = i64.const 16392
   v3 = i32.const 0
   v4 = i64.const 10000000
   v5 = i32.atomic.wait v2 v3 v4
@@ -26367,7 +26399,7 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, v0: i64) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   v2 = i32.const 0
   v3 = i64.const -1
   v4 = i32.atomic.wait v1 v2 v3
@@ -26385,7 +26417,7 @@ func () -> (i64) {
 block 0 () {
   v0 = i64.const 0
   v1 = thread.spawn 1 v0 v0
-  v2 = i64.const 8
+  v2 = i64.const 16392
   v3 = i32.const 0
   v4 = i64.const 8000000000
   v5 = i32.atomic.wait v2 v3 v4
@@ -26485,25 +26517,26 @@ block 0 (vsp: i64, v0: i64) {
     const CHILD_TRAP_POLLED: &str = r#"memory 17
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  ; spawn via record (op 17): entry=1 off=65536 sl=12 quota=0
+  ; spawn via record (op 17): entry=1 off=65536 sl=12 quota=0. #1094: the record + names sit above
+  ; the unconditional NULL guard (base 17536 = 16384 + 1152), since [0, 16384) is now unmapped.
   q0v0 = i64.const 4294967296
   q0v1 = i64.const 65536
   q0v2 = i64.const -4294967284
   q0v3 = i64.const 4294967295
   q0v4 = i64.const 0
-  q0a0 = i64.const 1152
+  q0a0 = i64.const 17536
   i64.store q0a0 q0v0
-  q0a1 = i64.const 1160
+  q0a1 = i64.const 17544
   i64.store q0a1 q0v1
-  q0a2 = i64.const 1168
+  q0a2 = i64.const 17552
   i64.store q0a2 q0v2
-  q0a3 = i64.const 1176
+  q0a3 = i64.const 17560
   i64.store q0a3 q0v3
-  q0a4 = i64.const 1184
+  q0a4 = i64.const 17568
   i64.store q0a4 q0v4
-  q0a5 = i64.const 1192
+  q0a5 = i64.const 17576
   i64.store q0a5 q0v4
-  q0a6 = i64.const 1200
+  q0a6 = i64.const 17584
   i64.store q0a6 q0v4
   v5 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   br 1(v0, v5)
@@ -26515,7 +26548,7 @@ block 1 (v6: i32, v7: i32) {
   br_if v10 2(v6, v7) 3(v8)
 }
 block 2 (v11: i32, v12: i32) {
-  v13 = i64.const 8
+  v13 = i64.const 16392
   v14 = i32.const 0
   v15 = i64.const 5000000
   v16 = i32.atomic.wait v13 v14 v15

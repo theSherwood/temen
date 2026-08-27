@@ -270,7 +270,7 @@ fn define_extra_unknown_signature_traps_fail_closed() {
     );
 }
 
-const MEM_PARENT: &str = "memory 16\nfunc () -> (i32) {\nblock 0 () {\n  v0 = i64.const 8\n  v1 = i32.load v0\n  return v1\n  }\n}\n";
+const MEM_PARENT: &str = "memory 16\nfunc () -> (i32) {\nblock 0 () {\n  v0 = i64.const 16392\n  v1 = i32.load v0\n  return v1\n  }\n}\n";
 
 /// Extra code shares the parent's window environment (DESIGN.md §22 "vmctx sharing"): it is
 /// compiled against the same confinement mask + backed extent, so its memory effects match
@@ -280,8 +280,8 @@ const MEM_PARENT: &str = "memory 16\nfunc () -> (i32) {\nblock 0 () {\n  v0 = i6
 #[test]
 fn define_extra_masking_matches_interp_memory_effects() {
     let mut cm = compile(MEM_PARENT);
-    // In-window: store 0xAB at offset 8, read it back.
-    let store_src = "memory 16\nfunc () -> (i32) {\nblock 0 () {\n  v0 = i64.const 8\n  v1 = i32.const 171\n  i32.store8 v0 v1\n  v2 = i64.const 8\n  v3 = i32.load8_u v2\n  return v3\n  }\n}\n";
+    // In-window: store 0xAB at offset 16392 (above the #1094 NULL guard), read it back.
+    let store_src = "memory 16\nfunc () -> (i32) {\nblock 0 () {\n  v0 = i64.const 16392\n  v1 = i32.const 171\n  i32.store8 v0 v1\n  v2 = i64.const 16392\n  v3 = i32.load8_u v2\n  return v3\n  }\n}\n";
     let extra = parse_module(store_src).expect("parse");
     verify_module(&extra).expect("verify");
     let mut fuel = 1_000_000u64;
@@ -298,8 +298,8 @@ fn define_extra_masking_matches_interp_memory_effects() {
         "{out:?}"
     );
     // Escape-oracle: exactly the stored byte changed.
-    assert_eq!(final_mem[8], 0xab);
-    assert!(final_mem[..8].iter().all(|&b| b == 0));
+    assert_eq!(final_mem[16392], 0xab);
+    assert!(final_mem[..16392].iter().all(|&b| b == 0));
 
     // Beyond `mapped` (64 KiB) but inside the reserved mask domain: a guard fault —
     // detect-and-kill — on the JIT, agreeing with the interpreter.

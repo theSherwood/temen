@@ -4692,8 +4692,11 @@ mod tests {
     }
     use temen_verify::verify_module;
 
-    const HEAP_BASE: u64 = 4096;
-    const HEAP_END: u64 = 64 << 10;
+    // Heap arena, shifted up by the #1094 NULL guard (16384) so every malloc/getenv-materialized
+    // pointer lands above the unconditionally-unmapped `[0, 16384)` region: base 4096 -> 20480,
+    // end 65536 -> 81920 (arena size preserved). Still well within the WIN window below.
+    const HEAP_BASE: u64 = 20480;
+    const HEAP_END: u64 = 80 << 10;
     const WIN: usize = 128 << 10;
 
     /// #863 slice 1 — the World/Proc fork contract, unit-level. [`Proc::fork`] copies the
@@ -5501,7 +5504,8 @@ mod tests {
 
     /// func 0 `(host_proc_handle) -> i64`: `malloc(2)`, store `"hi"` into the returned buffer,
     /// `write(1, ptr, 2)`, then encode `write_result * 1_000_000 + ptr`. `malloc` hands out the aligned
-    /// heap base (`4096`), `write` returns `2`, so the result is `2_004096` — and stdout is `"hi"`.
+    /// heap base (`20480`, above the #1094 NULL guard), `write` returns `2`, so the result is
+    /// `2_020480` — and stdout is `"hi"`.
     const MALLOC_WRITE: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (vph: i32) {\n\
@@ -5679,10 +5683,10 @@ block 0 (vph: i32) {\n\
     fn malloc_store_write_matches_across_backends() {
         let (ir, iout) = run_interp(MALLOC_WRITE, b"");
         let (jo, jout) = run_jit(MALLOC_WRITE, b"");
-        // Interpreter reference: malloc → 4096, write → 2, so 2*1_000_000 + 4096 = 2_004096; "hi" out.
+        // Interpreter reference: malloc → 20480, write → 2, so 2*1_000_000 + 20480 = 2_020480; "hi" out.
         assert_eq!(
             ir,
-            Ok(vec![Value::I64(2_004_096)]),
+            Ok(vec![Value::I64(2_020_480)]),
             "interp: malloc+write result"
         );
         assert_eq!(
@@ -5691,7 +5695,7 @@ block 0 (vph: i32) {\n\
         );
         // JIT parity: the HostProc dispatches through the same Host path, so identical result + output.
         assert!(
-            matches!(jo, JitOutcome::Returned(ref s) if s == &[2_004_096]),
+            matches!(jo, JitOutcome::Returned(ref s) if s == &[2_020_480]),
             "jit: must match interp, got {jo:?}"
         );
         assert_eq!(jout, iout, "jit: stdout must match interp");
@@ -5703,26 +5707,26 @@ block 0 (vph: i32) {\n\
     const FILE_ROUNDTRIP: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (vph: i32) {\n\
-  vpath = i64.const 0\n\
+  vpath = i64.const 16384\n\
   vfch = i32.const 102\n\
   i32.store8 vpath vfch\n\
   vplen = i64.const 1\n\
   vflags = i64.const 66\n\
   vfd = call.cap 13 5 (i64, i64, i64) -> (i64) vph (vpath, vplen, vflags)\n\
-  a16 = i64.const 16\n\
+  a16 = i64.const 16400\n\
   cH = i32.const 72\n\
   i32.store8 a16 cH\n\
-  a17 = i64.const 17\n\
+  a17 = i64.const 16401\n\
   ci = i32.const 105\n\
   i32.store8 a17 ci\n\
-  a18 = i64.const 18\n\
+  a18 = i64.const 16402\n\
   cbang = i32.const 33\n\
   i32.store8 a18 cbang\n\
   vwlen = i64.const 3\n\
   vw = call.cap 13 0 (i64, i64, i64) -> (i64) vph (vfd, a16, vwlen)\n\
   vzero = i64.const 0\n\
   vsk = call.cap 13 7 (i64, i64, i64) -> (i64) vph (vfd, vzero, vzero)\n\
-  a32 = i64.const 32\n\
+  a32 = i64.const 16416\n\
   veight = i64.const 8\n\
   vr = call.cap 13 1 (i64, i64, i64) -> (i64) vph (vfd, a32, veight)\n\
   vfd1 = i64.const 1\n\
@@ -5800,7 +5804,7 @@ block 0 (vph: i32) {\n\
     const UNLINK_THEN_OPEN: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (vph: i32) {\n\
-  vpath = i64.const 0\n\
+  vpath = i64.const 16384\n\
   vg = i32.const 103\n\
   i32.store8 vpath vg\n\
   vplen = i64.const 1\n\
@@ -5868,7 +5872,7 @@ block 0 (vph: i32) {\n\
     const DUP2_REDIRECT: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (vph: i32) {\n\
-  vp = i64.const 100\n\
+  vp = i64.const 16484\n\
   vf = i32.const 102\n\
   i32.store8 vp vf\n\
   vlen = i64.const 1\n\
@@ -6153,32 +6157,32 @@ block 0 (vph: i32) {\n\
     const SPAWN_REDIRECT: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (vph: i32) {\n\
-  vp0 = i64.const 110\n\
+  vp0 = i64.const 16494\n\
   voo = i32.const 111\n\
   i32.store8 vp0 voo\n\
-  vp1 = i64.const 111\n\
+  vp1 = i64.const 16495\n\
   vu2 = i32.const 117\n\
   i32.store8 vp1 vu2\n\
-  vp2 = i64.const 112\n\
+  vp2 = i64.const 16496\n\
   vtt = i32.const 116\n\
   i32.store8 vp2 vtt\n\
-  vn0 = i64.const 100\n\
+  vn0 = i64.const 16484\n\
   vuu = i32.const 117\n\
   i32.store8 vn0 vuu\n\
-  vn1 = i64.const 101\n\
+  vn1 = i64.const 16485\n\
   vpp = i32.const 112\n\
   i32.store8 vn1 vpp\n\
-  vpath = i64.const 110\n\
+  vpath = i64.const 16494\n\
   vplen = i64.const 3\n\
   vflags = i64.const 577\n\
   vfd = call.cap 13 5 (i64, i64, i64) -> (i64) vph (vpath, vplen, vflags)\n\
   vone = i64.const 1\n\
   vd = call.cap 13 24 (i64, i64) -> (i64) vph (vfd, vone)\n\
-  vnm = i64.const 100\n\
+  vnm = i64.const 16484\n\
   vnl = i64.const 2\n\
   vz = i64.const 0\n\
   vpid = call.cap 13 27 (i64, i64, i64, i64) -> (i64) vph (vnm, vnl, vz, vz)\n\
-  vsb = i64.const 120\n\
+  vsb = i64.const 16504\n\
   vr = call.cap 13 28 (i64, i64, i64) -> (i64) vph (vpid, vsb, vz)\n\
   return vr\n\
   }\n\
@@ -6379,20 +6383,20 @@ block 0 (vph: i32) {\n\
     /// func 0 `(handle) -> i64`: `getenv("PATH")` (name bytes staged at offset 0 by the harness), then
     /// `write(1, ptr, 4)` echoing the first 4 bytes of the value to stdout, and return the returned
     /// pointer. With `PATH=/bin` staged host-side, `getenv` materializes `"/bin\0"` in the arena at the
-    /// heap base (`4096`) and returns it; stdout is `"/bin"`.
+    /// heap base (`20480`, above the #1094 NULL guard) and returns it; stdout is `"/bin"`.
     const GETENV_ECHO: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (vph: i32) {\n\
-  vp = i64.const 0\n\
+  vp = i64.const 16384\n\
   vP = i32.const 80\n\
   i32.store8 vp vP\n\
-  vp1 = i64.const 1\n\
+  vp1 = i64.const 16385\n\
   vA = i32.const 65\n\
   i32.store8 vp1 vA\n\
-  vp2 = i64.const 2\n\
+  vp2 = i64.const 16386\n\
   vT = i32.const 84\n\
   i32.store8 vp2 vT\n\
-  vp3 = i64.const 3\n\
+  vp3 = i64.const 16387\n\
   vH = i32.const 72\n\
   i32.store8 vp3 vH\n\
   vnlen = i64.const 4\n\
@@ -6438,7 +6442,7 @@ block 0 (vph: i32) {\n\
         )
         .expect("jit")
         .0;
-        // getenv materializes "/bin\0" at the aligned heap base (4096) and returns it.
+        // getenv materializes "/bin\0" at the aligned heap base (20480) and returns it.
         assert_eq!(
             ir,
             Ok(vec![Value::I64(HEAP_BASE as i64)]),
@@ -6463,31 +6467,32 @@ block 0 (vph: i32) {\n\
     /// `Posix` handle wrote host-side. (The interp half — `fork_powerbox` carrying the factory across a
     /// twin — is pinned by `temen-interp`'s `fork_carries_a_forkable_host_proc_via_its_factory`.)
     ///
-    /// func 0 `(handle) -> i64`: stage `"greet"` at offset 0, `open(., 5, O_RDONLY)` → fd, `read(fd,
-    /// buf=32, 3)`, `write(1, buf, 3)` echoing to stdout, return the byte count.
+    /// func 0 `(handle) -> i64`: stage `"greet"` at offset 16384 (above the #1094 NULL guard),
+    /// `open(., 5, O_RDONLY)` → fd, `read(fd, buf=16416, 3)`, `write(1, buf, 3)` echoing to stdout,
+    /// return the byte count.
     const READ_GREET: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (vph: i32) {\n\
-  vp0 = i64.const 0\n\
+  vp0 = i64.const 16384\n\
   vg = i32.const 103\n\
   i32.store8 vp0 vg\n\
-  vp1 = i64.const 1\n\
+  vp1 = i64.const 16385\n\
   vr = i32.const 114\n\
   i32.store8 vp1 vr\n\
-  vp2 = i64.const 2\n\
+  vp2 = i64.const 16386\n\
   ve = i32.const 101\n\
   i32.store8 vp2 ve\n\
-  vp3 = i64.const 3\n\
+  vp3 = i64.const 16387\n\
   ve2 = i32.const 101\n\
   i32.store8 vp3 ve2\n\
-  vp4 = i64.const 4\n\
+  vp4 = i64.const 16388\n\
   vt = i32.const 116\n\
   i32.store8 vp4 vt\n\
-  vpath = i64.const 0\n\
+  vpath = i64.const 16384\n\
   vplen = i64.const 5\n\
   vflags = i64.const 0\n\
   vfd = call.cap 13 5 (i64, i64, i64) -> (i64) vph (vpath, vplen, vflags)\n\
-  vbuf = i64.const 32\n\
+  vbuf = i64.const 16416\n\
   vcap = i64.const 3\n\
   vn = call.cap 13 1 (i64, i64, i64) -> (i64) vph (vfd, vbuf, vcap)\n\
   vfd1 = i64.const 1\n\
@@ -6529,28 +6534,29 @@ block 0 (vph: i32) {\n\
         );
     }
 
-    /// func 0 `(handle) -> i64`: `chdir("/tmp")` (path bytes staged at offset 0), then `getcwd(buf, 8)`
-    /// into a scratch window buffer, echo the result (minus its NUL) to stdout, and return
-    /// `chdir_result * 1_000_000 + getcwd_ptr`. A working roundtrip: `chdir` → `0`, `getcwd` writes
-    /// `"/tmp\0"` and returns the buffer offset (32) → `0*1_000_000 + 32 = 32`; stdout is `"/tmp"`.
+    /// func 0 `(handle) -> i64`: `chdir("/tmp")` (path bytes staged at offset 16384, above the #1094
+    /// NULL guard), then `getcwd(buf, 8)` into a scratch window buffer, echo the result (minus its NUL)
+    /// to stdout, and return `chdir_result * 1_000_000 + getcwd_ptr`. A working roundtrip: `chdir` → `0`,
+    /// `getcwd` writes `"/tmp\0"` and returns the buffer offset (16416) → `0*1_000_000 + 16416 = 16416`;
+    /// stdout is `"/tmp"`.
     const CHDIR_GETCWD: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (vph: i32) {\n\
-  vp = i64.const 0\n\
+  vp = i64.const 16384\n\
   vsl = i32.const 47\n\
   i32.store8 vp vsl\n\
-  vp1 = i64.const 1\n\
+  vp1 = i64.const 16385\n\
   vt = i32.const 116\n\
   i32.store8 vp1 vt\n\
-  vp2 = i64.const 2\n\
+  vp2 = i64.const 16386\n\
   vm = i32.const 109\n\
   i32.store8 vp2 vm\n\
-  vp3 = i64.const 3\n\
+  vp3 = i64.const 16387\n\
   vpc = i32.const 112\n\
   i32.store8 vp3 vpc\n\
   vplen = i64.const 4\n\
   vcd = call.cap 13 10 (i64, i64) -> (i64) vph (vp, vplen)\n\
-  vbuf = i64.const 32\n\
+  vbuf = i64.const 16416\n\
   veight = i64.const 8\n\
   vgc = call.cap 13 9 (i64, i64) -> (i64) vph (vbuf, veight)\n\
   vfd1 = i64.const 1\n\
@@ -6567,15 +6573,15 @@ block 0 (vph: i32) {\n\
     fn chdir_then_getcwd_roundtrips_on_both() {
         let (ir, iout) = run_interp(CHDIR_GETCWD, b"");
         let (jo, jout) = run_jit(CHDIR_GETCWD, b"");
-        // chdir 0, getcwd returns buf (32) → 0*1_000_000 + 32 = 32; stdout "/tmp".
+        // chdir 0, getcwd returns buf (16416) → 0*1_000_000 + 16416 = 16416; stdout "/tmp".
         assert_eq!(
             ir,
-            Ok(vec![Value::I64(32)]),
+            Ok(vec![Value::I64(16416)]),
             "interp: chdir then getcwd roundtrip"
         );
         assert_eq!(iout, b"/tmp", "interp: getcwd wrote the new cwd");
         assert!(
-            matches!(jo, JitOutcome::Returned(ref s) if s == &[32]),
+            matches!(jo, JitOutcome::Returned(ref s) if s == &[16416]),
             "jit: roundtrip must match interp, got {jo:?}"
         );
         assert_eq!(jout, iout, "jit: getcwd output must match interp");
@@ -7107,7 +7113,7 @@ block 0 (vph: i32) {\n\
     /// call site carries a dummy `i32.const 0` handle operand (vestigial in static dispatch —
     /// IMPORTS.md §2.5), and the entry takes **no capability parameters at all** — the granted
     /// handle arrives through the slot binding ([`bind`]), never through an entry argument
-    /// (→ `2_004096`, `"hi"`).
+    /// (→ `2_020480`, `"hi"` — malloc base above the #1094 NULL guard).
     const IMPORT_BOUND_MALLOC_WRITE: &str = "memory 17\n\
 func () -> (i64) {\n\
 block 0 () {\n\
@@ -7174,7 +7180,7 @@ block 0 () {\n\
 
         assert_eq!(
             ir,
-            Ok(vec![Value::I64(2_004_096)]),
+            Ok(vec![Value::I64(2_020_480)]),
             "interp: bound-handle malloc+write"
         );
         assert_eq!(
@@ -7183,7 +7189,7 @@ block 0 () {\n\
             "interp: the write reached the personality"
         );
         assert!(
-            matches!(jo, JitOutcome::Returned(ref s) if s == &[2_004_096]),
+            matches!(jo, JitOutcome::Returned(ref s) if s == &[2_020_480]),
             "jit: must match interp, got {jo:?}"
         );
         assert_eq!(jposix.stdout(), b"hi", "jit: stdout must match interp");

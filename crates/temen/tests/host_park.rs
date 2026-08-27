@@ -242,7 +242,7 @@ block 2 (vi2: i64, vh2: i64) {{
   vt = thread.spawn 1 vi2 vh2
   vm = i64.const 4
   voff = i64.mul vi2 vm
-  vb = i64.const 16
+  vb = i64.const 16400
   va = i64.add vb voff
   i32.store va vt
   vone = i64.const 1
@@ -261,7 +261,7 @@ block 4 (vj: i64) {{
 block 5 (vj2: i64) {{
   vm2 = i64.const 4
   voff2 = i64.mul vj2 vm2
-  vb2 = i64.const 16
+  vb2 = i64.const 16400
   va2 = i64.add vb2 voff2
   vt2 = i32.load va2
   vjr = thread.join vt2
@@ -270,7 +270,7 @@ block 5 (vj2: i64) {{
   br 4(vnj)
 }}
 block 6 () {{
-  vz = i64.const 8
+  vz = i64.const 16392
   vsum = i64.atomic.load vz
   return vsum
   }}
@@ -279,7 +279,7 @@ func (i64, i64) -> (i64) {{
 block 0 (vsp: i64, vharg: i64) {{
   vhandle = i32.wrap_i64 vharg
   vr = call.cap 10 0 (i64) -> (i64) vhandle(vsp)
-  vaddr = i64.const 8
+  vaddr = i64.const 16392
   vold = i64.atomic.rmw.add vaddr vr
   vz = i64.const 0
   return vz

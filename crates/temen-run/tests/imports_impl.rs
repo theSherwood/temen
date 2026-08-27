@@ -120,7 +120,7 @@ export 0 interface \"counter\" 1 { add: 0 }
 
 func () -> (i64) {
 block 0 () {
-  va = i64.const 0
+  va = i64.const 16384
   vc = i64.load va
   v1 = i64.const 1
   vn = i64.add vc v1
@@ -196,7 +196,7 @@ func () -> () {
 block 0 () {
   vsp = i64.const 0
   vh = thread.spawn 1 vsp vsp
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   i32.store vaddr vh
   br 1()
   }
@@ -207,7 +207,7 @@ block 1 () {
   br_if vlt 1() 2()
   }
 block 2 () {
-  va2 = i64.const 0
+  va2 = i64.const 16384
   vh2 = i32.load va2
   vj = thread.join vh2
   br 3()
@@ -286,7 +286,7 @@ fn offer_func_fails_closed_on_unknown_offer_or_op() {
 /// 3, which the guest passes to `exit` — the cross-backend observable.
 const GROUPED_CONSUMER: &str = "\
 memory 16
-data 0 \"hi\\n\"
+data 16384 \"hi\\n\"
 type 0 func (i64, i64) -> (i64)
 type 1 interface { write: 0 }
 type 2 func (i32) -> ()
@@ -294,7 +294,7 @@ import 0 interface \"log\" 1
 import 1 func \"exit\" 2
 func 0 () -> () {
 block 0 () {
-  v0 = i64.const 0
+  v0 = i64.const 16384
   v1 = i64.const 3
   v2 = call.import 0.write (v0, v1)
   v3 = i32.wrap_i64 v2

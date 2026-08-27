@@ -38,11 +38,13 @@ fn roots_of(res: &Result<Vec<Value>, Trap>, snap: &[u8], buf: usize) -> (i64, BT
     (total, set)
 }
 
-/// Run `src` on both engines (buffer at window offset 0), assert soundness: `tw ⊆ bc`, every bytecode
-/// root is in `[lo, hi)`, and `expected ⊆ bc`.
+/// Run `src` on both engines (buffer at window offset 16384, above the #1094 NULL guard — a `gc.roots`
+/// write to `[0, 16384)` now traps `MemoryFault`), assert soundness: `tw ⊆ bc`, every bytecode root is
+/// in `[lo, hi)`, and `expected ⊆ bc`. The captured snapshot spans `init.len()` bytes, so `init` reaches
+/// past the buffer.
 fn check(src: &str, lo: u64, hi: u64, expected: &[u64]) {
     let m = parse_module(src).expect("parse");
-    let init = vec![0u8; 4096];
+    let init = vec![0u8; 20480];
 
     let mut f_tw = 1_000_000u64;
     let (tw_res, tw_snap) =
@@ -51,8 +53,8 @@ fn check(src: &str, lo: u64, hi: u64, expected: &[u64]) {
     let (bc_res, bc_snap) = bytecode::compile_and_run_capture(&m, 0, &[], &mut f_bc, &init)
         .expect("bytecode engine must support gc.roots (Slice 1c-7)");
 
-    let (tw_total, tw_set) = roots_of(&tw_res, &tw_snap, 0);
-    let (bc_total, bc_set) = roots_of(&bc_res, &bc_snap, 0);
+    let (tw_total, tw_set) = roots_of(&tw_res, &tw_snap, 16384);
+    let (bc_total, bc_set) = roots_of(&bc_res, &bc_snap, 16384);
 
     assert_eq!(
         tw_total as usize,
@@ -97,7 +99,7 @@ block 0 () {
   vlo = i64.const 4096
   vhi = i64.const 8192
   vmask = i64.const -1
-  vbuf = i64.const 0
+  vbuf = i64.const 16384
   vcap = i64.const 64
   vt = gc.roots vlo vhi vmask vbuf vcap
   return vt
@@ -126,7 +128,7 @@ block 1 () {
   vlo = i64.const 4096
   vhi = i64.const 8192
   vmask = i64.const -1
-  vbuf = i64.const 0
+  vbuf = i64.const 16384
   vcap = i64.const 64
   vt = gc.roots vlo vhi vmask vbuf vcap
   return vt
@@ -148,7 +150,7 @@ block 0 () {
   vlo = i64.const 4096
   vhi = i64.const 8192
   vmask = i64.const 72057594037927935
-  vbuf = i64.const 0
+  vbuf = i64.const 16384
   vcap = i64.const 64
   vt = gc.roots vlo vhi vmask vbuf vcap
   return vt
@@ -179,7 +181,7 @@ block 0 () {
   vlo = i64.const 4096
   vhi = i64.const 8192
   vmask = i64.const -1
-  vbuf = i64.const 0
+  vbuf = i64.const 16384
   vcap = i64.const 64
   vt = gc.roots vlo vhi vmask vbuf vcap
   return vt
@@ -192,18 +194,19 @@ fn caller_frame_root_across_call() {
     // The callee returns its own total; the caller adds vroot. Soundness check reads the buffer, so
     // the returned value isn't the total here — read the buffer directly instead.
     let m = parse_module(CALLER_FRAME).expect("parse");
-    let init = vec![0u8; 4096];
+    let init = vec![0u8; 20480];
     let mut f_tw = 1_000_000u64;
     let (_tw_res, tw_snap) =
         run_capture_reserved(&m, 0, &[], &mut f_tw, &init, DEFAULT_RESERVED_LOG2);
     let mut f_bc = 1_000_000u64;
     let (_bc_res, bc_snap) = bytecode::compile_and_run_capture(&m, 0, &[], &mut f_bc, &init)
         .expect("bytecode supports gc.roots");
-    // The buffer holds the ascending roots; both must contain the caller's 5000 and the callee's 4096.
-    // Read a generous prefix and collect in-range words.
+    // The buffer (at window offset 16384, above the #1094 NULL guard) holds the ascending roots; both
+    // must contain the caller's 5000 and the callee's 4096. Read a generous prefix and collect in-range
+    // words.
     let collect = |snap: &[u8]| -> BTreeSet<u64> {
         (0..64)
-            .map(|i| u64::from_le_bytes(snap[i * 8..i * 8 + 8].try_into().unwrap()))
+            .map(|i| u64::from_le_bytes(snap[16384 + i * 8..16384 + i * 8 + 8].try_into().unwrap()))
             .filter(|w| (4096..8192).contains(w))
             .collect()
     };
@@ -238,7 +241,7 @@ block 0 () {
   vlo = i64.const 4096
   vhi = i64.const 8192
   vmask = i64.const -1
-  vbuf = i64.const 0
+  vbuf = i64.const 16384
   vcap = i64.const 64
   vt = gc.roots vlo vhi vmask vbuf vcap
   return vt
@@ -270,7 +273,7 @@ block 0 () {
   vlo = i64.const 4096
   vhi = i64.const 8192
   vmask = i64.const 72057594037927680
-  vbuf = i64.const 0
+  vbuf = i64.const 16384
   vcap = i64.const 64
   vt = gc.roots vlo vhi vmask vbuf vcap
   return vt
@@ -320,7 +323,7 @@ block 0 () {
   vlo = i64.const 4096
   vhi = i64.const 8192
   vmask = i64.const -1
-  vbuf = i64.const 0
+  vbuf = i64.const 16384
   vcap = i64.const 64
   vt = gc.roots vlo vhi vmask vbuf vcap
   return vt
@@ -360,7 +363,7 @@ block 0 () {
   vlo = i64.const 4096
   vhi = i64.const 8192
   vmask = i64.const -1
-  vbuf = i64.const 0
+  vbuf = i64.const 16384
   vcap = i64.const 64
   vt = gc.roots vlo vhi vmask vbuf vcap
   return vt

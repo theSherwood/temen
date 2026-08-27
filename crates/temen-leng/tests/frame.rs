@@ -52,7 +52,8 @@ fn addr_of_local_through_a_call() {
 
     let m = temen_leng::translate(MODULE).unwrap_or_else(|e| panic!("translate: {e}"));
     // count is func 1 (incp is 0). Call it with sp = a window offset (its frame lives there) and n.
-    let sp = 4096;
+    // #1094: the NULL guard is unconditional, so the frame must clear `[0, POWERBOX_NULL_GUARD)`.
+    let sp = 20480;
     for n in [0i64, 1, 5, 50] {
         assert_eq!(run(&m, 1, &[sp, n]), n, "count({n})");
     }
@@ -76,7 +77,8 @@ fn mixed_frame_and_ssa_locals() {
      (call bump.0 (addr i.0))))
    (ret acc.0))))";
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
-    let sp = 8192;
+    // #1094: the NULL guard is unconditional, so the frame must clear `[0, POWERBOX_NULL_GUARD)`.
+    let sp = 24576;
     assert_eq!(run(&m, 1, &[sp, 5]), (0..5).sum::<i64>()); // 0+1+2+3+4 = 10
     assert_eq!(run(&m, 1, &[sp, 11]), (0..11).sum::<i64>()); // 55
 }
@@ -110,11 +112,11 @@ fn frameless_caller_of_framed_callee_gets_a_frame() {
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
     // Both are frame-needing now: caller ($sp, x) -> i64.
     assert_eq!(
-        run(&m, 1, &[8192, 5]),
+        run(&m, 1, &[24576, 5]),
         5,
         "caller threads a sub-frame to callee"
     );
-    assert_eq!(run(&m, 1, &[8192, 42]), 42);
+    assert_eq!(run(&m, 1, &[24576, 42]), 42);
 }
 
 #[test]
@@ -132,9 +134,9 @@ fn scalar_param_spill() {
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
     // f is frame-needing (spill): ($sp, x) -> i64. Result is 99 regardless of the incoming x.
     assert_eq!(
-        run(&m, 0, &[8192, 5]),
+        run(&m, 0, &[24576, 5]),
         99,
         "write through &x is seen reading x"
     );
-    assert_eq!(run(&m, 0, &[8192, 0]), 99);
+    assert_eq!(run(&m, 0, &[24576, 0]), 99);
 }

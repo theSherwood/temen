@@ -18,8 +18,13 @@ use std::time::{Duration, Instant};
 use temen_interp::Value;
 use temen_ir::{
     BinOp, Block, CmpOp, ConvOp, Data, Func, FuncType, Inst, IntTy, LoadOp, Memory, Module,
-    StoreOp, Terminator, TypeEntry, ValType, DEFAULT_RESERVED_LOG2,
+    StoreOp, Terminator, TypeEntry, ValType, DEFAULT_RESERVED_LOG2, POWERBOX_NULL_GUARD,
 };
+
+/// #1094: every module now reserves `[0, POWERBOX_NULL_GUARD)` as an unconditional unmapped NULL
+/// guard, so the interpreter programs (which used to live at address 0) and their scratch/heap
+/// regions must sit one guard up. Program `base + pc` decoding and const-overlays key off this.
+const PROG_BASE: u64 = POWERBOX_NULL_GUARD;
 use temen_jit::{CompiledModule, JitOutcome, Quota, INERT_CAP_THUNK};
 use temen_peval::{
     optimize_module, specialize, specialize_with, specialize_with_config, SpecArg, SpecConfig,
@@ -101,10 +106,10 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
     let header = Block {
         params: vec![t(), t(), t(), t()], // 0: acc, 1: i, 2: pc, 3: input
         insts: vec![
-            Inst::ConstI64(0),          // 4: base
-            add(4, 2),                  // 5: addr = base + pc
-            load(LoadOp::I32_8U, 5, 0), // 6: op
-            load(LoadOp::I64, 5, 1),    // 7: imm
+            Inst::ConstI64(PROG_BASE as i64), // 4: base
+            add(4, 2),                        // 5: addr = base + pc
+            load(LoadOp::I32_8U, 5, 0),       // 6: op
+            load(LoadOp::I64, 5, 1),          // 7: imm
         ],
         term: Terminator::BrTable {
             idx: 6,
@@ -203,7 +208,7 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
         }],
         memory: Some(Memory { size_log2: 16 }),
         data: vec![Data {
-            offset: 0,
+            offset: PROG_BASE,
             readonly: true,
             bytes: encode_program(program),
         }],
@@ -234,7 +239,7 @@ const C_END: u8 = 4; //         return acc
 
 /// `calc(a, b) -> i64`: a `br_table`-dispatched accumulator loop over a program (9-byte encoding,
 /// shared with [`build_interpreter`]). The program is **not** a data segment — it rides a
-/// `SpecConfig` const-overlay at address 0, exactly as the `peval_futamura` guest ships it to the
+/// `SpecConfig` const-overlay at `PROG_BASE`, exactly as the `peval_futamura` guest ships it to the
 /// `Jit` capability (so the residual is data-segment-free). State threaded: `(acc, b, pc)`.
 fn build_calc_interpreter() -> Module {
     let t = || ValType::I64;
@@ -265,12 +270,12 @@ fn build_calc_interpreter() -> Module {
     let header = Block {
         params: vec![t(), t(), t()], // 0: acc, 1: b, 2: pc
         insts: vec![
-            Inst::ConstI64(0),          // 3: base
-            add(3, 2),                  // 4: addr = base + pc
-            load(LoadOp::I32_8U, 4, 0), // 5: op (i32, used directly as the br_table index)
-            load(LoadOp::I64, 4, 1),    // 6: imm
-            Inst::ConstI64(9),          // 7
-            add(2, 7),                  // 8: npc = pc + 9
+            Inst::ConstI64(PROG_BASE as i64), // 3: base
+            add(3, 2),                        // 4: addr = base + pc
+            load(LoadOp::I32_8U, 4, 0),       // 5: op (i32, used directly as the br_table index)
+            load(LoadOp::I64, 4, 1),          // 6: imm
+            Inst::ConstI64(9),                // 7
+            add(2, 7),                        // 8: npc = pc + 9
         ],
         term: Terminator::BrTable {
             idx: 5,
@@ -521,7 +526,7 @@ fn build_stack_interpreter(program: &[(u8, i64)]) -> Module {
     let header = Block {
         params: vec![t(), t(), t()], // 0: pc, 1: sp, 2: input
         insts: vec![
-            Inst::ConstI64(0),
+            Inst::ConstI64(PROG_BASE as i64),
             bin(BinOp::Add, 3, 0),      // 4: addr = base + pc
             load(LoadOp::I32_8U, 4, 0), // 5: op
             load(LoadOp::I64, 4, 1),    // 6: imm
@@ -596,7 +601,7 @@ fn build_stack_interpreter(program: &[(u8, i64)]) -> Module {
         }],
         memory: Some(Memory { size_log2: 16 }),
         data: vec![Data {
-            offset: 0,
+            offset: PROG_BASE,
             readonly: true,
             bytes: encode_program(program),
         }],
@@ -765,7 +770,7 @@ fn demo_corpus() {
     let calc_i = build_calc_interpreter();
     verify_module(&calc_i).expect("calc interp verifies");
     let calc_cfg = SpecConfig {
-        const_overlays: vec![(0, encode_program(&calc_program()))],
+        const_overlays: vec![(PROG_BASE, encode_program(&calc_program()))],
         ..Default::default()
     };
     let calc_r =
@@ -880,7 +885,7 @@ fn build_stack_interpreter_calls(program: &[(u8, i64)]) -> Module {
     let header = Block {
         params: vec![t(), t(), t()], // 0: pc, 1: sp, 2: input
         insts: vec![
-            Inst::ConstI64(0),
+            Inst::ConstI64(PROG_BASE as i64),
             bin(BinOp::Add, 3, 0),      // 4: addr = base + pc
             load(LoadOp::I32_8U, 4, 0), // 5: op
             load(LoadOp::I64, 4, 1),    // 6: imm
@@ -978,7 +983,7 @@ fn build_stack_interpreter_calls(program: &[(u8, i64)]) -> Module {
         ],
         memory: Some(Memory { size_log2: 16 }),
         data: vec![Data {
-            offset: 0,
+            offset: PROG_BASE,
             readonly: true,
             bytes: encode_program(program),
         }],
@@ -1018,7 +1023,7 @@ const A_ADDIN: u8 = 2; //      acc = acc + input        (acc becomes dynamic)
 const A_ADDK: u8 = 3; // imm   acc = acc + imm
 const A_STOREH: u8 = 4; //     heap[acc & 63] = acc     (dynamic addr when acc is dynamic)
 const A_LOADH: u8 = 5; //      acc = heap[acc & 63]
-const HEAP_LO: u64 = 4096; // disjoint from the program (at 0) and the rename region
+const HEAP_LO: u64 = PROG_BASE + 4096; // disjoint from the program (at PROG_BASE) and the rename region
 
 fn build_heap_interpreter(program: &[(u8, i64)]) -> Module {
     let t = || ValType::I64;
@@ -1052,7 +1057,7 @@ fn build_heap_interpreter(program: &[(u8, i64)]) -> Module {
     let header = Block {
         params: vec![t(), t(), t()], // 0: acc, 1: pc, 2: input
         insts: vec![
-            Inst::ConstI64(0),
+            Inst::ConstI64(PROG_BASE as i64),
             bin(BinOp::Add, 3, 1),      // 4: addr = base + pc
             load(LoadOp::I32_8U, 4, 0), // 5: op
             load(LoadOp::I64, 4, 1),    // 6: imm
@@ -1150,7 +1155,7 @@ fn build_heap_interpreter(program: &[(u8, i64)]) -> Module {
         }],
         memory: Some(Memory { size_log2: 16 }),
         data: vec![Data {
-            offset: 0,
+            offset: PROG_BASE,
             readonly: true,
             bytes: encode_program(program),
         }],
@@ -1193,7 +1198,7 @@ fn build_threaded_interpreter(program: &[(u8, i64)]) -> Module {
     let header = Block {
         params: vec![t(), t(), t()], // 0: acc, 1: pc, 2: input
         insts: vec![
-            Inst::ConstI64(0),
+            Inst::ConstI64(PROG_BASE as i64),
             bin(BinOp::Add, 3, 1), // 4: addr = base + pc
             Inst::Load {
                 op: LoadOp::I32_8U,
@@ -1293,7 +1298,7 @@ fn build_threaded_interpreter(program: &[(u8, i64)]) -> Module {
         ],
         memory: Some(Memory { size_log2: 16 }),
         data: vec![Data {
-            offset: 0,
+            offset: PROG_BASE,
             readonly: true,
             bytes: program.iter().map(|&(op, _)| op).collect(),
         }],

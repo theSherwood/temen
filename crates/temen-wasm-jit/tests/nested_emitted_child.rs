@@ -30,7 +30,7 @@ use wasmi::{Caller, Engine, Func, Linker, Memory, MemoryType, Module as WModule,
 const WIN_BASE: i32 = 0x1_0000; // parent window base (the env cell lives below it)
 const ENV_PTR: i32 = 1024; // parent dispatcher-fuel cell
 const CHILD_ENV_PTR: i32 = 512; // child dispatcher-fuel cell (below the parent's scratch)
-const CARVE_OFF: i64 = 2048; // the child's carve offset (mirrors PARENT's `voff`); 1 KiB = child `memory 10`
+const CARVE_OFF: i64 = 16384; // the child's carve offset (mirrors PARENT's `voff`), one #1094 NULL guard up so the carve clears the parent's `[0,16384)` guard and stays 1 KiB (child `memory 10`)-aligned
 
 /// The **separate** child module: pure compute over its own carve. It stores the sentinel `42` at
 /// carve-relative offset 0, loads it back, doubles it, and returns `84`. The store proves the emitted
@@ -58,7 +58,7 @@ func (i64) -> (i64) {
 block 0 (v0: i64) {
   vinst = i32.wrap_i64 v0
   ventry = i64.const 0
-  voff = i64.const 2048
+  voff = i64.const 16384
   vslog = i64.const 10
   vquota = i64.const 0
   vch = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst (ventry, voff, vslog, vquota)
@@ -80,7 +80,7 @@ block 0 (v0: i32, v1: i32) {
   vgptr = i64.const 0
   vgn = i64.const 0
   ventry = i64.const 0
-  voff = i64.const 2048
+  voff = i64.const 16384
   vsl = i64.const 10
   vq = i64.const 0
   vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
@@ -489,7 +489,7 @@ block 0 (v0: i32, v1: i32) {
   vgptr = i64.const 0
   vgn = i64.const 0
   ventry = i64.const 0
-  voff = i64.const 2048
+  voff = i64.const 16384
   vsl = i64.const 10
   vq = i64.const 0
   vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)

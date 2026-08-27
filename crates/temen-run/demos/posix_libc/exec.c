@@ -82,9 +82,9 @@ static int xs_try_script_(char *path, char **argv, char **envp) {
   return r;
 }
 
-/* #1059 NULL guard: chibicc lays the powerbox args region one 16 KiB guard up
-   (`temen_ir::module_args_base` == guard + 128), so a `__null_guard`-marked command
-   reads argv from here and the host preserves this shifted range across the exec
+/* #1059/#1094 NULL guard: chibicc lays the powerbox args region one 16 KiB guard up
+   (`temen_ir::module_args_base` == guard + 128, the unconditional guarded layout), so a
+   command reads argv from here and the host preserves this shifted range across the exec
    image-replace (`commit_fresh_image`). */
 #define PX_ARGS_BASE (16384 + 128) /* POWERBOX_NULL_GUARD + POWERBOX_ARGS_BASE */
 

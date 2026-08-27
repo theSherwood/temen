@@ -36,17 +36,18 @@ use temen_text::parse_module;
 use temen_verify::verify_module;
 
 // Window byte offsets of the barrier's i32 slots (each a single-writer flag; `HANDLE`/`parked`/`work`
-// are per-mutator arrays). All well within the 64 KiB window (`memory 16`).
-const EPOCH: i64 = 256; // collector → mutators: a stop is requested (0 → 1)
-const RELEASE: i64 = 260; // collector → mutators: resume (0 → 1)
-const STOPPED: i64 = 264; // collector: 1 only inside the stopped window (mutual-exclusion probe)
-const VIOLATION: i64 = 268; // mutator → collector: a mutator ran work while STOPPED == 1 (must stay 0)
-const WORKFAIL: i64 = 272; // collector: a parked mutator's work[i] was 0 (must stay 0)
-const HANDLE_BASE: i64 = 320; // collector: thread handles, HANDLE_BASE + i*4
-const PARKED_BASE: i64 = 512; // mutator i → collector: parked[i]
-const WORK_BASE: i64 = 1024; // mutator i: work[i] progress counter
-                             // Mutators run a bounded work loop (the literal `64` in `MUTATOR`'s `block4`) so loop-end is a
-                             // fallback safepoint if the collector's `EPOCH` bump is somehow missed — keeps the test hang-proof.
+// are per-mutator arrays). All above the #1094 NULL guard (16384) and well within the 64 KiB window
+// (`memory 16`).
+const EPOCH: i64 = 16640; // collector → mutators: a stop is requested (0 → 1)
+const RELEASE: i64 = 16644; // collector → mutators: resume (0 → 1)
+const STOPPED: i64 = 16648; // collector: 1 only inside the stopped window (mutual-exclusion probe)
+const VIOLATION: i64 = 16652; // mutator → collector: a mutator ran work while STOPPED == 1 (must stay 0)
+const WORKFAIL: i64 = 16656; // collector: a parked mutator's work[i] was 0 (must stay 0)
+const HANDLE_BASE: i64 = 16704; // collector: thread handles, HANDLE_BASE + i*4
+const PARKED_BASE: i64 = 16896; // mutator i → collector: parked[i]
+const WORK_BASE: i64 = 17408; // mutator i: work[i] progress counter
+                              // Mutators run a bounded work loop (the literal `64` in `MUTATOR`'s `block4`) so loop-end is a
+                              // fallback safepoint if the collector's `EPOCH` bump is somehow missed — keeps the test hang-proof.
 const TIMEOUT: i64 = 1_000_000_000; // 1s futex timeout — every wait re-checks its condition (hang-proof)
 const WAKE_ALL: i64 = 1_000_000_000; // notify count: wake every waiter
 
@@ -66,22 +67,22 @@ func (i64, i64) -> (i64) {
 block 0 (msp: i64, mme: i64) {
   mfour = i64.const 4
   moff = i64.mul mme mfour
-  mwb = i64.const 1024
+  mwb = i64.const 17408
   mwa = i64.add mwb moff
-  mpb = i64.const 512
+  mpb = i64.const 16896
   mpa = i64.add mpb moff
   mc0 = i32.const 0
   br 1(mwa, mpa, mc0)
 }
 block 1 (twa: i64, tpa: i64, tc: i32) {
-  tsa = i64.const 264
+  tsa = i64.const 16648
   tst = i32.atomic.load tsa
   tone = i32.const 1
   tis = i32.eq tst tone
   br_if tis 2(twa, tpa, tc) 3(twa, tpa, tc)
 }
 block 2 (swa: i64, spa: i64, sc: i32) {
-  sva = i64.const 268
+  sva = i64.const 16652
   sone = i32.const 1
   i32.atomic.store sva sone
   br 3(swa, spa, sc)
@@ -90,7 +91,7 @@ block 3 (bwa: i64, bpa: i64, bc: i32) {
   bone = i32.const 1
   bcv = i32.add bc bone
   i32.atomic.store bwa bcv
-  bea = i64.const 256
+  bea = i64.const 16640
   be = i32.atomic.load bea
   bz = i32.const 0
   bchg = i32.ne be bz
@@ -109,14 +110,14 @@ block 5 (ppa: i64) {
   br 6()
 }
 block 6 () {
-  rra = i64.const 260
+  rra = i64.const 16644
   rr = i32.atomic.load rra
   rone = i32.const 1
   riseq = i32.eq rr rone
   br_if riseq 8() 7(rr)
 }
 block 7 (wr: i32) {
-  wra = i64.const 260
+  wra = i64.const 16644
   wto = i64.const 1000000000
   wres = i32.atomic.wait wra wr wto
   br 6()

@@ -46,13 +46,15 @@ fn both_windows_threaded(src: &str, init: &[u8]) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// Four worker threads each `atomic.rmw.add 1` a shared counter **100×** at an **in-window** address
-/// (offset 8). Confinement must route every one of those 400 atomic accesses *from the spawned
-/// threads* to offset 8 identically on both backends. The total (400) is interleaving-invariant
-/// (atomic add commutes), so the windows must be byte-identical: all zero except the i64 counter at
-/// offset 8. (The out-of-window atomic case is [`concurrent_out_of_window_atomic_faults_from_thread`].)
+/// (offset 16392, above the #1094 NULL guard). Confinement must route every one of those 400 atomic
+/// accesses *from the spawned threads* to offset 16392 identically on both backends. The total (400)
+/// is interleaving-invariant (atomic add commutes), so the windows must be byte-identical: all zero
+/// except the i64 counter at offset 16392. (The out-of-window atomic case is
+/// [`concurrent_out_of_window_atomic_faults_from_thread`].)
 #[test]
 fn concurrent_atomic_shared_counter_agrees() {
-    // counter address = 8 (i64, occupies [8,16)), well inside the 64 KiB window.
+    // counter address = 16392 (i64, occupies [16392,16400)), above the #1094 NULL guard, well inside
+    // the 64 KiB window.
     let src = "\
 memory 16
 func () -> (i64) {
@@ -67,7 +69,7 @@ block 0 () {
   v7 = thread.join v3
   v8 = thread.join v4
   v9 = thread.join v5
-  v10 = i64.const 8
+  v10 = i64.const 16392
   v11 = i64.atomic.load v10
   return v11
   }
@@ -82,7 +84,7 @@ block 1 (v1: i64) {
   br_if v3 3() 2(v1)
 }
 block 2 (v4: i64) {
-  v5 = i64.const 8
+  v5 = i64.const 16392
   v6 = i64.const 1
   v7 = i64.atomic.rmw.add v5 v6
   v8 = i64.const -1
@@ -101,12 +103,12 @@ block 3 () {
         imem, jmem,
         "concurrent escape-oracle: interp/JIT windows diverge (thread-context confinement?)"
     );
-    // The counter (i64, little-endian 400) at offset 8 — and *only* offset 8.
-    let counter = u64::from_le_bytes(imem[8..16].try_into().unwrap());
+    // The counter (i64, little-endian 400) at offset 16392 — and *only* offset 16392.
+    let counter = u64::from_le_bytes(imem[16392..16400].try_into().unwrap());
     assert_eq!(counter, 400, "shared atomic counter wrong/escaped");
     assert_eq!(
         imem.iter().filter(|&&b| b != 0).count(),
-        2, // 400 = 0x0190 → two non-zero bytes at offsets 8 and 9
+        2, // 400 = 0x0190 → two non-zero bytes at offsets 16392 and 16393
         "a concurrent access landed outside the shared counter slot"
     );
 }
@@ -118,19 +120,21 @@ block 3 () {
 /// and nowhere else, identically on both backends.
 #[test]
 fn concurrent_disjoint_plain_stores_confine() {
-    // Targets in-window offsets 0/8/16/24; each gets the 0xAA marker.
+    // Targets in-window offsets 16384/16392/16400/16408 (above the #1094 NULL guard); each gets the
+    // 0xAA marker. These are the per-thread store addresses handed in as `arg` (the store target),
+    // so they shift above the guard; the spawn stack-pointer operand `v0` stays 0.
     let src = "\
 memory 16
 func () -> (i64) {
 block 0 () {
   v0 = i64.const 0
-  v1 = i64.const 0
+  v1 = i64.const 16384
   v2 = thread.spawn 1 v0 v1
-  v3 = i64.const 8
+  v3 = i64.const 16392
   v4 = thread.spawn 1 v0 v3
-  v5 = i64.const 16
+  v5 = i64.const 16400
   v6 = thread.spawn 1 v0 v5
-  v7 = i64.const 24
+  v7 = i64.const 16408
   v8 = thread.spawn 1 v0 v7
   v9 = thread.join v2
   v10 = thread.join v4
@@ -155,7 +159,7 @@ block 0 (vsp: i64, v0: i64) {
         imem, jmem,
         "concurrent escape-oracle: interp/JIT windows diverge on disjoint plain stores"
     );
-    for slot in [0usize, 8, 16, 24] {
+    for slot in [16384usize, 16392, 16400, 16408] {
         assert_eq!(
             imem[slot], 0xAA,
             "a thread's plain store did not land at slot {slot}"

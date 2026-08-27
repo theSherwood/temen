@@ -21,13 +21,13 @@ const BACKENDS: [Backend; 3] = [Backend::TreeWalk, Backend::Bytecode, Backend::J
 const SRC: &str = r#"memory 16
 func () -> (i64) {
 block 0 () {
-  v0 = i64.const 64
+  v0 = i64.const 16448
   v1 = i64.const 7
   i64.store v0 v1 offset=8
   v2 = i32.const 170
   v3 = i64.const 32
   mem.fill v0 v2 v3
-  v4 = i64.const 192
+  v4 = i64.const 16576
   mem.copy v4 v0 v3
   v5 = i32.const 1
   i32.atomic.store v0 v5
@@ -44,22 +44,43 @@ block 0 () {
 /// The event stream `SRC` must produce, on every backend.
 fn expected_events() -> Vec<MemEvent> {
     vec![
-        MemEvent::Store { addr: 72, width: 8 },
-        MemEvent::Fill { dst: 64, len: 32 },
-        MemEvent::Copy {
-            dst: 192,
-            src: 64,
+        MemEvent::Store {
+            addr: 16456,
+            width: 8,
+        },
+        MemEvent::Fill {
+            dst: 16448,
             len: 32,
         },
-        MemEvent::AtomicStore { addr: 64, width: 4 },
-        MemEvent::AtomicLoad { addr: 64, width: 4 },
-        MemEvent::AtomicRmw { addr: 64, width: 4 },
-        MemEvent::AtomicCmpxchg { addr: 64, width: 4 },
+        MemEvent::Copy {
+            dst: 16576,
+            src: 16448,
+            len: 32,
+        },
+        MemEvent::AtomicStore {
+            addr: 16448,
+            width: 4,
+        },
+        MemEvent::AtomicLoad {
+            addr: 16448,
+            width: 4,
+        },
+        MemEvent::AtomicRmw {
+            addr: 16448,
+            width: 4,
+        },
+        MemEvent::AtomicCmpxchg {
+            addr: 16448,
+            width: 4,
+        },
         MemEvent::Load {
-            addr: 64,
+            addr: 16448,
             width: 16,
         },
-        MemEvent::Load { addr: 72, width: 8 },
+        MemEvent::Load {
+            addr: 16456,
+            width: 8,
+        },
     ]
 }
 
@@ -119,7 +140,7 @@ fn trace_is_identical_across_backends_and_the_result_is_unperturbed() {
 const OOB: &str = r#"memory 16
 func () -> (i64) {
 block 0 () {
-  v0 = i64.const 32
+  v0 = i64.const 16416
   v1 = i64.const 1
   i64.store v0 v1
   v2 = i64.const 65532
@@ -132,8 +153,13 @@ block 0 () {
 
 #[test]
 fn faulting_run_reports_the_attempted_access_last() {
+    // First store above the #1094 NULL guard (in-window); the second still straddles the window end
+    // (65532 + 8 > 65536), the intended OOB fault.
     let expected = vec![
-        MemEvent::Store { addr: 32, width: 8 },
+        MemEvent::Store {
+            addr: 16416,
+            width: 8,
+        },
         MemEvent::Store {
             addr: 65532,
             width: 8,
@@ -196,14 +222,14 @@ block 0 () {
   v0 = i64.const 43981
   v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
-  v3 = i64.const 0
+  v3 = i64.const 16384
   v4 = i64.atomic.load v3
   return v4
   }
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, v0: i64) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   i64.atomic.store v1 v0
   return v0
   }
@@ -225,8 +251,14 @@ fn multi_vcpu_guest_is_observed_without_crashing() {
         assert_eq!(
             trace,
             vec![
-                MemEvent::AtomicStore { addr: 0, width: 8 },
-                MemEvent::AtomicLoad { addr: 0, width: 8 },
+                MemEvent::AtomicStore {
+                    addr: 16384,
+                    width: 8
+                },
+                MemEvent::AtomicLoad {
+                    addr: 16384,
+                    width: 8
+                },
             ],
             "both vCPUs' accesses reach the hook ({backend:?})"
         );

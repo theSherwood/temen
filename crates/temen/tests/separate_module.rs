@@ -211,10 +211,10 @@ fn module_child_addressed_by_export_name() {
     // op 0, then instantiate_module's that funcidx → join. Proving name → funcidx mapping (the name
     // bytes live in the parent's own data segment at offset 200).
     let parent = "memory 17
-data 200 \"beta\"
+data 16384 \"beta\"
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
-  v2 = i64.const 200
+  v2 = i64.const 16384
   v3 = i64.const 4
   v4 = call.cap 8 0 (i64, i64) -> (i64) v1 (v2, v3)
   v5 = i64.extend_i32_s v1
@@ -241,10 +241,10 @@ fn module_resolve_export_is_fail_closed() {
     // An unknown name → -EINVAL (-22); the parent returns the resolve result directly. Pins the
     // fail-closed contract of the new untrusted-name surface (a bad name must never trap or default).
     let parent = "memory 17
-data 200 \"nope\"
+data 16384 \"nope\"
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
-  v2 = i64.const 200
+  v2 = i64.const 16384
   v3 = i64.const 4
   v4 = call.cap 8 0 (i64, i64) -> (i64) v1 (v2, v3)
   return v4

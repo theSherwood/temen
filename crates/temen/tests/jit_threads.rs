@@ -35,7 +35,7 @@ const ATOMIC4: &str = "memory 16\n\
     \x20 v6 = thread.spawn 1 v5 v5\n\
     \x20 v7 = i64.const 4\n\
     \x20 v8 = i64.mul v4 v7\n\
-    \x20 v9 = i64.const 16\n\
+    \x20 v9 = i64.const 16400\n\
     \x20 v10 = i64.add v9 v8\n\
     \x20 i32.store v10 v6\n\
     \x20 v11 = i64.const 1\n\
@@ -54,7 +54,7 @@ const ATOMIC4: &str = "memory 16\n\
     block 5 (v17: i64) {\n\
     \x20 v18 = i64.const 4\n\
     \x20 v19 = i64.mul v17 v18\n\
-    \x20 v20 = i64.const 16\n\
+    \x20 v20 = i64.const 16400\n\
     \x20 v21 = i64.add v20 v19\n\
     \x20 v22 = i32.load v21\n\
     \x20 v23 = thread.join v22\n\
@@ -63,7 +63,7 @@ const ATOMIC4: &str = "memory 16\n\
     \x20 br 4(v25)\n\
     }\n\
     block 6 () {\n\
-    \x20 v26 = i64.const 0\n\
+    \x20 v26 = i64.const 16384\n\
     \x20 v27 = i64.atomic.load v26\n\
     \x20 return v27\n\
       }\n\
@@ -78,7 +78,7 @@ const ATOMIC4: &str = "memory 16\n\
     \x20 br_if v3 3() 2(v1)\n\
     }\n\
     block 2 (v4: i64) {\n\
-    \x20 v5 = i64.const 0\n\
+    \x20 v5 = i64.const 16384\n\
     \x20 v6 = i64.const 1\n\
     \x20 v7 = i64.atomic.rmw.add v5 v6\n\
     \x20 v8 = i64.const -1\n\
@@ -157,8 +157,8 @@ fn thread_spawn_join_sums_results() {
 }
 
 /// Four worker threads each `atomic.rmw.add` a shared counter 100×; the total is exactly 400 on every
-/// interleaving (a non-atomic RMW would lose updates). Layout: `mem[0]` i64 counter, `mem[16+4i]` i32
-/// handle of worker `i`.
+/// interleaving (a non-atomic RMW would lose updates). Layout (above the #1094 NULL guard): `mem[16384]`
+/// i64 counter, `mem[16400+4i]` i32 handle of worker `i`.
 #[test]
 fn thread_atomic_counter() {
     assert_jit_matches_interp(ATOMIC4);
@@ -181,22 +181,22 @@ fn thread_parallel_atomic_counter() {
     }
 }
 
-/// Futex handoff: the producer writes a payload to `mem[8]`, spawns a consumer that `atomic.wait`s on
-/// the flag at `mem[0]`, then sets the flag (release) and notifies; the consumer returns the payload
+/// Futex handoff: the producer writes a payload to `mem[16392]`, spawns a consumer that `atomic.wait`s on
+/// the flag at `mem[16384]` (above the #1094 NULL guard), then sets the flag (release) and notifies; the consumer returns the payload
 /// it reads. On every interleaving the result is the written payload — exercising `atomic.wait` /
 /// `atomic.notify` end to end.
 const FUTEX: &str = "memory 16\n\
     func () -> (i64) {\n\
     block 0 () {\n\
-    \x20 v0 = i64.const 8\n\
+    \x20 v0 = i64.const 16392\n\
     \x20 v1 = i64.const 987654\n\
     \x20 i64.atomic.store v0 v1\n\
     \x20 v2 = i64.const 0\n\
     \x20 v3 = thread.spawn 1 v2 v2\n\
-    \x20 v4 = i64.const 0\n\
+    \x20 v4 = i64.const 16384\n\
     \x20 v5 = i32.const 1\n\
     \x20 i32.atomic.store v4 v5\n\
-    \x20 v6 = i64.const 0\n\
+    \x20 v6 = i64.const 16384\n\
     \x20 v7 = i32.const 1\n\
     \x20 v8 = atomic.notify v6 v7\n\
     \x20 v9 = thread.join v3\n\
@@ -205,11 +205,11 @@ const FUTEX: &str = "memory 16\n\
     }\n\
     func (i64, i64) -> (i64) {\n\
     block 0 (vsp: i64, v0: i64) {\n\
-    \x20 v1 = i64.const 0\n\
+    \x20 v1 = i64.const 16384\n\
     \x20 v2 = i32.const 0\n\
     \x20 v3 = i64.const 1000000000\n\
     \x20 v4 = i32.atomic.wait v1 v2 v3\n\
-    \x20 v5 = i64.const 8\n\
+    \x20 v5 = i64.const 16392\n\
     \x20 v6 = i64.atomic.load v5\n\
     \x20 return v6\n\
       }\n\
@@ -275,7 +275,7 @@ fn thread_with_fiber_inside() {
 /// Fibers + threads on the **parallel** pool: four worker threads each drive their own generator fiber
 /// (each returns `iters + 42` where the fiber yields 42) and `main` sums the joins. Each vCPU has its
 /// own fiber runtime, so the per-thread coroutines don't interfere — runs on real cores, exact sum
-/// every time. (`mem[16+4i]` holds worker `i`'s handle; result = Σ (i*10 + 42) for i in 0..4.)
+/// every time. (`mem[16400+4i]`, above the #1094 NULL guard, holds worker `i`'s handle; result = Σ (i*10 + 42) for i in 0..4.)
 #[test]
 fn thread_parallel_with_fibers() {
     let src = "memory 16\n\
@@ -295,7 +295,7 @@ fn thread_parallel_with_fibers() {
         \x20 v7 = thread.spawn 1 v4 v6\n\
         \x20 v8 = i64.const 4\n\
         \x20 v9 = i64.mul v4 v8\n\
-        \x20 v10 = i64.const 16\n\
+        \x20 v10 = i64.const 16400\n\
         \x20 v11 = i64.add v10 v9\n\
         \x20 i32.store v11 v7\n\
         \x20 v12 = i64.const 1\n\
@@ -314,7 +314,7 @@ fn thread_parallel_with_fibers() {
         block 5 (v19: i64, v20: i64) {\n\
         \x20 v21 = i64.const 4\n\
         \x20 v22 = i64.mul v19 v21\n\
-        \x20 v23 = i64.const 16\n\
+        \x20 v23 = i64.const 16400\n\
         \x20 v24 = i64.add v23 v22\n\
         \x20 v25 = i32.load v24\n\
         \x20 v26 = thread.join v25\n\
@@ -488,13 +488,13 @@ fn fiber_suspended_on_root_migrates_to_spawned_vcpu() {
 /// 30 reps on the JIT (real cores) + the interp differential.
 #[test]
 fn concurrent_fiber_steal_stress() {
-    // mem[16]: round-1 work index; mem[20]: round-2 work index; mem[512+8i]: fiber i's i64 handle;
-    // mem[128]: the i64 atomic sum. Fiber identity rides its `sp` (= its index i). (The handle array
-    // is at 512/stride-8 — not 24/stride-4 — because an i64 handle is 8 bytes and a stride-8 array
-    // from 24 would overlap the sum at 128.)
+    // All addresses are above the #1094 NULL guard (base 16384). mem[16400]: round-1 work index;
+    // mem[16404]: round-2 work index; mem[16896+8i]: fiber i's i64 handle; mem[16512]: the i64 atomic
+    // sum. Fiber identity rides its `sp` (= its index i). (The handle array is at 16896/stride-8 —
+    // an i64 handle is 8 bytes, so a stride-8 array kept clear of the sum at 16512.)
     // Worker body (funcs 1 and 2, differing only in the work-index address):
     //   loop: i = i32.atomic.rmw.add idx 1; if i >= 16 return 0;
-    //         h = i64.load(512+8i); (st, v) = cont.resume h 0; i64.atomic.rmw.add mem[128] v
+    //         h = i64.load(16896+8i); (st, v) = cont.resume h 0; i64.atomic.rmw.add mem[16512] v
     let worker = |idx_addr: u64| -> String {
         format!(
             "func (i64, i64) -> (i64) {{\n\
@@ -513,12 +513,12 @@ fn concurrent_fiber_steal_stress() {
              \x20 v8 = i64.extend_i32_u v7\n\
              \x20 v9 = i64.const 8\n\
              \x20 v10 = i64.mul v8 v9\n\
-             \x20 v11 = i64.const 512\n\
+             \x20 v11 = i64.const 16896\n\
              \x20 v12 = i64.add v11 v10\n\
              \x20 v13 = i64.load v12\n\
              \x20 v14 = i64.const 0\n\
              \x20 v15, v16 = cont.resume v13 v14\n\
-             \x20 v17 = i64.const 128\n\
+             \x20 v17 = i64.const 16512\n\
              \x20 v18 = i64.atomic.rmw.add v17 v16\n\
              \x20 br 1()\n\
              }}\n\
@@ -529,7 +529,7 @@ fn concurrent_fiber_steal_stress() {
              }}\n"
         )
     };
-    // Root: create the 16 fibers (handle at 24+4i, sp = i), then two rounds of spawn-4 / join-4.
+    // Root: create the 16 fibers (handle at 16896+8i, sp = i), then two rounds of spawn-4 / join-4.
     let mut root = String::from(
         "memory 16\n\
          func () -> (i64) {\n\
@@ -547,7 +547,7 @@ fn concurrent_fiber_steal_stress() {
          \x20 v6 = cont.new v5 v4\n\
          \x20 v7 = i64.const 8\n\
          \x20 v8 = i64.mul v4 v7\n\
-         \x20 v9 = i64.const 512\n\
+         \x20 v9 = i64.const 16896\n\
          \x20 v10 = i64.add v9 v8\n\
          \x20 i64.store v10 v6\n\
          \x20 v11 = i64.const 1\n\
@@ -556,7 +556,7 @@ fn concurrent_fiber_steal_stress() {
          }\n\
          block 3 () {\n",
     );
-    // Two rounds: spawn 4 workers of func `r` (1 then 2), storing thread handles at 256+…, then
+    // Two rounds: spawn 4 workers of func `r` (1 then 2), storing thread handles at 16640+…, then
     // join all 4 — the barrier between first-resumes and the migrating second-resumes.
     let mut v = 13;
     for r in 1..=2u32 {
@@ -569,7 +569,7 @@ fn concurrent_fiber_steal_stress() {
                 a = v,
                 b = v + 1,
                 c = v + 2,
-                addr = 256 + (r as u64 - 1) * 16 + w * 4,
+                addr = 16640 + (r as u64 - 1) * 16 + w * 4,
             ));
             v += 3;
         }
@@ -581,13 +581,13 @@ fn concurrent_fiber_steal_stress() {
                 a = v,
                 b = v + 1,
                 c = v + 2,
-                addr = 256 + (r as u64 - 1) * 16 + w * 4,
+                addr = 16640 + (r as u64 - 1) * 16 + w * 4,
             ));
             v += 3;
         }
     }
     root.push_str(&format!(
-        "\x20 v{a} = i64.const 128\n\
+        "\x20 v{a} = i64.const 16512\n\
          \x20 v{b} = i64.atomic.load v{a}\n\
          \x20 return v{b}\n\
          \x20 }}\n\
@@ -596,8 +596,8 @@ fn concurrent_fiber_steal_stress() {
         b = v + 1,
     ));
     // The fiber body: yield 3*sp+1 (parking RUNNABLE for round 2), then return 7*sp+2.
-    root.push_str(&worker(16));
-    root.push_str(&worker(20));
+    root.push_str(&worker(16400));
+    root.push_str(&worker(16404));
     root.push_str(
         "func (i64, i64) -> (i64) {\n\
          block 0 (v0: i64, v1: i64) {\n\

@@ -58,12 +58,12 @@ fn record_program(version: u64, budget: u64) -> String {
     format!(
         "\
 memory 17
-data 0 \"vm\"
+data 16384 \"vm\"
 import 0 \"exit\" (i32) -> ()
 
 func 0 () -> () {{
 block 0 () {{
-  vp = i64.const 0
+  vp = i64.const 16384
   vl = i64.const 2
   vh = self.resolve vp vl
   vf0 = i64.const {f0}
@@ -74,7 +74,7 @@ block 0 () {{
   vf40 = i64.const 0
   vf48 = i64.const 0
 {stores}
-  vrp = i64.const 1024
+  vrp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vh (vrp)
   vj = call.cap 6 1 (i32) -> (i64) vh (vch)
   vc = i32.wrap_i64 vj
@@ -93,19 +93,19 @@ block 0 (v0: i64) {{
         f0 = f0,
         f16 = f16,
         f24 = f24,
-        stores = store_record(1024),
+        stores = store_record(17408),
     )
 }
 
 /// The op-0 legacy spelling of the same spawn, for the differential.
 const LEGACY_PLAIN: &str = "\
 memory 17
-data 0 \"vm\"
+data 16384 \"vm\"
 import 0 \"exit\" (i32) -> ()
 
 func 0 () -> () {
 block 0 () {
-  vp = i64.const 0
+  vp = i64.const 16384
   vl = i64.const 2
   vh = self.resolve vp vl
   ventry = i64.const 1
@@ -137,7 +137,7 @@ fn record_pager_program() -> String {
     format!(
         "\
 memory 17
-data 0 \"vm\"
+data 16384 \"vm\"
 type 0 func (i64) -> (i64)
 type 1 interface {{ page: 0 }}
 export 0 interface \"pager\" 1 {{ page: 2 }}
@@ -145,7 +145,7 @@ import 0 \"exit\" (i32) -> ()
 
 func 0 () -> () {{
 block 0 () {{
-  vp = i64.const 0
+  vp = i64.const 16384
   vl = i64.const 2
   vh = self.resolve vp vl
   vf0 = i64.const {f0}
@@ -156,7 +156,7 @@ block 0 () {{
   vf40 = i64.const 0
   vf48 = i64.const 0
 {stores}
-  vrp = i64.const 1024
+  vrp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vh (vrp)
   vz = i32.const 0
   vs = svc.wait vz
@@ -191,7 +191,7 @@ block 0 (vaddr: i64) {{
         f0 = f0,
         f16 = f16,
         f24 = f24,
-        stores = store_record(1024),
+        stores = store_record(17408),
     )
 }
 
@@ -261,11 +261,11 @@ fn malformed_records_fail_closed() {
 fn record_spawn_matches_legacy_module_spawn() {
     let child_src = "\
 memory 16
-data 100 \"K\"
+data 16484 \"K\"
 
 func 0 (i64) -> (i64) {
 block 0 (v0: i64) {
-  va = i64.const 100
+  va = i64.const 16484
   vb = i32.load8_u va
   vw = i64.extend_i32_u vb
   return vw
@@ -291,7 +291,7 @@ block 0 (vh: i32, vmod: i32) {{
   vf40 = i64.const 0
   vf48 = i64.const 0
 {stores}
-  vrp = i64.const 1024
+  vrp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vh (vrp)
   vj = call.cap 6 1 (i32) -> (i64) vh (vch)
   return vj
@@ -300,7 +300,7 @@ block 0 (vh: i32, vmod: i32) {{
 ",
         f0 = 0i64, // version 0, entry 0 (the child module's func 0)
         f16 = (16u64 | (0xFFFF_FFFFu64 << 32)) as i64,
-        stores = store_record(1024),
+        stores = store_record(17408),
     );
     let legacy_parent = "\
 memory 17
@@ -358,25 +358,25 @@ fn record_spawn_carries_named_grants() {
         r#"memory 17
 func (i32, i32, i32) -> (i64) {{
 block 0 (vinst: i32, vout: i32, verr: i32) {{
-  a0 = i64.const 0
-  n100 = i32.const 100
+  a0 = i64.const 16384
+  n100 = i32.const 16484
   i32.store a0 n100
-  a4 = i64.const 4
+  a4 = i64.const 16388
   n6 = i32.const 6
   i32.store a4 n6
-  a8 = i64.const 8
+  a8 = i64.const 16392
   i32.store a8 vout
-  a12 = i64.const 12
+  a12 = i64.const 16396
   z0 = i32.const 0
   i32.store a12 z0
-  a16 = i64.const 16
-  n110 = i32.const 110
+  a16 = i64.const 16400
+  n110 = i32.const 16494
   i32.store a16 n110
-  a20 = i64.const 20
+  a20 = i64.const 16404
   i32.store a20 n6
-  a24 = i64.const 24
+  a24 = i64.const 16408
   i32.store a24 verr
-  a28 = i64.const 28
+  a28 = i64.const 16412
   i32.store a28 z0
   cs = i32.const 115
   ct = i32.const 116
@@ -385,39 +385,39 @@ block 0 (vinst: i32, vout: i32, verr: i32) {{
   cu = i32.const 117
   ce = i32.const 101
   cr = i32.const 114
-  p100 = i64.const 100
+  p100 = i64.const 16484
   i32.store8 p100 cs
-  p101 = i64.const 101
+  p101 = i64.const 16485
   i32.store8 p101 ct
-  p102 = i64.const 102
+  p102 = i64.const 16486
   i32.store8 p102 cd
-  p103 = i64.const 103
+  p103 = i64.const 16487
   i32.store8 p103 co
-  p104 = i64.const 104
+  p104 = i64.const 16488
   i32.store8 p104 cu
-  p105 = i64.const 105
+  p105 = i64.const 16489
   i32.store8 p105 ct
-  p110 = i64.const 110
+  p110 = i64.const 16494
   i32.store8 p110 cs
-  p111 = i64.const 111
+  p111 = i64.const 16495
   i32.store8 p111 ct
-  p112 = i64.const 112
+  p112 = i64.const 16496
   i32.store8 p112 cd
-  p113 = i64.const 113
+  p113 = i64.const 16497
   i32.store8 p113 ce
-  p114 = i64.const 114
+  p114 = i64.const 16498
   i32.store8 p114 cr
-  p115 = i64.const 115
+  p115 = i64.const 16499
   i32.store8 p115 cr
   vf0 = i64.const {f0}
   vf8 = i64.const 65536
   vf16 = i64.const {f16}
   vf24 = i64.const {f24}
   vf32 = i64.const 0
-  vf40 = i64.const 0
+  vf40 = i64.const 16384
   vf48 = i64.const 2
 {stores}
-  vrp = i64.const 1024
+  vrp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
   r = call.cap 6 1 (i32) -> (i64) vinst (vch)
   return r
@@ -476,7 +476,7 @@ block 0 (v0: i64) {{
         f0 = (1u64 << 32) as i64,                      // version 0, entry 1
         f16 = (16u64 | (0xFFFF_FFFFu64 << 32)) as i64, // size_log2 16, no pager
         f24 = 0xFFFF_FFFFi64,                          // module -1, budget 0
-        stores = store_record(1024),
+        stores = store_record(17408),
     );
     let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");
@@ -529,7 +529,7 @@ block 0 (vinst: i32, vbud: i32) {{
   vf40 = i64.const 0
   vf48 = i64.const 0
 {stores}
-  vrp = i64.const 1024
+  vrp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
   vzero = i32.const 0
   visneg = i32.lt_s vch vzero
@@ -582,7 +582,7 @@ block 2 (vf: i64) {{
         f16 = (16u64 | (0xFFFF_FFFFu64 << 32)) as i64,
         quota = quota,
         iters = iters,
-        stores = store_record(1024),
+        stores = store_record(17408),
     );
     let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");
@@ -652,16 +652,16 @@ fn budget_plus_raw_quota_fails_closed() {
 fn budget_record_src() -> String {
     format!(
         r#"memory 17
-data 0 "vm"
-data 8 "bgt"
+data 16384 "vm"
+data 16392 "bgt"
 import 0 "exit" (i32) -> ()
 
 func 0 () -> () {{
 block 0 () {{
-  vp = i64.const 0
+  vp = i64.const 16384
   vl = i64.const 2
   vh = self.resolve vp vl
-  vbp = i64.const 8
+  vbp = i64.const 16392
   vbl = i64.const 3
   vbud = self.resolve vbp vbl
   vf0 = i64.const {f0}
@@ -678,7 +678,7 @@ block 0 () {{
   vf40 = i64.const 0
   vf48 = i64.const 0
 {stores}
-  vrp = i64.const 1024
+  vrp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vh (vrp)
   vzero = i32.const 0
   visneg = i32.lt_s vch vzero
@@ -707,7 +707,7 @@ block 0 (v0: i64) {{
 "#,
         f0 = (1u64 << 32) as i64,
         f16 = (16u64 | (0xFFFF_FFFFu64 << 32)) as i64,
-        stores = store_record(1024),
+        stores = store_record(17408),
     )
 }
 

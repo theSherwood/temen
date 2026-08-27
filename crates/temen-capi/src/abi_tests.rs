@@ -243,7 +243,7 @@ export 0 func \"_start\" 0
 export 1 func \"add\" 1
 func () -> (i32) {
 block 0 () {
-  v0 = i64.const 1024
+  v0 = i64.const 17408
   v1 = i64.const 0
   i64.store v0 v1
   v2 = i32.const 0
@@ -252,7 +252,7 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (v0: i64, v1: i64) {
-  v2 = i64.const 1024
+  v2 = i64.const 17408
   v3 = i64.load v2
   v4 = i64.add v3 v1
   i64.store v2 v4
@@ -330,12 +330,13 @@ extern "C" fn record_hook(ctx: *mut c_void, ev: *const TemenMemEvent) -> i32 {
     }
 }
 
-// `store 7 @ 64+8; load @ 64+8` — a bare kernel (0 params) that runs under the fixed powerbox.
+// `store 7 @ 16448+8; load @ 16448+8` — a bare kernel (0 params) that runs under the fixed powerbox.
+// Base bumped to 16448 (= 64 above the #1094 NULL guard) so the effective 16456 clears the guard.
 const MEM_KERNEL: &str = "\
 memory 16
 func () -> (i64) {
 block 0 () {
-  v0 = i64.const 64
+  v0 = i64.const 16448
   v1 = i64.const 7
   i64.store v0 v1 offset=8
   v2 = i64.load v0 offset=8
@@ -377,10 +378,13 @@ fn mem_hooks_observe_every_access_via_c_abi() {
                 7,
                 "kernel returns the stored value"
             );
-            // Effective address is 64 + 8; store then load, each width 8.
+            // Effective address is 16448 + 8; store then load, each width 8.
             assert_eq!(
                 rec.events,
-                vec![(TEMEN_MEM_STORE, 72, 0, 8), (TEMEN_MEM_LOAD, 72, 0, 8),],
+                vec![
+                    (TEMEN_MEM_STORE, 16456, 0, 8),
+                    (TEMEN_MEM_LOAD, 16456, 0, 8),
+                ],
                 "C hook saw the store then the load (backend {backend})"
             );
             temen_run_free(run);
@@ -415,7 +419,7 @@ fn mem_hook_veto_aborts_the_run_via_c_abi() {
             assert!(run.is_null(), "vetoed run must fail (backend {backend})");
             assert_eq!(
                 rec.events,
-                vec![(TEMEN_MEM_STORE, 72, 0, 8)],
+                vec![(TEMEN_MEM_STORE, 16456, 0, 8)],
                 "the veto landed after exactly one observed event (backend {backend})"
             );
             temen_instance_free(hooked);
@@ -458,29 +462,29 @@ extern "C" fn upcase(
     1
 }
 
-// The entry writes "abc" to window offset 2048, calls `upcase` to uppercase it in place, then
-// streams the now-"ABC" bytes to stdout (both imports dispatch through their manifest slots; the
-// handle operands are dummies).
+// The entry writes "abc" to window offset 18432 (= 2048 above the #1094 NULL guard), calls `upcase`
+// to uppercase it in place, then streams the now-"ABC" bytes to stdout (both imports dispatch through
+// their manifest slots; the handle operands are dummies).
 const UPCASE_IR: &str = "\
 memory 15
 export 0 func \"_start\" 0
 func () -> (i32) {
 block 0 () {
-  v0 = i64.const 2048
+  v0 = i64.const 18432
   v1 = i32.const 97
   i32.store8 v0 v1
-  v2 = i64.const 2049
+  v2 = i64.const 18433
   v3 = i32.const 98
   i32.store8 v2 v3
-  v4 = i64.const 2050
+  v4 = i64.const 18434
   v5 = i32.const 99
   i32.store8 v4 v5
   v6 = i32.const 0
-  v7 = i64.const 2048
+  v7 = i64.const 18432
   v8 = i64.const 3
   v9 = call.sym \"upcase\" (i64, i64) -> (i64) v6 (v7, v8)
   v10 = i32.const 0
-  v11 = i64.const 2048
+  v11 = i64.const 18432
   v12 = i64.const 3
   v13 = call.sym \"write\" (i64, i64) -> (i64) v10 (v11, v12)
   v14 = i32.const 0

@@ -12,9 +12,10 @@
 use temen_interp::{Inspector, Stop, StopReason, Value, WatchKind};
 use temen_text::parse_module;
 
-/// Two workers each do a non-atomic `load; add varg; store` on `mem[0]` (the classic lost-update
-/// race); the root spawns both, joins, and reads the counter back. Worker `block0`: `vaddr=const 0`
-/// [0], `vc=load` [1], `vn=add vc varg` [2], `store vaddr vn` [3], `vz=const 0` [4], `return vz`.
+/// Two workers each do a non-atomic `load; add varg; store` on `mem[16384]` (above the #1094 NULL
+/// guard; the classic lost-update race); the root spawns both, joins, and reads the counter back.
+/// Worker `block0`: `vaddr=const 16384` [0], `vc=load` [1], `vn=add vc varg` [2], `store vaddr vn`
+/// [3], `vz=const 0` [4], `return vz`.
 const RACY_COUNTER: &str = r#"
 memory 16
 func () -> (i64) {
@@ -25,14 +26,14 @@ block 0 () {
   vh1 = thread.spawn 1 vsp va
   vj0 = thread.join vh0
   vj1 = thread.join vh1
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vr = i64.load vaddr
   return vr
   }
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vc = i64.load vaddr
   vn = i64.add vc varg
   i64.store vaddr vn
@@ -48,7 +49,7 @@ block 0 (vsp: i64, varg: i64) {
 fn write_watchpoint_fires_at_every_thread_write() {
     let m = parse_module(RACY_COUNTER).expect("parse");
     let mut insp = Inspector::attach_scheduled(&m, 0, &[], 50_000_000, vec![]);
-    insp.set_watchpoint(0, 8, WatchKind::Write);
+    insp.set_watchpoint(16384, 8, WatchKind::Write);
 
     let mut writers = Vec::new();
     loop {
@@ -59,7 +60,7 @@ fn write_watchpoint_fires_at_every_thread_write() {
                         reason,
                         StopReason::Watchpoint {
                             write: true,
-                            addr: 0
+                            addr: 16384
                         }
                     ),
                     "a write-watch fires write=true at the watched addr, got {reason:?}"
@@ -97,7 +98,7 @@ fn write_watchpoint_fires_at_every_thread_write() {
 fn read_watchpoint_fires_at_every_thread_read() {
     let m = parse_module(RACY_COUNTER).expect("parse");
     let mut insp = Inspector::attach_scheduled(&m, 0, &[], 50_000_000, vec![]);
-    insp.set_watchpoint(0, 8, WatchKind::Read);
+    insp.set_watchpoint(16384, 8, WatchKind::Read);
 
     let mut readers = Vec::new();
     loop {
@@ -108,7 +109,7 @@ fn read_watchpoint_fires_at_every_thread_read() {
                         reason,
                         StopReason::Watchpoint {
                             write: false,
-                            addr: 0
+                            addr: 16384
                         }
                     ),
                     "a read-watch fires write=false, got {reason:?}"
@@ -140,7 +141,7 @@ fn read_watchpoint_fires_at_every_thread_read() {
 fn watchpoint_reads_each_threads_pending_write() {
     let m = parse_module(RACY_COUNTER).expect("parse");
     let mut insp = Inspector::attach_scheduled(&m, 0, &[], 50_000_000, vec![]);
-    insp.set_watchpoint(0, 8, WatchKind::Write);
+    insp.set_watchpoint(16384, 8, WatchKind::Write);
 
     let mut about_to_write = Vec::new();
     loop {
@@ -177,7 +178,7 @@ fn watchpoint_reads_each_threads_pending_write() {
 fn inspect_other_threads_at_a_watchpoint() {
     let m = parse_module(RACY_COUNTER).expect("parse");
     let mut insp = Inspector::attach_scheduled(&m, 0, &[], 50_000_000, vec![]);
-    insp.set_watchpoint(0, 8, WatchKind::Write);
+    insp.set_watchpoint(16384, 8, WatchKind::Write);
 
     assert!(matches!(
         insp.run_until_stop(),
@@ -206,14 +207,14 @@ fn inspect_other_threads_at_a_watchpoint() {
     }
 }
 
-/// Range precision across threads: a watch on a *different* range (`[64, 72)`) is not tripped by the
-/// workers' writes to `mem[0]` — the run finishes with no watch stop, exactly as the confined
-/// `watch_hit` analysis dictates, regardless of which thread does the access.
+/// Range precision across threads: a watch on a *different* range (`[16448, 16456)`) is not tripped
+/// by the workers' writes to `mem[16384]` — the run finishes with no watch stop, exactly as the
+/// confined `watch_hit` analysis dictates, regardless of which thread does the access.
 #[test]
 fn watchpoint_range_is_precise_across_threads() {
     let m = parse_module(RACY_COUNTER).expect("parse");
     let mut insp = Inspector::attach_scheduled(&m, 0, &[], 50_000_000, vec![]);
-    insp.set_watchpoint(64, 8, WatchKind::ReadWrite); // a range no thread touches
+    insp.set_watchpoint(16448, 8, WatchKind::ReadWrite); // a range no thread touches
 
     match insp.run_until_stop() {
         Stop::Finished(r) => assert_eq!(r, Ok(vec![Value::I64(2)]), "ran clean, no spurious watch"),

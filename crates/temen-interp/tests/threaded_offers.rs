@@ -141,8 +141,8 @@ fn concurrent_callers_share_one_threaded_instance() {
         .expect("threaded offer");
     let tid = h.resolve_offer(offer).unwrap().type_id;
 
-    // Thread body (func 1): `arg i ∈ {0, 1}` picks cell `16 + 8i` and value `10 + i`; the store
-    // returns the value, which the thread returns to its joiner.
+    // Thread body (func 1): `arg i ∈ {0, 1}` picks cell `16400 + 8i` (above the #1094 NULL guard)
+    // and value `10 + i`; the store returns the value, which the thread returns to its joiner.
     let consumer_src = format!(
         "memory 16\n\
          func () -> (i64) {{\n\
@@ -155,9 +155,9 @@ fn concurrent_callers_share_one_threaded_instance() {
            vj0 = thread.join vt0\n\
            vj1 = thread.join vt1\n\
            vh = i32.const {offer}\n\
-           vc0 = i64.const 16\n\
+           vc0 = i64.const 16400\n\
            vr0 = call.cap {tid} 1 (i64) -> (i64) vh (vc0)\n\
-           vc1 = i64.const 24\n\
+           vc1 = i64.const 16408\n\
            vr1 = call.cap {tid} 1 (i64) -> (i64) vh (vc1)\n\
            vsum = i64.add vr0 vr1\n\
            return vsum\n\
@@ -169,7 +169,7 @@ fn concurrent_callers_share_one_threaded_instance() {
            vval = i64.add vi vten\n\
            veight = i64.const 8\n\
            voff = i64.mul vi veight\n\
-           vbase = i64.const 16\n\
+           vbase = i64.const 16400\n\
            vaddr = i64.add vbase voff\n\
            vh = i32.const {offer}\n\
            vr = call.cap {tid} 0 (i64, i64) -> (i64) vh (vaddr, vval)\n\
@@ -202,7 +202,8 @@ fn concurrent_callers_never_lose_an_admission() {
     let expected = N * (N + 1) / 2;
 
     // Build the consumer once the offer handle/type-id are known: root spawns N vCPUs (each `func 1`
-    // stores `i + 1` into cell `16 + 8i`), joins them all, then sums the cells back.
+    // stores `i + 1` into cell `16400 + 8i`, above the #1094 NULL guard), joins them all, then sums
+    // the cells back.
     let build_consumer = |offer: i32, tid: u32| -> temen_ir::Module {
         let mut body = String::from(
             "memory 16\n\
@@ -221,7 +222,7 @@ fn concurrent_callers_never_lose_an_admission() {
         body.push_str(&format!("               vh = i32.const {offer}\n"));
         body.push_str("               vacc0 = i64.const 0\n");
         for i in 0..N {
-            let addr = 16 + 8 * i;
+            let addr = 16400 + 8 * i;
             let next = i + 1;
             body.push_str(&format!(
                 "               vc{i} = i64.const {addr}\n               vr{i} = call.cap {tid} 1 (i64) -> (i64) vh (vc{i})\n               vacc{next} = i64.add vacc{i} vr{i}\n"
@@ -237,7 +238,7 @@ fn concurrent_callers_never_lose_an_admission() {
                vval = i64.add vi vone\n\
                veight = i64.const 8\n\
                voff = i64.mul vi veight\n\
-               vbase = i64.const 16\n\
+               vbase = i64.const 16400\n\
                vaddr = i64.add vbase voff\n",
         );
         body.push_str(&format!(
@@ -285,7 +286,7 @@ fn a_threaded_instance_keeps_state_across_calls() {
         "func () -> (i64) {{\n\
          block 0 () {{\n\
            vh = i32.const {offer}\n\
-           vaddr = i64.const 32\n\
+           vaddr = i64.const 16416\n\
            vval = i64.const 41\n\
            vs = call.cap {tid} 0 (i64, i64) -> (i64) vh (vaddr, vval)\n\
            vr = call.cap {tid} 1 (i64) -> (i64) vh (vaddr)\n\
@@ -320,14 +321,14 @@ fn the_host_side_tier_admits_a_threaded_instance() {
     let tid = h.resolve_offer(offer).unwrap().type_id;
 
     assert_eq!(
-        h.cap_dispatch_slots(tid, 0, offer, &[40, 5], None),
+        h.cap_dispatch_slots(tid, 0, offer, &[16424, 5], None),
         Ok(vec![5]),
-        "store(40, 5) ran host-side over the shared cell"
+        "store(16424, 5) — addr above the #1094 NULL guard — ran host-side over the shared cell"
     );
     assert_eq!(
-        h.cap_dispatch_slots(tid, 1, offer, &[40], None),
+        h.cap_dispatch_slots(tid, 1, offer, &[16424], None),
         Ok(vec![5]),
-        "load(40) sees the store — one persistent instance, gate reopened"
+        "load(16424) sees the store — one persistent instance, gate reopened"
     );
 }
 

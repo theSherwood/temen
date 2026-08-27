@@ -14,9 +14,9 @@
 //! than a top-level powerbox program — so a Rust-on-Temen driver guest can fan phases out the same way.
 //! The child's imports `exit`/`read`/`write`/`vm_map` bind by the reference policy to the re-granted
 //! Exit/Stream and the auto-granted AddressSpace; `fs` resolves by name from the grant list. #964/#1094:
-//! argv seeds at `carve + module_args_base(child)` — one guard up for a `__null_guard`-marked child (the
-//! guarded nifler_ce), the legacy 128 otherwise; the grant records/cap-names stay in the parent window
-//! (the op-13 handler reads them in the parent's context, so the child's guard never touches them).
+//! argv seeds at `carve + module_args_base(child)` — one guard up, the unconditional guarded layout;
+//! the grant records/cap-names stay in the parent window (the op-13 handler reads them in the parent's
+//! context, so the child's guard never touches them).
 
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -51,8 +51,8 @@ fn seed_dir(dir: &Path) -> Vec<(String, Vec<u8>)> {
 
 /// Build the text-IR op-13 parent that spawns `child` (window `child_sl`, carve at `carve_off`) with the
 /// three-entry grant list `{fs, stdout, exit}` and `argv` seeded at `carve + args_base`. #964/#1094:
-/// `args_base` is the child's [`temen_ir::module_args_base`] — one guard up for a `__null_guard`-marked
-/// child, the legacy 128 otherwise — since the child's `_start` reads argv there. The grant records and
+/// `args_base` is the child's [`temen_ir::module_args_base`] — one guard up (the unconditional guarded
+/// layout) — since the child's `_start` reads argv there. The grant records and
 /// cap-names stay at their parent-window offsets: the op-13 handler reads those in the *parent's*
 /// context (`m.read_window`), so the child's guard never touches them.
 fn parent_src(child_sl: u32, carve_off: u64, args_base: u64, argv: &[String]) -> String {

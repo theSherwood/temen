@@ -141,7 +141,9 @@ fn default_mapped_matches_declared_boundary() {
     // With the global left at its instantiation default (= the emit-time size), the boundary is the
     // declared window — i.e. behavior identical to the old baked constant. `run_at_mapped` sets the
     // global explicitly to DECLARED here, which is exactly that default value.
-    assert_eq!(run_at_mapped(LOAD8, &[0], DECLARED), R::Val(0));
+    // An in-window byte above the #1094 NULL guard `[0, 16384)` is backed ⇒ admitted (address 0
+    // itself now traps on the unconditional guard, so probe the first post-guard word instead).
+    assert_eq!(run_at_mapped(LOAD8, &[16384], DECLARED), R::Val(0));
     assert_eq!(
         run_at_mapped(LOAD8, &[(DECLARED - W) as i64], DECLARED),
         R::Val(0)

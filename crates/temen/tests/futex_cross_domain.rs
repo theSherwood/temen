@@ -28,8 +28,9 @@ fn run(src: &str, win_log2: u8, fuel: u64) -> Result<Vec<Value>, Trap> {
 }
 
 /// Deterministic rendezvous — the key-space proof. The parent instantiates a child in a 64 KiB
-/// carve at 64 KiB, then parks on `atomic.wait` at **parent** address `64K + 4096` (expected 0,
-/// no store ever changes it). The child spin-`notify`s **its** address `4096` — the same backing
+/// carve at 64 KiB, then parks on `atomic.wait` at **parent** address `64K + 20480` (expected 0,
+/// no store ever changes it; both addresses above the #1094 NULL guard). The child spin-`notify`s
+/// **its** address `20480` — the same backing
 /// byte under a different guest address — until the notify reports a waiter woken. If the keys
 /// did not collide, the parent would sleep to the wait cap and the child would spin to fuel
 /// exhaustion; instead the parent wakes (status 0 = woken, never 1 = not-equal since the value
@@ -49,22 +50,22 @@ block 0 (v0: i32) {\n\
   q0v2 = i64.const -4294967280\n\
   q0v3 = i64.const 4294967295\n\
   q0v4 = i64.const 0\n\
-  q0a0 = i64.const 1152\n\
+  q0a0 = i64.const 17536\n\
   i64.store q0a0 q0v0\n\
-  q0a1 = i64.const 1160\n\
+  q0a1 = i64.const 17544\n\
   i64.store q0a1 q0v1\n\
-  q0a2 = i64.const 1168\n\
+  q0a2 = i64.const 17552\n\
   i64.store q0a2 q0v2\n\
-  q0a3 = i64.const 1176\n\
+  q0a3 = i64.const 17560\n\
   i64.store q0a3 q0v3\n\
-  q0a4 = i64.const 1184\n\
+  q0a4 = i64.const 17568\n\
   i64.store q0a4 q0v4\n\
-  q0a5 = i64.const 1192\n\
+  q0a5 = i64.const 17576\n\
   i64.store q0a5 q0v4\n\
-  q0a6 = i64.const 1200\n\
+  q0a6 = i64.const 17584\n\
   i64.store q0a6 q0v4\n\
   v5 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)\n\
-  v6 = i64.const 69632\n\
+  v6 = i64.const 86016\n\
   v7 = i32.const 0\n\
   v8 = i64.const -1\n\
   v9 = i32.atomic.wait v6 v7 v8\n\
@@ -81,7 +82,7 @@ block 0 (v0: i64) {\n\
   br 1()\n\
 }\n\
 block 1 () {\n\
-  v1 = i64.const 4096\n\
+  v1 = i64.const 20480\n\
   v2 = i32.const 1\n\
   v3 = atomic.notify v1 v2\n\
   v4 = i32.const 0\n\
@@ -102,8 +103,9 @@ block 2 () {\n\
 }
 
 /// The inverse direction, racy by nature (the parent cannot spin-notify without starving a
-/// single-worker executor, so it stores + notifies once). Child `atomic.wait`s its address 4096
-/// (expected 0); parent stores 1 and notifies once at its alias `64K + 4096`, then joins. The
+/// single-worker executor, so it stores + notifies once). Child `atomic.wait`s its address 20480
+/// (expected 0); parent stores 1 and notifies once at its alias `64K + 20480` (both above the
+/// #1094 NULL guard), then joins. The
 /// futex compare-and-park makes every interleaving safe, and both legal outcomes prove the
 /// cross-domain semantics:
 ///   child parked first  → notify wakes it:   child status 0, parent saw 1 woken → result  1
@@ -120,22 +122,22 @@ block 0 (v0: i32) {\n\
   q1v2 = i64.const -4294967280\n\
   q1v3 = i64.const 4294967295\n\
   q1v4 = i64.const 0\n\
-  q1a0 = i64.const 1216\n\
+  q1a0 = i64.const 17600\n\
   i64.store q1a0 q1v0\n\
-  q1a1 = i64.const 1224\n\
+  q1a1 = i64.const 17608\n\
   i64.store q1a1 q1v1\n\
-  q1a2 = i64.const 1232\n\
+  q1a2 = i64.const 17616\n\
   i64.store q1a2 q1v2\n\
-  q1a3 = i64.const 1240\n\
+  q1a3 = i64.const 17624\n\
   i64.store q1a3 q1v3\n\
-  q1a4 = i64.const 1248\n\
+  q1a4 = i64.const 17632\n\
   i64.store q1a4 q1v4\n\
-  q1a5 = i64.const 1256\n\
+  q1a5 = i64.const 17640\n\
   i64.store q1a5 q1v4\n\
-  q1a6 = i64.const 1264\n\
+  q1a6 = i64.const 17648\n\
   i64.store q1a6 q1v4\n\
   v5 = call.cap 6 17 (i64) -> (i32) v0 (q1a0)\n\
-  v6 = i64.const 69632\n\
+  v6 = i64.const 86016\n\
   v7 = i32.const 1\n\
   i32.atomic.store v6 v7\n\
   v8 = atomic.notify v6 v7\n\
@@ -149,7 +151,7 @@ block 0 (v0: i32) {\n\
 }\n\
 func (i64) -> (i64) {\n\
 block 0 (v0: i64) {\n\
-  v1 = i64.const 4096\n\
+  v1 = i64.const 20480\n\
   v2 = i32.const 0\n\
   v3 = i64.const -1\n\
   v4 = i32.atomic.wait v1 v2 v3\n\

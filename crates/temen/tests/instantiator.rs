@@ -119,19 +119,19 @@ fn nesting_composes_to_depth_two() {
          \x20 q0v2 = i64.const -4294967284\n\
          \x20 q0v3 = i64.const 4294967295\n\
          \x20 q0v4 = i64.const 0\n\
-         \x20 q0a0 = i64.const 1152\n\
+         \x20 q0a0 = i64.const 17536\n\
          \x20 i64.store q0a0 q0v0\n\
-         \x20 q0a1 = i64.const 1160\n\
+         \x20 q0a1 = i64.const 17544\n\
          \x20 i64.store q0a1 q0v1\n\
-         \x20 q0a2 = i64.const 1168\n\
+         \x20 q0a2 = i64.const 17552\n\
          \x20 i64.store q0a2 q0v2\n\
-         \x20 q0a3 = i64.const 1176\n\
+         \x20 q0a3 = i64.const 17560\n\
          \x20 i64.store q0a3 q0v3\n\
-         \x20 q0a4 = i64.const 1184\n\
+         \x20 q0a4 = i64.const 17568\n\
          \x20 i64.store q0a4 q0v4\n\
-         \x20 q0a5 = i64.const 1192\n\
+         \x20 q0a5 = i64.const 17576\n\
          \x20 i64.store q0a5 q0v4\n\
-         \x20 q0a6 = i64.const 1200\n\
+         \x20 q0a6 = i64.const 17584\n\
          \x20 i64.store q0a6 q0v4\n\
          \x20 v5 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)\n\
          \x20 v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)\n\
@@ -202,10 +202,10 @@ fn nesting_composes_to_depth_two() {
         "grandchild in-window store escaped its 1 KiB slice"
     );
     // Confinement: every byte outside the child's 4 KiB window is exactly as the parent seeded
-    // it — except the parent's own 56-byte spawn record at 1152 (the child's record at
+    // it — except the parent's own 56-byte spawn record at 17536 (the child's record at
     // child-relative 1216 lands inside its exempted window).
     for i in 0..(128u64 << 10) {
-        if !(CHILD..CHILD + 4096).contains(&i) && !(1152..1152 + 56).contains(&i) {
+        if !(CHILD..CHILD + 4096).contains(&i) && !(17536..17536 + 56).contains(&i) {
             assert_eq!(
                 mem[i as usize], init[i as usize],
                 "depth-2 nest escaped to byte {i}"
@@ -232,19 +232,19 @@ fn child_manages_its_own_pages_via_address_space() {
          \x20 q2v2 = i64.const -4294967280\n\
          \x20 q2v3 = i64.const 4294967295\n\
          \x20 q2v4 = i64.const 0\n\
-         \x20 q2a0 = i64.const 1280\n\
+         \x20 q2a0 = i64.const 17664\n\
          \x20 i64.store q2a0 q2v0\n\
-         \x20 q2a1 = i64.const 1288\n\
+         \x20 q2a1 = i64.const 17672\n\
          \x20 i64.store q2a1 q2v1\n\
-         \x20 q2a2 = i64.const 1296\n\
+         \x20 q2a2 = i64.const 17680\n\
          \x20 i64.store q2a2 q2v2\n\
-         \x20 q2a3 = i64.const 1304\n\
+         \x20 q2a3 = i64.const 17688\n\
          \x20 i64.store q2a3 q2v3\n\
-         \x20 q2a4 = i64.const 1312\n\
+         \x20 q2a4 = i64.const 17696\n\
          \x20 i64.store q2a4 q2v4\n\
-         \x20 q2a5 = i64.const 1320\n\
+         \x20 q2a5 = i64.const 17704\n\
          \x20 i64.store q2a5 q2v4\n\
-         \x20 q2a6 = i64.const 1328\n\
+         \x20 q2a6 = i64.const 17712\n\
          \x20 i64.store q2a6 q2v4\n\
          \x20 v5 = call.cap 6 17 (i64) -> (i32) v0 (q2a0)\n\
          \x20 v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)\n\
@@ -276,8 +276,8 @@ fn child_manages_its_own_pages_via_address_space() {
                 mem[i as usize], 0,
                 "child's unmapped page byte {i} not decommitted"
             );
-        } else if !(1280..1280 + 56).contains(&i) {
-            // (1280..1336 is the parent's own 56-byte spawn record.)
+        } else if !(17664..17664 + 56).contains(&i) {
+            // (17664..17720 is the parent's own 56-byte spawn record.)
             assert_eq!(
                 mem[i as usize], init[i as usize],
                 "byte {i} outside the child's unmap changed"
@@ -299,19 +299,19 @@ fn instantiate_rejects_out_of_range_carve() {
          \x20 q3v2 = i64.const -4294967284\n\
          \x20 q3v3 = i64.const 4294967295\n\
          \x20 q3v4 = i64.const 0\n\
-         \x20 q3a0 = i64.const 1344\n\
+         \x20 q3a0 = i64.const 17728\n\
          \x20 i64.store q3a0 q3v0\n\
-         \x20 q3a1 = i64.const 1352\n\
+         \x20 q3a1 = i64.const 17736\n\
          \x20 i64.store q3a1 q3v1\n\
-         \x20 q3a2 = i64.const 1360\n\
+         \x20 q3a2 = i64.const 17744\n\
          \x20 i64.store q3a2 q3v2\n\
-         \x20 q3a3 = i64.const 1368\n\
+         \x20 q3a3 = i64.const 17752\n\
          \x20 i64.store q3a3 q3v3\n\
-         \x20 q3a4 = i64.const 1376\n\
+         \x20 q3a4 = i64.const 17760\n\
          \x20 i64.store q3a4 q3v4\n\
-         \x20 q3a5 = i64.const 1384\n\
+         \x20 q3a5 = i64.const 17768\n\
          \x20 i64.store q3a5 q3v4\n\
-         \x20 q3a6 = i64.const 1392\n\
+         \x20 q3a6 = i64.const 17776\n\
          \x20 i64.store q3a6 q3v4\n\
          \x20 v5 = call.cap 6 17 (i64) -> (i32) v0 (q3a0)\n\
          \x20 v6 = i64.extend_i32_s v5\n\
@@ -343,19 +343,19 @@ fn child_trap_propagates_on_join() {
          \x20 q4v1 = i64.const 0\n\
          \x20 q4v2 = i64.const -4294967284\n\
          \x20 q4v3 = i64.const 4294967295\n\
-         \x20 q4a0 = i64.const 4352\n\
+         \x20 q4a0 = i64.const 20736\n\
          \x20 i64.store q4a0 q4v0\n\
-         \x20 q4a1 = i64.const 4360\n\
+         \x20 q4a1 = i64.const 20744\n\
          \x20 i64.store q4a1 q4v1\n\
-         \x20 q4a2 = i64.const 4368\n\
+         \x20 q4a2 = i64.const 20752\n\
          \x20 i64.store q4a2 q4v2\n\
-         \x20 q4a3 = i64.const 4376\n\
+         \x20 q4a3 = i64.const 20760\n\
          \x20 i64.store q4a3 q4v3\n\
-         \x20 q4a4 = i64.const 4384\n\
+         \x20 q4a4 = i64.const 20768\n\
          \x20 i64.store q4a4 q4v1\n\
-         \x20 q4a5 = i64.const 4392\n\
+         \x20 q4a5 = i64.const 20776\n\
          \x20 i64.store q4a5 q4v1\n\
-         \x20 q4a6 = i64.const 4400\n\
+         \x20 q4a6 = i64.const 20784\n\
          \x20 i64.store q4a6 q4v1\n\
          \x20 v5 = call.cap 6 17 (i64) -> (i32) v0 (q4a0)\n\
          \x20 v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)\n\

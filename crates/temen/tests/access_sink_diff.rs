@@ -20,13 +20,13 @@ use temen_text::parse_module;
 const SRC: &str = r#"memory 16
 func () -> (i64) {
 block 0 () {
-  v0 = i64.const 64
+  v0 = i64.const 16448
   v1 = i64.const 7
   i64.store v0 v1 offset=8
   v2 = i32.const 170
   v3 = i64.const 32
   mem.fill v0 v2 v3
-  v4 = i64.const 192
+  v4 = i64.const 16576
   mem.copy v4 v0 v3
   v5 = i32.const 1
   i32.atomic.store v0 v5
@@ -44,22 +44,43 @@ block 0 () {
 /// sink over the *pristine* module must match it exactly.
 fn expected_events() -> Vec<MemEvent> {
     vec![
-        MemEvent::Store { addr: 72, width: 8 },
-        MemEvent::Fill { dst: 64, len: 32 },
-        MemEvent::Copy {
-            dst: 192,
-            src: 64,
+        MemEvent::Store {
+            addr: 16456,
+            width: 8,
+        },
+        MemEvent::Fill {
+            dst: 16448,
             len: 32,
         },
-        MemEvent::AtomicStore { addr: 64, width: 4 },
-        MemEvent::AtomicLoad { addr: 64, width: 4 },
-        MemEvent::AtomicRmw { addr: 64, width: 4 },
-        MemEvent::AtomicCmpxchg { addr: 64, width: 4 },
+        MemEvent::Copy {
+            dst: 16576,
+            src: 16448,
+            len: 32,
+        },
+        MemEvent::AtomicStore {
+            addr: 16448,
+            width: 4,
+        },
+        MemEvent::AtomicLoad {
+            addr: 16448,
+            width: 4,
+        },
+        MemEvent::AtomicRmw {
+            addr: 16448,
+            width: 4,
+        },
+        MemEvent::AtomicCmpxchg {
+            addr: 16448,
+            width: 4,
+        },
         MemEvent::Load {
-            addr: 64,
+            addr: 16448,
             width: 16,
         },
-        MemEvent::Load { addr: 72, width: 8 },
+        MemEvent::Load {
+            addr: 16456,
+            width: 8,
+        },
     ]
 }
 
@@ -111,15 +132,15 @@ fn sink_is_inert() {
 }
 
 /// **A write watchpoint covered only by a `mem.copy` destination span stops both engines** — the
-/// bulk-op watchpoint fix. Range `[200, 204)` is written by nothing but the copy (dst `192..224`);
-/// before the fix, both engines silently ran past it.
+/// bulk-op watchpoint fix. Range `[16584, 16588)` is written by nothing but the copy (dst
+/// `16576..16608`, above the #1094 NULL guard); before the fix, both engines silently ran past it.
 #[test]
 fn bulk_copy_dst_write_watchpoint_fires_on_both_engines() {
     let m = parse_module(SRC).expect("parses");
 
     // Tree-walker: the oracle.
     let mut insp = Inspector::attach(&m, 0, &[], u64::MAX);
-    insp.set_watchpoint(200, 4, WatchKind::Write);
+    insp.set_watchpoint(16584, 4, WatchKind::Write);
     let tw = match insp.run_until_stop() {
         Stop::Break {
             reason: StopReason::Watchpoint { addr, write },
@@ -131,24 +152,25 @@ fn bulk_copy_dst_write_watchpoint_fires_on_both_engines() {
     // Bytecode debug engine: must agree on the hit (address = the access span's base, a write)
     // and on the op it stopped before.
     let mut run = DebugRun::new(&m, 0, &[]).expect("subset");
-    run.set_watchpoints(vec![(200, 4, WatchKind::Write)]);
+    run.set_watchpoints(vec![(16584, 4, WatchKind::Write)]);
     let mut fuel = u64::MAX;
     let pc = run
         .run_to(&[], &mut fuel)
         .expect("bytecode missed the mem.copy write watchpoint");
     let (addr, write) = run.take_watch_hit().expect("a watch hit, not a breakpoint");
     assert_eq!((addr, write, pc), tw, "engines agree on the bulk watch hit");
-    assert_eq!((addr, write), (192, true), "the copy's dst span, a write");
+    assert_eq!((addr, write), (16576, true), "the copy's dst span, a write");
 }
 
-/// **A read watchpoint covered only by the `mem.copy` source span fires too** — range `[80, 81)`
-/// is read by nothing but the copy (src `64..96`; the v128/i64 loads end at 80).
+/// **A read watchpoint covered only by the `mem.copy` source span fires too** — range `[16464, 16465)`
+/// is read by nothing but the copy (src `16448..16480`, above the #1094 NULL guard; the v128/i64 loads
+/// end at 16464).
 #[test]
 fn bulk_copy_src_read_watchpoint_fires_on_both_engines() {
     let m = parse_module(SRC).expect("parses");
 
     let mut insp = Inspector::attach(&m, 0, &[], u64::MAX);
-    insp.set_watchpoint(80, 1, WatchKind::Read);
+    insp.set_watchpoint(16464, 1, WatchKind::Read);
     let tw = match insp.run_until_stop() {
         Stop::Break {
             reason: StopReason::Watchpoint { addr, write },
@@ -158,12 +180,12 @@ fn bulk_copy_src_read_watchpoint_fires_on_both_engines() {
     };
 
     let mut run = DebugRun::new(&m, 0, &[]).expect("subset");
-    run.set_watchpoints(vec![(80, 1, WatchKind::Read)]);
+    run.set_watchpoints(vec![(16464, 1, WatchKind::Read)]);
     let mut fuel = u64::MAX;
     let pc = run
         .run_to(&[], &mut fuel)
         .expect("bytecode missed the mem.copy read watchpoint");
     let (addr, write) = run.take_watch_hit().expect("a watch hit");
     assert_eq!((addr, write, pc), tw, "engines agree on the src-read hit");
-    assert_eq!((addr, write), (64, false), "the copy's src span, a read");
+    assert_eq!((addr, write), (16448, false), "the copy's src span, a read");
 }

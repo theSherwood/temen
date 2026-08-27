@@ -32,7 +32,7 @@ block 2 (v4: i64) {
   v6 = thread.spawn 1 v5 v5
   v7 = i64.const 4
   v8 = i64.mul v4 v7
-  v9 = i64.const 16
+  v9 = i64.const 16400
   v10 = i64.add v9 v8
   i32.store v10 v6
   v11 = i64.const 1
@@ -51,7 +51,7 @@ block 4 (v14: i64) {
 block 5 (v17: i64) {
   v18 = i64.const 4
   v19 = i64.mul v17 v18
-  v20 = i64.const 16
+  v20 = i64.const 16400
   v21 = i64.add v20 v19
   v22 = i32.load v21
   v23 = thread.join v22
@@ -60,7 +60,7 @@ block 5 (v17: i64) {
   br 4(v25)
 }
 block 6 () {
-  v26 = i64.const 0
+  v26 = i64.const 16384
   v27 = i64.atomic.load v26
   return v27
   }
@@ -75,7 +75,7 @@ block 1 (v1: i64) {
   br_if v3 3() 2(v1)
 }
 block 2 (v4: i64) {
-  v5 = i64.const 0
+  v5 = i64.const 16384
   v6 = i64.const 1
   v7 = i64.atomic.rmw.add v5 v6
   v8 = i64.const -1
@@ -95,11 +95,11 @@ func () -> (i64) {
 block 0 () {
   v3 = i64.const 0
   v4 = thread.spawn 1 v3 v3
-  v0 = i64.const 0
+  v0 = i64.const 16384
   v1 = i32.const 0
   v2 = i64.const 1000000000
   v5 = i32.atomic.wait v0 v1 v2
-  v6 = i64.const 8
+  v6 = i64.const 16392
   v7 = i64.atomic.load v6
   v8 = thread.join v4
   return v7
@@ -107,13 +107,13 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, v0: i64) {
-  v1 = i64.const 8
+  v1 = i64.const 16392
   v2 = i64.const 987654
   i64.atomic.store v1 v2
-  v3 = i64.const 0
+  v3 = i64.const 16384
   v4 = i32.const 1
   i32.atomic.store v3 v4
-  v5 = i64.const 0
+  v5 = i64.const 16384
   v6 = i32.const 1
   v7 = atomic.notify v5 v6
   v8 = i64.const 0

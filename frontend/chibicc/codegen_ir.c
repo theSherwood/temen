@@ -303,14 +303,15 @@ static int start_off; // 1 if a `_start` occupies function index 0, else 0
 #define POWERBOX_ARGS_BASE 128
 #define POWERBOX_ARGS_END 16384
 
-// **Trap-on-NULL** (#964/#1059): every fixed powerbox low-memory region — the handle-stash slots, the
+// **Trap-on-NULL** (#964/#1094): every fixed powerbox low-memory region — the handle-stash slots, the
 // §3e args buffer, and the globals/data-stack base — lives one 16 KiB guard **above** 0, so
-// `[0, POWERBOX_NULL_GUARD)` holds nothing. We mark the module with the `__null_guard` export (aliasing
-// `_start`, see `emit_start`) so a marker-aware host seeds that region `Unmapped` and places the args
+// `[0, POWERBOX_NULL_GUARD)` holds nothing and a host seeds that region `Unmapped`, placing the args
 // blob at the shifted base (`temen_ir::module_args_base`) — a NULL dereference then traps like native
-// on every tier, instead of silently touching low scratch. This mirrors `temen-llvm`'s `--null-guard`
-// layout; the guard is added to every absolute low address below. Must equal `temen_ir::POWERBOX_NULL_GUARD`
-// (16 KiB = the max host page, keeping the three enforcement mechanisms aligned — see that constant's docs).
+// on every tier, instead of silently touching low scratch. This mirrors `temen-llvm`'s layout; the
+// guard is added to every absolute low address below. The guard is **unconditional** now (#1094 — the
+// one canonical layout), so no `__null_guard` marker export is emitted (see `emit_start`). Must equal
+// `temen_ir::POWERBOX_NULL_GUARD` (16 KiB = the max host page, keeping the three enforcement mechanisms
+// aligned — see that constant's docs).
 #define POWERBOX_NULL_GUARD 16384
 
 // True when `main` takes `argc`/`argv` (>= 2 params), so the entry parses the args buffer and the
@@ -3132,12 +3133,10 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
   int slots[NHANDLES] = {STDOUT_SLOT,    STDIN_SLOT,  EXIT_SLOT,     MEMORY_SLOT,
                          ADDRSPACE_SLOT, IORING_SLOT, BLOCKING_SLOT, JIT_SLOT};
   cg("export 0 func \"_start\" 0\n");
-  // #964/#1059 guarded-layout marker: a `__null_guard` func export (aliasing `_start`'s funcidx 0,
-  // per the marker contract) declares the shifted low scratch, so a marker-aware host seeds
-  // `[0, POWERBOX_NULL_GUARD)` `Unmapped`, reserves it from the page ops, and places the args blob at
-  // the shifted base. Semantics, not observability — `temen-strip` keeps it like `_start`. Export
-  // index 1 (dense, right after `_start`); the emit-object symbol exports below continue past it.
-  cg("export 1 func \"__null_guard\" 0\n");
+  // #964/#1094 guarded layout: the low scratch sits one guard up so `[0, POWERBOX_NULL_GUARD)` stays
+  // empty and a host seeds it `Unmapped` (the args blob is placed at the shifted base). The guard is
+  // unconditional now — the one canonical layout — so no `__null_guard` marker export is emitted
+  // (#1094: the marker is retired).
   // A `--child-entry` module is spawned via `instantiate_module`, whose child ABI is
   // `(i64 starter) -> (i64 status)`; the top-level powerbox entry is paramless `() -> (main's ret)`.
   // The starter is ignored here (a no-capability command); `main`'s result is widened to the i64 the
@@ -3732,9 +3731,9 @@ void codegen_ir(Obj *prog, FILE *out) {
   // same name in different TUs never collide. `emit_start` already exported `_start` as export 0
   // when this unit defines `main`, so the numbering continues past it.
   if (opt_emit_object) {
-    // In the entry unit, exports 0/1 are `_start` and its `__null_guard` marker (#1059), so the
-    // symbol exports continue at 2; a non-entry unit starts at 0.
-    int k = has_main ? 2 : 0;
+    // In the entry unit, export 0 is `_start` (#1094: no `__null_guard` marker any more), so the
+    // symbol exports continue at 1; a non-entry unit starts at 0.
+    int k = has_main ? 1 : 0;
     for (int i = 0; i < nfuncs; i++) {
       if (funcs[i]->is_static || !funcs[i]->name)
         continue;

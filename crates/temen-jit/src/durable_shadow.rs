@@ -17,7 +17,7 @@ use std::cell::Cell;
 /// Default: the root context's region base (`shadow_region_base(0)` = `SHADOW_BASE`). The runtime
 /// re-seeds at every root entry / inline child / fiber switch before any instrumented code runs, so
 /// this default is only a never-stale fallback.
-const ROOT_SHADOW_BASE: u64 = 64;
+const ROOT_SHADOW_BASE: u64 = temen_ir::durable_abi::SHADOW_BASE;
 
 thread_local! {
     /// This OS thread's (vCPU's) active durable shadow-SP **word address** — the base of the region

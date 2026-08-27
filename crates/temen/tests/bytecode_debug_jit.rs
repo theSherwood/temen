@@ -18,8 +18,9 @@ use temen_run::grant_jit;
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
-/// Where the guest reads the submitted blob from (matches the `i64.const 4096` in the guests below).
-const BLOB_OFF: u64 = 4096;
+/// Where the guest reads the submitted blob from (matches the `i64.const 20480` in the guests below).
+/// Above the #1094 NULL guard — a `data`/blob segment in `[0, 16384)` now traps `MemoryFault`.
+const BLOB_OFF: u64 = 20480;
 
 /// Encode `src` as the binary unit blob a guest submits to `Jit.compile`.
 fn blob(src: &str) -> Vec<u8> {
@@ -81,10 +82,10 @@ fn debug_install_then_call_indirect_agrees() {
         "memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  \
          v2 = i32.mul v0 v1\n  v3 = i32.const 100\n  v4 = i32.add v2 v3\n  return v4\n  }\n}\n",
     );
-    // inst 0: const 4096 · 1: const BLOBLEN · 2: compile · 3: install · 4: wrap · 5: call.dyn.
+    // inst 0: const 20480 · 1: const BLOBLEN · 2: compile · 3: install · 4: wrap · 5: call.dyn.
     let guest_src =
         "memory 16\nfunc (i32, i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32, v2: i32) {\n  \
-         v3 = i64.const 4096\n  v4 = i64.const BLOBLEN\n  \
+         v3 = i64.const 20480\n  v4 = i64.const BLOBLEN\n  \
          v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  \
          v6 = call.cap 11 3 (i64) -> (i64) v0 (v5)\n  \
          v7 = i32.wrap_i64 v6\n  \
@@ -158,7 +159,7 @@ fn debug_invoke_leaf_agrees() {
     );
     let guest_src =
         "memory 16\nfunc (i32, i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32, v2: i32) {\n  \
-         v3 = i64.const 4096\n  v4 = i64.const BLOBLEN\n  \
+         v3 = i64.const 20480\n  v4 = i64.const BLOBLEN\n  \
          v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  \
          v6 = call.cap 11 1 (i64, i32, i32) -> (i32) v0 (v5, v1, v2)\n  return v6\n  }\n}\n";
     let m = guest_module(guest_src, &b);
@@ -202,7 +203,7 @@ fn debug_invoke_step_into_breakpoint() {
     );
     let guest_src =
         "memory 16\nfunc (i32, i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32, v2: i32) {\n  \
-         v3 = i64.const 4096\n  v4 = i64.const BLOBLEN\n  \
+         v3 = i64.const 20480\n  v4 = i64.const BLOBLEN\n  \
          v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  \
          v6 = call.cap 11 1 (i64, i32, i32) -> (i32) v0 (v5, v1, v2)\n  return v6\n  }\n}\n";
     let m = guest_module(guest_src, &b);

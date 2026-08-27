@@ -105,22 +105,23 @@ fn child_entry_write_binds_stdout_on_the_jit() {
     temen_verify::verify_module(&child).expect("child verifies");
     let sl = child.memory.expect("child window").size_log2;
 
-    // A one-entry grant record `{"stdout" -> v2}` at 1024, name at 2048; op-13 into a carve at `1<<sl`.
-    let word0: u64 = 2048 | (6u64 << 32);
+    // A one-entry grant record `{"stdout" -> v2}` at 17408, name at 18432 (both above the #1094 NULL
+    // guard); op-13 into a carve at `1<<sl`.
+    let word0: u64 = 18432 | (6u64 << 32);
     let carve_off: u64 = 1u64 << sl;
     let parent_src = format!(
         r#"memory {psl}
-data 2048 "stdout"
+data 18432 "stdout"
 func (i32, i32, i32) -> (i64) {{
 block 0 (v0: i32, v1: i32, v2: i32) {{
   vrec0 = i64.const {word0}
-  vrecoff = i64.const 1024
+  vrecoff = i64.const 17408
   i64.store vrecoff vrec0
   vsh = i64.extend_i32_u v2
-  vrec1off = i64.const 1032
+  vrec1off = i64.const 17416
   i64.store vrec1off vsh
   vmh = i64.extend_i32_u v1
-  vgptr = i64.const 1024
+  vgptr = i64.const 17408
   vgn = i64.const 1
   ventry = i64.const 0
   voff = i64.const {carve_off}

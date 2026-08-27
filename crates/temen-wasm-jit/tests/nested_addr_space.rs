@@ -53,7 +53,7 @@ block 0 (v0: i32, v1: i32) {
   vsub = call.cap 5 4 (i64, i64) -> (i32) v0 (voff, vslog)
   vps2 = call.cap 5 3 () -> (i64) vsub ()
   ventry = i64.const 1
-  vzoff = i64.const 0
+  vzoff = i64.const 16384
   vzslog = i64.const 10
   vquota = i64.const 0
   vch = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v1 (ventry, vzoff, vzslog, vquota)

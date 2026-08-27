@@ -30,7 +30,7 @@ const WIN_BASE: u32 = 0x1_0000;
 const ENV_PTR: u32 = 1024;
 /// Where the harness stages the unit blob inside the **guest** window, so the guest's `compile` op
 /// reads `(ptr, len)` = `(BLOB_OFF, blob.len())` there. Clear of the tiny guest's own memory use.
-const BLOB_OFF: u64 = 0x2000;
+const BLOB_OFF: u64 = 0x4000;
 
 // ---- the wasm-JIT emitter the browser tier installs (here: non-shared memory for native wasmi) ----
 
