@@ -4970,6 +4970,22 @@ pub struct JitOnrampRun {
     /// hands the produced file to the card exactly as the bytecode `onramp_fs_exec_readback` does. `None`
     /// for a stdout guest (Lua/chibicc), whose memfs handle is dropped.
     fs_readback: Option<(temen_fs::MemFsHandle, String)>,
+    /// #1153 — **growth state** carried across cross-tier bounces so the emitted `_start` can `vm_map`-grow
+    /// the live window instead of pre-sizing a fixed one (invariant 14, runtime-backend parity with the
+    /// coop tier). `reserved_log2` clamps each bounce's `Mem` reservation to the owned backing (an
+    /// over-grow fails `-EINVAL`, never a silent write-drop past the backing). `prots` is the committed
+    /// page map, re-seeded into (and re-captured from) the fresh per-bounce `Mem` so `vm_map`-committed
+    /// pages survive between bounces; `None` once a bounce aliased a §13 `SharedRegion` page (a byte
+    /// restore can't reproduce it — the run fails closed, the provisional durability exception). `mapped`
+    /// is the live committed scalar extent — read by [`temen_onramp_jit_run_mapped`] so the JS driver
+    /// re-syncs the emitted tier's `"mapped"` global after each bounce (the `driveCoopTierupRun` pattern).
+    /// `grow` gates all of this: the single-shot on-ramp path sets it (no pre-size, real growth); the
+    /// warm+JIT path leaves it `false` and keeps its pre-sized `run_over` bounce byte-for-byte, so this
+    /// slice touches only the single-shot tier.
+    grow: bool,
+    reserved_log2: u8,
+    prots: Option<Vec<(u64, u8)>>,
+    mapped: u64,
 }
 
 /// How a single-shot JIT run feeds its guest — the twin of [`onramp_exec`] (stdin) vs
@@ -5246,12 +5262,13 @@ impl JitOnrampRun {
                 onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
                 let mut module = m.clone();
                 temen_wasm_jit::outline_cap_calls(&mut module);
-                // Enlarge the mapped window to cover the guest's heap (fixed — emitted code can't grow it).
-                if let Some(mc) = module.memory.as_mut() {
-                    if (mc.size_log2 as u32) < win_log2 as u32 {
-                        mc.size_log2 = win_log2;
-                    }
-                }
+                // #1153: NO pre-size. The emitted `_start` grows the live window via `vm_map` — the
+                // emitter's bounds check reads the live `"mapped"` global, not a baked `1 << size_log2`
+                // (`temen-wasm-jit` `MAPPED_GLOBAL_IDX`), so growth is already emittable. `run_cross_tier`
+                // persists the grown page state across bounces and surfaces the new extent for the JS
+                // `"mapped"` re-sync — parity with the coop tier (invariant 14). The declared window stays
+                // the guest's own, so `mapped` starts small and grows into the owned backing (clamped by
+                // `reserved_log2`, so an over-grow fails `-EINVAL` rather than vanishing past the backing).
                 // Compile once — reused for every cross-tier bounce (and shared across Runs via the cache).
                 let program = std::sync::Arc::new(
                     bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?,
@@ -5331,6 +5348,10 @@ impl JitOnrampRun {
                 }
             }
         }
+        // #1153 growth state. `mapped` starts at the guest's declared extent (the emitted `"mapped"`
+        // global self-initializes to the same `1 << size_log2`); it grows as `vm_map` bounces commit
+        // pages. Computed before `module` moves into the struct.
+        let declared_extent = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
         Ok(JitOnrampRun {
             module,
             program,
@@ -5348,6 +5369,10 @@ impl JitOnrampRun {
             returned_value: 0,
             trapped: false,
             fs_readback,
+            grow: true, // #1153 single-shot on-ramp: real `vm_map` growth (no pre-size)
+            reserved_log2: win_log2, // clamps each bounce's `Mem` reservation to the owned backing
+            prots: Some(Vec::new()),
+            mapped: declared_extent,
         })
     }
 
@@ -5435,6 +5460,12 @@ impl JitOnrampRun {
             returned_value: 0,
             trapped: false,
             fs_readback: None,
+            // Warm+JIT keeps its pre-sized window and the prior `run_over` bounce (`grow: false`), so the
+            // growth fields are inert here; initialized for struct parity (#1153 touches only single-shot).
+            grow: false,
+            reserved_log2: win_log2,
+            prots: Some(Vec::new()),
+            mapped: 1u64 << win_log2,
         })
     }
 
@@ -5489,19 +5520,59 @@ impl JitOnrampRun {
     /// `exit`) so `f0` unwinds and the run reports `STATUS_EXIT` with that code.
     pub fn run_cross_tier(&mut self, func: u32, args: &[Value]) -> Result<Vec<Value>, Trap> {
         let mut fuel = u64::MAX;
-        let r = self.program.run_over(
-            func,
-            args,
-            &mut fuel,
-            self.back.clone(),
-            &mut self.host,
-            false,
-        );
+        let r = if self.grow {
+            // #1153 single-shot on-ramp: run the bounce over the PERSISTED page map (so a prior `vm_map`
+            // grow's committed pages survive the fresh-`Mem`-per-bounce shape), clamped to the owned
+            // backing, and re-capture the grown map + new committed extent — so the next bounce sees the
+            // growth and the JS driver can re-sync the emitted `"mapped"` global. A `None` page map = a
+            // §13 `Backed` alias appeared, unrestorable by a byte map ⇒ fail the run closed (the emitted
+            // `_start` unwinds; the caller declines to the interpreter, which handles §13 — invariant 9).
+            // On-ramp guests are not granted a `SharedRegion`, so this is defensive.
+            let (r, pages, mapped) = self.program.run_over_grown(
+                func,
+                args,
+                &mut fuel,
+                self.back.clone(),
+                &mut self.host,
+                false,
+                self.reserved_log2,
+                self.prots.as_deref(),
+            );
+            match pages {
+                Some(p) => {
+                    self.prots = Some(p);
+                    self.mapped = mapped;
+                }
+                None => {
+                    self.prots = None;
+                    return Err(Trap::CapFault);
+                }
+            }
+            r
+        } else {
+            // Warm+JIT (pre-sized window): the exact prior bounce — no persisted page state, no re-sync.
+            self.program.run_over(
+                func,
+                args,
+                &mut fuel,
+                self.back.clone(),
+                &mut self.host,
+                false,
+            )
+        };
         if let Err(Trap::Exit(code)) = &r {
             self.exit_code = *code;
             self.exited = true;
         }
         r
+    }
+
+    /// #1153 — the live committed scalar extent of the run window (`Mem::map_info`'s `mapped`), updated
+    /// after each cross-tier bounce. The JS driver reads it via [`temen_onramp_jit_run_mapped`] to re-sync
+    /// the emitted tier's `"mapped"` bound so a `vm_map`-grown store admits — the single-shot twin of the
+    /// coop tier's `temen_coop_mapped`.
+    pub fn mapped(&self) -> u64 {
+        self.mapped
     }
 
     /// The captured streams / exit — read after the emitted `f0` returns or unwinds (same contract as
@@ -7808,6 +7879,12 @@ pub extern "C" fn temen_onramp_jit_run_wasm_ptr() -> *const u8 {
 #[no_mangle]
 pub extern "C" fn temen_onramp_jit_run_wasm_len() -> usize {
     unsafe { (*core::ptr::addr_of!(JIT_RUN)).as_ref() }.map_or(0, |r| r.emitted_wasm().len())
+}
+/// #1153 — the live committed scalar extent of the run window, for the JS `"mapped"`-global re-sync
+/// after a cross-tier bounce (the single-shot twin of `temen_coop_mapped`). `0` with no live run.
+#[no_mangle]
+pub extern "C" fn temen_onramp_jit_run_mapped() -> u64 {
+    unsafe { (*core::ptr::addr_of!(JIT_RUN)).as_ref() }.map_or(0, |r| r.mapped())
 }
 /// The window base as a byte offset in this module's linear memory — the emitted `f0`'s `win`.
 #[no_mangle]

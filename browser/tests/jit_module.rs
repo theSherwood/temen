@@ -123,6 +123,15 @@ fn jit(m: &temen_ir::Module, stdin: &[u8]) -> (Out, u128) {
                     .run_cross_tier(func as u32, &args);
                 match outcome {
                     Ok(vals) => {
+                        // #1153: re-sync the emitted `"mapped"` global to the (possibly `vm_map`-grown)
+                        // live committed extent after each bounce — exactly what `driveJitRun` does in
+                        // the browser. Without this, an emitted store into a grown page traps against the
+                        // stale compile-time bound; with it, the single-shot JIT tier grows in lockstep
+                        // with the coop tier (invariant 14, runtime-backend parity).
+                        let mapped = caller.data().as_ref().unwrap().mapped() as i64;
+                        if let Some(wasmi::Extern::Global(g)) = caller.get_export("mapped") {
+                            g.set(&mut caller, Val::I64(mapped)).ok();
+                        }
                         let data = memory.data_mut(&mut caller);
                         for (i, v) in vals.iter().enumerate() {
                             if i >= results.len() {
@@ -237,6 +246,77 @@ fn differential(name: &str, stdin: &[u8]) {
 #[test]
 fn hello_c_jit_matches_interpreter() {
     differential("hello_c", b"");
+}
+
+/// The on-ramp powerbox's `vm_map` handle, replicated from `grant_onramp_caps`'s grant order
+/// (stdout, stdin, exit, **memory**, address-space) — `vm_map` (`AddressSpace` op 0) binds to the
+/// 4th grant (`grant_memory`), so the growing guest names it as `i32.const {mem_h}`.
+fn onramp_mem_handle() -> i32 {
+    use temen_interp::{Host, StreamRole};
+    let mut h = Host::new();
+    let _ = h.grant_stream(StreamRole::Out);
+    let _ = h.grant_stream(StreamRole::In);
+    let _ = h.grant_exit();
+    h.grant_memory()
+}
+
+/// #1153 — the single-shot on-ramp JIT growth differential: a guest that declares a 64-KiB window,
+/// `vm_map`-grows one page past it (`[64 KiB, 80 KiB)`), then stores a marker into the grown page
+/// **from emitted code** and loads it back. The emitted store confines against the live `"mapped"`
+/// global, so it admits only because the cross-tier `vm_map` bounce grew the extent and the driver
+/// re-synced `"mapped"` (the fix under test). The JIT run must return the same marker as the
+/// interpreter oracle — proving the emitted tier grows in lockstep with the interpreter, closing the
+/// runtime-backend gap invariant 14 requires (the coop tier already had this; the single-shot tier
+/// was pre-sizing a fixed window as a workaround).
+#[test]
+fn onramp_jit_grows_the_window_and_matches_interpreter() {
+    let mem_h = onramp_mem_handle();
+    // func 0 `_start` → func 1 (grow, then store+load the marker in the grown page) → func 2
+    // (`vm_map [64 KiB, 80 KiB)`, Rw). The store/load in func 1 are emitted; the `call.cap` in func 2
+    // is outlined to a cross-tier bounce, after which the driver re-syncs `"mapped"` to 80 KiB.
+    let src = format!(
+        "memory 16\n\
+         func () -> (i64) {{\n\
+         block 0 () {{\n\
+         \x20 vr = call 1 ()\n\
+         \x20 return vr\n\
+         \x20 }}\n\
+         }}\n\
+         func () -> (i64) {{\n\
+         block 0 () {{\n\
+         \x20 vg = call 2 ()\n\
+         \x20 va = i64.const 65552\n\
+         \x20 vm = i64.const 424242\n\
+         \x20 i64.store va vm\n\
+         \x20 vl = i64.load va\n\
+         \x20 return vl\n\
+         \x20 }}\n\
+         }}\n\
+         func () -> (i64) {{\n\
+         block 0 () {{\n\
+         \x20 vas = i32.const {mem_h}\n\
+         \x20 voff = i64.const 65536\n\
+         \x20 vlen = i64.const 16384\n\
+         \x20 vprot = i32.const 3\n\
+         \x20 vr = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)\n\
+         \x20 return vr\n\
+         \x20 }}\n\
+         }}\n\
+         export 0 func \"_start\" 0\n"
+    );
+    let m = temen_text::parse_module(&src).expect("parse growing guest");
+    temen_verify::verify_module(&m).expect("verify growing guest");
+
+    let (i, _ius) = interp(&m, b"");
+    let (j, _jus) = jit(&m, b"");
+    assert_eq!(
+        i.code, 424242,
+        "the interpreter oracle reads the marker back from the grown page"
+    );
+    assert_eq!(
+        j, i,
+        "the single-shot JIT run must grow the window and match the interpreter (#1153)"
+    );
 }
 
 // Lua / SQLite emit valid wasm that **V8** runs (proven byte-identical by `browser-jit-module-test.mjs`),

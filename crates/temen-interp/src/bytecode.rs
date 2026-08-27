@@ -2371,7 +2371,17 @@ impl SharedProgram {
         let (pages, mapped) = match mem.as_ref() {
             None => (Some(Vec::new()), 0),
             Some(m) => {
-                let (_, mapped, _, entries) = m.map_info();
+                let (_, _, reserved, entries) = m.map_info();
+                // The committed **scalar extent** — not `map_info`'s `window.mapped()`, which counts
+                // only the demand-committed prefix and misses a `vm_map`-grown tail (the pages live in
+                // the page map). `scalar_extent` folds the contiguous grown tail into the high-water so
+                // a cross-tier driver can re-sync the emitted `"mapped"` bound to admit a store into the
+                // grown page (#1153). It is `None` for a non-representable layout (an `Ro`/`Unmapped`
+                // hole, or `Rw` past a hole) — the single live bound can't model that, so fall back to
+                // the reservation (the whole owned backing, as the pre-#1153 flat pre-size did): reads
+                // of a self-`protect`ed rodata page still admit, and the interpreter page map (returned
+                // in `entries`, re-seeded next bounce) keeps per-page state authoritative on that tier.
+                let mapped = m.scalar_extent().unwrap_or(reserved);
                 if entries.iter().any(|&(_, kind)| kind == 3) {
                     (None, mapped) // §13 Backed alias — unrestorable by a byte snapshot; fail closed
                 } else {
