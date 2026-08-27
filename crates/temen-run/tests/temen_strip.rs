@@ -16,7 +16,7 @@ use temen_verify::verify_module;
 fn two_func_module() -> Module {
     let m = parse_module(
         "memory 16\n\
-         data 16 \"hi\\n\"\n\
+         data 16400 \"hi\\n\"\n\
          export 0 func \"_start\" 0\n\
          export 1 func \"emit\" 1\n\
          func () -> (i32) {\n\
@@ -28,7 +28,7 @@ fn two_func_module() -> Module {
          func () -> (i32) {\n\
          block 0 () {\n\
          \x20 v0 = i32.const 0\n\
-         \x20 v1 = i64.const 16\n\
+         \x20 v1 = i64.const 16400\n\
          \x20 v2 = i64.const 3\n\
          \x20 v3 = call.sym \"write\" (i64, i64) -> (i64) v0(v1, v2)\n\
          \x20 v4 = i32.const 7\n\

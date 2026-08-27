@@ -22,7 +22,7 @@ func () -> (i64) {
 block 0 () {
   hr = i32.const 0
   fd0 = i64.const 0
-  buf = i64.const 1024
+  buf = i64.const 16384
   cap = i64.const 256
   n = call.sym "read" (i64, i64, i64) -> (i64) hr (fd0, buf, cap)
   hw = i32.const 0

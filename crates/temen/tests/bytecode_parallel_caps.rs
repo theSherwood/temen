@@ -17,9 +17,10 @@ use temen_interp::{bytecode, Host, Region, StreamRole, Value};
 use temen_text::parse_module;
 
 // func 0 (root, param = stdout handle): spawn 8 workers (passing the handle), join them, return the
-// counter at mem[8]. func 1 (worker, args = sp, stdout handle): write "tick\n" then bump the counter.
+// counter at mem[16392] (above the #1094 NULL guard). func 1 (worker, args = sp, stdout handle): write
+// "tick\n" (staged by the data segment at mem[16384]) then bump the counter.
 const CAPS: &str = r#"memory 16
-data 0 "tick\n"
+data 16384 "tick\n"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   vh0 = i64.extend_i32_u v0
@@ -36,7 +37,7 @@ block 2 (vi2: i64, vhh2: i64) {
   vt = thread.spawn 1 vsp vhh2
   v4 = i64.const 4
   v5 = i64.mul vi2 v4
-  v6 = i64.const 16
+  v6 = i64.const 16400
   v7 = i64.add v6 v5
   i32.store v7 vt
   v8 = i64.const 1
@@ -55,7 +56,7 @@ block 4 (vj: i64) {
 block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
-  v15 = i64.const 16
+  v15 = i64.const 16400
   v16 = i64.add v15 v14
   v17 = i32.load v16
   v18 = thread.join v17
@@ -64,7 +65,7 @@ block 5 (vj2: i64) {
   br 4(v20)
 }
 block 6 () {
-  v21 = i64.const 8
+  v21 = i64.const 16392
   v22 = i64.atomic.load v21
   return v22
   }
@@ -72,10 +73,10 @@ block 6 () {
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, vh: i64) {
   vhandle = i32.wrap_i64 vh
-  vptr = i64.const 0
+  vptr = i64.const 16384
   vlen = i64.const 5
   vw = call.cap 0 1 (i64, i64) -> (i64) vhandle(vptr, vlen)
-  v1 = i64.const 8
+  v1 = i64.const 16392
   v2 = i64.const 1
   v3 = i64.atomic.rmw.add v1 v2
   v4 = i64.const 0

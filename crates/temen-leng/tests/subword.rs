@@ -46,9 +46,10 @@ fn u8_load_reads_one_byte_zero_extended() {
  (proc :lowbyte.0. (params (param :p.0 . (i +64))) (i +64) .
   (stmts . (ret (conv (i +64) (deref (cast (ptr (u 8)) p.0)))))))";
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
-    let mut seed = vec![0xFFu8; 4096];
-    seed[256] = 0xAB;
-    let (out, _) = run_capture_both(&m, 0, &[256], &seed);
+    // #1094: the NULL guard is unconditional, so the accessed byte must clear `[0, POWERBOX_NULL_GUARD)`.
+    let mut seed = vec![0xFFu8; 20480];
+    seed[16640] = 0xAB;
+    let (out, _) = run_capture_both(&m, 0, &[16640], &seed);
     assert_eq!(out, vec![0xAB], "one byte, zero-extended");
 }
 
@@ -60,9 +61,10 @@ fn i8_load_sign_extends() {
  (proc :sbyte.0. (params (param :p.0 . (i +64))) (i +64) .
   (stmts . (ret (conv (i +64) (deref (cast (ptr (i 8)) p.0)))))))";
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
-    let mut seed = vec![0u8; 4096];
-    seed[256] = 0xFF;
-    let (out, _) = run_capture_both(&m, 0, &[256], &seed);
+    // #1094: the NULL guard is unconditional, so the accessed byte must clear `[0, POWERBOX_NULL_GUARD)`.
+    let mut seed = vec![0u8; 20480];
+    seed[16640] = 0xFF;
+    let (out, _) = run_capture_both(&m, 0, &[16640], &seed);
     assert_eq!(out, vec![-1], "0xFF sign-extends to -1");
 }
 
@@ -75,9 +77,10 @@ fn u8_store_writes_exactly_one_byte() {
  (proc :setbyte.0. (params (param :p.0 . (i +64)) (param :v.0 . (i +64))) . .
   (stmts . (asgn (deref (cast (ptr (u 8)) p.0)) v.0))))";
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
-    let seed = vec![0xFFu8; 4096];
-    let (_, mem) = run_capture_both(&m, 0, &[256, 0], &seed);
-    assert_eq!(mem[256], 0x00, "the target byte is written");
-    assert_eq!(mem[257], 0xFF, "the neighbour byte is untouched");
-    assert_eq!(mem[255], 0xFF, "the previous byte is untouched");
+    // #1094: the NULL guard is unconditional, so the accessed byte must clear `[0, POWERBOX_NULL_GUARD)`.
+    let seed = vec![0xFFu8; 20480];
+    let (_, mem) = run_capture_both(&m, 0, &[16640, 0], &seed);
+    assert_eq!(mem[16640], 0x00, "the target byte is written");
+    assert_eq!(mem[16641], 0xFF, "the neighbour byte is untouched");
+    assert_eq!(mem[16639], 0xFF, "the previous byte is untouched");
 }

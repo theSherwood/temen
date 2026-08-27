@@ -33,7 +33,9 @@ fn memory_handle() -> i32 {
 /// `marker + scratch`.
 fn guest_text() -> String {
     let h = memory_handle();
-    let brk = temen_ir::POWERBOX_HEAP_BRK;
+    // The on-ramp brk word sits one guard up on the #1094 marked layout (`warm_read_brk`:
+    // `scratch + POWERBOX_HEAP_BRK`, scratch = the module guard base) — where the warm host seeds it.
+    let brk = temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_HEAP_BRK;
     format!(
         r#"memory 16
 func (i64) -> (i64) {{

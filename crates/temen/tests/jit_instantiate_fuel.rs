@@ -22,7 +22,7 @@ fn runaway_child_src(quota: i64) -> String {
          func (i32) -> (i64) {{\n\
          block 0 (v0: i32) {{\n\
          \x20 v1 = i64.const 1\n\
-         \x20 v2 = i64.const 0\n\
+         \x20 v2 = i64.const 65536\n\
          \x20 v3 = i64.const 12\n\
          \x20 v4 = i64.const {quota}\n\
          \x20 v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)\n\

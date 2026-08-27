@@ -502,7 +502,7 @@ fn counter_provider() -> temen_ir::Module {
            br_if vk2 1(vk2) 2()\n\
          }\n\
          block 2 () {\n\
-           va = i64.const 0\n\
+           va = i64.const 16384\n\
            vc = i64.load va\n\
            v1 = i64.const 1\n\
            vn = i64.add vc v1\n\
@@ -702,14 +702,14 @@ fn a_wrap_holds_and_forwards_a_real_capability() {
     // the provider's domain.
     let provider = temen_text::parse_module(
         "memory 16\n\
-         data 0 \"hi\"\n\
-         data 8 \"out\"\n\
+         data 16384 \"hi\"\n\
+         data 16392 \"out\"\n\
          func () -> (i64) {\n\
          block 0 () {\n\
-           vp = i64.const 8\n\
+           vp = i64.const 16392\n\
            vn = i64.const 3\n\
            vh = self.resolve vp vn\n\
-           vbuf = i64.const 0\n\
+           vbuf = i64.const 16384\n\
            vlen = i64.const 2\n\
            vw = call.cap 0 1 (i64, i64) -> (i64) vh (vbuf, vlen)\n\
            return vw\n\
@@ -796,10 +796,10 @@ fn a_cyclic_offer_call_is_a_probeable_eagain_not_a_deadlock() {
     // `0`), and `-EAGAIN`s — the same `-11`, but via the admission word, not a held `try_lock`.
     let provider = temen_text::parse_module(
         "memory 16\n\
-         data 0 \"me\"\n\
+         data 16384 \"me\"\n\
          func () -> (i64) {\n\
          block 0 () {\n\
-           vp = i64.const 0\n\
+           vp = i64.const 16384\n\
            vn = i64.const 2\n\
            vh = self.resolve vp vn\n\
            vr = call.cap 268435456 0 () -> (i64) vh ()\n\

@@ -9988,6 +9988,22 @@ impl CoopSched {
         let forked_twins: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         let hooked_twins: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
 
+        // #1122 — an armed external-wake doorbell: wire the personality's pipe-wake door to ring
+        // it (the cooperative twin of the tree-walker's `set_pipe_wake` → scheduler wiring). The
+        // pump then BLOCKS on the bell at its would-be all-parked deadlock and re-polls pipe
+        // readiness on each ring — an embedder's `feed_terminal` (another OS thread, or another
+        // wasm-thread instantiation) is the wake source. The pipe id is unused: the pump's settle
+        // already polls every parked pipe, so the ring only needs to say "something changed".
+        if let Some(bell) = host.external_wake() {
+            if let Some((_, source)) = host.signal_poll() {
+                source.set_pipe_wake(std::sync::Arc::new(move |_pipe| {
+                    let (gen, cv) = &*bell;
+                    *gen.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+                    cv.notify_all();
+                }));
+            }
+        }
+
         Ok(CoopSched {
             tasks,
             extra_envs,
@@ -10178,6 +10194,13 @@ impl CoopSched {
             for ci in reap_p_wakes {
                 tasks[ci].state = TaskState::Runnable;
             }
+            // #1122 — the external-wake generation, snapshotted BEFORE the pipe-readiness poll so
+            // the all-parked block below cannot lose a wake: a feed that lands before this read has
+            // already deposited its bytes (the poll sees them); one that lands after it bumps the
+            // generation past this snapshot (the block returns immediately). `0` when unarmed.
+            let bell_gen = host
+                .external_wake()
+                .map_or(0, |bell| *bell.0.lock().unwrap_or_else(|e| e.into_inner()));
             // #1080 rung 4 — pipe wakes: the cooperative driver has no scheduler-side `pipe_waiters`, so
             // it POLLS each parked reader/writer's shared FIFO here and re-admits (the rewound read/write
             // re-executes) once ready. A reader/writer is usually a forked command (`env: Some`); a root
@@ -10301,7 +10324,33 @@ impl CoopSched {
                             }
                         }
                     }
-                    None => return Err(Trap::ThreadFault), // deadlock (no runnable, no waiters)
+                    None => {
+                        // #1122 — every task is parked and no internal wake can come. With an
+                        // armed doorbell and at least one task parked on a PIPE — the state an
+                        // embedder can feed from outside the run (the interactive terminal) —
+                        // BLOCK for the next ring instead of declaring deadlock, then re-settle
+                        // (the readiness poll above sees the deposit). The `bell_gen` snapshot
+                        // predates that poll, so a feed racing this park is never lost. Without
+                        // a doorbell, or with only internally-wakeable parks (a join cycle),
+                        // this is the deadlock it always was.
+                        let external = tasks.iter().any(|t| {
+                            matches!(
+                                t.state,
+                                TaskState::BlockedPipeRead { .. }
+                                    | TaskState::BlockedPipeWrite { .. }
+                            )
+                        });
+                        match host.external_wake().filter(|_| external) {
+                            Some(bell) => {
+                                let (gen, cv) = &*bell;
+                                let mut g = gen.lock().unwrap_or_else(|e| e.into_inner());
+                                while *g == bell_gen {
+                                    g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
+                                }
+                            }
+                            None => return Err(Trap::ThreadFault), // deadlock (no runnable, no waiters)
+                        }
+                    }
                 }
                 continue;
             };
@@ -11052,13 +11101,17 @@ impl CoopSched {
                         0
                     };
                     let off_u = off as u64;
-                    let fits = carve_fits(
-                        off_u,
-                        size_log2,
-                        isz,
-                        ibase,
-                        mem.as_ref().map_or(0, |m| m.null_guard),
-                    );
+                    // #1094: the guard-overlap check must use the *spawning task's own* window guard,
+                    // not the root's. A nested child running in a sub-guard (< 16384) carve is
+                    // unguarded (`null_guard == 0`), so a low grandchild carve is legal there — the
+                    // OS-thread parallel driver already reads the child's own `mem` (this file, the
+                    // parallel `Instantiate` arm), so the cooperative driver must match it or the two
+                    // engines diverge on depth-2 nesting.
+                    let holder_guard = match tasks[ti].env {
+                        None => mem.as_ref().map_or(0, |m| m.null_guard),
+                        Some(k) => extra_envs[k].mem.as_ref().map_or(0, |m| m.null_guard),
+                    };
+                    let fits = carve_fits(off_u, size_log2, isz, ibase, holder_guard);
                     if !ok_entry || !fits {
                         tasks[ti]
                             .vt

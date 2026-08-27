@@ -32,7 +32,8 @@ block 0 () {
 "#;
 
 /// Root `(jit_handle, code_handle) -> counter`: pack both handles into the single `thread.spawn` arg
-/// (`(code << 32) | jit`), spawn 8 workers (func 1), join them, return the shared counter at `mem[8]`.
+/// (`(code << 32) | jit`), spawn 8 workers (func 1), join them, return the shared counter at `mem[16392]`
+/// (above the #1094 NULL guard).
 /// Worker (func 1, args = sp, packed): unpack the handles, `Jit.invoke` the unit, atomically add its
 /// return (7) to the counter. 8 workers ⇒ counter 56.
 const INVOKE: &str = r#"memory 16
@@ -56,7 +57,7 @@ block 2 (vi2: i64, vp2: i64) {
   vt = thread.spawn 1 vsp vp2
   v4 = i64.const 4
   v5 = i64.mul vi2 v4
-  v6 = i64.const 16
+  v6 = i64.const 16400
   v7 = i64.add v6 v5
   i32.store v7 vt
   v8 = i64.const 1
@@ -75,7 +76,7 @@ block 4 (vj: i64) {
 block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
-  v15 = i64.const 16
+  v15 = i64.const 16400
   v16 = i64.add v15 v14
   v17 = i32.load v16
   v18 = thread.join v17
@@ -84,7 +85,7 @@ block 5 (vj2: i64) {
   br 4(v20)
 }
 block 6 () {
-  v21 = i64.const 8
+  v21 = i64.const 16392
   v22 = i64.atomic.load v21
   return v22
   }
@@ -98,7 +99,7 @@ block 0 (vsp: i64, vp: i64) {
   vcode = i64.shr_u vp vsh
   vw = call.cap 11 1 (i64) -> (i32) vjit (vcode)
   vw64 = i64.extend_i32_u vw
-  vc8 = i64.const 8
+  vc8 = i64.const 16392
   vold = i64.atomic.rmw.add vc8 vw64
   vret = i64.const 0
   return vret
@@ -130,7 +131,7 @@ block 2 (vi2: i64, vp2: i64) {
   vt = thread.spawn 1 vsp vp2
   v4 = i64.const 4
   v5 = i64.mul vi2 v4
-  v6 = i64.const 16
+  v6 = i64.const 16400
   v7 = i64.add v6 v5
   i32.store v7 vt
   v8 = i64.const 1
@@ -149,7 +150,7 @@ block 4 (vj: i64) {
 block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
-  v15 = i64.const 16
+  v15 = i64.const 16400
   v16 = i64.add v15 v14
   v17 = i32.load v16
   v18 = thread.join v17
@@ -158,7 +159,7 @@ block 5 (vj2: i64) {
   br 4(v20)
 }
 block 6 () {
-  v21 = i64.const 8
+  v21 = i64.const 16392
   v22 = i64.atomic.load v21
   return v22
   }
@@ -174,7 +175,7 @@ block 0 (vsp: i64, vp: i64) {
   vslot32 = i32.wrap_i64 vslot
   vr = call.dyn () -> (i32) vslot32 ()
   vr64 = i64.extend_i32_u vr
-  vc8 = i64.const 8
+  vc8 = i64.const 16392
   vold = i64.atomic.rmw.add vc8 vr64
   vret = i64.const 0
   return vret
@@ -368,12 +369,13 @@ fn invoked_spawning_unit_stays_capfault() {
 // unit is host-pre-compiled; here every worker compiles its own, so the new concurrency is the
 // concurrent `compile` itself.
 
-/// Byte offset in the shared window where the unit blob is staged (clear of the counter at `mem[8]`
-/// and the thread-handle table at `mem[16..48]`), so each worker's `compile (ptr, len)` reads it there.
-const BLOB_OFF: usize = 0x2000;
+/// Byte offset in the shared window where the unit blob is staged (clear of the counter at `mem[16392]`
+/// and the thread-handle table at `mem[16400..16432]`, all above the #1094 NULL guard), so each
+/// worker's `compile (ptr, len)` reads it there.
+const BLOB_OFF: usize = 0x6000;
 
 /// Root `(jit) -> counter`: spawn 8 workers (func 1), each passed `jit` as the i64 spawn arg; join
-/// them; return the shared atomic counter at `mem[8]`. Worker: **runtime-`compile`** the `SERVICE`
+/// them; return the shared atomic counter at `mem[16392]`. Worker: **runtime-`compile`** the `SERVICE`
 /// blob staged at `BLOB_OFF`, `invoke` the resulting unit (→ 7), atomically fold it into the counter.
 /// 8 workers ⇒ 56, schedule-independent (each worker mints its *own* unit; whatever order the
 /// concurrent compiles serialise in, every invoke returns 7).
@@ -396,7 +398,7 @@ block 2 (vi2: i64, vp2: i64) {{
   vt = thread.spawn 1 vsp vp2
   v4 = i64.const 4
   v5 = i64.mul vi2 v4
-  v6 = i64.const 16
+  v6 = i64.const 16400
   v7 = i64.add v6 v5
   i32.store v7 vt
   v8 = i64.const 1
@@ -415,7 +417,7 @@ block 4 (vj: i64) {{
 block 5 (vj2: i64) {{
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
-  v15 = i64.const 16
+  v15 = i64.const 16400
   v16 = i64.add v15 v14
   v17 = i32.load v16
   v18 = thread.join v17
@@ -424,7 +426,7 @@ block 5 (vj2: i64) {{
   br 4(v20)
 }}
 block 6 () {{
-  v21 = i64.const 8
+  v21 = i64.const 16392
   v22 = i64.atomic.load v21
   return v22
 }}
@@ -437,7 +439,7 @@ block 0 (vsp: i64, vp: i64) {{
   vcode = call.cap 11 0 (i64, i64) -> (i64) vjit (vptr, vlen)
   vw = call.cap 11 1 (i64) -> (i32) vjit (vcode)
   vw64 = i64.extend_i32_u vw
-  vc8 = i64.const 8
+  vc8 = i64.const 16392
   vold = i64.atomic.rmw.add vc8 vw64
   vret = i64.const 0
   return vret

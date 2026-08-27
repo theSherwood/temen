@@ -24,7 +24,7 @@ fn pager_program(mem_log2: u8, carve_off: u64, carve_log2: u64, strides: u64) ->
     format!(
         "\
 memory {mem_log2}
-data 0 \"vm\"
+data 16384 \"vm\"
 type 0 func (i64) -> (i64)
 type 1 interface {{ page: 0 }}
 export 0 interface \"pager\" 1 {{ page: 2 }}
@@ -32,7 +32,7 @@ import 0 \"exit\" (i32) -> ()
 
 func 0 () -> () {{
 block 0 () {{
-  vp = i64.const 0
+  vp = i64.const 16384
   vl = i64.const 2
   vh = self.resolve vp vl
   ; spawn a demand child via record (op 17): pager = impl export 0 (f16 hi), entry 1
@@ -41,19 +41,19 @@ block 0 () {{
   rrv2 = i64.const {carve_log2}
   rrv3 = i64.const 4294967295
   rrvz = i64.const 0
-  rra0 = i64.const 1152
+  rra0 = i64.const 17536
   i64.store rra0 rrv0
-  rra1 = i64.const 1160
+  rra1 = i64.const 17544
   i64.store rra1 rrv1
-  rra2 = i64.const 1168
+  rra2 = i64.const 17552
   i64.store rra2 rrv2
-  rra3 = i64.const 1176
+  rra3 = i64.const 17560
   i64.store rra3 rrv3
-  rra4 = i64.const 1184
+  rra4 = i64.const 17568
   i64.store rra4 rrvz
-  rra5 = i64.const 1192
+  rra5 = i64.const 17576
   i64.store rra5 rrvz
-  rra6 = i64.const 1200
+  rra6 = i64.const 17584
   i64.store rra6 rrvz
   vch = call.cap 6 17 (i64) -> (i32) vh (rra0)
   vs0 = i64.const 0
@@ -86,7 +86,9 @@ block 0 (v0: i64) {{
 }}
 block 1 (vi: i64, va: i64) {{
   vstride = i64.const 65536
-  vaddr = i64.mul vi vstride
+  vaddrm = i64.mul vi vstride
+  vguard = i64.const 16384
+  vaddr = i64.add vaddrm vguard
   vb = i32.load8_u vaddr
   vbw = i64.extend_i32_u vb
   va2 = i64.add va vbw

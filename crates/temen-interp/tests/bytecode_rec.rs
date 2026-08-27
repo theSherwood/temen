@@ -21,7 +21,8 @@ use temen_text::parse_module;
 
 use temen_ir::errno::EINVAL;
 
-/// Parent (entry 0, `(i32 inst) -> (i64)`): build the record at 1152 — entry 1, off 64 KiB,
+/// Parent (entry 0, `(i32 inst) -> (i64)`): build the record at 17536 (above the #1094 NULL guard) —
+/// entry 1, off 64 KiB,
 /// size_log2 12, no pager/module/budget/quota/grants — spawn via op 17, join, return the child's
 /// result. Child (func 1) returns 42.
 const REC_SPAWN: &str = r#"memory 17
@@ -33,19 +34,19 @@ block 0 (v0: i32) {
   qv2 = i64.const -4294967284
   qv3 = i64.const 4294967295
   qv4 = i64.const 0
-  qa0 = i64.const 1152
+  qa0 = i64.const 17536
   i64.store qa0 qv0
-  qa1 = i64.const 1160
+  qa1 = i64.const 17544
   i64.store qa1 qv1
-  qa2 = i64.const 1168
+  qa2 = i64.const 17552
   i64.store qa2 qv2
-  qa3 = i64.const 1176
+  qa3 = i64.const 17560
   i64.store qa3 qv3
-  qa4 = i64.const 1184
+  qa4 = i64.const 17568
   i64.store qa4 qv4
-  qa5 = i64.const 1192
+  qa5 = i64.const 17576
   i64.store qa5 qv4
-  qa6 = i64.const 1200
+  qa6 = i64.const 17584
   i64.store qa6 qv4
   vch = call.cap 6 17 (i64) -> (i32) v0 (qa0)
   vr = call.cap 6 1 (i32) -> (i64) v0 (vch)
@@ -75,19 +76,19 @@ block 0 (v0: i32) {
   qv2 = i64.const -4294967284
   qv3 = i64.const 4294967295
   qv4 = i64.const 0
-  qa0 = i64.const 1152
+  qa0 = i64.const 17536
   i64.store qa0 qv0
-  qa1 = i64.const 1160
+  qa1 = i64.const 17544
   i64.store qa1 qv1
-  qa2 = i64.const 1168
+  qa2 = i64.const 17552
   i64.store qa2 qv2
-  qa3 = i64.const 1176
+  qa3 = i64.const 17560
   i64.store qa3 qv3
-  qa4 = i64.const 1184
+  qa4 = i64.const 17568
   i64.store qa4 qv4
-  qa5 = i64.const 1192
+  qa5 = i64.const 17576
   i64.store qa5 qv4
-  qa6 = i64.const 1200
+  qa6 = i64.const 17584
   i64.store qa6 qv4
   vch = call.cap 6 17 (i64) -> (i32) v0 (qa0)
   vr = call.cap 6 1 (i32) -> (i64) v0 (vch)
@@ -121,19 +122,19 @@ block 0 (v0: i32, v1: i64) {{
   qm1 = i64.const 4294967295
   qv3 = i64.or qm1 qbh
   qv4 = i64.const 0
-  qa0 = i64.const 1152
+  qa0 = i64.const 17536
   i64.store qa0 qv0
-  qa1 = i64.const 1160
+  qa1 = i64.const 17544
   i64.store qa1 qv1
-  qa2 = i64.const 1168
+  qa2 = i64.const 17552
   i64.store qa2 qv2
-  qa3 = i64.const 1176
+  qa3 = i64.const 17560
   i64.store qa3 qv3
-  qa4 = i64.const 1184
+  qa4 = i64.const 17568
   i64.store qa4 qv4
-  qa5 = i64.const 1192
+  qa5 = i64.const 17576
   i64.store qa5 qv4
-  qa6 = i64.const 1200
+  qa6 = i64.const 17584
   i64.store qa6 qv4
   vch = call.cap 6 17 (i64) -> (i32) v0 (qa0)
   vz = i32.const 0

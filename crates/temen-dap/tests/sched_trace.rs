@@ -11,21 +11,22 @@ use temen_dap::{BytecodeBackend, DapServer, Debuggee, Json, SharedSink};
 use temen_interp::Stop;
 use temen_text::parse_module;
 
-/// The `bytecode_debug_threads.rs` futex handoff: the root seeds mem[8], spawns a worker, flags +
-/// notifies mem[0], joins; the worker waits on mem[0] then reads mem[8].
+/// The `bytecode_debug_threads.rs` futex handoff: the root seeds mem[16392], spawns a worker,
+/// flags + notifies mem[16384], joins; the worker waits on mem[16384] then reads mem[16392] (the
+/// handoff/futex words shifted above the #1094 NULL guard; the futex word is 0-relative → 16384).
 const FUTEX_HANDOFF: &str = r#"
 memory 16
 func () -> (i64) {
 block 0 () {
-  v0 = i64.const 8
+  v0 = i64.const 16392
   v1 = i64.const 987654
   i64.atomic.store v0 v1
   v2 = i64.const 0
   v3 = thread.spawn 1 v2 v2
-  v4 = i64.const 0
+  v4 = i64.const 16384
   v5 = i32.const 1
   i32.atomic.store v4 v5
-  v6 = i64.const 0
+  v6 = i64.const 16384
   v7 = i32.const 1
   v8 = atomic.notify v6 v7
   v9 = thread.join v3
@@ -34,18 +35,19 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, v0: i64) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   v2 = i32.const 0
   v3 = i64.const 1000000000
   v4 = i32.atomic.wait v1 v2 v3
-  v5 = i64.const 8
+  v5 = i64.const 16392
   v6 = i64.atomic.load v5
   return v6
   }
 }
 "#;
 
-/// Two workers race load/add/store on mem[0]; the root joins both and returns the count.
+/// Two workers race load/add/store on mem[16384] (counter cell above the #1094 NULL guard); the
+/// root joins both and returns the count.
 const RACY_COUNTER: &str = r#"
 memory 16
 func () -> (i64) {
@@ -56,14 +58,14 @@ block 0 () {
   vh1 = thread.spawn 1 vsp va
   vj0 = thread.join vh0
   vj1 = thread.join vh1
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vr = i64.load vaddr
   return vr
   }
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vc = i64.load vaddr
   vn = i64.add vc varg
   i64.store vaddr vn
@@ -112,7 +114,7 @@ fn kinds_of(tape: &str) -> Vec<(String, Json)> {
 }
 
 /// A guest where the **root genuinely parks on the futex**: under the lowest-index schedule the
-/// root runs first — it spawns the worker, then `atomic.wait`s on mem[0] while the worker hasn't
+/// root runs first — it spawns the worker, then `atomic.wait`s on mem[16384] while the worker hasn't
 /// run yet, so it parks for real; the worker then sets the flag and `notify`s it awake.
 const ROOT_WAITS: &str = r#"
 memory 16
@@ -120,7 +122,7 @@ func () -> (i64) {
 block 0 () {
   v0 = i64.const 0
   v1 = thread.spawn 1 v0 v0
-  v2 = i64.const 0
+  v2 = i64.const 16384
   v3 = i32.const 0
   v4 = i64.const 1000000000
   v5 = i32.atomic.wait v2 v3 v4
@@ -130,7 +132,7 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   v2 = i32.const 1
   i32.atomic.store v1 v2
   v3 = i32.const 1
@@ -142,7 +144,8 @@ block 0 (vsp: i64, varg: i64) {
 "#;
 
 /// **Wake edges match wait/notify semantics**: the root's futex park appears as
-/// `parkWait(task 0, key 0)`, the worker's notify as `wakeNotify(waker 1 → wakee 0)`, the spawn
+/// `parkWait(task 0, key 16384)` (futex word 0 shifted above the #1094 NULL guard), the worker's
+/// notify as `wakeNotify(waker 1 → wakee 0)`, the spawn
 /// as `spawn(parent 0 → task 1)`, and the tape carries the turns. (The `FUTEX_HANDOFF` fixture's
 /// worker never parks under the lowest-index schedule — the root's flag lands first and the wait
 /// falls through `WAIT_NOT_EQUAL` — which the tape faithfully shows as *no* park edge; this
@@ -161,8 +164,8 @@ fn futex_wait_notify_edges_are_identified() {
     assert!(
         events.iter().any(|(k, e)| k == "parkWait"
             && field(e, "task") == Some(0)
-            && field(e, "key") == Some(0)),
-        "the root parks on futex word 0: {tape}"
+            && field(e, "key") == Some(16384)),
+        "the root parks on futex word 0 (shifted to 16384 above the #1094 NULL guard): {tape}"
     );
     assert!(
         events.iter().any(|(k, e)| k == "wakeNotify"
@@ -252,10 +255,10 @@ fn contested_words_match_the_oracle() {
     assert!(
         contested
             .iter()
-            .any(|e| e.get("addr").and_then(|a| a.as_i64()) == Some(0)),
-        "word 0 is contested: {stats}"
+            .any(|e| e.get("addr").and_then(|a| a.as_i64()) == Some(16384)),
+        "word 0 (shifted to 16384 above the #1094 NULL guard) is contested: {stats}"
     );
-    // The futex fixture's mem[8] handoff word is also contested (root writes, worker reads).
+    // The futex fixture's mem[16392] handoff word is also contested (root writes, worker reads).
     let handoff = feed_model(FUTEX_HANDOFF);
     let stats = handoff.lock().unwrap().stats_json();
     let contested = stats
@@ -266,7 +269,7 @@ fn contested_words_match_the_oracle() {
     assert!(
         contested
             .iter()
-            .any(|e| e.get("addr").and_then(|a| a.as_i64()) == Some(8)
+            .any(|e| e.get("addr").and_then(|a| a.as_i64()) == Some(16392)
                 && e.get("lastWriter").and_then(|w| w.as_i64()) == Some(0)),
         "the handoff word is contested with the root as last writer: {stats}"
     );

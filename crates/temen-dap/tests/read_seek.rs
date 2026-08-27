@@ -8,18 +8,19 @@ use temen_dap::{DapServer, Json};
 mod support;
 use support::{req, response};
 
-/// Loads the i64 at window address 8 and returns it (the slice-8 fixture).
+/// Loads the i64 at window address 16392 (cell 8, above the #1094 NULL guard) and returns it.
 const LOAD_CELL: &str = r#"memory 16
 func () -> (i64) {
 block 0 () {
-  v0 = i64.const 8
+  v0 = i64.const 16392
   v1 = i64.load v0
   return v1
   }
 }
 "#;
 
-/// The sum loop, storing the running total to mem[8] each iteration — seekable, memory-visible.
+/// The sum loop, storing the running total to mem[16392] (cell 8, above the #1094 NULL guard) each
+/// iteration — seekable, memory-visible.
 const STORE_LOOP: &str = r#"memory 16
 func () -> (i64) {
 block 0 () {
@@ -29,7 +30,7 @@ block 0 () {
 }
 block 1 (vi: i64, vacc: i64) {
   vsum = i64.add vacc vi
-  vaddr = i64.const 8
+  vaddr = i64.const 16392
   i64.store vaddr vsum
   vone = i64.const 1
   vnext = i64.sub vi vone
@@ -59,7 +60,7 @@ fn launch(s: &mut DapServer, src: &str, engine: Option<&str>) {
     );
 }
 
-/// **`readMemory` round-trips `writeMemory`**: write 42 at 0x8, read it back (plain reference,
+/// **`readMemory` round-trips `writeMemory`**: write 42 at 0x4008, read it back (plain reference,
 /// hex reference + offset, and a short count exercising the base64 padding shapes); the
 /// capability is advertised; an unmapped range and a missing count fail cleanly.
 #[test]
@@ -79,7 +80,7 @@ fn read_memory_round_trips_and_fails_closed() {
         3,
         "writeMemory",
         Json::obj(vec![
-            ("memoryReference", Json::s("0x8")),
+            ("memoryReference", Json::s("0x4008")),
             ("data", Json::s("KgAAAAAAAAA=")), // 42u64 little-endian
         ]),
     ));
@@ -91,7 +92,7 @@ fn read_memory_round_trips_and_fails_closed() {
     let r = read(
         &mut s,
         4,
-        vec![("memoryReference", Json::s("8")), ("count", Json::i(8))],
+        vec![("memoryReference", Json::s("16392")), ("count", Json::i(8))],
     );
     assert_eq!(r.get("success"), Some(&Json::Bool(true)));
     assert_eq!(
@@ -101,7 +102,7 @@ fn read_memory_round_trips_and_fails_closed() {
     );
     assert_eq!(
         r.get("body").and_then(|b| b.get("address")).cloned(),
-        Some(Json::s("0x8")),
+        Some(Json::s("0x4008")),
         "the landed address echoes"
     );
     // Hex reference + offset resolve to the same cell; a 2-byte count exercises `=` padding.
@@ -109,7 +110,7 @@ fn read_memory_round_trips_and_fails_closed() {
         &mut s,
         5,
         vec![
-            ("memoryReference", Json::s("0x0")),
+            ("memoryReference", Json::s("0x4000")),
             ("offset", Json::i(8)),
             ("count", Json::i(2)),
         ],
@@ -164,7 +165,7 @@ fn seek_jumps_both_ways_on_the_time_coordinate() {
         5,
         "readMemory",
         Json::obj(vec![
-            ("memoryReference", Json::s("8")),
+            ("memoryReference", Json::s("16392")),
             ("count", Json::i(8)),
         ]),
     ));

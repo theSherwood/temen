@@ -731,7 +731,7 @@ fn diff_v128_load_store_roundtrip() {
     let s = "memory 16\n\
         func (i32) -> (i32) {\n\
         block 0 (v0: i32) {\n\
-          v1 = i64.const 32\n\
+          v1 = i64.const 16416\n\
           v2 = i32x4.splat v0\n\
           v128.store v1 v2\n\
           v3 = v128.load v1\n\

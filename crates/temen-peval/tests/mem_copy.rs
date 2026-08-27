@@ -16,7 +16,7 @@ fn run(m: &Module, args: &[Value]) -> Result<Vec<Value>, Trap> {
 }
 
 /// `f(x) = { S.val = x; S.tag = 7; memcpy(D, S, 16); return D.val + D.tag }` — a TValue-shaped copy.
-/// S at 64, D at 128 (both constant addresses).
+/// S at 16448, D at 16512 (both constant addresses, above the #1094 NULL guard).
 fn tvalue_copy_module() -> Module {
     let entry = Func {
         params: vec![ValType::I64],
@@ -24,9 +24,9 @@ fn tvalue_copy_module() -> Module {
         blocks: vec![Block {
             params: vec![ValType::I64], // x = v0
             insts: vec![
-                Inst::ConstI64(64),  // v1: S
-                Inst::ConstI64(128), // v2: D
-                Inst::ConstI64(7),   // v3: tag
+                Inst::ConstI64(16448), // v1: S (above the #1094 NULL guard)
+                Inst::ConstI64(16512), // v2: D
+                Inst::ConstI64(7),     // v3: tag
                 Inst::Store {
                     op: StoreOp::I64,
                     addr: 1,
@@ -39,7 +39,7 @@ fn tvalue_copy_module() -> Module {
                     value: 3,
                     offset: 8,
                 }, // S.tag = 7
-                Inst::ConstI64(16),  // v4: len
+                Inst::ConstI64(16),    // v4: len
                 Inst::MemCopy {
                     dst: 2,
                     src: 1,
@@ -85,10 +85,10 @@ fn memcopy_in_rename_region_folds_and_matches() {
     let m = tvalue_copy_module();
     verify_module(&m).expect("source verifies");
 
-    // Rename [64, 144) covers both S and D: the copy is modeled as abstract cell moves, so no
+    // Rename [16448, 16528) covers both S and D: the copy is modeled as abstract cell moves, so no
     // MemCopy (and no residual store/load of the region) survives.
     let cfg = SpecConfig {
-        rename: Some((64, 144)),
+        rename: Some((16448, 16528)),
         rename_is_private: true,
         ..SpecConfig::default()
     };

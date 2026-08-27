@@ -1428,9 +1428,9 @@ pub fn analyze_from(m: &Module, entry: u32) -> Analysis {
         .iter()
         .map(|f| func_in_subset(m, f, atomics_ok))
         .collect();
-    // #1004: a `__null_guard`-marked module's bulk-memory span check now carries the guard low bound
-    // ([`emit_span_check`]), so bulk-mem functions stay in-subset and emit — the #964 exclusion is
-    // retired. (Unmarked modules were never affected: their span check emits byte-identically.)
+    // #1004: the bulk-memory span check carries the guard low bound ([`emit_span_check`]), so bulk-mem
+    // functions stay in-subset and emit — the #964 exclusion is retired. (#1094: the guard is
+    // unconditional now, so every module's span check carries it.)
     // The size valve then keeps a rare over-limit body (the SQLite VDBE dispatcher) off the wasm
     // tier so the whole-module emit clears the engine's per-function limit.
     cap_oversized(m, &mut in_subset);
@@ -1564,8 +1564,55 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
         None,
         false,
         None,
-        temen_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
+        emit_null_guard_extent(m), // #964/#1094: the guard is unconditional on every entry
         &[],
+        &[],
+    )
+}
+
+/// #1120 Slice 2c — like [`compile_module_with`] (a **local-table** whole-module emit: the module
+/// declares and fills its own funcref table, so instantiation needs only `env.memory`/`env.trap`/
+/// `env.call_interp` — the warm+JIT path's shape) but the one function `fidx` is emitted **split** into
+/// `group_count` block-group wasm functions. The split's group functions are direct-called (not in the
+/// table), so the local element segment still maps slot `fidx` → the wrapper; a `call.dyn` to `fidx`
+/// lands in the wrapper, which marshals params and tail-calls the groups. If the split can't be
+/// represented, the function emits whole. Correctness is the interp-vs-emitted differential (INVARIANTS #9).
+pub fn compile_module_with_split(
+    m: &Module,
+    shared_memory: bool,
+    fidx: usize,
+    group_count: usize,
+) -> Result<Vec<u8>, Error> {
+    let a = analyze(m);
+    if !a.in_subset.iter().all(|&s| s) {
+        return Err(Error::Unsupported(
+            "a function is outside the integer subset",
+        ));
+    }
+    let n = m.funcs.len();
+    if fidx >= n {
+        return Err(Error::Unsupported("split function index out of range"));
+    }
+    let emitted: Vec<usize> = (0..n).collect();
+    let wasm_of: Vec<Option<u32>> = (0..n).map(|i| Some(IMPORTED_FUNCS + i as u32)).collect();
+    let mut split_plan: Vec<Option<Vec<usize>>> = vec![None; n];
+    let nb = m.funcs[fidx].blocks.len();
+    let k = group_count.clamp(1, nb.max(1));
+    if nb >= 2 && k >= 2 {
+        split_plan[fidx] = Some((0..nb).map(|i| i * k / nb).collect());
+    }
+    emit_module(
+        m,
+        shared_memory,
+        &emitted,
+        &wasm_of,
+        &a.interp_leaf,
+        None,
+        false,
+        None,
+        temen_ir::module_null_guard(m),
+        &[],
+        &split_plan,
     )
 }
 
@@ -1608,7 +1655,7 @@ pub fn compile_module_nested_with_eligibility(
     // #1004: a marked granted unit emits with the NULL guard, and its bulk-mem functions now carry
     // the guard low bound in their span check ([`emit_span_check`]) — so they emit like any other
     // in-subset function instead of falling to the cross-tier leaf path.
-    let null_guard = temen_ir::module_null_guard(m);
+    let null_guard = emit_null_guard_extent(m);
     let mut wasm_of: Vec<Option<u32>> = vec![None; n];
     let mut interp_leaf = vec![false; n];
     let mut emitted: Vec<usize> = Vec::new();
@@ -1661,6 +1708,7 @@ pub fn compile_module_nested_with_eligibility(
         true,
         None,
         null_guard,
+        &[],
         &[],
     )?;
     Ok((wasm, eligible))
@@ -1755,8 +1803,64 @@ pub fn compile_module_b2(
         Some(table_log2),
         false,
         None,
-        temen_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
+        emit_null_guard_extent(m), // #964/#1094: the guard is unconditional on every entry
         &[],
+        &[],
+    )
+}
+
+/// #1120 Slice 2b — like [`compile_module_b2`] but the one function `fidx` is emitted **split** into
+/// `group_count` block-group wasm functions (contiguous, count-balanced groups) plus an entry wrapper at
+/// the function's normal index, so V8 TurboFans the (smaller) hot functions on the first Run instead of
+/// waiting several Runs for the one giant function's TurboFan compile (#1120). Every other function emits
+/// monolithically. The split is invisible to the interpreter oracle (it runs the original function) and to
+/// the confinement lowering — each block emits the identical masked accesses — so correctness is the
+/// existing interp-vs-emitted differential (INVARIANTS #9) and the mask stays constant (I2). If the split
+/// can't be represented (too-wide entry-block params, empty group, <2 groups), the function emits whole.
+pub fn compile_module_b2_split(
+    m: &Module,
+    shared_memory: bool,
+    table_log2: u32,
+    fidx: usize,
+    group_count: usize,
+) -> Result<Vec<u8>, Error> {
+    let a = analyze(m);
+    if !a.in_subset.iter().all(|&s| s) {
+        return Err(Error::Unsupported(
+            "a function is outside the integer subset",
+        ));
+    }
+    let est_total: usize = m.funcs.iter().map(est_emitted_size).sum();
+    if est_total > MAX_EST_EMITTED_MODULE_BYTES {
+        return Err(Error::Unsupported(
+            "estimated emitted module exceeds the engine memory budget",
+        ));
+    }
+    let n = m.funcs.len();
+    if fidx >= n {
+        return Err(Error::Unsupported("split function index out of range"));
+    }
+    let emitted: Vec<usize> = (0..n).collect();
+    let wasm_of: Vec<Option<u32>> = (0..n).map(|i| Some(IMPORTED_FUNCS + i as u32)).collect();
+    // Contiguous, count-balanced groups for `fidx` (block i → group `i*k/nb`); no split elsewhere.
+    let mut split_plan: Vec<Option<Vec<usize>>> = vec![None; n];
+    let nb = m.funcs[fidx].blocks.len();
+    let k = group_count.clamp(1, nb.max(1));
+    if nb >= 2 && k >= 2 {
+        split_plan[fidx] = Some((0..nb).map(|i| i * k / nb).collect());
+    }
+    emit_module(
+        m,
+        shared_memory,
+        &emitted,
+        &wasm_of,
+        &a.interp_leaf,
+        Some(table_log2),
+        false,
+        None,
+        temen_ir::module_null_guard(m),
+        &[],
+        &split_plan,
     )
 }
 
@@ -1822,8 +1926,9 @@ pub fn compile_module_split(
         Some(table_log2),
         false,
         None,
-        temen_ir::module_null_guard(m),
+        emit_null_guard_extent(m),
         &cross_module,
+        &[],
     )
 }
 
@@ -2081,6 +2186,58 @@ pub fn compile_module_reactor(
     compile_module_reactor_capped(m, entry, shared_memory, MAX_EMITTED_FUNC_BYTES)
 }
 
+/// #1120 Slice 2c — the **where-to-cut heuristic**: pick the single hot function whose outlining pays
+/// off most, and how many groups to cut it into. Choose the largest reachable, in-subset function by
+/// [`est_emitted_size`] (a static estimate — the biggest estimate is the biggest emitted body); only if
+/// it clears `min_bytes` (small functions already TurboFan on run 1, so splitting them is pure overhead).
+/// K targets ~`target_group_bytes` per group. Returns `None` when no function is worth splitting.
+pub fn pick_split_target(
+    m: &Module,
+    entry: u32,
+    min_bytes: usize,
+    target_group_bytes: usize,
+) -> Option<(usize, usize)> {
+    let a = analyze_from(m, entry);
+    let mut best: Option<(usize, usize)> = None; // (fidx, est)
+    for i in 0..m.funcs.len() {
+        if a.reachable[i] && a.in_subset[i] {
+            let est = est_emitted_size(&m.funcs[i]);
+            if best.is_none_or(|(_, b)| est > b) {
+                best = Some((i, est));
+            }
+        }
+    }
+    let (fidx, est) = best?;
+    if est < min_bytes || m.funcs[fidx].blocks.len() < 2 {
+        return None;
+    }
+    let k = est.div_ceil(target_group_bytes.max(1)).max(2);
+    Some((fidx, k))
+}
+
+/// #1120 Slice 2c — [`compile_module_reactor`], but the hottest large function (per [`pick_split_target`])
+/// is emitted **split** into block-group wasm functions so V8 TurboFans the hot path on the first Run
+/// instead of after several. `min_bytes`/`target_group_bytes` tune the heuristic. When nothing is worth
+/// splitting, this is exactly `compile_module_reactor` (byte-identical). Correctness is unchanged — the
+/// split is invisible to the interpreter oracle and the confinement lowering (INVARIANTS #9, I2).
+pub fn compile_module_reactor_split(
+    m: &Module,
+    entry: u32,
+    shared_memory: bool,
+    min_bytes: usize,
+    target_group_bytes: usize,
+) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    let target = pick_split_target(m, entry, min_bytes, target_group_bytes);
+    compile_module_reactor_budgeted(
+        m,
+        entry,
+        shared_memory,
+        MAX_EMITTED_FUNC_BYTES,
+        MAX_EST_EMITTED_MODULE_BYTES,
+        target,
+    )
+}
+
 /// [`compile_module_reactor`] with an explicit emitted-body byte cap. The public wrapper passes V8's
 /// [`MAX_EMITTED_FUNC_BYTES`]; the parameter exists so the exclusion loop can be differential-tested
 /// with a small cap (and a small module) instead of a genuine multi-megabyte function. `usize::MAX`
@@ -2092,19 +2249,32 @@ pub fn compile_module_reactor_capped(
     shared_memory: bool,
     cap: usize,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
-    compile_module_reactor_budgeted(m, entry, shared_memory, cap, MAX_EST_EMITTED_MODULE_BYTES)
+    compile_module_reactor_budgeted(
+        m,
+        entry,
+        shared_memory,
+        cap,
+        MAX_EST_EMITTED_MODULE_BYTES,
+        None,
+    )
 }
 
 /// [`compile_module_reactor_capped`] with an explicit **module-total** emit budget (#1038 — see
 /// [`MAX_EST_EMITTED_MODULE_BYTES`], which the public entries pass). The parameter exists so the
 /// budget decline can be tested with a small module instead of a genuine 104 MiB one.
+///
+/// `split_target = Some((fidx, k))` (#1120 Slice 2c) additionally emits function `fidx` **split** into
+/// `k` block-group wasm functions when it lands in the emitted set — so the giant hot function TurboFans
+/// on the first Run. `None` is byte-identical to before.
 #[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
 pub fn compile_module_reactor_budgeted(
     m: &Module,
     entry: u32,
     shared_memory: bool,
     cap: usize,
     module_budget: usize,
+    split_target: Option<(usize, usize)>,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
     let n = m.funcs.len();
     let a = analyze_from(m, entry);
@@ -2154,6 +2324,19 @@ pub fn compile_module_reactor_budgeted(
                 "estimated emitted module exceeds the engine memory budget",
             ));
         }
+        // #1120 Slice 2c: split the designated hot function into K block-group wasm functions — but only
+        // when it's actually in the emitted set (not pulled cross-tier for size) and has ≥2 blocks.
+        let mut split_plan: Vec<Option<Vec<usize>>> = Vec::new();
+        if let Some((fidx, k)) = split_target {
+            if fidx < n && wasm_of[fidx].is_some() {
+                let nb = m.funcs[fidx].blocks.len();
+                let kk = k.clamp(1, nb.max(1));
+                if nb >= 2 && kk >= 2 {
+                    split_plan = vec![None; n];
+                    split_plan[fidx] = Some((0..nb).map(|i| i * kk / nb).collect());
+                }
+            }
+        }
         let wasm = emit_module(
             m,
             shared_memory,
@@ -2163,8 +2346,9 @@ pub fn compile_module_reactor_budgeted(
             None,
             false,
             None,
-            temen_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
+            emit_null_guard_extent(m), // #964/#1094: the guard is unconditional on every entry
             &[],
+            &split_plan,
         )?;
         // Measure the emitted bodies and pull any over-large *marshallable* one out for a re-emit as a
         // cross-tier leaf. An over-large body that can't be crossed (non-marshallable sig) has nowhere
@@ -2252,7 +2436,8 @@ pub fn compile_module_reactor_keep(
         None,
         false,
         None,
-        temen_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
+        emit_null_guard_extent(m), // #964/#1094: the guard is unconditional on every entry
+        &[],
         &[],
     )?;
     Ok((wasm, emitted_bitmap))
@@ -2428,10 +2613,10 @@ pub fn compile_module_tierup_paged(
 /// interpreted (the span check has no low bound), same limit as paged mode.
 ///
 /// Since the #964 ABI landed this is the **measurement/override** entry: production compiles derive
-/// the guard from the module's `__null_guard` marker on every standard entry (see
-/// [`compile_module_tierup_inner`]), so a marked module needs no special entry. This one forces an
-/// arbitrary `guard` on an *unmarked* module — what `paged_bench_emit` / `bench_paged.mjs` emit +
-/// time as a third variant.
+/// the guard from [`temen_ir::module_null_guard`] on every standard entry (see
+/// [`compile_module_tierup_inner`]) — unconditional since #1094 — so no module needs a special entry.
+/// This one forces an arbitrary `guard` (or `0` to measure unguarded) — what `paged_bench_emit` /
+/// `bench_paged.mjs` emit + time as a third variant.
 pub fn compile_module_tierup_nullguard(
     m: &Module,
     shared_memory: bool,
@@ -2458,11 +2643,11 @@ fn compile_module_tierup_inner(
     null_guard: Option<u64>,
     module_budget: usize,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
-    // #964: a `__null_guard`-marked module opts every tier into the NULL guard — derive it from the
-    // marker whenever the caller didn't force one (the measurement entry still can), so the plain
-    // tier-up entries stay trap-parity with the interpreter oracle, which seeds `[0, guard)`
-    // `Unmapped` for marked modules. Unmarked modules keep `None` (byte-identical emit).
-    let null_guard = null_guard.or_else(|| temen_ir::module_null_guard(m));
+    // #964/#1094: every module opts into the NULL guard — derive it from `module_null_guard`
+    // (unconditional now) whenever the caller didn't force one (the measurement entry still can), so
+    // the plain tier-up entries stay trap-parity with the interpreter oracle, which seeds
+    // `[0, guard)` `Unmapped` for every module.
+    let null_guard = null_guard.or_else(|| emit_null_guard_extent(m));
     let n = m.funcs.len();
     // Track 3 (c)+(a): a page-op module (`map`/`unmap`/`protect`) can't be accelerated on the
     // mask-only tier — an emitted access ignores per-page state the interpreter would trap on
@@ -2491,6 +2676,7 @@ fn compile_module_tierup_inner(
             nested_caps,
             paged,
             null_guard,
+            &[],
             &[],
         )?;
         return Ok((wasm, vec![false; n]));
@@ -2611,6 +2797,7 @@ fn compile_module_tierup_inner(
         paged,
         null_guard,
         &[],
+        &[],
     )?;
     Ok((wasm, emit))
 }
@@ -2709,7 +2896,8 @@ fn compile_interp_only(
         None,
         nested_caps,
         None,
-        temen_ir::module_null_guard(m), // #964 (vacuous here — no bodies — but kept uniform)
+        emit_null_guard_extent(m), // #964 (vacuous here — no bodies — but kept uniform)
+        &[],
         &[],
     )?;
     Ok(Artifact {
@@ -2784,7 +2972,12 @@ fn emit_module(
     paged: Option<u8>,
     null_guard: Option<u64>,
     cross_module: &[bool],
+    split_plan: &[Option<Vec<usize>>],
 ) -> Result<Vec<u8>, Error> {
+    // #1120 Slice 2b intra-function split: `split_plan[fi] = Some(block_group)` ⇒ emit function `fi` as
+    // its wrapper (at its normal index) plus K appended block-group functions. Empty ⇒ no splitting (the
+    // behavior of every non-splitting caller). A per-block group id `block_group[b]` in `0..K`.
+    let fn_split_plan = |fi: usize| split_plan.get(fi).and_then(|o| o.as_ref());
     // #1110 emit-split prototype: `cross_module[g]` ⇒ function `g` is emitted by a *sibling* module of
     // this partition, reached through the shared reserved funcref table (`env.__indirect_function_table`)
     // by a `call_indirect` on `g`'s env-prepended signature at table slot `g` — the host populates every
@@ -3039,23 +3232,93 @@ fn emit_module(
         }
     }
 
-    let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(emitted.len() + extra_bodies.len());
+    // #1120 Slice 2b: plan the intra-function splits. A split function's group functions take wasm indices
+    // *after* all normal functions and the trampoline/trap-stub extras. A plan that fails validation is
+    // dropped here (the function then emits whole — always correct). The group sig `(win,env,entry)->results`
+    // is interned into `types` now, before the type section is written.
+    let first_widx = if nested_caps {
+        NESTED_IMPORTED_FUNCS + uses_rec as u32
+    } else {
+        IMPORTED_FUNCS
+    };
+    let mut fn_splits: Vec<FnSplit> = Vec::new();
+    let mut next_group_widx = first_widx + emitted.len() as u32 + extra_bodies.len() as u32;
     for &fi in emitted {
-        bodies.push(emit_func(
-            m,
-            &m.funcs[fi],
-            elide_bound,
-            wasm_of,
-            interp_leaf,
-            &types,
-            table_size,
-            nested_caps,
-            paged,
-            null_guard,
-            cross_module,
-        )?);
+        if let Some(bg) = fn_split_plan(fi) {
+            if let Some(mut fs) = plan_fn_split(fi, &m.funcs[fi], bg, next_group_widx) {
+                next_group_widx += fs.group_blocks.len() as u32;
+                let mut gres = Vec::with_capacity(m.funcs[fi].results.len());
+                for r in &m.funcs[fi].results {
+                    gres.push(valtype_byte(*r)?);
+                }
+                let gkey = (vec![0x7f, 0x7f, 0x7f], gres);
+                fs.group_type = match types.iter().position(|t| *t == gkey) {
+                    Some(i) => i as u32,
+                    None => {
+                        types.push(gkey);
+                        (types.len() - 1) as u32
+                    }
+                };
+                fn_splits.push(fs);
+            }
+        }
+    }
+
+    let group_body_count: usize = fn_splits.iter().map(|s| s.group_blocks.len()).sum();
+    let mut bodies: Vec<Vec<u8>> =
+        Vec::with_capacity(emitted.len() + extra_bodies.len() + group_body_count);
+    for &fi in emitted {
+        if let Some(fs) = fn_splits.iter().find(|s| s.fi == fi) {
+            // Split function: its normal slot is the entry wrapper; the K groups are appended below.
+            bodies.push(emit_split_wrapper(
+                &m.funcs[fi],
+                fs.entry_ordinal[0],
+                fs.group_widx[fs.block_group[0]],
+            )?);
+        } else {
+            bodies.push(emit_func(
+                m,
+                &m.funcs[fi],
+                elide_bound,
+                wasm_of,
+                interp_leaf,
+                &types,
+                table_size,
+                nested_caps,
+                paged,
+                null_guard,
+                cross_module,
+            )?);
+        }
     }
     bodies.extend(extra_bodies);
+    // Append each split function's K group functions, in the same order their wasm indices were assigned.
+    let mut group_type_idx: Vec<u32> = Vec::with_capacity(group_body_count);
+    for fs in &fn_splits {
+        let split = SplitCtx {
+            block_group: &fs.block_group,
+            group_widx: &fs.group_widx,
+            entry_ordinal: &fs.entry_ordinal,
+        };
+        for g in 0..fs.group_blocks.len() {
+            bodies.push(emit_split_group(
+                m,
+                &m.funcs[fs.fi],
+                &split,
+                &fs.group_blocks[g],
+                &fs.entry_blocks[g],
+                elide_bound,
+                wasm_of,
+                interp_leaf,
+                &types,
+                table_size,
+                nested_caps,
+                paged,
+                null_guard,
+            )?);
+            group_type_idx.push(fs.group_type);
+        }
+    }
 
     // ---- assemble the module ----
     let mut out = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]; // \0asm v1
@@ -3147,9 +3410,16 @@ fn emit_module(
     }
     section(&mut out, 2, &sec);
 
-    let mut sec = Vec::new(); // function section (3): emitted, then trampolines + trap stub
-    uleb(&mut sec, (fn_type_idx.len() + extra_type_idx.len()) as u64);
-    for ti in fn_type_idx.iter().chain(&extra_type_idx) {
+    let mut sec = Vec::new(); // function section (3): emitted, then trampolines + trap stub, then split groups
+    uleb(
+        &mut sec,
+        (fn_type_idx.len() + extra_type_idx.len() + group_type_idx.len()) as u64,
+    );
+    for ti in fn_type_idx
+        .iter()
+        .chain(&extra_type_idx)
+        .chain(&group_type_idx)
+    {
         uleb(&mut sec, *ti as u64);
     }
     section(&mut out, 3, &sec);
@@ -4141,6 +4411,88 @@ fn term_targets(t: &Terminator) -> Vec<u32> {
     }
 }
 
+/// #1120 Slice 2b — a validated plan to split one emitted function into K block-group wasm functions
+/// inside a larger module. Built by [`plan_fn_split`]; consumed by [`emit_module`], which emits the
+/// function's normal slot as the wrapper and appends the K group functions after all other functions.
+struct FnSplit {
+    /// Which emitted function this splits.
+    fi: usize,
+    /// Per-block group id.
+    block_group: Vec<usize>,
+    /// Group id → its blocks (global indices).
+    group_blocks: Vec<Vec<usize>>,
+    /// Group id → its inter-group entry blocks, in ordinal order.
+    entry_blocks: Vec<Vec<usize>>,
+    /// Per-block entry ordinal within its group (meaningful for entry blocks).
+    entry_ordinal: Vec<u32>,
+    /// Group id → its wasm function index.
+    group_widx: Vec<u32>,
+    /// The group functions' shared type-section index (filled in by [`emit_module`]).
+    group_type: u32,
+}
+
+/// Validate a per-block group assignment and derive the [`FnSplit`], or return `None` to **decline**
+/// (the caller then emits the function whole — always correct, just no tier-up win for it). Declines on:
+/// fewer than 2 groups, a length mismatch, an out-of-range group id, an empty group, or an inter-group
+/// entry block whose params exceed the env scratch (the split ABI marshals them there). `group_base` is
+/// the wasm index assigned to this function's first group function.
+fn plan_fn_split(fi: usize, f: &Func, block_group: &[usize], group_base: u32) -> Option<FnSplit> {
+    let n = f.blocks.len();
+    if block_group.len() != n {
+        return None;
+    }
+    let k = block_group
+        .iter()
+        .copied()
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(0);
+    if k < 2 {
+        return None; // nothing to split
+    }
+    let mut group_blocks = vec![Vec::new(); k];
+    for (i, &g) in block_group.iter().enumerate() {
+        if g >= k {
+            return None;
+        }
+        group_blocks[g].push(i);
+    }
+    if group_blocks.iter().any(|g| g.is_empty()) {
+        return None;
+    }
+    let mut is_entry = vec![false; n];
+    is_entry[0] = true; // the function entry
+    for b in 0..n {
+        for t in term_targets(&f.blocks[b].term) {
+            if block_group[t as usize] != block_group[b] {
+                is_entry[t as usize] = true;
+            }
+        }
+    }
+    let mut entry_ordinal = vec![0u32; n];
+    let mut entry_blocks = vec![Vec::new(); k];
+    for (b, &entry) in is_entry.iter().enumerate() {
+        if entry {
+            if slot_count(&f.blocks[b].params) > XCALL_MAX_SLOTS as u64 {
+                return None;
+            }
+            let g = block_group[b];
+            entry_ordinal[b] = entry_blocks[g].len() as u32;
+            entry_blocks[g].push(b);
+        }
+    }
+    let group_widx = (0..k).map(|g| group_base + g as u32).collect();
+    Some(FnSplit {
+        fi,
+        block_group: block_group.to_vec(),
+        group_blocks,
+        entry_blocks,
+        entry_ordinal,
+        group_widx,
+        group_type: 0,
+    })
+}
+
 /// #1120 Slice 1/2a — emit a **standalone whole-program module** in which the one function `m.funcs[fidx]`
 /// is split into `group_count` block-group wasm functions (plus an entry wrapper), while **every other
 /// function emits monolithically**. Cross-function `Call`s work in both directions: a call *into* the split
@@ -4244,7 +4596,7 @@ pub fn compile_split_fn(
     };
     let interp_leaf = vec![false; n_funcs];
     let dummy_types: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // no indirect calls → never indexed
-    let null_guard = temen_ir::module_null_guard(m);
+    let null_guard = emit_null_guard_extent(m);
 
     // Bodies in wasm-index order: one per function (`fidx` is its wrapper), then the k group functions.
     let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(n_funcs + k);
@@ -4553,6 +4905,17 @@ fn emit_page_check_one(cx: &mut FnCtx, code: &mut Vec<u8>, delta: u64, write: bo
 /// `[0, guard)` — so this is one compare + never-taken branch, the cheap lowering the NULL-trap
 /// design weighs against full paged mode. Masked into the same clamp domain as the access itself
 /// (matching [`emit_page_check_one`]'s defensive style). No-op when unguarded.
+/// The NULL-guard extent to **emit** for `m`: [`temen_ir::module_null_guard`] (unconditional, #1094),
+/// but no-op'd (→ `None`) for a window smaller than the guard — mirroring `Mem::seed_null_guard`, which
+/// skips the seed there. Without this a sub-guard confined child (e.g. a 1 KiB carve declared
+/// `memory 10`) would get a guard check covering its whole window and trap every access, diverging from
+/// the interpreter oracle (which seeds no guard for that window).
+fn emit_null_guard_extent(m: &temen_ir::Module) -> Option<u64> {
+    let g = temen_ir::module_null_guard(m)?;
+    let win = m.memory.as_ref().map_or(0, |mem| 1u64 << mem.size_log2);
+    (g <= win).then_some(g)
+}
+
 fn emit_null_guard(cx: &mut FnCtx, code: &mut Vec<u8>) {
     let Some(guard) = cx.null_guard else {
         return;

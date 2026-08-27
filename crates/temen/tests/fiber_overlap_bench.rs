@@ -34,7 +34,7 @@ fn mix(arg: i64) -> i64 {
         .wrapping_add(1442695040888963407)
 }
 
-/// Fiber lane `(i32 h) -> (i64)`: create `n` fibers (handles stored at window 16+8i), resume
+/// Fiber lane `(i32 h) -> (i64)`: create `n` fibers (handles stored at window 16400+8i, above the #1094 NULL guard), resume
 /// each once (each punts `Blocking.work(i)` and parks — its pool job is now in flight), then
 /// poll each to completion in order, summing `mix(i)`. The resume arg packs `h | (i << 16)`.
 fn fiber_lane(n: u64) -> String {
@@ -61,7 +61,7 @@ block 2 (vi2: i64, vh2: i64) {{
   vs, vv = cont.resume vk varg
   veight = i64.const 8
   voff = i64.mul vi2 veight
-  vb = i64.const 16
+  vb = i64.const 16400
   va = i64.add vb voff
   i64.store va vk
   vone = i64.const 1
@@ -81,7 +81,7 @@ block 4 (vj: i64, vsum: i64, vh4: i64) {{
 block 5 (vj2: i64, vsum2: i64, vh5: i64) {{
   veight2 = i64.const 8
   voff2 = i64.mul vj2 veight2
-  vb2 = i64.const 16
+  vb2 = i64.const 16400
   va2 = i64.add vb2 voff2
   vk2 = i64.load va2
   vsh2 = i64.const 16

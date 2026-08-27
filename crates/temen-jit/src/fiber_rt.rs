@@ -232,6 +232,14 @@ pub(crate) fn shadow_region_base(ctx: usize) -> u64 {
     SHADOW_BASE + ctx as u64 * SHADOW_STRIDE
 }
 
+/// Whether context `ctx`'s shadow region fits within the reserve (must match `temen-interp`'s
+/// `shadow_region_fits`). #1094: `SHADOW_BASE` moved one guard up, so the top `MAX_SHADOW_CTX`
+/// regions no longer all fit under `DURABLE_RESERVE` — the allocator skips the non-fitting ones so
+/// the JIT and interpreter hand out the identical context indices.
+pub(crate) fn shadow_region_fits(ctx: usize) -> bool {
+    shadow_region_base(ctx) + SHADOW_STRIDE <= DURABLE_RESERVE
+}
+
 /// The empty shadow-SP / frame base of a vCPU context `ctx`: just past its in-region SP word (§12.8
 /// 4A.5). Frames grow upward from here; the 8-byte SP word itself lives at `shadow_region_base(ctx)`.
 pub(crate) fn shadow_frame_base(ctx: usize) -> u64 {
@@ -399,6 +407,12 @@ impl SharedFiberTable {
         let mut t = self.lock();
         let floor = t.slots.len(); // fibers occupy contexts 1..=slots.len()
         let mut c = MAX_SHADOW_CTX;
+        // #1094: SHADOW_BASE moved one guard up, so the top `MAX_SHADOW_CTX` regions no longer all fit
+        // under `DURABLE_RESERVE` — skip the non-fitting top contexts before searching, exactly as
+        // `temen-interp`'s `reserve_vcpu_context` does, so both backends allocate the same context.
+        while c > floor && !shadow_region_fits(c) {
+            c -= 1;
+        }
         while c > floor {
             if t.vcpu_mask & (1 << c) == 0 {
                 t.vcpu_mask |= 1 << c;
@@ -1530,25 +1544,35 @@ pub(crate) unsafe extern "C" fn temen_gc_roots_flush(args: *const GcRootsArgs) -
 
 #[cfg(all(test, not(loom)))]
 mod vcpu_ctx_tests {
-    use super::{SharedFiberTable, MAX_FIBERS, MAX_SHADOW_CTX};
+    use super::{shadow_region_fits, SharedFiberTable, MAX_FIBERS, MAX_SHADOW_CTX};
+
+    /// The highest context whose shadow region still fits the reserve — #1094 pushed `SHADOW_BASE` up a
+    /// guard, so the top few of `MAX_SHADOW_CTX` no longer fit and the allocator starts below them.
+    fn top_ctx() -> usize {
+        (1..=MAX_SHADOW_CTX)
+            .rev()
+            .find(|&c| shadow_region_fits(c))
+            .unwrap()
+    }
 
     // The durable vCPU-context allocator (slice 3.3): top-down reservation above the fiber pool, with
     // free-then-reuse (recycling) and a thaw-seed — the JIT mirror of the interp registry's `vcpu_mask`.
     #[test]
     fn reserve_is_top_down_and_recycles() {
         let t = SharedFiberTable::new(MAX_FIBERS);
-        // Spawned vCPUs grow down from the top.
-        assert_eq!(t.reserve_vcpu_context(), Some(MAX_SHADOW_CTX));
-        assert_eq!(t.reserve_vcpu_context(), Some(MAX_SHADOW_CTX - 1));
-        assert_eq!(t.reserve_vcpu_context(), Some(MAX_SHADOW_CTX - 2));
+        // Spawned vCPUs grow down from the highest fitting context.
+        let top = top_ctx();
+        assert_eq!(t.reserve_vcpu_context(), Some(top));
+        assert_eq!(t.reserve_vcpu_context(), Some(top - 1));
+        assert_eq!(t.reserve_vcpu_context(), Some(top - 2));
         // Freeing a context returns it to the pool; the next reserve reuses it (peak-concurrent bound).
-        t.free_vcpu_context(MAX_SHADOW_CTX);
-        assert_eq!(t.reserve_vcpu_context(), Some(MAX_SHADOW_CTX));
+        t.free_vcpu_context(top);
+        assert_eq!(t.reserve_vcpu_context(), Some(top));
 
         // A thaw seed replaces the occupancy wholesale; reserve then avoids the seeded bit.
-        t.seed_vcpu_mask(1 << (MAX_SHADOW_CTX - 1));
-        assert_eq!(t.reserve_vcpu_context(), Some(MAX_SHADOW_CTX));
-        assert_eq!(t.reserve_vcpu_context(), Some(MAX_SHADOW_CTX - 2)); // skips the seeded one
+        t.seed_vcpu_mask(1 << (top - 1));
+        assert_eq!(t.reserve_vcpu_context(), Some(top));
+        assert_eq!(t.reserve_vcpu_context(), Some(top - 2)); // skips the seeded one
     }
 
     // §12.8 4A.6: a recycled-context freeze re-attaches a **sparse/gappy** vCPU set — a middle context
@@ -1557,7 +1581,8 @@ mod vcpu_ctx_tests {
     #[test]
     fn thaw_seed_with_gaps_reuses_the_recycled_context() {
         let t = SharedFiberTable::new(MAX_FIBERS);
-        let (hi, mid, lo) = (MAX_SHADOW_CTX, MAX_SHADOW_CTX - 1, MAX_SHADOW_CTX - 2);
+        let top = top_ctx();
+        let (hi, mid, lo) = (top, top - 1, top - 2);
         // Re-attach two live children at `hi` and `lo`; `mid` is the recycled gap between them.
         t.seed_vcpu_mask((1 << hi) | (1 << lo));
         // A post-thaw spawn reserves the highest free context — the recycled gap, not a re-attached one.
@@ -1576,14 +1601,18 @@ mod vcpu_ctx_tests {
     #[test]
     fn reserve_exhausts_cleanly() {
         let t = SharedFiberTable::new(MAX_FIBERS);
-        // A fresh table has no fibers, so contexts 1..=MAX_SHADOW_CTX are all free.
-        for _ in 0..MAX_SHADOW_CTX {
+        // A fresh table has no fibers, so every *fitting* non-root context is free (#1094 dropped the
+        // top few of `MAX_SHADOW_CTX` below `DURABLE_RESERVE` once `SHADOW_BASE` moved up a guard).
+        let fitting = (1..=MAX_SHADOW_CTX)
+            .filter(|&c| shadow_region_fits(c))
+            .count();
+        for _ in 0..fitting {
             assert!(t.reserve_vcpu_context().is_some());
         }
         assert_eq!(
             t.reserve_vcpu_context(),
             None,
-            "the reserve is full once every context is live"
+            "the reserve is full once every fitting context is live"
         );
     }
 }

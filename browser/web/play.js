@@ -24,10 +24,10 @@ const EXAMPLES = {
     desc: 'One vCPU call.cap-writes a greeting through the host-I/O powerbox and returns the byte ' +
       'count (14). stdout comes back onto the page after the run.',
     src: `memory 16
-data 0 "hello, world!\\n"
+data 16384 "hello, world!\\n"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   v2 = i64.const 14
   v3 = call.cap 0 1 (i64, i64) -> (i64) v0(v1, v2)
   return v3
@@ -56,7 +56,7 @@ block 2 (v4: i64) {
   v6 = thread.spawn 1 v5 v5
   v7 = i64.const 4
   v8 = i64.mul v4 v7
-  v9 = i64.const 16
+  v9 = i64.const 16400
   v10 = i64.add v9 v8
   i32.store v10 v6
   v11 = i64.const 1
@@ -75,7 +75,7 @@ block 4 (v14: i64) {
 block 5 (v17: i64) {
   v18 = i64.const 4
   v19 = i64.mul v17 v18
-  v20 = i64.const 16
+  v20 = i64.const 16400
   v21 = i64.add v20 v19
   v22 = i32.load v21
   v23 = thread.join v22
@@ -84,7 +84,7 @@ block 5 (v17: i64) {
   br 4(v25)
 }
 block 6 () {
-  v26 = i64.const 0
+  v26 = i64.const 16384
   v27 = i64.atomic.load v26
   return v27
   }
@@ -99,7 +99,7 @@ block 1 (v1: i64) {
   br_if v3 3() 2(v1)
 }
 block 2 (v4: i64) {
-  v5 = i64.const 0
+  v5 = i64.const 16384
   v6 = i64.const 1
   v7 = i64.atomic.rmw.add v5 v6
   v8 = i64.const -1
@@ -118,7 +118,7 @@ block 3 () {
     desc: '8 worker vCPUs (one Web Worker each) all call.cap-write "tick\\n" through the run\'s ONE ' +
       'shared powerbox and bump a shared counter — result 8, stdout "tick\\n" × 8, on every schedule.',
     src: `memory 16
-data 0 "tick\\n"
+data 16384 "tick\\n"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   vh0 = i64.extend_i32_u v0
@@ -135,7 +135,7 @@ block 2 (vi2: i64, vhh2: i64) {
   vt = thread.spawn 1 vsp vhh2
   v4 = i64.const 4
   v5 = i64.mul vi2 v4
-  v6 = i64.const 16
+  v6 = i64.const 16400
   v7 = i64.add v6 v5
   i32.store v7 vt
   v8 = i64.const 1
@@ -154,7 +154,7 @@ block 4 (vj: i64) {
 block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
-  v15 = i64.const 16
+  v15 = i64.const 16400
   v16 = i64.add v15 v14
   v17 = i32.load v16
   v18 = thread.join v17
@@ -163,7 +163,7 @@ block 5 (vj2: i64) {
   br 4(v20)
 }
 block 6 () {
-  v21 = i64.const 8
+  v21 = i64.const 16392
   v22 = i64.atomic.load v21
   return v22
   }
@@ -171,10 +171,10 @@ block 6 () {
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, vh: i64) {
   vhandle = i32.wrap_i64 vh
-  vptr = i64.const 0
+  vptr = i64.const 16384
   vlen = i64.const 5
   vw = call.cap 0 1 (i64, i64) -> (i64) vhandle(vptr, vlen)
-  v1 = i64.const 8
+  v1 = i64.const 16392
   v2 = i64.const 1
   v3 = i64.atomic.rmw.add v1 v2
   v4 = i64.const 0
@@ -208,7 +208,7 @@ block 2 (vi2: i64, vp2: i64) {
   vt = thread.spawn 1 vsp vp2
   v4 = i64.const 4
   v5 = i64.mul vi2 v4
-  v6 = i64.const 16
+  v6 = i64.const 16400
   v7 = i64.add v6 v5
   i32.store v7 vt
   v8 = i64.const 1
@@ -227,7 +227,7 @@ block 4 (vj: i64) {
 block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
-  v15 = i64.const 16
+  v15 = i64.const 16400
   v16 = i64.add v15 v14
   v17 = i32.load v16
   v18 = thread.join v17
@@ -236,7 +236,7 @@ block 5 (vj2: i64) {
   br 4(v20)
 }
 block 6 () {
-  v21 = i64.const 8
+  v21 = i64.const 16392
   v22 = i64.atomic.load v21
   return v22
   }
@@ -254,7 +254,7 @@ block 0 (vsp: i64, vp: i64) {
   vb = i32.const 7
   vr = call.dyn (i32, i32) -> (i32) vslot32 (va, vb)
   vr64 = i64.extend_i32_u vr
-  vc8 = i64.const 8
+  vc8 = i64.const 16392
   vold = i64.atomic.rmw.add vc8 vr64
   vret = i64.const 0
   return vret
@@ -289,7 +289,7 @@ block 2 (vi2: i64, vinst2: i32) {
   vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst2 (ventry, voff, vslog, vquota)
   v4 = i64.const 4
   vholo = i64.mul vi2 v4
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vhoff = i64.add v16 vholo
   i32.store vhoff vh
   vinext = i64.add vi2 vone
@@ -308,7 +308,7 @@ block 4 (vj: i64, vs: i64, vinst4: i32) {
 block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v4b = i64.const 4
   vjlo = i64.mul vj2 v4b
-  v16b = i64.const 16
+  v16b = i64.const 16400
   vjoff = i64.add v16b vjlo
   vhh = i32.load vjoff
   vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)
@@ -378,13 +378,13 @@ block 2 (r: i64) {
 memory 16
 func () -> (i64) {
 block 0 () {
-  a0 = i64.const 0
+  a0 = i64.const 16384
   z = i64.const 0
   i64.store a0 z
   br 1(z)
 }
 block 1 (i: i64) {
-  a1 = i64.const 0
+  a1 = i64.const 16384
   one = i64.const 1
   n = i64.add i one
   i64.store a1 n
@@ -393,7 +393,7 @@ block 1 (i: i64) {
   br_if done 2(n) 1(n)
 }
 block 2 (r: i64) {
-  a2 = i64.const 0
+  a2 = i64.const 16384
   out = i64.load a2
   return out
   }
@@ -413,7 +413,7 @@ debug.loc 0 1 5 0 17 3
 debug.loc 0 2 0 0 20 3
 debug.loc 0 2 1 0 21 3
 debug.type 0 base "long" signed 8
-debug.var 0 "count" fixed 0 "long" 0
+debug.var 0 "count" fixed 16384 "long" 0
 `,
   },
 
@@ -443,14 +443,14 @@ block 0 () {
   h1 = thread.spawn 1 sp one
   j0 = thread.join h0
   j1 = thread.join h1
-  addr = i64.const 0
+  addr = i64.const 16384
   total = i64.atomic.load addr
   return total
   }
 }
 func (i64, i64) -> (i64) {
 block 0 (sp: i64, inc: i64) {
-  addr = i64.const 0
+  addr = i64.const 16384
   old = i64.atomic.rmw.add addr inc
   z = i64.const 0
   return z
@@ -475,15 +475,15 @@ block 0 (sp: i64, inc: i64) {
 memory 16
 func () -> (i64) {
 block 0 () {
-  a8 = i64.const 8
+  a8 = i64.const 16392
   val = i64.const 987654
   i64.atomic.store a8 val
   sp = i64.const 0
   h = thread.spawn 1 sp sp
-  a0 = i64.const 0
+  a0 = i64.const 16384
   one = i32.const 1
   i32.atomic.store a0 one
-  a0n = i64.const 0
+  a0n = i64.const 16384
   n1 = i32.const 1
   woke = atomic.notify a0n n1
   r = thread.join h
@@ -492,11 +492,11 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (sp: i64, arg: i64) {
-  a0 = i64.const 0
+  a0 = i64.const 16384
   exp = i32.const 0
   tmo = i64.const 1000000000
   st = i32.atomic.wait a0 exp tmo
-  a8 = i64.const 8
+  a8 = i64.const 16392
   got = i64.atomic.load a8
   return got
   }
@@ -568,7 +568,7 @@ block 0 () {
   w1 = thread.spawn 1 sp a
   j0 = thread.join w0
   j1 = thread.join w1
-  addr = i64.const 0
+  addr = i64.const 16384
   total = i64.atomic.load addr
   return total
   }
@@ -582,7 +582,7 @@ block 0 (sp: i64, arg: i64) {
   s0, v0 = cont.resume gen a
   b = i64.const 20
   s1, v1 = cont.resume gen b
-  addr = i64.const 0
+  addr = i64.const 16384
   rmw = i64.atomic.rmw.add addr v1
   zero = i64.const 0
   return zero
@@ -1230,6 +1230,35 @@ if [ -n "$N" ]; then echo N is set; fi
 type seq
 `,
   },
+  'bash -i (an interactive terminal)': {
+    kind: 'bash-i',
+    jit: false, // the session runs on the cooperative bytecode engine, inside a dedicated Worker
+    url: './assets/bash.temen',
+    // The same /bin registry as the batch bash card — full paths, resolved through PATH=/bin.
+    cmds: [
+      { name: '/bin/true', url: './assets/bin_true.temen' },
+      { name: '/bin/false', url: './assets/bin_false.temen' },
+      { name: '/bin/echo', url: './assets/bin_echo.temen' },
+      { name: '/bin/cat', url: './assets/bin_cat.temen' },
+      { name: '/bin/seq', url: './assets/bin_seq.temen' },
+      { name: '/bin/head', url: './assets/bin_head.temen' },
+      { name: '/bin/wc', url: './assets/bin_wc.temen' },
+      { name: '/bin/sort', url: './assets/bin_sort.temen' },
+      { name: '/bin/uniq', url: './assets/bin_uniq.temen' },
+      { name: '/bin/ls', url: './assets/bin_ls.temen' },
+      { name: '/bin/pwd', url: './assets/bin_pwd.temen' },
+      { name: '/bin/grep', url: './assets/bin_grep.temen' },
+      { name: '/bin/tr', url: './assets/bin_tr.temen' },
+    ],
+    mode: 'io',
+    desc: 'A live bash session (#1122): the real GNU bash binary running `-i` on the bytecode ' +
+      'engine inside a dedicated Web Worker, over the sandbox’s controlling terminal. Click Run, ' +
+      'then type at the prompt below — each line you send goes through the terminal’s line ' +
+      'discipline into bash’s parked read; the prompt and output stream back. External commands ' +
+      '(seq, sort, …) fork→execve as separate compiled programs, exactly like the batch card. ' +
+      'Ctrl+D (or typing `exit`) ends the session. bash is GPLv3 and never committed — this ' +
+      'card’s module is built at deploy (node build-bash-assets.mjs).',
+  },
   'SQLite (:memory: — write & run SQL)': {
     kind: 'module',
     jit: true, // _start is wasm-JIT-emittable (proven byte-identical by browser-jit-module-test)
@@ -1812,6 +1841,124 @@ async function runBash(c) {
     logTo(c, `bash run status ${status}`);
     runEnd(rec, { ok: false, status, result: rv });
   }
+}
+
+// #1122 — the **interactive bash card**: a live `bash -i` session over the #797 controlling
+// terminal, on the cooperative bytecode engine, inside a dedicated Worker. Two Workers over the
+// page engine's shared memory (see bash-worker.js): the SESSION Worker blocks in
+// `temen_bash_session` for the whole session (the pump parks on the external-wake doorbell while
+// bash waits at the prompt); the CONTROL Worker feeds keystrokes (`temen_bash_feed` — the
+// line discipline runs at feed time) and poll-drains stdout/stderr back to the page. The page
+// itself never calls into the session's wasm (a contended Mutex would `Atomics.wait`, banned on
+// the main thread).
+async function runBashInteractive(c) {
+  const ex = c.ex;
+  const rec = runStart(c, { tier: 'interpreter' });
+  setState(c, 'running', 'fetching bash…');
+  c.el.result.textContent = '';
+  c.el.stdout.textContent = '';
+  c.el.canvas.hidden = true;
+  let bytes;
+  try {
+    bytes = await fetchTimed(rec, c, ex.url);
+  } catch (e) {
+    setState(c, 'error', `${e.message} — bash.temen is built at deploy (GPLv3, never committed): run \`node build-bash-assets.mjs\``);
+    logTo(c, `fetch failed: ${e.message}`);
+    runEnd(rec, { ok: false });
+    return;
+  }
+  const bins = [];
+  for (const cmd of ex.cmds || []) {
+    try {
+      bins.push({ name: cmd.name, bytes: await fetchTimed(rec, c, cmd.url) });
+    } catch (e) {
+      logTo(c, `command '${cmd.name}' unavailable (${e.message})`);
+    }
+  }
+  const binsBlob = buildCmdsBlob(bins);
+  // Stage the module + /bin blob in the shared memory (kept live for the whole session), then
+  // carve each Worker's stack + TLS the par.js way (16-aligned, leaked for the run).
+  const u8 = () => new Uint8Array(eng.memory.buffer);
+  const modPtr = eng.ex.temen_par_alloc(bytes.length);
+  u8().set(bytes, modPtr);
+  const binsPtr = binsBlob.length ? eng.ex.temen_par_alloc(binsBlob.length) : 0;
+  if (binsPtr) u8().set(binsBlob, binsPtr);
+  const STACK = 1 << 20;
+  const tlsSize = eng.ex.__tls_size.value, tlsAlign = eng.ex.__tls_align.value || 1;
+  const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
+  const carve = () => ({
+    stackTop: eng.ex.temen_par_alloc(STACK) + STACK,
+    tlsBase: tlsSize > 0 ? roundUp(eng.ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0,
+  });
+  const mk = (role) => {
+    const w = new Worker(new URL('./bash-worker.js', import.meta.url), { type: 'module' });
+    w.postMessage({
+      module: eng.module, memory: eng.memory, role,
+      modPtr, modLen: bytes.length, binsPtr, binsLen: binsBlob.length, ...carve(),
+    });
+    return w;
+  };
+  const session = mk('session');
+  const control = mk('control');
+  c.bashWorkers = [session, control];
+  const append = (text) => {
+    c.el.stdout.textContent += text;
+  };
+  const finish = (why) => {
+    if (!c.bashWorkers) return;
+    for (const w of c.bashWorkers) w.terminate();
+    c.bashWorkers = null;
+    c.el.term.disabled = true;
+    c.el.run.disabled = broken;
+    c.el.stop.disabled = true;
+    runEnd(rec, { ok: !why });
+  };
+  session.onmessage = (e) => {
+    const m = e.data;
+    if (m.kind === 'fail') {
+      setState(c, 'error', `session failed: ${m.why}`);
+      logTo(c, `session worker: ${m.why}`);
+      finish(m.why);
+    }
+    // 'exit' also arrives via the control Worker's 'done' (which has drained the farewell first).
+  };
+  control.onmessage = (e) => {
+    const m = e.data;
+    if (m.kind === 'out' || m.kind === 'err') append(m.text);
+    else if (m.kind === 'done') {
+      c.el.result.textContent = `${m.rc}`;
+      setState(c, 'done', `session ended · exit ${m.rc}`);
+      logTo(c, `bash -i session ended with exit ${m.rc}`);
+      finish(null);
+    } else if (m.kind === 'fail') {
+      setState(c, 'error', `control failed: ${m.why}`);
+      finish(m.why);
+    }
+  };
+  // The input line: Enter sends the line + '\n'; Ctrl+C / Ctrl+D send the raw control byte (the
+  // #797 line discipline handles echo, editing, and the VEOF one-shot).
+  const send = (arr) => control.postMessage({ kind: 'keys', bytes: Uint8Array.from(arr) });
+  c.el.term.disabled = false;
+  c.el.term.value = '';
+  c.el.term.focus();
+  c.el.term.onkeydown = (ev) => {
+    if (ev.key === 'Enter') {
+      const line = c.el.term.value;
+      c.el.term.value = '';
+      send([...new TextEncoder().encode(line), 10]);
+      ev.preventDefault();
+    } else if (ev.ctrlKey && (ev.key === 'c' || ev.key === 'C')) {
+      send([3]);
+      ev.preventDefault();
+    } else if (ev.ctrlKey && (ev.key === 'd' || ev.key === 'D')) {
+      send([4]);
+      ev.preventDefault();
+    }
+  };
+  c.el.run.disabled = true;
+  c.el.stop.disabled = false;
+  setState(c, 'running', 'session live — type at the prompt below');
+  logTo(c, `bash -i session started (${bytes.length}B bash, ${bins.length} /bin commands)`);
 }
 
 // A card's Run for an on-ramp module. The "wasm-JIT" toggle (offered on the emittable guests —
@@ -3483,12 +3630,24 @@ async function runDemo(c) {
   if (ex.kind === 'nimc') return runNimc(c);
   if (ex.kind === 'shell') return runShell(c);
   if (ex.kind === 'bash') return runBash(c);
+  if (ex.kind === 'bash-i') return runBashInteractive(c);
   if (ex.kind === 'module') return runModule(c);
   return runText(c);
 }
 
 // A card's Stop: close a live Postgres session, end a running reactor, or abort a threaded text run.
 function stopDemo(c) {
+  if (c.bashWorkers) {
+    // Tearing down the session Workers mid-run leaves the shared session state (the personality's
+    // world locks, the doorbell) unusable — same caveat as a par.js stop: reload before reusing.
+    for (const w of c.bashWorkers) w.terminate();
+    c.bashWorkers = null;
+    if (c.el.term) c.el.term.disabled = true;
+    c.el.run.disabled = broken;
+    c.el.stop.disabled = true;
+    setState(c, 'stopped', 'session torn down — reload the page before starting another');
+    return;
+  }
   if (c.pgSession) {
     eng.ex.temen_pg_close();
     c.pgSession = false;
@@ -3618,7 +3777,9 @@ function buildCard(name, ex) {
     }
   } else {
     section.appendChild(el('pre', 'note',
-      ex.kind === 'reactor'
+      ex.kind === 'bash-i'
+        ? `Real GNU bash, interactive (${ex.url}). Click Run to start the session, then type at the prompt in the input below — Enter sends the line, Ctrl+C / Ctrl+D send the control keys. Stop tears the session down.`
+        : ex.kind === 'reactor'
         ? `Pre-built on-ramp reactor module (${ex.url}). Click Run — the page calls tick() once per animation frame; the arrow keys steer it through the keyboard capability.`
         : ex.kind === 'selfhost'
         ? `chibicc compiling its own source. Pick one of chibicc’s cc1 translation units and click Run — chibicc.temen compiles that file to a linkable TEMEN-IR object, reading its ~96-file glibc header closure from the seeded in-memory filesystem, entirely in your browser. The emitted object appears below; "Prove interp ≡ JIT" recompiles it on both engines and checks they’re byte-identical.`
@@ -3723,6 +3884,21 @@ function buildCard(name, ex) {
   controls.appendChild(state);
   section.appendChild(controls);
 
+  // #1122 — the interactive bash card's terminal input line: Enter sends the line (+ '\n') into
+  // the session's line discipline; Ctrl+C / Ctrl+D send the raw control bytes. Wired by
+  // `runBashInteractive` (disabled until a session is live).
+  let term = null;
+  if (ex.kind === 'bash-i') {
+    term = el('input', 'term-input');
+    term.type = 'text';
+    term.placeholder = 'type a command and press Enter (Ctrl+C / Ctrl+D work) — Run starts the session';
+    term.disabled = true;
+    term.style.width = '100%';
+    term.style.boxSizing = 'border-box';
+    term.style.fontFamily = 'monospace';
+    section.appendChild(term);
+  }
+
   const out = el('div', 'output');
   const result = el('pre', 'result');
   const canvas = el('canvas', 'canvas');
@@ -3786,7 +3962,7 @@ function buildCard(name, ex) {
 
   const c = {
     name, ex, editor, id,
-    el: { section, state, result, stdout, log: logEl, canvas, gpucanvas, run: runBtn, stop: stopBtn, mode: modeSel, tu: tuSel, jit, gflag, prove: proveBtn, reset: resetBtn, share: shareBtn, debug: debugBtn, dbg, dbgVars },
+    el: { section, state, result, stdout, log: logEl, canvas, gpucanvas, run: runBtn, stop: stopBtn, mode: modeSel, tu: tuSel, jit, gflag, prove: proveBtn, reset: resetBtn, share: shareBtn, debug: debugBtn, dbg, dbgVars, term },
   };
   runBtn.addEventListener('click', () => runDemo(c));
   if (debugBtn) debugBtn.addEventListener('click', () => startDebug(c));

@@ -59,8 +59,11 @@ impl Drop for FloorGuard {
 /// Where the wasmi harness places the mirrored window / env cell in the emitted module's memory.
 const WIN_BASE: u32 = 0x4_0000;
 const ENV_PTR: u32 = 1024;
-/// Declared-prefix cell `_start` stages the summed result in before streaming it to stdout.
-const SLOT: i64 = 2048;
+/// Declared-prefix cell `_start` stages the summed result in before streaming it to stdout. It must
+/// clear the #1094 unconditional NULL guard (`[0, POWERBOX_NULL_GUARD)` = `[0, 16 KiB)` faults on any
+/// guest access) and the relocated args region above it — so it sits at `2 * POWERBOX_NULL_GUARD`
+/// (32 KiB) plus its legacy offset, well below every guest's mapped window at 64 KiB.
+const SLOT: i64 = 32768 + 2048;
 
 /// The on-ramp powerbox's stdout handle, replicated from `grant_onramp_caps`'s grant order (stdout,
 /// stdin, exit, memory, addrspace, …) against a fresh `Host` — deterministic per session, so the
@@ -222,7 +225,7 @@ fn service_coop_on_wasmi(n_results: usize) -> Option<Vec<i64>> {
 
 /// Leaf probe, blob-staging base, and the unit's added constant — mirrors the single-vCPU jit test.
 const PROBE: i64 = 65536 + 16;
-const BLOB_BASE: i64 = 4096;
+const BLOB_BASE: i64 = 32768 + 4096;
 const UNIT_K: i64 = 90909;
 
 /// The on-ramp stdout + memory (`AddressSpace`) handles, for a guest that both `vm_map`-grows and
@@ -1659,7 +1662,7 @@ const FIBER_UNIT_K: i64 = 777;
 const XT_K: i64 = 222;
 /// Hot-loop constants: per-iteration multiplier, staging cell, iteration count (== bounce count).
 const HOT_K: i64 = 77;
-const SLOT2: i64 = 2064;
+const SLOT2: i64 = 32768 + 2064;
 const HOT_N: i64 = 4;
 
 /// Stage `blob` into guest memory at `base` as i64 stores (`prefix` uniquifies the SSA names).
@@ -1952,8 +1955,9 @@ block 0 (vslot: i64, vx: i64) {
         temen_verify::verify_module(&u).expect("verify B");
         temen_encode::encode_module(&u)
     };
-    const A_BASE: i64 = 4096;
-    const B_BASE: i64 = 8192;
+    // Blob-staging bases, above the #1094 NULL guard (`[0, 16 KiB)` faults on any guest access).
+    const A_BASE: i64 = 32768 + 4096;
+    const B_BASE: i64 = 32768 + 8192;
     let (sa, sb) = (
         stage_blob("a", A_BASE, &blob_a),
         stage_blob("c", B_BASE, &blob_b),
@@ -2211,7 +2215,7 @@ func () -> (i64) {{
 block 0 () {{
   vx = i64.const {X}
   vr1 = call 1 (vx)
-  vha = i64.const 2104
+  vha = i64.const 34872
   vh = i64.load vha
   varg = i64.const 77
   vs2, vv2 = cont.resume vh varg
@@ -2237,7 +2241,7 @@ block 0 (v0: i64) {{
   vsp = i64.const 0
   vk = cont.new vf vsp
   vs1, vv1 = cont.resume vk v0
-  vha = i64.const 2104
+  vha = i64.const 34872
   i64.store vha vk
   return vv1
   }}
@@ -2675,12 +2679,16 @@ impl Drop for InstantiatorGuard {
 }
 
 /// The #816 guest: `_start` resolves its (knob-granted) `"instantiator"` by name, spawns a
-/// same-module confined child (f1, 4 KiB carve at 64 KiB), joins it, calls the eligible leaf f2
-/// itself, then reads back the marker byte each leaf run stored at *its own* window's offset 8 —
-/// the root's at absolute 8, the child's at absolute 65536+8 (visible through the parent window,
-/// shared backing). A mis-routed per-event `win` (root base for the child's event) would land the
-/// child's marker at 8 (clobbering nothing observable but leaving 65544 zero) and fail the sum.
-/// f2 stores marker 21 at [8] and returns x*3 + 7. Sum = child f(5)=22 + root f(3)=16 + 21 + 21 = 80.
+/// same-module confined child (f1, 32 KiB carve at 64 KiB), joins it, calls the eligible leaf f2
+/// itself, then reads back the marker byte each leaf run stored at *its own* window's offset 16384 —
+/// the root's at absolute 16384, the child's at absolute 65536+16384=81920 (visible through the
+/// parent window, shared backing). A mis-routed per-event `win` (root base for the child's event)
+/// would land the child's marker at 16384 (clobbering nothing observable but leaving 81920 zero) and
+/// fail the sum. The marker offset must clear the #1094 unconditional NULL guard (`[0, 16 KiB)`) yet
+/// stay inside the carve — so the same offset is valid in both windows, which forces the carve above
+/// the guard (a 4 KiB carve would have no writable byte the root's guarded window also admits, so the
+/// carve is now 32 KiB, size_log2 15; the handle-stash name at 33792 clears the guard too).
+/// f2 stores marker 21 at [16384] and returns x*3 + 7. Sum = child f(5)=22 + root f(3)=16 + 21 + 21 = 80.
 fn coop_child_guest_text() -> String {
     let out_h = onramp_out_handle();
     let name = b"instantiator";
@@ -2694,25 +2702,25 @@ fn coop_child_guest_text() -> String {
 func () -> (i64) {{
 block 0 () {{
   vw0 = i64.const {w0}
-  va0 = i64.const 1024
+  va0 = i64.const 33792
   i64.store va0 vw0
   vw1 = i64.const {w1}
-  va1 = i64.const 1032
+  va1 = i64.const 33800
   i64.store va1 vw1
   vnl = i64.const 12
   vh = self.resolve va0 vnl
   ve = i64.const 1
   voff = i64.const 65536
-  vsl = i64.const 12
+  vsl = i64.const 15
   vq = i64.const 0
   vch = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vh (ve, voff, vsl, vq)
   vj = call.cap 6 1 (i32) -> (i64) vh (vch)
   v3 = i64.const 3
   vlocal = call 2 (v3)
-  vma = i64.const 8
+  vma = i64.const 16384
   vm0 = i32.load8_u vma
   vm0e = i64.extend_i32_u vm0
-  vca = i64.const 65544
+  vca = i64.const 81920
   vm1 = i32.load8_u vca
   vm1e = i64.extend_i32_u vm1
   vs1 = i64.add vj vlocal
@@ -2736,7 +2744,7 @@ block 0 (v0: i64) {{
 func (i64) -> (i64) {{
 block 0 (vx: i64) {{
   v21 = i32.const 21
-  va = i64.const 8
+  va = i64.const 16384
   i32.store8 va v21
   v3 = i64.const 3
   vm = i64.mul vx v3
@@ -2775,7 +2783,7 @@ fn coop_tierup_serves_a_confined_child_over_its_own_carve() {
 
     let n_results = m.funcs[2].results.len();
     let mut tierups = 0u32;
-    // Per-event (win_len, mapped): the child's event serves its 4 KiB carve with its own extent;
+    // Per-event (win_len, mapped): the child's event serves its 32 KiB carve with its own extent;
     // the root's serves the full run window with the root's committed extent.
     let mut spans: Vec<(usize, i64)> = Vec::new();
     loop {
@@ -2798,7 +2806,7 @@ fn coop_tierup_serves_a_confined_child_over_its_own_carve() {
     // each served over ITS task's window (#1117's env routing, here over real emitted wasm).
     assert_eq!(
         spans,
-        vec![(4096, 4096), (1 << 25, 131072)],
+        vec![(32768, 32768), (1 << 25, 131072)],
         "per-event window span + mapped must be the child carve then the root window"
     );
     assert_eq!(
@@ -2831,24 +2839,27 @@ fn coop_tierup_serves_a_confined_child_over_its_own_carve() {
 // ============================================================================================
 
 /// The page-managing two-phase guest (the QuickJS shape in miniature). `warmup(sp)`: plant a
-/// rodata constant at 8200 then `protect` its page `[8 KiB, 12 KiB)` read-only, `vm_map`-grow
+/// rodata constant at 24584 then `protect` its page `[24 KiB, 28 KiB)` read-only, `vm_map`-grow
 /// `[64 KiB, 80 KiB)` and plant a marker at 65552, and advance the on-ramp brk so the image
 /// capture covers the growth. `eval_run(sp)`: read the marker (grown page) + the rodata constant
 /// (`Ro` page) + the scratch at 65560 (fresh-per-Run: must be 0), call the eligible leaf f2 with
-/// 3, dirty the scratch, stage the sum at 2048 and stream it to stdout, return the sum.
+/// 3, dirty the scratch, stage the sum at `SLOT` and stream it to stdout, return the sum.
+/// (The rodata page, brk word, and `SLOT` all clear the #1094 unconditional NULL guard `[0, 16 KiB)`.)
 /// Sum = 424242 + 777 + 0 + f(3)=16 = 425035.
 fn warm_coop_guest_text() -> String {
     let (out_h, mem_h) = onramp_out_mem_handles();
-    let brk = temen_ir::POWERBOX_HEAP_BRK;
+    // The on-ramp brk word sits one guard up on the #1094 marked layout — where the warm host
+    // reads/seeds it (`warm_read_brk`: `scratch + POWERBOX_HEAP_BRK`, scratch = the module guard base).
+    let brk = temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_HEAP_BRK;
     format!(
         r#"memory 16
 func (i64) -> (i64) {{
 block 0 (vsp: i64) {{
-  vroaddr = i64.const 8200
+  vroaddr = i64.const 24584
   vroval = i64.const 777
   i64.store vroaddr vroval
   vas = i32.const {mem_h}
-  vrooff = i64.const 8192
+  vrooff = i64.const 24576
   vrolen = i64.const 4096
   vro = i32.const 1
   vp = call.cap 5 2 (i64, i64, i32) -> (i64) vas (vrooff, vrolen, vro)
@@ -2870,7 +2881,7 @@ func (i64) -> (i64) {{
 block 0 (vsp: i64) {{
   vmaddr = i64.const 65552
   vmark = i64.load vmaddr
-  vroaddr = i64.const 8200
+  vroaddr = i64.const 24584
   vroval = i64.load vroaddr
   vsaddr = i64.const 65560
   vs = i64.load vsaddr
@@ -2881,7 +2892,7 @@ block 0 (vsp: i64) {{
   vs1 = i64.add vmark vroval
   vs2 = i64.add vs1 vs
   vsum = i64.add vs2 vleaf
-  vsl = i64.const 2048
+  vsl = i64.const {SLOT}
   i64.store vsl vsum
   vout = i32.const {out_h}
   vlen8 = i64.const 8

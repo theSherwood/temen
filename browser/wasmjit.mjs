@@ -96,7 +96,7 @@ block 1 (v3: i64, v4: i64, v5: i64) {
   br_if v6 2(v3, v4, v5) 3(v4)
 }
 block 2 (v7: i64, v8: i64, v9: i64) {
-  v10 = i64.const 8
+  v10 = i64.const 16392
   i64.store v10 v8
   v11 = i64.load v10
   v12 = i64.add v11 v9
@@ -211,7 +211,7 @@ block 0 (v0: i64) {
   v4 = i32x4.splat v3
   v5 = i32x4.add v2 v4
   v6 = i32x4.mul v5 v4
-  v7 = i64.const 32
+  v7 = i64.const 16416
   v128.store v7 v6
   v8 = v128.load v7
   v9 = i32x4.max_s v8 v2

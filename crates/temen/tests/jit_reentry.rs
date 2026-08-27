@@ -109,8 +109,8 @@ fn setup(extra_src: &str) -> (Box<TestCtx>, Box<CompiledModule>) {
 /// The invoked code's store lands in the guest's own window (visible in the run snapshot).
 #[test]
 fn mid_run_define_and_invoke_over_live_window() {
-    // (a, b) -> a + b + 1000, plus a store of 0xAB at offset 64 of the SHARED window.
-    let extra_src = "memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i64.const 64\n  v3 = i32.const 171\n  i32.store8 v2 v3\n  v4 = i32.add v0 v1\n  v5 = i32.const 1000\n  v6 = i32.add v4 v5\n  return v6\n  }\n}\n";
+    // (a, b) -> a + b + 1000, plus a store of 0xAB at offset 16448 (above the #1094 NULL guard) of the SHARED window.
+    let extra_src = "memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i64.const 16448\n  v3 = i32.const 171\n  i32.store8 v2 v3\n  v4 = i32.add v0 v1\n  v5 = i32.const 1000\n  v6 = i32.add v4 v5\n  return v6\n  }\n}\n";
     let (ctx, _cm) = setup(extra_src);
     let cm_ptr: *mut CompiledModule = ctx.cm.get();
     let (out, final_mem) =
@@ -120,7 +120,7 @@ fn mid_run_define_and_invoke_over_live_window() {
         "{out:?}"
     );
     assert_eq!(
-        final_mem[64], 0xab,
+        final_mem[16448], 0xab,
         "invoked code must write the LIVE window"
     );
 
@@ -128,7 +128,7 @@ fn mid_run_define_and_invoke_over_live_window() {
     let (out, final_mem) =
         unsafe { CompiledModule::run_raw(cm_ptr, &[1, 1], None, None) }.expect("re-run");
     assert!(matches!(out, JitOutcome::Returned(ref s) if s == &[1002]));
-    assert_eq!(final_mem[64], 0xab);
+    assert_eq!(final_mem[16448], 0xab);
 }
 
 /// An IR trap inside invoked code is **terminal for the domain**: the trampoline writes the

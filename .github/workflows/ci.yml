@@ -941,6 +941,11 @@ jobs:
           # assert the script's stdout. SKIPs cleanly when the deploy-built bash.temen is absent
           # (the fail-soft staging step above), so it reds only on a real engine/card regression.
           node browser-bash-test.mjs
+          # The interactive bash card (#1122): drive the play-page UI — Run starts a live `bash -i`
+          # session (a session Worker blocked in temen_bash_session + a control Worker feeding the
+          # #797 line discipline / draining output), type a builtin and a fork+exec'd coreutil at
+          # the prompt, ^D exits. SKIPs with the batch test when bash.temen is absent.
+          node browser-bash-interactive-test.mjs
           # DAP-over-bytecode debugger through the wasm FFI: drive a full initialize→launch→breakpoint→
           # variables→terminate conversation in Chromium on the bytecode engine (DEBUGGING.md).
           node browser-dap-test.mjs

@@ -330,12 +330,14 @@ mod tests {
         handle: 256,
     };
 
-    /// `func() -> i64 { store i64 7 at 16+8; load i64 at 16+8 }` — one store, one load, both with
-    /// a non-zero immediate offset, plus a bulk fill; exercises renumbering across insertions.
+    /// `func() -> i64 { store i64 7 at 16400+8; load i64 at 16400+8 }` — one store, one load, both
+    /// with a non-zero immediate offset, plus a bulk fill; exercises renumbering across insertions.
+    /// The base is one #1094 NULL guard up (`POWERBOX_NULL_GUARD + 16`) so the accesses land in
+    /// mapped memory rather than the unconditionally-unmapped `[0, 16384)` guard.
     fn sample() -> Module {
         let insts = vec![
-            Inst::ConstI64(16), // v0
-            Inst::ConstI64(7),  // v1
+            Inst::ConstI64(16400), // v0 = POWERBOX_NULL_GUARD + 16
+            Inst::ConstI64(7),     // v1
             Inst::Store {
                 op: StoreOp::I64,
                 addr: 0,
@@ -429,9 +431,9 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                (mem_hook_op::STORE, vec![24, 8]),
-                (mem_hook_op::FILL, vec![16, 32]),
-                (mem_hook_op::LOAD, vec![24, 8]),
+                (mem_hook_op::STORE, vec![16408, 8]),
+                (mem_hook_op::FILL, vec![16400, 32]),
+                (mem_hook_op::LOAD, vec![16408, 8]),
             ]
         );
     }

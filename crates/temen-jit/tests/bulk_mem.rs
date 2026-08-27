@@ -50,22 +50,23 @@ fn as_i64(v: Value) -> i64 {
     }
 }
 
-/// `mem.fill` then `mem.copy`: fill `[0,16)` with 0xAB, copy it to `[100,116)`, read back an i64.
+/// `mem.fill` then `mem.copy`: fill `[16384,16400)` with 0xAB, copy it to `[16484,16500)`, read back
+/// an i64. (Regions sit above the #1094 NULL guard, which unmaps `[0, 16384)`.)
 #[test]
 fn fill_then_copy() {
     let src = "\
 memory 16
 func () -> (i64) {
 block 0 () {
-  v0 = i64.const 0
+  v0 = i64.const 16384
   v1 = i32.const 171
   v2 = i64.const 16
   mem.fill v0 v1 v2
-  v3 = i64.const 100
-  v4 = i64.const 0
+  v3 = i64.const 16484
+  v4 = i64.const 16384
   v5 = i64.const 16
   mem.copy v3 v4 v5
-  v6 = i64.const 100
+  v6 = i64.const 16484
   v7 = i64.load v6
   return v7
   }
@@ -76,22 +77,23 @@ block 0 () {
 }
 
 /// `mem.move` with **overlapping** spans (dst = src+8, forward overlap): must be overlap-safe (read
-/// the whole source before writing). Fill `[0,24)` with 0x01, then move `[0,16)` to `[8,24)`.
+/// the whole source before writing). Fill `[16384,16408)` with 0x01, then move `[16384,16400)` to
+/// `[16392,16408)`. (Regions sit above the #1094 NULL guard, which unmaps `[0, 16384)`.)
 #[test]
 fn overlapping_move() {
     let src = "\
 memory 16
 func () -> (i64) {
 block 0 () {
-  v0 = i64.const 0
+  v0 = i64.const 16384
   v1 = i32.const 1
   v2 = i64.const 24
   mem.fill v0 v1 v2
-  v3 = i64.const 8
-  v4 = i64.const 0
+  v3 = i64.const 16392
+  v4 = i64.const 16384
   v5 = i64.const 16
   mem.move v3 v4 v5
-  v6 = i64.const 16
+  v6 = i64.const 16400
   v7 = i64.load v6
   return v7
   }

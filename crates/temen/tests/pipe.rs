@@ -65,18 +65,18 @@ fn both(src: &str) -> (Result<Vec<Value>, temen_interp::Trap>, JitOutcome) {
 const WRITE_THEN_READ: &str = "memory 17\n\
 func (i32, i32) -> (i64) {\n\
 block 0 (vw: i32, vr: i32) {\n\
-  a0 = i64.const 0\n\
+  a0 = i64.const 16384\n\
   ch = i32.const 104\n\
   i32.store8 a0 ch\n\
-  a1 = i64.const 1\n\
+  a1 = i64.const 16385\n\
   ci = i32.const 105\n\
   i32.store8 a1 ci\n\
   vlen = i64.const 2\n\
   vn = call.cap 0 1 (i64, i64) -> (i64) vw (a0, vlen)\n\
-  a16 = i64.const 16\n\
+  a16 = i64.const 16400\n\
   vread = call.cap 0 0 (i64, i64) -> (i64) vr (a16, vlen)\n\
   vb0 = i32.load8_u a16\n\
-  a17 = i64.const 17\n\
+  a17 = i64.const 16401\n\
   vb1 = i32.load8_u a17\n\
   k256 = i32.const 256\n\
   k65536 = i32.const 65536\n\
@@ -99,7 +99,7 @@ const EMPTY_AND_WRONG_DIRECTION: &str = "memory 17\n\
 func (i32, i32) -> (i64) {\n\
 block 0 (vw: i32, vr: i32) {\n\
   vcl = call.cap 0 2 () -> (i64) vw ()\n\
-  a0 = i64.const 0\n\
+  a0 = i64.const 16384\n\
   vlen = i64.const 4\n\
   vempty = call.cap 0 0 (i64, i64) -> (i64) vr (a0, vlen)\n\
   vbad = call.cap 0 1 (i64, i64) -> (i64) vr (a0, vlen)\n\

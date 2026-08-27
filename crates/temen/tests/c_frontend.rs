@@ -407,28 +407,25 @@ fn c_write_to_string_literal_faults() {
     );
 }
 
-/// #1059: the chibicc frontend emits the **guarded layout** — every fixed low region (handle slots,
-/// args buffer, globals, data stack) sits one `POWERBOX_NULL_GUARD` up and the module carries the
-/// `__null_guard` marker — so a NULL dereference **traps** (`MemoryFault`) on both the interpreter and
-/// the JIT, instead of silently reading low scratch. The guest-side differential for #964's "on
-/// everywhere" goal (the c_interpret null-deref consumer). A `volatile` pointer keeps the load in
-/// memory (no SSA-promotion/const-fold) so the dereference actually reaches address 0.
+/// #1059/#1094: the chibicc frontend emits the **guarded layout** — every fixed low region (handle
+/// slots, args buffer, globals, data stack) sits one `POWERBOX_NULL_GUARD` up — so a NULL dereference
+/// **traps** (`MemoryFault`) on both the interpreter and the JIT, instead of silently reading low
+/// scratch. The guard is **unconditional** now (#1094 — the one canonical layout; no `__null_guard`
+/// marker export). The guest-side differential for #964's "on everywhere" goal (the c_interpret
+/// null-deref consumer). A `volatile` pointer keeps the load in memory (no SSA-promotion/const-fold)
+/// so the dereference actually reaches address 0.
 #[cfg(unix)]
 #[test]
 fn c_null_deref_faults_under_the_guard() {
     let src = "int main(void){ volatile int *p = 0; return *p; }";
     let ir = c_to_ir(src);
-    assert!(
-        ir.contains("export 1 func \"__null_guard\" 0"),
-        "the frontend must emit the guard marker:\n{ir}"
-    );
     let m = parse_module(&ir).expect("parse");
     verify_module(&m).expect("verify");
-    // Guarded layout: the marker resolves to the guard extent, and the args base is shifted up by it.
+    // Guarded layout: the guard extent is unconditional, and the args base is shifted up by it.
     assert_eq!(
         temen_ir::module_null_guard(&m),
         Some(temen_ir::POWERBOX_NULL_GUARD),
-        "module is guard-marked:\n{ir}"
+        "module runs under the unconditional guard:\n{ir}"
     );
     assert_eq!(
         temen_ir::module_args_base(&m),

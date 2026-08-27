@@ -52,13 +52,13 @@ fn pin_all(src: &str, want: i64) {
 }
 
 /// The fiber body every kernel shares: a timed `i32.atomic.wait` on a never-notified zero cell
-/// (`mem[0]`, timeout `{TO}` ns), returning `wait_status * 1000 + 42` — so the result pins
+/// (`mem[16384]`, above the #1094 NULL guard, timeout `{TO}` ns), returning `wait_status * 1000 + 42` — so the result pins
 /// both that the fiber completed (42) and which `WAIT_*` status its park delivered.
 fn fiber_body(timeout_ns: u64) -> String {
     format!(
         r#"func (i64, i64) -> (i64) {{
 block 0 (vsp: i64, varg: i64) {{
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vexp = i32.const 0
   vto = i64.const {timeout_ns}
   vst = i32.atomic.wait vaddr vexp vto
@@ -89,7 +89,7 @@ block 0 () {{
   v2 = cont.new v0 v1
   v3 = i64.const 0
   vs1, vv1 = cont.resume v2 v3
-  va = i64.const 8
+  va = i64.const 16392
   ve = i32.const 0
   vt = i64.const 100000000
   vw = i32.atomic.wait va ve vt
@@ -194,7 +194,7 @@ block 0 () {{
   v3 = i64.const 0
   vs1, vv1 = cont.resume v2 v3
   vs2, vv2 = cont.resume v2 v3
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vcnt = i32.const 1
   vw = atomic.notify vaddr vcnt
   vs3, vv3 = cont.resume v2 v3
@@ -227,14 +227,14 @@ block 0 () {{
 /// temen-run path: the cell (`mem[0]`) already differs when the fiber waits, so the
 /// register-then-recheck wakes it immediately — one transient `FIBER_PARKED`, then the next
 /// resume delivers `WAIT_NOT_EQUAL`. Composite: s1*10_000 + s2*100 + v2 = 3*10_000 + 1*100 +
-/// (1*1000 + 42) = 31_142.
+/// (1*1000 + 42) = 31_142. (`mem[16384]`, above the #1094 NULL guard.)
 fn insta_wake() -> String {
     format!(
         r#"memory 16
 export 0 func "_start" 0
 func () -> (i64) {{
 block 0 () {{
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vfive = i32.const 5
   i32.store vaddr vfive
   v0 = ref.func 1

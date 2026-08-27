@@ -12915,17 +12915,18 @@ fn demo_bash_translates_and_verifies() {
         );
     }
 
-    // ▶ #748/#1122 route (b) — the same interactive session on the **parallel driver**: the
-    // terminal read is a CorePipe block (a level-triggered poll on the parallel driver), so the
-    // feeder's keystrokes land with no dedicated wake, while every bash fork twin would be a real
-    // OS thread. The `^C` is fed but its ONLY assertable effect is the swallow: async delivery
-    // into the parked read is an interpreter-only tier (#796 L2), so the interrupt is absorbed at
-    // the feed-time line discipline and `$?` stays 0 — pinned as `rc=0` (when async delivery
-    // lands on the bytecode tier, this flips to `rc=130` and the pin should move to match the
-    // tree-walker session above). The session must still fully work around it: prompt loop, the
-    // typed command runs, `^D` exits with the farewell. (The cooperative driver cannot run this
-    // session at all yet — the #1122 route (a) suspend/resume gap — so only parallel is pinned.)
-    {
+    // ▶ #748/#1122 — the same interactive session on **both bytecode drivers**. On the parallel
+    // driver the terminal read is a CorePipe block (a level-triggered poll), so the feeder's
+    // keystrokes land with no dedicated wake; on the cooperative driver the all-parked pump
+    // BLOCKS on the #1122 external-wake doorbell (armed by the terminal grant) and the feed's
+    // pipe-wake ring re-admits it — pre-doorbell this session was the pump's deadlock
+    // (`ThreadFault`). On both, the `^C` is fed but its ONLY assertable effect is the swallow:
+    // async delivery into the parked read is an interpreter-only tier (#796 L2), so the interrupt
+    // is absorbed at the feed-time line discipline and `$?` stays 0 — pinned as `rc=0` (when
+    // async delivery lands on the bytecode tier, this flips to `rc=130` and the pin should move
+    // to match the tree-walker session above). The session must still fully work around it:
+    // prompt loop, the typed command runs, `^D` exits with the farewell.
+    for parallel in [false, true] {
         let (cap, posix) = temen_run::posix::posix_cap_terminal(0, 0);
         let feeder = {
             let px = posix.clone();
@@ -12946,33 +12947,41 @@ fn demo_bash_translates_and_verifies() {
             ],
             ..Default::default()
         };
-        let run = inst
-            .run_with_caps_parallel(&config, &[("posix", cap)])
-            .expect("bash -i session (parallel)");
+        let label = if parallel {
+            "parallel"
+        } else {
+            "coop bytecode"
+        };
+        let run = if parallel {
+            inst.run_with_caps_parallel(&config, &[("posix", cap)])
+        } else {
+            inst.run_with_caps(temen_run::Backend::Bytecode, &config, &[("posix", cap)])
+        }
+        .unwrap_or_else(|e| panic!("bash -i session ({label}): {e}"));
         feeder.join().expect("feeder thread");
         assert_eq!(
             run.outcome,
             temen_run::Outcome::Exited(0),
-            "bash -i (parallel): the ^D exit carries the last command's status"
+            "bash -i ({label}): the ^D exit carries the last command's status"
         );
         let out = String::from_utf8_lossy(&posix.stdout()).into_owned();
         let err = String::from_utf8_lossy(&posix.stderr()).into_owned();
         assert!(
             out.contains("echo hi\nhi\n"),
-            "bash -i (parallel): the typed command echoed and ran (stdout: {out:?})"
+            "bash -i ({label}): the typed command echoed and ran (stdout: {out:?})"
         );
         assert!(
             out.contains("rc=0"),
-            "bash -i (parallel): the fed ^C is absorbed without async delivery (the pinned \
+            "bash -i ({label}): the fed ^C is absorbed without async delivery (the pinned \
              bytecode-tier gap — see the comment above) (stdout: {out:?})"
         );
         assert!(
             err.matches("$ ").count() >= 2,
-            "bash -i (parallel): the PS1 prompt re-printed between commands (stderr: {err:?})"
+            "bash -i ({label}): the PS1 prompt re-printed between commands (stderr: {err:?})"
         );
         assert!(
             err.contains("exit"),
-            "bash -i (parallel): ^D printed bash's `exit` farewell (stderr: {err:?})"
+            "bash -i ({label}): ^D printed bash's `exit` farewell (stderr: {err:?})"
         );
     }
 

@@ -38,19 +38,19 @@ block 0 (v0: i32) {
   q0v2 = i64.const -4294967278
   q0v3 = i64.const 4294967295
   q0v4 = i64.const 0
-  q0a0 = i64.const 1152
+  q0a0 = i64.const 17536
   i64.store q0a0 q0v0
-  q0a1 = i64.const 1160
+  q0a1 = i64.const 17544
   i64.store q0a1 q0v1
-  q0a2 = i64.const 1168
+  q0a2 = i64.const 17552
   i64.store q0a2 q0v2
-  q0a3 = i64.const 1176
+  q0a3 = i64.const 17560
   i64.store q0a3 q0v3
-  q0a4 = i64.const 1184
+  q0a4 = i64.const 17568
   i64.store q0a4 q0v4
-  q0a5 = i64.const 1192
+  q0a5 = i64.const 17576
   i64.store q0a5 q0v4
-  q0a6 = i64.const 1200
+  q0a6 = i64.const 17584
   i64.store q0a6 q0v4
   vc1 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   vexp = i64.const 1
@@ -76,24 +76,24 @@ block 0 (v0: i64) {
   q1v2 = i64.const -4294967279
   q1v3 = i64.const 4294967295
   q1v4 = i64.const 0
-  q1a0 = i64.const 1216
+  q1a0 = i64.const 17600
   i64.store q1a0 q1v0
-  q1a1 = i64.const 1224
+  q1a1 = i64.const 17608
   i64.store q1a1 q1v1
-  q1a2 = i64.const 1232
+  q1a2 = i64.const 17616
   i64.store q1a2 q1v2
-  q1a3 = i64.const 1240
+  q1a3 = i64.const 17624
   i64.store q1a3 q1v3
-  q1a4 = i64.const 1248
+  q1a4 = i64.const 17632
   i64.store q1a4 q1v4
-  q1a5 = i64.const 1256
+  q1a5 = i64.const 17640
   i64.store q1a5 q1v4
-  q1a6 = i64.const 1264
+  q1a6 = i64.const 17648
   i64.store q1a6 q1v4
   vc2 = call.cap 6 17 (i64) -> (i32) vh (q1a0)
   vexp = i64.const 0
   vh2 = call.cap 6 14 (i32, i64) -> (i32) vh (vc2, vexp)
-  vk = i64.const 65600
+  vk = i64.const 81984
   vh2w = i64.extend_i32_u vh2
   i64.store vk vh2w
   vz = i32.const 0
@@ -103,7 +103,7 @@ block 0 (v0: i64) {
 }
 func (i64) -> (i64) {
 block 0 (vx: i64) {
-  vk = i64.const 65600
+  vk = i64.const 81984
   vh2l = i64.load vk
   vh2 = i32.wrap_i64 vh2l
   vr = call.cap 268435456 0 (i64) -> (i64) vh2 (vx)

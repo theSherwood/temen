@@ -13,7 +13,8 @@ use temen_dap::{BytecodeBackend, Debuggee};
 use temen_interp::Value;
 use temen_text::parse_module;
 
-/// A counter loop that also stores its running sum to window address 0 each iteration, so a faithful
+/// A counter loop that also stores its running sum to window address 16384 (above the #1094 NULL
+/// guard) each iteration, so a faithful
 /// checkpoint must restore both the call stack *and* the window bytes. Run with a large enough arg to
 /// cross several `CHECKPOINT_STRIDE` (1024-op) boundaries.
 const LOOP_WITH_MEM: &str = "\
@@ -32,7 +33,7 @@ block 2 (v5: i32) {
 }
 block 3 (v6: i32, v7: i32) {
   v8 = i32.add v7 v6
-  v9 = i32.const 0
+  v9 = i32.const 16384
   i32.store v9 v8
   v10 = i32.const -1
   v11 = i32.add v6 v10
@@ -53,7 +54,7 @@ block 0 (vn: i64) {
   vh1 = thread.spawn 1 vsp vn
   vj0 = thread.join vh0
   vj1 = thread.join vh1
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vr = i64.load vaddr
   return vr
 }
@@ -71,7 +72,7 @@ block 2 () {
   return vr
 }
 block 3 (vi2: i64) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vc = i64.load vaddr
   v1 = i64.const 1
   vsum = i64.add vc v1
@@ -138,7 +139,7 @@ block 0 (vn: i64) {
   vh1 = thread.spawn 1 vsp vn
   vj0 = thread.join vh0
   vj1 = thread.join vh1
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vr = i64.load vaddr
   return vr
 }
@@ -168,7 +169,7 @@ block 2 () {
   return vr
 }
 block 3 (vi2: i64) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vc = i64.load vaddr
   v1 = i64.const 1
   vsum = i64.add vc v1
@@ -191,7 +192,7 @@ fn obs(b: &mut BytecodeBackend, t: u64) -> (u64, String, Vec<u8>) {
         .map(|f| format!("{}:{}:{}:{}", f.pc.module, f.pc.func, f.pc.block, f.pc.inst))
         .collect::<Vec<_>>()
         .join("|");
-    let mem = b.read_window(0, 4).unwrap_or_default();
+    let mem = b.read_window(16384, 4).unwrap_or_default();
     (clock, stack, mem)
 }
 
@@ -322,7 +323,7 @@ fn obs_sched(b: &mut BytecodeBackend, t: u64) -> (u64, usize, Option<u64>, Vec<u
     let turn = b.turn();
     let threads = b.threads();
     let stopped = b.stopped_task();
-    let mem = b.read_window(0, 8).unwrap_or_default();
+    let mem = b.read_window(16384, 8).unwrap_or_default();
     let mut stacks = Vec::new();
     for &tid in &threads {
         b.select_task(tid);

@@ -37,9 +37,10 @@ fn real_system_wasmoved_runs() {
     .unwrap_or_else(|e| panic!("link against real system: {e}"));
     temen_verify::verify_module(&linked).unwrap_or_else(|e| panic!("verify: {e:?}"));
 
-    // Seed a `string {bytes: 0xdeadbeef, more: 0}` at offset 256; `clr` must zero its `bytes` word.
-    let s = 256usize;
-    let mut seed = vec![0u8; 4096];
+    // Seed a `string {bytes: 0xdeadbeef, more: 0}` at offset 16640 (256 + 16384, above the
+    // unconditional NULL guard, #1094); `clr` must zero its `bytes` word.
+    let s = 16640usize;
+    let mut seed = vec![0u8; 32768];
     seed[s..s + 8].copy_from_slice(&0xdeadbeefu64.to_le_bytes());
     seed[s + 8..s + 16].copy_from_slice(&7u64.to_le_bytes()); // `more` — must be left untouched
 
@@ -101,8 +102,9 @@ fn real_system_destroy_walks_the_longstring() {
     temen_verify::verify_module(&linked).unwrap_or_else(|e| panic!("verify: {e:?}"));
 
     // A "long" string at `s`: low byte of `bytes` = 255 (the tag), `more` → a LongString blob at `b`.
-    let (s, b) = (256usize, 512usize);
-    let mut seed = vec![0u8; 4096];
+    // Both raised +16384 above the unconditional NULL guard (#1094).
+    let (s, b) = (16640usize, 16896usize);
+    let mut seed = vec![0u8; 32768];
     seed[s] = 255; // bytes low byte = long-string tag
     seed[s + 8..s + 16].copy_from_slice(&(b as u64).to_le_bytes()); // more → blob
 
@@ -155,8 +157,9 @@ fn real_system_destroy_short_string_is_noop() {
     ])
     .unwrap_or_else(|e| panic!("link: {e}"));
 
-    let (s, b) = (256usize, 512usize);
-    let mut seed = vec![0u8; 4096];
+    // Both raised +16384 above the unconditional NULL guard (#1094).
+    let (s, b) = (16640usize, 16896usize);
+    let mut seed = vec![0u8; 32768];
     seed[s] = 0x68; // low byte of a packed SSO word ("h") — not the long tag
     seed[s + 8..s + 16].copy_from_slice(&(b as u64).to_le_bytes());
 
@@ -215,8 +218,9 @@ fn real_system_copy_runs_short_path() {
 
     // Two short strings (low byte of `bytes` ≤ 14 → short path, ≠ 255 → no dealloc): `dest` at D,
     // `src` at S. `=copy` should reach `copyMem(&dest.bytes, …)`, marking dest.bytes.
-    let (d, s) = (256usize, 512usize);
-    let mut seed = vec![0u8; 4096];
+    // `dest` at D, `src` at S, both raised +16384 above the unconditional NULL guard (#1094).
+    let (d, s) = (16640usize, 16896usize);
+    let mut seed = vec![0u8; 32768];
     seed[d] = 5; // dest SSO length
     seed[s] = 5; // src SSO length
     let mut fuel = u64::MAX;
@@ -278,7 +282,7 @@ fn real_long_string_end_to_end_against_real_arc() {
     // sit in the low scratch page below the globals; the window must reach past the globals base
     // (`POWERBOX_NULL_GUARD + POWERBOX_STACK_PAGE`, 32768, #1091) so the snapshot covers the
     // relocated const `LongString` blob.
-    let (sp, sret) = (2048i64, 512usize);
+    let (sp, sret) = (18432i64, 16896usize); // both +16384 above the unconditional NULL guard (#1094)
     let seed = vec![0u8; 49152];
     let ivals = vec![Value::I64(sp), Value::I64(sret as i64)];
     let mut fuel = u64::MAX;
@@ -316,10 +320,11 @@ fn real_ref_type_dup_hook_increments_refcount() {
     let m = temen_leng::translate(R).unwrap_or_else(|e| panic!("translate ref hook: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
 
-    // A ref target at offset 256 whose `r` (refcount) word is 5. dupDriver derefs the aliased
-    // pointer, `arcInc` bumps `r` (5 → 6), and reads it back through the returned (== src) pointer.
-    let r = 256usize;
-    let mut seed = vec![0u8; 4096];
+    // A ref target at offset 16640 (256 + 16384, above the unconditional NULL guard, #1094) whose
+    // `r` (refcount) word is 5. dupDriver derefs the aliased pointer, `arcInc` bumps `r` (5 → 6),
+    // and reads it back through the returned (== src) pointer.
+    let r = 16640usize;
+    let mut seed = vec![0u8; 32768];
     seed[r..r + 8].copy_from_slice(&5u64.to_le_bytes());
 
     // dupDriver is func 2 (arcInc = 0, =dup = 1): (refptr) -> incremented refcount.

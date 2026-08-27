@@ -190,42 +190,17 @@ fn guard_is_never_elided() {
     assert_eq!(e.unwrap_err(), TRAP_MEMORY_FAULT);
 }
 
-/// Sanity: the same probes on the **unguarded** entry admit everything (the guard is what traps,
-/// not some latent behavior), and the guarded module actually differs from the plain emit.
+/// #1094: the guard is **unconditional**, so the plain tier-up entry now derives it from
+/// `module_null_guard` (always `Some(GUARD)`) on every standard entry — its emit is byte-identical to
+/// the explicit-`GUARD` measurement emit, and it traps a NULL access (where the pre-#1094 unguarded
+/// plain emit admitted) while admitting at the guard boundary. No `__null_guard` marker is involved.
 #[test]
-fn unguarded_admits_and_outputs_differ() {
+fn plain_emit_carries_the_unconditional_guard() {
     let m = build();
-    let (plain, _) = temen_wasm_jit::compile_module_tierup(&m, false).expect("plain emits");
-    let (guarded, _) = compile_module_tierup_nullguard(&m, false, GUARD).expect("guarded emits");
-    assert_ne!(plain, guarded, "the guard emits real checks");
-    assert_eq!(
-        run_emitted(&plain, 0, &[0]),
-        Ok(0),
-        "unguarded NULL load admits"
-    );
-    assert_eq!(
-        run_emitted(&plain, 1, &[8]),
-        Ok(8),
-        "unguarded NULL store admits"
-    );
-}
-
-/// #964: a `__null_guard`-marked module derives the guard on the **standard** entries — the plain
-/// tier-up emit of a marked module is byte-identical to the explicit measurement entry at
-/// `POWERBOX_NULL_GUARD`, and its NULL probe traps `MemoryFault`; the unmarked twin's plain emit
-/// keeps admitting (pinned by `unguarded_admits_and_outputs_differ` above).
-#[test]
-fn marked_module_derives_guard_on_standard_entries() {
-    let src = format!(
-        "memory 17\nexport 0 func \"_start\" 0\nexport 1 func \"__null_guard\" 0\n{}",
-        SRC.trim_start_matches("memory 17\n")
-    );
-    let m = temen_text::parse_module(&src).expect("parse");
-    temen_verify::verify_module(&m).expect("verify");
     assert_eq!(
         temen_ir::module_null_guard(&m),
         Some(GUARD),
-        "marker recognized"
+        "the guard is unconditional (#1094) — no marker needed"
     );
 
     let (plain, e1) = temen_wasm_jit::compile_module_tierup(&m, false).expect("plain emits");
@@ -233,18 +208,18 @@ fn marked_module_derives_guard_on_standard_entries() {
         compile_module_tierup_nullguard(&m, false, temen_ir::POWERBOX_NULL_GUARD).expect("emits");
     assert_eq!(
         plain, explicit,
-        "marked module derives the guard on the plain entry"
+        "the plain entry derives the same guard as the explicit measurement entry"
     );
     assert_eq!(e1, e2);
     assert_eq!(
         run_emitted(&plain, 0, &[8]),
         Err(TRAP_MEMORY_FAULT),
-        "marked plain emit traps a NULL load"
+        "plain emit traps a NULL load"
     );
     assert_eq!(
         run_emitted(&plain, 0, &[GUARD as i64]),
         Ok(0),
-        "marked plain emit admits at the guard boundary"
+        "plain emit admits at the guard boundary"
     );
 }
 

@@ -15,7 +15,7 @@ const WASM = fileURLToPath(new URL('./target/wasm32-unknown-unknown/release/teme
 const PAR_DONE = 0, PAR_TRAP = 1, PAR_JIT_INVOKE = 8;
 const STACK = 1 << 16;
 const WIN = 1 << 16;
-const BLOB_OFF = 0x2000; // where the guest stages its unit blob in its window (clear of its own use)
+const BLOB_OFF = 0x6000; // where the guest stages its unit blob in its window (clear of its own use, above the #1094 NULL guard)
 
 // The unit the guest compiles at runtime: `service(a, b) = a*b + 100`. Pure i32 compute (`6*7+100=142`).
 const UNIT = `

@@ -24,7 +24,7 @@ block 0 () {
   v3 = i64.const 0
   vs1, vv1 = cont.resume v2 v3
   vs2, vv2 = cont.resume v2 v3
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vcnt = i32.const 1
   vw = atomic.notify vaddr vcnt
   vs3, vv3 = cont.resume v2 v3
@@ -49,7 +49,7 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vexp = i32.const 0
   vto = i64.const -1
   vst = i32.atomic.wait vaddr vexp vto
@@ -105,7 +105,7 @@ block 0 (v0: i32) {
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
   vh = i32.wrap_i64 varg
-  vbuf = i64.const 8
+  vbuf = i64.const 16392
   vcap = i64.const 4
   vr = call.cap 0 0 (i64, i64) -> (i64) vh (vbuf, vcap)
   return vr
@@ -137,7 +137,7 @@ const NOT_EQUAL_INSTA_WAKE: &str = r#"
 memory 16
 func () -> (i64) {
 block 0 () {
-  vaddr = i64.const 8
+  vaddr = i64.const 16392
   vfive = i64.const 5
   i64.store vaddr vfive
   vf = ref.func 1
@@ -159,7 +159,7 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 8
+  vaddr = i64.const 16392
   vexp = i32.const 0
   vto = i64.const -1
   vst = i32.atomic.wait vaddr vexp vto
@@ -198,7 +198,7 @@ block 0 () {
   v2 = cont.new v0 v1
   v3 = i64.const 0
   vs1, vv1 = cont.resume v2 v3
-  va = i64.const 8
+  va = i64.const 16392
   ve = i32.const 0
   vt = i64.const 100000000
   vw = i32.atomic.wait va ve vt
@@ -216,7 +216,7 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vexp = i32.const 0
   vto = i64.const 10000000
   vst = i32.atomic.wait vaddr vexp vto
@@ -267,7 +267,7 @@ block 2 (vr: i64) {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vexp = i32.const 0
   vto = i64.const 10000000
   vst = i32.atomic.wait vaddr vexp vto

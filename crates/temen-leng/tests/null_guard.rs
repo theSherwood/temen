@@ -1,16 +1,16 @@
-//! **#964/#1091 — the NULL guard is on for every temen-leng powerbox program.** The guarded
+//! **#964/#1094 — the NULL guard is on for every temen-leng powerbox program.** The guarded
 //! synth-`_start` link path ([`temen_leng::link_whole_powerbox_manifest`], and the `link_nim_powerbox`
-//! bridge built on it) declares the `__null_guard` marker and shifts Leng's whole low layout one guard
-//! up, so `[0, POWERBOX_NULL_GUARD)` holds *nothing* and a marker-aware host (`run_powerbox`, the DAP,
-//! the browser on-ramp) seeds it `Unmapped` — a NULL dereference then traps on every engine instead of
-//! reading zeros. This test pins the layout contract **toolchain-free** (no nimony needed), so it gates
-//! every PR, not only the `nim-e2e` job: a regression that dropped the marker or let a segment slip
-//! back into the reserved region would go red here immediately.
+//! bridge built on it) shifts Leng's whole low layout one guard up, so `[0, POWERBOX_NULL_GUARD)` holds
+//! *nothing* and a host (`run_powerbox`, the DAP, the browser on-ramp) seeds it `Unmapped`
+//! unconditionally (#1094 — the one canonical layout) — a NULL dereference then traps on every engine
+//! instead of reading zeros. This test pins the layout contract **toolchain-free** (no nimony needed),
+//! so it gates every PR, not only the `nim-e2e` job: a regression that let a segment slip back into the
+//! reserved region would go red here immediately.
 //!
 //! The end-to-end trap parity itself is the oracle's job (`temen-interp`'s `null_guard_oracle` proves a
-//! `__null_guard`-marked module traps identically on the tree-walker and the bytecode engine); real
-//! Nim allocating and running under the shifted layout is `nim_e2e`'s (toolchain-gated). Here we prove
-//! the **producer** — that Leng's linker actually emits that marker and keeps the region clear.
+//! module traps identically on the tree-walker and the bytecode engine); real Nim allocating and running
+//! under the shifted layout is `nim_e2e`'s (toolchain-gated). Here we prove the **producer** — that
+//! Leng's linker keeps the reserved region clear.
 
 use temen_leng::WholeModule;
 
@@ -36,9 +36,9 @@ const PROG: &str = "\
   (params (param :p.0 . (ptr (i 64)))) . .
   (stmts . (ret .))))";
 
-/// Linking a whole program through the guarded powerbox manifest path emits the `__null_guard` marker,
-/// leaves `[0, POWERBOX_NULL_GUARD)` completely empty, and bakes the heap bump-pointer words one guard
-/// up (in the guard's scratch page) so the compute-shim `mmap` reads them without faulting.
+/// Linking a whole program through the guarded powerbox manifest path leaves `[0, POWERBOX_NULL_GUARD)`
+/// completely empty and bakes the heap bump-pointer words one guard up (in the guard's scratch page) so
+/// the compute-shim `mmap` reads them without faulting.
 #[test]
 fn guarded_powerbox_link_marks_and_clears_the_null_region() {
     let guard = temen_ir::POWERBOX_NULL_GUARD;
@@ -52,11 +52,11 @@ fn guarded_powerbox_link_marks_and_clears_the_null_region() {
     .unwrap_or_else(|e| panic!("guarded powerbox link: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
 
-    // (1) The module declares the guard.
+    // (1) The module runs under the (unconditional, #1094) guard extent.
     assert_eq!(
         temen_ir::module_null_guard(&m),
         Some(guard),
-        "the guarded powerbox link must export the `__null_guard` marker"
+        "the powerbox link runs under the unconditional NULL guard"
     );
 
     // (2) Nothing lives in the reserved NULL region — every data segment starts at or above the guard,
@@ -96,8 +96,8 @@ fn guarded_powerbox_link_marks_and_clears_the_null_region() {
 }
 
 /// The shifted layout is internally consistent end-to-end: running the same guarded program through
-/// the **real** `run_powerbox` host — which reads the `__null_guard` marker and seeds `[0, guard)`
-/// `Unmapped` — completes cleanly. A regression that left a live store/frame in the reserved region
+/// the **real** `run_powerbox` host — which seeds `[0, guard)` `Unmapped` unconditionally (#1094) —
+/// completes cleanly. A regression that left a live store/frame in the reserved region
 /// (rather than shifting it up) would fault here instead of returning. The trap side of the guard (a
 /// deliberate NULL access faulting) is pinned generically by `temen-interp`'s `null_guard_oracle`.
 #[test]

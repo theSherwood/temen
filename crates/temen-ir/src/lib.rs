@@ -251,23 +251,30 @@ pub mod durable_abi {
     /// Window byte offset of the `i32` **freeze state** word (`NORMAL`/`UNWINDING`/`REWINDING`/
     /// `ARMED`). A freeze is stop-the-world, so this single global word is the broadcast every poll
     /// reads (per-context thaw uses [`STATE_IN_REGION_OFF`] instead).
-    pub const STATE_OFF: u64 = 0;
-    /// Window byte offset of the `i64` shadow-stack pointer (itself a window byte offset).
-    pub const SHADOW_SP_OFF: u64 = 8;
+    ///
+    /// #1094: the whole durable control region is based one [`super::POWERBOX_NULL_GUARD`] up — the
+    /// unconditional NULL guard unmaps `[0, guard)`, so the state word, shadow-SP, arm countdowns and
+    /// shadow stack live in `[guard, DURABLE_RESERVE)` (below guest memory, which stays at
+    /// `DURABLE_RESERVE`). `[0, guard)` is the reserved NULL region.
+    pub const STATE_OFF: u64 = super::POWERBOX_NULL_GUARD;
+    /// Window byte offset of the `i64` shadow-stack pointer (itself a window byte offset). One guard up
+    /// (#1094 — see [`STATE_OFF`]).
+    pub const SHADOW_SP_OFF: u64 = super::POWERBOX_NULL_GUARD + 8;
     /// Byte length of the in-region shadow-SP word (before the per-context thaw state word).
     pub const SHADOW_SP_WORD_LEN: u64 = 8;
     /// Window byte offset of the `i64` **fiber-safepoint arm countdown** — safepoints
     /// (`cont.resume`/`suspend`) still to pass before an `ARMED` run promotes to `UNWINDING`. Inert
-    /// unless armed; lives in the reserve's `[16, 64)` gap, so an unarmed run is byte-identical.
-    pub const ARM_COUNTDOWN_OFF: u64 = 16;
+    /// unless armed; lives in the reserve's `[guard+16, guard+64)` gap, so an unarmed run is
+    /// byte-identical.
+    pub const ARM_COUNTDOWN_OFF: u64 = super::POWERBOX_NULL_GUARD + 16;
     /// Window byte offset of the `i64` **back-edge arm countdown** — loop back-edges still to pass
     /// before an `ARMED` run promotes to `UNWINDING` (the Phase-4 Slice A back-edge-poll trigger,
-    /// separate from [`ARM_COUNTDOWN_OFF`]). Reserve's `[24, 64)` gap.
-    pub const ARM_BACKEDGE_OFF: u64 = 24;
+    /// separate from [`ARM_COUNTDOWN_OFF`]). Reserve's `[guard+24, guard+64)` gap.
+    pub const ARM_BACKEDGE_OFF: u64 = super::POWERBOX_NULL_GUARD + 24;
     /// Window byte offset of the `i8` **freeze-on-quiesce** flag: non-zero arms the runtime to freeze
     /// when the run would otherwise block only on `svc.wait`-parked consumers (an idle server no
-    /// countdown can reach). Reserve's `[32, 64)` gap.
-    pub const ARM_QUIESCE_OFF: u64 = 32;
+    /// countdown can reach). Reserve's `[guard+32, guard+64)` gap.
+    pub const ARM_QUIESCE_OFF: u64 = super::POWERBOX_NULL_GUARD + 32;
     /// §12.8 concurrent-thaw: byte offset of a context's **per-context thaw state** word
     /// (`REWINDING`/`NORMAL`) within its region — just past the [`SHADOW_SP_WORD_LEN`]-byte in-region
     /// SP word. Each frozen vCPU rewinds against its own word, so thaw can run them as concurrent
@@ -277,11 +284,13 @@ pub mod durable_abi {
     /// the thaw state word at [`STATE_IN_REGION_OFF`], padded to 8 to keep frames 8-aligned.
     pub const REGION_HEADER_LEN: u64 = 16;
     /// Window byte offset where the shadow stack begins (grows upward, bounded by [`DURABLE_RESERVE`]).
-    pub const SHADOW_BASE: u64 = 64;
+    /// One guard up (#1094 — see [`STATE_OFF`]); the shadow stack occupies `[guard+64, DURABLE_RESERVE)`.
+    pub const SHADOW_BASE: u64 = super::POWERBOX_NULL_GUARD + 64;
     /// Per-context shadow-region stride: context `i` owns `[SHADOW_BASE + i*SHADOW_STRIDE, +stride)`.
     pub const SHADOW_STRIDE: u64 = 1 << 12;
-    /// Size of the reserved low region (one 64 KiB wasm page): `[0, DURABLE_RESERVE)` holds the state
-    /// word, shadow-SP, and shadow stack; the guest's memory is `[DURABLE_RESERVE, window)`.
+    /// Size of the reserved low region (one 64 KiB wasm page): `[0, DURABLE_RESERVE)` holds the NULL
+    /// guard `[0, POWERBOX_NULL_GUARD)` (#1094) then the state word, shadow-SP, and shadow stack in
+    /// `[POWERBOX_NULL_GUARD, DURABLE_RESERVE)`; the guest's memory is `[DURABLE_RESERVE, window)`.
     pub const DURABLE_RESERVE: u64 = 1 << 16;
 
     /// Freeze/thaw **state-word values** ([`STATE_OFF`] / [`STATE_IN_REGION_OFF`]).
@@ -3356,33 +3365,27 @@ pub fn write_args_blob(args: &[&[u8]], env: &[&[u8]]) -> Vec<u8> {
 /// by exactly one guard — and its globals/stack base sits at or above `2 * POWERBOX_NULL_GUARD`.
 pub const POWERBOX_NULL_GUARD: u64 = 16384;
 
-/// The **guard marker**: a function export with this name (aliasing `_start`'s funcidx) declares
-/// that the module was built with the guarded layout — its low scratch lives above
-/// [`POWERBOX_NULL_GUARD`], so a host may seed `[0, POWERBOX_NULL_GUARD)` unmapped and must place
-/// the args blob at the shifted base. A module **without** the marker uses the legacy layout
-/// (scratch from 0, args at [`POWERBOX_ARGS_BASE`]) and is never guarded — old artifacts keep
-/// running unchanged. The marker is **semantics, not observability**: hosts resolve it, so it is
-/// never stripped/demoted (`temen-strip` keeps it like `_start`).
-pub const NULL_GUARD_EXPORT: &str = "__null_guard";
-
-/// The NULL-guard extent of `m`, from its [`NULL_GUARD_EXPORT`] marker: `Some(POWERBOX_NULL_GUARD)`
-/// for a guard-marked module (seed `[0, guard)` unmapped; args at `guard + POWERBOX_ARGS_BASE`),
-/// `None` for a legacy module (no guard; args at [`POWERBOX_ARGS_BASE`]).
-pub fn module_null_guard(m: &Module) -> Option<u64> {
-    m.resolve_export(NULL_GUARD_EXPORT)
-        .map(|_| POWERBOX_NULL_GUARD)
+/// The NULL-guard extent of `m`: always `Some(POWERBOX_NULL_GUARD)` (#1094). The guard is
+/// **unconditional** now — every module reserves `[0, POWERBOX_NULL_GUARD)` so a NULL dereference
+/// traps on every one, the one canonical layout (INVARIANTS #13). (A host still no-ops the seed for a
+/// window smaller than the guard — see `Mem::seed_null_guard` — so tiny sub-windows are unaffected.)
+/// This is the single chokepoint every tier reads the extent from; `_m` is unused (the retired
+/// `__null_guard` marker export it once resolved is gone — #1094), and the `Option` return is kept
+/// only so the many `…unwrap_or(0)` call sites and the wasm-JIT's `Option<u64>` plumbing stay stable.
+pub fn module_null_guard(_m: &Module) -> Option<u64> {
+    Some(POWERBOX_NULL_GUARD)
 }
 
-/// Where a host seeds the args blob for `m` (and where its `_start` reads it): the guarded base for
-/// a [`NULL_GUARD_EXPORT`]-marked module, the legacy [`POWERBOX_ARGS_BASE`] otherwise.
-pub fn module_args_base(m: &Module) -> u64 {
-    module_null_guard(m).map_or(POWERBOX_ARGS_BASE, |g| g + POWERBOX_ARGS_BASE)
+/// Where a host seeds the args blob for `m` (and where its `_start` reads it): the guarded base,
+/// `POWERBOX_NULL_GUARD + POWERBOX_ARGS_BASE`, unconditionally (#1094).
+pub fn module_args_base(_m: &Module) -> u64 {
+    POWERBOX_NULL_GUARD + POWERBOX_ARGS_BASE
 }
 
-/// The exclusive end of `m`'s args region — the bound a host must reject a blob at (the guarded
-/// layout's region is the legacy one shifted up by the guard, same span).
-pub fn module_args_end(m: &Module) -> u64 {
-    module_null_guard(m).map_or(POWERBOX_ARGS_END, |g| g + POWERBOX_ARGS_END)
+/// The exclusive end of `m`'s args region — the bound a host must reject a blob at: the guarded
+/// `POWERBOX_NULL_GUARD + POWERBOX_ARGS_END`, unconditionally (#1094).
+pub fn module_args_end(_m: &Module) -> u64 {
+    POWERBOX_NULL_GUARD + POWERBOX_ARGS_END
 }
 /// The alignment of the powerbox **data-stack base** ([`powerbox_entry_sp`]). It must be **≥ the
 /// largest host page any artifact may run on** — 64 KiB (the wasm linear-memory page) — because the
@@ -3546,8 +3549,11 @@ pub fn synth_manifest_start(
     let mut insts: Vec<Inst> = Vec::new();
     let mut next: ValIdx = 0;
     if let Some(hb) = heap_base {
+        // #1094: the heap bump words live in the guard's scratch page at `guard + BRK`/`TOP`
+        // (the whole page-0 scratch relocated up one NULL guard, as temen-leng/-dap/-llvm read it),
+        // so seed them there — a raw `[32, 40]` store would fault in the unmapped `[0, guard)`.
         for off in [POWERBOX_HEAP_BRK, POWERBOX_HEAP_TOP] {
-            insts.push(Inst::ConstI64(off as i64));
+            insts.push(Inst::ConstI64((POWERBOX_NULL_GUARD + off) as i64));
             let addr = next;
             next += 1;
             insts.push(Inst::ConstI64(hb as i64));
