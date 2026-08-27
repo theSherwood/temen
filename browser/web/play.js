@@ -840,6 +840,7 @@ int main(void) {
     kind: 'module',
     url: './assets/nim_hello.temen',
     mode: 'io',
+    stream: true, // stdout streams live off the main thread (temen_run_onramp_stream)
     desc: "A **real Nim program** — `import std/syncio` / `write(stdout, \"hello, temen\\n\")` — compiled " +
       "all the way to a runnable Temen module and **run client-side in the sandbox**. The full nimony " +
       "toolchain (nifler → nimony → hexer) lowered the Nim to Leng, `temen-leng` translated + linked it " +
@@ -1912,6 +1913,25 @@ async function runModule(c) {
       logTo(c, 'warm-snapshot unavailable for this module; falling back to the interpreter');
       const r = moduleInterp(bytes, stdinBytes);
       rv = r.rv; status = r.status; stdout = r.stdout;
+    }
+  }
+  // Streamed interpreter run (opt-in `stream` cards, e.g. the nim/C stdout guests): run off the main
+  // thread and paint each stdout chunk as the guest writes it, instead of one dump at the end. Falls
+  // back to the synchronous main-thread `moduleInterp` if the worker is unavailable.
+  if (status === undefined && ex.stream && snapshotClient && !useJit) {
+    try {
+      c.el.stdout.textContent = '';
+      const dec = new TextDecoder();
+      const r = await snapshotClient.runStream(bytes, stdinBytes, (chunk) => {
+        c.el.stdout.textContent += dec.decode(chunk, { stream: true });
+      });
+      if (r.ok) {
+        rv = r.value; status = r.status; stdout = r.stdout; tier = 'interpreter (streamed)';
+      } else {
+        logTo(c, `stream worker: ${r.error}; falling back to the main thread`);
+      }
+    } catch (e) {
+      logTo(c, `stream worker unavailable (${e.message}); falling back to the main thread`);
     }
   }
   if (status === undefined) {

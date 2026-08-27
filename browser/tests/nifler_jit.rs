@@ -194,7 +194,11 @@ fn jit_parse(nifler: &temen_ir::Module, src: &str) -> Vec<u8> {
     // `exit` recorded is a real fault.
     if let Err(e) = &call {
         if !run.exited() {
-            panic!("emitted f0 trapped (not an exit): {} ({})", e, run.last_trap());
+            panic!(
+                "emitted f0 trapped (not an exit): {} ({})",
+                e,
+                run.last_trap()
+            );
         }
     }
     run.output()

@@ -2849,6 +2849,18 @@ pub extern "C" fn temen_onramp_set_grant_instantiator(on: i32) {
 /// shape is fail-closed (`STATUS_UNSUPPORTED`). The `fs` capability (SQLite Phase B, Lua
 /// `files.lua`) is a `host_proc` resolved by name — a Stage-1 follow-on, not part of this prefix.
 pub fn onramp_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
+    onramp_exec_with_tee(m, stdin, None)
+}
+
+/// [`onramp_exec`] with an optional **live stdout tee** ([`Host::set_stdout_tee`]): `tee` is called with
+/// each stdout chunk as the guest produces it (the browser playground relays it to the page for live
+/// streaming). The captured `stdout` in the returned [`PbOutcome`] is unchanged — the tee is additive —
+/// so callers that read the final bytes (and the interp≡JIT differential) are unaffected.
+pub fn onramp_exec_with_tee(
+    m: &temen_ir::Module,
+    stdin: &[u8],
+    tee: Option<temen_interp::StdoutTee>,
+) -> PbOutcome {
     let unsupported = || PbOutcome {
         status: STATUS_UNSUPPORTED,
         value: 0,
@@ -2861,6 +2873,9 @@ pub fn onramp_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
         return unsupported();
     }
     let mut host = Host::new();
+    if let Some(t) = tee {
+        host.set_stdout_tee(t);
+    }
     host.stdin = stdin.to_vec();
     // Grant the powerbox prefix + the `display`/`keyboard` graphical caps (shared with the reactor). A
     // single-shot run drains no keys, and `frame` captures the last frame the guest presented (if any).
@@ -5602,6 +5617,76 @@ pub extern "C" fn temen_run_onramp(
         }
     };
     let out = onramp_exec(&m, stdin);
+    set(out.status);
+    let (fb_rgba, fb_w, fb_h) = match out.framebuffer {
+        Some(f) => (f.rgba, f.width, f.height),
+        None => (Vec::new(), 0, 0),
+    };
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
+        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
+        stash(&mut *core::ptr::addr_of_mut!(FB), fb_rgba);
+        FB_W = fb_w;
+        FB_H = fb_h;
+        EXIT_CODE = out.exit_code;
+    }
+    out.value
+}
+
+/// The **live host import** for streamed stdout: the page's `temen_host.stdout_chunk` — called once per
+/// stdout write with the chunk's `[ptr, ptr+len)` in linear memory, so the page appends it to the card's
+/// output pane as the guest produces it. Wasm-only (like `webgpu_op`); native builds have no such import
+/// and the streaming FFI degrades to plain capture.
+#[cfg(target_arch = "wasm32")]
+#[link(wasm_import_module = "temen_host")]
+extern "C" {
+    fn stdout_chunk(ptr: *const u8, len: usize);
+}
+
+/// The tee handed to [`onramp_exec_with_tee`] on the streaming path: relay each chunk to the host import
+/// (wasm), or no-op (native — the FFI is never called there, but the closure must type-check).
+fn stream_tee() -> Option<temen_interp::StdoutTee> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        Some(Box::new(|b: &[u8]| unsafe {
+            stdout_chunk(b.as_ptr(), b.len())
+        }))
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        None
+    }
+}
+
+/// **Streaming twin of [`temen_run_onramp`]**: identical (decode → `onramp_exec` → stash the captured
+/// streams + exit + value into the read-back slots), except stdout is **teed live** to the page's
+/// `temen_host.stdout_chunk` import as the guest writes it. The final captured `stdout` is still stashed
+/// into `OUT` (so `temen_stdout_ptr`/`_len` return the whole output too, and a non-streaming caller sees
+/// no change). The host provides the import; on a Worker it relays each chunk to the page mid-run.
+#[no_mangle]
+pub extern "C" fn temen_run_onramp_stream(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees both ranges are live `temen_alloc`ations it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let stdin: &[u8] = if stdin_ptr.is_null() || stdin_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }
+    };
+    let m = match temen_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    let out = onramp_exec_with_tee(&m, stdin, stream_tee());
     set(out.status);
     let (fb_rgba, fb_w, fb_h) = match out.framebuffer {
         Some(f) => (f.rgba, f.width, f.height),

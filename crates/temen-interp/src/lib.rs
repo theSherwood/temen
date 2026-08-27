@@ -16658,6 +16658,11 @@ pub enum OffloadOutcome {
 /// thread — the ring's own discipline, kept as the registration contract).
 pub type OffloadHostProc = Box<dyn FnMut(u32, &[i64]) -> OffloadOutcome + Send>;
 
+/// A **live stdout tee** ([`Host::set_stdout_tee`]): called with each `Stream(Out)` write's bytes as the
+/// guest produces them, additively to the normal buffering. The browser playground streams output to the
+/// page through it.
+pub type StdoutTee = Box<dyn FnMut(&[u8]) + Send>;
+
 /// The two handler shapes one [`HostProcEntry`] can carry — the *registration* decides
 /// (CONSOLIDATION §7 per-entry powers, extended by §12 parking): `Sync` is today's full-powered
 /// synchronous closure; `Offloadable` declares blockingness and trades window/minter access for
@@ -17316,6 +17321,13 @@ pub struct Host {
     /// [`Host::shared_stdout`]/[`Host::shared_stderr`]; read the effective bytes via [`Host::stdout_bytes`].
     out_sink: Option<Arc<Mutex<Vec<u8>>>>,
     err_sink: Option<Arc<Mutex<Vec<u8>>>>,
+    /// Optional **live tee** on stdout: when set, every `Stream(Out)` write is handed to this callback
+    /// *in addition to* the normal buffering (the local `stdout` Vec / shared sink are untouched, so
+    /// captured-at-end readers and the interp≡JIT stdout differential are unaffected). The browser
+    /// playground sets it to relay each chunk to the page as the guest produces it (live streaming);
+    /// every other host leaves it `None` (zero cost — one `Option` check per write). Not carried into
+    /// forked/twin child hosts (a child's output routes through its own powerbox / shared sink).
+    out_tee: Option<StdoutTee>,
     /// §7c sink backings carried by re-granted stdout/stderr streams, indexed by the id a
     /// [`Binding::Stream`] `sink` holds — each entry aliases the granting parent's shared sink.
     sinks: Vec<Arc<Mutex<Vec<u8>>>>,
@@ -17891,6 +17903,7 @@ impl Host {
             stderr: Vec::new(),
             out_sink: None,
             err_sink: None,
+            out_tee: None,
             sinks: Vec::new(),
             clock_ns: 0,
             regions: Vec::new(),
@@ -19505,6 +19518,13 @@ impl Host {
             self.out_sink = Some(Arc::new(Mutex::new(taken)));
         }
         Arc::clone(self.out_sink.as_ref().unwrap())
+    }
+
+    /// Install a **live stdout tee** (see [`Host::out_tee`]): `tee` is called with each `Stream(Out)`
+    /// write's bytes as the guest produces them, *in addition to* the normal buffering. The browser
+    /// playground uses it to stream output to the page mid-run; it does not affect the captured bytes.
+    pub fn set_stdout_tee(&mut self, tee: StdoutTee) {
+        self.out_tee = Some(tee);
     }
 
     /// S2 — the stderr analogue of [`Host::shared_stdout`].
@@ -22857,6 +22877,14 @@ impl Host {
                 // §7c: a re-granted stdout/stderr carries its shared sink in the table entry (so a
                 // child's output reaches the embedder that granted it); a host's own stream routes
                 // to its promoted sink if a child shares it, else the local buffer.
+                // Live tee (browser playground streaming): hand each stdout chunk to the callback as it
+                // is produced, *before* the normal buffering below — a tee, not a replacement, so the
+                // captured-at-end bytes are identical.
+                if role == StreamRole::Out {
+                    if let Some(tee) = self.out_tee.as_mut() {
+                        tee(&bytes);
+                    }
+                }
                 if let Some(i) = sink {
                     let Some(s) = self.sinks.get(i as usize) else {
                         return ret(EINVAL);

@@ -18,7 +18,7 @@ export class SnapshotClient {
     let w = this._workers.get(url);
     if (w) return w;
     const worker = new Worker(new URL('./snapshot-worker.js', import.meta.url), { type: 'module' });
-    w = { worker, seq: 0, pending: new Map(), prewarm: null };
+    w = { worker, seq: 0, pending: new Map(), chunks: new Map(), prewarm: null };
     w.ready = new Promise((resolve, reject) => {
       w._resolveReady = resolve;
       w._rejectReady = reject;
@@ -29,7 +29,14 @@ export class SnapshotClient {
         w._resolveReady();
         return;
       }
+      if (m.type === 'stdout-chunk') {
+        // A live stdout chunk from a streaming Run — hand it to that request's sink as it arrives.
+        const onChunk = w.chunks.get(m.id);
+        if (onChunk) onChunk(m.bytes);
+        return;
+      }
       if (m.type === 'reply') {
+        w.chunks.delete(m.id);
         const resolve = w.pending.get(m.id);
         if (resolve) {
           w.pending.delete(m.id);
@@ -89,6 +96,27 @@ export class SnapshotClient {
   // The reserved worker key for the nim full-compile card (its own engine instance, separate from any
   // warm-card worker). A non-URL sentinel so it never collides with a warm module URL.
   static NIMC_KEY = '__nimc__';
+
+  // The reserved worker for **streamed plain-module Runs** (nim/C on-ramp guests): off the main thread so
+  // the page paints each stdout chunk as the guest writes it (the worker's synchronous run still delivers
+  // its `postMessage`s to the main thread's event loop). One shared worker — module Runs are independent
+  // and short — keyed by a non-URL sentinel.
+  static STREAM_KEY = '__stream__';
+
+  // Run a plain on-ramp module off the main thread with **live stdout**: `onChunk(Uint8Array)` fires for
+  // each write as it happens; resolves `{ ok, status, value, stdout, stderr }` (the full captured output),
+  // or `{ ok:false, error }` (the caller then falls back to the synchronous main-thread path). `stdin` is
+  // an optional `Uint8Array`.
+  async runStream(bytes, stdin, onChunk) {
+    const w = this._workerFor(SnapshotClient.STREAM_KEY);
+    await w.ready;
+    const id = ++w.seq;
+    if (onChunk) w.chunks.set(id, onChunk);
+    return new Promise((resolve) => {
+      w.pending.set(id, resolve);
+      w.worker.postMessage({ type: 'runStream', id, bytes, stdin: stdin || null });
+    });
+  }
 
   // Compile a whole Nim program off the main thread. `getAssets()` resolves the four phase buffers
   // `{ nifler, nimsem, hexer, stdlib }` (fetched + inflated by the caller); they're posted to the nim

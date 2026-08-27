@@ -27,6 +27,9 @@ let interpWarmPromise = null;
 // The nimony phase guests + stdlib image, cached here after the first `nimAssets` message so each
 // `nimCompile` Run re-uses them instead of re-posting ~28 MB across the worker boundary every time.
 let nimAssets = null;
+// Active only during a streaming Run (`runStream`/`nimCompile`): a fn that relays one stdout chunk to
+// the main thread. `null` at rest so the `stdout_chunk` import is a no-op for warm/prime dry runs.
+let chunkSink = null;
 
 const u8 = () => new Uint8Array(memory.buffer);
 // Read a captured stream out of the worker's memory. `.slice` copies to a non-shared buffer (TextDecoder
@@ -93,7 +96,15 @@ self.onmessage = async (e) => {
       memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
       ({ exports: ex } = await WebAssembly.instantiate(msg.module, {
         env: { memory },
-        temen_host: { webgpu_op: () => -1n },
+        temen_host: {
+          webgpu_op: () => -1n,
+          // The live-stdout tee (`temen_run_onramp_stream`): while a streaming Run is active, `chunkSink`
+          // relays each write to the main thread; the worker's run stays synchronous, so the main thread
+          // paints the chunks as they arrive (a Worker's postMessage delivers even while it computes).
+          stdout_chunk: (ptr, len) => {
+            if (chunkSink) chunkSink(new Uint8Array(memory.buffer, Number(ptr), Number(len)).slice());
+          },
+        },
       }));
       self.postMessage({ type: 'ready' });
       return;
@@ -131,6 +142,31 @@ self.onmessage = async (e) => {
       else if (interpWarmPromise) { try { await interpWarmPromise; } catch { /* dry eval failed → just run */ } }
       const r = await evalWarm(msg.source, msg.jit);
       self.postMessage({ type: 'reply', id: msg.id, ok: true, ...r });
+      return;
+    }
+    if (msg.type === 'runStream') {
+      // Run a plain on-ramp module (nim/C guest) off the main thread with **live stdout**: the tee
+      // (`temen_run_onramp_stream`) posts each write to the page as the guest produces it, so a long or
+      // chatty program's output appears progressively instead of in one dump at the end. The final
+      // captured stdout is returned too (the page overwrites with it for an exact end state).
+      const mod = msg.bytes;
+      const stdin = msg.stdin && msg.stdin.length ? msg.stdin : null;
+      const mp = Number(ex.temen_alloc(mod.length));
+      const sp = stdin ? Number(ex.temen_alloc(stdin.length)) : 0;
+      const view = u8();
+      view.set(mod, mp);
+      if (sp) view.set(stdin, sp);
+      chunkSink = (bytes) => self.postMessage({ type: 'stdout-chunk', id: msg.id, bytes }, [bytes.buffer]);
+      try {
+        ex.temen_run_onramp_stream(mp, mod.length, sp, stdin ? stdin.length : 0);
+      } finally {
+        chunkSink = null;
+      }
+      const status = ex.temen_status();
+      const value = Number(ex.temen_run_value());
+      ex.temen_dealloc(mp, mod.length);
+      if (sp) ex.temen_dealloc(sp, stdin.length);
+      self.postMessage({ type: 'reply', id: msg.id, ok: true, status, value, stdout: readStdout(), stderr: readStderr() });
       return;
     }
     if (msg.type === 'nimAssets') {
