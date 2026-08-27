@@ -26,28 +26,38 @@ use temen_interp::{bytecode, Host, Value};
 
 const FUEL: u64 = 10_000_000;
 
+/// Window-relative offset the leaf writes its marker to. It must be **above the #1094 unconditional
+/// NULL guard** (`[0, POWERBOX_NULL_GUARD)` = `[0, 16 KiB)` faults on any guest access) yet still
+/// inside the child's carve — so the same offset is valid in both the root window and the carve.
+/// That forces the carve to exceed the guard: a sub-16-KiB carve would have no writable byte the
+/// root's guarded window also admits. `16384` is the first writable byte above the guard.
+const MARKER_OFF: u64 = 16384;
+/// The child's carve: 32 KiB (`> POWERBOX_NULL_GUARD`) at 64 KiB in the 128 KiB root window.
+const CARVE_OFF: u64 = 65536;
+const CARVE_LOG2: u32 = 15;
+
 /// The guest. f0 (root; arg = its granted `Instantiator` handle): §14-instantiates a same-module
-/// confined child at f1 (4 KiB carve at 64 KiB), joins it, calls the eligible leaf f2 itself with
-/// 3, reads back both leaf markers — its own at `[8]` and the child's at `[65536 + 8]` (the carve
-/// interior, visible through the parent window) — and sums. f1 (child entry): calls the leaf with
-/// 5. f2 (the pure all-i64 leaf): `f(x) = x*3 + 7`, storing its result at window-relative `[8]` —
-/// the store that must land in each CALLER's own window (root vs carve), the routing pin.
-/// Total: child f(5)=22 + local f(3)=16 + root marker 16 + child marker 22 = 76.
+/// confined child at f1 (32 KiB carve at 64 KiB), joins it, calls the eligible leaf f2 itself with
+/// 3, reads back both leaf markers — its own at `[MARKER_OFF]` and the child's at
+/// `[CARVE_OFF + MARKER_OFF]` (the carve interior, visible through the parent window) — and sums.
+/// f1 (child entry): calls the leaf with 5. f2 (the leaf `f(x) = x*3 + 7`): stores its result at
+/// window-relative `[MARKER_OFF]` — the store that must land in each CALLER's own window (root vs
+/// carve), the routing pin. Total: child f(5)=22 + local f(3)=16 + root marker 16 + child marker 22 = 76.
 const SRC: &str = r#"
 memory 17
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   ve = i64.const 1
   voff = i64.const 65536
-  vsl = i64.const 12
+  vsl = i64.const 15
   vq = i64.const 0
   vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (ve, voff, vsl, vq)
   vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
   v3 = i64.const 3
   vlocal = call 2 (v3)
-  vma = i64.const 8
+  vma = i64.const 16384
   vm0 = i64.load vma
-  vca = i64.const 65544
+  vca = i64.const 81920
   vm1 = i64.load vca
   vs1 = i64.add vj vlocal
   vs2 = i64.add vs1 vm0
@@ -68,7 +78,7 @@ block 0 (vx: i64) {
   vm = i64.mul vx v3
   v7 = i64.const 7
   va = i64.add vm v7
-  vaddr = i64.const 8
+  vaddr = i64.const 16384
   i64.store vaddr va
   return va
   }
@@ -93,11 +103,11 @@ fn service_tierup(v: *mut temen_browser::ParVcpu, win: *mut u8, len: u64) {
     assert_eq!(argv.len(), 1);
     let r = argv[0] * 3 + 7;
     // The emitted leaf's store, emulated over the serving window: the marker at window-relative
-    // `[8]` — the write that must land in each caller's OWN window (root vs carve).
+    // `[MARKER_OFF]` — the write that must land in each caller's OWN window (root vs carve).
     // SAFETY: the paused vCPU is parked; `[win, win+len)` is exclusively ours until deliver, and
-    // the offset is within the (>= 4 KiB) window.
+    // `MARKER_OFF + 8 <= len` (the guard-clearing offset fits both the root window and the carve).
     unsafe {
-        std::ptr::copy_nonoverlapping(r.to_le_bytes().as_ptr(), win.add(8), 8);
+        std::ptr::copy_nonoverlapping(r.to_le_bytes().as_ptr(), win.add(MARKER_OFF as usize), 8);
     }
     temen_par_deliver_tierup(v, [r].as_ptr(), 1);
 }
@@ -121,6 +131,7 @@ fn par_confined_child_tiers_up_over_its_own_carve() {
                 Some(Value::I64(x)) => *x,
                 other => panic!("non-i64 oracle result {other:?}"),
             },
+            bytecode::CoopEvent::Trapped(t) => panic!("oracle trapped: {t:?}"),
             other => panic!(
                 "oracle did not run to completion: {:?}",
                 core::mem::discriminant(&other)
@@ -167,7 +178,11 @@ fn par_confined_child_tiers_up_over_its_own_carve() {
                 assert_eq!((smod, entry), (0, 1), "same-module child at f1");
                 let carve = temen_par_ev_b(root) as usize;
                 let slog = temen_par_ev_c(root) as u32;
-                assert_eq!((carve, slog), (65536, 12), "4 KiB carve at 64 KiB");
+                assert_eq!(
+                    (carve as u64, slog),
+                    (CARVE_OFF, CARVE_LOG2),
+                    "32 KiB carve at 64 KiB"
+                );
                 let cfuel = temen_par_ev_d(root);
                 // SAFETY: the engine validated the carve lies inside the root window before
                 // surfacing the event (worker.js relies on the same contract).
