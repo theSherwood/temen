@@ -13575,6 +13575,14 @@ struct Vm {
     /// domain's registered `self_module`, so serving from any *other* unit (an installed §22 unit
     /// running in the root domain) would index the wrong program table — fail closed instead.
     home: usize,
+    /// #1146 async signal delivery — the guard stack, the bytecode twin of the tree-walker's
+    /// `Vm::sig_handler_stack` (lib.rs). Each entry records `self.stack.len()` at the point an async
+    /// signal handler activation was injected (a `(i64 sp, i32 signum) -> ()` window opened like a
+    /// `call.dyn` at a per-op safepoint); `Op::Ret` pops the matching entry and calls
+    /// `handler_returned()` to restore the block-during-handler mask, and a `longjmp` OUT of a handler
+    /// (bash's `throw_to_top_level`) pops every crossed entry the same way. Bounded to
+    /// `MAX_SIG_HANDLER_NEST` nested deliveries. Empty on any run without a signal personality.
+    sig_handler_stack: Vec<usize>,
 }
 
 impl Vm {
@@ -13603,6 +13611,7 @@ impl Vm {
             serve_count: 0,
             tls: 0, // §12 per-vCPU TLS seed: dense vCPU id (root = 0; a spawned thread re-seeds to its id)
             home: 0,
+            sig_handler_stack: Vec::new(), // #1146 — no delivery in flight at entry
         })
     }
 
@@ -13673,6 +13682,12 @@ impl Vm {
         }
         let mut c: std::sync::Arc<Compiled> = resolve!(module);
 
+        // #1146 async signal delivery (the bytecode twin of the tree-walker's #796 L2 safepoint
+        // redirect). Fetch the personality's `(armed, source)` poll pair once per resume — two cheap
+        // `Arc` clones per quantum, not per op. `None` on any run without a signal personality (JIT
+        // bench, pure compute), so the per-op check in the loop is a single predictable branch there.
+        let signal_poll = host.with(|h| h.signal_poll());
+
         macro_rules! r {
             ($i:expr) => {
                 self.regs[base + $i as usize]
@@ -13727,6 +13742,62 @@ impl Vm {
                 return Ok(Outcome::Suspended);
             }
             budget -= 1;
+            // #1146 async signal delivery: at this per-op safepoint, if the personality has a caught,
+            // unmasked signal pending (its cheap `armed` flag) and we are not already
+            // `MAX_SIG_HANDLER_NEST` deep, redirect this vCPU into the guest handler
+            // `(i64 sp, i32 signum) -> ()` — a window opened exactly like a `call.dyn`, resolved and
+            // type-checked through the dispatch table. The interrupted op is NOT advanced (the return
+            // entry resumes at `pc`, re-running it once the handler returns), matching the tree-walker.
+            // Same interrupt-at-safepoint shape as `kill`, but non-lethal. (Interruptible-park `-EINTR`
+            // is a follow-up: no interruptible parks reach this synchronous safepoint path yet.)
+            if self.sig_handler_stack.len() < super::MAX_SIG_HANDLER_NEST {
+                if let Some((armed, source)) = &signal_poll {
+                    if armed.load(std::sync::atomic::Ordering::Relaxed) {
+                        // The source owns its own locking (an `Arc<Mutex<Proc>>`); we hold no host lock
+                        // here. A `None` means nothing deliverable (ignored/masked/stopped) — it also
+                        // disarms, so the check idles until the next `raise`/`kill`.
+                        if let Some((fref, signum, sp)) = source.take_deliverable() {
+                            let slot = (fref as u32 as usize) & (table.len() - 1);
+                            let ts = table.slot(slot);
+                            if ts.module != super::TABLE_EMPTY {
+                                let (tmod, tfunc) = (ts.module as usize, ts.func as usize);
+                                let tm = resolve!(tmod);
+                                let (cp, cr) = &tm.sigs[tfunc];
+                                // `void handler(int)` = `(i64 sp, i32 signum) -> ()` — chibicc threads
+                                // the data-SP as v0. A mis-typed handler is dropped (the signal was
+                                // already consumed by `take_deliverable`), never fatal.
+                                if matches!(cp.as_slice(), [ValType::I64, ValType::I32])
+                                    && cr.is_empty()
+                                {
+                                    // Open a fresh window past the current activation (like `Op::Call`),
+                                    // seeded with `(sp, signum)`. `nb`/`need` use the *current* `c`
+                                    // before any cross-module reassignment below.
+                                    let nb = base + c.progs[cur].nslots as usize;
+                                    let need = nb + tm.progs[tfunc].nslots as usize;
+                                    if self.regs.len() < need {
+                                        self.regs.resize(need, Reg::default());
+                                    }
+                                    self.regs[nb] = Reg::from_i64(sp as i64);
+                                    self.regs[nb + 1] = Reg::from_i32(signum);
+                                    // Return linkage resumes at the SAME `pc` so the interrupted op
+                                    // re-runs; the void handler writes no results (`ret_abs` unused —
+                                    // `base` is a harmless placeholder).
+                                    self.stack.push((module, cur, base, pc, base));
+                                    if tmod != module {
+                                        module = tmod;
+                                        c = tm;
+                                    }
+                                    cur = tfunc;
+                                    base = nb;
+                                    pc = 0;
+                                    self.sig_handler_stack.push(self.stack.len());
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             match &c.progs[cur].ops[pc] {
                 Op::Const { dst, val } => {
                     r!(*dst) = *val;
@@ -14034,6 +14105,23 @@ impl Vm {
                         return Err(Trap::Malformed); // the setjmp activation already returned
                     }
                     self.stack.truncate(point.depth);
+                    // #1146 — a longjmp OUT of an injected signal handler leaves it exactly like a
+                    // return: pop each crossed guard and fire `handler_returned()` so the personality
+                    // restores its block-during-handler mask and a LATER instance of the signal can
+                    // deliver (bash's `throw_to_top_level` siglongjmps out of `sigint_sighandler` —
+                    // without this, one ^C would silence the signal for the session). Guards record the
+                    // post-push stack depth, so `g > self.stack.len()` after the truncate is exactly the
+                    // crossed handlers; a longjmp WITHIN a handler crosses none and is untouched.
+                    while self
+                        .sig_handler_stack
+                        .last()
+                        .is_some_and(|&g| g > self.stack.len())
+                    {
+                        self.sig_handler_stack.pop();
+                        if let Some((_, source)) = &signal_poll {
+                            source.handler_returned();
+                        }
+                    }
                     module = point.module;
                     cur = point.cur;
                     base = point.base;
@@ -14148,29 +14236,43 @@ impl Vm {
                     base = nb;
                     pc = 0;
                 }
-                Op::Ret { srcs } => match self.stack.pop() {
-                    None => {
-                        let tys = &c.result_types[cur];
-                        return Ok(Outcome::Done(
-                            srcs.iter()
-                                .zip(tys)
-                                .map(|(s, ty)| self.regs[base + *s as usize].to_value(*ty))
-                                .collect(),
-                        ));
-                    }
-                    Some((cmod, cprog, cbase, cpc, ret_abs)) => {
-                        for (i, s) in srcs.iter().enumerate() {
-                            self.regs[ret_abs + i] = self.regs[base + *s as usize];
+                Op::Ret { srcs } => {
+                    // #1146 — if this returns from an injected async signal handler (its guard entry
+                    // records the stack depth at injection, which equals the current depth when the
+                    // handler's own `Ret` fires), restore the personality's block-during-handler mask
+                    // before unwinding, exactly as the tree-walker does on the handler's `Return`. A
+                    // held fatal signal exposed by the unmask fires its default action inside
+                    // `handler_returned` (a no-op here unless the driver wired `set_kill`).
+                    if self.sig_handler_stack.last() == Some(&self.stack.len()) {
+                        self.sig_handler_stack.pop();
+                        if let Some((_, source)) = &signal_poll {
+                            source.handler_returned();
                         }
-                        if cmod != module {
-                            module = cmod;
-                            c = resolve!(cmod);
-                        }
-                        cur = cprog;
-                        base = cbase;
-                        pc = cpc;
                     }
-                },
+                    match self.stack.pop() {
+                        None => {
+                            let tys = &c.result_types[cur];
+                            return Ok(Outcome::Done(
+                                srcs.iter()
+                                    .zip(tys)
+                                    .map(|(s, ty)| self.regs[base + *s as usize].to_value(*ty))
+                                    .collect(),
+                            ));
+                        }
+                        Some((cmod, cprog, cbase, cpc, ret_abs)) => {
+                            for (i, s) in srcs.iter().enumerate() {
+                                self.regs[ret_abs + i] = self.regs[base + *s as usize];
+                            }
+                            if cmod != module {
+                                module = cmod;
+                                c = resolve!(cmod);
+                            }
+                            cur = cprog;
+                            base = cbase;
+                            pc = cpc;
+                        }
+                    }
+                }
                 // Tail calls reuse the *current* window (`base` unchanged) instead of pushing a
                 // return entry, so the callee returns to this activation's caller. Args may alias the
                 // destination prefix, so gather into `scratch` then scatter (like edge copies).
