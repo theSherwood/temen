@@ -11,11 +11,12 @@ use support::{req, response, LOOP_SUM_DBG};
 use temen_interp::{IrPc, Stop, Value, VarValue};
 use temen_text::parse_module;
 
-/// Loads the i64 at window address 8 and returns it — 0 unless a debugger write lands first.
+/// Loads the i64 at window address 16392 (cell 8 shifted above the #1094 NULL guard) and returns
+/// it — 0 unless a debugger write lands first.
 const LOAD_CELL: &str = r#"memory 16
 func () -> (i64) {
 block 0 () {
-  v0 = i64.const 8
+  v0 = i64.const 16392
   v1 = i64.load v0
   return v1
   }
@@ -96,12 +97,12 @@ fn window_write_survives_seek_and_predates_nothing() {
         panic!("expected the pre-load breakpoint");
     };
     assert_eq!(
-        Debuggee::read_window(&b, 8, 8).expect("readable"),
+        Debuggee::read_window(&b, 16392, 8).expect("readable"),
         vec![0u8; 8],
         "the cell starts zeroed"
     );
     assert!(
-        Debuggee::write_window(&mut b, 8, &42i64.to_le_bytes()),
+        Debuggee::write_window(&mut b, 16392, &42i64.to_le_bytes()),
         "the write lands"
     );
     Debuggee::clear_breakpoint(&mut b, bp);
@@ -109,7 +110,7 @@ fn window_write_survives_seek_and_predates_nothing() {
     // Seek to before the write's clock: the rebuilt memory is the *original* zeros.
     let _ = Debuggee::seek(&mut b, 0);
     assert_eq!(
-        Debuggee::read_window(&b, 8, 8).expect("readable"),
+        Debuggee::read_window(&b, 16392, 8).expect("readable"),
         vec![0u8; 8],
         "before the write's clock the original state shows"
     );
@@ -121,7 +122,8 @@ fn window_write_survives_seek_and_predates_nothing() {
     );
 }
 
-/// Two workers each `mem[0] += 1`; the root joins both and returns the count — the threaded twin.
+/// Two workers each `mem[16384] += 1` (counter cell shifted above the #1094 NULL guard); the root
+/// joins both and returns the count — the threaded twin.
 const RACY_COUNTER: &str = r#"
 memory 16
 func () -> (i64) {
@@ -132,14 +134,14 @@ block 0 () {
   vh1 = thread.spawn 1 vsp va
   vj0 = thread.join vh0
   vj1 = thread.join vh1
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vr = i64.load vaddr
   return vr
   }
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vc = i64.load vaddr
   vn = i64.add vc varg
   i64.store vaddr vn
@@ -165,7 +167,7 @@ fn scheduled_window_write_survives_seek() {
         panic!("expected the worker breakpoint");
     };
     assert!(
-        Debuggee::write_window(&mut b, 0, &100i64.to_le_bytes()),
+        Debuggee::write_window(&mut b, 16384, &100i64.to_le_bytes()),
         "the write lands on the scheduled engine"
     );
     Debuggee::clear_breakpoint(&mut b, bp);
@@ -317,8 +319,8 @@ fn dap_set_variable_and_write_memory_round_trip() {
         3,
         "writeMemory",
         Json::obj(vec![
-            ("memoryReference", Json::s("0x8")),
-            ("data", Json::s("KgAAAAAAAAA=")), // 42u64 little-endian
+            ("memoryReference", Json::s("0x4008")), // cell 8 above the #1094 NULL guard (16392)
+            ("data", Json::s("KgAAAAAAAAA=")),      // 42u64 little-endian
         ]),
     ));
     let resp = response(&out);

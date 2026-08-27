@@ -1428,9 +1428,9 @@ pub fn analyze_from(m: &Module, entry: u32) -> Analysis {
         .iter()
         .map(|f| func_in_subset(m, f, atomics_ok))
         .collect();
-    // #1004: a `__null_guard`-marked module's bulk-memory span check now carries the guard low bound
-    // ([`emit_span_check`]), so bulk-mem functions stay in-subset and emit — the #964 exclusion is
-    // retired. (Unmarked modules were never affected: their span check emits byte-identically.)
+    // #1004: the bulk-memory span check carries the guard low bound ([`emit_span_check`]), so bulk-mem
+    // functions stay in-subset and emit — the #964 exclusion is retired. (#1094: the guard is
+    // unconditional now, so every module's span check carries it.)
     // The size valve then keeps a rare over-limit body (the SQLite VDBE dispatcher) off the wasm
     // tier so the whole-module emit clears the engine's per-function limit.
     cap_oversized(m, &mut in_subset);
@@ -1564,7 +1564,7 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
         None,
         false,
         None,
-        temen_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
+        emit_null_guard_extent(m), // #964/#1094: the guard is unconditional on every entry
         &[],
         &[],
     )
@@ -1655,7 +1655,7 @@ pub fn compile_module_nested_with_eligibility(
     // #1004: a marked granted unit emits with the NULL guard, and its bulk-mem functions now carry
     // the guard low bound in their span check ([`emit_span_check`]) — so they emit like any other
     // in-subset function instead of falling to the cross-tier leaf path.
-    let null_guard = temen_ir::module_null_guard(m);
+    let null_guard = emit_null_guard_extent(m);
     let mut wasm_of: Vec<Option<u32>> = vec![None; n];
     let mut interp_leaf = vec![false; n];
     let mut emitted: Vec<usize> = Vec::new();
@@ -1803,7 +1803,7 @@ pub fn compile_module_b2(
         Some(table_log2),
         false,
         None,
-        temen_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
+        emit_null_guard_extent(m), // #964/#1094: the guard is unconditional on every entry
         &[],
         &[],
     )
@@ -1926,7 +1926,7 @@ pub fn compile_module_split(
         Some(table_log2),
         false,
         None,
-        temen_ir::module_null_guard(m),
+        emit_null_guard_extent(m),
         &cross_module,
         &[],
     )
@@ -2346,7 +2346,7 @@ pub fn compile_module_reactor_budgeted(
             None,
             false,
             None,
-            temen_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
+            emit_null_guard_extent(m), // #964/#1094: the guard is unconditional on every entry
             &[],
             &split_plan,
         )?;
@@ -2436,7 +2436,7 @@ pub fn compile_module_reactor_keep(
         None,
         false,
         None,
-        temen_ir::module_null_guard(m), // #964: marked modules emit guarded on every entry
+        emit_null_guard_extent(m), // #964/#1094: the guard is unconditional on every entry
         &[],
         &[],
     )?;
@@ -2613,10 +2613,10 @@ pub fn compile_module_tierup_paged(
 /// interpreted (the span check has no low bound), same limit as paged mode.
 ///
 /// Since the #964 ABI landed this is the **measurement/override** entry: production compiles derive
-/// the guard from the module's `__null_guard` marker on every standard entry (see
-/// [`compile_module_tierup_inner`]), so a marked module needs no special entry. This one forces an
-/// arbitrary `guard` on an *unmarked* module — what `paged_bench_emit` / `bench_paged.mjs` emit +
-/// time as a third variant.
+/// the guard from [`temen_ir::module_null_guard`] on every standard entry (see
+/// [`compile_module_tierup_inner`]) — unconditional since #1094 — so no module needs a special entry.
+/// This one forces an arbitrary `guard` (or `0` to measure unguarded) — what `paged_bench_emit` /
+/// `bench_paged.mjs` emit + time as a third variant.
 pub fn compile_module_tierup_nullguard(
     m: &Module,
     shared_memory: bool,
@@ -2643,11 +2643,11 @@ fn compile_module_tierup_inner(
     null_guard: Option<u64>,
     module_budget: usize,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
-    // #964: a `__null_guard`-marked module opts every tier into the NULL guard — derive it from the
-    // marker whenever the caller didn't force one (the measurement entry still can), so the plain
-    // tier-up entries stay trap-parity with the interpreter oracle, which seeds `[0, guard)`
-    // `Unmapped` for marked modules. Unmarked modules keep `None` (byte-identical emit).
-    let null_guard = null_guard.or_else(|| temen_ir::module_null_guard(m));
+    // #964/#1094: every module opts into the NULL guard — derive it from `module_null_guard`
+    // (unconditional now) whenever the caller didn't force one (the measurement entry still can), so
+    // the plain tier-up entries stay trap-parity with the interpreter oracle, which seeds
+    // `[0, guard)` `Unmapped` for every module.
+    let null_guard = null_guard.or_else(|| emit_null_guard_extent(m));
     let n = m.funcs.len();
     // Track 3 (c)+(a): a page-op module (`map`/`unmap`/`protect`) can't be accelerated on the
     // mask-only tier — an emitted access ignores per-page state the interpreter would trap on
@@ -2896,7 +2896,7 @@ fn compile_interp_only(
         None,
         nested_caps,
         None,
-        temen_ir::module_null_guard(m), // #964 (vacuous here — no bodies — but kept uniform)
+        emit_null_guard_extent(m), // #964 (vacuous here — no bodies — but kept uniform)
         &[],
         &[],
     )?;
@@ -4596,7 +4596,7 @@ pub fn compile_split_fn(
     };
     let interp_leaf = vec![false; n_funcs];
     let dummy_types: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // no indirect calls → never indexed
-    let null_guard = temen_ir::module_null_guard(m);
+    let null_guard = emit_null_guard_extent(m);
 
     // Bodies in wasm-index order: one per function (`fidx` is its wrapper), then the k group functions.
     let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(n_funcs + k);
@@ -4905,6 +4905,17 @@ fn emit_page_check_one(cx: &mut FnCtx, code: &mut Vec<u8>, delta: u64, write: bo
 /// `[0, guard)` — so this is one compare + never-taken branch, the cheap lowering the NULL-trap
 /// design weighs against full paged mode. Masked into the same clamp domain as the access itself
 /// (matching [`emit_page_check_one`]'s defensive style). No-op when unguarded.
+/// The NULL-guard extent to **emit** for `m`: [`temen_ir::module_null_guard`] (unconditional, #1094),
+/// but no-op'd (→ `None`) for a window smaller than the guard — mirroring `Mem::seed_null_guard`, which
+/// skips the seed there. Without this a sub-guard confined child (e.g. a 1 KiB carve declared
+/// `memory 10`) would get a guard check covering its whole window and trap every access, diverging from
+/// the interpreter oracle (which seeds no guard for that window).
+fn emit_null_guard_extent(m: &temen_ir::Module) -> Option<u64> {
+    let g = temen_ir::module_null_guard(m)?;
+    let win = m.memory.as_ref().map_or(0, |mem| 1u64 << mem.size_log2);
+    (g <= win).then_some(g)
+}
+
 fn emit_null_guard(cx: &mut FnCtx, code: &mut Vec<u8>) {
     let Some(guard) = cx.null_guard else {
         return;

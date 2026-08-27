@@ -19,7 +19,7 @@ use temen_interp::{bytecode, Host, Region, Value};
 use temen_text::parse_module;
 
 /// Root `(instantiator) -> sum`: instantiate 8 children (func 1), each in its own 4 KiB sub-window at
-/// `64 KiB + i*4 KiB`, store the handles at `mem[16 + i*4]`, then `join` each and sum the results.
+/// `64 KiB + i*4 KiB`, store the handles at `mem[16400 + i*4]` (above the #1094 NULL guard), then `join` each and sum the results.
 /// Each child returns 5 ⇒ 8 × 5 = 40, regardless of how the child threads interleave.
 const FANOUT: &str = r#"memory 17
 func (i32) -> (i64) {
@@ -43,7 +43,7 @@ block 2 (vi2: i64, vinst2: i32) {
   vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst2 (ventry, voff, vslog, vquota)
   v4 = i64.const 4
   vholo = i64.mul vi2 v4
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vhoff = i64.add v16 vholo
   i32.store vhoff vh
   v1 = i64.const 1
@@ -63,7 +63,7 @@ block 4 (vj: i64, vs: i64, vinst4: i32) {
 block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v4b = i64.const 4
   vjlo = i64.mul vj2 v4b
-  v16b = i64.const 16
+  v16b = i64.const 16400
   vjoff = i64.add v16b vjlo
   vhh = i32.load vjoff
   vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)
@@ -109,7 +109,7 @@ block 2 (vi2: i64, vinst2: i32) {
   vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst2 (ventry, voff, vslog, vquota)
   v4 = i64.const 4
   vholo = i64.mul vi2 v4
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vhoff = i64.add v16 vholo
   i32.store vhoff vh
   v1 = i64.const 1
@@ -129,7 +129,7 @@ block 4 (vj: i64, vs: i64, vinst4: i32) {
 block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v4b = i64.const 4
   vjlo = i64.mul vj2 v4b
-  v16b = i64.const 16
+  v16b = i64.const 16400
   vjoff = i64.add v16b vjlo
   vhh = i32.load vjoff
   vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)
@@ -299,7 +299,7 @@ block 2 (vi2: i64, vinst2: i32, vmod2: i64) {
   vh = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) vinst2 (vmod2, ventry, voff, vslog, vquota)
   v4 = i64.const 4
   vholo = i64.mul vi2 v4
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vhoff = i64.add v16 vholo
   i32.store vhoff vh
   v1 = i64.const 1
@@ -319,7 +319,7 @@ block 4 (vj: i64, vs: i64, vinst4: i32) {
 block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v4b = i64.const 4
   vjlo = i64.mul vj2 v4b
-  v16b = i64.const 16
+  v16b = i64.const 16400
   vjoff = i64.add v16b vjlo
   vhh = i32.load vjoff
   vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)

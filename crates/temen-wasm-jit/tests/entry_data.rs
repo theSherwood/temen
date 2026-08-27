@@ -143,14 +143,15 @@ fn entry_not_func_zero() {
 }
 
 /// A kernel that **reads a data segment**: the window is seeded with 8 little-endian bytes at
-/// offset 0 (the i64 `0x0102030405060708`); the guest loads them and adds `arg`. Proves the emitter
-/// tolerates `data` and the host window-init makes the load see the initialized bytes.
+/// offset 16384 (the i64 `0x0102030405060708`, above the #1094 NULL guard `[0, 16384)`); the guest
+/// loads them and adds `arg`. Proves the emitter tolerates `data` and the host window-init makes the
+/// load see the initialized bytes.
 const DATA_READ: &str = r#"
 memory 16
-data 0 "\08\07\06\05\04\03\02\01"
+data 16384 "\08\07\06\05\04\03\02\01"
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   v2 = i64.load v1
   v3 = i64.add v2 v0
   return v3

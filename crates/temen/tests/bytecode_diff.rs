@@ -297,7 +297,7 @@ block 1 (v3: i64, v4: i64, v5: i64) {
   br_if v6 2(v3, v4, v5) 3(v4)
 }
 block 2 (v7: i64, v8: i64, v9: i64) {
-  v10 = i64.const 8
+  v10 = i64.const 16392
   i64.store v10 v8
   v11 = i64.load v10
   v12 = i64.add v11 v9

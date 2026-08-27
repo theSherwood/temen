@@ -1,12 +1,9 @@
-//! **The #964 guarded layout** (`TranslateOptions::null_guard`) — PR-1 slice: the *relocation*, not
-//! yet the enforcement. A `--null-guard` translate shifts the powerbox low scratch (heap words,
-//! format buffer, args blob) up by one `POWERBOX_NULL_GUARD` and marks the module with the
-//! `__null_guard` function export; a marker-aware host (`RunConfig::init_mem` →
-//! `temen_ir::module_args_base`) seeds the args blob where the shifted `_start` reads it. Nothing is
-//! guarded yet — `[0, guard)` is merely *unused* on the new layout — so the two layouts must be
-//! **behaviorally identical**: same stdout, same exit, for the same program and args. That parity is
-//! this test. The flag-off path is pinned byte-identical by the entire existing suite (every other
-//! test runs the legacy layout).
+//! **The #964/#1094 guarded layout** — the powerbox low scratch (heap words, format buffer, args
+//! blob) lives one `POWERBOX_NULL_GUARD` up, so `[0, guard)` is empty and a host seeds it `Unmapped`
+//! (the guard is **unconditional** now — #1094, the one canonical layout; the `__null_guard` marker
+//! export is retired). A host reads the args blob one guard up (`temen_ir::module_args_base` →
+//! `RunConfig::init_mem`), where the shifted `_start` reads it. This test pins that the guarded layout
+//! runs a scratch-heavy program correctly end to end, and that it survives the wire + `temen-strip`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -57,37 +54,29 @@ fn compile_to_ll(name: &str) -> Option<PathBuf> {
     }
 }
 
-fn translate(ll: &Path, null_guard: bool) -> temen_ir::Module {
-    let opts = temen_llvm::TranslateOptions {
-        null_guard,
-        ..Default::default()
-    };
-    let t =
-        temen_llvm::translate_ll_path_with_options(ll.to_str().unwrap(), opts).expect("translate");
+fn translate(ll: &Path) -> temen_ir::Module {
+    let t = temen_llvm::translate_ll_path_with_options(
+        ll.to_str().unwrap(),
+        temen_llvm::TranslateOptions::default(),
+    )
+    .expect("translate");
     temen_verify::verify_module(&t.module).expect("verify");
     t.module
 }
 
-/// The guarded layout is marked, reads its args one guard up, and behaves **identically** to the
-/// legacy layout for the same program/args/env — argv, getenv, malloc, and printf all land on the
-/// relocated scratch.
+/// The guarded layout reads its args one guard up and runs a scratch-heavy program correctly —
+/// argv, getenv, malloc, and printf all land on the relocated scratch.
 #[test]
-fn guarded_layout_matches_legacy_end_to_end() {
+fn guarded_layout_runs_end_to_end() {
     let Some(ll) = compile_to_ll("parity") else {
         return;
     };
-    let legacy = translate(&ll, false);
-    let guarded = translate(&ll, true);
+    let guarded = translate(&ll);
 
-    assert_eq!(
-        temen_ir::module_null_guard(&legacy),
-        None,
-        "legacy: no marker"
-    );
     assert_eq!(
         temen_ir::module_null_guard(&guarded),
         Some(temen_ir::POWERBOX_NULL_GUARD),
-        "guarded: marker present"
+        "the guard is unconditional (#1094)"
     );
     assert_eq!(
         temen_ir::module_args_base(&guarded),
@@ -97,8 +86,6 @@ fn guarded_layout_matches_legacy_end_to_end() {
 
     let args: [&[u8]; 4] = [b"prog", b"alpha", b"be", b"c"];
     let env: [&[u8]; 1] = [b"GUEST_HOME=/warm"];
-    let a = run_powerbox_cfg(&legacy, b"", &args, &env, None, temen_run::Quota::default())
-        .expect("legacy runs");
     let b = run_powerbox_cfg(
         &guarded,
         b"",
@@ -109,37 +96,32 @@ fn guarded_layout_matches_legacy_end_to_end() {
     )
     .expect("guarded runs");
     assert_eq!(
-        String::from_utf8_lossy(&a.stdout),
+        String::from_utf8_lossy(&b.stdout),
         "argc=4 sum=8 acc=672 home=/warm\n"
-    );
-    assert_eq!(a.stdout, b.stdout, "byte-identical stdout across layouts");
-    assert_eq!(
-        format!("{:?}", a.outcome),
-        format!("{:?}", b.outcome),
-        "same outcome across layouts"
     );
 }
 
-/// The marker survives the wire: encode → decode keeps `__null_guard`, and `temen-strip`'s
-/// `demote_exports` treats it as semantics (never demoted), like `_start`.
+/// The guarded layout survives the wire: encode → decode → `temen-strip`'s `demote_exports` keeps
+/// `_start` and the module still runs under the guard. (#1094: no `__null_guard` marker export is
+/// emitted any more, so none should appear.)
 #[test]
-fn marker_survives_wire_and_strip() {
+fn guarded_layout_survives_wire_and_strip() {
     let Some(ll) = compile_to_ll("wire") else {
         return;
     };
-    let guarded = translate(&ll, true);
+    let guarded = translate(&ll);
     let mut rt =
         temen_encode::decode_module(&temen_encode::encode_module(&guarded)).expect("roundtrip");
     assert_eq!(
         temen_ir::module_null_guard(&rt),
         Some(temen_ir::POWERBOX_NULL_GUARD),
-        "marker rides the .temen wire"
+        "runs under the unconditional guard after the wire roundtrip"
     );
     temen_run::demote_exports(&mut rt, &[]);
+    assert_eq!(rt.resolve_export("_start"), Some(0), "_start kept by strip");
     assert_eq!(
-        temen_ir::module_null_guard(&rt),
-        Some(temen_ir::POWERBOX_NULL_GUARD),
-        "temen-strip keeps the marker (semantics, not observability)"
+        rt.resolve_export("__null_guard"),
+        None,
+        "the retired marker export is not emitted (#1094)"
     );
-    assert_eq!(rt.resolve_export("_start"), Some(0), "_start kept too");
 }

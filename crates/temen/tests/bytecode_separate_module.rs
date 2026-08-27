@@ -157,19 +157,19 @@ block 0 (v0: i32, v1: i32) {
   q0v1 = i64.const 65536
   q0v2 = i64.const -4294967280
   q0v3 = i64.const 999
-  q0a0 = i64.const 1152
+  q0a0 = i64.const 17536
   i64.store q0a0 q0v0
-  q0a1 = i64.const 1160
+  q0a1 = i64.const 17544
   i64.store q0a1 q0v1
-  q0a2 = i64.const 1168
+  q0a2 = i64.const 17552
   i64.store q0a2 q0v2
-  q0a3 = i64.const 1176
+  q0a3 = i64.const 17560
   i64.store q0a3 q0v3
-  q0a4 = i64.const 1184
+  q0a4 = i64.const 17568
   i64.store q0a4 q0v0
-  q0a5 = i64.const 1192
+  q0a5 = i64.const 17576
   i64.store q0a5 q0v0
-  q0a6 = i64.const 1200
+  q0a6 = i64.const 17584
   i64.store q0a6 q0v0
   v6 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   v7 = i64.extend_i32_s v6
@@ -215,10 +215,10 @@ block 0 (v0: i64) {
 /// The parent resolves "beta" (func 1, in its own data segment at 200) via `Module` op 0, then
 /// instantiate_module's that funcidx → join → the *beta* result (`'V'` 86 + 2000).
 const PARENT_BY_NAME: &str = r#"memory 17
-data 200 "beta"
+data 16584 "beta"
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
-  v2 = i64.const 200
+  v2 = i64.const 16584
   v3 = i64.const 4
   v4 = call.cap 8 0 (i64, i64) -> (i64) v1 (v2, v3)
   v5 = i64.extend_i32_s v1

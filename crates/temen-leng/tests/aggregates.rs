@@ -36,8 +36,8 @@ fn object_field_dot() {
    (ret (add (i +64) (dot p.0 x.0 0) (dot p.0 y.0 0))))))";
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
     // p points at a 16-byte object in the window; write x=vx, y=vy, read back the sum.
-    assert_eq!(run(&m, 0, &[128, 3, 4]), 7);
-    assert_eq!(run(&m, 0, &[256, -10, 25]), 15);
+    assert_eq!(run(&m, 0, &[16512, 3, 4]), 7);
+    assert_eq!(run(&m, 0, &[16640, -10, 25]), 15);
 }
 
 #[test]
@@ -52,8 +52,8 @@ fn array_index_at_and_pat() {
    (ret (at (deref a.0) i.0)))))";
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
     // a → an array in the window; write a[i]=v, read back.
-    assert_eq!(run(&m, 0, &[512, 0, 11]), 11);
-    assert_eq!(run(&m, 0, &[512, 3, 99]), 99);
+    assert_eq!(run(&m, 0, &[16896, 0, 11]), 11);
+    assert_eq!(run(&m, 0, &[16896, 3, 99]), 99);
 }
 
 #[test]
@@ -66,8 +66,8 @@ fn pointer_index_pat() {
    (asgn (pat p.0 i.0) v.0)
    (ret (pat p.0 i.0)))))";
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
-    assert_eq!(run(&m, 0, &[1024, 0, 7]), 7);
-    assert_eq!(run(&m, 0, &[1024, 5, 42]), 42);
+    assert_eq!(run(&m, 0, &[17408, 0, 7]), 7);
+    assert_eq!(run(&m, 0, &[17408, 5, 42]), 42);
     // distinct indices write distinct slots (no aliasing): sum after two writes handled by caller.
 }
 
@@ -82,7 +82,7 @@ fn real_nimony_object_dot() {
         .unwrap_or_else(|e| panic!("translate real dot2: {e}"));
     temen_verify::verify_module(&m).expect("verify real dot2");
     // p → a zeroed 16-byte object; x=y=0 → 0. Consistency across engines is the real assertion.
-    assert_eq!(run(&m, 0, &[256]), 0);
+    assert_eq!(run(&m, 0, &[16640]), 0);
 }
 
 #[test]
@@ -105,7 +105,7 @@ fn aggregate_local_in_frame() {
         text.contains("func (i64) -> (i64)"),
         "aggregate-local proc gains a stack pointer:\n{text}"
     );
-    let sp = 4096;
+    let sp = 20480;
     assert_eq!(run(&m, 0, &[sp]), 60);
 }
 
@@ -123,8 +123,8 @@ fn oconstr_aggregate_argument() {
   (stmts . (ret (call addp.0 (oconstr P.0. (kv a.0 x.0) (kv b.0 7)))))))";
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
     // caller is frame-needing (holds the temp): ($sp, x) -> i64.
-    assert_eq!(run(&m, 1, &[4096, 5]), 12, "addp of a+b with a=5, b=7");
-    assert_eq!(run(&m, 1, &[4096, 100]), 107);
+    assert_eq!(run(&m, 1, &[20480, 5]), 12, "addp of a+b with a=5, b=7");
+    assert_eq!(run(&m, 1, &[20480, 100]), 107);
 }
 
 #[test]
@@ -147,9 +147,9 @@ fn oconstr_in_expression_position() {
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
     // f is frame-needing (acc is address-taken + the oconstr temp): ($sp, n) -> i64.
     assert_eq!(
-        run(&m, 0, &[8192, 42]),
+        run(&m, 0, &[24576, 42]),
         42,
         "a discarded oconstr temp in expression position leaves the frame local intact"
     );
-    assert_eq!(run(&m, 0, &[8192, 7]), 7);
+    assert_eq!(run(&m, 0, &[24576, 7]), 7);
 }

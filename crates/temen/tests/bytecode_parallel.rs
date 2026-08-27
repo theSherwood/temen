@@ -29,7 +29,7 @@ block 2 (v4: i64) {
   v6 = thread.spawn 1 v5 v5
   v7 = i64.const 4
   v8 = i64.mul v4 v7
-  v9 = i64.const 16
+  v9 = i64.const 16400
   v10 = i64.add v9 v8
   i32.store v10 v6
   v11 = i64.const 1
@@ -48,7 +48,7 @@ block 4 (v14: i64) {
 block 5 (v17: i64) {
   v18 = i64.const 4
   v19 = i64.mul v17 v18
-  v20 = i64.const 16
+  v20 = i64.const 16400
   v21 = i64.add v20 v19
   v22 = i32.load v21
   v23 = thread.join v22
@@ -57,7 +57,7 @@ block 5 (v17: i64) {
   br 4(v25)
 }
 block 6 () {
-  v26 = i64.const 0
+  v26 = i64.const 16384
   v27 = i64.atomic.load v26
   return v27
   }
@@ -72,7 +72,7 @@ block 1 (v1: i64) {
   br_if v3 3() 2(v1)
 }
 block 2 (v4: i64) {
-  v5 = i64.const 0
+  v5 = i64.const 16384
   v6 = i64.const 1
   v7 = i64.atomic.rmw.add v5 v6
   v8 = i64.const -1
@@ -105,7 +105,7 @@ block 2 (v4: i64, vacc2: i64) {
   v6 = thread.spawn 1 v5b v5b
   v7 = i64.const 4
   v8 = i64.mul v4 v7
-  v9 = i64.const 16
+  v9 = i64.const 16400
   v10 = i64.add v9 v8
   i32.store v10 v6
   v11 = i64.const 1
@@ -124,7 +124,7 @@ block 4 (v14: i64, vacc4: i64) {
 block 5 (v17: i64, vacc5: i64) {
   v18 = i64.const 4
   v19 = i64.mul v17 v18
-  v20 = i64.const 16
+  v20 = i64.const 16400
   v21 = i64.add v20 v19
   v22 = i32.load v21
   v23 = thread.join v22
@@ -144,23 +144,23 @@ block 0 (vsp: i64, v0: i64) {
 }
 "#;
 
-// Futex handoff: the producer writes a payload at mem[8], spawns a consumer that `atomic.wait`s on
-// the flag at mem[0], then sets the flag and `notify`s it. Under the parallel driver the consumer is a
+// Futex handoff: the producer writes a payload at mem[16392], spawns a consumer that `atomic.wait`s on
+// the flag at mem[16384] (both above the #1094 NULL guard), then sets the flag and `notify`s it. Under the parallel driver the consumer is a
 // **real** OS thread that genuinely parks on the cross-thread futex (or takes the not-equal fast path
 // if it loses the race to the flag store) — either way it returns the payload (987654) on every
 // interleaving, so the result is interleaving-invariant and differential-tests the futex cleanly.
 const FUTEX_HANDOFF: &str = r#"memory 16
 func () -> (i64) {
 block 0 () {
-  v0 = i64.const 8
+  v0 = i64.const 16392
   v1 = i64.const 987654
   i64.atomic.store v0 v1
   v2 = i64.const 0
   v3 = thread.spawn 1 v2 v2
-  v4 = i64.const 0
+  v4 = i64.const 16384
   v5 = i32.const 1
   i32.atomic.store v4 v5
-  v6 = i64.const 0
+  v6 = i64.const 16384
   v7 = i32.const 1
   v8 = atomic.notify v6 v7
   v9 = thread.join v3
@@ -169,11 +169,11 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, v0: i64) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   v2 = i32.const 0
   v3 = i64.const 1000000000
   v4 = i32.atomic.wait v1 v2 v3
-  v5 = i64.const 8
+  v5 = i64.const 16392
   v6 = i64.atomic.load v5
   return v6
   }
@@ -181,7 +181,7 @@ block 0 (vsp: i64, v0: i64) {
 "#;
 
 // A barrier-style fan-in: 8 workers each `atomic.rmw.add` a shared counter, and the last one to arrive
-// (counter == 8) `notify`s the flag at mem[8]; the root parks on that flag via `atomic.wait` until
+// (counter == 8) `notify`s the flag at mem[16392] (above the #1094 NULL guard); the root parks on that flag via `atomic.wait` until
 // released, then returns the counter (8). Exercises notify waking a genuinely-parked root across
 // threads, with an interleaving-invariant result.
 const BARRIER: &str = r#"memory 16
@@ -200,7 +200,7 @@ block 2 (v4: i64) {
   v6 = thread.spawn 1 v5 v5
   v7 = i64.const 4
   v8 = i64.mul v4 v7
-  v9 = i64.const 16
+  v9 = i64.const 16400
   v10 = i64.add v9 v8
   i32.store v10 v6
   v11 = i64.const 1
@@ -211,11 +211,11 @@ block 3 () {
   br 4()
 }
 block 4 () {
-  v13 = i64.const 8
+  v13 = i64.const 16392
   v14 = i32.const 0
   v15 = i64.const 1000000000
   v16 = i32.atomic.wait v13 v14 v15
-  v17 = i64.const 0
+  v17 = i64.const 16384
   v18 = i64.atomic.load v17
   v19 = i64.const 8
   v20 = i64.lt_u v18 v19
@@ -236,7 +236,7 @@ block 7 (v24: i64, v25: i64) {
 block 8 (v28: i64, v29: i64) {
   v30 = i64.const 4
   v31 = i64.mul v29 v30
-  v32 = i64.const 16
+  v32 = i64.const 16400
   v33 = i64.add v32 v31
   v34 = i32.load v33
   v35 = thread.join v34
@@ -250,7 +250,7 @@ block 9 (v38: i64) {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, v0: i64) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   v2 = i64.const 1
   v3 = i64.atomic.rmw.add v1 v2
   v4 = i64.const 7
@@ -258,10 +258,10 @@ block 0 (vsp: i64, v0: i64) {
   br_if v5 1() 2()
 }
 block 1 () {
-  v6 = i64.const 8
+  v6 = i64.const 16392
   v7 = i32.const 1
   i32.atomic.store v6 v7
-  v8 = i64.const 8
+  v8 = i64.const 16392
   v9 = i32.const 100
   v10 = atomic.notify v8 v9
   br 2()

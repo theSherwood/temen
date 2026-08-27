@@ -57,10 +57,10 @@ done < <(grep -E '^declare ' "$CACHE/leng.legal.ll" | grep -oE '@"?[A-Za-z0-9_.$
 [ "$UNRESOLVED" -eq 0 ] || { echo "stub audit failed: unhandled externs above" >&2; exit 1; }
 
 # [3/4] translate to a raw .temen. --host-page 65536 = wasm 64 KiB pages (browser-loadable, like
-# chibicc.temen); no --stub-externs, so translation proves every call resolves. --null-guard
-# (#964/#1094): the leng self-host compiler runs guarded like every other producer — the powerbox low
-# scratch shifts one 16 KiB guard up and the module is marked, so a host seeds [0, guard) unmapped and
-# a NULL deref in the compiler traps instead of reading zeros.
+# chibicc.temen); no --stub-externs, so translation proves every call resolves. The guarded powerbox
+# layout (#964/#1094) is unconditional now — the powerbox low scratch shifts one 16 KiB guard up so a
+# host seeds [0, guard) unmapped and a NULL deref in the compiler traps instead of reading zeros.
+# --null-guard below is a redundant no-op (the marker export is retired), kept for compatibility.
 echo "[3/4] temen-llvm-translate --binary ..."
 TR="$REPO/crates/temen-llvm/target/release/temen-llvm-translate"
 [ -x "$TR" ] || cargo build --release --bin temen-llvm-translate --manifest-path "$REPO/crates/temen-llvm/Cargo.toml"

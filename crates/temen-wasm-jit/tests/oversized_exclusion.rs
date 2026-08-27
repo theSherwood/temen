@@ -7,8 +7,9 @@
 //!
 //! The exclusion re-uses the existing cross-tier machinery (a direct `Call` to an excluded, marshallable
 //! function is routed through `env.call_interp`, run on the interpreter over the *shared* window). This
-//! differential proves that: `f0` (emitted) writes `mem[8]=x+7`, calls the over-large `f1` which reads
-//! `mem[8]` and writes `mem[100]`, then `f0` reads `mem[100]`. With the shared window the round trip
+//! differential proves that: `f0` (emitted) writes `mem[16392]=x+7`, calls the over-large `f1` which reads
+//! `mem[16392]` and writes `mem[16484]`, then `f0` reads `mem[16484]` (all above the #1094 NULL guard).
+//! With the shared window the round trip
 //! yields `x+7`; the interpreter oracle over the same module must agree. Rather than build a genuine
 //! multi-megabyte function, the test drives the real exclusion loop with a small cap via
 //! `compile_module_reactor_capped` and a modest `f1`.
@@ -24,9 +25,10 @@ const WIN_SIZE: u64 = 1 << 16;
 const ENV_PTR: u32 = 1024;
 
 /// Build the two-function module. `f1` carries `n_dummy` no-effect stores so its emitted body clears a
-/// small test cap (each masked `i64.store` lowers to ~27 bytes). `f0(x)` = `mem[100]` after calling
-/// `f1`, which copies `mem[8]` (= x+7) into `mem[100]` — so a correct run yields `x+7` whether `f1`
-/// ran as emitted wasm or as a cross-tier interpreter leaf over the shared window.
+/// small test cap (each masked `i64.store` lowers to ~27 bytes). `f0(x)` = `mem[16484]` after calling
+/// `f1`, which copies `mem[16392]` (= x+7) into `mem[16484]` (both above the #1094 NULL guard) — so a
+/// correct run yields `x+7` whether `f1` ran as emitted wasm or as a cross-tier interpreter leaf over
+/// the shared window.
 fn build_module(n_dummy: usize) -> temen_ir::Module {
     let mut src = String::from(
         r#"
@@ -35,21 +37,21 @@ func (i64) -> (i64) {
 block 0 (v0: i64) {
   v7 = i64.const 7
   vpre = i64.add v0 v7
-  va8 = i64.const 8
+  va8 = i64.const 16392
   i64.store va8 vpre
   vr1 = call 1 (v0)
-  vaddr = i64.const 100
+  vaddr = i64.const 16484
   vr = i64.load vaddr
   return vr
   }
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  va8 = i64.const 8
+  va8 = i64.const 16392
   vread = i64.load va8
-  vaddr = i64.const 100
+  vaddr = i64.const 16484
   i64.store vaddr vread
-  vscr = i64.const 16
+  vscr = i64.const 16400
 "#,
     );
     for _ in 0..n_dummy {

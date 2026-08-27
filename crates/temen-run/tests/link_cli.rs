@@ -10,18 +10,22 @@ use temen_ir::{
     Terminator, ValType,
 };
 
-/// Unit A: data-only — exports `g_val`, an 8-byte little-endian 7 at unit-local offset 0.
+/// Unit A: data-only — exports `g_val`, an 8-byte little-endian 7 at unit-local offset 16384. This
+/// is the *first* linked unit, so its data base is window offset 0; placing `g_val` one guard up
+/// (16384) keeps it clear of the #1094 NULL guard `[0, 16384)`, which the runtime unmaps — a segment
+/// at 0 would land in the guard and fault when the kernel loads it. Later units page-align above the
+/// guard on their own.
 fn unit_a() -> Module {
     Module {
         memory: Some(Memory { size_log2: 16 }),
         data: vec![Data {
-            offset: 0,
+            offset: 16384,
             readonly: false,
             bytes: 7u64.to_le_bytes().to_vec(),
         }],
         data_exports: vec![DataExport {
             name: "g_val".into(),
-            offset: 0,
+            offset: 16384,
         }],
         ..Default::default()
     }

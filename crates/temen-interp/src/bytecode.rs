@@ -11052,13 +11052,17 @@ impl CoopSched {
                         0
                     };
                     let off_u = off as u64;
-                    let fits = carve_fits(
-                        off_u,
-                        size_log2,
-                        isz,
-                        ibase,
-                        mem.as_ref().map_or(0, |m| m.null_guard),
-                    );
+                    // #1094: the guard-overlap check must use the *spawning task's own* window guard,
+                    // not the root's. A nested child running in a sub-guard (< 16384) carve is
+                    // unguarded (`null_guard == 0`), so a low grandchild carve is legal there — the
+                    // OS-thread parallel driver already reads the child's own `mem` (this file, the
+                    // parallel `Instantiate` arm), so the cooperative driver must match it or the two
+                    // engines diverge on depth-2 nesting.
+                    let holder_guard = match tasks[ti].env {
+                        None => mem.as_ref().map_or(0, |m| m.null_guard),
+                        Some(k) => extra_envs[k].mem.as_ref().map_or(0, |m| m.null_guard),
+                    };
+                    let fits = carve_fits(off_u, size_log2, isz, ibase, holder_guard);
                     if !ok_entry || !fits {
                         tasks[ti]
                             .vt

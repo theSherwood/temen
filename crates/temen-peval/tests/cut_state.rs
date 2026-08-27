@@ -58,22 +58,22 @@ fn agrees(residual: &Module, source: &Module, xs: &[i64]) {
 // Slice 1: a runtime call-out that reads and mutates the register file, kept opaque.
 // =============================================================================================
 
-// counter@8 (plain memory → dynamic, drives the roll), accumulator@16 (private rename, seeded
-// dynamic from the input). Each iteration an opaque *state-touching* callee `bump()` does `*16 += 5`
-// through memory; the specializer spills @16 before the call and reloads it after, so the mutation is
-// seen. return *16 = x + 5*x = 6*x.
+// counter@16392 (plain memory → dynamic, drives the roll), accumulator@16400 (private rename, seeded
+// dynamic from the input) — both above the #1094 NULL guard. Each iteration an opaque *state-touching*
+// callee `bump()` does `*16400 += 5` through memory; the specializer spills @16400 before the call and
+// reloads it after, so the mutation is seen. return *16400 = x + 5*x = 6*x.
 const LOOP_WITH_SAFEPOINT: &str = r#"
 memory 17
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v8 = i64.const 8
+  v8 = i64.const 16392
   i64.store v8 v0
-  v16 = i64.const 16
+  v16 = i64.const 16400
   i64.store v16 v0
   br 1()
 }
 block 1 () {
-  v8 = i64.const 8
+  v8 = i64.const 16392
   vc = i64.load v8
   vzero = i64.const 0
   vcond = i64.ne vc vzero
@@ -81,7 +81,7 @@ block 1 () {
 }
 block 2 () {
   call 1 ()
-  v8 = i64.const 8
+  v8 = i64.const 16392
   vc = i64.load v8
   v1 = i64.const 1
   vc2 = i64.sub vc v1
@@ -89,14 +89,14 @@ block 2 () {
   br 1()
 }
 block 3 () {
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vr = i64.load v16
   return vr
 }
 }
 func () -> () {
 block 0 () {
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vacc = i64.load v16
   v5 = i64.const 5
   vacc2 = i64.add vacc v5
@@ -112,7 +112,7 @@ fn a_state_touching_cut_call_reads_and_mutates_the_register_file() {
     verify_module(&m).expect("source verifies");
     let cfg = SpecConfig {
         cut_calls_touch_state: vec![1],
-        rename: Some((16, 24)),
+        rename: Some((16400, 16408)),
         rename_is_private: true,
         ..SpecConfig::default()
     };
@@ -151,35 +151,35 @@ fn a_state_touching_cut_call_reads_and_mutates_the_register_file() {
 // Slice 2: guard-and-deopt — a cold branch bails to the resume handler instead of being projected.
 // =============================================================================================
 
-// A mini-interpreter: input x is stored into the VM window@16 (renamed, dynamic), then read back and
+// A mini-interpreter: input x is stored into the VM window@16400 (renamed, dynamic), then read back and
 // dispatched. Fast path (x<100): result = x*2, folds to a residual multiply. Cold path (block 3, a
 // DEOPT TARGET): the specializer must NOT project it — it spills state to the window and tail-calls
-// the `() -> i64` resume handler (func 1), which reads x@16 and finishes (x+7), exactly as block 3
+// the `() -> i64` resume handler (func 1), which reads x@16400 and finishes (x+7), exactly as block 3
 // would. This models "guard passes → stay in the fast path; guard fails → deopt to the interpreter."
 const FAST_PATH_WITH_DEOPT: &str = r#"
 memory 17
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v16 = i64.const 16
+  v16 = i64.const 16400
   i64.store v16 v0
   br 1()
 }
 block 1 () {
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vx = i64.load v16
   v100 = i64.const 100
   vlt = i64.lt_s vx v100
   br_if vlt 2() 3()
 }
 block 2 () {
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vx = i64.load v16
   v2 = i64.const 2
   vr = i64.mul vx v2
   return vr
 }
 block 3 () {
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vx = i64.load v16
   v7 = i64.const 7
   vr = i64.add vx v7
@@ -188,7 +188,7 @@ block 3 () {
 }
 func () -> (i64) {
 block 0 () {
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vx = i64.load v16
   v7 = i64.const 7
   vr = i64.add vx v7
@@ -202,7 +202,7 @@ fn a_cold_branch_deopts_to_the_resume_handler() {
     let m = parse_module(FAST_PATH_WITH_DEOPT).expect("parse");
     verify_module(&m).expect("source verifies");
     let cfg = SpecConfig {
-        rename: Some((16, 24)),
+        rename: Some((16400, 16408)),
         rename_is_private: true,
         deopt_targets: vec![(0, 3)],
         deopt_handler: Some(1),
@@ -250,7 +250,7 @@ fn deopt_requires_a_well_typed_handler() {
     verify_module(&m).expect("source verifies");
     // A deopt target with no handler is rejected.
     let no_handler = SpecConfig {
-        rename: Some((16, 24)),
+        rename: Some((16400, 16408)),
         rename_is_private: true,
         deopt_targets: vec![(0, 3)],
         deopt_handler: None,
@@ -263,7 +263,7 @@ fn deopt_requires_a_well_typed_handler() {
     );
     // A handler whose signature isn't `() -> <entry results>` is rejected (func 0 takes an i64 param).
     let bad_sig = SpecConfig {
-        rename: Some((16, 24)),
+        rename: Some((16400, 16408)),
         rename_is_private: true,
         deopt_targets: vec![(0, 3)],
         deopt_handler: Some(0),
@@ -281,23 +281,24 @@ fn deopt_requires_a_well_typed_handler() {
 // This is the shape a partial-evaluated interpreter fast path actually wants.
 // =============================================================================================
 
-// counter@8 (plain, dynamic → rolls), accumulator@16 (private rename, seeded dynamic = input). The
-// loop runs a state-touching safepoint `bump()` (`*16 += 3`) each iteration; on exit a guard checks
-// the accumulator and, when it is "too large" (>= 1000, the cold case), DEOPTS to the resume handler
-// (func 2, `*16 + 1`) instead of projecting the cold block. With input v0: accumulator = v0 + 3*v0 =
+// counter@16392 (plain, dynamic → rolls), accumulator@16400 (private rename, seeded dynamic = input),
+// both above the #1094 NULL guard. The loop runs a state-touching safepoint `bump()` (`*16400 += 3`)
+// each iteration; on exit a guard checks the accumulator and, when it is "too large" (>= 1000, the
+// cold case), DEOPTS to the resume handler (func 2, `*16400 + 1`) instead of projecting the cold
+// block. With input v0: accumulator = v0 + 3*v0 =
 // 4*v0, so v0 < 250 stays on the fast path (return 4*v0) and v0 >= 250 deopts (return 4*v0 + 1).
 const ROLLED_FASTPATH: &str = r#"
 memory 17
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v8 = i64.const 8
+  v8 = i64.const 16392
   i64.store v8 v0
-  v16 = i64.const 16
+  v16 = i64.const 16400
   i64.store v16 v0
   br 1()
 }
 block 1 () {
-  v8 = i64.const 8
+  v8 = i64.const 16392
   vc = i64.load v8
   vzero = i64.const 0
   vcond = i64.ne vc vzero
@@ -305,7 +306,7 @@ block 1 () {
 }
 block 2 () {
   call 1 ()
-  v8 = i64.const 8
+  v8 = i64.const 16392
   vc = i64.load v8
   v1 = i64.const 1
   vc2 = i64.sub vc v1
@@ -313,19 +314,19 @@ block 2 () {
   br 1()
 }
 block 3 () {
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vacc = i64.load v16
   v1000 = i64.const 1000
   vlt = i64.lt_s vacc v1000
   br_if vlt 4() 5()
 }
 block 4 () {
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vr = i64.load v16
   return vr
 }
 block 5 () {
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vacc = i64.load v16
   v1 = i64.const 1
   vr = i64.add vacc v1
@@ -334,7 +335,7 @@ block 5 () {
 }
 func () -> () {
 block 0 () {
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vacc = i64.load v16
   v3 = i64.const 3
   vacc2 = i64.add vacc v3
@@ -344,7 +345,7 @@ block 0 () {
 }
 func () -> (i64) {
 block 0 () {
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vacc = i64.load v16
   v1 = i64.const 1
   vr = i64.add vacc v1
@@ -359,7 +360,7 @@ fn a_rolled_fast_path_composes_a_safepoint_call_out_and_a_deopt_guard() {
     verify_module(&m).expect("source verifies");
     let cfg = SpecConfig {
         cut_calls_touch_state: vec![1],
-        rename: Some((16, 24)),
+        rename: Some((16400, 16408)),
         rename_is_private: true,
         deopt_targets: vec![(0, 5)],
         deopt_handler: Some(2),
@@ -402,7 +403,7 @@ fn a_rolled_fast_path_composes_a_safepoint_call_out_and_a_deopt_guard() {
 //
 // The interpreter's input `n` arrives as a function PARAMETER, not pre-seeded in the window, and the
 // resume handler is `(i64) -> i64` — it must receive `n` directly. `n` is the loop trip count (plain
-// memory@8, dynamic → the loop rolls) and is also threaded as a live value `vn` through the loop to
+// memory@16392, dynamic → the loop rolls) and is also threaded as a live value `vn` through the loop to
 // the exit block, which is a DEOPT TARGET reached only after the rolled loop. So `n` must survive the
 // whole rolled loop and land on the deopt edge. Source: loop `n` times, then `return n*100`; handler:
 // `n*100`. Both equal, so the residual (which replaces the exit block with `handler(n)`) matches the
@@ -412,19 +413,19 @@ const THREADED_ARG_DEOPT: &str = r#"
 memory 17
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v8 = i64.const 8
+  v8 = i64.const 16392
   i64.store v8 v0
   br 1(v0)
 }
 block 1 (vn: i64) {
-  v8 = i64.const 8
+  v8 = i64.const 16392
   vc = i64.load v8
   vzero = i64.const 0
   vcond = i64.ne vc vzero
   br_if vcond 2(vn) 3(vn)
 }
 block 2 (vn: i64) {
-  v8 = i64.const 8
+  v8 = i64.const 16392
   vc = i64.load v8
   v1 = i64.const 1
   vc2 = i64.sub vc v1
@@ -489,7 +490,7 @@ fn a_deopt_edge_receives_the_threaded_entry_argument() {
 // deopt the whole block, killing the fast paths too. `deopt_edges` deopts the single
 // `(from_block -> to_block)` CFG edge.
 //
-// Toy: input x → window@16. Block 1 splits (dynamic) into a fast pred (block 2) and a cold pred
+// Toy: input x → window@16400. Block 1 splits (dynamic) into a fast pred (block 2) and a cold pred
 // (block 3); BOTH branch to the shared block 4, which returns `x*3`. We mark ONLY the cold edge
 // `(3 -> 4)` as a deopt edge. So x<50 flows 2→4 and PROJECTS block 4 (a residual multiply
 // survives), while x>=50 flows 3→4 and DEOPTS to the handler (`() -> i64`, also `x*3`). Both
@@ -499,12 +500,12 @@ const SHARED_BLOCK_EDGE_DEOPT: &str = r#"
 memory 17
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v16 = i64.const 16
+  v16 = i64.const 16400
   i64.store v16 v0
   br 1()
 }
 block 1 () {
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vx = i64.load v16
   v50 = i64.const 50
   vlt = i64.lt_s vx v50
@@ -517,7 +518,7 @@ block 3 () {
   br 4()
 }
 block 4 () {
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vx = i64.load v16
   v3 = i64.const 3
   vr = i64.mul vx v3
@@ -526,7 +527,7 @@ block 4 () {
 }
 func () -> (i64) {
 block 0 () {
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vx = i64.load v16
   v3 = i64.const 3
   vr = i64.mul vx v3
@@ -558,7 +559,7 @@ fn one_edge_of_a_shared_block_deopts_while_the_block_still_projects() {
 
     // Edge deopt: only the cold edge (3 -> 4) bails; the fast edge (2 -> 4) projects block 4.
     let cfg = SpecConfig {
-        rename: Some((16, 24)),
+        rename: Some((16400, 16408)),
         rename_is_private: true,
         deopt_edges: vec![(0, 3, 4)],
         deopt_handler: Some(1),
@@ -587,7 +588,7 @@ fn one_edge_of_a_shared_block_deopts_while_the_block_still_projects() {
 
     // Contrast: deopt_targets on the same block (0, 4) deopts BOTH edges — the multiply is gone.
     let cfg_target = SpecConfig {
-        rename: Some((16, 24)),
+        rename: Some((16400, 16408)),
         rename_is_private: true,
         deopt_targets: vec![(0, 4)],
         deopt_handler: Some(1),
@@ -614,19 +615,19 @@ fn a_no_arg_handler_still_resumes_from_the_window() {
 memory 17
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v8 = i64.const 8
+  v8 = i64.const 16392
   i64.store v8 v0
   br 1(v0)
 }
 block 1 (vn: i64) {
-  v8 = i64.const 8
+  v8 = i64.const 16392
   vc = i64.load v8
   vzero = i64.const 0
   vcond = i64.ne vc vzero
   br_if vcond 2(vn) 3(vn)
 }
 block 2 (vn: i64) {
-  v8 = i64.const 8
+  v8 = i64.const 16392
   vc = i64.load v8
   v1 = i64.const 1
   vc2 = i64.sub vc v1

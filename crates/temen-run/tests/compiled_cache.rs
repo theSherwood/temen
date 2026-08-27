@@ -29,7 +29,7 @@ fn echo_module() -> Module {
          func () -> (i32) {\n\
          block 0 () {\n\
          \x20 v0 = i32.const 0\n\
-         \x20 v1 = i64.const 0\n\
+         \x20 v1 = i64.const 16384\n\
          \x20 v2 = i64.const 64\n\
          \x20 v3 = call.sym \"read\" (i64, i64) -> (i64) v0(v1, v2)\n\
          \x20 v4 = call.sym \"write\" (i64, i64) -> (i64) v0(v1, v3)\n\
@@ -45,12 +45,12 @@ fn echo_module() -> Module {
 fn writer_module() -> Module {
     load(
         "memory 16\n\
-         data 16 \"hi\\n\"\n\
+         data 16400 \"hi\\n\"\n\
          export 0 func \"_start\" 0\n\
          func () -> (i32) {\n\
          block 0 () {\n\
          \x20 v0 = i32.const 0\n\
-         \x20 v1 = i64.const 16\n\
+         \x20 v1 = i64.const 16400\n\
          \x20 v2 = i64.const 3\n\
          \x20 v3 = call.sym \"write\" (i64, i64) -> (i64) v0(v1, v2)\n\
          \x20 v4 = i32.const 7\n\

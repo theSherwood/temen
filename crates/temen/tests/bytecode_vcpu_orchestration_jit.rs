@@ -32,8 +32,8 @@ block 0 () {
 "#;
 
 /// Root `(jit, code) -> counter`: pack both handles into the single `thread.spawn` arg, spawn 8
-/// workers (func 1), join them, return the shared counter at `mem[8]`. Worker: unpack, `Jit.invoke`
-/// the unit, atomically add its return (7). 8 workers ⇒ counter 56.
+/// workers (func 1), join them, return the shared counter at `mem[16392]` (above the #1094 NULL
+/// guard). Worker: unpack, `Jit.invoke` the unit, atomically add its return (7). 8 workers ⇒ counter 56.
 const INVOKE: &str = r#"memory 16
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
@@ -55,7 +55,7 @@ block 2 (vi2: i64, vp2: i64) {
   vt = thread.spawn 1 vsp vp2
   v4 = i64.const 4
   v5 = i64.mul vi2 v4
-  v6 = i64.const 16
+  v6 = i64.const 16400
   v7 = i64.add v6 v5
   i32.store v7 vt
   v8 = i64.const 1
@@ -74,7 +74,7 @@ block 4 (vj: i64) {
 block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
-  v15 = i64.const 16
+  v15 = i64.const 16400
   v16 = i64.add v15 v14
   v17 = i32.load v16
   v18 = thread.join v17
@@ -83,7 +83,7 @@ block 5 (vj2: i64) {
   br 4(v20)
 }
 block 6 () {
-  v21 = i64.const 8
+  v21 = i64.const 16392
   v22 = i64.atomic.load v21
   return v22
   }
@@ -97,7 +97,7 @@ block 0 (vsp: i64, vp: i64) {
   vcode = i64.shr_u vp vsh
   vw = call.cap 11 1 (i64) -> (i32) vjit (vcode)
   vw64 = i64.extend_i32_u vw
-  vc8 = i64.const 8
+  vc8 = i64.const 16392
   vold = i64.atomic.rmw.add vc8 vw64
   vret = i64.const 0
   return vret
@@ -129,7 +129,7 @@ block 2 (vi2: i64, vp2: i64) {
   vt = thread.spawn 1 vsp vp2
   v4 = i64.const 4
   v5 = i64.mul vi2 v4
-  v6 = i64.const 16
+  v6 = i64.const 16400
   v7 = i64.add v6 v5
   i32.store v7 vt
   v8 = i64.const 1
@@ -148,7 +148,7 @@ block 4 (vj: i64) {
 block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
-  v15 = i64.const 16
+  v15 = i64.const 16400
   v16 = i64.add v15 v14
   v17 = i32.load v16
   v18 = thread.join v17
@@ -157,7 +157,7 @@ block 5 (vj2: i64) {
   br 4(v20)
 }
 block 6 () {
-  v21 = i64.const 8
+  v21 = i64.const 16392
   v22 = i64.atomic.load v21
   return v22
   }
@@ -173,7 +173,7 @@ block 0 (vsp: i64, vp: i64) {
   vslot32 = i32.wrap_i64 vslot
   vr = call.dyn () -> (i32) vslot32 ()
   vr64 = i64.extend_i32_u vr
-  vc8 = i64.const 8
+  vc8 = i64.const 16392
   vold = i64.atomic.rmw.add vc8 vr64
   vret = i64.const 0
   return vret

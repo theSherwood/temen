@@ -205,7 +205,8 @@ fn nested_instantiate_join_matches_interp() {
 
 /// **§11 slice 3 — thread/futex ops in an emitted unit** (CONSOLIDATION.md §11): the unit's entry
 /// `thread.spawn`s its OWN `f1` (→ 7), `join`s it, and does a mismatching `i32.atomic.wait`
-/// (mem[64] = 0 ≠ 99 → status 1) — returning 7·10 + 1 = 71. On the emitted tier the four ops arrive
+/// (mem[16448] = 0 ≠ 99 → status 1, above the #1094 NULL guard) — returning 7·10 + 1 = 71. On the
+/// emitted tier the four ops arrive
 /// as the `env.thread_spawn`/`env.thread_join`/`env.mem_wait`/`env.mem_notify` imports; the servicer
 /// supplies the module context (it runs `f1` of THIS unit), mirroring the Worker host. Oracle: the
 /// bytecode cooperative driver runs the same unit whole (module-aware spawn, PR #593).
@@ -216,7 +217,7 @@ block 0 () {
   varg = i64.const 0
   vt = thread.spawn 1 vsp varg
   vj = thread.join vt
-  vaddr = i64.const 64
+  vaddr = i64.const 16448
   vexp = i32.const 99
   vtmo = i64.const 0
   vw = i32.atomic.wait vaddr vexp vtmo

@@ -68,10 +68,10 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
     let header = Block {
         params: vec![i64t(), i64t(), i64t()], // 0: acc, 1: pc, 2: input
         insts: vec![
-            Inst::ConstI64(0),          // 3: program base (offset 0)
-            add(3, 1),                  // 4: addr = base + pc
+            Inst::ConstI64(16384), // 3: program base (offset 16384, above the #1094 NULL guard)
+            add(3, 1),             // 4: addr = base + pc
             load(LoadOp::I32_8U, 4, 0), // 5: op   (i32)
-            load(LoadOp::I64, 4, 1),    // 6: imm  (i64)
+            load(LoadOp::I64, 4, 1), // 6: imm  (i64)
         ],
         term: Terminator::BrTable {
             idx: 5,
@@ -140,7 +140,7 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
         }],
         memory: Some(Memory { size_log2: 16 }),
         data: vec![Data {
-            offset: 0,
+            offset: 16384, // above the #1094 NULL guard
             readonly: true,
             bytes: encode(program),
         }],
@@ -327,8 +327,9 @@ const S_ADD: u8 = 3; //           pop b, pop a, push a + b
 const S_MUL: u8 = 4; //           pop b, pop a, push a * b
 
 // The operand stack lives in a private, zero-initialized window range. It must sit in a
-// different host page from the readonly program at offset 0 — RO protection is page-granular
-// (host pages can be up to 16 KiB), so a stack sharing the program's page would fault on write.
+// different host page from the readonly program at offset 16384 (above the #1094 NULL guard) — RO
+// protection is page-granular (host pages can be up to 16 KiB), so a stack sharing the program's
+// page would fault on write.
 const STACK_LO: u64 = 32768;
 const STACK_HI: u64 = 32768 + 512; // 64 i64 slots
 
@@ -364,7 +365,7 @@ fn build_stack_interpreter(program: &[(u8, i64)]) -> Module {
     let header = Block {
         params: vec![i64t(), i64t(), i64t()], // 0: pc, 1: sp, 2: input
         insts: vec![
-            Inst::ConstI64(0),          // 3: program base
+            Inst::ConstI64(16384),      // 3: program base (above the #1094 NULL guard)
             bin(BinOp::Add, 3, 0),      // 4: addr = base + pc
             load(LoadOp::I32_8U, 4, 0), // 5: op
             load(LoadOp::I64, 4, 1),    // 6: imm
@@ -444,7 +445,7 @@ fn build_stack_interpreter(program: &[(u8, i64)]) -> Module {
         }],
         memory: Some(Memory { size_log2: 16 }),
         data: vec![Data {
-            offset: 0,
+            offset: 16384, // above the #1094 NULL guard
             readonly: true,
             bytes: encode(program),
         }],
@@ -621,7 +622,8 @@ fn specializes_program_in_mutable_memory_via_const_region() {
 
     let len = (program.len() * 9) as u64;
     let cfg = SpecConfig {
-        const_regions: vec![(0, len)],
+        // The program now lives at offset 16384 (above the #1094 NULL guard), so promise that region.
+        const_regions: vec![(16384, 16384 + len)],
         ..SpecConfig::default()
     };
     let residual =
@@ -654,7 +656,7 @@ fn overlay_bytes_drive_folding() {
             blocks: vec![Block {
                 params: vec![],
                 insts: vec![
-                    Inst::ConstI64(16), // 0: addr
+                    Inst::ConstI64(16400), // 0: addr (above the #1094 NULL guard)
                     Inst::Load {
                         op: LoadOp::I64,
                         addr: 0,
@@ -668,7 +670,7 @@ fn overlay_bytes_drive_folding() {
         // The bytes are actually present in the window (so the unspecialized run reads them), but
         // in a *writable* segment the engine won't fold on its own.
         data: vec![Data {
-            offset: 16,
+            offset: 16400, // above the #1094 NULL guard
             readonly: false,
             bytes: value.to_le_bytes().to_vec(),
         }],
@@ -686,7 +688,7 @@ fn overlay_bytes_drive_folding() {
 
     // With an overlay promising those bytes, the load folds away to the constant.
     let cfg = SpecConfig {
-        const_overlays: vec![(16, value.to_le_bytes().to_vec())],
+        const_overlays: vec![(16400, value.to_le_bytes().to_vec())],
         ..SpecConfig::default()
     };
     let folded = specialize_with_config(&m, 0, &[], &cfg).expect("specializes");
@@ -737,8 +739,8 @@ fn build_float_interpreter(program: &[(u8, i64)]) -> Module {
     let header = Block {
         params: vec![f64t(), i64t(), f64t()], // 0: facc, 1: pc, 2: finput
         insts: vec![
-            Inst::ConstI64(0), // 3: base
-            iadd(3, 1),        // 4: addr = base + pc
+            Inst::ConstI64(16384), // 3: base (above the #1094 NULL guard)
+            iadd(3, 1),            // 4: addr = base + pc
             Inst::Load {
                 op: LoadOp::I32_8U,
                 addr: 4,
@@ -785,7 +787,7 @@ fn build_float_interpreter(program: &[(u8, i64)]) -> Module {
         }],
         memory: Some(Memory { size_log2: 16 }),
         data: vec![Data {
-            offset: 0,
+            offset: 16384, // above the #1094 NULL guard
             readonly: true,
             bytes: encode(program),
         }],
@@ -879,7 +881,7 @@ fn private_rename_allows_dynamic_heap_access() {
         memory: Some(Memory { size_log2: 16 }),
         // The heap cell *ptr will point at: a writable word holding 100.
         data: vec![Data {
-            offset: 4096,
+            offset: 20480, // 4096 + the #1094 NULL guard
             readonly: false,
             bytes: 100i64.to_le_bytes().to_vec(),
         }],
@@ -920,10 +922,10 @@ fn private_rename_allows_dynamic_heap_access() {
     assert_eq!(n_load, 1, "the heap load survives");
     assert_eq!(n_store, 0, "the operand-stack store is renamed away");
 
-    // ptr = 4096 -> *ptr = 100 -> 7 + 100 = 107.
-    assert_eq!(run(&h, &[Value::I64(4096)]), Ok(vec![Value::I64(107)]));
+    // ptr = 20480 -> *ptr = 100 -> 7 + 100 = 107.
+    assert_eq!(run(&h, &[Value::I64(20480)]), Ok(vec![Value::I64(107)]));
     assert_eq!(
-        run(&residual, &[Value::I64(4096)]),
+        run(&residual, &[Value::I64(20480)]),
         Ok(vec![Value::I64(107)])
     );
 }
@@ -1303,7 +1305,7 @@ fn build_call_interpreter(program: &[(u8, i64)]) -> Module {
     let header = Block {
         params: vec![i64t(), i64t(), i64t()], // 0: acc, 1: pc, 2: input
         insts: vec![
-            Inst::ConstI64(0),          // 3: base
+            Inst::ConstI64(16384),      // 3: base (above the #1094 NULL guard)
             add(3, 1),                  // 4: addr
             load(LoadOp::I32_8U, 4, 0), // 5: op
             load(LoadOp::I64, 4, 1),    // 6: imm
@@ -1382,7 +1384,7 @@ fn build_call_interpreter(program: &[(u8, i64)]) -> Module {
         ],
         memory: Some(Memory { size_log2: 16 }),
         data: vec![Data {
-            offset: 0,
+            offset: 16384, // above the #1094 NULL guard
             readonly: true,
             bytes: encode(program),
         }],
@@ -2525,7 +2527,7 @@ fn indirect_call_through_constant_memory_table_inlines() {
                 blocks: vec![Block {
                     params: vec![ValType::I64], // 0: x
                     insts: vec![
-                        Inst::ConstI64(0), // 1: table address
+                        Inst::ConstI64(16384), // 1: table address (above the #1094 NULL guard)
                         Inst::Load {
                             op: LoadOp::I32,
                             addr: 1,
@@ -2544,7 +2546,7 @@ fn indirect_call_through_constant_memory_table_inlines() {
         ],
         memory: Some(Memory { size_log2: 16 }),
         data: vec![Data {
-            offset: 0,
+            offset: 16384, // above the #1094 NULL guard
             readonly: true,
             bytes: 1i32.to_le_bytes().to_vec(), // the table holds func index 1 (double)
         }],

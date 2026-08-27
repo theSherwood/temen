@@ -11,7 +11,8 @@ use std::sync::Arc;
 use temen_interp::{bytecode, Region, Value};
 use temen_text::parse_module;
 
-// Writes the accumulator to offset 8 each iteration, then returns the sum (touches linear memory).
+// Writes the accumulator to offset 16392 (above the #1094 NULL guard) each iteration, then returns
+// the sum (touches linear memory).
 const MEM: &str = r#"memory 16
 func (i64) -> (i64) {
 block 0 (v0: i64) {
@@ -24,7 +25,7 @@ block 1 (v3: i64, v4: i64, v5: i64) {
   br_if v6 2(v3, v4, v5) 3(v4)
 }
 block 2 (v7: i64, v8: i64, v9: i64) {
-  v10 = i64.const 8
+  v10 = i64.const 16392
   i64.store v10 v8
   v11 = i64.load v10
   v12 = i64.add v11 v9
@@ -56,7 +57,7 @@ block 2 (v4: i64) {
   v6 = thread.spawn 1 v5 v5
   v7 = i64.const 4
   v8 = i64.mul v4 v7
-  v9 = i64.const 16
+  v9 = i64.const 16400
   v10 = i64.add v9 v8
   i32.store v10 v6
   v11 = i64.const 1
@@ -75,7 +76,7 @@ block 4 (v14: i64) {
 block 5 (v17: i64) {
   v18 = i64.const 4
   v19 = i64.mul v17 v18
-  v20 = i64.const 16
+  v20 = i64.const 16400
   v21 = i64.add v20 v19
   v22 = i32.load v21
   v23 = thread.join v22
@@ -84,7 +85,7 @@ block 5 (v17: i64) {
   br 4(v25)
 }
 block 6 () {
-  v26 = i64.const 0
+  v26 = i64.const 16384
   v27 = i64.atomic.load v26
   return v27
   }
@@ -99,7 +100,7 @@ block 1 (v1: i64) {
   br_if v3 3() 2(v1)
 }
 block 2 (v4: i64) {
-  v5 = i64.const 0
+  v5 = i64.const 16384
   v6 = i64.const 1
   v7 = i64.atomic.rmw.add v5 v6
   v8 = i64.const -1
@@ -130,7 +131,9 @@ fn shared_window(size: usize) -> (Arc<Region>, *mut u8, std::alloc::Layout) {
 #[test]
 fn engine_runs_over_caller_owned_shared_window() {
     let m = parse_module(MEM).unwrap();
-    let init = vec![0u8; 64];
+    // The guest stores at 16392 (above the #1094 NULL guard); the captured snapshot spans `init`, so
+    // it must reach past that offset for the store to land in the compared image.
+    let init = vec![0u8; 16400];
 
     let mut f = u64::MAX;
     let (want_r, want_snap) =
@@ -153,11 +156,12 @@ fn engine_runs_over_caller_owned_shared_window() {
         got_snap, want_snap,
         "final image over shared window != engine backing"
     );
-    // The guest's store at offset 8 physically landed in the caller's buffer.
-    let in_buf = back.read_word(8, 8);
+    // The guest's store at offset 16392 (above the #1094 NULL guard) physically landed in the
+    // caller's buffer.
+    let in_buf = back.read_word(16392, 8);
     assert_eq!(
         in_buf,
-        u64::from_le_bytes(got_snap[8..16].try_into().unwrap())
+        u64::from_le_bytes(got_snap[16392..16400].try_into().unwrap())
     );
     assert_ne!(
         in_buf, 0,

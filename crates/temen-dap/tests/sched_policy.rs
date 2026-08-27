@@ -9,8 +9,9 @@ use temen_dap::{BytecodeBackend, DapServer, Debuggee, Json};
 use temen_interp::{IrPc, Stop};
 use temen_text::parse_module;
 
-/// Two workers race load/add/store on mem[0]; the root joins both and returns the count. The race
-/// gives the schedule real freedom: interleavings differ observably (the final count is 1 or 2).
+/// Two workers race load/add/store on mem[16384] (counter cell above the #1094 NULL guard); the
+/// root joins both and returns the count. The race gives the schedule real freedom: interleavings
+/// differ observably (the final count is 1 or 2).
 const RACY_COUNTER: &str = r#"
 memory 16
 func () -> (i64) {
@@ -21,14 +22,14 @@ block 0 () {
   vh1 = thread.spawn 1 vsp va
   vj0 = thread.join vh0
   vj1 = thread.join vh1
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vr = i64.load vaddr
   return vr
   }
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vc = i64.load vaddr
   vn = i64.add vc varg
   i64.store vaddr vn

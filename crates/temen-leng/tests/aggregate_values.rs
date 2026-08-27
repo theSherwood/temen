@@ -32,7 +32,7 @@ fn object_constructor_then_read() {
    (var :p.0 . Pt.0. (oconstr Pt.0. (kv x.0 a.0) (kv y.0 b.0)))
    (ret (add (i +64) (dot p.0 x.0 0) (dot p.0 y.0 0))))))";
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
-    let sp = 4096;
+    let sp = 20480;
     assert_eq!(run(&m, 0, &[sp, 3, 4]), 7);
     assert_eq!(run(&m, 0, &[sp, 10, -25]), -15);
 }
@@ -54,7 +54,7 @@ fn whole_aggregate_copy() {
         text.contains("mem.copy"),
         "copy should use mem.copy:\n{text}"
     );
-    assert_eq!(run(&m, 0, &[8192, 5, 6]), 11);
+    assert_eq!(run(&m, 0, &[24576, 5, 6]), 11);
 }
 
 #[test]
@@ -68,7 +68,7 @@ fn array_constructor_then_index() {
    (var :a.0 . Arr3.0. (aconstr Arr3.0. 10 20 30))
    (ret (add (i +64) (add (i +64) (at a.0 0) (at a.0 1)) (at a.0 2))))))";
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
-    assert_eq!(run(&m, 0, &[4096]), 60);
+    assert_eq!(run(&m, 0, &[20480]), 60);
 }
 
 /// Real nimony `hexer` output for `mkSum(a,b): var p = Pt(x:a,y:b); p.x + p.y` — genuine
@@ -78,7 +78,7 @@ fn real_nimony_oconstr() {
     const REAL: &str = include_str!("fixtures/real_oconstr.leng.nif");
     let m = temen_leng::translate_proc(REAL, "mkSum.0.")
         .unwrap_or_else(|e| panic!("translate real mkSum: {e}"));
-    let sp = 4096;
+    let sp = 20480;
     assert_eq!(run(&m, 0, &[sp, 3, 4]), 7);
     assert_eq!(run(&m, 0, &[sp, 100, 200]), 300);
 }

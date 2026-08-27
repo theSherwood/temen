@@ -92,7 +92,7 @@ block 1 (v3: i64, v4: i64, v5: i64) {
   br_if v6 2(v3, v4, v5) 3(v4)
 }
 block 2 (v7: i64, v8: i64, v9: i64) {
-  v10 = i64.const 8
+  v10 = i64.const 16392
   i64.store v10 v8
   v11 = i64.load v10
   v12 = i64.add v11 v9
@@ -136,7 +136,7 @@ block 2 (v4: i64) {
   v6 = thread.spawn 1 v5 v5
   v7 = i64.const 4
   v8 = i64.mul v4 v7
-  v9 = i64.const 16
+  v9 = i64.const 16400
   v10 = i64.add v9 v8
   i32.store v10 v6
   v11 = i64.const 1
@@ -155,7 +155,7 @@ block 4 (v14: i64) {
 block 5 (v17: i64) {
   v18 = i64.const 4
   v19 = i64.mul v17 v18
-  v20 = i64.const 16
+  v20 = i64.const 16400
   v21 = i64.add v20 v19
   v22 = i32.load v21
   v23 = thread.join v22
@@ -164,7 +164,7 @@ block 5 (v17: i64) {
   br 4(v25)
 }
 block 6 () {
-  v26 = i64.const 0
+  v26 = i64.const 16384
   v27 = i64.atomic.load v26
   return v27
   }
@@ -179,7 +179,7 @@ block 1 (v1: i64) {
   br_if v3 3() 2(v1)
 }
 block 2 (v4: i64) {
-  v5 = i64.const 0
+  v5 = i64.const 16384
   v6 = i64.const 1
   v7 = i64.atomic.rmw.add v5 v6
   v8 = i64.const -1
@@ -217,7 +217,7 @@ block 2 (v4: i64) {
   v6 = thread.spawn 1 v5 v5
   v7 = i64.const 4
   v8 = i64.mul v4 v7
-  v9 = i64.const 16
+  v9 = i64.const 16400
   v10 = i64.add v9 v8
   i32.store v10 v6
   v11 = i64.const 1
@@ -236,7 +236,7 @@ block 4 (v14: i64) {
 block 5 (v17: i64) {
   v18 = i64.const 4
   v19 = i64.mul v17 v18
-  v20 = i64.const 16
+  v20 = i64.const 16400
   v21 = i64.add v20 v19
   v22 = i32.load v21
   v23 = thread.join v22
@@ -245,7 +245,7 @@ block 5 (v17: i64) {
   br 4(v25)
 }
 block 6 () {
-  v26 = i64.const 0
+  v26 = i64.const 16384
   v27 = i64.atomic.load v26
   return v27
   }
@@ -253,7 +253,7 @@ block 6 () {
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, v0: i64) {
   v1 = call 2 (v0)
-  v2 = i64.const 0
+  v2 = i64.const 16384
   v3 = i64.atomic.rmw.add v2 v1
   v4 = i64.const 0
   return v4
@@ -279,8 +279,8 @@ block 3 (v9: i64) {
 }
 "#;
 
-// Futex handoff: the root spawns a producer, then `memory.wait`s on the flag at mem[0]; the producer
-// writes the payload at mem[8], sets the flag, and `memory.notify`s it. The root then reads the
+// Futex handoff: the root spawns a producer, then `memory.wait`s on the flag at mem[16384]; the producer
+// writes the payload at mem[16392], sets the flag, and `memory.notify`s it. The root then reads the
 // payload → 987654 on every interleaving. Exercises the wasm parallel driver's wait/notify path
 // (Atomics.wait/notify across Workers), not just spawn/join.
 const FUTEX: &str = r#"
@@ -289,11 +289,11 @@ func () -> (i64) {
 block 0 () {
   v3 = i64.const 0
   v4 = thread.spawn 1 v3 v3
-  v0 = i64.const 0
+  v0 = i64.const 16384
   v1 = i32.const 0
   v2 = i64.const 1000000000
   v5 = i32.atomic.wait v0 v1 v2
-  v6 = i64.const 8
+  v6 = i64.const 16392
   v7 = i64.atomic.load v6
   v8 = thread.join v4
   return v7
@@ -301,13 +301,13 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, v0: i64) {
-  v1 = i64.const 8
+  v1 = i64.const 16392
   v2 = i64.const 987654
   i64.atomic.store v1 v2
-  v3 = i64.const 0
+  v3 = i64.const 16384
   v4 = i32.const 1
   i32.atomic.store v3 v4
-  v5 = i64.const 0
+  v5 = i64.const 16384
   v6 = i32.const 1
   v7 = atomic.notify v5 v6
   v8 = i64.const 0
@@ -324,10 +324,10 @@ block 0 (vsp: i64, v0: i64) {
 // `(out, in, exit)`: write a fixed 17-byte greeting to stdout via Stream.write (type 0, op 1).
 const PB_HELLO: &str = r#"
 memory 16
-data 0 "hello, powerbox!\n"
+data 16384 "hello, powerbox!\n"
 func (i32, i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  v3 = i64.const 0
+  v3 = i64.const 16384
   v4 = i64.const 17
   v5 = call.cap 0 1 (i64, i64) -> (i64) v0(v3, v4)
   v6 = i32.const 0
@@ -342,7 +342,7 @@ const PB_ECHO: &str = r#"
 memory 16
 func (i32, i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  v3 = i64.const 0
+  v3 = i64.const 16384
   v4 = i64.const 256
   v5 = call.cap 0 0 (i64, i64) -> (i64) v1(v3, v4)
   v6 = call.cap 0 1 (i64, i64) -> (i64) v0(v3, v5)
@@ -383,10 +383,10 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 // proving role routing (Out → stdout, Err → stderr).
 const PB_STDERR: &str = r#"
 memory 16
-data 0 "warning!\n"
+data 16384 "warning!\n"
 func (i32, i32, i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
-  v4 = i64.const 0
+  v4 = i64.const 16384
   v5 = i64.const 9
   v6 = call.cap 0 1 (i64, i64) -> (i64) v3(v4, v5)
   v7 = i32.const 0
@@ -398,17 +398,18 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
 // `(out, in, exit)`: F7 name→handle resolution through the powerbox — `self.resolve "stdout"`
 // re-finds the stdout handle **at runtime** (never reading the param slot), then writes through it.
 // Works only because the powerbox registers its caps under canonical names (PR #118); a regression in
-// either build diverges on stdout. The name "stdout" lives at offset 4096, the payload at 0.
+// either build diverges on stdout. The name "stdout" lives at offset 20480, the payload at 16384
+// (both above the #1094 NULL guard).
 const PB_RESOLVE: &str = r#"
 memory 16
-data 0 "via resolve\n"
-data 4096 "stdout"
+data 16384 "via resolve\n"
+data 20480 "stdout"
 func (i32, i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  v3 = i64.const 4096
+  v3 = i64.const 20480
   v4 = i64.const 6
   v5 = self.resolve v3 v4
-  v6 = i64.const 0
+  v6 = i64.const 16384
   v7 = i64.const 12
   v8 = call.cap 0 1 (i64, i64) -> (i64) v5(v6, v7)
   v9 = i32.const 0
@@ -423,11 +424,11 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 // asserts the bytes reached the host import and the host clock value flowed back to the guest.
 const LIVE_GUEST: &str = r#"
 memory 16
-data 0 "live from wasm!\n"
+data 16384 "live from wasm!\n"
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
   v2 = i64.const 0
-  v3 = i64.const 0
+  v3 = i64.const 16384
   v4 = i64.const 16
   v5 = call.cap 13 1 (i64, i64, i64) -> (i64) v0(v2, v3, v4)
   v6 = call.cap 13 0 () -> (i64) v1()
@@ -440,10 +441,10 @@ block 0 (v0: i32, v1: i32) {
 // window, reads up to 4 MiB of stdin and echoes it to stdout — used to push **megabytes** through
 // `temen_alloc`ed buffers, well past the old fixed 1 MiB scratch cap.
 const BIG_ECHO: &str = r#"
-memory 22
+memory 23
 func (i32, i32, i32) -> (i32) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  v3 = i64.const 0
+  v3 = i64.const 16384
   v4 = i64.const 4194304
   v5 = call.cap 0 0 (i64, i64) -> (i64) v1(v3, v4)
   v6 = call.cap 0 1 (i64, i64) -> (i64) v0(v3, v5)
@@ -826,7 +827,7 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
 
 // ---- §22 guest-JIT **across Workers** (THREADS.md 4c-domain C2) ----------------------------------
 // The root gets `(jit, code)` from the shared powerbox, packs both into the single `thread.spawn` arg
-// (`(code << 32) | jit`), spawns 8 worker vCPUs, joins them, and returns the shared counter at mem[8].
+// (`(code << 32) | jit`), spawns 8 worker vCPUs, joins them, and returns the shared counter at mem[16392].
 // Each worker drives the host-compiled unit `JIT_SERVICE(6, 7) = 6*7 + 100 = 142` on the shared
 // `Domain` and atomically adds it → 8 × 142 = 1136. Schedule-independent (every worker computes 142),
 // so the counter matches the cooperative oracle regardless of how the Workers interleave. `THREADS_JIT`
@@ -854,7 +855,7 @@ block 2 (vi2: i64, vp2: i64) {
   vt = thread.spawn 1 vsp vp2
   v4 = i64.const 4
   v5 = i64.mul vi2 v4
-  v6 = i64.const 16
+  v6 = i64.const 16400
   v7 = i64.add v6 v5
   i32.store v7 vt
   v8 = i64.const 1
@@ -873,7 +874,7 @@ block 4 (vj: i64) {
 block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
-  v15 = i64.const 16
+  v15 = i64.const 16400
   v16 = i64.add v15 v14
   v17 = i32.load v16
   v18 = thread.join v17
@@ -882,7 +883,7 @@ block 5 (vj2: i64) {
   br 4(v20)
 }
 block 6 () {
-  v21 = i64.const 8
+  v21 = i64.const 16392
   v22 = i64.atomic.load v21
   return v22
   }
@@ -898,7 +899,7 @@ block 0 (vsp: i64, vp: i64) {
   vb = i32.const 7
   vr = call.cap 11 1 (i64, i32, i32) -> (i32) vjit (vcode, va, vb)
   vr64 = i64.extend_i32_u vr
-  vc8 = i64.const 8
+  vc8 = i64.const 16392
   vold = i64.atomic.rmw.add vc8 vr64
   vret = i64.const 0
   return vret
@@ -932,7 +933,7 @@ block 2 (vi2: i64, vp2: i64) {
   vt = thread.spawn 1 vsp vp2
   v4 = i64.const 4
   v5 = i64.mul vi2 v4
-  v6 = i64.const 16
+  v6 = i64.const 16400
   v7 = i64.add v6 v5
   i32.store v7 vt
   v8 = i64.const 1
@@ -951,7 +952,7 @@ block 4 (vj: i64) {
 block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
-  v15 = i64.const 16
+  v15 = i64.const 16400
   v16 = i64.add v15 v14
   v17 = i32.load v16
   v18 = thread.join v17
@@ -960,7 +961,7 @@ block 5 (vj2: i64) {
   br 4(v20)
 }
 block 6 () {
-  v21 = i64.const 8
+  v21 = i64.const 16392
   v22 = i64.atomic.load v21
   return v22
   }
@@ -976,7 +977,7 @@ block 0 (vsp: i64, vp: i64) {
   vb = f64.const 7.0
   vr = call.cap 11 1 (i64, f64, f64) -> (f64) vjit (vcode, va, vb)
   vr64 = i64.trunc_f64_s vr
-  vc8 = i64.const 8
+  vc8 = i64.const 16392
   vold = i64.atomic.rmw.add vc8 vr64
   vret = i64.const 0
   return vret
@@ -1008,7 +1009,7 @@ block 2 (vi2: i64, vp2: i64) {
   vt = thread.spawn 1 vsp vp2
   v4 = i64.const 4
   v5 = i64.mul vi2 v4
-  v6 = i64.const 16
+  v6 = i64.const 16400
   v7 = i64.add v6 v5
   i32.store v7 vt
   v8 = i64.const 1
@@ -1027,7 +1028,7 @@ block 4 (vj: i64) {
 block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
-  v15 = i64.const 16
+  v15 = i64.const 16400
   v16 = i64.add v15 v14
   v17 = i32.load v16
   v18 = thread.join v17
@@ -1036,7 +1037,7 @@ block 5 (vj2: i64) {
   br 4(v20)
 }
 block 6 () {
-  v21 = i64.const 8
+  v21 = i64.const 16392
   v22 = i64.atomic.load v21
   return v22
   }
@@ -1054,7 +1055,7 @@ block 0 (vsp: i64, vp: i64) {
   vb = i32.const 7
   vr = call.dyn (i32, i32) -> (i32) vslot32 (va, vb)
   vr64 = i64.extend_i32_u vr
-  vc8 = i64.const 8
+  vc8 = i64.const 16392
   vold = i64.atomic.rmw.add vc8 vr64
   vret = i64.const 0
   return vret
@@ -1064,7 +1065,7 @@ block 0 (vsp: i64, vp: i64) {
 
 // ---- §14 instantiate **across Workers** (THREADS.md 4c-domain §14-D2) ----------------------------
 // Browser-sized: carves are 64 KiB (`slog 16` — the wasm page granularity) inside a 1 MiB window
-// (`memory 20`), children at `64 KiB × (i+1)`; handles at `mem[16 + i*4]`. Ground truths (40 / 72 /
+// (`memory 20`), children at `64 KiB × (i+1)`; handles at `mem[16400 + i*4]` (above the #1094 NULL guard). Ground truths (40 / 72 /
 // 600) are asserted in the JS host, like the threads kernel's 4000.
 
 // Root `(instantiator) -> sum`: instantiate 8 same-module children (func 1), join, sum. 8 × 5 = 40.
@@ -1090,7 +1091,7 @@ block 2 (vi2: i64, vinst2: i32) {
   vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst2 (ventry, voff, vslog, vquota)
   v4 = i64.const 4
   vholo = i64.mul vi2 v4
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vhoff = i64.add v16 vholo
   i32.store vhoff vh
   vinext = i64.add vi2 vone
@@ -1109,7 +1110,7 @@ block 4 (vj: i64, vs: i64, vinst4: i32) {
 block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v4b = i64.const 4
   vjlo = i64.mul vj2 v4b
-  v16b = i64.const 16
+  v16b = i64.const 16400
   vjoff = i64.add v16b vjlo
   vhh = i32.load vjoff
   vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)
@@ -1155,7 +1156,7 @@ block 2 (vi2: i64, vinst2: i32) {
   vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst2 (ventry, voff, vslog, vquota)
   v4 = i64.const 4
   vholo = i64.mul vi2 v4
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vhoff = i64.add v16 vholo
   i32.store vhoff vh
   vinext = i64.add vi2 vone
@@ -1174,7 +1175,7 @@ block 4 (vj: i64, vs: i64, vinst4: i32) {
 block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v4b = i64.const 4
   vjlo = i64.mul vj2 v4b
-  v16b = i64.const 16
+  v16b = i64.const 16400
   vjoff = i64.add v16b vjlo
   vhh = i32.load vjoff
   vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)
@@ -1210,10 +1211,10 @@ block 0 (v0: i64) {
 // The granted "plugin" module for op 5: a 64 KiB window (== the carve, §14 transparency) with a data
 // segment `"K"` (75) at offset 0; its entry reads that own data byte and returns it.
 const THREADS_INST_UNIT: &str = r#"memory 16
-data 0 "K"
+data 16384 "K"
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   v2 = i32.load8_u v1
   v3 = i64.extend_i32_u v2
   return v3
@@ -1229,11 +1230,11 @@ block 0 (v0: i64) {
 // Worker through the confined-child completion-slot protocol (grandchildren spawn on their own
 // Workers), differential against the interpreter's driver servicing the same ops.
 const THREADS_INST_NESTED_UNIT: &str = r#"memory 16
-data 0 "K"
+data 16384 "K"
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vinst = i32.wrap_i64 v0
-  vz = i64.const 0
+  vz = i64.const 16384
   vk32 = i32.load8_u vz
   vk = i64.extend_i32_u vk32
   ventry = i64.const 1
@@ -1279,7 +1280,7 @@ block 0 (vs: i64) {
 "#;
 
 /// Root `(jit) -> counter`: spawn 8 workers, each **runtime-`compile`s** the [`JIT_RT_UNIT`] blob
-/// staged at `off` and `invoke`s its own unit (→ 7), atomically folding into `mem[8]` → 56. The
+/// staged at `off` and `invoke`s its own unit (→ 7), atomically folding into `mem[16392]` → 56. The
 /// multi-Worker twin of `bytecode_parallel_jit.rs::parallel_runtime_compile_invoke_is_sound`.
 fn jit_rt_guest(off: usize, blob_len: usize) -> String {
     format!(
@@ -1291,7 +1292,7 @@ block 0 (vsp: i64, vp: i64) {{
   vcode = call.cap 11 0 (i64, i64) -> (i64) vjit (vptr, vlen)
   vw = call.cap 11 1 (i64) -> (i32) vjit (vcode)
   vw64 = i64.extend_i32_u vw
-  vc8 = i64.const 8
+  vc8 = i64.const 16392
   vold = i64.atomic.rmw.add vc8 vw64
   vret = i64.const 0
   return vret
@@ -1320,7 +1321,7 @@ block 0 (vsp: i64, vp: i64) {{
   vcb = call.cap 11 0 (i64, i64) -> (i64) vjit (vpb, vlb)
   vr = call.cap 11 1 (i64, i64) -> (i32) vjit (vcb, vslot)
   vr64 = i64.extend_i32_u vr
-  vc8 = i64.const 8
+  vc8 = i64.const 16392
   vold = i64.atomic.rmw.add vc8 vr64
   vret = i64.const 0
   return vret
@@ -1331,7 +1332,7 @@ block 0 (vsp: i64, vp: i64) {{
 }
 
 /// The shared root skeleton of the two §22 multi-Worker twins: `(i32 jit) -> (i64)` — spawn 8
-/// workers (func 1) each handed the `Jit` handle, join them, return the folded counter at `mem[8]`.
+/// workers (func 1) each handed the `Jit` handle, join them, return the folded counter at `mem[16392]`.
 const JIT_PAR_ROOT: &str = r#"memory 16
 func (i32) -> (i64) {
 block 0 (vjit0: i32) {
@@ -1349,7 +1350,7 @@ block 2 (vi2: i64, vp2: i64) {
   vt = thread.spawn 1 vsp vp2
   v4 = i64.const 4
   v5 = i64.mul vi2 v4
-  v6 = i64.const 16
+  v6 = i64.const 16400
   v7 = i64.add v6 v5
   i32.store v7 vt
   v8 = i64.const 1
@@ -1368,7 +1369,7 @@ block 4 (vj: i64) {
 block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
-  v15 = i64.const 16
+  v15 = i64.const 16400
   v16 = i64.add v15 v14
   v17 = i32.load v16
   v18 = thread.join v17
@@ -1377,7 +1378,7 @@ block 5 (vj2: i64) {
   br 4(v20)
 }
 block 6 () {
-  v21 = i64.const 8
+  v21 = i64.const 16392
   v22 = i64.atomic.load v21
   return v22
   }
@@ -1385,7 +1386,7 @@ block 6 () {
 "#;
 
 // §11 slice 3: the granted unit's entry uses the THREAD + FUTEX primitives — spawn its own f1
-// (→ 7), join, and a mismatching i32.atomic.wait (mem[64] = 0 ≠ 99 → 1) → 71; with the same
+// (→ 7), join, and a mismatching i32.atomic.wait (mem[16448] = 0 ≠ 99 → 1) → 71; with the same
 // [`THREADS_INST_MOD`] root: 8 × 71 = 568. On the codegen tier the entry runs on emitted wasm, its
 // ops bounced through env.thread_spawn/env.thread_join/env.mem_wait — each spawned thread a real
 // Worker over the child's own carve (worker.js services them via the spawn relay + completion slot).
@@ -1396,7 +1397,7 @@ block 0 (v0: i64) {
   varg = i64.const 0
   vt = thread.spawn 1 vsp varg
   vj = thread.join vt
-  vaddr = i64.const 64
+  vaddr = i64.const 16448
   vexp = i32.const 99
   vtmo = i64.const 0
   vw = i32.atomic.wait vaddr vexp vtmo
@@ -1440,7 +1441,7 @@ block 2 (vi2: i64, vinst2: i32, vmod2: i64) {
   vh = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) vinst2 (vmod2, ventry, voff, vslog, vquota)
   v4 = i64.const 4
   vholo = i64.mul vi2 v4
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vhoff = i64.add v16 vholo
   i32.store vhoff vh
   vinext = i64.add vi2 vone
@@ -1459,7 +1460,7 @@ block 4 (vj: i64, vs: i64, vinst4: i32) {
 block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v4b = i64.const 4
   vjlo = i64.mul vj2 v4b
-  v16b = i64.const 16
+  v16b = i64.const 16400
   vjoff = i64.add v16b vjlo
   vhh = i32.load vjoff
   vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)
@@ -1479,7 +1480,7 @@ block 6 (vs3: i64) {
 // `call.cap`-writes the SAME 5-byte line and bumps a shared counter — so result (8) AND stdout
 // ("tick\n" × 8) are schedule-independent. Ground truth asserted in the JS host.
 const THREADS_IO: &str = r#"memory 16
-data 0 "tick\n"
+data 16384 "tick\n"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   vh0 = i64.extend_i32_u v0
@@ -1496,7 +1497,7 @@ block 2 (vi2: i64, vhh2: i64) {
   vt = thread.spawn 1 vsp vhh2
   v4 = i64.const 4
   v5 = i64.mul vi2 v4
-  v6 = i64.const 16
+  v6 = i64.const 16400
   v7 = i64.add v6 v5
   i32.store v7 vt
   v8 = i64.const 1
@@ -1515,7 +1516,7 @@ block 4 (vj: i64) {
 block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
-  v15 = i64.const 16
+  v15 = i64.const 16400
   v16 = i64.add v15 v14
   v17 = i32.load v16
   v18 = thread.join v17
@@ -1524,7 +1525,7 @@ block 5 (vj2: i64) {
   br 4(v20)
 }
 block 6 () {
-  v21 = i64.const 8
+  v21 = i64.const 16392
   v22 = i64.atomic.load v21
   return v22
   }
@@ -1532,10 +1533,10 @@ block 6 () {
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, vh: i64) {
   vhandle = i32.wrap_i64 vh
-  vptr = i64.const 0
+  vptr = i64.const 16384
   vlen = i64.const 5
   vw = call.cap 0 1 (i64, i64) -> (i64) vhandle(vptr, vlen)
-  v1 = i64.const 8
+  v1 = i64.const 16392
   v2 = i64.const 1
   v3 = i64.atomic.rmw.add v1 v2
   v4 = i64.const 0
@@ -1587,12 +1588,14 @@ func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = call.cap 4 3 () -> (i64) v0 ()
   v2 = i64.const 0
+  vwin = i64.const 16384
+  vwin2 = i64.add vwin v1
   v3 = i32.const 3
-  v4 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (v2, v2, v1, v3)
-  v5 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (v1, v2, v1, v3)
+  v4 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (vwin, v2, v1, v3)
+  v5 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (vwin2, v2, v1, v3)
   v6 = i64.const 81985529216486895
-  i64.store v2 v6
-  v7 = i64.load v1
+  i64.store vwin v6
+  v7 = i64.load vwin2
   return v7
   }
 }
@@ -1723,7 +1726,7 @@ const SIMD_MEM: &str = r#"memory 16
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   v1 = i64x2.splat v0
-  v2 = i64.const 0
+  v2 = i64.const 16384
   v128.store v2 v1
   v3 = v128.load v2
   v4 = i64x2.extract_lane 1 v3
@@ -2185,8 +2188,8 @@ fn main() {
     let b2_len = temen_encode::encode_module(&temen_text::parse_module(JIT_B2_UNIT).unwrap()).len();
     emit("jit_rt_unit", JIT_RT_UNIT);
     emit("jit_b2_unit", JIT_B2_UNIT);
-    emit("jit_rt", &jit_rt_guest(0x2000, rt_len));
-    emit("jit_b2", &jit_b2_guest(0x2000, rt_len, 0x3000, b2_len));
+    emit("jit_rt", &jit_rt_guest(0x6000, rt_len));
+    emit("jit_b2", &jit_b2_guest(0x6000, rt_len, 0x7000, b2_len));
     // 4d host I/O across Workers — ground truth (result 8, stdout "tick\n"×8) asserted in JS.
     emit("threads_io", THREADS_IO);
     // wasm-JIT **tier-up** across Workers (BROWSER.md § "wasm-JIT tier", per-Worker JIT) — the 4000

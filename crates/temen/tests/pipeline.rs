@@ -879,7 +879,7 @@ fn store_then_load_roundtrips() {
     assert_eq!(
         run1(
             MEM_ROUNDTRIP,
-            &[Value::I64(128), Value::I64(0x0123_4567_89ab_cdef)]
+            &[Value::I64(16512), Value::I64(0x0123_4567_89ab_cdef)]
         ),
         Ok(vec![Value::I64(0x0123_4567_89ab_cdef)])
     );
@@ -889,7 +889,7 @@ fn store_then_load_roundtrips() {
 fn narrow_store_load_truncates_and_extends() {
     // store8 of 0x1ff keeps only 0xff; load8_u zero-extends -> 255.
     assert_eq!(
-        run1(MEM_NARROW, &[Value::I64(8), Value::I32(0x1ff)]),
+        run1(MEM_NARROW, &[Value::I64(16392), Value::I32(0x1ff)]),
         Ok(vec![Value::I32(255)])
     );
     // load8_s of 0x80 sign-extends -> -128.
@@ -904,7 +904,7 @@ block 0 (v0: i64, v1: i32) {
 }
 "#;
     assert_eq!(
-        run1(signed, &[Value::I64(8), Value::I32(0x80)]),
+        run1(signed, &[Value::I64(16392), Value::I32(0x80)]),
         Ok(vec![Value::I32(-128)])
     );
 }
@@ -933,11 +933,15 @@ block 0 (v0: i64, v1: i64, v2: i64) {
         ),
         Err(Trap::MemoryFault)
     );
-    // An in-window access is unaffected: store at 8, load it back.
+    // An in-window access is unaffected: store at 16392, load it back.
     assert_eq!(
         run1(
             src,
-            &[Value::I64(8), Value::I64(8), Value::I64(0xdead_beef)]
+            &[
+                Value::I64(16392),
+                Value::I64(16392),
+                Value::I64(0xdead_beef)
+            ]
         ),
         Ok(vec![Value::I64(0xdead_beef)])
     );
@@ -975,7 +979,7 @@ block 0 (v0: i64) {
   }
 }
 "#;
-    assert_eq!(run1(src, &[Value::I64(0)]), Ok(vec![Value::I32(777)]));
+    assert_eq!(run1(src, &[Value::I64(16384)]), Ok(vec![Value::I32(777)]));
 }
 
 #[test]
@@ -1697,19 +1701,20 @@ fn verifier_rejects_ref_func_out_of_range() {
 
 // ---- capabilities: call.cap, the host-owned handle table, the mock powerbox (§3c/§3e) ----
 
-// Store "Hi" into the window, then write(ptr=0, len=2) to the Stream handle (v0).
+// Store "Hi" into the window, then write(ptr=16384, len=2) to the Stream handle (v0).
+// (#1094: addresses sit above the [0, 16384) NULL guard.)
 const CAP_WRITE: &str = r#"
 memory 16
 
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   v2 = i32.const 72
   i32.store8 v1 v2
-  v3 = i64.const 1
+  v3 = i64.const 16385
   v4 = i32.const 105
   i32.store8 v3 v4
-  v5 = i64.const 0
+  v5 = i64.const 16384
   v6 = i64.const 2
   v7 = call.cap 0 1 (i64, i64) -> (i64) v0 (v5, v6)
   return v7
@@ -1733,13 +1738,14 @@ fn cap_stream_write_captures_output() {
     assert_eq!(host.stdout, b"Hi", "host captured the written bytes");
 }
 
-// read(ptr=0, len=4) from the Stream handle, then load the first byte back.
+// read(ptr=16384, len=4) from the Stream handle, then load the first byte back.
+// (#1094: the ptr sits above the [0, 16384) NULL guard.)
 const CAP_READ: &str = r#"
 memory 16
 
 func (i32) -> (i32) {
 block 0 (v0: i32) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   v2 = i64.const 4
   v3 = call.cap 0 0 (i64, i64) -> (i64) v0 (v1, v2)
   v4 = i32.load8_u v1

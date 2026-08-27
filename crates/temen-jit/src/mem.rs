@@ -164,9 +164,9 @@ impl GuestWindow {
         unsafe { pal::protect(self.base.add(start), end - start, Prot::None) };
     }
 
-    /// #964: reserve `[0, guard)` inaccessible — the NULL guard of a `__null_guard`-marked
-    /// module: a NULL dereference faults into the guard handler (hardware enforcement at zero
-    /// per-access cost), matching the interpreter oracle's `[0, guard)` `Unmapped` seeding.
+    /// #964/#1094: reserve `[0, guard)` inaccessible — the unconditional NULL guard: a NULL
+    /// dereference faults into the guard handler (hardware enforcement at zero per-access cost),
+    /// matching the interpreter oracle's `[0, guard)` `Unmapped` seeding.
     /// Page-granular, so it engages only when `guard` is host-page-exact (4 KiB / 16 KiB hosts;
     /// on a larger-page host protecting would swallow live scratch above the guard, so it skips —
     /// and the interpreter skips identically, keeping the tiers trap-parity per platform).
@@ -586,16 +586,46 @@ mod pal {
 
     /// Set the protection of a committed range `[base, base+len)`.
     ///
+    /// Walks the range with `VirtualQuery` and protects each committed region's intersection
+    /// separately: unlike unix `mprotect`, `VirtualProtect` **cannot span distinct allocations**,
+    /// and a §13 region map splits the window reservation into several (committed-private
+    /// fragments + mapped section views). A single spanning call then fails wholesale — leaving
+    /// e.g. the #1094 NULL-guard pages `NOACCESS` after `restore_rw`, so the post-run snapshot's
+    /// raw window read AVs in host code (the windows `jit_diff` STATUS_ACCESS_VIOLATION).
+    /// Non-committed fragments (placeholders) are skipped — they can't be protected.
+    ///
     /// # Safety
-    /// `[base, base+len)` must be a committed sub-range of a window reservation.
+    /// `[base, base+len)` must lie within a window reservation.
     pub(super) unsafe fn protect(base: *mut u8, len: usize, prot: Prot) {
         let flags: PAGE_PROTECTION_FLAGS = match prot {
             Prot::Rw => PAGE_READWRITE,
             Prot::Ro => PAGE_READONLY,
             Prot::None => PAGE_NOACCESS,
         };
-        let mut old: PAGE_PROTECTION_FLAGS = 0;
-        VirtualProtect(base as *const c_void, len, flags, &mut old);
+        let end = base as usize + len;
+        let mut addr = base as usize;
+        while addr < end {
+            let mut mbi: MEMORY_BASIC_INFORMATION = core::mem::zeroed();
+            if VirtualQuery(
+                addr as *const c_void,
+                &mut mbi,
+                core::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            ) == 0
+            {
+                break;
+            }
+            let region_end = mbi.BaseAddress as usize + mbi.RegionSize;
+            let b = end.min(region_end);
+            if mbi.State == MEM_COMMIT && b > addr {
+                let mut old: PAGE_PROTECTION_FLAGS = 0;
+                VirtualProtect(addr as *const c_void, b - addr, flags, &mut old);
+            }
+            addr = if region_end > addr {
+                region_end
+            } else {
+                addr + page_size()
+            };
+        }
     }
 
     /// Release a whole reservation from [`reserve`] — **every fragment of it**. After [`commit_rw`]
@@ -636,9 +666,23 @@ mod pal {
                     MEM_PRESERVE_PLACEHOLDER,
                 );
                 VirtualFree(region_base as *mut c_void, 0, MEM_RELEASE);
-            } else if mbi.State == MEM_COMMIT || mbi.State == MEM_RESERVE {
-                // A committed-private region or a leftover placeholder: free the whole fragment.
-                VirtualFree(mbi.AllocationBase, 0, MEM_RELEASE);
+            } else if mbi.State == MEM_COMMIT {
+                // A committed-private fragment. Free by its **exact queried range**, never by
+                // `mbi.AllocationBase`: after §13 interior view maps split the original commit, the
+                // committed remainders can still report the window base as their allocation base —
+                // a range this walk already released, which a concurrent thread may have reused, so
+                // a `VirtualFree(AllocationBase, 0, MEM_RELEASE)` here frees *another thread's live
+                // allocation* (the parallel-test STATUS_ACCESS_VIOLATION). Shrink the fragment to a
+                // placeholder (exact bounds), then release that placeholder.
+                VirtualFree(
+                    region_base as *mut c_void,
+                    mbi.RegionSize,
+                    MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+                );
+                VirtualFree(region_base as *mut c_void, 0, MEM_RELEASE);
+            } else if mbi.State == MEM_RESERVE {
+                // A leftover placeholder fragment: its region base is its allocation base; release it.
+                VirtualFree(region_base as *mut c_void, 0, MEM_RELEASE);
             }
             addr = if next > addr {
                 next
@@ -811,6 +855,44 @@ mod pal {
         (n >= 0).then(|| (pc, rets[..n as usize].to_vec(), fiber))
     }
 
+    /// The TEB stack-bound fields (`StackBase`/`StackLimit`/`DeallocationStack` — the same trio the
+    /// fiber switch swaps, at the same x64 offsets as `temen-fiber`'s `switch_x86_64_windows.rs`).
+    /// A trap inside a *fiber* unwinds to `run_guarded`'s recovery point on the root stack via a
+    /// `CONTEXT` restore, which does **not** touch the TEB — so without an explicit restore the
+    /// thread keeps the fiber's stack fields, and at thread exit the kernel frees
+    /// `DeallocationStack` = the fiber's arena slot. When that slot is an arena **allocation base**
+    /// the whole control-stack arena is released and the next fiber bootstrap write AVs (the
+    /// windows `jit_fibers` STATUS_ACCESS_VIOLATION, reproduced + verified under Wine). Non-x86-64
+    /// windows has no fiber switch (fiber_rt is x86-64-gated), so nothing to restore there.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn teb_stack_fields() -> (u64, u64, u64) {
+        let (b, l, d): (u64, u64, u64);
+        core::arch::asm!(
+            "mov {t}, gs:[0x30]",
+            "mov {b}, [{t} + 0x08]",
+            "mov {l}, [{t} + 0x10]",
+            "mov {d}, [{t} + 0x1478]",
+            t = out(reg) _, b = out(reg) b, l = out(reg) l, d = out(reg) d,
+            options(nostack, preserves_flags),
+        );
+        (b, l, d)
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn restore_teb_stack_fields(fields: (u64, u64, u64)) {
+        core::arch::asm!(
+            "mov {t}, gs:[0x30]",
+            "mov [{t} + 0x08], {b}",
+            "mov [{t} + 0x10], {l}",
+            "mov [{t} + 0x1478], {d}",
+            t = out(reg) _, b = in(reg) fields.0, l = in(reg) fields.1, d = in(reg) fields.2,
+            options(nostack, preserves_flags),
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    unsafe fn teb_stack_fields() {}
+    #[cfg(not(target_arch = "x86_64"))]
+    unsafe fn restore_teb_stack_fields(_fields: ()) {}
+
     /// Run `f` under the handler; `true` if an in-`[lo,hi)` access violation was caught.
     ///
     /// # Safety
@@ -830,11 +912,16 @@ mod pal {
         // §14 child guest can run (in its own window) inside the parent's guarded call. A child fault
         // resumes at the child's `saved` context; the parent's frame is restored afterwards intact.
         let prev = GUARD.with(|g| g.replace(None));
+        // Snapshot the TEB stack fields with the recovery point: a fiber-side fault unwinds here
+        // without the fiber switch-back, and the `CONTEXT` restore leaves the fiber's TEB values in
+        // place (see `teb_stack_fields`) — restore them on the tripped path.
+        let teb = teb_stack_fields();
         let mut saved = AlignedContext(core::mem::zeroed());
         // Capture the recovery point. On a guard fault the VEH copies `saved` over the fault context,
         // so execution resumes *here* with TRIPPED set — the longjmp-equivalent return.
         RtlCaptureContext(&mut saved.0);
         if TRIPPED.with(|x| x.replace(false)) {
+            restore_teb_stack_fields(teb); // undo a fiber-side fault's leftover TEB stack fields
             GUARD.with(|g| g.set(prev)); // restore the parent's frame; report the caught fault
             return true;
         }

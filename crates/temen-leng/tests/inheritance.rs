@@ -42,8 +42,8 @@ fn derived_layout_inlines_base_after_vtable() {
   (stmts .
    (ret (oconstr Derived.0. (kv value.0 a.0) (kv extra.0 b.0))))))";
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
-    let dst = 512usize;
-    let mem = run_void_capture(&m, 0, &[dst as i64, 5, 7], 4096);
+    let dst = 16896usize; // 512 + 16384, above the unconditional NULL guard (#1094)
+    let mem = run_void_capture(&m, 0, &[dst as i64, 5, 7], 32768);
     assert_eq!(read_i64(&mem, dst), 0, "vtable slot (unset) at 0");
     assert_eq!(read_i64(&mem, dst + 8), 5, "base field `value` at 8");
     assert_eq!(read_i64(&mem, dst + 16), 7, "derived field `extra` at 16");
@@ -63,8 +63,8 @@ fn rtti_vtable_field_reads_by_name() {
   (stmts .
    (ret (dot (deref d.0) vt.00 2)))))";
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
-    let obj = 256usize;
-    let mut seed = vec![0u8; 4096];
+    let obj = 16640usize; // 256 + 16384, above the unconditional NULL guard (#1094)
+    let mut seed = vec![0u8; 32768];
     seed[obj..obj + 8].copy_from_slice(&0xABCDi64.to_le_bytes()); // vt header at offset 0
     seed[obj + 8..obj + 16].copy_from_slice(&42i64.to_le_bytes());
     temen_verify::verify_module(&m).unwrap();
@@ -90,9 +90,10 @@ fn base_field_read_through_pointer() {
   (stmts .
    (ret (dot (deref d.0) value.0 0)))))";
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
-    // Build a Derived {vtable:0, value:42, extra:99} at offset 256 and read its base `value`.
-    let obj = 256usize;
-    let mut seed = vec![0u8; 4096];
+    // Build a Derived {vtable:0, value:42, extra:99} at offset 16640 (256 + 16384, above the
+    // unconditional NULL guard, #1094) and read its base `value`.
+    let obj = 16640usize;
+    let mut seed = vec![0u8; 32768];
     seed[obj + 8..obj + 16].copy_from_slice(&42i64.to_le_bytes());
     seed[obj + 16..obj + 24].copy_from_slice(&99i64.to_le_bytes());
     temen_verify::verify_module(&m).unwrap();
@@ -117,8 +118,8 @@ fn real_nimony_inheritance() {
     // kindOf: `(ptr BaseError) -> i64`, reads `e.value` (offset 8, past the vtable). Runs.
     let m = temen_leng::translate_proc(REAL, "kindOf.0.")
         .unwrap_or_else(|e| panic!("translate real kindOf: {e}"));
-    let base = 256usize;
-    let mut seed = vec![0u8; 4096];
+    let base = 16640usize; // 256 + 16384, above the unconditional NULL guard (#1094)
+    let mut seed = vec![0u8; 32768];
     seed[base + 8..base + 16].copy_from_slice(&123i64.to_le_bytes());
     temen_verify::verify_module(&m).unwrap();
     let mut fuel = u64::MAX;

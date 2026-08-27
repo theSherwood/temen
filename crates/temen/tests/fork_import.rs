@@ -37,15 +37,16 @@ use temen_verify::verify_module;
 const LIBC_LE: i64 = 0x6362_696c; // b"libc"
 
 /// The manager program: `main(inst, libc, guestmod)` spawns the server, mints the fork offer, builds a
-/// 2-entry grant list {`"fork"` → offer, `"libc"` → libc} at window offset 256, spawns the guest module
+/// 2-entry grant list {`"fork"` → offer, `"libc"` → libc} at window offset 16640 (above the #1094 NULL
+/// guard), spawns the guest module
 /// via op 13 into a 4 KiB carve at 266240, and joins it. Server = func 1, handler = func 2.
 const MANAGER: &str = r#"
 memory 19
 type 0 func (i64) -> (i64)
 type 1 interface { op: 0 }
 export 0 interface "fork" 1 { op: 2 }
-data 300 "fork"
-data 310 "libc"
+data 16684 "fork"
+data 16694 "libc"
 func (i32, i32, i64) -> (i64) {
 block 0 (v0: i32, vlibc: i32, vgmod: i64) {
   vlog = i64.const 12
@@ -56,39 +57,39 @@ block 0 (v0: i32, vlibc: i32, vgmod: i64) {
   q0v2 = i64.const -4294967284
   q0v3 = i64.const 4294967295
   q0v4 = i64.const 0
-  q0a0 = i64.const 1152
+  q0a0 = i64.const 17536
   i64.store q0a0 q0v0
-  q0a1 = i64.const 1160
+  q0a1 = i64.const 17544
   i64.store q0a1 q0v1
-  q0a2 = i64.const 1168
+  q0a2 = i64.const 17552
   i64.store q0a2 q0v2
-  q0a3 = i64.const 1176
+  q0a3 = i64.const 17560
   i64.store q0a3 q0v3
-  q0a4 = i64.const 1184
+  q0a4 = i64.const 17568
   i64.store q0a4 q0v4
-  q0a5 = i64.const 1192
+  q0a5 = i64.const 17576
   i64.store q0a5 q0v4
-  q0a6 = i64.const 1200
+  q0a6 = i64.const 17584
   i64.store q0a6 q0v4
   vs = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   vz0 = i64.const 0
   vforkoff = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
-  va0 = i64.const 256
-  vnp0 = i32.const 300
+  va0 = i64.const 16640
+  vnp0 = i32.const 16684
   i32.store va0 vnp0
-  va1 = i64.const 260
+  va1 = i64.const 16644
   vfour = i32.const 4
   i32.store va1 vfour
-  va2 = i64.const 264
+  va2 = i64.const 16648
   i32.store va2 vforkoff
-  va3 = i64.const 272
-  vnp1 = i32.const 310
+  va3 = i64.const 16656
+  vnp1 = i32.const 16694
   i32.store va3 vnp1
-  va4 = i64.const 276
+  va4 = i64.const 16660
   i32.store va4 vfour
-  va5 = i64.const 280
+  va5 = i64.const 16664
   i32.store va5 vlibc
-  vgp = i64.const 256
+  vgp = i64.const 16640
   vgn = i64.const 2
   ve0 = i64.const 0
   voffg = i64.const 266240

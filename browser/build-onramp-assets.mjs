@@ -6,14 +6,13 @@
 // read-only global must not share a host page with the writable data stack (it would fault under
 // D40). The native default (16 KiB) is wrong for the browser — see the `temen-llvm` stack-page commit.
 //
-// Every clang-translated asset also gets **`--null-guard`** (#964): the guarded powerbox layout
-// (`__null_guard`-marked, scratch/args one guard up) so a NULL dereference traps on every tier.
-// The marker rides the synthesized `_start` for a `main` program; #1094 extended it to **entry-less
-// reactor kernels** too (gradient, bounce, mandelzoom, gpu_shader — `tick` only, no `main`): under the
-// guard temen-llvm bases their globals one guard up and marks them (aliasing the first function), so
-// they no longer stay a legacy carve-out and a NULL deref in a kernel traps like everywhere else.
-// The remaining un-guarded assets are the ones this toolchain can't rebuild here (the nim assets need
-// nimony); the marker gates the layout, so mixed old/new assets coexist until they are regenerated.
+// Every clang-translated asset uses the guarded powerbox layout (#964/#1094): scratch/args one guard
+// up so a NULL dereference traps on every tier. This covers a `main` program's synthesized `_start`
+// and **entry-less reactor kernels** too (gradient, bounce, mandelzoom, gpu_shader — `tick` only, no
+// `main`): temen-llvm bases their globals one guard up, so a NULL deref in a kernel traps like
+// everywhere else. The guard is **unconditional** now (#1094 — the one canonical layout; the
+// `--null-guard` flag is a redundant no-op and the `__null_guard` marker export is retired). Old
+// assets a host still runs are seeded the same way, so mixed old/new assets coexist harmlessly.
 //
 // Usage:  node build-onramp-assets.mjs           (builds whatever the toolchain + caches allow)
 // Needs `clang`/`llvm-dis` on PATH. SQLite/Lua sources are fetched-and-cached (skipped offline).

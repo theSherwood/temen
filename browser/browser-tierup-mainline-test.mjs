@@ -61,7 +61,7 @@ block 3 (vaccf: i64) {
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  va = i64.const 4096
+  va = i64.const 20480
   i64.store va v0
   vld = i64.load va
   vk = i64.const 7

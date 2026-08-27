@@ -62,8 +62,9 @@ const BYTECODE: [u32; 11] = [
 // (the host page: 4 KiB on Linux, 16 KiB on macOS/ARM64, the 64 KiB allocation granularity on
 // Windows). So it must sit on its own page, clear of the writable register file below it — otherwise
 // the RO page rounds down to include the registers and their stores fault (a real macOS/Windows-only
-// `MemoryFault`). Placing it at a 64 KiB boundary keeps the registers (which live in [0, 64)) writable
-// under every host page size. The window is then 2 pages (`memory 17` = 128 KiB).
+// `MemoryFault`). Placing it at a 64 KiB boundary keeps the registers (which live in [16384, 16456),
+// one guard up above the #1094 NULL guard) writable under every host page size. The window is then 2
+// pages (`memory 17` = 128 KiB).
 const BYTECODE_BASE: u64 = 65536;
 const LOOP_TRIPS: i64 = 50;
 
@@ -111,7 +112,7 @@ fn skeleton_src() -> String {
 memory 17
 func (i64) -> (i64) {{
 block 0 (v0: i64) {{
-  v64 = i64.const 64
+  v64 = i64.const 16448
   i64.store v64 v0
   vpc0 = i64.const 0
   br 1(vpc0)
@@ -138,7 +139,9 @@ block 3 (vpc: i64, vinstr: i32) {{
   va32m = i32.and va32 vff
   va = i64.extend_i32_u va32m
   v8 = i64.const 8
-  vraddr = i64.mul va v8
+  vroff = i64.mul va v8
+  vrbase = i64.const 16384
+  vraddr = i64.add vroff vrbase
   v15 = i32.const 15
   vbx32 = i32.shr_u vinstr v15
   v1ffff = i32.const 131071
@@ -152,20 +155,20 @@ block 3 (vpc: i64, vinstr: i32) {{
   br 1(vnpc)
 }}
 block 4 (vpc: i64, vinstr: i32) {{
-  v8 = i64.const 8
+  v8 = i64.const 16392
   vinit = i64.load v8
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vlim = i64.load v16
-  v24 = i64.const 24
+  v24 = i64.const 16408
   vstep = i64.load v24
   vdiff = i64.sub vlim vinit
   vq = i64.div_s vdiff vstep
   v1 = i64.const 1
   vcount = i64.add vq v1
   i64.store v8 vcount
-  v64 = i64.const 64
+  v64 = i64.const 16448
   vx0 = i64.load v64
-  v0a = i64.const 0
+  v0a = i64.const 16384
   i64.store v0a vx0
   vnpc = i64.add vpc v1
   br 1(vnpc)
@@ -177,7 +180,9 @@ block 5 (vpc: i64, vinstr: i32) {{
   va32m = i32.and va32 vff
   va = i64.extend_i32_u va32m
   v8 = i64.const 8
-  vraddr = i64.mul va v8
+  vroff = i64.mul va v8
+  vrbase = i64.const 16384
+  vraddr = i64.add vroff vrbase
   v24s = i32.const 24
   vc32 = i32.shr_u vinstr v24s
   vc32m = i32.and vc32 vff
@@ -192,7 +197,7 @@ block 5 (vpc: i64, vinstr: i32) {{
   br 1(vnpc)
 }}
 block 6 (vpc: i64, vinstr: i32) {{
-  v8 = i64.const 8
+  v8 = i64.const 16392
   vc = i64.load v8
   v1 = i64.const 1
   vc2 = i64.sub vc v1
@@ -216,7 +221,9 @@ block 7 (vpc: i64, vinstr: i32) {{
   va32m = i32.and va32 vff
   va = i64.extend_i32_u va32m
   v8 = i64.const 8
-  vraddr = i64.mul va v8
+  vroff = i64.mul va v8
+  vrbase = i64.const 16384
+  vraddr = i64.add vroff vrbase
   vr = i64.load vraddr
   return vr
 }}

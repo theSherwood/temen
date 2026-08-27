@@ -42,14 +42,14 @@ block 0 () {
   v0 = i64.const 43981
   v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
-  v3 = i64.const 0
+  v3 = i64.const 16384
   v4 = i64.atomic.load v3
   return v4
   }
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, v0: i64) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   i64.atomic.store v1 v0
   return v0
   }
@@ -104,7 +104,7 @@ block 0 () {
   v6 = thread.join v2
   v7 = thread.join v3
   v8 = thread.join v4
-  v9 = i64.const 0
+  v9 = i64.const 16384
   v10 = i64.atomic.load v9
   return v10
   }
@@ -114,7 +114,7 @@ block 0 (vsp: i64, v0: i64) {
   br 1(v0)
 }
 block 1 (v1: i64) {
-  v2 = i64.const 0
+  v2 = i64.const 16384
   v3 = i64.const 1
   v4 = i64.atomic.rmw.add v2 v3
   v5 = i64.const -1
@@ -216,21 +216,21 @@ block 1 (v1: i64) {
   br_if v6 1(v4) 2()
 }
 block 2 () {
-  v7 = i64.const 0
+  v7 = i64.const 16384
   v8 = i64.atomic.load v7
   v9 = i64.const 1000
   v10 = i64.eq v8 v9
   br_if v10 3() 2()
 }
 block 3 () {
-  v11 = i64.const 0
+  v11 = i64.const 16384
   v12 = i64.atomic.load v11
   return v12
   }
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, v0: i64) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   v2 = i64.const 1
   v3 = i64.atomic.rmw.add v1 v2
   v4 = i64.const 0
@@ -307,7 +307,7 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, v0: i64) {
-  v1 = i64.const 8
+  v1 = i64.const 16392
   i64.atomic.store v1 v0
   return v0
   }
@@ -315,11 +315,13 @@ block 0 (vsp: i64, v0: i64) {
 "#;
     let m = module(src);
     let mut fuel = 10_000_000u64;
-    let (res, snap) = run_capture(&m, 0, &[], &mut fuel, &[0u8; 64]);
+    // #1094: the child stores above the NULL guard (offset 16392), so the captured init/snapshot
+    // slice must reach that far.
+    let (res, snap) = run_capture(&m, 0, &[], &mut fuel, &[0u8; 16400]);
     assert_eq!(res, Ok(vec![Value::I64(255)]));
-    // The child stored the i64 255 at offset 8 (little-endian low byte 0xFF).
-    assert_eq!(snap[8], 0xFF);
-    assert_eq!(snap[9], 0x00);
+    // The child stored the i64 255 at offset 16392 (little-endian low byte 0xFF).
+    assert_eq!(snap[16392], 0xFF);
+    assert_eq!(snap[16393], 0x00);
 }
 
 /// The verifier rejects a `thread.spawn` whose target isn't the fixed thread entry type
@@ -388,7 +390,7 @@ fn wait_returns_not_equal() {
 memory 16
 func () -> (i64) {
 block 0 () {
-  v0 = i64.const 0
+  v0 = i64.const 16384
   v1 = i32.const 7
   v2 = i64.const 1000000
   v3 = i32.atomic.wait v0 v1 v2
@@ -412,7 +414,7 @@ fn wait_times_out() {
 memory 16
 func () -> (i64) {
 block 0 () {
-  v0 = i64.const 0
+  v0 = i64.const 16384
   v1 = i32.const 0
   v2 = i64.const 1000000
   v3 = i32.atomic.wait v0 v1 v2
@@ -443,14 +445,14 @@ block 0 () {
   br 1(v1)
 }
 block 1 (v2: i32) {
-  v3 = i64.const 8
+  v3 = i64.const 16392
   v4 = i64.atomic.load v3
   v5 = i64.const 1
   v6 = i64.eq v4 v5
   br_if v6 2(v2) 1(v2)
 }
 block 2 (v7: i32) {
-  v8 = i64.const 0
+  v8 = i64.const 16384
   v9 = i32.const 1
   v10 = atomic.notify v8 v9
   v11 = i32.const 0
@@ -464,10 +466,10 @@ block 3 (v13: i32) {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, v0: i64) {
-  v1 = i64.const 8
+  v1 = i64.const 16392
   v2 = i64.const 1
   i64.atomic.store v1 v2
-  v3 = i64.const 0
+  v3 = i64.const 16384
   v4 = i32.const 0
   v5 = i64.const 100000000
   v6 = i32.atomic.wait v3 v4 v5
@@ -589,7 +591,7 @@ fn ordered_atomics_and_fence_execute() {
 memory 16
 func () -> (i64) {
 block 0 () {
-  v0 = i64.const 0
+  v0 = i64.const 16384
   v1 = i64.const 5
   i64.atomic.store v0 v1
   v2 = i64.atomic.load v0

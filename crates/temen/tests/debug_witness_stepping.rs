@@ -24,14 +24,14 @@ block 0 () {
   vh1 = thread.spawn 1 vsp va
   vj0 = thread.join vh0
   vj1 = thread.join vh1
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vr = i64.load vaddr
   return vr
   }
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vc = i64.load vaddr
   vn = i64.add vc varg
   i64.store vaddr vn
@@ -100,7 +100,7 @@ fn breakpoint_during_witness_replay_stays_aligned() {
 fn watchpoint_catches_the_lost_update_race_under_the_witness() {
     let (m, plan) = lost_update_witness();
     let mut insp = Inspector::attach_scheduled(&m, 0, &[], 50_000_000, plan);
-    insp.set_watchpoint(0, 8, WatchKind::Write);
+    insp.set_watchpoint(16384, 8, WatchKind::Write);
 
     let mut about_to_write = Vec::new();
     loop {

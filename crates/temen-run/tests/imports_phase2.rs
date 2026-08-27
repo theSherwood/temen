@@ -10,43 +10,43 @@ use temen_interp::cap_id;
 use temen_run::{instantiate_with_imports, Backend, HostCap, Imports, Outcome, RunConfig};
 use temen_text::{parse_module, print_module};
 
-/// Paramless `_start`: stores `"logger"` at 0..6 and `"hi"` at 32..34, resolves the
-/// runtime-granted `logger` capability by name, **attaches** it into rebindable slot 0
-/// (`"out"`), then writes through the slot and exits 7 via required slot 1 (`"exit"`).
+/// Paramless `_start`: stores `"logger"` at 16384..16390 and `"hi"` at 16416..16418 (above the
+/// #1094 NULL guard), resolves the runtime-granted `logger` capability by name, **attaches** it into
+/// rebindable slot 0 (`"out"`), then writes through the slot and exits 7 via required slot 1 (`"exit"`).
 const ATTACH_START: &str = "memory 17\n\
 import 0 \"out\" (i64, i64) -> (i64) rebindable\n\
 import 1 \"exit\" (i32) -> ()\n\
 func () -> () {\n\
 block 0 () {\n\
   vc0 = i32.const 108\n\
-  va0 = i64.const 0\n\
+  va0 = i64.const 16384\n\
   i32.store8 va0 vc0\n\
   vc1 = i32.const 111\n\
-  va1 = i64.const 1\n\
+  va1 = i64.const 16385\n\
   i32.store8 va1 vc1\n\
   vc2 = i32.const 103\n\
-  va2 = i64.const 2\n\
+  va2 = i64.const 16386\n\
   i32.store8 va2 vc2\n\
   vc3 = i32.const 103\n\
-  va3 = i64.const 3\n\
+  va3 = i64.const 16387\n\
   i32.store8 va3 vc3\n\
   vc4 = i32.const 101\n\
-  va4 = i64.const 4\n\
+  va4 = i64.const 16388\n\
   i32.store8 va4 vc4\n\
   vc5 = i32.const 114\n\
-  va5 = i64.const 5\n\
+  va5 = i64.const 16389\n\
   i32.store8 va5 vc5\n\
   vc6 = i32.const 104\n\
-  va6 = i64.const 32\n\
+  va6 = i64.const 16416\n\
   i32.store8 va6 vc6\n\
   vc7 = i32.const 105\n\
-  va7 = i64.const 33\n\
+  va7 = i64.const 16417\n\
   i32.store8 va7 vc7\n\
-  vp = i64.const 0\n\
+  vp = i64.const 16384\n\
   vl = i64.const 6\n\
   vh = self.resolve vp vl\n\
   vst = import.attach 0 vh\n\
-  vbuf = i64.const 32\n\
+  vbuf = i64.const 16416\n\
   vn = i64.const 2\n\
   vw = call.import 0 (vbuf, vn)\n\
   vcode = i32.const 7\n\
@@ -105,18 +105,18 @@ import 1 \"exit\" (i32) -> ()\n\
 func () -> () {\n\
 block 0 () {\n\
   vc0 = i32.const 101\n\
-  va0 = i64.const 0\n\
+  va0 = i64.const 16384\n\
   i32.store8 va0 vc0\n\
   vc1 = i32.const 120\n\
-  va1 = i64.const 1\n\
+  va1 = i64.const 16385\n\
   i32.store8 va1 vc1\n\
   vc2 = i32.const 105\n\
-  va2 = i64.const 2\n\
+  va2 = i64.const 16386\n\
   i32.store8 va2 vc2\n\
   vc3 = i32.const 116\n\
-  va3 = i64.const 3\n\
+  va3 = i64.const 16387\n\
   i32.store8 va3 vc3\n\
-  vp = i64.const 0\n\
+  vp = i64.const 16384\n\
   vl = i64.const 4\n\
   vh = self.resolve vp vl\n\
   vst = import.attach 0 vh\n\
@@ -148,7 +148,7 @@ import 1 \"exit\" (i32) -> ()\n\
 func () -> () {\n\
 block 0 () {\n\
   vph = i32.const 0\n\
-  vbuf = i64.const 32\n\
+  vbuf = i64.const 16416\n\
   vn = i64.const 2\n\
   vw = call.import 0 (vbuf, vn)\n\
   vcode = i32.const 0\n\
