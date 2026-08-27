@@ -37,6 +37,13 @@ export async function loadEngine() {
         const h = globalThis.__temen_webgpu_op;
         return h ? BigInt(h(op, a, b, c, ptr, len, memory)) : -1n;
       },
+      // The live-stdout tee (`temen_run_onramp_stream`): each write's [ptr,ptr+len) in linear memory.
+      // A no-op unless a page installs a sink on `globalThis.__temen_stdout_chunk` (play.js does during a
+      // streaming Run) — it receives a fresh copy of the chunk (the wasm memory may move after).
+      stdout_chunk: (ptr, len) => {
+        const h = globalThis.__temen_stdout_chunk;
+        if (h) h(new Uint8Array(memory.buffer, Number(ptr), Number(len)).slice());
+      },
     },
   };
   const { exports: ex } = await WebAssembly.instantiate(module, importObj);

@@ -46,7 +46,8 @@ self.onmessage = async (e) => {
   // no GPU surface (the playground's GPU reactor runs on the main thread via par.js), so stub it to a
   // no-op — a guest that resolves the `webgpu` cap here gets -1 and skips. Without it the instantiate
   // fails with "Import temen_host: module is not an object or function".
-  ({ exports: ex } = await WebAssembly.instantiate(module, { env: { memory }, temen_host: { webgpu_op: () => -1n } }));
+  // `stdout_chunk` (the live-stdout tee) is likewise stubbed — a Worker vCPU streams no card output.
+  ({ exports: ex } = await WebAssembly.instantiate(module, { env: { memory }, temen_host: { webgpu_op: () => -1n, stdout_chunk: () => {} } }));
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
   // Views over the shared memory, refreshed when stale: the shared WebAssembly.Memory can GROW

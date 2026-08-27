@@ -197,6 +197,20 @@ try {
   // `temen_run_onramp` (not the text/`temen_parse` path). Uses the committed `web/assets/hello_c.temen`.
   check('hello (C → Temen, on-ramp module)', await runPlay('hello (C → Temen)'), '0', 'hello, sandbox!\n');
 
+  // A real **Nim** program (`web/assets/nim_hello.temen`, gated headlessly by `nim_hello_asset.rs`) —
+  // the full nimony toolchain → temen-leng → nim→powerbox bridge, run in-browser via `temen_run_onramp`.
+  // This is the first real-browser assertion of any nim card: the guest's `write(stdout, "hello, temen\n")`
+  // must land in the stdout pane, returning 0. (Without this, a browser-only break in the run/capture
+  // path is invisible — the headless gate can't see the JS boundary.)
+  const nim = await runPlay('nim (Nim → Temen, runs)');
+  check('nim (Nim → Temen, runs)', nim, '0', 'hello, temen\n');
+  // …and it ran through the **streamed** off-main-thread path (temen_run_onramp_stream on a worker,
+  // stdout teed to the page live) — not the synchronous main-thread fallback. The status chip names the
+  // tier; a fallback would read plain "interpreter".
+  const nimStreamed = nim.status.includes('streamed');
+  checks.push(nimStreamed);
+  console.log(`  play/nim-streamed: status=${JSON.stringify(nim.status)} ${nimStreamed ? 'PASS' : 'FAIL'}`);
+
   // The framebuffer output path (the `display` capability): the gradient guest presents a 128×128
   // RGBA frame, which play.js blits to the canvas. Assert the canvas got the right dimensions and a
   // pixel matching the guest's analytic gradient — R ramps across X, G down Y (top-left ≈ black).

@@ -9,7 +9,9 @@
 // (Emitted wasm-JIT *units* are a different module with their own imports — `env.{memory,trap,
 // call_interp}`, no `temen_host` — so they do NOT use this.)
 export function engineImports(memory) {
-  const imports = { temen_host: { webgpu_op: () => -1n } };
+  // `stdout_chunk` is the live-stdout tee seam (`temen_run_onramp_stream`): the page appends each chunk
+  // as the guest writes it. Headless probes don't stream, so a no-op stub satisfies the import.
+  const imports = { temen_host: { webgpu_op: () => -1n, stdout_chunk: () => {} } };
   if (memory) imports.env = { memory };
   return imports;
 }
