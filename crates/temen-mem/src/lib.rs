@@ -256,6 +256,18 @@ impl Region {
         }
     }
 
+    /// Copy `data` into `[off, off+data.len())` — the bulk slice-store, mirror of [`Region::read_into`].
+    /// The mmap/shared backing does one `memcpy`; the `Paged` fallback locks its map once and writes
+    /// page-aligned chunks (vs the per-byte [`Region::set_byte`]). Bytes past the region end are
+    /// dropped (the caller confined `[off, off+len) ⊆ [0, size)`). Bulk/non-atomic: same
+    /// single-threaded contract as [`Region::fill`].
+    pub fn write_from(&self, off: u64, data: &[u8]) {
+        match self.backing() {
+            Ok(s) => s.write_from(off, data),
+            Err(p) => p.write_from(off, data),
+        }
+    }
+
     /// **Non-atomic** width-specialized (1/2/4/8) little-endian read — one (possibly unaligned)
     /// machine load instead of `width` per-byte atomic loads. Sound **only for a single-threaded
     /// caller**: the cooperative bytecode interpreter has exactly one vCPU touching the backing at a
@@ -463,6 +475,17 @@ mod shared {
             }
             // SAFETY: `[off, off+n) ⊆ [0, size)`; `out[..n]` is a distinct caller buffer.
             unsafe { core::ptr::copy_nonoverlapping(self.ptr(off), out.as_mut_ptr(), n) }
+        }
+
+        pub(super) fn write_from(&self, off: u64, data: &[u8]) {
+            let avail = self.size.saturating_sub(off) as usize;
+            let n = avail.min(data.len());
+            if n == 0 {
+                return;
+            }
+            // SAFETY: `[off, off+n) ⊆ [0, size)`; `data[..n]` is a distinct caller buffer. The bulk
+            // store counterpart of `read_into` (same single-threaded, non-atomic contract).
+            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr(off), n) }
         }
 
         pub(super) fn atomic_load(&self, off: u64, width: u32) -> u64 {
@@ -818,6 +841,30 @@ impl Paged {
         }
     }
 
+    // The bulk slice-store (the write counterpart of `read_into`): locks the page map ONCE and
+    // copies whole page-aligned chunks with `copy_from_slice`, instead of the per-byte `set_byte`
+    // (a lock + `BTreeMap` entry per byte). The hot fork/checkpoint `seed` copies the whole 2 MB
+    // window through here, so on the non-mmap `Paged` path this is the difference between ~2 M
+    // locked map ops and ~32 page inserts (#1080 browser bash-fork perf).
+    fn write_from(&self, off: u64, data: &[u8]) {
+        let page_sz = self.page as usize;
+        let mut map = self.lock();
+        let mut i = 0usize;
+        while i < data.len() {
+            let o = off.saturating_add(i as u64);
+            if o >= self.size {
+                break;
+            }
+            let idx = (o % self.page) as usize;
+            let take = (page_sz - idx).min(data.len() - i);
+            let p = map
+                .entry(o / self.page)
+                .or_insert_with(|| vec![0u8; page_sz]);
+            p[idx..idx + take].copy_from_slice(&data[i..i + take]);
+            i += take;
+        }
+    }
+
     // The atomic ops hold the lock across the whole read-modify-write, so they are atomic with
     // respect to one another (true atomicity vs. other backings comes from `Mapped`).
     fn load_locked(map: &BTreeMap<u64, Vec<u8>>, page: u64, off: u64, width: u32) -> u64 {
@@ -943,6 +990,32 @@ mod tests {
             let mut out = [0u8; 4];
             r.read_into(4094, &mut out);
             assert_eq!(out, [0, 1, 2, 0]);
+        });
+    }
+
+    #[test]
+    fn write_from_round_trips_across_pages_and_backings() {
+        each_region(1 << 16, 4096, |r| {
+            // A slice that spans a page boundary (partial head + whole-page interior + partial tail):
+            // the bulk store must land byte-identically to a per-byte `set_byte` loop.
+            let data: Vec<u8> = (0u32..8200).map(|i| (i % 251) as u8).collect();
+            r.write_from(4090, &data);
+            let mut out = vec![0u8; data.len()];
+            r.read_into(4090, &mut out);
+            assert_eq!(out, data, "write_from → read_into round-trips");
+            assert_eq!(r.byte(4089), 0, "the byte before the span is untouched");
+            assert_eq!(
+                r.byte(4090 + data.len() as u64),
+                0,
+                "the byte after is untouched"
+            );
+            // A second write over part of it overwrites exactly that sub-span, nothing more.
+            r.write_from(4090, &[0xEE; 3]);
+            assert_eq!([r.byte(4090), r.byte(4091), r.byte(4092)], [0xEE; 3]);
+            assert_eq!(r.byte(4093), data[3], "past the overwrite is unchanged");
+            // An out-of-range tail is dropped (the caller confined; belt-and-suspenders), no panic.
+            r.write_from((1 << 16) - 2, &[1, 2, 3, 4]);
+            assert_eq!([r.byte((1 << 16) - 2), r.byte((1 << 16) - 1)], [1, 2]);
         });
     }
 
