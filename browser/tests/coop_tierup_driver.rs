@@ -49,7 +49,9 @@ fn ffi_guard() -> FloorGuard {
     temen_coop_set_tierup_floor(0);
     FloorGuard(g)
 }
-struct FloorGuard(std::sync::MutexGuard<'static, ()>);
+// The `MutexGuard` is held purely for its lifetime/Drop (it keeps `FFI_LOCK` locked for the test and
+// resets the floor on drop), never read — so the field trips `dead_code` under `-D warnings`.
+struct FloorGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
 impl Drop for FloorGuard {
     fn drop(&mut self) {
         temen_coop_set_tierup_floor(temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES);
@@ -2666,7 +2668,8 @@ fn coop_jacl_compiler_runs_through_the_driver() {
 /// #816: opt the on-ramp powerbox into the `"instantiator"` grant for this test, resetting on drop
 /// (panic-safe) so no other test's guest inherits spawn authority. Composes with [`ffi_guard`]
 /// (holds the FFI lock + zeroes the tier-up floor first).
-struct InstantiatorGuard(FloorGuard);
+// The inner `FloorGuard` is held purely for its Drop (resets the instantiator grant), never read.
+struct InstantiatorGuard(#[allow(dead_code)] FloorGuard);
 fn instantiator_guard() -> InstantiatorGuard {
     let g = ffi_guard();
     temen_onramp_set_grant_instantiator(1);
