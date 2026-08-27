@@ -256,12 +256,14 @@ try {
     }), card(qjsName));
     const setQ = (src) => page.evaluate(({ sel, src }) =>
       document.querySelector(`${sel} .CodeMirror`).CodeMirror.setValue(src), { sel: card(qjsName), src });
-    // 1) First Run of the sample program — warms the runtime once; tier reports warm-snapshot.
+    // 1) First Run of the sample program — warms the runtime once; the card now defaults to the
+    // accelerated warm tier (#816): warm+JIT (whole-program over the restored image) or, if the eval
+    // declines that, warm-coop. Either way the runtime init is paid once and the output is identical.
     await runCard(page, qjsName, 30_000);
     const q1 = await readQ();
-    q1.state === 'done' && q1.msg.includes('warm-snapshot')
+    q1.state === 'done' && (q1.msg.includes('warm+JIT') || q1.msg.includes('warm-coop'))
       && q1.stdout.includes('fib(0..10): 0 1 1 2 3 5 8 13 21 34 55') && q1.stdout.includes('sorted: 1,2,3,5,7,8,9')
-      ? ok('QuickJS card runs on the warm-runtime snapshot → correct output')
+      ? ok('QuickJS card defaults to the accelerated warm tier (#816) → correct output')
       : fail(`qjs first run: ${JSON.stringify({ state: q1.state, msg: q1.msg, out: q1.stdout.slice(0, 80) })}`);
     // 2) Second Run — warm session reused: byte-identical output. The runtime rebuild is paid once, but
     // since the card pre-warms on the snapshot worker at page load (issue #804), the FIRST Run is already

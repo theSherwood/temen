@@ -7,7 +7,7 @@
 
 import { loadEngine, makeRunner, readParStdout } from './par.js';
 import { openJitReactor } from './wasmjit-reactor.js';
-import { runJitModule, runWarmJit, runJitCompiler, runJitSelfhost, runJitNifler } from './wasmjit-module.js';
+import { runJitModule, runWarmJit, runWarmCoop, runJitCompiler, runJitSelfhost, runJitNifler } from './wasmjit-module.js';
 import { SnapshotClient } from './snapshot-client.js';
 import { createDapClient } from './dap.js';
 import { initWebGPU, teardownWebGPU, webgpuAvailable } from './webgpu.js';
@@ -2079,9 +2079,28 @@ async function runModule(c) {
       }
     }
   }
+  if (status === undefined && useJit && ex.warm) {
+    try {
+      // Warm+JIT declined/trapped (a page-managing eval that grows/protects during eval) → the
+      // cooperative tier-up drive (#816 item 4): eligible pure leaves run on emitted wasm over the
+      // restored warm image, the interpreter owns the eval. A decline/trap throws → the warm
+      // interpreter below. Same run-value/stdout slots as the other tiers. (Main-thread fallback when
+      // the snapshot worker missed; the worker's evalWarm runs this same cascade.)
+      if (!ensureWarmSession(bytes, ex.url)) throw new Error('warm session unavailable for this module');
+      status = await runWarmCoop(eng.ex, eng.memory, stdinBytes, `${ex.url}#coop`);
+      rv = Number(eng.ex.temen_run_value());
+      stdout = readModuleStdout();
+      tier = 'warm-coop';
+    } catch (e) {
+      logTo(c, `warm-coop unavailable (${e.message}); falling back to the warm interpreter`);
+      runNote(rec, { coopFallbackReason: e.message });
+      status = undefined;
+    }
+  }
   if (status === undefined && ex.warm) {
-    // Warm-runtime snapshot (the default for the QuickJS card): open the session once (the first Run
-    // pays the ~one-time runtime init), then every Run restores the warm image and evaluates only.
+    // Warm-runtime snapshot: open the session once (the first Run pays the ~one-time runtime init), then
+    // every Run restores the warm image and evaluates only. The unaccelerated fallback (checkbox off, or
+    // both JIT tiers declined) — always correct, just the interpreter over the warm image.
     const needOpen = warmSessionUrl !== ex.url;
     if (needOpen) setState(c, 'running', 'warming up runtime (first Run)…');
     if (ensureWarmSession(bytes, ex.url)) {
@@ -3894,9 +3913,12 @@ function buildCard(name, ex) {
       : 'Run the reactor’s tick() on emitted wasm (wasm-JIT tier) instead of the interpreter';
     jit = el('input');
     jit.type = 'checkbox';
-    // A warm-snapshot card (QuickJS) defaults to the warm path (checkbox off); ticking it opts into the
-    // cold wasm-JIT tier. Every other jit card defaults to the JIT tier on.
-    jit.checked = !ex.warm;
+    // Default the wasm-JIT tier ON for every jit card — including warm-snapshot cards (QuickJS/Tcl),
+    // which now default to the accelerated warm cascade warm+JIT → warm-coop → warm-interp (#816): init
+    // stays paid-once via the snapshot, and the eval runs ~10x faster on emitted wasm than the warm
+    // interpreter (bench_warm_coop.mjs), even cold. Unticking forces the plain warm interpreter (a tier
+    // comparison / the "Prove interp ≡ JIT" baseline).
+    jit.checked = true;
     l.append(jit, ' wasm-JIT');
     controls.appendChild(l);
     // "Prove it": run the guest on both tiers and assert the result is byte-identical.
