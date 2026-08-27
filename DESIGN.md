@@ -1821,9 +1821,9 @@ on-ramp — returning from `main` *is* `exit`, all threads die unjoined — and 
 runtime, whose daemon pools are domain-internal.)
 
 Teardown mechanics, uniform across interpreter, explorer, and JIT (differentially
-tested): non-preemptive — a running sibling stops at its next safepoint, so post-teardown
-sibling effects are unspecified and diff harnesses compare only the root outcome + effects
-that happened-before it; parked siblings are woken/dropped by the scheduler, never left to
+tested): no mid-op interruption — a running sibling stops only at a safepoint (an op boundary: a
+park, or the #1157 cooperative preemption quantum), so post-teardown sibling effects are unspecified
+and diff harnesses compare only the root outcome + effects that happened-before it; parked siblings are woken/dropped by the scheduler, never left to
 a timeout (`MAX_WAIT` is an anti-wedge backstop, not semantics); in-flight host I/O
 quiesces before window read-back; cross-domain callers parked through the dying domain
 complete with a probeable errno (D37 death-is-revocation — the §3.6 machinery), never
@@ -1992,6 +1992,14 @@ fiber count or I/O concurrency**:
 ### Preemption & scheduling
 - Host preempts **vCPUs** via the fuel/epoch timer (§5) — **undisableable**, so
   cross-domain fairness and killing a runaway guest always work.
+- The **cooperative single-thread driver** (the bytecode oracle / browser tier) multiplexes a
+  domain's vCPUs onto one OS thread and preempts them at an **op-count quantum** — the deterministic
+  analog of the host's fuel/epoch timer. Armed **only while ≥2 vCPUs are runnable** (a single-runnable
+  run stays run-to-completion, zero overhead), so a vCPU that never reaches a park point (a yield-free
+  shared-memory spin — a spinlock, `while (!flag) {}`) still yields to its siblings. This makes the
+  cooperative tier a faithful model of **preemptive 1:1 threads** (D56), not run-to-completion; the
+  quantum is op-count, not wall-clock, so the schedule stays reproducible (the differential oracle).
+  (#1157)
 - **Fiber** preemption is guest policy via fuel-inserted yield points (Go-style
   async preemption); the VM supplies mechanism, not policy.
 - Nested (§14): a child's vCPUs are real OS threads the host scheduler runs within
