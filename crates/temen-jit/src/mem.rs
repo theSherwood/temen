@@ -855,6 +855,44 @@ mod pal {
         (n >= 0).then(|| (pc, rets[..n as usize].to_vec(), fiber))
     }
 
+    /// The TEB stack-bound fields (`StackBase`/`StackLimit`/`DeallocationStack` — the same trio the
+    /// fiber switch swaps, at the same x64 offsets as `temen-fiber`'s `switch_x86_64_windows.rs`).
+    /// A trap inside a *fiber* unwinds to `run_guarded`'s recovery point on the root stack via a
+    /// `CONTEXT` restore, which does **not** touch the TEB — so without an explicit restore the
+    /// thread keeps the fiber's stack fields, and at thread exit the kernel frees
+    /// `DeallocationStack` = the fiber's arena slot. When that slot is an arena **allocation base**
+    /// the whole control-stack arena is released and the next fiber bootstrap write AVs (the
+    /// windows `jit_fibers` STATUS_ACCESS_VIOLATION, reproduced + verified under Wine). Non-x86-64
+    /// windows has no fiber switch (fiber_rt is x86-64-gated), so nothing to restore there.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn teb_stack_fields() -> (u64, u64, u64) {
+        let (b, l, d): (u64, u64, u64);
+        core::arch::asm!(
+            "mov {t}, gs:[0x30]",
+            "mov {b}, [{t} + 0x08]",
+            "mov {l}, [{t} + 0x10]",
+            "mov {d}, [{t} + 0x1478]",
+            t = out(reg) _, b = out(reg) b, l = out(reg) l, d = out(reg) d,
+            options(nostack, preserves_flags),
+        );
+        (b, l, d)
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn restore_teb_stack_fields(fields: (u64, u64, u64)) {
+        core::arch::asm!(
+            "mov {t}, gs:[0x30]",
+            "mov [{t} + 0x08], {b}",
+            "mov [{t} + 0x10], {l}",
+            "mov [{t} + 0x1478], {d}",
+            t = out(reg) _, b = in(reg) fields.0, l = in(reg) fields.1, d = in(reg) fields.2,
+            options(nostack, preserves_flags),
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    unsafe fn teb_stack_fields() {}
+    #[cfg(not(target_arch = "x86_64"))]
+    unsafe fn restore_teb_stack_fields(_fields: ()) {}
+
     /// Run `f` under the handler; `true` if an in-`[lo,hi)` access violation was caught.
     ///
     /// # Safety
@@ -874,11 +912,16 @@ mod pal {
         // §14 child guest can run (in its own window) inside the parent's guarded call. A child fault
         // resumes at the child's `saved` context; the parent's frame is restored afterwards intact.
         let prev = GUARD.with(|g| g.replace(None));
+        // Snapshot the TEB stack fields with the recovery point: a fiber-side fault unwinds here
+        // without the fiber switch-back, and the `CONTEXT` restore leaves the fiber's TEB values in
+        // place (see `teb_stack_fields`) — restore them on the tripped path.
+        let teb = teb_stack_fields();
         let mut saved = AlignedContext(core::mem::zeroed());
         // Capture the recovery point. On a guard fault the VEH copies `saved` over the fault context,
         // so execution resumes *here* with TRIPPED set — the longjmp-equivalent return.
         RtlCaptureContext(&mut saved.0);
         if TRIPPED.with(|x| x.replace(false)) {
+            restore_teb_stack_fields(teb); // undo a fiber-side fault's leftover TEB stack fields
             GUARD.with(|g| g.set(prev)); // restore the parent's frame; report the caught fault
             return true;
         }
