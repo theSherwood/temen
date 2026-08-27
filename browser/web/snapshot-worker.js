@@ -8,7 +8,7 @@
 // "rare shared-memory race (a double-free)" in the shared setup. This Worker instantiates the engine over
 // a fresh memory of its own and allocates only there, so its warm session can't race the main thread's
 // allocator. Main ↔ worker communicate only by messages (source string in; stdout/status/value out).
-import { runWarmJit, primeWarmJit, jitCacheStats } from './wasmjit-module.js';
+import { runWarmJit, runWarmCoop, primeWarmJit, jitCacheStats } from './wasmjit-module.js';
 
 let ex = null; // the worker's own engine exports
 let memory = null; // the worker's own (private) shared WebAssembly.Memory
@@ -69,7 +69,15 @@ async function evalWarm(source, jit) {
       const status = await runWarmJit(ex, memory, stdinBytes, `${warmUrl}#eval`, 1);
       return { tier: 'warm+JIT', status, value: Number(ex.temen_run_value()), stdout: readStdout(), stderr: readStderr() };
     } catch {
-      // decline / trap → fall through to the warm interpreter
+      // whole-program decline / trap → the cooperative tier-up drive (#816 item 4): a page-managing
+      // eval (grows/protects during the eval, so it isn't WasmDriven) still runs its eligible pure
+      // leaves on emitted wasm. driveCoopTierupRun stages the result in the same run-value/stdout slots.
+    }
+    try {
+      const status = await runWarmCoop(ex, memory, stdinBytes, `${warmUrl}#coop`, 1);
+      return { tier: 'warm-coop', status, value: Number(ex.temen_run_value()), stdout: readStdout(), stderr: readStderr() };
+    } catch {
+      // coop decline / trap → fall through to the warm interpreter (always correct, just unaccelerated)
     }
   }
   let stdinP = 0;
