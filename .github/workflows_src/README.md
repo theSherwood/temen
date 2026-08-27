@@ -27,6 +27,11 @@ identical until the next agent edit.
   `real-browser` job already does, so whichever workflow publishes, the cards work. No new toolchain
   (the job already installs llvm-18/clang-18 for the on-ramp assets); GPLv3-safe (fetched-and-built,
   never committed). **Until copied over, the deployed bash cards stay 404.**
+  Same file, one more line: the change-gate's reachability curl points at the wrong project-site
+  path (`https://thesherwood.github.io/vm/DEPLOYED_SHA`) — the site serves at `…/temen/`, so the
+  gate always 404s → always thinks the site changed → rebuilds+republishes on every 30-min tick.
+  Fixed to `…/temen/DEPLOYED_SHA` so the gate correctly skips no-op rebuilds when the site is
+  already at HEAD.
 
 - **New `browser-jit-host-gates` job (the compiler-tier wasm-JIT host tests, #1011)** — the browser
   crate's Rust *host* tests (`nifler_jit`, `chibicc_jit`, `jit_module`) run a real compiler phase on
