@@ -3044,17 +3044,54 @@ pub fn bash_exec_with(
         stderr: Vec::new(),
         framebuffer: None,
     };
+    // Uncached path: compile fresh (the cross-Run cache lives in `temen_run_bash`, which has the module
+    // bytes to key on). `bash_exec` / native callers pay one compile.
+    let Some(compiled) = bytecode::compile_reserved(m) else {
+        return unsupported(STATUS_UNSUPPORTED);
+    };
+    bash_run_over_compiled(m, compiled, argv, stdin, bins)
+}
+
+/// #1145 — the **mask domain** (`1 << N` bytes) a browser bash window runs in. `bash.temen` declares a
+/// 2 MiB window and grows its heap only a little past it (observed ~2.06 MiB), and coreutil twins are
+/// smaller — so a bounded reservation, unlike the 1 TiB [`temen_ir::DEFAULT_RESERVED_LOG2`], lets the
+/// engine back the window with a **flat `Owned` buffer** (lock-free) instead of the per-access-locked
+/// `Paged` fallback wasm otherwise forces (no `mmap`). 32 MiB is generous headroom for a playground
+/// shell while keeping the eager allocation cheap; a guest that outgrows it faults (fail-closed), the
+/// same as any out-of-memory. Confinement is unaffected — a smaller mask domain is strictly tighter.
+const BASH_RESERVED_LOG2: u8 = 25;
+
+/// #1144 — the run + outcome mapping of [`bash_exec_with`] over an **already-compiled** (cached)
+/// program: build the personality host (grant + argv seed), run the reserved-window entry over the
+/// shared `Arc<Compiled>`, and map to a [`PbOutcome`]. Shared by the uncached `bash_exec_with` and
+/// the cross-Run-cached `temen_run_bash`.
+fn bash_run_over_compiled(
+    m: &temen_ir::Module,
+    compiled: std::sync::Arc<temen_interp::bytecode::Compiled>,
+    argv: &[&[u8]],
+    stdin: &[u8],
+    bins: &[(&str, &temen_ir::Module, u8)],
+) -> PbOutcome {
+    let unsupported = |status: i32| PbOutcome {
+        status,
+        value: 0,
+        exit_code: 0,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        framebuffer: None,
+    };
     let Some((mut host, posix, init_mem)) = bash_host_build(m, argv, stdin, bins, false) else {
         return unsupported(STATUS_UNSUPPORTED);
     };
     let mut fuel = u64::MAX;
-    let (status, value, exit_code) = match bytecode::compile_and_run_capture_reserved_with_host(
+    let (status, value, exit_code) = match bytecode::run_capture_reserved_over_compiled_with_host(
         m,
+        compiled,
         0,
         &[],
         &mut fuel,
         &init_mem,
-        temen_ir::DEFAULT_RESERVED_LOG2,
+        BASH_RESERVED_LOG2,
         &mut host,
     ) {
         None => (STATUS_UNSUPPORTED, 0, 0),
@@ -3075,6 +3112,46 @@ pub fn bash_exec_with(
         stderr: posix.stderr(),
         framebuffer: None,
     }
+}
+
+/// #1144 — the cross-Run **bash program cache**: the decoded `Module` + its `Arc<Compiled>` bytecode
+/// program, keyed by a cheap content hash of the module bytes (the [`NiflerEmitCache`] shape). The
+/// browser card passes the same ~2.2 MB `bash.temen` every Run, so decoding (~100 ms wasm) and
+/// compiling (~120 ms wasm) it each time is pure waste — cache both and reuse on every later Run.
+/// Single-threaded wasm ⇒ a plain static; one slot (the card runs one bash). A rebuilt asset changes
+/// the key and re-decodes+re-compiles.
+struct BashProgramCache {
+    key: u64,
+    module: temen_ir::Module,
+    compiled: std::sync::Arc<temen_interp::bytecode::Compiled>,
+}
+static mut BASH_PROGRAM: Option<BashProgramCache> = None;
+
+/// Decode + compile `bytes` as bash, or reuse the cached program when the content key matches. `None`
+/// if it doesn't decode or isn't the bytecode subset. Returns borrows into the static cache (valid
+/// until the next miss repopulates it — single-threaded, one Run at a time).
+#[allow(static_mut_refs)]
+fn cached_bash_program(
+    bytes: &[u8],
+) -> Option<(
+    &'static temen_ir::Module,
+    std::sync::Arc<temen_interp::bytecode::Compiled>,
+)> {
+    // The same cheap FNV(len + head/tail 4 KiB) content key as the nifler emit cache.
+    let key = nifler_module_key(bytes);
+    // SAFETY: single-threaded wasm; the cache is touched only here and only while no run borrows it.
+    let slot = unsafe { &mut *core::ptr::addr_of_mut!(BASH_PROGRAM) };
+    if slot.as_ref().map(|c| c.key) != Some(key) {
+        let m = temen_encode::decode_module(bytes).ok()?;
+        let compiled = bytecode::compile_reserved(&m)?;
+        *slot = Some(BashProgramCache {
+            key,
+            module: m,
+            compiled,
+        });
+    }
+    let c = slot.as_ref()?;
+    Some((&c.module, std::sync::Arc::clone(&c.compiled)))
 }
 
 /// The shared powerbox build for a bash run ([`bash_exec_with`] and the #1122 interactive
@@ -5203,7 +5280,7 @@ impl JitOnrampRun {
         // Build the powerbox + the window-prefix seed (`init_mem`, the argv blob for the `Fs` path)
         // from the input shape. `frame` is only ever populated by a `display.present` — kept for
         // struct parity; a compiler/compute guest never presents.
-        let (host, init_mem, frame, fs_readback): (Host, Vec<u8>, _, _) = match input {
+        let (mut host, init_mem, frame, fs_readback): (Host, Vec<u8>, _, _) = match input {
             RunInput::Stdin(stdin) => {
                 let mut host = Host::new();
                 host.stdin = stdin;
@@ -5231,6 +5308,11 @@ impl JitOnrampRun {
                 (host, init_mem, frame, fs_readback)
             }
         };
+        // Live-stream stdout from the emitted `_start`'s cross-tier `write` bounces (#1141) — a no-op
+        // unless the page has a streaming sink active.
+        if let Some(t) = stream_tee() {
+            host.set_stdout_tee(t);
+        }
         // Materialize the window before the emitted `_start` runs (the interpreter does this at
         // instantiation; the emitted `_start` seeds only the heap + stashes handles): first the argv
         // prefix (`init_mem`, empty for stdin), then `.data`/`.rodata`. Data segments start at the
@@ -5363,6 +5445,11 @@ impl JitOnrampRun {
     fn reset_warm(&mut self, stdin: Vec<u8>) {
         let mut host = Host::new();
         host.stdin = stdin;
+        // Live-stream stdout from the warm+JIT eval's cross-tier `write` bounces (#1142) — same tee as
+        // the interpreter warm path; a no-op unless the page has a streaming sink active.
+        if let Some(t) = stream_tee() {
+            host.set_stdout_tee(t);
+        }
         let (frame, _keys) = grant_onramp_caps(&mut host, &self.module, None);
         self.host = host;
         self.frame = frame;
@@ -6015,6 +6102,12 @@ pub extern "C" fn temen_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64
     }
     let mut host = Host::new();
     host.stdin = stdin.to_vec();
+    // Live-stream stdout as the eval writes it (#1142). The tee fires the `stdout_chunk` host import,
+    // which the page relays only while a streaming Run is active — a no-op otherwise, so the batch
+    // warm path is unaffected.
+    if let Some(t) = stream_tee() {
+        host.set_stdout_tee(t);
+    }
     let _ = grant_onramp_caps(&mut host, &s.module, None);
     let mut fuel = u64::MAX;
     // Re-establish the warmup image's page-state entries (no zeroing — the memcpy above restored
@@ -6695,12 +6788,11 @@ pub extern "C" fn temen_run_bash(
             unsafe { core::slice::from_raw_parts(p, n) }
         }
     };
-    let m = match temen_encode::decode_module(slice(mod_ptr, mod_len)) {
-        Ok(m) => m,
-        Err(_) => {
-            set(STATUS_DECODE_ERR);
-            return 0;
-        }
+    // #1144 — decode+compile the ~2.2 MB bash module once and reuse across Runs (the card re-sends the
+    // same bytes every Run). A miss (first Run, or a rebuilt asset) decodes+compiles; hits are free.
+    let Some((m, compiled)) = cached_bash_program(slice(mod_ptr, mod_len)) else {
+        set(STATUS_DECODE_ERR);
+        return 0;
     };
     let cmd = slice(cmd_ptr, cmd_len);
     let stdin = slice(stdin_ptr, stdin_len);
@@ -6712,7 +6804,7 @@ pub extern "C" fn temen_run_bash(
         .iter()
         .map(|(n, cm)| (n.as_str(), cm, cm.memory.map_or(0, |mc| mc.size_log2)))
         .collect();
-    let out = bash_exec_with(&m, &[b"bash", b"-c", cmd], stdin, &bins);
+    let out = bash_run_over_compiled(m, compiled, &[b"bash", b"-c", cmd], stdin, &bins);
     set(out.status);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
@@ -6766,7 +6858,8 @@ pub extern "C" fn temen_bash_session(
             unsafe { core::slice::from_raw_parts(p, n) }
         }
     };
-    let Ok(m) = temen_encode::decode_module(slice(mod_ptr, mod_len)) else {
+    // #1144 — reuse the decoded+compiled bash program across sessions (same cache as `temen_run_bash`).
+    let Some((m, compiled)) = cached_bash_program(slice(mod_ptr, mod_len)) else {
         return -1;
     };
     let owned = parse_shell_cmds(slice(bins_ptr, bins_len));
@@ -6774,8 +6867,7 @@ pub extern "C" fn temen_bash_session(
         .iter()
         .map(|(n, cm)| (n.as_str(), cm, cm.memory.map_or(0, |mc| mc.size_log2)))
         .collect();
-    let Some((mut host, posix, init_mem)) =
-        bash_host_build(&m, &[b"bash", b"-i"], &[], &bins, true)
+    let Some((mut host, posix, init_mem)) = bash_host_build(m, &[b"bash", b"-i"], &[], &bins, true)
     else {
         return -1;
     };
@@ -6795,13 +6887,14 @@ pub extern "C" fn temen_bash_session(
         posix.feed_terminal(&ahead);
     }
     let mut fuel = u64::MAX;
-    let code = match bytecode::compile_and_run_capture_reserved_with_host(
-        &m,
+    let code = match bytecode::run_capture_reserved_over_compiled_with_host(
+        m,
+        compiled,
         0,
         &[],
         &mut fuel,
         &init_mem,
-        temen_ir::DEFAULT_RESERVED_LOG2,
+        BASH_RESERVED_LOG2,
         &mut host,
     ) {
         None => -1,

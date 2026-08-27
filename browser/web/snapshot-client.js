@@ -62,8 +62,9 @@ export class SnapshotClient {
     return !!(w && w.prewarm);
   }
 
-  _request(w, type, payload) {
+  _request(w, type, payload, onChunk) {
     const id = ++w.seq;
+    if (onChunk) w.chunks.set(id, onChunk); // live stdout chunks for this request (streaming Runs)
     return new Promise((resolve) => {
       w.pending.set(id, resolve);
       w.worker.postMessage({ type, id, ...payload });
@@ -87,10 +88,10 @@ export class SnapshotClient {
   // Evaluate `source` over `url`'s warm session (pre-warming first if needed), on `url`'s worker. `jit`
   // picks the warm+JIT tier. Resolves `{ ok, tier, status, value, stdout, stderr }`, or `{ ok:false,
   // error }` (the caller then falls back to the main-thread path).
-  async evalWarm(url, getBytes, source, jit) {
+  async evalWarm(url, getBytes, source, jit, onChunk) {
     const warm = await this.prewarm(url, getBytes);
     if (!warm.ok) return warm;
-    return this._request(this._workers.get(url), 'eval', { url, source, jit });
+    return this._request(this._workers.get(url), 'eval', { url, source, jit }, onChunk);
   }
 
   // The reserved worker key for the nim full-compile card (its own engine instance, separate from any
@@ -118,11 +119,26 @@ export class SnapshotClient {
     });
   }
 
+  // Run a module's `_start` on the **wasm-JIT tier** off the main thread with **live stdout** (#1141);
+  // `onChunk(Uint8Array)` fires per write. Resolves `{ ok, status, value, stdout, stderr }`, or
+  // `{ ok:false, error }` on a JIT decline/trap (the caller then falls back to the interpreter path).
+  // `cacheKey` caches the emitted Module across Runs (same as the main-thread `runJitModule`).
+  async runJitStream(bytes, stdin, cacheKey, onChunk) {
+    const w = this._workerFor(SnapshotClient.STREAM_KEY);
+    await w.ready;
+    const id = ++w.seq;
+    if (onChunk) w.chunks.set(id, onChunk);
+    return new Promise((resolve) => {
+      w.pending.set(id, resolve);
+      w.worker.postMessage({ type: 'runJitStream', id, bytes, stdin: stdin || null, cacheKey });
+    });
+  }
+
   // Compile a whole Nim program off the main thread. `getAssets()` resolves the four phase buffers
   // `{ nifler, nimsem, hexer, stdlib }` (fetched + inflated by the caller); they're posted to the nim
   // worker once and cached there, so subsequent Runs ship only `source`. Resolves `{ ok, status,
   // stdout, stderr }`, or `{ ok:false, error }` (the caller then falls back to the main-thread path).
-  async nimCompile(getAssets, source, main = 'prog.nim') {
+  async nimCompile(getAssets, source, main = 'prog.nim', onChunk) {
     const w = this._workerFor(SnapshotClient.NIMC_KEY);
     await w.ready;
     if (!w.nimAssets) {
@@ -142,7 +158,7 @@ export class SnapshotClient {
       w.nimAssets = null; // worker rejected the upload: let a later Run retry it
       return { ok: false, error: loaded.error || 'nim assets failed to load' };
     }
-    return this._request(w, 'nimCompile', { source, main });
+    return this._request(w, 'nimCompile', { source, main }, onChunk);
   }
 
   // Abandon an in-flight nim compile: terminate the nim worker (a runaway guest can't be interrupted

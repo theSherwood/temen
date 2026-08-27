@@ -363,6 +363,21 @@ int main(void) {
         vec![Value::I32(2)],
         "the async handler ran during the compute loop (no poll) and set `fired = SIGINT`"
     );
+    // #1146 — the same async delivery now runs on the bytecode engine's per-op safepoint, on BOTH the
+    // cooperative driver (the browser tier) and `drive_parallel`. Each redirects the running vCPU into
+    // `handler` mid-compute-loop and returns 2, byte-identical to the tree-walker oracle above.
+    let b = run_bytecode_only(src, |_| {});
+    assert_eq!(
+        b.result,
+        vec![Value::I32(2)],
+        "#1146: the cooperative bytecode engine delivers the async handler mid-loop too"
+    );
+    let p = run_bytecode_parallel_only(src, |_| {});
+    assert_eq!(
+        p.result,
+        vec![Value::I32(2)],
+        "#1146: the parallel bytecode driver delivers the async handler mid-loop too"
+    );
 }
 
 /// #796 L2 — async delivery **honors the mask**: a blocked signal is held (not delivered to a running
@@ -399,6 +414,13 @@ int main(void) {
         e.result,
         vec![Value::I32(2)],
         "a blocked signal is not delivered async until unblocked"
+    );
+    // #1146 — the mask logic lives in the shared personality (`take_deliverable`), so the bytecode
+    // engine's safepoint delivery honors it identically: held while blocked, delivered on unblock.
+    assert_eq!(
+        run_bytecode_only(src, |_| {}).result,
+        vec![Value::I32(2)],
+        "#1146: the bytecode engine honors the block mask for async delivery too"
     );
 }
 
@@ -443,6 +465,14 @@ int main(void) {
         vec![Value::I32(2)],
         "the in-handler re-raise was held (blocked) and delivered exactly once after return"
     );
+    // #1146 — block-during-handler on the bytecode tier: the injected handler window blocks its own
+    // signal (via `take_deliverable`'s mask push) and `Op::Ret` fires `handler_returned` to restore
+    // it, so the held re-raise delivers exactly once after return — never reentrant.
+    assert_eq!(
+        run_bytecode_only(src, |_| {}).result,
+        vec![Value::I32(2)],
+        "#1146: the bytecode engine never reenters a handler by its own signal"
+    );
 }
 
 /// #796 nested delivery — **a different unmasked signal interrupts a running handler**: SIGINT's
@@ -486,6 +516,14 @@ int main(void) {
         e.result,
         vec![Value::I32(11)],
         "USR1's handler ran nested inside SIGINT's (saw10_in2 = 1), no stuck marker"
+    );
+    // #1146 — nested delivery on the bytecode tier: the `sig_handler_stack` guard admits a *different*
+    // unmasked signal while a handler is live (up to `MAX_SIG_HANDLER_NEST`), so USR1 nests into
+    // SIGINT's running handler exactly as on the tree-walker.
+    assert_eq!(
+        run_bytecode_only(src, |_| {}).result,
+        vec![Value::I32(11)],
+        "#1146: a different signal nests into a running handler on the bytecode engine too"
     );
 }
 
@@ -533,6 +571,13 @@ int main(void) {
         e.result,
         vec![Value::I32(101)],
         "sa_mask held USR1 through the handler (held=1), delivered non-nested after return"
+    );
+    // #1146 — `sa_mask` on the bytecode tier: `take_deliverable` folds the action mask into the
+    // handler mask, so USR1 is held through SIGINT's handler and delivered non-nested after return.
+    assert_eq!(
+        run_bytecode_only(src, |_| {}).result,
+        vec![Value::I32(101)],
+        "#1146: the bytecode engine honors sa_mask for the handler's duration too"
     );
 }
 

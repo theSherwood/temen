@@ -1975,7 +1975,8 @@ async function runModule(c) {
   // The interpreter tier streams off the main thread by default (a worker + `runStream`); name that as
   // the expected tier so a real fall-through to the synchronous path reads as the fallback, not this.
   const interpTier = !ex.warm && snapshotClient ? 'interpreter (streamed)' : 'interpreter';
-  const rec = runStart(c, { tier: useJit ? 'wasm-JIT' : interpTier });
+  const jitTier = snapshotClient ? 'wasm-JIT (streamed)' : 'wasm-JIT';
+  const rec = runStart(c, { tier: useJit ? jitTier : interpTier });
   let bytes;
   try {
     bytes = await fetchTimed(rec, c, ex.url);
@@ -2005,7 +2006,11 @@ async function runModule(c) {
     try {
       const source = ex.editable ? c.editor.getValue() : '';
       if (!snapshotClient.isWarming(ex.url)) setState(c, 'running', 'warming up runtime (first Run)…');
-      const r = await snapshotClient.evalWarm(ex.url, () => Promise.resolve(bytes), source, useJit);
+      // Live-stream the eval's stdout to the pane as it runs (#1142); the final `stdout` still overwrites.
+      c.el.stdout.textContent = '';
+      const wdec = new TextDecoder();
+      const r = await snapshotClient.evalWarm(ex.url, () => Promise.resolve(bytes), source, useJit,
+        (chunk) => { c.el.stdout.textContent += wdec.decode(chunk, { stream: true }); });
       if (r.ok) {
         rv = r.value; status = r.status; stdout = r.stdout; tier = r.tier;
         // Observability hook (harmless): lets the browser test confirm the run actually went through the
@@ -2038,21 +2043,40 @@ async function runModule(c) {
       status = undefined;
     }
   } else if (status === undefined && useJit) {
-    try {
-      // Emit `_start` and run it on wasm; temen_onramp_jit_run_finish captures stdout/exit/value into the
-      // shared slots (read back via the usual accessors, exactly like the interpreter path). `temen_run_value`
-      // is the guest's returned result — the same value `temen_run_onramp` returns on the interpreter, so the
-      // result matches on both tiers (a trap throws → we fall back to the interpreter below).
-      // Cache the compiled Module across Runs keyed by the module's content-addressed URL — the
-      // emitted `_start` depends only on the module, not the editor `stdinBytes` (slice 1, WASM_AOT.md).
-      status = await runJitModule(eng.ex, eng.memory, bytes, stdinBytes, ex.url);
-      rv = Number(eng.ex.temen_run_value());
-      stdout = readModuleStdout();
-      tier = 'wasm-JIT';
-    } catch (e) {
-      logTo(c, `wasm-JIT module unavailable (${e.message}); falling back to the interpreter`);
-      runNote(rec, { jitFallbackReason: e.message });
-      status = undefined;
+    // Prefer the worker (#1141): emit + run `_start` on the wasm-JIT tier off the main thread, streaming
+    // stdout live. A JIT decline / worker miss falls through to the synchronous main-thread `runJitModule`.
+    if (snapshotClient) {
+      try {
+        c.el.stdout.textContent = '';
+        const jdec = new TextDecoder();
+        const r = await snapshotClient.runJitStream(bytes, stdinBytes, ex.url,
+          (chunk) => { c.el.stdout.textContent += jdec.decode(chunk, { stream: true }); });
+        if (r.ok) {
+          rv = r.value; status = r.status; stdout = r.stdout; tier = 'wasm-JIT (streamed)';
+        } else {
+          logTo(c, `wasm-JIT worker: ${r.error}; falling back`);
+        }
+      } catch (e) {
+        logTo(c, `wasm-JIT worker unavailable (${e.message}); falling back`);
+      }
+    }
+    if (status === undefined) {
+      try {
+        // Emit `_start` and run it on wasm; temen_onramp_jit_run_finish captures stdout/exit/value into the
+        // shared slots (read back via the usual accessors, exactly like the interpreter path). `temen_run_value`
+        // is the guest's returned result — the same value `temen_run_onramp` returns on the interpreter, so the
+        // result matches on both tiers (a trap throws → we fall back to the interpreter below).
+        // Cache the compiled Module across Runs keyed by the module's content-addressed URL — the
+        // emitted `_start` depends only on the module, not the editor `stdinBytes` (slice 1, WASM_AOT.md).
+        status = await runJitModule(eng.ex, eng.memory, bytes, stdinBytes, ex.url);
+        rv = Number(eng.ex.temen_run_value());
+        stdout = readModuleStdout();
+        tier = 'wasm-JIT';
+      } catch (e) {
+        logTo(c, `wasm-JIT module unavailable (${e.message}); falling back to the interpreter`);
+        runNote(rec, { jitFallbackReason: e.message });
+        status = undefined;
+      }
     }
   }
   if (status === undefined && useJit && ex.warm) {
@@ -2475,7 +2499,11 @@ async function runNimc(c) {
       // worker, never the page. A fresh Run first `cancelNim`s any still-running one (terminates the
       // stuck worker), so the card is never wedged by a previous hang.
       snapshotClient.cancelNim();
-      const r = await snapshotClient.nimCompile(getAssets, source, main);
+      // Live-stream the compiled program's stdout as its `_start` runs (#1143) — after the phases finish,
+      // a chatty program prints progressively instead of all at once. The final banner+stdout overwrites.
+      const ndec = new TextDecoder();
+      const r = await snapshotClient.nimCompile(getAssets, source, main,
+        (chunk) => { c.el.stdout.textContent += ndec.decode(chunk, { stream: true }); });
       if (!r.ok) throw new Error(r.error || 'nim worker unavailable');
       ({ status } = r);
       out = r.stdout;

@@ -23251,7 +23251,7 @@ impl Mem {
         let window = Window::with_mapped(reserved_log2, 1u64 << mapped_log2.min(63));
         let page = host_page_size();
         Mem {
-            back: Arc::new(Region::new(window.reserved(), page)),
+            back: Arc::new(Self::reserved_backing(window.reserved(), page)),
             window,
             page,
             space: Arc::new(RwLock::new(AddrSpace::default())),
@@ -23262,6 +23262,38 @@ impl Mem {
             writes: 0,
             null_guard: 0,
         }
+    }
+
+    /// #1145 — the largest reservation [`Mem::with_reservation`] will eagerly allocate a **flat
+    /// `Owned`** backing for on a non-`mmap` target (wasm). Below this, a bounded reservation gets a
+    /// contiguous, lock-free buffer (raw-addressable, tier-up eligible) instead of the `Paged`
+    /// per-access-locked fallback; at or above it, `Paged`'s lazy per-page map is the only affordable
+    /// option. 256 MiB: comfortably covers a browser guest window while capping the eager cost.
+    const FLAT_BACKING_CAP: u64 = 1 << 28;
+
+    /// #1145 — the anonymous backing for a `with_reservation` window. [`Region::new`] is the right
+    /// default — a lazy `mmap` on unix — but its non-unix fallback is `Paged`, whose every byte access
+    /// takes a `Mutex` + `BTreeMap` lookup. When the default comes back non-flat **and** the
+    /// reservation is small enough to afford ([`FLAT_BACKING_CAP`]), an eagerly-allocated flat `Owned`
+    /// buffer is strictly faster: lock-free raw reads/writes on the browser cooperative tier.
+    fn reserved_backing(reserved: u64, page: u64) -> Region {
+        Self::reserved_backing_over(Region::new(reserved, page), reserved, page)
+    }
+
+    /// The decision half of [`reserved_backing`](Mem::reserved_backing), taking the already-built
+    /// default backing — split out so the non-unix (`Paged`-default) arm is unit-testable on a unix
+    /// host, where `Region::new` always comes back flat. When the default is non-flat and the
+    /// reservation is within [`FLAT_BACKING_CAP`], upgrade to an owned flat buffer sized to `reserved`
+    /// (`back.len() == reserved`, so every masked access — confined to `[0, reserved)` — stays in
+    /// bounds). Fail-soft: an allocation failure, an over-cap reservation, or an already-flat default
+    /// keeps the `Region::new` default (the window then runs Paged/interpreted, the prior behavior).
+    fn reserved_backing_over(default: Region, reserved: u64, page: u64) -> Region {
+        if default.raw_base().is_none() && reserved <= Self::FLAT_BACKING_CAP {
+            if let Some(flat) = Region::owned_zeroed(reserved, page) {
+                return flat;
+            }
+        }
+        default
     }
 
     /// Like [`Mem::with_reservation`], but the backing is a **caller-provided** [`Region`] (e.g. a
@@ -25699,6 +25731,40 @@ mod mem_fork_tests {
             b.raw_base().is_none(),
             "a non-flat parent's twin keeps the default backing"
         );
+    }
+
+    /// #1145 — the flat primary-backing seam, pinned on the non-unix arm (a forced `Paged` default,
+    /// since a unix `Region::new` always comes back flat): a bounded reservation gets an **owned flat**
+    /// backing (lock-free, tier-up eligible — the browser bash window), an over-cap reservation keeps
+    /// the `Paged` default (the 1 TiB `DEFAULT_RESERVED_LOG2` engine window), and a flat default (the
+    /// unix `mmap` arm) is kept as-is (lazy beats an eager buffer). `back.len() == reserved` on the
+    /// flat arm, so every confined access stays in bounds.
+    #[test]
+    fn reserved_backing_goes_owned_flat_only_for_a_bounded_reservation() {
+        let page = host_page_size();
+        // Bounded (≤ cap), non-flat default: upgraded to an owned flat buffer sized to the reservation.
+        let bounded = 1u64 << 25; // 32 MiB, the browser bash window
+        let b = Mem::reserved_backing_over(Region::paged(bounded, page), bounded, page);
+        assert!(
+            b.raw_base().is_some(),
+            "a bounded reservation must get a flat backing (#1145)"
+        );
+        assert_eq!(b.len(), bounded, "flat backing spans the whole reservation");
+
+        // Over-cap, non-flat default: keep the Paged default (an eager 1 TiB buffer is infeasible).
+        let over = Mem::FLAT_BACKING_CAP * 2;
+        let b = Mem::reserved_backing_over(Region::paged(over, page), over, page);
+        assert!(
+            b.raw_base().is_none(),
+            "an over-cap reservation must keep the Paged default"
+        );
+
+        // A flat default (the unix `mmap` arm) is kept as-is — lazy beats an eager copy.
+        #[cfg(unix)]
+        {
+            let b = Mem::reserved_backing_over(Region::new(bounded, page), bounded, page);
+            assert!(b.raw_base().is_some());
+        }
     }
 
     /// #816 item 3, end-to-end on the shapes that matter: `fork_private` of a **flat, clamped**

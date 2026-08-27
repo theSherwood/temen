@@ -195,7 +195,13 @@ try {
 
   // An on-ramp module: a real C guest (`hello.c`) compiled through the LLVM on-ramp and run via
   // `temen_run_onramp` (not the text/`temen_parse` path). Uses the committed `web/assets/hello_c.temen`.
-  check('hello (C → Temen, on-ramp module)', await runPlay('hello (C → Temen)'), '0', 'hello, sandbox!\n');
+  const helloC = await runPlay('hello (C → Temen)');
+  check('hello (C → Temen, on-ramp module)', helloC, '0', 'hello, sandbox!\n');
+  // …and it ran on the **wasm-JIT tier, off the main thread, streaming** (#1141) — the JIT run moved to a
+  // worker so its stdout paints as the emitted `_start` writes it. The status chip names the streamed tier.
+  const jitStreamed = helloC.status.includes('wasm-JIT (streamed)');
+  checks.push(jitStreamed);
+  console.log(`  play/jit-streamed: status=${JSON.stringify(helloC.status)} ${jitStreamed ? 'PASS' : 'FAIL'}`);
 
   // A real **Nim** program (`web/assets/nim_hello.temen`, gated headlessly by `nim_hello_asset.rs`) —
   // the full nimony toolchain → temen-leng → nim→powerbox bridge, run in-browser via `temen_run_onramp`.
@@ -210,6 +216,16 @@ try {
   const nimStreamed = nim.status.includes('streamed');
   checks.push(nimStreamed);
   console.log(`  play/nim-streamed: status=${JSON.stringify(nim.status)} ${nimStreamed ? 'PASS' : 'FAIL'}`);
+
+  // A **warm-snapshot** card (Lua): the eval runs on its snapshot worker over the restored warm image,
+  // and now streams stdout live to the pane as it writes (#1142). Type a `print`, Run, and require the
+  // output lands. Exercises the warm-eval stdout tee + the worker chunk relay end-to-end.
+  await play.evaluate((s) => document.querySelector(`${s} .CodeMirror`).CodeMirror.setValue('print("hi from lua")'),
+    card('Lua (5.4.7 — write & run)'));
+  const lua = await runPlay('Lua (5.4.7 — write & run)');
+  const luaOk = lua.state === 'done' && lua.stdout.includes('hi from lua');
+  checks.push(luaOk);
+  console.log(`  play/lua-warm-stream: state=${lua.state} stdout=${JSON.stringify(lua.stdout)} ${luaOk ? 'PASS' : 'FAIL'}`);
 
   // The framebuffer output path (the `display` capability): the gradient guest presents a 128×128
   // RGBA frame, which play.js blits to the canvas. Assert the canvas got the right dimensions and a

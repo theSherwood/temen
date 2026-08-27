@@ -731,8 +731,14 @@ struct ModuleSource {
 
 impl ModuleSource {
     fn new(primary: Compiled) -> ModuleSource {
+        ModuleSource::over(std::sync::Arc::new(primary))
+    }
+
+    /// [`ModuleSource::new`] over an already-`Arc`'d primary (the cross-run compiled-program cache,
+    /// #1144): the shared `Arc<Compiled>` becomes `mods[0]` of a fresh source.
+    fn over(primary: std::sync::Arc<Compiled>) -> ModuleSource {
         ModuleSource {
-            mods: std::sync::Mutex::new(vec![std::sync::Arc::new(primary)]),
+            mods: std::sync::Mutex::new(vec![primary]),
         }
     }
 
@@ -799,9 +805,18 @@ struct Domain {
 
 impl Domain {
     fn new(primary: Compiled, table_log2: u8) -> Domain {
+        Domain::over_primary(std::sync::Arc::new(primary), table_log2)
+    }
+
+    /// Like [`Domain::new`], but over an **already-`Arc`'d** primary `Compiled` — so a caller that
+    /// cached the compiled program across runs (#1144, the browser bash entry) reuses it via a cheap
+    /// refcount bump instead of recompiling. A **fresh** `ModuleSource` still wraps it each run (a run
+    /// pushes its own §14/exec'd command units into `mods[1..]` and must not inherit a prior run's),
+    /// so only the immutable `mods[0]` program is shared.
+    fn over_primary(primary: std::sync::Arc<Compiled>, table_log2: u8) -> Domain {
         let table = SharedSlots::new(primary.progs.len(), table_log2, 0);
         Domain {
-            source: std::sync::Arc::new(ModuleSource::new(primary)),
+            source: std::sync::Arc::new(ModuleSource::over(primary)),
             table,
         }
     }
@@ -4282,13 +4297,63 @@ pub fn compile_and_run_capture_reserved_with_host(
     // driver flattens idle parked fibers into their regions, and thaw seeding re-creates them from the
     // artifact residue. So a single-vCPU `cont.*` module is driven here in any window state (NORMAL /
     // UNWINDING freeze / REWINDING thaw); only multi-vCPU `thread.*` (above) still falls back.
-    let c = compile_module_for(m)?;
-    if func as usize >= c.progs.len() {
+    let c = std::sync::Arc::new(compile_module_for(m)?);
+    run_capture_reserved_over_compiled_with_host(
+        m,
+        c,
+        func,
+        args,
+        fuel,
+        init_mem,
+        reserved_log2,
+        host,
+    )
+}
+
+/// #1144 — **compile the reserved-window program without running it**, so a caller (the browser bash
+/// entry) can **cache the `Arc<Compiled>` across Runs** and skip the ~200 ms per-Run recompile of a
+/// large module. `None` if the module is outside the bytecode subset (same gate as
+/// [`compile_and_run_capture_reserved_with_host`]'s compile). Pair with
+/// [`run_capture_reserved_over_compiled_with_host`], which takes the cached program.
+pub fn compile_reserved(m: &Module) -> Option<std::sync::Arc<Compiled>> {
+    compile_module_for(m).map(std::sync::Arc::new)
+}
+
+/// #1144 — the run half of [`compile_and_run_capture_reserved_with_host`], over an **already-compiled**
+/// (and typically cached) `Arc<Compiled>`. Everything after the compile is identical — the `thread.*`/
+/// `Instantiator` out-of-scope refusal, the personality park door, `Mem` reservation + seed +
+/// data-init + NULL guard from `m`, run, window snapshot. A fresh `Domain`/`ModuleSource` wraps the
+/// shared program each call (so exec'd command units pushed this run don't leak into the next), reusing
+/// only the immutable primary program. `m` is still needed for the `Mem` init (data segments, window
+/// size, NULL guard) and the out-of-scope scan — cheap reads, no recompile.
+#[allow(clippy::too_many_arguments)] // mirrors compile_and_run_capture_reserved_with_host, plus `compiled`
+pub fn run_capture_reserved_over_compiled_with_host(
+    m: &Module,
+    compiled: std::sync::Arc<Compiled>,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    init_mem: &[u8],
+    reserved_log2: u8,
+    host: &mut Host,
+) -> Option<Capture> {
+    // Same out-of-scope gate as the compile-and-run entry — a cached program from a caller that also
+    // holds the module must still refuse the `thread.*`/§14-nesting shapes the freeze path can't drive.
+    let outside = m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(i, Inst::ThreadSpawn { .. } | Inst::ThreadJoin { .. })
+                || matches!(i, Inst::CapCall { type_id, .. } if *type_id == super::cap_id::INSTANTIATOR)
+        })
+    });
+    if outside {
+        return None;
+    }
+    if func as usize >= compiled.progs.len() {
         return Some((Err(Trap::Malformed), Vec::new()));
     }
     // #799/#1080 — install the personality fork/waitpid park-request door (see `compile_and_run_with_host`).
     host.wire_park_door();
-    let dom = Domain::new(c, host.jit_table_log2());
+    let dom = Domain::over_primary(compiled, host.jit_table_log2());
     let mut mem = m.memory.map(|mc| {
         let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
         mm.seed(init_mem);
@@ -13510,6 +13575,14 @@ struct Vm {
     /// domain's registered `self_module`, so serving from any *other* unit (an installed §22 unit
     /// running in the root domain) would index the wrong program table — fail closed instead.
     home: usize,
+    /// #1146 async signal delivery — the guard stack, the bytecode twin of the tree-walker's
+    /// `Vm::sig_handler_stack` (lib.rs). Each entry records `self.stack.len()` at the point an async
+    /// signal handler activation was injected (a `(i64 sp, i32 signum) -> ()` window opened like a
+    /// `call.dyn` at a per-op safepoint); `Op::Ret` pops the matching entry and calls
+    /// `handler_returned()` to restore the block-during-handler mask, and a `longjmp` OUT of a handler
+    /// (bash's `throw_to_top_level`) pops every crossed entry the same way. Bounded to
+    /// `MAX_SIG_HANDLER_NEST` nested deliveries. Empty on any run without a signal personality.
+    sig_handler_stack: Vec<usize>,
 }
 
 impl Vm {
@@ -13538,6 +13611,7 @@ impl Vm {
             serve_count: 0,
             tls: 0, // §12 per-vCPU TLS seed: dense vCPU id (root = 0; a spawned thread re-seeds to its id)
             home: 0,
+            sig_handler_stack: Vec::new(), // #1146 — no delivery in flight at entry
         })
     }
 
@@ -13608,6 +13682,12 @@ impl Vm {
         }
         let mut c: std::sync::Arc<Compiled> = resolve!(module);
 
+        // #1146 async signal delivery (the bytecode twin of the tree-walker's #796 L2 safepoint
+        // redirect). Fetch the personality's `(armed, source)` poll pair once per resume — two cheap
+        // `Arc` clones per quantum, not per op. `None` on any run without a signal personality (JIT
+        // bench, pure compute), so the per-op check in the loop is a single predictable branch there.
+        let signal_poll = host.with(|h| h.signal_poll());
+
         macro_rules! r {
             ($i:expr) => {
                 self.regs[base + $i as usize]
@@ -13662,6 +13742,62 @@ impl Vm {
                 return Ok(Outcome::Suspended);
             }
             budget -= 1;
+            // #1146 async signal delivery: at this per-op safepoint, if the personality has a caught,
+            // unmasked signal pending (its cheap `armed` flag) and we are not already
+            // `MAX_SIG_HANDLER_NEST` deep, redirect this vCPU into the guest handler
+            // `(i64 sp, i32 signum) -> ()` — a window opened exactly like a `call.dyn`, resolved and
+            // type-checked through the dispatch table. The interrupted op is NOT advanced (the return
+            // entry resumes at `pc`, re-running it once the handler returns), matching the tree-walker.
+            // Same interrupt-at-safepoint shape as `kill`, but non-lethal. (Interruptible-park `-EINTR`
+            // is a follow-up: no interruptible parks reach this synchronous safepoint path yet.)
+            if self.sig_handler_stack.len() < super::MAX_SIG_HANDLER_NEST {
+                if let Some((armed, source)) = &signal_poll {
+                    if armed.load(std::sync::atomic::Ordering::Relaxed) {
+                        // The source owns its own locking (an `Arc<Mutex<Proc>>`); we hold no host lock
+                        // here. A `None` means nothing deliverable (ignored/masked/stopped) — it also
+                        // disarms, so the check idles until the next `raise`/`kill`.
+                        if let Some((fref, signum, sp)) = source.take_deliverable() {
+                            let slot = (fref as u32 as usize) & (table.len() - 1);
+                            let ts = table.slot(slot);
+                            if ts.module != super::TABLE_EMPTY {
+                                let (tmod, tfunc) = (ts.module as usize, ts.func as usize);
+                                let tm = resolve!(tmod);
+                                let (cp, cr) = &tm.sigs[tfunc];
+                                // `void handler(int)` = `(i64 sp, i32 signum) -> ()` — chibicc threads
+                                // the data-SP as v0. A mis-typed handler is dropped (the signal was
+                                // already consumed by `take_deliverable`), never fatal.
+                                if matches!(cp.as_slice(), [ValType::I64, ValType::I32])
+                                    && cr.is_empty()
+                                {
+                                    // Open a fresh window past the current activation (like `Op::Call`),
+                                    // seeded with `(sp, signum)`. `nb`/`need` use the *current* `c`
+                                    // before any cross-module reassignment below.
+                                    let nb = base + c.progs[cur].nslots as usize;
+                                    let need = nb + tm.progs[tfunc].nslots as usize;
+                                    if self.regs.len() < need {
+                                        self.regs.resize(need, Reg::default());
+                                    }
+                                    self.regs[nb] = Reg::from_i64(sp as i64);
+                                    self.regs[nb + 1] = Reg::from_i32(signum);
+                                    // Return linkage resumes at the SAME `pc` so the interrupted op
+                                    // re-runs; the void handler writes no results (`ret_abs` unused —
+                                    // `base` is a harmless placeholder).
+                                    self.stack.push((module, cur, base, pc, base));
+                                    if tmod != module {
+                                        module = tmod;
+                                        c = tm;
+                                    }
+                                    cur = tfunc;
+                                    base = nb;
+                                    pc = 0;
+                                    self.sig_handler_stack.push(self.stack.len());
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             match &c.progs[cur].ops[pc] {
                 Op::Const { dst, val } => {
                     r!(*dst) = *val;
@@ -13969,6 +14105,23 @@ impl Vm {
                         return Err(Trap::Malformed); // the setjmp activation already returned
                     }
                     self.stack.truncate(point.depth);
+                    // #1146 — a longjmp OUT of an injected signal handler leaves it exactly like a
+                    // return: pop each crossed guard and fire `handler_returned()` so the personality
+                    // restores its block-during-handler mask and a LATER instance of the signal can
+                    // deliver (bash's `throw_to_top_level` siglongjmps out of `sigint_sighandler` —
+                    // without this, one ^C would silence the signal for the session). Guards record the
+                    // post-push stack depth, so `g > self.stack.len()` after the truncate is exactly the
+                    // crossed handlers; a longjmp WITHIN a handler crosses none and is untouched.
+                    while self
+                        .sig_handler_stack
+                        .last()
+                        .is_some_and(|&g| g > self.stack.len())
+                    {
+                        self.sig_handler_stack.pop();
+                        if let Some((_, source)) = &signal_poll {
+                            source.handler_returned();
+                        }
+                    }
                     module = point.module;
                     cur = point.cur;
                     base = point.base;
@@ -14083,29 +14236,43 @@ impl Vm {
                     base = nb;
                     pc = 0;
                 }
-                Op::Ret { srcs } => match self.stack.pop() {
-                    None => {
-                        let tys = &c.result_types[cur];
-                        return Ok(Outcome::Done(
-                            srcs.iter()
-                                .zip(tys)
-                                .map(|(s, ty)| self.regs[base + *s as usize].to_value(*ty))
-                                .collect(),
-                        ));
-                    }
-                    Some((cmod, cprog, cbase, cpc, ret_abs)) => {
-                        for (i, s) in srcs.iter().enumerate() {
-                            self.regs[ret_abs + i] = self.regs[base + *s as usize];
+                Op::Ret { srcs } => {
+                    // #1146 — if this returns from an injected async signal handler (its guard entry
+                    // records the stack depth at injection, which equals the current depth when the
+                    // handler's own `Ret` fires), restore the personality's block-during-handler mask
+                    // before unwinding, exactly as the tree-walker does on the handler's `Return`. A
+                    // held fatal signal exposed by the unmask fires its default action inside
+                    // `handler_returned` (a no-op here unless the driver wired `set_kill`).
+                    if self.sig_handler_stack.last() == Some(&self.stack.len()) {
+                        self.sig_handler_stack.pop();
+                        if let Some((_, source)) = &signal_poll {
+                            source.handler_returned();
                         }
-                        if cmod != module {
-                            module = cmod;
-                            c = resolve!(cmod);
-                        }
-                        cur = cprog;
-                        base = cbase;
-                        pc = cpc;
                     }
-                },
+                    match self.stack.pop() {
+                        None => {
+                            let tys = &c.result_types[cur];
+                            return Ok(Outcome::Done(
+                                srcs.iter()
+                                    .zip(tys)
+                                    .map(|(s, ty)| self.regs[base + *s as usize].to_value(*ty))
+                                    .collect(),
+                            ));
+                        }
+                        Some((cmod, cprog, cbase, cpc, ret_abs)) => {
+                            for (i, s) in srcs.iter().enumerate() {
+                                self.regs[ret_abs + i] = self.regs[base + *s as usize];
+                            }
+                            if cmod != module {
+                                module = cmod;
+                                c = resolve!(cmod);
+                            }
+                            cur = cprog;
+                            base = cbase;
+                            pc = cpc;
+                        }
+                    }
+                }
                 // Tail calls reuse the *current* window (`base` unchanged) instead of pushing a
                 // return entry, so the callee returns to this activation's caller. Args may alias the
                 // destination prefix, so gather into `scratch` then scatter (like edge copies).
