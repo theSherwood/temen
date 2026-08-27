@@ -6022,7 +6022,7 @@ pub extern "C" fn temen_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
     let mut fuel = u64::MAX;
     // The reservation is clamped to the backing (#816): a `map` past `win` fails with `-EINVAL`
     // instead of minting pages whose writes the backing silently drops.
-    let (ran, pages) = prog.run_over_grown(
+    let (ran, pages, _) = prog.run_over_grown(
         warmup_fn,
         &[Value::I64(entry_sp as i64)],
         &mut fuel,
@@ -6114,7 +6114,7 @@ pub extern "C" fn temen_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64
     // the bytes), so a `vm_map`-grown warm heap is addressable again — and its `protect`ed rodata
     // write-protected again (#816). Every eval starts from the SAME captured map — an eval's own
     // remaps never accumulate (fresh-per-Run isolation).
-    let (ran, eval_pages) = s.prog.run_over_grown(
+    let (ran, eval_pages, _) = s.prog.run_over_grown(
         s.eval_fn,
         &[Value::I64(s.entry_sp as i64)],
         &mut fuel,

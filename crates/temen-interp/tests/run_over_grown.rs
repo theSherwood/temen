@@ -72,7 +72,7 @@ fn grow_then(seed: bool) -> ProbeOutcome {
     let asl = host.grant_memory();
     let mut fuel = u64::MAX;
     // Call 1: grow one host page and write the marker (a whole 16-KiB page covers macOS too).
-    let (ran, pages) = prog.run_over_grown(
+    let (ran, pages, _) = prog.run_over_grown(
         0,
         &[Value::I32(asl), Value::I64(16384)],
         &mut fuel,
@@ -96,7 +96,7 @@ fn grow_then(seed: bool) -> ProbeOutcome {
     );
     // Call 2: fresh Mem over the same backing — the seam under test.
     let seed = seed.then_some(pages);
-    prog.run_over_grown(
+    let (ran, pages, _) = prog.run_over_grown(
         1,
         &[],
         &mut fuel,
@@ -105,7 +105,8 @@ fn grow_then(seed: bool) -> ProbeOutcome {
         false,
         BACKING_LOG2,
         seed.as_deref(),
-    )
+    );
+    (ran, pages)
 }
 
 #[test]
@@ -140,7 +141,7 @@ fn overgrow_past_the_clamped_reservation_fails_probeably() {
     let mut host = Host::new();
     let asl = host.grant_memory();
     let mut fuel = u64::MAX;
-    let (ran, _) = prog.run_over_grown(
+    let (ran, _, _) = prog.run_over_grown(
         2, // the store-free grow func: the errno itself is the observable
         &[Value::I32(asl), Value::I64(1 << 20)], // 1 MiB — far past the 128-KiB backing
         &mut fuel,
@@ -200,7 +201,7 @@ fn protected_rodata_round_trips_readable_and_write_protected() {
     let mut host = Host::new();
     let asl = host.grant_memory();
     let mut fuel = u64::MAX;
-    let (ran, pages) = prog.run_over_grown(
+    let (ran, pages, _) = prog.run_over_grown(
         0,
         &[Value::I32(asl)],
         &mut fuel,
@@ -218,7 +219,7 @@ fn protected_rodata_round_trips_readable_and_write_protected() {
     );
 
     // Seeded read: bytes AND readability restored.
-    let (ran, _) = prog.run_over_grown(
+    let (ran, _, _) = prog.run_over_grown(
         1,
         &[],
         &mut fuel,
@@ -235,7 +236,7 @@ fn protected_rodata_round_trips_readable_and_write_protected() {
     );
 
     // Seeded store: the PROTECTION is restored too — the write faults.
-    let (ran, _) = prog.run_over_grown(
+    let (ran, _, _) = prog.run_over_grown(
         2,
         &[],
         &mut fuel,

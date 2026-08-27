@@ -2333,6 +2333,11 @@ impl SharedProgram {
     /// `Some(entries)` to seed the next call with (empty for a plain flat window), or `None` if
     /// the guest aliased a §13 `SharedRegion` page — a byte restore cannot reproduce an alias, so
     /// a warm driver must fail closed on it. `Some(vec![])` for a memory-less module.
+    ///
+    /// The trailing `u64` is the window's **committed scalar extent** (`Mem::map_info`'s `mapped`)
+    /// after the run — `0` for a memory-less module. A cross-tier driver that grows a *live* window
+    /// across bounces (the single-shot on-ramp JIT path, #1153) reads it to re-sync the emitted
+    /// tier's `"mapped"` bound to the guest's real extent instead of pre-sizing a fixed window.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn run_over_grown(
         &self,
@@ -2344,9 +2349,9 @@ impl SharedProgram {
         seed_data: bool,
         reserved_log2: u8,
         prots: Option<&[(u64, u8)]>,
-    ) -> (Result<Vec<Value>, Trap>, Option<Vec<(u64, u8)>>) {
+    ) -> (Result<Vec<Value>, Trap>, Option<Vec<(u64, u8)>>, u64) {
         if func as usize >= self.n_funcs {
-            return (Err(Trap::Malformed), None);
+            return (Err(Trap::Malformed), None, 0);
         }
         // A fresh natural dispatch table over the shared compiled source (cheap: an `Arc` clone + the
         // slot vector) — the cross-tier reactor carries no §22 install state between calls.
@@ -2363,18 +2368,18 @@ impl SharedProgram {
             mm
         });
         let out = run(dom, func, args, fuel, &mut mem, host);
-        let pages = match mem.as_ref() {
-            None => Some(Vec::new()),
+        let (pages, mapped) = match mem.as_ref() {
+            None => (Some(Vec::new()), 0),
             Some(m) => {
-                let (_, _, _, entries) = m.map_info();
+                let (_, mapped, _, entries) = m.map_info();
                 if entries.iter().any(|&(_, kind)| kind == 3) {
-                    None // §13 Backed alias — unrestorable by a byte snapshot; fail closed
+                    (None, mapped) // §13 Backed alias — unrestorable by a byte snapshot; fail closed
                 } else {
-                    Some(entries)
+                    (Some(entries), mapped)
                 }
             }
         };
-        (out, pages)
+        (out, pages, mapped)
     }
 
     /// #816 item 4 — a **cooperative tier-up run** over the shared compiled source, for a restorable
