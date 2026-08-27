@@ -13,13 +13,17 @@ use temen_dap::models::{MemModel, MemModelCfg};
 use temen_interp::bytecode::DebugRun;
 use temen_text::parse_module;
 
+// The store loop bases at 16384 (the #1094 NULL guard end, `[0, 16 KiB)` faults on any guest
+// access) rather than 0; the base is cache-line-aligned, so the stride-relative miss pattern the
+// profiler measures is unchanged. The window is `memory 32` (128 KiB) so the strided walk clears
+// both the guard base and the top of its span (16384 + 127·512 = 81408) without faulting.
 fn store_loop(iters: i64, stride: i64) -> String {
     format!(
-        r#"memory 16
+        r#"memory 32
 func () -> (i64) {{
 block 0 () {{
   v0 = i32.const {iters}
-  v1 = i64.const 0
+  v1 = i64.const 16384
   br 1(v0, v1)
 }}
 block 1 (vk: i32, va: i64) {{

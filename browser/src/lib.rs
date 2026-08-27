@@ -205,14 +205,18 @@ pub extern "C" fn run_threads() -> i64 {
 /// runs every multi-domain guest on), over primitives already exercised on wasm32 — the wasm-JIT
 /// tier-up is orthogonal (a per-Worker compute accelerator; cap/serve/fork ops leaf-fold to the
 /// interp). Returns `100` (the original's reply) **iff** both replies (`100` + `200`) reached the
-/// shared stdout — i.e. the twin genuinely ran; `i64::MIN` on any failure.
+/// shared stdout — i.e. the twin genuinely ran; `i64::MIN` on any failure. The manager runs in the
+/// module's 72-KiB window, so its scratch (the queue/spawn-arg structs and the "svc"/"o" name data
+/// segments) sits above the #1094 unconditional NULL guard (`[0, 16 KiB)` faults on any guest
+/// access). The spawned domains run in 4-KiB carves — below the guard's minimum window, so the guard
+/// no-ops there (#1094) and the domain's own name cells + reply slot keep their low `[0, 24)` offsets.
 const FORK_TWIN: &str = r#"
 memory 18
 type 0 func (i64) -> (i64)
 type 1 interface { fork: 0, wait: 0 }
 export 0 interface "svc" 1 { fork: 2, wait: 3 }
-data 300 "svc"
-data 310 "o"
+data 16684 "svc"
+data 16694 "o"
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, vout: i32) {
   vlog = i64.const 12
@@ -222,59 +226,59 @@ block 0 (v0: i32, vout: i32) {
   q1v2 = i64.const -4294967284
   q1v3 = i64.const 4294967295
   q1v4 = i64.const 0
-  q1a0 = i64.const 1216
+  q1a0 = i64.const 17600
   i64.store q1a0 q1v0
-  q1a1 = i64.const 1224
+  q1a1 = i64.const 17608
   i64.store q1a1 q1v1
-  q1a2 = i64.const 1232
+  q1a2 = i64.const 17616
   i64.store q1a2 q1v2
-  q1a3 = i64.const 1240
+  q1a3 = i64.const 17624
   i64.store q1a3 q1v3
-  q1a4 = i64.const 1248
+  q1a4 = i64.const 17632
   i64.store q1a4 q1v4
-  q1a5 = i64.const 1256
+  q1a5 = i64.const 17640
   i64.store q1a5 q1v4
-  q1a6 = i64.const 1264
+  q1a6 = i64.const 17648
   i64.store q1a6 q1v4
   vs = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
   vz0 = i64.const 0
   vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
-  va0 = i64.const 256
-  vnp = i32.const 300
+  va0 = i64.const 16640
+  vnp = i32.const 16684
   i32.store va0 vnp
-  va1 = i64.const 260
+  va1 = i64.const 16644
   vnl = i32.const 3
   i32.store va1 vnl
-  va2 = i64.const 264
+  va2 = i64.const 16648
   i32.store va2 vcap
-  va3 = i64.const 272
-  vnp2 = i32.const 310
+  va3 = i64.const 16656
+  vnp2 = i32.const 16694
   i32.store va3 vnp2
-  va4 = i64.const 276
+  va4 = i64.const 16660
   vnl2 = i32.const 1
   i32.store va4 vnl2
-  va5 = i64.const 280
+  va5 = i64.const 16664
   i32.store va5 vout
   q2v0 = i64.const 17179869184
   q2v1 = i64.const 135168
   q2v2 = i64.const -4294967284
   q2v3 = i64.const 4294967295
   q2v4 = i64.const 0
-  q2v5 = i64.const 256
+  q2v5 = i64.const 16640
   q2v6 = i64.const 2
-  q2a0 = i64.const 1280
+  q2a0 = i64.const 17664
   i64.store q2a0 q2v0
-  q2a1 = i64.const 1288
+  q2a1 = i64.const 17672
   i64.store q2a1 q2v1
-  q2a2 = i64.const 1296
+  q2a2 = i64.const 17680
   i64.store q2a2 q2v2
-  q2a3 = i64.const 1304
+  q2a3 = i64.const 17688
   i64.store q2a3 q2v3
-  q2a4 = i64.const 1312
+  q2a4 = i64.const 17696
   i64.store q2a4 q2v4
-  q2a5 = i64.const 1320
+  q2a5 = i64.const 17704
   i64.store q2a5 q2v5
-  q2a6 = i64.const 1328
+  q2a6 = i64.const 17712
   i64.store q2a6 q2v6
   vc = call.cap 6 17 (i64) -> (i32) v0 (q2a0)
   vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
@@ -786,9 +790,17 @@ fn par_box(inner: bytecode::Vcpu<'static>) -> *mut ParVcpu {
     }))
 }
 
-/// Attach the tier-up bitmap (if published) — only the **plain compute paths** (root / `thread.spawn`
-/// child over the primary module + window) tier up; §14/§22 orchestration roots and confined children
-/// run different modules/windows, so they stay on the interpreter.
+/// Attach the tier-up bitmap (if published). #816 item 5 — every vCPU of the run carries it: the
+/// plain compute paths (root / `thread.spawn` child), the §14/§22 orchestration roots, and §14
+/// **confined children** alike. The routing is structurally per-vCPU on this driver (the coop
+/// driver needed explicit per-event routing; here each Worker holds its own window): a
+/// [`PAR_TIERUP`]'s `mapped`/page-state come from **that vCPU's own `Mem`** (a confined child's
+/// fully-mapped carve — its confinement bound), and the Worker calls the emitted `f{func}` with
+/// **its own** `win` (the carve base for a confined child's Worker). The engine's `module == 0`
+/// dispatch gate keeps the bitmap inert on a separate-module child (its direct `Call`s resolve in
+/// its own module, never the primary's emitted set), and `emit_module` turns bound-check elision
+/// off for any instantiator-bearing module, so an emitted access always checks the live per-event
+/// bound — a carve smaller than the emit-time window can never be overrun (#1117's floor rule).
 fn with_tierup(inner: bytecode::Vcpu<'static>) -> bytecode::Vcpu<'static> {
     match par_jit_eligible() {
         Some(e) => {
@@ -1777,7 +1789,9 @@ pub extern "C" fn temen_par_root(
             &[],
             host,
         ) {
-            Ok(inner) => par_box(inner),
+            // #816 item 5: a §14 orchestration root's compute leaves tier up too (module-0 root
+            // over the full run window — the same shape as the plain root below).
+            Ok(inner) => par_box(with_tierup(inner)),
             Err(_) => {
                 par_vcpu_retire();
                 core::ptr::null_mut()
@@ -1796,7 +1810,9 @@ pub extern "C" fn temen_par_root(
             back,
             &[],
         ) {
-            Ok(inner) => par_box(inner.with_shared_host(&cfg.host)),
+            // #816 item 5: the §22 runtime-compile root's compute leaves tier up too (the JACL
+            // shape — its `Jit.compile`d units already ran emitted; now so do its own hot leaves).
+            Ok(inner) => par_box(with_tierup(inner.with_shared_host(&cfg.host))),
             Err(_) => {
                 par_vcpu_retire();
                 core::ptr::null_mut()
@@ -1914,7 +1930,11 @@ pub extern "C" fn temen_par_child_confined(
         size_log2 as u8,
         fuel as u64,
     ) {
-        Ok(inner) => par_box(inner),
+        // #816 item 5: a same-module confined child's compute leaves tier up over its OWN carve —
+        // its Worker's `win` is the carve base and each event's `mapped`/page-state come from the
+        // child's own `Mem` (the carve-sized confinement bound). A separate-module child carries
+        // the bitmap inertly (the engine's module-0 dispatch gate). See [`with_tierup`].
+        Ok(inner) => par_box(with_tierup(inner)),
         Err(_) => {
             par_vcpu_retire();
             core::ptr::null_mut()
