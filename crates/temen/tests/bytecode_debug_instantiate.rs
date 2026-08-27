@@ -26,19 +26,19 @@ block 0 (v0: i32) {
   q0v2 = i64.const -4294967284
   q0v3 = i64.const 4294967295
   q0v4 = i64.const 0
-  q0a0 = i64.const 1152
+  q0a0 = i64.const 17536
   i64.store q0a0 q0v0
-  q0a1 = i64.const 1160
+  q0a1 = i64.const 17544
   i64.store q0a1 q0v1
-  q0a2 = i64.const 1168
+  q0a2 = i64.const 17552
   i64.store q0a2 q0v2
-  q0a3 = i64.const 1176
+  q0a3 = i64.const 17560
   i64.store q0a3 q0v3
-  q0a4 = i64.const 1184
+  q0a4 = i64.const 17568
   i64.store q0a4 q0v4
-  q0a5 = i64.const 1192
+  q0a5 = i64.const 17576
   i64.store q0a5 q0v4
-  q0a6 = i64.const 1200
+  q0a6 = i64.const 17584
   i64.store q0a6 q0v4
   v5 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
@@ -208,31 +208,32 @@ fn instantiate_child_tick_replays_deterministically() {
 
 // --- Depth-2 nesting (slice 15c) -----------------------------------------------------------------
 // Confinement composes to depth 2 under the scheduled debugger: the root (func 0) instantiates a child
-// (func 1) in a 4 KiB window at 64 KiB; the child, handed an `Instantiator` over *its* window, itself
-// instantiates a grandchild (func 2) in a 1 KiB window at its own offset 2048. Each joins the next; the
-// grandchild returns 77, propagated up. Same fixture as `bytecode_instantiate.rs::DEPTH_TWO`.
+// (func 1) in a 32 KiB window at 64 KiB; the child, handed an `Instantiator` over *its* window, itself
+// instantiates a grandchild (func 2) in a 1 KiB window at its own offset 16384 (a nested carve must
+// clear the #1094 NULL guard, so the child window is sized to hold a carve at 16384). Each joins the
+// next; the grandchild returns 77, propagated up. Same fixture as `bytecode_instantiate.rs::DEPTH_TWO`.
 const DEPTH_TWO: &str = r#"memory 17
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  ; spawn via record (op 17): entry=1 off=65536 sl=12 quota=0
+  ; spawn via record (op 17): entry=1 off=65536 sl=15 quota=0
   q1v0 = i64.const 4294967296
   q1v1 = i64.const 65536
-  q1v2 = i64.const -4294967284
+  q1v2 = i64.const -4294967281
   q1v3 = i64.const 4294967295
   q1v4 = i64.const 0
-  q1a0 = i64.const 1216
+  q1a0 = i64.const 17600
   i64.store q1a0 q1v0
-  q1a1 = i64.const 1224
+  q1a1 = i64.const 17608
   i64.store q1a1 q1v1
-  q1a2 = i64.const 1232
+  q1a2 = i64.const 17616
   i64.store q1a2 q1v2
-  q1a3 = i64.const 1240
+  q1a3 = i64.const 17624
   i64.store q1a3 q1v3
-  q1a4 = i64.const 1248
+  q1a4 = i64.const 17632
   i64.store q1a4 q1v4
-  q1a5 = i64.const 1256
+  q1a5 = i64.const 17640
   i64.store q1a5 q1v4
-  q1a6 = i64.const 1264
+  q1a6 = i64.const 17648
   i64.store q1a6 q1v4
   v5 = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
   v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
@@ -245,9 +246,9 @@ block 0 (v0: i64) {
   v2 = i64.const 0
   v3 = i32.const 171
   i32.store8 v2 v3
-  ; spawn via record (op 17): entry=2 off=2048 sl=10 quota=0
+  ; spawn via record (op 17): entry=2 off=16384 sl=10 quota=0
   q2v0 = i64.const 8589934592
-  q2v1 = i64.const 2048
+  q2v1 = i64.const 16384
   q2v2 = i64.const -4294967286
   q2v3 = i64.const 4294967295
   q2v4 = i64.const 0

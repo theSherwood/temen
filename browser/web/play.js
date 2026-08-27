@@ -24,10 +24,10 @@ const EXAMPLES = {
     desc: 'One vCPU call.cap-writes a greeting through the host-I/O powerbox and returns the byte ' +
       'count (14). stdout comes back onto the page after the run.',
     src: `memory 16
-data 0 "hello, world!\\n"
+data 16384 "hello, world!\\n"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   v2 = i64.const 14
   v3 = call.cap 0 1 (i64, i64) -> (i64) v0(v1, v2)
   return v3
@@ -56,7 +56,7 @@ block 2 (v4: i64) {
   v6 = thread.spawn 1 v5 v5
   v7 = i64.const 4
   v8 = i64.mul v4 v7
-  v9 = i64.const 16
+  v9 = i64.const 16400
   v10 = i64.add v9 v8
   i32.store v10 v6
   v11 = i64.const 1
@@ -75,7 +75,7 @@ block 4 (v14: i64) {
 block 5 (v17: i64) {
   v18 = i64.const 4
   v19 = i64.mul v17 v18
-  v20 = i64.const 16
+  v20 = i64.const 16400
   v21 = i64.add v20 v19
   v22 = i32.load v21
   v23 = thread.join v22
@@ -84,7 +84,7 @@ block 5 (v17: i64) {
   br 4(v25)
 }
 block 6 () {
-  v26 = i64.const 0
+  v26 = i64.const 16384
   v27 = i64.atomic.load v26
   return v27
   }
@@ -99,7 +99,7 @@ block 1 (v1: i64) {
   br_if v3 3() 2(v1)
 }
 block 2 (v4: i64) {
-  v5 = i64.const 0
+  v5 = i64.const 16384
   v6 = i64.const 1
   v7 = i64.atomic.rmw.add v5 v6
   v8 = i64.const -1
@@ -118,7 +118,7 @@ block 3 () {
     desc: '8 worker vCPUs (one Web Worker each) all call.cap-write "tick\\n" through the run\'s ONE ' +
       'shared powerbox and bump a shared counter — result 8, stdout "tick\\n" × 8, on every schedule.',
     src: `memory 16
-data 0 "tick\\n"
+data 16384 "tick\\n"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   vh0 = i64.extend_i32_u v0
@@ -135,7 +135,7 @@ block 2 (vi2: i64, vhh2: i64) {
   vt = thread.spawn 1 vsp vhh2
   v4 = i64.const 4
   v5 = i64.mul vi2 v4
-  v6 = i64.const 16
+  v6 = i64.const 16400
   v7 = i64.add v6 v5
   i32.store v7 vt
   v8 = i64.const 1
@@ -154,7 +154,7 @@ block 4 (vj: i64) {
 block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
-  v15 = i64.const 16
+  v15 = i64.const 16400
   v16 = i64.add v15 v14
   v17 = i32.load v16
   v18 = thread.join v17
@@ -163,7 +163,7 @@ block 5 (vj2: i64) {
   br 4(v20)
 }
 block 6 () {
-  v21 = i64.const 8
+  v21 = i64.const 16392
   v22 = i64.atomic.load v21
   return v22
   }
@@ -171,10 +171,10 @@ block 6 () {
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, vh: i64) {
   vhandle = i32.wrap_i64 vh
-  vptr = i64.const 0
+  vptr = i64.const 16384
   vlen = i64.const 5
   vw = call.cap 0 1 (i64, i64) -> (i64) vhandle(vptr, vlen)
-  v1 = i64.const 8
+  v1 = i64.const 16392
   v2 = i64.const 1
   v3 = i64.atomic.rmw.add v1 v2
   v4 = i64.const 0
@@ -208,7 +208,7 @@ block 2 (vi2: i64, vp2: i64) {
   vt = thread.spawn 1 vsp vp2
   v4 = i64.const 4
   v5 = i64.mul vi2 v4
-  v6 = i64.const 16
+  v6 = i64.const 16400
   v7 = i64.add v6 v5
   i32.store v7 vt
   v8 = i64.const 1
@@ -227,7 +227,7 @@ block 4 (vj: i64) {
 block 5 (vj2: i64) {
   v13 = i64.const 4
   v14 = i64.mul vj2 v13
-  v15 = i64.const 16
+  v15 = i64.const 16400
   v16 = i64.add v15 v14
   v17 = i32.load v16
   v18 = thread.join v17
@@ -236,7 +236,7 @@ block 5 (vj2: i64) {
   br 4(v20)
 }
 block 6 () {
-  v21 = i64.const 8
+  v21 = i64.const 16392
   v22 = i64.atomic.load v21
   return v22
   }
@@ -254,7 +254,7 @@ block 0 (vsp: i64, vp: i64) {
   vb = i32.const 7
   vr = call.dyn (i32, i32) -> (i32) vslot32 (va, vb)
   vr64 = i64.extend_i32_u vr
-  vc8 = i64.const 8
+  vc8 = i64.const 16392
   vold = i64.atomic.rmw.add vc8 vr64
   vret = i64.const 0
   return vret
@@ -289,7 +289,7 @@ block 2 (vi2: i64, vinst2: i32) {
   vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst2 (ventry, voff, vslog, vquota)
   v4 = i64.const 4
   vholo = i64.mul vi2 v4
-  v16 = i64.const 16
+  v16 = i64.const 16400
   vhoff = i64.add v16 vholo
   i32.store vhoff vh
   vinext = i64.add vi2 vone
@@ -308,7 +308,7 @@ block 4 (vj: i64, vs: i64, vinst4: i32) {
 block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v4b = i64.const 4
   vjlo = i64.mul vj2 v4b
-  v16b = i64.const 16
+  v16b = i64.const 16400
   vjoff = i64.add v16b vjlo
   vhh = i32.load vjoff
   vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)
@@ -378,13 +378,13 @@ block 2 (r: i64) {
 memory 16
 func () -> (i64) {
 block 0 () {
-  a0 = i64.const 0
+  a0 = i64.const 16384
   z = i64.const 0
   i64.store a0 z
   br 1(z)
 }
 block 1 (i: i64) {
-  a1 = i64.const 0
+  a1 = i64.const 16384
   one = i64.const 1
   n = i64.add i one
   i64.store a1 n
@@ -393,7 +393,7 @@ block 1 (i: i64) {
   br_if done 2(n) 1(n)
 }
 block 2 (r: i64) {
-  a2 = i64.const 0
+  a2 = i64.const 16384
   out = i64.load a2
   return out
   }
@@ -413,7 +413,7 @@ debug.loc 0 1 5 0 17 3
 debug.loc 0 2 0 0 20 3
 debug.loc 0 2 1 0 21 3
 debug.type 0 base "long" signed 8
-debug.var 0 "count" fixed 0 "long" 0
+debug.var 0 "count" fixed 16384 "long" 0
 `,
   },
 
@@ -443,14 +443,14 @@ block 0 () {
   h1 = thread.spawn 1 sp one
   j0 = thread.join h0
   j1 = thread.join h1
-  addr = i64.const 0
+  addr = i64.const 16384
   total = i64.atomic.load addr
   return total
   }
 }
 func (i64, i64) -> (i64) {
 block 0 (sp: i64, inc: i64) {
-  addr = i64.const 0
+  addr = i64.const 16384
   old = i64.atomic.rmw.add addr inc
   z = i64.const 0
   return z
@@ -475,15 +475,15 @@ block 0 (sp: i64, inc: i64) {
 memory 16
 func () -> (i64) {
 block 0 () {
-  a8 = i64.const 8
+  a8 = i64.const 16392
   val = i64.const 987654
   i64.atomic.store a8 val
   sp = i64.const 0
   h = thread.spawn 1 sp sp
-  a0 = i64.const 0
+  a0 = i64.const 16384
   one = i32.const 1
   i32.atomic.store a0 one
-  a0n = i64.const 0
+  a0n = i64.const 16384
   n1 = i32.const 1
   woke = atomic.notify a0n n1
   r = thread.join h
@@ -492,11 +492,11 @@ block 0 () {
 }
 func (i64, i64) -> (i64) {
 block 0 (sp: i64, arg: i64) {
-  a0 = i64.const 0
+  a0 = i64.const 16384
   exp = i32.const 0
   tmo = i64.const 1000000000
   st = i32.atomic.wait a0 exp tmo
-  a8 = i64.const 8
+  a8 = i64.const 16392
   got = i64.atomic.load a8
   return got
   }
@@ -568,7 +568,7 @@ block 0 () {
   w1 = thread.spawn 1 sp a
   j0 = thread.join w0
   j1 = thread.join w1
-  addr = i64.const 0
+  addr = i64.const 16384
   total = i64.atomic.load addr
   return total
   }
@@ -582,7 +582,7 @@ block 0 (sp: i64, arg: i64) {
   s0, v0 = cont.resume gen a
   b = i64.const 20
   s1, v1 = cont.resume gen b
-  addr = i64.const 0
+  addr = i64.const 16384
   rmw = i64.atomic.rmw.add addr v1
   zero = i64.const 0
   return zero

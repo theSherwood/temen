@@ -4,7 +4,8 @@
 //! `concurrent_fuzz.rs` generates interleaving-invariant concurrent programs (commutative
 //! `atomic.rmw.add` to shared cells) and checks an exact checksum — a *correctness* oracle on the
 //! interpreter. This file reuses that idea but turns it into an *escape* oracle on **both** backends:
-//! the shared cells live at in-window addresses `cell*8`, and each generated program is run through
+//! the shared cells live at in-window addresses `16384 + cell*8` (above the #1094 NULL guard), and
+//! each generated program is run through
 //! the **capture** path on the interpreter (the confinement reference) and the JIT, then their final
 //! windows are **byte-compared**. Confinement of every concurrent atomic access — issued from spawned
 //! threads — is the property under test; a thread-context bug diverges the windows (wrong cell) or
@@ -53,22 +54,23 @@ struct Worker {
 
 struct Program {
     text: String,
-    /// `expected[c]` = final value of cell `c`, which must land confined at window offset `c*8`.
+    /// `expected[c]` = final value of cell `c`, which must land confined at window offset `16384 + c*8`.
     expected: Vec<u64>,
 }
 
-/// Build a verifier-valid concurrent module whose shared cells live in-window at `cell*8`. The worker
-/// (func 1) unpacks `(cell, amount, iters)` from its spawn arg (`(cell<<32)|(amount<<16)|iters`) and
-/// adds `base + cell*8`. `main` (func 0) spawns and joins all workers, then loads each cell and returns
+/// Build a verifier-valid concurrent module whose shared cells live in-window at `16384 + cell*8`
+/// (above the #1094 NULL guard). The worker (func 1) unpacks `(cell, amount, iters)` from its spawn
+/// arg (`(cell<<32)|(amount<<16)|iters`) and adds `base + cell*8`. `main` (func 0) spawns and joins
+/// all workers, then loads each cell and returns
 /// a checksum (so the concurrent atomic *load* path is exercised too).
 fn gen_program(seed: u64) -> Program {
     let mut r = Rng::new(seed);
     let cells = r.range(1, 4);
     let n = r.range(2, 6);
-    // In-window base (0): `base + cell*8 = cell*8` lands in `[0, WINDOW)`. (The generator kept a
-    // window-aligned out-of-window base under the old wrap model; trap-confinement faults such
-    // accesses, so the shared cells are now in-window and the atomic path is what's under test.)
-    let base = 0u64;
+    // Shared cells live above the #1094 NULL guard: `base + cell*8` with base = 16384 lands in
+    // `[16384, WINDOW)`. (The guard seeds `[0, 16384)` Unmapped for every module, so the shared cells
+    // sit just above it; the confined atomic path — not a wrap — is what's under test.)
+    let base = 16384u64;
 
     let workers: Vec<Worker> = (0..n)
         .map(|_| Worker {
@@ -185,7 +187,7 @@ fn generated_concurrent_programs_confine_in_window_atomics() {
         );
 
         for (c, &want) in prog.expected.iter().enumerate() {
-            let slot = c * 8;
+            let slot = 16384 + c * 8;
             let got = u64::from_le_bytes(imem[slot..slot + 8].try_into().unwrap());
             assert_eq!(
                 got, want,
@@ -194,10 +196,14 @@ fn generated_concurrent_programs_confine_in_window_atomics() {
                 prog.text
             );
         }
-        // Nothing outside the `cells` slots may be non-zero — a stray write would be an escape.
-        let live = prog.expected.len() * 8;
+        // The cells live at [16384, 16384 + len*8) (above the #1094 NULL guard). Nothing outside that
+        // — neither the guard region [0, 16384) nor the tail — may be non-zero: a stray write there
+        // would be an escape.
+        let cells_start = 16384usize;
+        let cells_end = cells_start + prog.expected.len() * 8;
         assert!(
-            imem[live..].iter().all(|&b| b == 0),
+            imem[..cells_start].iter().all(|&b| b == 0)
+                && imem[cells_end..].iter().all(|&b| b == 0),
             "a concurrent access landed outside the confined cells (seed {pseed})\n{}",
             prog.text
         );

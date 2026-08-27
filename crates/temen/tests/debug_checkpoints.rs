@@ -15,7 +15,7 @@ use temen_text::parse_module;
 /// A guest that runs **well past the checkpoint stride** (≥ a few thousand ops): a counter loop that
 /// also mutates linear memory each iteration, so a faithful checkpoint must restore both the call
 /// stack *and* the window bytes. `block1` is the loop header; each turn stores the running sum to a
-/// fixed address and decrements the counter.
+/// fixed address (16384, above the #1094 NULL guard) and decrements the counter.
 const LOOP_WITH_MEM: &str = "\
 memory 16
 func (i32) -> (i32) {
@@ -32,7 +32,7 @@ block 2 (v5: i32) {
 }
 block 3 (v6: i32, v7: i32) {
   v8 = i32.add v7 v6
-  v9 = i32.const 0
+  v9 = i32.const 16384
   i32.store v9 v8
   v10 = i32.const -1
   v11 = i32.add v6 v10
@@ -47,7 +47,7 @@ struct Probe {
     stop_pc: Option<(usize, usize)>, // (block, inst) of the pause, or None when finished
     finished: Option<Result<Vec<Value>, Trap>>,
     clock: u64,
-    mem: Vec<u8>, // the low window bytes the loop writes to
+    mem: Vec<u8>, // the window bytes the loop writes to (at 16384, above the #1094 NULL guard)
 }
 
 fn probe(insp: &Inspector, stop: &Stop) -> Probe {
@@ -60,7 +60,7 @@ fn probe(insp: &Inspector, stop: &Stop) -> Probe {
         stop_pc,
         finished,
         clock: insp.clock(),
-        mem: insp.read_window(0, 8).unwrap_or_default(),
+        mem: insp.read_window(16384, 8).unwrap_or_default(),
     }
 }
 

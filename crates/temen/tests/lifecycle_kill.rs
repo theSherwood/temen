@@ -20,28 +20,29 @@ use temen_verify::verify_module;
 const SRC: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (v0: i32) {\n\
-  ; spawn via record (op 17): entry=1 off=0 sl=12 quota=0\n\
+  ; spawn via record (op 17): entry=1 off=16384 sl=12 quota=0\n\
   q0v0 = i64.const 4294967296\n\
   q0v1 = i64.const 0\n\
   q0v2 = i64.const -4294967284\n\
   q0v3 = i64.const 4294967295\n\
-  q0a0 = i64.const 4096\n\
+  q0a0 = i64.const 20480\n\
   i64.store q0a0 q0v0\n\
-  q0a1 = i64.const 4104\n\
-  i64.store q0a1 q0v1\n\
-  q0a2 = i64.const 4112\n\
+  q0off = i64.const 16384\n\
+  q0a1 = i64.const 20488\n\
+  i64.store q0a1 q0off\n\
+  q0a2 = i64.const 20496\n\
   i64.store q0a2 q0v2\n\
-  q0a3 = i64.const 4120\n\
+  q0a3 = i64.const 20504\n\
   i64.store q0a3 q0v3\n\
-  q0a4 = i64.const 4128\n\
+  q0a4 = i64.const 20512\n\
   i64.store q0a4 q0v1\n\
-  q0a5 = i64.const 4136\n\
+  q0a5 = i64.const 20520\n\
   i64.store q0a5 q0v1\n\
-  q0a6 = i64.const 4144\n\
+  q0a6 = i64.const 20528\n\
   i64.store q0a6 q0v1\n\
   vch = call.cap 6 17 (i64) -> (i32) v0 (q0a0)\n\
   vk = call.cap 6 12 (i32) -> (i32) v0 (vch)\n\
-  bz = i64.const 0\n\
+  bz = i64.const 16384\n\
   b1 = i32.const 1\n\
   i32.store8 bz b1\n\
   br 1(v0, vch)\n\
@@ -53,7 +54,7 @@ block 1 (v0a: i32, vcha: i32) {\n\
   br_if vne 3(v0a, vcha, vp) 2(v0a, vcha)\n\
 }\n\
 block 2 (v0b: i32, vchb: i32) {\n\
-  v8192 = i64.const 8192\n\
+  v8192 = i64.const 24576\n\
   vexp = i32.const 0\n\
   vto = i64.const 100000\n\
   vy = i32.atomic.wait v8192 vexp vto\n\

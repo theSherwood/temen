@@ -35,7 +35,7 @@ fn src(token: &[u8; 3]) -> String {
         .iter()
         .enumerate()
         .map(|(i, &b)| {
-            let addr = CARVE + i as u64;
+            let addr = CARVE + 16384 + i as u64;
             format!("  q{i} = i64.const {addr}\n  c{i} = i32.const {b}\n  i32.store8 q{i} c{i}\n")
         })
         .collect();
@@ -43,15 +43,15 @@ fn src(token: &[u8; 3]) -> String {
         r#"memory 17
 func (i32, i32) -> (i64) {{
 block 0 (vinst: i32, vout: i32) {{
-  a0 = i64.const 0
-  n100 = i32.const 100
+  a0 = i64.const 16384
+  n100 = i32.const 16484
   i32.store a0 n100
-  a4 = i64.const 4
+  a4 = i64.const 16388
   n6 = i32.const 6
   i32.store a4 n6
-  a8 = i64.const 8
+  a8 = i64.const 16392
   i32.store a8 vout
-  a12 = i64.const 12
+  a12 = i64.const 16396
   z0 = i32.const 0
   i32.store a12 z0
   cs = i32.const 115
@@ -59,38 +59,39 @@ block 0 (vinst: i32, vout: i32) {{
   cd = i32.const 100
   co = i32.const 111
   cu = i32.const 117
-  p100 = i64.const 100
+  p100 = i64.const 16484
   i32.store8 p100 cs
-  p101 = i64.const 101
+  p101 = i64.const 16485
   i32.store8 p101 ct
-  p102 = i64.const 102
+  p102 = i64.const 16486
   i32.store8 p102 cd
-  p103 = i64.const 103
+  p103 = i64.const 16487
   i32.store8 p103 co
-  p104 = i64.const 104
+  p104 = i64.const 16488
   i32.store8 p104 cu
-  p105 = i64.const 105
+  p105 = i64.const 16489
   i32.store8 p105 ct
-{seed}  ; spawn via record (op 17): off=CARVE sl=16 quota=0, one named grant record at 0
+{seed}  ; spawn via record (op 17): off=CARVE sl=16 quota=0, one named grant record at 16384
   rrv0 = i64.const 4294967296
   rrv1 = i64.const {CARVE}
   rrv2 = i64.const -4294967280
   rrv3 = i64.const 4294967295
   rrvz = i64.const 0
+  rrgp = i64.const 16384
   rrv1n = i64.const 1
-  rra0 = i64.const 1152
+  rra0 = i64.const 17536
   i64.store rra0 rrv0
-  rra1 = i64.const 1160
+  rra1 = i64.const 17544
   i64.store rra1 rrv1
-  rra2 = i64.const 1168
+  rra2 = i64.const 17552
   i64.store rra2 rrv2
-  rra3 = i64.const 1176
+  rra3 = i64.const 17560
   i64.store rra3 rrv3
-  rra4 = i64.const 1184
+  rra4 = i64.const 17568
   i64.store rra4 rrvz
-  rra5 = i64.const 1192
-  i64.store rra5 rrvz
-  rra6 = i64.const 1200
+  rra5 = i64.const 17576
+  i64.store rra5 rrgp
+  rra6 = i64.const 17584
   i64.store rra6 rrv1n
   vch = call.cap 6 17 (i64) -> (i32) vinst (rra0)
   r = call.cap 6 1 (i32) -> (i64) vinst (vch)
@@ -104,21 +105,21 @@ block 0 (vci: i64) {{
   cd = i32.const 100
   co = i32.const 111
   cu = i32.const 117
-  a200 = i64.const 200
+  a200 = i64.const 16584
   i32.store8 a200 cs
-  a201 = i64.const 201
+  a201 = i64.const 16585
   i32.store8 a201 ct
-  a202 = i64.const 202
+  a202 = i64.const 16586
   i32.store8 a202 cd
-  a203 = i64.const 203
+  a203 = i64.const 16587
   i32.store8 a203 co
-  a204 = i64.const 204
+  a204 = i64.const 16588
   i32.store8 a204 cu
-  a205 = i64.const 205
+  a205 = i64.const 16589
   i32.store8 a205 ct
   len6 = i64.const 6
   hout = self.resolve a200 len6
-  a0 = i64.const 0
+  a0 = i64.const 16384
   len3 = i64.const 3
   w = call.cap 0 1 (i64, i64) -> (i64) hout (a0, len3)
   return w

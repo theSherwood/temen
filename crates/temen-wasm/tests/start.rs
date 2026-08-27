@@ -49,8 +49,8 @@ fn start_runs_before_export() {
     let wat = r#"
       (module
         (memory 1)
-        (func $init (i32.store (i32.const 0) (i32.const 42)))
-        (func (export "get") (result i32) (i32.load (i32.const 0)))
+        (func $init (i32.store (i32.const 16384) (i32.const 42)))
+        (func (export "get") (result i32) (i32.load (i32.const 16384)))
         (start $init))"#;
     assert_eq!(run(wat, "get", &[]), 42, "start must run before the export");
 }
@@ -62,9 +62,9 @@ fn start_wrapper_threads_params_and_results() {
     let wat = r#"
       (module
         (memory 1)
-        (func $init (i32.store (i32.const 0) (i32.const 100)))
+        (func $init (i32.store (i32.const 16384) (i32.const 100)))
         (func (export "add") (param $x i32) (result i32)
-          (i32.add (local.get $x) (i32.load (i32.const 0))))
+          (i32.add (local.get $x) (i32.load (i32.const 16384))))
         (start $init))"#;
     assert_eq!(run(wat, "add", &[Value::I32(5)]), 105);
 }
@@ -79,8 +79,8 @@ fn start_runs_once_internal_calls_bypass_wrapper() {
       (module
         (memory 1)
         (func $init
-          (i32.store (i32.const 0) (i32.add (i32.load (i32.const 0)) (i32.const 1))))
-        (func $helper (result i32) (i32.load (i32.const 0)))
+          (i32.store (i32.const 16384) (i32.add (i32.load (i32.const 16384)) (i32.const 1))))
+        (func $helper (result i32) (i32.load (i32.const 16384)))
         (func (export "run") (result i32) (call $helper))
         (export "helper" (func $helper))
         (start $init))"#;

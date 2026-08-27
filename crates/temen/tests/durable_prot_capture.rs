@@ -15,6 +15,12 @@ use temen_snapshot::{freeze_with_prots, restore_with_prots, PageProt, PAGE};
 const SIZE_LOG2: u8 = 17;
 const WINDOW: usize = 1 << SIZE_LOG2;
 const RO_OFF: usize = 5 * PAGE; // a read-only data segment lands on page 5
+                                // The "ordinary committed page" reference: page 8 (offset 32768). It must be Rw ABOVE the
+                                // #1094 NULL guard `[0, 16384)` (pages 0..3, now seeded Unmapped) *and* live in a different
+                                // host page from `RO_OFF` — protection is host-page granular, so on a 16 KiB-page host
+                                // (macOS) page 4 shares host page 1 with the page-5 RO segment and captures Ro; page 8 is a
+                                // clean host page above it.
+const RW_OFF: usize = 8 * PAGE;
 
 // A read-only data segment + a trivial entry (it doesn't touch memory; the segment alone marks
 // its page `Ro` at instantiation, D40).
@@ -76,9 +82,9 @@ fn readonly_data_segment_is_captured_and_survives_the_codec() {
         "readonly segment page captured Ro"
     );
     assert_eq!(
-        caps[0],
+        caps[RW_OFF / PAGE],
         CapturedProt::Rw,
-        "an ordinary committed page is Rw"
+        "an ordinary committed page (above the #1094 guard) is Rw"
     );
     assert_eq!(
         &window[RO_OFF..RO_OFF + 4],
@@ -95,7 +101,7 @@ fn readonly_data_segment_is_captured_and_survives_the_codec() {
         PageProt::Ro,
         "Ro survives serialize/restore"
     );
-    assert_eq!(rprots[0], PageProt::Rw);
+    assert_eq!(rprots[RW_OFF / PAGE], PageProt::Rw);
     assert_eq!(&rwin[RO_OFF..RO_OFF + 4], b"ABCD", "Ro page bytes survive");
 }
 
@@ -285,7 +291,12 @@ fn jit_capture_matches_interp_for_a_readonly_segment() {
         &mut hj as *mut Host as *mut c_void,
     )
     .expect("jit compiles");
-    let caps_j = hj.capture_window_prots(&m.data, WINDOW as u64, npages);
+    let caps_j = hj.capture_window_prots(
+        &m.data,
+        WINDOW as u64,
+        npages,
+        temen_ir::module_null_guard(&m).unwrap_or(0),
+    );
 
     assert_eq!(caps_i[RO_OFF / PAGE], CapturedProt::Ro);
     assert_eq!(
@@ -307,7 +318,7 @@ fn jit_capture_overlays_runtime_protect_over_the_default() {
     let mut h = Host::new();
     let map = h.cap_window_pages(0);
     map.lock().unwrap().insert(0, 3); // code 3 = Unmapped
-    let caps = h.capture_window_prots(&[], WINDOW as u64, WINDOW / PAGE);
+    let caps = h.capture_window_prots(&[], WINDOW as u64, WINDOW / PAGE, 0);
     assert_eq!(
         caps[0],
         CapturedProt::Unmapped,

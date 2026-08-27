@@ -41,22 +41,23 @@ block 0 (v0: i64) {
 }
 ";
 
-/// Parent: lay a grant record at window 0 — `{name_off=100, name_len=6, handle=stdout, flags=0}` with
-/// `"stdout"` at 100 — then `instantiate_module_named(module, grants_ptr=0, grants_n=1, entry=0,
-/// off=CARVE, size_log2=17, quota=0)` (op 13) → `join` (op 1) → the child's result. Args:
+/// Parent: lay a grant record at window 16384 (above the #1094 NULL guard) —
+/// `{name_off=16484, name_len=6, handle=stdout, flags=0}` with `"stdout"` at 16484 — then
+/// `instantiate_module_named(module, grants_ptr=16384, grants_n=1, entry=0, off=CARVE, size_log2=17,
+/// quota=0)` (op 13) → `join` (op 1) → the child's result. Args:
 /// `(instantiator, module handle, stdout stream)`.
 const PARENT: &str = "memory 18
 func (i32, i32, i32) -> (i64) {
 block 0 (vinst: i32, vmod: i32, vout: i32) {
-  r0 = i64.const 0
-  n100 = i32.const 100
+  r0 = i64.const 16384
+  n100 = i32.const 16484
   i32.store r0 n100
-  r4 = i64.const 4
+  r4 = i64.const 16388
   n6 = i32.const 6
   i32.store r4 n6
-  r8 = i64.const 8
+  r8 = i64.const 16392
   i32.store r8 vout
-  r12 = i64.const 12
+  r12 = i64.const 16396
   zf = i32.const 0
   i32.store r12 zf
   cS = i32.const 115
@@ -64,20 +65,20 @@ block 0 (vinst: i32, vmod: i32, vout: i32) {
   cD = i32.const 100
   cO = i32.const 111
   cU = i32.const 117
-  q100 = i64.const 100
+  q100 = i64.const 16484
   i32.store8 q100 cS
-  q101 = i64.const 101
+  q101 = i64.const 16485
   i32.store8 q101 cT
-  q102 = i64.const 102
+  q102 = i64.const 16486
   i32.store8 q102 cD
-  q103 = i64.const 103
+  q103 = i64.const 16487
   i32.store8 q103 cO
-  q104 = i64.const 104
+  q104 = i64.const 16488
   i32.store8 q104 cU
-  q105 = i64.const 105
+  q105 = i64.const 16489
   i32.store8 q105 cT
   me = i64.extend_i32_s vmod
-  gp = i64.const 0
+  gp = i64.const 16384
   gn = i64.const 1
   ent = i64.const 0
   off = i64.const 131072

@@ -42,7 +42,7 @@ fn blocking_call_fails_closed_once_a_freeze_has_landed() {
     let mut host = Host::new();
     host.set_durable(true);
     let h = host.grant_blocking(Duration::ZERO, None);
-    let mut mem = VecMem(vec![0u8; 4096]);
+    let mut mem = VecMem(vec![0u8; STATE_OFF as usize + 4096]);
 
     // Freeze landed (UNWINDING): entering a new blocking offload would stall the STW, so refuse.
     set_state(&mut mem, STATE_UNWINDING);
@@ -61,13 +61,14 @@ fn blocking_call_fails_closed_once_a_freeze_has_landed() {
     );
 }
 
-/// The gate is conditioned on a **durable** domain: a non-durable run's byte at window offset 0 is
-/// ordinary guest data, not a freeze word, and must never spuriously refuse a blocking call.
+/// The gate is conditioned on a **durable** domain: a non-durable run's byte at the `STATE_OFF`
+/// freeze-word slot is ordinary guest data, not a freeze word, and must never spuriously refuse a
+/// blocking call.
 #[test]
 fn blocking_call_runs_when_not_durable_even_if_offset_zero_looks_like_unwinding() {
     let mut host = Host::new(); // NOT durable
     let h = host.grant_blocking(Duration::ZERO, None);
-    let mut mem = VecMem(vec![0u8; 4096]);
+    let mut mem = VecMem(vec![0u8; STATE_OFF as usize + 4096]);
     set_state(&mut mem, STATE_UNWINDING); // a coincidental guest byte pattern, not a freeze word
 
     let ran = host.cap_dispatch_slots(cap_id::BLOCKING, 0, h, &[7], Some(&mut mem));

@@ -53,12 +53,12 @@ fn writes_to_stdout_and_returns() {
     // import binds to the stdout slot at instantiation; the handle operand is a vestigial dummy.
     let m = load(
         "memory 16\n\
-         data 16 \"hi\\n\"\n\
+         data 16400 \"hi\\n\"\n\
          export 0 func \"_start\" 0\n\
          func () -> (i32) {\n\
          block 0 () {\n\
          \x20 v0 = i32.const 0\n\
-         \x20 v1 = i64.const 16\n\
+         \x20 v1 = i64.const 16400\n\
          \x20 v2 = i64.const 3\n\
          \x20 v3 = call.sym \"write\" (i64, i64) -> (i64) v0(v1, v2)\n\
          \x20 v4 = i32.const 7\n\
@@ -102,7 +102,7 @@ fn echoes_stdin_to_stdout() {
          func () -> (i32) {\n\
          block 0 () {\n\
          \x20 v0 = i32.const 0\n\
-         \x20 v1 = i64.const 0\n\
+         \x20 v1 = i64.const 16384\n\
          \x20 v2 = i64.const 64\n\
          \x20 v3 = call.sym \"read\" (i64, i64) -> (i64) v0(v1, v2)\n\
          \x20 v4 = call.sym \"write\" (i64, i64) -> (i64) v0(v1, v3)\n\
@@ -544,12 +544,12 @@ fn memfault_kill_message_carries_a_source_backtrace() {
 fn deadline_does_not_delay_fast_guest() {
     let m = load(
         "memory 16\n\
-         data 16 \"hi\\n\"\n\
+         data 16400 \"hi\\n\"\n\
          export 0 func \"_start\" 0\n\
          func () -> (i32) {\n\
          block 0 () {\n\
          \x20 v0 = i32.const 0\n\
-         \x20 v1 = i64.const 16\n\
+         \x20 v1 = i64.const 16400\n\
          \x20 v2 = i64.const 3\n\
          \x20 v3 = call.sym \"write\" (i64, i64) -> (i64) v0(v1, v2)\n\
          \x20 v4 = i32.const 7\n\
@@ -587,8 +587,12 @@ fn deadline_does_not_delay_fast_guest() {
 /// queries `region_page_size` (op 3) and works in whole granules.
 #[test]
 fn powerbox_region_minting_round_trips() {
+    // `memory 18` (256 KiB): the two aliases sit at granule-aligned offsets `65536` and `65536 + g`
+    // (#1094: above the NULL guard AND aligned to the 64 KiB Windows allocation granularity, which
+    // `MapViewOfFile3` requires for the placement address — 16384 would EINVAL there), so the second
+    // alias ends at 65536 + 2g = 196608 < 262144 even at the largest granule.
     let m = load(
-        "memory 17\n\
+        "memory 18\n\
          export 0 func \"_start\" 0\n\
          func () -> (i32) {\n\
          block 0 () {\n\
@@ -599,11 +603,13 @@ fn powerbox_region_minting_round_trips() {
          \x20 v4 = call.cap 4 3 () -> (i64) v3()\n\
          \x20 v5 = i64.const 0\n\
          \x20 v6 = i32.const 3\n\
-         \x20 v7 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v3(v5, v5, v4, v6)\n\
-         \x20 v8 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v3(v4, v5, v4, v6)\n\
+         \x20 vg = i64.const 65536\n\
+         \x20 vg2 = i64.add vg v4\n\
+         \x20 v7 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v3(vg, v5, v4, v6)\n\
+         \x20 v8 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v3(vg2, v5, v4, v6)\n\
          \x20 v9 = i32.const 123\n\
-         \x20 i32.store8 v5 v9\n\
-         \x20 v10 = i32.load8_u v4\n\
+         \x20 i32.store8 vg v9\n\
+         \x20 v10 = i32.load8_u vg2\n\
          \x20 return v10\n\
            }\n\
          }\n",
@@ -820,12 +826,12 @@ fn manifest_imports_run_like_inline_capcalls() {
     let named = "memory 16\n\
         import 0 \"write\" (i64, i64) -> (i64)\n\
         import 1 \"exit\" (i32) -> ()\n\
-        data 16 \"hi\\n\"\n\
+        data 16400 \"hi\\n\"\n\
         export 0 func \"_start\" 0\n\
         func () -> (i32) {\n\
         block 0 () {\n\
         \x20 v0 = i32.const 0\n\
-        \x20 v1 = i64.const 16\n\
+        \x20 v1 = i64.const 16400\n\
         \x20 v2 = i64.const 3\n\
         \x20 v3 = call.import 0 (v1, v2)\n\
         \x20 v4 = i32.const 0\n\
@@ -845,19 +851,19 @@ fn manifest_imports_run_like_inline_capcalls() {
     // and invoked with inline `call.cap 0 1` / `1 0` instead of manifest slots.
     let inline = load(
         "memory 16\n\
-        data 16 \"hi\\n\"\n\
-        data 32 \"stdout\"\n\
-        data 40 \"exit\"\n\
+        data 16400 \"hi\\n\"\n\
+        data 16416 \"stdout\"\n\
+        data 16424 \"exit\"\n\
         export 0 func \"_start\" 0\n\
         func () -> (i32) {\n\
         block 0 () {\n\
-        \x20 v0 = i64.const 32\n\
+        \x20 v0 = i64.const 16416\n\
         \x20 v1 = i64.const 6\n\
         \x20 v2 = self.resolve v0 v1\n\
-        \x20 v3 = i64.const 16\n\
+        \x20 v3 = i64.const 16400\n\
         \x20 v4 = i64.const 3\n\
         \x20 v5 = call.cap 0 1 (i64, i64) -> (i64) v2(v3, v4)\n\
-        \x20 v6 = i64.const 40\n\
+        \x20 v6 = i64.const 16424\n\
         \x20 v7 = i64.const 4\n\
         \x20 v8 = self.resolve v6 v7\n\
         \x20 v9 = i32.const 0\n\

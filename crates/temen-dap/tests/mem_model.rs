@@ -10,14 +10,15 @@ use temen_dap::models::{MemModel, MemModelCfg};
 use temen_dap::{BytecodeBackend, DapServer, Debuggee, Json, SharedSink};
 use temen_text::parse_module;
 
-/// A store loop: `iters` stores of one i64 each, `stride` bytes apart, starting at 0.
+/// A store loop: `iters` stores of one i64 each, `stride` bytes apart, starting at 16384 (above the
+/// #1094 NULL guard). `memory 17` (128 KiB) so the widest strided footprint clears the guard and fits.
 fn store_loop(iters: i64, stride: i64) -> String {
     format!(
-        r#"memory 16
+        r#"memory 17
 func () -> (i64) {{
 block 0 () {{
   v0 = i32.const {iters}
-  v1 = i64.const 0
+  v1 = i64.const 16384
   br 1(v0, v1)
 }}
 block 1 (vk: i32, va: i64) {{

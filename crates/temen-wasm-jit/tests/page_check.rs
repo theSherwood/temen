@@ -153,8 +153,8 @@ block 0 (v0: i64) {
 "#;
 
 /// `(as, off, len, probe)`: `unmap` `[off, off+len)`, then the leaf **`mem.copy`s** *from* the source
-/// span `[probe, probe+16)` (straddling the unmapped page) to the plain-`Rw` dest `[1024, 1040)` — the
-/// read side of the walk must trap on both tiers.
+/// span `[probe, probe+16)` (straddling the unmapped page) to the plain-`Rw` dest `[17408, 17424)`
+/// (above the #1094 NULL guard `[0, 16384)`) — the read side of the walk must trap on both tiers.
 const UNMAP_COPY: &str = r#"memory 17
 func (i32, i64, i64, i64) -> (i64) {
 block 0 (vas: i32, voff: i64, vlen: i64, vprobe: i64) {
@@ -165,7 +165,7 @@ block 0 (vas: i32, voff: i64, vlen: i64, vprobe: i64) {
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  vdst = i64.const 1024
+  vdst = i64.const 17408
   vn = i64.const 16
   mem.copy vdst v0 vn
   return v0
@@ -186,7 +186,7 @@ block 0 (vas: i32, voff: i64, vlen: i64, vprobe: i64) {
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  vdst = i64.const 1024
+  vdst = i64.const 17408
   vn = i64.const 16
   mem.copy vdst v0 vn
   return v0
@@ -670,7 +670,7 @@ fn b2_paged_composes_the_shared_table_import_with_the_pagestate_global() {
     // point the emitted page check at the live table) — the two features are orthogonal.
     let m = build(
         r#"memory 17
-data ro 0 "readonlybytes"
+data ro 16384 "readonlybytes"
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vs = i32.wrap_i64 v0
@@ -833,8 +833,8 @@ fn paged_reactor_frame_matches_interpreter() {
         "paged reactor diverged on the unmapped page"
     );
 
-    // Inside the mapped prefix: both succeed (zeroed window ⇒ 0).
-    let probe_ok = 4096 + 8;
+    // Inside the mapped prefix, above the #1094 NULL guard `[0, 16384)`: both succeed (zeroed window ⇒ 0).
+    let probe_ok = 16384 + 8;
     let (want, _) = reactor_frame(probe_ok, false);
     assert_eq!(want, Ok(vec![Value::I64(0)]), "oracle sanity");
     let (got, t2) = reactor_frame(probe_ok, true);
@@ -884,7 +884,7 @@ fn aligned_atomic_load_traps_on_unmapped_page() {
     assert_eq!(tierups, 1);
     assert_eq!(want, got, "paged tier diverged on an aligned atomic load");
 
-    let inside = 4096 + 8; // aligned, inside the mapped prefix
+    let inside = 16384 + 8; // aligned, inside the mapped prefix (above the #1094 NULL guard)
     let (want, _) = run_guest(UNMAP_ATOMIC_LOAD, off, len, inside, Mode::Interp);
     assert_eq!(want, Outcome::Vals(vec![0]), "oracle sanity");
     let (got, tierups) = run_guest(UNMAP_ATOMIC_LOAD, off, len, inside, Mode::PagedSynced);

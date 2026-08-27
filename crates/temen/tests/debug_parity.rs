@@ -265,6 +265,7 @@ fn jit_elides_const_only_source_line() {
 // ---- G2: variable-value parity + the debug/fast delegation boundary -------------------------------
 
 // A window-located source variable `x` at the arg pointer (`v0 + 0`), written twice: 0 -> 11 -> 22.
+// The arg pointer sits above the #1094 NULL guard.
 // Both engines drive the *same* `Mem`, so a window variable has a comparable value at every step. (An
 // SSA-located variable is *also* comparable — the bytecode engine gives each value a stable unique
 // slot, see `ssa_var_value_parity_per_step` — this fixture just exercises the window path.)
@@ -297,7 +298,7 @@ debug.loc 0 0 3 0 3 1
 #[test]
 fn window_var_value_parity_per_step() {
     let m = parse_module(WINDOW_VAR_DBG).expect("parse");
-    let addr: u64 = 1024;
+    let addr: u64 = 17792; // 1024 + 16384, above the #1094 NULL guard
     let width = 4usize;
 
     // Tree-walker: read `x` via `var_addr`/`read_var` at every executed instruction.
@@ -827,7 +828,7 @@ debug.var 0 "s" ssa 2 "int"
 #[test]
 fn read_var_by_name_parity() {
     let m = parse_module(READVAR_DBG).expect("parse");
-    let args = [Value::I64(1024)];
+    let args = [Value::I64(17792)]; // 1024 + 16384, above the #1094 NULL guard
     let bp = IrPc {
         module: 0,
         func: 0,

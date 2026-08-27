@@ -316,14 +316,14 @@ block 0 () {
   vh1 = thread.spawn 1 vsp va
   vj0 = thread.join vh0
   vj1 = thread.join vh1
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vr = i64.load vaddr
   return vr
   }
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vc = i64.load vaddr
   vn = i64.add vc varg
   i64.store vaddr vn
@@ -1002,7 +1002,7 @@ fn dap_expands_struct_and_array_in_the_variables_pane() {
         Json::obj(vec![
             ("programText", Json::s(AGGREGATES_DBG)),
             ("function", Json::i(0)),
-            ("args", Json::Arr(vec![Json::i(1024)])),
+            ("args", Json::Arr(vec![Json::i(17408)])),
         ]),
     ));
     s.handle(&req(
@@ -1135,7 +1135,7 @@ fn dap_inspects_a_non_c_frontend_by_structured_layout_only() {
         Json::obj(vec![
             ("programText", Json::s(NON_C_DBG)),
             ("function", Json::i(0)),
-            ("args", Json::Arr(vec![Json::i(1024)])),
+            ("args", Json::Arr(vec![Json::i(17408)])),
         ]),
     ));
     s.handle(&req(
@@ -1236,7 +1236,8 @@ fn eval_result(out: &[Json]) -> (bool, Option<String>) {
     (ok, val)
 }
 
-/// Launch `program` (data-SP arg 1024), break at source `line`, and return the stopped frame id.
+/// Launch `program` (data-SP arg 17408, above the #1094 NULL guard), break at source `line`, and
+/// return the stopped frame id.
 fn launch_and_break(s: &mut DapServer, program: &str, path: &str, line: i64) -> i64 {
     s.handle(&req(1, "initialize", Json::obj(vec![])));
     s.handle(&req(
@@ -1245,7 +1246,7 @@ fn launch_and_break(s: &mut DapServer, program: &str, path: &str, line: i64) -> 
         Json::obj(vec![
             ("programText", Json::s(program)),
             ("function", Json::i(0)),
-            ("args", Json::Arr(vec![Json::i(1024)])),
+            ("args", Json::Arr(vec![Json::i(17408)])),
         ]),
     ));
     s.handle(&req(
@@ -1309,7 +1310,8 @@ fn dap_evaluate_member_and_index_access() {
 }
 
 // A pointer `pp` (at +0) to a `struct Point {x=7,y=9}` placed at +16. Tests `->` and pointer
-// indexing (`pp[0].y`). data-SP arg is 1024, so the stored pointer value is 1040.
+// indexing (`pp[0].y`). data-SP arg is 17408 (above the #1094 NULL guard), so the stored pointer
+// value is 17424.
 const POINTER_DBG: &str = r#"
 memory 17
 func (i64) -> (i32) {
@@ -1397,8 +1399,8 @@ fn variables(s: &mut DapServer, vref: i64) -> std::collections::HashMap<String, 
 
 #[test]
 fn dap_expands_a_pointer_to_its_pointee() {
-    // POINTER_DBG: `pp` (at +0) points at a `struct Point {x=7,y=9}` at +16; data-SP arg 1024,
-    // so the stored pointer value is 1040 (= 0x410).
+    // POINTER_DBG: `pp` (at +0) points at a `struct Point {x=7,y=9}` at +16; data-SP arg 17408
+    // (above the #1094 NULL guard), so the stored pointer value is 17424 (= 0x4410).
     let mut s = DapServer::new();
     let fid = launch_and_break(&mut s, POINTER_DBG, "/work/p.c", 3);
     let sref = scope_ref(&mut s, fid);
@@ -1406,7 +1408,7 @@ fn dap_expands_a_pointer_to_its_pointee() {
     // The pointer local shows its address and is expandable (not a bare scalar).
     let locals = variables(&mut s, sref);
     let (summary, pp_ref) = locals.get("pp").expect("local pp");
-    assert_eq!(summary, "0x410", "pointer shows its hex value");
+    assert_eq!(summary, "0x4410", "pointer shows its hex value");
     assert!(*pp_ref >= (1 << 20), "pointer is expandable");
 
     // Expanding the pointer yields a single `*` child — the pointee struct, itself expandable.
@@ -1471,7 +1473,8 @@ fn dap_evaluate_floats_and_short_circuit() {
 }
 
 // A `WindowVia` struct local (the wasm/DWARF case): `p` lives at a runtime base (frame value v2 =
-// the arg + 16) + 0, with a `struct {int x, y}`. v0 (= the launch arg 1024) is the frame pointer.
+// the arg + 16) + 0, with a `struct {int x, y}`. v0 (= the launch arg 17408, above the #1094 NULL
+// guard) is the frame pointer.
 const WINVIA_DBG: &str = r#"
 memory 17
 func (i64) -> (i32) {
@@ -1549,14 +1552,15 @@ fn dap_data_breakpoint_stops_on_window_write() {
         "advertises data breakpoints"
     );
 
-    // Launch paused at entry (before the store), arg v0 = window address 1024 (n's base).
+    // Launch paused at entry (before the store), arg v0 = window address 17408 (n's base, above the
+    // #1094 NULL guard).
     s.handle(&req(
         2,
         "launch",
         Json::obj(vec![
             ("programText", Json::s(NON_C_DBG)),
             ("function", Json::i(0)),
-            ("args", Json::Arr(vec![Json::i(1024)])),
+            ("args", Json::Arr(vec![Json::i(17408)])),
             ("stopOnEntry", Json::Bool(true)),
         ]),
     ));
@@ -1694,7 +1698,8 @@ fn dap_data_breakpoint_info_null_for_unaddressable_local() {
     );
 }
 
-// WORKERS_DBG plus a window-located source variable `shared` over the raced address (window 0): each
+// WORKERS_DBG plus a window-located source variable `shared` over the raced address (window 16384,
+// above the #1094 NULL guard): each
 // worker does a read-modify-write `i64.store` to it. Gives `dataBreakpointInfo` a named, addressable
 // target so a *worker* thread's store can trip a watchpoint armed over DAP.
 const WATCH_MT_DBG: &str = r#"
@@ -1707,14 +1712,14 @@ block 0 () {
   vh1 = thread.spawn 1 vsp va
   vj0 = thread.join vh0
   vj1 = thread.join vh1
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vr = i64.load vaddr
   return vr
   }
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 0
+  vaddr = i64.const 16384
   vc = i64.load vaddr
   vn = i64.add vc varg
   i64.store vaddr vn
@@ -1726,7 +1731,7 @@ block 0 (vsp: i64, varg: i64) {
 debug.file 0 "worker.c"
 debug.loc 1 0 1 0 4 3
 debug.type 0 base "long" signed 8
-debug.var 1 "shared" win 0 "long" 0
+debug.var 1 "shared" win 16384 "long" 0
 "#;
 
 /// **Cross-thread data breakpoint over DAP (DEBUGGING.md Milestone B — the headline).** A watchpoint

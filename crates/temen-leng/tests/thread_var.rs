@@ -173,7 +173,8 @@ fn tvar_is_isolated_per_tls_base() {
 
     // The driver stands in for the thread runtime: it owns the `vcpu.tls.set`s and calls the
     // translated accessors (imported by name, bound to the user unit's exports by the linker).
-    // B0 = 2048, B1 = 4096 — two zeroed 8-byte blocks in the low scratch page.
+    // B0 = 18432, B1 = 20480 — two zeroed 8-byte blocks, each raised +16384 above the unconditional
+    // NULL guard (#1094) into the mapped scratch above it.
     let driver = temen_text::parse_module(
         "\
 memory 16
@@ -181,11 +182,11 @@ import 0 \"bump\" (i64) -> ()
 import 1 \"get\" () -> (i64)
 func 0 () -> (i64) {
 block 0 () {
-  b0 = i64.const 2048
+  b0 = i64.const 18432
   vcpu.tls.set b0
   three = i64.const 3
   call.import 0 (three)
-  b1 = i64.const 4096
+  b1 = i64.const 20480
   vcpu.tls.set b1
   five = i64.const 5
   call.import 0 (five)
@@ -277,7 +278,7 @@ import 0 \"rw.0.modw\" (i64) -> (i64)
 import 1 \"peek.0.mods\" () -> (i64)
 func 0 () -> (i64) {
 block 0 () {
-  b = i64.const 2048
+  b = i64.const 18432
   vcpu.tls.set b
   fortytwo = i64.const 42
   r1 = call.import 0 (fortytwo)

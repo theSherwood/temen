@@ -20,7 +20,7 @@ use temen_text::parse_module;
 use temen_verify::verify_module;
 
 /// Where the test harness places the blob in guest memory.
-const BLOB_OFF: usize = 4096;
+const BLOB_OFF: usize = 20480; // #1094: one NULL guard (16384) above the legacy 4096 scratch
 
 /// Encode `src` as the binary blob a guest submits to `Jit.compile`.
 fn blob(src: &str) -> Vec<u8> {
@@ -113,14 +113,14 @@ fn diff_run_t(
 
 /// A guest that compiles the blob then invokes it with `(a, b)`, returning the result:
 /// `(jit_handle, a, b) -> invoke(compile(blob), a, b)`.
-const COMPILE_INVOKE: &str = "memory 16\nfunc (i32, i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32, v2: i32) {\n  v3 = i64.const 4096\n  v4 = i64.const BLOBLEN\n  v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  v6 = call.cap 11 1 (i64, i32, i32) -> (i32) v0 (v5, v1, v2)\n  return v6\n  }\n}\n";
+const COMPILE_INVOKE: &str = "memory 16\nfunc (i32, i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32, v2: i32) {\n  v3 = i64.const 20480\n  v4 = i64.const BLOBLEN\n  v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  v6 = call.cap 11 1 (i64, i32, i32) -> (i32) v0 (v5, v1, v2)\n  return v6\n  }\n}\n";
 
 /// A guest that compiles the blob then invokes its **0-argument** `() -> i64` entry, returning the
 /// result — and carries the **fiber body at func 1** (table slot 1) so a submitted unit can create a
 /// fiber over it by slot (new→old for fibers: a unit `ref.func`s only its own indices, so it names a
 /// parent function by a raw `i32.const <slot>`, exactly like new→old `call.dyn`). Slot 1's body
 /// `(i64,i64)->(i64)` suspends its arg, then on the next resume adds 100 and returns.
-const COMPILE_INVOKE_0ARG: &str = "memory 16\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i64.const 4096\n  v2 = i64.const BLOBLEN\n  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = call.cap 11 1 (i64) -> (i64) v0 (v3)\n  return v4\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  v2 = suspend v1\n  v3 = i64.const 100\n  v4 = i64.add v2 v3\n  return v4\n  }\n}\n";
+const COMPILE_INVOKE_0ARG: &str = "memory 16\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i64.const 20480\n  v2 = i64.const BLOBLEN\n  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = call.cap 11 1 (i64) -> (i64) v0 (v3)\n  return v4\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  v2 = suspend v1\n  v3 = i64.const 100\n  v4 = i64.add v2 v3\n  return v4\n  }\n}\n";
 
 /// Like [`diff_run`], but grant the `Jit` domain **fiber-hosting** (`grant_jit_fibers`, DESIGN.md §22
 /// "Concurrency"): a submitted unit may run §12 fibers (`cont.*`). Same differential assertions
@@ -266,7 +266,7 @@ fn installed_unit_spawns_its_own_func_native_agrees() {
     let unit = "memory 16\nfunc () -> (i32) {\nblock 0 () {\n  vsp = i64.const 0\n  varg = i64.const 0\n  vt = thread.spawn 1 vsp varg\n  vr = thread.join vt\n  vr32 = i32.wrap_i64 vr\n  return vr32\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (vsp: i64, varg: i64) {\n  v7 = i64.const 7\n  return v7\n  }\n}\n";
     let b = blob(unit);
     // (jit) -> i32:  slot = install(compile(blob));  return call.dyn[slot]().
-    let guest_src = "memory 16\nfunc (i32) -> (i32) {\nblock 0 (v0: i32) {\n  v1 = i64.const 4096\n  v2 = i64.const BLOBLEN\n  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = call.cap 11 3 (i64) -> (i64) v0 (v3)\n  v5 = i32.wrap_i64 v4\n  v6 = call.dyn () -> (i32) v5 ()\n  return v6\n  }\n}\n";
+    let guest_src = "memory 16\nfunc (i32) -> (i32) {\nblock 0 (v0: i32) {\n  v1 = i64.const 20480\n  v2 = i64.const BLOBLEN\n  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = call.cap 11 3 (i64) -> (i64) v0 (v3)\n  v5 = i32.wrap_i64 v4\n  v6 = call.dyn () -> (i32) v5 ()\n  return v6\n  }\n}\n";
     let guest = with_len(guest_src, b.len());
     // Reserve a 16-slot table: parent f0 at slot 0, the unit's two funcs auto-install (JIT) into
     // padding, and the explicit `install` lands in a further padding slot — ample room.
@@ -280,17 +280,17 @@ fn installed_unit_spawns_its_own_func_native_agrees() {
 /// **Futex in an installed submitted unit — native tier** (CONSOLIDATION.md §11): with the domain
 /// granted thread-hosting, an installed unit's `memory.wait` resolves against the parent's futex
 /// (`enable_thread_hosting` stood up the scheduler `Domain`, so the `wait_thunk` is baked non-null).
-/// The unit `atomic.wait`s on `mem[64]` with an expected value that does **not** match (0 ≠ 99), so
+/// The unit `atomic.wait`s on `mem[16448]` with an expected value that does **not** match (0 ≠ 99), so
 /// the wait returns `1` ("not-equal") immediately without parking — the same value the interpreter's
 /// futex returns. Proves the native futex path is wired for installed units (the wasm-tier twin is
 /// the browser harness's `instthreads` item). Differential.
 #[test]
 fn installed_unit_futex_wait_native_agrees() {
-    // The unit's `f0() -> i32` `atomic.wait`s on mem[64] (=0) expecting 99 → returns 1 (not-equal).
-    let unit = "memory 16\nfunc () -> (i32) {\nblock 0 () {\n  vaddr = i64.const 64\n  vexp = i32.const 99\n  vto = i64.const 0\n  vs = i32.atomic.wait vaddr vexp vto\n  return vs\n  }\n}\n";
+    // The unit's `f0() -> i32` `atomic.wait`s on mem[16448] (=0) expecting 99 → returns 1 (not-equal).
+    let unit = "memory 16\nfunc () -> (i32) {\nblock 0 () {\n  vaddr = i64.const 16448\n  vexp = i32.const 99\n  vto = i64.const 0\n  vs = i32.atomic.wait vaddr vexp vto\n  return vs\n  }\n}\n";
     let b = blob(unit);
     // (jit) -> i32:  slot = install(compile(blob));  return call.dyn[slot]().
-    let guest_src = "memory 16\nfunc (i32) -> (i32) {\nblock 0 (v0: i32) {\n  v1 = i64.const 4096\n  v2 = i64.const BLOBLEN\n  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = call.cap 11 3 (i64) -> (i64) v0 (v3)\n  v5 = i32.wrap_i64 v4\n  v6 = call.dyn () -> (i32) v5 ()\n  return v6\n  }\n}\n";
+    let guest_src = "memory 16\nfunc (i32) -> (i32) {\nblock 0 (v0: i32) {\n  v1 = i64.const 20480\n  v2 = i64.const BLOBLEN\n  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = call.cap 11 3 (i64) -> (i64) v0 (v3)\n  v5 = i32.wrap_i64 v4\n  v6 = call.dyn () -> (i32) v5 ()\n  return v6\n  }\n}\n";
     let guest = with_len(guest_src, b.len());
     let (out, _) = diff_run_threads(&guest, &b, &[], 4);
     assert!(
@@ -311,7 +311,7 @@ fn invoked_threaded_unit_capfaults_native_agrees() {
     let unit = "memory 16\nfunc () -> (i32) {\nblock 0 () {\n  vsp = i64.const 0\n  varg = i64.const 0\n  vt = thread.spawn 1 vsp varg\n  vr = thread.join vt\n  vr32 = i32.wrap_i64 vr\n  return vr32\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (vsp: i64, varg: i64) {\n  v7 = i64.const 7\n  return v7\n  }\n}\n";
     let b = blob(unit);
     // (jit) -> i32:  return invoke(compile(blob))  — invoke of a threaded unit is a CapFault.
-    let guest_src = "memory 16\nfunc (i32) -> (i32) {\nblock 0 (v0: i32) {\n  v1 = i64.const 4096\n  v2 = i64.const BLOBLEN\n  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = call.cap 11 1 (i64) -> (i32) v0 (v3)\n  return v4\n  }\n}\n";
+    let guest_src = "memory 16\nfunc (i32) -> (i32) {\nblock 0 (v0: i32) {\n  v1 = i64.const 20480\n  v2 = i64.const BLOBLEN\n  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = call.cap 11 1 (i64) -> (i32) v0 (v3)\n  return v4\n  }\n}\n";
     let guest = with_len(guest_src, b.len());
     // Reserve a table so the grant permits install room (the invoke is refused regardless).
     let (out, _) = diff_run_threads(&guest, &b, &[], 4);
@@ -419,7 +419,7 @@ func (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  v2 = suspend v1\n  v
     );
     // Parent: compile the blob, then invoke its 0-arg entry. Reserve a Jit table (log2=3) so the
     // unit's two functions have padding slots to auto-install into.
-    let parent = "memory 16\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i64.const 4096\n  v2 = i64.const BLOBLEN\n  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = call.cap 11 1 (i64) -> (i64) v0 (v3)\n  return v4\n  }\n}\n";
+    let parent = "memory 16\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i64.const 20480\n  v2 = i64.const BLOBLEN\n  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = call.cap 11 1 (i64) -> (i64) v0 (v3)\n  return v4\n  }\n}\n";
     let guest = with_len(parent, b.len());
     let m = parse_module(&guest).expect("parse");
     verify_module(&m).expect("verify");
@@ -483,19 +483,19 @@ fn with_len(src: &str, len: usize) -> String {
 #[test]
 fn compile_and_invoke_agree_across_backends() {
     // (a, b) -> a + b + 1000, plus a store of 0xAB at window offset 64.
-    let b = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i64.const 64\n  v3 = i32.const 171\n  i32.store8 v2 v3\n  v4 = i32.add v0 v1\n  v5 = i32.const 1000\n  v6 = i32.add v4 v5\n  return v6\n  }\n}\n");
+    let b = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i64.const 16448\n  v3 = i32.const 171\n  i32.store8 v2 v3\n  v4 = i32.add v0 v1\n  v5 = i32.const 1000\n  v6 = i32.add v4 v5\n  return v6\n  }\n}\n");
     let guest = with_len(COMPILE_INVOKE, b.len());
     let (out, mem) = diff_run(&guest, &b, &[7, 35]);
     assert!(
         matches!(out, JitOutcome::Returned(ref s) if s == &[1042]),
         "{out:?}"
     );
-    assert_eq!(mem[64], 0xab, "invoked code writes the live window");
+    assert_eq!(mem[16448], 0xab, "invoked code writes the live window");
 }
 
 /// A guest that only compiles and returns the raw compile result (handle or -errno):
 /// `(jit_handle) -> compile(blob)`.
-const COMPILE_ONLY: &str = "memory 16\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i64.const 4096\n  v2 = i64.const BLOBLEN\n  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  return v3\n  }\n}\n";
+const COMPILE_ONLY: &str = "memory 16\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i64.const 20480\n  v2 = i64.const BLOBLEN\n  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  return v3\n  }\n}\n";
 
 /// Garbage bytes are rejected fail-closed (-EINVAL) identically on both backends — the
 /// decode/verify gate never lets them near Cranelift.
@@ -535,7 +535,7 @@ fn memory_mismatch_rejected_identically() {
 fn new_calls_old_via_call_indirect_agrees() {
     // Parent: func 0 = entry (compiles + invokes the blob), func 1 = the indirect target.
     let parent = "memory 16\n\
-func (i32, i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32, v2: i32) {\n  v3 = i64.const 4096\n  v4 = i64.const BLOBLEN\n  v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  v6 = call.cap 11 1 (i64, i32, i32) -> (i32) v0 (v5, v1, v2)\n  return v6\n  }\n}\n\
+func (i32, i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32, v2: i32) {\n  v3 = i64.const 20480\n  v4 = i64.const BLOBLEN\n  v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  v6 = call.cap 11 1 (i64, i32, i32) -> (i32) v0 (v5, v1, v2)\n  return v6\n  }\n}\n\
 func (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.add v0 v1\n  v3 = i32.const 5000\n  v4 = i32.add v2 v3\n  return v4\n  }\n}\n";
     // Unit entry (i32,i32)->(i32): call.dyn slot 1 with the target's signature → new→old.
     let b = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.const 1\n  v3 = call.dyn (i32, i32) -> (i32) v2 (v0, v1)\n  return v3\n  }\n}\n");
@@ -553,7 +553,7 @@ func (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.add v0 v1\n
 fn new_to_old_signature_mismatch_traps_identically() {
     // Parent func 1 is (i32,i32)->(i32); the unit calls slot 1 with a wrong (i32)->(i32) sig.
     let parent = "memory 16\n\
-func (i32, i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32, v2: i32) {\n  v3 = i64.const 4096\n  v4 = i64.const BLOBLEN\n  v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  v6 = call.cap 11 1 (i64, i32, i32) -> (i32) v0 (v5, v1, v2)\n  return v6\n  }\n}\n\
+func (i32, i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32, v2: i32) {\n  v3 = i64.const 20480\n  v4 = i64.const BLOBLEN\n  v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  v6 = call.cap 11 1 (i64, i32, i32) -> (i32) v0 (v5, v1, v2)\n  return v6\n  }\n}\n\
 func (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.add v0 v1\n  return v2\n  }\n}\n";
     let b = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.const 1\n  v3 = call.dyn (i32) -> (i32) v2 (v0)\n  return v3\n  }\n}\n");
     let guest = with_len(parent, b.len());
@@ -624,7 +624,7 @@ fn forged_code_handle_capfaults_identically() {
 #[test]
 fn release_then_invoke_capfaults_identically() {
     let b = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.add v0 v1\n  return v2\n  }\n}\n");
-    let guest_src = "memory 16\nfunc (i32, i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32, v2: i32) {\n  v3 = i64.const 4096\n  v4 = i64.const BLOBLEN\n  v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  v6 = call.cap 11 2 (i64) -> (i64) v0 (v5)\n  v7 = call.cap 11 1 (i64, i32, i32) -> (i32) v0 (v5, v1, v2)\n  return v7\n  }\n}\n";
+    let guest_src = "memory 16\nfunc (i32, i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32, v2: i32) {\n  v3 = i64.const 20480\n  v4 = i64.const BLOBLEN\n  v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  v6 = call.cap 11 2 (i64) -> (i64) v0 (v5)\n  v7 = call.cap 11 1 (i64, i32, i32) -> (i32) v0 (v5, v1, v2)\n  return v7\n  }\n}\n";
     let guest = with_len(guest_src, b.len());
     let (out, _) = diff_run(&guest, &b, &[1, 2]);
     assert!(
@@ -681,7 +681,7 @@ fn fuzzed_blobs_fail_closed_identically() {
 fn compile_quota_enforced_identically() {
     let b = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.add v0 v1\n  return v2\n  }\n}\n");
     // Three sequential compiles of the same blob; return the third's result.
-    let guest_src = "memory 16\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i64.const 4096\n  v2 = i64.const BLOBLEN\n  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  return v5\n  }\n}\n";
+    let guest_src = "memory 16\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i64.const 20480\n  v2 = i64.const BLOBLEN\n  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  return v5\n  }\n}\n";
     let guest = with_len(guest_src, b.len());
 
     let m = parse_module(&guest).expect("parse guest");
@@ -735,7 +735,7 @@ fn compile_quota_enforced_identically() {
 #[test]
 fn install_then_old_calls_new_agrees() {
     // (jit, a, b) -> slot = install(compile(blob)); call.dyn[slot](a, b).
-    let guest_src = "memory 16\nfunc (i32, i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32, v2: i32) {\n  v3 = i64.const 4096\n  v4 = i64.const BLOBLEN\n  v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  v6 = call.cap 11 3 (i64) -> (i64) v0 (v5)\n  v7 = i32.wrap_i64 v6\n  v8 = call.dyn (i32, i32) -> (i32) v7 (v1, v2)\n  return v8\n  }\n}\n";
+    let guest_src = "memory 16\nfunc (i32, i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32, v2: i32) {\n  v3 = i64.const 20480\n  v4 = i64.const BLOBLEN\n  v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  v6 = call.cap 11 3 (i64) -> (i64) v0 (v5)\n  v7 = i32.wrap_i64 v6\n  v8 = call.dyn (i32, i32) -> (i32) v7 (v1, v2)\n  return v8\n  }\n}\n";
     let b = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.mul v0 v1\n  v3 = i32.const 100\n  v4 = i32.add v2 v3\n  return v4\n  }\n}\n");
     let guest = with_len(guest_src, b.len());
     // Reserve a 16-slot table on both backends; the parent has 1 func, so install lands at slot 1.
@@ -760,17 +760,17 @@ fn invoked_unit_calls_installed_unit_agrees() {
     let a_blob = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.add v0 v1\n  return v2\n  }\n}\n");
     // B's entry call_indirects slot 1 (where A installs) then adds 1.
     let b_blob = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.const 1\n  v3 = call.dyn (i32, i32) -> (i32) v2 (v0, v1)\n  v4 = i32.const 1\n  v5 = i32.add v3 v4\n  return v5\n  }\n}\n");
-    // Lay A at 4096, B right after it.
+    // Lay A at BLOB_OFF (20480), B right after it.
     let mut both = a_blob.clone();
     both.extend_from_slice(&b_blob);
     let guest_src = format!(
         "memory 16\nfunc (i32, i32, i32) -> (i32) {{\nblock 0 (v0: i32, v1: i32, v2: i32) {{\n  \
-         v3 = i64.const 4096\n  v4 = i64.const {}\n  v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  \
+         v3 = i64.const 20480\n  v4 = i64.const {}\n  v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  \
          v6 = call.cap 11 3 (i64) -> (i64) v0 (v5)\n  \
          v7 = i64.const {}\n  v8 = i64.const {}\n  v9 = call.cap 11 0 (i64, i64) -> (i64) v0 (v7, v8)\n  \
          v10 = call.cap 11 1 (i64, i32, i32) -> (i32) v0 (v9, v1, v2)\n  return v10\n  }}\n}}\n",
         a_blob.len(),
-        4096 + a_blob.len(),
+        20480 + a_blob.len(),
         b_blob.len(),
     );
     let (out, _) = diff_run_t(&guest_src, &both, &[6, 7], 4);
@@ -797,7 +797,7 @@ fn uninstall_frees_slot_then_reinstall_reuses_it_agrees() {
     both.extend_from_slice(&b_blob);
     let guest_src = format!(
         "memory 16\nfunc (i32, i32, i32) -> (i32) {{\nblock 0 (v0: i32, v1: i32, v2: i32) {{\n  \
-         v3 = i64.const 4096\n  v4 = i64.const {}\n  v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  \
+         v3 = i64.const 20480\n  v4 = i64.const {}\n  v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  \
          v6 = call.cap 11 3 (i64) -> (i64) v0 (v5)\n  \
          v7 = call.cap 11 4 (i64) -> (i64) v0 (v6)\n  \
          v8 = i64.const {}\n  v9 = i64.const {}\n  v10 = call.cap 11 0 (i64, i64) -> (i64) v0 (v8, v9)\n  \
@@ -805,7 +805,7 @@ fn uninstall_frees_slot_then_reinstall_reuses_it_agrees() {
          v12 = i32.wrap_i64 v11\n  v13 = call.dyn (i32, i32) -> (i32) v12 (v1, v2)\n  \
          v14 = i32.const 1000\n  v15 = i32.mul v12 v14\n  v16 = i32.add v15 v13\n  return v16\n  }}\n}}\n",
         a_blob.len(),
-        4096 + a_blob.len(),
+        20480 + a_blob.len(),
         b_blob.len(),
     );
     // a=6,b=7: s2 must be slot 1 (reused), call B = 6*7 = 42 → 1*1000 + 42 = 1042.
@@ -834,7 +834,7 @@ fn uninstall_protects_real_functions_identically() {
 #[test]
 fn install_full_table_enospc_identically() {
     // (jit) -> install(compile(blob)); return the raw result. Natural table (reserve 0) → full.
-    let guest_src = "memory 16\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i64.const 4096\n  v2 = i64.const BLOBLEN\n  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = call.cap 11 3 (i64) -> (i64) v0 (v3)\n  return v4\n  }\n}\n";
+    let guest_src = "memory 16\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i64.const 20480\n  v2 = i64.const BLOBLEN\n  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = call.cap 11 3 (i64) -> (i64) v0 (v3)\n  return v4\n  }\n}\n";
     let b = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.add v0 v1\n  return v2\n  }\n}\n");
     let guest = with_len(guest_src, b.len());
     let (out, _) = diff_run_t(&guest, &b, &[], 0);
@@ -850,13 +850,13 @@ fn install_full_table_enospc_identically() {
 fn two_units_interleaved_agree_across_backends() {
     let add = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.add v0 v1\n  return v2\n  }\n}\n");
     let mul = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.mul v0 v1\n  return v2\n  }\n}\n");
-    // Both blobs in memory: add at 4096, mul right after it.
+    // Both blobs in memory: add at BLOB_OFF (20480), mul right after it.
     let mut both = add.clone();
     both.extend_from_slice(&mul);
     let guest_src = format!(
-        "memory 16\nfunc (i32, i32, i32) -> (i32) {{\nblock 0 (v0: i32, v1: i32, v2: i32) {{\n  v3 = i64.const 4096\n  v4 = i64.const {}\n  v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  v6 = i64.const {}\n  v7 = i64.const {}\n  v8 = call.cap 11 0 (i64, i64) -> (i64) v0 (v6, v7)\n  v9 = call.cap 11 1 (i64, i32, i32) -> (i32) v0 (v5, v1, v2)\n  v10 = call.cap 11 1 (i64, i32, i32) -> (i32) v0 (v8, v1, v2)\n  v11 = i32.add v9 v10\n  return v11\n  }}\n}}\n",
+        "memory 16\nfunc (i32, i32, i32) -> (i32) {{\nblock 0 (v0: i32, v1: i32, v2: i32) {{\n  v3 = i64.const 20480\n  v4 = i64.const {}\n  v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  v6 = i64.const {}\n  v7 = i64.const {}\n  v8 = call.cap 11 0 (i64, i64) -> (i64) v0 (v6, v7)\n  v9 = call.cap 11 1 (i64, i32, i32) -> (i32) v0 (v5, v1, v2)\n  v10 = call.cap 11 1 (i64, i32, i32) -> (i32) v0 (v8, v1, v2)\n  v11 = i32.add v9 v10\n  return v11\n  }}\n}}\n",
         add.len(),
-        4096 + add.len(),
+        20480 + add.len(),
         mul.len(),
     );
     let (out, _) = diff_run(&guest_src, &both, &[6, 7]);
@@ -877,7 +877,8 @@ fn two_units_interleaved_agree_across_backends() {
 /// the spawn, so install is the lone concurrent table op — no threaded-`compile` W^X concern.
 ///
 /// `func 0` = main `(jit) -> i32`; `func 1` = worker `(sp, arg) -> i64` (so two real funcs → install
-/// lands at slot 2 of the reserved table). Window: `[0]` ready flag, `[4]` slot index, `[8]` result.
+/// lands at slot 2 of the reserved table). Window (#1094 guard-shifted): `[16384]` ready flag,
+/// `[16388]` slot index, `[16392]` result.
 ///
 /// **Platform parity.** Runs on every target with a JIT thread runtime (`fiber_rt`: x86-64 unix,
 /// aarch64 unix/macOS, x86-64 Windows), like the other JIT thread tests. Correct on weakly-ordered
@@ -898,7 +899,7 @@ fn threaded_install_agrees_across_backends() {
         "memory 16\n",
         "func (i32) -> (i32) {\n",
         "block 0 (v0: i32) {\n",
-        "  v1 = i64.const 4096\n",
+        "  v1 = i64.const 20480\n",
         "  v2 = i64.const BLOBLEN\n",
         "  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n", // code handle
         "  v4 = i64.const 2048\n",                                // worker data-stack base (unused)
@@ -906,11 +907,11 @@ fn threaded_install_agrees_across_backends() {
         "  v6 = thread.spawn 1 v4 v5\n", // spawn worker BEFORE install
         "  v7 = call.cap 11 3 (i64) -> (i64) v0 (v3)\n", // install -> slot (i64)
         "  v8 = i32.wrap_i64 v7\n",
-        "  v9 = i64.const 4\n",
-        "  i32.store v9 v8\n", // window[4] = slot
-        "  v10 = i64.const 0\n",
+        "  v9 = i64.const 16388\n",
+        "  i32.store v9 v8\n", // window[16388] = slot (#1094: guard-shifted from 4)
+        "  v10 = i64.const 16384\n",
         "  v11 = i32.const 1\n",
-        "  i32.atomic.store v10 v11\n", // window[0] = ready (release)
+        "  i32.atomic.store v10 v11\n", // window[16384] = ready (release) (#1094: guard-shifted from 0)
         "  v12 = thread.join v6\n",     // worker result (i64)
         "  v13 = i32.wrap_i64 v12\n",
         "  return v13\n",
@@ -922,19 +923,19 @@ fn threaded_install_agrees_across_backends() {
         "  br 1()\n",
         "  }\n",
         "block 1 () {\n",
-        "  v2 = i64.const 0\n",
-        "  v3 = i32.atomic.load v2\n", // ready? (acquire)
+        "  v2 = i64.const 16384\n",
+        "  v3 = i32.atomic.load v2\n", // ready? (acquire) (#1094: guard-shifted from 0)
         "  v4 = i32.const 0\n",
         "  v5 = i32.ne v3 v4\n",
         "  br_if v5 2() 1()\n", // spin until ready
         "  }\n",
         "block 2 () {\n",
-        "  v6 = i64.const 4\n",
-        "  v7 = i32.load v6\n", // slot (visible via the acquire)
+        "  v6 = i64.const 16388\n",
+        "  v7 = i32.load v6\n", // slot (visible via the acquire) (#1094: guard-shifted from 4)
         "  v8 = i32.const 6\n",
         "  v9 = i32.const 7\n",
         "  v10 = call.dyn (i32, i32) -> (i32) v7 (v8, v9)\n", // the post-spawn-installed unit
-        "  v11 = i64.const 8\n",
+        "  v11 = i64.const 16392\n",
         "  i32.store v11 v10\n",
         "  v12 = i64.extend_i32_u v10\n",
         "  return v12\n",
@@ -975,7 +976,7 @@ fn threaded_compile_agrees_across_backends() {
         "  v1 = i64.extend_i32_u v0\n", // pass the jit handle to the worker
         "  v2 = i64.const 2048\n",      // worker data-stack base (unused)
         "  v3 = thread.spawn 1 v2 v1\n", // worker handle
-        "  v4 = i64.const 4096\n",
+        "  v4 = i64.const 20480\n",
         "  v5 = i64.const BLOBLEN\n",
         "  v6 = call.cap 11 0 (i64, i64) -> (i64) v0 (v4, v5)\n", // main compiles
         "  v7 = i32.const 6\n",
@@ -991,7 +992,7 @@ fn threaded_compile_agrees_across_backends() {
         "func (i64, i64) -> (i64) {\n",
         "block 0 (v0: i64, v1: i64) {\n",
         "  v2 = i32.wrap_i64 v1\n", // jit handle
-        "  v3 = i64.const 4096\n",
+        "  v3 = i64.const 20480\n",
         "  v4 = i64.const BLOBLEN\n",
         "  v5 = call.cap 11 0 (i64, i64) -> (i64) v2 (v3, v4)\n", // worker compiles
         "  v6 = i32.const 8\n",
@@ -1040,7 +1041,7 @@ fn threaded_compile_loop_stress_agrees() {
         "  br_if v10 2(v5, v6, v7, v8) 3(v6, v8)\n",
         "  }\n",
         "block 2 (v11: i32, v12: i32, v13: i32, v14: i32) {\n", // jit, wh, i, acc
-        "  v15 = i64.const 4096\n",
+        "  v15 = i64.const 20480\n",
         "  v16 = i64.const BLOBLEN\n",
         "  v17 = call.cap 11 0 (i64, i64) -> (i64) v11 (v15, v16)\n",
         "  v18 = i32.const 3\n",
@@ -1070,7 +1071,7 @@ fn threaded_compile_loop_stress_agrees() {
         "  br_if v8 2(v4, v5, v6) 3(v6)\n",
         "  }\n",
         "block 2 (v9: i32, v10: i32, v11: i32) {\n", // jit, i, acc
-        "  v12 = i64.const 4096\n",
+        "  v12 = i64.const 20480\n",
         "  v13 = i64.const BLOBLEN\n",
         "  v14 = call.cap 11 0 (i64, i64) -> (i64) v9 (v12, v13)\n",
         "  v15 = i32.const 4\n",
@@ -1119,16 +1120,16 @@ fn cross_thread_execute_fresh_code_agrees() {
         "  v1 = i64.const 2048\n",
         "  v2 = i64.const 0\n",
         "  v3 = thread.spawn 1 v1 v2\n", // worker runs before any compile
-        "  v4 = i64.const 4096\n",
+        "  v4 = i64.const 20480\n",
         "  v5 = i64.const BLOBLEN\n",
         "  v6 = call.cap 11 0 (i64, i64) -> (i64) v0 (v4, v5)\n", // compile while the worker runs
         "  v7 = call.cap 11 3 (i64) -> (i64) v0 (v6)\n",          // install -> slot
         "  v8 = i32.wrap_i64 v7\n",
-        "  v9 = i64.const 4\n",
+        "  v9 = i64.const 16388\n",
         "  i32.store v9 v8\n",
-        "  v10 = i64.const 0\n",
+        "  v10 = i64.const 16384\n",
         "  v11 = i32.const 1\n",
-        "  i32.atomic.store v10 v11\n", // publish ready (release)
+        "  i32.atomic.store v10 v11\n", // publish ready (release) (#1094: window[16384/16388])
         "  v12 = thread.join v3\n",
         "  v13 = i32.wrap_i64 v12\n",
         "  return v13\n",
@@ -1140,15 +1141,15 @@ fn cross_thread_execute_fresh_code_agrees() {
         "  br 1()\n",
         "  }\n",
         "block 1 () {\n",
-        "  v2 = i64.const 0\n",
-        "  v3 = i32.atomic.load v2\n", // ready? (acquire)
+        "  v2 = i64.const 16384\n",
+        "  v3 = i32.atomic.load v2\n", // ready? (acquire) (#1094: window[16384])
         "  v4 = i32.const 0\n",
         "  v5 = i32.ne v3 v4\n",
         "  br_if v5 2() 1()\n",
         "  }\n",
         "block 2 () {\n",
-        "  v6 = i64.const 4\n",
-        "  v7 = i32.load v6\n", // slot
+        "  v6 = i64.const 16388\n",
+        "  v7 = i32.load v6\n", // slot (#1094: window[16388])
         "  v8 = i32.const 6\n",
         "  v9 = i32.const 7\n",
         "  v10 = call.dyn (i32, i32) -> (i32) v7 (v8, v9)\n", // execute main's fresh code
@@ -1188,7 +1189,7 @@ export 0 interface "counter" 1 { bump: 1 }
 
 func () -> (i64) {
 block 0 () {
-  va = i64.const 0
+  va = i64.const 16384
   vseed = i64.const 7
   i64.store va vseed
   vz = i32.const 0
@@ -1203,7 +1204,7 @@ block 0 () {
 
 func (i64) -> (i64) {
 block 0 (vx: i64) {
-  va = i64.const 0
+  va = i64.const 16384
   vold = i64.load va
   vnew = i64.add vold vx
   i64.store va vnew
@@ -1222,7 +1223,7 @@ export 0 interface "counter" 1 { bump: 1 }
 
 func () -> (i64) {
 block 0 () {
-  va = i64.const 0
+  va = i64.const 16384
   vseed = i64.const 7
   i64.store va vseed
   vz = i32.const 0
@@ -1237,7 +1238,7 @@ block 0 () {
 
 func (i64) -> (i64) {
 block 0 (vx: i64) {
-  va = i64.const 0
+  va = i64.const 16384
   vold = i64.load va
   vnew = i64.add vold vx
   i64.store va vnew
@@ -1247,7 +1248,7 @@ block 0 (vx: i64) {
 
 func () -> (i32) {
 block 0 () {
-  va = i64.const 8
+  va = i64.const 16392
   vexp = i32.const 0
   vto = i64.const 1000
   vst = i32.atomic.wait va vexp vto

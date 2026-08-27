@@ -7,7 +7,7 @@
 ;   temen-run crates/temen-run/demos/hello.temt
 memory 16
 
-data 0 "hello, sandbox!\n"
+data 16384 "hello, sandbox!\n"
 
 import 0 "write" (i64, i64) -> (i64)
 
@@ -15,7 +15,7 @@ export 0 func "_start" 0
 
 func () -> (i32) {
 block 0 () {
-  v0 = i64.const 0
+  v0 = i64.const 16384
   v1 = i64.const 16
   v2 = call.import 0 (v0, v1)
   v3 = i32.const 0

@@ -146,23 +146,23 @@ fn on_ramp_child_reads_argv_paths_and_copies_a_file_over_a_regranted_memfs() {
     // #964/#1094: a guarded child reads argv one guard up — key off `module_args_base` (the grant
     // records/cap-names below stay in the parent window, read by the op-13 handler, never by the child).
     let argv_off = carve_off + temen_ir::module_args_base(&child);
-    let word0: u64 = 2048 | (2u64 << 32);
+    let word0: u64 = 18432 | (2u64 << 32);
     // `\x03\x00\x00\x00` = argc 3, `\x00\x00\x00\x00` = envc 0, then the NUL-separated args.
     let argv_data = "\\x03\\x00\\x00\\x00\\x00\\x00\\x00\\x00prog\\x00/in.nim\\x00/out.nif\\x00";
     let parent_src = format!(
         r#"memory {psl}
-data 2048 "fs"
+data 18432 "fs"
 data {argv_off} "{argv_data}"
 func (i32, i32, i32) -> (i64) {{
 block 0 (v0: i32, v1: i32, v2: i32) {{
   vrec0 = i64.const {word0}
-  vrecoff = i64.const 1024
+  vrecoff = i64.const 17408
   i64.store vrecoff vrec0
   vsh = i64.extend_i32_u v2
-  vrec1off = i64.const 1032
+  vrec1off = i64.const 17416
   i64.store vrec1off vsh
   vmh = i64.extend_i32_u v1
-  vgptr = i64.const 1024
+  vgptr = i64.const 17408
   vgn = i64.const 1
   ventry = i64.const {entry}
   voff = i64.const {carve_off}

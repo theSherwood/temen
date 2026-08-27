@@ -30,7 +30,7 @@ import 0 \"read\" (i64, i64) -> (i64)
 import 1 \"write\" (i64, i64) -> (i64)
 func 0 () -> () {
 block 0 () {
-  vp = i64.const 64
+  vp = i64.const 16448
   vc = i64.const 32
   vn = call.import 0 (vp, vc)
   vw1 = call.import 1 (vp, vn)
@@ -44,16 +44,16 @@ export 0 func \"_start\" 0
 /// Phase `p2` — echo stdin, then append a fixed `!` from the phase's own data. `aa` → `aa!`.
 const P2_ECHO_BANG: &str = "\
 memory 16
-data 0 \"!\"
+data 16384 \"!\"
 import 0 \"read\" (i64, i64) -> (i64)
 import 1 \"write\" (i64, i64) -> (i64)
 func 0 () -> () {
 block 0 () {
-  vp = i64.const 64
+  vp = i64.const 16448
   vc = i64.const 32
   vn = call.import 0 (vp, vc)
   vw1 = call.import 1 (vp, vn)
-  vbp = i64.const 0
+  vbp = i64.const 16384
   vbl = i64.const 1
   vw2 = call.import 1 (vbp, vbl)
   return
@@ -63,33 +63,34 @@ export 0 func \"_start\" 0
 ";
 
 /// The driver — the `nifmake` analog. Resolve `"exec"`; run `p1` with stdin `a`; read `p1`'s output
-/// into 32..; run `p2` with **that** buffer as stdin; read `p2`'s output into 64..; emit it and exit
-/// with its length. `exec` ops (iface 13): 0 = run(argv,stdin), 1 = read_out(job,buf,cap).
+/// into 16416.. (above the #1094 NULL guard); run `p2` with **that** buffer as stdin; read `p2`'s
+/// output into 16448..; emit it and exit with its length. `exec` ops (iface 13): 0 = run(argv,stdin),
+/// 1 = read_out(job,buf,cap).
 const DRIVER: &str = "\
 memory 16
-data 0 \"exec\"
-data 8 \"p1\"
-data 12 \"p2\"
-data 16 \"a\"
+data 16384 \"exec\"
+data 16392 \"p1\"
+data 16396 \"p2\"
+data 16400 \"a\"
 import 0 \"out\" (i64, i64) -> (i64)
 import 1 \"exit\" (i32) -> ()
 func 0 () -> () {
 block 0 () {
-  vp = i64.const 0
+  vp = i64.const 16384
   vl = i64.const 4
   vh = self.resolve vp vl
-  vp1 = i64.const 8
+  vp1 = i64.const 16392
   vp1l = i64.const 2
-  vsp = i64.const 16
+  vsp = i64.const 16400
   vsl = i64.const 1
   vjob1 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vp1, vp1l, vsp, vsl)
-  vbuf1 = i64.const 32
+  vbuf1 = i64.const 16416
   vcap = i64.const 16
   vn1 = call.cap 13 1 (i64, i64, i64) -> (i64) vh (vjob1, vbuf1, vcap)
-  vp2 = i64.const 12
+  vp2 = i64.const 16396
   vp2l = i64.const 2
   vjob2 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vp2, vp2l, vbuf1, vn1)
-  vbuf2 = i64.const 64
+  vbuf2 = i64.const 16448
   vn2 = call.cap 13 1 (i64, i64, i64) -> (i64) vh (vjob2, vbuf2, vcap)
   vw = call.import 0 (vbuf2, vn2)
   vcode = i32.wrap_i64 vn2
@@ -169,16 +170,16 @@ fn appender(letter: &str) -> String {
     format!(
         "\
 memory 16
-data 0 \"{letter}\"
+data 16384 \"{letter}\"
 import 0 \"read\" (i64, i64) -> (i64)
 import 1 \"write\" (i64, i64) -> (i64)
 func 0 () -> () {{
 block 0 () {{
-  vp = i64.const 64
+  vp = i64.const 16448
   vc = i64.const 32
   vn = call.import 0 (vp, vc)
   vw1 = call.import 1 (vp, vn)
-  vbp = i64.const 0
+  vbp = i64.const 16384
   vbl = i64.const 1
   vw2 = call.import 1 (vbp, vbl)
   return
@@ -203,33 +204,34 @@ block 0 () {
 export 0 func \"_start\" 0
 ";
 
-/// The four-phase driver — the `nifmake` analog with abort-on-failure. Data: `exec`@0; phase names
-/// `p1`@8 `p2`@12 `p3`@16 `p4`@20; seed `a`@24. Per phase: run it, read its output into a fresh
-/// buffer (out1@64, out2@128, out3@192, out4@256), read its status, and `br_if status` to the abort
-/// block (5) or the next phase. Block 4 emits the final output + exit 0; block 5 emits nothing and
-/// exits with the failed phase's status. The `exec` handle is re-resolved per block (idempotent by
-/// name), so only the inter-phase length is threaded.
+/// The four-phase driver — the `nifmake` analog with abort-on-failure. Data (above the #1094 NULL
+/// guard): `exec`@16384; phase names `p1`@16392 `p2`@16396 `p3`@16400 `p4`@16404; seed `a`@16408.
+/// Per phase: run it, read its output into a fresh buffer (out1@16448, out2@16512, out3@16576,
+/// out4@16640), read its status, and `br_if status` to the abort block (5) or the next phase.
+/// Block 4 emits the final output + exit 0; block 5 emits nothing and exits with the failed phase's
+/// status. The `exec` handle is re-resolved per block (idempotent by name), so only the inter-phase
+/// length is threaded.
 const DRIVER4: &str = "\
 memory 16
-data 0 \"exec\"
-data 8 \"p1\"
-data 12 \"p2\"
-data 16 \"p3\"
-data 20 \"p4\"
-data 24 \"a\"
+data 16384 \"exec\"
+data 16392 \"p1\"
+data 16396 \"p2\"
+data 16400 \"p3\"
+data 16404 \"p4\"
+data 16408 \"a\"
 import 0 \"out\" (i64, i64) -> (i64)
 import 1 \"exit\" (i32) -> ()
 func 0 () -> () {
 block 0 () {
-  vp0 = i64.const 0
+  vp0 = i64.const 16384
   vl0 = i64.const 4
   vh0 = self.resolve vp0 vl0
-  va0 = i64.const 8
+  va0 = i64.const 16392
   vln0 = i64.const 2
-  vsp0 = i64.const 24
+  vsp0 = i64.const 16408
   vsl0 = i64.const 1
   vj0 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh0 (va0, vln0, vsp0, vsl0)
-  vb0 = i64.const 64
+  vb0 = i64.const 16448
   vc0 = i64.const 32
   vn0 = call.cap 13 1 (i64, i64, i64) -> (i64) vh0 (vj0, vb0, vc0)
   vs0 = call.cap 13 3 (i64) -> (i64) vh0 (vj0)
@@ -237,14 +239,14 @@ block 0 () {
   br_if vs0w 5(vs0) 1(vn0)
 }
 block 1 (q1: i64) {
-  vp1 = i64.const 0
+  vp1 = i64.const 16384
   vl1 = i64.const 4
   vh1 = self.resolve vp1 vl1
-  va1 = i64.const 12
+  va1 = i64.const 16396
   vln1 = i64.const 2
-  vsp1 = i64.const 64
+  vsp1 = i64.const 16448
   vj1 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh1 (va1, vln1, vsp1, q1)
-  vb1 = i64.const 128
+  vb1 = i64.const 16512
   vc1 = i64.const 32
   vn1 = call.cap 13 1 (i64, i64, i64) -> (i64) vh1 (vj1, vb1, vc1)
   vs1 = call.cap 13 3 (i64) -> (i64) vh1 (vj1)
@@ -252,14 +254,14 @@ block 1 (q1: i64) {
   br_if vs1w 5(vs1) 2(vn1)
 }
 block 2 (q2: i64) {
-  vp2 = i64.const 0
+  vp2 = i64.const 16384
   vl2 = i64.const 4
   vh2 = self.resolve vp2 vl2
-  va2 = i64.const 16
+  va2 = i64.const 16400
   vln2 = i64.const 2
-  vsp2 = i64.const 128
+  vsp2 = i64.const 16512
   vj2 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh2 (va2, vln2, vsp2, q2)
-  vb2 = i64.const 192
+  vb2 = i64.const 16576
   vc2 = i64.const 32
   vn2 = call.cap 13 1 (i64, i64, i64) -> (i64) vh2 (vj2, vb2, vc2)
   vs2 = call.cap 13 3 (i64) -> (i64) vh2 (vj2)
@@ -267,14 +269,14 @@ block 2 (q2: i64) {
   br_if vs2w 5(vs2) 3(vn2)
 }
 block 3 (q3: i64) {
-  vp3 = i64.const 0
+  vp3 = i64.const 16384
   vl3 = i64.const 4
   vh3 = self.resolve vp3 vl3
-  va3 = i64.const 20
+  va3 = i64.const 16404
   vln3 = i64.const 2
-  vsp3 = i64.const 192
+  vsp3 = i64.const 16576
   vj3 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh3 (va3, vln3, vsp3, q3)
-  vb3 = i64.const 256
+  vb3 = i64.const 16640
   vc3 = i64.const 32
   vn3 = call.cap 13 1 (i64, i64, i64) -> (i64) vh3 (vj3, vb3, vc3)
   vs3 = call.cap 13 3 (i64) -> (i64) vh3 (vj3)
@@ -282,7 +284,7 @@ block 3 (q3: i64) {
   br_if vs3w 5(vs3) 4(vn3)
 }
 block 4 (q4: i64) {
-  vb4 = i64.const 256
+  vb4 = i64.const 16640
   vw4 = call.import 0 (vb4, q4)
   vz4 = i32.const 0
   call.import 1 (vz4)
@@ -403,15 +405,15 @@ const SUM_1_TO_10_LENG: &str = "\
 /// its exit status (op 13/3), and re-exit with it.
 const DRIVER_REAL: &str = "\
 memory 16
-data 0 \"exec\"
-data 8 \"compute\"
+data 16384 \"exec\"
+data 16392 \"compute\"
 import 0 \"exit\" (i32) -> ()
 func 0 () -> () {
 block 0 () {
-  vep = i64.const 0
+  vep = i64.const 16384
   vel = i64.const 4
   vh = self.resolve vep vel
-  vname = i64.const 8
+  vname = i64.const 16392
   vnamelen = i64.const 7
   vzero = i64.const 0
   vjob = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vname, vnamelen, vzero, vzero)
@@ -475,19 +477,19 @@ fn driver_runs_a_real_temen_leng_compiled_program_as_an_exec_child() {
 /// Phase `gen`: create `mid` (O_CREATE|O_WRITE) and write "OK" into it.
 const GEN_PHASE: &str = "\
 memory 16
-data 0 \"fs\"
-data 4 \"mid\"
-data 8 \"OK\"
+data 16384 \"fs\"
+data 16388 \"mid\"
+data 16392 \"OK\"
 func 0 () -> (i64) {
 block 0 () {
-  vfp = i64.const 0
+  vfp = i64.const 16384
   vfl = i64.const 2
   vfs = self.resolve vfp vfl
-  vpath = i64.const 4
+  vpath = i64.const 16388
   vplen = i64.const 3
   vflags = i64.const 18
   vfd = call.cap 13 0 (i64, i64, i64) -> (i64) vfs (vpath, vplen, vflags)
-  vbuf = i64.const 8
+  vbuf = i64.const 16392
   vblen = i64.const 2
   vn = call.cap 13 2 (i64, i64, i64) -> (i64) vfs (vfd, vbuf, vblen)
   vcl = call.cap 13 4 (i64) -> (i64) vfs (vfd)
@@ -501,19 +503,19 @@ export 0 func \"_start\" 0
 /// Phase `use`: open `mid` (O_READ), read it into a buffer, echo it to stdout, exit with the count.
 const USE_PHASE: &str = "\
 memory 16
-data 0 \"fs\"
-data 4 \"mid\"
+data 16384 \"fs\"
+data 16388 \"mid\"
 import 0 \"write\" (i64, i64) -> (i64)
 func 0 () -> (i64) {
 block 0 () {
-  vfp = i64.const 0
+  vfp = i64.const 16384
   vfl = i64.const 2
   vfs = self.resolve vfp vfl
-  vpath = i64.const 4
+  vpath = i64.const 16388
   vplen = i64.const 3
   vflags = i64.const 1
   vfd = call.cap 13 0 (i64, i64, i64) -> (i64) vfs (vpath, vplen, vflags)
-  vbuf = i64.const 64
+  vbuf = i64.const 16448
   vcap = i64.const 32
   vn = call.cap 13 1 (i64, i64, i64) -> (i64) vfs (vfd, vbuf, vcap)
   vw = call.import 0 (vbuf, vn)
@@ -527,25 +529,25 @@ export 0 func \"_start\" 0
 /// The driver: run `gen` (writes `mid`), then `use` (reads `mid`), drain `use`'s output and emit it.
 const DRIVER_FS: &str = "\
 memory 16
-data 0 \"exec\"
-data 8 \"gen\"
-data 12 \"use\"
+data 16384 \"exec\"
+data 16392 \"gen\"
+data 16396 \"use\"
 import 0 \"out\" (i64, i64) -> (i64)
 import 1 \"exit\" (i32) -> ()
 func 0 () -> () {
 block 0 () {
-  vep = i64.const 0
+  vep = i64.const 16384
   vel = i64.const 4
   vh = self.resolve vep vel
-  vgen = i64.const 8
+  vgen = i64.const 16392
   vgenl = i64.const 3
   vzero = i64.const 0
   vjg = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vgen, vgenl, vzero, vzero)
   vsg = call.cap 13 3 (i64) -> (i64) vh (vjg)
-  vuse = i64.const 12
+  vuse = i64.const 16396
   vusel = i64.const 3
   vju = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vuse, vusel, vzero, vzero)
-  vbuf = i64.const 64
+  vbuf = i64.const 16448
   vcap = i64.const 32
   vnu = call.cap 13 1 (i64, i64, i64) -> (i64) vh (vju, vbuf, vcap)
   vw = call.import 0 (vbuf, vnu)
@@ -596,10 +598,10 @@ fn driver_hands_off_a_file_between_phases_through_a_shared_memfs() {
 /// yields an i32 handle ≥ 0 on success, negative `-errno` when the name isn't granted.
 const PROBE_PHASE: &str = "\
 memory 16
-data 0 \"fs\"
+data 16384 \"fs\"
 func 0 () -> (i32) {
 block 0 () {
-  vfp = i64.const 0
+  vfp = i64.const 16384
   vfl = i64.const 2
   vfs = self.resolve vfp vfl
   vzero = i32.const 0
@@ -613,15 +615,15 @@ export 0 func \"_start\" 0
 /// A driver that runs `probe` and exits with its status (1 = it got `fs`, 0 = it didn't).
 const DRIVER_PROBE: &str = "\
 memory 16
-data 0 \"exec\"
-data 8 \"probe\"
+data 16384 \"exec\"
+data 16392 \"probe\"
 import 0 \"exit\" (i32) -> ()
 func 0 () -> () {
 block 0 () {
-  vep = i64.const 0
+  vep = i64.const 16384
   vel = i64.const 4
   vh = self.resolve vep vel
-  vname = i64.const 8
+  vname = i64.const 16392
   vnamel = i64.const 5
   vzero = i64.const 0
   vj = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vname, vnamel, vzero, vzero)

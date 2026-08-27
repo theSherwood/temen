@@ -110,24 +110,25 @@ fn root_attest_packs_tier_and_exposure_bits() {
 const NESTED_ATTEST: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (vinst: i32) {\n\
-  ; spawn via record (op 17): entry=1 off=0 sl=12 quota=0\n\
+  ; spawn via record (op 17): entry=1 off=16384 sl=12 quota=0 (child carve + record both above the #1094 NULL guard)\n\
   q0v0 = i64.const 4294967296\n\
   q0v1 = i64.const 0\n\
+  q0off = i64.const 16384\n\
   q0v2 = i64.const -4294967284\n\
   q0v3 = i64.const 4294967295\n\
-  q0a0 = i64.const 4096\n\
+  q0a0 = i64.const 20480\n\
   i64.store q0a0 q0v0\n\
-  q0a1 = i64.const 4104\n\
-  i64.store q0a1 q0v1\n\
-  q0a2 = i64.const 4112\n\
+  q0a1 = i64.const 20488\n\
+  i64.store q0a1 q0off\n\
+  q0a2 = i64.const 20496\n\
   i64.store q0a2 q0v2\n\
-  q0a3 = i64.const 4120\n\
+  q0a3 = i64.const 20504\n\
   i64.store q0a3 q0v3\n\
-  q0a4 = i64.const 4128\n\
+  q0a4 = i64.const 20512\n\
   i64.store q0a4 q0v1\n\
-  q0a5 = i64.const 4136\n\
+  q0a5 = i64.const 20520\n\
   i64.store q0a5 q0v1\n\
-  q0a6 = i64.const 4144\n\
+  q0a6 = i64.const 20528\n\
   i64.store q0a6 q0v1\n\
   vch = call.cap 6 17 (i64) -> (i32) vinst (q0a0)\n\
   vcr = call.cap 6 1 (i32) -> (i64) vinst (vch)\n\

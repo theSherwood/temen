@@ -30,9 +30,9 @@ const CHILD: &str = r#"memory 17
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vname = i64.const 29542
-  vzero = i64.const 0
+  vzero = i64.const 16384
   i64.store vzero vname
-  vp0 = i64.const 0
+  vp0 = i64.const 16384
   vl2 = i64.const 2
   vh = self.resolve vp0 vl2
   vr = call.cap 13 0 (i64) -> (i64) vh (vp0)

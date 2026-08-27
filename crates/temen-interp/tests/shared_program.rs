@@ -11,19 +11,20 @@ use std::sync::Arc;
 use temen_interp::{bytecode, Host, Region, Value};
 use temen_text::parse_module;
 
-// func 0 `store(x)`: writes x to mem[0], returns x. func 1 `load()`: returns mem[0].
+// func 0 `store(x)`: writes x to mem[16384] (above the #1094 NULL guard), returns x. func 1
+// `load()`: returns mem[16384].
 const SRC: &str = r#"
 memory 16
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  va = i64.const 0
+  va = i64.const 16384
   i64.store va v0
   return v0
   }
 }
 func () -> (i64) {
 block 0 () {
-  va = i64.const 0
+  va = i64.const 16384
   vr = i64.load va
   return vr
   }

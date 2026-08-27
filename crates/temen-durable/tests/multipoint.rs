@@ -113,7 +113,7 @@ const FREEZE_AT_0: &str = r#"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v_a = i64.const 0
+  v_a = i64.const 16384
   v_u = i32.const 1
   i32.store v_a v_u
   v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
@@ -130,7 +130,7 @@ func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
-  v_a = i64.const 0
+  v_a = i64.const 16384
   v_u = i32.const 1
   i32.store v_a v_u
   v3 = call.cap 2 0 (i32) -> (i64) v0 (v1)
@@ -180,7 +180,7 @@ block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v3 = call.cap 2 0 (i32) -> (i64) v0 (v1)
-  v_a = i64.const 0
+  v_a = i64.const 16384
   v_u = i32.const 1
   i32.store v_a v_u
   v4 = call.cap 2 0 (i32) -> (i64) v0 (v1)
@@ -238,7 +238,7 @@ const FREEZE_PROP_AT_1: &str = r#"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = call 1 (v0)
-  v_a = i64.const 0
+  v_a = i64.const 16384
   v_u = i32.const 1
   i32.store v_a v_u
   v2 = call 2 (v0)

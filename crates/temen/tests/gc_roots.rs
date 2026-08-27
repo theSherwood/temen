@@ -65,19 +65,19 @@ fn run_i64s(src: &str) -> Vec<i64> {
 /// set is `{heap_lo, sentinel}` written ascending.
 #[test]
 fn gc_roots_finds_caller_frame_root() {
-    // range [0x5000, 0x6000); sentinel 0x5050; buf at offset 0, cap 8 slots.
+    // range [0x5000, 0x6000); sentinel 0x5050; buf at offset 16384 (above the #1094 NULL guard), cap 8 slots.
     let src = "memory 16\n\
         func () -> (i64, i64, i64) {\n\
         block 0 () {\n\
         \x20 v0 = i64.const 20560\n\
         \x20 v1 = i64.const 20480\n\
         \x20 v2 = i64.const 24576\n\
-        \x20 v3 = i64.const 0\n\
+        \x20 v3 = i64.const 16384\n\
         \x20 v4 = i64.const 8\n\
         \x20 vmask = i64.const -1\n\
         \x20 v5 = gc.roots v1 v2 vmask v3 v4\n\
         \x20 v6 = i64.load v3\n\
-        \x20 v7 = i64.const 8\n\
+        \x20 v7 = i64.const 16392\n\
         \x20 v8 = i64.load v7\n\
         \x20 return v5 v6 v8\n\
           }\n\
@@ -96,7 +96,7 @@ fn gc_roots_excludes_out_of_range() {
         \x20 v0 = i64.const 20560\n\
         \x20 v1 = i64.const 32768\n\
         \x20 v2 = i64.const 36864\n\
-        \x20 v3 = i64.const 0\n\
+        \x20 v3 = i64.const 16384\n\
         \x20 v4 = i64.const 8\n\
         \x20 vmask = i64.const -1\n\
         \x20 v5 = gc.roots v1 v2 vmask v3 v4\n\
@@ -123,11 +123,11 @@ fn gc_roots_scans_suspended_fiber_stack() {
         \x20 v4, v5 = cont.resume v2 v3\n\
         \x20 v6 = i64.const 28672\n\
         \x20 v7 = i64.const 28928\n\
-        \x20 v8 = i64.const 0\n\
+        \x20 v8 = i64.const 16384\n\
         \x20 v9 = i64.const 8\n\
         \x20 vmask = i64.const -1\n\
         \x20 v10 = gc.roots v6 v7 vmask v8 v9\n\
-        \x20 v11 = i64.const 8\n\
+        \x20 v11 = i64.const 16392\n\
         \x20 v12 = i64.load v11\n\
         \x20 return v10 v12\n\
           }\n\
@@ -201,7 +201,7 @@ fn gc_roots_scans_suspended_fiber_stack_on_the_jit() {
     // root is reported — not an occupancy upper bound (GC.md §3.2: the JIT deliberately
     // over-approximates from raw stack words, so its candidate count is not something to bound).
     // The root passes arg 0x7050 (28752) to the fiber, which keeps it live across its suspend and
-    // returns it; buf at offset 0, cap 8 slots.
+    // returns it; buf at offset 16384 (above the #1094 NULL guard), cap 8 slots.
     let src = "memory 16\n\
         func () -> (i64, i64, i64) {\n\
         block 0 () {\n\
@@ -212,13 +212,13 @@ fn gc_roots_scans_suspended_fiber_stack_on_the_jit() {
         \x20 v4, v5 = cont.resume v2 v3\n\
         \x20 v6 = i64.const 28752\n\
         \x20 v7 = i64.const 28753\n\
-        \x20 v8 = i64.const 0\n\
+        \x20 v8 = i64.const 16384\n\
         \x20 v9 = i64.const 8\n\
         \x20 vmask = i64.const -1\n\
         \x20 v10 = gc.roots v6 v7 vmask v8 v9\n\
-        \x20 v11 = i64.const 0\n\
+        \x20 v11 = i64.const 16384\n\
         \x20 v12 = i64.load v11\n\
-        \x20 v13 = i64.const 8\n\
+        \x20 v13 = i64.const 16392\n\
         \x20 v14 = i64.load v13\n\
         \x20 return v10 v12 v14\n\
           }\n\
@@ -267,14 +267,15 @@ fn gc_roots_scans_suspended_fiber_stack_on_the_jit() {
 fn gc_roots_captures_caller_callee_saved_register_roots_on_the_jit() {
     use temen_jit::{compile_and_run, JitOutcome};
     const N: usize = 16;
-    // Layout (memory 16 = 64 KiB): the N pointer *values* 0x6008.. are pre-stored at 0x100.. so the
-    // fiber can load them (a load's result can't be rematerialized across the call). Root window
-    // [0x6000, 0x6100) covers heap_lo + all N pointers. gc.roots buffer at 0x200, cap 32. The fold sum
-    // is stored at 0x1000 (out of window) purely to keep the loads live past the call.
+    // Layout (memory 16 = 64 KiB): the N pointer *values* 0x6008.. are pre-stored at 0x100+16384.. so
+    // the fiber can load them (a load's result can't be rematerialized across the call), all above the
+    // #1094 NULL guard. Root window [0x6000, 0x6100) covers heap_lo + all N pointers (range values, not
+    // memory). gc.roots buffer at 0x200+16384=16896, cap 32. The fold sum is stored at 0x1000+16384=20480
+    // (out of window, above the guard) purely to keep the loads live past the call.
     let mut root = String::from("memory 16\nfunc () -> (i64) {\nblock 0 () {\n");
     let mut k = 0usize;
     for i in 0..N {
-        let (val, off) = (0x6008 + i * 8, 0x100 + i * 8);
+        let (val, off) = (0x6008 + i * 8, 0x100 + i * 8 + 16384);
         root.push_str(&format!("  v{k} = i64.const {val}\n"));
         let vval = k;
         k += 1;
@@ -303,7 +304,7 @@ fn gc_roots_captures_caller_callee_saved_register_roots_on_the_jit() {
     let mut fk = 2usize;
     let mut loaded = Vec::new();
     for i in 0..N {
-        let off = 0x100 + i * 8;
+        let off = 0x100 + i * 8 + 16384;
         f.push_str(&format!("  v{fk} = i64.const {off}\n"));
         let voff = fk;
         fk += 1;
@@ -311,8 +312,8 @@ fn gc_roots_captures_caller_callee_saved_register_roots_on_the_jit() {
         loaded.push(fk);
         fk += 1;
     }
-    // heap_lo=0x6000, heap_hi=0x6100, buf=0x200, cap=32 — emitted in order at fk..fk+3.
-    for val in [24576, 24832, 512, 32] {
+    // heap_lo=0x6000, heap_hi=0x6100, buf=0x200+16384=16896, cap=32 — emitted in order at fk..fk+3.
+    for val in [24576, 24832, 16896, 32] {
         f.push_str(&format!("  v{fk} = i64.const {val}\n"));
         fk += 1;
     }
@@ -331,7 +332,7 @@ fn gc_roots_captures_caller_callee_saved_register_roots_on_the_jit() {
         acc = fk;
         fk += 1;
     }
-    f.push_str(&format!("  v{fk} = i64.const 4096\n"));
+    f.push_str(&format!("  v{fk} = i64.const 20480\n"));
     let vsaddr = fk;
     f.push_str(&format!("  i64.store v{vsaddr} v{acc}\n"));
     f.push_str(&format!("  return v{vcount}\n  }}\n}}\n"));
@@ -369,8 +370,9 @@ fn gc_roots_captures_caller_callee_saved_register_roots_on_the_jit() {
 fn gc_roots_scans_running_ancestor_fiber_on_the_jit() {
     use temen_jit::{compile_and_run, JitOutcome};
     // 16-byte heap window [0x7ab0, 0x7ac0): only 0x7ab0 (heap_lo, on B) and 0x7ab8 (P_A, on A) fall in
-    // it (a stray stack word in a 16-byte range is ~2^-60). buf at 0, cap 4. A stores P_A at offset
-    // 0x1000 — outside both the buffer and the heap window — purely to keep it live past the resume.
+    // it (a stray stack word in a 16-byte range is ~2^-60). buf at 16384 (above the #1094 NULL guard),
+    // cap 4. A stores P_A at offset 0x1000+16384=20480 — outside both the buffer and the heap window,
+    // above the guard — purely to keep it live past the resume.
     let src = "memory 16\n\
         func () -> (i64, i64, i64) {\n\
         block 0 () {\n\
@@ -379,9 +381,9 @@ fn gc_roots_scans_running_ancestor_fiber_on_the_jit() {
         \x20 v2 = cont.new v0 v1\n\
         \x20 v3 = i64.const 31416\n\
         \x20 v4, v5 = cont.resume v2 v3\n\
-        \x20 v6 = i64.const 0\n\
+        \x20 v6 = i64.const 16384\n\
         \x20 v7 = i64.load v6\n\
-        \x20 v8 = i64.const 8\n\
+        \x20 v8 = i64.const 16392\n\
         \x20 v9 = i64.load v8\n\
         \x20 return v5 v7 v9\n\
           }\n\
@@ -393,7 +395,7 @@ fn gc_roots_scans_running_ancestor_fiber_on_the_jit() {
         \x20 v4 = cont.new v2 v3\n\
         \x20 v5 = i64.const 0\n\
         \x20 v6, v7 = cont.resume v4 v5\n\
-        \x20 v8 = i64.const 4096\n\
+        \x20 v8 = i64.const 20480\n\
         \x20 i64.store v8 v1\n\
         \x20 return v7\n\
           }\n\
@@ -402,7 +404,7 @@ fn gc_roots_scans_running_ancestor_fiber_on_the_jit() {
         block 0 (v0: i64, v1: i64) {\n\
         \x20 v2 = i64.const 31408\n\
         \x20 v3 = i64.const 31424\n\
-        \x20 v4 = i64.const 0\n\
+        \x20 v4 = i64.const 16384\n\
         \x20 v5 = i64.const 4\n\
         \x20 vmask = i64.const -1\n\
         \x20 v6 = gc.roots v2 v3 vmask v4 v5\n\
@@ -457,7 +459,8 @@ fn gc_roots_scans_running_ancestor_fiber_on_the_jit() {
 ))]
 #[test]
 fn gc_roots_cross_vcpu_stop_the_world_scan() {
-    // Window flags: READY at 128, GO at 136 (i32). gc.roots buffer at offset 0, cap 8. One-word
+    // Window flags: READY at 16512 (128+16384), GO at 16520 (136+16384) (i32), above the #1094 NULL
+    // guard. gc.roots buffer at offset 16384, cap 8. One-word
     // heap window [0x7050, 0x7051) so the conservative scan's result is deterministic (only the
     // exact pointer matches; soundness per GC.md §3.2, not an occupancy bound). The mutator fiber
     // holds 0x7050 (28752). `sp` args are unused parameters.
@@ -470,14 +473,14 @@ fn gc_roots_cross_vcpu_stop_the_world_scan() {
         \x20 br 1(v2)\n\
         }\n\
         block 1 (v3: i32) {\n\
-        \x20 v4 = i64.const 128\n\
+        \x20 v4 = i64.const 16512\n\
         \x20 v5 = i32.atomic.load v4\n\
         \x20 v6 = i32.const 0\n\
         \x20 v7 = i32.ne v5 v6\n\
         \x20 br_if v7 3(v3) 2(v3)\n\
         }\n\
         block 2 (v8: i32) {\n\
-        \x20 v9 = i64.const 128\n\
+        \x20 v9 = i64.const 16512\n\
         \x20 v10 = i32.const 0\n\
         \x20 v11 = i64.const 1000000000\n\
         \x20 v12 = i32.atomic.wait v9 v10 v11\n\
@@ -486,20 +489,20 @@ fn gc_roots_cross_vcpu_stop_the_world_scan() {
         block 3 (v13: i32) {\n\
         \x20 v14 = i64.const 28752\n\
         \x20 v15 = i64.const 28753\n\
-        \x20 v16 = i64.const 0\n\
+        \x20 v16 = i64.const 16384\n\
         \x20 v17 = i64.const 8\n\
         \x20 vmask = i64.const -1\n\
         \x20 v18 = gc.roots v14 v15 vmask v16 v17\n\
-        \x20 v19 = i64.const 136\n\
+        \x20 v19 = i64.const 16520\n\
         \x20 v20 = i32.const 1\n\
         \x20 i32.atomic.store v19 v20\n\
-        \x20 v21 = i64.const 136\n\
+        \x20 v21 = i64.const 16520\n\
         \x20 v22 = i32.const 1\n\
         \x20 v23 = atomic.notify v21 v22\n\
         \x20 v24 = thread.join v13\n\
-        \x20 v25 = i64.const 0\n\
+        \x20 v25 = i64.const 16384\n\
         \x20 v26 = i64.load v25\n\
-        \x20 v27 = i64.const 8\n\
+        \x20 v27 = i64.const 16392\n\
         \x20 v28 = i64.load v27\n\
         \x20 return v18 v26 v28\n\
           }\n\
@@ -511,23 +514,23 @@ fn gc_roots_cross_vcpu_stop_the_world_scan() {
         \x20 v4 = cont.new v2 v3\n\
         \x20 v5 = i64.const 28752\n\
         \x20 v6, v7 = cont.resume v4 v5\n\
-        \x20 v8 = i64.const 128\n\
+        \x20 v8 = i64.const 16512\n\
         \x20 v9 = i32.const 1\n\
         \x20 i32.atomic.store v8 v9\n\
-        \x20 v10 = i64.const 128\n\
+        \x20 v10 = i64.const 16512\n\
         \x20 v11 = i32.const 1\n\
         \x20 v12 = atomic.notify v10 v11\n\
         \x20 br 1()\n\
         }\n\
         block 1 () {\n\
-        \x20 v13 = i64.const 136\n\
+        \x20 v13 = i64.const 16520\n\
         \x20 v14 = i32.atomic.load v13\n\
         \x20 v15 = i32.const 0\n\
         \x20 v16 = i32.ne v14 v15\n\
         \x20 br_if v16 3() 2()\n\
         }\n\
         block 2 () {\n\
-        \x20 v17 = i64.const 136\n\
+        \x20 v17 = i64.const 16520\n\
         \x20 v18 = i32.const 0\n\
         \x20 v19 = i64.const 1000000000\n\
         \x20 v20 = i32.atomic.wait v17 v18 v19\n\
@@ -598,7 +601,7 @@ const BUF_WORDS: usize = 16;
 /// Build a module whose root creates one parked fiber per value in `roots` (each fiber holds its
 /// value live across a `suspend`, so it is spilled onto that fiber's control stack / lives in its
 /// reified frame), then calls `gc.roots` over `[lo, hi)` writing the deduped candidates to guest
-/// memory at offset 0 (cap `BUF_WORDS`) and **returns just the count**. The result buffer is read
+/// memory at offset 16384 (above the #1094 NULL guard; cap `BUF_WORDS`) and **returns just the count**. The result buffer is read
 /// back from *captured memory* (see [`run_multi_fiber_words`]), not returned — the guest's return
 /// arity stays at 1, since the Tail ABI's return-register budget differs across targets (8 values
 /// fit on x86-64 but not aarch64). Shared fiber body (func 1) is `(sp, arg) -> arg` across a suspend.
@@ -630,7 +633,7 @@ fn build_multi_fiber_module(roots: &[i64], lo: i64, hi: i64) -> temen_ir::Module
     }
     writeln!(src, "  v{v} = i64.const {lo}").unwrap();
     writeln!(src, "  v{} = i64.const {hi}", v + 1).unwrap();
-    writeln!(src, "  v{} = i64.const 0", v + 2).unwrap(); // buf offset
+    writeln!(src, "  v{} = i64.const 16384", v + 2).unwrap(); // buf offset (above #1094 NULL guard)
     writeln!(src, "  v{} = i64.const {BUF_WORDS}", v + 3).unwrap(); // cap
     writeln!(src, "  v{} = i64.const -1", v + 4).unwrap(); // payload mask (untagged identity)
     writeln!(
@@ -655,7 +658,7 @@ fn build_multi_fiber_module(roots: &[i64], lo: i64, hi: i64) -> temen_ir::Module
 }
 
 /// Run `build_multi_fiber_module`'s output on both backends and return the `gc.roots` result buffer
-/// (the first `BUF_WORDS` words written to guest memory at offset 0) per backend — read from
+/// (the first `BUF_WORDS` words written to guest memory at offset 16384, above the #1094 NULL guard) per backend — read from
 /// **captured memory**, so it doesn't depend on the guest's return arity. Soundness framing (GC.md
 /// §3.2): each backend is checked independently against the planted roots, not against each other.
 #[cfg(any(
@@ -664,15 +667,23 @@ fn build_multi_fiber_module(roots: &[i64], lo: i64, hi: i64) -> temen_ir::Module
     all(windows, target_arch = "x86_64")
 ))]
 fn run_multi_fiber_words(m: &temen_ir::Module) -> [Vec<i64>; 2] {
+    // The gc.roots buffer sits at offset 16384 (above the #1094 NULL guard); read the words back from there.
+    const BUF_OFF: usize = 16384;
     fn words(mem: &[u8]) -> Vec<i64> {
         (0..BUF_WORDS)
-            .map(|i| i64::from_le_bytes(mem[i * 8..i * 8 + 8].try_into().unwrap()))
+            .map(|i| {
+                i64::from_le_bytes(
+                    mem[BUF_OFF + i * 8..BUF_OFF + i * 8 + 8]
+                        .try_into()
+                        .unwrap(),
+                )
+            })
             .collect()
     }
-    // Seed `BUF_WORDS` words of zeroed memory: the capture APIs snapshot exactly `init_mem.len()`
+    // Seed zeroed memory up through the buffer: the capture APIs snapshot exactly `init_mem.len()`
     // post-run bytes (escape-oracle convention), so this is what makes the gc.roots buffer at
-    // offset 0 visible (its unwritten tail stays zero, which never matches a planted sentinel).
-    let init_mem = [0u8; BUF_WORDS * 8];
+    // offset 16384 visible (its unwritten tail stays zero, which never matches a planted sentinel).
+    let init_mem = [0u8; BUF_OFF + BUF_WORDS * 8];
     // Interp (shares the run registry across spawned vCPUs); capture the final guest memory.
     let mut fuel = 50_000_000u64;
     let (res, imem) = temen_interp::run_capture(m, 0, &[], &mut fuel, &init_mem);
@@ -817,12 +828,12 @@ fn gc_roots_strips_pointer_tag_via_mask() {
         \x20 v6 = i64.const 28672\n\
         \x20 v7 = i64.const 28928\n\
         \x20 vmask = i64.const {STRIP_MASK}\n\
-        \x20 v8 = i64.const 0\n\
+        \x20 v8 = i64.const 16384\n\
         \x20 v9 = i64.const 8\n\
         \x20 v10 = gc.roots v6 v7 vmask v8 v9\n\
-        \x20 v11 = i64.const 0\n\
+        \x20 v11 = i64.const 16384\n\
         \x20 v12 = i64.load v11\n\
-        \x20 v13 = i64.const 8\n\
+        \x20 v13 = i64.const 16392\n\
         \x20 v14 = i64.load v13\n\
         \x20 return v10 v12 v14\n\
           }}\n\
@@ -866,10 +877,10 @@ fn gc_roots_strips_pointer_tag_on_the_jit() {
         \x20 v6 = i64.const 28752\n\
         \x20 v7 = i64.const 28753\n\
         \x20 vmask = i64.const {STRIP_MASK}\n\
-        \x20 v8 = i64.const 0\n\
+        \x20 v8 = i64.const 16384\n\
         \x20 v9 = i64.const 8\n\
         \x20 v10 = gc.roots v6 v7 vmask v8 v9\n\
-        \x20 v11 = i64.const 0\n\
+        \x20 v11 = i64.const 16384\n\
         \x20 v12 = i64.load v11\n\
         \x20 return v10 v12\n\
           }}\n\

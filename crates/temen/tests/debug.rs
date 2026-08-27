@@ -185,13 +185,14 @@ fn backtrace_shows_both_frames_inside_the_callee() {
 
 #[test]
 fn reads_window_memory_a_store_left_behind() {
-    // Store a known i64 at offset 0, then return — and read it back via the Inspector.
+    // Store a known i64 at offset 16384 (above the #1094 NULL guard), then return — and read it
+    // back via the Inspector.
     const MAGIC: u64 = 0x1122334455667788;
     let src = r#"
 memory 17
 func () -> (i32) {
 block 0 () {
-  v0 = i64.const 0
+  v0 = i64.const 16384
   v1 = i64.const 1234605616436508552
   i64.store v0 v1
   v2 = i32.const 0
@@ -202,16 +203,17 @@ block 0 () {
     let m = parse_module(src).expect("parse");
     let mut insp = Inspector::attach(&m, 0, &[], 1_000_000);
     let _ = finished_ok(insp.run_until_stop());
-    let bytes = insp.read_window(0, 8).expect("read window");
+    let bytes = insp.read_window(16384, 8).expect("read window");
     assert_eq!(bytes, MAGIC.to_le_bytes());
 }
 
-// A store to a fixed window offset, then return — for write-watchpoint tests.
+// A store to a fixed window offset (16384, above the #1094 NULL guard), then return — for
+// write-watchpoint tests.
 const STORE_PROG: &str = r#"
 memory 17
 func () -> (i32) {
 block 0 () {
-  v0 = i64.const 0
+  v0 = i64.const 16384
   v1 = i64.const 1234605616436508552
   i64.store v0 v1
   v2 = i32.const 0
@@ -225,7 +227,7 @@ fn write_watchpoint_stops_before_the_store_then_step_applies_it() {
     const MAGIC: u64 = 0x1122334455667788;
     let m = parse_module(STORE_PROG).expect("parse");
     let mut insp = Inspector::attach(&m, 0, &[], 1_000_000);
-    insp.set_watchpoint(0, 8, WatchKind::Write);
+    insp.set_watchpoint(16384, 8, WatchKind::Write);
 
     // Pauses *before* the store; the watched bytes are still the initial zeros.
     match insp.run_until_stop() {
@@ -233,7 +235,7 @@ fn write_watchpoint_stops_before_the_store_then_step_applies_it() {
             reason: StopReason::Watchpoint { addr, write },
             pc,
         } => {
-            assert_eq!((addr, write), (0, true));
+            assert_eq!((addr, write), (16384, true));
             assert_eq!(
                 pc,
                 IrPc {
@@ -246,11 +248,11 @@ fn write_watchpoint_stops_before_the_store_then_step_applies_it() {
         }
         other => panic!("expected write watchpoint, got {other:?}"),
     }
-    assert_eq!(insp.read_window(0, 8).unwrap(), [0u8; 8]);
+    assert_eq!(insp.read_window(16384, 8).unwrap(), [0u8; 8]);
 
     // One step applies the store; now the new bytes are visible.
     let _ = insp.step();
-    assert_eq!(insp.read_window(0, 8).unwrap(), MAGIC.to_le_bytes());
+    assert_eq!(insp.read_window(16384, 8).unwrap(), MAGIC.to_le_bytes());
     assert_eq!(finished_ok(insp.run_until_stop()), vec![Value::I32(0)]);
 }
 
@@ -261,7 +263,7 @@ fn write_watchpoint_does_not_fire_on_a_read_and_read_watch_does() {
 memory 17
 func () -> (i64) {
 block 0 () {
-  v0 = i64.const 0
+  v0 = i64.const 16384
   v1 = i64.load v0
   return v1
   }
@@ -271,18 +273,18 @@ block 0 () {
 
     // Write-kind watch: the load is not a write, so the guest runs clean to completion.
     let mut insp = Inspector::attach(&m, 0, &[], 1_000_000);
-    insp.set_watchpoint(0, 8, WatchKind::Write);
+    insp.set_watchpoint(16384, 8, WatchKind::Write);
     assert_eq!(finished_ok(insp.run_until_stop()), vec![Value::I64(0)]);
 
     // Read-kind watch on the same range: pauses before the load.
     let mut insp = Inspector::attach(&m, 0, &[], 1_000_000);
-    insp.set_watchpoint(0, 8, WatchKind::Read);
+    insp.set_watchpoint(16384, 8, WatchKind::Read);
     match insp.run_until_stop() {
         Stop::Break {
             reason: StopReason::Watchpoint { addr, write },
             ..
         } => {
-            assert_eq!((addr, write), (0, false));
+            assert_eq!((addr, write), (16384, false));
         }
         other => panic!("expected read watchpoint, got {other:?}"),
     }
@@ -292,7 +294,7 @@ block 0 () {
 fn clearing_a_watchpoint_lets_the_guest_run_clean() {
     let m = parse_module(STORE_PROG).expect("parse");
     let mut insp = Inspector::attach(&m, 0, &[], 1_000_000);
-    let id = insp.set_watchpoint(0, 8, WatchKind::Write);
+    let id = insp.set_watchpoint(16384, 8, WatchKind::Write);
     assert!(insp.clear_watchpoint(id));
     assert!(!insp.clear_watchpoint(id), "second clear is a no-op");
     // With the watch gone, no pause: the store runs and the function returns 0.
@@ -301,10 +303,11 @@ fn clearing_a_watchpoint_lets_the_guest_run_clean() {
 
 #[test]
 fn watchpoint_outside_the_accessed_range_does_not_fire() {
-    // Watch [64, 72): the store hits [0, 8), which does not overlap, so the guest runs clean.
+    // Watch [16448, 16456): the store hits [16384, 16392) (above the #1094 NULL guard), which does
+    // not overlap, so the guest runs clean.
     let m = parse_module(STORE_PROG).expect("parse");
     let mut insp = Inspector::attach(&m, 0, &[], 1_000_000);
-    insp.set_watchpoint(64, 8, WatchKind::Write);
+    insp.set_watchpoint(16448, 8, WatchKind::Write);
     assert_eq!(finished_ok(insp.run_until_stop()), vec![Value::I32(0)]);
 }
 
@@ -314,13 +317,13 @@ const CAP_WRITE: &str = r#"
 memory 16
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   v2 = i32.const 72
   i32.store8 v1 v2
-  v3 = i64.const 1
+  v3 = i64.const 16385
   v4 = i32.const 105
   i32.store8 v3 v4
-  v5 = i64.const 0
+  v5 = i64.const 16384
   v6 = i64.const 2
   v7 = call.cap 0 1 (i64, i64) -> (i64) v0 (v5, v6)
   return v7
@@ -600,7 +603,8 @@ debug.file 0 "w.c"
 debug.var 0 "x" winvia 1 0 0 0 8 "int"
 "#;
     let m = parse_module(src).expect("parse");
-    let mut insp = Inspector::attach(&m, 0, &[Value::I64(4096)], 1_000_000);
+    // Data-SP base 20480 = 4096 + 16384: keep the store (base + 8) above the #1094 NULL guard.
+    let mut insp = Inspector::attach(&m, 0, &[Value::I64(20480)], 1_000_000);
     // Break at the last op (after the store), so the window holds the value.
     let last = m.funcs[0].blocks[0].insts.len() - 1;
     insp.set_breakpoint(IrPc {
@@ -764,10 +768,10 @@ const STDIN_FIRST: &str = r#"
 memory 16
 func (i32) -> (i32) {
 block 0 (v0: i32) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   v2 = i64.const 2
   v3 = call.cap 0 0 (i64, i64) -> (i64) v0 (v1, v2)
-  v4 = i64.const 0
+  v4 = i64.const 16384
   v5 = i32.load8_u v4
   return v5
   }
@@ -789,7 +793,7 @@ fn captape_replays_stdin_read_into_the_buffer_for_faithful_seek() {
     let tape = insp.cap_tape();
     assert_eq!(tape.records.len(), 1);
     assert_eq!(tape.records[0].result, Ok(vec![2])); // 2 bytes read
-    assert_eq!(tape.records[0].mem_writes, vec![(0u64, b"Hi".to_vec())]);
+    assert_eq!(tape.records[0].mem_writes, vec![(16384u64, b"Hi".to_vec())]);
 
     // Time-travel to the start and replay: the read's buffer write is re-applied from the tape, so
     // we reproduce 72 — even though the replay host has empty stdin.

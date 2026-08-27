@@ -19,7 +19,7 @@ use temen_text::parse_module;
 // serve fold no longer applies to nesting modules (`module_nests`).
 const SERVING_PROGRAM: &str = "\
 memory 17
-data 0 \"vm\"
+data 16384 \"vm\"
 type 0 func (i64, i64) -> (i64)
 type 1 interface { add: 0 }
 export 0 interface \"adder\" 1 { add: 2 }
@@ -27,28 +27,28 @@ import 0 \"exit\" (i32) -> ()
 
 func 0 () -> () {
 block 0 () {
-  vp = i64.const 0
+  vp = i64.const 16384
   vl = i64.const 2
   vh = self.resolve vp vl
-  ; spawn via record (op 17): entry=1 off=65536 sl=12 quota=0
+  ; spawn via record (op 17) at 17536 (above the #1094 NULL guard): entry=1 off=65536 sl=12 quota=0
   q0v0 = i64.const 4294967296
   q0v1 = i64.const 65536
   q0v2 = i64.const -4294967284
   q0v3 = i64.const 4294967295
   q0v4 = i64.const 0
-  q0a0 = i64.const 1152
+  q0a0 = i64.const 17536
   i64.store q0a0 q0v0
-  q0a1 = i64.const 1160
+  q0a1 = i64.const 17544
   i64.store q0a1 q0v1
-  q0a2 = i64.const 1168
+  q0a2 = i64.const 17552
   i64.store q0a2 q0v2
-  q0a3 = i64.const 1176
+  q0a3 = i64.const 17560
   i64.store q0a3 q0v3
-  q0a4 = i64.const 1184
+  q0a4 = i64.const 17568
   i64.store q0a4 q0v4
-  q0a5 = i64.const 1192
+  q0a5 = i64.const 17576
   i64.store q0a5 q0v4
-  q0a6 = i64.const 1200
+  q0a6 = i64.const 17584
   i64.store q0a6 q0v4
   v5 = call.cap 6 17 (i64) -> (i32) vh (q0a0)
   v6 = i64.const 0

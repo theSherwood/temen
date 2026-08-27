@@ -312,7 +312,7 @@ fn memory_store_load_roundtrip() {
     (i64.store (local.get $a) (local.get $v))
     (i64.load (local.get $a))))"#;
     assert_eq!(
-        run(wat, "rw", &[Value::I32(80), Value::I64(123456789)]),
+        run(wat, "rw", &[Value::I32(16464), Value::I64(123456789)]),
         123456789
     );
     // narrow store/load truncates like wasm
@@ -321,7 +321,10 @@ fn memory_store_load_roundtrip() {
   (func (export "rw8") (param $a i32) (param $v i32) (result i32)
     (i32.store8 (local.get $a) (local.get $v))
     (i32.load8_u (local.get $a))))"#;
-    assert_eq!(run(wat8, "rw8", &[Value::I32(16), Value::I32(0x1ff)]), 0xff);
+    assert_eq!(
+        run(wat8, "rw8", &[Value::I32(16400), Value::I32(0x1ff)]),
+        0xff
+    );
 }
 
 /// The real `memsum` bench kernel (wasm32): store `i` to a windowed slot, read it back, sum. Each slot
@@ -334,7 +337,7 @@ fn memsum_kernel_wasm32() {
     (local $acc i64) (local $i i64) (local $addr i32)
     (block $done (loop $loop
       (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
-      (local.set $addr (i32.mul (i32.and (i32.wrap_i64 (local.get $i)) (i32.const 1023)) (i32.const 8)))
+      (local.set $addr (i32.add (i32.const 16384) (i32.mul (i32.and (i32.wrap_i64 (local.get $i)) (i32.const 1023)) (i32.const 8))))
       (i64.store (local.get $addr) (local.get $i))
       (local.set $acc (i64.add (local.get $acc) (i64.load (local.get $addr))))
       (local.set $i (i64.add (local.get $i) (i64.const 1)))
@@ -354,7 +357,7 @@ fn memsum_kernel_wasm64() {
     (local $acc i64) (local $i i64) (local $addr i64)
     (block $done (loop $loop
       (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
-      (local.set $addr (i64.mul (i64.and (local.get $i) (i64.const 1023)) (i64.const 8)))
+      (local.set $addr (i64.add (i64.const 16384) (i64.mul (i64.and (local.get $i) (i64.const 1023)) (i64.const 8))))
       (i64.store (local.get $addr) (local.get $i))
       (local.set $acc (i64.add (local.get $acc) (i64.load (local.get $addr))))
       (local.set $i (i64.add (local.get $i) (i64.const 1)))
@@ -376,11 +379,11 @@ fn scatter_kernel() {
     (block $done (loop $loop
       (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
       (i64.store
-        (i32.mul (i32.and (i32.wrap_i64 (i64.mul (local.get $i) (i64.const 2654435761))) (i32.const 1023)) (i32.const 8))
+        (i32.add (i32.const 16384) (i32.mul (i32.and (i32.wrap_i64 (i64.mul (local.get $i) (i64.const 2654435761))) (i32.const 1023)) (i32.const 8)))
         (local.get $i))
       (local.set $acc (i64.add (local.get $acc)
         (i64.load
-          (i32.mul (i32.and (i32.wrap_i64 (i64.mul (local.get $i) (i64.const 2246822519))) (i32.const 1023)) (i32.const 8)))))
+          (i32.add (i32.const 16384) (i32.mul (i32.and (i32.wrap_i64 (i64.mul (local.get $i) (i64.const 2246822519))) (i32.const 1023)) (i32.const 8))))))
       (local.set $i (i64.add (local.get $i) (i64.const 1)))
       (br $loop)))
     (local.get $acc)))"#;
@@ -435,17 +438,17 @@ fn recursive_call_fib() {
 fn data_segment_init() {
     let wat = r#"
 (module (memory 1)
-  (data (i32.const 16) "\01\02\03\04\05\06\07\08")
-  (func (export "g") (result i64) (i64.load (i32.const 16))))"#;
+  (data (i32.const 16400) "\01\02\03\04\05\06\07\08")
+  (func (export "g") (result i64) (i64.load (i32.const 16400))))"#;
     // little-endian i64 from bytes 01..08
     assert_eq!(run(wat, "g", &[]), 0x0807_0605_0403_0201);
 
     // sum two i32s laid out by a data segment
     let wat2 = r#"
 (module (memory 1)
-  (data (i32.const 0) "\0a\00\00\00\14\00\00\00")
+  (data (i32.const 16384) "\0a\00\00\00\14\00\00\00")
   (func (export "sum") (result i32)
-    (i32.add (i32.load (i32.const 0)) (i32.load (i32.const 4)))))"#;
+    (i32.add (i32.load (i32.const 16384)) (i32.load (i32.const 16388)))))"#;
     assert_eq!(run(wat2, "sum", &[]), 30); // 10 + 20
 }
 
@@ -477,6 +480,8 @@ fn real_clang_wasm() {
         .args(["--target=wasm32", "-nostdlib", "-O2"])
         .args([
             "-Wl,--no-entry",
+            // #1094: data + shadow stack above the NULL guard `[0, POWERBOX_NULL_GUARD)`.
+            "-Wl,--global-base=16384",
             "-Wl,--export=fib",
             "-Wl,--export=sumto",
             "-Wl,--export=poly",
@@ -763,14 +768,18 @@ fn unsupported_is_clean_error() {
 fn memory_copy_overlap_is_memmove() {
     let wat = r#"
 (module (memory 1)
-  (data (i32.const 0) "\00\01\02\03\04\05\06\07")
+  (data (i32.const 16384) "\00\01\02\03\04\05\06\07")
   (func (export "byte") (param $idx i32) (result i32)
-    (memory.copy (i32.const 2) (i32.const 0) (i32.const 6))   ;; dest=2, src=0, len=6 (overlap)
+    (memory.copy (i32.const 16386) (i32.const 16384) (i32.const 6))   ;; dest=16386, src=16384, len=6 (overlap)
     (i32.load8_u (local.get $idx))))"#;
     // After memmove: bytes = [0,1,0,1,2,3,4,5]. (A naive forward byte loop would give [0,1,0,1,0,1,..].)
     let expect = [0, 1, 0, 1, 2, 3, 4, 5];
     for (i, &e) in expect.iter().enumerate() {
-        assert_eq!(run(wat, "byte", &[Value::I32(i as i32)]), e, "byte[{i}]");
+        assert_eq!(
+            run(wat, "byte", &[Value::I32(i as i32 + 16384)]),
+            e,
+            "byte[{i}]"
+        );
     }
 }
 
@@ -781,13 +790,13 @@ fn memory_fill_sets_bytes() {
     let wat = r#"
 (module (memory 1)
   (func (export "byte") (param $idx i32) (result i32)
-    (memory.fill (i32.const 4) (i32.const 0xAB) (i32.const 13))  ;; [4..17) = 0xAB
+    (memory.fill (i32.const 16388) (i32.const 0xAB) (i32.const 13))  ;; [16388..16401) = 0xAB
     (i32.load8_u (local.get $idx))))"#;
-    assert_eq!(run(wat, "byte", &[Value::I32(3)]), 0); // before the fill
-    for i in 4..17 {
+    assert_eq!(run(wat, "byte", &[Value::I32(16387)]), 0); // before the fill
+    for i in 16388..16401 {
         assert_eq!(run(wat, "byte", &[Value::I32(i)]), 0xAB, "byte[{i}]");
     }
-    assert_eq!(run(wat, "byte", &[Value::I32(17)]), 0); // after the fill
+    assert_eq!(run(wat, "byte", &[Value::I32(16401)]), 0); // after the fill
 }
 
 /// **Real clang program using bulk memory.** A struct copy by value (clang → `memory.copy`) and a
@@ -819,6 +828,8 @@ fn real_clang_bulk_memory() {
         .args(["--target=wasm32", "-nostdlib", "-O2", "-mbulk-memory"])
         .args([
             "-Wl,--no-entry",
+            // #1094: data + shadow stack above the NULL guard `[0, POWERBOX_NULL_GUARD)`.
+            "-Wl,--global-base=16384",
             "-Wl,--export=sum_copy",
             "-Wl,--export=zero_then_set",
         ])
@@ -857,44 +868,48 @@ fn memory_fill_dynamic_length() {
     let wat = r#"
 (module (memory 1)
   (func (export "byte") (param $n i32) (param $idx i32) (result i32)
-    (memory.fill (i32.const 4) (i32.const 0xCD) (local.get $n))
+    (memory.fill (i32.const 16388) (i32.const 0xCD) (local.get $n))
     (i32.load8_u (local.get $idx))))"#;
-    // fill 10 bytes [4..14) = 0xCD
-    assert_eq!(run(wat, "byte", &[Value::I32(10), Value::I32(3)]), 0); // before
-    assert_eq!(run(wat, "byte", &[Value::I32(10), Value::I32(4)]), 0xCD);
-    assert_eq!(run(wat, "byte", &[Value::I32(10), Value::I32(13)]), 0xCD);
-    assert_eq!(run(wat, "byte", &[Value::I32(10), Value::I32(14)]), 0); // after
-    assert_eq!(run(wat, "byte", &[Value::I32(0), Value::I32(4)]), 0); // n=0: no write
+    // fill 10 bytes [16388..16398) = 0xCD
+    assert_eq!(run(wat, "byte", &[Value::I32(10), Value::I32(16387)]), 0); // before
+    assert_eq!(run(wat, "byte", &[Value::I32(10), Value::I32(16388)]), 0xCD);
+    assert_eq!(run(wat, "byte", &[Value::I32(10), Value::I32(16397)]), 0xCD);
+    assert_eq!(run(wat, "byte", &[Value::I32(10), Value::I32(16398)]), 0); // after
+    assert_eq!(run(wat, "byte", &[Value::I32(0), Value::I32(16388)]), 0); // n=0: no write
 }
 
 /// Runtime-length `memory.copy`, **forward** direction (`dest ≤ src`): a non-overlapping copy and an
 /// overlapping `dest < src` copy (forward is the safe direction there).
 #[test]
 fn memory_copy_dynamic_forward() {
-    // non-overlapping: dest=20, src=0, len=n
+    // non-overlapping: dest=16404, src=16384, len=n
     let nonoverlap = r#"
 (module (memory 1)
-  (data (i32.const 0) "\00\01\02\03\04\05\06\07\08\09")
+  (data (i32.const 16384) "\00\01\02\03\04\05\06\07\08\09")
   (func (export "byte") (param $n i32) (param $idx i32) (result i32)
-    (memory.copy (i32.const 20) (i32.const 0) (local.get $n))
+    (memory.copy (i32.const 16404) (i32.const 16384) (local.get $n))
     (i32.load8_u (local.get $idx))))"#;
     for i in 0..6 {
         assert_eq!(
-            run(nonoverlap, "byte", &[Value::I32(6), Value::I32(20 + i)]),
+            run(nonoverlap, "byte", &[Value::I32(6), Value::I32(16404 + i)]),
             i as i64
         );
     }
-    // overlapping, dest<src: data 0..7, copy dest=0 src=2 len=6 → [0..6]=[2,3,4,5,6,7]
+    // overlapping, dest<src: data 16384..16391, copy dest=16384 src=16386 len=6 → [16384..16390]=[2,3,4,5,6,7]
     let overlap = r#"
 (module (memory 1)
-  (data (i32.const 0) "\00\01\02\03\04\05\06\07")
+  (data (i32.const 16384) "\00\01\02\03\04\05\06\07")
   (func (export "byte") (param $n i32) (param $idx i32) (result i32)
-    (memory.copy (i32.const 0) (i32.const 2) (local.get $n))
+    (memory.copy (i32.const 16384) (i32.const 16386) (local.get $n))
     (i32.load8_u (local.get $idx))))"#;
     let expect = [2, 3, 4, 5, 6, 7, 6, 7];
     for (i, &e) in expect.iter().enumerate() {
         assert_eq!(
-            run(overlap, "byte", &[Value::I32(6), Value::I32(i as i32)]),
+            run(
+                overlap,
+                "byte",
+                &[Value::I32(6), Value::I32(i as i32 + 16384)]
+            ),
             e,
             "fwd byte[{i}]"
         );
@@ -907,15 +922,15 @@ fn memory_copy_dynamic_forward() {
 fn memory_copy_dynamic_backward_overlap() {
     let wat = r#"
 (module (memory 1)
-  (data (i32.const 0) "\00\01\02\03\04\05\06\07")
+  (data (i32.const 16384) "\00\01\02\03\04\05\06\07")
   (func (export "byte") (param $n i32) (param $idx i32) (result i32)
-    (memory.copy (i32.const 2) (i32.const 0) (local.get $n))
+    (memory.copy (i32.const 16386) (i32.const 16384) (local.get $n))
     (i32.load8_u (local.get $idx))))"#;
-    // memmove dest=2,src=0,len=6 → bytes = [0,1,0,1,2,3,4,5]
+    // memmove dest=16386,src=16384,len=6 → bytes = [0,1,0,1,2,3,4,5]
     let expect = [0, 1, 0, 1, 2, 3, 4, 5];
     for (i, &e) in expect.iter().enumerate() {
         assert_eq!(
-            run(wat, "byte", &[Value::I32(6), Value::I32(i as i32)]),
+            run(wat, "byte", &[Value::I32(6), Value::I32(i as i32 + 16384)]),
             e,
             "bwd byte[{i}]"
         );
@@ -943,7 +958,12 @@ fn real_clang_dynamic_memcpy() {
     .unwrap();
     let out = Command::new("clang")
         .args(["--target=wasm32", "-nostdlib", "-O2", "-mbulk-memory"])
-        .args(["-Wl,--no-entry", "-Wl,--export=copy_prefix"])
+        .args([
+            "-Wl,--no-entry",
+            // #1094: data + shadow stack above the NULL guard `[0, POWERBOX_NULL_GUARD)`.
+            "-Wl,--global-base=16384",
+            "-Wl,--export=copy_prefix",
+        ])
         .arg(&c)
         .arg("-o")
         .arg(&w)
@@ -1005,7 +1025,10 @@ fn clang_wasm(
         .arg(format!("-I{inc_dir}"))
         .arg(format!("-I{}", dir.display()))
         .args(extra)
-        .arg("-Wl,--no-entry");
+        .arg("-Wl,--no-entry")
+        // #1094: place clang's data + shadow stack above the unconditional NULL guard
+        // `[0, POWERBOX_NULL_GUARD)` so the transpiled module's 1:1 linear memory never touches it.
+        .arg("-Wl,--global-base=16384");
     for e in exports {
         cmd.arg(format!("-Wl,--export={e}"));
     }

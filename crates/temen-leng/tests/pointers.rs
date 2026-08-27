@@ -40,8 +40,8 @@ fn store_then_load_through_pointer() {
         "module must declare memory:\n{text}"
     );
     // Pass p = a valid 8-aligned window offset; x is the value to round-trip.
-    assert_eq!(run(&m, 0, &[64, 42]), 42);
-    assert_eq!(run(&m, 0, &[128, -7]), -7);
+    assert_eq!(run(&m, 0, &[16448, 42]), 42);
+    assert_eq!(run(&m, 0, &[16512, -7]), -7);
 }
 
 #[test]
@@ -56,8 +56,8 @@ fn store_stmt_reversed_operands() {
    (ret (deref p.0)))))";
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
     // The window starts zeroed, so *p == 0 initially; addto(p, 5) → 5, and no `d` doubling.
-    assert_eq!(run(&m, 0, &[64, 5]), 5);
-    assert_eq!(run(&m, 0, &[256, 100]), 100);
+    assert_eq!(run(&m, 0, &[16448, 5]), 5);
+    assert_eq!(run(&m, 0, &[16640, 100]), 100);
 }
 
 #[test]
@@ -79,7 +79,7 @@ fn named_pointer_alias_type_derefs() {
     // through the aliased pointer. The window starts zeroed; write 42 via a helper store is awkward,
     // so instead point `n` at an offset we pre-seed by round-tripping through a sibling proc is
     // overkill — the zeroed window gives val == 0, and a distinct non-zero check follows.
-    assert_eq!(run(&m, 0, &[128]), 0);
+    assert_eq!(run(&m, 0, &[16512]), 0);
 }
 
 #[test]
@@ -95,8 +95,8 @@ fn named_pointer_alias_stores_through_field() {
    (asgn (dot (deref c.0) v.0 0) x.0)
    (ret (dot (deref c.0) v.0 0)))))";
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
-    assert_eq!(run(&m, 0, &[64, 42]), 42);
-    assert_eq!(run(&m, 0, &[256, -9]), -9);
+    assert_eq!(run(&m, 0, &[16448, 42]), 42);
+    assert_eq!(run(&m, 0, &[16640, -9]), -9);
 }
 
 #[test]

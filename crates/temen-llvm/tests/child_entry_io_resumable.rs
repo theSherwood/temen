@@ -126,29 +126,29 @@ fn child_entry_binds_imports_on_the_resumable_engine() {
     let sl = child.memory.expect("child window").size_log2;
 
     // The `"stdout"` name packed into one i64, and the grant record's first word
-    // (`name_off:u32=2048 | name_len:u32=6`). The parent lays the record, then op-13-spawns the child
-    // re-granting the `stdout` handle (arg `v2`) under that name.
+    // (`name_off:u32=18432 | name_len:u32=6`). The parent lays the record above the #1094 NULL guard,
+    // then op-13-spawns the child re-granting the `stdout` handle (arg `v2`) under that name.
     let name_i64: u64 = b"stdout"
         .iter()
         .enumerate()
         .fold(0u64, |acc, (i, &b)| acc | ((b as u64) << (8 * i)));
-    let word0: u64 = 2048 | (6u64 << 32);
+    let word0: u64 = 18432 | (6u64 << 32);
     let carve_off: u64 = 1u64 << sl;
     let parent_src = format!(
         r#"memory {psl}
 func (i32, i32, i32) -> (i64) {{
 block 0 (v0: i32, v1: i32, v2: i32) {{
   vname = i64.const {name_i64}
-  vnoff = i64.const 2048
+  vnoff = i64.const 18432
   i64.store vnoff vname
   vrec0 = i64.const {word0}
-  vrecoff = i64.const 1024
+  vrecoff = i64.const 17408
   i64.store vrecoff vrec0
   vsh = i64.extend_i32_u v2
-  vrec1off = i64.const 1032
+  vrec1off = i64.const 17416
   i64.store vrec1off vsh
   vmh = i64.extend_i32_u v1
-  vgptr = i64.const 1024
+  vgptr = i64.const 17408
   vgn = i64.const 1
   ventry = i64.const 0
   voff = i64.const {carve_off}

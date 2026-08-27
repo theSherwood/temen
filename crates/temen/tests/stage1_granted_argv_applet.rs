@@ -26,8 +26,8 @@ const WIN: usize = 128 << 10;
 const CARVE: u64 = 64 << 10;
 
 /// Parent (`(Instantiator, stdout)`) seeds `token` into the applet's carve, spawns the applet
-/// (func 1) via the record re-granting its stdout under `"g"` (name at 4096, grant record at 4104,
-/// spawn record at 4160), joins, and returns the applet's status. The applet
+/// (func 1) via the record re-granting its stdout under `"g"` (name at 20480, grant record at 20488,
+/// spawn record at 20544 — all above the #1094 NULL guard), joins, and returns the applet's status. The applet
 /// (`(Instantiator, AddressSpace)`) resolves `"g"` and writes its seeded 3-byte argv through it,
 /// returning the byte count.
 fn src(token: &[u8; 3]) -> String {
@@ -35,7 +35,7 @@ fn src(token: &[u8; 3]) -> String {
         .iter()
         .enumerate()
         .map(|(i, &b)| {
-            let addr = CARVE + i as u64;
+            let addr = CARVE + 16384 + i as u64;
             format!("  q{i} = i64.const {addr}\n  c{i} = i32.const {b}\n  i32.store8 q{i} c{i}\n")
         })
         .collect();
@@ -44,17 +44,17 @@ fn src(token: &[u8; 3]) -> String {
 func (i32, i32) -> (i64) {{
 block 0 (vinst: i32, vout: i32) {{
 {seed}  vg = i32.const 103
-  vnp1 = i64.const 4096
+  vnp1 = i64.const 20480
   i32.store8 vnp1 vg
-  vgr0 = i64.const 4104
-  vno = i32.const 4096
+  vgr0 = i64.const 20488
+  vno = i32.const 20480
   i32.store vgr0 vno
-  vgr1 = i64.const 4108
+  vgr1 = i64.const 20492
   vnl1 = i32.const 1
   i32.store vgr1 vnl1
-  vgr2 = i64.const 4112
+  vgr2 = i64.const 20496
   i32.store vgr2 vout
-  vgr3 = i64.const 4116
+  vgr3 = i64.const 20500
   vz32 = i32.const 0
   i32.store vgr3 vz32
   rrv0 = i64.const 4294967296
@@ -62,21 +62,21 @@ block 0 (vinst: i32, vout: i32) {{
   rrv2 = i64.const -4294967280
   rrv3 = i64.const 4294967295
   rrvz = i64.const 0
-  rrgp = i64.const 4104
+  rrgp = i64.const 20488
   rrgn = i64.const 1
-  rra0 = i64.const 4160
+  rra0 = i64.const 20544
   i64.store rra0 rrv0
-  rra1 = i64.const 4168
+  rra1 = i64.const 20552
   i64.store rra1 rrv1
-  rra2 = i64.const 4176
+  rra2 = i64.const 20560
   i64.store rra2 rrv2
-  rra3 = i64.const 4184
+  rra3 = i64.const 20568
   i64.store rra3 rrv3
-  rra4 = i64.const 4192
+  rra4 = i64.const 20576
   i64.store rra4 rrvz
-  rra5 = i64.const 4200
+  rra5 = i64.const 20584
   i64.store rra5 rrgp
-  rra6 = i64.const 4208
+  rra6 = i64.const 20592
   i64.store rra6 rrgn
   vch = call.cap 6 17 (i64) -> (i32) vinst (rra0)
   vres = call.cap 6 1 (i32) -> (i64) vinst (vch)
@@ -86,11 +86,11 @@ block 0 (vinst: i32, vout: i32) {{
 func (i64, i64) -> (i64) {{
 block 0 (vcinst: i64, vcas: i64) {{
   vg = i32.const 103
-  vnp = i64.const 512
+  vnp = i64.const 16896
   i32.store8 vnp vg
   vnl = i64.const 1
   vsh = self.resolve vnp vnl
-  vptr = i64.const 0
+  vptr = i64.const 16384
   vlen = i64.const 3
   vw = call.cap 0 1 (i64, i64) -> (i64) vsh (vptr, vlen)
   return vw
