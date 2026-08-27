@@ -774,6 +774,54 @@ fn c_a_personality_guest_blocks_on_a_capability_pipe_read() {
 /// returns `-EINTR` (sentinel 42). Nothing signal-specific lives in temen — the interrupt fires exactly when
 /// the personality hands over a delivery. The raiser *retries* (deterministic under the M:N executor): a
 /// `kill` before `main` parks is a no-op interrupt; `main` sets `done` once its read takes EINTR.
+/// #1157 — **a yield-free shared-memory spin makes progress on the cooperative driver.** `main`
+/// spawns a sibling that sets a flag and exits, then spins `while (!flag) {}` — reaching **no** park
+/// point (no syscall, no futex). Under real threads (parallel) or the preemptive tree-walker the
+/// sibling runs concurrently and `main` observes the store. The cooperative bytecode driver runs a
+/// task to park-or-completion, so without a preemption quantum `main` monopolizes the single thread
+/// and the sibling never runs → deadlock. With the #1157 op-count quantum (armed only while ≥2 tasks
+/// are runnable) `main` is preempted, the sibling runs, and the store becomes visible. The
+/// dual-driver differential now holds for this shape: all three engines return 7.
+const SPIN_FLAG_SRC: &str = r#"
+long __vm_atomic_add(void *p, long v);
+long __vm_atomic_load(void *p);
+int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);
+long __vm_thread_join(int h);
+long flag;
+long setter(long arg) {
+  __vm_atomic_add(&flag, 1);   /* set the flag, then exit — no wait, no park */
+  return 0;
+}
+int main(void) {
+  int h = __vm_thread_spawn(setter, (void *)0, 0);
+  while (__vm_atomic_load(&flag) == 0) { }   /* SPIN yield-free until the sibling's store lands */
+  __vm_thread_join(h);
+  return 7;
+}
+"#;
+
+#[test]
+fn c_yield_free_spin_makes_progress_on_the_cooperative_driver() {
+    let i = run_interp_only(SPIN_FLAG_SRC, |_| {});
+    assert_eq!(
+        i.result,
+        vec![Value::I32(7)],
+        "tree-walker (preemptive): the spin observed the store"
+    );
+    let p = run_bytecode_parallel_only(SPIN_FLAG_SRC, |_| {});
+    assert_eq!(
+        p.result,
+        vec![Value::I32(7)],
+        "parallel (real OS threads): the spin observed the store"
+    );
+    let c = run_bytecode_only(SPIN_FLAG_SRC, |_| {});
+    assert_eq!(
+        c.result,
+        vec![Value::I32(7)],
+        "coop bytecode: the #1157 preemption quantum let the sibling run so the spin observed the store"
+    );
+}
+
 const EINTR_CAUGHT_SRC: &str = r#"
 long __px_signal(int cap, long signum, long handler);
 long __px_kill(int cap, long pid, long sig);

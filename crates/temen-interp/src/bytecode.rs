@@ -3421,6 +3421,7 @@ impl<'p> Vcpu<'p> {
                 &mut ctx,
                 u64::MAX,
                 false, // single-vCPU `Vcpu::run`: no cooperative waker topology (I48 idle N/A)
+                false, // #1157: not preemptible (run-to-completion; budget is u64::MAX anyway)
             );
             match stop {
                 // §3.6 (I36 slice 2): live calls / svc.wait / child_offer need the cooperative
@@ -3444,7 +3445,9 @@ impl<'p> Vcpu<'p> {
                 | Ok(VcpuStop::PipeWrite { .. })
                 // I48: `BlockOnFiber` is a cooperative-driver idle (this path passes
                 // `cooperative: false`, so it never arises here); fail closed like its neighbours.
-                | Ok(VcpuStop::BlockOnFiber { .. }) => return VcpuEvent::Trapped(Trap::ThreadFault),
+                | Ok(VcpuStop::BlockOnFiber { .. })
+                // #1157: this path passes `preemptible: false`, so the quantum never yields here.
+                | Ok(VcpuStop::Preempted) => return VcpuEvent::Trapped(Trap::ThreadFault),
                 Err(t) => return VcpuEvent::Trapped(t),
                 Ok(VcpuStop::Done(vals)) => return VcpuEvent::Done(vals),
                 Ok(VcpuStop::TierUp {
@@ -8782,7 +8785,7 @@ fn freeze_drive(
             invoke_step_into: false,
         };
         match step_vcpu(
-            &mut sub, fibers, fiber_sp, fiber_meta, dom, ctx, budget, false,
+            &mut sub, fibers, fiber_sp, fiber_meta, dom, ctx, budget, false, false,
         )? {
             VcpuStop::Done(_) => {}
             _ => return Err(Trap::FiberFault), // a freeze unwind never spawns / instantiates / blocks
@@ -9110,6 +9113,12 @@ enum VcpuStop {
     PipeWrite {
         pipe: u32,
     },
+    /// #1157 — the cooperative preemption quantum expired at an op boundary. `resume` already persisted
+    /// the Vm cursor (its `Outcome::Suspended` path), so the pump re-admits the still-`Runnable` task and
+    /// round-robins the pick to a sibling. Produced only when `step_vcpu` is called with `preemptible`
+    /// true (the cooperative pump, and only while ≥2 tasks are runnable) — every other caller re-loops
+    /// on quantum exhaust, so its behavior is unchanged.
+    Preempted,
     Done(Vec<Value>),
     /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): run the emitted `f{func}` region on the
     /// host, delivering its `n_results` results to absolute slot `dst` via `deliver_tierup`.
@@ -9246,6 +9255,14 @@ struct RunCtx<'a> {
     durable: bool,
 }
 
+/// #1157 — the cooperative preemption quantum: the op count a runnable task may run before the pump
+/// round-robins to a sibling. Armed by [`CoopSched::pump`] **only while ≥2 tasks are runnable**, so a
+/// single-runnable run (bash and every non-threaded browser guest) is untouched. Coarse on purpose
+/// (~1M ops): fine enough to bound a yield-free spin to sub-second, coarse enough that the interleaving
+/// stays close to the old run-to-completion order (fewer differential surprises). Op-count, so the
+/// schedule stays deterministic.
+const COOP_QUANTUM: u64 = 1 << 20;
+
 /// Run one vCPU (its active `Vm` and any fibers it switches among) until it finishes or hits a
 /// multi-vCPU event. Fiber `Outcome`s are serviced here exactly as `run_inner`'s `cont.*` arms switch
 /// the active frame stack; `thread.*`/`memory.*` `Outcome`s are handed up to [`drive`]. `budget` only
@@ -9264,6 +9281,10 @@ fn step_vcpu(
     // take the advisory `FIBER_PARKED` poll instead — their idle is the follow-up slice (the same
     // OS-thread-block problem as the Cranelift JIT).
     cooperative: bool,
+    // #1157: when true, a `budget`-exhausted resume (the cooperative preemption quantum) yields to the
+    // pump as `VcpuStop::Preempted` instead of re-looping. Every caller but the cooperative pump passes
+    // `false` — the parallel driver and the single-step/debug harness keep the transparent re-loop.
+    preemptible: bool,
 ) -> Result<VcpuStop, Trap> {
     loop {
         match vt.active.resume(
@@ -9274,9 +9295,13 @@ fn step_vcpu(
             &mut ctx.host,
             budget,
         )? {
-            // Budget exhausted (sliced harness only): re-enter the same activation; its cursor is
-            // already persisted, so this is transparent.
-            Outcome::Suspended => {}
+            // Budget exhausted. Either the transparent sliced-harness re-loop (cursor already
+            // persisted), or — with `preemptible` — the #1157 quantum: yield to the pump to round-robin.
+            Outcome::Suspended => {
+                if preemptible {
+                    return Ok(VcpuStop::Preempted);
+                }
+            }
             Outcome::Done(vals) => match vt.chain.pop() {
                 // The vCPU's root activation finished.
                 None => return Ok(VcpuStop::Done(vals)),
@@ -10138,6 +10163,12 @@ impl CoopSched {
             // callbacks), never touched by the scheduler loop itself.
             invoke_fibers: _,
         } = self;
+        // #1157 — the round-robin pick cursor (the last task index run). Scanning from `last_pick + 1`
+        // (rather than always lowest-index) is what lets the preemption quantum actually rotate: a
+        // just-preempted task is re-admitted `Runnable`, and the next pick advances past it to a sibling
+        // instead of re-winning. Also subsumes #1115 (a re-woken low-index task can't starve a
+        // long-Runnable high-index one).
+        let mut last_pick: usize = 0;
         loop {
             // Domain lifetime & teardown (DESIGN.md §12 / ISSUES.md I37, owner 2026-07-24): a
             // member's trap/exit is terminal for its whole DOMAIN — run the teardown fixpoint
@@ -10320,9 +10351,11 @@ impl CoopSched {
                     }
                 }
             }
-            let Some(ti) = tasks
-                .iter()
-                .position(|t| matches!(t.state, TaskState::Runnable))
+            // #1157 — round-robin from `last_pick + 1` (wrapping) rather than lowest-index-first.
+            let n = tasks.len();
+            let Some(ti) = (1..=n)
+                .map(|k| (last_pick + k) % n)
+                .find(|&i| matches!(tasks[i].state, TaskState::Runnable))
             else {
                 // F2 (FIBER_PARK.md) — no runnable task with punt completions outstanding: that is
                 // pending work on the offload pool, never a deadlock and never a reason to jump the
@@ -10465,6 +10498,24 @@ impl CoopSched {
                 }
                 continue;
             };
+            last_pick = ti;
+            // #1157 — arm the preemption quantum ONLY when ≥2 tasks are runnable (genuinely concurrent).
+            // A single runnable task (the common case — bash, every non-threaded browser guest) keeps
+            // `budget = u64::MAX` / run-to-completion, so the hot path takes zero extra pump round-trips
+            // and its interleaving is unchanged. With a concurrent sibling, an op-count quantum bounds a
+            // yield-free spinner so the sibling gets the thread — deterministically (op-count, not
+            // wall-clock). `COOP_QUANTUM` is coarse (~1M ops) to keep interleaving close to the old
+            // run-to-completion order while still bounding a spin to sub-second.
+            let (quantum, preemptible) = if tasks
+                .iter()
+                .filter(|t| matches!(t.state, TaskState::Runnable))
+                .count()
+                >= 2
+            {
+                (COOP_QUANTUM, true)
+            } else {
+                (budget, false)
+            };
 
             // Select this vCPU's environment: the shared one (root + thread siblings), or its own
             // confined `instantiate` env. `tasks[ti].vt` and the chosen env borrow disjoint storage
@@ -10500,11 +10551,16 @@ impl CoopSched {
                 fiber_meta,
                 dom,
                 &mut ctx,
-                budget,
+                quantum,
                 true, // the cooperative scheduler: idle blocking `cont.resume.block` (I48)
+                preemptible, // #1157: yield at the op-count quantum when ≥2 tasks are runnable
             );
             match stop {
                 Err(trap) => complete(tasks, ti, Err(trap)),
+                // #1157 — the quantum expired: the task is still `Runnable` (its cursor persisted), so
+                // just loop. The round-robin `last_pick` advance picks a sibling next, giving it the
+                // thread; this task resumes on a later turn.
+                Ok(VcpuStop::Preempted) => {}
                 Ok(VcpuStop::Done(vals)) => complete(tasks, ti, Ok(vals)),
                 // #926 slice 2 — wasm-JIT tier-up: this module-0 task hit a direct call to an eligible
                 // function (its `Vm` carries the run's bitmap). `step_vcpu` has already spilled the frame
@@ -12759,6 +12815,7 @@ fn run_vcpu_parallel<'scope, 'env>(
             &mut ctx,
             u64::MAX,
             false, // OS-thread parallel driver: blocking `cont.resume.block` idle is a follow-up (I48)
+            false, // #1157: the OS preempts real threads — no in-engine quantum needed here
         );
         match stop {
             // §3.6 (I36 slice 2): the serve/call/offer trio runs only on the cooperative
@@ -12771,7 +12828,10 @@ fn run_vcpu_parallel<'scope, 'env>(
             | Ok(VcpuStop::ChildOffer { .. })
             | Ok(VcpuStop::CloneCaller { .. })
             | Ok(VcpuStop::Reap { .. })
-            | Ok(VcpuStop::BlockOnFiber { .. }) => return (Err(Trap::ThreadFault), mem),
+            | Ok(VcpuStop::BlockOnFiber { .. })
+            // #1157: this driver passes `preemptible: false` (the OS preempts real threads), so the
+            // in-engine quantum never yields here — fail closed if it somehow does.
+            | Ok(VcpuStop::Preempted) => return (Err(Trap::ThreadFault), mem),
             Err(trap) => return (Err(trap), mem),
             Ok(VcpuStop::Done(vals)) => return (Ok(vals), mem),
             // Tier-up is only enabled on the browser `Vcpu::run` path (`with_jit_eligible`).
