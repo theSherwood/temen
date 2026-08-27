@@ -586,16 +586,46 @@ mod pal {
 
     /// Set the protection of a committed range `[base, base+len)`.
     ///
+    /// Walks the range with `VirtualQuery` and protects each committed region's intersection
+    /// separately: unlike unix `mprotect`, `VirtualProtect` **cannot span distinct allocations**,
+    /// and a §13 region map splits the window reservation into several (committed-private
+    /// fragments + mapped section views). A single spanning call then fails wholesale — leaving
+    /// e.g. the #1094 NULL-guard pages `NOACCESS` after `restore_rw`, so the post-run snapshot's
+    /// raw window read AVs in host code (the windows `jit_diff` STATUS_ACCESS_VIOLATION).
+    /// Non-committed fragments (placeholders) are skipped — they can't be protected.
+    ///
     /// # Safety
-    /// `[base, base+len)` must be a committed sub-range of a window reservation.
+    /// `[base, base+len)` must lie within a window reservation.
     pub(super) unsafe fn protect(base: *mut u8, len: usize, prot: Prot) {
         let flags: PAGE_PROTECTION_FLAGS = match prot {
             Prot::Rw => PAGE_READWRITE,
             Prot::Ro => PAGE_READONLY,
             Prot::None => PAGE_NOACCESS,
         };
-        let mut old: PAGE_PROTECTION_FLAGS = 0;
-        VirtualProtect(base as *const c_void, len, flags, &mut old);
+        let end = base as usize + len;
+        let mut addr = base as usize;
+        while addr < end {
+            let mut mbi: MEMORY_BASIC_INFORMATION = core::mem::zeroed();
+            if VirtualQuery(
+                addr as *const c_void,
+                &mut mbi,
+                core::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            ) == 0
+            {
+                break;
+            }
+            let region_end = mbi.BaseAddress as usize + mbi.RegionSize;
+            let b = end.min(region_end);
+            if mbi.State == MEM_COMMIT && b > addr {
+                let mut old: PAGE_PROTECTION_FLAGS = 0;
+                VirtualProtect(addr as *const c_void, b - addr, flags, &mut old);
+            }
+            addr = if region_end > addr {
+                region_end
+            } else {
+                addr + page_size()
+            };
+        }
     }
 
     /// Release a whole reservation from [`reserve`] — **every fragment of it**. After [`commit_rw`]
