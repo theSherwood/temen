@@ -16,12 +16,22 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
-- **interactive bash card E2E (`ci.yml`, #1122)** — one line added to the `real-browser` job's
-  test block, right after `node browser-bash-test.mjs`: `node browser-bash-interactive-test.mjs`
-  (plus its comment). Drives the play page's new "bash -i" card in Chromium — a live interactive
-  session (session Worker + control Worker over the shared memory), a builtin and a fork+exec'd
-  coreutil typed at the prompt, `^D` exit. SKIPs with the batch bash test when the deploy-built
-  `bash.temen` is absent, so no new staging is needed.
+- **bash asset staging in `pages.yml` (the DEPLOY workflow, #1080/#1122 deploy fix)** — two steps
+  added to the `build` job, right after `build self-host closure image` and before the Postgres
+  cache step: a `cache bash build inputs` step (`actions/cache` on `/tmp/temen_bash_cache/bash_linked.ll`,
+  keyed on `crates/temen-run/demos/bash/**`) and a `build + stage bash artifacts` step
+  (`node build-bash-assets.mjs || echo "bash assets skipped …"`). `pages.yml` is the workflow that
+  actually publishes the site (scheduled every 30 min); it never built bash, so the published
+  playground shipped no `bash.temen`/`bin_*.temen` and the bash / `bash -i` cards 404'd — silently,
+  because those assets are in check-play-assets' `MAY_BE_ABSENT`. This mirrors what `ci.yml`'s
+  `real-browser` job already does, so whichever workflow publishes, the cards work. No new toolchain
+  (the job already installs llvm-18/clang-18 for the on-ramp assets); GPLv3-safe (fetched-and-built,
+  never committed). **Until copied over, the deployed bash cards stay 404.**
+  Same file, one more line: the change-gate's reachability curl points at the wrong project-site
+  path (`https://thesherwood.github.io/vm/DEPLOYED_SHA`) — the site serves at `…/temen/`, so the
+  gate always 404s → always thinks the site changed → rebuilds+republishes on every 30-min tick.
+  Fixed to `…/temen/DEPLOYED_SHA` so the gate correctly skips no-op rebuilds when the site is
+  already at HEAD.
 
 - **New `browser-jit-host-gates` job (the compiler-tier wasm-JIT host tests, #1011)** — the browser
   crate's Rust *host* tests (`nifler_jit`, `chibicc_jit`, `jit_module`) run a real compiler phase on

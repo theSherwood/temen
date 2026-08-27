@@ -55,7 +55,7 @@ jobs:
     steps:
       - id: check
         run: |
-          live=$(curl -fsS https://thesherwood.github.io/vm/DEPLOYED_SHA 2>/dev/null || echo none)
+          live=$(curl -fsS https://thesherwood.github.io/temen/DEPLOYED_SHA 2>/dev/null || echo none)
           echo "published=$live head=$GITHUB_SHA event=${{ github.event_name }}"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$live" != "$GITHUB_SHA" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -119,6 +119,25 @@ jobs:
       - name: build self-host closure image
         working-directory: browser
         run: node build-selfhost-assets.mjs || echo "self-host image skipped"
+
+      # The GNU bash card assets (#1080/#1122) — this is the DEPLOY workflow, so without this step the
+      # published site ships no bash.temen and the bash / `bash -i` cards 404 (`bash.temen` is in
+      # check-play-assets' MAY_BE_ABSENT, so a bash-less site still passes the reachability gate — it
+      # degrades silently). ci.yml's real-browser job already builds these for its own artifact; mirror
+      # it here so whichever workflow publishes, the cards work. Split like Postgres: the code-independent
+      # whole-program bitcode (bash_linked.ll) is cached (keyed on the bash demo sources); build-bash-
+      # assets.mjs regenerates bash.temen from it + copies the committed /bin coreutil fixtures. bash is
+      # GPLv3 — fetched-and-built at deploy, never committed. Fail-soft: an ftp.gnu.org/toolchain hiccup
+      # degrades the cards to a build hint (MAY_BE_ABSENT) rather than reding the deploy; the next run
+      # over the now-warm cache republishes with bash.
+      - name: cache bash build inputs
+        uses: actions/cache@v4
+        with:
+          path: /tmp/temen_bash_cache/bash_linked.ll
+          key: bash-inputs-v1-${{ hashFiles('crates/temen-run/demos/bash/**') }}
+      - name: build + stage bash artifacts
+        working-directory: browser
+        run: node build-bash-assets.mjs || echo "bash assets skipped (fetch/toolchain hiccup — the bash cards degrade to a build hint)"
 
       # PostgreSQL playground artifacts — regenerated from source so they never drift from the code.
       # The two CODE-INDEPENDENT inputs (whole-program bitcode + initdb'd cluster) are cached, keyed on
