@@ -24448,9 +24448,18 @@ impl Mem {
     /// Seed the low bytes of the window from `init` (escape-oracle, §18). Bytes past the
     /// window size are ignored — confinement only concerns `[0, size)`.
     fn seed(&mut self, init: &[u8]) {
-        let n = (init.len() as u64).min(self.window.mapped());
-        for i in 0..n {
-            self.set_byte(i, init[i as usize]);
+        let n = (init.len() as u64).min(self.window.mapped()) as usize;
+        // Bulk fast path: with no §13 region mapped, no page is `Backed`, so the whole prefix writes
+        // straight through to `back` — one `memcpy` (flat) or a single-lock page-wise copy (`Paged`),
+        // instead of a lock + `BTreeMap` entry PER BYTE. `fork_private` (the hot 2 MB seed) always
+        // hits this — it refuses a fork over any region. The per-byte arm stays for the (currently
+        // unused) region-mapped case, matching `set_byte`'s slow path exactly.
+        if !self.has_regions.load(Ordering::Relaxed) {
+            self.back.write_from(0, &init[..n]);
+        } else {
+            for (i, &b) in init[..n].iter().enumerate() {
+                self.set_byte(i as u64, b);
+            }
         }
     }
 
@@ -24463,7 +24472,16 @@ impl Mem {
     fn snapshot(&self, n: u64) -> Vec<u8> {
         let n = n.min(self.window.mapped());
         let base = self.window.base();
-        (0..n).map(|i| self.byte(base + i)).collect()
+        // Bulk fast path (mirror of `seed`): no §13 region ⇒ read the prefix straight from `back` in
+        // one pass (`memcpy` flat, single-lock page walk `Paged`) instead of a lock PER BYTE. The
+        // per-run window capture and `fork_private`'s `window_snapshot` both flow through here.
+        if !self.has_regions.load(Ordering::Relaxed) {
+            let mut out = vec![0u8; n as usize];
+            self.back.read_into(base, &mut out);
+            out
+        } else {
+            (0..n).map(|i| self.byte(base + i)).collect()
+        }
     }
 
     /// Whether the live memory state is **fully captured** by a [`window_snapshot`](Mem::window_snapshot)
