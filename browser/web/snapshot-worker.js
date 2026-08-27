@@ -164,9 +164,22 @@ self.onmessage = async (e) => {
       }
       const status = ex.temen_status();
       const value = Number(ex.temen_run_value());
+      // Return the framebuffer too (a `display`-cap guest like gradient presents one), so a streamed
+      // run stays feature-equivalent to the main-thread path — the page blits it from these bytes.
+      const fbw = Number(ex.temen_framebuffer_width());
+      const fbh = Number(ex.temen_framebuffer_height());
+      let fb = null;
+      if (fbw && fbh) {
+        const fp = Number(ex.temen_framebuffer_ptr());
+        const fl = Number(ex.temen_framebuffer_len());
+        fb = { w: fbw, h: fbh, rgba: u8().slice(fp, fp + fl) };
+      }
       ex.temen_dealloc(mp, mod.length);
       if (sp) ex.temen_dealloc(sp, stdin.length);
-      self.postMessage({ type: 'reply', id: msg.id, ok: true, status, value, stdout: readStdout(), stderr: readStderr() });
+      self.postMessage(
+        { type: 'reply', id: msg.id, ok: true, status, value, stdout: readStdout(), stderr: readStderr(), fb },
+        fb ? [fb.rgba.buffer] : [],
+      );
       return;
     }
     if (msg.type === 'nimAssets') {

@@ -840,7 +840,6 @@ int main(void) {
     kind: 'module',
     url: './assets/nim_hello.temen',
     mode: 'io',
-    stream: true, // stdout streams live off the main thread (temen_run_onramp_stream)
     desc: "A **real Nim program** — `import std/syncio` / `write(stdout, \"hello, temen\\n\")` — compiled " +
       "all the way to a runnable Temen module and **run client-side in the sandbox**. The full nimony " +
       "toolchain (nifler → nimony → hexer) lowered the Nim to Leng, `temen-leng` translated + linked it " +
@@ -1523,14 +1522,20 @@ async function fetchTimed(rec, c, url) {
 // Uint8ClampedArray (putImageData rejects a SharedArrayBuffer-backed view, and a later alloc could
 // detach the buffer). The canvas' intrinsic size is the frame's; CSS scales it up (pixelated).
 function presentFrame(c, w, h) {
-  const canvas = c.el.canvas;
-  if (!w || !h) { canvas.hidden = true; return; }
+  if (!w || !h) { c.el.canvas.hidden = true; return; }
   const sp = eng.ex.temen_framebuffer_ptr();
   const sl = eng.ex.temen_framebuffer_len();
-  const rgba = new Uint8ClampedArray(new Uint8Array(eng.memory.buffer).slice(sp, sp + sl));
+  presentFrameData(c, w, h, new Uint8Array(eng.memory.buffer).slice(sp, sp + sl));
+}
+
+// Blit a frame from RGBA bytes the caller already holds (e.g. returned by the streaming worker, whose
+// framebuffer lives in ITS memory, not `eng`'s). w/h of 0 ⇒ no frame: hide the canvas.
+function presentFrameData(c, w, h, rgba) {
+  const canvas = c.el.canvas;
+  if (!w || !h) { canvas.hidden = true; return; }
   canvas.width = w;
   canvas.height = h;
-  canvas.getContext('2d').putImageData(new ImageData(rgba, w, h), 0, 0);
+  canvas.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(rgba), w, h), 0, 0);
   canvas.hidden = false;
 }
 
@@ -1820,7 +1825,10 @@ async function runModule(c) {
   c.el.stdout.textContent = '';
   c.el.canvas.hidden = true;
   const useJit = !!(ex.jit && c.el.jit && c.el.jit.checked);
-  const rec = runStart(c, { tier: useJit ? 'wasm-JIT' : 'interpreter' });
+  // The interpreter tier streams off the main thread by default (a worker + `runStream`); name that as
+  // the expected tier so a real fall-through to the synchronous path reads as the fallback, not this.
+  const interpTier = !ex.warm && snapshotClient ? 'interpreter (streamed)' : 'interpreter';
+  const rec = runStart(c, { tier: useJit ? 'wasm-JIT' : interpTier });
   let bytes;
   try {
     bytes = await fetchTimed(rec, c, ex.url);
@@ -1915,10 +1923,11 @@ async function runModule(c) {
       rv = r.rv; status = r.status; stdout = r.stdout;
     }
   }
-  // Streamed interpreter run (opt-in `stream` cards, e.g. the nim/C stdout guests): run off the main
-  // thread and paint each stdout chunk as the guest writes it, instead of one dump at the end. Falls
-  // back to the synchronous main-thread `moduleInterp` if the worker is unavailable.
-  if (status === undefined && ex.stream && snapshotClient && !useJit) {
+  // The interpreter tier streams **by default**: run off the main thread and paint each stdout chunk as
+  // the guest writes it, instead of one dump at the end. A `display`-cap guest's frame comes back too, so
+  // this is feature-equivalent to the main-thread path. Falls back to the synchronous `moduleInterp` when
+  // there's no worker (e.g. the page lacks cross-origin isolation).
+  if (status === undefined && snapshotClient && !useJit) {
     try {
       c.el.stdout.textContent = '';
       const dec = new TextDecoder();
@@ -1927,6 +1936,7 @@ async function runModule(c) {
       });
       if (r.ok) {
         rv = r.value; status = r.status; stdout = r.stdout; tier = 'interpreter (streamed)';
+        if (r.fb) presentFrameData(c, r.fb.w, r.fb.h, r.fb.rgba);
       } else {
         logTo(c, `stream worker: ${r.error}; falling back to the main thread`);
       }
