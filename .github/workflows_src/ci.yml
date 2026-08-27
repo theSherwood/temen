@@ -709,6 +709,47 @@ jobs:
         working-directory: browser
         run: cargo test --test nifler_jit --test chibicc_jit --test jit_module -- --test-threads=1 --nocapture
 
+  browser-host-guests:
+    # The browser crate is its OWN cargo workspace, so the gating `check` job's
+    # `cargo test --workspace` never builds or runs it. Its Rust host tests were
+    # therefore exercised only by the nightly full run and by dev machines — no
+    # per-PR check ran them. That gap let #1094's unconditional NULL guard land on
+    # `main` silently breaking a batch of hand-written-guest tests (fork, mem_profile,
+    # onramp_posix, powerbox_cap_names, warm_grow, and the tier-up drivers): a
+    # runtime-invariant change that no gating check caught. This job closes the gap.
+    # It runs the browser host-side tests whose guest modules are written *inline* in
+    # the test (no staged toolchain / built asset), so a powerbox / NULL-guard /
+    # tier-up invariant change fails a PR here instead of surfacing in nightly. The
+    # heavy self-host / asset / real-guest tests (chibicc*, jacl, bash, doom, the
+    # reactor cards) stay in `browser-real` + the nightly full run — they need staged
+    # assets and are slow. When you add a new inline-guest host test, add it here too.
+    name: browser host guests (runtime-invariant gate)
+    runs-on: ubuntu-latest
+    # Backstop against a liveness hang (mirrors the `check` job): the invariant set
+    # runs in seconds warm; a wedged run fails fast instead of eating the 6 h default.
+    timeout-minutes: 20
+    env:
+      # Drop test-profile debug info: the browser test binaries pull the large
+      # Cranelift/Wasmtime rlibs, and several linking at once can OOM a 16 GB runner
+      # (the `check` job caps this the same way — ISSUES.md I30).
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}" }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with: { workspaces: browser }
+      - name: browser inline-guest host tests (powerbox / NULL-guard / tier-up invariants)
+        working-directory: browser
+        # -j 2 caps concurrent test-binary links (the OOM peak — ISSUES.md I30).
+        run: |
+          cargo test -j 2 \
+            --test coop_tierup_driver --test par_tierup_driver \
+            --test fork --test warm_grow --test mem_profile \
+            --test onramp --test onramp_posix --test powerbox_cap_names \
+            --test emit_budget --test dap_batch --test link_run \
+            --test setjmp --test pg_snapshot_roundtrip
+
   wasm64-differential:
     name: wasm64 differential (Wasmtime embedding)
     runs-on: ubuntu-latest

@@ -16,6 +16,23 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **New `browser-host-guests` job in `ci.yml` (browser runtime-invariant gate, #816/#1094 follow-up)** —
+  a per-PR job added right after `browser-jit-host-gates`. The browser crate is its own cargo
+  workspace, so the gating `check` job's `cargo test --workspace` never builds or runs it; its Rust
+  host tests were exercised only by the nightly full run and dev machines. That gap let #1094's
+  unconditional NULL guard land on `main` silently breaking a batch of hand-written-guest tests
+  (`fork`, `mem_profile`, `onramp_posix`, `powerbox_cap_names`, `warm_grow`, and the tier-up drivers)
+  with no per-PR check to catch it. The new job runs the browser host tests whose guest modules are
+  written *inline* (no staged toolchain / built asset) — `coop_tierup_driver`, `par_tierup_driver`,
+  `fork`, `warm_grow`, `mem_profile`, `onramp`, `onramp_posix`, `powerbox_cap_names`, `emit_budget`,
+  `dap_batch`, `link_run`, `setjmp`, `pg_snapshot_roundtrip` — so a powerbox / NULL-guard / tier-up
+  invariant change fails a PR here. The heavy self-host/asset/real-guest tests (chibicc\*, jacl, bash,
+  doom, reactor cards) stay in `browser-real` + the nightly full run; they need staged assets and are
+  slow (the whole browser suite is ~6 min warm vs. seconds for this set). **Until copied over, the
+  `workflows_src == workflows` check stays red and browser host tests are not gated per-PR.** After
+  copy-over, consider adding `browser host guests (runtime-invariant gate)` to the branch-protection
+  required-checks set so it actually blocks merges.
+
 - **bash asset staging in `pages.yml` (the DEPLOY workflow, #1080/#1122 deploy fix)** — two steps
   added to the `build` job, right after `build self-host closure image` and before the Postgres
   cache step: a `cache bash build inputs` step (`actions/cache` on `/tmp/temen_bash_cache/bash_linked.ll`,
