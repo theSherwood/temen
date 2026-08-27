@@ -402,7 +402,9 @@ pub fn compile_nim(
 
     let m = temen_leng::link_nim_powerbox(&units).map_err(|e| format!("nim→powerbox link: {e}"))?;
     temen_verify::verify_module(&m).map_err(|e| format!("verify: {e:?}"))?;
-    let out = crate::onramp_exec(&m, &[]);
+    // Stream the compiled program's stdout live (#1143): the tee fires the `stdout_chunk` host import,
+    // relayed to the page only while a streaming Run is active (a no-op otherwise).
+    let out = crate::onramp_exec_with_tee(&m, &[], crate::stream_tee());
     if out.status != crate::STATUS_OK && out.status != crate::STATUS_EXIT {
         return Err(format!("run failed (status {})", out.status));
     }

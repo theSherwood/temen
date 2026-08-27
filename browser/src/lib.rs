@@ -5203,7 +5203,7 @@ impl JitOnrampRun {
         // Build the powerbox + the window-prefix seed (`init_mem`, the argv blob for the `Fs` path)
         // from the input shape. `frame` is only ever populated by a `display.present` — kept for
         // struct parity; a compiler/compute guest never presents.
-        let (host, init_mem, frame, fs_readback): (Host, Vec<u8>, _, _) = match input {
+        let (mut host, init_mem, frame, fs_readback): (Host, Vec<u8>, _, _) = match input {
             RunInput::Stdin(stdin) => {
                 let mut host = Host::new();
                 host.stdin = stdin;
@@ -5231,6 +5231,11 @@ impl JitOnrampRun {
                 (host, init_mem, frame, fs_readback)
             }
         };
+        // Live-stream stdout from the emitted `_start`'s cross-tier `write` bounces (#1141) — a no-op
+        // unless the page has a streaming sink active.
+        if let Some(t) = stream_tee() {
+            host.set_stdout_tee(t);
+        }
         // Materialize the window before the emitted `_start` runs (the interpreter does this at
         // instantiation; the emitted `_start` seeds only the heap + stashes handles): first the argv
         // prefix (`init_mem`, empty for stdin), then `.data`/`.rodata`. Data segments start at the
@@ -5363,6 +5368,11 @@ impl JitOnrampRun {
     fn reset_warm(&mut self, stdin: Vec<u8>) {
         let mut host = Host::new();
         host.stdin = stdin;
+        // Live-stream stdout from the warm+JIT eval's cross-tier `write` bounces (#1142) — same tee as
+        // the interpreter warm path; a no-op unless the page has a streaming sink active.
+        if let Some(t) = stream_tee() {
+            host.set_stdout_tee(t);
+        }
         let (frame, _keys) = grant_onramp_caps(&mut host, &self.module, None);
         self.host = host;
         self.frame = frame;
@@ -6015,6 +6025,12 @@ pub extern "C" fn temen_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64
     }
     let mut host = Host::new();
     host.stdin = stdin.to_vec();
+    // Live-stream stdout as the eval writes it (#1142). The tee fires the `stdout_chunk` host import,
+    // which the page relays only while a streaming Run is active — a no-op otherwise, so the batch
+    // warm path is unaffected.
+    if let Some(t) = stream_tee() {
+        host.set_stdout_tee(t);
+    }
     let _ = grant_onramp_caps(&mut host, &s.module, None);
     let mut fuel = u64::MAX;
     // Re-establish the warmup image's page-state entries (no zeroing — the memcpy above restored
