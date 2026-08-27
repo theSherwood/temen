@@ -140,7 +140,15 @@ self.onmessage = async (e) => {
       // wasm-JIT Run waits for the JIT pre-compile; a warm-interp Run waits for the dry interp pre-run.
       if (msg.jit) { if (jitPrimePromise) { try { await jitPrimePromise; } catch { /* prime failed → runWarmJit falls back */ } } }
       else if (interpWarmPromise) { try { await interpWarmPromise; } catch { /* dry eval failed → just run */ } }
-      const r = await evalWarm(msg.source, msg.jit);
+      // Live-stream the eval's stdout to the page (#1142): the tee on the warm host (both tiers) fires
+      // `stdout_chunk`, relayed here for the duration of the eval.
+      chunkSink = (bytes) => self.postMessage({ type: 'stdout-chunk', id: msg.id, bytes }, [bytes.buffer]);
+      let r;
+      try {
+        r = await evalWarm(msg.source, msg.jit);
+      } finally {
+        chunkSink = null;
+      }
       self.postMessage({ type: 'reply', id: msg.id, ok: true, ...r });
       return;
     }
@@ -215,9 +223,16 @@ self.onmessage = async (e) => {
       view.set(stdlib, ip);
       view.set(src, sp);
       view.set(main, mp);
-      ex.temen_compile_nim_fs(
-        np, nifler.length, smp, nimsem.length, hp, hexer.length,
-        ip, stdlib.length, sp, src.length, mp, main.length);
+      // Live-stream the compiled program's stdout to the page (#1143): the tee on the final `_start`
+      // run fires `stdout_chunk`, relayed here for the duration of the compile+run.
+      chunkSink = (bytes) => self.postMessage({ type: 'stdout-chunk', id: msg.id, bytes }, [bytes.buffer]);
+      try {
+        ex.temen_compile_nim_fs(
+          np, nifler.length, smp, nimsem.length, hp, hexer.length,
+          ip, stdlib.length, sp, src.length, mp, main.length);
+      } finally {
+        chunkSink = null;
+      }
       const status = ex.temen_status();
       ex.temen_dealloc(np, nifler.length);
       ex.temen_dealloc(smp, nimsem.length);

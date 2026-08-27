@@ -2005,7 +2005,11 @@ async function runModule(c) {
     try {
       const source = ex.editable ? c.editor.getValue() : '';
       if (!snapshotClient.isWarming(ex.url)) setState(c, 'running', 'warming up runtime (first Run)…');
-      const r = await snapshotClient.evalWarm(ex.url, () => Promise.resolve(bytes), source, useJit);
+      // Live-stream the eval's stdout to the pane as it runs (#1142); the final `stdout` still overwrites.
+      c.el.stdout.textContent = '';
+      const wdec = new TextDecoder();
+      const r = await snapshotClient.evalWarm(ex.url, () => Promise.resolve(bytes), source, useJit,
+        (chunk) => { c.el.stdout.textContent += wdec.decode(chunk, { stream: true }); });
       if (r.ok) {
         rv = r.value; status = r.status; stdout = r.stdout; tier = r.tier;
         // Observability hook (harmless): lets the browser test confirm the run actually went through the
@@ -2456,7 +2460,11 @@ async function runNimc(c) {
       // worker, never the page. A fresh Run first `cancelNim`s any still-running one (terminates the
       // stuck worker), so the card is never wedged by a previous hang.
       snapshotClient.cancelNim();
-      const r = await snapshotClient.nimCompile(getAssets, source, main);
+      // Live-stream the compiled program's stdout as its `_start` runs (#1143) — after the phases finish,
+      // a chatty program prints progressively instead of all at once. The final banner+stdout overwrites.
+      const ndec = new TextDecoder();
+      const r = await snapshotClient.nimCompile(getAssets, source, main,
+        (chunk) => { c.el.stdout.textContent += ndec.decode(chunk, { stream: true }); });
       if (!r.ok) throw new Error(r.error || 'nim worker unavailable');
       ({ status } = r);
       out = r.stdout;

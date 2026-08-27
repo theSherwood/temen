@@ -211,6 +211,16 @@ try {
   checks.push(nimStreamed);
   console.log(`  play/nim-streamed: status=${JSON.stringify(nim.status)} ${nimStreamed ? 'PASS' : 'FAIL'}`);
 
+  // A **warm-snapshot** card (Lua): the eval runs on its snapshot worker over the restored warm image,
+  // and now streams stdout live to the pane as it writes (#1142). Type a `print`, Run, and require the
+  // output lands. Exercises the warm-eval stdout tee + the worker chunk relay end-to-end.
+  await play.evaluate((s) => document.querySelector(`${s} .CodeMirror`).CodeMirror.setValue('print("hi from lua")'),
+    card('Lua (5.4.7 — write & run)'));
+  const lua = await runPlay('Lua (5.4.7 — write & run)');
+  const luaOk = lua.state === 'done' && lua.stdout.includes('hi from lua');
+  checks.push(luaOk);
+  console.log(`  play/lua-warm-stream: state=${lua.state} stdout=${JSON.stringify(lua.stdout)} ${luaOk ? 'PASS' : 'FAIL'}`);
+
   // The framebuffer output path (the `display` capability): the gradient guest presents a 128×128
   // RGBA frame, which play.js blits to the canvas. Assert the canvas got the right dimensions and a
   // pixel matching the guest's analytic gradient — R ramps across X, G down Y (top-left ≈ black).
