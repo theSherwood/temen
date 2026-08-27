@@ -4972,18 +4972,18 @@ pub struct JitOnrampRun {
     fs_readback: Option<(temen_fs::MemFsHandle, String)>,
     /// #1153 — **growth state** carried across cross-tier bounces so the emitted `_start` can `vm_map`-grow
     /// the live window instead of pre-sizing a fixed one (invariant 14, runtime-backend parity with the
-    /// coop tier). `reserved_log2` clamps each bounce's `Mem` reservation to the owned backing (an
-    /// over-grow fails `-EINVAL`, never a silent write-drop past the backing). `prots` is the committed
-    /// page map, re-seeded into (and re-captured from) the fresh per-bounce `Mem` so `vm_map`-committed
-    /// pages survive between bounces; `None` once a bounce aliased a §13 `SharedRegion` page (a byte
-    /// restore can't reproduce it — the run fails closed, the provisional durability exception). `mapped`
-    /// is the live committed scalar extent — read by [`temen_onramp_jit_run_mapped`] so the JS driver
-    /// re-syncs the emitted tier's `"mapped"` global after each bounce (the `driveCoopTierupRun` pattern).
+    /// coop tier). `prots` is the committed page map, re-seeded into (and re-captured from) the fresh
+    /// per-bounce `Mem` so `vm_map`-committed pages survive between bounces; `None` once a bounce aliased a
+    /// §13 `SharedRegion` page (a byte restore can't reproduce it — the run fails closed, the provisional
+    /// durability exception). `mapped` is the live committed scalar extent — read by
+    /// [`temen_onramp_jit_run_mapped`] so the JS driver re-syncs the emitted tier's `"mapped"` global after
+    /// each bounce (the `driveCoopTierupRun` pattern). Each bounce reserves `DEFAULT_RESERVED_LOG2`, exactly
+    /// as the interpreter oracle does, so a `vm_map` that lands past the window yields the same result the
+    /// oracle gives and the emitted access then declines (see [`run_cross_tier`](Self::run_cross_tier)).
     /// `grow` gates all of this: the single-shot on-ramp path sets it (no pre-size, real growth); the
     /// warm+JIT path leaves it `false` and keeps its pre-sized `run_over` bounce byte-for-byte, so this
     /// slice touches only the single-shot tier.
     grow: bool,
-    reserved_log2: u8,
     prots: Option<Vec<(u64, u8)>>,
     mapped: u64,
 }
@@ -5252,6 +5252,10 @@ impl JitOnrampRun {
         input: RunInput,
         cached: Option<CachedEmit>,
     ) -> Result<JitOnrampRun, i32> {
+        // The window backing must be exactly `1 << win_log2` bytes — the emitter masks every access to
+        // that domain, so a shorter backing would let a masked access read past it. Every caller sizes
+        // `back`/`win_size` this way; assert the contract rather than silently trusting it.
+        debug_assert_eq!(win_size, 1u64 << win_log2, "window backing must equal 1 << win_log2");
         // The emit (outline → interp program → `compile_jit`) is what a re-Run reuses via `cached`
         // (#1011 slice 1): a nifler emit is ~2 s and its `Module` clone another ~2 s, so a cache hand
         // here turns a re-Run into build-window + drive. On a miss we emit fresh and return the products
@@ -5267,8 +5271,8 @@ impl JitOnrampRun {
                 // (`temen-wasm-jit` `MAPPED_GLOBAL_IDX`), so growth is already emittable. `run_cross_tier`
                 // persists the grown page state across bounces and surfaces the new extent for the JS
                 // `"mapped"` re-sync — parity with the coop tier (invariant 14). The declared window stays
-                // the guest's own, so `mapped` starts small and grows into the owned backing (clamped by
-                // `reserved_log2`, so an over-grow fails `-EINVAL` rather than vanishing past the backing).
+                // the guest's own, so `mapped` starts small and grows; a `vm_map` past the window gets the
+                // same result the interpreter oracle gives, and the emitted access to it then declines.
                 // Compile once — reused for every cross-tier bounce (and shared across Runs via the cache).
                 let program = std::sync::Arc::new(
                     bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?,
@@ -5370,7 +5374,6 @@ impl JitOnrampRun {
             trapped: false,
             fs_readback,
             grow: true, // #1153 single-shot on-ramp: real `vm_map` growth (no pre-size)
-            reserved_log2: win_log2, // clamps each bounce's `Mem` reservation to the owned backing
             prots: Some(Vec::new()),
             mapped: declared_extent,
         })
@@ -5463,7 +5466,6 @@ impl JitOnrampRun {
             // Warm+JIT keeps its pre-sized window and the prior `run_over` bounce (`grow: false`), so the
             // growth fields are inert here; initialized for struct parity (#1153 touches only single-shot).
             grow: false,
-            reserved_log2: win_log2,
             prots: Some(Vec::new()),
             mapped: 1u64 << win_log2,
         })
@@ -5522,12 +5524,19 @@ impl JitOnrampRun {
         let mut fuel = u64::MAX;
         let r = if self.grow {
             // #1153 single-shot on-ramp: run the bounce over the PERSISTED page map (so a prior `vm_map`
-            // grow's committed pages survive the fresh-`Mem`-per-bounce shape), clamped to the owned
-            // backing, and re-capture the grown map + new committed extent — so the next bounce sees the
-            // growth and the JS driver can re-sync the emitted `"mapped"` global. A `None` page map = a
-            // §13 `Backed` alias appeared, unrestorable by a byte map ⇒ fail the run closed (the emitted
-            // `_start` unwinds; the caller declines to the interpreter, which handles §13 — invariant 9).
-            // On-ramp guests are not granted a `SharedRegion`, so this is defensive.
+            // grow's committed pages survive the fresh-`Mem`-per-bounce shape), and re-capture the grown
+            // map + new committed extent — so the next bounce sees the growth and the JS driver can
+            // re-sync the emitted `"mapped"` global. The reservation is `DEFAULT_RESERVED_LOG2`, exactly
+            // as the interpreter oracle ([`onramp_fs_exec`]) uses — NOT clamped to the window. A guest
+            // whose `malloc` `vm_map`s at a high address (chibicc's compiled programs place their heap at
+            // 256 MiB) must get the SAME `vm_map` result the oracle gives: the map succeeds, the emitted
+            // access to that page then faults (wasm out-of-bounds past the linear-memory window), and the
+            // JS driver declines to the interpreter (invariant 9 — trap, don't run wrong). Clamping the
+            // reservation to the window instead made the `vm_map` fail `-EINVAL`, so `malloc` returned
+            // null and the run completed with WRONG output (a silent divergence) rather than declining.
+            // A `None` page map = a §13 `Backed` alias appeared, unrestorable by a byte map ⇒ fail the run
+            // closed (the caller declines to the interpreter, which handles §13). On-ramp guests are not
+            // granted a `SharedRegion`, so this is defensive.
             let (r, pages, mapped) = self.program.run_over_grown(
                 func,
                 args,
@@ -5535,7 +5544,7 @@ impl JitOnrampRun {
                 self.back.clone(),
                 &mut self.host,
                 false,
-                self.reserved_log2,
+                temen_ir::DEFAULT_RESERVED_LOG2,
                 self.prots.as_deref(),
             );
             match pages {
