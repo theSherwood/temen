@@ -3037,6 +3037,15 @@ pub fn bash_exec_with(
     bash_run_over_compiled(m, compiled, argv, stdin, bins)
 }
 
+/// #1145 — the **mask domain** (`1 << N` bytes) a browser bash window runs in. `bash.temen` declares a
+/// 2 MiB window and grows its heap only a little past it (observed ~2.06 MiB), and coreutil twins are
+/// smaller — so a bounded reservation, unlike the 1 TiB [`temen_ir::DEFAULT_RESERVED_LOG2`], lets the
+/// engine back the window with a **flat `Owned` buffer** (lock-free) instead of the per-access-locked
+/// `Paged` fallback wasm otherwise forces (no `mmap`). 32 MiB is generous headroom for a playground
+/// shell while keeping the eager allocation cheap; a guest that outgrows it faults (fail-closed), the
+/// same as any out-of-memory. Confinement is unaffected — a smaller mask domain is strictly tighter.
+const BASH_RESERVED_LOG2: u8 = 25;
+
 /// #1144 — the run + outcome mapping of [`bash_exec_with`] over an **already-compiled** (cached)
 /// program: build the personality host (grant + argv seed), run the reserved-window entry over the
 /// shared `Arc<Compiled>`, and map to a [`PbOutcome`]. Shared by the uncached `bash_exec_with` and
@@ -3067,7 +3076,7 @@ fn bash_run_over_compiled(
         &[],
         &mut fuel,
         &init_mem,
-        temen_ir::DEFAULT_RESERVED_LOG2,
+        BASH_RESERVED_LOG2,
         &mut host,
     ) {
         None => (STATUS_UNSUPPORTED, 0, 0),
@@ -6784,7 +6793,7 @@ pub extern "C" fn temen_bash_session(
         &[],
         &mut fuel,
         &init_mem,
-        temen_ir::DEFAULT_RESERVED_LOG2,
+        BASH_RESERVED_LOG2,
         &mut host,
     ) {
         None => -1,
