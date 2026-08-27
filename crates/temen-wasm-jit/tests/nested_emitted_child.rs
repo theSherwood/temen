@@ -24,8 +24,10 @@
 //! non-vacuity guards (the handler really emitted + ran the child, not a silent interpreter fallback).
 
 use temen_interp::{run, Value};
-use temen_wasm_jit::compile_module_nested;
-use wasmi::{Caller, Engine, Func, Linker, Memory, MemoryType, Module as WModule, Store, Val};
+use temen_wasm_jit::{check_child_carve, compile_module_nested};
+use wasmi::{
+    Caller, Engine, Func, Global, Linker, Memory, MemoryType, Module as WModule, Store, Val,
+};
 
 const WIN_BASE: i32 = 0x1_0000; // parent window base (the env cell lives below it)
 const ENV_PTR: i32 = 1024; // parent dispatcher-fuel cell
@@ -108,33 +110,73 @@ fn oracle_child(child: &temen_ir::Module) -> i64 {
     }
 }
 
-/// Host state threaded through the wasmi `Store`: the pre-instantiated child's emitted entry `f0`, each
-/// spawned child's result (indexed by the handle `env.instantiate` returns), and the non-vacuity flag.
+/// Host state threaded through the wasmi `Store`: the pre-instantiated child's emitted entry `f0`, its
+/// exported live `"mapped"` global (routed to the carve size per spawn — #1123 slice 2), the child
+/// module + parent window geometry the confinement gate needs, each spawned child's result (indexed by
+/// the handle `env.instantiate` returns), the non-vacuity flags, and whether the gate refused a carve.
 struct HostState {
     child_entry: Option<Func>,
+    child_mapped: Option<Global>,
+    child: Option<temen_ir::Module>,
+    win_mapped: u64,
     children: Vec<i64>,
     saw_emit: bool,
     saw_module: bool,
+    carve_rejected: bool,
 }
 
-/// Emit-and-run the pre-built child instance's entry over the carve `[win+off, ...)`, bank its result
-/// under a dense handle, and return that handle. Shared by the op-0 (`env.instantiate`) and op-13
-/// (`env.instantiate_module`) bounce servicers — both spawn the confined child on emitted wasm.
-fn spawn_emitted_child(caller: &mut Caller<'_, HostState>, win: i32, off: i64) -> i32 {
-    let child_entry = caller.data().child_entry.expect("child instance pre-built");
+/// Emit-and-run the pre-built child instance's entry over the carve `[win+off, win+off + 1<<slog)`, bank
+/// its result under a dense handle, and return that handle. Shared by the op-0 (`env.instantiate`) and
+/// op-13 (`env.instantiate_module`) bounce servicers — both spawn the confined child on emitted wasm.
+///
+/// #1123 slice 2 — the two confinement-critical steps a real servicer must do, mirroring native
+/// `instantiate_module_named` (`temen-jit/src/instantiator_rt.rs`):
+///  1. **Gate** the carve through [`check_child_carve`] (fail-closed): a carve that under-sizes the
+///     child, is misaligned, escapes the parent window, or dips into the NULL guard is refused — the
+///     child never runs and the servicer returns the `-1` error handle.
+///  2. **Route** the child's live `"mapped"` global to the carve size, so the child is confined to
+///     *this* carve (not its declared memory) and may use its whole carve — matching the interpreter
+///     confined child (`mapped == carve`). A child trap propagates out as a host error (`?`).
+fn spawn_emitted_child(
+    caller: &mut Caller<'_, HostState>,
+    win: i32,
+    off: i64,
+    slog: i64,
+) -> Result<i32, wasmi::Error> {
+    let st = caller.data();
+    let child = st.child.as_ref().expect("child module recorded");
+    let guard = temen_ir::module_null_guard(child).unwrap_or(0);
+    let gate = check_child_carve(
+        child,
+        off as u64,
+        slog as u32,
+        st.win_mapped,
+        win as u64,
+        guard,
+    );
+    if gate.is_err() {
+        // Fail-closed: refuse the spawn. No child runs; a `-1` handle propagates to `join`, which maps
+        // it to a sentinel. The parent observes the failure without the run trapping.
+        caller.data_mut().carve_rejected = true;
+        return Ok(-1);
+    }
+    let child_entry = st.child_entry.expect("child instance pre-built");
+    let mapped = st.child_mapped.expect("child mapped global exported");
+    // Per-event window routing: this carve is the child's confinement bound for this spawn.
+    mapped.set(&mut *caller, Val::I64(1i64 << slog))?;
     let carve = win + off as i32;
     let mut r = [Val::I64(0)];
-    child_entry
-        .call(
-            &mut *caller,
-            &[Val::I32(carve), Val::I32(CHILD_ENV_PTR)],
-            &mut r,
-        )
-        .expect("emitted child runs");
+    // Propagate a child trap (e.g. an out-of-carve access) out as a host error, so it surfaces at the
+    // parent's `f0` call — the escape-through-the-bounce confinement path.
+    child_entry.call(
+        &mut *caller,
+        &[Val::I32(carve), Val::I32(CHILD_ENV_PTR)],
+        &mut r,
+    )?;
     let res = r[0].i64().expect("child returns i64");
     let st = caller.data_mut();
     st.children.push(res);
-    (st.children.len() - 1) as i32
+    Ok((st.children.len() - 1) as i32)
 }
 
 /// Define the eight §14 nested imports on `linker`, sharing `memory`. `instantiate` emits + runs the
@@ -165,11 +207,11 @@ fn wire_nested_imports(linker: &mut Linker<HostState>, memory: Memory) {
              _inst: i32,
              _entry: i64,
              off: i64,
-             _slog: i64,
+             slog: i64,
              _quota: i64|
-             -> i32 {
+             -> Result<i32, wasmi::Error> {
                 caller.data_mut().saw_emit = true;
-                spawn_emitted_child(&mut caller, win, off)
+                spawn_emitted_child(&mut caller, win, off, slog)
             },
         )
         .unwrap();
@@ -188,13 +230,13 @@ fn wire_nested_imports(linker: &mut Linker<HostState>, memory: Memory) {
              _grants_n: i64,
              _entry: i64,
              off: i64,
-             _slog: i64,
+             slog: i64,
              _quota: i64|
-             -> i32 {
+             -> Result<i32, wasmi::Error> {
                 let st = caller.data_mut();
                 st.saw_emit = true;
                 st.saw_module = true;
-                spawn_emitted_child(&mut caller, win, off)
+                spawn_emitted_child(&mut caller, win, off, slog)
             },
         )
         .unwrap();
@@ -214,7 +256,13 @@ fn wire_nested_imports(linker: &mut Linker<HostState>, memory: Memory) {
             "env",
             "join",
             |caller: Caller<'_, HostState>, _inst: i32, child: i32| -> i64 {
-                caller.data().children[child as usize]
+                // A `-1` (or otherwise out-of-range) handle means the gate refused the spawn — map it
+                // to a sentinel instead of indexing, so a fail-closed rejection surfaces as a value.
+                let st = caller.data();
+                if child < 0 || child as usize >= st.children.len() {
+                    return i64::MIN;
+                }
+                st.children[child as usize]
             },
         )
         .unwrap();
@@ -256,20 +304,26 @@ fn wire_nested_imports(linker: &mut Linker<HostState>, memory: Memory) {
         .unwrap();
 }
 
+/// The result of running a parent over its child: `(parent_result, [i64@addr for addr in reads],
+/// saw_module, carve_rejected)`. `carve_rejected` is set when the confinement gate refused the spawn.
+type ParentRun = (i64, Vec<i64>, bool, bool);
+
 /// Build `parent_src` + `child_src` (both `compile_module_nested`), run the parent's `f0(params)` on
-/// wasmi with the child pre-emitted as its own instance over the carve, and return
-/// `(parent_result, [i64@addr for addr in reads], saw_module)`. Asserts the instantiate bounce fired.
-/// Both instances share the one linear memory, so the carve is a real sub-window of the parent window.
-fn run_parent_over_child(
+/// wasmi with the child pre-emitted as its own instance over the carve, and return the [`ParentRun`] —
+/// or the wasmi error if the parent call traps (e.g. an escaping child fault propagated through the
+/// bounce). Both instances share the one linear memory, so the carve is a real sub-window of the parent
+/// window; the child's live `"mapped"` global is handed to the servicer for per-event routing.
+fn try_run_parent_over_child(
     parent_src: &str,
     child_src: &str,
     params: &[Val],
     reads: &[usize],
-) -> (i64, Vec<i64>, bool) {
+) -> Result<ParentRun, wasmi::Error> {
     let parent = parse(parent_src);
     let child = parse(child_src);
     let parent_wasm = compile_module_nested(&parent, false).expect("parent emits (nested)");
     let child_wasm = compile_module_nested(&child, false).expect("child module emits (nested)");
+    let win_mapped = parent.memory.as_ref().map_or(0, |mc| 1u64 << mc.size_log2);
 
     let engine = Engine::default();
     let parent_module = WModule::new(&engine, &parent_wasm).expect("parent wasm validates");
@@ -279,9 +333,13 @@ fn run_parent_over_child(
         &engine,
         HostState {
             child_entry: None,
+            child_mapped: None,
+            child: Some(child),
+            win_mapped,
             children: Vec::new(),
             saw_emit: false,
             saw_module: false,
+            carve_rejected: false,
         },
     );
     // Two pages (128 KiB) hold the parent window `[WIN_BASE, WIN_BASE + 64 KiB)`; the carve lives inside.
@@ -296,8 +354,8 @@ fn run_parent_over_child(
     let mut linker: Linker<HostState> = Linker::new(&engine);
     wire_nested_imports(&mut linker, memory);
 
-    // Pre-build the child as its own wasmi instance over the shared memory; stash its emitted entry so
-    // the `env.instantiate`/`env.instantiate_module` servicer can run it over the carve.
+    // Pre-build the child as its own wasmi instance over the shared memory; stash its emitted entry and
+    // its exported live `"mapped"` global so the servicer can route the carve size per spawn.
     let child_instance = linker
         .instantiate(&mut store, &child_module)
         .unwrap()
@@ -306,7 +364,11 @@ fn run_parent_over_child(
     let child_entry = child_instance
         .get_func(&store, "f0")
         .expect("child emitted f0 export");
+    let child_mapped = child_instance
+        .get_global(&store, "mapped")
+        .expect("child mapped global export");
     store.data_mut().child_entry = Some(child_entry);
+    store.data_mut().child_mapped = Some(child_mapped);
 
     let parent_instance = linker
         .instantiate(&mut store, &parent_module)
@@ -318,8 +380,7 @@ fn run_parent_over_child(
         .expect("parent f0 export");
 
     let mut results = [Val::I64(0)];
-    f0.call(&mut store, params, &mut results)
-        .expect("parent f0 runs");
+    f0.call(&mut store, params, &mut results)?;
 
     assert!(
         store.data().saw_emit,
@@ -333,11 +394,25 @@ fn run_parent_over_child(
             i64::from_le_bytes(b)
         })
         .collect();
-    (
+    Ok((
         results[0].i64().expect("parent returns i64"),
         out,
         store.data().saw_module,
-    )
+        store.data().carve_rejected,
+    ))
+}
+
+/// The success-expecting front of [`try_run_parent_over_child`] — for tests where the parent must run
+/// to completion. Returns `(parent_result, reads, saw_module)`.
+fn run_parent_over_child(
+    parent_src: &str,
+    child_src: &str,
+    params: &[Val],
+    reads: &[usize],
+) -> (i64, Vec<i64>, bool) {
+    let (r, out, saw_module, _rejected) =
+        try_run_parent_over_child(parent_src, child_src, params, reads).expect("parent f0 runs");
+    (r, out, saw_module)
 }
 
 #[test]
@@ -425,9 +500,13 @@ fn emitted_child_out_of_window_access_faults_and_stays_confined() {
         &engine,
         HostState {
             child_entry: None,
+            child_mapped: None,
+            child: None,
+            win_mapped: 0,
             children: Vec::new(),
             saw_emit: false,
             saw_module: false,
+            carve_rejected: false,
         },
     );
     let memory = Memory::new(&mut store, MemoryType::new(2, None)).unwrap();
@@ -531,4 +610,251 @@ fn op13_and_op17_conditional_imports_compose() {
         "op-13 entry still spawns + joins the child when op-17 is also imported"
     );
     assert_eq!(reads[0], 42, "the emitted child ran over its carve");
+}
+
+// ---------------------------------------------------------------------------------------------------
+// #1123 slice 2 — confinement: per-event window routing + the fail-closed carve gate.
+// ---------------------------------------------------------------------------------------------------
+
+/// An op-13 parent spawning its child into the carve `[win+off, win+off + 1<<slog)` with an empty grant
+/// list — the [`PARENT_OP13`] shape parameterized on the carve offset + `size_log2`, so a test can drive
+/// a carve larger than (routing), equal to, or smaller than (fail-closed) the child's declared memory.
+fn op13_parent(off: i64, slog: i64) -> String {
+    format!(
+        r#"memory 16
+func (i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32) {{
+  vmh = i64.extend_i32_u v1
+  vgptr = i64.const 0
+  vgn = i64.const 0
+  ventry = i64.const 0
+  voff = i64.const {off}
+  vsl = i64.const {slog}
+  vq = i64.const 0
+  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
+  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  return vr
+  }}
+}}
+"#
+    )
+}
+
+/// Emit `child_src` (nested) and run its `f0` **directly** over a carve of `1 << carve_log2` bytes at
+/// `WIN_BASE`, routing its live `"mapped"` global to the carve size. Returns the child's `i64` result, or
+/// the wasmi error a confinement fault surfaces as. Probes a single child's emitted checks (the NULL
+/// guard, the window bound) without a parent bounce.
+fn run_child_direct(child_src: &str, carve_log2: u32) -> Result<i64, wasmi::Error> {
+    let child = parse(child_src);
+    let child_wasm = compile_module_nested(&child, false).expect("child emits (nested)");
+    let engine = Engine::default();
+    let child_module = WModule::new(&engine, &child_wasm).expect("child wasm validates");
+    let mut store: Store<HostState> = Store::new(
+        &engine,
+        HostState {
+            child_entry: None,
+            child_mapped: None,
+            child: None,
+            win_mapped: 0,
+            children: Vec::new(),
+            saw_emit: false,
+            saw_module: false,
+            carve_rejected: false,
+        },
+    );
+    // Enough 64-KiB pages to back `[WIN_BASE, WIN_BASE + carve)`.
+    let pages = ((WIN_BASE as u64 + (1u64 << carve_log2)) / 65536 + 1) as u32;
+    let memory = Memory::new(&mut store, MemoryType::new(pages, None)).unwrap();
+    memory
+        .write(&mut store, CHILD_ENV_PTR as usize, &i64::MAX.to_le_bytes())
+        .unwrap();
+    let mut linker: Linker<HostState> = Linker::new(&engine);
+    wire_nested_imports(&mut linker, memory);
+    let inst = linker
+        .instantiate(&mut store, &child_module)
+        .unwrap()
+        .start(&mut store)
+        .unwrap();
+    let f0 = inst.get_func(&store, "f0").expect("child f0 export");
+    let mapped = inst
+        .get_global(&store, "mapped")
+        .expect("child mapped export");
+    mapped
+        .set(&mut store, Val::I64(1i64 << carve_log2))
+        .unwrap();
+    let mut r = [Val::I64(0)];
+    f0.call(
+        &mut store,
+        &[Val::I32(WIN_BASE), Val::I32(CHILD_ENV_PTR)],
+        &mut r,
+    )?;
+    Ok(r[0].i64().expect("child returns i64"))
+}
+
+/// A child that uses memory **past its declared `memory 10` (1 KiB) window** — it stores/loads `55` at
+/// byte 1536, which lies in `[1024, 2048)`. This models a real child whose heap grows above `1<<declared`
+/// into a larger carve (a malloc child; FORK.md §8.6). With per-event routing OFF the child's live
+/// `"mapped"` self-inits to `1024` and the access **faults**; slice 2 routes `"mapped"` to the carve so
+/// the child may use its whole window.
+const CHILD_USES_FULL_CARVE: &str = r#"memory 10
+func () -> (i64) {
+block 0 () {
+  vaddr = i64.const 1536
+  vsent = i64.const 55
+  i64.store vaddr vsent
+  vgot = i64.load vaddr
+  return vgot
+  }
+}
+"#;
+
+#[test]
+fn carve_larger_than_declared_routes_mapped_and_child_uses_its_whole_carve() {
+    // Carve `size_log2 = 11` (2 KiB) over a `memory 10` (1 KiB) child: `carve > declared`. The child
+    // touches `[1024, 2048)`, which only its routed carve — not its declared window — admits. (No root
+    // interpreter oracle exists for this: a root run of the child module has `mapped == declared == 1024`
+    // and would itself trap at 1536; the confined carve run with `mapped == carve` is the semantics under
+    // test, so the assertion is structural — the access lands, byte-exact, in the carve.)
+    let params = [
+        Val::I32(WIN_BASE),
+        Val::I32(ENV_PTR),
+        Val::I32(7),
+        Val::I32(99),
+    ];
+    let read_at = (WIN_BASE as i64 + CARVE_OFF + 1536) as usize;
+    let (r, reads, saw_module, rejected) = try_run_parent_over_child(
+        &op13_parent(CARVE_OFF, 11),
+        CHILD_USES_FULL_CARVE,
+        &params,
+        &[read_at],
+    )
+    .expect("routed carve lets the child use `[declared, carve)` — no fault");
+    assert!(saw_module, "op-13 bounce fired");
+    assert!(!rejected, "a `carve > declared` spawn passes the gate");
+    assert_eq!(
+        r, 55,
+        "the child stored+loaded 55 in `[declared, carve)` (routing worked)"
+    );
+    assert_eq!(
+        reads[0], 55,
+        "the store landed at `carve + 1536`, inside the routed carve"
+    );
+}
+
+#[test]
+fn escape_through_the_op13_bounce_faults_and_stays_confined() {
+    // The op-13 parent spawns `CHILD_ESCAPE` (stores at 1040, past its `memory 10`/1 KiB carve, `slog=10`
+    // ⇒ `mapped == carve == 1024`). The out-of-carve store must fault, and the fault must **propagate
+    // through the bounce** to the parent's `f0` — the existing escape test runs the child directly; this
+    // one exercises the confinement of a child driven by an emitted parent.
+    let params = [
+        Val::I32(WIN_BASE),
+        Val::I32(ENV_PTR),
+        Val::I32(7),
+        Val::I32(99),
+    ];
+    let carve = WIN_BASE as i64 + CARVE_OFF;
+    let res = try_run_parent_over_child(
+        &op13_parent(CARVE_OFF, 10),
+        CHILD_ESCAPE,
+        &params,
+        &[(carve + 1040) as usize],
+    );
+    assert!(
+        res.is_err(),
+        "an out-of-carve child access must fault the whole run through the op-13 bounce, not proceed"
+    );
+}
+
+/// A trivially-correct child that declares `memory 12` (4 KiB) — used only to under-size its carve.
+const CHILD_MEM12: &str = r#"memory 12
+func () -> (i64) {
+block 0 () {
+  vaddr = i64.const 0
+  vsent = i64.const 7
+  i64.store vaddr vsent
+  vr = i64.const 7
+  return vr
+  }
+}
+"#;
+
+#[test]
+fn undersized_carve_is_rejected_fail_closed() {
+    // A `memory 12` (4 KiB) child spawned into a `slog = 10` (1 KiB) carve: `declared > carve`. The gate
+    // ([`check_child_carve`]) must refuse it — the child never runs (nothing is written into the carve),
+    // the servicer returns the `-1` error handle, and `join` maps that to the `i64::MIN` sentinel.
+    let params = [
+        Val::I32(WIN_BASE),
+        Val::I32(ENV_PTR),
+        Val::I32(7),
+        Val::I32(99),
+    ];
+    let carve = WIN_BASE as i64 + CARVE_OFF;
+    let (r, reads, saw_module, rejected) = try_run_parent_over_child(
+        &op13_parent(CARVE_OFF, 10),
+        CHILD_MEM12,
+        &params,
+        &[carve as usize],
+    )
+    .expect("a rejected spawn does not trap the parent — it returns the sentinel");
+    assert!(saw_module, "op-13 bounce fired");
+    assert!(
+        rejected,
+        "the gate refused a carve smaller than the child's declared memory"
+    );
+    assert_eq!(
+        r,
+        i64::MIN,
+        "join mapped the `-1` error handle to the sentinel"
+    );
+    assert_eq!(
+        reads[0], 0,
+        "fail-closed: the child never ran, so nothing was written into the carve"
+    );
+}
+
+/// A child with a `>= 16 KiB` declared window (`memory 15` = 32 KiB) that stores at byte 8 — **inside**
+/// the reserved NULL guard `[0, 16384)`. The emitted NULL-guard compare (#964/#1094) must trap it.
+const CHILD_NULL_DEREF: &str = r#"memory 15
+func () -> (i64) {
+block 0 () {
+  vaddr = i64.const 8
+  vval = i64.const 77
+  i64.store vaddr vval
+  vr = i64.const 0
+  return vr
+  }
+}
+"#;
+
+/// The same `memory 15` child storing **above** the guard (byte 16392) — a legal access that must run.
+const CHILD_ABOVE_GUARD: &str = r#"memory 15
+func () -> (i64) {
+block 0 () {
+  vaddr = i64.const 16392
+  vsent = i64.const 55
+  i64.store vaddr vsent
+  vgot = i64.load vaddr
+  return vgot
+  }
+}
+"#;
+
+#[test]
+fn nested_child_gets_the_null_guard() {
+    // A confined child with a `>= 16 KiB` window benefits from the trap-on-NULL guard (#964/#1094) just
+    // like a root guest: the guard is an emitted compare installed on every child compile path, so a
+    // low deref faults while an access above the guard runs. (A sub-16 KiB child declares no guard — the
+    // `g <= win` gate — matching the interpreter, so the smaller children elsewhere in this file are
+    // guard-free on both tiers.)
+    assert!(
+        run_child_direct(CHILD_NULL_DEREF, 15).is_err(),
+        "a store inside `[0, 16384)` must trap the child's emitted NULL guard"
+    );
+    assert_eq!(
+        run_child_direct(CHILD_ABOVE_GUARD, 15).expect("an access above the guard runs"),
+        55,
+        "the guard covers only `[0, 16384)`; `[16384, window)` is usable",
+    );
 }

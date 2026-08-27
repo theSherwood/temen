@@ -254,6 +254,14 @@ self.onmessage = async (e) => {
     });
     const envCell = Number(ex.temen_par_alloc(ex.temen_wasmjit_env_bytes()));
     new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true); // ample fuel
+    // #1123 slice 2/3 — per-event window routing: set the emitted child's live `mapped` global to ITS
+    // carve size (`winSize = 1 << slog`), not its declared memory. The emitted trap check reads this
+    // global live (#717), so this both confines the child to the carve (an access past `winSize` faults,
+    // fail-closed, regardless of how the carve compares to `1 << declared`) and lets a `carve > declared`
+    // child use its whole carve — heap growth into `[1 << declared, winSize)` (a malloc child, e.g. a nim
+    // phase). Matches the interpreter confined child (`mapped == carve`) and the headless wasmi servicer
+    // (crates/temen-wasm-jit/tests/nested_emitted_child.rs). `mapped` is exported by every emitted module.
+    uinst.exports.mapped.value = BigInt(winSize);
     const args = new Array(Number(ex.temen_par_inst_nparams(entry))).fill(0n); // cap handles, ignored
     if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // count emitted children (non-vacuity)
     try {

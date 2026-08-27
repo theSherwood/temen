@@ -1475,6 +1475,44 @@ block 6 (vs3: i64) {
 }
 "#;
 
+// #1123 slice 3 — a **carve LARGER than the granted unit's declared memory** (the malloc/nim-phase
+// shape: the child grows its heap above `1<<declared`). The root `instantiate_module`s the unit once
+// into a **128 KiB** carve (`slog 17`) at a 128 KiB-aligned offset, while the unit declares only
+// `memory 16` (64 KiB). The unit then stores+loads a sentinel at byte 100000 — inside `[64 KiB, 128 KiB)`,
+// above its declared window but inside the carve — and returns it (4242). This only succeeds when the
+// child's live `"mapped"` is routed to the carve (128 KiB); with `mapped == 1<<declared` (64 KiB) the
+// access faults. Asserted in the JS host (main.js) on BOTH the interp and emitted-codegen tiers, so it
+// exercises the browser per-event window routing directly, not just non-regression.
+const THREADS_INST_MOD_HIGH: &str = r#"memory 20
+func (i32, i32) -> (i64) {
+block 0 (vinst: i32, vmod0: i32) {
+  vmod = i64.extend_i32_s vmod0
+  ventry = i64.const 0
+  voff = i64.const 131072
+  vslog = i64.const 17
+  vquota = i64.const 0
+  vh = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) vinst (vmod, ventry, voff, vslog, vquota)
+  vr = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  return vr
+  }
+}
+"#;
+
+// The granted unit for [`THREADS_INST_MOD_HIGH`]: declares `memory 16` (64 KiB) but is run over a larger
+// carve; it stores+loads `4242` at byte 100000 (in `[64 KiB, carve)`) and returns it — proving the child
+// reaches above its declared memory only because `"mapped"` is routed to the carve.
+const THREADS_INST_UNIT_HIGH: &str = r#"memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vaddr = i64.const 100000
+  vsent = i64.const 4242
+  i64.store vaddr vsent
+  vgot = i64.load vaddr
+  return vgot
+  }
+}
+"#;
+
 // ---- 4d: host I/O across Workers (the shared powerbox) ------------------------------------------
 // The proven schedule-independent 4c-host kernel: root (param = stdout handle) spawns 8 workers, each
 // `call.cap`-writes the SAME 5-byte line and bumps a shared counter — so result (8) AND stdout
@@ -2179,6 +2217,8 @@ fn main() {
     emit("threads_inst_nested", THREADS_INST_NESTED);
     emit("threads_inst_mod", THREADS_INST_MOD);
     emit("threads_inst_unit", THREADS_INST_UNIT);
+    emit("threads_inst_mod_high", THREADS_INST_MOD_HIGH);
+    emit("threads_inst_unit_high", THREADS_INST_UNIT_HIGH);
     emit("threads_inst_nested_unit", THREADS_INST_NESTED_UNIT);
     emit("threads_inst_threads_unit", THREADS_INST_THREADS_UNIT);
     // §22 multi-Worker twins: the runtime-compile units + the guests whose workers compile them

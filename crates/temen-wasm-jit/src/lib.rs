@@ -1719,6 +1719,62 @@ pub fn compile_module_nested(m: &Module, shared_memory: bool) -> Result<Vec<u8>,
     compile_module_nested_with_eligibility(m, shared_memory).map(|(w, _)| w)
 }
 
+/// Validate a §14 separate-module child carve before spawning it on the emitted tier — the wasm-JIT
+/// twin of the native `mod_ok`/`fits` gate (`temen-jit/src/instantiator_rt.rs:1303-1312`) and the
+/// interpreter's `instantiate_module_named` carve check. **Fail-closed**: returns the carve byte size
+/// on success, [`Error::Unsupported`] on any violation, so a confined child can never be spawned over a
+/// window it could escape (`INVARIANTS` #2) or one that under-sizes its declared memory.
+///
+/// This is the load-bearing confinement precondition for the emitted op-13 child (issue #1123 slice 2).
+/// The child's emitted accesses trap against its live `"mapped"` global, which the servicer routes to
+/// **this carve size** (per-event window routing) — matching the interpreter's confined child
+/// (`mapped == carve`, `temen-interp/src/bytecode.rs`) and native (`compile_child` runs fully-mapped
+/// over the carve). That routing is sound only when the carve is **at least** the child's declared
+/// memory: an access the emitter elides against the compile-time `1 << declared` floor is then still
+/// inside the carve, and the always-on `& MASK` clamp (which only clamps to the full reservation, not
+/// the carve) never has to be the confinement of record. A carve smaller than declared, misaligned,
+/// straddling the parent window, or dipping into the reserved NULL guard is refused.
+///
+/// - `child`: the child module (its `memory N` gives the minimum carve; `None` ⇒ no linear memory).
+/// - `off`: the carve offset within the parent window (the `env.instantiate_module` bounce's `off`).
+/// - `carve_log2`: the requested carve `size_log2` (the bounce's `size_log2` arg).
+/// - `parent_mapped`: the parent window's live mapped size — the carve must fit inside it.
+/// - `parent_base`: the parent window base (absolute), for the NULL-region check.
+/// - `guard`: the reserved NULL-guard extent (`[0, guard)`); a carve may not dip into it.
+pub fn check_child_carve(
+    child: &Module,
+    off: u64,
+    carve_log2: u32,
+    parent_mapped: u64,
+    parent_base: u64,
+    guard: u64,
+) -> Result<u64, Error> {
+    // A `size_log2` of 64+ would overflow the shift (and no real window is that large) — reject it
+    // before the shift, so a wild bounce arg faults closed rather than wrapping.
+    if carve_log2 >= 64 {
+        return Err(Error::Unsupported("child carve size_log2 out of range"));
+    }
+    let carve = 1u64 << carve_log2;
+    let declared_log2 = child.memory.as_ref().map(|mc| mc.size_log2);
+    // A larger carve is a safe superset — confinement still masks every access to the carve — and the
+    // child *needs* `carve >= 1 << declared` so its bump allocator can grow the heap into
+    // `[1 << declared, carve)` (FORK.md §8.6 / #773). A carve smaller than declared is refused.
+    let mod_ok = declared_log2.is_none_or(|d| u32::from(d) <= carve_log2);
+    // The carve must lie wholly inside the parent window, power-of-two-aligned to its own size, and
+    // clear of the reserved NULL region — mirroring the native `fits` predicate.
+    let fits = carve <= parent_mapped
+        && off & (carve - 1) == 0
+        && off.checked_add(carve).is_some_and(|e| e <= parent_mapped)
+        && parent_base.checked_add(off).is_some_and(|a| a >= guard);
+    if mod_ok && fits {
+        Ok(carve)
+    } else {
+        Err(Error::Unsupported(
+            "child carve fails the confinement gate (undersized, misaligned, out of window, or in the NULL guard)",
+        ))
+    }
+}
+
 /// **The §14 nested front door** — the nesting analogue of [`compile_jit`], picking the drive mode
 /// from the IR so a nesting parent always yields a runnable [`Artifact`] (never `Err` for a verified
 /// module). Two modes, forced by wasm's inability to unwind a frame across a fiber stack switch:
