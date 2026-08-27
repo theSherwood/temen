@@ -731,8 +731,14 @@ struct ModuleSource {
 
 impl ModuleSource {
     fn new(primary: Compiled) -> ModuleSource {
+        ModuleSource::over(std::sync::Arc::new(primary))
+    }
+
+    /// [`ModuleSource::new`] over an already-`Arc`'d primary (the cross-run compiled-program cache,
+    /// #1144): the shared `Arc<Compiled>` becomes `mods[0]` of a fresh source.
+    fn over(primary: std::sync::Arc<Compiled>) -> ModuleSource {
         ModuleSource {
-            mods: std::sync::Mutex::new(vec![std::sync::Arc::new(primary)]),
+            mods: std::sync::Mutex::new(vec![primary]),
         }
     }
 
@@ -799,9 +805,18 @@ struct Domain {
 
 impl Domain {
     fn new(primary: Compiled, table_log2: u8) -> Domain {
+        Domain::over_primary(std::sync::Arc::new(primary), table_log2)
+    }
+
+    /// Like [`Domain::new`], but over an **already-`Arc`'d** primary `Compiled` — so a caller that
+    /// cached the compiled program across runs (#1144, the browser bash entry) reuses it via a cheap
+    /// refcount bump instead of recompiling. A **fresh** `ModuleSource` still wraps it each run (a run
+    /// pushes its own §14/exec'd command units into `mods[1..]` and must not inherit a prior run's),
+    /// so only the immutable `mods[0]` program is shared.
+    fn over_primary(primary: std::sync::Arc<Compiled>, table_log2: u8) -> Domain {
         let table = SharedSlots::new(primary.progs.len(), table_log2, 0);
         Domain {
-            source: std::sync::Arc::new(ModuleSource::new(primary)),
+            source: std::sync::Arc::new(ModuleSource::over(primary)),
             table,
         }
     }
@@ -4282,13 +4297,63 @@ pub fn compile_and_run_capture_reserved_with_host(
     // driver flattens idle parked fibers into their regions, and thaw seeding re-creates them from the
     // artifact residue. So a single-vCPU `cont.*` module is driven here in any window state (NORMAL /
     // UNWINDING freeze / REWINDING thaw); only multi-vCPU `thread.*` (above) still falls back.
-    let c = compile_module_for(m)?;
-    if func as usize >= c.progs.len() {
+    let c = std::sync::Arc::new(compile_module_for(m)?);
+    run_capture_reserved_over_compiled_with_host(
+        m,
+        c,
+        func,
+        args,
+        fuel,
+        init_mem,
+        reserved_log2,
+        host,
+    )
+}
+
+/// #1144 — **compile the reserved-window program without running it**, so a caller (the browser bash
+/// entry) can **cache the `Arc<Compiled>` across Runs** and skip the ~200 ms per-Run recompile of a
+/// large module. `None` if the module is outside the bytecode subset (same gate as
+/// [`compile_and_run_capture_reserved_with_host`]'s compile). Pair with
+/// [`run_capture_reserved_over_compiled_with_host`], which takes the cached program.
+pub fn compile_reserved(m: &Module) -> Option<std::sync::Arc<Compiled>> {
+    compile_module_for(m).map(std::sync::Arc::new)
+}
+
+/// #1144 — the run half of [`compile_and_run_capture_reserved_with_host`], over an **already-compiled**
+/// (and typically cached) `Arc<Compiled>`. Everything after the compile is identical — the `thread.*`/
+/// `Instantiator` out-of-scope refusal, the personality park door, `Mem` reservation + seed +
+/// data-init + NULL guard from `m`, run, window snapshot. A fresh `Domain`/`ModuleSource` wraps the
+/// shared program each call (so exec'd command units pushed this run don't leak into the next), reusing
+/// only the immutable primary program. `m` is still needed for the `Mem` init (data segments, window
+/// size, NULL guard) and the out-of-scope scan — cheap reads, no recompile.
+#[allow(clippy::too_many_arguments)] // mirrors compile_and_run_capture_reserved_with_host, plus `compiled`
+pub fn run_capture_reserved_over_compiled_with_host(
+    m: &Module,
+    compiled: std::sync::Arc<Compiled>,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    init_mem: &[u8],
+    reserved_log2: u8,
+    host: &mut Host,
+) -> Option<Capture> {
+    // Same out-of-scope gate as the compile-and-run entry — a cached program from a caller that also
+    // holds the module must still refuse the `thread.*`/§14-nesting shapes the freeze path can't drive.
+    let outside = m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(i, Inst::ThreadSpawn { .. } | Inst::ThreadJoin { .. })
+                || matches!(i, Inst::CapCall { type_id, .. } if *type_id == super::cap_id::INSTANTIATOR)
+        })
+    });
+    if outside {
+        return None;
+    }
+    if func as usize >= compiled.progs.len() {
         return Some((Err(Trap::Malformed), Vec::new()));
     }
     // #799/#1080 — install the personality fork/waitpid park-request door (see `compile_and_run_with_host`).
     host.wire_park_door();
-    let dom = Domain::new(c, host.jit_table_log2());
+    let dom = Domain::over_primary(compiled, host.jit_table_log2());
     let mut mem = m.memory.map(|mc| {
         let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
         mm.seed(init_mem);
