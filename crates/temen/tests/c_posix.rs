@@ -3241,6 +3241,11 @@ int main(void) {{\n\
 /// SIGINT and blocks in `read(0)`; the fed `VINTR` byte never enters the stream — the discipline
 /// fires the #798 group kill at the foreground group, the #796 EINTR path wakes the park, the
 /// read returns `-EINTR` (plain `signal()`, SysV no-restart), and the doorbell holds the handler.
+///
+/// #1146 slice 2 — the **cooperative bytecode** twin now matches: the all-parked pump sees the
+/// `^C`-raised deliverable SIGINT, sweeps the parked read (`Host::set_sig_interrupt` + re-admit),
+/// the rewound read completes `-EINTR`, and the slice-1 safepoint redirect runs the handler. This
+/// is the parked-read half of the async-signal gap that the compute-loop witnesses (slice 1) left.
 #[test]
 fn c_terminal_ctrl_c_interrupts_a_parked_read() {
     let src = format!(
@@ -3264,7 +3269,13 @@ int main(void) {{\n\
     assert_eq!(
         e.result,
         vec![Value::I32(42)],
-        "^C -> SIGINT at the fg group -> EINTR from the parked read, handler pending"
+        "tree-walker: ^C -> SIGINT at the fg group -> EINTR from the parked read, handler pending"
+    );
+    let byte = run_bytecode_terminal(&src, vec![(60, b"\x03".to_vec())]);
+    assert_eq!(
+        byte.result,
+        vec![Value::I32(42)],
+        "coop bytecode: the all-parked EINTR sweep interrupted the parked read and delivered the handler — matching the oracle"
     );
 }
 
