@@ -10061,7 +10061,19 @@ impl CoopSched {
         // already polls every parked pipe, so the ring only needs to say "something changed".
         if let Some(bell) = host.external_wake() {
             if let Some((_, source)) = host.signal_poll() {
+                let bell_pw = std::sync::Arc::clone(&bell);
                 source.set_pipe_wake(std::sync::Arc::new(move |_pipe| {
+                    let (gen, cv) = &*bell_pw;
+                    *gen.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+                    cv.notify_all();
+                }));
+                // #1146 slice 2 — a deliverable signal that deposits no bytes (a `^C` fg-group kill
+                // raises SIGINT, so `feed_terminal` wakes via signal delivery — the `set_wake` door —
+                // not the pipe-wake door) must also ring this bell, else the all-parked pump sleeps
+                // through it and never runs its EINTR sweep. The tree-walker points `set_wake` at
+                // `interrupt_interruptible_parks`; the cooperative pump needs only the ring — waking
+                // re-enters the `None` arm, whose sweep does the interrupting.
+                source.set_wake(std::sync::Arc::new(move || {
                     let (gen, cv) = &*bell;
                     *gen.lock().unwrap_or_else(|e| e.into_inner()) += 1;
                     cv.notify_all();
@@ -10390,6 +10402,40 @@ impl CoopSched {
                         }
                     }
                     None => {
+                        // #1146 slice 2 — before blocking, interrupt the parks if a deliverable
+                        // signal reached this all-parked run (e.g. a `^C` the terminal line
+                        // discipline raised, which rang the doorbell but deposited no bytes, so the
+                        // readiness poll above found nothing runnable). Set each pipe-parked task's
+                        // host EINTR flag and re-admit it: the rewound read/write re-runs and
+                        // completes `-EINTR` at the park site, and the caught handler is delivered
+                        // at that task's next safepoint (slice 1). The tree-walker drives this from
+                        // its `set_wake` closure; the cooperative pump polls it here, at the would-be
+                        // block. `interrupt_pending` is a non-consuming peek — delivery still fires.
+                        let sig_pending = host
+                            .signal_poll()
+                            .is_some_and(|(_, s)| s.interrupt_pending());
+                        if sig_pending {
+                            let mut woke = false;
+                            for t in tasks.iter_mut() {
+                                if matches!(
+                                    t.state,
+                                    TaskState::BlockedPipeRead { .. }
+                                        | TaskState::BlockedPipeWrite { .. }
+                                ) {
+                                    match t.env {
+                                        Some(k) => {
+                                            extra_envs[k].host.lock_unpoisoned().set_sig_interrupt()
+                                        }
+                                        None => host.set_sig_interrupt(),
+                                    }
+                                    t.state = TaskState::Runnable;
+                                    woke = true;
+                                }
+                            }
+                            if woke {
+                                continue;
+                            }
+                        }
                         // #1122 — every task is parked and no internal wake can come. With an
                         // armed doorbell and at least one task parked on a PIPE — the state an
                         // embedder can feed from outside the run (the interactive terminal) —
@@ -14561,27 +14607,53 @@ impl Vm {
                     // a full FIFO with readers open, REWINDS the op and parks the task on the pipe — the
                     // settle scan re-admits it when ready. The wake flags a write/close set need no action
                     // here: the cooperative driver POLLS pipe readiness at the settle (no `pipe_waiters`).
-                    let pipe_read_park = host.with(|p| p.take_pipe_read_parked());
-                    let pipe_write_park = host.with(|p| p.take_pipe_write_parked());
+                    // #1146 slice 2 — drain the transient EINTR flag ([`Host::set_sig_interrupt`], set by
+                    // the all-parked sweep) alongside the park flags, unconditionally: consuming it even on
+                    // the non-parking path keeps a mixed feed (bytes AND a signal in one `feed_terminal`)
+                    // from leaving it set to spuriously interrupt a *later* read. It only *acts* below.
+                    let (pipe_read_park, pipe_write_park, sig_flag) = host.with(|p| {
+                        (
+                            p.take_pipe_read_parked(),
+                            p.take_pipe_write_parked(),
+                            p.take_sig_interrupt(),
+                        )
+                    });
                     let _ = host.with(|p| (p.take_pipe_wake(), p.take_pipe_wake_writers()));
-                    if let Some(pipe) = pipe_read_park {
-                        self.module = module;
-                        self.cur = cur;
-                        self.base = base;
-                        self.pc = pc; // rewind: the read re-executes on wake
-                        return Ok(Outcome::PipeRead { pipe });
+                    // A signal interrupted this blocking pipe read/write: either the sweep set the flag
+                    // above, or a deliverable signal is already pending at the park insert (the slice-D
+                    // pre-park race). When so — and the delivery does not carry `SA_RESTART` — complete
+                    // `-EINTR` in `dst` and advance, exactly as the tree-walker's eval-loop park site does,
+                    // instead of rewinding+parking; the caught handler itself is delivered at the next
+                    // safepoint (the slice-1 redirect). `SA_RESTART` leaves the op to re-park (data resumes
+                    // it). The restart / pre-park peek is taken only when a park is actually pending.
+                    if pipe_read_park.is_some() || pipe_write_park.is_some() {
+                        let interrupted = (sig_flag && !host.with(|p| p.signal_restart()))
+                            || host.with(|p| p.park_interrupted());
+                        if interrupted {
+                            self.regs[base + *dst as usize] = Reg::from_i64(temen_ir::errno::EINTR);
+                            pc += 1;
+                        } else if let Some(pipe) = pipe_read_park {
+                            self.module = module;
+                            self.cur = cur;
+                            self.base = base;
+                            self.pc = pc; // rewind: the read re-executes on wake
+                            return Ok(Outcome::PipeRead { pipe });
+                        } else {
+                            self.module = module;
+                            self.cur = cur;
+                            self.base = base;
+                            self.pc = pc; // rewind: the write re-executes on wake
+                            return Ok(Outcome::PipeWrite {
+                                pipe: pipe_write_park.expect("write park present"),
+                            });
+                        }
+                    } else {
+                        for (i, (s, ty)) in res.iter().zip(results.iter()).enumerate() {
+                            self.regs[base + *dst as usize + i] =
+                                Reg::from_value(slot_to_val(*ty, *s));
+                        }
+                        pc += 1;
                     }
-                    if let Some(pipe) = pipe_write_park {
-                        self.module = module;
-                        self.cur = cur;
-                        self.base = base;
-                        self.pc = pc; // rewind: the write re-executes on wake
-                        return Ok(Outcome::PipeWrite { pipe });
-                    }
-                    for (i, (s, ty)) in res.iter().zip(results.iter()).enumerate() {
-                        self.regs[base + *dst as usize + i] = Reg::from_value(slot_to_val(*ty, *s));
-                    }
-                    pc += 1;
                 }
                 Op::SvcPoll { dst, wait } => {
                     // §3.6 serve-loop core (I36 slice 1), the tree-walk serve arm's rewind state
