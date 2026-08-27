@@ -3009,10 +3009,54 @@ pub fn bash_exec_with(
         stderr: Vec::new(),
         framebuffer: None,
     };
+    let Some((mut host, posix, init_mem)) = bash_host_build(m, argv, stdin, bins, false) else {
+        return unsupported(STATUS_UNSUPPORTED);
+    };
+    let mut fuel = u64::MAX;
+    let (status, value, exit_code) = match bytecode::compile_and_run_capture_reserved_with_host(
+        m,
+        0,
+        &[],
+        &mut fuel,
+        &init_mem,
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        &mut host,
+    ) {
+        None => (STATUS_UNSUPPORTED, 0, 0),
+        Some((Err(Trap::Exit(code)), _)) => (STATUS_EXIT, 0, code),
+        Some((Err(_), _)) => (STATUS_TRAP, 0, 0),
+        Some((Ok(vals), _)) => match vals.first() {
+            Some(Value::I64(x)) => (STATUS_OK, *x, 0),
+            Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
+            _ => (STATUS_OK, 0, 0), // bash's `main` may return void through `_start`
+        },
+    };
+    // The personality owns bash's fd 1/2 — its captured streams are the run's output.
+    PbOutcome {
+        status,
+        value,
+        exit_code,
+        stdout: posix.stdout(),
+        stderr: posix.stderr(),
+        framebuffer: None,
+    }
+}
+
+/// The shared powerbox build for a bash run ([`bash_exec_with`] and the #1122 interactive
+/// [`temen_bash_session`]): the on-ramp gate, the personality grant (+ terminal + external-wake
+/// doorbell when `interactive`), the `vm_map` bindings, the `/bin` registry, and the argv/env blob.
+/// `None` = not a bash-shaped module.
+fn bash_host_build(
+    m: &temen_ir::Module,
+    argv: &[&[u8]],
+    stdin: &[u8],
+    bins: &[(&str, &temen_ir::Module, u8)],
+    interactive: bool,
+) -> Option<(Host, temen_posix::Posix, Vec<u8>)> {
     // The on-ramp shape gate: a `vm_map`-importing bash module is a named-powerbox entry (paramless
     // `_start`), so `onramp_check` passes it; a non-bash module falls closed here.
     if onramp_check(m).is_err() {
-        return unsupported(STATUS_UNSUPPORTED);
+        return None;
     }
     use temen_interp::cap_id;
     let mut host = Host::new();
@@ -3022,6 +3066,14 @@ pub fn bash_exec_with(
     let (px_h, posix) = temen_posix::grant(&mut host, 0, 0, stdin.to_vec());
     // Reached by name: bash's shim resolves the personality via `__vm_cap_resolve("posix")`.
     host.register_cap_name("posix", px_h);
+    if interactive {
+        // #1122 — the interactive session: the #797 controlling terminal (keystrokes arrive via
+        // `feed_terminal` from ANOTHER wasm-thread instantiation over the shared memory) and the
+        // external-wake doorbell, so the cooperative pump BLOCKS this Worker at its all-parked
+        // point (bash waiting at the prompt) instead of faulting as a deadlock.
+        posix.enable_terminal(&mut host);
+        host.arm_external_wake();
+    }
     // bash's single manifest import `vm_map` (`AddressSpace` op 0) is its `malloc`'s page-commit op —
     // bind it to a growable memory cap (`base 0, size u64::MAX`) so the heap grows into the reserved
     // tail. Other AddressSpace ops (`vm_unmap`/`vm_protect`/`vm_page_size`) share the same handle.
@@ -3056,39 +3108,17 @@ pub fn bash_exec_with(
     // packed NUL strings), where the synthesized `_start` reads it. `PATH=/bin` lets bash resolve an
     // external command (`seq` → `/bin/seq`, registered above) for fork → execve; `HOME=/` is the
     // conventional minimum (the `bash_probe` env).
-    let env: &[&[u8]] = &[b"PATH=/bin", b"HOME=/"];
+    let env: &[&[u8]] = if interactive {
+        // The interactive session's prompt: bash prints PS1 on fd 2 between commands.
+        &[b"PATH=/bin", b"HOME=/", b"PS1=$ "]
+    } else {
+        &[b"PATH=/bin", b"HOME=/"]
+    };
     let blob = temen_ir::write_args_blob(argv, env);
     let base = temen_ir::module_args_base(m) as usize;
     let mut init_mem = vec![0u8; base + blob.len()];
     init_mem[base..].copy_from_slice(&blob);
-    let mut fuel = u64::MAX;
-    let (status, value, exit_code) = match bytecode::compile_and_run_capture_reserved_with_host(
-        m,
-        0,
-        &[],
-        &mut fuel,
-        &init_mem,
-        temen_ir::DEFAULT_RESERVED_LOG2,
-        &mut host,
-    ) {
-        None => (STATUS_UNSUPPORTED, 0, 0),
-        Some((Err(Trap::Exit(code)), _)) => (STATUS_EXIT, 0, code),
-        Some((Err(_), _)) => (STATUS_TRAP, 0, 0),
-        Some((Ok(vals), _)) => match vals.first() {
-            Some(Value::I64(x)) => (STATUS_OK, *x, 0),
-            Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
-            _ => (STATUS_OK, 0, 0), // bash's `main` may return void through `_start`
-        },
-    };
-    // The personality owns bash's fd 1/2 — its captured streams are the run's output.
-    PbOutcome {
-        status,
-        value,
-        exit_code,
-        stdout: posix.stdout(),
-        stderr: posix.stderr(),
-        framebuffer: None,
-    }
+    Some((host, posix, init_mem))
 }
 
 /// Run the **`temen-posix` shell** (STAGE1.md; `crates/temen/tests/c_shell.rs`) — a real command
@@ -6586,6 +6616,167 @@ pub extern "C" fn temen_run_bash(
         EXIT_CODE = out.exit_code;
     }
     out.value
+}
+
+/// #1122 — the live interactive bash session's control block, shared between the **session
+/// Worker** (which blocks inside [`temen_bash_session`] for the whole session) and the **control
+/// Worker** (which calls [`temen_bash_feed`]/[`temen_bash_drain`]/[`temen_bash_exited`] from its
+/// own instantiation of this module over the same shared linear memory — statics live in that
+/// memory, so both see this cell). A `Mutex`, never a `RefCell`: the two Workers are real wasm
+/// threads.
+struct BashSession {
+    posix: temen_posix::Posix,
+    /// How much of the personality's accumulated stdout/stderr the control Worker has drained.
+    out_off: usize,
+    err_off: usize,
+    /// `None` while the session runs; the exit code once it finished.
+    exit: Option<i32>,
+}
+static BASH_SESSION: std::sync::Mutex<Option<BashSession>> = std::sync::Mutex::new(None);
+/// #1122 — **type-ahead**: keystrokes fed before the session Worker has published its session
+/// (the two Workers start concurrently, so the race is real) queue here and flush into the
+/// terminal the moment [`temen_bash_session`] publishes — exactly a real terminal's type-ahead.
+static BASH_TYPEAHEAD: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+/// #1122 route (b) — run **interactive `bash -i`** to completion on the cooperative bytecode
+/// engine, over the #797 controlling terminal, with the external-wake doorbell armed. This call
+/// BLOCKS its Worker for the whole session (the pump parks on the doorbell whenever bash waits at
+/// the prompt), so it must run on a dedicated Worker of the **threads build** — never the main
+/// thread. Keystrokes and output travel through [`temen_bash_feed`]/[`temen_bash_drain`], called
+/// by a second (control) Worker. `[bins_ptr, bins_len)` is the same `/bin` registry blob
+/// [`temen_run_bash`] takes. Returns the session's exit code (`^D` → bash's `exit` status), or
+/// `-1` for a module that doesn't decode / isn't bash-shaped, `-2` for a trap.
+#[no_mangle]
+pub extern "C" fn temen_bash_session(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    bins_ptr: *const u8,
+    bins_len: usize,
+) -> i32 {
+    let slice = |p: *const u8, n: usize| -> &'static [u8] {
+        if p.is_null() || n == 0 {
+            &[]
+        } else {
+            // SAFETY: the host guarantees the range is a live `temen_alloc`ation it just filled.
+            unsafe { core::slice::from_raw_parts(p, n) }
+        }
+    };
+    let Ok(m) = temen_encode::decode_module(slice(mod_ptr, mod_len)) else {
+        return -1;
+    };
+    let owned = parse_shell_cmds(slice(bins_ptr, bins_len));
+    let bins: Vec<(&str, &temen_ir::Module, u8)> = owned
+        .iter()
+        .map(|(n, cm)| (n.as_str(), cm, cm.memory.map_or(0, |mc| mc.size_log2)))
+        .collect();
+    let Some((mut host, posix, init_mem)) =
+        bash_host_build(&m, &[b"bash", b"-i"], &[], &bins, true)
+    else {
+        return -1;
+    };
+    // Publish the session BEFORE entering the run: from here the control Worker's feed/drain reach
+    // the live personality. (The session lock is never held while the engine runs or feeds.)
+    *BASH_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = Some(BashSession {
+        posix: posix.clone(),
+        out_off: 0,
+        err_off: 0,
+        exit: None,
+    });
+    // Flush the type-ahead: keystrokes that raced this Worker's startup queued in
+    // [`BASH_TYPEAHEAD`] — deposit them into the (already enabled) terminal now, so bash's first
+    // read finds them, exactly like typing ahead of a slow shell.
+    let ahead = std::mem::take(&mut *BASH_TYPEAHEAD.lock().unwrap_or_else(|e| e.into_inner()));
+    if !ahead.is_empty() {
+        posix.feed_terminal(&ahead);
+    }
+    let mut fuel = u64::MAX;
+    let code = match bytecode::compile_and_run_capture_reserved_with_host(
+        &m,
+        0,
+        &[],
+        &mut fuel,
+        &init_mem,
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        &mut host,
+    ) {
+        None => -1,
+        Some((Err(Trap::Exit(code)), _)) => code,
+        Some((Err(_), _)) => -2,
+        Some((Ok(_), _)) => 0,
+    };
+    if let Some(s) = BASH_SESSION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        s.exit = Some(code);
+    }
+    code
+}
+
+/// #1122 — deliver keystrokes into the live session's terminal (the #797 feed-time line
+/// discipline: canonical editing, echo, `^C`/`^D` handling). Called by the control Worker; a call
+/// with no live session is a no-op.
+#[no_mangle]
+pub extern "C" fn temen_bash_feed(ptr: *const u8, len: usize) {
+    let bytes = if ptr.is_null() || len == 0 {
+        return;
+    } else {
+        // SAFETY: the host guarantees the range is a live allocation it just filled.
+        unsafe { core::slice::from_raw_parts(ptr, len) }
+    };
+    // Clone the Posix handle out and RELEASE the session lock before feeding: `feed_terminal`
+    // takes the personality's world locks, which the running session also takes — feeding under
+    // the session lock would couple the two lock orders for no benefit.
+    let px = BASH_SESSION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|s| s.posix.clone());
+    match px {
+        Some(px) => px.feed_terminal(bytes),
+        // No session published yet (the session Worker is still starting): queue as type-ahead —
+        // [`temen_bash_session`] flushes it the moment the terminal is live. Dropping these bytes
+        // would eat the user's (or the E2E's) first line.
+        None => BASH_TYPEAHEAD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend_from_slice(bytes),
+    }
+}
+
+/// #1122 — drain the session's NEW output bytes (`kind` 0 = the personality's stdout, 1 = stderr
+/// — bash's prompt lands on stderr) into `[buf, cap)`; returns how many bytes were copied and
+/// advances the drain offset. `0` = nothing new (or no live session).
+#[no_mangle]
+pub extern "C" fn temen_bash_drain(kind: i32, buf: *mut u8, cap: usize) -> usize {
+    if buf.is_null() || cap == 0 {
+        return 0;
+    }
+    let mut g = BASH_SESSION.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(s) = g.as_mut() else { return 0 };
+    let (bytes, off) = if kind == 0 {
+        (s.posix.stdout(), &mut s.out_off)
+    } else {
+        (s.posix.stderr(), &mut s.err_off)
+    };
+    let fresh = &bytes[(*off).min(bytes.len())..];
+    let n = fresh.len().min(cap);
+    // SAFETY: the host guarantees `[buf, cap)` is a live allocation owned by the caller.
+    unsafe { core::ptr::copy_nonoverlapping(fresh.as_ptr(), buf, n) };
+    *off += n;
+    n
+}
+
+/// #1122 — the session's state: `-1` while it runs (or before one started), else its exit code.
+#[no_mangle]
+pub extern "C" fn temen_bash_exited() -> i32 {
+    BASH_SESSION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|s| s.exit)
+        .unwrap_or(-1)
 }
 
 /// **In-browser link + run of a frontend-emitted program** (docs/TEMEN_BROWSER_PLAN.md option (b)):

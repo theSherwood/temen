@@ -16,6 +16,13 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **interactive bash card E2E (`ci.yml`, #1122)** — one line added to the `real-browser` job's
+  test block, right after `node browser-bash-test.mjs`: `node browser-bash-interactive-test.mjs`
+  (plus its comment). Drives the play page's new "bash -i" card in Chromium — a live interactive
+  session (session Worker + control Worker over the shared memory), a builtin and a fork+exec'd
+  coreutil typed at the prompt, `^D` exit. SKIPs with the batch bash test when the deploy-built
+  `bash.temen` is absent, so no new staging is needed.
+
 - **New `browser-jit-host-gates` job (the compiler-tier wasm-JIT host tests, #1011)** — the browser
   crate's Rust *host* tests (`nifler_jit`, `chibicc_jit`, `jit_module`) run a real compiler phase on
   the wasm-JIT via `wasmi` and assert the emitted output is byte-identical to the interpreter oracle,

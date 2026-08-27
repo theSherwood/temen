@@ -91,6 +91,10 @@ fn main() {
         }
         if with_term {
             p.enable_terminal(h);
+            // #1122 — let the cooperative bytecode driver BLOCK for the feeder's keystrokes at
+            // its all-parked point instead of faulting as a deadlock. Inert on the other tiers
+            // (the tree-walker wires its own scheduler doors; the parallel driver polls).
+            h.arm_external_wake();
         }
         handle
     });
