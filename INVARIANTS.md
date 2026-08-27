@@ -11,7 +11,8 @@ rejecting real proposals, not by describing the code.
 Every line is potential TCB. Prefer the boring, obvious implementation; no abstraction,
 configurability, or cleverness until something concrete demands it. When in doubt, do less.
 *Violated by:* any change justified by "we might need it" rather than a failing test, a
-measured regression, or a named consumer. (AGENTS.md prime directive; DESIGN.md §1.)
+measured regression, or a named consumer — but **closing an existing capability's cross-axis gap
+is itself a concrete demand (invariant 14), not speculation**. (AGENTS.md prime directive; DESIGN.md §1.)
 
 ## 2. Confinement is the masking lowering
 
@@ -185,3 +186,47 @@ format-version branch, or `unwrap_or(legacy)` fallback with no convergence plan;
 emitting the old layout after the new one exists; or "old artifacts still use it" offered to justify
 keeping a fork. (Owner decision 2026-08-25; sharpens invariant 1 — every retained fork is TCB
 surface and an assumption the tree can no longer make.)
+
+## 14. One frontier, consistent across every axis
+
+The set of **accepted** guest-observable capabilities is the *frontier*. New functionality may be
+**spiked on the interpreter** (the oracle) alone — the proving ground. But the moment a capability is
+**accepted** — merged as a *supported* feature, not an experimental flag — holding the frontier
+consistent is the **highest priority**: the immediate follow-up is to carry that capability across
+every axis it can reach —
+
+- **Runtime backend** — bytecode interpreter, Cranelift JIT, wasm-JIT: each runs it identically or
+  *declines to the oracle* (invariant 9), never a limiting workaround.
+- **Host target** — native (x86/arm), wasm32, Windows: a guest never behaves differently by platform;
+  a capability landing native-first is not done until it reaches the others.
+- **Concurrency model** — the cooperative multiplex driver (`CoopRun`) and the genuinely-parallel
+  per-Worker driver (`temen_par_*`) both carry it.
+- **Code origin** — the host-translated base module and a §22 guest-JIT unit (`vm_jit_*`,
+  runtime-compiled by the guest) both support it.
+- **Nesting** — it holds for a confined §14 child, a fork/clone twin, and a spawned thread, not just
+  the root.
+- **Debugger** — it stays observable under the debug tier, disciplined by invariant 9's observability
+  corollary (which governs *how* that tiering may differ).
+- **Durability** — its live state is capturable + restorable (warm snapshot) and representable in the
+  durable codec — not a `GeometryMismatch` refusal.
+
+Invariant 1 gates *admission* to the frontier (don't spike speculative capabilities — the frontier is
+expensive to hold); **this** invariant gates *propagation across* it: once admitted, **no partial
+support**. "No consumer yet" never justifies a standing gap — the inconsistency is itself the concrete
+demand invariant 1 asks for. A capability's presence on any axis is only ever **closed**, **in flight**
+(a tracked issue, worked immediately), or a **recorded exception** below — never parked. A workaround
+that sidesteps a gap by capping the guest (pre-sizing a fixed window because emitted code "can't grow
+it"; a snapshot that refuses a grown extent) **is** the gap, disguised — not a resting state.
+*Violated by:* a capability landed on one axis and left off another it could reach, excused by "no
+consumer"; a standing pre-size / over-allocate / refuse workaround with no tracked plan; a "decline"
+that hides un-wired support rather than proven impossibility; a spike merged as a supported feature
+without either propagation or a recorded exception. (Owner decision 2026-08-27; sharpens invariants
+1 + 9 + 13; the #816 warm-coop-grows-but-single-shot-JIT-pre-sizes gap.)
+
+**Accepted exceptions** — a *genuine impossibility* on some axis, each carrying the owner's dated
+approval; adding one always requires owner sign-off:
+
+- **Durability / §13 `Backed` shared regions** *(provisional — pending owner review, 2026-08-27):* a
+  byte snapshot cannot reproduce a live alias into shared backing, so `layout_snapshot_safe`
+  fail-closes on a `Backed` region. Recorded as the current behavior; **not yet ratified** as a
+  permanent exception.
