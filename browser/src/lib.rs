@@ -5634,10 +5634,10 @@ pub extern "C" fn temen_run_onramp(
     out.value
 }
 
-/// The **live host import** for streamed stdout: the page's `temen_host.stdout_chunk` — called once per
-/// stdout write with the chunk's `[ptr, ptr+len)` in linear memory, so the page appends it to the card's
-/// output pane as the guest produces it. Wasm-only (like `webgpu_op`); native builds have no such import
-/// and the streaming FFI degrades to plain capture.
+// The **live host import** for streamed stdout: the page's `temen_host.stdout_chunk` — called once per
+// stdout write with the chunk's `[ptr, ptr+len)` in linear memory, so the page appends it to the card's
+// output pane as the guest produces it. Wasm-only (like `webgpu_op`); native builds have no such import
+// and the streaming FFI degrades to plain capture. (Plain `//`: rustdoc rejects `///` on an extern block.)
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "temen_host")]
 extern "C" {
