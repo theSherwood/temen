@@ -423,12 +423,12 @@ fn c_null_deref_faults_under_the_guard() {
     verify_module(&m).expect("verify");
     // Guarded layout: the guard extent is unconditional, and the args base is shifted up by it.
     assert_eq!(
-        temen_ir::module_null_guard(&m),
-        Some(temen_ir::POWERBOX_NULL_GUARD),
+        temen_ir::module_null_guard(),
+        temen_ir::POWERBOX_NULL_GUARD,
         "module runs under the unconditional guard:\n{ir}"
     );
     assert_eq!(
-        temen_ir::module_args_base(&m),
+        temen_ir::module_args_base(),
         temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_ARGS_BASE,
         "args base is one guard up"
     );

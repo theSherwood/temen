@@ -74,12 +74,12 @@ fn guarded_layout_runs_end_to_end() {
     let guarded = translate(&ll);
 
     assert_eq!(
-        temen_ir::module_null_guard(&guarded),
-        Some(temen_ir::POWERBOX_NULL_GUARD),
+        temen_ir::module_null_guard(),
+        temen_ir::POWERBOX_NULL_GUARD,
         "the guard is unconditional (#1094)"
     );
     assert_eq!(
-        temen_ir::module_args_base(&guarded),
+        temen_ir::module_args_base(),
         temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_ARGS_BASE,
         "guarded args base is one guard up"
     );
@@ -113,8 +113,8 @@ fn guarded_layout_survives_wire_and_strip() {
     let mut rt =
         temen_encode::decode_module(&temen_encode::encode_module(&guarded)).expect("roundtrip");
     assert_eq!(
-        temen_ir::module_null_guard(&rt),
-        Some(temen_ir::POWERBOX_NULL_GUARD),
+        temen_ir::module_null_guard(),
+        temen_ir::POWERBOX_NULL_GUARD,
         "runs under the unconditional guard after the wire roundtrip"
     );
     temen_run::demote_exports(&mut rt, &[]);

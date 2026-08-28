@@ -903,7 +903,7 @@ impl Inspector {
         host.record_caps(); // W1: tape the cap inputs so `seek` can re-execute faithfully
         let host = Arc::new(Mutex::new(host));
         let shared = Arc::new(Mutex::new(DebugShared::new()));
-        let null_guard = temen_ir::module_null_guard(m).unwrap_or(0); // #964/#1059
+        let null_guard = temen_ir::module_null_guard(); // #964/#1059
         let root = Self::fresh_single_root(
             Arc::clone(&funcs),
             Arc::clone(&types),
@@ -1048,7 +1048,7 @@ impl Inspector {
         host0.record_caps(); // W1: tape cap inputs so scheduled `seek` re-executes faithfully
         let host = Arc::new(Mutex::new(host0));
         let shared = Arc::new(Mutex::new(DebugShared::new()));
-        let null_guard = temen_ir::module_null_guard(m).unwrap_or(0); // #964/#1059
+        let null_guard = temen_ir::module_null_guard(); // #964/#1059
         let sched = Self::fresh_scheduled(
             Arc::clone(&funcs),
             Arc::clone(&types),
@@ -1869,7 +1869,7 @@ pub fn run_with_host_traced(
     let mut mem = m.memory.map(|mc| {
         let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
         mm.init_data(&m.data); // §3a/D40 data segments (copy + RO-protect)
-        mm.seed_null_guard(temen_ir::module_null_guard(m).unwrap_or(0)); // #964
+        mm.seed_null_guard(temen_ir::module_null_guard()); // #964
         mm
     });
     drive(&m.funcs, &m.types, func, args, fuel, &mut mem, host)
@@ -2802,7 +2802,7 @@ pub fn run_capture_reserved(
         let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
         mm.seed(init_mem);
         mm.init_data(&m.data); // §3a/D40 data segments (after the escape-oracle seed)
-        mm.seed_null_guard(temen_ir::module_null_guard(m).unwrap_or(0)); // #964
+        mm.seed_null_guard(temen_ir::module_null_guard()); // #964
         mm
     });
     let (r, ..) = drive(&m.funcs, &m.types, func, args, fuel, &mut mem, &mut host);
@@ -2840,7 +2840,7 @@ pub fn run_capture_reserved_with_host(
         let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
         mm.seed(init_mem);
         mm.init_data(&m.data);
-        mm.seed_null_guard(temen_ir::module_null_guard(m).unwrap_or(0)); // #964
+        mm.seed_null_guard(temen_ir::module_null_guard()); // #964
         mm
     });
     let (r, ..) = drive(&m.funcs, &m.types, func, args, fuel, &mut mem, host);
@@ -2900,7 +2900,7 @@ pub fn run_capture_reserved_with_host_prots(
         let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
         mm.seed(init_mem);
         mm.init_data(&m.data);
-        mm.seed_null_guard(temen_ir::module_null_guard(m).unwrap_or(0)); // #964
+        mm.seed_null_guard(temen_ir::module_null_guard()); // #964
         if let Some(prots) = init_prots {
             mm.apply_prots(prots);
         }
@@ -2939,7 +2939,7 @@ pub fn run_capture_sub(
         let mut mm = Mem::sub_window(base, mc.size_log2, parent_bytes);
         mm.seed_parent(init_mem); // seed the whole parent, not just the child slice
         mm.init_data_at(&m.data, base); // child-relative segments shifted into the slice
-        mm.seed_null_guard(temen_ir::module_null_guard(m).unwrap_or(0)); // #964
+        mm.seed_null_guard(temen_ir::module_null_guard()); // #964
         mm
     });
     let (r, ..) = drive(&m.funcs, &m.types, func, args, fuel, &mut mem, &mut host);
@@ -2971,7 +2971,7 @@ pub fn run_scheduled(
     let mem = m.memory.map(|mc| {
         let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
         mm.init_data(&m.data);
-        mm.seed_null_guard(temen_ir::module_null_guard(m).unwrap_or(0)); // #964
+        mm.seed_null_guard(temen_ir::module_null_guard()); // #964
         mm
     });
     let det = Arc::new(DetSched::new(seed, MAX_VCPUS));
@@ -11624,9 +11624,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let mut fm =
                                     Mem::with_reservation(DEFAULT_RESERVED_LOG2, size_log2 as u8);
                                 fm.init_data(&cm.data);
-                                fm.seed_null_guard(
-                                    temen_ir::module_null_guard(&cm.module).unwrap_or(0),
-                                ); // #964
+                                fm.seed_null_guard(temen_ir::module_null_guard()); // #964
                                 let mut ch = Host::new();
                                 ch.set_attestation({
                                     let hg = host.lock_unpoisoned();
@@ -12436,7 +12434,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 sched.wake_pipe_writers(pipe);
                             }
                             return Ok(Inner::Exec(Box::new(ExecReq {
-                                null_guard: temen_ir::module_null_guard(&cm.module).unwrap_or(0),
+                                null_guard: temen_ir::module_null_guard(),
                                 funcs: cm.funcs,
                                 types: cm.types,
                                 data: cm.data,
@@ -19855,7 +19853,7 @@ impl Host {
         let mem = m.memory.map(|mc| {
             let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
             mm.init_data(&m.data);
-            mm.seed_null_guard(temen_ir::module_null_guard(m).unwrap_or(0)); // #964
+            mm.seed_null_guard(temen_ir::module_null_guard()); // #964
             mm
         });
         // A bare fn-list wire carries no op names — the anonymous-shape family (#1109).
@@ -19890,7 +19888,7 @@ impl Host {
         // it here — the one place every run path registers the running module — lets the native JIT's
         // Memory-cap backend (`temen-run`'s `MprotectWindow`, rebuilt per `call.cap` with no module
         // in reach) mirror the interpreter's refusal/unmapped semantics for the reserved region.
-        self.null_guard = temen_ir::module_null_guard(m).unwrap_or(0);
+        self.null_guard = temen_ir::module_null_guard();
         self.self_module = Some(Arc::clone(m));
     }
 
@@ -20353,7 +20351,7 @@ impl Host {
                 let mem = m.memory.map(|mc| {
                     let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
                     mm.init_data(&m.data);
-                    mm.seed_null_guard(temen_ir::module_null_guard(&m).unwrap_or(0)); // #964
+                    mm.seed_null_guard(temen_ir::module_null_guard()); // #964
                     mm
                 });
                 Arc::new(Mutex::new(ProviderState {

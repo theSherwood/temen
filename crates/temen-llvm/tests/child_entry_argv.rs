@@ -89,7 +89,7 @@ fn child_entry_parses_argv() {
     // Seed the §3e args buffer at the child's args base: `{argc=3, envc=0}` + packed "p\0Z\0q\0".
     // This is exactly what an op-13 parent seeds into the child's carve. #964/#1094: a guarded child
     // reads argv one guard up, so key off `module_args_base` (== POWERBOX_ARGS_BASE for a legacy child).
-    let base = temen_ir::module_args_base(&t.module) as usize;
+    let base = temen_ir::module_args_base() as usize;
     let mut init = vec![0u8; base + 32];
     init[base..base + 4].copy_from_slice(&3u32.to_le_bytes());
     init[base + 4..base + 8].copy_from_slice(&0u32.to_le_bytes());

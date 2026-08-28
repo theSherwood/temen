@@ -34,10 +34,8 @@ pub(crate) fn dominates(idom: &[Option<u32>], a: u32, b: u32) -> bool {
 /// new parameter appended at `to`.
 pub(crate) fn append_edge_arg(term: &mut Terminator, to: u32, arg: Value) {
     match term {
-        Terminator::Br { target, args } => {
-            if *target == to {
-                args.push(arg);
-            }
+        Terminator::Br { target, args } if *target == to => {
+            args.push(arg);
         }
         Terminator::BrIf {
             then_blk,

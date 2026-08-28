@@ -43,8 +43,8 @@ fn entryless_kernel_is_guarded_and_keeps_the_null_region_empty() {
 
     // The guard is unconditional (#1094) even though the kernel has no `_start`.
     assert_eq!(
-        temen_ir::module_null_guard(&kernel),
-        Some(guard),
+        temen_ir::module_null_guard(),
+        guard,
         "the guard is unconditional for an entry-less kernel too"
     );
     assert!(

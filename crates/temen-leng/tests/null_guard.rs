@@ -54,8 +54,8 @@ fn guarded_powerbox_link_marks_and_clears_the_null_region() {
 
     // (1) The module runs under the (unconditional, #1094) guard extent.
     assert_eq!(
-        temen_ir::module_null_guard(&m),
-        Some(guard),
+        temen_ir::module_null_guard(),
+        guard,
         "the powerbox link runs under the unconditional NULL guard"
     );
 
@@ -73,7 +73,7 @@ fn guarded_powerbox_link_marks_and_clears_the_null_region() {
     // `guard + POWERBOX_HEAP_BRK`/`TOP`, exactly where the compute shim reads them and the DAP heap
     // view keys off (`scratch == module_null_guard`). A word left at the legacy 32/40 would sit in the
     // now-`Unmapped` region and fault the shim's `mmap`.
-    let scratch = temen_ir::module_null_guard(&m).unwrap();
+    let scratch = temen_ir::module_null_guard();
     let read_word = |off: u64| -> u64 {
         let seg = m
             .data

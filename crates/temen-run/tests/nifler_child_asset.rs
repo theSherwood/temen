@@ -161,7 +161,7 @@ fn child_entry_asset_parses_nim_byte_identical_to_native_nifler() {
     let parent = temen_text::parse_module(&parent_src(
         child_sl,
         carve_off,
-        temen_ir::module_args_base(&child),
+        temen_ir::module_args_base(),
     ))
     .expect("parse parent");
     temen_verify::verify_module(&parent).expect("verify parent");

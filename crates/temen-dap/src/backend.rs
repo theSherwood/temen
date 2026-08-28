@@ -1227,14 +1227,8 @@ impl Debuggee for BytecodeBackend {
                 Json::obj(vec![
                     // #964/#1094: a module's args blob (and low scratch) sits one guard up (the
                     // unconditional guarded layout) — report where THIS module actually reads it.
-                    (
-                        "argsBase",
-                        Json::i(temen_ir::module_args_base(&self.module) as i64),
-                    ),
-                    (
-                        "argsEnd",
-                        Json::i(temen_ir::module_args_end(&self.module) as i64),
-                    ),
+                    ("argsBase", Json::i(temen_ir::module_args_base() as i64)),
+                    ("argsEnd", Json::i(temen_ir::module_args_end() as i64)),
                     ("stackPage", Json::i(temen_ir::POWERBOX_STACK_PAGE as i64)),
                     (
                         "stackReserve",
@@ -1249,7 +1243,7 @@ impl Debuggee for BytecodeBackend {
                 Some(i64::from_le_bytes(b.try_into().ok()?))
             };
             // #964: the heap words ride the (possibly guard-shifted) low scratch.
-            let scratch = temen_ir::module_null_guard(&self.module).unwrap_or(0);
+            let scratch = temen_ir::module_null_guard();
             if let (Some(brk), Some(top)) = (
                 word(scratch + temen_ir::POWERBOX_HEAP_BRK),
                 word(scratch + temen_ir::POWERBOX_HEAP_TOP),

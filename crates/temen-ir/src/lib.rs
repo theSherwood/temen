@@ -3365,28 +3365,29 @@ pub fn write_args_blob(args: &[&[u8]], env: &[&[u8]]) -> Vec<u8> {
 /// by exactly one guard — and its globals/stack base sits at or above `2 * POWERBOX_NULL_GUARD`.
 pub const POWERBOX_NULL_GUARD: u64 = 16384;
 
-/// The NULL-guard extent of `m`: always `Some(POWERBOX_NULL_GUARD)` (#1094). The guard is
-/// **unconditional** now — every module reserves `[0, POWERBOX_NULL_GUARD)` so a NULL dereference
-/// traps on every one, the one canonical layout (INVARIANTS #13). (A host still no-ops the seed for a
-/// window smaller than the guard — see `Mem::seed_null_guard` — so tiny sub-windows are unaffected.)
-/// This is the single chokepoint every tier reads the extent from; `_m` is unused (the retired
-/// `__null_guard` marker export it once resolved is gone — #1094), and the `Option` return is kept
-/// only so the many `…unwrap_or(0)` call sites and the wasm-JIT's `Option<u64>` plumbing stay stable.
-pub fn module_null_guard(_m: &Module) -> Option<u64> {
-    Some(POWERBOX_NULL_GUARD)
+/// The NULL-guard extent: always `POWERBOX_NULL_GUARD` (#1094). The guard is **unconditional** —
+/// every module reserves `[0, POWERBOX_NULL_GUARD)` so a NULL dereference traps on every one, the
+/// one canonical layout (INVARIANTS #13). (A host still no-ops the seed for a window smaller than
+/// the guard — see `Mem::seed_null_guard` — so tiny sub-windows are unaffected.) This is the single
+/// chokepoint every tier reads the extent from; the per-module `Option<u64>` form it once had (the
+/// retired `__null_guard` marker resolution, whose `…unwrap_or(0)` legacy branch was the last
+/// dual-mode residue) is deleted — #1094.
+pub fn module_null_guard() -> u64 {
+    POWERBOX_NULL_GUARD
 }
 
-/// Where a host seeds the args blob for `m` (and where its `_start` reads it): the guarded base,
+/// Where a host seeds the args blob (and where a `_start` reads it): the guarded base,
 /// `POWERBOX_NULL_GUARD + POWERBOX_ARGS_BASE`, unconditionally (#1094).
-pub fn module_args_base(_m: &Module) -> u64 {
+pub fn module_args_base() -> u64 {
     POWERBOX_NULL_GUARD + POWERBOX_ARGS_BASE
 }
 
-/// The exclusive end of `m`'s args region — the bound a host must reject a blob at: the guarded
+/// The exclusive end of the args region — the bound a host must reject a blob at: the guarded
 /// `POWERBOX_NULL_GUARD + POWERBOX_ARGS_END`, unconditionally (#1094).
-pub fn module_args_end(_m: &Module) -> u64 {
+pub fn module_args_end() -> u64 {
     POWERBOX_NULL_GUARD + POWERBOX_ARGS_END
 }
+
 /// The alignment of the powerbox **data-stack base** ([`powerbox_entry_sp`]). It must be **≥ the
 /// largest host page any artifact may run on** — 64 KiB (the wasm linear-memory page) — because the
 /// D40 read-only const-segment protection is applied at *host-page* granularity: the runtime rounds a

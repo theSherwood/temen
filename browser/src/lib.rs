@@ -3227,7 +3227,7 @@ fn bash_host_build(
         &[b"PATH=/bin", b"HOME=/"]
     };
     let blob = temen_ir::write_args_blob(argv, env);
-    let base = temen_ir::module_args_base(m) as usize;
+    let base = temen_ir::module_args_base() as usize;
     let mut init_mem = vec![0u8; base + blob.len()];
     init_mem[base..].copy_from_slice(&blob);
     Some((host, posix, init_mem))
@@ -3388,7 +3388,7 @@ fn pg_setup(
     // `find_my_exec` resolves; chibicc: `["chibicc", "/in.c"]`). #964/#1094: a module reads its args
     // one guard higher (the unconditional guarded layout) — place the blob where its `_start` looks.
     let blob = pg_args_blob(argv);
-    let base = temen_ir::module_args_base(m) as usize;
+    let base = temen_ir::module_args_base() as usize;
     let mut init_mem = vec![0u8; base + blob.len()];
     init_mem[base..].copy_from_slice(&blob);
     Ok((host, init_mem, fs_handle))
@@ -6083,7 +6083,7 @@ pub extern "C" fn temen_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
     }
     // Seed the on-ramp heap bump words (`_start` normally does this): brk = top = heap_base.
     // #964: a marked module's heap words sit one guard up.
-    let scratch = temen_ir::module_null_guard(&m).unwrap_or(0);
+    let scratch = temen_ir::module_null_guard();
     // SAFETY: `win_ptr` owns `win` zeroed bytes; no engine run is in flight (sole access here).
     unsafe {
         let w = core::slice::from_raw_parts_mut(win_ptr, win as usize);

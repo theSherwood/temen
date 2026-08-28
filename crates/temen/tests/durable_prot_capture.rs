@@ -295,7 +295,7 @@ fn jit_capture_matches_interp_for_a_readonly_segment() {
         &m.data,
         WINDOW as u64,
         npages,
-        temen_ir::module_null_guard(&m).unwrap_or(0),
+        temen_ir::module_null_guard(),
     );
 
     assert_eq!(caps_i[RO_OFF / PAGE], CapturedProt::Ro);

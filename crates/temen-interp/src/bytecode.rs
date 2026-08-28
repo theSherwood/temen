@@ -1993,7 +1993,7 @@ fn build_mem(m: &Module) -> Option<Mem> {
     m.memory.map(|mc| {
         let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
         mm.init_data(&m.data);
-        mm.seed_null_guard(temen_ir::module_null_guard(m).unwrap_or(0)); // #964
+        mm.seed_null_guard(temen_ir::module_null_guard()); // #964
         mm
     })
 }
@@ -2178,7 +2178,7 @@ pub fn compile_and_run_capture(
         let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
         mm.seed(init_mem);
         mm.init_data(&m.data);
-        mm.seed_null_guard(temen_ir::module_null_guard(m).unwrap_or(0)); // #964
+        mm.seed_null_guard(temen_ir::module_null_guard()); // #964
         mm
     });
     let r = run(dom, func, args, fuel, &mut mem, &mut host);
@@ -2220,7 +2220,7 @@ pub fn compile_and_run_capture_over(
         );
         mm.seed(init_mem);
         mm.init_data(&m.data);
-        mm.seed_null_guard(temen_ir::module_null_guard(m).unwrap_or(0)); // #964
+        mm.seed_null_guard(temen_ir::module_null_guard()); // #964
         mm
     });
     let r = run(dom, func, args, fuel, &mut mem, &mut host);
@@ -2260,7 +2260,7 @@ pub fn compile_and_run_over_shared_with_host(
         let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, mc.size_log2, back);
         if seed_data {
             mm.init_data(&m.data);
-            mm.seed_null_guard(temen_ir::module_null_guard(m).unwrap_or(0)); // #964
+            mm.seed_null_guard(temen_ir::module_null_guard()); // #964
         }
         mm
     });
@@ -2292,7 +2292,7 @@ impl SharedProgram {
             n_funcs,
             mem_size_log2: m.memory.map(|mc| mc.size_log2),
             data: m.data.clone(),
-            null_guard: temen_ir::module_null_guard(m).unwrap_or(0),
+            null_guard: temen_ir::module_null_guard(),
         })
     }
 
@@ -2503,7 +2503,7 @@ pub fn compile_and_run_capture_over_parallel_with_host(
         );
         mm.seed(init_mem);
         mm.init_data(&m.data);
-        mm.seed_null_guard(temen_ir::module_null_guard(m).unwrap_or(0)); // #964
+        mm.seed_null_guard(temen_ir::module_null_guard()); // #964
         mm
     });
     let (r, mem) = drive_parallel(dom, func, args, *fuel, mem, host);
@@ -2557,7 +2557,7 @@ impl VcpuProgram {
             dom,
             mem_size_log2: m.memory.as_ref().map(|mc| mc.size_log2),
             data: m.data.clone(),
-            null_guard: temen_ir::module_null_guard(m).unwrap_or(0),
+            null_guard: temen_ir::module_null_guard(),
         })
     }
 
@@ -4376,7 +4376,7 @@ pub fn run_capture_reserved_over_compiled_with_host(
         let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
         mm.seed(init_mem);
         mm.init_data(&m.data);
-        mm.seed_null_guard(temen_ir::module_null_guard(m).unwrap_or(0)); // #964
+        mm.seed_null_guard(temen_ir::module_null_guard()); // #964
         mm
     });
     let r = run(dom, func, args, fuel, &mut mem, host);
@@ -8194,7 +8194,7 @@ fn exec_image_build(
         let base = m.window.base();
         // #1059: preserve the command's guard-shifted args region across the image-replace (legacy
         // `[128, 16384)` for an unmarked command); mirrors the tree-walker exec path.
-        let null_guard = temen_ir::module_null_guard(&cmodule).unwrap_or(0);
+        let null_guard = temen_ir::module_null_guard();
         m.commit_fresh_image(
             (1u64 << cmem_log2.expect("mod_ok")).min(child_size),
             null_guard,
@@ -12200,7 +12200,7 @@ impl CoopRun {
             let mut mm = Mem::with_reservation_over(reserved_log2, mc.size_log2, back);
             mm.seed(init_mem);
             mm.init_data(&m.data);
-            mm.seed_null_guard(temen_ir::module_null_guard(m).unwrap_or(0)); // #964
+            mm.seed_null_guard(temen_ir::module_null_guard()); // #964
             mm
         });
         Self::assemble(m, entry, args, fuel, host, tierup, mem)
