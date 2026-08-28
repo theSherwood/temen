@@ -14,7 +14,7 @@
 //! than a top-level powerbox program — so a Rust-on-Temen driver guest can fan phases out the same way.
 //! The child's imports `exit`/`read`/`write`/`vm_map` bind by the reference policy to the re-granted
 //! Exit/Stream and the auto-granted AddressSpace; `fs` resolves by name from the grant list. #964/#1094:
-//! argv seeds at `carve + module_args_base(child)` — one guard up, the unconditional guarded layout;
+//! argv seeds at `carve + module_args_base()` — one guard up, the unconditional guarded layout;
 //! the grant records/cap-names stay in the parent window (the op-13 handler reads them in the parent's
 //! context, so the child's guard never touches them).
 
@@ -133,7 +133,7 @@ fn main() {
     let parent = temen_text::parse_module(&parent_src(
         child_sl,
         carve_off,
-        temen_ir::module_args_base(&child),
+        temen_ir::module_args_base(),
         &argv,
     ))
     .expect("parse parent");

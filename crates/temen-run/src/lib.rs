@@ -4420,16 +4420,16 @@ impl RunConfig {
     /// `None` when neither `args` nor `env` is set. Seeded *before* the module's data segments (which
     /// live at/above `POWERBOX_ARGS_END`), so the two never overlap. The single source for the
     /// powerbox args layout (shared by `Instance::run`/`run_diff` and the `run_powerbox*` wrappers).
-    fn init_mem(&self, m: &Module) -> Result<Option<Vec<u8>>, String> {
+    fn init_mem(&self) -> Result<Option<Vec<u8>>, String> {
         if self.args.is_empty() && self.env.is_empty() {
             return Ok(None);
         }
         let args: Vec<&[u8]> = self.args.iter().map(|v| v.as_slice()).collect();
         let env: Vec<&[u8]> = self.env.iter().map(|v| v.as_slice()).collect();
         let blob = build_args_blob(&args, &env)?;
-        // #964: a `__null_guard`-marked module reads its args one guard higher — place the blob
-        // where the module's own `_start` looks (`module_args_base`), legacy 128 otherwise.
-        let base = temen_ir::module_args_base(m) as usize;
+        // #964/#1094: every module reads its args at the guarded base — place the blob where the
+        // module's own `_start` looks (`module_args_base`).
+        let base = temen_ir::module_args_base() as usize;
         let mut buf = vec![0u8; base + blob.len()];
         buf[base..].copy_from_slice(&blob);
         Ok(Some(buf))
@@ -5463,7 +5463,7 @@ impl Instance {
         let owned = self.window_override(config);
         let m = owned.as_ref().unwrap_or(&self.module);
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-        let init_mem = config.init_mem(m)?;
+        let init_mem = config.init_mem()?;
 
         let mut host = Host::new();
         host.stdin = config.stdin.clone();
@@ -5538,7 +5538,7 @@ impl Instance {
         let owned = self.window_override(config);
         let m = owned.as_ref().unwrap_or(&self.module);
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-        let init_mem = config.init_mem(m)?;
+        let init_mem = config.init_mem()?;
 
         let mut host = Host::new();
         host.stdin = config.stdin.clone();
@@ -5597,7 +5597,7 @@ impl Instance {
         let owned = self.window_override(config);
         let m = owned.as_ref().unwrap_or(&self.module);
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-        let init_mem = config.init_mem(m)?;
+        let init_mem = config.init_mem()?;
 
         // Two hosts, granted identically (grants are deterministic, so the handle vectors match).
         let mut hi = Host::new();

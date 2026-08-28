@@ -198,8 +198,8 @@ fn guard_is_never_elided() {
 fn plain_emit_carries_the_unconditional_guard() {
     let m = build();
     assert_eq!(
-        temen_ir::module_null_guard(&m),
-        Some(GUARD),
+        temen_ir::module_null_guard(),
+        GUARD,
         "the guard is unconditional (#1094) — no marker needed"
     );
 

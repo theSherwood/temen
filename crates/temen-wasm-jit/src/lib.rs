@@ -1610,7 +1610,7 @@ pub fn compile_module_with_split(
         None,
         false,
         None,
-        temen_ir::module_null_guard(m),
+        Some(temen_ir::module_null_guard()),
         &[],
         &split_plan,
     )
@@ -1914,7 +1914,7 @@ pub fn compile_module_b2_split(
         Some(table_log2),
         false,
         None,
-        temen_ir::module_null_guard(m),
+        Some(temen_ir::module_null_guard()),
         &[],
         &split_plan,
     )
@@ -4967,7 +4967,7 @@ fn emit_page_check_one(cx: &mut FnCtx, code: &mut Vec<u8>, delta: u64, write: bo
 /// `memory 10`) would get a guard check covering its whole window and trap every access, diverging from
 /// the interpreter oracle (which seeds no guard for that window).
 fn emit_null_guard_extent(m: &temen_ir::Module) -> Option<u64> {
-    let g = temen_ir::module_null_guard(m)?;
+    let g = temen_ir::module_null_guard();
     let win = m.memory.as_ref().map_or(0, |mem| 1u64 << mem.size_log2);
     (g <= win).then_some(g)
 }

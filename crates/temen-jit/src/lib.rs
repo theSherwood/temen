@@ -2845,7 +2845,7 @@ impl CompiledModule {
         // seeds/copies carves outside the guarded call).
         #[cfg(fiber_rt)]
         if let Some(n) = &nursery {
-            n.set_null_guard(temen_ir::module_null_guard(m).unwrap_or(0));
+            n.set_null_guard(temen_ir::module_null_guard());
         }
         #[cfg(fiber_rt)]
         let inst = if let Some(n) = &nursery {
@@ -3277,7 +3277,7 @@ impl CompiledModule {
             // #964: the marker opts this module's window into the NULL guard — window-relative,
             // so a §14 sub-window compile guards `[sub_base, sub_base + guard)`, exactly where the
             // interpreter's `run_capture_sub` seeds its child-relative guard.
-            null_guard: temen_ir::module_null_guard(m).unwrap_or(0),
+            null_guard: temen_ir::module_null_guard(),
             mem_size_log2: m.memory.map(|mc| mc.size_log2),
             data: m.data.clone(),
             restore_prots: Vec::new(),

@@ -193,7 +193,7 @@ fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) ->
     // the unconditional guarded layout; key off `module_args_base`, not a bare constant, so
     // nifler/nimsem/hexer find argv where their `_start` looks.
     let blob = pg_args_blob(&argv.iter().map(|s| s.as_bytes()).collect::<Vec<_>>());
-    let base = temen_ir::module_args_base(m) as usize;
+    let base = temen_ir::module_args_base() as usize;
     let mut init_mem = vec![0u8; base + blob.len()];
     init_mem[base..].copy_from_slice(&blob);
 

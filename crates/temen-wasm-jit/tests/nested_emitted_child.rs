@@ -145,7 +145,7 @@ fn spawn_emitted_child(
 ) -> Result<i32, wasmi::Error> {
     let st = caller.data();
     let child = st.child.as_ref().expect("child module recorded");
-    let guard = temen_ir::module_null_guard(child).unwrap_or(0);
+    let guard = temen_ir::module_null_guard();
     let gate = check_child_carve(
         child,
         off as u64,

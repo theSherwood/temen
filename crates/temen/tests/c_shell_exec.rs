@@ -223,7 +223,7 @@ fn run(
     // `module_args_base` = guard + POWERBOX_ARGS_BASE, the unconditional guarded layout).
     let mut init = vec![0u8; win];
     let blob = args_blob(argv);
-    let args_base = temen_ir::module_args_base(&m) as usize;
+    let args_base = temen_ir::module_args_base() as usize;
     init[args_base..args_base + blob.len()].copy_from_slice(&blob);
 
     if jit {

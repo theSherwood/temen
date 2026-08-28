@@ -604,8 +604,7 @@ fn nim_powerbox_seeds_heap_words_to_window_top() {
     let win = 1u64 << m.memory.expect("powerbox module has a window").size_log2;
     // #964/#1094: the link bakes the heap words one guard up, in the guard's scratch page — read them
     // at `scratch + POWERBOX_HEAP_BRK`/`TOP` (the DAP convention). The guard is unconditional now.
-    let scratch =
-        temen_ir::module_null_guard(&m).expect("powerbox link runs under the unconditional guard");
+    let scratch = temen_ir::module_null_guard();
     let brk = read_word(scratch + temen_ir::POWERBOX_HEAP_BRK);
     let top = read_word(scratch + temen_ir::POWERBOX_HEAP_TOP);
     let entry_sp = temen_ir::powerbox_entry_sp(&m);
