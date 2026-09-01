@@ -91,7 +91,7 @@ async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp, entry
 // once. Returns the finish status. The caller must have opened the run (`temen_onramp_jit_run_open*`) already.
 // `cacheKey` (optional) is a stable identity of the guest module; when given, the compiled Module and its
 // instance are reused across Runs (see `cachedInstanceF0`).
-async function driveJitRun(ex, memory, cacheKey) {
+async function driveJitRun(ex, memory, cacheKey, afterFinish) {
   const u8 = () => new Uint8Array(memory.buffer);
   // Read the window base + the powerbox handle slots `_start` takes as params, and the env-cell size.
   const win = Number(ex.temen_onramp_jit_run_win_ptr());
@@ -163,6 +163,10 @@ async function driveJitRun(ex, memory, cacheKey) {
   ex.temen_dealloc(env, envBytes);
   ex.temen_onramp_jit_run_report(threw, value); // record the return value + throw before capturing
   const status = ex.temen_onramp_jit_run_finish(); // capture stdout/stderr/exit/value into the shared slots
+  // #1025: a phase whose run produces MULTIPLE memfs files (the nifler crawl's `.p.nif` + `.p.deps.nif`)
+  // reads the extras here, while the run's memfs handle is still live — finish stashed the primary
+  // readback, `afterFinish` reads the rest via `temen_onramp_jit_run_readfile`, then we close.
+  if (afterFinish) afterFinish(ex);
   ex.temen_onramp_jit_run_close();
   // A trap on the emitted tier is a refusal, not a result: throw so the caller runs the guest on the
   // interpreter oracle instead of surfacing a truncated run (INVARIANT 9 — diverge toward refusal).
@@ -621,6 +625,47 @@ export async function runJitNifler(ex, memory, moduleBytes, srcBytes, cacheKey) 
     throw new Error(`JIT nifler open failed: status ${ex.temen_status()} (2 = _start not emittable)`);
   }
   return driveJitRun(ex, memory, cacheKey);
+}
+
+// Run one **nifler import-crawl step** on the wasm-JIT (#1025 route A): `nifler --deps parse <file> <out>`
+// over a `{file: src}` memfs, emitted + emit-cached. Returns `{ status, pnif, deps }` — the `.p.nif` and its
+// `.p.deps.nif` sibling as `Uint8Array`s (the crawl reads the deps to discover imports). Throws on a JIT
+// trap/decline (the caller falls back to the bytecode `temen_run_nifler_crawl_fs`).
+export async function runJitNiflerCrawl(ex, memory, moduleBytes, filePath, outPath, srcBytes, cacheKey) {
+  const u8 = () => new Uint8Array(memory.buffer);
+  const enc = new TextEncoder();
+  const fileB = enc.encode(filePath), outB = enc.encode(outPath);
+  const modP = Number(ex.temen_alloc(moduleBytes.length));
+  const fileP = Number(ex.temen_alloc(fileB.length));
+  const outP = Number(ex.temen_alloc(outB.length));
+  const srcP = Number(ex.temen_alloc(srcBytes.length));
+  u8().set(moduleBytes, modP);
+  u8().set(fileB, fileP);
+  u8().set(outB, outP);
+  u8().set(srcBytes, srcP);
+  const opened = ex.temen_run_nifler_jit_crawl_open(
+    modP, moduleBytes.length, fileP, fileB.length, outP, outB.length, srcP, srcBytes.length);
+  ex.temen_dealloc(modP, moduleBytes.length);
+  ex.temen_dealloc(fileP, fileB.length);
+  ex.temen_dealloc(outP, outB.length);
+  ex.temen_dealloc(srcP, srcBytes.length);
+  if (opened !== 0) {
+    throw new Error(`JIT nifler crawl open failed: status ${ex.temen_status()}`);
+  }
+  const readOut = () => u8().slice(Number(ex.temen_stdout_ptr()), Number(ex.temen_stdout_ptr()) + ex.temen_stdout_len());
+  // `.p.deps.nif` sibling of the `.p.nif` output (memfs strips the leading `/`).
+  const depsKey = outPath.replace(/^\//, '').replace(/\.nif$/, '.deps.nif');
+  const depsB = enc.encode(depsKey);
+  let pnif = new Uint8Array(0), deps = new Uint8Array(0);
+  const status = await driveJitRun(ex, memory, cacheKey, () => {
+    pnif = readOut(); // finish stashed the `.p.nif` readback onto the stdout slot
+    const kp = Number(ex.temen_alloc(depsB.length));
+    u8().set(depsB, kp);
+    ex.temen_onramp_jit_run_readfile(kp, depsB.length); // → stdout slot (overwrites the `.p.nif`)
+    ex.temen_dealloc(kp, depsB.length);
+    deps = readOut();
+  });
+  return { status, pnif, deps };
 }
 
 // Run the **self-host** compile on the wasm-JIT (SELFHOST_C.md §7 step 5): chibicc.temen compiles one of

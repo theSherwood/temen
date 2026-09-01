@@ -4058,6 +4058,289 @@ pub extern "C" fn temen_run_nifler_jit_open(
     }
 }
 
+/// **Wasm-JIT nifler crawl step** (#1025 route A). Like [`temen_run_nifler_jit_open`] but for the import
+/// crawl: runs `nifler --portablePaths --deps parse <file> <out>` on **emitted wasm** so the phase-1 crawl
+/// tiers up. `file` is the module path (its source seeded there in the memfs), `out` the `.p.nif` output
+/// path; nifler also writes the `.p.deps.nif` sibling, read back via [`temen_onramp_jit_run_readfile`].
+/// Emit-cached ([`NiflerEmitCache`]) — one emit, run once per crawled module. Drive with the shared
+/// `temen_onramp_jit_run_*` exports; [`temen_onramp_jit_run_finish`] hands back `out` on the stdout slot.
+///
+/// # Safety
+/// Each `(ptr, len)` must be a live `temen_alloc`ation the host just filled.
+#[no_mangle]
+pub unsafe extern "C" fn temen_run_nifler_jit_crawl_open(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    file_ptr: *const u8,
+    file_len: usize,
+    out_ptr: *const u8,
+    out_len: usize,
+    src_ptr: *const u8,
+    src_len: usize,
+) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    let sl = |p: *const u8, n: usize| unsafe { core::slice::from_raw_parts(p, n) };
+    let bytes = sl(mod_ptr, mod_len);
+    let file = String::from_utf8_lossy(sl(file_ptr, file_len)).into_owned();
+    let out = String::from_utf8_lossy(sl(out_ptr, out_len)).into_owned();
+    let src = sl(src_ptr, src_len);
+    // Seed the source at its path (memfs strips the leading `/`); nifler writes `out` + its `.p.deps.nif`
+    // sibling into the memfs. The `nimcache` dir must exist for those writes.
+    let file_key = file.trim_start_matches('/').to_string();
+    let readback = out.trim_start_matches('/').to_string();
+    let image = temen_fs::encode_image(&[(file_key, src.to_vec())], &["nimcache".to_string()]);
+    let argv: [&[u8]; 6] = [
+        b"nifler",
+        b"--portablePaths",
+        b"--deps",
+        b"parse",
+        file.as_bytes(),
+        out.as_bytes(),
+    ];
+    let key = nifler_module_key(bytes);
+    // SAFETY: single-threaded wasm; exclusive access to the cache.
+    let cached = unsafe { (*core::ptr::addr_of!(NIFLER_EMIT)).as_ref() }
+        .filter(|c| c.key == key)
+        .map(|c| c.emit.clone());
+    let opened = if let Some(emit) = cached {
+        let module_ref = std::sync::Arc::clone(&emit.0);
+        JitOnrampRun::open_owned_run_fs_readback(
+            &module_ref,
+            JIT_RUN_WIN_LOG2,
+            true,
+            &image,
+            &argv,
+            readback,
+            Some(emit),
+        )
+    } else {
+        let m = match temen_encode::decode_module(bytes) {
+            Ok(m) => m,
+            Err(_) => {
+                set(STATUS_DECODE_ERR);
+                return -STATUS_DECODE_ERR;
+            }
+        };
+        if temen_verify::verify_module(&m).is_err() {
+            set(STATUS_VERIFY_ERR);
+            return -STATUS_VERIFY_ERR;
+        }
+        JitOnrampRun::open_owned_run_fs_readback(
+            &m,
+            JIT_RUN_WIN_LOG2,
+            true,
+            &image,
+            &argv,
+            readback,
+            None,
+        )
+        .inspect(|r| {
+            // SAFETY: single-threaded wasm; exclusive access to the cache.
+            unsafe {
+                *core::ptr::addr_of_mut!(NIFLER_EMIT) = Some(NiflerEmitCache {
+                    key,
+                    emit: r.cached_emit(),
+                });
+            }
+        })
+    };
+    match opened {
+        Ok(r) => {
+            // SAFETY: single-threaded wasm; the run is touched only by these export accessors.
+            unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = Some(r) };
+            set(STATUS_OK);
+            0
+        }
+        Err(status) => {
+            set(status);
+            -status
+        }
+    }
+}
+
+/// **Bytecode nifler crawl step** (#1025 route A oracle + fallback): the tree-walker twin of
+/// [`temen_run_nifler_jit_crawl_open`] — runs `nifler --portablePaths --deps parse <file> <out>` on the
+/// interpreter over a `{file: src}` memfs and stashes the two products the crawl reads: `out` (`.p.nif`)
+/// onto [`OUT`] and its `.p.deps.nif` sibling onto [`ERR`]. Returns `STATUS_OK`, else a `STATUS_*`.
+///
+/// # Safety
+/// Each `(ptr, len)` must be a live `temen_alloc`ation the host just filled.
+#[no_mangle]
+pub unsafe extern "C" fn temen_run_nifler_crawl_fs(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    file_ptr: *const u8,
+    file_len: usize,
+    out_ptr: *const u8,
+    out_len: usize,
+    src_ptr: *const u8,
+    src_len: usize,
+) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    let sl = |p: *const u8, n: usize| unsafe { core::slice::from_raw_parts(p, n) };
+    let file = String::from_utf8_lossy(sl(file_ptr, file_len)).into_owned();
+    let out = String::from_utf8_lossy(sl(out_ptr, out_len)).into_owned();
+    let src = sl(src_ptr, src_len);
+    let m = match temen_encode::decode_module(sl(mod_ptr, mod_len)) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return -STATUS_DECODE_ERR;
+        }
+    };
+    let file_key = file.trim_start_matches('/').to_string();
+    let readback = out.trim_start_matches('/').to_string();
+    let deps_key = readback.strip_suffix(".nif").map_or_else(
+        || format!("{readback}.deps.nif"),
+        |s| format!("{s}.deps.nif"),
+    );
+    let image = temen_fs::encode_image(&[(file_key, src.to_vec())], &["nimcache".to_string()]);
+    let argv: [&[u8]; 6] = [
+        b"nifler",
+        b"--portablePaths",
+        b"--deps",
+        b"parse",
+        file.as_bytes(),
+        out.as_bytes(),
+    ];
+    let argv_refs: Vec<&[u8]> = argv.to_vec();
+    let (mut host, init_mem, fs) = match pg_setup(&m, &image, &argv_refs) {
+        Ok(s) => s,
+        Err(status) => {
+            set(status);
+            return -status;
+        }
+    };
+    let mut fuel = u64::MAX;
+    bytecode::compile_and_run_capture_reserved_with_host(
+        &m,
+        0,
+        &[],
+        &mut fuel,
+        &init_mem,
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        &mut host,
+    );
+    let (files, _dirs) = fs.seed();
+    let read = |k: &str| {
+        files
+            .iter()
+            .find(|(f, _)| f == k)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(OUT), read(&readback));
+        stash(&mut *core::ptr::addr_of_mut!(ERR), read(&deps_key));
+    }
+    set(STATUS_OK);
+    STATUS_OK
+}
+
+/// Read an arbitrary file the open single-shot JIT run wrote to its retained memfs (the crawl's
+/// `.p.deps.nif` sibling), onto the [`OUT`] slot; returns its length (`0` if absent / no run). Call
+/// **after** [`temen_onramp_jit_run_finish`] and **before** `temen_onramp_jit_run_close`.
+#[no_mangle]
+pub extern "C" fn temen_onramp_jit_run_readfile(key_ptr: *const u8, key_len: usize) -> usize {
+    let key = String::from_utf8_lossy(unsafe { core::slice::from_raw_parts(key_ptr, key_len) })
+        .into_owned();
+    // SAFETY: single-threaded wasm; exclusive access to the run + the OUT stash.
+    let bytes = unsafe { (*core::ptr::addr_of!(JIT_RUN)).as_ref() }
+        .and_then(|r| r.read_file(&key))
+        .unwrap_or_default();
+    let len = bytes.len();
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
+    len
+}
+
+/// The decoded stdlib source files (path → bytes) for the JS-orchestrated crawl (#1025 route A): the JS
+/// loop reads each module's source from here to run the JIT nifler crawl step over it.
+static mut NIM_STDLIB: Option<Vec<(String, Vec<u8>)>> = None;
+
+/// Decode + cache the stdlib memfs `image` so [`temen_nim_stdlib_read`] can hand the JS crawl each
+/// module's source. `0` on success, negative `STATUS_DECODE_ERR` on a bad image.
+///
+/// # Safety
+/// `(img_ptr, img_len)` must be a live `temen_alloc`ation the host just filled.
+#[no_mangle]
+pub unsafe extern "C" fn temen_nim_stdlib_open(img_ptr: *const u8, img_len: usize) -> i32 {
+    let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
+    match temen_fs::decode_image(image) {
+        Ok((files, _dirs)) => {
+            // SAFETY: single-threaded wasm; exclusive access to the cache.
+            unsafe { *core::ptr::addr_of_mut!(NIM_STDLIB) = Some(files) };
+            0
+        }
+        Err(_) => {
+            unsafe { LAST_STATUS = STATUS_DECODE_ERR };
+            -STATUS_DECODE_ERR
+        }
+    }
+}
+
+/// Read a cached stdlib source file (keys are the image's — `lib/...`, no leading `/`) onto [`OUT`];
+/// returns its length (`0` if absent / unopened).
+///
+/// # Safety
+/// `(path_ptr, path_len)` must be a live `temen_alloc`ation the host just filled.
+#[no_mangle]
+pub unsafe extern "C" fn temen_nim_stdlib_read(path_ptr: *const u8, path_len: usize) -> usize {
+    let key = String::from_utf8_lossy(unsafe { core::slice::from_raw_parts(path_ptr, path_len) })
+        .trim_start_matches('/')
+        .to_string();
+    // SAFETY: single-threaded wasm; exclusive access to the cache + the OUT stash.
+    let bytes = unsafe { (*core::ptr::addr_of!(NIM_STDLIB)).as_ref() }
+        .and_then(|files| {
+            files
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.clone())
+        })
+        .unwrap_or_default();
+    let len = bytes.len();
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
+    len
+}
+
+/// nimony's module-stem hash for `path` ([`nimc::module_suffix`]) onto [`OUT`]; returns its length. The
+/// JS crawl uses it to name `.p.nif` cache files exactly as the Rust driver does.
+///
+/// # Safety
+/// `(path_ptr, path_len)` must be a live `temen_alloc`ation the host just filled.
+#[no_mangle]
+pub unsafe extern "C" fn temen_nim_module_suffix(path_ptr: *const u8, path_len: usize) -> usize {
+    let path = String::from_utf8_lossy(unsafe { core::slice::from_raw_parts(path_ptr, path_len) })
+        .into_owned();
+    let bytes = nimc::module_suffix(&path).into_bytes();
+    let len = bytes.len();
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
+    len
+}
+
+/// The active import targets in `deps` (a `.p.deps.nif`) for importer directory `dir`
+/// ([`nimc::parse_imports`]), **newline-joined**, onto [`OUT`]; returns its length. The JS crawl parses
+/// this to discover each module's imports exactly as the Rust driver does.
+///
+/// # Safety
+/// Each `(ptr, len)` must be a live `temen_alloc`ation the host just filled.
+#[no_mangle]
+pub unsafe extern "C" fn temen_nim_parse_imports(
+    deps_ptr: *const u8,
+    deps_len: usize,
+    dir_ptr: *const u8,
+    dir_len: usize,
+) -> usize {
+    let deps = String::from_utf8_lossy(unsafe { core::slice::from_raw_parts(deps_ptr, deps_len) })
+        .into_owned();
+    let dir = String::from_utf8_lossy(unsafe { core::slice::from_raw_parts(dir_ptr, dir_len) })
+        .into_owned();
+    let bytes = nimc::parse_imports(&deps, &dir).join("\n").into_bytes();
+    let len = bytes.len();
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
+    len
+}
+
 /// **Compile any Nim in the browser — the nimony compiler card** (NIM.md §3c/§3e, #958). Decode the
 /// three phase modules (`nifler`/`nimsem`/`hexer`), mount the stdlib image on the shared memfs and add
 /// the editor's Nim as `[main].nim`, then run the whole nimony toolchain **client-side** via
@@ -5608,6 +5891,15 @@ impl JitOnrampRun {
             }
             None => self.host.stdout.clone(),
         }
+    }
+
+    /// Read an **arbitrary** file from the run's retained memfs handle (a file-output guest) — used by the
+    /// nifler crawl to read the `.p.deps.nif` sibling of its `.p.nif` output. `None` if the run kept no
+    /// handle (a stdout guest) or the key is absent.
+    pub fn read_file(&self, key: &str) -> Option<Vec<u8>> {
+        let (fsh, _) = self.fs_readback.as_ref()?;
+        let (files, _dirs) = fsh.seed();
+        files.into_iter().find(|(k, _)| k == key).map(|(_, v)| v)
     }
     pub fn exited(&self) -> bool {
         self.exited

@@ -67,7 +67,7 @@ fn relative_path(path: &str, base: &str) -> String {
 
 /// `gear2/modnames.moduleSuffix` — `name[0..3]` + base36(`uhash`) of the shortest of the file's path
 /// relative to the cwd (`/`) and to each search path (`/lib`).
-fn module_suffix(file: &str) -> String {
+pub(crate) fn module_suffix(file: &str) -> String {
     let mut rel = relative_path(file, "/");
     let c = relative_path(file, "/lib");
     if c.len() < rel.len() {
@@ -103,7 +103,7 @@ fn balanced(s: &str, head: &str) -> Option<String> {
 }
 
 /// Active `import` targets as absolute memfs file paths; platform-`when`-guarded imports are skipped.
-fn parse_imports(deps_nif: &str, importer_dir: &str) -> Vec<String> {
+pub(crate) fn parse_imports(deps_nif: &str, importer_dir: &str) -> Vec<String> {
     let mut out = vec![];
     for kw in ["import", "fromimport"] {
         let mut rest = deps_nif;
