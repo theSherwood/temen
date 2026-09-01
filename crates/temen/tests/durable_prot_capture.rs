@@ -93,9 +93,10 @@ fn readonly_data_segment_is_captured_and_survives_the_codec() {
     );
 
     // Through the §12 codec: the protection is recorded and recovered (Phase-1 would have lost it).
-    let art = freeze_with_prots(&m, &window, &to_codec_prots(&caps), &host).expect("freeze");
+    let art =
+        freeze_with_prots(&m, &window, &to_codec_prots(&caps), SIZE_LOG2, &host).expect("freeze");
     let mut rhost = Host::new();
-    let (rwin, rprots) = restore_with_prots(&art, &m, &mut rhost).expect("restore");
+    let (rwin, rprots, _) = restore_with_prots(&art, &m, &mut rhost).expect("restore");
     assert_eq!(
         rprots[ro_page],
         PageProt::Ro,
@@ -103,6 +104,91 @@ fn readonly_data_segment_is_captured_and_survives_the_codec() {
     );
     assert_eq!(rprots[RW_OFF / PAGE], PageProt::Rw);
     assert_eq!(&rwin[RO_OFF..RO_OFF + 4], b"ABCD", "Ro page bytes survive");
+}
+
+/// #1154 end-to-end (invariant 14, durability axis): a guest that **`vm_map`-grows** its window past
+/// its declared size, captured through the real interpreter and round-tripped through the §12 codec.
+/// Pre-v18 the captured window (larger than `1 << size_log2`) hit `GeometryMismatch`; v18 carries the
+/// grown extent + reservation, so the grown page's content and protection survive serialize/restore —
+/// the durable-artifact analogue of the in-process warm-snapshot restore (#828/#1127).
+#[test]
+fn a_vm_map_grown_window_survives_the_codec() {
+    // Declares 128 KiB; `_start` `vm_map`s [128 KiB, 192 KiB) Rw and writes a marker into the grown
+    // region. The capture reserves 512 KiB (`GROW_RESERVED_LOG2`), so the guest grows within a mask
+    // domain larger than its declared window.
+    const GROW_SIZE_LOG2: u8 = 17; // 128 KiB declared
+    const GROW_RESERVED_LOG2: u8 = 19; // 512 KiB reservation
+    const GROWN_MARK_OFF: usize = (1 << GROW_SIZE_LOG2) + 3 * PAGE + 7; // a byte in a grown page
+    let src = r#"memory 17
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  voff = i64.const 131072
+  vlen = i64.const 65536
+  vprot = i32.const 3
+  vr = call.cap 5 0 (i64, i64, i32) -> (i64) v0 (voff, vlen, vprot)
+  vaddr = i64.const 143367
+  vmark = i64.const 424242
+  i64.store vaddr vmark
+  return vr
+  }
+}
+"#;
+    let mut m = temen_text::parse_module(src).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: GROW_SIZE_LOG2,
+    });
+
+    let mut host = Host::new();
+    let mem_h = host.grant_memory(); // the AddressSpace cap the guest `vm_map`s through (durable)
+    let init = vec![0u8; 1 << GROW_SIZE_LOG2];
+    let mut fuel = 100_000u64;
+    let (r, window, caps) = run_capture_reserved_with_host_prots(
+        &m,
+        0,
+        &[Value::I32(mem_h)],
+        &mut fuel,
+        &init,
+        None,
+        GROW_RESERVED_LOG2,
+        &mut host,
+    );
+    assert_eq!(r, Ok(vec![Value::I64(0)]), "the vm_map grow succeeds");
+    // The capture spans the grown region: the marker's page is committed Rw above the declared window.
+    let mark_page = GROWN_MARK_OFF / PAGE;
+    assert!(
+        mark_page >= (1 << GROW_SIZE_LOG2) / PAGE,
+        "the marker is in the grown tail, not the declared window"
+    );
+    assert_eq!(window[GROWN_MARK_OFF], 424242i64.to_le_bytes()[0]);
+    assert_eq!(caps[mark_page], CapturedProt::Rw, "grown page captured Rw");
+
+    // Through the codec at the guest's real reservation: pre-v18 this was GeometryMismatch.
+    let art = freeze_with_prots(
+        &m,
+        &window,
+        &to_codec_prots(&caps),
+        GROW_RESERVED_LOG2,
+        &host,
+    )
+    .expect("freeze grown");
+    let mut rhost = Host::new();
+    let (rwin, rprots, rreserved) =
+        restore_with_prots(&art, &m, &mut rhost).expect("restore grown");
+    assert_eq!(
+        rreserved, GROW_RESERVED_LOG2,
+        "the mask domain survives the codec"
+    );
+    assert_eq!(
+        rwin.len(),
+        window.len(),
+        "the grown committed extent survives"
+    );
+    assert_eq!(
+        &rwin[GROWN_MARK_OFF..GROWN_MARK_OFF + 8],
+        &424242i64.to_le_bytes(),
+        "the grown-region marker survives serialize/restore"
+    );
+    assert_eq!(rprots[mark_page], PageProt::Rw);
 }
 
 /// Map the codec's protections back to the interpreter's, for seeding a thawed run.
@@ -144,9 +230,9 @@ fn restore_re_establishes_ro_so_a_thawed_write_faults() {
     let window = vec![0u8; WINDOW];
     let mut prots = vec![PageProt::Rw; WINDOW / PAGE];
     prots[RO_OFF / PAGE] = PageProt::Ro;
-    let art = freeze_with_prots(&m, &window, &prots, &host).expect("freeze");
+    let art = freeze_with_prots(&m, &window, &prots, SIZE_LOG2, &host).expect("freeze");
     let mut rhost = Host::new();
-    let (rwin, rprots) = restore_with_prots(&art, &m, &mut rhost).expect("restore");
+    let (rwin, rprots, _) = restore_with_prots(&art, &m, &mut rhost).expect("restore");
 
     // Thaw with the restored protections: the store into the Ro page faults.
     let mut fuel = 100_000u64;
@@ -200,9 +286,9 @@ fn jit_re_establishes_ro_so_a_thawed_write_faults() {
     let window = vec![0u8; WINDOW];
     let mut prots = vec![PageProt::Rw; WINDOW / PAGE];
     prots[RO_OFF / PAGE] = PageProt::Ro;
-    let art = freeze_with_prots(&m, &window, &prots, &host).expect("freeze");
+    let art = freeze_with_prots(&m, &window, &prots, SIZE_LOG2, &host).expect("freeze");
     let mut rhost = Host::new();
-    let (rwin, rprots) = restore_with_prots(&art, &m, &mut rhost).expect("restore");
+    let (rwin, rprots, _) = restore_with_prots(&art, &m, &mut rhost).expect("restore");
     let jit_prots: Vec<WindowProt> = rprots
         .iter()
         .map(|p| match p {

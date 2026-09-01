@@ -130,7 +130,20 @@ const MAGIC: &[u8; 4] = b"SVMD";
 /// install order — re-applied to the thaw run's table so a `call.dyn` through an installed slot
 /// resolves. A v16 JIT section had neither, so it mis-parses under v17; a JIT-free artifact is
 /// unaffected (Section 5 stays elided).
-const FORMAT_VERSION: u16 = 17;
+/// v18 (#1154, invariant 14 durability axis): the geometry header now represents a **`vm_map`-grown
+/// extent**. Previously `reserved_log2`/`mapped` were both derived from `window.len()` and restore
+/// required `mapped == 1 << reserved_log2 == 1 << module.size_log2` — so a guest that grew its window
+/// past its declared size couldn't be serialized (`GeometryMismatch`). Now `reserved_log2` (the mask
+/// domain) is carried explicitly and `mapped` (the committed scalar extent) is the window-image byte
+/// length: a page-aligned value in `[1 << size_log2, 1 << reserved_log2]` that need not be a power of
+/// two. The grown pages ride the window image as `Rw` above `1 << size_log2` (the reserved tail's
+/// default stays `Unmapped`), exactly the in-process `map_info`/`seed_pages` shape (#828/#1127). The
+/// wire layout is byte-identical to v17 for a flat window (`reserved_log2 == size_log2`, `mapped ==
+/// 1 << size_log2`) — only the version differs; a grown artifact is new. Codec pages stay 4 KiB
+/// regardless of host page (portability); cross-host host-page-size representation is #737's concern,
+/// not widened here. Restore now also returns `reserved_log2` so a cross-host thaw sizes its Mem
+/// reservation to the guest's original mask domain (its future growth bound), not just the extent.
+const FORMAT_VERSION: u16 = 18;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -267,22 +280,51 @@ fn binding_in_window(binding: &DurableBinding, mapped: u64) -> bool {
 /// state rides along) bound to `module`'s digest, plus `host`'s re-grantable handle table.
 /// Refuses if a live handle isn't durable (§12.5). Every page is treated as `Rw` (the flat
 /// window model); for a window with read-only / unmapped pages use [`freeze_with_prots`].
+///
+/// The flat convenience assumes a **non-grown** window: `window.len()` is the reservation
+/// (`reserved_log2 = window.len().trailing_zeros()`), so `window.len()` must be a power of two. A
+/// `vm_map`-grown window (its committed extent is not the reservation) must go through
+/// [`freeze_with_prots`] with an explicit `reserved_log2`.
 pub fn freeze(module: &Module, window: &[u8], host: &Host) -> Result<Vec<u8>, FreezeError> {
+    if !window.len().is_power_of_two() || window.len() < PAGE {
+        return Err(FreezeError::WindowGeometry(window.len()));
+    }
     let npages = window.len() / PAGE;
-    freeze_with_prots(module, window, &vec![PageProt::Rw; npages], host)
+    let reserved_log2 = window.len().trailing_zeros() as u8;
+    freeze_with_prots(
+        module,
+        window,
+        &vec![PageProt::Rw; npages],
+        reserved_log2,
+        host,
+    )
 }
 
 /// [`freeze`] with an explicit per-page protection map (§12.3): `prots[i]` is the protection of
 /// the window page at `[i*PAGE, (i+1)*PAGE)` and must cover every page. `Ro` pages are always
 /// stored (bytes + prot) so restore can re-establish them; `Unmapped` pages store no bytes;
 /// zero `Rw` pages are elided.
+///
+/// `window` is the guest's **committed extent** (`mapped`) — the `vm_map`-grown high-water, so its
+/// length is page-aligned in `[1 << size_log2, 1 << reserved_log2]` and need **not** be a power of
+/// two (#1154). `reserved_log2` is the mask-domain reservation the window grew within; grown pages
+/// ride the image as `Rw` above `1 << size_log2` (the interp `snapshot_window`/`snapshot_prots`
+/// shape). A flat, non-grown window passes `reserved_log2 = window.len().trailing_zeros()` and
+/// reproduces the pre-#1154 bytes (only the container version differs).
 pub fn freeze_with_prots(
     module: &Module,
     window: &[u8],
     prots: &[PageProt],
+    reserved_log2: u8,
     host: &Host,
 ) -> Result<Vec<u8>, FreezeError> {
-    if !window.len().is_power_of_two() || window.len() < PAGE {
+    // The committed extent is page-granular (a `vm_map` grows whole pages) and must fit the mask
+    // domain it grew within. Unlike v17 it need not be a power of two — a grown high-water rarely is.
+    if window.len() < PAGE
+        || !window.len().is_multiple_of(PAGE)
+        || reserved_log2 as u32 >= usize::BITS
+        || (window.len() as u64) > 1u64 << reserved_log2
+    {
         return Err(FreezeError::WindowGeometry(window.len()));
     }
     let npages = window.len() / PAGE;
@@ -326,17 +368,18 @@ pub fn freeze_with_prots(
     let child_state = host.frozen_child_state().to_vec();
     let root_sp = host.frozen_root_sp().unwrap_or(SHADOW_BASE);
     let digest = digest256(&encode_module(module));
-    let reserved_log2 = window.len().trailing_zeros() as u8;
 
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
 
-    // Section 0 — Header (§12.2).
+    // Section 0 — Header (§12.2). `reserved_log2` is the caller's mask domain (v18: no longer derived
+    // from `window.len()`, so a grown committed extent < reservation is representable); `mapped` is the
+    // committed-extent window-image length.
     section(&mut out, TAG_HEADER, |b| {
         b.extend_from_slice(&digest);
         b.push(reserved_log2);
-        write_uleb(b, window.len() as u64); // mapped
+        write_uleb(b, window.len() as u64); // mapped (committed extent)
         write_uleb(b, PAGE as u64); // host page size at capture
         write_uleb(b, 1 + vcpus.len() as u64); // vcpu_count = root + spawned (§12.4 / slice 3.2.1)
         write_uleb(b, fibers.len() as u64); // fiber_count (§12.4)
@@ -526,17 +569,21 @@ fn write_jit(b: &mut Vec<u8>, table_log2: u8, jit: &[DurableJitDomain]) {
 /// `Rw` content). The caller flips the state word to `REWINDING` and re-enters to thaw. Use
 /// [`restore_with_prots`] when the window has `Ro`/`Unmapped` pages to re-establish.
 pub fn restore(artifact: &[u8], module: &Module, host: &mut Host) -> Result<Vec<u8>, RestoreError> {
-    restore_with_prots(artifact, module, host).map(|(window, _)| window)
+    restore_with_prots(artifact, module, host).map(|(window, ..)| window)
 }
 
-/// [`restore`] that also recovers the per-page protection map (§12.3): `prots[i]` is the
-/// protection to re-establish on the window page at `[i*PAGE, (i+1)*PAGE)` (default `Rw` for an
-/// elided page). Re-applying these to the runtime window is the escape-TCB restore step.
+/// [`restore`] that also recovers the per-page protection map (§12.3) and the mask-domain
+/// `reserved_log2`: `prots[i]` is the protection to re-establish on the window page at
+/// `[i*PAGE, (i+1)*PAGE)` (default `Rw` for an elided page). The returned `window` is the committed
+/// extent (`mapped`, page-aligned, possibly a grown high-water — #1154), and `reserved_log2` is the
+/// reservation the guest grew within, so a thaw rebuilds its `Mem` with the same mask domain (its
+/// future `vm_map` growth bound), not just the current extent. Re-applying `prots` to the runtime
+/// window is the escape-TCB restore step.
 pub fn restore_with_prots(
     artifact: &[u8],
     module: &Module,
     host: &mut Host,
-) -> Result<(Vec<u8>, Vec<PageProt>), RestoreError> {
+) -> Result<(Vec<u8>, Vec<PageProt>, u8), RestoreError> {
     let mut r = Reader::new(artifact);
     if r.take(4)? != MAGIC {
         return Err(RestoreError::BadMagic);
@@ -584,13 +631,27 @@ pub fn restore_with_prots(
     if digest != digest256(&encode_module(module)) {
         return Err(RestoreError::ModuleMismatch);
     }
+    // v18 geometry (#1154): the committed extent `mapped` may exceed the declared window (a `vm_map`
+    // grow), so the three quantities the codec once locked together — declared `size_log2`, the mask
+    // domain `reserved_log2`, and the committed `mapped` — are now checked as a nested chain:
+    //   `1 << size_log2  <=  mapped  <=  1 << reserved_log2`,   `mapped` page-aligned.
+    // The reservation must cover at least the declared window (a smaller one is corrupt), and the
+    // committed extent sits between the declared window and the reservation. A flat v17-shaped window
+    // (`mapped == 1 << reserved_log2 == 1 << size_log2`) still satisfies it exactly.
+    if page_size != PAGE || reserved_log2 as u32 >= usize::BITS {
+        return Err(RestoreError::GeometryMismatch);
+    }
+    let reserved = 1usize << reserved_log2;
+    if mapped == 0 || !mapped.is_multiple_of(PAGE) || mapped > reserved {
+        return Err(RestoreError::GeometryMismatch);
+    }
     if let Some(mem) = &module.memory {
-        if mem.size_log2 != reserved_log2 {
+        let declared = 1usize
+            .checked_shl(mem.size_log2 as u32)
+            .ok_or(RestoreError::GeometryMismatch)?;
+        if (mem.size_log2 as u32) >= usize::BITS || declared > mapped {
             return Err(RestoreError::GeometryMismatch);
         }
-    }
-    if page_size != PAGE || mapped != 1usize << reserved_log2 {
-        return Err(RestoreError::GeometryMismatch);
     }
 
     // ---- Window image: zeroed window (default `Rw`); splat each stored page + its prot. ----
@@ -711,7 +772,7 @@ pub fn restore_with_prots(
         host.set_svc_state(queue, results, next_ticket);
     }
 
-    Ok((window, prots))
+    Ok((window, prots, reserved_log2))
 }
 
 /// Decode Section 2: the frozen-fiber residue (canonical ascending slot), then — appended only when

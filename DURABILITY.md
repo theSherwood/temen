@@ -813,7 +813,7 @@ needs.
 | magic | `b"SVMD"` | TEMEN-Durable |
 | format version | u16 | bump on incompatible change |
 | instrumented-module digest | 32 bytes | digest of the `temen-encode` bytes of the **instrumented** module (R5). Restore refuses on mismatch — this is the durability boundary from §1. |
-| window geometry | `reserved_log2: u8`, `mapped: u64` | matches `Module::memory` / `temen_mask::Window`; stored for a fail-fast check |
+| window geometry | `reserved_log2: u8`, `mapped: u64` | the mask domain and the **committed extent** (`mapped`, the window-image length). v18 (#1154): `mapped` may exceed `1 << Module::memory.size_log2` — a `vm_map`-grown extent — with the chain `1 << size_log2 ≤ mapped ≤ 1 << reserved_log2` (`mapped` page-aligned); the grown pages ride §12.3 as `Rw` above the declared window. A flat window keeps `mapped == 1 << reserved_log2 == 1 << size_log2`. |
 | host page size at capture | u32 | page granularity of §12.3 |
 | vCPU count, fiber count | uleb, uleb | sizes §12.4 |
 

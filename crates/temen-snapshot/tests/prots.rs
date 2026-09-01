@@ -8,6 +8,7 @@ use temen_snapshot::{freeze, freeze_with_prots, restore_with_prots, FreezeError,
 
 const SIZE_LOG2: u8 = 17; // 128 KiB
 const WINDOW: usize = 1 << SIZE_LOG2;
+const RESERVED_LOG2: u8 = 19; // 512 KiB reservation — the mask domain a grown window lives in
 const PAGE: usize = 4096;
 const NPAGES: usize = WINDOW / PAGE; // 32
 
@@ -53,10 +54,11 @@ fn page_protections_round_trip_through_the_window_image() {
     window[9 * PAGE + 2] = 0x99; // page 9: Unmapped — content is NOT stored
     prots[9] = PageProt::Unmapped;
 
-    let art = freeze_with_prots(&m, &window, &prots, &host).expect("freeze");
+    let art = freeze_with_prots(&m, &window, &prots, SIZE_LOG2, &host).expect("freeze");
 
     let mut rhost = Host::new();
-    let (rwin, rprots) = restore_with_prots(&art, &m, &mut rhost).expect("restore");
+    let (rwin, rprots, rreserved) = restore_with_prots(&art, &m, &mut rhost).expect("restore");
+    assert_eq!(rreserved, SIZE_LOG2, "flat window: reserved == declared");
 
     // Protections recovered exactly.
     assert_eq!(rprots.len(), NPAGES);
@@ -81,10 +83,89 @@ fn page_protections_round_trip_through_the_window_image() {
 
     // §12.6 canonical: re-serializing the restored image at the same safepoint is byte-identical.
     assert_eq!(
-        freeze_with_prots(&m, &rwin, &rprots, &host).expect("re-freeze"),
+        freeze_with_prots(&m, &rwin, &rprots, SIZE_LOG2, &host).expect("re-freeze"),
         art,
         "restore → re-serialize reproduces the artifact"
     );
+}
+
+#[test]
+fn a_vm_map_grown_extent_round_trips() {
+    // #1154 (invariant 14, durability axis): a guest that `vm_map`-grew its window past its declared
+    // size (`SIZE_LOG2` = 128 KiB) to a 192-KiB committed extent, inside a 512-KiB reservation. Pre-v18
+    // this was `GeometryMismatch` (the codec required `mapped == 1 << declared`); v18 carries the grown
+    // `mapped` + `reserved_log2` and round-trips it — the grown pages ride the image as `Rw` above the
+    // declared window, exactly as an in-process `snapshot_window`/`seed_pages` restore does.
+    let m = module();
+    let host = host_with_durable_handles();
+
+    const MAPPED: usize = WINDOW + 16 * PAGE; // 128 KiB + 64 KiB = 192 KiB committed (48 pages)
+    const GROWN0: usize = WINDOW / PAGE; // first grown page (page 32)
+    let mut window = vec![0u8; MAPPED];
+    let mut prots = vec![PageProt::Rw; MAPPED / PAGE]; // committed prefix default Rw
+                                                       // A marker in a grown page proves grown content survives the codec.
+    window[(GROWN0 + 3) * PAGE + 7] = 0x5A;
+    // A read-only grown page (a `protect`ed grown allocation) and an Unmapped hole inside the grown
+    // region (a `vm_unmap` between two grows) — both must survive.
+    window[(GROWN0 + 5) * PAGE + 1] = 0x99;
+    prots[GROWN0 + 5] = PageProt::Ro;
+    prots[GROWN0 + 8] = PageProt::Unmapped;
+    // A declared-prefix Ro page too (rodata), so the mix spans both regions.
+    prots[2] = PageProt::Ro;
+
+    let art = freeze_with_prots(&m, &window, &prots, RESERVED_LOG2, &host).expect("freeze grown");
+
+    let mut rhost = Host::new();
+    let (rwin, rprots, rreserved) =
+        restore_with_prots(&art, &m, &mut rhost).expect("restore grown");
+
+    assert_eq!(rreserved, RESERVED_LOG2, "the mask domain survives");
+    assert_eq!(rwin.len(), MAPPED, "the committed extent survives");
+    assert_eq!(rprots.len(), MAPPED / PAGE);
+    assert_eq!(
+        rwin[(GROWN0 + 3) * PAGE + 7],
+        0x5A,
+        "grown-page content restored"
+    );
+    assert_eq!(rprots[GROWN0 + 5], PageProt::Ro, "grown Ro page restored");
+    assert_eq!(
+        rwin[(GROWN0 + 5) * PAGE + 1],
+        0x99,
+        "grown Ro page bytes restored"
+    );
+    assert_eq!(
+        rprots[GROWN0 + 8],
+        PageProt::Unmapped,
+        "grown Unmapped hole restored"
+    );
+    assert!(
+        rwin[(GROWN0 + 8) * PAGE..(GROWN0 + 9) * PAGE]
+            .iter()
+            .all(|&b| b == 0),
+        "an Unmapped grown page carries no bytes"
+    );
+    assert_eq!(rprots[2], PageProt::Ro, "declared-prefix Ro still restored");
+
+    // §12.6 canonical: restore → re-serialize at the same reservation is byte-identical.
+    assert_eq!(
+        freeze_with_prots(&m, &rwin, &rprots, RESERVED_LOG2, &host).expect("re-freeze"),
+        art,
+        "a grown artifact re-serializes byte-identically"
+    );
+}
+
+#[test]
+fn freeze_rejects_a_committed_extent_past_the_reservation() {
+    // The nested-chain geometry gate: `mapped` (the window image) must fit the mask domain it grew
+    // within. A window longer than `1 << reserved_log2` is corrupt — freeze fails closed.
+    let m = module();
+    let host = host_with_durable_handles();
+    let window = vec![0u8; 1 << (RESERVED_LOG2 + 1)]; // twice the reservation
+    let prots = vec![PageProt::Rw; window.len() / PAGE];
+    assert!(matches!(
+        freeze_with_prots(&m, &window, &prots, RESERVED_LOG2, &host),
+        Err(FreezeError::WindowGeometry(_))
+    ));
 }
 
 #[test]
@@ -94,7 +175,7 @@ fn freeze_rejects_a_wrong_length_prot_map() {
     let window = vec![0u8; WINDOW];
     let prots = vec![PageProt::Rw; NPAGES - 1]; // one short
     assert!(matches!(
-        freeze_with_prots(&m, &window, &prots, &host),
+        freeze_with_prots(&m, &window, &prots, SIZE_LOG2, &host),
         Err(FreezeError::ProtCount { pages: NPAGES, prots: p }) if p == NPAGES - 1
     ));
 }
@@ -110,6 +191,6 @@ fn flat_freeze_equals_an_all_rw_prot_map() {
     let all_rw = [PageProt::Rw; NPAGES];
     assert_eq!(
         freeze(&m, &window, &host).expect("flat"),
-        freeze_with_prots(&m, &window, &all_rw, &host).expect("explicit"),
+        freeze_with_prots(&m, &window, &all_rw, SIZE_LOG2, &host).expect("explicit"),
     );
 }
