@@ -5410,6 +5410,32 @@ impl JitOnrampRun {
         )
     }
 
+    /// Open a single-shot JIT run over an **owned** (heap-backed) window with a **caller-provided granted
+    /// `Host`** (#1025 Path 1 — the owned-window twin of [`open_shared_run_over_host`]). The run executes
+    /// its emitted `_start` over `host` verbatim (an op-13 phase child's marshaled powerbox); `init_mem`
+    /// seeds the window prefix (argv), and `readback` retains a memfs handle + key for a file-output phase.
+    /// The child's `call.cap` leaves resolve over `host` on the reactor cross-tier bounce, exactly as a
+    /// top-level phase's `fs` resolves. Used by the browser op-13-child-on-JIT servicer.
+    pub fn open_owned_run_over_host(
+        m: &temen_ir::Module,
+        win_log2: u8,
+        shared_memory: bool,
+        host: Host,
+        init_mem: Vec<u8>,
+        readback: Option<(temen_fs::MemFsHandle, String)>,
+    ) -> Result<JitOnrampRun, i32> {
+        Self::open_owned_run_with(
+            m,
+            win_log2,
+            shared_memory,
+            RunInput::PreGranted {
+                host: Box::new(host),
+                init_mem,
+                readback,
+            },
+        )
+    }
+
     /// Like [`open_owned_run_fs`](Self::open_owned_run_fs), but the guest's output is a **file it writes
     /// to the memfs** (at key `readback`), not stdout — the single-shot JIT twin of
     /// [`onramp_fs_exec_readback`], for a phase guest like nifler (`p /in.nim /out.p.nif`, #1011 slice 1).
@@ -11159,5 +11185,60 @@ block 0 () {
             "the marshaled `fs` cap resolved + ran inside the JIT run's cross-tier bounce"
         );
         drop(run);
+    }
+
+    #[test]
+    fn owned_window_jit_run_over_a_granted_host_runs_the_whole_child() {
+        // The owned-window twin (`open_owned_run_over_host`, the browser op-13 servicer's constructor).
+        // Drive the whole child `f0` (not just the leaf) as the interpreter oracle over the granted host —
+        // `40 + fs()` = 41, the exact value the JS-driven emitted `f0` returns (tier parity, INVARIANTS §9).
+        let m = temen_text::parse_module(CHILD).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        let (host, counter) = granted_fs_host();
+        let mut run = JitOnrampRun::open_owned_run_over_host(&m, 12, false, host, Vec::new(), None)
+            .expect("open an owned JIT run over the granted host");
+        let r = run.run_cross_tier(0, &[]).expect("child f0 runs over the granted host");
+        assert_eq!(
+            r.first(),
+            Some(&Value::I64(41)),
+            "child f0 = 40 + granted fs() = 41 over the caller-provided powerbox"
+        );
+        assert_eq!(*counter.lock().unwrap(), 1, "the granted fs ran exactly once");
+    }
+
+    #[test]
+    fn primitive_consumes_a_host_from_the_op13_marshal() {
+        // The composition the browser op-13 servicer performs: the child's powerbox is **marshaled** from a
+        // parent's grant records (`spawn_named_child_from_window`, #1025 slice 3a), then handed to the JIT
+        // run primitive — not a hand-built host. The child resolves the marshaled `fs` and computes 41.
+        let m = temen_text::parse_module(CHILD).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+
+        // A parent powerbox holding the grantable `fs`, and a window with one grant record naming it.
+        let (mut parent, counter) = granted_fs_host();
+        let fs_handle = parent.resolve_cap_name("fs").expect("parent holds fs");
+        let mut window = vec![0u8; 256];
+        // record at 32: {name_off=64, name_len=2, handle=fs_handle, flags=0}; name "fs" at 64.
+        window[32..36].copy_from_slice(&64u32.to_le_bytes());
+        window[36..40].copy_from_slice(&2u32.to_le_bytes());
+        window[40..44].copy_from_slice(&fs_handle.to_le_bytes());
+        window[64..66].copy_from_slice(b"fs");
+        let (child_host, _inst, _as) = parent
+            .spawn_named_child_from_window(&window, 32, 1, 1 << 12)
+            .expect("marshal the grant list into a child powerbox");
+
+        let mut run = JitOnrampRun::open_owned_run_over_host(&m, 12, false, child_host, Vec::new(), None)
+            .expect("open a JIT run over the *marshaled* granted host");
+        let r = run.run_cross_tier(0, &[]).expect("child f0 runs over the marshaled host");
+        assert_eq!(
+            r.first(),
+            Some(&Value::I64(41)),
+            "child resolved the *marshaled* fs (marshal -> primitive -> resolve, the op-13 servicer flow)"
+        );
+        assert_eq!(
+            *counter.lock().unwrap(),
+            1,
+            "the marshaled fs shares the parent's provider state (ticked once)"
+        );
     }
 }
