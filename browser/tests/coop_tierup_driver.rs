@@ -192,6 +192,28 @@ fn service_coop_on_wasmi(n_results: usize) -> Option<Vec<i64>> {
         .expect("emitted module exports the live-mapped global")
         .set(&mut store, Val::I64(mapped))
         .unwrap();
+    // #1151 paged leaf: the leaf's emitted accesses consult the page-state table (base in the
+    // exported `"pagestate"` global). Place it just after the (serving-window) mirror and point the
+    // global at it — the #750 driver contract, here for a paged tier-up over the serving vCPU's own
+    // window (root OR a §14 child's carve). No-op for a non-paged run (the global is absent).
+    if temen_coop_paged() != 0 {
+        let plen = temen_coop_pagestate_len();
+        // SAFETY: the pending-event page-state table is stable until the deliver call.
+        let table =
+            unsafe { std::slice::from_raw_parts(temen_coop_pagestate_ptr(), plen) }.to_vec();
+        let table_base = WIN_BASE as usize + win_len;
+        let need = (table_base + plen).div_ceil(1 << 16) as u32;
+        let have = memory.size(&store) as u32;
+        if need > have {
+            memory.grow(&mut store, (need - have) as u64).unwrap();
+        }
+        memory.write(&mut store, table_base, &table).unwrap();
+        instance
+            .get_global(&store, "pagestate")
+            .expect("paged emitted module exports the page-state base global")
+            .set(&mut store, Val::I32(table_base as i32))
+            .unwrap();
+    }
     let entry = format!("f{func}");
     let f = instance
         .get_func(&store, &entry)
@@ -2827,6 +2849,128 @@ fn coop_tierup_serves_a_confined_child_over_its_own_carve() {
     let got_out =
         unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
     assert_eq!(got_out, want.stdout, "stdout parity with the oracle");
+    temen_coop_close();
+}
+
+// ---- #1151: a §14 child page-op traps in REAL emitted wasm over its carve --------------------------
+
+/// The §14 child page-op guest. f0 (root): resolve the granted `Instantiator`, §14-instantiate a
+/// same-module confined child at f1 (32 KiB carve at 64 KiB), join it, return the join value. f1
+/// (child entry `(inst, as)`): `unmap` the whole usable carve `[16384, 32768)` through its granted
+/// AddressSpace, then call the eligible leaf f2. f2 (leaf): load carve-relative `[16384]` — a page the
+/// child just unmapped — so the **emitted** leaf's paged per-access check must trap `MemoryFault`
+/// over the carve, exactly as the interpreter oracle does. This is the emitted-execution twin of
+/// `temen-wasm-jit`'s `nested_paged.rs` (which drives the same trap with a hand-rolled harness),
+/// carried here through the real coop FFI over a confined child's own carve (#1151, INVARIANTS #14
+/// nesting + code-origin axes).
+fn coop_child_paged_guest_text() -> String {
+    let name = b"instantiator";
+    let mut w0 = [0u8; 8];
+    w0.copy_from_slice(&name[0..8]);
+    let mut w1 = [0u8; 8];
+    w1[..4].copy_from_slice(&name[8..12]);
+    let (w0, w1) = (i64::from_le_bytes(w0), i64::from_le_bytes(w1));
+    format!(
+        r#"memory 17
+func () -> (i64) {{
+block 0 () {{
+  vw0 = i64.const {w0}
+  va0 = i64.const 33792
+  i64.store va0 vw0
+  vw1 = i64.const {w1}
+  va1 = i64.const 33800
+  i64.store va1 vw1
+  vnl = i64.const 12
+  vh = self.resolve va0 vnl
+  ve = i64.const 1
+  voff = i64.const 65536
+  vsl = i64.const 15
+  vq = i64.const 0
+  vch = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vh (ve, voff, vsl, vq)
+  vj = call.cap 6 1 (i32) -> (i64) vh (vch)
+  return vj
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vinst: i64, vas: i64) {{
+  vasi = i32.wrap_i64 vas
+  voff = i64.const 16384
+  vlen = i64.const 16384
+  vu = call.cap 5 1 (i64, i64) -> (i64) vasi (voff, vlen)
+  v5 = i64.const 5
+  vr = call 2 (v5)
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vx: i64) {{
+  vaddr = i64.const 16384
+  vld = i64.load vaddr
+  return vld
+  }}
+}}
+export 0 func "_start" 0
+"#
+    )
+}
+
+#[test]
+fn coop_tierup_child_paged_traps_over_carve() {
+    let _g = instantiator_guard();
+    let m = temen_text::parse_module(&coop_child_paged_guest_text()).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+
+    // Oracle: the plain bytecode path with the identical powerbox — the child unmaps its carve then
+    // loads it, so the run traps `MemoryFault`.
+    let want = onramp_exec(&m, b"");
+    assert_eq!(
+        want.status, STATUS_TRAP,
+        "oracle: the child's load of its own unmapped page traps"
+    );
+
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(
+        opened,
+        0,
+        "open must accept the page-op child guest paged (status {})",
+        temen_status()
+    );
+
+    let n_results = m.funcs[2].results.len();
+    let mut tierups = 0u32;
+    loop {
+        match temen_coop_run() {
+            COOP_RUN_TIERUP => {
+                tierups += 1;
+                assert!(tierups < 50, "runaway tier-ups");
+                assert_eq!(temen_coop_func(), 2, "only the leaf (func 2) tiers up");
+                // The child's leaf runs paged over its carve; loading the unmapped page must trap,
+                // so `service_coop_on_wasmi` returns `None` (the emitted `MemoryFault`).
+                match service_coop_on_wasmi(n_results) {
+                    Some(res) => temen_coop_deliver(res.as_ptr(), res.len()),
+                    None => temen_coop_deliver_trap(),
+                }
+            }
+            COOP_RUN_DONE | COOP_RUN_TRAP => break,
+            ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
+        }
+    }
+
+    assert!(
+        tierups >= 1,
+        "non-vacuity: the child's paged leaf must have tiered up (and trapped) in emitted wasm"
+    );
+    assert_eq!(
+        temen_status(),
+        want.status,
+        "trap parity with the interpreter oracle over the child's carve"
+    );
+    assert_eq!(
+        temen_coop_value(),
+        want.value,
+        "value parity with the oracle on the trapping run"
+    );
     temen_coop_close();
 }
 
