@@ -1236,6 +1236,85 @@ int main(void) {
     );
 }
 
+/// #798 — **job-control stop/continue across every engine** (the `^Z` semantics bash's foreground
+/// wait relies on). A parent forks a child that catches signal 10 (a `sigcheck` token) and spins on
+/// it; the parent `SIGTSTP`s the child (as a terminal `^Z` does to the foreground job) and
+/// `waitpid(WUNTRACED)` reports the **stop** (`(20 << 8) | 0x7f`, `WIFSTOPPED`) — once. A signal sent
+/// **while the child is stopped** is HELD, proven by a long busy-wait: a still-running child would
+/// consume its token and exit, but `waitpid(WNOHANG)` keeps returning `-ECHILD` (alive, not exited).
+/// `SIGCONT` resumes it, the held 10 delivers (`sigcheck → 7`), the child exits `7`, and the parent
+/// reaps `WEXITSTATUS == 7`. This is the `ctrl_z_stops_a_forked_child_and_fg_resumes_it` oracle
+/// (`c_fork.rs`, VM-cap band) carried onto the `__px_*` personality band and **differentialled across
+/// the tree-walker, the cooperative bytecode driver (the browser tier), and the parallel driver** —
+/// the dual-driver principle: the stop/continue bookkeeping (`stopped_sig`/`stop_fresh`/`cont_fresh`,
+/// held-while-stopped) must agree on all three. All return 42.
+///
+/// This locks the *tractable* half of job control. Stopping a job that is **parked** when the stop
+/// arrives (e.g. a foreground `cat` blocked on `read`, with the shell already blocked in
+/// `waitpid(WUNTRACED)`) — the interactive browser `^Z` — needs the stop to interrupt the park and
+/// wake the shell, which is a cross-engine gap tracked in #1171 (the tree-walker hangs on it too).
+const STOP_CONT_SRC: &str = r#"
+long __px_fork(int cap, long a);
+long __px_waitpid(int cap, long pid, long status, long opts);
+long __px_kill(int cap, long pid, long sig);
+long __px_signal(int cap, long signum, long handler);
+long __px_sigcheck(int cap, long a);
+static int status;
+static long pid;
+static long i;
+static volatile long sink;
+int main(void) {
+  /* Pre-install a caught token (7) for signal 10, inherited by the twin, so the held-while-stopped
+   * 10 is a caught delivery (not SIG_DFL, which would terminate at continue instead of delivering). */
+  __px_signal(0, 10, 7);
+  pid = __px_fork(0, 0);
+  if (pid < 0) return 1;
+  if (pid == 0) {
+    __px_signal(0, 10, 7);                     /* the twin re-installs its own token */
+    while (__px_sigcheck(0, 0) != 7);          /* spin until the held 10 delivers post-continue */
+    return 7;
+  }
+  if (__px_kill(0, pid, 20) != 0) return 2;         /* SIGTSTP the child (^Z): default -> stop */
+  long h = __px_waitpid(0, pid, (long)&status, 2);  /* waitpid(pid, WUNTRACED): report the stop */
+  if (h != pid) return 3;
+  if ((status & 0xff) != 0x7f) return 4;            /* WIFSTOPPED: low byte 0x7f */
+  if (((status >> 8) & 0xff) != 20) return 5;       /* the stop signal = SIGTSTP(20) */
+  if (__px_kill(0, pid, 10) != 0) return 6;         /* the 10 lands while stopped: HELD */
+  for (i = 0; i < 200000; i = i + 1) sink = i;      /* every chance to run, were it runnable */
+  if (__px_waitpid(0, pid, (long)&status, 1) != -10) return 7;  /* WNOHANG: still alive (-ECHILD), truly stopped */
+  if (__px_kill(0, pid, 18) != 0) return 8;         /* SIGCONT: resume, the held 10 delivers */
+  h = __px_waitpid(0, pid, (long)&status, 0);       /* reap the resumed child's real exit */
+  if (h != pid) return 9;
+  if ((status & 0x7f) != 0) return 11;              /* a clean exit, not a signal death */
+  if (((status >> 8) & 0xff) != 7) return 10;       /* WEXITSTATUS = the child's 7 */
+  return 42;
+}
+"#;
+
+#[test]
+fn c_job_control_stop_continue_reports_wuntraced_then_reaps_the_exit() {
+    let e = run_interp_only(STOP_CONT_SRC, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "tree-walker: SIGTSTP stopped the child (waitpid WUNTRACED reported it), the held signal stayed \
+         held through the busy-wait, SIGCONT resumed it, and the parent reaped exit 7"
+    );
+    let b = run_bytecode_only(STOP_CONT_SRC, |_| {});
+    assert_eq!(
+        b.result,
+        vec![Value::I32(42)],
+        "coop bytecode (the browser tier): the stop/continue bookkeeping reported the stop via WUNTRACED, \
+         held the mid-stop signal, resumed on SIGCONT, and reaped exit 7 — matching the oracle"
+    );
+    let p = run_bytecode_parallel_only(STOP_CONT_SRC, |_| {});
+    assert_eq!(
+        p.result,
+        vec![Value::I32(42)],
+        "parallel driver: same stop/continue semantics over real OS threads — matching the oracle"
+    );
+}
+
 /// #1080 rung 3 — the **any-child** blocking wait (`waitpid(-1)` → `ParkEvent::TaskExitAny` → the
 /// driver's `BlockedReapPersonality { child: None }` park) on the bytecode engine. The parent forks a
 /// slow twin and blocks in `waitpid(-1)`; the settle scan wakes it when ANY forked child completes, and
