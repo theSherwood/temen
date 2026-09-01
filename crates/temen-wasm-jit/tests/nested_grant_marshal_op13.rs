@@ -7,14 +7,18 @@
 //! exactly the marshaling the native Cranelift path (`grant_named_child_build`) does, now on the wasm tier.
 //!
 //! The child returns `40 + granted_counter()` = `41`; the shared counter ticks once — the observable proof
-//! the *marshaled* (not pre-wired) authority ran inside the confined, emitted child. Two fail-closed cases
-//! guard the security hinge (INVARIANTS §2): a **forged handle** in the record and an **out-of-window**
-//! record pointer are both refused before any child runs, and the counter never moves.
+//! the *marshaled* (not pre-wired) authority ran inside the confined, emitted child. The servicer is the
+//! **faithful production shape**: it composes the two independent fail-closed axes (INVARIANTS §2) — the
+//! **carve gate** (`check_child_carve`: window confinement — aligned, in-parent, clears the NULL guard,
+//! sized ≥ declared) and the **grant marshal** (authority). Refusals on either axis (an undersized or
+//! misaligned carve; a forged handle or out-of-window record) run no child and leave the counter at 0.
 
 use std::sync::{Arc, Mutex};
 
 use temen_interp::{bytecode, ForkedProc, GrantMarshalError, Host, HostProc, Region, Value};
-use temen_wasm_jit::{compile_module_nested, compile_module_nested_with_eligibility};
+use temen_wasm_jit::{
+    check_child_carve, compile_module_nested, compile_module_nested_with_eligibility,
+};
 use wasmi::{Caller, Engine, Func, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
 const WIN_BASE: i32 = 0x1_0000; // parent window base (the env cell lives below it)
@@ -54,19 +58,19 @@ block 0 () {
 "#;
 
 /// The op-13 parent: `v0` = `Instantiator` handle, `v1` = child `Module` handle. Spawns the module into
-/// the 4-KiB carve at `CARVE_OFF` with a **one-entry grant list** (`vgptr = REC_OFF`, `vgn = 1`) — the
-/// record the test seeds names `"fs"`. Emittable via the `env.instantiate_module` bounce.
-fn parent_op13_src() -> String {
+/// a carve at `carve_off` sized `1 << carve_slog` with a **one-entry grant list** (`vgptr = rec_ptr`,
+/// `vgn = 1`) — the record the test seeds names `"fs"`. Emittable via the `env.instantiate_module` bounce.
+fn parent_op13_src(rec_ptr: u64, carve_off: u64, carve_slog: u64) -> String {
     format!(
         r#"memory 16
 func (i32, i32) -> (i64) {{
 block 0 (v0: i32, v1: i32) {{
   vmh = i64.extend_i32_u v1
-  vgptr = i64.const {REC_OFF}
+  vgptr = i64.const {rec_ptr}
   vgn = i64.const 1
   ventry = i64.const 0
-  voff = i64.const {CARVE_OFF}
-  vsl = i64.const 12
+  voff = i64.const {carve_off}
+  vsl = i64.const {carve_slog}
   vq = i64.const 0
   vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
   vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
@@ -135,18 +139,16 @@ struct HostState {
     carve_rejected: bool,
 }
 
-/// Run one op-13 parent over the granted child, seeding the record with `rec_handle` at `rec_ptr`. Returns
-/// `(parent_result, counter, rejected)`. `rec_handle`/`rec_ptr` let a caller inject a forged handle or an
-/// out-of-window record to drive the fail-closed paths.
-fn run_marshal(rec_handle_override: Option<i32>, rec_ptr: u64) -> (i64, i64, bool) {
-    let parent = parse(&{
-        // Only `vgptr` varies for the out-of-window case; keep the rest of the driver fixed.
-        let s = parent_op13_src();
-        s.replace(
-            &format!("vgptr = i64.const {REC_OFF}"),
-            &format!("vgptr = i64.const {rec_ptr}"),
-        )
-    });
+/// Run one op-13 parent over the granted child. `rec_handle`/`rec_ptr` inject a forged handle or an
+/// out-of-window record (authority / parse fail-closed); `carve_off`/`carve_slog` drive the carve gate
+/// (window fail-closed). Returns `(parent_result, counter, rejected)`.
+fn run_marshal(
+    rec_handle_override: Option<i32>,
+    rec_ptr: u64,
+    carve_off: u64,
+    carve_slog: u64,
+) -> (i64, i64, bool) {
+    let parent = parse(&parent_op13_src(rec_ptr, carve_off, carve_slog));
     let child = parse(CHILD);
 
     let (child_wasm, eligible) =
@@ -267,11 +269,14 @@ fn run_marshal(rec_handle_override: Option<i32>, rec_ptr: u64) -> (i64, i64, boo
             .unwrap();
     }
 
-    // env.instantiate_module (op 13): **marshal** the grant list out of the parent window and build the
-    // child powerbox from it (the #1025 slice 3a addition), then emit + run the child over the carve. A
-    // marshal refusal (forged handle / out-of-window record) fails closed: the child never runs, `-1` → join.
+    // env.instantiate_module (op 13): the **faithful production servicer** shape — two fail-closed axes,
+    // in order. (1) Gate the carve through `check_child_carve` (window confinement: aligned, in-parent,
+    // clears the NULL guard, sized ≥ the child's declared memory). (2) **Marshal** the grant list out of
+    // the parent window and build the child powerbox (authority). Either refusal means no child runs and
+    // `-1` → join → sentinel. Then emit + run the child over the carve.
     {
         let parent_cb = Arc::clone(&parent_host);
+        let child_ir = Arc::clone(&child_mod);
         linker
             .func_wrap(
                 "env",
@@ -284,9 +289,23 @@ fn run_marshal(rec_handle_override: Option<i32>, rec_ptr: u64) -> (i64, i64, boo
                       grants_n: i64,
                       _entry: i64,
                       off: i64,
-                      _slog: i64,
+                      slog: i64,
                       _quota: i64|
                       -> Result<i32, wasmi::Error> {
+                    // (1) Carve gate — window confinement, fail-closed before any authority work.
+                    if check_child_carve(
+                        &child_ir,
+                        off as u64,
+                        slog as u32,
+                        WIN_SIZE,
+                        win as u64,
+                        temen_ir::module_null_guard(),
+                    )
+                    .is_err()
+                    {
+                        caller.data_mut().carve_rejected = true;
+                        return Ok(-1);
+                    }
                     // Read the parent's window slice `[win, win+WIN_SIZE)` and marshal the grant records.
                     let window = {
                         let data = memory.data(&caller);
@@ -434,8 +453,8 @@ fn run_marshal(rec_handle_override: Option<i32>, rec_ptr: u64) -> (i64, i64, boo
 fn op13_bounce_marshals_the_grant_from_the_window() {
     // The record names the real parent `"fs"` handle at the canonical offset. The bounce marshals it, the
     // child resolves `"fs"` through the *marshaled* powerbox, and its granted call ticks the shared counter.
-    let (r, counter, rejected) = run_marshal(None, REC_OFF);
-    assert!(!rejected, "a valid grant list is accepted");
+    let (r, counter, rejected) = run_marshal(None, REC_OFF, CARVE_OFF as u64, 12);
+    assert!(!rejected, "a valid grant list + valid carve is accepted");
     assert_eq!(
         r, 41,
         "emitted op-13 parent + marshaled granted child = 40 + counter(1)"
@@ -450,7 +469,7 @@ fn op13_bounce_marshals_the_grant_from_the_window() {
 fn forged_handle_in_the_record_is_refused_fail_closed() {
     // The record names a handle the parent never granted (`4242`). `spawn_named_child_from_window` refuses
     // it (`NotRegrantable`); the child never runs and the counter stays put.
-    let (r, counter, rejected) = run_marshal(Some(4242), REC_OFF);
+    let (r, counter, rejected) = run_marshal(Some(4242), REC_OFF, CARVE_OFF as u64, 12);
     assert!(rejected, "a forged handle fails the marshal closed");
     assert_eq!(r, i64::MIN, "join mapped the `-1` refusal to the sentinel");
     assert_eq!(counter, 0, "no granted authority ran — nothing to tick");
@@ -460,13 +479,43 @@ fn forged_handle_in_the_record_is_refused_fail_closed() {
 fn out_of_window_record_pointer_is_refused_fail_closed() {
     // `vgptr` points past the 64-KiB window (record read `[WIN_SIZE-8, WIN_SIZE+8)` overruns). The marshal
     // refuses (`OutOfWindow`) before touching the parent powerbox; the child never runs.
-    let (r, counter, rejected) = run_marshal(None, WIN_SIZE - 8);
+    let (r, counter, rejected) = run_marshal(None, WIN_SIZE - 8, CARVE_OFF as u64, 12);
     assert!(
         rejected,
         "an out-of-window record pointer fails the marshal closed"
     );
     assert_eq!(r, i64::MIN, "join mapped the `-1` refusal to the sentinel");
     assert_eq!(counter, 0, "no granted authority ran");
+}
+
+#[test]
+fn undersized_carve_is_refused_even_with_a_valid_grant() {
+    // The two fail-closed axes compose: the grant list is valid (names the real `"fs"`), but the carve
+    // `slog = 11` (2 KiB) under-sizes the child's `memory 12` (4 KiB) window. `check_child_carve` refuses
+    // it **before** the grant is marshaled — window confinement is independent of authority — so the child
+    // never runs and the counter stays 0. (Native/interp gate this the same way; this is the emitted twin.)
+    let (r, counter, rejected) = run_marshal(None, REC_OFF, CARVE_OFF as u64, 11);
+    assert!(
+        rejected,
+        "an undersized carve is refused even with a valid grant"
+    );
+    assert_eq!(r, i64::MIN, "join mapped the carve refusal to the sentinel");
+    assert_eq!(
+        counter, 0,
+        "fail-closed on the window axis: no granted authority ran"
+    );
+}
+
+#[test]
+fn misaligned_carve_is_refused_even_with_a_valid_grant() {
+    // A carve offset that is not `1 << slog`-aligned (`CARVE_OFF + 8`, `slog = 12`) is refused by the gate,
+    // independently of the (valid) grant — the alignment half of the buddy-carve invariant.
+    let (_r, counter, rejected) = run_marshal(None, REC_OFF, CARVE_OFF as u64 + 8, 12);
+    assert!(
+        rejected,
+        "a misaligned carve is refused even with a valid grant"
+    );
+    assert_eq!(counter, 0, "fail-closed on the window axis");
 }
 
 #[test]

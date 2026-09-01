@@ -21619,7 +21619,10 @@ impl Host {
             let end = off.checked_add(len)?;
             window.get(usize::try_from(off).ok()?..usize::try_from(end).ok()?)
         };
-        let mut grants: Vec<(String, i32)> = Vec::with_capacity(grants_n as usize);
+        // Do NOT pre-size on `grants_n` — it is untrusted (a huge value would abort on the allocation
+        // before any bounds check). Records are 16 bytes each and must fit the window, so the loop bails
+        // at the first out-of-window record; the Vec grows to at most `window.len() / 16` entries.
+        let mut grants: Vec<(String, i32)> = Vec::new();
         for i in 0..grants_n {
             let rec_off = i
                 .checked_mul(16)
