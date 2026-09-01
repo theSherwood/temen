@@ -9976,7 +9976,9 @@ fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<Co
                 | temen_ir::ValType::F64
         )
     };
-    let max_slots = (temen_wasm_jit::ENV_CELL_BYTES - 16) / 8;
+    // The cross-tier call scratch capacity (NOT the whole env cell — #1120 Slice 3 enlarged the cell
+    // with a separate group-edge region; the shimmable-arity gate stays tied to the call scratch).
+    let max_slots = temen_wasm_jit::XCALL_MAX_SLOTS;
     let all_shimmable = m.funcs.iter().all(|f| {
         f.params.iter().all(scalar)
             && f.results.iter().all(scalar)
@@ -10511,7 +10513,9 @@ pub extern "C" fn temen_coop_call_interp(target: u32, args_ptr: *mut u8) -> i32 
     let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() }) else {
         return 1;
     };
-    let max_slots = (temen_wasm_jit::ENV_CELL_BYTES - 16) / 8;
+    // The cross-tier call scratch width (the call region only — #1120 Slice 3 added a separate group-edge
+    // region after it; a `call_interp` bounce marshals within the call scratch).
+    let max_slots = temen_wasm_jit::XCALL_MAX_SLOTS;
     // SAFETY: the host passes the env scratch, at least `max_slots` i64s wide.
     let io = unsafe { core::slice::from_raw_parts_mut(args_ptr as *mut i64, max_slots) };
     match s.run.bounce(target, io) {

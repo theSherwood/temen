@@ -97,8 +97,16 @@ async function measureVariant(split, cacheKey) {
     curve.push(ms);
   }
   const out = readStdout();
+  // Oracle (INVARIANTS #9): the interpreter warm eval of the same program. The split emit must byte-match
+  // it — the real correctness gate for the outlined function on the actual card.
+  const pb = enc(PROGRAM);
+  const ip = ex.temen_alloc(N(pb.length));
+  new Uint8Array(membuf()).set(pb, Number(ip));
+  ex.temen_warm_eval(ip, N(pb.length));
+  ex.temen_dealloc(ip, N(pb.length));
+  const interpOut = readStdout();
   ex.temen_warm_close();
-  return { primeMs, wasmLen, entryFunc, curve, out };
+  return { primeMs, wasmLen, entryFunc, curve, out, interpOut };
 }
 
 console.error(`engine ${wasmPath} (${(readFileSync(wasmPath).length / (1 << 20)).toFixed(1)} MiB)`);
@@ -107,10 +115,13 @@ console.error(`asset  ${modPath} (${(modBytes.length / (1 << 20)).toFixed(1)} Mi
 const steady = (c) => Math.min(...c.slice(Math.max(1, c.length - 3))); // min of the last 3 runs
 const fmt = (c) => c.map((x) => x.toFixed(0).padStart(6)).join('');
 const reportOne = (label, v) => {
+  const parity = v.out === v.interpOut;
   console.log(`${label}: emit wasm=${v.wasmLen} bytes (${(v.wasmLen / (1 << 20)).toFixed(3)}MiB) entryFunc=${v.entryFunc} prime=${v.primeMs.toFixed(0)}ms`);
   console.log(`  per-Run ms (1…${RUNS}): ${fmt(v.curve)}`);
   console.log(`  Run-1=${v.curve[0].toFixed(0)}ms  steady(min last 3)=${steady(v.curve).toFixed(0)}ms  Run-1/steady=${(v.curve[0] / steady(v.curve)).toFixed(2)}x`);
-  console.log(`  out=${JSON.stringify(v.out.trim())}`);
+  console.log(`  interp-parity: ${parity ? 'OK — warm+JIT ≡ warm-interp oracle' : 'MISMATCH!'}  out=${JSON.stringify(v.out.trim())}`);
+  if (!parity) { console.error(`  interp: ${JSON.stringify(v.interpOut)}`); process.exitCode = 1; }
+  return parity;
 };
 
 if (ONLY === 'off' || ONLY === 'on') {

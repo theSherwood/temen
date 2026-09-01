@@ -14,7 +14,7 @@ fn main() {
                     | temen_ir::ValType::F64
             )
         };
-        let max_slots = (temen_wasm_jit::ENV_CELL_BYTES - 16) / 8;
+        let max_slots = temen_wasm_jit::XCALL_MAX_SLOTS; // cross-tier call scratch capacity (#1120 Slice 3)
         let tally = |m: &temen_ir::Module| -> (usize, usize) {
             let mut em = m.clone();
             if let Some(mc) = em.memory.as_mut() {

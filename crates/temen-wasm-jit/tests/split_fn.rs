@@ -312,6 +312,67 @@ fn split_helper_callee_matches_interp() {
     );
 }
 
+/// #1120 Slice 3 — generate a function that threads `width` i64 values through a chain of `nblocks`
+/// blocks, so every inter-block edge carries `width` block params (`width` scratch slots). `param 0` is a
+/// data-dependent accumulator (each block folds a ballast value into it); params `1..width` are ballast
+/// threaded unchanged, purely to fatten the boundary. `f0(vn) = a well-defined function of vn` the
+/// interpreter oracle computes independently. This is the shape the intra-function split's group-edge
+/// marshalling must carry — and with `width` > 64 it exceeds the old cross-tier scratch cap, so it is the
+/// case Slice 3's dedicated group-edge scratch (256 slots) unlocks.
+fn wide_thread_fn(width: usize, nblocks: usize) -> String {
+    assert!(width >= 2 && nblocks >= 3);
+    let mut s = String::from("memory 16\nfunc (i64) -> (i64) {\n");
+    // block 0: acc0 = vn; ballast c0_k = const; br 1(vn, c0_1..c0_{width-1})
+    s.push_str("block 0 (vn: i64) {\n");
+    let mut a0 = vec!["vn".to_string()];
+    for k in 1..width {
+        s.push_str(&format!("  c0_{k} = i64.const {}\n", (k as i64) * 7 + 1));
+        a0.push(format!("c0_{k}"));
+    }
+    s.push_str(&format!("  br 1({})\n}}\n", a0.join(", ")));
+    // middle blocks 1..nblocks-1: fold one ballast into the accumulator, re-thread all width params.
+    for b in 1..nblocks - 1 {
+        let decl: Vec<String> = (0..width).map(|i| format!("p{b}_{i}: i64")).collect();
+        s.push_str(&format!("block {b} ({}) {{\n", decl.join(", ")));
+        let pick = 1 + (b % (width - 1));
+        s.push_str(&format!("  acc{b} = i64.add p{b}_0 p{b}_{pick}\n"));
+        let mut nexta = vec![format!("acc{b}")];
+        nexta.extend((1..width).map(|i| format!("p{b}_{i}")));
+        s.push_str(&format!("  br {}({})\n}}\n", b + 1, nexta.join(", ")));
+    }
+    // final block: sum every param, return.
+    let b = nblocks - 1;
+    let decl: Vec<String> = (0..width).map(|i| format!("q{i}: i64")).collect();
+    s.push_str(&format!("block {b} ({}) {{\n", decl.join(", ")));
+    s.push_str("  s1 = i64.add q0 q1\n");
+    for i in 2..width {
+        s.push_str(&format!("  s{i} = i64.add s{} q{i}\n", i - 1));
+    }
+    s.push_str(&format!("  return s{}\n}}\n}}\n", width - 1));
+    s
+}
+
+/// #1120 Slice 3 — a function with **80-slot block params** (> the old 64-slot cross-tier cap) splits at
+/// every K and matches the interpreter oracle. Before Slice 3's dedicated group-edge scratch this declined
+/// (`plan_fn_split` bailed on any entry block over 64 slots); now the group edge marshals up to 256 slots.
+#[test]
+fn split_wide_block_params_matches_interp() {
+    let src = wide_thread_fn(80, 6);
+    assert_split_parity(&src, &[&[0], &[1], &[7], &[100], &[-3]]);
+}
+
+/// #1120 Slice 3 — the group-edge scratch is 256 slots; a function whose boundary blocks exceed that still
+/// declines **gracefully** (an `Unsupported` error, never a miscompile). 300-slot blocks, cut so a boundary
+/// lands on one.
+#[test]
+fn split_over_scratch_declines_gracefully() {
+    let m = parse(&wide_thread_fn(300, 4));
+    assert!(
+        compile_split_fn(&m, 0, 4, false).is_err(),
+        "300-slot boundary blocks must exceed the 256-slot group-edge scratch and decline"
+    );
+}
+
 #[test]
 fn split_loop_sum_matches_interp() {
     assert_split_parity(
