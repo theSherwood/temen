@@ -5327,6 +5327,18 @@ enum RunInput {
         /// guest (chibicc), whose handle is dropped.
         readback: Option<String>,
     },
+    /// A **caller-provided granted powerbox** (#1025 Path 1) — the run executes its emitted `_start` over
+    /// `host` verbatim instead of building the on-ramp powerbox from stdin/an fs image. This is what an
+    /// op-13 nested phase child uses: its `host` is the powerbox the parent marshaled across the
+    /// `env.instantiate_module` bounce ([`Host::spawn_named_child_from_window`]), so the child's `call.cap`
+    /// leaves (an `fs`/`stdout`) resolve over that granted host on the reactor-path cross-tier bounce
+    /// ([`JitOnrampRun::run_cross_tier`] → `run_over(&mut self.host)`), exactly as a top-level phase's `fs`
+    /// resolves today. `init_mem` is the window prefix to seed (argv at `POWERBOX_ARGS_BASE`, or empty).
+    PreGranted {
+        host: Box<Host>,
+        init_mem: Vec<u8>,
+        readback: Option<(temen_fs::MemFsHandle, String)>,
+    },
 }
 
 impl JitOnrampRun {
@@ -5433,6 +5445,48 @@ impl JitOnrampRun {
             self.program.clone(),
             self.emitted_wasm.clone(),
             self.emitted.clone(),
+        )
+    }
+
+    /// Open a single-shot JIT run over a **caller-owned** window with a **caller-provided granted
+    /// `Host`** (#1025 Path 1 — the emitted nested phase child). The run executes its emitted `_start`
+    /// over `host` verbatim: the parent already marshaled exactly the caps the child holds (a shared
+    /// `fs`/`stdout`) across the op-13 bounce, so the child's `call.cap` leaves resolve over this granted
+    /// powerbox on the reactor cross-tier bounce — no on-ramp caps are added. `init_mem` seeds the window
+    /// prefix (argv at `POWERBOX_ARGS_BASE`, or empty); `readback` retains a memfs handle + key for a
+    /// file-output phase (nifler's `.p.nif`), else `None` for a stdout guest.
+    ///
+    /// # Safety
+    /// As [`open_shared_run`](Self::open_shared_run): `[win_ptr, win_size)` must be a live region of this
+    /// module's linear memory (the carve), used solely as this run's window, valid until the run is dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn open_shared_run_over_host(
+        m: &temen_ir::Module,
+        win_ptr: *mut u8,
+        win_size: u64,
+        win_log2: u8,
+        shared_memory: bool,
+        host: Host,
+        init_mem: Vec<u8>,
+        readback: Option<(temen_fs::MemFsHandle, String)>,
+    ) -> Result<JitOnrampRun, i32> {
+        let win_base = win_ptr as usize;
+        let back = std::sync::Arc::new(temen_interp::Region::shared(win_ptr, win_size));
+        Self::open_over_run(
+            m,
+            back,
+            None,
+            win_ptr,
+            win_size,
+            win_base,
+            win_log2,
+            shared_memory,
+            RunInput::PreGranted {
+                host: Box::new(host),
+                init_mem,
+                readback,
+            },
+            None,
         )
     }
 
@@ -5651,6 +5705,16 @@ impl JitOnrampRun {
                 let frame = std::sync::Arc::new(std::sync::Mutex::new(None));
                 let fs_readback = readback.map(|key| (fsh, key));
                 (host, init_mem, frame, fs_readback)
+            }
+            RunInput::PreGranted {
+                host,
+                init_mem,
+                readback,
+            } => {
+                // Run over the caller's marshaled granted powerbox verbatim — no on-ramp caps are added
+                // here; the parent granted exactly what the child holds (the confinement default).
+                let frame = std::sync::Arc::new(std::sync::Mutex::new(None));
+                (*host, init_mem, frame, readback)
             }
         };
         // Live-stream stdout from the emitted `_start`'s cross-tier `write` bounces (#1141) — a no-op
@@ -10990,5 +11054,110 @@ pub extern "C" fn temen_coop_close() {
     // SAFETY: single-threaded wasm; take + drop the session.
     unsafe {
         *core::ptr::addr_of_mut!(COOP_RUN) = None;
+    }
+}
+
+#[cfg(test)]
+mod path1_jit_over_host_tests {
+    //! #1025 Path 1 — the engine primitive for an **emitted nested phase child**:
+    //! [`JitOnrampRun::open_shared_run_over_host`] runs a guest's emitted `_start` over a
+    //! **caller-provided granted powerbox** (the host an op-13 parent marshals across the
+    //! `env.instantiate_module` bounce). This proves the caller's host is wired into the reactor
+    //! cross-tier bounce ([`JitOnrampRun::run_cross_tier`] → `run_over(&mut self.host)`), so a child's
+    //! `call.cap` leaf (an `fs`) resolves over the granted host — without needing the JS emitted driver
+    //! (the bounce seam is exercised directly, exactly what an emitted `f0` reaching a cross-tier leaf does).
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use temen_interp::{ForkedProc, HostProc};
+
+    // f0 (emitted) = 40 + f1(); f1 (cross-tier leaf) seeds "fs" (0x7366 LE), resolves it, calls the
+    // granted HOST_PROC counter, returns its post-increment result.
+    const CHILD: &str = r#"memory 12
+func () -> (i64) {
+block 0 () {
+  v40 = i64.const 40
+  vcap = call 1 ()
+  vr = i64.add v40 vcap
+  return vr
+  }
+}
+func () -> (i64) {
+block 0 () {
+  vname = i64.const 29542
+  vzero = i64.const 0
+  i64.store vzero vname
+  vp0 = i64.const 0
+  vl2 = i64.const 2
+  vh = self.resolve vp0 vl2
+  vr = call.cap 13 0 (i64) -> (i64) vh (vp0)
+  return vr
+  }
+}
+"#;
+
+    fn granted_fs_host() -> (Host, Arc<Mutex<i64>>) {
+        let counter = Arc::new(Mutex::new(0i64));
+        let mut host = Host::new();
+        let c1 = Arc::clone(&counter);
+        let handler: HostProc = Box::new(move |_op, _a, _m, _| {
+            let mut c = c1.lock().unwrap();
+            *c += 1;
+            Ok(vec![*c])
+        });
+        let c2 = Arc::clone(&counter);
+        let fork = Arc::new(move |_pid: u64| {
+            let c = Arc::clone(&c2);
+            ForkedProc::shared(Box::new(move |_op, _a, _m, _| {
+                let mut c = c.lock().unwrap();
+                *c += 1;
+                Ok(vec![*c])
+            }))
+        });
+        let h = host.grant_host_proc_forkable(handler, fork);
+        host.register_cap_name("fs", h);
+        (host, counter)
+    }
+
+    #[test]
+    fn jit_run_over_a_marshaled_granted_host_resolves_the_cap() {
+        let m = temen_text::parse_module(CHILD).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        let (host, counter) = granted_fs_host();
+
+        let win_log2 = 12u8;
+        let win_size = 1u64 << win_log2;
+        let mut backing = vec![0u8; win_size as usize];
+        let win_ptr = backing.as_mut_ptr();
+        // SAFETY: `backing` outlives `run` (dropped first, reverse declaration order); it is this run's
+        // sole window and never moves.
+        let mut run = unsafe {
+            JitOnrampRun::open_shared_run_over_host(
+                &m,
+                win_ptr,
+                win_size,
+                win_log2,
+                false,
+                host,
+                Vec::new(),
+                None,
+            )
+        }
+        .expect("open a JIT run over the caller-provided granted host");
+        // The emitted `f0` reaches its `call.cap` leaf `f1` via `run_cross_tier` — drive that seam
+        // directly (no JS emitted driver needed to prove the host is carried into the bounce).
+        let r = run
+            .run_cross_tier(1, &[])
+            .expect("the cross-tier leaf runs over the granted host");
+        assert_eq!(
+            r.first(),
+            Some(&Value::I64(1)),
+            "the granted `fs` returned its post-increment count (1)"
+        );
+        assert_eq!(
+            *counter.lock().unwrap(),
+            1,
+            "the marshaled `fs` cap resolved + ran inside the JIT run's cross-tier bounce"
+        );
+        drop(run);
     }
 }
