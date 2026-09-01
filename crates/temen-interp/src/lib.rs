@@ -17265,6 +17265,19 @@ pub trait SignalSource: Send + Sync {
 /// are half the key, so `self.schema` names are canonical). The `Host::iface_intern` element.
 type IfaceKey = (Arc<[String]>, Arc<[FuncType]>);
 
+/// Why [`Host::spawn_named_child_from_window`] refused a §14 op-13 grant list — each maps to the
+/// fail-closed trap the wasm-JIT `env.instantiate_module` servicer raises (matching the native
+/// `grant_named_child_build`: `OutOfWindow` → `MemoryFault`, `BadName`/`NotRegrantable` → `CapFault`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantMarshalError {
+    /// A record (`grants_ptr + i*16`) or a name (`name_off..name_off+name_len`) fell outside the window.
+    OutOfWindow,
+    /// A grant name was not valid UTF-8.
+    BadName,
+    /// A record named a forged / non-re-grantable handle (`spawn_named_child` fail-closed).
+    NotRegrantable,
+}
+
 /// The host: the **host-owned handle table** (the powerbox) plus deterministic mock
 /// capability state (captured stdio, a monotonic clock). Construct with [`Host::new`],
 /// `grant_*` the initial capabilities, then pass to [`run_with_host`]; afterwards read
@@ -21579,6 +21592,50 @@ impl Host {
             ch.register_cap_name(name, cg);
         }
         Some((ch, cinst, cas))
+    }
+
+    /// **Marshal a §14 op-13 grant list from a confined window and build the child powerbox** (#1025
+    /// slice 3a) — the safe, wasmi-friendly counterpart of the native `temen_run::grant_named_child_build`.
+    /// Reads `grants_n` × 16-byte records `{name_off: u32, name_len: u32, handle: i32, flags: u32}` at
+    /// window-relative `grants_ptr` from `window` (the parent's confined, readable window), then re-grants
+    /// each `(name, handle)` from `self` via [`Self::spawn_named_child`]. `flags` (bytes 12..16) is
+    /// reserved and ignored, exactly as on the native and interpreter (`read_grant_list`) paths.
+    ///
+    /// Fail-closed ([`GrantMarshalError`]): an out-of-window record/name (`OutOfWindow`), a non-UTF-8 name
+    /// (`BadName`), or any non-re-grantable handle (`NotRegrantable`, surfaced by `spawn_named_child`)
+    /// refuses the whole spawn — no partial child is built. This is the mechanism the wasm-JIT
+    /// `env.instantiate_module` servicer calls to carry a shared `fs` (or `stdout`) across the emitted
+    /// bounce; the `can_regrant` re-grant policy stays in `spawn_named_child` (INVARIANTS §4 — the
+    /// constructor is mechanism, the authority decision is one place).
+    pub fn spawn_named_child_from_window(
+        &mut self,
+        window: &[u8],
+        grants_ptr: u64,
+        grants_n: u64,
+        child_size: u64,
+    ) -> Result<(Host, i32, i32), GrantMarshalError> {
+        // Bounded read of `[off, off+len)` within the window slice, or `None` (out of window).
+        let read = |off: u64, len: u64| -> Option<&[u8]> {
+            let end = off.checked_add(len)?;
+            window.get(usize::try_from(off).ok()?..usize::try_from(end).ok()?)
+        };
+        let mut grants: Vec<(String, i32)> = Vec::with_capacity(grants_n as usize);
+        for i in 0..grants_n {
+            let rec_off = i
+                .checked_mul(16)
+                .and_then(|d| grants_ptr.checked_add(d))
+                .ok_or(GrantMarshalError::OutOfWindow)?;
+            let rec = read(rec_off, 16).ok_or(GrantMarshalError::OutOfWindow)?;
+            let name_off = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
+            let name_len = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as u64;
+            let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+            let name_bytes = read(name_off, name_len).ok_or(GrantMarshalError::OutOfWindow)?;
+            let name =
+                String::from_utf8(name_bytes.to_vec()).map_err(|_| GrantMarshalError::BadName)?;
+            grants.push((name, handle));
+        }
+        self.spawn_named_child(&grants, child_size)
+            .ok_or(GrantMarshalError::NotRegrantable)
     }
 
     /// FORK.md §8.6 (#1080) — carry an `execve` **image-replace**'s process-surviving state from `self`
