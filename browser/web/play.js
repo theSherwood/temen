@@ -1953,6 +1953,13 @@ async function runBashInteractive(c) {
     } else if (ev.ctrlKey && (ev.key === 'd' || ev.key === 'D')) {
       send([4]);
       ev.preventDefault();
+    } else if (ev.ctrlKey && (ev.key === 'z' || ev.key === 'Z')) {
+      // #798 job control — ^Z (VSUSP, 0x1a): the feed-time line discipline raises SIGTSTP at the
+      // foreground pgid. Stopping a job that is PARKED (a foreground `cat` on `read`) so bash's
+      // `waitpid(WUNTRACED)` wakes and returns to the prompt is tracked in #1171; the byte delivery
+      // is the correct foundation for it (and matches the ^C/^D wiring above).
+      send([26]);
+      ev.preventDefault();
     }
   };
   c.el.run.disabled = true;
