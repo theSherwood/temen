@@ -18,6 +18,10 @@ let warmUrl = null; // the module URL the warm session is currently open for (nu
 // it settles (compiled, or known non-emittable). A wasm-JIT eval awaits it so the first Run is a cache hit.
 let jitPrimePromise = null;
 let jitPrimed = false;
+// Whether this worker's warm+JIT emit outlined the hot `eval_run` (#1120 hot-function outlining). Set from
+// the `prewarm` message before the first `temen_warm_jit_open`; reported in `stats` so an A/B harness can
+// confirm which variant a Run used.
+let warmSplit = false;
 // The background warm-**interp** pre-run. Even the interpreter eval path has a first-call cost: V8
 // compiles the engine's `eval_run` interpreter functions lazily on the first real eval, and `warmup`
 // (Tcl_Init / QuickJS init) doesn't exercise all of them — so the user's first warm-snapshot Run paid
@@ -118,6 +122,11 @@ self.onmessage = async (e) => {
       return;
     }
     if (msg.type === 'prewarm') {
+      // #1120: outline the hot `eval_run` when requested, BEFORE the first `temen_warm_jit_open` (below)
+      // caches the emit — the engine's split toggle is a global read at open time. Default off keeps the
+      // shipping warm cards byte-identical. `temen_warm_jit_set_split` is absent on pre-#1131 engines.
+      warmSplit = !!msg.split;
+      if (ex.temen_warm_jit_set_split) ex.temen_warm_jit_set_split(warmSplit ? 1 : 0);
       const ok = ensureWarm(msg.url, msg.bytes);
       // Reply as soon as warm-interp is ready (the ~0.9 s `warmup`) — do NOT block on the JIT pre-compile,
       // so an early interpreter Run isn't delayed by it.
@@ -276,7 +285,7 @@ self.onmessage = async (e) => {
     if (msg.type === 'stats') {
       // Test/telemetry hook: whether the warm+JIT pre-compile has settled, and the worker's JIT cache
       // accounting (a primed instance ⇒ the first wasm-JIT Run is a cache hit, not a fresh compile).
-      self.postMessage({ type: 'reply', id: msg.id, ok: true, jitPrimed, compiles: jitCacheStats.compiles, hits: jitCacheStats.hits });
+      self.postMessage({ type: 'reply', id: msg.id, ok: true, jitPrimed, split: warmSplit, compiles: jitCacheStats.compiles, hits: jitCacheStats.hits });
       return;
     }
   } catch (err) {

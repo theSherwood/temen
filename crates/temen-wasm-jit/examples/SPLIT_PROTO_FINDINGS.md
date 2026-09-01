@@ -120,3 +120,43 @@ cut, indirect dispatch), scoped separately.
 
 The `compile_module_split` capability + its differential test are correct and retained as the reproducible
 evidence for the negative finding; they are not wired into `compile_jit`.
+
+## Result 6 — the split does NOT engage on the real QuickJS card (Slice 2c, #1120)
+
+Slices 1–2b built + differential-tested the intra-function split emitter (env-scratch trampolining:
+inter-group edges `return_call` a uniform-signature group function, marshaling the target block's
+live-in values through the fixed **64-slot** cross-tier scratch, `XCALL_MAX_SLOTS`). Slice 2c wired an
+opt-in toggle into the warm+JIT path and measured the real cards with `browser/warm-jit-split-test.mjs`
+(Node/V8, the shipping engine FFI + `primeWarmJit`/`runWarmJit`, over the committed snapshots).
+
+**The toggle is a no-op on QuickJS.** `pick_split_target` correctly picks `JS_CallInternal` (func 27:
+est 5.4 MiB, 1838 blocks, K=15), but `emit_module`'s `plan_fn_split` then **declines** it, so the emit is
+byte-identical (14,313,159 bytes split-on == split-off). Reason: the split marshals each inter-group entry
+block's params through the 64-slot scratch, and `JS_CallInternal`'s SSA liveness is enormous —
+
+| | inter-group entry blocks | over the 64-slot cap | max param slots |
+|---|---|---|---|
+| QuickJS `JS_CallInternal` (K=15) | 246 | **241** | **216** |
+| — all 1838 blocks | — | 1815 (98.7%) | 227 |
+| Lua hot fn (func 372, K=3) | 69 | **0** | 35 (all blocks max 43) |
+
+High boundary-liveness is **pervasive** in `JS_CallInternal` (1815/1838 blocks > 64 slots), so no choice of
+cut points can get under the cap — the 64-slot env-scratch ABI simply cannot carry ~216 live values across a
+group edge. `plan_fn_split` declines the whole function ⇒ monolithic fallback ⇒ no tier-up change.
+
+**And it cannot be measured on Lua either.** Lua's hot function *is* outlinable by liveness (max 43 < 64;
+`compile_module_reactor_split` emit grows +230,777 bytes, K=3), but Lua's warm+JIT tier itself **declines**:
+`eval_run` reaches `lua_pcall`'s setjmp, so `compile_jit` routes it to `InterpDriven` (#1081) and
+`temen_warm_jit_open` returns `STATUS_UNSUPPORTED`. Lua runs on warm-**coop**, never on the split emit.
+
+The earlier "3.95× Run-1 speedup" from an in-process A/B was a **run-order artifact** (whichever variant ran
+first paid V8/process cold-start); the emit being byte-identical proves the split contributed nothing. Use
+`--variant=off`/`--variant=on` in separate processes to avoid the confound.
+
+**Conclusion.** The split mechanism is correct and tested, but delivers no first-Run win on any current
+warm+JIT card: QuickJS (the only WasmDriven warm card) exceeds the 64-slot marshalling ABI, and Lua (the
+only other) declines to InterpDriven. To make outlining help QuickJS, the group-edge marshalling must carry
+~256+ live values — a **wider group-edge scratch/spill region** (independent of the 64-slot cross-tier call
+scratch), or a region-based partition that cuts at low-liveness boundaries. That is a follow-up ABI change,
+not part of Slice 2c. The toggle (default off), the reactor/local split entries, and this harness are
+retained as the reproducible evidence and the ready hook for that follow-up.

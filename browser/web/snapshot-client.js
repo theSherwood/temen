@@ -73,14 +73,17 @@ export class SnapshotClient {
 
   // Open the warm session for `url` on its worker (idempotent per URL). `getBytes()` fetches the module
   // bytes and is awaited only the first time. `primeJit` (default true) also pre-compiles the warm+JIT
-  // tier in the worker (skip it for cards whose warm+JIT declines, e.g. Tcl). Resolves `{ ok, status }`.
-  prewarm(url, getBytes, primeJit = true) {
+  // tier in the worker (skip it for cards whose warm+JIT declines, e.g. Tcl). `split` (default false)
+  // outlines the hot `eval_run` function into smaller wasm functions so V8 TurboFans it on the first Run
+  // (#1120); it must be set before the worker's first `temen_warm_jit_open`, which pre-warm performs.
+  // Resolves `{ ok, status }`.
+  prewarm(url, getBytes, primeJit = true, split = false) {
     const w = this._workerFor(url);
     if (w.prewarm) return w.prewarm;
     w.prewarm = (async () => {
       await w.ready;
       const bytes = await getBytes();
-      return this._request(w, 'prewarm', { url, bytes, primeJit });
+      return this._request(w, 'prewarm', { url, bytes, primeJit, split });
     })();
     return w.prewarm;
   }

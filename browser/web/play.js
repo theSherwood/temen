@@ -4149,6 +4149,12 @@ async function main() {
     snapshotClient = new SnapshotClient(eng.module);
     globalThis.__snapshotClient = snapshotClient; // test/telemetry hook (harmless): inspect prewarm state
     const warmCards = cards.filter((c) => c.ex.warm);
+    // #1120 hot-function outlining, opt-in (default off ⇒ shipping cards byte-identical). `?warmsplit=1`
+    // (or `globalThis.__warmJitSplit = true` before load) outlines the hot `eval_run` so V8 TurboFans it on
+    // the first Run — the A/B knob for measuring first-Run tier-up on the real QuickJS card.
+    const warmSplit =
+      globalThis.__warmJitSplit === true ||
+      new URLSearchParams(location.search).get('warmsplit') === '1';
     if (warmCards.length) {
       const prewarmAll = () => {
         for (const c of warmCards) {
@@ -4156,7 +4162,7 @@ async function main() {
           snapshotClient
             // `primeJit` (the card's `jit` flag) pre-compiles the warm+JIT tier during pre-warm — but only
             // for cards that actually use it (QuickJS/Lua); Tcl's warm+JIT declines, so we skip it there.
-            .prewarm(c.ex.url, () => fetchModule(c.ex.url), !!c.ex.jit)
+            .prewarm(c.ex.url, () => fetchModule(c.ex.url), !!c.ex.jit, warmSplit)
             .then((r) => setState(c, 'ready', r.ok ? 'runtime warm — Run is instant' : 'ready'))
             .catch(() => setState(c, 'ready', 'ready'));
         }
