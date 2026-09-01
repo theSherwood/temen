@@ -16,6 +16,16 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **`browser-op13jit-e2e-test.mjs` in the `browser-real` job (`ci.yml`, #1025 Path 1)** — one line added
+  after `node browser-jit-runtime-grow-test.mjs`: `node browser-op13jit-e2e-test.mjs` (with a comment). It
+  pins the JS-orchestrated §14 op-13 loop in real V8: a resumable driver marshals an `fs` grant to a
+  confined child, JS runs that child's `_start` on **emitted wasm** over its carve, the child's `call.cap`
+  leaf resolves the *marshaled* `fs` on the reactor cross-tier bounce and returns 41, and the driver joins
+  it — the browser realization of `nimc.rs::drive_op13` with the child tiered up. No new toolchain (reuses
+  the threads wasm the job already builds); parses its guest in-page, so no assets. Verified locally in
+  Chromium (result 41, counter 1). (Until copied over, the `workflows-in-sync` guard stays red — the
+  expected mirror-edit friction; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
+
 - **`browser-jit-runtime-grow-test.mjs` in the `browser-real` job (`ci.yml`, #1155)** — one line added
   after `node browser-tierup-mainline-test.mjs`: `node browser-jit-runtime-grow-test.mjs`. It is the
   invariant-14 **code-origin axis** pin: a §22 guest-JIT unit (code the guest `vm_jit_compile`s at

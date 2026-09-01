@@ -965,6 +965,12 @@ jobs:
           # (the first in-browser exercise of the guest-runtime-JIT growth path). No assets — parses
           # in-page via temen_parse; benign resource 404s (deploy-built cards) don't gate it.
           node browser-jit-runtime-grow-test.mjs
+          # #1025 Path 1: the JS-orchestrated §14 op-13 loop — a resumable driver marshals an `fs` grant to
+          # a confined child, and JS runs that child's `_start` on emitted wasm over its carve. The child's
+          # `call.cap` leaf resolves the marshaled `fs` on the reactor cross-tier bounce and returns 41; the
+          # driver joins it. The browser realization of nimc.rs::drive_op13 with the child tiered up. No
+          # assets (parses in-page); reuses the threads module built above.
+          node browser-op13jit-e2e-test.mjs
           node browser-play-editor-test.mjs
           # chibicc compile-time on V8 (bytecode vs wasm-JIT) — prints the speedup and asserts the two
           # tiers emit byte-identical IR (a second guard alongside chibicc_jit.rs). Uses the committed/
