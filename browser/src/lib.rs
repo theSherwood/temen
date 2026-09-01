@@ -11121,6 +11121,67 @@ block 0 () {
 }
 "#;
 
+    // Two distinct caps a nim phase child needs marshaled together ({fs, stdout, exit} in production; here
+    // two forkable counters "fs" + "ax"). f0 = f1() + f2(); f1 resolves "fs" (0x7366), f2 resolves "ax"
+    // (0x7861), each calls its granted HOST_PROC — proving multiple distinct marshaled caps resolve.
+    const CHILD_TWO_CAPS: &str = r#"memory 12
+func () -> (i64) {
+block 0 () {
+  va = call 1 ()
+  vb = call 2 ()
+  vr = i64.add va vb
+  return vr
+  }
+}
+func () -> (i64) {
+block 0 () {
+  vname = i64.const 29542
+  vzero = i64.const 0
+  i64.store vzero vname
+  vp0 = i64.const 0
+  vl2 = i64.const 2
+  vh = self.resolve vp0 vl2
+  vr = call.cap 13 0 (i64) -> (i64) vh (vp0)
+  return vr
+  }
+}
+func () -> (i64) {
+block 0 () {
+  vname = i64.const 30817
+  vzero = i64.const 0
+  i64.store vzero vname
+  vp0 = i64.const 0
+  vl2 = i64.const 2
+  vh = self.resolve vp0 vl2
+  vr = call.cap 13 0 (i64) -> (i64) vh (vp0)
+  return vr
+  }
+}
+"#;
+
+    /// A forkable `HOST_PROC` counter registered under `name` on `host`; returns its shared counter.
+    fn grant_counter(host: &mut Host, name: &str) -> Arc<Mutex<i64>> {
+        let counter = Arc::new(Mutex::new(0i64));
+        let c1 = Arc::clone(&counter);
+        let handler: HostProc = Box::new(move |_op, _a, _m, _| {
+            let mut c = c1.lock().unwrap();
+            *c += 1;
+            Ok(vec![*c])
+        });
+        let c2 = Arc::clone(&counter);
+        let fork = Arc::new(move |_pid: u64| {
+            let c = Arc::clone(&c2);
+            ForkedProc::shared(Box::new(move |_op, _a, _m, _| {
+                let mut c = c.lock().unwrap();
+                *c += 1;
+                Ok(vec![*c])
+            }))
+        });
+        let h = host.grant_host_proc_forkable(handler, fork);
+        host.register_cap_name(name, h);
+        counter
+    }
+
     fn granted_fs_host() -> (Host, Arc<Mutex<i64>>) {
         let counter = Arc::new(Mutex::new(0i64));
         let mut host = Host::new();
@@ -11240,5 +11301,49 @@ block 0 () {
             1,
             "the marshaled fs shares the parent's provider state (ticked once)"
         );
+    }
+
+    #[test]
+    fn primitive_resolves_multiple_marshaled_caps() {
+        // A nim phase child holds {fs, stdout, exit}; prove the primitive resolves **multiple distinct**
+        // marshaled caps. A parent grants two ("fs", "ax"); a two-record grant list marshals both into the
+        // child powerbox; the child resolves each and calls it — f0 = fs() + ax() = 2, both counters tick.
+        let m = temen_text::parse_module(CHILD_TWO_CAPS).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+
+        let mut parent = Host::new();
+        let c_fs = grant_counter(&mut parent, "fs");
+        let c_ax = grant_counter(&mut parent, "ax");
+        let h_fs = parent.resolve_cap_name("fs").expect("fs");
+        let h_ax = parent.resolve_cap_name("ax").expect("ax");
+
+        // Two 16-byte records at 32 and 48; names "fs" at 96 and "ax" at 100.
+        let mut window = vec![0u8; 256];
+        let mut rec = |slot: usize, name_off: u32, name: &[u8], handle: i32| {
+            let o = 32 + slot * 16;
+            window[o..o + 4].copy_from_slice(&name_off.to_le_bytes());
+            window[o + 4..o + 8].copy_from_slice(&(name.len() as u32).to_le_bytes());
+            window[o + 8..o + 12].copy_from_slice(&handle.to_le_bytes());
+            window[name_off as usize..name_off as usize + name.len()].copy_from_slice(name);
+        };
+        rec(0, 96, b"fs", h_fs);
+        rec(1, 100, b"ax", h_ax);
+
+        let (child_host, _i, _a) = parent
+            .spawn_named_child_from_window(&window, 32, 2, 1 << 12)
+            .expect("marshal a two-cap grant list");
+        let mut run =
+            JitOnrampRun::open_owned_run_over_host(&m, 12, false, child_host, Vec::new(), None)
+                .expect("open over the two-cap marshaled host");
+        let r = run
+            .run_cross_tier(0, &[])
+            .expect("child f0 runs over the marshaled host");
+        assert_eq!(
+            r.first(),
+            Some(&Value::I64(2)),
+            "child = fs() + ax() = 2 over the two marshaled caps"
+        );
+        assert_eq!(*c_fs.lock().unwrap(), 1, "the marshaled fs ran once");
+        assert_eq!(*c_ax.lock().unwrap(), 1, "the marshaled ax ran once");
     }
 }
