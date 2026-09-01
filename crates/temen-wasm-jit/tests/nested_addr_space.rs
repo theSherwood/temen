@@ -327,8 +327,11 @@ fn sub_carve_then_instantiate_matches_interp() {
     assert_eq!(got, want, "emitted composed §14 entry != interpreter");
 }
 
-/// `map`/`unmap`/`protect` stay fail-closed: an entry using `unmap` (op 1) must not emit — the whole
-/// unit falls back to the interpreter (mask-only confinement can't honor page state; D40/§13).
+/// `map`/`unmap`/`protect` stay fail-closed on the **mask-only** nested entry: even though
+/// [`outline_nested_cap_calls`] now hoists them (#1151), [`compile_module_nested`] (non-paged) can't
+/// honor the page state a `unmap`/`protect` establishes, so the [`module_uses_page_ops`] gate keeps
+/// the whole unit on the interpreter. The paged nested entry
+/// (`compile_module_nested_paged`, covered by `nested_paged.rs`) is what carries it.
 #[test]
 fn page_state_ops_stay_out_of_subset() {
     let src = r#"memory 17
@@ -342,10 +345,10 @@ block 0 (v0: i32) {
 }
 "#;
     let mut m = parse(src);
-    outline_nested_cap_calls(&mut m); // must NOT outline op 1
+    outline_nested_cap_calls(&mut m); // op 1 is now outlined, but the non-paged entry still gates
     assert!(
         compile_module_nested(&m, false).is_err(),
-        "an unmap-using entry must fail closed (interp fallback)"
+        "an unmap-using entry must fail closed on the mask-only entry (interp fallback)"
     );
 }
 

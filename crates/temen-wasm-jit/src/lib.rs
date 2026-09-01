@@ -840,14 +840,25 @@ fn module_can_spawn_same_module(m: &Module) -> bool {
 
 /// The §14 ADDRESS_SPACE (iface 5) ops a nested unit may reach as **outlined cross-tier leaves**
 /// (via the one existing `env.call_interp` transport — no new imports, per the CONSOLIDATION.md §0
-/// yardstick): `page_size` (op 3, a pure query) and `sub` (op 4, attenuation-minting — it carves a
-/// child window handle without changing any page state). `map`/`unmap`/`protect` (ops 0/1/2) are
-/// deliberately excluded: they change page state that *subsequent emitted accesses* must honor, and
-/// the wasm tier's confinement is mask-only — an emitted load would sail through an unmapped page the
-/// interpreter traps. They stay out-of-subset (fail-closed to the interpreter), deferred with the
-/// D40/§13 page-enforcement question.
+/// yardstick): `unmap` (1), `protect` (2), `page_size` (3, a pure query) and `sub` (4,
+/// attenuation-minting — it carves a child window handle without changing any page state).
+///
+/// `unmap`/`protect` change page state that *subsequent emitted accesses* must honor. They ride
+/// this transport only when the unit is compiled **paged** (#1151): the page-op runs interp-serviced
+/// through `env.call_interp` (never emitted, exactly like `page_size`/`sub`), the driver re-syncs the
+/// host page-state table on return, and every emitted access consults it — so an access to a page the
+/// op unmapped/`Ro`-protected traps exactly where the interpreter's `check_prot` does. Under mask-only
+/// (non-paged) compilation the containing unit still fails closed via the [`module_uses_page_ops`]
+/// gate; outlining them here is harmless there (the wrapper is still page-op-bearing, so the gate
+/// keeps the unit interpreter-tier). This closes the D40/§13 page-enforcement question on the nested
+/// axis (INVARIANTS #14) — the paged whole-program path already carries it (`module_uses_unmap_protect`).
+///
+/// `map` (0, a guest *grow*) is deliberately **not** outlined here yet: unlike `unmap`/`protect` it
+/// adds committed pages the emitted bounds check reaches only through a live `"mapped"` re-sync after
+/// the bounce, which the nested driver does not yet perform — admitting it is deferred to the nested-
+/// driver slice so a grow-using nested unit keeps its safe pre-#1151 interpreter fallback until then.
 fn is_nested_leaf_cap(type_id: u32, op: u32) -> bool {
-    type_id == cap_id::ADDRESS_SPACE && (op == 3 || op == 4)
+    type_id == cap_id::ADDRESS_SPACE && (op == 1 || op == 2 || op == 3 || op == 4)
 }
 
 /// Outline each [`is_nested_leaf_cap`] `call.cap` into an appended int-signature wrapper (exactly
@@ -1639,16 +1650,27 @@ pub fn compile_module_with_split(
 /// [`compile_module_nested`] plus the per-function emit map (like [`compile_module_tierup`]'s
 /// `emitted`): `eligible[i]` iff `f{i}` is an emitted export a host may call directly — the browser's
 /// per-entry `temen_par_inst_eligible` gate. A cross-tier leaf (an outlined wrapper) is `false`.
-pub fn compile_module_nested_with_eligibility(
+fn compile_module_nested_inner(
     m: &Module,
     shared_memory: bool,
+    paged: Option<u8>,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
     let n = m.funcs.len();
-    // Track 3 (c)+(a): a window-remapping op (`map`/`unmap`/`protect`, `SharedRegion` map/unmap)
-    // anywhere in the module makes *every* emitted mask-only access unsound (see
-    // [`module_uses_page_ops`]). Fail closed so a direct caller (the browser's per-instance nested
-    // codegen) falls back to its interpreter path — [`compile_nested`] gates this up front instead.
-    if module_uses_page_ops(m) {
+    // Track 3 (c)+(a): a window-remapping op anywhere in the module makes *every* emitted mask-only
+    // access unsound (see [`module_uses_page_ops`]). Fail closed so a direct caller (the browser's
+    // per-instance nested codegen) falls back to its interpreter path — [`compile_nested`] gates this
+    // up front instead.
+    //
+    // #1151: paged mode narrows the gate to `SharedRegion` aliasing only — `unmap`/`protect` are
+    // carried by the emitted per-access page check (the nested twin of `compile_module_tierup_inner`),
+    // so a self-page-managing nested unit tiers up instead of module-gating to emit-nothing. The
+    // page-op cap-calls themselves ride the [`is_nested_leaf_cap`] outlined-leaf bounce (interp-
+    // serviced), and the driver re-syncs the page-state table on return.
+    let gated = match paged {
+        None => module_uses_page_ops(m),
+        Some(_) => m.funcs.iter().any(func_uses_region_ops),
+    };
+    if gated {
         return Err(Error::Unsupported(
             "window-remapping op in a nested unit (needs the interpreter tier)",
         ));
@@ -1717,7 +1739,7 @@ pub fn compile_module_nested_with_eligibility(
         &interp_leaf,
         None,
         true,
-        None,
+        paged,
         null_guard,
         &[],
         &[],
@@ -1725,9 +1747,47 @@ pub fn compile_module_nested_with_eligibility(
     Ok((wasm, eligible))
 }
 
+/// [`compile_module_nested`] plus the per-function emit map (mask-only, non-paged) — the original
+/// signature. A window-remapping op (`unmap`/`protect`/`SharedRegion`) fails closed; use
+/// [`compile_module_nested_paged_with_eligibility`] to carry `unmap`/`protect` under the per-access
+/// page check.
+pub fn compile_module_nested_with_eligibility(
+    m: &Module,
+    shared_memory: bool,
+) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    compile_module_nested_inner(m, shared_memory, None)
+}
+
+/// #1151 — the **paged** nested emit: like [`compile_module_nested_with_eligibility`], but every
+/// emitted access also consults the host-maintained byte-per-page state table (base in the exported
+/// `"pagestate"` i32 global; `page_log2` is the run's software page size) and traps `Ro`/`Unmapped`
+/// exactly where the interpreter's `check_prot` does. This narrows the fail-closed gate to
+/// `SharedRegion` aliasing only, so a nested unit that `unmap`s/`protect`s its own pages tiers up
+/// instead of running whole-interpreter. The page-op `call.cap`s ride the [`is_nested_leaf_cap`]
+/// outlined-leaf bounce ([`outline_nested_cap_calls`]) and stay interp-serviced; the driver contract
+/// extends the nested one with the paged refresh — before each emitted call, and again after any
+/// `env.call_interp` bounce that may have remapped, rebuild the page-state table from the live map
+/// (`Mem::map_info`) and re-point `"pagestate"` + set `"mapped"` to its coverage.
+pub fn compile_module_nested_paged_with_eligibility(
+    m: &Module,
+    shared_memory: bool,
+    page_log2: u8,
+) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    compile_module_nested_inner(m, shared_memory, Some(page_log2))
+}
+
 /// The wasm-only front of [`compile_module_nested_with_eligibility`] (the original signature).
 pub fn compile_module_nested(m: &Module, shared_memory: bool) -> Result<Vec<u8>, Error> {
     compile_module_nested_with_eligibility(m, shared_memory).map(|(w, _)| w)
+}
+
+/// The wasm-only front of [`compile_module_nested_paged_with_eligibility`] (#1151).
+pub fn compile_module_nested_paged(
+    m: &Module,
+    shared_memory: bool,
+    page_log2: u8,
+) -> Result<Vec<u8>, Error> {
+    compile_module_nested_paged_with_eligibility(m, shared_memory, page_log2).map(|(w, _)| w)
 }
 
 /// Validate a §14 separate-module child carve before spawning it on the emitted tier — the wasm-JIT
