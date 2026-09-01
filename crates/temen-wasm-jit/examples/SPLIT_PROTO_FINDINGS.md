@@ -160,3 +160,39 @@ only other) declines to InterpDriven. To make outlining help QuickJS, the group-
 scratch), or a region-based partition that cuts at low-liveness boundaries. That is a follow-up ABI change,
 not part of Slice 2c. The toggle (default off), the reactor/local split entries, and this harness are
 retained as the reproducible evidence and the ready hook for that follow-up.
+
+## Result 7 — outlining JS_CallInternal is CORRECT but a net steady-state loss (Slice 3, #1120)
+
+Slice 3 gave inter-group edges a dedicated 256-slot scratch region (separate from the 64-slot cross-tier
+call scratch), so `plan_fn_split` no longer declines `JS_CallInternal`'s high-liveness boundaries. It now
+outlines. A/B on the real QuickJS card (Node/V8, `warm-jit-split-test.mjs --variant=off/on`, fresh process
+each, fib(28), 6 runs; the shipping engine over `qjs_snapshot.temen`):
+
+| | emit bytes | prime | Run 1 | steady (min last 3) | Run-1/steady | interp-parity |
+|---|---|---|---|---|---|---|
+| split-off (monolithic) | 14,313,162 | 3153 ms | 9984 ms | **2331 ms** | 4.28× | OK |
+| split-on (K≈15) | 15,420,505 | 715 ms | 10268 ms | **8882 ms** | 1.16× | OK |
+
+Two real effects, one good and one disqualifying:
+
+- **Correct + the tier-up penalty is gone (good).** The +1.1 MB emit confirms the split engaged; the
+  interpreter-oracle parity confirms the widened marshalling ABI is correct on a 5.4 MB function cut into
+  ~15 groups with 200+ live values per group edge. And Run-1/steady drops from 4.28× to 1.16× — the split
+  *does* reach its steady state on Run 1 (TurboFan finishes each small group immediately), while the
+  monolith spends run 1 on Liftoff.
+- **Steady state is 3.8× SLOWER (disqualifying).** The split's steady state (8882 ms) is 3.8× the monolith's
+  (2331 ms), so it is slower on *every* run — the Run-1 tier-up win is dwarfed. `JS_CallInternal` is a giant
+  hot **dispatch loop**; the contiguous block-index cuts (`i*k/nb`) fall *across* that loop, so every
+  bytecode dispatch now crosses a group boundary and pays the marshal-to-memory + `return_call` + read-back
+  cost — with up to 227 slots copied through memory on the heavy edges. The property that makes the function
+  tier up slowly (one big hot loop) is exactly what makes it pathological to outline this way.
+
+**Conclusion.** Block-group outlining is the wrong lever for `JS_CallInternal`. The mechanism is correct and
+retained (default off — shipping cards unaffected, byte-identical), and it may still help a function whose
+hot path does not straddle the cuts. But a *contiguous, liveness-and-hotness-blind* cut of a hot dispatch
+loop trades a one-time tier-up latency for a permanent per-iteration trampoline tax. The only outlining that
+could help QuickJS is a **hotness-aware partition** that outlines the *cold* blocks (rare opcodes, error
+paths) while keeping the hot dispatch core monolithic — shrinking the function TurboFan must compile without
+putting marshalling on the hot path. That needs per-block hotness (static heuristic or profile) and is a
+distinct, larger design. Otherwise the first-Run lever for QuickJS lies elsewhere (shrinking the emitted
+hot function, or making Liftoff→TurboFan of one big function faster), not in splitting it.
