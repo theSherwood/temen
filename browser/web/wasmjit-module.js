@@ -91,7 +91,7 @@ async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp, entry
 // once. Returns the finish status. The caller must have opened the run (`temen_onramp_jit_run_open*`) already.
 // `cacheKey` (optional) is a stable identity of the guest module; when given, the compiled Module and its
 // instance are reused across Runs (see `cachedInstanceF0`).
-async function driveJitRun(ex, memory, cacheKey, afterFinish) {
+export async function driveJitRun(ex, memory, cacheKey, afterFinish) {
   const u8 = () => new Uint8Array(memory.buffer);
   // Read the window base + the powerbox handle slots `_start` takes as params, and the env-cell size.
   const win = Number(ex.temen_onramp_jit_run_win_ptr());
@@ -167,10 +167,15 @@ async function driveJitRun(ex, memory, cacheKey, afterFinish) {
   // reads the extras here, while the run's memfs handle is still live — finish stashed the primary
   // readback, `afterFinish` reads the rest via `temen_onramp_jit_run_readfile`, then we close.
   if (afterFinish) afterFinish(ex);
+  let trapMsg = '';
+  if (status === 3) {
+    const tl = ex.temen_onramp_jit_run_trap_len();
+    trapMsg = tl ? new TextDecoder().decode(u8().slice(Number(ex.temen_stdout_ptr()), Number(ex.temen_stdout_ptr()) + tl)) : '';
+  }
   ex.temen_onramp_jit_run_close();
   // A trap on the emitted tier is a refusal, not a result: throw so the caller runs the guest on the
   // interpreter oracle instead of surfacing a truncated run (INVARIANT 9 — diverge toward refusal).
-  if (status === 3 /* STATUS_TRAP */) throw new Error('emitted run trapped (declined to the interpreter)');
+  if (status === 3 /* STATUS_TRAP */) throw new Error('emitted run trapped (declined to the interpreter): ' + trapMsg);
   return status;
 }
 
