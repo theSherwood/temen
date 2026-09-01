@@ -13,7 +13,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use temen_interp::{bytecode, Host, HostProc, StreamRole, Trap, Value};
+use temen_interp::{
+    bytecode, ForkedProc, Host, HostProc, HostProcFork, Region, StreamRole, Trap, Value,
+};
 use temen_ir::Module;
 
 use crate::{onramp_cap_resolver, onramp_check, pg_args_blob};
@@ -220,6 +222,191 @@ fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) ->
     (host.stdout, code)
 }
 
+// ---- run a phase as a confined §14 op-13 child on the resumable (tier-up-capable) engine (#1025) ---
+// A phase run this way executes as a **separate-module confined child** over a sub-window carve instead
+// of inline in the driver's own powerbox: the same resumable bytecode engine `run_phase` uses, but on
+// the tier-up-capable path (`new_confined_child_over_host`) a JIT'd phase rides — matching the native
+// op-13 conductor (`temen-run/examples/nim_chain_op13.rs`). `child` is a **child-entry** phase module
+// (func 0 = `[I64]->[I64]`, built `--child-entry`); `{fs, stdout, exit}` are re-granted into it (`vm_map`
+// auto-binds to the child's AddressSpace), argv is seeded into its carve, and its joined status returns.
+
+/// The text-IR op-13 parent that spawns `child` (window `child_sl`, carve at `carve_off`) with the grant
+/// list `{fs, stdout, exit}` and `argv` seeded at `carve + args_base`. Mirrors `nifler_child_asset.rs` /
+/// `spawn_child_fs.rs`; the guarded child's `module_args_base` places records at 17408.., names at
+/// 18432.. (above the #1094 NULL guard the parent itself carries), argv at `carve + args_base`.
+fn op13_parent_src(child_sl: u32, carve_off: u64, args_base: u64, argv: &[&str]) -> String {
+    let parent_sl = child_sl + 1;
+    let argv_off = carve_off + args_base;
+    let mut blob = Vec::new();
+    blob.extend_from_slice(&(argv.len() as u32).to_le_bytes()); // argc
+    blob.extend_from_slice(&0u32.to_le_bytes()); // envc
+    for s in argv {
+        blob.extend_from_slice(s.as_bytes());
+        blob.push(0);
+    }
+    let argv_esc: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
+    let rec = |off: u64, name_off: u64, name_len: u64| -> String {
+        let w0 = name_off | (name_len << 32);
+        format!(
+            "  x{off} = i64.const {w0}\n  o{off} = i64.const {off}\n  i64.store o{off} x{off}\n"
+        )
+    };
+    format!(
+        r#"memory {parent_sl}
+data 18432 "fs"
+data 18448 "stdout"
+data 18464 "exit"
+data {argv_off} "{argv_esc}"
+func (i32, i32, i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {{
+{r0}  hf = i64.extend_i32_u v2
+  ohf = i64.const 17416
+  i64.store ohf hf
+{r1}  hs = i64.extend_i32_u v3
+  ohs = i64.const 17432
+  i64.store ohs hs
+{r2}  he = i64.extend_i32_u v4
+  ohe = i64.const 17448
+  i64.store ohe he
+  vmh = i64.extend_i32_u v1
+  vgptr = i64.const 17408
+  vgn = i64.const 3
+  ventry = i64.const 0
+  voff = i64.const {carve_off}
+  vsl = i64.const {child_sl}
+  vq = i64.const 0
+  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
+  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  return vr
+  }}
+}}
+"#,
+        r0 = rec(17408, 18432, 2),
+        r1 = rec(17424, 18448, 6),
+        r2 = rec(17440, 18464, 4),
+    )
+}
+
+/// The resumable-engine drive loop (mirrors `temen-run/tests/child_entry_fs.rs`): on `Instantiate`, take
+/// the op-13 re-granted powerbox (`take_granted_host`) and run the child over it
+/// (`new_confined_child_over_host`, which binds the child manifest against that powerbox); `Join` delivers
+/// the child's result. Single-threaded here (the driver worker), so the window base travels as a raw ptr.
+fn drive_op13<'p>(
+    prog: &'p bytecode::VcpuProgram,
+    base: *mut u8,
+    mut vcpu: bytecode::Vcpu<'p>,
+) -> Result<Vec<Value>, Trap> {
+    let mut children: Vec<Result<Vec<Value>, Trap>> = Vec::new();
+    loop {
+        match vcpu.run() {
+            bytecode::VcpuEvent::Done(v) => return Ok(v),
+            bytecode::VcpuEvent::Trapped(t) => return Err(t),
+            bytecode::VcpuEvent::Instantiate {
+                module,
+                entry,
+                carve,
+                size_log2,
+                fuel,
+            } => {
+                let granted = vcpu.take_granted_host();
+                // SAFETY: the engine validated the carve within this vCPU's window (which outlives the
+                // child); the child region aliases that sub-window — the §14 shared data plane.
+                let child_base = unsafe { base.add(carve as usize) };
+                let back =
+                    std::sync::Arc::new(unsafe { Region::shared(child_base, 1u64 << size_log2) });
+                let child = match granted {
+                    Some(host) => bytecode::Vcpu::new_confined_child_over_host(
+                        prog, module, entry, back, size_log2, fuel, host,
+                    ),
+                    None => bytecode::Vcpu::new_confined_child(
+                        prog, module, entry, back, size_log2, fuel,
+                    ),
+                };
+                let r = match child {
+                    Ok(c) => drive_op13(prog, child_base, c),
+                    Err(t) => Err(t),
+                };
+                let handle = children.len() as i32;
+                children.push(r);
+                vcpu.deliver_handle(handle);
+            }
+            bytecode::VcpuEvent::Join { handle } => {
+                vcpu.deliver_join(children[handle as usize].clone());
+            }
+            _ => return Err(Trap::Malformed),
+        }
+    }
+}
+
+/// Run one child-entry phase `child` with `argv` as a confined §14 op-13 child over the shared memfs
+/// `factory`, on the resumable (tier-up-capable) engine. Returns the joined exit/return status. The carve
+/// is `(declared + 3).max(24)` (≥16 MiB — heap room above `1<<declared` for the phase's malloc).
+fn run_phase_op13(child: &Module, argv: &[&str], factory: &FsFactory) -> i64 {
+    let decl = child.memory.as_ref().map_or(24, |m| u32::from(m.size_log2));
+    let child_sl = (decl + 3).max(24);
+    let carve_off = 1u64 << child_sl;
+    let src = op13_parent_src(child_sl, carve_off, temen_ir::module_args_base(), argv);
+    let Ok(parent) = temen_text::parse_module(&src) else {
+        return -1;
+    };
+    let Some(prog) = bytecode::VcpuProgram::compile(&parent) else {
+        return -1;
+    };
+    let mut host = Host::new();
+    let fs_init: HostProc = (*factory)();
+    let fs_fork: HostProcFork = {
+        let f = std::sync::Arc::clone(factory);
+        std::sync::Arc::new(move |_pid| ForkedProc::shared((*f)()))
+    };
+    let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork);
+    let stdout_h = host.grant_stream(StreamRole::Out);
+    let exit_h = host.grant_exit();
+    let win = 1u64 << (child_sl + 1);
+    let inst = host.grant_instantiator(0, win);
+    let modh = host.grant_module(child);
+
+    let size = win as usize;
+    let Ok(layout) = std::alloc::Layout::from_size_align(size, 8) else {
+        return -1;
+    };
+    // SAFETY: non-zero 8-aligned layout; `size` valid bytes owned here until the dealloc below, after
+    // every vCPU and region view is dropped.
+    let mem_base = unsafe { std::alloc::alloc_zeroed(layout) };
+    if mem_base.is_null() {
+        return -1;
+    }
+    let back = std::sync::Arc::new(unsafe { Region::shared(mem_base, win) });
+    let status = match bytecode::Vcpu::new_root_with_powerbox(
+        &prog,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(modh),
+            Value::I32(fs_h),
+            Value::I32(stdout_h),
+            Value::I32(exit_h),
+        ],
+        std::sync::Arc::clone(&back),
+        &[],
+        host,
+    ) {
+        Ok(root) => drive_op13(&prog, mem_base, root),
+        Err(t) => Err(t),
+    };
+    drop(back);
+    // SAFETY: same layout; the root vCPU and its region views are dropped above.
+    unsafe { std::alloc::dealloc(mem_base, layout) };
+    match status {
+        Ok(v) => v.first().map_or(0, |x| match x {
+            Value::I64(n) => *n,
+            Value::I32(n) => *n as i64,
+            _ => 0,
+        }),
+        Err(Trap::Exit(c)) => c as i64,
+        Err(_) => -1,
+    }
+}
+
 /// The wasm-native `exec` cap: `nimsem`'s `system("nifler … parse …")` (routed by the shim to the
 /// `exec` capability) runs `nifler` as a nested guest over the **same** memfs. Only `nifler` is in the
 /// registry (argv[0] `nifler` or `/bin/nifler`); anything else is refused. Non-`run` ops
@@ -279,7 +466,31 @@ pub fn compile_nim(
     files: Vec<(String, Vec<u8>)>,
     main_nim: &str,
 ) -> Result<String, String> {
+    compile_nim_ce(nifler, None, nimsem, hexer, files, main_nim)
+}
+
+/// [`compile_nim`] with an optional **child-entry** nifler (`nifler_ce`, built `--child-entry`). When
+/// present, the phase-1 import crawl runs nifler as a confined §14 op-13 child on the tier-up-capable
+/// engine ([`run_phase_op13`], #1025) instead of inline in the driver's powerbox; otherwise it stays on
+/// the inline [`run_phase`] path (byte-identical output either way). nimsem/hexer stay inline for now
+/// (their 256 MiB carves are the #816 half of the browser story).
+pub fn compile_nim_ce(
+    nifler: &[u8],
+    nifler_ce: Option<&[u8]>,
+    nimsem: &[u8],
+    hexer: &[u8],
+    files: Vec<(String, Vec<u8>)>,
+    main_nim: &str,
+) -> Result<String, String> {
     let nifler_m = Arc::new(temen_encode::decode_module(nifler).map_err(|_| "decode nifler")?);
+    let nifler_ce_m = match nifler_ce {
+        Some(bytes) => {
+            let m = temen_encode::decode_module(bytes).map_err(|_| "decode nifler_ce")?;
+            temen_verify::verify_module(&m).map_err(|_| "verify nifler_ce")?;
+            Some(m)
+        }
+        None => None,
+    };
     let nimsem_m = temen_encode::decode_module(nimsem).map_err(|_| "decode nimsem")?;
     let hexer_m = temen_encode::decode_module(hexer).map_err(|_| "decode hexer")?;
 
@@ -298,12 +509,12 @@ pub fn compile_nim(
             continue;
         }
         let out = format!("/nimcache/{stem}.p.nif");
-        let (_o, code) = run_phase(
-            &nifler_m,
-            &["nifler", "--portablePaths", "--deps", "parse", &file, &out],
-            (factory)(),
-            None,
-        );
+        let argv = ["nifler", "--portablePaths", "--deps", "parse", &file, &out];
+        let code = match &nifler_ce_m {
+            // #1025: the crawl phase runs nifler as a confined op-13 child on the tier-up-capable engine.
+            Some(ce) => run_phase_op13(ce, &argv, &factory),
+            None => run_phase(&nifler_m, &argv, (factory)(), None).1,
+        };
         if code != 0 && code != 5 {
             return Err(format!("nifler failed on {file} (code {code})"));
         }
@@ -477,6 +688,121 @@ mod tests {
             r.as_deref(),
             Ok("hello, Nim\nhello, the Temen\n"),
             "in-browser compile+run of a proc + string-concat program"
+        );
+    }
+
+    /// Inflate a committed `.gz` asset with the system `gzip` (matching `nifler_child_asset.rs`).
+    fn inflate(path: &str) -> Option<Vec<u8>> {
+        use std::io::Write;
+        let bytes = std::fs::read(path).ok()?;
+        let mut c = std::process::Command::new("gzip")
+            .args(["-dc"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .ok()?;
+        let mut stdin = c.stdin.take()?;
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&bytes);
+        });
+        let out = c.wait_with_output().ok()?;
+        out.status.success().then_some(out.stdout)
+    }
+
+    /// The committed **child-entry** nifler (`nifler_ce.temen.gz`) — the op-13 phase asset.
+    fn inflate_nifler_ce() -> Option<Vec<u8>> {
+        inflate("../crates/temen-run/demos/nifler_temen/nifler_ce.temen.gz")
+    }
+
+    /// Fast differential (no full compile): the phase-1 nifler crawl over one file must produce
+    /// **byte-identical** `.p.nif` + `.p.deps.nif` whether run inline ([`run_phase`], top-level nifler)
+    /// or as a confined op-13 child ([`run_phase_op13`], child-entry nifler_ce). Proves the #1025 wiring
+    /// is output-preserving without paying the ~5 min end-to-end compile.
+    #[test]
+    fn op13_nifler_crawl_matches_inline() {
+        // Both nifler builds are committed browser/demo assets — no nim toolchain needed, so this gates
+        // in per-PR CI (unlike the `seed()`-gated end-to-end tests): the top-level `_start` nifler the
+        // card ships and the child-entry `nifler_ce`, which share the parser, must emit identical NIF.
+        let Some(ce) = inflate_nifler_ce() else {
+            eprintln!("SKIP: nifler_ce.temen.gz unavailable / gzip missing");
+            return;
+        };
+        let Some(top) = inflate("web/assets/nifler.temen.gz") else {
+            eprintln!("SKIP: web/assets/nifler.temen.gz unavailable");
+            return;
+        };
+        let ce_m = temen_encode::decode_module(&ce).expect("decode nifler_ce");
+        temen_verify::verify_module(&ce_m).expect("verify nifler_ce");
+        let top_m = Arc::new(temen_encode::decode_module(&top).expect("decode nifler"));
+
+        let src = b"let x = 1\n".to_vec();
+        let argv = [
+            "nifler",
+            "--portablePaths",
+            "--deps",
+            "parse",
+            "/in.nim",
+            "/nimcache/in.p.nif",
+        ];
+        let run = |m_inline: Option<&Arc<Module>>, ce: Option<&Module>| {
+            let (factory, handle) = temen_fs::mem_fs_shared_factory(
+                vec![("in.nim".into(), src.clone())],
+                vec!["nimcache".into()],
+            );
+            let factory: FsFactory = Arc::new(factory);
+            let code = match (m_inline, ce) {
+                (Some(m), _) => run_phase(m, &argv, (factory)(), None).1,
+                (None, Some(c)) => run_phase_op13(c, &argv, &factory),
+                _ => unreachable!(),
+            };
+            (
+                code,
+                read(&handle, "nimcache/in.p.nif"),
+                read(&handle, "nimcache/in.p.deps.nif"),
+            )
+        };
+        let (c_inline, nif_inline, deps_inline) = run(Some(&top_m), None);
+        let (c_op13, nif_op13, deps_op13) = run(None, Some(&ce_m));
+
+        assert!(
+            nif_op13.is_some(),
+            "op-13 nifler wrote its .p.nif into the shared memfs"
+        );
+        assert_eq!(
+            c_inline, c_op13,
+            "exit codes agree (inline {c_inline} vs op-13 {c_op13})"
+        );
+        assert_eq!(
+            nif_inline, nif_op13,
+            ".p.nif byte-identical between inline and op-13 nifler"
+        );
+        assert_eq!(
+            deps_inline, deps_op13,
+            ".p.deps.nif byte-identical between inline and op-13 nifler"
+        );
+    }
+
+    /// End-to-end: the full in-browser compile with the phase-1 crawl on the op-13 path
+    /// ([`compile_nim_ce`] with the child-entry nifler) produces the same program output as the inline
+    /// path. Slow (~5 min) — the interpreter runs the whole front-end — so it shares `io_hello`'s gate.
+    #[test]
+    fn io_hello_op13_nifler() {
+        let Some((nifler, nimsem, hexer, mut files)) = seed() else {
+            return;
+        };
+        let Some(ce) = inflate_nifler_ce() else {
+            eprintln!("SKIP: nifler_ce.temen.gz unavailable");
+            return;
+        };
+        files.push((
+            "prog.nim".into(),
+            b"import std/syncio\n\nproc greet(name: string): string =\n  \"hello, \" & name & \"\\n\"\n\nwrite(stdout, greet(\"Nim\"))\nwrite(stdout, greet(\"the Temen\"))\n".to_vec(),
+        ));
+        let r = compile_nim_ce(&nifler, Some(&ce), &nimsem, &hexer, files, "prog.nim");
+        assert_eq!(
+            r.as_deref(),
+            Ok("hello, Nim\nhello, the Temen\n"),
+            "op-13-crawl in-browser compile matches the inline path"
         );
     }
 }
