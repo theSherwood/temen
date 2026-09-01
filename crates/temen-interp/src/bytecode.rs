@@ -10459,30 +10459,58 @@ impl CoopSched {
                         // at that task's next safepoint (slice 1). The tree-walker drives this from
                         // its `set_wake` closure; the cooperative pump polls it here, at the would-be
                         // block. `interrupt_pending` is a non-consuming peek — delivery still fires.
-                        let sig_pending = host
-                            .signal_poll()
-                            .is_some_and(|(_, s)| s.interrupt_pending());
-                        if sig_pending {
-                            let mut woke = false;
-                            for t in tasks.iter_mut() {
-                                if matches!(
-                                    t.state,
-                                    TaskState::BlockedPipeRead { .. }
-                                        | TaskState::BlockedPipeWrite { .. }
-                                ) {
-                                    match t.env {
-                                        Some(k) => {
-                                            extra_envs[k].host.lock_unpoisoned().set_sig_interrupt()
-                                        }
-                                        None => host.set_sig_interrupt(),
-                                    }
-                                    t.state = TaskState::Runnable;
-                                    woke = true;
-                                }
-                            }
-                            if woke {
+                        // #1171 — DOMAIN-SCOPED (invariant 12): a parked task is interrupted only when
+                        // ITS OWN domain has a deliverable signal pending, never because some other
+                        // domain does. Before this a single root-host pending signal swept EVERY
+                        // pipe-parked task across all domains — so a shell's `SIGCHLD` (raised when a
+                        // foreground job stopped) wrongly `-EINTR`'d that job's own blocked read,
+                        // running it off the end instead of leaving it stopped (the browser `^Z` gap).
+                        // A pipe read/write re-runs `-EINTR`; a personality `waitpid` (BlockedReap-
+                        // Personality) re-runs and serves whatever its table now reports — a fresh
+                        // `WUNTRACED` stop, an exit, or re-parks if still nothing — so the shell's
+                        // `SIGCHLD` on a child's stop/continue transition wakes its blocked `waitpid`,
+                        // matching the tree-walker (whose `Blocked::Stopped` insert drains the reap
+                        // waiters). The caught handler itself is delivered at that task's next safepoint.
+                        let mut woke = false;
+                        for t in tasks.iter_mut() {
+                            let is_pipe = matches!(
+                                t.state,
+                                TaskState::BlockedPipeRead { .. }
+                                    | TaskState::BlockedPipeWrite { .. }
+                            );
+                            let is_reap =
+                                matches!(t.state, TaskState::BlockedReapPersonality { .. });
+                            if !is_pipe && !is_reap {
                                 continue;
                             }
+                            let pending = match t.env {
+                                Some(k) => extra_envs[k]
+                                    .host
+                                    .lock_unpoisoned()
+                                    .signal_poll()
+                                    .is_some_and(|(_, s)| s.interrupt_pending()),
+                                None => host
+                                    .signal_poll()
+                                    .is_some_and(|(_, s)| s.interrupt_pending()),
+                            };
+                            if !pending {
+                                continue;
+                            }
+                            // Only a pipe park needs the EINTR latch (its rewound read/write completes
+                            // `-EINTR`); a re-run `waitpid` re-consults the personality with no flag.
+                            if is_pipe {
+                                match t.env {
+                                    Some(k) => {
+                                        extra_envs[k].host.lock_unpoisoned().set_sig_interrupt()
+                                    }
+                                    None => host.set_sig_interrupt(),
+                                }
+                            }
+                            t.state = TaskState::Runnable;
+                            woke = true;
+                        }
+                        if woke {
+                            continue;
                         }
                         // #1122 — every task is parked and no internal wake can come. With an
                         // armed doorbell and at least one task parked on a PIPE — the state an

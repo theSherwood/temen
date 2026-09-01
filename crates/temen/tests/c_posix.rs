@@ -4092,3 +4092,86 @@ int main(void) {{\n\
         "handler longjmp escaped twice, delivery re-armed, terminal alive"
     );
 }
+
+/// #1171 — **a stopped foreground job wakes the shell's blocked `waitpid`, and only the shell's**
+/// (the core of the browser `^Z`). Three domains, no terminal: the shell `A` catches `SIGCHLD` (job
+/// control) and forks the job `B` (which **parks on a pipe read** — exactly `cat` on stdin, blocked
+/// with a live writer) and a stopper `C`. `A` blocks in `waitpid(B, WUNTRACED)` **first**; `C`
+/// `SIGTSTP`s `B`. `B`'s stop must (1) leave `B` parked — a stopped process makes no progress — and
+/// (2) `SIGCHLD` the shell, waking its parked `waitpid` so it reports the stop (`(20 << 8) | 0x7f`).
+///
+/// The cooperative bytecode driver's all-parked signal sweep used to interrupt **every** pipe-parked
+/// task whenever the root host had a deliverable signal — so `A`'s `SIGCHLD` `-EINTR`'d `B`'s own
+/// blocked read, running `B` off the end (it exits 7) and `A` reaped that exit instead of the stop
+/// (`0x0700`, `WEXITSTATUS 7` — the bug). #1171 makes the sweep **domain-scoped** (invariant 12: a
+/// signal to `A` never sweeps `B`'s park) and extends it to wake a `waitpid` park whose own domain has
+/// a pending signal, so the shell's `SIGCHLD` wakes its `waitpid` (which re-runs and finds `B`'s fresh
+/// stop) while `B` stays parked. The tree-walker already did this via its domain-scoped park interrupt;
+/// this is the bytecode twin. Both engines return 42.
+const STOP_WAKES_SHELL_WAIT_SRC: &str = r#"
+long __px_signal(int cap, long signum, long handler);
+long __px_sigaltstack(int cap, long sp, long size);
+long __px_fork(int cap, long a);
+long __px_waitpid(int cap, long pid, long status, long opts);
+long __px_kill(int cap, long pid, long sig);
+long __vm_pipe(int *fds);
+long __vm_read(int fd, void *buf, long len);
+long __px_pipe_adopt(int cap, long rh, long wh, long fdp);
+long __px_read(int cap, long fd, long buf, long len);
+static char sigstk[16384];
+static volatile long chld;
+static void on_chld(int s) { chld = chld + 1; }   /* the shell's SIGCHLD handler (job control) */
+static int status;
+static long bpid, cpid, i;
+static volatile long acc;
+static int fds[2];
+static char buf[8];
+static long px_h_(long r) { return r <= -1048576 ? -(r + 1048576) : -1; }
+int main(void) {
+  __px_signal(0, 17, (long)on_chld);         /* catch SIGCHLD(17) */
+  __px_sigaltstack(0, (long)sigstk, 16384);  /* async delivery on */
+  bpid = __px_fork(0, 0);
+  if (bpid < 0) return 1;
+  if (bpid == 0) {                           /* B — the foreground job: park on a pipe read forever */
+    int h[2];
+    __vm_pipe(h);
+    __px_pipe_adopt(0, h[0], h[1], (long)fds);
+    long r = __px_read(0, fds[0], (long)buf, 8);   /* PARKS (empty, B holds the write end) */
+    long hh = px_h_(r);
+    if (hh >= 0) __vm_read((int)hh, buf, 8);
+    return 7;                                /* only reached if B is wrongly run off its stopped read */
+  }
+  cpid = __px_fork(0, 0);
+  if (cpid < 0) return 2;
+  if (cpid == 0) {                           /* C — the stopper (its own quantum) */
+    for (i = 0; i < 40000; i = i + 1) acc = acc + 1;  /* let the shell bench in waitpid first */
+    __px_kill(0, bpid, 20);                  /* SIGTSTP B while the shell is parked in its wait */
+    return 3;
+  }
+  long h;
+  while ((h = __px_waitpid(0, bpid, (long)&status, 2)) == -4) {   /* waitpid(B, WUNTRACED), retry on EINTR */
+  }
+  if (h != bpid) return 4;
+  if ((status & 0xff) != 0x7f) return 2000 + (status & 0xffff);  /* WIFSTOPPED, not a reaped exit */
+  if (((status >> 8) & 0xff) != 20) return 5;                     /* by SIGTSTP(20) */
+  return 42;
+}
+"#;
+
+#[test]
+fn c_a_stopped_foreground_job_wakes_the_shells_parked_waitpid() {
+    let e = run_interp_only(STOP_WAKES_SHELL_WAIT_SRC, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "tree-walker: the job's stop SIGCHLD'd the shell, waking its parked waitpid(WUNTRACED) to \
+         report the stop — the job stayed parked (domain-scoped park interrupt)"
+    );
+    let b = run_bytecode_only(STOP_WAKES_SHELL_WAIT_SRC, |_| {});
+    assert_eq!(
+        b.result,
+        vec![Value::I32(42)],
+        "coop bytecode (the browser tier): the domain-scoped all-parked sweep woke the shell's \
+         waitpid on its SIGCHLD without EINTR'ing the job's own stopped read — matching the oracle"
+    );
+}
