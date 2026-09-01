@@ -16,6 +16,17 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **`browser-jit-runtime-grow-test.mjs` in the `browser-real` job (`ci.yml`, #1155)** — one line added
+  after `node browser-tierup-mainline-test.mjs`: `node browser-jit-runtime-grow-test.mjs`. It is the
+  invariant-14 **code-origin axis** pin: a §22 guest-JIT unit (code the guest `vm_jit_compile`s at
+  runtime) running on emitted wasm over a `vm_map`-GROWN window, through the shipped `runJitModule` →
+  `driveCoopTierupRun` coop driver, asserted byte-identical to the interpreter oracle in real V8 — the
+  first in-browser exercise of the guest-runtime-JIT growth path (the native `coop_tierup_driver.rs`
+  covers the mechanism against a reimplemented driver). No new toolchain (reuses the threads wasm the job
+  already builds); parses its guest in-page via `temen_parse`, so no assets; benign resource 404s don't
+  gate it. Verified locally in Chromium. (Until copied over, the `workflows-in-sync` guard stays red —
+  the expected mirror-edit friction; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
+
 - **New `browser-host-guests` job in `ci.yml` (browser runtime-invariant gate, #816/#1094 follow-up)** —
   a per-PR job added right after `browser-jit-host-gates`. The browser crate is its own cargo
   workspace, so the gating `check` job's `cargo test --workspace` never builds or runs it; its Rust
