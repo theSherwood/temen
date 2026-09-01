@@ -361,11 +361,17 @@ fn par_confined_child_paged_reflects_its_own_unmap() {
                             // leaf (built from the CHILD's own live map) marks the page the child just
                             // unmapped as Unmapped (0), while the marker page it stores to stays Rw (1).
                             let plen = temen_par_tierup_pagestate_len(child);
-                            assert!(plen > 0, "paged run must expose a page-state table for the child");
+                            assert!(
+                                plen > 0,
+                                "paged run must expose a page-state table for the child"
+                            );
                             // SAFETY: the pending-event table is stable until deliver; this thread is
                             // the only accessor (single-threaded stand-in for the child's Worker).
                             let table = unsafe {
-                                std::slice::from_raw_parts(temen_par_tierup_pagestate_ptr(child), plen)
+                                std::slice::from_raw_parts(
+                                    temen_par_tierup_pagestate_ptr(child),
+                                    plen,
+                                )
                             };
                             let upage = (unmap_off / page) as usize;
                             let mpage = (marker_off / page) as usize;
@@ -424,7 +430,10 @@ fn par_confined_child_paged_reflects_its_own_unmap() {
     temen_par_free(root);
 
     assert_eq!(child_value, Some(22), "child leaf f(5) over its carve");
-    assert_eq!(result, want, "parallel paged drive diverged from the interpreter oracle");
+    assert_eq!(
+        result, want,
+        "parallel paged drive diverged from the interpreter oracle"
+    );
     assert!(
         saw_unmap_reflected,
         "non-vacuity: the child's leaf tiered up paged and its unmap was reflected in the pagestate"
