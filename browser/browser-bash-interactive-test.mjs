@@ -16,9 +16,9 @@ import { dirname } from 'node:path';
 import { existsSync } from 'node:fs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
-const ASSETS = ['bash.temen', 'bin_seq.temen'];
+const ASSETS = ['bash.temen', 'bin_seq.temen', 'bin_cat.temen'];
 if (ASSETS.some((a) => !existsSync(`${ROOT}/web/assets/${a}`))) {
-  console.log('– interactive bash test skipped (web/assets/bash.temen or bin_seq.temen absent — run build-bash-assets.mjs)');
+  console.log('– interactive bash test skipped (web/assets/bash.temen, bin_seq.temen or bin_cat.temen absent — run build-bash-assets.mjs)');
   process.exit(0);
 }
 async function loadChromium() {
@@ -78,6 +78,35 @@ try {
     (sel) => document.querySelector(sel).textContent.includes('1\n2\n3'),
     `${CARD} pre.stdout`, { timeout: 60000 });
 
+  // #1171 — ^Z job control: run a foreground `cat` (blocks on its stdin read), then ^Z suspends it.
+  // The line discipline raises SIGTSTP at the foreground group; the exec'd cat stops on its parked
+  // read; its SIGCHLD wakes bash's foreground waitpid(WUNTRACED) — even though bash has no async
+  // SIGCHLD delivery (no sigaltstack) — so bash prints `[N]+ Stopped` and returns to the prompt.
+  await term.fill('cat');
+  await term.press('Enter');
+  await new Promise((r) => setTimeout(r, 800)); // let cat reach its blocking read
+  await term.press('Control+z');
+  await page.waitForFunction(
+    (sel) => document.querySelector(sel).textContent.includes('Stopped'),
+    `${CARD} pre.stdout`, { timeout: 60000 });
+  // The prompt is fully usable again: a stopped `cat` must NOT steal this line — bash runs it.
+  await term.fill('echo zdone=$?');
+  await term.press('Enter');
+  await page.waitForFunction(
+    (sel) => document.querySelector(sel).textContent.includes('zdone='),
+    `${CARD} pre.stdout`, { timeout: 60000 });
+
+  // Resume the stopped cat with `fg`: bash re-foregrounds the job's pgrp and SIGCONTs it. That
+  // SIGCONT is a *guest* `kill` syscall (unlike ^Z/^C, which arrive inline through the line
+  // discipline), so on the coop engine its deferred wake must fire inline — before #1171's inline
+  // fix it spawned an OS thread and trapped the wasm engine to a bare `unreachable`. Then ^D EOFs
+  // the resumed cat so it exits and bash reaps it and returns to a clean prompt.
+  await term.fill('fg');
+  await term.press('Enter');
+  await new Promise((r) => setTimeout(r, 800));
+  await term.press('Control+d'); // EOF to the resumed cat → it exits, bash reaps it
+  await new Promise((r) => setTimeout(r, 800));
+
   // ^D on the empty line ends the session: bash prints its `exit` farewell and the card settles.
   await term.press('Control+d');
   await page.waitForFunction(
@@ -95,5 +124,5 @@ try {
 await browser.close();
 await new Promise((r) => server.close(r));
 if (errors.length) { console.error('page errors:', errors); ok = false; }
-if (ok) { console.log('✓ interactive bash card: live session — prompt, builtin, ^C→rc=130, fork+exec\'d seq, ^D exit'); process.exit(0); }
+if (ok) { console.log('✓ interactive bash card: live session — prompt, builtin, ^C→rc=130, fork+exec\'d seq, ^Z suspends cat + usable prompt, fg resumes, ^D exit'); process.exit(0); }
 process.exit(1);

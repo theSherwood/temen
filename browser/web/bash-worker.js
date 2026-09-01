@@ -67,7 +67,16 @@ async function init(cfg) {
       const rc = exports.temen_bash_session(modPtr, modLen, binsPtr, binsLen);
       postMessage({ kind: 'exit', rc });
     } catch (err) {
-      postMessage({ kind: 'fail', why: String(err) });
+      let why = String(err);
+      try {
+        const n = exports.temen_par_last_panic_len();
+        if (n > 0) {
+          const p = exports.temen_par_last_panic_ptr();
+          const mem = new Uint8Array(memory.buffer, p, n).slice();
+          why += ' | ' + new TextDecoder().decode(mem);
+        }
+      } catch {}
+      postMessage({ kind: 'fail', why });
     }
     return;
   }

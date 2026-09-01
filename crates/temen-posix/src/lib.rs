@@ -949,6 +949,15 @@ struct Proc {
     stop_fresh: bool,
     /// #798 slice 2 — a continue not yet reported through `waitpid(WCONTINUED)` (report-once).
     cont_fresh: bool,
+    /// #1171 — a **one-shot** "a child of mine transitioned (stop/continue)" edge, set on this
+    /// (parent) process when a child stops or continues (beside the run-wake). The cooperative
+    /// driver's all-parked sweep reads-and-clears it via [`SignalSource::reap_pending`] to re-admit
+    /// this process's blocked `waitpid(WUNTRACED/WCONTINUED)` even when it has no async SIGCHLD
+    /// delivery armed (bash: no sigaltstack) — the parked reap park is not woken by a poll-only
+    /// SIGCHLD, and a foreground job stopped on a parked read never enters the core stop-park that
+    /// would drain the reap waiters. One-shot so the re-admitted `waitpid` (report-once via
+    /// `stop_fresh`/`cont_fresh`) cannot re-trigger itself into a spin.
+    reap_wake: bool,
     /// #796 default actions — the core's **terminate closure** for this process's domain
     /// ([`SignalSource::set_kill`], installed beside the wake/stop pair): firing it kills the
     /// domain at its next per-op poll. `None` (a driver without the mechanism) degrades to
@@ -1423,18 +1432,26 @@ impl Posix {
     /// firing the returned wake after the locks drop. The embedder-path twin of
     /// [`Ctx::notify_parent_chld`]; an absent, dead, or handler-less parent is a no-op.
     fn chld_to(&self, ppid: i32) {
-        let wake = {
+        // #1171 — grab BOTH the (maybe-`None`) async SIGCHLD delivery wake AND the parent's domain
+        // run-wake. A child's stop/continue transition must wake a parent blocked in
+        // `waitpid(WUNTRACED/WCONTINUED)` even when the parent has no async SIGCHLD delivery armed
+        // (bash: no sigaltstack), so its blocked `waitpid` re-runs and reports the fresh stop.
+        let (wake, run_wake) = {
             let w = self.world.lock().unwrap_or_else(|e| e.into_inner());
             match w.procs.get(&ppid) {
-                Some(ProcEntry::Live(t)) => t
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .deliver_signal(SIGCHLD),
-                _ => None,
+                Some(ProcEntry::Live(t)) => {
+                    let mut tp = t.lock().unwrap_or_else(|e| e.into_inner());
+                    tp.reap_wake = true; // #1171 — one-shot reap re-check edge for the coop sweep
+                    (tp.deliver_signal(SIGCHLD), tp.wake.clone())
+                }
+                _ => (None, None),
             }
         };
         if let Some(f) = wake {
             f();
+        }
+        if let Some(w) = run_wake {
+            w();
         }
     }
 }
@@ -1658,6 +1675,22 @@ impl SignalSource for SignalDoor {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .deliverable_now()
+    }
+
+    /// #1171 — read-and-clear the one-shot child-transition edge (set by [`Ctx::notify_parent_chld`]
+    /// / [`Posix::chld_to`] on this process when a child of it stopped or continued).
+    fn reap_pending(&self) -> bool {
+        let mut p = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut p.reap_wake)
+    }
+
+    /// #1171 — is this process stopped (`stopped_sig` set, before `SIGCONT`)? Gates the read re-admit.
+    fn stopped(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stopped_sig
+            .is_some()
     }
 
     /// #796 block-during-handler — an injected handler frame returned: restore the pre-delivery
@@ -2107,6 +2140,7 @@ fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
         stopped_sig: None,
         stop_fresh: false,
         cont_fresh: false,
+        reap_wake: false,
         kill: None,
         term_sig: None,
         handler_mask_stack: Vec::new(),
@@ -2229,6 +2263,20 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
             drop(p);
             drop(w);
             if !wakes.is_empty() {
+                // Both guards are dropped, so no `Host`/scheduler lock is held here. On a
+                // multi-threaded driver (the tree-walker's threads, `drive_parallel`) a same-stack
+                // fire could still close a host ↔ scheduler cycle *via another thread*, so we detach
+                // (cross-process signals are human-frequency — a short-lived thread is the boring,
+                // provably-unentangled choice). wasm32 has no `thread::spawn` and is always
+                // single-threaded (the cooperative `drive` or the tree-walker), where the wake
+                // closures only ring a dedicated doorbell mutex the pump never holds across an interp
+                // step — so there fire inline. Without this a guest `kill(SIGCONT)` from bash's `fg`
+                // (or its stopped-job exit sweep) panicked the engine to a bare `unreachable` (#1171).
+                #[cfg(target_arch = "wasm32")]
+                for wk in wakes {
+                    wk();
+                }
+                #[cfg(not(target_arch = "wasm32"))]
                 std::thread::spawn(move || {
                     for wk in wakes {
                         wk();
@@ -2484,6 +2532,7 @@ impl Proc {
             stopped_sig: None,
             stop_fresh: false,
             cont_fresh: false,
+            reap_wake: false,
             kill: None, // ditto — the twin's own terminate closure lands at mint
             term_sig: None,
             handler_mask_stack: self.handler_mask_stack.clone(), // forked mid-handler: the twin restores on its inherited return (POSIX fork copies signal state)
@@ -3602,15 +3651,29 @@ impl Ctx<'_> {
     /// parent (`fg`'s own `killpg(SIGCONT)`); an absent or dead parent is a no-op.
     fn notify_parent_chld(&mut self, ppid: i32) {
         if ppid == self.p.pid {
+            self.p.reap_wake = true; // #1171 — one-shot reap re-check edge for the coop sweep
             if let Some(f) = self.p.deliver_signal(SIGCHLD) {
                 self.wake_after.push(f);
+            }
+            // #1171 — a child's stop/continue transition must wake a parent blocked in
+            // `waitpid(WUNTRACED/WCONTINUED)`, independent of whether the parent has async SIGCHLD
+            // delivery armed (bash installs no sigaltstack, so its SIGCHLD is poll-only — the async
+            // `deliver_signal` wake above returns `None`, and a foreground job stopped on a parked
+            // read never enters the core stop-park that would drain the reap waiters). Fire the
+            // parent's own domain run-wake so its blocked `waitpid` re-runs and reports the fresh stop.
+            if let Some(w) = self.p.wake.clone() {
+                self.wake_after.push(w);
             }
             return;
         }
         if let Some(ProcEntry::Live(t)) = self.w.procs.get(&ppid) {
             let mut tp = t.lock().unwrap_or_else(|e| e.into_inner());
+            tp.reap_wake = true; // #1171 — one-shot reap re-check edge for the coop sweep
             if let Some(f) = tp.deliver_signal(SIGCHLD) {
                 self.wake_after.push(f);
+            }
+            if let Some(w) = tp.wake.clone() {
+                self.wake_after.push(w);
             }
         }
     }

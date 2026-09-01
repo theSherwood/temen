@@ -4477,3 +4477,160 @@ fn c_terminal_ctrl_z_stops_an_execd_foreground_command_and_the_shell_reports_it(
          reported, resumed, reaped — matching the oracle"
     );
 }
+
+/// #1171 — **a stopped child wakes a shell blocked in `waitpid(WUNTRACED)` even with NO async SIGCHLD
+/// delivery** — the bash shape. Real bash installs a `SIGCHLD` handler but no sigaltstack, so its
+/// `SIGCHLD` is poll-only: a parked `waitpid` cannot be woken by the async-delivery door, and a
+/// foreground job stopped on a parked read never enters a core stop-park that would drain the reap
+/// waiters. So the shell here catches `SIGCHLD` but registers **no** `sigaltstack`; a sibling `SIGTSTP`s
+/// the job (parked on a pipe read); the shell's blocked `waitpid` must still wake and report the stop.
+/// Before #1171 this HUNG on both engines. The wake now rides the one-shot child-transition edge
+/// (`notify_parent_chld`/`chld_to` → the parent's run-wake + `reap_wake`; the coop all-parked sweep
+/// re-admits the reap park via `reap_pending`). Both engines return 42.
+const STOP_WAKES_NOALT_SRC: &str = r#"
+long __px_signal(int cap, long signum, long handler);
+long __px_fork(int cap, long a);
+long __px_waitpid(int cap, long pid, long status, long opts);
+long __px_kill(int cap, long pid, long sig);
+long __vm_pipe(int *fds);
+long __vm_read(int fd, void *buf, long len);
+long __px_pipe_adopt(int cap, long rh, long wh, long fdp);
+long __px_read(int cap, long fd, long buf, long len);
+static volatile long chld;
+static void on_chld(int s){ chld = chld + 1; }   /* SIGCHLD handler, but NO sigaltstack (async off) */
+static int status;
+static long bpid, cpid, i;
+static volatile long acc;
+static int fds[2];
+static char buf[8];
+static long px_h_(long r){ return r <= -1048576 ? -(r+1048576) : -1; }
+int main(void){
+  __px_signal(0, 17, (long)on_chld);
+  bpid = __px_fork(0,0);
+  if (bpid < 0) return 1;
+  if (bpid == 0) {                        /* the job: park on a pipe read (writer held open) */
+    int h[2]; __vm_pipe(h); __px_pipe_adopt(0, h[0], h[1], (long)fds);
+    long r = __px_read(0, fds[0], (long)buf, 8);
+    long hh = px_h_(r); if (hh >= 0) __vm_read((int)hh, buf, 8);
+    return 7;
+  }
+  cpid = __px_fork(0,0);
+  if (cpid < 0) return 2;
+  if (cpid == 0) { for(i=0;i<40000;i++) acc=acc+1; __px_kill(0, bpid, 20); return 3; }  /* SIGTSTP the job */
+  long h;
+  while ((h = __px_waitpid(0, bpid, (long)&status, 2)) == -4) { }  /* blocks; the stop must wake it */
+  if (h != bpid) return 4;
+  if ((status & 0xff) != 0x7f) return 2000 + (status & 0xffff);
+  if (((status>>8)&0xff) != 20) return 5;
+  return 42;
+}
+"#;
+
+#[test]
+fn c_a_stopped_job_wakes_a_shell_wait_without_async_sigchld() {
+    let e = run_interp_only(STOP_WAKES_NOALT_SRC, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "tree-walker: the job's stop woke the shell's parked waitpid(WUNTRACED) via the child-transition \
+         run-wake — no async SIGCHLD delivery (no sigaltstack) needed"
+    );
+    let b = run_bytecode_only(STOP_WAKES_NOALT_SRC, |_| {});
+    assert_eq!(
+        b.result,
+        vec![Value::I32(42)],
+        "coop bytecode (the browser tier): the all-parked sweep re-admitted the shell's reap park on the \
+         one-shot reap_pending edge — matching the oracle (this is the bash-shape browser ^Z wake)"
+    );
+}
+
+fn zfg2_src() -> String {
+    format!(
+        "{WIN_PAD_17}{EXEC_C}\n\
+long __px_signal(int cap, long signum, long handler);\n\
+long __px_sigaltstack(int cap, long sp, long size);\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_kill(int cap, long pid, long sig);\n\
+long __px_setpgid(int cap, long pid, long pgid);\n\
+long __px_tcsetpgrp(int cap, long fd, long pgid);\n\
+long __vm_pipe(int *fds);\n\
+long __vm_read(int fd, void *buf, long len);\n\
+long __vm_write(int fd, void *buf, long len);\n\
+long __px_pipe_adopt(int cap, long rh, long wh, long fdp);\n\
+long __px_read(int cap, long fd, long buf, long len);\n\
+long __px_write(int cap, long fd, long buf, long len);\n\
+static char sigstk[16384];\n\
+static volatile long chld;\n\
+static void on_chld(int s){{ chld = chld + 1; }}\n\
+static int status;\n\
+static long cpid;\n\
+static int sync_fds[2];\n\
+static char *av[] = {{ \"catr\", 0 }};\n\
+static long ph_(long r){{ return r <= -1048576 ? -(r+1048576) : -1; }}\n\
+int main(void){{\n\
+  __px_signal(0, 17, (long)on_chld);\n\
+  __px_sigaltstack(0, (long)sigstk, 16384);\n\
+  int h2[2]; __vm_pipe(h2); __px_pipe_adopt(0, h2[0], h2[1], (long)sync_fds);\n\
+  cpid = __px_fork(0, 0);\n\
+  if (cpid < 0) return 1;\n\
+  if (cpid == 0) {{\n\
+    __px_setpgid(0, 0, 0);\n\
+    char g; long r = __px_read(0, sync_fds[0], (long)&g, 1);\n\
+    long hh = ph_(r); if (hh >= 0) __vm_read((int)hh, &g, 1);\n\
+    execve(\"/bin/catr\", av, 0);\n\
+    return 99;\n\
+  }}\n\
+  __px_setpgid(0, cpid, cpid);\n\
+  __px_tcsetpgrp(0, 0, cpid);\n\
+  char g = 'g'; long wr = __px_write(0, sync_fds[1], (long)&g, 1);\n\
+  long wh = ph_(wr); if (wh >= 0) __vm_write((int)wh, &g, 1);\n\
+  long h;\n\
+  while ((h = __px_waitpid(0, cpid, (long)&status, 2)) == -4) {{ }}\n\
+  if (h != cpid) return 4;\n\
+  if ((status & 0xff) != 0x7f) return 2000 + (status & 0xffff);\n\
+  __px_tcsetpgrp(0, 0, 1);\n\
+  /* fg: re-foreground + SIGCONT + block again in waitpid (resume-to-block).\n\
+     No data is fed after CONT, so the resumed catr re-blocks on its read and\n\
+     the shell's waitpid must PARK — the real bash `fg` shape. A second ^Z then\n\
+     re-stops it so the park wakes and the probe terminates. */\n\
+  __px_tcsetpgrp(0, 0, cpid);\n\
+  __px_kill(0, -cpid, 18);\n\
+  while ((h = __px_waitpid(0, cpid, (long)&status, 2)) == -4) {{ }}\n\
+  if (h != cpid) return 6;\n\
+  if ((status & 0xff) != 0x7f) return 2100 + (status & 0xffff);\n\
+  return 42;\n\
+}}\n"
+    )
+}
+
+// #1171 — the `fg` resume-to-block shape, both engines. After ^Z stops the exec'd foreground `catr`,
+// the shell reclaims the terminal, re-foregrounds the job, and SIGCONTs it via a *guest* `kill(-pgid,
+// SIGCONT)` (exactly what bash's `fg`/`start_job` does — unlike the ^Z stop, which arrives inline
+// through the line discipline). The continue-fire routes through the per-op syscall handler's deferred
+// `wake_after`: on wasm32 that must fire inline (no `thread::spawn`; firing it on a detached thread
+// panicked bash's `fg` to a bare `unreachable` in the browser). No data is fed after the CONT, so the
+// resumed catr re-blocks on its read and the shell's second waitpid must PARK; a second ^Z then re-stops
+// it, waking the park with a fresh WUNTRACED — the resume-to-block round-trip.
+#[test]
+fn c_terminal_fg_resumes_a_stopped_execd_job_then_restops_it() {
+    let feeds = || vec![(150u64, b"\x1a".to_vec()), (900u64, b"\x1a".to_vec())];
+    let e = run_interp_terminal_setup(&zfg2_src(), feeds(), |host, posix| {
+        stage_executable(host, posix, "/bin/catr", CATR_CMD);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "tree-walker: `fg` SIGCONT resumed the stopped job, its read re-blocked, and the second ^Z \
+         re-stopped it — the shell's re-parked waitpid(WUNTRACED) woke on the fresh stop"
+    );
+    let b = run_bytecode_terminal_setup(&zfg2_src(), feeds(), |host, posix| {
+        stage_executable(host, posix, "/bin/catr", CATR_CMD);
+    });
+    assert_eq!(
+        b.result,
+        vec![Value::I32(42)],
+        "coop bytecode (the browser tier): the guest `kill(-pgid, SIGCONT)` fired its deferred continue \
+         wake and re-parked the shell's reap — matching the oracle (this is the bash `fg` resume shape)"
+    );
+}

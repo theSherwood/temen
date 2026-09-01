@@ -10332,6 +10332,20 @@ impl CoopSched {
                 .iter()
                 .enumerate()
                 .filter_map(|(ci, t)| {
+                    // #1171 — a STOPPED reader/writer is not re-admitted by an input/room wake: a
+                    // stopped process makes no progress, so a suspended foreground `cat` must not steal
+                    // the bytes the shell should read (it re-admits at its `SIGCONT`). Domain-scoped.
+                    let stopped = match t.env {
+                        Some(k) => extra_envs[k]
+                            .host
+                            .lock_unpoisoned()
+                            .signal_poll()
+                            .is_some_and(|(_, s)| s.stopped()),
+                        None => host.signal_poll().is_some_and(|(_, s)| s.stopped()),
+                    };
+                    if stopped {
+                        return None;
+                    }
                     let ready = match &t.state {
                         TaskState::BlockedPipeRead { pipe } => match t.env {
                             Some(k) => extra_envs[k].host.lock_unpoisoned().pipe_read_ready(*pipe),
@@ -10483,7 +10497,13 @@ impl CoopSched {
                             if !is_pipe && !is_reap {
                                 continue;
                             }
-                            let pending = match t.env {
+                            // A pipe/reap park is interrupted by a deliverable (async) signal on its
+                            // OWN domain. A **reap** park is ALSO re-admitted by the one-shot
+                            // child-transition edge (#1171 `reap_pending`, read-and-clear) — so a
+                            // blocking `waitpid(WUNTRACED/WCONTINUED)` wakes when a child stops/continues
+                            // even with no async SIGCHLD delivery (bash: no sigaltstack). The re-run
+                            // `waitpid` reports the fresh stop/continue (report-once) and returns.
+                            let interrupt = match t.env {
                                 Some(k) => extra_envs[k]
                                     .host
                                     .lock_unpoisoned()
@@ -10493,12 +10513,24 @@ impl CoopSched {
                                     .signal_poll()
                                     .is_some_and(|(_, s)| s.interrupt_pending()),
                             };
-                            if !pending {
+                            let reap = is_reap
+                                && match t.env {
+                                    Some(k) => extra_envs[k]
+                                        .host
+                                        .lock_unpoisoned()
+                                        .signal_poll()
+                                        .is_some_and(|(_, s)| s.reap_pending()),
+                                    None => {
+                                        host.signal_poll().is_some_and(|(_, s)| s.reap_pending())
+                                    }
+                                };
+                            if !interrupt && !reap {
                                 continue;
                             }
-                            // Only a pipe park needs the EINTR latch (its rewound read/write completes
-                            // `-EINTR`); a re-run `waitpid` re-consults the personality with no flag.
-                            if is_pipe {
+                            // Only a pipe park interrupted by a signal needs the EINTR latch (its
+                            // rewound read/write completes `-EINTR`); a re-run `waitpid` re-consults the
+                            // personality with no flag.
+                            if is_pipe && interrupt {
                                 match t.env {
                                     Some(k) => {
                                         extra_envs[k].host.lock_unpoisoned().set_sig_interrupt()
