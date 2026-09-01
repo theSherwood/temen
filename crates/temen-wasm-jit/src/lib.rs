@@ -1528,10 +1528,21 @@ const INSTANTIATE_REC_IMPORT_IDX: u32 = 8;
 const ENV_SCRATCH_OFF: u64 = 16;
 /// Max 8-byte slots the cross-tier scratch holds (a `v128` occupies two, #749; a call whose
 /// params-or-results need more slots than this is refused — 64 is absurdly generous for a
-/// function signature).
-const XCALL_MAX_SLOTS: usize = 64;
-/// Bytes the host must allocate for the `env` cell: the `i64` fuel counter + the cross-tier scratch.
-pub const ENV_CELL_BYTES: usize = ENV_SCRATCH_OFF as usize + XCALL_MAX_SLOTS * 8;
+/// function signature). Public so the host's shimmable-arity gate stays tied to the **call** scratch
+/// capacity, not the whole (now larger, #1120 Slice 3) env cell.
+pub const XCALL_MAX_SLOTS: usize = 64;
+/// #1120 Slice 3 — inter-group split edges (`return_call` between block-group functions) marshal a
+/// target block's live-in values through their **own** scratch region, laid out right after the 64-slot
+/// cross-tier call scratch. It is separate so a group body can make a cross-tier call (which uses the
+/// call scratch) and then take a group edge without the two clobbering, and so intra-function boundary
+/// liveness is decoupled from cross-tier call arity. Sized to the max block-boundary liveness we outline:
+/// QuickJS's `JS_CallInternal` peaks at ~227 live slots across a block edge, so 256 covers it with headroom.
+const GROUP_SCRATCH_SLOTS: usize = 256;
+/// Byte offset of the group-edge scratch in the `env` cell (past fuel + the call scratch).
+const GROUP_SCRATCH_OFF: u64 = ENV_SCRATCH_OFF + (XCALL_MAX_SLOTS as u64) * 8;
+/// Bytes the host must allocate for the `env` cell: the `i64` fuel counter + the cross-tier call scratch
+/// + the group-edge scratch.
+pub const ENV_CELL_BYTES: usize = GROUP_SCRATCH_OFF as usize + GROUP_SCRATCH_SLOTS * 8;
 
 /// Compile every function of a **verified** `m` into one wasm module (whole-module, all-integer).
 /// Exports `f{i}` per Temen function; imports `env.memory` (shared iff `shared_memory`), `env.trap`,
@@ -4310,7 +4321,7 @@ fn emit_split_group(
             code.push(OP_LOCAL_GET);
             uleb(&mut code, 1); // env
             code.push(OP_I32_CONST);
-            sleb32(&mut code, (ENV_SCRATCH_OFF + slot_off(params, i)) as i32);
+            sleb32(&mut code, (GROUP_SCRATCH_OFF + slot_off(params, i)) as i32);
             code.push(0x6a); // i32.add
             emit_slot_load(&mut code, *pty);
             code.push(OP_LOCAL_SET);
@@ -4426,7 +4437,10 @@ fn emit_split_wrapper(f: &Func, entry_ord0: u32, group0_widx: u32) -> Result<Vec
         code.push(OP_LOCAL_GET);
         uleb(&mut code, 1); // env
         code.push(OP_I32_CONST);
-        sleb32(&mut code, (ENV_SCRATCH_OFF + slot_off(&f.params, i)) as i32);
+        sleb32(
+            &mut code,
+            (GROUP_SCRATCH_OFF + slot_off(&f.params, i)) as i32,
+        );
         code.push(0x6a); // i32.add
         code.push(OP_LOCAL_GET);
         uleb(&mut code, 2 + i as u64); // the i-th Temen param
@@ -4529,7 +4543,7 @@ fn plan_fn_split(fi: usize, f: &Func, block_group: &[usize], group_base: u32) ->
     let mut entry_blocks = vec![Vec::new(); k];
     for (b, &entry) in is_entry.iter().enumerate() {
         if entry {
-            if slot_count(&f.blocks[b].params) > XCALL_MAX_SLOTS as u64 {
+            if slot_count(&f.blocks[b].params) > GROUP_SCRATCH_SLOTS as u64 {
                 return None;
             }
             let g = block_group[b];
@@ -4627,10 +4641,10 @@ pub fn compile_split_fn(
             let g = block_group[b];
             entry_ordinal[b] = entry_blocks[g].len() as u32;
             entry_blocks[g].push(b);
-            // Every entry block's params ride the env scratch — decline if any exceeds its capacity.
-            if slot_count(&f.blocks[b].params) > XCALL_MAX_SLOTS as u64 {
+            // Every entry block's params ride the group-edge scratch — decline if any exceeds its capacity.
+            if slot_count(&f.blocks[b].params) > GROUP_SCRATCH_SLOTS as u64 {
                 return Err(Error::Unsupported(
-                    "entry block params exceed the env scratch",
+                    "entry block params exceed the group-edge scratch",
                 ));
             }
         }
@@ -5316,8 +5330,8 @@ fn emit_xgroup_edge(
         code.push(OP_LOCAL_GET);
         uleb(code, 1); // env
         code.push(OP_I32_CONST);
-        sleb32(code, (ENV_SCRATCH_OFF + slot_off(tparams, i)) as i32);
-        code.push(0x6a); // i32.add → scratch slot addr
+        sleb32(code, (GROUP_SCRATCH_OFF + slot_off(tparams, i)) as i32);
+        code.push(0x6a); // i32.add → group-scratch slot addr
         code.push(OP_LOCAL_GET);
         uleb(code, cx.local_of[from_block][*a as usize] as u64);
         emit_slot_store(code, tparams[i]);
