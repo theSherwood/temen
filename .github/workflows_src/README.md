@@ -16,6 +16,19 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **`browser-durable-persist-reload-test.mjs` in the `browser-real` job (`ci.yml`, #816 Slice C)** — one
+  line added after `node browser-jit-runtime-grow-test.mjs`: `node browser-durable-persist-reload-test.mjs`.
+  It is the invariant-14 **durability axis, cross-host leg** pin: a `vm_map`-GROWN durability-instrumented
+  guest frozen to a §12 SVMD artifact (`temen_durable_freeze`), persisted to **IndexedDB**, and — after a
+  genuine **page reload** into a fresh WebAssembly instance — thawed and resumed to completion
+  (`temen_durable_thaw_resume`), with the grown-page content surviving the reload. The shipped-path proof
+  of the browser "persist a warmed/grown guest across a reload" consumer (the native oracle
+  `crates/temen/tests/durable_grown_snapshot_resume.rs` pins the mechanism). No new toolchain (reuses the
+  threads wasm the job already builds); parses its guest in-page via `temen_parse`, so no assets; benign
+  resource 404s don't gate it. Verified locally in Chromium. (Until copied over, the `workflows-in-sync`
+  guard stays red — the expected mirror-edit friction; `cp .github/workflows_src/*.yml .github/workflows/`
+  drains it.)
+
 - **`browser-jit-runtime-grow-test.mjs` in the `browser-real` job (`ci.yml`, #1155)** — one line added
   after `node browser-tierup-mainline-test.mjs`: `node browser-jit-runtime-grow-test.mjs`. It is the
   invariant-14 **code-origin axis** pin: a §22 guest-JIT unit (code the guest `vm_jit_compile`s at
