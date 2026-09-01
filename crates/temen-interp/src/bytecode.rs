@@ -13069,6 +13069,19 @@ fn run_vcpu_parallel<'scope, 'env>(
                 // cell yet, and a level-triggered poll cannot lose a wake. Condvar doors on the
                 // shared pipe backing are the follow-up.
                 while !host.lock_unpoisoned().pipe_read_ready(pipe) {
+                    // #1146 slice 2 (parallel) — a signal reaching this OS thread while it blocks on
+                    // the pipe interrupts the read: when a deliverable, non-`SA_RESTART` signal is
+                    // pending, set this host's EINTR flag and break, so the re-run completes `-EINTR`
+                    // at the slice-2a park site (the caught handler is delivered at the vCPU's next
+                    // safepoint). Unlike the cooperative pump there is no central sweep — each blocked
+                    // OS thread observes the interrupt itself. Setting the flag latches the interrupt
+                    // across the break so the re-run surfaces EINTR even if that safepoint delivery
+                    // consumes the pending signal first. `SA_RESTART` leaves `park_interrupted` false,
+                    // so the poll keeps waiting for data (the restarted read).
+                    if host.lock_unpoisoned().park_interrupted() {
+                        host.lock_unpoisoned().set_sig_interrupt();
+                        break;
+                    }
                     std::thread::sleep(std::time::Duration::from_micros(50));
                 }
             }
@@ -13076,6 +13089,11 @@ fn run_vcpu_parallel<'scope, 'env>(
                 // The write twin: ready when the FIFO has room under `PIPE_CAP` (backpressure
                 // drained) or every reader closed (the re-run completes `-EPIPE`).
                 while !host.lock_unpoisoned().pipe_write_ready(pipe) {
+                    // #1146 slice 2 (parallel) — same interruptible break as the read poll above.
+                    if host.lock_unpoisoned().park_interrupted() {
+                        host.lock_unpoisoned().set_sig_interrupt();
+                        break;
+                    }
                     std::thread::sleep(std::time::Duration::from_micros(50));
                 }
             }

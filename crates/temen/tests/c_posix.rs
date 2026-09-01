@@ -862,7 +862,18 @@ fn c_a_caught_signal_interrupts_a_blocked_capability_read_with_eintr() {
     assert_eq!(
         e.result,
         vec![Value::I32(42)],
-        "a caught, delivered SIGINT interrupted the personality-linked guest's blocked capability read"
+        "tree-walker: a caught, delivered SIGINT interrupted the guest's blocked capability read"
+    );
+    // #1146 slice 2 (parallel) — the `drive_parallel` twin: the raiser is a real OS thread raising
+    // SIGINT concurrently while `main`'s thread blocks in the pipe-read poll loop. The loop observes
+    // the deliverable, non-SA_RESTART signal (`park_interrupted`), sets its host EINTR flag, and
+    // breaks; the re-run completes `-EINTR` at the park site and the handler fires (slice 1) — 42.
+    // Before this the parked read polled forever with no writer and the run deadlocked.
+    let p = run_bytecode_parallel_only(EINTR_CAUGHT_SRC, |_| {});
+    assert_eq!(
+        p.result,
+        vec![Value::I32(42)],
+        "parallel bytecode: the concurrent raiser's SIGINT broke the blocked read with -EINTR — matching the oracle"
     );
 }
 
@@ -911,7 +922,15 @@ fn c_an_ignored_signal_does_not_interrupt_a_blocked_capability_read() {
     assert_eq!(
         e.result,
         vec![Value::I32(3)],
-        "an ignored SIGINT must not interrupt the blocked read; it completed with data instead"
+        "tree-walker: an ignored SIGINT must not interrupt the blocked read; it completed with data"
+    );
+    // #1146 slice 2 (parallel) — SIG_IGN is not deliverable, so `park_interrupted` is false: the poll
+    // loop keeps waiting and the raiser's later write completes the read with DATA — no spurious EINTR.
+    let p = run_bytecode_parallel_only(EINTR_IGNORED_SRC, |_| {});
+    assert_eq!(
+        p.result,
+        vec![Value::I32(3)],
+        "parallel bytecode: an ignored SIGINT left the blocked read to complete with data — matching the oracle"
     );
 }
 
@@ -968,7 +987,16 @@ fn c_sa_restart_reissues_an_interrupted_blocked_read() {
     assert_eq!(
         e.result,
         vec![Value::I32(23)],
-        "the SA_RESTART'd SIGINT ran its handler but the blocked read restarted and returned data"
+        "tree-walker: the SA_RESTART'd SIGINT ran its handler but the read restarted and returned data"
+    );
+    // #1146 slice 2 (parallel) — SA_RESTART makes `park_interrupted` false (it honors `syscall_restart`),
+    // so the poll loop does NOT break on the signal: the handler runs (fired=2) but the read keeps
+    // waiting and the raiser's write completes it with data — result 23, never 42.
+    let p = run_bytecode_parallel_only(RESTART_READ_SRC, |_| {});
+    assert_eq!(
+        p.result,
+        vec![Value::I32(23)],
+        "parallel bytecode: SA_RESTART kept the read waiting (handler ran, data returned) — matching the oracle"
     );
 }
 
