@@ -509,14 +509,20 @@ pub fn compile_nim_ce(
             continue;
         }
         let out = format!("/nimcache/{stem}.p.nif");
-        let argv = ["nifler", "--portablePaths", "--deps", "parse", &file, &out];
-        let code = match &nifler_ce_m {
-            // #1025: the crawl phase runs nifler as a confined op-13 child on the tier-up-capable engine.
-            Some(ce) => run_phase_op13(ce, &argv, &factory),
-            None => run_phase(&nifler_m, &argv, (factory)(), None).1,
-        };
-        if code != 0 && code != 5 {
-            return Err(format!("nifler failed on {file} (code {code})"));
+        // #1025 route A: if the JS crawl already ran nifler on this module (on the wasm-JIT tier) and
+        // seeded its `.p.nif` into the memfs, skip the (interpreter) nifler run here — the crawl and this
+        // phase produce byte-identical NIF (proven by `op13_nifler_crawl_matches_inline`). Best-effort:
+        // a module the JS crawl missed has no `.p.nif` present and runs nifler inline as before.
+        if read(&handle, &format!("nimcache/{stem}.p.nif")).is_none() {
+            let argv = ["nifler", "--portablePaths", "--deps", "parse", &file, &out];
+            let code = match &nifler_ce_m {
+                // #1025: the crawl phase runs nifler as a confined op-13 child on the tier-up engine.
+                Some(ce) => run_phase_op13(ce, &argv, &factory),
+                None => run_phase(&nifler_m, &argv, (factory)(), None).1,
+            };
+            if code != 0 && code != 5 {
+                return Err(format!("nifler failed on {file} (code {code})"));
+            }
         }
         let deps_nif = read(&handle, &format!("nimcache/{stem}.p.deps.nif"))
             .map(|b| String::from_utf8_lossy(&b).into_owned())

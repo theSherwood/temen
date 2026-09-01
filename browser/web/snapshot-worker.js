@@ -8,7 +8,7 @@
 // "rare shared-memory race (a double-free)" in the shared setup. This Worker instantiates the engine over
 // a fresh memory of its own and allocates only there, so its warm session can't race the main thread's
 // allocator. Main ↔ worker communicate only by messages (source string in; stdout/status/value out).
-import { runWarmJit, runWarmCoop, primeWarmJit, jitCacheStats, runJitModule } from './wasmjit-module.js';
+import { runWarmJit, runWarmCoop, primeWarmJit, jitCacheStats, runJitModule, jitNimCrawl } from './wasmjit-module.js';
 
 let ex = null; // the worker's own engine exports
 let memory = null; // the worker's own (private) shared WebAssembly.Memory
@@ -236,8 +236,18 @@ self.onmessage = async (e) => {
         return;
       }
       const { nifler, nimsem, hexer, stdlib } = nimAssets;
+      const mainName = msg.main || 'prog.nim';
       const src = new TextEncoder().encode(msg.source);
-      const main = new TextEncoder().encode(msg.main || 'prog.nim');
+      const main = new TextEncoder().encode(mainName);
+      // #1025 route A: tier the phase-1 nifler import crawl up to the wasm-JIT. The JS-orchestrated crawl
+      // runs nifler on the emitted-wasm tier per module and seeds each `.p.nif` into the Rust accumulator
+      // that `temen_compile_nim_fs` mounts, so `compile_nim`'s phase-1 skips the interpreter nifler run for
+      // every module the crawl covered. Best-effort: any failure just falls back to full interpreter phase-1.
+      try {
+        await jitNimCrawl(ex, memory, nifler, stdlib, `/${mainName}`, src, 'nim-nifler-crawl');
+      } catch (e) {
+        ex.temen_nim_precrawl_reset(); // discard a partial crawl; interpreter phase-1 handles everything
+      }
       // Alloc every buffer before writing any (temen_alloc may grow/detach linear memory), then take one
       // fresh view and fill them — the same discipline as play.js's `runNimc`.
       const np = Number(ex.temen_alloc(nifler.length));

@@ -4341,6 +4341,39 @@ pub unsafe extern "C" fn temen_nim_parse_imports(
     len
 }
 
+/// Pre-crawled phase-1 outputs (`nimcache/<stem>.p.nif` + `.p.deps.nif`) the JS crawl loop produced by
+/// running nifler on the **wasm-JIT** (#1025 route A). [`temen_compile_nim_fs`] seeds these into the
+/// compile's memfs, so `nimc::compile_nim`'s phase-1 skips the (interpreter) nifler run for any module a
+/// `.p.nif` is present for — best-effort: a module the JS crawl missed just runs nifler inline as before.
+static mut NIM_PRECRAWL: Vec<(String, Vec<u8>)> = Vec::new();
+
+/// Clear the pre-crawl accumulator (call before a fresh crawl).
+#[no_mangle]
+pub extern "C" fn temen_nim_precrawl_reset() {
+    // SAFETY: single-threaded wasm; exclusive access.
+    unsafe { (*core::ptr::addr_of_mut!(NIM_PRECRAWL)).clear() };
+}
+
+/// Add one pre-crawled file (`path` a memfs key like `nimcache/<stem>.p.nif`, no leading `/`) to the
+/// accumulator [`temen_compile_nim_fs`] seeds.
+///
+/// # Safety
+/// Each `(ptr, len)` must be a live `temen_alloc`ation the host just filled.
+#[no_mangle]
+pub unsafe extern "C" fn temen_nim_precrawl_put(
+    path_ptr: *const u8,
+    path_len: usize,
+    bytes_ptr: *const u8,
+    bytes_len: usize,
+) {
+    let path = String::from_utf8_lossy(unsafe { core::slice::from_raw_parts(path_ptr, path_len) })
+        .trim_start_matches('/')
+        .to_string();
+    let bytes = unsafe { core::slice::from_raw_parts(bytes_ptr, bytes_len) }.to_vec();
+    // SAFETY: single-threaded wasm; exclusive access.
+    unsafe { (*core::ptr::addr_of_mut!(NIM_PRECRAWL)).push((path, bytes)) };
+}
+
 /// **Compile any Nim in the browser — the nimony compiler card** (NIM.md §3c/§3e, #958). Decode the
 /// three phase modules (`nifler`/`nimsem`/`hexer`), mount the stdlib image on the shared memfs and add
 /// the editor's Nim as `[main].nim`, then run the whole nimony toolchain **client-side** via
@@ -4387,6 +4420,14 @@ pub unsafe extern "C" fn temen_compile_nim_fs(
         }
     };
     files.push((main.clone(), src));
+
+    // Seed any JS-orchestrated wasm-JIT pre-crawl outputs (#1025 route A) so `compile_nim`'s phase-1
+    // skips the interpreter nifler run for modules the crawl already produced a `.p.nif` for. Best-effort:
+    // a `.p.nif` the crawl missed simply isn't present and nifler runs inline as before.
+    // SAFETY: single-threaded wasm; exclusive access.
+    for (path, bytes) in unsafe { &*core::ptr::addr_of!(NIM_PRECRAWL) } {
+        files.push((path.clone(), bytes.clone()));
+    }
 
     match nimc::compile_nim(nifler, nimsem, hexer, files, &main) {
         Ok(stdout) => {
