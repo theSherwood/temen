@@ -60,6 +60,17 @@ try {
     (sel) => document.querySelector(sel).textContent.includes('hi from the terminal'),
     `${CARD} pre.stdout`, { timeout: 60000 });
 
+  // #1146 — ^C at the prompt: the parked terminal read is interrupted (SIGINT delivered into bash's
+  // handler on the cooperative bytecode engine — the slice-1 safepoint redirect + slice-2a CorePipe
+  // EINTR), so bash aborts the line and sets `$? = 130` (128 + SIGINT). Before async delivery landed
+  // on the bytecode tier the ^C was swallowed and `$?` stayed 0.
+  await term.press('Control+c');
+  await term.fill('echo rc=$?');
+  await term.press('Enter');
+  await page.waitForFunction(
+    (sel) => document.querySelector(sel).textContent.includes('rc=130'),
+    `${CARD} pre.stdout`, { timeout: 60000 });
+
   // An external command mid-session: bash forks + execve's /bin/seq while interactive.
   await term.fill('seq 3');
   await term.press('Enter');
@@ -84,5 +95,5 @@ try {
 await browser.close();
 await new Promise((r) => server.close(r));
 if (errors.length) { console.error('page errors:', errors); ok = false; }
-if (ok) { console.log('✓ interactive bash card: live session — prompt, builtin, fork+exec\'d seq, ^D exit'); process.exit(0); }
+if (ok) { console.log('✓ interactive bash card: live session — prompt, builtin, ^C→rc=130, fork+exec\'d seq, ^D exit'); process.exit(0); }
 process.exit(1);
