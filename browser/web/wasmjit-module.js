@@ -91,7 +91,7 @@ async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp, entry
 // once. Returns the finish status. The caller must have opened the run (`temen_onramp_jit_run_open*`) already.
 // `cacheKey` (optional) is a stable identity of the guest module; when given, the compiled Module and its
 // instance are reused across Runs (see `cachedInstanceF0`).
-async function driveJitRun(ex, memory, cacheKey) {
+async function driveJitRun(ex, memory, cacheKey, afterFinish) {
   const u8 = () => new Uint8Array(memory.buffer);
   // Read the window base + the powerbox handle slots `_start` takes as params, and the env-cell size.
   const win = Number(ex.temen_onramp_jit_run_win_ptr());
@@ -163,6 +163,10 @@ async function driveJitRun(ex, memory, cacheKey) {
   ex.temen_dealloc(env, envBytes);
   ex.temen_onramp_jit_run_report(threw, value); // record the return value + throw before capturing
   const status = ex.temen_onramp_jit_run_finish(); // capture stdout/stderr/exit/value into the shared slots
+  // #1025: a phase whose run produces MULTIPLE memfs files (the nifler crawl's `.p.nif` + `.p.deps.nif`)
+  // reads the extras here, while the run's memfs handle is still live — finish stashed the primary
+  // readback, `afterFinish` reads the rest via `temen_onramp_jit_run_readfile`, then we close.
+  if (afterFinish) afterFinish(ex);
   ex.temen_onramp_jit_run_close();
   // A trap on the emitted tier is a refusal, not a result: throw so the caller runs the guest on the
   // interpreter oracle instead of surfacing a truncated run (INVARIANT 9 — diverge toward refusal).
@@ -621,6 +625,126 @@ export async function runJitNifler(ex, memory, moduleBytes, srcBytes, cacheKey) 
     throw new Error(`JIT nifler open failed: status ${ex.temen_status()} (2 = _start not emittable)`);
   }
   return driveJitRun(ex, memory, cacheKey);
+}
+
+// Run one **nifler import-crawl step** on the wasm-JIT (#1025 route A): `nifler --deps parse <file> <out>`
+// over a `{file: src}` memfs, emitted + emit-cached. Returns `{ status, pnif, deps }` — the `.p.nif` and its
+// `.p.deps.nif` sibling as `Uint8Array`s (the crawl reads the deps to discover imports). Throws on a JIT
+// trap/decline (the caller falls back to the bytecode `temen_run_nifler_crawl_fs`).
+export async function runJitNiflerCrawl(ex, memory, moduleBytes, filePath, outPath, srcBytes, cacheKey) {
+  const u8 = () => new Uint8Array(memory.buffer);
+  const enc = new TextEncoder();
+  const fileB = enc.encode(filePath), outB = enc.encode(outPath);
+  const modP = Number(ex.temen_alloc(moduleBytes.length));
+  const fileP = Number(ex.temen_alloc(fileB.length));
+  const outP = Number(ex.temen_alloc(outB.length));
+  const srcP = Number(ex.temen_alloc(srcBytes.length));
+  u8().set(moduleBytes, modP);
+  u8().set(fileB, fileP);
+  u8().set(outB, outP);
+  u8().set(srcBytes, srcP);
+  const opened = ex.temen_run_nifler_jit_crawl_open(
+    modP, moduleBytes.length, fileP, fileB.length, outP, outB.length, srcP, srcBytes.length);
+  ex.temen_dealloc(modP, moduleBytes.length);
+  ex.temen_dealloc(fileP, fileB.length);
+  ex.temen_dealloc(outP, outB.length);
+  ex.temen_dealloc(srcP, srcBytes.length);
+  if (opened !== 0) {
+    throw new Error(`JIT nifler crawl open failed: status ${ex.temen_status()}`);
+  }
+  const readOut = () => u8().slice(Number(ex.temen_stdout_ptr()), Number(ex.temen_stdout_ptr()) + ex.temen_stdout_len());
+  // `.p.deps.nif` sibling of the `.p.nif` output (memfs strips the leading `/`).
+  const depsKey = outPath.replace(/^\//, '').replace(/\.nif$/, '.deps.nif');
+  const depsB = enc.encode(depsKey);
+  let pnif = new Uint8Array(0), deps = new Uint8Array(0);
+  const status = await driveJitRun(ex, memory, cacheKey, () => {
+    pnif = readOut(); // finish stashed the `.p.nif` readback onto the stdout slot
+    const kp = Number(ex.temen_alloc(depsB.length));
+    u8().set(depsB, kp);
+    ex.temen_onramp_jit_run_readfile(kp, depsB.length); // → stdout slot (overwrites the `.p.nif`)
+    ex.temen_dealloc(kp, depsB.length);
+    deps = readOut();
+  });
+  return { status, pnif, deps };
+}
+
+// The **JS-orchestrated nifler import crawl on the wasm-JIT** (#1025 route A). nimony's phase-1 walks the
+// `import` graph, running `nifler --deps parse` on each module in the closure; here that walk lives in JS
+// so every step runs on the emitted-wasm tier (`runJitNiflerCrawl`, one nifler JIT compile reused across
+// all modules) instead of the interpreter. Each `.p.nif` + `.p.deps.nif` it produces is handed to the Rust
+// side via `temen_nim_precrawl_put`, which `temen_compile_nim_fs` seeds into the compile's memfs so
+// phase-1 skips re-running nifler for that module. Best-effort: a step that traps, or a module whose source
+// we can't resolve, is simply left for the (interpreter) phase-1 to redo — correctness holds regardless.
+// `mainPath`/`mainSrc` are the editor's Nim; stdlib module sources come from the opened `stdlibImage`.
+export async function jitNimCrawl(ex, memory, niflerBytes, stdlibImage, mainPath, mainSrc, cacheKey) {
+  const u8 = () => new Uint8Array(memory.buffer);
+  const enc = new TextEncoder(), dec = new TextDecoder();
+  const readOut = () => u8().slice(Number(ex.temen_stdout_ptr()), Number(ex.temen_stdout_ptr()) + ex.temen_stdout_len());
+  // Push one string through a scratch alloc into a `(ptr,len)->len`-stashing FFI, return its `OUT` readback.
+  const call1 = (fn, s) => {
+    const b = enc.encode(s);
+    const p = Number(ex.temen_alloc(b.length));
+    u8().set(b, p);
+    ex[fn](p, b.length);
+    const out = readOut();
+    ex.temen_dealloc(p, b.length);
+    return out;
+  };
+  // Seed one pre-crawl product (`path` a memfs key, no leading `/`) into the Rust accumulator.
+  const putFile = (path, bytes) => {
+    const pb = enc.encode(path);
+    const pp = Number(ex.temen_alloc(pb.length));
+    const bp = Number(ex.temen_alloc(bytes.length));
+    { const v = u8(); v.set(pb, pp); v.set(bytes, bp); }
+    ex.temen_nim_precrawl_put(pp, pb.length, bp, bytes.length);
+    ex.temen_dealloc(pp, pb.length);
+    ex.temen_dealloc(bp, bytes.length);
+  };
+
+  // Open the stdlib image (so `temen_nim_stdlib_read` serves module sources) and clear the accumulator.
+  {
+    const ip = Number(ex.temen_alloc(stdlibImage.length));
+    u8().set(stdlibImage, ip);
+    ex.temen_nim_stdlib_open(ip, stdlibImage.length);
+    ex.temen_dealloc(ip, stdlibImage.length);
+  }
+  ex.temen_nim_precrawl_reset();
+
+  const seen = new Set();
+  const work = ['/lib/std/system.nim', mainPath]; // same seeds as nimc::compile_nim's phase-1
+  let crawled = 0;
+  while (work.length) {
+    const file = work.pop();
+    const stem = dec.decode(call1('temen_nim_module_suffix', file));
+    if (seen.has(stem)) continue;
+    seen.add(stem);
+
+    // Resolve this module's source: the editor's Nim for the main file, else the stdlib image.
+    const src = file === mainPath ? mainSrc : call1('temen_nim_stdlib_read', file);
+    if (!src.length) continue; // unresolved (non-stdlib import) — leave it for interpreter phase-1
+
+    let r;
+    try {
+      r = await runJitNiflerCrawl(ex, memory, niflerBytes, file, `/nimcache/${stem}.p.nif`, src, cacheKey);
+    } catch { continue; } // JIT step trapped — interpreter phase-1 redoes this module
+    if (!r.pnif.length) continue;
+    putFile(`nimcache/${stem}.p.nif`, r.pnif);
+    putFile(`nimcache/${stem}.p.deps.nif`, r.deps);
+    crawled++;
+
+    // Queue this module's imports, exactly as the Rust driver's parse_imports does.
+    const dir = file.slice(0, file.lastIndexOf('/'));
+    const dirB = enc.encode(dir);
+    const dp = Number(ex.temen_alloc(r.deps.length));
+    const drp = Number(ex.temen_alloc(dirB.length));
+    { const v = u8(); v.set(r.deps, dp); v.set(dirB, drp); }
+    ex.temen_nim_parse_imports(dp, r.deps.length, drp, dirB.length);
+    const imports = dec.decode(readOut());
+    ex.temen_dealloc(dp, r.deps.length);
+    ex.temen_dealloc(drp, dirB.length);
+    for (const imp of imports.split('\n')) if (imp) work.push(imp);
+  }
+  return { crawled };
 }
 
 // Run the **self-host** compile on the wasm-JIT (SELFHOST_C.md §7 step 5): chibicc.temen compiles one of
