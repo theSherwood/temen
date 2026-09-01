@@ -23,8 +23,8 @@
 
 use temen_interp::bytecode::build_pagestate_table;
 use temen_wasm_jit::{
-    compile_module_nested, compile_module_nested_paged_with_eligibility, outline_nested_cap_calls,
-    TRAP_MEMORY_FAULT,
+    compile_module_nested, compile_module_nested_paged_with_eligibility, compile_nested_paged,
+    outline_nested_cap_calls, DriveMode, TRAP_MEMORY_FAULT,
 };
 use wasmi::{Caller, Engine, Global, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
@@ -361,6 +361,49 @@ fn nested_paged_protect_then_read_passes() {
         out,
         Outcome::Val(424242),
         "an emitted read of an Ro page must return the stored sentinel"
+    );
+}
+
+/// The paged §14 front door ([`compile_nested_paged`]) emits a **WasmDriven** artifact for an
+/// unmap/protect unit (where [`compile_nested`]'s mask-only path emits nothing), with the entry
+/// eligible. This is the browser codegen path's routing target.
+#[test]
+fn compile_nested_paged_front_door_emits_wasm_driven() {
+    let mut m = parse(&unmap_then_load_src(20480, 20480));
+    outline_nested_cap_calls(&mut m);
+    let a = compile_nested_paged(&m, false, PAGE_LOG2).expect("paged nested front door");
+    assert_eq!(a.drive, DriveMode::WasmDriven { entry: 0 });
+    assert_eq!(
+        a.emitted,
+        vec![true, false],
+        "the entry emits paged; the outlined unmap wrapper is a cross-tier leaf"
+    );
+}
+
+/// A `SharedRegion` aliasing op (iface 4) still fails closed to whole-interpreter even paged — a
+/// `Backed` page's bytes live outside the window, which no trap check can honor.
+#[test]
+fn compile_nested_paged_shared_region_fails_closed() {
+    // func 0: a SharedRegion `map` (iface 4 op 0) — the aliasing op paged mode cannot carry.
+    let src = r#"memory 17
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  vwo = i64.const 0
+  vro = i64.const 0
+  vlen = i64.const 4096
+  vprot = i32.const 3
+  vr = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (vwo, vro, vlen, vprot)
+  return vr
+  }
+}
+"#;
+    let mut m = parse(src);
+    outline_nested_cap_calls(&mut m);
+    let a = compile_nested_paged(&m, false, PAGE_LOG2).expect("artifact");
+    assert_eq!(a.drive, DriveMode::InterpDriven);
+    assert!(
+        a.emitted.iter().all(|&e| !e),
+        "region-op unit emits nothing"
     );
 }
 

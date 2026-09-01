@@ -1891,6 +1891,42 @@ pub fn compile_nested(m: &Module, shared_memory: bool) -> Result<Artifact, Error
     })
 }
 
+/// #1151 — the **paged** §14 nested front door: like [`compile_nested`], but a unit that manages its
+/// own pages with `unmap`/`protect` emits **paged** (the per-access page check) instead of running
+/// wholly on the interpreter. The caller passes `page_log2` (its run's software page size) and must
+/// have already outlined the ADDRESS_SPACE `call.cap`s ([`outline_nested_cap_calls`]) so the page ops
+/// ride the `env.call_interp` leaf bounce — the driver services them over the run's powerbox and
+/// **re-syncs the page-state table on return** (the [`compile_module_nested_paged_with_eligibility`]
+/// contract). `SharedRegion` aliasing (which no trap check can honor) still fails closed to the
+/// interpreter, as does a fiber-bearing unit (the mask-only interp-driven fallback can't carry the
+/// page state either — deferred, like the whole-program paged tier's own fiber gate).
+///
+/// Preconditions the caller owns (mirroring [`compile_nested`]'s outline note): pass the **outlined**
+/// module here *and* to the driver, so the wrapper `func` indices the servicer runs match the emitted
+/// module's cross-tier leaves.
+pub fn compile_nested_paged(
+    m: &Module,
+    shared_memory: bool,
+    page_log2: u8,
+) -> Result<Artifact, Error> {
+    // SharedRegion aliasing can't be carried by any trap check (a `Backed` page's bytes live outside
+    // the window); a fiber-bearing unit needs the interp to own the frame, and the paged per-access
+    // check isn't wired into that interp-driven fallback yet. Both fail closed to whole-interpreter.
+    if m.funcs.iter().any(func_uses_region_ops) || reachable_fibers(m, 0) {
+        return compile_interp_only(m, shared_memory, true);
+    }
+    match compile_module_nested_paged_with_eligibility(m, shared_memory, page_log2) {
+        Ok((wasm, emitted)) => Ok(Artifact {
+            wasm,
+            emitted,
+            drive: DriveMode::WasmDriven { entry: 0 },
+        }),
+        // The entry wasn't emittable even paged (e.g. a v128-signature cross-tier function) — the
+        // safe whole-interpreter fallback, exactly as `compile_nested`'s tierup-caps arm degrades.
+        Err(_) => compile_interp_only(m, shared_memory, true),
+    }
+}
+
 /// Whole-module emit like [`compile_module_with`], but wired for **§22 Model B2**: instead of a
 /// private table the module fills itself, it *imports* the domain's one shared funcref table
 /// (`env.__indirect_function_table`, sized `1 << table_log2` = `Host::jit_table_log2`) and populates
