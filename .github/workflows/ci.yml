@@ -959,6 +959,12 @@ jobs:
           # same value with tier-up on as all-interp, and tier-up must actually fire (the shape the
           # TEMEN-text 'plain' recipe now defaults on). No assets — parses in-page via temen_parse.
           node browser-tierup-mainline-test.mjs
+          # #1155 (invariant 14, code-origin axis): a §22 guest-JIT unit — code the guest compiled at
+          # runtime via vm_jit_compile — running on emitted wasm over a vm_map-GROWN window, through the
+          # shipped runJitModule → driveCoopTierupRun coop driver, must match the interpreter oracle in V8
+          # (the first in-browser exercise of the guest-runtime-JIT growth path). No assets — parses
+          # in-page via temen_parse; benign resource 404s (deploy-built cards) don't gate it.
+          node browser-jit-runtime-grow-test.mjs
           node browser-play-editor-test.mjs
           # chibicc compile-time on V8 (bytecode vs wasm-JIT) — prints the speedup and asserts the two
           # tiers emit byte-identical IR (a second guard alongside chibicc_jit.rs). Uses the committed/
