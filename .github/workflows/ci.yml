@@ -977,6 +977,12 @@ jobs:
           # interpreter oracle (top-level nifler on the tree-walker). nimc.rs phase-1 nifler crawl, nested +
           # JIT'd. Uses the committed nifler_ce.temen.gz + web/assets/nifler.temen.gz; reuses the threads module.
           node browser-op13jit-nifler-test.mjs
+          # #1025 Path 1 (whole card): drive the WHOLE nim card through the op-13 loop — the compile's phase-1
+          # nifler crawl runs each module as a nested op-13 emitted child (nifler_ce, {fs,stdout,exit}
+          # marshaled, emit cached across modules), then nimsem/hexer/link/run finish. The card's output is
+          # byte-identical whether phase-1 ran on the interpreter or as nested op-13 emitted children. Uses
+          # the committed nim assets + nifler_ce.temen.gz; reuses the threads module.
+          node browser-nim-op13-crawl-e2e-test.mjs
           # #816 Slice C (invariant 14, durability axis, cross-host leg): a vm_map-GROWN durability-
           # instrumented guest frozen to a §12 SVMD artifact (temen_durable_freeze), persisted to
           # IndexedDB, and — after a real page reload into a fresh wasm instance — thawed and resumed to
