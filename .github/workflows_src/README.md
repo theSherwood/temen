@@ -23,6 +23,16 @@ identical until the next agent edit.
   the PR — the target file and its `fuzz/Cargo.toml` `[[bin]]` exist but the live matrix lacks the row;
   `cp .github/workflows_src/*.yml .github/workflows/` drains it.
 
+- **`browser-bash-bg-test.mjs` in the `browser-real` job (`ci.yml`, #798 bg/&)** — one line added after
+  `node browser-bash-jobs-test.mjs`: `node browser-bash-bg-test.mjs`. It drives the interactive bash
+  card's **background job launch**: `seq 3 &` runs in its own process group without a terminal handoff
+  or a blocking wait — bash prints `[1] pid`, the prompt stays usable, the job's output streams, and the
+  async `[1]+ Done seq 3` posts on the next prompt; then a clean `^D` exit. SKIPs cleanly with the rest
+  of the bash batch when the deploy-built `bash.temen`/`bin_seq.temen` are absent, so it reds only on a
+  real background-job regression. Verified locally in Chromium. (Until copied over, the
+  `workflows-in-sync` guard stays red — the expected mirror-edit friction;
+  `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
+
 - **`browser-nim-op13-crawl-e2e-test.mjs` in the `browser-real` job (`ci.yml`, #1025 Path 1, whole card)** —
   one line added after `node browser-op13jit-nifler-test.mjs`: `node browser-nim-op13-crawl-e2e-test.mjs`. It
   drives the **whole nim card through the op-13 loop**: the compile's phase-1 nifler crawl runs each module
