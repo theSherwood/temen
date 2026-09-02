@@ -5676,7 +5676,18 @@ impl JitOnrampRun {
         let (module, program, emitted_wasm, emitted): CachedEmit = match cached {
             Some(c) => c,
             None => {
-                onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
+                // A §14 **child-entry** module (`f0: [I64]->[I64]` / `[I64,I64]->[I64]`, `child_entry_ok`)
+                // is not a named-powerbox `_start`, so it fails `onramp_check` — but its manifest is bound
+                // separately by the op-13 servicer (`bind_child_manifest`), so the check is moot. Skip it
+                // for a child-entry; keep it for every `_start` guest (#1025 Path 1).
+                let child_entry = m.funcs.first().is_some_and(|f| {
+                    f.results[..] == [temen_ir::ValType::I64]
+                        && (f.params[..] == [temen_ir::ValType::I64]
+                            || f.params[..] == [temen_ir::ValType::I64, temen_ir::ValType::I64])
+                });
+                if !child_entry {
+                    onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
+                }
                 let mut module = m.clone();
                 temen_wasm_jit::outline_cap_calls(&mut module);
                 // #1153: NO pre-size. The emitted `_start` grows the live window via `vm_map` — the
@@ -8511,6 +8522,10 @@ struct Op13JitDriver {
     children: Vec<Result<Vec<Value>, Trap>>,
     /// The driver's final return value (set on `Done`).
     result: i64,
+    /// The shared memfs a phase child reads/writes, and the key its output lands at (`nimcache/…p.nif`) —
+    /// read back by [`temen_op13jit_phase_output`]. `None` for the built-in mini driver (no fs output).
+    fsh: Option<temen_fs::MemFsHandle>,
+    readback: Option<String>,
 }
 static mut OP13_JIT: Option<Op13JitDriver> = None;
 
@@ -8659,9 +8674,161 @@ pub extern "C" fn temen_op13jit_open() -> i32 {
             layout,
             children: Vec::new(),
             result: 0,
+            fsh: None,
+            readback: None,
         });
     }
     STATUS_OK
+}
+
+/// **Open the op-13 loop over a real phase child** (#1025 Path 1 scaling to nifler): decode the
+/// child-entry phase module `child` (nifler_ce), mount a shared memfs seeded with `src` at `file`, build
+/// the real `nimc::op13_parent_src` driver (argv `nifler --portablePaths --deps parse <file> <out>`),
+/// grant it `{fs, stdout, exit}` + the child `Module` + an `Instantiator`, and stand up the resumable
+/// root over a linear-memory window. Drive with [`temen_op13jit_step`] (which does the child-entry setup
+/// and runs the child EMITTED over its carve); after `OP13JIT_DONE`, read the produced `.p.nif` with
+/// [`temen_op13jit_phase_output`]. Returns `0` or a negative status.
+///
+/// # Safety
+/// Each `(ptr, len)` must be a live `temen_alloc`ation the host just filled.
+#[no_mangle]
+pub unsafe extern "C" fn temen_op13jit_phase_open(
+    child_ptr: *const u8,
+    child_len: usize,
+    file_ptr: *const u8,
+    file_len: usize,
+    out_ptr: *const u8,
+    out_len: usize,
+    src_ptr: *const u8,
+    src_len: usize,
+) -> i32 {
+    temen_op13jit_close();
+    let sl = |p: *const u8, n: usize| unsafe { core::slice::from_raw_parts(p, n) };
+    let file = String::from_utf8_lossy(sl(file_ptr, file_len)).into_owned();
+    let out = String::from_utf8_lossy(sl(out_ptr, out_len)).into_owned();
+    let src = sl(src_ptr, src_len).to_vec();
+    let Ok(child) = temen_encode::decode_module(sl(child_ptr, child_len)) else {
+        return -STATUS_DECODE_ERR;
+    };
+    if temen_verify::verify_module(&child).is_err() {
+        return -STATUS_VERIFY_ERR;
+    }
+
+    // The shared memfs the child reads its source from + writes its `.p.nif` into.
+    let file_key = file.trim_start_matches('/').to_string();
+    let readback = out.trim_start_matches('/').to_string();
+    let (factory, handle) =
+        temen_fs::mem_fs_shared_factory(vec![(file_key, src)], vec!["nimcache".into()]);
+    let factory = std::sync::Arc::new(factory);
+
+    // The real phase driver (mirrors nimc::run_phase_op13): a buddy-half carve sized for the phase heap.
+    let decl = child.memory.as_ref().map_or(24, |m| u32::from(m.size_log2));
+    let child_sl = (decl + 3).max(24);
+    let carve_off = 1u64 << child_sl;
+    let argv = [
+        "nifler",
+        "--portablePaths",
+        "--deps",
+        "parse",
+        file.as_str(),
+        out.as_str(),
+    ];
+    let driver_src =
+        nimc::op13_parent_src(child_sl, carve_off, temen_ir::module_args_base(), &argv);
+    let Ok(driver) = temen_text::parse_module(&driver_src) else {
+        return -STATUS_DECODE_ERR;
+    };
+    if temen_verify::verify_module(&driver).is_err() {
+        return -STATUS_VERIFY_ERR;
+    }
+    let Some(prog) = bytecode::VcpuProgram::compile(&driver) else {
+        return -STATUS_UNSUPPORTED;
+    };
+    let prog = Box::into_raw(Box::new(prog));
+
+    let mut host = Host::new();
+    let fs_init: temen_interp::HostProc = (*factory)();
+    let fs_fork: temen_interp::HostProcFork = {
+        let f = std::sync::Arc::clone(&factory);
+        std::sync::Arc::new(move |_pid| temen_interp::ForkedProc::shared((*f)()))
+    };
+    let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork);
+    let stdout_h = host.grant_stream(StreamRole::Out);
+    let exit_h = host.grant_exit();
+    let win = 1u64 << (child_sl + 1);
+    let inst = host.grant_instantiator(0, win);
+    let modh = host.grant_module(&child);
+
+    let Ok(layout) = Layout::from_size_align(win as usize, 8) else {
+        unsafe { drop(Box::from_raw(prog)) };
+        return -STATUS_UNSUPPORTED;
+    };
+    // SAFETY: non-zero 8-aligned layout; owned until close. Linear-memory backed so the emitted child
+    // (and JS driver) can access it.
+    let mem_base = unsafe { std::alloc::alloc_zeroed(layout) };
+    if mem_base.is_null() {
+        unsafe { drop(Box::from_raw(prog)) };
+        return -STATUS_UNSUPPORTED;
+    }
+    let back = std::sync::Arc::new(unsafe { temen_interp::Region::shared(mem_base, win) });
+    // SAFETY: `prog` outlives the vCPU (freed only in `close`).
+    let root = match bytecode::Vcpu::new_root_with_powerbox(
+        unsafe { &*prog },
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(modh),
+            Value::I32(fs_h),
+            Value::I32(stdout_h),
+            Value::I32(exit_h),
+        ],
+        std::sync::Arc::clone(&back),
+        &[],
+        host,
+    ) {
+        Ok(r) => r,
+        Err(_) => {
+            unsafe {
+                std::alloc::dealloc(mem_base, layout);
+                drop(Box::from_raw(prog));
+            }
+            return -STATUS_TRAP;
+        }
+    };
+    unsafe {
+        *core::ptr::addr_of_mut!(OP13_JIT) = Some(Op13JitDriver {
+            prog,
+            root,
+            child: std::sync::Arc::new(child),
+            mem_base,
+            layout,
+            children: Vec::new(),
+            result: 0,
+            fsh: Some(handle),
+            readback: Some(readback),
+        });
+    }
+    STATUS_OK
+}
+
+/// Stash the phase child's produced file (the `.p.nif` it wrote to the shared memfs) onto [`OUT`] and
+/// return its length — read via [`temen_stdout_ptr`]/`_len`. Call after a [`OP13JIT_DONE`] step on a
+/// [`temen_op13jit_phase_open`] run. `0` if no run / no output.
+#[no_mangle]
+pub extern "C" fn temen_op13jit_phase_output() -> usize {
+    // SAFETY: single-threaded wasm; exclusive access to the driver + the OUT stash.
+    let bytes = unsafe { (*core::ptr::addr_of!(OP13_JIT)).as_ref() }
+        .and_then(|d| match (&d.fsh, &d.readback) {
+            (Some(h), Some(k)) => {
+                let (files, _) = h.seed();
+                files.into_iter().find(|(kk, _)| kk == k).map(|(_, v)| v)
+            }
+            _ => None,
+        })
+        .unwrap_or_default();
+    let len = bytes.len();
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
+    len
 }
 
 /// **Step the op-13 driver** to its next event. Returns [`OP13JIT_DONE`] (result ready), [`OP13JIT_CHILD`]
@@ -8686,27 +8853,44 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
             }
             bytecode::VcpuEvent::Trapped(_) => return OP13JIT_TRAP,
             bytecode::VcpuEvent::Instantiate {
-                carve, size_log2, ..
+                entry,
+                carve,
+                size_log2,
+                ..
             } => {
-                let Some(host) = d.root.take_granted_host() else {
+                let Some(mut host) = d.root.take_granted_host() else {
                     return OP13JIT_TRAP; // the driver always marshals; a grant-less child is off-contract
                 };
+                // Replicate the confined child-entry setup `new_confined_child_over_host` does, so the
+                // child runs EMITTED over the same powerbox it would on the interpreter: grant the starter
+                // Instantiator + AddressSpace over the carve, bind the child's import manifest (write/read/
+                // exit/fs) against the re-granted caps, and pass the child-entry its `Instantiator` handle
+                // as `f{entry}`'s first param (`[I64]->[I64]`, `child_entry_ok`). An import-free child
+                // (empty manifest) is unaffected; a manifest phase (nifler_ce) resolves its caps via it.
+                let child_size = 1u64 << size_log2;
+                let cinst = host.grant_instantiator(0, child_size);
+                let _cas = host.grant_address_space(0, child_size);
+                if host
+                    .bind_child_manifest(&d.child.imports, &d.child.types)
+                    .is_err()
+                {
+                    return OP13JIT_TRAP;
+                }
                 // SAFETY: the engine validated the carve within the driver's window; the child window
                 // aliases that sub-window (the §14 data plane), and `mem_base` outlives the child run.
                 let carve_ptr = unsafe { d.mem_base.add(carve as usize) };
-                // The child-entry's data-stack pointer: near the top of its carve (8-aligned), grows down.
-                let entry_sp = (1u64 << size_log2).saturating_sub(64);
+                let _ = entry; // the emitted entry is `f{entry}` (0 for the phase drivers here)
                 let run = unsafe {
                     JitOnrampRun::open_shared_run_over_host(
                         &d.child,
                         carve_ptr,
-                        1u64 << size_log2,
+                        child_size,
                         size_log2,
                         true,
                         host,
                         Vec::new(),
                         None,
-                        entry_sp,
+                        cinst as u64,
                     )
                 };
                 match run {
@@ -11974,5 +12158,65 @@ block 0 () {
         );
         temen_op13jit_close();
         assert_eq!(temen_op13jit_counter(), 0, "close cleared the loop state");
+    }
+
+    /// Inflate a committed `.gz` asset with the system `gzip` (mirrors nimc's test helper).
+    fn inflate(path: &str) -> Option<Vec<u8>> {
+        use std::io::Write;
+        let bytes = std::fs::read(path).ok()?;
+        let mut c = std::process::Command::new("gzip")
+            .args(["-dc"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .ok()?;
+        let mut stdin = c.stdin.take()?;
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&bytes);
+        });
+        let out = c.wait_with_output().ok()?;
+        out.status.success().then_some(out.stdout)
+    }
+
+    #[test]
+    fn op13jit_phase_open_stages_a_real_nifler_child() {
+        // Scaling to a real phase child: `temen_op13jit_phase_open` builds the real nimc::op13_parent_src
+        // driver over nifler_ce (child-entry) + a memfs seeded with a source, and the first `_step` marshals
+        // {fs, stdout, exit}, does the child-entry setup (starter caps + manifest bind + cinst arg), and
+        // **emits** nifler_ce over its carve — returning OP13JIT_CHILD. This validates the whole driver +
+        // marshal + child-entry-setup + emit path host-side (the emitted RUN itself is the Chromium leg,
+        // browser-op13jit-nifler-test.mjs). SKIPs if the committed nifler_ce asset / gzip is unavailable.
+        let Some(nifler_ce) = inflate("../crates/temen-run/demos/nifler_temen/nifler_ce.temen.gz")
+        else {
+            eprintln!("SKIP: nifler_ce.temen.gz unavailable / gzip missing");
+            return;
+        };
+        let file = b"/prog.nim";
+        let out = b"/nimcache/prog.p.nif";
+        let src = b"import std/syncio\n\nwrite(stdout, \"hi\\n\")\n";
+        let st = unsafe {
+            temen_op13jit_phase_open(
+                nifler_ce.as_ptr(),
+                nifler_ce.len(),
+                file.as_ptr(),
+                file.len(),
+                out.as_ptr(),
+                out.len(),
+                src.as_ptr(),
+                src.len(),
+            )
+        };
+        assert_eq!(st, STATUS_OK, "phase_open built the driver + memfs");
+        let step = temen_op13jit_step();
+        assert_eq!(
+            step, OP13JIT_CHILD,
+            "the driver marshaled {{fs,stdout,exit}}, set up the child-entry, and emitted nifler_ce (staged)"
+        );
+        // The staged run holds the emitted nifler_ce; the emitted RUN is the Chromium leg.
+        assert!(
+            unsafe { (*core::ptr::addr_of!(JIT_RUN)).is_some() },
+            "nifler_ce is staged in JIT_RUN"
+        );
+        temen_op13jit_close();
     }
 }

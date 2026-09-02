@@ -16,6 +16,16 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **`browser-op13jit-nifler-test.mjs` in the `browser-real` job (`ci.yml`, #1025 Path 1, real nifler)** —
+  one line added after `node browser-op13jit-e2e-test.mjs`: `node browser-op13jit-nifler-test.mjs`. It scales
+  the op-13 loop to a **real phase child**: a driver marshals `{fs, stdout, exit}` to nifler_ce (child-entry)
+  and JS runs its `_start` on emitted wasm over the carve; it reads the source from the marshaled memfs and
+  writes `.p.nif`, asserted byte-identical to the interpreter oracle (top-level nifler on the tree-walker) —
+  `nimc.rs` phase-1 nifler crawl, nested under op-13 and tiered up to JIT. Uses the committed
+  `nifler_ce.temen.gz` + `web/assets/nifler.temen.gz` (stages a temp gunzipped copy it deletes); reuses the
+  threads wasm the job already builds. Verified locally in Chromium (174B `.p.nif` ≡ oracle). (Until copied
+  over, the `workflows-in-sync` guard stays red; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
+
 - **`browser-op13jit-e2e-test.mjs` in the `browser-real` job (`ci.yml`, #1025 Path 1)** — one line added
   after `node browser-jit-runtime-grow-test.mjs`: `node browser-op13jit-e2e-test.mjs` (with a comment). It
   pins the JS-orchestrated §14 op-13 loop in real V8: a resumable driver marshals an `fs` grant to a

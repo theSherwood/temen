@@ -234,7 +234,7 @@ fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) ->
 /// list `{fs, stdout, exit}` and `argv` seeded at `carve + args_base`. Mirrors `nifler_child_asset.rs` /
 /// `spawn_child_fs.rs`; the guarded child's `module_args_base` places records at 17408.., names at
 /// 18432.. (above the #1094 NULL guard the parent itself carries), argv at `carve + args_base`.
-fn op13_parent_src(child_sl: u32, carve_off: u64, args_base: u64, argv: &[&str]) -> String {
+pub(crate) fn op13_parent_src(child_sl: u32, carve_off: u64, args_base: u64, argv: &[&str]) -> String {
     let parent_sl = child_sl + 1;
     let argv_off = carve_off + args_base;
     let mut blob = Vec::new();
