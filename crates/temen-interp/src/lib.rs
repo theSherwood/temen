@@ -23380,19 +23380,17 @@ impl Mem {
     /// `#![forbid(unsafe_code)]` — the `unsafe` of borrowing host memory is in the embedder's
     /// `Region::shared` call, not here. Today still driven cooperatively; only the backing changes.
     ///
-    /// **The reservation is clamped to the backing** (`reserved ≤ back.len()`, rounded down to a power
-    /// of two, never below the mapped prefix). The confinement bound of every access is the
-    /// reservation (`Window::checked_reserved` + the page map), and the flat backings' word fast
-    /// path (`Region::read_word`/`write_word`) is bounded by that alone — so a reservation wider
-    /// than the backing let a guest `map`/`protect` pages past the backing's end (both are admitted
-    /// anywhere in `[0, reserved)`) and then read/write **host memory** behind the window through
-    /// them (found by the `nested_paged` differential: a `protect` past a 128-KiB `Region::shared`
-    /// followed by a load returned heap bytes). With the clamp, `prot_pages` rejects such a range
-    /// with `-EINVAL` (a value, invariant 5) and a scalar access past the backing faults — the
-    /// `run_over_grown` seam's #816 clamp, now enforced for every caller instead of by convention.
+    /// `back` may be **narrower than the reservation** (every Region-backed vCPU path asks for the
+    /// 1-TiB `DEFAULT_RESERVED_LOG2` over a window-sized backing). A `map`/`protect` past the backing
+    /// is then admitted by the reservation — deliberately: a guest that `vm_map`s high behaves as it
+    /// would over the engine's own reservation right up to the first access, which the emitted tier's
+    /// bounds check turns into a **decline** (#1153, the browser re-runs on the interpreter) — while
+    /// the interpreter's own accesses past the backing read as zero / drop writes, enforced at the
+    /// [`Region`] accessors themselves (#1191: the word/atomic fast paths were unbounded and reached
+    /// host memory behind the window). A Region-backed run that needs memory past its backing is
+    /// decline-and-rerun territory, never a silent host access.
     fn with_reservation_over(reserved_log2: u8, mapped_log2: u8, back: Arc<Region>) -> Mem {
-        let backing_log2 = back.len().checked_ilog2().map_or(0, |b| b as u8);
-        let reserved_log2 = reserved_log2.min(backing_log2).max(mapped_log2);
+        let reserved_log2 = reserved_log2.max(mapped_log2);
         let window = Window::with_mapped(reserved_log2, 1u64 << mapped_log2.min(63));
         let page = host_page_size();
         Mem {

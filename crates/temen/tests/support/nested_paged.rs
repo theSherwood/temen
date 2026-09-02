@@ -438,10 +438,15 @@ pub fn fuzz_one(data: &[u8]) -> Cat {
 
     let gi = (b[0] as usize) % 8;
     let guest = &guests()[gi];
-    // The unmap/protect region: page-aligned start + a whole number of pages (the op is
-    // interp-serviced on both tiers; the emitted access is what is under test).
-    let rstart = ((b[1] as u64) % (npages + 1)) * page;
-    let rpages = (b[2] as u64) % (npages + 1);
+    // The unmap/protect region: page-aligned start + a whole number of pages, kept **inside the
+    // window** (the op is interp-serviced on both tiers; the emitted access is what is under test).
+    // A region past the window is deliberately out of scope: the reservation admits it (#1153) but
+    // the tiers then differ by design — the interpreter reads zero past its backing (#1191, the
+    // `Region` seam) while the emitted access wraps under the window mask — a decline-class shape,
+    // not a page-check question.
+    let rpage = (b[1] as u64) % npages;
+    let rstart = rpage * page;
+    let rpages = 1 + (b[2] as u64) % (npages - rpage);
     let rlen = rpages * page;
     let addr = edge_offset(b[3], b[4], page, npages);
 

@@ -1,13 +1,15 @@
-//! **The reservation never exceeds a caller-provided backing** (`Mem::with_reservation_over`, found
-//! by the #1151 `nested_paged` differential). Every Region-backed vCPU path (`Vcpu::new_root_with_powerbox`,
-//! the browser's `Region::shared` reactor / tier-up / threads windows) asked for the 1-TiB
-//! `DEFAULT_RESERVED_LOG2` reservation over a backing of the window's size. The confinement bound is
-//! the reservation plus the page map, and the flat backings' word fast path is bounded by nothing
-//! else — so a guest `map`/`protect` past the backing's end (admitted anywhere in `[0, reserved)`)
-//! turned those pages readable/writable, and a following load/store reached **host memory** behind
-//! the window. The reservation is now clamped to the backing: the page op fails with a negative errno
-//! (invariant 5) and a scalar access past the backing faults `MemoryFault`. The canary byte placed
-//! just past the backing pins the store side directly.
+//! **Accesses past a caller-provided backing never reach host memory** (#1191, found by the #1151
+//! `nested_paged` differential). Every Region-backed vCPU path (`Vcpu::new_root_with_powerbox`, the
+//! browser's `Region::shared` reactor / tier-up / threads windows) asks for the 1-TiB
+//! `DEFAULT_RESERVED_LOG2` reservation over a backing of the window's size — deliberately (#1153: a
+//! guest's high `vm_map` is admitted so the emitted tier's bounds check turns the first access into a
+//! decline). The confinement bound is the reservation plus the page map; the flat backings' word and
+//! atomic fast paths were bounded by nothing else, so a `map`/`protect` past the backing's end followed
+//! by a load/store read or wrote **host memory** behind the window. The `Region` accessors now bound
+//! every access to the backing: such a load reads zero and such a store is dropped — the documented
+//! "reserved-tail accesses beyond the backing read as zero" contract, enforced at the seam. The canary
+//! byte placed just past the backing pins the store side directly; the page op itself still succeeds
+//! (the oracle's engine-`mmap`ed window would too — the divergence is the tier's to decline).
 
 use std::sync::Arc;
 use temen_interp::{bytecode, Host, Region, Trap, Value};
@@ -80,7 +82,10 @@ fn run(op: u32, func: u32, off: u64, len: u64) -> (Result<Vec<Value>, Trap>, u8)
         _ => panic!("unexpected event"),
     };
     let reserved = vcpu.mem_map_info().expect("window").2;
-    assert_eq!(reserved, WIN, "the reservation is clamped to the backing");
+    assert!(
+        reserved > WIN,
+        "the reservation stays wider than the backing (#1153)"
+    );
     drop(vcpu);
     // SAFETY: the vCPU (and its `Mem` aliasing the region) is dropped.
     let canary = unsafe { base.add(WIN as usize + 8).read() };
@@ -99,37 +104,37 @@ fn errno_of(r: &Result<Vec<Value>, Trap>) -> i64 {
 }
 
 #[test]
-fn map_past_the_backing_fails_with_errno_and_never_writes_host_memory() {
+fn map_past_the_backing_never_writes_host_memory() {
     let page = temen_interp::host_page_size();
-    // A grow landing exactly past the backing: rejected as a value the guest can observe.
+    // A grow landing exactly past the backing is admitted by the (wider) reservation — the page op
+    // itself succeeds, as it would over the engine's own reservation.
     let (r, canary) = run(0, 0, WIN, page);
-    assert!(errno_of(&r) < 0, "map past the backing must fail probeably");
+    assert_eq!(errno_of(&r), 0, "map inside the reservation succeeds");
     assert_eq!(canary, 0x5A);
-    // The same grow followed by the store/load: the access past the backing faults, and the canary
-    // right after the backing is untouched — no host write.
+    // The same grow followed by the store/load: the store is dropped at the backing's end and the
+    // load reads zero — the canary right after the backing is untouched, no host write.
     let (r, canary) = run(0, 1, WIN, page);
-    assert!(
-        matches!(r, Err(Trap::MemoryFault)),
-        "expected MemoryFault, got {r:?}"
+    assert_eq!(
+        errno_of(&r),
+        0,
+        "a load past the backing reads zero (the store was dropped)"
     );
     assert_eq!(canary, 0x5A, "no host write past the backing");
 }
 
 #[test]
-fn protect_straddling_the_backing_end_fails_with_errno() {
+fn protect_straddling_the_backing_end_never_reads_host_memory() {
     let page = temen_interp::host_page_size();
     // The nested_paged seed-900 shape: a protect that starts inside the window and runs past it.
     let (r, canary) = run(2, 0, WIN - 8 * page, 30 * page);
-    assert!(
-        errno_of(&r) < 0,
-        "protect past the backing must fail probeably"
-    );
+    assert_eq!(errno_of(&r), 0, "protect inside the reservation succeeds");
     assert_eq!(canary, 0x5A);
-    // Followed by a load just past the backing: faults (the pages were never admitted).
+    // Followed by a store just past the backing: the page is read-only, so the interpreter faults
+    // before the access — and the canary behind the buffer is untouched either way.
     let (r, canary) = run(2, 1, WIN - 8 * page, 30 * page);
     assert!(
         matches!(r, Err(Trap::MemoryFault)),
-        "expected MemoryFault, got {r:?}"
+        "a store to a protected page faults, got {r:?}"
     );
     assert_eq!(canary, 0x5A);
 }
