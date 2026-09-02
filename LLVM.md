@@ -118,8 +118,21 @@ puts first on `PATH`; the rest of the tree uses **unversioned** tool names. The 
 the `peval_*` probes can feed default-`rustc` IR straight to `llvm-link`/`opt` (which only ingest IR
 of their own version or older) with no second rustc toolchain; `ci_tool_canary` asserts the two
 majors agree. Bump both together when rustc moves. The reader itself is version-tolerant (§8 Q1a):
-it takes textual IR from any recent LLVM, including the LLVM ≥19 `#dbg_*` debug records and the
-LLVM ≥20 `llvm.fake.use` liveness marker.
+it takes textual IR from any recent LLVM, including the LLVM ≥19 `#dbg_*` debug records, the
+LLVM ≥20 `llvm.fake.use` liveness marker, and the `llvm.eh.typeid.for.p0` spelling.
+
+*What the 18 → 22 bump surfaced* (each found by running the full suite under clang 21 and 22, each
+now a regression test): (1) the `#dbg_*` records above — every `-g` path parse-failed, invisible
+while CI's LLVM-21 lane ran without `-g`; (2) `llvm.fake.use` at `-Og`; (3) the `.p0` EH intrinsic;
+(4) **LLVM 22's x86-64 `__int128` ABI** — clang no longer coerces `i128` params/returns to
+`(i64, i64)` pairs itself but passes a bare `i128`, so the on-ramp now does that split
+(`param_vtypes`/`agg_vtypes`: two `i64` signature slots, the `(lo, hi)` pair the value is held as
+everywhere else, fanned out at call sites and bound as a two-result return) — the Temen-side ABI is
+unchanged; (5) LLVM ≥21's loop-idiom pass synthesizes `wcslen` from a `while (s[i]) i++` over
+`wchar_t` (the Postgres `libc_shim` now defines it); (6) rustc ≥1.83 moved `Vec` growth into a
+non-generic `RawVecInner::grow_one` inside precompiled `liballoc`, so the `peval_*` probes link the
+sysroot rlib's embedded bitcode (`ar x` + `llvm-objcopy --dump-section .llvmbc`) beside the
+`--emit=llvm-ir` output.
 
 *History:* the on-ramp was born pinned to **LLVM 18** — the dev container's `clang` default and the
 `llvm-ir` crate's binding — and bitcode from any other major was rejected outright. The textual

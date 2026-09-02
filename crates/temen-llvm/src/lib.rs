@@ -342,7 +342,7 @@ fn decl_extern_sig(
 ) -> Option<temen_ir::FuncType> {
     let mut sp_params = vec![ValType::I64]; // the prepended data-SP
     for p in params {
-        sp_params.push(val_type(p.ty.as_ref()).ok()?);
+        sp_params.extend(param_vtypes(p.ty.as_ref()).ok()?);
     }
     let results = result_types(return_type, types).ok()?;
     Some(temen_ir::FuncType {
@@ -367,7 +367,7 @@ fn extern_stub_sig(c: &crate::ll::ast::Call, types: &Types) -> Result<temen_ir::
     };
     let mut params = vec![ValType::I64]; // the prepended data-SP
     for p in param_types {
-        params.push(val_type(p.as_ref())?);
+        params.extend(param_vtypes(p.as_ref())?);
     }
     let results = result_types(result_type.as_ref(), types)?;
     Ok(temen_ir::FuncType { params, results })
@@ -679,8 +679,9 @@ fn translate_impl(
         let params: Option<Vec<ValType>> = f
             .parameters
             .iter()
-            .map(|p| val_type(p.ty.as_ref()).ok())
-            .collect();
+            .map(|p| param_vtypes(p.ty.as_ref()).ok())
+            .collect::<Option<Vec<_>>>()
+            .map(|v| v.concat());
         if let Some(params) = params {
             def_sigs.insert(f.name.clone(), (params, f.is_var_arg));
         }
@@ -2192,6 +2193,31 @@ fn val_type(ty: &Type) -> Result<ValType, Error> {
     }
 }
 
+/// `Some([i64, i64])` for a 65..=128-bit integer type — held everywhere as a `(lo, hi)` pair in the
+/// `agg` side-table (the unified i128 representation) — else `None`.
+fn i128_pair(ty: &Type) -> Option<Vec<ValType>> {
+    matches!(ty, Type::IntegerType { bits } if (65..=128).contains(bits))
+        .then(|| vec![ValType::I64, ValType::I64])
+}
+
+/// The Temen **signature slots** of one LLVM parameter/argument type. An `i128` takes two `i64`
+/// slots `(lo, hi)` — the pair it is held as ([`i128_pair`]), and exactly the `(i64, i64)` coercion
+/// clang ≤21 applied itself on x86-64; LLVM 22's clang passes `__int128` params/returns as a bare
+/// `i128`, so the on-ramp now does the split (the ABI a caller sees is unchanged). Anything else is
+/// its one scalar type.
+fn param_vtypes(ty: &Type) -> Result<Vec<ValType>, Error> {
+    match i128_pair(ty) {
+        Some(pair) => Ok(pair),
+        None => Ok(vec![val_type(ty)?]),
+    }
+}
+
+/// The field types of a value held **field-wise** in the `agg` side-table: a flat struct's fields
+/// ([`struct_field_vtypes`]) or an i128's `(lo, hi)` pair. `None` for a scalar.
+fn agg_vtypes(ty: &Type, types: &Types) -> Option<Result<Vec<ValType>, Error>> {
+    struct_field_vtypes(ty, types).or_else(|| i128_pair(ty).map(Ok))
+}
+
 /// The lane type of a **2-lane 32-bit vector** (`<2 x float>` or `<2 x i32>`) — the only vectors the
 /// on-ramp scalarizes (packed into an `i64`, lane 0 low). `None` for any other vector.
 fn vec2_lane_ty(ty: &Type) -> Option<ValType> {
@@ -2341,7 +2367,8 @@ fn struct_field_vtypes(ty: &Type, types: &Types) -> Option<Result<Vec<ValType>, 
 fn result_types(ty: &Type, types: &Types) -> Result<Vec<ValType>, Error> {
     match ty {
         Type::VoidType => Ok(Vec::new()),
-        _ => match struct_field_vtypes(ty, types) {
+        // (An `i128` return is the `(lo, hi)` pair — two results, like a `{i64, i64}` struct.)
+        _ => match agg_vtypes(ty, types) {
             Some(fields) => fields,
             None => Ok(vec![val_type(ty)?]),
         },
@@ -2711,7 +2738,7 @@ fn translate_func(
     // is threaded as block-local index 0 of every block; a call passes `sp + frame_size`.
     let mut params: Vec<ValType> = vec![ValType::I64];
     for p in &f.parameters {
-        params.push(val_type(&p.ty)?);
+        params.extend(param_vtypes(&p.ty)?);
     }
     // A small by-value struct return flattens to a multi-result signature (§3a).
     let results = result_types(f.return_type.as_ref(), types)?;
@@ -2971,7 +2998,15 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
     for p in &f.parameters {
         let id = s.ty.len();
         s.name2id.insert(p.name.clone(), id);
-        s.ty.push(val_type(&p.ty)?);
+        // An i128 parameter arrives as two i64 slots (`param_vtypes`) and is held as its `(lo, hi)`
+        // pair — the `agg_layout` fan-out the entry block's params get exactly like any other edge.
+        match i128_pair(&p.ty) {
+            Some(pair) => {
+                s.agg_layout.insert(id, pair);
+                s.ty.push(ValType::I64);
+            }
+            None => s.ty.push(val_type(&p.ty)?),
+        }
         s.def_block.push(0);
     }
     for (bi, bb) in f.basic_blocks.iter().enumerate() {
@@ -3269,7 +3304,7 @@ fn indirect_sig(c: &crate::ll::ast::Call, types: &Types) -> Result<temen_ir::Fun
         } => {
             let mut params = vec![ValType::I64]; // the prepended data-SP
             for p in param_types {
-                params.push(val_type(p.as_ref())?);
+                params.extend(param_vtypes(p.as_ref())?);
             }
             let results = result_types(result_type.as_ref(), types)?;
             Ok(temen_ir::FuncType { params, results })
@@ -16394,7 +16429,7 @@ impl<'a> BlockCtx<'a> {
             Operand::LocalOperand { .. } => self.agg_of(op).map(Ok),
             Operand::ConstantOperand(c) => {
                 let ty = c.get_type(self.types);
-                match struct_field_vtypes(ty.as_ref(), self.types) {
+                match agg_vtypes(ty.as_ref(), self.types) {
                     Some(Ok(ftys)) => Some(self.agg_operand(op, &ftys)),
                     Some(Err(e)) => Some(Err(e)),
                     None => None,
@@ -16913,6 +16948,27 @@ impl<'a> BlockCtx<'a> {
     /// param width when the call-site type drifted (empty-parens prototypes let each site invent
     /// its own). Integer widths zero-extend/wrap — deterministic where the native ABI leaves the
     /// upper bits as junk; a float/vector drift has no ABI story and fails closed.
+    /// Append one call argument's signature slot(s) to `args`: an i128 argument is its `(lo, hi)`
+    /// pair (two slots, matching [`param_vtypes`]), anything else one scalar coerced to the callee's
+    /// slot type `coerce_to[slot]`. Returns the next slot index.
+    fn push_call_arg(
+        &mut self,
+        args: &mut Vec<ValIdx>,
+        a: &Operand,
+        coerce_to: Option<&[ValType]>,
+        slot: usize,
+        types: &Types,
+    ) -> Result<usize, Error> {
+        if let Some(pair) = i128_pair(a.get_type(types).as_ref()) {
+            args.extend(self.agg_operand(a, &pair)?);
+            return Ok(slot + 2);
+        }
+        let v = self.operand(a)?;
+        let want = coerce_to.and_then(|p| p.get(slot)).copied();
+        args.push(self.coerce_arg(v, a, want, types)?);
+        Ok(slot + 1)
+    }
+
     fn coerce_arg(
         &mut self,
         v: ValIdx,
@@ -18615,6 +18671,18 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // `synth_dispatcher`): the deposit is skipped here because the dispatcher owns ALL
         // marshaling (its default arm reproduces the strict varargs `call.dyn` exactly).
         let dispatcher = dispatch_key_for(c, types).and_then(|k| ctx.dispatch_map.get(&k).copied());
+        // The argument list in signature **slots** (an i128 argument is two, `param_vtypes`).
+        let arg_slots: usize = c
+            .arguments
+            .iter()
+            .map(|(a, _)| {
+                if i128_pair(a.get_type(types).as_ref()).is_some() {
+                    2
+                } else {
+                    1
+                }
+            })
+            .sum();
         let (fixed, coerce_to): (Option<usize>, Option<Vec<ValType>>) = if dispatcher.is_some() {
             (None, None)
         } else {
@@ -18626,7 +18694,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                     (Some(params.len()), Some(params))
                 }
                 Some((params, false)) => {
-                    if params.len() != c.arguments.len() {
+                    if params.len() != arg_slots {
                         return unsup("call arity differs from a non-variadic definition");
                     }
                     (None, Some(params))
@@ -18642,6 +18710,9 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             }
         };
         if let Some(fixed) = fixed {
+            if arg_slots != c.arguments.len() {
+                return unsup("i128 argument to a variadic call");
+            }
             let scratch_off = *ctx.frame.get(&VARARG_SCRATCH).ok_or_else(|| {
                 Error::Unsupported("varargs call without reserved scratch".into())
             })?;
@@ -18677,10 +18748,9 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 args.push(ctx.coerce_arg(v, a, want, types)?);
             }
         } else {
-            for (i, (a, _attrs)) in c.arguments.iter().enumerate() {
-                let v = ctx.operand(a)?;
-                let want = coerce_to.as_ref().and_then(|p| p.get(i)).copied();
-                args.push(ctx.coerce_arg(v, a, want, types)?);
+            let mut slot = 0;
+            for (a, _attrs) in c.arguments.iter() {
+                slot = ctx.push_call_arg(&mut args, a, coerce_to.as_deref(), slot, types)?;
             }
         }
         // A direct call (named, defined function) lowers to `call <idx>`; an indirect call (through
@@ -18756,7 +18826,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             Type::FuncType { result_type, .. } => result_type.clone(),
             other => return unsup(format!("call through non-function type {other}")),
         };
-        let agg_fields = match struct_field_vtypes(result_ty.as_ref(), types) {
+        let agg_fields = match agg_vtypes(result_ty.as_ref(), types) {
             Some(r) => Some(r?),
             None => None,
         };

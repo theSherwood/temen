@@ -56,7 +56,8 @@ pub fn build_std_toolchain_present() -> bool {
 /// or no IR is emitted.
 ///
 /// Mirrors the manual probe exactly: emit per-crate textual IR for the whole dependency closure
-/// (`RUSTFLAGS=--emit=llvm-ir cargo build --release`), `llvm-link -S` them, then
+/// (`RUSTFLAGS=--emit=llvm-ir cargo build --release`), `llvm-link -S` them (plus the sysroot
+/// `liballoc` bitcode, [`sysroot_alloc_bitcode`]), then
 /// `opt internalize,globaldce` down to the closure reachable from the powerbox `main`/`malloc`/
 /// `free`. Building the fixture as a `lib` means no final executable link, so cargo exits cleanly even
 /// though `malloc`/`free`/`write`/`__vm_jit_*` are undefined (the on-ramp synthesizes/lowers them); we
@@ -105,6 +106,7 @@ pub fn build_fixture_bc(fixture: &str) -> Option<PathBuf> {
         Command::new("llvm-link")
             .arg("-S")
             .args(&lls)
+            .arg(sysroot_alloc_bitcode(&work))
             .arg("-o")
             .arg(&linked)
             .status()
@@ -130,6 +132,58 @@ pub fn build_fixture_bc(fixture: &str) -> Option<PathBuf> {
         "opt failed"
     );
     Some(legalized)
+}
+
+/// The precompiled `liballoc`'s LLVM bitcode, pulled out of the toolchain's own rlib. `--emit=llvm-ir`
+/// only covers the crates cargo compiles, and since rustc 1.83 `Vec` growth goes through the
+/// non-generic `RawVecInner::grow_one` *inside* `liballoc` (older rustcs monomorphized it into the
+/// caller), so the closure has a real-code extern no stub can stand in for. rustup ships the std rlibs
+/// with their bitcode embedded (`.llvmbc`, for `-C lto`); `ar x` the one object out and
+/// `llvm-objcopy --dump-section` it. Its LLVM is rustc's — the pinned `llvm-link` (same major, per
+/// `scripts/ci/install-llvm.sh`) reads it — and `globaldce` prunes everything unreachable.
+fn sysroot_alloc_bitcode(work: &Path) -> PathBuf {
+    let libdir = Command::new("rustc")
+        .args(["--print", "target-libdir"])
+        .output()
+        .expect("rustc --print target-libdir");
+    let libdir = PathBuf::from(String::from_utf8_lossy(&libdir.stdout).trim());
+    let rlib = std::fs::read_dir(&libdir)
+        .expect("read target-libdir")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| {
+            let n = p.file_name().unwrap_or_default().to_string_lossy();
+            n.starts_with("liballoc-") && n.ends_with(".rlib")
+        })
+        .expect("liballoc-*.rlib in the sysroot");
+    let dir = work.join("alloc_rlib");
+    std::fs::create_dir_all(&dir).expect("create alloc_rlib dir");
+    assert!(
+        Command::new("ar")
+            .current_dir(&dir)
+            .arg("x")
+            .arg(&rlib)
+            .status()
+            .expect("run ar")
+            .success(),
+        "ar x liballoc failed"
+    );
+    let obj = std::fs::read_dir(&dir)
+        .expect("read alloc_rlib dir")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().map(|x| x == "o").unwrap_or(false))
+        .expect("an object in liballoc.rlib");
+    let bc = work.join("alloc.bc");
+    assert!(
+        Command::new("llvm-objcopy")
+            .arg(format!("--dump-section=.llvmbc={}", bc.display()))
+            .arg(&obj)
+            .arg("/dev/null")
+            .status()
+            .expect("run llvm-objcopy")
+            .success(),
+        "llvm-objcopy --dump-section .llvmbc failed (liballoc built without embedded bitcode?)"
+    );
+    bc
 }
 
 /// [`build_fixture_bc`], but with **`std` compiled from source** via `-Z build-std` (W5 §3e). The

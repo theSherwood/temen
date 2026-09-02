@@ -44,6 +44,8 @@ fn ci_has_every_tool_the_auto_skips_probe_for() {
         ("llvm-as", &["--version"]),
         ("llvm-link", &["--version"]),
         ("opt", &["--version"]),
+        ("llvm-objcopy", &["--version"]),
+        ("ar", &["--version"]),
         ("rustc", &["--version"]),
     ];
     let missing: Vec<&str> = tools

@@ -11075,6 +11075,30 @@ fn i128_param_and_return() {
     }
 }
 
+/// i128 through an **internal call**: a `noinline` callee taking two `__int128`s (one a constant at
+/// the call site) and returning one. clang ≤21 coerces these to `(i64, i64)` pairs itself; LLVM 22's
+/// clang passes/returns a bare `i128`, so the on-ramp splits the signature, fans the argument pair out
+/// at the call, and binds the two-result return — either shape must compute the same value.
+#[test]
+fn i128_noinline_callee_param_and_return() {
+    let src =
+        "__attribute__((noinline)) static __int128 addc(__int128 a, __int128 b){ return a + b; }\n\
+               __int128 big2(__int128 a){ return addc(a, addc(a, 7)); }\n";
+    for (lo, hi) in [(0u64, 0u64), (u64::MAX, 0x1234), (u64::MAX, u64::MAX)] {
+        let a = ((hi as u128) << 64) | lo as u128;
+        let r = a.wrapping_add(a).wrapping_add(7);
+        check(
+            "i128_big2",
+            src,
+            &[Value::I64(lo as i64), Value::I64(hi as i64)],
+            &[
+                Value::I64(r as u64 as i64),
+                Value::I64((r >> 64) as u64 as i64),
+            ],
+        );
+    }
+}
+
 /// i128 comparisons across **all predicates** (signed + unsigned ordering, eq/ne), each compared to a
 /// native `i128`/`u128` oracle. Packs the ten results into an int.
 #[test]
